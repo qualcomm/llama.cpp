@@ -9,6 +9,8 @@
 
 #import <Metal/Metal.h>
 
+#include <stdatomic.h>
+
 #undef MIN
 #undef MAX
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
@@ -6327,8 +6329,10 @@ static ggml_backend_buffer_t ggml_backend_metal_buffer_type_alloc_buffer(ggml_ba
         ctx->all_data = ggml_metal_host_malloc(size_aligned);
         ctx->is_shared = true;
     } else {
-        // dummy, non-NULL value - we'll populate this after creating the Metal buffer below
-        ctx->all_data = (void *) 0x000000400ULL;
+        // virtual address for GPU memory allocations
+        static atomic_uintptr_t addr_device = 0x000000400ULL;
+
+        ctx->all_data = (void *) atomic_fetch_add_explicit(&addr_device, size_aligned, memory_order_relaxed);
         ctx->is_shared = false;
     }
     ctx->all_size = size_aligned;
@@ -6351,7 +6355,10 @@ static ggml_backend_buffer_t ggml_backend_metal_buffer_type_alloc_buffer(ggml_ba
             } else {
                 ctx->buffers[0].metal = [device newBufferWithLength:size_aligned options:MTLResourceStorageModePrivate];
 
-                ctx->all_data = (void *) (ctx->buffers[0].metal.gpuAddress);
+                // MTLBuffer.gpuAddress is not available on early OSes, so we use a virtual address instead
+                //if (@available(macOS 10.13, iOS 16.0, *)) {
+                //    ctx->all_data = (void *) (ctx->buffers[0].metal.gpuAddress);
+                //}
             }
         }
 
