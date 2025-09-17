@@ -1002,6 +1002,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "RWKV_WKV6",
     "GATED_LINEAR_ATTN",
     "RWKV_WKV7",
+    "DELTA_NET",
 
     "UNARY",
 
@@ -1019,7 +1020,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 90, "GGML_OP_COUNT != 90");
+static_assert(GGML_OP_COUNT == 91, "GGML_OP_COUNT != 91");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1106,6 +1107,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "rwkv_wkv6(k, v, r, tf, td, s)",
     "gated_linear_attn(k, v, q, gate, s)",
     "rwkv_wkv7(r, w, k, v, a, b, s)",
+    "delta_net(k, v, q, g, conv_w, conv_b, beta, state, chunk_size, use_qk_l2norm, scale)",
 
     "unary(x)",
 
@@ -1123,7 +1125,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 90, "GGML_OP_COUNT != 90");
+static_assert(GGML_OP_COUNT == 91, "GGML_OP_COUNT != 91");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5414,6 +5416,124 @@ struct ggml_tensor * ggml_gated_linear_attn(
     result->src[3] = g;
     result->src[4] = state;
 
+    return result;
+}
+
+// ggml_delta_net
+
+struct ggml_tensor * ggml_delta_net(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * conv_weight,
+        struct ggml_tensor  * conv_bias,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * state,
+        int                   chunk_size,
+        bool                  use_qk_l2norm,
+        float                 scale) {
+    GGML_ASSERT(ggml_is_contiguous(k));
+    GGML_ASSERT(ggml_is_contiguous(v));
+    GGML_ASSERT(ggml_is_contiguous(q));
+    GGML_ASSERT(ggml_is_contiguous(g));
+    GGML_ASSERT(ggml_is_contiguous(beta));
+    GGML_ASSERT(ggml_is_contiguous(state));
+    
+    const int64_t S = k->ne[0];
+    const int64_t H = k->ne[1];
+    const int64_t n_tokens = k->ne[2];
+    const int64_t n_seqs = state->ne[1];
+    
+    // Validate dimensions
+    GGML_ASSERT(v->ne[0] == S && v->ne[1] == H && v->ne[2] == n_tokens);
+    GGML_ASSERT(q->ne[0] == S && q->ne[1] == H && q->ne[2] == n_tokens);
+    GGML_ASSERT(g->ne[0] == S && g->ne[1] == H && g->ne[2] == n_tokens);
+    GGML_ASSERT(beta->ne[0] == H && beta->ne[1] == n_tokens && beta->ne[2] == n_seqs);
+    GGML_ASSERT(ggml_nelements(state) == S * S * H * n_seqs);
+    
+    // Apply L2 normalization to query and key if requested
+    struct ggml_tensor * q_norm = q;
+    struct ggml_tensor * k_norm = k;
+    if (use_qk_l2norm) {
+        q_norm = ggml_l2_norm(ctx, q, 1e-6f);
+        k_norm = ggml_l2_norm(ctx, k, 1e-6f);
+    }
+    
+    // Apply scaling to query
+    q_norm = ggml_scale(ctx, q_norm, scale);
+    
+    // Apply sigmoid to beta for gating
+    struct ggml_tensor * beta_sigmoid = ggml_sigmoid(ctx, beta);
+    
+    // Apply causal 1D convolution preprocessing to mixed QKV
+    // Concatenate q, k, v along the feature dimension
+    int64_t concat_ne[4] = { q->ne[0], q->ne[1], q->ne[2], q->ne[3] * 3 };
+    struct ggml_tensor * mixed_qkv = ggml_concat(ctx, q_norm, k_norm, 3);
+    mixed_qkv = ggml_concat(ctx, mixed_qkv, v, 3);
+    
+    // Transpose for convolution: [S, H, n_tokens, n_seqs*3] -> [S, n_tokens, H, n_seqs*3]
+    mixed_qkv = ggml_permute(ctx, mixed_qkv, 0, 2, 1, 3);
+    
+    // Apply causal 1D convolution
+    struct ggml_tensor * conv_out = ggml_conv_1d(
+        ctx,
+        conv_weight,
+        mixed_qkv,
+        1,  // stride
+        conv_weight->ne[2] - 1,  // padding (kernel_size - 1)
+        1   // dilation
+    );
+    
+    // Apply bias if provided
+    if (conv_bias) {
+        conv_out = ggml_add(ctx, conv_out, conv_bias);
+    }
+    
+    // Apply SiLU activation
+    conv_out = ggml_silu(ctx, conv_out);
+    
+    // Transpose back: [S, n_tokens, H, n_seqs*3] -> [S, H, n_tokens, n_seqs*3]
+    conv_out = ggml_permute(ctx, conv_out, 0, 2, 1, 3);
+    
+    // Split the convolved output back into q, k, v components
+    // Split along the last dimension (3 * original size)
+    int64_t split_size = q->ne[3];
+    struct ggml_tensor * q_conv = ggml_view_4d(ctx, conv_out, q->ne[0], q->ne[1], q->ne[2], split_size,
+                                               conv_out->nb[0], conv_out->nb[1], conv_out->nb[2], 0);
+    
+    struct ggml_tensor * k_conv = ggml_view_4d(ctx, conv_out, k->ne[0], k->ne[1], k->ne[2], split_size,
+                                               conv_out->nb[0], conv_out->nb[1], conv_out->nb[2],
+                                               split_size * ggml_type_size(q->type));
+    
+    struct ggml_tensor * v_conv = ggml_view_4d(ctx, conv_out, v->ne[0], v->ne[1], v->ne[2], split_size,
+                                               conv_out->nb[0], conv_out->nb[1], conv_out->nb[2],
+                                               2 * split_size * ggml_type_size(q->type));
+    
+    // concat output and new_state
+    const int64_t ne[4] = { S * H, n_tokens + S * n_seqs, 1, 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+    
+    // Set operation parameters for the delta rule computation
+    int32_t params[8] = {
+        chunk_size,
+        use_qk_l2norm ? 1 : 0,
+        0, 0,  // reserved
+        0, 0, 0, 0  // scale and other params
+    };
+    memcpy(params + 4, &scale, sizeof(float));
+    ggml_set_op_params(result, params, sizeof(params));
+    
+    // Use custom operation for the gated delta rule computation
+    result->op = GGML_OP_DELTA_NET;
+    result->src[0] = q_conv;
+    result->src[1] = k_conv;
+    result->src[2] = v_conv;
+    result->src[3] = g;
+    result->src[4] = beta_sigmoid;
+    result->src[5] = state;
+    
     return result;
 }
 

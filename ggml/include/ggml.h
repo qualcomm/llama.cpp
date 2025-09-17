@@ -539,7 +539,8 @@ extern "C" {
         GGML_OP_RWKV_WKV6,
         GGML_OP_GATED_LINEAR_ATTN,
         GGML_OP_RWKV_WKV7,
-
+        GGML_OP_DELTA_NET,
+    
         GGML_OP_UNARY,
 
         GGML_OP_MAP_CUSTOM1,
@@ -2277,6 +2278,31 @@ extern "C" {
             struct ggml_tensor  * g,
             struct ggml_tensor  * state,
             float scale);
+
+    // Delta-Net linear layer activation
+    // Implements the complete Delta-Net gated linear attention mechanism
+    // This includes causal convolution preprocessing and gated delta rule computation
+    // k, v, q, g: [S, H, n_tokens, n_seqs] - key, value, query, gate tensors
+    // conv_weight: [conv_dim, 1, conv_kernel_size] - convolution kernel weights
+    // conv_bias: [conv_dim] - convolution bias (optional, can be NULL)
+    // beta: [H, n_tokens, n_seqs] - beta parameter for delta rule
+    // state: [S, S, H, n_seqs] - recurrent state tensor
+    // chunk_size: chunk size for chunked computation (0 for recurrent mode)
+    // use_qk_l2norm: whether to apply L2 normalization to query and key
+    // scale: attention scaling factor
+    GGML_API struct ggml_tensor * ggml_delta_net(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * conv_weight,
+            struct ggml_tensor  * conv_bias,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * state,
+            int                   chunk_size,
+            bool                  use_qk_l2norm,
+            float                 scale);
 
     GGML_API struct ggml_tensor * ggml_rwkv_wkv7(
             struct ggml_context * ctx,
