@@ -3435,7 +3435,7 @@ struct ggml_tensor * ggml_reshape_4d(
         int64_t               ne2,
         int64_t               ne3) {
     GGML_ASSERT(ggml_is_contiguous(a));
-    GGML_ASSERT(ggml_nelements(a) == ne0*ne1*ne2*ne3);
+     GGML_ASSERT(ggml_nelements(a) == ne0*ne1*ne2*ne3);
 
     const int64_t ne[4] = { ne0, ne1, ne2, ne3 };
     struct ggml_tensor * result = ggml_new_tensor_impl(ctx, a->type, 4, ne, a, 0);
@@ -5441,17 +5441,25 @@ struct ggml_tensor * ggml_delta_net(
     GGML_ASSERT(ggml_is_contiguous(beta));
     GGML_ASSERT(ggml_is_contiguous(state));
     
-    const int64_t S = k->ne[0];
-    const int64_t H = k->ne[1];
+    const int64_t S_k = k->ne[0];
+    const int64_t H_k = k->ne[1];
     const int64_t n_tokens = k->ne[2];
     const int64_t n_seqs = state->ne[1];
     
-    // Validate dimensions
-    GGML_ASSERT(v->ne[0] == S && v->ne[1] == H && v->ne[2] == n_tokens);
-    GGML_ASSERT(q->ne[0] == S && q->ne[1] == H && q->ne[2] == n_tokens);
-    GGML_ASSERT(g->ne[0] == S && g->ne[1] == H && g->ne[2] == n_tokens);
-    GGML_ASSERT(beta->ne[0] == H && beta->ne[1] == n_tokens && beta->ne[2] == n_seqs);
-    GGML_ASSERT(ggml_nelements(state) == S * S * H * n_seqs);
+    const int64_t S_v = v->ne[0];
+    const int64_t H_v = v->ne[1];
+    
+    // Validate dimensions - allow different head dimensions for q/k vs v
+    GGML_ASSERT(v->ne[2] == n_tokens);
+    GGML_ASSERT(q->ne[2] == n_tokens);
+    GGML_ASSERT(g->ne[2] == n_tokens);
+    GGML_ASSERT(beta->ne[0] == H_v && beta->ne[1] == n_tokens && (beta->ne[2] == n_seqs || beta->ne[2] == 1));
+    GGML_ASSERT(ggml_nelements(state) == S_v * H_v * n_seqs);
+    
+    // Check that q and k have the same dimensions
+    GGML_ASSERT(q->ne[0] == S_k && q->ne[1] == H_k && q->ne[2] == n_tokens);
+    GGML_ASSERT(k->ne[0] == S_k && k->ne[1] == H_k && k->ne[2] == n_tokens);
+    GGML_ASSERT(g->ne[0] == S_v && g->ne[1] == H_v && g->ne[2] == n_tokens);
     
     // Apply L2 normalization to query and key if requested
     struct ggml_tensor * q_norm = q;
@@ -5466,53 +5474,101 @@ struct ggml_tensor * ggml_delta_net(
     
     // Apply sigmoid to beta for gating
     struct ggml_tensor * beta_sigmoid = ggml_sigmoid(ctx, beta);
-    
-    // Apply causal 1D convolution preprocessing to mixed QKV
-    // Concatenate q, k, v along the feature dimension
-    int64_t concat_ne[4] = { q->ne[0], q->ne[1], q->ne[2], q->ne[3] * 3 };
-    struct ggml_tensor * mixed_qkv = ggml_concat(ctx, q_norm, k_norm, 3);
-    mixed_qkv = ggml_concat(ctx, mixed_qkv, v, 3);
-    
-    // Transpose for convolution: [S, H, n_tokens, n_seqs*3] -> [S, n_tokens, H, n_seqs*3]
-    mixed_qkv = ggml_permute(ctx, mixed_qkv, 0, 2, 1, 3);
-    
-    // Apply causal 1D convolution
-    struct ggml_tensor * conv_out = ggml_conv_1d(
-        ctx,
-        conv_weight,
-        mixed_qkv,
-        1,  // stride
-        conv_weight->ne[2] - 1,  // padding (kernel_size - 1)
-        1   // dilation
-    );
-    
+    struct ggml_tensor * mixed_qkv = ggml_concat(ctx, q_norm, k_norm, 1);
+    mixed_qkv = ggml_concat(ctx, mixed_qkv, v, 1);
+
+    u_int32_t dim = (S_v * H_v) + 2 * (H_k * S_k);
+
+    mixed_qkv = ggml_reshape_3d(ctx, mixed_qkv, 1, dim, n_tokens);
+    struct ggml_tensor * mixed_qkv_padded = ggml_pad(ctx, mixed_qkv, 3, 0, 0, 0);
+
+    // Apply SSM convolution
+    struct ggml_tensor * conv_out = ggml_ssm_conv(ctx, mixed_qkv_padded, conv_weight);
+
     // Apply bias if provided
     if (conv_bias) {
         conv_out = ggml_add(ctx, conv_out, conv_bias);
     }
-    
+
     // Apply SiLU activation
     conv_out = ggml_silu(ctx, conv_out);
-    
-    // Transpose back: [S, n_tokens, H, n_seqs*3] -> [S, H, n_tokens, n_seqs*3]
+
+    // Reshape back to 4D: [dim, n_tokens, 1] -> [dim, n_tokens, 1, 1]
+    conv_out = ggml_reshape_4d(ctx, conv_out, dim, n_tokens, 1, 1);
+
+    // Transpose to get the right layout: [dim, n_tokens, 1] -> [dim, 1, n_tokens, 1]
     conv_out = ggml_permute(ctx, conv_out, 0, 2, 1, 3);
+
+    // q projection view
+    struct ggml_tensor * q_conv = ggml_view_4d(ctx, conv_out,
+                                               S_k,                  // ne0
+                                               H_k,                  // ne1
+                                               conv_out->ne[1],      // ne2 = sequence length (1)
+                                               conv_out->ne[2],      // ne3 = batch (1)
+                                               H_k * sizeof(float),  // nb1 = stride along H_k
+                                               conv_out->nb[1],      // nb2 = stride along sequence dim
+                                               conv_out->nb[2],      // nb3 = stride along batch dim
+                                               0                     // offset in bytes
+    );
+
+    // k projection view
+    struct ggml_tensor * k_conv = ggml_view_4d(ctx, conv_out,
+                                               S_k,                       // ne0
+                                               H_k,                       // ne1
+                                               conv_out->ne[1],           // ne2
+                                               conv_out->ne[2],           // ne3
+                                               H_k * sizeof(float),       // nb1
+                                               conv_out->nb[1],           // nb2
+                                               conv_out->nb[2],           // nb3
+                                               S_k * H_k * sizeof(q->type)  // offset = skip q_out
+    );
+
+    // v projection view
+    struct ggml_tensor * v_conv = ggml_view_4d(ctx, conv_out,
+                                               S_v,                             // ne0
+                                               H_v,                             // ne1
+                                               conv_out->ne[1],                 // ne2
+                                               conv_out->ne[2],                 // ne3
+                                               H_v * sizeof(float),             // nb1
+                                               conv_out->nb[1],                 // nb2
+                                               conv_out->nb[2],                 // nb3
+                                               (2 * S_k * H_k) * sizeof(q->type)// offset = skip q_out + k_out
+    );
+
+    // Transpose each component back to original layout: [S_v, 1, token_split_size, 1] -> [S_v, token_split_size, 1, 1]
+    q_conv = ggml_permute(ctx, q_conv, 0, 2, 1, 3);
+    k_conv = ggml_permute(ctx, k_conv, 0, 2, 1, 3);
+    v_conv = ggml_permute(ctx, v_conv, 0, 2, 1, 3);
+
+    q_conv = ggml_reshape_3d(ctx, ggml_cont(ctx, q_conv), S_k * H_k, 1, n_tokens);
+    k_conv = ggml_reshape_3d(ctx, ggml_cont(ctx, k_conv), S_k * H_k, 1, n_tokens);
+    v_conv = ggml_reshape_3d(ctx, ggml_cont(ctx, v_conv), S_v * H_v, 1, n_tokens);
     
-    // Split the convolved output back into q, k, v components
-    // Split along the last dimension (3 * original size)
-    int64_t split_size = q->ne[3];
-    struct ggml_tensor * q_conv = ggml_view_4d(ctx, conv_out, q->ne[0], q->ne[1], q->ne[2], split_size,
-                                               conv_out->nb[0], conv_out->nb[1], conv_out->nb[2], 0);
+    // NOW we repeat query and key to match value head dimensions if needed (after convolution)
+    struct ggml_tensor * q_broadcast = q_conv;
+    struct ggml_tensor * k_broadcast = k_conv;
     
-    struct ggml_tensor * k_conv = ggml_view_4d(ctx, conv_out, k->ne[0], k->ne[1], k->ne[2], split_size,
-                                               conv_out->nb[0], conv_out->nb[1], conv_out->nb[2],
-                                               split_size * ggml_type_size(q->type));
-    
-    struct ggml_tensor * v_conv = ggml_view_4d(ctx, conv_out, v->ne[0], v->ne[1], v->ne[2], split_size,
-                                               conv_out->nb[0], conv_out->nb[1], conv_out->nb[2],
-                                               2 * split_size * ggml_type_size(q->type));
+    if (H_k != H_v) {
+        // Calculate the repeat factor: H_v / H_k
+        GGML_ASSERT(H_v % H_k == 0);
+        int64_t repeat_factor = H_v / H_k;
+        
+        // Repeat query and key along the head dimension
+        // First reshape to separate the repeat dimension: [S_k, H_k, n_tokens, 1] -> [S_k, 1, H_k, n_tokens]
+        q_broadcast = ggml_reshape_4d(ctx, q_conv, S_k, 1, H_k, n_tokens);
+        k_broadcast = ggml_reshape_4d(ctx, k_conv, S_k, 1, H_k, n_tokens);
+        
+        // Repeat along the new dimension: [S_k, repeat_factor, H_k, n_tokens]
+        q_broadcast = ggml_repeat_4d(ctx, q_broadcast, S_k, repeat_factor, H_k, n_tokens);
+        k_broadcast = ggml_repeat_4d(ctx, k_broadcast, S_k, repeat_factor, H_k, n_tokens);
+        
+        // Reshape back to original dimensions but with H_v heads: [S_k, H_v, n_tokens, 1]
+        q_broadcast = ggml_reshape_4d(ctx, q_broadcast, S_k, H_v, n_tokens, 1);
+        k_broadcast = ggml_reshape_4d(ctx, k_broadcast, S_k, H_v, n_tokens, 1);
+    }
     
     // concat output and new_state
-    const int64_t ne[4] = { S * H, n_tokens + S * n_seqs, 1, 1 };
+    const int64_t ne[4] = { S_v * H_v, n_tokens + H_v * n_seqs, 1, 1 };
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
     
     // Set operation parameters for the delta rule computation
@@ -5520,15 +5576,15 @@ struct ggml_tensor * ggml_delta_net(
         chunk_size,
         use_qk_l2norm ? 1 : 0,
         0, 0,  // reserved
-        0, 0, 0, 0  // scale and other params
+        0, 0, 0  // scale and other params
     };
     memcpy(params + 4, &scale, sizeof(float));
     ggml_set_op_params(result, params, sizeof(params));
     
     // Use custom operation for the gated delta rule computation
     result->op = GGML_OP_DELTA_NET;
-    result->src[0] = q_conv;
-    result->src[1] = k_conv;
+    result->src[0] = q_broadcast;
+    result->src[1] = k_broadcast;
     result->src[2] = v_conv;
     result->src[3] = g;
     result->src[4] = beta_sigmoid;
