@@ -2631,6 +2631,83 @@ template [[host_name("kernel_rms_norm_f32")]]         kernel kernel_rms_norm_fus
 template [[host_name("kernel_rms_norm_mul_f32")]]     kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<2>;
 template [[host_name("kernel_rms_norm_mul_add_f32")]] kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<3>;
 
+// TODO: same as kernel_rms_norm_fuse_impl but fuses the previous ADD operation
+//       can be simplified, but for now there does not seem to be benefit from this fusion so leaving it like this
+// F == 1 : rms_norm (no fuse)
+// F == 2 : rms_norm + mul
+// F == 3 : rms_norm + mul + add
+template <short F>
+kernel void kernel_rms_norm_prev_fuse_impl(
+        constant ggml_metal_kargs_rms_norm & args,
+        device const char * src0_0, // src0 = src0_0 + src1_0
+        device const char * src0_1,
+        device const char * src1_0,
+        device const char * src1_1,
+        device       char * dst,
+        threadgroup float * shmem_f32 [[threadgroup(0)]],
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    if (sgitg == 0) {
+        shmem_f32[tiisg] = 0.0f;
+    }
+
+    const int i01 = tgpig.x;
+    const int i02 = tgpig.y;
+    const int i03 = tgpig.z;
+
+    device const float4 * x0 = (device const float4 *) (src0_0 + i03*args.nbf3[0] + i02*args.nbf2[0] + i01*args.nbf1[0]);
+    device const float4 * x1 = (device const float4 *) (src0_1 + i03*args.nbf3[0] + i02*args.nbf2[0] + i01*args.nbf1[0]);
+
+    device const float4 * f0 = (device const float4 *) (src1_0 + (i03%args.nef3[1])*args.nbf3[1] + (i02%args.nef2[1])*args.nbf2[1] + (i01%args.nef1[1])*args.nbf1[1]);
+    device const float4 * f1 = (device const float4 *) (src1_1 + (i03%args.nef3[2])*args.nbf3[2] + (i02%args.nef2[2])*args.nbf2[2] + (i01%args.nef1[2])*args.nbf1[2]);
+
+    float sumf = 0.0f;
+
+    // parallel sum
+    for (int i00 = tpitg.x; i00 < args.ne00_4; i00 += ntg.x) {
+        const float4 x = x0[i00] + x1[i00];
+        sumf += dot(x, x);
+    }
+    sumf = simd_sum(sumf);
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tiisg == 0) {
+        shmem_f32[sgitg] = sumf;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    sumf = shmem_f32[tiisg];
+    sumf = simd_sum(sumf);
+
+    const float mean  = sumf/args.ne00;
+    const float scale = 1.0f/sqrt(mean + args.eps);
+
+    device float4 * y = (device float4 *) (dst + i03*args.nb3 + i02*args.nb2 + i01*args.nb1);
+    for (int i00 = tpitg.x; i00 < args.ne00_4; i00 += ntg.x) {
+        const float4 x = x0[i00] + x1[i00];
+        if (F == 1) {
+            y[i00] = (x*scale);
+        }
+        if (F == 2) {
+            y[i00] = (x*scale)*f0[i00];
+        }
+        if (F == 3) {
+            y[i00] = (x*scale)*f0[i00] + f1[i00];
+        }
+    }
+}
+
+typedef decltype(kernel_rms_norm_prev_fuse_impl<1>) kernel_rms_norm_prev_fuse_t;
+
+template [[host_name("kernel_rms_norm_prev_f32")]]         kernel kernel_rms_norm_prev_fuse_t kernel_rms_norm_prev_fuse_impl<1>;
+template [[host_name("kernel_rms_norm_prev_mul_f32")]]     kernel kernel_rms_norm_prev_fuse_t kernel_rms_norm_prev_fuse_impl<2>;
+template [[host_name("kernel_rms_norm_prev_mul_add_f32")]] kernel kernel_rms_norm_prev_fuse_t kernel_rms_norm_prev_fuse_impl<3>;
+
 kernel void kernel_l2_norm_f32(
         constant ggml_metal_kargs_l2_norm & args,
         device const char * src0,

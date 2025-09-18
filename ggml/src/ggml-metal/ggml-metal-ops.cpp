@@ -193,6 +193,19 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
         case GGML_OP_MUL:
         case GGML_OP_DIV:
             {
+                if (node->op == GGML_OP_ADD) {
+                    const ggml_op fops[2] = { GGML_OP_ADD, GGML_OP_RMS_NORM };
+
+                    if (idx + 1 < ctx->idx_end &&
+                        nodes[1]->op == GGML_OP_RMS_NORM &&
+                        ggml_can_fuse(gf, idx, fops, 2) &&
+                        ggml_are_same_layout(node, node->src[0]) &&
+                        ggml_are_same_layout(node, node->src[1])) {
+                        n_fuse = ggml_metal_op_rms_norm(ctx, idx + 1, true) + 1;
+                        break;
+                    }
+                }
+
                 n_fuse = ggml_metal_op_bin(ctx, idx);
             } break;
         case GGML_OP_ADD_ID:
@@ -268,7 +281,7 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             } break;
         case GGML_OP_RMS_NORM:
             {
-                n_fuse = ggml_metal_op_rms_norm(ctx, idx);
+                n_fuse = ggml_metal_op_rms_norm(ctx, idx, false);
             } break;
         case GGML_OP_L2_NORM:
             {
@@ -2346,7 +2359,7 @@ int ggml_metal_op_bin(ggml_metal_op_t ctx, int idx) {
     return n_fuse;
 }
 
-int ggml_metal_op_rms_norm(ggml_metal_op_t ctx, int idx) {
+int ggml_metal_op_rms_norm(ggml_metal_op_t ctx, int idx, bool fuse_prev) {
     ggml_cgraph * gf = ctx->gf;
     ggml_tensor * op = ggml_graph_node(gf, idx);
 
@@ -2371,6 +2384,17 @@ int ggml_metal_op_rms_norm(ggml_metal_op_t ctx, int idx) {
 
     ggml_metal_buffer_id bid_src0 = ggml_metal_get_buffer_id(op->src[0]);
     ggml_metal_buffer_id bid_dst  = ggml_metal_get_buffer_id(op);
+
+    ggml_metal_buffer_id bid_src0_0;
+    ggml_metal_buffer_id bid_src0_1;
+
+    if (fuse_prev) {
+        ggml_tensor * prev = ggml_graph_node(gf, idx - 1);
+        GGML_ASSERT(prev->op == GGML_OP_ADD);
+
+        bid_src0_0 = ggml_metal_get_buffer_id(prev->src[0]);
+        bid_src0_1 = ggml_metal_get_buffer_id(prev->src[1]);
+    }
 
     ggml_metal_kargs_rms_norm args = {
         /*.ne00   =*/ ne00,
@@ -2459,7 +2483,7 @@ int ggml_metal_op_rms_norm(ggml_metal_op_t ctx, int idx) {
         }
     }
 
-    ggml_metal_pipeline_t pipeline = ggml_metal_library_get_pipeline_rms_norm(lib, op, n_fuse);
+    ggml_metal_pipeline_t pipeline = ggml_metal_library_get_pipeline_rms_norm(lib, op, n_fuse, fuse_prev);
 
     int nth = 32; // SIMD width
 
@@ -2474,10 +2498,18 @@ int ggml_metal_op_rms_norm(ggml_metal_op_t ctx, int idx) {
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
-    ggml_metal_encoder_set_buffer  (enc, bid_src0, 1);
-    ggml_metal_encoder_set_buffer  (enc, bid_fuse[0], 2);
-    ggml_metal_encoder_set_buffer  (enc, bid_fuse[1], 3);
-    ggml_metal_encoder_set_buffer  (enc, bid_dst, 4);
+    if (fuse_prev) {
+        ggml_metal_encoder_set_buffer  (enc, bid_src0_0,  1);
+        ggml_metal_encoder_set_buffer  (enc, bid_src0_1,  2);
+        ggml_metal_encoder_set_buffer  (enc, bid_fuse[0], 3);
+        ggml_metal_encoder_set_buffer  (enc, bid_fuse[1], 4);
+        ggml_metal_encoder_set_buffer  (enc, bid_dst,     5);
+    } else {
+        ggml_metal_encoder_set_buffer  (enc, bid_src0,    1);
+        ggml_metal_encoder_set_buffer  (enc, bid_fuse[0], 2);
+        ggml_metal_encoder_set_buffer  (enc, bid_fuse[1], 3);
+        ggml_metal_encoder_set_buffer  (enc, bid_dst,     4);
+    }
 
     ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
 

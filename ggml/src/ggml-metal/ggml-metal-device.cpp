@@ -1090,7 +1090,7 @@ ggml_metal_pipeline_t ggml_metal_library_get_pipeline_bin(
     return res;
 }
 
-ggml_metal_pipeline_t ggml_metal_library_get_pipeline_rms_norm(ggml_metal_library_t lib, const ggml_tensor * op, int32_t n_fuse) {
+ggml_metal_pipeline_t ggml_metal_library_get_pipeline_rms_norm(ggml_metal_library_t lib, const ggml_tensor * op, int32_t n_fuse, bool fuse_prev) {
     assert(op->op == GGML_OP_RMS_NORM);
 
     GGML_ASSERT(op->src[0]->ne[0] % 4 == 0);
@@ -1099,10 +1099,12 @@ ggml_metal_pipeline_t ggml_metal_library_get_pipeline_rms_norm(ggml_metal_librar
     char base[256];
     char name[256];
 
+    const char * suffix = fuse_prev ? "_prev" : "";
+
     switch (n_fuse) {
-        case 1: snprintf(base, 256, "kernel_rms_norm_f32");         break;
-        case 2: snprintf(base, 256, "kernel_rms_norm_mul_f32");     break;
-        case 3: snprintf(base, 256, "kernel_rms_norm_mul_add_f32"); break;
+        case 1: snprintf(base, 256, "kernel_rms_norm%s_f32", suffix);         break;
+        case 2: snprintf(base, 256, "kernel_rms_norm%s_mul_f32", suffix);     break;
+        case 3: snprintf(base, 256, "kernel_rms_norm%s_mul_add_f32", suffix); break;
         default: GGML_ABORT("fatal error");
     }
 
