@@ -2436,7 +2436,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
                         if ((i + 1) % 4 == 0) {  // TODO: magic 4
                                                  // Attention layers
-                            layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q, "weight", i), { n_embd, n_ff }, 0);
+                            layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q, "weight", i), { n_embd, n_embd_head_k * n_head }, 0);
                             layer.wk = create_tensor(tn(LLM_TENSOR_ATTN_K, "weight", i), { n_embd, n_embd_k_gqa }, 0);
                             layer.wv = create_tensor(tn(LLM_TENSOR_ATTN_V, "weight", i), { n_embd, n_embd_v_gqa }, 0);
                             layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), { n_embd_head_k * n_head, n_embd }, 0);
@@ -2444,6 +2444,9 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                             // Q/K normalization for attention layers
                             layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), { n_embd_head_k }, 0);
                             layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), { n_embd_head_k }, 0);
+
+                            // attn gate
+                            layer.wq_gate = create_tensor(tn(LLM_TENSOR_ATTN_GATE, "weight", i), { n_embd, n_embd_head_k * n_head }, 0);
 
                         } else {
                             // Linear attention (gated delta net) specific tensors
@@ -2454,7 +2457,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                             layer.ssm_a = create_tensor(tn(LLM_TENSOR_SSM_A, i), { hparams.ssm_dt_rank }, 0);
                             layer.ssm_beta_alpha = create_tensor(tn(LLM_TENSOR_SSM_BETA_ALPHA, "weight", i), { n_embd, ba_projection_size }, 0);
                             layer.ssm_norm = create_tensor(tn(LLM_TENSOR_SSM_NORM, "weight", i), { head_v_dim }, 0);
-                            layer.ssm_out = create_tensor(tn(LLM_TENSOR_SSM_OUT, "weight", i), { n_ff, n_embd }, 0);
+                            layer.ssm_out = create_tensor(tn(LLM_TENSOR_SSM_OUT, "weight", i), { value_dim, n_embd }, 0);
                         }
 
                         layer.ffn_gate_inp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP, "weight", i), { n_embd, n_expert }, 0);
@@ -19032,30 +19035,27 @@ private:
         const int64_t                 n_embd_head,
         const int                     il) {
 
-        // QKV projection with gating
-        ggml_tensor * qkv_g = build_lora_mm(model.layers[il].wq, cur);
-        cb(qkv_g, "qkv_g", il);
-        
-        // Split into Q and gate
-        const int64_t n_embd_q = hparams.n_head(il) * n_embd_head;
-        ggml_tensor * Qcur = ggml_view_3d(ctx0, qkv_g, n_embd_head, hparams.n_head(il), n_tokens, 
-                                         n_embd_head * sizeof(float), qkv_g->nb[1], 0);
-        ggml_tensor * gate = ggml_view_3d(ctx0, qkv_g, n_embd_head, hparams.n_head(il), n_tokens,
-                                         n_embd_head * sizeof(float), qkv_g->nb[1], n_embd_q * ggml_element_size(qkv_g));
-        
-        // K and V projections
-        ggml_tensor * Kcur = build_lora_mm(model.layers[il].wk, cur);
-        ggml_tensor * Vcur = build_lora_mm(model.layers[il].wv, cur);
+        ggml_tensor * gate = build_lora_mm(model.layers[il].wq_gate, cur);
+
+        // compute Q and K and RoPE them
+        struct ggml_tensor * Qcur = build_lora_mm(model.layers[il].wq, cur);
+        cb(Qcur, "Qcur", il);
+
+        struct ggml_tensor * Kcur = build_lora_mm(model.layers[il].wk, cur);
         cb(Kcur, "Kcur", il);
+
+        struct ggml_tensor * Vcur = build_lora_mm(model.layers[il].wv, cur);
         cb(Vcur, "Vcur", il);
 
-        Qcur = ggml_reshape_3d(ctx0, ggml_cont(ctx0, Qcur), n_embd_head, hparams.n_head(il), n_tokens);
-        Kcur = ggml_reshape_3d(ctx0, ggml_cont(ctx0, Kcur), n_embd_head, hparams.n_head_kv(il), n_tokens);
-        Vcur = ggml_reshape_3d(ctx0, ggml_cont(ctx0, Vcur), n_embd_head, hparams.n_head_kv(il), n_tokens);
+        Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head, n_tokens);
+        Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
+        Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
 
         // Apply Q/K normalization
         Qcur = build_norm(Qcur, model.layers[il].attn_q_norm, NULL, LLM_NORM_RMS, il);
         Kcur = build_norm(Kcur, model.layers[il].attn_k_norm, NULL, LLM_NORM_RMS, il);
+        cb(Kcur, "Qcur_normed", il);
+        cb(Kcur, "Kcur_normed", il);
 
         // Apply RoPE
         Qcur = ggml_rope_ext(
@@ -19079,7 +19079,6 @@ private:
                 Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
         
         // Apply gating
-        gate = ggml_reshape_2d(ctx0, ggml_cont(ctx0, gate), n_embd_q, n_tokens);
         cur = ggml_cont(ctx0, ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, gate)));
         cb(cur, "attn_gated", il);
         

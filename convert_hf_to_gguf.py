@@ -3767,8 +3767,12 @@ class Qwen3NextModel(Qwen3MoeModel):
             name = name.rpartition(".dt_bias")[0] + ".dt_proj.bias"
         elif "conv1d" in name:
             data_torch = data_torch.squeeze()
+        elif "q_proj.weight" in name:
+            q_proj, gate = data_torch.chunk(2, dim=0)
+            yield (self.format_tensor_name(gguf.MODEL_TENSOR.ATTN_GATE, bid), gate)
+            data_torch = q_proj
 
-        return Qwen2MoeModel.modify_tensors(self, data_torch, name, bid)
+        yield from Qwen2MoeModel.modify_tensors(self, data_torch, name, bid)
 
 
 @ModelBase.register("GPT2LMHeadModel")
