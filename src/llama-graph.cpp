@@ -934,11 +934,20 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
         // organize experts into n_expert_groups
         ggml_tensor * selection_groups = ggml_view_2d(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, selection_probs)), n_tokens * n_exp_per_group, hparams.n_expert_groups, n_tokens * n_exp_per_group * sizeof(float), 0); // [n_tokens * n_exp_per_group, n_expert_groups]
+#if 0
         ggml_tensor * group_scores = ggml_top_k(ctx0, selection_groups, 2); // [2, n_expert_groups]
         group_scores = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, selection_groups, 1, selection_groups->ne[0], selection_groups->ne[1]), group_scores); // [1, 2, n_expert_groups]
 
         // get top n_group_used expert groups
         group_scores = ggml_transpose(ctx0, ggml_sum_rows(ctx0, ggml_reshape_2d(ctx0, group_scores, group_scores->ne[1], group_scores->ne[2]))); // [n_expert_groups, 1]
+#else
+        // Replace top_k(2) with argmax due to backend limitations, ideally we should use something like argmax2 instead
+        ggml_tensor * group_scores = ggml_reshape_2d(ctx0, ggml_argmax(ctx0, selection_groups), 1, selection_groups->ne[1]); // [1, n_expert_groups]
+        group_scores = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, selection_groups, 1, selection_groups->ne[0], selection_groups->ne[1]), group_scores); // [1, 1, n_expert_groups]
+
+        // get top n_group_used expert groups
+        group_scores = ggml_transpose(ctx0, ggml_reshape_2d(ctx0, group_scores, group_scores->ne[1], group_scores->ne[2])); // [n_expert_groups, 1]
+#endif
         ggml_tensor * expert_groups = ggml_top_k(ctx0, ggml_cont(ctx0, group_scores), hparams.n_group_used); // [n_group_used, 1]
         cb(expert_groups->src[0], "ffn_moe_group_argsort", il);
         cb(expert_groups, "ffn_moe_group_topk", il);
