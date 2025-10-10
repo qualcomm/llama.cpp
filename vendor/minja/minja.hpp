@@ -1313,7 +1313,7 @@ static bool in(const Value & value, const Value & container) {
   return (((container.is_array() || container.is_object()) && container.contains(value)) ||
       (value.is_string() && container.is_string() &&
         container.to_str().find(value.to_str()) != std::string::npos));
-};
+}
 
 class BinaryOpExpr : public Expression {
 public:
