@@ -1586,12 +1586,19 @@ struct server_prompt_cache {
         }
 
         if (limit_tokens > 0) {
-            while (states.size() > 1 && n_tokens() > limit_tokens) {
+            // average size per token
+            const float size_per_token = std::max<float>(1.0f, float(size()) / (std::max<size_t>(1, n_tokens())));
+
+            // dynamically increase the token limit if it can fit in the memory limit
+            const size_t limit_tokens_cur = limit_size > 0 ? std::max<size_t>(limit_tokens, limit_size/size_per_token) : limit_tokens;
+
+            while (states.size() > 1 && n_tokens() > limit_tokens_cur) {
                 if (states.empty()) {
                     break;
                 }
 
-                SRV_WRN(" - cache token limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
+                SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
+                        limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
 
                 states.pop_front();
             }
@@ -1601,7 +1608,8 @@ struct server_prompt_cache {
                 states.size(), size() / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0), limit_tokens);
 
         for (const auto & state : states) {
-            SRV_WRN("   - prompt %p: %7d tokens, checkpoints: %2zu, %9.3f MiB\n", (const void *)&state, state.n_tokens(), state.checkpoints.size(), state.size() / (1024.0 * 1024.0));
+            SRV_WRN("   - prompt %p: %7d tokens, checkpoints: %2zu, %9.3f MiB\n",
+                    (const void *)&state, state.n_tokens(), state.checkpoints.size(), state.size() / (1024.0 * 1024.0));
         }
     }
 };
