@@ -432,7 +432,7 @@ kernel void kernel_rope_multi_f32(
                 }
             } else {
                 if (sector < sections.s0) {
-                theta_base = pos[i2];
+                    theta_base = pos[i2];
                 }
                 else if (sector >= sections.s0 && sector < sec_w) {
                     theta_base = pos[i2 + ne2 * 1];
@@ -543,7 +543,7 @@ kernel void kernel_rope_multi_f16(
                 }
             } else {
                 if (sector < sections.s0) {
-                theta_base = pos[i2];
+                    theta_base = pos[i2];
                 }
                 else if (sector >= sections.s0 && sector < sec_w) {
                     theta_base = pos[i2 + ne2 * 1];
