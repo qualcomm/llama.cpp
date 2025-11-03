@@ -45,18 +45,26 @@ The llama.cpp OpenCL backend is designed to enable llama.cpp on **Qualcomm Adren
 |:----------------------:|:--------------------------:|
 | Q4_0                   | Support                    |
 | Q6_K                   | Support, but not optimized |
+| Q8_0                   | Support                    |
+| MXFP4                  | Support                    |
 
 ## Model Preparation
 
-You can refer to the general [*Prepare and Quantize*](README.md#prepare-and-quantize) guide for model prepration.
+You can refer to the general [llama-quantize tool](tools/quantize/README.md) for steps to convert a model in Hugging Face safetensor format to GGUF with quantization.
 
-Currently we support `Q4_0` quantization and have optimize for it. To achieve best performance on Adreno GPU, add `--pure` to `llama-quantize`. For example,
+Currently we support `Q4_0` quantization and have optimized for it. To achieve best performance on Adreno GPU, add `--pure` to `llama-quantize`. For example,
 
 ```sh
 ./llama-quantize --pure ggml-model-qwen2.5-3b-f16.gguf ggml-model-qwen-3b-Q4_0.gguf Q4_0
 ```
 
 Since `Q6_K` is also supported, `Q4_0` quantization without `--pure` will also work. However, the performance will be worse compared to pure `Q4_0` quantization.
+
+### MXFP4 Models
+
+OpenAI gpt-oss models are in MXFP4. The quantized model will be in MXFP4_MOE, a mixture of MXFP4 and Q8_0.
+For this quantization, there is no need to specify `--pure`.
+For gpt-oss-20b model, you can directly download a quantized GGUF file in MXFP4 from Hugging Face.
 
 ## CMake Options
 
@@ -146,9 +154,12 @@ A Snapdragon X Elite device with Windows 11 Arm64 is used. Make sure the followi
 * Ninja
 * Visual Studio 2022
 * Powershell 7
+* Python
 
 Visual Studio provides necessary headers and libraries although it is not directly used for building.
 Alternatively, Visual Studio Build Tools can be installed instead of the full Visual Studio.
+
+> Note that building using Visual Studio's cl compiler is not supported. Clang must be used. Clang depends on libraries provided by Visual Studio to work. Therefore, Visual Studio must be installed. Alternatively, Visual Studio Build Tools can be installed instead of the full Visual Studio.
 
 Powershell 7 is used for the following commands.
 If an older version of Powershell is used, these commands may not work as they are.
@@ -201,7 +212,9 @@ ninja
 
 ## Known Issues
 
-- Currently OpenCL backend does not work on Adreno 6xx GPUs.
+- Flash attention does not always improve performance. Disable it for models above 3B.
+- Currently OpenCL backend works on A6xx GPUs with recent drivers and compilers (usually found in IoT platforms).
+  However, it does not work on A6xx GPUs found in phones with old drivers and compilers.
 
 ## TODO
 
