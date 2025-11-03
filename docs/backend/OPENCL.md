@@ -60,11 +60,16 @@ Currently we support `Q4_0` quantization and have optimized for it. To achieve b
 
 Since `Q6_K` is also supported, `Q4_0` quantization without `--pure` will also work. However, the performance will be worse compared to pure `Q4_0` quantization.
 
-### MXFP4 Models
+### `MXFP4` MoE Models
 
-OpenAI gpt-oss models are in MXFP4. The quantized model will be in MXFP4_MOE, a mixture of MXFP4 and Q8_0.
+OpenAI gpt-oss models are MoE models in `MXFP4`. The quantized model will be in `MXFP4_MOE`, a mixture of `MXFP4` and `Q8_0`.
 For this quantization, there is no need to specify `--pure`.
-For gpt-oss-20b model, you can directly download a quantized GGUF file in MXFP4 from Hugging Face.
+For gpt-oss-20b model, you can directly [download](https://huggingface.co/ggml-org/gpt-oss-20b-GGUF) the quantized GGUF file in `MXFP4_MOE` from Hugging Face.
+
+Although it is possible to quantize gpt-oss-20b model in pure `Q4_0`, it is not recommendedsince `MXFP4` has been optimized for MoE while `Q4_0` is not.
+Hence, using the default `MXFP4_MOE` quantization will give better performance compared to pure `Q4_0` quantization for this model.
+
+However, note that the `Q4_0` model found [here](https://huggingface.co/unsloth/gpt-oss-20b-GGUF/blob/main/gpt-oss-20b-Q4_0.gguf) is a mixture of `Q4_0`, `Q8_0` and `MXFP4` and gives better performance than `MXFP4_MOE` quantization.
 
 ## CMake Options
 
