@@ -50,7 +50,7 @@ The llama.cpp OpenCL backend is designed to enable llama.cpp on **Qualcomm Adren
 
 ## Model Preparation
 
-You can refer to the general [llama-quantize tool](tools/quantize/README.md) for steps to convert a model in Hugging Face safetensor format to GGUF with quantization.
+You can refer to the general [llama-quantize tool](/tools/quantize/README.md) for steps to convert a model in Hugging Face safetensor format to GGUF with quantization.
 
 Currently we support `Q4_0` quantization and have optimized for it. To achieve best performance on Adreno GPU, add `--pure` to `llama-quantize`. For example,
 
