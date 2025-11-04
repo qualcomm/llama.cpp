@@ -53,6 +53,36 @@
 
 bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor);
 
+// See https://gmplib.org/~tege/divcnst-pldi94.pdf figure 4.1.
+// Precompute mp (m' in the paper) and L such that division
+// can be computed using a multiply (high 32b of 64b result)
+// and a shift:
+//
+// n/d = (mulhi(n, mp) + n) >> L;
+struct fastdiv_vals {
+    uint32_t mp;
+    uint32_t L;
+    uint32_t d;
+};
+static_assert(sizeof(fastdiv_vals) == 12, "fastdiv_vals size incorrect");
+
+static fastdiv_vals init_fastdiv_values(uint64_t d_64) {
+    GGML_ASSERT(d_64 != 0);
+    GGML_ASSERT(d_64 <= std::numeric_limits<uint32_t>::max());
+
+    uint32_t d = (uint32_t)d_64;
+
+    // compute L = ceil(log2(d));
+    uint32_t L = 0;
+    while (L < 32 && (uint32_t{ 1 } << L) < d) {
+        L++;
+    }
+
+    uint32_t mp = (uint32_t) ((uint64_t{ 1 } << 32) * ((uint64_t{ 1 } << L) - d) / d + 1);
+    // pack divisor as well to reduce error surface
+    return { mp, L, d };
+}
+
 enum GPU_FAMILY {
     ADRENO,
     INTEL,
@@ -7078,6 +7108,10 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 int batch_stride_b = ne10*ne11;
                 int batch_stride_d = ne0*ne1;
 
+                fastdiv_vals ne12_ = init_fastdiv_values(ne12);
+                fastdiv_vals r2_   = init_fastdiv_values(r2);
+                fastdiv_vals r3_   = init_fastdiv_values(r3);
+
                 CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0_q8_0->q));
                 CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_mem),   &extra0_q8_0->d));
                 CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),   &extra1->data_device));
@@ -7088,15 +7122,15 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 CL_CHECK(clSetKernelArg(kernel,  7, sizeof(int),      &ne01));
                 CL_CHECK(clSetKernelArg(kernel,  8, sizeof(int),      &ne02));
                 CL_CHECK(clSetKernelArg(kernel,  9, sizeof(int),      &ne11));
-                CL_CHECK(clSetKernelArg(kernel, 10, sizeof(int),      &ne12));
+                CL_CHECK(clSetKernelArg(kernel, 10, sizeof(fastdiv_vals), &ne12_));
                 CL_CHECK(clSetKernelArg(kernel, 11, sizeof(int),      &ne10)); // stride_a
                 CL_CHECK(clSetKernelArg(kernel, 12, sizeof(int),      &ne10)); // stride_b
                 CL_CHECK(clSetKernelArg(kernel, 13, sizeof(int),      &ne01)); // stride_d
                 CL_CHECK(clSetKernelArg(kernel, 14, sizeof(int),      &batch_stride_a));
                 CL_CHECK(clSetKernelArg(kernel, 15, sizeof(int),      &batch_stride_b));
                 CL_CHECK(clSetKernelArg(kernel, 16, sizeof(int),      &batch_stride_d));
-                CL_CHECK(clSetKernelArg(kernel, 17, sizeof(int),      &r2));
-                CL_CHECK(clSetKernelArg(kernel, 18, sizeof(int),      &r3));
+                CL_CHECK(clSetKernelArg(kernel, 17, sizeof(fastdiv_vals), &r2_));
+                CL_CHECK(clSetKernelArg(kernel, 18, sizeof(fastdiv_vals), &r3_));
 
                 // 64 is block tile size BM and BN - change here when BM and BN in the kernel are changed.
                 size_t global_work_size[] = {(size_t)(CEIL_DIV(ne01, 64)*nth0), (size_t)(CEIL_DIV(ne11, 64)), (size_t)ne12*ne13};
