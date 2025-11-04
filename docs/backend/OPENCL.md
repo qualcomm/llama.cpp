@@ -39,6 +39,9 @@ The llama.cpp OpenCL backend is designed to enable llama.cpp on **Qualcomm Adren
 | Adreno 830 (Snapdragon 8 Elite)      | Support |
 | Adreno X85 (Snapdragon X Elite)      | Support |
 
+> A6x GPUs with a recent driver and compiler are supported; they are usually found in IoT platforms.
+However, A6x GPUs in phones are likely not supported due to the outdated driver and compiler.
+
 ## DataType Supports
 
 | DataType               | Status                     |
@@ -52,7 +55,7 @@ The llama.cpp OpenCL backend is designed to enable llama.cpp on **Qualcomm Adren
 
 You can refer to the general [llama-quantize tool](/tools/quantize/README.md) for steps to convert a model in Hugging Face safetensor format to GGUF with quantization.
 
-Currently we support `Q4_0` quantization and have optimized for it. To achieve best performance on Adreno GPU, add `--pure` to `llama-quantize`. For example,
+Currently we support `Q4_0` quantization and have optimized for it. To achieve best performance on Adreno GPU, add `--pure` to `llama-quantize` (i.e., make all weights in `Q4_0`). For example,
 
 ```sh
 ./llama-quantize --pure ggml-model-qwen2.5-3b-f16.gguf ggml-model-qwen-3b-Q4_0.gguf Q4_0
@@ -66,10 +69,10 @@ OpenAI gpt-oss models are MoE models in `MXFP4`. The quantized model will be in 
 For this quantization, there is no need to specify `--pure`.
 For gpt-oss-20b model, you can directly [download](https://huggingface.co/ggml-org/gpt-oss-20b-GGUF) the quantized GGUF file in `MXFP4_MOE` from Hugging Face.
 
-Although it is possible to quantize gpt-oss-20b model in pure `Q4_0`, it is not recommendedsince `MXFP4` has been optimized for MoE while `Q4_0` is not.
-Hence, using the default `MXFP4_MOE` quantization will give better performance compared to pure `Q4_0` quantization for this model.
+Although it is possible to quantize gpt-oss-20b model in pure `Q4_0` (all weights in `Q4_0`), it is not recommended since `MXFP4` has been optimized for MoE while `Q4_0` is not. In addition, accuracy should degrade with such pure `Q4_0` quantization.
+Hence, using the default `MXFP4_MOE` quantization (see the link above) is recommended for this model.
 
-However, note that the `Q4_0` model found [here](https://huggingface.co/unsloth/gpt-oss-20b-GGUF/blob/main/gpt-oss-20b-Q4_0.gguf) is a mixture of `Q4_0`, `Q8_0` and `MXFP4` and gives better performance than `MXFP4_MOE` quantization.
+> Note that the `Q4_0` model found [here](https://huggingface.co/unsloth/gpt-oss-20b-GGUF/blob/main/gpt-oss-20b-Q4_0.gguf) is a mixture of `Q4_0`, `Q8_0` and `MXFP4` and gives better performance than `MXFP4_MOE` quantization.
 
 ## CMake Options
 
@@ -217,7 +220,7 @@ ninja
 
 ## Known Issues
 
-- Flash attention does not always improve performance. Disable it for models above 3B.
+- Flash attention does not always improve performance.
 - Currently OpenCL backend works on A6xx GPUs with recent drivers and compilers (usually found in IoT platforms).
   However, it does not work on A6xx GPUs found in phones with old drivers and compilers.
 
@@ -225,3 +228,4 @@ ninja
 
 - Optimization for Q6_K
 - Support and optimization for Q4_K
+- Improve flash attention
