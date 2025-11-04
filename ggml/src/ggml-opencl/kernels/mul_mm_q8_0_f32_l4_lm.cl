@@ -10,12 +10,12 @@
 #define TN 8
 
 // v = { mp, L, d }
-inline uint fastdiv(uint n, uint3 v) {
+inline uint fastdiv(uint n, uint4 v) {
     uint msbs;
     msbs = mul_hi(n, v.s0);
     return (msbs + n) >> v.s1;
 }
-inline uint fastmod(uint n, uint3 v) {
+inline uint fastmod(uint n, uint4 v) {
     uint q = fastdiv(n, v);
     return n - q * v.s2;
 }
@@ -32,7 +32,7 @@ kernel void kernel_mul_mm_q8_0_f32_l4_lm(
     int ne01,
     int ne02,
     int ne11,
-    uint3 ne12,
+    uint4 ne12,
 
     int stride_a,
     int stride_b,
@@ -42,8 +42,8 @@ kernel void kernel_mul_mm_q8_0_f32_l4_lm(
     int batch_stride_b,
     int batch_stride_d,
 
-    uint3 r2,
-    uint3 r3
+    uint4 r2,
+    uint4 r3
 ) {
     src1 = (global float4*)((global char*)src1 + offset1);
     dst  = (global float *)((global char*)dst  + offsetd);

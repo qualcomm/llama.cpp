@@ -63,8 +63,9 @@ struct fastdiv_vals {
     uint32_t mp;
     uint32_t L;
     uint32_t d;
+    uint32_t pad;
 };
-static_assert(sizeof(fastdiv_vals) == 12, "fastdiv_vals size incorrect");
+static_assert(sizeof(fastdiv_vals) == 16, "fastdiv_vals size incorrect");
 
 static fastdiv_vals init_fastdiv_values(uint64_t d_64) {
     GGML_ASSERT(d_64 != 0);
@@ -80,7 +81,7 @@ static fastdiv_vals init_fastdiv_values(uint64_t d_64) {
 
     uint32_t mp = (uint32_t) ((uint64_t{ 1 } << 32) * ((uint64_t{ 1 } << L) - d) / d + 1);
     // pack divisor as well to reduce error surface
-    return { mp, L, d };
+    return { mp, L, d, 0 };
 }
 
 enum GPU_FAMILY {
