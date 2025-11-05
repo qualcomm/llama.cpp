@@ -9,17 +9,6 @@
 #define TM 4
 #define TN 8
 
-// v = { mp, L, d }
-inline uint fastdiv(uint n, uint4 v) {
-    uint msbs;
-    msbs = mul_hi(n, v.s0);
-    return (msbs + n) >> v.s1;
-}
-inline uint fastmod(uint n, uint4 v) {
-    uint q = fastdiv(n, v);
-    return n - q * v.s2;
-}
-
 kernel void kernel_mul_mm_q8_0_f32_l4_lm(
     global char4  * src0_q,
     global half   * src0_d,
@@ -32,7 +21,7 @@ kernel void kernel_mul_mm_q8_0_f32_l4_lm(
     int ne01,
     int ne02,
     int ne11,
-    uint4 ne12,
+    int ne12,
 
     int stride_a,
     int stride_b,
@@ -42,8 +31,8 @@ kernel void kernel_mul_mm_q8_0_f32_l4_lm(
     int batch_stride_b,
     int batch_stride_d,
 
-    uint4 r2,
-    uint4 r3
+    int r2,
+    int r3
 ) {
     src1 = (global float4*)((global char*)src1 + offset1);
     dst  = (global float *)((global char*)dst  + offsetd);
@@ -53,15 +42,11 @@ kernel void kernel_mul_mm_q8_0_f32_l4_lm(
 
     const int batch_idx = get_global_id(2);
 
-    //const int i13 = batch_idx / ne12;
-    //const int i12 = batch_idx % ne12;
-    const int i13 = fastdiv(batch_idx, ne12);
-    const int i12 = fastmod(batch_idx, ne12);
+    const int i13 = batch_idx / ne12;
+    const int i12 = batch_idx % ne12;
 
-    //const int i03 = i13 / r3;
-    //const int i02 = i12 / r2;
-    const int i03 = fastdiv(i13, r3);
-    const int i02 = fastmod(i12, r2);
+    const int i03 = i13 / r3;
+    const int i02 = i12 / r2;
 
     const int batch_idx_a = i03 * ne02 + i02;
 

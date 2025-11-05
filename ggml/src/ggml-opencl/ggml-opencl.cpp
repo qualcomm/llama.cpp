@@ -7112,10 +7112,6 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 int batch_stride_b = ne10*ne11;
                 int batch_stride_d = ne0*ne1;
 
-                fastdiv_vals ne12_ = init_fastdiv_values(ne12);
-                fastdiv_vals r2_   = init_fastdiv_values(r2);
-                fastdiv_vals r3_   = init_fastdiv_values(r3);
-
                 CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0_q8_0->q));
                 CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_mem),   &extra0_q8_0->d));
                 CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),   &extra1->data_device));
@@ -7126,15 +7122,15 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 CL_CHECK(clSetKernelArg(kernel,  7, sizeof(int),      &ne01));
                 CL_CHECK(clSetKernelArg(kernel,  8, sizeof(int),      &ne02));
                 CL_CHECK(clSetKernelArg(kernel,  9, sizeof(int),      &ne11));
-                CL_CHECK(clSetKernelArg(kernel, 10, sizeof(fastdiv_vals), &ne12_));
+                CL_CHECK(clSetKernelArg(kernel, 10, sizeof(int),      &ne12));
                 CL_CHECK(clSetKernelArg(kernel, 11, sizeof(int),      &ne10)); // stride_a
                 CL_CHECK(clSetKernelArg(kernel, 12, sizeof(int),      &ne10)); // stride_b
                 CL_CHECK(clSetKernelArg(kernel, 13, sizeof(int),      &ne01)); // stride_d
                 CL_CHECK(clSetKernelArg(kernel, 14, sizeof(int),      &batch_stride_a));
                 CL_CHECK(clSetKernelArg(kernel, 15, sizeof(int),      &batch_stride_b));
                 CL_CHECK(clSetKernelArg(kernel, 16, sizeof(int),      &batch_stride_d));
-                CL_CHECK(clSetKernelArg(kernel, 17, sizeof(fastdiv_vals), &r2_));
-                CL_CHECK(clSetKernelArg(kernel, 18, sizeof(fastdiv_vals), &r3_));
+                CL_CHECK(clSetKernelArg(kernel, 17, sizeof(int),      &r2));
+                CL_CHECK(clSetKernelArg(kernel, 18, sizeof(int),      &r3));
 
                 // 64 is block tile size BM and BN - change here when BM and BN in the kernel are changed.
                 size_t global_work_size[] = {(size_t)(CEIL_DIV(ne01, 64)*nth0), (size_t)(CEIL_DIV(ne11, 64)), (size_t)ne12*ne13};
