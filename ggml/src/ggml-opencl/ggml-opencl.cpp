@@ -6789,10 +6789,6 @@ static void ggml_cl_mul_mat_kq_kqv_adreno(ggml_backend_t backend, const ggml_ten
     CL_CHECK(clReleaseMemObject(A_sub_buffer));
     CL_CHECK(clReleaseMemObject(B_sub_buffer));
     CL_CHECK(clReleaseMemObject(D_sub_buffer));
-    // <--------------------------------------------> //
-
-    return;
-
 }
 
 static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
