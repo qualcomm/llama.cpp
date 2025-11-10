@@ -2884,16 +2884,9 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
 
-        // skip NOPs
-        switch (node->op) {
-        case GGML_OP_NONE:
-        case GGML_OP_RESHAPE:
-        case GGML_OP_VIEW:
-        case GGML_OP_PERMUTE:
-        case GGML_OP_TRANSPOSE:
+        if (ggml_op_is_empty(node->op)) {
+            // skip NOPs
             continue;
-        default:
-            break;
         }
 
         ggml_compute_forward(&params, node);
