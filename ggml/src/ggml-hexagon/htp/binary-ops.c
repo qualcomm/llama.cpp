@@ -111,18 +111,17 @@ static void binary_job_f32_per_thread(struct htp_ops_context * octx,
 
     uint8_t * restrict spad_data_th = spad_data + (ith * src0_row_size);
 
-    const uint32_t nr0 = ne00 / ne10;
-
     const uint8_t * restrict src0_ptr = (const uint8_t *) src0->data + (src0_start_row * src0_row_size);
     uint8_t * restrict dst_ptr        = (uint8_t *) dst->data + (src0_start_row * dst_row_size);
 
     const uint8_t * restrict data_src1 = (const uint8_t *) src1->data;
 
-    const uint32_t ne0201 = ne02 * ne01;
+    const uint32_t ne02_ne01 = ne02 * ne01;
+
     for (uint32_t ir = src0_start_row; ir < src0_end_row; ir++) {
         const uint32_t i03 = fastdiv(ir, &octx->src0_div21);
-        const uint32_t i02 = fastdiv(ir - i03 * ne0201, &octx->src0_div1);
-        const uint32_t i01 = (ir - i03 * ne0201 - i02 * ne01);
+        const uint32_t i02 = fastdiv(ir - i03 * ne02_ne01, &octx->src0_div1);
+        const uint32_t i01 = (ir - i03 * ne02_ne01 - i02 * ne01);
 
         const uint32_t i13 = fastmodulo(i03, ne13, &octx->src1_div3);
         const uint32_t i12 = fastmodulo(i02, ne12, &octx->src1_div2);
@@ -137,6 +136,7 @@ static void binary_job_f32_per_thread(struct htp_ops_context * octx,
             }
         }
 
+        const uint32_t nr0 = ne00 / ne10;
         if (nr0 > 1) {
             if ((1 == is_aligned) && (nr0 == ne00)) {
                 hvx_bcast_fp32_a(spad_data_th, *(float *) src1_ptr, nr0);
@@ -172,7 +172,6 @@ static void binary_add_id_job_f32_per_thread(struct htp_ops_context * octx,
     const size_t src1_row_size = nb11;
     const size_t dst_row_size  = nb1;
 
-    const uint32_t ne02_ne01  = ne02 * ne01;
     const uint32_t src0_nrows = ne01 * ne02 * ne03;  // src0 rows
 
     const uint32_t src0_start_row = src0_nrows_per_thread * ith;
@@ -195,10 +194,11 @@ static void binary_add_id_job_f32_per_thread(struct htp_ops_context * octx,
     const uint8_t * restrict data_src1 = (const uint8_t *) src1->data;
     uint8_t * restrict data_dst        = (uint8_t *) dst->data;
 
+    const uint32_t ne02_ne01  = ne02 * ne01;
     for (uint32_t ir = src0_start_row; ir < src0_end_row; ir++) {
         // src0 indices
-        const uint32_t i03 = ir / ne02_ne01;
-        const uint32_t i02 = (ir - i03 * ne02_ne01) / ne01;
+        const uint32_t i03 = fastdiv(ir, &octx->src0_div21);
+        const uint32_t i02 = fastdiv(ir - i03 * ne02_ne01, &octx->src0_div1);
         const uint32_t i01 = (ir - i03 * ne02_ne01 - i02 * ne01);
 
         // src1 indices
