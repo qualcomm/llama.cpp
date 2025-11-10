@@ -3158,18 +3158,7 @@ static inline bool op_reuse_src1(const ggml_tensor * op1, const ggml_tensor * op
 
 static inline bool is_compute_op(ggml_tensor *node)
 {
-    switch (node->op) {
-        case GGML_OP_NONE:
-        case GGML_OP_RESHAPE:
-        case GGML_OP_VIEW:
-        case GGML_OP_PERMUTE:
-        case GGML_OP_TRANSPOSE:
-            return false;
-        default:
-            break;
-    }
-
-    return ggml_nrows(node) != 0;
+    return !(ggml_op_is_empty(node->op) || ggml_is_empty(node));
 }
 
 // scan the graph and figure out last compute op index
