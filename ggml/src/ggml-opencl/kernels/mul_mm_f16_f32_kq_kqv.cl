@@ -8,9 +8,9 @@
 
 
 inline float16 mm_load_a(
-    image1d_buffer_t matrix_A, 
-    uint subMatrixAStartInElements, 
-    int nb01, 
+    image1d_buffer_t matrix_A,
+    uint subMatrixAStartInElements,
+    int nb01,
     int line_stride_matrix_A_in_bytes
 ) {
     __private float8 regA;
@@ -29,7 +29,7 @@ inline float16 mm_load_a(
 }
 
 inline float4 alu_32(
-    float16 regA, 
+    float16 regA,
     __local float4* matrix_B_vec
 ) {
 
@@ -55,12 +55,12 @@ inline float4 alu_32(
     rC += regA.sb  * matrix_B_vec[i + 18];
     rC += regA.se  * matrix_B_vec[i + 3];
     rC += regA.sf  * matrix_B_vec[i + 19];
-   
+
     return rC;
 }
 
 inline float16 alu_16(
-    float16 regA, 
+    float16 regA,
     __local float* matrix_B_local
 ) {
     float16 out;
@@ -83,7 +83,7 @@ inline void mm_mad(
     float16* regC1_ptr
 ) {
     int offset = b_localOffsetInWords + get_sub_group_id() * 256;
-   
+
     matrix_B_local[offset + LM_FIRST_256B] = regB.s0;
     matrix_B_local[offset + LM_SECOND_256B] = regB.s1;
     matrix_B_local[offset + LM_THIRD_256B] = regB.s2;
@@ -102,11 +102,11 @@ inline void mm_mad(
 }
 
 inline void mm_store_c_N(
-    __write_only image1d_buffer_t matrix_C, 
-    float16 regC0, 
-    float16 regC1, 
-    uint subMatrixCStartInElements, 
-    int line_stride_matrix_C_in_bytes, 
+    __write_only image1d_buffer_t matrix_C,
+    float16 regC0,
+    float16 regC1,
+    uint subMatrixCStartInElements,
+    int line_stride_matrix_C_in_bytes,
     int mask
 ) {
     size_t sub_block_id_m = get_local_id(0);
@@ -145,7 +145,7 @@ inline void mm_store_c_N(
     uint c_coordInWords_29 = c_coordInWords_0 + 29 * strideInWords;
     uint c_coordInWords_30 = c_coordInWords_0 + 30 * strideInWords;
     uint c_coordInWords_31 = c_coordInWords_0 + 31 * strideInWords;
-    
+
     if (mask > 0)  { write_imagef(matrix_C, c_coordInWords_0, regC0.s0);  }
     if (mask > 1)  { write_imagef(matrix_C, c_coordInWords_1, regC0.s1);  }
     if (mask > 2)  { write_imagef(matrix_C, c_coordInWords_2, regC0.s2);  }
@@ -200,10 +200,10 @@ __kernel void mul_mm_f16_f32_kq(
         int nb01
 ) {
 
-    uint block_id_m = get_global_id(1);                              
-    uint block_id_n = get_global_id(2) % ((N+TILESIZE_N-1)/TILESIZE_N);              
+    uint block_id_m = get_global_id(1);
+    uint block_id_n = get_global_id(2) % ((N+TILESIZE_N-1)/TILESIZE_N);
     uint block_id_d = get_global_id(2) / ((N+TILESIZE_N-1)/TILESIZE_N);
-   
+
     __private float16  regA;
     __private float8   regB;
     __private float16 regC0;
@@ -227,7 +227,7 @@ __kernel void mul_mm_f16_f32_kq(
     const uint strideAinElements = line_stride_matrix_A_in_bytes / 2;
     const uint strideBinElements = line_stride_matrix_B_in_bytes / 4;
 
-    size_t sub_block_id_m = get_local_id(0); 
+    size_t sub_block_id_m = get_local_id(0);
 
     uint b_localOffsetInWords = (sub_block_id_m/16)*16
                            + ((((sub_block_id_m)>>0)&1)<<2)
@@ -235,16 +235,16 @@ __kernel void mul_mm_f16_f32_kq(
                            + ((((sub_block_id_m)>>2)&1)<<0)
                            + ((((sub_block_id_m)>>3)&1)<<1);
 
-    uint2 b_globalOffsetInWords_xy = {((sub_block_id_m%4)*4), (sub_block_id_m>>2)}; 
+    uint2 b_globalOffsetInWords_xy = {((sub_block_id_m%4)*4), (sub_block_id_m>>2)};
     uint b_globalOffsetInWords00, b_globalOffsetInWords16;
-#ifdef KQV    
+#ifdef KQV
     b_globalOffsetInWords00 = b_globalOffsetInWords_xy.x + b_globalOffsetInWords_xy.y*K;
-    b_globalOffsetInWords16 = b_globalOffsetInWords00 + (16 * K); 
+    b_globalOffsetInWords16 = b_globalOffsetInWords00 + (16 * K);
     uint subMatrixAStartInElements = depth_A * strideAinElements + col * nb01 / 2;
     uint subMatrixBStartInElements = depth_B * strideBinElements + row * K;
 #else
     b_globalOffsetInWords00 = b_globalOffsetInWords_xy.x + b_globalOffsetInWords_xy.y*line_stride_matrix_B_in_bytes/4;
-    b_globalOffsetInWords16 = b_globalOffsetInWords00 + (16 * line_stride_matrix_B_in_bytes/4); 
+    b_globalOffsetInWords16 = b_globalOffsetInWords00 + (16 * line_stride_matrix_B_in_bytes/4);
     uint subMatrixAStartInElements = col * strideAinElements + depth_A * K;
     uint subMatrixBStartInElements = row * strideBinElements + depth_B * K;
 #endif
@@ -254,7 +254,7 @@ __kernel void mul_mm_f16_f32_kq(
     for (uint step=0; step < K; step+=TILESIZE_K) {
         size_t sub_block_id_m = get_local_id(0);
         regA = mm_load_a(matrix_A, subMatrixAStartInElements, nb01, line_stride_matrix_A_in_bytes);
-      
+
         uint b_coordInWords00 = subMatrixBStartInElements + b_globalOffsetInWords00;
         uint b_coordInWords16 = subMatrixBStartInElements + b_globalOffsetInWords16;
 
@@ -270,3 +270,4 @@ __kernel void mul_mm_f16_f32_kq(
     uint subMatrixCStartInElements = depth_B * N * M + row * M + col;
     mm_store_c_N(matrix_C, regC0, regC1, subMatrixCStartInElements, line_stride_matrix_C_in_bytes, (N-block_id_n*32));
 }
+

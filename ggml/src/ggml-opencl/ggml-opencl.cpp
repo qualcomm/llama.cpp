@@ -6692,7 +6692,7 @@ static void ggml_cl_mul_mat_kq_kqv_adreno(ggml_backend_t backend, const ggml_ten
     int M = ne01;
     int N = ne1;
     int K = ne00;
-    
+
     if (nb01 > nb02) {
         // KQ
         kernel = backend_ctx->kernel_mul_mm_f16_f32_kq;
