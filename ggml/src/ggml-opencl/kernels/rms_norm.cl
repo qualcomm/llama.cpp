@@ -134,6 +134,11 @@ kernel void kernel_rms_norm_mul(
     src1 = src1 + offset1;
     dst  = dst  + offsetd;
 
+    // The size of sum is sizeof(float)*subgroup_size.
+    // Each subgroup writes its partial sum to this array.
+    // So the number of subgroups per workgroup for this kernel cannot exceed the subgroup size.
+    // This is generally true -
+    // for subgroup size 64, workgroup size should be less than 4096 (the max is usually 1024).
     if (get_sub_group_id() == 0) {
         sum[get_sub_group_local_id()] = 0.0f;
     }
