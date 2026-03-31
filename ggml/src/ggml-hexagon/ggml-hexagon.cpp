@@ -1977,7 +1977,7 @@ static bool ggml_hexagon_supported_unary(const struct ggml_hexagon_session * ses
     }
 
     // TODO: add support for non-contigiuos tensors
-    if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(dst)) {
+    if (!ggml_is_contiguous(dst)) {
         return false;
     }
 
@@ -2148,7 +2148,7 @@ static bool ggml_hexagon_supported_rope(const struct ggml_hexagon_session * sess
 
     int mode = op_params[2];
 
-    if ((mode & GGML_ROPE_TYPE_MROPE) || (mode & GGML_ROPE_TYPE_VISION)) {
+    if ((mode & GGML_ROPE_TYPE_MROPE) == GGML_ROPE_TYPE_MROPE) {
         return false;
     }
     if (mode & 1) {
