@@ -1365,6 +1365,7 @@ static void htp_packet_callback(dspqueue_t queue, int error, void * context) {
             case HTP_OP_UNARY_EXP:
             case HTP_OP_UNARY_SIGMOID:
             case HTP_OP_UNARY_SOFTPLUS:
+            case HTP_OP_L2_NORM:
                 if (n_bufs != 2) {
                     FARF(ERROR, "Bad unary-req buffer list");
                     continue;

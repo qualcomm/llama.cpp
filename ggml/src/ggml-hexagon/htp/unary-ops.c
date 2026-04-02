@@ -39,6 +39,14 @@ struct htp_unary_context {
     uint32_t                  src0_nrows;
     uint32_t                  src0_nrows_per_thread;
     uint32_t                  nc;
+
+    // Non-contiguous src0 support
+    int                       src0_nc;  // non-zero if src0 has non-standard strides
+    uint32_t                  ne01;     // src0 ne[1] (rows per slice)
+    uint32_t                  ne02;     // src0 ne[2] (slices per batch)
+    uint32_t                  nb01;     // src0 nb[1] (row stride in bytes)
+    uint32_t                  nb02;     // src0 nb[2] (slice stride in bytes)
+    uint32_t                  nb03;     // src0 nb[3] (batch stride in bytes)
 };
 
 #define htp_unary_preamble            \
@@ -237,6 +245,82 @@ static void softplus_f32(const float * restrict src,
     }
 }
 
+// Compute the byte offset of row 'ir' in a potentially non-contiguous src0 tensor.
+// For contiguous tensors this is equivalent to ir * nb1.
+static inline size_t unary_src0_row_offset(
+    uint32_t ir,
+    uint32_t ne1, uint32_t ne2,
+    uint32_t nb1, uint32_t nb2, uint32_t nb3)
+{
+    uint32_t r3 = ir / (ne1 * ne2);
+    uint32_t r2 = (ir / ne1) % ne2;
+    uint32_t r1 = ir % ne1;
+    return (size_t)r3 * nb3 + (size_t)r2 * nb2 + (size_t)r1 * nb1;
+}
+
+static void hvx_fast_l2_norm_f32(const uint8_t * restrict src,
+                                 uint8_t * restrict dst,
+                                 uint8_t * restrict pad,
+                                 const int num_elems,
+                                 float     epsilon) {
+    const HVX_Vector * restrict v_src = (HVX_Vector *) src;
+    HVX_Vector * restrict v_dst       = (HVX_Vector *) dst;
+
+    HVX_Vector sum_v = Q6_V_vsplat_R(0x00000000);
+
+    int step_of_1 = num_elems >> 5;
+    #pragma unroll(4)
+    for (int i = 0; i < step_of_1; i++) {
+        HVX_Vector v1 = v_src[i];
+        sum_v         = Q6_Vqf32_vadd_Vqf32Vqf32(sum_v, Q6_Vqf32_vmpy_VsfVsf(v1, v1));
+    }
+
+    // Reduce QF32 sum to a scalar SF32 value, then compute scale in scalar float.
+    // Using scalar sqrtf avoids HVX rsqrt approximation error for all epsilon values
+    // (including large epsilon where the HVX approximation diverges significantly).
+    sum_v = hvx_vec_reduce_sum_f32(Q6_Vsf_equals_Vqf32(sum_v));
+    float __attribute__((aligned(128))) sum_buf[32];
+    *(HVX_Vector *)sum_buf = sum_v;
+    const float scale_scalar = 1.0f / sqrtf(sum_buf[0] + epsilon);
+
+    // Splat the scalar scale back into an HVX vector for the vectorised multiply pass
+    HVX_Vector scale_v = hvx_vec_splat_f32(scale_scalar);
+
+    #pragma unroll(4)
+    for (int i = 0; i < step_of_1; i++) {
+        HVX_Vector v1 = v_src[i];
+        v_dst[i]      = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(v1, scale_v));
+    }
+
+    // Handle tail elements (num_elems not a multiple of 32)
+    const int tail_start = step_of_1 * 32;
+    if (tail_start < num_elems) {
+        const float * src_f = (const float *) src;
+        float * dst_f = (float *) dst;
+        for (int i = tail_start; i < num_elems; i++) {
+            dst_f[i] = src_f[i] * scale_scalar;
+        }
+    }
+}
+
+static void l2_norm_f32(const float * restrict src,
+                        float * restrict dst,
+                        uint8_t * restrict spad,
+                        const uint32_t num_rows,
+                        const uint32_t row_elems,
+                        const size_t   row_size,
+                        int32_t *      op_params) {
+    float epsilon = 0.f;
+    memcpy(&epsilon, op_params, sizeof(float));
+
+    for (uint32_t ir = 0; ir < num_rows; ir++) {
+        const float * restrict src_f = (const float *)((const uint8_t *)src + (ir * row_size));
+        float * restrict dst_f       = (float *)((uint8_t *)dst + (ir * row_size));
+
+        hvx_fast_l2_norm_f32((const uint8_t *)src_f, (uint8_t *)dst_f, spad, row_elems, epsilon);
+    }
+}
+
 static void unary_job_f32_per_thread(unsigned int nth, unsigned int ith, void * data) {
     const struct htp_unary_context * uctx = (const struct htp_unary_context *) data;
     struct htp_ops_context * octx = uctx->octx;
@@ -285,21 +369,45 @@ static void unary_job_f32_per_thread(unsigned int nth, unsigned int ith, void * 
 
     dma_queue * dma_queue = octx->ctx->dma[ith];
 
-    for (uint32_t ir = src0_start_row, spad_idx = 0; ir < src0_end_row && spad_idx < 2; ir += BLOCK, spad_idx++) {
-        const uint32_t block_size = MIN(BLOCK, src0_end_row - ir);
+    {
+        uint32_t prime_ir = src0_start_row;
+        for (uint32_t spad_idx = 0; spad_idx < 2 && prime_ir < src0_end_row; spad_idx++) {
+            uint32_t block_size = MIN(BLOCK, src0_end_row - prime_ir);
+            if (uctx->src0_nc) {
+                block_size = MIN(block_size, uctx->ne01 - (prime_ir % uctx->ne01));
+            }
+            size_t src_offset = uctx->src0_nc
+                ? unary_src0_row_offset(prime_ir, uctx->ne01, uctx->ne02, uctx->nb01, uctx->nb02, uctx->nb03)
+                : (size_t)prime_ir * src0_row_size;
 
-        // Dummy DMA transation for sequencing (interleaving dst,src,dst,...)
-        dma_queue_push_vtcm_to_ddr(dma_queue,
-            dma_make_ptr(data_dst, dst_spad_data + (spad_idx * dst_spad_half_size)),
-            dst_row_size, dst_row_size_aligned, 0);
+            // Dummy DMA transaction for sequencing (interleaving dst,src,dst,...)
+            dma_queue_push_vtcm_to_ddr(dma_queue,
+                dma_make_ptr(data_dst, dst_spad_data + (spad_idx * dst_spad_half_size)),
+                dst_row_size, dst_row_size_aligned, 0);
 
-        dma_queue_push_ddr_to_vtcm(dma_queue,
-            dma_make_ptr(src0_spad_data + (spad_idx * src0_spad_half_size), data_src + (ir * src0_row_size)),
-            src0_row_size_aligned, src0_row_size, block_size);
+            dma_queue_push_ddr_to_vtcm(dma_queue,
+                dma_make_ptr(src0_spad_data + (spad_idx * src0_spad_half_size), data_src + src_offset),
+                src0_row_size_aligned, src0_row_size, block_size);
+
+            prime_ir += block_size;
+        }
     }
 
-    for (uint32_t ir = src0_start_row; ir < src0_end_row; ir += BLOCK) {
-        const uint32_t block_size = MIN(BLOCK, src0_end_row - ir);
+    uint32_t next_pref_ir = src0_start_row;
+    // Advance next_pref_ir past the two blocks already primed above
+    for (uint32_t spad_idx = 0; spad_idx < 2 && next_pref_ir < src0_end_row; spad_idx++) {
+        uint32_t bs = MIN(BLOCK, src0_end_row - next_pref_ir);
+        if (uctx->src0_nc) {
+            bs = MIN(bs, uctx->ne01 - (next_pref_ir % uctx->ne01));
+        }
+        next_pref_ir += bs;
+    }
+
+    for (uint32_t ir = src0_start_row; ir < src0_end_row; ) {
+        uint32_t block_size = MIN(BLOCK, src0_end_row - ir);
+        if (uctx->src0_nc) {
+            block_size = MIN(block_size, uctx->ne01 - (ir % uctx->ne01));
+        }
 
         float * dst_spad  = (float *) dma_queue_pop(dma_queue).src;
         float * src0_spad = (float *) dma_queue_pop(dma_queue).dst;
@@ -330,6 +438,9 @@ static void unary_job_f32_per_thread(unsigned int nth, unsigned int ith, void * 
             case HTP_OP_UNARY_SOFTPLUS:
                 softplus_f32(src0_spad, dst_spad, NULL, block_size, ne0, src0_row_size_aligned, op_params);
                 break;
+            case HTP_OP_L2_NORM:
+                l2_norm_f32(src0_spad, dst_spad, NULL, block_size, ne0, src0_row_size_aligned, op_params);
+                break;
             default:
                 break;
         }
@@ -339,13 +450,21 @@ static void unary_job_f32_per_thread(unsigned int nth, unsigned int ith, void * 
             dst_row_size, dst_row_size_aligned, block_size);
 
         // prefetch N+2 loop iteration if any
-        const uint32_t pref_block = (ir + BLOCK * 2);
-        if (pref_block < src0_end_row) {
-            const uint32_t pref_block_size = MIN(BLOCK, src0_end_row - pref_block);
+        if (next_pref_ir < src0_end_row) {
+            uint32_t pref_block_size = MIN(BLOCK, src0_end_row - next_pref_ir);
+            if (uctx->src0_nc) {
+                pref_block_size = MIN(pref_block_size, uctx->ne01 - (next_pref_ir % uctx->ne01));
+            }
+            size_t pref_offset = uctx->src0_nc
+                ? unary_src0_row_offset(next_pref_ir, uctx->ne01, uctx->ne02, uctx->nb01, uctx->nb02, uctx->nb03)
+                : (size_t)next_pref_ir * src0_row_size;
             dma_queue_push_ddr_to_vtcm(dma_queue,
-                dma_make_ptr(src0_spad, data_src + (pref_block * src0_row_size)),
+                dma_make_ptr(src0_spad, data_src + pref_offset),
                 src0_row_size_aligned, src0_row_size, pref_block_size);
+            next_pref_ir += pref_block_size;
         }
+
+        ir += block_size;
     }
 
     dma_queue_flush(dma_queue);
@@ -389,6 +508,10 @@ static int execute_op_unary_f32(struct htp_ops_context * octx) {
             break;
         case HTP_OP_UNARY_SOFTPLUS:
             op_type = "softplus-f32";
+            break;
+
+        case HTP_OP_L2_NORM:
+            op_type = "l2norm-f32";
             break;
 
         default:
@@ -452,6 +575,14 @@ static int execute_op_unary_f32(struct htp_ops_context * octx) {
 
             .block                 = (octx->src0_spad.size_per_thread / 2) / src0_row_size_aligned,
             .nc                    = src0->ne[0],
+
+            .src0_nc               = (src0->nb[2] != (size_t)src0->ne[1] * src0->nb[1]) ||
+                                     (src0->nb[3] != (size_t)src0->ne[2] * src0->nb[2]),
+            .ne01                  = src0->ne[1],
+            .ne02                  = src0->ne[2],
+            .nb01                  = src0->nb[1],
+            .nb02                  = src0->nb[2],
+            .nb03                  = src0->nb[3],
         };
 
         worker_pool_run_func(octx->ctx->worker_pool, unary_job_f32_per_thread, &uctx, n_threads);

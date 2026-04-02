@@ -46,6 +46,7 @@ static int    opt_profile      = 0;
 static int    opt_hostbuf      = 1; // hostbuf ON by default
 static int    opt_experimental = 0;
 static int    opt_use_hmx      = 1; // when set, enable HMX; when 0, use HVX only
+static int    opt_l2_norm      = 0; // when set, enable L2_NORM on HVX
 
 // Enable all stages by default
 static int opt_opmask = HTP_OPMASK_QUEUE | HTP_OPMASK_QUANTIZE | HTP_OPMASK_COMPUTE;
@@ -1984,6 +1985,21 @@ static bool ggml_hexagon_supported_unary(const struct ggml_hexagon_session * ses
     return true;
 }
 
+// Variant of ggml_hexagon_supported_unary that allows non-contiguous src0.
+// Used for ops (like L2_NORM) whose DSP-side DMA loop handles strides explicitly.
+static bool ggml_hexagon_supported_unary_nc(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op) {
+    const struct ggml_tensor * src0 = op->src[0];
+    const struct ggml_tensor * dst  = op;
+
+    if (src0->type != GGML_TYPE_F32) return false;
+    if (dst->type  != GGML_TYPE_F32) return false;
+    if (!ggml_are_same_shape(src0, dst)) return false;
+    // dst must be contiguous; src0 may be non-contiguous
+    if (!ggml_is_contiguous(dst)) return false;
+
+    return true;
+}
+
 static bool ggml_hexagon_supported_sum_rows(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op) {
     const struct ggml_tensor * src0 = op->src[0];
     const struct ggml_tensor * dst  = op;
@@ -2534,6 +2550,11 @@ static inline size_t init_unary_req(htp_general_req * req, dspqueue_buffer * buf
             supported = true;
             break;
 
+        case GGML_OP_L2_NORM:
+            req->op   = HTP_OP_L2_NORM;
+            supported = true;
+            break;
+
         default:
             break;
     }
@@ -2778,6 +2799,12 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
 
             case GGML_OP_SSM_CONV:
                 ggml_hexagon_dispatch_op<init_ssm_conv_req>(sess, node, flags);
+                break;
+
+            case GGML_OP_L2_NORM:
+                if (opt_l2_norm) {
+                    ggml_hexagon_dispatch_op<init_unary_req>(sess, node, flags);
+                }
                 break;
 
             default:
@@ -3254,6 +3281,10 @@ static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, cons
             supp = ggml_hexagon_supported_ssm_conv(sess, op);
             break;
 
+        case GGML_OP_L2_NORM:
+            supp = opt_l2_norm && ggml_hexagon_supported_unary_nc(sess, op);
+            break;
+
         default:
             break;
     }
@@ -3411,6 +3442,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_use_hmx = getenv("GGML_HEXAGON_USE_HMX");
     const char * str_ndev    = getenv("GGML_HEXAGON_NDEV");
     const char * str_arch    = getenv("GGML_HEXAGON_ARCH");
+    const char * str_l2_norm = getenv("GGML_HEXAGON_L2_NORM");
 
     opt_experimental = str_experimental ? atoi(str_experimental) : 0;
     opt_verbose      = str_verbose ? atoi(str_verbose) : 0;
@@ -3422,6 +3454,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     opt_nhvx         = str_nhvx    ? strtoul(str_nhvx, NULL, 0) : opt_nhvx;
     opt_use_hmx      = str_use_hmx ? atoi(str_use_hmx) : opt_use_hmx;
     opt_ndev         = str_ndev    ? strtoul(str_ndev, NULL, 0) : opt_ndev;
+    opt_l2_norm      = str_l2_norm ? atoi(str_l2_norm) : opt_l2_norm;
 
     if (opt_ndev > GGML_HEXAGON_MAX_SESSIONS) {
         opt_ndev = GGML_HEXAGON_MAX_SESSIONS;
