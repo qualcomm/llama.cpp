@@ -593,6 +593,9 @@ static int execute_op(struct htp_ops_context * octx) {
         case HTP_OP_SOLVE_TRI:
             return op_solve_tri(octx);
 
+        case HTP_OP_TRI:
+            return op_tri(octx);
+
         case HTP_OP_INVALID:
             break;
 
