@@ -13,6 +13,16 @@
 #define WG_SIZE (BLOCK_M)
 #define Q1_WG_SIZE 64
 
+// At DK>=192 the Adreno compiler runs out of host memory trying to fully
+// unroll 48/64-trip loops across the dot-product, output-accumulate and
+// output-write sections. Drop the unroll hints so compile succeeds; let the
+// driver decide on its own loop strategy.
+#if DK >= 192
+#define FA_UNROLL
+#else
+#define FA_UNROLL _Pragma("unroll")
+#endif
+
 inline float get_alibi_slope(
     const float max_bias, const uint h, const uint n_head_log2, const float m0, const float m1
 ) {
@@ -82,14 +92,14 @@ __kernel void flash_attn_f32(
     if (my_query_row < n_q) {
         const ulong q_row_offset = batch_idx * q_nb3 + head_idx * q_nb2 + my_query_row * q_nb1;
         const global DATA_TYPE4* q_ptr = (const global DATA_TYPE4*)(q_base + q_row_offset);
-        #pragma unroll
+        FA_UNROLL
         for (int i = 0; i < DK_VEC; ++i) {
             q_priv[i] = CONVERT_ACC4(q_ptr[i]);
         }
     }
 
     ACC_TYPE4 o_acc[DV_VEC];
-    #pragma unroll
+    FA_UNROLL
     for (int i = 0; i < DV_VEC; ++i) {
         o_acc[i] = (ACC_TYPE4)(0.0f);
     }
@@ -136,7 +146,7 @@ __kernel void flash_attn_f32(
             ACC_TYPE4 dot_acc1 = (ACC_TYPE4)(0.0f);
             ACC_TYPE4 dot_acc2 = (ACC_TYPE4)(0.0f);
             ACC_TYPE4 dot_acc3 = (ACC_TYPE4)(0.0f);
-            #pragma unroll
+            FA_UNROLL
             for (int k = 0; k < DK_VEC; k++) {
                 const ACC_TYPE4 qk = q_priv[k];
                 dot_acc0 = mad(qk, CONVERT_ACC4(l_k[j][k]),   dot_acc0);
@@ -183,7 +193,7 @@ __kernel void flash_attn_f32(
             const ACC_TYPE p2         = native_exp(s2 - m_new);
             const ACC_TYPE p3         = native_exp(s3 - m_new);
 
-            #pragma unroll
+            FA_UNROLL
             for (int i = 0; i < DV_VEC; ++i) {
                 o_acc[i] = mad(p3, CONVERT_ACC4(l_v[j+3][i]),
                            mad(p2, CONVERT_ACC4(l_v[j+2][i]),
@@ -203,7 +213,7 @@ __kernel void flash_attn_f32(
             const ACC_TYPE m_final = max(m_i, m_sink);
 
             const ACC_TYPE scale_o = exp(m_i - m_final);
-            #pragma unroll
+            FA_UNROLL
             for (int i = 0; i < DV_VEC; ++i) {
                 o_acc[i] *= scale_o;
             }
@@ -215,12 +225,12 @@ __kernel void flash_attn_f32(
         global DATA_TYPE4 *o_row = (global DATA_TYPE4 *)(o_base + o_row_offset);
         if (l_i > 0.0f) {
             const ACC_TYPE l_inv = 1.0f / l_i;
-            #pragma unroll
+            FA_UNROLL
             for (int i = 0; i < DV_VEC; ++i) {
                 o_row[i] = CONVERT_DATA4(o_acc[i] * l_inv);
             }
         } else {
-            #pragma unroll
+            FA_UNROLL
             for (int i = 0; i < DV_VEC; ++i) {
                 o_row[i] = (DATA_TYPE4)(0.0f);
             }
@@ -282,7 +292,7 @@ __kernel void flash_attn_f32_q1(
     ACC_TYPE4 q_priv[DK_VEC];
     const ulong q_row_offset = batch_idx * q_nb3 + head_idx * q_nb2;
     const global DATA_TYPE4* q_ptr = (const global DATA_TYPE4*)(q_base + q_row_offset);
-    #pragma unroll
+    FA_UNROLL
     for (int i = 0; i < DK_VEC; ++i) {
         q_priv[i] = CONVERT_ACC4(q_ptr[i]);
     }
@@ -299,7 +309,7 @@ __kernel void flash_attn_f32_q1(
         const ulong k_row_offset = batch_idx * k_nb3 + head_kv_idx * k_nb2 + k_idx * k_nb1;
         const global DATA_TYPE4* k_ptr = (const global DATA_TYPE4*)(k_base + k_row_offset);
         ACC_TYPE4 dot_acc = (ACC_TYPE4)(0.0f);
-        #pragma unroll
+        FA_UNROLL
         for (int k = 0; k < DK_VEC; k++) {
             dot_acc = mad(q_priv[k], CONVERT_ACC4(k_ptr[k]), dot_acc);
         }
@@ -317,7 +327,7 @@ __kernel void flash_attn_f32_q1(
     __local ACC_TYPE local_m[Q1_WG_SIZE];
     local_m[tid] = m_i;
     barrier(CLK_LOCAL_MEM_FENCE);
-    #pragma unroll
+    FA_UNROLL
     for (int s = Q1_WG_SIZE / 2; s > 0; s >>= 1) {
         if (tid < s) local_m[tid] = max(local_m[tid], local_m[tid + s]);
         barrier(CLK_LOCAL_MEM_FENCE);
@@ -325,7 +335,7 @@ __kernel void flash_attn_f32_q1(
     const ACC_TYPE m_final = local_m[0];
 
     ACC_TYPE4 o_acc[DV_VEC];
-    #pragma unroll
+    FA_UNROLL
     for (int i = 0; i < DV_VEC; ++i) o_acc[i] = (ACC_TYPE4)(0.0f);
     ACC_TYPE l_i = 0.0f;
 
@@ -335,7 +345,7 @@ __kernel void flash_attn_f32_q1(
         const global DATA_TYPE4* k_ptr = (const global DATA_TYPE4*)(k_base + k_row_offset);
         const global DATA_TYPE4* v_ptr = (const global DATA_TYPE4*)(v_base + v_row_offset);
         ACC_TYPE4 dot_acc = (ACC_TYPE4)(0.0f);
-        #pragma unroll
+        FA_UNROLL
         for (int k = 0; k < DK_VEC; k++) {
             dot_acc = mad(q_priv[k], CONVERT_ACC4(k_ptr[k]), dot_acc);
         }
@@ -349,7 +359,7 @@ __kernel void flash_attn_f32_q1(
         }
         const ACC_TYPE p = exp(score - m_final);
         l_i += p;
-        #pragma unroll
+        FA_UNROLL
         for (int i = 0; i < DV_VEC; i++) {
             o_acc[i] = mad(p, CONVERT_ACC4(v_ptr[i]), o_acc[i]);
         }
@@ -359,7 +369,7 @@ __kernel void flash_attn_f32_q1(
     __local ACC_TYPE4 local_o_comp[Q1_WG_SIZE];
     local_l[tid] = l_i;
     barrier(CLK_LOCAL_MEM_FENCE);
-    #pragma unroll
+    FA_UNROLL
     for (int s = Q1_WG_SIZE / 2; s > 0; s >>= 1) {
         if (tid < s) local_l[tid] += local_l[tid + s];
         barrier(CLK_LOCAL_MEM_FENCE);
@@ -378,7 +388,7 @@ __kernel void flash_attn_f32_q1(
         for (int i = 0; i < DV_VEC; i++) {
             local_o_comp[tid] = o_acc[i];
             barrier(CLK_LOCAL_MEM_FENCE);
-            #pragma unroll
+            FA_UNROLL
             for (int s = Q1_WG_SIZE / 2; s > 0; s >>= 1) {
                 if (tid < s) local_o_comp[tid] += local_o_comp[tid + s];
                 barrier(CLK_LOCAL_MEM_FENCE);
@@ -388,7 +398,7 @@ __kernel void flash_attn_f32_q1(
             }
         }
     } else if (tid == 0) {
-        #pragma unroll
+        FA_UNROLL
         for (int i = 0; i < DV_VEC; ++i) o_row[i] = (DATA_TYPE4)(0.0f);
     }
 }

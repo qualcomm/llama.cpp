@@ -26,6 +26,14 @@
 #define DV_VEC (DV/4)
 #define Q1_WG_SIZE 64
 
+// See note in flash_attn_f32.cl: drop full-unroll hints at DK>=192 to keep
+// the Adreno compiler within its host-memory budget.
+#if DK >= 192
+#define FA_UNROLL
+#else
+#define FA_UNROLL _Pragma("unroll")
+#endif
+
 // N_SPLIT: number of threads that collaborate on each query's dot product.
 // When N_SPLIT > 1, each query is processed by N_SPLIT threads, each owning
 // 1/N_SPLIT of the DK and DV dimensions.  This reduces register pressure for
@@ -145,19 +153,19 @@ __kernel void flash_attn_f32_f16(
     if (query_valid) {
         const ulong q_row_offset = batch_idx * q_nb3 + head_idx * q_nb2 + my_query_row * q_nb1;
         const global Q_DATA_TYPE4* q_ptr = (const global Q_DATA_TYPE4*)(q_base + q_row_offset);
-        #pragma unroll
+        FA_UNROLL
         for (int i = 0; i < SPLIT_DK_VEC; ++i) {
             q_priv[i] = CONVERT_Q_ACC4(q_ptr[dk_off + i]);
         }
     } else {
-        #pragma unroll
+        FA_UNROLL
         for (int i = 0; i < SPLIT_DK_VEC; ++i) {
             q_priv[i] = (ACC_TYPE4)(0.0f);
         }
     }
 
     ACC_TYPE4 o_acc[SPLIT_DV_VEC];
-    #pragma unroll
+    FA_UNROLL
     for (int i = 0; i < SPLIT_DV_VEC; ++i) {
         o_acc[i] = (ACC_TYPE4)(0.0f);
     }
@@ -263,7 +271,7 @@ __kernel void flash_attn_f32_f16(
                 // --- QK partial dots (each thread covers SPLIT_DK_VEC float4 lanes) ---
                 ACC_TYPE partial0 = 0.0f;
                 ACC_TYPE partial1 = 0.0f;
-                #pragma unroll
+                FA_UNROLL
                 for (int k = 0; k < SPLIT_DK_VEC; k++) {
                     const ACC_TYPE4 qk = q_priv[k];
                     ACC_TYPE4 dot0 = qk * CONVERT_KV_ACC4(l_k[j  ][dk_off + k]);
@@ -277,7 +285,7 @@ __kernel void flash_attn_f32_f16(
                 // (q_lane*N_SPLIT .. q_lane*N_SPLIT + N_SPLIT-1), so XOR with
                 // powers of 2 correctly pairs up the right threads.
                 // After the loop every thread in the group has the full sum.
-                #pragma unroll
+                FA_UNROLL
                 for (int step = 1; step < N_SPLIT; step <<= 1) {
                     partial0 += sub_group_shuffle_xor(partial0, step);
                     partial1 += sub_group_shuffle_xor(partial1, step);
@@ -320,7 +328,7 @@ __kernel void flash_attn_f32_f16(
                 const ACC_TYPE p0    = native_exp(score0 - m_new);
                 const ACC_TYPE p1    = native_exp(score1 - m_new);
 
-                #pragma unroll
+                FA_UNROLL
                 for (int i = 0; i < SPLIT_DV_VEC; ++i) {
                     o_acc[i] = o_acc[i] * sp
                              + p0 * CONVERT_KV_ACC4(l_v[j  ][dv_off + i])
@@ -345,7 +353,7 @@ __kernel void flash_attn_f32_f16(
         // for WG_SIZE=128 threads, 32 banks).
         for (int j = 0; j < BLOCK_N; ++j) {
             ACC_TYPE4 dot_acc = (ACC_TYPE4)(0.0f);
-            #pragma unroll
+            FA_UNROLL
             for (int k = 0; k < SPLIT_DK_VEC; k++) {
                 dot_acc = mad(q_priv[k], CONVERT_KV_ACC4(l_k[j][dk_off + k]), dot_acc);
             }
@@ -361,7 +369,7 @@ __kernel void flash_attn_f32_f16(
                 for (int j = 0; j < BLOCK_N; ++j) {
                     const int k_row = k_start + j;
                     ACC_TYPE score = 0.0f;
-                    #pragma unroll
+                    FA_UNROLL
                     for (int s = 0; s < N_SPLIT; s++) {
                         score += local_partial[j][q_lane * N_SPLIT + s];
                     }
@@ -411,13 +419,13 @@ __kernel void flash_attn_f32_f16(
         {
             const ACC_TYPE sp_block = local_softmax_scale[q_lane];
             const int dv_off = split_idx * SPLIT_DV_VEC;
-            #pragma unroll
+            FA_UNROLL
             for (int i = 0; i < SPLIT_DV_VEC; ++i) {
                 o_acc[i] *= sp_block;
             }
             for (int j = 0; j < BLOCK_N; ++j) {
                 const ACC_TYPE p = local_p[q_lane][j];
-                #pragma unroll
+                FA_UNROLL
                 for (int i = 0; i < SPLIT_DV_VEC; ++i) {
                     o_acc[i] = mad(p, CONVERT_KV_ACC4(l_v[j][dv_off + i]), o_acc[i]);
                 }
@@ -448,7 +456,7 @@ __kernel void flash_attn_f32_f16(
                 ACC_TYPE4 dot_acc1 = (ACC_TYPE4)(0.0f);
                 ACC_TYPE4 dot_acc2 = (ACC_TYPE4)(0.0f);
                 ACC_TYPE4 dot_acc3 = (ACC_TYPE4)(0.0f);
-                #pragma unroll
+                FA_UNROLL
                 for (int k = 0; k < DK_VEC; k++) {
                     const ACC_TYPE4 qk = q_priv[k];
                     dot_acc0 = mad(qk, CONVERT_KV_ACC4(l_k[j][k]),   dot_acc0);
@@ -503,7 +511,7 @@ __kernel void flash_attn_f32_f16(
                 const ACC_TYPE p2         = native_exp(s2 - m_new);
                 const ACC_TYPE p3         = native_exp(s3 - m_new);
 
-                #pragma unroll
+                FA_UNROLL
                 for (int i = 0; i < DV_VEC; ++i) {
                     o_acc[i] = mad(p3, CONVERT_KV_ACC4(l_v[j+3][i]),
                                mad(p2, CONVERT_KV_ACC4(l_v[j+2][i]),
@@ -540,12 +548,12 @@ __kernel void flash_attn_f32_f16(
         const ulong o_row_offset = batch_idx * o_nb3 + my_query_row * o_nb2 + head_idx * o_nb1;
         global O_DATA_TYPE4 *o_row = (global O_DATA_TYPE4 *)(o_base + o_row_offset);
         if (l_inv > 0.0f) {
-            #pragma unroll
+            FA_UNROLL
             for (int i = 0; i < SPLIT_DV_VEC; ++i) {
                 o_row[dv_off + i] = CONVERT_O_DATA4(o_acc[i] * sinks_sp * l_inv);
             }
         } else {
-            #pragma unroll
+            FA_UNROLL
             for (int i = 0; i < SPLIT_DV_VEC; ++i) {
                 o_row[dv_off + i] = (O_DATA_TYPE4)(0.0f);
             }
@@ -575,12 +583,12 @@ __kernel void flash_attn_f32_f16(
         const ulong o_row_offset = batch_idx * o_nb3 + my_query_row * o_nb2 + head_idx * o_nb1;
         global O_DATA_TYPE4 *o_row = (global O_DATA_TYPE4 *)(o_base + o_row_offset);
         if (l_inv > 0.0f) {
-            #pragma unroll
+            FA_UNROLL
             for (int i = 0; i < SPLIT_DV_VEC; ++i) {
                 o_row[dv_off + i] = CONVERT_O_DATA4(o_acc[i] * sinks_sp * l_inv);
             }
         } else {
-            #pragma unroll
+            FA_UNROLL
             for (int i = 0; i < SPLIT_DV_VEC; ++i) {
                 o_row[dv_off + i] = (O_DATA_TYPE4)(0.0f);
             }
@@ -594,7 +602,7 @@ __kernel void flash_attn_f32_f16(
             const ACC_TYPE m_final = max(m_i, m_sink);
 
             const ACC_TYPE scale_o = exp(m_i - m_final);
-            #pragma unroll
+            FA_UNROLL
             for (int i = 0; i < DV_VEC; ++i) {
                 o_acc[i] *= scale_o;
             }
@@ -606,12 +614,12 @@ __kernel void flash_attn_f32_f16(
         global O_DATA_TYPE4 *o_row = (global O_DATA_TYPE4 *)(o_base + o_row_offset);
         if (l_i > 0.0f) {
             const ACC_TYPE l_inv = 1.0f / l_i;
-            #pragma unroll
+            FA_UNROLL
             for (int i = 0; i < DV_VEC; ++i) {
                 o_row[i] = CONVERT_O_DATA4(o_acc[i] * l_inv);
             }
         } else {
-            #pragma unroll
+            FA_UNROLL
             for (int i = 0; i < DV_VEC; ++i) {
                 o_row[i] = (O_DATA_TYPE4)(0.0f);
             }
@@ -674,7 +682,7 @@ __kernel void flash_attn_f32_f16_q1(
     ACC_TYPE4 q_priv[DK_VEC];
     const ulong q_row_offset = batch_idx * q_nb3 + head_idx * q_nb2;
     const global Q_DATA_TYPE4* q_ptr = (const global Q_DATA_TYPE4*)(q_base + q_row_offset);
-    #pragma unroll
+    FA_UNROLL
     for (int i = 0; i < DK_VEC; ++i) {
         q_priv[i] = CONVERT_Q_ACC4(q_ptr[i]);
     }
@@ -691,7 +699,7 @@ __kernel void flash_attn_f32_f16_q1(
         const ulong k_row_offset = batch_idx * k_nb3 + head_kv_idx * k_nb2 + k_idx * k_nb1;
         const global KV_DATA_TYPE4* k_ptr = (const global KV_DATA_TYPE4*)(k_base + k_row_offset);
         ACC_TYPE4 dot_acc = (ACC_TYPE4)(0.0f);
-        #pragma unroll
+        FA_UNROLL
         for (int k = 0; k < DK_VEC; k++) {
             dot_acc = mad(q_priv[k], CONVERT_KV_ACC4(k_ptr[k]), dot_acc);
         }
@@ -709,7 +717,7 @@ __kernel void flash_attn_f32_f16_q1(
     __local ACC_TYPE local_m[Q1_WG_SIZE];
     local_m[tid] = m_i;
     barrier(CLK_LOCAL_MEM_FENCE);
-    #pragma unroll
+    FA_UNROLL
     for (int s = Q1_WG_SIZE / 2; s > 0; s >>= 1) {
         if (tid < s) local_m[tid] = max(local_m[tid], local_m[tid + s]);
         barrier(CLK_LOCAL_MEM_FENCE);
@@ -717,7 +725,7 @@ __kernel void flash_attn_f32_f16_q1(
     const ACC_TYPE m_final = local_m[0];
 
     ACC_TYPE4 o_acc[DV_VEC];
-    #pragma unroll
+    FA_UNROLL
     for (int i = 0; i < DV_VEC; ++i) o_acc[i] = (ACC_TYPE4)(0.0f);
     ACC_TYPE l_i = 0.0f;
 
@@ -727,7 +735,7 @@ __kernel void flash_attn_f32_f16_q1(
         const global KV_DATA_TYPE4* k_ptr = (const global KV_DATA_TYPE4*)(k_base + k_row_offset);
         const global KV_DATA_TYPE4* v_ptr = (const global KV_DATA_TYPE4*)(v_base + v_row_offset);
         ACC_TYPE4 dot_acc = (ACC_TYPE4)(0.0f);
-        #pragma unroll
+        FA_UNROLL
         for (int k = 0; k < DK_VEC; k++) {
             dot_acc = mad(q_priv[k], CONVERT_KV_ACC4(k_ptr[k]), dot_acc);
         }
@@ -741,7 +749,7 @@ __kernel void flash_attn_f32_f16_q1(
         }
         const ACC_TYPE p = exp(score - m_final);
         l_i += p;
-        #pragma unroll
+        FA_UNROLL
         for (int i = 0; i < DV_VEC; i++) {
             o_acc[i] = mad(p, CONVERT_KV_ACC4(v_ptr[i]), o_acc[i]);
         }
@@ -751,7 +759,7 @@ __kernel void flash_attn_f32_f16_q1(
     __local ACC_TYPE4 local_o_comp[Q1_WG_SIZE];
     local_l[tid] = l_i;
     barrier(CLK_LOCAL_MEM_FENCE);
-    #pragma unroll
+    FA_UNROLL
     for (int s = Q1_WG_SIZE / 2; s > 0; s >>= 1) {
         if (tid < s) local_l[tid] += local_l[tid + s];
         barrier(CLK_LOCAL_MEM_FENCE);
@@ -770,7 +778,7 @@ __kernel void flash_attn_f32_f16_q1(
         for (int i = 0; i < DV_VEC; i++) {
             local_o_comp[tid] = o_acc[i];
             barrier(CLK_LOCAL_MEM_FENCE);
-            #pragma unroll
+            FA_UNROLL
             for (int s = Q1_WG_SIZE / 2; s > 0; s >>= 1) {
                 if (tid < s) local_o_comp[tid] += local_o_comp[tid + s];
                 barrier(CLK_LOCAL_MEM_FENCE);
@@ -780,7 +788,7 @@ __kernel void flash_attn_f32_f16_q1(
             }
         }
     } else if (tid == 0) {
-        #pragma unroll
+        FA_UNROLL
         for (int i = 0; i < DV_VEC; ++i) o_row[i] = (O_DATA_TYPE4)(0.0f);
     }
 }

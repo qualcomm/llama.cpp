@@ -976,6 +976,50 @@ kernel void kernel_dequant_q8_0_f16_view_aos(
     }
 }
 
+// View-aware AoS dequant for q4_0 (block = 2-byte scale + 16-byte packed
+// nibbles for 32 elements). Mirrors kernel_dequant_q8_0_f16_view_aos — reads
+// a (possibly permuted / strided) view of an AoS q4_0 tensor and writes a
+// tightly packed f16 buffer in the view's logical order. Used by MUL_MAT when
+// src0 is q4_0 AoS (e.g., KV cache with -fa 0).
+kernel void kernel_dequant_q4_0_f16_view_aos(
+    global char * src,
+    ulong         src_offset,
+    ulong         src_nb1,
+    ulong         src_nb2,
+    ulong         src_nb3,
+    int           nblk0,
+    int           ne1,
+    int           ne2,
+    int           ne3,
+    global half * dst
+) {
+    int blk_i0 = get_global_id(0);
+    int i1     = get_global_id(1);
+    int batch  = get_global_id(2);
+
+    if (blk_i0 >= nblk0) return;
+    if (i1     >= ne1)   return;
+
+    int i2 = batch % ne2;
+    int i3 = batch / ne2;
+    if (i3 >= ne3) return;
+
+    global char * block = src + src_offset + (ulong)i3*src_nb3 + (ulong)i2*src_nb2 + (ulong)i1*src_nb1 + (ulong)blk_i0 * (2 + QK4_0/2);
+    float d = vload_half(0, (global half *)block);
+    global uchar * qs = (global uchar *)(block + 2);
+
+    ulong dst_row_base = ((ulong)i3 * ne2 * ne1 + (ulong)i2 * ne1 + (ulong)i1) * nblk0;
+    global half * out = dst + (dst_row_base + blk_i0) * QK4_0;
+
+    for (int i = 0; i < QK4_0/2; ++i) {
+        uchar byte = qs[i];
+        int q0 = (int)(byte & 0x0F) - 8;
+        int q1 = (int)(byte >> 4)   - 8;
+        out[i]          = (half)(d * (float)q0);
+        out[i + QK4_0/2] = (half)(d * (float)q1);
+    }
+}
+
 // SoA layout: separate scale sub-buffer (half per block) and quant sub-buffer
 // (QK8_0 int8 per block). Matches the on-device layout set up by
 // kernel_convert_block_q8_0.
