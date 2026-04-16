@@ -524,13 +524,19 @@ struct ggml_backend_opencl_context {
     std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_f16;
     std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_f16_split; // N_SPLIT>1 variant
     std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_f16_q1;
+    // Flash-decoding K-split: per-split partial kernel + merge kernel for f16 KV.
+    // Compiled alongside kernels_flash_attn_f32_f16_q1 for the same (dk, dv) set.
+    std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_f16_q1_split;
+    std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_merge;
     std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_q8_0_q1;  // Q=f32, KV=q8_0 decode
+    std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_q8_0_q1_split; // Flash-Decoding Pass 1 for q8_0
     std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_q8_0;     // Q=f32, KV=q8_0 prefill (baseline)
     std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_q8_0_split;                // N_SPLIT>1 variant
     std::map<std::pair<int, int>, int>       kernels_flash_attn_f32_q8_0_split_wg_size;        // wg_size = bm*n_split
     std::map<std::pair<int, int>, int>       kernels_flash_attn_f32_q8_0_split_nkv_threshold;  // use split when n_kv >= this
     std::map<std::pair<int, int>, int>       kernels_flash_attn_f32_q8_0_split_bm;             // per-split BLOCK_M (usually same as f16 bm)
     std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_q4_0_q1;  // Q=f32, KV=q4_0 decode
+    std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_q4_0_q1_split; // Flash-Decoding Pass 1 for q4_0
     std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_q4_0;     // Q=f32, KV=q4_0 prefill (baseline)
     std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_q4_0_split;                // N_SPLIT>1 variant
     std::map<std::pair<int, int>, int>       kernels_flash_attn_f32_q4_0_split_wg_size;
@@ -3108,6 +3114,15 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
             CL_CHECK((kq1 = clCreateKernel(prog, "flash_attn_f32_f16_q1", &err), err));
             backend_ctx->kernels_flash_attn_f32_f16[{dk, dv}]    = k;
             backend_ctx->kernels_flash_attn_f32_f16_q1[{dk, dv}] = kq1;
+            // Flash-Decoding: extract split + merge kernels from the same program.
+            cl_kernel k_split = clCreateKernel(prog, "flash_attn_f32_f16_q1_split", &err);
+            if (err == CL_SUCCESS) {
+                backend_ctx->kernels_flash_attn_f32_f16_q1_split[{dk, dv}] = k_split;
+            }
+            cl_kernel k_merge = clCreateKernel(prog, "flash_attn_f32_merge", &err);
+            if (err == CL_SUCCESS) {
+                backend_ctx->kernels_flash_attn_f32_merge[{dk, dv}] = k_merge;
+            }
             break;
         }
         case FA_VARIANT_Q8_0: {
@@ -3116,6 +3131,17 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
             CL_CHECK((k   = clCreateKernel(prog, "flash_attn_f32_q8_0",    &err), err));
             backend_ctx->kernels_flash_attn_f32_q8_0_q1[{dk, dv}] = kq1;
             backend_ctx->kernels_flash_attn_f32_q8_0[{dk, dv}]    = k;
+            // Flash-Decoding: extract q8_0 split + merge kernels.
+            cl_kernel k_split = clCreateKernel(prog, "flash_attn_f32_q8_0_q1_split", &err);
+            if (err == CL_SUCCESS) {
+                backend_ctx->kernels_flash_attn_f32_q8_0_q1_split[{dk, dv}] = k_split;
+            }
+            if (!backend_ctx->kernels_flash_attn_f32_merge.count({dk, dv})) {
+                cl_kernel k_merge = clCreateKernel(prog, "flash_attn_f32_merge", &err);
+                if (err == CL_SUCCESS) {
+                    backend_ctx->kernels_flash_attn_f32_merge[{dk, dv}] = k_merge;
+                }
+            }
             break;
         }
         case FA_VARIANT_Q4_0: {
@@ -3124,6 +3150,17 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
             CL_CHECK((k   = clCreateKernel(prog, "flash_attn_f32_q4_0",    &err), err));
             backend_ctx->kernels_flash_attn_f32_q4_0_q1[{dk, dv}] = kq1;
             backend_ctx->kernels_flash_attn_f32_q4_0[{dk, dv}]    = k;
+            // Flash-Decoding: extract q4_0 split + merge kernels.
+            cl_kernel k_split = clCreateKernel(prog, "flash_attn_f32_q4_0_q1_split", &err);
+            if (err == CL_SUCCESS) {
+                backend_ctx->kernels_flash_attn_f32_q4_0_q1_split[{dk, dv}] = k_split;
+            }
+            if (!backend_ctx->kernels_flash_attn_f32_merge.count({dk, dv})) {
+                cl_kernel k_merge = clCreateKernel(prog, "flash_attn_f32_merge", &err);
+                if (err == CL_SUCCESS) {
+                    backend_ctx->kernels_flash_attn_f32_merge[{dk, dv}] = k_merge;
+                }
+            }
             break;
         }
         case FA_VARIANT_F32_F16_SPLIT: {
@@ -10516,9 +10553,30 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     cl_ulong mask_pad_nb2 = 0;
     cl_ulong mask_pad_nb3 = 0;
 
+    // Early FD eligibility probe. Used only to gate the non-FD prefill prep
+    // kernels (KV pad, blk-mask classification) — the real FD dispatch still
+    // happens below with its own guards. Keep the predicates here in sync with
+    // the `if (use_fd)` block further down.
+    const int  fd_is_causal_probe = (mask == NULL && n_q > 1 && n_q == n_kv);
+    // Match the gating used by the actual FD dispatch below. Multi-query FD is
+    // DK-gated (see FD_MAX_DK_MULTI comment in the dispatch block). FD is also
+    // bypassed for DK>128: the single-pass kernel is already compute-bound at
+    // that depth, so the partial-buffer + merge overhead regresses decode.
+    const int  fd_max_n_q_probe = (d_head_q <= 64) ? 8 : 1;
+    const bool fd_will_fire =
+        (n_q >= 1 && n_q <= fd_max_n_q_probe && n_kv >= 2048 && !fd_is_causal_probe &&
+         d_head_q <= 128 &&
+         backend_ctx->kernels_flash_attn_f32_merge.count(dk_dv) > 0 &&
+         ((is_mixed && backend_ctx->kernels_flash_attn_f32_f16_q1_split.count(dk_dv) > 0) ||
+          (is_q8_0  && backend_ctx->kernels_flash_attn_f32_q8_0_q1_split.count(dk_dv) > 0) ||
+          (is_q4_0  && backend_ctx->kernels_flash_attn_f32_q4_0_q1_split.count(dk_dv) > 0)));
+
     const int n_q_blocks = n_q > 1 ? (n_q + block_m - 1) / block_m : 0;
     const int n_kv_blocks = n_kv > 0 ? (n_kv + block_n - 1) / block_n : 0;
-    const bool use_mixed_prepass = is_mixed && n_q > 1;
+    // Non-FD prefill uses KV padding and a per-tile mask classification. When
+    // FD will fire these are pure overhead (the FD kernels don't consume them),
+    // so gate on `!fd_will_fire`.
+    const bool use_mixed_prepass = is_mixed && n_q > 1 && !fd_will_fire;
     const bool use_kv_pad = use_mixed_prepass && (n_kv % block_n != 0);
     // blk prepass: classifies each KV tile as fully-masked / mixed / fully-unmasked
     // based on the attention mask. Drives two optimisations inside the FA kernel:
@@ -10526,7 +10584,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     //   2-blocks → skip per-row mask lookup (~BLOCK_M×BLOCK_N half reads per tile).
     // Extended to the native q8_0 / q4_0 prefill kernels: they now accept a blk
     // pointer and consume the classification identically to f32_f16.
-    const bool use_quant_prepass = (use_native_q8_0 || use_native_q4_0);
+    const bool use_quant_prepass = (use_native_q8_0 || use_native_q4_0) && !fd_will_fire;
     const bool use_blk_mask = (use_mixed_prepass || use_quant_prepass) && mask_buffer != NULL;
 
     if (use_kv_pad) {
@@ -10624,6 +10682,151 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     const float n_head_log2_f = n_head_log2_val > 0 ? (float)n_head_log2_val : 1.0f;
     const float m0 = powf(2.0f, -(max_bias) / n_head_log2_f);
     const float m1 = powf(2.0f, -(max_bias / 2.0f) / n_head_log2_f);
+
+    // ============================================================================
+    // Flash-Decoding (K-split) for decode / short-query path.
+    //
+    // Single-query (n_q == 1): decode. Always eligible for DK∈{64,96,128,192,256}
+    // when n_kv ≥ FD_MIN_N_KV.
+    //
+    // Multi-query (2 ≤ n_q ≤ FD_MAX_N_Q_MULTI): speculative decoding / parallel-
+    // token generation. Each WG owns one (batch, head, query, split) tuple, so
+    // K/V reads are NOT shared across queries — total K/V bandwidth scales as
+    // O(n_q · n_kv). That beats the prefill kernel only when per-row compute is
+    // light relative to launch/merge overhead. Measured on Adreno X1-85:
+    //   DK=64  (Llama-3.2-1B)   : +26 to +115% at pp4, d=2048..16384
+    //   DK=96  (Phi-3.5-mini)   : -21% to neutral
+    //   DK=128 (Qwen3-{0.6B,4B}): -16% to -21%
+    // So multi-query FD is gated on DK ≤ FD_MAX_DK_MULTI. A future rewrite that
+    // shares K/V across queries inside a single WG (cross-Q accumulation) should
+    // relax this — see e.g. FlashDecoding++ / FlashAttention-2 multi-token
+    // decode paths.
+    //
+    // Splits the KV dimension across N_SPLITS work-groups per (batch, head, q),
+    // each writing a (m_c, l_c, O_c) partial to a temp buffer. A tiny merge
+    // kernel reduces partials into the final token. Supports f16 / q8_0 / q4_0
+    // KV — merge kernel is type-agnostic. !is_causal required (FD loop has no
+    // causal bounds; speculative decoding supplies an explicit mask).
+    // ============================================================================
+    const int FD_MIN_N_KV      = 2048;
+    const int FD_KV_PER_SP     = 2048;
+    const int FD_MAX_N_Q_MULTI = 8;
+    const int FD_MAX_DK_MULTI  = 64;
+    const int FD_MAX_DK        = 128;
+    const int fd_max_n_q = (d_head_q <= FD_MAX_DK_MULTI) ? FD_MAX_N_Q_MULTI : 1;
+    // Pick the Pass 1 kernel based on KV type; all three produce identical
+    // partial-buffer layout so Pass 2 (merge) is shared. DK>128 is compute-
+    // bound in the single-pass kernel; skipping FD there avoids a measured
+    // 6-15% decode regression on Qwen3.5-9B (DK=256) at d4096/d8192.
+    cl_kernel fd_k_split = NULL;
+    if (n_q >= 1 && n_q <= fd_max_n_q && n_kv >= FD_MIN_N_KV && !is_causal &&
+        d_head_q <= FD_MAX_DK &&
+        backend_ctx->kernels_flash_attn_f32_merge.count(dk_dv) > 0) {
+        if (is_mixed &&
+            backend_ctx->kernels_flash_attn_f32_f16_q1_split.count(dk_dv) > 0) {
+            fd_k_split = backend_ctx->kernels_flash_attn_f32_f16_q1_split.at(dk_dv);
+        } else if (is_q8_0 &&
+            backend_ctx->kernels_flash_attn_f32_q8_0_q1_split.count(dk_dv) > 0) {
+            fd_k_split = backend_ctx->kernels_flash_attn_f32_q8_0_q1_split.at(dk_dv);
+        } else if (is_q4_0 &&
+            backend_ctx->kernels_flash_attn_f32_q4_0_q1_split.count(dk_dv) > 0) {
+            fd_k_split = backend_ctx->kernels_flash_attn_f32_q4_0_q1_split.at(dk_dv);
+        }
+    }
+    const bool use_fd = (fd_k_split != NULL);
+
+    if (use_fd) {
+        // Choose N_SPLITS: roughly n_kv / 2048, clamped to [2, 16].
+        int n_splits = (n_kv + FD_KV_PER_SP - 1) / FD_KV_PER_SP;
+        if (n_splits < 2)  n_splits = 2;
+        if (n_splits > 16) n_splits = 16;
+        const int kv_per_split = (n_kv + n_splits - 1) / n_splits;
+
+        // Partial buffer: n_batch × n_head × n_q × n_splits × (2 + DV) floats.
+        // Layout [batch][head][query][split][m,l,O] matches the split kernel's
+        // record_idx computation.
+        const int fa_partial_floats = 2 + d_head_v;
+        const size_t partial_size_bytes =
+            (size_t) n_batch * n_head * n_q * n_splits * fa_partial_floats * sizeof(float);
+
+        ggml_cl_flash_attn_temp_buffer temp_partial;
+        cl_int err;
+        temp_partial.data = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE,
+                                           partial_size_bytes, NULL, &err);
+        if (err != CL_SUCCESS) {
+            CL_CHECK(clFinish(backend_ctx->queue));
+            temp_partial.data = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE,
+                                               partial_size_bytes, NULL, &err);
+        }
+        CL_CHECK(err);
+
+        // --- Pass 1: per-split partials ---
+        cl_kernel k_split = fd_k_split;
+        int argi = 0;
+        CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(cl_mem),   &extra_q->data_device));
+        CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(cl_ulong), &offset_q));
+        CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(cl_mem),   &k_data_device));
+        CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(cl_ulong), &offset_k));
+        CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(cl_mem),   &v_data_device));
+        CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(cl_ulong), &offset_v));
+        CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(float),    &scale));
+        CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(int),      &n_q));
+        CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(int),      &n_kv));
+        CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(int),      &n_head));
+        CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(cl_ulong), &q_nb1));
+        CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(cl_ulong), &q_nb2));
+        CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(cl_ulong), &q_nb3));
+        CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(cl_ulong), &k_nb1));
+        CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(cl_ulong), &k_nb2));
+        CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(cl_ulong), &k_nb3));
+        CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(cl_ulong), &v_nb1));
+        CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(cl_ulong), &v_nb2));
+        CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(cl_ulong), &v_nb3));
+        CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(float),    &max_bias));
+        CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(float),    &m0));
+        CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(float),    &m1));
+        CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(int),      &n_head_log2_val));
+        CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(float),    &logit_softcap));
+        CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(int),      &n_head_kv));
+        CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(cl_mem),   &mask_buffer));
+        CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(cl_ulong), &offset_mask));
+        CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(cl_ulong), &mask_nb1));
+        CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(cl_ulong), &mask_nb2));
+        CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(cl_ulong), &mask_nb3));
+        CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(int),      &mask_ne2));
+        CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(int),      &mask_ne3));
+        CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(cl_mem),   &temp_partial.data));
+        CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(int),      &n_splits));
+        CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(int),      &kv_per_split));
+
+        const size_t fd_wg = 64; // matches Q1_WG_SIZE in the kernel
+        size_t fd_lws[3] = { fd_wg, 1, 1 };
+        // gid(2) = q_idx * n_splits + split_idx, dispatched as one dim of size
+        // n_splits * n_q so the split kernel can decode both indices.
+        size_t fd_gws[3] = { fd_wg, (size_t)(n_head * n_batch), (size_t)(n_splits * n_q) };
+        backend_ctx->enqueue_ndrange_kernel(k_split, 3, fd_gws, fd_lws, dst);
+
+        // --- Pass 2: merge ---
+        cl_kernel k_merge = backend_ctx->kernels_flash_attn_f32_merge.at(dk_dv);
+        argi = 0;
+        CL_CHECK(clSetKernelArg(k_merge, argi++, sizeof(cl_mem),   &temp_partial.data));
+        CL_CHECK(clSetKernelArg(k_merge, argi++, sizeof(cl_mem),   &extra_o->data_device));
+        CL_CHECK(clSetKernelArg(k_merge, argi++, sizeof(cl_ulong), &offset_o));
+        CL_CHECK(clSetKernelArg(k_merge, argi++, sizeof(int),      &n_head));
+        CL_CHECK(clSetKernelArg(k_merge, argi++, sizeof(int),      &n_splits));
+        CL_CHECK(clSetKernelArg(k_merge, argi++, sizeof(cl_ulong), &o_nb1));
+        CL_CHECK(clSetKernelArg(k_merge, argi++, sizeof(cl_ulong), &o_nb2));
+        CL_CHECK(clSetKernelArg(k_merge, argi++, sizeof(cl_ulong), &o_nb3));
+        CL_CHECK(clSetKernelArg(k_merge, argi++, sizeof(cl_mem),   &sinks_buffer));
+        CL_CHECK(clSetKernelArg(k_merge, argi++, sizeof(cl_ulong), &offset_sinks));
+        CL_CHECK(clSetKernelArg(k_merge, argi++, sizeof(int),      &n_q));
+
+        const size_t merge_wg  = (size_t) (d_head_v / 4); // one lane per float4
+        size_t merge_lws[3] = { merge_wg, 1, 1 };
+        size_t merge_gws[3] = { merge_wg, (size_t)(n_head * n_batch), (size_t) n_q };
+        backend_ctx->enqueue_ndrange_kernel(k_merge, 3, merge_gws, merge_lws, dst);
+        return;
+    }
 
     CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),    &extra_q->data_device));
     CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_ulong),  &offset_q));
