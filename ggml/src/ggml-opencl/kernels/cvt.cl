@@ -877,6 +877,126 @@ kernel void kernel_restore_block_q8_0(
     }
 }
 
+// GPU-side q8_0 -> f16 dequant kernels. Used by flash_attn when the KV is
+// q8_0 and the variant that expects f16 inputs is being dispatched (e.g.,
+// prefill path that doesn't have a native q8_0 reader). One thread per 32-
+// element block; each thread loads the scale once and writes 32 fp16 values.
+// AoS layout: block_q8_0 records (2 byte scale + 32 byte quants).
+kernel void kernel_dequant_q8_0_f16_aos(
+    global char * src,
+    global half * dst,
+    int n_blocks
+) {
+    int blk = get_global_id(0);
+    if (blk >= n_blocks) return;
+
+    global char * block = src + blk * (QK8_0 + 2);
+    float d = vload_half(0, (global half *)block);
+    global char * qs = block + 2;
+
+    global half * out = dst + blk * QK8_0;
+    for (int i = 0; i < QK8_0; ++i) {
+        out[i] = (half)(d * (float)qs[i]);
+    }
+}
+
+// View-aware AoS dequant producing f32. Same layout assumptions as the f16
+// view variant but writes float output — used by the f32_f32 FA kernel.
+kernel void kernel_dequant_q8_0_f32_view_aos(
+    global char * src,
+    ulong         src_offset,
+    ulong         src_nb1,
+    ulong         src_nb2,
+    ulong         src_nb3,
+    int           nblk0,
+    int           ne1,
+    int           ne2,
+    int           ne3,
+    global float * dst
+) {
+    int blk_i0 = get_global_id(0);
+    int i1     = get_global_id(1);
+    int batch  = get_global_id(2);
+
+    if (blk_i0 >= nblk0) return;
+    if (i1     >= ne1)   return;
+
+    int i2 = batch % ne2;
+    int i3 = batch / ne2;
+    if (i3 >= ne3) return;
+
+    global char * block = src + src_offset + (ulong)i3*src_nb3 + (ulong)i2*src_nb2 + (ulong)i1*src_nb1 + (ulong)blk_i0 * (2 + QK8_0);
+    float d = vload_half(0, (global half *)block);
+    global char * qs = block + 2;
+
+    ulong dst_row_base = ((ulong)i3 * ne2 * ne1 + (ulong)i2 * ne1 + (ulong)i1) * nblk0;
+    global float * out = dst + (dst_row_base + blk_i0) * QK8_0;
+
+    for (int i = 0; i < QK8_0; ++i) {
+        out[i] = d * (float)qs[i];
+    }
+}
+
+// View-aware AoS dequant. Handles simple row-slice views where each row is
+// tight (nb0 = 34 for q8_0) but batch strides may include gaps (e.g., a view
+// of the first n_kv rows of a larger KV cache). Writes into a contiguous f16
+// output buffer indexed by (i3, i2, i1, blk_i0).
+kernel void kernel_dequant_q8_0_f16_view_aos(
+    global char * src,
+    ulong         src_offset,
+    ulong         src_nb1,
+    ulong         src_nb2,
+    ulong         src_nb3,
+    int           nblk0,
+    int           ne1,
+    int           ne2,
+    int           ne3,
+    global half * dst
+) {
+    int blk_i0 = get_global_id(0);
+    int i1     = get_global_id(1);
+    int batch  = get_global_id(2);
+
+    if (blk_i0 >= nblk0) return;
+    if (i1     >= ne1)   return;
+
+    int i2 = batch % ne2;
+    int i3 = batch / ne2;
+    if (i3 >= ne3) return;
+
+    global char * block = src + src_offset + (ulong)i3*src_nb3 + (ulong)i2*src_nb2 + (ulong)i1*src_nb1 + (ulong)blk_i0 * (2 + QK8_0);
+    float d = vload_half(0, (global half *)block);
+    global char * qs = block + 2;
+
+    ulong dst_row_base = ((ulong)i3 * ne2 * ne1 + (ulong)i2 * ne1 + (ulong)i1) * nblk0;
+    global half * out = dst + (dst_row_base + blk_i0) * QK8_0;
+
+    for (int i = 0; i < QK8_0; ++i) {
+        out[i] = (half)(d * (float)qs[i]);
+    }
+}
+
+// SoA layout: separate scale sub-buffer (half per block) and quant sub-buffer
+// (QK8_0 int8 per block). Matches the on-device layout set up by
+// kernel_convert_block_q8_0.
+kernel void kernel_dequant_q8_0_f16_soa(
+    global char * src_q,
+    global char * src_d,
+    global half * dst,
+    int n_blocks
+) {
+    int blk = get_global_id(0);
+    if (blk >= n_blocks) return;
+
+    float d = vload_half(0, (global half *)src_d + blk);
+    global char * qs = src_q + blk * QK8_0;
+
+    global half * out = dst + blk * QK8_0;
+    for (int i = 0; i < QK8_0; ++i) {
+        out[i] = (half)(d * (float)qs[i]);
+    }
+}
+
 kernel void kernel_restore_block_q8_0_trans(
     global uchar * src_q,
     global half  * src_d,

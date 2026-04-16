@@ -1,0 +1,867 @@
+// Enable extensions at the very top of the file. OpenCL pragmas must appear
+// before any non-directive tokens; some drivers don't register overloads if
+// the enable pragma is interleaved with other directives or comments.
+#pragma OPENCL EXTENSION cl_khr_fp16 : enable
+#ifdef cl_khr_integer_dot_product
+#pragma OPENCL EXTENSION cl_khr_integer_dot_product : enable
+#define FA_HAVE_INT_DOT 1
+#endif
+
+// sub_group_shuffle_xor: needed by the N_SPLIT>1 path to reduce per-thread
+// QK partial dots across the N_SPLIT threads that share a query row.
+#ifdef cl_khr_subgroup_shuffle
+#pragma OPENCL EXTENSION cl_khr_subgroup_shuffle : enable
+#define HAS_SUBGROUP_SHUFFLE 1
+#elif defined(cl_qcom_subgroup_shuffle)
+#pragma OPENCL EXTENSION cl_qcom_subgroup_shuffle : enable
+#define HAS_SUBGROUP_SHUFFLE 1
+#endif
+
+// Flash attention kernel for Q=f32, K=q4_0, V=q4_0.
+//
+// q4_0 block layout (18 bytes): half d (scale) + uchar qs[16] (16 packed
+// nibbles in the "shuffled" layout). Element ordering within a block:
+//   - qs[j] low nibble = element j        (j ∈ 0..15)
+//   - qs[j] high nibble = element j+16    (j ∈ 0..15)
+// Dequantization: val[i] = d * (nibble_i - 8)
+//
+// KV footprint is half of q8_0's (quarter of f16's). The decode-path QK dot
+// can exploit this via a dp4a trick: instead of subtracting 8 per nibble
+// inside the inner loop (32 subs per block), we pack the raw nibbles
+// (values 0..15, positive in int8 representation) into uints and compute
+//
+//   sum(q_i * (nibble_i - 8)) = sum(q_i * nibble_i) - 8 * sum(q_i)
+//
+// so one dp4a acts on the unadjusted nibbles and the -8*q_sum correction
+// is applied once per block at the end. q_sum is precomputed when Q is
+// quantised to int8 (see quant_q_block_int8_packed_q4).
+//
+// Nibble → 8 uints packing (matches the Q 4-element grouping exactly):
+//   k_packed[0] = low_nibbles(qs[0..3])   (K positions 0..3)
+//   k_packed[1] = low_nibbles(qs[4..7])   (K positions 4..7)
+//   k_packed[2] = low_nibbles(qs[8..11])  (K positions 8..11)
+//   k_packed[3] = low_nibbles(qs[12..15]) (K positions 12..15)
+//   k_packed[4] = high_nibbles(qs[0..3])  (K positions 16..19)
+//   k_packed[5] = high_nibbles(qs[4..7])  (K positions 20..23)
+//   k_packed[6] = high_nibbles(qs[8..11]) (K positions 24..27)
+//   k_packed[7] = high_nibbles(qs[12..15])(K positions 28..31)
+
+#define ACC_TYPE float
+#define ACC_TYPE4 float4
+#define Q_DATA_TYPE4 float4
+#define O_DATA_TYPE4 float4
+#define MASK_DATA_TYPE half
+#define CONVERT_Q_ACC4(x) (x)
+#define CONVERT_O_DATA4(x) (x)
+
+#define DK_VEC (DK/4)
+#define DV_VEC (DV/4)
+#define Q1_WG_SIZE 64
+
+// q4_0 block layout: 2 bytes scale (half) + 16 bytes packed nibbles = 18 bytes
+#define QK4_0 32
+#define Q4_0_BLOCK_SIZE 18
+
+// Number of q4_0 blocks per row of K or V
+#define DK_Q4_BLOCKS (DK / QK4_0)
+#define DV_Q4_BLOCKS (DV / QK4_0)
+
+// Inline dequantize: load a q4_0 block and compute dot product with a slice of q_priv.
+// q_slice points to 8 float4 elements (32 floats) from the query.
+// Returns the dot product of the dequantized block with the query slice.
+inline float dot_q4_0_f32(const global char * block_ptr, ACC_TYPE4 * q_slice) {
+    float d = vload_half(0, (const global half *)block_ptr);
+    const global uchar * qs = (const global uchar *)(block_ptr + 2);
+
+    float sum = 0.0f;
+    // Low nibbles → elements 0..15 (covers q_slice[0..3])
+    #pragma unroll
+    for (int g = 0; g < 4; ++g) {
+        float4 nv = (float4)((float)(int)(qs[g*4 + 0] & 0x0F) - 8.0f,
+                             (float)(int)(qs[g*4 + 1] & 0x0F) - 8.0f,
+                             (float)(int)(qs[g*4 + 2] & 0x0F) - 8.0f,
+                             (float)(int)(qs[g*4 + 3] & 0x0F) - 8.0f);
+        sum += dot(q_slice[g], nv);
+    }
+    // High nibbles → elements 16..31 (covers q_slice[4..7])
+    #pragma unroll
+    for (int g = 0; g < 4; ++g) {
+        float4 nv = (float4)((float)(int)(qs[g*4 + 0] >> 4) - 8.0f,
+                             (float)(int)(qs[g*4 + 1] >> 4) - 8.0f,
+                             (float)(int)(qs[g*4 + 2] >> 4) - 8.0f,
+                             (float)(int)(qs[g*4 + 3] >> 4) - 8.0f);
+        sum += dot(q_slice[4 + g], nv);
+    }
+    return sum * d;
+}
+
+#ifdef FA_HAVE_INT_DOT
+// Pack four signed 8-bit chars into a uint32 (little-endian byte order).
+inline uint pack_i8x4(char a, char b, char c, char d) {
+    return ((uint)(uchar)a)       |
+           ((uint)(uchar)b) <<  8  |
+           ((uint)(uchar)c) << 16  |
+           ((uint)(uchar)d) << 24;
+}
+
+// Quantise a single 32-float Q block to int8, store as 8 packed uint32s, and
+// return both the per-block scale Qd and the integer sum of the quantised
+// values (needed for the q4_0 nibble bias correction: -8 * sum_of_q).
+typedef struct {
+    float qd;
+    int   q_sum;
+} q4_q_block_info;
+
+inline q4_q_block_info quant_q_block_int8_packed_q4(const ACC_TYPE4 * q_block,
+                                                    uint *            out_packed) {
+    float amax = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        float4 av = fabs(q_block[i]);
+        amax = fmax(amax, fmax(fmax(av.s0, av.s1), fmax(av.s2, av.s3)));
+    }
+    float qd  = amax / 127.0f;
+    float qid = (amax > 0.0f) ? 127.0f / amax : 0.0f;
+
+    int q_sum = 0;
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        float4 v = q_block[i] * qid;
+        char a = (char)((int)round(v.s0));
+        char b = (char)((int)round(v.s1));
+        char c = (char)((int)round(v.s2));
+        char d = (char)((int)round(v.s3));
+        out_packed[i] = pack_i8x4(a, b, c, d);
+        q_sum += (int)a + (int)b + (int)c + (int)d;
+    }
+    q4_q_block_info info = { qd, q_sum };
+    return info;
+}
+
+// Pack K's q4_0 block (16 bytes of nibbles) into 8 uint32s of 4 int8s each.
+// Low nibbles go to k_packed[0..3] (Q positions 0..15), high nibbles go to
+// k_packed[4..7] (Q positions 16..31). Values remain in 0..15 (positive in
+// int8 representation); the -8 bias is applied once per block via q_sum.
+inline void pack_q4_0_nibbles(const global uchar * qs, uint * k_packed) {
+    #pragma unroll
+    for (int g = 0; g < 4; ++g) {
+        uchar b0 = qs[g*4 + 0];
+        uchar b1 = qs[g*4 + 1];
+        uchar b2 = qs[g*4 + 2];
+        uchar b3 = qs[g*4 + 3];
+        k_packed[g] =
+              ((uint)(b0 & 0x0F))       |
+              ((uint)(b1 & 0x0F)) <<  8 |
+              ((uint)(b2 & 0x0F)) << 16 |
+              ((uint)(b3 & 0x0F)) << 24;
+        k_packed[4 + g] =
+              ((uint)(b0 >> 4))         |
+              ((uint)(b1 >> 4)) <<  8   |
+              ((uint)(b2 >> 4)) << 16   |
+              ((uint)(b3 >> 4)) << 24;
+    }
+}
+
+// dp4a-accelerated QK dot product for a single q4_0 block.
+// Layout caveat: sum here accumulates q_i * nibble_i where nibble_i ∈ 0..15;
+// the real K value is (nibble_i - 8) * d, so we subtract 8 * q_sum at the end.
+inline float dot_q4_0_int(const global char * k_block_ptr,
+                          const uint *        q_packed,
+                          float               q_d,
+                          int                 q_sum) {
+    float kd = vload_half(0, (const global half *)k_block_ptr);
+    const global uchar * k_qs = (const global uchar *)(k_block_ptr + 2);
+
+    uint k_packed[8];
+    pack_q4_0_nibbles(k_qs, k_packed);
+
+    int sum = 0;
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        sum = dot_acc_sat_4x8packed_ss_int(q_packed[i], k_packed[i], sum);
+    }
+    // sum currently holds sum(q_i * nibble_i); real value is
+    //   sum(q_i * (nibble_i - 8)) = sum - 8 * q_sum
+    return (float)(sum - 8 * q_sum) * q_d * kd;
+}
+#endif // FA_HAVE_INT_DOT
+
+// Dequantize a q4_0 block into 8 float4 values (32 floats).
+// Element i at position i: positions 0..15 from low nibbles, 16..31 from high.
+inline void dequant_q4_0_f32(const global char * block_ptr, ACC_TYPE4 * out) {
+    float d = vload_half(0, (const global half *)block_ptr);
+    const global uchar * qs = (const global uchar *)(block_ptr + 2);
+
+    #pragma unroll
+    for (int g = 0; g < 4; ++g) {
+        out[g] = d * (float4)((float)(int)(qs[g*4 + 0] & 0x0F) - 8.0f,
+                              (float)(int)(qs[g*4 + 1] & 0x0F) - 8.0f,
+                              (float)(int)(qs[g*4 + 2] & 0x0F) - 8.0f,
+                              (float)(int)(qs[g*4 + 3] & 0x0F) - 8.0f);
+    }
+    #pragma unroll
+    for (int g = 0; g < 4; ++g) {
+        out[4 + g] = d * (float4)((float)(int)(qs[g*4 + 0] >> 4) - 8.0f,
+                                  (float)(int)(qs[g*4 + 1] >> 4) - 8.0f,
+                                  (float)(int)(qs[g*4 + 2] >> 4) - 8.0f,
+                                  (float)(int)(qs[g*4 + 3] >> 4) - 8.0f);
+    }
+}
+
+// ALiBi slope computation. When max_bias <= 0 (no ALiBi) this returns 1.0f so
+// the mask term is applied directly (score += 1.0 * mask[k_idx]); the baseline
+// f16 FA kernel does the same. Returning 0 here would silently drop the mask.
+inline float get_alibi_slope(float max_bias, int head_idx, int n_head_log2, float m0, float m1) {
+    if (max_bias <= 0.0f) return 1.0f;
+    float base = (head_idx < n_head_log2) ? m0 : m1;
+    int   exph = (head_idx < n_head_log2) ? (head_idx + 1) : (2*(head_idx - n_head_log2) + 1);
+    return pow(base, (float)exph);
+}
+
+// ============================================================================
+// q1 decode kernel: Q=f32, K=q4_0, V=q4_0
+// One query row, each thread processes a different KV position.
+// ============================================================================
+__kernel void flash_attn_f32_q4_0_q1(
+    const global void * q_void, ulong q_offset,
+    const global void * k_void, ulong k_offset,
+    const global void * v_void, ulong v_offset,
+    global void * o_void, ulong o_offset,
+    const float scale,
+    const int n_q,
+    const int n_kv,
+    const int is_causal,
+    const int n_head,
+    const ulong q_nb1, const ulong q_nb2, const ulong q_nb3,
+    const ulong k_nb1, const ulong k_nb2, const ulong k_nb3,
+    const ulong v_nb1, const ulong v_nb2, const ulong v_nb3,
+    const ulong o_nb1, const ulong o_nb2, const ulong o_nb3,
+    const float max_bias,
+    const float m0,
+    const float m1,
+    const int n_head_log2,
+    const float logit_softcap,
+    const int n_head_kv,
+    const global void* mask_void,
+    const ulong mask_offset,
+    const ulong mask_nb1,
+    const ulong mask_nb2,
+    const ulong mask_nb3,
+    const int mask_ne2,
+    const int mask_ne3,
+    const global void* sinks_void,
+    const ulong sinks_offset
+) {
+    const int tid = get_local_id(0);
+    const int head_batch_idx = get_global_id(1);
+
+    const int batch_idx = head_batch_idx / n_head;
+    const int head_idx = head_batch_idx % n_head;
+
+    const int gqa_ratio = n_head / n_head_kv;
+    const int head_kv_idx = head_idx / gqa_ratio;
+
+    const global char* q_base = (const global char*)q_void + q_offset;
+    const global char* k_base = (const global char*)k_void + k_offset;
+    const global char* v_base = (const global char*)v_void + v_offset;
+    global char* o_base = (global char*)o_void + o_offset;
+
+    const global char* mask_base = NULL;
+    if (mask_void != NULL) {
+        const int mask_head_idx = head_idx % mask_ne2;
+        const int mask_batch_idx = batch_idx % mask_ne3;
+        mask_base = (const global char*)mask_void + mask_offset + mask_batch_idx * mask_nb3 + mask_head_idx * mask_nb2;
+    }
+
+    // Load query row into private registers (f32)
+    ACC_TYPE4 q_priv[DK_VEC];
+    const ulong q_row_offset = batch_idx * q_nb3 + head_idx * q_nb2;
+    const global Q_DATA_TYPE4* q_ptr = (const global Q_DATA_TYPE4*)(q_base + q_row_offset);
+    #pragma unroll
+    for (int i = 0; i < DK_VEC; ++i) {
+        q_priv[i] = CONVERT_Q_ACC4(q_ptr[i]);
+    }
+
+#ifdef FA_HAVE_INT_DOT
+    // Quantize Q once per q4_0-sized block (32 floats = 8 float4s). For each
+    // block we store 8 packed uint32 quants, the per-block scale qd, and the
+    // integer sum of the 32 int8 quants (used to remove the -8 bias in the
+    // inner loop).
+    uint  q_packed[DK_Q4_BLOCKS * 8];
+    float q_d_scale[DK_Q4_BLOCKS];
+    int   q_sum_arr[DK_Q4_BLOCKS];
+    #pragma unroll
+    for (int b = 0; b < DK_Q4_BLOCKS; ++b) {
+        q4_q_block_info info = quant_q_block_int8_packed_q4(&q_priv[b * 8], &q_packed[b * 8]);
+        q_d_scale[b] = info.qd;
+        q_sum_arr[b] = info.q_sum;
+    }
+#endif
+
+    float slope = get_alibi_slope(max_bias, head_idx, n_head_log2, m0, m1);
+
+    const global ACC_TYPE* sinks_ptr = NULL;
+    if (sinks_void != NULL) {
+        sinks_ptr = (const global ACC_TYPE*)((const global char*)sinks_void + sinks_offset);
+    }
+
+    // === Pass 1: find max score ===
+    ACC_TYPE m_i = (sinks_ptr != NULL) ? sinks_ptr[head_idx] : -INFINITY;
+    for (int k_idx = tid; k_idx < n_kv; k_idx += Q1_WG_SIZE) {
+        const global char* k_row = k_base + batch_idx * k_nb3 + head_kv_idx * k_nb2 + k_idx * k_nb1;
+
+        ACC_TYPE score = 0.0f;
+        #pragma unroll
+        for (int b = 0; b < DK_Q4_BLOCKS; b++) {
+#ifdef FA_HAVE_INT_DOT
+            score += dot_q4_0_int(k_row + b * Q4_0_BLOCK_SIZE,
+                                   &q_packed[b * 8], q_d_scale[b], q_sum_arr[b]);
+#else
+            score += dot_q4_0_f32(k_row + b * Q4_0_BLOCK_SIZE, &q_priv[b * 8]);
+#endif
+        }
+        score *= scale;
+
+        if (mask_base != NULL) {
+            const global MASK_DATA_TYPE* mask_ptr = (const global MASK_DATA_TYPE*)(mask_base);
+            score += slope * (ACC_TYPE)mask_ptr[k_idx];
+        }
+        if (logit_softcap > 0.0f) {
+            score = logit_softcap * tanh(score / logit_softcap);
+        }
+        m_i = max(m_i, score);
+    }
+
+    // Reduce max across workgroup
+    __local ACC_TYPE local_m[Q1_WG_SIZE];
+    local_m[tid] = m_i;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    #pragma unroll
+    for (int s = Q1_WG_SIZE / 2; s > 0; s >>= 1) {
+        if (tid < s) local_m[tid] = max(local_m[tid], local_m[tid + s]);
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    const ACC_TYPE m_final = local_m[0];
+
+    // === Pass 2: compute softmax-weighted V accumulation ===
+    ACC_TYPE4 o_acc[DV_VEC];
+    #pragma unroll
+    for (int i = 0; i < DV_VEC; ++i) o_acc[i] = (ACC_TYPE4)(0.0f);
+    ACC_TYPE l_i = 0.0f;
+
+    for (int k_idx = tid; k_idx < n_kv; k_idx += Q1_WG_SIZE) {
+        const global char* k_row = k_base + batch_idx * k_nb3 + head_kv_idx * k_nb2 + k_idx * k_nb1;
+        const global char* v_row = v_base + batch_idx * v_nb3 + head_kv_idx * v_nb2 + k_idx * v_nb1;
+
+        ACC_TYPE score = 0.0f;
+        #pragma unroll
+        for (int b = 0; b < DK_Q4_BLOCKS; b++) {
+#ifdef FA_HAVE_INT_DOT
+            score += dot_q4_0_int(k_row + b * Q4_0_BLOCK_SIZE,
+                                   &q_packed[b * 8], q_d_scale[b], q_sum_arr[b]);
+#else
+            score += dot_q4_0_f32(k_row + b * Q4_0_BLOCK_SIZE, &q_priv[b * 8]);
+#endif
+        }
+        score *= scale;
+
+        if (mask_base != NULL) {
+            const global MASK_DATA_TYPE* mask_ptr = (const global MASK_DATA_TYPE*)(mask_base);
+            score += slope * (ACC_TYPE)mask_ptr[k_idx];
+        }
+        if (logit_softcap > 0.0f) {
+            score = logit_softcap * tanh(score / logit_softcap);
+        }
+
+        const ACC_TYPE p = exp(score - m_final);
+        l_i += p;
+
+        // Accumulate p * V (dequantize V inline)
+        #pragma unroll
+        for (int b = 0; b < DV_Q4_BLOCKS; b++) {
+            ACC_TYPE4 v_dequant[8];
+            dequant_q4_0_f32(v_row + b * Q4_0_BLOCK_SIZE, v_dequant);
+            #pragma unroll
+            for (int i = 0; i < 8; i++) {
+                o_acc[b * 8 + i] = mad(p, v_dequant[i], o_acc[b * 8 + i]);
+            }
+        }
+    }
+
+    // === Reduce and write output ===
+    __local ACC_TYPE local_l[Q1_WG_SIZE];
+    __local ACC_TYPE4 local_o_comp[Q1_WG_SIZE];
+    local_l[tid] = l_i;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    #pragma unroll
+    for (int s = Q1_WG_SIZE / 2; s > 0; s >>= 1) {
+        if (tid < s) local_l[tid] += local_l[tid + s];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    const ulong o_row_offset = batch_idx * o_nb3 + head_idx * o_nb1;
+    global O_DATA_TYPE4 *o_row = (global O_DATA_TYPE4 *)(o_base + o_row_offset);
+    ACC_TYPE l_final = local_l[0];
+
+    if (sinks_ptr != NULL) {
+        l_final += exp(sinks_ptr[head_idx] - m_final);
+    }
+
+    if (l_final > 0.0f) {
+        const ACC_TYPE l_inv = 1.0f / l_final;
+        for (int i = 0; i < DV_VEC; i++) {
+            local_o_comp[tid] = o_acc[i];
+            barrier(CLK_LOCAL_MEM_FENCE);
+            #pragma unroll
+            for (int s = Q1_WG_SIZE / 2; s > 0; s >>= 1) {
+                if (tid < s) local_o_comp[tid] += local_o_comp[tid + s];
+                barrier(CLK_LOCAL_MEM_FENCE);
+            }
+            if (tid == 0) {
+                o_row[i] = CONVERT_O_DATA4(local_o_comp[0] * l_inv);
+            }
+        }
+    } else if (tid == 0) {
+        #pragma unroll
+        for (int i = 0; i < DV_VEC; ++i) o_row[i] = (O_DATA_TYPE4)(0.0f);
+    }
+}
+
+// ============================================================================
+// Prefill kernel: Q=f32, K=q4_0, V=q4_0, n_q > 1.
+// BLOCK_M × BLOCK_N tiling.
+//
+// K path: stored in local memory as packed int8 (8 uints per q4_0 block) +
+// per-block scale + per-block nibble sum (= sum over k nibbles in 0..15 — used
+// below to subtract 16 * 4 = 64 total? No: we track only the Q sum and apply
+// -8 * q_sum). QK dot uses dot_acc_sat_4x8packed_ss_int.
+//
+// V path: dequantised to half in local memory (same rationale as q8_0 kernel:
+// half4 → float4 convert is a fast hardware path; keeping V as nibbles + inline
+// unpack saves local memory but costs more cycles on Adreno X1-85).
+//
+// Supports the same (DK, DV) set as the q8_0 kernel; DK % QK4_0 == 0 and
+// DV % QK4_0 == 0 (identical block size of 32 — same pairs work).
+// ============================================================================
+#define KV_DATA_TYPE4 half4
+#define CONVERT_KV_ACC4(x) ((float4)((float)(x).s0, (float)(x).s1, (float)(x).s2, (float)(x).s3))
+
+#define DK_Q4_BLOCKS_PREFILL (DK / QK4_0)
+#define DV_Q4_BLOCKS_PREFILL (DV / QK4_0)
+
+// N_SPLIT: same mechanism as the q8_0 kernel. When >1, each thread owns
+// 1/N_SPLIT of DK and DV; partial QK dots are reduced via sub_group_shuffle_xor.
+// All threads evolve (m_i, l_i) identically so no extra barriers.
+// Requires DK_Q4_BLOCKS_PREFILL % N_SPLIT == 0.
+#ifndef N_SPLIT
+#define N_SPLIT 1
+#endif
+
+#if N_SPLIT > 1
+#define SPLIT_DK_VEC        (DK_VEC / N_SPLIT)
+#define SPLIT_DV_VEC        (DV_VEC / N_SPLIT)
+#define SPLIT_DK_Q4_BLOCKS  (DK_Q4_BLOCKS_PREFILL / N_SPLIT)
+#define WG_SIZE             (BLOCK_M * N_SPLIT)
+#else
+#define SPLIT_DK_VEC        DK_VEC
+#define SPLIT_DV_VEC        DV_VEC
+#define SPLIT_DK_Q4_BLOCKS  DK_Q4_BLOCKS_PREFILL
+#define WG_SIZE             BLOCK_M
+#endif
+
+__kernel void flash_attn_f32_q4_0(
+    const global void * q_void, ulong q_offset,
+    const global void * k_void, ulong k_offset,
+    const global void * v_void, ulong v_offset,
+    global void * o_void, ulong o_offset,
+    const float scale,
+    const int n_q,
+    const int n_kv,
+    const int is_causal,
+    const int n_head,
+    const ulong q_nb1, const ulong q_nb2, const ulong q_nb3,
+    const ulong k_nb1, const ulong k_nb2, const ulong k_nb3,
+    const ulong v_nb1, const ulong v_nb2, const ulong v_nb3,
+    const ulong o_nb1, const ulong o_nb2, const ulong o_nb3,
+    const float max_bias,
+    const float m0,
+    const float m1,
+    const int n_head_log2,
+    const float logit_softcap,
+    const int n_head_kv,
+    const global void* mask_void,
+    const ulong mask_offset,
+    const ulong mask_nb1,
+    const ulong mask_nb2,
+    const ulong mask_nb3,
+    const int mask_ne2,
+    const int mask_ne3,
+    const global void* sinks_void,
+    const ulong sinks_offset,
+    // blk (optional): per-(qblock, kvblock) classification from flash_attn_blk_f16.
+    //   0 = fully masked → skip tile, 1 = mixed → apply per-row mask,
+    //   2 = fully unmasked → skip mask application.
+    // Pass NULL to disable the prepass optimisation.
+    const global void * blk_void
+) {
+    const int tid = get_local_id(0);
+    const int block_q_idx = get_group_id(0);
+    const int head_batch_idx = get_global_id(1);
+
+#if N_SPLIT > 1
+    const int q_lane    = tid / N_SPLIT;
+    const int split_idx = tid % N_SPLIT;
+#else
+    const int q_lane    = tid;
+    const int split_idx = 0;
+#endif
+    const int my_query_row = block_q_idx * BLOCK_M + q_lane;
+    const int query_valid = my_query_row < n_q;
+
+    const int batch_idx = head_batch_idx / n_head;
+    const int head_idx  = head_batch_idx % n_head;
+
+    const int gqa_ratio   = n_head / n_head_kv;
+    const int head_kv_idx = head_idx / gqa_ratio;
+    const int mask_head_idx  = mask_void != NULL ? head_idx  % mask_ne2 : 0;
+    const int mask_batch_idx = mask_void != NULL ? batch_idx % mask_ne3 : 0;
+
+    const global char * q_base = (const global char *) q_void + q_offset;
+    const global char * k_base = (const global char *) k_void + k_offset;
+    const global char * v_base = (const global char *) v_void + v_offset;
+    global       char * o_base = (global       char *) o_void + o_offset;
+
+    const global char * mask_base = NULL;
+    if (mask_void != NULL) {
+        mask_base = (const global char *) mask_void + mask_offset +
+                    mask_batch_idx * mask_nb3 + mask_head_idx * mask_nb2;
+    }
+
+    // blk_base: classification buffer pointer for this (batch, head, q_block).
+    // BLK_PREPASS_BM may differ from this kernel's BLOCK_M (see q8_0 kernel for
+    // rationale). Default to BLOCK_M when unset.
+    #ifndef BLK_PREPASS_BM
+    #define BLK_PREPASS_BM BLOCK_M
+    #endif
+    const global char * blk_base = NULL;
+    int n_kv_blocks = 0;
+    if (blk_void != NULL) {
+        n_kv_blocks = (n_kv + BLOCK_N - 1) / BLOCK_N;
+        const int n_q_blocks_prepass = (n_q + BLK_PREPASS_BM - 1) / BLK_PREPASS_BM;
+        const int prepass_q_block    = (block_q_idx * BLOCK_M) / BLK_PREPASS_BM;
+        blk_base = (const global char *) blk_void +
+                   (((mask_batch_idx * mask_ne2) + mask_head_idx) * n_q_blocks_prepass + prepass_q_block) * n_kv_blocks;
+    }
+
+    // --- Load Q row slice into private registers -----------------------------
+    const int dk_off_vec = split_idx * SPLIT_DK_VEC;
+    ACC_TYPE4 q_priv[SPLIT_DK_VEC];
+    if (query_valid) {
+        const ulong q_row_offset = batch_idx * q_nb3 + head_idx * q_nb2 + my_query_row * q_nb1;
+        const global float4 * q_ptr = (const global float4 *) (q_base + q_row_offset);
+        #pragma unroll
+        for (int i = 0; i < SPLIT_DK_VEC; ++i) {
+            q_priv[i] = q_ptr[dk_off_vec + i];
+        }
+    } else {
+        #pragma unroll
+        for (int i = 0; i < SPLIT_DK_VEC; ++i) q_priv[i] = (ACC_TYPE4)(0.0f);
+    }
+
+#ifdef FA_HAVE_INT_DOT
+    // Quantise owned Q slice into packed int8. Each thread processes
+    // SPLIT_DK_Q4_BLOCKS q4_0-sized blocks (its share of DK).
+    uint  q_packed_pf[SPLIT_DK_Q4_BLOCKS * 8];
+    float q_d_pf[SPLIT_DK_Q4_BLOCKS];
+    int   q_sum_pf[SPLIT_DK_Q4_BLOCKS];
+    #pragma unroll
+    for (int b = 0; b < SPLIT_DK_Q4_BLOCKS; ++b) {
+        q4_q_block_info info = quant_q_block_int8_packed_q4(&q_priv[b * 8], &q_packed_pf[b * 8]);
+        q_d_pf[b]   = info.qd;
+        q_sum_pf[b] = info.q_sum;
+    }
+#endif
+
+    // --- Output accumulator, softmax state -----------------------------------
+    const int dv_off_vec = split_idx * SPLIT_DV_VEC;
+    ACC_TYPE4 o_acc[SPLIT_DV_VEC];
+    #pragma unroll
+    for (int i = 0; i < SPLIT_DV_VEC; ++i) o_acc[i] = (ACC_TYPE4)(0.0f);
+
+    ACC_TYPE m_i = -INFINITY;
+    ACC_TYPE l_i = 0.0f;
+
+    float slope = get_alibi_slope(max_bias, head_idx, n_head_log2, m0, m1);
+
+#ifdef FA_HAVE_INT_DOT
+    // K tile: packed int8 (8 uints per block, nibbles in 0..15) + per-block scale.
+    __local uint  l_k_packed[BLOCK_N][DK_Q4_BLOCKS_PREFILL * 8];
+    __local float l_k_scale [BLOCK_N][DK_Q4_BLOCKS_PREFILL];
+#else
+    __local half4 l_k[BLOCK_N][DK_VEC];
+#endif
+
+    __local half4 l_v[BLOCK_N][DV_VEC];
+
+    // --- KV iteration --------------------------------------------------------
+    for (int k_start = 0; k_start < n_kv; k_start += BLOCK_N) {
+        // Skip fully-masked KV blocks before loading K/V tiles. Uniform branch.
+        char blk_cur = 1;
+        if (blk_base != NULL) {
+            blk_cur = blk_base[k_start / BLOCK_N];
+            if (blk_cur == 0) continue;
+        }
+
+        // K tile load.
+        {
+#ifdef FA_HAVE_INT_DOT
+            // One thread per q4_0 block reads the 16-byte qs, unpacks to
+            // 8 uints of raw nibbles (values 0..15), and stores scale.
+            const int k_blocks_per_row = DK_Q4_BLOCKS_PREFILL;
+            const int n_blocks_total = BLOCK_N * k_blocks_per_row;
+            for (int i = tid; i < n_blocks_total; i += WG_SIZE) {
+                const int row = i / k_blocks_per_row;
+                const int blk = i % k_blocks_per_row;
+                const int k_row_idx = k_start + row;
+                if (k_row_idx < n_kv) {
+                    const ulong k_row_off = batch_idx * k_nb3 + head_kv_idx * k_nb2 + k_row_idx * k_nb1;
+                    const global char * blk_ptr = k_base + k_row_off + blk * Q4_0_BLOCK_SIZE;
+                    const float df = (float) vload_half(0, (const global half *) blk_ptr);
+                    const global uchar * qs = (const global uchar *)(blk_ptr + 2);
+                    l_k_scale[row][blk] = df;
+                    uint k_packed[8];
+                    pack_q4_0_nibbles(qs, k_packed);
+                    #pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        l_k_packed[row][blk * 8 + j] = k_packed[j];
+                    }
+                } else {
+                    l_k_scale[row][blk] = 0.0f;
+                    #pragma unroll
+                    for (int j = 0; j < 8; ++j) l_k_packed[row][blk * 8 + j] = 0u;
+                }
+            }
+#else
+            // Fallback: dequant q4_0 → half in local memory.
+            const int k_blocks_per_row = DK_Q4_BLOCKS_PREFILL;
+            const int n_blocks_total = BLOCK_N * k_blocks_per_row;
+            for (int i = tid; i < n_blocks_total; i += WG_SIZE) {
+                const int row = i / k_blocks_per_row;
+                const int blk = i % k_blocks_per_row;
+                const int k_row_idx = k_start + row;
+                if (k_row_idx < n_kv) {
+                    const ulong k_row_off = batch_idx * k_nb3 + head_kv_idx * k_nb2 + k_row_idx * k_nb1;
+                    const global char * blk_ptr = k_base + k_row_off + blk * Q4_0_BLOCK_SIZE;
+                    const float df = (float) vload_half(0, (const global half *) blk_ptr);
+                    const global uchar * qs = (const global uchar *)(blk_ptr + 2);
+                    #pragma unroll
+                    for (int g = 0; g < 4; ++g) {
+                        float4 vlo = df * (float4)((float)(int)(qs[g*4 + 0] & 0x0F) - 8.0f,
+                                                   (float)(int)(qs[g*4 + 1] & 0x0F) - 8.0f,
+                                                   (float)(int)(qs[g*4 + 2] & 0x0F) - 8.0f,
+                                                   (float)(int)(qs[g*4 + 3] & 0x0F) - 8.0f);
+                        float4 vhi = df * (float4)((float)(int)(qs[g*4 + 0] >> 4) - 8.0f,
+                                                   (float)(int)(qs[g*4 + 1] >> 4) - 8.0f,
+                                                   (float)(int)(qs[g*4 + 2] >> 4) - 8.0f,
+                                                   (float)(int)(qs[g*4 + 3] >> 4) - 8.0f);
+                        l_k[row][blk * 8 + g    ] = (half4)((half)vlo.s0, (half)vlo.s1, (half)vlo.s2, (half)vlo.s3);
+                        l_k[row][blk * 8 + 4 + g] = (half4)((half)vhi.s0, (half)vhi.s1, (half)vhi.s2, (half)vhi.s3);
+                    }
+                } else {
+                    #pragma unroll
+                    for (int j = 0; j < 8; ++j) l_k[row][blk * 8 + j] = (half4)(0.0h);
+                }
+            }
+#endif
+        }
+        // V tile load — dequant V → half in local memory.
+        {
+            const int v_blocks_per_row = DV_Q4_BLOCKS_PREFILL;
+            const int n_blocks_total = BLOCK_N * v_blocks_per_row;
+            for (int i = tid; i < n_blocks_total; i += WG_SIZE) {
+                const int row = i / v_blocks_per_row;
+                const int blk = i % v_blocks_per_row;
+                const int v_row_idx = k_start + row;
+                if (v_row_idx < n_kv) {
+                    const ulong v_row_off = batch_idx * v_nb3 + head_kv_idx * v_nb2 + v_row_idx * v_nb1;
+                    const global char * blk_ptr = v_base + v_row_off + blk * Q4_0_BLOCK_SIZE;
+                    const float df = (float) vload_half(0, (const global half *) blk_ptr);
+                    const global uchar * qs = (const global uchar *)(blk_ptr + 2);
+                    #pragma unroll
+                    for (int g = 0; g < 4; ++g) {
+                        float4 vlo = df * (float4)((float)(int)(qs[g*4 + 0] & 0x0F) - 8.0f,
+                                                   (float)(int)(qs[g*4 + 1] & 0x0F) - 8.0f,
+                                                   (float)(int)(qs[g*4 + 2] & 0x0F) - 8.0f,
+                                                   (float)(int)(qs[g*4 + 3] & 0x0F) - 8.0f);
+                        float4 vhi = df * (float4)((float)(int)(qs[g*4 + 0] >> 4) - 8.0f,
+                                                   (float)(int)(qs[g*4 + 1] >> 4) - 8.0f,
+                                                   (float)(int)(qs[g*4 + 2] >> 4) - 8.0f,
+                                                   (float)(int)(qs[g*4 + 3] >> 4) - 8.0f);
+                        l_v[row][blk * 8 + g    ] = (half4)((half)vlo.s0, (half)vlo.s1, (half)vlo.s2, (half)vlo.s3);
+                        l_v[row][blk * 8 + 4 + g] = (half4)((half)vhi.s0, (half)vhi.s1, (half)vhi.s2, (half)vhi.s3);
+                    }
+                } else {
+                    #pragma unroll
+                    for (int j = 0; j < 8; ++j) l_v[row][blk * 8 + j] = (half4)(0.0h);
+                }
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        // --- QK dot + online softmax (j += 4 unroll, mirrors f32_f16) ---
+#if N_SPLIT > 1
+        {
+#else
+        if (query_valid) {
+#endif
+            const int k_blk_base = split_idx * SPLIT_DK_Q4_BLOCKS;
+            for (int j = 0; j < BLOCK_N; j += 4) {
+                const int k_row0 = k_start + j;
+                const int k_row1 = k_start + j + 1;
+                const int k_row2 = k_start + j + 2;
+                const int k_row3 = k_start + j + 3;
+
+                ACC_TYPE s0, s1, s2, s3;
+#ifdef FA_HAVE_INT_DOT
+                // dp4a QK dot on nibbles-as-int8 (values 0..15). Correction
+                // -8*q_sum is applied once per block via the (sumX - 8*q_sum)
+                // step below.
+                s0 = 0.0f; s1 = 0.0f; s2 = 0.0f; s3 = 0.0f;
+                #pragma unroll
+                for (int b_local = 0; b_local < SPLIT_DK_Q4_BLOCKS; ++b_local) {
+                    const int b = k_blk_base + b_local;
+                    int sum0 = 0, sum1 = 0, sum2 = 0, sum3 = 0;
+                    #pragma unroll
+                    for (int g = 0; g < 8; ++g) {
+                        const uint qp = q_packed_pf[b_local * 8 + g];
+                        sum0 = dot_acc_sat_4x8packed_ss_int(qp, l_k_packed[j  ][b * 8 + g], sum0);
+                        sum1 = dot_acc_sat_4x8packed_ss_int(qp, l_k_packed[j+1][b * 8 + g], sum1);
+                        sum2 = dot_acc_sat_4x8packed_ss_int(qp, l_k_packed[j+2][b * 8 + g], sum2);
+                        sum3 = dot_acc_sat_4x8packed_ss_int(qp, l_k_packed[j+3][b * 8 + g], sum3);
+                    }
+                    const float qd    = q_d_pf[b_local];
+                    const int   q_sum = q_sum_pf[b_local];
+                    s0 += (float)(sum0 - 8 * q_sum) * qd * l_k_scale[j  ][b];
+                    s1 += (float)(sum1 - 8 * q_sum) * qd * l_k_scale[j+1][b];
+                    s2 += (float)(sum2 - 8 * q_sum) * qd * l_k_scale[j+2][b];
+                    s3 += (float)(sum3 - 8 * q_sum) * qd * l_k_scale[j+3][b];
+                }
+#else
+                ACC_TYPE4 dot_acc0 = (ACC_TYPE4)(0.0f);
+                ACC_TYPE4 dot_acc1 = (ACC_TYPE4)(0.0f);
+                ACC_TYPE4 dot_acc2 = (ACC_TYPE4)(0.0f);
+                ACC_TYPE4 dot_acc3 = (ACC_TYPE4)(0.0f);
+                #pragma unroll
+                for (int k = 0; k < SPLIT_DK_VEC; ++k) {
+                    const ACC_TYPE4 qk = q_priv[k];
+                    const int k_abs = dk_off_vec + k;
+                    dot_acc0 = mad(qk, CONVERT_KV_ACC4(l_k[j  ][k_abs]), dot_acc0);
+                    dot_acc1 = mad(qk, CONVERT_KV_ACC4(l_k[j+1][k_abs]), dot_acc1);
+                    dot_acc2 = mad(qk, CONVERT_KV_ACC4(l_k[j+2][k_abs]), dot_acc2);
+                    dot_acc3 = mad(qk, CONVERT_KV_ACC4(l_k[j+3][k_abs]), dot_acc3);
+                }
+                s0 = dot_acc0.s0 + dot_acc0.s1 + dot_acc0.s2 + dot_acc0.s3;
+                s1 = dot_acc1.s0 + dot_acc1.s1 + dot_acc1.s2 + dot_acc1.s3;
+                s2 = dot_acc2.s0 + dot_acc2.s1 + dot_acc2.s2 + dot_acc2.s3;
+                s3 = dot_acc3.s0 + dot_acc3.s1 + dot_acc3.s2 + dot_acc3.s3;
+#endif
+
+#if N_SPLIT > 1
+                // Reduce partials across the N_SPLIT threads that share this
+                // query row. Power-of-2 N_SPLIT uses shuffle_xor butterfly;
+                // N_SPLIT=3 (DK=96 case, where DK_Q4_BLOCKS=3) uses explicit
+                // 3-way shuffle since butterfly doesn't cover a 3-lane group.
+                #if (N_SPLIT & (N_SPLIT - 1)) == 0
+                    #pragma unroll
+                    for (int step = 1; step < N_SPLIT; step <<= 1) {
+                        s0 += sub_group_shuffle_xor(s0, step);
+                        s1 += sub_group_shuffle_xor(s1, step);
+                        s2 += sub_group_shuffle_xor(s2, step);
+                        s3 += sub_group_shuffle_xor(s3, step);
+                    }
+                #else
+                    const uint tri_base = (get_sub_group_local_id() / N_SPLIT) * N_SPLIT;
+                    s0 = sub_group_shuffle(s0, tri_base + 0) + sub_group_shuffle(s0, tri_base + 1) + sub_group_shuffle(s0, tri_base + 2);
+                    s1 = sub_group_shuffle(s1, tri_base + 0) + sub_group_shuffle(s1, tri_base + 1) + sub_group_shuffle(s1, tri_base + 2);
+                    s2 = sub_group_shuffle(s2, tri_base + 0) + sub_group_shuffle(s2, tri_base + 1) + sub_group_shuffle(s2, tri_base + 2);
+                    s3 = sub_group_shuffle(s3, tri_base + 0) + sub_group_shuffle(s3, tri_base + 1) + sub_group_shuffle(s3, tri_base + 2);
+                #endif
+                if (!query_valid) { s0 = -INFINITY; s1 = -INFINITY; s2 = -INFINITY; s3 = -INFINITY; }
+#endif
+                s0 *= scale; s1 *= scale; s2 *= scale; s3 *= scale;
+
+                if (is_causal) {
+                    const int causal_limit = n_kv - n_q + my_query_row;
+                    if (k_row0 > causal_limit) s0 = -INFINITY;
+                    if (k_row1 > causal_limit) s1 = -INFINITY;
+                    if (k_row2 > causal_limit) s2 = -INFINITY;
+                    if (k_row3 > causal_limit) s3 = -INFINITY;
+                }
+                if (k_row0 >= n_kv) s0 = -INFINITY;
+                if (k_row1 >= n_kv) s1 = -INFINITY;
+                if (k_row2 >= n_kv) s2 = -INFINITY;
+                if (k_row3 >= n_kv) s3 = -INFINITY;
+
+                if (mask_base != NULL && blk_cur != 2) {
+                    const global MASK_DATA_TYPE * mask_ptr =
+                        (const global MASK_DATA_TYPE *) (mask_base + my_query_row * mask_nb1);
+                    if (k_row0 < n_kv) s0 += slope * (ACC_TYPE) mask_ptr[k_row0];
+                    if (k_row1 < n_kv) s1 += slope * (ACC_TYPE) mask_ptr[k_row1];
+                    if (k_row2 < n_kv) s2 += slope * (ACC_TYPE) mask_ptr[k_row2];
+                    if (k_row3 < n_kv) s3 += slope * (ACC_TYPE) mask_ptr[k_row3];
+                }
+                if (logit_softcap > 0.0f) {
+                    s0 = logit_softcap * tanh(s0 / logit_softcap);
+                    s1 = logit_softcap * tanh(s1 / logit_softcap);
+                    s2 = logit_softcap * tanh(s2 / logit_softcap);
+                    s3 = logit_softcap * tanh(s3 / logit_softcap);
+                }
+
+                const ACC_TYPE m_new      = max(m_i, max(max(s0, s1), max(s2, s3)));
+                const ACC_TYPE scale_prev = native_exp(m_i - m_new);
+                const ACC_TYPE p0         = native_exp(s0 - m_new);
+                const ACC_TYPE p1         = native_exp(s1 - m_new);
+                const ACC_TYPE p2         = native_exp(s2 - m_new);
+                const ACC_TYPE p3         = native_exp(s3 - m_new);
+
+                #pragma unroll
+                for (int i = 0; i < SPLIT_DV_VEC; ++i) {
+                    const int i_abs = dv_off_vec + i;
+                    o_acc[i] = mad(p3, CONVERT_KV_ACC4(l_v[j+3][i_abs]),
+                               mad(p2, CONVERT_KV_ACC4(l_v[j+2][i_abs]),
+                               mad(p1, CONVERT_KV_ACC4(l_v[j+1][i_abs]),
+                               mad(p0, CONVERT_KV_ACC4(l_v[j  ][i_abs]),
+                               o_acc[i] * scale_prev))));
+                }
+                l_i = l_i * scale_prev + p0 + p1 + p2 + p3;
+                m_i = m_new;
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    // --- Write output --------------------------------------------------------
+    if (query_valid) {
+        if (sinks_void != NULL) {
+            const global ACC_TYPE * sinks_ptr =
+                (const global ACC_TYPE *) ((const global char *) sinks_void + sinks_offset);
+            const ACC_TYPE m_sink  = sinks_ptr[head_idx];
+            const ACC_TYPE m_final = max(m_i, m_sink);
+            const ACC_TYPE scale_o = exp(m_i - m_final);
+            #pragma unroll
+            for (int i = 0; i < SPLIT_DV_VEC; ++i) o_acc[i] *= scale_o;
+            l_i = l_i * scale_o + exp(m_sink - m_final);
+            m_i = m_final;
+        }
+        const ACC_TYPE l_inv = (l_i > 0.0f) ? (1.0f / l_i) : 0.0f;
+        const ulong o_row_offset = batch_idx * o_nb3 + my_query_row * o_nb2 + head_idx * o_nb1;
+        global float4 * o_row = (global float4 *) (o_base + o_row_offset);
+        if (l_inv > 0.0f) {
+            #pragma unroll
+            for (int i = 0; i < SPLIT_DV_VEC; ++i) o_row[dv_off_vec + i] = o_acc[i] * l_inv;
+        } else {
+            #pragma unroll
+            for (int i = 0; i < SPLIT_DV_VEC; ++i) o_row[dv_off_vec + i] = (float4)(0.0f);
+        }
+    }
+}
