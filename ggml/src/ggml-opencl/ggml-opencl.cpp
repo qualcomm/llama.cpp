@@ -2876,7 +2876,7 @@ static const ggml_opencl_fa_dim g_opencl_fa_dims[] = {
     {112, 112, 64, 32, 2, 64}, {128, 128, 64, 32, 2, 64},
     {192, 128, 16, 16, 1, 0},
     {192, 192, 16, 16, 1, 0},
-    {256, 256, 32, 16, 4, 0},
+    {256, 256, 16, 16, 8, 0},
 };
 
 // Lazily compile flash_attn kernels for one (dk, dv) pair on first dispatch.
