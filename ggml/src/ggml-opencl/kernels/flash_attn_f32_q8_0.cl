@@ -895,7 +895,7 @@ __kernel void flash_attn_f32_q8_0(
                 // Skip per-row mask when blk_cur==2 (fully unmasked tile —
                 // all mask entries are 0.0h with no -inf). Saves BLOCK_M ×
                 // BLOCK_N mask-lookup half reads per fully-unmasked tile.
-                if (mask_base != NULL && blk_cur != 2) {
+                if (query_valid && mask_base != NULL && blk_cur != 2) {
                     const global MASK_DATA_TYPE * mask_ptr =
                         (const global MASK_DATA_TYPE *) (mask_base + my_query_row * mask_nb1);
                     if (k_row0 < n_kv) s0 += slope * (ACC_TYPE) mask_ptr[k_row0];

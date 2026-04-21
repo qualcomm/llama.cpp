@@ -910,7 +910,7 @@ __kernel void flash_attn_f32_q4_0(
                 if (k_row2 >= n_kv) s2 = -INFINITY;
                 if (k_row3 >= n_kv) s3 = -INFINITY;
 
-                if (mask_base != NULL && blk_cur != 2) {
+                if (query_valid && mask_base != NULL && blk_cur != 2) {
                     const global MASK_DATA_TYPE * mask_ptr =
                         (const global MASK_DATA_TYPE *) (mask_base + my_query_row * mask_nb1);
                     if (k_row0 < n_kv) s0 += slope * (ACC_TYPE) mask_ptr[k_row0];

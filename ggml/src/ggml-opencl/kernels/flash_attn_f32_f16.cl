@@ -253,7 +253,7 @@ __kernel void flash_attn_f32_f16(
                 if (k_row0 >= n_kv) score0 = -INFINITY;
                 if (k_row1 >= n_kv) score1 = -INFINITY;
 
-                if (mask_base != NULL && blk_cur != 2) {
+                if (query_valid && mask_base != NULL && blk_cur != 2) {
                     if (use_kv_pad && mask_pad_base != NULL) {
                         const global MASK_DATA_TYPE* mask_ptr =
                             (const global MASK_DATA_TYPE*)(mask_pad_base + my_query_row * mask_pad_nb1);
