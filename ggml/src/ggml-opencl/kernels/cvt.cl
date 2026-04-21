@@ -877,11 +877,7 @@ kernel void kernel_restore_block_q8_0(
     }
 }
 
-// GPU-side q8_0 -> f16 dequant kernels. Used by flash_attn when the KV is
-// q8_0 and the variant that expects f16 inputs is being dispatched (e.g.,
-// prefill path that doesn't have a native q8_0 reader). One thread per 32-
-// element block; each thread loads the scale once and writes 32 fp16 values.
-// AoS layout: block_q8_0 records (2 byte scale + 32 byte quants).
+// AoS q8_0 dequant → f16. One thread per 32-elem block.
 kernel void kernel_dequant_q8_0_f16_aos(
     global char * src,
     global half * dst,
@@ -900,8 +896,7 @@ kernel void kernel_dequant_q8_0_f16_aos(
     }
 }
 
-// View-aware AoS dequant producing f32. Same layout assumptions as the f16
-// view variant but writes float output — used by the f32_f32 FA kernel.
+// View-aware AoS q8_0 → f32 dequant (f32/f32 FA path).
 kernel void kernel_dequant_q8_0_f32_view_aos(
     global char * src,
     ulong         src_offset,
@@ -937,10 +932,7 @@ kernel void kernel_dequant_q8_0_f32_view_aos(
     }
 }
 
-// View-aware AoS dequant. Handles simple row-slice views where each row is
-// tight (nb0 = 34 for q8_0) but batch strides may include gaps (e.g., a view
-// of the first n_kv rows of a larger KV cache). Writes into a contiguous f16
-// output buffer indexed by (i3, i2, i1, blk_i0).
+// View-aware AoS q8_0 → f16 dequant. Rows tight, batch strides may be gapped.
 kernel void kernel_dequant_q8_0_f16_view_aos(
     global char * src,
     ulong         src_offset,
@@ -976,11 +968,7 @@ kernel void kernel_dequant_q8_0_f16_view_aos(
     }
 }
 
-// View-aware AoS dequant for q4_0 (block = 2-byte scale + 16-byte packed
-// nibbles for 32 elements). Mirrors kernel_dequant_q8_0_f16_view_aos — reads
-// a (possibly permuted / strided) view of an AoS q4_0 tensor and writes a
-// tightly packed f16 buffer in the view's logical order. Used by MUL_MAT when
-// src0 is q4_0 AoS (e.g., KV cache with -fa 0).
+// View-aware AoS q4_0 → f16 dequant (mirrors the q8_0 view variant).
 kernel void kernel_dequant_q4_0_f16_view_aos(
     global char * src,
     ulong         src_offset,
@@ -1020,9 +1008,7 @@ kernel void kernel_dequant_q4_0_f16_view_aos(
     }
 }
 
-// SoA layout: separate scale sub-buffer (half per block) and quant sub-buffer
-// (QK8_0 int8 per block). Matches the on-device layout set up by
-// kernel_convert_block_q8_0.
+// SoA q8_0 dequant; layout matches kernel_convert_block_q8_0.
 kernel void kernel_dequant_q8_0_f16_soa(
     global char * src_q,
     global char * src_d,

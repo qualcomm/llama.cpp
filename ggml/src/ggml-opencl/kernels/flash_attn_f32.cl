@@ -13,10 +13,7 @@
 #define WG_SIZE (BLOCK_M)
 #define Q1_WG_SIZE 64
 
-// At DK>=192 the Adreno compiler runs out of host memory trying to fully
-// unroll 48/64-trip loops across the dot-product, output-accumulate and
-// output-write sections. Drop the unroll hints so compile succeeds; let the
-// driver decide on its own loop strategy.
+// Drop full unroll at DK>=192 — Adreno compiler host-memory budget.
 #if DK >= 192
 #define FA_UNROLL
 #else

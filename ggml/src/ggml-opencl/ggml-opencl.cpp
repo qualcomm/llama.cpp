@@ -410,8 +410,7 @@ struct ggml_backend_opencl_context {
     bool adreno_use_large_buffer;
     ggml_cl_compiler_version adreno_cl_compiler_version;
 
-    // Cached compile flags for lazy kernel compile paths (e.g. flash_attn).
-    std::string kernel_compile_opts;
+    std::string kernel_compile_opts;  // cached for lazy-compiled kernels.
 
     int adreno_wave_size;
 
@@ -544,8 +543,7 @@ struct ggml_backend_opencl_context {
     std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_f16;
     std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_f16_split; // N_SPLIT>1 variant
     std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_f16_q1;
-    // Flash-decoding K-split: per-split partial kernel + merge kernel for f16 KV.
-    // Compiled alongside kernels_flash_attn_f32_f16_q1 for the same (dk, dv) set.
+    // Flash-decoding K-split (f16 KV).
     std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_f16_q1_split;
     std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_merge;
     std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_q8_0_q1;  // Q=f32, KV=q8_0 decode
@@ -847,10 +845,8 @@ inline std::string read_file(const std::string &path) {
   return text;
 }
 
-// If fatal=true, aborts on compile failure (legacy behavior). If false,
-// returns NULL and logs the error — used by optional FA variants so that a
-// single heavy kernel exhausting the Adreno compiler doesn't kill the whole
-// backend when other variants compile fine.
+// fatal=false returns NULL on compile failure instead of aborting; used for
+// optional FA variants that may exhaust the Adreno compiler at large DK.
 static cl_program build_program_from_source_ex(cl_context ctx, cl_device_id dev, const char* program_buffer, const std::string &compile_opts, bool fatal, const char *tag = nullptr) {
     if (tag) GGML_LOG_INFO("ggml_opencl: compiling %s\n", tag);
     cl_program p;
@@ -2039,10 +2035,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
         GGML_LOG_CONT(".");
     }
 
-    // flash_attn: kernels are compiled lazily per (dk, dv) on first dispatch
-    // — see ggml_opencl_ensure_fa_kernels. Compiling all 9 (dk, dv) pairs
-    // up-front cost ~50 cl_program builds and made 7B models OOM at long
-    // context.
+    // flash_attn: lazy per-(dk, dv) compile; see ggml_opencl_ensure_fa_kernels.
 
     // argsort
     {
@@ -3238,20 +3231,14 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
 // XXX    static bool initialized = false;
 // XXX    static ggml_backend_opencl_context *backend_ctx = nullptr;
 
-// Per-(dk, dv) flash-attn config used by the lazy compile path. Centralised
-// here so dispatch and `supports_op` can share the same source of truth.
+// Per-(dk, dv) FA config; shared by dispatch and supports_op.
 struct ggml_opencl_fa_dim {
     int dk; int dv; int bm; int bn; int n_split; int nkv_split_threshold;
 };
 
-// N_SPLIT dispatch:
-//   n_kv < threshold: use baseline (N_SPLIT=1, BLOCK_M threads)
-//   n_kv >= threshold: use split variant (N_SPLIT>1, BLOCK_M*N_SPLIT threads)
-// Threshold=0 means always use split for n_q>1.
+// Split variant fires when n_kv >= threshold (threshold=0 → always split).
 static const ggml_opencl_fa_dim g_opencl_fa_dims[] = {
     { 40,  40, 64, 32, 1, 0}, { 64,  64, 64, 64, 1, 0},
-    // DK=80-128: N_SPLIT=2, threshold=64 — split wins once n_kv is big enough
-    // to amortise the extra barrier/shuffle cost.
     { 80,  80, 64, 32, 2, 64}, { 96,  96, 64, 32, 2, 64},
     {112, 112, 64, 32, 2, 64}, {128, 128, 64, 32, 2, 64},
     {192, 128, 16, 16, 1, 0},
@@ -3259,15 +3246,9 @@ static const ggml_opencl_fa_dim g_opencl_fa_dims[] = {
     {256, 256, 16, 16, 8, 0},
 };
 
-// Lazily compile flash_attn kernels for one (dk, dv) pair on first dispatch.
-// A single inference uses one DK/DV combo; the eager init path used to compile
-// all 9 pairs (~50 cl_program builds) which inflates driver-side memory and
-// makes 7B models OOM at long context. Lazy compile keeps only the kernels
-// actually needed and matches the Q4_K GEMM lazy pattern below.
-// FA variant enum — each (dk, dv) × variant compiles separately on first
-// dispatch, so models only pay for what they actually use. At DK=256 for
-// example, the f32_f16 variant is used by Qwen3.5; the heavy pure-f16 /
-// pure-f32 / quant variants are skipped entirely.
+// Lazy FA compile: one (dk, dv) pair per first-dispatch. Matches the Q4_K
+// GEMM lazy pattern below; keeps Adreno host-memory footprint small.
+// FA variant key for the per-(dk,dv,variant) lazy compile cache.
 enum ggml_opencl_fa_variant {
     FA_VARIANT_PRE      = 0,  // prepass kernels (kv_pad, mask_pad, blk)
     FA_VARIANT_F16      = 1,
@@ -3328,8 +3309,6 @@ static std::string ggml_opencl_fa_kernel_src(ggml_opencl_fa_variant v) {
 #endif
 }
 
-// Build the -D flags for a given FA variant. Split variants add N_SPLIT and
-// the shuffle-extension macro.
 static std::string ggml_opencl_fa_compile_opts(ggml_backend_opencl_context * backend_ctx,
                                                 const ggml_opencl_fa_dim * cfg,
                                                 ggml_opencl_fa_variant variant) {
@@ -3353,8 +3332,6 @@ static std::string ggml_opencl_fa_compile_opts(ggml_backend_opencl_context * bac
     return opts;
 }
 
-// Ensure the common-to-all-variants prepass kernels and per-(dk, dv) block/wg
-// metadata are populated. Called from every FA dispatch.
 static void ggml_opencl_ensure_fa_pre_kernels(ggml_backend_opencl_context * backend_ctx, int dk, int dv) {
     const std::pair<int, int> dk_dv = {dk, dv};
     if (backend_ctx->kernels_flash_attn_kv_pad_f16.count(dk_dv) > 0) return;
@@ -3388,11 +3365,7 @@ static void ggml_opencl_ensure_fa_pre_kernels(ggml_backend_opencl_context * back
     backend_ctx->kernels_flash_attn_bn[{dk, dv}]              = cfg->bn;
 }
 
-// Ensure a specific (dk, dv, variant) triple is compiled. Safe to call
-// multiple times — each (variant, dk, dv) is attempted once, then cached.
-// Returns true on success; false means the Adreno compiler rejected this
-// variant (out-of-host-memory at DK=256 is common) and the caller must fall
-// back or abort with a clearer message.
+// Compile one (variant, dk, dv); memoised. false = compiler rejected.
 static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_ctx, int dk, int dv, ggml_opencl_fa_variant variant) {
     const std::pair<int, int> dk_dv = {dk, dv};
 
@@ -3402,7 +3375,6 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
     }
     if (cfg == nullptr) return false;
 
-    // Guard: is the result already present?
     switch (variant) {
         case FA_VARIANT_F16:
             if (backend_ctx->kernels_flash_attn_f16.count(dk_dv)) return true;
@@ -3433,12 +3405,11 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
             return true;
     }
 
-    // De-dupe repeated attempts: once we've tried and failed, don't retry.
+    // Don't retry a variant that failed once.
     const auto attempt_key = std::make_pair(variant, dk_dv);
     if (backend_ctx->fa_variant_attempted.count(attempt_key)) return false;
     backend_ctx->fa_variant_attempted.insert(attempt_key);
 
-    // Constraints shared by the quant variants (per-lane divisibility).
     const bool is_split = variant == FA_VARIANT_F32_F16_SPLIT ||
                           variant == FA_VARIANT_Q8_0_SPLIT    ||
                           variant == FA_VARIANT_Q4_0_SPLIT;
@@ -3494,7 +3465,6 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
             CL_CHECK((kq1 = clCreateKernel(prog, "flash_attn_f32_f16_q1", &err), err));
             backend_ctx->kernels_flash_attn_f32_f16[{dk, dv}]    = k;
             backend_ctx->kernels_flash_attn_f32_f16_q1[{dk, dv}] = kq1;
-            // Flash-Decoding: extract split + merge kernels from the same program.
             cl_kernel k_split = clCreateKernel(prog, "flash_attn_f32_f16_q1_split", &err);
             if (err == CL_SUCCESS) {
                 backend_ctx->kernels_flash_attn_f32_f16_q1_split[{dk, dv}] = k_split;
@@ -3511,7 +3481,6 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
             CL_CHECK((k   = clCreateKernel(prog, "flash_attn_f32_q8_0",    &err), err));
             backend_ctx->kernels_flash_attn_f32_q8_0_q1[{dk, dv}] = kq1;
             backend_ctx->kernels_flash_attn_f32_q8_0[{dk, dv}]    = k;
-            // Flash-Decoding: extract q8_0 split + merge kernels.
             cl_kernel k_split = clCreateKernel(prog, "flash_attn_f32_q8_0_q1_split", &err);
             if (err == CL_SUCCESS) {
                 backend_ctx->kernels_flash_attn_f32_q8_0_q1_split[{dk, dv}] = k_split;
@@ -3530,7 +3499,6 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
             CL_CHECK((k   = clCreateKernel(prog, "flash_attn_f32_q4_0",    &err), err));
             backend_ctx->kernels_flash_attn_f32_q4_0_q1[{dk, dv}] = kq1;
             backend_ctx->kernels_flash_attn_f32_q4_0[{dk, dv}]    = k;
-            // Flash-Decoding: extract q4_0 split + merge kernels.
             cl_kernel k_split = clCreateKernel(prog, "flash_attn_f32_q4_0_q1_split", &err);
             if (err == CL_SUCCESS) {
                 backend_ctx->kernels_flash_attn_f32_q4_0_q1_split[{dk, dv}] = k_split;
@@ -3557,8 +3525,7 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
             backend_ctx->kernels_flash_attn_f32_q8_0_split[{dk, dv}]                = k;
             backend_ctx->kernels_flash_attn_f32_q8_0_split_wg_size[{dk, dv}]        = cfg->bm * cfg->n_split;
             backend_ctx->kernels_flash_attn_f32_q8_0_split_bm[{dk, dv}]             = cfg->bm;
-            // Quant prefill carries extra per-thread state — split relief is more
-            // valuable, so trigger at threshold=0 (always-on).
+            // Quant prefill: always split (threshold=0).
             backend_ctx->kernels_flash_attn_f32_q8_0_split_nkv_threshold[{dk, dv}]  = 0;
             break;
         }
@@ -3577,11 +3544,8 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
     return true;
 }
 
-// DK=96 quant-KV special: default N_SPLIT=2 is unusable since 96/32=3 isn't
-// divisible by 2. Override with N_SPLIT=3, BLOCK_M=32 (WG_SIZE=96 fits one
-// 128-lane subgroup for the 3-way sub_group_shuffle reduction). ~2× prefill
-// on Phi-3/3.5/4-mini at long prompts. Called only from the quant KV
-// dispatch path at DK=DV=96.
+// DK=96 quant override: N_SPLIT=3, BLOCK_M=32 (96%2 ≠ 0, so the default
+// N_SPLIT=2 doesn't apply). Called only from quant KV dispatch at DK=DV=96.
 static bool ggml_opencl_ensure_fa_dk96_quant_split(ggml_backend_opencl_context * backend_ctx, bool is_q8_0) {
     const std::pair<int, int> dk_dv = {96, 96};
     if (is_q8_0 && backend_ctx->kernels_flash_attn_f32_q8_0_split.count(dk_dv)) return true;
@@ -3600,9 +3564,7 @@ static bool ggml_opencl_ensure_fa_dk96_quant_split(ggml_backend_opencl_context *
             ? " -D cl_qcom_subgroup_shuffle=1"
             : " -D cl_khr_subgroup_shuffle=1";
     }
-    // Prepass uses the main (f16) BLOCK_M (cfg->bm for DK=96 is 64); the quant
-    // kernel needs to know that to index blk[] correctly when its own BLOCK_M
-    // differs.
+    // Pass the prepass-kernel BLOCK_M so quant code can index blk[] correctly.
     const ggml_opencl_fa_dim * cfg = nullptr;
     for (const auto & d : g_opencl_fa_dims) {
         if (d.dk == 96 && d.dv == 96) { cfg = &d; break; }
@@ -3973,7 +3935,7 @@ static ggml_backend_opencl_context * ggml_cl2_init(ggml_backend_dev_t dev) {
     GGML_LOG_INFO("ggml_opencl: device FP16 support: %s\n", backend_ctx->fp16_support ? "true" : "false");
     // check Adreno large buffer support
     backend_ctx->adreno_has_large_buffer = strstr(ext_buffer, "cl_qcom_large_buffer") != NULL;
-    // check subgroup shuffle support (needed by N_SPLIT>1 flash-attention kernel)
+    // subgroup shuffle support (N_SPLIT>1 FA kernel)
     backend_ctx->has_qcom_subgroup_shuffle = strstr(ext_buffer, "cl_qcom_subgroup_shuffle") != NULL;
     backend_ctx->has_subgroup_shuffle =
         strstr(ext_buffer, "cl_khr_subgroup_shuffle") != NULL ||
@@ -5040,12 +5002,9 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                 case GGML_UNARY_OP_TANH:
                 case GGML_UNARY_OP_NEG:
                 case GGML_UNARY_OP_EXP:
-                   // F16 EXP overflows on Adreno even after half→float conversion;
-                   // fall back to CPU for F16.
+                   // Adreno F16 exp/expm1 overflow even post-half→float convert.
                    return op->src[0]->type == GGML_TYPE_F32;
                 case GGML_UNARY_OP_EXPM1:
-                   // F16 EXPM1 overflows on Adreno even after half→float conversion;
-                   // fall back to CPU for F16.
                    return op->src[0]->type == GGML_TYPE_F32;
                 case GGML_UNARY_OP_SOFTPLUS:
                    return op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16;
@@ -5109,10 +5068,7 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
             } else if (op->src[0]->type == GGML_TYPE_F32) {
                 return op->src[1]->type == GGML_TYPE_F32;
             } else if (op->src[0]->type == GGML_TYPE_Q4_0) {
-                // Non-contig src0 is routed through the dequant-to-f16 fast
-                // path in ggml_cl_mul_mat (handles both AoS KV cache with
-                // -fa 0 and permuted SoA views). src1 doesn't need to be
-                // contig — the generic f16 MUL_MAT handles its strides.
+                // Non-contig src0 routes through on-device dequant-to-f16.
                 return op->src[1]->type == GGML_TYPE_F32;
             } else if (op->src[0]->type == GGML_TYPE_Q4_1 ||
                        op->src[0]->type == GGML_TYPE_MXFP4 ||
@@ -5236,8 +5192,7 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                                          v->type == GGML_TYPE_Q4_0 && op->type == GGML_TYPE_F32 &&
                                          dk % 32 == 0 && dv % 32 == 0;
 
-                // Asymmetric KV (e.g. -ctk q4_0 -ctv f16): dispatch dequants both
-                // K and V to F32 host-side and uses the f32/f32 kernel.
+                // Asymmetric KV: host-dequants both sides to F32, uses f32 kernel.
                 auto is_kv_type_ok = [](ggml_type t) {
                     return t == GGML_TYPE_F16 || t == GGML_TYPE_F32 ||
                            t == GGML_TYPE_Q4_0 || t == GGML_TYPE_Q8_0;
@@ -5642,17 +5597,11 @@ struct ggml_backend_opencl_buffer_context {
     std::vector<ggml_tensor_extra_cl_q6_K *> temp_tensor_extras_q6_K;
     std::vector<ggml_tensor_extra_cl_q6_K *> temp_tensor_extras_q6_K_in_use;
 
-    // Tracks which q8_0 tensors had their layout converted from AoS (contiguous
-    // block_q8_0 records) to SoA (separate scale and quant sub-buffers in
-    // ggml_tensor_extra_cl_q8_0) by set_tensor. SET_ROWS and FA need to know
-    // this to pick the right kernel variant / data path.
+    // q8_0 tensors with AoS→SoA layout conversion installed by set_tensor.
     std::unordered_set<const ggml_tensor *> q8_0_soa_tensors;
 
-    // Same as q8_0_soa_tensors but for q4_0. Unlike q8_0, q4_0 set_tensor is
-    // unconditional (always SoA when GGML_OPENCL_SOA_Q is defined), so this
-    // set exists primarily for KV-cache dst tensors created by allocation and
-    // never passed through set_tensor — those remain AoS and must use the
-    // non-SoA SET_ROWS / FA variants.
+    // Same for q4_0. KV-cache q4_0 tensors are allocated but never pass
+    // through set_tensor, so they stay AoS and aren't in this set.
     std::unordered_set<const ggml_tensor *> q4_0_soa_tensors;
 
     // The buffer_context is initially created by ggml_backend_buft_alloc_buffer
@@ -5737,11 +5686,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
     // buffers for quantized bits and scales, which are then populated by the
     // conversion kernel.
     if (tensor->type == GGML_TYPE_Q4_0) {
-        // Views and non-contiguous tensors can't be cleanly SoA-ified here —
-        // the parent's buffer may already be in SoA layout, so re-writing the
-        // view's AoS bytes into it would corrupt the surrounding region.
-        // Skip; the parent's initialization (or a later SET_ROWS / op path)
-        // populates the region the view references. Matches the q8_0 guard.
+        // Views can't SoA-ify here — parent owns the layout (see q8_0 guard).
         if (tensor->view_src != nullptr || !ggml_is_contiguous(tensor)) {
             return;
         }
@@ -6310,11 +6255,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         return;
     }
     if (tensor->type == GGML_TYPE_Q8_0) {
-        // Views are backed by their parent tensor's buffer, which goes through
-        // its own SoA conversion below. A view's AoS bytes can't be re-written
-        // into an already-SoA-laid-out parent buffer here, so skip the view's
-        // set_tensor — the parent's initialization (or a later SET_ROWS) is
-        // responsible for populating the region the view references.
+        // Views share the parent's buffer; parent owns SoA conversion.
         if (tensor->view_src != nullptr || !ggml_is_contiguous(tensor)) {
             return;
         }
@@ -6835,11 +6776,7 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
     // To properly support this, we need to restore block_q4_0 struct arrays
     // from the flattened buffers.
     if (tensor->type == GGML_TYPE_Q4_0) {
-        // KV-cache q4_0 tensors stay AoS (only weights go through the SoA
-        // conversion). In that case the extra is the plain ggml_tensor_extra_cl
-        // and the device bytes are already in the standard block_q4_0 layout —
-        // a straight readback is both correct and cheaper than the SoA restore
-        // path below.
+        // KV-cache q4_0 stays AoS — direct readback, no SoA restore.
         if (!ggml_cl_is_q4_0_soa(tensor)) {
             ggml_tensor_extra_cl * extra_aos = (ggml_tensor_extra_cl *) tensor->extra;
             CL_CHECK(clEnqueueReadBuffer(
@@ -6848,9 +6785,7 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
                 size, data, 0, NULL, NULL));
             return;
         }
-        // For view tensors, the SoA extra was installed on the parent only
-        // (set_tensor updates tensor->extra of the real tensor); follow
-        // view_src to read the correct q/d subbuffers.
+        // SoA extra lives on the parent tensor — follow view_src.
         const ggml_tensor * extra_src = tensor->view_src != nullptr ? tensor->view_src : tensor;
         ggml_tensor_extra_cl_q4_0 * extra = (ggml_tensor_extra_cl_q4_0 *)extra_src->extra;
 
@@ -7191,8 +7126,7 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
         return;
     }
     if (tensor->type == GGML_TYPE_Q8_0) {
-        // KV-cache q8_0 tensors stay AoS — straight readback from the packed
-        // block_q8_0 device buffer. See Q4_0 AoS branch above for rationale.
+        // KV-cache q8_0 stays AoS (see Q4_0 branch).
         if (!ggml_cl_is_q8_0_soa(tensor)) {
             ggml_tensor_extra_cl * extra_aos = (ggml_tensor_extra_cl *) tensor->extra;
             CL_CHECK(clEnqueueReadBuffer(
@@ -7201,8 +7135,7 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
                 size, data, 0, NULL, NULL));
             return;
         }
-        // For view tensors, the SoA extra was installed on the parent only;
-        // follow view_src to read the correct q/d subbuffers.
+        // SoA extra lives on the parent — follow view_src.
         const ggml_tensor * extra_src = tensor->view_src != nullptr ? tensor->view_src : tensor;
         ggml_tensor_extra_cl_q8_0 * extra = (ggml_tensor_extra_cl_q8_0 *)extra_src->extra;
 
@@ -8176,10 +8109,7 @@ static void ggml_cl_get_rows(ggml_backend_t backend, const ggml_tensor * src0, c
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
 }
 
-// Returns true if `tensor` is a q8_0 tensor whose on-device layout was
-// converted from AoS to SoA by ggml_backend_opencl_buffer_set_tensor — i.e.,
-// tensor->extra points to a ggml_tensor_extra_cl_q8_0 with separate q and d
-// sub-buffers, not the regular ggml_tensor_extra_cl.
+// True iff tensor's on-device layout was converted to SoA by set_tensor.
 static bool ggml_cl_is_q8_0_soa(const ggml_tensor * tensor) {
     if (tensor == nullptr || tensor->type != GGML_TYPE_Q8_0 || tensor->buffer == nullptr) {
         return false;
@@ -8192,9 +8122,7 @@ static bool ggml_cl_is_q8_0_soa(const ggml_tensor * tensor) {
     return ctx->q8_0_soa_tensors.count(key) > 0;
 }
 
-// Q4_0 SoA counterpart. True for weight tensors whose set_tensor path ran the
-// AoS→SoA conversion; false for KV-cache tensors that were only allocated and
-// populated by SET_ROWS (those stay AoS).
+// Q4_0 SoA counterpart.
 static bool ggml_cl_is_q4_0_soa(const ggml_tensor * tensor) {
     if (tensor == nullptr || tensor->type != GGML_TYPE_Q4_0 || tensor->buffer == nullptr) {
         return false;
@@ -8302,12 +8230,8 @@ static void ggml_cl_set_rows(ggml_backend_t backend, const ggml_tensor * src0, c
     CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_ulong), &offset1));
 
     if (is_soa) {
-        // Both ggml_tensor_extra_cl_q8_0 and ggml_tensor_extra_cl_q4_0 expose
-        // the q / d subbuffers in the same shape — pick one for the cast.
-        // NOTE: when dst is a view (e.g. the `out` tensor from ggml_set_rows,
-        // which is a view of the real dst), set_tensor installed the q8_0/q4_0
-        // extra on the parent only — dst->extra still points to the original
-        // plain ggml_tensor_extra_cl. Follow view_src to reach the SoA extra.
+        // The q/d subbuffers in q8_0/q4_0 extras are interchangeable here.
+        // For views (e.g. ggml_set_rows' `out`), follow view_src for the SoA extra.
         const ggml_tensor * soa_src = dst->view_src != nullptr ? dst->view_src : dst;
         cl_mem q_mem = nullptr;
         cl_mem d_mem = nullptr;
@@ -10932,12 +10856,8 @@ struct ggml_cl_flash_attn_temp_buffer {
     }
 };
 
-// Reconstruct an AoS q8_0 byte layout (interleaved scale + 32 quants per
-// block) into a temp buffer from a SoA q8_0 tensor. On success, `out_buf` and
-// `out_offset` refer to the freshly reconstructed buffer and the AoS strides
-// `out_nb1/2/3` describe its natural layout (tightly packed q8_0 blocks).
-// Returns true if reconstruction happened, false if the tensor is AoS (caller
-// should keep using extra->data_device as-is).
+// Rebuild AoS q8_0 bytes from a SoA q8_0 tensor into a temp buffer.
+// Returns false if the tensor is already AoS.
 static bool ggml_cl_flash_attn_reconstruct_aos_q8_0(
         ggml_backend_opencl_context *         backend_ctx,
         const ggml_tensor *                   tensor,
@@ -10951,16 +10871,12 @@ static bool ggml_cl_flash_attn_reconstruct_aos_q8_0(
         return false;
     }
 
-    // For view tensors, the SoA buffers live on the parent (view_src). The
-    // view's own ->extra still points to the parent's pre-SoA regular extra
-    // (stale after the swap), so consult view_src->extra instead.
+    // For views, SoA extra is on view_src (view->extra is pre-SoA).
     const ggml_tensor * soa_src = tensor->view_src ? tensor->view_src : tensor;
     auto * extra_soa = (ggml_tensor_extra_cl_q8_0 *) soa_src->extra;
     GGML_ASSERT(extra_soa && extra_soa->q && extra_soa->d);
 
-    // Reconstruct the FULL parent (view_src) as AoS — then the view's position
-    // within that AoS block layout lines up naturally (block_q8_0 rows mirror
-    // the parent tensor's element order, same as the scales/quants sub-buffers).
+    // Reconstruct the whole parent; view offsets then work naturally.
     const size_t parent_nbytes = ggml_nbytes(soa_src);
     cl_int err;
     temp.data = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE, parent_nbytes, NULL, &err);
@@ -10977,9 +10893,6 @@ static bool ggml_cl_flash_attn_reconstruct_aos_q8_0(
     CL_CHECK(clEnqueueNDRangeKernel(backend_ctx->queue, kernel, 3, NULL,
                                     global_work_size, local_work_size, 0, NULL, NULL));
 
-    // AoS q8_0 strides mirror the parent's element layout. The view's stride
-    // nb values already express the correct byte strides into this layout
-    // (they were computed from the parent's AoS strides at view creation).
     out_buf    = temp.data;
     out_offset = tensor->view_offs;
     out_nb1    = tensor->nb[1];
@@ -10988,12 +10901,8 @@ static bool ggml_cl_flash_attn_reconstruct_aos_q8_0(
     return true;
 }
 
-// q4_0 analogue of reconstruct_aos_q8_0. SoA q4_0 tensors occur when set_tensor
-// ran its AoS→SoA path (weights, test dst). For FA we need AoS bytes back —
-// kernel_restore_block_q4_0 copies 18 B per block (half scale + 16 packed
-// nibbles), matching block_q4_0 exactly. The noshuffle variant is not used
-// here: set_tensor only triggers noshuffle on large 2D weight tensors, which
-// are never FA inputs; test / KV tensors get the plain shuffled layout.
+// q4_0 analogue. noshuffle variant never applies — set_tensor only picks it
+// for 2D weights, which aren't FA inputs.
 static bool ggml_cl_flash_attn_reconstruct_aos_q4_0(
         ggml_backend_opencl_context *         backend_ctx,
         const ggml_tensor *                   tensor,
@@ -11035,19 +10944,8 @@ static bool ggml_cl_flash_attn_reconstruct_aos_q4_0(
     return true;
 }
 
-// Fast GPU-side dequant path for q8_0 -> f16. Used when the input tensor is
-// contiguously laid out (including the common case of a simple row-slice view
-// whose strides match the parent's). Produces a tightly packed f16 buffer
-// and returns contiguous nb values, ready to be consumed by the f16 FA kernel.
-//
-// Layout detection: a tensor is contiguous iff nb[1]=row_bytes,
-// nb[2]=nb[1]*ne[1], nb[3]=nb[2]*ne[2]. For simple row-slice views the
-// check uses the tensor's own ne values, which describe the view. If src_buf
-// / src_offset are passed in (already AoS reconstructed), those are used;
-// otherwise tensor->extra->data_device is consulted.
-//
-// Returns true on success. Callers should fall back to the slower CPU dequant
-// path when this returns false (non-contiguous layout).
+// GPU q8_0→f16 dequant for contig tensors. Caller supplies src_buf when
+// reconstructing from SoA. Returns false for non-contig layouts.
 static bool ggml_cl_flash_attn_dequant_q8_0_gpu(
         ggml_backend_opencl_context *    backend_ctx,
         const ggml_tensor *              tensor,
@@ -11081,9 +10979,8 @@ static bool ggml_cl_flash_attn_dequant_q8_0_gpu(
     }
 
     const size_t row_bytes = (size_t) (tensor->ne[0] / 32) * (2 + 32);
-    // Only handle tensors whose row is tight (nb0 implicit = block bytes);
-    // permuted / transposed layouts need a different kernel.
     if (src_nb1 != (cl_ulong) row_bytes) {
+        // Not a tight row — needs a permuted-layout path.
         return false;
     }
 
@@ -11140,9 +11037,7 @@ static bool ggml_cl_flash_attn_prepare_quantized_tensor(
         return false;
     }
 
-    // `data_device` / `offset` may already point to a caller-supplied AoS
-    // buffer (e.g., reconstructed from SoA by the FA dispatch). When they do,
-    // read from there; otherwise fall back to tensor->extra.
+    // Caller-supplied AoS buffer wins over tensor->extra when present.
     cl_mem   src_buffer = data_device;
     cl_ulong src_offset = offset;
     cl_ulong src_nb1    = nb1;
@@ -11161,17 +11056,13 @@ static bool ggml_cl_flash_attn_prepare_quantized_tensor(
 
     const int64_t n = ggml_nelements(tensor);
     const size_t  row_bytes = (size_t) (tensor->ne[0] / ggml_blck_size(tensor->type)) * ggml_type_size(tensor->type);
-    // ggml_nbytes of a strided view returns the memory extent including gaps;
-    // we want the tightly-packed element footprint instead.
+    // tight-packed byte count (ggml_nbytes includes stride gaps).
     const size_t  total_bytes = (size_t) (n / ggml_blck_size(tensor->type)) * ggml_type_size(tensor->type);
     std::vector<uint8_t> host_quant(total_bytes);
 
     sync_with_other_backends(backend_ctx);
 
-    // Detect whether the source layout is tightly packed (row_bytes * ne1 ==
-    // batch stride, batch stride * ne2 == outer batch stride). If yes, one
-    // bulk read is correct. Otherwise the tensor is a strided view and we
-    // need to read row-by-batch.
+    // Tightly-packed → one bulk read; strided view → row-by-batch gather.
     const bool contiguous_layout =
         src_nb1 == row_bytes &&
         src_nb2 == row_bytes * (cl_ulong) tensor->ne[1] &&
@@ -11189,9 +11080,7 @@ static bool ggml_cl_flash_attn_prepare_quantized_tensor(
             NULL,
             NULL));
     } else {
-        // Strided gather. Permuted or viewed tensors may have gaps at any
-        // dim > 0, so iterate the full (i3, i2, i1) index space and read one
-        // row's worth of bytes at a time. Row along dim 0 is always tight.
+        // Strided gather. dim 0 is always tight; iterate (i3, i2, i1).
         size_t dst_off = 0;
         for (int64_t i3 = 0; i3 < tensor->ne[3]; ++i3) {
             for (int64_t i2 = 0; i2 < tensor->ne[2]; ++i2) {
@@ -11249,11 +11138,7 @@ static bool ggml_cl_flash_attn_prepare_quantized_tensor(
     return true;
 }
 
-// Host-side F16 -> F32 conversion for the asymmetric KV path: when -ctk and
-// -ctv specify different types (e.g. -ctk q4_0 -ctv f16), the FA dispatch
-// falls through to the F32 fallback kernel, dequant-ing any quantized side to
-// F32; an F16 side then needs the same conversion to keep the kernel happy.
-// Returns false (no work) when the tensor isn't F16.
+// Host-side F16 → F32 for the asymmetric-KV F32 fallback path.
 static bool ggml_cl_flash_attn_convert_f16_to_f32(
         ggml_backend_opencl_context *         backend_ctx,
         const ggml_tensor *                   tensor,
@@ -11368,10 +11253,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     const int n_head_kv = k->ne[2];
     const int n_batch = q->ne[3];
 
-    // Compile FA kernels for this (dk, dv) on first dispatch. Per-variant
-    // lazy compile: only build the type variant the dispatch actually needs,
-    // so DK=256 hybrid models (e.g. Qwen3.5) don't pay for f32/q8_0/q4_0
-    // variants that would blow the Adreno compiler's host-memory budget.
+    // Per-variant lazy compile for this (dk, dv).
     ggml_opencl_ensure_fa_pre_kernels(backend_ctx, d_head_q, d_head_v);
 
     cl_kernel kernel = NULL;
@@ -11381,7 +11263,6 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     const bool is_q8_0 = q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_Q8_0 && v->type == GGML_TYPE_Q8_0;
     const bool is_q4_0 = q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_Q4_0 && v->type == GGML_TYPE_Q4_0;
 
-    // Drive the per-variant lazy compile based on tensor types.
     if (is_f16) {
         ggml_opencl_ensure_fa_variant(backend_ctx, d_head_q, d_head_v, FA_VARIANT_F16);
     } else if (is_mixed) {
@@ -11407,9 +11288,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     const std::pair<int, int> dk_dv = {d_head_q, d_head_v};
     const bool use_native_q8_0_q1 = is_q8_0 && n_q == 1 &&
                                     backend_ctx->kernels_flash_attn_f32_q8_0_q1.count(dk_dv) > 0;
-    // Native q8_0 prefill kernel: available for the same dk_dv set, reads q8_0
-    // directly (no host-side dequant, no GPU dequant temp buffer). Uses the
-    // same BLOCK_M (=wg_size) as the f32 baseline kernel for these dk_dv pairs.
+    // Native q8_0 prefill — reads q8_0 directly, wg_size = cfg->bm.
     const bool use_native_q8_0 = is_q8_0 && n_q > 1 &&
                                  backend_ctx->kernels_flash_attn_f32_q8_0.count(dk_dv) > 0;
     const bool use_native_q4_0_q1 = is_q4_0 && n_q == 1 &&
@@ -11422,19 +11301,16 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     const int block_n = is_mixed
         ? backend_ctx->kernels_flash_attn_f32_f16_bn.at(dk_dv)
         : backend_ctx->kernels_flash_attn_bn.at(dk_dv);
-    // For DK values that have a split variant (N_SPLIT>1), choose it only when
-    // n_kv is large enough to amortise the extra barrier overhead.
+    // Pick split variant only when n_kv crosses the per-(dk,dv) threshold.
     const bool use_split_kernel = (n_q > 1 && is_mixed &&
         backend_ctx->kernels_flash_attn_f32_f16_split.count(dk_dv) > 0 &&
         n_kv >= backend_ctx->kernels_flash_attn_f32_f16_split_nkv_threshold.at(dk_dv));
-    // Same idea for the q8_0 prefill split variant.
     const bool use_split_q8_0 = (use_native_q8_0 &&
         backend_ctx->kernels_flash_attn_f32_q8_0_split.count(dk_dv) > 0 &&
         n_kv >= backend_ctx->kernels_flash_attn_f32_q8_0_split_nkv_threshold.at(dk_dv));
     const bool use_split_q4_0 = (use_native_q4_0 &&
         backend_ctx->kernels_flash_attn_f32_q4_0_split.count(dk_dv) > 0 &&
         n_kv >= backend_ctx->kernels_flash_attn_f32_q4_0_split_nkv_threshold.at(dk_dv));
-    // wg_size_fa: BLOCK_M for baseline kernel, BLOCK_M*N_SPLIT for split variant.
     const int wg_size_fa = (n_q > 1 && is_mixed)
         ? (use_split_kernel
             ? backend_ctx->kernels_flash_attn_f32_f16_split_wg_size.at(dk_dv)
@@ -11446,10 +11322,8 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     ggml_tensor_extra_cl * extra_mask = mask ? (ggml_tensor_extra_cl *)mask->extra : NULL;
     ggml_tensor_extra_cl * extra_sinks = sinks ? (ggml_tensor_extra_cl *)sinks->extra : NULL;
 
-    // K/V may be SoA (either q8_0 or q4_0). In that case ggml_tensor_extra_cl's
-    // data_device field actually aliases the `q` subbuffer of the quant-specific
-    // extra struct, so we reconstruct AoS into a temp buffer below. For AoS
-    // (regular extra), fall through to extra_k/v->data_device.
+    // SoA q8_0/q4_0 K/V: data_device aliases the `q` subbuffer; reconstruct
+    // AoS into a temp buffer below. AoS tensors use extra_k/v->data_device.
     const bool k_soa_q8_0 = ggml_cl_is_q8_0_soa(k);
     const bool v_soa_q8_0 = ggml_cl_is_q8_0_soa(v);
     const bool k_soa_q4_0 = ggml_cl_is_q4_0_soa(k);
@@ -11528,11 +11402,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     cl_mem k_data_device = k_soa ? NULL : extra_k->data_device;
     cl_mem v_data_device = v_soa ? NULL : extra_v->data_device;
 
-    // For SoA q8_0 tensors (tensor went through set_tensor's AoS->SoA path),
-    // reconstruct an AoS byte layout into a temp buffer so downstream kernels
-    // that read tight q8_0 records see the expected data. The native q8_0 FA
-    // decode kernel reads AoS records; the host-side dequant fallback also
-    // reads AoS bytes from the tensor's data_device.
+    // SoA q8_0 → reconstruct AoS for downstream kernels that expect tight records.
     ggml_cl_flash_attn_temp_buffer temp_k_aos;
     ggml_cl_flash_attn_temp_buffer temp_v_aos;
     if (k_soa_q8_0) {
@@ -11554,12 +11424,10 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
                                                 v_nb1, v_nb2, v_nb3);
     }
 
-    // Skip host-side dequant when a native quantised kernel (q8_0 or q4_0)
-    // will read the quants directly.
+    // Skip host dequant when a native quantised kernel will read the quants.
     if (!use_native_q8_0_q1 && !use_native_q8_0 &&
         !use_native_q4_0_q1 && !use_native_q4_0) {
-        // Fast path: GPU-side q8_0 dequant (to f16 or f32) for tight-row
-        // tensors. Falls back to CPU dequant when the row isn't tight.
+        // GPU q8_0 dequant for tight rows; CPU fallback otherwise.
         bool k_done = false;
         bool v_done = false;
         if (is_q8_0) {
@@ -11576,12 +11444,8 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         if (!v_done) {
             ggml_cl_flash_attn_prepare_quantized_tensor(backend_ctx, v, kv_target_type, temp_v, v_data_device, offset_v, v_nb1, v_nb2, v_nb3);
         }
-        // Asymmetric KV (e.g. -ctk q4_0 -ctv f16): the dispatch falls through
-        // to the F32 fallback kernel because is_mixed/is_f16/is_q* require
-        // matched K/V types. The quantized side has been dequant'd to F32; an
-        // F16 side still needs F16->F32 conversion to match what the kernel
-        // reads. is_mixed/is_f16 paths leave K/V as F16 for their kernels,
-        // so skip conversion there.
+        // Asymmetric KV on the F32 fallback path: convert the F16 side to F32
+        // too. (Symmetric F16 / mixed paths handle F16 directly.)
         if (kv_target_type == GGML_TYPE_F32 && !is_mixed && !is_f16) {
             ggml_cl_flash_attn_convert_f16_to_f32(backend_ctx, k, temp_k, k_data_device, offset_k, k_nb1, k_nb2, k_nb3);
             ggml_cl_flash_attn_convert_f16_to_f32(backend_ctx, v, temp_v, v_data_device, offset_v, v_nb1, v_nb2, v_nb3);
@@ -11596,15 +11460,11 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     cl_ulong mask_pad_nb2 = 0;
     cl_ulong mask_pad_nb3 = 0;
 
-    // Early FD eligibility probe. Used only to gate the non-FD prefill prep
-    // kernels (KV pad, blk-mask classification) — the real FD dispatch still
-    // happens below with its own guards. Keep the predicates here in sync with
-    // the `if (use_fd)` block further down.
+    // Early FD eligibility probe; gates the non-FD prefill prep only.
+    // Real FD dispatch below applies its own guards — keep predicates in sync.
     const int  fd_is_causal_probe = (mask == NULL && n_q > 1 && n_q == n_kv);
-    // Match the gating used by the actual FD dispatch below. Multi-query FD is
-    // DK-gated (see FD_MAX_DK_MULTI comment in the dispatch block). FD is also
-    // bypassed for DK>128: the single-pass kernel is already compute-bound at
-    // that depth, so the partial-buffer + merge overhead regresses decode.
+    // Multi-query FD: DK-gated. FD also bypassed for DK>128 (single-pass is
+    // already compute-bound).
     const int  fd_max_n_q_probe = (d_head_q <= 64) ? 8 : 1;
     const bool fd_will_fire =
         (n_q >= 1 && n_q <= fd_max_n_q_probe && n_kv >= 2048 && !fd_is_causal_probe &&
@@ -11616,17 +11476,11 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
 
     const int n_q_blocks = n_q > 1 ? (n_q + block_m - 1) / block_m : 0;
     const int n_kv_blocks = n_kv > 0 ? (n_kv + block_n - 1) / block_n : 0;
-    // Non-FD prefill uses KV padding and a per-tile mask classification. When
-    // FD will fire these are pure overhead (the FD kernels don't consume them),
-    // so gate on `!fd_will_fire`.
+    // KV pad + blk prepass are pure overhead when FD will fire — skip them.
     const bool use_mixed_prepass = is_mixed && n_q > 1 && !fd_will_fire;
     const bool use_kv_pad = use_mixed_prepass && (n_kv % block_n != 0);
-    // blk prepass: classifies each KV tile as fully-masked / mixed / fully-unmasked
-    // based on the attention mask. Drives two optimisations inside the FA kernel:
-    //   0-blocks → skip the tile entirely (~50% of KV reads on causal PP);
-    //   2-blocks → skip per-row mask lookup (~BLOCK_M×BLOCK_N half reads per tile).
-    // Extended to the native q8_0 / q4_0 prefill kernels: they now accept a blk
-    // pointer and consume the classification identically to f32_f16.
+    // blk prepass: per-KV-tile mask class (0=masked, 1=mixed, 2=unmasked).
+    // Consumed identically by f32_f16, q8_0 and q4_0 prefill kernels.
     const bool use_quant_prepass = (use_native_q8_0 || use_native_q4_0) && !fd_will_fire;
     const bool use_blk_mask = (use_mixed_prepass || use_quant_prepass) && mask_buffer != NULL;
 
@@ -11695,8 +11549,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         const size_t blk_size = (size_t) n_kv_blocks * (size_t) n_q_blocks * (size_t) mask_ne2 * (size_t) mask_ne3;
         temp_blk.data = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE, blk_size, NULL, &err);
         if (err != CL_SUCCESS) {
-            // Flush all pending GPU work so the driver can reclaim deferred deallocations,
-            // then retry. This handles intermittent OOM after long benchmark runs.
+            // Flush before retry — reclaim deferred driver deallocations.
             CL_CHECK(clFinish(backend_ctx->queue));
             temp_blk.data = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE, blk_size, NULL, &err);
         }
@@ -11726,41 +11579,16 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     const float m0 = powf(2.0f, -(max_bias) / n_head_log2_f);
     const float m1 = powf(2.0f, -(max_bias / 2.0f) / n_head_log2_f);
 
-    // ============================================================================
-    // Flash-Decoding (K-split) for decode / short-query path.
-    //
-    // Single-query (n_q == 1): decode. Always eligible for DK∈{64,96,128,192,256}
-    // when n_kv ≥ FD_MIN_N_KV.
-    //
-    // Multi-query (2 ≤ n_q ≤ FD_MAX_N_Q_MULTI): speculative decoding / parallel-
-    // token generation. Each WG owns one (batch, head, query, split) tuple, so
-    // K/V reads are NOT shared across queries — total K/V bandwidth scales as
-    // O(n_q · n_kv). That beats the prefill kernel only when per-row compute is
-    // light relative to launch/merge overhead. Measured on Adreno X1-85:
-    //   DK=64  (Llama-3.2-1B)   : +26 to +115% at pp4, d=2048..16384
-    //   DK=96  (Phi-3.5-mini)   : -21% to neutral
-    //   DK=128 (Qwen3-{0.6B,4B}): -16% to -21%
-    // So multi-query FD is gated on DK ≤ FD_MAX_DK_MULTI. A future rewrite that
-    // shares K/V across queries inside a single WG (cross-Q accumulation) should
-    // relax this — see e.g. FlashDecoding++ / FlashAttention-2 multi-token
-    // decode paths.
-    //
-    // Splits the KV dimension across N_SPLITS work-groups per (batch, head, q),
-    // each writing a (m_c, l_c, O_c) partial to a temp buffer. A tiny merge
-    // kernel reduces partials into the final token. Supports f16 / q8_0 / q4_0
-    // KV — merge kernel is type-agnostic. !is_causal required (FD loop has no
-    // causal bounds; speculative decoding supplies an explicit mask).
-    // ============================================================================
+    // Flash-Decoding (K-split). Single-query always eligible at DK∈{64..256}
+    // when n_kv ≥ FD_MIN_N_KV; multi-query gated on DK ≤ FD_MAX_DK_MULTI.
+    // Supports f16/q8_0/q4_0 KV (merge kernel is type-agnostic). !is_causal.
     const int FD_MIN_N_KV      = 2048;
     const int FD_KV_PER_SP     = 2048;
     const int FD_MAX_N_Q_MULTI = 8;
     const int FD_MAX_DK_MULTI  = 64;
     const int FD_MAX_DK        = 128;
     const int fd_max_n_q = (d_head_q <= FD_MAX_DK_MULTI) ? FD_MAX_N_Q_MULTI : 1;
-    // Pick the Pass 1 kernel based on KV type; all three produce identical
-    // partial-buffer layout so Pass 2 (merge) is shared. DK>128 is compute-
-    // bound in the single-pass kernel; skipping FD there avoids a measured
-    // 6-15% decode regression on Qwen3.5-9B (DK=256) at d4096/d8192.
+    // FD skipped for DK>128 (single-pass already compute-bound).
     cl_kernel fd_k_split = NULL;
     if (n_q >= 1 && n_q <= fd_max_n_q && n_kv >= FD_MIN_N_KV && !is_causal &&
         d_head_q <= FD_MAX_DK &&
@@ -11779,15 +11607,11 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     const bool use_fd = (fd_k_split != NULL);
 
     if (use_fd) {
-        // Choose N_SPLITS: roughly n_kv / 2048, clamped to [2, 16].
-        int n_splits = (n_kv + FD_KV_PER_SP - 1) / FD_KV_PER_SP;
+        int n_splits = (n_kv + FD_KV_PER_SP - 1) / FD_KV_PER_SP;  // ~n_kv/2048, clamped.
         if (n_splits < 2)  n_splits = 2;
         if (n_splits > 16) n_splits = 16;
         const int kv_per_split = (n_kv + n_splits - 1) / n_splits;
 
-        // Partial buffer: n_batch × n_head × n_q × n_splits × (2 + DV) floats.
-        // Layout [batch][head][query][split][m,l,O] matches the split kernel's
-        // record_idx computation.
         const int fa_partial_floats = 2 + d_head_v;
         const size_t partial_size_bytes =
             (size_t) n_batch * n_head * n_q * n_splits * fa_partial_floats * sizeof(float);
@@ -11803,7 +11627,6 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         }
         CL_CHECK(err);
 
-        // --- Pass 1: per-split partials ---
         cl_kernel k_split = fd_k_split;
         int argi = 0;
         CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(cl_mem),   &extra_q->data_device));
@@ -11844,12 +11667,10 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
 
         const size_t fd_wg = 64; // matches Q1_WG_SIZE in the kernel
         size_t fd_lws[3] = { fd_wg, 1, 1 };
-        // gid(2) = q_idx * n_splits + split_idx, dispatched as one dim of size
-        // n_splits * n_q so the split kernel can decode both indices.
+        // gid(2) packs q_idx * n_splits + split_idx.
         size_t fd_gws[3] = { fd_wg, (size_t)(n_head * n_batch), (size_t)(n_splits * n_q) };
         backend_ctx->enqueue_ndrange_kernel(k_split, 3, fd_gws, fd_lws, dst);
 
-        // --- Pass 2: merge ---
         cl_kernel k_merge = backend_ctx->kernels_flash_attn_f32_merge.at(dk_dv);
         argi = 0;
         CL_CHECK(clSetKernelArg(k_merge, argi++, sizeof(cl_mem),   &temp_partial.data));
@@ -11913,8 +11734,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         CL_CHECK(clSetKernelArg(kernel, 46, sizeof(cl_ulong),  &mask_pad_nb2));
         CL_CHECK(clSetKernelArg(kernel, 47, sizeof(cl_ulong),  &mask_pad_nb3));
     } else if (use_native_q8_0 || use_native_q4_0) {
-        // Native q8_0 / q4_0 prefill: accept the optional blk classification
-        // buffer as arg 40. NULL disables the prepass-driven skip/fast-path.
+        // arg 40 = blk classification buffer (NULL disables prepass opt).
         CL_CHECK(clSetKernelArg(kernel, 40, sizeof(cl_mem),    &blk_buffer));
     }
 
@@ -11924,9 +11744,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         size_t global_work_size[] = { wg_size, (size_t)(n_head * n_batch) };
         backend_ctx->enqueue_ndrange_kernel(kernel, 2, global_work_size, local_work_size, dst);
     } else if (use_native_q8_0) {
-        // Native q8_0 prefill: wg_size = BLOCK_M for baseline, BLOCK_M*N_SPLIT for
-        // split. The split variant may use a different BLOCK_M (e.g., DK=96 quant
-        // uses BM=32 with N_SPLIT=3) so we read the per-split bm when splitting.
+        // Split variant may override BLOCK_M (e.g. DK=96 quant uses BM=32).
         const int bm = use_split_q8_0
             ? backend_ctx->kernels_flash_attn_f32_q8_0_split_bm.at(dk_dv)
             : backend_ctx->kernels_flash_attn_bm.at(dk_dv);
@@ -11937,7 +11755,6 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         size_t global_work_size[] = { (size_t)((n_q + bm - 1) / bm) * wg_size, (size_t)(n_head * n_batch) };
         backend_ctx->enqueue_ndrange_kernel(kernel, 2, global_work_size, local_work_size, dst);
     } else if (use_native_q4_0) {
-        // Native q4_0 prefill: same bm/split structure as q8_0 above.
         const int bm = use_split_q4_0
             ? backend_ctx->kernels_flash_attn_f32_q4_0_split_bm.at(dk_dv)
             : backend_ctx->kernels_flash_attn_bm.at(dk_dv);
@@ -11948,7 +11765,6 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         size_t global_work_size[] = { (size_t)((n_q + bm - 1) / bm) * wg_size, (size_t)(n_head * n_batch) };
         backend_ctx->enqueue_ndrange_kernel(kernel, 2, global_work_size, local_work_size, dst);
     } else {
-        // wg_size_fa = block_m * N_SPLIT for the split variant, block_m otherwise.
         const size_t wg_size = (size_t) wg_size_fa;
         size_t local_work_size[] = { wg_size, 1 };
         size_t global_work_size[] = { (size_t)((n_q + block_m - 1) / block_m) * wg_size, (size_t)(n_head * n_batch) };
@@ -12978,7 +12794,7 @@ static void ggml_cl_mul_mat_q8_0_f32_adreno(ggml_backend_t backend, const ggml_t
 
     ggml_tensor_extra_cl * extra1 = (ggml_tensor_extra_cl *)src1->extra;
     ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
-    // For views, SoA extra lives on the parent (view->extra stays pre-SoA).
+    // SoA extra lives on view_src (view->extra is pre-SoA).
     const ggml_tensor * soa0_src = src0->view_src != nullptr ? src0->view_src : src0;
     ggml_tensor_extra_cl_q8_0 * extra0_q8_0 = (ggml_tensor_extra_cl_q8_0 *)soa0_src->extra;
 
@@ -13732,12 +13548,9 @@ static void ggml_cl_mul_mat_q5_K_f32_adreno(ggml_backend_t backend, const ggml_t
 #endif
 }
 
-// Dequant a (possibly permuted / strided) q4_0 or q8_0 tensor to a tightly
-// packed f16 buffer in the tensor's logical order. For SoA (weight) tensors
-// accessed via a permuted view, the SoA representation is first reconstructed
-// into a temporary AoS buffer. Returns a temp cl_mem the caller must release.
-// `extra_reconstruct` is populated if reconstruction happened; the caller must
-// release that buffer too.
+// Dequant a possibly-strided q4_0/q8_0 tensor to tight-packed f16. Returns a
+// temp cl_mem the caller must release. SoA inputs are reconstructed into a
+// temp AoS buffer reported via *extra_reconstruct (also caller-released).
 static cl_mem ggml_cl_mul_mat_dequant_quant_to_f16(
         ggml_backend_opencl_context * backend_ctx,
         const ggml_tensor *           tensor,
@@ -13759,10 +13572,7 @@ static cl_mem ggml_cl_mul_mat_dequant_quant_to_f16(
         : ggml_cl_is_q8_0_soa(tensor);
 
     if (is_soa) {
-        // Reconstruct the full parent tensor from SoA into a temporary AoS
-        // buffer, then index into it with the view's strides. The parent
-        // buffer is tightly packed in AoS layout, so the view's own nb[]
-        // can be recomputed from the block size.
+        // Reconstruct full parent AoS; view's own nb[] then index it correctly.
         const ggml_tensor * parent = tensor->view_src ? tensor->view_src : tensor;
         const ggml_tensor * soa_src = parent;
         const size_t block_bytes = (size_t) ggml_type_size(tensor->type);
@@ -13797,9 +13607,6 @@ static cl_mem ggml_cl_mul_mat_dequant_quant_to_f16(
 
         (void) parent_row_blocks;
         (void) parent_row_bytes;
-        // The reconstructed parent is bit-identical to the original AoS
-        // allocation, so the view's own nb[] (which already encode any
-        // permutation) address the new buffer correctly.
         src_buf    = aos;
         src_offset = tensor->view_offs;
         src_nb1    = tensor->nb[1];
@@ -13809,8 +13616,7 @@ static cl_mem ggml_cl_mul_mat_dequant_quant_to_f16(
         if (extra_reconstruct) {
             *extra_reconstruct = aos;
         } else {
-            // Safe to release now: OpenCL retains the memobj while kernels
-            // that reference it are still in flight.
+            // OpenCL retains the memobj while queued kernels reference it.
             CL_CHECK(clReleaseMemObject(aos));
         }
     } else {
@@ -13869,11 +13675,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
 
-    // Non-contig q4_0 / q8_0 src0 (KV cache accessed via permuted view with
-    // -fa 0, or permuted SoA weight views in test-backend-ops): dequant on-
-    // device to tightly-packed f16 and re-dispatch through the native f16
-    // MUL_MAT path. Keeps the op entirely on GPU. Contig src0 falls through
-    // to the existing specialised quant kernels.
+    // Non-contig quant src0: on-device dequant to f16 then native f16 MUL_MAT.
     if ((src0t == GGML_TYPE_Q4_0 || src0t == GGML_TYPE_Q8_0) && !ggml_is_contiguous(src0)) {
         cl_mem f16_buf = ggml_cl_mul_mat_dequant_quant_to_f16(backend_ctx, src0, nullptr);
 
@@ -13907,12 +13709,8 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
     cl_ulong offsetd = extrad->offset + dst->view_offs;
 
 #ifdef GGML_OPENCL_SOA_Q
-    // SoA extras for quantized weights are installed on the real tensor by
-    // set_tensor (replacing the original ggml_tensor_extra_cl). View tensors
-    // (e.g. ggml_permute(a), ggml_view_*, ggml_set_rows' output view) still
-    // carry the pre-SoA extra from buffer_init_tensor, so casting view->extra
-    // to one of these SoA structs reads garbage and SIGSEGVs on kernel launch.
-    // Follow view_src to reach the parent tensor's SoA extra.
+    // view->extra stays pre-SoA; cast to the SoA struct would SIGSEGV.
+    // Follow view_src to reach the real SoA extra.
     const ggml_tensor * soa0_src = src0->view_src != nullptr ? src0->view_src : src0;
     ggml_tensor_extra_cl_q4_0 * extra0_q4_0 = (ggml_tensor_extra_cl_q4_0 *)soa0_src->extra;
     ggml_tensor_extra_cl_q4_1 * extra0_q4_1 = (ggml_tensor_extra_cl_q4_1 *)soa0_src->extra;
@@ -15406,8 +15204,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
     GGML_UNUSED(offset0);
 
 #ifdef GGML_OPENCL_SOA_Q
-    // View tensors still point to the pre-SoA extra; follow view_src to reach
-    // the SoA extra (q/d/e subbuffers) installed by set_tensor.
+    // SoA extra lives on view_src (view->extra is pre-SoA).
     const ggml_tensor * soa0_src = src0->view_src != nullptr ? src0->view_src : src0;
     ggml_tensor_extra_cl_q4_0 * extra0_q4_0 = (ggml_tensor_extra_cl_q4_0 *)soa0_src->extra;
     ggml_tensor_extra_cl_q4_1 * extra0_q4_1 = (ggml_tensor_extra_cl_q4_1 *)soa0_src->extra;
