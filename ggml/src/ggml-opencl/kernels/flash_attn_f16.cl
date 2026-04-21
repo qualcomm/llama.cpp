@@ -12,8 +12,7 @@
 #define WG_SIZE (BLOCK_M)
 #define Q1_WG_SIZE 64
 
-// See note in flash_attn_f32.cl: drop full-unroll hints at DK>=192 to keep
-// the Adreno compiler within its host-memory budget.
+// Drop full unroll at DK>=192 — Adreno compiler host-memory budget.
 #if DK >= 192
 #define FA_UNROLL
 #else

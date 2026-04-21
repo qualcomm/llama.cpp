@@ -1,9 +1,5 @@
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
 
-// sub_group_shuffle_xor: shuffle float values across lanes without local memory.
-// Qualcomm Adreno exposes this via cl_qcom_subgroup_shuffle (vendor extension);
-// other devices may use the KHR standard cl_khr_subgroup_shuffle.
-// Falls back to local-memory reduction when neither is available.
 #ifdef cl_khr_subgroup_shuffle
 #pragma OPENCL EXTENSION cl_khr_subgroup_shuffle : enable
 #define HAS_SUBGROUP_SHUFFLE 1
@@ -26,19 +22,15 @@
 #define DV_VEC (DV/4)
 #define Q1_WG_SIZE 64
 
-// See note in flash_attn_f32.cl: drop full-unroll hints at DK>=192 to keep
-// the Adreno compiler within its host-memory budget.
+// Drop full unroll at DK>=192 — Adreno compiler host-memory budget.
 #if DK >= 192
 #define FA_UNROLL
 #else
 #define FA_UNROLL _Pragma("unroll")
 #endif
 
-// N_SPLIT: number of threads that collaborate on each query's dot product.
-// When N_SPLIT > 1, each query is processed by N_SPLIT threads, each owning
-// 1/N_SPLIT of the DK and DV dimensions.  This reduces register pressure for
-// large head dimensions (e.g. DK=256 where N_SPLIT=1 causes ~512 float
-// registers per thread → heavy spilling).
+// N_SPLIT>1 splits DK/DV across N_SPLIT threads per query row. Reduces
+// per-thread register pressure at large DK.
 #ifndef N_SPLIT
 #define N_SPLIT 1
 #endif
@@ -105,9 +97,6 @@ __kernel void flash_attn_f32_f16(
     const int block_q_idx = get_group_id(0);
     const int head_batch_idx = get_global_id(1);
 
-    // When N_SPLIT > 1: q_lane identifies which query row within the block,
-    // split_idx identifies which DK/DV slice this thread owns.
-    // When N_SPLIT == 1: q_lane == tid, split_idx == 0 (compile-time constant).
 #if N_SPLIT > 1
     const int q_lane    = tid / N_SPLIT;
     const int split_idx = tid % N_SPLIT;
@@ -146,8 +135,6 @@ __kernel void flash_attn_f32_f16(
         blk_base = blk + (((mask_batch_idx * mask_ne2) + mask_head_idx) * n_q_blocks + block_q_idx) * n_kv_blocks;
     }
 
-    // Each thread owns SPLIT_DK_VEC float4 elements of the query row.
-    // For N_SPLIT==1: SPLIT_DK_VEC == DK_VEC, identical to original.
     ACC_TYPE4 q_priv[SPLIT_DK_VEC];
     const int dk_off = split_idx * SPLIT_DK_VEC;
     if (query_valid) {
@@ -170,13 +157,6 @@ __kernel void flash_attn_f32_f16(
         o_acc[i] = (ACC_TYPE4)(0.0f);
     }
 
-    // Softmax running state.
-    // N_SPLIT==1: maintained per-thread (one thread per query row).
-    // N_SPLIT>1 + HAS_SUBGROUP_SHUFFLE: maintained independently on all N_SPLIT
-    //   threads — they see identical scores after the shuffle reduction, so (m_i,
-    //   l_i) evolve identically.
-    // N_SPLIT>1 (no shuffle): only split_idx==0 maintains the real state; others
-    //   read back softmax scales from local memory.
     ACC_TYPE m_i = -INFINITY;
     ACC_TYPE l_i = 0.0f;
 
@@ -186,16 +166,8 @@ __kernel void flash_attn_f32_f16(
     __local KV_DATA_TYPE4 l_v[BLOCK_N][DV_VEC];
 
 #if N_SPLIT > 1 && !defined(HAS_SUBGROUP_SHUFFLE)
-    // Reduction arrays only needed when sub_group_shuffle_xor is unavailable.
-    // With shuffle the entire QK reduction and softmax broadcast fit in registers,
-    // so these arrays (and their associated barriers) are completely eliminated.
-    //
-    // local_partial[BLOCK_N][WG_SIZE]: each thread writes at [j][tid].
-    // Bank for j=0: tid % 32 → exactly 4-way conflict (theoretical minimum for
-    // 128 threads / 32 banks).  The previous layout [BLOCK_M][BLOCK_N][N_SPLIT]
-    // had stride BLOCK_N*N_SPLIT=128; since 128%32==0 all q_lanes mapped to the
-    // same 8 banks → 16-way conflicts.  The new layout cuts write serialisation
-    // by 4x at the cost of zero extra memory (BLOCK_N*WG_SIZE == BLOCK_M*BLOCK_N*N_SPLIT).
+    // Fallback reduction arrays (shuffle path eliminates these).
+    // local_partial layout [BLOCK_N][WG_SIZE] chosen to minimise bank conflicts.
     __local ACC_TYPE local_partial[BLOCK_N][WG_SIZE];
     __local ACC_TYPE local_p[BLOCK_M][BLOCK_N];
     __local ACC_TYPE local_softmax_scale[BLOCK_M];
@@ -203,10 +175,7 @@ __kernel void flash_attn_f32_f16(
 #endif
 
     for (int k_start = 0; k_start < n_kv; k_start += BLOCK_N) {
-        // Skip fully-masked KV blocks before loading K/V tiles.
-        // blk_base[k_start/BLOCK_N] is uniform across all threads in the work group
-        // (same pointer, same k_start), so the continue is a uniform branch — safe.
-        // For causal PP this skips ~50% of KV global memory reads.
+        // Skip fully-masked KV tiles (uniform branch across WG).
         char blk_cur = 1;
         if (blk_base != NULL) {
             blk_cur = blk_base[k_start / BLOCK_N];
@@ -247,28 +216,14 @@ __kernel void flash_attn_f32_f16(
         barrier(CLK_LOCAL_MEM_FENCE);
 
 #if N_SPLIT > 1 && defined(HAS_SUBGROUP_SHUFFLE)
-        // ----------------------------------------------------------------
-        // N_SPLIT > 1 + subgroup shuffle path (Adreno).
-        //
-        // Each thread owns SPLIT_DK_VEC of the DK dimension and SPLIT_DV_VEC
-        // of the DV dimension.  For DK=64, N_SPLIT=2: WG_SIZE=64 fills one
-        // Adreno X85 wavefront (was 32 = half a wavefront with N_SPLIT=1).
-        //
-        // Key insight: all N_SPLIT threads for a given q_lane see the same
-        // QK score after the shuffle reduction, so they can each maintain
-        // their own copy of the running (m_i, l_i) state independently —
-        // no local memory and NO extra barriers beyond the K/V tile load.
-        //
-        // Barrier budget: 1 per KV block (K/V load only), same as N_SPLIT=1.
-        // Local memory:   only l_k + l_v (~8 KB for DK=64) → 4× WG occupancy.
-        // ----------------------------------------------------------------
+        // N_SPLIT>1 shuffle path: all split threads per q_lane share the same
+        // QK score post-shuffle, so (m_i, l_i) evolves identically on each.
         {
             const int dv_off = split_idx * SPLIT_DV_VEC;
             for (int j = 0; j < BLOCK_N; j += 2) {
                 const int k_row0 = k_start + j;
                 const int k_row1 = k_start + j + 1;
 
-                // --- QK partial dots (each thread covers SPLIT_DK_VEC float4 lanes) ---
                 ACC_TYPE partial0 = 0.0f;
                 ACC_TYPE partial1 = 0.0f;
                 FA_UNROLL
@@ -280,11 +235,7 @@ __kernel void flash_attn_f32_f16(
                     partial1 += dot1.s0 + dot1.s1 + dot1.s2 + dot1.s3;
                 }
 
-                // --- Reduce across N_SPLIT threads via shuffle XOR tree ---
-                // Threads for the same q_lane sit at consecutive positions
-                // (q_lane*N_SPLIT .. q_lane*N_SPLIT + N_SPLIT-1), so XOR with
-                // powers of 2 correctly pairs up the right threads.
-                // After the loop every thread in the group has the full sum.
+                // shuffle_xor reduction across the N_SPLIT threads.
                 FA_UNROLL
                 for (int step = 1; step < N_SPLIT; step <<= 1) {
                     partial0 += sub_group_shuffle_xor(partial0, step);
@@ -294,7 +245,6 @@ __kernel void flash_attn_f32_f16(
                 ACC_TYPE score0 = partial0 * scale;
                 ACC_TYPE score1 = partial1 * scale;
 
-                // --- Causal / out-of-range mask ---
                 if (!query_valid) { score0 = -INFINITY; score1 = -INFINITY; }
                 if (is_causal) {
                     if (k_row0 > (n_kv - n_q + my_query_row)) score0 = -INFINITY;
@@ -322,7 +272,6 @@ __kernel void flash_attn_f32_f16(
                     score1 = logit_softcap * tanh(score1 / logit_softcap);
                 }
 
-                // --- Online softmax update (identical on all N_SPLIT threads) ---
                 const ACC_TYPE m_new = max(m_i, max(score0, score1));
                 const ACC_TYPE sp    = native_exp(m_i - m_new);
                 const ACC_TYPE p0    = native_exp(score0 - m_new);
@@ -339,18 +288,8 @@ __kernel void flash_attn_f32_f16(
             }
         }
 #elif N_SPLIT > 1
-        // ----------------------------------------------------------------
-        // N_SPLIT > 1 path (no shuffle): batched dot-product reduction via
-        // local memory.  2 barriers per KV block.
-        // Phase 1: every thread writes its partial dot to local_partial[j][tid].
-        // Phase 2: split_idx==0 reduces, computes block softmax, writes local_p.
-        // Phase 3: all threads accumulate V using local_p.
-        // ----------------------------------------------------------------
-
+        // N_SPLIT>1 fallback (no shuffle): 3-phase local-memory reduction.
         // Phase 1 — partial dots for all BLOCK_N tokens.
-        // Write to local_partial[j][tid]: consecutive tids map to consecutive
-        // banks (bank = tid%32), giving 4-way conflicts (theoretical minimum
-        // for WG_SIZE=128 threads, 32 banks).
         for (int j = 0; j < BLOCK_N; ++j) {
             ACC_TYPE4 dot_acc = (ACC_TYPE4)(0.0f);
             FA_UNROLL
@@ -413,9 +352,9 @@ __kernel void flash_attn_f32_f16(
                 for (int j = 0; j < BLOCK_N; ++j) local_p[q_lane][j] = 0.0f;
             }
         }
-        barrier(CLK_LOCAL_MEM_FENCE);  // probabilities visible to all threads
+        barrier(CLK_LOCAL_MEM_FENCE);
 
-        // Phase 3 — accumulate V using broadcast probabilities from local_p.
+        // Phase 3 — V accumulate using broadcast probabilities.
         {
             const ACC_TYPE sp_block = local_softmax_scale[q_lane];
             const int dv_off = split_idx * SPLIT_DV_VEC;
@@ -432,19 +371,7 @@ __kernel void flash_attn_f32_f16(
             }
         }
 #else
-        // ----------------------------------------------------------------
-        // N_SPLIT == 1 path: j+=4 unroll.
-        //
-        // 4 KV tokens per outer loop step vs 2 before:
-        //   - exp calls: 5 per 4-token group vs 6 per two j+=2 steps
-        //     → 8 groups × 5 = 40 exps/tile vs 16 × 3 = 48 (save 8/tile)
-        //   - o_acc rescales: 8 per tile vs 16 → save 8×DV_VEC scalar muls
-        //   - V accumulate: 4 chained MADs per DV element
-        // j+=8 tested and regressed (likely instruction pressure with
-        // 8 simultaneous dot accumulators in the inner k-loop).
-        // Requires BLOCK_N % 4 == 0 (holds for all entries: 32, 16).
-        // All temporaries stay as named scalars — no private memory arrays.
-        // ----------------------------------------------------------------
+        // N_SPLIT==1: j+=4 unroll. Requires BLOCK_N % 4 == 0.
         if (query_valid) {
             for (int j = 0; j < BLOCK_N; j += 4) {
                 const int k_row0 = k_start + j;
@@ -526,13 +453,8 @@ __kernel void flash_attn_f32_f16(
 #endif
     }
 
-    // ----------------------------------------------------------------
-    // Write output
-    // ----------------------------------------------------------------
+    // Write output.
 #if N_SPLIT > 1 && defined(HAS_SUBGROUP_SHUFFLE)
-    // All N_SPLIT threads carry identical (m_i, l_i) after the shuffle path,
-    // so sinks and normalisation can be computed independently per thread
-    // without any local memory or extra barriers.
     if (query_valid) {
         ACC_TYPE sinks_sp = 1.0f;
         if (sinks_void != NULL) {
@@ -560,7 +482,6 @@ __kernel void flash_attn_f32_f16(
         }
     }
 #elif N_SPLIT > 1
-    // split_idx==0 finalises l_inv (handles sinks), broadcasts to all threads.
     if (split_idx == 0) {
         ACC_TYPE sinks_sp = 1.0f;
         if (query_valid && sinks_void != NULL) {
@@ -793,29 +714,9 @@ __kernel void flash_attn_f32_f16_q1(
     }
 }
 
-// ============================================================================
-// Flash-Decoding (K-split) — Pass 1: per-split partial reduction.
-//
-// Each work group processes a contiguous KV slice of length kv_per_split for
-// one (batch, head, query) triple. The query axis supports multi-token decode
-// (n_q = 1 for decode, 2..FD_MAX_N_Q for speculative decoding / parallel draft
-// paths); the [query] axis is unrolled into gid(2) alongside split:
-//
-//   gid(2) = q_idx * n_splits + split_idx
-//
-// Output: per-(batch, head, query, split) record of (m_c, l_c, O_c[DV]) into
-// `partial_void`. No sinks / alibi-slope application here; the merge kernel
-// handles global reductions. Mask (if any) is applied per-query via
-// q_idx * mask_nb1. Causal is never set on this path — the host gates FD on
-// !is_causal (speculative decoding supplies an explicit mask instead).
-//
-// Partial buffer stride per (batch, head, query, split):
-//   offset 0          : m_c       (float)
-//   offset 4          : l_c       (float)
-//   offset 8..8+DV*4  : O_c[DV]   (float4 × DV_VEC)
-// Laid out as [batch][head][query][split][m,l,O]. Host computes the record
-// offset via the same ordering.
-// ============================================================================
+// Flash-decoding split pass. Writes [m_c, l_c, O_c[DV]] per split; merge
+// kernel handles sinks/normalisation. Causal disabled by host (speculative
+// decoding supplies explicit mask). gid(2) = q_idx * n_splits + split_idx.
 #define FA_PARTIAL_FLOATS (2 + DV)
 
 __kernel void flash_attn_f32_f16_q1_split(
@@ -859,22 +760,18 @@ __kernel void flash_attn_f32_f16_q1_split(
     const int kv_start = split_idx * kv_per_split;
     const int kv_end   = min(kv_start + kv_per_split, n_kv);
 
-    // Record pointer for this (batch, head, query, split). Layout matches
-    // merge kernel: [batch][head][query][split][m,l,O].
     const ulong record_stride = (ulong) FA_PARTIAL_FLOATS;
     const ulong record_idx    = ((((ulong) batch_idx * n_head + head_idx) * n_q + q_idx)
                                  * n_splits + split_idx);
     global float  * rec       = partial_void + record_idx * record_stride;
     global float4 * rec_o     = (global float4 *) (rec + 2);
 
-    // Empty split (last split beyond n_kv when n_kv doesn't divide evenly).
-    // Write an empty-marker record so the merge kernel can detect it.
     if (kv_start >= kv_end) {
+        // Empty split: leave sentinel partial for merge.
         if (tid == 0) {
             rec[0] = -INFINITY;
             rec[1] = 0.0f;
         }
-        // tid==0 covers o_acc init to 0 via merge's `m_c == -INF` skip path.
         return;
     }
 
@@ -932,7 +829,7 @@ __kernel void flash_attn_f32_f16_q1_split(
     }
     const ACC_TYPE m_c = local_m[0];
 
-    // Pass 1b — softmax-weighted V accumulate using the split's own max.
+    // Pass 1b — softmax-weighted V accumulate.
     ACC_TYPE4 o_acc[DV_VEC];
     #pragma unroll
     for (int i = 0; i < DV_VEC; ++i) o_acc[i] = (ACC_TYPE4)(0.0f);
@@ -975,8 +872,6 @@ __kernel void flash_attn_f32_f16_q1_split(
     }
     const ACC_TYPE l_c = local_l[0];
 
-    // Write partial record. tid==0 writes m, l; all threads cooperate on O via
-    // per-lane local reduction across Q1_WG_SIZE for each float4 output lane.
     if (tid == 0) {
         rec[0] = (float) m_c;
         rec[1] = (float) l_c;
@@ -995,24 +890,10 @@ __kernel void flash_attn_f32_f16_q1_split(
     }
 }
 
-// ============================================================================
-// Flash-Decoding (K-split) — Pass 2: merge partials into the final token.
-//
-// One work group per (batch, head, query). Each thread owns one float4 lane of
-// the output vector (DV_VEC lanes total, so wg_size = DV_VEC). Thread 0 does
-// the m/l reduction across splits (short loop, n_splits ≤ 32).
-//
-// For multi-token decode (n_q > 1), the query axis is dispatched on gid(2);
-// for single-token decode n_q=1 the grid collapses to a 2D dispatch where
-// gid(2)=0 and q_idx=0.
-//
-// Formula (for each head, each query):
-//   m = max(m_c over splits; m_sink if sinks)
-//   l = Σ l_c · exp(m_c - m) + exp(m_sink - m)
+// FD Pass 2: merge per-split partials into the final token.
+//   m = max(m_c, m_sink); l = Σ l_c · exp(m_c - m) + exp(m_sink - m)
 //   O[i] = Σ O_c[i] · exp(m_c - m) / l
-// Splits where m_c == -INFINITY are empty (trailing edge when n_kv doesn't
-// divide by kv_per_split) and are silently skipped by the exp(...) → 0.
-// ============================================================================
+// Empty splits (m_c == -INF) drop out via exp(-INF) = 0.
 __kernel void flash_attn_f32_merge(
     const global float * partial_void,
     global void * o_void,
@@ -1034,7 +915,6 @@ __kernel void flash_attn_f32_merge(
     const ulong record_idx_0  = (((ulong) batch_idx * n_head + head_idx) * n_q + q_idx) * n_splits;
     const global float * rec0 = partial_void + record_idx_0 * record_stride;
 
-    // Reduce m across splits (including sink if present).
     __local ACC_TYPE m_final_shared;
     __local ACC_TYPE l_final_shared;
     if (lane == 0) {
@@ -1052,12 +932,10 @@ __kernel void flash_attn_f32_merge(
             has_sink = true;
             m = max(m, m_sink);
         }
-        // Now reduce l, rescaling each split's l_c by exp(m_c - m).
         ACC_TYPE l = 0.0f;
         for (int c = 0; c < n_splits; ++c) {
             const ACC_TYPE m_c = rec0[c * record_stride + 0];
             const ACC_TYPE l_c = rec0[c * record_stride + 1];
-            // empty split: m_c == -INFINITY → exp(-INF) = 0, l_c is 0 anyway.
             if (m_c > -INFINITY) {
                 l += l_c * exp(m_c - m);
             }
@@ -1073,7 +951,6 @@ __kernel void flash_attn_f32_merge(
     const ACC_TYPE l_final = l_final_shared;
     const ACC_TYPE l_inv   = (l_final > 0.0f) ? (1.0f / l_final) : 0.0f;
 
-    // Each lane owns one float4 of the output.
     ACC_TYPE4 o = (ACC_TYPE4)(0.0f);
     for (int c = 0; c < n_splits; ++c) {
         const global float * rec_c   = rec0 + c * record_stride;

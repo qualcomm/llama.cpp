@@ -158,10 +158,7 @@ kernel void kernel_set_rows_f32_i32(
     }
 }
 
-// q8_0 quantization: src0 is f32, dst is q8_0 blocks.
-// Each block: half d (scale) + char qs[32] (quants).
-// nblk0 = number of q8_0 blocks per row = ne00 / 32.
-// The kernel quantizes 32 f32 values into one q8_0 block.
+// f32 → q8_0 quantize set_rows. Block = half d + char qs[32].
 #define QK8_0 32
 
 kernel void kernel_set_rows_q8_0_i64(
@@ -283,23 +280,13 @@ kernel void kernel_set_rows_q8_0_i32(
         vstore_half(d, 0, (global half *)y);
 
         for (int j = 0; j < QK8_0; j++) {
-            // OpenCL round() matches C roundf() semantics (round half away from zero)
             y[2 + j] = (char)((int)round(x[j] * id));
         }
     }
 }
 
-// SoA variants for q8_0 dst. Used when the backend has split the block_q8_0
-// records into separate quant (dst_q) and scale (dst_d) sub-buffers — e.g.,
-// after ggml_backend_opencl_buffer_set_tensor ran its q8_0 AoS->SoA path.
-//
-// Layout assumed by these kernels (matches kernel_convert_block_q8_0):
-//   dst_q: contiguous array of QK8_0 int8 quants per block, block i at
-//          offset i * QK8_0 bytes.
-//   dst_d: contiguous array of fp16 scales, block i at offset i * 2 bytes.
-// Block index i follows the dst tensor's element order: for a target row
-// (i1, i02, i03) out of (ne1_dst, ne2_dst, ne3_dst), the row's first block
-// index is (i03 * ne2_dst * ne1_dst + i02 * ne1_dst + i1) * nblk0.
+// SoA q8_0 variants. dst_q: int8[QK8_0] per block; dst_d: fp16 scale per block.
+// Layout matches kernel_convert_block_q8_0; block index follows dst element order.
 kernel void kernel_set_rows_q8_0_soa_i64(
         global char * src0,
         ulong         offset0,
@@ -342,7 +329,6 @@ kernel void kernel_set_rows_q8_0_soa_i64(
     int i10 = i01;
     long i1 = ((global long *)(src1 + i10*nb10 + i11*nb11 + i12*nb12))[0];
 
-    // First block index of target row in the linear SoA layout.
     long row_blk_base = ((long)i03 * ne2_dst * ne1_dst + (long)i02 * ne1_dst + i1) * nblk0;
 
     global half  * d_row = (global half  *)(dst_d) + row_blk_base;
@@ -486,9 +472,8 @@ kernel void kernel_set_rows_f16_i32(
     }
 }
 
-// q4_0 quantization: src0 is f32, dst is q4_0 blocks.
-// Each block: half d (scale) + uchar qs[16] (16 packed nibbles, shuffled layout).
-// Shuffled layout: qs[j] low nibble = element j; qs[j] high nibble = element j+16.
+// f32 → q4_0 quantize set_rows. Block = half d + uchar qs[16] (shuffled
+// nibbles: qs[j] low/high = elem j / j+16).
 // Dequant: val[i] = d * (nibble_i - 8)
 // nblk0 = number of q4_0 blocks per row = ne00 / 32.
 #define QK4_0 32

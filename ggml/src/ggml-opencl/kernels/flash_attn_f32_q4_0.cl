@@ -1,14 +1,9 @@
-// Enable extensions at the very top of the file. OpenCL pragmas must appear
-// before any non-directive tokens; some drivers don't register overloads if
-// the enable pragma is interleaved with other directives or comments.
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
 #ifdef cl_khr_integer_dot_product
 #pragma OPENCL EXTENSION cl_khr_integer_dot_product : enable
 #define FA_HAVE_INT_DOT 1
 #endif
 
-// sub_group_shuffle_xor: needed by the N_SPLIT>1 path to reduce per-thread
-// QK partial dots across the N_SPLIT threads that share a query row.
 #ifdef cl_khr_subgroup_shuffle
 #pragma OPENCL EXTENSION cl_khr_subgroup_shuffle : enable
 #define HAS_SUBGROUP_SHUFFLE 1
@@ -17,34 +12,10 @@
 #define HAS_SUBGROUP_SHUFFLE 1
 #endif
 
-// Flash attention kernel for Q=f32, K=q4_0, V=q4_0.
-//
-// q4_0 block layout (18 bytes): half d (scale) + uchar qs[16] (16 packed
-// nibbles in the "shuffled" layout). Element ordering within a block:
-//   - qs[j] low nibble = element j        (j ∈ 0..15)
-//   - qs[j] high nibble = element j+16    (j ∈ 0..15)
-// Dequantization: val[i] = d * (nibble_i - 8)
-//
-// KV footprint is half of q8_0's (quarter of f16's). The decode-path QK dot
-// can exploit this via a dp4a trick: instead of subtracting 8 per nibble
-// inside the inner loop (32 subs per block), we pack the raw nibbles
-// (values 0..15, positive in int8 representation) into uints and compute
-//
-//   sum(q_i * (nibble_i - 8)) = sum(q_i * nibble_i) - 8 * sum(q_i)
-//
-// so one dp4a acts on the unadjusted nibbles and the -8*q_sum correction
-// is applied once per block at the end. q_sum is precomputed when Q is
-// quantised to int8 (see quant_q_block_int8_packed_q4).
-//
-// Nibble → 8 uints packing (matches the Q 4-element grouping exactly):
-//   k_packed[0] = low_nibbles(qs[0..3])   (K positions 0..3)
-//   k_packed[1] = low_nibbles(qs[4..7])   (K positions 4..7)
-//   k_packed[2] = low_nibbles(qs[8..11])  (K positions 8..11)
-//   k_packed[3] = low_nibbles(qs[12..15]) (K positions 12..15)
-//   k_packed[4] = high_nibbles(qs[0..3])  (K positions 16..19)
-//   k_packed[5] = high_nibbles(qs[4..7])  (K positions 20..23)
-//   k_packed[6] = high_nibbles(qs[8..11]) (K positions 24..27)
-//   k_packed[7] = high_nibbles(qs[12..15])(K positions 28..31)
+// Flash attention: Q=f32, K=q4_0, V=q4_0.
+// Block = half d + uchar qs[16]; qs[j] low/high nibble → elem j / j+16.
+// Dequant: val[i] = d * (nibble_i - 8). dp4a path runs on raw 0..15 nibbles
+// and applies the -8*sum(q) correction once per block (needs Q q_sum).
 
 #define ACC_TYPE float
 #define ACC_TYPE4 float4
@@ -58,23 +29,18 @@
 #define DV_VEC (DV/4)
 #define Q1_WG_SIZE 64
 
-// q4_0 block layout: 2 bytes scale (half) + 16 bytes packed nibbles = 18 bytes
 #define QK4_0 32
 #define Q4_0_BLOCK_SIZE 18
 
-// Number of q4_0 blocks per row of K or V
 #define DK_Q4_BLOCKS (DK / QK4_0)
 #define DV_Q4_BLOCKS (DV / QK4_0)
 
-// Inline dequantize: load a q4_0 block and compute dot product with a slice of q_priv.
-// q_slice points to 8 float4 elements (32 floats) from the query.
-// Returns the dot product of the dequantized block with the query slice.
 inline float dot_q4_0_f32(const global char * block_ptr, ACC_TYPE4 * q_slice) {
     float d = vload_half(0, (const global half *)block_ptr);
     const global uchar * qs = (const global uchar *)(block_ptr + 2);
 
     float sum = 0.0f;
-    // Low nibbles → elements 0..15 (covers q_slice[0..3])
+    // Low nibbles → elems 0..15.
     #pragma unroll
     for (int g = 0; g < 4; ++g) {
         float4 nv = (float4)((float)(int)(qs[g*4 + 0] & 0x0F) - 8.0f,
@@ -83,7 +49,7 @@ inline float dot_q4_0_f32(const global char * block_ptr, ACC_TYPE4 * q_slice) {
                              (float)(int)(qs[g*4 + 3] & 0x0F) - 8.0f);
         sum += dot(q_slice[g], nv);
     }
-    // High nibbles → elements 16..31 (covers q_slice[4..7])
+    // High nibbles → elems 16..31.
     #pragma unroll
     for (int g = 0; g < 4; ++g) {
         float4 nv = (float4)((float)(int)(qs[g*4 + 0] >> 4) - 8.0f,
@@ -96,7 +62,6 @@ inline float dot_q4_0_f32(const global char * block_ptr, ACC_TYPE4 * q_slice) {
 }
 
 #ifdef FA_HAVE_INT_DOT
-// Pack four signed 8-bit chars into a uint32 (little-endian byte order).
 inline uint pack_i8x4(char a, char b, char c, char d) {
     return ((uint)(uchar)a)       |
            ((uint)(uchar)b) <<  8  |
@@ -104,9 +69,7 @@ inline uint pack_i8x4(char a, char b, char c, char d) {
            ((uint)(uchar)d) << 24;
 }
 
-// Quantise a single 32-float Q block to int8, store as 8 packed uint32s, and
-// return both the per-block scale Qd and the integer sum of the quantised
-// values (needed for the q4_0 nibble bias correction: -8 * sum_of_q).
+// Returns (qd, q_sum); q_sum feeds the -8*sum(q) bias correction.
 typedef struct {
     float qd;
     int   q_sum;
@@ -138,10 +101,7 @@ inline q4_q_block_info quant_q_block_int8_packed_q4(const ACC_TYPE4 * q_block,
     return info;
 }
 
-// Pack K's q4_0 block (16 bytes of nibbles) into 8 uint32s of 4 int8s each.
-// Low nibbles go to k_packed[0..3] (Q positions 0..15), high nibbles go to
-// k_packed[4..7] (Q positions 16..31). Values remain in 0..15 (positive in
-// int8 representation); the -8 bias is applied once per block via q_sum.
+// k_packed[0..3] = low nibbles (Q elems 0..15), k_packed[4..7] = high (16..31).
 inline void pack_q4_0_nibbles(const global uchar * qs, uint * k_packed) {
     #pragma unroll
     for (int g = 0; g < 4; ++g) {
@@ -162,9 +122,6 @@ inline void pack_q4_0_nibbles(const global uchar * qs, uint * k_packed) {
     }
 }
 
-// dp4a-accelerated QK dot product for a single q4_0 block.
-// Layout caveat: sum here accumulates q_i * nibble_i where nibble_i ∈ 0..15;
-// the real K value is (nibble_i - 8) * d, so we subtract 8 * q_sum at the end.
 inline float dot_q4_0_int(const global char * k_block_ptr,
                           const uint *        q_packed,
                           float               q_d,
@@ -180,14 +137,11 @@ inline float dot_q4_0_int(const global char * k_block_ptr,
     for (int i = 0; i < 8; ++i) {
         sum = dot_acc_sat_4x8packed_ss_int(q_packed[i], k_packed[i], sum);
     }
-    // sum currently holds sum(q_i * nibble_i); real value is
-    //   sum(q_i * (nibble_i - 8)) = sum - 8 * q_sum
+    // Correct raw-nibble sum: (nibble - 8) bias → subtract 8 * q_sum.
     return (float)(sum - 8 * q_sum) * q_d * kd;
 }
 #endif // FA_HAVE_INT_DOT
 
-// Dequantize a q4_0 block into 8 float4 values (32 floats).
-// Element i at position i: positions 0..15 from low nibbles, 16..31 from high.
 inline void dequant_q4_0_f32(const global char * block_ptr, ACC_TYPE4 * out) {
     float d = vload_half(0, (const global half *)block_ptr);
     const global uchar * qs = (const global uchar *)(block_ptr + 2);
@@ -208,9 +162,7 @@ inline void dequant_q4_0_f32(const global char * block_ptr, ACC_TYPE4 * out) {
     }
 }
 
-// ALiBi slope computation. When max_bias <= 0 (no ALiBi) this returns 1.0f so
-// the mask term is applied directly (score += 1.0 * mask[k_idx]); the baseline
-// f16 FA kernel does the same. Returning 0 here would silently drop the mask.
+// max_bias<=0 returns 1.0 so score += 1.0 * mask[k] stays a no-op multiplier.
 inline float get_alibi_slope(float max_bias, int head_idx, int n_head_log2, float m0, float m1) {
     if (max_bias <= 0.0f) return 1.0f;
     float base = (head_idx < n_head_log2) ? m0 : m1;
@@ -218,10 +170,7 @@ inline float get_alibi_slope(float max_bias, int head_idx, int n_head_log2, floa
     return pow(base, (float)exph);
 }
 
-// ============================================================================
-// q1 decode kernel: Q=f32, K=q4_0, V=q4_0
-// One query row, each thread processes a different KV position.
-// ============================================================================
+// q1 decode: one query row per WG, threads sweep KV positions.
 __kernel void flash_attn_f32_q4_0_q1(
     const global void * q_void, ulong q_offset,
     const global void * k_void, ulong k_offset,
@@ -273,7 +222,6 @@ __kernel void flash_attn_f32_q4_0_q1(
         mask_base = (const global char*)mask_void + mask_offset + mask_batch_idx * mask_nb3 + mask_head_idx * mask_nb2;
     }
 
-    // Load query row into private registers (f32)
     ACC_TYPE4 q_priv[DK_VEC];
     const ulong q_row_offset = batch_idx * q_nb3 + head_idx * q_nb2;
     const global Q_DATA_TYPE4* q_ptr = (const global Q_DATA_TYPE4*)(q_base + q_row_offset);
@@ -283,10 +231,7 @@ __kernel void flash_attn_f32_q4_0_q1(
     }
 
 #ifdef FA_HAVE_INT_DOT
-    // Quantize Q once per q4_0-sized block (32 floats = 8 float4s). For each
-    // block we store 8 packed uint32 quants, the per-block scale qd, and the
-    // integer sum of the 32 int8 quants (used to remove the -8 bias in the
-    // inner loop).
+    // Quantise Q once per thread: 8 uints + qd + q_sum per block.
     uint  q_packed[DK_Q4_BLOCKS * 8];
     float q_d_scale[DK_Q4_BLOCKS];
     int   q_sum_arr[DK_Q4_BLOCKS];
@@ -305,7 +250,7 @@ __kernel void flash_attn_f32_q4_0_q1(
         sinks_ptr = (const global ACC_TYPE*)((const global char*)sinks_void + sinks_offset);
     }
 
-    // === Pass 1: find max score ===
+    // Pass 1: max score.
     ACC_TYPE m_i = (sinks_ptr != NULL) ? sinks_ptr[head_idx] : -INFINITY;
     for (int k_idx = tid; k_idx < n_kv; k_idx += Q1_WG_SIZE) {
         const global char* k_row = k_base + batch_idx * k_nb3 + head_kv_idx * k_nb2 + k_idx * k_nb1;
@@ -332,7 +277,6 @@ __kernel void flash_attn_f32_q4_0_q1(
         m_i = max(m_i, score);
     }
 
-    // Reduce max across workgroup
     __local ACC_TYPE local_m[Q1_WG_SIZE];
     local_m[tid] = m_i;
     barrier(CLK_LOCAL_MEM_FENCE);
@@ -343,7 +287,7 @@ __kernel void flash_attn_f32_q4_0_q1(
     }
     const ACC_TYPE m_final = local_m[0];
 
-    // === Pass 2: compute softmax-weighted V accumulation ===
+    // Pass 2: softmax-weighted V accumulation.
     ACC_TYPE4 o_acc[DV_VEC];
     #pragma unroll
     for (int i = 0; i < DV_VEC; ++i) o_acc[i] = (ACC_TYPE4)(0.0f);
@@ -376,7 +320,6 @@ __kernel void flash_attn_f32_q4_0_q1(
         const ACC_TYPE p = exp(score - m_final);
         l_i += p;
 
-        // Accumulate p * V (dequantize V inline)
         #pragma unroll
         for (int b = 0; b < DV_Q4_BLOCKS; b++) {
             ACC_TYPE4 v_dequant[8];
@@ -388,7 +331,6 @@ __kernel void flash_attn_f32_q4_0_q1(
         }
     }
 
-    // === Reduce and write output ===
     __local ACC_TYPE local_l[Q1_WG_SIZE];
     __local ACC_TYPE4 local_o_comp[Q1_WG_SIZE];
     local_l[tid] = l_i;
@@ -427,12 +369,8 @@ __kernel void flash_attn_f32_q4_0_q1(
     }
 }
 
-// ============================================================================
-// Flash-Decoding (K-split) — Pass 1 for q4_0 KV.
-// See flash_attn_f32_q8_0.cl / flash_attn_f32_f16.cl for the layout contract
-// (now [batch][head][query][split][m,l,O]) and the matching merge kernel
-// (type-agnostic, reused as-is). gid(2) encodes q_idx*n_splits + split_idx.
-// ============================================================================
+// Flash-decoding split pass for q4_0 KV. Merge kernel is type-agnostic and
+// shared with the f16/q8_0 FA kernels.
 #define FA_PARTIAL_FLOATS (2 + DV)
 
 __kernel void flash_attn_f32_q4_0_q1_split(
@@ -629,32 +567,17 @@ __kernel void flash_attn_f32_q4_0_q1_split(
     }
 }
 
-// ============================================================================
-// Prefill kernel: Q=f32, K=q4_0, V=q4_0, n_q > 1.
-// BLOCK_M × BLOCK_N tiling.
-//
-// K path: stored in local memory as packed int8 (8 uints per q4_0 block) +
-// per-block scale + per-block nibble sum (= sum over k nibbles in 0..15 — used
-// below to subtract 16 * 4 = 64 total? No: we track only the Q sum and apply
-// -8 * q_sum). QK dot uses dot_acc_sat_4x8packed_ss_int.
-//
-// V path: dequantised to half in local memory (same rationale as q8_0 kernel:
-// half4 → float4 convert is a fast hardware path; keeping V as nibbles + inline
-// unpack saves local memory but costs more cycles on Adreno X1-85).
-//
-// Supports the same (DK, DV) set as the q8_0 kernel; DK % QK4_0 == 0 and
-// DV % QK4_0 == 0 (identical block size of 32 — same pairs work).
-// ============================================================================
+// Prefill: q4_0 K/V, n_q > 1. BLOCK_M × BLOCK_N tiling.
+// K in local as packed nibbles + per-block scale; V dequant → half in local.
+// Requires DK % QK4_0 == 0 and DV % QK4_0 == 0.
 #define KV_DATA_TYPE4 half4
 #define CONVERT_KV_ACC4(x) ((float4)((float)(x).s0, (float)(x).s1, (float)(x).s2, (float)(x).s3))
 
 #define DK_Q4_BLOCKS_PREFILL (DK / QK4_0)
 #define DV_Q4_BLOCKS_PREFILL (DV / QK4_0)
 
-// N_SPLIT: same mechanism as the q8_0 kernel. When >1, each thread owns
-// 1/N_SPLIT of DK and DV; partial QK dots are reduced via sub_group_shuffle_xor.
-// All threads evolve (m_i, l_i) identically so no extra barriers.
-// Requires DK_Q4_BLOCKS_PREFILL % N_SPLIT == 0.
+// N_SPLIT>1 splits DK/DV across N_SPLIT threads per query row; needs
+// sub_group_shuffle_xor and DK_Q4_BLOCKS_PREFILL % N_SPLIT == 0.
 #ifndef N_SPLIT
 #define N_SPLIT 1
 #endif
@@ -700,10 +623,8 @@ __kernel void flash_attn_f32_q4_0(
     const int mask_ne3,
     const global void* sinks_void,
     const ulong sinks_offset,
-    // blk (optional): per-(qblock, kvblock) classification from flash_attn_blk_f16.
-    //   0 = fully masked → skip tile, 1 = mixed → apply per-row mask,
-    //   2 = fully unmasked → skip mask application.
-    // Pass NULL to disable the prepass optimisation.
+    // blk: per-(qblock,kvblock) class from flash_attn_blk_f16
+    // (0=masked, 1=mixed, 2=unmasked). NULL disables the prepass opt.
     const global void * blk_void
 ) {
     const int tid = get_local_id(0);
@@ -739,9 +660,7 @@ __kernel void flash_attn_f32_q4_0(
                     mask_batch_idx * mask_nb3 + mask_head_idx * mask_nb2;
     }
 
-    // blk_base: classification buffer pointer for this (batch, head, q_block).
-    // BLK_PREPASS_BM may differ from this kernel's BLOCK_M (see q8_0 kernel for
-    // rationale). Default to BLOCK_M when unset.
+    // BLK_PREPASS_BM may differ from this kernel's BLOCK_M; scale q-block idx.
     #ifndef BLK_PREPASS_BM
     #define BLK_PREPASS_BM BLOCK_M
     #endif
@@ -755,7 +674,6 @@ __kernel void flash_attn_f32_q4_0(
                    (((mask_batch_idx * mask_ne2) + mask_head_idx) * n_q_blocks_prepass + prepass_q_block) * n_kv_blocks;
     }
 
-    // --- Load Q row slice into private registers -----------------------------
     const int dk_off_vec = split_idx * SPLIT_DK_VEC;
     ACC_TYPE4 q_priv[SPLIT_DK_VEC];
     if (query_valid) {
@@ -771,8 +689,6 @@ __kernel void flash_attn_f32_q4_0(
     }
 
 #ifdef FA_HAVE_INT_DOT
-    // Quantise owned Q slice into packed int8. Each thread processes
-    // SPLIT_DK_Q4_BLOCKS q4_0-sized blocks (its share of DK).
     uint  q_packed_pf[SPLIT_DK_Q4_BLOCKS * 8];
     float q_d_pf[SPLIT_DK_Q4_BLOCKS];
     int   q_sum_pf[SPLIT_DK_Q4_BLOCKS];
@@ -784,7 +700,6 @@ __kernel void flash_attn_f32_q4_0(
     }
 #endif
 
-    // --- Output accumulator, softmax state -----------------------------------
     const int dv_off_vec = split_idx * SPLIT_DV_VEC;
     ACC_TYPE4 o_acc[SPLIT_DV_VEC];
     #pragma unroll
@@ -796,7 +711,6 @@ __kernel void flash_attn_f32_q4_0(
     float slope = get_alibi_slope(max_bias, head_idx, n_head_log2, m0, m1);
 
 #ifdef FA_HAVE_INT_DOT
-    // K tile: packed int8 (8 uints per block, nibbles in 0..15) + per-block scale.
     __local uint  l_k_packed[BLOCK_N][DK_Q4_BLOCKS_PREFILL * 8];
     __local float l_k_scale [BLOCK_N][DK_Q4_BLOCKS_PREFILL];
 #else
@@ -805,20 +719,16 @@ __kernel void flash_attn_f32_q4_0(
 
     __local half4 l_v[BLOCK_N][DV_VEC];
 
-    // --- KV iteration --------------------------------------------------------
     for (int k_start = 0; k_start < n_kv; k_start += BLOCK_N) {
-        // Skip fully-masked KV blocks before loading K/V tiles. Uniform branch.
+        // Skip fully-masked KV tiles (uniform branch across WG).
         char blk_cur = 1;
         if (blk_base != NULL) {
             blk_cur = blk_base[k_start / BLOCK_N];
             if (blk_cur == 0) continue;
         }
 
-        // K tile load.
         {
 #ifdef FA_HAVE_INT_DOT
-            // One thread per q4_0 block reads the 16-byte qs, unpacks to
-            // 8 uints of raw nibbles (values 0..15), and stores scale.
             const int k_blocks_per_row = DK_Q4_BLOCKS_PREFILL;
             const int n_blocks_total = BLOCK_N * k_blocks_per_row;
             for (int i = tid; i < n_blocks_total; i += WG_SIZE) {
@@ -910,7 +820,8 @@ __kernel void flash_attn_f32_q4_0(
         }
         barrier(CLK_LOCAL_MEM_FENCE);
 
-        // --- QK dot + online softmax (j += 4 unroll, mirrors f32_f16) ---
+        // QK dot + online softmax. N_SPLIT>1 reduces per-thread partials via
+        // sub_group_shuffle_xor; mask/softmax stay identical across split_idx.
 #if N_SPLIT > 1
         {
 #else
@@ -925,9 +836,6 @@ __kernel void flash_attn_f32_q4_0(
 
                 ACC_TYPE s0, s1, s2, s3;
 #ifdef FA_HAVE_INT_DOT
-                // dp4a QK dot on nibbles-as-int8 (values 0..15). Correction
-                // -8*q_sum is applied once per block via the (sumX - 8*q_sum)
-                // step below.
                 s0 = 0.0f; s1 = 0.0f; s2 = 0.0f; s3 = 0.0f;
                 #pragma unroll
                 for (int b_local = 0; b_local < SPLIT_DK_Q4_BLOCKS; ++b_local) {
@@ -969,10 +877,8 @@ __kernel void flash_attn_f32_q4_0(
 #endif
 
 #if N_SPLIT > 1
-                // Reduce partials across the N_SPLIT threads that share this
-                // query row. Power-of-2 N_SPLIT uses shuffle_xor butterfly;
-                // N_SPLIT=3 (DK=96 case, where DK_Q4_BLOCKS=3) uses explicit
-                // 3-way shuffle since butterfly doesn't cover a 3-lane group.
+                // Power-of-2 N_SPLIT: shuffle_xor butterfly. N_SPLIT=3 (DK=96):
+                // explicit 3-lane shuffle.
                 #if (N_SPLIT & (N_SPLIT - 1)) == 0
                     #pragma unroll
                     for (int step = 1; step < N_SPLIT; step <<= 1) {
@@ -1042,7 +948,7 @@ __kernel void flash_attn_f32_q4_0(
         barrier(CLK_LOCAL_MEM_FENCE);
     }
 
-    // --- Write output --------------------------------------------------------
+    // Write output.
     if (query_valid) {
         if (sinks_void != NULL) {
             const global ACC_TYPE * sinks_ptr =
@@ -1068,9 +974,8 @@ __kernel void flash_attn_f32_q4_0(
     }
 }
 
-// Flash-Decoding Pass 2: merge partials from all splits into the final output.
-// Type-agnostic — operates only on float partials. Identical to the merge kernel
-// in flash_attn_f32_f16.cl; duplicated here so q4_0 FD is self-contained.
+// FD Pass 2: merge split partials. Identical across q4_0/q8_0/f16; each FA
+// source owns a copy since kernels compile per-source-program.
 __kernel void flash_attn_f32_merge(
     const global float * partial_void,
     global void * o_void,

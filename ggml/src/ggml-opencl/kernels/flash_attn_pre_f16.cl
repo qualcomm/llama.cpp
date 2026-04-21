@@ -88,14 +88,8 @@ __kernel void flash_attn_mask_pad_f16(
     mask_pad[dst_idx] = src_col_idx < n_kv ? mask_src[src_col_idx] : (half) (-INFINITY);
 }
 
-// Block mask classification for flash attention:
-// 0 -> fully masked block (all entries are -inf, skip entirely)
-// 1 -> mixed block (has both -inf and non-inf entries, must apply mask)
-// 2 -> all-zero block (all entries are 0.0h with NO -inf, safe to skip mask)
-//
-// IMPORTANT: a causal mask block at the diagonal has {0.0h, -inf} entries.
-// Such a block MUST be classified as 1 (mixed), not 2, because the -inf
-// entries must be applied to prevent future token leakage.
+// Per-KV-tile mask class. 0=all -inf (skip tile), 1=mixed (apply mask),
+// 2=all zero, no -inf (skip mask lookup). Causal diagonal tiles are class 1.
 __kernel void flash_attn_blk_f16(
     const global void * mask_void, ulong mask_offset,
     global char * blk,
@@ -146,13 +140,9 @@ __kernel void flash_attn_blk_f16(
                 }
             }
         }
-        // Early exit: if we found both masked and unmasked, it's type 1
-        if (has_masked && has_unmasked) break;
+        if (has_masked && has_unmasked) break;  // mixed tile — short-circuit.
     }
 
-    // 0: fully masked (no unmasked entries)
-    // 1: mixed (has -inf entries that need mask application) or has non-zero bias values
-    // 2: all-zero and no -inf entries (safe to skip mask entirely)
     char res;
     if (has_unmasked == 0) {
         res = 0;
