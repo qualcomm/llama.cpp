@@ -2858,7 +2858,7 @@ struct ggml_opencl_fa_dim {
 
 // Split variant fires when n_kv >= threshold (threshold=0 → always split).
 static const ggml_opencl_fa_dim g_opencl_fa_dims[] = {
-    { 40,  40, 64, 32, 1, 0}, { 64,  64, 64, 64, 1, 0},
+    { 40,  40, 64, 32, 1, 0}, { 64,  64, 64, 32, 2, 64},
     { 80,  80, 64, 32, 2, 64}, { 96,  96, 64, 32, 2, 64},
     {112, 112, 64, 32, 2, 64}, {128, 128, 64, 32, 2, 64},
     {192, 128, 16, 16, 1, 0},
