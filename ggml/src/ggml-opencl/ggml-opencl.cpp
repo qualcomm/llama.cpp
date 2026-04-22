@@ -1030,7 +1030,8 @@ inline std::string read_file(const std::string &path) {
 
 // fatal=false returns NULL on compile failure instead of aborting; used for
 // optional FA variants that may exhaust the Adreno compiler at large DK.
-static cl_program build_program_from_source_ex(cl_context ctx, cl_device_id dev, const char* program_buffer, const std::string &compile_opts, bool fatal, const char *tag = nullptr) {
+// bin_size>0 loads a precompiled program binary instead of compiling source.
+static cl_program build_program_from_source_ex(cl_context ctx, cl_device_id dev, const char* program_buffer, const std::string &compile_opts, bool fatal, const char *tag = nullptr, size_t bin_size = 0) {
     if (tag) GGML_LOG_INFO("ggml_opencl: compiling %s\n", tag);
     cl_program p;
     char *program_log;
@@ -1038,13 +1039,22 @@ static cl_program build_program_from_source_ex(cl_context ctx, cl_device_id dev,
     size_t log_size;
     int err;
 
-    program_size = strlen(program_buffer);
+    if (bin_size == 0) {
+        program_size = strlen(program_buffer);
 
-    p = clCreateProgramWithSource(ctx, 1, (const char**)&program_buffer, &program_size, &err);
-    if(err < 0) {
-        GGML_LOG_ERROR("OpenCL error creating program");
-        if (fatal) exit(1);
-        return NULL;
+        p = clCreateProgramWithSource(ctx, 1, (const char**)&program_buffer, &program_size, &err);
+        if(err < 0) {
+            GGML_LOG_ERROR("OpenCL error creating program");
+            if (fatal) exit(1);
+            return NULL;
+        }
+    } else {
+        p = clCreateProgramWithBinary(ctx, 1, &dev, &bin_size, (const unsigned char**)&program_buffer, NULL, &err);
+        if(err < 0) {
+            GGML_LOG_ERROR("OpenCL error creating program from binary");
+            if (fatal) exit(1);
+            return NULL;
+        }
     }
 
     err = clBuildProgram(p, 0, NULL, compile_opts.c_str(), NULL, NULL);
@@ -1063,8 +1073,8 @@ static cl_program build_program_from_source_ex(cl_context ctx, cl_device_id dev,
     return p;
 }
 
-static cl_program build_program_from_source(cl_context ctx, cl_device_id dev, const char* program_buffer, const std::string &compile_opts) {
-    return build_program_from_source_ex(ctx, dev, program_buffer, compile_opts, /*fatal=*/true);
+static cl_program build_program_from_source(cl_context ctx, cl_device_id dev, const char* program_buffer, const std::string &compile_opts, size_t bin_size = 0) {
+    return build_program_from_source_ex(ctx, dev, program_buffer, compile_opts, /*fatal=*/true, /*tag=*/nullptr, bin_size);
 }
 
 static void load_cl_kernels_argsort(ggml_backend_opencl_context *backend_ctx) {
