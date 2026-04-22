@@ -1245,18 +1245,17 @@ inline std::string read_file(const std::string &path) {
 
 // fatal=false returns NULL on compile failure instead of aborting; used for
 // optional FA variants that may exhaust the Adreno compiler at large DK.
-// when the compiler returns CL_OUT_OF_HOST_MEMORY/CL_OUT_OF_RESOURCES (seen with DK>=256/512)
-// for FA programs, do clFinish the queue to free up resources, then rebuild (up to 3x)
-// if retry_queue is provided
-static cl_program build_program_from_source_ex(cl_context ctx, cl_device_id dev, const char* program_buffer, const std::string &compile_opts, bool fatal, const char *tag = nullptr, cl_command_queue retry_queue = nullptr) {
-    if (tag) { GGML_LOG_INFO("ggml_opencl: compiling %s\n", tag); }
+// bin_size>0 loads a precompiled program binary instead of compiling source.
+static cl_program build_program_from_source_ex(cl_context ctx, cl_device_id dev, const char* program_buffer, const std::string &compile_opts, bool fatal, const char *tag = nullptr, size_t bin_size = 0) {
+    if (tag) GGML_LOG_INFO("ggml_opencl: compiling %s\n", tag);
     cl_program p;
     char *program_log;
     size_t program_size;
     size_t log_size;
     int err;
 
-    program_size = strlen(program_buffer);
+    if (bin_size == 0) {
+        program_size = strlen(program_buffer);
 
     const int max_attempts = retry_queue ? 3 : 1;
     for (int attempt = 0; attempt < max_attempts; ++attempt) {
@@ -1266,20 +1265,14 @@ static cl_program build_program_from_source_ex(cl_context ctx, cl_device_id dev,
             if (fatal) exit(1);
             return NULL;
         }
-
-        err = clBuildProgram(p, 0, NULL, compile_opts.c_str(), NULL, NULL);
-        if (err == CL_SUCCESS) {
-            return p;
+    } else {
+        p = clCreateProgramWithBinary(ctx, 1, &dev, &bin_size, (const unsigned char**)&program_buffer, NULL, &err);
+        if(err < 0) {
+            GGML_LOG_ERROR("OpenCL error creating program from binary");
+            if (fatal) exit(1);
+            return NULL;
         }
-
-        const bool transient = (err == CL_OUT_OF_HOST_MEMORY || err == CL_OUT_OF_RESOURCES);
-        if (retry_queue && transient && attempt + 1 < max_attempts) {
-            clReleaseProgram(p);
-            GGML_LOG_WARN("ggml_opencl: transient compile failure (err=%d)%s%s — clFinish + retry (%d/%d)\n",
-                err, tag ? " building " : "", tag ? tag : "", attempt + 2, max_attempts);
-            clFinish(retry_queue);  // drain in-flight ops holding driver host-heap
-            continue;
-        }
+    }
 
         clGetProgramBuildInfo(p, dev, CL_PROGRAM_BUILD_LOG, 0, NULL, &log_size);
         program_log = (char*) malloc(log_size + 1);
@@ -1296,8 +1289,8 @@ static cl_program build_program_from_source_ex(cl_context ctx, cl_device_id dev,
     return NULL;
 }
 
-static cl_program build_program_from_source(cl_context ctx, cl_device_id dev, const char* program_buffer, const std::string &compile_opts) {
-    return build_program_from_source_ex(ctx, dev, program_buffer, compile_opts, /*fatal=*/true);
+static cl_program build_program_from_source(cl_context ctx, cl_device_id dev, const char* program_buffer, const std::string &compile_opts, size_t bin_size = 0) {
+    return build_program_from_source_ex(ctx, dev, program_buffer, compile_opts, /*fatal=*/true, /*tag=*/nullptr, bin_size);
 }
 
 static cl_program build_program_from_binary(cl_context ctx, cl_device_id dev, const char* program_buffer, const std::string &compile_opts, size_t bin_size = 0) {
