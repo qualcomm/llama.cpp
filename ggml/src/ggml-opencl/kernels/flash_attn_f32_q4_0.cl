@@ -820,8 +820,7 @@ __kernel void flash_attn_f32_q4_0(
         }
         barrier(CLK_LOCAL_MEM_FENCE);
 
-        // QK dot + online softmax. N_SPLIT>1 reduces per-thread partials via
-        // sub_group_shuffle_xor; mask/softmax stay identical across split_idx.
+        // QK dot + online softmax. N_SPLIT>1 reduces per-thread partials via shuffle_xor.
 #if N_SPLIT > 1
         {
 #else
