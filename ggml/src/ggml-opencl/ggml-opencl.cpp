@@ -10418,10 +10418,8 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     cl_ulong mask_pad_nb3 = 0;
 
     // Early FD eligibility probe; gates the non-FD prefill prep only.
-    // Real FD dispatch below applies its own guards — keep predicates in sync.
+    // Must stay in sync with the real FD dispatch below.
     const int  fd_is_causal_probe = (mask == NULL && n_q > 1 && n_q == n_kv);
-    // Multi-query FD: DK-gated. FD also bypassed for DK>128 (single-pass is
-    // already compute-bound).
     const int  fd_max_n_q_probe = (d_head_q <= 64) ? 8 : 1;
     const bool fd_will_fire =
         (n_q >= 1 && n_q <= fd_max_n_q_probe && n_kv >= 2048 && !fd_is_causal_probe &&
@@ -10536,16 +10534,14 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     const float m0 = powf(2.0f, -(max_bias) / n_head_log2_f);
     const float m1 = powf(2.0f, -(max_bias / 2.0f) / n_head_log2_f);
 
-    // Flash-Decoding (K-split). Single-query always eligible at DK∈{64..256}
-    // when n_kv ≥ FD_MIN_N_KV; multi-query gated on DK ≤ FD_MAX_DK_MULTI.
-    // Supports f16/q8_0/q4_0 KV (merge kernel is type-agnostic). !is_causal.
+    // Flash-Decoding K-split: !is_causal, n_kv >= FD_MIN_N_KV, DK <= FD_MAX_DK.
+    // Multi-query capped at FD_MAX_DK_MULTI.
     const int FD_MIN_N_KV      = 2048;
     const int FD_KV_PER_SP     = 2048;
     const int FD_MAX_N_Q_MULTI = 8;
     const int FD_MAX_DK_MULTI  = 64;
     const int FD_MAX_DK        = 128;
     const int fd_max_n_q = (d_head_q <= FD_MAX_DK_MULTI) ? FD_MAX_N_Q_MULTI : 1;
-    // FD skipped for DK>128 (single-pass already compute-bound).
     cl_kernel fd_k_split = NULL;
     if (n_q >= 1 && n_q <= fd_max_n_q && n_kv >= FD_MIN_N_KV && !is_causal &&
         d_head_q <= FD_MAX_DK &&

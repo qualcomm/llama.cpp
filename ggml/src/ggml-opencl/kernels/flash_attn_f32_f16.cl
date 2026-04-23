@@ -29,8 +29,7 @@
 #define FA_UNROLL _Pragma("unroll")
 #endif
 
-// N_SPLIT>1 splits DK/DV across N_SPLIT threads per query row. Reduces
-// per-thread register pressure at large DK.
+// N_SPLIT>1 splits DK/DV across threads to cut per-thread register use.
 #ifndef N_SPLIT
 #define N_SPLIT 1
 #endif
@@ -166,8 +165,6 @@ __kernel void flash_attn_f32_f16(
     __local KV_DATA_TYPE4 l_v[BLOCK_N][DV_VEC];
 
 #if N_SPLIT > 1 && !defined(HAS_SUBGROUP_SHUFFLE)
-    // Fallback reduction arrays (shuffle path eliminates these).
-    // local_partial layout [BLOCK_N][WG_SIZE] chosen to minimise bank conflicts.
     __local ACC_TYPE local_partial[BLOCK_N][WG_SIZE];
     __local ACC_TYPE local_p[BLOCK_M][BLOCK_N];
     __local ACC_TYPE local_softmax_scale[BLOCK_M];
@@ -175,7 +172,6 @@ __kernel void flash_attn_f32_f16(
 #endif
 
     for (int k_start = 0; k_start < n_kv; k_start += BLOCK_N) {
-        // Skip fully-masked KV tiles (uniform branch across WG).
         char blk_cur = 1;
         if (blk_base != NULL) {
             blk_cur = blk_base[k_start / BLOCK_N];
@@ -216,8 +212,6 @@ __kernel void flash_attn_f32_f16(
         barrier(CLK_LOCAL_MEM_FENCE);
 
 #if N_SPLIT > 1 && defined(HAS_SUBGROUP_SHUFFLE)
-        // N_SPLIT>1 shuffle path: all split threads per q_lane share the same
-        // QK score post-shuffle, so (m_i, l_i) evolves identically on each.
         {
             const int dv_off = split_idx * SPLIT_DV_VEC;
             for (int j = 0; j < BLOCK_N; j += 2) {
@@ -235,7 +229,6 @@ __kernel void flash_attn_f32_f16(
                     partial1 += dot1.s0 + dot1.s1 + dot1.s2 + dot1.s3;
                 }
 
-                // shuffle_xor reduction across the N_SPLIT threads.
                 FA_UNROLL
                 for (int step = 1; step < N_SPLIT; step <<= 1) {
                     partial0 += sub_group_shuffle_xor(partial0, step);
@@ -714,9 +707,8 @@ __kernel void flash_attn_f32_f16_q1(
     }
 }
 
-// Flash-decoding split pass. Writes [m_c, l_c, O_c[DV]] per split; merge
-// kernel handles sinks/normalisation. Causal disabled by host (speculative
-// decoding supplies explicit mask). gid(2) = q_idx * n_splits + split_idx.
+// Flash-decoding split pass. gid(2) = q_idx * n_splits + split_idx.
+// Partial record per split: [m, l, O[DV]]. Merge kernel applies sink + norm.
 #define FA_PARTIAL_FLOATS (2 + DV)
 
 __kernel void flash_attn_f32_f16_q1_split(
@@ -890,10 +882,7 @@ __kernel void flash_attn_f32_f16_q1_split(
     }
 }
 
-// FD Pass 2: merge per-split partials into the final token.
-//   m = max(m_c, m_sink); l = Σ l_c · exp(m_c - m) + exp(m_sink - m)
-//   O[i] = Σ O_c[i] · exp(m_c - m) / l
-// Empty splits (m_c == -INF) drop out via exp(-INF) = 0.
+// FD Pass 2: merge per-split partials into final O. Empty splits drop via exp(-INF)=0.
 __kernel void flash_attn_f32_merge(
     const global float * partial_void,
     global void * o_void,

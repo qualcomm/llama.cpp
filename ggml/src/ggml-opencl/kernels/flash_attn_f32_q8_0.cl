@@ -605,8 +605,7 @@ __kernel void flash_attn_f32_q8_0(
                     mask_batch_idx * mask_nb3 + mask_head_idx * mask_nb2;
     }
 
-    // BLK_PREPASS_BM is the BLOCK_M the prepass kernel was compiled with; may
-    // differ from this kernel's BLOCK_M, so scale q-block idx accordingly.
+    // BLK_PREPASS_BM may differ from this kernel's BLOCK_M; scale q-block idx.
     #ifndef BLK_PREPASS_BM
     #define BLK_PREPASS_BM BLOCK_M
     #endif
@@ -796,8 +795,7 @@ __kernel void flash_attn_f32_q8_0(
 #endif
         barrier(CLK_LOCAL_MEM_FENCE);
 
-        // QK dot + online softmax. N_SPLIT>1 reduces per-thread partials via
-        // sub_group_shuffle_xor; mask/softmax stay identical across split_idx.
+        // QK dot + online softmax. N_SPLIT>1 reduces per-thread partials via shuffle_xor.
 #if N_SPLIT > 1
         {
 #else
@@ -853,10 +851,7 @@ __kernel void flash_attn_f32_q8_0(
 #endif
 
 #if N_SPLIT > 1
-                // Reduce partials across the N_SPLIT threads that share this
-                // query row. Power-of-2 N_SPLIT uses shuffle_xor butterfly;
-                // N_SPLIT=3 (DK=96 case, where DK_QK_BLOCKS=3) uses explicit
-                // 3-way shuffle since butterfly doesn't cover a 3-lane group.
+                // Power-of-2 N_SPLIT: shuffle_xor butterfly. N_SPLIT=3 (DK=96): 3-way shuffle.
                 #if (N_SPLIT & (N_SPLIT - 1)) == 0
                     #pragma unroll
                     for (int step = 1; step < N_SPLIT; step <<= 1) {
@@ -866,10 +861,6 @@ __kernel void flash_attn_f32_q8_0(
                         s3 += sub_group_shuffle_xor(s3, step);
                     }
                 #else
-                    // 3-way reduction: each triplet of adjacent lanes (base+0,1,2)
-                    // shares a query row. Each thread reads all three lanes'
-                    // partials and sums. Requires all 3 lanes to be in the same
-                    // subgroup → WG_SIZE must be a multiple of 3 and ≤ subgroup size.
                     const uint tri_base = (get_sub_group_local_id() / N_SPLIT) * N_SPLIT;
                     s0 = sub_group_shuffle(s0, tri_base + 0) + sub_group_shuffle(s0, tri_base + 1) + sub_group_shuffle(s0, tri_base + 2);
                     s1 = sub_group_shuffle(s1, tri_base + 0) + sub_group_shuffle(s1, tri_base + 1) + sub_group_shuffle(s1, tri_base + 2);
@@ -892,9 +883,6 @@ __kernel void flash_attn_f32_q8_0(
                 if (k_row2 >= n_kv) s2 = -INFINITY;
                 if (k_row3 >= n_kv) s3 = -INFINITY;
 
-                // Skip per-row mask when blk_cur==2 (fully unmasked tile —
-                // all mask entries are 0.0h with no -inf). Saves BLOCK_M ×
-                // BLOCK_N mask-lookup half reads per fully-unmasked tile.
                 if (query_valid && mask_base != NULL && blk_cur != 2) {
                     const global MASK_DATA_TYPE * mask_ptr =
                         (const global MASK_DATA_TYPE *) (mask_base + my_query_row * mask_nb1);
