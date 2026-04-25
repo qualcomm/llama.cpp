@@ -581,6 +581,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_dequant_q8_0_f16_view_aos;
     cl_kernel kernel_dequant_q8_0_f32_view_aos;
     cl_kernel kernel_dequant_q4_0_f16_view_aos;
+    cl_kernel kernel_dequant_q4_0_f32_view_aos;
     cl_kernel kernel_convert_block_q6_K_noshuffle, kernel_restore_block_q6_K_noshuffle;
     cl_kernel kernel_mul_mat_q4_0_f32_8x_flat;
     cl_kernel kernel_convert_block_q4_0_noshuffle;
@@ -1008,6 +1009,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
         CL_CHECK((backend_ctx->kernel_dequant_q8_0_f16_view_aos = clCreateKernel(backend_ctx->program_cvt, "kernel_dequant_q8_0_f16_view_aos", &err), err));
         CL_CHECK((backend_ctx->kernel_dequant_q8_0_f32_view_aos = clCreateKernel(backend_ctx->program_cvt, "kernel_dequant_q8_0_f32_view_aos", &err), err));
         CL_CHECK((backend_ctx->kernel_dequant_q4_0_f16_view_aos = clCreateKernel(backend_ctx->program_cvt, "kernel_dequant_q4_0_f16_view_aos", &err), err));
+        CL_CHECK((backend_ctx->kernel_dequant_q4_0_f32_view_aos = clCreateKernel(backend_ctx->program_cvt, "kernel_dequant_q4_0_f32_view_aos", &err), err));
         CL_CHECK((backend_ctx->kernel_convert_block_q4_K  = clCreateKernel(backend_ctx->program_cvt, "kernel_convert_block_q4_K", &err), err));
         CL_CHECK((backend_ctx->kernel_restore_block_q4_K  = clCreateKernel(backend_ctx->program_cvt, "kernel_restore_block_q4_K", &err), err));
         CL_CHECK((backend_ctx->kernel_convert_block_q4_K_noshuffle = clCreateKernel(backend_ctx->program_cvt, "kernel_convert_block_q4_K_noshuffle", &err), err));
@@ -10013,9 +10015,9 @@ static bool ggml_cl_flash_attn_dequant_q8_0_gpu(
         src_nb3    = tensor->nb[3];
     }
 
-    const size_t row_bytes = (size_t) (tensor->ne[0] / 32) * (2 + 32);
-    if (src_nb1 != (cl_ulong) row_bytes) {
-        // Not a tight row — needs a permuted-layout path.
+    // Kernel uses stride-based indexing for ne[1..3], but indexes blocks
+    // as blk_i0 * 34 within ne[0]; require ne[0] tight in memory.
+    if (tensor->nb[0] != (cl_ulong) (2 + 32)) {
         return false;
     }
 
@@ -10034,6 +10036,85 @@ static bool ggml_cl_flash_attn_dequant_q8_0_gpu(
     cl_kernel kernel = (target_type == GGML_TYPE_F16)
         ? backend_ctx->kernel_dequant_q8_0_f16_view_aos
         : backend_ctx->kernel_dequant_q8_0_f32_view_aos;
+
+    CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),   &src_buf));
+    CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_ulong), &src_offset));
+    CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_ulong), &src_nb1));
+    CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_ulong), &src_nb2));
+    CL_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_ulong), &src_nb3));
+    CL_CHECK(clSetKernelArg(kernel, 5, sizeof(cl_int),   &nblk0_arg));
+    CL_CHECK(clSetKernelArg(kernel, 6, sizeof(cl_int),   &ne1_arg));
+    CL_CHECK(clSetKernelArg(kernel, 7, sizeof(cl_int),   &ne2_arg));
+    CL_CHECK(clSetKernelArg(kernel, 8, sizeof(cl_int),   &ne3_arg));
+    CL_CHECK(clSetKernelArg(kernel, 9, sizeof(cl_mem),   &temp.data));
+
+    size_t global_ws[3] = { (size_t) nblk0_arg, (size_t) ne1_arg, (size_t) ne2_arg * (size_t) ne3_arg };
+    CL_CHECK(clEnqueueNDRangeKernel(backend_ctx->queue, kernel, 3, NULL,
+                                    global_ws, NULL, 0, NULL, NULL));
+
+    out_buf    = temp.data;
+    out_offset = 0;
+    out_nb1    = (cl_ulong) tensor->ne[0] * elem_size;
+    out_nb2    = out_nb1 * (cl_ulong) tensor->ne[1];
+    out_nb3    = out_nb2 * (cl_ulong) tensor->ne[2];
+    return true;
+}
+
+// GPU q4_0→f16/f32 dequant for contig tensors. Mirrors the q8_0 helper.
+// Returns false for non-contig layouts so the caller can fall back to host.
+static bool ggml_cl_flash_attn_dequant_q4_0_gpu(
+        ggml_backend_opencl_context *    backend_ctx,
+        const ggml_tensor *              tensor,
+        ggml_type                        target_type,
+        cl_mem                           in_src_buf,
+        cl_ulong                         in_src_offset,
+        cl_ulong                         in_src_nb1,
+        cl_ulong                         in_src_nb2,
+        cl_ulong                         in_src_nb3,
+        ggml_cl_flash_attn_temp_buffer & temp,
+        cl_mem &                         out_buf,
+        cl_ulong &                       out_offset,
+        cl_ulong &                       out_nb1,
+        cl_ulong &                       out_nb2,
+        cl_ulong &                       out_nb3) {
+    GGML_ASSERT(tensor->type == GGML_TYPE_Q4_0);
+    GGML_ASSERT(target_type == GGML_TYPE_F16 || target_type == GGML_TYPE_F32);
+
+    cl_mem   src_buf    = in_src_buf;
+    cl_ulong src_offset = in_src_offset;
+    cl_ulong src_nb1    = in_src_nb1;
+    cl_ulong src_nb2    = in_src_nb2;
+    cl_ulong src_nb3    = in_src_nb3;
+    if (src_buf == NULL) {
+        ggml_tensor_extra_cl * extra = (ggml_tensor_extra_cl *) tensor->extra;
+        src_buf    = extra->data_device;
+        src_offset = extra->offset + tensor->view_offs;
+        src_nb1    = tensor->nb[1];
+        src_nb2    = tensor->nb[2];
+        src_nb3    = tensor->nb[3];
+    }
+
+    // The kernel indexes blocks as blk_i0 * 18 within the ne[0] direction;
+    // require ne[0] to be tight in memory (nb[0] == one q4_0 block).
+    if (tensor->nb[0] != (cl_ulong) (2 + 16)) {
+        return false;
+    }
+
+    const size_t n_blocks = (size_t) ggml_nelements(tensor) / 32;
+    const size_t elem_size = ggml_type_size(target_type);
+    const size_t out_bytes = n_blocks * 32 * elem_size;
+    const cl_int nblk0_arg = (cl_int) (tensor->ne[0] / 32);
+    const cl_int ne1_arg   = (cl_int) tensor->ne[1];
+    const cl_int ne2_arg   = (cl_int) tensor->ne[2];
+    const cl_int ne3_arg   = (cl_int) tensor->ne[3];
+
+    cl_int err;
+    temp.data = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE, out_bytes, NULL, &err);
+    CL_CHECK(err);
+
+    cl_kernel kernel = (target_type == GGML_TYPE_F16)
+        ? backend_ctx->kernel_dequant_q4_0_f16_view_aos
+        : backend_ctx->kernel_dequant_q4_0_f32_view_aos;
 
     CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),   &src_buf));
     CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_ulong), &src_offset));
@@ -10462,16 +10543,34 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     // Skip host dequant when a native quantised kernel will read the quants.
     if (!use_native_q8_0_q1 && !use_native_q8_0 &&
         !use_native_q4_0_q1 && !use_native_q4_0) {
-        // GPU q8_0 dequant for tight rows; CPU fallback otherwise.
+        // Per-tensor GPU dequant — important for asymmetric KV (k, v of
+        // different quant types) which would otherwise host-roundtrip.
         bool k_done = false;
         bool v_done = false;
-        if (is_q8_0) {
+        if (k->type == GGML_TYPE_Q8_0) {
             k_done = ggml_cl_flash_attn_dequant_q8_0_gpu(
                 backend_ctx, k, kv_target_type, k_data_device, offset_k, k_nb1, k_nb2, k_nb3,
                 temp_k, k_data_device, offset_k, k_nb1, k_nb2, k_nb3);
+        } else if (k->type == GGML_TYPE_Q4_0) {
+            k_done = ggml_cl_flash_attn_dequant_q4_0_gpu(
+                backend_ctx, k, kv_target_type, k_data_device, offset_k, k_nb1, k_nb2, k_nb3,
+                temp_k, k_data_device, offset_k, k_nb1, k_nb2, k_nb3);
+        }
+        if (v->type == GGML_TYPE_Q8_0) {
             v_done = ggml_cl_flash_attn_dequant_q8_0_gpu(
                 backend_ctx, v, kv_target_type, v_data_device, offset_v, v_nb1, v_nb2, v_nb3,
                 temp_v, v_data_device, offset_v, v_nb1, v_nb2, v_nb3);
+        } else if (v->type == GGML_TYPE_Q4_0) {
+            v_done = ggml_cl_flash_attn_dequant_q4_0_gpu(
+                backend_ctx, v, kv_target_type, v_data_device, offset_v, v_nb1, v_nb2, v_nb3,
+                temp_v, v_data_device, offset_v, v_nb1, v_nb2, v_nb3);
+        }
+        static bool _asym_dbg = false;
+        if (!_asym_dbg) {
+            _asym_dbg = true;
+            fprintf(stderr, "asym-kv-fix: k=%s v=%s k_done=%d v_done=%d kv_target=%s\n",
+                ggml_type_name(k->type), ggml_type_name(v->type),
+                k_done, v_done, ggml_type_name(kv_target_type));
         }
         if (!k_done) {
             ggml_cl_flash_attn_prepare_quantized_tensor(backend_ctx, k, kv_target_type, temp_k, k_data_device, offset_k, k_nb1, k_nb2, k_nb3);
