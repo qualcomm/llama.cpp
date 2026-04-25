@@ -593,13 +593,16 @@ __kernel void flash_attn_f32_f16_q1(
         mask_base = (const global char*)mask_void + mask_offset + mask_batch_idx * mask_nb3 + mask_head_idx * mask_nb2;
     }
 
-    ACC_TYPE4 q_priv[DK_VEC];
+    // Q is uniform across WG threads (n_q=1). Share via local memory to
+    // avoid per-thread q_priv[DK_VEC] dynamic-indexed private array that
+    // spills to DDR on Adreno.
+    __local ACC_TYPE4 q_shared[DK_VEC];
     const ulong q_row_offset = batch_idx * q_nb3 + head_idx * q_nb2;
     const global Q_DATA_TYPE4* q_ptr = (const global Q_DATA_TYPE4*)(q_base + q_row_offset);
-    FA_UNROLL
-    for (int i = 0; i < DK_VEC; ++i) {
-        q_priv[i] = CONVERT_Q_ACC4(q_ptr[i]);
+    for (int i = tid; i < DK_VEC; i += Q1_WG_SIZE) {
+        q_shared[i] = CONVERT_Q_ACC4(q_ptr[i]);
     }
+    barrier(CLK_LOCAL_MEM_FENCE);
 
     float slope = get_alibi_slope(max_bias, head_idx, n_head_log2, m0, m1);
 
@@ -615,7 +618,7 @@ __kernel void flash_attn_f32_f16_q1(
         ACC_TYPE4 dot_acc = (ACC_TYPE4)(0.0f);
         FA_UNROLL
         for (int k = 0; k < DK_VEC; k++) {
-            dot_acc = mad(q_priv[k], CONVERT_KV_ACC4(k_ptr[k]), dot_acc);
+            dot_acc = mad(q_shared[k], CONVERT_KV_ACC4(k_ptr[k]), dot_acc);
         }
         ACC_TYPE score = (dot_acc.s0 + dot_acc.s1 + dot_acc.s2 + dot_acc.s3) * scale;
         if (mask_base != NULL) {
@@ -651,7 +654,7 @@ __kernel void flash_attn_f32_f16_q1(
         ACC_TYPE4 dot_acc = (ACC_TYPE4)(0.0f);
         FA_UNROLL
         for (int k = 0; k < DK_VEC; k++) {
-            dot_acc = mad(q_priv[k], CONVERT_KV_ACC4(k_ptr[k]), dot_acc);
+            dot_acc = mad(q_shared[k], CONVERT_KV_ACC4(k_ptr[k]), dot_acc);
         }
         ACC_TYPE score = (dot_acc.s0 + dot_acc.s1 + dot_acc.s2 + dot_acc.s3) * scale;
         if (mask_base != NULL) {
@@ -780,13 +783,14 @@ __kernel void flash_attn_f32_f16_q1_split(
                     (ulong) q_idx * mask_nb1;
     }
 
-    ACC_TYPE4 q_priv[DK_VEC];
+    // Share Q via local memory (n_q=1 per split → uniform across WG).
+    __local ACC_TYPE4 q_shared[DK_VEC];
     const ulong q_row_offset = batch_idx * q_nb3 + head_idx * q_nb2 + (ulong) q_idx * q_nb1;
     const global Q_DATA_TYPE4 * q_ptr = (const global Q_DATA_TYPE4 *) (q_base + q_row_offset);
-    #pragma unroll
-    for (int i = 0; i < DK_VEC; ++i) {
-        q_priv[i] = CONVERT_Q_ACC4(q_ptr[i]);
+    for (int i = tid; i < DK_VEC; i += Q1_WG_SIZE) {
+        q_shared[i] = CONVERT_Q_ACC4(q_ptr[i]);
     }
+    barrier(CLK_LOCAL_MEM_FENCE);
 
     const float slope = get_alibi_slope(max_bias, head_idx, n_head_log2, m0, m1);
 
@@ -798,7 +802,7 @@ __kernel void flash_attn_f32_f16_q1_split(
         ACC_TYPE4 dot_acc = (ACC_TYPE4)(0.0f);
         #pragma unroll
         for (int k = 0; k < DK_VEC; ++k) {
-            dot_acc = mad(q_priv[k], CONVERT_KV_ACC4(k_ptr[k]), dot_acc);
+            dot_acc = mad(q_shared[k], CONVERT_KV_ACC4(k_ptr[k]), dot_acc);
         }
         ACC_TYPE score = (dot_acc.s0 + dot_acc.s1 + dot_acc.s2 + dot_acc.s3) * scale;
         if (mask_base != NULL) {
@@ -835,7 +839,7 @@ __kernel void flash_attn_f32_f16_q1_split(
         ACC_TYPE4 dot_acc = (ACC_TYPE4)(0.0f);
         #pragma unroll
         for (int k = 0; k < DK_VEC; ++k) {
-            dot_acc = mad(q_priv[k], CONVERT_KV_ACC4(k_ptr[k]), dot_acc);
+            dot_acc = mad(q_shared[k], CONVERT_KV_ACC4(k_ptr[k]), dot_acc);
         }
         ACC_TYPE score = (dot_acc.s0 + dot_acc.s1 + dot_acc.s2 + dot_acc.s3) * scale;
         if (mask_base != NULL) {
