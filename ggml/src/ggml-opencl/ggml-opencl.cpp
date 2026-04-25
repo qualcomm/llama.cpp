@@ -3243,6 +3243,66 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
     return true;
 }
 
+// DK=256 quant override: N_SPLIT=8 (default fa_dims has 16, but Q4_0/Q8_0
+// prefill requires DK_Q4_BLOCKS_PREFILL=DK/32=8 % N_SPLIT == 0; NS=16 → 0
+// blocks/split = degenerate). NS=8 → 1 block/split, valid; WG_SIZE = BM × NS
+// = 16 × 8 = 128.
+static bool ggml_opencl_ensure_fa_dk256_quant_split(ggml_backend_opencl_context * backend_ctx, bool is_q8_0) {
+    const std::pair<int, int> dk_dv = {256, 256};
+    if (is_q8_0 && backend_ctx->kernels_flash_attn_f32_q8_0_split.count(dk_dv)) return true;
+    if (!is_q8_0 && backend_ctx->kernels_flash_attn_f32_q4_0_split.count(dk_dv)) return true;
+
+    const ggml_opencl_fa_variant variant = is_q8_0 ? FA_VARIANT_Q8_0_SPLIT : FA_VARIANT_Q4_0_SPLIT;
+    const auto attempt_key = std::make_pair(variant, dk_dv);
+    if (backend_ctx->fa_variant_attempted.count(attempt_key)) return false;
+    backend_ctx->fa_variant_attempted.insert(attempt_key);
+
+    const int quant_bm = 16;
+    const int quant_n_split = 8;
+    std::string shuffle_opts;
+    if (backend_ctx->has_subgroup_shuffle) {
+        shuffle_opts = backend_ctx->has_qcom_subgroup_shuffle
+            ? " -D cl_qcom_subgroup_shuffle=1"
+            : " -D cl_khr_subgroup_shuffle=1";
+    }
+    const ggml_opencl_fa_dim * cfg = nullptr;
+    for (const auto & d : g_opencl_fa_dims) {
+        if (d.dk == 256 && d.dv == 256) { cfg = &d; break; }
+    }
+    if (cfg == nullptr) return false;
+
+    std::string opts = backend_ctx->kernel_compile_opts + shuffle_opts +
+        " -D DK=256 -D DV=256"
+        " -D BLOCK_M=" + std::to_string(quant_bm) +
+        " -D BLOCK_N=" + std::to_string(cfg->bn) +
+        " -D N_SPLIT=" + std::to_string(quant_n_split) +
+        " -D BLK_PREPASS_BM=" + std::to_string(cfg->bm);
+
+    const std::string src = ggml_opencl_fa_kernel_src(variant);
+    if (src.empty()) return false;
+    cl_program prog = build_program_from_source_ex(
+        backend_ctx->context, backend_ctx->device, src.c_str(), opts,
+        /*fatal=*/false, is_q8_0 ? "fa q8_0 split DK=256" : "fa q4_0 split DK=256");
+    if (!prog) return false;
+    cl_int err;
+    cl_kernel k;
+    if (is_q8_0) {
+        CL_CHECK((k = clCreateKernel(prog, "flash_attn_f32_q8_0", &err), err));
+        backend_ctx->kernels_flash_attn_f32_q8_0_split[dk_dv]                = k;
+        backend_ctx->kernels_flash_attn_f32_q8_0_split_wg_size[dk_dv]        = quant_bm * quant_n_split;
+        backend_ctx->kernels_flash_attn_f32_q8_0_split_bm[dk_dv]             = quant_bm;
+        backend_ctx->kernels_flash_attn_f32_q8_0_split_nkv_threshold[dk_dv]  = 0;
+    } else {
+        CL_CHECK((k = clCreateKernel(prog, "flash_attn_f32_q4_0", &err), err));
+        backend_ctx->kernels_flash_attn_f32_q4_0_split[dk_dv]                = k;
+        backend_ctx->kernels_flash_attn_f32_q4_0_split_wg_size[dk_dv]        = quant_bm * quant_n_split;
+        backend_ctx->kernels_flash_attn_f32_q4_0_split_bm[dk_dv]             = quant_bm;
+        backend_ctx->kernels_flash_attn_f32_q4_0_split_nkv_threshold[dk_dv]  = 0;
+    }
+    CL_CHECK(clReleaseProgram(prog));
+    return true;
+}
+
 // DK=96 quant override: N_SPLIT=3, BLOCK_M=32 (96%2 ≠ 0, so the default
 // N_SPLIT=2 doesn't apply). Called only from quant KV dispatch at DK=DV=96.
 static bool ggml_opencl_ensure_fa_dk96_quant_split(ggml_backend_opencl_context * backend_ctx, bool is_q8_0) {
@@ -10388,6 +10448,8 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         ggml_opencl_ensure_fa_variant(backend_ctx, d_head_q, d_head_v, FA_VARIANT_Q8_0);
         if (d_head_q == 96 && d_head_v == 96) {
             ggml_opencl_ensure_fa_dk96_quant_split(backend_ctx, /*is_q8_0=*/true);
+        } else if (d_head_q == 256 && d_head_v == 256) {
+            ggml_opencl_ensure_fa_dk256_quant_split(backend_ctx, /*is_q8_0=*/true);
         } else {
             ggml_opencl_ensure_fa_variant(backend_ctx, d_head_q, d_head_v, FA_VARIANT_Q8_0_SPLIT);
         }
@@ -10395,6 +10457,8 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         ggml_opencl_ensure_fa_variant(backend_ctx, d_head_q, d_head_v, FA_VARIANT_Q4_0);
         if (d_head_q == 96 && d_head_v == 96) {
             ggml_opencl_ensure_fa_dk96_quant_split(backend_ctx, /*is_q8_0=*/false);
+        } else if (d_head_q == 256 && d_head_v == 256) {
+            ggml_opencl_ensure_fa_dk256_quant_split(backend_ctx, /*is_q8_0=*/false);
         } else {
             ggml_opencl_ensure_fa_variant(backend_ctx, d_head_q, d_head_v, FA_VARIANT_Q4_0_SPLIT);
         }
