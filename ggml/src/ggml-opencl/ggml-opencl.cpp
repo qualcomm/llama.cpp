@@ -100,6 +100,7 @@ enum ADRENO_GPU_GEN {
     A7X,
     A8X,
     X1E,
+    X2E,   // placeholder; tuning table added when hardware available
 };
 
 enum ADRENO_CL_COMPILER_TYPE {
@@ -238,6 +239,10 @@ static ADRENO_GPU_GEN get_adreno_gpu_gen(const char *device_name) {
 
     if (strstr(device_name, "X1")) {
         return ADRENO_GPU_GEN::X1E;
+    }
+
+    if (strstr(device_name, "X2")) {
+        return ADRENO_GPU_GEN::X2E;
     }
 
     return ADRENO_GPU_GEN::ADRENO_UNKNOWN;
@@ -2857,7 +2862,8 @@ struct ggml_opencl_fa_dim {
 };
 
 // Split variant fires when n_kv >= threshold (threshold=0 → always split).
-static const ggml_opencl_fa_dim g_opencl_fa_dims[] = {
+// Default tuning covers Adreno 7xx/8xx mobile and X1-series laptop GPUs.
+static const ggml_opencl_fa_dim g_fa_dims_adreno_default[] = {
     { 40,  40, 64, 32, 1, 0}, { 64,  64, 64, 32, 2, 64},
     { 80,  80, 64, 32, 2, 64}, { 96,  96, 64, 32, 2, 64},
     {112, 112, 64, 32, 2, 64}, {128, 128, 64, 32, 2, 64},
@@ -2865,6 +2871,46 @@ static const ggml_opencl_fa_dim g_opencl_fa_dims[] = {
     {192, 192, 16, 16, 1, 0},
     {256, 256, 16, 16, 16, 0},
 };
+
+// Placeholder for Adreno X2 / next-gen; mirrors default until retuned on hardware.
+static const ggml_opencl_fa_dim g_fa_dims_adreno_x2[] = {
+    { 40,  40, 64, 32, 1, 0}, { 64,  64, 64, 32, 2, 64},
+    { 80,  80, 64, 32, 2, 64}, { 96,  96, 64, 32, 2, 64},
+    {112, 112, 64, 32, 2, 64}, {128, 128, 64, 32, 2, 64},
+    {192, 128, 16, 16, 1, 0},
+    {192, 192, 16, 16, 1, 0},
+    {256, 256, 16, 16, 16, 0},
+};
+
+struct ggml_opencl_fa_dim_table {
+    const ggml_opencl_fa_dim * data;
+    size_t                     count;
+
+    const ggml_opencl_fa_dim * begin() const { return data; }
+    const ggml_opencl_fa_dim * end()   const { return data + count; }
+};
+
+static ggml_opencl_fa_dim_table g_opencl_fa_dims = {
+    g_fa_dims_adreno_default,
+    sizeof(g_fa_dims_adreno_default) / sizeof(g_fa_dims_adreno_default[0]),
+};
+
+static void ggml_cl_select_fa_dims_table(ADRENO_GPU_GEN gen) {
+    switch (gen) {
+        case ADRENO_GPU_GEN::X2E:
+            g_opencl_fa_dims = {
+                g_fa_dims_adreno_x2,
+                sizeof(g_fa_dims_adreno_x2) / sizeof(g_fa_dims_adreno_x2[0]),
+            };
+            break;
+        default:
+            g_opencl_fa_dims = {
+                g_fa_dims_adreno_default,
+                sizeof(g_fa_dims_adreno_default) / sizeof(g_fa_dims_adreno_default[0]),
+            };
+            break;
+    }
+}
 
 // Lazy FA compile: one (dk, dv) pair per first-dispatch. Matches the Q4_K
 // GEMM lazy pattern below; keeps Adreno host-memory footprint small.
@@ -3526,6 +3572,7 @@ static ggml_backend_opencl_context * ggml_cl2_init(ggml_backend_dev_t dev) {
         if (backend_ctx->adreno_gen == ADRENO_GPU_GEN::ADRENO_UNKNOWN) {
             backend_ctx->adreno_gen = get_adreno_gpu_gen(dev_ctx->device_name.c_str());
         }
+        ggml_cl_select_fa_dims_table(backend_ctx->adreno_gen);
 
         // Use wave size of 64 for all Adreno GPUs.
         backend_ctx->adreno_wave_size = 64;
