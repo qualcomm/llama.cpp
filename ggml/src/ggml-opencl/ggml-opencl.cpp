@@ -2952,6 +2952,28 @@ static std::string ggml_opencl_fa_compile_opts(ggml_backend_opencl_context * bac
     return opts;
 }
 
+// Log compiled private-memory footprint for an FA kernel. On Adreno any
+// non-zero private_mem means the compiler spilled to DDR global memory
+// (per-work-item, no cache locality) — a strong signal to pick a config
+// with smaller per-thread state (e.g. larger N_SPLIT). Enabled via
+// GGML_OPENCL_FA_LOG_SPILL=1.
+static void ggml_opencl_log_fa_kernel_spill(ggml_backend_opencl_context * backend_ctx,
+                                            cl_kernel kernel, const char * name, int dk, int dv) {
+    static const bool enabled = []{
+        const char * e = std::getenv("GGML_OPENCL_FA_LOG_SPILL");
+        return e && e[0] && e[0] != '0';
+    }();
+    if (!enabled || kernel == NULL) return;
+
+    cl_ulong priv_mem = 0;
+    if (clGetKernelWorkGroupInfo(kernel, backend_ctx->device, CL_KERNEL_PRIVATE_MEM_SIZE,
+                                 sizeof(priv_mem), &priv_mem, NULL) == CL_SUCCESS) {
+        const char * tag = priv_mem > 0 ? "SPILL" : "ok";
+        fprintf(stderr, "ggml_opencl: [%s] %s DK=%d DV=%d private_mem=%llu bytes\n",
+                tag, name, dk, dv, (unsigned long long) priv_mem);
+    }
+}
+
 static void ggml_opencl_ensure_fa_pre_kernels(ggml_backend_opencl_context * backend_ctx, int dk, int dv) {
     const std::pair<int, int> dk_dv = {dk, dv};
     if (backend_ctx->kernels_flash_attn_kv_pad_f16.count(dk_dv) > 0) return;
@@ -3085,9 +3107,12 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
             CL_CHECK((kq1 = clCreateKernel(prog, "flash_attn_f32_f16_q1", &err), err));
             backend_ctx->kernels_flash_attn_f32_f16[{dk, dv}]    = k;
             backend_ctx->kernels_flash_attn_f32_f16_q1[{dk, dv}] = kq1;
+            ggml_opencl_log_fa_kernel_spill(backend_ctx, k,   "flash_attn_f32_f16",    dk, dv);
+            ggml_opencl_log_fa_kernel_spill(backend_ctx, kq1, "flash_attn_f32_f16_q1", dk, dv);
             cl_kernel k_split = clCreateKernel(prog, "flash_attn_f32_f16_q1_split", &err);
             if (err == CL_SUCCESS) {
                 backend_ctx->kernels_flash_attn_f32_f16_q1_split[{dk, dv}] = k_split;
+                ggml_opencl_log_fa_kernel_spill(backend_ctx, k_split, "flash_attn_f32_f16_q1_split", dk, dv);
             }
             cl_kernel k_merge = clCreateKernel(prog, "flash_attn_f32_merge", &err);
             if (err == CL_SUCCESS) {
@@ -3101,9 +3126,12 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
             CL_CHECK((k   = clCreateKernel(prog, "flash_attn_f32_q8_0",    &err), err));
             backend_ctx->kernels_flash_attn_f32_q8_0_q1[{dk, dv}] = kq1;
             backend_ctx->kernels_flash_attn_f32_q8_0[{dk, dv}]    = k;
+            ggml_opencl_log_fa_kernel_spill(backend_ctx, kq1, "flash_attn_f32_q8_0_q1", dk, dv);
+            ggml_opencl_log_fa_kernel_spill(backend_ctx, k,   "flash_attn_f32_q8_0",    dk, dv);
             cl_kernel k_split = clCreateKernel(prog, "flash_attn_f32_q8_0_q1_split", &err);
             if (err == CL_SUCCESS) {
                 backend_ctx->kernels_flash_attn_f32_q8_0_q1_split[{dk, dv}] = k_split;
+                ggml_opencl_log_fa_kernel_spill(backend_ctx, k_split, "flash_attn_f32_q8_0_q1_split", dk, dv);
             }
             if (!backend_ctx->kernels_flash_attn_f32_merge.count({dk, dv})) {
                 cl_kernel k_merge = clCreateKernel(prog, "flash_attn_f32_merge", &err);
@@ -3119,9 +3147,12 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
             CL_CHECK((k   = clCreateKernel(prog, "flash_attn_f32_q4_0",    &err), err));
             backend_ctx->kernels_flash_attn_f32_q4_0_q1[{dk, dv}] = kq1;
             backend_ctx->kernels_flash_attn_f32_q4_0[{dk, dv}]    = k;
+            ggml_opencl_log_fa_kernel_spill(backend_ctx, kq1, "flash_attn_f32_q4_0_q1", dk, dv);
+            ggml_opencl_log_fa_kernel_spill(backend_ctx, k,   "flash_attn_f32_q4_0",    dk, dv);
             cl_kernel k_split = clCreateKernel(prog, "flash_attn_f32_q4_0_q1_split", &err);
             if (err == CL_SUCCESS) {
                 backend_ctx->kernels_flash_attn_f32_q4_0_q1_split[{dk, dv}] = k_split;
+                ggml_opencl_log_fa_kernel_spill(backend_ctx, k_split, "flash_attn_f32_q4_0_q1_split", dk, dv);
             }
             if (!backend_ctx->kernels_flash_attn_f32_merge.count({dk, dv})) {
                 cl_kernel k_merge = clCreateKernel(prog, "flash_attn_f32_merge", &err);
