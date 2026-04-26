@@ -167,6 +167,9 @@ set(GGML_OPENCL_KERNELS
     flash_attn_f32_q4_0
     flash_attn_f16
     flash_attn_f32
+    pool_2d
+    conv_transpose_1d
+    im2col_3d
 )
 
 foreach (K ${GGML_OPENCL_KERNELS})
