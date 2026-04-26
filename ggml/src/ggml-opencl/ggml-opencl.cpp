@@ -4770,19 +4770,22 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
             return cols <= max_workgroup_size && op->src[0]->type == GGML_TYPE_F32;
         }
         case GGML_OP_GATED_DELTA_NET: {
-            // Simple kernel: requires contiguous q/k/v, v_repeat=1, power-of-2 S_v.
+            // Power-of-2 S_v fits one WG; uses nb strides so permuted/v_repeat OK.
+            // q/k/v rows must still be contiguous (nb0 == sizeof(float)).
             const ggml_tensor * t_q = op->src[0];
+            const ggml_tensor * t_k = op->src[1];
             const ggml_tensor * t_v = op->src[2];
             cl_kernel kernel = backend_ctx->kernel_gated_delta_net_f32;
             int max_wg = backend_ctx->get_kernel_workgroup_size(kernel);
             const int S_v = (int) t_v->ne[0];
             const bool pow2 = (S_v & (S_v - 1)) == 0;
-            const bool same_heads = t_q->ne[1] == t_v->ne[1];
             return op->src[0]->type == GGML_TYPE_F32 && pow2 && S_v <= max_wg &&
-                   ggml_is_contiguous(op->src[0]) &&
-                   ggml_is_contiguous(op->src[1]) &&
-                   ggml_is_contiguous(op->src[2]) &&
-                   same_heads;
+                   t_q->nb[0] == sizeof(float) &&
+                   t_k->nb[0] == sizeof(float) &&
+                   t_v->nb[0] == sizeof(float) &&
+                   ggml_is_contiguous(op->src[3]) &&
+                   ggml_is_contiguous(op->src[4]) &&
+                   ggml_is_contiguous(op->src[5]);
         }
         case GGML_OP_SUM_ROWS:
         case GGML_OP_CUMSUM:
@@ -15379,6 +15382,16 @@ static void ggml_cl_gated_delta_net(ggml_backend_t backend, const ggml_tensor * 
     const int T   = (int) t_v->ne[2];
     const int B   = (int) t_v->ne[3];
     const int G   = (int) t_g->ne[0];
+    const int neq1 = (int) t_q->ne[1];
+    const int nek1 = (int) t_k->ne[1];
+    const int rq3  = (int) (t_v->ne[3] / t_q->ne[3]);
+    const int rk3  = (int) (t_v->ne[3] / t_k->ne[3]);
+
+    cl_ulong nbq1 = t_q->nb[1], nbq2 = t_q->nb[2], nbq3 = t_q->nb[3];
+    cl_ulong nbk1 = t_k->nb[1], nbk2 = t_k->nb[2], nbk3 = t_k->nb[3];
+    cl_ulong nbv1 = t_v->nb[1], nbv2 = t_v->nb[2], nbv3 = t_v->nb[3];
+    cl_ulong nbg1 = t_g->nb[1], nbg2 = t_g->nb[2], nbg3 = t_g->nb[3];
+    cl_ulong nbb1 = t_b->nb[1], nbb2 = t_b->nb[2], nbb3 = t_b->nb[3];
 
     cl_kernel kernel = backend_ctx->kernel_gated_delta_net_f32;
 
@@ -15402,6 +15415,25 @@ static void ggml_cl_gated_delta_net(ggml_backend_t backend, const ggml_tensor * 
     CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(int),      &T));
     CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(int),      &B));
     CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(int),      &G));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(int),      &neq1));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(int),      &nek1));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(int),      &rq3));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(int),      &rk3));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &nbq1));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &nbq2));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &nbq3));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &nbk1));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &nbk2));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &nbk3));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &nbv1));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &nbv2));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &nbv3));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &nbg1));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &nbg2));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &nbg3));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &nbb1));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &nbb2));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &nbb3));
     CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(float)*S_v, NULL));
 
     size_t global_work_size[] = {(size_t)B * S_v, (size_t)H, (size_t)S_v};
