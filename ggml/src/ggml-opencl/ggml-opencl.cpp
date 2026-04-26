@@ -476,6 +476,7 @@ struct ggml_backend_opencl_context {
     cl_program program_softmax_4_f32;
     cl_program program_softmax_4_f16;
     cl_program program_argsort_f32_i32;
+    cl_program program_gated_delta_net_f32;
     cl_program program_sum_rows_f32;
     cl_program program_pad;
     cl_program program_upscale;
@@ -612,6 +613,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_solve_tri_f32;
     cl_kernel kernel_im2col_f32, kernel_im2col_f16;
     cl_kernel kernel_argsort_f32_i32;
+    cl_kernel kernel_gated_delta_net_f32;
     cl_kernel kernel_sum_rows_f32, kernel_sum_rows_f32_4;
     cl_kernel kernel_cumsum_blk, kernel_cumsum_add;
     cl_kernel kernel_repeat_f32;
@@ -1934,6 +1936,22 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
             build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
 
         CL_CHECK((backend_ctx->kernel_argsort_f32_i32 = clCreateKernel(backend_ctx->program_argsort_f32_i32, "kernel_argsort_f32_i32", &err), err));
+        GGML_LOG_CONT(".");
+    }
+
+    // gated_delta_net
+    {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src {
+            #include "gated_delta_net.cl.h"
+        };
+#else
+        const std::string kernel_src = read_file("gated_delta_net.cl");
+#endif
+        backend_ctx->program_gated_delta_net_f32 =
+            build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
+
+        CL_CHECK((backend_ctx->kernel_gated_delta_net_f32 = clCreateKernel(backend_ctx->program_gated_delta_net_f32, "kernel_gated_delta_net_f32", &err), err));
         GGML_LOG_CONT(".");
     }
 
@@ -4750,6 +4768,21 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
             }
 
             return cols <= max_workgroup_size && op->src[0]->type == GGML_TYPE_F32;
+        }
+        case GGML_OP_GATED_DELTA_NET: {
+            // Simple kernel: requires contiguous q/k/v, v_repeat=1, power-of-2 S_v.
+            const ggml_tensor * t_q = op->src[0];
+            const ggml_tensor * t_v = op->src[2];
+            cl_kernel kernel = backend_ctx->kernel_gated_delta_net_f32;
+            int max_wg = backend_ctx->get_kernel_workgroup_size(kernel);
+            const int S_v = (int) t_v->ne[0];
+            const bool pow2 = (S_v & (S_v - 1)) == 0;
+            const bool same_heads = t_q->ne[1] == t_v->ne[1];
+            return op->src[0]->type == GGML_TYPE_F32 && pow2 && S_v <= max_wg &&
+                   ggml_is_contiguous(op->src[0]) &&
+                   ggml_is_contiguous(op->src[1]) &&
+                   ggml_is_contiguous(op->src[2]) &&
+                   same_heads;
         }
         case GGML_OP_SUM_ROWS:
         case GGML_OP_CUMSUM:
@@ -15310,6 +15343,73 @@ static void ggml_cl_im2col(ggml_backend_t backend, const ggml_tensor * src0, con
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
 }
 
+static void ggml_cl_gated_delta_net(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    GGML_UNUSED(src0);
+    GGML_UNUSED(src1);
+    GGML_ASSERT(dst);
+    GGML_ASSERT(dst->extra);
+
+    ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
+
+    const ggml_tensor * t_q = dst->src[0];
+    const ggml_tensor * t_k = dst->src[1];
+    const ggml_tensor * t_v = dst->src[2];
+    const ggml_tensor * t_g = dst->src[3];
+    const ggml_tensor * t_b = dst->src[4];
+    const ggml_tensor * t_s = dst->src[5];
+
+    ggml_tensor_extra_cl * e_q = (ggml_tensor_extra_cl *) t_q->extra;
+    ggml_tensor_extra_cl * e_k = (ggml_tensor_extra_cl *) t_k->extra;
+    ggml_tensor_extra_cl * e_v = (ggml_tensor_extra_cl *) t_v->extra;
+    ggml_tensor_extra_cl * e_g = (ggml_tensor_extra_cl *) t_g->extra;
+    ggml_tensor_extra_cl * e_b = (ggml_tensor_extra_cl *) t_b->extra;
+    ggml_tensor_extra_cl * e_s = (ggml_tensor_extra_cl *) t_s->extra;
+    ggml_tensor_extra_cl * e_d = (ggml_tensor_extra_cl *) dst->extra;
+
+    cl_ulong off_q = e_q->offset + t_q->view_offs;
+    cl_ulong off_k = e_k->offset + t_k->view_offs;
+    cl_ulong off_v = e_v->offset + t_v->view_offs;
+    cl_ulong off_g = e_g->offset + t_g->view_offs;
+    cl_ulong off_b = e_b->offset + t_b->view_offs;
+    cl_ulong off_s = e_s->offset + t_s->view_offs;
+    cl_ulong off_d = e_d->offset + dst->view_offs;
+
+    const int S_v = (int) t_v->ne[0];
+    const int H   = (int) t_v->ne[1];
+    const int T   = (int) t_v->ne[2];
+    const int B   = (int) t_v->ne[3];
+    const int G   = (int) t_g->ne[0];
+
+    cl_kernel kernel = backend_ctx->kernel_gated_delta_net_f32;
+
+    int idx = 0;
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem),   &e_q->data_device));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off_q));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem),   &e_k->data_device));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off_k));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem),   &e_v->data_device));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off_v));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem),   &e_g->data_device));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off_g));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem),   &e_b->data_device));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off_b));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem),   &e_s->data_device));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off_s));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem),   &e_d->data_device));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off_d));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(int),      &S_v));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(int),      &H));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(int),      &T));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(int),      &B));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(int),      &G));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(float)*S_v, NULL));
+
+    size_t global_work_size[] = {(size_t)B * S_v, (size_t)H, (size_t)S_v};
+    size_t local_work_size[]  = {(size_t)S_v, 1, 1};
+
+    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+}
+
 static void ggml_cl_argsort(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_ASSERT(src0);
     GGML_ASSERT(src0->extra);
@@ -15963,6 +16063,12 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
                 return false;
             }
             func = ggml_cl_argsort;
+            break;
+        case GGML_OP_GATED_DELTA_NET:
+            if (!any_on_device) {
+                return false;
+            }
+            func = ggml_cl_gated_delta_net;
             break;
         case GGML_OP_SUM_ROWS:
             if (!any_on_device) {
