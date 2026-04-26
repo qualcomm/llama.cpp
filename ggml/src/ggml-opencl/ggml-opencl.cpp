@@ -476,6 +476,9 @@ struct ggml_backend_opencl_context {
     cl_program program_softmax_4_f32;
     cl_program program_softmax_4_f16;
     cl_program program_argsort_f32_i32;
+    cl_program program_argmax_f32_i32;
+    cl_program program_arange_f32;
+    cl_program program_roll_f32;
     cl_program program_sum_rows_f32;
     cl_program program_pad;
     cl_program program_upscale;
@@ -612,6 +615,9 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_solve_tri_f32;
     cl_kernel kernel_im2col_f32, kernel_im2col_f16;
     cl_kernel kernel_argsort_f32_i32;
+    cl_kernel kernel_argmax_f32_i32;
+    cl_kernel kernel_arange_f32;
+    cl_kernel kernel_roll_f32;
     cl_kernel kernel_sum_rows_f32, kernel_sum_rows_f32_4;
     cl_kernel kernel_cumsum_blk, kernel_cumsum_add;
     cl_kernel kernel_repeat_f32;
@@ -1934,6 +1940,54 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
             build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
 
         CL_CHECK((backend_ctx->kernel_argsort_f32_i32 = clCreateKernel(backend_ctx->program_argsort_f32_i32, "kernel_argsort_f32_i32", &err), err));
+        GGML_LOG_CONT(".");
+    }
+
+    // argmax
+    {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src {
+            #include "argmax.cl.h"
+        };
+#else
+        const std::string kernel_src = read_file("argmax.cl");
+#endif
+        backend_ctx->program_argmax_f32_i32 =
+            build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
+
+        CL_CHECK((backend_ctx->kernel_argmax_f32_i32 = clCreateKernel(backend_ctx->program_argmax_f32_i32, "kernel_argmax_f32_i32", &err), err));
+        GGML_LOG_CONT(".");
+    }
+
+    // arange
+    {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src {
+            #include "arange.cl.h"
+        };
+#else
+        const std::string kernel_src = read_file("arange.cl");
+#endif
+        backend_ctx->program_arange_f32 =
+            build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
+
+        CL_CHECK((backend_ctx->kernel_arange_f32 = clCreateKernel(backend_ctx->program_arange_f32, "kernel_arange_f32", &err), err));
+        GGML_LOG_CONT(".");
+    }
+
+    // roll
+    {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src {
+            #include "roll.cl.h"
+        };
+#else
+        const std::string kernel_src = read_file("roll.cl");
+#endif
+        backend_ctx->program_roll_f32 =
+            build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
+
+        CL_CHECK((backend_ctx->kernel_roll_f32 = clCreateKernel(backend_ctx->program_roll_f32, "kernel_roll_f32", &err), err));
         GGML_LOG_CONT(".");
     }
 
@@ -4751,6 +4805,14 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
 
             return cols <= max_workgroup_size && op->src[0]->type == GGML_TYPE_F32;
         }
+        case GGML_OP_ARGMAX:
+            return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_I32 &&
+                   ggml_is_contiguous(op->src[0]);
+        case GGML_OP_ARANGE:
+            return op->type == GGML_TYPE_F32;
+        case GGML_OP_ROLL:
+            return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                   ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op);
         case GGML_OP_SUM_ROWS:
         case GGML_OP_CUMSUM:
             return op->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]);
@@ -15310,6 +15372,127 @@ static void ggml_cl_im2col(ggml_backend_t backend, const ggml_tensor * src0, con
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
 }
 
+static void ggml_cl_argmax(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    GGML_ASSERT(src0);
+    GGML_ASSERT(src0->extra);
+    GGML_ASSERT(dst);
+    GGML_ASSERT(dst->extra);
+    GGML_UNUSED(src1);
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT( dst->type == GGML_TYPE_I32);
+
+    ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
+
+    ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *) src0->extra;
+    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *) dst->extra;
+
+    cl_ulong offset0 = extra0->offset + src0->view_offs;
+    cl_ulong offsetd = extrad->offset + dst->view_offs;
+
+    const int    ne00  = (int)    src0->ne[0];
+    const int    nrows = (int)    ggml_nrows(src0);
+    const cl_ulong nb01 = (cl_ulong) src0->nb[1];
+
+    cl_kernel kernel = backend_ctx->kernel_argmax_f32_i32;
+    const size_t max_wg = backend_ctx->get_kernel_workgroup_size(kernel);
+
+    size_t lsize = 64;
+    while (lsize * 2 <= (size_t)ne00 && lsize * 2 <= max_wg) lsize *= 2;
+
+    CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),   &extra0->data_device));
+    CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_ulong), &offset0));
+    CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem),   &extrad->data_device));
+    CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_ulong), &offsetd));
+    CL_CHECK(clSetKernelArg(kernel, 4, sizeof(int),      &ne00));
+    CL_CHECK(clSetKernelArg(kernel, 5, sizeof(cl_ulong), &nb01));
+    CL_CHECK(clSetKernelArg(kernel, 6, lsize*sizeof(float), NULL));
+    CL_CHECK(clSetKernelArg(kernel, 7, lsize*sizeof(int),   NULL));
+
+    size_t global_work_size[] = {(size_t)nrows * lsize, 1, 1};
+    size_t local_work_size[]  = {lsize, 1, 1};
+
+    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+}
+
+static void ggml_cl_arange(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    GGML_UNUSED(src0);
+    GGML_UNUSED(src1);
+    GGML_ASSERT(dst);
+    GGML_ASSERT(dst->extra);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+
+    ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
+
+    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *) dst->extra;
+    cl_ulong offsetd = extrad->offset + dst->view_offs;
+
+    const float start = ggml_get_op_params_f32(dst, 0);
+    const float stop  = ggml_get_op_params_f32(dst, 1);
+    const float step  = ggml_get_op_params_f32(dst, 2);
+    const int   n     = (int) ceilf((stop - start) / step);
+
+    cl_kernel kernel = backend_ctx->kernel_arange_f32;
+
+    CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),   &extrad->data_device));
+    CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_ulong), &offsetd));
+    CL_CHECK(clSetKernelArg(kernel, 2, sizeof(int),      &n));
+    CL_CHECK(clSetKernelArg(kernel, 3, sizeof(float),    &start));
+    CL_CHECK(clSetKernelArg(kernel, 4, sizeof(float),    &step));
+
+    size_t local_work_size[]  = {64, 1, 1};
+    size_t global_work_size[] = {((size_t)n + 63) / 64 * 64, 1, 1};
+
+    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+}
+
+static void ggml_cl_roll(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    GGML_ASSERT(src0);
+    GGML_ASSERT(src0->extra);
+    GGML_ASSERT(dst);
+    GGML_ASSERT(dst->extra);
+    GGML_UNUSED(src1);
+
+    ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
+
+    ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *) src0->extra;
+    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *) dst->extra;
+
+    cl_ulong offset0 = extra0->offset + src0->view_offs;
+    cl_ulong offsetd = extrad->offset + dst->view_offs;
+
+    const int ne00 = (int) src0->ne[0];
+    const int ne01 = (int) src0->ne[1];
+    const int ne02 = (int) src0->ne[2];
+    const int ne03 = (int) src0->ne[3];
+
+    const int s0 = ggml_get_op_params_i32(dst, 0);
+    const int s1 = ggml_get_op_params_i32(dst, 1);
+    const int s2 = ggml_get_op_params_i32(dst, 2);
+    const int s3 = ggml_get_op_params_i32(dst, 3);
+
+    cl_kernel kernel = backend_ctx->kernel_roll_f32;
+
+    CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0->data_device));
+    CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_ulong), &offset0));
+    CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),   &extrad->data_device));
+    CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_ulong), &offsetd));
+    CL_CHECK(clSetKernelArg(kernel,  4, sizeof(int),      &ne00));
+    CL_CHECK(clSetKernelArg(kernel,  5, sizeof(int),      &ne01));
+    CL_CHECK(clSetKernelArg(kernel,  6, sizeof(int),      &ne02));
+    CL_CHECK(clSetKernelArg(kernel,  7, sizeof(int),      &ne03));
+    CL_CHECK(clSetKernelArg(kernel,  8, sizeof(int),      &s0));
+    CL_CHECK(clSetKernelArg(kernel,  9, sizeof(int),      &s1));
+    CL_CHECK(clSetKernelArg(kernel, 10, sizeof(int),      &s2));
+    CL_CHECK(clSetKernelArg(kernel, 11, sizeof(int),      &s3));
+
+    const size_t lsize = (ne00 < 64 ? (size_t)ne00 : 64);
+    size_t global_work_size[] = {(size_t)ne01 * lsize, (size_t)ne02, (size_t)ne03};
+    size_t local_work_size[]  = {lsize, 1, 1};
+
+    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+}
+
 static void ggml_cl_argsort(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_ASSERT(src0);
     GGML_ASSERT(src0->extra);
@@ -15963,6 +16146,24 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
                 return false;
             }
             func = ggml_cl_argsort;
+            break;
+        case GGML_OP_ARGMAX:
+            if (!any_on_device) {
+                return false;
+            }
+            func = ggml_cl_argmax;
+            break;
+        case GGML_OP_ARANGE:
+            if (!any_on_device) {
+                return false;
+            }
+            func = ggml_cl_arange;
+            break;
+        case GGML_OP_ROLL:
+            if (!any_on_device) {
+                return false;
+            }
+            func = ggml_cl_roll;
             break;
         case GGML_OP_SUM_ROWS:
             if (!any_on_device) {
