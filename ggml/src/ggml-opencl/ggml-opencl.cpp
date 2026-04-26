@@ -5136,8 +5136,18 @@ inline bool use_adreno_kernels(const ggml_backend_opencl_context *backend_ctx, c
         threshold_ne0 = 128;
         threshold_ne1 = 128;
     }
-    return tensor->ne[0] >= threshold_ne0 && tensor->ne[1] >= threshold_ne1 &&
+    bool ok = tensor->ne[0] >= threshold_ne0 && tensor->ne[1] >= threshold_ne1 &&
             tensor->ne[2] == 1 && tensor->ne[3] == 1;
+    // K-quant Adreno gemv/gemm kernels (kernel_gemv/gemm_noshuffle_q[456]_K_f32)
+    // pack 2 rows per work-item (gemv) and 4 rows per work-item (gemm) without
+    // bounds checks. Require ne[1] % 4 == 0 to avoid OOB writes. Granite-3.0 has
+    // odd vocab=49155 — output.weight Q6_K [1536, 49155] tripped this.
+    if (ok && (tensor->type == GGML_TYPE_Q4_K ||
+               tensor->type == GGML_TYPE_Q5_K ||
+               tensor->type == GGML_TYPE_Q6_K) && (tensor->ne[1] % 4 != 0)) {
+        ok = false;
+    }
+    return ok;
 }
 
 inline bool use_adreno_moe_kernels(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor) {
