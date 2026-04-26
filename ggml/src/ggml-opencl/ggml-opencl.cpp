@@ -4691,10 +4691,8 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
             int max_workgroup_size = backend_ctx->get_kernel_workgroup_size(kernel);
             const int d_state = op->src[0]->ne[0];
             const bool pow2 = (d_state & (d_state - 1)) == 0;
-            // d_state>=256 (e.g. Falcon-H1) hangs on Adreno X1-85 with this
-            // simple kernel; cap at 128 until a tuned wide-state kernel is added.
             return op->src[0]->type == GGML_TYPE_F32 && pow2 &&
-                   d_state <= 128 && d_state <= max_workgroup_size;
+                   d_state <= max_workgroup_size;
         }
         case GGML_OP_CONCAT:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
