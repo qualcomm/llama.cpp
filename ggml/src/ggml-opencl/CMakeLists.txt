@@ -101,6 +101,7 @@ set(GGML_OPENCL_KERNELS
     mul_mv_id_q4_0_f32_8x_flat
     mul_mv_id_q8_0_f32
     mul_mv_id_q8_0_f32_flat
+    mul_mv_id_q4_K_f32
     mul_mv_id_mxfp4_f32
     mul_mv_id_mxfp4_f32_flat
     gemm_moe_mxfp4_f32
