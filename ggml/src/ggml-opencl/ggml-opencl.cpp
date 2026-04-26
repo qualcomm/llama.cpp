@@ -6706,12 +6706,37 @@ static bool ggml_backend_opencl_buffer_type_supports_backend(ggml_backend_buffer
     UNUSED(buft);
 }
 
+static size_t ggml_backend_opencl_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buffer_type, const ggml_tensor * tensor) {
+    size_t size = ggml_nbytes(tensor);
+#ifdef GGML_OPENCL_SOA_Q
+    // SoA conversion in set_tensor splits the tensor into N sections aligned to
+    // mem_base_addr_align. Reserve (N-1) * alignment of slack so the last
+    // section's origin doesn't overrun the parent buffer when the tensor lands
+    // at the end (e.g. Granite output.weight Q6_K [1536, 49155]).
+    int n_sections = 0;
+    switch (tensor->type) {
+        case GGML_TYPE_Q4_0: n_sections = 2; break;
+        case GGML_TYPE_Q8_0: n_sections = 2; break;
+        case GGML_TYPE_MXFP4: n_sections = 2; break;
+        case GGML_TYPE_Q4_K: n_sections = 4; break;
+        case GGML_TYPE_Q5_K: n_sections = 5; break;
+        case GGML_TYPE_Q6_K: n_sections = 4; break;
+        default: break;
+    }
+    if (n_sections > 1) {
+        ggml_backend_opencl_context * backend_ctx = ggml_cl2_init(buffer_type->device);
+        size += (size_t)(n_sections - 1) * backend_ctx->alignment;
+    }
+#endif
+    return size;
+}
+
 static ggml_backend_buffer_type_i ggml_backend_opencl_buffer_type_interface = {
     /* .get_name         = */ ggml_backend_opencl_buffer_type_get_name,
     /* .alloc_buffer     = */ ggml_backend_opencl_buffer_type_alloc_buffer,
     /* .get_alignment    = */ ggml_backend_opencl_buffer_type_get_alignment,
     /* .get_max_size     = */ ggml_backend_opencl_buffer_type_get_max_size,
-    /* .get_alloc_size   = */ NULL,
+    /* .get_alloc_size   = */ ggml_backend_opencl_buffer_type_get_alloc_size,
     /* .is_host          = */ NULL,
 };
 
