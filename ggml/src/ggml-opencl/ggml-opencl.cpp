@@ -389,6 +389,7 @@ struct ggml_backend_opencl_context {
     ADRENO_GPU_GEN adreno_gen;
 
     cl_int alignment;
+    size_t global_mem_size;
     size_t max_alloc_size;
     size_t max_workgroup_size;
     bool fp16_support;
@@ -3384,6 +3385,9 @@ static ggml_backend_opencl_context * ggml_cl2_init(ggml_backend_dev_t dev) {
     GGML_ASSERT(base_align_in_bits % 8u == 0);
     backend_ctx->alignment = base_align_in_bits / 8u;
     GGML_LOG_INFO("ggml_opencl: mem base addr align: %u\n", backend_ctx->alignment);
+
+    clGetDeviceInfo(device, CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(size_t), &backend_ctx->global_mem_size, NULL);
+    GGML_LOG_INFO("ggml_opencl: global mem size: %zu MB\n", backend_ctx->global_mem_size/1024/1024);
 
     clGetDeviceInfo(device, CL_DEVICE_MAX_MEM_ALLOC_SIZE, sizeof(size_t), &backend_ctx->max_alloc_size, NULL);
     GGML_LOG_INFO("ggml_opencl: max mem alloc size: %zu MB\n", backend_ctx->max_alloc_size/1024/1024);
@@ -6547,11 +6551,10 @@ static const char * ggml_backend_opencl_device_get_description(ggml_backend_dev_
 }
 
 static void ggml_backend_opencl_device_get_memory(ggml_backend_dev_t dev, size_t * free, size_t * total) {
-    // no memory to report
-    *free  = 0;
-    *total = 0;
-
-    GGML_UNUSED(dev);
+    ggml_backend_opencl_device_context *dev_ctx = (ggml_backend_opencl_device_context *) dev->context;
+    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *) dev_ctx->backend_ctx;
+    *free  = backend_ctx->global_mem_size - 1.5*1024*1024*1024; // leave 1.5 GB
+    *total = backend_ctx->global_mem_size;
 }
 
 static enum ggml_backend_dev_type ggml_backend_opencl_device_get_type(ggml_backend_dev_t dev) {
