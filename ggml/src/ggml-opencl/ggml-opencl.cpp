@@ -13,6 +13,22 @@
 #include "ggml-backend-impl.h"
 #include "ggml.h"
 
+#ifdef GGML_OPENCL_USE_ADRENO_BIN_KERNELS
+#include "libdl.h"
+typedef const void * (*get_adreno_bin_kernel_func_t)(
+    const char * name,
+    const char * gpu_name,
+    const char * compiler_ver,
+    size_t     * out_size
+);
+
+#ifdef _WIN32
+#define KERNEL_LIB_NAME "adreno-opencl-kernels.dll"
+#else
+#define KERNEL_LIB_NAME "libadreno-opencl-kernels.so"
+#endif // _WIN32
+#endif // GGML_OPENCL_USE_ADRENO_BIN_KERNELS
+
 #include <CL/cl.h>
 
 #include <inttypes.h>
@@ -516,6 +532,8 @@ struct ggml_backend_opencl_context {
 
     bool adreno_has_large_buffer;
     bool adreno_use_large_buffer;
+    bool adreno_use_bin_kernels;
+    get_adreno_bin_kernel_func_t get_adreno_bin_kernel_func = nullptr;
     ggml_cl_compiler_version adreno_cl_compiler_version;
 
     std::string kernel_compile_opts;  // cached for lazy-compiled kernels.
@@ -934,6 +952,20 @@ struct ggml_backend_opencl_context {
 #endif
     }
 
+    const void * get_adreno_bin_kernel(const std::string &kernel_name, size_t *bin_size) const {
+        if (!get_adreno_bin_kernel_func) {
+            return nullptr;
+        }
+
+        size_t sz;
+        const void * kernel_bin = get_adreno_bin_kernel_func(
+            kernel_name.c_str(), device_name.c_str(), driver_version.c_str(), &sz);
+        if (bin_size) {
+            *bin_size = sz;
+        }
+        return kernel_bin;
+    }
+
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
     // Transpose kernels
     cl_program program_transpose;
@@ -1075,6 +1107,17 @@ static cl_program build_program_from_source_ex(cl_context ctx, cl_device_id dev,
 
 static cl_program build_program_from_source(cl_context ctx, cl_device_id dev, const char* program_buffer, const std::string &compile_opts, size_t bin_size = 0) {
     return build_program_from_source_ex(ctx, dev, program_buffer, compile_opts, /*fatal=*/true, /*tag=*/nullptr, bin_size);
+}
+
+static bool use_adreno_bin_kernels(ggml_backend_opencl_context * backend_ctx) {
+#ifndef GGML_OPENCL_USE_ADRENO_BIN_KERNELS
+    return false;
+#else
+    if (backend_ctx->gpu_family != GPU_FAMILY::ADRENO) {
+        return false;
+    }
+    return backend_ctx->adreno_use_bin_kernels;
+#endif // GGML_OPENCL_USE_ADRENO_BIN_KERNELS
 }
 
 static void load_cl_kernels_argsort(ggml_backend_opencl_context *backend_ctx) {
@@ -5156,6 +5199,27 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
     // determine whether to use large buffer for Adreno
     backend_ctx->adreno_use_large_buffer = getenv("GGML_OPENCL_ADRENO_USE_LARGE_BUFFER") != nullptr &&
                                            backend_ctx->gpu_family == GPU_FAMILY::ADRENO;
+
+#ifdef GGML_OPENCL_USE_ADRENO_BIN_KERNELS
+    // try loading adreno binary kernels if enabled
+    // if fails to load, builtin kernels will be used
+    {
+        dl_handle * kernel_lib_handle = dl_load_library(KERNEL_LIB_NAME);
+        backend_ctx->adreno_use_bin_kernels = false;
+
+        if (kernel_lib_handle) {
+            backend_ctx->get_adreno_bin_kernel_func = (get_adreno_bin_kernel_func_t)dl_get_sym(kernel_lib_handle, "get_adreno_kernels");
+            if (backend_ctx->get_adreno_bin_kernel_func) {
+                GGML_LOG_INFO("ggml_opencl: using binary kernels from %s\n", KERNEL_LIB_NAME);
+                backend_ctx->adreno_use_bin_kernels = true;
+            } else {
+                GGML_LOG_INFO("ggml_opencl: bin kernel library %s is invalid, will use builtin kernels\n", KERNEL_LIB_NAME);
+            }
+        } else {
+            GGML_LOG_INFO("ggml_opencl: failed to load %s, will use builtin kernels\n", KERNEL_LIB_NAME);
+        }
+    }
+#endif // GGML_OPENCL_USE_ADRENO_BIN_KERNELS
 
     cl_int err;
 
