@@ -3272,26 +3272,68 @@ struct ggml_opencl_fa_dim_table {
     const ggml_opencl_fa_dim * end()   const { return data + count; }
 };
 
+// Mutable buffer the active table is copied into before lazy compile, so
+// GGML_OPENCL_FA_TUNE can patch entries without touching the const tables.
+// Capacity = max of all source tables; bump if a larger table is added.
+static ggml_opencl_fa_dim g_fa_dims_runtime[16];
+
 static ggml_opencl_fa_dim_table g_opencl_fa_dims = {
     g_fa_dims_adreno_default,
     sizeof(g_fa_dims_adreno_default) / sizeof(g_fa_dims_adreno_default[0]),
 };
 
+// GGML_OPENCL_FA_TUNE=dk:dv:bm:bn:nsplit:thr[,…] — patches matching entries
+// in the active table at backend init, before the first FA kernel compiles.
+// Unmatched (dk,dv) pairs are warned and ignored.
+static void ggml_opencl_fa_apply_env_overrides() {
+    const char * e = std::getenv("GGML_OPENCL_FA_TUNE");
+    if (!e || !e[0]) return;
+    std::string s = e;
+    size_t pos = 0;
+    while (pos < s.size()) {
+        size_t comma = s.find(',', pos);
+        std::string entry = s.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+        int dk, dv, bm, bn, nsplit, thr;
+        if (std::sscanf(entry.c_str(), "%d:%d:%d:%d:%d:%d", &dk, &dv, &bm, &bn, &nsplit, &thr) == 6) {
+            bool patched = false;
+            for (size_t i = 0; i < g_opencl_fa_dims.count; ++i) {
+                ggml_opencl_fa_dim & d = g_fa_dims_runtime[i];
+                if (d.dk == dk && d.dv == dv) {
+                    d.bm = bm; d.bn = bn; d.n_split = nsplit; d.nkv_split_threshold = thr;
+                    GGML_LOG_INFO("ggml_opencl: FA tune override DK=%d DV=%d -> bm=%d bn=%d n_split=%d thr=%d\n",
+                                  dk, dv, bm, bn, nsplit, thr);
+                    patched = true;
+                    break;
+                }
+            }
+            if (!patched) {
+                GGML_LOG_WARN("ggml_opencl: FA tune override DK=%d DV=%d ignored (no matching dim)\n", dk, dv);
+            }
+        } else {
+            GGML_LOG_WARN("ggml_opencl: FA tune override entry malformed: '%s'\n", entry.c_str());
+        }
+        if (comma == std::string::npos) break;
+        pos = comma + 1;
+    }
+}
+
 static void ggml_cl_select_fa_dims_table(ADRENO_GPU_GEN gen) {
+    const ggml_opencl_fa_dim * src;
+    size_t                     count;
     switch (gen) {
         case ADRENO_GPU_GEN::X2E:
-            g_opencl_fa_dims = {
-                g_fa_dims_adreno_x2,
-                sizeof(g_fa_dims_adreno_x2) / sizeof(g_fa_dims_adreno_x2[0]),
-            };
+            src   = g_fa_dims_adreno_x2;
+            count = sizeof(g_fa_dims_adreno_x2) / sizeof(g_fa_dims_adreno_x2[0]);
             break;
         default:
-            g_opencl_fa_dims = {
-                g_fa_dims_adreno_default,
-                sizeof(g_fa_dims_adreno_default) / sizeof(g_fa_dims_adreno_default[0]),
-            };
+            src   = g_fa_dims_adreno_default;
+            count = sizeof(g_fa_dims_adreno_default) / sizeof(g_fa_dims_adreno_default[0]);
             break;
     }
+    GGML_ASSERT(count <= sizeof(g_fa_dims_runtime) / sizeof(g_fa_dims_runtime[0]));
+    for (size_t i = 0; i < count; ++i) g_fa_dims_runtime[i] = src[i];
+    g_opencl_fa_dims = { g_fa_dims_runtime, count };
+    ggml_opencl_fa_apply_env_overrides();
 }
 
 // Lazy FA compile: one (dk, dv) pair per first-dispatch. Matches the Q4_K
