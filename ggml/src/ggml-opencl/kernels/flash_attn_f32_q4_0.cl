@@ -250,48 +250,14 @@ __kernel void flash_attn_f32_q4_0_q1(
         sinks_ptr = (const global ACC_TYPE*)((const global char*)sinks_void + sinks_offset);
     }
 
-    // Pass 1: max score.
+    // One-pass online softmax (FA-2): single sweep over kv positions,
+    // updating per-thread (m_i, l_i, o_acc) per K. Eliminates the second
+    // K read of the original two-pass implementation.
     ACC_TYPE m_i = (sinks_ptr != NULL) ? sinks_ptr[head_idx] : -INFINITY;
-    for (int k_idx = tid; k_idx < n_kv; k_idx += Q1_WG_SIZE) {
-        const global char* k_row = k_base + batch_idx * k_nb3 + head_kv_idx * k_nb2 + k_idx * k_nb1;
-
-        ACC_TYPE score = 0.0f;
-        #pragma unroll
-        for (int b = 0; b < DK_Q4_BLOCKS; b++) {
-#ifdef FA_HAVE_INT_DOT
-            score += dot_q4_0_int(k_row + b * Q4_0_BLOCK_SIZE,
-                                   &q_packed[b * 8], q_d_scale[b], q_sum_arr[b]);
-#else
-            score += dot_q4_0_f32(k_row + b * Q4_0_BLOCK_SIZE, &q_priv[b * 8]);
-#endif
-        }
-        score *= scale;
-
-        if (mask_base != NULL) {
-            const global MASK_DATA_TYPE* mask_ptr = (const global MASK_DATA_TYPE*)(mask_base);
-            score += slope * (ACC_TYPE)mask_ptr[k_idx];
-        }
-        if (logit_softcap > 0.0f) {
-            score = logit_softcap * tanh(score / logit_softcap);
-        }
-        m_i = max(m_i, score);
-    }
-
-    __local ACC_TYPE local_m[Q1_WG_SIZE];
-    local_m[tid] = m_i;
-    barrier(CLK_LOCAL_MEM_FENCE);
-    #pragma unroll
-    for (int s = Q1_WG_SIZE / 2; s > 0; s >>= 1) {
-        if (tid < s) local_m[tid] = max(local_m[tid], local_m[tid + s]);
-        barrier(CLK_LOCAL_MEM_FENCE);
-    }
-    const ACC_TYPE m_final = local_m[0];
-
-    // Pass 2: softmax-weighted V accumulation.
+    ACC_TYPE l_i = 0.0f;
     ACC_TYPE4 o_acc[DV_VEC];
     #pragma unroll
     for (int i = 0; i < DV_VEC; ++i) o_acc[i] = (ACC_TYPE4)(0.0f);
-    ACC_TYPE l_i = 0.0f;
 
     for (int k_idx = tid; k_idx < n_kv; k_idx += Q1_WG_SIZE) {
         const global char* k_row = k_base + batch_idx * k_nb3 + head_kv_idx * k_nb2 + k_idx * k_nb1;
@@ -317,8 +283,14 @@ __kernel void flash_attn_f32_q4_0_q1(
             score = logit_softcap * tanh(score / logit_softcap);
         }
 
-        const ACC_TYPE p = exp(score - m_final);
-        l_i += p;
+        // Online softmax step.
+        const ACC_TYPE m_new = max(m_i, score);
+        const ACC_TYPE alpha = exp(m_i  - m_new);
+        const ACC_TYPE p     = exp(score - m_new);
+
+        l_i = alpha * l_i + p;
+        #pragma unroll
+        for (int i = 0; i < DV_VEC; ++i) o_acc[i] *= alpha;
 
         #pragma unroll
         for (int b = 0; b < DV_Q4_BLOCKS; b++) {
@@ -329,7 +301,26 @@ __kernel void flash_attn_f32_q4_0_q1(
                 o_acc[b * 8 + i] = mad(p, v_dequant[i], o_acc[b * 8 + i]);
             }
         }
+
+        m_i = m_new;
     }
+
+    // Cross-thread reduce: max(m_i) -> m_final, rescale per-thread l_i and
+    // o_acc by alpha = exp(m_i_thread - m_final) before sum-reduce.
+    __local ACC_TYPE local_m[Q1_WG_SIZE];
+    local_m[tid] = m_i;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    #pragma unroll
+    for (int s = Q1_WG_SIZE / 2; s > 0; s >>= 1) {
+        if (tid < s) local_m[tid] = max(local_m[tid], local_m[tid + s]);
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    const ACC_TYPE m_final = local_m[0];
+
+    const ACC_TYPE alpha_final = exp(m_i - m_final);
+    l_i *= alpha_final;
+    #pragma unroll
+    for (int i = 0; i < DV_VEC; ++i) o_acc[i] *= alpha_final;
 
     __local ACC_TYPE local_l[Q1_WG_SIZE];
     __local ACC_TYPE4 local_o_comp[Q1_WG_SIZE];
@@ -463,46 +454,12 @@ __kernel void flash_attn_f32_q4_0_q1_split(
 
     const float slope = get_alibi_slope(max_bias, head_idx, n_head_log2, m0, m1);
 
-    // Pass 1a — split-local max (no sink).
+    // One-pass online softmax (FA-2): single sweep over the split's K range.
     ACC_TYPE m_i = -INFINITY;
-    for (int k_idx = kv_start + tid; k_idx < kv_end; k_idx += Q1_WG_SIZE) {
-        const global char * k_row = k_base + batch_idx * k_nb3 + head_kv_idx * k_nb2 + k_idx * k_nb1;
-        ACC_TYPE score = 0.0f;
-        #pragma unroll
-        for (int b = 0; b < DK_Q4_BLOCKS; ++b) {
-#ifdef FA_HAVE_INT_DOT
-            score += dot_q4_0_int(k_row + b * Q4_0_BLOCK_SIZE,
-                                   &q_packed[b * 8], q_d_scale[b], q_sum_arr[b]);
-#else
-            score += dot_q4_0_f32(k_row + b * Q4_0_BLOCK_SIZE, &q_priv[b * 8]);
-#endif
-        }
-        score *= scale;
-        if (mask_base != NULL) {
-            const global MASK_DATA_TYPE * mask_ptr = (const global MASK_DATA_TYPE *) (mask_base);
-            score += slope * (ACC_TYPE) mask_ptr[k_idx];
-        }
-        if (logit_softcap > 0.0f) {
-            score = logit_softcap * tanh(score / logit_softcap);
-        }
-        m_i = max(m_i, score);
-    }
-
-    __local ACC_TYPE local_m[Q1_WG_SIZE];
-    local_m[tid] = m_i;
-    barrier(CLK_LOCAL_MEM_FENCE);
-    #pragma unroll
-    for (int s = Q1_WG_SIZE / 2; s > 0; s >>= 1) {
-        if (tid < s) local_m[tid] = max(local_m[tid], local_m[tid + s]);
-        barrier(CLK_LOCAL_MEM_FENCE);
-    }
-    const ACC_TYPE m_c = local_m[0];
-
-    // Pass 1b — softmax-weighted V accumulate.
+    ACC_TYPE l_i = 0.0f;
     ACC_TYPE4 o_acc[DV_VEC];
     #pragma unroll
     for (int i = 0; i < DV_VEC; ++i) o_acc[i] = (ACC_TYPE4)(0.0f);
-    ACC_TYPE l_i = 0.0f;
 
     for (int k_idx = kv_start + tid; k_idx < kv_end; k_idx += Q1_WG_SIZE) {
         const global char * k_row = k_base + batch_idx * k_nb3 + head_kv_idx * k_nb2 + k_idx * k_nb1;
@@ -525,8 +482,16 @@ __kernel void flash_attn_f32_q4_0_q1_split(
         if (logit_softcap > 0.0f) {
             score = logit_softcap * tanh(score / logit_softcap);
         }
-        const ACC_TYPE p = exp(score - m_c);
-        l_i += p;
+
+        // Online softmax step.
+        const ACC_TYPE m_new = max(m_i, score);
+        const ACC_TYPE alpha = exp(m_i  - m_new);
+        const ACC_TYPE p     = exp(score - m_new);
+
+        l_i = alpha * l_i + p;
+        #pragma unroll
+        for (int i = 0; i < DV_VEC; ++i) o_acc[i] *= alpha;
+
         #pragma unroll
         for (int b = 0; b < DV_Q4_BLOCKS; ++b) {
             ACC_TYPE4 v_dequant[8];
@@ -536,7 +501,26 @@ __kernel void flash_attn_f32_q4_0_q1_split(
                 o_acc[b * 8 + i] = mad(p, v_dequant[i], o_acc[b * 8 + i]);
             }
         }
+
+        m_i = m_new;
     }
+
+    // Cross-thread reduce: max(m_i) -> m_c, rescale per-thread l_i and o_acc
+    // by alpha = exp(m_i_thread - m_c) before sum-reduce.
+    __local ACC_TYPE local_m[Q1_WG_SIZE];
+    local_m[tid] = m_i;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    #pragma unroll
+    for (int s = Q1_WG_SIZE / 2; s > 0; s >>= 1) {
+        if (tid < s) local_m[tid] = max(local_m[tid], local_m[tid + s]);
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    const ACC_TYPE m_c = local_m[0];
+
+    const ACC_TYPE alpha_final = exp(m_i - m_c);
+    l_i *= alpha_final;
+    #pragma unroll
+    for (int i = 0; i < DV_VEC; ++i) o_acc[i] *= alpha_final;
 
     __local ACC_TYPE  local_l[Q1_WG_SIZE];
     __local ACC_TYPE4 local_o[Q1_WG_SIZE];
