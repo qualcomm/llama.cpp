@@ -95,7 +95,8 @@ enum ADRENO_GPU_GEN {
     ADRENO_UNKNOWN,
     A7X,
     A8X,
-    X1E,
+    X1,
+    X2,
 };
 
 enum ADRENO_CL_COMPILER_TYPE {
@@ -233,7 +234,11 @@ static ADRENO_GPU_GEN get_adreno_gpu_gen(const char *device_name) {
     }
 
     if (strstr(device_name, "X1")) {
-        return ADRENO_GPU_GEN::X1E;
+        return ADRENO_GPU_GEN::X1;
+    }
+
+    if (strstr(device_name, "X2")) {
+        return ADRENO_GPU_GEN::X2;
     }
 
     return ADRENO_GPU_GEN::ADRENO_UNKNOWN;
