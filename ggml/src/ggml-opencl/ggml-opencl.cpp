@@ -769,6 +769,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_conv_2d_f16_f32;
     cl_kernel kernel_ssm_conv_f32_f32, kernel_ssm_conv_f32_f32_4;
     cl_kernel kernel_gated_delta_net_f32;
+    cl_kernel kernel_gated_delta_net_f32_sv128 = nullptr;
     cl_kernel kernel_timestep_embedding;
     cl_kernel kernel_gemv_moe_q4_0_f32_ns, kernel_gemm_moe_q4_0_f32_ns;
     cl_kernel kernel_gemv_moe_q4_1_f32_ns, kernel_gemm_moe_q4_1_f32_ns;
@@ -2749,6 +2750,16 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
 
         CL_CHECK((backend_ctx->kernel_gated_delta_net_f32 = clCreateKernel(prog, "kernel_gated_delta_net_f32", &err), err));
+        // Specialized SV=128 (Qwen3-Next / Qwen3.6-A3B): cluster-of-32 reduction
+        // per column, 128-lane workgroup. Created best-effort — may be absent if
+        // the device lacks cl_*_subgroup_shuffle. ggml_cl_gated_delta_net falls
+        // back to the generic kernel when this handle is NULL.
+        cl_int err_sv128 = CL_SUCCESS;
+        backend_ctx->kernel_gated_delta_net_f32_sv128 =
+            clCreateKernel(prog, "kernel_gated_delta_net_f32_sv128", &err_sv128);
+        if (err_sv128 != CL_SUCCESS) {
+            backend_ctx->kernel_gated_delta_net_f32_sv128 = nullptr;
+        }
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
@@ -5910,6 +5921,9 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
             // f32 only; autoregressive (n_tokens == 1) only — prefill keeps the
             // chunked path. (cparams.fused_gdn_ch then auto-disables on the
             // chunked-graph reservation; fused_gdn_ar stays enabled.)
+            // GGML_OPENCL_DISABLE_GDN=1 forces CPU fallback for A/B benching.
+            static const bool gdn_disabled = getenv("GGML_OPENCL_DISABLE_GDN") != nullptr;
+            if (gdn_disabled) return false;
             const ggml_tensor * v = op->src[2];
             for (int i = 0; i < 6; ++i) {
                 if (op->src[i]->type != GGML_TYPE_F32) return false;
@@ -10508,7 +10522,11 @@ static void ggml_cl_gated_delta_net(ggml_backend_t backend, const ggml_tensor * 
     cl_ulong nbk1 = k->nb[1], nbk3 = k->nb[3];
     cl_ulong nbv1 = v->nb[1], nbv3 = v->nb[3];
 
-    cl_kernel kernel = backend_ctx->kernel_gated_delta_net_f32;
+    const bool use_sv128 = (s_v == 128) && (backend_ctx->kernel_gated_delta_net_f32_sv128 != nullptr);
+
+    cl_kernel kernel = use_sv128
+        ? backend_ctx->kernel_gated_delta_net_f32_sv128
+        : backend_ctx->kernel_gated_delta_net_f32;
 
     int i = 0;
     CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_mem),   &eq->data_device));
@@ -10531,7 +10549,10 @@ static void ggml_cl_gated_delta_net(ggml_backend_t backend, const ggml_tensor * 
     CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbk3));
     CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbv1));
     CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbv3));
-    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(int),      &s_v));
+    if (!use_sv128) {
+        // generic kernel takes s_v as the next int arg
+        CL_CHECK(clSetKernelArg(kernel, i++, sizeof(int),  &s_v));
+    }
     CL_CHECK(clSetKernelArg(kernel, i++, sizeof(int),      &neq1));
     CL_CHECK(clSetKernelArg(kernel, i++, sizeof(int),      &nek1));
     CL_CHECK(clSetKernelArg(kernel, i++, sizeof(int),      &neq3));
@@ -10541,9 +10562,18 @@ static void ggml_cl_gated_delta_net(ggml_backend_t backend, const ggml_tensor * 
     CL_CHECK(clSetKernelArg(kernel, i++, sizeof(int),      &kda));
     CL_CHECK(clSetKernelArg(kernel, i++, sizeof(int),      &neg0));
 
-    // one thread per (column j, head, seq); driver picks the workgroup size
-    size_t global_work_size[] = { (size_t)s_v * H * n_seqs, 1, 1 };
-    backend_ctx->enqueue_ndrange_kernel(kernel, 1, global_work_size, NULL, dst);
+    if (use_sv128) {
+        // 128-thread workgroup = 1 full subgroup; cluster of 32 lanes per col;
+        // 4 cols per workgroup; grid = (H, n_seqs, s_v / 4).
+        const int cols_per_wg = 4;
+        size_t global_work_size[] = { (size_t)H * 128, (size_t)n_seqs, (size_t)(s_v / cols_per_wg) };
+        size_t local_work_size[]  = { 128, 1, 1 };
+        backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+    } else {
+        // one thread per (column j, head, seq); driver picks the workgroup size
+        size_t global_work_size[] = { (size_t)s_v * H * n_seqs, 1, 1 };
+        backend_ctx->enqueue_ndrange_kernel(kernel, 1, global_work_size, NULL, dst);
+    }
 }
 
 static void ggml_cl_gelu(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
