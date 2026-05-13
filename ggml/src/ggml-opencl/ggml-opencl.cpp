@@ -768,6 +768,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_conv_2d_f32;
     cl_kernel kernel_conv_2d_f16_f32;
     cl_kernel kernel_ssm_conv_f32_f32, kernel_ssm_conv_f32_f32_4;
+    cl_kernel kernel_gated_delta_net_f32;
     cl_kernel kernel_timestep_embedding;
     cl_kernel kernel_gemv_moe_q4_0_f32_ns, kernel_gemm_moe_q4_0_f32_ns;
     cl_kernel kernel_gemv_moe_q4_1_f32_ns, kernel_gemm_moe_q4_1_f32_ns;
@@ -2731,6 +2732,23 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 
         CL_CHECK((backend_ctx->kernel_ssm_conv_f32_f32   = clCreateKernel(prog, "kernel_ssm_conv_f32_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_ssm_conv_f32_f32_4 = clCreateKernel(prog, "kernel_ssm_conv_f32_f32_4", &err), err));
+        CL_CHECK(clReleaseProgram(prog));
+        GGML_LOG_CONT(".");
+    }
+
+    // gated_delta_net
+    {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src {
+            #include "gated_delta_net.cl.h"
+        };
+#else
+        const std::string kernel_src = read_file("gated_delta_net.cl");
+#endif
+        cl_program prog =
+            build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+
+        CL_CHECK((backend_ctx->kernel_gated_delta_net_f32 = clCreateKernel(prog, "kernel_gated_delta_net_f32", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
@@ -5888,6 +5906,16 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                    (op->src[0]->type == GGML_TYPE_F16 && op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32);
         case GGML_OP_SSM_CONV:
             return (op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32);
+        case GGML_OP_GATED_DELTA_NET: {
+            // f32 only; autoregressive (n_tokens == 1) only — prefill keeps the
+            // chunked path. (cparams.fused_gdn_ch then auto-disables on the
+            // chunked-graph reservation; fused_gdn_ar stays enabled.)
+            const ggml_tensor * v = op->src[2];
+            for (int i = 0; i < 6; ++i) {
+                if (op->src[i]->type != GGML_TYPE_F32) return false;
+            }
+            return op->type == GGML_TYPE_F32 && v->ne[2] == 1 && v->ne[0] >= 1;
+        }
         case GGML_OP_CONCAT:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
         case GGML_OP_TIMESTEP_EMBEDDING:
@@ -10436,6 +10464,86 @@ static void ggml_cl_ssm_conv(ggml_backend_t backend, const ggml_tensor * src0, c
     }
 
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size_ptr, dst);
+}
+
+static void ggml_cl_gated_delta_net(ggml_backend_t backend, const ggml_tensor * q, const ggml_tensor * k, ggml_tensor * dst) {
+    const ggml_tensor * v     = dst->src[2];
+    const ggml_tensor * g     = dst->src[3];
+    const ggml_tensor * beta  = dst->src[4];
+    const ggml_tensor * state = dst->src[5];
+
+    GGML_ASSERT(q && k && v && g && beta && state && dst);
+    GGML_ASSERT(q->extra && k->extra && v->extra && g->extra && beta->extra && state->extra && dst->extra);
+    GGML_ASSERT(v->ne[2] == 1); // autoregressive only (see ggml_backend_opencl_device_supports_op)
+
+    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *)backend->context;
+
+    ggml_tensor_extra_cl * eq = (ggml_tensor_extra_cl *)q->extra;
+    ggml_tensor_extra_cl * ek = (ggml_tensor_extra_cl *)k->extra;
+    ggml_tensor_extra_cl * ev = (ggml_tensor_extra_cl *)v->extra;
+    ggml_tensor_extra_cl * eg = (ggml_tensor_extra_cl *)g->extra;
+    ggml_tensor_extra_cl * eb = (ggml_tensor_extra_cl *)beta->extra;
+    ggml_tensor_extra_cl * es = (ggml_tensor_extra_cl *)state->extra;
+    ggml_tensor_extra_cl * ed = (ggml_tensor_extra_cl *)dst->extra;
+
+    cl_ulong q_off = eq->offset + q->view_offs;
+    cl_ulong k_off = ek->offset + k->view_offs;
+    cl_ulong v_off = ev->offset + v->view_offs;
+    cl_ulong g_off = eg->offset + g->view_offs;
+    cl_ulong b_off = eb->offset + beta->view_offs;
+    cl_ulong s_off = es->offset + state->view_offs;
+    cl_ulong d_off = ed->offset + dst->view_offs;
+
+    const int s_v    = (int)v->ne[0];
+    const int H      = (int)v->ne[1];
+    const int n_seqs = (int)v->ne[3];
+    const int neq1   = (int)q->ne[1];
+    const int nek1   = (int)k->ne[1];
+    const int neq3   = (int)q->ne[3];
+    const int nek3   = (int)k->ne[3];
+    const int neg0   = (int)g->ne[0];
+    const int kda    = (neg0 == s_v) ? 1 : 0;
+
+    cl_ulong nbq1 = q->nb[1], nbq3 = q->nb[3];
+    cl_ulong nbk1 = k->nb[1], nbk3 = k->nb[3];
+    cl_ulong nbv1 = v->nb[1], nbv3 = v->nb[3];
+
+    cl_kernel kernel = backend_ctx->kernel_gated_delta_net_f32;
+
+    int i = 0;
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_mem),   &eq->data_device));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &q_off));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_mem),   &ek->data_device));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &k_off));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_mem),   &ev->data_device));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &v_off));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_mem),   &eg->data_device));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &g_off));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_mem),   &eb->data_device));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &b_off));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_mem),   &es->data_device));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &s_off));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_mem),   &ed->data_device));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &d_off));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbq1));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbq3));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbk1));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbk3));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbv1));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbv3));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(int),      &s_v));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(int),      &neq1));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(int),      &nek1));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(int),      &neq3));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(int),      &nek3));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(int),      &H));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(int),      &n_seqs));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(int),      &kda));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(int),      &neg0));
+
+    // one thread per (column j, head, seq); driver picks the workgroup size
+    size_t global_work_size[] = { (size_t)s_v * H * n_seqs, 1, 1 };
+    backend_ctx->enqueue_ndrange_kernel(kernel, 1, global_work_size, NULL, dst);
 }
 
 static void ggml_cl_gelu(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
@@ -20334,6 +20442,12 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
             }
             func = ggml_cl_ssm_conv;
             break;
+        case GGML_OP_GATED_DELTA_NET:
+            if (!any_on_device) {
+                return false;
+            }
+            ggml_cl_gated_delta_net(backend, tensor->src[0], tensor->src[1], tensor);
+            return true;
         case GGML_OP_CONCAT:
             if (!any_on_device) {
                 return false;
