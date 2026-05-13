@@ -43,13 +43,16 @@ kernel void kernel_gated_delta_net_f32(
     global char * b_base,    ulong b_off,
     global char * s_base,    ulong s_off,
     global char * dst_base,  ulong dst_off,
-    ulong nbq1, ulong nbq3,
-    ulong nbk1, ulong nbk3,
-    ulong nbv1, ulong nbv3,
+    ulong nbq1, ulong nbq2, ulong nbq3,
+    ulong nbk1, ulong nbk2, ulong nbk3,
+    ulong nbv1, ulong nbv2, ulong nbv3,
+    ulong nbb1, ulong nbb2, ulong nbb3,
+    ulong nbg1, ulong nbg2, ulong nbg3,
     int s_v,
     int neq1, int nek1,
     int neq3, int nek3,
     int H,
+    int n_tokens,
     int n_seqs,
     int kda,
     int neg0
@@ -78,40 +81,58 @@ kernel void kernel_gated_delta_net_f32(
     s_base   += s_off;
     dst_base += dst_off;
 
-    const ulong attn_elems = (ulong)s_v * H * n_seqs;
-    global float * attn_out  = (global float *)dst_base;
-    global float * state_out = (global float *)dst_base + attn_elems;
+    const ulong attn_elems = (ulong)s_v * H * (ulong)n_tokens * n_seqs;
+    global float * attn_out_base  = (global float *)dst_base;
+    global float * state_out_base = (global float *)dst_base + attn_elems;
 
     global const float * s_in  = (global const float *)s_base + ((ulong)iv3 * H + iv1) * s_v * s_v + (ulong)j * s_v;
-    global       float * s_out = state_out                    + ((ulong)iv3 * H + iv1) * s_v * s_v + (ulong)j * s_v;
+    global       float * s_out = state_out_base               + ((ulong)iv3 * H + iv1) * s_v * s_v + (ulong)j * s_v;
 
-    global const float * q_d = (global const float *)(q_base + (ulong)iq3*nbq3 + (ulong)iq1*nbq1);
-    global const float * k_d = (global const float *)(k_base + (ulong)ik3*nbk3 + (ulong)ik1*nbk1);
-    global const float * v_d = (global const float *)(v_base + (ulong)iv3*nbv3 + (ulong)iv1*nbv1);
-    const ulong hb = ((ulong)iv3*H + iv1);
-    const float beta = ((global const float *)b_base)[hb];
-    global const float * g_d = (global const float *)g_base + hb * (ulong)neg0;
+    // For n_tokens == 1, the state column is copied/updated in-place in global
+    // (preserves the original kernel's behavior). For n_tokens > 1, we keep
+    // s_out in global throughout but the columns are touched once per token.
+    // The naive kernel is slow for prefill; the sv128 specialization is the
+    // fast path for the only s_v we ship today (Qwen3-Next family).
+    // Initialize new state by copying input state into output state buffer.
+    for (int i = 0; i < s_v; ++i) s_out[i] = s_in[i];
 
-    if (kda) {
-        for (int i = 0; i < s_v; ++i) s_out[i] = s_in[i] * exp(g_d[i]);
-    } else {
-        const float gd = exp(g_d[0]);
-        for (int i = 0; i < s_v; ++i) s_out[i] = s_in[i] * gd;
+    global char * q_hd = q_base + (ulong)iq3*nbq3 + (ulong)iq1*nbq1;
+    global char * k_hd = k_base + (ulong)ik3*nbk3 + (ulong)ik1*nbk1;
+    global char * v_hd = v_base + (ulong)iv3*nbv3 + (ulong)iv1*nbv1;
+    global char * b_hd = b_base + (ulong)iv3 * nbb3 + (ulong)iv1 * nbb1;
+    global char * g_hd = g_base + (ulong)iv3 * nbg3 + (ulong)iv1 * nbg1;
+
+    global float * attn_data = attn_out_base + ((ulong)iv3 * (ulong)n_tokens * H + iv1) * s_v;
+
+    for (int t = 0; t < n_tokens; t++) {
+        global const float * q_d = (global const float *)(q_hd + (ulong)t * nbq2);
+        global const float * k_d = (global const float *)(k_hd + (ulong)t * nbk2);
+        global const float * v_d = (global const float *)(v_hd + (ulong)t * nbv2);
+        const float beta         = *(global const float *)(b_hd + (ulong)t * nbb2);
+        global const float * g_d = (global const float *)(g_hd + (ulong)t * nbg2);
+
+        if (kda) {
+            for (int i = 0; i < s_v; ++i) s_out[i] *= exp(g_d[i]);
+        } else {
+            const float gd = exp(g_d[0]);
+            for (int i = 0; i < s_v; ++i) s_out[i] *= gd;
+        }
+
+        float kv = 0.0f;
+        for (int i = 0; i < s_v; ++i) kv = mad(s_out[i], k_d[i], kv);
+
+        const float delta = (v_d[j] - kv) * beta;
+
+        float o = 0.0f;
+        for (int i = 0; i < s_v; ++i) {
+            const float sij = mad(k_d[i], delta, s_out[i]);
+            s_out[i] = sij;
+            o = mad(sij, q_d[i], o);
+        }
+
+        attn_data[j] = o * scale;
+        attn_data += (ulong)s_v * H;
     }
-
-    float kv = 0.0f;
-    for (int i = 0; i < s_v; ++i) kv = mad(s_out[i], k_d[i], kv);
-
-    const float delta = (v_d[j] - kv) * beta;
-
-    float o = 0.0f;
-    for (int i = 0; i < s_v; ++i) {
-        const float sij = mad(k_d[i], delta, s_out[i]);
-        s_out[i] = sij;
-        o = mad(sij, q_d[i], o);
-    }
-
-    attn_out[((ulong)iv3*H + iv1) * s_v + j] = o * scale;
 }
 
 // ============================================================================
@@ -156,12 +177,15 @@ kernel void kernel_gated_delta_net_f32_sv128(
     global char * b_base,    ulong b_off,
     global char * s_base,    ulong s_off,
     global char * dst_base,  ulong dst_off,
-    ulong nbq1, ulong nbq3,
-    ulong nbk1, ulong nbk3,
-    ulong nbv1, ulong nbv3,
+    ulong nbq1, ulong nbq2, ulong nbq3,
+    ulong nbk1, ulong nbk2, ulong nbk3,
+    ulong nbv1, ulong nbv2, ulong nbv3,
+    ulong nbb1, ulong nbb2, ulong nbb3,
+    ulong nbg1, ulong nbg2, ulong nbg3,
     int neq1, int nek1,
     int neq3, int nek3,
     int H,
+    int n_tokens,
     int n_seqs,
     int kda,
     int neg0
@@ -192,82 +216,92 @@ kernel void kernel_gated_delta_net_f32_sv128(
     s_base   += s_off;
     dst_base += dst_off;
 
-    const ulong attn_elems = (ulong)GDN_SV * H * n_seqs;
-    global float * attn_out  = (global float *)dst_base;
-    global float * state_out = (global float *)dst_base + attn_elems;
+    // Output layout: [ attn (S_v * H * n_tokens * n_seqs) | new_state (S_v * S_v * H * n_seqs) ]
+    const ulong attn_elems = (ulong)GDN_SV * H * (ulong)n_tokens * n_seqs;
+    global float * attn_out_base  = (global float *)dst_base;
+    global float * state_out_base = (global float *)dst_base + attn_elems;
 
     global const float * s_in  = (global const float *)s_base + ((ulong)iv3 * H + iv1) * GDN_SV * GDN_SV + (ulong)col * GDN_SV;
-    global       float * s_out = state_out                    + ((ulong)iv3 * H + iv1) * GDN_SV * GDN_SV + (ulong)col * GDN_SV;
+    global       float * s_out = state_out_base               + ((ulong)iv3 * H + iv1) * GDN_SV * GDN_SV + (ulong)col * GDN_SV;
 
-    global const float * q_d = (global const float *)(q_base + (ulong)iq3*nbq3 + (ulong)iq1*nbq1);
-    global const float * k_d = (global const float *)(k_base + (ulong)ik3*nbk3 + (ulong)ik1*nbk1);
-    global const float * v_d = (global const float *)(v_base + (ulong)iv3*nbv3 + (ulong)iv1*nbv1);
-    const ulong hb = (ulong)iv3 * H + iv1;
-    const float beta_val = ((global const float *)b_base)[hb];
-    global const float * g_d = (global const float *)g_base + hb * (ulong)neg0;
+    // Per-head per-seq base pointers; per-token offsets applied inside the t-loop.
+    global char * q_hd = q_base + (ulong)iq3*nbq3 + (ulong)iq1*nbq1;
+    global char * k_hd = k_base + (ulong)ik3*nbk3 + (ulong)ik1*nbk1;
+    global char * v_hd = v_base + (ulong)iv3*nbv3 + (ulong)iv1*nbv1;
+    global char * b_hd = b_base + (ulong)iv3*nbb3 + (ulong)iv1*nbb1;
+    global char * g_hd = g_base + (ulong)iv3*nbg3 + (ulong)iv1*nbg1;
 
-    // The 4 cols in this workgroup share the same head, so they all need the
-    // same k[i] and q[i] values. Stage them through __local once (each thread
-    // loads 1 element) so each lane's 4 reads hit __local instead of global —
-    // 4× fewer global k/q reads per workgroup. Same trick for g[i] in the
-    // kda path. v[col] is per-column so stays as a direct global read.
-    __local float k_loc[GDN_SV];
-    __local float q_loc[GDN_SV];
-    __local float g_loc[GDN_SV];  // unused / dead in scalar-g path
-
-    k_loc[lid] = k_d[lid];
-    q_loc[lid] = q_d[lid];
-    if (kda) {
-        g_loc[lid] = exp(g_d[lid]);
-    }
-    barrier(CLK_LOCAL_MEM_FENCE);
-
+    // Load state column 'col' into private once for the whole t-loop.
     float s_shard[GDN_RPL];
-    float k_reg  [GDN_RPL];
-    float q_reg  [GDN_RPL];
-    float g_exp  [GDN_RPL];
-
     #pragma unroll
     for (int r = 0; r < GDN_RPL; r++) {
-        const int i = r * GDN_LPC + lane;
-        s_shard[r] = s_in[i];
-        k_reg[r]   = k_loc[i];
-        q_reg[r]   = q_loc[i];
+        s_shard[r] = s_in[r * GDN_LPC + lane];
     }
 
-    if (kda) {
+    const float scale = 1.0f / sqrt((float) GDN_SV);
+
+    // attn output advances by GDN_SV * H per token, starting at first token of
+    // this (seq, head): attn_data[t][col] = base + (iv3*n_tokens + t)*H*S_v + iv1*S_v + col.
+    global float * attn_data = attn_out_base + ((ulong)iv3 * (ulong)n_tokens * H + iv1) * GDN_SV;
+
+    // For decode (n_tokens==1) the __local-cache variant was a slight win but
+    // barriers would dominate for the prefill t-loop. We read k/q/g directly
+    // from global on every iter — the 4 cols sharing a head only need ~4 cache
+    // lines per (r,token) read, which the Adreno L1 absorbs across the 4
+    // cluster-of-32 reads in the same workgroup. No barriers in the hot loop.
+    for (int t = 0; t < n_tokens; t++) {
+        global const float * q_t = (global const float *)(q_hd + (ulong)t * nbq2);
+        global const float * k_t = (global const float *)(k_hd + (ulong)t * nbk2);
+        global const float * v_t = (global const float *)(v_hd + (ulong)t * nbv2);
+        const float beta_val     = *(global const float *)(b_hd + (ulong)t * nbb2);
+        global const float * g_t = (global const float *)(g_hd + (ulong)t * nbg2);
+
+        float k_reg[GDN_RPL];
+        float q_reg[GDN_RPL];
+        float g_exp[GDN_RPL];
+
         #pragma unroll
         for (int r = 0; r < GDN_RPL; r++) {
-            g_exp[r] = g_loc[r * GDN_LPC + lane];
+            const int i = r * GDN_LPC + lane;
+            k_reg[r] = k_t[i];
+            q_reg[r] = q_t[i];
         }
-    } else {
-        const float gv = exp(g_d[0]);
+
+        if (kda) {
+            #pragma unroll
+            for (int r = 0; r < GDN_RPL; r++) {
+                g_exp[r] = exp(g_t[r * GDN_LPC + lane]);
+            }
+        } else {
+            const float gv = exp(g_t[0]);
+            #pragma unroll
+            for (int r = 0; r < GDN_RPL; r++) g_exp[r] = gv;
+        }
+
+        const float v_val = v_t[col];
+
+        float kv_shard = 0.0f;
         #pragma unroll
-        for (int r = 0; r < GDN_RPL; r++) g_exp[r] = gv;
-    }
+        for (int r = 0; r < GDN_RPL; r++) {
+            kv_shard = mad(g_exp[r] * s_shard[r], k_reg[r], kv_shard);
+        }
+        const float kv_col = gdn_cluster32_sum(kv_shard);
 
-    const float v_val = v_d[col];
+        const float delta = (v_val - kv_col) * beta_val;
 
-    float kv_shard = 0.0f;
-    #pragma unroll
-    for (int r = 0; r < GDN_RPL; r++) {
-        kv_shard = mad(g_exp[r] * s_shard[r], k_reg[r], kv_shard);
-    }
-    const float kv_col = gdn_cluster32_sum(kv_shard);
+        float attn_partial = 0.0f;
+        #pragma unroll
+        for (int r = 0; r < GDN_RPL; r++) {
+            const float sij = mad(k_reg[r], delta, g_exp[r] * s_shard[r]);
+            s_shard[r] = sij;
+            attn_partial = mad(sij, q_reg[r], attn_partial);
+        }
+        const float attn_col = gdn_cluster32_sum(attn_partial);
 
-    const float delta = (v_val - kv_col) * beta_val;
-
-    float attn_partial = 0.0f;
-    #pragma unroll
-    for (int r = 0; r < GDN_RPL; r++) {
-        const float sij = mad(k_reg[r], delta, g_exp[r] * s_shard[r]);
-        s_shard[r] = sij;
-        attn_partial = mad(sij, q_reg[r], attn_partial);
-    }
-    const float attn_col = gdn_cluster32_sum(attn_partial);
-
-    if (lane == 0) {
-        attn_out[((ulong)iv3 * H + iv1) * GDN_SV + col] = attn_col * (1.0f / sqrt((float) GDN_SV));
+        if (lane == 0) {
+            attn_data[col] = attn_col * scale;
+        }
+        attn_data += (ulong)GDN_SV * H;
     }
 
     #pragma unroll

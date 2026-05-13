@@ -5918,17 +5918,22 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
         case GGML_OP_SSM_CONV:
             return (op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32);
         case GGML_OP_GATED_DELTA_NET: {
-            // f32 only; autoregressive (n_tokens == 1) only — prefill keeps the
-            // chunked path. (cparams.fused_gdn_ch then auto-disables on the
-            // chunked-graph reservation; fused_gdn_ar stays enabled.)
-            // GGML_OPENCL_DISABLE_GDN=1 forces CPU fallback for A/B benching.
-            static const bool gdn_disabled = getenv("GGML_OPENCL_DISABLE_GDN") != nullptr;
+            // f32 only. Both autoregressive (n_tokens==1) and chunked
+            // (n_tokens>1) — the sv128 kernel handles both via an internal
+            // t-loop. Other s_v sizes use the (slow) generic fallback that
+            // also handles both, so test-backend-ops correctness still holds.
+            // GGML_OPENCL_DISABLE_GDN=1 forces CPU fallback for A/B benching;
+            // GGML_OPENCL_DISABLE_GDN_CH=1 disables only the chunked path
+            // (keeps autoregressive on the GPU).
+            static const bool gdn_disabled    = getenv("GGML_OPENCL_DISABLE_GDN")    != nullptr;
+            static const bool gdn_ch_disabled = getenv("GGML_OPENCL_DISABLE_GDN_CH") != nullptr;
             if (gdn_disabled) return false;
             const ggml_tensor * v = op->src[2];
             for (int i = 0; i < 6; ++i) {
                 if (op->src[i]->type != GGML_TYPE_F32) return false;
             }
-            return op->type == GGML_TYPE_F32 && v->ne[2] == 1 && v->ne[0] >= 1;
+            if (gdn_ch_disabled && v->ne[2] > 1) return false;
+            return op->type == GGML_TYPE_F32 && v->ne[0] >= 1;
         }
         case GGML_OP_CONCAT:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
@@ -10488,7 +10493,6 @@ static void ggml_cl_gated_delta_net(ggml_backend_t backend, const ggml_tensor * 
 
     GGML_ASSERT(q && k && v && g && beta && state && dst);
     GGML_ASSERT(q->extra && k->extra && v->extra && g->extra && beta->extra && state->extra && dst->extra);
-    GGML_ASSERT(v->ne[2] == 1); // autoregressive only (see ggml_backend_opencl_device_supports_op)
 
     ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *)backend->context;
 
@@ -10508,19 +10512,22 @@ static void ggml_cl_gated_delta_net(ggml_backend_t backend, const ggml_tensor * 
     cl_ulong s_off = es->offset + state->view_offs;
     cl_ulong d_off = ed->offset + dst->view_offs;
 
-    const int s_v    = (int)v->ne[0];
-    const int H      = (int)v->ne[1];
-    const int n_seqs = (int)v->ne[3];
-    const int neq1   = (int)q->ne[1];
-    const int nek1   = (int)k->ne[1];
-    const int neq3   = (int)q->ne[3];
-    const int nek3   = (int)k->ne[3];
-    const int neg0   = (int)g->ne[0];
-    const int kda    = (neg0 == s_v) ? 1 : 0;
+    const int s_v      = (int)v->ne[0];
+    const int H        = (int)v->ne[1];
+    const int n_tokens = (int)v->ne[2];
+    const int n_seqs   = (int)v->ne[3];
+    const int neq1     = (int)q->ne[1];
+    const int nek1     = (int)k->ne[1];
+    const int neq3     = (int)q->ne[3];
+    const int nek3     = (int)k->ne[3];
+    const int neg0     = (int)g->ne[0];
+    const int kda      = (neg0 == s_v) ? 1 : 0;
 
-    cl_ulong nbq1 = q->nb[1], nbq3 = q->nb[3];
-    cl_ulong nbk1 = k->nb[1], nbk3 = k->nb[3];
-    cl_ulong nbv1 = v->nb[1], nbv3 = v->nb[3];
+    cl_ulong nbq1 = q->nb[1],    nbq2 = q->nb[2],    nbq3 = q->nb[3];
+    cl_ulong nbk1 = k->nb[1],    nbk2 = k->nb[2],    nbk3 = k->nb[3];
+    cl_ulong nbv1 = v->nb[1],    nbv2 = v->nb[2],    nbv3 = v->nb[3];
+    cl_ulong nbb1 = beta->nb[1], nbb2 = beta->nb[2], nbb3 = beta->nb[3];
+    cl_ulong nbg1 = g->nb[1],    nbg2 = g->nb[2],    nbg3 = g->nb[3];
 
     const bool use_sv128 = (s_v == 128) && (backend_ctx->kernel_gated_delta_net_f32_sv128 != nullptr);
 
@@ -10544,11 +10551,20 @@ static void ggml_cl_gated_delta_net(ggml_backend_t backend, const ggml_tensor * 
     CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_mem),   &ed->data_device));
     CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &d_off));
     CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbq1));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbq2));
     CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbq3));
     CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbk1));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbk2));
     CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbk3));
     CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbv1));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbv2));
     CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbv3));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbb1));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbb2));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbb3));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbg1));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbg2));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbg3));
     if (!use_sv128) {
         // generic kernel takes s_v as the next int arg
         CL_CHECK(clSetKernelArg(kernel, i++, sizeof(int),  &s_v));
@@ -10558,6 +10574,7 @@ static void ggml_cl_gated_delta_net(ggml_backend_t backend, const ggml_tensor * 
     CL_CHECK(clSetKernelArg(kernel, i++, sizeof(int),      &neq3));
     CL_CHECK(clSetKernelArg(kernel, i++, sizeof(int),      &nek3));
     CL_CHECK(clSetKernelArg(kernel, i++, sizeof(int),      &H));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(int),      &n_tokens));
     CL_CHECK(clSetKernelArg(kernel, i++, sizeof(int),      &n_seqs));
     CL_CHECK(clSetKernelArg(kernel, i++, sizeof(int),      &kda));
     CL_CHECK(clSetKernelArg(kernel, i++, sizeof(int),      &neg0));
