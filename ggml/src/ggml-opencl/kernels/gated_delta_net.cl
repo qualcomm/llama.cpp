@@ -206,6 +206,22 @@ kernel void kernel_gated_delta_net_f32_sv128(
     const float beta_val = ((global const float *)b_base)[hb];
     global const float * g_d = (global const float *)g_base + hb * (ulong)neg0;
 
+    // The 4 cols in this workgroup share the same head, so they all need the
+    // same k[i] and q[i] values. Stage them through __local once (each thread
+    // loads 1 element) so each lane's 4 reads hit __local instead of global —
+    // 4× fewer global k/q reads per workgroup. Same trick for g[i] in the
+    // kda path. v[col] is per-column so stays as a direct global read.
+    __local float k_loc[GDN_SV];
+    __local float q_loc[GDN_SV];
+    __local float g_loc[GDN_SV];  // unused / dead in scalar-g path
+
+    k_loc[lid] = k_d[lid];
+    q_loc[lid] = q_d[lid];
+    if (kda) {
+        g_loc[lid] = exp(g_d[lid]);
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
     float s_shard[GDN_RPL];
     float k_reg  [GDN_RPL];
     float q_reg  [GDN_RPL];
@@ -215,14 +231,14 @@ kernel void kernel_gated_delta_net_f32_sv128(
     for (int r = 0; r < GDN_RPL; r++) {
         const int i = r * GDN_LPC + lane;
         s_shard[r] = s_in[i];
-        k_reg[r]   = k_d[i];
-        q_reg[r]   = q_d[i];
+        k_reg[r]   = k_loc[i];
+        q_reg[r]   = q_loc[i];
     }
 
     if (kda) {
         #pragma unroll
         for (int r = 0; r < GDN_RPL; r++) {
-            g_exp[r] = exp(g_d[r * GDN_LPC + lane]);
+            g_exp[r] = g_loc[r * GDN_LPC + lane];
         }
     } else {
         const float gv = exp(g_d[0]);
