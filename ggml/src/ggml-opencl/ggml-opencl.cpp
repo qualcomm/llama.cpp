@@ -629,6 +629,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mat_f16_f32_1row;
     cl_kernel kernel_mul_mat_f16_f32;
     cl_kernel kernel_mul_mat_f16_f32_l4;
+    cl_kernel kernel_mul_mat_f16_f32_l4_x8 = nullptr;
     cl_kernel kernel_mul_mat_f16_f32_tiled;
     cl_kernel kernel_adreno_xmem_pack_src_f32;
     cl_kernel kernel_adreno_xmem_prepack_weight_f16;
@@ -1630,6 +1631,11 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
             build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
 
         CL_CHECK((backend_ctx->kernel_mul_mat_f16_f32_l4   = clCreateKernel(backend_ctx->program_mul_mv_f16_f32_l4, "kernel_mul_mat_f16_f32_l4", &err), err));
+        // Best-effort: multi-row decode variant (8 K rows / WG, Q cached in __local).
+        cl_int err_x8 = CL_SUCCESS;
+        backend_ctx->kernel_mul_mat_f16_f32_l4_x8 =
+            clCreateKernel(backend_ctx->program_mul_mv_f16_f32_l4, "kernel_mul_mat_f16_f32_l4_x8", &err_x8);
+        if (err_x8 != CL_SUCCESS) backend_ctx->kernel_mul_mat_f16_f32_l4_x8 = nullptr;
         GGML_LOG_CONT(".");
     }
 
@@ -15177,8 +15183,20 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 if (ne11 * ne12 < 4) {
                     kernel = backend_ctx->kernel_mul_mat_f16_f32_1row;
                 } else if (ne00 >= 128 && ne01 >= 8 && ne00%4 == 0) {
-                    kernel = backend_ctx->kernel_mul_mat_f16_f32_l4;
-                    nrows = ne11;
+                    // Multi-row decode variant when Q is a single row, K has
+                    // many rows, and DK fits the kernel's __local Q cache
+                    // (ne00 <= 256 = sub_group_size_64 * float4). Biggest win
+                    // at long context where the KQ/KQV launches ~262K WGs
+                    // each with a single mad.
+                    if (ne11 == 1 && ne01 >= 64 && ne01 % 8 == 0 &&
+                        ne00 <= 256 &&
+                        backend_ctx->kernel_mul_mat_f16_f32_l4_x8 != nullptr) {
+                        kernel = backend_ctx->kernel_mul_mat_f16_f32_l4_x8;
+                        nrows = 1;  // x8 path uses a different dispatch grid
+                    } else {
+                        kernel = backend_ctx->kernel_mul_mat_f16_f32_l4;
+                        nrows = ne11;
+                    }
                 } else {
                     kernel = backend_ctx->kernel_mul_mat_f16_f32;
                     nrows = 4;
@@ -15822,6 +15840,12 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         size_t global_work_size[] = {(size_t)(ne01+ndst*nth1-1)/(ndst*nth1)*nth0, (size_t)ne11*nth1, (size_t)ne12*ne13};
         size_t local_work_size[] = {(size_t)nth0, (size_t)nth1, 1};
 
+        backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+    } else if (kernel == backend_ctx->kernel_mul_mat_f16_f32_l4_x8) {
+        // Multi-row decode variant: each WG processes 8 K rows; ne11 == 1.
+        const int64_t n_wg_x = ne01 / 8;
+        size_t global_work_size[] = {(size_t)n_wg_x*nth0, (size_t)nth1, (size_t)ne12*ne13};
+        size_t local_work_size[]  = {(size_t)nth0, (size_t)nth1, 1};
         backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
     } else {
         int64_t ny = (ne11 + nrows - 1)/nrows;
