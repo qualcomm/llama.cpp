@@ -3443,12 +3443,16 @@ static std::string ggml_opencl_fa_compile_opts(ggml_backend_opencl_context * bac
 
 // Refuse to register a kernel whose dispatch WG size exceeds the device's
 // CL_DEVICE_MAX_WORK_GROUP_SIZE — that's the only WG cap that's always
-// authoritative. (CL_KERNEL_WORK_GROUP_SIZE is intended to be a tighter,
-// per-kernel cap derived from register use, but on Adreno X2 it under-reports
-// significantly — the q1_vec_mq kernel runs fine at WG=1024 even though the
-// per-kernel query returns 640, and similarly across the vec FA kernels.
-// Trusting the per-kernel query would needlessly skip working kernels on
-// Adreno and silently regress perf, so we only enforce the device cap.)
+// authoritative.
+//
+// CL_KERNEL_WORK_GROUP_SIZE is intended as a tighter per-kernel cap derived
+// from register use + barrier behaviour, but on Adreno it's only advisory:
+// barrier-free kernels can essentially always dispatch up to 1024 regardless
+// of what the per-kernel query returns, and even barrier-using kernels often
+// run at the full device cap. Concrete case from this file: q1_vec_mq has
+// a cross-subgroup barrier yet runs correctly at WG=1024 despite the
+// per-kernel query reporting 640. Honoring the 640 cap silently regressed
+// tg@d=16k by ~14% on Gemma-3-1B. So we only enforce the device cap.
 //
 // When the device max is below required, the existing
 // `kernel_map.count(dk_dv) > 0` dispatch checks fall back gracefully instead
