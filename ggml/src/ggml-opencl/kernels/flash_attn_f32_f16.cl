@@ -953,10 +953,16 @@ __kernel void flash_attn_f32_f16_q1_vec(
 #endif
 
 // MQ collapses one WG per KV-head (vs one per Q-head in legacy q1_vec).
-// To preserve total wavefront count, push NSG up: legacy 4 WGs × 4 sg = 16 sg
-// total; MQ at NSG=16 × 1 WG = 16 sg. Adreno X2 max WG size = 1024 = 16 × 64.
+// Wanted NSG=8 or 16 to compensate for the wavefront-count loss after the
+// head-dim collapse, but Adreno X2's per-kernel CL_KERNEL_WORK_GROUP_SIZE
+// for this signature is 320 — only NSG=4 / WG=256 is reliably dispatchable.
+// At that NSG this kernel benches worse than legacy q1_vec on the target
+// model (Gemma-3-1B tg@d=0 = 60 t/s vs 72 legacy), so it's compiled but
+// not dispatched in the host code. The win came from pairing MQ with the
+// flash-decoding split (q1_vec_mq_split below) — that's the path host
+// dispatch uses at n_kv >= FD_MIN_N_KV.
 #ifndef MQ_NSG
-#define MQ_NSG 16
+#define MQ_NSG 4
 #endif
 #define MQ_WG_SIZE (Q1_WG_SIZE * MQ_NSG)
 

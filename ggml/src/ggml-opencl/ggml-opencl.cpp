@@ -3441,22 +3441,14 @@ static std::string ggml_opencl_fa_compile_opts(ggml_backend_opencl_context * bac
     return opts;
 }
 
-// Refuse to register a kernel whose dispatch WG size exceeds the device's
-// CL_DEVICE_MAX_WORK_GROUP_SIZE — that's the only WG cap that's always
-// authoritative.
-//
-// CL_KERNEL_WORK_GROUP_SIZE is intended as a tighter per-kernel cap derived
-// from register use + barrier behaviour, but on Adreno it's only advisory:
-// barrier-free kernels can essentially always dispatch up to 1024 regardless
-// of what the per-kernel query returns, and even barrier-using kernels often
-// run at the full device cap. Concrete case from this file: q1_vec_mq has
-// a cross-subgroup barrier yet runs correctly at WG=1024 despite the
-// per-kernel query reporting 640. Honoring the 640 cap silently regressed
-// tg@d=16k by ~14% on Gemma-3-1B. So we only enforce the device cap.
-//
-// When the device max is below required, the existing
-// `kernel_map.count(dk_dv) > 0` dispatch checks fall back gracefully instead
-// of crashing with CL_INVALID_WORK_GROUP_SIZE.
+// Refuse to register a kernel whose required dispatch WG size exceeds either
+// the per-kernel cap (CL_KERNEL_WORK_GROUP_SIZE) or the device cap
+// (CL_DEVICE_MAX_WORK_GROUP_SIZE). On Adreno X2 the per-kernel cap can be
+// well below the device cap (e.g. CL_KERNEL_WORK_GROUP_SIZE = 320 for the
+// q1_vec_mq signature against a device max of 1024) and is enforced at
+// enqueue time — dispatching above it returns CL_INVALID_WORK_GROUP_SIZE.
+// When the check fails, the caller releases the kernel so the existing
+// `kernel_map.count(dk_dv) > 0` dispatch checks fall back gracefully.
 static bool ggml_opencl_fa_kernel_fits_wg(ggml_backend_opencl_context * backend_ctx,
                                           cl_kernel kernel, size_t required_wg,
                                           const char * name, int dk, int dv) {
@@ -3465,6 +3457,20 @@ static bool ggml_opencl_fa_kernel_fits_wg(ggml_backend_opencl_context * backend_
     if (dev_max < required_wg) {
         GGML_LOG_INFO("ggml_opencl: %s DK=%d DV=%d requires WG %zu > device max %zu; skipping registration (will fall back)\n",
                       name, dk, dv, required_wg, dev_max);
+        return false;
+    }
+    size_t kwg = 0;
+    cl_int err = clGetKernelWorkGroupInfo(kernel, backend_ctx->device,
+                                          CL_KERNEL_WORK_GROUP_SIZE,
+                                          sizeof(kwg), &kwg, NULL);
+    if (err != CL_SUCCESS) {
+        GGML_LOG_INFO("ggml_opencl: clGetKernelWorkGroupInfo failed for %s DK=%d DV=%d (err=%d); skipping registration\n",
+                      name, dk, dv, err);
+        return false;
+    }
+    if (kwg < required_wg) {
+        GGML_LOG_INFO("ggml_opencl: %s DK=%d DV=%d per-kernel max %zu < required %zu; skipping registration (will fall back)\n",
+                      name, dk, dv, kwg, required_wg);
         return false;
     }
     return true;
@@ -3648,10 +3654,10 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
             }
             // KV-head-coalesced vec for high-GQA small models (Gemma-3-1B).
             // Best-effort compile; only used when gqa_ratio == MQ_GQA at dispatch.
-            // Required WG = 16 × 64 = 1024 (MQ_NSG × Q1_WG_SIZE).
+            // Required WG = 4 × 64 = 256 (MQ_NSG × Q1_WG_SIZE).
             cl_kernel k_q1_vec_mq = clCreateKernel(prog, "flash_attn_f32_f16_q1_vec_mq", &err);
             if (err == CL_SUCCESS) {
-                if (ggml_opencl_fa_kernel_fits_wg(backend_ctx, k_q1_vec_mq, 1024,
+                if (ggml_opencl_fa_kernel_fits_wg(backend_ctx, k_q1_vec_mq, 256,
                                                   "flash_attn_f32_f16_q1_vec_mq", dk, dv)) {
                     backend_ctx->kernels_flash_attn_f32_f16_q1_vec_mq[{dk, dv}] = k_q1_vec_mq;
                     ggml_opencl_log_fa_kernel_spill(backend_ctx, k_q1_vec_mq, "flash_attn_f32_f16_q1_vec_mq", dk, dv);
@@ -11763,17 +11769,16 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
             // where the standard q1 spills o_acc to DDR. Gate at DV >= 256
             // for now (Qwen3.6 / Gemma-4 SWA / Gemma-4 global). Fall back if
             // the kernel didn't compile (no-extension driver).
-            const char * mq_env = getenv("GGML_OPENCL_FA_MQ");
-            const bool mq_enabled = (mq_env == NULL) ? true : (mq_env[0] != '0');
-            if (mq_enabled && gqa_ratio_dispatch == 4 && d_head_q == 256 && d_head_v == 256 &&
-                backend_ctx->kernels_flash_attn_f32_f16_q1_vec_mq.count(dk_dv) > 0) {
-                // High-GQA small model (Gemma-3 family): coalesce gqa_ratio Q-heads
-                // per WG to share the KV stream. Cuts 4× redundant K/V reads from
-                // DDR when attention is the decode bottleneck.
-                kernel = backend_ctx->kernels_flash_attn_f32_f16_q1_vec_mq.at(dk_dv);
-                use_q1_vec    = true;
-                use_q1_vec_mq = true;
-            } else if (d_head_v >= 256 &&
+            // NOTE: single-WG MQ (q1_vec_mq) is registered but not dispatched.
+            // At Gemma-3-1B / DK=DV=256 with WG=256 (4 subgroups, the max
+            // viable on Adreno X2 for this kernel), it benches at ~60 t/s
+            // vs legacy q1_vec at ~72 t/s — a regression — so there's no
+            // reason to fire it over legacy at short context. The MQ win
+            // comes from the FD-split path below (q1_vec_mq_split), which
+            // pairs MQ coalescing with n_kv splitting across WGs for
+            // occupancy. Left registered so the source is available for
+            // future experimentation.
+            if (d_head_v >= 256 &&
                 backend_ctx->kernels_flash_attn_f32_f16_q1_vec.count(dk_dv) > 0) {
                 kernel = backend_ctx->kernels_flash_attn_f32_f16_q1_vec.at(dk_dv);
                 use_q1_vec = true;
@@ -12193,8 +12198,10 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         // q1_vec dispatches with NSG subgroups (WG = NSG*64) to expose the
         // n_kv loop to multi-subgroup parallelism; everything else uses 64.
         // q1_vec is compiled with VEC_NSG=4 → WG = 4 * 64 = 256.
-        // q1_vec_mq folds MQ_GQA Q-heads into each WG, so the head dim of
-        // the grid collapses to n_head_kv (one WG per (kv_head, batch)).
+        // q1_vec_mq is compiled with MQ_NSG=4 → WG = 4 * 64 = 256 (same as
+        // legacy q1_vec; the per-kernel cap on Adreno X2 forbids higher).
+        // It folds MQ_GQA Q-heads into each WG so the head dim of the grid
+        // collapses to n_head_kv (one WG per (kv_head, batch)).
         const size_t wg_size = use_q1_vec ? 256 : 64;
         const size_t head_dim_global = use_q1_vec_mq
             ? (size_t)(n_head_kv * n_batch)
