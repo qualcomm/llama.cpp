@@ -3441,6 +3441,31 @@ static std::string ggml_opencl_fa_compile_opts(ggml_backend_opencl_context * bac
     return opts;
 }
 
+// Refuse to register a kernel whose dispatch WG size exceeds the device's
+// CL_DEVICE_MAX_WORK_GROUP_SIZE — that's the only WG cap that's always
+// authoritative. (CL_KERNEL_WORK_GROUP_SIZE is intended to be a tighter,
+// per-kernel cap derived from register use, but on Adreno X2 it under-reports
+// significantly — the q1_vec_mq kernel runs fine at WG=1024 even though the
+// per-kernel query returns 640, and similarly across the vec FA kernels.
+// Trusting the per-kernel query would needlessly skip working kernels on
+// Adreno and silently regress perf, so we only enforce the device cap.)
+//
+// When the device max is below required, the existing
+// `kernel_map.count(dk_dv) > 0` dispatch checks fall back gracefully instead
+// of crashing with CL_INVALID_WORK_GROUP_SIZE.
+static bool ggml_opencl_fa_kernel_fits_wg(ggml_backend_opencl_context * backend_ctx,
+                                          cl_kernel kernel, size_t required_wg,
+                                          const char * name, int dk, int dv) {
+    if (kernel == NULL) return false;
+    const size_t dev_max = backend_ctx->max_workgroup_size;
+    if (dev_max < required_wg) {
+        GGML_LOG_INFO("ggml_opencl: %s DK=%d DV=%d requires WG %zu > device max %zu; skipping registration (will fall back)\n",
+                      name, dk, dv, required_wg, dev_max);
+        return false;
+    }
+    return true;
+}
+
 // Log compiled private-memory footprint for an FA kernel. On Adreno any
 // non-zero private_mem means the compiler spilled to DDR global memory
 // (per-work-item, no cache locality) — a strong signal to pick a config
@@ -3605,24 +3630,42 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
             }
             // q1_vec decode kernel (DV-split + subgroup reduce). Compile is
             // best-effort; if it fails (e.g. driver/extension gap) the standard
-            // q1 path stays the fallback at dispatch.
+            // q1 path stays the fallback at dispatch. Required WG = 4 × 64 = 256
+            // (VEC_NSG × Q1_WG_SIZE in the kernel).
             cl_kernel k_q1_vec = clCreateKernel(prog, "flash_attn_f32_f16_q1_vec", &err);
             if (err == CL_SUCCESS) {
-                backend_ctx->kernels_flash_attn_f32_f16_q1_vec[{dk, dv}] = k_q1_vec;
-                ggml_opencl_log_fa_kernel_spill(backend_ctx, k_q1_vec, "flash_attn_f32_f16_q1_vec", dk, dv);
+                if (ggml_opencl_fa_kernel_fits_wg(backend_ctx, k_q1_vec, 256,
+                                                  "flash_attn_f32_f16_q1_vec", dk, dv)) {
+                    backend_ctx->kernels_flash_attn_f32_f16_q1_vec[{dk, dv}] = k_q1_vec;
+                    ggml_opencl_log_fa_kernel_spill(backend_ctx, k_q1_vec, "flash_attn_f32_f16_q1_vec", dk, dv);
+                } else {
+                    clReleaseKernel(k_q1_vec);
+                }
             }
             // KV-head-coalesced vec for high-GQA small models (Gemma-3-1B).
             // Best-effort compile; only used when gqa_ratio == MQ_GQA at dispatch.
+            // Required WG = 16 × 64 = 1024 (MQ_NSG × Q1_WG_SIZE).
             cl_kernel k_q1_vec_mq = clCreateKernel(prog, "flash_attn_f32_f16_q1_vec_mq", &err);
             if (err == CL_SUCCESS) {
-                backend_ctx->kernels_flash_attn_f32_f16_q1_vec_mq[{dk, dv}] = k_q1_vec_mq;
-                ggml_opencl_log_fa_kernel_spill(backend_ctx, k_q1_vec_mq, "flash_attn_f32_f16_q1_vec_mq", dk, dv);
+                if (ggml_opencl_fa_kernel_fits_wg(backend_ctx, k_q1_vec_mq, 1024,
+                                                  "flash_attn_f32_f16_q1_vec_mq", dk, dv)) {
+                    backend_ctx->kernels_flash_attn_f32_f16_q1_vec_mq[{dk, dv}] = k_q1_vec_mq;
+                    ggml_opencl_log_fa_kernel_spill(backend_ctx, k_q1_vec_mq, "flash_attn_f32_f16_q1_vec_mq", dk, dv);
+                } else {
+                    clReleaseKernel(k_q1_vec_mq);
+                }
             }
             // KV-head-coalesced + flash-decoding split. Reused merge kernel.
+            // Required WG = 4 × 64 = 256 (MQ_NSG_SPLIT × Q1_WG_SIZE).
             cl_kernel k_q1_vec_mq_split = clCreateKernel(prog, "flash_attn_f32_f16_q1_vec_mq_split", &err);
             if (err == CL_SUCCESS) {
-                backend_ctx->kernels_flash_attn_f32_f16_q1_vec_mq_split[{dk, dv}] = k_q1_vec_mq_split;
-                ggml_opencl_log_fa_kernel_spill(backend_ctx, k_q1_vec_mq_split, "flash_attn_f32_f16_q1_vec_mq_split", dk, dv);
+                if (ggml_opencl_fa_kernel_fits_wg(backend_ctx, k_q1_vec_mq_split, 256,
+                                                  "flash_attn_f32_f16_q1_vec_mq_split", dk, dv)) {
+                    backend_ctx->kernels_flash_attn_f32_f16_q1_vec_mq_split[{dk, dv}] = k_q1_vec_mq_split;
+                    ggml_opencl_log_fa_kernel_spill(backend_ctx, k_q1_vec_mq_split, "flash_attn_f32_f16_q1_vec_mq_split", dk, dv);
+                } else {
+                    clReleaseKernel(k_q1_vec_mq_split);
+                }
             }
             cl_kernel k_merge = clCreateKernel(prog, "flash_attn_f32_merge", &err);
             if (err == CL_SUCCESS) {
@@ -3644,10 +3687,16 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
                 ggml_opencl_log_fa_kernel_spill(backend_ctx, k_split, "flash_attn_f32_q8_0_q1_split", dk, dv);
             }
             // DV-split decode variant; best-effort compile.
+            // Required WG = 4 × 64 = 256 (VEC_NSG × Q1_WG_SIZE).
             cl_kernel k_q1_vec = clCreateKernel(prog, "flash_attn_f32_q8_0_q1_vec", &err);
             if (err == CL_SUCCESS) {
-                backend_ctx->kernels_flash_attn_f32_q8_0_q1_vec[{dk, dv}] = k_q1_vec;
-                ggml_opencl_log_fa_kernel_spill(backend_ctx, k_q1_vec, "flash_attn_f32_q8_0_q1_vec", dk, dv);
+                if (ggml_opencl_fa_kernel_fits_wg(backend_ctx, k_q1_vec, 256,
+                                                  "flash_attn_f32_q8_0_q1_vec", dk, dv)) {
+                    backend_ctx->kernels_flash_attn_f32_q8_0_q1_vec[{dk, dv}] = k_q1_vec;
+                    ggml_opencl_log_fa_kernel_spill(backend_ctx, k_q1_vec, "flash_attn_f32_q8_0_q1_vec", dk, dv);
+                } else {
+                    clReleaseKernel(k_q1_vec);
+                }
             }
             if (!backend_ctx->kernels_flash_attn_f32_merge.count({dk, dv})) {
                 cl_kernel k_merge = clCreateKernel(prog, "flash_attn_f32_merge", &err);
@@ -3671,10 +3720,16 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
                 ggml_opencl_log_fa_kernel_spill(backend_ctx, k_split, "flash_attn_f32_q4_0_q1_split", dk, dv);
             }
             // DV-split decode variant; best-effort compile.
+            // Required WG = 4 × 64 = 256 (VEC_NSG × Q1_WG_SIZE).
             cl_kernel k_q1_vec = clCreateKernel(prog, "flash_attn_f32_q4_0_q1_vec", &err);
             if (err == CL_SUCCESS) {
-                backend_ctx->kernels_flash_attn_f32_q4_0_q1_vec[{dk, dv}] = k_q1_vec;
-                ggml_opencl_log_fa_kernel_spill(backend_ctx, k_q1_vec, "flash_attn_f32_q4_0_q1_vec", dk, dv);
+                if (ggml_opencl_fa_kernel_fits_wg(backend_ctx, k_q1_vec, 256,
+                                                  "flash_attn_f32_q4_0_q1_vec", dk, dv)) {
+                    backend_ctx->kernels_flash_attn_f32_q4_0_q1_vec[{dk, dv}] = k_q1_vec;
+                    ggml_opencl_log_fa_kernel_spill(backend_ctx, k_q1_vec, "flash_attn_f32_q4_0_q1_vec", dk, dv);
+                } else {
+                    clReleaseKernel(k_q1_vec);
+                }
             }
             if (!backend_ctx->kernels_flash_attn_f32_merge.count({dk, dv})) {
                 cl_kernel k_merge = clCreateKernel(prog, "flash_attn_f32_merge", &err);
