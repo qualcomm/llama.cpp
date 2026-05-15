@@ -548,6 +548,9 @@ struct ggml_backend_opencl_context {
     std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_f16;
     std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_f16_split; // N_SPLIT>1 variant
     std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_f16_q1;
+    // Decode kernel with DV-split + subgroup-reduced dot (mirrors Metal vec FA).
+    // Used at large DV (e.g. DK=DV=512) where the standard q1 spills o_acc.
+    std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_f16_q1_vec;
     // Flash-decoding K-split (f16 KV).
     std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_f16_q1_split;
     std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_merge;
@@ -3589,6 +3592,14 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
             if (err == CL_SUCCESS) {
                 backend_ctx->kernels_flash_attn_f32_f16_q1_split[{dk, dv}] = k_split;
                 ggml_opencl_log_fa_kernel_spill(backend_ctx, k_split, "flash_attn_f32_f16_q1_split", dk, dv);
+            }
+            // q1_vec decode kernel (DV-split + subgroup reduce). Compile is
+            // best-effort; if it fails (e.g. driver/extension gap) the standard
+            // q1 path stays the fallback at dispatch.
+            cl_kernel k_q1_vec = clCreateKernel(prog, "flash_attn_f32_f16_q1_vec", &err);
+            if (err == CL_SUCCESS) {
+                backend_ctx->kernels_flash_attn_f32_f16_q1_vec[{dk, dv}] = k_q1_vec;
+                ggml_opencl_log_fa_kernel_spill(backend_ctx, k_q1_vec, "flash_attn_f32_f16_q1_vec", dk, dv);
             }
             cl_kernel k_merge = clCreateKernel(prog, "flash_attn_f32_merge", &err);
             if (err == CL_SUCCESS) {
@@ -11630,13 +11641,24 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     max_bias      = params[1];
     logit_softcap = params[2];
 
+    bool use_q1_vec = false;
     if (n_q == 1) {
         if (use_native_q8_0_q1) {
             kernel = backend_ctx->kernels_flash_attn_f32_q8_0_q1.at(dk_dv);
         } else if (use_native_q4_0_q1) {
             kernel = backend_ctx->kernels_flash_attn_f32_q4_0_q1.at(dk_dv);
         } else if (is_mixed) {
-            kernel = backend_ctx->kernels_flash_attn_f32_f16_q1.at(dk_dv);
+            // DV-split decode kernel (mirrors Metal vec FA) wins at large DV
+            // where the standard q1 spills o_acc to DDR. Gate at DV >= 256
+            // for now (Qwen3.6 / Gemma-4 SWA / Gemma-4 global). Fall back if
+            // the kernel didn't compile (no-extension driver).
+            if (d_head_v >= 256 &&
+                backend_ctx->kernels_flash_attn_f32_f16_q1_vec.count(dk_dv) > 0) {
+                kernel = backend_ctx->kernels_flash_attn_f32_f16_q1_vec.at(dk_dv);
+                use_q1_vec = true;
+            } else {
+                kernel = backend_ctx->kernels_flash_attn_f32_f16_q1.at(dk_dv);
+            }
         } else if (is_f16) {
             kernel = backend_ctx->kernels_flash_attn_f16_q1.at(dk_dv);
         } else {
@@ -12025,7 +12047,10 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     }
 
     if (n_q == 1) {
-        const size_t wg_size = 64;
+        // q1_vec dispatches with NSG subgroups (WG = NSG*64) to expose the
+        // n_kv loop to multi-subgroup parallelism; everything else uses 64.
+        // q1_vec is compiled with VEC_NSG=4 → WG = 4 * 64 = 256.
+        const size_t wg_size = use_q1_vec ? 256 : 64;
         size_t local_work_size[] = { wg_size, 1 };
         size_t global_work_size[] = { wg_size, (size_t)(n_head * n_batch) };
         backend_ctx->enqueue_ndrange_kernel(kernel, 2, global_work_size, local_work_size, dst);
