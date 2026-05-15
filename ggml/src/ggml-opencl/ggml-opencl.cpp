@@ -555,6 +555,10 @@ struct ggml_backend_opencl_context {
     // KV-head; K/V loaded once and reused. Compile-locked to MQ_GQA=4 (Gemma-3
     // family). Falls back to q1_vec / q1 when gate isn't met.
     std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_f16_q1_vec_mq;
+    // KV-head-coalesced + flash-decoding split. Pairs MQ coalescing with FD
+    // n_kv-split for occupancy. Produces MQ_GQA partial records per WG;
+    // reuses `flash_attn_f32_merge` for normalization.
+    std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_f16_q1_vec_mq_split;
     // Flash-decoding K-split (f16 KV).
     std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_f16_q1_split;
     std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_merge;
@@ -3613,6 +3617,12 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
             if (err == CL_SUCCESS) {
                 backend_ctx->kernels_flash_attn_f32_f16_q1_vec_mq[{dk, dv}] = k_q1_vec_mq;
                 ggml_opencl_log_fa_kernel_spill(backend_ctx, k_q1_vec_mq, "flash_attn_f32_f16_q1_vec_mq", dk, dv);
+            }
+            // KV-head-coalesced + flash-decoding split. Reused merge kernel.
+            cl_kernel k_q1_vec_mq_split = clCreateKernel(prog, "flash_attn_f32_f16_q1_vec_mq_split", &err);
+            if (err == CL_SUCCESS) {
+                backend_ctx->kernels_flash_attn_f32_f16_q1_vec_mq_split[{dk, dv}] = k_q1_vec_mq_split;
+                ggml_opencl_log_fa_kernel_spill(backend_ctx, k_q1_vec_mq_split, "flash_attn_f32_f16_q1_vec_mq_split", dk, dv);
             }
             cl_kernel k_merge = clCreateKernel(prog, "flash_attn_f32_merge", &err);
             if (err == CL_SUCCESS) {
@@ -11950,7 +11960,24 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     const int FD_MAX_DK        = 128;
     const int fd_max_n_q = (d_head_q <= FD_MAX_DK_MULTI) ? FD_MAX_N_Q_MULTI : 1;
     cl_kernel fd_k_split = NULL;
-    if (n_q >= 1 && n_q <= fd_max_n_q && n_kv >= FD_MIN_N_KV && !is_causal &&
+    bool use_fd_mq = false;
+    // MQ flash-decoding gate. Bypasses FD_MAX_DK because the MQ split kernel
+    // uses NSG=8 × 64 lanes, so o_acc is DV-split — no spill at DK=DV=256.
+    // Same MQ enable knob as the single-WG MQ path.
+    {
+        const char * mq_env = getenv("GGML_OPENCL_FA_MQ");
+        const bool mq_enabled = (mq_env == NULL) ? true : (mq_env[0] != '0');
+        if (mq_enabled && is_mixed && n_q == 1 && !is_causal &&
+            n_kv >= FD_MIN_N_KV && gqa_ratio_dispatch == 4 &&
+            d_head_q == 256 && d_head_v == 256 &&
+            backend_ctx->kernels_flash_attn_f32_merge.count(dk_dv) > 0 &&
+            backend_ctx->kernels_flash_attn_f32_f16_q1_vec_mq_split.count(dk_dv) > 0) {
+            fd_k_split = backend_ctx->kernels_flash_attn_f32_f16_q1_vec_mq_split.at(dk_dv);
+            use_fd_mq  = true;
+        }
+    }
+    if (fd_k_split == NULL &&
+        n_q >= 1 && n_q <= fd_max_n_q && n_kv >= FD_MIN_N_KV && !is_causal &&
         d_head_q <= FD_MAX_DK &&
         backend_ctx->kernels_flash_attn_f32_merge.count(dk_dv) > 0) {
         if (is_mixed &&
@@ -12025,10 +12052,15 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(int),      &n_splits));
         CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(int),      &kv_per_split));
 
-        const size_t fd_wg = 64; // matches Q1_WG_SIZE in the kernel
+        // MQ split kernel uses MQ_NSG_SPLIT subgroups × 64 lanes and one WG
+        // per (kv_head, batch, split) — collapses the n_head dim to n_head_kv.
+        const size_t fd_wg = use_fd_mq ? 256 : 64; // matches Q1_WG_SIZE * NSG
+        const size_t fd_head_dim = use_fd_mq
+            ? (size_t)(n_head_kv * n_batch)
+            : (size_t)(n_head     * n_batch);
         size_t fd_lws[3] = { fd_wg, 1, 1 };
         // gid(2) packs q_idx * n_splits + split_idx.
-        size_t fd_gws[3] = { fd_wg, (size_t)(n_head * n_batch), (size_t)(n_splits * n_q) };
+        size_t fd_gws[3] = { fd_wg, fd_head_dim, (size_t)(n_splits * n_q) };
         backend_ctx->enqueue_ndrange_kernel(k_split, 3, fd_gws, fd_lws, dst);
 
         cl_kernel k_merge = backend_ctx->kernels_flash_attn_f32_merge.at(dk_dv);
