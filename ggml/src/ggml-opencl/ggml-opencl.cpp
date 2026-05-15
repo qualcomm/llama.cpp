@@ -3252,6 +3252,11 @@ static const ggml_opencl_fa_dim g_fa_dims_adreno_default[] = {
     {192, 128, 16, 16, 1, 0},
     {192, 192, 16, 16, 1, 0},
     {256, 256, 16, 16, 16, 0},
+    // DK=DV=512 covers Gemma-4's global-attention layers (SWA layers run on
+    // the 256 path). BM=8 keeps local memory under 32 KB (l_k+l_v=2×8×128×8 B).
+    // N_SPLIT=32 caps SPLIT_DK_VEC/SPLIT_DV_VEC at 4 float4 each, matching the
+    // register footprint of the 256/16 row that we know fits on Adreno X2.
+    {512, 512,  8, 16, 32, 0},
 };
 
 // Placeholder for Adreno X2 / next-gen; mirrors default until retuned on hardware.
@@ -3262,6 +3267,7 @@ static const ggml_opencl_fa_dim g_fa_dims_adreno_x2[] = {
     {192, 128, 16, 16, 1, 0},
     {192, 192, 16, 16, 1, 0},
     {256, 256, 16, 16, 16, 0},
+    {512, 512,  8, 16, 32, 0},
 };
 
 struct ggml_opencl_fa_dim_table {
@@ -5348,6 +5354,7 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                     { 40,  40}, { 64,  64}, { 80,  80}, { 96,  96},
                     {112, 112}, {128, 128}, {192, 128},
                     {192, 192}, {256, 256},
+                    {512, 512},  // Gemma-4 global-attention layers
                 };
 
                 bool dims_supported = false;
