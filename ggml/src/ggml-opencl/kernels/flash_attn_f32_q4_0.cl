@@ -463,6 +463,28 @@ __kernel void flash_attn_f32_q4_0_q1_vec(
     }
     barrier(CLK_LOCAL_MEM_FENCE);
 
+#ifdef FA_HAVE_INT_DOT
+    // Quantize Q to int8-packed uints + per-block (qd, q_sum) once per WG
+    // for dp4a dot. One thread per Q block (DK_Q4_BLOCKS threads active);
+    // remaining threads idle this step. At DK=256 this is 8 blocks ~ 320 B
+    // LDS plus the 8-uint packed payload per block.
+    __local uint  q_packed_shared[DK_Q4_BLOCKS * 8];
+    __local float q_d_shared[DK_Q4_BLOCKS];
+    __local int   q_sum_shared[DK_Q4_BLOCKS];
+    if (tid < DK_Q4_BLOCKS) {
+        ACC_TYPE4 q_block[8];
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) q_block[i] = q_shared[tid * 8 + i];
+        uint packed[8];
+        q4_q_block_info info = quant_q_block_int8_packed_q4(q_block, packed);
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) q_packed_shared[tid * 8 + i] = packed[i];
+        q_d_shared[tid]   = info.qd;
+        q_sum_shared[tid] = info.q_sum;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+#endif
+
     const float slope = get_alibi_slope(max_bias, head_idx, n_head_log2, m0, m1);
 
     const global ACC_TYPE * sinks_ptr = NULL;
@@ -485,6 +507,46 @@ __kernel void flash_attn_f32_q4_0_q1_vec(
         const global char * k_row = k_base + batch_idx * k_nb3 + head_kv_idx * k_nb2 + k_idx * k_nb1;
         const global char * v_row = v_base + batch_idx * v_nb3 + head_kv_idx * v_nb2 + k_idx * v_nb1;
 
+#ifdef FA_HAVE_INT_DOT
+        // Per-lane dp4a path: each lane packs 4 raw q4_0 nibbles (its
+        // quartet of the K block) into a uint, then dot_acc_sat_4x8packed_ss_int
+        // against the matching Q-quartet uint from q_packed_shared. The
+        // (nibble - 8) bias correction is folded in on lane_in_block==0 only,
+        // so the per-block sum reduces correctly across the 8 lanes
+        // contributing to it.
+        ACC_TYPE lane_contrib = 0.0f;
+        for (int qk = tid_sg; qk < DK_VEC; qk += Q1_WG_SIZE) {
+            const int block_idx     = qk / 8;
+            const int lane_in_block = qk % 8;
+            const int g             = lane_in_block & 3;
+            const int shift         = (lane_in_block < 4) ? 0 : 4;
+            const global char *  k_block = k_row + block_idx * Q4_0_BLOCK_SIZE;
+            const float kd = vload_half(0, (const global half *)k_block);
+            const global uchar * k_qs = (const global uchar *)(k_block + 2);
+            const uchar b0 = k_qs[g*4 + 0];
+            const uchar b1 = k_qs[g*4 + 1];
+            const uchar b2 = k_qs[g*4 + 2];
+            const uchar b3 = k_qs[g*4 + 3];
+            const uint k_packed = ((uint)((b0 >> shift) & 0x0F))       |
+                                  ((uint)((b1 >> shift) & 0x0F)) <<  8 |
+                                  ((uint)((b2 >> shift) & 0x0F)) << 16 |
+                                  ((uint)((b3 >> shift) & 0x0F)) << 24;
+            const uint q_packed_lane = q_packed_shared[block_idx * 8 + lane_in_block];
+            const int  raw_dot = dot_acc_sat_4x8packed_ss_int(q_packed_lane, k_packed, 0);
+            const float qd          = q_d_shared[block_idx];
+            const float block_scale = qd * kd;
+            float contrib = (float)raw_dot * block_scale;
+            if (lane_in_block == 0) {
+                // Block bias correction is per-block; attribute it to lane 0
+                // so summing across the 8 lanes recovers
+                // qd*kd*(raw_dot_block - 8*q_sum_block).
+                const int q_sum_b = q_sum_shared[block_idx];
+                contrib -= 8.0f * block_scale * (float)q_sum_b;
+            }
+            lane_contrib += contrib;
+        }
+        ACC_TYPE score = sub_group_reduce_add(lane_contrib) * scale;
+#else
         ACC_TYPE4 dot4 = (ACC_TYPE4)(0.0f);
         for (int qk = tid_sg; qk < DK_VEC; qk += Q1_WG_SIZE) {
             const int block_idx = qk / 8;
@@ -494,6 +556,7 @@ __kernel void flash_attn_f32_q4_0_q1_vec(
         }
         ACC_TYPE dot_partial = dot4.s0 + dot4.s1 + dot4.s2 + dot4.s3;
         ACC_TYPE score = sub_group_reduce_add(dot_partial) * scale;
+#endif
 
         if (mask_base != NULL) {
             const global MASK_DATA_TYPE * mask_ptr = (const global MASK_DATA_TYPE *) mask_base;
