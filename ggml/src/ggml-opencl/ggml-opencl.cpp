@@ -11758,12 +11758,24 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
                 kernel = backend_ctx->kernels_flash_attn_f32_q8_0_q1.at(dk_dv);
             }
         } else if (use_native_q4_0_q1) {
-            // q4_0 vec kernel exists but uses f32 dot (no dp4a). The legacy
-            // q1 path uses cl_khr_integer_dot_product, ~4x faster ALU on
-            // Adreno X2 — its dp4a advantage offsets the o_acc spill at
-            // short ctx, where the cheap dot dominates. Until the vec port
-            // implements per-lane dp4a, keep dispatch on legacy.
-            kernel = backend_ctx->kernels_flash_attn_f32_q4_0_q1.at(dk_dv);
+            // q4_0 vec kernel now uses per-lane dp4a (cl_khr_integer_dot_product)
+            // — closes most of the gap vs legacy q1 at short ctx (was -45%
+            // pre-dp4a) but still measures -10/-11% behind legacy on the
+            // canonical target (Qwen3.6-A3B MXFP4 / q4_0 KV) at both short
+            // and long context. q8_0 vec wins because q8_0 KV exposes the
+            // o_acc spill more sharply than q4_0; for q4_0 the legacy q1
+            // path's lower per-WG overhead still wins on MoE-bound models.
+            // Keep dispatch on legacy q1 until vec beats it on a real target;
+            // opt-in via GGML_OPENCL_FA_Q4_VEC=1 for measurement.
+            const char * q4vec_env = getenv("GGML_OPENCL_FA_Q4_VEC");
+            const bool   q4vec_opt_in = (q4vec_env != NULL) && (q4vec_env[0] != '0');
+            if (q4vec_opt_in && d_head_v >= 256 &&
+                backend_ctx->kernels_flash_attn_f32_q4_0_q1_vec.count(dk_dv) > 0) {
+                kernel = backend_ctx->kernels_flash_attn_f32_q4_0_q1_vec.at(dk_dv);
+                use_q1_vec = true;
+            } else {
+                kernel = backend_ctx->kernels_flash_attn_f32_q4_0_q1.at(dk_dv);
+            }
         } else if (is_mixed) {
             // DV-split decode kernel (mirrors Metal vec FA) wins at large DV
             // where the standard q1 spills o_acc to DDR. Gate at DV >= 256
