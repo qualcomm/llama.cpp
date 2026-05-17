@@ -12251,45 +12251,59 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         // Opt-in: hybrid local-tile + MQ + FD-split for is_mixed @ DK=DV=128.
         const char * lmq_env = getenv("GGML_OPENCL_FA_LOCAL_MQ_SPLIT");
         const bool   lmq_on  = (lmq_env != NULL) && (lmq_env[0] != '0');
-        if (mq_enabled && mq_kv_ok && n_q == 1 && !is_causal &&
+        // Phase C session 1: extend Qwen3-30B-A3B-class (DK=DV=128 GQA=8) f16
+        // MQ_G8 vec path to handle n_q ∈ [1, N_MAX_VEC_NQ] for speculative
+        // verification batches. The kernel + grid already support n_q > 1
+        // (gid(2) decodes split_idx & q_idx); only the n_q==1 gate kept it
+        // off for n_q>1. Default cap = 1 (preserves old behaviour). Override
+        // via GGML_OPENCL_FA_VEC_NQ=N for a higher cap (recommended N=32 for
+        // spec --spec-draft-n-max=16 verify batches).
+        static const char * vec_nq_env = getenv("GGML_OPENCL_FA_VEC_NQ");
+        static const int N_MAX_VEC_NQ  = (vec_nq_env != NULL && vec_nq_env[0] != '\0')
+                                           ? atoi(vec_nq_env) : 1;
+        const bool nq_in_vec_range = (n_q >= 1) && (n_q <= N_MAX_VEC_NQ);
+        // Only the MQ_G8 path takes n_q > 1 in session 1. All other MQ paths
+        // (DK=DV=256, q8_0, q4_0, local_*) still require n_q == 1.
+        const bool nq1_only        = (n_q == 1);
+        if (mq_enabled && mq_kv_ok && nq_in_vec_range && !is_causal &&
             !use_local_tile &&  // local-tile dispatches its own grid, skip MQ FD-split
             n_kv >= FD_MIN_N_KV &&
             backend_ctx->kernels_flash_attn_f32_merge.count(dk_dv) > 0) {
-            // Hybrid local-tile + MQ + FD-split — opt-in via env, f16 KV DK=DV=128.
-            if (lmq_on && is_mixed && d_head_q == 128 && d_head_v == 128 &&
+            // Hybrid local-tile + MQ + FD-split — opt-in via env, f16 KV DK=DV=128, n_q==1 only.
+            if (nq1_only && lmq_on && is_mixed && d_head_q == 128 && d_head_v == 128 &&
                 gqa_ratio_dispatch == 8 &&
                 backend_ctx->kernels_flash_attn_f32_f16_q1_local_mq_split_g8.count(dk_dv) > 0) {
                 fd_k_split = backend_ctx->kernels_flash_attn_f32_f16_q1_local_mq_split_g8.at(dk_dv);
                 use_fd_mq  = true;
                 fd_mq_wg   = 64;  // LMQ_WG
-            } else if (lmq_on && is_mixed && d_head_q == 128 && d_head_v == 128 &&
+            } else if (nq1_only && lmq_on && is_mixed && d_head_q == 128 && d_head_v == 128 &&
                 gqa_ratio_dispatch == 4 &&
                 backend_ctx->kernels_flash_attn_f32_f16_q1_local_mq_split.count(dk_dv) > 0) {
                 fd_k_split = backend_ctx->kernels_flash_attn_f32_f16_q1_local_mq_split.at(dk_dv);
                 use_fd_mq  = true;
                 fd_mq_wg   = 64;  // LMQ_WG
-            // f16 KV — Gemma-3 class (DK=DV=256 GQA=4)
-            } else if (is_mixed && gqa_ratio_dispatch == 4 &&
+            // f16 KV — Gemma-3 class (DK=DV=256 GQA=4); n_q==1 only for now
+            } else if (nq1_only && is_mixed && gqa_ratio_dispatch == 4 &&
                 d_head_q == 256 && d_head_v == 256 &&
                 backend_ctx->kernels_flash_attn_f32_f16_q1_vec_mq_split.count(dk_dv) > 0) {
                 fd_k_split = backend_ctx->kernels_flash_attn_f32_f16_q1_vec_mq_split.at(dk_dv);
                 use_fd_mq  = true;
-            // f16 KV — Qwen3-30B-A3B class (DK=DV=128 GQA=8)
+            // f16 KV — Qwen3-30B-A3B class (DK=DV=128 GQA=8); EXTENDED to n_q ∈ [1, N_MAX_VEC_NQ]
             } else if (is_mixed && gqa_ratio_dispatch == 8 &&
                 d_head_q == 128 && d_head_v == 128 &&
                 backend_ctx->kernels_flash_attn_f32_f16_q1_vec_mq_split_g8.count(dk_dv) > 0) {
                 fd_k_split = backend_ctx->kernels_flash_attn_f32_f16_q1_vec_mq_split_g8.at(dk_dv);
                 use_fd_mq  = true;
                 fd_mq_wg   = 192;
-            // q8_0 KV — DK=DV=128 GQA=8 (Qwen3-30B-A3B q8 KV path)
-            } else if (is_q8_0 && gqa_ratio_dispatch == 8 &&
+            // q8_0 KV — DK=DV=128 GQA=8 (Qwen3-30B-A3B q8 KV path); n_q==1 only for now
+            } else if (nq1_only && is_q8_0 && gqa_ratio_dispatch == 8 &&
                 d_head_q == 128 && d_head_v == 128 &&
                 backend_ctx->kernels_flash_attn_f32_q8_0_q1_vec_mq_split_g8.count(dk_dv) > 0) {
                 fd_k_split = backend_ctx->kernels_flash_attn_f32_q8_0_q1_vec_mq_split_g8.at(dk_dv);
                 use_fd_mq  = true;
                 fd_mq_wg   = 192;
-            // q8_0 KV — DK=DV=128 GQA=4 (Gemma-3 q8, Llama q8 class)
-            } else if (is_q8_0 && gqa_ratio_dispatch == 4 &&
+            // q8_0 KV — DK=DV=128 GQA=4 (Gemma-3 q8, Llama q8 class); n_q==1 only for now
+            } else if (nq1_only && is_q8_0 && gqa_ratio_dispatch == 4 &&
                 d_head_q == 128 && d_head_v == 128 &&
                 backend_ctx->kernels_flash_attn_f32_q8_0_q1_vec_mq_split.count(dk_dv) > 0) {
                 fd_k_split = backend_ctx->kernels_flash_attn_f32_q8_0_q1_vec_mq_split.at(dk_dv);
@@ -12300,7 +12314,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
             // doesn't offset the per-h dp4a + LDS overhead. Compare q8 (8 b/e)
             // which wins +24.8% and f16 (16 b/e) which wins +11.9%. Kernel
             // kept registered; enable for measurement via GGML_OPENCL_FA_Q4_MQ=1.
-            } else if (is_q4_0) {
+            } else if (nq1_only && is_q4_0) {
                 const char * q4_mq_env = getenv("GGML_OPENCL_FA_Q4_MQ");
                 const bool   q4_mq_on  = (q4_mq_env != NULL) && (q4_mq_env[0] != '0');
                 if (q4_mq_on && gqa_ratio_dispatch == 8 &&
