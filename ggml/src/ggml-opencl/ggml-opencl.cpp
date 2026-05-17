@@ -14789,7 +14789,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
                 backend_ctx->fa.f32_f16_q1_local_mq_split_g8.count(dk_dv) > 0) {
                 fd_k_split = backend_ctx->fa.f32_f16_q1_local_mq_split_g8.at(dk_dv);
                 use_fd_mq  = true;
-                fd_mq_wg   = 64;
+                fd_mq_wg   = 64;  // LMQ_WG
             } else if (nq1_only && lmq_on && is_mixed && d_head_q == 128 && d_head_v == 128 &&
                 gqa_ratio_dispatch == 4 &&
                 backend_ctx->fa.f32_f16_q1_local_mq_split.count(dk_dv) > 0) {
@@ -14858,12 +14858,14 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
                 fd_k_split = backend_ctx->fa.f32_f16_q1_vec_mq_split_g8.at(dk_dv);
                 use_fd_mq  = true;
                 fd_mq_wg   = 192;
+            // q8_0 KV — DK=DV=128 GQA=8 (Qwen3-30B-A3B q8 KV path); n_q==1 only for now
             } else if (nq1_only && is_q8_0 && gqa_ratio_dispatch == 8 &&
                 d_head_q == 128 && d_head_v == 128 &&
                 backend_ctx->fa.f32_q8_0_q1_vec_mq_split_g8.count(dk_dv) > 0) {
                 fd_k_split = backend_ctx->fa.f32_q8_0_q1_vec_mq_split_g8.at(dk_dv);
                 use_fd_mq  = true;
                 fd_mq_wg   = 192;
+            // q8_0 KV — DK=DV=128 GQA=4 (Gemma-3 q8, Llama q8 class); n_q==1 only for now
             } else if (nq1_only && is_q8_0 && gqa_ratio_dispatch == 4 &&
                 d_head_q == 128 && d_head_v == 128 &&
                 backend_ctx->fa.f32_q8_0_q1_vec_mq_split.count(dk_dv) > 0) {
@@ -14876,6 +14878,11 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
                     fd_k_split = backend_ctx->fa.f32_q8_0_q1_vec_mq_split.at(dk_dv);
                 }
                 use_fd_mq  = true;
+            // q4_0 KV — opt-in only. The MQ port for q4_0 regressed on
+            // Qwen3-30B-A3B: q4_0 K is only 4 bits/element, so the K-bandwidth
+            // saving MQ offers doesn't offset the per-head dp4a + LDS overhead
+            // (q8_0 at 8 b/e and f16 at 16 b/e do win). Kernel kept registered;
+            // enable for measurement via GGML_OPENCL_FA_Q4_MQ=1.
             } else if (nq1_only && is_q4_0) {
                 const char * q4_mq_env = getenv("GGML_OPENCL_FA_Q4_MQ");
                 const bool   q4_mq_on  = (q4_mq_env != NULL) && (q4_mq_env[0] != '0');
