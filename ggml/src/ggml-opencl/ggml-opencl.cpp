@@ -559,12 +559,35 @@ struct ggml_backend_opencl_context {
     // n_kv-split for occupancy. Produces MQ_GQA partial records per WG;
     // reuses `flash_attn_f32_merge` for normalization.
     std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_f16_q1_vec_mq_split;
+    // MQ_GQA=8 specializations (Qwen3-30B-A3B / Qwen3-4B family). Compiled
+    // alongside the default MQ_GQA=4 set so each gqa_ratio routes to a
+    // kernel whose compile-time Q-row stride matches. Same kernel source,
+    // second program with -DMQ_GQA=8.
+    std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_f16_q1_vec_mq_g8;
+    std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_f16_q1_vec_mq_split_g8;
+    // Alternative decode FA: 1 WG per (q_idx, q_head) with __local K/V tile +
+    // pure __local tree-reduce. One float of o_acc per thread (D-split).
+    // Trades K-bw (no Q-head coalescing) for parallelism (n_head WGs in
+    // flight). Compiled only at DK=DV=128 (LT_WG fixed at 128).
+    std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_f16_q1_local_tile;
+    // Hybrid local-tile + MQ + FD-split kernel. Combines: (1) MQ_GQA Q-head
+    // coalescing, (2) sub_group_reduce_add dot, (3) FD n_kv split, plus the
+    // __local K/V tile. WG=64 (1 subgroup), MQ_GQA=4 default + _g8 second
+    // compile. Compiled at DK=DV=128 only.
+    std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_f16_q1_local_mq_split;
+    std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_f16_q1_local_mq_split_g8;
     // Flash-decoding K-split (f16 KV).
     std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_f16_q1_split;
     std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_merge;
     std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_q8_0_q1;  // Q=f32, KV=q8_0 decode
     std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_q8_0_q1_vec; // DV-split + multi-subgroup variant
     std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_q8_0_q1_split; // Flash-Decoding Pass 1 for q8_0
+    // KV-head-coalesced + flash-decoding split for q8_0 KV. Mirrors the f16
+    // variant — one WG handles MQ_GQA Q-heads sharing one KV-head, K and V
+    // each read once. MQ_GQA=4 default for Gemma class; _g8 second compile
+    // for Qwen3-30B-A3B class (GQA=8).
+    std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_q8_0_q1_vec_mq_split;
+    std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_q8_0_q1_vec_mq_split_g8;
     std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_q8_0;     // Q=f32, KV=q8_0 prefill (baseline)
     std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_q8_0_split;                // N_SPLIT>1 variant
     std::map<std::pair<int, int>, int>       kernels_flash_attn_f32_q8_0_split_wg_size;        // wg_size = bm*n_split
@@ -572,6 +595,10 @@ struct ggml_backend_opencl_context {
     std::map<std::pair<int, int>, int>       kernels_flash_attn_f32_q8_0_split_bm;             // per-split BLOCK_M (usually same as f16 bm)
     std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_q4_0_q1;  // Q=f32, KV=q4_0 decode
     std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_q4_0_q1_vec; // DV-split + multi-subgroup variant
+    // KV-head-coalesced + flash-decoding split for q4_0 KV. dp4a K dot.
+    // MQ_GQA=4 default; _g8 second compile for Qwen3-30B-A3B class.
+    std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_q4_0_q1_vec_mq_split;
+    std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_q4_0_q1_vec_mq_split_g8;
     std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_q4_0_q1_split; // Flash-Decoding Pass 1 for q4_0
     std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_q4_0;     // Q=f32, KV=q4_0 prefill (baseline)
     std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_q4_0_split;                // N_SPLIT>1 variant
@@ -3681,6 +3708,88 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
             if (err == CL_SUCCESS) {
                 backend_ctx->kernels_flash_attn_f32_merge[{dk, dv}] = k_merge;
             }
+            // Local-tile decode variant (DK=DV=128 only; LT_WG=128).
+            // Required WG = 128. Best-effort compile.
+            if (dk == 128 && dv == 128) {
+                cl_kernel k_lt = clCreateKernel(prog, "flash_attn_f32_f16_q1_local_tile", &err);
+                if (err == CL_SUCCESS) {
+                    if (ggml_opencl_fa_kernel_fits_wg(backend_ctx, k_lt, 128,
+                                                      "flash_attn_f32_f16_q1_local_tile", dk, dv)) {
+                        backend_ctx->kernels_flash_attn_f32_f16_q1_local_tile[{dk, dv}] = k_lt;
+                        ggml_opencl_log_fa_kernel_spill(backend_ctx, k_lt, "flash_attn_f32_f16_q1_local_tile", dk, dv);
+                    } else {
+                        clReleaseKernel(k_lt);
+                    }
+                }
+                // Hybrid local-tile + MQ + FD-split. MQ_GQA=4 from default
+                // compile. Required WG = 64 (1 subgroup).
+                cl_kernel k_lmq = clCreateKernel(prog, "flash_attn_f32_f16_q1_local_mq_split", &err);
+                if (err == CL_SUCCESS) {
+                    if (ggml_opencl_fa_kernel_fits_wg(backend_ctx, k_lmq, 64,
+                                                      "flash_attn_f32_f16_q1_local_mq_split", dk, dv)) {
+                        backend_ctx->kernels_flash_attn_f32_f16_q1_local_mq_split[{dk, dv}] = k_lmq;
+                        ggml_opencl_log_fa_kernel_spill(backend_ctx, k_lmq, "flash_attn_f32_f16_q1_local_mq_split", dk, dv);
+                    } else {
+                        clReleaseKernel(k_lmq);
+                    }
+                }
+            }
+            // Second compile of the same source with -DMQ_GQA=8 for the
+            // Qwen3-30B-A3B / Qwen3-4B class (GQA=8). Only the two MQ kernels
+            // are extracted; everything else is identical to the MQ_GQA=4
+            // program above and would just duplicate cache. Compile is
+            // best-effort: if the larger __local Q stage (8 Q rows × DK_VEC)
+            // doesn't fit or the WG cap drops, the dispatch falls back to
+            // the legacy q1_vec path. Mirrors Metal's per-NQPSG template
+            // specialization (see [[feedback_mimic_metal_fa]]).
+            // MQ_GQA=8 doubles per-thread state (o_acc[8][1], m_i[8], l_i[8],
+            // slope[8], mask_base[8]) → Adreno's per-kernel WG cap drops from
+            // 256 to 192 due to register pressure (measured 2026-05-16 on
+            // Adreno X2-90). Compile with MQ_NSG=3 / MQ_NSG_SPLIT=3 so the
+            // 192-thread cap is sufficient; the kernel's merge loops are
+            // already NSG-agnostic.
+            const std::string opts_g8 = opts + " -D MQ_GQA=8 -D MQ_NSG=3 -D MQ_NSG_SPLIT=3";
+            cl_program prog_g8 = build_program_from_source_ex(
+                backend_ctx->context, backend_ctx->device, src.c_str(), opts_g8,
+                /*fatal=*/false, "fa f32_f16 MQ_GQA=8");
+            if (prog_g8) {
+                const size_t mq_g8_required_wg = 192;  // Q1_WG_SIZE(64) * MQ_NSG_SPLIT(3)
+                cl_kernel k_q1_vec_mq_g8 = clCreateKernel(prog_g8, "flash_attn_f32_f16_q1_vec_mq", &err);
+                if (err == CL_SUCCESS) {
+                    if (ggml_opencl_fa_kernel_fits_wg(backend_ctx, k_q1_vec_mq_g8, mq_g8_required_wg,
+                                                      "flash_attn_f32_f16_q1_vec_mq (g8)", dk, dv)) {
+                        backend_ctx->kernels_flash_attn_f32_f16_q1_vec_mq_g8[{dk, dv}] = k_q1_vec_mq_g8;
+                        ggml_opencl_log_fa_kernel_spill(backend_ctx, k_q1_vec_mq_g8, "flash_attn_f32_f16_q1_vec_mq_g8", dk, dv);
+                    } else {
+                        clReleaseKernel(k_q1_vec_mq_g8);
+                    }
+                }
+                cl_kernel k_q1_vec_mq_split_g8 = clCreateKernel(prog_g8, "flash_attn_f32_f16_q1_vec_mq_split", &err);
+                if (err == CL_SUCCESS) {
+                    if (ggml_opencl_fa_kernel_fits_wg(backend_ctx, k_q1_vec_mq_split_g8, mq_g8_required_wg,
+                                                      "flash_attn_f32_f16_q1_vec_mq_split (g8)", dk, dv)) {
+                        backend_ctx->kernels_flash_attn_f32_f16_q1_vec_mq_split_g8[{dk, dv}] = k_q1_vec_mq_split_g8;
+                        ggml_opencl_log_fa_kernel_spill(backend_ctx, k_q1_vec_mq_split_g8, "flash_attn_f32_f16_q1_vec_mq_split_g8", dk, dv);
+                    } else {
+                        clReleaseKernel(k_q1_vec_mq_split_g8);
+                    }
+                }
+                // Hybrid local-tile + MQ_GQA=8. WG=64 (1 subgroup); the
+                // per-kernel WG cap should stay >= 64 even at high reg pressure.
+                if (dk == 128 && dv == 128) {
+                    cl_kernel k_lmq_g8 = clCreateKernel(prog_g8, "flash_attn_f32_f16_q1_local_mq_split", &err);
+                    if (err == CL_SUCCESS) {
+                        if (ggml_opencl_fa_kernel_fits_wg(backend_ctx, k_lmq_g8, 64,
+                                                          "flash_attn_f32_f16_q1_local_mq_split (g8)", dk, dv)) {
+                            backend_ctx->kernels_flash_attn_f32_f16_q1_local_mq_split_g8[{dk, dv}] = k_lmq_g8;
+                            ggml_opencl_log_fa_kernel_spill(backend_ctx, k_lmq_g8, "flash_attn_f32_f16_q1_local_mq_split_g8", dk, dv);
+                        } else {
+                            clReleaseKernel(k_lmq_g8);
+                        }
+                    }
+                }
+                clReleaseProgram(prog_g8);
+            }
             break;
         }
         case FA_VARIANT_Q8_0: {
@@ -3708,11 +3817,46 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
                     clReleaseKernel(k_q1_vec);
                 }
             }
+            // MQ split variant: shares one KV-head across MQ_GQA Q-heads.
+            // Default MQ_GQA=4 / MQ_NSG_SPLIT=4 (Gemma-3 class). Second
+            // compile below for MQ_GQA=8 / MQ_NSG_SPLIT=3 (Qwen3-30B-A3B).
+            cl_kernel k_q1_vec_mq_split = clCreateKernel(prog, "flash_attn_f32_q8_0_q1_vec_mq_split", &err);
+            if (err == CL_SUCCESS) {
+                if (ggml_opencl_fa_kernel_fits_wg(backend_ctx, k_q1_vec_mq_split, 256,
+                                                  "flash_attn_f32_q8_0_q1_vec_mq_split", dk, dv)) {
+                    backend_ctx->kernels_flash_attn_f32_q8_0_q1_vec_mq_split[{dk, dv}] = k_q1_vec_mq_split;
+                    ggml_opencl_log_fa_kernel_spill(backend_ctx, k_q1_vec_mq_split, "flash_attn_f32_q8_0_q1_vec_mq_split", dk, dv);
+                } else {
+                    clReleaseKernel(k_q1_vec_mq_split);
+                }
+            }
             if (!backend_ctx->kernels_flash_attn_f32_merge.count({dk, dv})) {
                 cl_kernel k_merge = clCreateKernel(prog, "flash_attn_f32_merge", &err);
                 if (err == CL_SUCCESS) {
                     backend_ctx->kernels_flash_attn_f32_merge[{dk, dv}] = k_merge;
                 }
+            }
+            // Second compile with MQ_GQA=8 / MQ_NSG=3 / MQ_NSG_SPLIT=3 for
+            // Qwen3-30B-A3B / Qwen3-4B class. WG cap at MQ_GQA=8 drops to
+            // 192 on Adreno X2 due to register pressure; NSG=3 matches.
+            // Best-effort; falls back to legacy q1 at dispatch if missing.
+            const std::string opts_q8_g8 = opts + " -D MQ_GQA=8 -D MQ_NSG=3 -D MQ_NSG_SPLIT=3";
+            cl_program prog_q8_g8 = build_program_from_source_ex(
+                backend_ctx->context, backend_ctx->device, src.c_str(), opts_q8_g8,
+                /*fatal=*/false, "fa q8_0 MQ_GQA=8");
+            if (prog_q8_g8) {
+                const size_t q8_mq_g8_required_wg = 192;
+                cl_kernel k_g8 = clCreateKernel(prog_q8_g8, "flash_attn_f32_q8_0_q1_vec_mq_split", &err);
+                if (err == CL_SUCCESS) {
+                    if (ggml_opencl_fa_kernel_fits_wg(backend_ctx, k_g8, q8_mq_g8_required_wg,
+                                                      "flash_attn_f32_q8_0_q1_vec_mq_split (g8)", dk, dv)) {
+                        backend_ctx->kernels_flash_attn_f32_q8_0_q1_vec_mq_split_g8[{dk, dv}] = k_g8;
+                        ggml_opencl_log_fa_kernel_spill(backend_ctx, k_g8, "flash_attn_f32_q8_0_q1_vec_mq_split_g8", dk, dv);
+                    } else {
+                        clReleaseKernel(k_g8);
+                    }
+                }
+                clReleaseProgram(prog_q8_g8);
             }
             break;
         }
@@ -3741,11 +3885,42 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
                     clReleaseKernel(k_q1_vec);
                 }
             }
+            // q4_0 MQ split (MQ_GQA=4 default).
+            cl_kernel k_q4_mq_split = clCreateKernel(prog, "flash_attn_f32_q4_0_q1_vec_mq_split", &err);
+            if (err == CL_SUCCESS) {
+                if (ggml_opencl_fa_kernel_fits_wg(backend_ctx, k_q4_mq_split, 256,
+                                                  "flash_attn_f32_q4_0_q1_vec_mq_split", dk, dv)) {
+                    backend_ctx->kernels_flash_attn_f32_q4_0_q1_vec_mq_split[{dk, dv}] = k_q4_mq_split;
+                    ggml_opencl_log_fa_kernel_spill(backend_ctx, k_q4_mq_split, "flash_attn_f32_q4_0_q1_vec_mq_split", dk, dv);
+                } else {
+                    clReleaseKernel(k_q4_mq_split);
+                }
+            }
             if (!backend_ctx->kernels_flash_attn_f32_merge.count({dk, dv})) {
                 cl_kernel k_merge = clCreateKernel(prog, "flash_attn_f32_merge", &err);
                 if (err == CL_SUCCESS) {
                     backend_ctx->kernels_flash_attn_f32_merge[{dk, dv}] = k_merge;
                 }
+            }
+            // Second compile with MQ_GQA=8 / MQ_NSG=3 / MQ_NSG_SPLIT=3 for
+            // Qwen3-30B-A3B / Qwen3-4B class. Best-effort.
+            const std::string opts_q4_g8 = opts + " -D MQ_GQA=8 -D MQ_NSG=3 -D MQ_NSG_SPLIT=3";
+            cl_program prog_q4_g8 = build_program_from_source_ex(
+                backend_ctx->context, backend_ctx->device, src.c_str(), opts_q4_g8,
+                /*fatal=*/false, "fa q4_0 MQ_GQA=8");
+            if (prog_q4_g8) {
+                const size_t q4_mq_g8_required_wg = 192;
+                cl_kernel k_g8 = clCreateKernel(prog_q4_g8, "flash_attn_f32_q4_0_q1_vec_mq_split", &err);
+                if (err == CL_SUCCESS) {
+                    if (ggml_opencl_fa_kernel_fits_wg(backend_ctx, k_g8, q4_mq_g8_required_wg,
+                                                      "flash_attn_f32_q4_0_q1_vec_mq_split (g8)", dk, dv)) {
+                        backend_ctx->kernels_flash_attn_f32_q4_0_q1_vec_mq_split_g8[{dk, dv}] = k_g8;
+                        ggml_opencl_log_fa_kernel_spill(backend_ctx, k_g8, "flash_attn_f32_q4_0_q1_vec_mq_split_g8", dk, dv);
+                    } else {
+                        clReleaseKernel(k_g8);
+                    }
+                }
+                clReleaseProgram(prog_q4_g8);
             }
             break;
         }
@@ -11743,6 +11918,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
 
     bool use_q1_vec = false;
     bool use_q1_vec_mq = false;
+    bool use_local_tile = false;
     // KV-head-coalesced gate: gqa_ratio == compile-time MQ_GQA (4 → Gemma-3
     // family). LDS budget restricts to DK=DV=256 for now. At higher DV the
     // sg_o array (16 KB at DV=256) doubles per DV doubling and would exceed
@@ -11778,9 +11954,12 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
             }
         } else if (is_mixed) {
             // DV-split decode kernel (mirrors Metal vec FA) wins at large DV
-            // where the standard q1 spills o_acc to DDR. Gate at DV >= 256
-            // for now (Qwen3.6 / Gemma-4 SWA / Gemma-4 global). Fall back if
-            // the kernel didn't compile (no-extension driver).
+            // where the standard q1 spills o_acc to DDR. Gate originally at
+            // DV >= 256 (Qwen3.6 / Gemma-4). 2026-05-16: lowered to DV >= 128
+            // to probe Qwen3-30B-A3B (DK=DV=128 GQA 8:1). CUDA & Metal pick
+            // the vec-style kernel for DK=128 with multi-Q-per-CTA, so this
+            // is the expected portable shape. Fall back if the kernel
+            // didn't compile (no-extension driver).
             // NOTE: single-WG MQ (q1_vec_mq) is registered but not dispatched.
             // At Gemma-3-1B / DK=DV=256 with WG=256 (4 subgroups, the max
             // viable on Adreno X2 for this kernel), it benches at ~60 t/s
@@ -11790,12 +11969,32 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
             // pairs MQ coalescing with n_kv splitting across WGs for
             // occupancy. Left registered so the source is available for
             // future experimentation.
-            if (d_head_v >= 256 &&
-                backend_ctx->kernels_flash_attn_f32_f16_q1_vec.count(dk_dv) > 0) {
-                kernel = backend_ctx->kernels_flash_attn_f32_f16_q1_vec.at(dk_dv);
-                use_q1_vec = true;
+            // Gate the vec path. 2026-05-16: default lowered from DV >= 256 to
+            // DV >= 128 after a 5-model regression sweep (Qwen3-30B-A3B,
+            // Qwen3-8B Q8, Qwen3-4B Q4, Llama-3-8B Q4, Qwen2.5-7B Q4_K_M) showed
+            // no regression and small wins (+0.3 to +3.2% tg128@d=8k fa=1 f16).
+            // GGML_OPENCL_FA_F16_VEC_DK128=0 forces legacy q1 (opt-out for
+            // diagnosis if a regression surfaces on an untested shape).
+            // Opt-in: alternative local-tile decode kernel (DK=DV=128 only).
+            // GGML_OPENCL_FA_LOCAL_TILE=1 routes to flash_attn_f32_f16_q1_local_tile
+            // when registered; suppresses both vec and MQ FD-split paths.
+            static const char * lt_env = getenv("GGML_OPENCL_FA_LOCAL_TILE");
+            static const bool   lt_on  = (lt_env != NULL) && (lt_env[0] != '0');
+            if (lt_on && d_head_q == 128 && d_head_v == 128 &&
+                backend_ctx->kernels_flash_attn_f32_f16_q1_local_tile.count(dk_dv) > 0) {
+                kernel = backend_ctx->kernels_flash_attn_f32_f16_q1_local_tile.at(dk_dv);
+                use_local_tile = true;
             } else {
-                kernel = backend_ctx->kernels_flash_attn_f32_f16_q1.at(dk_dv);
+                static const char * f16_vec_dk128_env = getenv("GGML_OPENCL_FA_F16_VEC_DK128");
+                static const bool   f16_vec_dk128_off = (f16_vec_dk128_env != NULL) && (f16_vec_dk128_env[0] == '0');
+                const int dv_gate = f16_vec_dk128_off ? 256 : 128;
+                if (d_head_v >= dv_gate &&
+                    backend_ctx->kernels_flash_attn_f32_f16_q1_vec.count(dk_dv) > 0) {
+                    kernel = backend_ctx->kernels_flash_attn_f32_f16_q1_vec.at(dk_dv);
+                    use_q1_vec = true;
+                } else {
+                    kernel = backend_ctx->kernels_flash_attn_f32_f16_q1.at(dk_dv);
+                }
             }
         } else if (is_f16) {
             kernel = backend_ctx->kernels_flash_attn_f16_q1.at(dk_dv);
@@ -12037,19 +12236,86 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     const int fd_max_n_q = (d_head_q <= FD_MAX_DK_MULTI) ? FD_MAX_N_Q_MULTI : 1;
     cl_kernel fd_k_split = NULL;
     bool use_fd_mq = false;
+    size_t fd_mq_wg = 256;  // MQ_GQA=4 kernel: Q1_WG_SIZE(64) * MQ_NSG_SPLIT(4)
     // MQ flash-decoding gate. Bypasses FD_MAX_DK because the MQ split kernel
     // uses NSG=8 × 64 lanes, so o_acc is DV-split — no spill at DK=DV=256.
     // Same MQ enable knob as the single-WG MQ path.
+    // - gqa_ratio == 4 + DK=DV=256: Gemma-3 family, MQ_GQA=4 kernel.
+    // - gqa_ratio == 8 + DK=DV=128: Qwen3-30B-A3B / Qwen3-4B class, MQ_GQA=8
+    //   kernel (compiled alongside via second program). Phase B1 lever per
+    //   [[feedback_mimic_metal_fa]] — mirrors Metal's NQPSG dispatch.
     {
         const char * mq_env = getenv("GGML_OPENCL_FA_MQ");
         const bool mq_enabled = (mq_env == NULL) ? true : (mq_env[0] != '0');
-        if (mq_enabled && is_mixed && n_q == 1 && !is_causal &&
-            n_kv >= FD_MIN_N_KV && gqa_ratio_dispatch == 4 &&
-            d_head_q == 256 && d_head_v == 256 &&
-            backend_ctx->kernels_flash_attn_f32_merge.count(dk_dv) > 0 &&
-            backend_ctx->kernels_flash_attn_f32_f16_q1_vec_mq_split.count(dk_dv) > 0) {
-            fd_k_split = backend_ctx->kernels_flash_attn_f32_f16_q1_vec_mq_split.at(dk_dv);
-            use_fd_mq  = true;
+        const bool mq_kv_ok   = is_mixed || is_q8_0 || is_q4_0;
+        // Opt-in: hybrid local-tile + MQ + FD-split for is_mixed @ DK=DV=128.
+        const char * lmq_env = getenv("GGML_OPENCL_FA_LOCAL_MQ_SPLIT");
+        const bool   lmq_on  = (lmq_env != NULL) && (lmq_env[0] != '0');
+        if (mq_enabled && mq_kv_ok && n_q == 1 && !is_causal &&
+            !use_local_tile &&  // local-tile dispatches its own grid, skip MQ FD-split
+            n_kv >= FD_MIN_N_KV &&
+            backend_ctx->kernels_flash_attn_f32_merge.count(dk_dv) > 0) {
+            // Hybrid local-tile + MQ + FD-split — opt-in via env, f16 KV DK=DV=128.
+            if (lmq_on && is_mixed && d_head_q == 128 && d_head_v == 128 &&
+                gqa_ratio_dispatch == 8 &&
+                backend_ctx->kernels_flash_attn_f32_f16_q1_local_mq_split_g8.count(dk_dv) > 0) {
+                fd_k_split = backend_ctx->kernels_flash_attn_f32_f16_q1_local_mq_split_g8.at(dk_dv);
+                use_fd_mq  = true;
+                fd_mq_wg   = 64;  // LMQ_WG
+            } else if (lmq_on && is_mixed && d_head_q == 128 && d_head_v == 128 &&
+                gqa_ratio_dispatch == 4 &&
+                backend_ctx->kernels_flash_attn_f32_f16_q1_local_mq_split.count(dk_dv) > 0) {
+                fd_k_split = backend_ctx->kernels_flash_attn_f32_f16_q1_local_mq_split.at(dk_dv);
+                use_fd_mq  = true;
+                fd_mq_wg   = 64;  // LMQ_WG
+            // f16 KV — Gemma-3 class (DK=DV=256 GQA=4)
+            } else if (is_mixed && gqa_ratio_dispatch == 4 &&
+                d_head_q == 256 && d_head_v == 256 &&
+                backend_ctx->kernels_flash_attn_f32_f16_q1_vec_mq_split.count(dk_dv) > 0) {
+                fd_k_split = backend_ctx->kernels_flash_attn_f32_f16_q1_vec_mq_split.at(dk_dv);
+                use_fd_mq  = true;
+            // f16 KV — Qwen3-30B-A3B class (DK=DV=128 GQA=8)
+            } else if (is_mixed && gqa_ratio_dispatch == 8 &&
+                d_head_q == 128 && d_head_v == 128 &&
+                backend_ctx->kernels_flash_attn_f32_f16_q1_vec_mq_split_g8.count(dk_dv) > 0) {
+                fd_k_split = backend_ctx->kernels_flash_attn_f32_f16_q1_vec_mq_split_g8.at(dk_dv);
+                use_fd_mq  = true;
+                fd_mq_wg   = 192;
+            // q8_0 KV — DK=DV=128 GQA=8 (Qwen3-30B-A3B q8 KV path)
+            } else if (is_q8_0 && gqa_ratio_dispatch == 8 &&
+                d_head_q == 128 && d_head_v == 128 &&
+                backend_ctx->kernels_flash_attn_f32_q8_0_q1_vec_mq_split_g8.count(dk_dv) > 0) {
+                fd_k_split = backend_ctx->kernels_flash_attn_f32_q8_0_q1_vec_mq_split_g8.at(dk_dv);
+                use_fd_mq  = true;
+                fd_mq_wg   = 192;
+            // q8_0 KV — DK=DV=128 GQA=4 (Gemma-3 q8, Llama q8 class)
+            } else if (is_q8_0 && gqa_ratio_dispatch == 4 &&
+                d_head_q == 128 && d_head_v == 128 &&
+                backend_ctx->kernels_flash_attn_f32_q8_0_q1_vec_mq_split.count(dk_dv) > 0) {
+                fd_k_split = backend_ctx->kernels_flash_attn_f32_q8_0_q1_vec_mq_split.at(dk_dv);
+                use_fd_mq  = true;
+            // q4_0 KV — opt-in only. The MQ port for q4_0 measured -50% on
+            // Qwen3-30B-A3B (3.36 → 1.67 t/s tg256@d=16k 2026-05-16) — q4_0 K
+            // is only 4 bits/element, so the K-bandwidth saving MQ offers
+            // doesn't offset the per-h dp4a + LDS overhead. Compare q8 (8 b/e)
+            // which wins +24.8% and f16 (16 b/e) which wins +11.9%. Kernel
+            // kept registered; enable for measurement via GGML_OPENCL_FA_Q4_MQ=1.
+            } else if (is_q4_0) {
+                const char * q4_mq_env = getenv("GGML_OPENCL_FA_Q4_MQ");
+                const bool   q4_mq_on  = (q4_mq_env != NULL) && (q4_mq_env[0] != '0');
+                if (q4_mq_on && gqa_ratio_dispatch == 8 &&
+                    d_head_q == 128 && d_head_v == 128 &&
+                    backend_ctx->kernels_flash_attn_f32_q4_0_q1_vec_mq_split_g8.count(dk_dv) > 0) {
+                    fd_k_split = backend_ctx->kernels_flash_attn_f32_q4_0_q1_vec_mq_split_g8.at(dk_dv);
+                    use_fd_mq  = true;
+                    fd_mq_wg   = 192;
+                } else if (q4_mq_on && gqa_ratio_dispatch == 4 &&
+                    d_head_q == 128 && d_head_v == 128 &&
+                    backend_ctx->kernels_flash_attn_f32_q4_0_q1_vec_mq_split.count(dk_dv) > 0) {
+                    fd_k_split = backend_ctx->kernels_flash_attn_f32_q4_0_q1_vec_mq_split.at(dk_dv);
+                    use_fd_mq  = true;
+                }
+            }
         }
     }
     if (fd_k_split == NULL &&
@@ -12130,7 +12396,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
 
         // MQ split kernel uses MQ_NSG_SPLIT subgroups × 64 lanes and one WG
         // per (kv_head, batch, split) — collapses the n_head dim to n_head_kv.
-        const size_t fd_wg = use_fd_mq ? 256 : 64; // matches Q1_WG_SIZE * NSG
+        const size_t fd_wg = use_fd_mq ? fd_mq_wg : 64; // matches Q1_WG_SIZE * NSG (MQ_GQA=4 → 256; MQ_GQA=8 → 192)
         const size_t fd_head_dim = use_fd_mq
             ? (size_t)(n_head_kv * n_batch)
             : (size_t)(n_head     * n_batch);
@@ -12207,20 +12473,30 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     }
 
     if (n_q == 1) {
-        // q1_vec dispatches with NSG subgroups (WG = NSG*64) to expose the
-        // n_kv loop to multi-subgroup parallelism; everything else uses 64.
-        // q1_vec is compiled with VEC_NSG=4 → WG = 4 * 64 = 256.
-        // q1_vec_mq is compiled with MQ_NSG=4 → WG = 4 * 64 = 256 (same as
-        // legacy q1_vec; the per-kernel cap on Adreno X2 forbids higher).
-        // It folds MQ_GQA Q-heads into each WG so the head dim of the grid
-        // collapses to n_head_kv (one WG per (kv_head, batch)).
-        const size_t wg_size = use_q1_vec ? 256 : 64;
-        const size_t head_dim_global = use_q1_vec_mq
-            ? (size_t)(n_head_kv * n_batch)
-            : (size_t)(n_head     * n_batch);
-        size_t local_work_size[] = { wg_size, 1 };
-        size_t global_work_size[] = { wg_size, head_dim_global };
-        backend_ctx->enqueue_ndrange_kernel(kernel, 2, global_work_size, local_work_size, dst);
+        if (use_local_tile) {
+            // Local-tile decode: 3D grid (LT_WG, n_head, n_batch).
+            // One WG per (q_idx, q_head, batch); LT_WG=128 lanes per WG
+            // co-compute one Q-row's attention via __local tile + tree-reduce.
+            const size_t lt_wg = 128;
+            size_t local_work_size[]  = { lt_wg, 1, 1 };
+            size_t global_work_size[] = { lt_wg, (size_t) n_head, (size_t) n_batch };
+            backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+        } else {
+            // q1_vec dispatches with NSG subgroups (WG = NSG*64) to expose the
+            // n_kv loop to multi-subgroup parallelism; everything else uses 64.
+            // q1_vec is compiled with VEC_NSG=4 → WG = 4 * 64 = 256.
+            // q1_vec_mq is compiled with MQ_NSG=4 → WG = 4 * 64 = 256 (same as
+            // legacy q1_vec; the per-kernel cap on Adreno X2 forbids higher).
+            // It folds MQ_GQA Q-heads into each WG so the head dim of the grid
+            // collapses to n_head_kv (one WG per (kv_head, batch)).
+            const size_t wg_size = use_q1_vec ? 256 : 64;
+            const size_t head_dim_global = use_q1_vec_mq
+                ? (size_t)(n_head_kv * n_batch)
+                : (size_t)(n_head     * n_batch);
+            size_t local_work_size[] = { wg_size, 1 };
+            size_t global_work_size[] = { wg_size, head_dim_global };
+            backend_ctx->enqueue_ndrange_kernel(kernel, 2, global_work_size, local_work_size, dst);
+        }
     } else if (use_native_q8_0) {
         // Split variant may override BLOCK_M (e.g. DK=96 quant uses BM=32).
         const int bm = use_split_q8_0
