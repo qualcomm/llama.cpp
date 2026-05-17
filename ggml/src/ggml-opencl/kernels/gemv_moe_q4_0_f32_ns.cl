@@ -30,18 +30,22 @@ __kernel void kernel_gemv_moe_q4_0_f32_ns(
     ulong         offsetd,
     int           ne00,
     int           ne01,
-    int           ne11
+    int           n_used   // ne20 (n_expert_used). Was "ne11" arg; renamed for
+                           // multi-token support where router src2 is laid
+                           // out [n_tokens][n_used] (token outer/slow, slot
+                           // inner/fast). At ne12==1 dispatch fires global
+                           // size [ne01,4,ne20], so i20 in [0, n_used) and
+                           // i11 = i20/n_used = 0. Backward compatible.
 ) {
     uint i01  = get_global_id(0);
     uint i20  = get_global_id(2);
     uint sgid = get_local_id(1);
     uint slid = get_sub_group_local_id();
 
-    if (i01 >= ne01) {
-        return;
-    }
-
-    uint i11 = i20 % ne11;
+    // Token index for src1: with src2 laid out [n_tokens][n_used] (slot inner),
+    // i20 = token*n_used + slot, so token = i20/n_used. Slot is implicit via
+    // src2[i20]. At ne12==1 dispatch, i20 < n_used → i11 = 0.
+    uint i11 = i20 / n_used;
 
     uint expert_id = src2[i20];
     uint expert_offset = expert_id * ne00 * ne01 / 32;
