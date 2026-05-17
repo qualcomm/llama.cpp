@@ -1313,7 +1313,8 @@ __kernel void flash_attn_f32_f16_q1_local_mq_split(
         barrier(CLK_LOCAL_MEM_FENCE);  // Before next tile load overwrites k/v_tile.
     }
 
-    // write partial records: one per (h, split)
+    // Write partial records: one per (h, split). Each lane writes its
+    // LMQ_DPL D-positions of o_acc[h]; merge kernel rescales across splits.
     #pragma unroll
     for (int h = 0; h < MQ_GQA; ++h) {
         const int head_idx = head_kv_idx * MQ_GQA + h;
