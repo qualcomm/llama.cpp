@@ -963,9 +963,390 @@ __kernel void flash_attn_f32_f16_q1_vec(
 // Currently compile-locked to MQ_GQA=4 (covers Gemma-3 family); other GQA
 // ratios still fall back to legacy q1 / q1_vec at the dispatch site.
 
+// ---------------------------------------------------------------------------
+// flash_attn_f32_f16_q1_local_tile — alternative decode FA design:
+// one WG per (q_idx, q_head). Stages K/V into __local tiles of
+// LT_KC rows. Per K-step, all LT_WG=DK lanes co-compute one Q·K dot via a
+// pure __local tree-reduce (no subgroup primitives), broadcast the score,
+// then each lane updates ONE float of its private o_val (D-split, not
+// DV-split). Trades K-bandwidth (no Q-head coalescing, K read by every Q
+// head's WG) for parallelism (n_head WGs in flight instead of n_head_kv).
+// Compiled only at DK=DV=128 and registered at WG=DK=128 (LT_WG match).
+// Dispatch is gated behind GGML_OPENCL_FA_LOCAL_TILE=1.
+// ---------------------------------------------------------------------------
+
+#define LT_KC 32
+#define LT_WG 128
+
+REQD_SUBGROUP_SIZE_64
+__kernel void flash_attn_f32_f16_q1_local_tile(
+    const global void * q_void, ulong q_offset,
+    const global void * k_void, ulong k_offset,
+    const global void * v_void, ulong v_offset,
+    global void * o_void, ulong o_offset,
+    const float scale,
+    const int n_q,
+    const int n_kv,
+    const int is_causal,
+    const int n_head,
+    const ulong q_nb1, const ulong q_nb2, const ulong q_nb3,
+    const ulong k_nb1, const ulong k_nb2, const ulong k_nb3,
+    const ulong v_nb1, const ulong v_nb2, const ulong v_nb3,
+    const ulong o_nb1, const ulong o_nb2, const ulong o_nb3,
+    const float max_bias,
+    const float m0,
+    const float m1,
+    const int n_head_log2,
+    const float logit_softcap,
+    const int n_head_kv,
+    const global void * mask_void,
+    const ulong mask_offset,
+    const ulong mask_nb1,
+    const ulong mask_nb2,
+    const ulong mask_nb3,
+    const int mask_ne2,
+    const int mask_ne3,
+    const global void * sinks_void,
+    const ulong sinks_offset
+) {
+    const int q_idx     = get_global_id(0) / LT_WG;
+    const int head_idx  = get_global_id(1);
+    const int batch_idx = get_global_id(2);
+    const int tid       = get_local_id(0);
+
+    const int gqa_ratio   = n_head_kv > 0 ? (n_head / n_head_kv) : 1;
+    const int head_kv_idx = head_idx / gqa_ratio;
+
+    const float slope = get_alibi_slope(max_bias, head_idx, n_head_log2, m0, m1);
+
+    __local half  k_tile[LT_KC * DK];   // 32*128*2 = 8 KB at DK=128
+    __local half  v_tile[LT_KC * DV];   // 8 KB
+    __local float red[LT_WG];           // 512 B reduction scratch
+    __local float score_shared;         // broadcast score (each K-step)
+
+    // Each thread owns one float of Q at index `tid` (assumes LT_WG == DK).
+    const global char * q_row_base = (const global char *) q_void + q_offset +
+                                     batch_idx * q_nb3 + head_idx * q_nb2 + (ulong) q_idx * q_nb1;
+    float q_val = ((const global float *) q_row_base)[tid];
+
+    const global char * mask_base = NULL;
+    if (mask_void != NULL) {
+        const int mask_head_idx  = head_idx  % mask_ne2;
+        const int mask_batch_idx = batch_idx % mask_ne3;
+        mask_base = (const global char *) mask_void + mask_offset +
+                    mask_batch_idx * mask_nb3 + mask_head_idx * mask_nb2 +
+                    (ulong) q_idx * mask_nb1;
+    }
+
+    float o_val = 0.0f;
+    float m_i = -INFINITY;
+    float l_i = 0.0f;
+
+    for (int kb = 0; kb < n_kv; kb += LT_KC) {
+        const int tile_len = min(LT_KC, n_kv - kb);
+
+        // Stage K and V tiles into __local.
+        for (int i = tid; i < tile_len * DK; i += LT_WG) {
+            const int j = i / DK;
+            const int d = i % DK;
+            const int kv_idx = kb + j;
+            const global char * k_row = (const global char *) k_void + k_offset +
+                                        batch_idx * k_nb3 + head_kv_idx * k_nb2 +
+                                        (ulong) kv_idx * k_nb1;
+            const global char * v_row = (const global char *) v_void + v_offset +
+                                        batch_idx * v_nb3 + head_kv_idx * v_nb2 +
+                                        (ulong) kv_idx * v_nb1;
+            k_tile[j * DK + d] = ((const global half *) k_row)[d];
+            v_tile[j * DV + d] = ((const global half *) v_row)[d];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        for (int j = 0; j < tile_len; ++j) {
+            const int kv_idx = kb + j;
+
+            // Q·K dot via __local tree-reduce.
+            red[tid] = q_val * convert_float(k_tile[j * DK + tid]);
+            barrier(CLK_LOCAL_MEM_FENCE);
+            for (int stride = LT_WG >> 1; stride > 0; stride >>= 1) {
+                if (tid < stride) {
+                    red[tid] += red[tid + stride];
+                }
+                barrier(CLK_LOCAL_MEM_FENCE);
+            }
+
+            if (tid == 0) {
+                float s = red[0] * scale;
+                if (mask_base != NULL) {
+                    const global MASK_DATA_TYPE * mask_ptr = (const global MASK_DATA_TYPE *) mask_base;
+                    s += slope * (float) mask_ptr[kv_idx];
+                }
+                if (logit_softcap > 0.0f) {
+                    s = logit_softcap * tanh(s / logit_softcap);
+                }
+                score_shared = s;
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
+
+            const float s     = score_shared;
+            const float m_new = fmax(m_i, s);
+            const float alpha = native_exp(m_i - m_new);
+            const float beta  = native_exp(s   - m_new);
+
+            o_val = o_val * alpha + beta * convert_float(v_tile[j * DV + tid]);
+            l_i   = l_i   * alpha + beta;
+            m_i   = m_new;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    // Fold attention sinks into the running (m, l, o), if present.
+    if (sinks_void != NULL) {
+        const global float * sinks_ptr =
+            (const global float *) ((const global char *) sinks_void + sinks_offset);
+        const float m_sink = sinks_ptr[head_idx];
+        const float m_new  = fmax(m_i, m_sink);
+        const float alpha  = native_exp(m_i    - m_new);
+        const float beta   = native_exp(m_sink - m_new);
+        o_val = o_val * alpha;
+        l_i   = l_i * alpha + beta;
+        m_i   = m_new;
+    }
+
+    const float l_inv = (l_i > 0.0f) ? (1.0f / l_i) : 0.0f;
+    global float * o_row = (global float *) ((global char *) o_void + o_offset +
+                                              batch_idx * o_nb3 + head_idx * o_nb1 +
+                                              (ulong) q_idx * o_nb2);
+    o_row[tid] = o_val * l_inv;
+}
+
+// ---------------------------------------------------------------------------
+// flash_attn_f32_f16_q1_local_mq_split — hybrid local-tile + MQ + FD-split.
+// Combines the 3 levers identified while evaluating local_tile:
+//   1. Q-head coalescing (MQ_GQA Q rows per WG share one KV slice)
+//   2. sub_group_reduce_add for the dot (1 reduce vs tree-reduce's 7 barriers)
+//   3. Flash-decoding split along n_kv (n_splits WGs per kv_head)
+// Plus the __local K/V tile from local_tile (re-use within each tile).
+//
+// WG layout: 1 subgroup of 64 lanes. Each lane owns DK/64 = 2 D-elements at
+// indices (tid*LMQ_DPL .. tid*LMQ_DPL+1). MQ_GQA per-h state lives in
+// private registers (o_acc[MQ_GQA][LMQ_DPL], m_i[MQ_GQA], l_i[MQ_GQA]).
+//
+// Grid: (LMQ_WG, n_head_kv * n_batch, n_splits * n_q). Compiled at DK=DV=128.
+// MQ_GQA=4 default + second compile MQ_GQA=8 alongside the existing MQ split
+// kernels (shared MQ_GQA macro). Writes one partial record per (h, split);
+// flash_attn_f32_merge reused for normalization.
+// ---------------------------------------------------------------------------
+
+#define LMQ_WG  64
+#define LMQ_KC  32
+#define LMQ_DPL 2   // DK / LMQ_WG at DK=128
+
 #ifndef MQ_GQA
 #define MQ_GQA 4
 #endif
+
+#ifndef FA_PARTIAL_FLOATS
+#define FA_PARTIAL_FLOATS (2 + DV)
+#endif
+
+REQD_SUBGROUP_SIZE_64
+__kernel void flash_attn_f32_f16_q1_local_mq_split(
+    const global void * q_void, ulong q_offset,
+    const global void * k_void, ulong k_offset,
+    const global void * v_void, ulong v_offset,
+    const float scale,
+    const int n_q,
+    const int n_kv,
+    const int n_head,
+    const ulong q_nb1, const ulong q_nb2, const ulong q_nb3,
+    const ulong k_nb1, const ulong k_nb2, const ulong k_nb3,
+    const ulong v_nb1, const ulong v_nb2, const ulong v_nb3,
+    const float max_bias,
+    const float m0,
+    const float m1,
+    const int n_head_log2,
+    const float logit_softcap,
+    const int n_head_kv,
+    const global void * mask_void,
+    const ulong mask_offset,
+    const ulong mask_nb1,
+    const ulong mask_nb2,
+    const ulong mask_nb3,
+    const int mask_ne2,
+    const int mask_ne3,
+    global float * partial_void,
+    const int n_splits,
+    const int kv_per_split
+) {
+    const int tid              = get_local_id(0);  // 0..LMQ_WG-1
+    const int kvhead_batch_idx = get_global_id(1);
+    const int split_q_idx      = get_global_id(2);
+    const int split_idx        = split_q_idx % n_splits;
+    const int q_idx            = split_q_idx / n_splits;
+
+    const int batch_idx   = kvhead_batch_idx / n_head_kv;
+    const int head_kv_idx = kvhead_batch_idx % n_head_kv;
+
+    const int kv_start = split_idx * kv_per_split;
+    const int kv_end   = min(kv_start + kv_per_split, n_kv);
+
+    const ulong record_stride = (ulong) FA_PARTIAL_FLOATS;
+
+    if (kv_start >= kv_end) {
+        // Empty split — write sentinel for each Q-head so merge treats it as 0.
+        if (tid == 0) {
+            #pragma unroll
+            for (int h = 0; h < MQ_GQA; ++h) {
+                const int head_idx = head_kv_idx * MQ_GQA + h;
+                const ulong rec_idx = ((((ulong) batch_idx * n_head + head_idx) * n_q + q_idx)
+                                       * n_splits + split_idx);
+                global float * rec = partial_void + rec_idx * record_stride;
+                rec[0] = -INFINITY;
+                rec[1] = 0.0f;
+            }
+        }
+        return;
+    }
+
+    const global char * q_base = (const global char *) q_void + q_offset;
+    const global char * k_base = (const global char *) k_void + k_offset;
+    const global char * v_base = (const global char *) v_void + v_offset;
+
+    // Stage MQ_GQA Q rows in __local (MQ_GQA × DK floats).
+    __local float q_shared[MQ_GQA * DK];
+    for (int i = tid; i < MQ_GQA * DK; i += LMQ_WG) {
+        const int h        = i / DK;
+        const int d        = i % DK;
+        const int head_idx = head_kv_idx * MQ_GQA + h;
+        const ulong q_row_off = batch_idx * q_nb3 + head_idx * q_nb2 + (ulong) q_idx * q_nb1;
+        const global float * q_ptr = (const global float *) (q_base + q_row_off);
+        q_shared[h * DK + d] = q_ptr[d];
+    }
+
+    // K/V tile staging buffers (16 KB combined at DK=DV=128 KC=32).
+    __local half k_tile[LMQ_KC * DK];
+    __local half v_tile[LMQ_KC * DV];
+
+    // Per-h state held in private registers.
+    float o_acc[MQ_GQA][LMQ_DPL];
+    float m_i[MQ_GQA];
+    float l_i[MQ_GQA];
+    float slope[MQ_GQA];
+    #pragma unroll
+    for (int h = 0; h < MQ_GQA; ++h) {
+        m_i[h] = -INFINITY;
+        l_i[h] = 0.0f;
+        slope[h] = get_alibi_slope(max_bias, head_kv_idx * MQ_GQA + h, n_head_log2, m0, m1);
+        #pragma unroll
+        for (int p = 0; p < LMQ_DPL; ++p) o_acc[h][p] = 0.0f;
+    }
+
+    // Per-h mask pointers.
+    const global char * mask_base[MQ_GQA];
+    if (mask_void != NULL) {
+        const int mask_batch_idx = batch_idx % mask_ne3;
+        const global char * mask_base_b = (const global char *) mask_void + mask_offset +
+                                          mask_batch_idx * mask_nb3 +
+                                          (ulong) q_idx * mask_nb1;
+        #pragma unroll
+        for (int h = 0; h < MQ_GQA; ++h) {
+            const int head_idx      = head_kv_idx * MQ_GQA + h;
+            const int mask_head_idx = head_idx % mask_ne2;
+            mask_base[h] = mask_base_b + mask_head_idx * mask_nb2;
+        }
+    } else {
+        #pragma unroll
+        for (int h = 0; h < MQ_GQA; ++h) mask_base[h] = NULL;
+    }
+
+    barrier(CLK_LOCAL_MEM_FENCE);  // Ensure Q staged before first dot.
+
+    for (int kb = kv_start; kb < kv_end; kb += LMQ_KC) {
+        const int tile_len = min((int) LMQ_KC, kv_end - kb);
+
+        // Cooperative load K + V tile.
+        for (int i = tid; i < tile_len * DK; i += LMQ_WG) {
+            const int j = i / DK;
+            const int d = i % DK;
+            const int kv_idx = kb + j;
+            const global char * k_row = k_base + batch_idx * k_nb3 + head_kv_idx * k_nb2 + (ulong) kv_idx * k_nb1;
+            const global char * v_row = v_base + batch_idx * v_nb3 + head_kv_idx * v_nb2 + (ulong) kv_idx * v_nb1;
+            k_tile[j * DK + d] = ((const global half *) k_row)[d];
+            v_tile[j * DV + d] = ((const global half *) v_row)[d];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        // Process each cache row in the tile.
+        for (int j = 0; j < tile_len; ++j) {
+            const int kv_idx = kb + j;
+
+            // Dot product per h: lane owns LMQ_DPL D-elements at (tid*LMQ_DPL..).
+            float score[MQ_GQA];
+            #pragma unroll
+            for (int h = 0; h < MQ_GQA; ++h) {
+                float contrib = 0.0f;
+                #pragma unroll
+                for (int p = 0; p < LMQ_DPL; ++p) {
+                    const int d = tid * LMQ_DPL + p;
+                    contrib += q_shared[h * DK + d] * (float) k_tile[j * DK + d];
+                }
+                float s = sub_group_reduce_add(contrib) * scale;
+                if (mask_base[h] != NULL) {
+                    const global MASK_DATA_TYPE * mask_ptr = (const global MASK_DATA_TYPE *) mask_base[h];
+                    s += slope[h] * (float) mask_ptr[kv_idx];
+                }
+                if (logit_softcap > 0.0f) {
+                    s = logit_softcap * tanh(s / logit_softcap);
+                }
+                score[h] = s;
+            }
+
+            // Online softmax update + V accumulation per h.
+            float p_h[MQ_GQA];
+            float sp_h[MQ_GQA];
+            #pragma unroll
+            for (int h = 0; h < MQ_GQA; ++h) {
+                const float m_new = fmax(m_i[h], score[h]);
+                sp_h[h] = native_exp(m_i[h] - m_new);
+                p_h[h]  = native_exp(score[h] - m_new);
+                l_i[h]  = l_i[h] * sp_h[h] + p_h[h];
+                m_i[h]  = m_new;
+            }
+
+            #pragma unroll
+            for (int p = 0; p < LMQ_DPL; ++p) {
+                const int d = tid * LMQ_DPL + p;
+                const float v_val = (float) v_tile[j * DV + d];
+                #pragma unroll
+                for (int h = 0; h < MQ_GQA; ++h) {
+                    o_acc[h][p] = o_acc[h][p] * sp_h[h] + p_h[h] * v_val;
+                }
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);  // Before next tile load overwrites k/v_tile.
+    }
+
+    // Write partial records: one per (h, split). Each lane writes its
+    // LMQ_DPL D-positions of o_acc[h]; merge kernel rescales across splits.
+    #pragma unroll
+    for (int h = 0; h < MQ_GQA; ++h) {
+        const int head_idx = head_kv_idx * MQ_GQA + h;
+        const ulong rec_idx = ((((ulong) batch_idx * n_head + head_idx) * n_q + q_idx)
+                               * n_splits + split_idx);
+        global float * rec   = partial_void + rec_idx * record_stride;
+        global float * rec_o = rec + 2;
+
+        if (tid == 0) {
+            rec[0] = m_i[h];
+            rec[1] = l_i[h];
+        }
+        #pragma unroll
+        for (int p = 0; p < LMQ_DPL; ++p) {
+            const int d = tid * LMQ_DPL + p;
+            rec_o[d] = o_acc[h][p];
+        }
+    }
+}
 
 // MQ collapses one WG per KV-head (vs one per Q-head in legacy q1_vec).
 // Wanted NSG=8 or 16 to compensate for the wavefront-count loss after the
@@ -1228,7 +1609,9 @@ __kernel void flash_attn_f32_f16_q1_vec_mq(
 #endif
 #define MQ_SPLIT_WG_SIZE (Q1_WG_SIZE * MQ_NSG_SPLIT)
 
+#ifndef FA_PARTIAL_FLOATS
 #define FA_PARTIAL_FLOATS (2 + DV)
+#endif
 
 REQD_SUBGROUP_SIZE_64
 __kernel void flash_attn_f32_f16_q1_vec_mq_split(
