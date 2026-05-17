@@ -519,6 +519,11 @@ struct mtmd_context {
                     img_end = "";
                     image_preproc = std::make_unique<mtmd_image_preprocessor_llava_uhd>(ctx_v);
                 } break;
+            case PROJECTOR_TYPE_PALIGEMMA:
+                {
+                    // SigLIP fixed-size encoder: no wrapping tokens, 256 patch embeddings per image
+                    image_preproc = std::make_unique<mtmd_image_preprocessor_fixed_size>(ctx_v);
+                } break;
             default:
                 throw std::runtime_error(string_format("%s: unexpected vision projector type %d\n", __func__, proj));
         }
@@ -1173,6 +1178,7 @@ bool mtmd_decode_use_non_causal(const mtmd_context * ctx, const mtmd_input_chunk
         case PROJECTOR_TYPE_GEMMA3:
         case PROJECTOR_TYPE_GEMMA4V:
         case PROJECTOR_TYPE_GEMMA4UV:
+        case PROJECTOR_TYPE_PALIGEMMA:
             return true;
         default:
             return false;
