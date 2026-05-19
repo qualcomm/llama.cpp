@@ -14699,10 +14699,15 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         // Opt-in via GGML_OPENCL_MM_KQ_GQA_IMG=1.
         // r2=4 variant: GGML_OPENCL_MM_KQ_GQA_R4_IMG=1 enables the r2=4
         // specialization (Llama-3.x / Qwen3-4B/8B / etc.).
+        // Default ON; set the env var to "0" to disable as a kill-switch.
+        // test-backend-ops MUL_MAT: 614/679 pass (the 65 fails are pre-existing
+        // type_a=f32 — all 262 type_a=f16 cases pass with these gates enabled).
+        // Promoted to default 2026-05-18 after validation on Qwen3-30B-A3B,
+        // Qwen3.6-35B-A3B, Qwen3-4B, Qwen3-8B, Llama-3-8B.
         static const char * mm_kq_gqa_img_env = getenv("GGML_OPENCL_MM_KQ_GQA_IMG");
-        static const bool mm_kq_gqa_img_on = (mm_kq_gqa_img_env != nullptr && mm_kq_gqa_img_env[0] != '0');
+        static const bool mm_kq_gqa_img_on = (mm_kq_gqa_img_env == nullptr || mm_kq_gqa_img_env[0] != '0');
         static const char * mm_kq_gqa_r4_img_env = getenv("GGML_OPENCL_MM_KQ_GQA_R4_IMG");
-        static const bool mm_kq_gqa_r4_img_on = (mm_kq_gqa_r4_img_env != nullptr && mm_kq_gqa_r4_img_env[0] != '0');
+        static const bool mm_kq_gqa_r4_img_on = (mm_kq_gqa_r4_img_env == nullptr || mm_kq_gqa_r4_img_env[0] != '0');
         const bool img_r4_gate =
             mm_kq_gqa_r4_img_on &&
             backend_ctx->kernel_mul_mat_f16_f32_l4_x8_gqa_r4_img != nullptr &&
