@@ -1043,3 +1043,109 @@ kernel void kernel_mul_mat_f16_f32_l4_x8_gqa_r4_img(
         }
     }
 }
+
+// DK=256, r2=2 specialization for Gemma-3-4B (n_head=8, n_head_kv=4,
+// head_dim=256). 64-lane subgroup partitioned across 2 Q-heads (32 lanes
+// each). DK_VEC=64 half4 per K-row; each lane reads 1 CL_RGBA/CL_FLOAT
+// pixel = 2 half4 — clean 1:1 mapping. Reduction masks {16,8,4,2,1} are
+// all <32 (safe on Adreno X2). Q stage: 2×64=128 float4 = 2 KB local.
+//
+// Opt-in via GGML_OPENCL_MM_KQ_GQA_R2_DK256_IMG=1.
+#define N_K_ROWS_GQA_R2_DK256   16
+#define GQA_RATIO_R2            2
+#define LANES_PER_QH_R2         32    // = 64 / GQA_RATIO_R2
+#define DK_VEC_DK256            64    // DK / 4 for DK=256
+
+#ifdef ADRENO_GPU
+REQD_SUBGROUP_SIZE_64
+#endif
+kernel void kernel_mul_mat_f16_f32_l4_x8_gqa_r2_dk256_img(
+        __read_only image1d_buffer_t src0_img,
+        global char * src1,
+        ulong offset1,
+        global float * dst,
+        ulong offsetd,
+        int ne00,
+        int ne01,
+        int ne02,
+        ulong nb01,
+        ulong nb02,
+        ulong nb03,
+        int ne10,
+        int ne11,
+        int ne12,
+        ulong nb10,
+        ulong nb11,
+        ulong nb12,
+        ulong nb13,
+        int ne0,
+        int ne1,
+        int r2,
+        int r3
+) {
+    src1 = (global char *)((global char *)src1 + offset1);
+    dst  = (global float*)((global char *)dst  + offsetd);
+
+    const int sgs_lid = get_sub_group_local_id();
+    const int q_id    = sgs_lid >> 5;       // 0..1
+    const int lane_q  = sgs_lid & 31;       // 0..31
+
+    const int r0_base = get_group_id(0) * N_K_ROWS_GQA_R2_DK256;
+    const int im_kv   = get_group_id(2);
+
+    const int i02 = im_kv % ne02;
+    const int i03 = im_kv / ne02;
+
+    const int q_head_lo = i02 * GQA_RATIO_R2;
+
+    // Stage 2 Q-heads × 64 float4 = 128 float4 (2 KB). Each of 64 lanes
+    // loads exactly one float4 per Q-head (DK_VEC_DK256 == subgroup size).
+    __local float4 q_loc[GQA_RATIO_R2 * DK_VEC_DK256];
+    #pragma unroll
+    for (int qh = 0; qh < GQA_RATIO_R2; ++qh) {
+        const int qh_idx = q_head_lo + qh;
+        global float4 * y4 = (global float4 *)(src1 + qh_idx * nb12 + i03 * nb13);
+        q_loc[qh * DK_VEC_DK256 + sgs_lid] = y4[sgs_lid];
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    const int pitch_px_row  = (int)(nb01 >> 4);
+    const int pitch_px_head = (int)(nb02 >> 4);
+    const int pitch_px_n13  = (int)(nb03 >> 4);
+
+    const int head_px_base = i02 * pitch_px_head + (i03 / r3) * pitch_px_n13;
+
+    #pragma unroll
+    for (int dr = 0; dr < N_K_ROWS_GQA_R2_DK256; ++dr) {
+        const int r0 = r0_base + dr;
+        const int row_px_base = r0 * pitch_px_row + head_px_base;
+
+        // 1 pixel per lane = 2 half4 = 8 fp16. 32 lanes × 2 half4 = 64 half4 covers DK=256.
+        const int p = lane_q;
+        const half8 k8 = as_half8(read_imagef(src0_img, row_px_base + p));
+        const int   i0 = 2 * p;
+        const float4 qa = q_loc[q_id * DK_VEC_DK256 + i0    ];
+        const float4 qb = q_loc[q_id * DK_VEC_DK256 + i0 + 1];
+
+        float sumf =
+              convert_float(k8.s0) * qa.s0
+            + convert_float(k8.s1) * qa.s1
+            + convert_float(k8.s2) * qa.s2
+            + convert_float(k8.s3) * qa.s3
+            + convert_float(k8.s4) * qb.s0
+            + convert_float(k8.s5) * qb.s1
+            + convert_float(k8.s6) * qb.s2
+            + convert_float(k8.s7) * qb.s3;
+
+        sumf += sub_group_shuffle_xor(sumf, 16);
+        sumf += sub_group_shuffle_xor(sumf, 8);
+        sumf += sub_group_shuffle_xor(sumf, 4);
+        sumf += sub_group_shuffle_xor(sumf, 2);
+        sumf += sub_group_shuffle_xor(sumf, 1);
+
+        if (lane_q == 0) {
+            const int im_out = i03 * ne12 + (q_head_lo + q_id);
+            dst[im_out * ne1 * ne0 + r0] = sumf;
+        }
+    }
+}
