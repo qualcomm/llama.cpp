@@ -465,24 +465,11 @@ struct ggml_opencl_fa_kernels {
     // MQ_GQA=8 specializations
     std::map<std::pair<int, int>, cl_kernel> f32_f16_q1_vec_mq_g8;
     std::map<std::pair<int, int>, cl_kernel> f32_f16_q1_vec_mq_split_g8;
-    // k-image variant of MQ_G8 vec_mq_split
+    // K-image variant of MQ_G8 vec_mq_split: K bound as image1d_buffer_t
+    // (Adreno texture cache, separate BW path from L2). Opt-in, GGML_OPENCL_FA_K_IMG=1.
     std::map<std::pair<int, int>, cl_kernel> f32_f16_q1_vec_mq_split_g8_k_img;
-    // k-image variant of MQ_GQA=4 vec_mq_split
-    std::map<std::pair<int, int>, cl_kernel> f32_f16_q1_vec_mq_split_k_img;
-    // Cluster-parallel decode
-    std::map<std::pair<int, int>, cl_kernel> f32_f16_q1_vec_mq_split_c8;
-    std::map<std::pair<int, int>, cl_kernel> f32_f16_q1_vec_mq_split_g8_c8;
-    // NSG_SPLIT=2 specializations (WG=128): the c8 kernel's register footprint
-    // caps its per-kernel WG at 128 on X2, below the stock 256/192 requirement.
-    // 2 subgroups × FA_CL_NCL streams still gives 16 in-flight rows per WG.
-    std::map<std::pair<int, int>, cl_kernel> f32_f16_q1_vec_mq_split_c8_ns2;
-    std::map<std::pair<int, int>, cl_kernel> f32_f16_q1_vec_mq_split_g8_c8_ns2;
-    // FA_CL_C=32 / MQ_GQA=8 / NSG_SPLIT=2 specialization for the DK=DV=256
-    // GQA=8 class (Qwen3.5/3.6-35B-A3B: 16 Q heads, 2 KV heads). o_acc =
-    // DV_VEC/32 × 8 = 128B/lane (in budget); the baseline fa1 path for this
-    // shape has NO MQ/FD at all and pays an 8× KV re-read per Q head.
-    std::map<std::pair<int, int>, cl_kernel> f32_f16_q1_vec_mq_split_g8_c32;
-    // alternative decode
+    // Alternative decode FA: 1 WG per (q_idx, q_head) with a __local K/V tile +
+    // pure __local tree-reduce. Compiled only at DK=DV=128. Opt-in.
     std::map<std::pair<int, int>, cl_kernel> f32_f16_q1_local_tile;
     // hybrid local-tile + MQ + FD-split kernel for DK=DV=128 only
     std::map<std::pair<int, int>, cl_kernel> f32_f16_q1_local_mq_split;
@@ -5068,6 +5055,20 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
                         ggml_opencl_log_fa_kernel_spill(backend_ctx, k_q1_vec_mq_split_g8, "flash_attn_f32_f16_q1_vec_mq_split_g8", dk, dv);
                     } else {
                         clReleaseKernel(k_q1_vec_mq_split_g8);
+                    }
+                }
+                // K-image variant: same MQ_GQA=8 specialization but K is
+                // bound as image1d_buffer_t (Adreno texture cache). Only
+                // dispatched when GGML_OPENCL_FA_K_IMG=1. Same source, same
+                // -DMQ_GQA=8 program, just a different __kernel entry.
+                cl_kernel k_q1_vec_mq_split_g8_k_img = clCreateKernel(prog_g8, "flash_attn_f32_f16_q1_vec_mq_split_k_img", &err);
+                if (err == CL_SUCCESS) {
+                    if (ggml_opencl_fa_kernel_fits_wg(backend_ctx, k_q1_vec_mq_split_g8_k_img, mq_g8_required_wg,
+                                                      "flash_attn_f32_f16_q1_vec_mq_split_k_img (g8)", dk, dv)) {
+                        backend_ctx->fa.f32_f16_q1_vec_mq_split_g8_k_img[{dk, dv}] = k_q1_vec_mq_split_g8_k_img;
+                        ggml_opencl_log_fa_kernel_spill(backend_ctx, k_q1_vec_mq_split_g8_k_img, "flash_attn_f32_f16_q1_vec_mq_split_g8_k_img", dk, dv);
+                    } else {
+                        clReleaseKernel(k_q1_vec_mq_split_g8_k_img);
                     }
                 }
                 // Hybrid local-tile + MQ_GQA=8. WG=64 (1 subgroup); the
@@ -14098,7 +14099,8 @@ static void ggml_cl_flash_attn_read_tensor_host(
     GGML_ASSERT(dst_off == total_bytes);
 }
 
-// forward decl: used by the FA decode dispatch (K-image variant) below.
+// Forward decl: used by the FA decode dispatch (K-image variant) below.
+// Definition lives near the other mul_mat IMG paths.
 static cl_mem ggml_cl_img_pool_get_or_create(
     ggml_backend_opencl_context * backend_ctx,
     std::map<ggml_backend_opencl_context::ImagePoolKey,
@@ -14764,7 +14766,12 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     bool use_fd_mq = false;
     size_t fd_mq_wg = 256;  // MQ_GQA=4 kernel: Q1_WG_SIZE(64) * MQ_NSG_SPLIT(4)
     bool use_fa_k_img = false;  // K bound as image1d_buffer_t instead of (buf, offset)
-
+    // MQ flash-decoding gate. Bypasses FD_MAX_DK because the MQ split kernel
+    // uses NSG subgroups × 64 lanes, so o_acc is DV-split — no spill at DK=DV=256.
+    // - gqa_ratio == 4 + DK=DV=256: Gemma-3 family, MQ_GQA=4 kernel.
+    // - gqa_ratio == 8 + DK=DV=128: Qwen3-30B-A3B / Qwen3-4B class, MQ_GQA=8
+    //   kernel (compiled alongside via a second program). Mirrors Metal's
+    //   per-NQPSG template dispatch.
     {
         const char * mq_env = getenv("GGML_OPENCL_FA_MQ");
         const bool mq_enabled = (mq_env == NULL) ? true : (mq_env[0] != '0');
@@ -15104,6 +15111,12 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(cl_mem),   &extra_q->data_device));
         CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(cl_ulong), &offset_q));
         if (use_fa_k_img) {
+            // K via image1d_buffer_t. Pool keyed on (parent_buffer, offset_k);
+            // image is sub-buffer-backed (origin=offset_k), so the kernel reads
+            // pixels relative to sub-buffer start — no k_offset arg.
+            // Byte-span must cover the FULL strided extent (the K view at FA
+            // decode is often head-major permuted on Adreno, so head/batch
+            // strides can dominate). Round up to 8 B (pixel size = 1 half4).
             const size_t nb00_bytes  = sizeof(uint16_t);
             const size_t k_bytes_span =
                 (size_t)(n_kv > 0 ? n_kv - 1 : 0) * (size_t)k_nb1 +
@@ -15132,6 +15145,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
                 CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(cl_ulong), &offset_k));
             } else {
                 CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(cl_mem),   &k_img));
+                // k_offset is baked into the sub-buffer; no separate arg.
             }
         } else {
             CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(cl_mem),   &k_data_device));
