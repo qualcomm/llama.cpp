@@ -4620,7 +4620,7 @@ inline bool use_adreno_kernels(const ggml_backend_opencl_context *backend_ctx, c
 inline bool use_adreno_moe_kernels(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor) {
     GGML_UNUSED(backend_ctx);
     int ne01 = tensor->ne[1];
-    return (((strstr(tensor->name, "ffn") != NULL) && (strstr(tensor->name, "exps") != NULL)) || (strstr(tensor->name, "as") != NULL)) && (ne01 % 64 == 0);
+    return (((strstr(tensor->name, "ffn") != NULL) && (strstr(tensor->name, "exps") != NULL)) || (strstr(tensor->name, "as") != NULL)) && (ne01 % 32 == 0);
 }
 
 inline bool enable_adreno_trans_weight(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor) {
@@ -14218,7 +14218,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     CL_CHECK(status);
 
                     // set thread grid
-                    global_size[0] = static_cast<size_t>(ne01);
+                    global_size[0] = static_cast<size_t>(((ne01 + 63) / 64) * 64);
                     global_size[1] = 4;
                     global_size[2] = static_cast<size_t>(ne20);
                     local_size[1] = 4;
@@ -14434,7 +14434,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     CL_CHECK(status);
 
                     // set thread grid
-                    global_size[0] = static_cast<size_t>(ne01);
+                    global_size[0] = static_cast<size_t>(((ne01 + 63) / 64) * 64);
                     global_size[1] = 4;
                     global_size[2] = static_cast<size_t>(ne20);
                     local_size[1] = 4;
@@ -14610,7 +14610,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     CL_CHECK(status);
 
                     // set thread grid
-                    global_size[0] = static_cast<size_t>(ne01);
+                    global_size[0] = static_cast<size_t>(((ne01 + 63) / 64) * 64);
                     global_size[1] = 4;
                     global_size[2] = static_cast<size_t>(ne20);
                     local_size[1] = 4;
@@ -14786,7 +14786,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     CL_CHECK(status);
 
                     // set thread grid
-                    global_size[0] = static_cast<size_t>(ne01);
+                    global_size[0] = static_cast<size_t>(((ne01 + 63) / 64) * 64);
                     global_size[1] = 4;
                     global_size[2] = static_cast<size_t>(ne20);
                     local_size[1] = 4;
@@ -15039,7 +15039,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     CL_CHECK(status);
 
                     // set thread grid
-                    global_size[0] = static_cast<size_t>(ne01);
+                    global_size[0] = static_cast<size_t>(((ne01 + 63) / 64) * 64);
                     global_size[1] = 4;
                     global_size[2] = static_cast<size_t>(ne20);
                     local_size[1] = 4;
@@ -15212,7 +15212,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     CL_CHECK(status);
 
                     // set thread grid
-                    global_size[0] = static_cast<size_t>(ne01);
+                    global_size[0] = static_cast<size_t>(((ne01 + 63) / 64) * 64);
                     global_size[1] = 4;
                     global_size[2] = static_cast<size_t>(ne20);
                     local_size[1] = 4;
@@ -15390,7 +15390,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     CL_CHECK(status);
 
                     // set thread grid
-                    global_size[0] = static_cast<size_t>(ne01);
+                    global_size[0] = static_cast<size_t>(((ne01 + 63) / 64) * 64);
                     global_size[1] = 4;
                     global_size[2] = static_cast<size_t>(ne20);
                     local_size[1] = 4;
@@ -15565,7 +15565,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     CL_CHECK(status);
 
                     // set thread grid
-                    global_size[0] = static_cast<size_t>(ne01);
+                    global_size[0] = static_cast<size_t>(((ne01 + 63) / 64) * 64);
                     global_size[1] = 4;
                     global_size[2] = static_cast<size_t>(ne20);
                     local_size[1] = 4;
