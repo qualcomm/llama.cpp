@@ -311,6 +311,206 @@ __kernel void flash_attn_f32_q8_0_q1(
     }
 }
 
+// Decode variant for large DV with q8_0 KV — mirrors the f16 vec FA design.
+// See flash_attn_f32_f16.cl / _q4_0.cl for the protocol; the only change here
+// is the per-lane q8_0 dequant on the K/V reads.
+#ifdef cl_intel_subgroups
+#pragma OPENCL EXTENSION cl_intel_subgroups : enable
+#else
+#pragma OPENCL EXTENSION cl_khr_subgroups : enable
+#endif
+
+#ifdef cl_qcom_reqd_sub_group_size
+#pragma OPENCL EXTENSION cl_qcom_reqd_sub_group_size : enable
+#define REQD_SUBGROUP_SIZE_64 __attribute__((qcom_reqd_sub_group_size("half")))
+#else
+#define REQD_SUBGROUP_SIZE_64
+#endif
+
+#define VEC_NSG          4
+#define VEC_WG_SIZE      (Q1_WG_SIZE * VEC_NSG)
+#define Q1V_DV_PER_THREAD ((DV_VEC + Q1_WG_SIZE - 1) / Q1_WG_SIZE)
+
+// Dequant one float4 lane (0..7) from a q8_0 block.
+// Each q8_0 block holds 32 int8 values; lane L reads bytes [2+L*4 .. 2+L*4+3].
+inline float4 dequant_q8_0_lane(const global char * block_ptr, int lane) {
+    const float d = vload_half(0, (const global half *)block_ptr);
+    const global char * qs = block_ptr + 2 + lane * 4;
+    return d * (float4)((float)qs[0], (float)qs[1], (float)qs[2], (float)qs[3]);
+}
+
+REQD_SUBGROUP_SIZE_64
+__kernel void flash_attn_f32_q8_0_q1_vec(
+    const global void * q_void, ulong q_offset,
+    const global void * k_void, ulong k_offset,
+    const global void * v_void, ulong v_offset,
+    global void * o_void, ulong o_offset,
+    const float scale,
+    const int n_q,
+    const int n_kv,
+    const int is_causal,
+    const int n_head,
+    const ulong q_nb1, const ulong q_nb2, const ulong q_nb3,
+    const ulong k_nb1, const ulong k_nb2, const ulong k_nb3,
+    const ulong v_nb1, const ulong v_nb2, const ulong v_nb3,
+    const ulong o_nb1, const ulong o_nb2, const ulong o_nb3,
+    const float max_bias,
+    const float m0,
+    const float m1,
+    const int n_head_log2,
+    const float logit_softcap,
+    const int n_head_kv,
+    const global void* mask_void,
+    const ulong mask_offset,
+    const ulong mask_nb1,
+    const ulong mask_nb2,
+    const ulong mask_nb3,
+    const int mask_ne2,
+    const int mask_ne3,
+    const global void* sinks_void,
+    const ulong sinks_offset
+) {
+    const int tid             = get_local_id(0);
+    const int sgid            = tid / Q1_WG_SIZE;
+    const int tid_sg          = tid % Q1_WG_SIZE;
+    const int head_batch_idx  = get_global_id(1);
+
+    const int batch_idx = head_batch_idx / n_head;
+    const int head_idx  = head_batch_idx % n_head;
+
+    const int gqa_ratio   = n_head / n_head_kv;
+    const int head_kv_idx = head_idx / gqa_ratio;
+
+    const global char * q_base = (const global char *) q_void + q_offset;
+    const global char * k_base = (const global char *) k_void + k_offset;
+    const global char * v_base = (const global char *) v_void + v_offset;
+    global       char * o_base = (global       char *) o_void + o_offset;
+
+    const global char * mask_base = NULL;
+    if (mask_void != NULL) {
+        const int mask_head_idx  = head_idx  % mask_ne2;
+        const int mask_batch_idx = batch_idx % mask_ne3;
+        mask_base = (const global char *) mask_void + mask_offset +
+                    mask_batch_idx * mask_nb3 + mask_head_idx * mask_nb2;
+    }
+
+    __local ACC_TYPE4 q_shared[DK_VEC];
+    {
+        const ulong q_row_offset = batch_idx * q_nb3 + head_idx * q_nb2;
+        const global Q_DATA_TYPE4 * q_ptr = (const global Q_DATA_TYPE4 *) (q_base + q_row_offset);
+        for (int i = tid; i < DK_VEC; i += VEC_WG_SIZE) {
+            q_shared[i] = CONVERT_Q_ACC4(q_ptr[i]);
+        }
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    const float slope = get_alibi_slope(max_bias, head_idx, n_head_log2, m0, m1);
+
+    const global ACC_TYPE * sinks_ptr = NULL;
+    if (sinks_void != NULL) {
+        sinks_ptr = (const global ACC_TYPE *) ((const global char *) sinks_void + sinks_offset);
+    }
+
+    ACC_TYPE4 o_acc[Q1V_DV_PER_THREAD];
+    #pragma unroll
+    for (int i = 0; i < Q1V_DV_PER_THREAD; ++i) o_acc[i] = (ACC_TYPE4)(0.0f);
+
+    ACC_TYPE m_i = -INFINITY;
+    ACC_TYPE l_i = 0.0f;
+
+    const int kv_per_sg = (n_kv + VEC_NSG - 1) / VEC_NSG;
+    const int kv_start  = sgid * kv_per_sg;
+    const int kv_end    = min(n_kv, kv_start + kv_per_sg);
+
+    for (int k_idx = kv_start; k_idx < kv_end; ++k_idx) {
+        const global char * k_row = k_base + batch_idx * k_nb3 + head_kv_idx * k_nb2 + k_idx * k_nb1;
+        const global char * v_row = v_base + batch_idx * v_nb3 + head_kv_idx * v_nb2 + k_idx * v_nb1;
+
+        ACC_TYPE4 dot4 = (ACC_TYPE4)(0.0f);
+        for (int qk = tid_sg; qk < DK_VEC; qk += Q1_WG_SIZE) {
+            const int block_idx = qk / 8;
+            const int lane      = qk % 8;
+            const float4 k_v = dequant_q8_0_lane(k_row + block_idx * Q8_0_BLOCK_SIZE, lane);
+            dot4 = mad(q_shared[qk], k_v, dot4);
+        }
+        ACC_TYPE dot_partial = dot4.s0 + dot4.s1 + dot4.s2 + dot4.s3;
+        ACC_TYPE score = sub_group_reduce_add(dot_partial) * scale;
+
+        if (mask_base != NULL) {
+            const global MASK_DATA_TYPE * mask_ptr = (const global MASK_DATA_TYPE *) mask_base;
+            score += slope * (ACC_TYPE) mask_ptr[k_idx];
+        }
+        if (logit_softcap > 0.0f) {
+            score = logit_softcap * tanh(score / logit_softcap);
+        }
+
+        const ACC_TYPE m_new      = max(m_i, score);
+        const ACC_TYPE scale_prev = native_exp(m_i - m_new);
+        const ACC_TYPE p          = native_exp(score - m_new);
+
+        int idx = 0;
+        for (int dv = tid_sg; dv < DV_VEC; dv += Q1_WG_SIZE, ++idx) {
+            const int block_idx = dv / 8;
+            const int lane      = dv % 8;
+            const float4 v_v = dequant_q8_0_lane(v_row + block_idx * Q8_0_BLOCK_SIZE, lane);
+            o_acc[idx] = mad(p, v_v, o_acc[idx] * scale_prev);
+        }
+        l_i = l_i * scale_prev + p;
+        m_i = m_new;
+    }
+
+    __local ACC_TYPE  sg_m[VEC_NSG];
+    __local ACC_TYPE  sg_l[VEC_NSG];
+    __local ACC_TYPE4 sg_o[VEC_NSG][DV_VEC];
+
+    if (tid_sg == 0) {
+        sg_m[sgid] = m_i;
+        sg_l[sgid] = l_i;
+    }
+    {
+        int idx = 0;
+        for (int dv = tid_sg; dv < DV_VEC; dv += Q1_WG_SIZE, ++idx) {
+            sg_o[sgid][dv] = o_acc[idx];
+        }
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    if (sgid == 0) {
+        ACC_TYPE m_final = sg_m[0];
+        #pragma unroll
+        for (int s = 1; s < VEC_NSG; ++s) {
+            m_final = max(m_final, sg_m[s]);
+        }
+        if (sinks_ptr != NULL) {
+            m_final = max(m_final, sinks_ptr[head_idx]);
+        }
+
+        ACC_TYPE l_final = 0.0f;
+        #pragma unroll
+        for (int s = 0; s < VEC_NSG; ++s) {
+            l_final += sg_l[s] * native_exp(sg_m[s] - m_final);
+        }
+        if (sinks_ptr != NULL) {
+            l_final += native_exp(sinks_ptr[head_idx] - m_final);
+        }
+        const ACC_TYPE l_inv = (l_final > 0.0f) ? (1.0f / l_final) : 0.0f;
+
+        const ulong o_row_offset = batch_idx * o_nb3 + head_idx * o_nb1;
+        global O_DATA_TYPE4 * o_row = (global O_DATA_TYPE4 *) (o_base + o_row_offset);
+
+        int idx = 0;
+        for (int dv = tid_sg; dv < DV_VEC; dv += Q1_WG_SIZE, ++idx) {
+            ACC_TYPE4 o_merged = (ACC_TYPE4)(0.0f);
+            #pragma unroll
+            for (int s = 0; s < VEC_NSG; ++s) {
+                const ACC_TYPE alpha = native_exp(sg_m[s] - m_final);
+                o_merged = mad((ACC_TYPE4)(alpha), sg_o[s][dv], o_merged);
+            }
+            o_row[dv] = CONVERT_O_DATA4(o_merged * l_inv);
+        }
+    }
+}
+
 // Flash-decoding split pass for q8_0 KV. Partial record: [m, l, O[DV]].
 // Merge kernel from flash_attn_f32_f16.cl is type-agnostic and reused.
 #define FA_PARTIAL_FLOATS (2 + DV)
