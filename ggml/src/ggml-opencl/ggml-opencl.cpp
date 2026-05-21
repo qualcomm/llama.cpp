@@ -525,6 +525,30 @@ struct ggml_backend_opencl_context {
     ggml_cl_buffer prealloc_scales_trans;
     ggml_cl_buffer prealloc_act_trans;
 
+    // Pool of persistent image1d_buffer views over KV-cache layers, keyed by
+    // (parent buffer, offset within parent). Used by the IMG-variant KQ/KQV
+    // dispatch paths to avoid per-call clCreateSubBuffer + clCreateImage +
+    // pending-release-queue churn on long-context decode (which was
+    // catastrophic on Qwen3.6-35B-A3B: 0.99 t/s vs 14.33 t/s on the smaller
+    // 30B model). Entries grow if a later dispatch sees a larger byte-span;
+    // released in free().
+    struct ImagePoolKey {
+        uintptr_t buf;
+        uint64_t  offset;
+        bool operator<(const ImagePoolKey & o) const {
+            if (buf != o.buf) return buf < o.buf;
+            return offset < o.offset;
+        }
+    };
+    struct ImagePoolEntry {
+        cl_mem sub_buffer = nullptr;
+        cl_mem image      = nullptr;
+        size_t k_bytes    = 0;
+        cl_channel_type channel_data_type = CL_FLOAT;
+    };
+    std::map<ImagePoolKey, ImagePoolEntry> kq_img_pool;
+    std::map<ImagePoolKey, ImagePoolEntry> kqv_img_pool;
+
     // prealloc buffers for src0 and src1
     ggml_cl_buffer prealloc_src0;
     ggml_cl_buffer prealloc_src1;
@@ -649,7 +673,13 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mat_f16_f32;
     cl_kernel kernel_mul_mat_f16_f32_l4;
     cl_kernel kernel_mul_mat_f16_f32_l4_x8 = nullptr;
+    cl_kernel kernel_mul_mat_f16_f32_l4_x8_pair = nullptr;
+    cl_kernel kernel_mul_mat_f16_f32_l4_x8_gqa4 = nullptr;
+    cl_kernel kernel_mul_mat_f16_f32_l4_x8_gqa4_img = nullptr;
+    cl_kernel kernel_mul_mat_f16_f32_l4_x8_gqa_r4_img = nullptr;
     cl_kernel kernel_mul_mat_f16_f32_l4_y8 = nullptr;
+    cl_kernel kernel_mul_mat_f16_f32_l4_y8_gqa = nullptr;
+    cl_kernel kernel_mul_mat_f16_f32_l4_y8_gqa_img = nullptr;
     cl_kernel kernel_mul_mat_f16_f32_tiled;
     cl_kernel kernel_adreno_xmem_pack_src_f32;
     cl_kernel kernel_adreno_xmem_prepack_weight_f16;
@@ -899,6 +929,17 @@ struct ggml_backend_opencl_context {
             write_profiling_info();
             profiling_info.clear();
 #endif
+            // Release pooled image1d_buffer views over KV cache layers.
+            for (auto & kv : kq_img_pool) {
+                if (kv.second.image)      CL_CHECK(clReleaseMemObject(kv.second.image));
+                if (kv.second.sub_buffer) CL_CHECK(clReleaseMemObject(kv.second.sub_buffer));
+            }
+            kq_img_pool.clear();
+            for (auto & kv : kqv_img_pool) {
+                if (kv.second.image)      CL_CHECK(clReleaseMemObject(kv.second.image));
+                if (kv.second.sub_buffer) CL_CHECK(clReleaseMemObject(kv.second.sub_buffer));
+            }
+            kqv_img_pool.clear();
         }
     }
 };
@@ -1700,12 +1741,54 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         backend_ctx->kernel_mul_mat_f16_f32_l4_x8 =
             clCreateKernel(backend_ctx->program_mul_mv_f16_f32_l4, "kernel_mul_mat_f16_f32_l4_x8", &err_x8);
         if (err_x8 != CL_SUCCESS) backend_ctx->kernel_mul_mat_f16_f32_l4_x8 = nullptr;
+        // Paired K-row variant of _x8: doubles per-wave-cycle memory-issue
+        // parallelism at DK in [128, 256] by using both halves of the 64-lane
+        // warp on adjacent K-rows. Best-effort.
+        cl_int err_x8p = CL_SUCCESS;
+        backend_ctx->kernel_mul_mat_f16_f32_l4_x8_pair =
+            clCreateKernel(backend_ctx->program_mul_mv_f16_f32_l4, "kernel_mul_mat_f16_f32_l4_x8_pair", &err_x8p);
+        if (err_x8p != CL_SUCCESS) backend_ctx->kernel_mul_mat_f16_f32_l4_x8_pair = nullptr;
+        // GQA-coalesced variant of _x8 for DK=128, r2=4: one WG per K-head,
+        // 64-lane warp partitioned across 4 Q-heads so each K-row is read
+        // once and contributes to 4 outputs. Targets long-context KQ where
+        // the 4× K replay dominates. Best-effort.
+        cl_int err_x8g = CL_SUCCESS;
+        backend_ctx->kernel_mul_mat_f16_f32_l4_x8_gqa4 =
+            clCreateKernel(backend_ctx->program_mul_mv_f16_f32_l4, "kernel_mul_mat_f16_f32_l4_x8_gqa4", &err_x8g);
+        if (err_x8g != CL_SUCCESS) backend_ctx->kernel_mul_mat_f16_f32_l4_x8_gqa4 = nullptr;
+        // image1d_buffer_t (texture-cache) variant of _x8_gqa4. Same kernel
+        // body but K is bound as a read-only image1d_buffer over a sub-buffer
+        // covering the K cache. Host creates the sub-buffer + image per call.
+        // Targets the long-ctx KQ BW gap (effective K-read 7.3 GB/s vs 76
+        // GB/s coalesced peak on Adreno X2). Best-effort.
+        cl_int err_x8gi = CL_SUCCESS;
+        backend_ctx->kernel_mul_mat_f16_f32_l4_x8_gqa4_img =
+            clCreateKernel(backend_ctx->program_mul_mv_f16_f32_l4, "kernel_mul_mat_f16_f32_l4_x8_gqa4_img", &err_x8gi);
+        if (err_x8gi != CL_SUCCESS) backend_ctx->kernel_mul_mat_f16_f32_l4_x8_gqa4_img = nullptr;
+        // r2=4 specialization (Llama-3.x / Qwen3-4B/8B / Qwen3.5-4B / etc.).
+        cl_int err_x8gi_r4 = CL_SUCCESS;
+        backend_ctx->kernel_mul_mat_f16_f32_l4_x8_gqa_r4_img =
+            clCreateKernel(backend_ctx->program_mul_mv_f16_f32_l4, "kernel_mul_mat_f16_f32_l4_x8_gqa_r4_img", &err_x8gi_r4);
+        if (err_x8gi_r4 != CL_SUCCESS) backend_ctx->kernel_mul_mat_f16_f32_l4_x8_gqa_r4_img = nullptr;
         // Streaming-Q multi-output variant for KQV-shaped matmul (ne00 large,
         // ne01 small). Best-effort.
         cl_int err_y8 = CL_SUCCESS;
         backend_ctx->kernel_mul_mat_f16_f32_l4_y8 =
             clCreateKernel(backend_ctx->program_mul_mv_f16_f32_l4, "kernel_mul_mat_f16_f32_l4_y8", &err_y8);
         if (err_y8 != CL_SUCCESS) backend_ctx->kernel_mul_mat_f16_f32_l4_y8 = nullptr;
+        // GQA-coalesced KQV variant: one WG per K-head emits 8 DV-rows × 8
+        // Q-heads = 64 outputs. Reduces V replay by r2=8. Best-effort.
+        cl_int err_y8g = CL_SUCCESS;
+        backend_ctx->kernel_mul_mat_f16_f32_l4_y8_gqa =
+            clCreateKernel(backend_ctx->program_mul_mv_f16_f32_l4, "kernel_mul_mat_f16_f32_l4_y8_gqa", &err_y8g);
+        if (err_y8g != CL_SUCCESS) backend_ctx->kernel_mul_mat_f16_f32_l4_y8_gqa = nullptr;
+        // image1d_buffer_t (texture-cache) variant of _y8_gqa. V bound as
+        // read-only image; same generic k_bytes formula handles the V
+        // (transposed n_kv-fast) layout.
+        cl_int err_y8gi = CL_SUCCESS;
+        backend_ctx->kernel_mul_mat_f16_f32_l4_y8_gqa_img =
+            clCreateKernel(backend_ctx->program_mul_mv_f16_f32_l4, "kernel_mul_mat_f16_f32_l4_y8_gqa_img", &err_y8gi);
+        if (err_y8gi != CL_SUCCESS) backend_ctx->kernel_mul_mat_f16_f32_l4_y8_gqa_img = nullptr;
         GGML_LOG_CONT(".");
     }
 
@@ -14556,6 +14639,68 @@ static cl_mem ggml_cl_mul_mat_dequant_quant_to_f16(
     return out;
 }
 
+// Look up or create a pooled image1d_buffer over a KV-cache view (parent
+// buffer + offset). Reuse across decode steps avoids per-call sub-buffer +
+// image churn that catastrophically slows down 64-layer / 20 GB models. The
+// pool grows the image if a later dispatch sees a larger byte-span; the
+// entry is released only at backend teardown.
+static cl_mem ggml_cl_img_pool_get_or_create(
+    ggml_backend_opencl_context * backend_ctx,
+    std::map<ggml_backend_opencl_context::ImagePoolKey,
+             ggml_backend_opencl_context::ImagePoolEntry> & pool,
+    cl_mem data_device,
+    cl_ulong offset0,
+    size_t required_bytes,
+    cl_channel_type channel_data_type)
+{
+    ggml_backend_opencl_context::ImagePoolKey key{(uintptr_t)data_device, (uint64_t)offset0};
+    auto it = pool.find(key);
+    if (it != pool.end()
+        && it->second.k_bytes >= required_bytes
+        && it->second.channel_data_type == channel_data_type
+        && it->second.image != nullptr) {
+        return it->second.image;
+    }
+
+    // Need to create or recreate. Release any stale entry first.
+    if (it != pool.end()) {
+        if (it->second.image)      CL_CHECK(clReleaseMemObject(it->second.image));
+        if (it->second.sub_buffer) CL_CHECK(clReleaseMemObject(it->second.sub_buffer));
+        pool.erase(it);
+    }
+
+    cl_int status = CL_SUCCESS;
+    cl_buffer_region region = {};
+    region.origin = (size_t)offset0;
+    region.size   = required_bytes;
+    cl_mem sub = clCreateSubBuffer(data_device, 0,
+                                   CL_BUFFER_CREATE_TYPE_REGION, &region, &status);
+    if (status != CL_SUCCESS) {
+        return nullptr;
+    }
+
+    const size_t pixel_size = (channel_data_type == CL_HALF_FLOAT) ? 8 : 16;
+    cl_image_format fmt = {CL_RGBA, channel_data_type};
+    cl_image_desc   desc = {};
+    desc.image_type   = CL_MEM_OBJECT_IMAGE1D_BUFFER;
+    desc.image_width  = required_bytes / pixel_size;
+    desc.buffer       = sub;
+    cl_mem img = clCreateImage(backend_ctx->context, CL_MEM_READ_ONLY,
+                               &fmt, &desc, NULL, &status);
+    if (status != CL_SUCCESS) {
+        CL_CHECK(clReleaseMemObject(sub));
+        return nullptr;
+    }
+
+    ggml_backend_opencl_context::ImagePoolEntry entry;
+    entry.sub_buffer = sub;
+    entry.image      = img;
+    entry.k_bytes    = required_bytes;
+    entry.channel_data_type = channel_data_type;
+    pool[key] = entry;
+    return img;
+}
+
 static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_ASSERT(src0);
     GGML_ASSERT(src0->extra);
@@ -14658,6 +14803,199 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 ((nb02 * ne02 / 4)/4 <= backend_ctx->image_max_buffer_size)) {
                 ggml_cl_mul_mat_kq_kqv_adreno(backend, src0, src1, dst);
                 return;
+            }
+        }
+
+        // Decode-time GQA-coalesced KQ via image1d_buffer_t (texture cache).
+        // Same shape gate as _x8_gqa4 (DK=128, r2=8, r3=1, ne01%16==0, ne11=1)
+        // plus enough K-cache bytes (must fit image_max_buffer_size in pixels).
+        // Opt-in via GGML_OPENCL_MM_KQ_GQA_IMG=1.
+        // r2=4 variant: GGML_OPENCL_MM_KQ_GQA_R4_IMG=1 enables the r2=4
+        // specialization (Llama-3.x / Qwen3-4B/8B / etc.).
+        // Default ON; set the env var to "0" to disable as a kill-switch.
+        // All test-backend-ops MUL_MAT type_a=f16 cases pass with these gates
+        // enabled. Promoted to default after validation on Qwen3-30B-A3B,
+        // Qwen3.6-35B-A3B, Qwen3-4B, Qwen3-8B, Llama-3-8B.
+        static const char * mm_kq_gqa_img_env = getenv("GGML_OPENCL_MM_KQ_GQA_IMG");
+        static const bool mm_kq_gqa_img_on = (mm_kq_gqa_img_env == nullptr || mm_kq_gqa_img_env[0] != '0');
+        static const char * mm_kq_gqa_r4_img_env = getenv("GGML_OPENCL_MM_KQ_GQA_R4_IMG");
+        static const bool mm_kq_gqa_r4_img_on = (mm_kq_gqa_r4_img_env == nullptr || mm_kq_gqa_r4_img_env[0] != '0');
+        const bool img_r4_gate =
+            mm_kq_gqa_r4_img_on &&
+            backend_ctx->kernel_mul_mat_f16_f32_l4_x8_gqa_r4_img != nullptr &&
+            ne11 == 1 && ne01 >= 64 && (ne01 % 16) == 0 && ne00 == 128 &&
+            (ne12 % ne02) == 0 && (ne12 / ne02) == 4 && (ne13 / ne03) == 1;
+        if (mm_kq_gqa_img_on &&
+            backend_ctx->kernel_mul_mat_f16_f32_l4_x8_gqa4_img != nullptr &&
+            ne11 == 1 && ne01 >= 64 && (ne01 % 16) == 0 && ne00 == 128 &&
+            (ne12 % ne02) == 0 && (ne12 / ne02) == 8 && (ne13 / ne03) == 1) {
+            // K cache byte-span the image must cover. The K view at decode
+            // KQ is often PERMUTED on Adreno (nb01 > nb02 — head-major), so
+            // compute the actual byte-span generically: max byte touched =
+            // (ne01-1)*nb01 + (ne02-1)*nb02 + (ne03-1)*nb03 + ne00*sizeof(half).
+            // Image pixel = 16 bytes (CL_RGBA, CL_FLOAT — mirrors prefill kq).
+            const size_t nb00_bytes = sizeof(uint16_t);
+            const size_t k_bytes_span =
+                (size_t)(ne01 > 0 ? ne01 - 1 : 0) * (size_t)nb01 +
+                (size_t)(ne02 > 0 ? ne02 - 1 : 0) * (size_t)nb02 +
+                (size_t)(ne03 > 0 ? ne03 - 1 : 0) * (size_t)nb03 +
+                (size_t)ne00 * nb00_bytes;
+            // Round up to a multiple of 16 (pixel size) so image_width covers it.
+            const size_t k_bytes = (k_bytes_span + 15) & ~(size_t)15;
+            const size_t k_pixels = k_bytes >> 4;
+            if (k_pixels > 0 && k_pixels <= backend_ctx->image_max_buffer_size) {
+                cl_kernel kernel = backend_ctx->kernel_mul_mat_f16_f32_l4_x8_gqa4_img;
+                // Persistent pool: reuse the same image1d_buffer across decode
+                // steps for the same (parent buffer, offset) view.
+                cl_mem K_img = ggml_cl_img_pool_get_or_create(
+                    backend_ctx, backend_ctx->kq_img_pool,
+                    extra0->data_device, offset0, k_bytes, CL_FLOAT);
+                if (K_img != nullptr) {
+                    cl_uint k_arg = 0;
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(cl_mem),   &K_img));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(cl_mem),   &extra1->data_device));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(cl_ulong), &offset1));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(cl_mem),   &extrad->data_device));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(cl_ulong), &offsetd));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(int),      &ne00));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(int),      &ne01));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(int),      &ne02));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(cl_ulong), &nb01));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(cl_ulong), &nb02));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(cl_ulong), &nb03));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(int),      &ne10));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(int),      &ne11));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(int),      &ne12));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(cl_ulong), &nb10));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(cl_ulong), &nb11));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(cl_ulong), &nb12));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(cl_ulong), &nb13));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(int),      &ne0));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(int),      &ne1));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(int),      &r2));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(int),      &r3));
+
+                    const int nth0_d = 64;
+                    const int64_t n_wg_x = ne01 / 16;
+                    size_t global_work_size[] = {(size_t)n_wg_x * nth0_d, (size_t)1, (size_t)ne02 * ne13};
+                    size_t local_work_size[]  = {(size_t)nth0_d, (size_t)1, 1};
+                    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+                    return;
+                }
+                // Fall through on pool creation failure (rare; image_max etc).
+            }
+        }
+
+        // r2=4 specialization: Llama-3.x / Qwen3-4B/8B / etc.
+        // Uses the same pool (kq_img_pool) as the r2=8 path; different kernel.
+        if (img_r4_gate) {
+            const size_t nb00_bytes = sizeof(uint16_t);
+            const size_t k_bytes_span =
+                (size_t)(ne01 > 0 ? ne01 - 1 : 0) * (size_t)nb01 +
+                (size_t)(ne02 > 0 ? ne02 - 1 : 0) * (size_t)nb02 +
+                (size_t)(ne03 > 0 ? ne03 - 1 : 0) * (size_t)nb03 +
+                (size_t)ne00 * nb00_bytes;
+            const size_t k_bytes = (k_bytes_span + 15) & ~(size_t)15;
+            const size_t k_pixels = k_bytes >> 4;
+            if (k_pixels > 0 && k_pixels <= backend_ctx->image_max_buffer_size) {
+                cl_kernel kernel = backend_ctx->kernel_mul_mat_f16_f32_l4_x8_gqa_r4_img;
+                cl_mem K_img = ggml_cl_img_pool_get_or_create(
+                    backend_ctx, backend_ctx->kq_img_pool,
+                    extra0->data_device, offset0, k_bytes, CL_FLOAT);
+                if (K_img != nullptr) {
+                    cl_uint k_arg = 0;
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(cl_mem),   &K_img));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(cl_mem),   &extra1->data_device));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(cl_ulong), &offset1));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(cl_mem),   &extrad->data_device));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(cl_ulong), &offsetd));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(int),      &ne00));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(int),      &ne01));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(int),      &ne02));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(cl_ulong), &nb01));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(cl_ulong), &nb02));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(cl_ulong), &nb03));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(int),      &ne10));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(int),      &ne11));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(int),      &ne12));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(cl_ulong), &nb10));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(cl_ulong), &nb11));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(cl_ulong), &nb12));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(cl_ulong), &nb13));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(int),      &ne0));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(int),      &ne1));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(int),      &r2));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(int),      &r3));
+
+                    const int nth0_d = 64;
+                    const int64_t n_wg_x = ne01 / 16;
+                    size_t global_work_size[] = {(size_t)n_wg_x * nth0_d, (size_t)1, (size_t)ne02 * ne13};
+                    size_t local_work_size[]  = {(size_t)nth0_d, (size_t)1, 1};
+                    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+                    return;
+                }
+            }
+        }
+
+        // Decode-time GQA-coalesced KQV via image1d_buffer_t (texture cache).
+        // Companion to KQ image dispatch above. Gate matches _y8_gqa:
+        //   src0=V (ne00=n_kv, ne01=DV=128, ne02=n_head_kv), src1=softmax(KQ).
+        //   r2 = ne12/ne02 = 8 for Qwen3-30B-A3B family.
+        // Same generic k_bytes formula handles V's transposed (n_kv-fast) layout.
+        // Opt-in via GGML_OPENCL_MM_KQV_GQA_IMG=1.
+        static const char * mm_kqv_gqa_img_env = getenv("GGML_OPENCL_MM_KQV_GQA_IMG");
+        static const bool mm_kqv_gqa_img_on = (mm_kqv_gqa_img_env != nullptr && mm_kqv_gqa_img_env[0] != '0');
+        if (mm_kqv_gqa_img_on &&
+            backend_ctx->kernel_mul_mat_f16_f32_l4_y8_gqa_img != nullptr &&
+            ne11 == 1 && ne01 == 128 &&
+            (ne12 % ne02) == 0 && (ne12 / ne02) == 8 && (ne13 / ne03) == 1) {
+            const size_t nb00_bytes = sizeof(uint16_t);
+            const size_t v_bytes_span =
+                (size_t)(ne01 > 0 ? ne01 - 1 : 0) * (size_t)nb01 +
+                (size_t)(ne02 > 0 ? ne02 - 1 : 0) * (size_t)nb02 +
+                (size_t)(ne03 > 0 ? ne03 - 1 : 0) * (size_t)nb03 +
+                (size_t)ne00 * nb00_bytes;
+            // CL_RGBA/CL_HALF_FLOAT: 8-byte pixels (= 1 half4). Same per-iter
+            // access pattern as _y8_gqa, kept register-equivalent.
+            const size_t v_bytes = (v_bytes_span + 7) & ~(size_t)7;
+            const size_t v_pixels = v_bytes >> 3;
+            if (v_pixels > 0 && v_pixels <= backend_ctx->image_max_buffer_size) {
+                cl_kernel kernel = backend_ctx->kernel_mul_mat_f16_f32_l4_y8_gqa_img;
+                cl_mem V_img = ggml_cl_img_pool_get_or_create(
+                    backend_ctx, backend_ctx->kqv_img_pool,
+                    extra0->data_device, offset0, v_bytes, CL_HALF_FLOAT);
+                if (V_img != nullptr) {
+                    cl_uint k_arg = 0;
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(cl_mem),   &V_img));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(cl_mem),   &extra1->data_device));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(cl_ulong), &offset1));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(cl_mem),   &extrad->data_device));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(cl_ulong), &offsetd));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(int),      &ne00));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(int),      &ne01));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(int),      &ne02));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(cl_ulong), &nb01));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(cl_ulong), &nb02));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(cl_ulong), &nb03));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(int),      &ne10));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(int),      &ne11));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(int),      &ne12));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(cl_ulong), &nb10));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(cl_ulong), &nb11));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(cl_ulong), &nb12));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(cl_ulong), &nb13));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(int),      &ne0));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(int),      &ne1));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(int),      &r2));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(int),      &r3));
+
+                    const int nth0_d = 64;
+                    const int64_t n_wg_x = ne01 / 8;
+                    size_t global_work_size[] = {(size_t)n_wg_x * nth0_d, (size_t)1, (size_t)ne02 * ne13};
+                    size_t local_work_size[]  = {(size_t)nth0_d, (size_t)1, 1};
+                    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+                    return;
+                }
             }
         }
     }
@@ -15312,10 +15650,45 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     //     outputs in the WG.
                     // Biggest win at long context where the KQ/KQV launches
                     // ~262K WGs each with a single mad.
-                    const bool can_multi_out = ne11 == 1 && ne01 >= 64 && ne01 % 8 == 0;
-                    if (can_multi_out && ne00 <= 256 &&
+                    // Diagnostic: GGML_OPENCL_MM_F16_FORCE_L4=1 bypasses _x8/_y8 multi-output
+                    // variants and forces the original _l4 kernel. Used to bisect Qwen3.6-35B-A3B
+                    // baseline drift between 940c1ef5f and ff90e9a95 (11.13 → 8.38 t/s at d=16k).
+                    static const char * mm_force_l4_env = getenv("GGML_OPENCL_MM_F16_FORCE_L4");
+                    static const bool mm_force_l4_on = (mm_force_l4_env != nullptr && mm_force_l4_env[0] != '0');
+                    const bool can_multi_out = !mm_force_l4_on && ne11 == 1 && ne01 >= 64 && ne01 % 8 == 0;
+                    // Opt-in: GGML_OPENCL_MM_KQ_PAIR=1 swaps _x8 for the
+                    // paired-K-row variant that doubles per-wave-cycle
+                    // memory-issue parallelism at DK in [128, 256]. Held
+                    // behind env var (no long-ctx win on Qwen3-30B-A3B).
+                    static const char * mm_kq_pair_env = getenv("GGML_OPENCL_MM_KQ_PAIR");
+                    static const bool mm_kq_pair_on = (mm_kq_pair_env != nullptr && mm_kq_pair_env[0] != '0');
+                    // Opt-in: GGML_OPENCL_MM_KQ_GQA=1 swaps _x8 for the
+                    // GQA-coalesced variant that reads each K-row once and
+                    // emits gqa_ratio outputs. Specialized for DK=128, r2=8,
+                    // r3=1 (Qwen3-30B-A3B / Qwen3-4B / Qwen3.6-A3B shape).
+                    // +35% tg128 @ d=16k, +30% @ d=8k, +20% @ d=4k on Qwen3-30B-A3B.
+                    static const char * mm_kq_gqa_env = getenv("GGML_OPENCL_MM_KQ_GQA");
+                    static const bool mm_kq_gqa_on = (mm_kq_gqa_env != nullptr && mm_kq_gqa_env[0] != '0');
+                    // Opt-in: GGML_OPENCL_MM_KQV_GQA=1 swaps _y8 for the
+                    // GQA-coalesced KQV variant (DK=128/r2=8/r3=1) that reads
+                    // each V slab once per K-head and emits all r2 Q-heads.
+                    static const char * mm_kqv_gqa_env = getenv("GGML_OPENCL_MM_KQV_GQA");
+                    static const bool mm_kqv_gqa_on = (mm_kqv_gqa_env != nullptr && mm_kqv_gqa_env[0] != '0');
+                    if (can_multi_out && (ne01 % 16) == 0 && ne00 == 128 && r2 == 8 && r3 == 1 && mm_kq_gqa_on &&
+                        backend_ctx->kernel_mul_mat_f16_f32_l4_x8_gqa4 != nullptr) {
+                        kernel = backend_ctx->kernel_mul_mat_f16_f32_l4_x8_gqa4;
+                        nrows = 1;
+                    } else if (can_multi_out && ne00 <= 256 && mm_kq_pair_on &&
+                        backend_ctx->kernel_mul_mat_f16_f32_l4_x8_pair != nullptr) {
+                        kernel = backend_ctx->kernel_mul_mat_f16_f32_l4_x8_pair;
+                        nrows = 1;
+                    } else if (can_multi_out && ne00 <= 256 &&
                         backend_ctx->kernel_mul_mat_f16_f32_l4_x8 != nullptr) {
                         kernel = backend_ctx->kernel_mul_mat_f16_f32_l4_x8;
+                        nrows = 1;
+                    } else if (can_multi_out && ne01 == 128 && r2 == 8 && r3 == 1 && mm_kqv_gqa_on &&
+                        backend_ctx->kernel_mul_mat_f16_f32_l4_y8_gqa != nullptr) {
+                        kernel = backend_ctx->kernel_mul_mat_f16_f32_l4_y8_gqa;
                         nrows = 1;
                     } else if (can_multi_out &&
                         backend_ctx->kernel_mul_mat_f16_f32_l4_y8 != nullptr) {
@@ -15970,12 +16343,29 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 
         backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
     } else if (kernel == backend_ctx->kernel_mul_mat_f16_f32_l4_x8 ||
+               kernel == backend_ctx->kernel_mul_mat_f16_f32_l4_x8_pair ||
                kernel == backend_ctx->kernel_mul_mat_f16_f32_l4_y8) {
         // Multi-output decode variants: each WG processes 8 outputs along
         // ne01; ne11 == 1. Same grid shape for both x8 (Q cached) and y8
         // (streaming Q).
         const int64_t n_wg_x = ne01 / 8;
         size_t global_work_size[] = {(size_t)n_wg_x*nth0, (size_t)nth1, (size_t)ne12*ne13};
+        size_t local_work_size[]  = {(size_t)nth0, (size_t)nth1, 1};
+        backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+    } else if (kernel == backend_ctx->kernel_mul_mat_f16_f32_l4_x8_gqa4) {
+        // GQA-coalesced KQ: one WG per K-head emits N_K_ROWS_GQA=16 K-rows ×
+        // r2 Q-heads. Widens the per-WG latency-hiding window vs the original
+        // N=8 (post-profile: KQ was 70% of decode at d=16k due to memory-stall
+        // serialization on K-row fetches). N=32 regressed 9-11% at long ctx,
+        // likely due to I-cache pressure from the unrolled outer loop.
+        const int64_t n_wg_x = ne01 / 16;
+        size_t global_work_size[] = {(size_t)n_wg_x*nth0, (size_t)nth1, (size_t)ne02*ne13};
+        size_t local_work_size[]  = {(size_t)nth0, (size_t)nth1, 1};
+        backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+    } else if (kernel == backend_ctx->kernel_mul_mat_f16_f32_l4_y8_gqa) {
+        // GQA-coalesced KQV: one WG per K-head emits 8 DV-rows × r2 Q-heads.
+        const int64_t n_wg_x = ne01 / 8;
+        size_t global_work_size[] = {(size_t)n_wg_x*nth0, (size_t)nth1, (size_t)ne02*ne13};
         size_t local_work_size[]  = {(size_t)nth0, (size_t)nth1, 1};
         backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
     } else {
