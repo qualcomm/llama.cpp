@@ -20,6 +20,11 @@ static const ggml_opencl_fa_dim g_fa_dims_adreno_default[] = {
     {192, 128, 16, 16, 1, 0},
     {192, 192, 16, 16, 1, 0},
     {256, 256, 16, 16, 16, 0},
+    // DK=DV=512 covers Gemma-4's global-attention layers (SWA layers run on
+    // the 256 path). BM=8 keeps local memory under 32 KB (l_k+l_v=2×8×128×8 B).
+    // N_SPLIT=32 caps SPLIT_DK_VEC/SPLIT_DV_VEC at 4 float4 each, matching the
+    // register footprint of the 256/16 row known to fit on Adreno X2.
+    {512, 512,  8, 16, 32, 0},
 };
 
 struct ggml_opencl_fa_dim_table {

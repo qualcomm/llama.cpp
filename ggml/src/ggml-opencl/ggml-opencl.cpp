@@ -5387,6 +5387,7 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                     { 40,  40}, { 64,  64}, { 80,  80}, { 96,  96},
                     {112, 112}, {128, 128}, {192, 128},
                     {192, 192}, {256, 256},
+                    {512, 512},  // Gemma-4 global-attention layers
                 };
 
                 bool dims_supported = false;
@@ -5422,7 +5423,31 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                                          k->type != v->type &&
                                          is_kv_type_ok(k->type) && is_kv_type_ok(v->type);
 
-                return is_f32_f32 || is_f16_f16 || is_f32_f16 || is_f32_q8_0 || is_f32_q4_0 || is_f32_asym;
+                const bool kv_combo_ok = is_f32_f32 || is_f16_f16 || is_f32_f16 ||
+                                         is_f32_q8_0 || is_f32_q4_0 || is_f32_asym;
+                if (!kv_combo_ok) {
+                    return false;
+                }
+
+                // DK=512 (Gemma-4 global-attention layers) is a large FA kernel.
+                // Probe-compile the variant here so a device whose compiler runs
+                // out of host memory building it (seen on memory-constrained
+                // Adreno parts) cleanly declines the op — the graph then runs it
+                // on the CPU backend — instead of crashing later at dispatch on
+                // a kernel that never compiled. The lazy compile is cached, so
+                // this costs at most one build attempt per (dk, dv, variant).
+                if (dk == 512) {
+                    ggml_opencl_fa_variant fa_variant;
+                    if      (is_f16_f16)  fa_variant = FA_VARIANT_F16;
+                    else if (is_f32_f16)  fa_variant = FA_VARIANT_F32_F16;
+                    else if (is_f32_q8_0) fa_variant = FA_VARIANT_Q8_0;
+                    else if (is_f32_q4_0) fa_variant = FA_VARIANT_Q4_0;
+                    else                  fa_variant = FA_VARIANT_F32;  // f32 / asymmetric KV
+                    if (!ggml_opencl_ensure_fa_variant(backend_ctx, dk, dv, fa_variant)) {
+                        return false;
+                    }
+                }
+                return true;
             }
         default:
             return false;
