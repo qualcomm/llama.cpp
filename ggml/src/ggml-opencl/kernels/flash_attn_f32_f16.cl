@@ -1,5 +1,18 @@
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
 
+#ifdef cl_intel_subgroups
+#pragma OPENCL EXTENSION cl_intel_subgroups : enable
+#else
+#pragma OPENCL EXTENSION cl_khr_subgroups : enable
+#endif
+
+#ifdef cl_qcom_reqd_sub_group_size
+#pragma OPENCL EXTENSION cl_qcom_reqd_sub_group_size : enable
+#define REQD_SUBGROUP_SIZE_64 __attribute__((qcom_reqd_sub_group_size("half")))
+#else
+#define REQD_SUBGROUP_SIZE_64
+#endif
+
 #ifdef cl_khr_subgroup_shuffle
 #pragma OPENCL EXTENSION cl_khr_subgroup_shuffle : enable
 #define HAS_SUBGROUP_SHUFFLE 1
@@ -722,6 +735,210 @@ __kernel void flash_attn_f32_f16_q1(
     } else if (tid == 0) {
         FA_UNROLL
         for (int i = 0; i < DV_VEC; ++i) o_row[i] = (O_DATA_TYPE4)(0.0f);
+    }
+}
+
+// Decode variant for large DV (e.g. Gemma-4 DK=DV=512 global layers).
+// Mirrors ggml-metal's kernel_flash_attn_ext_vec design:
+//   - WG = VEC_NSG subgroups × 64 lanes. Each subgroup runs the FA-2 online
+//     softmax loop independently over its slice of n_kv, then a __local merge
+//     combines (m_i, l_i, o_acc) across subgroups. This restores the n_kv
+//     parallelism that a single-subgroup vec port loses.
+//   - DV is split across the subgroup (each thread owns DV_VEC/64 of o_acc);
+//     this kills the o_acc[DV_VEC] private-array spill (~2 KB/thread at DV=512).
+//   - DK is split across the subgroup too; partial dots reduce via
+//     sub_group_reduce_add — no per-iteration barriers in the inner loop.
+//   - Cross-subgroup merge uses __local for sg_m / sg_l / sg_o (~4 KB at
+//     NSG=2, DV=512); one subgroup performs the final norm + write.
+// REQD_SUBGROUP_SIZE_64 ensures the subgroup width matches what the
+// dot/o_acc striding assumes (Adreno X2 miscompiles full-subgroup reduces
+// without the explicit attribute; see ssm_scan notes).
+
+#define VEC_NSG          4
+#define VEC_WG_SIZE      (Q1_WG_SIZE * VEC_NSG)
+#define Q1V_DV_PER_THREAD ((DV_VEC + Q1_WG_SIZE - 1) / Q1_WG_SIZE)
+
+REQD_SUBGROUP_SIZE_64
+__kernel void flash_attn_f32_f16_q1_vec(
+    const global void * q_void, ulong q_offset,
+    const global void * k_void, ulong k_offset,
+    const global void * v_void, ulong v_offset,
+    global void * o_void, ulong o_offset,
+    const float scale,
+    const int n_q,
+    const int n_kv,
+    const int is_causal,
+    const int n_head,
+    const ulong q_nb1, const ulong q_nb2, const ulong q_nb3,
+    const ulong k_nb1, const ulong k_nb2, const ulong k_nb3,
+    const ulong v_nb1, const ulong v_nb2, const ulong v_nb3,
+    const ulong o_nb1, const ulong o_nb2, const ulong o_nb3,
+    const float max_bias,
+    const float m0,
+    const float m1,
+    const int n_head_log2,
+    const float logit_softcap,
+    const int n_head_kv,
+    const global void* mask_void,
+    const ulong mask_offset,
+    const ulong mask_nb1,
+    const ulong mask_nb2,
+    const ulong mask_nb3,
+    const int mask_ne2,
+    const int mask_ne3,
+    const global void* sinks_void,
+    const ulong sinks_offset
+) {
+    const int tid             = get_local_id(0);
+    const int sgid            = tid / Q1_WG_SIZE;   // subgroup index (0..VEC_NSG-1)
+    const int tid_sg          = tid % Q1_WG_SIZE;   // lane within subgroup
+    const int head_batch_idx  = get_global_id(1);
+
+    const int batch_idx = head_batch_idx / n_head;
+    const int head_idx  = head_batch_idx % n_head;
+
+    const int gqa_ratio   = n_head / n_head_kv;
+    const int head_kv_idx = head_idx / gqa_ratio;
+
+    const global char * q_base = (const global char *) q_void + q_offset;
+    const global char * k_base = (const global char *) k_void + k_offset;
+    const global char * v_base = (const global char *) v_void + v_offset;
+    global       char * o_base = (global       char *) o_void + o_offset;
+
+    const global char * mask_base = NULL;
+    if (mask_void != NULL) {
+        const int mask_head_idx  = head_idx  % mask_ne2;
+        const int mask_batch_idx = batch_idx % mask_ne3;
+        mask_base = (const global char *) mask_void + mask_offset +
+                    mask_batch_idx * mask_nb3 + mask_head_idx * mask_nb2;
+    }
+
+    // Q is uniform across the WG — stage in __local once. All WG threads load.
+    __local ACC_TYPE4 q_shared[DK_VEC];
+    {
+        const ulong q_row_offset = batch_idx * q_nb3 + head_idx * q_nb2;
+        const global Q_DATA_TYPE4 * q_ptr = (const global Q_DATA_TYPE4 *) (q_base + q_row_offset);
+        for (int i = tid; i < DK_VEC; i += VEC_WG_SIZE) {
+            q_shared[i] = CONVERT_Q_ACC4(q_ptr[i]);
+        }
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    const float slope = get_alibi_slope(max_bias, head_idx, n_head_log2, m0, m1);
+
+    const global ACC_TYPE * sinks_ptr = NULL;
+    if (sinks_void != NULL) {
+        sinks_ptr = (const global ACC_TYPE *) ((const global char *) sinks_void + sinks_offset);
+    }
+
+    // Per-thread DV slice within its subgroup. For DV=512 / 64-wide subgroup
+    // this is 2 float4 = 32 bytes; for DV=256, 1 float4. Cheap in registers —
+    // replaces the o_acc[DV_VEC] per-thread spill (~2 KB at DV=512).
+    ACC_TYPE4 o_acc[Q1V_DV_PER_THREAD];
+    #pragma unroll
+    for (int i = 0; i < Q1V_DV_PER_THREAD; ++i) o_acc[i] = (ACC_TYPE4)(0.0f);
+
+    // Each subgroup independently runs the FA-2 online softmax over its slice
+    // of n_kv. Sinks are NOT folded into per-subgroup m_i — they're added once
+    // in the cross-subgroup merge to avoid double-counting.
+    ACC_TYPE m_i = -INFINITY;
+    ACC_TYPE l_i = 0.0f;
+
+    const int kv_per_sg = (n_kv + VEC_NSG - 1) / VEC_NSG;
+    const int kv_start  = sgid * kv_per_sg;
+    const int kv_end    = min(n_kv, kv_start + kv_per_sg);
+
+    for (int k_idx = kv_start; k_idx < kv_end; ++k_idx) {
+        const ulong k_row_off = batch_idx * k_nb3 + head_kv_idx * k_nb2 + k_idx * k_nb1;
+        const ulong v_row_off = batch_idx * v_nb3 + head_kv_idx * v_nb2 + k_idx * v_nb1;
+        const global KV_DATA_TYPE4 * k_ptr = (const global KV_DATA_TYPE4 *) (k_base + k_row_off);
+        const global KV_DATA_TYPE4 * v_ptr = (const global KV_DATA_TYPE4 *) (v_base + v_row_off);
+
+        // Q*K^T: each thread accumulates its DK slice; subgroup-reduce the partial.
+        ACC_TYPE4 dot4 = (ACC_TYPE4)(0.0f);
+        for (int k = tid_sg; k < DK_VEC; k += Q1_WG_SIZE) {
+            dot4 = mad(q_shared[k], CONVERT_KV_ACC4(k_ptr[k]), dot4);
+        }
+        ACC_TYPE dot_partial = dot4.s0 + dot4.s1 + dot4.s2 + dot4.s3;
+        ACC_TYPE score = sub_group_reduce_add(dot_partial) * scale;
+
+        if (mask_base != NULL) {
+            const global MASK_DATA_TYPE * mask_ptr = (const global MASK_DATA_TYPE *) mask_base;
+            score += slope * (ACC_TYPE) mask_ptr[k_idx];
+        }
+        if (logit_softcap > 0.0f) {
+            score = logit_softcap * tanh(score / logit_softcap);
+        }
+
+        // FA-2 online update. All threads in the subgroup see the same score,
+        // so m_i and l_i evolve identically across lanes within the subgroup.
+        const ACC_TYPE m_new      = max(m_i, score);
+        const ACC_TYPE scale_prev = native_exp(m_i - m_new);
+        const ACC_TYPE p          = native_exp(score - m_new);
+
+        int idx = 0;
+        for (int dv_idx = tid_sg; dv_idx < DV_VEC; dv_idx += Q1_WG_SIZE, ++idx) {
+            o_acc[idx] = mad(p, CONVERT_KV_ACC4(v_ptr[dv_idx]), o_acc[idx] * scale_prev);
+        }
+        l_i = l_i * scale_prev + p;
+        m_i = m_new;
+    }
+
+    // Cross-subgroup merge via __local. Each subgroup publishes (m_i, l_i)
+    // and its o_acc slice; subgroup 0 then folds them into the final norm
+    // and writes the row.
+    __local ACC_TYPE  sg_m[VEC_NSG];
+    __local ACC_TYPE  sg_l[VEC_NSG];
+    __local ACC_TYPE4 sg_o[VEC_NSG][DV_VEC];
+
+    if (tid_sg == 0) {
+        sg_m[sgid] = m_i;
+        sg_l[sgid] = l_i;
+    }
+    {
+        int idx = 0;
+        for (int dv_idx = tid_sg; dv_idx < DV_VEC; dv_idx += Q1_WG_SIZE, ++idx) {
+            sg_o[sgid][dv_idx] = o_acc[idx];
+        }
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    if (sgid == 0) {
+        // m_final = max over all subgroups' m_i, plus the sink (if any).
+        ACC_TYPE m_final = sg_m[0];
+        #pragma unroll
+        for (int s = 1; s < VEC_NSG; ++s) {
+            m_final = max(m_final, sg_m[s]);
+        }
+        if (sinks_ptr != NULL) {
+            m_final = max(m_final, sinks_ptr[head_idx]);
+        }
+
+        ACC_TYPE l_final = 0.0f;
+        #pragma unroll
+        for (int s = 0; s < VEC_NSG; ++s) {
+            l_final += sg_l[s] * native_exp(sg_m[s] - m_final);
+        }
+        if (sinks_ptr != NULL) {
+            l_final += native_exp(sinks_ptr[head_idx] - m_final);
+        }
+        const ACC_TYPE l_inv = (l_final > 0.0f) ? (1.0f / l_final) : 0.0f;
+
+        const ulong o_row_offset = batch_idx * o_nb3 + head_idx * o_nb1;
+        global O_DATA_TYPE4 * o_row = (global O_DATA_TYPE4 *) (o_base + o_row_offset);
+
+        // Each thread in subgroup 0 writes its DV slice, folding all subgroups'
+        // contributions with the rescale factor.
+        int idx = 0;
+        for (int dv_idx = tid_sg; dv_idx < DV_VEC; dv_idx += Q1_WG_SIZE, ++idx) {
+            ACC_TYPE4 o_merged = (ACC_TYPE4)(0.0f);
+            #pragma unroll
+            for (int s = 0; s < VEC_NSG; ++s) {
+                const ACC_TYPE alpha = native_exp(sg_m[s] - m_final);
+                o_merged = mad((ACC_TYPE4)(alpha), sg_o[s][dv_idx], o_merged);
+            }
+            o_row[dv_idx] = CONVERT_O_DATA4(o_merged * l_inv);
+        }
     }
 }
 
