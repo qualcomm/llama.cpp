@@ -868,9 +868,9 @@ __kernel void flash_attn_f32_f16_q1_vec(
     #pragma unroll
     for (int i = 0; i < Q1V_DV_PER_THREAD; ++i) o_acc[i] = (ACC_TYPE4)(0.0f);
 
-    // each subgroup independently runs the FA-2 online softmax over its slice of n_kv.
-    // sinks are not folded into per-subgroup m_i — they're added once in
-    // the cross-subgroup merge to avoid double-counting.
+    // Each subgroup independently runs the FA-2 online softmax over its slice
+    // of n_kv. Sinks are NOT folded into per-subgroup m_i — they're added once
+    // in the cross-subgroup merge to avoid double-counting.
     ACC_TYPE m_i = FA_M_INIT;
     ACC_TYPE l_i = 0.0f;
 
@@ -1882,7 +1882,7 @@ __kernel void flash_attn_f32_f16_q1_vec_mq_split_k_img(
                 const ulong rec_idx = ((((ulong) batch_idx * n_head + head_idx) * n_q + q_idx)
                                        * n_splits + split_idx);
                 global float * rec = partial_void + rec_idx * record_stride;
-                rec[0] = -INFINITY;
+                rec[0] = FA_M_INIT;
                 rec[1] = 0.0f;
             }
         }
@@ -1931,7 +1931,7 @@ __kernel void flash_attn_f32_f16_q1_vec_mq_split_k_img(
     ACC_TYPE  l_i[MQ_GQA];
     #pragma unroll
     for (int h = 0; h < MQ_GQA; ++h) {
-        m_i[h] = -INFINITY;
+        m_i[h] = FA_M_INIT;
         l_i[h] = 0.0f;
         #pragma unroll
         for (int i = 0; i < Q1V_DV_PER_THREAD; ++i) o_acc[h][i] = (ACC_TYPE4)(0.0f);
