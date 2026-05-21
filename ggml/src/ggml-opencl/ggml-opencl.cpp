@@ -712,14 +712,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mat_f16_f32_l4_dr_ls;
     cl_kernel kernel_mul_mat_f16_f32_l4_dr_lq;
     cl_kernel kernel_mul_mat_f16_f32_l4_x8 = nullptr;
-    cl_kernel kernel_mul_mat_f16_f32_l4_x8_pair = nullptr;
-    cl_kernel kernel_mul_mat_f16_f32_l4_x8_gqa4 = nullptr;
-    cl_kernel kernel_mul_mat_f16_f32_l4_x8_gqa4_img = nullptr;
-    cl_kernel kernel_mul_mat_f16_f32_l4_x8_gqa_r4_img = nullptr;
-    cl_kernel kernel_mul_mat_f16_f32_l4_x8_gqa_r2_dk256_img = nullptr;
     cl_kernel kernel_mul_mat_f16_f32_l4_y8 = nullptr;
-    cl_kernel kernel_mul_mat_f16_f32_l4_y8_gqa = nullptr;
-    cl_kernel kernel_mul_mat_f16_f32_l4_y8_gqa_img = nullptr;
     cl_kernel kernel_mul_mat_f16_f32_tiled;
     cl_kernel kernel_adreno_xmem_pack_src_f32;
     cl_kernel kernel_adreno_xmem_prepack_weight_f16;
@@ -19246,9 +19239,10 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 
         backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
     } else if (kernel == backend_ctx->kernel_mul_mat_f16_f32_l4_x8 ||
-               kernel == backend_ctx->kernel_mul_mat_f16_f32_l4_x8_pair ||
                kernel == backend_ctx->kernel_mul_mat_f16_f32_l4_y8) {
-        // multi-output decode variants: each WG processes 8 outputs along ne01, ne11 == 1
+        // Multi-output decode variants: each WG processes 8 outputs along
+        // ne01; ne11 == 1. Same grid shape for both x8 (Q cached) and y8
+        // (streaming Q).
         const int64_t n_wg_x = ne01 / 8;
         size_t global_work_size[] = {(size_t)n_wg_x*nth0, (size_t)nth1, (size_t)ne12*ne13};
         size_t local_work_size[]  = {(size_t)nth0, (size_t)nth1, 1};
