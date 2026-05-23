@@ -12077,6 +12077,15 @@ static constexpr int FD_MAX_SPLITS    = 16;
 static constexpr int FD_MAX_DK        = 128;
 static constexpr int FD_MAX_DK_MULTI  = 64;
 static constexpr int FD_MAX_N_Q_MULTI = 8;
+// Decode-time split granularity for the Multi-Query (MQ) FD kernels. An MQ
+// split work-group has only MQ_NSG_SPLIT (3-4) subgroups sweeping the KV
+// range, so the online-softmax recurrence per subgroup is kv_per_split /
+// MQ_NSG_SPLIT. The prefill-tuned FD_KV_PER_SPLIT=2048 leaves a ~512-deep
+// serial chain → latency-bound. ~256 KV/split keeps the recurrence ~64 and
+// measured +17-25% tg on Qwen3-4B q8_0 KV. The non-MQ split already spreads
+// KV across 64 lanes (short recurrence) so it keeps FD_KV_PER_SPLIT.
+static constexpr int FD_MQ_KV_PER_SPLIT = 256;
+static constexpr int FD_MQ_MAX_SPLITS   = 128;
 
 static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, const ggml_tensor * k, ggml_tensor * dst) {
     const ggml_tensor * v = dst->src[2];
@@ -12603,9 +12612,25 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     const float m1 = powf(2.0f, -(max_bias / 2.0f) / n_head_log2_f);
 
     if (use_fd) {
-        int n_splits = (n_kv + FD_KV_PER_SPLIT - 1) / FD_KV_PER_SPLIT;
+        // MQ FD split kernels are latency-bound on a deep per-subgroup
+        // online-softmax recurrence at the prefill-tuned FD_KV_PER_SPLIT;
+        // use a finer decode granularity for them (see FD_MQ_KV_PER_SPLIT).
+        // Env overrides (read once) keep the granularity sweepable.
+        static const int fd_env_kv_per_split = []{
+            const char * e = getenv("GGML_OPENCL_FD_KV_PER_SPLIT");
+            return (e && e[0]) ? atoi(e) : 0;
+        }();
+        static const int fd_env_max_splits = []{
+            const char * e = getenv("GGML_OPENCL_FD_MAX_SPLITS");
+            return (e && e[0]) ? atoi(e) : 0;
+        }();
+        int fd_kv_per_split = use_fd_mq ? FD_MQ_KV_PER_SPLIT : FD_KV_PER_SPLIT;
+        int fd_max_splits   = use_fd_mq ? FD_MQ_MAX_SPLITS   : FD_MAX_SPLITS;
+        if (fd_env_kv_per_split > 0) fd_kv_per_split = fd_env_kv_per_split;
+        if (fd_env_max_splits   > 0) fd_max_splits   = fd_env_max_splits;
+        int n_splits = (n_kv + fd_kv_per_split - 1) / fd_kv_per_split;
         if (n_splits < FD_MIN_SPLITS) n_splits = FD_MIN_SPLITS;
-        if (n_splits > FD_MAX_SPLITS) n_splits = FD_MAX_SPLITS;
+        if (n_splits > fd_max_splits) n_splits = fd_max_splits;
         const int kv_per_split = (n_kv + n_splits - 1) / n_splits;
 
         const int fa_partial_floats = 2 + d_head_v;
