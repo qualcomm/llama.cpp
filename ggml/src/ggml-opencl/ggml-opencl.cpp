@@ -12479,11 +12479,16 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
                 backend_ctx->fa.f32_q8_0_q1_vec_mq_split.count(dk_dv) > 0) {
                 fd_k_split = backend_ctx->fa.f32_q8_0_q1_vec_mq_split.at(dk_dv);
                 use_fd_mq  = true;
-            // q4_0 KV — opt-in only. The MQ port for q4_0 regressed on
-            // Qwen3-30B-A3B: q4_0 K is only 4 bits/element, so the K-bandwidth
-            // saving MQ offers doesn't offset the per-head dp4a + LDS overhead
-            // (q8_0 at 8 b/e and f16 at 16 b/e do win). Kernel kept registered;
-            // enable for measurement via GGML_OPENCL_FA_Q4_MQ=1.
+            // q4_0 KV — MQ-split dispatch is split by GQA fan-out:
+            //   GQA=4 (MQ_GQA=4 kernel): default-on. Dense 4/8-class targets
+            //     (Mistral-7B, Qwen3-4B/8B, Llama-3-8B) measure +72-151%
+            //     decode at d=8k/16k vs plain q1_split on Adreno X1-85.
+            //   GQA=8 (g8 / MQ_GQA=8 kernel): opt-in. Regressed on
+            //     Qwen3-30B-A3B (per-FA-call +20% on X1-85): q4_0 K at
+            //     4 b/e gives less K-BW saving than q8/f16 while the
+            //     occupancy drop + per-head dp4a + LDS overhead cost
+            //     more than they save on that shape.
+            //     Enable for measurement via GGML_OPENCL_FA_Q4_MQ=1.
             } else if (nq1_only && is_q4_0) {
                 const char * q4_mq_env = getenv("GGML_OPENCL_FA_Q4_MQ");
                 const bool   q4_mq_on  = (q4_mq_env != NULL) && (q4_mq_env[0] != '0');
@@ -12493,7 +12498,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
                     fd_k_split = backend_ctx->fa.f32_q4_0_q1_vec_mq_split_g8.at(dk_dv);
                     use_fd_mq  = true;
                     fd_mq_wg   = 192;
-                } else if (q4_mq_on && gqa_ratio_dispatch == 4 &&
+                } else if (gqa_ratio_dispatch == 4 &&
                     d_head_q == 128 && d_head_v == 128 &&
                     backend_ctx->fa.f32_q4_0_q1_vec_mq_split.count(dk_dv) > 0) {
                     fd_k_split = backend_ctx->fa.f32_q4_0_q1_vec_mq_split.at(dk_dv);
