@@ -12433,9 +12433,17 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
                 fd_k_split = backend_ctx->fa.f32_f16_q1_local_mq_split.at(dk_dv);
                 use_fd_mq  = true;
                 fd_mq_wg   = 64;  // LMQ_WG
-            // f16 KV — Gemma-3 class (DK=DV=256 GQA=4); n_q==1 only for now
+            // f16 KV — Gemma-3 class (DK=DV=256 GQA=4) and the GQA=4 DK=DV=128
+            // family (Qwen3-4B/8B, Llama-3.x, Mistral-7B). Same MQ_GQA=4 kernel,
+            // already compiled per (dk, dv). Without the DK=128 branch f16 KV
+            // decode on these models falls to the spilling non-MQ split and
+            // pays a GQA-replay on K reads — structurally slower than the q8_0
+            // path on the same model. WG=256 fits at DK=128 (less per-thread
+            // state than DK=256); if the kernel didn't compile or doesn't fit,
+            // `count(dk_dv) > 0` skips dispatch. n_q==1 only for now.
             } else if (nq1_only && is_mixed && gqa_ratio_dispatch == 4 &&
-                d_head_q == 256 && d_head_v == 256 &&
+                ((d_head_q == 256 && d_head_v == 256) ||
+                 (d_head_q == 128 && d_head_v == 128)) &&
                 backend_ctx->fa.f32_f16_q1_vec_mq_split.count(dk_dv) > 0) {
                 fd_k_split = backend_ctx->fa.f32_f16_q1_vec_mq_split.at(dk_dv);
                 use_fd_mq  = true;
