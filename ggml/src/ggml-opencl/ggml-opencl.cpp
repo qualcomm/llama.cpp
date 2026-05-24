@@ -9826,10 +9826,52 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         GGML_ASSERT(size_ql + size_qh + size_s + size_d == ggml_nbytes(tensor) &&
             "Incorrect tensor size");
 
+        // Temp upload buffer for the SoA conversion kernel. On Adreno X1-85
+        // the driver reports max_mem_alloc ~1.99 GB but returns
+        // CL_OUT_OF_RESOURCES well below that once the heap fragments
+        // (observed on Qwen3.5-9B output.weight at 834 MB after the rest
+        // of the model has been loaded). Three-step retry:
+        //   1. normal alloc (device-only pool, fast path)
+        //   2. clFinish + retry (drains in-flight allocs that may be
+        //      fragmenting the heap; same pattern as the partial-buffer
+        //      retry at the FD-split call site)
+        //   3. CL_MEM_ALLOC_HOST_PTR + map/memcpy/unmap (host-pinned pool,
+        //      different alloc source; true zero-copy on Adreno per QCOM
+        //      guidance — CL_MEM_USE_HOST_PTR is NOT zero-copy because
+        //      the driver triggers an internal copy for arbitrary host
+        //      pages)
         cl_int err;
-        cl_mem data_device;
-        CL_CHECK((data_device = clCreateBuffer(context, CL_MEM_READ_WRITE, ggml_nbytes(tensor), NULL, &err), err));
-        CL_CHECK(clEnqueueWriteBuffer(queue, data_device, CL_TRUE, 0, ggml_nbytes(tensor), data, 0, NULL, NULL));
+        cl_mem data_device = NULL;
+        bool   host_pinned  = false;
+        const size_t nbytes = ggml_nbytes(tensor);
+        data_device = clCreateBuffer(context, CL_MEM_READ_WRITE, nbytes, NULL, &err);
+        if (err != CL_SUCCESS) {
+            clFinish(queue);
+            data_device = clCreateBuffer(context, CL_MEM_READ_WRITE, nbytes, NULL, &err);
+        }
+        if (err != CL_SUCCESS) {
+            data_device = clCreateBuffer(context,
+                CL_MEM_READ_ONLY | CL_MEM_ALLOC_HOST_PTR | CL_MEM_HOST_WRITE_ONLY,
+                nbytes, NULL, &err);
+            if (err == CL_SUCCESS) {
+                void * mapped = clEnqueueMapBuffer(queue, data_device, CL_TRUE,
+                    CL_MAP_WRITE_INVALIDATE_REGION, 0, nbytes, 0, NULL, NULL, &err);
+                if (err == CL_SUCCESS) {
+                    memcpy(mapped, data, nbytes);
+                    CL_CHECK(clEnqueueUnmapMemObject(queue, data_device, mapped, 0, NULL, NULL));
+                    host_pinned = true;
+                    GGML_LOG_INFO("ggml_opencl: q6_K set_tensor %s (%.1f MiB) — device alloc failed, using CL_MEM_ALLOC_HOST_PTR fallback\n",
+                                  tensor->name, nbytes / 1024.0 / 1024.0);
+                } else {
+                    clReleaseMemObject(data_device);
+                    data_device = NULL;
+                }
+            }
+        }
+        CL_CHECK(err);
+        if (!host_pinned) {
+            CL_CHECK(clEnqueueWriteBuffer(queue, data_device, CL_TRUE, 0, nbytes, data, 0, NULL, NULL));
+        }
 
         cl_buffer_region region;
 
