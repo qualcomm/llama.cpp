@@ -1,7 +1,16 @@
-// Gated DeltaNet (Qwen3-Next / KDA linear attention) fused op — autoregressive
-// (n_tokens == 1) case only. Reference: ggml/src/ggml-cpu/ops.cpp
-// ggml_compute_forward_gated_delta_net_f32, ggml/src/ggml-cuda/gated_delta_net.cu,
-// ggml/src/ggml-vulkan/vulkan-shaders/gated_delta_net.comp.
+// Gated DeltaNet (Qwen3-Next / Qwen3.5 MTP / KDA linear attention) fused op.
+// Reference: ggml/src/ggml-cpu/ops.cpp ggml_compute_forward_gated_delta_net_f32,
+// ggml/src/ggml-cuda/gated_delta_net.cu (the K>1 / keep_rs_t version).
+//
+// K>1 snapshot slots for MTP speculative-decoding rollback (upstream PR #22673):
+//   - Input state shape (S_v*S_v*H, K, n_seqs). Only slot 0 holds the seed; the
+//     rest of K is caller-owned and untouched by us (used to roll back to an
+//     earlier draft position).
+//   - Output state layout: K slots stacked as the outermost dim of dst, each
+//     slot of size S_v*S_v*H*n_seqs. Slot k holds the state AFTER processing the
+//     (shift+k)-th token, where shift = n_tokens - K (negative when n_tokens<K,
+//     so the last n_tokens slots get written and earlier ones are left alone).
+//   - K==1: backwards-compatible — only slot 0 gets the final state.
 //
 // State layout (matches Vulkan / CPU): state[(h_seq)*S_v*S_v + j*S_v + i] = S[i][j]
 // i.e. each column j is contiguous along i.
@@ -35,6 +44,12 @@
 // Generic fallback: one thread per (column j, head h, sequence s). Used when
 // the S_v=128 specialization is not applicable.
 // ============================================================================
+// Max s_v supported by the private state buffer in the generic kernel.
+// All known GDN-bearing models (Qwen3-Next, Qwen3.5/3.6 MoE) use s_v <= 128.
+#ifndef GDN_GENERIC_MAX_SV
+#define GDN_GENERIC_MAX_SV 128
+#endif
+
 kernel void kernel_gated_delta_net_f32(
     global char * q_base,    ulong q_off,
     global char * k_base,    ulong k_off,
@@ -55,7 +70,8 @@ kernel void kernel_gated_delta_net_f32(
     int n_tokens,
     int n_seqs,
     int kda,
-    int neg0
+    int neg0,
+    int K
 ) {
     const int gid = get_global_id(0);
     if (gid >= s_v * H * n_seqs) return;
@@ -85,16 +101,21 @@ kernel void kernel_gated_delta_net_f32(
     global float * attn_out_base  = (global float *)dst_base;
     global float * state_out_base = (global float *)dst_base + attn_elems;
 
-    global const float * s_in  = (global const float *)s_base + ((ulong)iv3 * H + iv1) * s_v * s_v + (ulong)j * s_v;
-    global       float * s_out = state_out_base               + ((ulong)iv3 * H + iv1) * s_v * s_v + (ulong)j * s_v;
+    // Input state: always slot 0 of the K-snapshot input (layout (D, K, n_seqs)).
+    //   For K == 1: per_seq_stride = 1 * H * s_v * s_v (matches the legacy offset).
+    //   For K  > 1: per_seq_stride = K * H * s_v * s_v.
+    global const float * s_in =
+        (global const float *)s_base
+        + ((ulong)iv3 * K * H + iv1) * s_v * s_v
+        + (ulong)j * s_v;
 
-    // For n_tokens == 1, the state column is copied/updated in-place in global
-    // (preserves the original kernel's behavior). For n_tokens > 1, we keep
-    // s_out in global throughout but the columns are touched once per token.
-    // The naive kernel is slow for prefill; the sv128 specialization is the
-    // fast path for the only s_v we ship today (Qwen3-Next family).
-    // Initialize new state by copying input state into output state buffer.
-    for (int i = 0; i < s_v; ++i) s_out[i] = s_in[i];
+    // Output state: K slots stacked, each S_v*S_v*H*n_seqs floats.
+    const ulong state_size_per_slot = (ulong)s_v * s_v * H * n_seqs;
+    const ulong state_out_seq_head  = ((ulong)iv3 * H + iv1) * s_v * s_v + (ulong)j * s_v;
+
+    // Working state column in private memory. Capped at GDN_GENERIC_MAX_SV.
+    float s_col[GDN_GENERIC_MAX_SV];
+    for (int i = 0; i < s_v; ++i) s_col[i] = s_in[i];
 
     global char * q_hd = q_base + (ulong)iq3*nbq3 + (ulong)iq1*nbq1;
     global char * k_hd = k_base + (ulong)ik3*nbk3 + (ulong)ik1*nbk1;
@@ -104,6 +125,12 @@ kernel void kernel_gated_delta_net_f32(
 
     global float * attn_data = attn_out_base + ((ulong)iv3 * (ulong)n_tokens * H + iv1) * s_v;
 
+    // Slot mapping per CUDA / SYCL: target_slot = t - (n_tokens - K).
+    //   K == 1, t == n_tokens-1: target_slot = 0     -> final state -> slot 0.
+    //   K  > 1, n_tokens >= K:   last K iters fill slots 0..K-1.
+    //   K  > 1, n_tokens <  K:   last n_tokens iters fill slots K-n_tokens..K-1.
+    const int shift = n_tokens - K;
+
     for (int t = 0; t < n_tokens; t++) {
         global const float * q_d = (global const float *)(q_hd + (ulong)t * nbq2);
         global const float * k_d = (global const float *)(k_hd + (ulong)t * nbk2);
@@ -112,26 +139,33 @@ kernel void kernel_gated_delta_net_f32(
         global const float * g_d = (global const float *)(g_hd + (ulong)t * nbg2);
 
         if (kda) {
-            for (int i = 0; i < s_v; ++i) s_out[i] *= exp(g_d[i]);
+            for (int i = 0; i < s_v; ++i) s_col[i] *= exp(g_d[i]);
         } else {
             const float gd = exp(g_d[0]);
-            for (int i = 0; i < s_v; ++i) s_out[i] *= gd;
+            for (int i = 0; i < s_v; ++i) s_col[i] *= gd;
         }
 
         float kv = 0.0f;
-        for (int i = 0; i < s_v; ++i) kv = mad(s_out[i], k_d[i], kv);
+        for (int i = 0; i < s_v; ++i) kv = mad(s_col[i], k_d[i], kv);
 
         const float delta = (v_d[j] - kv) * beta;
 
         float o = 0.0f;
         for (int i = 0; i < s_v; ++i) {
-            const float sij = mad(k_d[i], delta, s_out[i]);
-            s_out[i] = sij;
+            const float sij = mad(k_d[i], delta, s_col[i]);
+            s_col[i] = sij;
             o = mad(sij, q_d[i], o);
         }
 
         attn_data[j] = o * scale;
         attn_data += (ulong)s_v * H;
+
+        const int target_slot = t - shift;
+        if (target_slot >= 0 && target_slot < K) {
+            global float * slot_ptr =
+                state_out_base + (ulong)target_slot * state_size_per_slot + state_out_seq_head;
+            for (int i = 0; i < s_v; ++i) slot_ptr[i] = s_col[i];
+        }
     }
 }
 
@@ -188,7 +222,8 @@ kernel void kernel_gated_delta_net_f32_sv128(
     int n_tokens,
     int n_seqs,
     int kda,
-    int neg0
+    int neg0,
+    int K
 ) {
     const int lid       = get_local_id(0);
     const int lane      = lid & (GDN_LPC - 1);
@@ -221,8 +256,13 @@ kernel void kernel_gated_delta_net_f32_sv128(
     global float * attn_out_base  = (global float *)dst_base;
     global float * state_out_base = (global float *)dst_base + attn_elems;
 
-    global const float * s_in  = (global const float *)s_base + ((ulong)iv3 * H + iv1) * GDN_SV * GDN_SV + (ulong)col * GDN_SV;
-    global       float * s_out = state_out_base               + ((ulong)iv3 * H + iv1) * GDN_SV * GDN_SV + (ulong)col * GDN_SV;
+    // Input state: slot 0 only, layout (D, K, n_seqs) — seq stride is K * D.
+    global const float * s_in  = (global const float *)s_base
+        + ((ulong)iv3 * K * H + iv1) * GDN_SV * GDN_SV + (ulong)col * GDN_SV;
+
+    // Output state: K slots stacked, each S_v*S_v*H*n_seqs floats.
+    const ulong gdn_slot_size      = (ulong)GDN_SV * GDN_SV * H * n_seqs;
+    const ulong gdn_state_seq_head = ((ulong)iv3 * H + iv1) * GDN_SV * GDN_SV + (ulong)col * GDN_SV;
 
     // Per-head per-seq base pointers; per-token offsets applied inside the t-loop.
     global char * q_hd = q_base + (ulong)iq3*nbq3 + (ulong)iq1*nbq1;
@@ -243,6 +283,9 @@ kernel void kernel_gated_delta_net_f32_sv128(
     // attn output advances by GDN_SV * H per token, starting at first token of
     // this (seq, head): attn_data[t][col] = base + (iv3*n_tokens + t)*H*S_v + iv1*S_v + col.
     global float * attn_data = attn_out_base + ((ulong)iv3 * (ulong)n_tokens * H + iv1) * GDN_SV;
+
+    // Slot mapping: target_slot = t - (n_tokens - K). See generic kernel comment.
+    const int sv128_shift = n_tokens - K;
 
     // For decode (n_tokens==1) the __local-cache variant was a slight win but
     // barriers would dominate for the prefill t-loop. We read k/q/g directly
@@ -302,11 +345,19 @@ kernel void kernel_gated_delta_net_f32_sv128(
             attn_data[col] = attn_col * scale;
         }
         attn_data += (ulong)GDN_SV * H;
-    }
 
-    #pragma unroll
-    for (int r = 0; r < GDN_RPL; r++) {
-        s_out[r * GDN_LPC + lane] = s_shard[r];
+        // Write this t's state to slot target_slot if it falls in [0, K).
+        // For K==1 only the last iteration writes (target_slot=0). For K>1
+        // the last K iterations fill slots 0..K-1 in order.
+        const int target_slot = t - sv128_shift;
+        if (target_slot >= 0 && target_slot < K) {
+            global float * slot_ptr =
+                state_out_base + (ulong)target_slot * gdn_slot_size + gdn_state_seq_head;
+            #pragma unroll
+            for (int r = 0; r < GDN_RPL; r++) {
+                slot_ptr[r * GDN_LPC + lane] = s_shard[r];
+            }
+        }
     }
 }
 

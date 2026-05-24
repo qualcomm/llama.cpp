@@ -2747,7 +2747,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         const std::string kernel_src = read_file("gated_delta_net.cl");
 #endif
         cl_program prog =
-            build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+            build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
 
         CL_CHECK((backend_ctx->kernel_gated_delta_net_f32 = clCreateKernel(prog, "kernel_gated_delta_net_f32", &err), err));
         // Specialized SV=128 (Qwen3-Next / Qwen3.6-A3B): cluster-of-32 reduction
@@ -10522,6 +10522,11 @@ static void ggml_cl_gated_delta_net(ggml_backend_t backend, const ggml_tensor * 
     const int nek3     = (int)k->ne[3];
     const int neg0     = (int)g->ne[0];
     const int kda      = (neg0 == s_v) ? 1 : 0;
+    // Input state shape (D, K, n_seqs). K is the snapshot-slot count for MTP
+    // speculative-decode rollback (upstream PR #22673). K==1 = legacy single-
+    // slot behaviour; K>1 = the kernel writes the last min(n_tokens, K) per-
+    // token snapshots into slots [K-min(n_tokens,K), K-1].
+    const int K        = (int)state->ne[1];
 
     cl_ulong nbq1 = q->nb[1],    nbq2 = q->nb[2],    nbq3 = q->nb[3];
     cl_ulong nbk1 = k->nb[1],    nbk2 = k->nb[2],    nbk3 = k->nb[3];
@@ -10578,6 +10583,7 @@ static void ggml_cl_gated_delta_net(ggml_backend_t backend, const ggml_tensor * 
     CL_CHECK(clSetKernelArg(kernel, i++, sizeof(int),      &n_seqs));
     CL_CHECK(clSetKernelArg(kernel, i++, sizeof(int),      &kda));
     CL_CHECK(clSetKernelArg(kernel, i++, sizeof(int),      &neg0));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(int),      &K));
 
     if (use_sv128) {
         // 128-thread workgroup = 1 full subgroup; cluster of 32 lanes per col;
