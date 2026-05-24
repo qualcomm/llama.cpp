@@ -468,6 +468,12 @@ struct ggml_opencl_fa_kernels {
     // K-image variant of MQ_G8 vec_mq_split: K bound as image1d_buffer_t
     // (Adreno texture cache, separate BW path from L2). Opt-in, GGML_OPENCL_FA_K_IMG=1.
     std::map<std::pair<int, int>, cl_kernel> f32_f16_q1_vec_mq_split_g8_k_img;
+    // K-image variant of MQ_GQA=4 vec_mq_split (default program). Same source as
+    // _g8_k_img but compiled with the default MQ_GQA=4 — targets dense GQA=4
+    // DK=DV=128 (Mistral-7B / Qwen3-8B / Llama-3-8B). Opt-in via
+    // GGML_OPENCL_FA_F16_MQ_DK128=1 (+ GGML_OPENCL_FA_K_IMG=1 for the K-image
+    // path; without K_IMG, the non-image f32_f16_q1_vec_mq_split fires).
+    std::map<std::pair<int, int>, cl_kernel> f32_f16_q1_vec_mq_split_k_img;
     // Alternative decode FA: 1 WG per (q_idx, q_head) with a __local K/V tile +
     // pure __local tree-reduce. Compiled only at DK=DV=128. Opt-in.
     std::map<std::pair<int, int>, cl_kernel> f32_f16_q1_local_tile;
@@ -14867,6 +14873,30 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
                     fd_mq_wg   = 128;
                 }
                 use_fd_mq  = true;
+            // f16 KV — dense 7-8B class (Mistral-7B / Qwen3-8B / Llama-3-8B),
+            // DK=DV=128 GQA=4. Plain q1_split is 3.5x slower per layer than
+            // FA=0's image-fed l4_x8_gqa_r4_img KQ. MQ closes +60-90% of that
+            // end-to-end at d=8k on X1-85 (Mistral 2.90→5.49, Qwen3-8B 2.37→3.80,
+            // Llama-3-8B 2.56→4.68 t/s). K-image adds ~1-3% per-FA-call further,
+            // opt-in via GGML_OPENCL_FA_K_IMG=1 (mirrors the g8 dispatch).
+            } else if (nq1_only && is_mixed && gqa_ratio_dispatch == 4 &&
+                d_head_q == 128 && d_head_v == 128 &&
+                backend_ctx->fa.f32_f16_q1_vec_mq_split.count(dk_dv) > 0) {
+                const bool k_img_on = getenv("GGML_OPENCL_FA_K_IMG") != NULL &&
+                                      getenv("GGML_OPENCL_FA_K_IMG")[0] != '0';
+                if (k_img_on &&
+                    backend_ctx->fa.f32_f16_q1_vec_mq_split_k_img.count(dk_dv) > 0) {
+                    fd_k_split   = backend_ctx->fa.f32_f16_q1_vec_mq_split_k_img.at(dk_dv);
+                    use_fd_mq    = true;
+                    use_fa_k_img = true;
+                } else {
+                    fd_k_split = backend_ctx->fa.f32_f16_q1_vec_mq_split.at(dk_dv);
+                    use_fd_mq  = true;
+                }
+            // f16 KV — Qwen3-30B-A3B class (DK=DV=128 GQA=8); extended to n_q ∈ [1, N_MAX_VEC_NQ].
+            // K-image variant: same MQ_G8 path but K bound via image1d_buffer_t.
+            // Opt-in via GGML_OPENCL_FA_K_IMG=1; targets the long-context FA
+            // K-read bandwidth bottleneck.
             } else if (is_mixed && gqa_ratio_dispatch == 8 &&
                 d_head_q == 128 && d_head_v == 128 &&
                 getenv("GGML_OPENCL_FA_K_IMG") != NULL &&
@@ -15143,8 +15173,10 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
                     backend_ctx, backend_ctx->kq_img_pool,
                     k_data_device, offset_k, k_bytes, CL_HALF_FLOAT);
             }
-
-            // if image creation fails, fallback to buffer based kernels
+            // Fallback: if image creation failed (over max pixels, alloc fail),
+            // re-route through the matching non-image MQ path. Rare; keeps the
+            // run alive instead of crashing. gqa==4 → default MQ kernel,
+            // gqa==8 → MQ_G8 kernel.
             if (k_img == nullptr) {
                 if (gqa_ratio_dispatch == 4 &&
                     backend_ctx->fa.f32_f16_q1_vec_mq_split.count(dk_dv) > 0) {
