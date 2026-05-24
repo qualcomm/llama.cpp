@@ -13871,6 +13871,14 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
             }
         } else if (use_native_q4_0_q1) {
             // q4_0 vec kernel uses per-lane dp4a (cl_khr_integer_dot_product)
+            // and DV-split across subgroups. The earlier "-10/-11% on
+            // Qwen3.6-A3B MXFP4 / q4_0 KV" caveat was stale: re-measured
+            // 2026-05-23 on X1-85 across four DV=256 targets (gemma-3-4b,
+            // gemma-2-2b, Qwen3.5-9B, Qwen3.6-A3B MXFP4) the vec kernel
+            // wins +25 to +71% end-to-end vs legacy q1; Qwen3.6-A3B at
+            // per-FA-call profile is 3.6× faster (11.0 → 3.04 ms/call).
+            // Default-on for DV>=256. Opt-out via GGML_OPENCL_FA_Q4_VEC=0
+            // for diagnosis if a regression surfaces on an untested shape.
             const char * q4vec_env = getenv("GGML_OPENCL_FA_Q4_VEC");
             const bool   q4vec_off = (q4vec_env != NULL) && (q4vec_env[0] == '0');
             if (!q4vec_off && d_head_v >= 256 &&
