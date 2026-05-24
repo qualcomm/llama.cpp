@@ -11255,7 +11255,11 @@ static ggml_backend_buffer_t ggml_backend_opencl_buffer_type_alloc_buffer(ggml_b
     }
 
     if (err != CL_SUCCESS) {
-        GGML_LOG_INFO("%s: failed to allocate %.2f MiB\n", __func__, size / 1024.0 / 1024.0);
+        GGML_LOG_ERROR("%s: failed to allocate %.2f MiB (err=%d). On Adreno X1-class "
+                       "drivers a per-context cap around 6 GB has been observed even when "
+                       "more global memory is reported free; reduce -ngl, lower -c / -ub, "
+                       "or use quantized KV cache (-ctk q8_0 -ctv q8_0).\n",
+                       __func__, size / 1024.0 / 1024.0, err);
         return nullptr;
     }
 
