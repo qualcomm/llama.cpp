@@ -11577,6 +11577,20 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         GGML_ASSERT(size_ql + size_qh + size_s + size_d == ggml_nbytes(tensor) &&
             "Incorrect tensor size");
 
+        // Temp upload buffer for the SoA conversion kernel. On Adreno X1-85
+        // the driver reports max_mem_alloc ~1.99 GB but returns
+        // CL_OUT_OF_RESOURCES well below that once the heap fragments
+        // (observed on Qwen3.5-9B output.weight at 834 MB after the rest
+        // of the model has been loaded). Three-step retry:
+        //   1. normal alloc (device-only pool, fast path)
+        //   2. clFinish + retry (drains in-flight allocs that may be
+        //      fragmenting the heap; same pattern as the partial-buffer
+        //      retry at the FD-split call site)
+        //   3. CL_MEM_ALLOC_HOST_PTR + map/memcpy/unmap (host-pinned pool,
+        //      different alloc source; true zero-copy on Adreno per QCOM
+        //      guidance — CL_MEM_USE_HOST_PTR is NOT zero-copy because
+        //      the driver triggers an internal copy for arbitrary host
+        //      pages)
         cl_int err;
         cl_mem data_device = ggml_cl_create_temp_upload_buffer(context, queue, ggml_nbytes(tensor), data, tensor->name);
         GGML_ASSERT(data_device != NULL && "q6_K set_tensor: temp upload buffer alloc failed");
