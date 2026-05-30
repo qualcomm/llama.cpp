@@ -4310,17 +4310,20 @@ static void ggml_opencl_ensure_fa_pre_kernels(ggml_backend_opencl_context * back
     backend_ctx->fa.bm[{dk, dv}]              = cfg->bm;
     backend_ctx->fa.bn[{dk, dv}]              = cfg->bn;
 
-    if (backend_ctx->fa.kv_pad_f16.count(dk_dv) > 0) { return; }
+    if (backend_ctx->fa.kv_pad_f16.count(dk_dv) > 0) return;
 
     GGML_LOG_INFO("ggml_opencl: lazy-compiling flash_attn prepass for DK=%d DV=%d\n", dk, dv);
     cl_int err;
     const std::string src  = ggml_opencl_fa_kernel_src(FA_VARIANT_PRE);
     const std::string opts = ggml_opencl_fa_compile_opts(backend_ctx, cfg, FA_VARIANT_PRE);
-    // retry when kernel compile fails
+    // Best-effort: the prepass program can OOM the Adreno compiler at large DK.
+    // If it fails, leave kv_pad/mask_pad/blk uncached — the prefill dispatch
+    // checks .count() and skips the prepass step (block-aligned n_kv needs no
+    // pad), declining cleanly instead of aborting at a CL_CHECK.
     cl_program prog_pre_f16 = build_program_from_source_ex(
         backend_ctx->context, backend_ctx->device, src.c_str(), opts,
-        /*fatal=*/false, "fa prepass f16", backend_ctx->queue);
-    if (!prog_pre_f16) { return; }
+        /*fatal=*/false, "fa prepass f16");
+    if (!prog_pre_f16) return;
     cl_kernel k_kv_pad_f16  = clCreateKernel(prog_pre_f16, "flash_attn_kv_pad_f16",   &err);
     if (err != CL_SUCCESS) { clReleaseProgram(prog_pre_f16); return; }
     cl_kernel k_mask_pad_f16 = clCreateKernel(prog_pre_f16, "flash_attn_mask_pad_f16", &err);
@@ -4333,15 +4336,19 @@ static void ggml_opencl_ensure_fa_pre_kernels(ggml_backend_opencl_context * back
     clReleaseProgram(prog_pre_f16);
 }
 
-// DK=512 prefill BM-tile
+// DK=512 (Gemma-4 global layers) prefill BM-tile, built in its own minimal
+// FA_PREFILL_ONLY program. The full f32_f16 program OOMs the Adreno compiler at
+// DK=512; isolating the tile keeps it under the host-memory ceiling (see
+// [[opencl_adreno_split_programs]]). split=false → N_SPLIT=1 → f32_f16;
+// split=true → N_SPLIT=cfg → f32_f16_split. Returns true if the tile registered.
 static bool ggml_opencl_ensure_fa_f32_f16_prefill_512(ggml_backend_opencl_context * backend_ctx, bool split) {
     const int dk = 512, dv = 512;
     const std::pair<int, int> dk_dv = {dk, dv};
     auto & target = split ? backend_ctx->fa.f32_f16_split : backend_ctx->fa.f32_f16;
-    if (target.count(dk_dv) > 0) { return true; }
+    if (target.count(dk_dv) > 0) return true;
 
     static bool failed[2] = { false, false };
-    if (failed[split ? 1 : 0]) { return false; }
+    if (failed[split ? 1 : 0]) return false;
 
     const ggml_opencl_fa_dim * cfg = nullptr;
     for (const auto & d : g_opencl_fa_dims) {
@@ -4371,7 +4378,12 @@ static bool ggml_opencl_ensure_fa_f32_f16_prefill_512(ggml_backend_opencl_contex
         split ? "flash_attn_f32_f16 (prefill512 split)" : "flash_attn_f32_f16 (prefill512)", dk, dv);
     clReleaseProgram(prog);
 
-    // determine whether to use the K-image variant of the split tile
+    // K-image variant of the split tile (texture-cache K reads). MEASURED no
+    // win on Gemma-4-26B (pp2048@d16k 66.1 buffer vs 65.7 image): the tile
+    // already stages K into __local via coalesced global reads, and the 16 MB
+    // K working set far exceeds the texture cache so there's no cross-query-block
+    // reuse to accelerate. Kept opt-in for future revisit; only compiled when
+    // GGML_OPENCL_FA_PREFILL_K_IMG is set so the default path pays nothing.
     static const char * pkimg_build_env = getenv("GGML_OPENCL_FA_PREFILL_K_IMG");
     const bool pkimg_build = (pkimg_build_env != NULL) && (pkimg_build_env[0] != '0');
     if (split && pkimg_build && backend_ctx->fa.f32_f16_split_k_img.count(dk_dv) == 0) {
@@ -4494,29 +4506,18 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
     }
 
     const std::string src = ggml_opencl_fa_kernel_src(variant);
-    if (src.empty()) { return false; }
+    if (src.empty()) return false;
     std::string opts = ggml_opencl_fa_compile_opts(backend_ctx, cfg, variant);
 
-    // bypass kernels for DK=512
+    // DK=512 (Gemma-4 global-attention layers): the full f32_f16 program OOMs
+    // the Adreno shader compiler (CL_OUT_OF_HOST_MEMORY) — see
+    // [[opencl_adreno_split_programs]]. Compile a decode-only program (q1 +
+    // q1_split + merge) so single-token decode stays on the GPU; prefill
+    // (n_q>1) is kept on CPU via the supports_op n_q gate.
     const bool fa_decode_only = (variant == FA_VARIANT_F32_F16 && dk == 512);
     if (fa_decode_only) {
-        opts += " -D FA_DECODE_ONLY -D FA_DECODE_MINIMAL";
+        opts += " -D FA_DECODE_ONLY";
     }
-
-    // c8 cluster width (GGML_OPENCL_FA_CL_C overrides): value = GQA4 cluster
-    // width (kernel default 8); the g8 programs use 2x the value (default 16).
-    // Wider clusters halve per-lane o_acc at the cost of position streams per
-    // subgroup
-    static const int fa_cl_c_env = []{
-        const char * e = std::getenv("GGML_OPENCL_FA_CL_C");
-        const int x = (e && e[0]) ? atoi(e) : 0;
-        return (x == 8 || x == 16 || x == 32) ? x : 0;   // 0 = per-gen default
-    }();
-    const int fa_cl_c_gqa4 = fa_cl_c_env ? fa_cl_c_env
-        : (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E ? 16 : 0);
-    const std::string opts_cl_c_gqa4 = fa_cl_c_gqa4
-        ? " -D FA_CL_C=" + std::to_string(fa_cl_c_gqa4) : std::string();
-    const std::string fa_cl_c_g8_val = std::to_string(fa_cl_c_gqa4 ? fa_cl_c_gqa4 * 2 : 16);
 
     const char * tag = nullptr;
     switch (variant) {
@@ -4556,6 +4557,7 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
         case FA_VARIANT_F32_F16: {
             cl_kernel kq1;
             // BM-tile prefill kernel is excluded from the decode-only (DK=512)
+            // program; only register it for the full build.
             if (!fa_decode_only) {
                 cl_kernel k;
                 CL_CHECK((k = clCreateKernel(prog, "flash_attn_f32_f16", &err), err));
@@ -4655,15 +4657,25 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
                     }
                 }
             }
-
-            // second compile of the same source with -DMQ_GQA=8.
-            // FA_MQ_ONLY keeps only the vec_mq kernels so that the program
-            // compiles within the Adreno compiler's memory budget at DK>=256.
-            // FA_CL_C for the g8 program: MQ_GQA=8 doubles the c8 kernel's
-            // per-lane o_acc, so widen the cluster to keep the register
-            // footprint inside the 192-thread WG cap (see fa_cl_c_gqa4 above
-            // for the per-gen default).
-            const std::string opts_g8 = opts + " -D MQ_GQA=8 -D MQ_NSG=3 -D MQ_NSG_SPLIT=3 -D FA_MQ_ONLY -D FA_CL_C=" + fa_cl_c_g8_val;
+            // Second compile of the same source with -DMQ_GQA=8 for the
+            // Qwen3-30B-A3B / Qwen3-4B class (GQA=8). Only the two MQ kernels
+            // are extracted; everything else is identical to the MQ_GQA=4
+            // program above and would just duplicate cache. Compile is
+            // best-effort: if the larger __local Q stage (8 Q rows × DK_VEC)
+            // doesn't fit or the WG cap drops, the dispatch falls back to
+            // the legacy q1_vec path. Mirrors Metal's per-NQPSG template
+            // specialization.
+            // MQ_GQA=8 doubles per-thread state (o_acc[8][1], m_i[8], l_i[8],
+            // slope[8], mask_base[8]) → Adreno's per-kernel WG cap drops from
+            // 256 to 192 due to register pressure (measured on Adreno X2).
+            // Compile with MQ_NSG=3 / MQ_NSG_SPLIT=3 so the
+            // 192-thread cap is sufficient; the kernel's merge loops are
+            // already NSG-agnostic.
+            // Skip the GQA=8 program entirely for the decode-only (DK=512)
+            // build — its MQ kernels are excluded from the source and DK=512
+            // has no MQ decode dispatch path, so the second compile would be
+            // pure waste (and another OOM risk).
+            const std::string opts_g8 = opts + " -D MQ_GQA=8 -D MQ_NSG=3 -D MQ_NSG_SPLIT=3";
             cl_program prog_g8 = fa_decode_only ? nullptr : build_program_from_source_ex(
                 backend_ctx->context, backend_ctx->device, src.c_str(), opts_g8,
                 /*fatal=*/false, "fa f32_f16 MQ_GQA=8", backend_ctx->queue);
@@ -13712,20 +13724,19 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     const int n_batch = q->ne[3];
 
     // DK=512 (Gemma-4 global layers) runs decode-only (q1 / q1_split) on
-    // Adreno - it never uses the BM-tile path, and the prepass + split-tile
-    // programs OOM the compiler at DK=512; supports_op only admits
-    // n_q==1 here and prefill goes to CPU
+    // Adreno — it never uses the BM-tile path, and the prepass + split-tile
+    // programs OOM the shader compiler at DK=512. supports_op only admits
+    // n_q==1 here, so prefill is already on CPU. See [[opencl_adreno_split_programs]].
     const bool fa_decode_only_512 = (d_head_q == 512);
 
-    // per-variant lazy compile for this (dk, dv)
-    // DK=512 decode (n_q==1) needs no prepass
-    // DK=512 prefill (n_q>1) does, so compile it only when needed
+    // Per-variant lazy compile for this (dk, dv). DK=512 decode (n_q==1) needs
+    // no prepass; DK=512 prefill (n_q>1) does, so compile it then.
     if (!fa_decode_only_512 || n_q > 1) {
         ggml_opencl_ensure_fa_pre_kernels(backend_ctx, d_head_q, d_head_v);
     }
 
     cl_kernel kernel = NULL;
-    bool use_prefill_k_img = false;  //  K is image1d_buffer_t for DK=512 prefill
+    bool use_prefill_k_img = false;  // DK=512 prefill tile with K bound as image1d_buffer_t
 
     const bool is_f16 = q->type == GGML_TYPE_F16;
     const bool is_mixed = q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16;
@@ -13737,8 +13748,8 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     } else if (is_mixed) {
         ggml_opencl_ensure_fa_variant(backend_ctx, d_head_q, d_head_v, FA_VARIANT_F32_F16);
         if (fa_decode_only_512) {
-            // DK=512: the BM-tile prefill kernels are specifically compiled from
-            // FA_PREFILL_ONLY
+            // DK=512: the BM-tile prefill kernels come from their own minimal
+            // FA_PREFILL_ONLY programs (the shared split variant would OOM).
             if (n_q > 1) {
                 ggml_opencl_ensure_fa_f32_f16_prefill_512(backend_ctx, /*split=*/false);
                 ggml_opencl_ensure_fa_f32_f16_prefill_512(backend_ctx, /*split=*/true);
@@ -14274,6 +14285,10 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     }
     if (fd_k_split == NULL &&
         n_q >= 1 && n_q <= fd_max_n_q && n_kv >= FD_MIN_N_KV && !is_causal &&
+        // NB: DK=512 (Gemma-4 global) is intentionally NOT routed here. Measured
+        // 2026-05-29: the scalar q1_split flash-decoding path regressed DK=512
+        // decode (tg@d16k 6.96→6.61) — the decode is K/V-read-bandwidth-bound,
+        // not occupancy-bound, so inter-WG split + merge only adds overhead.
         d_head_q <= FD_MAX_DK &&
         backend_ctx->fa.f32_merge.count(dk_dv) > 0) {
         if (is_mixed && backend_ctx->fa.f32_f16_q1_split.count(dk_dv) > 0) {
@@ -14290,7 +14305,11 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     const int n_kv_blocks = (n_kv > 0 && block_n > 0) ? (n_kv + block_n - 1) / block_n : 0;
     // KV pad + blk prepass are pure overhead when FD will fire — skip them.
     const bool use_mixed_prepass = is_mixed && n_q > 1 && !use_fd;
-    // make sure prepass kernels are compiled
+    // Prepass kernels may be absent if their program failed to compile (e.g. the
+    // DK=512 prepass OOMs the Adreno compiler). Gate on presence so the tile
+    // path declines the (optional) pad/blk-classify steps instead of throwing at
+    // .at(); the tile kernel already handles the no-prepass case (n_kv aligned /
+    // no tile-class hint), as it does whenever mask_buffer == NULL.
     const bool have_kv_pad = backend_ctx->fa.kv_pad_f16.count(dk_dv) > 0;
     const bool have_blk    = backend_ctx->fa.blk_f16.count(dk_dv) > 0;
     const bool use_kv_pad = use_mixed_prepass && (n_kv % block_n != 0) && have_kv_pad;
@@ -14540,6 +14559,8 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         return;
     }
 
+    // DK=512 prefill K-image: create/pool the texture-cache view of K up front.
+    // Decide before arg binding so a fallback can swap to the buffer tile cleanly.
     cl_mem prefill_k_img = nullptr;
     if (use_prefill_k_img) {
         const size_t nb00_bytes = sizeof(uint16_t);
@@ -14556,6 +14577,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
                 k_data_device, offset_k, k_bytes, CL_HALF_FLOAT);
         }
         if (prefill_k_img == nullptr) {
+            // Image unavailable → revert to the plain buffer split tile.
             kernel = backend_ctx->fa.f32_f16_split.at(dk_dv);
             use_prefill_k_img = false;
         }
