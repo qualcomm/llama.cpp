@@ -244,7 +244,11 @@ kernel void Q6K_O4_NAME(
     ushort slid = get_sub_group_local_id();
 
     // Map quad index to the two pair-indices the existing 2-output access
-    // pattern uses (consecutive output pairs along ne01).
+    // pattern uses (consecutive output pairs along ne01). NB: the two pairs are
+    // kept ADJACENT (gid*2, gid*2+1) on purpose — a "stride-1" split (pairs
+    // ne01/4 apart) was measured -37% because two distant cache-line streams
+    // have worse locality than the adjacent pair whose reads interleave into
+    // the same lines each iteration.
     int gid_a = gid * 2;
     int gid_b = gid * 2 + 1;
 
