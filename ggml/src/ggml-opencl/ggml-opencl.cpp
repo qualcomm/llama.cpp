@@ -925,6 +925,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemv_noshuffle_q4_k_f32_o4;  // 4-output-per-WI, long-vocab lm_head
     cl_kernel kernel_gemm_noshuffle_q4_k_f32;
     cl_kernel kernel_gemv_noshuffle_q6_K_f32;
+    cl_kernel kernel_gemv_noshuffle_q6_K_f32_o4;
     cl_kernel kernel_gemm_noshuffle_q6_K_f32;
     cl_kernel kernel_gemv_noshuffle_q5_k_f32;
     cl_kernel kernel_gemm_noshuffle_q5_k_f32;
@@ -3494,6 +3495,30 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), CL_gemv_compile_opts);
 
         CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q6_K_f32 = clCreateKernel(prog, "kernel_gemv_noshuffle_q6_K_f32", &err), err));
+        GGML_LOG_CONT(".");
+    }
+
+    // gemv_noshuffle_q6_k_f32_o4 — 4-output-per-WI variant, opt-in via
+    // GGML_OPENCL_Q6K_GEMV_O4=1 (~3x fewer dispatches on long-vocab lm_head).
+    {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src {
+            #include "gemv_noshuffle_q6_k_f32_o4.cl.h"
+        };
+#else
+        const std::string kernel_src = read_file("gemv_noshuffle_q6_k_f32_o4.cl");
+#endif
+
+        std::string CL_gemv_compile_opts = std::string("-cl-std=") + opencl_c_std +
+                                       " -cl-mad-enable ";
+        if (backend_ctx->has_vector_subgroup_broadcast) {
+            CL_gemv_compile_opts += " -DVECTOR_SUB_GROUP_BROADCAT ";
+        }
+
+        cl_program prog =
+            build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), CL_gemv_compile_opts);
+
+        CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q6_K_f32_o4 = clCreateKernel(prog, "kernel_gemv_noshuffle_q6_K_f32_o4", &err), err));
         GGML_LOG_CONT(".");
     }
 
@@ -14640,7 +14665,24 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
         img_desc.buffer = b_sub_buffer;
         CL_CHECK((b_img = clCreateImage(context, CL_MEM_READ_ONLY, &img_fmt, &img_desc, NULL, &err), err));
 
-        kernel = backend_ctx->kernel_gemv_noshuffle_q6_K_f32;
+        // 4-output-per-WI variant — opt-in. Wins big on the huge lm_head /
+        // embedding GEMVs (long-vocab models: +37% tg on Llama-3.2-3B Q4_K_M,
+        // +13% tg on Qwen3.5-4B-MTP) by sharing one activation read across
+        // 4 output rows. Loses ~16% on small q6_K matmuls (per-layer FFN/attn
+        // at hidden=4096) where halving the WG count drops below the device's
+        // saturating concurrent-WG threshold. ne01 >= 32768 keeps the gate on
+        // lm_head / embed shapes — vocab sits in [50K, 200K] range there for
+        // every model that benefits, while per-layer q6_K matmuls have
+        // ne01 = hidden = 2-8K.
+        // Requires ne01 % 4 == 0 for the halved grid to cover exactly.
+        static const bool gemv_o4_env = []{
+            const char * e = std::getenv("GGML_OPENCL_Q6K_GEMV_O4");
+            return !e || e[0] == '\0' || e[0] != '0'; // default ON
+        }();
+        const bool use_o4 = gemv_o4_env && (ne01 % 4 == 0) && (ne01 >= 32768);
+
+        kernel = use_o4 ? backend_ctx->kernel_gemv_noshuffle_q6_K_f32_o4
+                        : backend_ctx->kernel_gemv_noshuffle_q6_K_f32;
 
         CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),   &ql_img));
         CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem),   &qh_img));
@@ -14652,8 +14694,11 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
         CL_CHECK(clSetKernelArg(kernel, 7, sizeof(cl_int),   &ne00));
         CL_CHECK(clSetKernelArg(kernel, 8, sizeof(cl_int),   &ne01));
 
-        size_t local_work_size[3] = {64, 4, 1};
-        size_t global_work_size[3] = {(size_t)CEIL_DIV(ne01/2, 64)*64, 4, 1};
+        const size_t gws_x = use_o4
+                                 ? (size_t) CEIL_DIV(ne01/4, 64) * 64
+                                 : (size_t) CEIL_DIV(ne01/2, 64) * 64;
+        size_t local_work_size[3]  = {64, 4, 1};
+        size_t global_work_size[3] = {gws_x, 4, 1};
 
         backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
 
