@@ -210,9 +210,27 @@
 #if defined(ADRENO_GPU)
 REQD_SUBGROUP_SIZE_64
 #endif
-kernel void kernel_gemv_noshuffle_q6_K_f32_o4(
-    read_only image1d_buffer_t src0_ql,
-    read_only image1d_buffer_t src0_qh,
+// Q6K_O4_GLOBAL: read the (read-once-per-token, no-reuse) lm_head/embed weights
+// from __global coalesced instead of image1d_buffer. The texture cache caps a
+// streaming 600 MB read at ~22 GB/s; global coalesced reaches the ~60 GB/s the
+// rest of the model gets. src1 (activation) stays an image (it IS reused via
+// the cross-subgroup broadcast).
+#ifdef Q6K_O4_GLOBAL
+#define Q6K_O4_NAME kernel_gemv_noshuffle_q6_K_f32_o4_global
+#define QL_ARG __global uint * src0_ql
+#define QH_ARG __global half * src0_qh
+#define RD_QL(b,i) (b[i])
+#define RD_QH(b,i) as_ushort(b[i])
+#else
+#define Q6K_O4_NAME kernel_gemv_noshuffle_q6_K_f32_o4
+#define QL_ARG read_only image1d_buffer_t src0_ql
+#define QH_ARG read_only image1d_buffer_t src0_qh
+#define RD_QL(b,i) (read_imageui(b,i).x)
+#define RD_QH(b,i) as_ushort(read_imageh(b,i).x)
+#endif
+kernel void Q6K_O4_NAME(
+    QL_ARG,
+    QH_ARG,
     global half2 * src0_s,
     global half2 * src0_d,
     read_only image1d_buffer_t src1,
@@ -265,28 +283,28 @@ kernel void kernel_gemv_noshuffle_q6_K_f32_o4(
         // both in one block so the `_lo` macro can see the `shared_y` that
         // `_hi` declared. Pair b follows in its own block — fresh shared_y.
         {
-            reg_a_l_a.s0 = read_imageui(src0_ql, gid_a + k*block_stride_a + line_stride_a*0).x;
-            reg_a_l_a.s1 = read_imageui(src0_ql, gid_a + k*block_stride_a + line_stride_a*1).x;
-            reg_a_l_a.s2 = read_imageui(src0_ql, gid_a + k*block_stride_a + line_stride_a*2).x;
-            reg_a_l_a.s3 = read_imageui(src0_ql, gid_a + k*block_stride_a + line_stride_a*3).x;
-            reg_a_h_a.s0 = as_ushort(read_imageh(src0_qh, gid_a + k*block_stride_a + line_stride_a*0).x);
-            reg_a_h_a.s1 = as_ushort(read_imageh(src0_qh, gid_a + k*block_stride_a + line_stride_a*1).x);
-            reg_a_h_a.s2 = as_ushort(read_imageh(src0_qh, gid_a + k*block_stride_a + line_stride_a*2).x);
-            reg_a_h_a.s3 = as_ushort(read_imageh(src0_qh, gid_a + k*block_stride_a + line_stride_a*3).x);
+            reg_a_l_a.s0 = RD_QL(src0_ql, gid_a + k*block_stride_a + line_stride_a*0);
+            reg_a_l_a.s1 = RD_QL(src0_ql, gid_a + k*block_stride_a + line_stride_a*1);
+            reg_a_l_a.s2 = RD_QL(src0_ql, gid_a + k*block_stride_a + line_stride_a*2);
+            reg_a_l_a.s3 = RD_QL(src0_ql, gid_a + k*block_stride_a + line_stride_a*3);
+            reg_a_h_a.s0 = RD_QH(src0_qh, gid_a + k*block_stride_a + line_stride_a*0);
+            reg_a_h_a.s1 = RD_QH(src0_qh, gid_a + k*block_stride_a + line_stride_a*1);
+            reg_a_h_a.s2 = RD_QH(src0_qh, gid_a + k*block_stride_a + line_stride_a*2);
+            reg_a_h_a.s3 = RD_QH(src0_qh, gid_a + k*block_stride_a + line_stride_a*3);
 #ifdef VECTOR_SUB_GROUP_BROADCAT
             dequantize_block_acc_bcast_8_hi(total_sum_a, as_ushort8(reg_a_l_a), as_uchar8(reg_a_h_a), cs_a, reg_b);
 #else
             dequantize_block_acc_bcast_1_hi(total_sum_a, as_ushort8(reg_a_l_a), as_uchar8(reg_a_h_a), cs_a, reg_b);
 #endif
 
-            reg_a_l_a.s0 = read_imageui(src0_ql, gid_a + k*block_stride_a + line_stride_a*4).x;
-            reg_a_l_a.s1 = read_imageui(src0_ql, gid_a + k*block_stride_a + line_stride_a*5).x;
-            reg_a_l_a.s2 = read_imageui(src0_ql, gid_a + k*block_stride_a + line_stride_a*6).x;
-            reg_a_l_a.s3 = read_imageui(src0_ql, gid_a + k*block_stride_a + line_stride_a*7).x;
-            reg_a_h_a.s0 = as_ushort(read_imageh(src0_qh, gid_a + k*block_stride_a + line_stride_a*4).x);
-            reg_a_h_a.s1 = as_ushort(read_imageh(src0_qh, gid_a + k*block_stride_a + line_stride_a*5).x);
-            reg_a_h_a.s2 = as_ushort(read_imageh(src0_qh, gid_a + k*block_stride_a + line_stride_a*6).x);
-            reg_a_h_a.s3 = as_ushort(read_imageh(src0_qh, gid_a + k*block_stride_a + line_stride_a*7).x);
+            reg_a_l_a.s0 = RD_QL(src0_ql, gid_a + k*block_stride_a + line_stride_a*4);
+            reg_a_l_a.s1 = RD_QL(src0_ql, gid_a + k*block_stride_a + line_stride_a*5);
+            reg_a_l_a.s2 = RD_QL(src0_ql, gid_a + k*block_stride_a + line_stride_a*6);
+            reg_a_l_a.s3 = RD_QL(src0_ql, gid_a + k*block_stride_a + line_stride_a*7);
+            reg_a_h_a.s0 = RD_QH(src0_qh, gid_a + k*block_stride_a + line_stride_a*4);
+            reg_a_h_a.s1 = RD_QH(src0_qh, gid_a + k*block_stride_a + line_stride_a*5);
+            reg_a_h_a.s2 = RD_QH(src0_qh, gid_a + k*block_stride_a + line_stride_a*6);
+            reg_a_h_a.s3 = RD_QH(src0_qh, gid_a + k*block_stride_a + line_stride_a*7);
 #ifdef VECTOR_SUB_GROUP_BROADCAT
             dequantize_block_acc_bcast_8_lo(total_sum_a, as_ushort8(reg_a_l_a), as_uchar8(reg_a_h_a), cs_a, reg_b);
 #else
@@ -295,28 +313,28 @@ kernel void kernel_gemv_noshuffle_q6_K_f32_o4(
         }
 
         {
-            reg_a_l_b.s0 = read_imageui(src0_ql, gid_b + k*block_stride_a + line_stride_a*0).x;
-            reg_a_l_b.s1 = read_imageui(src0_ql, gid_b + k*block_stride_a + line_stride_a*1).x;
-            reg_a_l_b.s2 = read_imageui(src0_ql, gid_b + k*block_stride_a + line_stride_a*2).x;
-            reg_a_l_b.s3 = read_imageui(src0_ql, gid_b + k*block_stride_a + line_stride_a*3).x;
-            reg_a_h_b.s0 = as_ushort(read_imageh(src0_qh, gid_b + k*block_stride_a + line_stride_a*0).x);
-            reg_a_h_b.s1 = as_ushort(read_imageh(src0_qh, gid_b + k*block_stride_a + line_stride_a*1).x);
-            reg_a_h_b.s2 = as_ushort(read_imageh(src0_qh, gid_b + k*block_stride_a + line_stride_a*2).x);
-            reg_a_h_b.s3 = as_ushort(read_imageh(src0_qh, gid_b + k*block_stride_a + line_stride_a*3).x);
+            reg_a_l_b.s0 = RD_QL(src0_ql, gid_b + k*block_stride_a + line_stride_a*0);
+            reg_a_l_b.s1 = RD_QL(src0_ql, gid_b + k*block_stride_a + line_stride_a*1);
+            reg_a_l_b.s2 = RD_QL(src0_ql, gid_b + k*block_stride_a + line_stride_a*2);
+            reg_a_l_b.s3 = RD_QL(src0_ql, gid_b + k*block_stride_a + line_stride_a*3);
+            reg_a_h_b.s0 = RD_QH(src0_qh, gid_b + k*block_stride_a + line_stride_a*0);
+            reg_a_h_b.s1 = RD_QH(src0_qh, gid_b + k*block_stride_a + line_stride_a*1);
+            reg_a_h_b.s2 = RD_QH(src0_qh, gid_b + k*block_stride_a + line_stride_a*2);
+            reg_a_h_b.s3 = RD_QH(src0_qh, gid_b + k*block_stride_a + line_stride_a*3);
 #ifdef VECTOR_SUB_GROUP_BROADCAT
             dequantize_block_acc_bcast_8_hi(total_sum_b, as_ushort8(reg_a_l_b), as_uchar8(reg_a_h_b), cs_b, reg_b);
 #else
             dequantize_block_acc_bcast_1_hi(total_sum_b, as_ushort8(reg_a_l_b), as_uchar8(reg_a_h_b), cs_b, reg_b);
 #endif
 
-            reg_a_l_b.s0 = read_imageui(src0_ql, gid_b + k*block_stride_a + line_stride_a*4).x;
-            reg_a_l_b.s1 = read_imageui(src0_ql, gid_b + k*block_stride_a + line_stride_a*5).x;
-            reg_a_l_b.s2 = read_imageui(src0_ql, gid_b + k*block_stride_a + line_stride_a*6).x;
-            reg_a_l_b.s3 = read_imageui(src0_ql, gid_b + k*block_stride_a + line_stride_a*7).x;
-            reg_a_h_b.s0 = as_ushort(read_imageh(src0_qh, gid_b + k*block_stride_a + line_stride_a*4).x);
-            reg_a_h_b.s1 = as_ushort(read_imageh(src0_qh, gid_b + k*block_stride_a + line_stride_a*5).x);
-            reg_a_h_b.s2 = as_ushort(read_imageh(src0_qh, gid_b + k*block_stride_a + line_stride_a*6).x);
-            reg_a_h_b.s3 = as_ushort(read_imageh(src0_qh, gid_b + k*block_stride_a + line_stride_a*7).x);
+            reg_a_l_b.s0 = RD_QL(src0_ql, gid_b + k*block_stride_a + line_stride_a*4);
+            reg_a_l_b.s1 = RD_QL(src0_ql, gid_b + k*block_stride_a + line_stride_a*5);
+            reg_a_l_b.s2 = RD_QL(src0_ql, gid_b + k*block_stride_a + line_stride_a*6);
+            reg_a_l_b.s3 = RD_QL(src0_ql, gid_b + k*block_stride_a + line_stride_a*7);
+            reg_a_h_b.s0 = RD_QH(src0_qh, gid_b + k*block_stride_a + line_stride_a*4);
+            reg_a_h_b.s1 = RD_QH(src0_qh, gid_b + k*block_stride_a + line_stride_a*5);
+            reg_a_h_b.s2 = RD_QH(src0_qh, gid_b + k*block_stride_a + line_stride_a*6);
+            reg_a_h_b.s3 = RD_QH(src0_qh, gid_b + k*block_stride_a + line_stride_a*7);
 #ifdef VECTOR_SUB_GROUP_BROADCAT
             dequantize_block_acc_bcast_8_lo(total_sum_b, as_ushort8(reg_a_l_b), as_uchar8(reg_a_h_b), cs_b, reg_b);
 #else
