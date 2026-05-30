@@ -1072,6 +1072,8 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemv_noshuffle_q6_K_f32;
     cl_kernel kernel_gemv_noshuffle_q6_K_f32_o4;
     cl_kernel kernel_gemv_noshuffle_q6_K_f32_o4_global;  // weights via __global (opt-in)
+    cl_kernel kernel_gemv_noshuffle_q6_K_f32_tiled;      // tiled-wide layout (opt-in)
+    cl_kernel kernel_convert_block_q6_k_tiled_ns;        // tiled-wide convert (opt-in)
     cl_kernel kernel_gemm_noshuffle_q6_K_f32;
     cl_kernel kernel_gemv_noshuffle_q5_k_f32;
     cl_kernel kernel_gemm_noshuffle_q5_k_f32;
@@ -1425,6 +1427,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         CL_CHECK((backend_ctx->kernel_restore_block_q5_k_trans4_ns = clCreateKernel(backend_ctx->program_cvt, "kernel_restore_block_q5_k_trans4_ns", &err), err));
         CL_CHECK((backend_ctx->kernel_convert_block_q6_k_trans4_ns = clCreateKernel(backend_ctx->program_cvt, "kernel_convert_block_q6_k_trans4_ns", &err), err));
         CL_CHECK((backend_ctx->kernel_restore_block_q6_k_trans4_ns = clCreateKernel(backend_ctx->program_cvt, "kernel_restore_block_q6_k_trans4_ns", &err), err));
+        CL_CHECK((backend_ctx->kernel_convert_block_q6_k_tiled_ns = clCreateKernel(backend_ctx->program_cvt, "kernel_convert_block_q6_k_tiled_ns", &err), err));
         CL_CHECK((backend_ctx->kernel_convert_block_mxfp4 = clCreateKernel(backend_ctx->program_cvt, "kernel_convert_block_mxfp4", &err), err));
         CL_CHECK((backend_ctx->kernel_convert_block_mxfp4_trans = clCreateKernel(backend_ctx->program_cvt, "kernel_convert_block_mxfp4_trans", &err), err));
         CL_CHECK((backend_ctx->kernel_convert_block_mxfp4_trans4_ns = clCreateKernel(backend_ctx->program_cvt, "kernel_convert_block_mxfp4_trans4_ns", &err), err));
@@ -4500,6 +4503,25 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         GGML_LOG_CONT(".");
     }
 
+    // gemv_noshuffle_q6_k_f32_tiled — tiled-wide canonical layout, opt-in via
+    // GGML_OPENCL_Q6K_GEMV_TILED=1 (separate convert + GEMV; weights via __global).
+    {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src {
+            #include "gemv_noshuffle_q6_k_f32_tiled.cl.h"
+        };
+#else
+        const std::string kernel_src = read_file("gemv_noshuffle_q6_k_f32_tiled.cl");
+#endif
+        std::string compile_opts = std::string("-cl-std=") + opencl_c_std + " -cl-mad-enable ";
+        cl_program prog =
+            build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
+        CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q6_K_f32_tiled =
+            clCreateKernel(prog, "kernel_gemv_noshuffle_q6_K_f32_tiled", &err), err));
+        CL_CHECK(clReleaseProgram(prog));
+        GGML_LOG_CONT(".");
+    }
+
     // gemm_noshuffle_q6_k_f32
     {
 #ifdef GGML_OPENCL_EMBED_KERNELS
@@ -7087,6 +7109,23 @@ inline bool use_adreno_moe_kernels(const ggml_backend_opencl_context *backend_ct
     return (((strstr(tensor->name, "ffn") != NULL) && (strstr(tensor->name, "exps") != NULL)) || (strstr(tensor->name, "as") != NULL)) && (ne01 % 32 == 0);
 }
 
+// Opt-in tiled-wide q6_K GEMV (default OFF). Both the convert (set_tensor) and
+// the GEMV dispatch must agree on this so the buffer layout matches the kernel.
+inline bool q6k_gemv_tiled_enabled() {
+    static const bool en = []{
+        const char * e = std::getenv("GGML_OPENCL_Q6K_GEMV_TILED");
+        return e && e[0] != '\0' && e[0] != '0';
+    }();
+    return en;
+}
+
+// Only the long-vocab lm_head/embed shapes use the tiled layout; ne01 % 64 == 0
+// is required by the 64-row tiling (no row padding in the buffers).
+inline bool use_q6k_tiled(const ggml_tensor *tensor) {
+    return q6k_gemv_tiled_enabled() && tensor->type == GGML_TYPE_Q6_K &&
+           tensor->ne[1] >= 32768 && tensor->ne[1] % 64 == 0;
+}
+
 inline bool enable_adreno_trans_weight(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor) {
 
     bool adreno_kernel = use_adreno_kernels(backend_ctx, tensor);
@@ -9496,6 +9535,45 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         region.size = size_d;
         CL_CHECK((extra->d = clCreateSubBuffer(extra_orig->data_device, CL_MEM_READ_WRITE, CL_BUFFER_CREATE_TYPE_REGION, &region, &err), err));
         previous_origin = region.origin;
+
+#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+        // Tiled-wide convert for the long-vocab lm_head/embed (opt-in). The embed
+        // /output q6_K weight (e.g. token_embd.weight, ne1=vocab) is NOT matched by
+        // use_adreno_moe_kernels, so it lands here in the general branch. Produce
+        // the final 64-row-tiled canonical layout directly into ql/qh/s/d (buffer
+        // sizes already match), read back by kernel_gemv_noshuffle_q6_K_f32_tiled.
+        // Bypasses the plain-SOA convert + per-array transpose below.
+        if (use_q6k_tiled(tensor)) {
+            cl_kernel kernel = backend_ctx->kernel_convert_block_q6_k_tiled_ns;
+
+            int ne00 = tensor->ne[0];
+            int ne01 = tensor->ne[1];
+            int ne02 = tensor->ne[2];
+
+            CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &data_device));
+            CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &extra->ql));
+            CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem), &extra->qh));
+            CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_mem), &extra->d));
+            CL_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_mem), &extra->s));
+            CL_CHECK(clSetKernelArg(kernel, 5, sizeof(int), &ne00));
+            CL_CHECK(clSetKernelArg(kernel, 6, sizeof(int), &ne01));
+
+            size_t global_work_size[] = {static_cast<size_t>(((ne01 + 63) / 64) * 64), static_cast<size_t>(ne00 / 256), static_cast<size_t>(ne02)};
+            size_t local_work_size[] = {64, 1, 1};
+
+            cl_event evt;
+            CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, &evt));
+            CL_CHECK(clWaitForEvents(1, &evt));
+            CL_CHECK(clReleaseMemObject(data_device));
+
+            extra->size_ql = size_ql;
+            extra->size_qh = size_qh;
+            extra->size_s  = size_s;
+            extra->size_d  = size_d;
+            tensor->extra  = extra;
+            return;
+        }
+#endif // GGML_OPENCL_USE_ADRENO_KERNELS
 
         // Flatten the weights
         cl_kernel kernel;
@@ -18005,11 +18083,12 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
             const char * e = std::getenv("GGML_OPENCL_Q6K_GEMV_O4_GLOBAL");
             return !e || e[0] == '\0' || e[0] != '0';
         }();
-        const bool use_o4        = gemv_o4_env && (ne01 % 4 == 0) && (ne01 >= 32768);
+        const bool use_tiled     = use_q6k_tiled(src0);
+        const bool use_o4        = !use_tiled && gemv_o4_env && (ne01 % 4 == 0) && (ne01 >= 32768);
         const bool use_o4_global = use_o4 && o4_global_env;
 
         // ql/qh image views are only needed when NOT reading weights from global.
-        if (!use_o4_global) {
+        if (!use_o4_global && !use_tiled) {
             // image for ql
             img_fmt.image_channel_order = CL_R;
             img_fmt.image_channel_data_type = CL_FLOAT;
@@ -18041,11 +18120,12 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
         img_desc.buffer = b_sub_buffer;
         CL_CHECK((b_img = clCreateImage(context, CL_MEM_READ_ONLY, &img_fmt, &img_desc, NULL, &err), err));
 
-        kernel = use_o4_global ? backend_ctx->kernel_gemv_noshuffle_q6_K_f32_o4_global
+        kernel = use_tiled     ? backend_ctx->kernel_gemv_noshuffle_q6_K_f32_tiled
+               : use_o4_global ? backend_ctx->kernel_gemv_noshuffle_q6_K_f32_o4_global
                : use_o4        ? backend_ctx->kernel_gemv_noshuffle_q6_K_f32_o4
                                : backend_ctx->kernel_gemv_noshuffle_q6_K_f32;
 
-        if (use_o4_global) {
+        if (use_o4_global || use_tiled) {
             CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &extra0_q6_K->ql));
             CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &extra0_q6_K->qh));
         } else {
@@ -18060,7 +18140,9 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
         CL_CHECK(clSetKernelArg(kernel, 7, sizeof(cl_int),   &ne00));
         CL_CHECK(clSetKernelArg(kernel, 8, sizeof(cl_int),   &ne01));
 
-        const size_t gws_x = use_o4
+        const size_t gws_x = use_tiled
+                                 ? (size_t) CEIL_DIV(ne01, 64) * 64
+                                 : use_o4
                                  ? (size_t) CEIL_DIV(ne01/4, 64) * 64
                                  : (size_t) CEIL_DIV(ne01/2, 64) * 64;
         size_t local_work_size[3]  = {64, 4, 1};
