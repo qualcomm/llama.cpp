@@ -161,6 +161,7 @@ set(GGML_OPENCL_KERNELS
     gemv_noshuffle_q8_0_f32
     gemm_noshuffle_q8_0_f32
     gemv_noshuffle_q4_k_f32
+    gemv_noshuffle_q4_k_f32_o4
     gemm_noshuffle_q4_k_f32
     gemv_noshuffle_q6_k_f32
     gemm_noshuffle_q6_k_f32
