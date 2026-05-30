@@ -1,0 +1,339 @@
+// 4-output-per-WI variant of kernel_gemv_noshuffle_q6_K_f32.
+// Each WI now produces 4 consecutive outputs (output quad). The activation
+// fetch (reg_b) is shared across all 4 outputs, doubling per-WI ALU per
+// activation broadcast and halving the WG count vs the 2-output kernel.
+//
+// Implementation: each K-block we fetch TWO sets of (scales + ql + qh)
+// — one for the low pair (rows 0,1 of the quad) and one for the high pair
+// (rows 2,3) — and invoke the existing 2-output dequant macros twice
+// against the *same* reg_b. Identical data layout to the 2-output kernel,
+// so the host only needs to halve the grid and double the gid-to-output
+// mapping.
+//
+// Opt-in via the host dispatch when GGML_OPENCL_Q6K_GEMV_O4=1.
+
+#pragma OPENCL EXTENSION cl_khr_fp16 : enable
+#pragma OPENCL EXTENSION cl_khr_subgroups : enable
+
+#ifdef cl_intel_required_subgroup_size
+#pragma OPENCL EXTENSION cl_intel_required_subgroup_size : enable
+#define INTEL_GPU 1
+#define REQD_SUBGROUP_SIZE_16 __attribute__((intel_reqd_sub_group_size(16)))
+#define REQD_SUBGROUP_SIZE_32 __attribute__((intel_reqd_sub_group_size(32)))
+#elif defined(cl_qcom_reqd_sub_group_size)
+#pragma OPENCL EXTENSION cl_qcom_reqd_sub_group_size : enable
+#define ADRENO_GPU 1
+#define REQD_SUBGROUP_SIZE_64  __attribute__((qcom_reqd_sub_group_size("half")))
+#define REQD_SUBGROUP_SIZE_128 __attribute__((qcom_reqd_sub_group_size("full")))
+#endif
+
+#define NSUBGROUPS 4
+#define SUBGROUP_SIZE 64
+
+// Macros are identical to the 2-output kernel — they accept `total_sum` as
+// a parameter so we can call them twice (once per pair) against different
+// accumulators against the same reg_b.
+#define dequantize_block_acc_bcast_8_hi(total_sum, bits4, bits2, scale_d, scale_s, y) \
+    float8 shared_y; \
+    shared_y = sub_group_broadcast(y, 0); \
+    total_sum.s0 += ((float)(((bits4.s0 & 0x000F)      ) | ((bits2.s0 & 0x03) << 4)) - 32.f) * scale_s.s0 * scale_d.s0 * shared_y.s0; \
+    total_sum.s0 += ((float)(((bits4.s0 & 0x00F0) >>  4) | ((bits2.s0 & 0x0C) << 2)) - 32.f) * scale_s.s0 * scale_d.s0 * shared_y.s1; \
+    total_sum.s0 += ((float)(((bits4.s0 & 0x0F00) >>  8) | ((bits2.s0 & 0x30)     )) - 32.f) * scale_s.s0 * scale_d.s0 * shared_y.s2; \
+    total_sum.s0 += ((float)(((bits4.s0 & 0xF000) >> 12) | ((bits2.s0 & 0xC0) >> 2)) - 32.f) * scale_s.s0 * scale_d.s0 * shared_y.s3; \
+    total_sum.s0 += ((float)(((bits4.s2 & 0x000F)      ) | ((bits2.s2 & 0x03) << 4)) - 32.f) * scale_s.s0 * scale_d.s0 * shared_y.s4; \
+    total_sum.s0 += ((float)(((bits4.s2 & 0x00F0) >>  4) | ((bits2.s2 & 0x0C) << 2)) - 32.f) * scale_s.s0 * scale_d.s0 * shared_y.s5; \
+    total_sum.s0 += ((float)(((bits4.s2 & 0x0F00) >>  8) | ((bits2.s2 & 0x30)     )) - 32.f) * scale_s.s0 * scale_d.s0 * shared_y.s6; \
+    total_sum.s0 += ((float)(((bits4.s2 & 0xF000) >> 12) | ((bits2.s2 & 0xC0) >> 2)) - 32.f) * scale_s.s0 * scale_d.s0 * shared_y.s7; \
+    total_sum.s1 += ((float)(((bits4.s1 & 0x000F)      ) | ((bits2.s1 & 0x03) << 4)) - 32.f) * scale_s.s2 * scale_d.s1 * shared_y.s0; \
+    total_sum.s1 += ((float)(((bits4.s1 & 0x00F0) >>  4) | ((bits2.s1 & 0x0C) << 2)) - 32.f) * scale_s.s2 * scale_d.s1 * shared_y.s1; \
+    total_sum.s1 += ((float)(((bits4.s1 & 0x0F00) >>  8) | ((bits2.s1 & 0x30)     )) - 32.f) * scale_s.s2 * scale_d.s1 * shared_y.s2; \
+    total_sum.s1 += ((float)(((bits4.s1 & 0xF000) >> 12) | ((bits2.s1 & 0xC0) >> 2)) - 32.f) * scale_s.s2 * scale_d.s1 * shared_y.s3; \
+    total_sum.s1 += ((float)(((bits4.s3 & 0x000F)      ) | ((bits2.s3 & 0x03) << 4)) - 32.f) * scale_s.s2 * scale_d.s1 * shared_y.s4; \
+    total_sum.s1 += ((float)(((bits4.s3 & 0x00F0) >>  4) | ((bits2.s3 & 0x0C) << 2)) - 32.f) * scale_s.s2 * scale_d.s1 * shared_y.s5; \
+    total_sum.s1 += ((float)(((bits4.s3 & 0x0F00) >>  8) | ((bits2.s3 & 0x30)     )) - 32.f) * scale_s.s2 * scale_d.s1 * shared_y.s6; \
+    total_sum.s1 += ((float)(((bits4.s3 & 0xF000) >> 12) | ((bits2.s3 & 0xC0) >> 2)) - 32.f) * scale_s.s2 * scale_d.s1 * shared_y.s7; \
+    shared_y = sub_group_broadcast(y, 1); \
+    total_sum.s0 += ((float)(((bits4.s4 & 0x000F)      ) | ((bits2.s4 & 0x03) << 4)) - 32.f) * scale_s.s0 * scale_d.s0 * shared_y.s0; \
+    total_sum.s0 += ((float)(((bits4.s4 & 0x00F0) >>  4) | ((bits2.s4 & 0x0C) << 2)) - 32.f) * scale_s.s0 * scale_d.s0 * shared_y.s1; \
+    total_sum.s0 += ((float)(((bits4.s4 & 0x0F00) >>  8) | ((bits2.s4 & 0x30)     )) - 32.f) * scale_s.s0 * scale_d.s0 * shared_y.s2; \
+    total_sum.s0 += ((float)(((bits4.s4 & 0xF000) >> 12) | ((bits2.s4 & 0xC0) >> 2)) - 32.f) * scale_s.s0 * scale_d.s0 * shared_y.s3; \
+    total_sum.s0 += ((float)(((bits4.s6 & 0x000F)      ) | ((bits2.s6 & 0x03) << 4)) - 32.f) * scale_s.s0 * scale_d.s0 * shared_y.s4; \
+    total_sum.s0 += ((float)(((bits4.s6 & 0x00F0) >>  4) | ((bits2.s6 & 0x0C) << 2)) - 32.f) * scale_s.s0 * scale_d.s0 * shared_y.s5; \
+    total_sum.s0 += ((float)(((bits4.s6 & 0x0F00) >>  8) | ((bits2.s6 & 0x30)     )) - 32.f) * scale_s.s0 * scale_d.s0 * shared_y.s6; \
+    total_sum.s0 += ((float)(((bits4.s6 & 0xF000) >> 12) | ((bits2.s6 & 0xC0) >> 2)) - 32.f) * scale_s.s0 * scale_d.s0 * shared_y.s7; \
+    total_sum.s1 += ((float)(((bits4.s5 & 0x000F)      ) | ((bits2.s5 & 0x03) << 4)) - 32.f) * scale_s.s2 * scale_d.s1 * shared_y.s0; \
+    total_sum.s1 += ((float)(((bits4.s5 & 0x00F0) >>  4) | ((bits2.s5 & 0x0C) << 2)) - 32.f) * scale_s.s2 * scale_d.s1 * shared_y.s1; \
+    total_sum.s1 += ((float)(((bits4.s5 & 0x0F00) >>  8) | ((bits2.s5 & 0x30)     )) - 32.f) * scale_s.s2 * scale_d.s1 * shared_y.s2; \
+    total_sum.s1 += ((float)(((bits4.s5 & 0xF000) >> 12) | ((bits2.s5 & 0xC0) >> 2)) - 32.f) * scale_s.s2 * scale_d.s1 * shared_y.s3; \
+    total_sum.s1 += ((float)(((bits4.s7 & 0x000F)      ) | ((bits2.s7 & 0x03) << 4)) - 32.f) * scale_s.s2 * scale_d.s1 * shared_y.s4; \
+    total_sum.s1 += ((float)(((bits4.s7 & 0x00F0) >>  4) | ((bits2.s7 & 0x0C) << 2)) - 32.f) * scale_s.s2 * scale_d.s1 * shared_y.s5; \
+    total_sum.s1 += ((float)(((bits4.s7 & 0x0F00) >>  8) | ((bits2.s7 & 0x30)     )) - 32.f) * scale_s.s2 * scale_d.s1 * shared_y.s6; \
+    total_sum.s1 += ((float)(((bits4.s7 & 0xF000) >> 12) | ((bits2.s7 & 0xC0) >> 2)) - 32.f) * scale_s.s2 * scale_d.s1 * shared_y.s7; \
+
+#define dequantize_block_acc_bcast_8_lo(total_sum, bits4, bits2, scale_d, scale_s, y) \
+    shared_y = sub_group_broadcast(y, 2); \
+    total_sum.s0 += ((float)(((bits4.s0 & 0x000F)      ) | ((bits2.s0 & 0x03) << 4)) - 32.f) * scale_s.s1 * scale_d.s0 * shared_y.s0; \
+    total_sum.s0 += ((float)(((bits4.s0 & 0x00F0) >>  4) | ((bits2.s0 & 0x0C) << 2)) - 32.f) * scale_s.s1 * scale_d.s0 * shared_y.s1; \
+    total_sum.s0 += ((float)(((bits4.s0 & 0x0F00) >>  8) | ((bits2.s0 & 0x30)     )) - 32.f) * scale_s.s1 * scale_d.s0 * shared_y.s2; \
+    total_sum.s0 += ((float)(((bits4.s0 & 0xF000) >> 12) | ((bits2.s0 & 0xC0) >> 2)) - 32.f) * scale_s.s1 * scale_d.s0 * shared_y.s3; \
+    total_sum.s0 += ((float)(((bits4.s2 & 0x000F)      ) | ((bits2.s2 & 0x03) << 4)) - 32.f) * scale_s.s1 * scale_d.s0 * shared_y.s4; \
+    total_sum.s0 += ((float)(((bits4.s2 & 0x00F0) >>  4) | ((bits2.s2 & 0x0C) << 2)) - 32.f) * scale_s.s1 * scale_d.s0 * shared_y.s5; \
+    total_sum.s0 += ((float)(((bits4.s2 & 0x0F00) >>  8) | ((bits2.s2 & 0x30)     )) - 32.f) * scale_s.s1 * scale_d.s0 * shared_y.s6; \
+    total_sum.s0 += ((float)(((bits4.s2 & 0xF000) >> 12) | ((bits2.s2 & 0xC0) >> 2)) - 32.f) * scale_s.s1 * scale_d.s0 * shared_y.s7; \
+    total_sum.s1 += ((float)(((bits4.s1 & 0x000F)      ) | ((bits2.s1 & 0x03) << 4)) - 32.f) * scale_s.s3 * scale_d.s1 * shared_y.s0; \
+    total_sum.s1 += ((float)(((bits4.s1 & 0x00F0) >>  4) | ((bits2.s1 & 0x0C) << 2)) - 32.f) * scale_s.s3 * scale_d.s1 * shared_y.s1; \
+    total_sum.s1 += ((float)(((bits4.s1 & 0x0F00) >>  8) | ((bits2.s1 & 0x30)     )) - 32.f) * scale_s.s3 * scale_d.s1 * shared_y.s2; \
+    total_sum.s1 += ((float)(((bits4.s1 & 0xF000) >> 12) | ((bits2.s1 & 0xC0) >> 2)) - 32.f) * scale_s.s3 * scale_d.s1 * shared_y.s3; \
+    total_sum.s1 += ((float)(((bits4.s3 & 0x000F)      ) | ((bits2.s3 & 0x03) << 4)) - 32.f) * scale_s.s3 * scale_d.s1 * shared_y.s4; \
+    total_sum.s1 += ((float)(((bits4.s3 & 0x00F0) >>  4) | ((bits2.s3 & 0x0C) << 2)) - 32.f) * scale_s.s3 * scale_d.s1 * shared_y.s5; \
+    total_sum.s1 += ((float)(((bits4.s3 & 0x0F00) >>  8) | ((bits2.s3 & 0x30)     )) - 32.f) * scale_s.s3 * scale_d.s1 * shared_y.s6; \
+    total_sum.s1 += ((float)(((bits4.s3 & 0xF000) >> 12) | ((bits2.s3 & 0xC0) >> 2)) - 32.f) * scale_s.s3 * scale_d.s1 * shared_y.s7; \
+    shared_y = sub_group_broadcast(y, 3); \
+    total_sum.s0 += ((float)(((bits4.s4 & 0x000F)      ) | ((bits2.s4 & 0x03) << 4)) - 32.f) * scale_s.s1 * scale_d.s0 * shared_y.s0; \
+    total_sum.s0 += ((float)(((bits4.s4 & 0x00F0) >>  4) | ((bits2.s4 & 0x0C) << 2)) - 32.f) * scale_s.s1 * scale_d.s0 * shared_y.s1; \
+    total_sum.s0 += ((float)(((bits4.s4 & 0x0F00) >>  8) | ((bits2.s4 & 0x30)     )) - 32.f) * scale_s.s1 * scale_d.s0 * shared_y.s2; \
+    total_sum.s0 += ((float)(((bits4.s4 & 0xF000) >> 12) | ((bits2.s4 & 0xC0) >> 2)) - 32.f) * scale_s.s1 * scale_d.s0 * shared_y.s3; \
+    total_sum.s0 += ((float)(((bits4.s6 & 0x000F)      ) | ((bits2.s6 & 0x03) << 4)) - 32.f) * scale_s.s1 * scale_d.s0 * shared_y.s4; \
+    total_sum.s0 += ((float)(((bits4.s6 & 0x00F0) >>  4) | ((bits2.s6 & 0x0C) << 2)) - 32.f) * scale_s.s1 * scale_d.s0 * shared_y.s5; \
+    total_sum.s0 += ((float)(((bits4.s6 & 0x0F00) >>  8) | ((bits2.s6 & 0x30)     )) - 32.f) * scale_s.s1 * scale_d.s0 * shared_y.s6; \
+    total_sum.s0 += ((float)(((bits4.s6 & 0xF000) >> 12) | ((bits2.s6 & 0xC0) >> 2)) - 32.f) * scale_s.s1 * scale_d.s0 * shared_y.s7; \
+    total_sum.s1 += ((float)(((bits4.s5 & 0x000F)      ) | ((bits2.s5 & 0x03) << 4)) - 32.f) * scale_s.s3 * scale_d.s1 * shared_y.s0; \
+    total_sum.s1 += ((float)(((bits4.s5 & 0x00F0) >>  4) | ((bits2.s5 & 0x0C) << 2)) - 32.f) * scale_s.s3 * scale_d.s1 * shared_y.s1; \
+    total_sum.s1 += ((float)(((bits4.s5 & 0x0F00) >>  8) | ((bits2.s5 & 0x30)     )) - 32.f) * scale_s.s3 * scale_d.s1 * shared_y.s2; \
+    total_sum.s1 += ((float)(((bits4.s5 & 0xF000) >> 12) | ((bits2.s5 & 0xC0) >> 2)) - 32.f) * scale_s.s3 * scale_d.s1 * shared_y.s3; \
+    total_sum.s1 += ((float)(((bits4.s7 & 0x000F)      ) | ((bits2.s7 & 0x03) << 4)) - 32.f) * scale_s.s3 * scale_d.s1 * shared_y.s4; \
+    total_sum.s1 += ((float)(((bits4.s7 & 0x00F0) >>  4) | ((bits2.s7 & 0x0C) << 2)) - 32.f) * scale_s.s3 * scale_d.s1 * shared_y.s5; \
+    total_sum.s1 += ((float)(((bits4.s7 & 0x0F00) >>  8) | ((bits2.s7 & 0x30)     )) - 32.f) * scale_s.s3 * scale_d.s1 * shared_y.s6; \
+    total_sum.s1 += ((float)(((bits4.s7 & 0xF000) >> 12) | ((bits2.s7 & 0xC0) >> 2)) - 32.f) * scale_s.s3 * scale_d.s1 * shared_y.s7; \
+
+#define dequantize_block_acc_bcast_1_hi(total_sum, bits4, bits2, scale_d, scale_s, y) \
+    float shared_y; \
+    shared_y = sub_group_broadcast(y.s0, 0); \
+    total_sum.s0 += ((float)(((bits4.s0 & 0x000F)      ) | ((bits2.s0 & 0x03) << 4)) - 32.f) * scale_s.s0 * scale_d.s0 * shared_y; \
+    total_sum.s1 += ((float)(((bits4.s1 & 0x000F)      ) | ((bits2.s1 & 0x03) << 4)) - 32.f) * scale_s.s2 * scale_d.s1 * shared_y; \
+    shared_y = sub_group_broadcast(y.s1, 0); \
+    total_sum.s0 += ((float)(((bits4.s0 & 0x00F0) >>  4) | ((bits2.s0 & 0x0C) << 2)) - 32.f) * scale_s.s0 * scale_d.s0 * shared_y; \
+    total_sum.s1 += ((float)(((bits4.s1 & 0x00F0) >>  4) | ((bits2.s1 & 0x0C) << 2)) - 32.f) * scale_s.s2 * scale_d.s1 * shared_y; \
+    shared_y = sub_group_broadcast(y.s2, 0); \
+    total_sum.s0 += ((float)(((bits4.s0 & 0x0F00) >>  8) | ((bits2.s0 & 0x30)     )) - 32.f) * scale_s.s0 * scale_d.s0 * shared_y; \
+    total_sum.s1 += ((float)(((bits4.s1 & 0x0F00) >>  8) | ((bits2.s1 & 0x30)     )) - 32.f) * scale_s.s2 * scale_d.s1 * shared_y; \
+    shared_y = sub_group_broadcast(y.s3, 0); \
+    total_sum.s0 += ((float)(((bits4.s0 & 0xF000) >> 12) | ((bits2.s0 & 0xC0) >> 2)) - 32.f) * scale_s.s0 * scale_d.s0 * shared_y; \
+    total_sum.s1 += ((float)(((bits4.s1 & 0xF000) >> 12) | ((bits2.s1 & 0xC0) >> 2)) - 32.f) * scale_s.s2 * scale_d.s1 * shared_y; \
+    shared_y = sub_group_broadcast(y.s4, 0); \
+    total_sum.s0 += ((float)(((bits4.s2 & 0x000F)      ) | ((bits2.s2 & 0x03) << 4)) - 32.f) * scale_s.s0 * scale_d.s0 * shared_y; \
+    total_sum.s1 += ((float)(((bits4.s3 & 0x000F)      ) | ((bits2.s3 & 0x03) << 4)) - 32.f) * scale_s.s2 * scale_d.s1 * shared_y; \
+    shared_y = sub_group_broadcast(y.s5, 0); \
+    total_sum.s0 += ((float)(((bits4.s2 & 0x00F0) >>  4) | ((bits2.s2 & 0x0C) << 2)) - 32.f) * scale_s.s0 * scale_d.s0 * shared_y; \
+    total_sum.s1 += ((float)(((bits4.s3 & 0x00F0) >>  4) | ((bits2.s3 & 0x0C) << 2)) - 32.f) * scale_s.s2 * scale_d.s1 * shared_y; \
+    shared_y = sub_group_broadcast(y.s6, 0); \
+    total_sum.s0 += ((float)(((bits4.s2 & 0x0F00) >>  8) | ((bits2.s2 & 0x30)     )) - 32.f) * scale_s.s0 * scale_d.s0 * shared_y; \
+    total_sum.s1 += ((float)(((bits4.s3 & 0x0F00) >>  8) | ((bits2.s3 & 0x30)     )) - 32.f) * scale_s.s2 * scale_d.s1 * shared_y; \
+    shared_y = sub_group_broadcast(y.s7, 0); \
+    total_sum.s0 += ((float)(((bits4.s2 & 0xF000) >> 12) | ((bits2.s2 & 0xC0) >> 2)) - 32.f) * scale_s.s0 * scale_d.s0 * shared_y; \
+    total_sum.s1 += ((float)(((bits4.s3 & 0xF000) >> 12) | ((bits2.s3 & 0xC0) >> 2)) - 32.f) * scale_s.s2 * scale_d.s1 * shared_y; \
+    shared_y = sub_group_broadcast(y.s0, 1); \
+    total_sum.s0 += ((float)(((bits4.s4 & 0x000F)      ) | ((bits2.s4 & 0x03) << 4)) - 32.f) * scale_s.s0 * scale_d.s0 * shared_y; \
+    total_sum.s1 += ((float)(((bits4.s5 & 0x000F)      ) | ((bits2.s5 & 0x03) << 4)) - 32.f) * scale_s.s2 * scale_d.s1 * shared_y; \
+    shared_y = sub_group_broadcast(y.s1, 1); \
+    total_sum.s0 += ((float)(((bits4.s4 & 0x00F0) >>  4) | ((bits2.s4 & 0x0C) << 2)) - 32.f) * scale_s.s0 * scale_d.s0 * shared_y; \
+    total_sum.s1 += ((float)(((bits4.s5 & 0x00F0) >>  4) | ((bits2.s5 & 0x0C) << 2)) - 32.f) * scale_s.s2 * scale_d.s1 * shared_y; \
+    shared_y = sub_group_broadcast(y.s2, 1); \
+    total_sum.s0 += ((float)(((bits4.s4 & 0x0F00) >>  8) | ((bits2.s4 & 0x30)     )) - 32.f) * scale_s.s0 * scale_d.s0 * shared_y; \
+    total_sum.s1 += ((float)(((bits4.s5 & 0x0F00) >>  8) | ((bits2.s5 & 0x30)     )) - 32.f) * scale_s.s2 * scale_d.s1 * shared_y; \
+    shared_y = sub_group_broadcast(y.s3, 1); \
+    total_sum.s0 += ((float)(((bits4.s4 & 0xF000) >> 12) | ((bits2.s4 & 0xC0) >> 2)) - 32.f) * scale_s.s0 * scale_d.s0 * shared_y; \
+    total_sum.s1 += ((float)(((bits4.s5 & 0xF000) >> 12) | ((bits2.s5 & 0xC0) >> 2)) - 32.f) * scale_s.s2 * scale_d.s1 * shared_y; \
+    shared_y = sub_group_broadcast(y.s4, 1); \
+    total_sum.s0 += ((float)(((bits4.s6 & 0x000F)      ) | ((bits2.s6 & 0x03) << 4)) - 32.f) * scale_s.s0 * scale_d.s0 * shared_y; \
+    total_sum.s1 += ((float)(((bits4.s7 & 0x000F)      ) | ((bits2.s7 & 0x03) << 4)) - 32.f) * scale_s.s2 * scale_d.s1 * shared_y; \
+    shared_y = sub_group_broadcast(y.s5, 1); \
+    total_sum.s0 += ((float)(((bits4.s6 & 0x00F0) >>  4) | ((bits2.s6 & 0x0C) << 2)) - 32.f) * scale_s.s0 * scale_d.s0 * shared_y; \
+    total_sum.s1 += ((float)(((bits4.s7 & 0x00F0) >>  4) | ((bits2.s7 & 0x0C) << 2)) - 32.f) * scale_s.s2 * scale_d.s1 * shared_y; \
+    shared_y = sub_group_broadcast(y.s6, 1); \
+    total_sum.s0 += ((float)(((bits4.s6 & 0x0F00) >>  8) | ((bits2.s6 & 0x30)     )) - 32.f) * scale_s.s0 * scale_d.s0 * shared_y; \
+    total_sum.s1 += ((float)(((bits4.s7 & 0x0F00) >>  8) | ((bits2.s7 & 0x30)     )) - 32.f) * scale_s.s2 * scale_d.s1 * shared_y; \
+    shared_y = sub_group_broadcast(y.s7, 1); \
+    total_sum.s0 += ((float)(((bits4.s6 & 0xF000) >> 12) | ((bits2.s6 & 0xC0) >> 2)) - 32.f) * scale_s.s0 * scale_d.s0 * shared_y; \
+    total_sum.s1 += ((float)(((bits4.s7 & 0xF000) >> 12) | ((bits2.s7 & 0xC0) >> 2)) - 32.f) * scale_s.s2 * scale_d.s1 * shared_y; \
+
+#define dequantize_block_acc_bcast_1_lo(total_sum, bits4, bits2, scale_d, scale_s, y) \
+    shared_y = sub_group_broadcast(y.s0, 2); \
+    total_sum.s0 += ((float)(((bits4.s0 & 0x000F)      ) | ((bits2.s0 & 0x03) << 4)) - 32.f) * scale_s.s1 * scale_d.s0 * shared_y; \
+    total_sum.s1 += ((float)(((bits4.s1 & 0x000F)      ) | ((bits2.s1 & 0x03) << 4)) - 32.f) * scale_s.s3 * scale_d.s1 * shared_y; \
+    shared_y = sub_group_broadcast(y.s1, 2); \
+    total_sum.s0 += ((float)(((bits4.s0 & 0x00F0) >>  4) | ((bits2.s0 & 0x0C) << 2)) - 32.f) * scale_s.s1 * scale_d.s0 * shared_y; \
+    total_sum.s1 += ((float)(((bits4.s1 & 0x00F0) >>  4) | ((bits2.s1 & 0x0C) << 2)) - 32.f) * scale_s.s3 * scale_d.s1 * shared_y; \
+    shared_y = sub_group_broadcast(y.s2, 2); \
+    total_sum.s0 += ((float)(((bits4.s0 & 0x0F00) >>  8) | ((bits2.s0 & 0x30)     )) - 32.f) * scale_s.s1 * scale_d.s0 * shared_y; \
+    total_sum.s1 += ((float)(((bits4.s1 & 0x0F00) >>  8) | ((bits2.s1 & 0x30)     )) - 32.f) * scale_s.s3 * scale_d.s1 * shared_y; \
+    shared_y = sub_group_broadcast(y.s3, 2); \
+    total_sum.s0 += ((float)(((bits4.s0 & 0xF000) >> 12) | ((bits2.s0 & 0xC0) >> 2)) - 32.f) * scale_s.s1 * scale_d.s0 * shared_y; \
+    total_sum.s1 += ((float)(((bits4.s1 & 0xF000) >> 12) | ((bits2.s1 & 0xC0) >> 2)) - 32.f) * scale_s.s3 * scale_d.s1 * shared_y; \
+    shared_y = sub_group_broadcast(y.s4, 2); \
+    total_sum.s0 += ((float)(((bits4.s2 & 0x000F)      ) | ((bits2.s2 & 0x03) << 4)) - 32.f) * scale_s.s1 * scale_d.s0 * shared_y; \
+    total_sum.s1 += ((float)(((bits4.s3 & 0x000F)      ) | ((bits2.s3 & 0x03) << 4)) - 32.f) * scale_s.s3 * scale_d.s1 * shared_y; \
+    shared_y = sub_group_broadcast(y.s5, 2); \
+    total_sum.s0 += ((float)(((bits4.s2 & 0x00F0) >>  4) | ((bits2.s2 & 0x0C) << 2)) - 32.f) * scale_s.s1 * scale_d.s0 * shared_y; \
+    total_sum.s1 += ((float)(((bits4.s3 & 0x00F0) >>  4) | ((bits2.s3 & 0x0C) << 2)) - 32.f) * scale_s.s3 * scale_d.s1 * shared_y; \
+    shared_y = sub_group_broadcast(y.s6, 2); \
+    total_sum.s0 += ((float)(((bits4.s2 & 0x0F00) >>  8) | ((bits2.s2 & 0x30)     )) - 32.f) * scale_s.s1 * scale_d.s0 * shared_y; \
+    total_sum.s1 += ((float)(((bits4.s3 & 0x0F00) >>  8) | ((bits2.s3 & 0x30)     )) - 32.f) * scale_s.s3 * scale_d.s1 * shared_y; \
+    shared_y = sub_group_broadcast(y.s7, 2); \
+    total_sum.s0 += ((float)(((bits4.s2 & 0xF000) >> 12) | ((bits2.s2 & 0xC0) >> 2)) - 32.f) * scale_s.s1 * scale_d.s0 * shared_y; \
+    total_sum.s1 += ((float)(((bits4.s3 & 0xF000) >> 12) | ((bits2.s3 & 0xC0) >> 2)) - 32.f) * scale_s.s3 * scale_d.s1 * shared_y; \
+    shared_y = sub_group_broadcast(y.s0, 3); \
+    total_sum.s0 += ((float)(((bits4.s4 & 0x000F)      ) | ((bits2.s4 & 0x03) << 4)) - 32.f) * scale_s.s1 * scale_d.s0 * shared_y; \
+    total_sum.s1 += ((float)(((bits4.s5 & 0x000F)      ) | ((bits2.s5 & 0x03) << 4)) - 32.f) * scale_s.s3 * scale_d.s1 * shared_y; \
+    shared_y = sub_group_broadcast(y.s1, 3); \
+    total_sum.s0 += ((float)(((bits4.s4 & 0x00F0) >>  4) | ((bits2.s4 & 0x0C) << 2)) - 32.f) * scale_s.s1 * scale_d.s0 * shared_y; \
+    total_sum.s1 += ((float)(((bits4.s5 & 0x00F0) >>  4) | ((bits2.s5 & 0x0C) << 2)) - 32.f) * scale_s.s3 * scale_d.s1 * shared_y; \
+    shared_y = sub_group_broadcast(y.s2, 3); \
+    total_sum.s0 += ((float)(((bits4.s4 & 0x0F00) >>  8) | ((bits2.s4 & 0x30)     )) - 32.f) * scale_s.s1 * scale_d.s0 * shared_y; \
+    total_sum.s1 += ((float)(((bits4.s5 & 0x0F00) >>  8) | ((bits2.s5 & 0x30)     )) - 32.f) * scale_s.s3 * scale_d.s1 * shared_y; \
+    shared_y = sub_group_broadcast(y.s3, 3); \
+    total_sum.s0 += ((float)(((bits4.s4 & 0xF000) >> 12) | ((bits2.s4 & 0xC0) >> 2)) - 32.f) * scale_s.s1 * scale_d.s0 * shared_y; \
+    total_sum.s1 += ((float)(((bits4.s5 & 0xF000) >> 12) | ((bits2.s5 & 0xC0) >> 2)) - 32.f) * scale_s.s3 * scale_d.s1 * shared_y; \
+    shared_y = sub_group_broadcast(y.s4, 3); \
+    total_sum.s0 += ((float)(((bits4.s6 & 0x000F)      ) | ((bits2.s6 & 0x03) << 4)) - 32.f) * scale_s.s1 * scale_d.s0 * shared_y; \
+    total_sum.s1 += ((float)(((bits4.s7 & 0x000F)      ) | ((bits2.s7 & 0x03) << 4)) - 32.f) * scale_s.s3 * scale_d.s1 * shared_y; \
+    shared_y = sub_group_broadcast(y.s5, 3); \
+    total_sum.s0 += ((float)(((bits4.s6 & 0x00F0) >>  4) | ((bits2.s6 & 0x0C) << 2)) - 32.f) * scale_s.s1 * scale_d.s0 * shared_y; \
+    total_sum.s1 += ((float)(((bits4.s7 & 0x00F0) >>  4) | ((bits2.s7 & 0x0C) << 2)) - 32.f) * scale_s.s3 * scale_d.s1 * shared_y; \
+    shared_y = sub_group_broadcast(y.s6, 3); \
+    total_sum.s0 += ((float)(((bits4.s6 & 0x0F00) >>  8) | ((bits2.s6 & 0x30)     )) - 32.f) * scale_s.s1 * scale_d.s0 * shared_y; \
+    total_sum.s1 += ((float)(((bits4.s7 & 0x0F00) >>  8) | ((bits2.s7 & 0x30)     )) - 32.f) * scale_s.s3 * scale_d.s1 * shared_y; \
+    shared_y = sub_group_broadcast(y.s7, 3); \
+    total_sum.s0 += ((float)(((bits4.s6 & 0xF000) >> 12) | ((bits2.s6 & 0xC0) >> 2)) - 32.f) * scale_s.s1 * scale_d.s0 * shared_y; \
+    total_sum.s1 += ((float)(((bits4.s7 & 0xF000) >> 12) | ((bits2.s7 & 0xC0) >> 2)) - 32.f) * scale_s.s3 * scale_d.s1 * shared_y; \
+
+#if defined(ADRENO_GPU)
+REQD_SUBGROUP_SIZE_64
+#endif
+kernel void kernel_gemv_noshuffle_q6_K_f32_o4(
+    read_only image1d_buffer_t src0_ql,
+    read_only image1d_buffer_t src0_qh,
+    global half2 * src0_s,
+    global half2 * src0_d,
+    read_only image1d_buffer_t src1,
+    global float * dst,
+    ulong offsetd,
+    int ne00,
+    int ne01
+) {
+    int grp = get_local_id(1);
+    int gid = get_global_id(0);              // 4-output-quad index
+    ushort slid = get_sub_group_local_id();
+
+    // Map quad index to the two pair-indices the existing 2-output access
+    // pattern uses (consecutive output pairs along ne01).
+    int gid_a = gid * 2;
+    int gid_b = gid * 2 + 1;
+
+    int nb = ne00 / 32;
+
+    uint4   reg_a_l_a, reg_a_l_b;
+    ushort4 reg_a_h_a, reg_a_h_b;
+    half2   reg_d_a,   reg_d_b;
+    char4   reg_s_a,   reg_s_b;
+    float8  reg_b;
+
+    float2 total_sum_a = 0.0f;
+    float2 total_sum_b = 0.0f;
+
+    int line_stride_a = ne01 / 2;
+    int block_stride_a = NSUBGROUPS * ne01;
+
+    for (int k = grp; k < nb; k += NSUBGROUPS) {
+        reg_d_a = src0_d[gid_a + k/8 * line_stride_a];
+        reg_d_b = src0_d[gid_b + k/8 * line_stride_a];
+        reg_s_a = as_char4(src0_s[gid_a + k * line_stride_a]);
+        reg_s_b = as_char4(src0_s[gid_b + k * line_stride_a]);
+
+        if (slid < 4) {
+            reg_b.s0123 = read_imagef(src1, 0 + slid*2 + k*8);
+            reg_b.s4567 = read_imagef(src1, 1 + slid*2 + k*8);
+        }
+
+        // Pair a (output rows gid_a*2, gid_a*2+1): read hi+lo then dequant
+        // both in one block so the `_lo` macro can see the `shared_y` that
+        // `_hi` declared. Pair b follows in its own block — fresh shared_y.
+        {
+            reg_a_l_a.s0 = read_imageui(src0_ql, gid_a + k*block_stride_a + line_stride_a*0).x;
+            reg_a_l_a.s1 = read_imageui(src0_ql, gid_a + k*block_stride_a + line_stride_a*1).x;
+            reg_a_l_a.s2 = read_imageui(src0_ql, gid_a + k*block_stride_a + line_stride_a*2).x;
+            reg_a_l_a.s3 = read_imageui(src0_ql, gid_a + k*block_stride_a + line_stride_a*3).x;
+            reg_a_h_a.s0 = as_ushort(read_imageh(src0_qh, gid_a + k*block_stride_a + line_stride_a*0).x);
+            reg_a_h_a.s1 = as_ushort(read_imageh(src0_qh, gid_a + k*block_stride_a + line_stride_a*1).x);
+            reg_a_h_a.s2 = as_ushort(read_imageh(src0_qh, gid_a + k*block_stride_a + line_stride_a*2).x);
+            reg_a_h_a.s3 = as_ushort(read_imageh(src0_qh, gid_a + k*block_stride_a + line_stride_a*3).x);
+#ifdef VECTOR_SUB_GROUP_BROADCAT
+            dequantize_block_acc_bcast_8_hi(total_sum_a, as_ushort8(reg_a_l_a), as_uchar8(reg_a_h_a), reg_d_a, reg_s_a, reg_b);
+#else
+            dequantize_block_acc_bcast_1_hi(total_sum_a, as_ushort8(reg_a_l_a), as_uchar8(reg_a_h_a), reg_d_a, reg_s_a, reg_b);
+#endif
+
+            reg_a_l_a.s0 = read_imageui(src0_ql, gid_a + k*block_stride_a + line_stride_a*4).x;
+            reg_a_l_a.s1 = read_imageui(src0_ql, gid_a + k*block_stride_a + line_stride_a*5).x;
+            reg_a_l_a.s2 = read_imageui(src0_ql, gid_a + k*block_stride_a + line_stride_a*6).x;
+            reg_a_l_a.s3 = read_imageui(src0_ql, gid_a + k*block_stride_a + line_stride_a*7).x;
+            reg_a_h_a.s0 = as_ushort(read_imageh(src0_qh, gid_a + k*block_stride_a + line_stride_a*4).x);
+            reg_a_h_a.s1 = as_ushort(read_imageh(src0_qh, gid_a + k*block_stride_a + line_stride_a*5).x);
+            reg_a_h_a.s2 = as_ushort(read_imageh(src0_qh, gid_a + k*block_stride_a + line_stride_a*6).x);
+            reg_a_h_a.s3 = as_ushort(read_imageh(src0_qh, gid_a + k*block_stride_a + line_stride_a*7).x);
+#ifdef VECTOR_SUB_GROUP_BROADCAT
+            dequantize_block_acc_bcast_8_lo(total_sum_a, as_ushort8(reg_a_l_a), as_uchar8(reg_a_h_a), reg_d_a, reg_s_a, reg_b);
+#else
+            dequantize_block_acc_bcast_1_lo(total_sum_a, as_ushort8(reg_a_l_a), as_uchar8(reg_a_h_a), reg_d_a, reg_s_a, reg_b);
+#endif
+        }
+
+        {
+            reg_a_l_b.s0 = read_imageui(src0_ql, gid_b + k*block_stride_a + line_stride_a*0).x;
+            reg_a_l_b.s1 = read_imageui(src0_ql, gid_b + k*block_stride_a + line_stride_a*1).x;
+            reg_a_l_b.s2 = read_imageui(src0_ql, gid_b + k*block_stride_a + line_stride_a*2).x;
+            reg_a_l_b.s3 = read_imageui(src0_ql, gid_b + k*block_stride_a + line_stride_a*3).x;
+            reg_a_h_b.s0 = as_ushort(read_imageh(src0_qh, gid_b + k*block_stride_a + line_stride_a*0).x);
+            reg_a_h_b.s1 = as_ushort(read_imageh(src0_qh, gid_b + k*block_stride_a + line_stride_a*1).x);
+            reg_a_h_b.s2 = as_ushort(read_imageh(src0_qh, gid_b + k*block_stride_a + line_stride_a*2).x);
+            reg_a_h_b.s3 = as_ushort(read_imageh(src0_qh, gid_b + k*block_stride_a + line_stride_a*3).x);
+#ifdef VECTOR_SUB_GROUP_BROADCAT
+            dequantize_block_acc_bcast_8_hi(total_sum_b, as_ushort8(reg_a_l_b), as_uchar8(reg_a_h_b), reg_d_b, reg_s_b, reg_b);
+#else
+            dequantize_block_acc_bcast_1_hi(total_sum_b, as_ushort8(reg_a_l_b), as_uchar8(reg_a_h_b), reg_d_b, reg_s_b, reg_b);
+#endif
+
+            reg_a_l_b.s0 = read_imageui(src0_ql, gid_b + k*block_stride_a + line_stride_a*4).x;
+            reg_a_l_b.s1 = read_imageui(src0_ql, gid_b + k*block_stride_a + line_stride_a*5).x;
+            reg_a_l_b.s2 = read_imageui(src0_ql, gid_b + k*block_stride_a + line_stride_a*6).x;
+            reg_a_l_b.s3 = read_imageui(src0_ql, gid_b + k*block_stride_a + line_stride_a*7).x;
+            reg_a_h_b.s0 = as_ushort(read_imageh(src0_qh, gid_b + k*block_stride_a + line_stride_a*4).x);
+            reg_a_h_b.s1 = as_ushort(read_imageh(src0_qh, gid_b + k*block_stride_a + line_stride_a*5).x);
+            reg_a_h_b.s2 = as_ushort(read_imageh(src0_qh, gid_b + k*block_stride_a + line_stride_a*6).x);
+            reg_a_h_b.s3 = as_ushort(read_imageh(src0_qh, gid_b + k*block_stride_a + line_stride_a*7).x);
+#ifdef VECTOR_SUB_GROUP_BROADCAT
+            dequantize_block_acc_bcast_8_lo(total_sum_b, as_ushort8(reg_a_l_b), as_uchar8(reg_a_h_b), reg_d_b, reg_s_b, reg_b);
+#else
+            dequantize_block_acc_bcast_1_lo(total_sum_b, as_ushort8(reg_a_l_b), as_uchar8(reg_a_h_b), reg_d_b, reg_s_b, reg_b);
+#endif
+        }
+    }
+
+    // Cross-subgroup reduce. Same shape as the 2-output kernel but with the
+    // pair-a and pair-b accumulators concatenated into a single float4.
+    local float4 reduce_lm[SUBGROUP_SIZE * 3];
+    float4 acc = (float4)(total_sum_a.s0, total_sum_a.s1, total_sum_b.s0, total_sum_b.s1);
+    if (grp == 1) { reduce_lm[SUBGROUP_SIZE*0 + slid] = acc; }
+    if (grp == 2) { reduce_lm[SUBGROUP_SIZE*1 + slid] = acc; }
+    if (grp == 3) { reduce_lm[SUBGROUP_SIZE*2 + slid] = acc; }
+
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    if (grp == 0) {
+        acc += reduce_lm[SUBGROUP_SIZE*0 + slid];
+        acc += reduce_lm[SUBGROUP_SIZE*1 + slid];
+        acc += reduce_lm[SUBGROUP_SIZE*2 + slid];
+        dst = (global float*)((global char*)dst + offsetd);
+        vstore4(acc, 0, &(dst[gid * 4]));
+    }
+}
