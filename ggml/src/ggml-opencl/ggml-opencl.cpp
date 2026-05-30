@@ -835,6 +835,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemm_noshuffle_q4_k_f32;
     cl_kernel kernel_gemv_noshuffle_q6_K_f32;
     cl_kernel kernel_gemv_noshuffle_q6_K_f32_o4;
+    cl_kernel kernel_gemv_noshuffle_q6_K_f32_o4_global;  // weights via __global (opt-in)
     cl_kernel kernel_gemm_noshuffle_q6_K_f32;
     cl_kernel kernel_gemv_noshuffle_q5_k_f32;
     cl_kernel kernel_gemm_noshuffle_q5_k_f32;
@@ -3688,6 +3689,16 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), CL_gemv_compile_opts);
 
         CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q6_K_f32_o4 = clCreateKernel(prog, "kernel_gemv_noshuffle_q6_K_f32_o4", &err), err));
+        CL_CHECK(clReleaseProgram(prog));
+
+        // Global-read variant: weights read from __global coalesced instead of
+        // image1d_buffer (the texture cache caps the streaming lm_head read at
+        // ~22 GB/s). Opt-in via GGML_OPENCL_Q6K_GEMV_O4_GLOBAL.
+        cl_program prog_g = build_program_from_source(backend_ctx->context, backend_ctx->device,
+            kernel_src.c_str(), CL_gemv_compile_opts + " -DQ6K_O4_GLOBAL");
+        CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q6_K_f32_o4_global =
+            clCreateKernel(prog_g, "kernel_gemv_noshuffle_q6_K_f32_o4_global", &err), err));
+        CL_CHECK(clReleaseProgram(prog_g));
         GGML_LOG_CONT(".");
     }
 
@@ -13518,23 +13529,45 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
         cl_mem b_sub_buffer = nullptr;
         cl_mem b_img = nullptr;
 
-        // image for ql
-        img_fmt.image_channel_order = CL_R;
-        img_fmt.image_channel_data_type = CL_FLOAT;
-        memset(&img_desc, 0, sizeof(img_desc));
-        img_desc.image_type = CL_MEM_OBJECT_IMAGE1D_BUFFER;
-        img_desc.image_width = ne01 * ne00 / 8;
-        img_desc.buffer = extra0_q6_K->ql;
-        CL_CHECK((ql_img = clCreateImage(context, CL_MEM_READ_ONLY, &img_fmt, &img_desc, NULL, &err), err));
+        // o4 = 4-output-per-WI variant for long-vocab lm_head/embed; gated to
+        // ne01 >= 32768 so per-layer q6_K (ne01=hidden 2-8K) keeps the 2-output
+        // kernel (o4 regresses ~16% there). o4_global reads the weights from
+        // __global coalesced instead of image1d_buffer — the texture cache caps
+        // the read-once-per-token lm_head at ~22 GB/s, while __global reaches
+        // ~the 60 GB/s the rest of the model gets (+10% Gemma-4-26B tg, 22.6 ->
+        // ~higher GB/s). Both default ON; opt out via GGML_OPENCL_Q6K_GEMV_O4 /
+        // GGML_OPENCL_Q6K_GEMV_O4_GLOBAL = 0.
+        static const bool gemv_o4_env = []{
+            const char * e = std::getenv("GGML_OPENCL_Q6K_GEMV_O4");
+            return !e || e[0] == '\0' || e[0] != '0';
+        }();
+        static const bool o4_global_env = []{
+            const char * e = std::getenv("GGML_OPENCL_Q6K_GEMV_O4_GLOBAL");
+            return !e || e[0] == '\0' || e[0] != '0';
+        }();
+        const bool use_o4        = gemv_o4_env && (ne01 % 4 == 0) && (ne01 >= 32768);
+        const bool use_o4_global = use_o4 && o4_global_env;
 
-        // image for qh
-        img_fmt.image_channel_order = CL_R;
-        img_fmt.image_channel_data_type = CL_HALF_FLOAT;
-        memset(&img_desc, 0, sizeof(img_desc));
-        img_desc.image_type = CL_MEM_OBJECT_IMAGE1D_BUFFER;
-        img_desc.image_width = ne01 * ne00 / 8;
-        img_desc.buffer = extra0_q6_K->qh;
-        CL_CHECK((qh_img = clCreateImage(context, CL_MEM_READ_ONLY, &img_fmt, &img_desc, NULL, &err), err));
+        // ql/qh image views are only needed when NOT reading weights from global.
+        if (!use_o4_global) {
+            // image for ql
+            img_fmt.image_channel_order = CL_R;
+            img_fmt.image_channel_data_type = CL_FLOAT;
+            memset(&img_desc, 0, sizeof(img_desc));
+            img_desc.image_type = CL_MEM_OBJECT_IMAGE1D_BUFFER;
+            img_desc.image_width = ne01 * ne00 / 8;
+            img_desc.buffer = extra0_q6_K->ql;
+            CL_CHECK((ql_img = clCreateImage(context, CL_MEM_READ_ONLY, &img_fmt, &img_desc, NULL, &err), err));
+
+            // image for qh
+            img_fmt.image_channel_order = CL_R;
+            img_fmt.image_channel_data_type = CL_HALF_FLOAT;
+            memset(&img_desc, 0, sizeof(img_desc));
+            img_desc.image_type = CL_MEM_OBJECT_IMAGE1D_BUFFER;
+            img_desc.image_width = ne01 * ne00 / 8;
+            img_desc.buffer = extra0_q6_K->qh;
+            CL_CHECK((qh_img = clCreateImage(context, CL_MEM_READ_ONLY, &img_fmt, &img_desc, NULL, &err), err));
+        }
 
         region.origin = offset1;
         region.size = ne00 * ne1 * sizeof(float);
@@ -13548,27 +13581,17 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
         img_desc.buffer = b_sub_buffer;
         CL_CHECK((b_img = clCreateImage(context, CL_MEM_READ_ONLY, &img_fmt, &img_desc, NULL, &err), err));
 
-        // 4-output-per-WI variant — opt-in. Wins big on the huge lm_head /
-        // embedding GEMVs (long-vocab models: +37% tg on Llama-3.2-3B Q4_K_M,
-        // +13% tg on Qwen3.5-4B-MTP) by sharing one activation read across
-        // 4 output rows. Loses ~16% on small q6_K matmuls (per-layer FFN/attn
-        // at hidden=4096) where halving the WG count drops below the device's
-        // saturating concurrent-WG threshold. ne01 >= 32768 keeps the gate on
-        // lm_head / embed shapes — vocab sits in [50K, 200K] range there for
-        // every model that benefits, while per-layer q6_K matmuls have
-        // ne01 = hidden = 2-8K.
-        // Requires ne01 % 4 == 0 for the halved grid to cover exactly.
-        static const bool gemv_o4_env = []{
-            const char * e = std::getenv("GGML_OPENCL_Q6K_GEMV_O4");
-            return !e || e[0] == '\0' || e[0] != '0'; // default ON
-        }();
-        const bool use_o4 = gemv_o4_env && (ne01 % 4 == 0) && (ne01 >= 32768);
+        kernel = use_o4_global ? backend_ctx->kernel_gemv_noshuffle_q6_K_f32_o4_global
+               : use_o4        ? backend_ctx->kernel_gemv_noshuffle_q6_K_f32_o4
+                               : backend_ctx->kernel_gemv_noshuffle_q6_K_f32;
 
-        kernel = use_o4 ? backend_ctx->kernel_gemv_noshuffle_q6_K_f32_o4
-                        : backend_ctx->kernel_gemv_noshuffle_q6_K_f32;
-
-        CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),   &ql_img));
-        CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem),   &qh_img));
+        if (use_o4_global) {
+            CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &extra0_q6_K->ql));
+            CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &extra0_q6_K->qh));
+        } else {
+            CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &ql_img));
+            CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &qh_img));
+        }
         CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem),   &extra0_q6_K->s));
         CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_mem),   &extra0_q6_K->d));
         CL_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_mem),   &b_img));
@@ -13585,8 +13608,8 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
 
         backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
 
-        CL_CHECK(clReleaseMemObject(ql_img));
-        CL_CHECK(clReleaseMemObject(qh_img));
+        if (ql_img) CL_CHECK(clReleaseMemObject(ql_img));
+        if (qh_img) CL_CHECK(clReleaseMemObject(qh_img));
         CL_CHECK(clReleaseMemObject(b_sub_buffer));
         CL_CHECK(clReleaseMemObject(b_img));
     } else {
