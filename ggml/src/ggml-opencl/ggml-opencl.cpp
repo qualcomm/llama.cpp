@@ -5259,14 +5259,19 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                 // The generic mul_mv (GEMV) kernels CORRUPT large-batch prefill
                 // (N=src1->ne[1] >= 512) on Adreno. Quant mul_mats only avoid the
                 // GEMV when they hit the Adreno trans-weight GEMM, which requires
-                // use_adreno_kernels(weight) (and a GEMM kernel for the type).
-                // Q5_K/Q5_0/Q5_1 have NO GEMM kernel at all -> always GEMV. Reject
-                // any large-N quant mul_mat that would fall to the buggy GEMV.
+                // a GEMM kernel for the type AND use_adreno_kernels(weight) (weight
+                // dims >= 512). Q5_K DOES have a trans-weight GEMM (PR #21595) and
+                // is correct at large N (720-token-prompt greedy generation matches
+                // the CPU reference, modulo expected FP drift in the tail); it only
+                // takes the buggy GEMV for small/odd-shaped projections that fail
+                // use_adreno_kernels. Reject any large-N quant mul_mat that would
+                // fall to the buggy GEMV.
                 {
                     const ggml_type t = op->src[0]->type;
                     const bool type_has_gemm = (t == GGML_TYPE_Q4_0 || t == GGML_TYPE_Q4_1 ||
                                                 t == GGML_TYPE_IQ4_NL || t == GGML_TYPE_Q8_0 ||
-                                                t == GGML_TYPE_Q4_K  || t == GGML_TYPE_Q6_K);
+                                                t == GGML_TYPE_Q4_K  || t == GGML_TYPE_Q5_K  ||
+                                                t == GGML_TYPE_Q6_K);
                     const bool uses_gemm = type_has_gemm && use_adreno_kernels(backend_ctx, op->src[0]);
                     if (!uses_gemm && op->src[1]->ne[1] >= 512) {
                         return false;
