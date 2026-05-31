@@ -3308,8 +3308,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         GGML_LOG_CONT(".");
     }
 
-    // gemv_noshuffle_q4_k_f32_tiled — tiled-wide canonical layout, opt-in via
-    // GGML_OPENCL_Q4K_GEMV_TILED=1 (separate convert + GEMV; weights via __global).
+    // gemv_noshuffle_q4_k_f32_tiled — tiled-wide canonical layout, default ON
+    // (opt out: GGML_OPENCL_Q4K_GEMV_TILED=0; separate convert + GEMV; weights via __global).
     {
 #ifdef GGML_OPENCL_EMBED_KERNELS
         const std::string kernel_src {
@@ -3727,8 +3727,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         GGML_LOG_CONT(".");
     }
 
-    // gemv_noshuffle_q6_k_f32_tiled — tiled-wide canonical layout, opt-in via
-    // GGML_OPENCL_Q6K_GEMV_TILED=1 (separate convert + GEMV; weights via __global).
+    // gemv_noshuffle_q6_k_f32_tiled — tiled-wide canonical layout, default ON
+    // (opt out: GGML_OPENCL_Q6K_GEMV_TILED=0; separate convert + GEMV; weights via __global).
     {
 #ifdef GGML_OPENCL_EMBED_KERNELS
         const std::string kernel_src {
@@ -5139,12 +5139,13 @@ inline bool use_adreno_moe_kernels(const ggml_backend_opencl_context *backend_ct
     return (((strstr(tensor->name, "ffn") != NULL) && (strstr(tensor->name, "exps") != NULL)) || (strstr(tensor->name, "as") != NULL)) && (ne01 % 32 == 0);
 }
 
-// Opt-in tiled-wide q6_K GEMV (default OFF). Both the convert (set_tensor) and
-// the GEMV dispatch must agree on this so the buffer layout matches the kernel.
+// Tiled-wide q6_K GEMV (default ON; opt out via GGML_OPENCL_Q6K_GEMV_TILED=0).
+// Both the convert (set_tensor) and the GEMV dispatch must agree on this so the
+// buffer layout matches the kernel.
 inline bool q6k_gemv_tiled_enabled() {
     static const bool en = []{
         const char * e = std::getenv("GGML_OPENCL_Q6K_GEMV_TILED");
-        return e && e[0] != '\0' && e[0] != '0';
+        return !e || e[0] == '\0' || e[0] != '0';
     }();
     return en;
 }
@@ -5156,11 +5157,12 @@ inline bool use_q6k_tiled(const ggml_tensor *tensor) {
            tensor->ne[1] >= 32768 && tensor->ne[1] % 64 == 0;
 }
 
-// q4_K analog of the tiled-wide lm_head/embed GEMV (default OFF). Same gate.
+// q4_K analog of the tiled-wide lm_head/embed GEMV (default ON; opt out via
+// GGML_OPENCL_Q4K_GEMV_TILED=0). Same gate.
 inline bool q4k_gemv_tiled_enabled() {
     static const bool en = []{
         const char * e = std::getenv("GGML_OPENCL_Q4K_GEMV_TILED");
-        return e && e[0] != '\0' && e[0] != '0';
+        return !e || e[0] == '\0' || e[0] != '0';
     }();
     return en;
 }
