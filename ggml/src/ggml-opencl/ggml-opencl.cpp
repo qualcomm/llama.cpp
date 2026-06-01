@@ -7314,6 +7314,16 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                 }
                 return op->src[1]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]);
             } else if (op->src[0]->type == GGML_TYPE_Q8_0) {
+                // ggml_cl_mul_mat_q8_0_f32_adreno asserts src1->view_offs==0, so it
+                // cannot be the per-slice target of the broadcast-matmul iteration
+                // (which advances src1/dst view_offs to address each batch). All other
+                // quant Adreno GEMMs honor view_offs; q8_0 alone does not. Reject a
+                // broadcast q8_0 matmul (src1 batch > src0 batch) -> CPU, otherwise the
+                // assert fires (e.g. Qwen3.5-9B-UD / Qwen3.6-35B q8_0 GDN ssm_out).
+                if (op->src[1]->ne[2] > op->src[0]->ne[2] ||
+                    op->src[1]->ne[3] > op->src[0]->ne[3]) {
+                    return false;
+                }
                 return op->src[1]->type == GGML_TYPE_F32;
             }
             return false;
