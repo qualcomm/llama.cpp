@@ -7431,16 +7431,22 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                         return false;
                     }
 
-                    // The Q6_K Adreno trans-weight GEMM (kernel_gemm_noshuffle_q6_K_f32)
-                    // CORRUPTS batched output for the very-large-m lm_head/embed weight
-                    // (ne01 = vocab, ~250K): it writes the final token column correctly
-                    // but garbles the intermediate columns. This breaks batched scoring
-                    // (perplexity / speculative-decode verify) on the large-vocab hybrid
-                    // + Gemma models while leaving normal generation (final-column only)
-                    // correct. Per-layer Q6_K matmuls (small m) are fine. Until the kernel
-                    // is fixed, route the batched large-vocab Q6_K lm_head/embed matmul to
-                    // CPU. Decode (ne1==1 GEMV) is unaffected and stays on GPU.
-                    if (t == GGML_TYPE_Q6_K && op->src[1]->ne[1] >= 512 &&
+                    // The Q6_K Adreno trans-weight GEMM (kernel_gemm_noshuffle_q6_K_f32,
+                    // ne1>1) data-dependently MISCOMPUTES the batched large-vocab
+                    // lm_head/embed output (ne01 = vocab, ~250K): on real trained weights
+                    // it emits logits that are entirely UNCORRELATED with the reference
+                    // (corr~0) at every token position, while op-tests with random data of
+                    // the identical shape pass (NMSE OK). Inputs were verified correct:
+                    // the noshuffle convert is fine (decode via the same buffers is
+                    // coherent), the activation and its transpose are correct, offsets and
+                    // addressing are in-range. The miscompute is therefore inside the GEMM
+                    // kernel and is value-dependent; root cause unresolved. It breaks
+                    // batched scoring (perplexity, speculative-decode verify, batched
+                    // serving) for ANY batch n>1 (not just n>=512), while normal generation
+                    // (ne1==1 GEMV path, different kernel) stays correct. Per-layer Q6_K
+                    // matmuls (small m) are unaffected. Route the batched large-vocab Q6_K
+                    // lm_head/embed matmul to CPU; decode (ne1==1) stays on GPU.
+                    if (t == GGML_TYPE_Q6_K && op->src[1]->ne[1] > 1 &&
                         op->src[0]->ne[1] >= 32768) {
                         return false;
                     }
