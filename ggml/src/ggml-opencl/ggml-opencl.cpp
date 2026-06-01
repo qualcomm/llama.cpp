@@ -6073,6 +6073,20 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                     if (!uses_gemm && op->src[1]->ne[1] >= 512) {
                         return false;
                     }
+
+                    // The Q6_K Adreno trans-weight GEMM (kernel_gemm_noshuffle_q6_K_f32)
+                    // CORRUPTS batched output for the very-large-m lm_head/embed weight
+                    // (ne01 = vocab, ~250K): it writes the final token column correctly
+                    // but garbles the intermediate columns. This breaks batched scoring
+                    // (perplexity / speculative-decode verify) on the large-vocab hybrid
+                    // + Gemma models while leaving normal generation (final-column only)
+                    // correct. Per-layer Q6_K matmuls (small m) are fine. Until the kernel
+                    // is fixed, route the batched large-vocab Q6_K lm_head/embed matmul to
+                    // CPU. Decode (ne1==1 GEMV) is unaffected and stays on GPU.
+                    if (t == GGML_TYPE_Q6_K && op->src[1]->ne[1] >= 512 &&
+                        op->src[0]->ne[1] >= 32768) {
+                        return false;
+                    }
                 }
                 return op->src[1]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]);
             } else if (op->src[0]->type == GGML_TYPE_Q8_0) {
