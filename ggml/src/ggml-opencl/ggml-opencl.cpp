@@ -16162,7 +16162,19 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
     cl_kernel kernel;
 
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
-    if(src0t == GGML_TYPE_F16 && src1t == GGML_TYPE_F32){
+    // The mul_mm_f16_f32_kq / _kqv attention kernels MISCOMPUTE the batched
+    // prefill attention: they produce correct results only for the final query
+    // position and garble all intermediate positions. Generation stays coherent
+    // (it consumes the final position), but perplexity, speculative-decode verify
+    // and any batched/multi-position scoring are wrong. Verified on Gemma-3-4b
+    // (head_dim 256, fa=0 PPL ~3.2e4 vs ~14.2 CPU) AND Llama-3.2-3B (head_dim 128,
+    // PPL ~2.6e3 vs ~8.4); routing both KQ and KQV to the generic mul_mm/mul_mv
+    // path below restores correctness on every model. The kernel is also NOT a
+    // perf win: pp512 is within noise (-1% Llama / -0.6% Gemma) and pp4096 is
+    // ~8% FASTER without it (the generic path scales better at long context).
+    // Disabled by default; opt in with GGML_OPENCL_KQKV_KERNEL=1 only to debug/
+    // benchmark the (incorrect) kernel.
+    if(src0t == GGML_TYPE_F16 && src1t == GGML_TYPE_F32 && getenv("GGML_OPENCL_KQKV_KERNEL") != nullptr){
         if (ne01 >= 64 && ne1 >= 32 && ne00 >= 16 && (ne12 % ne02) == 0  &&
             // dst is wrapped with image1d_buffer, the size limit applies, also src0
             (ne0 * ne1 * dst->ne[2] * dst->nb[0] / 4 <= backend_ctx->image_max_buffer_size)) {
