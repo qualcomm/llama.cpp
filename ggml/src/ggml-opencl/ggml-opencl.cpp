@@ -13826,9 +13826,12 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
             CL_CHECK(clSetKernelArg(kt, 8, sizeof(int),      &ne01));
             CL_CHECK(clSetKernelArg(kt, 9, sizeof(int),      &ne1));
 
-            const int BN_T = 8; // must match BN in gemm_noshuffle_q6_k_f32_tiled.cl
+            // Must match the kernel: NTILES=4 64-row tiles per work-group (256 rows),
+            // BN=8 output columns per work-group.
+            const int BN_T  = 16;
+            const int WROWS = 4 * 64; // NTILES * TILE_ROWS
             size_t local_work_size[3]  = {64, 4, 1};
-            size_t global_work_size[3] = {(size_t)CEIL_DIV(ne01, 64) * 64, 4, (size_t)CEIL_DIV(ne1, BN_T)};
+            size_t global_work_size[3] = {(size_t)CEIL_DIV(ne01, WROWS) * 64, 4, (size_t)CEIL_DIV(ne1, BN_T)};
             backend_ctx->enqueue_ndrange_kernel(kt, 3, global_work_size, local_work_size, dst);
 
             CL_CHECK(clReleaseMemObject(b_img_t));
