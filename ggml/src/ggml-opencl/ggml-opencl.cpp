@@ -20136,19 +20136,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                 size_t local_size[3] = {64, 2, 1};
                 size_t global_size[3] = {64, 2, 1};
 
-                // Extend the gemv path to small ne12 (multi-token
-                // routed MoE GEMM). The existing gemv kernel already supports
-                // multi-token via (i11 = i20 % ne11) when src1 image covers
-                // ne10*ne12 floats and src2 covers ne20*ne12 ints. Just need
-                // to widen the gate and pass ne12 (token count) as the
-                // "ne11" arg + scale global_size[2] by ne12. Default cap = 1
-                // (preserves old behaviour); override via env for spec
-                // verify batches (typical 2..17). At cap=N, dispatcher uses
-                // gemv for ne12 ≤ N and falls back to gemm for ne12 > N.
-                static const char * moe_gemv_env = getenv("GGML_OPENCL_MOE_GEMV_NQ");
-                static const int N_MOE_GEMV_NQ_MAX = (moe_gemv_env != NULL && moe_gemv_env[0] != '\0')
-                                                       ? atoi(moe_gemv_env) : 1;
-                if (ne12 >= 1 && ne12 <= N_MOE_GEMV_NQ_MAX) {
+                if (ne12 == 1) { // for gemv
                     kernel = backend_ctx->kernel_gemv_moe_q4_0_f32_ns;
 
                     cl_mem src1_sub_buffer, buf_src1_image, buf_src2;
@@ -20160,12 +20148,10 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     buf_src2 = clCreateSubBuffer(extra2->data_device, 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &status);
                     CL_CHECK(status);
 
-                    // set thread grid. global_size[2] covers all (token, expert)
-                    // assignments. ne12==1 -> ne20 (single-token baseline). ne12>1
-                    // -> ne20*ne12 since src2 router is [n_used][n_tokens].
-                    global_size[0] = static_cast<size_t>(ne01);
+                    // set thread grid
+                    global_size[0] = static_cast<size_t>(((ne01 + 63) / 64) * 64);
                     global_size[1] = 4;
-                    global_size[2] = static_cast<size_t>(ne20 * ne12);
+                    global_size[2] = static_cast<size_t>(ne20);
                     local_size[1] = 4;
 
                     // create a sub_buffer for src1 (covers all ne12 tokens)
@@ -20180,14 +20166,6 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     buf_src1_image = clCreateImage(backend_ctx->context, CL_MEM_READ_ONLY, &image_format_buf_src1, &image_desc_buf_src1, NULL, &status);
                     CL_CHECK(status);
 
-                    // Pass ne20 (n_expert_used) as the kernel's "n_used" arg.
-                    // With src2 laid out [n_tokens][n_used] (token outer, slot
-                    // inner), i20 = token*n_used + slot and the kernel
-                    // recovers token = i20 / n_used. At ne12==1 this gives
-                    // token=0 for i20 ∈ [0, ne20) — identical to old path
-                    // where the arg meant ne11=1 and i11=i20%1=0.
-                    const int kernel_n_used = ne20;
-
                     // Set kernel args
                     int arg_idx = 0;
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),    &extra0_q4_0->q));
@@ -20198,7 +20176,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_ulong),  &offsetd));
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ne00));
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ne01));
-                    CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &kernel_n_used));
+                    CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ne11));
 
                     // launch kernel
                     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_size, local_size, dst);
