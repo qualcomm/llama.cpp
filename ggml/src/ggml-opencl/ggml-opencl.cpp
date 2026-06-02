@@ -839,6 +839,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemv_noshuffle_q6_K_f32_o4;
     cl_kernel kernel_gemv_noshuffle_q6_K_f32_o4_global;  // weights via __global (opt-in)
     cl_kernel kernel_gemv_noshuffle_q6_K_f32_tiled;      // tiled-wide layout (opt-in)
+    cl_kernel kernel_gemm_noshuffle_q6_K_f32_tiled;      // batched (N>1) over the tiled layout
     cl_kernel kernel_convert_block_q6_k_tiled_ns;        // tiled-wide convert (opt-in)
     cl_kernel kernel_gemm_noshuffle_q6_K_f32;
     cl_kernel kernel_gemv_noshuffle_q5_k_f32;
@@ -3746,6 +3747,25 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         GGML_LOG_CONT(".");
     }
 
+    // gemm_noshuffle_q6_k_f32_tiled — batched (N>1) GEMM over the same tiled-wide
+    // canonical layout, so batched lm_head/embed stays correct + on GPU.
+    {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src {
+            #include "gemm_noshuffle_q6_k_f32_tiled.cl.h"
+        };
+#else
+        const std::string kernel_src = read_file("gemm_noshuffle_q6_k_f32_tiled.cl");
+#endif
+        std::string compile_opts = std::string("-cl-std=") + opencl_c_std + " -cl-mad-enable ";
+        cl_program prog =
+            build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
+        CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q6_K_f32_tiled =
+            clCreateKernel(prog, "kernel_gemm_noshuffle_q6_K_f32_tiled", &err), err));
+        CL_CHECK(clReleaseProgram(prog));
+        GGML_LOG_CONT(".");
+    }
+
     // gemm_noshuffle_q6_k_f32
     {
 #ifdef GGML_OPENCL_EMBED_KERNELS
@@ -5411,25 +5431,16 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                         return false;
                     }
 
-                    // The Q6_K Adreno trans-weight GEMM (kernel_gemm_noshuffle_q6_K_f32,
-                    // ne1>1) data-dependently MISCOMPUTES the batched large-vocab
-                    // lm_head/embed output (ne01 = vocab, ~250K): on real trained weights
-                    // it emits logits that are entirely UNCORRELATED with the reference
-                    // (corr~0) at every token position, while op-tests with random data of
-                    // the identical shape pass (NMSE OK). Inputs were verified correct:
-                    // the noshuffle convert is fine (decode via the same buffers is
-                    // coherent), the activation and its transpose are correct, offsets and
-                    // addressing are in-range. The miscompute is therefore inside the GEMM
-                    // kernel and is value-dependent; root cause unresolved. It breaks
-                    // batched scoring (perplexity, speculative-decode verify, batched
-                    // serving) for ANY batch n>1 (not just n>=512), while normal generation
-                    // (ne1==1 GEMV path, different kernel) stays correct. Per-layer Q6_K
-                    // matmuls (small m) are unaffected. Route the batched large-vocab Q6_K
-                    // lm_head/embed matmul to CPU; decode (ne1==1) stays on GPU.
-                    if (t == GGML_TYPE_Q6_K && op->src[1]->ne[1] > 1 &&
-                        op->src[0]->ne[1] >= 32768) {
-                        return false;
-                    }
+                    // Batched large-vocab Q6_K lm_head/embed (ne1>1) now runs correctly on
+                    // GPU. The historical garbage was a weight-LAYOUT mismatch (not a
+                    // data-dependent/compiler bug): the default q6k-tiled convert stores the
+                    // weight in the 64-row-tiled canonical layout, but the batched path used
+                    // kernel_gemm_noshuffle_q6_K_f32 which reads the plain M-transposed
+                    // layout. Fixed by dispatching the tiled weight to
+                    // kernel_gemm_noshuffle_q6_K_f32_tiled (matches the decode tiled GEMV
+                    // layout); the plain noshuffle GEMM still handles the non-tiled convert
+                    // (GGML_OPENCL_Q6K_GEMV_TILED=0). Verified Llama-3.2-1B-Q4_K_M GPU PPL
+                    // == CPU in both convert modes. No CPU fallback needed.
                 }
                 return op->src[1]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]);
             } else if (op->src[0]->type == GGML_TYPE_Q8_0) {
@@ -13782,6 +13793,49 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
         CL_CHECK(clReleaseMemObject(b_sub_buffer));
         CL_CHECK(clReleaseMemObject(b_img));
     } else {
+        // Tiled-layout batched GEMM. When the weight was converted to the 64-row
+        // tiled canonical layout (use_q6k_tiled — the default for lm_head/embed),
+        // the plain noshuffle GEMM below reads it as plain-transposed and produces
+        // garbage. Use the batched GEMM that matches the decode tiled GEMV's
+        // layout; it reads the f32 activation directly (column-major, no transpose).
+        if (use_q6k_tiled(src0)) {
+            cl_mem b_sub_buf_t = nullptr;
+            cl_mem b_img_t     = nullptr;
+
+            region.origin = offset1;
+            region.size = ne00 * ne1 * sizeof(float);
+            CL_CHECK((b_sub_buf_t = clCreateSubBuffer(extra1->data_device, 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &err), err));
+
+            img_fmt.image_channel_order = CL_RGBA;
+            img_fmt.image_channel_data_type = CL_FLOAT;
+            memset(&img_desc, 0, sizeof(img_desc));
+            img_desc.image_type = CL_MEM_OBJECT_IMAGE1D_BUFFER;
+            img_desc.image_width = ne00 * ne1 / 4;
+            img_desc.buffer = b_sub_buf_t;
+            CL_CHECK((b_img_t = clCreateImage(context, CL_MEM_READ_ONLY, &img_fmt, &img_desc, NULL, &err), err));
+
+            cl_kernel kt = backend_ctx->kernel_gemm_noshuffle_q6_K_f32_tiled;
+            CL_CHECK(clSetKernelArg(kt, 0, sizeof(cl_mem),   &extra0_q6_K->ql));
+            CL_CHECK(clSetKernelArg(kt, 1, sizeof(cl_mem),   &extra0_q6_K->qh));
+            CL_CHECK(clSetKernelArg(kt, 2, sizeof(cl_mem),   &extra0_q6_K->s));
+            CL_CHECK(clSetKernelArg(kt, 3, sizeof(cl_mem),   &extra0_q6_K->d));
+            CL_CHECK(clSetKernelArg(kt, 4, sizeof(cl_mem),   &b_img_t));
+            CL_CHECK(clSetKernelArg(kt, 5, sizeof(cl_mem),   &extrad->data_device));
+            CL_CHECK(clSetKernelArg(kt, 6, sizeof(cl_ulong), &offsetd));
+            CL_CHECK(clSetKernelArg(kt, 7, sizeof(int),      &ne00));
+            CL_CHECK(clSetKernelArg(kt, 8, sizeof(int),      &ne01));
+            CL_CHECK(clSetKernelArg(kt, 9, sizeof(int),      &ne1));
+
+            const int BN_T = 8; // must match BN in gemm_noshuffle_q6_k_f32_tiled.cl
+            size_t local_work_size[3]  = {64, 4, 1};
+            size_t global_work_size[3] = {(size_t)CEIL_DIV(ne01, 64) * 64, 4, (size_t)CEIL_DIV(ne1, BN_T)};
+            backend_ctx->enqueue_ndrange_kernel(kt, 3, global_work_size, local_work_size, dst);
+
+            CL_CHECK(clReleaseMemObject(b_img_t));
+            CL_CHECK(clReleaseMemObject(b_sub_buf_t));
+            return;
+        }
+
         cl_mem b_sub_buf;
         cl_mem b_buf_trans;
         cl_mem b_img;
