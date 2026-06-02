@@ -932,6 +932,9 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemv_noshuffle_q4_k_f32_tiled;  // tiled-wide layout (opt-in)
     cl_kernel kernel_convert_block_q4_k_tiled_ns;    // tiled-wide convert (opt-in)
     cl_kernel kernel_gemm_noshuffle_q4_k_f32;
+    cl_kernel kernel_gemm_noshuffle_q4_k_f32_r1;
+    cl_kernel kernel_gemm_noshuffle_q4_k_f32_kimg;
+    cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok;
     cl_kernel kernel_gemv_noshuffle_q6_K_f32;
     cl_kernel kernel_gemv_noshuffle_q6_K_f32_o4;
     cl_kernel kernel_gemv_noshuffle_q6_K_f32_o4_global;  // weights via __global (opt-in)
@@ -939,6 +942,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemm_noshuffle_q6_K_f32_tiled;      // batched (N>1) over the tiled layout
     cl_kernel kernel_convert_block_q6_k_tiled_ns;        // tiled-wide convert (opt-in)
     cl_kernel kernel_gemm_noshuffle_q6_K_f32;
+    cl_kernel kernel_gemm_noshuffle_q6_K_f32_cok;
     cl_kernel kernel_gemv_noshuffle_q5_k_f32;
     cl_kernel kernel_gemm_noshuffle_q5_k_f32;
     cl_kernel kernel_gemv_noshuffle_q5_0_f32;
@@ -3457,6 +3461,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog = build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_k_f32 = clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_f32", &err), err));
+        CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_k_f32_r1 = clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_f32_r1", &err), err));
+        CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_k_f32_kimg = clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_f32_kimg", &err), err));
+        CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok = clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_f32_cok", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
@@ -4048,6 +4055,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), CL_moe_compile_opts);
 
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q6_K_f32 = clCreateKernel(prog, "kernel_gemm_noshuffle_q6_K_f32", &err), err));
+        CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q6_K_f32_cok = clCreateKernel(prog, "kernel_gemm_noshuffle_q6_K_f32_cok", &err), err));
         GGML_LOG_CONT(".");
     }
 
@@ -15776,10 +15784,46 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
         backend_ctx->enqueue_ndrange_kernel(kernel, 2, global_work_size_t, local_work_size_t, dst);
 
         // gemm
-        kernel = backend_ctx->kernel_gemm_noshuffle_q4_k_f32;
+        // Small-batch (medium n_q) occupancy fix: at ne1<=8 the 2x8 grid is
+        // (1, ceil(M/2)) -> ~M/256 workgroups, which under-occupies the SP and
+        // makes the GEMM ~2.75x slower than the ne1==1 GEMV at the same weight
+        // traffic. The _r1 (1-row) kernel doubles the M-axis workgroup count
+        // and removes the accumulator spill. Opt-in via env while validating.
+        static const bool q4k_gemm_r1   = (getenv("GGML_OPENCL_Q4K_GEMM_R1")   != nullptr);
+        static const bool q4k_gemm_kimg = (getenv("GGML_OPENCL_Q4K_GEMM_KIMG") != nullptr);
+        // Cooperative-K (intra-WG K-split + reduction) for the small-batch
+        // (n_q in [2..8]) path: DEFAULT ON, opt out with GGML_OPENCL_Q4K_GEMM_COK=0.
+        // Validated +30% (Qwen3.5-4B-MTP) / +59% (Qwen3-4B) at ne1<=8, byte-
+        // identical greedy, large-batch (ne1>8) untouched. See memory
+        // opencl_q4k_gemm_medium_batch_2026_06_02.
+        static const char * q4k_cok_env = getenv("GGML_OPENCL_Q4K_GEMM_COK");
+        static const bool q4k_gemm_cok  = (q4k_cok_env == nullptr) || (atoi(q4k_cok_env) != 0);
+        const bool use_cok  = q4k_gemm_cok && (ne1 <= 8);
+        const bool use_r1   = !use_cok && q4k_gemm_r1 && (ne1 <= 8);
+        // Weights-as-image (L1/TPL1) for the small-batch weight-read-bound path.
+        const bool use_kimg = !use_cok && !use_r1 && q4k_gemm_kimg && (ne1 <= 8);
+
+        cl_mem q_img = nullptr;
+        if (use_kimg) {
+            img_fmt = { CL_R, CL_UNSIGNED_INT32 };
+            memset(&img_desc, 0, sizeof(img_desc));
+            img_desc.image_type = CL_MEM_OBJECT_IMAGE1D_BUFFER;
+            img_desc.image_width = M * K / 2 / 4;
+            img_desc.buffer = extra0_q4_k->q;
+            CL_CHECK((q_img = clCreateImage(context, CL_MEM_READ_ONLY, &img_fmt, &img_desc, NULL, &err), err));
+        }
+
+        kernel = use_cok  ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok
+               : use_r1   ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_r1
+               : use_kimg ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_kimg
+                          : backend_ctx->kernel_gemm_noshuffle_q4_k_f32;
         int padded_N = N + padding;
 
-        CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),   &extra0_q4_k->q));
+        if (use_kimg) {
+            CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &q_img));
+        } else {
+            CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &extra0_q4_k->q));
+        }
         CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem),   &extra0_q4_k->s));
         CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem),   &extra0_q4_k->d));
         CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_mem),   &extra0_q4_k->dm));
@@ -15794,10 +15838,45 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
         CL_CHECK(clSetKernelArg(kernel, 12, sizeof(cl_uchar), &mask_d4));
         CL_CHECK(clSetKernelArg(kernel, 13, sizeof(cl_uchar), &mask_hi2));
 
-        size_t global_work_size[3] = {(size_t)CEIL_DIV(ne1, 8), (size_t)CEIL_DIV(ne01, 4), 1};
-        size_t local_work_size[3] = {1, 128, 1};
+        size_t global_work_size[3];
+        size_t local_work_size[3];
+        if (use_cok) {
+            // (COK_SG lanes x COK_NSG subgroups): one row per lane, K split
+            // across the COK_NSG subgroups. ne01 is a multiple of 64.
+            global_work_size[0] = (size_t)ne01;   // rows
+            global_work_size[1] = 8;              // COK_NSG
+            global_work_size[2] = 1;
+            local_work_size[0] = 64;              // COK_SG
+            local_work_size[1] = 8;               // COK_NSG
+            local_work_size[2] = 1;
+        } else if (use_r1) {
+            // 1 row per WI (opt-in occupancy experiment).
+            global_work_size[0] = (size_t)CEIL_DIV(ne1, 8);
+            global_work_size[1] = (size_t)ne01;
+            global_work_size[2] = 1;
+            local_work_size[0] = 1;
+            local_work_size[1] = 128;
+            local_work_size[2] = 1;
+        } else if (use_kimg) {
+            // kimg is a 2-row tile (opt-in weights-as-image experiment).
+            global_work_size[0] = (size_t)CEIL_DIV(ne1, 8);
+            global_work_size[1] = (size_t)CEIL_DIV(ne01, 2);
+            global_work_size[2] = 1;
+            local_work_size[0] = 1;
+            local_work_size[1] = 128;
+            local_work_size[2] = 1;
+        } else {
+            // Default: x2-unified base kernel is the 4-row (gx<<2) tile.
+            global_work_size[0] = (size_t)CEIL_DIV(ne1, 8);
+            global_work_size[1] = (size_t)CEIL_DIV(ne01, 4);
+            global_work_size[2] = 1;
+            local_work_size[0] = 1;
+            local_work_size[1] = 128;
+            local_work_size[2] = 1;
+        }
 
         backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+        if (q_img) CL_CHECK(clReleaseMemObject(q_img));
         CL_CHECK(clReleaseMemObject(b_sub_buf));
         CL_CHECK(clReleaseMemObject(b_sub_buf_trans));
         CL_CHECK(clReleaseMemObject(b_img));
@@ -16046,7 +16125,19 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
         backend_ctx->enqueue_ndrange_kernel(kernel, 2, global_size_t, local_size_t, dst);
 
         // gemm
-        kernel = backend_ctx->kernel_gemm_noshuffle_q6_K_f32;
+        // Cooperative-K small-batch (n_q in [2..8]) path: intra-WG K-split,
+        // mirrors the q4_K _cok win. +30% on pp2..8 (batched serving). OPT-IN
+        // (GGML_OPENCL_Q6K_GEMM_COK=1), DEFAULT OFF: q6_K is the tied lm_head/
+        // output projection, so the K-reassociation perturbs final logits and
+        // greedy is NOT byte-identical (op-tests pass, output coherent, but not
+        // bit-exact). It is also NEUTRAL on end-to-end MTP (q4_K cok already
+        // captured that; the MTP bottleneck moved off the GEMMs). Keep opt-in
+        // for batched serving until PPL-validated on a non-GDN q6_K model.
+        static const char * q6k_cok_env = getenv("GGML_OPENCL_Q6K_GEMM_COK");
+        static const bool q6k_gemm_cok  = (q6k_cok_env != nullptr) && (atoi(q6k_cok_env) != 0);
+        const bool use_q6k_cok = q6k_gemm_cok && (ne1 <= 8);
+        kernel = use_q6k_cok ? backend_ctx->kernel_gemm_noshuffle_q6_K_f32_cok
+                             : backend_ctx->kernel_gemm_noshuffle_q6_K_f32;
         int padded_N = ne1 + padding;
 
         cl_ushort mask_f000 = 0xF000;
@@ -16066,8 +16157,23 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
         CL_CHECK(clSetKernelArg(kernel, 11, sizeof(cl_ushort),&mask_f000));
         CL_CHECK(clSetKernelArg(kernel, 12, sizeof(cl_uchar), &mask_c0));
 
-        size_t global_work_size[3] = {(size_t)CEIL_DIV(ne1, 8), (size_t)CEIL_DIV(ne01, 4), 1};
-        size_t local_work_size[3] = {2, 128, 1};
+        size_t global_work_size[3];
+        size_t local_work_size[3];
+        if (use_q6k_cok) {
+            global_work_size[0] = (size_t)ne01;   // rows (1 per lane)
+            global_work_size[1] = 8;              // COK_NSG
+            global_work_size[2] = 1;
+            local_work_size[0] = 64;              // COK_SG
+            local_work_size[1] = 8;               // COK_NSG
+            local_work_size[2] = 1;
+        } else {
+            global_work_size[0] = (size_t)CEIL_DIV(ne1, 8);
+            global_work_size[1] = (size_t)CEIL_DIV(ne01, 4);
+            global_work_size[2] = 1;
+            local_work_size[0] = 2;
+            local_work_size[1] = 128;
+            local_work_size[2] = 1;
+        }
         backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
 
         CL_CHECK(clReleaseMemObject(b_sub_buf));
