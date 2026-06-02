@@ -85,7 +85,6 @@ ggml_cgraph * clip_graph_siglip::build() {
 
     } else if (proj_type == PROJECTOR_TYPE_PALIGEMMA) {
         // PaliGemma uses a single linear projection with no pooling and no normalization.
-        // mm_0_w: [vision_hidden, text_hidden] (swapped by is_ffn_swapped back-compat logic)
         cur = ggml_add(ctx0, ggml_mul_mat(ctx0, model.mm_0_w, cur), model.mm_0_b);
 
     } else {

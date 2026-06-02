@@ -33,16 +33,20 @@ class PaliGemmaTextModel(GemmaModel):
         if name.startswith("language_model."):
             # Strip prefix so downstream mapping sees standard Gemma tensor names
             return super().filter_tensors((name[len("language_model."):], gen))
-        return None  # skip vision_tower, multi_modal_projector, etc.
+        return None 
 
     def set_vocab(self):
-        # PaliGemma 1 ships tokenizer.model (SentencePiece)
         self._set_vocab_sentencepiece()
         self.gguf_writer.add_add_space_prefix(False)
 
+    def does_token_look_special(self, token: str | bytes) -> bool:
+        if isinstance(token, bytes):
+            token = token.decode("utf-8", errors="replace")
+        if token in ("<end_of_turn>", "</s>"):
+            return True
+        return super().does_token_look_special(token)
+
     def set_gguf_parameters(self):
-        # PaliGemma 1 omits several fields from text_config that GemmaModel
-        # expects. Fill in the canonical GemmaConfig defaults before delegating.
         self.hparams.setdefault("max_position_embeddings", 8192)
         self.hparams.setdefault("rms_norm_eps", 1e-6)
         self.hparams.setdefault(
@@ -57,8 +61,6 @@ class PaliGemmaVisionModel(MmprojModel):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # SigLIP vision_config in PaliGemma HF configs omits image_size.
-        # Infer it from preprocessor_config or num_image_tokens * patch_size.
         if self.hparams_vision and "image_size" not in self.hparams_vision:
             size = self.preprocessor_config.get("size", {})
             if "height" in size:
@@ -91,7 +93,7 @@ class PaliGemmaVisionModel(MmprojModel):
         yield from super().modify_tensors(data_torch, name, bid)
 
     def tensor_force_quant(self, name: str, new_name: str, bid: int | None, n_dims: int) -> gguf.GGMLQuantizationType | bool:
-        # position_embd must be F32: ggml_add in clip.cpp requires matching dtypes
+        # position_embd must be F32
         if new_name == "v.position_embd.weight":
             return gguf.GGMLQuantizationType.F32
         return super().tensor_force_quant(name, new_name, bid, n_dims)

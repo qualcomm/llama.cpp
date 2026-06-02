@@ -80,6 +80,7 @@ static const std::map<std::string, llm_chat_template> LLM_CHAT_TEMPLATES = {
     { "grok-2",            LLM_CHAT_TEMPLATE_GROK_2            },
     { "pangu-embedded",    LLM_CHAT_TEMPLATE_PANGU_EMBED       },
     { "solar-open",        LLM_CHAT_TEMPLATE_SOLAR_OPEN        },
+    { "paligemma",         LLM_CHAT_TEMPLATE_PALIGEMMA         },
 };
 
 llm_chat_template llm_chat_template_from_str(const std::string & name) {
@@ -397,6 +398,16 @@ int32_t llm_chat_apply_template(
         }
         if (add_ass) {
             ss << "<start_of_turn>model\n";
+        }
+    } else if (tmpl == LLM_CHAT_TEMPLATE_PALIGEMMA) {
+        // google/paligemma-3b
+        for (const auto & message : chat) {
+            std::string role(message->role);
+            if (role == "system") {
+                // paliGemma has no system prompt
+                continue;
+            }
+            ss << trim(message->content) << "\n";
         }
     } else if (tmpl == LLM_CHAT_TEMPLATE_ORION) {
         // OrionStarAI/Orion-14B-Chat

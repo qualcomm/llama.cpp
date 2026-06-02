@@ -1412,7 +1412,6 @@ struct clip_model_loader {
 
                 case PROJECTOR_TYPE_PALIGEMMA:
                     {
-                        // PaliGemma feeds all patches directly to the LLM without pooling
                         hparams.n_merge = 1;
                     } break;
 
@@ -2155,7 +2154,7 @@ struct clip_model_loader {
                 } break;
             case PROJECTOR_TYPE_PALIGEMMA:
                 {
-                    // Single linear projection (no pooling, no norm): mm.0.weight / mm.0.bias
+                    // Single linear projection (no pooling, no norm)
                     model.mm_0_w = get_tensor(string_format(TN_LLAVA_PROJ, 0, "weight"));
                     model.mm_0_b = get_tensor(string_format(TN_LLAVA_PROJ, 0, "bias"));
                 } break;
@@ -3501,8 +3500,7 @@ int clip_n_output_tokens(const struct clip_ctx * ctx, struct clip_image_f32 * im
             } break;
         case PROJECTOR_TYPE_PALIGEMMA:
             {
-                // no pooling: all patches passed directly to the LLM
-                // n_patches stays as computed above (image_size/patch_size)^2
+                n_patches = (img->nx / patch_size) * (img->ny / patch_size);
             } break;
         default:
             GGML_ABORT("unsupported projector type");
@@ -4546,7 +4544,6 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
         case PROJECTOR_TYPE_NEMOTRON_V2_VL:
             return ctx->model.mm_3_w->ne[1];
         case PROJECTOR_TYPE_PALIGEMMA:
-            // mm_0_w shape: [vision_hidden, text_hidden] in GGUF → ne[1] = text_hidden
             return ctx->model.mm_0_w->ne[1];
         case PROJECTOR_TYPE_LLAMA4:
             return ctx->model.mm_model_proj->ne[1];

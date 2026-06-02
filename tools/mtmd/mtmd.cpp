@@ -521,7 +521,8 @@ struct mtmd_context {
                 } break;
             case PROJECTOR_TYPE_PALIGEMMA:
                 {
-                    // SigLIP fixed-size encoder: no wrapping tokens, 256 patch embeddings per image
+                    // (image embeddings) <bos>
+                    img_end = "<bos>";
                     image_preproc = std::make_unique<mtmd_image_preprocessor_fixed_size>(ctx_v);
                 } break;
             default:
@@ -728,14 +729,18 @@ struct mtmd_tokenizer {
                     // add BOS token to the beginning of first text chunk
                     cur.entries[0].tokens_text.insert(cur.entries[0].tokens_text.begin(), llama_vocab_bos(vocab));
                 } else {
-                    // create a new text chunk with BOS token at the beginning
-                    mtmd_input_chunk bos_chunk{
-                        MTMD_INPUT_CHUNK_TYPE_TEXT,
-                        {llama_vocab_bos(vocab)},
-                        nullptr, // image tokens
-                        nullptr, // audio tokens
-                    };
-                    cur.entries.insert(cur.entries.begin(), std::move(bos_chunk));
+                    if (ctx->proj_type_v() == PROJECTOR_TYPE_PALIGEMMA) {
+                        // For Paligemma skip — BOS is already in img_end
+                    } else {
+                        // create a new text chunk with BOS token at the beginning
+                        mtmd_input_chunk bos_chunk{
+                            MTMD_INPUT_CHUNK_TYPE_TEXT,
+                            {llama_vocab_bos(vocab)},
+                            nullptr, // image tokens
+                            nullptr, // audio tokens
+                        };
+                        cur.entries.insert(cur.entries.begin(), std::move(bos_chunk));
+                    }
                 }
             }
 
