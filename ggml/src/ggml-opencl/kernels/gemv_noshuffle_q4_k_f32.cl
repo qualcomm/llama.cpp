@@ -316,3 +316,128 @@ kernel void kernel_gemv_noshuffle_q4_k_f32(
     }
 
 }
+
+// Multi-column (N=3) variant of the q4_K decode GEMV, for the speculative /
+// MTP verify batch (ne1=3 = 2 drafts + 1 bonus). Stays on the efficient GEMV
+// path (subgroup-broadcast activation, NSUBGROUPS K-split) instead of the
+// transposed-GEMM dead-zone path. Each K-block's weights (regA_hi/regA_lo) are
+// loaded ONCE and reused across all 3 activation columns — same weight traffic
+// as one decode, ~3x the (cheap) dequant ALU. Per-column accumulation is
+// independent and identical to 3 standalone GEMVs => byte-identical, so it does
+// NOT perturb the lm_head logits / spec accept rate.
+#ifdef ADRENO_GPU
+REQD_SUBGROUP_SIZE_64
+#endif
+kernel void kernel_gemv_noshuffle_q4_k_f32_mc3(
+        read_only  image1d_buffer_t src0_q,
+        global half2  * src0_d,
+        global half2  * src0_m,
+        global uchar  * src0_s,
+        read_only  image1d_buffer_t src1,
+        global float * dst,
+        ulong offsetd,
+        int ne00,
+        int ne01,
+        uchar mask_d6,
+        uchar mask_d4,
+        uchar mask_hi2)
+{
+    uint groupId = get_local_id(1);
+    uint gid     = get_global_id(0);
+    ushort slid  = get_sub_group_local_id();
+
+    uint K = ne00;
+    uint M = ne01;
+
+    uint LINE_STRIDE_A  = M / 2;
+    uint BLOCK_STRIDE_A = NSUBGROUPS * M;
+    uint scales_per_row = (K / QK_K) * 12;
+    uint COL_STRIDE     = K / 4;   // float4 pixels per activation column
+
+    private uint4  regA_hi, regA_lo;
+    private half2  regS, regM;
+    private float8 regB;
+
+    private float2 ts0 = (float2)(0.0f);
+    private float2 ts1 = (float2)(0.0f);
+    private float2 ts2 = (float2)(0.0f);
+
+    for (uint k = groupId; k < (K / 32); k += NSUBGROUPS) {
+        uint sb = k / 8;
+        uint j  = k % 8;
+
+        half2 d   = src0_d[gid + sb * LINE_STRIDE_A];
+        half2 dm  = src0_m[gid + sb * LINE_STRIDE_A];
+
+        global const uchar * sc0 = src0_s + 2 * gid * scales_per_row + sb * 12;
+        global const uchar * sc1 = src0_s + (2 * gid + 1) * scales_per_row + sb * 12;
+
+        uchar sv0, mn0, sv1, mn1;
+        get_scale_min_k4(j, sc0, &sv0, &mn0, mask_d6, mask_d4, mask_hi2);
+        get_scale_min_k4(j, sc1, &sv1, &mn1, mask_d6, mask_d4, mask_hi2);
+
+        regS = convert_half2(convert_float2(d)  * convert_float2((uchar2)(sv0, sv1)));
+        regM = convert_half2(convert_float2(dm) * convert_float2((uchar2)(mn0, mn1)));
+
+        // weights loaded ONCE, reused across the 3 columns
+        regA_hi.s0 = read_imageui(src0_q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 0)).x;
+        regA_hi.s1 = read_imageui(src0_q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 1)).x;
+        regA_hi.s2 = read_imageui(src0_q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 2)).x;
+        regA_hi.s3 = read_imageui(src0_q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 3)).x;
+        regA_lo.s0 = read_imageui(src0_q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 4)).x;
+        regA_lo.s1 = read_imageui(src0_q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 5)).x;
+        regA_lo.s2 = read_imageui(src0_q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 6)).x;
+        regA_lo.s3 = read_imageui(src0_q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 7)).x;
+
+        // Per-column: load only this column's activation (single regB live at a
+        // time -> 1/3 the activation register pressure vs holding all 3) then
+        // dequant against the shared weights. Cuts the private-mem spill.
+#ifdef VECTOR_SUB_GROUP_BROADCAST
+        { if (slid < 4) { regB.s0123 = read_imagef(src1, 0*COL_STRIDE     + slid*2 + k*8);
+                          regB.s4567 = read_imagef(src1, 0*COL_STRIDE + 1 + slid*2 + k*8); }
+          dequantizeBlockAccum_ns_sgbroadcast_8_hi(ts0, as_ushort8(regA_hi), regS, regM, regB);
+          dequantizeBlockAccum_ns_sgbroadcast_8_lo(ts0, as_ushort8(regA_lo), regS, regM, regB); }
+        { if (slid < 4) { regB.s0123 = read_imagef(src1, 1*COL_STRIDE     + slid*2 + k*8);
+                          regB.s4567 = read_imagef(src1, 1*COL_STRIDE + 1 + slid*2 + k*8); }
+          dequantizeBlockAccum_ns_sgbroadcast_8_hi(ts1, as_ushort8(regA_hi), regS, regM, regB);
+          dequantizeBlockAccum_ns_sgbroadcast_8_lo(ts1, as_ushort8(regA_lo), regS, regM, regB); }
+        { if (slid < 4) { regB.s0123 = read_imagef(src1, 2*COL_STRIDE     + slid*2 + k*8);
+                          regB.s4567 = read_imagef(src1, 2*COL_STRIDE + 1 + slid*2 + k*8); }
+          dequantizeBlockAccum_ns_sgbroadcast_8_hi(ts2, as_ushort8(regA_hi), regS, regM, regB);
+          dequantizeBlockAccum_ns_sgbroadcast_8_lo(ts2, as_ushort8(regA_lo), regS, regM, regB); }
+#else
+        { if (slid < 4) { regB.s0123 = read_imagef(src1, 0*COL_STRIDE     + slid*2 + k*8);
+                          regB.s4567 = read_imagef(src1, 0*COL_STRIDE + 1 + slid*2 + k*8); }
+          dequantizeBlockAccum_ns_sgbroadcast_1_hi(ts0, as_ushort8(regA_hi), regS, regM, regB);
+          dequantizeBlockAccum_ns_sgbroadcast_1_lo(ts0, as_ushort8(regA_lo), regS, regM, regB); }
+        { if (slid < 4) { regB.s0123 = read_imagef(src1, 1*COL_STRIDE     + slid*2 + k*8);
+                          regB.s4567 = read_imagef(src1, 1*COL_STRIDE + 1 + slid*2 + k*8); }
+          dequantizeBlockAccum_ns_sgbroadcast_1_hi(ts1, as_ushort8(regA_hi), regS, regM, regB);
+          dequantizeBlockAccum_ns_sgbroadcast_1_lo(ts1, as_ushort8(regA_lo), regS, regM, regB); }
+        { if (slid < 4) { regB.s0123 = read_imagef(src1, 2*COL_STRIDE     + slid*2 + k*8);
+                          regB.s4567 = read_imagef(src1, 2*COL_STRIDE + 1 + slid*2 + k*8); }
+          dequantizeBlockAccum_ns_sgbroadcast_1_hi(ts2, as_ushort8(regA_hi), regS, regM, regB);
+          dequantizeBlockAccum_ns_sgbroadcast_1_lo(ts2, as_ushort8(regA_lo), regS, regM, regB); }
+#endif
+    }
+
+    // cross-subgroup reduce: pack the 3 columns' float2 into a float8 (6 used).
+    local float8 reduceLM[SUBGROUP_SIZE * 3];
+    float8 acc = (float8)(ts0.s0, ts0.s1, ts1.s0, ts1.s1, ts2.s0, ts2.s1, 0.0f, 0.0f);
+    if (groupId == 1) { reduceLM[SUBGROUP_SIZE * 0 + slid] = acc; }
+    if (groupId == 2) { reduceLM[SUBGROUP_SIZE * 1 + slid] = acc; }
+    if (groupId == 3) { reduceLM[SUBGROUP_SIZE * 2 + slid] = acc; }
+
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    if (groupId == 0) {
+        acc += reduceLM[SUBGROUP_SIZE * 0 + slid];
+        acc += reduceLM[SUBGROUP_SIZE * 1 + slid];
+        acc += reduceLM[SUBGROUP_SIZE * 2 + slid];
+        dst = (global float*)((global char*)dst + offsetd);
+        // dst is column-major [M rows x 3 cols]: (row, col) at col*M + row
+        vstore2((float2)(acc.s0, acc.s1), 0, &(dst[0 * M + gid * 2]));
+        vstore2((float2)(acc.s2, acc.s3), 0, &(dst[1 * M + gid * 2]));
+        vstore2((float2)(acc.s4, acc.s5), 0, &(dst[2 * M + gid * 2]));
+    }
+}
