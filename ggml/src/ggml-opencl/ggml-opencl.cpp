@@ -827,6 +827,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mv_id_mxfp4_f32;
     cl_kernel kernel_mul_mv_id_mxfp4_f32_flat;
     cl_kernel kernel_mul_mm_f32_f32_l4_lm;
+    cl_kernel kernel_gemv_f32_f32_mc;  // multi-column (small-N) f32 GEMV for spec/MTP verify
     cl_kernel kernel_mul_mm_f16_f32_l4_lm;
     cl_kernel kernel_mul_mm_q1_0_f32_l4_lm;
     cl_kernel kernel_mul_mm_q4_0_f32_l4_lm;
@@ -992,11 +993,13 @@ struct ggml_backend_opencl_context {
     // Gemm and Gemv related programs, kernels, etc
     cl_kernel kernel_gemm_noshuffle_q4_0_f32;
     cl_kernel kernel_gemv_noshuffle_q4_0_f32;
+    cl_kernel kernel_gemv_noshuffle_q4_0_f32_mc3;  // multi-column (N=3) verify GEMV (spec/MTP)
     cl_kernel kernel_gemv_noshuffle_q4_0_f32_4096_1_11008;
     cl_kernel kernel_gemv_noshuffle_q4_0_f32_4096_1_4096;
     cl_kernel kernel_gemv_noshuffle_q4_0_f32_11008_1_4096;
     cl_kernel kernel_gemv_noshuffle_q4_0_f32_32000_1_4096;
     cl_kernel kernel_gemv_noshuffle_q4_1_f32;
+    cl_kernel kernel_gemv_noshuffle_q4_1_f32_mc3;  // multi-column (N=3) verify GEMV (spec/MTP)
     cl_kernel kernel_gemm_noshuffle_q4_1_f32;
     cl_kernel kernel_gemm_noshuffle_q8_0_f32, kernel_gemm_noshuffle_q8_0_f32_bin;
     cl_kernel kernel_gemv_noshuffle_q8_0_f32;
@@ -1022,6 +1025,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemm_noshuffle_q6_K_f32;
     cl_kernel kernel_gemm_noshuffle_q6_K_f32_cok;
     cl_kernel kernel_gemv_noshuffle_q5_k_f32;
+    cl_kernel kernel_gemv_noshuffle_q5_k_f32_mc3;  // multi-column (N=3) verify GEMV (spec/MTP)
     cl_kernel kernel_gemm_noshuffle_q5_k_f32;
     cl_kernel kernel_gemv_noshuffle_q5_0_f32;
     cl_kernel kernel_gemm_noshuffle_q5_0_f32;
@@ -2173,6 +2177,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
 
         CL_CHECK((backend_ctx->kernel_mul_mm_f32_f32_l4_lm = clCreateKernel(backend_ctx->program_mul_mm_f32_f32_l4_lm, "kernel_mul_mm_f32_f32_l4_lm", &err), err));
+        CL_CHECK((backend_ctx->kernel_gemv_f32_f32_mc = clCreateKernel(backend_ctx->program_mul_mm_f32_f32_l4_lm, "kernel_gemv_f32_f32_mc", &err), err));
         GGML_LOG_CONT(".");
     }
 
@@ -3298,6 +3303,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             backend_ctx->context, backend_ctx->device, kernel_src_CL_gemv_general.c_str(), CL_gemv_compile_opts);
 
         CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q4_0_f32 = clCreateKernel(prog, "kernel_gemv_noshuffle_q4_0_f32", &err), err));
+        CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q4_0_f32_mc3 = clCreateKernel(prog, "kernel_gemv_noshuffle_q4_0_f32_mc3", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
@@ -3432,6 +3438,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             backend_ctx->context, backend_ctx->device, kernel_src.c_str(), CL_gemv_compile_opts);
 
         CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q4_1_f32 = clCreateKernel(prog, "kernel_gemv_noshuffle_q4_1_f32", &err), err));
+        CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q4_1_f32_mc3 = clCreateKernel(prog, "kernel_gemv_noshuffle_q4_1_f32_mc3", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
@@ -3632,6 +3639,18 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                                        " -cl-mad-enable ";
         if (backend_ctx->has_vector_subgroup_broadcast) {
             CL_gemv_compile_opts += " -DVECTOR_SUB_GROUP_BROADCAST ";
+        }
+        // Opt-in: dequant-once-per-block mc3 verify GEMV (factors q4_K dequant
+        // out of the 3-column loop; byte-identical, lower spill). A/B vs the
+        // shipped inline mc3 in the same binary.
+        if (getenv("GGML_OPENCL_Q4K_MC3_DQ")) {
+            CL_gemv_compile_opts += " -DQ4K_MC3_DEQUANT_ONCE ";
+        }
+        // Opt-in: LDS-staged dequant mc3 verify GEMV (stages the dequantized
+        // q4_K weights in __local instead of private regs that spill to slow
+        // global on Adreno; byte-identical). A/B vs inline + dequant-once.
+        if (getenv("GGML_OPENCL_Q4K_MC3_LDS")) {
+            CL_gemv_compile_opts += " -DQ4K_MC3_DEQUANT_LDS ";
         }
 
 #ifdef GGML_OPENCL_EMBED_KERNELS
@@ -4252,6 +4271,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             backend_ctx->context, backend_ctx->device, kernel_src.c_str(), CL_gemv_compile_opts);
 
         CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q5_k_f32 = clCreateKernel(prog, "kernel_gemv_noshuffle_q5_k_f32", &err), err));
+        CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q5_k_f32_mc3 = clCreateKernel(prog, "kernel_gemv_noshuffle_q5_k_f32_mc3", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
@@ -15643,7 +15663,17 @@ static void ggml_cl_mul_mat_q4_0_f32_adreno(ggml_backend_t backend, const ggml_t
     int N = ne1;
     int K = ne00;
 
-    if (ne1 == 1) {
+    // Multi-column (N=3) verify GEMV for q4_0: route the spec/MTP verify batch
+    // (ne1==3) onto the efficient GEMV path instead of the transposed-GEMM dead-
+    // zone (gemm_noshuffle_q4_0 is ~50% of MTP decode on a Q4_0 model since q4_0
+    // weights have no cok/mc3, unlike q4_K). Reuses the ne1==1 GEMV image setup
+    // (activation image already sized by N=ne1). Byte-identical. Opt-in via
+    // GGML_OPENCL_Q40_MC3=1. Per-layer only (ne01 < 32768); q4_0 lm_head doesn't
+    // occur (token_embd/output stay Q6_K), guard kept for parity with q4_K mc3.
+    static const bool q40_mc3 = (getenv("GGML_OPENCL_Q40_MC3") != nullptr);
+    const bool use_q40_mc3 = q40_mc3 && (ne1 >= 2 && ne1 <= 4) && (ne01 < 32768);
+
+    if (ne1 == 1 || use_q40_mc3) {
         cl_mem q_img = nullptr;
         cl_mem b_sub_buf = nullptr;
         cl_mem b_img = nullptr;
@@ -15669,38 +15699,56 @@ static void ggml_cl_mul_mat_q4_0_f32_adreno(ggml_backend_t backend, const ggml_t
         img_desc.buffer = b_sub_buf;
         CL_CHECK((b_img = clCreateImage(context, CL_MEM_READ_ONLY, &img_fmt, &img_desc, NULL, &err), err));
 
-        kernel = backend_ctx->kernel_gemv_noshuffle_q4_0_f32;
-        if (M == 4096 && K == 4096) {
-            kernel = backend_ctx->kernel_gemv_noshuffle_q4_0_f32_4096_1_4096;
-        } else if (M == 4096 && K == 11008) {
-            kernel = backend_ctx->kernel_gemv_noshuffle_q4_0_f32_4096_1_11008;
-        } else if (M == 11008 && K == 4096) {
-            kernel = backend_ctx->kernel_gemv_noshuffle_q4_0_f32_11008_1_4096;
-        } else if (M == 32000 && K == 4096) {
-            kernel = backend_ctx->kernel_gemv_noshuffle_q4_0_f32_32000_1_4096;
+        if (use_q40_mc3) {
+            kernel = backend_ctx->kernel_gemv_noshuffle_q4_0_f32_mc3;
+            CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),   &q_img));
+            CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem),   &extra0_q4_0->d));
+            CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem),   &b_img));
+            CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_mem),   &extrad->data_device));
+            CL_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_ulong), &offsetd));
+            CL_CHECK(clSetKernelArg(kernel, 5, sizeof(int),      &ne00));
+            CL_CHECK(clSetKernelArg(kernel, 6, sizeof(int),      &ne01));
+            CL_CHECK(clSetKernelArg(kernel, 7, sizeof(int),      &ne1));
+        } else {
+            kernel = backend_ctx->kernel_gemv_noshuffle_q4_0_f32;
+            if (M == 4096 && K == 4096) {
+                kernel = backend_ctx->kernel_gemv_noshuffle_q4_0_f32_4096_1_4096;
+            } else if (M == 4096 && K == 11008) {
+                kernel = backend_ctx->kernel_gemv_noshuffle_q4_0_f32_4096_1_11008;
+            } else if (M == 11008 && K == 4096) {
+                kernel = backend_ctx->kernel_gemv_noshuffle_q4_0_f32_11008_1_4096;
+            } else if (M == 32000 && K == 4096) {
+                kernel = backend_ctx->kernel_gemv_noshuffle_q4_0_f32_32000_1_4096;
+            }
+
+            int r2 = 1;
+            int r3 = 1;
+
+            CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &q_img));
+            CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_mem),   &extra0_q4_0->d));
+            CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),   &b_img));
+            CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_ulong), &offset1));
+            CL_CHECK(clSetKernelArg(kernel,  4, sizeof(cl_mem),   &extrad->data_device));
+            CL_CHECK(clSetKernelArg(kernel,  5, sizeof(cl_ulong), &offsetd));
+            CL_CHECK(clSetKernelArg(kernel,  6, sizeof(int),      &ne00));
+            CL_CHECK(clSetKernelArg(kernel,  7, sizeof(int),      &ne01));
+            CL_CHECK(clSetKernelArg(kernel,  8, sizeof(int),      &ne02));
+            CL_CHECK(clSetKernelArg(kernel,  9, sizeof(int),      &ne10));
+            CL_CHECK(clSetKernelArg(kernel, 10, sizeof(int),      &ne12));
+            CL_CHECK(clSetKernelArg(kernel, 11, sizeof(int),      &ne0));
+            CL_CHECK(clSetKernelArg(kernel, 12, sizeof(int),      &ne1));
+            CL_CHECK(clSetKernelArg(kernel, 13, sizeof(int),      &r2));
+            CL_CHECK(clSetKernelArg(kernel, 14, sizeof(int),      &r3));
         }
 
-        int r2 = 1;
-        int r3 = 1;
-
-        CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &q_img));
-        CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_mem),   &extra0_q4_0->d));
-        CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),   &b_img));
-        CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_ulong), &offset1));
-        CL_CHECK(clSetKernelArg(kernel,  4, sizeof(cl_mem),   &extrad->data_device));
-        CL_CHECK(clSetKernelArg(kernel,  5, sizeof(cl_ulong), &offsetd));
-        CL_CHECK(clSetKernelArg(kernel,  6, sizeof(int),      &ne00));
-        CL_CHECK(clSetKernelArg(kernel,  7, sizeof(int),      &ne01));
-        CL_CHECK(clSetKernelArg(kernel,  8, sizeof(int),      &ne02));
-        CL_CHECK(clSetKernelArg(kernel,  9, sizeof(int),      &ne10));
-        CL_CHECK(clSetKernelArg(kernel, 10, sizeof(int),      &ne12));
-        CL_CHECK(clSetKernelArg(kernel, 11, sizeof(int),      &ne0));
-        CL_CHECK(clSetKernelArg(kernel, 12, sizeof(int),      &ne1));
-        CL_CHECK(clSetKernelArg(kernel, 13, sizeof(int),      &r2));
-        CL_CHECK(clSetKernelArg(kernel, 14, sizeof(int),      &r3));
-
-        size_t local_work_size[3] = {64, 4, 1};
-        size_t global_work_size[3] = {(size_t)CEIL_DIV(ne01/2, 64)*64, 4, 1};
+        // Small-M mc3 verify is occupancy/latency-bound (too few WGs, e.g. M=2560 ->
+        // ~20 WGs at ~17 GB/s vs ffn ~68 GB/s). Use 8 subgroups (512-WI WGs, half the
+        // per-lane K-walk) for small M. Layout stride is fixed (4 uints/block), so only
+        // the K-split count changes; the mc3 kernel reads it via get_local_size(1). The
+        // ne1==1 base kernel hardcodes N_SIMDGROUP=4, so it always stays at 4.
+        const int mc3_nsg = (use_q40_mc3 && ne01 < 4096) ? 8 : 4;
+        size_t local_work_size[3] = {64, (size_t)mc3_nsg, 1};
+        size_t global_work_size[3] = {(size_t)CEIL_DIV(ne01/2, 64)*64, (size_t)mc3_nsg, 1};
 
         backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
 
@@ -15867,7 +15915,14 @@ static void ggml_cl_mul_mat_q4_1_f32_adreno(ggml_backend_t backend, const ggml_t
     int N = ne1;
     int K = ne00;
 
-    if (ne1 == 1) {
+    // Multi-column (N=3) verify GEMV for q4_1: route the spec/MTP verify batch
+    // (ne1==3) onto the efficient GEMV path instead of the transposed-GEMM dead-
+    // zone (gemm_noshuffle_q4_1). Reuses the ne1==1 GEMV image setup. Opt-in via
+    // GGML_OPENCL_Q41_MC3=1. Per-layer only (ne01 < 32768).
+    static const bool q41_mc3 = (getenv("GGML_OPENCL_Q41_MC3") != nullptr);
+    const bool use_q41_mc3 = q41_mc3 && (ne1 >= 2 && ne1 <= 4) && (ne01 < 32768);
+
+    if (ne1 == 1 || use_q41_mc3) {
         cl_mem q_img = nullptr;
         cl_mem b_sub_buf = nullptr;
         cl_mem b_img = nullptr;
@@ -15893,7 +15948,8 @@ static void ggml_cl_mul_mat_q4_1_f32_adreno(ggml_backend_t backend, const ggml_t
         img_desc.buffer = b_sub_buf;
         CL_CHECK((b_img = clCreateImage(context, CL_MEM_READ_ONLY, &img_fmt, &img_desc, NULL, &err), err));
 
-        kernel = backend_ctx->kernel_gemv_noshuffle_q4_1_f32;
+        kernel = use_q41_mc3 ? backend_ctx->kernel_gemv_noshuffle_q4_1_f32_mc3
+                             : backend_ctx->kernel_gemv_noshuffle_q4_1_f32;
 
         CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),   &q_img));
         CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem),   &extra0_q4_1->d));
@@ -15903,6 +15959,9 @@ static void ggml_cl_mul_mat_q4_1_f32_adreno(ggml_backend_t backend, const ggml_t
         CL_CHECK(clSetKernelArg(kernel, 5, sizeof(cl_ulong), &offsetd));
         CL_CHECK(clSetKernelArg(kernel, 6, sizeof(cl_int),   &ne00));
         CL_CHECK(clSetKernelArg(kernel, 7, sizeof(cl_int),   &ne01));
+        if (use_q41_mc3) {
+            CL_CHECK(clSetKernelArg(kernel, 8, sizeof(cl_int), &ne1));  // n_cols
+        }
 
         size_t local_work_size[3] = {64, 4, 1};
         size_t global_work_size[3] = {(size_t)CEIL_DIV(ne01/2, 64)*64, 4, 1};
@@ -17478,7 +17537,15 @@ static void ggml_cl_mul_mat_q5_K_f32_adreno(ggml_backend_t backend, const ggml_t
     cl_uchar mask_d4  = 0x0F;
     cl_uchar mask_hi2 = 0xC0;
 
-    if (ne1 == 1) {
+    // Multi-column (N=3) verify GEMV for q5_K: route the spec/MTP verify batch
+    // (ne1==3) onto the efficient GEMV path instead of the transposed-GEMM dead-
+    // zone (gemm_noshuffle_q5_k, the #2 chunk of MTP decode on a Q4_0-mix model
+    // after q4_0 mc3). Reuses the ne1==1 GEMV image setup (q + qh + activations).
+    // Opt-in via GGML_OPENCL_Q5K_MC3=1. Per-layer only (ne01 < 32768).
+    static const bool q5k_mc3 = (getenv("GGML_OPENCL_Q5K_MC3") != nullptr);
+    const bool use_q5k_mc3 = q5k_mc3 && (ne1 >= 2 && ne1 <= 4) && (ne01 < 32768);
+
+    if (ne1 == 1 || use_q5k_mc3) {
         cl_mem q_img  = nullptr;
         cl_mem qh_img = nullptr;
         cl_mem b_sub_buf = nullptr;
@@ -17513,7 +17580,8 @@ static void ggml_cl_mul_mat_q5_K_f32_adreno(ggml_backend_t backend, const ggml_t
         img_desc.buffer      = b_sub_buf;
         CL_CHECK((b_img = clCreateImage(context, CL_MEM_READ_ONLY, &img_fmt, &img_desc, NULL, &err), err));
 
-        kernel = backend_ctx->kernel_gemv_noshuffle_q5_k_f32;
+        kernel = use_q5k_mc3 ? backend_ctx->kernel_gemv_noshuffle_q5_k_f32_mc3
+                             : backend_ctx->kernel_gemv_noshuffle_q5_k_f32;
 
         CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &q_img));
         CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_mem),   &qh_img));
@@ -17528,6 +17596,9 @@ static void ggml_cl_mul_mat_q5_K_f32_adreno(ggml_backend_t backend, const ggml_t
         CL_CHECK(clSetKernelArg(kernel, 10, sizeof(cl_uchar), &mask_d6));
         CL_CHECK(clSetKernelArg(kernel, 11, sizeof(cl_uchar), &mask_d4));
         CL_CHECK(clSetKernelArg(kernel, 12, sizeof(cl_uchar), &mask_hi2));
+        if (use_q5k_mc3) {
+            CL_CHECK(clSetKernelArg(kernel, 13, sizeof(cl_int), &ne1));  // n_cols
+        }
 
         size_t local_work_size[3]  = {64, 4, 1};
         size_t global_work_size[3] = {(size_t)CEIL_DIV(ne01/2, 64)*64, 4, 1};
@@ -18365,6 +18436,35 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         ne11 > 1) {
         switch(src0t) {
             case GGML_TYPE_F32: {
+                // Small-N f32 GEMV for the spec/MTP verify batch: the tiled GEMM
+                // below always computes a full 64x64 tile, so at ne11=3 with a
+                // skinny f32 weight (GDN ssm_alpha/ssm_beta, M=32) it launches one
+                // under-occupied WG at ~2.3% tile utilization. Route to a per-output
+                // (m,n) GEMV (64-thread WG, K-split + __local reduce) instead.
+                // Opt-in GGML_OPENCL_F32_MC=1; 2D contiguous, small N + skinny M only.
+                static const bool f32_mc = (getenv("GGML_OPENCL_F32_MC") != nullptr);
+                if (f32_mc && ne11 >= 2 && ne11 <= 8 && ne01 <= 512 && (ne00 % 4 == 0) &&
+                    ne02 == 1 && ne12 == 1 && ne13 == 1 &&
+                    ggml_is_contiguous(src0) && ggml_is_contiguous(src1)) {
+                    cl_kernel kmc = backend_ctx->kernel_gemv_f32_f32_mc;
+                    int stride_a = ne00, stride_b = ne00, stride_d = ne01;
+                    CL_CHECK(clSetKernelArg(kmc,  0, sizeof(cl_mem),   &extra0->data_device));
+                    CL_CHECK(clSetKernelArg(kmc,  1, sizeof(cl_ulong), &offset0));
+                    CL_CHECK(clSetKernelArg(kmc,  2, sizeof(cl_mem),   &extra1->data_device));
+                    CL_CHECK(clSetKernelArg(kmc,  3, sizeof(cl_ulong), &offset1));
+                    CL_CHECK(clSetKernelArg(kmc,  4, sizeof(cl_mem),   &extrad->data_device));
+                    CL_CHECK(clSetKernelArg(kmc,  5, sizeof(cl_ulong), &offsetd));
+                    CL_CHECK(clSetKernelArg(kmc,  6, sizeof(int),      &ne00));
+                    CL_CHECK(clSetKernelArg(kmc,  7, sizeof(int),      &ne01));
+                    CL_CHECK(clSetKernelArg(kmc,  8, sizeof(int),      &ne11));
+                    CL_CHECK(clSetKernelArg(kmc,  9, sizeof(int),      &stride_a));
+                    CL_CHECK(clSetKernelArg(kmc, 10, sizeof(int),      &stride_b));
+                    CL_CHECK(clSetKernelArg(kmc, 11, sizeof(int),      &stride_d));
+                    size_t gws[3] = {64, (size_t)ne01 * (size_t)ne11, 1};
+                    size_t lws[3] = {64, 1, 1};
+                    backend_ctx->enqueue_ndrange_kernel(kmc, 3, gws, lws, dst);
+                    return;
+                }
                 kernel = backend_ctx->kernel_mul_mm_f32_f32_l4_lm;
                 nth0 = 128; // calculated as (BM*BN)/(TM*TN)
 
