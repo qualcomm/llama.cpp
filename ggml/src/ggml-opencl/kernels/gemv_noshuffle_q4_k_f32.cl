@@ -317,6 +317,55 @@ kernel void kernel_gemv_noshuffle_q4_k_f32(
 
 }
 
+// --- Dequant-once macros for the mc3 verify GEMV (Q4K_MC3_DEQUANT_ONCE) ---
+// The inline dequantizeBlockAccum_* macros recompute the dequantized weight
+// ((code & mask)>>shift)*scale - minv ONCE PER COLUMN (3x), and the flat
+// 32-FMA unroll spills ~430 B of temporaries. These macros split the work:
+// DEQUANT_Q4K_BLOCK computes the 16 weights/row of one 32-block ONCE into a
+// half2[] (row0 in .s0, row1 in .s1) — stored as half, the exact type the
+// inline expression yields (int*half-half), so no extra rounding. MAC_Q4K_BLOCK
+// then accumulates them against a column's broadcast activation in the SAME
+// per-accumulator order as the inline macro. Each weight value and each
+// accumulator's add-chain is bit-for-bit identical => byte-identical output,
+// while the dequant ALU drops 3x->1x and the live set shrinks. Requires the
+// Qualcomm vector sub_group_broadcast (float8); enabled opt-in on Adreno.
+#define DEQ_Q4K_HALF2(b0, b1, msk, sh, scale, minv) \
+    (half2)( ((b0 & msk) >> sh) * scale.s0 - minv.s0, \
+             ((b1 & msk) >> sh) * scale.s1 - minv.s1 )
+
+#define DEQUANT_Q4K_BLOCK(wq, bits, scale, minv) \
+    wq[0]  = DEQ_Q4K_HALF2(bits.s0, bits.s1, 0x000F, 0,  scale, minv); \
+    wq[1]  = DEQ_Q4K_HALF2(bits.s0, bits.s1, 0x00F0, 4,  scale, minv); \
+    wq[2]  = DEQ_Q4K_HALF2(bits.s0, bits.s1, 0x0F00, 8,  scale, minv); \
+    wq[3]  = DEQ_Q4K_HALF2(bits.s0, bits.s1, 0xF000, 12, scale, minv); \
+    wq[4]  = DEQ_Q4K_HALF2(bits.s2, bits.s3, 0x000F, 0,  scale, minv); \
+    wq[5]  = DEQ_Q4K_HALF2(bits.s2, bits.s3, 0x00F0, 4,  scale, minv); \
+    wq[6]  = DEQ_Q4K_HALF2(bits.s2, bits.s3, 0x0F00, 8,  scale, minv); \
+    wq[7]  = DEQ_Q4K_HALF2(bits.s2, bits.s3, 0xF000, 12, scale, minv); \
+    wq[8]  = DEQ_Q4K_HALF2(bits.s4, bits.s5, 0x000F, 0,  scale, minv); \
+    wq[9]  = DEQ_Q4K_HALF2(bits.s4, bits.s5, 0x00F0, 4,  scale, minv); \
+    wq[10] = DEQ_Q4K_HALF2(bits.s4, bits.s5, 0x0F00, 8,  scale, minv); \
+    wq[11] = DEQ_Q4K_HALF2(bits.s4, bits.s5, 0xF000, 12, scale, minv); \
+    wq[12] = DEQ_Q4K_HALF2(bits.s6, bits.s7, 0x000F, 0,  scale, minv); \
+    wq[13] = DEQ_Q4K_HALF2(bits.s6, bits.s7, 0x00F0, 4,  scale, minv); \
+    wq[14] = DEQ_Q4K_HALF2(bits.s6, bits.s7, 0x0F00, 8,  scale, minv); \
+    wq[15] = DEQ_Q4K_HALF2(bits.s6, bits.s7, 0xF000, 12, scale, minv);
+
+// ln0/ln1 = the two source lanes whose activation float8 this block consumes
+// (0,1 for the hi block, 2,3 for the lo block — matching the inline _hi/_lo).
+#define MAC_Q4K_BLOCK(ts, wq, y, ln0, ln1) { \
+    float8 sy = sub_group_broadcast(y, ln0); \
+    ts.s0 += wq[0].s0*sy.s0; ts.s0 += wq[1].s0*sy.s1; ts.s0 += wq[2].s0*sy.s2; ts.s0 += wq[3].s0*sy.s3; \
+    ts.s0 += wq[4].s0*sy.s4; ts.s0 += wq[5].s0*sy.s5; ts.s0 += wq[6].s0*sy.s6; ts.s0 += wq[7].s0*sy.s7; \
+    ts.s1 += wq[0].s1*sy.s0; ts.s1 += wq[1].s1*sy.s1; ts.s1 += wq[2].s1*sy.s2; ts.s1 += wq[3].s1*sy.s3; \
+    ts.s1 += wq[4].s1*sy.s4; ts.s1 += wq[5].s1*sy.s5; ts.s1 += wq[6].s1*sy.s6; ts.s1 += wq[7].s1*sy.s7; \
+    sy = sub_group_broadcast(y, ln1); \
+    ts.s0 += wq[8].s0*sy.s0;  ts.s0 += wq[9].s0*sy.s1;  ts.s0 += wq[10].s0*sy.s2; ts.s0 += wq[11].s0*sy.s3; \
+    ts.s0 += wq[12].s0*sy.s4; ts.s0 += wq[13].s0*sy.s5; ts.s0 += wq[14].s0*sy.s6; ts.s0 += wq[15].s0*sy.s7; \
+    ts.s1 += wq[8].s1*sy.s0;  ts.s1 += wq[9].s1*sy.s1;  ts.s1 += wq[10].s1*sy.s2; ts.s1 += wq[11].s1*sy.s3; \
+    ts.s1 += wq[12].s1*sy.s4; ts.s1 += wq[13].s1*sy.s5; ts.s1 += wq[14].s1*sy.s6; ts.s1 += wq[15].s1*sy.s7; \
+}
+
 // Multi-column (N=3) variant of the q4_K decode GEMV, for the speculative /
 // MTP verify batch (ne1=3 = 2 drafts + 1 bonus). Stays on the efficient GEMV
 // path (subgroup-broadcast activation, NSUBGROUPS K-split) instead of the
@@ -362,6 +411,15 @@ kernel void kernel_gemv_noshuffle_q4_k_f32_mc3(
     private float2 ts1 = (float2)(0.0f);
     private float2 ts2 = (float2)(0.0f);
 
+#ifdef Q4K_MC3_DEQUANT_LDS
+    // One 16-half2 block buffer per WI (reused hi->lo): forces the dequantized
+    // weights into LDS instead of private arrays (which spill to slow global on
+    // Adreno). 64*NSUBGROUPS WIs * 16 half2 = 16 KB; each WI owns its own slot
+    // range (flat*16) -> no cross-lane sharing, no barrier needed.
+    local half2 wstage[SUBGROUP_SIZE * NSUBGROUPS * 16];
+    local half2 * ws = wstage + (groupId * SUBGROUP_SIZE + slid) * 16;
+#endif
+
     for (uint k = groupId; k < (K / 32); k += NSUBGROUPS) {
         uint sb = k / 8;
         uint j  = k % 8;
@@ -389,6 +447,49 @@ kernel void kernel_gemv_noshuffle_q4_k_f32_mc3(
         regA_lo.s2 = read_imageui(src0_q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 6)).x;
         regA_lo.s3 = read_imageui(src0_q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 7)).x;
 
+#ifdef Q4K_MC3_DEQUANT_ONCE
+        // Dequant the 32 weights/row (16 hi + 16 lo) ONCE into half2[] (byte-
+        // identical to the inline intermediate), then MAC against each column's
+        // activation. Drops the dequant ALU 3x->1x and the macro-temp spill.
+        half2 wq_hi[16], wq_lo[16];
+        DEQUANT_Q4K_BLOCK(wq_hi, as_ushort8(regA_hi), regS, regM);
+        DEQUANT_Q4K_BLOCK(wq_lo, as_ushort8(regA_lo), regS, regM);
+        { if (slid < 4) { regB.s0123 = read_imagef(src1, 0*COL_STRIDE     + slid*2 + k*8);
+                          regB.s4567 = read_imagef(src1, 0*COL_STRIDE + 1 + slid*2 + k*8); }
+          MAC_Q4K_BLOCK(ts0, wq_hi, regB, 0, 1); MAC_Q4K_BLOCK(ts0, wq_lo, regB, 2, 3); }
+        { if (slid < 4) { regB.s0123 = read_imagef(src1, 1*COL_STRIDE     + slid*2 + k*8);
+                          regB.s4567 = read_imagef(src1, 1*COL_STRIDE + 1 + slid*2 + k*8); }
+          MAC_Q4K_BLOCK(ts1, wq_hi, regB, 0, 1); MAC_Q4K_BLOCK(ts1, wq_lo, regB, 2, 3); }
+        { if (slid < 4) { regB.s0123 = read_imagef(src1, 2*COL_STRIDE     + slid*2 + k*8);
+                          regB.s4567 = read_imagef(src1, 2*COL_STRIDE + 1 + slid*2 + k*8); }
+          MAC_Q4K_BLOCK(ts2, wq_hi, regB, 0, 1); MAC_Q4K_BLOCK(ts2, wq_lo, regB, 2, 3); }
+#elif defined(Q4K_MC3_DEQUANT_LDS)
+        // LDS-staged dequant: dequant a 32-block ONCE into the per-WI LDS slot
+        // (hi pass then lo pass, overwriting), MAC each column from LDS. ts*
+        // receive hi-then-lo in the same order as DEQUANT_ONCE -> byte-identical.
+        // Activations reloaded per pass (cheap, imaged); only one regB + 0 weight
+        // regs live -> the weight working set lives in LDS, not spilled private.
+        DEQUANT_Q4K_BLOCK(ws, as_ushort8(regA_hi), regS, regM);
+        { if (slid < 4) { regB.s0123 = read_imagef(src1, 0*COL_STRIDE     + slid*2 + k*8);
+                          regB.s4567 = read_imagef(src1, 0*COL_STRIDE + 1 + slid*2 + k*8); }
+          MAC_Q4K_BLOCK(ts0, ws, regB, 0, 1); }
+        { if (slid < 4) { regB.s0123 = read_imagef(src1, 1*COL_STRIDE     + slid*2 + k*8);
+                          regB.s4567 = read_imagef(src1, 1*COL_STRIDE + 1 + slid*2 + k*8); }
+          MAC_Q4K_BLOCK(ts1, ws, regB, 0, 1); }
+        { if (slid < 4) { regB.s0123 = read_imagef(src1, 2*COL_STRIDE     + slid*2 + k*8);
+                          regB.s4567 = read_imagef(src1, 2*COL_STRIDE + 1 + slid*2 + k*8); }
+          MAC_Q4K_BLOCK(ts2, ws, regB, 0, 1); }
+        DEQUANT_Q4K_BLOCK(ws, as_ushort8(regA_lo), regS, regM);
+        { if (slid < 4) { regB.s0123 = read_imagef(src1, 0*COL_STRIDE     + slid*2 + k*8);
+                          regB.s4567 = read_imagef(src1, 0*COL_STRIDE + 1 + slid*2 + k*8); }
+          MAC_Q4K_BLOCK(ts0, ws, regB, 2, 3); }
+        { if (slid < 4) { regB.s0123 = read_imagef(src1, 1*COL_STRIDE     + slid*2 + k*8);
+                          regB.s4567 = read_imagef(src1, 1*COL_STRIDE + 1 + slid*2 + k*8); }
+          MAC_Q4K_BLOCK(ts1, ws, regB, 2, 3); }
+        { if (slid < 4) { regB.s0123 = read_imagef(src1, 2*COL_STRIDE     + slid*2 + k*8);
+                          regB.s4567 = read_imagef(src1, 2*COL_STRIDE + 1 + slid*2 + k*8); }
+          MAC_Q4K_BLOCK(ts2, ws, regB, 2, 3); }
+#else
         // Per-column: load only this column's activation (single regB live at a
         // time -> 1/3 the activation register pressure vs holding all 3) then
         // dequant against the shared weights. Cuts the private-mem spill.
@@ -419,6 +520,7 @@ kernel void kernel_gemv_noshuffle_q4_k_f32_mc3(
           dequantizeBlockAccum_ns_sgbroadcast_1_hi(ts2, as_ushort8(regA_hi), regS, regM, regB);
           dequantizeBlockAccum_ns_sgbroadcast_1_lo(ts2, as_ushort8(regA_lo), regS, regM, regB); }
 #endif
+#endif // Q4K_MC3_DEQUANT_ONCE
     }
 
     // cross-subgroup reduce: pack the 3 columns' float2 into a float8 (6 used).
