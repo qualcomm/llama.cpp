@@ -103,3 +103,94 @@ kernel void kernel_gemv_noshuffle_q6_K_f32_tiled(
         dst[row] = total;
     }
 }
+
+// Multi-column (N=3) variant of the tiled q6_K decode GEMV, for the speculative/
+// MTP VERIFY lm_head/embed (ne1=3 = 2 drafts + 1 bonus). Identical tiled weight
+// layout + unpack as the ne1=1 kernel above; each WI computes 3 output columns,
+// streaming the (large) lm_head weight ONCE per superblock and reusing it across
+// the 3 verify activation columns (dequant once per code, MAC into 3 accs). This
+// is the lm_head analogue of the per-layer mc3 GEMV; the multiply order matches
+// the ne1=1 kernel, so each column is byte-identical to a standalone tiled GEMV.
+#if defined(ADRENO_GPU)
+REQD_SUBGROUP_SIZE_64
+#endif
+kernel void kernel_gemv_noshuffle_q6_K_f32_tiled_mc3(
+    __global uint4 * src0_ql,
+    __global uint4 * src0_qh,
+    __global char  * src0_s,
+    __global half  * src0_d,
+    read_only image1d_buffer_t src1,
+    global float * dst,
+    ulong offsetd,
+    int ne00,
+    int ne01
+) {
+    int grp = get_local_id(1);
+    int row = get_global_id(0);
+    int rt  = row / TILE_ROWS;
+    int rit = row % TILE_ROWS;
+
+    int nb = ne00 / 256;
+    int col_stride = ne00 / 4;          // activation float4 pixels per column
+
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f;
+
+    for (int sb = grp; sb < nb; sb += NSUBGROUPS) {
+        int tile_blk = rt * nb + sb;
+
+        float dval = (float)src0_d[tile_blk * TILE_ROWS + rit];
+        __global char * sc = src0_s + (tile_blk * TILE_ROWS + rit) * 16;
+
+        uint ql[32];
+        uint qh[16];
+        #pragma unroll
+        for (int g = 0; g < 8; ++g) {
+            uint4 v = src0_ql[(tile_blk * 8 + g) * TILE_ROWS + rit];
+            ql[g*4+0] = v.x; ql[g*4+1] = v.y; ql[g*4+2] = v.z; ql[g*4+3] = v.w;
+        }
+        #pragma unroll
+        for (int g = 0; g < 4; ++g) {
+            uint4 v = src0_qh[(tile_blk * 4 + g) * TILE_ROWS + rit];
+            qh[g*4+0] = v.x; qh[g*4+1] = v.y; qh[g*4+2] = v.z; qh[g*4+3] = v.w;
+        }
+
+        int act_base = sb * 64;
+        #pragma unroll
+        for (int e4 = 0; e4 < 64; ++e4) {
+            float4 a0 = read_imagef(src1, 0*col_stride + act_base + e4);
+            float4 a1 = read_imagef(src1, 1*col_stride + act_base + e4);
+            float4 a2 = read_imagef(src1, 2*col_stride + act_base + e4);
+            #pragma unroll
+            for (int t = 0; t < 4; ++t) {
+                int  e    = e4 * 4 + t;
+                uint low4 = (ql[e >> 3] >> ((e & 7) * 4)) & 0xF;
+                uint hi2  = (qh[e >> 4] >> ((e & 15) * 2)) & 0x3;
+                int  code = (int)(low4 | (hi2 << 4)) - 32;
+                int  sidx = ((e >> 7) << 3) + (((e >> 5) & 3) << 1) + ((e >> 4) & 1);
+                float w   = (float)code * ((float)sc[sidx] * dval);  // dequant+scale once
+                float av0 = (t == 0) ? a0.x : (t == 1) ? a0.y : (t == 2) ? a0.z : a0.w;
+                float av1 = (t == 0) ? a1.x : (t == 1) ? a1.y : (t == 2) ? a1.z : a1.w;
+                float av2 = (t == 0) ? a2.x : (t == 1) ? a2.y : (t == 2) ? a2.z : a2.w;
+                acc0 += w * av0;
+                acc1 += w * av1;
+                acc2 += w * av2;
+            }
+        }
+    }
+
+    local float4 reduce_lm[NSUBGROUPS * TILE_ROWS];
+    reduce_lm[grp * TILE_ROWS + rit] = (float4)(acc0, acc1, acc2, 0.0f);
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    if (grp == 0) {
+        float4 total = reduce_lm[0 * TILE_ROWS + rit]
+                     + reduce_lm[1 * TILE_ROWS + rit]
+                     + reduce_lm[2 * TILE_ROWS + rit]
+                     + reduce_lm[3 * TILE_ROWS + rit];
+        dst = (global float*)((global char*)dst + offsetd);
+        // dst column-major [ne01 rows x 3 cols]: (row, col) at col*ne01 + row
+        dst[0*ne01 + row] = total.x;
+        dst[1*ne01 + row] = total.y;
+        dst[2*ne01 + row] = total.z;
+    }
+}
