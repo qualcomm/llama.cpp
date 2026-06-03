@@ -931,6 +931,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemv_noshuffle_q4_k_f32_o4;  // 4-output-per-WI, long-vocab lm_head
     cl_kernel kernel_gemv_noshuffle_q4_k_f32_tiled;  // tiled-wide layout (opt-in)
     cl_kernel kernel_convert_block_q4_k_tiled_ns;    // tiled-wide convert (opt-in)
+    cl_kernel kernel_gemv_noshuffle_q4_k_f32_mc3;  // multi-column (N=3) verify GEMV
     cl_kernel kernel_gemm_noshuffle_q4_k_f32;
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_r1;
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_kimg;
@@ -941,6 +942,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemv_noshuffle_q6_K_f32_tiled;      // tiled-wide layout (opt-in)
     cl_kernel kernel_gemm_noshuffle_q6_K_f32_tiled;      // batched (N>1) over the tiled layout
     cl_kernel kernel_convert_block_q6_k_tiled_ns;        // tiled-wide convert (opt-in)
+    cl_kernel kernel_gemv_noshuffle_q6_K_f32_mc3;        // multi-column (N=3) verify GEMV
     cl_kernel kernel_gemm_noshuffle_q6_K_f32;
     cl_kernel kernel_gemm_noshuffle_q6_K_f32_cok;
     cl_kernel kernel_gemv_noshuffle_q5_k_f32;
@@ -3488,6 +3490,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             backend_ctx->context, backend_ctx->device, kernel_src.c_str(), CL_gemv_compile_opts);
 
         CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q4_k_f32 = clCreateKernel(prog, "kernel_gemv_noshuffle_q4_k_f32", &err), err));
+        CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q4_k_f32_mc3 = clCreateKernel(prog, "kernel_gemv_noshuffle_q4_k_f32_mc3", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
@@ -3967,6 +3970,18 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), CL_gemv_compile_opts);
 
         CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q6_K_f32 = clCreateKernel(prog, "kernel_gemv_noshuffle_q6_K_f32", &err), err));
+        CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q6_K_f32_mc3 = clCreateKernel(prog, "kernel_gemv_noshuffle_q6_K_f32_mc3", &err), err));
+        if (getenv("GGML_OPENCL_MC3_PROBE")) {
+            cl_ulong pm6 = 0, pm4 = 0; size_t wg6 = 0, wg4 = 0, mult = 0;
+            clGetKernelWorkGroupInfo(backend_ctx->kernel_gemv_noshuffle_q6_K_f32_mc3, backend_ctx->device, CL_KERNEL_PRIVATE_MEM_SIZE, sizeof(pm6), &pm6, NULL);
+            clGetKernelWorkGroupInfo(backend_ctx->kernel_gemv_noshuffle_q6_K_f32_mc3, backend_ctx->device, CL_KERNEL_WORK_GROUP_SIZE, sizeof(wg6), &wg6, NULL);
+            clGetKernelWorkGroupInfo(backend_ctx->kernel_gemv_noshuffle_q4_k_f32_mc3, backend_ctx->device, CL_KERNEL_PRIVATE_MEM_SIZE, sizeof(pm4), &pm4, NULL);
+            clGetKernelWorkGroupInfo(backend_ctx->kernel_gemv_noshuffle_q4_k_f32_mc3, backend_ctx->device, CL_KERNEL_WORK_GROUP_SIZE, sizeof(wg4), &wg4, NULL);
+            clGetKernelWorkGroupInfo(backend_ctx->kernel_gemv_noshuffle_q6_K_f32_mc3, backend_ctx->device, CL_KERNEL_PREFERRED_WORK_GROUP_SIZE_MULTIPLE, sizeof(mult), &mult, NULL);
+            fprintf(stderr, "[MC3-PROBE] q4K_mc3 private=%llu wg_cap=%zu | q6K_mc3 private=%llu wg_cap=%zu | pref_mult=%zu\n",
+                          (unsigned long long)pm4, wg4, (unsigned long long)pm6, wg6, mult);
+            fflush(stderr);
+        }
         GGML_LOG_CONT(".");
     }
 
@@ -15644,12 +15659,23 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
     cl_uchar mask_d4 = 0x0F;
     cl_uchar mask_hi2 = 0xC0;
 
-    if (ne1 == 1) {
+    // Multi-column verify GEMV: route the spec/MTP verify batch (ne1==3 = 2
+    // drafts + 1 bonus) onto the efficient GEMV path (subgroup-broadcast, no
+    // transpose) instead of the transposed-GEMM dead-zone. Reuses the ne1==1
+    // GEMV setup (the activation image is already sized by N=ne1). Byte-
+    // identical. Opt-in via GGML_OPENCL_Q4K_MC3=1 while validating.
+    static const bool q4k_mc3 = (getenv("GGML_OPENCL_Q4K_MC3") != nullptr);
+    // Per-layer only (ne01 < 32768): the batched large-vocab lm_head at ne1==3
+    // is left to the existing routing (corrupts on the Adreno GEMV path; x2-
+    // unified routes batched Q6_K lm_head to CPU). Per-layer mc3 is byte-identical.
+    const bool use_mc3 = q4k_mc3 && (ne1 == 3) && (ne01 < 32768);
+
+    if (ne1 == 1 || use_mc3) {
         cl_mem q_img = nullptr;
         cl_mem b_sub_buf = nullptr;
         cl_mem b_img = nullptr;
 
-        const bool use_tiled = use_q4k_tiled(src0);
+        const bool use_tiled = !use_mc3 && use_q4k_tiled(src0);
 
         // image for q (not needed for the tiled path, which reads __global)
         if (!use_tiled) {
@@ -15676,17 +15702,15 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
 
         // 4-output-per-WI o4 variant for the long-vocab lm_head/embed GEMV
         // (ne01 = vocab ~256K on Gemma): shares one activation read across 4
-        // output rows. Per the decode profile this kernel is ~36% of Gemma-4
-        // token-gen at ~16 ms/call. Gated to large ne01 — per-layer q4_K
-        // matmuls have ne01 = hidden (2-8K) where halving the WG count would
-        // drop below the device's saturating concurrent-WG threshold (the
-        // q6_K o4 measured -16% there). Default on; opt-out GGML_OPENCL_Q4K_GEMV_O4=0.
+        // output rows. Gated to large ne01 (lm_head/embed). Default on; opt-out
+        // GGML_OPENCL_Q4K_GEMV_O4=0. (Skipped when mc3 handles the ne1==3 verify.)
         static const bool q4k_o4_env = []{
             const char * e = std::getenv("GGML_OPENCL_Q4K_GEMV_O4");
             return !e || e[0] == '\0' || e[0] != '0';
         }();
-        const bool use_q4k_o4 = !use_tiled && q4k_o4_env && (ne01 % 4 == 0) && (ne01 >= 32768);
-        kernel = use_tiled  ? backend_ctx->kernel_gemv_noshuffle_q4_k_f32_tiled
+        const bool use_q4k_o4 = !use_tiled && !use_mc3 && q4k_o4_env && (ne01 % 4 == 0) && (ne01 >= 32768);
+        kernel = use_mc3    ? backend_ctx->kernel_gemv_noshuffle_q4_k_f32_mc3
+               : use_tiled  ? backend_ctx->kernel_gemv_noshuffle_q4_k_f32_tiled
                : use_q4k_o4 ? backend_ctx->kernel_gemv_noshuffle_q4_k_f32_o4
                             : backend_ctx->kernel_gemv_noshuffle_q4_k_f32;
 
@@ -15924,7 +15948,17 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
     cl_image_desc    img_desc;
 
     // subbuffer and image for activation
-    if (ne1 == 1) {
+    // Multi-column verify GEMV: route the spec/MTP verify q6_K matmuls (ne1==3)
+    // onto the efficient GEMV path instead of the transposed-GEMM dead-zone.
+    // Reuses the ne1==1 image setup (activation image sized by N=ne1). Byte-
+    // identical. Opt-in via GGML_OPENCL_Q6K_MC3=1 while validating.
+    static const bool q6k_mc3 = (getenv("GGML_OPENCL_Q6K_MC3") != nullptr);
+    // Per-layer only (ne01 < 32768): batched large-vocab lm_head stays on the
+    // existing path (x2-unified routes batched Q6_K lm_head to CPU; the Adreno
+    // GEMV corrupts it). Per-layer mc3 is byte-identical.
+    const bool use_q6k_mc3 = q6k_mc3 && (ne1 == 3) && (ne01 < 32768);
+
+    if (ne1 == 1 || use_q6k_mc3) {
         cl_mem ql_img = nullptr;
         cl_mem qh_img = nullptr;
         cl_mem b_sub_buffer = nullptr;
@@ -15946,8 +15980,8 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
             const char * e = std::getenv("GGML_OPENCL_Q6K_GEMV_O4_GLOBAL");
             return !e || e[0] == '\0' || e[0] != '0';
         }();
-        const bool use_tiled     = use_q6k_tiled(src0);
-        const bool use_o4        = !use_tiled && gemv_o4_env && (ne01 % 4 == 0) && (ne01 >= 32768);
+        const bool use_tiled     = !use_q6k_mc3 && use_q6k_tiled(src0);
+        const bool use_o4        = !use_tiled && !use_q6k_mc3 && gemv_o4_env && (ne01 % 4 == 0) && (ne01 >= 32768);
         const bool use_o4_global = use_o4 && o4_global_env;
 
         // ql/qh image views are only needed when NOT reading weights from global.
@@ -15983,7 +16017,8 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
         img_desc.buffer = b_sub_buffer;
         CL_CHECK((b_img = clCreateImage(context, CL_MEM_READ_ONLY, &img_fmt, &img_desc, NULL, &err), err));
 
-        kernel = use_tiled     ? backend_ctx->kernel_gemv_noshuffle_q6_K_f32_tiled
+        kernel = use_q6k_mc3   ? backend_ctx->kernel_gemv_noshuffle_q6_K_f32_mc3
+               : use_tiled     ? backend_ctx->kernel_gemv_noshuffle_q6_K_f32_tiled
                : use_o4_global ? backend_ctx->kernel_gemv_noshuffle_q6_K_f32_o4_global
                : use_o4        ? backend_ctx->kernel_gemv_noshuffle_q6_K_f32_o4
                                : backend_ctx->kernel_gemv_noshuffle_q6_K_f32;
