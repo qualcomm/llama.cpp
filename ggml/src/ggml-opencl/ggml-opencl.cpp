@@ -7507,6 +7507,19 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                     // layout); the plain noshuffle GEMM still handles the non-tiled convert
                     // (GGML_OPENCL_Q6K_GEMV_TILED=0). Verified Llama-3.2-1B-Q4_K_M GPU PPL
                     // == CPU in both convert modes. No CPU fallback needed.
+
+                    // ... EXCEPT it is NOT fully fixed: the batched large-vocab quant
+                    // lm_head/embed (ne1>1) still corrupts on the Adreno trans-weight GEMM
+                    // in a DATA-DEPENDENT way — gemma-4-E4B GPU PPL explodes (94 -> 1.5e5)
+                    // at ne1>=128, and the gemma4 MTP verify batch produces garbage logits
+                    // (wrong argmax) from a byte-correct hidden even at ne1=3. The hidden
+                    // feeding the lm_head matches CPU to f16 rounding; only the GEMM output
+                    // is wrong, and only for certain activation distributions (so random
+                    // op-tests pass). Route batched large-vocab quant lm_head/embed to CPU;
+                    // single-token decode (ne1==1, GEMV) is correct and stays on GPU.
+                    if (op->ne[0] >= 32768 && op->src[1]->ne[1] > 1) {
+                        return false;
+                    }
                 }
                 return op->src[1]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]);
             } else if (op->src[0]->type == GGML_TYPE_Q8_0) {
