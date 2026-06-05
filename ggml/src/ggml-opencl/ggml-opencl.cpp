@@ -6039,7 +6039,11 @@ static inline bool use_flat_gemv_for_large_m_q4_K(const ggml_tensor *tensor) {
     // gemv_noshuffle variant perf drops for large M, use flat variant for large M.
     // threshold is well above typical hidden/FFN dims, but below typical vocab sizes.
     // note that this forces large M weights to use LM GEMM.
-    return tensor->ne[1] >= 32768 && tensor->ne[2] == 1 && tensor->ne[3] == 1;
+    // EXCEPT when this branch's tiled-canonical lm_head/embed layout is active: the
+    // weight is converted to the 64-row tiled layout, which the flat gemv would
+    // misread as garbage. use_q4k_tiled owns these large-M weights, so defer to it.
+    return tensor->ne[1] >= 32768 && tensor->ne[2] == 1 && tensor->ne[3] == 1
+           && !use_q4k_tiled(tensor);
 }
 
 static inline bool use_flat_gemv_for_large_m_q6_K(const ggml_tensor *tensor) {
@@ -6047,7 +6051,11 @@ static inline bool use_flat_gemv_for_large_m_q6_K(const ggml_tensor *tensor) {
     // threshold is well above typical hidden/FFN dims, but below typical vocab sizes.
     // q6_K flat gemv is worse for smaller K; 2048 seems to be a reasonable threshold.
     // note that this forces large M weights to use LM GEMM.
-    return tensor->ne[1] >= 32768 && tensor->ne[0] >= 2048 && tensor->ne[2] == 1 && tensor->ne[3] == 1;
+    // EXCEPT when this branch's tiled-canonical lm_head/embed layout is active: the
+    // weight is converted to the 64-row tiled layout, which the flat gemv would
+    // misread as garbage. use_q6k_tiled owns these large-M weights, so defer to it.
+    return tensor->ne[1] >= 32768 && tensor->ne[0] >= 2048 && tensor->ne[2] == 1 && tensor->ne[3] == 1
+           && !use_q6k_tiled(tensor);
 }
 
 static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
