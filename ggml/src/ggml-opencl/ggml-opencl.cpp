@@ -16555,7 +16555,18 @@ static void ggml_cl_mul_mat_q4_0_f32_adreno(ggml_backend_t backend, const ggml_t
         // per-lane K-walk) for small M. Layout stride is fixed (4 uints/block), so only
         // the K-split count changes; the mc3 kernel reads it via get_local_size(1). The
         // ne1==1 base kernel hardcodes N_SIMDGROUP=4, so it always stays at 4.
-        const int mc3_nsg = (use_q40_mc3 && ne01 < 4096) ? 8 : 4;
+        int mc3_nsg = (use_q40_mc3 && ne01 < 4096) ? 8 : 4;
+        // Clamp the K-split (get_local_size(1)) so 64*mc3_nsg fits the per-kernel
+        // WG cap. On Adreno X1-85 the q4_0 mc3 kernel's CL_KERNEL_WORK_GROUP_SIZE
+        // is < 512, so the 8-subgroup small-M path returns CL_INVALID_WORK_GROUP_SIZE.
+        // X2-90 keeps nsg=8; X1-85 drops to 4. The kernel reads the split count via
+        // get_local_size(1), so clamping is safe.
+        if (use_q40_mc3) {
+            size_t kwg = backend_ctx->max_workgroup_size;
+            clGetKernelWorkGroupInfo(kernel, backend_ctx->device, CL_KERNEL_WORK_GROUP_SIZE,
+                                     sizeof(kwg), &kwg, NULL);
+            while (mc3_nsg > 1 && (size_t)(64 * mc3_nsg) > kwg) mc3_nsg /= 2;
+        }
         size_t local_work_size[3] = {64, (size_t)mc3_nsg, 1};
         size_t global_work_size[3] = {(size_t)CEIL_DIV(ne01/2, 64)*64, (size_t)mc3_nsg, 1};
 
@@ -18400,10 +18411,12 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
     // existing path (x2-unified routes batched Q6_K lm_head to CPU; the Adreno
     // GEMV corrupts it). Per-layer mc3 is byte-identical.
     const bool use_q6k_mc3 = q6k_mc3 && (ne1 == 3) && (ne01 < 32768);
-    // Batched verify lm_head/embed (ne1==3, tiled layout): multi-column tiled
-    // GEMV — streams the large lm_head weight once across the 3 verify columns
+    // Batched verify lm_head/embed (ne1 in [2..4], tiled layout): multi-column
+    // tiled GEMV — streams the large lm_head weight once across the verify columns
     // (the #1 MTP bottleneck; mc3 above can't, it reads the noshuffle layout).
-    const bool use_q6k_tiled_mc = q6k_mc3 && (ne1 == 3) && (ne01 >= 32768) && use_q6k_tiled(src0);
+    // ne1==4 is the common case (n_max=3 drafts + 1 bonus); the prior ne1==3 gate
+    // never fired in practice so the lm_head fell to the dead-zone tiled GEMM.
+    const bool use_q6k_tiled_mc = q6k_mc3 && (ne1 >= 2 && ne1 <= 4) && (ne01 >= 32768) && use_q6k_tiled(src0);
 
     if (ne1 == 1 || use_q6k_mc3 || use_q6k_tiled_mc) {
         cl_mem ql_img = nullptr;
@@ -18485,6 +18498,10 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
         CL_CHECK(clSetKernelArg(kernel, 6, sizeof(cl_ulong), &offsetd));
         CL_CHECK(clSetKernelArg(kernel, 7, sizeof(cl_int),   &ne00));
         CL_CHECK(clSetKernelArg(kernel, 8, sizeof(cl_int),   &ne01));
+        if (use_q6k_tiled_mc) {
+            // tiled_mc3 takes the verify column count (2..4) as an extra arg.
+            CL_CHECK(clSetKernelArg(kernel, 9, sizeof(cl_int), &ne1));
+        }
 
         const size_t gws_x = use_tiled
                                  ? (size_t) CEIL_DIV(ne01, 64) * 64
