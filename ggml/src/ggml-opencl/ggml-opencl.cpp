@@ -67,6 +67,54 @@ typedef const void * (*get_adreno_bin_kernel_func_t)(
     } while (0)
 
 //------------------------------------------------------------------------------
+// cl_qcom_recordable_queues
+//
+// Self-contained declarations for the Qualcomm recordable-queue extension so we
+// don't depend on the system <CL/cl_ext_qcom.h> exposing it. ABI matches
+// QC's cl_ext_qcom.h exactly (see opencl-adreno skill raw SDK). This extension
+// records a fixed sequence of clEnqueueNDRangeKernel dispatches once and replays
+// it via a single driver call (clEnqueueRecordingQCOM) — OpenCL's analog of CUDA
+// graphs. Only NDRange enqueues may be recorded; events must be NULL while
+// recording. Used to cut the per-dispatch CPU enqueue overhead on Adreno decode
+// (~1264 tiny dispatches/token, ~15% exposed non-GPU time on Gemma-4-E4B).
+//------------------------------------------------------------------------------
+#ifndef CL_QUEUE_RECORDABLE_QCOM
+#define CL_QUEUE_RECORDABLE_QCOM (1u << 30u)
+#define CL_DEVICE_RECORDABLE_QUEUE_MAX_SIZE_QCOM 0x41DE
+
+typedef struct _cl_recording_qcom * cl_recording_qcom;
+
+typedef struct _cl_array_arg_qcom {
+    cl_uint      dispatch_index;
+    cl_uint      arg_index;
+    size_t       arg_size;
+    const void * arg_value;
+} cl_array_arg_qcom;
+
+typedef struct _cl_workgroup_qcom {
+    cl_uint        dispatch_index;
+    const size_t * workgroup_size;
+} cl_workgroup_qcom;
+
+typedef struct _cl_offset_qcom {
+    cl_uint dispatch_index;
+    size_t  offsets[3];
+} cl_offset_qcom;
+#endif // CL_QUEUE_RECORDABLE_QCOM
+
+// Function-pointer typedefs (loaded via clGetExtensionFunctionAddressForPlatform).
+typedef cl_recording_qcom (CL_API_CALL * ggml_clNewRecordingQCOM_fn)(cl_command_queue, cl_int *);
+typedef cl_int (CL_API_CALL * ggml_clEndRecordingQCOM_fn)(cl_recording_qcom);
+typedef cl_int (CL_API_CALL * ggml_clReleaseRecordingQCOM_fn)(cl_recording_qcom);
+typedef cl_int (CL_API_CALL * ggml_clEnqueueRecordingQCOM_fn)(
+    cl_command_queue, cl_recording_qcom,
+    size_t, const cl_array_arg_qcom *,
+    size_t, const cl_offset_qcom *,
+    size_t, const cl_workgroup_qcom *,
+    size_t, const cl_workgroup_qcom *,
+    cl_uint, const cl_event *, cl_event *);
+
+//------------------------------------------------------------------------------
 // OpenCL
 //------------------------------------------------------------------------------
 
@@ -525,6 +573,22 @@ struct ggml_opencl_fa_kernels {
 };
 
 // backend context
+// Per-node fingerprint used to decide whether a recorded dispatch sequence is
+// still valid for the current cgraph (mirrors ggml-cuda's node_properties +
+// memcmp). Any change in op, tensor dims/strides, or buffer data pointers
+// invalidates the recording and forces a re-record.
+struct ggml_cl_node_fingerprint {
+    int     op;
+    void *  dst_data;
+    int64_t dst_ne[GGML_MAX_DIMS];
+    size_t  dst_nb[GGML_MAX_DIMS];
+    void *  src_data[GGML_MAX_SRC];
+    int64_t src_ne[GGML_MAX_SRC][GGML_MAX_DIMS];
+    size_t  src_nb[GGML_MAX_SRC][GGML_MAX_DIMS];
+    // op_params capture position/scale-style scalars baked into kernel args
+    int32_t op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t)];
+};
+
 struct ggml_backend_opencl_context {
     int ref_count;
 
@@ -555,6 +619,7 @@ struct ggml_backend_opencl_context {
     bool has_integer_dot      = false;       // cl_khr_integer_dot_product or cl_qcom_dot_product8
     bool has_qcom_subgroup_shuffle = false;  // specifically cl_qcom_subgroup_shuffle
     bool disable_fusion;
+    bool fuse_rope_set_rows = true;  // opt-out GGML_OPENCL_FUSE_ROPE_SET_ROWS=0
 
     // ragged moe, use int to directly pass to kernel
     cl_uint  adreno_use_moe_ragged;
@@ -584,6 +649,23 @@ struct ggml_backend_opencl_context {
     cl_context context;
     cl_command_queue queue;
 
+    // --- cl_qcom_recordable_queues state (decode dispatch-overhead reduction) ---
+    bool             rec_supported = false;   // extension present
+    bool             rec_enabled   = false;   // opt-in via GGML_OPENCL_RECORDABLE_QUEUE
+    cl_command_queue rec_queue     = nullptr; // CL_QUEUE_RECORDABLE_QCOM queue used only to capture
+    cl_uint          rec_max_size  = 0;       // CL_DEVICE_RECORDABLE_QUEUE_MAX_SIZE_QCOM
+    ggml_clNewRecordingQCOM_fn      clNewRecordingQCOM     = nullptr;
+    ggml_clEndRecordingQCOM_fn      clEndRecordingQCOM     = nullptr;
+    ggml_clReleaseRecordingQCOM_fn  clReleaseRecordingQCOM = nullptr;
+    ggml_clEnqueueRecordingQCOM_fn  clEnqueueRecordingQCOM = nullptr;
+    // currently-cached recording + the cgraph fingerprint it was recorded for
+    cl_recording_qcom               rec_recording = nullptr;
+    const void *                    rec_graph_key = nullptr;
+    uint64_t                        rec_uid = 0;       // cgraph->uid the recording was built for
+    std::vector<ggml_cl_node_fingerprint> rec_fingerprints;
+    bool                            rec_active = false; // true while capturing into rec_queue
+    int                             rec_dispatch_count = 0; // dispatches in the last capture
+
     // prealloc buffers for transposing weights and activations
     ggml_cl_buffer prealloc_quant_trans;
     ggml_cl_buffer prealloc_scales_trans;
@@ -594,6 +676,7 @@ struct ggml_backend_opencl_context {
     ggml_cl_buffer prealloc_moe_sa;   // per-block s  [tok_slots * ne00/32] (half)
     // scratch copy of the router weights to avoid dst aliasing
     ggml_cl_buffer prealloc_moe_combine_w;
+    ggml_cl_buffer prealloc_splitk_partial;  // [ksplit * M] partials for split-K GEMV
 
     // Pool of persistent image1d_buffer views over KV-cache layers, keyed by
     // (parent buffer, offset within parent). Used by the IMG-variant KQ/KQV
@@ -723,7 +806,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_geglu, kernel_reglu, kernel_swiglu, kernel_swiglu_oai, kernel_geglu_erf, kernel_geglu_quick,
               kernel_geglu_f16, kernel_reglu_f16, kernel_swiglu_f16, kernel_geglu_erf_f16, kernel_geglu_quick_f16;
     cl_kernel kernel_norm, kernel_norm_mul_add;
-    cl_kernel kernel_rms_norm, kernel_rms_norm_mul;
+    cl_kernel kernel_rms_norm, kernel_rms_norm_mul, kernel_rms_norm_mul_add;
     cl_kernel kernel_l2_norm_f32;
     cl_kernel kernel_group_norm, kernel_group_norm_mul_add;
     cl_kernel kernel_diag_mask_inf, kernel_diag_mask_inf_8;
@@ -738,6 +821,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_set_rows_q4_0_i64, kernel_set_rows_q4_0_i32;
     cl_kernel kernel_set_rows_q4_0_soa_i64, kernel_set_rows_q4_0_soa_i32;
     cl_kernel kernel_rope_norm_f32, kernel_rope_norm_f16, kernel_rope_neox_f32, kernel_rope_neox_f16;
+    cl_kernel kernel_rope_norm_f32_set_rows_f16, kernel_rope_neox_f32_set_rows_f16;
     cl_kernel kernel_rope_multi_f32, kernel_rope_multi_f16, kernel_rope_vision_f32, kernel_rope_vision_f16;
     cl_kernel kernel_cpy_f16_f16, kernel_cpy_f16_f32, kernel_cpy_f32_f16, kernel_cpy_f32_f32, kernel_cpy_f32_f32_pack, kernel_cpy_i32_i32;
     cl_kernel kernel_mul_mat_f32_f32;
@@ -1006,6 +1090,15 @@ struct ggml_backend_opencl_context {
     }
 
     void enqueue_ndrange_kernel(cl_kernel kernel, cl_uint work_dim, size_t *global_work_size, size_t *local_work_size, const ggml_tensor * tensor) {
+        // While capturing into a recordable queue, only NDRange enqueues are
+        // legal and the event must be NULL. The recordable queue also cannot
+        // have profiling enabled, so skip the profiling path entirely.
+        if (rec_active) {
+            GGML_UNUSED(tensor);
+            rec_dispatch_count++;
+            CL_CHECK(clEnqueueNDRangeKernel(rec_queue, kernel, work_dim, NULL, global_work_size, local_work_size, 0, NULL, NULL));
+            return;
+        }
 #ifdef GGML_OPENCL_PROFILING
         cl_event evt;
         CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, work_dim, NULL, global_work_size, local_work_size, 0, NULL, &evt));
@@ -1065,6 +1158,8 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemm_noshuffle_q1_0_f32;
     cl_kernel kernel_gemv_noshuffle_q1_0_f32;
     cl_kernel kernel_gemv_noshuffle_q4_k_f32;
+    cl_kernel kernel_gemv_noshuffle_q4_k_f32_splitk;  // split-K across WGs (small M)
+    cl_kernel kernel_gemv_splitk_reduce_f32;          // sums split-K partials
     cl_kernel kernel_gemv_noshuffle_q4_k_f32_o4;  // 4-output-per-WI, long-vocab lm_head
     cl_kernel kernel_gemv_noshuffle_q4_k_f32_tiled;  // tiled-wide layout (opt-in)
     cl_kernel kernel_convert_block_q4_k_tiled_ns;    // tiled-wide convert (opt-in)
@@ -1124,6 +1219,16 @@ struct ggml_backend_opencl_context {
                 if (kv.second.sub_buffer) CL_CHECK(clReleaseMemObject(kv.second.sub_buffer));
             }
             kqv_img_pool.clear();
+
+            // Release recordable-queue state.
+            if (rec_recording && clReleaseRecordingQCOM) {
+                clReleaseRecordingQCOM(rec_recording);
+                rec_recording = nullptr;
+            }
+            if (rec_queue) {
+                clReleaseCommandQueue(rec_queue);
+                rec_queue = nullptr;
+            }
         }
     }
 };
@@ -2519,8 +2624,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         backend_ctx->program_rms_norm =
             build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
 
-        CL_CHECK((backend_ctx->kernel_rms_norm     = clCreateKernel(backend_ctx->program_rms_norm, "kernel_rms_norm", &err), err));
-        CL_CHECK((backend_ctx->kernel_rms_norm_mul = clCreateKernel(backend_ctx->program_rms_norm, "kernel_rms_norm_mul", &err), err));
+        CL_CHECK((backend_ctx->kernel_rms_norm         = clCreateKernel(backend_ctx->program_rms_norm, "kernel_rms_norm", &err), err));
+        CL_CHECK((backend_ctx->kernel_rms_norm_mul     = clCreateKernel(backend_ctx->program_rms_norm, "kernel_rms_norm_mul", &err), err));
+        CL_CHECK((backend_ctx->kernel_rms_norm_mul_add = clCreateKernel(backend_ctx->program_rms_norm, "kernel_rms_norm_mul_add", &err), err));
         GGML_LOG_CONT(".");
     }
 
@@ -2557,6 +2663,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         CL_CHECK((backend_ctx->kernel_rope_norm_f16   = clCreateKernel(backend_ctx->program_rope, "kernel_rope_norm_f16", &err), err));
         CL_CHECK((backend_ctx->kernel_rope_neox_f32   = clCreateKernel(backend_ctx->program_rope, "kernel_rope_neox_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_rope_neox_f16   = clCreateKernel(backend_ctx->program_rope, "kernel_rope_neox_f16", &err), err));
+        CL_CHECK((backend_ctx->kernel_rope_norm_f32_set_rows_f16 = clCreateKernel(backend_ctx->program_rope, "kernel_rope_norm_f32_set_rows_f16", &err), err));
+        CL_CHECK((backend_ctx->kernel_rope_neox_f32_set_rows_f16 = clCreateKernel(backend_ctx->program_rope, "kernel_rope_neox_f32_set_rows_f16", &err), err));
         CL_CHECK((backend_ctx->kernel_rope_multi_f32  = clCreateKernel(backend_ctx->program_rope, "kernel_rope_multi_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_rope_multi_f16  = clCreateKernel(backend_ctx->program_rope, "kernel_rope_multi_f16", &err), err));
         CL_CHECK((backend_ctx->kernel_rope_vision_f32 = clCreateKernel(backend_ctx->program_rope, "kernel_rope_vision_f32", &err), err));
@@ -3907,6 +4015,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 
         CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q4_k_f32 = clCreateKernel(prog, "kernel_gemv_noshuffle_q4_k_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q4_k_f32_mc3 = clCreateKernel(prog, "kernel_gemv_noshuffle_q4_k_f32_mc3", &err), err));
+        CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q4_k_f32_splitk = clCreateKernel(prog, "kernel_gemv_noshuffle_q4_k_f32_splitk", &err), err));
+        CL_CHECK((backend_ctx->kernel_gemv_splitk_reduce_f32 = clCreateKernel(prog, "kernel_gemv_splitk_reduce_f32", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
@@ -6041,6 +6151,24 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
     // check Adreno large buffer support
     backend_ctx->adreno_has_large_buffer = strstr(ext_buffer, "cl_qcom_large_buffer") != NULL;
 
+
+    // check recordable-queue support (cl_qcom_recordable_queues). Opt-in via
+    // GGML_OPENCL_RECORDABLE_QUEUE=1 — it records the decode dispatch sequence
+    // once and replays it in one driver call, cutting per-dispatch CPU overhead.
+    // Cannot coexist with profiling (the recordable queue forbids
+    // CL_QUEUE_PROFILING_ENABLE), so it is force-disabled in profiling builds.
+    if (const char * env = getenv("GGML_OPENCL_FUSE_ROPE_SET_ROWS")) {
+        backend_ctx->fuse_rope_set_rows = atoi(env) != 0;
+    }
+
+    backend_ctx->rec_supported = strstr(ext_buffer, "cl_qcom_recordable_queues") != NULL;
+#ifndef GGML_OPENCL_PROFILING
+    {
+        const char * e = getenv("GGML_OPENCL_RECORDABLE_QUEUE");
+        backend_ctx->rec_enabled = backend_ctx->rec_supported && e && e[0] == '1';
+    }
+#endif
+
     // subgroup shuffle support (N_SPLIT>1 FA kernel)
     backend_ctx->has_qcom_subgroup_shuffle = strstr(ext_buffer, "cl_qcom_subgroup_shuffle") != NULL;
     backend_ctx->has_subgroup_shuffle =
@@ -6143,6 +6271,41 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
     command_queue_props |= CL_QUEUE_PROFILING_ENABLE;
 #endif
     CL_CHECK((backend_ctx->queue = clCreateCommandQueue(context, device, command_queue_props, &err), err));
+
+    // Set up the recordable queue (cl_qcom_recordable_queues) used to capture
+    // the decode dispatch sequence. Kernels are only *recorded* here; replay
+    // happens on backend_ctx->queue. If anything fails, fall back silently to
+    // the normal per-dispatch path.
+    if (backend_ctx->rec_enabled) {
+        backend_ctx->clNewRecordingQCOM = (ggml_clNewRecordingQCOM_fn)
+            clGetExtensionFunctionAddressForPlatform(dev_ctx->platform, "clNewRecordingQCOM");
+        backend_ctx->clEndRecordingQCOM = (ggml_clEndRecordingQCOM_fn)
+            clGetExtensionFunctionAddressForPlatform(dev_ctx->platform, "clEndRecordingQCOM");
+        backend_ctx->clReleaseRecordingQCOM = (ggml_clReleaseRecordingQCOM_fn)
+            clGetExtensionFunctionAddressForPlatform(dev_ctx->platform, "clReleaseRecordingQCOM");
+        backend_ctx->clEnqueueRecordingQCOM = (ggml_clEnqueueRecordingQCOM_fn)
+            clGetExtensionFunctionAddressForPlatform(dev_ctx->platform, "clEnqueueRecordingQCOM");
+
+        clGetDeviceInfo(device, CL_DEVICE_RECORDABLE_QUEUE_MAX_SIZE_QCOM,
+                        sizeof(cl_uint), &backend_ctx->rec_max_size, NULL);
+
+        cl_int rec_err = CL_SUCCESS;
+        if (backend_ctx->clNewRecordingQCOM && backend_ctx->clEndRecordingQCOM &&
+            backend_ctx->clReleaseRecordingQCOM && backend_ctx->clEnqueueRecordingQCOM) {
+            backend_ctx->rec_queue = clCreateCommandQueue(
+                context, device, CL_QUEUE_RECORDABLE_QCOM, &rec_err);
+        }
+        if (!backend_ctx->rec_queue || rec_err != CL_SUCCESS) {
+            fprintf(stderr, "ggml_opencl: recordable queue requested but unavailable (err %d) — using per-dispatch path\n", rec_err);
+            backend_ctx->rec_enabled = false;
+            backend_ctx->rec_queue   = nullptr;
+        } else {
+            fprintf(stderr, "ggml_opencl: recordable queue ENABLED (max %u commands)\n", backend_ctx->rec_max_size);
+        }
+    } else if (getenv("GGML_OPENCL_RECORDABLE_QUEUE")) {
+        fprintf(stderr, "ggml_opencl: recordable queue NOT enabled (supported=%d, profiling build disables it)\n",
+                (int) backend_ctx->rec_supported);
+    }
 
     // delay kernel loading until the first buffer is created
     // load_cl_kernels(backend_ctx.get());
@@ -7021,7 +7184,51 @@ static void ggml_cl_moe_combine_fused(ggml_backend_t backend, const ggml_tensor 
     backend_ctx->enqueue_ndrange_kernel(kernel, 2, gws, lws, dst);
 }
 
+// Fused ROPE + VIEW + SET_ROWS eligibility — mirrors ggml_cuda_should_fuse_rope_set_rows.
+// f32 src → f16 dst, NORMAL/NEOX rope, i64 row indices, contiguous view that
+// flattens the two rope dims, ne[3] == 1.
+static bool ggml_opencl_should_fuse_rope_set_rows(const ggml_tensor * rope,
+                                                  const ggml_tensor * view,
+                                                  const ggml_tensor * set_rows) {
+    if (rope->op != GGML_OP_ROPE || view->op != GGML_OP_VIEW || set_rows->op != GGML_OP_SET_ROWS) {
+        return false;
+    }
+    if (rope->src[0]->ne[3] != 1) {
+        return false;
+    }
+    if (rope->src[0]->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (set_rows->type != GGML_TYPE_F16) {
+        return false;
+    }
+    if (set_rows->src[1]->type != GGML_TYPE_I64) {
+        return false;
+    }
+    if (!ggml_is_contiguous(view) || view->ne[0] != rope->ne[0] * rope->ne[1]) {
+        return false;
+    }
+    const int mode = ((const int32_t *) rope->op_params)[2];
+    if (mode != GGML_ROPE_TYPE_NORMAL && mode != GGML_ROPE_TYPE_NEOX) {
+        return false;
+    }
+    return true;
+}
+
 static bool ggml_opencl_can_fuse(const struct ggml_cgraph * cgraph, int node_idx, std::initializer_list<enum ggml_op> ops) {
+    // ROPE + VIEW + SET_ROWS uses ggml_can_fuse_subgraph (the VIEW is a no-op
+    // node) instead of the contiguous ggml_can_fuse below.
+    if (ops.size() == 3 && ops.begin()[0] == GGML_OP_ROPE &&
+        ops.begin()[1] == GGML_OP_VIEW && ops.begin()[2] == GGML_OP_SET_ROWS) {
+        const enum ggml_op rsr_ops[] = { GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS };
+        const int          rsr_out[] = { node_idx + 2 };
+        if (!ggml_can_fuse_subgraph(cgraph, node_idx, 3, rsr_ops, rsr_out, 1)) {
+            return false;
+        }
+        return ggml_opencl_should_fuse_rope_set_rows(
+            cgraph->nodes[node_idx], cgraph->nodes[node_idx + 1], cgraph->nodes[node_idx + 2]);
+    }
+
     if (!ggml_can_fuse(cgraph, node_idx, ops)) {
         return false;
     }
@@ -7069,6 +7276,44 @@ static bool ggml_opencl_can_fuse(const struct ggml_cgraph * cgraph, int node_idx
         if (!ggml_is_contiguous(norm->src[0]) || !ggml_is_contiguous(w) || !ggml_is_contiguous(b)) {
             return false;
         }
+    } else if (ops.size() == 3 && ops.begin()[0] == GGML_OP_RMS_NORM && ops.begin()[1] == GGML_OP_MUL && ops.begin()[2] == GGML_OP_ADD) {
+        // rms_norm(x) * w + b, fused. Dominant residual pattern on Gemma
+        // matformers (post_attention_norm / post_ffw_norm). Mirrors the
+        // RMS_NORM+MUL gate plus the residual-add operand's constraints.
+        const ggml_tensor *rms_norm = cgraph->nodes[node_idx];
+        const ggml_tensor *mul      = cgraph->nodes[node_idx+1];
+        const ggml_tensor *add      = cgraph->nodes[node_idx+2];
+        const ggml_tensor *w        = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
+        const ggml_tensor *b        = add->src[0] == mul      ? add->src[1] : add->src[0];
+
+        GGML_ASSERT(rms_norm->src[0]->type == GGML_TYPE_F32);
+        GGML_ASSERT(rms_norm->type == GGML_TYPE_F32);
+
+        if (w->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 ||
+            b->type != GGML_TYPE_F32 || add->type != GGML_TYPE_F32) {
+            return false;
+        }
+
+        if (rms_norm->src[0]->ne[0] % 4 != 0) {
+            return false;
+        }
+
+        // if rms_norm is the B operand of mul, broadcast is not handled
+        if (rms_norm == mul->src[1] && !ggml_are_same_shape(mul->src[0], rms_norm)) {
+            return false;
+        }
+
+        // the residual must match the normed output shape (no add broadcast);
+        // the kernel indexes the residual per-row like the norm weight.
+        if (!ggml_are_same_shape(b, add)) {
+            return false;
+        }
+
+        // rms_norm assumes contiguous rows
+        if (!ggml_is_contiguous_rows(mul->src[0]) || !ggml_is_contiguous_rows(mul->src[1]) ||
+            !ggml_is_contiguous_rows(b)) {
+            return false;
+        }
     } else if (ops.size() == 3 && ops.begin()[0] == GGML_OP_GROUP_NORM && ops.begin()[1] == GGML_OP_MUL && ops.begin()[2] == GGML_OP_ADD) {
         const ggml_tensor *gn = cgraph->nodes[node_idx];
         const ggml_tensor *mul = cgraph->nodes[node_idx+1];
@@ -7089,10 +7334,18 @@ static bool ggml_opencl_can_fuse(const struct ggml_cgraph * cgraph, int node_idx
 }
 
 static void ggml_opencl_op_rms_norm_fused(ggml_backend_t backend, ggml_tensor * rms_norm_tensor, ggml_tensor * mul_tensor);
+static void ggml_opencl_op_rms_norm_mul_add_fused(ggml_backend_t backend, ggml_tensor * rms_norm_tensor, ggml_tensor * mul_tensor, ggml_tensor * add_tensor);
 static void ggml_opencl_op_norm_fused(ggml_backend_t backend, ggml_tensor * norm_tensor, ggml_tensor * mul_tensor, ggml_tensor * add_tensor);
 static void ggml_opencl_op_group_norm_fused(ggml_backend_t backend, ggml_tensor * gn_tensor, ggml_tensor * mul_tensor, ggml_tensor * add_tensor);
+static void ggml_cl_rope_set_rows(ggml_backend_t backend, ggml_tensor * rope_tensor, ggml_tensor * view_tensor, ggml_tensor * set_rows_tensor);
 
-static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+// Walk the cgraph and dispatch each node's kernels. When backend_ctx->rec_active
+// is set, the per-op enqueue helper records into the recordable queue instead of
+// the live queue (so this same path both executes normally and captures a
+// recording, with no per-op changes). sync_with_other_backends is skipped while
+// recording: it is a cross-backend host sync, not part of the dispatch sequence,
+// and the single replay handles ordering on the live queue.
+static void ggml_backend_opencl_exec_graph_nodes(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
@@ -7101,7 +7354,9 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
         // NOTE: this may oversynchronize by synchronizing with
         //       backends/devices which don't compute 'cgraph's
         //       dependencies.
-        sync_with_other_backends(backend);
+        if (!backend_ctx->rec_active) {
+            sync_with_other_backends(backend);
+        }
 
         if (ggml_is_empty(node) || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE) {
             continue;
@@ -7132,6 +7387,26 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
             }
         }
 
+        if (!backend_ctx->disable_fusion && backend_ctx->fuse_rope_set_rows &&
+            ggml_opencl_can_fuse(cgraph, i, { GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS })) {
+            ggml_cl_rope_set_rows(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
+            i += 2;
+            continue;
+        }
+
+        // Fuse rms_norm + mul(weight) + add(residual). Default on; opt out with
+        // GGML_OPENCL_FUSE_RMS_ADD=0 (kept separate from the rms_norm+mul fuse so
+        // the residual fold can be A/B'd in isolation).
+        static const bool fuse_rms_add = []{
+            const char * e = std::getenv("GGML_OPENCL_FUSE_RMS_ADD");
+            return !e || e[0] == '\0' || e[0] != '0';
+        }();
+        if (fuse_rms_add && !backend_ctx->disable_fusion &&
+            ggml_opencl_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD })) {
+            ggml_opencl_op_rms_norm_mul_add_fused(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
+            i += 2;
+            continue;
+        }
         if (!backend_ctx->disable_fusion && ggml_opencl_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL })) {
             ggml_opencl_op_rms_norm_fused(backend, node, cgraph->nodes[i+1]);
             i++;
@@ -7143,6 +7418,206 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
             GGML_LOG_ERROR("%s: error: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
         }
         GGML_ASSERT(ok);
+    }
+}
+
+// Fill a per-node fingerprint (op + dst/src dims/strides/pointers + op_params).
+// Any change between tokens invalidates the cached recording.
+static void ggml_cl_node_fp_fill(ggml_cl_node_fingerprint & fp, const ggml_tensor * node) {
+    memset(&fp, 0, sizeof(fp));
+    fp.op       = (int) node->op;
+    fp.dst_data = node->data;
+    memcpy(fp.dst_ne,    node->ne,        sizeof(fp.dst_ne));
+    memcpy(fp.dst_nb,    node->nb,        sizeof(fp.dst_nb));
+    memcpy(fp.op_params, node->op_params, sizeof(fp.op_params));
+    for (int j = 0; j < GGML_MAX_SRC; j++) {
+        const ggml_tensor * s = node->src[j];
+        if (s) {
+            fp.src_data[j] = s->data;
+            memcpy(fp.src_ne[j], s->ne, sizeof(fp.src_ne[j]));
+            memcpy(fp.src_nb[j], s->nb, sizeof(fp.src_nb[j]));
+        }
+    }
+}
+
+// A cgraph is recording-eligible only if every node dispatches purely via
+// clEnqueueNDRangeKernel. FLASH_ATTN_EXT allocates per-call temp buffers whose
+// cl_mem handles change every token (mask blocks / split partials), which a
+// replayed recording would reference as dangling args — so exclude any graph
+// containing it. (Gemma-4 fa=0 dense decode — the target — contains none.)
+static bool ggml_cl_graph_recordable(const ggml_cgraph * cgraph) {
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Compare the current cgraph's compute nodes to the cached fingerprints. Returns
+// true (and refreshes the cache) if the recording must be (re)built.
+static bool ggml_cl_recording_needs_update(ggml_backend_opencl_context * backend_ctx, ggml_cgraph * cgraph) {
+    const void * key = (cgraph->n_nodes > 0) ? (const void *) cgraph->nodes[0] : nullptr;
+
+    // Fast path (mirrors ggml-cuda): a non-zero, unchanged cgraph->uid means the
+    // scheduler reused the exact same split graph — no need to rebuild and memcmp
+    // the per-node fingerprints (which is ~600 KB of CPU work for a 1.5k-node
+    // decode graph). Only fall back to the full check when the uid is absent or
+    // changed.
+    if (backend_ctx->rec_recording != nullptr && key == backend_ctx->rec_graph_key &&
+        cgraph->uid != 0 && cgraph->uid == backend_ctx->rec_uid) {
+        return false;
+    }
+
+    std::vector<ggml_cl_node_fingerprint> cur;
+    cur.reserve(cgraph->n_nodes);
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        ggml_tensor * node = cgraph->nodes[i];
+        if (ggml_is_empty(node) || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE ||
+            node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE) {
+            continue;
+        }
+        if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
+        cur.emplace_back();
+        ggml_cl_node_fp_fill(cur.back(), node);
+    }
+
+    bool changed = backend_ctx->rec_recording == nullptr ||
+                   key != backend_ctx->rec_graph_key ||
+                   cur.size() != backend_ctx->rec_fingerprints.size();
+    if (!changed) {
+        changed = memcmp(cur.data(), backend_ctx->rec_fingerprints.data(),
+                         cur.size() * sizeof(ggml_cl_node_fingerprint)) != 0;
+    }
+    if (changed) {
+        backend_ctx->rec_fingerprints = std::move(cur);
+        backend_ctx->rec_graph_key    = key;
+    }
+    // Always refresh the uid so the next-token fast path can short-circuit.
+    backend_ctx->rec_uid = cgraph->uid;
+    return changed;
+}
+
+static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+    ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
+
+    // One-shot decode-graph dump to discover fusable op adjacencies.
+    // GGML_OPENCL_DUMP_GRAPH=1 prints, for each compute node: index, op, name,
+    // dims, and the op of each src (producer). Used to find fusion targets.
+    static const bool dump_graph = getenv("GGML_OPENCL_DUMP_GRAPH") != nullptr;
+    if (dump_graph) {
+        static int dump_done = 0;
+        if (dump_done < 2) {  // skip warmup graph, dump the 2nd (steady-state decode)
+            if (dump_done == 1) {
+                for (int i = 0; i < cgraph->n_nodes; i++) {
+                    ggml_tensor * n = cgraph->nodes[i];
+                    if (ggml_is_empty(n) || n->op == GGML_OP_RESHAPE || n->op == GGML_OP_TRANSPOSE ||
+                        n->op == GGML_OP_VIEW || n->op == GGML_OP_PERMUTE || n->op == GGML_OP_NONE) continue;
+                    fprintf(stderr, "DG %4d %-16s %-28s [%lldx%lldx%lld] <- %s(%s) , %s(%s)\n", i,
+                        ggml_op_name(n->op), n->name,
+                        (long long)n->ne[0], (long long)n->ne[1], (long long)n->ne[2],
+                        n->src[0] ? ggml_op_name(n->src[0]->op) : "-", n->src[0] ? n->src[0]->name : "-",
+                        n->src[1] ? ggml_op_name(n->src[1]->op) : "-", n->src[1] ? n->src[1]->name : "-");
+                }
+                fprintf(stderr, "DG: total nodes = %d\n", cgraph->n_nodes);
+            }
+            dump_done++;
+        }
+    }
+
+    // Fast path: recordable queues disabled, or graph not eligible.
+    if (!backend_ctx->rec_enabled || !ggml_cl_graph_recordable(cgraph)) {
+        // Drop any stale recording so a later eligible graph re-records cleanly.
+        if (backend_ctx->rec_recording) {
+            backend_ctx->clReleaseRecordingQCOM(backend_ctx->rec_recording);
+            backend_ctx->rec_recording = nullptr;
+            backend_ctx->rec_graph_key = nullptr;
+            backend_ctx->rec_fingerprints.clear();
+        }
+        ggml_backend_opencl_exec_graph_nodes(backend, cgraph);
+        return GGML_STATUS_SUCCESS;
+    }
+
+    static int  s_record_count = 0;
+    static int  s_replay_count = 0;
+    static bool s_log = getenv("GGML_OPENCL_RECORDABLE_LOG") != nullptr;
+
+    const bool need_update = ggml_cl_recording_needs_update(backend_ctx, cgraph);
+
+    if (need_update) {
+        // Size guard: avoid overrunning the driver's max recording size. Most
+        // compute nodes emit a single dispatch; a small headroom factor covers
+        // ops that emit a few. If the estimate exceeds the cap, run normally.
+        if (backend_ctx->rec_max_size != 0 &&
+            backend_ctx->rec_fingerprints.size() * 2 > backend_ctx->rec_max_size) {
+            ggml_backend_opencl_exec_graph_nodes(backend, cgraph);
+            return GGML_STATUS_SUCCESS;
+        }
+
+        // The compute graph for *this* token has not run yet; capturing into the
+        // recordable queue records dispatches without executing them, so we must
+        // replay afterwards to actually produce results.
+        if (backend_ctx->rec_recording) {
+            backend_ctx->clReleaseRecordingQCOM(backend_ctx->rec_recording);
+            backend_ctx->rec_recording = nullptr;
+        }
+
+        cl_int err = CL_SUCCESS;
+        cl_recording_qcom rec = backend_ctx->clNewRecordingQCOM(backend_ctx->rec_queue, &err);
+        if (!rec || err != CL_SUCCESS) {
+            if (s_log) GGML_LOG_INFO("ggml_opencl: clNewRecordingQCOM failed (err %d) — disabling recordable queue\n", err);
+            backend_ctx->rec_enabled = false;
+            ggml_backend_opencl_exec_graph_nodes(backend, cgraph);
+            return GGML_STATUS_SUCCESS;
+        }
+
+        backend_ctx->rec_dispatch_count = 0;
+        backend_ctx->rec_active = true;
+        ggml_backend_opencl_exec_graph_nodes(backend, cgraph);  // records into rec_queue
+        backend_ctx->rec_active = false;
+
+        if (s_log && s_record_count < 2) {
+            fprintf(stderr, "ggml_opencl: recorded %d dispatches (%zu compute nodes, max %u)\n",
+                backend_ctx->rec_dispatch_count, backend_ctx->rec_fingerprints.size(), backend_ctx->rec_max_size);
+        }
+
+        err = backend_ctx->clEndRecordingQCOM(rec);
+        if (err != CL_SUCCESS) {
+            if (s_log) GGML_LOG_INFO("ggml_opencl: clEndRecordingQCOM failed (err %d) — disabling recordable queue\n", err);
+            backend_ctx->clReleaseRecordingQCOM(rec);
+            backend_ctx->rec_enabled = false;
+            backend_ctx->rec_graph_key = nullptr;
+            backend_ctx->rec_fingerprints.clear();
+            // Recording captured nothing executable; run the graph normally.
+            ggml_backend_opencl_exec_graph_nodes(backend, cgraph);
+            return GGML_STATUS_SUCCESS;
+        }
+        backend_ctx->rec_recording = rec;
+        s_record_count++;
+    }
+
+    // Order any prior cross-backend work before consuming its outputs.
+    sync_with_other_backends(backend);
+
+    // Replay the recording on the live queue (single driver submit for the whole
+    // dispatch sequence). No arg/work-size overrides yet: a fingerprint change is
+    // what triggers a re-record above, so the recorded args are always current.
+    cl_int err = backend_ctx->clEnqueueRecordingQCOM(
+        backend_ctx->queue, backend_ctx->rec_recording,
+        0, NULL,   // args
+        0, NULL,   // global offsets
+        0, NULL,   // global work sizes
+        0, NULL,   // local work sizes
+        0, NULL, NULL);
+    CL_CHECK(err);
+    s_replay_count++;
+
+    if (s_log && (s_replay_count % 64) == 0) {
+        fprintf(stderr, "ggml_opencl: recordable queue: %d records / %d replays (%.0f%% re-record)\n",
+            s_record_count, s_replay_count, 100.0 * s_record_count / s_replay_count);
     }
 
     return GGML_STATUS_SUCCESS;
@@ -13226,6 +13701,101 @@ static void ggml_opencl_op_rms_norm_fused(ggml_backend_t backend, ggml_tensor * 
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
 }
 
+// rms_norm(x) * w + residual, fused into one dispatch. src0 = rms_norm input,
+// src1 = norm weight (the mul's non-rms_norm operand), src2 = residual (the
+// add's non-mul operand), dst = the add tensor. See kernel_rms_norm_mul_add.
+static void ggml_opencl_op_rms_norm_mul_add_fused(ggml_backend_t backend, ggml_tensor * rms_norm_tensor, ggml_tensor * mul_tensor, ggml_tensor * add_tensor) {
+    GGML_ASSERT(rms_norm_tensor && mul_tensor && add_tensor);
+
+    const ggml_tensor * src0 = rms_norm_tensor->src[0];
+    const ggml_tensor * src1 = mul_tensor->src[0] == rms_norm_tensor ? mul_tensor->src[1] : mul_tensor->src[0];
+    const ggml_tensor * src2 = add_tensor->src[0] == mul_tensor ? add_tensor->src[1] : add_tensor->src[0];
+    const ggml_tensor * dst  = add_tensor;
+
+    GGML_ASSERT(src0 && src0->extra);
+    GGML_ASSERT(src1 && src1->extra);
+    GGML_ASSERT(src2 && src2->extra);
+    GGML_ASSERT(dst  && dst->extra);
+
+    ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *)src0->extra;
+    ggml_tensor_extra_cl * extra1 = (ggml_tensor_extra_cl *)src1->extra;
+    ggml_tensor_extra_cl * extra2 = (ggml_tensor_extra_cl *)src2->extra;
+    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
+
+    cl_ulong offset0 = extra0->offset + src0->view_offs;
+    cl_ulong offset1 = extra1->offset + src1->view_offs;
+    cl_ulong offset2 = extra2->offset + src2->view_offs;
+    cl_ulong offsetd = extrad->offset + dst->view_offs;
+
+    ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
+
+    float eps;
+    memcpy(&eps, rms_norm_tensor->op_params, sizeof(float));
+
+    const int ne00 = src0->ne[0], ne01 = src0->ne[1], ne02 = src0->ne[2], ne03 = src0->ne[3];
+    const cl_ulong nb01 = src0->nb[1], nb02 = src0->nb[2], nb03 = src0->nb[3];
+    const int ne10 = src1->ne[0], ne11 = src1->ne[1], ne12 = src1->ne[2], ne13 = src1->ne[3];
+    const cl_ulong nb11 = src1->nb[1], nb12 = src1->nb[2], nb13 = src1->nb[3];
+    const int ne20 = src2->ne[0], ne21 = src2->ne[1], ne22 = src2->ne[2], ne23 = src2->ne[3];
+    const cl_ulong nb21 = src2->nb[1], nb22 = src2->nb[2], nb23 = src2->nb[3];
+    const cl_ulong nb1 = dst->nb[1], nb2 = dst->nb[2], nb3 = dst->nb[3];
+
+    GGML_ASSERT(ne00 % 4 == 0);
+
+    size_t sgs;
+    if (backend_ctx->gpu_family == ADRENO) sgs = 64;
+    else if (backend_ctx->gpu_family == INTEL) sgs = 32;
+    else GGML_ASSERT(false && "Unsupported GPU");
+
+    cl_kernel kernel = backend_ctx->kernel_rms_norm_mul_add;
+
+    int nth = sgs;
+    int max_workgroup_size = backend_ctx->get_kernel_workgroup_size(kernel);
+    while (nth < ne00 && nth < max_workgroup_size) nth *= 2;
+    nth = MIN(nth, max_workgroup_size);
+    nth = MIN(nth, ne00);
+
+    size_t global_work_size[] = {(size_t)ne01*nth, (size_t)ne02, (size_t)ne03};
+    size_t local_work_size[]  = {(size_t)nth, 1, 1};
+
+    CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0->data_device));
+    CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_ulong), &offset0));
+    CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),   &extra1->data_device));
+    CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_ulong), &offset1));
+    CL_CHECK(clSetKernelArg(kernel,  4, sizeof(cl_mem),   &extra2->data_device));
+    CL_CHECK(clSetKernelArg(kernel,  5, sizeof(cl_ulong), &offset2));
+    CL_CHECK(clSetKernelArg(kernel,  6, sizeof(cl_mem),   &extrad->data_device));
+    CL_CHECK(clSetKernelArg(kernel,  7, sizeof(cl_ulong), &offsetd));
+    CL_CHECK(clSetKernelArg(kernel,  8, sizeof(int),      &ne00));
+    CL_CHECK(clSetKernelArg(kernel,  9, sizeof(int),      &ne01));
+    CL_CHECK(clSetKernelArg(kernel, 10, sizeof(int),      &ne02));
+    CL_CHECK(clSetKernelArg(kernel, 11, sizeof(int),      &ne03));
+    CL_CHECK(clSetKernelArg(kernel, 12, sizeof(cl_ulong), &nb01));
+    CL_CHECK(clSetKernelArg(kernel, 13, sizeof(cl_ulong), &nb02));
+    CL_CHECK(clSetKernelArg(kernel, 14, sizeof(cl_ulong), &nb03));
+    CL_CHECK(clSetKernelArg(kernel, 15, sizeof(int),      &ne10));
+    CL_CHECK(clSetKernelArg(kernel, 16, sizeof(int),      &ne11));
+    CL_CHECK(clSetKernelArg(kernel, 17, sizeof(int),      &ne12));
+    CL_CHECK(clSetKernelArg(kernel, 18, sizeof(int),      &ne13));
+    CL_CHECK(clSetKernelArg(kernel, 19, sizeof(cl_ulong), &nb11));
+    CL_CHECK(clSetKernelArg(kernel, 20, sizeof(cl_ulong), &nb12));
+    CL_CHECK(clSetKernelArg(kernel, 21, sizeof(cl_ulong), &nb13));
+    CL_CHECK(clSetKernelArg(kernel, 22, sizeof(int),      &ne20));
+    CL_CHECK(clSetKernelArg(kernel, 23, sizeof(int),      &ne21));
+    CL_CHECK(clSetKernelArg(kernel, 24, sizeof(int),      &ne22));
+    CL_CHECK(clSetKernelArg(kernel, 25, sizeof(int),      &ne23));
+    CL_CHECK(clSetKernelArg(kernel, 26, sizeof(cl_ulong), &nb21));
+    CL_CHECK(clSetKernelArg(kernel, 27, sizeof(cl_ulong), &nb22));
+    CL_CHECK(clSetKernelArg(kernel, 28, sizeof(cl_ulong), &nb23));
+    CL_CHECK(clSetKernelArg(kernel, 29, sizeof(cl_ulong), &nb1));
+    CL_CHECK(clSetKernelArg(kernel, 30, sizeof(cl_ulong), &nb2));
+    CL_CHECK(clSetKernelArg(kernel, 31, sizeof(cl_ulong), &nb3));
+    CL_CHECK(clSetKernelArg(kernel, 32, sizeof(float),    &eps));
+    CL_CHECK(clSetKernelArg(kernel, 33, sizeof(float)*sgs, NULL));
+
+    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+}
+
 static void ggml_opencl_op_norm_fused(ggml_backend_t backend, ggml_tensor * norm_tensor, ggml_tensor * mul_tensor, ggml_tensor * add_tensor) {
     GGML_ASSERT(norm_tensor && mul_tensor && add_tensor);
 
@@ -18067,6 +18637,63 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
             return !e || e[0] == '\0' || e[0] != '0';
         }();
         const bool use_q4k_o4 = !use_tiled && !use_mc3 && q4k_o4_env && (ne01 % 4 == 0) && (ne01 >= 32768);
+        // Split-K across workgroups for small-M projections (Kcur/Vcur). A single-
+        // token GEMV makes only CEIL_DIV(M/2,64) workgroups; for M<=1024 that's
+        // <=8 WGs on 16 CUs, leaving CUs idle (~30-60 GB/s). Splitting K across
+        // `ksplit` workgroups (+ a reduce pass) fills the CUs and is a big KERNEL
+        // win in isolation (microbench +52% @M=512, +20% @M=1024). BUT it adds a
+        // second (reduce) dispatch per small matmul (~84/token), and E4B decode is
+        // partly dispatch-bound on these many tiny per-layer ops, so end-to-end it
+        // nets ~-0.5% vs the dispatch-free wide K-split. Correct/coherent, kept as
+        // an OPT-IN (GGML_OPENCL_Q4K_GEMV_SPLITK=1) for contexts where the small
+        // matmuls dominate or dispatch overhead is lower (e.g. batched serving).
+        static const bool splitk_wg_env = []{
+            const char * e = std::getenv("GGML_OPENCL_Q4K_GEMV_SPLITK");
+            return e && e[0] && e[0] != '0';   // default OFF
+        }();
+        const bool use_splitk = splitk_wg_env && !use_tiled && !use_q4k_o4 && !use_mc3 && ne01 <= 1024;
+
+        if (use_splitk) {
+            const int    nsg    = 8;
+            const int    ksplit = (ne01 <= 512) ? 8 : 4;   // -> ~32 total WGs
+            const size_t gx     = (size_t)CEIL_DIV(ne01/2, 64) * 64;
+
+            backend_ctx->prealloc_splitk_partial.allocate(
+                backend_ctx->context, (size_t)ksplit * ne01 * sizeof(float));
+            cl_mem partial = backend_ctx->prealloc_splitk_partial.buffer;
+
+            cl_kernel ks = backend_ctx->kernel_gemv_noshuffle_q4_k_f32_splitk;
+            CL_CHECK(clSetKernelArg(ks, 0,  sizeof(cl_mem),   &q_img));
+            CL_CHECK(clSetKernelArg(ks, 1,  sizeof(cl_mem),   &extra0_q4_k->d));
+            CL_CHECK(clSetKernelArg(ks, 2,  sizeof(cl_mem),   &extra0_q4_k->dm));
+            CL_CHECK(clSetKernelArg(ks, 3,  sizeof(cl_mem),   &extra0_q4_k->s));
+            CL_CHECK(clSetKernelArg(ks, 4,  sizeof(cl_mem),   &b_img));
+            CL_CHECK(clSetKernelArg(ks, 5,  sizeof(cl_mem),   &partial));
+            CL_CHECK(clSetKernelArg(ks, 6,  sizeof(cl_int),   &ne00));
+            CL_CHECK(clSetKernelArg(ks, 7,  sizeof(cl_int),   &ne01));
+            CL_CHECK(clSetKernelArg(ks, 8,  sizeof(cl_uchar), &mask_d6));
+            CL_CHECK(clSetKernelArg(ks, 9,  sizeof(cl_uchar), &mask_d4));
+            CL_CHECK(clSetKernelArg(ks, 10, sizeof(cl_uchar), &mask_hi2));
+            size_t lsk[3] = {64, (size_t)nsg, 1};
+            size_t gsk[3] = {gx, (size_t)(nsg * ksplit), 1};
+            backend_ctx->enqueue_ndrange_kernel(ks, 3, gsk, lsk, dst);
+
+            cl_kernel kr = backend_ctx->kernel_gemv_splitk_reduce_f32;
+            CL_CHECK(clSetKernelArg(kr, 0, sizeof(cl_mem),   &partial));
+            CL_CHECK(clSetKernelArg(kr, 1, sizeof(cl_mem),   &extrad->data_device));
+            CL_CHECK(clSetKernelArg(kr, 2, sizeof(cl_ulong), &offsetd));
+            CL_CHECK(clSetKernelArg(kr, 3, sizeof(cl_int),   &ne01));
+            CL_CHECK(clSetKernelArg(kr, 4, sizeof(cl_int),   &ksplit));
+            size_t lr[3] = {64, 1, 1};
+            size_t gr[3] = {(size_t)CEIL_DIV(ne01, 64) * 64, 1, 1};
+            backend_ctx->enqueue_ndrange_kernel(kr, 3, gr, lr, dst);
+
+            if (q_img) CL_CHECK(clReleaseMemObject(q_img));
+            CL_CHECK(clReleaseMemObject(b_sub_buf));
+            CL_CHECK(clReleaseMemObject(b_img));
+            return;
+        }
+
         kernel = use_mc3    ? backend_ctx->kernel_gemv_noshuffle_q4_k_f32_mc3
                : use_tiled  ? backend_ctx->kernel_gemv_noshuffle_q4_k_f32_tiled
                : use_q4k_o4 ? backend_ctx->kernel_gemv_noshuffle_q4_k_f32_o4
@@ -18097,8 +18724,25 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
             CL_CHECK(clSetKernelArg(kernel, 11, sizeof(cl_uchar), &mask_hi2));
         }
 
-        size_t local_work_size[3] = {64, 4, 1};
-        size_t global_work_size[3] = {(size_t)CEIL_DIV(use_tiled ? ne01 : (use_q4k_o4 ? ne01/4 : ne01/2), 64)*64, 4, 1};
+        // Wide K-split for the decode GEMV: the default 4-subgroup K-split leaves
+        // each Adreno SP with only ~4 waves, too few to hide LPDDR weight-load
+        // latency, so even the large FFN matmuls run well below the achievable
+        // bandwidth. Widen to 16 subgroups/WG (= the 1024-lane Adreno WG max) so
+        // each SP holds enough in-flight memory requests. Measured +9-11% tg on
+        // Gemma-4-E4B Q4_K_M (X2), neutral prefill (GEMM path is separate), and
+        // coherence-identical (greedy output unchanged). Applies to the plain base
+        // GEMV only; tiled/o4/mc3 keep 4 (their reductions are hard-coded to 4).
+        // Layout-safe: the base kernel derives its K-split from get_local_size(1)
+        // and the packed block stride is a physical constant (independent of it).
+        // Opt-out: GGML_OPENCL_Q4K_GEMV_WIDE=0.
+        static const bool splitk_wide_env = []{
+            const char * e = std::getenv("GGML_OPENCL_Q4K_GEMV_WIDE");
+            return !e || e[0] == '\0' || e[0] != '0';
+        }();
+        const bool   splitk_wide = splitk_wide_env && !use_tiled && !use_q4k_o4 && !use_mc3;
+        const size_t nsg_y       = splitk_wide ? 16 : 4;
+        size_t local_work_size[3] = {64, nsg_y, 1};
+        size_t global_work_size[3] = {(size_t)CEIL_DIV(use_tiled ? ne01 : (use_q4k_o4 ? ne01/4 : ne01/2), 64)*64, nsg_y, 1};
 
         backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
 
@@ -18508,8 +19152,27 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
                                  : use_o4
                                  ? (size_t) CEIL_DIV(ne01/4, 64) * 64
                                  : (size_t) CEIL_DIV(ne01/2, 64) * 64;
-        size_t local_work_size[3]  = {64, 4, 1};
-        size_t global_work_size[3] = {gws_x, 4, 1};
+        // Wide K-split for the plain base q6_K decode GEMV (ffn_down / attn_v in
+        // Q4_K_M): widen 4 -> 16 subgroups/WG so each SP has enough in-flight
+        // weight loads to hide LPDDR latency (same rationale + win as the q4_K
+        // GEMV). Base kernel only; tiled/o4/mc3 keep 4 (hard-coded reductions).
+        // Opt-out: GGML_OPENCL_Q6K_GEMV_WIDE=0.
+        static const int q6k_wide_nsg_env = []{
+            const char * e = std::getenv("GGML_OPENCL_Q6K_GEMV_WIDE");
+            // Unlike q4_K (100% memory-bound, ALU fully hidden -> big wide-split
+            // win), the dominant q6_K matmul (ffn_down) is ~85% memory-bound and
+            // already near its ceiling (microbench: 94->98 GB/s wide, NO-ALU 110),
+            // so wide split barely helps it; the small attn_v gains in isolation
+            // but is latency-dominated per single launch in-graph. Net end-to-end
+            // is neutral-to-slightly-negative (the 256 B-private/spill wide WG adds
+            // contention), so default OFF (4). Opt-in tuning hook (set >4).
+            return (e && e[0]) ? atoi(e) : 4;
+        }();
+        const bool   q6k_wide = q6k_wide_nsg_env > 4 && !use_tiled && !use_o4 && !use_o4_global
+                                && !use_q6k_mc3 && !use_q6k_tiled_mc;
+        const size_t q6k_nsg  = q6k_wide ? (size_t)q6k_wide_nsg_env : 4;
+        size_t local_work_size[3]  = {64, q6k_nsg, 1};
+        size_t global_work_size[3] = {gws_x, q6k_nsg, 1};
 
         backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
 
@@ -24642,6 +25305,127 @@ static void ggml_cl_rope(ggml_backend_t backend, const ggml_tensor * src0, const
     size_t local_work_size[] = {(size_t)nth, 1, 1};
 
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+}
+
+// Fused dispatch for ROPE + VIEW + SET_ROWS. Scope: f32 source, f16 K-cache
+// destination, NORMAL/NEOX rope, i64 row indices. Eligibility gated by
+// ggml_opencl_should_fuse_rope_set_rows. Folds the K-cache row scatter into the
+// rope kernel so we save one dispatch per layer per token (the set_rows call).
+static void ggml_cl_rope_set_rows(ggml_backend_t backend,
+                                  ggml_tensor * rope_tensor,
+                                  ggml_tensor * /*view_tensor*/,
+                                  ggml_tensor * set_rows_tensor) {
+    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *) backend->context;
+
+    const ggml_tensor * src0 = rope_tensor->src[0];
+    const ggml_tensor * src1 = rope_tensor->src[1];
+    const ggml_tensor * src2 = rope_tensor->src[2];
+    const ggml_tensor * row_indices_tensor = set_rows_tensor->src[1];
+
+    GGML_ASSERT(src0 && src0->extra);
+    GGML_ASSERT(src1 && src1->extra);
+    GGML_ASSERT(set_rows_tensor && set_rows_tensor->extra);
+    GGML_ASSERT(row_indices_tensor && row_indices_tensor->extra);
+
+    ggml_tensor_extra_cl * extra0      = (ggml_tensor_extra_cl *) src0->extra;
+    ggml_tensor_extra_cl * extra1      = (ggml_tensor_extra_cl *) src1->extra;
+    ggml_tensor_extra_cl * extra2      = src2 ? (ggml_tensor_extra_cl *) src2->extra : nullptr;
+    ggml_tensor_extra_cl * extra_dst   = (ggml_tensor_extra_cl *) set_rows_tensor->extra;
+    ggml_tensor_extra_cl * extra_idx   = (ggml_tensor_extra_cl *) row_indices_tensor->extra;
+
+    cl_ulong offset0 = extra0->offset + src0->view_offs;
+    cl_ulong offset1 = extra1->offset + src1->view_offs;
+    cl_ulong offset2 = extra2 ? extra2->offset + src2->view_offs : offset0;
+    cl_ulong offsetd = extra_dst->offset + set_rows_tensor->view_offs;
+    cl_ulong offset_row_indices = extra_idx->offset + row_indices_tensor->view_offs;
+
+    const int ne00 = src0->ne[0];
+    const int ne01 = src0->ne[1];
+    const int ne02 = src0->ne[2];
+    const int ne03 = src0->ne[3];
+
+    const cl_ulong nb00 = src0->nb[0];
+    const cl_ulong nb01 = src0->nb[1];
+    const cl_ulong nb02 = src0->nb[2];
+    const cl_ulong nb03 = src0->nb[3];
+
+    const int ne0 = rope_tensor->ne[0];
+    const int ne1 = rope_tensor->ne[1];
+    const int ne2 = rope_tensor->ne[2];
+    const int ne3 = rope_tensor->ne[3];
+    const cl_ulong nb0 = rope_tensor->nb[0];
+    const cl_ulong nb1 = rope_tensor->nb[1];
+    const cl_ulong nb2 = rope_tensor->nb[2];
+    const cl_ulong nb3 = rope_tensor->nb[3];
+
+    const int n_past     = ((int32_t *) rope_tensor->op_params)[0];
+    const int n_dims     = ((int32_t *) rope_tensor->op_params)[1];
+    const int n_ctx_orig = ((int32_t *) rope_tensor->op_params)[4];
+
+    float freq_base;
+    float freq_scale;
+    float ext_factor;
+    float attn_factor;
+    float beta_fast;
+    float beta_slow;
+    memcpy(&freq_base,   (int32_t *) rope_tensor->op_params +  5, sizeof(float));
+    memcpy(&freq_scale,  (int32_t *) rope_tensor->op_params +  6, sizeof(float));
+    memcpy(&ext_factor,  (int32_t *) rope_tensor->op_params +  7, sizeof(float));
+    memcpy(&attn_factor, (int32_t *) rope_tensor->op_params +  8, sizeof(float));
+    memcpy(&beta_fast,   (int32_t *) rope_tensor->op_params +  9, sizeof(float));
+    memcpy(&beta_slow,   (int32_t *) rope_tensor->op_params + 10, sizeof(float));
+
+    const int set_rows_stride = (int) (set_rows_tensor->nb[1] / ggml_type_size(set_rows_tensor->type));
+
+    const int mode = ((const int32_t *) rope_tensor->op_params)[2];
+    cl_kernel kernel = (mode == GGML_ROPE_TYPE_NEOX)
+        ? backend_ctx->kernel_rope_neox_f32_set_rows_f16
+        : backend_ctx->kernel_rope_norm_f32_set_rows_f16;
+
+    int nth = MIN(64, ne00);
+
+    int arg = 0;
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_mem),   &extra0->data_device));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &offset0));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_mem),   &extra1->data_device));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &offset1));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_mem),   extra2 ? &extra2->data_device : &extra0->data_device));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &offset2));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_mem),   &extra_dst->data_device));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &offsetd));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_mem),   &extra_idx->data_device));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &offset_row_indices));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(int),      &set_rows_stride));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(int),      &ne00));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(int),      &ne01));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(int),      &ne02));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(int),      &ne03));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &nb00));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &nb01));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &nb02));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &nb03));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(int),      &ne0));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(int),      &ne1));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(int),      &ne2));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(int),      &ne3));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &nb0));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &nb1));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &nb2));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &nb3));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(int),      &n_past));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(int),      &n_dims));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(int),      &n_ctx_orig));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(float),    &freq_base));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(float),    &freq_scale));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(float),    &ext_factor));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(float),    &attn_factor));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(float),    &beta_fast));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(float),    &beta_slow));
+
+    size_t global_work_size[] = { (size_t) ne01 * nth, (size_t) ne02, (size_t) ne03 };
+    size_t local_work_size[]  = { (size_t) nth, 1, 1 };
+
+    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, set_rows_tensor);
 }
 
 static void ggml_cl_solve_tri(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {

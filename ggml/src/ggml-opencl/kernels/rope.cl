@@ -745,3 +745,173 @@ kernel void kernel_rope_vision_f16(
         dst_data[n_dims] = x0*cos_sin_theta.s1 + x1*cos_sin_theta.s0;
     }
 }
+
+// Fused ROPE_NORM + VIEW + SET_ROWS for f32 source / f16 destination.
+// NORM-style rope pairs are adjacent (dst[0], dst[1]) vs NEOX split halves.
+// Mirrors the CUDA `rope_norm_cuda<float, half>(..., row_indices, set_rows_stride)` path.
+kernel void kernel_rope_norm_f32_set_rows_f16(
+        global void * src0,
+        ulong offset0,
+        global int * src1,
+        ulong offset1,
+        global float * src2,
+        ulong offset2,
+        global void * dst,
+        ulong offsetd,
+        global long * row_indices,
+        ulong offset_row_indices,
+        int set_rows_stride,
+        int ne00,
+        int ne01,
+        int ne02,
+        int ne03,
+        ulong nb00,
+        ulong nb01,
+        ulong nb02,
+        ulong nb03,
+        int ne0,
+        int ne1,
+        int ne2,
+        int ne3,
+        ulong nb0,
+        ulong nb1,
+        ulong nb2,
+        ulong nb3,
+        int n_past,
+        int n_dims,
+        int n_ctx_orig,
+        float freq_base,
+        float freq_scale,
+        float ext_factor,
+        float attn_factor,
+        float beta_fast,
+        float beta_slow
+) {
+    src0        = (global void  *)((global char *)src0        + offset0);
+    src1        = (global int   *)((global char *)src1        + offset1);
+    src2        = (global float *)((global char *)src2        + offset2);
+    dst         = (global void  *)((global char *)dst         + offsetd);
+    row_indices = (global long  *)((global char *)row_indices + offset_row_indices);
+
+    int i3 = get_group_id(2);
+    int i2 = get_group_id(1);
+    int i1 = get_group_id(0);
+
+    float2 corr_dims = rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow);
+
+    global int * pos = src1;
+
+    float theta_base = (float) pos[i2];
+    float inv_ndims = -1.f/n_dims;
+
+    long row_idx = row_indices[i2];
+    global half * dst_row = (global half *)dst + row_idx * (long)set_rows_stride + (long)i1 * (long)ne00;
+
+    for (int i0 = 2*get_local_id(0); i0 < ne0; i0 += 2*get_local_size(0)) {
+        if (i0 < n_dims) {
+            int ic = i0/2;
+
+            float theta = theta_base * pow(freq_base, inv_ndims*i0);
+            float freq_factor = src2 != src0 ? src2[ic] : 1.0f;
+            float2 cos_sin_theta = rope_yarn(theta/freq_factor, freq_scale, corr_dims, i0, ext_factor, attn_factor);
+
+            global float * src = (global float *)((global char *) src0 + i3*nb03 + i2*nb02 + i1*nb01 + i0*nb00);
+
+            float x0 = src[0];
+            float x1 = src[1];
+
+            dst_row[i0]     = (half)(x0*cos_sin_theta.s0 - x1*cos_sin_theta.s1);
+            dst_row[i0 + 1] = (half)(x0*cos_sin_theta.s1 + x1*cos_sin_theta.s0);
+        } else {
+            global float * src = (global float *)((global char *) src0 + i3*nb03 + i2*nb02 + i1*nb01 + i0*nb00);
+            dst_row[i0]     = (half)src[0];
+            dst_row[i0 + 1] = (half)src[1];
+        }
+    }
+}
+
+// Fused ROPE_NEOX + VIEW + SET_ROWS for f32 source / f16 destination.
+// Mirrors the CUDA `rope_neox_cuda<float, half>(..., row_indices, set_rows_stride)` path.
+// The rope output is redirected into the K-cache at the row indicated by row_indices[i2].
+kernel void kernel_rope_neox_f32_set_rows_f16(
+        global void * src0,
+        ulong offset0,
+        global int * src1,
+        ulong offset1,
+        global float * src2,
+        ulong offset2,
+        global void * dst,
+        ulong offsetd,
+        global long * row_indices,
+        ulong offset_row_indices,
+        int set_rows_stride,
+        int ne00,
+        int ne01,
+        int ne02,
+        int ne03,
+        ulong nb00,
+        ulong nb01,
+        ulong nb02,
+        ulong nb03,
+        int ne0,
+        int ne1,
+        int ne2,
+        int ne3,
+        ulong nb0,
+        ulong nb1,
+        ulong nb2,
+        ulong nb3,
+        int n_past,
+        int n_dims,
+        int n_ctx_orig,
+        float freq_base,
+        float freq_scale,
+        float ext_factor,
+        float attn_factor,
+        float beta_fast,
+        float beta_slow
+) {
+    src0        = (global void  *)((global char *)src0        + offset0);
+    src1        = (global int   *)((global char *)src1        + offset1);
+    src2        = (global float *)((global char *)src2        + offset2);
+    dst         = (global void  *)((global char *)dst         + offsetd);
+    row_indices = (global long  *)((global char *)row_indices + offset_row_indices);
+
+    int i3 = get_group_id(2);
+    int i2 = get_group_id(1);
+    int i1 = get_group_id(0);
+
+    float2 corr_dims = rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow);
+
+    global int * pos = src1;
+
+    float theta_base = (float) pos[i2];
+    float inv_ndims = -1.f/n_dims;
+
+    // Token → K-cache row redirection. Per-head stride inside the cache row is ne00 (head_dim).
+    long row_idx = row_indices[i2];
+    global half * dst_row = (global half *)dst + row_idx * (long)set_rows_stride + (long)i1 * (long)ne00;
+
+    for (int i0 = 2*get_local_id(0); i0 < ne0; i0 += 2*get_local_size(0)) {
+        if (i0 < n_dims) {
+            int ic = i0/2;
+
+            const float theta = theta_base * pow(freq_base, inv_ndims*i0);
+            const float freq_factor = src2 != src0 ? src2[ic] : 1.0f;
+            float2 cos_sin_theta = rope_yarn(theta/freq_factor, freq_scale, corr_dims, i0, ext_factor, attn_factor);
+
+            global float * src = (global float *)((global char *) src0 + i3*nb03 + i2*nb02 + i1*nb01 + ic*nb00);
+
+            const float x0 = src[0];
+            const float x1 = src[n_dims/2];
+
+            dst_row[ic]          = (half)(x0*cos_sin_theta.s0 - x1*cos_sin_theta.s1);
+            dst_row[ic + n_dims/2] = (half)(x0*cos_sin_theta.s1 + x1*cos_sin_theta.s0);
+        } else {
+            global float * src = (global float *)((global char *) src0 + i3*nb03 + i2*nb02 + i1*nb01 + i0*nb00);
+            dst_row[i0]     = (half)src[0];
+            dst_row[i0 + 1] = (half)src[1];
+        }
+    }
+}
+
