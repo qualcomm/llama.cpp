@@ -7484,14 +7484,26 @@ static void ggml_opencl_op_gemma4_perlayer_block(ggml_backend_t backend, const s
     const cl_int zero = 0;
     CL_CHECK(clEnqueueFillBuffer(backend_ctx->queue, counters, &zero, sizeof(cl_int), 0, 3 * sizeof(cl_int), 0, NULL, NULL));
 
-    // Persistent-threads grid: R WGs (< ~256 X2 resident cap for this occupancy),
-    // each 64 x nsg lanes (nsg = K-split subgroups). The grid barrier requires
-    // every launched WG to be co-resident, so R must stay under the cap.
-    // Tunable via GGML_OPENCL_MEGA_R / GGML_OPENCL_MEGA_NSG for sweeping.
-    static const size_t R   = []{ const char* e = getenv("GGML_OPENCL_MEGA_R");   return e && atoi(e) > 0 ? (size_t)atoi(e) : (size_t)128; }();
+    // Persistent-threads grid: the software grid barrier REQUIRES every launched
+    // WG to be concurrently resident (OpenCL gives no independent-forward-progress
+    // guarantee — a non-resident WG never reaches the barrier, so the resident WGs
+    // spin forever -> GPU hang/TDR -> garbage). The co-resident cap is set by this
+    // kernel's REGISTER + local-memory footprint (a 64 x nsg=8 = 512-lane WG with
+    // ~8.7 KB local fits only ~1-2 WGs per compute unit). Empirically on X2-90 the
+    // barrier is correct for R up to ~32-39 and deadlocks above; perf already
+    // loses badly at the safe cap (low occupancy can't feed the memory-bound
+    // GEMVs). So default R = #compute-units (1 WG/CU, always co-resident);
+    // GGML_OPENCL_MEGA_R overrides for experiments (do NOT exceed the cap).
+    static const size_t cu = [backend_ctx]{
+        cl_uint n = 0;
+        clGetDeviceInfo(backend_ctx->device, CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(n), &n, NULL);
+        return (size_t)(n ? n : 16);
+    }();
+    static const size_t R   = []{ const char* e = getenv("GGML_OPENCL_MEGA_R");   return e && atoi(e) > 0 ? (size_t)atoi(e) : (size_t)0; }();
+    const size_t        Reff = R ? R : cu;
     static const size_t nsg = []{ const char* e = getenv("GGML_OPENCL_MEGA_NSG"); return e && atoi(e) > 0 ? (size_t)atoi(e) : (size_t)8;   }();
     size_t local_work_size[3]  = { 64, nsg, 1 };
-    size_t global_work_size[3] = { R * 64, nsg, 1 };
+    size_t global_work_size[3] = { Reff * 64, nsg, 1 };
 
     if (is_f32) {
         // F32-weight variant (E4B per-layer weights are stored f32).

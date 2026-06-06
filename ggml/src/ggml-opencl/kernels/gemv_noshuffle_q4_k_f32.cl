@@ -719,6 +719,18 @@ inline void mega_grid_barrier(volatile global atomic_int * counter) {
     work_group_barrier(CLK_GLOBAL_MEM_FENCE);
 }
 
+// Cross-WG-coherent scratch access. On Adreno X2 regular global loads/stores are
+// NOT visible across workgroups even after a grid barrier (per-CU L1 is not
+// snooped), but ATOMICS are coherent (they go to L2). So route the shared scratch
+// (y1/y2/y3) through traditional int atomics on the float bits: atomic_xchg to
+// store (write-through to L2), atomic_add(.,0) to load (read-from-L2, bypass L1).
+inline void  mega_st(volatile global float * p, uint i, float v) {
+    atomic_xchg((volatile global int *)p + i, as_int(v));
+}
+inline float mega_ld(volatile global float * p, uint i) {
+    return as_float(atomic_add((volatile global int *)p + i, 0));
+}
+
 // One q4_K GEMV output fiber (2 rows): totalSum valid on groupId==0 only.
 // act is the activation vector as a plain global float buffer (K elems).
 // reduceLM is a WG-shared scratch (>= SUBGROUP_SIZE * (nsg-1) float2).
@@ -902,10 +914,24 @@ kernel void kernel_gemma4_perlayer_block(
 // barrier + gelu_mul + rms_mul_add_scale stages.
 // ============================================================================
 
-// One f32 GEMV output row: result valid on groupId==0.
-inline float mega_f32_gemv_fiber(global const float * W, volatile global const float * act,
+// One f32 GEMV output row, activation from GLOBAL (coherent input). groupId==0.
+inline float mega_f32_gemv_fiber(global const float * W, global const float * act,
                                  uint row, uint lid0, uint groupId, uint nsg, uint K,
                                  local float * red) {
+    float p = 0.0f;
+    global const float * Wr = W + (ulong)row * K;
+    for (uint k = groupId; k < K; k += nsg) p += Wr[k] * act[k];
+    if (groupId > 0) red[SUBGROUP_SIZE * (groupId - 1) + lid0] = p;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (groupId == 0) { for (uint i = 0; i < nsg - 1; ++i) p += red[SUBGROUP_SIZE * i + lid0]; }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    return p;
+}
+
+// Same, activation from LOCAL (used after atomically staging cross-WG y2).
+inline float mega_f32_gemv_fiber_l(global const float * W, local const float * act,
+                                   uint row, uint lid0, uint groupId, uint nsg, uint K,
+                                   local float * red) {
     float p = 0.0f;
     global const float * Wr = W + (ulong)row * K;
     for (uint k = groupId; k < K; k += nsg) p += Wr[k] * act[k];
@@ -959,35 +985,42 @@ kernel void kernel_gemma4_perlayer_block_f32(
     volatile global float * y1 = scratch;
     volatile global float * y2 = scratch + n_pl;
     volatile global float * y3 = scratch + 2 * n_pl;
+    local float ly2[256];   // staged y2 (n_pl<=256 for gemma4)
 
-    // stage 1: y1 = Wg . x  (M=n_pl, K=D)
+    // stage 1: y1 = Wg . x  (M=n_pl, K=D). x is a coherent prior-dispatch input
+    // (regular read OK); y1 is cross-WG scratch -> atomic store (mega_st).
     for (uint row = get_global_id(0); row < (uint)n_pl; row += gstride) {
         float r = mega_f32_gemv_fiber(g_w, x, row, lid0, groupId, nsg, (uint)D, red);
-        if (groupId == 0) y1[row] = r;
+        if (groupId == 0) mega_st(y1, row, r);
     }
     mega_grid_barrier(counters + 0);
 
-    // stage 2/3: y2 = gelu(y1) * gate  (single WG)
+    // stage 2/3: y2 = gelu(y1) * gate  (single WG). y1 written by other WGs ->
+    // atomic load (mega_ld); y2 read by all WGs next -> atomic store.
     if (get_group_id(0) == 0) {
         for (uint i = flid; i < (uint)n_pl; i += nflat) {
-            float v  = y1[i];
+            float v  = mega_ld(y1, i);
             float ge = 0.5f * v * (1.0f + tanh(SQRT_2_OVER_PI * v * (1.0f + GELU_COEF_A * v * v)));
-            y2[i] = ge * gate[i];
+            mega_st(y2, i, ge * gate[i]);
         }
     }
     mega_grid_barrier(counters + 1);
 
-    // stage 4: y3 = Wp . y2  (M=D, K=n_pl)
+    // stage 4: y3 = Wp . y2  (M=D, K=n_pl). Stage cross-WG y2 into __local once
+    // via atomic loads, then GEMV reads it from local (avoids per-MAC atomics).
+    for (uint i = flid; i < (uint)n_pl; i += nflat) ly2[i] = mega_ld(y2, i);
+    barrier(CLK_LOCAL_MEM_FENCE);
     for (uint row = get_global_id(0); row < (uint)D; row += gstride) {
-        float r = mega_f32_gemv_fiber(p_w, y2, row, lid0, groupId, nsg, (uint)n_pl, red);
-        if (groupId == 0) y3[row] = r;
+        float r = mega_f32_gemv_fiber_l(p_w, ly2, row, lid0, groupId, nsg, (uint)n_pl, red);
+        if (groupId == 0) mega_st(y3, row, r);
     }
     mega_grid_barrier(counters + 2);
 
-    // stage 5-8: out = (rms_norm(y3)*wn + x) * oscale  (single WG)
+    // stage 5-8: out = (rms_norm(y3)*wn + x) * oscale  (single WG). y3 written by
+    // other WGs -> atomic load.
     if (get_group_id(0) == 0) {
         float p = 0.0f;
-        for (uint i = flid; i < (uint)D; i += nflat) p += y3[i] * y3[i];
+        for (uint i = flid; i < (uint)D; i += nflat) { float v = mega_ld(y3, i); p += v * v; }
         red[flid] = p;
         barrier(CLK_LOCAL_MEM_FENCE);
         for (uint s = nflat / 2; s > 0; s >>= 1) {
@@ -998,7 +1031,8 @@ kernel void kernel_gemma4_perlayer_block_f32(
         float os  = oscale[0];   // layer_output_scale is a SCALAR [1], broadcast over D
         global float * o = (global float *)((global char *)out + offset_out);
         for (uint i = flid; i < (uint)D; i += nflat) {
-            o[i] = (y3[i] * rms * wn[i] + x[i]) * os;
+            float v = mega_ld(y3, i);
+            o[i] = (v * rms * wn[i] + x[i]) * os;
         }
     }
 }
