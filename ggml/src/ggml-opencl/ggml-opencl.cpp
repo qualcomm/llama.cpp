@@ -6962,16 +6962,17 @@ static void ggml_opencl_op_gemma4_perlayer_block(ggml_backend_t backend, const s
     // Persistent-threads grid: the software grid barrier REQUIRES every launched
     // WG to be concurrently resident (OpenCL gives no independent-forward-progress
     // guarantee — a non-resident WG never reaches the barrier, so the resident WGs
-    // spin forever -> GPU hang/TDR -> garbage). The co-resident cap is set by this
-    // kernel's REGISTER + local-memory footprint (a 64 x nsg=8 = 512-lane WG with
-    // ~8.7 KB local fits only ~1-2 WGs per compute unit). Empirically on X2-90 the
-    // barrier is correct for R up to ~32-39 and deadlocks above; perf already
-    // loses badly at the safe cap (low occupancy can't feed the memory-bound
-    // GEMVs). So default R = #compute-units (1 WG/CU, always co-resident);
-    // GGML_OPENCL_MEGA_R overrides for experiments (do NOT exceed the cap).
+    // spin forever -> GPU hang/TDR -> garbage). Concurrent-WG capacity scales with
+    // the COMPUTE-UNIT count; how many WGs fit per CU is set by the WG's register +
+    // wave/local footprint. Measured on X2-90: CL_DEVICE_MAX_COMPUTE_UNITS reports
+    // 16, but this 64 x nsg=8 (512-lane, ~8.7 KB local) kernel co-resides exactly
+    // 32 WGs (= 2 WG/CU): R<=32 correct, R>=33 deadlocks. Default R = reported CU
+    // count (conservative, well within the 32 cap, and lower R is also the less-bad
+    // perf point). GGML_OPENCL_MEGA_R overrides (do NOT exceed the measured cap).
     static const size_t cu = [backend_ctx]{
         cl_uint n = 0;
         clGetDeviceInfo(backend_ctx->device, CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(n), &n, NULL);
+        if (getenv("GGML_OPENCL_MEGA_DEBUG")) fprintf(stderr, "[MEGA] CL_DEVICE_MAX_COMPUTE_UNITS=%u (concurrent-WG cap = 1 WG/CU)\n", n);
         return (size_t)(n ? n : 16);
     }();
     static const size_t R   = []{ const char* e = getenv("GGML_OPENCL_MEGA_R");   return e && atoi(e) > 0 ? (size_t)atoi(e) : (size_t)0; }();
