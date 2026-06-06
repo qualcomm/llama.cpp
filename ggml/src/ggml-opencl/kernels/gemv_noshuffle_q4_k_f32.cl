@@ -549,3 +549,341 @@ kernel void kernel_gemv_noshuffle_q4_k_f32_mc3(
         vstore2((float2)(acc.s4, acc.s5), 0, &(dst[2 * M + gid * 2]));
     }
 }
+
+// --- Split-K-across-workgroups decode GEMV (small-M projections) ----------------
+// A single-token GEMV makes only ceil(M/2/64) workgroups; a WG runs on one Adreno
+// compute unit, so for small M (Kcur/Vcur, M=512 -> 4 WGs) most of the 16 CUs sit
+// idle and the matmul caps at ~30 GB/s even with a wide intra-WG K-split. This
+// variant adds a SECOND grid dimension of `ksplit` workgroups that each reduce a
+// disjoint slice of K and write a per-slice partial; kernel_gemv_splitk_reduce_f32
+// then sums the partials into dst. Microbench (X2): M=512 31->47 GB/s (+52%),
+// M=1024 60->72 (+20%). Identical math/layout to the base kernel (physical block
+// stride 4*M, get_scale_min_k4) -> coherent. Gated host-side to M<=1024 (M>=2048
+// already fills the CUs and the extra reduce dispatch only hurts).
+#ifdef ADRENO_GPU
+REQD_SUBGROUP_SIZE_64
+#endif
+kernel void kernel_gemv_noshuffle_q4_k_f32_splitk(
+        read_only  image1d_buffer_t src0_q,
+        global half2  * src0_d,
+        global half2  * src0_m,
+        global uchar  * src0_s,
+        read_only  image1d_buffer_t src1,
+        global float * partial,          // [ksplit * M], slice-major
+        int ne00,
+        int ne01,
+        uchar mask_d6,
+        uchar mask_d4,
+        uchar mask_hi2)
+{
+    uint groupId = get_local_id(1);
+    uint gid     = get_global_id(0);
+    ushort slid  = get_sub_group_local_id();
+    uint nsg     = get_local_size(1);
+    uint ksplit  = get_num_groups(1);
+    uint kslice  = get_group_id(1);
+
+    uint K = ne00;
+    uint M = ne01;
+    uint LINE_STRIDE_A  = M / 2;
+    uint BLOCK_STRIDE_A = 4 * M;      // physical, independent of the K-split
+    uint scales_per_row = (K / QK_K) * 12;
+
+    private uint4  regA;
+    private half2  regS, regM;
+    private float8 regB;
+    private float2 totalSum = (float2)(0.0f);
+
+    // each (kslice, subgroup) pair owns a disjoint set of K-blocks
+    for (uint k = kslice * nsg + groupId; k < (K / 32); k += ksplit * nsg) {
+        uint sb = k / 8;
+        uint j  = k % 8;
+        half2 d   = src0_d[gid + sb * LINE_STRIDE_A];
+        half2 dm  = src0_m[gid + sb * LINE_STRIDE_A];
+        global const uchar * sc0 = src0_s + 2 * gid * scales_per_row + sb * 12;
+        global const uchar * sc1 = src0_s + (2 * gid + 1) * scales_per_row + sb * 12;
+        uchar sv0, mn0, sv1, mn1;
+        get_scale_min_k4(j, sc0, &sv0, &mn0, mask_d6, mask_d4, mask_hi2);
+        get_scale_min_k4(j, sc1, &sv1, &mn1, mask_d6, mask_d4, mask_hi2);
+        regS = convert_half2(convert_float2(d)  * convert_float2((uchar2)(sv0, sv1)));
+        regM = convert_half2(convert_float2(dm) * convert_float2((uchar2)(mn0, mn1)));
+        if (slid < 4) {
+            regB.s0123 = read_imagef(src1, (slid * 2 + k * 8));
+            regB.s4567 = read_imagef(src1, (1 + slid * 2 + k * 8));
+        }
+        regA.s0 = read_imageui(src0_q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 0)).x;
+        regA.s1 = read_imageui(src0_q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 1)).x;
+        regA.s2 = read_imageui(src0_q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 2)).x;
+        regA.s3 = read_imageui(src0_q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 3)).x;
+#ifdef VECTOR_SUB_GROUP_BROADCAST
+        dequantizeBlockAccum_ns_sgbroadcast_8_hi(totalSum, as_ushort8(regA), regS, regM, regB);
+#else
+        dequantizeBlockAccum_ns_sgbroadcast_1_hi(totalSum, as_ushort8(regA), regS, regM, regB);
+#endif
+        regA.s0 = read_imageui(src0_q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 4)).x;
+        regA.s1 = read_imageui(src0_q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 5)).x;
+        regA.s2 = read_imageui(src0_q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 6)).x;
+        regA.s3 = read_imageui(src0_q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 7)).x;
+#ifdef VECTOR_SUB_GROUP_BROADCAST
+        dequantizeBlockAccum_ns_sgbroadcast_8_lo(totalSum, as_ushort8(regA), regS, regM, regB);
+#else
+        dequantizeBlockAccum_ns_sgbroadcast_1_lo(totalSum, as_ushort8(regA), regS, regM, regB);
+#endif
+    }
+
+    local float2 reduceLM[SUBGROUP_SIZE * 15];
+    if (groupId > 0) {
+        reduceLM[SUBGROUP_SIZE * (groupId - 1) + slid] = totalSum;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (groupId == 0) {
+        for (uint i = 0; i < nsg - 1; ++i) {
+            totalSum += reduceLM[SUBGROUP_SIZE * i + slid];
+        }
+        vstore2(totalSum, 0, &(partial[kslice * M + gid * 2]));
+    }
+}
+
+// Sum the per-slice partials [ksplit * M] into dst[M]; applies the dst byte offset.
+kernel void kernel_gemv_splitk_reduce_f32(
+        global float * partial,
+        global float * dst,
+        ulong offsetd,
+        int   ne01,         // M
+        int   ksplit)
+{
+    uint r = get_global_id(0);
+    if (r >= (uint)ne01) return;
+    float acc = 0.0f;
+    for (uint s = 0; s < (uint)ksplit; ++s) {
+        acc += partial[s * (uint)ne01 + r];
+    }
+    dst = (global float*)((global char*)dst + offsetd);
+    dst[r] = acc;
+}
+
+// ============================================================================
+// kernel_gemma4_perlayer_block  --  software-grid-barrier MEGAKERNEL
+// ----------------------------------------------------------------------------
+// Fuses the entire Gemma-4 per-layer-embedding block (graph nodes DG48..65,
+// one per layer x 42) into a SINGLE dispatch, removing 7 of 8 GPU launch
+// boundaries. The block is dispatch-bound at decode (both matmuls are small --
+// one dim is n_pl=256 -- so ~8 x ~5us launch overhead dwarfs the few-us of
+// q4_K BW work). Per-layer-block + q4_K-cap microbenches predicted ~+5% tg E4B
+// and settled the resident-cap / capped-R-GEMV risks (see memory notes).
+//
+// Op chain (decode, n_tokens=1), both MUL_MATs are q4_K:
+//   1 MUL_MAT inp_gate : y1[n_pl] = Wg[n_pl x D] . x[D]            (all-WG GEMV)
+//   2 UNARY   gelu      : y1 = gelu(y1)                            (single-WG)
+//   3 MUL     gate      : y2 = y1 * gate[n_pl]                     (single-WG)
+//   4 MUL_MAT proj      : y3[D]   = Wp[D x n_pl] . y2[n_pl]        (all-WG GEMV)
+//   5 RMS_NORM          : r = rms_norm(y3)                         (single-WG)
+//   6 MUL     post_norm : r = r * wn[D]                            (single-WG)
+//   7 ADD     residual  : r = r + x[D]   (x == pe_in)              (single-WG)
+//   8 MUL     out_scale : out = r * oscale[D]                      (single-WG)
+//
+// Persistent-threads grid: launch R workgroups (R=get_num_groups(0), host picks
+// R=128, well under the X2 resident cap of ~256 measured for this occupancy);
+// each WG is 64 x nsg lanes (REQD_SUBGROUP_SIZE_64, nsg = K-split subgroups).
+// The GEMV stages grid-stride over output row-pairs; the small stages run on
+// WG 0. A Xiao&Feng atomic-counter grid_barrier (plain global atomics, L2-
+// coherent on Adreno -- validated in microbench/global_barrier_microbench.cpp)
+// separates the 4 stages. counters[3] must be pre-zeroed by the host each call.
+//
+// Activations are read from PLAIN global buffers (not the image1d the standalone
+// GEMV uses): the proj activation y2 is computed mid-kernel and can't be bound
+// as an image. Activations are tiny (<=2560 floats) so the texture-cache loss is
+// negligible; the WEIGHTS (the BW item) stay as image1d_buffer reads. The dequant
+// math reuses the file's get_scale_min_k4 + dequantizeBlockAccum_* macros
+// verbatim, so per-block weight handling is identical to the standalone GEMV.
+// nsg differs from the standalone wide-split (16), so output is numerically
+// faithful / coherent, NOT byte-identical to the per-op path.
+// ============================================================================
+
+#define GELU_COEF_A    0.044715f
+#define SQRT_2_OVER_PI 0.79788456080286535587989211986876f
+
+// Xiao&Feng arrival-counter grid barrier across all R = get_num_groups(0) WGs.
+// One lane (flat 0) per WG arrives + spins; the surrounding WG barriers give
+// cross-WG global-memory visibility. counter slot must be pre-zeroed.
+inline void mega_grid_barrier(volatile global int * counter) {
+    int R = get_num_groups(0);
+    barrier(CLK_GLOBAL_MEM_FENCE);
+    if (get_local_id(0) == 0 && get_local_id(1) == 0) {
+        atomic_inc(counter);
+        while (atomic_add(counter, 0) < R) {}
+    }
+    barrier(CLK_GLOBAL_MEM_FENCE);
+}
+
+// One q4_K GEMV output fiber (2 rows): totalSum valid on groupId==0 only.
+// act is the activation vector as a plain global float buffer (K elems).
+// reduceLM is a WG-shared scratch (>= SUBGROUP_SIZE * (nsg-1) float2).
+inline float2 mega_q4k_gemv_fiber(
+        read_only image1d_buffer_t src0_q,
+        global const half2 * src0_d,
+        global const half2 * src0_m,
+        global const uchar * src0_s,
+        global const float * act,
+        uint gid, uint groupId, uint nsg, ushort slid,
+        uint K, uint M,
+        uchar mask_d6, uchar mask_d4, uchar mask_hi2,
+        local float2 * reduceLM) {
+    uint LINE_STRIDE_A  = M / 2;
+    uint BLOCK_STRIDE_A = 4 * M;
+    uint scales_per_row = (K / QK_K) * 12;
+
+    private uint4  regA;
+    private half2  regS, regM;
+    private float8 regB;
+    private float2 totalSum = (float2)(0.0f);
+
+    for (uint k = groupId; k < (K / 32); k += nsg) {
+        uint sb = k / 8;
+        uint j  = k % 8;
+
+        half2 d   = src0_d[gid + sb * LINE_STRIDE_A];
+        half2 dm  = src0_m[gid + sb * LINE_STRIDE_A];
+
+        global const uchar * sc0 = src0_s + 2 * gid * scales_per_row + sb * 12;
+        global const uchar * sc1 = src0_s + (2 * gid + 1) * scales_per_row + sb * 12;
+
+        uchar sv0, mn0, sv1, mn1;
+        get_scale_min_k4(j, sc0, &sv0, &mn0, mask_d6, mask_d4, mask_hi2);
+        get_scale_min_k4(j, sc1, &sv1, &mn1, mask_d6, mask_d4, mask_hi2);
+
+        regS = convert_half2(convert_float2(d)  * convert_float2((uchar2)(sv0, sv1)));
+        regM = convert_half2(convert_float2(dm) * convert_float2((uchar2)(mn0, mn1)));
+
+        if (slid < 4) {
+            regB.s0123 = vload4(slid * 2 + k * 8, act);
+            regB.s4567 = vload4(1 + slid * 2 + k * 8, act);
+        }
+
+        regA.s0 = read_imageui(src0_q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 0)).x;
+        regA.s1 = read_imageui(src0_q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 1)).x;
+        regA.s2 = read_imageui(src0_q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 2)).x;
+        regA.s3 = read_imageui(src0_q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 3)).x;
+#ifdef VECTOR_SUB_GROUP_BROADCAST
+        dequantizeBlockAccum_ns_sgbroadcast_8_hi(totalSum, as_ushort8(regA), regS, regM, regB);
+#else
+        dequantizeBlockAccum_ns_sgbroadcast_1_hi(totalSum, as_ushort8(regA), regS, regM, regB);
+#endif
+
+        regA.s0 = read_imageui(src0_q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 4)).x;
+        regA.s1 = read_imageui(src0_q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 5)).x;
+        regA.s2 = read_imageui(src0_q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 6)).x;
+        regA.s3 = read_imageui(src0_q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 7)).x;
+#ifdef VECTOR_SUB_GROUP_BROADCAST
+        dequantizeBlockAccum_ns_sgbroadcast_8_lo(totalSum, as_ushort8(regA), regS, regM, regB);
+#else
+        dequantizeBlockAccum_ns_sgbroadcast_1_lo(totalSum, as_ushort8(regA), regS, regM, regB);
+#endif
+    }
+
+    if (groupId > 0) {
+        reduceLM[SUBGROUP_SIZE * (groupId - 1) + slid] = totalSum;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (groupId == 0) {
+        for (uint i = 0; i < nsg - 1; ++i) {
+            totalSum += reduceLM[SUBGROUP_SIZE * i + slid];
+        }
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);   // protect reduceLM reuse on the next fiber
+    return totalSum;
+}
+
+#ifdef ADRENO_GPU
+REQD_SUBGROUP_SIZE_64
+#endif
+kernel void kernel_gemma4_perlayer_block(
+        read_only image1d_buffer_t g_q,        // inp_gate q4_K weights (image)
+        global const half2  * g_d,
+        global const half2  * g_m,
+        global const uchar  * g_s,
+        read_only image1d_buffer_t p_q,        // proj q4_K weights (image)
+        global const half2  * p_d,
+        global const half2  * p_m,
+        global const uchar  * p_s,
+        global const float  * x,               // pe_in [D] (inp_gate act + residual)
+        ulong                 offset_x,
+        global const float  * gate,            // inp_this_layer [n_pl]
+        ulong                 offset_gate,
+        global const float  * wn,              // per_layer_post_norm weight [D]
+        ulong                 offset_wn,
+        global const float  * oscale,          // layer_output_scale weight [D]
+        ulong                 offset_oscale,
+        global float        * out,
+        ulong                 offset_out,
+        global float        * scratch,         // y1[n_pl] | y2[n_pl] | y3[D]
+        volatile global int * counters,        // [3], pre-zeroed
+        int   D,
+        int   n_pl,
+        float eps,
+        uchar mask_d6,
+        uchar mask_d4,
+        uchar mask_hi2) {
+    local float2 reduceLM[SUBGROUP_SIZE * 15];   // up to 16 subgroups
+
+    x      = (global const float *)((global const char *)x      + offset_x);
+    gate   = (global const float *)((global const char *)gate   + offset_gate);
+    wn     = (global const float *)((global const char *)wn     + offset_wn);
+    oscale = (global const float *)((global const char *)oscale + offset_oscale);
+
+    global float * y1 = scratch;
+    global float * y2 = scratch + n_pl;
+    global float * y3 = scratch + 2 * n_pl;
+
+    uint lid0    = get_local_id(0);
+    uint groupId = get_local_id(1);
+    uint nsg     = get_local_size(1);
+    ushort slid  = get_sub_group_local_id();
+    uint flid    = groupId * SUBGROUP_SIZE + lid0;   // flat lane id
+    uint nflat   = nsg * SUBGROUP_SIZE;
+    uint gstride = get_global_size(0);
+
+    // ---- stage 1: y1 = Wg . x  (q4_K GEMV, K=D, M=n_pl) ----
+    for (uint fiber = get_global_id(0); fiber < (uint)(n_pl / 2); fiber += gstride) {
+        float2 r = mega_q4k_gemv_fiber(g_q, g_d, g_m, g_s, x, fiber, groupId, nsg, slid,
+                                       (uint)D, (uint)n_pl, mask_d6, mask_d4, mask_hi2, reduceLM);
+        if (groupId == 0) { y1[fiber * 2] = r.s0; y1[fiber * 2 + 1] = r.s1; }
+    }
+    mega_grid_barrier(counters + 0);
+
+    // ---- stage 2/3: y2 = gelu(y1) * gate  (single WG) ----
+    if (get_group_id(0) == 0) {
+        for (uint i = flid; i < (uint)n_pl; i += nflat) {
+            float v  = y1[i];
+            float ge = 0.5f * v * (1.0f + tanh(SQRT_2_OVER_PI * v * (1.0f + GELU_COEF_A * v * v)));
+            y2[i] = ge * gate[i];
+        }
+    }
+    mega_grid_barrier(counters + 1);
+
+    // ---- stage 4: y3 = Wp . y2  (q4_K GEMV, K=n_pl, M=D) ----
+    for (uint fiber = get_global_id(0); fiber < (uint)(D / 2); fiber += gstride) {
+        float2 r = mega_q4k_gemv_fiber(p_q, p_d, p_m, p_s, y2, fiber, groupId, nsg, slid,
+                                       (uint)n_pl, (uint)D, mask_d6, mask_d4, mask_hi2, reduceLM);
+        if (groupId == 0) { y3[fiber * 2] = r.s0; y3[fiber * 2 + 1] = r.s1; }
+    }
+    mega_grid_barrier(counters + 2);
+
+    // ---- stage 5-8: out = (rms_norm(y3)*wn + x) * oscale  (single WG) ----
+    if (get_group_id(0) == 0) {
+        local float * fred = (local float *) reduceLM;
+        float p = 0.0f;
+        for (uint i = flid; i < (uint)D; i += nflat) p += y3[i] * y3[i];
+        fred[flid] = p;
+        barrier(CLK_LOCAL_MEM_FENCE);
+        for (uint s = nflat / 2; s > 0; s >>= 1) {
+            if (flid < s) fred[flid] += fred[flid + s];
+            barrier(CLK_LOCAL_MEM_FENCE);
+        }
+        float rms = rsqrt(fred[0] / (float)D + eps);
+        global float * o = (global float *)((global char *)out + offset_out);
+        for (uint i = flid; i < (uint)D; i += nflat) {
+            o[i] = (y3[i] * rms * wn[i] + x[i]) * oscale[i];
+        }
+    }
+}
