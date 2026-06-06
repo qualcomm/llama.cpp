@@ -698,16 +698,19 @@ kernel void kernel_gemv_splitk_reduce_f32(
 #define SQRT_2_OVER_PI 0.79788456080286535587989211986876f
 
 // Xiao&Feng arrival-counter grid barrier across all R = get_num_groups(0) WGs.
-// One lane (flat 0) per WG arrives + spins; the surrounding WG barriers give
-// cross-WG global-memory visibility. counter slot must be pre-zeroed.
-inline void mega_grid_barrier(volatile global int * counter) {
+// A plain barrier(CLK_GLOBAL_MEM_FENCE) only orders accesses WITHIN a workgroup;
+// it does NOT publish one WG's regular global writes to another WG. So we use
+// C11 atomics with DEVICE-SCOPE release/acquire: the WG barrier orders all lanes'
+// data writes before lane-0's release atomic_fetch_add; readers acquire-load the
+// counter, which makes those data writes visible cross-WG. counter pre-zeroed.
+inline void mega_grid_barrier(volatile global atomic_int * counter) {
     int R = get_num_groups(0);
-    barrier(CLK_GLOBAL_MEM_FENCE);
+    work_group_barrier(CLK_GLOBAL_MEM_FENCE);
     if (get_local_id(0) == 0 && get_local_id(1) == 0) {
-        atomic_inc(counter);
-        while (atomic_add(counter, 0) < R) {}
+        atomic_fetch_add_explicit(counter, 1, memory_order_release, memory_scope_device);
+        while (atomic_load_explicit(counter, memory_order_acquire, memory_scope_device) < R) {}
     }
-    barrier(CLK_GLOBAL_MEM_FENCE);
+    work_group_barrier(CLK_GLOBAL_MEM_FENCE);
 }
 
 // One q4_K GEMV output fiber (2 rows): totalSum valid on groupId==0 only.
@@ -811,7 +814,7 @@ kernel void kernel_gemma4_perlayer_block(
         global float        * out,
         ulong                 offset_out,
         global float        * scratch,         // y1[n_pl] | y2[n_pl] | y3[D]
-        volatile global int * counters,        // [3], pre-zeroed
+        volatile global atomic_int * counters,  // [3], pre-zeroed
         int   D,
         int   n_pl,
         float eps,
@@ -875,9 +878,121 @@ kernel void kernel_gemma4_perlayer_block(
             barrier(CLK_LOCAL_MEM_FENCE);
         }
         float rms = rsqrt(fred[0] / (float)D + eps);
+        float os  = oscale[0];   // layer_output_scale is a SCALAR [1], broadcast over D
         global float * o = (global float *)((global char *)out + offset_out);
         for (uint i = flid; i < (uint)D; i += nflat) {
-            o[i] = (y3[i] * rms * wn[i] + x[i]) * oscale[i];
+            o[i] = (y3[i] * rms * wn[i] + x[i]) * os;
+        }
+    }
+}
+
+// ============================================================================
+// kernel_gemma4_perlayer_block_f32  --  F32-weight variant of the megakernel.
+// In Gemma-4-E4B-Q4_K_M the per-layer inp_gate/proj weights are stored F32 (not
+// q4_K), so the q4_K variant above never fires. This variant embeds a plain f32
+// GEMV: fiber = output row (grid-strided), K split over the nsg subgroups, cross-
+// subgroup reduce in __local (mirrors the q4_K kernel's WG-uniform barrier
+// structure -> avoids the Adreno full-subgroup-reduce miscompile). Same grid
+// barrier + gelu_mul + rms_mul_add_scale stages.
+// ============================================================================
+
+// One f32 GEMV output row: result valid on groupId==0.
+inline float mega_f32_gemv_fiber(global const float * W, volatile global const float * act,
+                                 uint row, uint lid0, uint groupId, uint nsg, uint K,
+                                 local float * red) {
+    float p = 0.0f;
+    global const float * Wr = W + (ulong)row * K;
+    for (uint k = groupId; k < K; k += nsg) p += Wr[k] * act[k];
+    if (groupId > 0) red[SUBGROUP_SIZE * (groupId - 1) + lid0] = p;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (groupId == 0) { for (uint i = 0; i < nsg - 1; ++i) p += red[SUBGROUP_SIZE * i + lid0]; }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    return p;
+}
+
+#ifdef ADRENO_GPU
+REQD_SUBGROUP_SIZE_64
+#endif
+kernel void kernel_gemma4_perlayer_block_f32(
+        global const float  * g_w,             // inp_gate f32 weights [n_pl x D]
+        ulong                 offset_gw,
+        global const float  * p_w,             // proj f32 weights [D x n_pl]
+        ulong                 offset_pw,
+        global const float  * x,               // pe_in [D]
+        ulong                 offset_x,
+        global const float  * gate,            // inp_this_layer [n_pl]
+        ulong                 offset_gate,
+        global const float  * wn,              // per_layer_post_norm weight [D]
+        ulong                 offset_wn,
+        global const float  * oscale,          // layer_output_scale weight [D]
+        ulong                 offset_oscale,
+        global float        * out,
+        ulong                 offset_out,
+        volatile global float * scratch,       // y1[n_pl] | y2[n_pl] | y3[D]
+        volatile global atomic_int * counters,  // [3], pre-zeroed
+        int   D,
+        int   n_pl,
+        float eps) {
+    local float2 reduceLM[SUBGROUP_SIZE * 15];
+    local float * red = (local float *) reduceLM;
+
+    g_w    = (global const float *)((global const char *)g_w    + offset_gw);
+    p_w    = (global const float *)((global const char *)p_w    + offset_pw);
+    x      = (global const float *)((global const char *)x      + offset_x);
+    gate   = (global const float *)((global const char *)gate   + offset_gate);
+    wn     = (global const float *)((global const char *)wn     + offset_wn);
+    oscale = (global const float *)((global const char *)oscale + offset_oscale);
+
+    uint lid0    = get_local_id(0);
+    uint groupId = get_local_id(1);
+    uint nsg     = get_local_size(1);
+    uint flid    = groupId * SUBGROUP_SIZE + lid0;
+    uint nflat   = nsg * SUBGROUP_SIZE;
+    uint gstride = get_global_size(0);
+
+    volatile global float * y1 = scratch;
+    volatile global float * y2 = scratch + n_pl;
+    volatile global float * y3 = scratch + 2 * n_pl;
+
+    // stage 1: y1 = Wg . x  (M=n_pl, K=D)
+    for (uint row = get_global_id(0); row < (uint)n_pl; row += gstride) {
+        float r = mega_f32_gemv_fiber(g_w, x, row, lid0, groupId, nsg, (uint)D, red);
+        if (groupId == 0) y1[row] = r;
+    }
+    mega_grid_barrier(counters + 0);
+
+    // stage 2/3: y2 = gelu(y1) * gate  (single WG)
+    if (get_group_id(0) == 0) {
+        for (uint i = flid; i < (uint)n_pl; i += nflat) {
+            float v  = y1[i];
+            float ge = 0.5f * v * (1.0f + tanh(SQRT_2_OVER_PI * v * (1.0f + GELU_COEF_A * v * v)));
+            y2[i] = ge * gate[i];
+        }
+    }
+    mega_grid_barrier(counters + 1);
+
+    // stage 4: y3 = Wp . y2  (M=D, K=n_pl)
+    for (uint row = get_global_id(0); row < (uint)D; row += gstride) {
+        float r = mega_f32_gemv_fiber(p_w, y2, row, lid0, groupId, nsg, (uint)n_pl, red);
+        if (groupId == 0) y3[row] = r;
+    }
+    mega_grid_barrier(counters + 2);
+
+    // stage 5-8: out = (rms_norm(y3)*wn + x) * oscale  (single WG)
+    if (get_group_id(0) == 0) {
+        float p = 0.0f;
+        for (uint i = flid; i < (uint)D; i += nflat) p += y3[i] * y3[i];
+        red[flid] = p;
+        barrier(CLK_LOCAL_MEM_FENCE);
+        for (uint s = nflat / 2; s > 0; s >>= 1) {
+            if (flid < s) red[flid] += red[flid + s];
+            barrier(CLK_LOCAL_MEM_FENCE);
+        }
+        float rms = rsqrt(red[0] / (float)D + eps);
+        float os  = oscale[0];   // layer_output_scale is a SCALAR [1], broadcast over D
+        global float * o = (global float *)((global char *)out + offset_out);
+        for (uint i = flid; i < (uint)D; i += nflat) {
+            o[i] = (y3[i] * rms * wn[i] + x[i]) * os;
         }
     }
 }
