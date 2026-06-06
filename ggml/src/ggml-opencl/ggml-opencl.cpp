@@ -4008,6 +4008,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         if (getenv("GGML_OPENCL_Q4K_MC3_LDS")) {
             CL_gemv_compile_opts += " -DQ4K_MC3_DEQUANT_LDS ";
         }
+        if (getenv("GGML_OPENCL_MEGA_REGULAR")) {
+            CL_gemv_compile_opts += " -DMEGA_REGULAR ";   // megakernel: regular scratch r/w (no atomics)
+        }
 
 #ifdef GGML_OPENCL_EMBED_KERNELS
         const std::string kernel_src {

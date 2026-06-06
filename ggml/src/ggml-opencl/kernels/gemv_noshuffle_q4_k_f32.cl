@@ -725,10 +725,18 @@ inline void mega_grid_barrier(volatile global atomic_int * counter) {
 // (y1/y2/y3) through traditional int atomics on the float bits: atomic_xchg to
 // store (write-through to L2), atomic_add(.,0) to load (read-from-L2, bypass L1).
 inline void  mega_st(volatile global float * p, uint i, float v) {
+#ifdef MEGA_REGULAR
+    p[i] = v;   // regular store: rely on the grid barrier's release for cross-WG publish
+#else
     atomic_xchg((volatile global int *)p + i, as_int(v));
+#endif
 }
 inline float mega_ld(volatile global float * p, uint i) {
+#ifdef MEGA_REGULAR
+    return p[i];   // regular load: barrier's acquire makes other WGs' writes visible
+#else
     return as_float(atomic_add((volatile global int *)p + i, 0));
+#endif
 }
 
 // One q4_K GEMV output fiber (2 rows): totalSum valid on groupId==0 only.
