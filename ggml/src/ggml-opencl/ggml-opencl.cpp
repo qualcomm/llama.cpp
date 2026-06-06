@@ -1169,7 +1169,8 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemv_noshuffle_q4_k_f32_tiled;  // tiled-wide layout (opt-in)
     cl_kernel kernel_convert_block_q4_k_tiled_ns;    // tiled-wide convert (opt-in)
     cl_kernel kernel_gemv_noshuffle_q4_k_f32_mc3;  // multi-column (N=3) verify GEMV
-    cl_kernel kernel_gemma4_perlayer_block;        // per-layer-block megakernel (grid barrier)
+    cl_kernel kernel_gemma4_perlayer_block;        // per-layer-block megakernel (grid barrier), q4_K weights
+    cl_kernel kernel_gemma4_perlayer_block_f32;    // same, f32 weights (E4B per-layer)
     cl_kernel kernel_gemm_noshuffle_q4_k_f32;
     cl_kernel kernel_gemm_noshuffle_q4_k_q8_1_dp4a = nullptr;  // dp4a (int8) dense prefill GEMM
     cl_kernel kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg = nullptr;  // dp4a dense prefill GEMM, weights via texture (X1 opt-in)
@@ -4022,6 +4023,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q4_k_f32 = clCreateKernel(prog, "kernel_gemv_noshuffle_q4_k_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q4_k_f32_mc3 = clCreateKernel(prog, "kernel_gemv_noshuffle_q4_k_f32_mc3", &err), err));
         CL_CHECK((backend_ctx->kernel_gemma4_perlayer_block = clCreateKernel(prog, "kernel_gemma4_perlayer_block", &err), err));
+        CL_CHECK((backend_ctx->kernel_gemma4_perlayer_block_f32 = clCreateKernel(prog, "kernel_gemma4_perlayer_block_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q4_k_f32_splitk = clCreateKernel(prog, "kernel_gemv_noshuffle_q4_k_f32_splitk", &err), err));
         CL_CHECK((backend_ctx->kernel_gemv_splitk_reduce_f32 = clCreateKernel(prog, "kernel_gemv_splitk_reduce_f32", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -7346,9 +7348,15 @@ static void ggml_opencl_op_rms_norm_mul_add_fused(ggml_backend_t backend, ggml_t
 static void ggml_opencl_op_norm_fused(ggml_backend_t backend, ggml_tensor * norm_tensor, ggml_tensor * mul_tensor, ggml_tensor * add_tensor);
 static void ggml_opencl_op_group_norm_fused(ggml_backend_t backend, ggml_tensor * gn_tensor, ggml_tensor * mul_tensor, ggml_tensor * add_tensor);
 static void ggml_cl_rope_set_rows(ggml_backend_t backend, ggml_tensor * rope_tensor, ggml_tensor * view_tensor, ggml_tensor * set_rows_tensor);
-static bool ggml_opencl_can_fuse_gemma4_perlayer_block(const struct ggml_cgraph * cgraph, int i);
-static void ggml_opencl_op_gemma4_perlayer_block(ggml_backend_t backend, const struct ggml_cgraph * cgraph, int i);
+static bool ggml_opencl_can_fuse_gemma4_perlayer_block(const struct ggml_cgraph * cgraph, int i, int * out_idx);
+static void ggml_opencl_op_gemma4_perlayer_block(ggml_backend_t backend, const struct ggml_cgraph * cgraph, const int * idx);
 inline bool use_q4k_tiled(const ggml_tensor *tensor);   // defined below
+
+// A graph node the dispatch loop skips (no kernel): VIEW/RESHAPE/PERMUTE/etc.
+static inline bool ggml_opencl_node_is_noop(const ggml_tensor * n) {
+    return ggml_is_empty(n) || n->op == GGML_OP_RESHAPE || n->op == GGML_OP_TRANSPOSE ||
+           n->op == GGML_OP_VIEW || n->op == GGML_OP_PERMUTE || n->op == GGML_OP_NONE;
+}
 
 // Match the Gemma-4 per-layer-embedding block (graph nodes DG48..65, one per
 // layer): MUL_MAT(inp_gate q4_K) -> UNARY(gelu) -> MUL(inp_this_layer) ->
@@ -7357,18 +7365,27 @@ inline bool use_q4k_tiled(const ggml_tensor *tensor);   // defined below
 // contiguous in graph order for every layer (the one-time inp_per_layer
 // precompute lives elsewhere). Highly specific wiring -> the intermediate
 // outputs are private to the block, no separate use-count guard needed.
-static bool ggml_opencl_can_fuse_gemma4_perlayer_block(const struct ggml_cgraph * cgraph, int i) {
-    if (i + 7 >= cgraph->n_nodes) {
-        return false;
+static bool ggml_opencl_can_fuse_gemma4_perlayer_block(const struct ggml_cgraph * cgraph, int i, int * out_idx) {
+    // Gather the next 8 COMPUTED nodes from index i (skipping no-op VIEW/RESHAPE/
+    // PERMUTE/etc nodes that sit between the block's ops, e.g. the inp_this_layer
+    // view). out_idx receives their graph indices so the caller can advance past
+    // the whole span (the skipped no-ops produce no kernels).
+    int idx[8];
+    int got = 0;
+    for (int j = i; j < cgraph->n_nodes && got < 8; ++j) {
+        if (ggml_opencl_node_is_noop(cgraph->nodes[j])) { continue; }
+        idx[got++] = j;
     }
-    ggml_tensor * n0 = cgraph->nodes[i];     // MUL_MAT inp_gate
-    ggml_tensor * n1 = cgraph->nodes[i + 1]; // UNARY gelu
-    ggml_tensor * n2 = cgraph->nodes[i + 2]; // MUL gate
-    ggml_tensor * n3 = cgraph->nodes[i + 3]; // MUL_MAT proj
-    ggml_tensor * n4 = cgraph->nodes[i + 4]; // RMS_NORM
-    ggml_tensor * n5 = cgraph->nodes[i + 5]; // MUL post_norm
-    ggml_tensor * n6 = cgraph->nodes[i + 6]; // ADD residual
-    ggml_tensor * n7 = cgraph->nodes[i + 7]; // MUL out_scale (= dst)
+    if (got < 8) { return false; }
+
+    ggml_tensor * n0 = cgraph->nodes[idx[0]]; // MUL_MAT inp_gate
+    ggml_tensor * n1 = cgraph->nodes[idx[1]]; // UNARY gelu
+    ggml_tensor * n2 = cgraph->nodes[idx[2]]; // MUL gate
+    ggml_tensor * n3 = cgraph->nodes[idx[3]]; // MUL_MAT proj
+    ggml_tensor * n4 = cgraph->nodes[idx[4]]; // RMS_NORM
+    ggml_tensor * n5 = cgraph->nodes[idx[5]]; // MUL post_norm
+    ggml_tensor * n6 = cgraph->nodes[idx[6]]; // ADD residual
+    ggml_tensor * n7 = cgraph->nodes[idx[7]]; // MUL out_scale (= dst)
 
     if (n0->op != GGML_OP_MUL_MAT)  { return false; }
     if (n1->op != GGML_OP_UNARY || ggml_get_unary_op(n1) != GGML_UNARY_OP_GELU) { return false; }
@@ -7391,40 +7408,45 @@ static bool ggml_opencl_can_fuse_gemma4_perlayer_block(const struct ggml_cgraph 
 
     const ggml_tensor * Wg = n0->src[0];
     const ggml_tensor * Wp = n3->src[0];
-    if (Wg->type != GGML_TYPE_Q4_K || Wp->type != GGML_TYPE_Q4_K) { return false; }
-    if (!Wg->extra || !Wp->extra)                                 { return false; }
-    if (use_q4k_tiled(Wg) || use_q4k_tiled(Wp))                   { return false; }
-    if (((ggml_tensor_extra_cl_q4_K *)Wg->extra)->q == nullptr)   { return false; }
-    if (((ggml_tensor_extra_cl_q4_K *)Wp->extra)->q == nullptr)   { return false; }
-
-    const int blck = ggml_blck_size(GGML_TYPE_Q4_K);               // QK_K = 256
-    if (Wg->ne[0] % blck != 0 || Wp->ne[0] % blck != 0)           { return false; }
+    if (Wg->type != Wp->type || !Wg->extra || !Wp->extra)         { return false; }
+    const bool is_q4k = (Wg->type == GGML_TYPE_Q4_K);
+    const bool is_f32 = (Wg->type == GGML_TYPE_F32);
+    if (!is_q4k && !is_f32)                                       { return false; }
+    if (is_q4k) {
+        if (use_q4k_tiled(Wg) || use_q4k_tiled(Wp))               { return false; }
+        if (((ggml_tensor_extra_cl_q4_K *)Wg->extra)->q == nullptr) { return false; }
+        if (((ggml_tensor_extra_cl_q4_K *)Wp->extra)->q == nullptr) { return false; }
+        const int blck = ggml_blck_size(GGML_TYPE_Q4_K);           // QK_K = 256
+        if (Wg->ne[0] % blck != 0 || Wp->ne[0] % blck != 0)       { return false; }
+        if (n0->ne[0] % 2 != 0 || n3->ne[0] % 2 != 0)             { return false; }  // 2 outputs / fiber (q4_K)
+    } else { // f32
+        if (!ggml_is_contiguous(Wg) || !ggml_is_contiguous(Wp))   { return false; }
+    }
     if (Wp->ne[0] != n0->ne[0])                                   { return false; }  // proj K == inp_gate M (n_pl)
     if (n0->ne[1] != 1)                                           { return false; }  // decode: 1 token column
-    if (n0->ne[0] % 2 != 0 || n3->ne[0] % 2 != 0)                { return false; }  // 2 outputs / fiber
     if (n7->type != GGML_TYPE_F32)                               { return false; }
+    for (int k = 0; k < 8; ++k) { out_idx[k] = idx[k]; }
     return true;
 }
 
-static void ggml_opencl_op_gemma4_perlayer_block(ggml_backend_t backend, const struct ggml_cgraph * cgraph, int i) {
+static void ggml_opencl_op_gemma4_perlayer_block(ggml_backend_t backend, const struct ggml_cgraph * cgraph, const int * idx) {
     ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *)backend->context;
 
-    ggml_tensor * n_gate_mm = cgraph->nodes[i];       // MUL_MAT inp_gate
-    ggml_tensor * n_mul_g   = cgraph->nodes[i + 2];   // MUL gate
-    ggml_tensor * n_proj_mm = cgraph->nodes[i + 3];   // MUL_MAT proj
-    ggml_tensor * n_rms     = cgraph->nodes[i + 4];   // RMS_NORM
-    ggml_tensor * n_mul_wn  = cgraph->nodes[i + 5];   // MUL post_norm
-    ggml_tensor * n_out     = cgraph->nodes[i + 7];   // MUL out_scale (= dst)
+    ggml_tensor * n_gate_mm = cgraph->nodes[idx[0]];  // MUL_MAT inp_gate
+    ggml_tensor * n_mul_g   = cgraph->nodes[idx[2]];  // MUL gate
+    ggml_tensor * n_proj_mm = cgraph->nodes[idx[3]];  // MUL_MAT proj
+    ggml_tensor * n_rms     = cgraph->nodes[idx[4]];  // RMS_NORM
+    ggml_tensor * n_mul_wn  = cgraph->nodes[idx[5]];  // MUL post_norm
+    ggml_tensor * n_out     = cgraph->nodes[idx[7]];  // MUL out_scale (= dst)
 
-    const ggml_tensor * Wg     = n_gate_mm->src[0];   // inp_gate q4_K
+    const ggml_tensor * Wg     = n_gate_mm->src[0];   // inp_gate weight
     const ggml_tensor * x_t    = n_gate_mm->src[1];   // pe_in [D]
     const ggml_tensor * gate_t = n_mul_g->src[1];     // inp_this_layer [n_pl]
-    const ggml_tensor * Wp     = n_proj_mm->src[0];   // proj q4_K
+    const ggml_tensor * Wp     = n_proj_mm->src[0];   // proj weight
     const ggml_tensor * wn_t   = n_mul_wn->src[1];    // per_layer_post_norm [D]
     const ggml_tensor * os_t   = n_out->src[1];       // layer_output_scale [D]
+    const bool is_f32 = (Wg->type == GGML_TYPE_F32);
 
-    ggml_tensor_extra_cl_q4_K * eg = (ggml_tensor_extra_cl_q4_K *) Wg->extra;
-    ggml_tensor_extra_cl_q4_K * ep = (ggml_tensor_extra_cl_q4_K *) Wp->extra;
     ggml_tensor_extra_cl * ex_x   = (ggml_tensor_extra_cl *) x_t->extra;
     ggml_tensor_extra_cl * ex_gate = (ggml_tensor_extra_cl *) gate_t->extra;
     ggml_tensor_extra_cl * ex_wn  = (ggml_tensor_extra_cl *) wn_t->extra;
@@ -7437,19 +7459,79 @@ static void ggml_opencl_op_gemma4_perlayer_block(ggml_backend_t backend, const s
     float eps = 0.0f;
     memcpy(&eps, n_rms->op_params, sizeof(float));
 
+    static int dbg = 0;
+    if (getenv("GGML_OPENCL_MEGA_DEBUG") && dbg < 3) {
+        dbg++;
+        fprintf(stderr, "[MEGA] call#%d f32=%d D=%d n_pl=%d eps=%g | Wg='%s'(%lldx%lld) x='%s'(%lldx%lld) gate='%s' Wp='%s'(%lldx%lld) wn='%s' os='%s' out='%s'\n",
+            dbg, (int)is_f32, D, n_pl, eps,
+            Wg->name,(long long)Wg->ne[0],(long long)Wg->ne[1],
+            x_t->name,(long long)x_t->ne[0],(long long)x_t->ne[1], gate_t->name,
+            Wp->name,(long long)Wp->ne[0],(long long)Wp->ne[1],
+            wn_t->name, os_t->name, n_out->name);
+    }
+
     const cl_ulong off_x   = ex_x->offset   + x_t->view_offs;
     const cl_ulong off_gate = ex_gate->offset + gate_t->view_offs;
     const cl_ulong off_wn  = ex_wn->offset   + wn_t->view_offs;
     const cl_ulong off_os  = ex_os->offset   + os_t->view_offs;
     const cl_ulong off_out = ex_out->offset  + n_out->view_offs;
 
-    const cl_uchar mask_d6 = 0x3F, mask_d4 = 0x0F, mask_hi2 = 0xC0;
+    // scratch (y1[n_pl] | y2[n_pl] | y3[D]) + 3 grid-barrier counters (pre-zeroed)
+    backend_ctx->prealloc_mega_pl_scratch.allocate(backend_ctx->context, (size_t)(2 * n_pl + D) * sizeof(float));
+    backend_ctx->prealloc_mega_pl_counters.allocate(backend_ctx->context, 3 * sizeof(cl_int));
+    cl_mem scratch  = backend_ctx->prealloc_mega_pl_scratch.buffer;
+    cl_mem counters = backend_ctx->prealloc_mega_pl_counters.buffer;
+    const cl_int zero = 0;
+    CL_CHECK(clEnqueueFillBuffer(backend_ctx->queue, counters, &zero, sizeof(cl_int), 0, 3 * sizeof(cl_int), 0, NULL, NULL));
 
+    // Persistent-threads grid: R WGs (< ~256 X2 resident cap for this occupancy),
+    // each 64 x nsg lanes (nsg = K-split subgroups). The grid barrier requires
+    // every launched WG to be co-resident, so R must stay under the cap.
+    // Tunable via GGML_OPENCL_MEGA_R / GGML_OPENCL_MEGA_NSG for sweeping.
+    static const size_t R   = []{ const char* e = getenv("GGML_OPENCL_MEGA_R");   return e && atoi(e) > 0 ? (size_t)atoi(e) : (size_t)128; }();
+    static const size_t nsg = []{ const char* e = getenv("GGML_OPENCL_MEGA_NSG"); return e && atoi(e) > 0 ? (size_t)atoi(e) : (size_t)8;   }();
+    size_t local_work_size[3]  = { 64, nsg, 1 };
+    size_t global_work_size[3] = { R * 64, nsg, 1 };
+
+    if (is_f32) {
+        // F32-weight variant (E4B per-layer weights are stored f32).
+        ggml_tensor_extra_cl * ex_gw = (ggml_tensor_extra_cl *) Wg->extra;
+        ggml_tensor_extra_cl * ex_pw = (ggml_tensor_extra_cl *) Wp->extra;
+        const cl_ulong off_gw = ex_gw->offset + Wg->view_offs;
+        const cl_ulong off_pw = ex_pw->offset + Wp->view_offs;
+        cl_kernel kernel = backend_ctx->kernel_gemma4_perlayer_block_f32;
+        int a = 0;
+        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &ex_gw->data_device));
+        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &off_gw));
+        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &ex_pw->data_device));
+        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &off_pw));
+        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &ex_x->data_device));
+        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &off_x));
+        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &ex_gate->data_device));
+        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &off_gate));
+        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &ex_wn->data_device));
+        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &off_wn));
+        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &ex_os->data_device));
+        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &off_os));
+        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &ex_out->data_device));
+        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &off_out));
+        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &scratch));
+        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &counters));
+        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_int),   &D));
+        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_int),   &n_pl));
+        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_float), &eps));
+        backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, n_out);
+        return;
+    }
+
+    // q4_K-weight variant: images over the two weight buffers (noshuffle 4*M
+    // layout; width = M*K/2/4).
+    ggml_tensor_extra_cl_q4_K * eg = (ggml_tensor_extra_cl_q4_K *) Wg->extra;
+    ggml_tensor_extra_cl_q4_K * ep = (ggml_tensor_extra_cl_q4_K *) Wp->extra;
+    const cl_uchar mask_d6 = 0x3F, mask_d4 = 0x0F, mask_hi2 = 0xC0;
     cl_int err;
     cl_image_format img_fmt = { CL_R, CL_UNSIGNED_INT32 };
     cl_image_desc   img_desc;
-
-    // images over the two q4_K weight buffers (noshuffle 4*M layout; width = M*K/2/4)
     cl_mem g_img = nullptr, p_img = nullptr;
     memset(&img_desc, 0, sizeof(img_desc));
     img_desc.image_type  = CL_MEM_OBJECT_IMAGE1D_BUFFER;
@@ -7461,14 +7543,6 @@ static void ggml_opencl_op_gemma4_perlayer_block(ggml_backend_t backend, const s
     img_desc.image_width = (size_t) Wp->ne[1] * Wp->ne[0] / 2 / 4;
     img_desc.buffer      = ep->q;
     CL_CHECK((p_img = clCreateImage(backend_ctx->context, CL_MEM_READ_ONLY, &img_fmt, &img_desc, NULL, &err), err));
-
-    // scratch (y1[n_pl] | y2[n_pl] | y3[D]) + 3 grid-barrier counters (pre-zeroed)
-    backend_ctx->prealloc_mega_pl_scratch.allocate(backend_ctx->context, (size_t)(2 * n_pl + D) * sizeof(float));
-    backend_ctx->prealloc_mega_pl_counters.allocate(backend_ctx->context, 3 * sizeof(cl_int));
-    cl_mem scratch  = backend_ctx->prealloc_mega_pl_scratch.buffer;
-    cl_mem counters = backend_ctx->prealloc_mega_pl_counters.buffer;
-    const cl_int zero = 0;
-    CL_CHECK(clEnqueueFillBuffer(backend_ctx->queue, counters, &zero, sizeof(cl_int), 0, 3 * sizeof(cl_int), 0, NULL, NULL));
 
     cl_kernel kernel = backend_ctx->kernel_gemma4_perlayer_block;
     int a = 0;
@@ -7498,15 +7572,6 @@ static void ggml_opencl_op_gemma4_perlayer_block(ggml_backend_t backend, const s
     CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_uchar), &mask_d6));
     CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_uchar), &mask_d4));
     CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_uchar), &mask_hi2));
-
-    // Persistent-threads grid: R WGs (< ~256 X2 resident cap for this occupancy),
-    // each 64 x nsg lanes (nsg = K-split subgroups). The grid barrier requires
-    // every launched WG to be co-resident, so R must stay under the cap.
-    // Tunable via GGML_OPENCL_MEGA_R / GGML_OPENCL_MEGA_NSG for sweeping.
-    static const size_t R   = []{ const char* e = getenv("GGML_OPENCL_MEGA_R");   return e && atoi(e) > 0 ? (size_t)atoi(e) : (size_t)128; }();
-    static const size_t nsg = []{ const char* e = getenv("GGML_OPENCL_MEGA_NSG"); return e && atoi(e) > 0 ? (size_t)atoi(e) : (size_t)8;   }();
-    size_t local_work_size[3]  = { 64, nsg, 1 };
-    size_t global_work_size[3] = { R * 64, nsg, 1 };
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, n_out);
 
     CL_CHECK(clReleaseMemObject(g_img));
@@ -7572,10 +7637,11 @@ static void ggml_backend_opencl_exec_graph_nodes(ggml_backend_t backend, ggml_cg
         // collapse the 8-op chain (DG48..65) into one dispatch. Opt-in via
         // GGML_OPENCL_MEGA_PERLAYER. Checked before the rms_add fuse so it wins
         // over the inner rms_norm+mul+add sub-pattern it contains.
+        int mega_idx[8];
         if (backend_ctx->mega_perlayer && !backend_ctx->disable_fusion &&
-            ggml_opencl_can_fuse_gemma4_perlayer_block(cgraph, i)) {
-            ggml_opencl_op_gemma4_perlayer_block(backend, cgraph, i);
-            i += 7;
+            ggml_opencl_can_fuse_gemma4_perlayer_block(cgraph, i, mega_idx)) {
+            ggml_opencl_op_gemma4_perlayer_block(backend, cgraph, mega_idx);
+            i = mega_idx[7];   // jump past the whole block (interspersed no-ops produce no kernels)
             continue;
         }
 
