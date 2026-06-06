@@ -7487,13 +7487,16 @@ static void ggml_opencl_op_gemma4_perlayer_block(ggml_backend_t backend, const s
     // Persistent-threads grid: the software grid barrier REQUIRES every launched
     // WG to be concurrently resident (OpenCL gives no independent-forward-progress
     // guarantee — a non-resident WG never reaches the barrier, so the resident WGs
-    // spin forever -> GPU hang/TDR -> garbage). Concurrent-WG capacity scales with
-    // the COMPUTE-UNIT count; how many WGs fit per CU is set by the WG's register +
-    // wave/local footprint. Measured on X2-90: CL_DEVICE_MAX_COMPUTE_UNITS reports
-    // 16, but this 64 x nsg=8 (512-lane, ~8.7 KB local) kernel co-resides exactly
-    // 32 WGs (= 2 WG/CU): R<=32 correct, R>=33 deadlocks. Default R = reported CU
-    // count (conservative, well within the 32 cap, and lower R is also the less-bad
-    // perf point). GGML_OPENCL_MEGA_R overrides (do NOT exceed the measured cap).
+    // spin forever -> GPU hang/TDR -> garbage). Concurrent capacity = (CU count) x
+    // (WGs per CU), where WGs/CU is bounded by TWO per-CU hardware limits (X2-90,
+    // measured): <=16 concurrent SUBGROUPS/CU (register-file bound) AND <=8 WGs/CU.
+    //   nsg=8 (8 sg/WG): 16/8 = 2 WG/CU -> 16*2 = 32 WG cap (R<=32 OK, R>=33 hangs)
+    //   nsg=4 (4 sg/WG): 16/4 = 4 WG/CU -> ~64 WG cap
+    //   nsg=2 (2 sg/WG): hits BOTH (8 WG/CU, 16 sg/CU) -> ~128 WG cap
+    // Device ceiling = 16 CU x 16 sg/CU = 256 concurrent subgroups regardless.
+    // Default R = reported CU count (always safe; lower R is also the less-bad perf
+    // point). GGML_OPENCL_MEGA_R overrides (do NOT exceed the cap for the chosen nsg
+    // -- near-cap configs are also TDR-flaky under sustained load).
     static const size_t cu = [backend_ctx]{
         cl_uint n = 0;
         clGetDeviceInfo(backend_ctx->device, CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(n), &n, NULL);
