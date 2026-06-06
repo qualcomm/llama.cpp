@@ -207,6 +207,9 @@ kernel void kernel_gemv_noshuffle_q6_K_f32(
     int grp = get_local_id(1);
     int gid = get_global_id(0);
     ushort slid = get_sub_group_local_id();
+    // K-split factor = #subgroups in the WG, read from the launch so the decode
+    // dispatch can widen it for better memory-latency hiding (see the q4_K GEMV).
+    uint nsg = get_local_size(1);
 
     int nb = ne00 / 32;
 
@@ -219,9 +222,11 @@ kernel void kernel_gemv_noshuffle_q6_K_f32(
     float2  total_sum = 0.0f;
 
     int line_stride_a = ne01 / 2;
-    int block_stride_a = NSUBGROUPS * ne01;
+    // Physical per-K-block stride: 8 uints/block-row-pair * (ne01/2) row-pairs =
+    // 4*ne01. Layout constant, NOT tied to the K-split factor.
+    int block_stride_a = 4 * ne01;
 
-    for (int k = grp; k < nb; k += NSUBGROUPS) {
+    for (int k = grp; k < nb; k += nsg) {
         reg_d = src0_d[gid + k/8 * line_stride_a];
         reg_s = as_char4(src0_s[gid + k * line_stride_a]);
 
@@ -263,27 +268,20 @@ kernel void kernel_gemv_noshuffle_q6_K_f32(
 #endif // VECTOR_SUB_GROUP_BROADCAT
     }
 
-    local float2 reduce_lm[SUBGROUP_SIZE * 3];
-    if (grp == 1) {
-        reduce_lm[SUBGROUP_SIZE*0 + slid] = total_sum;
-    }
-    if (grp == 2) {
-        reduce_lm[SUBGROUP_SIZE*1 + slid] = total_sum;
-    }
-    if (grp == 3) {
-        reduce_lm[SUBGROUP_SIZE*2 + slid] = total_sum;
+    // Cross-subgroup reduction, generalized to nsg subgroups (sized for up to 16,
+    // the widest K-split we dispatch). At nsg==4 the order matches the original
+    // unroll -> byte-identical for any caller still launching 4 subgroups.
+    local float2 reduce_lm[SUBGROUP_SIZE * 15];
+    if (grp > 0) {
+        reduce_lm[SUBGROUP_SIZE*(grp - 1) + slid] = total_sum;
     }
 
     barrier(CLK_LOCAL_MEM_FENCE);
 
     if (grp == 0) {
-        total_sum += reduce_lm[SUBGROUP_SIZE*0 + slid];
-    }
-    if (grp == 0) {
-        total_sum += reduce_lm[SUBGROUP_SIZE*1 + slid];
-    }
-    if (grp == 0) {
-        total_sum += reduce_lm[SUBGROUP_SIZE*2 + slid];
+        for (uint i = 0; i < nsg - 1; ++i) {
+            total_sum += reduce_lm[SUBGROUP_SIZE*i + slid];
+        }
     }
 
     if (grp == 0) {
