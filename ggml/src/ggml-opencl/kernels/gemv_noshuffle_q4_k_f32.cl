@@ -923,12 +923,25 @@ kernel void kernel_gemma4_perlayer_block(
 // ============================================================================
 
 // One f32 GEMV output row, activation from GLOBAL (coherent input). groupId==0.
+// K is split across the nsg subgroups; when K is a multiple of nsg*4 each
+// subgroup streams a CONTIGUOUS chunk with float4 loads (4x fewer load insns +
+// better BW than the scalar interleaved path), else falls back to scalar stride.
 inline float mega_f32_gemv_fiber(global const float * W, global const float * act,
                                  uint row, uint lid0, uint groupId, uint nsg, uint K,
                                  local float * red) {
     float p = 0.0f;
     global const float * Wr = W + (ulong)row * K;
-    for (uint k = groupId; k < K; k += nsg) p += Wr[k] * act[k];
+    if ((K % (nsg * 4u)) == 0u) {
+        uint kc = K / nsg;            // contiguous chunk per subgroup (mult of 4)
+        uint k0 = groupId * kc;       // chunk base (mult of 4)
+        float4 acc = (float4)(0.0f);
+        for (uint k = 0; k < kc; k += 4) {
+            acc += vload4((k0 + k) >> 2, Wr) * vload4((k0 + k) >> 2, act);
+        }
+        p = acc.x + acc.y + acc.z + acc.w;
+    } else {
+        for (uint k = groupId; k < K; k += nsg) p += Wr[k] * act[k];
+    }
     if (groupId > 0) red[SUBGROUP_SIZE * (groupId - 1) + lid0] = p;
     barrier(CLK_LOCAL_MEM_FENCE);
     if (groupId == 0) { for (uint i = 0; i < nsg - 1; ++i) p += red[SUBGROUP_SIZE * i + lid0]; }
@@ -942,7 +955,17 @@ inline float mega_f32_gemv_fiber_l(global const float * W, local const float * a
                                    local float * red) {
     float p = 0.0f;
     global const float * Wr = W + (ulong)row * K;
-    for (uint k = groupId; k < K; k += nsg) p += Wr[k] * act[k];
+    if ((K % (nsg * 4u)) == 0u) {
+        uint kc = K / nsg;
+        uint k0 = groupId * kc;
+        float4 acc = (float4)(0.0f);
+        for (uint k = 0; k < kc; k += 4) {
+            acc += vload4((k0 + k) >> 2, Wr) * vload4((k0 + k) >> 2, act);
+        }
+        p = acc.x + acc.y + acc.z + acc.w;
+    } else {
+        for (uint k = groupId; k < K; k += nsg) p += Wr[k] * act[k];
+    }
     if (groupId > 0) red[SUBGROUP_SIZE * (groupId - 1) + lid0] = p;
     barrier(CLK_LOCAL_MEM_FENCE);
     if (groupId == 0) { for (uint i = 0; i < nsg - 1; ++i) p += red[SUBGROUP_SIZE * i + lid0]; }
