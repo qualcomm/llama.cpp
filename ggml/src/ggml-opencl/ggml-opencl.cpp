@@ -18511,21 +18511,31 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
             return !e || e[0] == '\0' || e[0] != '0';
         }();
         const bool use_q4k_o4 = !use_tiled && !use_mc3 && q4k_o4_env && (ne01 % 4 == 0) && (ne01 >= 32768);
-        // Split-K across workgroups for small-M projections (Kcur/Vcur). A single-
-        // token GEMV makes only CEIL_DIV(M/2,64) workgroups; for M<=1024 that's
-        // <=8 WGs on 16 CUs, leaving CUs idle (~30-60 GB/s). Splitting K across
-        // `ksplit` workgroups (+ a reduce pass) fills the CUs and is a big KERNEL
-        // win in isolation (microbench +52% @M=512, +20% @M=1024). BUT it adds a
-        // second (reduce) dispatch per small matmul (~84/token), and E4B decode is
-        // partly dispatch-bound on these many tiny per-layer ops, so end-to-end it
-        // nets ~-0.5% vs the dispatch-free wide K-split. Correct/coherent, kept as
-        // an OPT-IN (GGML_OPENCL_Q4K_GEMV_SPLITK=1) for contexts where the small
-        // matmuls dominate or dispatch overhead is lower (e.g. batched serving).
+        // Split-K across workgroups for small-M decode GEMVs. A single-token GEMV
+        // makes only CEIL_DIV(M/2,64) workgroups; even with the wide intra-WG split
+        // (16 subgroups) those all land on ONE CU, so small-M matmuls under-fill the
+        // 16 CUs and cap well below the ~104 GB/s the M=10240 FFN matmuls reach
+        // (profile: ffn_down/attn_output M=2560 @69-81 GB/s, Kcur/Vcur M=1024 @62).
+        // Adding a `ksplit` second grid dim that spreads K across WGs (+ a reduce
+        // pass) fills the CUs. Gate is M<=2560: the tiny M<=1024 ones only break even
+        // (the ~5us reduce dispatch eats the kernel win — this was a -0.5% OPT-IN when
+        // the gate was M<=1024), but extending to the big-K M=2560 cases (ffn_down
+        // K=10240 @182us/call, attn_output @42us) makes the per-call win dwarf the
+        // reduce -> +3.36% tg E4B (6/6 paired, byte-identical). Default ON, opt-out
+        // GGML_OPENCL_Q4K_GEMV_SPLITK=0. ffn_gate/up (M=10240) fill the CUs already
+        // and are excluded.
         static const bool splitk_wg_env = []{
             const char * e = std::getenv("GGML_OPENCL_Q4K_GEMV_SPLITK");
-            return e && e[0] && e[0] != '0';   // default OFF
+            return !e || e[0] == '\0' || e[0] != '0';   // default ON, opt-out =0
         }();
-        const bool use_splitk = splitk_wg_env && !use_tiled && !use_q4k_o4 && !use_mc3 && ne01 <= 1024;
+        // Gate: small-M decode GEMVs that under-fill the 16 CUs even with the wide
+        // intra-WG split (all 16 subgroups land on one CU). M<=2560 covers Kcur/Vcur
+        // (M=1024), Qcur (2048), attn_output + ffn_down (2560). The tiny ones
+        // (M<=1024) only break even (reduce dispatch eats the kernel win), but the
+        // big-K M=2560 cases (ffn_down K=10240 @182us, attn_output @42us) have a
+        // large per-call win that dwarfs the ~5us reduce, so extending to 2560 nets
+        // positive end-to-end. ffn_gate/up (M=10240) already fill the CUs -> excluded.
+        const bool use_splitk = splitk_wg_env && !use_tiled && !use_q4k_o4 && !use_mc3 && ne01 <= 2560;
 
         if (use_splitk) {
             const int    nsg    = 8;
