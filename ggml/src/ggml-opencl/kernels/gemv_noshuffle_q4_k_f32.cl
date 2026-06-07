@@ -323,6 +323,150 @@ kernel void kernel_gemv_noshuffle_q4_k_f32(
 
 }
 
+// --- Fused gate+up GEMV + GLU epilogue (FFN) ------------------------------------
+// Folds the FFN's two decode GEMVs (ffn_gate, ffn_up) and the following GLU into a
+// SINGLE dispatch: {MUL_MAT(Wg,x), MUL_MAT(Wu,x), GLU}. Both matmuls share the same
+// activation x (ffn_norm), so the activation image read is issued ONCE per K-block
+// and reused for the gate and up dot products (the per-op path re-reads it twice and
+// also materializes the two full ffn-wide intermediates to global, which the GLU
+// then re-reads). The gate/up partial sums are accumulated in the SAME per-fiber
+// order and reduced in the SAME cross-subgroup order as the standalone GEMV, and the
+// GLU formula is the exact scalar expression from kernels/glu.cl, so the output is
+// BYTE-IDENTICAL to the per-op matmul+matmul+glu path -> safe to default on.
+//   glu_op: REGLU=0, GEGLU=1, SWIGLU=2, GEGLU_ERF=4, GEGLU_QUICK=5 (ggml_glu_op).
+// Weights: src0g_* = gate (= GLU src[0]); src0u_* = up (= GLU src[1]).
+#define GLU_GEGLU_COEF_A      0.044715f
+#define GLU_SQRT_2_OVER_PI    0.79788456080286535587989211986876f
+#define GLU_SQRT_2_INV        0.70710678118654752440084436210484f
+#define GLU_QUICK_COEF       -1.702f
+
+inline float glu_apply(int glu_op, float g, float u) {
+    float act;
+    if (glu_op == 1) {        // GEGLU (tanh-approx gelu)
+        act = 0.5f*g*(1.0f + tanh(GLU_SQRT_2_OVER_PI*g*(1.0f + GLU_GEGLU_COEF_A*g*g)));
+    } else if (glu_op == 2) { // SWIGLU (silu)
+        act = g / (1.0f + exp(-g));
+    } else if (glu_op == 0) { // REGLU
+        return g*u*(g > 0.0f);
+    } else if (glu_op == 4) { // GEGLU_ERF
+        act = 0.5f*g*(1.0f + erf(g*GLU_SQRT_2_INV));
+    } else {                  // GEGLU_QUICK (glu_op == 5)
+        act = g*(1.0f/(1.0f + exp(GLU_QUICK_COEF*g)));
+    }
+    return act*u;
+}
+
+#ifdef ADRENO_GPU
+REQD_SUBGROUP_SIZE_64
+#endif
+kernel void kernel_gemv_noshuffle_q4_k_f32_glu(
+        read_only  image1d_buffer_t src0g_q,
+        global half2  * src0g_d,
+        global half2  * src0g_m,
+        global uchar  * src0g_s,
+        read_only  image1d_buffer_t src0u_q,
+        global half2  * src0u_d,
+        global half2  * src0u_m,
+        global uchar  * src0u_s,
+        read_only  image1d_buffer_t src1,
+        global float * dst,
+        ulong offsetd,
+        int ne00,
+        int ne01,
+        int glu_op,
+        uchar mask_d6,
+        uchar mask_d4,
+        uchar mask_hi2)
+{
+    uint groupId = get_local_id(1);
+    uint gid     = get_global_id(0);
+    ushort slid  = get_sub_group_local_id();
+    uint nsg     = get_local_size(1);
+
+    uint K = ne00;
+    uint M = ne01;
+
+    uint LINE_STRIDE_A  = M / 2;
+    uint BLOCK_STRIDE_A = 4 * M;
+    uint scales_per_row = (K / QK_K) * 12;
+
+    private uint4  regA;
+    private half2  regS, regM;
+    private float8 regB;
+
+    private float2 gateSum = (float2)(0.0f);
+    private float2 upSum   = (float2)(0.0f);
+
+    // Two SEQUENTIAL K-loops (gate fully, then up). Keeping only one weight's
+    // working set live at a time holds the kernel's register footprint at ~the
+    // base single-weight GEMV's, so its max WG stays 1024 (16 subgroups) and the
+    // per-subgroup K-split matches the standalone wide GEMV exactly -> the gate
+    // and up partial sums are BYTE-IDENTICAL to the per-op path. The macro body
+    // is the base kernel's inner loop verbatim, parameterized by weight source.
+#define Q4K_GLU_LOOP(SUM, Q, DD, MM, SS)                                                       \
+    for (uint k = groupId; k < (K / 32); k += nsg) {                                           \
+        uint sb = k / 8;                                                                       \
+        uint j  = k % 8;                                                                       \
+        half2 d   = DD[gid + sb * LINE_STRIDE_A];                                              \
+        half2 dm  = MM[gid + sb * LINE_STRIDE_A];                                              \
+        global const uchar * sc0 = SS + 2 * gid * scales_per_row + sb * 12;                    \
+        global const uchar * sc1 = SS + (2 * gid + 1) * scales_per_row + sb * 12;              \
+        uchar sv0, mn0, sv1, mn1;                                                              \
+        get_scale_min_k4(j, sc0, &sv0, &mn0, mask_d6, mask_d4, mask_hi2);                      \
+        get_scale_min_k4(j, sc1, &sv1, &mn1, mask_d6, mask_d4, mask_hi2);                      \
+        regS = convert_half2(convert_float2(d)  * convert_float2((uchar2)(sv0, sv1)));         \
+        regM = convert_half2(convert_float2(dm) * convert_float2((uchar2)(mn0, mn1)));         \
+        if (slid < 4) {                                                                        \
+            regB.s0123 = read_imagef(src1, (slid * 2 + k * 8));                                \
+            regB.s4567 = read_imagef(src1, (1 + slid * 2 + k * 8));                            \
+        }                                                                                      \
+        regA.s0 = read_imageui(Q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 0)).x;           \
+        regA.s1 = read_imageui(Q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 1)).x;           \
+        regA.s2 = read_imageui(Q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 2)).x;           \
+        regA.s3 = read_imageui(Q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 3)).x;           \
+        DEQ_HI(SUM, as_ushort8(regA), regS, regM, regB);                                       \
+        regA.s0 = read_imageui(Q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 4)).x;           \
+        regA.s1 = read_imageui(Q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 5)).x;           \
+        regA.s2 = read_imageui(Q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 6)).x;           \
+        regA.s3 = read_imageui(Q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 7)).x;           \
+        DEQ_LO(SUM, as_ushort8(regA), regS, regM, regB);                                       \
+    }
+
+#ifdef VECTOR_SUB_GROUP_BROADCAST
+#define DEQ_HI dequantizeBlockAccum_ns_sgbroadcast_8_hi
+#define DEQ_LO dequantizeBlockAccum_ns_sgbroadcast_8_lo
+#else
+#define DEQ_HI dequantizeBlockAccum_ns_sgbroadcast_1_hi
+#define DEQ_LO dequantizeBlockAccum_ns_sgbroadcast_1_lo
+#endif
+
+    Q4K_GLU_LOOP(gateSum, src0g_q, src0g_d, src0g_m, src0g_s)
+    Q4K_GLU_LOOP(upSum,   src0u_q, src0u_d, src0u_m, src0u_s)
+
+#undef DEQ_HI
+#undef DEQ_LO
+#undef Q4K_GLU_LOOP
+
+    // Cross-subgroup reduction in local memory. Packs gate (xy) + up (zw) into a
+    // float4 so both reduce in one pass; summation order matches the base GEMV's
+    // per-channel loop -> byte-identical partial sums.
+    local float4 reduceLM[SUBGROUP_SIZE * 15];
+    if (groupId > 0) {
+        reduceLM[SUBGROUP_SIZE * (groupId - 1) + slid] = (float4)(gateSum, upSum);
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (groupId == 0) {
+        for (uint i = 0; i < nsg - 1; ++i) {
+            float4 p = reduceLM[SUBGROUP_SIZE * i + slid];
+            gateSum += p.xy;
+            upSum   += p.zw;
+        }
+        dst = (global float*)((global char*)dst + offsetd);
+        dst[gid * 2 + 0] = glu_apply(glu_op, gateSum.s0, upSum.s0);
+        dst[gid * 2 + 1] = glu_apply(glu_op, gateSum.s1, upSum.s1);
+    }
+}
+
 // --- Dequant-once macros for the mc3 verify GEMV (Q4K_MC3_DEQUANT_ONCE) ---
 // The inline dequantizeBlockAccum_* macros recompute the dequantized weight
 // ((code & mask)>>shift)*scale - minv ONCE PER COLUMN (3x), and the flat

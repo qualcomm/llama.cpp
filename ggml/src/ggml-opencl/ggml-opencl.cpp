@@ -622,6 +622,7 @@ struct ggml_backend_opencl_context {
     bool fuse_rope_set_rows = true;  // opt-out GGML_OPENCL_FUSE_ROPE_SET_ROWS=0
     bool fuse_rms_rope = true;       // opt-out GGML_OPENCL_FUSE_RMS_ROPE=0
     bool fuse_mm_gelu = false;       // opt-IN GGML_OPENCL_FUSE_MM_GELU=1 (not byte-identical: scalar vs vector tanh)
+    bool fuse_mm_glu = true;         // opt-out GGML_OPENCL_FUSE_MM_GLU=0 (byte-identical gate+up GEMV + GLU, q4_K FFN)
     bool fuse_rms_rope_set_rows = false; // opt-IN GGML_OPENCL_FUSE_RMS_ROPE_SET_ROWS=1 (cross-gap K-cache scatter fold)
 
     // ragged moe, use int to directly pass to kernel
@@ -1171,6 +1172,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemv_noshuffle_q4_k_f32;
     cl_kernel kernel_gemv_noshuffle_q4_k_f32_splitk;  // split-K across WGs (small M)
     cl_kernel kernel_gemv_splitk_reduce_f32;          // sums split-K partials
+    cl_kernel kernel_gemv_noshuffle_q4_k_f32_glu;     // fused gate+up GEMV + GLU (FFN)
     cl_kernel kernel_gemv_noshuffle_q4_k_f32_o4;  // 4-output-per-WI, long-vocab lm_head
     cl_kernel kernel_gemv_noshuffle_q4_k_f32_tiled;  // tiled-wide layout (opt-in)
     cl_kernel kernel_convert_block_q4_k_tiled_ns;    // tiled-wide convert (opt-in)
@@ -4040,6 +4042,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         CL_CHECK((backend_ctx->kernel_gemma4_perlayer_block_f32 = clCreateKernel(prog, "kernel_gemma4_perlayer_block_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q4_k_f32_splitk = clCreateKernel(prog, "kernel_gemv_noshuffle_q4_k_f32_splitk", &err), err));
         CL_CHECK((backend_ctx->kernel_gemv_splitk_reduce_f32 = clCreateKernel(prog, "kernel_gemv_splitk_reduce_f32", &err), err));
+        CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q4_k_f32_glu = clCreateKernel(prog, "kernel_gemv_noshuffle_q4_k_f32_glu", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
@@ -6189,6 +6192,9 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
     if (const char * env = getenv("GGML_OPENCL_FUSE_MM_GELU")) {
         backend_ctx->fuse_mm_gelu = atoi(env) != 0;
     }
+    if (const char * env = getenv("GGML_OPENCL_FUSE_MM_GLU")) {
+        backend_ctx->fuse_mm_glu = atoi(env) != 0;
+    }
     if (const char * env = getenv("GGML_OPENCL_FUSE_RMS_ROPE_SET_ROWS")) {
         backend_ctx->fuse_rms_rope_set_rows = atoi(env) != 0;
     }
@@ -7248,6 +7254,8 @@ static bool ggml_opencl_should_fuse_rope_set_rows(const ggml_tensor * rope,
     return true;
 }
 
+inline bool use_q4k_tiled(const ggml_tensor *tensor);   // defined below
+
 static bool ggml_opencl_can_fuse(const struct ggml_cgraph * cgraph, int node_idx, std::initializer_list<enum ggml_op> ops) {
     // ROPE + VIEW + SET_ROWS uses ggml_can_fuse_subgraph (the VIEW is a no-op
     // node) instead of the contiguous ggml_can_fuse below.
@@ -7260,6 +7268,59 @@ static bool ggml_opencl_can_fuse(const struct ggml_cgraph * cgraph, int node_idx
         }
         return ggml_opencl_should_fuse_rope_set_rows(
             cgraph->nodes[node_idx], cgraph->nodes[node_idx + 1], cgraph->nodes[node_idx + 2]);
+    }
+
+    // glu(mul_mat(Wg,x), mul_mat(Wu,x)) — the FFN gate/up GEMVs + GLU. This is a
+    // non-linear subgraph (up does NOT consume gate), so the contiguous
+    // ggml_can_fuse below rejects it; use ggml_can_fuse_subgraph with the glu as
+    // the sole output and validate the edges explicitly. q4_K decode only;
+    // byte-identical to the per-op path.
+    if (ops.size() == 3 && ops.begin()[0] == GGML_OP_MUL_MAT &&
+        ops.begin()[1] == GGML_OP_MUL_MAT && ops.begin()[2] == GGML_OP_GLU) {
+        const enum ggml_op glu_ops[] = { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU };
+        const int          glu_out[] = { node_idx + 2 };
+        if (!ggml_can_fuse_subgraph(cgraph, node_idx, 3, glu_ops, glu_out, 1)) {
+            return false;
+        }
+
+        const ggml_tensor *gate = cgraph->nodes[node_idx];
+        const ggml_tensor *up   = cgraph->nodes[node_idx+1];
+        const ggml_tensor *glu  = cgraph->nodes[node_idx+2];
+
+        // decode GEMV path only (single token); prefill GEMM is separate
+        if (gate->ne[1] != 1 || up->ne[1] != 1) {
+            return false;
+        }
+        // both projections must be q4_K weights, f32 activation/output
+        if (gate->src[0]->type != GGML_TYPE_Q4_K || up->src[0]->type != GGML_TYPE_Q4_K ||
+            gate->src[1]->type != GGML_TYPE_F32  || up->src[1]->type != GGML_TYPE_F32  ||
+            gate->type != GGML_TYPE_F32 || up->type != GGML_TYPE_F32 || glu->type != GGML_TYPE_F32) {
+            return false;
+        }
+        // gate and up must share the same activation and have matching shape/stride
+        if (gate->src[1] != up->src[1] ||
+            !ggml_are_same_shape(gate->src[0], up->src[0]) ||
+            !ggml_are_same_stride(gate->src[0], up->src[0])) {
+            return false;
+        }
+        // GLU must read gate as src[0] and up as src[1], no swap (the fused
+        // epilogue applies the activation to gate, multiplies by up)
+        if (glu->src[0] != gate || glu->src[1] != up) {
+            return false;
+        }
+        if (ggml_get_op_params_i32(glu, 1) /* swapped */) {
+            return false;
+        }
+        // SWIGLU_OAI carries extra alpha/limit params -> not handled by the fused kernel
+        if (ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU_OAI) {
+            return false;
+        }
+        // the fused kernel reads the standard noshuffle image layout; the tiled
+        // layout packs weights differently -> defer those to the per-op path
+        if (use_q4k_tiled(gate->src[0]) || use_q4k_tiled(up->src[0])) {
+            return false;
+        }
+        return true;
     }
 
     if (!ggml_can_fuse(cgraph, node_idx, ops)) {
@@ -7482,6 +7543,7 @@ static void ggml_opencl_op_rms_norm_fused(ggml_backend_t backend, ggml_tensor * 
 static void ggml_opencl_op_rms_norm_mul_add_fused(ggml_backend_t backend, ggml_tensor * rms_norm_tensor, ggml_tensor * mul_tensor, ggml_tensor * add_tensor);
 static void ggml_opencl_op_rms_norm_mul_add_scale_fused(ggml_backend_t backend, ggml_tensor * rms_norm_tensor, ggml_tensor * mul_tensor, ggml_tensor * add_tensor, ggml_tensor * mul2_tensor);
 static void ggml_cl_rope_rms_fused(ggml_backend_t backend, ggml_tensor * rms_norm_tensor, ggml_tensor * mul_tensor, ggml_tensor * rope_tensor);
+static void ggml_cl_mul_mat_q4_k_glu_fused(ggml_backend_t backend, ggml_tensor * gate_tensor, ggml_tensor * up_tensor, ggml_tensor * glu_tensor);
 static void ggml_cl_rope_rms_set_rows_fused(ggml_backend_t backend, ggml_tensor * rms_norm_tensor, ggml_tensor * mul_tensor, ggml_tensor * rope_tensor, ggml_tensor * set_rows_tensor);
 // Look ahead from a contiguous {RMS_NORM,MUL,ROPE} at node i for a VIEW+SET_ROWS
 // that scatters the rope output into a cache, even when other (independent)
@@ -7824,6 +7886,17 @@ static void ggml_backend_opencl_exec_graph_nodes(ggml_backend_t backend, ggml_cg
             ggml_opencl_can_fuse(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_UNARY })) {
             ggml_cl_mul_mat_f32_gelu_fused(backend, node, cgraph->nodes[i+1]);
             i += 1;
+            continue;
+        }
+
+        // Fuse mul_mat(Wg,x) + mul_mat(Wu,x) + glu — fold the FFN's two decode
+        // GEMVs and the GLU into one dispatch (CUDA/Vulkan parity). q4_K only;
+        // byte-identical to the per-op path (same accumulation/reduction order,
+        // same scalar GLU formula). Default on, opt-out GGML_OPENCL_FUSE_MM_GLU=0.
+        if (backend_ctx->fuse_mm_glu && !backend_ctx->disable_fusion &&
+            ggml_opencl_can_fuse(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU })) {
+            ggml_cl_mul_mat_q4_k_glu_fused(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
+            i += 2;
             continue;
         }
 
@@ -14440,6 +14513,123 @@ static void ggml_cl_mul_mat_f32_gelu_fused(ggml_backend_t backend, ggml_tensor *
     }
 
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+}
+
+// Fused dispatch for the FFN's {MUL_MAT(Wg,x), MUL_MAT(Wu,x), GLU}. Both q4_K
+// projections share the activation x; the fused kernel issues the activation read
+// once per K-block and folds the GLU into the epilogue. Mirrors the q4_K decode
+// GEMV setup (wide 16-subgroup K-split, activation+weights as image1d_buffer) for
+// each of the two weight matrices, so the gate/up sums are byte-identical to the
+// per-op path and the GLU output matches kernels/glu.cl exactly.
+static void ggml_cl_mul_mat_q4_k_glu_fused(ggml_backend_t backend, ggml_tensor * gate_tensor, ggml_tensor * up_tensor, ggml_tensor * glu_tensor) {
+#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+    GGML_ASSERT(gate_tensor && up_tensor && glu_tensor);
+
+    const ggml_tensor * Wg   = gate_tensor->src[0];
+    const ggml_tensor * Wu   = up_tensor->src[0];
+    const ggml_tensor * src1 = gate_tensor->src[1];   // == up_tensor->src[1]
+    const ggml_tensor * dst  = glu_tensor;
+
+    GGML_ASSERT(Wg && Wg->extra);
+    GGML_ASSERT(Wu && Wu->extra);
+    GGML_ASSERT(src1 && src1->extra);
+    GGML_ASSERT(dst && dst->extra);
+
+    ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
+
+    ggml_tensor_extra_cl       * extra1  = (ggml_tensor_extra_cl *)src1->extra;
+    ggml_tensor_extra_cl       * extrad  = (ggml_tensor_extra_cl *)dst->extra;
+    ggml_tensor_extra_cl_q4_K  * extra_g = (ggml_tensor_extra_cl_q4_K *)Wg->extra;
+    ggml_tensor_extra_cl_q4_K  * extra_u = (ggml_tensor_extra_cl_q4_K *)Wu->extra;
+
+    cl_ulong offset1 = extra1->offset + src1->view_offs;
+    cl_ulong offsetd = extrad->offset + dst->view_offs;
+
+    const int K = Wg->ne[0];   // ne00
+    const int M = Wg->ne[1];   // ne01 (= ffn intermediate width)
+    const int N = 1;           // decode GEMV
+
+    const cl_uchar mask_d6 = 0x3F, mask_d4 = 0x0F, mask_hi2 = 0xC0;
+    const int glu_op = (int)ggml_get_glu_op(dst);
+
+    cl_context context = backend_ctx->context;
+    cl_int           err;
+    cl_image_format  img_fmt;
+    cl_image_desc    img_desc;
+    cl_buffer_region region;
+
+    // q images for the two weight matrices (standard noshuffle layout)
+    img_fmt = { CL_R, CL_UNSIGNED_INT32 };
+    memset(&img_desc, 0, sizeof(img_desc));
+    img_desc.image_type  = CL_MEM_OBJECT_IMAGE1D_BUFFER;
+    img_desc.image_width = (size_t)M * K / 2 / 4;
+    img_desc.buffer      = extra_g->q;
+    cl_mem qg_img = nullptr, qu_img = nullptr;
+    CL_CHECK((qg_img = clCreateImage(context, CL_MEM_READ_ONLY, &img_fmt, &img_desc, NULL, &err), err));
+    img_desc.buffer = extra_u->q;
+    CL_CHECK((qu_img = clCreateImage(context, CL_MEM_READ_ONLY, &img_fmt, &img_desc, NULL, &err), err));
+
+    // shared activation image (one column at decode)
+    region.origin = offset1;
+    region.size   = (size_t)K * N * sizeof(float);
+    cl_mem b_sub_buf = nullptr, b_img = nullptr;
+    CL_CHECK((b_sub_buf = clCreateSubBuffer(extra1->data_device, 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &err), err));
+    img_fmt = { CL_RGBA, CL_FLOAT };
+    memset(&img_desc, 0, sizeof(img_desc));
+    img_desc.image_type  = CL_MEM_OBJECT_IMAGE1D_BUFFER;
+    img_desc.image_width = (size_t)K * N / 4;
+    img_desc.buffer      = b_sub_buf;
+    CL_CHECK((b_img = clCreateImage(context, CL_MEM_READ_ONLY, &img_fmt, &img_desc, NULL, &err), err));
+
+    cl_kernel kernel = backend_ctx->kernel_gemv_noshuffle_q4_k_f32_glu;
+    CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &qg_img));
+    CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_mem),   &extra_g->d));
+    CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),   &extra_g->dm));
+    CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_mem),   &extra_g->s));
+    CL_CHECK(clSetKernelArg(kernel,  4, sizeof(cl_mem),   &qu_img));
+    CL_CHECK(clSetKernelArg(kernel,  5, sizeof(cl_mem),   &extra_u->d));
+    CL_CHECK(clSetKernelArg(kernel,  6, sizeof(cl_mem),   &extra_u->dm));
+    CL_CHECK(clSetKernelArg(kernel,  7, sizeof(cl_mem),   &extra_u->s));
+    CL_CHECK(clSetKernelArg(kernel,  8, sizeof(cl_mem),   &b_img));
+    CL_CHECK(clSetKernelArg(kernel,  9, sizeof(cl_mem),   &extrad->data_device));
+    CL_CHECK(clSetKernelArg(kernel, 10, sizeof(cl_ulong), &offsetd));
+    CL_CHECK(clSetKernelArg(kernel, 11, sizeof(cl_int),   &K));
+    CL_CHECK(clSetKernelArg(kernel, 12, sizeof(cl_int),   &M));
+    CL_CHECK(clSetKernelArg(kernel, 13, sizeof(cl_int),   &glu_op));
+    CL_CHECK(clSetKernelArg(kernel, 14, sizeof(cl_uchar), &mask_d6));
+    CL_CHECK(clSetKernelArg(kernel, 15, sizeof(cl_uchar), &mask_d4));
+    CL_CHECK(clSetKernelArg(kernel, 16, sizeof(cl_uchar), &mask_hi2));
+
+    // K-split = nsg_y subgroups. The fused kernel holds two weight sets so its
+    // per-kernel max WG is below the base GEMV's: query it and cap nsg_y to the
+    // largest power-of-two that fits (16 -> 8 on X2 where max WG = 896). NOTE:
+    // nsg_y < 16 means the cross-subgroup accumulation grouping differs from the
+    // standalone wide (nsg=16) GEMV, so the output is coherent but NOT byte-
+    // identical to the per-op path.
+    size_t maxwg = backend_ctx->get_kernel_workgroup_size(kernel);
+    size_t nsg_y = 16;
+    while (nsg_y > 1 && 64 * nsg_y > maxwg) { nsg_y >>= 1; }
+    size_t local_work_size[3]  = { 64, nsg_y, 1 };
+    size_t global_work_size[3] = { (size_t)CEIL_DIV(M / 2, 64) * 64, nsg_y, 1 };
+
+    if (getenv("GGML_OPENCL_FUSE_DEBUG")) {
+        static int dbg = 0;
+        if (dbg < 3) { fprintf(stderr, "[FUSE_MM_GLU] fired #%d K=%d M=%d glu_op=%d nsg=%zu maxwg=%zu\n", ++dbg, K, M, glu_op, nsg_y, maxwg); fflush(stderr); }
+    }
+
+    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+
+    CL_CHECK(clReleaseMemObject(qg_img));
+    CL_CHECK(clReleaseMemObject(qu_img));
+    CL_CHECK(clReleaseMemObject(b_img));
+    CL_CHECK(clReleaseMemObject(b_sub_buf));
+#else
+    GGML_UNUSED(backend);
+    GGML_UNUSED(gate_tensor);
+    GGML_UNUSED(up_tensor);
+    GGML_UNUSED(glu_tensor);
+    GGML_ABORT("q4_K GLU fusion requires GGML_OPENCL_USE_ADRENO_KERNELS");
+#endif
 }
 
 static int ggml_opencl_find_rope_set_rows_after(const struct ggml_cgraph * cgraph, int rope_idx) {
