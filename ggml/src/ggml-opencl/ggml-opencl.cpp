@@ -591,6 +591,7 @@ struct ggml_backend_opencl_context {
     bool fuse_rope_set_rows = true;  // opt-out GGML_OPENCL_FUSE_ROPE_SET_ROWS=0
     bool fuse_rms_rope = true;       // opt-out GGML_OPENCL_FUSE_RMS_ROPE=0
     bool fuse_mm_gelu = false;       // opt-IN GGML_OPENCL_FUSE_MM_GELU=1 (not byte-identical: scalar vs vector tanh)
+    bool fuse_rms_rope_set_rows = false; // opt-IN GGML_OPENCL_FUSE_RMS_ROPE_SET_ROWS=1 (cross-gap K-cache scatter fold)
 
     // ragged moe, use int to directly pass to kernel
     cl_uint  adreno_use_moe_ragged;
@@ -789,6 +790,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_rope_norm_f32, kernel_rope_norm_f16, kernel_rope_neox_f32, kernel_rope_neox_f16;
     cl_kernel kernel_rope_norm_f32_set_rows_f16, kernel_rope_neox_f32_set_rows_f16;
     cl_kernel kernel_rope_norm_f32_rms, kernel_rope_neox_f32_rms;
+    cl_kernel kernel_rope_neox_f32_rms_set_rows_f16;
     cl_kernel kernel_rope_multi_f32, kernel_rope_multi_f16, kernel_rope_vision_f32, kernel_rope_vision_f16;
     cl_kernel kernel_cpy_f16_f16, kernel_cpy_f16_f32, kernel_cpy_f32_f16, kernel_cpy_f32_f32, kernel_cpy_f32_f32_pack, kernel_cpy_i32_i32;
     cl_kernel kernel_mul_mat_f32_f32;
@@ -2607,6 +2609,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         CL_CHECK((backend_ctx->kernel_rope_neox_f32_set_rows_f16 = clCreateKernel(backend_ctx->program_rope, "kernel_rope_neox_f32_set_rows_f16", &err), err));
         CL_CHECK((backend_ctx->kernel_rope_norm_f32_rms = clCreateKernel(backend_ctx->program_rope, "kernel_rope_norm_f32_rms", &err), err));
         CL_CHECK((backend_ctx->kernel_rope_neox_f32_rms = clCreateKernel(backend_ctx->program_rope, "kernel_rope_neox_f32_rms", &err), err));
+        CL_CHECK((backend_ctx->kernel_rope_neox_f32_rms_set_rows_f16 = clCreateKernel(backend_ctx->program_rope, "kernel_rope_neox_f32_rms_set_rows_f16", &err), err));
         CL_CHECK((backend_ctx->kernel_rope_multi_f32  = clCreateKernel(backend_ctx->program_rope, "kernel_rope_multi_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_rope_multi_f16  = clCreateKernel(backend_ctx->program_rope, "kernel_rope_multi_f16", &err), err));
         CL_CHECK((backend_ctx->kernel_rope_vision_f32 = clCreateKernel(backend_ctx->program_rope, "kernel_rope_vision_f32", &err), err));
@@ -5827,6 +5830,9 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
     if (const char * env = getenv("GGML_OPENCL_FUSE_MM_GELU")) {
         backend_ctx->fuse_mm_gelu = atoi(env) != 0;
     }
+    if (const char * env = getenv("GGML_OPENCL_FUSE_RMS_ROPE_SET_ROWS")) {
+        backend_ctx->fuse_rms_rope_set_rows = atoi(env) != 0;
+    }
 
     backend_ctx->rec_supported = strstr(ext_buffer, "cl_qcom_recordable_queues") != NULL;
 #ifndef GGML_OPENCL_PROFILING
@@ -6951,6 +6957,13 @@ static void ggml_opencl_op_rms_norm_fused(ggml_backend_t backend, ggml_tensor * 
 static void ggml_opencl_op_rms_norm_mul_add_fused(ggml_backend_t backend, ggml_tensor * rms_norm_tensor, ggml_tensor * mul_tensor, ggml_tensor * add_tensor);
 static void ggml_opencl_op_rms_norm_mul_add_scale_fused(ggml_backend_t backend, ggml_tensor * rms_norm_tensor, ggml_tensor * mul_tensor, ggml_tensor * add_tensor, ggml_tensor * mul2_tensor);
 static void ggml_cl_rope_rms_fused(ggml_backend_t backend, ggml_tensor * rms_norm_tensor, ggml_tensor * mul_tensor, ggml_tensor * rope_tensor);
+static void ggml_cl_rope_rms_set_rows_fused(ggml_backend_t backend, ggml_tensor * rms_norm_tensor, ggml_tensor * mul_tensor, ggml_tensor * rope_tensor, ggml_tensor * set_rows_tensor);
+// Look ahead from a contiguous {RMS_NORM,MUL,ROPE} at node i for a VIEW+SET_ROWS
+// that scatters the rope output into a cache, even when other (independent)
+// compute nodes sit between the rope and the view. Returns the SET_ROWS node
+// index (its VIEW is index-1) or -1. Safe only if the rope output feeds nothing
+// but that view in the gap (so the scatter may run early).
+static int ggml_opencl_find_rope_set_rows_after(const struct ggml_cgraph * cgraph, int rope_idx);
 static void ggml_cl_mul_mat_f32_gelu_fused(ggml_backend_t backend, ggml_tensor * mm_tensor, ggml_tensor * gelu_tensor);
 static void ggml_opencl_op_norm_fused(ggml_backend_t backend, ggml_tensor * norm_tensor, ggml_tensor * mul_tensor, ggml_tensor * add_tensor);
 static void ggml_opencl_op_group_norm_fused(ggml_backend_t backend, ggml_tensor * gn_tensor, ggml_tensor * mul_tensor, ggml_tensor * add_tensor);
@@ -7210,8 +7223,17 @@ static void ggml_opencl_op_gemma4_perlayer_block(ggml_backend_t backend, const s
 static void ggml_backend_opencl_exec_graph_nodes(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
 
+    // Nodes already executed early as part of a cross-gap fusion (e.g. a SET_ROWS
+    // whose K-cache scatter was folded into an earlier rms+rope dispatch). Skipped
+    // when the loop reaches them.
+    std::vector<char> skip_node(cgraph->n_nodes, 0);
+
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
+
+        if (skip_node[i]) {
+            continue;
+        }
 
         // NOTE: this may oversynchronize by synchronizing with
         //       backends/devices which don't compute 'cgraph's
@@ -7302,7 +7324,17 @@ static void ggml_backend_opencl_exec_graph_nodes(ggml_backend_t backend, ggml_cg
         // Checked before the 2-op rms_norm+mul fuse so the longer pattern wins.
         if (backend_ctx->fuse_rms_rope && !backend_ctx->disable_fusion &&
             ggml_opencl_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE })) {
-            ggml_cl_rope_rms_fused(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
+            // Cross-gap extension: if the rope output is scattered into the K-cache
+            // by a later SET_ROWS (V-compute interposes on Gemma), fold that scatter
+            // in too. Opt-in; otherwise just the rms+mul+rope fold.
+            int sr = backend_ctx->fuse_rms_rope_set_rows
+                   ? ggml_opencl_find_rope_set_rows_after(cgraph, i + 2) : -1;
+            if (sr >= 0) {
+                ggml_cl_rope_rms_set_rows_fused(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2], cgraph->nodes[sr]);
+                skip_node[sr] = 1;   // the SET_ROWS is done early; its VIEW is a no-op
+            } else {
+                ggml_cl_rope_rms_fused(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
+            }
             i += 2;
             continue;
         }
@@ -13735,6 +13767,153 @@ static void ggml_cl_mul_mat_f32_gelu_fused(ggml_backend_t backend, ggml_tensor *
         static int dbg = 0;
         if (dbg < 3) { fprintf(stderr, "[FUSE_MM_GELU] fired #%d ne00=%d ne01=%d ne11=%d\n", ++dbg, ne00, ne01, ne11); }
     }
+
+    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+}
+
+static int ggml_opencl_find_rope_set_rows_after(const struct ggml_cgraph * cgraph, int rope_idx) {
+    const ggml_tensor * rope = cgraph->nodes[rope_idx];
+    const int n = cgraph->n_nodes;
+    const int WINDOW = 8;   // the K-path V-compute interposes ~2-4 nodes
+    for (int j = rope_idx + 1; j < n && j <= rope_idx + WINDOW; ++j) {
+        const ggml_tensor * sr = cgraph->nodes[j];
+        if (sr->op != GGML_OP_SET_ROWS) {
+            continue;
+        }
+        const ggml_tensor * view = sr->src[0];
+        if (!view || view->op != GGML_OP_VIEW || view->src[0] != rope) {
+            continue;
+        }
+        if (!ggml_opencl_should_fuse_rope_set_rows(rope, view, sr)) {
+            return -1;
+        }
+        // Safety: no node strictly between the rope and the set_rows (other than
+        // the fusion's own VIEW) may read the rope output or the view — else
+        // moving the scatter early would skip a needed read. The rope output here
+        // is single-use (only this scatter via the view).
+        for (int k = rope_idx + 1; k < j; ++k) {
+            const ggml_tensor * mid = cgraph->nodes[k];
+            if (mid == view) {
+                continue;
+            }
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                if (mid->src[s] == rope || mid->src[s] == view) {
+                    return -1;
+                }
+            }
+        }
+        return j;
+    }
+    return -1;
+}
+
+// Fused dispatch for RMS_NORM + MUL(weight) + ROPE(neox) + SET_ROWS. Same as
+// ggml_cl_rope_rms_fused but scatters the roped (rmsnorm*w) result straight into
+// the f16 K-cache at the set_rows row indices, folding the K-cache write in too.
+static void ggml_cl_rope_rms_set_rows_fused(ggml_backend_t backend, ggml_tensor * rms_norm_tensor, ggml_tensor * mul_tensor, ggml_tensor * rope_tensor, ggml_tensor * set_rows_tensor) {
+    GGML_ASSERT(rms_norm_tensor && mul_tensor && rope_tensor && set_rows_tensor);
+
+    const ggml_tensor * src0 = rms_norm_tensor->src[0];                                  // un-normed K
+    const ggml_tensor * w    = mul_tensor->src[0] == rms_norm_tensor ? mul_tensor->src[1] : mul_tensor->src[0];
+    const ggml_tensor * pos  = rope_tensor->src[1];
+    const ggml_tensor * freq = rope_tensor->src[2];
+    const ggml_tensor * idx  = set_rows_tensor->src[1];
+    const ggml_tensor * dst  = set_rows_tensor;
+
+    GGML_ASSERT(src0 && src0->extra);
+    GGML_ASSERT(w    && w->extra);
+    GGML_ASSERT(pos  && pos->extra);
+    GGML_ASSERT(idx  && idx->extra);
+    GGML_ASSERT(dst  && dst->extra);
+
+    ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
+
+    ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *)src0->extra;
+    ggml_tensor_extra_cl * extra1 = (ggml_tensor_extra_cl *)pos->extra;
+    ggml_tensor_extra_cl * extra3 = (ggml_tensor_extra_cl *)w->extra;
+    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
+    ggml_tensor_extra_cl * extra_idx = (ggml_tensor_extra_cl *)idx->extra;
+    ggml_tensor_extra_cl * extra2 = freq ? (ggml_tensor_extra_cl *)freq->extra : nullptr;
+
+    cl_ulong offset0 = extra0->offset + src0->view_offs;
+    cl_ulong offset1 = extra1->offset + pos->view_offs;
+    cl_ulong offset3 = extra3->offset + w->view_offs;
+    cl_ulong offsetd = extrad->offset + dst->view_offs;
+    cl_ulong offset_idx = extra_idx->offset + idx->view_offs;
+    cl_ulong offset2 = extra2 ? extra2->offset + freq->view_offs : offset0;
+
+    const int      ne00 = src0->ne[0], ne01 = src0->ne[1], ne02 = src0->ne[2], ne03 = src0->ne[3];
+    const cl_ulong nb00 = src0->nb[0], nb01 = src0->nb[1], nb02 = src0->nb[2], nb03 = src0->nb[3];
+    const int      ne0  = rope_tensor->ne[0];
+    const int      ne_w0 = w->ne[0];
+    const int      set_rows_stride = (int) (set_rows_tensor->nb[1] / ggml_type_size(set_rows_tensor->type));
+
+    float eps;
+    memcpy(&eps, rms_norm_tensor->op_params, sizeof(float));
+
+    const int n_past     = ((const int32_t *) rope_tensor->op_params)[0];
+    const int n_dims     = ((const int32_t *) rope_tensor->op_params)[1];
+    const int n_ctx_orig = ((const int32_t *) rope_tensor->op_params)[4];
+
+    float freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow;
+    memcpy(&freq_base,   (const int32_t *) rope_tensor->op_params + 5,  sizeof(float));
+    memcpy(&freq_scale,  (const int32_t *) rope_tensor->op_params + 6,  sizeof(float));
+    memcpy(&ext_factor,  (const int32_t *) rope_tensor->op_params + 7,  sizeof(float));
+    memcpy(&attn_factor, (const int32_t *) rope_tensor->op_params + 8,  sizeof(float));
+    memcpy(&beta_fast,   (const int32_t *) rope_tensor->op_params + 9,  sizeof(float));
+    memcpy(&beta_slow,   (const int32_t *) rope_tensor->op_params + 10, sizeof(float));
+
+    size_t sgs;
+    if (backend_ctx->gpu_family == ADRENO)      sgs = 64;
+    else if (backend_ctx->gpu_family == INTEL)  sgs = 32;
+    else { GGML_ASSERT(false && "Unsupported GPU"); }
+
+    const int nth = MIN(64, ne00);
+
+    cl_kernel kernel = backend_ctx->kernel_rope_neox_f32_rms_set_rows_f16;
+
+    CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0->data_device));
+    CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_ulong), &offset0));
+    CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),   &extra1->data_device));
+    CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_ulong), &offset1));
+    CL_CHECK(clSetKernelArg(kernel,  4, sizeof(cl_mem),   extra2 ? &extra2->data_device : &extra0->data_device));
+    CL_CHECK(clSetKernelArg(kernel,  5, sizeof(cl_ulong), &offset2));
+    CL_CHECK(clSetKernelArg(kernel,  6, sizeof(cl_mem),   &extra3->data_device));
+    CL_CHECK(clSetKernelArg(kernel,  7, sizeof(cl_ulong), &offset3));
+    CL_CHECK(clSetKernelArg(kernel,  8, sizeof(int),      &ne_w0));
+    CL_CHECK(clSetKernelArg(kernel,  9, sizeof(float),    &eps));
+    CL_CHECK(clSetKernelArg(kernel, 10, sizeof(cl_mem),   &extrad->data_device));
+    CL_CHECK(clSetKernelArg(kernel, 11, sizeof(cl_ulong), &offsetd));
+    CL_CHECK(clSetKernelArg(kernel, 12, sizeof(cl_mem),   &extra_idx->data_device));
+    CL_CHECK(clSetKernelArg(kernel, 13, sizeof(cl_ulong), &offset_idx));
+    CL_CHECK(clSetKernelArg(kernel, 14, sizeof(int),      &set_rows_stride));
+    CL_CHECK(clSetKernelArg(kernel, 15, sizeof(int),      &ne00));
+    CL_CHECK(clSetKernelArg(kernel, 16, sizeof(int),      &ne01));
+    CL_CHECK(clSetKernelArg(kernel, 17, sizeof(int),      &ne02));
+    CL_CHECK(clSetKernelArg(kernel, 18, sizeof(int),      &ne03));
+    CL_CHECK(clSetKernelArg(kernel, 19, sizeof(cl_ulong), &nb00));
+    CL_CHECK(clSetKernelArg(kernel, 20, sizeof(cl_ulong), &nb01));
+    CL_CHECK(clSetKernelArg(kernel, 21, sizeof(cl_ulong), &nb02));
+    CL_CHECK(clSetKernelArg(kernel, 22, sizeof(cl_ulong), &nb03));
+    CL_CHECK(clSetKernelArg(kernel, 23, sizeof(int),      &ne0));
+    CL_CHECK(clSetKernelArg(kernel, 24, sizeof(int),      &n_past));
+    CL_CHECK(clSetKernelArg(kernel, 25, sizeof(int),      &n_dims));
+    CL_CHECK(clSetKernelArg(kernel, 26, sizeof(int),      &n_ctx_orig));
+    CL_CHECK(clSetKernelArg(kernel, 27, sizeof(float),    &freq_base));
+    CL_CHECK(clSetKernelArg(kernel, 28, sizeof(float),    &freq_scale));
+    CL_CHECK(clSetKernelArg(kernel, 29, sizeof(float),    &ext_factor));
+    CL_CHECK(clSetKernelArg(kernel, 30, sizeof(float),    &attn_factor));
+    CL_CHECK(clSetKernelArg(kernel, 31, sizeof(float),    &beta_fast));
+    CL_CHECK(clSetKernelArg(kernel, 32, sizeof(float),    &beta_slow));
+    CL_CHECK(clSetKernelArg(kernel, 33, sizeof(float)*sgs, NULL));
+
+    if (getenv("GGML_OPENCL_FUSE_DEBUG")) {
+        static int dbg = 0;
+        if (dbg < 3) { fprintf(stderr, "[FUSE_RMS_ROPE_SET_ROWS] fired #%d ne00=%d ne01=%d stride=%d\n", ++dbg, ne00, ne01, set_rows_stride); }
+    }
+
+    size_t global_work_size[] = {(size_t)ne01*nth, (size_t)ne02, (size_t)ne03};
+    size_t local_work_size[]  = {(size_t)nth, 1, 1};
 
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
 }
