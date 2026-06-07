@@ -620,6 +620,7 @@ struct ggml_backend_opencl_context {
     bool has_qcom_subgroup_shuffle = false;  // specifically cl_qcom_subgroup_shuffle
     bool disable_fusion;
     bool fuse_rope_set_rows = true;  // opt-out GGML_OPENCL_FUSE_ROPE_SET_ROWS=0
+    bool fuse_rms_rope = true;       // opt-out GGML_OPENCL_FUSE_RMS_ROPE=0
 
     // ragged moe, use int to directly pass to kernel
     cl_uint  adreno_use_moe_ragged;
@@ -827,6 +828,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_set_rows_q4_0_soa_i64, kernel_set_rows_q4_0_soa_i32;
     cl_kernel kernel_rope_norm_f32, kernel_rope_norm_f16, kernel_rope_neox_f32, kernel_rope_neox_f16;
     cl_kernel kernel_rope_norm_f32_set_rows_f16, kernel_rope_neox_f32_set_rows_f16;
+    cl_kernel kernel_rope_norm_f32_rms, kernel_rope_neox_f32_rms;
     cl_kernel kernel_rope_multi_f32, kernel_rope_multi_f16, kernel_rope_vision_f32, kernel_rope_vision_f16;
     cl_kernel kernel_cpy_f16_f16, kernel_cpy_f16_f32, kernel_cpy_f32_f16, kernel_cpy_f32_f32, kernel_cpy_f32_f32_pack, kernel_cpy_i32_i32;
     cl_kernel kernel_mul_mat_f32_f32;
@@ -2672,6 +2674,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         CL_CHECK((backend_ctx->kernel_rope_neox_f16   = clCreateKernel(backend_ctx->program_rope, "kernel_rope_neox_f16", &err), err));
         CL_CHECK((backend_ctx->kernel_rope_norm_f32_set_rows_f16 = clCreateKernel(backend_ctx->program_rope, "kernel_rope_norm_f32_set_rows_f16", &err), err));
         CL_CHECK((backend_ctx->kernel_rope_neox_f32_set_rows_f16 = clCreateKernel(backend_ctx->program_rope, "kernel_rope_neox_f32_set_rows_f16", &err), err));
+        CL_CHECK((backend_ctx->kernel_rope_norm_f32_rms = clCreateKernel(backend_ctx->program_rope, "kernel_rope_norm_f32_rms", &err), err));
+        CL_CHECK((backend_ctx->kernel_rope_neox_f32_rms = clCreateKernel(backend_ctx->program_rope, "kernel_rope_neox_f32_rms", &err), err));
         CL_CHECK((backend_ctx->kernel_rope_multi_f32  = clCreateKernel(backend_ctx->program_rope, "kernel_rope_multi_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_rope_multi_f16  = clCreateKernel(backend_ctx->program_rope, "kernel_rope_multi_f16", &err), err));
         CL_CHECK((backend_ctx->kernel_rope_vision_f32 = clCreateKernel(backend_ctx->program_rope, "kernel_rope_vision_f32", &err), err));
@@ -6172,6 +6176,9 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
     if (const char * env = getenv("GGML_OPENCL_FUSE_ROPE_SET_ROWS")) {
         backend_ctx->fuse_rope_set_rows = atoi(env) != 0;
     }
+    if (const char * env = getenv("GGML_OPENCL_FUSE_RMS_ROPE")) {
+        backend_ctx->fuse_rms_rope = atoi(env) != 0;
+    }
 
     backend_ctx->rec_supported = strstr(ext_buffer, "cl_qcom_recordable_queues") != NULL;
 #ifndef GGML_OPENCL_PROFILING
@@ -7327,6 +7334,52 @@ static bool ggml_opencl_can_fuse(const struct ggml_cgraph * cgraph, int node_idx
             !ggml_is_contiguous_rows(b)) {
             return false;
         }
+    } else if (ops.size() == 3 && ops.begin()[0] == GGML_OP_RMS_NORM && ops.begin()[1] == GGML_OP_MUL && ops.begin()[2] == GGML_OP_ROPE) {
+        // rope(rms_norm(x) * w), fused. The per-head Q/K norm + learned-weight
+        // multiply (Gemma/Qwen q_norm/k_norm) folded into the rope kernel.
+        const ggml_tensor *rms_norm = cgraph->nodes[node_idx];
+        const ggml_tensor *mul      = cgraph->nodes[node_idx+1];
+        const ggml_tensor *rope     = cgraph->nodes[node_idx+2];
+        const ggml_tensor *w        = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
+
+        GGML_ASSERT(rms_norm->src[0]->type == GGML_TYPE_F32);
+        GGML_ASSERT(rms_norm->type == GGML_TYPE_F32);
+
+        // f32 source only (rope reads/writes f32 here)
+        if (w->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 ||
+            rope->src[0]->type != GGML_TYPE_F32 || rope->type != GGML_TYPE_F32) {
+            return false;
+        }
+
+        // mul must consume the rms_norm output (so the rope sees rmsnorm(x)*w)
+        if (mul->src[0] != rms_norm && mul->src[1] != rms_norm) {
+            return false;
+        }
+        // rope must consume the mul output
+        if (rope->src[0] != mul) {
+            return false;
+        }
+
+        // only plain NORM / NEOX rope; mrope/vision have extra section params
+        const int mode = ((const int32_t *) rope->op_params)[2];
+        if ((mode & GGML_ROPE_TYPE_MROPE) || mode == GGML_ROPE_TYPE_VISION) {
+            return false;
+        }
+
+        // the reduction runs one 64-wide subgroup per row
+        if (rms_norm->src[0]->ne[0] % 4 != 0 || rms_norm->src[0]->ne[0] < 64) {
+            return false;
+        }
+
+        // if rms_norm is the B operand of mul, broadcast is not handled
+        if (rms_norm == mul->src[1] && !ggml_are_same_shape(mul->src[0], rms_norm)) {
+            return false;
+        }
+
+        // rms_norm assumes contiguous rows; weight indexed per element
+        if (!ggml_is_contiguous_rows(rms_norm->src[0]) || !ggml_is_contiguous(w)) {
+            return false;
+        }
     } else if (ops.size() == 3 && ops.begin()[0] == GGML_OP_GROUP_NORM && ops.begin()[1] == GGML_OP_MUL && ops.begin()[2] == GGML_OP_ADD) {
         const ggml_tensor *gn = cgraph->nodes[node_idx];
         const ggml_tensor *mul = cgraph->nodes[node_idx+1];
@@ -7348,6 +7401,7 @@ static bool ggml_opencl_can_fuse(const struct ggml_cgraph * cgraph, int node_idx
 
 static void ggml_opencl_op_rms_norm_fused(ggml_backend_t backend, ggml_tensor * rms_norm_tensor, ggml_tensor * mul_tensor);
 static void ggml_opencl_op_rms_norm_mul_add_fused(ggml_backend_t backend, ggml_tensor * rms_norm_tensor, ggml_tensor * mul_tensor, ggml_tensor * add_tensor);
+static void ggml_cl_rope_rms_fused(ggml_backend_t backend, ggml_tensor * rms_norm_tensor, ggml_tensor * mul_tensor, ggml_tensor * rope_tensor);
 static void ggml_opencl_op_norm_fused(ggml_backend_t backend, ggml_tensor * norm_tensor, ggml_tensor * mul_tensor, ggml_tensor * add_tensor);
 static void ggml_opencl_op_group_norm_fused(ggml_backend_t backend, ggml_tensor * gn_tensor, ggml_tensor * mul_tensor, ggml_tensor * add_tensor);
 static void ggml_cl_rope_set_rows(ggml_backend_t backend, ggml_tensor * rope_tensor, ggml_tensor * view_tensor, ggml_tensor * set_rows_tensor);
@@ -7674,6 +7728,15 @@ static void ggml_backend_opencl_exec_graph_nodes(ggml_backend_t backend, ggml_cg
         if (fuse_rms_add && !backend_ctx->disable_fusion &&
             ggml_opencl_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD })) {
             ggml_opencl_op_rms_norm_mul_add_fused(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
+            i += 2;
+            continue;
+        }
+        // Fuse rms_norm + mul(weight) + rope (Gemma/Qwen per-head Q/K norm folded
+        // into the rope kernel). Default on; opt out with GGML_OPENCL_FUSE_RMS_ROPE=0.
+        // Checked before the 2-op rms_norm+mul fuse so the longer pattern wins.
+        if (backend_ctx->fuse_rms_rope && !backend_ctx->disable_fusion &&
+            ggml_opencl_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE })) {
+            ggml_cl_rope_rms_fused(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
             i += 2;
             continue;
         }
@@ -14062,6 +14125,124 @@ static void ggml_opencl_op_rms_norm_mul_add_fused(ggml_backend_t backend, ggml_t
     CL_CHECK(clSetKernelArg(kernel, 31, sizeof(cl_ulong), &nb3));
     CL_CHECK(clSetKernelArg(kernel, 32, sizeof(float),    &eps));
     CL_CHECK(clSetKernelArg(kernel, 33, sizeof(float)*sgs, NULL));
+
+    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+}
+
+// Fused dispatch for RMS_NORM + MUL(weight) + ROPE. src0 = the un-normed Q/K
+// (rms_norm input), w = the norm weight (mul's non-rms operand), dst = the rope
+// output. Folds the per-head q_norm/k_norm rms+weight into the rope kernel,
+// saving one dispatch (and the normed intermediate's round-trip) per Q/K rope.
+static void ggml_cl_rope_rms_fused(ggml_backend_t backend, ggml_tensor * rms_norm_tensor, ggml_tensor * mul_tensor, ggml_tensor * rope_tensor) {
+    GGML_ASSERT(rms_norm_tensor && mul_tensor && rope_tensor);
+
+    const ggml_tensor * src0 = rms_norm_tensor->src[0];                                  // un-normed Q/K
+    const ggml_tensor * w    = mul_tensor->src[0] == rms_norm_tensor ? mul_tensor->src[1] : mul_tensor->src[0];
+    const ggml_tensor * pos  = rope_tensor->src[1];
+    const ggml_tensor * freq = rope_tensor->src[2];
+    const ggml_tensor * dst  = rope_tensor;
+
+    GGML_ASSERT(src0 && src0->extra);
+    GGML_ASSERT(w    && w->extra);
+    GGML_ASSERT(pos  && pos->extra);
+    GGML_ASSERT(dst  && dst->extra);
+
+    ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
+
+    ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *)src0->extra;
+    ggml_tensor_extra_cl * extra1 = (ggml_tensor_extra_cl *)pos->extra;
+    ggml_tensor_extra_cl * extra3 = (ggml_tensor_extra_cl *)w->extra;
+    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
+    ggml_tensor_extra_cl * extra2 = freq ? (ggml_tensor_extra_cl *)freq->extra : nullptr;
+
+    cl_ulong offset0 = extra0->offset + src0->view_offs;
+    cl_ulong offset1 = extra1->offset + pos->view_offs;
+    cl_ulong offset3 = extra3->offset + w->view_offs;
+    cl_ulong offsetd = extrad->offset + dst->view_offs;
+    cl_ulong offset2 = extra2 ? extra2->offset + freq->view_offs : offset0;
+
+    const int     ne00 = src0->ne[0], ne01 = src0->ne[1], ne02 = src0->ne[2], ne03 = src0->ne[3];
+    const cl_ulong nb00 = src0->nb[0], nb01 = src0->nb[1], nb02 = src0->nb[2], nb03 = src0->nb[3];
+
+    const int     ne0 = dst->ne[0], ne1 = dst->ne[1], ne2 = dst->ne[2], ne3 = dst->ne[3];
+    const cl_ulong nb0 = dst->nb[0], nb1 = dst->nb[1], nb2 = dst->nb[2], nb3 = dst->nb[3];
+
+    const int ne_w0 = w->ne[0];
+
+    float eps;
+    memcpy(&eps, rms_norm_tensor->op_params, sizeof(float));
+
+    const int n_past     = ((const int32_t *) dst->op_params)[0];
+    const int n_dims     = ((const int32_t *) dst->op_params)[1];
+    const int mode       = ((const int32_t *) dst->op_params)[2];
+    const int n_ctx_orig = ((const int32_t *) dst->op_params)[4];
+
+    float freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow;
+    memcpy(&freq_base,   (const int32_t *) dst->op_params + 5,  sizeof(float));
+    memcpy(&freq_scale,  (const int32_t *) dst->op_params + 6,  sizeof(float));
+    memcpy(&ext_factor,  (const int32_t *) dst->op_params + 7,  sizeof(float));
+    memcpy(&attn_factor, (const int32_t *) dst->op_params + 8,  sizeof(float));
+    memcpy(&beta_fast,   (const int32_t *) dst->op_params + 9,  sizeof(float));
+    memcpy(&beta_slow,   (const int32_t *) dst->op_params + 10, sizeof(float));
+
+    const bool is_neox = mode & 2;
+
+    if (getenv("GGML_OPENCL_FUSE_DEBUG")) {
+        static int dbg = 0;
+        if (dbg < 4) { fprintf(stderr, "[FUSE_RMS_ROPE] fired #%d ne00=%d ne01=%d neox=%d ne_w0=%d\n", ++dbg, ne00, ne01, (int)is_neox, ne_w0); }
+    }
+
+    cl_kernel kernel = is_neox ? backend_ctx->kernel_rope_neox_f32_rms
+                               : backend_ctx->kernel_rope_norm_f32_rms;
+
+    size_t sgs;
+    if (backend_ctx->gpu_family == ADRENO)      sgs = 64;
+    else if (backend_ctx->gpu_family == INTEL)  sgs = 32;
+    else { GGML_ASSERT(false && "Unsupported GPU"); }
+
+    const int nth = MIN(64, ne00);
+
+    CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0->data_device));
+    CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_ulong), &offset0));
+    CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),   &extra1->data_device));
+    CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_ulong), &offset1));
+    CL_CHECK(clSetKernelArg(kernel,  4, sizeof(cl_mem),   extra2 ? &extra2->data_device : &extra0->data_device));
+    CL_CHECK(clSetKernelArg(kernel,  5, sizeof(cl_ulong), &offset2));
+    CL_CHECK(clSetKernelArg(kernel,  6, sizeof(cl_mem),   &extra3->data_device));
+    CL_CHECK(clSetKernelArg(kernel,  7, sizeof(cl_ulong), &offset3));
+    CL_CHECK(clSetKernelArg(kernel,  8, sizeof(int),      &ne_w0));
+    CL_CHECK(clSetKernelArg(kernel,  9, sizeof(float),    &eps));
+    CL_CHECK(clSetKernelArg(kernel, 10, sizeof(cl_mem),   &extrad->data_device));
+    CL_CHECK(clSetKernelArg(kernel, 11, sizeof(cl_ulong), &offsetd));
+    CL_CHECK(clSetKernelArg(kernel, 12, sizeof(int),      &ne00));
+    CL_CHECK(clSetKernelArg(kernel, 13, sizeof(int),      &ne01));
+    CL_CHECK(clSetKernelArg(kernel, 14, sizeof(int),      &ne02));
+    CL_CHECK(clSetKernelArg(kernel, 15, sizeof(int),      &ne03));
+    CL_CHECK(clSetKernelArg(kernel, 16, sizeof(cl_ulong), &nb00));
+    CL_CHECK(clSetKernelArg(kernel, 17, sizeof(cl_ulong), &nb01));
+    CL_CHECK(clSetKernelArg(kernel, 18, sizeof(cl_ulong), &nb02));
+    CL_CHECK(clSetKernelArg(kernel, 19, sizeof(cl_ulong), &nb03));
+    CL_CHECK(clSetKernelArg(kernel, 20, sizeof(int),      &ne0));
+    CL_CHECK(clSetKernelArg(kernel, 21, sizeof(int),      &ne1));
+    CL_CHECK(clSetKernelArg(kernel, 22, sizeof(int),      &ne2));
+    CL_CHECK(clSetKernelArg(kernel, 23, sizeof(int),      &ne3));
+    CL_CHECK(clSetKernelArg(kernel, 24, sizeof(cl_ulong), &nb0));
+    CL_CHECK(clSetKernelArg(kernel, 25, sizeof(cl_ulong), &nb1));
+    CL_CHECK(clSetKernelArg(kernel, 26, sizeof(cl_ulong), &nb2));
+    CL_CHECK(clSetKernelArg(kernel, 27, sizeof(cl_ulong), &nb3));
+    CL_CHECK(clSetKernelArg(kernel, 28, sizeof(int),      &n_past));
+    CL_CHECK(clSetKernelArg(kernel, 29, sizeof(int),      &n_dims));
+    CL_CHECK(clSetKernelArg(kernel, 30, sizeof(int),      &n_ctx_orig));
+    CL_CHECK(clSetKernelArg(kernel, 31, sizeof(float),    &freq_base));
+    CL_CHECK(clSetKernelArg(kernel, 32, sizeof(float),    &freq_scale));
+    CL_CHECK(clSetKernelArg(kernel, 33, sizeof(float),    &ext_factor));
+    CL_CHECK(clSetKernelArg(kernel, 34, sizeof(float),    &attn_factor));
+    CL_CHECK(clSetKernelArg(kernel, 35, sizeof(float),    &beta_fast));
+    CL_CHECK(clSetKernelArg(kernel, 36, sizeof(float),    &beta_slow));
+    CL_CHECK(clSetKernelArg(kernel, 37, sizeof(float)*sgs, NULL));
+
+    size_t global_work_size[] = {(size_t)ne01*nth, (size_t)ne02, (size_t)ne03};
+    size_t local_work_size[]  = {(size_t)nth, 1, 1};
 
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
 }
