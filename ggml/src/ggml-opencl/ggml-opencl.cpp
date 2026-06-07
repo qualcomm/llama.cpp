@@ -590,6 +590,7 @@ struct ggml_backend_opencl_context {
     bool disable_fusion;
     bool fuse_rope_set_rows = true;  // opt-out GGML_OPENCL_FUSE_ROPE_SET_ROWS=0
     bool fuse_rms_rope = true;       // opt-out GGML_OPENCL_FUSE_RMS_ROPE=0
+    bool fuse_mm_gelu = false;       // opt-IN GGML_OPENCL_FUSE_MM_GELU=1 (not byte-identical: scalar vs vector tanh)
 
     // ragged moe, use int to directly pass to kernel
     cl_uint  adreno_use_moe_ragged;
@@ -791,6 +792,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_rope_multi_f32, kernel_rope_multi_f16, kernel_rope_vision_f32, kernel_rope_vision_f16;
     cl_kernel kernel_cpy_f16_f16, kernel_cpy_f16_f32, kernel_cpy_f32_f16, kernel_cpy_f32_f32, kernel_cpy_f32_f32_pack, kernel_cpy_i32_i32;
     cl_kernel kernel_mul_mat_f32_f32;
+    cl_kernel kernel_mul_mat_f32_f32_gelu;
     cl_kernel kernel_mul_mat_f16_f16;
     cl_kernel kernel_mul_mat_f16_f32_1row;
     cl_kernel kernel_mul_mat_f16_f32;
@@ -2234,6 +2236,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
 
         CL_CHECK((backend_ctx->kernel_mul_mat_f32_f32 = clCreateKernel(backend_ctx->program_mul_mv_f32_f32, "kernel_mul_mat_f32_f32", &err), err));
+        CL_CHECK((backend_ctx->kernel_mul_mat_f32_f32_gelu = clCreateKernel(backend_ctx->program_mul_mv_f32_f32, "kernel_mul_mat_f32_f32_gelu", &err), err));
         GGML_LOG_CONT(".");
     }
 
@@ -5821,6 +5824,9 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
     if (const char * env = getenv("GGML_OPENCL_FUSE_RMS_ROPE")) {
         backend_ctx->fuse_rms_rope = atoi(env) != 0;
     }
+    if (const char * env = getenv("GGML_OPENCL_FUSE_MM_GELU")) {
+        backend_ctx->fuse_mm_gelu = atoi(env) != 0;
+    }
 
     backend_ctx->rec_supported = strstr(ext_buffer, "cl_qcom_recordable_queues") != NULL;
 #ifndef GGML_OPENCL_PROFILING
@@ -6918,6 +6924,24 @@ static bool ggml_opencl_can_fuse(const struct ggml_cgraph * cgraph, int node_idx
         if (!ggml_is_contiguous(gn->src[0]) || !ggml_is_contiguous(w) || !ggml_is_contiguous(b)) {
             return false;
         }
+    } else if (ops.size() == 2 && ops.begin()[0] == GGML_OP_MUL_MAT && ops.begin()[1] == GGML_OP_UNARY) {
+        // gelu(mul_mat(W, x)) — fold a GELU activation into the f32 matmul
+        // epilogue (Gemma-4 inp_gate). Scoped to the f32xf32 GEMV kernel.
+        const ggml_tensor *mm  = cgraph->nodes[node_idx];
+        const ggml_tensor *un  = cgraph->nodes[node_idx+1];
+
+        if (ggml_get_unary_op(un) != GGML_UNARY_OP_GELU) {
+            return false;
+        }
+        // f32 weights + f32 activation -> kernel_mul_mat_f32_f32(_gelu) path only
+        if (mm->src[0]->type != GGML_TYPE_F32 || mm->src[1]->type != GGML_TYPE_F32 ||
+            mm->type != GGML_TYPE_F32 || un->type != GGML_TYPE_F32) {
+            return false;
+        }
+        // gelu must consume the matmul output
+        if (un->src[0] != mm) {
+            return false;
+        }
     }
 
     return true;
@@ -6927,6 +6951,7 @@ static void ggml_opencl_op_rms_norm_fused(ggml_backend_t backend, ggml_tensor * 
 static void ggml_opencl_op_rms_norm_mul_add_fused(ggml_backend_t backend, ggml_tensor * rms_norm_tensor, ggml_tensor * mul_tensor, ggml_tensor * add_tensor);
 static void ggml_opencl_op_rms_norm_mul_add_scale_fused(ggml_backend_t backend, ggml_tensor * rms_norm_tensor, ggml_tensor * mul_tensor, ggml_tensor * add_tensor, ggml_tensor * mul2_tensor);
 static void ggml_cl_rope_rms_fused(ggml_backend_t backend, ggml_tensor * rms_norm_tensor, ggml_tensor * mul_tensor, ggml_tensor * rope_tensor);
+static void ggml_cl_mul_mat_f32_gelu_fused(ggml_backend_t backend, ggml_tensor * mm_tensor, ggml_tensor * gelu_tensor);
 static void ggml_opencl_op_norm_fused(ggml_backend_t backend, ggml_tensor * norm_tensor, ggml_tensor * mul_tensor, ggml_tensor * add_tensor);
 static void ggml_opencl_op_group_norm_fused(ggml_backend_t backend, ggml_tensor * gn_tensor, ggml_tensor * mul_tensor, ggml_tensor * add_tensor);
 static void ggml_cl_rope_set_rows(ggml_backend_t backend, ggml_tensor * rope_tensor, ggml_tensor * view_tensor, ggml_tensor * set_rows_tensor);
@@ -7229,6 +7254,18 @@ static void ggml_backend_opencl_exec_graph_nodes(ggml_backend_t backend, ggml_cg
             ggml_opencl_can_fuse_gemma4_perlayer_block(cgraph, i, mega_idx)) {
             ggml_opencl_op_gemma4_perlayer_block(backend, cgraph, mega_idx);
             i = mega_idx[7];   // jump past the whole block (interspersed no-ops produce no kernels)
+            continue;
+        }
+
+        // Fuse mul_mat(f32) + gelu — fold the GELU activation into the f32 matmul
+        // epilogue (Gemma-4 inp_gate gate). Opt-in GGML_OPENCL_FUSE_MM_GELU=1: it
+        // is numerically faithful but NOT byte-identical (the epilogue uses scalar
+        // tanh vs the standalone kernel_gelu_4's vector tanh), and the isolated
+        // gain is below the tg noise floor, so it is off by default.
+        if (backend_ctx->fuse_mm_gelu && !backend_ctx->disable_fusion &&
+            ggml_opencl_can_fuse(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_UNARY })) {
+            ggml_cl_mul_mat_f32_gelu_fused(backend, node, cgraph->nodes[i+1]);
+            i += 1;
             continue;
         }
 
@@ -13624,6 +13661,80 @@ static void ggml_opencl_op_rms_norm_mul_add_scale_fused(ggml_backend_t backend, 
     CL_CHECK(clSetKernelArg(kernel, 33, sizeof(cl_ulong), &nb3));
     CL_CHECK(clSetKernelArg(kernel, 34, sizeof(float),    &eps));
     CL_CHECK(clSetKernelArg(kernel, 35, sizeof(float)*sgs, NULL));
+
+    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+}
+
+// Fused dispatch for MUL_MAT(f32,f32) + UNARY(GELU). Mirrors the f32xf32 GEMV
+// arg setup but writes gelu(matmul) directly to the unary's output tensor,
+// removing the separate gelu dispatch (Gemma-4 per-layer inp_gate gate).
+static void ggml_cl_mul_mat_f32_gelu_fused(ggml_backend_t backend, ggml_tensor * mm_tensor, ggml_tensor * gelu_tensor) {
+    GGML_ASSERT(mm_tensor && gelu_tensor);
+
+    const ggml_tensor * src0 = mm_tensor->src[0];
+    const ggml_tensor * src1 = mm_tensor->src[1];
+    const ggml_tensor * dst  = gelu_tensor;
+
+    GGML_ASSERT(src0 && src0->extra);
+    GGML_ASSERT(src1 && src1->extra);
+    GGML_ASSERT(dst  && dst->extra);
+
+    ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
+
+    ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *)src0->extra;
+    ggml_tensor_extra_cl * extra1 = (ggml_tensor_extra_cl *)src1->extra;
+    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
+
+    cl_ulong offset0 = extra0->offset + src0->view_offs;
+    cl_ulong offset1 = extra1->offset + src1->view_offs;
+    cl_ulong offsetd = extrad->offset + dst->view_offs;
+
+    const int      ne00 = src0->ne[0], ne01 = src0->ne[1], ne02 = src0->ne[2], ne03 = src0->ne[3];
+    const cl_ulong nb00 = src0->nb[0], nb01 = src0->nb[1], nb02 = src0->nb[2], nb03 = src0->nb[3];
+    const int      ne10 = src1->ne[0], ne11 = src1->ne[1], ne12 = src1->ne[2], ne13 = src1->ne[3];
+    const cl_ulong nb10 = src1->nb[0], nb11 = src1->nb[1], nb12 = src1->nb[2], nb13 = src1->nb[3];
+    const int      ne0 = dst->ne[0], ne1 = dst->ne[1];
+    const int      r2 = ne12 / ne02;
+    const int      r3 = ne13 / ne03;
+
+    cl_kernel kernel = backend_ctx->kernel_mul_mat_f32_f32_gelu;
+
+    int nth0 = 64, nth1 = 1, nrows = 4;
+    if (backend_ctx->gpu_family == INTEL) { nth0 = 32; }
+
+    CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0->data_device));
+    CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_ulong), &offset0));
+    CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),   &extra1->data_device));
+    CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_ulong), &offset1));
+    CL_CHECK(clSetKernelArg(kernel,  4, sizeof(cl_mem),   &extrad->data_device));
+    CL_CHECK(clSetKernelArg(kernel,  5, sizeof(cl_ulong), &offsetd));
+    CL_CHECK(clSetKernelArg(kernel,  6, sizeof(int),      &ne00));
+    CL_CHECK(clSetKernelArg(kernel,  7, sizeof(int),      &ne01));
+    CL_CHECK(clSetKernelArg(kernel,  8, sizeof(int),      &ne02));
+    CL_CHECK(clSetKernelArg(kernel,  9, sizeof(cl_ulong), &nb00));
+    CL_CHECK(clSetKernelArg(kernel, 10, sizeof(cl_ulong), &nb01));
+    CL_CHECK(clSetKernelArg(kernel, 11, sizeof(cl_ulong), &nb02));
+    CL_CHECK(clSetKernelArg(kernel, 12, sizeof(cl_ulong), &nb03));
+    CL_CHECK(clSetKernelArg(kernel, 13, sizeof(int),      &ne10));
+    CL_CHECK(clSetKernelArg(kernel, 14, sizeof(int),      &ne11));
+    CL_CHECK(clSetKernelArg(kernel, 15, sizeof(int),      &ne12));
+    CL_CHECK(clSetKernelArg(kernel, 16, sizeof(cl_ulong), &nb10));
+    CL_CHECK(clSetKernelArg(kernel, 17, sizeof(cl_ulong), &nb11));
+    CL_CHECK(clSetKernelArg(kernel, 18, sizeof(cl_ulong), &nb12));
+    CL_CHECK(clSetKernelArg(kernel, 19, sizeof(cl_ulong), &nb13));
+    CL_CHECK(clSetKernelArg(kernel, 20, sizeof(int),      &ne0));
+    CL_CHECK(clSetKernelArg(kernel, 21, sizeof(int),      &ne1));
+    CL_CHECK(clSetKernelArg(kernel, 22, sizeof(int),      &r2));
+    CL_CHECK(clSetKernelArg(kernel, 23, sizeof(int),      &r3));
+
+    int64_t ny = (ne11 + nrows - 1)/nrows;
+    size_t global_work_size[] = {(size_t)ne01*nth0, (size_t)ny*nth1, (size_t)ne12*ne13};
+    size_t local_work_size[]  = {(size_t)nth0, (size_t)nth1, 1};
+
+    if (getenv("GGML_OPENCL_FUSE_DEBUG")) {
+        static int dbg = 0;
+        if (dbg < 3) { fprintf(stderr, "[FUSE_MM_GELU] fired #%d ne00=%d ne01=%d ne11=%d\n", ++dbg, ne00, ne01, ne11); }
+    }
 
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
 }
