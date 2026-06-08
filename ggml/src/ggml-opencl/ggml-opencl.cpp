@@ -593,6 +593,7 @@ struct ggml_backend_opencl_context {
     bool fuse_mm_gelu = false;       // opt-IN GGML_OPENCL_FUSE_MM_GELU=1 (not byte-identical: scalar vs vector tanh)
     bool fuse_mm_glu = true;         // opt-out GGML_OPENCL_FUSE_MM_GLU=0 (byte-identical gate+up GEMV + GLU, q4_K FFN)
     bool fuse_rms_rope_set_rows = false; // opt-IN GGML_OPENCL_FUSE_RMS_ROPE_SET_ROWS=1 (cross-gap K-cache scatter fold)
+    bool f16_mrow = true;            // opt-out GGML_OPENCL_F16_MROW=0 (multi-row-per-WG f16 decode GEMV for attn proj + lm_head)
 
     // ragged moe, use int to directly pass to kernel
     cl_uint  adreno_use_moe_ragged;
@@ -716,6 +717,7 @@ struct ggml_backend_opencl_context {
     cl_program program_mul_mv_mxfp4_f32_flat;
     cl_program program_mul_mv_f16_f16;
     cl_program program_mul_mv_f16_f32_1row;
+    cl_program program_mul_mv_f16_f32_mrow;
     cl_program program_mul_mv_f16_f32_l4;
     cl_program program_mul_mv_f16_f32;
     cl_program program_mul_mv_f32_f32;
@@ -798,6 +800,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mat_f32_f32_gelu;
     cl_kernel kernel_mul_mat_f16_f16;
     cl_kernel kernel_mul_mat_f16_f32_1row;
+    cl_kernel kernel_mul_mat_f16_f32_mrow = nullptr;
     cl_kernel kernel_mul_mat_f16_f32;
     cl_kernel kernel_mul_mat_f16_f32_l4;
     cl_kernel kernel_mul_mat_f16_f32_l4_dr;
@@ -2129,6 +2132,22 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
 
         CL_CHECK((backend_ctx->kernel_mul_mat_f16_f32_1row = clCreateKernel(backend_ctx->program_mul_mv_f16_f32_1row, "kernel_mul_mat_f16_f32_1row", &err), err));
+        GGML_LOG_CONT(".");
+    }
+
+    // mul_mv_f16_f32_mrow (multi-row decode GEMV)
+    {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src {
+            #include "mul_mv_f16_f32_mrow.cl.h"
+        };
+#else
+        const std::string kernel_src = read_file("mul_mv_f16_f32_mrow.cl");
+#endif
+        backend_ctx->program_mul_mv_f16_f32_mrow =
+            build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
+
+        CL_CHECK((backend_ctx->kernel_mul_mat_f16_f32_mrow = clCreateKernel(backend_ctx->program_mul_mv_f16_f32_mrow, "kernel_mul_mat_f16_f32_mrow", &err), err));
         GGML_LOG_CONT(".");
     }
 
@@ -5838,6 +5857,9 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
     }
     if (const char * env = getenv("GGML_OPENCL_FUSE_RMS_ROPE_SET_ROWS")) {
         backend_ctx->fuse_rms_rope_set_rows = atoi(env) != 0;
+    }
+    if (const char * env = getenv("GGML_OPENCL_F16_MROW")) {
+        backend_ctx->f16_mrow = atoi(env) != 0;
     }
 
     backend_ctx->rec_supported = strstr(ext_buffer, "cl_qcom_recordable_queues") != NULL;
@@ -20953,6 +20975,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
     }
 
     // use custom matrix x vector kernel
+    bool use_f16_mrow = false;
     switch (src0t) {
         case GGML_TYPE_F32:
             //GGML_ASSERT(ne02 == ne12);
@@ -21018,7 +21041,18 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     (ne12 % r2) == 0;
 
                 if (ne11 * ne12 < 4) {
-                    kernel = backend_ctx->kernel_mul_mat_f16_f32_1row;
+                    // Decode (single token): the legacy _1row runs one 64-lane
+                    // subgroup per WG (one output row), which under-utilizes BW.
+                    // Route the wide f16 weight matmuls (attn proj + lm_head) to the
+                    // multi-row variant: MROW rows per WG -> more loads in flight +
+                    // activation staged once in __local. ne00<=8192 bounds the LDS.
+                    if (backend_ctx->f16_mrow && backend_ctx->kernel_mul_mat_f16_f32_mrow != nullptr &&
+                        ne00 >= 128 && ne01 >= 8 && ne00 % 4 == 0 && ne00 <= 8192) {
+                        kernel = backend_ctx->kernel_mul_mat_f16_f32_mrow;
+                        use_f16_mrow = true;
+                    } else {
+                        kernel = backend_ctx->kernel_mul_mat_f16_f32_1row;
+                    }
                 } else if (adreno_use_lane_split && ne00 >= 64 && ne00 <= 128) {
                     kernel = backend_ctx->kernel_mul_mat_f16_f32_l4_dr_lq;
                     nrows  = 1;
@@ -21122,6 +21156,15 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             CL_CHECK(clSetKernelArg(kernel, 21, sizeof(int),      &ne1));
             CL_CHECK(clSetKernelArg(kernel, 22, sizeof(int),      &r2));
             CL_CHECK(clSetKernelArg(kernel, 23, sizeof(int),      &r3));
+            if (use_f16_mrow) {
+                const int MROW = 16;  // must match MROW in mul_mv_f16_f32_mrow.cl
+                // __local activation buffer: ne00 floats, rounded up for float4 access
+                CL_CHECK(clSetKernelArg(kernel, 24, sizeof(float) * ((ne00 + 3) / 4 * 4), nullptr));
+                size_t mrow_global[] = { (size_t)((ne01 + MROW - 1) / MROW) * 64, (size_t)ne11 * MROW, (size_t)ne12 * ne13 };
+                size_t mrow_local[]  = { 64, (size_t)MROW, 1 };
+                backend_ctx->enqueue_ndrange_kernel(kernel, 3, mrow_global, mrow_local, dst);
+                return;
+            }
             break;
         case GGML_TYPE_Q1_0: {
 #ifdef GGML_OPENCL_SOA_Q
