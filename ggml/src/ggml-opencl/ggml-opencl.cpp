@@ -625,6 +625,9 @@ struct ggml_backend_opencl_context {
     bool fuse_mm_glu = true;         // opt-out GGML_OPENCL_FUSE_MM_GLU=0 (byte-identical gate+up GEMV + GLU, q4_K FFN)
     bool fuse_rms_rope_set_rows = false; // opt-IN GGML_OPENCL_FUSE_RMS_ROPE_SET_ROWS=1 (cross-gap K-cache scatter fold)
     bool f16_mrow = true;            // opt-out GGML_OPENCL_F16_MROW=0 (multi-row-per-WG f16 decode GEMV for attn proj + lm_head)
+    int  f16_mrow_rpt = 1;           // GGML_OPENCL_F16_MROW_RPT={1,2,4} rows-per-subgroup register blocking for the mrow GEMV
+    bool fuse_moe_glu = true;        // opt-out GGML_OPENCL_FUSE_MOE_GLU=0 (byte-identical combined gate_up MoE GEMV + GLU, q4_K)
+    bool fuse_moe_glu_mxfp4 = true;  // opt-out GGML_OPENCL_FUSE_MOE_GLU_MXFP4=0 (byte-identical separate gate/up + bias + swiglu_oai MoE GEMV, gpt-oss mxfp4)
 
     // ragged moe, use int to directly pass to kernel
     cl_uint  adreno_use_moe_ragged;
@@ -842,6 +845,10 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mat_f16_f16;
     cl_kernel kernel_mul_mat_f16_f32_1row;
     cl_kernel kernel_mul_mat_f16_f32_mrow = nullptr;
+    cl_kernel kernel_mul_mat_f16_f32_mrow_r2 = nullptr;
+    cl_kernel kernel_mul_mat_f16_f32_mrow_r4 = nullptr;
+    cl_kernel kernel_mul_mat_f16_f32_mrow_h8 = nullptr;
+    cl_kernel kernel_mul_mat_f16_f32_mrow_h8r2 = nullptr;
     cl_kernel kernel_mul_mat_f16_f32;
     cl_kernel kernel_mul_mat_f16_f32_l4;
     cl_kernel kernel_mul_mat_f16_f32_l4_dr;
@@ -967,6 +974,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_moe_expand_scale_q5_0 = nullptr;    // q5_0 d -> uniform scale[2]/min[1] per 32-block
     cl_kernel kernel_gemm_moe_q8_1_dp4a_q5k = nullptr;   // generic dp4a MoE GEMM (MOE_QT=5, q5_K), opt-in
     cl_kernel kernel_moe_expand_scale_q5_K = nullptr;    // q5_K 6-bit s[] -> uniform scale[16]/min[8]
+    cl_kernel kernel_gemv_moe_q4_k_f32_ns_glu;   // fused combined-gate_up GEMV + GLU (MoE FFN)
     cl_kernel kernel_gemv_moe_q5_k_f32_ns, kernel_gemm_moe_q5_k_f32_ns;
     cl_kernel kernel_gemv_moe_q6_k_f32_ns, kernel_gemm_moe_q6_k_f32_ns;
     cl_kernel kernel_gemm_moe_q6_k_q8_1_dp4a = nullptr;    // dp4a (int8) q6_K MoE prefill GEMM
@@ -975,6 +983,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemv_moe_mxfp4_f32_ns_wimg = nullptr;      // weight-as-texture MoE decode GEMV
     cl_kernel kernel_gemm_moe_mxfp4_q8_1_dp4a = nullptr;   // dp4a (int8) mxfp4 MoE prefill GEMM
     cl_kernel kernel_gemm_moe_q4_0_q8_1_dp4a = nullptr;    // dp4a (int8) q4_0 MoE prefill GEMM
+    cl_kernel kernel_gemv_moe_mxfp4_f32_ns_glu;
     cl_kernel kernel_moe_reorder_b;
     cl_kernel kernel_moe_histogram, kernel_moe_scan, kernel_moe_fill, kernel_moe_scatter;
     cl_kernel kernel_moe_combine_f32 = nullptr;   // fused router-weight mul + cross-expert sum
@@ -2221,6 +2230,10 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
 
         CL_CHECK((backend_ctx->kernel_mul_mat_f16_f32_mrow = clCreateKernel(backend_ctx->program_mul_mv_f16_f32_mrow, "kernel_mul_mat_f16_f32_mrow", &err), err));
+        CL_CHECK((backend_ctx->kernel_mul_mat_f16_f32_mrow_r2 = clCreateKernel(backend_ctx->program_mul_mv_f16_f32_mrow, "kernel_mul_mat_f16_f32_mrow_r2", &err), err));
+        CL_CHECK((backend_ctx->kernel_mul_mat_f16_f32_mrow_r4 = clCreateKernel(backend_ctx->program_mul_mv_f16_f32_mrow, "kernel_mul_mat_f16_f32_mrow_r4", &err), err));
+        CL_CHECK((backend_ctx->kernel_mul_mat_f16_f32_mrow_h8 = clCreateKernel(backend_ctx->program_mul_mv_f16_f32_mrow, "kernel_mul_mat_f16_f32_mrow_h8", &err), err));
+        CL_CHECK((backend_ctx->kernel_mul_mat_f16_f32_mrow_h8r2 = clCreateKernel(backend_ctx->program_mul_mv_f16_f32_mrow, "kernel_mul_mat_f16_f32_mrow_h8r2", &err), err));
         GGML_LOG_CONT(".");
     }
 
@@ -4343,6 +4356,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 
         CL_CHECK((backend_ctx->kernel_gemv_moe_q4_k_f32_ns = clCreateKernel(prog, "kernel_gemv_moe_q4_k_f32_ns", &err), err));
         CL_CHECK((backend_ctx->kernel_gemv_moe_q4_k_f32_ns_wimg = clCreateKernel(prog, "kernel_gemv_moe_q4_k_f32_ns_wimg", &err), err));
+        CL_CHECK((backend_ctx->kernel_gemv_moe_q4_k_f32_ns_glu = clCreateKernel(prog, "kernel_gemv_moe_q4_k_f32_ns_glu", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
@@ -4578,6 +4592,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 
         CL_CHECK((backend_ctx->kernel_gemv_moe_mxfp4_f32_ns = clCreateKernel(prog, "kernel_gemv_moe_mxfp4_f32_ns", &err), err));
         CL_CHECK((backend_ctx->kernel_gemv_moe_mxfp4_f32_ns_wimg = clCreateKernel(prog, "kernel_gemv_moe_mxfp4_f32_ns_wimg", &err), err));
+        CL_CHECK((backend_ctx->kernel_gemv_moe_mxfp4_f32_ns_glu = clCreateKernel(prog, "kernel_gemv_moe_mxfp4_f32_ns_glu", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
@@ -6220,6 +6235,17 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
     if (const char * env = getenv("GGML_OPENCL_F16_MROW")) {
         backend_ctx->f16_mrow = atoi(env) != 0;
     }
+    if (const char * env = getenv("GGML_OPENCL_F16_MROW_RPT")) {
+        int v = atoi(env);
+        // 1/2/4 = half4 register blocking; 8 = half8(1 row); 16 = half8(2 rows)
+        backend_ctx->f16_mrow_rpt = (v == 2 || v == 4 || v == 8 || v == 16) ? v : 1;
+    }
+    if (const char * env = getenv("GGML_OPENCL_FUSE_MOE_GLU")) {
+        backend_ctx->fuse_moe_glu = atoi(env) != 0;
+    }
+    if (const char * env = getenv("GGML_OPENCL_FUSE_MOE_GLU_MXFP4")) {
+        backend_ctx->fuse_moe_glu_mxfp4 = atoi(env) != 0;
+    }
 
     backend_ctx->rec_supported = strstr(ext_buffer, "cl_qcom_recordable_queues") != NULL;
 #ifndef GGML_OPENCL_PROFILING
@@ -7277,6 +7303,7 @@ static bool ggml_opencl_should_fuse_rope_set_rows(const ggml_tensor * rope,
 }
 
 inline bool use_q4k_tiled(const ggml_tensor *tensor);   // defined below
+inline bool use_adreno_moe_kernels(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor);   // defined below
 
 static bool ggml_opencl_can_fuse(const struct ggml_cgraph * cgraph, int node_idx, std::initializer_list<enum ggml_op> ops) {
     // ROPE + VIEW + SET_ROWS uses ggml_can_fuse_subgraph (the VIEW is a no-op
@@ -7340,6 +7367,110 @@ static bool ggml_opencl_can_fuse(const struct ggml_cgraph * cgraph, int node_idx
         // the fused kernel reads the standard noshuffle image layout; the tiled
         // layout packs weights differently -> defer those to the per-op path
         if (use_q4k_tiled(gate->src[0]) || use_q4k_tiled(up->src[0])) {
+            return false;
+        }
+        return true;
+    }
+
+    // glu(view(gate_up,[0:n_ff)), view(gate_up,[n_ff:2n_ff))) — the Gemma-4 MoE
+    // FFN: a single mul_mat_id over the COMBINED ffn_gate_up_exps weight, then the
+    // GLU on the two row-halves. Non-linear subgraph (the two views feed one GLU),
+    // validated with ggml_can_fuse_subgraph (the VIEW nodes are no-ops); the fused
+    // MoE GEMV applies the GLU in its epilogue. q4_K decode only; byte-identical.
+    if (ops.size() == 4 && ops.begin()[0] == GGML_OP_MUL_MAT_ID &&
+        ops.begin()[1] == GGML_OP_VIEW && ops.begin()[2] == GGML_OP_VIEW &&
+        ops.begin()[3] == GGML_OP_GLU) {
+        const enum ggml_op mg_ops[] = { GGML_OP_MUL_MAT_ID, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_GLU };
+        const int          mg_out[] = { node_idx + 3 };
+        if (!ggml_can_fuse_subgraph(cgraph, node_idx, 4, mg_ops, mg_out, 1)) {
+            return false;
+        }
+
+        const ggml_tensor *mmid = cgraph->nodes[node_idx];
+        const ggml_tensor *vg   = cgraph->nodes[node_idx+1];
+        const ggml_tensor *vu   = cgraph->nodes[node_idx+2];
+        const ggml_tensor *glu  = cgraph->nodes[node_idx+3];
+
+        // combined gate_up weight must be q4_K, f32 activation/output
+        if (mmid->src[0]->type != GGML_TYPE_Q4_K ||
+            mmid->src[1]->type != GGML_TYPE_F32  ||
+            mmid->type != GGML_TYPE_F32 || glu->type != GGML_TYPE_F32) {
+            return false;
+        }
+        // decode GEMV path only (single token) and the noshuffle MoE layout
+        if (mmid->src[1]->ne[2] != 1 || !use_adreno_moe_kernels(nullptr, mmid->src[0])) {
+            return false;
+        }
+        // both GLU operands must be the gate/up halves of THIS mul_mat_id output:
+        // vg = view at offset 0, vu = view at offset n_ff rows, each n_ff wide
+        if (glu->src[0] != vg || glu->src[1] != vu ||
+            vg->view_src != mmid || vu->view_src != mmid) {
+            return false;
+        }
+        // mul_mat_id output ne = [2*n_ff, n_expert_used, n_tokens]; the combined
+        // gate_up width is ne[0] (ne[1] is n_expert_used). build_moe_ffn splits
+        // along ne[0] at offset n_ff*nb[0] (see llama-graph.cpp merged gate_up path).
+        const int64_t n_ff = mmid->ne[0] / 2;
+        if (mmid->ne[0] % 2 != 0 || vg->ne[0] != n_ff || vu->ne[0] != n_ff ||
+            vg->view_offs != 0 || vu->view_offs != (size_t)n_ff * mmid->nb[0]) {
+            return false;
+        }
+        if (ggml_get_op_params_i32(glu, 1) /* swapped */) {
+            return false;
+        }
+        if (ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU_OAI) {
+            return false;
+        }
+        return true;
+    }
+
+    // gpt-oss MoE FFN: {MUL_MAT_ID(gate), ADD_ID(gate_bias), MUL_MAT_ID(up),
+    // ADD_ID(up_bias), GLU(swiglu_oai)} — two separate mxfp4 expert matmuls, each
+    // with a per-expert bias add, joined by a single swiglu_oai. Non-linear subgraph
+    // (the two add_id outputs feed one GLU), validated with ggml_can_fuse_subgraph;
+    // the fused MoE GEMV folds both biases and the activation into its epilogue.
+    if (ops.size() == 5 && ops.begin()[0] == GGML_OP_MUL_MAT_ID &&
+        ops.begin()[1] == GGML_OP_ADD_ID && ops.begin()[2] == GGML_OP_MUL_MAT_ID &&
+        ops.begin()[3] == GGML_OP_ADD_ID && ops.begin()[4] == GGML_OP_GLU) {
+        const enum ggml_op mg_ops[] = { GGML_OP_MUL_MAT_ID, GGML_OP_ADD_ID, GGML_OP_MUL_MAT_ID, GGML_OP_ADD_ID, GGML_OP_GLU };
+        const int          mg_out[] = { node_idx + 4 };
+        if (!ggml_can_fuse_subgraph(cgraph, node_idx, 5, mg_ops, mg_out, 1)) {
+            return false;
+        }
+
+        const ggml_tensor *gmm = cgraph->nodes[node_idx];
+        const ggml_tensor *gad = cgraph->nodes[node_idx+1];
+        const ggml_tensor *umm = cgraph->nodes[node_idx+2];
+        const ggml_tensor *uad = cgraph->nodes[node_idx+3];
+        const ggml_tensor *glu = cgraph->nodes[node_idx+4];
+
+        if (ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU_OAI) {
+            return false;
+        }
+        // mxfp4 expert weights, f32 activation/bias/output
+        if (gmm->src[0]->type != GGML_TYPE_MXFP4 || umm->src[0]->type != GGML_TYPE_MXFP4 ||
+            gmm->src[1]->type != GGML_TYPE_F32   || gmm->type != GGML_TYPE_F32 ||
+            glu->type != GGML_TYPE_F32) {
+            return false;
+        }
+        if (!gad->src[1] || gad->src[1]->type != GGML_TYPE_F32 ||
+            !uad->src[1] || uad->src[1]->type != GGML_TYPE_F32) {
+            return false;
+        }
+        // decode GEMV path only (single token) and the noshuffle MoE layout
+        if (gmm->src[1]->ne[2] != 1 || !use_adreno_moe_kernels(nullptr, gmm->src[0])) {
+            return false;
+        }
+        // wiring: both matmuls share the same activation + expert selection; each
+        // add_id biases its own matmul; the GLU consumes the two biased results.
+        if (gad->src[0] != gmm || uad->src[0] != umm ||
+            glu->src[0] != gad || glu->src[1] != uad ||
+            umm->src[1] != gmm->src[1] || umm->src[2] != gmm->src[2]) {
+            return false;
+        }
+        // gate and up weights must share shape (same K, n_ff)
+        if (gmm->src[0]->ne[0] != umm->src[0]->ne[0] ||
+            gmm->src[0]->ne[1] != umm->src[0]->ne[1]) {
             return false;
         }
         return true;
@@ -7566,6 +7697,8 @@ static void ggml_opencl_op_rms_norm_mul_add_fused(ggml_backend_t backend, ggml_t
 static void ggml_opencl_op_rms_norm_mul_add_scale_fused(ggml_backend_t backend, ggml_tensor * rms_norm_tensor, ggml_tensor * mul_tensor, ggml_tensor * add_tensor, ggml_tensor * mul2_tensor);
 static void ggml_cl_rope_rms_fused(ggml_backend_t backend, ggml_tensor * rms_norm_tensor, ggml_tensor * mul_tensor, ggml_tensor * rope_tensor);
 static void ggml_cl_mul_mat_q4_k_glu_fused(ggml_backend_t backend, ggml_tensor * gate_tensor, ggml_tensor * up_tensor, ggml_tensor * glu_tensor);
+static void ggml_cl_mul_mat_id_q4_k_glu_fused(ggml_backend_t backend, ggml_tensor * mmid_tensor, ggml_tensor * glu_tensor);
+static void ggml_cl_mul_mat_id_mxfp4_glu_fused(ggml_backend_t backend, ggml_tensor * gate_mm, ggml_tensor * gate_add, ggml_tensor * up_mm, ggml_tensor * up_add, ggml_tensor * glu_tensor);
 static void ggml_cl_rope_rms_set_rows_fused(ggml_backend_t backend, ggml_tensor * rms_norm_tensor, ggml_tensor * mul_tensor, ggml_tensor * rope_tensor, ggml_tensor * set_rows_tensor);
 // Look ahead from a contiguous {RMS_NORM,MUL,ROPE} at node i for a VIEW+SET_ROWS
 // that scatters the rope output into a cache, even when other (independent)
@@ -7919,6 +8052,28 @@ static void ggml_backend_opencl_exec_graph_nodes(ggml_backend_t backend, ggml_cg
             ggml_opencl_can_fuse(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU })) {
             ggml_cl_mul_mat_q4_k_glu_fused(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
             i += 2;
+            continue;
+        }
+
+        // Fuse mul_mat_id(combined gate_up) + glu(view,view) — the Gemma-4 MoE FFN
+        // (one mul_mat_id over ffn_gate_up_exps, GLU on the two row-halves). Folds
+        // the GLU into the MoE GEMV epilogue; q4_K decode only, byte-identical to
+        // the per-op path. Default on, opt-out GGML_OPENCL_FUSE_MOE_GLU=0.
+        if (backend_ctx->fuse_moe_glu && !backend_ctx->disable_fusion &&
+            ggml_opencl_can_fuse(cgraph, i, { GGML_OP_MUL_MAT_ID, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_GLU })) {
+            ggml_cl_mul_mat_id_q4_k_glu_fused(backend, node, cgraph->nodes[i+3]);
+            i += 3;
+            continue;
+        }
+
+        // Fuse the gpt-oss MoE FFN: mul_mat_id(gate) + add_id(bias) + mul_mat_id(up)
+        // + add_id(bias) + glu(swiglu_oai) -> one mxfp4 MoE GEMV with both biases and
+        // the activation folded into the epilogue. mxfp4 decode only, byte-identical
+        // to the per-op path. Default on, opt-out GGML_OPENCL_FUSE_MOE_GLU_MXFP4=0.
+        if (backend_ctx->fuse_moe_glu_mxfp4 && !backend_ctx->disable_fusion &&
+            ggml_opencl_can_fuse(cgraph, i, { GGML_OP_MUL_MAT_ID, GGML_OP_ADD_ID, GGML_OP_MUL_MAT_ID, GGML_OP_ADD_ID, GGML_OP_GLU })) {
+            ggml_cl_mul_mat_id_mxfp4_glu_fused(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2], cgraph->nodes[i+3], cgraph->nodes[i+4]);
+            i += 4;
             continue;
         }
 
@@ -14651,6 +14806,211 @@ static void ggml_cl_mul_mat_q4_k_glu_fused(ggml_backend_t backend, ggml_tensor *
     GGML_UNUSED(up_tensor);
     GGML_UNUSED(glu_tensor);
     GGML_ABORT("q4_K GLU fusion requires GGML_OPENCL_USE_ADRENO_KERNELS");
+#endif
+}
+
+// Fused combined-gate_up MoE GEMV + GLU. mmid_tensor = the mul_mat_id over the
+// combined ffn_gate_up_exps weight (rows [0,n_ff)=gate, [n_ff,2n_ff)=up);
+// glu_tensor = the GLU on the two row-halves. Folds the GLU into the MoE GEMV
+// epilogue: one dispatch writes the n_ff-wide GLU output directly, skipping the
+// 2*n_ff intermediate. q4_K decode (gemv) only; byte-identical to the per-op path.
+static void ggml_cl_mul_mat_id_q4_k_glu_fused(ggml_backend_t backend, ggml_tensor * mmid_tensor, ggml_tensor * glu_tensor) {
+#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+    GGML_ASSERT(mmid_tensor && glu_tensor);
+
+    const ggml_tensor * src0 = mmid_tensor->src[0];   // combined gate_up weight (q4_K)
+    const ggml_tensor * src1 = mmid_tensor->src[1];   // activation (f32)
+    const ggml_tensor * src2 = mmid_tensor->src[2];   // selected_experts (i32)
+    const ggml_tensor * dst  = glu_tensor;
+
+    GGML_ASSERT(src0 && src0->extra);
+    GGML_ASSERT(src1 && src1->extra);
+    GGML_ASSERT(src2 && src2->extra);
+    GGML_ASSERT(dst && dst->extra);
+
+    ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
+
+    const ggml_tensor * soa0_src = src0->view_src != nullptr ? src0->view_src : src0;
+    ggml_tensor_extra_cl_q4_K * extra0 = (ggml_tensor_extra_cl_q4_K *)soa0_src->extra;
+    ggml_tensor_extra_cl       * extra1 = (ggml_tensor_extra_cl *)src1->extra;
+    ggml_tensor_extra_cl       * extra2 = (ggml_tensor_extra_cl *)src2->extra;
+    ggml_tensor_extra_cl       * extrad = (ggml_tensor_extra_cl *)dst->extra;
+
+    cl_ulong offset1 = extra1->offset + src1->view_offs;
+    cl_ulong offset2 = extra2->offset + src2->view_offs;
+    cl_ulong offsetd = extrad->offset + dst->view_offs;
+
+    const int ne00 = src0->ne[0];          // K
+    const int ne01 = src0->ne[1];          // combined rows = 2*n_ff
+    const int n_ff = ne01 / 2;             // GLU output rows
+    const int ne10 = src1->ne[0];
+    const int ne11 = src1->ne[1];
+    const int ne12 = src1->ne[2];          // == 1 (gemv)
+    const int ne20 = src2->ne[0];          // n_expert_used
+    const int ne21 = src2->ne[1];
+    const int glu_op = (int)ggml_get_glu_op(dst);
+
+    cl_int status;
+
+    // sub-buffer for src2 (selected experts)
+    cl_buffer_region region;
+    region.origin = offset2;
+    region.size   = (size_t)ne20 * ne21 * sizeof(int);
+    cl_mem buf_src2 = clCreateSubBuffer(extra2->data_device, 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &status);
+    CL_CHECK(status);
+
+    // sub-buffer + image for src1 (activation)
+    region.origin = offset1;
+    region.size   = (size_t)ne10 * ne11 * ne12 * sizeof(float);
+    cl_mem src1_sub_buffer = clCreateSubBuffer(extra1->data_device, 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &status);
+    CL_CHECK(status);
+
+    cl_image_format image_format_buf_src1 = {CL_RGBA, CL_FLOAT};
+    cl_image_desc image_desc_buf_src1 = {CL_MEM_OBJECT_IMAGE1D_BUFFER, (size_t)(ne10 * ne11 * ne12 / 4), 0,0,0,0,0,0,0, {src1_sub_buffer}};
+    cl_mem buf_src1_image = clCreateImage(backend_ctx->context, CL_MEM_READ_ONLY, &image_format_buf_src1, &image_desc_buf_src1, NULL, &status);
+    CL_CHECK(status);
+
+    cl_kernel kernel = backend_ctx->kernel_gemv_moe_q4_k_f32_ns_glu;
+    int arg_idx = 0;
+    CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),    &extra0->q));
+    CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),    &extra0->d));
+    CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),    &extra0->dm));
+    CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),    &extra0->s));
+    CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),    &buf_src1_image));
+    CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),    &buf_src2));
+    CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),    &extrad->data_device));
+    CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_ulong),  &offsetd));
+    CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ne00));
+    CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ne01));
+    CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ne11));
+    CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &n_ff));
+    CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &glu_op));
+
+    size_t local_size[3]  = {64, 4, 1};
+    size_t global_size[3] = {(size_t)(((n_ff + 63) / 64) * 64), 4, (size_t)ne20};
+
+    if (getenv("GGML_OPENCL_FUSE_DEBUG")) {
+        static int dbg = 0;
+        if (dbg < 3) { fprintf(stderr, "[FUSE_MOE_GLU] fired #%d K=%d 2nff=%d n_ff=%d ne20=%d glu_op=%d\n", ++dbg, ne00, ne01, n_ff, ne20, glu_op); fflush(stderr); }
+    }
+
+    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_size, local_size, dst);
+
+    CL_CHECK(clReleaseMemObject(src1_sub_buffer));
+    CL_CHECK(clReleaseMemObject(buf_src1_image));
+    CL_CHECK(clReleaseMemObject(buf_src2));
+#else
+    GGML_UNUSED(backend);
+    GGML_UNUSED(mmid_tensor);
+    GGML_UNUSED(glu_tensor);
+    GGML_ABORT("q4_K MoE GLU fusion requires GGML_OPENCL_USE_ADRENO_KERNELS");
+#endif
+}
+
+// Fused gpt-oss MoE FFN: {MUL_MAT_ID(gate), ADD_ID(gate_bias), MUL_MAT_ID(up),
+// ADD_ID(up_bias), GLU(swiglu_oai)} -> one mxfp4 MoE GEMV that folds both bias adds
+// and the SWIGLU_OAI activation into its epilogue. Byte-identical to the per-op path.
+static void ggml_cl_mul_mat_id_mxfp4_glu_fused(ggml_backend_t backend,
+        ggml_tensor * gate_mm, ggml_tensor * gate_add,
+        ggml_tensor * up_mm,   ggml_tensor * up_add, ggml_tensor * glu_tensor) {
+#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+    GGML_ASSERT(gate_mm && gate_add && up_mm && up_add && glu_tensor);
+
+    const ggml_tensor * gate_w = gate_mm->src[0];     // ffn_gate_exps (mxfp4)
+    const ggml_tensor * up_w   = up_mm->src[0];       // ffn_up_exps   (mxfp4)
+    const ggml_tensor * src1   = gate_mm->src[1];     // activation (f32), shared
+    const ggml_tensor * src2   = gate_mm->src[2];     // selected_experts (i32)
+    const ggml_tensor * gate_b = gate_add->src[1];    // per-expert gate bias (f32)
+    const ggml_tensor * up_b   = up_add->src[1];      // per-expert up bias   (f32)
+    const ggml_tensor * dst    = glu_tensor;
+
+    GGML_ASSERT(gate_w && gate_w->extra && up_w && up_w->extra);
+    GGML_ASSERT(src1 && src1->extra && src2 && src2->extra);
+    GGML_ASSERT(gate_b && gate_b->extra && up_b && up_b->extra && dst && dst->extra);
+
+    ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
+
+    const ggml_tensor * gate_soa = gate_w->view_src != nullptr ? gate_w->view_src : gate_w;
+    const ggml_tensor * up_soa   = up_w->view_src   != nullptr ? up_w->view_src   : up_w;
+    ggml_tensor_extra_cl_mxfp4 * eg  = (ggml_tensor_extra_cl_mxfp4 *)gate_soa->extra;
+    ggml_tensor_extra_cl_mxfp4 * eu  = (ggml_tensor_extra_cl_mxfp4 *)up_soa->extra;
+    ggml_tensor_extra_cl * e1   = (ggml_tensor_extra_cl *)src1->extra;
+    ggml_tensor_extra_cl * e2   = (ggml_tensor_extra_cl *)src2->extra;
+    ggml_tensor_extra_cl * egb  = (ggml_tensor_extra_cl *)gate_b->extra;
+    ggml_tensor_extra_cl * eub  = (ggml_tensor_extra_cl *)up_b->extra;
+    ggml_tensor_extra_cl * ed   = (ggml_tensor_extra_cl *)dst->extra;
+
+    cl_ulong offset1 = e1->offset  + src1->view_offs;
+    cl_ulong offset2 = e2->offset  + src2->view_offs;
+    cl_ulong offsetd = ed->offset  + dst->view_offs;
+    cl_ulong gboff   = egb->offset + gate_b->view_offs;
+    cl_ulong uboff   = eub->offset + up_b->view_offs;
+
+    const int ne00 = gate_w->ne[0];        // K
+    const int ne01 = gate_w->ne[1];        // n_ff (output rows of each weight)
+    const int ne10 = src1->ne[0];
+    const int ne11 = src1->ne[1];
+    const int ne12 = src1->ne[2];          // == 1 (gemv)
+    const int ne20 = src2->ne[0];          // n_expert_used
+    const int ne21 = src2->ne[1];
+    const float alpha = ggml_get_op_params_f32(dst, 2);
+    const float limit = ggml_get_op_params_f32(dst, 3);
+
+    cl_int status;
+
+    cl_buffer_region region;
+    region.origin = offset2;
+    region.size   = (size_t)ne20 * ne21 * sizeof(int);
+    cl_mem buf_src2 = clCreateSubBuffer(e2->data_device, 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &status);
+    CL_CHECK(status);
+
+    region.origin = offset1;
+    region.size   = (size_t)ne10 * ne11 * ne12 * sizeof(float);
+    cl_mem src1_sub_buffer = clCreateSubBuffer(e1->data_device, 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &status);
+    CL_CHECK(status);
+
+    cl_image_format image_format_buf_src1 = {CL_RGBA, CL_FLOAT};
+    cl_image_desc image_desc_buf_src1 = {CL_MEM_OBJECT_IMAGE1D_BUFFER, (size_t)(ne10 * ne11 * ne12 / 4), 0,0,0,0,0,0,0, {src1_sub_buffer}};
+    cl_mem buf_src1_image = clCreateImage(backend_ctx->context, CL_MEM_READ_ONLY, &image_format_buf_src1, &image_desc_buf_src1, NULL, &status);
+    CL_CHECK(status);
+
+    cl_kernel kernel = backend_ctx->kernel_gemv_moe_mxfp4_f32_ns_glu;
+    int arg_idx = 0;
+    CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),   &eg->q));
+    CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),   &eg->e));
+    CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),   &eu->q));
+    CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),   &eu->e));
+    CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),   &egb->data_device));
+    CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_ulong), &gboff));
+    CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),   &eub->data_device));
+    CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_ulong), &uboff));
+    CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),   &buf_src1_image));
+    CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),   &buf_src2));
+    CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),   &ed->data_device));
+    CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_ulong), &offsetd));
+    CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),      &ne00));
+    CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),      &ne01));
+    CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),      &ne11));
+    CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(float),    &alpha));
+    CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(float),    &limit));
+
+    size_t local_size[3]  = {64, 4, 1};
+    size_t global_size[3] = {(size_t)(((ne01 + 63) / 64) * 64), 4, (size_t)ne20};
+
+    if (getenv("GGML_OPENCL_FUSE_DEBUG")) {
+        static int dbg = 0;
+        if (dbg < 3) { fprintf(stderr, "[FUSE_MOE_GLU_MXFP4] fired #%d K=%d n_ff=%d ne20=%d alpha=%.3f limit=%.3f\n", ++dbg, ne00, ne01, ne20, alpha, limit); fflush(stderr); }
+    }
+
+    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_size, local_size, (ggml_tensor *)dst);
+
+    CL_CHECK(clReleaseMemObject(src1_sub_buffer));
+    CL_CHECK(clReleaseMemObject(buf_src1_image));
+    CL_CHECK(clReleaseMemObject(buf_src2));
+#else
+    GGML_UNUSED(backend); GGML_UNUSED(gate_mm); GGML_UNUSED(gate_add);
+    GGML_UNUSED(up_mm); GGML_UNUSED(up_add); GGML_UNUSED(glu_tensor);
+    GGML_ABORT("mxfp4 MoE GLU fusion requires GGML_OPENCL_USE_ADRENO_KERNELS");
 #endif
 }
 
@@ -22286,7 +22646,21 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     // activation staged once in __local. ne00<=8192 bounds the LDS.
                     if (backend_ctx->f16_mrow && backend_ctx->kernel_mul_mat_f16_f32_mrow != nullptr &&
                         ne00 >= 128 && ne01 >= 8 && ne00 % 4 == 0 && ne00 <= 8192) {
-                        kernel = backend_ctx->kernel_mul_mat_f16_f32_mrow;
+                        // Register-blocked variants: each subgroup does RPT rows (more
+                        // weight loads in flight per lane -> higher streaming BW).
+                        // 8/16 use half8 (128-bit) loads (gated on ne00 % 8 == 0).
+                        const int rpt = backend_ctx->f16_mrow_rpt;
+                        if (rpt == 16 && ne00 % 8 == 0 && backend_ctx->kernel_mul_mat_f16_f32_mrow_h8r2 != nullptr) {
+                            kernel = backend_ctx->kernel_mul_mat_f16_f32_mrow_h8r2;
+                        } else if (rpt == 8 && ne00 % 8 == 0 && backend_ctx->kernel_mul_mat_f16_f32_mrow_h8 != nullptr) {
+                            kernel = backend_ctx->kernel_mul_mat_f16_f32_mrow_h8;
+                        } else if (rpt == 4 && backend_ctx->kernel_mul_mat_f16_f32_mrow_r4 != nullptr) {
+                            kernel = backend_ctx->kernel_mul_mat_f16_f32_mrow_r4;
+                        } else if (rpt == 2 && backend_ctx->kernel_mul_mat_f16_f32_mrow_r2 != nullptr) {
+                            kernel = backend_ctx->kernel_mul_mat_f16_f32_mrow_r2;
+                        } else {
+                            kernel = backend_ctx->kernel_mul_mat_f16_f32_mrow;
+                        }
                         use_f16_mrow = true;
                     } else {
                         kernel = backend_ctx->kernel_mul_mat_f16_f32_1row;
@@ -22395,10 +22769,18 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             CL_CHECK(clSetKernelArg(kernel, 22, sizeof(int),      &r2));
             CL_CHECK(clSetKernelArg(kernel, 23, sizeof(int),      &r3));
             if (use_f16_mrow) {
-                const int MROW = 16;  // must match MROW in mul_mv_f16_f32_mrow.cl
+                const int MROW = 16; // must match MROW in mul_mv_f16_f32_mrow.cl
+                // rows-per-subgroup multiplier for the selected variant:
+                //   1/2/4 -> half4 register blocking; 8 -> half8(1 row); 16 -> half8(2 rows)
+                const int rpt = backend_ctx->f16_mrow_rpt;
+                int rmul;
+                if (rpt == 16)      rmul = (ne00 % 8 == 0) ? 2 : 1;
+                else if (rpt == 8)  rmul = 1;
+                else                rmul = rpt; // 1,2,4
+                const int rows_per_wg = MROW * rmul;
                 // __local activation buffer: ne00 floats, rounded up for float4 access
                 CL_CHECK(clSetKernelArg(kernel, 24, sizeof(float) * ((ne00 + 3) / 4 * 4), nullptr));
-                size_t mrow_global[] = { (size_t)((ne01 + MROW - 1) / MROW) * 64, (size_t)ne11 * MROW, (size_t)ne12 * ne13 };
+                size_t mrow_global[] = { (size_t)((ne01 + rows_per_wg - 1) / rows_per_wg) * 64, (size_t)ne11 * MROW, (size_t)ne12 * ne13 };
                 size_t mrow_local[]  = { 64, (size_t)MROW, 1 };
                 backend_ctx->enqueue_ndrange_kernel(kernel, 3, mrow_global, mrow_local, dst);
                 return;
