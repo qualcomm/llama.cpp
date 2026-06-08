@@ -163,3 +163,116 @@ __kernel void kernel_gemv_moe_mxfp4_f32_ns(
     }
 
 }
+
+// --- Fused separate gate/up MoE GEMV + per-expert bias + SWIGLU_OAI epilogue ----
+// gpt-oss MoE FFN: two independent mul_mat_id over ffn_gate_exps / ffn_up_exps
+// (each [K, n_ff, n_expert]), each followed by an add_id of a per-expert bias
+// vector, then a single GLU(SWIGLU_OAI) over the two results. The graph is the 5
+// consecutive nodes {MUL_MAT_ID(gate), ADD_ID(gate_b), MUL_MAT_ID(up), ADD_ID(up_b),
+// GLU}. The per-op path materializes two n_ff-wide intermediates to global, re-reads
+// them for the two bias adds, and re-reads again for the GLU. This kernel folds all
+// of it into one GEMV epilogue: each work-item computes BOTH dot products for output
+// row i01 (gate row i01 of ffn_gate_exps and up row i01 of ffn_up_exps, same expert),
+// adds the per-expert bias to each, applies SWIGLU_OAI, and writes the n_ff-wide
+// result -> one dispatch, no intermediates.
+// Each dot product accumulates in the SAME per-block / cross-subgroup order as the
+// standalone kernel_gemv_moe_mxfp4_f32_ns above, the bias add matches add_id, and the
+// epilogue is the exact scalar expression from kernels/glu.cl kernel_swiglu_oai, so
+// the output is BYTE-IDENTICAL to the per-op mul_mat_id + add_id + glu path.
+
+// One row's mxfp4 dot product, body identical to the standalone kernel above.
+// Q/E are the quant/scale planes of one weight; SUM is the subgroup accumulator.
+#define MXFP4_MOE_ROW_DOT(SUM, Q, E)                                                      \
+    for (uint ib00 = sgid; ib00 < (ne00 / QK_MXFP4); ib00 += N_SIMDGROUP) {              \
+        uint4 regQ;                                                                       \
+        uint block_offset = expert_offset * 4 + ib00 * ne01 * 4 + i01;                    \
+        regQ.s0 = (Q)[block_offset];                                                       \
+        regQ.s1 = (Q)[block_offset + ne01];                                               \
+        regQ.s2 = (Q)[block_offset + ne01 * 2];                                           \
+        regQ.s3 = (Q)[block_offset + ne01 * 3];                                           \
+        uint offset = i11 * ne00 / 4 + ib00 * 8;                                          \
+        half8 fp16x8 = mxfp4_to_fp16_packed8(as_ushort2(regQ.s0));                         \
+        float4 shared_y4 = read_imagef(src1, (offset + 0));                               \
+        float4 acc = shared_y4 * convert_float4(fp16x8.lo);                               \
+        shared_y4 = read_imagef(src1, (offset + 1)); acc += shared_y4 * convert_float4(fp16x8.hi); \
+        fp16x8 = mxfp4_to_fp16_packed8(as_ushort2(regQ.s1));                               \
+        shared_y4 = read_imagef(src1, (offset + 2)); acc += shared_y4 * convert_float4(fp16x8.lo); \
+        shared_y4 = read_imagef(src1, (offset + 3)); acc += shared_y4 * convert_float4(fp16x8.hi); \
+        fp16x8 = mxfp4_to_fp16_packed8(as_ushort2(regQ.s2));                               \
+        shared_y4 = read_imagef(src1, (offset + 4)); acc += shared_y4 * convert_float4(fp16x8.lo); \
+        shared_y4 = read_imagef(src1, (offset + 5)); acc += shared_y4 * convert_float4(fp16x8.hi); \
+        fp16x8 = mxfp4_to_fp16_packed8(as_ushort2(regQ.s3));                               \
+        shared_y4 = read_imagef(src1, (offset + 6)); acc += shared_y4 * convert_float4(fp16x8.lo); \
+        shared_y4 = read_imagef(src1, (offset + 7)); acc += shared_y4 * convert_float4(fp16x8.hi); \
+        uchar regE = (E)[ib00 * ne01 + i01 + expert_offset];                              \
+        SUM += e8m0_to_fp32(regE) * ((acc.s0 + acc.s1) + (acc.s2 + acc.s3));              \
+    }
+
+__attribute__((qcom_reqd_sub_group_size("half")))
+__kernel void kernel_gemv_moe_mxfp4_f32_ns_glu(
+    __global uint *              gate_q,
+    __global uchar *             gate_e,
+    __global uint *              up_q,
+    __global uchar *             up_e,
+    __global float *             gate_bias,
+    ulong                        gate_bias_off,
+    __global float *             up_bias,
+    ulong                        up_bias_off,
+    __read_only image1d_buffer_t src1,
+    __global uint *              src2,
+    __global float *             dst,
+    ulong                        offsetd,
+    int                          ne00,    // K
+    int                          ne01,    // n_ff (output rows of each weight)
+    int                          ne11,
+    float                        alpha,
+    float                        limit
+) {
+    uint i01  = get_global_id(0);    // output row in [0, ne01)
+    uint i20  = get_global_id(2);
+    uint sgid = get_local_id(1);
+    uint slid = get_sub_group_local_id();
+
+    if (i01 >= (uint)ne01) {
+        return;
+    }
+
+    uint i11 = i20 % ne11;
+
+    uint expert_id = src2[i20];
+    uint expert_offset = expert_id * ne00 * ne01 / 32;
+
+    __private float gate_sum = 0.0f;
+    __private float up_sum   = 0.0f;
+
+    MXFP4_MOE_ROW_DOT(gate_sum, gate_q, gate_e)
+    MXFP4_MOE_ROW_DOT(up_sum,   up_q,   up_e)
+
+    // Cross-subgroup reduction (assumes #subgroups=4), gate (x) + up (y) packed.
+    __local float2 reduceLM[SIMDGROUP_WIDTH * (N_SIMDGROUP - 1)];
+    if (sgid == 1) reduceLM[SIMDGROUP_WIDTH * 0 + slid] = (float2)(gate_sum, up_sum);
+    if (sgid == 2) reduceLM[SIMDGROUP_WIDTH * 1 + slid] = (float2)(gate_sum, up_sum);
+    if (sgid == 3) reduceLM[SIMDGROUP_WIDTH * 2 + slid] = (float2)(gate_sum, up_sum);
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (sgid == 0) {
+        gate_sum += reduceLM[SIMDGROUP_WIDTH * 0 + slid].s0;
+        up_sum   += reduceLM[SIMDGROUP_WIDTH * 0 + slid].s1;
+        gate_sum += reduceLM[SIMDGROUP_WIDTH * 1 + slid].s0;
+        up_sum   += reduceLM[SIMDGROUP_WIDTH * 1 + slid].s1;
+        gate_sum += reduceLM[SIMDGROUP_WIDTH * 2 + slid].s0;
+        up_sum   += reduceLM[SIMDGROUP_WIDTH * 2 + slid].s1;
+
+        // per-expert bias (add_id): bias laid out [n_ff, n_expert], natural order
+        gate_sum += gate_bias[(gate_bias_off >> 2) + (uint)expert_id * ne01 + i01];
+        up_sum   += up_bias[(up_bias_off >> 2) + (uint)expert_id * ne01 + i01];
+
+        // SWIGLU_OAI: x0=gate (clamped above), x1=up (clamped both sides)
+        float x0 = min(gate_sum, limit);
+        float x1 = max(min(up_sum, limit), -limit);
+        float out_glu = x0 / (1.0f + exp(-x0 * alpha));
+        out_glu = out_glu * (1.0f + x1);
+
+        dst = dst + (offsetd >> 2);
+        dst[i01 + i20 * ne01] = out_glu;
+    }
+}
