@@ -13,14 +13,18 @@
 #include "ggml-backend-impl.h"
 #include "ggml.h"
 
-#ifdef GGML_OPENCL_USE_ADRENO_BIN_KERNELS
-#include "libdl.h"
+// Always declare the bin-kernel lookup signature so the context struct field
+// below compiles regardless of GGML_OPENCL_USE_ADRENO_BIN_KERNELS; the actual
+// loading path (libdl + lib name) is gated by the macro.
 typedef const void * (*get_adreno_bin_kernel_func_t)(
     const char * name,
     const char * gpu_name,
     const char * compiler_ver,
     size_t     * out_size
 );
+
+#ifdef GGML_OPENCL_USE_ADRENO_BIN_KERNELS
+#include "libdl.h"
 
 #ifdef _WIN32
 #define KERNEL_LIB_NAME "adreno-opencl-kernels.dll"
