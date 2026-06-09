@@ -15,6 +15,14 @@
 #define WG_SIZE (BLOCK_M)
 #define Q1_WG_SIZE 64
 
+// Finite running-max sentinel. The FA program is compiled with
+// -cl-finite-math-only, under which -INFINITY arithmetic (notably
+// exp(-inf - -inf) for a fully-masked key block, which occurs on SWA models
+// like gpt-oss) is undefined and leaks. Mirror the quant-KV FA kernels: use a
+// large finite negative and clamp the softmax max so masked blocks stay well
+// defined.
+#define FA_M_INIT (-3.0e38f)
+
 inline float get_alibi_slope(
     const float max_bias, const uint h, const uint n_head_log2, const float m0, const float m1
 ) {
@@ -95,7 +103,7 @@ __kernel void flash_attn_f32_f16(
     for (int i = 0; i < DV_VEC; ++i) {
         o_acc[i] = (ACC_TYPE4)(0.0f);
     }
-    ACC_TYPE m_i = -INFINITY;
+    ACC_TYPE m_i = FA_M_INIT;
     ACC_TYPE l_i = 0.0f;
 
     float slope = get_alibi_slope(max_bias, head_idx, n_head_log2, m0, m1);
@@ -143,12 +151,12 @@ __kernel void flash_attn_f32_f16(
             ACC_TYPE score1 = (dot_acc1.s0 + dot_acc1.s1 + dot_acc1.s2 + dot_acc1.s3) * scale;
 
             if (is_causal) {
-                if (k_row0 > (n_kv - n_q + my_query_row)) score0 = -INFINITY;
-                if (k_row1 > (n_kv - n_q + my_query_row)) score1 = -INFINITY;
+                if (k_row0 > (n_kv - n_q + my_query_row)) score0 = FA_M_INIT;
+                if (k_row1 > (n_kv - n_q + my_query_row)) score1 = FA_M_INIT;
             }
 
-            if (k_row0 >= n_kv) score0 = -INFINITY;
-            if (k_row1 >= n_kv) score1 = -INFINITY;
+            if (k_row0 >= n_kv) score0 = FA_M_INIT;
+            if (k_row1 >= n_kv) score1 = FA_M_INIT;
 
             if (mask_base != NULL) {
                 const global MASK_DATA_TYPE* mask_ptr = (const global MASK_DATA_TYPE*)(mask_base + my_query_row * mask_nb1);
@@ -162,9 +170,14 @@ __kernel void flash_attn_f32_f16(
             }
 
             const ACC_TYPE m_new = max(m_i, max(score0, score1));
-            const ACC_TYPE p0 = exp(score0 - m_new);
-            const ACC_TYPE p1 = exp(score1 - m_new);
-            const ACC_TYPE scale_prev = exp(m_i - m_new);
+            // A fully-masked key block leaves m_new == FA_M_INIT (or the mask's
+            // -inf wins to the same effect). Clamp the exp() reference to 0 so
+            // masked positions yield exp(-inf)=0 instead of exp(-inf - -inf)=nan
+            // (undefined under -cl-finite-math-only -> the SWA leak).
+            const ACC_TYPE m_exp = (m_new <= FA_M_INIT) ? 0.0f : m_new;
+            const ACC_TYPE p0 = native_exp(score0 - m_exp);
+            const ACC_TYPE p1 = native_exp(score1 - m_exp);
+            const ACC_TYPE scale_prev = native_exp(m_i - m_exp);
 
             #pragma unroll
             for (int i = 0; i < DV_VEC; ++i) {
@@ -273,7 +286,7 @@ __kernel void flash_attn_f32_f16_q1(
         sinks_ptr = (const global ACC_TYPE*)((const global char*)sinks_void + sinks_offset);
     }
 
-    ACC_TYPE m_i = (sinks_ptr != NULL) ? sinks_ptr[head_idx] : -INFINITY;
+    ACC_TYPE m_i = (sinks_ptr != NULL) ? sinks_ptr[head_idx] : FA_M_INIT;
     for (int k_idx = tid; k_idx < n_kv; k_idx += Q1_WG_SIZE) {
         const ulong k_row_offset = batch_idx * k_nb3 + head_kv_idx * k_nb2 + k_idx * k_nb1;
         const global KV_DATA_TYPE4* k_ptr = (const global KV_DATA_TYPE4*)(k_base + k_row_offset);
