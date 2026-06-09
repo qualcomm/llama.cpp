@@ -57,6 +57,19 @@ kernel void kernel_transpose_16_buf(
     output[x*ldo + y] = input[y*ldi + x];
 }
 
+// Transpose treating each element as 32-bit using buffer
+kernel void kernel_transpose_32_buf(
+    global const uint * input,
+    global uint * output,
+    const int ldi,
+    const int ldo
+) {
+    const int x = get_global_id(0);
+    const int y = get_global_id(1);
+
+    output[x*ldo + y] = input[y*ldi + x];
+}
+
 // 32-bit transpose, loading/storing a 4x4 tile of elements
 kernel void kernel_transpose_32(
     __read_only image1d_buffer_t input,

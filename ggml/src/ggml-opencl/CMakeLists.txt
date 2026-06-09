@@ -102,6 +102,8 @@ set(GGML_OPENCL_KERNELS
     gemv_moe_mxfp4_f32
     gemm_moe_mxfp4_f32_ns
     gemv_moe_mxfp4_f32_ns
+    gemm_noshuffle_q8_0_f32
+    gemv_noshuffle_q8_0_f32
     moe_reorder_b
     moe_sort_by_expert
     mul_mm_f32_f32_l4_lm
