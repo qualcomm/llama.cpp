@@ -28,6 +28,7 @@
 #include <memory>
 #include <charconv>
 #include <mutex>
+#include <unordered_set>
 
 #undef MIN
 #undef MAX
@@ -3594,6 +3595,13 @@ struct ggml_backend_opencl_buffer_context {
     // allocation are enabled.
     std::vector<cl_mem> img;
     std::string name;
+
+    // Tracks which q8_0/q4_0 tensors in this buffer were flattened to the
+    // struct-of-arrays (SoA) weight layout by set_tensor. Tensors NOT in these
+    // sets (e.g. a quantised KV cache written on-device via SET_ROWS) stay AoS,
+    // so get_tensor must read them back directly instead of un-shuffling SoA.
+    std::unordered_set<const ggml_tensor *> q8_0_soa_tensors;
+    std::unordered_set<const ggml_tensor *> q4_0_soa_tensors;
 };
 
 static void ggml_backend_opencl_buffer_free_buffer(ggml_backend_buffer_t buffer) {
@@ -3676,6 +3684,19 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
     cl_command_queue queue = backend_ctx->queue;
 
 #ifdef GGML_OPENCL_SOA_Q
+    // A quantised KV-cache tensor (named cache_k_l*/cache_v_l*) stays AoS: it is
+    // written on-device via SET_ROWS and read by flash-attention as AoS, never
+    // SoA-flattened. When KV-cache state is restored (llama_state_seq_set_data),
+    // write the serialized bytes straight into the AoS buffer and skip the SoA
+    // conversion (which would corrupt the layout the FA kernels expect).
+    if ((tensor->type == GGML_TYPE_Q4_0 || tensor->type == GGML_TYPE_Q8_0) &&
+        strncmp(tensor->name, "cache_", 6) == 0) {
+        ggml_tensor_extra_cl * extra_aos = (ggml_tensor_extra_cl *)tensor->extra;
+        GGML_ASSERT(extra_aos && extra_aos->data_device);
+        CL_CHECK(clEnqueueWriteBuffer(queue, extra_aos->data_device, CL_TRUE,
+            extra_aos->offset + tensor->view_offs + offset, size, data, 0, NULL, NULL));
+        return;
+    }
     // We separate the quantized bits and scale from block_q4_0 by using an
     // additional kernel, where each thread handles a block. We first read the
     // original weights into a temporary buffer, then create two separate
@@ -3763,6 +3784,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         CL_CHECK(clReleaseMemObject(data_device));
 
         tensor->extra = extra;
+        ctx->q4_0_soa_tensors.insert(tensor);
 
         // transpose the weights and scales
     #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
@@ -4082,6 +4104,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         CL_CHECK(clReleaseMemObject(data_device));
 
         tensor->extra = extra;
+        ctx->q8_0_soa_tensors.insert(tensor);
 
         return;
     }
@@ -4116,6 +4139,16 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
     // To properly support this, we need to restore block_q4_0 struct arrays
     // from the flattened buffers.
     if (tensor->type == GGML_TYPE_Q4_0) {
+        ggml_backend_opencl_buffer_context * buf_ctx = (ggml_backend_opencl_buffer_context *) buffer->context;
+        if (buf_ctx->q4_0_soa_tensors.count(tensor) == 0) {
+            // AoS quant KV-cache tensor (written on-device via SET_ROWS, never
+            // SoA-flattened by set_tensor): read it back directly. Needed for
+            // KV-cache state serialization (llama_state_seq_get_data).
+            ggml_tensor_extra_cl * extra_aos = (ggml_tensor_extra_cl *)tensor->extra;
+            CL_CHECK(clEnqueueReadBuffer(queue, extra_aos->data_device, CL_TRUE,
+                extra_aos->offset + tensor->view_offs + offset, size, data, 0, NULL, NULL));
+            return;
+        }
         ggml_tensor_extra_cl_q4_0 * extra = (ggml_tensor_extra_cl_q4_0 *)tensor->extra;
 
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
@@ -4279,6 +4312,16 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
         return;
     }
     if (tensor->type == GGML_TYPE_Q8_0) {
+        ggml_backend_opencl_buffer_context * buf_ctx = (ggml_backend_opencl_buffer_context *) buffer->context;
+        if (buf_ctx->q8_0_soa_tensors.count(tensor) == 0) {
+            // AoS quant KV-cache tensor (written on-device via SET_ROWS, never
+            // SoA-flattened by set_tensor): read it back directly. Needed for
+            // KV-cache state serialization (llama_state_seq_get_data).
+            ggml_tensor_extra_cl * extra_aos = (ggml_tensor_extra_cl *)tensor->extra;
+            CL_CHECK(clEnqueueReadBuffer(queue, extra_aos->data_device, CL_TRUE,
+                extra_aos->offset + tensor->view_offs + offset, size, data, 0, NULL, NULL));
+            return;
+        }
         ggml_tensor_extra_cl_q8_0 * extra = (ggml_tensor_extra_cl_q8_0 *)tensor->extra;
 
         cl_int err;
