@@ -413,6 +413,8 @@ struct ggml_backend_opencl_context {
     size_t max_workgroup_size;
     bool fp16_support;
     bool has_vector_subgroup_broadcast;
+    bool has_subgroup_shuffle;
+    bool has_qcom_subgroup_shuffle;
     bool disable_fusion;
     ggml_cl_compiler_version adreno_cl_compiler_version;
 
@@ -556,6 +558,16 @@ struct ggml_backend_opencl_context {
     std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_q8_0_q1;
     std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_q4_0;
     std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_q4_0_q1;
+    // N_SPLIT>1 prefill variants of the native quant FA kernels: split the
+    // DK/DV reduction across N_SPLIT threads per query row (shuffle-combined),
+    // which lifts the otherwise sub-occupied quant prefill onto the BW wall.
+    // wg_size = per-split BLOCK_M * N_SPLIT; bm = per-split BLOCK_M (the rows
+    // per WG, which the blk prepass still classifies at the original BLOCK_M).
+    std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_q8_0_split;
+    std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_q4_0_split;
+    std::map<std::pair<int, int>, int>       kernels_flash_attn_split_wg_size;
+    std::map<std::pair<int, int>, int>       kernels_flash_attn_split_bm;
+    std::map<std::pair<int, int>, int>       kernels_flash_attn_split_nkv_threshold;
     std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_blk_f16;
     std::map<std::pair<int, int>, int>       kernels_flash_attn_bm;
     std::map<std::pair<int, int>, int>       kernels_flash_attn_bn;
@@ -1620,10 +1632,18 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
         #endif
 
         if (!kernel_src_f16.empty() && !kernel_src_f32.empty() && !kernel_src_f32_f16.empty()) {
-            const struct { int dk; int dv; int bm; int bn; } fa_dims[] = {
-                { 40,  40, 32, 32}, { 64,  64, 64, 64}, { 80,  80, 64, 32}, { 96,  96, 64, 32},
-                {112, 112, 32, 32}, {128, 128, 32, 32}, {192, 128, 16, 16},
-                {192, 192, 16, 16}, {256, 256, 16, 16},
+            // n_split>0 enables the N_SPLIT prefill variant of the native quant
+            // (q8_0/q4_0) FA kernel for that (dk,dv): the DK/DV reduction is
+            // spread over n_split threads per query row, lifting the otherwise
+            // sub-occupied quant prefill toward the BW wall. Requires
+            // (dk/32)%n_split==0 && (dv/4)%n_split==0 and subgroup shuffle. The
+            // split fires only when n_kv >= nkv_thr (the per-split overhead is
+            // not worth it for tiny prefills). gpt-oss-20b (DK=DV=64) is the
+            // server target; other dims keep n_split=1 (non-split, unchanged).
+            const struct { int dk; int dv; int bm; int bn; int n_split; int nkv_thr; } fa_dims[] = {
+                { 40,  40, 32, 32, 1,  0}, { 64,  64, 64, 64, 2, 64}, { 80,  80, 64, 32, 1,  0}, { 96,  96, 64, 32, 1,  0},
+                {112, 112, 32, 32, 1,  0}, {128, 128, 32, 32, 1,  0}, {192, 128, 16, 16, 1,  0},
+                {192, 192, 16, 16, 1,  0}, {256, 256, 16, 16, 1,  0},
             };
 
             for (size_t i = 0; i < sizeof(fa_dims)/sizeof(fa_dims[0]); ++i) {
@@ -1631,11 +1651,29 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
                 const int dv = fa_dims[i].dv;
                 const int bm = fa_dims[i].bm;
                 const int bn = fa_dims[i].bn;
+                const int n_split = fa_dims[i].n_split;
+                const int nkv_thr = fa_dims[i].nkv_thr;
                 std::string OPTS = compile_opts +
                     " -D DK=" + std::to_string(dk) +
                     " -D DV=" + std::to_string(dv) +
                     " -D BLOCK_M=" + std::to_string(bm) +
                     " -D BLOCK_N=" + std::to_string(bn);
+
+                // N_SPLIT>1 prefill needs sub_group_shuffle_xor; enable the
+                // right shuffle extension for the device when building the
+                // split program (the non-split programs never touch shuffle).
+                std::string shuffle_opts;
+                if (backend_ctx->has_subgroup_shuffle) {
+                    shuffle_opts = backend_ctx->has_qcom_subgroup_shuffle
+                        ? " -D cl_qcom_subgroup_shuffle=1"
+                        : " -D cl_khr_subgroup_shuffle=1";
+                }
+                // Opt-out for the N_SPLIT quant prefill (GGML_OPENCL_FA_QUANT_SPLIT=0).
+                static const char * split_env = getenv("GGML_OPENCL_FA_QUANT_SPLIT");
+                const bool split_enabled = (split_env == NULL) || (split_env[0] != '0');
+                const bool build_split =
+                    split_enabled && n_split > 1 && backend_ctx->has_subgroup_shuffle &&
+                    (dk / 32) % n_split == 0 && (dv / 4) % n_split == 0;
 
                 cl_program prog_f16 = build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src_f16.c_str(), OPTS);
                 cl_kernel k_f16, k_f16_q1;
@@ -1671,6 +1709,24 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
                     backend_ctx->kernels_flash_attn_f32_q8_0_q1[{dk, dv}] = k_f32_q8_0_q1;
                     CL_CHECK(clReleaseProgram(prog_f32_q8_0));
 
+                    // N_SPLIT>1 prefill variant of the q8_0 kernel. BLOCK_M is
+                    // unchanged (the WG just gains n_split threads per row, so
+                    // WG = bm*n_split); BLK_PREPASS_BM=bm keeps the shared blk
+                    // prepass classification indexed correctly.
+                    if (build_split) {
+                        std::string SPLIT_OPTS = OPTS + shuffle_opts +
+                            " -D N_SPLIT=" + std::to_string(n_split) +
+                            " -D BLK_PREPASS_BM=" + std::to_string(bm);
+                        cl_program prog_split = build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src_f32_q8_0.c_str(), SPLIT_OPTS);
+                        cl_kernel k_split;
+                        CL_CHECK((k_split = clCreateKernel(prog_split, "flash_attn_f32_q8_0", &err), err));
+                        backend_ctx->kernels_flash_attn_f32_q8_0_split[{dk, dv}] = k_split;
+                        backend_ctx->kernels_flash_attn_split_wg_size[{dk, dv}]       = bm * n_split;
+                        backend_ctx->kernels_flash_attn_split_bm[{dk, dv}]            = bm;
+                        backend_ctx->kernels_flash_attn_split_nkv_threshold[{dk, dv}] = nkv_thr;
+                        CL_CHECK(clReleaseProgram(prog_split));
+                    }
+
                     // Native q4_0 KV-cache flash-attention (non-split path; N_SPLIT defaults to 1).
                     if (!kernel_src_f32_q4_0.empty()) {
                         cl_program prog_f32_q4_0 = build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src_f32_q4_0.c_str(), OPTS);
@@ -1680,6 +1736,23 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
                         backend_ctx->kernels_flash_attn_f32_q4_0[{dk, dv}] = k_f32_q4_0;
                         backend_ctx->kernels_flash_attn_f32_q4_0_q1[{dk, dv}] = k_f32_q4_0_q1;
                         CL_CHECK(clReleaseProgram(prog_f32_q4_0));
+
+                        // N_SPLIT>1 prefill variant of the q4_0 kernel (see q8_0 above).
+                        if (build_split) {
+                            std::string SPLIT_OPTS = OPTS + shuffle_opts +
+                                " -D N_SPLIT=" + std::to_string(n_split) +
+                                " -D BLK_PREPASS_BM=" + std::to_string(bm);
+                            cl_program prog_split = build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src_f32_q4_0.c_str(), SPLIT_OPTS);
+                            cl_kernel k_split;
+                            CL_CHECK((k_split = clCreateKernel(prog_split, "flash_attn_f32_q4_0", &err), err));
+                            backend_ctx->kernels_flash_attn_f32_q4_0_split[{dk, dv}] = k_split;
+                            // wg_size / bm / threshold are shared with the q8_0 split
+                            // (same dk_dv → same tiling); set once is enough but
+                            // re-asserting keeps the maps self-consistent if q8_0 was absent.
+                            backend_ctx->kernels_flash_attn_split_wg_size[{dk, dv}]       = bm * n_split;
+                            backend_ctx->kernels_flash_attn_split_bm[{dk, dv}]            = bm;
+                            backend_ctx->kernels_flash_attn_split_nkv_threshold[{dk, dv}] = nkv_thr;
+                        }
                     }
 
                     // Prefill prepass: per-(q-tile,kv-tile) mask classifier used by the
@@ -2819,6 +2892,12 @@ static ggml_backend_opencl_context * ggml_cl2_init(ggml_backend_dev_t dev) {
     // Check if ext_buffer contains cl_khr_fp16
     backend_ctx->fp16_support = strstr(ext_buffer, "cl_khr_fp16") != NULL;
     GGML_LOG_INFO("ggml_opencl: device FP16 support: %s\n", backend_ctx->fp16_support ? "true" : "false");
+
+    // Subgroup shuffle (sub_group_shuffle_xor) — needed by the N_SPLIT>1
+    // native-quant FA prefill kernel to combine per-split QK partials.
+    backend_ctx->has_qcom_subgroup_shuffle = strstr(ext_buffer, "cl_qcom_subgroup_shuffle") != NULL;
+    backend_ctx->has_subgroup_shuffle =
+        backend_ctx->has_qcom_subgroup_shuffle || strstr(ext_buffer, "cl_khr_subgroup_shuffle") != NULL;
 
     // fp16 is required
     if (!backend_ctx->fp16_support) {
@@ -7592,6 +7671,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     const int n_batch = q->ne[3];
 
     cl_kernel kernel = NULL;
+    bool use_split_fa = false;  // N_SPLIT>1 quant prefill variant selected
 
     const bool is_f16 = q->type == GGML_TYPE_F16;
     const bool k_quant = k->type == GGML_TYPE_Q8_0 || k->type == GGML_TYPE_Q4_0;
@@ -7623,9 +7703,26 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         }
     } else {
         if (is_q8_0) {
-            kernel = backend_ctx->kernels_flash_attn_f32_q8_0.at(dk_dv);
+            // Prefer the N_SPLIT>1 prefill variant once n_kv crosses the
+            // per-(dk,dv) threshold (the split lifts quant prefill toward the
+            // BW wall; below the threshold the non-split kernel is faster).
+            auto sit = backend_ctx->kernels_flash_attn_f32_q8_0_split.find(dk_dv);
+            if (sit != backend_ctx->kernels_flash_attn_f32_q8_0_split.end() &&
+                n_kv >= backend_ctx->kernels_flash_attn_split_nkv_threshold.at(dk_dv)) {
+                kernel = sit->second;
+                use_split_fa = true;
+            } else {
+                kernel = backend_ctx->kernels_flash_attn_f32_q8_0.at(dk_dv);
+            }
         } else if (is_q4_0) {
-            kernel = backend_ctx->kernels_flash_attn_f32_q4_0.at(dk_dv);
+            auto sit = backend_ctx->kernels_flash_attn_f32_q4_0_split.find(dk_dv);
+            if (sit != backend_ctx->kernels_flash_attn_f32_q4_0_split.end() &&
+                n_kv >= backend_ctx->kernels_flash_attn_split_nkv_threshold.at(dk_dv)) {
+                kernel = sit->second;
+                use_split_fa = true;
+            } else {
+                kernel = backend_ctx->kernels_flash_attn_f32_q4_0.at(dk_dv);
+            }
         } else if (route_mixed) {
             kernel = backend_ctx->kernels_flash_attn_f32_f16.at(dk_dv);
         } else if (is_f16) {
@@ -7774,8 +7871,16 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         size_t global_work_size[] = { wg_size, (size_t)(n_head * n_batch) };
         backend_ctx->enqueue_ndrange_kernel(kernel, 2, global_work_size, local_work_size, dst);
     } else {
-        const int block_m = backend_ctx->kernels_flash_attn_bm.at(dk_dv);
-        const size_t wg_size = block_m;
+        // Prefill. The N_SPLIT>1 quant variant keeps the same BLOCK_M (rows per
+        // WG) but runs WG = BLOCK_M*N_SPLIT lanes, so the local size and grid
+        // stride scale with the split's wg_size while the q-block count (and
+        // thus BLK_PREPASS_BM indexing) stays keyed on BLOCK_M.
+        const int    block_m = use_split_fa
+            ? backend_ctx->kernels_flash_attn_split_bm.at(dk_dv)
+            : backend_ctx->kernels_flash_attn_bm.at(dk_dv);
+        const size_t wg_size = use_split_fa
+            ? (size_t)backend_ctx->kernels_flash_attn_split_wg_size.at(dk_dv)
+            : (size_t)block_m;
         size_t local_work_size[] = { wg_size, 1 };
         size_t global_work_size[] = { (size_t)((n_q + block_m - 1) / block_m) * wg_size, (size_t)(n_head * n_batch) };
         backend_ctx->enqueue_ndrange_kernel(kernel, 2, global_work_size, local_work_size, dst);
