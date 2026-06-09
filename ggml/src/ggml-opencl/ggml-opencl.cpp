@@ -507,12 +507,15 @@ struct ggml_backend_opencl_context {
     std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_f16_q1;
     std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_q8_0;
     std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_q8_0_q1;
+    std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_q4_0;
+    std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_q4_0_q1;
     std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_blk_f16;
     std::map<std::pair<int, int>, int>       kernels_flash_attn_bm;
     std::map<std::pair<int, int>, int>       kernels_flash_attn_bn;
     cl_kernel kernel_get_rows_f32, kernel_get_rows_f16, kernel_get_rows_q4_0;
     cl_kernel kernel_set_rows_f32_i64, kernel_set_rows_f32_i32, kernel_set_rows_f16_i64, kernel_set_rows_f16_i32;
     cl_kernel kernel_set_rows_q8_0_i64, kernel_set_rows_q8_0_i32;
+    cl_kernel kernel_set_rows_q4_0_i64, kernel_set_rows_q4_0_i32;
     cl_kernel kernel_rope_norm_f32, kernel_rope_norm_f16, kernel_rope_neox_f32, kernel_rope_neox_f16;
     cl_kernel kernel_rope_multi_f32, kernel_rope_multi_f16, kernel_rope_vision_f32, kernel_rope_vision_f16;
     cl_kernel kernel_cpy_f16_f16, kernel_cpy_f16_f32, kernel_cpy_f32_f16, kernel_cpy_f32_f32;
@@ -528,6 +531,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_convert_block_q4_0, kernel_restore_block_q4_0;
     cl_kernel kernel_convert_block_mxfp4, kernel_convert_block_mxfp4_trans, kernel_restore_block_mxfp4, kernel_restore_block_mxfp4_trans;
     cl_kernel kernel_convert_block_q8_0, kernel_restore_block_q8_0;
+    cl_kernel kernel_dequant_q8_0_f16_view_aos, kernel_dequant_q4_0_f16_view_aos;
     cl_kernel kernel_mul_mat_q4_0_f32_8x_flat;
     cl_kernel kernel_convert_block_q4_0_noshuffle;
     cl_kernel kernel_restore_block_q4_0_noshuffle;
@@ -871,6 +875,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
         CL_CHECK((backend_ctx->kernel_restore_block_mxfp4 = clCreateKernel(backend_ctx->program_cvt, "kernel_restore_block_mxfp4", &err), err));
         CL_CHECK((backend_ctx->kernel_convert_block_q8_0  = clCreateKernel(backend_ctx->program_cvt, "kernel_convert_block_q8_0", &err), err));
         CL_CHECK((backend_ctx->kernel_restore_block_q8_0  = clCreateKernel(backend_ctx->program_cvt, "kernel_restore_block_q8_0", &err), err));
+        CL_CHECK((backend_ctx->kernel_dequant_q8_0_f16_view_aos = clCreateKernel(backend_ctx->program_cvt, "kernel_dequant_q8_0_f16_view_aos", &err), err));
+        CL_CHECK((backend_ctx->kernel_dequant_q4_0_f16_view_aos = clCreateKernel(backend_ctx->program_cvt, "kernel_dequant_q4_0_f16_view_aos", &err), err));
         GGML_LOG_CONT(".");
     }
 
@@ -1523,6 +1529,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
                 const std::string kernel_src_f32_q8_0 {
                     #include "flash_attn_f32_q8_0.cl.h"
                 };
+                const std::string kernel_src_f32_q4_0 {
+                    #include "flash_attn_f32_q4_0.cl.h"
+                };
                 const std::string kernel_src_pre_f16 {
                     #include "flash_attn_pre_f16.cl.h"
                 };
@@ -1531,6 +1540,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
                 const std::string kernel_src_f32 = read_file("flash_attn_f32.cl");
                 const std::string kernel_src_f32_f16 = read_file("flash_attn_f32_f16.cl");
                 const std::string kernel_src_f32_q8_0 = read_file("flash_attn_f32_q8_0.cl");
+                const std::string kernel_src_f32_q4_0 = read_file("flash_attn_f32_q4_0.cl");
                 const std::string kernel_src_pre_f16 = read_file("flash_attn_pre_f16.cl");
         #endif
 
@@ -1585,6 +1595,17 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
                     backend_ctx->kernels_flash_attn_f32_q8_0[{dk, dv}] = k_f32_q8_0;
                     backend_ctx->kernels_flash_attn_f32_q8_0_q1[{dk, dv}] = k_f32_q8_0_q1;
                     CL_CHECK(clReleaseProgram(prog_f32_q8_0));
+
+                    // Native q4_0 KV-cache flash-attention (non-split path; N_SPLIT defaults to 1).
+                    if (!kernel_src_f32_q4_0.empty()) {
+                        cl_program prog_f32_q4_0 = build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src_f32_q4_0.c_str(), OPTS);
+                        cl_kernel k_f32_q4_0, k_f32_q4_0_q1;
+                        CL_CHECK((k_f32_q4_0 = clCreateKernel(prog_f32_q4_0, "flash_attn_f32_q4_0", &err), err));
+                        CL_CHECK((k_f32_q4_0_q1 = clCreateKernel(prog_f32_q4_0, "flash_attn_f32_q4_0_q1", &err), err));
+                        backend_ctx->kernels_flash_attn_f32_q4_0[{dk, dv}] = k_f32_q4_0;
+                        backend_ctx->kernels_flash_attn_f32_q4_0_q1[{dk, dv}] = k_f32_q4_0_q1;
+                        CL_CHECK(clReleaseProgram(prog_f32_q4_0));
+                    }
 
                     // Prefill prepass: per-(q-tile,kv-tile) mask classifier used by the
                     // native quant FA prefill kernel to skip fully-masked KV tiles
@@ -1984,6 +2005,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
         CL_CHECK((backend_ctx->kernel_set_rows_f16_i32 = clCreateKernel(backend_ctx->program_set_rows, "kernel_set_rows_f16_i32", &err), err));
         CL_CHECK((backend_ctx->kernel_set_rows_q8_0_i64 = clCreateKernel(backend_ctx->program_set_rows, "kernel_set_rows_q8_0_i64", &err), err));
         CL_CHECK((backend_ctx->kernel_set_rows_q8_0_i32 = clCreateKernel(backend_ctx->program_set_rows, "kernel_set_rows_q8_0_i32", &err), err));
+        CL_CHECK((backend_ctx->kernel_set_rows_q4_0_i64 = clCreateKernel(backend_ctx->program_set_rows, "kernel_set_rows_q4_0_i64", &err), err));
+        CL_CHECK((backend_ctx->kernel_set_rows_q4_0_i32 = clCreateKernel(backend_ctx->program_set_rows, "kernel_set_rows_q4_0_i32", &err), err));
         GGML_LOG_CONT(".");
     }
 
@@ -3136,6 +3159,7 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                     case GGML_TYPE_F16:
                     case GGML_TYPE_F32:
                     case GGML_TYPE_Q8_0:
+                    case GGML_TYPE_Q4_0:
                         return (op->src[1]->type == GGML_TYPE_I64 || op->src[1]->type == GGML_TYPE_I32);
                     default:
                         return false;
@@ -3351,11 +3375,17 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                                         v->type == GGML_TYPE_F16 && op->type == GGML_TYPE_F16;
                 const bool is_f32_f16 = q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16 &&
                                         v->type == GGML_TYPE_F16 && op->type == GGML_TYPE_F32;
-                // Native q8_0 KV-cache flash-attention (inline dequant in-kernel).
-                const bool is_f32_q8_0 = q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_Q8_0 &&
-                                        v->type == GGML_TYPE_Q8_0 && op->type == GGML_TYPE_F32;
+                // f32-query KV matrix: K and V may each be f16 / q8_0 / q4_0,
+                // including asymmetric (k->type != v->type). Native kernels handle
+                // the symmetric q8_0/q4_0 pairs; everything else GPU-dequantises the
+                // quant side(s) to f16 and runs the f32_f16 kernel.
+                auto kv_type_ok = [](ggml_type t) {
+                    return t == GGML_TYPE_F16 || t == GGML_TYPE_Q8_0 || t == GGML_TYPE_Q4_0;
+                };
+                const bool is_f32_quant_kv = q->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                                        kv_type_ok(k->type) && kv_type_ok(v->type);
 
-                return is_f32_f32 || is_f16_f16 || is_f32_f16 || is_f32_q8_0;
+                return is_f32_f32 || is_f16_f16 || is_f32_f16 || is_f32_quant_kv;
             }
         default:
             return false;
@@ -4856,6 +4886,14 @@ static void ggml_cl_set_rows(ggml_backend_t backend, const ggml_tensor * src0, c
                 kernel = backend_ctx->kernel_set_rows_q8_0_i64;
             } else {
                 kernel = backend_ctx->kernel_set_rows_q8_0_i32;
+            }
+            break;
+        case GGML_TYPE_Q4_0:
+            // Quantize-on-write into a q4_0 (KV cache) destination (AoS block_q4_0).
+            if (src1->type == GGML_TYPE_I64) {
+                kernel = backend_ctx->kernel_set_rows_q4_0_i64;
+            } else {
+                kernel = backend_ctx->kernel_set_rows_q4_0_i32;
             }
             break;
         default:
@@ -7220,6 +7258,75 @@ static void ggml_cl_timestep_embedding(ggml_backend_t backend, const ggml_tensor
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, NULL, dst);
 }
 
+// RAII holder for a flash-attention temporary device buffer.
+struct ggml_cl_flash_attn_temp_buffer {
+    cl_mem data = nullptr;
+    ~ggml_cl_flash_attn_temp_buffer() {
+        if (data != nullptr) {
+            CL_CHECK(clReleaseMemObject(data));
+            data = nullptr;
+        }
+    }
+};
+
+// GPU-dequantise a (possibly strided-view) q8_0/q4_0 KV tensor into a tight f16
+// temp buffer, honouring the view offset/strides. Used by the asymmetric-KV
+// flash-attention fallback so the f32_f16 (mixed) kernel can read a quant side.
+// On success repoints buf/offset/nb1..3 at the f16 temp and returns true.
+static bool ggml_cl_flash_attn_dequant_kv_to_f16(
+        ggml_backend_opencl_context *    backend_ctx,
+        const ggml_tensor *              tensor,
+        ggml_cl_flash_attn_temp_buffer & temp,
+        cl_mem &   buf,
+        cl_ulong & offset,
+        cl_ulong & nb1,
+        cl_ulong & nb2,
+        cl_ulong & nb3) {
+    GGML_ASSERT(tensor->type == GGML_TYPE_Q8_0 || tensor->type == GGML_TYPE_Q4_0);
+    if (tensor->nb[0] != (cl_ulong) ggml_type_size(tensor->type)) {
+        return false;
+    }
+    const bool is_q8_0 = tensor->type == GGML_TYPE_Q8_0;
+
+    const cl_int nblk0 = (cl_int) (tensor->ne[0] / 32);
+    const cl_int ne1   = (cl_int) tensor->ne[1];
+    const cl_int ne2   = (cl_int) tensor->ne[2];
+    const cl_int ne3   = (cl_int) tensor->ne[3];
+    const size_t out_bytes = (size_t) ggml_nelements(tensor) * sizeof(ggml_fp16_t);
+
+    cl_int err;
+    temp.data = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE, out_bytes, NULL, &err);
+    if (err != CL_SUCCESS) {
+        CL_CHECK(clFinish(backend_ctx->queue));
+        temp.data = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE, out_bytes, NULL, &err);
+    }
+    CL_CHECK(err);
+
+    cl_kernel kernel = is_q8_0 ? backend_ctx->kernel_dequant_q8_0_f16_view_aos
+                               : backend_ctx->kernel_dequant_q4_0_f16_view_aos;
+    CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),   &buf));
+    CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_ulong), &offset));
+    CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_ulong), &nb1));
+    CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_ulong), &nb2));
+    CL_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_ulong), &nb3));
+    CL_CHECK(clSetKernelArg(kernel, 5, sizeof(cl_int),   &nblk0));
+    CL_CHECK(clSetKernelArg(kernel, 6, sizeof(cl_int),   &ne1));
+    CL_CHECK(clSetKernelArg(kernel, 7, sizeof(cl_int),   &ne2));
+    CL_CHECK(clSetKernelArg(kernel, 8, sizeof(cl_int),   &ne3));
+    CL_CHECK(clSetKernelArg(kernel, 9, sizeof(cl_mem),   &temp.data));
+
+    size_t gws[3] = { (size_t) nblk0, (size_t) ne1, (size_t) ne2 * (size_t) ne3 };
+    CL_CHECK(clEnqueueNDRangeKernel(backend_ctx->queue, kernel, 3, NULL, gws, NULL, 0, NULL, NULL));
+
+    // Tight f16 layout produced by the dequant kernel.
+    buf    = temp.data;
+    offset = 0;
+    nb1    = (cl_ulong) tensor->ne[0] * sizeof(ggml_fp16_t);
+    nb2    = nb1 * (cl_ulong) tensor->ne[1];
+    nb3    = nb2 * (cl_ulong) tensor->ne[2];
+    return true;
+}
+
 static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, const ggml_tensor * k, ggml_tensor * dst) {
     const ggml_tensor * v = dst->src[2];
     const ggml_tensor * mask = dst->src[3];
@@ -7248,16 +7355,27 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     cl_kernel kernel = NULL;
 
     const bool is_f16 = q->type == GGML_TYPE_F16;
-    const bool is_mixed = q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16;
-    // Native q8_0 KV-cache flash-attention: q is f32, K/V are read directly in q8_0
-    // (inline dequant in the kernel, no host round-trip).
-    const bool is_q8_0 = q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_Q8_0;
+    const bool k_quant = k->type == GGML_TYPE_Q8_0 || k->type == GGML_TYPE_Q4_0;
+    const bool v_quant = v->type == GGML_TYPE_Q8_0 || v->type == GGML_TYPE_Q4_0;
+    // Native quant KV-cache flash-attention: q is f32, K and V are both the same
+    // quant type and read directly (inline dequant in the kernel, no host round-trip).
+    const bool is_q8_0 = q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_Q8_0 && v->type == GGML_TYPE_Q8_0;
+    const bool is_q4_0 = q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_Q4_0 && v->type == GGML_TYPE_Q4_0;
+    // Asymmetric / unsupported-symmetric quant KV: q is f32 and at least one of
+    // K/V is quantised but not a native symmetric pair. Each quant side is
+    // GPU-dequantised to f16 below and the f32_f16 (mixed) kernel reads both
+    // sides as f16 (the f16 side, if any, is used as-is).
+    const bool use_dequant = q->type == GGML_TYPE_F32 && !is_q8_0 && !is_q4_0 && (k_quant || v_quant);
+    const bool is_mixed    = q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16;
+    const bool route_mixed = is_mixed || use_dequant;
     const std::pair<int, int> dk_dv = {d_head_q, d_head_v};
 
     if (n_q == 1) {
         if (is_q8_0) {
             kernel = backend_ctx->kernels_flash_attn_f32_q8_0_q1.at(dk_dv);
-        } else if (is_mixed) {
+        } else if (is_q4_0) {
+            kernel = backend_ctx->kernels_flash_attn_f32_q4_0_q1.at(dk_dv);
+        } else if (route_mixed) {
             kernel = backend_ctx->kernels_flash_attn_f32_f16_q1.at(dk_dv);
         } else if (is_f16) {
             kernel = backend_ctx->kernels_flash_attn_f16_q1.at(dk_dv);
@@ -7267,7 +7385,9 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     } else {
         if (is_q8_0) {
             kernel = backend_ctx->kernels_flash_attn_f32_q8_0.at(dk_dv);
-        } else if (is_mixed) {
+        } else if (is_q4_0) {
+            kernel = backend_ctx->kernels_flash_attn_f32_q4_0.at(dk_dv);
+        } else if (route_mixed) {
             kernel = backend_ctx->kernels_flash_attn_f32_f16.at(dk_dv);
         } else if (is_f16) {
             kernel = backend_ctx->kernels_flash_attn_f16.at(dk_dv);
@@ -7293,10 +7413,30 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     cl_mem   sinks_buffer = extra_sinks ? extra_sinks->data_device : NULL;
     cl_ulong offset_sinks = extra_sinks ? extra_sinks->offset + sinks->view_offs : 0;
 
+    cl_mem k_buffer = extra_k->data_device;
+    cl_mem v_buffer = extra_v->data_device;
+
     const cl_ulong q_nb1 = q->nb[1], q_nb2 = q->nb[2], q_nb3 = q->nb[3];
-    const cl_ulong k_nb1 = k->nb[1], k_nb2 = k->nb[2], k_nb3 = k->nb[3];
-    const cl_ulong v_nb1 = v->nb[1], v_nb2 = v->nb[2], v_nb3 = v->nb[3];
+    cl_ulong k_nb1 = k->nb[1], k_nb2 = k->nb[2], k_nb3 = k->nb[3];
+    cl_ulong v_nb1 = v->nb[1], v_nb2 = v->nb[2], v_nb3 = v->nb[3];
     const cl_ulong o_nb1 = dst->nb[1], o_nb2 = dst->nb[2], o_nb3 = dst->nb[3];
+
+    // Asymmetric / non-native quant KV: GPU-dequantise each quant side to a tight
+    // f16 temp buffer; the f16 side (if any) is read as-is. The f32_f16 kernel
+    // then reads both K and V as f16. Temp buffers live until the kernel is
+    // enqueued (released at function scope).
+    ggml_cl_flash_attn_temp_buffer temp_k_f16;
+    ggml_cl_flash_attn_temp_buffer temp_v_f16;
+    if (use_dequant) {
+        if (k_quant) {
+            GGML_ASSERT(ggml_cl_flash_attn_dequant_kv_to_f16(
+                backend_ctx, k, temp_k_f16, k_buffer, offset_k, k_nb1, k_nb2, k_nb3));
+        }
+        if (v_quant) {
+            GGML_ASSERT(ggml_cl_flash_attn_dequant_kv_to_f16(
+                backend_ctx, v, temp_v_f16, v_buffer, offset_v, v_nb1, v_nb2, v_nb3));
+        }
+    }
     const cl_ulong mask_nb1 = mask ? mask->nb[1] : 0;
     const cl_ulong mask_nb2 = mask ? mask->nb[2] : 0;
     const cl_ulong mask_nb3 = mask ? mask->nb[3] : 0;
@@ -7318,9 +7458,9 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
 
     CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),   &extra_q->data_device));
     CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_ulong), &offset_q));
-    CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem),   &extra_k->data_device));
+    CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem),   &k_buffer));
     CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_ulong), &offset_k));
-    CL_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_mem),   &extra_v->data_device));
+    CL_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_mem),   &v_buffer));
     CL_CHECK(clSetKernelArg(kernel, 5, sizeof(cl_ulong), &offset_v));
     CL_CHECK(clSetKernelArg(kernel, 6, sizeof(cl_mem),   &extra_o->data_device));
     CL_CHECK(clSetKernelArg(kernel, 7, sizeof(cl_ulong), &offset_o));
@@ -7354,7 +7494,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     // classifier so the kernel can skip fully-masked KV tiles — essential to stay
     // under the GPU TDR budget at long context. NULL falls back to full work.
     cl_mem blk_buffer = NULL;
-    if (is_q8_0 && n_q > 1) {
+    if ((is_q8_0 || is_q4_0) && n_q > 1) {
         const int block_m = backend_ctx->kernels_flash_attn_bm.at(dk_dv);
         const int block_n = backend_ctx->kernels_flash_attn_bn.at(dk_dv);
         auto blk_it = backend_ctx->kernels_flash_attn_blk_f16.find(dk_dv);
