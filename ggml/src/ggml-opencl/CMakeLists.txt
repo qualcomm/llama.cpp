@@ -149,6 +149,7 @@ set(GGML_OPENCL_KERNELS
     flash_attn_f32
     flash_attn_f32_q8_0
     flash_attn_f32_q4_0
+    flash_attn_f32_q8_0_q4_0
     flash_attn_pre_f16
 )
 

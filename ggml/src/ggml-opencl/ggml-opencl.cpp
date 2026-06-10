@@ -558,6 +558,12 @@ struct ggml_backend_opencl_context {
     std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_q8_0_q1;
     std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_q4_0;
     std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_q4_0_q1;
+    // Asymmetric native KV: K=q8_0, V=q4_0 (gpt-oss — K needs q8 for the
+    // attention-sink outliers, V is lossless at q4). Same kernel signature as
+    // the symmetric q8_0 path; only the V dequant differs.
+    std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_q8_0_q4_0;
+    std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_q8_0_q4_0_q1;
+    std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f32_q8_0_q4_0_split;
     // N_SPLIT>1 prefill variants of the native quant FA kernels: split the
     // DK/DV reduction across N_SPLIT threads per query row (shuffle-combined),
     // which lifts the otherwise sub-occupied quant prefill onto the BW wall.
@@ -1635,6 +1641,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
                 const std::string kernel_src_f32_q4_0 {
                     #include "flash_attn_f32_q4_0.cl.h"
                 };
+                const std::string kernel_src_f32_q8_0_q4_0 {
+                    #include "flash_attn_f32_q8_0_q4_0.cl.h"
+                };
                 const std::string kernel_src_pre_f16 {
                     #include "flash_attn_pre_f16.cl.h"
                 };
@@ -1644,6 +1653,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
                 const std::string kernel_src_f32_f16 = read_file("flash_attn_f32_f16.cl");
                 const std::string kernel_src_f32_q8_0 = read_file("flash_attn_f32_q8_0.cl");
                 const std::string kernel_src_f32_q4_0 = read_file("flash_attn_f32_q4_0.cl");
+                const std::string kernel_src_f32_q8_0_q4_0 = read_file("flash_attn_f32_q8_0_q4_0.cl");
                 const std::string kernel_src_pre_f16 = read_file("flash_attn_pre_f16.cl");
         #endif
 
@@ -1765,6 +1775,32 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
                             // wg_size / bm / threshold are shared with the q8_0 split
                             // (same dk_dv → same tiling); set once is enough but
                             // re-asserting keeps the maps self-consistent if q8_0 was absent.
+                            backend_ctx->kernels_flash_attn_split_wg_size[{dk, dv}]       = bm * n_split;
+                            backend_ctx->kernels_flash_attn_split_bm[{dk, dv}]            = bm;
+                            backend_ctx->kernels_flash_attn_split_nkv_threshold[{dk, dv}] = nkv_thr;
+                        }
+                    }
+
+                    // Asymmetric native KV: K=q8_0, V=q4_0 (non-split + N_SPLIT prefill).
+                    if (!kernel_src_f32_q8_0_q4_0.empty()) {
+                        cl_program prog_q8q4 = build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src_f32_q8_0_q4_0.c_str(), OPTS);
+                        cl_kernel k_q8q4, k_q8q4_q1;
+                        CL_CHECK((k_q8q4 = clCreateKernel(prog_q8q4, "flash_attn_f32_q8_0_q4_0", &err), err));
+                        CL_CHECK((k_q8q4_q1 = clCreateKernel(prog_q8q4, "flash_attn_f32_q8_0_q4_0_q1", &err), err));
+                        backend_ctx->kernels_flash_attn_f32_q8_0_q4_0[{dk, dv}] = k_q8q4;
+                        backend_ctx->kernels_flash_attn_f32_q8_0_q4_0_q1[{dk, dv}] = k_q8q4_q1;
+                        CL_CHECK(clReleaseProgram(prog_q8q4));
+
+                        // N_SPLIT>1 prefill variant (see q8_0 above). Shares the
+                        // wg_size / bm / threshold maps (same dk_dv → same tiling).
+                        if (build_split) {
+                            std::string SPLIT_OPTS = OPTS + shuffle_opts +
+                                " -D N_SPLIT=" + std::to_string(n_split) +
+                                " -D BLK_PREPASS_BM=" + std::to_string(bm);
+                            cl_program prog_split = build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src_f32_q8_0_q4_0.c_str(), SPLIT_OPTS);
+                            cl_kernel k_split;
+                            CL_CHECK((k_split = clCreateKernel(prog_split, "flash_attn_f32_q8_0_q4_0", &err), err));
+                            backend_ctx->kernels_flash_attn_f32_q8_0_q4_0_split[{dk, dv}] = k_split;
                             backend_ctx->kernels_flash_attn_split_wg_size[{dk, dv}]       = bm * n_split;
                             backend_ctx->kernels_flash_attn_split_bm[{dk, dv}]            = bm;
                             backend_ctx->kernels_flash_attn_split_nkv_threshold[{dk, dv}] = nkv_thr;
@@ -8270,20 +8306,28 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     // quant type and read directly (inline dequant in the kernel, no host round-trip).
     const bool is_q8_0 = q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_Q8_0 && v->type == GGML_TYPE_Q8_0;
     const bool is_q4_0 = q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_Q4_0 && v->type == GGML_TYPE_Q4_0;
+    const std::pair<int, int> dk_dv = {d_head_q, d_head_v};
+    // Asymmetric native KV: K=q8_0, V=q4_0 read directly (K dp4a dot, V inline
+    // q4 dequant — no host f16 round-trip). Lossless on gpt-oss (K outliers need
+    // q8, V tolerates q4) at ~q4-class bandwidth. Falls back to use_dequant if
+    // the mixed kernel was not registered for this (dk,dv).
+    const bool is_q8q4 = q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_Q8_0 && v->type == GGML_TYPE_Q4_0 &&
+                         backend_ctx->kernels_flash_attn_f32_q8_0_q4_0_q1.count(dk_dv) > 0;
     // Asymmetric / unsupported-symmetric quant KV: q is f32 and at least one of
-    // K/V is quantised but not a native symmetric pair. Each quant side is
-    // GPU-dequantised to f16 below and the f32_f16 (mixed) kernel reads both
-    // sides as f16 (the f16 side, if any, is used as-is).
-    const bool use_dequant = q->type == GGML_TYPE_F32 && !is_q8_0 && !is_q4_0 && (k_quant || v_quant);
+    // K/V is quantised but not a native (symmetric q8/q4 or q8K/q4V) pair. Each
+    // quant side is GPU-dequantised to f16 below and the f32_f16 (mixed) kernel
+    // reads both sides as f16 (the f16 side, if any, is used as-is).
+    const bool use_dequant = q->type == GGML_TYPE_F32 && !is_q8_0 && !is_q4_0 && !is_q8q4 && (k_quant || v_quant);
     const bool is_mixed    = q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16;
     const bool route_mixed = is_mixed || use_dequant;
-    const std::pair<int, int> dk_dv = {d_head_q, d_head_v};
 
     if (n_q == 1) {
         if (is_q8_0) {
             kernel = backend_ctx->kernels_flash_attn_f32_q8_0_q1.at(dk_dv);
         } else if (is_q4_0) {
             kernel = backend_ctx->kernels_flash_attn_f32_q4_0_q1.at(dk_dv);
+        } else if (is_q8q4) {
+            kernel = backend_ctx->kernels_flash_attn_f32_q8_0_q4_0_q1.at(dk_dv);
         } else if (route_mixed) {
             kernel = backend_ctx->kernels_flash_attn_f32_f16_q1.at(dk_dv);
         } else if (is_f16) {
@@ -8312,6 +8356,15 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
                 use_split_fa = true;
             } else {
                 kernel = backend_ctx->kernels_flash_attn_f32_q4_0.at(dk_dv);
+            }
+        } else if (is_q8q4) {
+            auto sit = backend_ctx->kernels_flash_attn_f32_q8_0_q4_0_split.find(dk_dv);
+            if (sit != backend_ctx->kernels_flash_attn_f32_q8_0_q4_0_split.end() &&
+                n_kv >= backend_ctx->kernels_flash_attn_split_nkv_threshold.at(dk_dv)) {
+                kernel = sit->second;
+                use_split_fa = true;
+            } else {
+                kernel = backend_ctx->kernels_flash_attn_f32_q8_0_q4_0.at(dk_dv);
             }
         } else if (route_mixed) {
             kernel = backend_ctx->kernels_flash_attn_f32_f16.at(dk_dv);
@@ -8420,7 +8473,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     // classifier so the kernel can skip fully-masked KV tiles — essential to stay
     // under the GPU TDR budget at long context. NULL falls back to full work.
     cl_mem blk_buffer = NULL;
-    if ((is_q8_0 || is_q4_0) && n_q > 1) {
+    if ((is_q8_0 || is_q4_0 || is_q8q4) && n_q > 1) {
         const int block_m = backend_ctx->kernels_flash_attn_bm.at(dk_dv);
         const int block_n = backend_ctx->kernels_flash_attn_bn.at(dk_dv);
         auto blk_it = backend_ctx->kernels_flash_attn_blk_f16.find(dk_dv);
