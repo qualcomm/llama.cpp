@@ -14777,14 +14777,20 @@ static void ggml_cl_mul_mat_q4_k_glu_fused(ggml_backend_t backend, ggml_tensor *
     CL_CHECK(clSetKernelArg(kernel, 15, sizeof(cl_uchar), &mask_d4));
     CL_CHECK(clSetKernelArg(kernel, 16, sizeof(cl_uchar), &mask_hi2));
 
-    // K-split = nsg_y subgroups. The fused kernel holds two weight sets so its
-    // per-kernel max WG is below the base GEMV's: query it and cap nsg_y to the
-    // largest power-of-two that fits (16 -> 8 on X2 where max WG = 896). NOTE:
-    // nsg_y < 16 means the cross-subgroup accumulation grouping differs from the
-    // standalone wide (nsg=16) GEMV, so the output is coherent but NOT byte-
-    // identical to the per-op path.
+    // K-split = nsg_y subgroups. HARD-CAP at 8 (512 work-items): the fused
+    // kernel's cross-subgroup reduce uses a float4 reduceLM (gate+up packed) =
+    // 2x the LDS of the base GEMV's float2 reduce, so 16 co-resident subgroups
+    // exceed the per-CU LDS budget on X2 and the WG barrier DEADLOCKS -> GPU TDR
+    // (reproduced on upstream gemma-4 E4B decode, K=2560 M=10240). This used to
+    // be masked: get_kernel_workgroup_size reported 896 for this kernel (so the
+    // cap loop fell to 8), but it now returns 1024 and the Adreno per-kernel WG
+    // query is unreliable (over-reports), so cap explicitly instead of trusting
+    // it. nsg_y < 16 also means the cross-subgroup accumulation grouping differs
+    // from the standalone wide (nsg=16) GEMV, so the output is coherent but NOT
+    // byte-identical to the per-op path. Keep the maxwg query as a further floor
+    // for any driver that reports < 512.
     size_t maxwg = backend_ctx->get_kernel_workgroup_size(kernel);
-    size_t nsg_y = 16;
+    size_t nsg_y = 8;
     while (nsg_y > 1 && 64 * nsg_y > maxwg) { nsg_y >>= 1; }
     size_t local_work_size[3]  = { 64, nsg_y, 1 };
     size_t global_work_size[3] = { (size_t)CEIL_DIV(M / 2, 64) * 64, nsg_y, 1 };
