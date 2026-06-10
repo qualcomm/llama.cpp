@@ -19202,7 +19202,19 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
             return !e || e[0] == '\0' || e[0] != '0';
         }();
         const bool   splitk_wide = splitk_wide_env && !use_tiled && !use_q4k_o4 && !use_mc3;
-        const size_t nsg_y       = splitk_wide ? 16 : 4;
+        size_t       nsg_y       = splitk_wide ? 16 : 4;
+        // Cap the wide K-split by the kernel's real max WG. X1-class drivers cap
+        // this GEMV at 768 (< 64*16 = 1024), so an uncapped lws aborts the
+        // dispatch with CL_INVALID_WORK_GROUP_SIZE (-54) and breaks ALL q4_K
+        // decode for M>2560. nsg_y is a pure K-split (the base kernel reads it
+        // from get_local_size(1); the packed block stride is a physical constant),
+        // so halving it stays coherent — just a narrower split. X2 keeps 16
+        // (maxwg 1024); X1 falls to 8. (Same Adreno WG-query class as the fused
+        // GLU GEMV cap; see ggml_cl_mul_mat_q4_k_glu_fused.)
+        if (splitk_wide) {
+            const size_t maxwg = backend_ctx->get_kernel_workgroup_size(kernel);
+            while (nsg_y > 4 && 64 * nsg_y > maxwg) { nsg_y >>= 1; }
+        }
         size_t local_work_size[3] = {64, nsg_y, 1};
         size_t global_work_size[3] = {(size_t)CEIL_DIV(use_tiled ? ne01 : (use_q4k_o4 ? ne01/4 : ne01/2), 64)*64, nsg_y, 1};
 
@@ -19536,7 +19548,14 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
         }();
         const bool   q6k_wide = q6k_wide_nsg_env > 4 && !use_tiled && !use_o4 && !use_o4_global
                                 && !use_q6k_mc3 && !use_q6k_tiled_mc;
-        const size_t q6k_nsg  = q6k_wide ? (size_t)q6k_wide_nsg_env : 4;
+        size_t       q6k_nsg  = q6k_wide ? (size_t)q6k_wide_nsg_env : 4;
+        // Cap by the kernel's real max WG so a high opt-in (e.g. =16 -> lws 1024)
+        // can't abort with CL_INVALID_WORK_GROUP_SIZE (-54) on X1-class drivers
+        // (max 768). Default 4 is unaffected; same cap as the q4_K WIDE GEMV.
+        if (q6k_wide) {
+            const size_t maxwg = backend_ctx->get_kernel_workgroup_size(kernel);
+            while (q6k_nsg > 4 && 64 * q6k_nsg > maxwg) { q6k_nsg >>= 1; }
+        }
         size_t local_work_size[3]  = {64, q6k_nsg, 1};
         size_t global_work_size[3] = {gws_x, q6k_nsg, 1};
 
