@@ -491,6 +491,16 @@ struct ggml_opencl_fa_kernels {
     std::map<std::pair<int, int>, int>       f32_q4_0_split_wg_size;
     std::map<std::pair<int, int>, int>       f32_q4_0_split_nkv_threshold;
     std::map<std::pair<int, int>, int>       f32_q4_0_split_bm;
+    // f32 Q / asymmetric native KV: K=q8_0, V=q4_0 (gpt-oss — K needs q8 for the
+    // attention-sink outliers, V is lossless at q4). K path == q8_0; only V dequant
+    // differs. No vec/mq variants (gpt-oss is DK=DV=64; vec gates at DV>=256/128).
+    std::map<std::pair<int, int>, cl_kernel> f32_q8_0_q4_0_q1;            // decode
+    std::map<std::pair<int, int>, cl_kernel> f32_q8_0_q4_0_q1_split;      // flash-decoding pass 1
+    std::map<std::pair<int, int>, cl_kernel> f32_q8_0_q4_0;               // prefill (baseline)
+    std::map<std::pair<int, int>, cl_kernel> f32_q8_0_q4_0_split;         // N_SPLIT>1 variant
+    std::map<std::pair<int, int>, int>       f32_q8_0_q4_0_split_wg_size;
+    std::map<std::pair<int, int>, int>       f32_q8_0_q4_0_split_nkv_threshold;
+    std::map<std::pair<int, int>, int>       f32_q8_0_q4_0_split_bm;
     // shared: flash-decoding merge + prefill prepass (kv-pad, mask-pad, blk class)
     std::map<std::pair<int, int>, cl_kernel> f32_merge;
     std::map<std::pair<int, int>, cl_kernel> kv_pad_f16;
@@ -4073,6 +4083,8 @@ enum ggml_opencl_fa_variant {
     FA_VARIANT_F32_F16_SPLIT = 6,
     FA_VARIANT_Q8_0_SPLIT    = 7,
     FA_VARIANT_Q4_0_SPLIT    = 8,
+    FA_VARIANT_Q8_0_Q4_0       = 9,   // asymmetric native KV: K=q8_0, V=q4_0
+    FA_VARIANT_Q8_0_Q4_0_SPLIT = 10,
 };
 
 static std::string ggml_opencl_fa_kernel_src(ggml_opencl_fa_variant v) {
@@ -4105,6 +4117,11 @@ static std::string ggml_opencl_fa_kernel_src(ggml_opencl_fa_variant v) {
             return std::string{
                 #include "flash_attn_f32_q4_0.cl.h"
             };
+        case FA_VARIANT_Q8_0_Q4_0:
+        case FA_VARIANT_Q8_0_Q4_0_SPLIT:
+            return std::string{
+                #include "flash_attn_f32_q8_0_q4_0.cl.h"
+            };
     }
     return {};
 #else
@@ -4118,6 +4135,8 @@ static std::string ggml_opencl_fa_kernel_src(ggml_opencl_fa_variant v) {
         case FA_VARIANT_Q8_0_SPLIT:    return read_file("flash_attn_f32_q8_0.cl");
         case FA_VARIANT_Q4_0:
         case FA_VARIANT_Q4_0_SPLIT:    return read_file("flash_attn_f32_q4_0.cl");
+        case FA_VARIANT_Q8_0_Q4_0:
+        case FA_VARIANT_Q8_0_Q4_0_SPLIT: return read_file("flash_attn_f32_q8_0_q4_0.cl");
     }
     return {};
 #endif
@@ -4134,7 +4153,8 @@ static std::string ggml_opencl_fa_compile_opts(ggml_backend_opencl_context * bac
 
     const bool is_split = variant == FA_VARIANT_F32_F16_SPLIT ||
                           variant == FA_VARIANT_Q8_0_SPLIT    ||
-                          variant == FA_VARIANT_Q4_0_SPLIT;
+                          variant == FA_VARIANT_Q4_0_SPLIT    ||
+                          variant == FA_VARIANT_Q8_0_Q4_0_SPLIT;
     if (is_split) {
         opts += " -D N_SPLIT=" + std::to_string(cfg->n_split);
         if (backend_ctx->has_subgroup_shuffle) {
@@ -4354,6 +4374,12 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
         case FA_VARIANT_Q4_0_SPLIT:
             if (backend_ctx->fa.f32_q4_0_split.count(dk_dv)) return true;
             break;
+        case FA_VARIANT_Q8_0_Q4_0:
+            if (backend_ctx->fa.f32_q8_0_q4_0_q1.count(dk_dv)) return true;
+            break;
+        case FA_VARIANT_Q8_0_Q4_0_SPLIT:
+            if (backend_ctx->fa.f32_q8_0_q4_0_split.count(dk_dv)) return true;
+            break;
         case FA_VARIANT_PRE:
             ggml_opencl_ensure_fa_pre_kernels(backend_ctx, dk, dv);
             return true;
@@ -4366,12 +4392,15 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
 
     const bool is_split = variant == FA_VARIANT_F32_F16_SPLIT ||
                           variant == FA_VARIANT_Q8_0_SPLIT    ||
-                          variant == FA_VARIANT_Q4_0_SPLIT;
+                          variant == FA_VARIANT_Q4_0_SPLIT    ||
+                          variant == FA_VARIANT_Q8_0_Q4_0_SPLIT;
     const bool is_quant = variant == FA_VARIANT_Q8_0 || variant == FA_VARIANT_Q8_0_SPLIT ||
-                          variant == FA_VARIANT_Q4_0 || variant == FA_VARIANT_Q4_0_SPLIT;
+                          variant == FA_VARIANT_Q4_0 || variant == FA_VARIANT_Q4_0_SPLIT ||
+                          variant == FA_VARIANT_Q8_0_Q4_0 || variant == FA_VARIANT_Q8_0_Q4_0_SPLIT;
     if (is_quant && (dk % 32 != 0 || dv % 32 != 0)) return false;
     if (is_split && cfg->n_split <= 1) return false;
-    if ((variant == FA_VARIANT_Q8_0_SPLIT || variant == FA_VARIANT_Q4_0_SPLIT) &&
+    if ((variant == FA_VARIANT_Q8_0_SPLIT || variant == FA_VARIANT_Q4_0_SPLIT ||
+         variant == FA_VARIANT_Q8_0_Q4_0_SPLIT) &&
         ((dk / 32) % cfg->n_split != 0 || (dv / 4) % cfg->n_split != 0)) return false;
 
     const std::string src = ggml_opencl_fa_kernel_src(variant);
@@ -4398,6 +4427,8 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
         case FA_VARIANT_F32_F16_SPLIT:   tag = "fa f32_f16 split";   break;
         case FA_VARIANT_Q8_0_SPLIT:      tag = "fa q8_0 split";      break;
         case FA_VARIANT_Q4_0_SPLIT:      tag = "fa q4_0 split";      break;
+        case FA_VARIANT_Q8_0_Q4_0:       tag = "fa q8_0/q4_0";       break;
+        case FA_VARIANT_Q8_0_Q4_0_SPLIT: tag = "fa q8_0/q4_0 split"; break;
         default: break;
     }
     cl_program prog = build_program_from_source_ex(
@@ -4704,6 +4735,39 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
             split_wg[{dk, dv}]     = cfg->bm * cfg->n_split;
             split_bm[{dk, dv}]     = cfg->bm;
             split_thresh[{dk, dv}] = 0;  // quant prefill: always split
+            break;
+        }
+        case FA_VARIANT_Q8_0_Q4_0: {
+            // Asymmetric K=q8_0 / V=q4_0. q1 + prefill are required; q1_split
+            // (flash-decoding) + merge are best-effort (used at long ctx).
+            // No vec/mq variants — gpt-oss is DK=DV=64, below the vec gate.
+            cl_kernel k, kq1;
+            CL_CHECK((kq1 = clCreateKernel(prog, "flash_attn_f32_q8_0_q4_0_q1", &err), err));
+            CL_CHECK((k   = clCreateKernel(prog, "flash_attn_f32_q8_0_q4_0",    &err), err));
+            backend_ctx->fa.f32_q8_0_q4_0_q1[{dk, dv}] = kq1;
+            backend_ctx->fa.f32_q8_0_q4_0[{dk, dv}]    = k;
+            ggml_opencl_log_fa_kernel_spill(backend_ctx, kq1, "flash_attn_f32_q8_0_q4_0_q1", dk, dv);
+            ggml_opencl_log_fa_kernel_spill(backend_ctx, k,   "flash_attn_f32_q8_0_q4_0",    dk, dv);
+            cl_kernel k_split = clCreateKernel(prog, "flash_attn_f32_q8_0_q4_0_q1_split", &err);
+            if (err == CL_SUCCESS) {
+                backend_ctx->fa.f32_q8_0_q4_0_q1_split[{dk, dv}] = k_split;
+                ggml_opencl_log_fa_kernel_spill(backend_ctx, k_split, "flash_attn_f32_q8_0_q4_0_q1_split", dk, dv);
+            }
+            if (!backend_ctx->fa.f32_merge.count({dk, dv})) {
+                cl_kernel k_merge = clCreateKernel(prog, "flash_attn_f32_merge", &err);
+                if (err == CL_SUCCESS) {
+                    backend_ctx->fa.f32_merge[{dk, dv}] = k_merge;
+                }
+            }
+            break;
+        }
+        case FA_VARIANT_Q8_0_Q4_0_SPLIT: {
+            cl_kernel k;
+            CL_CHECK((k = clCreateKernel(prog, "flash_attn_f32_q8_0_q4_0", &err), err));
+            backend_ctx->fa.f32_q8_0_q4_0_split[{dk, dv}]               = k;
+            backend_ctx->fa.f32_q8_0_q4_0_split_wg_size[{dk, dv}]       = cfg->bm * cfg->n_split;
+            backend_ctx->fa.f32_q8_0_q4_0_split_bm[{dk, dv}]            = cfg->bm;
+            backend_ctx->fa.f32_q8_0_q4_0_split_nkv_threshold[{dk, dv}] = 0;  // quant prefill: always split
             break;
         }
         default: break;
@@ -13240,6 +13304,10 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     const bool is_mixed = q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16;
     const bool is_q8_0 = q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_Q8_0 && v->type == GGML_TYPE_Q8_0;
     const bool is_q4_0 = q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_Q4_0 && v->type == GGML_TYPE_Q4_0;
+    // Asymmetric native KV: K=q8_0, V=q4_0. Lossless on gpt-oss (K outliers need
+    // q8, V tolerates q4) at ~q4-class bandwidth; without this the asymmetric KV
+    // falls to the dequant-to-f32 fallback (full f32 attention bandwidth).
+    const bool is_q8q4 = q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_Q8_0 && v->type == GGML_TYPE_Q4_0;
 
     if (is_f16) {
         ggml_opencl_ensure_fa_variant(backend_ctx, d_head_q, d_head_v, FA_VARIANT_F16);
@@ -13273,6 +13341,9 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         } else {
             ggml_opencl_ensure_fa_variant(backend_ctx, d_head_q, d_head_v, FA_VARIANT_Q4_0_SPLIT);
         }
+    } else if (is_q8q4) {
+        ggml_opencl_ensure_fa_variant(backend_ctx, d_head_q, d_head_v, FA_VARIANT_Q8_0_Q4_0);
+        ggml_opencl_ensure_fa_variant(backend_ctx, d_head_q, d_head_v, FA_VARIANT_Q8_0_Q4_0_SPLIT);
     } else {
         ggml_opencl_ensure_fa_variant(backend_ctx, d_head_q, d_head_v, FA_VARIANT_F32);
     }
@@ -13286,6 +13357,10 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
                                     backend_ctx->fa.f32_q4_0_q1.count(dk_dv) > 0;
     const bool use_native_q4_0    = is_q4_0 && n_q > 1 &&
                                     backend_ctx->fa.f32_q4_0.count(dk_dv) > 0;
+    const bool use_native_q8q4_q1 = is_q8q4 && n_q == 1 &&
+                                    backend_ctx->fa.f32_q8_0_q4_0_q1.count(dk_dv) > 0;
+    const bool use_native_q8q4    = is_q8q4 && n_q > 1 &&
+                                    backend_ctx->fa.f32_q8_0_q4_0.count(dk_dv) > 0;
     const int block_m = n_q > 1
         ? (is_mixed ? backend_ctx->fa.f32_f16_bm.at(dk_dv) : backend_ctx->fa.bm.at(dk_dv))
         : 0;
@@ -13302,6 +13377,9 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     const bool use_split_q4_0 = (use_native_q4_0 &&
         backend_ctx->fa.f32_q4_0_split.count(dk_dv) > 0 &&
         n_kv >= backend_ctx->fa.f32_q4_0_split_nkv_threshold.at(dk_dv));
+    const bool use_split_q8q4 = (use_native_q8q4 &&
+        backend_ctx->fa.f32_q8_0_q4_0_split.count(dk_dv) > 0 &&
+        n_kv >= backend_ctx->fa.f32_q8_0_q4_0_split_nkv_threshold.at(dk_dv));
     const int wg_size_fa = (n_q > 1 && is_mixed)
         ? (use_split_kernel
             ? backend_ctx->fa.f32_f16_split_wg_size.at(dk_dv)
@@ -13381,6 +13459,11 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
             } else {
                 kernel = backend_ctx->fa.f32_q4_0_q1.at(dk_dv);
             }
+        } else if (use_native_q8q4_q1) {
+            // K=q8_0/V=q4_0 decode. Plain q1 (no vec/mq: gpt-oss is DV=64,
+            // below the DV>=256 vec gate). Long ctx routes to the q1_split
+            // flash-decoding path below (FD), same as the symmetric quant path.
+            kernel = backend_ctx->fa.f32_q8_0_q4_0_q1.at(dk_dv);
         } else if (is_mixed) {
             // DV-split decode kernel (mirrors Metal vec FA) wins at large DV
             // where the standard q1 spills o_acc to DDR. Gate originally at
@@ -13439,6 +13522,10 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
             kernel = use_split_q4_0
                 ? backend_ctx->fa.f32_q4_0_split.at(dk_dv)
                 : backend_ctx->fa.f32_q4_0.at(dk_dv);
+        } else if (use_native_q8q4) {
+            kernel = use_split_q8q4
+                ? backend_ctx->fa.f32_q8_0_q4_0_split.at(dk_dv)
+                : backend_ctx->fa.f32_q8_0_q4_0.at(dk_dv);
         } else if (is_mixed) {
             if (use_split_kernel) {
                 // DK=512 prefill: opt-in texture-cache K reads (image1d_buffer_t).
@@ -13484,7 +13571,8 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
 
     // Skip host dequant when a native quantised kernel will read the quants.
     if (!use_native_q8_0_q1 && !use_native_q8_0 &&
-        !use_native_q4_0_q1 && !use_native_q4_0) {
+        !use_native_q4_0_q1 && !use_native_q4_0 &&
+        !use_native_q8q4_q1 && !use_native_q8q4) {
         // Per-tensor GPU dequant — important for asymmetric KV (k, v of
         // different quant types) which would otherwise host-roundtrip.
         bool k_done = false;
@@ -13671,6 +13759,8 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
             fd_k_split = backend_ctx->fa.f32_q8_0_q1_split.at(dk_dv);
         } else if (is_q4_0 && backend_ctx->fa.f32_q4_0_q1_split.count(dk_dv) > 0) {
             fd_k_split = backend_ctx->fa.f32_q4_0_q1_split.at(dk_dv);
+        } else if (is_q8q4 && backend_ctx->fa.f32_q8_0_q4_0_q1_split.count(dk_dv) > 0) {
+            fd_k_split = backend_ctx->fa.f32_q8_0_q4_0_q1_split.at(dk_dv);
         }
     }
     const bool use_fd = (fd_k_split != NULL);
@@ -13689,7 +13779,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     const bool use_kv_pad = use_mixed_prepass && (n_kv % block_n != 0) && have_kv_pad;
     // blk prepass: per-KV-tile mask class (0=masked, 1=mixed, 2=unmasked).
     // Consumed identically by f32_f16, q8_0 and q4_0 prefill kernels.
-    const bool use_quant_prepass = (use_native_q8_0 || use_native_q4_0) && !use_fd;
+    const bool use_quant_prepass = (use_native_q8_0 || use_native_q4_0 || use_native_q8q4) && !use_fd;
     const bool use_blk_mask = (use_mixed_prepass || use_quant_prepass) && mask_buffer != NULL && have_blk;
 
     if (use_kv_pad) {
@@ -14006,7 +14096,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         CL_CHECK(clSetKernelArg(kernel, 45, sizeof(cl_ulong),  &mask_pad_nb1));
         CL_CHECK(clSetKernelArg(kernel, 46, sizeof(cl_ulong),  &mask_pad_nb2));
         CL_CHECK(clSetKernelArg(kernel, 47, sizeof(cl_ulong),  &mask_pad_nb3));
-    } else if (use_native_q8_0 || use_native_q4_0) {
+    } else if (use_native_q8_0 || use_native_q4_0 || use_native_q8q4) {
         // arg 40 = blk classification buffer (NULL disables prepass opt).
         CL_CHECK(clSetKernelArg(kernel, 40, sizeof(cl_mem),    &blk_buffer));
     }
@@ -14034,17 +14124,25 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
             size_t global_work_size[] = { wg_size, head_dim_global };
             backend_ctx->enqueue_ndrange_kernel(kernel, 2, global_work_size, local_work_size, dst);
         }
-    } else if (use_native_q8_0 || use_native_q4_0) {
+    } else if (use_native_q8_0 || use_native_q4_0 || use_native_q8q4) {
         // Native quant prefill. The split variant may override BLOCK_M
         // (e.g. DK=96 quant uses BM=16).
-        const bool use_split = use_native_q8_0 ? use_split_q8_0 : use_split_q4_0;
+        const bool use_split = use_native_q8_0 ? use_split_q8_0
+                             : use_native_q4_0 ? use_split_q4_0
+                                               : use_split_q8q4;
         int    bm;
         size_t wg_size;
         if (use_split) {
-            bm      = use_native_q8_0 ? backend_ctx->fa.f32_q8_0_split_bm.at(dk_dv)
-                                      : backend_ctx->fa.f32_q4_0_split_bm.at(dk_dv);
-            wg_size = use_native_q8_0 ? backend_ctx->fa.f32_q8_0_split_wg_size.at(dk_dv)
-                                      : backend_ctx->fa.f32_q4_0_split_wg_size.at(dk_dv);
+            if (use_native_q8_0) {
+                bm      = backend_ctx->fa.f32_q8_0_split_bm.at(dk_dv);
+                wg_size = backend_ctx->fa.f32_q8_0_split_wg_size.at(dk_dv);
+            } else if (use_native_q4_0) {
+                bm      = backend_ctx->fa.f32_q4_0_split_bm.at(dk_dv);
+                wg_size = backend_ctx->fa.f32_q4_0_split_wg_size.at(dk_dv);
+            } else {
+                bm      = backend_ctx->fa.f32_q8_0_q4_0_split_bm.at(dk_dv);
+                wg_size = backend_ctx->fa.f32_q8_0_q4_0_split_wg_size.at(dk_dv);
+            }
         } else {
             bm      = backend_ctx->fa.bm.at(dk_dv);
             wg_size = (size_t) bm;
