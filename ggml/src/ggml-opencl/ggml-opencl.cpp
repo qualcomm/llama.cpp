@@ -20838,16 +20838,26 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
 
         // gemm
         // Cooperative-K small-batch (n_q in [2..8]) path: intra-WG K-split,
-        // mirrors the q4_K _cok win. +30% on pp2..8 (batched serving). OPT-IN
-        // (GGML_OPENCL_Q6K_GEMM_COK=1), DEFAULT OFF: q6_K is the tied lm_head/
-        // output projection, so the K-reassociation perturbs final logits and
-        // greedy is NOT byte-identical (op-tests pass, output coherent, but not
-        // bit-exact). It is also NEUTRAL on end-to-end MTP (q4_K cok already
-        // captured that; the MTP bottleneck moved off the GEMMs). Keep opt-in
-        // for batched serving until PPL-validated on a non-GDN q6_K model.
+        // mirrors the q4_K _cok win. DEFAULT ON; opt out with
+        // GGML_OPENCL_Q6K_GEMM_COK=0. Measured +56% end-to-end MTP and +59% on
+        // batched pp2..8 (gemma-4-E4B-it-Q4_K_M): the cost is dominated by the
+        // PER-LAYER q6_K tensors (ffn_down/attn_v), which the cok K-reassociation
+        // speeds up at no quality cost. The reassociation is coherent but NOT
+        // bit-exact, which only matters for the tied lm_head/output projection
+        // (it shifts the final logits / greedy + spec-accept). So SKIP cok for the
+        // output weight: large-vocab lm_heads are already tiled and never reach
+        // this path, and small-vocab (<32768) q6_K outputs are caught here by name.
+        // Match the lm_head by NAME PREFIX ("output" / tied "token_embd") so the
+        // per-layer "attn_output" projection (substring "output") is NOT excluded;
+        // the input token_embd is a GET_ROWS not a MUL_MAT, so a q6_K matmul whose
+        // weight is named output/token_embd is unambiguously the lm_head. Plain
+        // decode (ne1==1) uses the GEMV path and prefill (ne1>8) is gated out —
+        // neither takes this path, so single-stream latency is unchanged.
         static const char * q6k_cok_env = getenv("GGML_OPENCL_Q6K_GEMM_COK");
-        static const bool q6k_gemm_cok  = (q6k_cok_env != nullptr) && (atoi(q6k_cok_env) != 0);
-        const bool use_q6k_cok = q6k_gemm_cok && (ne1 <= 8);
+        static const bool q6k_gemm_cok  = (q6k_cok_env == nullptr) || (atoi(q6k_cok_env) != 0);
+        const bool is_output_w = strncmp(src0->name, "output", 6) == 0 ||
+                                 strncmp(src0->name, "token_embd", 10) == 0;
+        const bool use_q6k_cok = q6k_gemm_cok && (ne1 >= 2 && ne1 <= 8) && !is_output_w;
         kernel = use_q6k_cok ? backend_ctx->kernel_gemm_noshuffle_q6_K_f32_cok
                              : backend_ctx->kernel_gemm_noshuffle_q6_K_f32;
         int padded_N = ne1 + padding;
