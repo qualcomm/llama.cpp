@@ -1166,6 +1166,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemv_noshuffle_q5_k_f32;
     cl_kernel kernel_gemv_noshuffle_q5_k_f32_mc3;  // multi-column (N=3) verify GEMV (spec/MTP)
     cl_kernel kernel_gemm_noshuffle_q5_k_f32;
+    cl_kernel kernel_gemm_noshuffle_q5_k_f32_cok;  // cooperative-K small-batch GEMM (spec/MTP verify)
     cl_kernel kernel_gemv_noshuffle_q5_0_f32;
     cl_kernel kernel_gemm_noshuffle_q5_0_f32;
     cl_kernel kernel_gemv_noshuffle_q5_1_f32;
@@ -4560,6 +4561,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog = build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q5_k_f32 = clCreateKernel(prog, "kernel_gemm_noshuffle_q5_k_f32", &err), err));
+        CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q5_k_f32_cok = clCreateKernel(prog, "kernel_gemm_noshuffle_q5_k_f32_cok", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
@@ -20125,7 +20127,22 @@ static void ggml_cl_mul_mat_q5_K_f32_adreno(ggml_backend_t backend, const ggml_t
         backend_ctx->enqueue_ndrange_kernel(kernel, 2, global_work_size_t, local_work_size_t, dst);
 
         // gemm
-        kernel = backend_ctx->kernel_gemm_noshuffle_q5_k_f32;
+        // Cooperative-K small-batch (n_q in [2..8]) path: intra-WG K-split,
+        // mirrors the q4_K/q6_K _cok win. DEFAULT ON; opt out with
+        // GGML_OPENCL_Q5K_GEMM_COK=0. q5_K is the #2 verify chunk on Qwen3.5
+        // spec/MTP (~32% of the ne1=4 batch, on the slow base GEMM). Same output-
+        // weight guard as q6_K cok (K-reassociation is coherent but not bit-exact,
+        // which only matters for the tied lm_head); require ne01 % 64 == 0 since
+        // the cok grid is (ne01 rows x 8 subgroups, local 64) — otherwise fall
+        // back to the base GEMM. ne1==1 (GEMV) and prefill (ne1>8) never reach here.
+        static const char * q5k_cok_env = getenv("GGML_OPENCL_Q5K_GEMM_COK");
+        static const bool q5k_gemm_cok  = (q5k_cok_env == nullptr) || (atoi(q5k_cok_env) != 0);
+        const bool is_output_w = strncmp(src0->name, "output", 6) == 0 ||
+                                 strncmp(src0->name, "token_embd", 10) == 0;
+        const bool use_q5k_cok = q5k_gemm_cok && (ne1 >= 2 && ne1 <= 8) &&
+                                 !is_output_w && (ne01 % 64 == 0);
+        kernel = use_q5k_cok ? backend_ctx->kernel_gemm_noshuffle_q5_k_f32_cok
+                             : backend_ctx->kernel_gemm_noshuffle_q5_k_f32;
         int padded_N = N + padding;
 
         CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0_q5_k->q));
@@ -20144,8 +20161,23 @@ static void ggml_cl_mul_mat_q5_K_f32_adreno(ggml_backend_t backend, const ggml_t
         CL_CHECK(clSetKernelArg(kernel, 13, sizeof(cl_uchar), &mask_d4));
         CL_CHECK(clSetKernelArg(kernel, 14, sizeof(cl_uchar), &mask_hi2));
 
-        size_t global_work_size[3] = {(size_t)CEIL_DIV(ne1, 8), (size_t)CEIL_DIV(ne01, 4), 1};
-        size_t local_work_size[3]  = {1, 128, 1};
+        size_t global_work_size[3];
+        size_t local_work_size[3];
+        if (use_q5k_cok) {
+            global_work_size[0] = (size_t)ne01;   // rows (1 per lane)
+            global_work_size[1] = 8;              // COK_NSG
+            global_work_size[2] = 1;
+            local_work_size[0] = 64;              // COK_SG
+            local_work_size[1] = 8;               // COK_NSG
+            local_work_size[2] = 1;
+        } else {
+            global_work_size[0] = (size_t)CEIL_DIV(ne1, 8);
+            global_work_size[1] = (size_t)CEIL_DIV(ne01, 4);
+            global_work_size[2] = 1;
+            local_work_size[0] = 1;
+            local_work_size[1] = 128;
+            local_work_size[2] = 1;
+        }
 
         backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
 
