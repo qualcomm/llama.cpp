@@ -8738,7 +8738,21 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                                                 t == GGML_TYPE_Q4_K  || t == GGML_TYPE_Q5_K  ||
                                                 t == GGML_TYPE_Q6_K);
                     const bool uses_gemm = type_has_gemm && use_adreno_kernels(backend_ctx, op->src[0]);
-                    if (!uses_gemm && op->src[1]->ne[1] >= 512) {
+                    // Small-output projections (weight ne1 < 512, e.g. GQA K/V
+                    // [n_embd, n_kv_head*head_dim] = [3072,256] on Falcon-H1) fail
+                    // use_adreno_kernels (needs ne0,ne1 >= 512) so they have no
+                    // trans-weight GEMM. Blanket-rejecting them at activation
+                    // ne1>=512 made the reserve graph (ubatch=512) mark the op
+                    // unsupported, so llama NEVER offloaded the weight -> every
+                    // DECODE K/V MUL_MAT ran on CPU (88 CPU MUL_MATs/token, ~46
+                    // CPU<->GPU sync barriers, Falcon-H1-7B tg ~4 t/s). The
+                    // documented GEMV corruption is the LARGE-ne1 regime
+                    // (lm_head/large-vocab); allow small-ne1 weights through so
+                    // they offload and decode runs the (correct) GEMV on GPU.
+                    // GGML_OPENCL_GEMV_LARGE_N_GUARD_ALL=1 restores the blanket reject.
+                    static const bool guard_all = getenv("GGML_OPENCL_GEMV_LARGE_N_GUARD_ALL") != nullptr;
+                    const bool small_out = op->src[0]->ne[1] < 512;
+                    if (!uses_gemm && op->src[1]->ne[1] >= 512 && (guard_all || !small_out)) {
                         return false;
                     }
 
