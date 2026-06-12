@@ -21717,10 +21717,12 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
     // (which also enables the buggy batched-prefill KQ) — this fires ONLY at
     // ne11==1 decode, so it is safe to enable on its own. The texture-cache K
     // read is a separate BW lane from L1, where the buffer _x8_gqa8_dk256 lost
-    // (-9%). Opt-in GGML_OPENCL_MM_KQ_GQA_DK256_IMG=1.
+    // (-9%). Default-on for the DK=256/r2=8 shape (Qwen3.6-A3B tg128 fa=0
+    // +36% @16k alone, +49% combined with the KQV coalesce below, byte-id);
+    // opt out with GGML_OPENCL_MM_KQ_GQA_DK256_IMG=0.
     if (src0t == GGML_TYPE_F16 && src1t == GGML_TYPE_F32) {
         static const char * mm_kq_r8_dk256_img_env = getenv("GGML_OPENCL_MM_KQ_GQA_DK256_IMG");
-        static const bool mm_kq_r8_dk256_img_on = (mm_kq_r8_dk256_img_env != nullptr && mm_kq_r8_dk256_img_env[0] != '0');
+        static const bool mm_kq_r8_dk256_img_on = (mm_kq_r8_dk256_img_env == nullptr || mm_kq_r8_dk256_img_env[0] != '0');
         if (mm_kq_r8_dk256_img_on &&
             backend_ctx->kernel_mul_mat_f16_f32_l4_x8_gqa_r8_dk256_img != nullptr &&
             ne11 == 1 && ne01 >= 64 && (ne01 % 16) == 0 && ne00 == 256 &&
@@ -22946,11 +22948,15 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     // +35% tg128 @ d=16k, +30% @ d=8k, +20% @ d=4k on Qwen3-30B-A3B.
                     static const char * mm_kq_gqa_env = getenv("GGML_OPENCL_MM_KQ_GQA");
                     static const bool mm_kq_gqa_on = (mm_kq_gqa_env != nullptr && mm_kq_gqa_env[0] != '0');
-                    // Opt-in: GGML_OPENCL_MM_KQV_GQA=1 swaps _y8 for the
-                    // GQA-coalesced KQV variant (DK=128/r2=8/r3=1) that reads
-                    // each V slab once per K-head and emits all r2 Q-heads.
+                    // GGML_OPENCL_MM_KQV_GQA swaps _y8 for the GQA-coalesced KQV
+                    // (r2=8/r3=1) that reads each V slab once per K-head and emits
+                    // all r2 Q-heads. y8_gqa is DV-agnostic. Default-on for DV=256
+                    // (Qwen3.6/Next, validated +49% combined with the DK=256 img
+                    // KQ; opt out =0); opt-in =1 for DV=128 (DK=128 sibling, not
+                    // validated as a default here).
                     static const char * mm_kqv_gqa_env = getenv("GGML_OPENCL_MM_KQV_GQA");
-                    static const bool mm_kqv_gqa_on = (mm_kqv_gqa_env != nullptr && mm_kqv_gqa_env[0] != '0');
+                    const bool mm_kqv_gqa_off  = (mm_kqv_gqa_env != nullptr && mm_kqv_gqa_env[0] == '0');
+                    const bool mm_kqv_gqa_optin = (mm_kqv_gqa_env != nullptr && mm_kqv_gqa_env[0] != '0');
                     if (can_multi_out && (ne01 % 16) == 0 && ne00 == 128 && r2 == 8 && r3 == 1 && mm_kq_gqa_on &&
                         backend_ctx->kernel_mul_mat_f16_f32_l4_x8_gqa4 != nullptr) {
                         kernel = backend_ctx->kernel_mul_mat_f16_f32_l4_x8_gqa4;
@@ -22963,10 +22969,12 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                         backend_ctx->kernel_mul_mat_f16_f32_l4_x8 != nullptr) {
                         kernel = backend_ctx->kernel_mul_mat_f16_f32_l4_x8;
                         nrows = 1;
-                    } else if (can_multi_out && (ne01 == 128 || ne01 == 256) && r2 == 8 && r3 == 1 && mm_kqv_gqa_on &&
+                    } else if (can_multi_out && r2 == 8 && r3 == 1 &&
+                        ((ne01 == 256 && !mm_kqv_gqa_off) || (ne01 == 128 && mm_kqv_gqa_optin)) &&
                         backend_ctx->kernel_mul_mat_f16_f32_l4_y8_gqa != nullptr) {
                         // y8_gqa is DV-agnostic (emits 8 DV-rows/WG over ne01/8
-                        // WGs, streams ne00); DV=256 (Qwen3.6) works as-is.
+                        // WGs, streams ne00); DV=256 (Qwen3.6) works as-is and is
+                        // default-on, DV=128 stays opt-in.
                         kernel = backend_ctx->kernel_mul_mat_f16_f32_l4_y8_gqa;
                         nrows = 1;
                     } else if (can_multi_out &&
