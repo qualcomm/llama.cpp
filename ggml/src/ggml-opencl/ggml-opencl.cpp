@@ -712,6 +712,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mat_f16_f32_l4_x8_gqa4_img = nullptr;
     cl_kernel kernel_mul_mat_f16_f32_l4_x8_gqa_r4_img = nullptr;
     cl_kernel kernel_mul_mat_f16_f32_l4_x8_gqa_r2_dk256_img = nullptr;
+    cl_kernel kernel_mul_mat_f16_f32_l4_x8_gqa_r8_dk256_img = nullptr;
     cl_kernel kernel_mul_mat_f16_f32_l4_y8 = nullptr;
     cl_kernel kernel_mul_mat_f16_f32_l4_y8_gqa = nullptr;
     cl_kernel kernel_mul_mat_f16_f32_l4_y8_gqa_img = nullptr;
@@ -2035,6 +2036,11 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         backend_ctx->kernel_mul_mat_f16_f32_l4_x8_gqa_r2_dk256_img =
             clCreateKernel(backend_ctx->program_mul_mv_f16_f32_l4, "kernel_mul_mat_f16_f32_l4_x8_gqa_r2_dk256_img", &err_r2dk256);
         if (err_r2dk256 != CL_SUCCESS) backend_ctx->kernel_mul_mat_f16_f32_l4_x8_gqa_r2_dk256_img = nullptr;
+        // DK=256, r2=8 specialization for Qwen3.6-35B-A3B (image/texture-cache KQ).
+        cl_int err_r8dk256 = CL_SUCCESS;
+        backend_ctx->kernel_mul_mat_f16_f32_l4_x8_gqa_r8_dk256_img =
+            clCreateKernel(backend_ctx->program_mul_mv_f16_f32_l4, "kernel_mul_mat_f16_f32_l4_x8_gqa_r8_dk256_img", &err_r8dk256);
+        if (err_r8dk256 != CL_SUCCESS) backend_ctx->kernel_mul_mat_f16_f32_l4_x8_gqa_r8_dk256_img = nullptr;
         // Streaming-Q multi-output variant for KQV-shaped matmul (ne00 large,
         // ne01 small). Best-effort.
         cl_int err_y8 = CL_SUCCESS;
@@ -17044,7 +17050,80 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
     cl_kernel kernel;
 
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
-    if(src0t == GGML_TYPE_F16 && src1t == GGML_TYPE_F32){
+    // Decode-only GQA-coalesced KQ via image1d_buffer_t (texture cache) for
+    // DK=256, r2=8 (Qwen3.6-35B-A3B). Independent of GGML_OPENCL_KQKV_KERNEL
+    // (which also enables the buggy batched-prefill KQ) — this fires ONLY at
+    // ne11==1 decode, so it is safe to enable on its own. The texture-cache K
+    // read is a separate BW lane from L1, where the buffer _x8_gqa8_dk256 lost
+    // (-9%). Opt-in GGML_OPENCL_MM_KQ_GQA_DK256_IMG=1.
+    if (src0t == GGML_TYPE_F16 && src1t == GGML_TYPE_F32) {
+        static const char * mm_kq_r8_dk256_img_env = getenv("GGML_OPENCL_MM_KQ_GQA_DK256_IMG");
+        static const bool mm_kq_r8_dk256_img_on = (mm_kq_r8_dk256_img_env != nullptr && mm_kq_r8_dk256_img_env[0] != '0');
+        if (mm_kq_r8_dk256_img_on &&
+            backend_ctx->kernel_mul_mat_f16_f32_l4_x8_gqa_r8_dk256_img != nullptr &&
+            ne11 == 1 && ne01 >= 64 && (ne01 % 16) == 0 && ne00 == 256 &&
+            (ne12 % ne02) == 0 && (ne12 / ne02) == 8 && (ne13 / ne03) == 1) {
+            const size_t nb00_bytes = sizeof(uint16_t);
+            const size_t k_bytes_span =
+                (size_t)(ne01 > 0 ? ne01 - 1 : 0) * (size_t)nb01 +
+                (size_t)(ne02 > 0 ? ne02 - 1 : 0) * (size_t)nb02 +
+                (size_t)(ne03 > 0 ? ne03 - 1 : 0) * (size_t)nb03 +
+                (size_t)ne00 * nb00_bytes;
+            const size_t k_bytes = (k_bytes_span + 15) & ~(size_t)15;
+            const size_t k_pixels = k_bytes >> 4;
+            if (k_pixels > 0 && k_pixels <= backend_ctx->image_max_buffer_size) {
+                cl_kernel kernel = backend_ctx->kernel_mul_mat_f16_f32_l4_x8_gqa_r8_dk256_img;
+                cl_mem K_img = ggml_cl_img_pool_get_or_create(
+                    backend_ctx, backend_ctx->kq_img_pool,
+                    extra0->data_device, offset0, k_bytes, CL_FLOAT);
+                if (K_img != nullptr) {
+                    cl_uint k_arg = 0;
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(cl_mem),   &K_img));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(cl_mem),   &extra1->data_device));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(cl_ulong), &offset1));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(cl_mem),   &extrad->data_device));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(cl_ulong), &offsetd));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(int),      &ne00));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(int),      &ne01));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(int),      &ne02));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(cl_ulong), &nb01));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(cl_ulong), &nb02));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(cl_ulong), &nb03));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(int),      &ne10));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(int),      &ne11));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(int),      &ne12));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(cl_ulong), &nb10));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(cl_ulong), &nb11));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(cl_ulong), &nb12));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(cl_ulong), &nb13));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(int),      &ne0));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(int),      &ne1));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(int),      &r2));
+                    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(int),      &r3));
+
+                    const int nth0_d = 64;
+                    const int64_t n_wg_x = ne01 / 16;
+                    size_t global_work_size[] = {(size_t)n_wg_x * nth0_d, (size_t)1, (size_t)ne02 * ne13};
+                    size_t local_work_size[]  = {(size_t)nth0_d, (size_t)1, 1};
+                    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+                    return;
+                }
+            }
+        }
+    }
+    // The mul_mm_f16_f32_kq / _kqv attention kernels MISCOMPUTE the batched
+    // prefill attention: they produce correct results only for the final query
+    // position and garble all intermediate positions. Generation stays coherent
+    // (it consumes the final position), but perplexity, speculative-decode verify
+    // and any batched/multi-position scoring are wrong. Verified on Gemma-3-4b
+    // (head_dim 256, fa=0 PPL ~3.2e4 vs ~14.2 CPU) AND Llama-3.2-3B (head_dim 128,
+    // PPL ~2.6e3 vs ~8.4); routing both KQ and KQV to the generic mul_mm/mul_mv
+    // path below restores correctness on every model. The kernel is also NOT a
+    // perf win: pp512 is within noise (-1% Llama / -0.6% Gemma) and pp4096 is
+    // ~8% FASTER without it (the generic path scales better at long context).
+    // Disabled by default; opt in with GGML_OPENCL_KQKV_KERNEL=1 only to debug/
+    // benchmark the (incorrect) kernel.
+    if(src0t == GGML_TYPE_F16 && src1t == GGML_TYPE_F32 && getenv("GGML_OPENCL_KQKV_KERNEL") != nullptr){
         if (ne01 >= 64 && ne1 >= 32 && ne00 >= 16 && (ne12 % ne02) == 0  &&
             // dst is wrapped with image1d_buffer, the size limit applies, also src0
             (ne0 * ne1 * dst->ne[2] * dst->nb[0] / 4 <= backend_ctx->image_max_buffer_size)) {
@@ -18167,8 +18246,10 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                         backend_ctx->kernel_mul_mat_f16_f32_l4_x8 != nullptr) {
                         kernel = backend_ctx->kernel_mul_mat_f16_f32_l4_x8;
                         nrows = 1;
-                    } else if (can_multi_out && ne01 == 128 && r2 == 8 && r3 == 1 && mm_kqv_gqa_on &&
+                    } else if (can_multi_out && (ne01 == 128 || ne01 == 256) && r2 == 8 && r3 == 1 && mm_kqv_gqa_on &&
                         backend_ctx->kernel_mul_mat_f16_f32_l4_y8_gqa != nullptr) {
+                        // y8_gqa is DV-agnostic (emits 8 DV-rows/WG over ne01/8
+                        // WGs, streams ne00); DV=256 (Qwen3.6) works as-is.
                         kernel = backend_ctx->kernel_mul_mat_f16_f32_l4_y8_gqa;
                         nrows = 1;
                     } else if (can_multi_out &&

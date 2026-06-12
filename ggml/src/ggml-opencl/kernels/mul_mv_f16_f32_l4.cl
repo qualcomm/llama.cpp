@@ -1445,3 +1445,112 @@ kernel void kernel_mul_mat_f16_f32_l4_x8_gqa_r2_dk256_img(
         }
     }
 }
+
+// DK=256, r2=8 specialization for Qwen3.6-35B-A3B (n_head=16, n_head_kv=2,
+// head_dim=256). Image/texture-cache K reads (separate BW lane from L1, where
+// the BUFFER _x8_gqa8_dk256 lost — the +244% KQ win on the DK=128 sibling was
+// img-only). 64-lane subgroup across 8 Q-heads (8 lanes each). DK=256 = 64
+// half4/row = 32 pixels (half8 each); each of 8 lanes reads 4 pixels (p =
+// lane_q + t*8, t=0..3). Reduction masks {4,2,1} are <8 (safe on X2). Q stage:
+// 8×64=512 float4 = 8 KB local. Opt-in via GGML_OPENCL_MM_KQ_GQA_DK256_IMG=1.
+#define N_K_ROWS_GQA_R8_DK256   16
+#define GQA_RATIO_R8_DK256      8
+#define LANES_PER_QH_R8_DK256   8     // = 64 / GQA_RATIO_R8_DK256
+#define PIX_PER_LANE_R8_DK256   4     // 32 pixels / 8 lanes
+// DK_VEC_DK256 (= 64) reused from the r2=2 variant above.
+
+#ifdef ADRENO_GPU
+REQD_SUBGROUP_SIZE_64
+#endif
+kernel void kernel_mul_mat_f16_f32_l4_x8_gqa_r8_dk256_img(
+        __read_only image1d_buffer_t src0_img,
+        global char * src1,
+        ulong offset1,
+        global float * dst,
+        ulong offsetd,
+        int ne00,
+        int ne01,
+        int ne02,
+        ulong nb01,
+        ulong nb02,
+        ulong nb03,
+        int ne10,
+        int ne11,
+        int ne12,
+        ulong nb10,
+        ulong nb11,
+        ulong nb12,
+        ulong nb13,
+        int ne0,
+        int ne1,
+        int r2,
+        int r3
+) {
+    src1 = (global char *)((global char *)src1 + offset1);
+    dst  = (global float*)((global char *)dst  + offsetd);
+
+    const int sgs_lid = get_sub_group_local_id();
+    const int q_id    = sgs_lid >> 3;       // 0..7
+    const int lane_q  = sgs_lid & 7;        // 0..7
+
+    const int r0_base = get_group_id(0) * N_K_ROWS_GQA_R8_DK256;
+    const int im_kv   = get_group_id(2);
+
+    const int i02 = im_kv % ne02;
+    const int i03 = im_kv / ne02;
+
+    const int q_head_lo = i02 * GQA_RATIO_R8_DK256;
+
+    // Stage 8 Q-heads × 64 float4 = 512 float4 (8 KB). Each of 64 lanes loads
+    // exactly one float4 per Q-head (DK_VEC_DK256 == subgroup size).
+    __local float4 q_loc[GQA_RATIO_R8_DK256 * DK_VEC_DK256];
+    #pragma unroll
+    for (int qh = 0; qh < GQA_RATIO_R8_DK256; ++qh) {
+        const int qh_idx = q_head_lo + qh;
+        global float4 * y4 = (global float4 *)(src1 + qh_idx * nb12 + i03 * nb13);
+        q_loc[qh * DK_VEC_DK256 + sgs_lid] = y4[sgs_lid];
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    const int pitch_px_row  = (int)(nb01 >> 4);
+    const int pitch_px_head = (int)(nb02 >> 4);
+    const int pitch_px_n13  = (int)(nb03 >> 4);
+
+    const int head_px_base = i02 * pitch_px_head + (i03 / r3) * pitch_px_n13;
+
+    #pragma unroll
+    for (int dr = 0; dr < N_K_ROWS_GQA_R8_DK256; ++dr) {
+        const int r0 = r0_base + dr;
+        const int row_px_base = r0 * pitch_px_row + head_px_base;
+
+        // Each lane reads PIX_PER_LANE_R8_DK256=4 pixels (stride 8) covering all
+        // 32 pixels (DK=256). 1 pixel = 1 half8 = 2 half4.
+        float sumf = 0.0f;
+        #pragma unroll
+        for (int t = 0; t < PIX_PER_LANE_R8_DK256; ++t) {
+            const int p = lane_q + t * LANES_PER_QH_R8_DK256;
+            const half8 k8 = as_half8(read_imagef(src0_img, row_px_base + p));
+            const int   i0 = 2 * p;
+            const float4 qa = q_loc[q_id * DK_VEC_DK256 + i0    ];
+            const float4 qb = q_loc[q_id * DK_VEC_DK256 + i0 + 1];
+            sumf +=
+                  convert_float(k8.s0) * qa.s0
+                + convert_float(k8.s1) * qa.s1
+                + convert_float(k8.s2) * qa.s2
+                + convert_float(k8.s3) * qa.s3
+                + convert_float(k8.s4) * qb.s0
+                + convert_float(k8.s5) * qb.s1
+                + convert_float(k8.s6) * qb.s2
+                + convert_float(k8.s7) * qb.s3;
+        }
+
+        sumf += sub_group_shuffle_xor(sumf, 4);
+        sumf += sub_group_shuffle_xor(sumf, 2);
+        sumf += sub_group_shuffle_xor(sumf, 1);
+
+        if (lane_q == 0) {
+            const int im_out = i03 * ne12 + (q_head_lo + q_id);
+            dst[im_out * ne1 * ne0 + r0] = sumf;
+        }
+    }
+}
