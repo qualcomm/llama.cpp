@@ -21712,21 +21712,34 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
     cl_kernel kernel;
 
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
-    // Decode-only GQA-coalesced KQ via image1d_buffer_t (texture cache) for
-    // DK=256, r2=8 (Qwen3.6-35B-A3B). Independent of GGML_OPENCL_KQKV_KERNEL
-    // (which also enables the buggy batched-prefill KQ) — this fires ONLY at
-    // ne11==1 decode, so it is safe to enable on its own. The texture-cache K
-    // read is a separate BW lane from L1, where the buffer _x8_gqa8_dk256 lost
-    // (-9%). Default-on for the DK=256/r2=8 shape (Qwen3.6-A3B tg128 fa=0
-    // +36% @16k alone, +49% combined with the KQV coalesce below, byte-id);
-    // opt out with GGML_OPENCL_MM_KQ_GQA_DK256_IMG=0.
+    // Decode-only GQA-coalesced KQ via image1d_buffer_t (texture cache) for the
+    // r2=8 GQA shapes: DK=256 (Qwen3.6/Next) and DK=128 (Qwen3-30B-A3B). Reads
+    // K once per K-head and fans 8 Q-heads; the texture-cache K read is a
+    // separate BW lane from L1 (a plain-buffer coalesce lost -9% at DK=256).
+    // Dispatched ONLY at ne11==1 decode and INDEPENDENT of GGML_OPENCL_KQKV_KERNEL
+    // (which also enables the buggy batched-prefill KQ), so it is safe default-on.
+    // Default-on; opt out per shape with GGML_OPENCL_MM_KQ_GQA_DK256_IMG=0 /
+    // GGML_OPENCL_MM_KQ_GQA_DK128_IMG=0. Qwen3.6 tg128 fa=0 +49% @16k (with KQV);
+    // Qwen3-30B-A3B DK=128 was +244% @16k as opt-in, now default.
     if (src0t == GGML_TYPE_F16 && src1t == GGML_TYPE_F32) {
-        static const char * mm_kq_r8_dk256_img_env = getenv("GGML_OPENCL_MM_KQ_GQA_DK256_IMG");
-        static const bool mm_kq_r8_dk256_img_on = (mm_kq_r8_dk256_img_env == nullptr || mm_kq_r8_dk256_img_env[0] != '0');
-        if (mm_kq_r8_dk256_img_on &&
-            backend_ctx->kernel_mul_mat_f16_f32_l4_x8_gqa_r8_dk256_img != nullptr &&
-            ne11 == 1 && ne01 >= 64 && (ne01 % 16) == 0 && ne00 == 256 &&
+        static const char * mm_kq_dk256_env = getenv("GGML_OPENCL_MM_KQ_GQA_DK256_IMG");
+        static const bool mm_kq_dk256_on = (mm_kq_dk256_env == nullptr || mm_kq_dk256_env[0] != '0');
+        static const char * mm_kq_dk128_env = getenv("GGML_OPENCL_MM_KQ_GQA_DK128_IMG");
+        static const bool mm_kq_dk128_on = (mm_kq_dk128_env == nullptr || mm_kq_dk128_env[0] != '0');
+        // Select the decode KQ image kernel for this (DK, r2=8, r3=1) shape:
+        //   DK=256 -> Qwen3.6/Next (x8_gqa_r8_dk256_img)
+        //   DK=128 -> Qwen3-30B-A3B (x8_gqa4_img; +244% fa=0@16k, was locked
+        //             behind the buggy KQKV_KERNEL gate).
+        cl_kernel kq_img_kernel = nullptr;
+        if (ne11 == 1 && ne01 >= 64 && (ne01 % 16) == 0 &&
             (ne12 % ne02) == 0 && (ne12 / ne02) == 8 && (ne13 / ne03) == 1) {
+            if (ne00 == 256 && mm_kq_dk256_on) {
+                kq_img_kernel = backend_ctx->kernel_mul_mat_f16_f32_l4_x8_gqa_r8_dk256_img;
+            } else if (ne00 == 128 && mm_kq_dk128_on) {
+                kq_img_kernel = backend_ctx->kernel_mul_mat_f16_f32_l4_x8_gqa4_img;
+            }
+        }
+        if (kq_img_kernel != nullptr) {
             const size_t nb00_bytes = sizeof(uint16_t);
             const size_t k_bytes_span =
                 (size_t)(ne01 > 0 ? ne01 - 1 : 0) * (size_t)nb01 +
@@ -21736,7 +21749,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             const size_t k_bytes = (k_bytes_span + 15) & ~(size_t)15;
             const size_t k_pixels = k_bytes >> 4;
             if (k_pixels > 0 && k_pixels <= backend_ctx->image_max_buffer_size) {
-                cl_kernel kernel = backend_ctx->kernel_mul_mat_f16_f32_l4_x8_gqa_r8_dk256_img;
+                cl_kernel kernel = kq_img_kernel;
                 cl_mem K_img = ggml_cl_img_pool_get_or_create(
                     backend_ctx, backend_ctx->kq_img_pool,
                     extra0->data_device, offset0, k_bytes, CL_FLOAT);
@@ -22950,13 +22963,12 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     static const bool mm_kq_gqa_on = (mm_kq_gqa_env != nullptr && mm_kq_gqa_env[0] != '0');
                     // GGML_OPENCL_MM_KQV_GQA swaps _y8 for the GQA-coalesced KQV
                     // (r2=8/r3=1) that reads each V slab once per K-head and emits
-                    // all r2 Q-heads. y8_gqa is DV-agnostic. Default-on for DV=256
-                    // (Qwen3.6/Next, validated +49% combined with the DK=256 img
-                    // KQ; opt out =0); opt-in =1 for DV=128 (DK=128 sibling, not
-                    // validated as a default here).
+                    // all r2 Q-heads. y8_gqa is DV-agnostic. Default-on for the r2=8
+                    // GQA shapes DV in {128,256}, paired with the decode KQ image
+                    // above: Qwen3.6 (DV=256) +49% combined; Qwen3-30B-A3B (DV=128)
+                    // +254% combined tg@16k. Opt out with =0.
                     static const char * mm_kqv_gqa_env = getenv("GGML_OPENCL_MM_KQV_GQA");
-                    const bool mm_kqv_gqa_off  = (mm_kqv_gqa_env != nullptr && mm_kqv_gqa_env[0] == '0');
-                    const bool mm_kqv_gqa_optin = (mm_kqv_gqa_env != nullptr && mm_kqv_gqa_env[0] != '0');
+                    const bool mm_kqv_gqa_off = (mm_kqv_gqa_env != nullptr && mm_kqv_gqa_env[0] == '0');
                     if (can_multi_out && (ne01 % 16) == 0 && ne00 == 128 && r2 == 8 && r3 == 1 && mm_kq_gqa_on &&
                         backend_ctx->kernel_mul_mat_f16_f32_l4_x8_gqa4 != nullptr) {
                         kernel = backend_ctx->kernel_mul_mat_f16_f32_l4_x8_gqa4;
@@ -22970,11 +22982,11 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                         kernel = backend_ctx->kernel_mul_mat_f16_f32_l4_x8;
                         nrows = 1;
                     } else if (can_multi_out && r2 == 8 && r3 == 1 &&
-                        ((ne01 == 256 && !mm_kqv_gqa_off) || (ne01 == 128 && mm_kqv_gqa_optin)) &&
+                        (ne01 == 128 || ne01 == 256) && !mm_kqv_gqa_off &&
                         backend_ctx->kernel_mul_mat_f16_f32_l4_y8_gqa != nullptr) {
                         // y8_gqa is DV-agnostic (emits 8 DV-rows/WG over ne01/8
-                        // WGs, streams ne00); DV=256 (Qwen3.6) works as-is and is
-                        // default-on, DV=128 stays opt-in.
+                        // WGs, streams ne00); DV in {128,256} (Qwen3-30B / Qwen3.6)
+                        // both default-on, paired with the decode KQ image.
                         kernel = backend_ctx->kernel_mul_mat_f16_f32_l4_y8_gqa;
                         nrows = 1;
                     } else if (can_multi_out &&
