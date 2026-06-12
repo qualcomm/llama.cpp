@@ -1549,3 +1549,114 @@ kernel void kernel_mul_mat_f16_f32_l4_x8_gqa_r8_dk256_img(
         }
     }
 }
+
+// DK=512, r2=8 specialization for the Gemma-4 GLOBAL-attention layers
+// (gemma-4-26B-A4B: n_head=16, n_head_kv=2 on the 1-in-6 full-attention layers,
+// head_dim 512). These are the only layers whose K grows with context (the 5/6
+// sliding-window layers are DK=256 capped at the window), so they dominate the
+// decode depth slope (26B tg64 21.5->15.0 @4k->16k). Same texture-cache image
+// coalesce as _r8_dk256: 64-lane subgroup across 8 Q-heads (8 lanes each), DK=512
+// = 128 half4/row = 64 pixels (half8 each); each of 8 lanes reads 8 pixels
+// (p = lane_q + t*8, t=0..7). Q stage: 8x128 float4 = 16 KB local (2 float4/lane).
+// Reduction masks {4,2,1} are <8 (safe on X2).
+#define N_K_ROWS_GQA_R8_DK512   16
+#define GQA_RATIO_R8_DK512      8
+#define LANES_PER_QH_R8_DK512   8     // = 64 / GQA_RATIO_R8_DK512
+#define PIX_PER_LANE_R8_DK512   8     // 64 pixels / 8 lanes
+#define DK_VEC_DK512            128   // DK / 4 for DK=512
+
+#ifdef ADRENO_GPU
+REQD_SUBGROUP_SIZE_64
+#endif
+kernel void kernel_mul_mat_f16_f32_l4_x8_gqa_r8_dk512_img(
+        __read_only image1d_buffer_t src0_img,
+        global char * src1,
+        ulong offset1,
+        global float * dst,
+        ulong offsetd,
+        int ne00,
+        int ne01,
+        int ne02,
+        ulong nb01,
+        ulong nb02,
+        ulong nb03,
+        int ne10,
+        int ne11,
+        int ne12,
+        ulong nb10,
+        ulong nb11,
+        ulong nb12,
+        ulong nb13,
+        int ne0,
+        int ne1,
+        int r2,
+        int r3
+) {
+    src1 = (global char *)((global char *)src1 + offset1);
+    dst  = (global float*)((global char *)dst  + offsetd);
+
+    const int sgs_lid = get_sub_group_local_id();
+    const int q_id    = sgs_lid >> 3;       // 0..7
+    const int lane_q  = sgs_lid & 7;        // 0..7
+
+    const int r0_base = get_group_id(0) * N_K_ROWS_GQA_R8_DK512;
+    const int im_kv   = get_group_id(2);
+
+    const int i02 = im_kv % ne02;
+    const int i03 = im_kv / ne02;
+
+    const int q_head_lo = i02 * GQA_RATIO_R8_DK512;
+
+    // Stage 8 Q-heads x 128 float4 = 1024 float4 (16 KB). DK_VEC=128 > subgroup
+    // (64), so each lane loads 2 float4 per Q-head (sgs_lid and sgs_lid+64).
+    __local float4 q_loc[GQA_RATIO_R8_DK512 * DK_VEC_DK512];
+    #pragma unroll
+    for (int qh = 0; qh < GQA_RATIO_R8_DK512; ++qh) {
+        const int qh_idx = q_head_lo + qh;
+        global float4 * y4 = (global float4 *)(src1 + qh_idx * nb12 + i03 * nb13);
+        q_loc[qh * DK_VEC_DK512 + sgs_lid]      = y4[sgs_lid];
+        q_loc[qh * DK_VEC_DK512 + sgs_lid + 64] = y4[sgs_lid + 64];
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    const int pitch_px_row  = (int)(nb01 >> 4);
+    const int pitch_px_head = (int)(nb02 >> 4);
+    const int pitch_px_n13  = (int)(nb03 >> 4);
+
+    const int head_px_base = i02 * pitch_px_head + (i03 / r3) * pitch_px_n13;
+
+    #pragma unroll
+    for (int dr = 0; dr < N_K_ROWS_GQA_R8_DK512; ++dr) {
+        const int r0 = r0_base + dr;
+        const int row_px_base = r0 * pitch_px_row + head_px_base;
+
+        // Each lane reads 8 pixels (stride 8) covering all 64 pixels (DK=512).
+        float sumf = 0.0f;
+        #pragma unroll
+        for (int t = 0; t < PIX_PER_LANE_R8_DK512; ++t) {
+            const int p = lane_q + t * LANES_PER_QH_R8_DK512;
+            const half8 k8 = as_half8(read_imagef(src0_img, row_px_base + p));
+            const int   i0 = 2 * p;
+            const float4 qa = q_loc[q_id * DK_VEC_DK512 + i0    ];
+            const float4 qb = q_loc[q_id * DK_VEC_DK512 + i0 + 1];
+            sumf +=
+                  convert_float(k8.s0) * qa.s0
+                + convert_float(k8.s1) * qa.s1
+                + convert_float(k8.s2) * qa.s2
+                + convert_float(k8.s3) * qa.s3
+                + convert_float(k8.s4) * qb.s0
+                + convert_float(k8.s5) * qb.s1
+                + convert_float(k8.s6) * qb.s2
+                + convert_float(k8.s7) * qb.s3;
+        }
+
+        sumf += sub_group_shuffle_xor(sumf, 4);
+        sumf += sub_group_shuffle_xor(sumf, 2);
+        sumf += sub_group_shuffle_xor(sumf, 1);
+
+        if (lane_q == 0) {
+            const int im_out = i03 * ne12 + (q_head_lo + q_id);
+            dst[im_out * ne1 * ne0 + r0] = sumf;
+        }
+    }
+}
