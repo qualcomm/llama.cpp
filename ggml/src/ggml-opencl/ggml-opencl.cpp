@@ -15575,12 +15575,14 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
         size_t global_work_size_t[2] = { (size_t)width_B, (size_t)padded_height_B };
         backend_ctx->enqueue_ndrange_kernel(kernel, 2, global_work_size_t, local_work_size_t, dst);
 
-        // dp4a (int8) dense prefill GEMM (opt-in while validating). Quantizes the
-        // original [N,K] activations to q8_1 and runs the int8 dp4a GEMM instead
-        // of the f16 half-dot kernel (the transpose output is unused here).
-        // Large-batch (prefill) only; ne1<=8 keeps the cok/f16 small-batch path.
+        // dp4a (int8) dense prefill GEMM. Quantizes the original [N,K] activations
+        // to q8_1 and runs the int8 dp4a GEMM instead of the f16 half-dot kernel
+        // (the transpose output is unused here). Large-batch (prefill) only; ne1<=8
+        // keeps the cok/f16 small-batch path. DEFAULT ON; opt out with
+        // GGML_OPENCL_Q4K_DENSE_DP4A=0. Greedy byte-identical across Qwen3-30B/3.5-
+        // 35B/3.6-35B-A3B, Granite-a800m, Qwen3-8B; +0.5..15% prefill, no regressions.
         static const char * q4k_dense_dp4a_env = getenv("GGML_OPENCL_Q4K_DENSE_DP4A");
-        static const bool   q4k_dense_dp4a_on  = (q4k_dense_dp4a_env != nullptr) && (atoi(q4k_dense_dp4a_env) != 0);
+        static const bool   q4k_dense_dp4a_on  = (q4k_dense_dp4a_env == nullptr) || (atoi(q4k_dense_dp4a_env) != 0);
         if (q4k_dense_dp4a_on && N > 8 && (K % 32 == 0) && (M % 64 == 0)) {
             const size_t n_blocks = (size_t)N * (K / 32);
             backend_ctx->prealloc_moe_qa.allocate(context, (size_t)N * K * sizeof(cl_char));
@@ -19515,11 +19517,13 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     cl_mem buf_src1_reordered = nullptr, image_src1_reordered = nullptr;
                     cl_mem buf_src2, buf_src2_emap;
 
-                    // dp4a (int8) q6_K MoE prefill GEMM variant (opt-in): fused
-                    // reorder+q8_1 quant + the int8 dp4a GEMM, in place of the f32
-                    // reorder + half-dot kernel. Opt-in GGML_OPENCL_Q6K_MOE_DP4A=1.
+                    // dp4a (int8) q6_K MoE prefill GEMM variant: fused reorder+q8_1
+                    // quant + the int8 dp4a GEMM, in place of the f32 reorder +
+                    // half-dot kernel. DEFAULT ON; opt out with GGML_OPENCL_Q6K_MOE
+                    // _DP4A=0. Greedy byte-identical across the q4_K-MoE model sweep
+                    // (Qwen3-30B/3.5-35B/3.6-35B-A3B, Granite-a800m); +6.6% Qwen3-30B.
                     static const char * q6k_moe_dp4a_env = getenv("GGML_OPENCL_Q6K_MOE_DP4A");
-                    static const bool   use_q6k_dp4a = (q6k_moe_dp4a_env != nullptr) && (atoi(q6k_moe_dp4a_env) != 0);
+                    static const bool   use_q6k_dp4a = (q6k_moe_dp4a_env == nullptr) || (atoi(q6k_moe_dp4a_env) != 0);
 
                     cl_buffer_region region;
                     region.origin = 0;
