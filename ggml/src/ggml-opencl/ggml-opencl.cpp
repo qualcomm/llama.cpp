@@ -19365,8 +19365,9 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
     // drafts + 1 bonus) onto the efficient GEMV path (subgroup-broadcast, no
     // transpose) instead of the transposed-GEMM dead-zone. Reuses the ne1==1
     // GEMV setup (the activation image is already sized by N=ne1). Byte-
-    // identical. Opt-in via GGML_OPENCL_Q4K_MC3=1 while validating.
-    static const bool q4k_mc3 = (getenv("GGML_OPENCL_Q4K_MC3") != nullptr);
+    // identical (per-layer only). DEFAULT-ON; opt out with GGML_OPENCL_Q4K_MC3=0.
+    static const char * q4k_mc3_env = getenv("GGML_OPENCL_Q4K_MC3");
+    static const bool q4k_mc3 = (q4k_mc3_env == nullptr) || (atoi(q4k_mc3_env) != 0);
     // Per-layer only (ne01 < 32768): the batched large-vocab lm_head at ne1==3
     // is left to the existing routing (corrupts on the Adreno GEMV path; x2-
     // unified routes batched Q6_K lm_head to CPU). Per-layer mc3 is byte-identical.
@@ -19802,8 +19803,9 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
     // Multi-column verify GEMV: route the spec/MTP verify q6_K matmuls (ne1==3)
     // onto the efficient GEMV path instead of the transposed-GEMM dead-zone.
     // Reuses the ne1==1 image setup (activation image sized by N=ne1). Byte-
-    // identical. Opt-in via GGML_OPENCL_Q6K_MC3=1 while validating.
-    static const bool q6k_mc3 = (getenv("GGML_OPENCL_Q6K_MC3") != nullptr);
+    // identical. DEFAULT-ON; opt out with GGML_OPENCL_Q6K_MC3=0.
+    static const char * q6k_mc3_env = getenv("GGML_OPENCL_Q6K_MC3");
+    static const bool q6k_mc3 = (q6k_mc3_env == nullptr) || (atoi(q6k_mc3_env) != 0);
     // Per-layer only (ne01 < 32768): batched large-vocab lm_head stays on the
     // existing path (x2-unified routes batched Q6_K lm_head to CPU; the Adreno
     // GEMV corrupts it). Per-layer mc3 is byte-identical.
