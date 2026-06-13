@@ -308,7 +308,8 @@ kernel void kernel_gemv_noshuffle_q6_K_f32_mc3(
     global float * dst,
     ulong offsetd,
     int ne00,
-    int ne01
+    int ne01,
+    int n_cols   // verify columns (2..4); weights streamed once, reused per col
 ) {
     int grp  = get_local_id(1);
     int gid  = get_global_id(0);
@@ -325,7 +326,7 @@ kernel void kernel_gemv_noshuffle_q6_K_f32_mc3(
     char4   reg_s;
     float8  reg_b;
 
-    float2  ts0 = 0.0f, ts1 = 0.0f, ts2 = 0.0f;
+    float2  ts0 = 0.0f, ts1 = 0.0f, ts2 = 0.0f, ts3 = 0.0f;
 
     for (int k = grp; k < nb; k += NSUBGROUPS) {
         reg_d = src0_d[gid + k/8 * line_stride_a];
@@ -361,10 +362,16 @@ kernel void kernel_gemv_noshuffle_q6_K_f32_mc3(
                           reg_b.s4567 = read_imagef(src1, 1*COL_STRIDE + 1 + slid*2 + k*8); }
           dequantize_block_acc_bcast_8_hi(ts1, as_ushort8(ql_hi), as_uchar8(qh_hi), reg_d, reg_s, reg_b);
           dequantize_block_acc_bcast_8_lo(ts1, as_ushort8(ql_lo), as_uchar8(qh_lo), reg_d, reg_s, reg_b); }
+        if (n_cols > 2)
         { if (slid < 4) { reg_b.s0123 = read_imagef(src1, 2*COL_STRIDE + 0 + slid*2 + k*8);
                           reg_b.s4567 = read_imagef(src1, 2*COL_STRIDE + 1 + slid*2 + k*8); }
           dequantize_block_acc_bcast_8_hi(ts2, as_ushort8(ql_hi), as_uchar8(qh_hi), reg_d, reg_s, reg_b);
           dequantize_block_acc_bcast_8_lo(ts2, as_ushort8(ql_lo), as_uchar8(qh_lo), reg_d, reg_s, reg_b); }
+        if (n_cols > 3)
+        { if (slid < 4) { reg_b.s0123 = read_imagef(src1, 3*COL_STRIDE + 0 + slid*2 + k*8);
+                          reg_b.s4567 = read_imagef(src1, 3*COL_STRIDE + 1 + slid*2 + k*8); }
+          dequantize_block_acc_bcast_8_hi(ts3, as_ushort8(ql_hi), as_uchar8(qh_hi), reg_d, reg_s, reg_b);
+          dequantize_block_acc_bcast_8_lo(ts3, as_ushort8(ql_lo), as_uchar8(qh_lo), reg_d, reg_s, reg_b); }
 #else
         { if (slid < 4) { reg_b.s0123 = read_imagef(src1, 0*COL_STRIDE + 0 + slid*2 + k*8);
                           reg_b.s4567 = read_imagef(src1, 0*COL_STRIDE + 1 + slid*2 + k*8); }
@@ -374,15 +381,21 @@ kernel void kernel_gemv_noshuffle_q6_K_f32_mc3(
                           reg_b.s4567 = read_imagef(src1, 1*COL_STRIDE + 1 + slid*2 + k*8); }
           dequantize_block_acc_bcast_1_hi(ts1, as_ushort8(ql_hi), as_uchar8(qh_hi), reg_d, reg_s, reg_b);
           dequantize_block_acc_bcast_1_lo(ts1, as_ushort8(ql_lo), as_uchar8(qh_lo), reg_d, reg_s, reg_b); }
+        if (n_cols > 2)
         { if (slid < 4) { reg_b.s0123 = read_imagef(src1, 2*COL_STRIDE + 0 + slid*2 + k*8);
                           reg_b.s4567 = read_imagef(src1, 2*COL_STRIDE + 1 + slid*2 + k*8); }
           dequantize_block_acc_bcast_1_hi(ts2, as_ushort8(ql_hi), as_uchar8(qh_hi), reg_d, reg_s, reg_b);
           dequantize_block_acc_bcast_1_lo(ts2, as_ushort8(ql_lo), as_uchar8(qh_lo), reg_d, reg_s, reg_b); }
+        if (n_cols > 3)
+        { if (slid < 4) { reg_b.s0123 = read_imagef(src1, 3*COL_STRIDE + 0 + slid*2 + k*8);
+                          reg_b.s4567 = read_imagef(src1, 3*COL_STRIDE + 1 + slid*2 + k*8); }
+          dequantize_block_acc_bcast_1_hi(ts3, as_ushort8(ql_hi), as_uchar8(qh_hi), reg_d, reg_s, reg_b);
+          dequantize_block_acc_bcast_1_lo(ts3, as_ushort8(ql_lo), as_uchar8(qh_lo), reg_d, reg_s, reg_b); }
 #endif
     }
 
     local float8 reduce_lm[SUBGROUP_SIZE * 3];
-    float8 acc = (float8)(ts0.s0, ts0.s1, ts1.s0, ts1.s1, ts2.s0, ts2.s1, 0.0f, 0.0f);
+    float8 acc = (float8)(ts0.s0, ts0.s1, ts1.s0, ts1.s1, ts2.s0, ts2.s1, ts3.s0, ts3.s1);
     if (grp == 1) { reduce_lm[SUBGROUP_SIZE*0 + slid] = acc; }
     if (grp == 2) { reduce_lm[SUBGROUP_SIZE*1 + slid] = acc; }
     if (grp == 3) { reduce_lm[SUBGROUP_SIZE*2 + slid] = acc; }
@@ -397,6 +410,7 @@ kernel void kernel_gemv_noshuffle_q6_K_f32_mc3(
         // dst column-major [ne01 rows x 3 cols]: (row, col) at col*ne01 + row
         vstore2((float2)(acc.s0, acc.s1), 0, &(dst[0*ne01 + gid*2]));
         vstore2((float2)(acc.s2, acc.s3), 0, &(dst[1*ne01 + gid*2]));
-        vstore2((float2)(acc.s4, acc.s5), 0, &(dst[2*ne01 + gid*2]));
+        if (n_cols > 2) vstore2((float2)(acc.s4, acc.s5), 0, &(dst[2*ne01 + gid*2]));
+        if (n_cols > 3) vstore2((float2)(acc.s6, acc.s7), 0, &(dst[3*ne01 + gid*2]));
     }
 }
