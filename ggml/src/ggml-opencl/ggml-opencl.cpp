@@ -25619,7 +25619,17 @@ static void ggml_cl_cpy(ggml_backend_t backend, const ggml_tensor * src0, const 
 
         backend_ctx->enqueue_ndrange_kernel(kernel, 1, global_work_size, local_work_size, src1);
     } else {
-        const int nth = MIN(64, ne00);
+        // Default: one workgroup per (i01,i02,i03) row, nth lanes split ne00.
+        // For "tall-thin" copies — huge ne00, very few rows — this launches
+        // only nrows*64 work-items (e.g. the GDN/SSM state snapshot cache_s at
+        // MTP verify is 524288x1x3 => 3 WGs x 64 lanes, ~5 GB/s). Widen the
+        // per-row lane count to a full (barrier-free) workgroup so the row's
+        // ne00 is split across up to max_workgroup_size lanes.
+        const int nrows = ne01*ne02*ne03;
+        int nth = MIN(64, ne00);
+        if (nrows <= 8 && ne00 >= 4096) {
+            nth = (int)MIN((size_t)ne00, backend_ctx->max_workgroup_size);
+        }
 
         size_t global_work_size[] = {(size_t)ne01*nth, (size_t)ne02, (size_t)ne03};
         size_t local_work_size[] = {(size_t)nth, 1, 1};
