@@ -124,6 +124,8 @@ set(GGML_OPENCL_KERNELS
     gemm_moe_q4_k_f32_ns
     gemm_moe_q4_k_q8_1_dp4a
     moe_reorder_quant_a_q8_1
+    gemm_noshuffle_q4_k_q8_1_dp4a
+    quant_a_q8_1
     gemv_moe_q4_k_f32_ns
     gemm_moe_q5_k_f32_ns
     gemv_moe_q5_k_f32_ns
