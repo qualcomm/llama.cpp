@@ -18992,11 +18992,13 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     cl_mem buf_src1_reordered = nullptr, image_src1_reordered = nullptr;
                     cl_mem buf_src2, buf_src2_emap;
 
-                    // dp4a (int8) prefill GEMM variant (opt-in while validating):
-                    // fused reorder+q8_1 quant of activations, then the int8 dp4a
-                    // inner-loop GEMM, in place of the f32 reorder + half-dot kernel.
+                    // dp4a (int8) prefill GEMM variant: fused reorder+q8_1 quant of
+                    // activations, then the int8 dp4a inner-loop GEMM, in place of the
+                    // f32 reorder + half-dot kernel. DEFAULT ON; opt out with
+                    // GGML_OPENCL_Q4K_MOE_DP4A=0. Validated PPL-neutral + 18-31% prefill
+                    // on Qwen3-30B / 3.5-35B / 3.6-35B-A3B and Granite-3.0-3b-a800m.
                     static const char * q4k_moe_dp4a_env = getenv("GGML_OPENCL_Q4K_MOE_DP4A");
-                    static const bool   use_moe_dp4a = (q4k_moe_dp4a_env != nullptr) && (atoi(q4k_moe_dp4a_env) != 0);
+                    static const bool   use_moe_dp4a = (q4k_moe_dp4a_env == nullptr) || (atoi(q4k_moe_dp4a_env) != 0);
 
                     cl_buffer_region region;
                     region.origin = 0;
