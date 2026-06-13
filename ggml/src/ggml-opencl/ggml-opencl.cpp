@@ -1156,6 +1156,8 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemma4_perlayer_block;        // per-layer-block megakernel (grid barrier), q4_K weights
     cl_kernel kernel_gemma4_perlayer_block_f32;    // same, f32 weights (E4B per-layer)
     cl_kernel kernel_gemm_noshuffle_q4_k_f32;
+    cl_kernel kernel_gemm_noshuffle_q4_k_q8_1_dp4a;  // dp4a (int8) dense prefill GEMM
+    cl_kernel kernel_quant_a_q8_1;                    // plain activation q8_1 pre-pass
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_r1;
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_kimg;
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok;
@@ -3882,6 +3884,36 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_k_f32_r1 = clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_f32_r1", &err), err));
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_k_f32_kimg = clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_f32_kimg", &err), err));
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok = clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_f32_cok", &err), err));
+        CL_CHECK(clReleaseProgram(prog));
+        GGML_LOG_CONT(".");
+    }
+
+    // gemm_noshuffle_q4_k_q8_1_dp4a (dp4a dense prefill GEMM)
+    {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src {
+            #include "gemm_noshuffle_q4_k_q8_1_dp4a.cl.h"
+        };
+#else
+        const std::string kernel_src = read_file("gemm_noshuffle_q4_k_q8_1_dp4a.cl");
+#endif
+        cl_program prog = build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
+        CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a = clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_q8_1_dp4a", &err), err));
+        CL_CHECK(clReleaseProgram(prog));
+        GGML_LOG_CONT(".");
+    }
+
+    // quant_a_q8_1 (plain activation q8_1 pre-pass for the dense dp4a GEMM)
+    {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src {
+            #include "quant_a_q8_1.cl.h"
+        };
+#else
+        const std::string kernel_src = read_file("quant_a_q8_1.cl");
+#endif
+        cl_program prog = build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
+        CL_CHECK((backend_ctx->kernel_quant_a_q8_1 = clCreateKernel(prog, "kernel_quant_a_q8_1", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
@@ -19532,6 +19564,57 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
         size_t local_work_size_t[2] = { 1, 16 };
         size_t global_work_size_t[2] = { (size_t)width_B, (size_t)padded_height_B };
         backend_ctx->enqueue_ndrange_kernel(kernel, 2, global_work_size_t, local_work_size_t, dst);
+
+        // dp4a (int8) dense prefill GEMM (opt-in while validating). Quantizes the
+        // original [N,K] activations to q8_1 and runs the int8 dp4a GEMM instead
+        // of the f16 half-dot kernel (the transpose output is unused here).
+        // Large-batch (prefill) only; ne1<=8 keeps the cok/f16 small-batch path.
+        static const char * q4k_dense_dp4a_env = getenv("GGML_OPENCL_Q4K_DENSE_DP4A");
+        static const bool   q4k_dense_dp4a_on  = (q4k_dense_dp4a_env != nullptr) && (atoi(q4k_dense_dp4a_env) != 0);
+        if (q4k_dense_dp4a_on && N > 8 && (K % 32 == 0) && (M % 64 == 0)) {
+            const size_t n_blocks = (size_t)N * (K / 32);
+            backend_ctx->prealloc_moe_qa.allocate(context, (size_t)N * K * sizeof(cl_char));
+            backend_ctx->prealloc_moe_da.allocate(context, n_blocks * sizeof(cl_half));
+            backend_ctx->prealloc_moe_sa.allocate(context, n_blocks * sizeof(cl_half));
+
+            cl_int tb = (cl_int)n_blocks;
+            cl_kernel qk = backend_ctx->kernel_quant_a_q8_1;
+            CL_CHECK(clSetKernelArg(qk, 0, sizeof(cl_mem), &b_sub_buf));
+            CL_CHECK(clSetKernelArg(qk, 1, sizeof(cl_mem), &backend_ctx->prealloc_moe_qa.buffer));
+            CL_CHECK(clSetKernelArg(qk, 2, sizeof(cl_mem), &backend_ctx->prealloc_moe_da.buffer));
+            CL_CHECK(clSetKernelArg(qk, 3, sizeof(cl_mem), &backend_ctx->prealloc_moe_sa.buffer));
+            CL_CHECK(clSetKernelArg(qk, 4, sizeof(cl_int), &tb));
+            size_t q_local[1]  = { 64 };
+            size_t q_global[1] = { (size_t)(((n_blocks + 63) / 64) * 64) };
+            backend_ctx->enqueue_ndrange_kernel(qk, 1, q_global, q_local, dst);
+
+            cl_kernel dk = backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a;
+            int ai = 0;
+            CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_mem),   &extra0_q4_k->q));
+            CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_mem),   &extra0_q4_k->s));
+            CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_mem),   &extra0_q4_k->d));
+            CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_mem),   &extra0_q4_k->dm));
+            CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_mem),   &backend_ctx->prealloc_moe_qa.buffer));
+            CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_mem),   &backend_ctx->prealloc_moe_da.buffer));
+            CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_mem),   &backend_ctx->prealloc_moe_sa.buffer));
+            CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_mem),   &extrad->data_device));
+            CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_ulong), &offsetd));
+            CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_int),   &M));
+            CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_int),   &N));
+            CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_int),   &K));
+            CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_uchar), &mask_d6));
+            CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_uchar), &mask_d4));
+            CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_uchar), &mask_hi2));
+            size_t d_local[3]  = { 64, 1, 1 };
+            size_t d_global[3] = { 64, (size_t)(M / 64), (size_t)CEIL_DIV(N, 32) };
+            backend_ctx->enqueue_ndrange_kernel(dk, 3, d_global, d_local, dst);
+
+            CL_CHECK(clReleaseMemObject(b_sub_buf));
+            CL_CHECK(clReleaseMemObject(b_sub_buf_trans));
+            CL_CHECK(clReleaseMemObject(b_img));
+            CL_CHECK(clReleaseMemObject(b_img_trans));
+            return;
+        }
 
         // gemm
         // Small-batch (medium n_q) occupancy fix: at ne1<=8 the 2x8 grid is
