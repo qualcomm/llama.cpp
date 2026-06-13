@@ -539,7 +539,8 @@ kernel void kernel_gemv_noshuffle_q4_k_f32_mc3(
         int ne01,
         uchar mask_d6,
         uchar mask_d4,
-        uchar mask_hi2)
+        uchar mask_hi2,
+        int n_cols)   // verify columns (2..4); weights streamed once, reused per col
 {
     uint groupId = get_local_id(1);
     uint gid     = get_global_id(0);
@@ -560,6 +561,7 @@ kernel void kernel_gemv_noshuffle_q4_k_f32_mc3(
     private float2 ts0 = (float2)(0.0f);
     private float2 ts1 = (float2)(0.0f);
     private float2 ts2 = (float2)(0.0f);
+    private float2 ts3 = (float2)(0.0f);
 
 #ifdef Q4K_MC3_DEQUANT_LDS
     // One 16-half2 block buffer per WI (reused hi->lo): forces the dequantized
@@ -652,10 +654,16 @@ kernel void kernel_gemv_noshuffle_q4_k_f32_mc3(
                           regB.s4567 = read_imagef(src1, 1*COL_STRIDE + 1 + slid*2 + k*8); }
           dequantizeBlockAccum_ns_sgbroadcast_8_hi(ts1, as_ushort8(regA_hi), regS, regM, regB);
           dequantizeBlockAccum_ns_sgbroadcast_8_lo(ts1, as_ushort8(regA_lo), regS, regM, regB); }
+        if (n_cols > 2)
         { if (slid < 4) { regB.s0123 = read_imagef(src1, 2*COL_STRIDE     + slid*2 + k*8);
                           regB.s4567 = read_imagef(src1, 2*COL_STRIDE + 1 + slid*2 + k*8); }
           dequantizeBlockAccum_ns_sgbroadcast_8_hi(ts2, as_ushort8(regA_hi), regS, regM, regB);
           dequantizeBlockAccum_ns_sgbroadcast_8_lo(ts2, as_ushort8(regA_lo), regS, regM, regB); }
+        if (n_cols > 3)
+        { if (slid < 4) { regB.s0123 = read_imagef(src1, 3*COL_STRIDE     + slid*2 + k*8);
+                          regB.s4567 = read_imagef(src1, 3*COL_STRIDE + 1 + slid*2 + k*8); }
+          dequantizeBlockAccum_ns_sgbroadcast_8_hi(ts3, as_ushort8(regA_hi), regS, regM, regB);
+          dequantizeBlockAccum_ns_sgbroadcast_8_lo(ts3, as_ushort8(regA_lo), regS, regM, regB); }
 #else
         { if (slid < 4) { regB.s0123 = read_imagef(src1, 0*COL_STRIDE     + slid*2 + k*8);
                           regB.s4567 = read_imagef(src1, 0*COL_STRIDE + 1 + slid*2 + k*8); }
@@ -665,17 +673,23 @@ kernel void kernel_gemv_noshuffle_q4_k_f32_mc3(
                           regB.s4567 = read_imagef(src1, 1*COL_STRIDE + 1 + slid*2 + k*8); }
           dequantizeBlockAccum_ns_sgbroadcast_1_hi(ts1, as_ushort8(regA_hi), regS, regM, regB);
           dequantizeBlockAccum_ns_sgbroadcast_1_lo(ts1, as_ushort8(regA_lo), regS, regM, regB); }
+        if (n_cols > 2)
         { if (slid < 4) { regB.s0123 = read_imagef(src1, 2*COL_STRIDE     + slid*2 + k*8);
                           regB.s4567 = read_imagef(src1, 2*COL_STRIDE + 1 + slid*2 + k*8); }
           dequantizeBlockAccum_ns_sgbroadcast_1_hi(ts2, as_ushort8(regA_hi), regS, regM, regB);
           dequantizeBlockAccum_ns_sgbroadcast_1_lo(ts2, as_ushort8(regA_lo), regS, regM, regB); }
+        if (n_cols > 3)
+        { if (slid < 4) { regB.s0123 = read_imagef(src1, 3*COL_STRIDE     + slid*2 + k*8);
+                          regB.s4567 = read_imagef(src1, 3*COL_STRIDE + 1 + slid*2 + k*8); }
+          dequantizeBlockAccum_ns_sgbroadcast_1_hi(ts3, as_ushort8(regA_hi), regS, regM, regB);
+          dequantizeBlockAccum_ns_sgbroadcast_1_lo(ts3, as_ushort8(regA_lo), regS, regM, regB); }
 #endif
 #endif // Q4K_MC3_DEQUANT_ONCE
     }
 
-    // cross-subgroup reduce: pack the 3 columns' float2 into a float8 (6 used).
+    // cross-subgroup reduce: pack the up-to-4 columns' float2 into a float8.
     local float8 reduceLM[SUBGROUP_SIZE * 3];
-    float8 acc = (float8)(ts0.s0, ts0.s1, ts1.s0, ts1.s1, ts2.s0, ts2.s1, 0.0f, 0.0f);
+    float8 acc = (float8)(ts0.s0, ts0.s1, ts1.s0, ts1.s1, ts2.s0, ts2.s1, ts3.s0, ts3.s1);
     if (groupId == 1) { reduceLM[SUBGROUP_SIZE * 0 + slid] = acc; }
     if (groupId == 2) { reduceLM[SUBGROUP_SIZE * 1 + slid] = acc; }
     if (groupId == 3) { reduceLM[SUBGROUP_SIZE * 2 + slid] = acc; }
@@ -687,10 +701,11 @@ kernel void kernel_gemv_noshuffle_q4_k_f32_mc3(
         acc += reduceLM[SUBGROUP_SIZE * 1 + slid];
         acc += reduceLM[SUBGROUP_SIZE * 2 + slid];
         dst = (global float*)((global char*)dst + offsetd);
-        // dst is column-major [M rows x 3 cols]: (row, col) at col*M + row
+        // dst is column-major [M rows x n_cols cols]: (row, col) at col*M + row
         vstore2((float2)(acc.s0, acc.s1), 0, &(dst[0 * M + gid * 2]));
         vstore2((float2)(acc.s2, acc.s3), 0, &(dst[1 * M + gid * 2]));
-        vstore2((float2)(acc.s4, acc.s5), 0, &(dst[2 * M + gid * 2]));
+        if (n_cols > 2) vstore2((float2)(acc.s4, acc.s5), 0, &(dst[2 * M + gid * 2]));
+        if (n_cols > 3) vstore2((float2)(acc.s6, acc.s7), 0, &(dst[3 * M + gid * 2]));
     }
 }
 

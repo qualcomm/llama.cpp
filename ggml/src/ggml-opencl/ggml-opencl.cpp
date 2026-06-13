@@ -20319,7 +20319,7 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
     // Per-layer only (ne01 < 32768): the batched large-vocab lm_head at ne1==3
     // is left to the existing routing (corrupts on the Adreno GEMV path; x2-
     // unified routes batched Q6_K lm_head to CPU). Per-layer mc3 is byte-identical.
-    const bool use_mc3 = q4k_mc3 && (ne1 == 3) && (ne01 < 32768);
+    const bool use_mc3 = q4k_mc3 && (ne1 >= 2 && ne1 <= 4) && (ne01 < 32768);
 
     if (ne1 == 1 || use_mc3) {
         cl_mem q_img = nullptr;
@@ -20455,6 +20455,10 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
             CL_CHECK(clSetKernelArg(kernel, 9, sizeof(cl_uchar), &mask_d6));
             CL_CHECK(clSetKernelArg(kernel, 10, sizeof(cl_uchar), &mask_d4));
             CL_CHECK(clSetKernelArg(kernel, 11, sizeof(cl_uchar), &mask_hi2));
+            if (use_mc3) {
+                const cl_int n_cols = ne1;   // 2..4 verify columns
+                CL_CHECK(clSetKernelArg(kernel, 12, sizeof(cl_int), &n_cols));
+            }
         }
 
         // Wide K-split for the decode GEMV: the default 4-subgroup K-split leaves
@@ -20800,7 +20804,7 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
     // Per-layer only (ne01 < 32768): batched large-vocab lm_head stays on the
     // existing path (x2-unified routes batched Q6_K lm_head to CPU; the Adreno
     // GEMV corrupts it). Per-layer mc3 is byte-identical.
-    const bool use_q6k_mc3 = q6k_mc3 && (ne1 == 3) && (ne01 < 32768);
+    const bool use_q6k_mc3 = q6k_mc3 && (ne1 >= 2 && ne1 <= 4) && (ne01 < 32768);
     // Batched verify lm_head/embed (ne1 in [2..4], tiled layout): multi-column
     // tiled GEMV — streams the large lm_head weight once across the verify columns
     // (the #1 MTP bottleneck; mc3 above can't, it reads the noshuffle layout).
@@ -20888,8 +20892,8 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
         CL_CHECK(clSetKernelArg(kernel, 6, sizeof(cl_ulong), &offsetd));
         CL_CHECK(clSetKernelArg(kernel, 7, sizeof(cl_int),   &ne00));
         CL_CHECK(clSetKernelArg(kernel, 8, sizeof(cl_int),   &ne01));
-        if (use_q6k_tiled_mc) {
-            // tiled_mc3 takes the verify column count (2..4) as an extra arg.
+        if (use_q6k_tiled_mc || use_q6k_mc3) {
+            // mc3 / tiled_mc3 take the verify column count (2..4) as an extra arg.
             CL_CHECK(clSetKernelArg(kernel, 9, sizeof(cl_int), &ne1));
         }
 
