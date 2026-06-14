@@ -889,6 +889,8 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mat_q4_0_f32_gqa_r4_dk128_img = nullptr;
     cl_kernel kernel_mul_mat_q4_0_f32_gqa8_dk256 = nullptr;
     cl_kernel kernel_mul_mat_q4_0_f32_gqa8_dk256_img = nullptr;
+    cl_kernel kernel_mul_mat_q4_0_f32_gqa_r4_dk256 = nullptr;
+    cl_kernel kernel_mul_mat_q4_0_f32_gqa_r4_dk256_img = nullptr;
     cl_kernel kernel_convert_block_q4_0, kernel_restore_block_q4_0;
     cl_kernel kernel_convert_block_q4_0_trans4_ns, kernel_restore_block_q4_0_trans4_ns;
     cl_kernel kernel_convert_block_q4_1, kernel_restore_block_q4_1;
@@ -950,6 +952,8 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mat_q8_0_f32_gqa_r4_dk128_img = nullptr;
     cl_kernel kernel_mul_mat_q8_0_f32_gqa8_dk256 = nullptr;
     cl_kernel kernel_mul_mat_q8_0_f32_gqa8_dk256_img = nullptr;
+    cl_kernel kernel_mul_mat_q8_0_f32_gqa_r4_dk256 = nullptr;
+    cl_kernel kernel_mul_mat_q8_0_f32_gqa_r4_dk256_img = nullptr;
     cl_kernel kernel_mul_mv_iq4_nl_f32;
     cl_kernel kernel_mul_mv_iq4_nl_f32_flat;
     cl_kernel kernel_solve_tri_f32;
@@ -1841,6 +1845,15 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         backend_ctx->kernel_mul_mat_q4_0_f32_gqa8_dk256_img =
             clCreateKernel(backend_ctx->program_mul_mv_q4_0_f32, "kernel_mul_mat_q4_0_f32_gqa8_dk256_img", &err_q4gqa256i);
         if (err_q4gqa256i != CL_SUCCESS) backend_ctx->kernel_mul_mat_q4_0_f32_gqa8_dk256_img = nullptr;
+        // r2=4 DK=256 variants for Qwen3.5-9B (n_head_kv=4, head_dim=256) -- memory-footprint.
+        cl_int err_q4gqar4256 = CL_SUCCESS;
+        backend_ctx->kernel_mul_mat_q4_0_f32_gqa_r4_dk256 =
+            clCreateKernel(backend_ctx->program_mul_mv_q4_0_f32, "kernel_mul_mat_q4_0_f32_gqa_r4_dk256", &err_q4gqar4256);
+        if (err_q4gqar4256 != CL_SUCCESS) backend_ctx->kernel_mul_mat_q4_0_f32_gqa_r4_dk256 = nullptr;
+        cl_int err_q4gqar4256i = CL_SUCCESS;
+        backend_ctx->kernel_mul_mat_q4_0_f32_gqa_r4_dk256_img =
+            clCreateKernel(backend_ctx->program_mul_mv_q4_0_f32, "kernel_mul_mat_q4_0_f32_gqa_r4_dk256_img", &err_q4gqar4256i);
+        if (err_q4gqar4256i != CL_SUCCESS) backend_ctx->kernel_mul_mat_q4_0_f32_gqa_r4_dk256_img = nullptr;
         GGML_LOG_CONT(".");
     }
 
@@ -2160,6 +2173,15 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         backend_ctx->kernel_mul_mat_q8_0_f32_gqa8_dk256_img =
             clCreateKernel(backend_ctx->program_mul_mv_q8_0_f32, "kernel_mul_mat_q8_0_f32_gqa8_dk256_img", &err_q8gqa256i);
         if (err_q8gqa256i != CL_SUCCESS) backend_ctx->kernel_mul_mat_q8_0_f32_gqa8_dk256_img = nullptr;
+        // r2=4 DK=256 variants for Qwen3.5-9B (n_head_kv=4, head_dim=256) -- memory-footprint.
+        cl_int err_q8gqar4256 = CL_SUCCESS;
+        backend_ctx->kernel_mul_mat_q8_0_f32_gqa_r4_dk256 =
+            clCreateKernel(backend_ctx->program_mul_mv_q8_0_f32, "kernel_mul_mat_q8_0_f32_gqa_r4_dk256", &err_q8gqar4256);
+        if (err_q8gqar4256 != CL_SUCCESS) backend_ctx->kernel_mul_mat_q8_0_f32_gqa_r4_dk256 = nullptr;
+        cl_int err_q8gqar4256i = CL_SUCCESS;
+        backend_ctx->kernel_mul_mat_q8_0_f32_gqa_r4_dk256_img =
+            clCreateKernel(backend_ctx->program_mul_mv_q8_0_f32, "kernel_mul_mat_q8_0_f32_gqa_r4_dk256_img", &err_q8gqar4256i);
+        if (err_q8gqar4256i != CL_SUCCESS) backend_ctx->kernel_mul_mat_q8_0_f32_gqa_r4_dk256_img = nullptr;
         GGML_LOG_CONT(".");
     }
 
@@ -21856,10 +21878,12 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         const int ne13 = src1->ne[3];
         const int rr   = (ne02 > 0 && (ne12 % ne02) == 0) ? (ne12 / ne02) : 0;
         cl_kernel kbuf = (ne00 == 256 && rr == 8) ? backend_ctx->kernel_mul_mat_q8_0_f32_gqa8_dk256
+                       : (ne00 == 256 && rr == 4) ? backend_ctx->kernel_mul_mat_q8_0_f32_gqa_r4_dk256
                        : (ne00 == 128 && rr == 8) ? backend_ctx->kernel_mul_mat_q8_0_f32_gqa8_dk128
                        : (ne00 == 128 && rr == 4) ? backend_ctx->kernel_mul_mat_q8_0_f32_gqa_r4_dk128
                        : nullptr;
         cl_kernel kimg = (ne00 == 256 && rr == 8) ? backend_ctx->kernel_mul_mat_q8_0_f32_gqa8_dk256_img
+                       : (ne00 == 256 && rr == 4) ? backend_ctx->kernel_mul_mat_q8_0_f32_gqa_r4_dk256_img
                        : (ne00 == 128 && rr == 8) ? backend_ctx->kernel_mul_mat_q8_0_f32_gqa8_dk128_img
                        : (ne00 == 128 && rr == 4) ? backend_ctx->kernel_mul_mat_q8_0_f32_gqa_r4_dk128_img
                        : nullptr;
@@ -21998,10 +22022,12 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         const int ne13 = src1->ne[3];
         const int rr   = (ne02 > 0 && (ne12 % ne02) == 0) ? (ne12 / ne02) : 0;
         cl_kernel kbuf = (ne00 == 256 && rr == 8) ? backend_ctx->kernel_mul_mat_q4_0_f32_gqa8_dk256
+                       : (ne00 == 256 && rr == 4) ? backend_ctx->kernel_mul_mat_q4_0_f32_gqa_r4_dk256
                        : (ne00 == 128 && rr == 8) ? backend_ctx->kernel_mul_mat_q4_0_f32_gqa8_dk128
                        : (ne00 == 128 && rr == 4) ? backend_ctx->kernel_mul_mat_q4_0_f32_gqa_r4_dk128
                        : nullptr;
         cl_kernel kimg = (ne00 == 256 && rr == 8) ? backend_ctx->kernel_mul_mat_q4_0_f32_gqa8_dk256_img
+                       : (ne00 == 256 && rr == 4) ? backend_ctx->kernel_mul_mat_q4_0_f32_gqa_r4_dk256_img
                        : (ne00 == 128 && rr == 8) ? backend_ctx->kernel_mul_mat_q4_0_f32_gqa8_dk128_img
                        : (ne00 == 128 && rr == 4) ? backend_ctx->kernel_mul_mat_q4_0_f32_gqa_r4_dk128_img
                        : nullptr;
