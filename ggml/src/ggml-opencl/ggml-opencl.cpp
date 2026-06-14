@@ -580,6 +580,14 @@ struct ggml_backend_opencl_context {
     std::map<ImagePoolKey, ImagePoolEntry> kq_img_pool;
     std::map<ImagePoolKey, ImagePoolEntry> kqv_img_pool;
 
+    // Pool for the on-device f16 buffer backing the non-FA quantized-K (q8_0/q4_0)
+    // KV-cache dequant path. Keyed by the stable KV-cache device buffer + view offset
+    // so one buffer is reused (and grown) across decode steps instead of being
+    // allocated/freed per attention op. The per-op churn exhausts the allocator on
+    // deep-context 20 GB MoE decode (old clCreateBuffer hit GGML_ASSERT). Buffer stored
+    // in .image; .k_bytes = current capacity. Released at teardown.
+    std::map<ImagePoolKey, ImagePoolEntry> dequant_f16_pool;
+
     // prealloc buffers for src0 and src1
     ggml_cl_buffer prealloc_src0;
     ggml_cl_buffer prealloc_src1;
@@ -1036,6 +1044,10 @@ struct ggml_backend_opencl_context {
                 if (kv.second.sub_buffer) CL_CHECK(clReleaseMemObject(kv.second.sub_buffer));
             }
             kqv_img_pool.clear();
+            for (auto & kv : dequant_f16_pool) {
+                if (kv.second.image) CL_CHECK(clReleaseMemObject(kv.second.image));
+            }
+            dequant_f16_pool.clear();
         }
     }
 };
@@ -16802,6 +16814,11 @@ static cl_mem ggml_cl_mul_mat_dequant_quant_to_f16(
     cl_ulong src_nb2;
     cl_ulong src_nb3;
 
+    // Stable identity of this KV-cache view for the dequant_f16_pool (survives the
+    // per-step graph rebuild because the underlying cache device buffer persists).
+    uintptr_t pool_key_buf = 0;
+    cl_ulong  pool_key_off = (cl_ulong) tensor->view_offs;
+
     const bool is_soa = tensor->type == GGML_TYPE_Q4_0
         ? ggml_cl_is_q4_0_soa(tensor)
         : ggml_cl_is_q8_0_soa(tensor);
@@ -16827,12 +16844,14 @@ static cl_mem ggml_cl_mul_mat_dequant_quant_to_f16(
             CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &extra->q));
             CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &extra->d));
             CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem), &aos));
+            pool_key_buf = (uintptr_t) extra->q;
         } else {
             auto * extra = (ggml_tensor_extra_cl_q4_0 *) soa_src->extra;
             kernel = backend_ctx->kernel_restore_block_q4_0;
             CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &extra->q));
             CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &extra->d));
             CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem), &aos));
+            pool_key_buf = (uintptr_t) extra->q;
         }
 
         const size_t n_blocks = parent_nbytes / block_bytes;
@@ -16862,6 +16881,8 @@ static cl_mem ggml_cl_mul_mat_dequant_quant_to_f16(
         src_nb1    = tensor->nb[1];
         src_nb2    = tensor->nb[2];
         src_nb3    = tensor->nb[3];
+        pool_key_buf = (uintptr_t) extra->data_device;
+        pool_key_off = (cl_ulong) src_offset;
     }
 
     const cl_int nblk0 = (cl_int) (tensor->ne[0] / ggml_blck_size(tensor->type));
@@ -16871,9 +16892,31 @@ static cl_mem ggml_cl_mul_mat_dequant_quant_to_f16(
 
     const size_t out_bytes = (size_t) ggml_nelements(tensor) * sizeof(ggml_fp16_t);
 
-    cl_int err;
-    cl_mem out = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE, out_bytes, NULL, &err);
-    CL_CHECK(err);
+    // Reuse a pooled f16 buffer for this KV-cache view across decode steps instead of
+    // allocating one per attention op — the per-op alloc/free churn exhausts the
+    // allocator on deep-context 20 GB MoE decode. The pool owns the buffer (released at
+    // teardown); the caller must NOT release the returned cl_mem.
+    cl_mem out = nullptr;
+    {
+        auto & pool = backend_ctx->dequant_f16_pool;
+        ggml_backend_opencl_context::ImagePoolKey key{pool_key_buf, (uint64_t) pool_key_off};
+        auto it = pool.find(key);
+        if (it != pool.end() && it->second.k_bytes >= out_bytes && it->second.image) {
+            out = it->second.image;
+        } else {
+            if (it != pool.end()) {
+                if (it->second.image) CL_CHECK(clReleaseMemObject(it->second.image));
+                pool.erase(it);
+            }
+            cl_int err = CL_SUCCESS;
+            out = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE, out_bytes, NULL, &err);
+            CL_CHECK(err);
+            ggml_backend_opencl_context::ImagePoolEntry entry;
+            entry.image   = out;
+            entry.k_bytes = out_bytes;
+            pool[key]     = entry;
+        }
+    }
 
     cl_kernel dq_kernel = tensor->type == GGML_TYPE_Q8_0
         ? backend_ctx->kernel_dequant_q8_0_f16_view_aos
@@ -16992,9 +17035,8 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 
         ggml_cl_mul_mat(backend, &fake_src0, src1, dst);
 
-        // Safe to release now: OpenCL retains the memobj while queued
-        // kernels that reference it are still in flight.
-        CL_CHECK(clReleaseMemObject(f16_buf));
+        // f16_buf is owned by backend_ctx->dequant_f16_pool and reused across decode
+        // steps — do NOT release it here (it is freed at backend teardown).
         return;
     }
 
