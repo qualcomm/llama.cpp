@@ -4502,7 +4502,11 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
     // (n_q>1) is kept on CPU via the supports_op n_q gate.
     const bool fa_decode_only = (variant == FA_VARIANT_F32_F16 && dk == 512);
     if (fa_decode_only) {
-        opts += " -D FA_DECODE_ONLY";
+        // FA_DECODE_MINIMAL also drops q1_vec, shrinking the DK=512 program to
+        // q1 + q1_split + merge so the Adreno shader compiler stops OOMing under
+        // host-memory pressure (gemma-4 global layers). q1_vec at DV=512 was the
+        // dominant compile-memory cost and is a fallback-only kernel on X1 anyway.
+        opts += " -D FA_DECODE_ONLY -D FA_DECODE_MINIMAL";
     }
 
     const char * tag = nullptr;
