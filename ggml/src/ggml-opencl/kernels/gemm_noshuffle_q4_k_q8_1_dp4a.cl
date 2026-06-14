@@ -45,6 +45,21 @@ inline void get_scale_min_k4(
                   (((uint)((u) & 0x0F00u)) << 8)  | \
                   (((uint)((u) & 0xF000u)) << 12) )
 
+// 32-K dp4a dot of one token's int8 activations (8 packed uints in LDS) against the
+// row's 8 packed weight uints. qw passed by value as a uint8 (register), not an array.
+inline int dot8_q8a(uint8 qw, __local const uint * a) {
+    int r = 0;
+    r = dot_acc_sat_4x8packed_ss_int(qw.s0, a[0], r);
+    r = dot_acc_sat_4x8packed_ss_int(qw.s1, a[1], r);
+    r = dot_acc_sat_4x8packed_ss_int(qw.s2, a[2], r);
+    r = dot_acc_sat_4x8packed_ss_int(qw.s3, a[3], r);
+    r = dot_acc_sat_4x8packed_ss_int(qw.s4, a[4], r);
+    r = dot_acc_sat_4x8packed_ss_int(qw.s5, a[5], r);
+    r = dot_acc_sat_4x8packed_ss_int(qw.s6, a[6], r);
+    r = dot_acc_sat_4x8packed_ss_int(qw.s7, a[7], r);
+    return r;
+}
+
 __attribute__((qcom_wave_pair_mode(1)))
 kernel void kernel_gemm_noshuffle_q4_k_q8_1_dp4a(
         __global const ushort * src0_q,    // q4_K weights (noshuffle, packed nibbles)
@@ -82,9 +97,17 @@ kernel void kernel_gemm_noshuffle_q4_k_q8_1_dp4a(
     __local half sh_d[TILESIZE_N];
     __local half sh_s[TILESIZE_N];
 
-    float acc[TILESIZE_N];
+    // One float4 vector-register accumulator per group of 4 tokens (NGROUPS =
+    // TILESIZE_N/4). NO per-WI private acc[] array: on Adreno X1 a private array
+    // spills to private memory whose loads are issued per-wave with no cross-WI
+    // coalescing (each WI pulls its own 512-bit line, no reuse) — that spill, not
+    // the dp4a or LDS path, is the main cost. float4 (not float8) is Adreno's
+    // native 128-bit register/transaction width: it packs into the register file
+    // without 256-bit alignment padding. Byte-identical to the scalar acc[].
+#define NGROUPS (TILESIZE_N / 4)
+    float4 acc[NGROUPS];
     #pragma unroll
-    for (int t = 0; t < TILESIZE_N; ++t) acc[t] = 0.0f;
+    for (int g = 0; g < NGROUPS; ++g) acc[g] = (float4)(0.0f);
 
     for (uint step = 0; step < (uint)k; step += 32) {
         const uint sub     = step >> 5;
@@ -104,15 +127,15 @@ kernel void kernel_gemm_noshuffle_q4_k_q8_1_dp4a(
         // layout stores one ushort = 4 consecutive-K nibbles for a row at
         // src0_q[row + (K_group)*m], K_group = step/4 + u.
         const uint wbase = rrow + (step >> 2) * (uint)m;
-        uint qw[8];
-        qw[0] = EXP4(src0_q[wbase + 0 * m]);
-        qw[1] = EXP4(src0_q[wbase + 1 * m]);
-        qw[2] = EXP4(src0_q[wbase + 2 * m]);
-        qw[3] = EXP4(src0_q[wbase + 3 * m]);
-        qw[4] = EXP4(src0_q[wbase + 4 * m]);
-        qw[5] = EXP4(src0_q[wbase + 5 * m]);
-        qw[6] = EXP4(src0_q[wbase + 6 * m]);
-        qw[7] = EXP4(src0_q[wbase + 7 * m]);
+        uint8 qw;
+        qw.s0 = EXP4(src0_q[wbase + 0 * m]);
+        qw.s1 = EXP4(src0_q[wbase + 1 * m]);
+        qw.s2 = EXP4(src0_q[wbase + 2 * m]);
+        qw.s3 = EXP4(src0_q[wbase + 3 * m]);
+        qw.s4 = EXP4(src0_q[wbase + 4 * m]);
+        qw.s5 = EXP4(src0_q[wbase + 5 * m]);
+        qw.s6 = EXP4(src0_q[wbase + 6 * m]);
+        qw.s7 = EXP4(src0_q[wbase + 7 * m]);
 
         // cooperatively stage the 32-token x 32-K int8 activations to LDS
         for (uint idx = lid; idx < TILESIZE_N * 8; idx += 64) {
@@ -128,19 +151,16 @@ kernel void kernel_gemm_noshuffle_q4_k_q8_1_dp4a(
         }
         barrier(CLK_LOCAL_MEM_FENCE);
 
+#define LD4(arr, b) ((float4)((float)arr[(b)+0], (float)arr[(b)+1], (float)arr[(b)+2], (float)arr[(b)+3]))
         #pragma unroll
-        for (int t = 0; t < TILESIZE_N; ++t) {
-            int raw = 0;
-            raw = dot_acc_sat_4x8packed_ss_int(qw[0], sh_qa[t][0], raw);
-            raw = dot_acc_sat_4x8packed_ss_int(qw[1], sh_qa[t][1], raw);
-            raw = dot_acc_sat_4x8packed_ss_int(qw[2], sh_qa[t][2], raw);
-            raw = dot_acc_sat_4x8packed_ss_int(qw[3], sh_qa[t][3], raw);
-            raw = dot_acc_sat_4x8packed_ss_int(qw[4], sh_qa[t][4], raw);
-            raw = dot_acc_sat_4x8packed_ss_int(qw[5], sh_qa[t][5], raw);
-            raw = dot_acc_sat_4x8packed_ss_int(qw[6], sh_qa[t][6], raw);
-            raw = dot_acc_sat_4x8packed_ss_int(qw[7], sh_qa[t][7], raw);
-            acc[t] += scale * (float)sh_d[t] * (float)raw - minv * (float)sh_s[t];
+        for (int g = 0; g < NGROUPS; ++g) {
+            const int b = g * 4;
+            float4 rf;
+            rf.s0 = (float)dot8_q8a(qw, sh_qa[b+0]);  rf.s1 = (float)dot8_q8a(qw, sh_qa[b+1]);
+            rf.s2 = (float)dot8_q8a(qw, sh_qa[b+2]);  rf.s3 = (float)dot8_q8a(qw, sh_qa[b+3]);
+            acc[g] += scale * LD4(sh_d, b) * rf - minv * LD4(sh_s, b);
         }
+#undef LD4
         barrier(CLK_LOCAL_MEM_FENCE);
     }
 
@@ -148,12 +168,17 @@ kernel void kernel_gemm_noshuffle_q4_k_q8_1_dp4a(
         return;
     }
 
-    // dst is [token, feature] row-major (stride m): dst[col*m + row]
+    // dst is [token, feature] row-major (stride m): dst[col*m + row]. Scatter each
+    // lane with a per-token padding guard (dst is non-contiguous in token).
     #pragma unroll
-    for (int t = 0; t < TILESIZE_N; ++t) {
-        const uint c = col_base + t;
-        if (c < (uint)n_no_padding) {
-            dst[c * (uint)m + row] = acc[t];
-        }
+    for (int g = 0; g < NGROUPS; ++g) {
+        const uint b = (uint)(g * 4);
+        const float4 a = acc[g];
+        const uint c0 = col_base + b;
+        if (c0 + 0 < (uint)n_no_padding) dst[(c0 + 0) * (uint)m + row] = a.s0;
+        if (c0 + 1 < (uint)n_no_padding) dst[(c0 + 1) * (uint)m + row] = a.s1;
+        if (c0 + 2 < (uint)n_no_padding) dst[(c0 + 2) * (uint)m + row] = a.s2;
+        if (c0 + 3 < (uint)n_no_padding) dst[(c0 + 3) * (uint)m + row] = a.s3;
     }
+#undef NGROUPS
 }
