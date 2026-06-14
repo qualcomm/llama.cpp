@@ -598,6 +598,234 @@ kernel void kernel_mul_mat_q8_0_f32_gqa8_dk256_img(
 }
 
 // ===========================================================================
+// DK=256, r2=4 variants for Qwen3.5-9B (n_head_kv=4 => GQA r=4, head_dim=256).
+// Memory-footprint play: q8/q4 K cache halves/quarters K DDR at depth. 64-lane
+// subgroup = 4 Q-heads x 16 lanes; DK=256 = 8 q8_0 blocks, so each lane owns a
+// HALF block (16 elems, blk=lane_q>>1, hoff=(lane_q&1)*16) -- same per-lane body
+// as gqa8_dk128, but 16 lanes/Q-head (reduce masks {8,4,2,1}) and DK_VEC=64.
+// ===========================================================================
+#define N_K_ROWS_Q8GQA_R4_256   16
+#define GQA_RATIO_Q8GQA_R4_256  4
+#define DK_VEC_Q8GQA_R4_256     64   // DK/4 for DK=256
+
+#ifdef ADRENO_GPU
+REQD_SUBGROUP_SIZE_64
+#endif
+kernel void kernel_mul_mat_q8_0_f32_gqa_r4_dk256(
+        global char * src0,
+        ulong offset0,
+        global char * src1,
+        ulong offset1,
+        global float * dst,
+        ulong offsetd,
+        int ne00,
+        int ne01,
+        int ne02,
+        ulong nb01,
+        ulong nb02,
+        ulong nb03,
+        int ne10,
+        int ne11,
+        int ne12,
+        ulong nb10,
+        ulong nb11,
+        ulong nb12,
+        ulong nb13,
+        int ne0,
+        int ne1,
+        int r2,
+        int r3
+) {
+    src0 = (global char *)((global char *)src0 + offset0);
+    src1 = (global char *)((global char *)src1 + offset1);
+    dst  = (global float*)((global char *)dst  + offsetd);
+
+    const int sgs_lid = get_sub_group_local_id();
+    const int q_id    = sgs_lid >> 4;   // 0..3: Q-head
+    const int lane_q  = sgs_lid & 15;   // 0..15: lane within Q-head partition
+
+    const int r0_base = get_group_id(0) * N_K_ROWS_Q8GQA_R4_256;
+    const int im_kv   = get_group_id(2);
+
+    const int i02 = im_kv % ne02;
+    const int i03 = im_kv / ne02;
+
+    const int q_head_lo = i02 * GQA_RATIO_Q8GQA_R4_256;
+
+    __local float4 q_loc[GQA_RATIO_Q8GQA_R4_256 * DK_VEC_Q8GQA_R4_256];
+    #pragma unroll
+    for (int qh = 0; qh < GQA_RATIO_Q8GQA_R4_256; ++qh) {
+        const int qh_idx = q_head_lo + qh;
+        global float4 * y4 = (global float4 *)(src1 + qh_idx * nb12 + i03 * nb13);
+        q_loc[qh * DK_VEC_Q8GQA_R4_256 + sgs_lid] = y4[sgs_lid];
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    const int blk  = lane_q >> 1;           // 0..7 (q8_0 block within the DK=256 row)
+    const int hoff = (lane_q & 1) * 16;     // 0 or 16 (byte offset in qs[32])
+    const int qf4  = lane_q * 4;            // first of this lane's 4 float4
+
+    const ulong head_off = (i02) * nb02 + (i03 / r3) * nb03;
+
+    #pragma unroll
+    for (int dr = 0; dr < N_K_ROWS_Q8GQA_R4_256; ++dr) {
+        const int r0 = r0_base + dr;
+        global block_q8_0 * kb = (global block_q8_0 *)(src0 + r0 * nb01 + head_off) + blk;
+        const float d = convert_float(kb->d);
+        global char * qs = kb->qs + hoff;   // 16 int8 for this lane
+
+        float sumf = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const float4 qv = q_loc[q_id * DK_VEC_Q8GQA_R4_256 + qf4 + j];
+            const int b = j * 4;
+            sumf += (float)qs[b + 0] * qv.s0
+                  + (float)qs[b + 1] * qv.s1
+                  + (float)qs[b + 2] * qv.s2
+                  + (float)qs[b + 3] * qv.s3;
+        }
+        sumf *= d;
+
+        // Reduce within 16-lane Q-head partition.
+        sumf += sub_group_shuffle_xor(sumf, 8);
+        sumf += sub_group_shuffle_xor(sumf, 4);
+        sumf += sub_group_shuffle_xor(sumf, 2);
+        sumf += sub_group_shuffle_xor(sumf, 1);
+
+        if (lane_q == 0) {
+            const int im_out = i03 * ne12 + (q_head_lo + q_id);
+            dst[im_out * ne1 * ne0 + r0] = sumf;
+        }
+    }
+}
+
+// image1d_buffer_t (texture-cache) variant of kernel_mul_mat_q8_0_f32_gqa_r4_dk256.
+// Row = 8 q8_0 blocks x 34 B = 272 B = 68 px (same as the gqa8_dk256 row). Lane owns
+// a half block: blk=lane_q>>1, hoff=(lane_q&1)*16; d at byte 34*blk, qs+hoff at
+// 34*blk+2+hoff -- generic q_sh = (q_byte&3)*8 (read 5 px + shift-combine when shifted).
+#ifdef ADRENO_GPU
+REQD_SUBGROUP_SIZE_64
+#endif
+kernel void kernel_mul_mat_q8_0_f32_gqa_r4_dk256_img(
+        __read_only image1d_buffer_t src0_img,
+        global char * src1,
+        ulong offset1,
+        global float * dst,
+        ulong offsetd,
+        int ne00,
+        int ne01,
+        int ne02,
+        ulong nb01,
+        ulong nb02,
+        ulong nb03,
+        int ne10,
+        int ne11,
+        int ne12,
+        ulong nb10,
+        ulong nb11,
+        ulong nb12,
+        ulong nb13,
+        int ne0,
+        int ne1,
+        int r2,
+        int r3
+) {
+    src1 = (global char *)((global char *)src1 + offset1);
+    dst  = (global float*)((global char *)dst  + offsetd);
+
+    const int sgs_lid = get_sub_group_local_id();
+    const int q_id    = sgs_lid >> 4;
+    const int lane_q  = sgs_lid & 15;
+
+    const int r0_base = get_group_id(0) * N_K_ROWS_Q8GQA_R4_256;
+    const int im_kv   = get_group_id(2);
+
+    const int i02 = im_kv % ne02;
+    const int i03 = im_kv / ne02;
+
+    const int q_head_lo = i02 * GQA_RATIO_Q8GQA_R4_256;
+
+    __local float4 q_loc[GQA_RATIO_Q8GQA_R4_256 * DK_VEC_Q8GQA_R4_256];
+    #pragma unroll
+    for (int qh = 0; qh < GQA_RATIO_Q8GQA_R4_256; ++qh) {
+        const int qh_idx = q_head_lo + qh;
+        global float4 * y4 = (global float4 *)(src1 + qh_idx * nb12 + i03 * nb13);
+        q_loc[qh * DK_VEC_Q8GQA_R4_256 + sgs_lid] = y4[sgs_lid];
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    const int blk  = lane_q >> 1;
+    const int hoff = (lane_q & 1) * 16;
+    const int qf4  = lane_q * 4;
+
+    const int pitch_px_row  = (int)(nb01 >> 2);
+    const int pitch_px_head = (int)(nb02 >> 2);
+    const int pitch_px_n13  = (int)(nb03 >> 2);
+    const int head_px_base  = i02 * pitch_px_head + (i03 / r3) * pitch_px_n13;
+
+    const int d_byte   = 34 * blk;
+    const int d_pxoff  = d_byte >> 2;
+    const int d_bit    = (d_byte & 3) * 8;
+    const int q_byte   = 34 * blk + 2 + hoff;
+    const int q_pxoff  = q_byte >> 2;
+    const uint q_sh    = (uint)((q_byte & 3) * 8);
+
+    #pragma unroll
+    for (int dr = 0; dr < N_K_ROWS_Q8GQA_R4_256; ++dr) {
+        const int r0 = r0_base + dr;
+        const int row_px = r0 * pitch_px_row + head_px_base;
+
+        const half  d  = as_half((ushort)((read_imageui(src0_img, row_px + d_pxoff).x >> d_bit) & 0xFFFFu));
+        const float df = convert_float(d);
+
+        const int qpx = row_px + q_pxoff;
+        uint w0, w1, w2, w3;
+        if (q_sh == 0u) {
+            w0 = read_imageui(src0_img, qpx + 0).x;
+            w1 = read_imageui(src0_img, qpx + 1).x;
+            w2 = read_imageui(src0_img, qpx + 2).x;
+            w3 = read_imageui(src0_img, qpx + 3).x;
+        } else {
+            const uint p0 = read_imageui(src0_img, qpx + 0).x;
+            const uint p1 = read_imageui(src0_img, qpx + 1).x;
+            const uint p2 = read_imageui(src0_img, qpx + 2).x;
+            const uint p3 = read_imageui(src0_img, qpx + 3).x;
+            const uint p4 = read_imageui(src0_img, qpx + 4).x;
+            w0 = (p0 >> q_sh) | (p1 << (32u - q_sh));
+            w1 = (p1 >> q_sh) | (p2 << (32u - q_sh));
+            w2 = (p2 >> q_sh) | (p3 << (32u - q_sh));
+            w3 = (p3 >> q_sh) | (p4 << (32u - q_sh));
+        }
+
+        const char4 c0 = as_char4(w0);
+        const char4 c1 = as_char4(w1);
+        const char4 c2 = as_char4(w2);
+        const char4 c3 = as_char4(w3);
+        const float4 qa = q_loc[q_id * DK_VEC_Q8GQA_R4_256 + qf4 + 0];
+        const float4 qb = q_loc[q_id * DK_VEC_Q8GQA_R4_256 + qf4 + 1];
+        const float4 qc = q_loc[q_id * DK_VEC_Q8GQA_R4_256 + qf4 + 2];
+        const float4 qd = q_loc[q_id * DK_VEC_Q8GQA_R4_256 + qf4 + 3];
+
+        float sumf =
+              (float)c0.s0*qa.s0 + (float)c0.s1*qa.s1 + (float)c0.s2*qa.s2 + (float)c0.s3*qa.s3
+            + (float)c1.s0*qb.s0 + (float)c1.s1*qb.s1 + (float)c1.s2*qb.s2 + (float)c1.s3*qb.s3
+            + (float)c2.s0*qc.s0 + (float)c2.s1*qc.s1 + (float)c2.s2*qc.s2 + (float)c2.s3*qc.s3
+            + (float)c3.s0*qd.s0 + (float)c3.s1*qd.s1 + (float)c3.s2*qd.s2 + (float)c3.s3*qd.s3;
+        sumf *= df;
+
+        sumf += sub_group_shuffle_xor(sumf, 8);
+        sumf += sub_group_shuffle_xor(sumf, 4);
+        sumf += sub_group_shuffle_xor(sumf, 2);
+        sumf += sub_group_shuffle_xor(sumf, 1);
+
+        if (lane_q == 0) {
+            const int im_out = i03 * ne12 + (q_head_lo + q_id);
+            dst[im_out * ne1 * ne0 + r0] = sumf;
+        }
+    }
+}
+
+// ===========================================================================
 // r2=4 variants (DK=128) for Llama-3-8B (n_head=32, n_head_kv=8 => r2=4, all-
 // global => K grows every layer; fa=0 tg64 collapses 13.0->5.5 @4k->16k, i.e.
 // severely KV-BW-bound at depth). 64-lane subgroup = 4 Q-heads x 16 lanes; each
