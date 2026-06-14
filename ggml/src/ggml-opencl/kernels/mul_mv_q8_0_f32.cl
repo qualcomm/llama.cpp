@@ -376,6 +376,228 @@ kernel void kernel_mul_mat_q8_0_f32_gqa8_dk128_img(
 }
 
 // ===========================================================================
+// DK=256, r2=8 variants for Qwen3.6-35B-A3B (n_head=16, n_head_kv=2 => r2=8,
+// head_dim=256). Same GQA-coalesced decode KQ as gqa8_dk128, but DK=256 means a
+// row is 8 q8_0 blocks; the 64-lane subgroup is still 8 Q-heads x 8 lanes, so
+// each lane owns a WHOLE q8_0 block (32 elems, blk=lane_q, hoff=0) instead of a
+// half block. Q (f32) for the 8 Q-heads pre-staged in __local (DK_VEC=64 float4).
+// ===========================================================================
+#define N_K_ROWS_Q8GQA256   16
+#define GQA_RATIO_Q8GQA256  8
+#define DK_VEC_Q8GQA256     64   // DK/4 for DK=256
+
+#ifdef ADRENO_GPU
+REQD_SUBGROUP_SIZE_64
+#endif
+kernel void kernel_mul_mat_q8_0_f32_gqa8_dk256(
+        global char * src0,
+        ulong offset0,
+        global char * src1,
+        ulong offset1,
+        global float * dst,
+        ulong offsetd,
+        int ne00,
+        int ne01,
+        int ne02,
+        ulong nb01,
+        ulong nb02,
+        ulong nb03,
+        int ne10,
+        int ne11,
+        int ne12,
+        ulong nb10,
+        ulong nb11,
+        ulong nb12,
+        ulong nb13,
+        int ne0,
+        int ne1,
+        int r2,
+        int r3
+) {
+    src0 = (global char *)((global char *)src0 + offset0);
+    src1 = (global char *)((global char *)src1 + offset1);
+    dst  = (global float*)((global char *)dst  + offsetd);
+
+    const int sgs_lid = get_sub_group_local_id();
+    const int q_id    = sgs_lid >> 3;   // 0..7: Q-head
+    const int lane_q  = sgs_lid & 7;    // 0..7: lane within Q-head -> owns block lane_q
+
+    const int r0_base = get_group_id(0) * N_K_ROWS_Q8GQA256;
+    const int im_kv   = get_group_id(2);
+
+    const int i02 = im_kv % ne02;       // K-head index
+    const int i03 = im_kv / ne02;       // n13 batch index
+
+    const int q_head_lo = i02 * GQA_RATIO_Q8GQA256;
+
+    // Stage 8 Q-heads x 64 float4 (DK=256) into __local (f32 Q, 8 KB). DK_VEC=64
+    // == subgroup size, so each lane loads exactly one float4 per Q-head.
+    __local float4 q_loc[GQA_RATIO_Q8GQA256 * DK_VEC_Q8GQA256];
+    #pragma unroll
+    for (int qh = 0; qh < GQA_RATIO_Q8GQA256; ++qh) {
+        const int qh_idx = q_head_lo + qh;
+        global float4 * y4 = (global float4 *)(src1 + qh_idx * nb12 + i03 * nb13);
+        q_loc[qh * DK_VEC_Q8GQA256 + sgs_lid] = y4[sgs_lid];
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    const int blk = lane_q;          // 0..7: this lane's whole q8_0 block
+    const int qf4 = lane_q * 8;      // first of this lane's 8 float4 (32 elems)
+
+    const ulong head_off = (i02) * nb02 + (i03 / r3) * nb03;
+
+    #pragma unroll
+    for (int dr = 0; dr < N_K_ROWS_Q8GQA256; ++dr) {
+        const int r0 = r0_base + dr;
+        global block_q8_0 * kb = (global block_q8_0 *)(src0 + r0 * nb01 + head_off) + blk;
+        const float d = convert_float(kb->d);
+        global char * qs = kb->qs;   // 32 int8 for this lane (full block)
+
+        float sumf = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const float4 qv = q_loc[q_id * DK_VEC_Q8GQA256 + qf4 + j];
+            const int b = j * 4;
+            sumf += (float)qs[b + 0] * qv.s0
+                  + (float)qs[b + 1] * qv.s1
+                  + (float)qs[b + 2] * qv.s2
+                  + (float)qs[b + 3] * qv.s3;
+        }
+        sumf *= d;
+
+        // Reduce within 8-lane Q-head partition.
+        sumf += sub_group_shuffle_xor(sumf, 4);
+        sumf += sub_group_shuffle_xor(sumf, 2);
+        sumf += sub_group_shuffle_xor(sumf, 1);
+
+        if (lane_q == 0) {
+            const int im_out = i03 * ne12 + (q_head_lo + q_id);
+            dst[im_out * ne1 * ne0 + r0] = sumf;
+        }
+    }
+}
+
+// image1d_buffer_t (texture-cache) variant of kernel_mul_mat_q8_0_f32_gqa8_dk256.
+// q8_0 row (DK=256): 8 blocks x 34 B = 272 B = 68 uint32 pixels. Lane lane_q owns
+// whole block lane_q: d at byte 34*lane_q, qs[32] at byte 34*lane_q+2. d_byte&3 is
+// 0 for even lane_q, 2 for odd; q_byte=34*lane_q+2 is 2-byte-shifted (q_sh=16) for
+// even lane_q and pixel-aligned (q_sh=0) for odd -- so even lanes read 9 pixels and
+// shift-combine 8 quant words.
+#ifdef ADRENO_GPU
+REQD_SUBGROUP_SIZE_64
+#endif
+kernel void kernel_mul_mat_q8_0_f32_gqa8_dk256_img(
+        __read_only image1d_buffer_t src0_img,
+        global char * src1,
+        ulong offset1,
+        global float * dst,
+        ulong offsetd,
+        int ne00,
+        int ne01,
+        int ne02,
+        ulong nb01,
+        ulong nb02,
+        ulong nb03,
+        int ne10,
+        int ne11,
+        int ne12,
+        ulong nb10,
+        ulong nb11,
+        ulong nb12,
+        ulong nb13,
+        int ne0,
+        int ne1,
+        int r2,
+        int r3
+) {
+    src1 = (global char *)((global char *)src1 + offset1);
+    dst  = (global float*)((global char *)dst  + offsetd);
+
+    const int sgs_lid = get_sub_group_local_id();
+    const int q_id    = sgs_lid >> 3;   // 0..7: Q-head
+    const int lane_q  = sgs_lid & 7;    // 0..7: lane -> owns block lane_q
+
+    const int r0_base = get_group_id(0) * N_K_ROWS_Q8GQA256;
+    const int im_kv   = get_group_id(2);
+
+    const int i02 = im_kv % ne02;
+    const int i03 = im_kv / ne02;
+
+    const int q_head_lo = i02 * GQA_RATIO_Q8GQA256;
+
+    __local float4 q_loc[GQA_RATIO_Q8GQA256 * DK_VEC_Q8GQA256];
+    #pragma unroll
+    for (int qh = 0; qh < GQA_RATIO_Q8GQA256; ++qh) {
+        const int qh_idx = q_head_lo + qh;
+        global float4 * y4 = (global float4 *)(src1 + qh_idx * nb12 + i03 * nb13);
+        q_loc[qh * DK_VEC_Q8GQA256 + sgs_lid] = y4[sgs_lid];
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    const int qf4 = lane_q * 8;       // first of this lane's 8 float4 (32 elems)
+
+    // Pixel pitches (4-byte pixels). nb01=272 -> 68 px/row; nb02/nb03 divisible by 4.
+    const int pitch_px_row  = (int)(nb01 >> 2);
+    const int pitch_px_head = (int)(nb02 >> 2);
+    const int pitch_px_n13  = (int)(nb03 >> 2);
+    const int head_px_base  = i02 * pitch_px_head + (i03 / r3) * pitch_px_n13;
+
+    const int d_byte   = 34 * lane_q;
+    const int d_pxoff  = d_byte >> 2;
+    const int d_bit    = (d_byte & 3) * 8;
+    const int q_byte   = 34 * lane_q + 2;
+    const int q_pxoff  = q_byte >> 2;
+    const uint q_sh    = (uint)((q_byte & 3) * 8);   // 0 (odd lane) or 16 (even lane)
+
+    #pragma unroll
+    for (int dr = 0; dr < N_K_ROWS_Q8GQA256; ++dr) {
+        const int r0 = r0_base + dr;
+        const int row_px = r0 * pitch_px_row + head_px_base;
+
+        const half  d  = as_half((ushort)((read_imageui(src0_img, row_px + d_pxoff).x >> d_bit) & 0xFFFFu));
+        const float df = convert_float(d);
+
+        const int qpx = row_px + q_pxoff;
+        uint w[8];
+        if (q_sh == 0u) {
+            #pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                w[k] = read_imageui(src0_img, qpx + k).x;
+            }
+        } else {
+            uint p[9];
+            #pragma unroll
+            for (int k = 0; k < 9; ++k) {
+                p[k] = read_imageui(src0_img, qpx + k).x;
+            }
+            #pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                w[k] = (p[k] >> q_sh) | (p[k + 1] << (32u - q_sh));
+            }
+        }
+
+        float sumf = 0.0f;
+        #pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            const char4  c  = as_char4(w[k]);
+            const float4 qv = q_loc[q_id * DK_VEC_Q8GQA256 + qf4 + k];
+            sumf += (float)c.s0 * qv.s0 + (float)c.s1 * qv.s1
+                  + (float)c.s2 * qv.s2 + (float)c.s3 * qv.s3;
+        }
+        sumf *= df;
+
+        sumf += sub_group_shuffle_xor(sumf, 4);
+        sumf += sub_group_shuffle_xor(sumf, 2);
+        sumf += sub_group_shuffle_xor(sumf, 1);
+
+        if (lane_q == 0) {
+            const int im_out = i03 * ne12 + (q_head_lo + q_id);
+            dst[im_out * ne1 * ne0 + r0] = sumf;
+        }
+    }
+}
+
+// ===========================================================================
 // r2=4 variants (DK=128) for Llama-3-8B (n_head=32, n_head_kv=8 => r2=4, all-
 // global => K grows every layer; fa=0 tg64 collapses 13.0->5.5 @4k->16k, i.e.
 // severely KV-BW-bound at depth). 64-lane subgroup = 4 Q-heads x 16 lanes; each
