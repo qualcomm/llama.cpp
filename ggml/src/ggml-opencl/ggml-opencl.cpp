@@ -719,7 +719,12 @@ struct ggml_backend_opencl_context {
     // (DK=128 = 4 blocks x 34 B) maps to exactly 34 integer pixels.
     std::map<ImagePoolKey, ImagePoolEntry> kq_img_pool_q8;
 
-    // pool for the on-device f16 buffer for kv-cache with non-FA quantized-K (q8_0/q4_0)
+    // Pool for the on-device f16 buffer backing the non-FA quantized-K (q8_0/q4_0)
+    // KV-cache dequant path. Keyed by the stable KV-cache device buffer + view offset
+    // so one buffer is reused (and grown) across decode steps instead of being
+    // allocated/freed per attention op. The per-op churn exhausts the allocator on
+    // deep-context 20 GB MoE decode (old clCreateBuffer hit GGML_ASSERT). Buffer stored
+    // in .image; .k_bytes = current capacity. Released at teardown.
     std::map<ImagePoolKey, ImagePoolEntry> dequant_f16_pool;
 
     // prealloc buffers for src0 and src1
@@ -1269,6 +1274,10 @@ struct ggml_backend_opencl_context {
                 if (kv.second.sub_buffer) CL_CHECK(clReleaseMemObject(kv.second.sub_buffer));
             }
             kq_img_pool_q8.clear();
+            for (auto & kv : dequant_f16_pool) {
+                if (kv.second.image) CL_CHECK(clReleaseMemObject(kv.second.image));
+            }
+            dequant_f16_pool.clear();
 
             // Release recordable-queue state.
             if (rec_recording && clReleaseRecordingQCOM) {
@@ -21482,6 +21491,8 @@ static cl_mem ggml_cl_mul_mat_dequant_quant_to_f16(
     cl_ulong src_nb2;
     cl_ulong src_nb3;
 
+    // Stable identity of this KV-cache view for the dequant_f16_pool (survives the
+    // per-step graph rebuild because the underlying cache device buffer persists).
     uintptr_t pool_key_buf = 0;
     cl_ulong  pool_key_off = (cl_ulong) tensor->view_offs;
 
@@ -21608,8 +21619,10 @@ static cl_mem ggml_cl_mul_mat_dequant_quant_to_f16(
 
     const size_t out_bytes = (size_t) ggml_nelements(tensor) * sizeof(ggml_fp16_t);
 
-    // reuse a pooled f16 buffer for this KV-cache view across decode steps instead of
-    // allocating new one per attention op
+    // Reuse a pooled f16 buffer for this KV-cache view across decode steps instead of
+    // allocating one per attention op — the per-op alloc/free churn exhausts the
+    // allocator on deep-context 20 GB MoE decode. The pool owns the buffer (released at
+    // teardown); the caller must NOT release the returned cl_mem.
     cl_mem out = nullptr;
     {
         auto & pool = backend_ctx->dequant_f16_pool;
@@ -21619,7 +21632,7 @@ static cl_mem ggml_cl_mul_mat_dequant_quant_to_f16(
             out = it->second.image;
         } else {
             if (it != pool.end()) {
-                if (it->second.image) { CL_CHECK(clReleaseMemObject(it->second.image)); }
+                if (it->second.image) CL_CHECK(clReleaseMemObject(it->second.image));
                 pool.erase(it);
             }
             cl_int err = CL_SUCCESS;
@@ -22096,6 +22109,9 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         fake_src0.nb[3] = fake_src0.nb[2] * src0->ne[2];
 
         ggml_cl_mul_mat(backend, &fake_src0, src1, dst);
+
+        // f16_buf is owned by backend_ctx->dequant_f16_pool and reused across decode
+        // steps — do NOT release it here (it is freed at backend teardown).
         return;
     }
 
