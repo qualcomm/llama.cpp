@@ -421,6 +421,247 @@ kernel void kernel_mul_mat_q4_0_f32_gqa8_dk128_img(
 }
 
 // ===========================================================================
+// DK=256, r2=8 variants for Qwen3.6-35B-A3B (n_head_kv=2 => GQA r=8, head_dim=256).
+// 64-lane subgroup = 8 Q-heads x 8 lanes; each lane owns a WHOLE q4_0 block (32
+// elems = both nibble halves of all 16 qs bytes). Low nibbles -> K elems [0,16) ->
+// Q float4 [qf4,qf4+4); high nibbles -> K elems [16,32) -> Q float4 [qf4+4,qf4+8).
+// ===========================================================================
+#define N_K_ROWS_Q4GQA256   16
+#define GQA_RATIO_Q4GQA256  8
+#define DK_VEC_Q4GQA256     64   // DK/4 for DK=256
+
+#ifdef ADRENO_GPU
+REQD_SUBGROUP_SIZE_64
+#endif
+kernel void kernel_mul_mat_q4_0_f32_gqa8_dk256(
+        global char * src0,
+        ulong offset0,
+        global char * src1,
+        ulong offset1,
+        global float * dst,
+        ulong offsetd,
+        int ne00,
+        int ne01,
+        int ne02,
+        ulong nb01,
+        ulong nb02,
+        ulong nb03,
+        int ne10,
+        int ne11,
+        int ne12,
+        ulong nb10,
+        ulong nb11,
+        ulong nb12,
+        ulong nb13,
+        int ne0,
+        int ne1,
+        int r2,
+        int r3
+) {
+    src0 = (global char *)((global char *)src0 + offset0);
+    src1 = (global char *)((global char *)src1 + offset1);
+    dst  = (global float*)((global char *)dst  + offsetd);
+
+    const int sgs_lid = get_sub_group_local_id();
+    const int q_id    = sgs_lid >> 3;
+    const int lane_q  = sgs_lid & 7;
+
+    const int r0_base = get_group_id(0) * N_K_ROWS_Q4GQA256;
+    const int im_kv   = get_group_id(2);
+
+    const int i02 = im_kv % ne02;
+    const int i03 = im_kv / ne02;
+
+    const int q_head_lo = i02 * GQA_RATIO_Q4GQA256;
+
+    __local float4 q_loc[GQA_RATIO_Q4GQA256 * DK_VEC_Q4GQA256];
+    #pragma unroll
+    for (int qh = 0; qh < GQA_RATIO_Q4GQA256; ++qh) {
+        const int qh_idx = q_head_lo + qh;
+        global float4 * y4 = (global float4 *)(src1 + qh_idx * nb12 + i03 * nb13);
+        q_loc[qh * DK_VEC_Q4GQA256 + sgs_lid] = y4[sgs_lid];
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    const int blk = lane_q;          // this lane's whole q4_0 block
+    const int qf4 = lane_q * 8;      // 8 float4 (32 elems)
+
+    const ulong head_off = (ulong)i02 * nb02 + (ulong)(i03 / r3) * nb03;
+
+    #pragma unroll
+    for (int dr = 0; dr < N_K_ROWS_Q4GQA256; ++dr) {
+        const int r0 = r0_base + dr;
+        global struct block_q4_0 * kb =
+            (global struct block_q4_0 *)(src0 + r0 * nb01 + head_off) + blk;
+        const float d = convert_float(kb->d);
+        global uchar * qs = kb->qs;   // 16 bytes (full block)
+
+        float sumf = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {       // low nibbles -> K elems [0,16)
+            const float4 qv = q_loc[q_id * DK_VEC_Q4GQA256 + qf4 + j];
+            const int b = j * 4;
+            sumf += (float)(((int)(qs[b + 0] & 0xF)) - 8) * qv.s0
+                  + (float)(((int)(qs[b + 1] & 0xF)) - 8) * qv.s1
+                  + (float)(((int)(qs[b + 2] & 0xF)) - 8) * qv.s2
+                  + (float)(((int)(qs[b + 3] & 0xF)) - 8) * qv.s3;
+        }
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {       // high nibbles -> K elems [16,32)
+            const float4 qv = q_loc[q_id * DK_VEC_Q4GQA256 + qf4 + 4 + j];
+            const int b = j * 4;
+            sumf += (float)(((int)(qs[b + 0] >> 4)) - 8) * qv.s0
+                  + (float)(((int)(qs[b + 1] >> 4)) - 8) * qv.s1
+                  + (float)(((int)(qs[b + 2] >> 4)) - 8) * qv.s2
+                  + (float)(((int)(qs[b + 3] >> 4)) - 8) * qv.s3;
+        }
+        sumf *= d;
+
+        sumf += sub_group_shuffle_xor(sumf, 4);
+        sumf += sub_group_shuffle_xor(sumf, 2);
+        sumf += sub_group_shuffle_xor(sumf, 1);
+
+        if (lane_q == 0) {
+            const int im_out = i03 * ne12 + (q_head_lo + q_id);
+            dst[im_out * ne1 * ne0 + r0] = sumf;
+        }
+    }
+}
+
+// image1d_buffer_t variant of kernel_mul_mat_q4_0_f32_gqa8_dk256.
+// q4_0 row (DK=256) = 8 blocks x 18 B = 144 B = 36 uint32 pixels. Lane owns whole
+// block lane_q: d at byte 18*lane_q, qs[16] at 18*lane_q+2 (even/odd 2-byte-shift
+// as the DK=128 kernel). Unpack 16 qs bytes (4 words): low nibbles -> Q[qf4,qf4+4),
+// high nibbles -> Q[qf4+4,qf4+8).
+#ifdef ADRENO_GPU
+REQD_SUBGROUP_SIZE_64
+#endif
+kernel void kernel_mul_mat_q4_0_f32_gqa8_dk256_img(
+        __read_only image1d_buffer_t src0_img,
+        global char * src1,
+        ulong offset1,
+        global float * dst,
+        ulong offsetd,
+        int ne00,
+        int ne01,
+        int ne02,
+        ulong nb01,
+        ulong nb02,
+        ulong nb03,
+        int ne10,
+        int ne11,
+        int ne12,
+        ulong nb10,
+        ulong nb11,
+        ulong nb12,
+        ulong nb13,
+        int ne0,
+        int ne1,
+        int r2,
+        int r3
+) {
+    src1 = (global char *)((global char *)src1 + offset1);
+    dst  = (global float*)((global char *)dst  + offsetd);
+
+    const int sgs_lid = get_sub_group_local_id();
+    const int q_id    = sgs_lid >> 3;
+    const int lane_q  = sgs_lid & 7;
+
+    const int r0_base = get_group_id(0) * N_K_ROWS_Q4GQA256;
+    const int im_kv   = get_group_id(2);
+
+    const int i02 = im_kv % ne02;
+    const int i03 = im_kv / ne02;
+
+    const int q_head_lo = i02 * GQA_RATIO_Q4GQA256;
+
+    __local float4 q_loc[GQA_RATIO_Q4GQA256 * DK_VEC_Q4GQA256];
+    #pragma unroll
+    for (int qh = 0; qh < GQA_RATIO_Q4GQA256; ++qh) {
+        const int qh_idx = q_head_lo + qh;
+        global float4 * y4 = (global float4 *)(src1 + qh_idx * nb12 + i03 * nb13);
+        q_loc[qh * DK_VEC_Q4GQA256 + sgs_lid] = y4[sgs_lid];
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    const int qf4 = lane_q * 8;
+
+    const int pitch_px_row  = (int)(nb01 >> 2);   // 144 B -> 36 px
+    const int pitch_px_head = (int)(nb02 >> 2);
+    const int pitch_px_n13  = (int)(nb03 >> 2);
+    const int head_px_base  = i02 * pitch_px_head + (i03 / r3) * pitch_px_n13;
+
+    const int d_byte  = 18 * lane_q;
+    const int d_pxoff = d_byte >> 2;
+    const int d_bit   = (d_byte & 3) * 8;
+    const int q_byte  = 18 * lane_q + 2;
+    const int q_pxoff = q_byte >> 2;
+    const uint q_sh   = (uint)((q_byte & 3) * 8);   // 0 or 16
+
+    #pragma unroll
+    for (int dr = 0; dr < N_K_ROWS_Q4GQA256; ++dr) {
+        const int r0 = r0_base + dr;
+        const int row_px = r0 * pitch_px_row + head_px_base;
+
+        const half  d  = as_half((ushort)((read_imageui(src0_img, row_px + d_pxoff).x >> d_bit) & 0xFFFFu));
+        const float df = convert_float(d);
+
+        const int qpx = row_px + q_pxoff;
+        uint w0, w1, w2, w3;
+        if (q_sh == 0u) {
+            w0 = read_imageui(src0_img, qpx + 0).x;
+            w1 = read_imageui(src0_img, qpx + 1).x;
+            w2 = read_imageui(src0_img, qpx + 2).x;
+            w3 = read_imageui(src0_img, qpx + 3).x;
+        } else {
+            const uint p0 = read_imageui(src0_img, qpx + 0).x;
+            const uint p1 = read_imageui(src0_img, qpx + 1).x;
+            const uint p2 = read_imageui(src0_img, qpx + 2).x;
+            const uint p3 = read_imageui(src0_img, qpx + 3).x;
+            const uint p4 = read_imageui(src0_img, qpx + 4).x;
+            w0 = (p0 >> q_sh) | (p1 << (32u - q_sh));
+            w1 = (p1 >> q_sh) | (p2 << (32u - q_sh));
+            w2 = (p2 >> q_sh) | (p3 << (32u - q_sh));
+            w3 = (p3 >> q_sh) | (p4 << (32u - q_sh));
+        }
+
+        float sumf = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {       // low nibbles -> Q[qf4,qf4+4)
+            const uint w = (j == 0) ? w0 : (j == 1) ? w1 : (j == 2) ? w2 : w3;
+            const float4 nv = (float4)(
+                (float)((w >> 0u)  & 0xFu),
+                (float)((w >> 8u)  & 0xFu),
+                (float)((w >> 16u) & 0xFu),
+                (float)((w >> 24u) & 0xFu)) - 8.0f;
+            const float4 qv = q_loc[q_id * DK_VEC_Q4GQA256 + qf4 + j];
+            sumf += nv.s0*qv.s0 + nv.s1*qv.s1 + nv.s2*qv.s2 + nv.s3*qv.s3;
+        }
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {       // high nibbles -> Q[qf4+4,qf4+8)
+            const uint w = (j == 0) ? w0 : (j == 1) ? w1 : (j == 2) ? w2 : w3;
+            const float4 nv = (float4)(
+                (float)((w >> 4u)  & 0xFu),
+                (float)((w >> 12u) & 0xFu),
+                (float)((w >> 20u) & 0xFu),
+                (float)((w >> 28u) & 0xFu)) - 8.0f;
+            const float4 qv = q_loc[q_id * DK_VEC_Q4GQA256 + qf4 + 4 + j];
+            sumf += nv.s0*qv.s0 + nv.s1*qv.s1 + nv.s2*qv.s2 + nv.s3*qv.s3;
+        }
+        sumf *= df;
+
+        sumf += sub_group_shuffle_xor(sumf, 4);
+        sumf += sub_group_shuffle_xor(sumf, 2);
+        sumf += sub_group_shuffle_xor(sumf, 1);
+
+        if (lane_q == 0) {
+            const int im_out = i03 * ne12 + (q_head_lo + q_id);
+            dst[im_out * ne1 * ne0 + r0] = sumf;
+        }
+    }
+}
+
+// ===========================================================================
 // r2=4 variants (DK=128) for Llama-3-8B. 4 Q-heads x 16 lanes; each lane owns 8
 // head_dim elements (a QUARTER block). For q4_0 a quarter = 8 nibbles from 8 qs
 // bytes: blk=lane_q>>2, nibble half nsh=((lane_q>>1)&1)*4, byte offset
