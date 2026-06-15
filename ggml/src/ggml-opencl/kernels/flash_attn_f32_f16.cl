@@ -13,7 +13,13 @@
 #define REQD_SUBGROUP_SIZE_64
 #endif
 
-// subgroup size for q1 kernels
+// Subgroup width the q1-family kernels stripe the dot/o_acc over and reduce
+// across (sub_group_reduce_*). Defaults to the Adreno default sg (64); the host
+// overrides it with -D FA_SG=<device sg> on non-Adreno GPUs. REQD_FA_SG pins the
+// width on Intel (intel_reqd_sub_group_size), where the WG would otherwise split
+// into multiple narrower subgroups and the reduces would cover only part of it.
+// Left empty on Adreno: the qcom default sg already equals FA_SG=64 there, and
+// the explicit attribute regresses sibling kernels (see the q1_vec note below).
 #ifndef FA_SG
 #define FA_SG 64
 #endif
@@ -640,6 +646,7 @@ __kernel void FA_TILE_NAME(
 // above; every decode kernel below is excluded so the tile compiles in its own
 // minimal program (the full program OOMs the Adreno compiler at DK=512).
 #ifndef FA_PREFILL_ONLY
+REQD_FA_SG
 __kernel void flash_attn_f32_f16_q1(
     const global void * q_void, ulong q_offset,
     const global void * k_void, ulong k_offset,

@@ -31,7 +31,8 @@
 
 #define DK_VEC (DK/4)
 #define DV_VEC (DV/4)
-
+// q1 reduces over a Q1_WG_SIZE-wide WG via work-group barriers; the launch WG
+// must match. Defaults to the Adreno sg (64); host passes -D FA_SG=32 on Intel.
 #ifndef FA_SG
 #define FA_SG 64
 #endif

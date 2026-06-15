@@ -1632,12 +1632,16 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         CL_CHECK((backend_ctx->kernel_restore_block_q5_1_trans4_ns = clCreateKernel(backend_ctx->program_cvt, "kernel_restore_block_q5_1_trans4_ns", &err), err));
         CL_CHECK((backend_ctx->kernel_convert_block_q4_k_trans4_ns = clCreateKernel(backend_ctx->program_cvt, "kernel_convert_block_q4_k_trans4_ns", &err), err));
         CL_CHECK((backend_ctx->kernel_restore_block_q4_k_trans4_ns = clCreateKernel(backend_ctx->program_cvt, "kernel_restore_block_q4_k_trans4_ns", &err), err));
+#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
         CL_CHECK((backend_ctx->kernel_convert_block_q4_k_tiled_ns = clCreateKernel(backend_ctx->program_cvt, "kernel_convert_block_q4_k_tiled_ns", &err), err));
+#endif
         CL_CHECK((backend_ctx->kernel_convert_block_q5_k_trans4_ns = clCreateKernel(backend_ctx->program_cvt, "kernel_convert_block_q5_k_trans4_ns", &err), err));
         CL_CHECK((backend_ctx->kernel_restore_block_q5_k_trans4_ns = clCreateKernel(backend_ctx->program_cvt, "kernel_restore_block_q5_k_trans4_ns", &err), err));
         CL_CHECK((backend_ctx->kernel_convert_block_q6_k_trans4_ns = clCreateKernel(backend_ctx->program_cvt, "kernel_convert_block_q6_k_trans4_ns", &err), err));
         CL_CHECK((backend_ctx->kernel_restore_block_q6_k_trans4_ns = clCreateKernel(backend_ctx->program_cvt, "kernel_restore_block_q6_k_trans4_ns", &err), err));
+#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
         CL_CHECK((backend_ctx->kernel_convert_block_q6_k_tiled_ns = clCreateKernel(backend_ctx->program_cvt, "kernel_convert_block_q6_k_tiled_ns", &err), err));
+#endif
         CL_CHECK((backend_ctx->kernel_convert_block_mxfp4 = clCreateKernel(backend_ctx->program_cvt, "kernel_convert_block_mxfp4", &err), err));
         CL_CHECK((backend_ctx->kernel_convert_block_mxfp4_trans = clCreateKernel(backend_ctx->program_cvt, "kernel_convert_block_mxfp4_trans", &err), err));
         CL_CHECK((backend_ctx->kernel_convert_block_mxfp4_trans4_ns = clCreateKernel(backend_ctx->program_cvt, "kernel_convert_block_mxfp4_trans4_ns", &err), err));
@@ -5100,6 +5104,9 @@ static std::string ggml_opencl_fa_compile_opts(ggml_backend_opencl_context * bac
         " -D BLOCK_M=" + std::to_string(cfg->bm) +
         " -D BLOCK_N=" + std::to_string(cfg->bn);
 
+    // q1-family kernels stripe the dot/o_acc over an FA_SG-wide subgroup and
+    // reduce across it; the width must match the hardware subgroup. Adreno uses
+    // the .cl default (64); Intel's subgroup is 32, so override + pin it there.
     if (backend_ctx->gpu_family == INTEL) {
         opts += " -D FA_SG=32";
     }
@@ -7896,8 +7903,10 @@ static void ggml_cl_mul_mat_f32_gelu_fused(ggml_backend_t backend, ggml_tensor *
 static void ggml_opencl_op_norm_fused(ggml_backend_t backend, ggml_tensor * norm_tensor, ggml_tensor * mul_tensor, ggml_tensor * add_tensor);
 static void ggml_opencl_op_group_norm_fused(ggml_backend_t backend, ggml_tensor * gn_tensor, ggml_tensor * mul_tensor, ggml_tensor * add_tensor);
 static void ggml_cl_rope_set_rows(ggml_backend_t backend, ggml_tensor * rope_tensor, ggml_tensor * view_tensor, ggml_tensor * set_rows_tensor);
+#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
 static bool ggml_opencl_can_fuse_gemma4_perlayer_block(const struct ggml_cgraph * cgraph, int i, int * out_idx);
 static void ggml_opencl_op_gemma4_perlayer_block(ggml_backend_t backend, const struct ggml_cgraph * cgraph, const int * idx);
+#endif
 inline bool use_q4k_tiled(const ggml_tensor *tensor);   // defined below
 
 // A graph node the dispatch loop skips (no kernel): VIEW/RESHAPE/PERMUTE/etc.
@@ -7913,6 +7922,7 @@ static inline bool ggml_opencl_node_is_noop(const ggml_tensor * n) {
 // contiguous in graph order for every layer (the one-time inp_per_layer
 // precompute lives elsewhere). Highly specific wiring -> the intermediate
 // outputs are private to the block, no separate use-count guard needed.
+#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
 static bool ggml_opencl_can_fuse_gemma4_perlayer_block(const struct ggml_cgraph * cgraph, int i, int * out_idx) {
     // Gather the next 8 COMPUTED nodes from index i (skipping no-op VIEW/RESHAPE/
     // PERMUTE/etc nodes that sit between the block's ops, e.g. the inp_this_layer
@@ -8141,6 +8151,7 @@ static void ggml_opencl_op_gemma4_perlayer_block(ggml_backend_t backend, const s
     CL_CHECK(clReleaseMemObject(g_img));
     CL_CHECK(clReleaseMemObject(p_img));
 }
+#endif // GGML_OPENCL_USE_ADRENO_KERNELS
 
 // Walk the cgraph and dispatch each node's kernels. When backend_ctx->rec_active
 // is set, the per-op enqueue helper records into the recordable queue instead of
@@ -8210,6 +8221,7 @@ static void ggml_backend_opencl_exec_graph_nodes(ggml_backend_t backend, ggml_cg
         // collapse the 8-op chain (DG48..65) into one dispatch. Opt-in via
         // GGML_OPENCL_MEGA_PERLAYER. Checked before the rms_add fuse so it wins
         // over the inner rms_norm+mul+add sub-pattern it contains.
+#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
         int mega_idx[8];
         if (backend_ctx->mega_perlayer && !backend_ctx->disable_fusion &&
             ggml_opencl_can_fuse_gemma4_perlayer_block(cgraph, i, mega_idx)) {
@@ -8217,6 +8229,7 @@ static void ggml_backend_opencl_exec_graph_nodes(ggml_backend_t backend, ggml_cg
             i = mega_idx[7];   // jump past the whole block (interspersed no-ops produce no kernels)
             continue;
         }
+#endif
 
         // Fuse mul_mat(f32) + gelu — fold the GELU activation into the f32 matmul
         // epilogue (Gemma-4 inp_gate gate). Opt-in GGML_OPENCL_FUSE_MM_GELU=1: it
@@ -8230,6 +8243,7 @@ static void ggml_backend_opencl_exec_graph_nodes(ggml_backend_t backend, ggml_cg
             continue;
         }
 
+#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
         // Fuse mul_mat(Wg,x) + mul_mat(Wu,x) + glu — fold the FFN's two decode
         // GEMVs and the GLU into one dispatch (CUDA/Vulkan parity). q4_K only;
         // byte-identical to the per-op path (same accumulation/reduction order,
@@ -8262,6 +8276,7 @@ static void ggml_backend_opencl_exec_graph_nodes(ggml_backend_t backend, ggml_cg
             i += 4;
             continue;
         }
+#endif // GGML_OPENCL_USE_ADRENO_KERNELS
 
         // Fuse rms_norm + mul(weight) + add(residual). Default on; opt out with
         // GGML_OPENCL_FUSE_RMS_ADD=0 (kept separate from the rms_norm+mul fuse so
@@ -9093,6 +9108,15 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
             }
 
             if (dk == 512) {
+                // The DK=512 program is split into minimal per-purpose
+                // programs so each fits the Adreno compiler's host-memory
+                // ceiling (the monolithic program OOMs with CL_OUT_OF_HOST_MEMORY).
+                // Only f16 KV (Gemma-4 global layers) is built on the GPU here;
+                // every other KV combo (f32, f16-q, quant) would need a full
+                // program that OOMs, so decline up front — no probe compile —
+                // and let the graph run it on CPU. q->ne[1] is n_q.
+                // Intel's OpenCL compiler crashes building the DK=512 kernels, so
+                // decline on Intel up front and run these layers on the CPU backend.
                 if (backend_ctx->gpu_family == INTEL) {
                     return false;
                 }
@@ -17285,12 +17309,15 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
                     : backend_ctx->fa.bn.at(dk_dv))
         : 0;
     // Pick split variant only when n_kv crosses the per-(dk,dv) threshold.
-    // the N_SPLIT>1 prefill tile reduces DK partials via subgroup shuffle,
-    // on Intel it uses the non-split BM tile and does not depend on subgroup size
+    // The N_SPLIT>1 prefill tile reduces DK partials via subgroup shuffle (64-wide
+    // on Adreno); on Intel use the non-split BM tile, which is per-query-row and
+    // subgroup-width-agnostic.
     const bool use_split_kernel = (n_q > 1 && is_mixed &&
         backend_ctx->gpu_family != INTEL &&
         backend_ctx->fa.f32_f16_split.count(dk_dv) > 0 &&
         n_kv >= backend_ctx->fa.f32_f16_split_nkv_threshold.at(dk_dv));
+    // Split prefill reduces DK partials via subgroup shuffle (64-wide on Adreno);
+    // on Intel use the non-split native tile (per-query-row, sg-width-agnostic).
     const bool use_split_q8_0 = (use_native_q8_0 && backend_ctx->gpu_family != INTEL &&
         backend_ctx->fa.f32_q8_0_split.count(dk_dv) > 0 &&
         n_kv >= backend_ctx->fa.f32_q8_0_split_nkv_threshold.at(dk_dv));
@@ -17469,7 +17496,11 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         }
     }
 
-    // Intel goes to the basic q1 kernel
+    // Intel reference path: the vec/MQ/local-tile decode variants are tuned for
+    // a 64-wide Adreno subgroup and miscompute on Intel's narrower (32) subgroup.
+    // Route decode to the basic q1 kernel, which is parameterized on FA_SG and
+    // pins the subgroup width via REQD_FA_SG. The MQ FD-split path is disabled on
+    // Intel below; prefill uses the non-split BM tile (per-lane, sg-agnostic).
     if (backend_ctx->gpu_family == INTEL && n_q == 1) {
         use_q1_vec = use_q1_vec_mq = use_local_tile = false;
         if (is_mixed && backend_ctx->fa.f32_f16_q1.count(dk_dv))      { kernel = backend_ctx->fa.f32_f16_q1.at(dk_dv); }
@@ -17588,8 +17619,8 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         // Quant-KV (q4_0/q8_0) GQA4 c8: default-on X2E + X1E
         const bool c8_quant_on = (c8_env_state >= 0) ? (c8_env_state == 1) : c8_default_on;
         if (mq_enabled && mq_kv_ok && nq_in_vec_range && !is_causal &&
-            backend_ctx->gpu_family != INTEL &&
-            !use_local_tile &&
+            backend_ctx->gpu_family != INTEL &&  // MQ FD-split is 64-wide-subgroup tuned; Intel uses basic q1
+            !use_local_tile &&  // local-tile dispatches its own grid, skip MQ FD-split
             n_kv >= FD_MIN_N_KV &&
             backend_ctx->fa.f32_merge.count(dk_dv) > 0) {
             if (nq1_only && lmq_on && is_mixed && d_head_q == 128 && d_head_v == 128 &&
@@ -23519,7 +23550,11 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     // Route the wide f16 weight matmuls (attn proj + lm_head) to the
                     // multi-row variant: MROW rows per WG -> more loads in flight +
                     // activation staged once in __local. ne00<=8192 bounds the LDS.
-                    if (backend_ctx->f16_mrow && backend_ctx->kernel_mul_mat_f16_f32_mrow != nullptr &&
+                    // The mrow kernels launch a 64-lane (Adreno subgroup) x MROW WG
+                    // = 1024 work-items, over Intel's 512 max -> CL_INVALID_WORK_GROUP_SIZE.
+                    // They also reduce within a 64-wide subgroup. Skip on Intel.
+                    if (backend_ctx->f16_mrow && backend_ctx->gpu_family != INTEL &&
+                        backend_ctx->kernel_mul_mat_f16_f32_mrow != nullptr &&
                         ne00 >= 128 && ne01 >= 8 && ne00 % 4 == 0 && ne00 <= 8192) {
                         // Register-blocked variants: each subgroup does RPT rows (more
                         // weight loads in flight per lane -> higher streaming BW).
