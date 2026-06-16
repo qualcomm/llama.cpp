@@ -57,6 +57,25 @@ struct block_q4_1 {
 };
 
 //------------------------------------------------------------------------------
+// block_q5_0
+//------------------------------------------------------------------------------
+struct block_q5_0 {
+    half d; // delta
+    uchar qh[4]; // 5-th bit of quants
+    uchar qs[QK5_0 / 2]; // nibbles / quants
+};
+
+//------------------------------------------------------------------------------
+// block_q5_1
+//------------------------------------------------------------------------------
+struct block_q5_1 {
+    half d; // delta
+    half m; // min
+    uchar qh[4]; // 5-th bit of quants
+    uchar qs[QK5_1 / 2]; // nibbles / quants
+};
+
+//------------------------------------------------------------------------------
 // block_q4_k
 //------------------------------------------------------------------------------
 struct block_q4_K {
@@ -97,6 +116,48 @@ struct block_iq4_nl
     half d;
     uint8_t qs[QK4_NL / 2];
 };
+
+//------------------------------------------------------------------------------
+// bf16 to f16
+//------------------------------------------------------------------------------
+kernel void kernel_convert_bf16_to_f16(
+    global const ushort * src,
+    global half * dst,
+    ulong off_dst,
+    ulong n
+) {
+    uint i = get_global_id(0);
+    if (i >= n) {
+        return;
+    }
+
+    dst[i + off_dst] = (half) as_float((uint) src[i] << 16);
+}
+
+//------------------------------------------------------------------------------
+// f16 to bf16
+//------------------------------------------------------------------------------
+kernel void kernel_convert_f16_to_bf16(
+    global const half * src,
+    ulong off_src,
+    global ushort * dst,
+    ulong n
+) {
+    uint i = get_global_id(0);
+    if (i >= n) {
+        return;
+    }
+
+    float f = (float) src[i + off_src];
+    uint bits = as_uint(f);
+    if ((bits & 0x7fffffffu) > 0x7f800000u) {
+        // nan to quiet nan
+        dst[i] = (ushort)((bits >> 16) | 0x40u);
+    } else {
+        uint rounded = bits + 0x7fffu + ((bits >> 16) & 1u);
+        dst[i] = (ushort)(rounded >> 16);
+    }
+}
 
 //------------------------------------------------------------------------------
 // kernel_convert_block_q4_0
@@ -188,6 +249,100 @@ kernel void kernel_restore_block_q4_0_noshuffle(
         b->qs[2*i + 0] = convert_uchar((x0 & mask_0F) | ((x1 & mask_0F) << 4));
         b->qs[2*i + 1] = convert_uchar(((x0 & mask_F0) >> 4) | (x1 & mask_F0));
     }
+}
+
+kernel void kernel_convert_block_q4_0_trans4_ns(
+    global struct block_q4_0 * src0,
+    __global uint * dst_q,
+    __global half * dst_d,
+    uint ne00,
+    uint ne01
+) {
+    uint i00 = get_global_id(1);
+    uint i01 = get_global_id(0);
+    uint i02 = get_global_id(2);
+
+    if (i01 >= ne01) {
+        return;
+    }
+
+    uint ne00_blk = ne00 / QK4_0;
+    uint src_blk_offset = i00 + i01 * ne00_blk + i02 * ne00_blk * ne01;
+    uint dst_blk_offset = i01 + i00 * ne01 + i02 * ne00_blk * ne01;
+
+    global struct block_q4_0 * b = src0 + src_blk_offset;
+    dst_d[dst_blk_offset] = b->d;
+
+    // extract quantization and unshuffle
+    ushort8 pre_block = ((global ushort8 *)(&(b->qs[0])))[0];
+
+    ushort8 post_block = (ushort8)(0);
+
+    uchar * pre_block_ptr = (uchar *)(&pre_block);
+    uchar * post_block_ptr = (uchar *)(&post_block);
+
+    for (int i = 0; i < QK4_0 / 4; ++i) {
+        uchar x0 = pre_block_ptr[2*i + 0];
+        uchar x1 = pre_block_ptr[2*i + 1];
+
+        post_block_ptr[i + 0        ] = convert_uchar(x0 & 0x0F) | convert_uchar((x1 & 0x0F) << 4);
+        post_block_ptr[i + QK4_0 / 4] = convert_uchar((x0 & 0xF0) >> 4) | convert_uchar(x1 & 0xF0);
+    }
+
+    uint4 q_block = as_uint4(post_block);
+
+    uint offset = i02 * ne00_blk * ne01 * 4 + i00 * ne01 * 4 + i01;
+    dst_q[offset] = q_block.x;
+    dst_q[offset + ne01] = q_block.y;
+    dst_q[offset + ne01 * 2] = q_block.z;
+    dst_q[offset + ne01 * 3] = q_block.w;
+}
+
+kernel void kernel_restore_block_q4_0_trans4_ns(
+    __global uint * src_q,
+    __global half * src_d,
+    __global struct block_q4_0 * dst0,
+    uint ne00,
+    uint ne01
+) {
+    uint i00 = get_global_id(1);
+    uint i01 = get_global_id(0);
+    uint i02 = get_global_id(2);
+
+    if (i01 >= ne01) {
+        return;
+    }
+
+    uint ne00_blk = ne00 / QK4_0;
+    uint dst_blk_offset = i00 + i01 * ne00_blk + i02 * ne00_blk * ne01;
+    uint src_d_offset = i01 + i00 * ne01 + i02 * ne00_blk * ne01;
+
+    __global struct block_q4_0 * b = dst0 + dst_blk_offset;
+    b->d = src_d[src_d_offset];
+
+    // collect transposed quantization parts for a block
+    uint src_q_offset = i02 * ne00_blk * ne01 * 4 + i00 * ne01 * 4 + i01;
+    uint4 q_block;
+    q_block.x = src_q[src_q_offset];
+    q_block.y = src_q[src_q_offset + ne01];
+    q_block.z = src_q[src_q_offset + ne01 * 2];
+    q_block.w = src_q[src_q_offset + ne01 * 3];
+
+    ushort8 post_block = as_ushort8(q_block);
+    ushort8 pre_block = (ushort8)(0);
+
+    uchar * pre_block_ptr = (uchar *)(&pre_block);
+    uchar * post_block_ptr = (uchar *)(&post_block);
+
+    for (int i = 0; i < QK4_0 / 4; ++i) {
+        uchar x0 = post_block_ptr[i + 0];
+        uchar x1 = post_block_ptr[i + QK4_0 / 4];
+
+        pre_block_ptr[2 * i + 0] = convert_uchar(x0 & 0x0F) | convert_uchar((x1 & 0x0F) << 4);
+        pre_block_ptr[2 * i + 1] = convert_uchar((x0 & 0xF0) >> 4) | convert_uchar(x1 & 0xF0);
+    }
+
+    ((__global ushort8 *)(&(b->qs[0])))[0] = pre_block;
 }
 
 //------------------------------------------------------------------------------
@@ -284,6 +439,1000 @@ kernel void kernel_restore_block_q4_1_noshuffle(
     }
 }
 
+kernel void kernel_convert_block_q4_1_trans4_ns(
+    __global struct block_q4_1 * src0,
+    __global uint * dst_q,
+    __global half * dst_d,
+    __global half * dst_m,
+    uint ne00,
+    uint ne01
+) {
+    uint i00 = get_global_id(1);
+    uint i01 = get_global_id(0);
+    uint i02 = get_global_id(2);
+
+    if (i01 >= ne01) {
+        return;
+    }
+
+    uint ne00_blk = ne00 / QK4_1;
+    uint src_blk_offset = i00 + i01 * ne00_blk + i02 * ne00_blk * ne01;
+    uint dst_blk_offset = i01 + i00 * ne01 + i02 * ne00_blk * ne01;
+
+    global struct block_q4_1 * b = src0 + src_blk_offset;
+    dst_d[dst_blk_offset] = b->d;
+    dst_m[dst_blk_offset] = b->m;
+
+    // extract quantization and unshuffle
+    ushort8 pre_block = ((global ushort8 *)(&(b->qs[0])))[0];
+
+    ushort8 post_block = (ushort8)(0);
+
+    uchar * pre_block_ptr = (uchar *)(&pre_block);
+    uchar * post_block_ptr = (uchar *)(&post_block);
+
+    for (int i = 0; i < QK4_1 / 4; ++i) {
+        uchar x0 = pre_block_ptr[2*i + 0];
+        uchar x1 = pre_block_ptr[2*i + 1];
+
+        post_block_ptr[i + 0        ] = convert_uchar(x0 & 0x0F) | convert_uchar((x1 & 0x0F) << 4);
+        post_block_ptr[i + QK4_1 / 4] = convert_uchar((x0 & 0xF0) >> 4) | convert_uchar(x1 & 0xF0);
+    }
+
+    uint4 q_block = as_uint4(post_block);
+
+    uint offset = i02 * ne00_blk * ne01 * 4 + i00 * ne01 * 4 + i01;
+    dst_q[offset] = q_block.x;
+    dst_q[offset + ne01] = q_block.y;
+    dst_q[offset + ne01 * 2] = q_block.z;
+    dst_q[offset + ne01 * 3] = q_block.w;
+}
+
+kernel void kernel_restore_block_q4_1_trans4_ns(
+    __global uint * src_q,
+    __global half * src_d,
+    __global half * src_m,
+    __global struct block_q4_1 * dst0,
+    uint ne00,
+    uint ne01
+) {
+    int i00 = get_global_id(1);
+    uint i01 = get_global_id(0);
+    uint i02 = get_global_id(2);
+
+    if (i01 >= ne01) {
+        return;
+    }
+
+    uint ne00_blk = ne00 / QK4_1;
+    uint dst_blk_offset = i00 + i01 * ne00_blk + i02 * ne00_blk * ne01;
+    uint src_dm_offset = i01 + i00 * ne01 + i02 * ne00_blk * ne01;
+
+    __global struct block_q4_1 * b = dst0 + dst_blk_offset;
+    b->d = src_d[src_dm_offset];
+    b->m = src_m[src_dm_offset];
+
+    // collect transposed quantization parts for a block
+    uint src_q_offset = i02 * ne00_blk * ne01 * 4 + i00 * ne01 * 4 + i01;
+    uint4 q_block;
+    q_block.x = src_q[src_q_offset];
+    q_block.y = src_q[src_q_offset + ne01];
+    q_block.z = src_q[src_q_offset + ne01 * 2];
+    q_block.w = src_q[src_q_offset + ne01 * 3];
+
+    ushort8 post_block = as_ushort8(q_block);
+    ushort8 pre_block = (ushort8)(0);
+
+    uchar * pre_block_ptr = (uchar *)(&pre_block);
+    uchar * post_block_ptr = (uchar *)(&post_block);
+
+    for (int i = 0; i < QK4_0 / 4; ++i) {
+        uchar x0 = post_block_ptr[i + 0];
+        uchar x1 = post_block_ptr[i + QK4_0 / 4];
+
+        pre_block_ptr[2 * i + 0] = convert_uchar(x0 & 0x0F) | convert_uchar((x1 & 0x0F) << 4);
+        pre_block_ptr[2 * i + 1] = convert_uchar((x0 & 0xF0) >> 4) | convert_uchar(x1 & 0xF0);
+    }
+
+    ((__global ushort8 *)(&(b->qs[0])))[0] = pre_block;
+}
+
+//------------------------------------------------------------------------------
+// kernel_convert_block_q5_0
+// Convert the block_q5_0 format to 3 separate arrays (AOS -> SOA).
+// This kernel does not deshuffle the bits.
+//------------------------------------------------------------------------------
+kernel void kernel_convert_block_q5_0(
+    global struct block_q5_0 * src0,
+    global uchar * dst_qs,
+    global uint  * dst_qh,
+    global half  * dst_d,
+    ulong n_blk
+) {
+    if (get_global_id(0) >= n_blk) {
+        return;
+    }
+
+    global struct block_q5_0 * b = (global struct block_q5_0 *) src0 + get_global_id(0);
+    global uchar * qs = (global uchar *) dst_qs + (QK5_0/2)*get_global_id(0);
+    global uint  * qh = (global uint  *) dst_qh + get_global_id(0);
+    global half  * d  = (global half  *) dst_d  + get_global_id(0);
+
+    *d = b->d;
+    *qh = *((global uint *)(b->qh));
+
+    for (int i = 0; i < QK5_0/2; ++i) {
+        qs[i] = b->qs[i];
+    }
+}
+
+kernel void kernel_restore_block_q5_0(
+    global uchar * src_qs,
+    global uint  * src_qh,
+    global half  * src_d,
+    global struct block_q5_0 * dst
+) {
+    global struct block_q5_0 * b = (global struct block_q5_0 *) dst + get_global_id(0);
+    global uchar * qs = (global uchar *) src_qs + (QK5_0/2)*get_global_id(0);
+    global uint  * qh = (global uint  *) src_qh + get_global_id(0);
+    global half  * d  = (global half  *) src_d  + get_global_id(0);
+
+    b->d = *d;
+    *((global uint *)(b->qh)) = *qh;
+    for (int i = 0; i < QK5_0/2; ++i) {
+        b->qs[i] = qs[i];
+    }
+}
+
+kernel void kernel_convert_block_q5_0_noshuffle(
+    global struct block_q5_0 * src0,
+    global uchar * dst_q,
+    global uint  * dst_qh,
+    global half  * dst_d
+) {
+    global struct block_q5_0 * b = (global struct block_q5_0 *) src0 + get_global_id(0);
+    global uchar * q  = (global uchar *) dst_q + QK5_0/2*get_global_id(0);
+    global uint  * qh = (global uint  *) dst_qh + get_global_id(0);
+    global half  * d  = (global half  *) dst_d  + get_global_id(0);
+
+    *d = b->d;
+    *qh = *((global uint *)(b->qh));
+
+    for (int i = 0; i < QK5_0/4; ++i) {
+        uchar x0 = b->qs[2*i + 0];
+        uchar x1 = b->qs[2*i + 1];
+
+        q[i + 0      ] = convert_uchar(x0 & 0x0F) | convert_uchar((x1 & 0x0F) << 4);
+        q[i + QK5_0/4] = convert_uchar((x0 & 0xF0) >> 4) | convert_uchar(x1 & 0xF0);
+
+#ifdef ADRENO_GPU
+        if (get_global_id(0) == 65536*4096) {
+            printf("%04x - %02x\n", *(global ushort*)d, ((x0 & 0xF0) >> 4) | (x1 & 0xF0));
+        }
+#endif
+    }
+}
+
+kernel void kernel_restore_block_q5_0_noshuffle(
+    global uchar * src_q,
+    global uint  * src_qh,
+    global half  * src_d,
+    global struct block_q5_0 * dst,
+    uchar mask_0F,
+    uchar mask_F0
+) {
+    global struct block_q5_0 * b = (global struct block_q5_0 *) dst + get_global_id(0);
+    global uchar * q  = (global uchar *) src_q + QK5_0/2*get_global_id(0);
+    global uint  * qh = (global uint  *) src_qh + get_global_id(0);
+    global half  * d  = (global half  *) src_d  + get_global_id(0);
+
+    b->d = *d;
+    *((global uint *)(b->qh)) = *qh;
+
+    for (int i = 0; i < QK5_0/4; ++i) {
+        uchar x0 = q[i + 0      ];
+        uchar x1 = q[i + QK5_0/4];
+
+        b->qs[2*i + 0] = convert_uchar((x0 & mask_0F) | ((x1 & mask_0F) << 4));
+        b->qs[2*i + 1] = convert_uchar(((x0 & mask_F0) >> 4) | (x1 & mask_F0));
+    }
+}
+
+kernel void kernel_convert_block_q5_0_trans4_ns(
+    __global struct block_q5_0 * src0,
+    __global uint * dst_qs,
+    __global uint * dst_qh,
+    __global half * dst_d,
+    uint ne00,
+    uint ne01
+) {
+    uint i00 = get_global_id(1);
+    uint i01 = get_global_id(0);
+    uint i02 = get_global_id(2);
+
+    if (i01 >= ne01) {
+        return;
+    }
+
+    uint ne00_blk = ne00 / QK5_0;
+    uint src_blk_offset = i00 + i01 * ne00_blk + i02 * ne00_blk * ne01;
+    uint dst_blk_offset = i01 + i00 * ne01 + i02 * ne00_blk * ne01;
+
+    global struct block_q5_0 * b = src0 + src_blk_offset;
+    dst_d[dst_blk_offset] = b->d;
+
+    dst_qh[dst_blk_offset] = ((global uint *)(&(b->qh[0])))[0];
+
+    // extract quantization and unshuffle
+    ushort8 pre_block = ((global ushort8 *)(&(b->qs[0])))[0];
+    ushort8 post_block = (ushort8)(0);
+
+    uchar * pre_block_ptr = (uchar *)(&pre_block);
+    uchar * post_block_ptr = (uchar *)(&post_block);
+
+    for (int i = 0; i < QK5_0 / 4; ++i) {
+        uchar x0 = pre_block_ptr[2*i + 0];
+        uchar x1 = pre_block_ptr[2*i + 1];
+
+        post_block_ptr[i + 0        ] = convert_uchar(x0 & 0x0F) | convert_uchar((x1 & 0x0F) << 4);
+        post_block_ptr[i + QK5_0 / 4] = convert_uchar((x0 & 0xF0) >> 4) | convert_uchar(x1 & 0xF0);
+    }
+
+    uint4 q_block = as_uint4(post_block);
+
+    uint offset = i02 * ne00_blk * ne01 * 4 + i00 * ne01 * 4 + i01;
+    dst_qs[offset] = q_block.x;
+    dst_qs[offset + ne01] = q_block.y;
+    dst_qs[offset + ne01 * 2] = q_block.z;
+    dst_qs[offset + ne01 * 3] = q_block.w;
+}
+
+kernel void kernel_restore_block_q5_0_trans4_ns(
+    __global uint * src_qs,
+    __global uint * src_qh,
+    __global half * src_d,
+    __global struct block_q5_0 * dst0,
+    uint ne00,
+    uint ne01
+) {
+    int i00 = get_global_id(1);
+    uint i01 = get_global_id(0);
+    uint i02 = get_global_id(2);
+
+    if (i01 >= ne01) {
+        return;
+    }
+
+    uint ne00_blk = ne00 / QK5_0;
+    uint dst_blk_offset = i00 + i01 * ne00_blk + i02 * ne00_blk * ne01;
+    uint src_blk_offset = i01 + i00 * ne01 + i02 * ne00_blk * ne01;
+
+    __global struct block_q5_0 * b = dst0 + dst_blk_offset;
+    b->d = src_d[src_blk_offset];
+
+    ((__global uint *)(&(b->qh[0])))[0] = src_qh[src_blk_offset];
+
+    // collect transposed quantization parts for a block
+    uint src_q_offset = i02 * ne00_blk * ne01 * 4 + i00 * ne01 * 4 + i01;
+    uint4 q_block;
+    q_block.x = src_qs[src_q_offset];
+    q_block.y = src_qs[src_q_offset + ne01];
+    q_block.z = src_qs[src_q_offset + ne01 * 2];
+    q_block.w = src_qs[src_q_offset + ne01 * 3];
+
+    ushort8 post_block = as_ushort8(q_block);
+    ushort8 pre_block = (ushort8)(0);
+
+    uchar * pre_block_ptr = (uchar *)(&pre_block);
+    uchar * post_block_ptr = (uchar *)(&post_block);
+
+    for (int i = 0; i < QK5_0 / 4; ++i) {
+        uchar x0 = post_block_ptr[i + 0];
+        uchar x1 = post_block_ptr[i + QK5_0 / 4];
+
+        pre_block_ptr[2 * i + 0] = convert_uchar(x0 & 0x0F) | convert_uchar((x1 & 0x0F) << 4);
+        pre_block_ptr[2 * i + 1] = convert_uchar((x0 & 0xF0) >> 4) | convert_uchar(x1 & 0xF0);
+    }
+
+    ((__global ushort8 *)(&(b->qs[0])))[0] = pre_block;
+}
+
+//------------------------------------------------------------------------------
+// kernel_convert_block_q5_1
+// Convert the block_q5_1 format to 4 separate arrays (AOS -> SOA).
+// This kernel does not deshuffle the bits.
+//------------------------------------------------------------------------------
+kernel void kernel_convert_block_q5_1(
+    global struct block_q5_1 * src0,
+    global uchar * dst_qs,
+    global uint  * dst_qh,
+    global half  * dst_d,
+    global half  * dst_m,
+    ulong n_blk
+) {
+    if (get_global_id(0) >= n_blk) {
+        return;
+    }
+
+    global struct block_q5_1 * b = (global struct block_q5_1 *) src0 + get_global_id(0);
+    global uchar * qs = (global uchar *) dst_qs + (QK5_1/2)*get_global_id(0);
+    global uint  * qh = (global uint  *) dst_qh + get_global_id(0);
+    global half  * d  = (global half  *) dst_d  + get_global_id(0);
+    global half  * m  = (global half  *) dst_m  + get_global_id(0);
+
+    *d = b->d;
+    *m = b->m;
+    *qh = *((global uint *)(b->qh));
+
+    for (int i = 0; i < QK5_1/2; ++i) {
+        qs[i] = b->qs[i];
+    }
+}
+
+kernel void kernel_restore_block_q5_1(
+    global uchar * src_qs,
+    global uint  * src_qh,
+    global half  * src_d,
+    global half  * src_m,
+    global struct block_q5_1 * dst
+) {
+    global struct block_q5_1 * b = (global struct block_q5_1 *) dst + get_global_id(0);
+    global uchar * qs = (global uchar *) src_qs + (QK5_1/2)*get_global_id(0);
+    global uint  * qh = (global uint  *) src_qh + get_global_id(0);
+    global half  * d  = (global half  *) src_d  + get_global_id(0);
+    global half  * m  = (global half  *) src_m  + get_global_id(0);
+
+    b->d = *d;
+    b->m = *m;
+    *((global uint *)(b->qh)) = *qh;
+    for (int i = 0; i < QK5_1/2; ++i) {
+        b->qs[i] = qs[i];
+    }
+}
+
+kernel void kernel_convert_block_q5_1_noshuffle(
+    global struct block_q5_1 * src0,
+    global uchar * dst_q,
+    global uint  * dst_qh,
+    global half  * dst_d,
+    global half  * dst_m
+) {
+    global struct block_q5_1 * b = (global struct block_q5_1 *) src0 + get_global_id(0);
+    global uchar * q  = (global uchar *) dst_q + QK5_1/2*get_global_id(0);
+    global uint  * qh = (global uint  *) dst_qh + get_global_id(0);
+    global half  * d  = (global half  *) dst_d  + get_global_id(0);
+    global half  * m  = (global half  *) dst_m  + get_global_id(0);
+
+    *d = b->d;
+    *m = b->m;
+    *qh = *((global uint *)(b->qh));
+
+    for (int i = 0; i < QK5_1/4; ++i) {
+        uchar x0 = b->qs[2*i + 0];
+        uchar x1 = b->qs[2*i + 1];
+
+        q[i + 0      ] = convert_uchar(x0 & 0x0F) | convert_uchar((x1 & 0x0F) << 4);
+        q[i + QK5_1/4] = convert_uchar((x0 & 0xF0) >> 4) | convert_uchar(x1 & 0xF0);
+
+#ifdef ADRENO_GPU
+        if (get_global_id(0) == 65536*4096) {
+            printf("%04x - %02x\n", *(global ushort*)d, ((x0 & 0xF0) >> 4) | (x1 & 0xF0));
+        }
+#endif
+    }
+}
+
+kernel void kernel_restore_block_q5_1_noshuffle(
+    global uchar * src_q,
+    global uint  * src_qh,
+    global half  * src_d,
+    global half  * src_m,
+    global struct block_q5_1 * dst,
+    uchar mask_0F,
+    uchar mask_F0
+) {
+    global struct block_q5_1 * b = (global struct block_q5_1 *) dst + get_global_id(0);
+    global uchar * q  = (global uchar *) src_q + QK5_1/2*get_global_id(0);
+    global uint  * qh = (global uint  *) src_qh + get_global_id(0);
+    global half  * d  = (global half  *) src_d  + get_global_id(0);
+    global half  * m  = (global half  *) src_m  + get_global_id(0);
+
+    b->d = *d;
+    b->m = *m;
+    *((global uint *)(b->qh)) = *qh;
+
+    for (int i = 0; i < QK5_1/4; ++i) {
+        uchar x0 = q[i + 0      ];
+        uchar x1 = q[i + QK5_1/4];
+
+        b->qs[2*i + 0] = convert_uchar((x0 & mask_0F) | ((x1 & mask_0F) << 4));
+        b->qs[2*i + 1] = convert_uchar(((x0 & mask_F0) >> 4) | (x1 & mask_F0));
+    }
+}
+
+kernel void kernel_convert_block_q5_1_trans4_ns(
+    __global struct block_q5_1 * src0,
+    __global uint * dst_qs,
+    __global uint * dst_qh,
+    __global half * dst_d,
+    __global half * dst_m,
+    uint ne00,
+    uint ne01
+) {
+    uint i00 = get_global_id(1);
+    uint i01 = get_global_id(0);
+    uint i02 = get_global_id(2);
+
+    if (i01 >= ne01) {
+        return;
+    }
+
+    uint ne00_blk = ne00 / QK5_1;
+    uint src_blk_offset = i00 + i01 * ne00_blk + i02 * ne00_blk * ne01;
+    uint dst_blk_offset = i01 + i00 * ne01 + i02 * ne00_blk * ne01;
+
+    global struct block_q5_1 * b = src0 + src_blk_offset;
+    dst_d[dst_blk_offset] = b->d;
+    dst_m[dst_blk_offset] = b->m;
+
+    dst_qh[dst_blk_offset] = ((global uint *)(&(b->qh[0])))[0];
+
+    // extract quantization and unshuffle
+    ushort8 pre_block = ((global ushort8 *)(&(b->qs[0])))[0];
+    ushort8 post_block = (ushort8)(0);
+
+    uchar * pre_block_ptr = (uchar *)(&pre_block);
+    uchar * post_block_ptr = (uchar *)(&post_block);
+
+    for (int i = 0; i < QK5_1 / 4; ++i) {
+        uchar x0 = pre_block_ptr[2*i + 0];
+        uchar x1 = pre_block_ptr[2*i + 1];
+
+        post_block_ptr[i + 0        ] = convert_uchar(x0 & 0x0F) | convert_uchar((x1 & 0x0F) << 4);
+        post_block_ptr[i + QK5_1 / 4] = convert_uchar((x0 & 0xF0) >> 4) | convert_uchar(x1 & 0xF0);
+    }
+
+    uint4 q_block = as_uint4(post_block);
+
+    uint offset = i02 * ne00_blk * ne01 * 4 + i00 * ne01 * 4 + i01;
+    dst_qs[offset] = q_block.x;
+    dst_qs[offset + ne01] = q_block.y;
+    dst_qs[offset + ne01 * 2] = q_block.z;
+    dst_qs[offset + ne01 * 3] = q_block.w;
+}
+
+kernel void kernel_restore_block_q5_1_trans4_ns(
+    __global uint * src_qs,
+    __global uint * src_qh,
+    __global half * src_d,
+    __global half * src_m,
+    __global struct block_q5_1 * dst0,
+    uint ne00,
+    uint ne01
+) {
+    int i00 = get_global_id(1);
+    uint i01 = get_global_id(0);
+    uint i02 = get_global_id(2);
+
+    if (i01 >= ne01) {
+        return;
+    }
+
+    uint ne00_blk = ne00 / QK5_1;
+    uint dst_blk_offset = i00 + i01 * ne00_blk + i02 * ne00_blk * ne01;
+    uint src_blk_offset = i01 + i00 * ne01 + i02 * ne00_blk * ne01;
+
+    __global struct block_q5_1 * b = dst0 + dst_blk_offset;
+    b->d = src_d[src_blk_offset];
+    b->m = src_m[src_blk_offset];
+
+    ((__global uint *)(&(b->qh[0])))[0] = src_qh[src_blk_offset];
+
+    // collect transposed quantization parts for a block
+    uint src_q_offset = i02 * ne00_blk * ne01 * 4 + i00 * ne01 * 4 + i01;
+    uint4 q_block;
+    q_block.x = src_qs[src_q_offset];
+    q_block.y = src_qs[src_q_offset + ne01];
+    q_block.z = src_qs[src_q_offset + ne01 * 2];
+    q_block.w = src_qs[src_q_offset + ne01 * 3];
+
+    ushort8 post_block = as_ushort8(q_block);
+    ushort8 pre_block = (ushort8)(0);
+
+    uchar * pre_block_ptr = (uchar *)(&pre_block);
+    uchar * post_block_ptr = (uchar *)(&post_block);
+
+    for (int i = 0; i < QK5_1 / 4; ++i) {
+        uchar x0 = post_block_ptr[i + 0];
+        uchar x1 = post_block_ptr[i + QK5_1 / 4];
+
+        pre_block_ptr[2 * i + 0] = convert_uchar(x0 & 0x0F) | convert_uchar((x1 & 0x0F) << 4);
+        pre_block_ptr[2 * i + 1] = convert_uchar((x0 & 0xF0) >> 4) | convert_uchar(x1 & 0xF0);
+    }
+    ((__global ushort8 *)(&(b->qs[0])))[0] = pre_block;
+}
+
+kernel void kernel_convert_block_q4_k_trans4_ns(
+    __global struct block_q4_K * src0,
+    __global uint  * dst_q,
+    __global half  * dst_d,
+    __global half  * dst_dm,
+    __global uchar * dst_s,
+    uint ne00,
+    uint ne01,
+    uchar mask_0F,
+    uchar mask_F0
+) {
+    uint i00 = get_global_id(1);
+    uint i01 = get_global_id(0);
+    uint i02 = get_global_id(2);
+
+    if (i01 >= ne01) {
+        return;
+    }
+
+    uint ne00_blk = ne00 / QK_K;
+    uint src_blk_offset = i00 + i01 * ne00_blk + i02 * ne00_blk * ne01;
+    uint dst_blk_offset = i01 + i00 * ne01     + i02 * ne00_blk * ne01;
+
+    __global struct block_q4_K * b = src0 + src_blk_offset;
+
+    dst_d [dst_blk_offset] = b->d;
+    dst_dm[dst_blk_offset] = b->dm;
+
+    uint4 qv[8];
+    uchar * qv_bytes = (uchar *)qv;
+    for (int i = 0; i < QK_K / 64; ++i) {
+        for (int j = 0; j < 16; ++j) {
+            uchar x0 = b->q[i*32 + 2*j];
+            uchar x1 = b->q[i*32 + 2*j + 1];
+
+            qv_bytes[i*32 + j     ] = convert_uchar(x0 & mask_0F) | convert_uchar((x1 & mask_0F) << 4);
+            qv_bytes[i*32 + j + 16] = convert_uchar((x0 & mask_F0) >> 4) | convert_uchar(x1 & mask_F0);
+        }
+    }
+
+    uint base = i02 * ne00_blk * ne01 * 32 + i00 * ne01 * 32 + i01;
+    #pragma unroll
+    for (int p = 0; p < 8; ++p) {
+        uint4 v = qv[p];
+        dst_q[base + (p * 4 + 0) * ne01] = v.x;
+        dst_q[base + (p * 4 + 1) * ne01] = v.y;
+        dst_q[base + (p * 4 + 2) * ne01] = v.z;
+        dst_q[base + (p * 4 + 3) * ne01] = v.w;
+    }
+
+    __global uchar * s_dst = dst_s + (i02 * ne01 + i01) * ne00_blk * K_SCALE_SIZE + i00 * K_SCALE_SIZE;
+    #pragma unroll
+    for (int i = 0; i < K_SCALE_SIZE; ++i) {
+        s_dst[i] = b->s[i];
+    }
+}
+
+kernel void kernel_restore_block_q4_k_trans4_ns(
+    __global uint  * src_q,
+    __global half  * src_d,
+    __global half  * src_dm,
+    __global uchar * src_s,
+    __global struct block_q4_K * dst0,
+    uint ne00,
+    uint ne01,
+    uchar mask_0F,
+    uchar mask_F0
+) {
+    uint i00 = get_global_id(1);  // block index along K
+    uint i01 = get_global_id(0);  // row index
+    uint i02 = get_global_id(2);  // batch index
+
+    if (i01 >= ne01) {
+        return;
+    }
+
+    uint ne00_blk = ne00 / QK_K;
+
+    uint src_blk_offset = i01 + i00 * ne01 + i02 * ne00_blk * ne01;
+    uint dst_blk_offset = i00 + i01 * ne00_blk + i02 * ne00_blk * ne01;
+
+    __global struct block_q4_K * b = dst0 + dst_blk_offset;
+
+    b->d  = src_d[src_blk_offset];
+    b->dm = src_dm[src_blk_offset];
+
+    __global uchar * s_src = src_s + (i02 * ne01 + i01) * ne00_blk * K_SCALE_SIZE + i00 * K_SCALE_SIZE;
+    for (int i = 0; i < K_SCALE_SIZE; ++i) {
+        b->s[i] = s_src[i];
+    }
+
+    uint base = i02 * ne00_blk * ne01 * 32 + i00 * ne01 * 32 + i01;
+
+    uint4 qv[8];
+    for (int p = 0; p < 8; ++p) {
+        qv[p].x = src_q[base + (p * 4 + 0) * ne01];
+        qv[p].y = src_q[base + (p * 4 + 1) * ne01];
+        qv[p].z = src_q[base + (p * 4 + 2) * ne01];
+        qv[p].w = src_q[base + (p * 4 + 3) * ne01];
+    }
+
+    uchar * qv_bytes = (uchar *)qv;
+    for (int i = 0; i < QK_K / 64; ++i) {
+        for (int j = 0; j < 16; ++j) {
+            uchar lo = qv_bytes[i*32 + j];
+            uchar hi = qv_bytes[i*32 + j + 16];
+            b->q[i*32 + 2*j]     = convert_uchar((lo & mask_0F) | ((hi & mask_0F) << 4));
+            b->q[i*32 + 2*j + 1] = convert_uchar(((lo & mask_F0) >> 4) | (hi & mask_F0));
+        }
+    }
+}
+
+//------------------------------------------------------------------------------
+// kernel_convert_block_q4_k_tiled_ns
+//
+// Tiled-wide layout for the long-vocab q4_K lm_head/embed GEMV (decode path).
+// Mirror of kernel_convert_block_q6_k_tiled_ns: recovers each weight's 4-bit
+// code in CANONICAL ggml element order (e in [0,256)) and re-packs into 32 uints
+// (8 codes/uint), stored TILED by 64 output rows so the matching GEMV
+// (gemv_noshuffle_q4_k_f32_tiled) coalesces every weight load. The 12-byte
+// packed scale block `s` and d/dm are stored per (row, K-block) tiled; the GEMV
+// re-derives the 8 (scale,min) pairs via get_scale_min_k4, exactly like the o4
+// kernel. Both ends owned here -> correct by construction vs the reference q4_K
+// dequant. Requires ne01 % 64 == 0 (gated host-side). Buffer sizes identical to
+// the trans4_ns layout.
+//
+//   q  uint4 granule g of (row r, K-block sb): idx = ((rt*ne00_blk+sb)*8 + g)*64 + rit
+//   s  (12 bytes) of (r, sb):                  idx = (rt*ne00_blk+sb)*64 + rit, *12
+//   d/dm (half)  of (r, sb):                   idx = (rt*ne00_blk+sb)*64 + rit
+//   where rt = r/64, rit = r%64.
+//------------------------------------------------------------------------------
+kernel void kernel_convert_block_q4_k_tiled_ns(
+    __global struct block_q4_K * src0,
+    __global uint  * dst_q,    // 32 uints / superblock (4-bit codes, 8 codes/uint)
+    __global half  * dst_d,    // 1 half  / superblock
+    __global half  * dst_dm,   // 1 half  / superblock
+    __global uchar * dst_s,    // K_SCALE_SIZE (12) bytes / superblock
+    uint ne00,
+    uint ne01
+) {
+    uint i00 = get_global_id(1);   // K-block index (superblock along ne00)
+    uint i01 = get_global_id(0);   // output row index (along ne01)
+    uint i02 = get_global_id(2);   // batch
+
+    uint ne00_blk = ne00 / QK_K;
+
+    uint src_blk_offset = i00 + i01 * ne00_blk + i02 * ne00_blk * ne01;
+    __global struct block_q4_K * b = src0 + src_blk_offset;
+
+    uint rt  = i01 / 64;
+    uint rit = i01 % 64;
+    uint tile_blk = (i02 * (ne01 / 64) + rt) * ne00_blk + i00;
+
+    // --- recover canonical 4-bit codes in e-order, pack 8 codes/uint ---
+    uint qw[32] = {0};
+    for (uint e = 0; e < 256; ++e) {
+        uint g    = e >> 6;           // group 0..3 (q advances 32 bytes/group)
+        uint within = e & 63u;
+        uint hlf  = within >> 5;      // 0 = low nibble, 1 = high nibble
+        uint l    = within & 31u;     // 0..31
+        uchar byte = b->q[g * 32u + l];
+        uint code = (hlf == 0u) ? (uint)(byte & 0x0F) : (uint)(byte >> 4);
+        qw[e >> 3] |= code << ((e & 7u) * 4u);
+    }
+
+    for (uint gr = 0; gr < 8; ++gr) {
+        uint base = (tile_blk * 8u + gr) * 64u + rit;   // uint4 index
+        dst_q[base * 4u + 0u] = qw[gr * 4u + 0u];
+        dst_q[base * 4u + 1u] = qw[gr * 4u + 1u];
+        dst_q[base * 4u + 2u] = qw[gr * 4u + 2u];
+        dst_q[base * 4u + 3u] = qw[gr * 4u + 3u];
+    }
+
+    // packed scales (12 bytes), tiled per (row, block)
+    __global uchar * s_dst = dst_s + (tile_blk * 64u + rit) * K_SCALE_SIZE;
+    #pragma unroll
+    for (int i = 0; i < K_SCALE_SIZE; ++i) {
+        s_dst[i] = b->s[i];
+    }
+
+    dst_d [tile_blk * 64u + rit] = b->d;
+    dst_dm[tile_blk * 64u + rit] = b->dm;
+}
+
+kernel void kernel_convert_block_q5_k_trans4_ns(
+    __global struct block_q5_K * src0,
+    __global uint  * dst_qs,
+    __global uint  * dst_qh,
+    __global half  * dst_d,
+    __global half  * dst_dm,
+    __global uchar * dst_s,
+    uint ne00,
+    uint ne01,
+    uchar mask_0F,
+    uchar mask_F0
+) {
+    uint i00 = get_global_id(1);
+    uint i01 = get_global_id(0);
+    uint i02 = get_global_id(2);
+
+    if (i01 >= ne01) {
+        return;
+    }
+
+    uint ne00_blk = ne00 / QK_K;
+    uint src_blk_offset = i00 + i01 * ne00_blk + i02 * ne00_blk * ne01;
+    uint dst_blk_offset = i01 + i00 * ne01     + i02 * ne00_blk * ne01;
+
+    __global struct block_q5_K * b = src0 + src_blk_offset;
+
+    dst_d [dst_blk_offset] = b->d;
+    dst_dm[dst_blk_offset] = b->dm;
+
+    for (int k = 0; k < 8; k++) {
+        uchar b0 = 0, b1 = 0, b2 = 0, b3 = 0;
+        for (int bit = 0; bit < 8; bit++) {
+            b0 |= (uchar)(((b->qh[bit]      >> k) & 1) << bit);
+            b1 |= (uchar)(((b->qh[8  + bit] >> k) & 1) << bit);
+            b2 |= (uchar)(((b->qh[16 + bit] >> k) & 1) << bit);
+            b3 |= (uchar)(((b->qh[24 + bit] >> k) & 1) << bit);
+        }
+        uint packed = (uint)b0 | ((uint)b1 << 8) | ((uint)b2 << 16) | ((uint)b3 << 24);
+        dst_qh[i01 + (i00 * 8 + k) * ne01 + i02 * ne00_blk * 8 * ne01] = packed;
+    }
+
+    uint4 qv[8];
+    uchar * qv_bytes = (uchar *)qv;
+    for (int i = 0; i < QK_K / 64; ++i) {
+        for (int j = 0; j < 16; ++j) {
+            uchar x0 = b->qs[i*32 + 2*j];
+            uchar x1 = b->qs[i*32 + 2*j + 1];
+
+            qv_bytes[i*32 + j     ] = convert_uchar(x0 & mask_0F) | convert_uchar((x1 & mask_0F) << 4);
+            qv_bytes[i*32 + j + 16] = convert_uchar((x0 & mask_F0) >> 4) | convert_uchar(x1 & mask_F0);
+        }
+    }
+
+    uint base = i02 * ne00_blk * ne01 * 32 + i00 * ne01 * 32 + i01;
+    #pragma unroll
+    for (int p = 0; p < 8; ++p) {
+        uint4 v = qv[p];
+        dst_qs[base + (p * 4 + 0) * ne01] = v.x;
+        dst_qs[base + (p * 4 + 1) * ne01] = v.y;
+        dst_qs[base + (p * 4 + 2) * ne01] = v.z;
+        dst_qs[base + (p * 4 + 3) * ne01] = v.w;
+    }
+
+    __global uchar * s_dst = dst_s + (i02 * ne01 + i01) * ne00_blk * K_SCALE_SIZE + i00 * K_SCALE_SIZE;
+    #pragma unroll
+    for (int i = 0; i < K_SCALE_SIZE; ++i) {
+        s_dst[i] = b->s[i];
+    }
+}
+
+kernel void kernel_restore_block_q5_k_trans4_ns(
+    __global uint  * src_qs,
+    __global uint  * src_qh,
+    __global half  * src_d,
+    __global half  * src_dm,
+    __global uchar * src_s,
+    __global struct block_q5_K * dst0,
+    uint ne00,
+    uint ne01,
+    uchar mask_0F,
+    uchar mask_F0
+) {
+    uint i00 = get_global_id(1);  // block index along K
+    uint i01 = get_global_id(0);  // row index
+    uint i02 = get_global_id(2);  // batch index
+
+    if (i01 >= ne01) {
+        return;
+    }
+
+    uint ne00_blk = ne00 / QK_K;
+
+    uint src_blk_offset = i01 + i00 * ne01 + i02 * ne00_blk * ne01;
+    uint dst_blk_offset = i00 + i01 * ne00_blk + i02 * ne00_blk * ne01;
+
+    __global struct block_q5_K * b = dst0 + dst_blk_offset;
+
+    b->d  = src_d[src_blk_offset];
+    b->dm = src_dm[src_blk_offset];
+
+    for (int j = 0; j < 32; j++) b->qh[j] = 0;
+    for (int k = 0; k < 8; k++) {
+        uint packed = src_qh[i01 + (i00 * 8 + k) * ne01 + i02 * ne00_blk * 8 * ne01];
+        uchar b0 = (uchar)(packed & 0xFF);
+        uchar b1 = (uchar)((packed >> 8) & 0xFF);
+        uchar b2 = (uchar)((packed >> 16) & 0xFF);
+        uchar b3 = (uchar)((packed >> 24) & 0xFF);
+        for (int bit = 0; bit < 8; bit++) {
+            b->qh[bit]      |= (uchar)(((b0 >> bit) & 1) << k);
+            b->qh[8  + bit] |= (uchar)(((b1 >> bit) & 1) << k);
+            b->qh[16 + bit] |= (uchar)(((b2 >> bit) & 1) << k);
+            b->qh[24 + bit] |= (uchar)(((b3 >> bit) & 1) << k);
+        }
+    }
+
+    __global uchar * s_src = src_s + (i02 * ne01 + i01) * ne00_blk * K_SCALE_SIZE + i00 * K_SCALE_SIZE;
+    for (int i = 0; i < K_SCALE_SIZE; ++i) {
+        b->s[i] = s_src[i];
+    }
+
+    uint base = i02 * ne00_blk * ne01 * 32 + i00 * ne01 * 32 + i01;
+
+    uint4 qv[8];
+    for (int p = 0; p < 8; ++p) {
+        qv[p].x = src_qs[base + (p * 4 + 0) * ne01];
+        qv[p].y = src_qs[base + (p * 4 + 1) * ne01];
+        qv[p].z = src_qs[base + (p * 4 + 2) * ne01];
+        qv[p].w = src_qs[base + (p * 4 + 3) * ne01];
+    }
+
+    uchar * qv_bytes = (uchar *)qv;
+    for (int i = 0; i < QK_K / 64; ++i) {
+        for (int j = 0; j < 16; ++j) {
+            uchar lo = qv_bytes[i*32 + j];
+            uchar hi = qv_bytes[i*32 + j + 16];
+            b->qs[i*32 + 2*j]     = convert_uchar((lo & mask_0F) | ((hi & mask_0F) << 4));
+            b->qs[i*32 + 2*j + 1] = convert_uchar(((lo & mask_F0) >> 4) | (hi & mask_F0));
+        }
+    }
+}
+
+kernel void kernel_convert_block_q6_k_trans4_ns(
+    __global struct block_q6_K * src0,
+    __global uint  * dst_ql,
+    __global uint  * dst_qh,
+    __global half  * dst_d,
+    __global char  * dst_s,
+    uint ne00,
+    uint ne01,
+    uchar mask_0F,
+    uchar mask_F0
+) {
+    uint i00 = get_global_id(1);
+    uint i01 = get_global_id(0);
+    uint i02 = get_global_id(2);
+
+    if (i01 >= ne01) {
+        return;
+    }
+
+    uint ne00_blk = ne00 / QK_K;
+
+    uint src_blk_offset = i00 + i01 * ne00_blk + i02 * ne00_blk * ne01;
+    uint dst_blk_offset = i01 + i00 * ne01     + i02 * ne00_blk * ne01;
+
+    __global struct block_q6_K * b = src0 + src_blk_offset;
+
+    dst_d[dst_blk_offset] = b->d;
+
+    uint4 qlv[8];
+    uchar * qlv_bytes = (uchar *)qlv;
+    for (int i = 0; i < 2; ++i) {
+        for (int j = 0; j < 16; ++j) {
+            uchar x0 = b->ql[i*64 + 2*j];
+            uchar x1 = b->ql[i*64 + 2*j + 1];
+            uchar x2 = b->ql[i*64 + 32 + 2*j];
+            uchar x3 = b->ql[i*64 + 32 + 2*j + 1];
+            qlv_bytes[i*64 + j     ] = convert_uchar(x0 & mask_0F) | convert_uchar((x1 & mask_0F) << 4);
+            qlv_bytes[i*64 + j + 16] = convert_uchar(x2 & mask_0F) | convert_uchar((x3 & mask_0F) << 4);
+            qlv_bytes[i*64 + j + 32] = convert_uchar((x0 & mask_F0) >> 4) | convert_uchar(x1 & mask_F0);
+            qlv_bytes[i*64 + j + 48] = convert_uchar((x2 & mask_F0) >> 4) | convert_uchar(x3 & mask_F0);
+        }
+    }
+
+    uint ql_base = i02 * ne00_blk * ne01 * 32 + i00 * ne01 * 32 + i01;
+
+    #pragma unroll
+    for (int p = 0; p < 8; ++p) {
+        uint4 v = qlv[p];
+        dst_ql[ql_base + (p * 4 + 0) * ne01] = v.x;
+        dst_ql[ql_base + (p * 4 + 1) * ne01] = v.y;
+        dst_ql[ql_base + (p * 4 + 2) * ne01] = v.z;
+        dst_ql[ql_base + (p * 4 + 3) * ne01] = v.w;
+    }
+
+    uint qhv[16] = {0};
+
+    for (int n = 0; n < 2; ++n) {
+        for (int l = 0; l < 32; ++l) {
+            uchar h = b->qh[n*32 + l];
+            int u = l / 16;
+            int bit_pos = (l % 16) * 2;
+            qhv[(n*4 + 0)*2 + u] |= ((uint)((h >> 0) & 0x03)) << bit_pos;
+            qhv[(n*4 + 1)*2 + u] |= ((uint)((h >> 2) & 0x03)) << bit_pos;
+            qhv[(n*4 + 2)*2 + u] |= ((uint)((h >> 4) & 0x03)) << bit_pos;
+            qhv[(n*4 + 3)*2 + u] |= ((uint)((h >> 6) & 0x03)) << bit_pos;
+        }
+    }
+
+    uint qh_base = i02 * ne00_blk * ne01 * 16 + i00 * ne01 * 16 + i01;
+
+    for (int p = 0; p < 16; ++p) {
+        dst_qh[qh_base + p * ne01] = qhv[p];
+    }
+
+    __global char * s_dst = dst_s + (i02 * ne01 + i01) * ne00_blk * 16 + i00 * 16;
+    #pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        s_dst[i] = b->scales[i];
+    }
+}
+
+kernel void kernel_restore_block_q6_k_trans4_ns(
+    __global uint  * src_ql,
+    __global uint  * src_qh,
+    __global half  * src_d,
+    __global char  * src_s,
+    __global struct block_q6_K * dst0,
+    uint ne00,
+    uint ne01,
+    uchar mask_0F,
+    uchar mask_F0
+) {
+    uint i00 = get_global_id(1);  // block index along K
+    uint i01 = get_global_id(0);  // row index
+    uint i02 = get_global_id(2);  // batch index
+
+    if (i01 >= ne01) {
+        return;
+    }
+
+    uint ne00_blk = ne00 / QK_K;
+
+    uint src_blk_offset = i01 + i00 * ne01 + i02 * ne00_blk * ne01;
+    uint dst_blk_offset = i00 + i01 * ne00_blk + i02 * ne00_blk * ne01;
+
+    __global struct block_q6_K * b = dst0 + dst_blk_offset;
+
+    b->d = src_d[src_blk_offset];
+
+    uint ql_base = i02 * ne00_blk * ne01 * 32 + i00 * ne01 * 32 + i01;
+    uint4 qlv[8];
+    for (int p = 0; p < 8; ++p) {
+        qlv[p].x = src_ql[ql_base + (p * 4 + 0) * ne01];
+        qlv[p].y = src_ql[ql_base + (p * 4 + 1) * ne01];
+        qlv[p].z = src_ql[ql_base + (p * 4 + 2) * ne01];
+        qlv[p].w = src_ql[ql_base + (p * 4 + 3) * ne01];
+    }
+
+    uchar * qlv_bytes = (uchar *)qlv;
+    for (int i = 0; i < 2; ++i) {
+        for (int j = 0; j < 16; ++j) {
+            uchar lo_02 = qlv_bytes[i*64 + j];
+            uchar lo_13 = qlv_bytes[i*64 + j + 16];
+            uchar hi_02 = qlv_bytes[i*64 + j + 32];
+            uchar hi_13 = qlv_bytes[i*64 + j + 48];
+            b->ql[i*64 + 2*j]          = convert_uchar((lo_02 & mask_0F) | ((hi_02 & mask_0F) << 4));
+            b->ql[i*64 + 2*j + 1]      = convert_uchar(((lo_02 & mask_F0) >> 4) | (hi_02 & mask_F0));
+            b->ql[i*64 + 32 + 2*j]     = convert_uchar((lo_13 & mask_0F) | ((hi_13 & mask_0F) << 4));
+            b->ql[i*64 + 32 + 2*j + 1] = convert_uchar(((lo_13 & mask_F0) >> 4) | (hi_13 & mask_F0));
+        }
+    }
+
+    uint qh_base = i02 * ne00_blk * ne01 * 16 + i00 * ne01 * 16 + i01;
+    uint qhv[16];
+    for (int p = 0; p < 16; ++p) {
+        qhv[p] = src_qh[qh_base + p * ne01];
+    }
+
+    for (int n = 0; n < 2; ++n) {
+        for (int l = 0; l < 32; ++l) {
+            int u = l / 16;
+            int bit_pos = (l % 16) * 2;
+            uchar v0 = (uchar)((qhv[(n*4 + 0)*2 + u] >> bit_pos) & 0x03);
+            uchar v1 = (uchar)((qhv[(n*4 + 1)*2 + u] >> bit_pos) & 0x03);
+            uchar v2 = (uchar)((qhv[(n*4 + 2)*2 + u] >> bit_pos) & 0x03);
+            uchar v3 = (uchar)((qhv[(n*4 + 3)*2 + u] >> bit_pos) & 0x03);
+            b->qh[n*32 + l] = v0 | (v1 << 2) | (v2 << 4) | (v3 << 6);
+        }
+    }
+
+    __global char * s_src = src_s + (i02 * ne01 + i01) * ne00_blk * 16 + i00 * 16;
+    for (int i = 0; i < 16; ++i) {
+        b->scales[i] = s_src[i];
+    }
+}
+
 //------------------------------------------------------------------------------
 // block_mxfp4
 //------------------------------------------------------------------------------
@@ -372,6 +1521,200 @@ kernel void kernel_restore_block_mxfp4_trans(
 }
 
 //------------------------------------------------------------------------------
+// kernel_convert_block_q6_k_tiled_ns
+//
+// Tiled-wide layout for the long-vocab q6_K lm_head/embed GEMV (decode path).
+// Unlike *_trans4_ns (which mirrors the bit-interleave the legacy 2-output GEMV
+// consumes), this kernel is correct-by-construction against the CANONICAL ggml
+// q6_K dequant: it recovers each weight's 6-bit code in element order e in
+// [0,256), then re-packs low-4-bits into 32 uints (8 codes/uint) and high-2-bits
+// into 16 uints (16 codes/uint). The matching GEMV (gemv_noshuffle_q6_k_f32_tiled)
+// unpacks the same order, so both ends are owned here.
+//
+// Storage is TILED by 64 output rows so the GEMV's 64-thread tile coalesces:
+//   ql uint4 granule g of (row r, K-block sb): idx = ((rt*ne00_blk + sb)*8 + g)*64 + rit
+//   qh uint4 granule g:                         idx = ((rt*ne00_blk + sb)*4 + g)*64 + rit
+//   scales (char16) of (r, sb):                 idx = (rt*ne00_blk + sb)*64 + rit
+//   d (half) of (r, sb):                        idx = (rt*ne00_blk + sb)*64 + rit
+// where rt = r/64, rit = r%64. Requires ne01 % 64 == 0 (gated host-side).
+// Buffer sizes are byte-identical to the trans4_ns layout.
+//------------------------------------------------------------------------------
+kernel void kernel_convert_block_q6_k_tiled_ns(
+    __global struct block_q6_K * src0,
+    __global uint  * dst_ql,   // 32 uints / superblock (low 4 bits, 8 codes/uint)
+    __global uint  * dst_qh,   // 16 uints / superblock (high 2 bits, 16 codes/uint)
+    __global half  * dst_d,    // 1 half  / superblock
+    __global char  * dst_s,    // 16 chars/ superblock
+    uint ne00,
+    uint ne01
+) {
+    uint i00 = get_global_id(1);   // K-block index (superblock along ne00)
+    uint i01 = get_global_id(0);   // output row index (along ne01)
+    uint i02 = get_global_id(2);   // batch
+
+    uint ne00_blk = ne00 / QK_K;
+
+    // Source block: row-major over (i02, i01, i00).
+    uint src_blk_offset = i00 + i01 * ne00_blk + i02 * ne00_blk * ne01;
+    __global struct block_q6_K * b = src0 + src_blk_offset;
+
+    uint rt  = i01 / 64;
+    uint rit = i01 % 64;
+    uint tile_blk = (i02 * (ne01 / 64) + rt) * ne00_blk + i00;  // tile-major (row-tile, K-block)
+
+    // --- recover canonical 6-bit codes, pack into ql (4b) + qh (2b) in e-order ---
+    // 32 ql-uints (8 low-nibbles each) + 16 qh-uints (16 2-bit slots each).
+    uint qlw[32] = {0};
+    uint qhw[16] = {0};
+
+    for (uint e = 0; e < 256; ++e) {
+        uint n   = (e >= 128) ? 1u : 0u;       // which 128-half
+        uint within = e - n * 128u;
+        uint q   = within / 32u;               // quadrant 0..3
+        uint l   = within % 32u;               // 0..31
+
+        uint off_ql = n * 64u;                 // raw ql byte base for this half
+        uint off_qh = n * 32u;                 // raw qh byte base for this half
+
+        uchar low4;
+        uchar qlb0 = b->ql[off_ql + l];
+        uchar qlb1 = b->ql[off_ql + l + 32];
+        if (q == 0)      low4 = qlb0 & 0x0F;
+        else if (q == 1) low4 = qlb1 & 0x0F;
+        else if (q == 2) low4 = (qlb0 >> 4) & 0x0F;
+        else             low4 = (qlb1 >> 4) & 0x0F;
+
+        uchar hi2 = (b->qh[off_qh + l] >> (q * 2u)) & 0x03;
+
+        // pack low4 (e-order): uint e/8, nibble (e%8)
+        qlw[e >> 3] |= ((uint)low4) << ((e & 7u) * 4u);
+        // pack hi2 (e-order): uint e/16, 2-bit slot (e%16)
+        qhw[e >> 4] |= ((uint)hi2)  << ((e & 15u) * 2u);
+    }
+
+    // --- write tiled ---
+    for (uint g = 0; g < 8; ++g) {
+        uint base = (tile_blk * 8u + g) * 64u + rit;   // uint4 index
+        dst_ql[base * 4u + 0u] = qlw[g * 4u + 0u];
+        dst_ql[base * 4u + 1u] = qlw[g * 4u + 1u];
+        dst_ql[base * 4u + 2u] = qlw[g * 4u + 2u];
+        dst_ql[base * 4u + 3u] = qlw[g * 4u + 3u];
+    }
+    for (uint g = 0; g < 4; ++g) {
+        uint base = (tile_blk * 4u + g) * 64u + rit;   // uint4 index
+        dst_qh[base * 4u + 0u] = qhw[g * 4u + 0u];
+        dst_qh[base * 4u + 1u] = qhw[g * 4u + 1u];
+        dst_qh[base * 4u + 2u] = qhw[g * 4u + 2u];
+        dst_qh[base * 4u + 3u] = qhw[g * 4u + 3u];
+    }
+
+    // scales: 16 chars contiguous per (row, block), tiled
+    __global char * s_dst = dst_s + (tile_blk * 64u + rit) * 16u;
+    #pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        s_dst[i] = b->scales[i];
+    }
+
+    // super-block scale
+    dst_d[tile_blk * 64u + rit] = b->d;
+}
+
+kernel void kernel_convert_block_mxfp4_trans4_ns(
+    global struct block_mxfp4 * src0,
+    __global uint * dst_q,
+    __global uchar * dst_e,
+    uint ne00,
+    uint ne01
+) {
+    uint i00 = get_global_id(1);
+    uint i01 = get_global_id(0);
+    uint i02 = get_global_id(2);
+
+    if (i01 >= ne01) {
+        return;
+    }
+
+    uint ne00_blk = ne00 / QK_MXFP4;
+    uint src_blk_offset = i00 + i01 * ne00_blk + i02 * ne00_blk * ne01;
+    uint dst_blk_offset = i01 + i00 * ne01 + i02 * ne00_blk * ne01;
+
+    global struct block_mxfp4 * b = src0 + src_blk_offset;
+    dst_e[dst_blk_offset] = b->e;
+
+    // extract quantization and unshuffle
+    ushort8 pre_block = ((global ushort8 *)(&(b->qs[0])))[0];
+
+    ushort8 post_block = (ushort8)(0);
+
+    uchar * pre_block_ptr = (uchar *)(&pre_block);
+    uchar * post_block_ptr = (uchar *)(&post_block);
+
+    for (int i = 0; i < QK_MXFP4 / 4; ++i) {
+        uchar x0 = pre_block_ptr[2*i + 0];
+        uchar x1 = pre_block_ptr[2*i + 1];
+
+        post_block_ptr[i + 0        ] = convert_uchar(x0 & 0x0F) | convert_uchar((x1 & 0x0F) << 4);
+        post_block_ptr[i + QK_MXFP4 / 4] = convert_uchar((x0 & 0xF0) >> 4) | convert_uchar(x1 & 0xF0);
+    }
+
+    uint4 q_block = as_uint4(post_block);
+
+    uint offset = i02 * ne00_blk * ne01 * 4 + i00 * ne01 * 4 + i01;
+    dst_q[offset] = q_block.x;
+    dst_q[offset + ne01] = q_block.y;
+    dst_q[offset + ne01 * 2] = q_block.z;
+    dst_q[offset + ne01 * 3] = q_block.w;
+}
+
+kernel void kernel_restore_block_mxfp4_trans4_ns(
+    __global uint * src_q,
+    __global uchar * src_e,
+    __global struct block_mxfp4 * dst0,
+    uint ne00,
+    uint ne01
+) {
+    uint i00 = get_global_id(1);
+    uint i01 = get_global_id(0);
+    uint i02 = get_global_id(2);
+
+    if (i01 >= ne01) {
+        return;
+    }
+
+    uint ne00_blk = ne00 / QK_MXFP4;
+    uint dst_blk_offset = i00 + i01 * ne00_blk + i02 * ne00_blk * ne01;
+    uint src_d_offset = i01 + i00 * ne01 + i02 * ne00_blk * ne01;
+
+    __global struct block_mxfp4 * b = dst0 + dst_blk_offset;
+    b->e = src_e[src_d_offset];
+
+    // collect transposed quantization parts for a block
+    uint src_q_offset = i02 * ne00_blk * ne01 * 4 + i00 * ne01 * 4 + i01;
+    uint4 q_block;
+    q_block.x = src_q[src_q_offset];
+    q_block.y = src_q[src_q_offset + ne01];
+    q_block.z = src_q[src_q_offset + ne01 * 2];
+    q_block.w = src_q[src_q_offset + ne01 * 3];
+
+    ushort8 post_block = as_ushort8(q_block);
+    ushort8 pre_block = (ushort8)(0);
+
+    uchar * pre_block_ptr = (uchar *)(&pre_block);
+    uchar * post_block_ptr = (uchar *)(&post_block);
+
+    for (int i = 0; i < QK_MXFP4 / 4; ++i) {
+        uchar x0 = post_block_ptr[i + 0];
+        uchar x1 = post_block_ptr[i + QK_MXFP4 / 4];
+
+        pre_block_ptr[2 * i + 0] = convert_uchar(x0 & 0x0F) | convert_uchar((x1 & 0x0F) << 4);
+        pre_block_ptr[2 * i + 1] = convert_uchar((x0 & 0xF0) >> 4) | convert_uchar(x1 & 0xF0);
+    }
+
+    ((__global ushort8 *)(&(b->qs[0])))[0] = pre_block;
+}
+
+
+//------------------------------------------------------------------------------
 // block_q8_0
 //------------------------------------------------------------------------------
 typedef struct {
@@ -407,6 +1750,158 @@ kernel void kernel_restore_block_q8_0(
     b->d = *d;
     for (int i = 0; i < QK8_0; ++i) {
         b->qs[i] = q[i];
+    }
+}
+
+// View-aware AoS q8_0 → f32 dequant (f32/f32 FA path).
+kernel void kernel_dequant_q8_0_f32_view_aos(
+    global char * src,
+    ulong         src_offset,
+    ulong         src_nb1,
+    ulong         src_nb2,
+    ulong         src_nb3,
+    int           nblk0,
+    int           ne1,
+    int           ne2,
+    int           ne3,
+    global float * dst
+) {
+    int blk_i0 = get_global_id(0);
+    int i1     = get_global_id(1);
+    int batch  = get_global_id(2);
+
+    if (blk_i0 >= nblk0) return;
+    if (i1     >= ne1)   return;
+
+    int i2 = batch % ne2;
+    int i3 = batch / ne2;
+    if (i3 >= ne3) return;
+
+    global char * block = src + src_offset + (ulong)i3*src_nb3 + (ulong)i2*src_nb2 + (ulong)i1*src_nb1 + (ulong)blk_i0 * (2 + QK8_0);
+    float d = vload_half(0, (global half *)block);
+    global char * qs = block + 2;
+
+    ulong dst_row_base = ((ulong)i3 * ne2 * ne1 + (ulong)i2 * ne1 + (ulong)i1) * nblk0;
+    global float * out = dst + (dst_row_base + blk_i0) * QK8_0;
+
+    for (int i = 0; i < QK8_0; ++i) {
+        out[i] = d * (float)qs[i];
+    }
+}
+
+// View-aware AoS q8_0 → f16 dequant. Rows tight, batch strides may be gapped.
+kernel void kernel_dequant_q8_0_f16_view_aos(
+    global char * src,
+    ulong         src_offset,
+    ulong         src_nb1,
+    ulong         src_nb2,
+    ulong         src_nb3,
+    int           nblk0,
+    int           ne1,
+    int           ne2,
+    int           ne3,
+    global half * dst
+) {
+    int blk_i0 = get_global_id(0);
+    int i1     = get_global_id(1);
+    int batch  = get_global_id(2);
+
+    if (blk_i0 >= nblk0) return;
+    if (i1     >= ne1)   return;
+
+    int i2 = batch % ne2;
+    int i3 = batch / ne2;
+    if (i3 >= ne3) return;
+
+    global char * block = src + src_offset + (ulong)i3*src_nb3 + (ulong)i2*src_nb2 + (ulong)i1*src_nb1 + (ulong)blk_i0 * (2 + QK8_0);
+    float d = vload_half(0, (global half *)block);
+    global char * qs = block + 2;
+
+    ulong dst_row_base = ((ulong)i3 * ne2 * ne1 + (ulong)i2 * ne1 + (ulong)i1) * nblk0;
+    global half * out = dst + (dst_row_base + blk_i0) * QK8_0;
+
+    for (int i = 0; i < QK8_0; ++i) {
+        out[i] = (half)(d * (float)qs[i]);
+    }
+}
+
+// View-aware AoS q4_0 → f32 dequant (mirrors the q8_0 view variant).
+kernel void kernel_dequant_q4_0_f32_view_aos(
+    global char * src,
+    ulong         src_offset,
+    ulong         src_nb1,
+    ulong         src_nb2,
+    ulong         src_nb3,
+    int           nblk0,
+    int           ne1,
+    int           ne2,
+    int           ne3,
+    global float * dst
+) {
+    int blk_i0 = get_global_id(0);
+    int i1     = get_global_id(1);
+    int batch  = get_global_id(2);
+
+    if (blk_i0 >= nblk0) return;
+    if (i1     >= ne1)   return;
+
+    int i2 = batch % ne2;
+    int i3 = batch / ne2;
+    if (i3 >= ne3) return;
+
+    global char * block = src + src_offset + (ulong)i3*src_nb3 + (ulong)i2*src_nb2 + (ulong)i1*src_nb1 + (ulong)blk_i0 * (2 + QK4_0/2);
+    float d = vload_half(0, (global half *)block);
+    global uchar * qs = (global uchar *)(block + 2);
+
+    ulong dst_row_base = ((ulong)i3 * ne2 * ne1 + (ulong)i2 * ne1 + (ulong)i1) * nblk0;
+    global float * out = dst + (dst_row_base + blk_i0) * QK4_0;
+
+    for (int i = 0; i < QK4_0/2; ++i) {
+        uchar byte = qs[i];
+        int q0 = (int)(byte & 0x0F) - 8;
+        int q1 = (int)(byte >> 4)   - 8;
+        out[i]            = d * (float)q0;
+        out[i + QK4_0/2]  = d * (float)q1;
+    }
+}
+
+// View-aware AoS q4_0 → f16 dequant (mirrors the q8_0 view variant).
+kernel void kernel_dequant_q4_0_f16_view_aos(
+    global char * src,
+    ulong         src_offset,
+    ulong         src_nb1,
+    ulong         src_nb2,
+    ulong         src_nb3,
+    int           nblk0,
+    int           ne1,
+    int           ne2,
+    int           ne3,
+    global half * dst
+) {
+    int blk_i0 = get_global_id(0);
+    int i1     = get_global_id(1);
+    int batch  = get_global_id(2);
+
+    if (blk_i0 >= nblk0) return;
+    if (i1     >= ne1)   return;
+
+    int i2 = batch % ne2;
+    int i3 = batch / ne2;
+    if (i3 >= ne3) return;
+
+    global char * block = src + src_offset + (ulong)i3*src_nb3 + (ulong)i2*src_nb2 + (ulong)i1*src_nb1 + (ulong)blk_i0 * (2 + QK4_0/2);
+    float d = vload_half(0, (global half *)block);
+    global uchar * qs = (global uchar *)(block + 2);
+
+    ulong dst_row_base = ((ulong)i3 * ne2 * ne1 + (ulong)i2 * ne1 + (ulong)i1) * nblk0;
+    global half * out = dst + (dst_row_base + blk_i0) * QK4_0;
+
+    for (int i = 0; i < QK4_0/2; ++i) {
+        uchar byte = qs[i];
+        int q0 = (int)(byte & 0x0F) - 8;
+        int q1 = (int)(byte >> 4)   - 8;
+        out[i]          = (half)(d * (float)q0);
+        out[i + QK4_0/2] = (half)(d * (float)q1);
     }
 }
 

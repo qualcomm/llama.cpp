@@ -191,14 +191,14 @@
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
 #endif
-__kernel void kernel_gemv_noshuffle(
+__kernel void kernel_gemv_noshuffle_q4_0_f32(
         __read_only  image1d_buffer_t src0_q,  // quantized A
         global half2  * src0_d,  // A scales
         __read_only  image1d_buffer_t src1,    // B
         ulong offset1,            // offset to B (0)
         global float * dst,     // C
         ulong offsetd,            // offset to C (0)
-        int ne00,               // K
+        uint K,               // K
         int ne01,               // M
         int ne02,               // 1
         int ne10,               // K
@@ -211,12 +211,6 @@ __kernel void kernel_gemv_noshuffle(
     uint groupId = get_local_id(1);
     uint gid     = get_global_id(0);
     ushort slid    = get_sub_group_local_id();
-
-    uint K = ne00;
-    uint M = ne01;
-
-    uint LINE_STRIDE_A = M / 2;
-    uint BLOCK_STRIDE_A = N_SIMDGROUP * M;
 
     __private uint4     regA;
     __private half2     regS;
@@ -238,21 +232,21 @@ __kernel void kernel_gemv_noshuffle(
         regA.s1 = read_imageui(src0_q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 1)).x;
         regA.s2 = read_imageui(src0_q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 2)).x;
         regA.s3 = read_imageui(src0_q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 3)).x;
-#ifdef VECTOR_SUB_GROUP_BROADCAT
+#ifdef VECTOR_SUB_GROUP_BROADCAST
         dequantizeBlockAccum_ns_sgbroadcast_8_hi(totalSum, as_ushort8(regA), regS, regB);
 #else
         dequantizeBlockAccum_ns_sgbroadcast_1_hi(totalSum, as_ushort8(regA), regS, regB);
-#endif // VECTOR_SUB_GROUP_BROADCAT
+#endif // VECTOR_SUB_GROUP_BROADCAST
 
         regA.s0 = read_imageui(src0_q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 4)).x;
         regA.s1 = read_imageui(src0_q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 5)).x;
         regA.s2 = read_imageui(src0_q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 6)).x;
         regA.s3 = read_imageui(src0_q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 7)).x;
-#ifdef VECTOR_SUB_GROUP_BROADCAT
+#ifdef VECTOR_SUB_GROUP_BROADCAST
         dequantizeBlockAccum_ns_sgbroadcast_8_lo(totalSum, as_ushort8(regA), regS, regB);
 #else
         dequantizeBlockAccum_ns_sgbroadcast_1_lo(totalSum, as_ushort8(regA), regS, regB);
-#endif // VECTOR_SUB_GROUP_BROADCAT
+#endif // VECTOR_SUB_GROUP_BROADCAST
     }
 
     // reduction in local memory, assumes #wave=4
