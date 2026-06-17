@@ -21101,8 +21101,16 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
     }
 #endif // GGML_OPENCL_USE_ADRENO_KERNELS
 
-    // Non-contig quant src0: on-device dequant to f16 then native f16 MUL_MAT.
-    if ((src0t == GGML_TYPE_Q4_0 || src0t == GGML_TYPE_Q8_0) && !ggml_is_contiguous(src0)) {
+    // Quant KV-cache read (fa=0 attention K/V): on-device dequant to f16 then
+    // native f16 MUL_MAT. Triggered for non-contiguous src0 (the usual head-major
+    // permuted K view when n_head_kv>1) AND for the contiguous case that occurs
+    // when n_head_kv==1 (e.g. Gemma-4 E2B, GQA 8:1) — there the K view is dense so
+    // !ggml_is_contiguous is false, but it still broadcasts over heads
+    // (src1->ne[2] > src0->ne[2]) and must NOT fall into the generic weight GEMV
+    // (which assumes no head broadcast and SIGSEGVs). Head broadcast (r2>1) is a
+    // weight-free signal: model weights never broadcast over ne2.
+    if ((src0t == GGML_TYPE_Q4_0 || src0t == GGML_TYPE_Q8_0) &&
+        (!ggml_is_contiguous(src0) || src1->ne[2] > src0->ne[2])) {
         cl_mem f16_buf = ggml_cl_mul_mat_dequant_quant_to_f16(backend_ctx, src0, nullptr);
 
         ggml_tensor         fake_src0 = *src0;
