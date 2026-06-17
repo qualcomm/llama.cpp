@@ -4230,7 +4230,7 @@ inline bool use_adreno_kernels(const ggml_backend_opencl_context *backend_ctx, c
 inline bool use_adreno_moe_kernels(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor) {
     GGML_UNUSED(backend_ctx);
     int ne01 = tensor->ne[1];
-    return ((strstr(tensor->name, "ffn") != NULL) || (strstr(tensor->name, "as") != NULL)) && (ne01 % 64 == 0);
+    return ((strstr(tensor->name, "ffn") != NULL) || (strstr(tensor->name, "as") != NULL)) && (ne01 % 32 == 0);
 }
 
 // q8_0 dense weights destined for the noshuffle Adreno GEMM/GEMV are stored
