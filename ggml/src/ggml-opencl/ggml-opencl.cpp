@@ -19739,8 +19739,13 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
         // keeps the cok/f16 small-batch path. DEFAULT ON; opt out with
         // GGML_OPENCL_Q4K_DENSE_DP4A=0. Greedy byte-identical across Qwen3-30B/3.5-
         // 35B/3.6-35B-A3B, Granite-a800m, Qwen3-8B; +0.5..15% prefill, no regressions.
+        // DEFAULT ON only on Adreno X2 — on X1-85 dp4a dense prefill regresses -72..-77%
+        // (per-WI private-array spill, dp4a stays ~2x behind the f16 half8 path), so the
+        // default is gated to X2E. Opt in/out anywhere with the env override.
         static const char * q4k_dense_dp4a_env = getenv("GGML_OPENCL_Q4K_DENSE_DP4A");
-        static const bool   q4k_dense_dp4a_on  = (q4k_dense_dp4a_env == nullptr) || (atoi(q4k_dense_dp4a_env) != 0);
+        const bool          q4k_dense_dp4a_on  = q4k_dense_dp4a_env
+            ? (atoi(q4k_dense_dp4a_env) != 0)
+            : (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E);
         if (q4k_dense_dp4a_on && N > 8 && (K % 32 == 0) && (M % 64 == 0)) {
             const size_t n_blocks = (size_t)N * (K / 32);
             backend_ctx->prealloc_moe_qa.allocate(context, (size_t)N * K * sizeof(cl_char));
@@ -20132,8 +20137,15 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
         // (prefill, ne1>8) only; the output/lm_head weight stays on the f16 path
         // for logit stability (matches the q6_K cok exclusion). DEFAULT ON; opt
         // out with GGML_OPENCL_Q6K_DENSE_DP4A=0.
+        // DEFAULT ON only on Adreno X2 — on X1-85 dense dp4a prefill regresses ~-68%
+        // (the f16 dense GEMM reads weights via texture/L1 and is near-BW-optimal; dp4a
+        // gives up the texture path, so the 1.96x int8-dot ALU win can't clear it —
+        // measured X1-85 driver 851.0, both per-WI and once-quantized recipes lose).
+        // Same gate as the q4_K dense + MoE dp4a (2acfaced7). Env override forces either way.
         static const char * q6k_dense_dp4a_env = getenv("GGML_OPENCL_Q6K_DENSE_DP4A");
-        static const bool   q6k_dense_dp4a_on  = (q6k_dense_dp4a_env == nullptr) || (atoi(q6k_dense_dp4a_env) != 0);
+        const bool          q6k_dense_dp4a_on  = q6k_dense_dp4a_env
+            ? (atoi(q6k_dense_dp4a_env) != 0)
+            : (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E);
         const bool is_output_w_dp4a = strncmp(src0->name, "output", 6) == 0 ||
                                       strncmp(src0->name, "token_embd", 10) == 0;
         if (q6k_dense_dp4a_on && !is_output_w_dp4a && ne1 > 8 && (ne00 % 32 == 0) && (ne01 % 64 == 0)) {
@@ -24799,8 +24811,12 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     // f32 reorder + half-dot kernel. DEFAULT ON; opt out with
                     // GGML_OPENCL_Q4K_MOE_DP4A=0. Validated PPL-neutral + 18-31% prefill
                     // on Qwen3-30B / 3.5-35B / 3.6-35B-A3B and Granite-3.0-3b-a800m.
+                    // DEFAULT ON only on Adreno X2 (X1 dp4a MoE prefill regresses -14%);
+                    // gated to X2E, env override forces either way.
                     static const char * q4k_moe_dp4a_env = getenv("GGML_OPENCL_Q4K_MOE_DP4A");
-                    static const bool   use_moe_dp4a = (q4k_moe_dp4a_env == nullptr) || (atoi(q4k_moe_dp4a_env) != 0);
+                    const bool          use_moe_dp4a = q4k_moe_dp4a_env
+                        ? (atoi(q4k_moe_dp4a_env) != 0)
+                        : (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E);
 
                     cl_buffer_region region;
                     region.origin = 0;
@@ -25225,8 +25241,12 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     // half-dot kernel. DEFAULT ON; opt out with GGML_OPENCL_Q6K_MOE
                     // _DP4A=0. Greedy byte-identical across the q4_K-MoE model sweep
                     // (Qwen3-30B/3.5-35B/3.6-35B-A3B, Granite-a800m); +6.6% Qwen3-30B.
+                    // DEFAULT ON only on Adreno X2 (X1 dp4a prefill regresses); gated to
+                    // X2E, env override forces either way.
                     static const char * q6k_moe_dp4a_env = getenv("GGML_OPENCL_Q6K_MOE_DP4A");
-                    static const bool   use_q6k_dp4a = (q6k_moe_dp4a_env == nullptr) || (atoi(q6k_moe_dp4a_env) != 0);
+                    const bool          use_q6k_dp4a = q6k_moe_dp4a_env
+                        ? (atoi(q6k_moe_dp4a_env) != 0)
+                        : (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E);
 
                     cl_buffer_region region;
                     region.origin = 0;
