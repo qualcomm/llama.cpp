@@ -317,6 +317,119 @@ kernel void kernel_gemv_noshuffle_q4_k_f32(
 
 }
 
+// --- Split-K-across-workgroups decode GEMV (small-M projections) ----------------
+// A single-token GEMV makes only ceil(M/2/64) workgroups; a WG runs on one Adreno
+// compute unit, so for small M (Kcur/Vcur, M=512 -> 4 WGs) most of the 16 CUs sit
+// idle and the matmul caps at ~30 GB/s even with a wide intra-WG K-split. This
+// variant adds a SECOND grid dimension of `ksplit` workgroups that each reduce a
+// disjoint slice of K and write a per-slice partial; kernel_gemv_splitk_reduce_f32
+// then sums the partials into dst. Microbench (X2): M=512 31->47 GB/s (+52%),
+// M=1024 60->72 (+20%). Identical math/layout to the base kernel (physical block
+// stride 4*M, get_scale_min_k4) -> coherent. Gated host-side to M<=1024 (M>=2048
+// already fills the CUs and the extra reduce dispatch only hurts).
+#ifdef ADRENO_GPU
+REQD_SUBGROUP_SIZE_64
+#endif
+kernel void kernel_gemv_noshuffle_q4_k_f32_splitk(
+        read_only  image1d_buffer_t src0_q,
+        global half2  * src0_d,
+        global half2  * src0_m,
+        global uchar  * src0_s,
+        read_only  image1d_buffer_t src1,
+        global float * partial,          // [ksplit * M], slice-major
+        int ne00,
+        int ne01,
+        uchar mask_d6,
+        uchar mask_d4,
+        uchar mask_hi2)
+{
+    uint groupId = get_local_id(1);
+    uint gid     = get_global_id(0);
+    ushort slid  = get_sub_group_local_id();
+    uint nsg     = get_local_size(1);
+    uint ksplit  = get_num_groups(1);
+    uint kslice  = get_group_id(1);
+
+    uint K = ne00;
+    uint M = ne01;
+    uint LINE_STRIDE_A  = M / 2;
+    uint BLOCK_STRIDE_A = 4 * M;      // physical, independent of the K-split
+    uint scales_per_row = (K / QK_K) * 12;
+
+    private uint4  regA;
+    private half2  regS, regM;
+    private float8 regB;
+    private float2 totalSum = (float2)(0.0f);
+
+    // each (kslice, subgroup) pair owns a disjoint set of K-blocks
+    for (uint k = kslice * nsg + groupId; k < (K / 32); k += ksplit * nsg) {
+        uint sb = k / 8;
+        uint j  = k % 8;
+        half2 d   = src0_d[gid + sb * LINE_STRIDE_A];
+        half2 dm  = src0_m[gid + sb * LINE_STRIDE_A];
+        global const uchar * sc0 = src0_s + 2 * gid * scales_per_row + sb * 12;
+        global const uchar * sc1 = src0_s + (2 * gid + 1) * scales_per_row + sb * 12;
+        uchar sv0, mn0, sv1, mn1;
+        get_scale_min_k4(j, sc0, &sv0, &mn0, mask_d6, mask_d4, mask_hi2);
+        get_scale_min_k4(j, sc1, &sv1, &mn1, mask_d6, mask_d4, mask_hi2);
+        regS = convert_half2(convert_float2(d)  * convert_float2((uchar2)(sv0, sv1)));
+        regM = convert_half2(convert_float2(dm) * convert_float2((uchar2)(mn0, mn1)));
+        if (slid < 4) {
+            regB.s0123 = read_imagef(src1, (slid * 2 + k * 8));
+            regB.s4567 = read_imagef(src1, (1 + slid * 2 + k * 8));
+        }
+        regA.s0 = read_imageui(src0_q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 0)).x;
+        regA.s1 = read_imageui(src0_q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 1)).x;
+        regA.s2 = read_imageui(src0_q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 2)).x;
+        regA.s3 = read_imageui(src0_q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 3)).x;
+#ifdef VECTOR_SUB_GROUP_BROADCAST
+        dequantizeBlockAccum_ns_sgbroadcast_8_hi(totalSum, as_ushort8(regA), regS, regM, regB);
+#else
+        dequantizeBlockAccum_ns_sgbroadcast_1_hi(totalSum, as_ushort8(regA), regS, regM, regB);
+#endif
+        regA.s0 = read_imageui(src0_q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 4)).x;
+        regA.s1 = read_imageui(src0_q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 5)).x;
+        regA.s2 = read_imageui(src0_q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 6)).x;
+        regA.s3 = read_imageui(src0_q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 7)).x;
+#ifdef VECTOR_SUB_GROUP_BROADCAST
+        dequantizeBlockAccum_ns_sgbroadcast_8_lo(totalSum, as_ushort8(regA), regS, regM, regB);
+#else
+        dequantizeBlockAccum_ns_sgbroadcast_1_lo(totalSum, as_ushort8(regA), regS, regM, regB);
+#endif
+    }
+
+    local float2 reduceLM[SUBGROUP_SIZE * 15];
+    if (groupId > 0) {
+        reduceLM[SUBGROUP_SIZE * (groupId - 1) + slid] = totalSum;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (groupId == 0) {
+        for (uint i = 0; i < nsg - 1; ++i) {
+            totalSum += reduceLM[SUBGROUP_SIZE * i + slid];
+        }
+        vstore2(totalSum, 0, &(partial[kslice * M + gid * 2]));
+    }
+}
+
+// Sum the per-slice partials [ksplit * M] into dst[M]; applies the dst byte offset.
+kernel void kernel_gemv_splitk_reduce_f32(
+        global float * partial,
+        global float * dst,
+        ulong offsetd,
+        int   ne01,         // M
+        int   ksplit)
+{
+    uint r = get_global_id(0);
+    if (r >= (uint)ne01) return;
+    float acc = 0.0f;
+    for (uint s = 0; s < (uint)ksplit; ++s) {
+        acc += partial[s * (uint)ne01 + r];
+    }
+    dst = (global float*)((global char*)dst + offsetd);
+    dst[r] = acc;
+}
+
+
 // --- Dequant-once macros for the mc3 verify GEMV (Q4K_MC3_DEQUANT_ONCE) ---
 // The inline dequantizeBlockAccum_* macros recompute the dequantized weight
 // ((code & mask)>>shift)*scale - minv ONCE PER COLUMN (3x), and the flat

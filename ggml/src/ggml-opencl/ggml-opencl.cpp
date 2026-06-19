@@ -514,6 +514,7 @@ struct ggml_backend_opencl_context {
     ggml_cl_buffer prealloc_quant_trans;
     ggml_cl_buffer prealloc_scales_trans;
     ggml_cl_buffer prealloc_act_trans;
+    ggml_cl_buffer prealloc_splitk_partial;  // [ksplit * M] partials for split-K GEMV
 
     // prealloc buffers for src0 and src1
     ggml_cl_buffer prealloc_src0;
@@ -933,6 +934,8 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemv_noshuffle_q4_k_f32;
     cl_kernel kernel_gemv_noshuffle_q4_k_f32_o4;  // 4-output-per-WI, long-vocab lm_head
     cl_kernel kernel_gemv_noshuffle_q4_k_f32_tiled;  // tiled-wide layout (opt-in)
+    cl_kernel kernel_gemv_noshuffle_q4_k_f32_splitk; // split-K across WGs (small-M decode)
+    cl_kernel kernel_gemv_splitk_reduce_f32;         // sums split-K per-slice partials
     cl_kernel kernel_convert_block_q4_k_tiled_ns;    // tiled-wide convert (opt-in)
     cl_kernel kernel_gemv_noshuffle_q4_k_f32_mc3;  // multi-column (N=3) verify GEMV
     cl_kernel kernel_gemm_noshuffle_q4_k_f32;
@@ -3511,6 +3514,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 
         CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q4_k_f32 = clCreateKernel(prog, "kernel_gemv_noshuffle_q4_k_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q4_k_f32_mc3 = clCreateKernel(prog, "kernel_gemv_noshuffle_q4_k_f32_mc3", &err), err));
+        CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q4_k_f32_splitk = clCreateKernel(prog, "kernel_gemv_noshuffle_q4_k_f32_splitk", &err), err));
+        CL_CHECK((backend_ctx->kernel_gemv_splitk_reduce_f32 = clCreateKernel(prog, "kernel_gemv_splitk_reduce_f32", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
@@ -15779,6 +15784,73 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
             return !e || e[0] == '\0' || e[0] != '0';
         }();
         const bool use_q4k_o4 = !use_tiled && !use_mc3 && q4k_o4_env && (ne01 % 4 == 0) && (ne01 >= 32768);
+        // Split-K across workgroups for small-M decode GEMVs. A single-token GEMV
+        // makes only CEIL_DIV(M/2,64) workgroups; even with the wide intra-WG split
+        // (16 subgroups) those all land on ONE CU, so small-M matmuls under-fill the
+        // 16 CUs and cap well below the ~104 GB/s the M=10240 FFN matmuls reach
+        // (profile: ffn_down/attn_output M=2560 @69-81 GB/s, Kcur/Vcur M=1024 @62).
+        // Adding a `ksplit` second grid dim that spreads K across WGs (+ a reduce
+        // pass) fills the CUs. Gate is M<=2560: the tiny M<=1024 ones only break even
+        // (the ~5us reduce dispatch eats the kernel win — this was a -0.5% OPT-IN when
+        // the gate was M<=1024), but extending to the big-K M=2560 cases (ffn_down
+        // K=10240 @182us/call, attn_output @42us) makes the per-call win dwarf the
+        // reduce -> +3.36% tg E4B (6/6 paired, byte-identical). Default ON, opt-out
+        // GGML_OPENCL_Q4K_GEMV_SPLITK=0. ffn_gate/up (M=10240) fill the CUs already
+        // and are excluded.
+        static const bool splitk_wg_env = []{
+            const char * e = std::getenv("GGML_OPENCL_Q4K_GEMV_SPLITK");
+            return !e || e[0] == '\0' || e[0] != '0';   // default ON, opt-out =0
+        }();
+        // Gate: small-M decode GEMVs that under-fill the 16 CUs even with the wide
+        // intra-WG split (all 16 subgroups land on one CU). M<=2560 covers Kcur/Vcur
+        // (M=1024), Qcur (2048), attn_output + ffn_down (2560). The tiny ones
+        // (M<=1024) only break even (reduce dispatch eats the kernel win), but the
+        // big-K M=2560 cases (ffn_down K=10240 @182us, attn_output @42us) have a
+        // large per-call win that dwarfs the ~5us reduce, so extending to 2560 nets
+        // positive end-to-end. ffn_gate/up (M=10240) already fill the CUs -> excluded.
+        const bool use_splitk = splitk_wg_env && !use_tiled && !use_q4k_o4 && !use_mc3 && ne01 <= 2560;
+
+        if (use_splitk) {
+            const int    nsg    = 8;
+            const int    ksplit = (ne01 <= 512) ? 8 : 4;   // -> ~32 total WGs
+            const size_t gx     = (size_t)CEIL_DIV(ne01/2, 64) * 64;
+
+            backend_ctx->prealloc_splitk_partial.allocate(
+                backend_ctx->context, (size_t)ksplit * ne01 * sizeof(float));
+            cl_mem partial = backend_ctx->prealloc_splitk_partial.buffer;
+
+            cl_kernel ks = backend_ctx->kernel_gemv_noshuffle_q4_k_f32_splitk;
+            CL_CHECK(clSetKernelArg(ks, 0,  sizeof(cl_mem),   &q_img));
+            CL_CHECK(clSetKernelArg(ks, 1,  sizeof(cl_mem),   &extra0_q4_k->d));
+            CL_CHECK(clSetKernelArg(ks, 2,  sizeof(cl_mem),   &extra0_q4_k->dm));
+            CL_CHECK(clSetKernelArg(ks, 3,  sizeof(cl_mem),   &extra0_q4_k->s));
+            CL_CHECK(clSetKernelArg(ks, 4,  sizeof(cl_mem),   &b_img));
+            CL_CHECK(clSetKernelArg(ks, 5,  sizeof(cl_mem),   &partial));
+            CL_CHECK(clSetKernelArg(ks, 6,  sizeof(cl_int),   &ne00));
+            CL_CHECK(clSetKernelArg(ks, 7,  sizeof(cl_int),   &ne01));
+            CL_CHECK(clSetKernelArg(ks, 8,  sizeof(cl_uchar), &mask_d6));
+            CL_CHECK(clSetKernelArg(ks, 9,  sizeof(cl_uchar), &mask_d4));
+            CL_CHECK(clSetKernelArg(ks, 10, sizeof(cl_uchar), &mask_hi2));
+            size_t lsk[3] = {64, (size_t)nsg, 1};
+            size_t gsk[3] = {gx, (size_t)(nsg * ksplit), 1};
+            backend_ctx->enqueue_ndrange_kernel(ks, 3, gsk, lsk, dst);
+
+            cl_kernel kr = backend_ctx->kernel_gemv_splitk_reduce_f32;
+            CL_CHECK(clSetKernelArg(kr, 0, sizeof(cl_mem),   &partial));
+            CL_CHECK(clSetKernelArg(kr, 1, sizeof(cl_mem),   &extrad->data_device));
+            CL_CHECK(clSetKernelArg(kr, 2, sizeof(cl_ulong), &offsetd));
+            CL_CHECK(clSetKernelArg(kr, 3, sizeof(cl_int),   &ne01));
+            CL_CHECK(clSetKernelArg(kr, 4, sizeof(cl_int),   &ksplit));
+            size_t lr[3] = {64, 1, 1};
+            size_t gr[3] = {(size_t)CEIL_DIV(ne01, 64) * 64, 1, 1};
+            backend_ctx->enqueue_ndrange_kernel(kr, 3, gr, lr, dst);
+
+            if (q_img) CL_CHECK(clReleaseMemObject(q_img));
+            CL_CHECK(clReleaseMemObject(b_sub_buf));
+            CL_CHECK(clReleaseMemObject(b_img));
+            return;
+        }
+
         kernel = use_mc3    ? backend_ctx->kernel_gemv_noshuffle_q4_k_f32_mc3
                : use_tiled  ? backend_ctx->kernel_gemv_noshuffle_q4_k_f32_tiled
                : use_q4k_o4 ? backend_ctx->kernel_gemv_noshuffle_q4_k_f32_o4
