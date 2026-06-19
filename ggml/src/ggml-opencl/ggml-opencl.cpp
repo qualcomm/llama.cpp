@@ -489,6 +489,7 @@ struct ggml_backend_opencl_context {
     bool has_subgroup_shuffle = false;       // cl_khr_subgroup_shuffle or cl_qcom_subgroup_shuffle
     bool has_qcom_subgroup_shuffle = false;  // specifically cl_qcom_subgroup_shuffle
     bool disable_fusion;
+    bool fuse_rms_add = true;                    // opt-out GGML_OPENCL_FUSE_RMS_ADD=0 (fused rms_norm*w + residual)
 
     bool adreno_has_large_buffer;
     bool adreno_use_large_buffer;
@@ -617,6 +618,7 @@ struct ggml_backend_opencl_context {
               kernel_geglu_f16, kernel_reglu_f16, kernel_swiglu_f16, kernel_geglu_erf_f16, kernel_geglu_quick_f16;
     cl_kernel kernel_norm, kernel_norm_mul_add;
     cl_kernel kernel_rms_norm, kernel_rms_norm_mul;
+    cl_kernel kernel_rms_norm_mul_add = nullptr;   // fused rms_norm(x)*w + b (residual)
     cl_kernel kernel_l2_norm_f32;
     cl_kernel kernel_group_norm, kernel_group_norm_mul_add;
     cl_kernel kernel_diag_mask_inf, kernel_diag_mask_inf_8;
@@ -2292,6 +2294,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 
         CL_CHECK((backend_ctx->kernel_rms_norm     = clCreateKernel(backend_ctx->program_rms_norm, "kernel_rms_norm", &err), err));
         CL_CHECK((backend_ctx->kernel_rms_norm_mul = clCreateKernel(backend_ctx->program_rms_norm, "kernel_rms_norm_mul", &err), err));
+        CL_CHECK((backend_ctx->kernel_rms_norm_mul_add = clCreateKernel(backend_ctx->program_rms_norm, "kernel_rms_norm_mul_add", &err), err));
         GGML_LOG_CONT(".");
     }
 
@@ -5165,6 +5168,9 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
 #endif // GGML_OPENCL_USE_ADRENO_KERNELS
 
     backend_ctx->disable_fusion = getenv("GGML_OPENCL_DISABLE_FUSION") != nullptr;
+    if (const char * env = getenv("GGML_OPENCL_FUSE_RMS_ADD")) {
+        backend_ctx->fuse_rms_add = atoi(env) != 0;
+    }
 
     dev_ctx->backend_ctx = backend_ctx.release();
     return dev_ctx->backend_ctx;
@@ -5906,6 +5912,38 @@ static bool ggml_opencl_can_fuse(const struct ggml_cgraph * cgraph, int node_idx
         if (!ggml_is_contiguous(norm->src[0]) || !ggml_is_contiguous(w) || !ggml_is_contiguous(b)) {
             return false;
         }
+    } else if (ops.size() == 3 && ops.begin()[0] == GGML_OP_RMS_NORM && ops.begin()[1] == GGML_OP_MUL && ops.begin()[2] == GGML_OP_ADD) {
+        // rms_norm(x) * w + b, fused (residual). Mirrors the RMS_NORM+MUL gate
+        // plus the residual-add operand's constraints.
+        const ggml_tensor *rms_norm = cgraph->nodes[node_idx];
+        const ggml_tensor *mul      = cgraph->nodes[node_idx+1];
+        const ggml_tensor *add      = cgraph->nodes[node_idx+2];
+        const ggml_tensor *w        = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
+        const ggml_tensor *b        = add->src[0] == mul      ? add->src[1] : add->src[0];
+
+        GGML_ASSERT(rms_norm->src[0]->type == GGML_TYPE_F32);
+        GGML_ASSERT(rms_norm->type == GGML_TYPE_F32);
+
+        if (w->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 ||
+            b->type != GGML_TYPE_F32 || add->type != GGML_TYPE_F32) {
+            return false;
+        }
+        if (rms_norm->src[0]->ne[0] % 4 != 0) {
+            return false;
+        }
+        // if rms_norm is the B operand of mul, broadcast is not handled
+        if (rms_norm == mul->src[1] && !ggml_are_same_shape(mul->src[0], rms_norm)) {
+            return false;
+        }
+        // the residual must match the normed output shape (no add broadcast)
+        if (!ggml_are_same_shape(b, add)) {
+            return false;
+        }
+        // rms_norm assumes contiguous rows
+        if (!ggml_is_contiguous_rows(mul->src[0]) || !ggml_is_contiguous_rows(mul->src[1]) ||
+            !ggml_is_contiguous_rows(b)) {
+            return false;
+        }
     } else if (ops.size() == 3 && ops.begin()[0] == GGML_OP_GROUP_NORM && ops.begin()[1] == GGML_OP_MUL && ops.begin()[2] == GGML_OP_ADD) {
         const ggml_tensor *gn = cgraph->nodes[node_idx];
         const ggml_tensor *mul = cgraph->nodes[node_idx+1];
@@ -5928,6 +5966,98 @@ static bool ggml_opencl_can_fuse(const struct ggml_cgraph * cgraph, int node_idx
 static void ggml_opencl_op_rms_norm_fused(ggml_backend_t backend, ggml_tensor * rms_norm_tensor, ggml_tensor * mul_tensor);
 static void ggml_opencl_op_norm_fused(ggml_backend_t backend, ggml_tensor * norm_tensor, ggml_tensor * mul_tensor, ggml_tensor * add_tensor);
 static void ggml_opencl_op_group_norm_fused(ggml_backend_t backend, ggml_tensor * gn_tensor, ggml_tensor * mul_tensor, ggml_tensor * add_tensor);
+
+static void ggml_opencl_op_rms_norm_mul_add_fused(ggml_backend_t backend, ggml_tensor * rms_norm_tensor, ggml_tensor * mul_tensor, ggml_tensor * add_tensor) {
+    GGML_ASSERT(rms_norm_tensor && mul_tensor && add_tensor);
+
+    const ggml_tensor * src0 = rms_norm_tensor->src[0];
+    const ggml_tensor * src1 = mul_tensor->src[0] == rms_norm_tensor ? mul_tensor->src[1] : mul_tensor->src[0];
+    const ggml_tensor * src2 = add_tensor->src[0] == mul_tensor ? add_tensor->src[1] : add_tensor->src[0];
+    const ggml_tensor * dst  = add_tensor;
+
+    GGML_ASSERT(src0 && src0->extra);
+    GGML_ASSERT(src1 && src1->extra);
+    GGML_ASSERT(src2 && src2->extra);
+    GGML_ASSERT(dst  && dst->extra);
+
+    ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *)src0->extra;
+    ggml_tensor_extra_cl * extra1 = (ggml_tensor_extra_cl *)src1->extra;
+    ggml_tensor_extra_cl * extra2 = (ggml_tensor_extra_cl *)src2->extra;
+    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
+
+    cl_ulong offset0 = extra0->offset + src0->view_offs;
+    cl_ulong offset1 = extra1->offset + src1->view_offs;
+    cl_ulong offset2 = extra2->offset + src2->view_offs;
+    cl_ulong offsetd = extrad->offset + dst->view_offs;
+
+    ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
+
+    float eps;
+    memcpy(&eps, rms_norm_tensor->op_params, sizeof(float));
+
+    const int ne00 = src0->ne[0], ne01 = src0->ne[1], ne02 = src0->ne[2], ne03 = src0->ne[3];
+    const cl_ulong nb01 = src0->nb[1], nb02 = src0->nb[2], nb03 = src0->nb[3];
+    const int ne10 = src1->ne[0], ne11 = src1->ne[1], ne12 = src1->ne[2], ne13 = src1->ne[3];
+    const cl_ulong nb11 = src1->nb[1], nb12 = src1->nb[2], nb13 = src1->nb[3];
+    const int ne20 = src2->ne[0], ne21 = src2->ne[1], ne22 = src2->ne[2], ne23 = src2->ne[3];
+    const cl_ulong nb21 = src2->nb[1], nb22 = src2->nb[2], nb23 = src2->nb[3];
+    const cl_ulong nb1 = dst->nb[1], nb2 = dst->nb[2], nb3 = dst->nb[3];
+
+    GGML_ASSERT(ne00 % 4 == 0);
+
+    size_t sgs;
+    if (backend_ctx->gpu_family == ADRENO) sgs = 64;
+    else if (backend_ctx->gpu_family == INTEL) sgs = 32;
+    else GGML_ASSERT(false && "Unsupported GPU");
+
+    cl_kernel kernel = backend_ctx->kernel_rms_norm_mul_add;
+
+    int nth = sgs;
+    int max_workgroup_size = backend_ctx->get_kernel_workgroup_size(kernel);
+    while (nth < ne00 && nth < max_workgroup_size) nth *= 2;
+    nth = MIN(nth, max_workgroup_size);
+    nth = MIN(nth, ne00);
+
+    size_t global_work_size[] = {(size_t)ne01*nth, (size_t)ne02, (size_t)ne03};
+    size_t local_work_size[]  = {(size_t)nth, 1, 1};
+
+    CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0->data_device));
+    CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_ulong), &offset0));
+    CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),   &extra1->data_device));
+    CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_ulong), &offset1));
+    CL_CHECK(clSetKernelArg(kernel,  4, sizeof(cl_mem),   &extra2->data_device));
+    CL_CHECK(clSetKernelArg(kernel,  5, sizeof(cl_ulong), &offset2));
+    CL_CHECK(clSetKernelArg(kernel,  6, sizeof(cl_mem),   &extrad->data_device));
+    CL_CHECK(clSetKernelArg(kernel,  7, sizeof(cl_ulong), &offsetd));
+    CL_CHECK(clSetKernelArg(kernel,  8, sizeof(int),      &ne00));
+    CL_CHECK(clSetKernelArg(kernel,  9, sizeof(int),      &ne01));
+    CL_CHECK(clSetKernelArg(kernel, 10, sizeof(int),      &ne02));
+    CL_CHECK(clSetKernelArg(kernel, 11, sizeof(int),      &ne03));
+    CL_CHECK(clSetKernelArg(kernel, 12, sizeof(cl_ulong), &nb01));
+    CL_CHECK(clSetKernelArg(kernel, 13, sizeof(cl_ulong), &nb02));
+    CL_CHECK(clSetKernelArg(kernel, 14, sizeof(cl_ulong), &nb03));
+    CL_CHECK(clSetKernelArg(kernel, 15, sizeof(int),      &ne10));
+    CL_CHECK(clSetKernelArg(kernel, 16, sizeof(int),      &ne11));
+    CL_CHECK(clSetKernelArg(kernel, 17, sizeof(int),      &ne12));
+    CL_CHECK(clSetKernelArg(kernel, 18, sizeof(int),      &ne13));
+    CL_CHECK(clSetKernelArg(kernel, 19, sizeof(cl_ulong), &nb11));
+    CL_CHECK(clSetKernelArg(kernel, 20, sizeof(cl_ulong), &nb12));
+    CL_CHECK(clSetKernelArg(kernel, 21, sizeof(cl_ulong), &nb13));
+    CL_CHECK(clSetKernelArg(kernel, 22, sizeof(int),      &ne20));
+    CL_CHECK(clSetKernelArg(kernel, 23, sizeof(int),      &ne21));
+    CL_CHECK(clSetKernelArg(kernel, 24, sizeof(int),      &ne22));
+    CL_CHECK(clSetKernelArg(kernel, 25, sizeof(int),      &ne23));
+    CL_CHECK(clSetKernelArg(kernel, 26, sizeof(cl_ulong), &nb21));
+    CL_CHECK(clSetKernelArg(kernel, 27, sizeof(cl_ulong), &nb22));
+    CL_CHECK(clSetKernelArg(kernel, 28, sizeof(cl_ulong), &nb23));
+    CL_CHECK(clSetKernelArg(kernel, 29, sizeof(cl_ulong), &nb1));
+    CL_CHECK(clSetKernelArg(kernel, 30, sizeof(cl_ulong), &nb2));
+    CL_CHECK(clSetKernelArg(kernel, 31, sizeof(cl_ulong), &nb3));
+    CL_CHECK(clSetKernelArg(kernel, 32, sizeof(float),    &eps));
+    CL_CHECK(clSetKernelArg(kernel, 33, sizeof(float)*sgs, NULL));
+
+    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+}
 
 static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
@@ -5955,6 +6085,15 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
         }
         if (!backend_ctx->disable_fusion && ggml_opencl_can_fuse(cgraph, i, { GGML_OP_GROUP_NORM, GGML_OP_MUL, GGML_OP_ADD })) {
             ggml_opencl_op_group_norm_fused(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
+            i += 2;
+            continue;
+        }
+        // Fuse rms_norm + mul(weight) + add(residual). Checked before the
+        // rms_norm+mul fuse so the 3-op pattern wins over its 2-op prefix.
+        // Default on, opt-out GGML_OPENCL_FUSE_RMS_ADD=0.
+        if (!backend_ctx->disable_fusion && backend_ctx->fuse_rms_add &&
+            ggml_opencl_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD })) {
+            ggml_opencl_op_rms_norm_mul_add_fused(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
             i += 2;
             continue;
         }
