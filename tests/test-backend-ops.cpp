@@ -8557,6 +8557,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2560,   1, 4096, {1, 1}, {4, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2560, 128, 4096, {1, 1}, {4, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2560, 170, 4096, {1, 1}, {3, 1}));
+    // q4_0 GDN ssm_out broadcast: same trans-weight dequant-to-f16 reroute as q8_0
+    // (large weights are stored transposed; the reroute must restore them correctly).
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 2560,   1, 4096, {1, 1}, {4, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 2560, 128, 4096, {1, 1}, {4, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 2560, 170, 4096, {1, 1}, {3, 1}));
 
     for (ggml_type type_a : all_types) {
         for (int i = 1; i < 10; ++i) {
