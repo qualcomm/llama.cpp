@@ -16886,27 +16886,84 @@ static cl_mem ggml_cl_mul_mat_dequant_quant_to_f16(
         cl_mem aos = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE, parent_nbytes, NULL, &err);
         CL_CHECK(err);
 
-        cl_kernel kernel;
-        if (tensor->type == GGML_TYPE_Q8_0) {
+        // Large q4_0/q8_0 WEIGHTS are stored transposed (Adreno trans-weight format,
+        // gated by use_adreno_kernels / enable_adreno_trans_weight at set_tensor). The
+        // plain restore_block kernels assume the un-transposed SoA layout and would
+        // produce scrambled AoS for those weights — pick the trans-aware restore to
+        // match how the weight was actually stored (mirrors get_tensor). Small weights
+        // (and the AoS KV-cache, handled in the else branch above) are not transposed.
+        bool restored = false;
+#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+        const int p_ne00 = (int) parent->ne[0];
+        const int p_ne01 = (int) parent->ne[1];
+        if (tensor->type == GGML_TYPE_Q8_0 && enable_adreno_trans_weight(backend_ctx, parent)) {
             auto * extra = (ggml_tensor_extra_cl_q8_0 *) soa_src->extra;
-            kernel = backend_ctx->kernel_restore_block_q8_0;
+            pool_key_buf = (uintptr_t) extra->q;
+            cl_kernel kernel = backend_ctx->kernel_restore_block_q8_0_trans;
             CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &extra->q));
             CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &extra->d));
             CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem), &aos));
-            pool_key_buf = (uintptr_t) extra->q;
-        } else {
+            CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_int), &p_ne00));
+            CL_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_int), &p_ne01));
+            size_t gws[] = { (size_t)(((p_ne01 + 63) / 64) * 64), 1, 1 };
+            size_t lws[] = { 64, 1, 1 };
+            CL_CHECK(clEnqueueNDRangeKernel(backend_ctx->queue, kernel, 3, NULL, gws, lws, 0, NULL, NULL));
+            restored = true;
+        } else if (tensor->type == GGML_TYPE_Q4_0 &&
+                   use_adreno_kernels(backend_ctx, parent) &&
+                   !use_adreno_moe_kernels(backend_ctx, parent)) {
+            // Dense q4_0 weight: stored noshuffle + transposed. Transpose q/d back into
+            // scratch, then reconstruct AoS via the noshuffle restore.
             auto * extra = (ggml_tensor_extra_cl_q4_0 *) soa_src->extra;
-            kernel = backend_ctx->kernel_restore_block_q4_0;
-            CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &extra->q));
-            CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &extra->d));
-            CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem), &aos));
             pool_key_buf = (uintptr_t) extra->q;
+            const size_t size_q = (size_t) ggml_nelements(parent) / blck_size * (blck_size / 2);
+            const size_t size_d = (size_t) ggml_nelements(parent) / blck_size * sizeof(ggml_fp16_t);
+            cl_int err2 = CL_SUCCESS;
+            cl_mem buf_tq = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE, size_q, NULL, &err2); CL_CHECK(err2);
+            cl_mem buf_td = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE, size_d, NULL, &err2); CL_CHECK(err2);
+            transpose_2d_as_16b(backend_ctx, extra->q, buf_tq, size_q, p_ne01, p_ne00 / 4);
+            transpose_2d_as_16b(backend_ctx, extra->d, buf_td, size_d, p_ne01, p_ne00 / 32);
+            cl_uchar mask_0F = 0x0F, mask_F0 = 0xF0;
+            cl_kernel kernel = backend_ctx->kernel_restore_block_q4_0_noshuffle;
+            CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),   &buf_tq));
+            CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem),   &buf_td));
+            CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem),   &aos));
+            CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_uchar), &mask_0F));
+            CL_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_uchar), &mask_F0));
+            const size_t n_blk = parent_nbytes / block_bytes;
+            size_t gws[] = { n_blk, 1, 1 };
+            size_t lws[] = { 1, 1, 1 };
+            CL_CHECK(clEnqueueNDRangeKernel(backend_ctx->queue, kernel, 3, NULL, gws, lws, 0, NULL, NULL));
+            // Retained by the runtime while the restore kernel is queued.
+            CL_CHECK(clReleaseMemObject(buf_tq));
+            CL_CHECK(clReleaseMemObject(buf_td));
+            restored = true;
         }
+#endif // GGML_OPENCL_USE_ADRENO_KERNELS
 
-        const size_t n_blocks = parent_nbytes / block_bytes;
-        size_t gws_rec[] = { n_blocks, 1, 1 };
-        size_t lws_rec[] = { 1, 1, 1 };
-        CL_CHECK(clEnqueueNDRangeKernel(backend_ctx->queue, kernel, 3, NULL, gws_rec, lws_rec, 0, NULL, NULL));
+        if (!restored) {
+            cl_kernel kernel;
+            if (tensor->type == GGML_TYPE_Q8_0) {
+                auto * extra = (ggml_tensor_extra_cl_q8_0 *) soa_src->extra;
+                kernel = backend_ctx->kernel_restore_block_q8_0;
+                CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &extra->q));
+                CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &extra->d));
+                CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem), &aos));
+                pool_key_buf = (uintptr_t) extra->q;
+            } else {
+                auto * extra = (ggml_tensor_extra_cl_q4_0 *) soa_src->extra;
+                kernel = backend_ctx->kernel_restore_block_q4_0;
+                CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &extra->q));
+                CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &extra->d));
+                CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem), &aos));
+                pool_key_buf = (uintptr_t) extra->q;
+            }
+
+            const size_t n_blocks = parent_nbytes / block_bytes;
+            size_t gws_rec[] = { n_blocks, 1, 1 };
+            size_t lws_rec[] = { 1, 1, 1 };
+            CL_CHECK(clEnqueueNDRangeKernel(backend_ctx->queue, kernel, 3, NULL, gws_rec, lws_rec, 0, NULL, NULL));
+        }
 
         (void) parent_row_blocks;
         (void) parent_row_bytes;
