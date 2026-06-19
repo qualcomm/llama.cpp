@@ -578,6 +578,7 @@ struct ggml_backend_opencl_context {
         cl_channel_type channel_data_type = CL_FLOAT;
     };
     std::map<ImagePoolKey, ImagePoolEntry> kq_img_pool;
+    std::map<ImagePoolKey, ImagePoolEntry> kq_img_pool_q8;   // q8_0 K-cache GQA-coalesced KQ (CL_R/UINT32)
     std::map<ImagePoolKey, ImagePoolEntry> kqv_img_pool;
 
     // prealloc buffers for src0 and src1
@@ -780,6 +781,15 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mv_q6_K_f32_flat;
     cl_kernel kernel_mul_mv_mxfp4_f32, kernel_mul_mv_mxfp4_f32_flat;
     cl_kernel kernel_mul_mv_q8_0_f32, kernel_mul_mv_q8_0_f32_flat;
+    // GQA-coalesced decode KQ for a q8_0 K-cache (read K once per K-head, fan to r2 Q-heads)
+    cl_kernel kernel_mul_mat_q8_0_f32_gqa8_dk128 = nullptr;
+    cl_kernel kernel_mul_mat_q8_0_f32_gqa8_dk128_img = nullptr;
+    cl_kernel kernel_mul_mat_q8_0_f32_gqa_r4_dk128 = nullptr;
+    cl_kernel kernel_mul_mat_q8_0_f32_gqa_r4_dk128_img = nullptr;
+    cl_kernel kernel_mul_mat_q8_0_f32_gqa8_dk256 = nullptr;
+    cl_kernel kernel_mul_mat_q8_0_f32_gqa8_dk256_img = nullptr;
+    cl_kernel kernel_mul_mat_q8_0_f32_gqa_r4_dk256 = nullptr;
+    cl_kernel kernel_mul_mat_q8_0_f32_gqa_r4_dk256_img = nullptr;
     cl_kernel kernel_mul_mv_iq4_nl_f32;
     cl_kernel kernel_mul_mv_iq4_nl_f32_flat;
     cl_kernel kernel_solve_tri_f32;
@@ -1032,6 +1042,11 @@ struct ggml_backend_opencl_context {
                 if (kv.second.sub_buffer) CL_CHECK(clReleaseMemObject(kv.second.sub_buffer));
             }
             kq_img_pool.clear();
+            for (auto & kv : kq_img_pool_q8) {
+                if (kv.second.image)      CL_CHECK(clReleaseMemObject(kv.second.image));
+                if (kv.second.sub_buffer) CL_CHECK(clReleaseMemObject(kv.second.sub_buffer));
+            }
+            kq_img_pool_q8.clear();
             for (auto & kv : kqv_img_pool) {
                 if (kv.second.image)      CL_CHECK(clReleaseMemObject(kv.second.image));
                 if (kv.second.sub_buffer) CL_CHECK(clReleaseMemObject(kv.second.sub_buffer));
@@ -1828,6 +1843,44 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
 
         CL_CHECK((backend_ctx->kernel_mul_mv_q8_0_f32 = clCreateKernel(backend_ctx->program_mul_mv_q8_0_f32, "kernel_mul_mv_q8_0_f32", &err), err));
+        // GQA-coalesced decode KQ for a q8_0 K-cache (DK=128, r2=8). Same program.
+        // nullptr-on-failure so an old driver that can't compile it just falls back.
+        cl_int err_q8gqa = CL_SUCCESS;
+        backend_ctx->kernel_mul_mat_q8_0_f32_gqa8_dk128 =
+            clCreateKernel(backend_ctx->program_mul_mv_q8_0_f32, "kernel_mul_mat_q8_0_f32_gqa8_dk128", &err_q8gqa);
+        if (err_q8gqa != CL_SUCCESS) backend_ctx->kernel_mul_mat_q8_0_f32_gqa8_dk128 = nullptr;
+        cl_int err_q8gqai = CL_SUCCESS;
+        backend_ctx->kernel_mul_mat_q8_0_f32_gqa8_dk128_img =
+            clCreateKernel(backend_ctx->program_mul_mv_q8_0_f32, "kernel_mul_mat_q8_0_f32_gqa8_dk128_img", &err_q8gqai);
+        if (err_q8gqai != CL_SUCCESS) backend_ctx->kernel_mul_mat_q8_0_f32_gqa8_dk128_img = nullptr;
+        // r2=4 variants for Llama-3-8B (DK=128, n_head_kv=8).
+        cl_int err_q8gqa_r4 = CL_SUCCESS;
+        backend_ctx->kernel_mul_mat_q8_0_f32_gqa_r4_dk128 =
+            clCreateKernel(backend_ctx->program_mul_mv_q8_0_f32, "kernel_mul_mat_q8_0_f32_gqa_r4_dk128", &err_q8gqa_r4);
+        if (err_q8gqa_r4 != CL_SUCCESS) backend_ctx->kernel_mul_mat_q8_0_f32_gqa_r4_dk128 = nullptr;
+        cl_int err_q8gqa_r4i = CL_SUCCESS;
+        backend_ctx->kernel_mul_mat_q8_0_f32_gqa_r4_dk128_img =
+            clCreateKernel(backend_ctx->program_mul_mv_q8_0_f32, "kernel_mul_mat_q8_0_f32_gqa_r4_dk128_img", &err_q8gqa_r4i);
+        if (err_q8gqa_r4i != CL_SUCCESS) backend_ctx->kernel_mul_mat_q8_0_f32_gqa_r4_dk128_img = nullptr;
+        // r2=8 DK=256 variants for Qwen3.6-35B-A3B (n_head_kv=2, head_dim=256).
+        cl_int err_q8gqa256 = CL_SUCCESS;
+        backend_ctx->kernel_mul_mat_q8_0_f32_gqa8_dk256 =
+            clCreateKernel(backend_ctx->program_mul_mv_q8_0_f32, "kernel_mul_mat_q8_0_f32_gqa8_dk256", &err_q8gqa256);
+        if (err_q8gqa256 != CL_SUCCESS) backend_ctx->kernel_mul_mat_q8_0_f32_gqa8_dk256 = nullptr;
+        cl_int err_q8gqa256i = CL_SUCCESS;
+        backend_ctx->kernel_mul_mat_q8_0_f32_gqa8_dk256_img =
+            clCreateKernel(backend_ctx->program_mul_mv_q8_0_f32, "kernel_mul_mat_q8_0_f32_gqa8_dk256_img", &err_q8gqa256i);
+        if (err_q8gqa256i != CL_SUCCESS) backend_ctx->kernel_mul_mat_q8_0_f32_gqa8_dk256_img = nullptr;
+        // r2=4 DK=256 variants for Qwen3.5-9B (n_head_kv=4, head_dim=256) -- memory-footprint.
+        cl_int err_q8gqar4256 = CL_SUCCESS;
+        backend_ctx->kernel_mul_mat_q8_0_f32_gqa_r4_dk256 =
+            clCreateKernel(backend_ctx->program_mul_mv_q8_0_f32, "kernel_mul_mat_q8_0_f32_gqa_r4_dk256", &err_q8gqar4256);
+        if (err_q8gqar4256 != CL_SUCCESS) backend_ctx->kernel_mul_mat_q8_0_f32_gqa_r4_dk256 = nullptr;
+        cl_int err_q8gqar4256i = CL_SUCCESS;
+        backend_ctx->kernel_mul_mat_q8_0_f32_gqa_r4_dk256_img =
+            clCreateKernel(backend_ctx->program_mul_mv_q8_0_f32, "kernel_mul_mat_q8_0_f32_gqa_r4_dk256_img", &err_q8gqar4256i);
+        if (err_q8gqar4256i != CL_SUCCESS) backend_ctx->kernel_mul_mat_q8_0_f32_gqa_r4_dk256_img = nullptr;
+        GGML_LOG_CONT(".");
         GGML_LOG_CONT(".");
     }
 
@@ -13241,6 +13294,59 @@ static bool ggml_cl_flash_attn_reconstruct_aos(
     return true;
 }
 
+static cl_mem ggml_cl_img_pool_get_or_create_r32(
+    ggml_backend_opencl_context * backend_ctx,
+    std::map<ggml_backend_opencl_context::ImagePoolKey,
+             ggml_backend_opencl_context::ImagePoolEntry> & pool,
+    cl_mem data_device,
+    cl_ulong offset0,
+    size_t required_bytes)
+{
+    ggml_backend_opencl_context::ImagePoolKey key{(uintptr_t)data_device, (uint64_t)offset0};
+    auto it = pool.find(key);
+    if (it != pool.end()
+        && it->second.k_bytes >= required_bytes
+        && it->second.channel_data_type == CL_UNSIGNED_INT32
+        && it->second.image != nullptr) {
+        return it->second.image;
+    }
+    if (it != pool.end()) {
+        if (it->second.image)      CL_CHECK(clReleaseMemObject(it->second.image));
+        if (it->second.sub_buffer) CL_CHECK(clReleaseMemObject(it->second.sub_buffer));
+        pool.erase(it);
+    }
+
+    cl_int status = CL_SUCCESS;
+    cl_buffer_region region = {};
+    region.origin = (size_t)offset0;
+    region.size   = required_bytes;
+    cl_mem sub = clCreateSubBuffer(data_device, 0,
+                                   CL_BUFFER_CREATE_TYPE_REGION, &region, &status);
+    if (status != CL_SUCCESS) {
+        return nullptr;
+    }
+
+    cl_image_format fmt = {CL_R, CL_UNSIGNED_INT32};
+    cl_image_desc   desc = {};
+    desc.image_type   = CL_MEM_OBJECT_IMAGE1D_BUFFER;
+    desc.image_width  = required_bytes / 4;   // 4-byte pixels
+    desc.buffer       = sub;
+    cl_mem img = clCreateImage(backend_ctx->context, CL_MEM_READ_ONLY,
+                               &fmt, &desc, NULL, &status);
+    if (status != CL_SUCCESS) {
+        CL_CHECK(clReleaseMemObject(sub));
+        return nullptr;
+    }
+
+    ggml_backend_opencl_context::ImagePoolEntry entry;
+    entry.sub_buffer = sub;
+    entry.image      = img;
+    entry.k_bytes    = required_bytes;
+    entry.channel_data_type = CL_UNSIGNED_INT32;
+    pool[key] = entry;
+    return img;
+}
+
 // GPU dequant of a contiguous q4_0/q8_0 KV tensor to f16/f32. Caller supplies
 // src_buf when reconstructing from SoA. Returns false for non-contig layouts
 // (the kernel indexes blocks tightly within ne[0]) so the caller can fall back
@@ -16978,6 +17084,159 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
     const enum ggml_type src1t = src1->type;
 
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
+
+    // GQA-coalesced decode KQ for a q8_0 K-cache (DK=128, r2=8, ne11==1) -- the
+    // fa=0 quant-K analog of the f16 _x8_gqa4 image coalesce. The K cache is an
+    // AoS block_q8_0 runtime tensor (never set_tensor'd, so never SoA; see
+    // ggml_cl_is_q8_0_soa). Read each K-row once per K-head from extra0->data_device
+    // and fan it to 8 Q-heads. This must run BEFORE the non-contig dequant-to-f16
+    // interception below (the decode K view is non-contiguous, n_kv<n_ctx), which it
+    // would otherwise fall into -- doing a full f16 dequant pass every step and, at
+    // depth, crashing. Default-on; opt out with GGML_OPENCL_MM_KQ_GQA_Q8_0=0.
+    // r2=8 (Qwen3-30B-A3B) and r2=4 (Llama-3-8B) select different kernels with the
+    // same args/grid; the r4 lane geometry (4 Q-heads x 16 lanes) is baked into the
+    // kernel. Both default-on; opt out with GGML_OPENCL_MM_KQ_GQA_Q8_0=0.
+    if (src0t == GGML_TYPE_Q8_0 && src1t == GGML_TYPE_F32 &&
+        (backend_ctx->kernel_mul_mat_q8_0_f32_gqa8_dk128 != nullptr ||
+         backend_ctx->kernel_mul_mat_q8_0_f32_gqa_r4_dk128 != nullptr)) {
+        static const char * q8gqa_env = getenv("GGML_OPENCL_MM_KQ_GQA_Q8_0");
+        static const bool   q8gqa_on  = (q8gqa_env == nullptr || q8gqa_env[0] != '0');
+
+        const int ne00 = src0->ne[0];
+        const int ne01 = src0->ne[1];
+        const int ne02 = src0->ne[2];
+        const int ne03 = src0->ne[3];
+        const int ne11 = src1->ne[1];
+        const int ne12 = src1->ne[2];
+        const int ne13 = src1->ne[3];
+        const int rr   = (ne02 > 0 && (ne12 % ne02) == 0) ? (ne12 / ne02) : 0;
+        cl_kernel kbuf = (ne00 == 256 && rr == 8) ? backend_ctx->kernel_mul_mat_q8_0_f32_gqa8_dk256
+                       : (ne00 == 256 && rr == 4) ? backend_ctx->kernel_mul_mat_q8_0_f32_gqa_r4_dk256
+                       : (ne00 == 128 && rr == 8) ? backend_ctx->kernel_mul_mat_q8_0_f32_gqa8_dk128
+                       : (ne00 == 128 && rr == 4) ? backend_ctx->kernel_mul_mat_q8_0_f32_gqa_r4_dk128
+                       : nullptr;
+        cl_kernel kimg = (ne00 == 256 && rr == 8) ? backend_ctx->kernel_mul_mat_q8_0_f32_gqa8_dk256_img
+                       : (ne00 == 256 && rr == 4) ? backend_ctx->kernel_mul_mat_q8_0_f32_gqa_r4_dk256_img
+                       : (ne00 == 128 && rr == 8) ? backend_ctx->kernel_mul_mat_q8_0_f32_gqa8_dk128_img
+                       : (ne00 == 128 && rr == 4) ? backend_ctx->kernel_mul_mat_q8_0_f32_gqa_r4_dk128_img
+                       : nullptr;
+
+        if (q8gqa_on && kbuf != nullptr && (ne00 == 128 || ne00 == 256) && ne11 == 1 && ne01 >= 64 &&
+            (ne01 % 16) == 0 && ne02 > 0 && (ne13 / ne03) == 1) {
+            ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *)src0->extra;
+            ggml_tensor_extra_cl * extra1 = (ggml_tensor_extra_cl *)src1->extra;
+            ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
+
+            cl_ulong offset0 = extra0->offset + src0->view_offs;
+            cl_ulong offset1 = extra1->offset + src1->view_offs;
+            cl_ulong offsetd = extrad->offset + dst->view_offs;
+
+            const cl_ulong nb01 = src0->nb[1];
+            const cl_ulong nb02 = src0->nb[2];
+            const cl_ulong nb03 = src0->nb[3];
+            const int      ne10 = src1->ne[0];
+            const cl_ulong nb10 = src1->nb[0];
+            const cl_ulong nb11 = src1->nb[1];
+            const cl_ulong nb12 = src1->nb[2];
+            const cl_ulong nb13 = src1->nb[3];
+            const int      ne0  = dst->ne[0];
+            const int      ne1  = dst->ne[1];
+            const int      r2   = ne12 / ne02;
+            const int      r3   = ne13 / ne03;
+
+            // Texture-cache (image1d_buffer) variant: read the q8_0 K through a
+            // CL_R/CL_UNSIGNED_INT32 image so K uses the texture-cache BW lane
+            // (the lever the plain buffer kernel below can't reach). Default-on --
+            // Qwen3-30B-A3B tg64 @16k 8.16->16.81 (+106% vs buffer, +11% vs f16 KV
+            // at -23% KV DDR); @4k 17.54->24.66 (~f16 parity). Buffer kernel below
+            // is the fallback when the image can't be created (e.g. k_pixels over
+            // image_max_buffer_size). Opt out with GGML_OPENCL_MM_KQ_GQA_Q8_0_IMG=0.
+            static const char * q8gqai_env = getenv("GGML_OPENCL_MM_KQ_GQA_Q8_0_IMG");
+            static const bool   q8gqai_on  = (q8gqai_env == nullptr || q8gqai_env[0] != '0');
+            if (q8gqai_on && kimg != nullptr) {
+                // Byte span of K read, rounded up to a 4-byte pixel boundary.
+                const size_t span =
+                    (size_t)(ne01 - 1) * (size_t)nb01 +
+                    (size_t)(ne02 - 1) * (size_t)nb02 +
+                    (size_t)(ne03 - 1) * (size_t)nb03 +
+                    (size_t)nb01;
+                const size_t k_bytes  = (span + 3) & ~(size_t)3;
+                const size_t k_pixels = k_bytes >> 2;
+                if (k_pixels > 0 && k_pixels <= backend_ctx->image_max_buffer_size) {
+                    cl_mem K_img = ggml_cl_img_pool_get_or_create_r32(
+                        backend_ctx, backend_ctx->kq_img_pool_q8,
+                        extra0->data_device, offset0, k_bytes);
+                    if (K_img != nullptr) {
+                        cl_kernel kernel = kimg;
+                        cl_uint a = 0;
+                        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &K_img));
+                        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &extra1->data_device));
+                        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &offset1));
+                        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &extrad->data_device));
+                        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &offsetd));
+                        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &ne00));
+                        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &ne01));
+                        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &ne02));
+                        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &nb01));
+                        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &nb02));
+                        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &nb03));
+                        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &ne10));
+                        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &ne11));
+                        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &ne12));
+                        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &nb10));
+                        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &nb11));
+                        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &nb12));
+                        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &nb13));
+                        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &ne0));
+                        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &ne1));
+                        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &r2));
+                        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &r3));
+
+                        const int nth0 = 64;
+                        const int64_t n_wg_x = ne01 / 16;
+                        size_t gws[] = {(size_t)n_wg_x * nth0, (size_t)1, (size_t)ne02 * ne13};
+                        size_t lws[] = {(size_t)nth0, (size_t)1, 1};
+                        backend_ctx->enqueue_ndrange_kernel(kernel, 3, gws, lws, dst);
+                        return;
+                    }
+                }
+            }
+
+            cl_kernel kernel = kbuf;
+            cl_uint a = 0;
+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &extra0->data_device));
+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &offset0));
+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &extra1->data_device));
+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &offset1));
+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &extrad->data_device));
+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &offsetd));
+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &ne00));
+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &ne01));
+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &ne02));
+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &nb01));
+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &nb02));
+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &nb03));
+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &ne10));
+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &ne11));
+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &ne12));
+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &nb10));
+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &nb11));
+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &nb12));
+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &nb13));
+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &ne0));
+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &ne1));
+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &r2));
+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &r3));
+
+            const int nth0 = 64;
+            const int64_t n_wg_x = ne01 / 16;
+            size_t global_work_size[] = {(size_t)n_wg_x * nth0, (size_t)1, (size_t)ne02 * ne13};
+            size_t local_work_size[]  = {(size_t)nth0, (size_t)1, 1};
+            backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+            return;
+        }
+    }
+
 
     // Non-contig quant src0: on-device dequant to f16 then native f16 MUL_MAT.
     if ((src0t == GGML_TYPE_Q4_0 || src0t == GGML_TYPE_Q8_0) && !ggml_is_contiguous(src0)) {
