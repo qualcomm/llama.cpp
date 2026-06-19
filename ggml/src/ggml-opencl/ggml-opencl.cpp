@@ -15809,8 +15809,36 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
             CL_CHECK(clSetKernelArg(kernel, 11, sizeof(cl_uchar), &mask_hi2));
         }
 
-        size_t local_work_size[3] = {64, 4, 1};
-        size_t global_work_size[3] = {(size_t)CEIL_DIV(use_tiled ? ne01 : (use_q4k_o4 ? ne01/4 : ne01/2), 64)*64, 4, 1};
+        // Wide K-split for the decode GEMV: the default 4-subgroup K-split leaves
+        // each Adreno SP with only ~4 waves, too few to hide LPDDR weight-load
+        // latency, so even the large FFN matmuls run well below the achievable
+        // bandwidth. Widen to 16 subgroups/WG (= the 1024-lane Adreno WG max) so
+        // each SP holds enough in-flight memory requests. Measured +9-11% tg on
+        // Gemma-4-E4B Q4_K_M (X2), neutral prefill (GEMM path is separate), and
+        // coherence-identical (greedy output unchanged). Applies to the plain base
+        // GEMV only; tiled/o4/mc3 keep 4 (their reductions are hard-coded to 4).
+        // Layout-safe: the base kernel derives its K-split from get_local_size(1)
+        // and the packed block stride is a physical constant (independent of it).
+        // Opt-out: GGML_OPENCL_Q4K_GEMV_WIDE=0.
+        static const bool splitk_wide_env = []{
+            const char * e = std::getenv("GGML_OPENCL_Q4K_GEMV_WIDE");
+            return !e || e[0] == '\0' || e[0] != '0';
+        }();
+        const bool   splitk_wide = splitk_wide_env && !use_tiled && !use_q4k_o4 && !use_mc3;
+        size_t       nsg_y       = splitk_wide ? 16 : 4;
+        // Cap the wide K-split by the kernel's real max WG. X1-class drivers cap
+        // this GEMV at 768 (< 64*16 = 1024), so an uncapped lws aborts the
+        // dispatch with CL_INVALID_WORK_GROUP_SIZE (-54) and breaks ALL q4_K
+        // decode for M>2560. nsg_y is a pure K-split (the base kernel reads it
+        // from get_local_size(1); the packed block stride is a physical constant),
+        // so halving it stays coherent — just a narrower split. X2 keeps 16
+        // (maxwg 1024); X1 falls to 8.
+        if (splitk_wide) {
+            const size_t maxwg = backend_ctx->get_kernel_workgroup_size(kernel);
+            while (nsg_y > 4 && 64 * nsg_y > maxwg) { nsg_y >>= 1; }
+        }
+        size_t local_work_size[3] = {64, nsg_y, 1};
+        size_t global_work_size[3] = {(size_t)CEIL_DIV(use_tiled ? ne01 : (use_q4k_o4 ? ne01/4 : ne01/2), 64)*64, nsg_y, 1};
 
         backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
 
