@@ -21613,9 +21613,12 @@ static cl_mem ggml_cl_mul_mat_dequant_quant_to_f16(
         aos = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE, parent_nbytes, NULL, &err);
         CL_CHECK(err);
 
-        // large q4_0/q8_0 WEIGHTS are stored transposed and small weights
-        // (and the AoS KV-cache, handled in the else branch above) are not.
-        // choose a proper restore kernel based on this.
+        // Large q4_0/q8_0 WEIGHTS are stored transposed (Adreno trans-weight format,
+        // gated by use_adreno_kernels / enable_adreno_trans_weight at set_tensor). The
+        // plain restore_block kernels assume the un-transposed SoA layout and would
+        // produce scrambled AoS for those weights — pick the trans-aware restore to
+        // match how the weight was actually stored (mirrors get_tensor). Small weights
+        // (and the AoS KV-cache, handled in the else branch above) are not transposed.
         bool restored = false;
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
         const int p_ne00 = (int) parent->ne[0];
@@ -21636,6 +21639,8 @@ static cl_mem ggml_cl_mul_mat_dequant_quant_to_f16(
         } else if (tensor->type == GGML_TYPE_Q4_0 &&
                    use_adreno_kernels(backend_ctx, parent) &&
                    !use_adreno_moe_kernels(backend_ctx, parent)) {
+            // Dense q4_0 weight: stored noshuffle + transposed. Transpose q/d back into
+            // scratch, then reconstruct AoS via the noshuffle restore.
             auto * extra = (ggml_tensor_extra_cl_q4_0 *) soa_src->extra;
             pool_key_buf = (uintptr_t) extra->q;
             const size_t size_q = (size_t) ggml_nelements(parent) / blck_size * (blck_size / 2);
@@ -21656,7 +21661,7 @@ static cl_mem ggml_cl_mul_mat_dequant_quant_to_f16(
             size_t gws[] = { n_blk, 1, 1 };
             size_t lws[] = { 1, 1, 1 };
             CL_CHECK(clEnqueueNDRangeKernel(backend_ctx->queue, kernel, 3, NULL, gws, lws, 0, NULL, NULL));
-
+            // Retained by the runtime while the restore kernel is queued.
             CL_CHECK(clReleaseMemObject(buf_tq));
             CL_CHECK(clReleaseMemObject(buf_td));
             restored = true;
