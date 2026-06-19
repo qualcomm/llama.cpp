@@ -1073,11 +1073,14 @@ inline std::string read_file(const std::string &path) {
 
 // fatal=false returns NULL on compile failure instead of aborting; used for
 // optional FA variants that may exhaust the Adreno compiler at large DK.
-static cl_program build_program_from_source_ex(cl_context ctx, cl_device_id dev, const char* program_buffer, const std::string &compile_opts, bool fatal, const char *tag = nullptr) {
-    if (tag) {
-        GGML_LOG_INFO("ggml_opencl: compiling %s\n", tag);
-    }
-
+// retry_queue (optional): when the shader compiler returns a *transient* resource
+// error (CL_OUT_OF_HOST_MEMORY / CL_OUT_OF_RESOURCES) — seen on the big DK>=256/512
+// FA programs when host memory is momentarily pressured — clFinish the queue to
+// drain in-flight ops holding driver host-heap, then rebuild (up to 3x). Mirrors
+// the proven set_tensor/alloc clFinish-retry pattern. Real source errors (e.g.
+// CL_BUILD_PROGRAM_FAILURE) are NOT retried. nullptr -> no retry (legacy behavior).
+static cl_program build_program_from_source_ex(cl_context ctx, cl_device_id dev, const char* program_buffer, const std::string &compile_opts, bool fatal, const char *tag = nullptr, cl_command_queue retry_queue = nullptr) {
+    if (tag) GGML_LOG_INFO("ggml_opencl: compiling %s\n", tag);
     cl_program p;
     char *program_log;
     size_t program_size;
@@ -1086,17 +1089,29 @@ static cl_program build_program_from_source_ex(cl_context ctx, cl_device_id dev,
 
     program_size = strlen(program_buffer);
 
-    p = clCreateProgramWithSource(ctx, 1, (const char**)&program_buffer, &program_size, &err);
-    if(err < 0) {
-        GGML_LOG_ERROR("OpenCL error creating program");
-        if (fatal) {
-            exit(1);
+    const int max_attempts = retry_queue ? 3 : 1;
+    for (int attempt = 0; attempt < max_attempts; ++attempt) {
+        p = clCreateProgramWithSource(ctx, 1, (const char**)&program_buffer, &program_size, &err);
+        if(err < 0) {
+            GGML_LOG_ERROR("OpenCL error creating program");
+            if (fatal) exit(1);
+            return NULL;
         }
-        return nullptr;
-    }
 
-    err = clBuildProgram(p, 0, NULL, compile_opts.c_str(), NULL, NULL);
-    if(err < 0) {
+        err = clBuildProgram(p, 0, NULL, compile_opts.c_str(), NULL, NULL);
+        if (err == CL_SUCCESS) {
+            return p;
+        }
+
+        const bool transient = (err == CL_OUT_OF_HOST_MEMORY || err == CL_OUT_OF_RESOURCES);
+        if (retry_queue && transient && attempt + 1 < max_attempts) {
+            clReleaseProgram(p);
+            GGML_LOG_WARN("ggml_opencl: transient compile failure (err=%d)%s%s — clFinish + retry (%d/%d)\n",
+                err, tag ? " building " : "", tag ? tag : "", attempt + 2, max_attempts);
+            clFinish(retry_queue);  // drain in-flight ops holding driver host-heap
+            continue;
+        }
+
         clGetProgramBuildInfo(p, dev, CL_PROGRAM_BUILD_LOG, 0, NULL, &log_size);
         program_log = (char*) malloc(log_size + 1);
         program_log[log_size] = '\0';
@@ -1109,8 +1124,7 @@ static cl_program build_program_from_source_ex(cl_context ctx, cl_device_id dev,
         }
         return nullptr;
     }
-
-    return p;
+    return NULL;
 }
 
 static cl_program build_program_from_source(cl_context ctx, cl_device_id dev, const char* program_buffer, const std::string &compile_opts) {
@@ -4314,7 +4328,7 @@ static void ggml_opencl_ensure_fa_pre_kernels(ggml_backend_opencl_context * back
     // pad), declining cleanly instead of aborting at a CL_CHECK.
     cl_program prog_pre_f16 = build_program_from_source_ex(
         backend_ctx->context, backend_ctx->device, src.c_str(), opts,
-        /*fatal=*/false, "fa prepass f16");
+        /*fatal=*/false, "fa prepass f16", backend_ctx->queue);
     if (!prog_pre_f16) return;
     cl_kernel k_kv_pad_f16  = clCreateKernel(prog_pre_f16, "flash_attn_kv_pad_f16",   &err);
     if (err != CL_SUCCESS) { clReleaseProgram(prog_pre_f16); return; }
@@ -4354,7 +4368,8 @@ static bool ggml_opencl_ensure_fa_f32_f16_prefill_512(ggml_backend_opencl_contex
     cl_program prog = build_program_from_source_ex(
         backend_ctx->context, backend_ctx->device,
         ggml_opencl_fa_kernel_src(FA_VARIANT_F32_F16).c_str(), opts,
-        /*fatal=*/false, split ? "fa f32_f16 prefill512 split" : "fa f32_f16 prefill512");
+        /*fatal=*/false, split ? "fa f32_f16 prefill512 split" : "fa f32_f16 prefill512",
+        backend_ctx->queue);
     if (!prog) { failed[split ? 1 : 0] = true; return false; }
 
     cl_int err;
@@ -4383,7 +4398,7 @@ static bool ggml_opencl_ensure_fa_f32_f16_prefill_512(ggml_backend_opencl_contex
         cl_program prog_img = build_program_from_source_ex(
             backend_ctx->context, backend_ctx->device,
             ggml_opencl_fa_kernel_src(FA_VARIANT_F32_F16).c_str(), opts_img,
-            /*fatal=*/false, "fa f32_f16 prefill512 split k_img");
+            /*fatal=*/false, "fa f32_f16 prefill512 split k_img", backend_ctx->queue);
         if (prog_img) {
             cl_int err_img;
             cl_kernel k_img = clCreateKernel(prog_img, "flash_attn_f32_f16_k_img", &err_img);
@@ -4522,11 +4537,9 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
         default: break;
     }
     cl_program prog = build_program_from_source_ex(
-        backend_ctx->context, backend_ctx->device, src.c_str(), opts, /*fatal=*/false, tag);
-
-    if (!prog) {
-        return false;
-    }
+        backend_ctx->context, backend_ctx->device, src.c_str(), opts,
+        /*fatal=*/false, tag, backend_ctx->queue);
+    if (!prog) return false;
 
     cl_int err;
     switch (variant) {
@@ -4668,7 +4681,7 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
             const std::string opts_g8 = opts + " -D MQ_GQA=8 -D MQ_NSG=3 -D MQ_NSG_SPLIT=3";
             cl_program prog_g8 = fa_decode_only ? nullptr : build_program_from_source_ex(
                 backend_ctx->context, backend_ctx->device, src.c_str(), opts_g8,
-                /*fatal=*/false, "fa f32_f16 MQ_GQA=8");
+                /*fatal=*/false, "fa f32_f16 MQ_GQA=8", backend_ctx->queue);
             if (prog_g8) {
                 const size_t mq_g8_required_wg = 192;  // Q1_WG_SIZE(64) * MQ_NSG_SPLIT(3)
                 cl_kernel k_q1_vec_mq_g8 = clCreateKernel(prog_g8, "flash_attn_f32_f16_q1_vec_mq", &err);
@@ -4789,7 +4802,8 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
             const std::string opts_mq_g8 = opts + " -D MQ_GQA=8 -D MQ_NSG=3 -D MQ_NSG_SPLIT=3";
             cl_program prog_mq_g8 = build_program_from_source_ex(
                 backend_ctx->context, backend_ctx->device, src.c_str(), opts_mq_g8,
-                /*fatal=*/false, is_q8 ? "fa q8_0 MQ_GQA=8" : "fa q4_0 MQ_GQA=8");
+                /*fatal=*/false, is_q8 ? "fa q8_0 MQ_GQA=8" : "fa q4_0 MQ_GQA=8",
+                backend_ctx->queue);
             if (prog_mq_g8) {
                 const size_t mq_g8_required_wg = 192;
                 cl_kernel k_g8 = clCreateKernel(prog_mq_g8, name_mq_split.c_str(), &err);
@@ -4900,12 +4914,9 @@ static bool ggml_opencl_ensure_fa_quant_split_override(
     const std::string tag = std::string("fa ") + (is_q8_0 ? "q8_0" : "q4_0") +
         " split DK=" + std::to_string(dk);
     cl_program prog = build_program_from_source_ex(
-        backend_ctx->context, backend_ctx->device, src.c_str(), opts, /*fatal=*/false, tag.c_str());
-
-    if (!prog) {
-        return false;
-    }
-
+        backend_ctx->context, backend_ctx->device, src.c_str(), opts,
+        /*fatal=*/false, tag.c_str(), backend_ctx->queue);
+    if (!prog) return false;
     cl_int err;
     cl_kernel k;
     if (is_q8_0) {
