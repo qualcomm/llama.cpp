@@ -416,6 +416,7 @@ struct ggml_backend_opencl_context {
     bool has_vector_subgroup_broadcast;
     bool has_qcom_subgroup_shuffle = false;     // cl_qcom_subgroup_shuffle
     bool disable_fusion;
+    bool fuse_rope_set_rows = true;              // opt-out GGML_OPENCL_FUSE_ROPE_SET_ROWS=0 (fused ROPE+VIEW+SET_ROWS)
 
     bool adreno_has_large_buffer;
     bool adreno_use_large_buffer;
@@ -558,6 +559,8 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_set_rows_f32_i64, kernel_set_rows_f32_i32, kernel_set_rows_f16_i64, kernel_set_rows_f16_i32;
     cl_kernel kernel_rope_norm_f32, kernel_rope_norm_f16, kernel_rope_neox_f32, kernel_rope_neox_f16;
     cl_kernel kernel_rope_multi_f32, kernel_rope_multi_f16, kernel_rope_vision_f32, kernel_rope_vision_f16;
+    cl_kernel kernel_rope_norm_f32_set_rows_f16 = nullptr;  // fused ROPE+VIEW+SET_ROWS (K-cache scatter)
+    cl_kernel kernel_rope_neox_f32_set_rows_f16 = nullptr;
     cl_kernel kernel_cpy_f16_f16, kernel_cpy_f16_f32, kernel_cpy_f32_f16, kernel_cpy_f32_f32, kernel_cpy_f32_f32_pack, kernel_cpy_i32_i32;
     cl_kernel kernel_mul_mat_f32_f32;
     cl_kernel kernel_mul_mat_f16_f16;
@@ -2199,6 +2202,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         CL_CHECK((backend_ctx->kernel_rope_multi_f16  = clCreateKernel(backend_ctx->program_rope, "kernel_rope_multi_f16", &err), err));
         CL_CHECK((backend_ctx->kernel_rope_vision_f32 = clCreateKernel(backend_ctx->program_rope, "kernel_rope_vision_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_rope_vision_f16 = clCreateKernel(backend_ctx->program_rope, "kernel_rope_vision_f16", &err), err));
+        CL_CHECK((backend_ctx->kernel_rope_norm_f32_set_rows_f16 = clCreateKernel(backend_ctx->program_rope, "kernel_rope_norm_f32_set_rows_f16", &err), err));
+        CL_CHECK((backend_ctx->kernel_rope_neox_f32_set_rows_f16 = clCreateKernel(backend_ctx->program_rope, "kernel_rope_neox_f32_set_rows_f16", &err), err));
         GGML_LOG_CONT(".");
     }
 
@@ -4409,6 +4414,9 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
 #endif // GGML_OPENCL_USE_ADRENO_KERNELS
 
     backend_ctx->disable_fusion = getenv("GGML_OPENCL_DISABLE_FUSION") != nullptr;
+    if (const char * env = getenv("GGML_OPENCL_FUSE_ROPE_SET_ROWS")) {
+        backend_ctx->fuse_rope_set_rows = atoi(env) != 0;
+    }
 
     dev_ctx->backend_ctx = backend_ctx.release();
     return dev_ctx->backend_ctx;
@@ -5069,7 +5077,52 @@ static void sync_with_other_backends(ggml_backend_t backend) {
     sync_with_other_backends(backend_ctx);
 }
 
+// Fused ROPE + VIEW + SET_ROWS eligibility — mirrors ggml_cuda_should_fuse_rope_set_rows.
+// f32 src → f16 dst, NORMAL/NEOX rope, i64 row indices, contiguous view that
+// flattens the two rope dims, ne[3] == 1.
+static bool ggml_opencl_should_fuse_rope_set_rows(const ggml_tensor * rope,
+                                                  const ggml_tensor * view,
+                                                  const ggml_tensor * set_rows) {
+    if (rope->op != GGML_OP_ROPE || view->op != GGML_OP_VIEW || set_rows->op != GGML_OP_SET_ROWS) {
+        return false;
+    }
+    if (rope->src[0]->ne[3] != 1) {
+        return false;
+    }
+    if (rope->src[0]->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (set_rows->type != GGML_TYPE_F16) {
+        return false;
+    }
+    if (set_rows->src[1]->type != GGML_TYPE_I64) {
+        return false;
+    }
+    if (!ggml_is_contiguous(view) || view->ne[0] != rope->ne[0] * rope->ne[1]) {
+        return false;
+    }
+    const int mode = ((const int32_t *) rope->op_params)[2];
+    if (mode != GGML_ROPE_TYPE_NORMAL && mode != GGML_ROPE_TYPE_NEOX) {
+        return false;
+    }
+    return true;
+}
+
+
 static bool ggml_opencl_can_fuse(const struct ggml_cgraph * cgraph, int node_idx, std::initializer_list<enum ggml_op> ops) {
+    // ROPE + VIEW + SET_ROWS uses ggml_can_fuse_subgraph (the VIEW is a no-op
+    // node) instead of the contiguous ggml_can_fuse below.
+    if (ops.size() == 3 && ops.begin()[0] == GGML_OP_ROPE &&
+        ops.begin()[1] == GGML_OP_VIEW && ops.begin()[2] == GGML_OP_SET_ROWS) {
+        const enum ggml_op rsr_ops[] = { GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS };
+        const int          rsr_out[] = { node_idx + 2 };
+        if (!ggml_can_fuse_subgraph(cgraph, node_idx, 3, rsr_ops, rsr_out, 1)) {
+            return false;
+        }
+        return ggml_opencl_should_fuse_rope_set_rows(
+            cgraph->nodes[node_idx], cgraph->nodes[node_idx + 1], cgraph->nodes[node_idx + 2]);
+    }
+
     if (!ggml_can_fuse(cgraph, node_idx, ops)) {
         return false;
     }
@@ -5140,6 +5193,123 @@ static void ggml_opencl_op_rms_norm_fused(ggml_backend_t backend, ggml_tensor * 
 static void ggml_opencl_op_norm_fused(ggml_backend_t backend, ggml_tensor * norm_tensor, ggml_tensor * mul_tensor, ggml_tensor * add_tensor);
 static void ggml_opencl_op_group_norm_fused(ggml_backend_t backend, ggml_tensor * gn_tensor, ggml_tensor * mul_tensor, ggml_tensor * add_tensor);
 
+static void ggml_cl_rope_set_rows(ggml_backend_t backend,
+                                  ggml_tensor * rope_tensor,
+                                  ggml_tensor * /*view_tensor*/,
+                                  ggml_tensor * set_rows_tensor) {
+    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *) backend->context;
+
+    const ggml_tensor * src0 = rope_tensor->src[0];
+    const ggml_tensor * src1 = rope_tensor->src[1];
+    const ggml_tensor * src2 = rope_tensor->src[2];
+    const ggml_tensor * row_indices_tensor = set_rows_tensor->src[1];
+
+    GGML_ASSERT(src0 && src0->extra);
+    GGML_ASSERT(src1 && src1->extra);
+    GGML_ASSERT(set_rows_tensor && set_rows_tensor->extra);
+    GGML_ASSERT(row_indices_tensor && row_indices_tensor->extra);
+
+    ggml_tensor_extra_cl * extra0      = (ggml_tensor_extra_cl *) src0->extra;
+    ggml_tensor_extra_cl * extra1      = (ggml_tensor_extra_cl *) src1->extra;
+    ggml_tensor_extra_cl * extra2      = src2 ? (ggml_tensor_extra_cl *) src2->extra : nullptr;
+    ggml_tensor_extra_cl * extra_dst   = (ggml_tensor_extra_cl *) set_rows_tensor->extra;
+    ggml_tensor_extra_cl * extra_idx   = (ggml_tensor_extra_cl *) row_indices_tensor->extra;
+
+    cl_ulong offset0 = extra0->offset + src0->view_offs;
+    cl_ulong offset1 = extra1->offset + src1->view_offs;
+    cl_ulong offset2 = extra2 ? extra2->offset + src2->view_offs : offset0;
+    cl_ulong offsetd = extra_dst->offset + set_rows_tensor->view_offs;
+    cl_ulong offset_row_indices = extra_idx->offset + row_indices_tensor->view_offs;
+
+    const int ne00 = src0->ne[0];
+    const int ne01 = src0->ne[1];
+    const int ne02 = src0->ne[2];
+    const int ne03 = src0->ne[3];
+
+    const cl_ulong nb00 = src0->nb[0];
+    const cl_ulong nb01 = src0->nb[1];
+    const cl_ulong nb02 = src0->nb[2];
+    const cl_ulong nb03 = src0->nb[3];
+
+    const int ne0 = rope_tensor->ne[0];
+    const int ne1 = rope_tensor->ne[1];
+    const int ne2 = rope_tensor->ne[2];
+    const int ne3 = rope_tensor->ne[3];
+    const cl_ulong nb0 = rope_tensor->nb[0];
+    const cl_ulong nb1 = rope_tensor->nb[1];
+    const cl_ulong nb2 = rope_tensor->nb[2];
+    const cl_ulong nb3 = rope_tensor->nb[3];
+
+    const int n_past     = ((int32_t *) rope_tensor->op_params)[0];
+    const int n_dims     = ((int32_t *) rope_tensor->op_params)[1];
+    const int n_ctx_orig = ((int32_t *) rope_tensor->op_params)[4];
+
+    float freq_base;
+    float freq_scale;
+    float ext_factor;
+    float attn_factor;
+    float beta_fast;
+    float beta_slow;
+    memcpy(&freq_base,   (int32_t *) rope_tensor->op_params +  5, sizeof(float));
+    memcpy(&freq_scale,  (int32_t *) rope_tensor->op_params +  6, sizeof(float));
+    memcpy(&ext_factor,  (int32_t *) rope_tensor->op_params +  7, sizeof(float));
+    memcpy(&attn_factor, (int32_t *) rope_tensor->op_params +  8, sizeof(float));
+    memcpy(&beta_fast,   (int32_t *) rope_tensor->op_params +  9, sizeof(float));
+    memcpy(&beta_slow,   (int32_t *) rope_tensor->op_params + 10, sizeof(float));
+
+    const int set_rows_stride = (int) (set_rows_tensor->nb[1] / ggml_type_size(set_rows_tensor->type));
+
+    const int mode = ((const int32_t *) rope_tensor->op_params)[2];
+    cl_kernel kernel = (mode == GGML_ROPE_TYPE_NEOX)
+        ? backend_ctx->kernel_rope_neox_f32_set_rows_f16
+        : backend_ctx->kernel_rope_norm_f32_set_rows_f16;
+
+    int nth = MIN(64, ne00);
+
+    int arg = 0;
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_mem),   &extra0->data_device));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &offset0));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_mem),   &extra1->data_device));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &offset1));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_mem),   extra2 ? &extra2->data_device : &extra0->data_device));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &offset2));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_mem),   &extra_dst->data_device));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &offsetd));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_mem),   &extra_idx->data_device));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &offset_row_indices));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(int),      &set_rows_stride));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(int),      &ne00));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(int),      &ne01));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(int),      &ne02));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(int),      &ne03));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &nb00));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &nb01));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &nb02));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &nb03));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(int),      &ne0));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(int),      &ne1));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(int),      &ne2));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(int),      &ne3));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &nb0));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &nb1));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &nb2));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &nb3));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(int),      &n_past));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(int),      &n_dims));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(int),      &n_ctx_orig));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(float),    &freq_base));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(float),    &freq_scale));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(float),    &ext_factor));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(float),    &attn_factor));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(float),    &beta_fast));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(float),    &beta_slow));
+
+    size_t global_work_size[] = { (size_t) ne01 * nth, (size_t) ne02, (size_t) ne03 };
+    size_t local_work_size[]  = { (size_t) nth, 1, 1 };
+
+    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, set_rows_tensor);
+}
+
 static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
 
@@ -5156,6 +5326,15 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
         }
 
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
+
+        // Fuse rope + view + set_rows — fold the K-cache row scatter into the
+        // ROPE kernel (the VIEW is a no-op). Default on, opt-out GGML_OPENCL_FUSE_ROPE_SET_ROWS=0.
+        if (!backend_ctx->disable_fusion && backend_ctx->fuse_rope_set_rows &&
+            ggml_opencl_can_fuse(cgraph, i, { GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS })) {
+            ggml_cl_rope_set_rows(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
+            i += 2;
             continue;
         }
 
