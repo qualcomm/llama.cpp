@@ -4220,6 +4220,13 @@ static std::string ggml_opencl_fa_compile_opts(ggml_backend_opencl_context * bac
         " -D BLOCK_M=" + std::to_string(cfg->bm) +
         " -D BLOCK_N=" + std::to_string(cfg->bn);
 
+    // q1-family kernels stripe the dot/o_acc over an FA_SG-wide subgroup and
+    // reduce across it; the width must match the hardware subgroup. Adreno uses
+    // the .cl default (64); Intel's subgroup is 32, so override + pin it there.
+    if (backend_ctx->gpu_family == INTEL) {
+        opts += " -D FA_SG=32";
+    }
+
     const bool is_split = variant == FA_VARIANT_F32_F16_SPLIT ||
                           variant == FA_VARIANT_Q8_0_SPLIT    ||
                           variant == FA_VARIANT_Q4_0_SPLIT;
@@ -6703,6 +6710,11 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                 // every other KV combo (f32, f16-q, quant) would need a full
                 // program that OOMs, so decline up front — no probe compile —
                 // and let the graph run it on CPU. q->ne[1] is n_q.
+                // Intel's OpenCL compiler crashes building the DK=512 kernels, so
+                // decline on Intel up front and run these layers on the CPU backend.
+                if (backend_ctx->gpu_family == INTEL) {
+                    return false;
+                }
                 if (!is_f32_f16) {
                     return false;
                 }
@@ -13589,13 +13601,17 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         ? backend_ctx->fa.f32_f16_bn.at(dk_dv)
         : backend_ctx->fa.bn.at(dk_dv);
     // Pick split variant only when n_kv crosses the per-(dk,dv) threshold.
+    // The N_SPLIT>1 prefill tile reduces DK partials via subgroup shuffle (64-wide
+    // on Adreno); on Intel use the non-split BM tile, which is per-query-row and
+    // subgroup-width-agnostic.
     const bool use_split_kernel = (n_q > 1 && is_mixed &&
+        backend_ctx->gpu_family != INTEL &&
         backend_ctx->fa.f32_f16_split.count(dk_dv) > 0 &&
         n_kv >= backend_ctx->fa.f32_f16_split_nkv_threshold.at(dk_dv));
-    const bool use_split_q8_0 = (use_native_q8_0 &&
+    const bool use_split_q8_0 = (use_native_q8_0 && backend_ctx->gpu_family != INTEL &&
         backend_ctx->fa.f32_q8_0_split.count(dk_dv) > 0 &&
         n_kv >= backend_ctx->fa.f32_q8_0_split_nkv_threshold.at(dk_dv));
-    const bool use_split_q4_0 = (use_native_q4_0 &&
+    const bool use_split_q4_0 = (use_native_q4_0 && backend_ctx->gpu_family != INTEL &&
         backend_ctx->fa.f32_q4_0_split.count(dk_dv) > 0 &&
         n_kv >= backend_ctx->fa.f32_q4_0_split_nkv_threshold.at(dk_dv));
     const int wg_size_fa = (n_q > 1 && is_mixed)
@@ -13771,6 +13787,20 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
             kernel = backend_ctx->fa.f32.at(dk_dv);
         }
     }
+
+    // Intel reference path: the vec/MQ/local-tile decode variants are tuned for
+    // a 64-wide Adreno subgroup and miscompute on Intel's narrower (32) subgroup.
+    // Route decode to the basic q1 kernel, which is parameterized on FA_SG and
+    // pins the subgroup width via REQD_FA_SG. The MQ FD-split path is disabled on
+    // Intel below; prefill uses the non-split BM tile (per-lane, sg-agnostic).
+    if (backend_ctx->gpu_family == INTEL && n_q == 1) {
+        use_q1_vec = use_q1_vec_mq = use_local_tile = false;
+        if (is_mixed && backend_ctx->fa.f32_f16_q1.count(dk_dv))      { kernel = backend_ctx->fa.f32_f16_q1.at(dk_dv); }
+        else if (is_f16 && backend_ctx->fa.f16_q1.count(dk_dv))       { kernel = backend_ctx->fa.f16_q1.at(dk_dv); }
+        else if (is_q8_0 && backend_ctx->fa.f32_q8_0_q1.count(dk_dv)) { kernel = backend_ctx->fa.f32_q8_0_q1.at(dk_dv); }
+        else if (is_q4_0 && backend_ctx->fa.f32_q4_0_q1.count(dk_dv)) { kernel = backend_ctx->fa.f32_q4_0_q1.at(dk_dv); }
+        else if (backend_ctx->fa.f32_q1.count(dk_dv))                 { kernel = backend_ctx->fa.f32_q1.at(dk_dv); }
+    }
     GGML_ASSERT(kernel != NULL);
 
     ggml_cl_flash_attn_temp_buffer temp_k;
@@ -13875,6 +13905,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         // q8_0, q4_0, local_*) still require n_q == 1.
         const bool nq1_only        = (n_q == 1);
         if (mq_enabled && mq_kv_ok && nq_in_vec_range && !is_causal &&
+            backend_ctx->gpu_family != INTEL &&  // MQ FD-split is 64-wide-subgroup tuned; Intel uses basic q1
             !use_local_tile &&  // local-tile dispatches its own grid, skip MQ FD-split
             n_kv >= FD_MIN_N_KV &&
             backend_ctx->fa.f32_merge.count(dk_dv) > 0) {
@@ -14345,7 +14376,10 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
             // q1_vec is compiled with VEC_NSG=4 → WG = 4 * 64 = 256.
             // q1_vec_mq folds MQ_GQA Q-heads into each WG so the head dim of
             // the grid collapses to n_head_kv (one WG per (kv_head, batch)).
-            const size_t wg_size = use_q1_vec ? 256 : 64;
+            // Basic q1 launches one subgroup-wide WG; the width must match FA_SG
+            // (and REQD_FA_SG) the kernel reduces over -- 64 on Adreno, 32 on Intel.
+            const size_t q1_wg = backend_ctx->gpu_family == INTEL ? 32 : 64;
+            const size_t wg_size = use_q1_vec ? 256 : q1_wg;
             const size_t head_dim_global = use_q1_vec_mq
                 ? (size_t)(n_head_kv * n_batch)
                 : (size_t)(n_head     * n_batch);
