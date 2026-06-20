@@ -15594,11 +15594,15 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
         // dp4a (int8) dense prefill GEMM. Quantizes the original [N,K] activations
         // to q8_1 and runs the int8 dp4a GEMM instead of the f16 half-dot kernel
         // (the transpose output is unused here). Large-batch (prefill) only; ne1<=8
-        // keeps the cok/f16 small-batch path. DEFAULT ON; opt out with
-        // GGML_OPENCL_Q4K_DENSE_DP4A=0. Greedy byte-identical across Qwen3-30B/3.5-
-        // 35B/3.6-35B-A3B, Granite-a800m, Qwen3-8B; +0.5..15% prefill, no regressions.
+        // keeps the cok/f16 small-batch path. DEFAULT ON, except disabled on Adreno
+        // X1 (X1-85: dp4a ~2x slower than the f16 half-dot, occupancy/mem-wall bound).
+        // Opt out / in with GGML_OPENCL_Q4K_DENSE_DP4A=0 / 1. Greedy byte-identical
+        // across Qwen3-30B/3.5-35B/3.6-35B-A3B, Granite-a800m, Qwen3-8B; +0.5..15%
+        // prefill on X2, no regressions.
         static const char * q4k_dense_dp4a_env = getenv("GGML_OPENCL_Q4K_DENSE_DP4A");
-        static const bool   q4k_dense_dp4a_on  = (q4k_dense_dp4a_env == nullptr) || (atoi(q4k_dense_dp4a_env) != 0);
+        static const bool   q4k_dense_dp4a_on  = (q4k_dense_dp4a_env != nullptr)
+                                                   ? (atoi(q4k_dense_dp4a_env) != 0)
+                                                   : (backend_ctx->adreno_gen != ADRENO_GPU_GEN::X1E);
         if (q4k_dense_dp4a_on && N > 8 && (K % 32 == 0) && (M % 64 == 0)) {
             const size_t n_blocks = (size_t)N * (K / 32);
             backend_ctx->prealloc_moe_qa.allocate(context, (size_t)N * K * sizeof(cl_char));
@@ -15786,10 +15790,13 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
         // [N,K] activations to q8_1 and runs the int8 dp4a GEMM instead of the
         // f16 half-dot kernel — no activation transpose needed. Large-batch
         // (prefill, ne1>8) only; the output/lm_head weight stays on the f16 path
-        // for logit stability (matches the q6_K cok exclusion). DEFAULT ON; opt
-        // out with GGML_OPENCL_Q6K_DENSE_DP4A=0.
+        // for logit stability (matches the q6_K cok exclusion). DEFAULT ON, except
+        // disabled on Adreno X1 (dp4a ~2x slower than f16 there). Opt out / in with
+        // GGML_OPENCL_Q6K_DENSE_DP4A=0 / 1.
         static const char * q6k_dense_dp4a_env = getenv("GGML_OPENCL_Q6K_DENSE_DP4A");
-        static const bool   q6k_dense_dp4a_on  = (q6k_dense_dp4a_env == nullptr) || (atoi(q6k_dense_dp4a_env) != 0);
+        static const bool   q6k_dense_dp4a_on  = (q6k_dense_dp4a_env != nullptr)
+                                                   ? (atoi(q6k_dense_dp4a_env) != 0)
+                                                   : (backend_ctx->adreno_gen != ADRENO_GPU_GEN::X1E);
         const bool is_output_w_dp4a = strncmp(src0->name, "output", 6) == 0 ||
                                       strncmp(src0->name, "token_embd", 10) == 0;
         if (q6k_dense_dp4a_on && !is_output_w_dp4a && ne1 > 8 && (ne00 % 32 == 0) && (ne01 % 64 == 0)) {
@@ -19162,11 +19169,14 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
 
                     // dp4a (int8) prefill GEMM variant: fused reorder+q8_1 quant of
                     // activations, then the int8 dp4a inner-loop GEMM, in place of the
-                    // f32 reorder + half-dot kernel. DEFAULT ON; opt out with
-                    // GGML_OPENCL_Q4K_MOE_DP4A=0. Validated PPL-neutral + 18-31% prefill
-                    // on Qwen3-30B / 3.5-35B / 3.6-35B-A3B and Granite-3.0-3b-a800m.
+                    // f32 reorder + half-dot kernel. DEFAULT ON, except disabled on
+                    // Adreno X1 (dp4a ~2x slower than f16 there). Opt out / in with
+                    // GGML_OPENCL_Q4K_MOE_DP4A=0 / 1. Validated PPL-neutral + 18-31%
+                    // prefill on Qwen3-30B / 3.5-35B / 3.6-35B-A3B and Granite-3.0-3b-a800m.
                     static const char * q4k_moe_dp4a_env = getenv("GGML_OPENCL_Q4K_MOE_DP4A");
-                    static const bool   use_moe_dp4a = (q4k_moe_dp4a_env == nullptr) || (atoi(q4k_moe_dp4a_env) != 0);
+                    static const bool   use_moe_dp4a = (q4k_moe_dp4a_env != nullptr)
+                                                         ? (atoi(q4k_moe_dp4a_env) != 0)
+                                                         : (backend_ctx->adreno_gen != ADRENO_GPU_GEN::X1E);
 
                     cl_buffer_region region;
                     region.origin = 0;
@@ -19584,11 +19594,14 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
 
                     // dp4a (int8) q6_K MoE prefill GEMM variant: fused reorder+q8_1
                     // quant + the int8 dp4a GEMM, in place of the f32 reorder +
-                    // half-dot kernel. DEFAULT ON; opt out with GGML_OPENCL_Q6K_MOE
-                    // _DP4A=0. Greedy byte-identical across the q4_K-MoE model sweep
+                    // half-dot kernel. DEFAULT ON, except disabled on Adreno X1 (dp4a
+                    // ~2x slower than f16 there). Opt out / in with GGML_OPENCL_Q6K_MOE
+                    // _DP4A=0 / 1. Greedy byte-identical across the q4_K-MoE model sweep
                     // (Qwen3-30B/3.5-35B/3.6-35B-A3B, Granite-a800m); +6.6% Qwen3-30B.
                     static const char * q6k_moe_dp4a_env = getenv("GGML_OPENCL_Q6K_MOE_DP4A");
-                    static const bool   use_q6k_dp4a = (q6k_moe_dp4a_env == nullptr) || (atoi(q6k_moe_dp4a_env) != 0);
+                    static const bool   use_q6k_dp4a = (q6k_moe_dp4a_env != nullptr)
+                                                         ? (atoi(q6k_moe_dp4a_env) != 0)
+                                                         : (backend_ctx->adreno_gen != ADRENO_GPU_GEN::X1E);
 
                     cl_buffer_region region;
                     region.origin = 0;
