@@ -24818,10 +24818,17 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     // on Qwen3-30B / 3.5-35B / 3.6-35B-A3B and Granite-3.0-3b-a800m.
                     // DEFAULT ON only on Adreno X2 (X1 dp4a MoE prefill regresses -14%);
                     // gated to X2E, env override forces either way.
+                    // EXCEPTION: when the q4_k MoE bin (ILA) kernel is loaded
+                    // (GGML_OPENCL_USE_ADRENO_BIN_KERNELS build + kernel lib present),
+                    // it beats the dp4a GEMM on X2E (+13-19% prefill on Qwen3-30B-A3B,
+                    // byte-identical greedy), so default dp4a off to let the bin kernel
+                    // (dispatched in the !use_moe_dp4a path below) win. The explicit env
+                    // GGML_OPENCL_Q4K_MOE_DP4A=1 still forces dp4a for A/B / fallback.
                     static const char * q4k_moe_dp4a_env = getenv("GGML_OPENCL_Q4K_MOE_DP4A");
                     const bool          use_moe_dp4a = q4k_moe_dp4a_env
                         ? (atoi(q4k_moe_dp4a_env) != 0)
-                        : (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E);
+                        : (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E
+                           && backend_ctx->kernel_gemm_moe_q4_k_f32_ns_bin == nullptr);
 
                     cl_buffer_region region;
                     region.origin = 0;
