@@ -8174,7 +8174,19 @@ inline bool enable_adreno_trans_weight(const ggml_backend_opencl_context *backen
 
     size_t elem_num = tensor->ne[0] * tensor->ne[1] * tensor->ne[2] * tensor->ne[3];
 
-    return ((elem_num < 128 * 1024 * 1024) && adreno_kernel);  // max element num: 2**27
+    // The 2D weight transpose (transpose_2d_as_*) tiles rows by 4 over a 2D matrix,
+    // so it requires K(ne0)%32==0, M(ne1)%4==0 and ne2==ne3==1. Every real
+    // transformer weight (hidden/FFN/vocab dims, 2D) already satisfies this, so this
+    // is a no-op for conforming weights — it only guards the rare non-conforming
+    // shape (e.g. a full-Q8_0 model with a 2D weight whose ne1%4!=0) so it falls back
+    // to the flat (un-transposed) path instead of hitting the set_tensor asserts. This
+    // predicate is the single source of truth (set_tensor transpose, get_tensor /
+    // restore_block_q8_0_trans, and the ggml_cl_mul_mat_q8_0_f32_adreno dispatch all
+    // read it), so flat storage and flat dispatch stay in sync — no layout mismatch.
+    const bool shape_ok = (tensor->ne[0] % 32 == 0) && (tensor->ne[1] % 4 == 0) &&
+                          (tensor->ne[2] == 1) && (tensor->ne[3] == 1);
+
+    return ((elem_num < 128 * 1024 * 1024) && adreno_kernel && shape_ok);  // max element num: 2**27
 }
 
 static inline bool use_flat_gemv_for_large_m_q4_K(const ggml_tensor *tensor) {
@@ -24555,14 +24567,27 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
         }
         case GGML_TYPE_Q8_0: {
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
-            // Prototype: batched MoE GEMM for q8_0 at prefill (ne12>1). q8_0 is the
-            // only quant without a gemm_moe path, so prefill MoE falls to per-token
-            // GEMV (re-streams each expert weight per token, ~32x over-fetch). This
-            // groups tokens by expert (shared reorder pipeline) and reuses each
-            // expert weight across its tile of 32 tokens. Reads the EXISTING flat
-            // q8_0 weights (no transposed image / decode-path change). Opt-in.
+            // Batched MoE GEMM for q8_0 at prefill (ne12>1). q8_0 is the only quant
+            // without a gemm_moe path, so prefill MoE otherwise falls to the per-token
+            // GEMV (mul_mv_id_q8_0_f32_flat: re-streams each expert weight per token,
+            // ~32x over-fetch). This groups tokens by expert (shared reorder pipeline)
+            // and reuses each expert weight across its tile of 32 tokens. Reads the
+            // EXISTING flat q8_0 weights (no transposed image / decode-path change).
+            // HUGE prefill win: Gemma-4-26B-A4B Q4_K_M pp512 201->348 (+73%),
+            // pp4096 181->286 (+59%); decode (ne12==1) unaffected.
+            // DEFAULT ON for X2E. Correctness verified via test-backend-ops MUL_MAT_ID
+            // q8_0: all 75 cases pass NMSE-vs-CPU (5e-4) with the batched kernel routed
+            // (trace-confirmed firing on ne12={4,5,16,17,32,129}, ne01={64,512}); the
+            // flat path passes the same bar. A reordered-reduction GEMM is NOT bit-id
+            // to the flat GEMV (both within 5e-4 of CPU, ~1e-3 of each other), so greedy
+            // generation diverges late but stays coherent — that is benign fp-reorder
+            // cascade, not a kernel bug; wikitext PPL on the (reasoning-model) 26B was
+            // the wrong yardstick. Held X1 off — like the dp4a prefill GEMMs, X1 keeps
+            // the flat path until measured. Opt in/out anywhere with the env override.
             static const char * moe_gemm_q8_env = getenv("GGML_OPENCL_MOE_GEMM_Q8");
-            static const bool   moe_gemm_q8     = moe_gemm_q8_env != nullptr && atoi(moe_gemm_q8_env) != 0;
+            const bool          moe_gemm_q8     = moe_gemm_q8_env
+                ? (atoi(moe_gemm_q8_env) != 0)
+                : (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E);
             if (moe_gemm_q8 && use_adreno_moe_kernels(backend_ctx, src0) && ne12 > 1) {
                 cl_int status;
 
