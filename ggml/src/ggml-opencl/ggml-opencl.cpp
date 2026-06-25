@@ -741,6 +741,7 @@ struct ggml_backend_opencl_context {
 
     cl_kernel kernel_timestep_embedding;
     cl_kernel kernel_gemv_moe_q4_0_f32_ns, kernel_gemm_moe_q4_0_f32_ns, kernel_gemm_moe_q4_0_f32_ns_bin;
+    cl_kernel kernel_gemm_moe_q8_0_f32_ns;
     cl_kernel kernel_gemv_moe_q4_1_f32_ns, kernel_gemm_moe_q4_1_f32_ns, kernel_gemm_moe_q4_1_f32_ns_bin;
     cl_kernel kernel_gemv_moe_q5_0_f32_ns, kernel_gemm_moe_q5_0_f32_ns;
     cl_kernel kernel_gemv_moe_q5_1_f32_ns, kernel_gemm_moe_q5_1_f32_ns;
@@ -3668,6 +3669,23 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         }
     }
 
+    // gemm_moe_q8_0_f32_ns
+    {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src {
+            #include "gemm_moe_q8_0_f32_ns.cl.h"
+        };
+#else
+        const std::string kernel_src = read_file("gemm_moe_q8_0_f32_ns.cl");
+#endif
+        cl_program prog =
+            build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), CL_moe_compile_opts);
+
+        CL_CHECK((backend_ctx->kernel_gemm_moe_q8_0_f32_ns = clCreateKernel(prog, "kernel_gemm_moe_q8_0_f32_ns", &err), err));
+        CL_CHECK(clReleaseProgram(prog));
+        GGML_LOG_CONT(".");
+    }
+
     // gemv_moe_q5_0_f32_ns
     {
 #ifdef GGML_OPENCL_EMBED_KERNELS
@@ -5938,7 +5956,19 @@ inline bool enable_adreno_trans_weight(const ggml_backend_opencl_context *backen
 
     size_t elem_num = tensor->ne[0] * tensor->ne[1] * tensor->ne[2] * tensor->ne[3];
 
-    return ((elem_num < 128 * 1024 * 1024) && adreno_kernel);  // max element num: 2**27
+    // The 2D weight transpose (transpose_2d_as_*) tiles rows by 4 over a 2D matrix,
+    // so it requires K(ne0)%32==0, M(ne1)%4==0 and ne2==ne3==1. Every real
+    // transformer weight (hidden/FFN/vocab dims, 2D) already satisfies this, so this
+    // is a no-op for conforming weights — it only guards the rare non-conforming
+    // shape (e.g. a full-Q8_0 model with a 2D weight whose ne1%4!=0) so it falls back
+    // to the flat (un-transposed) path instead of hitting the set_tensor asserts. This
+    // predicate is the single source of truth (set_tensor transpose, get_tensor /
+    // restore_block_q8_0_trans, and the ggml_cl_mul_mat_q8_0_f32_adreno dispatch all
+    // read it), so flat storage and flat dispatch stay in sync — no layout mismatch.
+    const bool shape_ok = (tensor->ne[0] % 32 == 0) && (tensor->ne[1] % 4 == 0) &&
+                          (tensor->ne[2] == 1) && (tensor->ne[3] == 1);
+
+    return ((elem_num < 128 * 1024 * 1024) && adreno_kernel && shape_ok);  // max element num: 2**27
 }
 
 static inline bool use_flat_gemv_for_large_m_q4_K(const ggml_tensor *tensor) {
@@ -19015,6 +19045,124 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
 #endif //GGML_OPENCL_USE_ADRENO_KERNELS
         }
         case GGML_TYPE_Q8_0: {
+#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+            // Batched MoE GEMM for q8_0 at prefill (ne12>1). q8_0 is the only quant
+            // without a gemm_moe path, so prefill MoE otherwise falls to the per-token
+            // GEMV (mul_mv_id_q8_0_f32_flat: re-streams each expert weight per token,
+            // ~32x over-fetch). This groups tokens by expert (shared reorder pipeline)
+            // and reuses each expert weight across its tile of 32 tokens. Reads the
+            // EXISTING flat q8_0 weights (no transposed image / decode-path change).
+            // HUGE prefill win: Gemma-4-26B-A4B Q4_K_M pp512 201->348 (+73%),
+            // pp4096 181->286 (+59%); decode (ne12==1) unaffected.
+            // DEFAULT ON for X2E. Correctness verified via test-backend-ops MUL_MAT_ID
+            // q8_0: all 75 cases pass NMSE-vs-CPU (5e-4) with the batched kernel routed
+            // (trace-confirmed firing on ne12={4,5,16,17,32,129}, ne01={64,512}); the
+            // flat path passes the same bar. A reordered-reduction GEMM is NOT bit-id
+            // to the flat GEMV (both within 5e-4 of CPU, ~1e-3 of each other), so greedy
+            // generation diverges late but stays coherent — that is benign fp-reorder
+            // cascade, not a kernel bug; wikitext PPL on the (reasoning-model) 26B was
+            // the wrong yardstick. Held X1 off — like the dp4a prefill GEMMs, X1 keeps
+            // the flat path until measured. Opt in/out anywhere with the env override.
+            static const char * moe_gemm_q8_env = getenv("GGML_OPENCL_MOE_GEMM_Q8");
+            const bool          moe_gemm_q8     = moe_gemm_q8_env
+                ? (atoi(moe_gemm_q8_env) != 0)
+                : (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E);
+            if (moe_gemm_q8 && use_adreno_moe_kernels(backend_ctx, src0) && ne12 > 1) {
+                cl_int status;
+
+                size_t local_size[3]  = {64, 2, 1};
+                size_t global_size[3] = {64, 2, 1};
+
+                kernel = backend_ctx->kernel_gemm_moe_q8_0_f32_ns;
+
+                if ((strstr(src0->name, "as") != NULL) || backend_ctx->toggle_reorder) {
+                    moe_router_reoerder(backend, src2, ne20);
+                    backend_ctx->toggle_reorder = false;
+                }
+
+                cl_mem sub_buf_src1_pre, buf_src1_reordered, image_src1_reordered, sub_buf_dst, buf_dst_image;
+                cl_mem buf_src2, buf_src2_emap;
+
+                cl_buffer_region region;
+                region.origin = 0;
+                region.size = sizeof(int) * max_post_router_tile * n_tile_size;
+                buf_src2 = clCreateSubBuffer(backend_ctx->prealloc_post_router.buffer, 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &status);
+                CL_CHECK(status);
+
+                region.origin = 0;
+                region.size = sizeof(short) * max_post_router_tile;
+                buf_src2_emap = clCreateSubBuffer(backend_ctx->prealloc_emap.buffer, 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &status);
+                CL_CHECK(status);
+
+                // Reorder activations (group tokens by expert into tiles of 32)
+                region.origin = offset1;
+                region.size = ne10 * ne11 * ne12 * sizeof(float);
+                sub_buf_src1_pre = clCreateSubBuffer(extra1->data_device, 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &status);
+                CL_CHECK(status);
+
+                region.origin = 0;
+                region.size = ne00 * max_post_router_tile * n_tile_size * sizeof(float);
+                backend_ctx->prealloc_act_trans.allocate(backend_ctx->context, region.size);
+                buf_src1_reordered = clCreateSubBuffer(
+                    backend_ctx->prealloc_act_trans.buffer, 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &status);
+                CL_CHECK(status);
+                cl_image_format image_format_buf_src1 = {CL_RGBA, CL_FLOAT};
+                cl_image_desc image_desc_buf_src1 = {CL_MEM_OBJECT_IMAGE1D_BUFFER, static_cast<size_t>(ne00 * max_post_router_tile * n_tile_size / 4), 0,0,0,0,0,0,0, {buf_src1_reordered}};
+                image_src1_reordered = clCreateImage(backend_ctx->context, CL_MEM_READ_ONLY, &image_format_buf_src1, &image_desc_buf_src1, NULL, &status);
+                CL_CHECK(status);
+
+                unsigned short map_ratio = ne20 / ne11;
+                GGML_ASSERT(((map_ratio == 1) || (map_ratio == ne20)) && "Map ratio not supported\n");
+                CL_CHECK(clSetKernelArg(backend_ctx->kernel_moe_reorder_b, 0, sizeof(cl_mem),         &sub_buf_src1_pre));
+                CL_CHECK(clSetKernelArg(backend_ctx->kernel_moe_reorder_b, 1, sizeof(cl_mem),         &buf_src2));
+                CL_CHECK(clSetKernelArg(backend_ctx->kernel_moe_reorder_b, 2, sizeof(cl_mem),         &buf_src1_reordered));
+                CL_CHECK(clSetKernelArg(backend_ctx->kernel_moe_reorder_b, 3, sizeof(cl_mem),         &(backend_ctx->prealloc_total_tiles.buffer)));
+                CL_CHECK(clSetKernelArg(backend_ctx->kernel_moe_reorder_b, 4, sizeof(unsigned int),   &ne00));
+                CL_CHECK(clSetKernelArg(backend_ctx->kernel_moe_reorder_b, 5, sizeof(unsigned short), &map_ratio));
+                CL_CHECK(clSetKernelArg(backend_ctx->kernel_moe_reorder_b, 6, sizeof(unsigned int),   &n_tile_size));
+
+                size_t reorder_b_local_size[3]  = {256, 1, 1};
+                size_t reorder_b_global_size[3] = {static_cast<size_t>(((ne00 / 4) + 255) / 256 * 256), static_cast<size_t>(max_post_router_tile * n_tile_size), 1};
+                backend_ctx->enqueue_ndrange_kernel(backend_ctx->kernel_moe_reorder_b, 3, reorder_b_global_size, reorder_b_local_size, dst);
+
+                // dst image
+                region.origin = offsetd;
+                region.size = ne0 * ne1 * ne2 * sizeof(float);
+                sub_buf_dst = clCreateSubBuffer(extrad->data_device, 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &status);
+                CL_CHECK(status);
+                cl_image_format image_format_buf_dst = {CL_R, CL_FLOAT};
+                cl_image_desc image_desc_buf_dst = {CL_MEM_OBJECT_IMAGE1D_BUFFER, static_cast<size_t>(ne0 * ne1 * ne2), 0,0,0,0,0,0,0, {sub_buf_dst}};
+                buf_dst_image = clCreateImage(backend_ctx->context, CL_MEM_WRITE_ONLY, &image_format_buf_dst, &image_desc_buf_dst, NULL, &status);
+                CL_CHECK(status);
+
+                int arg_idx = 0;
+                CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem), &extra0_q8_0->q));   // flat q8_0 quants
+                CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem), &extra0_q8_0->d));   // flat q8_0 scales
+                CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem), &image_src1_reordered));
+                CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem), &buf_src2));
+                CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem), &buf_src2_emap));
+                CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem), &buf_dst_image));
+                CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem), &(backend_ctx->prealloc_total_tiles.buffer)));
+                CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),    &ne00));
+                CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),    &ne01));
+
+                global_size[1] = static_cast<size_t>((ne01 + 63) / 64);
+                global_size[2] = static_cast<size_t>(max_post_router_tile);
+                local_size[1]  = 1;
+                local_size[2]  = 1;
+
+                backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_size, local_size, dst);
+
+                clReleaseMemObject(sub_buf_src1_pre);
+                clReleaseMemObject(buf_src1_reordered);
+                clReleaseMemObject(image_src1_reordered);
+                clReleaseMemObject(buf_src2);
+                clReleaseMemObject(buf_src2_emap);
+                clReleaseMemObject(sub_buf_dst);
+                clReleaseMemObject(buf_dst_image);
+                return;
+            }
+#endif // GGML_OPENCL_USE_ADRENO_KERNELS
 #ifdef GGML_OPENCL_SOA_Q
             kernel = backend_ctx->kernel_mul_mv_id_q8_0_f32_flat;
 
