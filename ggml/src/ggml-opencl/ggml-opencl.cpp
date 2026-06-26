@@ -597,6 +597,7 @@ struct ggml_backend_opencl_context {
     int  f16_mrow_rpt = 1;           // GGML_OPENCL_F16_MROW_RPT={1,2,4} rows-per-subgroup register blocking for the mrow GEMV
     bool fuse_moe_glu = true;        // opt-out GGML_OPENCL_FUSE_MOE_GLU=0 (byte-identical combined gate_up MoE GEMV + GLU, q4_K)
     bool fuse_moe_glu_mxfp4 = true;  // opt-out GGML_OPENCL_FUSE_MOE_GLU_MXFP4=0 (byte-identical separate gate/up + bias + swiglu_oai MoE GEMV, gpt-oss mxfp4)
+    bool moe_gemm_ragged = true;     // opt-out GGML_OPENCL_MOE_RAGGED=0 (skip the ~50% per-expert padded tokens in the q4_K/q6_K MoE prefill GEMM tiles; byte-identical, +8-16% pp)
 
     // ragged moe, use int to directly pass to kernel
     cl_uint  adreno_use_moe_ragged;
@@ -6184,6 +6185,9 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
     }
     if (const char * env = getenv("GGML_OPENCL_FUSE_MOE_GLU_MXFP4")) {
         backend_ctx->fuse_moe_glu_mxfp4 = atoi(env) != 0;
+    }
+    if (const char * env = getenv("GGML_OPENCL_MOE_RAGGED")) {
+        backend_ctx->moe_gemm_ragged = atoi(env) != 0;
     }
 
     backend_ctx->rec_supported = strstr(ext_buffer, "cl_qcom_recordable_queues") != NULL;
@@ -23685,6 +23689,23 @@ static void moe_router_reoerder(ggml_backend_t backend, const ggml_tensor * src,
 
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, histogram_global_size, histogram_local_size, src);
 
+    // [MOE_TILES] env-gated padding probe: read back total_tiles (= Sum_e
+    // ceil(k_e/n_tile_size)) and compare to the ideal tile count for the real
+    // routing count. Quantifies the per-expert tile-padding waste. Blocking
+    // readback perturbs timing -> diagnostic only.
+    if (getenv("GGML_OPENCL_MOE_TILES_DEBUG")) {
+        int h_total = 0;
+        clFinish(backend_ctx->queue);
+        CL_CHECK(clEnqueueReadBuffer(backend_ctx->queue, total_tiles_buf, CL_TRUE, 0, sizeof(int), &h_total, 0, NULL, NULL));
+        const int routings = ne20 * ne21;
+        const int ideal    = (routings + n_tile_size - 1) / n_tile_size;
+        const int slots     = h_total * n_tile_size;
+        fprintf(stderr, "[MOE_TILES] routings=%d (ne20=%d ne21=%d nexp=%d) total_tiles=%d ideal=%d slots=%d pad=%.1f%%\n",
+                routings, ne20, ne21, ne02, h_total, ideal, slots,
+                routings > 0 ? 100.0 * (slots - routings) / routings : 0.0);
+        fflush(stderr);
+    }
+
     CL_CHECK(clReleaseMemObject(original_router_buf));
     CL_CHECK(clReleaseMemObject(hist_buf));
     CL_CHECK(clReleaseMemObject(tile_offset_buf));
@@ -24969,6 +24990,11 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                         CL_CHECK(clSetKernelArg(dk, aidx++, sizeof(cl_mem), &(backend_ctx->prealloc_total_tiles.buffer)));
                         CL_CHECK(clSetKernelArg(dk, aidx++, sizeof(int),    &ne00));
                         CL_CHECK(clSetKernelArg(dk, aidx++, sizeof(int),    &ne01));
+                        // ragged tiles: compute only real tokens per tile (skip the
+                        // ~50% per-expert padding at the ub=512 prefill floor).
+                        // Byte-identical; default on, opt-out GGML_OPENCL_MOE_RAGGED=0.
+                        const int moe_ragged = backend_ctx->moe_gemm_ragged ? 1 : 0;
+                        CL_CHECK(clSetKernelArg(dk, aidx++, sizeof(int),    &moe_ragged));
 
                         size_t dp_global[3] = { 64, (size_t)((ne01 + 63) / 64), (size_t)max_post_router_tile };
                         size_t dp_local[3]  = { 64, 1, 1 };
@@ -25393,6 +25419,9 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                         CL_CHECK(clSetKernelArg(dk, qi++, sizeof(cl_mem), &(backend_ctx->prealloc_total_tiles.buffer)));
                         CL_CHECK(clSetKernelArg(dk, qi++, sizeof(int),    &ne00));
                         CL_CHECK(clSetKernelArg(dk, qi++, sizeof(int),    &ne01));
+                        // ragged tiles (skip padded tokens); byte-identical, default on.
+                        const int moe_ragged_q6 = backend_ctx->moe_gemm_ragged ? 1 : 0;
+                        CL_CHECK(clSetKernelArg(dk, qi++, sizeof(int),    &moe_ragged_q6));
 
                         size_t dp_global[3] = { 64, (size_t)((ne01 + 63) / 64), (size_t)max_post_router_tile };
                         size_t dp_local[3]  = { 64, 1, 1 };
