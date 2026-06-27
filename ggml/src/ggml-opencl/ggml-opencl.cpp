@@ -8144,9 +8144,19 @@ inline bool use_adreno_moe_kernels(const ggml_backend_opencl_context *backend_ct
 // Both the convert (set_tensor) and the GEMV dispatch must agree on this so the
 // buffer layout matches the kernel.
 inline bool q6k_gemv_tiled_enabled() {
+    // DEFAULT OFF: the tiled q6_K lm_head/embed GEMV miscomputes multi-superblock
+    // (K>256) inputs — test-backend-ops MUL_MAT q6_K m>=32768,k=2048 gives NMSE ~2
+    // vs CPU, while single-superblock (k=256) is correct and the non-tiled GEMV
+    // passes. The kernel logic is byte-exact vs the ggml reference, so the cause is
+    // an Adreno miscompile of the unrolled multi-superblock loop. It went unnoticed
+    // because op-tests never covered the >=32768 (lm_head) shape and greedy decode
+    // is argmax-robust. Until that's fixed, route the large-vocab lm_head/embed to
+    // the correct non-tiled GEMV. Zero-cost: these weights are CPU-pinned by
+    // default, so the tiled path is dormant. Opt back in with
+    // GGML_OPENCL_Q6K_GEMV_TILED=1.
     static const bool en = []{
         const char * e = std::getenv("GGML_OPENCL_Q6K_GEMV_TILED");
-        return !e || e[0] == '\0' || e[0] != '0';
+        return e && atoi(e) != 0;
     }();
     return en;
 }
@@ -8158,12 +8168,15 @@ inline bool use_q6k_tiled(const ggml_tensor *tensor) {
            tensor->ne[1] >= 32768 && tensor->ne[1] % 64 == 0;
 }
 
-// q4_K analog of the tiled-wide lm_head/embed GEMV (default ON; opt out via
-// GGML_OPENCL_Q4K_GEMV_TILED=0). Same gate.
+// q4_K analog of the tiled-wide lm_head/embed GEMV. DEFAULT OFF: same
+// multi-superblock miscompile as the q6_K tiled GEMV (its line-for-line twin) —
+// test-backend-ops MUL_MAT q4_K m=151936,k=2048 -> NMSE ~2 vs CPU; non-tiled
+// passes. Route the lm_head/embed to the non-tiled GEMV. Zero-cost (tiled is only
+// used for CPU-pinned lm_head/embed). Opt in with GGML_OPENCL_Q4K_GEMV_TILED=1.
 inline bool q4k_gemv_tiled_enabled() {
     static const bool en = []{
         const char * e = std::getenv("GGML_OPENCL_Q4K_GEMV_TILED");
-        return !e || e[0] == '\0' || e[0] != '0';
+        return e && atoi(e) != 0;
     }();
     return en;
 }
