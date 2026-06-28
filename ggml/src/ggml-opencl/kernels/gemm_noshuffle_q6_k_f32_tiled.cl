@@ -24,6 +24,9 @@
 // Adreno texture cache.
 
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
+#ifdef cl_khr_integer_dot_product
+#pragma OPENCL EXTENSION cl_khr_integer_dot_product : enable
+#endif
 
 #ifdef cl_qcom_reqd_sub_group_size
 #pragma OPENCL EXTENSION cl_qcom_reqd_sub_group_size : enable
@@ -35,6 +38,7 @@
 #define TILE_ROWS  64
 #define BN         16       // output columns handled per work-group (global z step)
 #define WG_THREADS (NTILES * TILE_ROWS)
+#define BN_DP      8        // dp4a variant: fewer cols/WG to fit register budget
 
 #if defined(ADRENO_GPU)
 REQD_SUBGROUP_SIZE_64
@@ -131,6 +135,115 @@ kernel void kernel_gemm_noshuffle_q6_K_f32_tiled(
             if (c < ne11) {
                 dst[(ulong)c * ne01 + row] = acc[j];
             }
+        }
+    }
+}
+
+// dp4a batched GEMM for the tiled q6_K lm_head/embed (ne1>1). Same layout as the
+// float kernel above, but the q8_1-quantized activation (kernel_quant_a_q8_1) is
+// staged to LDS and int8-dotted: the q6_K weight unpack + code-pack is done ONCE
+// per superblock and reused across BN_DP columns, so the pack amortizes and the
+// dp4a int-dot dominates -> ~3.4x the f32 GEMM (measured X2-90). BN_DP=8 keeps the
+// register budget so the {64x4} work-group is legal (BN=16 overflows -> CL_-54).
+#if defined(ADRENO_GPU)
+REQD_SUBGROUP_SIZE_64
+#endif
+kernel void kernel_gemm_noshuffle_q6_K_f32_tiled_dp4a(
+    __global uint4 * src0_ql,
+    __global uint4 * src0_qh,
+    __global char  * src0_s,
+    __global half  * src0_d,
+    __global uint  * qa,        // q8_1 int8 activation, 4/uint  [ne11][ne00/4]
+    __global half  * qad,       // q8_1 per-32-block scale       [ne11][ne00/32]
+    global float * dst,
+    ulong offsetd,
+    int ne00,
+    int ne01,
+    int ne11
+) {
+    int rit = get_local_id(0);
+    int sg  = get_local_id(1);
+    int lid = sg * TILE_ROWS + rit;
+    int row = get_group_id(0) * WG_THREADS + lid;
+    int rt  = row / TILE_ROWS;
+    int col0 = get_global_id(2) * BN_DP;
+    int nb  = ne00 / 256;
+    int qcs = ne00 / 4;
+    int dcs = ne00 / 32;
+
+    const bool row_ok = row < ne01;
+    __local uint sh_qa[BN_DP * 64];
+    __local half sh_qad[BN_DP * 8];
+
+    float acc[BN_DP];
+    #pragma unroll
+    for (int j = 0; j < BN_DP; ++j) acc[j] = 0.0f;
+
+    for (int sb = 0; sb < nb; ++sb) {
+        for (int p = lid; p < BN_DP * 64; p += WG_THREADS) {
+            int j = p >> 6, u = p & 63, c = col0 + j;
+            sh_qa[p] = (c < ne11) ? qa[c * qcs + sb * 64 + u] : 0u;
+        }
+        for (int p = lid; p < BN_DP * 8; p += WG_THREADS) {
+            int j = p >> 3, b = p & 7, c = col0 + j;
+            sh_qad[p] = (c < ne11) ? qad[c * dcs + sb * 8 + b] : (half)0;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        if (row_ok) {
+            int tile_blk = rt * nb + sb;
+            float dval = (float)src0_d[tile_blk * TILE_ROWS + rit];
+            __global char * sc = src0_s + (tile_blk * TILE_ROWS + rit) * 16;
+
+            uint ql[32];
+            uint qh[16];
+            #pragma unroll
+            for (int g = 0; g < 8; ++g) {
+                uint4 v = src0_ql[(tile_blk * 8 + g) * TILE_ROWS + rit];
+                ql[g*4+0] = v.x; ql[g*4+1] = v.y; ql[g*4+2] = v.z; ql[g*4+3] = v.w;
+            }
+            #pragma unroll
+            for (int g = 0; g < 4; ++g) {
+                uint4 v = src0_qh[(tile_blk * 4 + g) * TILE_ROWS + rit];
+                qh[g*4+0] = v.x; qh[g*4+1] = v.y; qh[g*4+2] = v.z; qh[g*4+3] = v.w;
+            }
+
+            for (int seg = 0; seg < 16; ++seg) {
+                uint cw[4];
+                #pragma unroll
+                for (int t = 0; t < 4; ++t) {
+                    uint pk = 0;
+                    #pragma unroll
+                    for (int u = 0; u < 4; ++u) {
+                        int e = seg * 16 + t * 4 + u;
+                        uint lo = (ql[e >> 3] >> ((e & 7) * 4)) & 0xF;
+                        uint hi = (qh[e >> 4] >> ((e & 15) * 2)) & 0x3;
+                        int code = (int)(lo | (hi << 4)) - 32;
+                        pk |= ((uint)(code & 0xFF)) << (u * 8);
+                    }
+                    cw[t] = pk;
+                }
+                float segsc = (float)sc[seg] * dval;
+                #pragma unroll
+                for (int j = 0; j < BN_DP; ++j) {
+                    __local uint * a = sh_qa + j * 64 + seg * 4;
+                    int raw = dot_acc_sat_4x8packed_ss_int(cw[0], a[0], 0);
+                    raw = dot_acc_sat_4x8packed_ss_int(cw[1], a[1], raw);
+                    raw = dot_acc_sat_4x8packed_ss_int(cw[2], a[2], raw);
+                    raw = dot_acc_sat_4x8packed_ss_int(cw[3], a[3], raw);
+                    acc[j] += (float)raw * segsc * (float)sh_qad[j * 8 + (seg >> 1)];
+                }
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    if (row_ok) {
+        dst = (global float*)((global char*)dst + offsetd);
+        #pragma unroll
+        for (int j = 0; j < BN_DP; ++j) {
+            int c = col0 + j;
+            if (c < ne11) dst[(ulong)c * ne01 + row] = acc[j];
         }
     }
 }
