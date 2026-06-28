@@ -1166,6 +1166,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemv_noshuffle_q4_k_f32_glu;     // fused gate+up GEMV + GLU (FFN)
     cl_kernel kernel_gemv_noshuffle_q4_k_f32_o4;  // 4-output-per-WI, long-vocab lm_head
     cl_kernel kernel_gemv_noshuffle_q4_k_f32_tiled;  // tiled-wide layout (opt-in)
+    cl_kernel kernel_gemm_noshuffle_q4_K_f32_tiled_dp4a; // dp4a (q8_1 int8) batched lm_head GEMM
     cl_kernel kernel_convert_block_q4_k_tiled_ns;    // tiled-wide convert (opt-in)
     cl_kernel kernel_gemv_noshuffle_q4_k_f32_mc3;  // multi-column (N=3) verify GEMV
     cl_kernel kernel_gemma4_perlayer_block;        // per-layer-block megakernel (grid barrier), q4_K weights
@@ -1183,6 +1184,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemv_noshuffle_q6_K_f32_tiled;      // tiled-wide layout (opt-in)
     cl_kernel kernel_gemv_noshuffle_q6_K_f32_tiled_mc3;  // tiled multi-column (N=3) verify lm_head
     cl_kernel kernel_gemm_noshuffle_q6_K_f32_tiled;      // batched (N>1) over the tiled layout
+    cl_kernel kernel_gemm_noshuffle_q6_K_f32_tiled_dp4a; // dp4a (q8_1 int8) batched lm_head GEMM
     cl_kernel kernel_convert_block_q6_k_tiled_ns;        // tiled-wide convert (opt-in)
     cl_kernel kernel_gemv_noshuffle_q6_K_f32_mc3;        // multi-column (N=3) verify GEMV
     cl_kernel kernel_gemm_noshuffle_q6_K_f32;
@@ -4097,6 +4099,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
         CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q4_k_f32_tiled =
             clCreateKernel(prog, "kernel_gemv_noshuffle_q4_k_f32_tiled", &err), err));
+        CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_K_f32_tiled_dp4a =
+            clCreateKernel(prog, "kernel_gemm_noshuffle_q4_K_f32_tiled_dp4a", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
@@ -4709,6 +4713,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q6_K_f32_tiled =
             clCreateKernel(prog, "kernel_gemm_noshuffle_q6_K_f32_tiled", &err), err));
+        CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q6_K_f32_tiled_dp4a =
+            clCreateKernel(prog, "kernel_gemm_noshuffle_q6_K_f32_tiled_dp4a", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
@@ -8518,8 +8524,22 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                     // is wrong, and only for certain activation distributions (so random
                     // op-tests pass). Route batched large-vocab quant lm_head/embed to CPU;
                     // single-token decode (ne1==1, GEMV) is correct and stays on GPU.
+                    // Large-vocab quant lm_head/embed at ne1>1: DEFAULT to CPU.
+                    // Perf: GPU lm_head decode is a wash on X2 (GPU BW ~= CPU LPDDR,
+                    // CPU runs it off the decode critical path), and the GPU batched
+                    // win (dp4a tiled GEMM, ~3.4-4x) only matters for PPL/MTP, not
+                    // single-stream generation. Opt into GPU lm_head with
+                    // GGML_OPENCL_Q6K_LMHEAD_GPU=1 (also needs the tiled convert,
+                    // GGML_OPENCL_Q6K/Q4K_GEMV_TILED=1): that routes ne1>1 to the
+                    // correct dp4a tiled GEMM (the trans-weight GEMM still corrupts,
+                    // so only the tiled path is exempted from the CPU pin).
+                    static const bool lmhead_gpu = std::getenv("GGML_OPENCL_Q6K_LMHEAD_GPU") != nullptr;
                     if (op->ne[0] >= 32768 && op->src[1]->ne[1] > 1) {
-                        return false;
+                        const bool tiled_gpu_ok = lmhead_gpu &&
+                            (use_q6k_tiled(op->src[0]) || use_q4k_tiled(op->src[0]));
+                        if (!tiled_gpu_ok) {
+                            return false;
+                        }
                     }
                 }
                 return op->src[1]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]);
@@ -19714,6 +19734,51 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
         region.size = K * N * sizeof(float);
         CL_CHECK((b_sub_buf = clCreateSubBuffer(extra1->data_device, 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &err), err));
 
+        // Tiled q4_K lm_head/embed (use_q4k_tiled): weight is in the 64-row tiled
+        // layout, which the non-tiled GEMMs below misread -> garbage. Quantize the
+        // activation to q8_1 and run the dp4a tiled GEMM (the only correct GPU path
+        // for this layout; ~3.9x the f32 path, min term via the q8_1 sum).
+        if (use_q4k_tiled(src0)) {
+            const size_t n_blocks = (size_t)N * (K / 32);
+            backend_ctx->prealloc_moe_qa.allocate(context, (size_t)N * K * sizeof(cl_char));
+            backend_ctx->prealloc_moe_da.allocate(context, n_blocks * sizeof(cl_half));
+            backend_ctx->prealloc_moe_sa.allocate(context, n_blocks * sizeof(cl_half));
+
+            cl_int tbq = (cl_int)n_blocks;
+            cl_kernel qk = backend_ctx->kernel_quant_a_q8_1;
+            CL_CHECK(clSetKernelArg(qk, 0, sizeof(cl_mem), &b_sub_buf));
+            CL_CHECK(clSetKernelArg(qk, 1, sizeof(cl_mem), &backend_ctx->prealloc_moe_qa.buffer));
+            CL_CHECK(clSetKernelArg(qk, 2, sizeof(cl_mem), &backend_ctx->prealloc_moe_da.buffer));
+            CL_CHECK(clSetKernelArg(qk, 3, sizeof(cl_mem), &backend_ctx->prealloc_moe_sa.buffer));
+            CL_CHECK(clSetKernelArg(qk, 4, sizeof(cl_int), &tbq));
+            size_t q_local[1]  = { 64 };
+            size_t q_global[1] = { (size_t)(((n_blocks + 63) / 64) * 64) };
+            backend_ctx->enqueue_ndrange_kernel(qk, 1, q_global, q_local, dst);
+
+            cl_kernel dk = backend_ctx->kernel_gemm_noshuffle_q4_K_f32_tiled_dp4a;
+            CL_CHECK(clSetKernelArg(dk, 0, sizeof(cl_mem),   &extra0_q4_k->q));
+            CL_CHECK(clSetKernelArg(dk, 1, sizeof(cl_mem),   &extra0_q4_k->d));
+            CL_CHECK(clSetKernelArg(dk, 2, sizeof(cl_mem),   &extra0_q4_k->dm));
+            CL_CHECK(clSetKernelArg(dk, 3, sizeof(cl_mem),   &extra0_q4_k->s));
+            CL_CHECK(clSetKernelArg(dk, 4, sizeof(cl_mem),   &backend_ctx->prealloc_moe_qa.buffer));
+            CL_CHECK(clSetKernelArg(dk, 5, sizeof(cl_mem),   &backend_ctx->prealloc_moe_da.buffer));
+            CL_CHECK(clSetKernelArg(dk, 6, sizeof(cl_mem),   &backend_ctx->prealloc_moe_sa.buffer));
+            CL_CHECK(clSetKernelArg(dk, 7, sizeof(cl_mem),   &extrad->data_device));
+            CL_CHECK(clSetKernelArg(dk, 8, sizeof(cl_ulong), &offsetd));
+            CL_CHECK(clSetKernelArg(dk, 9, sizeof(cl_int),   &ne00));
+            CL_CHECK(clSetKernelArg(dk, 10, sizeof(cl_int),  &ne01));
+            CL_CHECK(clSetKernelArg(dk, 11, sizeof(cl_int),  &ne1));
+
+            const int WROWS_D = 4 * 64;
+            const int BN_DP   = 8;
+            size_t dlocal[3]  = {64, 4, 1};
+            size_t dglobal[3] = {(size_t)CEIL_DIV(ne01, WROWS_D) * 64, 4, (size_t)CEIL_DIV(ne1, BN_DP)};
+            backend_ctx->enqueue_ndrange_kernel(dk, 3, dglobal, dlocal, dst);
+
+            CL_CHECK(clReleaseMemObject(b_sub_buf));
+            return;
+        }
+
         // image for activations
         img_fmt = {CL_RGBA, CL_FLOAT};
         memset(&img_desc, 0, sizeof(img_desc));
@@ -19971,12 +20036,16 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
     // existing path (x2-unified routes batched Q6_K lm_head to CPU; the Adreno
     // GEMV corrupts it). Per-layer mc3 is byte-identical.
     const bool use_q6k_mc3 = q6k_mc3 && (ne1 >= 2 && ne1 <= 4) && (ne01 < 32768);
-    // Batched verify lm_head/embed (ne1 in [2..4], tiled layout): multi-column
-    // tiled GEMV — streams the large lm_head weight once across the verify columns
-    // (the #1 MTP bottleneck; mc3 above can't, it reads the noshuffle layout).
-    // ne1==4 is the common case (n_max=3 drafts + 1 bonus); the prior ne1==3 gate
-    // never fired in practice so the lm_head fell to the dead-zone tiled GEMM.
-    const bool use_q6k_tiled_mc = q6k_mc3 && (ne1 >= 2 && ne1 <= 4) && (ne01 >= 32768) && use_q6k_tiled(src0);
+    // Batched verify lm_head/embed (ne1 in [2..4], tiled layout). DEFAULT now
+    // routes to the dp4a tiled GEMM (the else branch below): ~4x the float
+    // multi-column tiled GEMV at ne1=2..4 (X2-90), q8_1-approx (NMSE ~1e-5, like
+    // the shipped MoE q8_1 dp4a). Opt back to the byte-identical float mc3 GEMV
+    // with GGML_OPENCL_Q6K_LMHEAD_MTP_DP4A=0 (e.g. for strict spec-decode parity).
+    static const bool q6k_mtp_dp4a = []{
+        const char * e = std::getenv("GGML_OPENCL_Q6K_LMHEAD_MTP_DP4A");
+        return !e || e[0] == '\0' || e[0] != '0';
+    }();
+    const bool use_q6k_tiled_mc = q6k_mc3 && (ne1 >= 2 && ne1 <= 4) && (ne01 >= 32768) && use_q6k_tiled(src0) && !q6k_mtp_dp4a;
 
     if (ne1 == 1 || use_q6k_mc3 || use_q6k_tiled_mc) {
         cl_mem ql_img = nullptr;
@@ -20116,6 +20185,54 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
             region.origin = offset1;
             region.size = ne00 * ne1 * sizeof(float);
             CL_CHECK((b_sub_buf_t = clCreateSubBuffer(extra1->data_device, 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &err), err));
+
+            // dp4a batched lm_head GEMM: quantize the [ne1,ne00] activations to q8_1
+            // and int8-dot the tiled q6_K weight. The unpack+pack amortizes across
+            // BN_DP columns -> ~3.4x the f32 tiled GEMM (PPL / MTP-verify / batched).
+            // Opt out: GGML_OPENCL_Q6K_LMHEAD_GEMM_DP4A=0.
+            static const bool lmhead_gemm_dp4a = []{
+                const char * e = std::getenv("GGML_OPENCL_Q6K_LMHEAD_GEMM_DP4A");
+                return !e || e[0] == '\0' || e[0] != '0';
+            }();
+            if (lmhead_gemm_dp4a && (ne00 % 32 == 0)) {
+                const size_t n_blocks = (size_t)ne1 * (ne00 / 32);
+                backend_ctx->prealloc_moe_qa.allocate(context, (size_t)ne1 * ne00 * sizeof(cl_char));
+                backend_ctx->prealloc_moe_da.allocate(context, n_blocks * sizeof(cl_half));
+                backend_ctx->prealloc_moe_sa.allocate(context, n_blocks * sizeof(cl_half));
+
+                cl_int tbq = (cl_int)n_blocks;
+                cl_kernel qk = backend_ctx->kernel_quant_a_q8_1;
+                CL_CHECK(clSetKernelArg(qk, 0, sizeof(cl_mem), &b_sub_buf_t));
+                CL_CHECK(clSetKernelArg(qk, 1, sizeof(cl_mem), &backend_ctx->prealloc_moe_qa.buffer));
+                CL_CHECK(clSetKernelArg(qk, 2, sizeof(cl_mem), &backend_ctx->prealloc_moe_da.buffer));
+                CL_CHECK(clSetKernelArg(qk, 3, sizeof(cl_mem), &backend_ctx->prealloc_moe_sa.buffer));
+                CL_CHECK(clSetKernelArg(qk, 4, sizeof(cl_int), &tbq));
+                size_t q_local[1]  = { 64 };
+                size_t q_global[1] = { (size_t)(((n_blocks + 63) / 64) * 64) };
+                backend_ctx->enqueue_ndrange_kernel(qk, 1, q_global, q_local, dst);
+
+                cl_kernel dk = backend_ctx->kernel_gemm_noshuffle_q6_K_f32_tiled_dp4a;
+                CL_CHECK(clSetKernelArg(dk, 0, sizeof(cl_mem),   &extra0_q6_K->ql));
+                CL_CHECK(clSetKernelArg(dk, 1, sizeof(cl_mem),   &extra0_q6_K->qh));
+                CL_CHECK(clSetKernelArg(dk, 2, sizeof(cl_mem),   &extra0_q6_K->s));
+                CL_CHECK(clSetKernelArg(dk, 3, sizeof(cl_mem),   &extra0_q6_K->d));
+                CL_CHECK(clSetKernelArg(dk, 4, sizeof(cl_mem),   &backend_ctx->prealloc_moe_qa.buffer));
+                CL_CHECK(clSetKernelArg(dk, 5, sizeof(cl_mem),   &backend_ctx->prealloc_moe_da.buffer));
+                CL_CHECK(clSetKernelArg(dk, 6, sizeof(cl_mem),   &extrad->data_device));
+                CL_CHECK(clSetKernelArg(dk, 7, sizeof(cl_ulong), &offsetd));
+                CL_CHECK(clSetKernelArg(dk, 8, sizeof(cl_int),   &ne00));
+                CL_CHECK(clSetKernelArg(dk, 9, sizeof(cl_int),   &ne01));
+                CL_CHECK(clSetKernelArg(dk, 10, sizeof(cl_int),  &ne1));
+
+                const int WROWS_D = 4 * 64;   // NTILES * TILE_ROWS
+                const int BN_DP   = 8;        // matches the kernel
+                size_t dlocal[3]  = {64, 4, 1};
+                size_t dglobal[3] = {(size_t)CEIL_DIV(ne01, WROWS_D) * 64, 4, (size_t)CEIL_DIV(ne1, BN_DP)};
+                backend_ctx->enqueue_ndrange_kernel(dk, 3, dglobal, dlocal, dst);
+
+                CL_CHECK(clReleaseMemObject(b_sub_buf_t));
+                return;
+            }
 
             img_fmt.image_channel_order = CL_RGBA;
             img_fmt.image_channel_data_type = CL_FLOAT;
