@@ -2603,3 +2603,67 @@ __kernel void kernel_moe_expand_scale_q5_0(
     dst_scale[sb + 1] = d;
     dst_min[mb] = (half)((float)d * 16.0f);
 }
+
+// ---------------------------------------------------------------------------
+// kernel_moe_expand_scale_q5_K
+//
+// q5_K value = d*sv*code + (-dm*mn), with the 6-bit packed per-sub-block scale sv
+// and min mn (8 sub-blocks of 32 per 256-superblock, decoded by get_scale_min_k4
+// from the 12-byte s[]). The generic dp4a MoE GEMM (kernel_gemm_moe_q8_1_dp4a,
+// MOE_QT=5) keeps the unsigned 5-bit code and applies scale/min via the uniform
+// per-32-block buffers:
+//   acc += sc0*a_d*raw1 + sc1*a_d*raw2 - mn_u*a_s,
+//   sc0 = sc1 = d*sv (both per-16 segments of a 32-block share the sub-block scale),
+//   mn_u = dm*mn (positive; the GEMM subtracts it -> the -dm*mn min term).
+// q5_K's q_img (low nibbles) + qh (hi-bit plane) are already in the layout the GEMM
+// reads (same trans4_ns convert that feeds gemm_moe_q5_k_f32_ns), so only the scale
+// is rebuilt here.
+//
+// Inputs are the trans4_ns convert outputs:
+//   src_s  : uchar [expert][row][superblock][12]   (6-bit packed scales/mins)
+//   src_d  : half  [expert][superblock][row]        (superblock scale d)
+//   src_dm : half  [expert][superblock][row]        (superblock min dm)
+// Outputs (FLAT per-32-block, [expert][row][32block]):
+//   dst_scale : half 2/32-block      dst_min : half 1/32-block
+// One work-item per (row, superblock, expert); each emits 8 sub-blocks.
+// ---------------------------------------------------------------------------
+__kernel void kernel_moe_expand_scale_q5_K(
+    __global const uchar * src_s,     // [expert][row][superblock][12]
+    __global const half  * src_d,     // [expert][superblock][row]
+    __global const half  * src_dm,    // [expert][superblock][row]
+    __global       half  * dst_scale, // [expert][row][32block][2]
+    __global       half  * dst_min,   // [expert][row][32block]
+    int ne00,
+    int ne01
+) {
+    int row = get_global_id(0);
+    int sb  = get_global_id(1);   // superblock index along K
+    int e   = get_global_id(2);
+    if (row >= ne01) return;
+
+    long nsb    = ne00 / 256;     // superblocks per row
+    long nblk32 = ne00 / 32;      // 32-blocks per row
+
+    float d  = (float)src_d [((long)e*nsb + sb)*ne01 + row];
+    float dm = (float)src_dm[((long)e*nsb + sb)*ne01 + row];
+
+    __global const uchar * sc = src_s + ((long)e*ne01 + row)*nsb*12 + (long)sb*12;
+
+    for (int j = 0; j < 8; ++j) {
+        uchar sv, mn;
+        // get_scale_min_k4 (6-bit packed scale/min for sub-block j of 8)
+        if (j < 4) {
+            sv = sc[j]   & 63;
+            mn = sc[j+4] & 63;
+        } else {
+            sv = (sc[j+4] & 0x0F) | ((sc[j-4] & 0xC0) >> 2);
+            mn = ((sc[j+4] >> 4) & 0x0F) | ((sc[j]   & 0xC0) >> 2);
+        }
+        long sub   = (long)sb*8 + j;
+        long sbase = (((long)e*ne01 + row)*nblk32 + sub) * 2;
+        half s_val = (half)(d  * (float)sv);
+        dst_scale[sbase + 0] = s_val;
+        dst_scale[sbase + 1] = s_val;
+        dst_min[((long)e*ne01 + row)*nblk32 + sub] = (half)(dm * (float)mn);
+    }
+}
