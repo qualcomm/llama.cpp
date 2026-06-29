@@ -9553,7 +9553,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // q6_K long-vocab lm_head GEMV (decode, dot-bound): m=vocab, n=1, k=hidden.
     // Exercises the tiled q6_K dp4a decode path (use_q6k_tiled; image-qa candidate).
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 151936, 1, 2560, {1, 1}, {1, 1}));
-    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 151936, 2, 2560, {1, 1}, {1, 1}));
 
     // FWHT tests
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 128, 1, 128));
