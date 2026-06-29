@@ -1238,6 +1238,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemv_noshuffle_q6_K_f32_tiled_mc3;  // tiled multi-column (N=3) verify lm_head
     cl_kernel kernel_gemm_noshuffle_q6_K_f32_tiled;      // batched (N>1) over the tiled layout
     cl_kernel kernel_gemm_noshuffle_q6_K_f32_tiled_dp4a; // dp4a (q8_1 int8) batched lm_head GEMM
+    cl_kernel kernel_gemm_noshuffle_q6_K_f32_tiled_dp4a_imga = nullptr; // dp4a lm_head GEMM, qa from image (decode/dot-bound), opt-in
     cl_kernel kernel_convert_block_q6_k_tiled_ns;        // tiled-wide convert (opt-in)
     cl_kernel kernel_gemv_noshuffle_q6_K_f32_mc3;        // multi-column (N=3) verify GEMV
     cl_kernel kernel_gemm_noshuffle_q6_K_f32;
@@ -4966,6 +4967,14 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q6_K_f32_tiled_dp4a =
             clCreateKernel(prog, "kernel_gemm_noshuffle_q6_K_f32_tiled_dp4a", &err), err));
         CL_CHECK(clReleaseProgram(prog));
+
+        // image-qa variant (qa read from an image1d_buffer; decode/dot-bound experiment)
+        const std::string compile_opts_imga = compile_opts + " -DQA_IMAGE";
+        cl_program prog_imga =
+            build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts_imga);
+        CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q6_K_f32_tiled_dp4a_imga =
+            clCreateKernel(prog_imga, "kernel_gemm_noshuffle_q6_K_f32_tiled_dp4a", &err), err));
+        CL_CHECK(clReleaseProgram(prog_imga));
         GGML_LOG_CONT(".");
     }
 
@@ -21165,12 +21174,38 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
                 size_t q_global[1] = { (size_t)(((n_blocks + 63) / 64) * 64) };
                 backend_ctx->enqueue_ndrange_kernel(qk, 1, q_global, q_local, dst);
 
-                cl_kernel dk = backend_ctx->kernel_gemm_noshuffle_q6_K_f32_tiled_dp4a;
+                // image-qa experiment (opt-in GGML_OPENCL_Q6K_LMHEAD_IMGA): read the
+                // q8_1 activation from an image1d_buffer (texture cache) instead of the
+                // global qa buffer. Pays off in the dot-bound decode regime where the
+                // single token's qa is re-read by every output-row work-group.
+                static const bool lmhead_imga = []{
+                    const char * e = std::getenv("GGML_OPENCL_Q6K_LMHEAD_IMGA");
+                    return e && e[0] != '\0' && e[0] != '0';
+                }();
+                cl_mem qa_img = nullptr;
+                const bool use_imga = lmhead_imga
+                    && backend_ctx->kernel_gemm_noshuffle_q6_K_f32_tiled_dp4a_imga != nullptr;
+                if (use_imga) {
+                    cl_image_format qa_fmt = {CL_R, CL_UNSIGNED_INT32};
+                    cl_image_desc qa_desc;
+                    memset(&qa_desc, 0, sizeof(qa_desc));
+                    qa_desc.image_type  = CL_MEM_OBJECT_IMAGE1D_BUFFER;
+                    qa_desc.image_width = (size_t)ne1 * ne00 / 4;   // uints (4 int8 / uint)
+                    qa_desc.buffer      = backend_ctx->prealloc_moe_qa.buffer;
+                    CL_CHECK((qa_img = clCreateImage(context, CL_MEM_READ_ONLY, &qa_fmt, &qa_desc, NULL, &err), err));
+                }
+
+                cl_kernel dk = use_imga ? backend_ctx->kernel_gemm_noshuffle_q6_K_f32_tiled_dp4a_imga
+                                        : backend_ctx->kernel_gemm_noshuffle_q6_K_f32_tiled_dp4a;
                 CL_CHECK(clSetKernelArg(dk, 0, sizeof(cl_mem),   &extra0_q6_K->ql));
                 CL_CHECK(clSetKernelArg(dk, 1, sizeof(cl_mem),   &extra0_q6_K->qh));
                 CL_CHECK(clSetKernelArg(dk, 2, sizeof(cl_mem),   &extra0_q6_K->s));
                 CL_CHECK(clSetKernelArg(dk, 3, sizeof(cl_mem),   &extra0_q6_K->d));
-                CL_CHECK(clSetKernelArg(dk, 4, sizeof(cl_mem),   &backend_ctx->prealloc_moe_qa.buffer));
+                if (use_imga) {
+                    CL_CHECK(clSetKernelArg(dk, 4, sizeof(cl_mem), &qa_img));
+                } else {
+                    CL_CHECK(clSetKernelArg(dk, 4, sizeof(cl_mem), &backend_ctx->prealloc_moe_qa.buffer));
+                }
                 CL_CHECK(clSetKernelArg(dk, 5, sizeof(cl_mem),   &backend_ctx->prealloc_moe_da.buffer));
                 CL_CHECK(clSetKernelArg(dk, 6, sizeof(cl_mem),   &extrad->data_device));
                 CL_CHECK(clSetKernelArg(dk, 7, sizeof(cl_ulong), &offsetd));
@@ -21184,6 +21219,7 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
                 size_t dglobal[3] = {(size_t)CEIL_DIV(ne01, WROWS_D) * 64, 4, (size_t)CEIL_DIV(ne1, BN_DP)};
                 backend_ctx->enqueue_ndrange_kernel(dk, 3, dglobal, dlocal, dst);
 
+                if (qa_img) CL_CHECK(clReleaseMemObject(qa_img));
                 CL_CHECK(clReleaseMemObject(b_sub_buf_t));
                 return;
             }
