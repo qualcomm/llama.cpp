@@ -148,12 +148,26 @@ kernel void kernel_gemm_noshuffle_q6_K_f32_tiled(
 #if defined(ADRENO_GPU)
 REQD_SUBGROUP_SIZE_64
 #endif
+// image-qa variant (compiled with -DQA_IMAGE): the q8_1 activation `qa` is read
+// from an image1d_buffer (CL_R/UI32) instead of a global buffer. In the decode /
+// dot-bound regime (ne11 small, ne01=vocab) the single token's qa is re-read by
+// every output-row work-group (~ne01/256 of them), so routing it through the
+// texture cache can beat the coalesced-global staging. The weights stay __global
+// (streamed once per token -> texture cache would cap them below the global rate).
+#ifdef QA_IMAGE
+  #define QA_PARAM   read_only image1d_buffer_t qa,
+  #define QA_LOAD(i) (read_imageui(qa, (i)).x)
+#else
+  #define QA_PARAM   __global uint * qa,
+  #define QA_LOAD(i) (qa[(i)])
+#endif
+
 kernel void kernel_gemm_noshuffle_q6_K_f32_tiled_dp4a(
     __global uint4 * src0_ql,
     __global uint4 * src0_qh,
     __global char  * src0_s,
     __global half  * src0_d,
-    __global uint  * qa,        // q8_1 int8 activation, 4/uint  [ne11][ne00/4]
+    QA_PARAM                    // q8_1 int8 activation, 4/uint  [ne11][ne00/4]
     __global half  * qad,       // q8_1 per-32-block scale       [ne11][ne00/32]
     global float * dst,
     ulong offsetd,
@@ -182,7 +196,7 @@ kernel void kernel_gemm_noshuffle_q6_K_f32_tiled_dp4a(
     for (int sb = 0; sb < nb; ++sb) {
         for (int p = lid; p < BN_DP * 64; p += WG_THREADS) {
             int j = p >> 6, u = p & 63, c = col0 + j;
-            sh_qa[p] = (c < ne11) ? qa[c * qcs + sb * 64 + u] : 0u;
+            sh_qa[p] = (c < ne11) ? QA_LOAD(c * qcs + sb * 64 + u) : 0u;
         }
         for (int p = lid; p < BN_DP * 8; p += WG_THREADS) {
             int j = p >> 3, b = p & 7, c = col0 + j;
