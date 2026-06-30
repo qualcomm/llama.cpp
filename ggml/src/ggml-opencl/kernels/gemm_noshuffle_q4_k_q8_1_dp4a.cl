@@ -182,3 +182,137 @@ kernel void kernel_gemm_noshuffle_q4_k_q8_1_dp4a(
     }
 #undef NGROUPS
 }
+
+// Weight-as-texture variant of kernel_gemm_noshuffle_q4_k_q8_1_dp4a.
+//
+// Byte-identical math; the ONLY change is that the q4_K weight plane is read
+// through an image1d_buffer (read_imageui -> texture/L1 cache) instead of a
+// plain __global buffer. Motivation (Adreno X1): the f16 half-dot GEMM beats
+// the dp4a buffer GEMM on X1 not because the int8 dot is slow (it is ~2x the
+// f16-mad rate) but because the f16 path streams weights through the texture
+// cache and is near-BW-optimal, while the dp4a buffer path gives that up. The
+// cross-N-tile weight reuse (same weight texels re-read for every 32-token
+// tile) is exactly what the texture cache captures. This variant keeps the
+// int8 ALU win AND the texture path; gated to X1, opt-in via
+// GGML_OPENCL_Q4K_DENSE_DP4A_WIMG.
+//
+// The weight buffer is bound as CL_R/CL_UNSIGNED_INT32 (one texel = 2 packed
+// ushorts), the same proven format the f16 _kimg / MoE _ns kernels use. The
+// dispatch guarantees M%64==0 so m is even, hence every weight read for a
+// given output row has constant ushort parity (= rrow&1): the wanted ushort is
+// selected with a single hoisted shift, and adjacent lanes (rows) share each
+// uint32 texel -> good cache-line / coalescing behaviour.
+__attribute__((qcom_wave_pair_mode(1)))
+kernel void kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg(
+        __read_only image1d_buffer_t src0_q_img, // q4_K weights as uint32 texels (2 ushorts/texel)
+        __global const uchar  * src0_s,    // 6-bit scale/min codes
+        __global const half   * src0_d,    // per-superblock scale
+        __global const half   * src0_dm,   // per-superblock min
+        __global const uint   * src1_qa,   // q8_1 activations int8 (as uint, 4/elem) [N, K]
+        __global const half   * src1_da,   // q8_1 per-block scale [N, K/32]
+        __global const half   * src1_sa,   // q8_1 per-block sum*d [N, K/32]
+        __global       float  * dst,
+        ulong  offsetd,
+        int    m,                          // output features (rows)
+        int    n_no_padding,               // tokens (cols)
+        int    k,                          // K (== ne00)
+        uchar  mask_d6,
+        uchar  mask_d4,
+        uchar  mask_hi2
+) {
+    dst = (global float *)((global char *)dst + offsetd);
+
+    const uint lid = get_local_id(0);          // 0..63 -> row within the M-tile
+    const uint block_id_m = get_global_id(1);
+    const uint block_id_n = get_global_id(2);
+
+    const uint row      = block_id_m * 64 + lid;
+    const uint col_base = block_id_n * TILESIZE_N;
+    const bool row_valid = row < (uint)m;
+    const uint rrow     = row_valid ? row : 0;  // clamp OOB rows; their writes are masked
+
+    // Constant per WI: the ushort the row needs always sits in the same half of
+    // its uint32 texel (m even => index parity == rrow parity). Hoist the shift.
+    const uint sel = (rrow & 1u) * 16u;
+
+    const uint k_u = (uint)k >> 2;   // K in uint (int8x4) units
+    const uint k_b = (uint)k >> 5;   // blocks-of-32 along K
+    const uint num_superblocks = (uint)k / QK_K;
+
+    __local uint sh_qa[TILESIZE_N][8];
+    __local half sh_d[TILESIZE_N];
+    __local half sh_s[TILESIZE_N];
+
+#define NGROUPS (TILESIZE_N / 4)
+    float4 acc[NGROUPS];
+    #pragma unroll
+    for (int g = 0; g < NGROUPS; ++g) acc[g] = (float4)(0.0f);
+
+    for (uint step = 0; step < (uint)k; step += 32) {
+        const uint sub     = step >> 5;
+        const uint sb_idx  = step / QK_K;
+        const uint sub_idx = sub & 7;
+
+        const float dd  = (float)src0_d [rrow + sb_idx * m];
+        const float dmm = (float)src0_dm[rrow + sb_idx * m];
+        global const uchar * sc = src0_s + rrow * num_superblocks * K_SCALE_SIZE + sb_idx * K_SCALE_SIZE;
+        uchar sv, mn;
+        get_scale_min_k4(sub_idx, sc, &sv, &mn, mask_d6, mask_d4, mask_hi2);
+        const float scale = dd  * (float)sv;
+        const float minv  = dmm * (float)mn;
+
+        // Same logical ushort index (wbase + j*m) as the buffer kernel, read
+        // through the texture: uint32 texel = ushort_index>>1, half = sel.
+        const uint wbase = rrow + (step >> 2) * (uint)m;
+        uint8 qw;
+        qw.s0 = EXP4(read_imageui(src0_q_img, (int)((wbase + 0 * m) >> 1)).x >> sel);
+        qw.s1 = EXP4(read_imageui(src0_q_img, (int)((wbase + 1 * m) >> 1)).x >> sel);
+        qw.s2 = EXP4(read_imageui(src0_q_img, (int)((wbase + 2 * m) >> 1)).x >> sel);
+        qw.s3 = EXP4(read_imageui(src0_q_img, (int)((wbase + 3 * m) >> 1)).x >> sel);
+        qw.s4 = EXP4(read_imageui(src0_q_img, (int)((wbase + 4 * m) >> 1)).x >> sel);
+        qw.s5 = EXP4(read_imageui(src0_q_img, (int)((wbase + 5 * m) >> 1)).x >> sel);
+        qw.s6 = EXP4(read_imageui(src0_q_img, (int)((wbase + 6 * m) >> 1)).x >> sel);
+        qw.s7 = EXP4(read_imageui(src0_q_img, (int)((wbase + 7 * m) >> 1)).x >> sel);
+
+        for (uint idx = lid; idx < TILESIZE_N * 8; idx += 64) {
+            const uint t = idx >> 3;
+            const uint u = idx & 7;
+            const uint c = col_base + t;
+            sh_qa[t][u] = (c < (uint)n_no_padding) ? src1_qa[c * k_u + (step >> 2) + u] : 0u;
+        }
+        if (lid < TILESIZE_N) {
+            const uint c = col_base + lid;
+            sh_d[lid] = (c < (uint)n_no_padding) ? src1_da[c * k_b + sub] : (half)0;
+            sh_s[lid] = (c < (uint)n_no_padding) ? src1_sa[c * k_b + sub] : (half)0;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+#define LD4(arr, b) ((float4)((float)arr[(b)+0], (float)arr[(b)+1], (float)arr[(b)+2], (float)arr[(b)+3]))
+        #pragma unroll
+        for (int g = 0; g < NGROUPS; ++g) {
+            const int b = g * 4;
+            float4 rf;
+            rf.s0 = (float)dot8_q8a(qw, sh_qa[b+0]);  rf.s1 = (float)dot8_q8a(qw, sh_qa[b+1]);
+            rf.s2 = (float)dot8_q8a(qw, sh_qa[b+2]);  rf.s3 = (float)dot8_q8a(qw, sh_qa[b+3]);
+            acc[g] += scale * LD4(sh_d, b) * rf - minv * LD4(sh_s, b);
+        }
+#undef LD4
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    if (!row_valid) {
+        return;
+    }
+
+    #pragma unroll
+    for (int g = 0; g < NGROUPS; ++g) {
+        const uint b = (uint)(g * 4);
+        const float4 a = acc[g];
+        const uint c0 = col_base + b;
+        if (c0 + 0 < (uint)n_no_padding) dst[(c0 + 0) * (uint)m + row] = a.s0;
+        if (c0 + 1 < (uint)n_no_padding) dst[(c0 + 1) * (uint)m + row] = a.s1;
+        if (c0 + 2 < (uint)n_no_padding) dst[(c0 + 2) * (uint)m + row] = a.s2;
+        if (c0 + 3 < (uint)n_no_padding) dst[(c0 + 3) * (uint)m + row] = a.s3;
+    }
+#undef NGROUPS
+}
