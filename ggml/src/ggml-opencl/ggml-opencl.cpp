@@ -1005,6 +1005,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemm_moe_q8_1_dp4a_q5k = nullptr;   // generic dp4a MoE GEMM (MOE_QT=5, q5_K), opt-in
     cl_kernel kernel_moe_expand_scale_q5_K = nullptr;    // q5_K 6-bit s[] -> uniform scale[16]/min[8]
     cl_kernel kernel_gemv_moe_q4_k_f32_ns_glu;   // fused combined-gate_up GEMV + GLU (MoE FFN)
+    cl_kernel kernel_gemv_moe_q4_k_f32_ns_glu_wimg = nullptr;  // weight-as-texture variant
     cl_kernel kernel_gemv_moe_q5_k_f32_ns, kernel_gemm_moe_q5_k_f32_ns;
     cl_kernel kernel_gemv_moe_q6_k_f32_ns, kernel_gemm_moe_q6_k_f32_ns;
     cl_kernel kernel_gemm_moe_q6_k_q8_1_dp4a = nullptr;    // dp4a (int8) q6_K MoE prefill GEMM
@@ -1014,6 +1015,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemm_moe_mxfp4_q8_1_dp4a = nullptr;   // dp4a (int8) mxfp4 MoE prefill GEMM
     cl_kernel kernel_gemm_moe_q4_0_q8_1_dp4a = nullptr;    // dp4a (int8) q4_0 MoE prefill GEMM
     cl_kernel kernel_gemv_moe_mxfp4_f32_ns_glu;
+    cl_kernel kernel_gemv_moe_mxfp4_f32_ns_glu_wimg = nullptr;  // weight-as-texture variant
     cl_kernel kernel_moe_reorder_b;
     cl_kernel kernel_moe_histogram, kernel_moe_scan, kernel_moe_fill, kernel_moe_scatter;
     cl_kernel kernel_moe_combine_f32 = nullptr;   // fused router-weight mul + cross-expert sum
@@ -4547,6 +4549,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         CL_CHECK((backend_ctx->kernel_gemv_moe_q4_k_f32_ns = clCreateKernel(prog, "kernel_gemv_moe_q4_k_f32_ns", &err), err));
         CL_CHECK((backend_ctx->kernel_gemv_moe_q4_k_f32_ns_wimg = clCreateKernel(prog, "kernel_gemv_moe_q4_k_f32_ns_wimg", &err), err));
         CL_CHECK((backend_ctx->kernel_gemv_moe_q4_k_f32_ns_glu = clCreateKernel(prog, "kernel_gemv_moe_q4_k_f32_ns_glu", &err), err));
+        CL_CHECK((backend_ctx->kernel_gemv_moe_q4_k_f32_ns_wimg = clCreateKernel(prog, "kernel_gemv_moe_q4_k_f32_ns_wimg", &err), err));
+        CL_CHECK((backend_ctx->kernel_gemv_moe_q4_k_f32_ns_glu_wimg = clCreateKernel(prog, "kernel_gemv_moe_q4_k_f32_ns_glu_wimg", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
@@ -4783,6 +4787,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         CL_CHECK((backend_ctx->kernel_gemv_moe_mxfp4_f32_ns = clCreateKernel(prog, "kernel_gemv_moe_mxfp4_f32_ns", &err), err));
         CL_CHECK((backend_ctx->kernel_gemv_moe_mxfp4_f32_ns_wimg = clCreateKernel(prog, "kernel_gemv_moe_mxfp4_f32_ns_wimg", &err), err));
         CL_CHECK((backend_ctx->kernel_gemv_moe_mxfp4_f32_ns_glu = clCreateKernel(prog, "kernel_gemv_moe_mxfp4_f32_ns_glu", &err), err));
+        CL_CHECK((backend_ctx->kernel_gemv_moe_mxfp4_f32_ns_wimg = clCreateKernel(prog, "kernel_gemv_moe_mxfp4_f32_ns_wimg", &err), err));
+        CL_CHECK((backend_ctx->kernel_gemv_moe_mxfp4_f32_ns_glu_wimg = clCreateKernel(prog, "kernel_gemv_moe_mxfp4_f32_ns_glu_wimg", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
@@ -15252,8 +15258,21 @@ static void ggml_cl_mul_mat_id_q4_k_glu_fused(ggml_backend_t backend, ggml_tenso
     CL_CHECK(status);
 
     cl_kernel kernel = backend_ctx->kernel_gemv_moe_q4_k_f32_ns_glu;
+    // Weight-as-texture for the fused GLU GEMV: byte-identical, q_img for arg 0.
+    // DEFAULT OFF (opt-in GGML_OPENCL_MOE_DECODE_WIMG_GLU=1): unlike the plain MoE
+    // decode GEMV (a win), the combined gate_up GLU path is perf-NEUTRAL on gemma-4
+    // (+0.25%); the mxfp4 two-image GLU sibling regresses. So only the plain paths
+    // default-on; the GLU variants are kept opt-in.
+    static const char * moe_decode_wimg_glu_env = getenv("GGML_OPENCL_MOE_DECODE_WIMG_GLU");
+    const bool use_moe_decode_wimg =
+        (moe_decode_wimg_glu_env && (atoi(moe_decode_wimg_glu_env) != 0))
+        && backend_ctx->kernel_gemv_moe_q4_k_f32_ns_glu_wimg != nullptr
+        && extra0->q_img != nullptr;
+    if (use_moe_decode_wimg) {
+        kernel = backend_ctx->kernel_gemv_moe_q4_k_f32_ns_glu_wimg;
+    }
     int arg_idx = 0;
-    CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),    &extra0->q));
+    CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),    use_moe_decode_wimg ? &extra0->q_img : &extra0->q));
     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),    &extra0->d));
     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),    &extra0->dm));
     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),    &extra0->s));
@@ -15356,10 +15375,22 @@ static void ggml_cl_mul_mat_id_mxfp4_glu_fused(ggml_backend_t backend,
     CL_CHECK(status);
 
     cl_kernel kernel = backend_ctx->kernel_gemv_moe_mxfp4_f32_ns_glu;
+    // Weight-as-texture for the fused GLU GEMV (gate_q + up_q as images).
+    // DEFAULT OFF (opt-in GGML_OPENCL_MOE_DECODE_WIMG_GLU=1): this two-image GLU path
+    // REGRESSES ~6% on gpt-oss (the two competing weight texture streams thrash the
+    // cache), unlike the single-image plain MoE decode GEMV which wins. Kept opt-in.
+    static const char * moe_decode_wimg_glu_env = getenv("GGML_OPENCL_MOE_DECODE_WIMG_GLU");
+    const bool use_moe_decode_wimg =
+        (moe_decode_wimg_glu_env && (atoi(moe_decode_wimg_glu_env) != 0))
+        && backend_ctx->kernel_gemv_moe_mxfp4_f32_ns_glu_wimg != nullptr
+        && eg->q_img != nullptr && eu->q_img != nullptr;
+    if (use_moe_decode_wimg) {
+        kernel = backend_ctx->kernel_gemv_moe_mxfp4_f32_ns_glu_wimg;
+    }
     int arg_idx = 0;
-    CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),   &eg->q));
+    CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),   use_moe_decode_wimg ? &eg->q_img : &eg->q));
     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),   &eg->e));
-    CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),   &eu->q));
+    CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),   use_moe_decode_wimg ? &eu->q_img : &eu->q));
     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),   &eu->e));
     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),   &egb->data_device));
     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_ulong), &gboff));

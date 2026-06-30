@@ -164,6 +164,10 @@ __kernel void kernel_gemv_moe_mxfp4_f32_ns(
 
 }
 
+// --- Weight-as-texture variant of kernel_gemv_moe_mxfp4_f32_ns -----------------
+// Byte-identical; the mxfp4 plane is read via image1d_buffer (texture cache)
+// instead of a __global uint buffer. Mirrors the q4_K _wimg MoE decode GEMV.
+// Opt path: GGML_OPENCL_MOE_DECODE_WIMG (default on X2E).
 __attribute__((qcom_reqd_sub_group_size("half")))
 __kernel void kernel_gemv_moe_mxfp4_f32_ns_wimg(
     __read_only image1d_buffer_t src0_q,
@@ -359,6 +363,101 @@ __kernel void kernel_gemv_moe_mxfp4_f32_ns_glu(
         up_sum   += up_bias[(up_bias_off >> 2) + (uint)expert_id * ne01 + i01];
 
         // SWIGLU_OAI: x0=gate (clamped above), x1=up (clamped both sides)
+        float x0 = min(gate_sum, limit);
+        float x1 = max(min(up_sum, limit), -limit);
+        float out_glu = x0 / (1.0f + exp(-x0 * alpha));
+        out_glu = out_glu * (1.0f + x1);
+
+        dst = dst + (offsetd >> 2);
+        dst[i01 + i20 * ne01] = out_glu;
+    }
+}
+
+// Weight-as-texture variant of MXFP4_MOE_ROW_DOT: Q is an image1d_buffer_t.
+#define MXFP4_MOE_ROW_DOT_IMG(SUM, Q, E)                                                  \
+    for (uint ib00 = sgid; ib00 < (ne00 / QK_MXFP4); ib00 += N_SIMDGROUP) {              \
+        uint4 regQ;                                                                       \
+        uint block_offset = expert_offset * 4 + ib00 * ne01 * 4 + i01;                    \
+        regQ.s0 = read_imageui((Q), (int)(block_offset)).x;                               \
+        regQ.s1 = read_imageui((Q), (int)(block_offset + ne01)).x;                        \
+        regQ.s2 = read_imageui((Q), (int)(block_offset + ne01 * 2)).x;                    \
+        regQ.s3 = read_imageui((Q), (int)(block_offset + ne01 * 3)).x;                    \
+        uint offset = i11 * ne00 / 4 + ib00 * 8;                                          \
+        half8 fp16x8 = mxfp4_to_fp16_packed8(as_ushort2(regQ.s0));                         \
+        float4 shared_y4 = read_imagef(src1, (offset + 0));                               \
+        float4 acc = shared_y4 * convert_float4(fp16x8.lo);                               \
+        shared_y4 = read_imagef(src1, (offset + 1)); acc += shared_y4 * convert_float4(fp16x8.hi); \
+        fp16x8 = mxfp4_to_fp16_packed8(as_ushort2(regQ.s1));                               \
+        shared_y4 = read_imagef(src1, (offset + 2)); acc += shared_y4 * convert_float4(fp16x8.lo); \
+        shared_y4 = read_imagef(src1, (offset + 3)); acc += shared_y4 * convert_float4(fp16x8.hi); \
+        fp16x8 = mxfp4_to_fp16_packed8(as_ushort2(regQ.s2));                               \
+        shared_y4 = read_imagef(src1, (offset + 4)); acc += shared_y4 * convert_float4(fp16x8.lo); \
+        shared_y4 = read_imagef(src1, (offset + 5)); acc += shared_y4 * convert_float4(fp16x8.hi); \
+        fp16x8 = mxfp4_to_fp16_packed8(as_ushort2(regQ.s3));                               \
+        shared_y4 = read_imagef(src1, (offset + 6)); acc += shared_y4 * convert_float4(fp16x8.lo); \
+        shared_y4 = read_imagef(src1, (offset + 7)); acc += shared_y4 * convert_float4(fp16x8.hi); \
+        uchar regE = (E)[ib00 * ne01 + i01 + expert_offset];                              \
+        SUM += e8m0_to_fp32(regE) * ((acc.s0 + acc.s1) + (acc.s2 + acc.s3));              \
+    }
+
+// Weight-as-texture variant of kernel_gemv_moe_mxfp4_f32_ns_glu (gate_q/up_q as
+// images). Byte-identical; gpt-oss MoE decode. gate_e/up_e/bias stay buffers.
+__attribute__((qcom_reqd_sub_group_size("half")))
+__kernel void kernel_gemv_moe_mxfp4_f32_ns_glu_wimg(
+    __read_only image1d_buffer_t gate_q,
+    __global uchar *             gate_e,
+    __read_only image1d_buffer_t up_q,
+    __global uchar *             up_e,
+    __global float *             gate_bias,
+    ulong                        gate_bias_off,
+    __global float *             up_bias,
+    ulong                        up_bias_off,
+    __read_only image1d_buffer_t src1,
+    __global uint *              src2,
+    __global float *             dst,
+    ulong                        offsetd,
+    int                          ne00,
+    int                          ne01,
+    int                          ne11,
+    float                        alpha,
+    float                        limit
+) {
+    uint i01  = get_global_id(0);
+    uint i20  = get_global_id(2);
+    uint sgid = get_local_id(1);
+    uint slid = get_sub_group_local_id();
+
+    if (i01 >= (uint)ne01) {
+        return;
+    }
+
+    uint i11 = i20 % ne11;
+
+    uint expert_id = src2[i20];
+    uint expert_offset = expert_id * ne00 * ne01 / 32;
+
+    __private float gate_sum = 0.0f;
+    __private float up_sum   = 0.0f;
+
+    MXFP4_MOE_ROW_DOT_IMG(gate_sum, gate_q, gate_e)
+    MXFP4_MOE_ROW_DOT_IMG(up_sum,   up_q,   up_e)
+
+    __local float2 reduceLM[SIMDGROUP_WIDTH * (N_SIMDGROUP - 1)];
+    if (sgid == 1) reduceLM[SIMDGROUP_WIDTH * 0 + slid] = (float2)(gate_sum, up_sum);
+    if (sgid == 2) reduceLM[SIMDGROUP_WIDTH * 1 + slid] = (float2)(gate_sum, up_sum);
+    if (sgid == 3) reduceLM[SIMDGROUP_WIDTH * 2 + slid] = (float2)(gate_sum, up_sum);
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (sgid == 0) {
+        gate_sum += reduceLM[SIMDGROUP_WIDTH * 0 + slid].s0;
+        up_sum   += reduceLM[SIMDGROUP_WIDTH * 0 + slid].s1;
+        gate_sum += reduceLM[SIMDGROUP_WIDTH * 1 + slid].s0;
+        up_sum   += reduceLM[SIMDGROUP_WIDTH * 1 + slid].s1;
+        gate_sum += reduceLM[SIMDGROUP_WIDTH * 2 + slid].s0;
+        up_sum   += reduceLM[SIMDGROUP_WIDTH * 2 + slid].s1;
+
+        gate_sum += gate_bias[(gate_bias_off >> 2) + (uint)expert_id * ne01 + i01];
+        up_sum   += up_bias[(up_bias_off >> 2) + (uint)expert_id * ne01 + i01];
+
         float x0 = min(gate_sum, limit);
         float x1 = max(min(up_sum, limit), -limit);
         float out_glu = x0 / (1.0f + exp(-x0 * alpha));
