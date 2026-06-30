@@ -16,7 +16,9 @@
 // dot over K via dp4a. Mirrors the MoE dp4a kernel without routing/scatter.
 // q4_K reassociation per 32-subblock: Sum w*a = scale*a_d*dp4a(q,a) - minv*a_s.
 
+#ifndef TILESIZE_N
 #define TILESIZE_N 32
+#endif
 #define QK_K 256
 #define K_SCALE_SIZE 12
 
