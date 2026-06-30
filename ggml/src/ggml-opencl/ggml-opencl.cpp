@@ -489,6 +489,7 @@ struct ggml_backend_opencl_context {
     bool has_subgroup_shuffle = false;       // cl_khr_subgroup_shuffle or cl_qcom_subgroup_shuffle
     bool has_qcom_subgroup_shuffle = false;  // specifically cl_qcom_subgroup_shuffle
     bool disable_fusion;
+    bool fuse_moe_combine = true;    // opt-out GGML_OPENCL_FUSE_MOE_COMBINE=0 (router-weight mul + cross-expert add chain -> one weighted-sum kernel; +4-5% MoE prefill, PPL-parity; weights copied to scratch + bails on experts/dst alias)
     bool moe_gemm_ragged = true;     // opt-out GGML_OPENCL_MOE_RAGGED=0 (skip the ~50% per-expert padded tokens in the q4_K/q6_K MoE prefill GEMM tiles; byte-identical, +8-16% pp)
 
     bool adreno_has_large_buffer;
@@ -739,6 +740,8 @@ struct ggml_backend_opencl_context {
     // [size_idx][kda][tgpp] where size_idx: 0=S_V=16, 1=32, 2=64, 3=128; kda: 0 or 1.
     // tgpp 0 = TG variant (COLS_PER_LANE_GROUP=1), tgpp 1 = prefill variant (COLS_PER_LANE_GROUP=4).
     cl_kernel kernel_gated_delta_net_f32[4][2][2] = {};
+    cl_kernel kernel_moe_combine_f32 = nullptr;   // fused router-weight mul + cross-expert sum
+    ggml_cl_buffer prealloc_moe_combine_w;        // small scratch copy of the router weights (avoids dst-aliasing)
 
     cl_kernel kernel_timestep_embedding;
     cl_kernel kernel_gemv_moe_q4_0_f32_ns, kernel_gemm_moe_q4_0_f32_ns, kernel_gemm_moe_q4_0_f32_ns_bin;
@@ -2987,6 +2990,23 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         GGML_LOG_CONT(".");
     }
 
+    // moe_combine (fused router-weight mul + cross-expert sum)
+    {
+    #ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src {
+            #include "moe_combine.cl.h"
+        };
+    #else
+        const std::string kernel_src = read_file("moe_combine.cl");
+    #endif
+        cl_program prog = build_program_from_source(
+            backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
+        CL_CHECK((backend_ctx->kernel_moe_combine_f32 =
+                    clCreateKernel(prog, "kernel_moe_combine_f32", &err), err));
+        CL_CHECK(clReleaseProgram(prog));
+        GGML_LOG_CONT(".");
+    }
+
     // mul_mv_id_q4_0_f32_8x_flat
     {
 #ifdef GGML_OPENCL_EMBED_KERNELS
@@ -5068,6 +5088,9 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
     // check Adreno large buffer support
     backend_ctx->adreno_has_large_buffer = strstr(ext_buffer, "cl_qcom_large_buffer") != NULL;
 
+    if (const char * env = getenv("GGML_OPENCL_FUSE_MOE_COMBINE")) {
+        backend_ctx->fuse_moe_combine = atoi(env) != 0;
+    }
     if (const char * env = getenv("GGML_OPENCL_MOE_RAGGED")) {
         backend_ctx->moe_gemm_ragged = atoi(env) != 0;
     }
@@ -5911,6 +5934,121 @@ static void sync_with_other_backends(ggml_backend_t backend) {
     sync_with_other_backends(backend_ctx);
 }
 
+// True if two tensors share a device buffer with overlapping byte ranges. The pool
+// allocator may place a fused op's output over a sequentially-dead input (safe for the
+// original separate kernels, but a read/write race inside one fused kernel).
+static bool ggml_cl_tensors_overlap(const ggml_tensor * x, const ggml_tensor * y) {
+    ggml_tensor_extra_cl * ex = (ggml_tensor_extra_cl *)x->extra;
+    ggml_tensor_extra_cl * ey = (ggml_tensor_extra_cl *)y->extra;
+    if (!ex || !ey || ex->data_device != ey->data_device) return false;
+    const cl_ulong xo = ex->offset + x->view_offs, xe = xo + ggml_nbytes(x);
+    const cl_ulong yo = ey->offset + y->view_offs, ye = yo + ggml_nbytes(y);
+    return xo < ye && yo < xe;
+}
+
+// Detect the MoE combine epilogue: router-weight MUL ([n_embd,k,nt] * [1,k,nt]) followed
+// by k VIEWs of it and a (k-1)-long ADD reduction chain producing [n_embd, nt]. When it
+// matches (and the output does not alias the inputs), the whole subgraph collapses to one
+// weighted-sum-across-experts kernel.
+static bool ggml_opencl_can_fuse_moe_combine(const struct ggml_cgraph * cgraph, int node_idx,
+                                             const ggml_tensor ** out_final_add) {
+    const ggml_tensor * mul = cgraph->nodes[node_idx];
+    if (mul->op != GGML_OP_MUL) return false;
+    const ggml_tensor * experts = mul->src[0];
+    const ggml_tensor * weights = mul->src[1];
+    if (!experts || !weights) return false;
+    if (experts->type != GGML_TYPE_F32 || weights->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32) return false;
+
+    const int64_t n_embd = experts->ne[0];
+    const int64_t k      = experts->ne[1];
+    const int64_t nt     = experts->ne[2];
+    if (k < 2 || k > 64 || experts->ne[3] != 1 || n_embd % 4 != 0) return false;
+    if (weights->ne[0] != 1 || weights->ne[1] != k || weights->ne[2] != nt || weights->ne[3] != 1) return false;
+    if (mul->ne[0] != n_embd || mul->ne[1] != k || mul->ne[2] != nt) return false;
+    // the fused kernel needs contiguous experts/weights and a contiguous 2D dst
+    if (!ggml_is_contiguous(experts) || !ggml_is_contiguous(weights)) return false;
+
+    const int n_nodes = 1 + (int)k + (int)(k - 1);  // MUL + k*VIEW + (k-1)*ADD
+    if (node_idx + n_nodes > cgraph->n_nodes) return false;
+
+    enum ggml_op ops[1 + 64 + 63];
+    int n = 0;
+    ops[n++] = GGML_OP_MUL;
+    for (int j = 0; j < (int)k;     ++j) ops[n++] = GGML_OP_VIEW;
+    for (int j = 0; j < (int)k - 1; ++j) ops[n++] = GGML_OP_ADD;
+    const int outs[] = { node_idx + n_nodes - 1 };
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx, n_nodes, ops, outs, 1)) return false;
+
+    for (int j = 0; j < (int)k; ++j) {
+        const ggml_tensor * vw = cgraph->nodes[node_idx + 1 + j];
+        if (vw->op != GGML_OP_VIEW || vw->src[0] != mul || vw->ne[0] != n_embd || vw->ne[1] != nt) return false;
+    }
+    const ggml_tensor * final_add = cgraph->nodes[node_idx + n_nodes - 1];
+    if (final_add->op != GGML_OP_ADD || final_add->type != GGML_TYPE_F32 ||
+        final_add->ne[0] != n_embd || final_add->ne[1] != nt || final_add->ne[2] != 1) return false;
+    if (!ggml_is_contiguous(final_add)) return false;
+    // CRITICAL: the fused kernel reads experts + writes final_add in one pass; bail if the
+    // pool allocator overlapped the output with the (large) experts input -> would race.
+    // The small weights input is copied to a private scratch in the dispatch, so its own
+    // aliasing with the output is handled there and does not block the fusion.
+    if (ggml_cl_tensors_overlap(experts, final_add)) return false;
+
+    *out_final_add = final_add;
+    return true;
+}
+
+static void ggml_cl_moe_combine_fused(ggml_backend_t backend, const ggml_tensor * mul, const ggml_tensor * dst) {
+    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *)backend->context;
+    const ggml_tensor * experts = mul->src[0];
+    const ggml_tensor * weights = mul->src[1];
+
+    ggml_tensor_extra_cl * ee = (ggml_tensor_extra_cl *)experts->extra;
+    ggml_tensor_extra_cl * ew = (ggml_tensor_extra_cl *)weights->extra;
+    ggml_tensor_extra_cl * ed = (ggml_tensor_extra_cl *)dst->extra;
+    cl_ulong off_e = ee->offset + experts->view_offs;
+    cl_ulong off_w = ew->offset + weights->view_offs;
+    cl_ulong off_d = ed->offset + dst->view_offs;
+
+    const int n_embd4 = (int)(experts->ne[0] / 4);
+    const int k       = (int)experts->ne[1];
+    const int nt      = (int)experts->ne[2];
+    const cl_uint e1 = (cl_uint)(experts->nb[1] / sizeof(float));
+    const cl_uint e2 = (cl_uint)(experts->nb[2] / sizeof(float));
+    const cl_uint w1 = (cl_uint)(weights->nb[1] / sizeof(float));
+    const cl_uint w2 = (cl_uint)(weights->nb[2] / sizeof(float));
+    const cl_uint d1 = (cl_uint)(dst->nb[1] / sizeof(float));
+
+    // The router weights are tiny ([1,k,nt]) and may share a pool buffer with the output;
+    // copy them into a private scratch so the fused kernel never reads aliased memory.
+    const size_t w_bytes = ggml_nbytes(weights);
+    backend_ctx->prealloc_moe_combine_w.allocate(backend_ctx->context, w_bytes);
+    CL_CHECK(clEnqueueCopyBuffer(backend_ctx->queue, ew->data_device, backend_ctx->prealloc_moe_combine_w.buffer,
+                                 off_w, 0, w_bytes, 0, NULL, NULL));
+    cl_mem   w_dev = backend_ctx->prealloc_moe_combine_w.buffer;
+    cl_ulong w_off = 0;
+
+    cl_kernel kernel = backend_ctx->kernel_moe_combine_f32;
+    int a = 0;
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &ee->data_device));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &off_e));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &w_dev));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &w_off));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &ed->data_device));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &off_d));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &n_embd4));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &k));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &nt));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_uint),  &e1));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_uint),  &e2));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_uint),  &w1));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_uint),  &w2));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_uint),  &d1));
+
+    size_t lws[2] = { 64, 1 };
+    size_t gws[2] = { (size_t)(((n_embd4 + 63) / 64) * 64), (size_t)nt };
+    backend_ctx->enqueue_ndrange_kernel(kernel, 2, gws, lws, (ggml_tensor *)dst);
+}
+
 static bool ggml_opencl_can_fuse(const struct ggml_cgraph * cgraph, int node_idx, std::initializer_list<enum ggml_op> ops) {
     if (!ggml_can_fuse(cgraph, node_idx, ops)) {
         return false;
@@ -6011,6 +6149,17 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
             i += 2;
             continue;
         }
+        // Fuse the MoE combine: router-weight mul + cross-expert add chain ->
+        // one weighted-sum-across-experts kernel (opt-in GGML_OPENCL_FUSE_MOE_COMBINE).
+        if (backend_ctx->fuse_moe_combine && !backend_ctx->disable_fusion) {
+            const ggml_tensor * combine_out = nullptr;
+            if (ggml_opencl_can_fuse_moe_combine(cgraph, i, &combine_out)) {
+                ggml_cl_moe_combine_fused(backend, node, combine_out);
+                i += 2 * (int)node->ne[1] - 1;   // skip the k VIEWs + (k-1) ADDs
+                continue;
+            }
+        }
+
         if (!backend_ctx->disable_fusion && ggml_opencl_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL })) {
             ggml_opencl_op_rms_norm_fused(backend, node, cgraph->nodes[i+1]);
             i++;
