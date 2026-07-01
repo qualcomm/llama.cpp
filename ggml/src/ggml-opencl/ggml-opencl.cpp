@@ -18205,6 +18205,15 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     const int is_ragged = (ragged_fp16_env == NULL) ? 1 : (atoi(ragged_fp16_env) != 0);
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &is_ragged));
 
+                    // Tile-skip granularity (columns per skip-group): 8 = quarter (default),
+                    // 16 = half (legacy), 32 = disabled. Quarter wins at every prefill size
+                    // (pp64..pp4096) on both many- and few-expert MoE models with no full-tile
+                    // regression (X2-90). Override with GGML_OPENCL_MOE_RAGGED_GRAN={8,16,32}.
+                    static const char * ragged_gran_env = getenv("GGML_OPENCL_MOE_RAGGED_GRAN");
+                    int skip_gran = (ragged_gran_env != NULL) ? atoi(ragged_gran_env) : 8;
+                    if (skip_gran != 8 && skip_gran != 16 && skip_gran != 32) { skip_gran = 8; }
+                    CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &skip_gran));
+
                     // set thread grid
                     global_size[1] = static_cast<size_t>((ne01 + 63) / 64);
                     global_size[2] = static_cast<size_t>(max_post_router_tile);
@@ -18437,6 +18446,15 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     const int is_ragged = (ragged_fp16_env == NULL) ? 1 : (atoi(ragged_fp16_env) != 0);
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &is_ragged));
 
+                    // Tile-skip granularity (columns per skip-group): 8 = quarter (default),
+                    // 16 = half (legacy), 32 = disabled. Quarter wins at every prefill size
+                    // (pp64..pp4096) on both many- and few-expert MoE models with no full-tile
+                    // regression (X2-90). Override with GGML_OPENCL_MOE_RAGGED_GRAN={8,16,32}.
+                    static const char * ragged_gran_env = getenv("GGML_OPENCL_MOE_RAGGED_GRAN");
+                    int skip_gran = (ragged_gran_env != NULL) ? atoi(ragged_gran_env) : 8;
+                    if (skip_gran != 8 && skip_gran != 16 && skip_gran != 32) { skip_gran = 8; }
+                    CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &skip_gran));
+
                     // set thread grid
                     global_size[1] = static_cast<size_t>((ne01 + 63) / 64);
                     global_size[2] = static_cast<size_t>(max_post_router_tile);
@@ -18618,6 +18636,15 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     static const char * ragged_fp16_env = getenv("GGML_OPENCL_MOE_RAGGED_FP16");
                     const int is_ragged = (ragged_fp16_env == NULL) ? 1 : (atoi(ragged_fp16_env) != 0);
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &is_ragged));
+
+                    // Tile-skip granularity (columns per skip-group): 8 = quarter (default),
+                    // 16 = half (legacy), 32 = disabled. Quarter wins at every prefill size
+                    // (pp64..pp4096) on both many- and few-expert MoE models with no full-tile
+                    // regression (X2-90). Override with GGML_OPENCL_MOE_RAGGED_GRAN={8,16,32}.
+                    static const char * ragged_gran_env = getenv("GGML_OPENCL_MOE_RAGGED_GRAN");
+                    int skip_gran = (ragged_gran_env != NULL) ? atoi(ragged_gran_env) : 8;
+                    if (skip_gran != 8 && skip_gran != 16 && skip_gran != 32) { skip_gran = 8; }
+                    CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &skip_gran));
 
                     // set thread grid
                     global_size[1] = static_cast<size_t>((ne01 + 63) / 64);
@@ -18801,6 +18828,15 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     static const char * ragged_fp16_env = getenv("GGML_OPENCL_MOE_RAGGED_FP16");
                     const int is_ragged = (ragged_fp16_env == NULL) ? 1 : (atoi(ragged_fp16_env) != 0);
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &is_ragged));
+
+                    // Tile-skip granularity (columns per skip-group): 8 = quarter (default),
+                    // 16 = half (legacy), 32 = disabled. Quarter wins at every prefill size
+                    // (pp64..pp4096) on both many- and few-expert MoE models with no full-tile
+                    // regression (X2-90). Override with GGML_OPENCL_MOE_RAGGED_GRAN={8,16,32}.
+                    static const char * ragged_gran_env = getenv("GGML_OPENCL_MOE_RAGGED_GRAN");
+                    int skip_gran = (ragged_gran_env != NULL) ? atoi(ragged_gran_env) : 8;
+                    if (skip_gran != 8 && skip_gran != 16 && skip_gran != 32) { skip_gran = 8; }
+                    CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &skip_gran));
 
                     // set thread grid
                     global_size[1] = static_cast<size_t>((ne01 + 63) / 64);
@@ -19058,12 +19094,21 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),    &(backend_ctx->prealloc_total_tiles.buffer)));
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ne00));
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ne01));
-                    // Ragged tile-skip: skip the second dot-half for sparse expert tiles whose
-                    // upper 16 token-slots are all padding (byte-identical). Default on; opt out
-                    // with GGML_OPENCL_MOE_RAGGED_FP16=0.
+                    // Ragged tile-skip: skip empty 8-column dot-groups for sparse expert tiles
+                    // whose trailing token-slots are all padding (byte-identical). Default on;
+                    // opt out with GGML_OPENCL_MOE_RAGGED_FP16=0.
                     static const char * ragged_fp16_env = getenv("GGML_OPENCL_MOE_RAGGED_FP16");
                     const int is_ragged = (ragged_fp16_env == NULL) ? 1 : (atoi(ragged_fp16_env) != 0);
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &is_ragged));
+
+                    // Tile-skip granularity (columns per skip-group): 8 = quarter (default),
+                    // 16 = half (legacy), 32 = disabled. Quarter wins at every prefill size
+                    // (pp64..pp4096) on both many- and few-expert MoE models with no full-tile
+                    // regression (X2-90). Override with GGML_OPENCL_MOE_RAGGED_GRAN={8,16,32}.
+                    static const char * ragged_gran_env = getenv("GGML_OPENCL_MOE_RAGGED_GRAN");
+                    int skip_gran = (ragged_gran_env != NULL) ? atoi(ragged_gran_env) : 8;
+                    if (skip_gran != 8 && skip_gran != 16 && skip_gran != 32) { skip_gran = 8; }
+                    CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &skip_gran));
 
                     // set thread grid
                     global_size[1] = static_cast<size_t>((ne01 + 63) / 64);
@@ -19249,6 +19294,15 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     const int is_ragged = (ragged_fp16_env == NULL) ? 1 : (atoi(ragged_fp16_env) != 0);
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &is_ragged));
 
+                    // Tile-skip granularity (columns per skip-group): 8 = quarter (default),
+                    // 16 = half (legacy), 32 = disabled. Quarter wins at every prefill size
+                    // (pp64..pp4096) on both many- and few-expert MoE models with no full-tile
+                    // regression (X2-90). Override with GGML_OPENCL_MOE_RAGGED_GRAN={8,16,32}.
+                    static const char * ragged_gran_env = getenv("GGML_OPENCL_MOE_RAGGED_GRAN");
+                    int skip_gran = (ragged_gran_env != NULL) ? atoi(ragged_gran_env) : 8;
+                    if (skip_gran != 8 && skip_gran != 16 && skip_gran != 32) { skip_gran = 8; }
+                    CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &skip_gran));
+
                     // set thread grid
                     global_size[1] = static_cast<size_t>((ne01 + 63) / 64);
                     global_size[2] = static_cast<size_t>(max_post_router_tile);
@@ -19429,6 +19483,15 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     static const char * ragged_fp16_env = getenv("GGML_OPENCL_MOE_RAGGED_FP16");
                     const int is_ragged = (ragged_fp16_env == NULL) ? 1 : (atoi(ragged_fp16_env) != 0);
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &is_ragged));
+
+                    // Tile-skip granularity (columns per skip-group): 8 = quarter (default),
+                    // 16 = half (legacy), 32 = disabled. Quarter wins at every prefill size
+                    // (pp64..pp4096) on both many- and few-expert MoE models with no full-tile
+                    // regression (X2-90). Override with GGML_OPENCL_MOE_RAGGED_GRAN={8,16,32}.
+                    static const char * ragged_gran_env = getenv("GGML_OPENCL_MOE_RAGGED_GRAN");
+                    int skip_gran = (ragged_gran_env != NULL) ? atoi(ragged_gran_env) : 8;
+                    if (skip_gran != 8 && skip_gran != 16 && skip_gran != 32) { skip_gran = 8; }
+                    CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &skip_gran));
 
                     // set thread grid
                     global_size[1] = static_cast<size_t>((ne01 + 63) / 64);
@@ -19618,6 +19681,15 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     static const char * ragged_fp16_env = getenv("GGML_OPENCL_MOE_RAGGED_FP16");
                     const int is_ragged = (ragged_fp16_env == NULL) ? 1 : (atoi(ragged_fp16_env) != 0);
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &is_ragged));
+
+                    // Tile-skip granularity (columns per skip-group): 8 = quarter (default),
+                    // 16 = half (legacy), 32 = disabled. Quarter wins at every prefill size
+                    // (pp64..pp4096) on both many- and few-expert MoE models with no full-tile
+                    // regression (X2-90). Override with GGML_OPENCL_MOE_RAGGED_GRAN={8,16,32}.
+                    static const char * ragged_gran_env = getenv("GGML_OPENCL_MOE_RAGGED_GRAN");
+                    int skip_gran = (ragged_gran_env != NULL) ? atoi(ragged_gran_env) : 8;
+                    if (skip_gran != 8 && skip_gran != 16 && skip_gran != 32) { skip_gran = 8; }
+                    CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &skip_gran));
 
                     // set thread grid
                     global_size[1] = static_cast<size_t>((ne01 + 63) / 64);
