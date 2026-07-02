@@ -5285,9 +5285,15 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
             break;
         }
         case FA_VARIANT_F32_F16: {
-            // The DK=512 decode-only program does not create the f32_f16
-            // prefill kernel; check the q1 kernel instead so that repeated
-            // calls return a consistent result.
+            // DK=512 (Gemma-4 global layers) builds a decode-only program that
+            // does NOT create the f32_f16 (BM-tile prefill) kernel — its
+            // "compiled" marker is the q1 decode kernel. Checking f32_f16 here
+            // would never hit for DK=512, so ensure_fa_variant would return an
+            // INCONSISTENT result for the same op across calls (compile→true,
+            // then variant_attempted-guard→false). supports_op is a purity
+            // contract; that flip-flop corrupts scheduler op-placement across
+            // reserve passes and crashes (stack overrun) before FA even
+            // dispatches. Key the cache-hit on the map the build populates.
             const bool decode_only = (dk == 512);
             if (decode_only ? (backend_ctx->fa.f32_f16_q1.count(dk_dv) > 0)
                             : (backend_ctx->fa.f32_f16.count(dk_dv)    > 0)) {
@@ -17158,8 +17164,12 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     const int block_m = n_q > 1
         ? (is_mixed ? backend_ctx->fa.f32_f16_bm.at(dk_dv) : backend_ctx->fa.bm.at(dk_dv))
         : 0;
-    // block_n is only used by the n_q > 1 prefill path; its map is not
-    // populated for DK=512 decode, so do not read it for decode.
+    // block_n (BM-tile KV width) is only consumed by the n_q>1 prefill/prepass
+    // path; its map (f32_f16_bn / bn) is populated by ggml_opencl_ensure_fa_pre_
+    // kernels, which is intentionally NOT called for DK=512 decode (n_q==1) —
+    // the DK=512 prepass OOMs the Adreno compiler. Guard on n_q>1 so decode does
+    // not throw std::out_of_range on the missing key (was crashing 0xC0000409 on
+    // Gemma-4 global layers). For n_q==1 decode block_n is unused.
     const int block_n = (n_q > 1)
         ? (is_mixed ? backend_ctx->fa.f32_f16_bn.at(dk_dv)
                     : backend_ctx->fa.bn.at(dk_dv))
