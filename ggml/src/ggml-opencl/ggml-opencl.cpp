@@ -1383,17 +1383,6 @@ static cl_program build_program_from_binary(cl_context ctx, cl_device_id dev, co
     return p;
 }
 
-static bool use_adreno_bin_kernels(ggml_backend_opencl_context * backend_ctx) {
-#ifndef GGML_OPENCL_USE_ADRENO_BIN_KERNELS
-    return false;
-#else
-    if (backend_ctx->gpu_family != GPU_FAMILY::ADRENO) {
-        return false;
-    }
-    return backend_ctx->adreno_use_bin_kernels;
-#endif // GGML_OPENCL_USE_ADRENO_BIN_KERNELS
-}
-
 static void load_cl_kernels_argsort(ggml_backend_opencl_context *backend_ctx) {
     // compiler options for general kernels
     auto opencl_c_std =
