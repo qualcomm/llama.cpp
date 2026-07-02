@@ -123,7 +123,11 @@ kernel void kernel_gated_delta_net(
     const uint iq3 = seq_id / rq3; // seq index for Q and K
 
     const uint state_size = S_V * S_V;
-    const uint state_base = (seq_id * K * H_v + head_id) * state_size;
+    // Input state s is [S_v, S_v, H_v, n_seqs] (K snapshot slots are an OUTPUT concept only),
+    // so the per-seq stride is H_v*state_size, NOT K*H_v*state_size. The old `seq_id * K * H_v`
+    // read the wrong sequence's initial state for n_seqs>1 && K>1 (single-seq/K=1 hid it since
+    // seq_id=0 or K=1 cancels the factor). Matches the CPU reference (iv3*H + iv1)*S_v*S_v.
+    const uint state_base = (seq_id * H_v + head_id) * state_size;
     const uint q_off_base  = iq3 * sq3 + iq1 * sq1;
     const uint v_off_base  = seq_id * sv3 + head_id * sv1;
     const uint gb_off_base = seq_id * sb3 + head_id * sb1;
@@ -143,7 +147,6 @@ kernel void kernel_gated_delta_net(
         }
     }
 
-    const int shift = (int)n_tokens - (int)K;
     uint attn_off = (seq_id * n_tokens * H_v + head_id) * S_V;
 
     for (uint t = 0; t < n_tokens; t++) {
@@ -219,7 +222,15 @@ kernel void kernel_gated_delta_net(
         attn_off += S_V * H_v;
 
         if (K > 1u) {
-            const int target_slot = (int)t - shift;
+            // Snapshot slot convention MUST match the CPU reference
+            // (ggml-cpu/ops.cpp ggml_compute_forward_gated_delta_net_one_chunk):
+            //   slot 0 = most recent state (after the last token), slot s = s tokens back.
+            // The backend-agnostic rollback/read path (llama-memory-recurrent.cpp s_copy/seq_rm)
+            // relies on this ordering; writing it reversed (the old `t - (n_tokens - K)`) made
+            // rs_idx=0 read the OLDEST snapshot after prefill, so Qwen MTP verify diverged from
+            // plain greedy by a slowly-drifting near-tie flip. Only the last min(n_tokens,K) tokens
+            // land in a slot; older slots are caller-owned.
+            const int target_slot = (int)n_tokens - 1 - (int)t;
             if (target_slot >= 0 && target_slot < (int)K) {
                 #pragma unroll
                 for (uint cg = 0; cg < COLS_PER_LANE_GROUP; cg++) {
