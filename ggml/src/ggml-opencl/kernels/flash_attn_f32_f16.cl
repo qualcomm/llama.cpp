@@ -101,7 +101,7 @@ inline float get_alibi_slope(
 // full program OOMs the Adreno shader compiler (CL_OUT_OF_HOST_MEMORY). The
 // decode-only build keeps just q1 + q1_split + merge; the heavy BM-tile prefill
 // kernel and all vec/MQ variants are excluded so the program fits the compiler.
-#ifndef FA_DECODE_ONLY
+#if !defined(FA_DECODE_ONLY) && !defined(FA_MQ_ONLY)
 #ifndef FA_TILE_NAME
 #define FA_TILE_NAME flash_attn_f32_f16
 #endif
@@ -646,6 +646,7 @@ __kernel void FA_TILE_NAME(
 // above; every decode kernel below is excluded so the tile compiles in its own
 // minimal program (the full program OOMs the Adreno compiler at DK=512).
 #ifndef FA_PREFILL_ONLY
+#ifndef FA_MQ_ONLY  // q1 excluded from the MQ-only (g8) program
 REQD_FA_SG
 __kernel void flash_attn_f32_f16_q1(
     const global void * q_void, ulong q_offset,
@@ -802,8 +803,23 @@ __kernel void flash_attn_f32_f16_q1(
     }
 }
 
+// Decode variant for large DV (e.g. Gemma-4 DK=DV=512 global layers).
+// Mirrors ggml-metal's kernel_flash_attn_ext_vec design:
+//   - WG = VEC_NSG subgroups × 64 lanes. Each subgroup runs the FA-2 online
+//     softmax loop independently over its slice of n_kv, then a __local merge
+//     combines (m_i, l_i, o_acc) across subgroups. This restores the n_kv
+//     parallelism that a single-subgroup vec port loses.
+//   - DV is split across the subgroup (each thread owns DV_VEC/64 of o_acc);
+//     this kills the o_acc[DV_VEC] private-array spill (~2 KB/thread at DV=512).
+//   - DK is split across the subgroup too; partial dots reduce via
+//     sub_group_reduce_add — no per-iteration barriers in the inner loop.
+//   - Cross-subgroup merge uses __local for sg_m / sg_l / sg_o (~4 KB at
+//     NSG=2, DV=512); one subgroup performs the final norm + write.
+// REQD_SUBGROUP_SIZE_64 ensures the subgroup width matches what the
+// dot/o_acc striding assumes (Adreno X2 miscompiles full-subgroup reduces
+// without the explicit attribute; see ssm_scan notes).
+
 #endif  // !FA_MQ_ONLY (q1)
-// decode variant for large DV (e.g. Gemma-4 DK=DV=512 global layers).
 #define VEC_NSG          4
 #define VEC_WG_SIZE      (Q1_WG_SIZE * VEC_NSG)
 #define Q1V_DV_PER_THREAD ((DV_VEC + Q1_WG_SIZE - 1) / Q1_WG_SIZE)
@@ -814,7 +830,7 @@ __kernel void flash_attn_f32_f16_q1(
 // fragile under load), and on Adreno X1 REQD_SUBGROUP_SIZE_64 routes to a slow
 // fallback variant anyway. The minimal program keeps q1 + q1_split + merge, which is
 // correct for decode at any depth; dispatch falls back from q1_vec to q1 cleanly.
-#ifndef FA_DECODE_MINIMAL
+#if !defined(FA_DECODE_MINIMAL) && !defined(FA_MQ_ONLY)
 REQD_SUBGROUP_SIZE_64
 __kernel void flash_attn_f32_f16_q1_vec(
     const global void * q_void, ulong q_offset,
@@ -1365,6 +1381,15 @@ __kernel void flash_attn_f32_f16_q1_local_mq_split(
     }
 }
 
+// MQ collapses one WG per KV-head (vs one per Q-head in legacy q1_vec).
+// Wanted NSG=8 or 16 to compensate for the wavefront-count loss after the
+// head-dim collapse, but Adreno X2's per-kernel CL_KERNEL_WORK_GROUP_SIZE
+// for this signature is 320 — only NSG=4 / WG=256 is reliably dispatchable.
+// At that NSG this kernel benches worse than legacy q1_vec on the target
+// model (Gemma-3-1B tg@d=0 = 60 t/s vs 72 legacy), so it's compiled but
+// not dispatched in the host code. The win came from pairing MQ with the
+// flash-decoding split (q1_vec_mq_split below) — that's the path host
+// dispatch uses at n_kv >= FD_MIN_N_KV.
 #endif  // !FA_MQ_ONLY (q1_local_mq_split)
 #ifndef MQ_NSG
 #define MQ_NSG 4
@@ -2090,6 +2115,7 @@ __kernel void flash_attn_f32_f16_q1_vec_mq_split_k_img(
 
 
 #endif  // !FA_DECODE_ONLY (vec / MQ / local-tile decode variants)
+#ifndef FA_MQ_ONLY  // q1_split + merge excluded from the MQ-only (g8) program
 __kernel void flash_attn_f32_f16_q1_split(
     const global void * q_void, ulong q_offset,
     const global void * k_void, ulong k_offset,
