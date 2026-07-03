@@ -5596,8 +5596,12 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
             // build — its MQ kernels are excluded from the source and DK=512
             // has no MQ decode dispatch path, so the second compile would be
             // pure waste (and another OOM risk).
+            // MQ_GQA=8 at DK>=256 always OOMs the X1 shader compiler (err=-6);
+            // skip on X1E (dispatch falls back to q1_split). X2 builds it fine.
+            const bool skip_g8 = fa_decode_only ||
+                (dk >= 256 && backend_ctx->adreno_gen == ADRENO_GPU_GEN::X1E);
             const std::string opts_g8 = opts + " -D MQ_GQA=8 -D MQ_NSG=3 -D MQ_NSG_SPLIT=3";
-            cl_program prog_g8 = fa_decode_only ? nullptr : build_program_from_source_ex(
+            cl_program prog_g8 = skip_g8 ? nullptr : build_program_from_source_ex(
                 backend_ctx->context, backend_ctx->device, src.c_str(), opts_g8,
                 /*fatal=*/false, "fa f32_f16 MQ_GQA=8", /*bin_size=*/0, backend_ctx->queue);
             if (prog_g8) {
