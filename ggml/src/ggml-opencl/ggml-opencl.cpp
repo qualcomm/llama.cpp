@@ -31,6 +31,8 @@ typedef const void * (*get_adreno_bin_kernel_func_t)(
 
 #include <CL/cl.h>
 
+#include "cl-program-cache.h"
+
 #include <inttypes.h>
 #include <string.h>
 
@@ -1333,7 +1335,25 @@ inline std::string read_file(const std::string &path) {
 // queue to drain in-flight ops holding driver host-heap, then rebuild. Mirrors the
 // proven set_tensor/alloc clFinish-retry pattern. Real source errors (e.g.
 // CL_BUILD_PROGRAM_FAILURE) are NOT retried. nullptr → no retry (legacy behavior).
+// On-disk program-binary cache (opt-in via GGML_OPENCL_KERNEL_CACHE_DIR).
+// File-static so it transparently covers BOTH the eager load_cl_kernels path
+// and the lazy FA build_program_from_source_ex path without threading state
+// through every caller. Set once at backend init.
+static cl_program_cache_state g_cl_program_cache;
+
 static cl_program build_program_from_source_ex(cl_context ctx, cl_device_id dev, const char* program_buffer, const std::string &compile_opts, bool fatal, const char *tag = nullptr, size_t bin_size = 0, cl_command_queue retry_queue = nullptr) {
+    // Source compiles only (bin_size==0). Precompiled-binary loads (ILA) have
+    // their own path and are not source-cached. A cache hit returns a fully
+    // built program and skips the online compiler entirely — which is exactly
+    // what saves the big DK>=256 FA programs on repeat runs (they only reach
+    // this cache once they're small enough to compile the first time).
+    if (bin_size == 0) {
+        cl_program p_cached = cl_program_cache_try_load(g_cl_program_cache, ctx, dev, program_buffer, compile_opts);
+        if (p_cached != nullptr) {
+            if (tag) GGML_LOG_INFO("ggml_opencl: loaded %s from program cache\n", tag);
+            return p_cached;
+        }
+    }
     if (tag) GGML_LOG_INFO("ggml_opencl: compiling %s\n", tag);
     cl_program p;
     char *program_log;
@@ -1362,6 +1382,9 @@ static cl_program build_program_from_source_ex(cl_context ctx, cl_device_id dev,
 
         err = clBuildProgram(p, 0, NULL, compile_opts.c_str(), NULL, NULL);
         if (err == CL_SUCCESS) {
+            if (bin_size == 0) {
+                cl_program_cache_try_save(g_cl_program_cache, p, dev, program_buffer, compile_opts);
+            }
             return p;
         }
 
@@ -6386,6 +6409,11 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
 
     // A local ref of cl_device_id for convenience
     cl_device_id device = backend_ctx->device;
+
+    // Initialise the on-disk program-binary cache (opt-in via
+    // GGML_OPENCL_KERNEL_CACHE_DIR; a no-op when unset). Must precede any
+    // build_program_from_source_ex call (load_cl_kernels + lazy FA).
+    g_cl_program_cache = cl_program_cache_init(device);
 
     ggml_cl_version platform_version = get_opencl_platform_version(dev_ctx->platform);
     ggml_cl_version opencl_c_version = get_opencl_c_version(platform_version, device);
