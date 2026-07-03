@@ -301,20 +301,46 @@ static std::string opts_preview(const std::string & opts, size_t n = 120) {
     return opts.substr(0, n) + "...";
 }
 
+// Running cache tally (diagnostic; plain ints — a benign race in the rare
+// multi-threaded lazy-compile case at worst miscounts by one).
+static int g_cache_hits = 0, g_cache_misses = 0, g_cache_saves = 0;
+
+// Debug trace goes straight to stderr, NOT through GGML_LOG_*: llama-cli /
+// llama-bench filter INFO (and, on some Adreno drivers, WARN too), which made
+// the previous log-based trace invisible. Redirect stderr to a file to record
+// a full HIT/MISS/SAVE trail for a run.
+static void cache_debug_line(const char * kind, const std::string & key,
+                             const char * source, const std::string & opts) {
+    if (!cache_debug_enabled()) return;
+    fprintf(stderr, "ggml_opencl: cache %-4s [h=%d m=%d s=%d] key=%s src=%zuB opts='%s'\n",
+            kind, g_cache_hits, g_cache_misses, g_cache_saves,
+            key.substr(0, 16).c_str(), strlen(source), opts_preview(opts).c_str());
+    fflush(stderr);
+}
+
 cl_program_cache_state cl_program_cache_init(cl_device_id device) {
     cl_program_cache_state st;
 
+    // DEFAULT-ON. The cache is opt-OUT, not opt-in:
+    //   unset / empty / "1" / "default"        → platform default dir (below)
+    //   "0" / "off" / "none" / "disable(d)"     → disabled
+    //   any other value                         → used verbatim as the cache path
     const char * env = std::getenv("GGML_OPENCL_KERNEL_CACHE_DIR");
-    if (!env || !*env) {
-        return st;  // disabled
+    if (env && (!std::strcmp(env, "0")    || !std::strcmp(env, "off")  ||
+                !std::strcmp(env, "none") || !std::strcmp(env, "disable") ||
+                !std::strcmp(env, "disabled"))) {
+        if (cache_debug_enabled()) {
+            fprintf(stderr, "ggml_opencl: kernel cache disabled by GGML_OPENCL_KERNEL_CACHE_DIR=%s\n", env);
+            fflush(stderr);
+        }
+        return st;  // explicit opt-out
     }
 
     std::string dir;
-    // "1" or "default" → pick the platform default; else use the env path verbatim.
-    if (std::strcmp(env, "1") == 0 || std::strcmp(env, "default") == 0) {
-        dir = default_cache_dir();
+    if (!env || !*env || !std::strcmp(env, "1") || !std::strcmp(env, "default")) {
+        dir = default_cache_dir();   // default-on
     } else {
-        dir = env;
+        dir = env;                   // explicit path
     }
 
     if (!make_dir_recursive(dir)) {
@@ -325,6 +351,11 @@ cl_program_cache_state cl_program_cache_init(cl_device_id device) {
     st.dir        = dir;
     st.key_suffix = compute_key_suffix(device);
     GGML_LOG_INFO("ggml_opencl: kernel cache enabled at '%s'\n", st.dir.c_str());
+    if (cache_debug_enabled()) {
+        fprintf(stderr, "ggml_opencl: kernel cache enabled at '%s' "
+                        "(GGML_OPENCL_KERNEL_CACHE_DIR=off to disable)\n", st.dir.c_str());
+        fflush(stderr);
+    }
     return st;
 }
 
@@ -342,11 +373,8 @@ cl_program cl_program_cache_try_load(
 
     std::vector<uint8_t> file;
     if (!read_all(path, file)) {
-        if (cache_debug_enabled()) {
-            GGML_LOG_INFO("ggml_opencl: cache MISS  key=%s src_bytes=%zu opts='%s'\n",
-                key.substr(0, 16).c_str(), strlen(source),
-                opts_preview(compile_opts).c_str());
-        }
+        ++g_cache_misses;
+        cache_debug_line("MISS", key, source, compile_opts);
         return nullptr;
     }
     if (file.size() < 16 || std::memcmp(file.data(), MAGIC, 8) != 0) return nullptr;
@@ -373,11 +401,8 @@ cl_program cl_program_cache_try_load(
         clReleaseProgram(p);
         return nullptr;
     }
-    if (cache_debug_enabled()) {
-        GGML_LOG_INFO("ggml_opencl: cache HIT   key=%s src_bytes=%zu opts='%s'\n",
-            key.substr(0, 16).c_str(), strlen(source),
-            opts_preview(compile_opts).c_str());
-    }
+    ++g_cache_hits;
+    cache_debug_line("HIT", key, source, compile_opts);
     return p;
 }
 
@@ -427,9 +452,8 @@ void cl_program_cache_try_save(
     const std::string path = state.dir + "/" + key + ".clbin";
     if (!write_atomic(path, file.data(), file.size())) {
         GGML_LOG_INFO("ggml_opencl: kernel cache: failed to write '%s'\n", path.c_str());
-    } else if (cache_debug_enabled()) {
-        GGML_LOG_INFO("ggml_opencl: cache SAVE  key=%s src_bytes=%zu opts='%s'\n",
-            key.substr(0, 16).c_str(), strlen(source),
-            opts_preview(compile_opts).c_str());
+    } else {
+        ++g_cache_saves;
+        cache_debug_line("SAVE", key, source, compile_opts);
     }
 }

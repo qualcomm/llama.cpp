@@ -2,10 +2,17 @@
 // expensive clBuildProgram-from-source step when a binary for the exact same
 // (source, compile options, device, driver, platform) was previously saved.
 //
-// Activation: set env var GGML_OPENCL_KERNEL_CACHE_DIR to a writable directory
-// path. If unset, cache is disabled and all functions are no-ops. If set but
-// the directory cannot be created/used, cache silently disables itself for the
-// rest of the process and the build path falls back to source compile.
+// Activation: DEFAULT-ON (opt-out) via GGML_OPENCL_KERNEL_CACHE_DIR:
+//   unset / empty / "1" / "default"      → platform default cache dir
+//                                          (%LOCALAPPDATA%\llama.cpp\cl-cache,
+//                                          ~/Library/Caches/…, $XDG_CACHE_HOME/…)
+//   "0" / "off" / "none" / "disable(d)"  → disabled (all functions no-op)
+//   any other value                      → used verbatim as the cache path
+// If the chosen directory cannot be created/used, the cache silently disables
+// itself for the process and the build path falls back to source compile.
+// GGML_OPENCL_KERNEL_CACHE_DEBUG=1 prints a HIT/MISS/SAVE trace (with a running
+// tally) straight to stderr — visible even in tools that filter INFO/WARN logs;
+// redirect stderr to record it.
 //
 // Cache key (SHA-256 hex):
 //   sha256(source_bytes || '\x00' ||
