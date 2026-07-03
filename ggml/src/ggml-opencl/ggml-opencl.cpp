@@ -9061,9 +9061,13 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                     return false;
                 }
                 if (q->ne[1] == 1) {
-                    // DK=512 decode is bandwidth-bound and slower on the GPU
-                    // than on the CPU; decline it here so it runs on the CPU.
-                    // Prefill (n_q > 1) stays on the GPU.
+                    // Decode (n_q==1): the DK=512 q1 GPU decode path is correct but
+                    // bandwidth-bound. Measured on X2-90 (gemma-4-26B-A4B, f16 KV,
+                    // tg128): GPU decode is 9% (d0) to 39% (d8192) SLOWER than running
+                    // these 5 global-attention layers' FA decode on CPU, and the gap
+                    // widens with context (full-attention KV grows unbounded). Decline
+                    // decode so the graph runs it on CPU; GPU prefill (n_q>1) is kept
+                    // below (prefill is compute-bound and wins on GPU).
                     return false;
                 } else {
                     // prefill, BM-tile in its own FA_PREFILL_ONLY program
