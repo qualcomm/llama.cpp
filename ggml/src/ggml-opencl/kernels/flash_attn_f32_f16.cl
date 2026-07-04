@@ -1925,6 +1925,11 @@ __kernel void flash_attn_f32_f16_q1_vec_mq_split(
 #ifndef FA_CL_C
 #define FA_CL_C 8
 #endif
+
+// The lane striping requires DK/DV to divide evenly across the cluster;
+// otherwise (e.g. DK=40 with FA_CL_C=16 -> zero-size arrays) compile the
+// kernel out — host soft-create falls back silently.
+#if (DK_VEC % FA_CL_C) == 0 && (DV_VEC % FA_CL_C) == 0
 #define FA_CL_NCL (Q1_WG_SIZE / FA_CL_C)   // clusters (position streams) per subgroup
 #define FA_CL_DK  (DK_VEC / FA_CL_C)       // half4s of K per lane per row
 #define FA_CL_DV  (DV_VEC / FA_CL_C)       // float4s of o_acc per lane per head
@@ -2216,6 +2221,7 @@ __kernel void flash_attn_f32_f16_q1_vec_mq_split_c8(
     }
 }
 
+#endif  // DK_VEC/DV_VEC divisible by FA_CL_C
 #endif  // HAS_SUBGROUP_SHUFFLE (q1_vec_mq_split_c8)
 
 // K-image variant of _q1_vec_mq_split.

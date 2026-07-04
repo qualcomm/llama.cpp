@@ -1187,9 +1187,28 @@ __kernel void flash_attn_f32_q4_0_q1_vec_mq_split(
     }
 }
 
+// ---------------------------------------------------------------------------
 // flash_attn_f32_q4_0_q1_vec_mq_split_c8 — cluster-parallel variant of the MQ
-// split, port of flash_attn_f32_f16_q1_vec_mq_split_c8
-// Requires dp4a + subgroup shuffles
+// split above (structural port of flash_attn_f32_f16_q1_vec_mq_split_c8; see
+// notes/asus-x2-fa-decode-roofline-20260704.md). The subgroup is split into
+// FA_CL_NCL clusters of FA_CL_C lanes; each cluster owns its own KV position
+// stream with private per-cluster online-softmax state, so FA_CL_NCL K rows
+// are in flight per subgroup instead of one. Primary target: gpt-oss-class
+// DK=DV=64 / GQA=8 / q4_0 KV decode, where the baseline q1_split path is
+// dequant-ALU-bound (~31 GFLOPS vs 111 f16 on the same shape) AND pays
+// per-Q-head KV re-reads.
+//   - dp4a K dot: lane lic covers quartets {lic + FA_CL_C*i}; per-block
+//     -8*q_sum bias is attributed to lane_in_block==0 exactly as in the
+//     baseline (each block has one such lane inside the cluster).
+//   - cluster-reduce via sub_group_shuffle_xor (steps < FA_CL_C stay inside
+//     the cluster); merge stage 1 = cross-cluster shuffles, stage 2 = the
+//     baseline cross-subgroup LDS merge (same partial format -> the FD merge
+//     kernel's sinks handling applies unchanged).
+//   - uniform trip count + clamped row address + FA_M_INIT tail scores keep
+//     every shuffle convergent.
+// Requires dp4a + subgroup shuffles; compiled out otherwise (dispatch falls
+// back to the baseline kernels).
+// ---------------------------------------------------------------------------
 
 #if defined(FA_HAVE_INT_DOT) && defined(HAS_SUBGROUP_SHUFFLE)
 
@@ -1203,13 +1222,7 @@ __kernel void flash_attn_f32_q4_0_q1_vec_mq_split(
 #define FA_CL_DKQ  (DK_VEC / FA_CL_C)       // K quartets per lane per row
 #define FA_CL_DVQ  (DV_VEC / FA_CL_C)       // V quartets (o_acc float4s) per lane per head
 
-#ifdef FA_C8_NO_SG_PIN
-#define FA_C8_SG_ATTR_Q4
-#else
-#define FA_C8_SG_ATTR_Q4 REQD_SUBGROUP_SIZE_64
-#endif
-
-FA_C8_SG_ATTR_Q4
+REQD_SUBGROUP_SIZE_64
 __kernel void flash_attn_f32_q4_0_q1_vec_mq_split_c8(
     const global void * q_void, ulong q_offset,
     const global void * k_void, ulong k_offset,
