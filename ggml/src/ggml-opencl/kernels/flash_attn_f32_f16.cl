@@ -1934,7 +1934,19 @@ __kernel void flash_attn_f32_f16_q1_vec_mq_split(
 #define FA_CL_DK  (DK_VEC / FA_CL_C)       // half4s of K per lane per row
 #define FA_CL_DV  (DV_VEC / FA_CL_C)       // float4s of o_acc per lane per head
 
-REQD_SUBGROUP_SIZE_64
+// FA_C8_NO_SG_PIN (host passes it on Adreno X1E): the explicit "half"
+// sub-group attribute routes this fp16-heavy kernel to a slow fallback
+// codegen path on the X1 compiler — hp-hamoa measured -20/-23% WITH the pin
+// vs +17/+56% WITHOUT (tg@d8k/16k), correctness clean, because the 64*NSG
+// launch geometry already yields sg=64 there. X2 KEEPS the pin: its driver
+// picks a 128-wide wave without it and miscompiles full-subgroup reduces.
+#ifdef FA_C8_NO_SG_PIN
+#define FA_C8_SG_ATTR
+#else
+#define FA_C8_SG_ATTR REQD_SUBGROUP_SIZE_64
+#endif
+
+FA_C8_SG_ATTR
 __kernel void flash_attn_f32_f16_q1_vec_mq_split_c8(
     const global void * q_void, ulong q_offset,
     const global void * k_void, ulong k_offset,

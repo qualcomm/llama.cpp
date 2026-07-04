@@ -5172,8 +5172,12 @@ static std::string ggml_opencl_fa_compile_opts(ggml_backend_opencl_context * bac
             ? " -D cl_qcom_subgroup_shuffle=1"
             : " -D cl_khr_subgroup_shuffle=1";
     }
-    // X1E drops the explicit sub-group size pin on the c8 kernels, compiler
-    // routes the fp16-heavy kernel to a slow variant with explicit subgroup size
+    // X1E drops the explicit sub-group pin on the c8 kernels: the X1 compiler
+    // routes the fp16-heavy kernel to a slow fallback variant WITH the pin
+    // (-20/-23% tg) and is correct without it (the 64*NSG launch geometry
+    // already yields sg=64 there); removing it flips X1 to +17/+56%
+    // (hp-hamoa, 2026-07-04). X2 KEEPS the pin — its driver picks a 128-wide
+    // wave without it and miscompiles full-subgroup reduces.
     if (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X1E) {
         opts += " -D FA_C8_NO_SG_PIN";
     }
