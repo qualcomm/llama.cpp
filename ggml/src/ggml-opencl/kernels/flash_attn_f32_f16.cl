@@ -52,6 +52,41 @@
 #define CONVERT_KV_ACC4(x) convert_float4(x)
 #define CONVERT_O_DATA4(x) (x)
 
+// FA_Q_HALF: store the register-resident Q (q_priv) in half instead of float.
+// Motivation: the DK=DV=64 non-causal ViT prefill FA is memory/occupancy-bound
+// (K/V re-read per query block), and per-thread register footprint caps the
+// resident-wave count. Q is a bounded activation, so rounding it to half costs
+// negligible accuracy while halving q_priv's register bytes; the dot itself
+// still runs in float (q converted back), so the arithmetic is unchanged.
+// Default OFF -> byte-identical to the original float path.
+#ifdef FA_Q_HALF
+#define Q_PRIV_TYPE4      half4
+#define Q_PRIV_TO_ACC4(x) convert_float4(x)
+#define CONVERT_Q_STORE4(x) convert_half4(x)
+#else
+#define Q_PRIV_TYPE4      ACC_TYPE4
+#define Q_PRIV_TO_ACC4(x) (x)
+#define CONVERT_Q_STORE4(x) CONVERT_Q_ACC4(x)
+#endif
+
+// FA_O_HALF: store the online-softmax output accumulator o_acc in half. o_acc is
+// the LARGEST per-thread register consumer of the tile kernel (SPLIT_DV_VEC
+// float4s), so on the occupancy/register-bound ViT prefill FA, halving it frees
+// the most registers -> more resident waves. Each online step still computes in
+// float (O_LD4 loads to float4, O_ST4 rounds the result back to half), so only
+// the STORED accumulator is half; the running rescale keeps values bounded.
+// Applies to the tile kernel only; the q1-family decode kernels keep float o_acc.
+// Default OFF -> byte-identical to the original float path.
+#ifdef FA_O_HALF
+#define O_ACC_TYPE4 half4
+#define O_LD4(x)    convert_float4(x)
+#define O_ST4(x)    convert_half4(x)
+#else
+#define O_ACC_TYPE4 ACC_TYPE4
+#define O_LD4(x)    (x)
+#define O_ST4(x)    (x)
+#endif
+
 #define DK_VEC (DK/4)
 #define DV_VEC (DV/4)
 
@@ -196,26 +231,26 @@ __kernel void FA_TILE_NAME(
         blk_base = blk + (((mask_batch_idx * mask_ne2) + mask_head_idx) * n_q_blocks + block_q_idx) * n_kv_blocks;
     }
 
-    ACC_TYPE4 q_priv[SPLIT_DK_VEC];
+    Q_PRIV_TYPE4 q_priv[SPLIT_DK_VEC];
     const int dk_off = split_idx * SPLIT_DK_VEC;
     if (query_valid) {
         const ulong q_row_offset = batch_idx * q_nb3 + head_idx * q_nb2 + my_query_row * q_nb1;
         const global Q_DATA_TYPE4* q_ptr = (const global Q_DATA_TYPE4*)(q_base + q_row_offset);
         FA_UNROLL
         for (int i = 0; i < SPLIT_DK_VEC; ++i) {
-            q_priv[i] = CONVERT_Q_ACC4(q_ptr[dk_off + i]);
+            q_priv[i] = CONVERT_Q_STORE4(q_ptr[dk_off + i]);
         }
     } else {
         FA_UNROLL
         for (int i = 0; i < SPLIT_DK_VEC; ++i) {
-            q_priv[i] = (ACC_TYPE4)(0.0f);
+            q_priv[i] = (Q_PRIV_TYPE4)(0.0f);
         }
     }
 
-    ACC_TYPE4 o_acc[SPLIT_DV_VEC];
+    O_ACC_TYPE4 o_acc[SPLIT_DV_VEC];
     FA_UNROLL
     for (int i = 0; i < SPLIT_DV_VEC; ++i) {
-        o_acc[i] = (ACC_TYPE4)(0.0f);
+        o_acc[i] = (O_ACC_TYPE4)(0.0f);
     }
 
     ACC_TYPE m_i = FA_M_INIT;
@@ -303,7 +338,7 @@ __kernel void FA_TILE_NAME(
                 ACC_TYPE partial1 = 0.0f;
                 FA_UNROLL
                 for (int k = 0; k < SPLIT_DK_VEC; k++) {
-                    const ACC_TYPE4 qk = q_priv[k];
+                    const ACC_TYPE4 qk = Q_PRIV_TO_ACC4(q_priv[k]);
                     ACC_TYPE4 dot0 = qk * CONVERT_KV_ACC4(l_k[j  ][dk_off + k]);
                     ACC_TYPE4 dot1 = qk * CONVERT_KV_ACC4(l_k[j+1][dk_off + k]);
                     partial0 += dot0.s0 + dot0.s1 + dot0.s2 + dot0.s3;
@@ -356,9 +391,9 @@ __kernel void FA_TILE_NAME(
 
                 FA_UNROLL
                 for (int i = 0; i < SPLIT_DV_VEC; ++i) {
-                    o_acc[i] = o_acc[i] * sp
+                    o_acc[i] = O_ST4(O_LD4(o_acc[i]) * sp
                              + p0 * CONVERT_KV_ACC4(l_v[j  ][dv_off + i])
-                             + p1 * CONVERT_KV_ACC4(l_v[j+1][dv_off + i]);
+                             + p1 * CONVERT_KV_ACC4(l_v[j+1][dv_off + i]));
                 }
                 l_i = l_i * sp + p0 + p1;
                 m_i = m_new;
@@ -371,7 +406,7 @@ __kernel void FA_TILE_NAME(
             ACC_TYPE4 dot_acc = (ACC_TYPE4)(0.0f);
             FA_UNROLL
             for (int k = 0; k < SPLIT_DK_VEC; k++) {
-                dot_acc = mad(q_priv[k], CONVERT_KV_ACC4(l_k[j][dk_off + k]), dot_acc);
+                dot_acc = mad(Q_PRIV_TO_ACC4(q_priv[k]), CONVERT_KV_ACC4(l_k[j][dk_off + k]), dot_acc);
             }
             local_partial[j][tid] =
                 dot_acc.s0 + dot_acc.s1 + dot_acc.s2 + dot_acc.s3;
@@ -438,13 +473,13 @@ __kernel void FA_TILE_NAME(
             const int dv_off = split_idx * SPLIT_DV_VEC;
             FA_UNROLL
             for (int i = 0; i < SPLIT_DV_VEC; ++i) {
-                o_acc[i] *= sp_block;
+                o_acc[i] = O_ST4(O_LD4(o_acc[i]) * sp_block);
             }
             for (int j = 0; j < BLOCK_N; ++j) {
                 const ACC_TYPE p = local_p[q_lane][j];
                 FA_UNROLL
                 for (int i = 0; i < SPLIT_DV_VEC; ++i) {
-                    o_acc[i] = mad(p, CONVERT_KV_ACC4(l_v[j][dv_off + i]), o_acc[i]);
+                    o_acc[i] = O_ST4(mad(p, CONVERT_KV_ACC4(l_v[j][dv_off + i]), O_LD4(o_acc[i])));
                 }
             }
         }
@@ -463,7 +498,7 @@ __kernel void FA_TILE_NAME(
                 ACC_TYPE4 dot_acc3 = (ACC_TYPE4)(0.0f);
                 FA_UNROLL
                 for (int k = 0; k < DK_VEC; k++) {
-                    const ACC_TYPE4 qk = q_priv[k];
+                    const ACC_TYPE4 qk = Q_PRIV_TO_ACC4(q_priv[k]);
                     dot_acc0 = mad(qk, CONVERT_KV_ACC4(l_k[j][k]),   dot_acc0);
                     dot_acc1 = mad(qk, CONVERT_KV_ACC4(l_k[j+1][k]), dot_acc1);
                     dot_acc2 = mad(qk, CONVERT_KV_ACC4(l_k[j+2][k]), dot_acc2);
@@ -521,11 +556,11 @@ __kernel void FA_TILE_NAME(
 
                 FA_UNROLL
                 for (int i = 0; i < DV_VEC; ++i) {
-                    o_acc[i] = mad(p3, CONVERT_KV_ACC4(l_v[j+3][i]),
+                    o_acc[i] = O_ST4(mad(p3, CONVERT_KV_ACC4(l_v[j+3][i]),
                                mad(p2, CONVERT_KV_ACC4(l_v[j+2][i]),
                                mad(p1, CONVERT_KV_ACC4(l_v[j+1][i]),
                                mad(p0, CONVERT_KV_ACC4(l_v[j][i]),
-                               o_acc[i] * scale_prev))));
+                               O_LD4(o_acc[i]) * scale_prev)))));
                 }
                 l_i = l_i * scale_prev + p0 + p1 + p2 + p3;
                 m_i = m_new;
@@ -556,7 +591,7 @@ __kernel void FA_TILE_NAME(
         if (l_inv > 0.0f) {
             FA_UNROLL
             for (int i = 0; i < SPLIT_DV_VEC; ++i) {
-                o_row[dv_off + i] = CONVERT_O_DATA4(o_acc[i] * sinks_sp * l_inv);
+                o_row[dv_off + i] = CONVERT_O_DATA4(O_LD4(o_acc[i]) * sinks_sp * l_inv);
             }
         } else {
             FA_UNROLL
@@ -590,7 +625,7 @@ __kernel void FA_TILE_NAME(
         if (l_inv > 0.0f) {
             FA_UNROLL
             for (int i = 0; i < SPLIT_DV_VEC; ++i) {
-                o_row[dv_off + i] = CONVERT_O_DATA4(o_acc[i] * sinks_sp * l_inv);
+                o_row[dv_off + i] = CONVERT_O_DATA4(O_LD4(o_acc[i]) * sinks_sp * l_inv);
             }
         } else {
             FA_UNROLL
@@ -609,7 +644,7 @@ __kernel void FA_TILE_NAME(
             const ACC_TYPE scale_o = exp(m_i - m_final);
             FA_UNROLL
             for (int i = 0; i < DV_VEC; ++i) {
-                o_acc[i] *= scale_o;
+                o_acc[i] = O_ST4(O_LD4(o_acc[i]) * scale_o);
             }
 
             l_i = l_i * exp(m_i - m_final) + exp(m_sink - m_final);
@@ -621,7 +656,7 @@ __kernel void FA_TILE_NAME(
             const ACC_TYPE l_inv = 1.0f / l_i;
             FA_UNROLL
             for (int i = 0; i < DV_VEC; ++i) {
-                o_row[i] = CONVERT_O_DATA4(o_acc[i] * l_inv);
+                o_row[i] = CONVERT_O_DATA4(O_LD4(o_acc[i]) * l_inv);
             }
         } else {
             FA_UNROLL
