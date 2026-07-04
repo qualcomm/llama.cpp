@@ -524,6 +524,16 @@ struct ggml_opencl_fa_kernels {
     // GGML_OPENCL_FA_F16_MQ_DK128=1 (+ GGML_OPENCL_FA_K_IMG=1 for the K-image
     // path; without K_IMG, the non-image f32_f16_q1_vec_mq_split fires).
     std::map<std::pair<int, int>, cl_kernel> f32_f16_q1_vec_mq_split_k_img;
+    // Cluster-parallel decode (FA_CL_C lanes per KV position, FA_CL_NCL
+    // independent position streams per subgroup — the roofline kernel).
+    // Opt-in via GGML_OPENCL_FA_C8=1.
+    std::map<std::pair<int, int>, cl_kernel> f32_f16_q1_vec_mq_split_c8;
+    std::map<std::pair<int, int>, cl_kernel> f32_f16_q1_vec_mq_split_g8_c8;
+    // NSG_SPLIT=2 specializations (WG=128): the c8 kernel's register footprint
+    // caps its per-kernel WG at 128 on X2, below the stock 256/192 requirement.
+    // 2 subgroups × FA_CL_NCL streams still gives 16 in-flight rows per WG.
+    std::map<std::pair<int, int>, cl_kernel> f32_f16_q1_vec_mq_split_c8_ns2;
+    std::map<std::pair<int, int>, cl_kernel> f32_f16_q1_vec_mq_split_g8_c8_ns2;
     // Alternative decode FA: 1 WG per (q_idx, q_head) with a __local K/V tile +
     // pure __local tree-reduce. Compiled only at DK=DV=128. Opt-in.
     std::map<std::pair<int, int>, cl_kernel> f32_f16_q1_local_tile;
@@ -5579,7 +5589,8 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
                     clReleaseKernel(k_q1_vec_mq_split_k_img);
                 }
             }
-            // Cluster-parallel decode variant
+            // Cluster-parallel decode variant (opt-in, GGML_OPENCL_FA_C8=1).
+            // Best-effort: needs subgroup shuffles + WG cap headroom.
             cl_kernel k_q1_vec_mq_split_c8 = clCreateKernel(prog, "flash_attn_f32_f16_q1_vec_mq_split_c8", &err);
             if (err == CL_SUCCESS) {
                 if (ggml_opencl_fa_kernel_fits_wg(backend_ctx, k_q1_vec_mq_split_c8, 256,
@@ -5641,7 +5652,10 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
             // FA_MQ_ONLY builds a minimal program with ONLY the 3 vec_mq kernels,
             // so the whole-file compile no longer OOMs the Adreno compiler at
             // DK>=256 (the full MQ_GQA=8 program did — err=-6 on X1 and X2 alike).
-            const std::string opts_g8 = opts + " -D MQ_GQA=8 -D MQ_NSG=3 -D MQ_NSG_SPLIT=3 -D FA_MQ_ONLY";
+            // FA_CL_C=16 for the g8 program: MQ_GQA=8 doubles the c8 kernel's
+            // per-lane o_acc, so widen the cluster (16 lanes/position, 4
+            // streams) to keep it at 256B/lane and inside the 192-thread cap.
+            const std::string opts_g8 = opts + " -D MQ_GQA=8 -D MQ_NSG=3 -D MQ_NSG_SPLIT=3 -D FA_MQ_ONLY -D FA_CL_C=16";
             cl_program prog_g8 = fa_decode_only ? nullptr : build_program_from_source_ex(
                 backend_ctx->context, backend_ctx->device, src.c_str(), opts_g8,
                 /*fatal=*/false, "fa f32_f16 MQ_GQA=8", /*bin_size=*/0, backend_ctx->queue);
@@ -5681,6 +5695,18 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
                         clReleaseKernel(k_q1_vec_mq_split_g8_k_img);
                     }
                 }
+                // Cluster-parallel decode, MQ_GQA=8 / FA_CL_C=16 specialization.
+                // Opt-in, GGML_OPENCL_FA_C8=1.
+                cl_kernel k_q1_vec_mq_split_g8_c8 = clCreateKernel(prog_g8, "flash_attn_f32_f16_q1_vec_mq_split_c8", &err);
+                if (err == CL_SUCCESS) {
+                    if (ggml_opencl_fa_kernel_fits_wg(backend_ctx, k_q1_vec_mq_split_g8_c8, mq_g8_required_wg,
+                                                      "flash_attn_f32_f16_q1_vec_mq_split_c8 (g8)", dk, dv)) {
+                        backend_ctx->fa.f32_f16_q1_vec_mq_split_g8_c8[{dk, dv}] = k_q1_vec_mq_split_g8_c8;
+                        ggml_opencl_log_fa_kernel_spill(backend_ctx, k_q1_vec_mq_split_g8_c8, "flash_attn_f32_f16_q1_vec_mq_split_g8_c8", dk, dv);
+                    } else {
+                        clReleaseKernel(k_q1_vec_mq_split_g8_c8);
+                    }
+                }
                 // Hybrid local-tile + MQ_GQA=8. WG=64 (1 subgroup); the
                 // per-kernel WG cap should stay >= 64 even at high reg pressure.
                 if (dk == 128 && dv == 128) {
@@ -5709,7 +5735,7 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
                 const std::string opts_c8_ns2 = opts + " -D FA_MQ_ONLY -D MQ_GQA=4 -D MQ_NSG=2 -D MQ_NSG_SPLIT=2" + opts_cl_c_gqa4;
                 cl_program prog_c8 = build_program_from_source_ex(
                     backend_ctx->context, backend_ctx->device, src.c_str(), opts_c8_ns2,
-                    /*fatal=*/false, "fa f32_f16 c8 NSG2", backend_ctx->queue);
+                    /*fatal=*/false, "fa f32_f16 c8 NSG2", /*bin_size=*/0, backend_ctx->queue);
                 if (prog_c8) {
                     cl_kernel k_c8 = clCreateKernel(prog_c8, "flash_attn_f32_f16_q1_vec_mq_split_c8", &err);
                     if (err == CL_SUCCESS) {
@@ -5732,7 +5758,7 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
                 const std::string opts_g8_c32 = opts + " -D FA_MQ_ONLY -D MQ_GQA=8 -D MQ_NSG=2 -D MQ_NSG_SPLIT=2 -D FA_CL_C=32";
                 cl_program prog_g8_c32 = build_program_from_source_ex(
                     backend_ctx->context, backend_ctx->device, src.c_str(), opts_g8_c32,
-                    /*fatal=*/false, "fa f32_f16 c32 g8 d256 NSG2", backend_ctx->queue);
+                    /*fatal=*/false, "fa f32_f16 c32 g8 d256 NSG2", /*bin_size=*/0, backend_ctx->queue);
                 if (prog_g8_c32) {
                     cl_kernel k_g8_c32 = clCreateKernel(prog_g8_c32, "flash_attn_f32_f16_q1_vec_mq_split_c8", &err);
                     if (err == CL_SUCCESS) {
@@ -17871,6 +17897,23 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
             // K-image variant: same MQ_G8 path but K bound via image1d_buffer_t.
             // Opt-in via GGML_OPENCL_FA_K_IMG=1; targets the long-context FA
             // K-read bandwidth bottleneck.
+            // Cluster-parallel A/B for the g8 class (opt-in; checked before
+            // K_IMG so the two experiments don't compose silently). Stock
+            // program (WG 192) first, NSG_SPLIT=2 fallback (WG 128) otherwise.
+            } else if (is_mixed && gqa_ratio_dispatch == 8 &&
+                d_head_q == 128 && d_head_v == 128 &&
+                getenv("GGML_OPENCL_FA_C8") != NULL &&
+                getenv("GGML_OPENCL_FA_C8")[0] != '0' &&
+                (backend_ctx->fa.f32_f16_q1_vec_mq_split_g8_c8.count(dk_dv) > 0 ||
+                 backend_ctx->fa.f32_f16_q1_vec_mq_split_g8_c8_ns2.count(dk_dv) > 0)) {
+                if (backend_ctx->fa.f32_f16_q1_vec_mq_split_g8_c8.count(dk_dv) > 0) {
+                    fd_k_split = backend_ctx->fa.f32_f16_q1_vec_mq_split_g8_c8.at(dk_dv);
+                    fd_mq_wg   = 192;
+                } else {
+                    fd_k_split = backend_ctx->fa.f32_f16_q1_vec_mq_split_g8_c8_ns2.at(dk_dv);
+                    fd_mq_wg   = 128;
+                }
+                use_fd_mq  = true;
             } else if (is_mixed && gqa_ratio_dispatch == 8 &&
                 d_head_q == 128 && d_head_v == 128 &&
                 getenv("GGML_OPENCL_FA_K_IMG") != NULL &&
