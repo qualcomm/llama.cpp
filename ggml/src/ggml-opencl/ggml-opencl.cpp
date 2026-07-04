@@ -5102,6 +5102,25 @@ static std::string ggml_opencl_fa_compile_opts(ggml_backend_opencl_context * bac
     if (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X1E) {
         opts += " -D FA_C8_NO_SG_PIN";
     }
+    // Opt-in: store register-resident Q in half to free registers and lift
+    // resident-wave count on the memory/occupancy-bound small-head-dim prefill
+    // FA (e.g. DK=DV=64 non-causal ViT attention). Byte-identical when unset.
+    static const bool q_half = []{
+        const char * e = std::getenv("GGML_OPENCL_FA_Q_HALF");
+        return e && e[0] && e[0] != '0';
+    }();
+    if (q_half) {
+        opts += " -D FA_Q_HALF";
+    }
+    // Companion register lever: store the online output accumulator o_acc in half
+    // (the tile kernel's largest per-thread register user). Opt-in.
+    static const bool o_half = []{
+        const char * e = std::getenv("GGML_OPENCL_FA_O_HALF");
+        return e && e[0] && e[0] != '0';
+    }();
+    if (o_half) {
+        opts += " -D FA_O_HALF";
+    }
     return opts;
 }
 
@@ -6117,10 +6136,49 @@ static std::vector<ggml_backend_device> ggml_opencl_probe_devices(ggml_backend_r
 
     cl_int                err;
     cl_context            shared_context;
-    cl_context_properties properties[] = { (intptr_t) CL_CONTEXT_PLATFORM, (intptr_t) default_device->platform->id, 0 };
+
+    // cl_qcom_perf_hint (not in the public headers). Requesting HIGH biases the
+    // driver toward performance clocks over power — meaningful for agent loops
+    // that fire many encodes back-to-back on a throttling mobile GPU. Added as a
+    // context property only when the device advertises the extension (else
+    // clCreateContext rejects the unknown property). Env override:
+    // GGML_OPENCL_PERF_HINT = high|normal|low|off (default high when supported).
+#ifndef CL_CONTEXT_PERF_HINT_QCOM
+#define CL_CONTEXT_PERF_HINT_QCOM 0x40C2
+#define CL_PERF_HINT_HIGH_QCOM    0x40C3
+#define CL_PERF_HINT_NORMAL_QCOM  0x40C4
+#define CL_PERF_HINT_LOW_QCOM     0x40C5
+#endif
+    std::vector<cl_context_properties> properties = {
+        (cl_context_properties) CL_CONTEXT_PLATFORM, (cl_context_properties) default_device->platform->id
+    };
+    {
+        size_t ext_size = 0;
+        clGetDeviceInfo(default_device->id, CL_DEVICE_EXTENSIONS, 0, NULL, &ext_size);
+        std::string exts(ext_size, '\0');
+        if (ext_size) {
+            clGetDeviceInfo(default_device->id, CL_DEVICE_EXTENSIONS, ext_size, &exts[0], NULL);
+        }
+        bool enable = exts.find("cl_qcom_perf_hint") != std::string::npos;
+        cl_context_properties hint = CL_PERF_HINT_HIGH_QCOM;
+        const char * ph = getenv("GGML_OPENCL_PERF_HINT");
+        if (ph) {
+            if (!strcmp(ph, "off") || !strcmp(ph, "0")) enable = false;
+            else if (!strcmp(ph, "normal")) hint = CL_PERF_HINT_NORMAL_QCOM;
+            else if (!strcmp(ph, "low"))    hint = CL_PERF_HINT_LOW_QCOM;
+        }
+        if (enable) {
+            properties.push_back(CL_CONTEXT_PERF_HINT_QCOM);
+            properties.push_back(hint);
+            GGML_LOG_INFO("ggml_opencl: Qualcomm perf hint enabled (%s)\n",
+                hint == CL_PERF_HINT_HIGH_QCOM ? "high" :
+                hint == CL_PERF_HINT_NORMAL_QCOM ? "normal" : "low");
+        }
+    }
+    properties.push_back(0);
 
     CL_CHECK(
-        (shared_context = clCreateContext(properties, device_ids.size(), device_ids.data(), NULL, NULL, &err), err));
+        (shared_context = clCreateContext(properties.data(), device_ids.size(), device_ids.data(), NULL, NULL, &err), err));
 
     for (auto dev = candidate_devices, dev_end = candidate_devices + n_candidate_devices; dev != dev_end; dev++) {
         GGML_LOG_INFO("\nggml_opencl: device: '%s (%s)'\n", dev->name, dev->version);
