@@ -536,6 +536,9 @@ struct ggml_opencl_fa_kernels {
     // MQ_GQA=4 default, _g8 second compile for the Qwen3-30B-A3B class.
     std::map<std::pair<int, int>, cl_kernel> f32_q4_0_q1_vec_mq_split;
     std::map<std::pair<int, int>, cl_kernel> f32_q4_0_q1_vec_mq_split_g8;
+    // Cluster-parallel q4_0 decode (MQ_GQA=8 / NSG_SPLIT=2 / WG=128 program;
+    // gpt-oss DK=64 class). Opt-in via GGML_OPENCL_FA_C8=1.
+    std::map<std::pair<int, int>, cl_kernel> f32_q4_0_q1_vec_mq_split_g8_c8;
     std::map<std::pair<int, int>, cl_kernel> f32_q4_0;
     std::map<std::pair<int, int>, cl_kernel> f32_q4_0_split;
     std::map<std::pair<int, int>, int>       f32_q4_0_split_wg_size;
@@ -5824,7 +5827,7 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
                 cl_program prog_c8_gqa4 = build_program_from_source_ex(
                     backend_ctx->context, backend_ctx->device, src.c_str(), opts_c8_gqa4,
                     /*fatal=*/false, is_q8 ? "fa q8_0 c8 GQA4 NSG2" : "fa q4_0 c8 GQA4 NSG2",
-                    backend_ctx->queue);
+                    /*bin_size=*/0, backend_ctx->queue);
                 if (prog_c8_gqa4) {
                     cl_kernel k_c8_gqa4 = clCreateKernel(prog_c8_gqa4, name_c8_gqa4.c_str(), &err);
                     if (err == CL_SUCCESS) {
@@ -5844,7 +5847,7 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
                 const std::string opts_c8 = opts + " -D MQ_GQA=8 -D MQ_NSG=2 -D MQ_NSG_SPLIT=2";
                 cl_program prog_c8 = build_program_from_source_ex(
                     backend_ctx->context, backend_ctx->device, src.c_str(), opts_c8,
-                    /*fatal=*/false, "fa q4_0 c8 NSG2", backend_ctx->queue);
+                    /*fatal=*/false, "fa q4_0 c8 NSG2", /*bin_size=*/0, backend_ctx->queue);
                 if (prog_c8) {
                     cl_kernel k_c8 = clCreateKernel(prog_c8, "flash_attn_f32_q4_0_q1_vec_mq_split_c8", &err);
                     if (err == CL_SUCCESS) {
