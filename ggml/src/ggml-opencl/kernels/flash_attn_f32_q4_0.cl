@@ -1218,7 +1218,15 @@ __kernel void flash_attn_f32_q4_0_q1_vec_mq_split(
 #define FA_CL_DKQ  (DK_VEC / FA_CL_C)       // K quartets per lane per row
 #define FA_CL_DVQ  (DV_VEC / FA_CL_C)       // V quartets (o_acc float4s) per lane per head
 
-REQD_SUBGROUP_SIZE_64
+// FA_C8_NO_SG_PIN: X1E drops the explicit sub-group pin (slow-codegen
+// landmine on the X1 compiler); X2 keeps it. See the f16 c8 note.
+#ifdef FA_C8_NO_SG_PIN
+#define FA_C8_SG_ATTR_Q4
+#else
+#define FA_C8_SG_ATTR_Q4 REQD_SUBGROUP_SIZE_64
+#endif
+
+FA_C8_SG_ATTR_Q4
 __kernel void flash_attn_f32_q4_0_q1_vec_mq_split_c8(
     const global void * q_void, ulong q_offset,
     const global void * k_void, ulong k_offset,
