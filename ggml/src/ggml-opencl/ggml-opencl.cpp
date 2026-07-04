@@ -17804,11 +17804,17 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
 
         const bool nq_in_vec_range = (n_q >= 1) && (n_q <= N_MAX_VEC_NQ);
         const bool nq1_only        = (n_q == 1);
-
-        // Cluster-parallel decode default on for Adreno X2E/X1E
+        // Cluster-parallel decode (c8): DEFAULT-ON for Adreno X2E/X1E on the
+        // f16 DK=128 MQ paths — validated e2e wins: X2E +35-62% (Qwen3-4B/8B,
+        // Mistral-7B, Llama-3-8B GQA4; Qwen3-30B g8 +19-22%), X1E +20-55%
+        // (pin-gated via FA_C8_NO_SG_PIN; hp-hamoa re-validation 2026-07-04).
+        // GGML_OPENCL_FA_C8 overrides both ways (0 = off, non-0 = on — the
+        // explicit-on also enables the opt-in q4_0 DK=64 path, which stays
+        // default-off: measured -6..-10% on gpt-oss). Other Adreno gens and
+        // Intel stay default-off pending validation.
         static const int c8_env_state = []{
             const char * e = getenv("GGML_OPENCL_FA_C8");
-            if (e == NULL || e[0] == '\0') { return -1; }
+            if (e == NULL || e[0] == '\0') return -1;
             return (e[0] != '0') ? 1 : 0;
         }();
         const bool c8_default_on = backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E ||
@@ -17904,13 +17910,12 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
             // K-image variant: same MQ_G8 path but K bound via image1d_buffer_t.
             // Opt-in via GGML_OPENCL_FA_K_IMG=1; targets the long-context FA
             // K-read bandwidth bottleneck.
-            // Cluster-parallel A/B for the g8 class (opt-in; checked before
-            // K_IMG so the two experiments don't compose silently). Stock
-            // program (WG 192) first, NSG_SPLIT=2 fallback (WG 128) otherwise.
+            // Cluster-parallel decode for the g8 class (default-on X2E/X1E;
+            // checked before K_IMG so the experiments don't compose silently).
+            // Stock program (WG 192) first, NSG_SPLIT=2 fallback (WG 128).
             } else if (is_mixed && gqa_ratio_dispatch == 8 &&
                 d_head_q == 128 && d_head_v == 128 &&
-                getenv("GGML_OPENCL_FA_C8") != NULL &&
-                getenv("GGML_OPENCL_FA_C8")[0] != '0' &&
+                c8_f16_on &&
                 (backend_ctx->fa.f32_f16_q1_vec_mq_split_g8_c8.count(dk_dv) > 0 ||
                  backend_ctx->fa.f32_f16_q1_vec_mq_split_g8_c8_ns2.count(dk_dv) > 0)) {
                 if (backend_ctx->fa.f32_f16_q1_vec_mq_split_g8_c8.count(dk_dv) > 0) {
