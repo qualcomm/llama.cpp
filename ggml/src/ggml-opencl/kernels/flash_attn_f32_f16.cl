@@ -1852,7 +1852,8 @@ __kernel void flash_attn_f32_f16_q1_vec_mq_split(
 #else
 // REQD_FA_SG pins the HW subgroup on Intel (intel_reqd_sub_group_size(FA_SG),
 // host passes -D FA_SG=32); empty on Adreno. REQD_SUBGROUP_SIZE_64 pins 64 on
-// Adreno; empty on Intel.
+// Adreno; empty on Intel. So both vendors get the correct pin for the c8
+// cluster lane-math + full-subgroup reduces. dell-x64-hq Intel c8 enable.
 #define FA_C8_SG_ATTR REQD_FA_SG REQD_SUBGROUP_SIZE_64
 #endif
 
