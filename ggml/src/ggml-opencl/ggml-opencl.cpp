@@ -504,6 +504,11 @@ struct ggml_opencl_fa_kernels {
     // 2 subgroups × FA_CL_NCL streams still gives 16 in-flight rows per WG.
     std::map<std::pair<int, int>, cl_kernel> f32_f16_q1_vec_mq_split_c8_ns2;
     std::map<std::pair<int, int>, cl_kernel> f32_f16_q1_vec_mq_split_g8_c8_ns2;
+    // FA_CL_C=32 / MQ_GQA=8 / NSG_SPLIT=2 specialization for the DK=DV=256
+    // GQA=8 class (Qwen3.5/3.6-35B-A3B: 16 Q heads, 2 KV heads). o_acc =
+    // DV_VEC/32 × 8 = 128B/lane (in budget); the baseline fa1 path for this
+    // shape has NO MQ/FD at all and pays an 8× KV re-read per Q head.
+    std::map<std::pair<int, int>, cl_kernel> f32_f16_q1_vec_mq_split_g8_c32;
     // Alternative decode FA: 1 WG per (q_idx, q_head) with a __local K/V tile +
     // pure __local tree-reduce. Compiled only at DK=DV=128. Opt-in.
     std::map<std::pair<int, int>, cl_kernel> f32_f16_q1_local_tile;
@@ -5703,7 +5708,9 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
                     clReleaseProgram(prog_c8);
                 }
             }
-            // FA_CL_C=32 g8 program for the DK=DV=256 GQA=8
+            // FA_CL_C=32 g8 program for the DK=DV=256 GQA=8 class
+            // (Qwen3.5/3.6-35B-A3B). Only compiled at (256,256): the wide
+            // cluster is pointless at DK=128 and underflows below DV=128.
             if (!fa_decode_only && backend_ctx->has_subgroup_shuffle &&
                 dk == 256 && dv == 256) {
                 const std::string opts_g8_c32 = opts + " -D FA_MQ_ONLY -D MQ_GQA=8 -D MQ_NSG=2 -D MQ_NSG_SPLIT=2 -D FA_CL_C=32";
@@ -17715,6 +17722,17 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
             // K-image variant: same MQ_G8 path but K bound via image1d_buffer_t.
             // Opt-in via GGML_OPENCL_FA_K_IMG=1; targets the long-context FA
             // K-read bandwidth bottleneck.
+            // Cluster-parallel decode, DK=DV=256 GQA=8 class (Qwen3.5/3.6-35B
+            // MoE: 16 Q heads / 2 KV heads). FA_CL_C=32 program; STRICT
+            // opt-in pending A/B — the baseline fa1 path for this shape has
+            // no MQ/FD at all (falls to q1_vec with an 8x KV re-read).
+            } else if (nq1_only && is_mixed && gqa_ratio_dispatch == 8 &&
+                d_head_q == 256 && d_head_v == 256 &&
+                c8_env_state == 1 &&
+                backend_ctx->fa.f32_f16_q1_vec_mq_split_g8_c32.count(dk_dv) > 0) {
+                fd_k_split = backend_ctx->fa.f32_f16_q1_vec_mq_split_g8_c32.at(dk_dv);
+                use_fd_mq  = true;
+                fd_mq_wg   = 128;
             // Cluster-parallel decode for the g8 class (default-on X2E/X1E;
             // checked before K_IMG so the experiments don't compose silently).
             // Stock program (WG 192) first, NSG_SPLIT=2 fallback (WG 128).
