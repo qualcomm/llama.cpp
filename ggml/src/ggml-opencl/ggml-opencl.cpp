@@ -1104,6 +1104,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mv_q5_1_f32_flat;
     cl_kernel kernel_mul_mv_q4_K_f32;
     cl_kernel kernel_mul_mv_q4_K_f32_flat;
+    cl_kernel kernel_mul_mv_q4_K_f32_flat_ndst8 = nullptr; // small-m variant (Intel): N_DST=8 raises subgroup count/occupancy
     cl_kernel kernel_mul_mv_q5_K_f32;
     cl_kernel kernel_mul_mv_q5_K_f32_flat;
     cl_kernel kernel_mul_mv_q6_K_f32;
@@ -2292,6 +2293,20 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         CL_CHECK((backend_ctx->kernel_mul_mv_q4_K_f32_flat = clCreateKernel(prog, "kernel_mul_mv_q4_K_f32_flat", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
+
+        // Small-m variant (Intel only): N_DST=8 doubles the subgroup count so
+        // small-output GEMVs (K/V-cur m=1024 = 64 subgroups @ N_DST=16 = ~10% of
+        // the 672 HW threads) fill more of the GPU. Measured +38% at m=1024 vs
+        // N_DST=16; the big FFN GEMVs (m>=4096, already ~90% occupancy) keep
+        // N_DST=16 for activation reuse. Dispatch picks by ne01.
+        if (backend_ctx->gpu_family == INTEL) {
+            const std::string q4k_ndst8_opts = compile_opts + " -D Q4K_N_DST_OVERRIDE=8";
+            cl_program prog8 =
+                build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), q4k_ndst8_opts);
+            backend_ctx->kernel_mul_mv_q4_K_f32_flat_ndst8 = clCreateKernel(prog8, "kernel_mul_mv_q4_K_f32_flat", &err);
+            if (err != CL_SUCCESS) backend_ctx->kernel_mul_mv_q4_K_f32_flat_ndst8 = nullptr;
+            CL_CHECK(clReleaseProgram(prog8));
+        }
     }
 
     // mul_mv_q5_0_f32
@@ -25950,6 +25965,13 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 nth0 = 16;
                 nth1 = 1;
                 ndst = 16; // 8->16 rows per subgroup — matches N_DST in mul_mv_q4_k_f32_flat.cl (32 spills)
+                // Small-output GEMV (e.g. K/V-cur m=1024): N_DST=16 gives only
+                // ne01/16 subgroups, starving the EUs. Switch to the N_DST=8
+                // variant below ~2560 rows to double occupancy (+38% at m=1024).
+                if (ne01 <= 2560 && backend_ctx->kernel_mul_mv_q4_K_f32_flat_ndst8 != nullptr) {
+                    kernel = backend_ctx->kernel_mul_mv_q4_K_f32_flat_ndst8;
+                    ndst = 8;
+                }
             } else if (backend_ctx->gpu_family == ADRENO) {
                 nth0 = 64;
                 nth1 = 2;
