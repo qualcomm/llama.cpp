@@ -9676,6 +9676,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32,   8, 1, 1, false, false, /*K=*/3));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  16, 2, 1, false, false, /*K=*/4));
 
+    // Long-KV decode FA at the production DK=128 GQA=4 shape with f16 and
+    // quantized (q4_0/q8_0) KV. Exercises the flash-decoding MQ/cluster
+    // kernels that only fire at n_kv >= 2048 — without these, that path has
+    // no correctness gate in this suite (kv=4099 exercises non-multiple tails).
+    for (int kv : { 4096, 4099 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    }
+
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging
     test_cases.emplace_back(new test_llama(2, true));

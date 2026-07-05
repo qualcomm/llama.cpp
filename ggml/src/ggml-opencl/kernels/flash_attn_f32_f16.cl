@@ -1943,7 +1943,10 @@ __kernel void flash_attn_f32_f16_q1_vec_mq_split(
 #ifdef FA_C8_NO_SG_PIN
 #define FA_C8_SG_ATTR
 #else
-#define FA_C8_SG_ATTR REQD_SUBGROUP_SIZE_64
+// REQD_FA_SG pins 32-wide on Intel (empty on Adreno); REQD_SUBGROUP_SIZE_64
+// pins the qcom half-wave (empty on Intel) — each vendor gets exactly its
+// pin (dell-x64 Intel enablement, 2026-07-04; c8 +119% per-op on Xe-LP).
+#define FA_C8_SG_ATTR REQD_FA_SG REQD_SUBGROUP_SIZE_64
 #endif
 
 FA_C8_SG_ATTR
