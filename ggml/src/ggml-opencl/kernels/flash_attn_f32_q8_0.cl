@@ -994,8 +994,20 @@ __kernel void flash_attn_f32_q8_0_q1_vec_mq_split(
     }
 }
 
+// ---------------------------------------------------------------------------
 // flash_attn_f32_q8_0_q1_vec_mq_split_c8 — cluster-parallel variant of the MQ
-// split above, port of the f16/q4_0 c8 kernels
+// split above (structural port of the f16/q4_0 c8 kernels; see
+// notes/asus-x2-fa-decode-roofline-20260704.md). FA_CL_NCL clusters of
+// FA_CL_C lanes per subgroup, each cluster owning its own KV position stream
+// with private online-softmax state. K/V dequant stays the float
+// dequant_q8_0_lane path of the baseline (no dp4a staging needed for q8_0
+// decode). Uniform trip count + clamped row + FA_M_INIT tail keeps shuffles
+// convergent. Same partial format -> unchanged FD merge (sinks included).
+// Target: GQA=4 DK=DV=128 quantized-KV long-context decode (o_acc =
+// DV_VEC/8 x 4 heads = 256B/lane — inside the register budget; the GQA=8
+// variant of this kernel would be 512B/lane = the measured -71% spill
+// pathology, so no g8 program is compiled for it).
+// ---------------------------------------------------------------------------
 
 #ifdef HAS_SUBGROUP_SHUFFLE
 
@@ -1009,6 +1021,8 @@ __kernel void flash_attn_f32_q8_0_q1_vec_mq_split(
 #define FA_CL_DKQ  (DK_VEC / FA_CL_C)       // K quartets per lane per row
 #define FA_CL_DVQ  (DV_VEC / FA_CL_C)       // V quartets (o_acc float4s) per lane per head
 
+// FA_C8_NO_SG_PIN: X1E drops the explicit sub-group pin (slow-codegen
+// landmine on the X1 compiler); X2 keeps it. See the f16 c8 note.
 #ifdef FA_C8_NO_SG_PIN
 #define FA_C8_SG_ATTR_Q8
 #else
