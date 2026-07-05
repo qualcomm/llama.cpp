@@ -18028,7 +18028,11 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
             }
         }
     }
-    // Intel cluster-parallel decode FA
+    // dell-x64-hq c8 port: Intel cluster-parallel decode FA (opt-in GGML_OPENCL_FA_C8=1).
+    // The MQ block above is gpu_family!=INTEL-gated; reach x2's c8 path here for Intel.
+    // Xe-LP q1_vec FA is 1.5-6% of the 74.5 GB/s streaming floor -> MLP-starved; c8's
+    // per-lane KV streams fill the pipe (+2x per-op, 16->33 GFLOPS @kv8-16k). f16 KV,
+    // DK=DV=128, GQA=4, n_q==1. WG: stock c8 = MQ_NSG(4)xFA_SG(32)=128; ns2 = 64.
     if (fd_k_split == NULL && backend_ctx->gpu_family == INTEL && n_q == 1 && !is_causal &&
         is_mixed && gqa_ratio_dispatch == 4 && d_head_q == 128 && d_head_v == 128 &&
         n_kv >= FD_MIN_N_KV &&
