@@ -553,6 +553,9 @@ struct ggml_opencl_fa_kernels {
     // _g8 second compile for the Qwen3-30B-A3B class (GQA=8).
     std::map<std::pair<int, int>, cl_kernel> f32_q8_0_q1_vec_mq_split;
     std::map<std::pair<int, int>, cl_kernel> f32_q8_0_q1_vec_mq_split_g8;
+    // Cluster-parallel q8_0 decode, GQA=4 / NSG_SPLIT=2 / WG=128 program
+    // (quant-KV long-context, dense GQA4 DK=128 class). Opt-in FA_C8=1.
+    std::map<std::pair<int, int>, cl_kernel> f32_q8_0_q1_vec_mq_split_c8;
     std::map<std::pair<int, int>, cl_kernel> f32_q8_0;               // prefill (baseline)
     std::map<std::pair<int, int>, cl_kernel> f32_q8_0_split;         // N_SPLIT>1 variant
     std::map<std::pair<int, int>, int>       f32_q8_0_split_wg_size;        // wg_size = bm*n_split
@@ -569,6 +572,9 @@ struct ggml_opencl_fa_kernels {
     // Cluster-parallel q4_0 decode (MQ_GQA=8 / NSG_SPLIT=2 / WG=128 program;
     // gpt-oss DK=64 class). Opt-in via GGML_OPENCL_FA_C8=1.
     std::map<std::pair<int, int>, cl_kernel> f32_q4_0_q1_vec_mq_split_g8_c8;
+    // Cluster-parallel q4_0 decode, GQA=4 / NSG_SPLIT=2 / WG=128 program
+    // (quant-KV long-context, dense GQA4 DK=128 class). Opt-in FA_C8=1.
+    std::map<std::pair<int, int>, cl_kernel> f32_q4_0_q1_vec_mq_split_c8;
     std::map<std::pair<int, int>, cl_kernel> f32_q4_0;
     std::map<std::pair<int, int>, cl_kernel> f32_q4_0_split;
     std::map<std::pair<int, int>, int>       f32_q4_0_split_wg_size;
@@ -17952,7 +17958,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
             } else if (nq1_only && is_q8_0 && gqa_ratio_dispatch == 4 &&
                 d_head_q == 128 && d_head_v == 128 &&
                 backend_ctx->fa.f32_q8_0_q1_vec_mq_split.count(dk_dv) > 0) {
-                // Cluster-parallel q8_0 GQA4
+                // Cluster-parallel q8_0 GQA4 (default-on X2E; measured +78/+100%).
                 if (c8_quant_on &&
                     backend_ctx->fa.f32_q8_0_q1_vec_mq_split_c8.count(dk_dv) > 0) {
                     fd_k_split = backend_ctx->fa.f32_q8_0_q1_vec_mq_split_c8.at(dk_dv);
@@ -17991,7 +17997,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
                 } else if (gqa_ratio_dispatch == 4 &&
                     d_head_q == 128 && d_head_v == 128 &&
                     backend_ctx->fa.f32_q4_0_q1_vec_mq_split.count(dk_dv) > 0) {
-                    // Cluster-parallel q4_0 GQA4
+                    // Cluster-parallel q4_0 GQA4 (default-on X2E; measured +89/+110%).
                     if (c8_quant_on &&
                         backend_ctx->fa.f32_q4_0_q1_vec_mq_split_c8.count(dk_dv) > 0) {
                         fd_k_split = backend_ctx->fa.f32_q4_0_q1_vec_mq_split_c8.at(dk_dv);
