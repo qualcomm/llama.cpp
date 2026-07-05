@@ -14378,10 +14378,31 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
                     : backend_ctx->fa.bn.at(dk_dv))
         : 0;
     // Pick split variant only when n_kv crosses the per-(dk,dv) threshold.
-    // the N_SPLIT>1 prefill tile reduces DK partials via subgroup shuffle,
-    // on Intel it uses the non-split BM tile and does not depend on subgroup size
+    // The N_SPLIT>1 prefill tile reduces DK partials via subgroup shuffle (64-wide
+    // on Adreno); on Intel the baseline is the non-split BM tile (per-query-row,
+    // one thread walks all n_kv serially -> the prefill analog of the decode-q1
+    // serialization). EXPERIMENT (GGML_OPENCL_FA_PREFILL_SPLIT=1): route Intel to
+    // the split tile too. The N_SPLIT lanes for a query are adjacent (split_idx =
+    // tid % N_SPLIT) and the shuffle_xor reduction is subgroup-relative, so with
+    // FA_SG=32 pinned the DK=128/N_SPLIT=2 reduction stays within one 32-wide
+    // subgroup -> correct. Mirrors the c8 decode transfer (Adreno-gated cooperative
+    // kernel + 32-wide pin). Default OFF pending A/B + correctness on Intel.
+    // Intel prefill FA: DEFAULT-ON N_SPLIT tile for DK=128 (opt-out GGML_OPENCL_FA_PREFILL_SPLIT=0).
+    // The Intel baseline was the non-split BM tile: one thread per query row walking
+    // all n_kv serially (the prefill analog of the decode-q1 serialization). The
+    // N_SPLIT=2 split tile cooperates 2 lanes/query on the DK dot via subgroup
+    // shuffle_xor — the 2 lanes are adjacent (split_idx = tid % N_SPLIT) and, with
+    // FA_SG=32 pinned, stay within one 32-wide subgroup, so the reduction is correct
+    // (test-backend-ops: hsk=128 matches the split-off 2565/2565 fail-set exactly).
+    // e2e (Qwen3-4B-Q4_K_M, dell-x64-hq Xe-LP, 2026-07-05): pp512 46->70 (+52%),
+    // pp512@d8192 4.4->28.6 (+6.5x, now 1.8x AHEAD of SYCL's 15.9). n_split>2 is a
+    // wash (68/68.6/68.9 short). DK=256 EXCLUDED: its N_SPLIT=16 config miscomputes
+    // on the 32-wide subgroup (84 hsk=256 FAILs), so it keeps the non-split BM tile.
+    static const char * intel_psplit_env = getenv("GGML_OPENCL_FA_PREFILL_SPLIT");
+    const bool intel_psplit_on = (intel_psplit_env == NULL || intel_psplit_env[0] != '0') &&
+                                 d_head_q == 128 && d_head_v == 128;
     const bool use_split_kernel = (n_q > 1 && is_mixed &&
-        backend_ctx->gpu_family != INTEL &&
+        (backend_ctx->gpu_family != INTEL || intel_psplit_on) &&
         backend_ctx->fa.f32_f16_split.count(dk_dv) > 0 &&
         n_kv >= backend_ctx->fa.f32_f16_split_nkv_threshold.at(dk_dv));
     const bool use_split_q8_0 = (use_native_q8_0 && backend_ctx->gpu_family != INTEL &&
