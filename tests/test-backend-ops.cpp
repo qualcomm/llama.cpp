@@ -9604,6 +9604,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // 32-wide-subgroup g8 reduction against the CPU reference.
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {8, 1}, 2048, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {8, 1}, 4096, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    // gqa=1 (MHA) DK=DV=128 f16-KV decode at n_kv>=2048 — exercises the Intel g1
+    // c8 (MQ_GQA=1 cluster-parallel) path that replaces the two-pass q1.
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {1, 1}, 2048, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {1, 1}, 4096, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
 
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));
