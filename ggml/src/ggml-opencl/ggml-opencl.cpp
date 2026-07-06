@@ -18934,6 +18934,24 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
             fd_mq_wg   = 64;
         }
     }
+    // Intel g8 (GQA=8) cluster-parallel decode FA — same c8 transfer as the GQA=4
+    // block above, widened to the Qwen2.5/Qwen3 GQA=8 DK=DV=128 f16-KV class (falls
+    // to the two-pass q1 otherwise). WG is the 32-wide-subgroup analog of Adreno's:
+    // stock g8 = MQ_NSG_SPLIT(3)*FA_SG(32)=96, ns2 = MQ_NSG_SPLIT(2)*32=64.
+    if (fd_k_split == NULL && backend_ctx->gpu_family == INTEL && n_q == 1 && !is_causal &&
+        is_mixed && gqa_ratio_dispatch == 8 && d_head_q == 128 && d_head_v == 128 &&
+        n_kv >= FD_MIN_N_KV && fa_c8_on &&
+        backend_ctx->fa.f32_merge.count(dk_dv) > 0) {
+        if (backend_ctx->fa.f32_f16_q1_vec_mq_split_g8_c8.count(dk_dv) > 0) {
+            fd_k_split = backend_ctx->fa.f32_f16_q1_vec_mq_split_g8_c8.at(dk_dv);
+            use_fd_mq  = true;
+            fd_mq_wg   = 96;
+        } else if (backend_ctx->fa.f32_f16_q1_vec_mq_split_g8_c8_ns2.count(dk_dv) > 0) {
+            fd_k_split = backend_ctx->fa.f32_f16_q1_vec_mq_split_g8_c8_ns2.at(dk_dv);
+            use_fd_mq  = true;
+            fd_mq_wg   = 64;
+        }
+    }
     if (fd_k_split == NULL &&
         n_q >= 1 && n_q <= fd_max_n_q && n_kv >= FD_MIN_N_KV && !is_causal &&
         // NB: DK=512 (Gemma-4 global) is intentionally NOT routed here. Measured
