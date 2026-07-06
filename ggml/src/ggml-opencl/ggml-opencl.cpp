@@ -822,6 +822,14 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mv_q4_K_f32;
     cl_kernel kernel_mul_mv_q4_K_f32_flat;
     cl_kernel kernel_mul_mv_q4_K_f32_flat_ndst8 = nullptr; // small-m variant (Intel): N_DST=8 raises subgroup count/occupancy
+    cl_kernel kernel_mul_mv_q4_k_q8_1 = nullptr;           // int8 q8_1 decode GEMV (Intel small-m, noshuffle weight)
+    cl_kernel kernel_quant_a_q8_1_i = nullptr;             // activation f32->q8_1 (Intel; Adreno's is behind USE_ADRENO_KERNELS)
+    // Persistent q8_1 activation scratch for the int8 decode GEMV — grown on demand
+    // to the largest K seen, reused across ops to avoid per-call clCreateBuffer churn.
+    cl_mem q4k_i8_qa = nullptr;   // int8 quants   [cap_k]
+    cl_mem q4k_i8_da = nullptr;   // per-block d   [cap_k/32]
+    cl_mem q4k_i8_sa = nullptr;   // per-block d*sum [cap_k/32]
+    int    q4k_i8_cap_k = 0;      // current scratch capacity in K elements
     cl_kernel kernel_mul_mv_q5_K_f32;
     cl_kernel kernel_mul_mv_q5_K_f32_flat;
     cl_kernel kernel_mul_mv_q6_K_f32;
@@ -1099,7 +1107,13 @@ struct ggml_backend_opencl_context {
             write_profiling_info();
             profiling_results.clear();
 #endif
-            // release pooled image1d_buffer views over KV cache layers.
+            // Release persistent q8_1 activation scratch (int8 decode GEMV).
+            if (q4k_i8_qa) { CL_CHECK(clReleaseMemObject(q4k_i8_qa)); q4k_i8_qa = nullptr; }
+            if (q4k_i8_da) { CL_CHECK(clReleaseMemObject(q4k_i8_da)); q4k_i8_da = nullptr; }
+            if (q4k_i8_sa) { CL_CHECK(clReleaseMemObject(q4k_i8_sa)); q4k_i8_sa = nullptr; }
+            q4k_i8_cap_k = 0;
+
+            // Release pooled image1d_buffer views over KV cache layers.
             for (auto & kv : kq_img_pool) {
                 if (kv.second.image)      { CL_CHECK(clReleaseMemObject(kv.second.image)); }
                 if (kv.second.sub_buffer) { CL_CHECK(clReleaseMemObject(kv.second.sub_buffer)); }
@@ -1787,6 +1801,39 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             if (err != CL_SUCCESS) backend_ctx->kernel_mul_mv_q4_K_f32_flat_ndst8 = nullptr;
             CL_CHECK(clReleaseProgram(prog8));
         }
+    }
+
+    // mul_mv_q4_k_q8_1 (int8 q8_1 decode GEMV, Intel small-m) — SYCL-style MMVQ.
+    if (backend_ctx->gpu_family == INTEL) {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src {
+            #include "mul_mv_q4_k_q8_1.cl.h"
+        };
+#else
+        const std::string kernel_src = read_file("mul_mv_q4_k_q8_1.cl");
+#endif
+        cl_program prog =
+            build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
+        backend_ctx->kernel_mul_mv_q4_k_q8_1 = clCreateKernel(prog, "kernel_mul_mv_q4_k_q8_1", &err);
+        if (err != CL_SUCCESS) backend_ctx->kernel_mul_mv_q4_k_q8_1 = nullptr;
+        CL_CHECK(clReleaseProgram(prog));
+
+        // Activation q8_1 quantizer (Intel; the Adreno one is behind USE_ADRENO_KERNELS).
+        {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+            const std::string qsrc {
+                #include "quant_a_q8_1.cl.h"
+            };
+#else
+            const std::string qsrc = read_file("quant_a_q8_1.cl");
+#endif
+            cl_program qprog =
+                build_program_from_source(backend_ctx->context, backend_ctx->device, qsrc.c_str(), compile_opts);
+            backend_ctx->kernel_quant_a_q8_1_i = clCreateKernel(qprog, "kernel_quant_a_q8_1", &err);
+            if (err != CL_SUCCESS) backend_ctx->kernel_quant_a_q8_1_i = nullptr;
+            CL_CHECK(clReleaseProgram(qprog));
+        }
+        GGML_LOG_CONT(".");
     }
 
     // mul_mv_q5_0_f32
@@ -6482,6 +6529,16 @@ struct ggml_tensor_extra_cl_q4_K {
     // Min
     cl_mem dm  = nullptr;
 
+    // Noshuffle (row-major, un-shuffled) copies for the int8 q8_1 decode GEMV
+    // (kernel_mul_mv_q4_k_q8_1). Populated at set_tensor for small-m Intel
+    // weights only; null otherwise. The flat q/s/d/dm above stay for the f32
+    // flat GEMV and the prefill mul_mm.
+    cl_mem q_ns_base = nullptr;   // single backing buffer; q/s/d/dm_ns are subbuffers of it
+    cl_mem q_ns  = nullptr;
+    cl_mem s_ns  = nullptr;
+    cl_mem d_ns  = nullptr;
+    cl_mem dm_ns = nullptr;
+
     ~ggml_tensor_extra_cl_q4_K() {
         reset();
     }
@@ -6507,6 +6564,11 @@ struct ggml_tensor_extra_cl_q4_K {
             CL_CHECK(clReleaseMemObject(q_img));
             q_img = nullptr;
         }
+        if (q_ns  != nullptr) { CL_CHECK(clReleaseMemObject(q_ns));  q_ns  = nullptr; }
+        if (s_ns  != nullptr) { CL_CHECK(clReleaseMemObject(s_ns));  s_ns  = nullptr; }
+        if (d_ns  != nullptr) { CL_CHECK(clReleaseMemObject(d_ns));  d_ns  = nullptr; }
+        if (dm_ns != nullptr) { CL_CHECK(clReleaseMemObject(dm_ns)); dm_ns = nullptr; }
+        if (q_ns_base != nullptr) { CL_CHECK(clReleaseMemObject(q_ns_base)); q_ns_base = nullptr; }
     }
 };
 
@@ -9028,6 +9090,63 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         cl_event evt;
         CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, &evt));
         CL_CHECK(clWaitForEvents(1, &evt));
+
+        // Intel small-m: also build a noshuffle (row-major, un-shuffled) copy for
+        // the int8 q8_1 decode GEMV (kernel_mul_mv_q4_k_q8_1). Only for small
+        // output dims (K/V-cur, ffn_out, attn_out — the occupancy-starved GEMVs);
+        // the big FFN GEMVs stay on the f32 flat path, so the extra weight copy is
+        // bounded. Reads the same source (data_device) before it is released.
+        static const bool q4k_int8_on = []{
+            const char * e = std::getenv("GGML_OPENCL_Q4K_INT8");
+            return e && e[0] && e[0] != '0';
+        }();
+        static const bool q4k_int8_noconv = std::getenv("GGML_OPENCL_Q4K_INT8_NOCONV") != nullptr;
+        // With persistent activation scratch (no per-op clCreateBuffer churn), int8
+        // wins at every eligible K on Xe-LP: all-K int8 gave +15.6% tg vs +6.5% when
+        // gated to K>=4096 (the churn, not the arithmetic, was the small-K penalty).
+        // Default KMIN=256 = "on for every eligible small-output-dim weight"; the
+        // GGML_OPENCL_Q4K_INT8_KMIN env still lets you raise the floor to experiment.
+        static const int64_t q4k_int8_kmin = []{
+            const char * e = std::getenv("GGML_OPENCL_Q4K_INT8_KMIN");
+            return (e && e[0]) ? (int64_t) atoll(e) : (int64_t) 256;
+        }();
+        if (q4k_int8_on && backend_ctx->gpu_family == INTEL &&
+            backend_ctx->kernel_mul_mv_q4_k_q8_1 != nullptr &&
+            tensor->ne[1] <= 2560 && (tensor->ne[0] % 256 == 0) && tensor->ne[0] >= q4k_int8_kmin) {
+            // One backing buffer + aligned subbuffers (matches ggml's flat scheme:
+            // many separate raw cl_mem wedge the NEO context; subbuffers of a single
+            // buffer do not). Layout: [q][s][d][dm], each aligned to mem_base_align.
+            const size_t al = backend_ctx->alignment;
+            const size_t off_q  = 0;
+            const size_t off_s  = align_to(off_q + size_q,  al);
+            const size_t off_d  = align_to(off_s + size_s,  al);
+            const size_t off_dm = align_to(off_d + size_d,  al);
+            const size_t ns_total = off_dm + size_dm;
+            extra->q_ns_base = clCreateBuffer(context, CL_MEM_READ_WRITE, ns_total, NULL, &err); CL_CHECK(err);
+            cl_buffer_region rq  = { off_q,  size_q  };
+            cl_buffer_region rs  = { off_s,  size_s  };
+            cl_buffer_region rd  = { off_d,  size_d  };
+            cl_buffer_region rdm = { off_dm, size_dm };
+            extra->q_ns  = clCreateSubBuffer(extra->q_ns_base, CL_MEM_READ_WRITE, CL_BUFFER_CREATE_TYPE_REGION, &rq,  &err); CL_CHECK(err);
+            extra->s_ns  = clCreateSubBuffer(extra->q_ns_base, CL_MEM_READ_WRITE, CL_BUFFER_CREATE_TYPE_REGION, &rs,  &err); CL_CHECK(err);
+            extra->d_ns  = clCreateSubBuffer(extra->q_ns_base, CL_MEM_READ_WRITE, CL_BUFFER_CREATE_TYPE_REGION, &rd,  &err); CL_CHECK(err);
+            extra->dm_ns = clCreateSubBuffer(extra->q_ns_base, CL_MEM_READ_WRITE, CL_BUFFER_CREATE_TYPE_REGION, &rdm, &err); CL_CHECK(err);
+
+            cl_kernel nk = backend_ctx->kernel_convert_block_q4_K_noshuffle;
+            CL_CHECK(clSetKernelArg(nk, 0, sizeof(cl_mem),   &data_device));
+            CL_CHECK(clSetKernelArg(nk, 1, sizeof(cl_mem),   &extra->q_ns));
+            CL_CHECK(clSetKernelArg(nk, 2, sizeof(cl_mem),   &extra->s_ns));
+            CL_CHECK(clSetKernelArg(nk, 3, sizeof(cl_mem),   &extra->d_ns));
+            CL_CHECK(clSetKernelArg(nk, 4, sizeof(cl_mem),   &extra->dm_ns));
+            CL_CHECK(clSetKernelArg(nk, 5, sizeof(cl_uchar), &mask_0F));
+            CL_CHECK(clSetKernelArg(nk, 6, sizeof(cl_uchar), &mask_F0));
+            if (!q4k_int8_noconv) {
+                cl_event nevt;
+                CL_CHECK(clEnqueueNDRangeKernel(queue, nk, 3, NULL, global_work_size, NULL, 0, NULL, &nevt));
+                CL_CHECK(clWaitForEvents(1, &nevt));
+            }
+        }
+
         CL_CHECK(clReleaseMemObject(data_device));
 
         tensor->extra  = extra;
@@ -20072,6 +20191,77 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         case GGML_TYPE_Q3_K:
         case GGML_TYPE_Q4_K: {
 #ifdef GGML_OPENCL_SOA_Q
+            // Intel int8 q8_1 decode GEMV (SYCL-style MMVQ): quantize the single
+            // activation column to q8_1, then 1-row-per-subgroup int8 dot against
+            // the noshuffle weight. Only when the noshuffle copy exists (small-m
+            // weights) and this is a pure n_q==1 decode. kernel=nullptr sentinel
+            // makes the shared Q4_K launch below skip.
+            if (backend_ctx->gpu_family == INTEL && ne11 == 1 && ne12 == 1 && ne13 == 1 &&
+                extra0_q4_K->q_ns != nullptr && backend_ctx->kernel_mul_mv_q4_k_q8_1 != nullptr &&
+                backend_ctx->kernel_quant_a_q8_1_i != nullptr) {
+                // q_ns is only populated when GGML_OPENCL_Q4K_INT8 is set (load path),
+                // so this whole branch is opt-in / default-off.
+                cl_int err = CL_SUCCESS;
+                cl_buffer_region areg;
+                areg.origin = (size_t) offset1;
+                areg.size   = (size_t) ne00 * sizeof(float);
+                cl_mem a_sub = clCreateSubBuffer(extra1->data_device, 0, CL_BUFFER_CREATE_TYPE_REGION, &areg, &err);
+                CL_CHECK(err);
+
+                const size_t n_blocks = (size_t) ne00 / 32;
+                // Persistent activation scratch, grown on demand to the largest K seen.
+                // Reused across decode ops so the common case does zero allocation.
+                if (backend_ctx->q4k_i8_cap_k < ne00) {
+                    if (backend_ctx->q4k_i8_qa) CL_CHECK(clReleaseMemObject(backend_ctx->q4k_i8_qa));
+                    if (backend_ctx->q4k_i8_da) CL_CHECK(clReleaseMemObject(backend_ctx->q4k_i8_da));
+                    if (backend_ctx->q4k_i8_sa) CL_CHECK(clReleaseMemObject(backend_ctx->q4k_i8_sa));
+                    backend_ctx->q4k_i8_qa = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE, (size_t) ne00 * sizeof(cl_char),   NULL, &err); CL_CHECK(err);
+                    backend_ctx->q4k_i8_da = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE, n_blocks * sizeof(cl_half),        NULL, &err); CL_CHECK(err);
+                    backend_ctx->q4k_i8_sa = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE, n_blocks * sizeof(cl_half),        NULL, &err); CL_CHECK(err);
+                    backend_ctx->q4k_i8_cap_k = (int) ne00;
+                }
+                cl_mem qa = backend_ctx->q4k_i8_qa;
+                cl_mem da = backend_ctx->q4k_i8_da;
+                cl_mem sa = backend_ctx->q4k_i8_sa;
+
+                cl_int tb = (cl_int) n_blocks;
+                cl_kernel qk = backend_ctx->kernel_quant_a_q8_1_i;
+                CL_CHECK(clSetKernelArg(qk, 0, sizeof(cl_mem), &a_sub));
+                CL_CHECK(clSetKernelArg(qk, 1, sizeof(cl_mem), &qa));
+                CL_CHECK(clSetKernelArg(qk, 2, sizeof(cl_mem), &da));
+                CL_CHECK(clSetKernelArg(qk, 3, sizeof(cl_mem), &sa));
+                CL_CHECK(clSetKernelArg(qk, 4, sizeof(cl_int), &tb));
+                size_t q_local[1]  = { 64 };
+                size_t q_global[1] = { ((n_blocks + 63) / 64) * 64 };
+                backend_ctx->enqueue_ndrange_kernel(qk, 1, q_global, q_local, dst);
+
+                cl_kernel ik = backend_ctx->kernel_mul_mv_q4_k_q8_1;
+                int ai = 0;
+                CL_CHECK(clSetKernelArg(ik, ai++, sizeof(cl_mem), &extra0_q4_K->q_ns));
+                CL_CHECK(clSetKernelArg(ik, ai++, sizeof(cl_mem), &extra0_q4_K->s_ns));
+                CL_CHECK(clSetKernelArg(ik, ai++, sizeof(cl_mem), &extra0_q4_K->d_ns));
+                CL_CHECK(clSetKernelArg(ik, ai++, sizeof(cl_mem), &extra0_q4_K->dm_ns));
+                CL_CHECK(clSetKernelArg(ik, ai++, sizeof(cl_mem), &qa));
+                CL_CHECK(clSetKernelArg(ik, ai++, sizeof(cl_mem), &da));
+                CL_CHECK(clSetKernelArg(ik, ai++, sizeof(cl_mem), &sa));
+                CL_CHECK(clSetKernelArg(ik, ai++, sizeof(cl_mem), &extrad->data_device));
+                CL_CHECK(clSetKernelArg(ik, ai++, sizeof(int),    &offsetd));
+                CL_CHECK(clSetKernelArg(ik, ai++, sizeof(int),    &ne01));
+                CL_CHECK(clSetKernelArg(ik, ai++, sizeof(int),    &ne00));
+                size_t g_local[1]  = { 16 };
+                size_t g_global[1] = { (size_t) ne01 * 16 };
+                backend_ctx->enqueue_ndrange_kernel(ik, 1, g_global, g_local, dst);
+
+                // qa/da/sa persist in backend_ctx; only the activation view is per-call.
+                CL_CHECK(clReleaseMemObject(a_sub));
+                // Done: return outright rather than falling through to the shared
+                // terminal dispatch chain. A kernel=nullptr sentinel is unsafe there —
+                // the chain's `else if (kernel == backend_ctx->kernel_mul_mat_f16_*)`
+                // comparisons match when that member is also null, dispatching a null
+                // kernel (CL_INVALID_KERNEL).
+                return;
+            }
+
             kernel = backend_ctx->kernel_mul_mv_q4_K_f32_flat;
 
             if (backend_ctx->gpu_family == INTEL) {
@@ -20389,7 +20579,8 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         size_t local_work_size[] = {(size_t)nth0, (size_t)nth1, 1};
 
         backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
-    } else if (src0t == GGML_TYPE_Q4_K) {
+    } else if (src0t == GGML_TYPE_Q4_K && kernel != nullptr) {
+        // kernel == nullptr => the int8 q8_1 decode GEMV already launched above.
         size_t global_work_size[] = {(size_t)(ne01+ndst*nth1-1)/(ndst*nth1)*nth0, (size_t)ne11*nth1, (size_t)ne12*ne13};
         size_t local_work_size[] = {(size_t)nth0, (size_t)nth1, 1};
 

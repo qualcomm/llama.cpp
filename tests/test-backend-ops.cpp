@@ -8625,6 +8625,30 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 512, 5120, {128, 1}, {1, 1}));
 #endif
 
+    // Adreno trans-weight GEMM at real Qwen3.5-4B ssm_out (GatedDeltaNet output proj):
+    // q5_K, m=2560, K=4096, run by the chunked GDN path at N in {128,170} with ne12>1.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32, 2560, 128, 4096, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32, 2560, 128, 4096, {1, 1}, {4, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32, 2560, 170, 4096, {1, 1}, {3, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 2560, 128, 4096, {1, 1}, {4, 1}));
+    // Qwen3-4B decode (n=1) GEMV shapes — the real per-token matmuls (Intel/SYCL study).
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 9728, 1, 2560, {1, 1}, {1, 1})); // ffn up/gate
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 2560, 1, 9728, {1, 1}, {1, 1})); // ffn down
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 4096, 1, 2560, {1, 1}, {1, 1})); // Qcur
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 2560, 1, 4096, {1, 1}, {1, 1})); // attn out
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 1024, 1, 2560, {1, 1}, {1, 1})); // K/V cur
+    // q8_0 GDN ssm_out broadcast (Qwen3.5-9B-UD / Qwen3.6-35B): the q8_0 Adreno GEMM/GEMV
+    // must honor src1/dst view_offs so the per-slice broadcast iteration is correct.
+    // N=1 exercises the GEMV offsetd path; N>1 the GEMM path.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2560,   1, 4096, {1, 1}, {4, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2560, 128, 4096, {1, 1}, {4, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2560, 170, 4096, {1, 1}, {3, 1}));
+    // q4_0 GDN ssm_out broadcast: same trans-weight dequant-to-f16 reroute as q8_0
+    // (large weights are stored transposed; the reroute must restore them correctly).
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 2560,   1, 4096, {1, 1}, {4, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 2560, 128, 4096, {1, 1}, {4, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 2560, 170, 4096, {1, 1}, {3, 1}));
+
     for (ggml_type type_a : all_types) {
         for (int i = 1; i < 10; ++i) {
             test_cases.emplace_back(new test_mul_mat(type_a,    GGML_TYPE_F32, 16,  i, 256, { 1,  1}, {1, 1}));
@@ -9614,6 +9638,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 16416, 1, 128, {8,  1}, {4, 1}, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 128, 1, 16416, {8,  1}, {4, 1}, {0, 1, 2, 3}, 2*16416));
+
+    // q6_K long-vocab lm_head GEMV (decode, dot-bound): m=vocab, n=1, k=hidden.
+    // Exercises the tiled q6_K dp4a decode path (use_q6k_tiled; image-qa candidate).
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 151936, 1, 2560, {1, 1}, {1, 1}));
+
+    // Qwen3-4B decode (n=1) GEMV shapes — the real per-token matmuls (Intel/SYCL study).
+    // int8-path shapes (m<=2560) FIRST so they run before any flat case (debug).
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 1024, 1, 2560, {1, 1}, {1, 1})); // K/V cur (int8)
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 2560, 1, 9728, {1, 1}, {1, 1})); // ffn down (int8)
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 2560, 1, 4096, {1, 1}, {1, 1})); // attn out (int8)
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 9728, 1, 2560, {1, 1}, {1, 1})); // ffn up/gate (flat)
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 4096, 1, 2560, {1, 1}, {1, 1})); // Qcur (flat)
 
     // FWHT tests
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 128, 1, 128));
