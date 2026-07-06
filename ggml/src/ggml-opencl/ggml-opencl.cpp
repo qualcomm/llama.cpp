@@ -16649,6 +16649,11 @@ static cl_mem ggml_cl_mul_mat_dequant_quant_to_f16(
     uintptr_t pool_key_buf = 0;
     cl_ulong  pool_key_off = (cl_ulong) tensor->view_offs;
 
+    // Reconstructed AoS scratch that this call owns and must free AFTER the dequant
+    // kernel below is enqueued (src_buf aliases it). Releasing it before the enqueue
+    // invalidates the kernel arg on strict drivers (Intel NEO -> CL_INVALID_MEM_OBJECT).
+    cl_mem owned_scratch = NULL;
+
     const bool is_soa = tensor->type == GGML_TYPE_Q4_0
         ? ggml_cl_is_q4_0_soa(tensor)
         : ggml_cl_is_q8_0_soa(tensor);
@@ -16752,8 +16757,10 @@ static cl_mem ggml_cl_mul_mat_dequant_quant_to_f16(
         if (extra_reconstruct) {
             *extra_reconstruct = aos;
         } else {
-            // OpenCL retains the memobj while queued kernels reference it.
-            CL_CHECK(clReleaseMemObject(aos));
+            // src_buf aliases aos and is still consumed by the dequant kernel below;
+            // defer the release until after that enqueue (OpenCL retains the memobj
+            // while the queued kernel references it).
+            owned_scratch = aos;
         }
     } else {
         auto * extra = (ggml_tensor_extra_cl *) tensor->extra;
@@ -16816,6 +16823,11 @@ static cl_mem ggml_cl_mul_mat_dequant_quant_to_f16(
     size_t gws[3] = { (size_t) nblk0, (size_t) ne1_, (size_t) (ne2_ * ne3_) };
     size_t lws[3] = { 1, 1, 1 };
     CL_CHECK(clEnqueueNDRangeKernel(backend_ctx->queue, dq_kernel, 3, NULL, gws, lws, 0, NULL, NULL));
+
+    // Safe to drop our reference now: the enqueue above holds it until the kernel runs.
+    if (owned_scratch) {
+        CL_CHECK(clReleaseMemObject(owned_scratch));
+    }
 
     return out;
 }
