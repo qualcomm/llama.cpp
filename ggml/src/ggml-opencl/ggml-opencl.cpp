@@ -471,6 +471,10 @@ struct ggml_opencl_fa_kernels {
     // Cluster-parallel decode
     std::map<std::pair<int, int>, cl_kernel> f32_f16_q1_vec_mq_split_c8;
     std::map<std::pair<int, int>, cl_kernel> f32_f16_q1_vec_mq_split_g8_c8;
+    // MQ_GQA=1 (no KV sharing) c8 for the gqa=1 / MHA decode class — brings the
+    // cluster-parallel structure to the shape that otherwise falls to the two-pass
+    // q1. Intel-only, DK=DV=128. o_acc[1][FA_CL_DV] = tiny register footprint.
+    std::map<std::pair<int, int>, cl_kernel> f32_f16_q1_vec_mq_split_g1_c8;
     // NSG_SPLIT=2 specializations (WG=128): the c8 kernel's register footprint
     // caps its per-kernel WG at 128 on X2, below the stock 256/192 requirement.
     // 2 subgroups × FA_CL_NCL streams still gives 16 in-flight rows per WG.
@@ -5202,6 +5206,31 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
                         }
                     }
                     clReleaseProgram(prog_g8_c8);
+                }
+            }
+            // MQ_GQA=1 c8 for the gqa=1 / MHA decode class (Intel only, DK=DV=128).
+            // Cluster-parallelism is orthogonal to KV sharing, so the c8 kernel is
+            // valid at MQ_GQA=1 (1 Q head/KV head); it replaces the two-pass q1 that
+            // otherwise runs at ~13 GFLOPS. o_acc[1][FA_CL_DV] is the smallest of any
+            // c8 variant, so the stock WG (MQ_NSG=4 -> 128 on Intel) registers freely.
+            if (!fa_decode_only && backend_ctx->has_subgroup_shuffle &&
+                backend_ctx->gpu_family == INTEL && dk == 128 && dv == 128) {
+                const std::string opts_g1_c8 = opts + " -D FA_MQ_ONLY -D MQ_GQA=1";
+                cl_program prog_g1_c8 = build_program_from_source_ex(
+                    backend_ctx->context, backend_ctx->device, src.c_str(), opts_g1_c8,
+                    /*fatal=*/false, "fa f32_f16 c8 g1 (gqa=1)", backend_ctx->queue);
+                if (prog_g1_c8) {
+                    cl_kernel k_g1_c8 = clCreateKernel(prog_g1_c8, "flash_attn_f32_f16_q1_vec_mq_split_c8", &err);
+                    if (err == CL_SUCCESS) {
+                        if (ggml_opencl_fa_kernel_fits_wg(backend_ctx, k_g1_c8, 128,
+                                                          "flash_attn_f32_f16_q1_vec_mq_split_c8 (g1)", dk, dv)) {
+                            backend_ctx->fa.f32_f16_q1_vec_mq_split_g1_c8[{dk, dv}] = k_g1_c8;
+                            ggml_opencl_log_fa_kernel_spill(backend_ctx, k_g1_c8, "flash_attn_f32_f16_q1_vec_mq_split_g1_c8", dk, dv);
+                        } else {
+                            clReleaseKernel(k_g1_c8);
+                        }
+                    }
+                    clReleaseProgram(prog_g1_c8);
                 }
             }
             break;
@@ -14968,6 +14997,18 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
             use_fd_mq  = true;
             fd_mq_wg   = 64;
         }
+    }
+    // Intel gqa=1 (MHA) cluster-parallel decode FA — the c8 transfer for the
+    // no-KV-sharing shape that otherwise falls to the two-pass q1 (~13 GFLOPS vs
+    // SYCL ~62). MQ_GQA=1 program, stock WG = MQ_NSG(4)*FA_SG(32) = 128.
+    if (fd_k_split == NULL && backend_ctx->gpu_family == INTEL && n_q == 1 && !is_causal &&
+        is_mixed && gqa_ratio_dispatch == 1 && d_head_q == 128 && d_head_v == 128 &&
+        n_kv >= FD_MIN_N_KV && fa_c8_on &&
+        backend_ctx->fa.f32_f16_q1_vec_mq_split_g1_c8.count(dk_dv) > 0 &&
+        backend_ctx->fa.f32_merge.count(dk_dv) > 0) {
+        fd_k_split = backend_ctx->fa.f32_f16_q1_vec_mq_split_g1_c8.at(dk_dv);
+        use_fd_mq  = true;
+        fd_mq_wg   = 128;
     }
     if (fd_k_split == NULL &&
         n_q >= 1 && n_q <= fd_max_n_q && n_kv >= FD_MIN_N_KV && !is_causal &&
