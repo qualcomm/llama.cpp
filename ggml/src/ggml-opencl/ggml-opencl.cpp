@@ -603,6 +603,11 @@ struct ggml_opencl_fa_kernels {
     // Opt-in via GGML_OPENCL_FA_C8=1.
     std::map<std::pair<int, int>, cl_kernel> f32_f16_q1_vec_mq_split_c8;
     std::map<std::pair<int, int>, cl_kernel> f32_f16_q1_vec_mq_split_g8_c8;
+    // Position-parallel block-softmax decode FA (MQ_GQA=8, WG=32=1 subgroup).
+    std::map<std::pair<int, int>, cl_kernel> f32_f16_q1_ppb_g8;
+    // Wider-WG ppb: 4 subgroups/WG, head-split (WG=128). Shares q_shared across
+    // the 4 subgroups → ~4x occupancy vs ppb's 1-subgroup WG. Opt-in FA_PPB4=1.
+    std::map<std::pair<int, int>, cl_kernel> f32_f16_q1_ppb4_g8;
     // MQ_GQA=1 (no KV sharing) c8 for the gqa=1 / MHA decode class — brings the
     // cluster-parallel structure to the shape that otherwise falls to the two-pass
     // q1. Intel-only, DK=DV=128. o_acc[1][FA_CL_DV] = tiny register footprint.
@@ -6085,6 +6090,39 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
                         ggml_opencl_log_fa_kernel_spill(backend_ctx, k_q1_vec_mq_split_g8_c8, "flash_attn_f32_f16_q1_vec_mq_split_g8_c8", dk, dv);
                     } else {
                         clReleaseKernel(k_q1_vec_mq_split_g8_c8);
+                    }
+                }
+                // Position-parallel block-softmax decode FA (MQ_GQA=8). WG=32=1
+                // subgroup; compiled only for DK=DV=128 (DV_VEC==DK_VEC==FA_SG).
+                // Env-gated GGML_OPENCL_FA_PPB=1 at dispatch. Experimental.
+                if (dk == 128 && dv == 128) {
+                    cl_kernel k_ppb_g8 = clCreateKernel(prog_g8, "flash_attn_f32_f16_q1_ppb", &err);
+                    if (err == CL_SUCCESS) {
+                        if (ggml_opencl_fa_kernel_fits_wg(backend_ctx, k_ppb_g8, 32,
+                                                          "flash_attn_f32_f16_q1_ppb (g8)", dk, dv)) {
+                            backend_ctx->fa.f32_f16_q1_ppb_g8[{dk, dv}] = k_ppb_g8;
+                            ggml_opencl_log_fa_kernel_spill(backend_ctx, k_ppb_g8, "flash_attn_f32_f16_q1_ppb", dk, dv);
+                        } else {
+                            clReleaseKernel(k_ppb_g8);
+                        }
+                    } else {
+                        GGML_LOG_WARN("ggml_opencl: flash_attn_f32_f16_q1_ppb (g8) clCreateKernel failed (err=%d)\n", err);
+                    }
+                }
+                // Wider-WG ppb: 4 subgroups/WG (WG=128), head-split. Env-gated
+                // GGML_OPENCL_FA_PPB4=1 at dispatch. Experimental.
+                if (dk == 128 && dv == 128) {
+                    cl_kernel k_ppb4_g8 = clCreateKernel(prog_g8, "flash_attn_f32_f16_q1_ppb4", &err);
+                    if (err == CL_SUCCESS) {
+                        if (ggml_opencl_fa_kernel_fits_wg(backend_ctx, k_ppb4_g8, 128,
+                                                          "flash_attn_f32_f16_q1_ppb4 (g8)", dk, dv)) {
+                            backend_ctx->fa.f32_f16_q1_ppb4_g8[{dk, dv}] = k_ppb4_g8;
+                            ggml_opencl_log_fa_kernel_spill(backend_ctx, k_ppb4_g8, "flash_attn_f32_f16_q1_ppb4", dk, dv);
+                        } else {
+                            clReleaseKernel(k_ppb4_g8);
+                        }
+                    } else {
+                        GGML_LOG_WARN("ggml_opencl: flash_attn_f32_f16_q1_ppb4 (g8) clCreateKernel failed (err=%d)\n", err);
                     }
                 }
                 // Hybrid local-tile + MQ_GQA=8. WG=64 (1 subgroup); the
@@ -18283,6 +18321,12 @@ static constexpr int FD_MAX_N_Q_MULTI = 8;
 // KV across 64 lanes (short recurrence) so it keeps FD_KV_PER_SPLIT.
 static constexpr int FD_MQ_KV_PER_SPLIT = 256;
 static constexpr int FD_MQ_MAX_SPLITS   = 128;
+// Position-parallel block-softmax (ppb) decode FA runs a WG of ONE 32-wide
+// subgroup, so it needs ~3x more work-groups than the c8 MQ path (WG=96) to
+// reach the same iGPU occupancy. Use a finer split (256/3 ≈ 64) so the win
+// lands without the GGML_OPENCL_FD_KV_PER_SPLIT knob. Measured on Xe-LP
+// (gqa8 DK128 f16): +15-21% per-op over c8 at kps=64 vs only +4-5% at 256.
+static constexpr int FD_PPB_KV_PER_SPLIT = 64;
 
 static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, const ggml_tensor * k, ggml_tensor * dst) {
     const ggml_tensor * v = dst->src[2];
@@ -18691,6 +18735,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     const int fd_max_n_q = (d_head_q <= FD_MAX_DK_MULTI) ? FD_MAX_N_Q_MULTI : 1;
     cl_kernel fd_k_split = NULL;
     bool use_fd_mq = false;
+    bool use_ppb   = false;  // position-parallel block-softmax kernel (finer split)
     size_t fd_mq_wg = 256;  // MQ_GQA=4 kernel: Q1_WG_SIZE(64) * MQ_NSG_SPLIT(4)
     bool use_fa_k_img = false;  // K bound as image1d_buffer_t instead of (buf, offset)
     // MQ flash-decoding gate. Bypasses FD_MAX_DK because the MQ split kernel
@@ -18963,6 +19008,37 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
             fd_mq_wg   = 64;
         }
     }
+    // Intel g8 position-parallel block-softmax decode FA (EXPERIMENTAL, opt-in
+    // GGML_OPENCL_FA_PPB=1). Mirrors SYCL fattn-tile: KV positions across the
+    // 32-wide subgroup (full-DK dot, no per-position reduce) + one block-softmax
+    // per FA_SG positions — targets the ~6x FP-instruction gap (VTune 2026-07-06).
+    // WG=32 (1 subgroup); occupancy from the FD KV-split. Same partial/merge as c8.
+    // Wider-WG ppb (EXPERIMENTAL, opt-in GGML_OPENCL_FA_PPB4=1): 4 subgroups/WG
+    // head-split. Same ppb math, but 4 subgroups share one q_shared → ~4x the
+    // occupancy that ppb's 1-subgroup WG reaches (VTune 23% work-size limit).
+    // WG=128; same finer split as ppb. Preempts the ppb branch when set.
+    const char * fa_ppb4_env = getenv("GGML_OPENCL_FA_PPB4");
+    if (fd_k_split == NULL && backend_ctx->gpu_family == INTEL && n_q == 1 && !is_causal &&
+        is_mixed && gqa_ratio_dispatch == 8 && d_head_q == 128 && d_head_v == 128 &&
+        n_kv >= FD_MIN_N_KV && fa_ppb4_env != NULL && fa_ppb4_env[0] != '0' &&
+        backend_ctx->fa.f32_f16_q1_ppb4_g8.count(dk_dv) > 0 &&
+        backend_ctx->fa.f32_merge.count(dk_dv) > 0) {
+        fd_k_split = backend_ctx->fa.f32_f16_q1_ppb4_g8.at(dk_dv);
+        use_fd_mq  = true;
+        use_ppb    = true;
+        fd_mq_wg   = 128;
+    }
+    const char * fa_ppb_env = getenv("GGML_OPENCL_FA_PPB");
+    if (fd_k_split == NULL && backend_ctx->gpu_family == INTEL && n_q == 1 && !is_causal &&
+        is_mixed && gqa_ratio_dispatch == 8 && d_head_q == 128 && d_head_v == 128 &&
+        n_kv >= FD_MIN_N_KV && fa_ppb_env != NULL && fa_ppb_env[0] != '0' &&
+        backend_ctx->fa.f32_f16_q1_ppb_g8.count(dk_dv) > 0 &&
+        backend_ctx->fa.f32_merge.count(dk_dv) > 0) {
+        fd_k_split = backend_ctx->fa.f32_f16_q1_ppb_g8.at(dk_dv);
+        use_fd_mq  = true;
+        use_ppb    = true;
+        fd_mq_wg   = 32;
+    }
     // Intel g8 (GQA=8) cluster-parallel decode FA — same c8 transfer as the GQA=4
     // block above, widened to the Qwen2.5/Qwen3 GQA=8 DK=DV=128 f16-KV class (falls
     // to the two-pass q1 otherwise). WG is the 32-wide-subgroup analog of Adreno's:
@@ -19134,7 +19210,8 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
             const char * e = getenv("GGML_OPENCL_FD_MAX_SPLITS");
             return (e && e[0]) ? atoi(e) : 0;
         }();
-        int fd_kv_per_split = use_fd_mq ? FD_MQ_KV_PER_SPLIT : FD_KV_PER_SPLIT;
+        int fd_kv_per_split = use_ppb ? FD_PPB_KV_PER_SPLIT
+                                      : (use_fd_mq ? FD_MQ_KV_PER_SPLIT : FD_KV_PER_SPLIT);
         int fd_max_splits   = use_fd_mq ? FD_MQ_MAX_SPLITS   : FD_MAX_SPLITS;
         if (fd_env_kv_per_split > 0) fd_kv_per_split = fd_env_kv_per_split;
         if (fd_env_max_splits   > 0) fd_max_splits   = fd_env_max_splits;
