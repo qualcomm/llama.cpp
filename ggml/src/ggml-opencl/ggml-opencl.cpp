@@ -6069,15 +6069,12 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                        op->src[0]->type == GGML_TYPE_Q4_K  ||
                        op->src[0]->type == GGML_TYPE_Q5_K  ||
                        op->src[0]->type == GGML_TYPE_Q6_K) {
-#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
-                // Decode (ne1==1) for a non-128-multiple ne01 q6_K weight uses the
-                // padded noshuffle GEMV (q6_K_noshuffle_ne01_padded). The batched GEMM
-                // (ne1>1) has no padded variant -- the noshuffle GEMM tiles 4 rows with
-                // no M guard -- so it falls back to CPU for these shapes.
-                if (op->src[0]->type == GGML_TYPE_Q6_K && op->ne[1] > 1 && op->src[0]->ne[1] % 128 != 0) {
-                    return false;
-                }
-#endif // GGML_OPENCL_USE_ADRENO_KERNELS
+                // Non-128-multiple ne01 q6_K (e.g. an odd-vocab lm_head) stays on GPU
+                // for both decode (ne1==1, padded noshuffle GEMV) and the batched GEMM
+                // (ne1>1): the GEMM addresses src0 with the padded row stride and stores
+                // with the real ne01 stride under a row-validity guard (m_dst), so padded
+                // rows are never written. See q6_K_noshuffle_ne01_padded and the m/m_dst
+                // split in kernel_gemm_noshuffle_q6_K_f32.
                 return op->src[1]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]);
             } else if (op->src[0]->type == GGML_TYPE_Q8_0) {
                 return op->src[1]->type == GGML_TYPE_F32;
@@ -15761,6 +15758,12 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
         kernel = backend_ctx->kernel_gemm_noshuffle_q6_K_f32;
         int padded_N = ne1 + padding;
 
+        // The weight (src0) is laid out with rows padded to a 128-multiple for the
+        // noshuffle layout (q6_K_noshuffle_ne01_padded); the kernel's `m` is that
+        // padded stride for src0 addressing, while m_dst = the real ne01 is the dst
+        // store stride + row-validity bound. Equal for the common ne01 % 128 == 0 case.
+        const int ne01_pad = q6_K_noshuffle_ne01_padded(src0);
+
         cl_ushort mask_f000 = 0xF000;
         cl_uchar  mask_c0   = 0xC0;
 
@@ -15771,12 +15774,13 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
         CL_CHECK(clSetKernelArg(kernel,  4, sizeof(cl_mem),   &b_img_trans));
         CL_CHECK(clSetKernelArg(kernel,  5, sizeof(cl_mem),   &extrad->data_device));
         CL_CHECK(clSetKernelArg(kernel,  6, sizeof(cl_ulong), &offsetd));
-        CL_CHECK(clSetKernelArg(kernel,  7, sizeof(int),      &ne01));
+        CL_CHECK(clSetKernelArg(kernel,  7, sizeof(int),      &ne01_pad));
         CL_CHECK(clSetKernelArg(kernel,  8, sizeof(int),      &padded_N));
         CL_CHECK(clSetKernelArg(kernel,  9, sizeof(int),      &ne00));
         CL_CHECK(clSetKernelArg(kernel, 10, sizeof(int),      &ne1));
         CL_CHECK(clSetKernelArg(kernel, 11, sizeof(cl_ushort),&mask_f000));
         CL_CHECK(clSetKernelArg(kernel, 12, sizeof(cl_uchar), &mask_c0));
+        CL_CHECK(clSetKernelArg(kernel, 13, sizeof(int),      &ne01));
 
         size_t global_work_size[3] = {(size_t)CEIL_DIV(ne1, 8), (size_t)CEIL_DIV(ne01, 4), 1};
         size_t local_work_size[3] = {2, 128, 1};

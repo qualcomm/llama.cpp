@@ -23,7 +23,8 @@ kernel void kernel_gemm_noshuffle_q6_K_f32(
         int k,
         int n_no_padding,
         ushort mask_f000,
-        uchar  mask_c0
+        uchar  mask_c0,
+        int m_dst
 ) {
     dst = (global float *)( (global char *)dst + offsetd );
 
@@ -104,37 +105,30 @@ kernel void kernel_gemm_noshuffle_q6_K_f32(
         c3 += B * dequantized_weights.s3;
     }
 
-    int idx = (gy<<3)*m + (gx<<2);
-
-    if(idx+3 < m*n_no_padding){
-        vstore4((float4)(c0.s0, c1.s0, c2.s0, c3.s0), 0, dst + idx);
-        idx += m;
-    }
-    if(idx+3 < m*n_no_padding){
-        vstore4((float4)(c0.s1, c1.s1, c2.s1, c3.s1), 0, dst + idx);
-        idx += m;
-    }
-    if(idx+3 < m*n_no_padding){
-        vstore4((float4)(c0.s2, c1.s2, c2.s2, c3.s2), 0, dst + idx);
-        idx += m;
-    }
-    if(idx+3 < m*n_no_padding){
-        vstore4((float4)(c0.s3, c1.s3, c2.s3, c3.s3), 0, dst + idx);
-        idx += m;
-    }
-    if(idx+3 < m*n_no_padding){
-        vstore4((float4)(c0.s4, c1.s4, c2.s4, c3.s4), 0, dst + idx);
-        idx += m;
-    }
-    if(idx+3 < m*n_no_padding){
-        vstore4((float4)(c0.s5, c1.s5, c2.s5, c3.s5), 0, dst + idx);
-        idx += m;
-    }
-    if(idx+3 < m*n_no_padding){
-        vstore4((float4)(c0.s6, c1.s6, c2.s6, c3.s6), 0, dst + idx);
-        idx += m;
-    }
-    if(idx+3 < m*n_no_padding){
-        vstore4((float4)(c0.s7, c1.s7, c2.s7, c3.s7), 0, dst + idx);
+    // Store stride is m_dst = the REAL dst row count. m (above) is the weight's
+    // (possibly padded-to-128) row stride used for the src0 layout. They differ only
+    // for a non-128-multiple ne01 (e.g. an odd-vocab lm_head); then the last row-tile
+    // straddles the real/padded boundary and its padded rows must not be written
+    // (a vstore4 there would spill into the next column at the real stride). For the
+    // common m_dst == m case rv == 4 and the vstore4 fast path is taken unchanged.
+    int row = gx << 2;
+    int col0 = gy << 3;
+    int rv = m_dst - row;              // real rows in this 4-row tile
+    if (rv > 4) rv = 4;
+    if (rv > 0) {
+        #define ST_COL(I, sel) \
+            if (col0 + (I) < n_no_padding) { \
+                int b = (col0 + (I)) * m_dst + row; \
+                if (rv == 4) { \
+                    vstore4((float4)(c0.sel, c1.sel, c2.sel, c3.sel), 0, dst + b); \
+                } else { \
+                    dst[b] = c0.sel; \
+                    if (rv > 1) dst[b + 1] = c1.sel; \
+                    if (rv > 2) dst[b + 2] = c2.sel; \
+                } \
+            }
+        ST_COL(0, s0) ST_COL(1, s1) ST_COL(2, s2) ST_COL(3, s3)
+        ST_COL(4, s4) ST_COL(5, s5) ST_COL(6, s6) ST_COL(7, s7)
+        #undef ST_COL
     }
 }
