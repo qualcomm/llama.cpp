@@ -202,7 +202,8 @@ kernel void kernel_gemv_noshuffle_q6_K_f32(
     global float * dst,
     ulong offsetd,
     int ne00,
-    int ne01
+    int ne01,
+    int ne01_dst
 ) {
     int grp = get_local_id(1);
     int gid = get_global_id(0);
@@ -288,6 +289,17 @@ kernel void kernel_gemv_noshuffle_q6_K_f32(
 
     if (grp == 0) {
         dst = (global float*)((global char*)dst + offsetd);
-        vstore2(total_sum, 0, &(dst[gid * 2]));
+        // ne01 is the (possibly padded-to-128) row stride the weight layout was
+        // laid out and dispatched with; ne01_dst is the real dst row count. When
+        // the weight rows were padded (odd/non-128 ne01, e.g. an odd-vocab lm_head),
+        // the tail work-items compute garbage-but-in-bounds rows that must not be
+        // stored. For the common unpadded case ne01_dst == ne01 and both rows are
+        // always in range, so the vectorized store path is taken unchanged.
+        int row = gid * 2;
+        if (row + 1 < ne01_dst) {
+            vstore2(total_sum, 0, &(dst[row]));
+        } else if (row < ne01_dst) {
+            dst[row] = total_sum.s0;
+        }
     }
 }

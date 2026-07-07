@@ -5842,24 +5842,27 @@ static inline bool use_flat_gemv_for_large_m_q4_K(const ggml_tensor *tensor) {
     return tensor->ne[1] >= 32768 && tensor->ne[2] == 1 && tensor->ne[3] == 1;
 }
 
+// The noshuffle (transposed-weight) q6_K layout packs 2 rows per 32-bit texel and the
+// gemv reads it with a ne01/2 texel stride and a ceil((ne01/2)/64)*64 dispatch; it is
+// only self-consistent when ne01 is a multiple of 128. For other ne01 (e.g. granitemoe
+// lm_head [1536, 49155] -- odd vocab) we round the transposed weight row count up to the
+// next multiple of 128 at convert/transpose time (the tail rows are never stored -- the
+// gemv guards on the real ne01). This is the padded row stride the gemv must read and
+// dispatch with; for already-aligned ne01 it is a no-op (== ne01).
+static inline int q6_K_noshuffle_ne01_padded(const ggml_tensor *tensor) {
+    const int ne01 = (int)tensor->ne[1];
+    return (ne01 % 128 == 0) ? ne01 : ((ne01 + 127) / 128) * 128;
+}
+
 static inline bool use_flat_gemv_for_large_m_q6_K(const ggml_tensor *tensor) {
     // gemv_noshuffle variant perf drops for large M, use flat variant for large M.
     // threshold is well above typical hidden/FFN dims, but below typical vocab sizes.
     // q6_K flat gemv is worse for smaller K; 2048 seems to be a reasonable threshold.
     // note that this forces large M weights to use LM GEMM.
-    // The noshuffle (transposed-weight) layout packs 2 rows per 32-bit texel and the
-    // gemv reads it with a ne01/2 texel stride and an exact-cover dispatch of
-    // ceil(ne01/2 / 64)*64 work-items with no store guard; the gemm uses 4-row tiles.
-    // It is therefore only correct for ne01 % 128 == 0: an odd ne01 (e.g. granitemoe
-    // lm_head [1536, 49155] -- odd vocab) truncates the texel stride, misaligning every
-    // odd column of the transposed layout (gross garbage) and dropping the last row;
-    // other non-multiples over-dispatch and write past the end of dst. Route such
-    // tensors to the flat GEMV + regular convert; the matching GEMM (ne1>1) falls back
-    // to CPU (see supports_op). All standard even-vocab/hidden dims are multiples of
-    // 128 and keep the noshuffle path.
-    if ((tensor->ne[1] % 128 != 0) && tensor->ne[2] == 1 && tensor->ne[3] == 1) {
-        return true;
-    }
+    // Non-multiple-of-128 ne01 (e.g. odd vocab lm_head) is NOT forced to flat here: the
+    // decode gemv path pads the transposed layout to a multiple of 128 and keeps the fast
+    // noshuffle kernel (see q6_K_noshuffle_ne01_padded). The matching small-batch GEMM
+    // (ne1>1) has no padded variant and still falls back to CPU (see supports_op).
     return tensor->ne[1] >= 32768 && tensor->ne[0] >= 2048 && tensor->ne[2] == 1 && tensor->ne[3] == 1;
 }
 
@@ -6067,10 +6070,10 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                        op->src[0]->type == GGML_TYPE_Q5_K  ||
                        op->src[0]->type == GGML_TYPE_Q6_K) {
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
-                // q6_K GEMM (ne1>1) for weights routed off the noshuffle path because
-                // ne01 % 128 != 0 (see use_flat_gemv_for_large_m_q6_K): the flat convert
-                // has no verified small-batch GEMM kernel for these shapes (l4_lm drifts
-                // at small K). Fall back to CPU; decode (ne1==1) stays on the flat GEMV.
+                // Decode (ne1==1) for a non-128-multiple ne01 q6_K weight uses the
+                // padded noshuffle GEMV (q6_K_noshuffle_ne01_padded). The batched GEMM
+                // (ne1>1) has no padded variant -- the noshuffle GEMM tiles 4 rows with
+                // no M guard -- so it falls back to CPU for these shapes.
                 if (op->src[0]->type == GGML_TYPE_Q6_K && op->ne[1] > 1 && op->src[0]->ne[1] % 128 != 0) {
                     return false;
                 }
@@ -7957,6 +7960,19 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         GGML_ASSERT(size_ql + size_qh + size_s + size_d == ggml_nbytes(tensor) &&
             "Incorrect tensor size");
 
+        // For the noshuffle path the transposed layout is padded to a 128-multiple
+        // row count (see q6_K_noshuffle_ne01_padded / use_flat_gemv_for_large_m_q6_K):
+        // the per-component subbuffers must reserve those extra rows so the transpose
+        // and gemv can address them. size_*_carve == size_* when ne01 % 128 == 0.
+        const int  ne01_real = (int)tensor->ne[1];
+        const int  ne01_carve =
+            (use_adreno_kernels(backend_ctx, tensor) && !use_flat_gemv_for_large_m_q6_K(tensor))
+            ? q6_K_noshuffle_ne01_padded(tensor) : ne01_real;
+        size_t size_ql_carve = size_ql / ne01_real * ne01_carve;
+        size_t size_qh_carve = size_qh / ne01_real * ne01_carve;
+        size_t size_s_carve  = size_s  / ne01_real * ne01_carve;
+        size_t size_d_carve  = size_d  / ne01_real * ne01_carve;
+
         cl_int err;
         cl_mem data_device;
         CL_CHECK((data_device = clCreateBuffer(context, CL_MEM_READ_WRITE, ggml_nbytes(tensor), NULL, &err), err));
@@ -8039,25 +8055,25 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
 
         // Subbuffer for ql
         region.origin = align_to(extra_orig->offset + tensor->view_offs + offset, backend_ctx->alignment);
-        region.size = size_ql;
+        region.size = size_ql_carve;
         CL_CHECK((extra->ql = clCreateSubBuffer(extra_orig->data_device, CL_MEM_READ_WRITE, CL_BUFFER_CREATE_TYPE_REGION, &region, &err), err));
         auto previous_origin = region.origin;
 
         // Subbuffer for qh
-        region.origin = align_to(previous_origin + size_ql, backend_ctx->alignment);
-        region.size = size_qh;
+        region.origin = align_to(previous_origin + size_ql_carve, backend_ctx->alignment);
+        region.size = size_qh_carve;
         CL_CHECK((extra->qh = clCreateSubBuffer(extra_orig->data_device, CL_MEM_READ_WRITE, CL_BUFFER_CREATE_TYPE_REGION, &region, &err), err));
         previous_origin = region.origin;
 
         // Subbuffer for scales
-        region.origin = align_to(previous_origin + size_qh, backend_ctx->alignment);
-        region.size = size_s;
+        region.origin = align_to(previous_origin + size_qh_carve, backend_ctx->alignment);
+        region.size = size_s_carve;
         CL_CHECK((extra->s = clCreateSubBuffer(extra_orig->data_device, CL_MEM_READ_WRITE, CL_BUFFER_CREATE_TYPE_REGION, &region, &err), err));
         previous_origin = region.origin;
 
         // Create subbuffer for d.
-        region.origin = align_to(previous_origin + size_s, backend_ctx->alignment);
-        region.size = size_d;
+        region.origin = align_to(previous_origin + size_s_carve, backend_ctx->alignment);
+        region.size = size_d_carve;
         CL_CHECK((extra->d = clCreateSubBuffer(extra_orig->data_device, CL_MEM_READ_WRITE, CL_BUFFER_CREATE_TYPE_REGION, &region, &err), err));
         previous_origin = region.origin;
 
@@ -8090,33 +8106,35 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         CL_CHECK(clWaitForEvents(1, &evt));
         CL_CHECK(clReleaseMemObject(data_device));
 
-        extra->size_ql = size_ql;
-        extra->size_qh = size_qh;
-        extra->size_s  = size_s;
-        extra->size_d  = size_d;
+        extra->size_ql = size_ql_carve;
+        extra->size_qh = size_qh_carve;
+        extra->size_s  = size_s_carve;
+        extra->size_d  = size_d_carve;
 
         tensor->extra  = extra;
 
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
         if (use_adreno_kernels(backend_ctx, tensor) && !use_flat_gemv_for_large_m_q6_K(tensor)) {
-            cl_int M = tensor->ne[1];   // ne01
+            cl_int M = ne01_carve;      // ne01 padded up to a 128-multiple for the noshuffle layout
             cl_int K = tensor->ne[0];   // ne00
 
-            // Transpose ql as ushort
+            // Transpose ql as ushort. The convert kernel wrote only the real ne01
+            // rows; rows [ne01_real, ne01_carve) are uninitialized but never stored
+            // (the gemv guards on the real ne01), so they only need to be in-bounds.
             transpose_2d_as_16b(backend_ctx,
-                extra->ql, extra->ql, size_ql, K/4, M);
+                extra->ql, extra->ql, size_ql_carve, K/4, M);
 
             // Transpose qh as uchar
             transpose_2d_as_8b(backend_ctx,
-                extra->qh, extra->qh, size_qh, K/4, M);
+                extra->qh, extra->qh, size_qh_carve, K/4, M);
 
             // Transpose s as ushort
             transpose_2d_as_16b(backend_ctx,
-                extra->s, extra->s, size_s, K/16/2, M);
+                extra->s, extra->s, size_s_carve, K/16/2, M);
 
             // Transpose d as ushort
             transpose_2d_as_16b(backend_ctx,
-                extra->d, extra->d, size_d, K/256, M);
+                extra->d, extra->d, size_d_carve, K/256, M);
         }
 #endif // GGML_OPENCL_USE_ADRENO_KERNELS
         return;
@@ -9138,8 +9156,13 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
             static ggml_cl_buffer buf_trans_d;
             static ggml_cl_buffer buf_unpacked;
 
-            cl_int M = tensor->ne[1];   // ne01
+            // The forward layout was transposed with the padded row count as its
+            // width (q6_K_noshuffle_ne01_padded), so transpose back with the same
+            // padded stride; the real rows land first and the unpack below reads only
+            // the real n_blk. M == ne01 when ne01 % 128 == 0.
+            cl_int M = q6_K_noshuffle_ne01_padded(tensor);   // padded ne01 (transposed-layout width)
             cl_int K = tensor->ne[0];   // ne00
+            const int ne01_real = (int)tensor->ne[1];
 
             GGML_ASSERT(K % ggml_blck_size(tensor->type) == 0);
 
@@ -9149,17 +9172,23 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
             size_t size_d  = ggml_nelements(tensor)/ggml_blck_size(tensor->type)*sizeof(ggml_fp16_t);
             GGML_ASSERT(size_ql + size_qh + size_s + size_d == ggml_nbytes(tensor) && "Incorrect tensor size");
 
-            buf_trans_ql.allocate(backend_ctx->context, size_ql);
-            buf_trans_qh.allocate(backend_ctx->context, size_qh);
-            buf_trans_s.allocate(backend_ctx->context, size_s);
-            buf_trans_d.allocate(backend_ctx->context, size_d);
+            // padded transposed-buffer sizes (== size_* when M == ne01_real)
+            size_t size_ql_pad = size_ql / ne01_real * M;
+            size_t size_qh_pad = size_qh / ne01_real * M;
+            size_t size_s_pad  = size_s  / ne01_real * M;
+            size_t size_d_pad  = size_d  / ne01_real * M;
+
+            buf_trans_ql.allocate(backend_ctx->context, size_ql_pad);
+            buf_trans_qh.allocate(backend_ctx->context, size_qh_pad);
+            buf_trans_s.allocate(backend_ctx->context, size_s_pad);
+            buf_trans_d.allocate(backend_ctx->context, size_d_pad);
             buf_unpacked.allocate(backend_ctx->context, ggml_nbytes(tensor));
 
-            // transpose ql, qh, s and d back
-            transpose_2d_as_16b(backend_ctx, extra->ql, buf_trans_ql.buffer, size_ql, M, K/4);
-            transpose_2d_as_8b(backend_ctx,  extra->qh, buf_trans_qh.buffer, size_qh, M, K/4);
-            transpose_2d_as_16b(backend_ctx, extra->s,  buf_trans_s.buffer,  size_s,  M, K/16/2);
-            transpose_2d_as_16b(backend_ctx, extra->d,  buf_trans_d.buffer,  size_d,  M, K/256);
+            // transpose ql, qh, s and d back (padded width M; real rows land first)
+            transpose_2d_as_16b(backend_ctx, extra->ql, buf_trans_ql.buffer, size_ql_pad, M, K/4);
+            transpose_2d_as_8b(backend_ctx,  extra->qh, buf_trans_qh.buffer, size_qh_pad, M, K/4);
+            transpose_2d_as_16b(backend_ctx, extra->s,  buf_trans_s.buffer,  size_s_pad,  M, K/16/2);
+            transpose_2d_as_16b(backend_ctx, extra->d,  buf_trans_d.buffer,  size_d_pad,  M, K/256);
 
             // unpack
             cl_uchar mask = 0xFF;
@@ -9356,9 +9385,17 @@ static size_t ggml_backend_opencl_buffer_type_get_alloc_size(ggml_backend_buffer
     // alignment), the aligned carve extends past ggml_nbytes and the last
     // subbuffer would overlap the next tensor in the pool. Reserve the worst-case
     // carve slack: at most 5 components (q5_K), i.e. 4 aligned gaps.
+    //
+    // Additionally, the noshuffle q6_K path pads the transposed layout row count up
+    // to a 128-multiple (q6_K_noshuffle_ne01_padded), so the carved subbuffers span
+    // padded rows. Reserve for the padded row count (a no-op when ne01 % 128 == 0;
+    // harmless over-reserve of <=127 rows for other quant types on odd shapes).
     if (ggml_is_quantized(tensor->type)) {
         ggml_backend_opencl_device_context * dev_ctx = (ggml_backend_opencl_device_context *) buft->device->context;
-        size += 4 * dev_ctx->backend_ctx->alignment;
+        const int64_t ne1     = tensor->ne[1];
+        const int64_t ne1_pad = (ne1 % 128 == 0) ? ne1 : ((ne1 + 127) / 128) * 128;
+        const size_t  padded  = ggml_row_size(tensor->type, tensor->ne[0]) * ne1_pad * tensor->ne[2] * tensor->ne[3];
+        size = std::max(size, padded) + 4 * dev_ctx->backend_ctx->alignment;
     }
 #endif // GGML_OPENCL_SOA_Q
     return size;
@@ -15601,12 +15638,18 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
         cl_mem b_sub_buffer = nullptr;
         cl_mem b_img = nullptr;
 
+        // The noshuffle weight layout was padded to a 128-multiple row count at
+        // set_tensor time (see q6_K_noshuffle_ne01_padded); the gemv reads and
+        // dispatches with that padded stride and guards the store on the real ne01.
+        // ne01_pad == ne01 for the common (already-aligned) case.
+        const int ne01_pad = q6_K_noshuffle_ne01_padded(src0);
+
         // image for ql
         img_fmt.image_channel_order = CL_R;
         img_fmt.image_channel_data_type = CL_FLOAT;
         memset(&img_desc, 0, sizeof(img_desc));
         img_desc.image_type = CL_MEM_OBJECT_IMAGE1D_BUFFER;
-        img_desc.image_width = ne01 * ne00 / 8;
+        img_desc.image_width = ne01_pad * ne00 / 8;
         img_desc.buffer = extra0_q6_K->ql;
         CL_CHECK((ql_img = clCreateImage(context, CL_MEM_READ_ONLY, &img_fmt, &img_desc, NULL, &err), err));
 
@@ -15615,7 +15658,7 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
         img_fmt.image_channel_data_type = CL_HALF_FLOAT;
         memset(&img_desc, 0, sizeof(img_desc));
         img_desc.image_type = CL_MEM_OBJECT_IMAGE1D_BUFFER;
-        img_desc.image_width = ne01 * ne00 / 8;
+        img_desc.image_width = ne01_pad * ne00 / 8;
         img_desc.buffer = extra0_q6_K->qh;
         CL_CHECK((qh_img = clCreateImage(context, CL_MEM_READ_ONLY, &img_fmt, &img_desc, NULL, &err), err));
 
@@ -15641,10 +15684,11 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
         CL_CHECK(clSetKernelArg(kernel, 5, sizeof(cl_mem),   &extrad->data_device));
         CL_CHECK(clSetKernelArg(kernel, 6, sizeof(cl_ulong), &offsetd));
         CL_CHECK(clSetKernelArg(kernel, 7, sizeof(cl_int),   &ne00));
-        CL_CHECK(clSetKernelArg(kernel, 8, sizeof(cl_int),   &ne01));
+        CL_CHECK(clSetKernelArg(kernel, 8, sizeof(cl_int),   &ne01_pad));   // padded row stride
+        CL_CHECK(clSetKernelArg(kernel, 9, sizeof(cl_int),   &ne01));       // real dst row count (store guard)
 
         size_t local_work_size[3] = {64, 4, 1};
-        size_t global_work_size[3] = {(size_t)CEIL_DIV(ne01/2, 64)*64, 4, 1};
+        size_t global_work_size[3] = {(size_t)CEIL_DIV(ne01_pad/2, 64)*64, 4, 1};
 
         backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
 
