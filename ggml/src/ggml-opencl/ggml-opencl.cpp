@@ -17817,10 +17817,18 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
 
         const bool nq_in_vec_range = (n_q >= 1) && (n_q <= N_MAX_VEC_NQ);
         const bool nq1_only        = (n_q == 1);
-        // Cluster-parallel decode (c8): DEFAULT-ON for Adreno X2E/X1E on the
-        // f16 DK=128 MQ paths — validated e2e wins: X2E +35-62% (Qwen3-4B/8B,
-        // Mistral-7B, Llama-3-8B GQA4; Qwen3-30B g8 +19-22%), X1E +20-55%
-        // (pin-gated via FA_C8_NO_SG_PIN; hp-hamoa re-validation 2026-07-04).
+        // Cluster-parallel decode (c8): DEFAULT-ON for Adreno X1E only, where
+        // the stock kernels compile unspilled (fit WG>=256) and hp-hamoa's
+        // clean-build re-validation holds (+17-56% f16 GQA4, +72/+128% quant-KV;
+        // pin-gated via FA_C8_NO_SG_PIN, 2026-07-04/05, raw data in outbox).
+        // X2E is default-OFF (2026-07-07): the stock kernels are register-capped
+        // (max WG 128 < required 192/256) so dispatch lands on the spilled
+        // NSG_SPLIT=2 fallbacks (868/916B private), which measure e2e f16 g8
+        // -27% (Qwen3-30B @d8k), quant-KV GQA4 -16/-19% (Mistral @d8k/16k),
+        // f16 GQA4 only +5-6% — the 07-04/05 X2 sweep wins do NOT reproduce
+        // from clean rebuilds of the recorded commits (702ae7934/ec916312b;
+        // ALU/BW microbenches + baselines match their records, so it is the
+        // c8 numbers that are stale). Re-enable X2E only with fresh raw logs.
         // GGML_OPENCL_FA_C8 overrides both ways (0 = off, non-0 = on — the
         // explicit-on also enables the opt-in q4_0 DK=64 path, which stays
         // default-off: measured -6..-10% on gpt-oss). Other Adreno gens and
@@ -17830,8 +17838,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
             if (e == NULL || e[0] == '\0') return -1;
             return (e[0] != '0') ? 1 : 0;
         }();
-        const bool c8_default_on = backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E ||
-                                   backend_ctx->adreno_gen == ADRENO_GPU_GEN::X1E;
+        const bool c8_default_on = backend_ctx->adreno_gen == ADRENO_GPU_GEN::X1E;
         const bool c8_f16_on = (c8_env_state >= 0) ? (c8_env_state == 1) : c8_default_on;
         // Quant-KV (q4_0/q8_0) GQA4 c8: default-on X2E + X1E
         const bool c8_quant_on = (c8_env_state >= 0) ? (c8_env_state == 1) : c8_default_on;
