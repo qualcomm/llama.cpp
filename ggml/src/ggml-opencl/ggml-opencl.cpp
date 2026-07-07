@@ -5448,6 +5448,29 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
         opts += " -D FA_DECODE_ONLY -D FA_DECODE_MINIMAL";
     }
 
+    // c8 cluster width (GGML_OPENCL_FA_CL_C overrides): value = GQA4 cluster
+    // width (kernel default 8); the g8 programs use 2x the value (default 16).
+    // Wider clusters halve per-lane o_acc at the cost of position streams per
+    // subgroup. Per-gen default: X2E uses GQA4 16 / g8 32, keeping per-lane
+    // o_acc at 128B — at 256B (C=8/16) the X2 compiler spills 868/916B private
+    // and c8 LOSES e2e (2026-07-07: wide-C flips f16 g8 -27% -> +84%
+    // (Qwen3-30B @d8k), f16 GQA4 +6% -> +50-93% (Mistral/Qwen3-4B, new @16k
+    // records 12.38/14.11), quant-KV -16/-19% -> +45/+62%; C=32 GQA4 / C=64 g8
+    // overshoot). X1E keeps the original widths — its compiler holds C=8/16
+    // unspilled (hp-hamoa clean-build wins) and wide-C is unmeasured there.
+    // Appended per-program (not to the shared base opts) to avoid a duplicate
+    // -D FA_CL_C with the g8 programs' own define.
+    static const int fa_cl_c_env = []{
+        const char * e = std::getenv("GGML_OPENCL_FA_CL_C");
+        const int x = (e && e[0]) ? atoi(e) : 0;
+        return (x == 8 || x == 16 || x == 32) ? x : 0;   // 0 = per-gen default
+    }();
+    const int fa_cl_c_gqa4 = fa_cl_c_env ? fa_cl_c_env
+        : (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E ? 16 : 0);
+    const std::string opts_cl_c_gqa4 = fa_cl_c_gqa4
+        ? " -D FA_CL_C=" + std::to_string(fa_cl_c_gqa4) : std::string();
+    const std::string fa_cl_c_g8_val = std::to_string(fa_cl_c_gqa4 ? fa_cl_c_gqa4 * 2 : 16);
+
     const char * tag = nullptr;
     switch (variant) {
         case FA_VARIANT_F16:             tag = "fa f16";             break;
@@ -5461,7 +5484,7 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
         default: break;
     }
     cl_program prog = build_program_from_source_ex(
-        backend_ctx->context, backend_ctx->device, src.c_str(), opts,
+        backend_ctx->context, backend_ctx->device, src.c_str(), opts + opts_cl_c_gqa4,
         /*fatal=*/false, tag, /*bin_size=*/0, backend_ctx->queue);
     if (!prog) return false;
 
@@ -5611,7 +5634,7 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
             // FA_CL_C=16 for the g8 program: MQ_GQA=8 doubles the c8 kernel's
             // per-lane o_acc, so widen the cluster (16 lanes/position, 4
             // streams) to keep it at 256B/lane and inside the 192-thread cap.
-            const std::string opts_g8 = opts + " -D MQ_GQA=8 -D MQ_NSG=3 -D MQ_NSG_SPLIT=3 -D FA_MQ_ONLY -D FA_CL_C=16";
+            const std::string opts_g8 = opts + " -D MQ_GQA=8 -D MQ_NSG=3 -D MQ_NSG_SPLIT=3 -D FA_MQ_ONLY -D FA_CL_C=" + fa_cl_c_g8_val;
             cl_program prog_g8 = fa_decode_only ? nullptr : build_program_from_source_ex(
                 backend_ctx->context, backend_ctx->device, src.c_str(), opts_g8,
                 /*fatal=*/false, "fa f32_f16 MQ_GQA=8", /*bin_size=*/0, backend_ctx->queue);
@@ -17616,18 +17639,17 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
 
         const bool nq_in_vec_range = (n_q >= 1) && (n_q <= N_MAX_VEC_NQ);
         const bool nq1_only        = (n_q == 1);
-        // Cluster-parallel decode (c8): DEFAULT-ON for Adreno X1E only, where
-        // the stock kernels compile unspilled (fit WG>=256) and hp-hamoa's
-        // clean-build re-validation holds (+17-56% f16 GQA4, +72/+128% quant-KV;
-        // pin-gated via FA_C8_NO_SG_PIN, 2026-07-04/05, raw data in outbox).
-        // X2E is default-OFF (2026-07-07): the stock kernels are register-capped
-        // (max WG 128 < required 192/256) so dispatch lands on the spilled
-        // NSG_SPLIT=2 fallbacks (868/916B private), which measure e2e f16 g8
-        // -27% (Qwen3-30B @d8k), quant-KV GQA4 -16/-19% (Mistral @d8k/16k),
-        // f16 GQA4 only +5-6% — the 07-04/05 X2 sweep wins do NOT reproduce
-        // from clean rebuilds of the recorded commits (702ae7934/ec916312b;
-        // ALU/BW microbenches + baselines match their records, so it is the
-        // c8 numbers that are stale). Re-enable X2E only with fresh raw logs.
+        // Cluster-parallel decode (c8): DEFAULT-ON for Adreno X2E/X1E on the
+        // f16 DK=128 MQ paths. X1E: stock kernels compile unspilled at C=8/16
+        // (hp-hamoa clean-build re-validation, +17-56% f16 GQA4, +72/+128%
+        // quant-KV, 2026-07-04/05). X2E: requires the WIDE cluster widths
+        // (GQA4 16 / g8 32 — see fa_cl_c_gqa4 in ensure_fa) that keep per-lane
+        // o_acc at 128B; re-measured 2026-07-07 at those widths: f16 g8 +84%
+        // (Qwen3-30B 9.0->16.6 @d8k), f16 GQA4 +50-93% (Mistral/Qwen3-4B, new
+        // @16k records), quant-KV +45/+62%, TBO FLASH_ATTN_EXT 0 FAIL. (At the
+        // original widths X2's compiler spills 868/916B private and c8 LOSES —
+        // that spilled config shipped default-on 07-05..07-07 and caused a
+        // customer-visible fa1-at-depth regression.)
         // GGML_OPENCL_FA_C8 overrides both ways (0 = off, non-0 = on — the
         // explicit-on also enables the opt-in q4_0 DK=64 path, which stays
         // default-off: measured -6..-10% on gpt-oss). Other Adreno gens and
@@ -17637,9 +17659,14 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
             if (e == NULL || e[0] == '\0') return -1;
             return (e[0] != '0') ? 1 : 0;
         }();
-        const bool c8_default_on = backend_ctx->adreno_gen == ADRENO_GPU_GEN::X1E;
+        const bool c8_default_on = backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E ||
+                                   backend_ctx->adreno_gen == ADRENO_GPU_GEN::X1E;
         const bool c8_f16_on = (c8_env_state >= 0) ? (c8_env_state == 1) : c8_default_on;
-        // Quant-KV (q4_0/q8_0) GQA4 c8: default-on X2E + X1E
+        // Quant-KV (q4_0/q8_0) GQA4 c8: default-on X2E + X1E (X2E re-measured
+        // at C=16 2026-07-07: q4-KV +45/+62% @d8k/16k Mistral; X1-85 validated
+        // by hp-hamoa 2026-07-05: q8-KV +128% (9.19 @d16k), q4-KV +72%, clean
+        // TBO + coherence). NOTE the per-gen quant preference differs: X2 is
+        // BW-bound (q4_0 fastest), X1 is dequant-ALU-bound (q8_0 fastest).
         const bool c8_quant_on = (c8_env_state >= 0) ? (c8_env_state == 1) : c8_default_on;
         if (mq_enabled && mq_kv_ok && nq_in_vec_range && !is_causal &&
             backend_ctx->gpu_family != INTEL &&  // MQ FD-split is 64-wide-subgroup tuned; Intel uses basic q1
