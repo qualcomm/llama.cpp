@@ -7516,6 +7516,10 @@ static bool ggml_opencl_can_fuse_moe_combine(const struct ggml_cgraph * cgraph, 
     if (!ggml_is_contiguous(experts) || !ggml_is_contiguous(weights)) return false;
 
     const int n_nodes = 1 + (int)k + (int)(k - 1);  // MUL + k*VIEW + (k-1)*ADD
+    // ggml_can_fuse_subgraph has a fixed idxs[32] buffer (GGML_ASSERT(count < 32));
+    // k can be up to 64 here (n_nodes up to 127), so guard before we call it or the
+    // host aborts. k >= 16 (n_nodes >= 32) falls back to the correct per-op path.
+    if (n_nodes >= 32) return false;
     if (node_idx + n_nodes > cgraph->n_nodes) return false;
 
     enum ggml_op ops[1 + 64 + 63];
