@@ -462,8 +462,9 @@ kernel void kernel_gemv_noshuffle_q4_k_f32_glu(
             upSum   += p.zw;
         }
         dst = (global float*)((global char*)dst + offsetd);
-        dst[gid * 2 + 0] = glu_apply(glu_op, gateSum.s0, upSum.s0);
-        dst[gid * 2 + 1] = glu_apply(glu_op, gateSum.s1, upSum.s1);
+        // Guard output rows (padded x-grid); no-op / byte-identical for ne01 % 128 == 0.
+        if (gid * 2 + 0 < M) dst[gid * 2 + 0] = glu_apply(glu_op, gateSum.s0, upSum.s0);
+        if (gid * 2 + 1 < M) dst[gid * 2 + 1] = glu_apply(glu_op, gateSum.s1, upSum.s1);
     }
 }
 
@@ -701,11 +702,16 @@ kernel void kernel_gemv_noshuffle_q4_k_f32_mc3(
         acc += reduceLM[SUBGROUP_SIZE * 1 + slid];
         acc += reduceLM[SUBGROUP_SIZE * 2 + slid];
         dst = (global float*)((global char*)dst + offsetd);
-        // dst is column-major [M rows x n_cols cols]: (row, col) at col*M + row
-        vstore2((float2)(acc.s0, acc.s1), 0, &(dst[0 * M + gid * 2]));
-        vstore2((float2)(acc.s2, acc.s3), 0, &(dst[1 * M + gid * 2]));
-        if (n_cols > 2) vstore2((float2)(acc.s4, acc.s5), 0, &(dst[2 * M + gid * 2]));
-        if (n_cols > 3) vstore2((float2)(acc.s6, acc.s7), 0, &(dst[3 * M + gid * 2]));
+        // dst is column-major [M rows x n_cols cols]: (row, col) at col*M + row.
+        // Guard output rows (padded x-grid); no-op / byte-identical for ne01 % 128 == 0.
+        const bool w0 = (gid * 2 + 0 < M);
+        const bool w1 = (gid * 2 + 1 < M);
+        if (w0) dst[0 * M + gid * 2 + 0] = acc.s0;
+        if (w1) dst[0 * M + gid * 2 + 1] = acc.s1;
+        if (w0) dst[1 * M + gid * 2 + 0] = acc.s2;
+        if (w1) dst[1 * M + gid * 2 + 1] = acc.s3;
+        if (n_cols > 2) { if (w0) dst[2 * M + gid * 2 + 0] = acc.s4; if (w1) dst[2 * M + gid * 2 + 1] = acc.s5; }
+        if (n_cols > 3) { if (w0) dst[3 * M + gid * 2 + 0] = acc.s6; if (w1) dst[3 * M + gid * 2 + 1] = acc.s7; }
     }
 }
 
@@ -799,7 +805,10 @@ kernel void kernel_gemv_noshuffle_q4_k_f32_splitk(
         for (uint i = 0; i < nsg - 1; ++i) {
             totalSum += reduceLM[SUBGROUP_SIZE * i + slid];
         }
-        vstore2(totalSum, 0, &(partial[kslice * M + gid * 2]));
+        // Guard output rows: the padded x-grid tail would overrun this K-slice's
+        // partial region into the next slice. No-op / byte-identical for ne01 % 128 == 0.
+        if (gid * 2 + 0 < M) partial[kslice * M + gid * 2 + 0] = totalSum.s0;
+        if (gid * 2 + 1 < M) partial[kslice * M + gid * 2 + 1] = totalSum.s1;
     }
 }
 
