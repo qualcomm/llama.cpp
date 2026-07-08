@@ -412,10 +412,15 @@ kernel void kernel_gemv_noshuffle_q6_K_f32_mc3(
         acc += reduce_lm[SUBGROUP_SIZE*1 + slid];
         acc += reduce_lm[SUBGROUP_SIZE*2 + slid];
         dst = (global float*)((global char*)dst + offsetd);
-        // dst column-major [ne01 rows x 3 cols]: (row, col) at col*ne01 + row
-        vstore2((float2)(acc.s0, acc.s1), 0, &(dst[0*ne01 + gid*2]));
-        vstore2((float2)(acc.s2, acc.s3), 0, &(dst[1*ne01 + gid*2]));
-        if (n_cols > 2) vstore2((float2)(acc.s4, acc.s5), 0, &(dst[2*ne01 + gid*2]));
-        if (n_cols > 3) vstore2((float2)(acc.s6, acc.s7), 0, &(dst[3*ne01 + gid*2]));
+        // dst column-major [ne01 rows x 3 cols]: (row, col) at col*ne01 + row.
+        // Guard output rows (padded x-grid); no-op / byte-identical for ne01 % 128 == 0.
+        const bool w0 = (gid*2 + 0 < ne01);
+        const bool w1 = (gid*2 + 1 < ne01);
+        if (w0) dst[0*ne01 + gid*2 + 0] = acc.s0;
+        if (w1) dst[0*ne01 + gid*2 + 1] = acc.s1;
+        if (w0) dst[1*ne01 + gid*2 + 0] = acc.s2;
+        if (w1) dst[1*ne01 + gid*2 + 1] = acc.s3;
+        if (n_cols > 2) { if (w0) dst[2*ne01 + gid*2 + 0] = acc.s4; if (w1) dst[2*ne01 + gid*2 + 1] = acc.s5; }
+        if (n_cols > 3) { if (w0) dst[3*ne01 + gid*2 + 0] = acc.s6; if (w1) dst[3*ne01 + gid*2 + 1] = acc.s7; }
     }
 }
