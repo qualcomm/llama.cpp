@@ -629,6 +629,27 @@ struct ggml_backend_opencl_context {
     bool adreno_x2_class() const {
         return adreno_gen == ADRENO_GPU_GEN::X2E || adreno_gen == ADRENO_GPU_GEN::A8X;
     }
+
+    // Derived FA tuning (scale axis of the capability/scale model): computed
+    // once in ggml_cl2_init after the identity/capability/scale queries, read
+    // by the compile/dispatch sites instead of per-chip constants there.
+    //
+    // fa_c8_cluster: GQA4 c8 cluster width the FA programs compile at (the g8
+    // programs use 2x). 0 = kernel-default widths (C=8 / g8 16). The deciding
+    // property is per-lane o_acc register pressure — a compiler/register-file
+    // trait of the ISA generation, NOT compute-unit count: X2-class compilers
+    // spill the kernel-default widths (868/916B private, c8 loses e2e) and
+    // need 16/32 to keep o_acc at 128B/lane, while X1's compiler holds the
+    // defaults unspilled (wide-C unmeasured there).
+    // GGML_OPENCL_FA_CL_C={8,16,32} overrides for per-device A/B.
+    int  fa_c8_cluster = 0;
+    // fa_c8_default_on: cluster-parallel decode FA default. Follows per-gen
+    // measured validation, not class membership: X2E (wide-C re-measure
+    // 2026-07-07) and X1E (hp-hamoa 2026-07-04/05) are validated; A8X/840 is
+    // pending a decode-at-depth A/B — fa_c8_cluster is already X2-class there,
+    // so GGML_OPENCL_FA_C8=1 exercises the intended wide config.
+    bool fa_c8_default_on = false;
+
     bool disable_fusion;
     bool fuse_rope_set_rows = true;  // opt-out GGML_OPENCL_FUSE_ROPE_SET_ROWS=0
     bool fuse_rms_rope = true;       // opt-out GGML_OPENCL_FUSE_RMS_ROPE=0
@@ -5464,25 +5485,20 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
         opts += " -D FA_DECODE_ONLY -D FA_DECODE_MINIMAL";
     }
 
-    // c8 cluster width (GGML_OPENCL_FA_CL_C overrides): value = GQA4 cluster
-    // width (kernel default 8); the g8 programs use 2x the value (default 16).
-    // Wider clusters halve per-lane o_acc at the cost of position streams per
-    // subgroup. Per-gen default: X2E uses GQA4 16 / g8 32, keeping per-lane
-    // o_acc at 128B — at 256B (C=8/16) the X2 compiler spills 868/916B private
-    // and c8 LOSES e2e (2026-07-07: wide-C flips f16 g8 -27% -> +84%
-    // (Qwen3-30B @d8k), f16 GQA4 +6% -> +50-93% (Mistral/Qwen3-4B, new @16k
-    // records 12.38/14.11), quant-KV -16/-19% -> +45/+62%; C=32 GQA4 / C=64 g8
+    // c8 cluster width: value = GQA4 cluster width (kernel default 8); the g8
+    // programs use 2x the value (default 16). Wider clusters halve per-lane
+    // o_acc at the cost of position streams per subgroup. Derived at init into
+    // fa_c8_cluster (env GGML_OPENCL_FA_CL_C overrides; see the context-struct
+    // comment): X2-class compiles GQA4 16 / g8 32, keeping per-lane o_acc at
+    // 128B — at 256B (C=8/16) the X2 compiler spills 868/916B private and c8
+    // LOSES e2e (2026-07-07: wide-C flips f16 g8 -27% -> +84% (Qwen3-30B
+    // @d8k), f16 GQA4 +6% -> +50-93% (Mistral/Qwen3-4B, new @16k records
+    // 12.38/14.11), quant-KV -16/-19% -> +45/+62%; C=32 GQA4 / C=64 g8
     // overshoot). X1E keeps the original widths — its compiler holds C=8/16
     // unspilled (hp-hamoa clean-build wins) and wide-C is unmeasured there.
     // Appended per-program (not to the shared base opts) to avoid a duplicate
     // -D FA_CL_C with the g8 programs' own define.
-    static const int fa_cl_c_env = []{
-        const char * e = std::getenv("GGML_OPENCL_FA_CL_C");
-        const int x = (e && e[0]) ? atoi(e) : 0;
-        return (x == 8 || x == 16 || x == 32) ? x : 0;   // 0 = per-gen default
-    }();
-    const int fa_cl_c_gqa4 = fa_cl_c_env ? fa_cl_c_env
-        : (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E ? 16 : 0);
+    const int fa_cl_c_gqa4 = backend_ctx->fa_c8_cluster;
     const std::string opts_cl_c_gqa4 = fa_cl_c_gqa4
         ? " -D FA_CL_C=" + std::to_string(fa_cl_c_gqa4) : std::string();
     const std::string fa_cl_c_g8_val = std::to_string(fa_cl_c_gqa4 ? fa_cl_c_gqa4 * 2 : 16);
@@ -6325,6 +6341,8 @@ static void ggml_opencl_print_backend_info(ggml_backend_opencl_device_context * 
         backend_ctx->fp16_support ? "true" : "false");
     GGML_LOG_INFO("ggml_opencl: integer dot product (dp4a) support: %s, compute units: %u\n",
         backend_ctx->has_integer_dot_product ? "true" : "false", backend_ctx->compute_units);
+    GGML_LOG_INFO("ggml_opencl: fa c8 tuning: cluster=%d (0=kernel default), default_on=%s\n",
+        backend_ctx->fa_c8_cluster, backend_ctx->fa_c8_default_on ? "true" : "false");
     GGML_LOG_INFO("ggml_opencl: mem base addr align: %u\n",
         backend_ctx->alignment);
     GGML_LOG_INFO("ggml_opencl: global mem size: %zu MB\n",
@@ -6534,6 +6552,19 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
     backend_ctx->has_integer_dot_product = strstr(ext_buffer, "cl_khr_integer_dot_product") != NULL;
 
     CL_CHECK(clGetDeviceInfo(device, CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(cl_uint), &backend_ctx->compute_units, NULL));
+
+    // Derived FA c8 tuning (see the field comments on the context struct):
+    // cluster width follows the compiler class, default-on follows per-gen
+    // measured validation.
+    {
+        const char * env = getenv("GGML_OPENCL_FA_CL_C");
+        const int v = (env && env[0]) ? atoi(env) : 0;
+        // 8/16/32 = explicit width; anything else (unset/0) = derived default
+        backend_ctx->fa_c8_cluster = (v == 8 || v == 16 || v == 32) ? v
+            : (backend_ctx->adreno_x2_class() ? 16 : 0);
+    }
+    backend_ctx->fa_c8_default_on = backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E ||
+                                    backend_ctx->adreno_gen == ADRENO_GPU_GEN::X1E;
 
     // check Adreno large buffer support
     backend_ctx->adreno_has_large_buffer = strstr(ext_buffer, "cl_qcom_large_buffer") != NULL;
@@ -17667,17 +17698,19 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
 
         const bool nq_in_vec_range = (n_q >= 1) && (n_q <= N_MAX_VEC_NQ);
         const bool nq1_only        = (n_q == 1);
-        // Cluster-parallel decode (c8): DEFAULT-ON for Adreno X2E/X1E on the
-        // f16 DK=128 MQ paths. X1E: stock kernels compile unspilled at C=8/16
-        // (hp-hamoa clean-build re-validation, +17-56% f16 GQA4, +72/+128%
-        // quant-KV, 2026-07-04/05). X2E: requires the WIDE cluster widths
-        // (GQA4 16 / g8 32 — see fa_cl_c_gqa4 in ensure_fa) that keep per-lane
-        // o_acc at 128B; re-measured 2026-07-07 at those widths: f16 g8 +84%
-        // (Qwen3-30B 9.0->16.6 @d8k), f16 GQA4 +50-93% (Mistral/Qwen3-4B, new
-        // @16k records), quant-KV +45/+62%, TBO FLASH_ATTN_EXT 0 FAIL. (At the
-        // original widths X2's compiler spills 868/916B private and c8 LOSES —
-        // that spilled config shipped default-on 07-05..07-07 and caused a
-        // customer-visible fa1-at-depth regression.)
+        // Cluster-parallel decode (c8): default derived at init into
+        // fa_c8_default_on (X2E/X1E validated; see the context-struct comment)
+        // for the f16 DK=128 MQ paths. X1E: stock kernels compile unspilled at
+        // C=8/16 (hp-hamoa clean-build re-validation, +17-56% f16 GQA4,
+        // +72/+128% quant-KV, 2026-07-04/05). X2E: requires the WIDE cluster
+        // widths (GQA4 16 / g8 32 — fa_c8_cluster, consumed in ensure_fa) that
+        // keep per-lane o_acc at 128B; re-measured 2026-07-07 at those widths:
+        // f16 g8 +84% (Qwen3-30B 9.0->16.6 @d8k), f16 GQA4 +50-93%
+        // (Mistral/Qwen3-4B, new @16k records), quant-KV +45/+62%, TBO
+        // FLASH_ATTN_EXT 0 FAIL. (At the original widths X2's compiler spills
+        // 868/916B private and c8 LOSES — that spilled config shipped
+        // default-on 07-05..07-07 and caused a customer-visible fa1-at-depth
+        // regression.)
         // GGML_OPENCL_FA_C8 overrides both ways (0 = off, non-0 = on — the
         // explicit-on also enables the opt-in q4_0 DK=64 path, which stays
         // default-off: measured -6..-10% on gpt-oss). Other Adreno gens and
@@ -17687,8 +17720,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
             if (e == NULL || e[0] == '\0') return -1;
             return (e[0] != '0') ? 1 : 0;
         }();
-        const bool c8_default_on = backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E ||
-                                   backend_ctx->adreno_gen == ADRENO_GPU_GEN::X1E;
+        const bool c8_default_on = backend_ctx->fa_c8_default_on;
         const bool c8_f16_on = (c8_env_state >= 0) ? (c8_env_state == 1) : c8_default_on;
         // Quant-KV (q4_0/q8_0) GQA4 c8: default-on X2E + X1E (X2E re-measured
         // at C=16 2026-07-07: q4-KV +45/+62% @d8k/16k Mistral; X1-85 validated
