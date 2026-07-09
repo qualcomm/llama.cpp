@@ -170,6 +170,32 @@ enum ADRENO_GPU_GEN {
     X2E,
 };
 
+// Ordered capability level for the gpu-profile gating model (Phase 3). The
+// ADRENO_GPU_GEN enum order does NOT reflect ISA capability — A8X (Adreno
+// 830/840, Snapdragon 8 Elite) is the SAME generation as the X2 laptop part
+// (Snapdragon X2 Elite), a generation ABOVE X1E — so gates cannot use the raw
+// enum ordinal. gen_level encodes the true order; forward-facing gates compare
+// with >= so a newer chip inherits every path a same-or-older gen enabled.
+// (X1E-specific driver-quirk carve-outs still match == X1E; those are negative
+// workarounds for one old compiler, not capability levels.)
+enum {
+    GEN_LEVEL_NONE = 0,
+    GEN_LEVEL_A7X  = 70,
+    GEN_LEVEL_X1E  = 81,   // Snapdragon X Elite (gen 1)
+    GEN_LEVEL_X2   = 90,   // Snapdragon X2 Elite == Snapdragon 8 Elite (A8X); same ISA gen
+    GEN_LEVEL_MAX_KNOWN = GEN_LEVEL_X2,
+};
+
+static int adreno_gen_level(ADRENO_GPU_GEN gen) {
+    switch (gen) {
+        case ADRENO_GPU_GEN::A7X: return GEN_LEVEL_A7X;
+        case ADRENO_GPU_GEN::X1E: return GEN_LEVEL_X1E;
+        case ADRENO_GPU_GEN::A8X: return GEN_LEVEL_X2;   // same gen as X2E
+        case ADRENO_GPU_GEN::X2E: return GEN_LEVEL_X2;
+        default:                  return GEN_LEVEL_NONE; // ADRENO_UNKNOWN handled at init (optimistic)
+    }
+}
+
 enum ADRENO_CL_COMPILER_TYPE {
     E031,
     DX,
@@ -615,6 +641,8 @@ struct ggml_backend_opencl_context {
     bool has_qcom_subgroup_shuffle = false;  // specifically cl_qcom_subgroup_shuffle
     bool has_integer_dot_product = false;    // cl_khr_integer_dot_product (dp4a); kernels #ifdef on the same name
     cl_uint compute_units = 0;               // CL_DEVICE_MAX_COMPUTE_UNITS (scale axis for tuning formulas)
+    int gen_level = GEN_LEVEL_NONE;          // ordered capability level (see adreno_gen_level); set at init,
+                                             // ADRENO_UNKNOWN -> optimistic highest-known + GGML_OPENCL_GEN_LEVEL override
 
     // dp4a MoE GEMM/GEMV paths gate on capability, not chip identity, so any
     // Adreno advertising the integer-dot extension (X2E, X1E, A8X/840, future
@@ -624,10 +652,13 @@ struct ggml_backend_opencl_context {
     }
     // The dense dp4a GEMMs must NOT gate on the extension alone: X1E advertises
     // it but its compiler spills the dense dp4a kernels (792B vs 352B private
-    // on X2) and they lose to f16 there. X2-class = the X2E ISA generation,
-    // including its mobile flavor A8X (Adreno 830/840).
+    // on X2) and they lose to f16 there. Gate on the ISA capability LEVEL (>=),
+    // not chip identity: X2-class = the X2/8-Elite generation (X2E, its mobile
+    // twin A8X = Adreno 830/840) and anything newer. A future higher gen
+    // inherits these without a code edit; an unknown chip gets them via the
+    // optimistic init default (dialable with GGML_OPENCL_GEN_LEVEL).
     bool adreno_x2_class() const {
-        return adreno_gen == ADRENO_GPU_GEN::X2E || adreno_gen == ADRENO_GPU_GEN::A8X;
+        return gpu_family == GPU_FAMILY::ADRENO && gen_level >= GEN_LEVEL_X2;
     }
 
     // Derived FA tuning (scale axis of the capability/scale model): computed
@@ -642,12 +673,21 @@ struct ggml_backend_opencl_context {
     // need 16/32 to keep o_acc at 128B/lane, while X1's compiler holds the
     // defaults unspilled (wide-C unmeasured there).
     // GGML_OPENCL_FA_CL_C={8,16,32} overrides for per-device A/B.
+    // fa_c8_cluster is the base/quant-KV width; fa_c8_cluster_f16 is the f16
+    // GQA4-dense width, which wants a WIDER cluster on the 12-CU A8X (hphq
+    // 2026-07-09: f16 C=32 beats C=16 by +25.7%, while quant KV stays best at
+    // 16). The f16 optimum tracks compute-unit count (X2-90 @16 CU -> 16;
+    // A8X/840 @12 CU -> 32) — the scale axis the capability model predicted;
+    // encoded per-gen from the two validated points, generalize to f(n_cu)
+    // when a third flavor gives data. The g8 (GQA8) program always doubles the
+    // BASE width (never the f16 32: 2x=64 trips the kernel cluster guard).
     int  fa_c8_cluster = 0;
-    // fa_c8_default_on: cluster-parallel decode FA default. Follows per-gen
-    // measured validation, not class membership: X2E (wide-C re-measure
-    // 2026-07-07) and X1E (hp-hamoa 2026-07-04/05) are validated; A8X/840 is
-    // pending a decode-at-depth A/B — fa_c8_cluster is already X2-class there,
-    // so GGML_OPENCL_FA_C8=1 exercises the intended wide config.
+    int  fa_c8_cluster_f16 = 0;
+    // fa_c8_default_on: cluster-parallel decode FA default. Gated on gen_level
+    // >= X1 (X1E, A8X/840, X2E and newer). All device-validated: X2E (wide-C
+    // re-measure 2026-07-07), X1E (hp-hamoa 2026-07-04/05), A8X (hphq 840
+    // 2026-07-09: c8 +296..563% tg at d4096/d8192, coherent). Newer/unknown
+    // gens inherit via the optimistic init default.
     bool fa_c8_default_on = false;
 
     bool disable_fusion;
@@ -5498,10 +5538,18 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
     // unspilled (hp-hamoa clean-build wins) and wide-C is unmeasured there.
     // Appended per-program (not to the shared base opts) to avoid a duplicate
     // -D FA_CL_C with the g8 programs' own define.
-    const int fa_cl_c_gqa4 = backend_ctx->fa_c8_cluster;
+    // f16 GQA4-dense uses the (possibly wider) f16 width; quant-KV uses the
+    // base width. See fa_c8_cluster / fa_c8_cluster_f16.
+    const int fa_cl_c_gqa4 = (variant == FA_VARIANT_F32_F16)
+        ? backend_ctx->fa_c8_cluster_f16
+        : backend_ctx->fa_c8_cluster;
     const std::string opts_cl_c_gqa4 = fa_cl_c_gqa4
         ? " -D FA_CL_C=" + std::to_string(fa_cl_c_gqa4) : std::string();
-    const std::string fa_cl_c_g8_val = std::to_string(fa_cl_c_gqa4 ? fa_cl_c_gqa4 * 2 : 16);
+    // The g8 (GQA8) program doubles the BASE width, never the f16 width — a
+    // 2x of 32 gives 64, which trips the kernel's cluster divisibility guard.
+    // Cap the base at 16 so g8 stays valid even under an explicit FA_CL_C=32.
+    const int fa_cl_c_g8_base = backend_ctx->fa_c8_cluster > 16 ? 16 : backend_ctx->fa_c8_cluster;
+    const std::string fa_cl_c_g8_val = std::to_string(fa_cl_c_g8_base ? fa_cl_c_g8_base * 2 : 16);
 
     const char * tag = nullptr;
     switch (variant) {
@@ -6341,6 +6389,8 @@ static void ggml_opencl_print_backend_info(ggml_backend_opencl_device_context * 
         backend_ctx->fp16_support ? "true" : "false");
     GGML_LOG_INFO("ggml_opencl: integer dot product (dp4a) support: %s, compute units: %u\n",
         backend_ctx->has_integer_dot_product ? "true" : "false", backend_ctx->compute_units);
+    GGML_LOG_INFO("ggml_opencl: gpu capability level: %d (x2-class paths: %s)\n",
+        backend_ctx->gen_level, backend_ctx->adreno_x2_class() ? "on" : "off");
     GGML_LOG_INFO("ggml_opencl: fa c8 tuning: cluster=%d (0=kernel default), default_on=%s\n",
         backend_ctx->fa_c8_cluster, backend_ctx->fa_c8_default_on ? "true" : "false");
     GGML_LOG_INFO("ggml_opencl: mem base addr align: %u\n",
@@ -6553,18 +6603,44 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
 
     CL_CHECK(clGetDeviceInfo(device, CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(cl_uint), &backend_ctx->compute_units, NULL));
 
+    // Ordered capability level (Phase 3 of the capability/scale gating model).
+    // Forward-facing gates compare gen_level with >= so a newer chip inherits
+    // every path a same-or-older gen enabled. Unknown Adreno -> optimistic:
+    // assume the highest known gen (the motivating case, the Adreno 840, was a
+    // NEW same-or-newer chip stranded at zero opts, not a resurrected old one),
+    // but still feature-gated (dp4a paths also require the extension) and
+    // dialable back for bring-up on a genuinely older unknown part.
+    //   GGML_OPENCL_GEN_LEVEL=<n>  (e.g. 81 to cap an unknown chip at X1-class)
+    if (backend_ctx->gpu_family == GPU_FAMILY::ADRENO) {
+        int lvl = adreno_gen_level(backend_ctx->adreno_gen);
+        if (backend_ctx->adreno_gen == ADRENO_GPU_GEN::ADRENO_UNKNOWN) {
+            lvl = GEN_LEVEL_MAX_KNOWN;
+            GGML_LOG_WARN("ggml_opencl: unknown Adreno gen; assuming capability level %d "
+                          "(override with GGML_OPENCL_GEN_LEVEL)\n", lvl);
+        }
+        if (const char * env = getenv("GGML_OPENCL_GEN_LEVEL")) {
+            if (env[0]) lvl = atoi(env);
+        }
+        backend_ctx->gen_level = lvl;
+    }
+
     // Derived FA c8 tuning (see the field comments on the context struct):
-    // cluster width follows the compiler class, default-on follows per-gen
-    // measured validation.
+    // cluster width follows the compiler class, default-on follows the gen
+    // level (>= X1: X1E, A8X/840, X2E and newer — all device-validated or
+    // optimistic-forward).
     {
         const char * env = getenv("GGML_OPENCL_FA_CL_C");
         const int v = (env && env[0]) ? atoi(env) : 0;
-        // 8/16/32 = explicit width; anything else (unset/0) = derived default
-        backend_ctx->fa_c8_cluster = (v == 8 || v == 16 || v == 32) ? v
-            : (backend_ctx->adreno_x2_class() ? 16 : 0);
+        const bool env_set = (v == 8 || v == 16 || v == 32);  // else unset/invalid -> derived
+        const int base = env_set ? v : (backend_ctx->adreno_x2_class() ? 16 : 0);
+        backend_ctx->fa_c8_cluster = base;
+        // f16 GQA4-dense wants a wider cluster on the 12-CU A8X (see the field
+        // comment). Env override wins uniformly.
+        backend_ctx->fa_c8_cluster_f16 = env_set ? v
+            : (backend_ctx->adreno_gen == ADRENO_GPU_GEN::A8X ? 32 : base);
     }
-    backend_ctx->fa_c8_default_on = backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E ||
-                                    backend_ctx->adreno_gen == ADRENO_GPU_GEN::X1E;
+    backend_ctx->fa_c8_default_on = backend_ctx->gpu_family == GPU_FAMILY::ADRENO &&
+                                    backend_ctx->gen_level >= GEN_LEVEL_X1E;
 
     // check Adreno large buffer support
     backend_ctx->adreno_has_large_buffer = strstr(ext_buffer, "cl_qcom_large_buffer") != NULL;
@@ -17699,22 +17775,25 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         const bool nq_in_vec_range = (n_q >= 1) && (n_q <= N_MAX_VEC_NQ);
         const bool nq1_only        = (n_q == 1);
         // Cluster-parallel decode (c8): default derived at init into
-        // fa_c8_default_on (X2E/X1E validated; see the context-struct comment)
-        // for the f16 DK=128 MQ paths. X1E: stock kernels compile unspilled at
-        // C=8/16 (hp-hamoa clean-build re-validation, +17-56% f16 GQA4,
-        // +72/+128% quant-KV, 2026-07-04/05). X2E: requires the WIDE cluster
-        // widths (GQA4 16 / g8 32 — fa_c8_cluster, consumed in ensure_fa) that
-        // keep per-lane o_acc at 128B; re-measured 2026-07-07 at those widths:
-        // f16 g8 +84% (Qwen3-30B 9.0->16.6 @d8k), f16 GQA4 +50-93%
-        // (Mistral/Qwen3-4B, new @16k records), quant-KV +45/+62%, TBO
-        // FLASH_ATTN_EXT 0 FAIL. (At the original widths X2's compiler spills
-        // 868/916B private and c8 LOSES — that spilled config shipped
-        // default-on 07-05..07-07 and caused a customer-visible fa1-at-depth
-        // regression.)
+        // fa_c8_default_on (gen_level >= X1: X1E/A8X/X2E and newer; see the
+        // context-struct comment) for the f16 DK=128 MQ paths. X1E: stock
+        // kernels compile unspilled at C=8/16 (hp-hamoa clean-build
+        // re-validation, +17-56% f16 GQA4, +72/+128% quant-KV, 2026-07-04/05).
+        // X2E: requires the WIDE cluster widths (GQA4 16 / g8 32 —
+        // fa_c8_cluster, consumed in ensure_fa) that keep per-lane o_acc at
+        // 128B; re-measured 2026-07-07 at those widths: f16 g8 +84% (Qwen3-30B
+        // 9.0->16.6 @d8k), f16 GQA4 +50-93% (Mistral/Qwen3-4B, new @16k
+        // records), quant-KV +45/+62%, TBO FLASH_ATTN_EXT 0 FAIL. (At the
+        // original widths X2's compiler spills 868/916B private and c8 LOSES —
+        // that spilled config shipped default-on 07-05..07-07 and caused a
+        // customer-visible fa1-at-depth regression.) A8X (840): hphq 2026-07-09
+        // c8 +296..563% tg @d4096/d8192, coherent; its width preference is
+        // KV-type-dependent (f16 wants 32, quant 16 — see fa_c8_cluster in
+        // ensure_fa).
         // GGML_OPENCL_FA_C8 overrides both ways (0 = off, non-0 = on — the
         // explicit-on also enables the opt-in q4_0 DK=64 path, which stays
-        // default-off: measured -6..-10% on gpt-oss). Other Adreno gens and
-        // Intel stay default-off pending validation.
+        // default-off: measured -6..-10% on gpt-oss). Gens below X1 and Intel
+        // stay default-off pending validation.
         static const int c8_env_state = []{
             const char * e = getenv("GGML_OPENCL_FA_C8");
             if (e == NULL || e[0] == '\0') return -1;
