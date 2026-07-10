@@ -666,21 +666,22 @@ struct ggml_backend_opencl_context {
     // by the compile/dispatch sites instead of per-chip constants there.
     //
     // fa_c8_cluster: GQA4 c8 cluster width the FA programs compile at (the g8
-    // programs use 2x). 0 = kernel-default widths (C=8 / g8 16). The deciding
-    // property is per-lane o_acc register pressure — a compiler/register-file
-    // trait of the ISA generation, NOT compute-unit count: X2-class compilers
-    // spill the kernel-default widths (868/916B private, c8 loses e2e) and
-    // need 16/32 to keep o_acc at 128B/lane, while X1's compiler holds the
-    // defaults unspilled (wide-C unmeasured there).
+    // programs use 2x). 0 = kernel-default widths (C=8 / g8 16). On X2-class
+    // the deciding property is per-lane o_acc register pressure: those
+    // compilers spill the kernel-default widths (868/916B private, c8 loses
+    // e2e) and need 16/32 to keep o_acc at 128B/lane. X1E's compiler holds the
+    // defaults unspilled, yet measured wide-C is STILL a win there (hp-hamoa
+    // 2026-07-10: C=16 = +28-30% on DK128-GQA4 decode, neutral on DK64 / GQA1
+    // / quant-KV), so every c8-default-on gen (>= X1E) takes base 16.
     // GGML_OPENCL_FA_CL_C={8,16,32} overrides for per-device A/B.
     // fa_c8_cluster is the base/quant-KV width; fa_c8_cluster_f16 is the f16
     // GQA4-dense width, which wants a WIDER cluster on the 12-CU A8X (hphq
     // 2026-07-09: f16 C=32 beats C=16 by +25.7%, while quant KV stays best at
-    // 16). The f16 optimum tracks compute-unit count (X2-90 @16 CU -> 16;
-    // A8X/840 @12 CU -> 32) — the scale axis the capability model predicted;
-    // encoded per-gen from the two validated points, generalize to f(n_cu)
-    // when a third flavor gives data. The g8 (GQA8) program always doubles the
-    // BASE width (never the f16 32: 2x=64 trips the kernel cluster guard).
+    // 16). Three validated f16 points: X1E @6 CU -> 16, A8X @12 CU -> 32,
+    // X2E @16 CU -> 16 — NOT monotonic in compute-unit count, so the width is
+    // encoded per-gen; do not generalize to f(n_cu). The g8 (GQA8) program
+    // always doubles the BASE width (never the f16 32: 2x=64 trips the kernel
+    // cluster guard).
     int  fa_c8_cluster = 0;
     int  fa_c8_cluster_f16 = 0;
     // fa_c8_default_on: cluster-parallel decode FA default. Gated on gen_level
@@ -5534,8 +5535,9 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
     // LOSES e2e (2026-07-07: wide-C flips f16 g8 -27% -> +84% (Qwen3-30B
     // @d8k), f16 GQA4 +6% -> +50-93% (Mistral/Qwen3-4B, new @16k records
     // 12.38/14.11), quant-KV -16/-19% -> +45/+62%; C=32 GQA4 / C=64 g8
-    // overshoot). X1E keeps the original widths — its compiler holds C=8/16
-    // unspilled (hp-hamoa clean-build wins) and wide-C is unmeasured there.
+    // overshoot). X1E also compiles GQA4 16 — no spill there, but measured
+    // C=16 wins +28-30% on DK128-GQA4 decode (hp-hamoa 2026-07-10), neutral
+    // elsewhere.
     // Appended per-program (not to the shared base opts) to avoid a duplicate
     // -D FA_CL_C with the g8 programs' own define.
     // f16 GQA4-dense uses the (possibly wider) f16 width; quant-KV uses the
@@ -6632,7 +6634,12 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
         const char * env = getenv("GGML_OPENCL_FA_CL_C");
         const int v = (env && env[0]) ? atoi(env) : 0;
         const bool env_set = (v == 8 || v == 16 || v == 32);  // else unset/invalid -> derived
-        const int base = env_set ? v : (backend_ctx->adreno_x2_class() ? 16 : 0);
+        // Base width 16 for every gen that runs c8 by default (>= X1E): X2-class
+        // needs it to avoid the o_acc spill; X1E doesn't spill but measures C=16
+        // as a +28-30% DK128-GQA4 decode win anyway (see the field comment).
+        const int base = env_set ? v
+            : (backend_ctx->gpu_family == GPU_FAMILY::ADRENO &&
+               backend_ctx->gen_level >= GEN_LEVEL_X1E ? 16 : 0);
         backend_ctx->fa_c8_cluster = base;
         // f16 GQA4-dense wants a wider cluster on the 12-CU A8X (see the field
         // comment). Env override wins uniformly.
