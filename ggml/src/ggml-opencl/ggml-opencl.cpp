@@ -636,6 +636,7 @@ struct ggml_backend_opencl_context {
     size_t max_alloc_size;
     size_t max_workgroup_size;
     bool fp16_support;
+    bool half_denorm_support = false;        // CL_DEVICE_HALF_FP_CONFIG & CL_FP_DENORM (A7X flushes f16 denorms)
     bool has_vector_subgroup_broadcast;
     bool has_subgroup_shuffle = false;       // cl_khr_subgroup_shuffle or cl_qcom_subgroup_shuffle
     bool has_qcom_subgroup_shuffle = false;  // specifically cl_qcom_subgroup_shuffle
@@ -6387,8 +6388,9 @@ static void ggml_opencl_print_backend_info(ggml_backend_opencl_device_context * 
         backend_ctx->has_vector_subgroup_broadcast ? "true" : "false");
     GGML_LOG_INFO("ggml_opencl: subgroup shuffle support: %s\n",
         backend_ctx->has_subgroup_shuffle ? "true" : "false");
-    GGML_LOG_INFO("ggml_opencl: device FP16 support: %s\n",
-        backend_ctx->fp16_support ? "true" : "false");
+    GGML_LOG_INFO("ggml_opencl: device FP16 support: %s (denorm: %s)\n",
+        backend_ctx->fp16_support ? "true" : "false",
+        backend_ctx->half_denorm_support ? "true" : "false");
     GGML_LOG_INFO("ggml_opencl: integer dot product (dp4a) support: %s, compute units: %u\n",
         backend_ctx->has_integer_dot_product ? "true" : "false", backend_ctx->compute_units);
     GGML_LOG_INFO("ggml_opencl: gpu capability level: %d (x2-class paths: %s)\n",
@@ -6602,6 +6604,17 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
     // dp4a capability, feature-detected so new same-class devices pick up the
     // dp4a paths without a per-name gate
     backend_ctx->has_integer_dot_product = strstr(ext_buffer, "cl_khr_integer_dot_product") != NULL;
+
+    // f16 denormal support, feature-detected. The A7X (Adreno 740) reports no
+    // CL_FP_DENORM in its half config and flushes f16 denormals to zero on store,
+    // which diverges from a denorm-preserving reference on any kernel writing f16.
+    {
+        cl_device_fp_config half_cfg = 0;
+        if (backend_ctx->fp16_support &&
+            clGetDeviceInfo(device, 0x1033 /*CL_DEVICE_HALF_FP_CONFIG*/, sizeof(half_cfg), &half_cfg, NULL) == CL_SUCCESS) {
+            backend_ctx->half_denorm_support = (half_cfg & CL_FP_DENORM) != 0;
+        }
+    }
 
     CL_CHECK(clGetDeviceInfo(device, CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(cl_uint), &backend_ctx->compute_units, NULL));
 
@@ -7747,6 +7760,13 @@ static bool ggml_opencl_can_fuse(const ggml_backend_opencl_context * backend_ctx
         const enum ggml_op rsr_ops[] = { GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS };
         const int          rsr_out[] = { node_idx + 2 };
         if (!ggml_can_fuse_subgraph(cgraph, node_idx, 3, rsr_ops, rsr_out, 1)) {
+            return false;
+        }
+        // The fused kernel stores rope output straight to the f16 K-cache. On a
+        // device without f16 denormal support (A7X) that flush-to-zero diverges
+        // from the denorm-preserving reference; the unfused path (f32 rope then
+        // set_rows) avoids it. Decline the fusion there.
+        if (!backend_ctx->half_denorm_support) {
             return false;
         }
         return ggml_opencl_should_fuse_rope_set_rows(
