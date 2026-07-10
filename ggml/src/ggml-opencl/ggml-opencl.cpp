@@ -6435,7 +6435,18 @@ inline bool use_adreno_kernels(const ggml_backend_opencl_context *backend_ctx, c
 }
 
 inline bool use_adreno_moe_kernels(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor) {
-    GGML_UNUSED(backend_ctx);
+    // The A7X compiler (Adreno 740, E031.41) miscompiles the *_trans4_ns weight-convert
+    // kernels this MoE layout depends on — they alias a byte pointer into a private
+    // ushort8 — so every quant routed through it gets garbage weights. Decline the
+    // layout wholesale there: q4_0/q8_0/mxfp4 fall back to the general mul_mv_id
+    // kernels, which read the plain convert that the dense path already exercises on
+    // this compiler, and the remaining quants have no general MUL_MAT_ID support so
+    // ggml_opencl_supports_op declines them to CPU. Both the convert in set_tensor and
+    // the dispatch in ggml_cl_mul_mat_id key off this predicate, so the buffer layout
+    // and the kernel reading it stay in agreement.
+    if (backend_ctx && backend_ctx->adreno_gen == ADRENO_GPU_GEN::A7X) {
+        return false;
+    }
     int ne01 = tensor->ne[1];
     return (((strstr(tensor->name, "ffn") != NULL) && (strstr(tensor->name, "exps") != NULL)) || (strstr(tensor->name, "as") != NULL)) && (ne01 % 32 == 0);
 }
