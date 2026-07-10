@@ -7872,6 +7872,15 @@ static bool ggml_opencl_can_fuse(const struct ggml_cgraph * cgraph, int node_idx
         if (use_q4k_tiled(gate->src[0]) || use_q4k_tiled(up->src[0])) {
             return false;
         }
+        // that noshuffle layout is only produced at set_tensor time when
+        // use_adreno_kernels() accepts the weight (ne0 >= 512 && ne1 >= 512).
+        // Smaller weights stay in the plain q4_K layout, which this kernel would
+        // misread -> defer them to the per-op path. Real FFN gate/up weights are
+        // far above the threshold, so production dispatch is unchanged.
+        if (!use_adreno_kernels(backend_ctx, gate->src[0]) ||
+            !use_adreno_kernels(backend_ctx, up->src[0])) {
+            return false;
+        }
         return true;
     }
 
@@ -8156,6 +8165,13 @@ static bool ggml_opencl_can_fuse(const struct ggml_cgraph * cgraph, int node_idx
 
         // rms_norm assumes contiguous rows; weight indexed per element
         if (!ggml_is_contiguous_rows(rms_norm->src[0]) || !ggml_is_contiguous(w)) {
+            return false;
+        }
+
+        // the kernel reads the weight as src3[i0 % ne_w0], i.e. one row broadcast
+        // over every row of the norm input. A multi-row weight would silently use
+        // row 0 for all rows. Real q/k_norm weights are 1-D (per head_dim).
+        if (ggml_nrows(w) != 1) {
             return false;
         }
     } else if (ops.size() == 3 && ops.begin()[0] == GGML_OP_GROUP_NORM && ops.begin()[1] == GGML_OP_MUL && ops.begin()[2] == GGML_OP_ADD) {
