@@ -7901,7 +7901,7 @@ static bool ggml_opencl_can_fuse(const struct ggml_cgraph * cgraph, int node_idx
             return false;
         }
         // decode GEMV path only (single token) and the noshuffle MoE layout
-        if (mmid->src[1]->ne[2] != 1 || !use_adreno_moe_kernels(nullptr, mmid->src[0])) {
+        if (mmid->src[1]->ne[2] != 1 || !use_adreno_moe_kernels(backend_ctx, mmid->src[0])) {
             return false;
         }
         // both GLU operands must be the gate/up halves of THIS mul_mat_id output:
@@ -7961,7 +7961,7 @@ static bool ggml_opencl_can_fuse(const struct ggml_cgraph * cgraph, int node_idx
             return false;
         }
         // decode GEMV path only (single token) and the noshuffle MoE layout
-        if (gmm->src[1]->ne[2] != 1 || !use_adreno_moe_kernels(nullptr, gmm->src[0])) {
+        if (gmm->src[1]->ne[2] != 1 || !use_adreno_moe_kernels(backend_ctx, gmm->src[0])) {
             return false;
         }
         // wiring: both matmuls share the same activation + expert selection; each
@@ -8499,12 +8499,12 @@ static void ggml_backend_opencl_exec_graph_nodes(ggml_backend_t backend, ggml_cg
             continue;
         }
 
-        if (!backend_ctx->disable_fusion && ggml_opencl_can_fuse(cgraph, i, { GGML_OP_NORM, GGML_OP_MUL, GGML_OP_ADD })) {
+        if (!backend_ctx->disable_fusion && ggml_opencl_can_fuse(backend_ctx, cgraph, i, { GGML_OP_NORM, GGML_OP_MUL, GGML_OP_ADD })) {
             ggml_opencl_op_norm_fused(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
             i += 2;
             continue;
         }
-        if (!backend_ctx->disable_fusion && ggml_opencl_can_fuse(cgraph, i, { GGML_OP_GROUP_NORM, GGML_OP_MUL, GGML_OP_ADD })) {
+        if (!backend_ctx->disable_fusion && ggml_opencl_can_fuse(backend_ctx, cgraph, i, { GGML_OP_GROUP_NORM, GGML_OP_MUL, GGML_OP_ADD })) {
             ggml_opencl_op_group_norm_fused(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
             i += 2;
             continue;
@@ -8521,7 +8521,7 @@ static void ggml_backend_opencl_exec_graph_nodes(ggml_backend_t backend, ggml_cg
         }
 
         if (!backend_ctx->disable_fusion && backend_ctx->fuse_rope_set_rows &&
-            ggml_opencl_can_fuse(cgraph, i, { GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS })) {
+            ggml_opencl_can_fuse(backend_ctx, cgraph, i, { GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS })) {
             ggml_cl_rope_set_rows(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
             i += 2;
             continue;
@@ -8547,7 +8547,7 @@ static void ggml_backend_opencl_exec_graph_nodes(ggml_backend_t backend, ggml_cg
         // tanh vs the standalone kernel_gelu_4's vector tanh), and the isolated
         // gain is below the tg noise floor, so it is off by default.
         if (backend_ctx->fuse_mm_gelu && !backend_ctx->disable_fusion &&
-            ggml_opencl_can_fuse(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_UNARY })) {
+            ggml_opencl_can_fuse(backend_ctx, cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_UNARY })) {
             ggml_cl_mul_mat_f32_gelu_fused(backend, node, cgraph->nodes[i+1]);
             i += 1;
             continue;
@@ -8559,7 +8559,7 @@ static void ggml_backend_opencl_exec_graph_nodes(ggml_backend_t backend, ggml_cg
         // byte-identical to the per-op path (same accumulation/reduction order,
         // same scalar GLU formula). Default on, opt-out GGML_OPENCL_FUSE_MM_GLU=0.
         if (backend_ctx->fuse_mm_glu && !backend_ctx->disable_fusion &&
-            ggml_opencl_can_fuse(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU })) {
+            ggml_opencl_can_fuse(backend_ctx, cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU })) {
             ggml_cl_mul_mat_q4_k_glu_fused(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
             i += 2;
             continue;
@@ -8570,7 +8570,7 @@ static void ggml_backend_opencl_exec_graph_nodes(ggml_backend_t backend, ggml_cg
         // the GLU into the MoE GEMV epilogue; q4_K decode only, byte-identical to
         // the per-op path. Default on, opt-out GGML_OPENCL_FUSE_MOE_GLU=0.
         if (backend_ctx->fuse_moe_glu && !backend_ctx->disable_fusion &&
-            ggml_opencl_can_fuse(cgraph, i, { GGML_OP_MUL_MAT_ID, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_GLU })) {
+            ggml_opencl_can_fuse(backend_ctx, cgraph, i, { GGML_OP_MUL_MAT_ID, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_GLU })) {
             ggml_cl_mul_mat_id_q4_k_glu_fused(backend, node, cgraph->nodes[i+3]);
             i += 3;
             continue;
@@ -8581,7 +8581,7 @@ static void ggml_backend_opencl_exec_graph_nodes(ggml_backend_t backend, ggml_cg
         // the activation folded into the epilogue. mxfp4 decode only, byte-identical
         // to the per-op path. Default on, opt-out GGML_OPENCL_FUSE_MOE_GLU_MXFP4=0.
         if (backend_ctx->fuse_moe_glu_mxfp4 && !backend_ctx->disable_fusion &&
-            ggml_opencl_can_fuse(cgraph, i, { GGML_OP_MUL_MAT_ID, GGML_OP_ADD_ID, GGML_OP_MUL_MAT_ID, GGML_OP_ADD_ID, GGML_OP_GLU })) {
+            ggml_opencl_can_fuse(backend_ctx, cgraph, i, { GGML_OP_MUL_MAT_ID, GGML_OP_ADD_ID, GGML_OP_MUL_MAT_ID, GGML_OP_ADD_ID, GGML_OP_GLU })) {
             ggml_cl_mul_mat_id_mxfp4_glu_fused(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2], cgraph->nodes[i+3], cgraph->nodes[i+4]);
             i += 4;
             continue;
@@ -8600,7 +8600,7 @@ static void ggml_backend_opencl_exec_graph_nodes(ggml_backend_t backend, ggml_cg
             return !e || e[0] == '\0' || e[0] != '0';
         }();
         if (fuse_rms_add_scale && !backend_ctx->disable_fusion &&
-            ggml_opencl_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_MUL })) {
+            ggml_opencl_can_fuse(backend_ctx, cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_MUL })) {
             ggml_opencl_op_rms_norm_mul_add_scale_fused(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2], cgraph->nodes[i+3]);
             i += 3;
             continue;
@@ -8611,7 +8611,7 @@ static void ggml_backend_opencl_exec_graph_nodes(ggml_backend_t backend, ggml_cg
             return !e || e[0] == '\0' || e[0] != '0';
         }();
         if (fuse_rms_add && !backend_ctx->disable_fusion &&
-            ggml_opencl_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD })) {
+            ggml_opencl_can_fuse(backend_ctx, cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD })) {
             ggml_opencl_op_rms_norm_mul_add_fused(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
             i += 2;
             continue;
@@ -8620,7 +8620,7 @@ static void ggml_backend_opencl_exec_graph_nodes(ggml_backend_t backend, ggml_cg
         // into the rope kernel). Default on; opt out with GGML_OPENCL_FUSE_RMS_ROPE=0.
         // Checked before the 2-op rms_norm+mul fuse so the longer pattern wins.
         if (backend_ctx->fuse_rms_rope && !backend_ctx->disable_fusion &&
-            ggml_opencl_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE })) {
+            ggml_opencl_can_fuse(backend_ctx, cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE })) {
             // Cross-gap extension: if the rope output is scattered into the K-cache
             // by a later SET_ROWS (V-compute interposes on Gemma), fold that scatter
             // in too. Opt-in; otherwise just the rms+mul+rope fold.
@@ -8635,7 +8635,7 @@ static void ggml_backend_opencl_exec_graph_nodes(ggml_backend_t backend, ggml_cg
             i += 2;
             continue;
         }
-        if (!backend_ctx->disable_fusion && ggml_opencl_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL })) {
+        if (!backend_ctx->disable_fusion && ggml_opencl_can_fuse(backend_ctx, cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL })) {
             ggml_opencl_op_rms_norm_fused(backend, node, cgraph->nodes[i+1]);
             i++;
             continue;
