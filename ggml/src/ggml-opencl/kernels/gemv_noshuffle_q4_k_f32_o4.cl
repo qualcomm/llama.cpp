@@ -338,6 +338,13 @@ kernel void kernel_gemv_noshuffle_q4_k_f32_o4(
         acc += reduceLM[SUBGROUP_SIZE * 1 + slid];
         acc += reduceLM[SUBGROUP_SIZE * 2 + slid];
         dst = (global float*)((global char*)dst + offsetd);
-        vstore4(acc, 0, &(dst[gid * 4]));
+        // Guard the four output rows. The x-grid is padded to CEIL_DIV(ne01/4,64)*64,
+        // so when ne01 is not a multiple of 256 the tail quads run past row ne01 and
+        // vstore4 overruns dst into the adjacent tensor (e.g. ne01=151936 -> 128 rows
+        // = 512 bytes past the end). No-op / byte-identical when ne01 % 256 == 0.
+        if (gid * 4 + 0 < M) dst[gid * 4 + 0] = acc.s0;
+        if (gid * 4 + 1 < M) dst[gid * 4 + 1] = acc.s1;
+        if (gid * 4 + 2 < M) dst[gid * 4 + 2] = acc.s2;
+        if (gid * 4 + 3 < M) dst[gid * 4 + 3] = acc.s3;
     }
 }

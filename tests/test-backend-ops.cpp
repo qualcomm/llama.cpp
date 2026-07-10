@@ -8537,6 +8537,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 151936, 1, 2048, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 151936, 1, 2048, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 151936, 1, 2048, {1, 1}, {1, 1}));
+    // Long vocab with k < 2048, so the OpenCL flat GEMV does not preempt the noshuffle
+    // _o4 (4-rows-per-work-item) GEMV. ne01=151936 is not a multiple of 256, so the
+    // padded x-grid runs 128 rows past ne01 -- the dst sentinel catches the overrun.
+    // Regression cover for the odd-ne01 GEMV dst-overrun family.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 151936, 1, 1536, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 151936, 1, 1536, {1, 1}, {1, 1}));
     // diagnostic k/m-sweep to localize the tiled-path failure (single vs multi
     // superblock; smaller tile count). use_q6k/q4k_tiled needs m>=32768 && m%64==0.
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32,  32768, 1,  256, {1, 1}, {1, 1}));
