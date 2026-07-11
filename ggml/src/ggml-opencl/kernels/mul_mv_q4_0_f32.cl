@@ -1110,3 +1110,106 @@ kernel void kernel_mul_mat_q4_0_f32_gqa_r4_dk128_img(
         }
     }
 }
+
+// Generic decode KQ for a q4_0 K-cache: any GQA ratio, any DK in [32, 512] that
+// is a multiple of 32. The q4_0 analog of kernel_mul_mat_q8_0_f32_kq_gen -- see
+// that kernel for why this exists (the GQA-coalesced table only covers
+// DK in {128,256} x r2 in {4,8}, and a model outside it, e.g. Gemma-4, falls back
+// to dequantizing the whole K view to f16 on every attention op).
+//
+// Lanes split across DK: lane l owns the 8 contiguous elements [8l, 8l+8) of the
+// K row, i.e. q4_0 block l/4 at nibble offset (l%4)*8. In a q4_0 block the low
+// nibbles of qs[0..15] hold elements 0..15 and the high nibbles hold 16..31, so a
+// lane's 8 elements are always 8 consecutive bytes read at a single nibble
+// position. 64 lanes x 8 = 512, so DK <= 512 needs one pass; lanes past DK/8 idle.
+#define N_ROWS_Q4GEN  4
+
+#ifdef ADRENO_GPU
+REQD_SUBGROUP_SIZE_64
+#endif
+kernel void kernel_mul_mat_q4_0_f32_kq_gen(
+        global char * src0,
+        ulong offset0,
+        global char * src1,
+        ulong offset1,
+        global float * dst,
+        ulong offsetd,
+        int ne00,
+        int ne01,
+        int ne02,
+        ulong nb01,
+        ulong nb02,
+        ulong nb03,
+        int ne10,
+        int ne11,
+        int ne12,
+        ulong nb10,
+        ulong nb11,
+        ulong nb12,
+        ulong nb13,
+        int ne0,
+        int ne1,
+        int r2,
+        int r3
+) {
+    src0 = (global char *)((global char *)src0 + offset0);
+    src1 = (global char *)((global char *)src1 + offset1);
+    dst  = (global float*)((global char *)dst  + offsetd);
+
+    const int lid = get_sub_group_local_id();   // 0..63
+
+    const int r0_base = get_group_id(0) * N_ROWS_Q4GEN;
+    const int im      = get_group_id(2);        // Q-head across batch
+
+    const int i12 = im % ne12;
+    const int i13 = im / ne12;
+    const int i02 = i12 / r2;                   // K-head this Q-head reads
+    const int i03 = i13 / r3;
+
+    const int e0   = lid * 8;                   // this lane's first element
+    const bool act = (e0 < ne00);
+    const int blk  = e0 >> 5;                   // q4_0 block index
+    const int eoff = e0 & 31;                   // element offset inside the block
+    const int boff = eoff & 15;                 // byte offset  (0 or 8)
+    const int nsh  = (eoff >> 4) * 4;           // nibble shift (0 = low, 4 = high)
+
+    float4 qa = (float4)(0.0f);
+    float4 qb = (float4)(0.0f);
+    if (act) {
+        global float4 * q4 = (global float4 *)(src1 + i12 * nb12 + i13 * nb13);
+        qa = q4[(e0 >> 2) + 0];
+        qb = q4[(e0 >> 2) + 1];
+    }
+
+    const ulong head_off = i02 * nb02 + i03 * nb03;
+
+    for (int dr = 0; dr < N_ROWS_Q4GEN; ++dr) {
+        const int r0 = r0_base + dr;
+        if (r0 >= ne01) {
+            break;
+        }
+
+        float sumf = 0.0f;
+        if (act) {
+            global struct block_q4_0 * kb =
+                (global struct block_q4_0 *)(src0 + r0 * nb01 + head_off) + blk;
+            const float d = convert_float(kb->d);
+            global uchar * qs = kb->qs + boff;
+
+            sumf = (float)(((qs[0] >> nsh) & 0xF) - 8) * qa.s0
+                 + (float)(((qs[1] >> nsh) & 0xF) - 8) * qa.s1
+                 + (float)(((qs[2] >> nsh) & 0xF) - 8) * qa.s2
+                 + (float)(((qs[3] >> nsh) & 0xF) - 8) * qa.s3
+                 + (float)(((qs[4] >> nsh) & 0xF) - 8) * qb.s0
+                 + (float)(((qs[5] >> nsh) & 0xF) - 8) * qb.s1
+                 + (float)(((qs[6] >> nsh) & 0xF) - 8) * qb.s2
+                 + (float)(((qs[7] >> nsh) & 0xF) - 8) * qb.s3;
+            sumf *= d;
+        }
+
+        const float tot = sub_group_reduce_add(sumf);
+        if (lid == 0) {
+            dst[im * ne1 * ne0 + r0] = tot;
+        }
+    }
+}
