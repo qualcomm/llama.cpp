@@ -273,9 +273,12 @@ kernel void kernel_gemm_moe_mxfp4_f32_ns(
         shared_b[b_local_offset.x] = bx8_f16.lo;
         shared_b[b_local_offset.y] = bx8_f16.hi;
 
-        // Dequantization
-        reg_a.lo = mxfp4_to_fp16_packed8(as_ushort2(mxfp4x16.lo)) * s;
-        reg_a.hi = mxfp4_to_fp16_packed8(as_ushort2(mxfp4x16.hi)) * s;
+        // Dequantization. Cast the scale to half explicitly: a bare half8*float
+        // (vector*scalar mixed-type) multiply crashes the Adreno 850 (art.api37)
+        // shader compiler. OpenCL converts the scalar to the vector element type
+        // anyway, so this is byte-identical on every other driver.
+        reg_a.lo = mxfp4_to_fp16_packed8(as_ushort2(mxfp4x16.lo)) * (half)s;
+        reg_a.hi = mxfp4_to_fp16_packed8(as_ushort2(mxfp4x16.hi)) * (half)s;
 
         sub_group_barrier(CLK_LOCAL_MEM_FENCE);
 
@@ -303,9 +306,12 @@ kernel void kernel_gemm_moe_mxfp4_f32_ns(
         shared_b[b_local_offset.x] = bx8_f16.lo;
         shared_b[b_local_offset.y] = bx8_f16.hi;
 
-        // Dequantization
-        reg_a.lo = mxfp4_to_fp16_packed8(as_ushort2(mxfp4x16.lo)) * s;
-        reg_a.hi = mxfp4_to_fp16_packed8(as_ushort2(mxfp4x16.hi)) * s;
+        // Dequantization. Cast the scale to half explicitly: a bare half8*float
+        // (vector*scalar mixed-type) multiply crashes the Adreno 850 (art.api37)
+        // shader compiler. OpenCL converts the scalar to the vector element type
+        // anyway, so this is byte-identical on every other driver.
+        reg_a.lo = mxfp4_to_fp16_packed8(as_ushort2(mxfp4x16.lo)) * (half)s;
+        reg_a.hi = mxfp4_to_fp16_packed8(as_ushort2(mxfp4x16.hi)) * (half)s;
 
         sub_group_barrier(CLK_LOCAL_MEM_FENCE);
 
