@@ -1036,3 +1036,113 @@ kernel void kernel_mul_mat_q8_0_f32_gqa_r4_dk128_img(
         }
     }
 }
+
+// Generic decode KQ for a q8_0 K-cache: any GQA ratio, any DK in [32, 512] that
+// is a multiple of 32. The GQA-coalesced kernels above bake the GQA ratio and DK
+// into their lane geometry (8 Q-heads x 8 lanes at DK=128), so a model whose
+// attention shape falls outside that table -- e.g. Gemma-4, whose SWA layers are
+// DK=256/r2=2 and whose global layers are DK=512/r2=8 -- misses them entirely and
+// falls back to dequantizing the whole K view to f16 on every attention op. That
+// fallback costs ~2.5x end-to-end even though the GPU does the same work, because
+// the dequant pass runs off the critical path of the GPU kernels.
+//
+// This kernel takes the other axis: instead of splitting lanes across Q-heads, it
+// splits them across DK. One subgroup owns one (row-block, Q-head, batch) and each
+// lane owns 8 contiguous elements of the K row -- lane l covers [8l, 8l+8), i.e.
+// q8_0 block l/4, byte offset (l%4)*8. 64 lanes x 8 = 512 elements, so DK<=512
+// needs at most one pass and lanes beyond DK/8 sit out. K stays q8_0: no dequant
+// pass, no per-op scratch buffer.
+//
+// Slower per row than the coalesced kernels (it re-reads K once per Q-head), so
+// the host only selects it when the coalesced table misses.
+#define N_ROWS_Q8GEN  4      // K rows per subgroup, to amortize the Q load
+#define DK_MAX_Q8GEN  512
+
+#ifdef ADRENO_GPU
+REQD_SUBGROUP_SIZE_64
+#endif
+kernel void kernel_mul_mat_q8_0_f32_kq_gen(
+        global char * src0,
+        ulong offset0,
+        global char * src1,
+        ulong offset1,
+        global float * dst,
+        ulong offsetd,
+        int ne00,
+        int ne01,
+        int ne02,
+        ulong nb01,
+        ulong nb02,
+        ulong nb03,
+        int ne10,
+        int ne11,
+        int ne12,
+        ulong nb10,
+        ulong nb11,
+        ulong nb12,
+        ulong nb13,
+        int ne0,
+        int ne1,
+        int r2,
+        int r3
+) {
+    src0 = (global char *)((global char *)src0 + offset0);
+    src1 = (global char *)((global char *)src1 + offset1);
+    dst  = (global float*)((global char *)dst  + offsetd);
+
+    const int lid = get_sub_group_local_id();   // 0..63
+
+    const int r0_base = get_group_id(0) * N_ROWS_Q8GEN;
+    const int im      = get_group_id(2);        // Q-head across batch
+
+    const int i12 = im % ne12;                  // Q-head
+    const int i13 = im / ne12;                  // batch
+    const int i02 = i12 / r2;                   // K-head this Q-head reads
+    const int i03 = i13 / r3;
+
+    // This lane's slice of the row: 8 contiguous elements.
+    const int e0   = lid * 8;                   // first element
+    const bool act = (e0 < ne00);               // lanes past DK sit out
+    const int blk  = e0 >> 5;                   // q8_0 block index (32 elems each)
+    const int boff = e0 & 31;                   // byte offset inside the block
+
+    // Q for this head: the 8 f32 this lane needs (2 float4, contiguous).
+    float4 qa = (float4)(0.0f);
+    float4 qb = (float4)(0.0f);
+    if (act) {
+        global float4 * q4 = (global float4 *)(src1 + i12 * nb12 + i13 * nb13);
+        qa = q4[(e0 >> 2) + 0];
+        qb = q4[(e0 >> 2) + 1];
+    }
+
+    const ulong head_off = i02 * nb02 + i03 * nb03;
+
+    for (int dr = 0; dr < N_ROWS_Q8GEN; ++dr) {
+        const int r0 = r0_base + dr;
+        if (r0 >= ne01) {
+            break;
+        }
+
+        float sumf = 0.0f;
+        if (act) {
+            global block_q8_0 * kb = (global block_q8_0 *)(src0 + r0 * nb01 + head_off) + blk;
+            const float d = convert_float(kb->d);
+            global char * qs = kb->qs + boff;
+
+            sumf = (float)qs[0] * qa.s0
+                 + (float)qs[1] * qa.s1
+                 + (float)qs[2] * qa.s2
+                 + (float)qs[3] * qa.s3
+                 + (float)qs[4] * qb.s0
+                 + (float)qs[5] * qb.s1
+                 + (float)qs[6] * qb.s2
+                 + (float)qs[7] * qb.s3;
+            sumf *= d;
+        }
+
+        const float tot = sub_group_reduce_add(sumf);
+        if (lid == 0) {
+            dst[im * ne1 * ne0 + r0] = tot;
+        }
+    }
+}
