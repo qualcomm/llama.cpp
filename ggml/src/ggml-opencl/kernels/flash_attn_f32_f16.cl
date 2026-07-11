@@ -667,7 +667,6 @@ __kernel void FA_TILE_NAME(
     }
 #endif
 }
-#endif  // !FA_DECODE_ONLY
 
 // Note: REQD_SUBGROUP_SIZE_64 intentionally omitted. Adding it routes the
 // X2 driver (and X1, per hp-hamoa) to its slower $fallback kernel variant
