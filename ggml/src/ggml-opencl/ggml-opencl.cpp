@@ -580,6 +580,27 @@ struct ggml_backend_opencl_context {
     bool adreno_x2_class() const {
         return adreno_gen == ADRENO_GPU_GEN::X2E || adreno_gen == ADRENO_GPU_GEN::A8X;
     }
+
+    // Derived FA tuning (scale axis of the capability/scale model): computed
+    // once in ggml_cl2_init after the identity/capability/scale queries, read
+    // by the compile/dispatch sites instead of per-chip constants there.
+    //
+    // fa_c8_cluster: GQA4 c8 cluster width the FA programs compile at (the g8
+    // programs use 2x). 0 = kernel-default widths (C=8 / g8 16). The deciding
+    // property is per-lane o_acc register pressure — a compiler/register-file
+    // trait of the ISA generation, NOT compute-unit count: X2-class compilers
+    // spill the kernel-default widths (868/916B private, c8 loses e2e) and
+    // need 16/32 to keep o_acc at 128B/lane, while X1's compiler holds the
+    // defaults unspilled.
+    // GGML_OPENCL_FA_CL_C={8,16,32} overrides for per-device A/B.
+    int  fa_c8_cluster = 0;
+    // fa_c8_default_on: cluster-parallel decode FA default. Follows per-gen
+    // measured validation, not class membership: X2E and X1E are validated;
+    // A8X (830/840) is pending a decode-at-depth A/B — fa_c8_cluster is
+    // already X2-class there, so GGML_OPENCL_FA_C8=1 exercises the intended
+    // wide config.
+    bool fa_c8_default_on = false;
+
     bool disable_fusion;
 
     // ragged moe, use int to directly pass to kernel
@@ -4909,17 +4930,12 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
         opts += " -D FA_DECODE_ONLY -D FA_DECODE_MINIMAL";
     }
 
-    // c8 cluster width (GGML_OPENCL_FA_CL_C overrides): value = GQA4 cluster
-    // width (kernel default 8); the g8 programs use 2x the value (default 16).
-    // Wider clusters halve per-lane o_acc at the cost of position streams per
-    // subgroup
-    static const int fa_cl_c_env = []{
-        const char * e = std::getenv("GGML_OPENCL_FA_CL_C");
-        const int x = (e && e[0]) ? atoi(e) : 0;
-        return (x == 8 || x == 16 || x == 32) ? x : 0;   // 0 = per-gen default
-    }();
-    const int fa_cl_c_gqa4 = fa_cl_c_env ? fa_cl_c_env
-        : (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E ? 16 : 0);
+    // c8 cluster width: value = GQA4 cluster width (kernel default 8); the g8
+    // programs use 2x the value (default 16). Wider clusters halve per-lane
+    // o_acc at the cost of position streams per subgroup. Derived at init into
+    // fa_c8_cluster (env GGML_OPENCL_FA_CL_C overrides; see the context-struct
+    // comment).
+    const int fa_cl_c_gqa4 = backend_ctx->fa_c8_cluster;
     const std::string opts_cl_c_gqa4 = fa_cl_c_gqa4
         ? " -D FA_CL_C=" + std::to_string(fa_cl_c_gqa4) : std::string();
     const std::string fa_cl_c_g8_val = std::to_string(fa_cl_c_gqa4 ? fa_cl_c_gqa4 * 2 : 16);
@@ -5693,6 +5709,8 @@ static void ggml_opencl_print_backend_info(ggml_backend_opencl_device_context * 
         backend_ctx->fp16_support ? "true" : "false");
     GGML_LOG_INFO("ggml_opencl: khr dot product support: %s\n",
         backend_ctx->has_integer_dot ? "true" : "false");
+    GGML_LOG_INFO("ggml_opencl: fa c8 tuning: cluster=%d (0=kernel default), default_on=%s\n",
+        backend_ctx->fa_c8_cluster, backend_ctx->fa_c8_default_on ? "true" : "false");
     GGML_LOG_INFO("ggml_opencl: mem base addr align: %u\n",
         backend_ctx->alignment);
     GGML_LOG_INFO("ggml_opencl: global mem size: %zu MB\n",
@@ -5897,6 +5915,19 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
     backend_ctx->has_integer_dot_product = strstr(ext_buffer, "cl_khr_integer_dot_product") != NULL;
 
     CL_CHECK(clGetDeviceInfo(device, CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(cl_uint), &backend_ctx->compute_units, NULL));
+
+    // Derived FA c8 tuning (see the field comments on the context struct):
+    // cluster width follows the compiler class, default-on follows per-gen
+    // measured validation.
+    {
+        const char * env = getenv("GGML_OPENCL_FA_CL_C");
+        const int v = (env && env[0]) ? atoi(env) : 0;
+        // 8/16/32 = explicit width; anything else (unset/0) = derived default
+        backend_ctx->fa_c8_cluster = (v == 8 || v == 16 || v == 32) ? v
+            : (backend_ctx->adreno_x2_class() ? 16 : 0);
+    }
+    backend_ctx->fa_c8_default_on = backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E ||
+                                    backend_ctx->adreno_gen == ADRENO_GPU_GEN::X1E;
 
     // check Adreno large buffer support
     backend_ctx->adreno_has_large_buffer = strstr(ext_buffer, "cl_qcom_large_buffer") != NULL;
@@ -14802,14 +14833,14 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         const bool nq_in_vec_range = (n_q >= 1) && (n_q <= N_MAX_VEC_NQ);
         const bool nq1_only        = (n_q == 1);
 
-        // Cluster-parallel decode default on for Adreno X2E/X1E
+        // Cluster-parallel decode: default derived at init into
+        // fa_c8_default_on (X2E/X1E validated; see the context-struct comment)
         static const int c8_env_state = []{
             const char * e = getenv("GGML_OPENCL_FA_C8");
             if (e == NULL || e[0] == '\0') { return -1; }
             return (e[0] != '0') ? 1 : 0;
         }();
-        const bool c8_default_on = backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E ||
-                                   backend_ctx->adreno_gen == ADRENO_GPU_GEN::X1E;
+        const bool c8_default_on = backend_ctx->fa_c8_default_on;
         const bool c8_f16_on = (c8_env_state >= 0) ? (c8_env_state == 1) : c8_default_on;
         // Quant-KV (q4_0/q8_0) GQA4 c8: default-on X2E + X1E
         const bool c8_quant_on = (c8_env_state >= 0) ? (c8_env_state == 1) : c8_default_on;
