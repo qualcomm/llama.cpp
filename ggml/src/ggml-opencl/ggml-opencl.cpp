@@ -24089,6 +24089,13 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     // +254% combined tg@16k. Opt out with =0.
                     static const char * mm_kqv_gqa_env = getenv("GGML_OPENCL_MM_KQV_GQA");
                     const bool mm_kqv_gqa_off = (mm_kqv_gqa_env != nullptr && mm_kqv_gqa_env[0] == '0');
+                    // Minimum n_kv for the coalesced KQV to pay off (see the gate below).
+                    // GGML_OPENCL_MM_KQV_GQA_MIN_KV retunes it per device.
+                    static const int mm_kqv_gqa_min_kv = []{
+                        const char * e = getenv("GGML_OPENCL_MM_KQV_GQA_MIN_KV");
+                        const int v = (e && e[0]) ? atoi(e) : 0;
+                        return v > 0 ? v : 8192;
+                    }();
                     if (can_multi_out && (ne01 % 16) == 0 && ne00 == 128 && r2 == 8 && r3 == 1 && mm_kq_gqa_on &&
                         backend_ctx->kernel_mul_mat_f16_f32_l4_x8_gqa4 != nullptr) {
                         kernel = backend_ctx->kernel_mul_mat_f16_f32_l4_x8_gqa4;
@@ -24103,10 +24110,17 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                         nrows = 1;
                     } else if (can_multi_out && r2 == 8 && r3 == 1 &&
                         (ne01 == 128 || ne01 == 256) && !mm_kqv_gqa_off &&
+                        ne00 >= mm_kqv_gqa_min_kv &&
                         backend_ctx->kernel_mul_mat_f16_f32_l4_y8_gqa != nullptr) {
                         // y8_gqa is DV-agnostic (emits 8 DV-rows/WG over ne01/8
-                        // WGs, streams ne00); DV in {128,256} (Qwen3-30B / Qwen3.6)
-                        // both default-on, paired with the decode KQ image.
+                        // WGs, streams ne00 = n_kv); DV in {128,256} (Qwen3-30B /
+                        // Qwen3.6), paired with the decode KQ image.
+                        //
+                        // Depth-gated: coalescing V across the 8 Q-heads only pays
+                        // once the V slab is large enough to amortize the wider
+                        // per-WG footprint. Measured on Qwen3-30B-A3B (X2-90, fa=0,
+                        // tg64) vs the stock y8 kernel: n_kv 2048 -7.6%, 4096 -5.2%,
+                        // 8192 +0.6%, 16384 +7.3%. Enable from n_kv >= 8192.
                         kernel = backend_ctx->kernel_mul_mat_f16_f32_l4_y8_gqa;
                         nrows = 1;
                     } else if (can_multi_out &&
