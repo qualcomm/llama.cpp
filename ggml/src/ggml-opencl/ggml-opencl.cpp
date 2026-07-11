@@ -120,6 +120,32 @@ enum ADRENO_GPU_GEN {
     X2E,
 };
 
+// Ordered capability level for the gpu-profile gating model (Phase 3). The
+// ADRENO_GPU_GEN enum order does NOT reflect ISA capability — A8X (Adreno
+// 830/840, Snapdragon 8 Elite) is the SAME generation as the X2 laptop part
+// (Snapdragon X2 Elite), a generation ABOVE X1E — so gates cannot use the raw
+// enum ordinal. gen_level encodes the true order; forward-facing gates compare
+// with >= so a newer chip inherits every path a same-or-older gen enabled.
+// (X1E-specific driver-quirk carve-outs still match == X1E; those are negative
+// workarounds for one old compiler, not capability levels.)
+enum {
+    GEN_LEVEL_NONE = 0,
+    GEN_LEVEL_A7X  = 70,
+    GEN_LEVEL_X1E  = 81,   // Snapdragon X Elite (gen 1)
+    GEN_LEVEL_X2   = 90,   // Snapdragon X2 Elite == Snapdragon 8 Elite (A8X); same ISA gen
+    GEN_LEVEL_MAX_KNOWN = GEN_LEVEL_X2,
+};
+
+static int adreno_gen_level(ADRENO_GPU_GEN gen) {
+    switch (gen) {
+        case ADRENO_GPU_GEN::A7X: return GEN_LEVEL_A7X;
+        case ADRENO_GPU_GEN::X1E: return GEN_LEVEL_X1E;
+        case ADRENO_GPU_GEN::A8X: return GEN_LEVEL_X2;   // same gen as X2E
+        case ADRENO_GPU_GEN::X2E: return GEN_LEVEL_X2;
+        default:                  return GEN_LEVEL_NONE; // ADRENO_UNKNOWN handled at init (optimistic)
+    }
+}
+
 enum ADRENO_CL_COMPILER_TYPE {
     E031,
     DX,
@@ -535,6 +561,8 @@ struct ggml_backend_opencl_context {
     bool has_qcom_subgroup_shuffle = false;  // specifically cl_qcom_subgroup_shuffle
     bool has_integer_dot_product = false;    // cl_khr_integer_dot_product (dp4a); kernels #ifdef on the same name
     cl_uint compute_units = 0;               // CL_DEVICE_MAX_COMPUTE_UNITS (scale axis for tuning formulas)
+    int gen_level = GEN_LEVEL_NONE;          // ordered capability level (see adreno_gen_level); set at init,
+                                             // ADRENO_UNKNOWN -> optimistic highest-known + GGML_OPENCL_GEN_LEVEL override
 
     // dp4a MoE GEMM/GEMV paths gate on capability, not chip identity, so any
     // Adreno advertising the integer-dot extension (X2E, X1E, A8X/840, future
@@ -544,10 +572,13 @@ struct ggml_backend_opencl_context {
     }
     // The dense dp4a GEMMs must NOT gate on the extension alone: X1E advertises
     // it but its compiler spills the dense dp4a kernels (792B vs 352B private
-    // on X2) and they lose to f16 there. X2-class = the X2E ISA generation,
-    // including its mobile flavor A8X (Adreno 830/840).
+    // on X2) and they lose to f16 there. Gate on the ISA capability LEVEL (>=),
+    // not chip identity: X2-class = the X2/8-Elite generation (X2E, its mobile
+    // twin A8X = Adreno 830/840) and anything newer. A future higher gen
+    // inherits these without a code edit; an unknown chip gets them via the
+    // optimistic init default (dialable with GGML_OPENCL_GEN_LEVEL).
     bool adreno_x2_class() const {
-        return adreno_gen == ADRENO_GPU_GEN::X2E || adreno_gen == ADRENO_GPU_GEN::A8X;
+        return gpu_family == GPU_FAMILY::ADRENO && gen_level >= GEN_LEVEL_X2;
     }
 
     // Derived FA tuning (scale axis of the capability/scale model): computed
@@ -563,11 +594,11 @@ struct ggml_backend_opencl_context {
     // defaults unspilled.
     // GGML_OPENCL_FA_CL_C={8,16,32} overrides for per-device A/B.
     int  fa_c8_cluster = 0;
-    // fa_c8_default_on: cluster-parallel decode FA default. Follows per-gen
-    // measured validation, not class membership: X2E and X1E are validated;
-    // A8X (830/840) is pending a decode-at-depth A/B — fa_c8_cluster is
-    // already X2-class there, so GGML_OPENCL_FA_C8=1 exercises the intended
-    // wide config.
+    // fa_c8_default_on: cluster-parallel decode FA default. Gated on gen_level
+    // >= X1 (X1E, A8X/840, X2E and newer). Device-validated on X2E (wide-C
+    // re-measure) and X1E; A8X validated directionally (c8 vs no-c8 decode at
+    // depth, multiples not margins). Newer/unknown gens inherit via the
+    // optimistic init default.
     bool fa_c8_default_on = false;
 
     bool disable_fusion;
@@ -5636,6 +5667,8 @@ static void ggml_opencl_print_backend_info(ggml_backend_opencl_device_context * 
         backend_ctx->fp16_support ? "true" : "false");
     GGML_LOG_INFO("ggml_opencl: integer dot product (dp4a) support: %s, compute units: %u\n",
         backend_ctx->has_integer_dot_product ? "true" : "false", backend_ctx->compute_units);
+    GGML_LOG_INFO("ggml_opencl: gpu capability level: %d (x2-class paths: %s)\n",
+        backend_ctx->gen_level, backend_ctx->adreno_x2_class() ? "on" : "off");
     GGML_LOG_INFO("ggml_opencl: fa c8 tuning: cluster=%d (0=kernel default), default_on=%s\n",
         backend_ctx->fa_c8_cluster, backend_ctx->fa_c8_default_on ? "true" : "false");
     GGML_LOG_INFO("ggml_opencl: mem base addr align: %u\n",
@@ -5843,9 +5876,30 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
 
     CL_CHECK(clGetDeviceInfo(device, CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(cl_uint), &backend_ctx->compute_units, NULL));
 
+    // Ordered capability level (Phase 3 of the capability/scale gating model).
+    // Forward-facing gates compare gen_level with >= so a newer chip inherits
+    // every path a same-or-older gen enabled. Unknown Adreno -> optimistic:
+    // assume the highest known gen (the motivating case, the Adreno 840, was a
+    // NEW same-or-newer chip stranded at zero opts, not a resurrected old one),
+    // but still feature-gated (dp4a paths also require the extension) and
+    // dialable back for bring-up on a genuinely older unknown part.
+    //   GGML_OPENCL_GEN_LEVEL=<n>  (e.g. 81 to cap an unknown chip at X1-class)
+    if (backend_ctx->gpu_family == GPU_FAMILY::ADRENO) {
+        int lvl = adreno_gen_level(backend_ctx->adreno_gen);
+        if (backend_ctx->adreno_gen == ADRENO_GPU_GEN::ADRENO_UNKNOWN) {
+            lvl = GEN_LEVEL_MAX_KNOWN;
+            GGML_LOG_WARN("ggml_opencl: unknown Adreno gen; assuming capability level %d "
+                          "(override with GGML_OPENCL_GEN_LEVEL)\n", lvl);
+        }
+        if (const char * env = getenv("GGML_OPENCL_GEN_LEVEL")) {
+            if (env[0]) lvl = atoi(env);
+        }
+        backend_ctx->gen_level = lvl;
+    }
+
     // Derived FA c8 tuning (see the field comments on the context struct):
-    // cluster width follows the compiler class, default-on follows per-gen
-    // measured validation.
+    // cluster width follows the compiler class, default-on follows the gen
+    // level (>= X1: X1E, A8X/840, X2E and newer).
     {
         const char * env = getenv("GGML_OPENCL_FA_CL_C");
         const int v = (env && env[0]) ? atoi(env) : 0;
@@ -5853,8 +5907,8 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
         backend_ctx->fa_c8_cluster = (v == 8 || v == 16 || v == 32) ? v
             : (backend_ctx->adreno_x2_class() ? 16 : 0);
     }
-    backend_ctx->fa_c8_default_on = backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E ||
-                                    backend_ctx->adreno_gen == ADRENO_GPU_GEN::X1E;
+    backend_ctx->fa_c8_default_on = backend_ctx->gpu_family == GPU_FAMILY::ADRENO &&
+                                    backend_ctx->gen_level >= GEN_LEVEL_X1E;
 
     // check Adreno large buffer support
     backend_ctx->adreno_has_large_buffer = strstr(ext_buffer, "cl_qcom_large_buffer") != NULL;
