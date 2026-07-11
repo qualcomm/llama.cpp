@@ -5841,7 +5841,7 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
                 const std::string opts_g8_c8_ns2 = opts + " -D FA_MQ_ONLY -D MQ_GQA=8 -D MQ_NSG=2 -D MQ_NSG_SPLIT=2 -D FA_CL_C=" + fa_cl_c_g8_val;
                 cl_program prog_g8_c8 = build_program_from_source_ex(
                     backend_ctx->context, backend_ctx->device, src.c_str(), opts_g8_c8_ns2,
-                    /*fatal=*/false, "fa f32_f16 c8 g8 NSG2", backend_ctx->queue);
+                    /*fatal=*/false, "fa f32_f16 c8 g8 NSG2", /*bin_size=*/0, backend_ctx->queue);
                 if (prog_g8_c8) {
                     cl_kernel k_g8_c8 = clCreateKernel(prog_g8_c8, "flash_attn_f32_f16_q1_vec_mq_split_c8", &err);
                     if (err == CL_SUCCESS) {
