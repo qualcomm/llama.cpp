@@ -564,6 +564,22 @@ struct ggml_backend_opencl_context {
     bool has_subgroup_shuffle = false;       // cl_khr_subgroup_shuffle or cl_qcom_subgroup_shuffle
     bool has_integer_dot      = false;       // cl_khr_integer_dot_product or cl_qcom_dot_product8
     bool has_qcom_subgroup_shuffle = false;  // specifically cl_qcom_subgroup_shuffle
+    bool has_integer_dot_product = false;    // cl_khr_integer_dot_product (dp4a); kernels #ifdef on the same name
+    cl_uint compute_units = 0;               // CL_DEVICE_MAX_COMPUTE_UNITS (scale axis for tuning formulas)
+
+    // dp4a MoE GEMM/GEMV paths gate on capability, not chip identity, so any
+    // Adreno advertising the integer-dot extension (X2E, X1E, A8X/840, future
+    // gens) inherits them.
+    bool adreno_dp4a_moe() const {
+        return gpu_family == GPU_FAMILY::ADRENO && has_integer_dot_product;
+    }
+    // The dense dp4a GEMMs must NOT gate on the extension alone: X1E advertises
+    // it but its compiler spills the dense dp4a kernels (792B vs 352B private
+    // on X2) and they lose to f16 there. X2-class = the X2E ISA generation,
+    // including its mobile flavor A8X (Adreno 830/840).
+    bool adreno_x2_class() const {
+        return adreno_gen == ADRENO_GPU_GEN::X2E || adreno_gen == ADRENO_GPU_GEN::A8X;
+    }
     bool disable_fusion;
 
     // ragged moe, use int to directly pass to kernel
@@ -5876,6 +5892,12 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
     // Check if ext_buffer contains cl_khr_fp16
     backend_ctx->fp16_support = strstr(ext_buffer, "cl_khr_fp16") != NULL;
 
+    // dp4a capability, feature-detected so new same-class devices pick up the
+    // dp4a paths without a per-name gate
+    backend_ctx->has_integer_dot_product = strstr(ext_buffer, "cl_khr_integer_dot_product") != NULL;
+
+    CL_CHECK(clGetDeviceInfo(device, CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(cl_uint), &backend_ctx->compute_units, NULL));
+
     // check Adreno large buffer support
     backend_ctx->adreno_has_large_buffer = strstr(ext_buffer, "cl_qcom_large_buffer") != NULL;
 
@@ -8403,7 +8425,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
             {
                 static const char * q5dp4a_env = getenv("GGML_OPENCL_Q5_MOE_DP4A");
                 const bool q5dp4a = q5dp4a_env ? (atoi(q5dp4a_env) != 0)
-                                               : (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E);
+                                               : backend_ctx->adreno_dp4a_moe();
                 if (q5dp4a && ne02 > 1 && (ne00 % 32 == 0)) {
                     size_t nb32 = (size_t)ne00 / 32;
                     size_t sc_elems = (size_t)ne02 * ne01 * nb32 * 2;
@@ -8808,7 +8830,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         {
             static const char * q8dp4a_env = getenv("GGML_OPENCL_Q8_MOE_DP4A");
             const bool q8dp4a = q8dp4a_env ? (atoi(q8dp4a_env) != 0)
-                                           : (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E);
+                                           : backend_ctx->adreno_dp4a_moe();
             if (q8dp4a && tensor->ne[2] > 1 && (tensor->ne[0] % 32 == 0)) {
                 int ne00 = (int)tensor->ne[0];
                 int ne01 = (int)tensor->ne[1];
@@ -9190,7 +9212,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
             {
                 static const char * q5kdp4a_env = getenv("GGML_OPENCL_Q5K_MOE_DP4A");
                 const bool q5kdp4a = q5kdp4a_env ? (atoi(q5kdp4a_env) != 0)
-                                                 : (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E);
+                                                 : backend_ctx->adreno_dp4a_moe();
                 if (q5kdp4a && ne02 > 1 && (ne00 % 256 == 0)) {
                     size_t nb32     = (size_t)ne00 / 32;
                     size_t sc_elems = (size_t)ne02 * ne01 * nb32 * 2;
@@ -16926,7 +16948,7 @@ static void ggml_cl_mul_mat_iq4_nl_f32_adreno(ggml_backend_t backend, const ggml
         static const char * iq4nl_dense_dp4a_env = getenv("GGML_OPENCL_IQ4NL_DENSE_DP4A");
         bool iq4nl_dense_dp4a_on = iq4nl_dense_dp4a_env
             ? (atoi(iq4nl_dense_dp4a_env) != 0)
-            : (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E);
+            : backend_ctx->adreno_x2_class();
         // dot prod has to be available
         iq4nl_dense_dp4a_on = backend_ctx->has_integer_dot && iq4nl_dense_dp4a_on;
 
@@ -17182,7 +17204,7 @@ static void ggml_cl_mul_mat_q8_0_f32_adreno(ggml_backend_t backend, const ggml_t
             ? true
             : q8_dense_dp4a_env
             ? (atoi(q8_dense_dp4a_env) != 0)
-            : (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E && !q8_bin_loaded);
+            : (backend_ctx->adreno_x2_class() && !q8_bin_loaded);
         // dot prod has to be available
         q8_dense_dp4a_on = backend_ctx->has_integer_dot && q8_dense_dp4a_on;
 
@@ -17596,7 +17618,7 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
             ? true
             : q4k_dense_dp4a_env
             ? (atoi(q4k_dense_dp4a_env) != 0)
-            : (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E);
+            : backend_ctx->adreno_x2_class();
 
         // dp4 has to be available
         q4k_dense_dp4a_on = backend_ctx->has_integer_dot && q4k_dense_dp4a_on;
@@ -17825,7 +17847,7 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
         static const char * q6k_dense_dp4a_env = getenv("GGML_OPENCL_Q6K_DENSE_DP4A");
                      bool   q6k_dense_dp4a_on  = (q6k_dense_dp4a_env != nullptr)
                                                    ? (atoi(q6k_dense_dp4a_env) != 0)
-                                                   : (backend_ctx->adreno_gen != ADRENO_GPU_GEN::X1E);
+                                                   : backend_ctx->adreno_x2_class();
         // dot prod has to be available
         q6k_dense_dp4a_on = backend_ctx->has_integer_dot && q6k_dense_dp4a_on;
 
@@ -18120,7 +18142,7 @@ static void ggml_cl_mul_mat_q5_K_f32_adreno(ggml_backend_t backend, const ggml_t
         static const char * q5k_dense_dp4a_env = getenv("GGML_OPENCL_Q5K_DENSE_DP4A");
                      bool   q5k_dense_dp4a_on  = q5k_dense_dp4a_env
             ? (atoi(q5k_dense_dp4a_env) != 0)
-            : (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E);
+            : backend_ctx->adreno_x2_class();
         // dot prod has to be available
         q5k_dense_dp4a_on = backend_ctx->has_integer_dot && q5k_dense_dp4a_on;
 
@@ -20878,7 +20900,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     static const char * q4_0_moe_dp4a_env = getenv("GGML_OPENCL_Q4_0_MOE_DP4A");
                     bool use_moe_dp4a = q4_0_moe_dp4a_env
                         ? (atoi(q4_0_moe_dp4a_env) != 0)
-                        : (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E);
+                        : backend_ctx->adreno_dp4a_moe();
                     // dot prod has to be available
                     use_moe_dp4a = backend_ctx->has_integer_dot && use_moe_dp4a;
                     // bin kernel takes precedence
@@ -21371,7 +21393,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     {
                         static const char * q5mdp4a_env = getenv("GGML_OPENCL_Q5_MOE_DP4A");
                         const bool q5mdp4a_on = q5mdp4a_env ? (atoi(q5mdp4a_env) != 0)
-                                                            : (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E);
+                                                            : backend_ctx->adreno_dp4a_moe();
                         const bool use_q5_moe_dp4a = q5mdp4a_on
                             && backend_ctx->kernel_gemm_moe_q8_1_dp4a_q50 != nullptr
                             && extra0_q5_0->scale != nullptr;
@@ -21716,7 +21738,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
             static const char * moe_gemm_q8_env = getenv("GGML_OPENCL_MOE_GEMM_Q8");
             const bool          moe_gemm_q8     = moe_gemm_q8_env
                 ? (atoi(moe_gemm_q8_env) != 0)
-                : (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E);
+                : backend_ctx->adreno_dp4a_moe();
             if (moe_gemm_q8 && use_adreno_moe_kernels(backend_ctx, src0) && ne12 > 1) {
                 cl_int status;
 
@@ -21754,7 +21776,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                 {
                     static const char * q8mdp4a_env = getenv("GGML_OPENCL_Q8_MOE_DP4A");
                     const bool q8mdp4a_on = q8mdp4a_env ? (atoi(q8mdp4a_env) != 0)
-                                                        : (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E);
+                                                        : backend_ctx->adreno_dp4a_moe();
                     const bool use_q8_moe_dp4a = q8mdp4a_on
                         && backend_ctx->kernel_gemm_moe_q8_1_dp4a_q80 != nullptr
                         && extra0_q8_0->scale != nullptr;
@@ -21977,7 +21999,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     static const char * moe_decode_wimg_env = getenv("GGML_OPENCL_MOE_DECODE_WIMG");
                     const bool moe_decode_wimg_on = moe_decode_wimg_env
                         ? (atoi(moe_decode_wimg_env) != 0)
-                        : (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E);
+                        : backend_ctx->adreno_x2_class();
                     const bool use_moe_decode_wimg = moe_decode_wimg_on
                         && backend_ctx->kernel_gemv_moe_q4_k_f32_ns_wimg != nullptr
                         && extra0_q4_K->q_img != nullptr;
@@ -22055,7 +22077,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     static const char * q4k_moe_dp4a_env = getenv("GGML_OPENCL_Q4K_MOE_DP4A");
                     bool  use_moe_dp4a = (q4k_moe_dp4a_env != nullptr)
                                          ? (atoi(q4k_moe_dp4a_env) != 0)
-                                         : (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E || backend_ctx->adreno_gen == ADRENO_GPU_GEN::X1E);
+                                         : backend_ctx->adreno_dp4a_moe();
                     // dot prod has to be available
                     use_moe_dp4a = backend_ctx->has_integer_dot && use_moe_dp4a;
                     // bin kernel takes precedence
@@ -22322,7 +22344,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     {
                         static const char * q5kmdp4a_env = getenv("GGML_OPENCL_Q5K_MOE_DP4A");
                         const bool q5kmdp4a_on = q5kmdp4a_env ? (atoi(q5kmdp4a_env) != 0)
-                                                              : (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E);
+                                                              : backend_ctx->adreno_dp4a_moe();
                         bool use_moe_dp4a = q5kmdp4a_on
                             && backend_ctx->kernel_gemm_moe_q8_1_dp4a_q5k != nullptr
                             && extra0_q5_K->scale != nullptr;
@@ -22564,8 +22586,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     static const char * q6k_moe_dp4a_env = getenv("GGML_OPENCL_Q6K_MOE_DP4A");
                                  bool   use_moe_dp4a = (q6k_moe_dp4a_env != nullptr)
                                                          ? (atoi(q6k_moe_dp4a_env) != 0)
-                                                         : (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E
-                                                            || backend_ctx->adreno_gen == ADRENO_GPU_GEN::X1E);
+                                                         : backend_ctx->adreno_dp4a_moe();
                     // dot prod has to be available
                     use_moe_dp4a = backend_ctx->has_integer_dot && use_moe_dp4a;
                     // bin kernel takes precedence
@@ -22823,7 +22844,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     static const char * mxfp4_moe_dp4a_env = getenv("GGML_OPENCL_MXFP4_MOE_DP4A");
                     bool use_moe_dp4a = mxfp4_moe_dp4a_env
                         ? (atoi(mxfp4_moe_dp4a_env) != 0)
-                        : (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E);
+                        : backend_ctx->adreno_dp4a_moe();
                     // dot prod has to be available
                     use_moe_dp4a = backend_ctx->has_integer_dot && use_moe_dp4a;
                     // bin kernel takes precedence
