@@ -25322,6 +25322,16 @@ static void moe_router_reoerder(ggml_backend_t backend, const ggml_tensor * src,
     CL_CHECK(clReleaseMemObject(emap_buf));
 }
 
+// Whether a kernel declares an argument at index idx (probe for optional
+// trailing args whose presence depends on the prebuilt kernel-lib version).
+static bool cl_kernel_has_arg(cl_kernel kernel, cl_uint idx) {
+    cl_uint n_args = 0;
+    if (clGetKernelInfo(kernel, CL_KERNEL_NUM_ARGS, sizeof(n_args), &n_args, NULL) != CL_SUCCESS) {
+        return false;
+    }
+    return idx < n_args;
+}
+
 static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_ASSERT(src0);
     GGML_ASSERT(src0->extra);
@@ -25647,8 +25657,10 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),    &(backend_ctx->prealloc_total_tiles.buffer)));
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ne00));
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ne01));
-                    // prebuilt bin kernels do not take the ragged args
-                    if (!backend_ctx->kernel_gemm_moe_q4_0_f32_ns_bin) {
+                    // prebuilt bin kernels take the ragged args only from kernel-lib
+                    // 0.0.7 on; probe the selected kernel's signature (source kernels
+                    // always have them)
+                    if (!backend_ctx->kernel_gemm_moe_q4_0_f32_ns_bin || cl_kernel_has_arg(kernel, arg_idx + 1)) {
                         CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_uint),   &backend_ctx->adreno_use_moe_ragged));
                         CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_uint),   &backend_ctx->adreno_moe_ragged_skip_gran));
                     }
@@ -25878,8 +25890,10 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),    &(backend_ctx->prealloc_total_tiles.buffer)));
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ne00));
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ne01));
-                    // prebuilt bin kernels do not take the ragged args
-                    if (!backend_ctx->kernel_gemm_moe_q4_1_f32_ns_bin) {
+                    // prebuilt bin kernels take the ragged args only from kernel-lib
+                    // 0.0.7 on; probe the selected kernel's signature (source kernels
+                    // always have them)
+                    if (!backend_ctx->kernel_gemm_moe_q4_1_f32_ns_bin || cl_kernel_has_arg(kernel, arg_idx + 1)) {
                         CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_uint),   &backend_ctx->adreno_use_moe_ragged));
                         CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_uint),   &backend_ctx->adreno_moe_ragged_skip_gran));
                     }
@@ -26840,8 +26854,10 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),    &(backend_ctx->prealloc_total_tiles.buffer)));
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ne00));
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ne01));
-                    // prebuilt bin kernels do not take the ragged args
-                    if (!backend_ctx->kernel_gemm_moe_q4_k_f32_ns_bin) {
+                    // prebuilt bin kernels take the ragged args only from kernel-lib
+                    // 0.0.7 on; probe the selected kernel's signature (source kernels
+                    // always have them)
+                    if (!backend_ctx->kernel_gemm_moe_q4_k_f32_ns_bin || cl_kernel_has_arg(kernel, arg_idx + 1)) {
                         CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_uint),   &backend_ctx->adreno_use_moe_ragged));
                         CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_uint),   &backend_ctx->adreno_moe_ragged_skip_gran));
                     }
@@ -27597,8 +27613,10 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),    &(backend_ctx->prealloc_total_tiles.buffer)));
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ne00));
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ne01));
-                    // prebuilt bin kernels do not take the ragged args
-                    if (!backend_ctx->kernel_gemm_moe_mxfp4_f32_ns_bin) {
+                    // prebuilt bin kernels take the ragged args only from kernel-lib
+                    // 0.0.7 on; probe the selected kernel's signature (source kernels
+                    // always have them)
+                    if (!backend_ctx->kernel_gemm_moe_mxfp4_f32_ns_bin || cl_kernel_has_arg(kernel, arg_idx + 1)) {
                         CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_uint),   &backend_ctx->adreno_use_moe_ragged));
                         CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_uint),   &backend_ctx->adreno_moe_ragged_skip_gran));
                     }
