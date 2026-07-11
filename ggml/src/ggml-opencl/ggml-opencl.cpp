@@ -737,8 +737,6 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mat_f16_f32_l4_dr_ls;
     cl_kernel kernel_mul_mat_f16_f32_l4_dr_lq;
     cl_kernel kernel_mul_mat_f16_f32_l4_x8 = nullptr;
-    cl_kernel kernel_mul_mat_f16_f32_l4_x8_pair = nullptr;
-    cl_kernel kernel_mul_mat_f16_f32_l4_x8_gqa4 = nullptr;
     cl_kernel kernel_mul_mat_f16_f32_l4_x8_gqa4_img = nullptr;
     cl_kernel kernel_mul_mat_f16_f32_l4_x8_gqa_r4_img = nullptr;
     cl_kernel kernel_mul_mat_f16_f32_l4_x8_gqa_r2_dk256_img = nullptr;
@@ -2184,21 +2182,6 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         backend_ctx->kernel_mul_mat_f16_f32_l4_x8 =
             clCreateKernel(backend_ctx->program_mul_mv_f16_f32_l4, "kernel_mul_mat_f16_f32_l4_x8", &err_x8);
         if (err_x8 != CL_SUCCESS) backend_ctx->kernel_mul_mat_f16_f32_l4_x8 = nullptr;
-        // Paired K-row variant of _x8: doubles per-wave-cycle memory-issue
-        // parallelism at DK in [128, 256] by using both halves of the 64-lane
-        // warp on adjacent K-rows. Best-effort.
-        cl_int err_x8p = CL_SUCCESS;
-        backend_ctx->kernel_mul_mat_f16_f32_l4_x8_pair =
-            clCreateKernel(backend_ctx->program_mul_mv_f16_f32_l4, "kernel_mul_mat_f16_f32_l4_x8_pair", &err_x8p);
-        if (err_x8p != CL_SUCCESS) backend_ctx->kernel_mul_mat_f16_f32_l4_x8_pair = nullptr;
-        // GQA-coalesced variant of _x8 for DK=128, r2=4: one WG per K-head,
-        // 64-lane warp partitioned across 4 Q-heads so each K-row is read
-        // once and contributes to 4 outputs. Targets long-context KQ where
-        // the 4× K replay dominates. Best-effort.
-        cl_int err_x8g = CL_SUCCESS;
-        backend_ctx->kernel_mul_mat_f16_f32_l4_x8_gqa4 =
-            clCreateKernel(backend_ctx->program_mul_mv_f16_f32_l4, "kernel_mul_mat_f16_f32_l4_x8_gqa4", &err_x8g);
-        if (err_x8g != CL_SUCCESS) backend_ctx->kernel_mul_mat_f16_f32_l4_x8_gqa4 = nullptr;
         // image1d_buffer_t (texture-cache) variant of _x8_gqa4. Same kernel
         // body but K is bound as a read-only image1d_buffer over a sub-buffer
         // covering the K cache. Host creates the sub-buffer + image per call.
@@ -18137,6 +18120,17 @@ static void ggml_cl_mul_mat_q5_K_f32_adreno(ggml_backend_t backend, const ggml_t
 // temp cl_mem the caller must release. SoA inputs are reconstructed into a
 // temp AoS buffer reported via *extra_reconstruct (also caller-released).
 // this is for quantized K cache without FA.
+// Single opt-out for every decode KQ/KQV fast path below (the GQA-coalesced
+// kernels, their texture-cache variants, and the generic quantized-K kernels).
+// They are all default-on; GGML_OPENCL_MM_KQ=0 forces the stock kernels, which is
+// the one switch a bug report needs. Per-path env vars were used while bringing
+// these up; a single kill switch is what survives.
+static bool ggml_cl_mm_kq_fastpath_on() {
+    static const char * env = getenv("GGML_OPENCL_MM_KQ");
+    static const bool   on  = (env == nullptr || env[0] != '0');
+    return on;
+}
+
 static cl_mem ggml_cl_mul_mat_dequant_quant_to_f16(
         ggml_backend_opencl_context * backend_ctx,
         const ggml_tensor *           tensor,
@@ -18485,8 +18479,6 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
     if (src0t == GGML_TYPE_Q8_0 && src1t == GGML_TYPE_F32 &&
         (backend_ctx->kernel_mul_mat_q8_0_f32_gqa8_dk128 != nullptr ||
          backend_ctx->kernel_mul_mat_q8_0_f32_gqa_r4_dk128 != nullptr)) {
-        static const char * q8gqa_env = getenv("GGML_OPENCL_MM_KQ_GQA_Q8_0");
-        static const bool   q8gqa_on  = (q8gqa_env == nullptr || q8gqa_env[0] != '0');
 
         const int ne00 = src0->ne[0];
         const int ne01 = src0->ne[1];
@@ -18507,7 +18499,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                        : (ne00 == 128 && rr == 4) ? backend_ctx->kernel_mul_mat_q8_0_f32_gqa_r4_dk128_img
                        : nullptr;
 
-        if (q8gqa_on && kbuf != nullptr && (ne00 == 128 || ne00 == 256) && ne11 == 1 && ne01 >= 64 &&
+        if (ggml_cl_mm_kq_fastpath_on() && kbuf != nullptr && (ne00 == 128 || ne00 == 256) && ne11 == 1 && ne01 >= 64 &&
             (ne01 % 16) == 0 && ne02 > 0 && (ne13 / ne03) == 1) {
             ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *)src0->extra;
             ggml_tensor_extra_cl * extra1 = (ggml_tensor_extra_cl *)src1->extra;
@@ -18537,9 +18529,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             // at -23% KV DDR); @4k 17.54->24.66 (~f16 parity). Buffer kernel below
             // is the fallback when the image can't be created (e.g. k_pixels over
             // image_max_buffer_size). Opt out with GGML_OPENCL_MM_KQ_GQA_Q8_0_IMG=0.
-            static const char * q8gqai_env = getenv("GGML_OPENCL_MM_KQ_GQA_Q8_0_IMG");
-            static const bool   q8gqai_on  = (q8gqai_env == nullptr || q8gqai_env[0] != '0');
-            if (q8gqai_on && kimg != nullptr) {
+            if (ggml_cl_mm_kq_fastpath_on() && kimg != nullptr) {
                 // Byte span of K read, rounded up to a 4-byte pixel boundary.
                 const size_t span =
                     (size_t)(ne01 - 1) * (size_t)nb01 +
@@ -18633,8 +18623,6 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
     // Opt out with GGML_OPENCL_MM_KQ_GEN_Q8_0=0.
     if (src0t == GGML_TYPE_Q8_0 && src1t == GGML_TYPE_F32 &&
         backend_ctx->kernel_mul_mat_q8_0_f32_kq_gen != nullptr) {
-        static const char * q8gen_env = getenv("GGML_OPENCL_MM_KQ_GEN_Q8_0");
-        static const bool   q8gen_on  = (q8gen_env == nullptr || q8gen_env[0] != '0');
 
         const int ne00 = src0->ne[0];
         const int ne01 = src0->ne[1];
@@ -18654,7 +18642,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         const bool is_kv_view = (src0->view_src != nullptr) && (ne02 > 0) &&
                                 (ne12 % ne02) == 0 && (ne12 / ne02) >= 2;
 
-        if (q8gen_on && is_kv_view && ne11 == 1 && ne00 >= 32 && ne00 <= 512 && (ne00 % 32) == 0 &&
+        if (ggml_cl_mm_kq_fastpath_on() && is_kv_view && ne11 == 1 && ne00 >= 32 && ne00 <= 512 && (ne00 % 32) == 0 &&
             ne03 > 0 && (ne13 % ne03) == 0) {
             ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *)src0->extra;
             ggml_tensor_extra_cl * extra1 = (ggml_tensor_extra_cl *)src1->extra;
@@ -18718,8 +18706,6 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
     if (src0t == GGML_TYPE_Q4_0 && src1t == GGML_TYPE_F32 &&
         (backend_ctx->kernel_mul_mat_q4_0_f32_gqa8_dk128 != nullptr ||
          backend_ctx->kernel_mul_mat_q4_0_f32_gqa_r4_dk128 != nullptr)) {
-        static const char * q4gqa_env = getenv("GGML_OPENCL_MM_KQ_GQA_Q4_0");
-        static const bool   q4gqa_on  = (q4gqa_env == nullptr || q4gqa_env[0] != '0');
 
         const int ne00 = src0->ne[0];
         const int ne01 = src0->ne[1];
@@ -18740,7 +18726,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                        : (ne00 == 128 && rr == 4) ? backend_ctx->kernel_mul_mat_q4_0_f32_gqa_r4_dk128_img
                        : nullptr;
 
-        if (q4gqa_on && kbuf != nullptr && (ne00 == 128 || ne00 == 256) && ne11 == 1 && ne01 >= 64 &&
+        if (ggml_cl_mm_kq_fastpath_on() && kbuf != nullptr && (ne00 == 128 || ne00 == 256) && ne11 == 1 && ne01 >= 64 &&
             (ne01 % 16) == 0 && ne02 > 0 && (ne13 / ne03) == 1) {
             ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *)src0->extra;
             ggml_tensor_extra_cl * extra1 = (ggml_tensor_extra_cl *)src1->extra;
@@ -18765,9 +18751,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 
             // Texture-cache image variant (default-on, opt out _IMG=0). q4_0 row =
             // 72 B = 18 px; falls through to the buffer kernel if the image fails.
-            static const char * q4gqai_env = getenv("GGML_OPENCL_MM_KQ_GQA_Q4_0_IMG");
-            static const bool   q4gqai_on  = (q4gqai_env == nullptr || q4gqai_env[0] != '0');
-            if (q4gqai_on && kimg != nullptr) {
+            if (ggml_cl_mm_kq_fastpath_on() && kimg != nullptr) {
                 const size_t span =
                     (size_t)(ne01 - 1) * (size_t)nb01 +
                     (size_t)(ne02 - 1) * (size_t)nb02 +
@@ -18856,8 +18840,6 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
     // Opt out with GGML_OPENCL_MM_KQ_GEN_Q4_0=0.
     if (src0t == GGML_TYPE_Q4_0 && src1t == GGML_TYPE_F32 &&
         backend_ctx->kernel_mul_mat_q4_0_f32_kq_gen != nullptr) {
-        static const char * q4gen_env = getenv("GGML_OPENCL_MM_KQ_GEN_Q4_0");
-        static const bool   q4gen_on  = (q4gen_env == nullptr || q4gen_env[0] != '0');
 
         const int ne00 = src0->ne[0];
         const int ne01 = src0->ne[1];
@@ -18870,7 +18852,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         const bool is_kv_view = (src0->view_src != nullptr) && (ne02 > 0) &&
                                 (ne12 % ne02) == 0 && (ne12 / ne02) >= 2;
 
-        if (q4gen_on && is_kv_view && ne11 == 1 && ne00 >= 32 && ne00 <= 512 && (ne00 % 32) == 0 &&
+        if (ggml_cl_mm_kq_fastpath_on() && is_kv_view && ne11 == 1 && ne00 >= 32 && ne00 <= 512 && (ne00 % 32) == 0 &&
             ne03 > 0 && (ne13 % ne03) == 0) {
             ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *)src0->extra;
             ggml_tensor_extra_cl * extra1 = (ggml_tensor_extra_cl *)src1->extra;
@@ -19009,10 +18991,6 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
     // GGML_OPENCL_MM_KQ_GQA_DK128_IMG=0. Qwen3.6 tg128 fa=0 +49% @16k (with KQV);
     // Qwen3-30B-A3B DK=128 was +244% @16k as opt-in, now default.
     if (src0t == GGML_TYPE_F16 && src1t == GGML_TYPE_F32) {
-        static const char * mm_kq_dk256_env = getenv("GGML_OPENCL_MM_KQ_GQA_DK256_IMG");
-        static const bool mm_kq_dk256_on = (mm_kq_dk256_env == nullptr || mm_kq_dk256_env[0] != '0');
-        static const char * mm_kq_dk128_env = getenv("GGML_OPENCL_MM_KQ_GQA_DK128_IMG");
-        static const bool mm_kq_dk128_on = (mm_kq_dk128_env == nullptr || mm_kq_dk128_env[0] != '0');
         // Select the decode KQ image kernel for this (DK, r2=8, r3=1) shape:
         //   DK=256 -> Qwen3.6/Next (x8_gqa_r8_dk256_img)
         //   DK=128 -> Qwen3-30B-A3B (x8_gqa4_img; +244% fa=0@16k, was locked
@@ -19020,9 +18998,9 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         cl_kernel kq_img_kernel = nullptr;
         if (ne11 == 1 && ne01 >= 64 && (ne01 % 16) == 0 &&
             (ne12 % ne02) == 0 && (ne12 / ne02) == 8 && (ne13 / ne03) == 1) {
-            if (ne00 == 256 && mm_kq_dk256_on) {
+            if (ne00 == 256 && ggml_cl_mm_kq_fastpath_on()) {
                 kq_img_kernel = backend_ctx->kernel_mul_mat_f16_f32_l4_x8_gqa_r8_dk256_img;
-            } else if (ne00 == 128 && mm_kq_dk128_on) {
+            } else if (ne00 == 128 && ggml_cl_mm_kq_fastpath_on()) {
                 kq_img_kernel = backend_ctx->kernel_mul_mat_f16_f32_l4_x8_gqa4_img;
             }
         }
@@ -19121,16 +19099,12 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         // All test-backend-ops MUL_MAT type_a=f16 cases pass with these gates
         // enabled. Promoted to default after validation on Qwen3-30B-A3B,
         // Qwen3.6-35B-A3B, Qwen3-4B, Qwen3-8B, Llama-3-8B.
-        static const char * mm_kq_gqa_img_env = getenv("GGML_OPENCL_MM_KQ_GQA_IMG");
-        static const bool mm_kq_gqa_img_on = (mm_kq_gqa_img_env == nullptr || mm_kq_gqa_img_env[0] != '0');
-        static const char * mm_kq_gqa_r4_img_env = getenv("GGML_OPENCL_MM_KQ_GQA_R4_IMG");
-        static const bool mm_kq_gqa_r4_img_on = (mm_kq_gqa_r4_img_env == nullptr || mm_kq_gqa_r4_img_env[0] != '0');
         const bool img_r4_gate =
-            mm_kq_gqa_r4_img_on &&
+            ggml_cl_mm_kq_fastpath_on() &&
             backend_ctx->kernel_mul_mat_f16_f32_l4_x8_gqa_r4_img != nullptr &&
             ne11 == 1 && ne01 >= 64 && (ne01 % 16) == 0 && ne00 == 128 &&
             (ne12 % ne02) == 0 && (ne12 / ne02) == 4 && (ne13 / ne03) == 1;
-        if (mm_kq_gqa_img_on &&
+        if (ggml_cl_mm_kq_fastpath_on() &&
             backend_ctx->kernel_mul_mat_f16_f32_l4_x8_gqa4_img != nullptr &&
             ne11 == 1 && ne01 >= 64 && (ne01 % 16) == 0 && ne00 == 128 &&
             (ne12 % ne02) == 0 && (ne12 / ne02) == 8 && (ne13 / ne03) == 1) {
@@ -19248,9 +19222,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         // r2=2 is only 2x K-reuse and Gemma is SWA + small (dispatch-bound), so the
         // KQ coalesce that won +106% on Qwen3-30B-A3B (r2=8, all-global) does nothing
         // here. Kept opt-in; do not promote without a win on a larger r2=2/DK256 model.
-        static const char * mm_kq_r2_dk256_env = getenv("GGML_OPENCL_MM_KQ_GQA_R2_DK256_IMG");
-        static const bool mm_kq_r2_dk256_on = (mm_kq_r2_dk256_env != nullptr && mm_kq_r2_dk256_env[0] != '0');
-        if (mm_kq_r2_dk256_on &&
+        if (ggml_cl_mm_kq_fastpath_on() &&
             backend_ctx->kernel_mul_mat_f16_f32_l4_x8_gqa_r2_dk256_img != nullptr &&
             ne11 == 1 && ne01 >= 64 && (ne01 % 16) == 0 && ne00 == 256 &&
             (ne12 % ne02) == 0 && (ne12 / ne02) == 2 && (ne13 / ne03) == 1) {
@@ -19310,9 +19282,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         // whose K grows with context, they're just 1-in-6, KQ is a small slice of
         // the MoE/projection-dominated decode, and only KQ (not KQV/DV=512) is
         // coalesced -- so the Qwen3-30B KQ win doesn't transfer. Kept opt-in.
-        static const char * mm_kq_r8_dk512_env = getenv("GGML_OPENCL_MM_KQ_GQA_R8_DK512_IMG");
-        static const bool mm_kq_r8_dk512_on = (mm_kq_r8_dk512_env != nullptr && mm_kq_r8_dk512_env[0] != '0');
-        if (mm_kq_r8_dk512_on &&
+        if (ggml_cl_mm_kq_fastpath_on() &&
             backend_ctx->kernel_mul_mat_f16_f32_l4_x8_gqa_r8_dk512_img != nullptr &&
             ne11 == 1 && ne01 >= 64 && (ne01 % 16) == 0 && ne00 == 512 &&
             (ne12 % ne02) == 0 && (ne12 / ne02) == 8 && (ne13 / ne03) == 1) {
@@ -19370,9 +19340,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         //   r2 = ne12/ne02 = 8 for Qwen3-30B-A3B family.
         // Same generic k_bytes formula handles V's transposed (n_kv-fast) layout.
         // Opt-in via GGML_OPENCL_MM_KQV_GQA_IMG=1.
-        static const char * mm_kqv_gqa_img_env = getenv("GGML_OPENCL_MM_KQV_GQA_IMG");
-        static const bool mm_kqv_gqa_img_on = (mm_kqv_gqa_img_env != nullptr && mm_kqv_gqa_img_env[0] != '0');
-        if (mm_kqv_gqa_img_on &&
+        if (ggml_cl_mm_kq_fastpath_on() &&
             backend_ctx->kernel_mul_mat_f16_f32_l4_y8_gqa_img != nullptr &&
             ne11 == 1 && ne01 == 128 &&
             (ne12 % ne02) == 0 && (ne12 / ne02) == 8 && (ne13 / ne03) == 1) {
@@ -20241,32 +20209,14 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     // Biggest win at long context where the KQ/KQV launches
                     // ~262K WGs each with a single mad.
                     // Diagnostic: GGML_OPENCL_MM_F16_FORCE_L4=1 bypasses _x8/_y8 multi-output
-                    // variants and forces the original _l4 kernel. Used to bisect Qwen3.6-35B-A3B
-                    // baseline drift between 940c1ef5f and ff90e9a95 (11.13 → 8.38 t/s at d=16k).
-                    static const char * mm_force_l4_env = getenv("GGML_OPENCL_MM_F16_FORCE_L4");
-                    static const bool mm_force_l4_on = (mm_force_l4_env != nullptr && mm_force_l4_env[0] != '0');
-                    const bool can_multi_out = !mm_force_l4_on && ne11 == 1 && ne01 >= 64 && ne01 % 8 == 0;
-                    // Opt-in: GGML_OPENCL_MM_KQ_PAIR=1 swaps _x8 for the
-                    // paired-K-row variant that doubles per-wave-cycle
-                    // memory-issue parallelism at DK in [128, 256]. Held
-                    // behind env var (no long-ctx win on Qwen3-30B-A3B).
-                    static const char * mm_kq_pair_env = getenv("GGML_OPENCL_MM_KQ_PAIR");
-                    static const bool mm_kq_pair_on = (mm_kq_pair_env != nullptr && mm_kq_pair_env[0] != '0');
-                    // Opt-in: GGML_OPENCL_MM_KQ_GQA=1 swaps _x8 for the
-                    // GQA-coalesced variant that reads each K-row once and
-                    // emits gqa_ratio outputs. Specialized for DK=128, r2=8,
-                    // r3=1 (Qwen3-30B-A3B / Qwen3-4B / Qwen3.6-A3B shape).
-                    // +35% tg128 @ d=16k, +30% @ d=8k, +20% @ d=4k on Qwen3-30B-A3B.
-                    static const char * mm_kq_gqa_env = getenv("GGML_OPENCL_MM_KQ_GQA");
-                    static const bool mm_kq_gqa_on = (mm_kq_gqa_env != nullptr && mm_kq_gqa_env[0] != '0');
+                    const bool can_multi_out = ne11 == 1 && ne01 >= 64 && ne01 % 8 == 0;
                     // GGML_OPENCL_MM_KQV_GQA swaps _y8 for the GQA-coalesced KQV
                     // (r2=8/r3=1) that reads each V slab once per K-head and emits
                     // all r2 Q-heads. y8_gqa is DV-agnostic. Default-on for the r2=8
                     // GQA shapes DV in {128,256}, paired with the decode KQ image
                     // above: Qwen3.6 (DV=256) +49% combined; Qwen3-30B-A3B (DV=128)
                     // +254% combined tg@16k. Opt out with =0.
-                    static const char * mm_kqv_gqa_env = getenv("GGML_OPENCL_MM_KQV_GQA");
-                    const bool mm_kqv_gqa_off = (mm_kqv_gqa_env != nullptr && mm_kqv_gqa_env[0] == '0');
+                    const bool mm_kqv_gqa_off = !ggml_cl_mm_kq_fastpath_on();
                     // Minimum n_kv for the coalesced KQV to pay off (see the gate below).
                     // GGML_OPENCL_MM_KQV_GQA_MIN_KV retunes it per device.
                     static const int mm_kqv_gqa_min_kv = []{
@@ -20274,15 +20224,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                         const int v = (e && e[0]) ? atoi(e) : 0;
                         return v > 0 ? v : 8192;
                     }();
-                    if (can_multi_out && (ne01 % 16) == 0 && ne00 == 128 && r2 == 8 && r3 == 1 && mm_kq_gqa_on &&
-                        backend_ctx->kernel_mul_mat_f16_f32_l4_x8_gqa4 != nullptr) {
-                        kernel = backend_ctx->kernel_mul_mat_f16_f32_l4_x8_gqa4;
-                        nrows = 1;
-                    } else if (can_multi_out && ne00 <= 256 && mm_kq_pair_on &&
-                        backend_ctx->kernel_mul_mat_f16_f32_l4_x8_pair != nullptr) {
-                        kernel = backend_ctx->kernel_mul_mat_f16_f32_l4_x8_pair;
-                        nrows = 1;
-                    } else if (can_multi_out && ne00 <= 256 &&
+                    if (can_multi_out && ne00 <= 256 &&
                         backend_ctx->kernel_mul_mat_f16_f32_l4_x8 != nullptr) {
                         kernel = backend_ctx->kernel_mul_mat_f16_f32_l4_x8;
                         nrows = 1;
@@ -21169,23 +21111,12 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 
         backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
     } else if (kernel == backend_ctx->kernel_mul_mat_f16_f32_l4_x8 ||
-               kernel == backend_ctx->kernel_mul_mat_f16_f32_l4_x8_pair ||
                kernel == backend_ctx->kernel_mul_mat_f16_f32_l4_y8) {
         // Multi-output decode variants: each WG processes 8 outputs along
         // ne01; ne11 == 1. Same grid shape for both x8 (Q cached) and y8
         // (streaming Q).
         const int64_t n_wg_x = ne01 / 8;
         size_t global_work_size[] = {(size_t)n_wg_x*nth0, (size_t)nth1, (size_t)ne12*ne13};
-        size_t local_work_size[]  = {(size_t)nth0, (size_t)nth1, 1};
-        backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
-    } else if (kernel == backend_ctx->kernel_mul_mat_f16_f32_l4_x8_gqa4) {
-        // GQA-coalesced KQ: one WG per K-head emits N_K_ROWS_GQA=16 K-rows ×
-        // r2 Q-heads. Widens the per-WG latency-hiding window vs the original
-        // N=8 (post-profile: KQ was 70% of decode at d=16k due to memory-stall
-        // serialization on K-row fetches). N=32 regressed 9-11% at long ctx,
-        // likely due to I-cache pressure from the unrolled outer loop.
-        const int64_t n_wg_x = ne01 / 16;
-        size_t global_work_size[] = {(size_t)n_wg_x*nth0, (size_t)nth1, (size_t)ne02*ne13};
         size_t local_work_size[]  = {(size_t)nth0, (size_t)nth1, 1};
         backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
     } else if (kernel == backend_ctx->kernel_mul_mat_f16_f32_l4_y8_gqa) {
