@@ -24,12 +24,19 @@
 // dp4a ops from each Q fetch and cuts LDS traffic by that factor. (Register blocking
 // did nothing for the f16 KQ kernel because that one is FMA-bound; dp4a changes which
 // lever works.)
+// What matters is the ratio (dp4a per LDS fetch) = KQ_ROWS, at a fixed accumulator budget
+// of KQ_ROWS * KQ_COLS floats. 2x32 and 4x16 both cost 64 accumulators, but 4x16 issues
+// half the LDS reads for the same dp4a volume. Above ~64 accumulators the compiler spills
+// and the gain reverses (4x32 = 128 accumulators measured slower than 2x32).
 #ifndef KQ_ROWS
 #define KQ_ROWS 2
 #endif
+#ifndef KQ_COLS
+#define KQ_COLS 32
+#endif
 
 #define TILESIZE_M (64 * KQ_ROWS)
-#define TILESIZE_N 32
+#define TILESIZE_N KQ_COLS
 #define Q8_0_BLK   32
 #define Q8_0_SZ    34   // f16 scale + 32 int8
 
@@ -202,40 +209,41 @@ __kernel void mul_mm_q8_0_f32_kq_dp4a(
         k_row_h[r] = (__global const half *)k_row_u[r];
     }
 
-    __local uint  q_lds[2 * TILESIZE_N * 8];   // 2 n-tiles x 32 columns x 32 int8
+    __local uint  q_lds[2 * TILESIZE_N * 8];   // 2 n-tiles x KQ_COLS columns x 32 int8
     __local float q_dl [2 * TILESIZE_N];
 
     float16 regC0[KQ_ROWS];
+#if KQ_COLS == 32
     float16 regC1[KQ_ROWS];
+#endif
 
     #pragma unroll
     for (int r = 0; r < KQ_ROWS; ++r) {
         regC0[r] = (float16)(0.0f);
+#if KQ_COLS == 32
         regC1[r] = (float16)(0.0f);
+#endif
     }
 
     for (int b = 0; b < n_blk; ++b) {
-        // Stage this k-block's 32 Q columns (int8 + scale) into local memory.
+        // Stage this k-block's Q columns (int8 + scale) into local memory. Each lane owns
+        // one fixed uint slot j within a column and walks the columns 8 at a time, so the
+        // 64 lanes write contiguous runs.
         barrier(CLK_LOCAL_MEM_FENCE);
         {
-            const uint n_local = lane >> 1;        // 0..31: column
-            const uint jhalf   = (lane & 1) * 4;   // which half of the 8 uints
-            const uint gcol    = row + n_local;
+            const uint j     = lane & 7;    // which of the 8 uints of a column
+            const uint c0    = lane >> 3;   // 0..7: first column this lane serves
 
-            __local uint * dl = q_lds + sg * (TILESIZE_N * 8) + n_local * 8 + jhalf;
+            #pragma unroll
+            for (int i = 0; i < KQ_COLS / 8; ++i) {
+                const uint n_local = c0 + 8 * i;
+                const uint gcol    = row + n_local;
 
-            if (gcol < (uint)N) {
-                __global const uint * s =
-                    qq + (((ulong)(depth_B * N + gcol) * K + b * Q8_0_BLK) >> 2) + jhalf;
-                dl[0] = s[0];
-                dl[1] = s[1];
-                dl[2] = s[2];
-                dl[3] = s[3];
-            } else {
-                dl[0] = 0;
-                dl[1] = 0;
-                dl[2] = 0;
-                dl[3] = 0;
+                __local uint * dl = q_lds + sg * (TILESIZE_N * 8) + n_local * 8 + j;
+
+                *dl = (gcol < (uint)N)
+                    ? qq[(((ulong)(depth_B * N + gcol) * K + b * Q8_0_BLK) >> 2) + j]
+                    : 0u;
             }
 
             if (lane < TILESIZE_N) {
@@ -264,10 +272,12 @@ __kernel void mul_mm_q8_0_f32_kq_dp4a(
         KQ_COL( 4, regC0, s4) KQ_COL( 5, regC0, s5) KQ_COL( 6, regC0, s6) KQ_COL( 7, regC0, s7)
         KQ_COL( 8, regC0, s8) KQ_COL( 9, regC0, s9) KQ_COL(10, regC0, sa) KQ_COL(11, regC0, sb)
         KQ_COL(12, regC0, sc) KQ_COL(13, regC0, sd) KQ_COL(14, regC0, se) KQ_COL(15, regC0, sf)
+#if KQ_COLS == 32
         KQ_COL(16, regC1, s0) KQ_COL(17, regC1, s1) KQ_COL(18, regC1, s2) KQ_COL(19, regC1, s3)
         KQ_COL(20, regC1, s4) KQ_COL(21, regC1, s5) KQ_COL(22, regC1, s6) KQ_COL(23, regC1, s7)
         KQ_COL(24, regC1, s8) KQ_COL(25, regC1, s9) KQ_COL(26, regC1, sa) KQ_COL(27, regC1, sb)
         KQ_COL(28, regC1, sc) KQ_COL(29, regC1, sd) KQ_COL(30, regC1, se) KQ_COL(31, regC1, sf)
+#endif
     }
 
     // dst(m, n, head) = depth_B*N*M + n*M + m, matching mul_mm_f16_f32_kq's C layout.
@@ -285,10 +295,12 @@ __kernel void mul_mm_q8_0_f32_kq_dp4a(
         KQ_ST( 4, regC0[r].s4) KQ_ST( 5, regC0[r].s5) KQ_ST( 6, regC0[r].s6) KQ_ST( 7, regC0[r].s7)
         KQ_ST( 8, regC0[r].s8) KQ_ST( 9, regC0[r].s9) KQ_ST(10, regC0[r].sa) KQ_ST(11, regC0[r].sb)
         KQ_ST(12, regC0[r].sc) KQ_ST(13, regC0[r].sd) KQ_ST(14, regC0[r].se) KQ_ST(15, regC0[r].sf)
+#if KQ_COLS == 32
         KQ_ST(16, regC1[r].s0) KQ_ST(17, regC1[r].s1) KQ_ST(18, regC1[r].s2) KQ_ST(19, regC1[r].s3)
         KQ_ST(20, regC1[r].s4) KQ_ST(21, regC1[r].s5) KQ_ST(22, regC1[r].s6) KQ_ST(23, regC1[r].s7)
         KQ_ST(24, regC1[r].s8) KQ_ST(25, regC1[r].s9) KQ_ST(26, regC1[r].sa) KQ_ST(27, regC1[r].sb)
         KQ_ST(28, regC1[r].sc) KQ_ST(29, regC1[r].sd) KQ_ST(30, regC1[r].se) KQ_ST(31, regC1[r].sf)
+#endif
         #undef KQ_ST
     }
 }

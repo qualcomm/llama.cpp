@@ -1026,7 +1026,8 @@ struct ggml_backend_opencl_context {
     // dp4a fa=0 prefill KQ straight off a q8_0 K cache (+ its Q int8 pre-pass)
     cl_kernel kernel_mul_mm_q8_0_f32_kq_dp4a = nullptr;
     cl_kernel kernel_kq_quant_q_i8           = nullptr;
-    int       kq_dp4a_rows                   = 2;   // K rows per lane (compiled in)
+    int       kq_dp4a_rows                   = 2;   // K rows per lane     (compiled in)
+    int       kq_dp4a_cols                   = 32;  // query cols per tile (compiled in)
     cl_kernel kernel_mul_mat_q4_0_f32, kernel_mul_mat_q4_0_f32_v;
     cl_kernel kernel_convert_block_q1_0, kernel_restore_block_q1_0;
     cl_kernel kernel_mul_mat_q4_0_f32_gqa8_dk128 = nullptr;
@@ -2970,18 +2971,24 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #else
         const std::string kernel_src = read_file("mul_mm_q8_0_f32_kq_dp4a.cl");
 #endif
-        // Rows of K per lane. dp4a leaves the inner loop LDS-issue-bound, so each lane
-        // holds several K rows and feeds that many dp4a ops per Q fetch.
+        // dp4a leaves the inner loop LDS-read-issue-bound, so each lane holds several K rows
+        // and feeds that many dp4a ops per Q fetch. Rows x cols is an accumulator budget:
+        // keep the product at 64 or the compiler spills (4x32 = 128 accumulators regresses).
+        //
+        // Do NOT buy a better dp4a:LDS ratio by shrinking the column tile: K is re-streamed
+        // once per n-tile, so global K traffic scales as N/KQ_COLS. 4x16 halves the LDS reads
+        // but doubles K row-loads and lands 50% SLOWER than 2x32 (2.23 vs 1.48 ms/op) -- and
+        // 2x16 measures the same, which rules out register pressure and pins it on K traffic.
         int kq_rows = 2;
-        if (const char * e = getenv("GGML_OPENCL_KQ_ROWS")) {
-            kq_rows = atoi(e);
-        }
+        int kq_cols = 32;
+        if (const char * e = getenv("GGML_OPENCL_KQ_ROWS")) { kq_rows = atoi(e); }
+        if (const char * e = getenv("GGML_OPENCL_KQ_COLS")) { kq_cols = atoi(e); }
         backend_ctx->kq_dp4a_rows = kq_rows;
+        backend_ctx->kq_dp4a_cols = kq_cols;
 
-        std::string kq_opts = compile_opts + " -DKQ_ROWS=" + std::to_string(kq_rows);
-        if (getenv("GGML_OPENCL_KQ_PROBE_NO_LDS")) {
-            kq_opts += " -DKQ_PROBE_NO_LDS ";
-        }
+        std::string kq_opts = compile_opts +
+            " -DKQ_ROWS=" + std::to_string(kq_rows) +
+            " -DKQ_COLS=" + std::to_string(kq_cols);
         cl_program prog = build_program_from_source(
             backend_ctx->context, backend_ctx->device, kernel_src.c_str(), kq_opts.c_str());
 
@@ -19327,7 +19334,8 @@ static void ggml_cl_mul_mat_kq_q8_0_dp4a_adreno(
     CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_int), &nb02));
 
     const int tile_m   = 64 * backend_ctx->kq_dp4a_rows;
-    const int n_tiles  = (N + 31) / 32;
+    const int tile_n   = backend_ctx->kq_dp4a_cols;
+    const int n_tiles  = (N + tile_n - 1) / tile_n;
     const int m_blocks = (M + tile_m - 1) / tile_m;
 
     // n-tiles on the fast axis, m-blocks on the slow one (same reason as the f16 KQ:
@@ -23093,17 +23101,208 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
     // Batched-prefill KQ against a q8_0 K cache: read K in place with dp4a instead of
     // dequantizing the whole view to f16 first (the branch below). Same shape gate as
     // the f16 KQ kernel, plus q8_0's 32-element blocking and the 64-row m-block.
-    if (ggml_cl_kq_dp4a_on() &&
+    //
+    // kq_dp4a_rerun makes the KQ_DP4A_VERIFY oracle below re-enter and land on the stock
+    // path, so the same op can be run through both and compared.
+    static bool kq_dp4a_rerun = false;
+
+    const bool kq_dp4a_shape =
         src0t == GGML_TYPE_Q8_0 && src1t == GGML_TYPE_F32 &&
         backend_ctx->kernel_mul_mm_q8_0_f32_kq_dp4a != nullptr &&
         !ggml_cl_is_q8_0_soa(src0) &&
         ggml_is_permuted(src0) && ggml_is_permuted(src1) &&
         src0->ne[3] == 1 && src1->ne[3] == 1 &&
-        src0->ne[1] >= 64 && dst->ne[1] >= 32 &&
+        src0->ne[1] >= 64 && dst->ne[1] >= backend_ctx->kq_dp4a_cols &&
         (src0->ne[0] % 32) == 0 &&
         (src0->ne[1] % (64 * backend_ctx->kq_dp4a_rows)) == 0 &&
         src1->ne[2] >= src0->ne[2] && (src1->ne[2] % src0->ne[2]) == 0 &&
-        src0->nb[1] > src0->nb[2]) {   // KQ (not KQV)
+        src0->nb[1] > src0->nb[2];   // KQ (not KQV)
+
+    // Numeric oracle, CPU reference. The stock-path compare (KQ_DP4A_VERIFY below) mixes two
+    // things: this kernel's arithmetic AND the int8 loss on Q, which the stock f32 path does
+    // not have -- so a mismatch there proves nothing on its own. This reference applies the
+    // SAME int8 quantization to Q, which isolates indexing/arithmetic from quantization loss:
+    // against it the kernel must agree to fp noise (1e-6), not merely "closely".
+    //
+    // Indices come from ggml's tensor semantics (nb[] strides + view_offs), NOT from the
+    // kernel's own index math -- a reference that mirrors the kernel's assumptions is
+    // self-consistent and blind to exactly the bug class worth catching.
+    if (getenv("KQ_DP4A_CPUREF") && !kq_dp4a_rerun && kq_dp4a_shape) {
+        ggml_cl_mul_mat_kq_q8_0_dp4a_adreno(backend, src0, src1, dst);
+        CL_CHECK(clFinish(backend_ctx->queue));
+
+        ggml_tensor_extra_cl * e0 = src0->view_src ? (ggml_tensor_extra_cl *)src0->view_src->extra
+                                                   : (ggml_tensor_extra_cl *)src0->extra;
+        ggml_tensor_extra_cl * e1 = (ggml_tensor_extra_cl *)src1->extra;
+        ggml_tensor_extra_cl * ed = (ggml_tensor_extra_cl *)dst->extra;
+
+        const int M   = src0->ne[1], K = src0->ne[0], N = dst->ne[1];
+        const int D_A = src0->ne[2], D_B = src1->ne[2];
+        const int r2  = D_B / D_A;
+
+        // Pull the raw operands and the GPU result back.
+        const size_t k_bytes = (size_t) M * src0->nb[1];
+        std::vector<uint8_t> kbuf(k_bytes);
+        CL_CHECK(clEnqueueReadBuffer(backend_ctx->queue, e0->data_device, CL_TRUE,
+                                     e0->offset + src0->view_offs, k_bytes, kbuf.data(), 0, NULL, NULL));
+
+        const size_t q_bytes = (size_t) N * src1->nb[1];
+        std::vector<uint8_t> qbuf(q_bytes);
+        CL_CHECK(clEnqueueReadBuffer(backend_ctx->queue, e1->data_device, CL_TRUE,
+                                     e1->offset + src1->view_offs, q_bytes, qbuf.data(), 0, NULL, NULL));
+
+        const size_t d_bytes = ggml_nbytes(dst);
+        std::vector<float> gpu(d_bytes / 4);
+        CL_CHECK(clEnqueueReadBuffer(backend_ctx->queue, ed->data_device, CL_TRUE,
+                                     ed->offset + dst->view_offs, d_bytes, gpu.data(), 0, NULL, NULL));
+
+        double max_abs = 0.0, max_rel = 0.0, scale = 0.0;
+        size_t bad = 0;
+        const int n_blk = K / 32;
+
+        // Compare the pre-pass's int8 codes against a CPU quantization of the same Q. The
+        // kernel builds with -cl-fast-relaxed-math, so 127/amax uses a fast reciprocal; a
+        // value sitting on a .5 boundary can round the other way and land one code apart.
+        // That is benign (one step, well inside int8 noise) -- but it must be ONLY that.
+        {
+            std::vector<int8_t> gq((size_t) D_B * N * K);
+            CL_CHECK(clEnqueueReadBuffer(backend_ctx->queue, backend_ctx->prealloc_kq_qq.buffer,
+                                         CL_TRUE, 0, gq.size(), gq.data(), 0, NULL, NULL));
+            size_t diff = 0, worst = 0;
+            for (int h = 0; h < D_B; ++h) {
+            for (int n = 0; n < N; ++n) {
+                for (int b = 0; b < n_blk; ++b) {
+                    float amax = 0.0f;
+                    for (int i = 0; i < 32; ++i) {
+                        const float v = *(const float *)(qbuf.data() + (size_t) n * src1->nb[1] +
+                                            (size_t) h * src1->nb[2] + (size_t)(b*32+i) * src1->nb[0]);
+                        amax = std::max(amax, std::fabs(v));
+                    }
+                    const float id = (amax > 0.0f) ? (127.0f / amax) : 0.0f;
+                    for (int i = 0; i < 32; ++i) {
+                        const float v = *(const float *)(qbuf.data() + (size_t) n * src1->nb[1] +
+                                            (size_t) h * src1->nb[2] + (size_t)(b*32+i) * src1->nb[0]);
+                        const int cpu = (int) lrintf(v * id);
+                        const int gpu_c = (int) gq[((size_t)(h * N + n) * K) + b*32 + i];
+                        const size_t dd = (size_t) std::abs(cpu - gpu_c);
+                        if (dd) { diff++; worst = std::max(worst, dd); }
+                    }
+                }
+            }
+            }
+            fprintf(stderr, "[KQ_DP4A_CPUREF]   int8 codes: %zu/%zu differ, worst delta=%zu code(s)%s\n",
+                    diff, gq.size(), worst,
+                    worst <= 1 ? "  (rounding ties only -- benign)" : "  <<<< NOT a rounding tie");
+        }
+
+        for (int h = 0; h < D_B; ++h) {
+        for (int n = 0; n < N; ++n) {
+            // int8-quantize this (head, token) row of Q, per 32-block, exactly as the pre-pass does
+            std::vector<int8_t> q8(K);
+            std::vector<float>  qd(n_blk);
+            for (int b = 0; b < n_blk; ++b) {
+                float amax = 0.0f;
+                for (int i = 0; i < 32; ++i) {
+                    const float v = *(const float *)(qbuf.data() + (size_t) n * src1->nb[1] +
+                                                     (size_t) h * src1->nb[2] + (size_t)(b*32+i) * src1->nb[0]);
+                    amax = std::max(amax, std::fabs(v));
+                }
+                const float d  = amax / 127.0f;
+                const float id = (amax > 0.0f) ? (127.0f / amax) : 0.0f;
+                // the pre-pass stores the Q scale as half; model that or the reference is
+                // more precise than the kernel and reports a phantom ~1e-4 residual
+                qd[b] = ggml_fp16_to_fp32(ggml_fp32_to_fp16(d));
+                for (int i = 0; i < 32; ++i) {
+                    const float v = *(const float *)(qbuf.data() + (size_t) n * src1->nb[1] +
+                                                     (size_t) h * src1->nb[2] + (size_t)(b*32+i) * src1->nb[0]);
+                    q8[b*32+i] = (int8_t) lrintf(v * id);
+                }
+            }
+
+            for (int m = 0; m < M; ++m) {
+                const uint8_t * krow = kbuf.data() + (size_t) m * src0->nb[1] + (size_t)(h / r2) * src0->nb[2];
+                float ref = 0.0f;
+                for (int b = 0; b < n_blk; ++b) {
+                    const uint8_t * blk = krow + (size_t) b * 34;   // q8_0: f16 d, then 32 int8
+                    ggml_fp16_t dh;
+                    memcpy(&dh, blk, sizeof(dh));
+                    const float dk = ggml_fp16_to_fp32(dh);
+                    int acc = 0;
+                    for (int i = 0; i < 32; ++i) {
+                        acc += (int)(int8_t)blk[2 + i] * (int) q8[b*32 + i];
+                    }
+                    ref += (float) acc * dk * qd[b];
+                }
+
+                const float got = gpu[(size_t) h * N * M + (size_t) n * M + m];
+                const double d = std::fabs((double) got - (double) ref);
+                const double r = d / (std::fabs((double) ref) + 1e-6);
+                if (d > max_abs) { max_abs = d; }
+                if (r > max_rel && std::fabs((double) ref) > 1e-3) { max_rel = r; }
+                scale = std::max(scale, (double) std::fabs(ref));
+                if (r > 1e-4 && d > 1e-3) { bad++; }
+            }
+        }
+        }
+
+        fprintf(stderr,
+            "[KQ_DP4A_CPUREF] KQ M=%d N=%d K=%d D_A=%d D_B=%d voff=%zu :: bad=%zu/%zu max_abs=%.3e "
+            "max_rel=%.3e (|v|max=%.3e)%s\n",
+            M, N, K, D_A, D_B, (size_t) src0->view_offs, bad, (size_t) M * N * D_B,
+            max_abs, max_rel, scale, bad ? "  <<<< MISMATCH" : "  OK");
+        return;
+    }
+
+    // Numeric oracle vs the stock path. NOTE: this compares int8-Q math against f32-Q math, so
+    // a nonzero delta is EXPECTED (it is the quantization loss, ~0.2% of score magnitude). Use
+    // KQ_DP4A_CPUREF above to judge correctness; use this one to size the accuracy cost.
+    if (getenv("KQ_DP4A_VERIFY") && !kq_dp4a_rerun && kq_dp4a_shape) {
+        const size_t nb_dst = ggml_nbytes(dst);
+        std::vector<float> a(nb_dst / 4), b(nb_dst / 4);
+        ggml_tensor_extra_cl * ed = (ggml_tensor_extra_cl *)dst->extra;
+
+        ggml_cl_mul_mat_kq_q8_0_dp4a_adreno(backend, src0, src1, dst);
+        CL_CHECK(clFinish(backend_ctx->queue));
+        CL_CHECK(clEnqueueReadBuffer(backend_ctx->queue, ed->data_device, CL_TRUE,
+                                     ed->offset + dst->view_offs, nb_dst, a.data(), 0, NULL, NULL));
+
+        kq_dp4a_rerun = true;
+        ggml_cl_mul_mat(backend, src0, src1, dst);
+        kq_dp4a_rerun = false;
+        CL_CHECK(clFinish(backend_ctx->queue));
+        CL_CHECK(clEnqueueReadBuffer(backend_ctx->queue, ed->data_device, CL_TRUE,
+                                     ed->offset + dst->view_offs, nb_dst, b.data(), 0, NULL, NULL));
+
+        // No threshold: report the true worst difference. int8-Q quantization shows up as a
+        // small relative error on every element; an indexing/stream bug shows up as O(1).
+        size_t bad = 0, nan_c = 0;
+        double max_rel = 0.0, max_abs = 0.0, sum_abs = 0.0, mag = 0.0;
+        for (size_t i = 0; i < a.size(); i++) {
+            if (isnan(a[i]) || isinf(a[i])) { nan_c++; }
+            const double d = fabs((double)a[i] - (double)b[i]);
+            const double r = d / (fabs((double)b[i]) + 1e-6);
+            if (r > 5e-2 && d > 5e-2) { bad++; }   // int8 Q is ~1e-2 relative; a bug is O(1)
+            if (d > max_abs) { max_abs = d; }
+            if (r > max_rel && fabs((double)b[i]) > 1e-3) { max_rel = r; }
+            sum_abs += d;
+            mag     += fabs((double)b[i]);
+        }
+
+        static std::set<std::string> seen;
+        char key[160];
+        snprintf(key, sizeof(key), "KQ M=%d N=%d K=%d D_A=%d D_B=%d voff=%zu",
+                 (int)src0->ne[1], (int)dst->ne[1], (int)src0->ne[0],
+                 (int)src0->ne[2], (int)src1->ne[2], (size_t)src0->view_offs);
+        if (bad > 0 || seen.insert(key).second) {
+            fprintf(stderr,
+                "[KQ_DP4A_VERIFY] %-46s bad=%zu/%zu max_abs=%.3e max_rel=%.3e mean_abs=%.3e (mean|v|=%.3e) nan=%zu%s\n",
+                key, bad, a.size(), max_abs, max_rel, sum_abs / a.size(), mag / a.size(), nan_c,
+                bad ? "  <<<< MISMATCH" : "");
+        }
+        return;
+    }
+
+    if (ggml_cl_kq_dp4a_on() && !kq_dp4a_rerun && kq_dp4a_shape) {
         ggml_cl_mul_mat_kq_q8_0_dp4a_adreno(backend, src0, src1, dst);
         return;
     }
