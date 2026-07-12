@@ -15815,8 +15815,17 @@ static void ggml_cl_mul_mat_kq_kqv_adreno(ggml_backend_t backend, const ggml_ten
     CL_CHECK(clSetKernelArg(kernel,  k_arg++, sizeof(int),    &ne12));
     CL_CHECK(clSetKernelArg(kernel,  k_arg++, sizeof(int),    &nb01));
 
-    size_t global_work_size[3] = {64, static_cast<size_t>(((M+63)/64)), static_cast<size_t>(((N+31)/32)*ne12)};
-    size_t local_work_size[3] = {64, 1, 2};
+    const int n_tiles  = (N + 31) / 32;
+    const int m_blocks = (M + 63) / 64;
+
+    // The n-tiles go on the fast-varying axis so that the A panel of an m-block is reused
+    // across every n-tile while it is still cache-hot (see the kernel). A workgroup takes
+    // two adjacent n-tiles, one per subgroup, so both share that A panel while keeping
+    // their own local-memory B partition; an odd tile count falls back to one subgroup.
+    const int n_tiles_per_wg = (n_tiles % 2) == 0 ? 2 : 1;
+
+    size_t global_work_size[3] = {64, static_cast<size_t>(n_tiles), static_cast<size_t>(m_blocks*ne12)};
+    size_t local_work_size[3]  = {64, static_cast<size_t>(n_tiles_per_wg), 1};
 
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
 
