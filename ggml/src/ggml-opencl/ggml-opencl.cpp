@@ -604,9 +604,10 @@ struct ggml_backend_opencl_context {
     ggml_cl_buffer prealloc_moe_sa;   // per-block s  [tok_slots * ne00/32] (half)
     // scratch copy of the router weights to avoid dst aliasing
     ggml_cl_buffer prealloc_moe_combine_w;
-    // int8-quantized Q for the dp4a fa=0 prefill KQ GEMM off a q8_0 K cache
-    ggml_cl_buffer prealloc_kq_qq;   // int8 Q      [D_B * N * K]
-    ggml_cl_buffer prealloc_kq_qd;   // per-block d [D_B * N * K/32] (half)
+    // int8-quantized Q for the dp4a fa=0 prefill KQ GEMM off a quantized K cache
+    ggml_cl_buffer prealloc_kq_qq;   // int8 Q         [D_B * N * K]
+    ggml_cl_buffer prealloc_kq_qd;   // per-block d    [D_B * N * K/32] (half)
+    ggml_cl_buffer prealloc_kq_qs;   // per-block sum(q) [D_B * N * K/32] (float, q4_0 only)
 
     // Pool of persistent image1d_buffer views over KV-cache layers, keyed by
     // (parent buffer, offset within parent). Used by the IMG-variant KQ/KQV
@@ -793,8 +794,9 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_adreno_xmem_store_dst_f32;
     cl_kernel kernel_mul_mm_f16_f32_kqv;
     cl_kernel kernel_mul_mm_f16_f32_kq;
-    // dp4a fa=0 prefill KQ straight off a q8_0 K cache (+ its Q int8 pre-pass)
+    // dp4a fa=0 prefill KQ straight off a quantized K cache (+ its Q int8 pre-pass)
     cl_kernel kernel_mul_mm_q8_0_f32_kq_dp4a = nullptr;
+    cl_kernel kernel_mul_mm_q4_0_f32_kq_dp4a = nullptr;
     cl_kernel kernel_kq_quant_q_i8           = nullptr;
     int       kq_dp4a_rows                   = 2;   // K rows per lane     (compiled in)
     int       kq_dp4a_cols                   = 32;  // query cols per tile (compiled in)
@@ -2601,13 +2603,24 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             " -DKQ_ROWS=" + std::to_string(kq_rows) +
             " -DKQ_COLS=" + std::to_string(kq_cols);
         cl_program prog = build_program_from_source(
-            backend_ctx->context, backend_ctx->device, kernel_src.c_str(), kq_opts.c_str());
+            backend_ctx->context, backend_ctx->device, kernel_src.c_str(),
+            (kq_opts + " -DKQ_KTYPE=80").c_str());
 
         CL_CHECK((backend_ctx->kernel_mul_mm_q8_0_f32_kq_dp4a =
             clCreateKernel(prog, "mul_mm_q8_0_f32_kq_dp4a", &err), err));
         CL_CHECK((backend_ctx->kernel_kq_quant_q_i8 =
             clCreateKernel(prog, "kernel_kq_quant_q_i8", &err), err));
         CL_CHECK(clReleaseProgram(prog));
+
+        // Same kernel against a q4_0 K cache: 18-byte blocks, nibbles unpacked to 0..15,
+        // and the +8 bias removed via the block-sum term. The dp4a chain is identical.
+        cl_program prog_q4 = build_program_from_source(
+            backend_ctx->context, backend_ctx->device, kernel_src.c_str(),
+            (kq_opts + " -DKQ_KTYPE=40").c_str());
+
+        CL_CHECK((backend_ctx->kernel_mul_mm_q4_0_f32_kq_dp4a =
+            clCreateKernel(prog_q4, "mul_mm_q8_0_f32_kq_dp4a", &err), err));
+        CL_CHECK(clReleaseProgram(prog_q4));
         GGML_LOG_CONT(".");
     }
 
@@ -16067,8 +16080,10 @@ static void ggml_cl_mul_mat_kq_q8_0_dp4a_adreno(
     // the GEMM streams the Q tile once per m-block).
     const size_t qq_bytes = (size_t) D_B * N * K;
     const size_t qd_bytes = (size_t) D_B * N * n_blk * sizeof(cl_half);
+    const size_t qs_bytes = (size_t) D_B * N * n_blk * sizeof(cl_float);
     backend_ctx->prealloc_kq_qq.allocate(backend_ctx->context, qq_bytes);
     backend_ctx->prealloc_kq_qd.allocate(backend_ctx->context, qd_bytes);
+    backend_ctx->prealloc_kq_qs.allocate(backend_ctx->context, qs_bytes);
 
     // The pre-pass indexes Q as floats from the start of its buffer; src1 is f32 and
     // its offset is a whole number of floats.
@@ -16081,6 +16096,7 @@ static void ggml_cl_mul_mat_kq_q8_0_dp4a_adreno(
         CL_CHECK(clSetKernelArg(kq, a++, sizeof(cl_int), &offset1_words));
         CL_CHECK(clSetKernelArg(kq, a++, sizeof(cl_mem), &backend_ctx->prealloc_kq_qq.buffer));
         CL_CHECK(clSetKernelArg(kq, a++, sizeof(cl_mem), &backend_ctx->prealloc_kq_qd.buffer));
+        CL_CHECK(clSetKernelArg(kq, a++, sizeof(cl_mem), &backend_ctx->prealloc_kq_qs.buffer));
         CL_CHECK(clSetKernelArg(kq, a++, sizeof(cl_int), &K));
         CL_CHECK(clSetKernelArg(kq, a++, sizeof(cl_int), &N));
         CL_CHECK(clSetKernelArg(kq, a++, sizeof(cl_int), &D_B));
@@ -16089,12 +16105,15 @@ static void ggml_cl_mul_mat_kq_q8_0_dp4a_adreno(
         backend_ctx->enqueue_ndrange_kernel(kq, 3, gws, NULL, dst);
     }
 
-    cl_kernel kernel = backend_ctx->kernel_mul_mm_q8_0_f32_kq_dp4a;
+    cl_kernel kernel = (src0->type == GGML_TYPE_Q4_0)
+        ? backend_ctx->kernel_mul_mm_q4_0_f32_kq_dp4a
+        : backend_ctx->kernel_mul_mm_q8_0_f32_kq_dp4a;
     cl_uint a = 0;
     CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &extra0->data_device));
     CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_int), &offset0));
     CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &backend_ctx->prealloc_kq_qq.buffer));
     CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &backend_ctx->prealloc_kq_qd.buffer));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &backend_ctx->prealloc_kq_qs.buffer));
     CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &extrad->data_device));
     CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_int), &offsetd));
     CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_int), &M));
@@ -19377,10 +19396,14 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
     // path, so the same op can be run through both and compared.
     static bool kq_dp4a_rerun = false;
 
+    const bool kq_kt_ok =
+        (src0t == GGML_TYPE_Q8_0 && !ggml_cl_is_q8_0_soa(src0) &&
+         backend_ctx->kernel_mul_mm_q8_0_f32_kq_dp4a != nullptr) ||
+        (src0t == GGML_TYPE_Q4_0 && !ggml_cl_is_q4_0_soa(src0) &&
+         backend_ctx->kernel_mul_mm_q4_0_f32_kq_dp4a != nullptr);
+
     const bool kq_dp4a_shape =
-        src0t == GGML_TYPE_Q8_0 && src1t == GGML_TYPE_F32 &&
-        backend_ctx->kernel_mul_mm_q8_0_f32_kq_dp4a != nullptr &&
-        !ggml_cl_is_q8_0_soa(src0) &&
+        kq_kt_ok && src1t == GGML_TYPE_F32 &&
         ggml_is_permuted(src0) && ggml_is_permuted(src1) &&
         src0->ne[3] == 1 && src1->ne[3] == 1 &&
         src0->ne[1] >= 64 && dst->ne[1] >= backend_ctx->kq_dp4a_cols &&
@@ -19490,17 +19513,26 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 }
             }
 
+            const bool  is_q4  = (src0t == GGML_TYPE_Q4_0);
+            const size_t blksz = is_q4 ? 18 : 34;
+
             for (int m = 0; m < M; ++m) {
                 const uint8_t * krow = kbuf.data() + (size_t) m * src0->nb[1] + (size_t)(h / r2) * src0->nb[2];
                 float ref = 0.0f;
                 for (int b = 0; b < n_blk; ++b) {
-                    const uint8_t * blk = krow + (size_t) b * 34;   // q8_0: f16 d, then 32 int8
+                    const uint8_t * blk = krow + (size_t) b * blksz;   // f16 d, then the quants
                     ggml_fp16_t dh;
                     memcpy(&dh, blk, sizeof(dh));
                     const float dk = ggml_fp16_to_fp32(dh);
                     int acc = 0;
                     for (int i = 0; i < 32; ++i) {
-                        acc += (int)(int8_t)blk[2 + i] * (int) q8[b*32 + i];
+                        // q4_0 stores element i<16 in the low nibble of byte i and i+16 in
+                        // the high nibble, both biased by +8
+                        const int kc = is_q4
+                            ? ((i < 16) ? ((int)(blk[2 + i]      & 0x0F) - 8)
+                                        : ((int)(blk[2 + i - 16] >>   4) - 8))
+                            : (int)(int8_t) blk[2 + i];
+                        acc += kc * (int) q8[b*32 + i];
                     }
                     ref += (float) acc * dk * qd[b];
                 }
