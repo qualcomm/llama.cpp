@@ -5487,20 +5487,36 @@ extern struct ggml_backend_device_i ggml_backend_opencl_device_i;
 //
 // Measured on the Adreno 850 (Qwen3-4B-Q4_0, -fa 0, interleaved A/B/B/A): tg32 3.96 ->
 // 6.59 t/s (+66.5%), prefill unaffected (pp512 349.0 -> 343.7, inside this device's
-// run-to-run wander). Not yet verified on other Adrenos: the 840 could not be benched at
-// full clock (it dozes down to 768 MHz mid-run), so it is on everywhere by default and the
-// env override below is the way to turn it off if a device ever regresses.
+// run-to-run wander).
+//
+// It is only demonstrated to help where the driver is actually starved, so it is not applied
+// everywhere. On a device that is NOT starved there is nothing to win back, and the CPU ops
+// the graph still runs each token pay a futex wake instead of landing on a hot spinning
+// thread. On the Adreno 840 that predicted cost did not actually materialize -- an
+// interleaved A/B/B/A at a stable clock came out NEUTRAL (tg32 17.43/17.54 with the default,
+// 17.44/17.48 with the workers asleep: no difference outside noise) -- so there is no
+// evidence it hurts either. Absent a measured win on any driver but one, default it on only
+// for the driver where the starvation was measured: the "unrecognized compiler" Adreno
+// (art.api37 / E17.xx), the same signature this file already uses to decline FA and to steer
+// the dp4a paths.
+//
+// GGML_OPENCL_KMP_BLOCKTIME=<ms> overrides the gate and applies that value on ANY device --
+// which is how the numbers above were taken, and how to try it on a device you suspect is
+// starved. Negative leaves the runtime's setting alone.
 //
 // Resolved dynamically, so this is a no-op when the process is not linked against libomp
 // (MSVC's vcomp, GOMP, or no OpenMP at all) -- there is no build-time dependency on the
-// OpenMP runtime. Override the value with GGML_OPENCL_KMP_BLOCKTIME=<ms>, or set it
-// negative to leave the runtime's setting alone.
-static void ggml_cl_quiesce_omp_threads() {
+// OpenMP runtime.
+static void ggml_cl_quiesce_omp_threads(ggml_backend_opencl_context * backend_ctx) {
     int blocktime_ms = 0;
+
     if (const char * env = getenv("GGML_OPENCL_KMP_BLOCKTIME")) {
         blocktime_ms = atoi(env);
-    }
-    if (blocktime_ms < 0) {
+        if (blocktime_ms < 0) {
+            return;
+        }
+    } else if (!(backend_ctx->gpu_family == ADRENO &&
+                 backend_ctx->adreno_cl_compiler_version.major < 0)) {
         return;
     }
 
@@ -5704,8 +5720,6 @@ static std::vector<ggml_backend_device> ggml_opencl_probe_devices(ggml_backend_r
 
     CL_CHECK(
         (shared_context = clCreateContext(properties, device_ids.size(), device_ids.data(), NULL, NULL, &err), err));
-
-    ggml_cl_quiesce_omp_threads();
 
     for (auto dev = candidate_devices, dev_end = candidate_devices + n_candidate_devices; dev != dev_end; dev++) {
         GGML_LOG_INFO("\nggml_opencl: device: '%s (%s)'\n", dev->name, dev->version);
@@ -5948,6 +5962,9 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
     backend_ctx->driver_version = driver_version;
 
     backend_ctx->adreno_cl_compiler_version = get_adreno_cl_compiler_version(driver_version);
+
+    ggml_cl_quiesce_omp_threads(backend_ctx.get());
+
     backend_ctx->has_vector_subgroup_broadcast =
         (backend_ctx->adreno_cl_compiler_version.type == E031 && backend_ctx->adreno_cl_compiler_version.major >= 47) ||
         (backend_ctx->adreno_cl_compiler_version.type == DX   && backend_ctx->adreno_cl_compiler_version.major >= 17);
