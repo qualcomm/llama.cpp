@@ -35,10 +35,22 @@
 #define KQ_COLS 32
 #endif
 
+// K-cache type this program is compiled for: 80 = q8_0, 40 = q4_0.
+#ifndef KQ_KTYPE
+#define KQ_KTYPE 80
+#endif
+
 #define TILESIZE_M (64 * KQ_ROWS)
 #define TILESIZE_N KQ_COLS
 #define Q8_0_BLK   32
 #define Q8_0_SZ    34   // f16 scale + 32 int8
+#define Q4_0_SZ    18   // f16 scale + 32 nibbles
+
+#if KQ_KTYPE == 40
+#define KQ_BLK_SZ Q4_0_SZ
+#else
+#define KQ_BLK_SZ Q8_0_SZ
+#endif
 
 // ---------------------------------------------------------------------------
 // Pre-pass: quantize the KQ op's permuted f32 Q to int8 + one scale per 32-block.
@@ -51,11 +63,17 @@
 //
 // Quantizing once per op (rather than inside the GEMM) also shrinks every re-read of Q
 // by 4x: the GEMM streams the Q tile once per m-block. One work-item per (block, n, h).
+// qs is the plain sum of the block's int8 codes. A q4_0 K stores its nibbles biased by
+// +8, and the cheapest way to undo that is not to subtract 8 from every unpacked byte
+// (which would need a borrow-safe SWAR subtract) but to fold it into the block result:
+//   sum_i (n_i - 8) * q_i  ==  dot(n, q) - 8 * sum_i q_i
+// so the GEMM needs sum(q) per (column, block). q8_0 K is symmetric and ignores it.
 __kernel void kernel_kq_quant_q_i8(
         __global const float * q,
         int              offset1_words,
         __global char  * qq,
         __global half  * qd,
+        __global float * qs,
         int              K,
         int              N,
         int              D_B
@@ -82,12 +100,16 @@ __kernel void kernel_kq_quant_q_i8(
     const float id = (amax > 0.0f) ? (127.0f / amax) : 0.0f;
 
     __global char * dq = qq + ((ulong)(h * N + n) * K + b * Q8_0_BLK);
+    int sum = 0;
     #pragma unroll
     for (int i = 0; i < Q8_0_BLK; ++i) {
-        dq[i] = (char)(int)rint(src[i] * id);
+        const int c = (int)rint(src[i] * id);
+        dq[i] = (char)c;
+        sum  += c;
     }
 
     qd[(ulong)(h * N + n) * n_blk + b] = (half)d;
+    qs[(ulong)(h * N + n) * n_blk + b] = (float)sum;
 }
 
 // ---------------------------------------------------------------------------
@@ -108,25 +130,48 @@ inline int kq_dot8(uint8 kv, uint8 qv) {
     return r;
 }
 
-// Load one q8_0 block's 32 int8 codes for a K row. A block is 34 bytes, so the codes
-// are uint-aligned for odd b and 2-byte-shifted for even b; the shifted case stitches
-// each uint from the top half of one word and the bottom of the next. b is
-// workgroup-uniform, so this branch never diverges within a wave.
+// Load one K block's 32 codes, packed 4-per-uint in natural element order so that the
+// dp4a chain lines up with the Q the pre-pass wrote. Both q8_0 (34 B) and q4_0 (18 B)
+// blocks put their quants 2 bytes into an even-length block, so the quants are
+// uint-aligned for odd b and 2-byte-shifted for even b; the shifted case stitches each
+// uint from the top half of one word and the bottom of the next. b is workgroup-uniform,
+// so this branch never diverges within a wave.
 inline uint8 kq_load_k(__global const uint * k_row_u, int b) {
-    const int byte_qs = Q8_0_SZ * b + 2;
+    const int byte_qs = KQ_BLK_SZ * b + 2;
     const int i0      = byte_qs >> 2;
+    const bool shift  = (byte_qs & 3) != 0;
+
+#if KQ_KTYPE == 40
+    // q4_0: 16 bytes of nibbles. Element i<16 is the low nibble of byte i, element i+16
+    // the high nibble -- so the 4 source uints expand to uints 0..3 (low) and 4..7 (high),
+    // which is exactly Q's 4-per-uint order. Bytes come out 0..15, which fits signed int8,
+    // so the plain signed dot works; the +8 bias is removed by the block-sum term.
+    uint4 u;
+    if (shift) {
+        u.s0 = (k_row_u[i0 + 0] >> 16) | (k_row_u[i0 + 1] << 16);
+        u.s1 = (k_row_u[i0 + 1] >> 16) | (k_row_u[i0 + 2] << 16);
+        u.s2 = (k_row_u[i0 + 2] >> 16) | (k_row_u[i0 + 3] << 16);
+        u.s3 = (k_row_u[i0 + 3] >> 16) | (k_row_u[i0 + 4] << 16);
+    } else {
+        u.s0 = k_row_u[i0 + 0];
+        u.s1 = k_row_u[i0 + 1];
+        u.s2 = k_row_u[i0 + 2];
+        u.s3 = k_row_u[i0 + 3];
+    }
 
     uint8 kv;
-    if ((byte_qs & 3) == 0) {
-        kv.s0 = k_row_u[i0 + 0];
-        kv.s1 = k_row_u[i0 + 1];
-        kv.s2 = k_row_u[i0 + 2];
-        kv.s3 = k_row_u[i0 + 3];
-        kv.s4 = k_row_u[i0 + 4];
-        kv.s5 = k_row_u[i0 + 5];
-        kv.s6 = k_row_u[i0 + 6];
-        kv.s7 = k_row_u[i0 + 7];
-    } else {
+    kv.s0 =  u.s0       & 0x0F0F0F0Fu;
+    kv.s1 =  u.s1       & 0x0F0F0F0Fu;
+    kv.s2 =  u.s2       & 0x0F0F0F0Fu;
+    kv.s3 =  u.s3       & 0x0F0F0F0Fu;
+    kv.s4 = (u.s0 >> 4) & 0x0F0F0F0Fu;
+    kv.s5 = (u.s1 >> 4) & 0x0F0F0F0Fu;
+    kv.s6 = (u.s2 >> 4) & 0x0F0F0F0Fu;
+    kv.s7 = (u.s3 >> 4) & 0x0F0F0F0Fu;
+    return kv;
+#else
+    uint8 kv;
+    if (shift) {
         kv.s0 = (k_row_u[i0 + 0] >> 16) | (k_row_u[i0 + 1] << 16);
         kv.s1 = (k_row_u[i0 + 1] >> 16) | (k_row_u[i0 + 2] << 16);
         kv.s2 = (k_row_u[i0 + 2] >> 16) | (k_row_u[i0 + 3] << 16);
@@ -135,13 +180,32 @@ inline uint8 kq_load_k(__global const uint * k_row_u, int b) {
         kv.s5 = (k_row_u[i0 + 5] >> 16) | (k_row_u[i0 + 6] << 16);
         kv.s6 = (k_row_u[i0 + 6] >> 16) | (k_row_u[i0 + 7] << 16);
         kv.s7 = (k_row_u[i0 + 7] >> 16) | (k_row_u[i0 + 8] << 16);
+    } else {
+        kv.s0 = k_row_u[i0 + 0];
+        kv.s1 = k_row_u[i0 + 1];
+        kv.s2 = k_row_u[i0 + 2];
+        kv.s3 = k_row_u[i0 + 3];
+        kv.s4 = k_row_u[i0 + 4];
+        kv.s5 = k_row_u[i0 + 5];
+        kv.s6 = k_row_u[i0 + 6];
+        kv.s7 = k_row_u[i0 + 7];
     }
     return kv;
+#endif
 }
 
 // One query column against all KQ_ROWS of this lane's K rows: 8 LDS reads feed
 // KQ_ROWS dp4a chains. ACC/COMP name the accumulator vector and the component that
 // this column lands in.
+//
+// q4_0 unpacks to 0..15, i.e. the true code biased by +8, so the block result is
+// (dot - 8*sum(q)) * d_k * d_q. sb is the column's sum(q); q8_0 is symmetric and skips it.
+#if KQ_KTYPE == 40
+#define KQ_BIAS(CIDX) (- 8.0f * sb[CIDX])
+#else
+#define KQ_BIAS(CIDX) 0.0f
+#endif
+
 #define KQ_COL(CIDX, ACC, COMP)                                                       \
     {                                                                                 \
         uint8 qv;                                                                     \
@@ -153,10 +217,11 @@ inline uint8 kq_load_k(__global const uint * k_row_u, int b) {
         qv.s5 = qb[(CIDX) * 8 + 5];                                                   \
         qv.s6 = qb[(CIDX) * 8 + 6];                                                   \
         qv.s7 = qb[(CIDX) * 8 + 7];                                                   \
-        const float dq = db[CIDX];                                                    \
+        const float dq   = db[CIDX];                                                  \
+        const float bias = KQ_BIAS(CIDX);                                             \
         _Pragma("unroll")                                                             \
         for (int r = 0; r < KQ_ROWS; ++r) {                                           \
-            ACC[r].COMP += (float)kq_dot8(kv[r], qv) * dk[r] * dq;                    \
+            ACC[r].COMP += ((float)kq_dot8(kv[r], qv) + bias) * dk[r] * dq;           \
         }                                                                             \
     }
 
@@ -168,6 +233,7 @@ __kernel void mul_mm_q8_0_f32_kq_dp4a(
         int              offset0,          // bytes
         __global const uint  * qq,         // int8 Q from the pre-pass
         __global const half  * qd,         // per-32-block Q scales
+        __global const float * qsum,       // per-32-block sum(q) -- q4_0 zero-point only
         __global float * dst,
         int              offsetd,          // bytes
         int M, int K, int N,
@@ -211,6 +277,9 @@ __kernel void mul_mm_q8_0_f32_kq_dp4a(
 
     __local uint  q_lds[2 * TILESIZE_N * 8];   // 2 n-tiles x KQ_COLS columns x 32 int8
     __local float q_dl [2 * TILESIZE_N];
+#if KQ_KTYPE == 40
+    __local float q_sl [2 * TILESIZE_N];
+#endif
 
     float16 regC0[KQ_ROWS];
 #if KQ_COLS == 32
@@ -247,10 +316,13 @@ __kernel void mul_mm_q8_0_f32_kq_dp4a(
             }
 
             if (lane < TILESIZE_N) {
-                const uint gc = row + lane;
-                q_dl[sg * TILESIZE_N + lane] = (gc < (uint)N)
-                    ? convert_float(qd[(ulong)(depth_B * N + gc) * n_blk + b])
-                    : 0.0f;
+                const uint gc  = row + lane;
+                const bool ok  = gc < (uint)N;
+                const ulong bi = (ulong)(depth_B * N + gc) * n_blk + b;
+                q_dl[sg * TILESIZE_N + lane] = ok ? convert_float(qd[bi]) : 0.0f;
+#if KQ_KTYPE == 40
+                q_sl[sg * TILESIZE_N + lane] = ok ? qsum[bi] : 0.0f;
+#endif
             }
         }
         barrier(CLK_LOCAL_MEM_FENCE);
@@ -261,12 +333,15 @@ __kernel void mul_mm_q8_0_f32_kq_dp4a(
         #pragma unroll
         for (int r = 0; r < KQ_ROWS; ++r) {
             kv[r] = kq_load_k(k_row_u[r], b);
-            // The scale sits at byte 34*b, always even, so index it as a half.
-            dk[r] = convert_float(k_row_h[r][(Q8_0_SZ / 2) * b]);
+            // The scale sits at byte KQ_BLK_SZ*b, always even, so index it as a half.
+            dk[r] = convert_float(k_row_h[r][(KQ_BLK_SZ / 2) * b]);
         }
 
         __local const uint  * qb = q_lds + sg * (TILESIZE_N * 8);
         __local const float * db = q_dl  + sg * TILESIZE_N;
+#if KQ_KTYPE == 40
+        __local const float * sb = q_sl  + sg * TILESIZE_N;
+#endif
 
         KQ_COL( 0, regC0, s0) KQ_COL( 1, regC0, s1) KQ_COL( 2, regC0, s2) KQ_COL( 3, regC0, s3)
         KQ_COL( 4, regC0, s4) KQ_COL( 5, regC0, s5) KQ_COL( 6, regC0, s6) KQ_COL( 7, regC0, s7)
