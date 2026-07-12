@@ -4759,6 +4759,9 @@ static std::string ggml_opencl_fa_compile_opts(ggml_backend_opencl_context * bac
     if (ggml_cl_env_flag("GGML_OPENCL_FA_PROBE_NO_QK")) {
         opts += " -D FA_PROBE_NO_QK";
     }
+    if (ggml_cl_env_flag("GGML_OPENCL_FA16_PROBE_NO_LDS")) {
+        opts += " -D FA16_PROBE_NO_LDS";
+    }
     // Transposed K tile in local memory: the 4 KV rows the QK loop walks together become
     // adjacent, so each (block, group) step is ONE 128-bit local read instead of four
     // 32-bit ones. The QK loop is LDS-read-issue-bound (a wrong-math probe that kept every
