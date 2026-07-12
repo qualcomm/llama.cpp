@@ -7310,6 +7310,18 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                 return false;
             }
 
+            // The A7X (Adreno 740, compiler E031.41) SIGSEGVs inside clBuildProgram when
+            // building the flash_attn programs whose KV path is mixed-type or dequantized:
+            // f32_f16, f32_q8_0, f32_q4_0 (reproduced at DK=40 and DK=64 -- it is
+            // DK-independent). It is a driver crash rather than a compile error, so it
+            // cannot be caught in-process. The uniform f32_f32 / f16_f16 programs build
+            // fine on the same compiler, so decline only the KV-convert variants and let
+            // those attention layers fall back off this backend.
+            if (backend_ctx->adreno_gen == ADRENO_GPU_GEN::A7X &&
+                (is_f32_f16 || is_f32_q8_0 || is_f32_q4_0)) {
+                return false;
+            }
+
             if (dk == 512) {
                 if (backend_ctx->gpu_family == INTEL) {
                     return false;
