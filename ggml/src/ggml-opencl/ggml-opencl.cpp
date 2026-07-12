@@ -819,6 +819,9 @@ struct ggml_backend_opencl_context {
     ggml_cl_buffer prealloc_mega_pl_scratch;  // y1[n_pl] + y2[n_pl] + y3[D] f32
     ggml_cl_buffer prealloc_mega_pl_counters; // [3] int grid-barrier counters
     bool           mega_perlayer = false;     // opt-in GGML_OPENCL_MEGA_PERLAYER
+    // int8-quantized Q for the dp4a fa=0 prefill KQ GEMM off a q8_0 K cache
+    ggml_cl_buffer prealloc_kq_qq;   // int8 Q      [D_B * N * K]
+    ggml_cl_buffer prealloc_kq_qd;   // per-block d [D_B * N * K/32] (half)
 
     // Pool of persistent image1d_buffer views over KV-cache layers, keyed by
     // (parent buffer, offset within parent). Used by the IMG-variant KQ/KQV
@@ -1010,6 +1013,10 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_adreno_xmem_store_dst_f32;
     cl_kernel kernel_mul_mm_f16_f32_kqv;
     cl_kernel kernel_mul_mm_f16_f32_kq;
+    // dp4a fa=0 prefill KQ straight off a q8_0 K cache (+ its Q int8 pre-pass)
+    cl_kernel kernel_mul_mm_q8_0_f32_kq_dp4a = nullptr;
+    cl_kernel kernel_kq_quant_q_i8           = nullptr;
+    int       kq_dp4a_rows                   = 2;   // K rows per lane (compiled in)
     cl_kernel kernel_mul_mat_q4_0_f32, kernel_mul_mat_q4_0_f32_v;
     cl_kernel kernel_convert_block_q1_0, kernel_restore_block_q1_0;
     cl_kernel kernel_mul_mat_q4_0_f32_gqa8_dk128 = nullptr;
@@ -2944,6 +2951,38 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 
         CL_CHECK((backend_ctx->kernel_mul_mm_f16_f32_kqv = clCreateKernel(backend_ctx->program_mul_mm_f16_f32_kqv, "mul_mm_f16_f32_kqv", &err), err));
         CL_CHECK((backend_ctx->kernel_mul_mm_f16_f32_kq = clCreateKernel(backend_ctx->program_mul_mm_f16_f32_kq, "mul_mm_f16_f32_kq", &err), err));
+        GGML_LOG_CONT(".");
+    }
+
+    // mul_mm_q8_0_f32_kq_dp4a (dp4a fa=0 prefill KQ off a q8_0 K cache)
+    {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src {
+            #include "mul_mm_q8_0_f32_kq_dp4a.cl.h"
+        };
+#else
+        const std::string kernel_src = read_file("mul_mm_q8_0_f32_kq_dp4a.cl");
+#endif
+        // Rows of K per lane. dp4a leaves the inner loop LDS-issue-bound, so each lane
+        // holds several K rows and feeds that many dp4a ops per Q fetch.
+        int kq_rows = 2;
+        if (const char * e = getenv("GGML_OPENCL_KQ_ROWS")) {
+            kq_rows = atoi(e);
+        }
+        backend_ctx->kq_dp4a_rows = kq_rows;
+
+        std::string kq_opts = compile_opts + " -DKQ_ROWS=" + std::to_string(kq_rows);
+        if (getenv("GGML_OPENCL_KQ_PROBE_NO_LDS")) {
+            kq_opts += " -DKQ_PROBE_NO_LDS ";
+        }
+        cl_program prog = build_program_from_source(
+            backend_ctx->context, backend_ctx->device, kernel_src.c_str(), kq_opts.c_str());
+
+        CL_CHECK((backend_ctx->kernel_mul_mm_q8_0_f32_kq_dp4a =
+            clCreateKernel(prog, "mul_mm_q8_0_f32_kq_dp4a", &err), err));
+        CL_CHECK((backend_ctx->kernel_kq_quant_q_i8 =
+            clCreateKernel(prog, "kernel_kq_quant_q_i8", &err), err));
+        CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
 
@@ -19298,6 +19337,104 @@ static void ggml_cl_mul_mat_kq_kqv_adreno(ggml_backend_t backend, const ggml_ten
     CL_CHECK(clReleaseMemObject(D_sub_buffer));
 }
 
+// fa=0 prefill KQ with a q8_0 K cache, consumed in place via dp4a.
+//
+// The stock path for a quantized K at prefill is: dequantize the whole K view to a
+// scratch f16 buffer, then run the f32 KQ GEMM on it. That pass is pure overhead --
+// it is why a q8_0 K cache currently COSTS ~11% of pp4096 rather than saving anything.
+// Here K is read as q8_0 in place and Q is quantized to int8 once, so the pass is gone
+// and the inner product runs on dp4a.
+//
+// Off by default while it is being brought up: GGML_OPENCL_KQ_DP4A=1 to enable.
+static bool ggml_cl_kq_dp4a_on() {
+    static const char * env = getenv("GGML_OPENCL_KQ_DP4A");
+    static const bool   on  = (env != nullptr && env[0] == '1');
+    return on;
+}
+
+static void ggml_cl_mul_mat_kq_q8_0_dp4a_adreno(
+        ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *)backend->context;
+
+    ggml_tensor_extra_cl * extra1 = (ggml_tensor_extra_cl *)src1->extra;
+    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
+
+    // src0 (K) is a view into the KV cache; view_offs is what selects this sequence's
+    // stream inside it (see the f16 KQ path -- dropping it reads stream 0 for everyone).
+    ggml_tensor_extra_cl * extra0 =
+        src0->view_src ? (ggml_tensor_extra_cl *)src0->view_src->extra
+                       : (ggml_tensor_extra_cl *)src0->extra;
+
+    const int M = src0->ne[1];   // n_kv
+    const int K = src0->ne[0];   // head dim
+    const int N = dst->ne[1];    // n_q
+    const int D_A = src0->ne[2]; // KV heads
+    const int D_B = src1->ne[2]; // query heads
+
+    const cl_int nb01 = (cl_int) src0->nb[1];
+    const cl_int nb02 = (cl_int) src0->nb[2];
+
+    const cl_int offset0 = (cl_int)(extra0->offset + src0->view_offs);
+    const cl_int offsetd = (cl_int)(extrad->offset + dst->view_offs);
+
+    const int n_blk = K / 32;
+
+    // Quantize Q to int8 once for this op (also shrinks every re-read of Q by 4x --
+    // the GEMM streams the Q tile once per m-block).
+    const size_t qq_bytes = (size_t) D_B * N * K;
+    const size_t qd_bytes = (size_t) D_B * N * n_blk * sizeof(cl_half);
+    backend_ctx->prealloc_kq_qq.allocate(backend_ctx->context, qq_bytes);
+    backend_ctx->prealloc_kq_qd.allocate(backend_ctx->context, qd_bytes);
+
+    // The pre-pass indexes Q as floats from the start of its buffer; src1 is f32 and
+    // its offset is a whole number of floats.
+    const cl_int offset1_words = (cl_int)((extra1->offset + src1->view_offs) / sizeof(float));
+
+    {
+        cl_kernel kq = backend_ctx->kernel_kq_quant_q_i8;
+        cl_uint a = 0;
+        CL_CHECK(clSetKernelArg(kq, a++, sizeof(cl_mem), &extra1->data_device));
+        CL_CHECK(clSetKernelArg(kq, a++, sizeof(cl_int), &offset1_words));
+        CL_CHECK(clSetKernelArg(kq, a++, sizeof(cl_mem), &backend_ctx->prealloc_kq_qq.buffer));
+        CL_CHECK(clSetKernelArg(kq, a++, sizeof(cl_mem), &backend_ctx->prealloc_kq_qd.buffer));
+        CL_CHECK(clSetKernelArg(kq, a++, sizeof(cl_int), &K));
+        CL_CHECK(clSetKernelArg(kq, a++, sizeof(cl_int), &N));
+        CL_CHECK(clSetKernelArg(kq, a++, sizeof(cl_int), &D_B));
+
+        size_t gws[3] = { (size_t) n_blk, (size_t) N, (size_t) D_B };
+        backend_ctx->enqueue_ndrange_kernel(kq, 3, gws, NULL, dst);
+    }
+
+    cl_kernel kernel = backend_ctx->kernel_mul_mm_q8_0_f32_kq_dp4a;
+    cl_uint a = 0;
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &extra0->data_device));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_int), &offset0));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &backend_ctx->prealloc_kq_qq.buffer));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &backend_ctx->prealloc_kq_qd.buffer));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &extrad->data_device));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_int), &offsetd));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_int), &M));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_int), &K));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_int), &N));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_int), &D_A));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_int), &D_B));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_int), &nb01));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_int), &nb02));
+
+    const int tile_m   = 64 * backend_ctx->kq_dp4a_rows;
+    const int n_tiles  = (N + 31) / 32;
+    const int m_blocks = (M + tile_m - 1) / tile_m;
+
+    // n-tiles on the fast axis, m-blocks on the slow one (same reason as the f16 KQ:
+    // it keeps the m-block's K panel cache-hot across every n-tile).
+    const int n_tiles_per_wg = (n_tiles % 2) == 0 ? 2 : 1;
+
+    size_t global_work_size[3] = { 64, (size_t) n_tiles, (size_t)(m_blocks * D_B) };
+    size_t local_work_size[3]  = { 64, (size_t) n_tiles_per_wg, 1 };
+
+    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+}
+
 static void ggml_cl_mul_mat_q1_0_f32_adreno(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
     GGML_ASSERT(src0);
@@ -22996,6 +23133,23 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             backend_ctx->enqueue_ndrange_kernel(kernel, 3, gws, lws, dst);
             return;
         }
+    }
+    // Batched-prefill KQ against a q8_0 K cache: read K in place with dp4a instead of
+    // dequantizing the whole view to f16 first (the branch below). Same shape gate as
+    // the f16 KQ kernel, plus q8_0's 32-element blocking and the 64-row m-block.
+    if (ggml_cl_kq_dp4a_on() &&
+        src0t == GGML_TYPE_Q8_0 && src1t == GGML_TYPE_F32 &&
+        backend_ctx->kernel_mul_mm_q8_0_f32_kq_dp4a != nullptr &&
+        !ggml_cl_is_q8_0_soa(src0) &&
+        ggml_is_permuted(src0) && ggml_is_permuted(src1) &&
+        src0->ne[3] == 1 && src1->ne[3] == 1 &&
+        src0->ne[1] >= 64 && dst->ne[1] >= 32 &&
+        (src0->ne[0] % 32) == 0 &&
+        (src0->ne[1] % (64 * backend_ctx->kq_dp4a_rows)) == 0 &&
+        src1->ne[2] >= src0->ne[2] && (src1->ne[2] % src0->ne[2]) == 0 &&
+        src0->nb[1] > src0->nb[2]) {   // KQ (not KQV)
+        ggml_cl_mul_mat_kq_q8_0_dp4a_adreno(backend, src0, src1, dst);
+        return;
     }
 #endif // GGML_OPENCL_USE_ADRENO_KERNELS
 
