@@ -224,8 +224,8 @@ __kernel void FA_TILE_NAME(
     // every FMA and removed the LDS reads ran it 38.6% faster (18.92 -> 11.62 ms/op).
     __local KV_DATA_TYPE4 l_k[DK_VEC][BLOCK_N];
 #define FA_LK(ROW, C) l_k[C][ROW]
-    // Two adjacent KV rows as one 128-bit local read (half4 pair == 16 B). j is a multiple
-    // of 2 and BLOCK_N of 4, so &l_k[c][j] is 16 B aligned.
+    // Two adjacent KV rows as one 128-bit local read (half4 pair == 16 B). j is even and
+    // BLOCK_N is even, so &l_k[c][j] is 16 B aligned.
 #define FA_LK_PAIR(C, J) as_half8(*(__local const float4 *)(&l_k[C][J]))
 #else
     __local KV_DATA_TYPE4 l_k[BLOCK_N][DK_VEC];
