@@ -8,6 +8,10 @@
 #endif
 
 #include "ggml-opencl.h"
+#include <chrono>
+#ifndef _WIN32
+#include <dlfcn.h>
+#endif
 #include "ggml-backend.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
@@ -1023,6 +1027,45 @@ struct ggml_backend_opencl_context {
         }
 #else
         GGML_UNUSED(tensor);
+        // Dispatch-submission profile (GGML_OPENCL_ENQ_PROF=1). Splits the per-dispatch host
+        // cost in two: time spent INSIDE clEnqueueNDRangeKernel (i.e. blocked on driver
+        // backpressure) versus the ggml host work BETWEEN enqueues. That split is what
+        // identified the OpenMP spin above -- enqueue was blocking ~440 us/call while ggml's
+        // own host work was only ~60 us -- and it is the tool for the idle time that remains
+        // (the GPU is still only ~25% busy during decode on the 850).
+        static const bool enq_prof = getenv("GGML_OPENCL_ENQ_PROF") != nullptr;
+        if (enq_prof) {
+            using clk = std::chrono::steady_clock;
+            static double   t_enq = 0, t_host = 0, t_max = 0;
+            static uint64_t n = 0, n_slow = 0;
+            static clk::time_point last_end;
+            static bool have_last = false;
+
+            const clk::time_point t0 = clk::now();
+            if (have_last) {
+                t_host += std::chrono::duration<double, std::micro>(t0 - last_end).count();
+            }
+            CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, work_dim, NULL, global_work_size, local_work_size, 0, NULL, NULL));
+            const clk::time_point t1 = clk::now();
+
+            const double dt = std::chrono::duration<double, std::micro>(t1 - t0).count();
+            t_enq += dt;
+            if (dt > t_max)   t_max = dt;
+            if (dt > 1000.0)  n_slow++;
+            last_end = t1;
+            have_last = true;
+            ++n;
+
+            if (n % 2000 == 0) {
+                fprintf(stderr,
+                    "[ENQ] n=%llu | clEnqueue: mean %7.1f us  max %8.0f us  >1ms %llu (%.1f%%) "
+                    "| ggml host between enqueues: mean %7.1f us\n",
+                    (unsigned long long) n, t_enq / n, t_max,
+                    (unsigned long long) n_slow, 100.0 * n_slow / n, t_host / n);
+                fflush(stderr);
+            }
+            return;
+        }
         CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, work_dim, NULL, global_work_size, local_work_size, 0, NULL, NULL));
 #endif
     }
@@ -5431,6 +5474,51 @@ namespace /* anonymous */ {
 extern struct ggml_backend_device_i ggml_backend_opencl_device_i;
 }
 
+// Stop the OpenMP runtime's idle worker threads from spin-waiting.
+//
+// ggml-cpu is (usually) built against libomp, whose workers spin for KMP_BLOCKTIME after
+// every parallel region before they sleep -- 200 ms by default, i.e. effectively forever
+// between tokens. Even with the graph fully offloaded the CPU backend still runs an op or
+// two per token, so every worker spins continuously, saturates the CPU, and starves the
+// GPU driver's command-submission thread. The GPU then goes idle waiting for work while
+// clEnqueueNDRangeKernel BLOCKS in the caller: on the Adreno 850 it blocked for a mean of
+// 440 us per dispatch and the GPU sat idle ~84% of decode. Dropping the blocktime lets the
+// workers sleep and hands that CPU back to the driver.
+//
+// Measured on the Adreno 850 (Qwen3-4B-Q4_0, -fa 0, interleaved A/B/B/A): tg32 3.96 ->
+// 6.59 t/s (+66.5%), prefill unaffected (pp512 349.0 -> 343.7, inside this device's
+// run-to-run wander). Not yet verified on other Adrenos: the 840 could not be benched at
+// full clock (it dozes down to 768 MHz mid-run), so it is on everywhere by default and the
+// env override below is the way to turn it off if a device ever regresses.
+//
+// Resolved dynamically, so this is a no-op when the process is not linked against libomp
+// (MSVC's vcomp, GOMP, or no OpenMP at all) -- there is no build-time dependency on the
+// OpenMP runtime. Override the value with GGML_OPENCL_KMP_BLOCKTIME=<ms>, or set it
+// negative to leave the runtime's setting alone.
+static void ggml_cl_quiesce_omp_threads() {
+    int blocktime_ms = 0;
+    if (const char * env = getenv("GGML_OPENCL_KMP_BLOCKTIME")) {
+        blocktime_ms = atoi(env);
+    }
+    if (blocktime_ms < 0) {
+        return;
+    }
+
+#ifndef _WIN32
+    typedef void (*kmp_set_blocktime_t)(int);
+    kmp_set_blocktime_t set_blocktime =
+        (kmp_set_blocktime_t) dlsym(RTLD_DEFAULT, "kmp_set_blocktime");
+    if (set_blocktime) {
+        set_blocktime(blocktime_ms);
+        GGML_LOG_INFO("ggml_opencl: OpenMP blocktime set to %d ms "
+                      "(idle CPU threads would otherwise spin and starve GPU submission)\n",
+                      blocktime_ms);
+    }
+#else
+    GGML_UNUSED(blocktime_ms);
+#endif
+}
+
 // Look for available and suitable devices.
 static std::vector<ggml_backend_device> ggml_opencl_probe_devices(ggml_backend_reg * reg) {
     std::vector<ggml_backend_device> found_devices;
@@ -5616,6 +5704,8 @@ static std::vector<ggml_backend_device> ggml_opencl_probe_devices(ggml_backend_r
 
     CL_CHECK(
         (shared_context = clCreateContext(properties, device_ids.size(), device_ids.data(), NULL, NULL, &err), err));
+
+    ggml_cl_quiesce_omp_threads();
 
     for (auto dev = candidate_devices, dev_end = candidate_devices + n_candidate_devices; dev != dev_end; dev++) {
         GGML_LOG_INFO("\nggml_opencl: device: '%s (%s)'\n", dev->name, dev->version);
