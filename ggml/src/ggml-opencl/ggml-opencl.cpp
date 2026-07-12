@@ -71,6 +71,16 @@ typedef const void * (*get_adreno_bin_kernel_func_t)(
 //------------------------------------------------------------------------------
 
 bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor);
+
+// An env flag is only "set" if it is present AND non-empty. A bare getenv() presence
+// check treats VAR="" as set, so a shell that clears a flag by assigning an empty string
+// (PowerShell's `$env:VAR = ""` does exactly that) leaves the flag silently ON -- which
+// turns an A/B into two copies of the same arm.
+static inline bool ggml_cl_env_flag(const char * name) {
+    const char * v = getenv(name);
+    return v != nullptr && v[0] != '\0';
+}
+
 static bool ggml_cl_is_q4_0_soa(const ggml_tensor * tensor);
 static bool ggml_cl_is_q8_0_soa(const ggml_tensor * tensor);
 static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
@@ -4619,6 +4629,27 @@ static std::string ggml_opencl_fa_compile_opts(ggml_backend_opencl_context * bac
     // routes the fp16-heavy kernel to a slow variant with explicit subgroup size
     if (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X1E) {
         opts += " -D FA_C8_NO_SG_PIN";
+    }
+    // WRONG MATH, diagnostic only: see FA_PROBE_* in flash_attn_f32_q8_0.cl. Note the
+    // non-empty test -- a bare getenv() presence check treats VAR="" as SET, and a shell
+    // that "clears" a flag by assigning an empty string then silently leaves it on.
+    if (ggml_cl_env_flag("GGML_OPENCL_FA_PROBE_NO_LDS")) {
+        opts += " -D FA_PROBE_NO_LDS";
+    }
+    if (ggml_cl_env_flag("GGML_OPENCL_FA_PROBE_NO_QK")) {
+        opts += " -D FA_PROBE_NO_QK";
+    }
+    // Transposed K tile in local memory: the 4 KV rows the QK loop walks together become
+    // adjacent, so each (block, group) step is ONE 128-bit local read instead of four
+    // 32-bit ones. The QK loop is LDS-read-issue-bound (a wrong-math probe that kept every
+    // dp4a but removed the LDS reads ran the kernel 41% faster), so this is worth ~1.5x on
+    // the kernel and ~+17% on fa=1 prefill. Output is bit-identical -- only the layout
+    // moves. Default on; GGML_OPENCL_FA_K_LDS_T=0 restores the row-major tile.
+    {
+        const char * e = getenv("GGML_OPENCL_FA_K_LDS_T");
+        if (e == nullptr || e[0] != '0') {
+            opts += " -D FA_K_LDS_T";
+        }
     }
     return opts;
 }
