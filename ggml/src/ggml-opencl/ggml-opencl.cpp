@@ -19142,7 +19142,10 @@ static void ggml_cl_mul_mat_kq_kqv_adreno(ggml_backend_t backend, const ggml_ten
     // <--------------------------------------------> //
     extra0 = src0->view_src ? (ggml_tensor_extra_cl *)src0->view_src->extra : (ggml_tensor_extra_cl *)src0->extra;
 
-    region.origin = (extra0->offset);
+    // src0 (K/V) is a view into the KV cache, and view_offs is what selects this sequence's
+    // stream inside it. Dropping it makes every sequence read stream 0's cache: correct for
+    // a single stream (offset 0), silently wrong for any multi-sequence server.
+    region.origin = extra0->offset + src0->view_offs;
     if (nb01 > nb02) {
         // KQ
         region.size = nb01 * ne01;
@@ -19158,7 +19161,7 @@ static void ggml_cl_mul_mat_kq_kqv_adreno(ggml_backend_t backend, const ggml_ten
 
     // create sub-buffer for B
     // <--------------------------------------------> //
-    region.origin = (extra1->offset);
+    region.origin = extra1->offset + src1->view_offs;
     region.size = nb10 * ne10 * ne11 * ne12;
     B_sub_buffer = clCreateSubBuffer((extra1->data_device), 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &status);
     CL_CHECK(status);
@@ -19179,7 +19182,7 @@ static void ggml_cl_mul_mat_kq_kqv_adreno(ggml_backend_t backend, const ggml_ten
 
     // create sub-buffer for output C
     // <--------------------------------------------> //
-    region.origin = (extrad->offset);
+    region.origin = extrad->offset + dst->view_offs;
     region.size = ne0 * ne1 * dst->ne[2] * dst->nb[0]; // size of C in bytes
     D_sub_buffer = clCreateSubBuffer((extrad->data_device), 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &status);
     CL_CHECK(status);
@@ -19215,8 +19218,17 @@ static void ggml_cl_mul_mat_kq_kqv_adreno(ggml_backend_t backend, const ggml_ten
     CL_CHECK(clSetKernelArg(kernel,  k_arg++, sizeof(int),    &ne12));
     CL_CHECK(clSetKernelArg(kernel,  k_arg++, sizeof(int),    &nb01));
 
-    size_t global_work_size[3] = {64, static_cast<size_t>(((M+63)/64)), static_cast<size_t>(((N+31)/32)*ne12)};
-    size_t local_work_size[3] = {64, 1, 2};
+    const int n_tiles  = (N + 31) / 32;
+    const int m_blocks = (M + 63) / 64;
+
+    // The n-tiles go on the fast-varying axis so that the A panel of an m-block is reused
+    // across every n-tile while it is still cache-hot (see the kernel). A workgroup takes
+    // two adjacent n-tiles, one per subgroup, so both share that A panel while keeping
+    // their own local-memory B partition; an odd tile count falls back to one subgroup.
+    const int n_tiles_per_wg = (n_tiles % 2) == 0 ? 2 : 1;
+
+    size_t global_work_size[3] = {64, static_cast<size_t>(n_tiles), static_cast<size_t>(m_blocks*ne12)};
+    size_t local_work_size[3]  = {64, static_cast<size_t>(n_tiles_per_wg), 1};
 
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
 
@@ -23122,6 +23134,10 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
     // benchmark the (incorrect) kernel.
     if(src0t == GGML_TYPE_F16 && src1t == GGML_TYPE_F32 && getenv("GGML_OPENCL_KQKV_KERNEL") != nullptr){
         if (ne01 >= 64 && ne1 >= 32 && ne00 >= 16 && (ne12 % ne02) == 0  &&
+            // the kq/kqv kernels and their dispatch are 3D only: dim 3 is never indexed,
+            // so a multi-stream batched attention op (ne03 > 1, several sequences in one
+            // ubatch) would leave streams 1.. of dst unwritten while stream 0 computes
+            ne03 == 1 && ne13 == 1 &&
             // dst is wrapped with image1d_buffer, the size limit applies, also src0
             (ne0 * ne1 * dst->ne[2] * dst->nb[0] / 4 <= backend_ctx->image_max_buffer_size)) {
             // For KQ
