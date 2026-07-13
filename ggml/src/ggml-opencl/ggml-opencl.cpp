@@ -19047,7 +19047,10 @@ static void ggml_cl_mul_mat_kq_kqv_adreno(ggml_backend_t backend, const ggml_ten
     // <--------------------------------------------> //
     extra0 = src0->view_src ? (ggml_tensor_extra_cl *)src0->view_src->extra : (ggml_tensor_extra_cl *)src0->extra;
 
-    region.origin = (extra0->offset);
+    // src0 (K/V) is a view into the KV cache, and view_offs is what selects this sequence's
+    // stream inside it. Dropping it makes every sequence read stream 0's cache: correct for
+    // a single stream (offset 0), silently wrong for any multi-sequence server.
+    region.origin = extra0->offset + src0->view_offs;
     if (nb01 > nb02) {
         // KQ
         region.size = nb01 * ne01;
@@ -19063,7 +19066,7 @@ static void ggml_cl_mul_mat_kq_kqv_adreno(ggml_backend_t backend, const ggml_ten
 
     // create sub-buffer for B
     // <--------------------------------------------> //
-    region.origin = (extra1->offset);
+    region.origin = extra1->offset + src1->view_offs;
     region.size = nb10 * ne10 * ne11 * ne12;
     B_sub_buffer = clCreateSubBuffer((extra1->data_device), 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &status);
     CL_CHECK(status);
@@ -19084,7 +19087,7 @@ static void ggml_cl_mul_mat_kq_kqv_adreno(ggml_backend_t backend, const ggml_ten
 
     // create sub-buffer for output C
     // <--------------------------------------------> //
-    region.origin = (extrad->offset);
+    region.origin = extrad->offset + dst->view_offs;
     region.size = ne0 * ne1 * dst->ne[2] * dst->nb[0]; // size of C in bytes
     D_sub_buffer = clCreateSubBuffer((extrad->data_device), 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &status);
     CL_CHECK(status);
@@ -19120,8 +19123,17 @@ static void ggml_cl_mul_mat_kq_kqv_adreno(ggml_backend_t backend, const ggml_ten
     CL_CHECK(clSetKernelArg(kernel,  k_arg++, sizeof(int),    &ne12));
     CL_CHECK(clSetKernelArg(kernel,  k_arg++, sizeof(int),    &nb01));
 
-    size_t global_work_size[3] = {64, static_cast<size_t>(((M+63)/64)), static_cast<size_t>(((N+31)/32)*ne12)};
-    size_t local_work_size[3] = {64, 1, 2};
+    const int n_tiles  = (N + 31) / 32;
+    const int m_blocks = (M + 63) / 64;
+
+    // The n-tiles go on the fast-varying axis so that the A panel of an m-block is reused
+    // across every n-tile while it is still cache-hot (see the kernel). A workgroup takes
+    // two adjacent n-tiles, one per subgroup, so both share that A panel while keeping
+    // their own local-memory B partition; an odd tile count falls back to one subgroup.
+    const int n_tiles_per_wg = (n_tiles % 2) == 0 ? 2 : 1;
+
+    size_t global_work_size[3] = {64, static_cast<size_t>(n_tiles), static_cast<size_t>(m_blocks*ne12)};
+    size_t local_work_size[3]  = {64, static_cast<size_t>(n_tiles_per_wg), 1};
 
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
 
@@ -22988,24 +23000,63 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
     cl_kernel kernel;
 
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
-    // Decode-only GQA-coalesced KQ via image1d_buffer_t (texture cache) for the
-    // r2=8 GQA shapes: DK=256 (Qwen3.6/Next) and DK=128 (Qwen3-30B-A3B). Reads
-    // K once per K-head and fans 8 Q-heads; the texture-cache K read is a
-    // separate BW lane from L1 (a plain-buffer coalesce lost -9% at DK=256).
-    // Dispatched ONLY at ne11==1 decode and INDEPENDENT of GGML_OPENCL_KQKV_KERNEL
-    // (which also enables the buggy batched-prefill KQ), so it is safe default-on.
-    // Default-on; opt out per shape with GGML_OPENCL_MM_KQ_GQA_DK256_IMG=0 /
-    // GGML_OPENCL_MM_KQ_GQA_DK128_IMG=0. Qwen3.6 tg128 fa=0 +49% @16k (with KQV);
-    // Qwen3-30B-A3B DK=128 was +244% @16k as opt-in, now default.
+    // Adreno f16 attention GEMMs. Two disjoint paths share this block:
+    //   - batched prefill KQ/KQV (ne1 >= 32), the view_offs-fixed kernels;
+    //   - decode-only GQA-coalesced KQ through the texture cache (ne11 == 1).
+    // They cannot both match: one requires ne1 >= 32, the other ne11 == 1.
     if (src0t == GGML_TYPE_F16 && src1t == GGML_TYPE_F32) {
+        if (ne01 >= 64 && ne1 >= 32 && ne00 >= 16 && (ne12 % ne02) == 0  &&
+            // the kq/kqv kernels and their dispatch are 3D only: dim 3 is never indexed,
+            // so a multi-stream batched attention op (ne03 > 1, several sequences in one
+            // ubatch) would leave streams 1.. of dst unwritten while stream 0 computes
+            ne03 == 1 && ne13 == 1 &&
+            // These kernels are correct on every Adreno, but they are not faster on every
+            // Adreno. Measured against the generic mul_mm path at prefill:
+            //
+            //   Adreno 740   +75% @pp512, +289% @pp2048   (the generic f16 mul_mm is
+            //                                              pathological there: 94% of GPU time)
+            //   Adreno 840   +2.6% .. +10%
+            //   Adreno X2    +4% / +9% / +11% @pp512/2048/4096
+            //   Adreno X1E   -2.8% / -8.5% / -18.4%       <-- loses, and worse with depth
+            //
+            // So decline them on X1E and let it keep the generic path. This is a carve-out
+            // for one part, not a capability level: X1E sits between two generations that
+            // both win, so there is no ordering of "capability" that expresses it.
+            backend_ctx->adreno_gen != ADRENO_GPU_GEN::X1E &&
+            // dst is wrapped with image1d_buffer, the size limit applies, also src0
+            (ne0 * ne1 * dst->ne[2] * dst->nb[0] / 4 <= backend_ctx->image_max_buffer_size)) {
+            // For KQ
+            if (ggml_is_permuted(src0) && ggml_is_permuted(src1) &&
+                ((nb01 * ne01 / 4)/4 <= backend_ctx->image_max_buffer_size) &&
+                nb00 <= nb02 &&
+                nb02 <= nb01 &&
+                nb01 <= nb03 &&
+                nb10 <= nb12 &&
+                nb12 <= nb11 &&
+                nb11 <= nb13) {
+                ggml_cl_mul_mat_kq_kqv_adreno(backend, src0, src1, dst);
+                return;
+            }
+            // For KQV
+            if (!ggml_is_contiguous(src0) && ggml_is_contiguous(src1) &&
+                ((nb02 * ne02 / 4)/4 <= backend_ctx->image_max_buffer_size)) {
+                ggml_cl_mul_mat_kq_kqv_adreno(backend, src0, src1, dst);
+                return;
+            }
+        }
+
+        // Decode-only GQA-coalesced KQ via image1d_buffer_t (texture cache) for the
+        // r2=8 GQA shapes: DK=256 (Qwen3.6/Next) and DK=128 (Qwen3-30B-A3B). Reads
+        // K once per K-head and fans 8 Q-heads; the texture-cache K read is a
+        // separate BW lane from L1 (a plain-buffer coalesce lost -9% at DK=256).
+        // Dispatched ONLY at ne11==1 decode, so it cannot collide with the prefill
+        // dispatch above. Default-on; opt out per shape with
+        // GGML_OPENCL_MM_KQ_GQA_DK256_IMG=0 / GGML_OPENCL_MM_KQ_GQA_DK128_IMG=0.
+        // Qwen3.6 tg128 fa=0 +49% @16k (with KQV); Qwen3-30B-A3B DK=128 +244% @16k.
         static const char * mm_kq_dk256_env = getenv("GGML_OPENCL_MM_KQ_GQA_DK256_IMG");
         static const bool mm_kq_dk256_on = (mm_kq_dk256_env == nullptr || mm_kq_dk256_env[0] != '0');
         static const char * mm_kq_dk128_env = getenv("GGML_OPENCL_MM_KQ_GQA_DK128_IMG");
         static const bool mm_kq_dk128_on = (mm_kq_dk128_env == nullptr || mm_kq_dk128_env[0] != '0');
-        // Select the decode KQ image kernel for this (DK, r2=8, r3=1) shape:
-        //   DK=256 -> Qwen3.6/Next (x8_gqa_r8_dk256_img)
-        //   DK=128 -> Qwen3-30B-A3B (x8_gqa4_img; +244% fa=0@16k, was locked
-        //             behind the buggy KQKV_KERNEL gate).
         cl_kernel kq_img_kernel = nullptr;
         if (ne11 == 1 && ne01 >= 64 && (ne01 % 16) == 0 &&
             (ne12 % ne02) == 0 && (ne12 / ne02) == 8 && (ne13 / ne03) == 1) {
@@ -23064,42 +23115,14 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             }
         }
     }
-    // The mul_mm_f16_f32_kq / _kqv attention kernels MISCOMPUTE the batched
-    // prefill attention: they produce correct results only for the final query
-    // position and garble all intermediate positions. Generation stays coherent
-    // (it consumes the final position), but perplexity, speculative-decode verify
-    // and any batched/multi-position scoring are wrong. Verified on Gemma-3-4b
-    // (head_dim 256, fa=0 PPL ~3.2e4 vs ~14.2 CPU) AND Llama-3.2-3B (head_dim 128,
-    // PPL ~2.6e3 vs ~8.4); routing both KQ and KQV to the generic mul_mm/mul_mv
-    // path below restores correctness on every model. The kernel is also NOT a
-    // perf win: pp512 is within noise (-1% Llama / -0.6% Gemma) and pp4096 is
-    // ~8% FASTER without it (the generic path scales better at long context).
-    // Disabled by default; opt in with GGML_OPENCL_KQKV_KERNEL=1 only to debug/
-    // benchmark the (incorrect) kernel.
-    if(src0t == GGML_TYPE_F16 && src1t == GGML_TYPE_F32 && getenv("GGML_OPENCL_KQKV_KERNEL") != nullptr){
-        if (ne01 >= 64 && ne1 >= 32 && ne00 >= 16 && (ne12 % ne02) == 0  &&
-            // dst is wrapped with image1d_buffer, the size limit applies, also src0
-            (ne0 * ne1 * dst->ne[2] * dst->nb[0] / 4 <= backend_ctx->image_max_buffer_size)) {
-            // For KQ
-            if (ggml_is_permuted(src0) && ggml_is_permuted(src1) &&
-                ((nb01 * ne01 / 4)/4 <= backend_ctx->image_max_buffer_size) &&
-                nb00 <= nb02 &&
-                nb02 <= nb01 &&
-                nb01 <= nb03 &&
-                nb10 <= nb12 &&
-                nb12 <= nb11 &&
-                nb11 <= nb13) {
-                ggml_cl_mul_mat_kq_kqv_adreno(backend, src0, src1, dst);
-                return;
-            }
-            // For KQV
-            if (!ggml_is_contiguous(src0) && ggml_is_contiguous(src1) &&
-                ((nb02 * ne02 / 4)/4 <= backend_ctx->image_max_buffer_size)) {
-                ggml_cl_mul_mat_kq_kqv_adreno(backend, src0, src1, dst);
-                return;
-            }
-        }
-
+    // Remaining opt-in decode KQ image specializations (r2=4, and the DK=256/r2=2
+    // Gemma-3 shape). The batched-prefill KQ/KQV dispatch that used to head this block
+    // is gone: it lived behind GGML_OPENCL_KQKV_KERNEL because those kernels were
+    // believed to miscompute batched prefill. They do not -- the dispatch had simply
+    // dropped src0->view_offs, so it always read KV stream 0. That is fixed above, and
+    // the fixed kernels now run by default, so the opt-in duplicate would only be a
+    // second, worse copy of the same dispatch.
+    if (src0t == GGML_TYPE_F16 && src1t == GGML_TYPE_F32) {
         // Decode-time GQA-coalesced KQ via image1d_buffer_t (texture cache).
         // Same shape gate as _x8_gqa4 (DK=128, r2=8, r3=1, ne01%16==0, ne11=1)
         // plus enough K-cache bytes (must fit image_max_buffer_size in pixels).
