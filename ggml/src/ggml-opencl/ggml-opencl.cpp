@@ -164,6 +164,7 @@ enum GPU_FAMILY {
 
 enum ADRENO_GPU_GEN {
     ADRENO_UNKNOWN,
+    A6X,
     A7X,
     A8X,
     X1E,
@@ -180,6 +181,7 @@ enum ADRENO_GPU_GEN {
 // workarounds for one old compiler, not capability levels.)
 enum {
     GEN_LEVEL_NONE = 0,
+    GEN_LEVEL_A6X  = 60,   // Adreno 6xx (64x/65x/66x/670/680) -- the oldest gen we model
     GEN_LEVEL_A7X  = 70,
     GEN_LEVEL_X1E  = 81,   // Snapdragon X Elite (gen 1)
     GEN_LEVEL_X2   = 90,   // Snapdragon X2 Elite == Snapdragon 8 Elite (A8X); same ISA gen
@@ -188,6 +190,7 @@ enum {
 
 static int adreno_gen_level(ADRENO_GPU_GEN gen) {
     switch (gen) {
+        case ADRENO_GPU_GEN::A6X: return GEN_LEVEL_A6X;
         case ADRENO_GPU_GEN::A7X: return GEN_LEVEL_A7X;
         case ADRENO_GPU_GEN::X1E: return GEN_LEVEL_X1E;
         case ADRENO_GPU_GEN::A8X: return GEN_LEVEL_X2;   // same gen as X2E
@@ -320,14 +323,43 @@ static ggml_cl_version get_opencl_c_version(ggml_cl_version platform_version, cl
 }
 
 static ADRENO_GPU_GEN get_adreno_gpu_gen(const char *device_name) {
+    // Adreno 6xx. The 64x / 65x / 66x parts and the 670 / 680 are one family for our
+    // purposes; they share a compiler generation and none of the paths gated above A7X.
+    // An Adreno 642L reports "Adreno642Lv1", so match the number, not an exact name.
+    if (strstr(device_name, "640") ||
+        strstr(device_name, "642") ||
+        strstr(device_name, "643") ||
+        strstr(device_name, "644") ||
+        strstr(device_name, "650") ||
+        strstr(device_name, "660") ||
+        strstr(device_name, "662") ||
+        strstr(device_name, "663") ||
+        strstr(device_name, "670") ||
+        strstr(device_name, "680")) {
+        return ADRENO_GPU_GEN::A6X;
+    }
+
     if (strstr(device_name, "730") ||
         strstr(device_name, "740") ||
         strstr(device_name, "750")) {
         return ADRENO_GPU_GEN::A7X;
     }
 
+    // The 850 reports "Adreno850v2". It is a generation above the 840, but nothing here
+    // depends on that: it is listed so that it does not fall through to ADRENO_UNKNOWN
+    // and get treated as a brand-new part (see the unknown-device policy at init). A8X is
+    // the closest gen we have actually validated it against.
+    //
+    // Note for whoever adds the next gen-gated fast path: this puts the 850 at the same
+    // capability level as the X2, so anything gated on that level is ON for it. That is
+    // correct for every path in the tree today (verified: the 850 passes MUL_MAT with the
+    // dense dp4a paths force-enabled). But its compiler is not the 840's, and it is known to
+    // miscompile some kernels the other Adrenos build correctly -- so a new path gated purely
+    // on capability level will reach it. Gate anything the E17 compiler cannot build on the
+    // compiler, not on the gen.
     if (strstr(device_name, "830") ||
-        strstr(device_name, "840")) {
+        strstr(device_name, "840") ||
+        strstr(device_name, "850")) {
         return ADRENO_GPU_GEN::A8X;
     }
 
@@ -6661,8 +6693,11 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
         int lvl = adreno_gen_level(backend_ctx->adreno_gen);
         if (backend_ctx->adreno_gen == ADRENO_GPU_GEN::ADRENO_UNKNOWN) {
             lvl = GEN_LEVEL_MAX_KNOWN;
-            GGML_LOG_WARN("ggml_opencl: unknown Adreno gen; assuming capability level %d "
-                          "(override with GGML_OPENCL_GEN_LEVEL)\n", lvl);
+            GGML_LOG_WARN("ggml_opencl: unrecognized Adreno '%s'; assuming it is newer than "
+                          "anything known and using capability level %d. If this is an OLDER "
+                          "part, pin it with GGML_OPENCL_GEN_LEVEL (e.g. %d) and add it to "
+                          "get_adreno_gpu_gen().\n",
+                          backend_ctx->device_name.c_str(), lvl, GEN_LEVEL_A6X);
         }
         if (const char * env = getenv("GGML_OPENCL_GEN_LEVEL")) {
             if (env[0]) lvl = atoi(env);
