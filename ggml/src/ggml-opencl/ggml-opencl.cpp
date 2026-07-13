@@ -1565,6 +1565,13 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         compile_opts += " -qcom-enable-large-buffer ";
     }
 
+    // The A7X compiler (E031.41) does not declare the KHR-name sub_group_shuffle_xor,
+    // so the kernels that use it remap to the qcom builtin. Newer Adreno compilers do
+    // declare it and must build the original source.
+    if (backend_ctx->adreno_gen == ADRENO_GPU_GEN::A7X) {
+        compile_opts += " -DADRENO_OLD_COMPILER=1";
+    }
+
     backend_ctx->kernel_compile_opts = compile_opts;
 
     GGML_LOG_INFO("ggml_opencl: loading OpenCL kernels");
@@ -8855,16 +8862,16 @@ inline bool use_adreno_kernels(const ggml_backend_opencl_context *backend_ctx, c
 }
 
 inline bool use_adreno_moe_kernels(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor) {
-    // The A7X compiler (Adreno 740, E031.41) miscompiles the *_trans4_ns weight-convert
-    // kernels this MoE layout depends on — they alias a byte pointer into a private
-    // ushort8 — so every quant routed through it gets garbage weights. Decline the
-    // layout wholesale there: q4_0/q8_0/mxfp4 fall back to the general mul_mv_id
-    // kernels, which read the plain convert that the dense path already exercises on
-    // this compiler, and the remaining quants have no general MUL_MAT_ID support so
-    // ggml_opencl_supports_op declines them to CPU. Both the convert in set_tensor and
-    // the dispatch in ggml_cl_mul_mat_id key off this predicate, so the buffer layout
-    // and the kernel reading it stay in agreement.
-    if (backend_ctx && backend_ctx->adreno_gen == ADRENO_GPU_GEN::A7X) {
+    // The A7X compiler still miscompiles the K-quant trans4_ns converts. The block converts
+    // that type-punned a private vector are fixed (see the previous commit) and are correct
+    // there again, so only the K-quants are declined; everything else keeps the Adreno MoE
+    // weight layout. Both the convert in set_tensor and the dispatch in ggml_cl_mul_mat_id
+    // key off this predicate, so the buffer layout and the kernel reading it stay in
+    // agreement.
+    if (backend_ctx && backend_ctx->adreno_gen == ADRENO_GPU_GEN::A7X &&
+        (tensor->type == GGML_TYPE_Q4_K ||
+         tensor->type == GGML_TYPE_Q5_K ||
+         tensor->type == GGML_TYPE_Q6_K)) {
         return false;
     }
     int ne01 = tensor->ne[1];
