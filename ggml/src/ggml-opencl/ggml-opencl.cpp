@@ -1600,6 +1600,13 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         compile_opts += " -qcom-enable-large-buffer ";
     }
 
+    // The A7X compiler (E031.41) does not declare the KHR-name sub_group_shuffle_xor,
+    // so the kernels that use it remap to the qcom builtin. Newer Adreno compilers do
+    // declare it and must build the original source.
+    if (backend_ctx->adreno_gen == ADRENO_GPU_GEN::A7X) {
+        compile_opts += " -DADRENO_OLD_COMPILER=1";
+    }
+
     backend_ctx->kernel_compile_opts = compile_opts;
 
     GGML_LOG_INFO("ggml_opencl: loading OpenCL kernels");
