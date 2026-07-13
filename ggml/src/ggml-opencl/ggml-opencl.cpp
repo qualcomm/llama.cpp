@@ -181,6 +181,7 @@ enum ADRENO_GPU_GEN {
 // workarounds for one old compiler, not capability levels.)
 enum {
     GEN_LEVEL_NONE = 0,
+    GEN_LEVEL_A6X  = 60,   // Adreno 6xx (64x/65x/66x/670/680) -- the oldest gen we model
     GEN_LEVEL_A7X  = 70,
     GEN_LEVEL_X1E  = 81,   // Snapdragon X Elite (gen 1)
     GEN_LEVEL_X2   = 90,   // Snapdragon X2 Elite == Snapdragon 8 Elite (A8X); same ISA gen
@@ -189,11 +190,12 @@ enum {
 
 static int adreno_gen_level(ADRENO_GPU_GEN gen) {
     switch (gen) {
+        case ADRENO_GPU_GEN::A6X: return GEN_LEVEL_A6X;
         case ADRENO_GPU_GEN::A7X: return GEN_LEVEL_A7X;
         case ADRENO_GPU_GEN::X1E: return GEN_LEVEL_X1E;
         case ADRENO_GPU_GEN::A8X: return GEN_LEVEL_X2;   // same gen as X2E
         case ADRENO_GPU_GEN::X2E: return GEN_LEVEL_X2;
-        default:                  return GEN_LEVEL_NONE; // ADRENO_UNKNOWN handled at init (optimistic)
+        default:                  return GEN_LEVEL_NONE; // ADRENO_UNKNOWN handled at init
     }
 }
 
@@ -6696,19 +6698,34 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
     CL_CHECK(clGetDeviceInfo(device, CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(cl_uint), &backend_ctx->compute_units, NULL));
 
     // Ordered capability level (Phase 3 of the capability/scale gating model).
-    // Forward-facing gates compare gen_level with >= so a newer chip inherits
-    // every path a same-or-older gen enabled. Unknown Adreno -> optimistic:
-    // assume the highest known gen (the motivating case, the Adreno 840, was a
-    // NEW same-or-newer chip stranded at zero opts, not a resurrected old one),
-    // but still feature-gated (dp4a paths also require the extension) and
-    // dialable back for bring-up on a genuinely older unknown part.
-    //   GGML_OPENCL_GEN_LEVEL=<n>  (e.g. 81 to cap an unknown chip at X1-class)
+    // Forward-facing gates compare gen_level with >= so a newer chip inherits every path a
+    // same-or-older gen enabled.
+    //
+    // An Adreno we do not recognize is assumed to be NEWER than everything we do, and gets
+    // the highest level we know. That is the case this policy exists for: the Adreno 840
+    // was a new part stranded at zero optimizations because nothing matched its name. It is
+    // safe in the sense that matters -- every path it unlocks is additionally feature-gated
+    // (the dp4a paths also require the extension), so the worst case is a path that is
+    // enabled but not selected.
+    //
+    // It is only defensible because the roster above actually covers the parts we have. An
+    // OLDER unrecognized part would take this branch too, and old Adrenos are exactly where
+    // the compiler bugs are: an unlisted device also misses every gen-keyed workaround, so
+    // it gets the newest fast paths AND none of the fixes. That combination is what left
+    // MoE silently emitting garbage on two devices before they were listed. If you add a
+    // part, add it to get_adreno_gpu_gen() -- do not leave it to this branch.
+    //
+    // GGML_OPENCL_GEN_LEVEL=<n> overrides, which is the bring-up escape hatch for a genuinely
+    // older unknown part (e.g. 60 to pin it to the A6X floor).
     if (backend_ctx->gpu_family == GPU_FAMILY::ADRENO) {
         int lvl = adreno_gen_level(backend_ctx->adreno_gen);
         if (backend_ctx->adreno_gen == ADRENO_GPU_GEN::ADRENO_UNKNOWN) {
             lvl = GEN_LEVEL_MAX_KNOWN;
-            GGML_LOG_WARN("ggml_opencl: unknown Adreno gen; assuming capability level %d "
-                          "(override with GGML_OPENCL_GEN_LEVEL)\n", lvl);
+            GGML_LOG_WARN("ggml_opencl: unrecognized Adreno '%s'; assuming it is newer than "
+                          "anything known and using capability level %d. If this is an OLDER "
+                          "part, pin it with GGML_OPENCL_GEN_LEVEL (e.g. %d) and add it to "
+                          "get_adreno_gpu_gen().\n",
+                          backend_ctx->device_name.c_str(), lvl, GEN_LEVEL_A6X);
         }
         if (const char * env = getenv("GGML_OPENCL_GEN_LEVEL")) {
             if (env[0]) lvl = atoi(env);
