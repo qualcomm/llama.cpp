@@ -8809,6 +8809,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // Decode GEMV (n == 1) with an output dimension that is not a multiple of the
+    // work-item tiling. Backends that pad the output grid and write without a row
+    // guard overrun dst into the next tensor; the dst sentinel catches it.
+    // m = 6680 is Falcon-H1-7B's ssm_in (its only weight whose ne1 is not 64-aligned):
+    // 6680 % 128 = 24, and 6680 % 64 = 24, so it pads under both 2-row and 1-row tilings.
+    for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1,
+                             GGML_TYPE_Q8_0, GGML_TYPE_Q1_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K,
+                             GGML_TYPE_Q6_K, GGML_TYPE_IQ4_NL}) {
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 6680, 1, 3072, {1, 1}, {1, 1}));
+    }
+
     // sycl backend will limit task global_range < MAX_INT
     // test case for f16-type-convert-to-fp32 kernel with large k under fp32 compute dtype (occurs in stable-diffusion)
     // however this case needs to alloc more memory which may fail in some devices (Intel Arc770, etc.)

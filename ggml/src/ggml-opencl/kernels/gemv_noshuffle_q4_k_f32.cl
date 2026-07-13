@@ -314,9 +314,8 @@ kernel void kernel_gemv_noshuffle_q4_k_f32(
         dst = (global float*)((global char*)dst + offsetd);
         // Guard the two output rows. The x-grid is padded to CEIL_DIV(ne01/2,64)*64,
         // so when ne01 is not a multiple of 128 the tail row-pairs run past row ne01
-        // and would overrun dst into the adjacent tensor (garbage downstream, e.g.
-        // Falcon-H1 ssm_in ne01=6680). No-op / byte-identical when ne01 % 128 == 0
-        // (M/2 already a multiple of 64 -> no padding).
+        // and would overrun dst into the adjacent tensor. No-op / byte-identical when
+        // ne01 % 128 == 0 (M/2 already a multiple of 64 -> no padding).
         if (gid * 2 + 0 < M) dst[gid * 2 + 0] = totalSum.s0;
         if (gid * 2 + 1 < M) dst[gid * 2 + 1] = totalSum.s1;
     }
