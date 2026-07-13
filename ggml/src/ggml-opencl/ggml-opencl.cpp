@@ -542,6 +542,7 @@ struct ggml_backend_opencl_context {
     bool fp16_support;
     bool has_vector_subgroup_broadcast;
     bool has_subgroup_shuffle = false;       // cl_khr_subgroup_shuffle or cl_qcom_subgroup_shuffle
+    bool has_integer_dot      = false;       // cl_khr_integer_dot_product (dp4a)
     bool has_qcom_subgroup_shuffle = false;  // specifically cl_qcom_subgroup_shuffle
     bool disable_fusion;
 
@@ -2552,7 +2553,14 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
     }
 
     // mul_mm_q8_0_f32_kq_dp4a (dp4a fa=0 prefill KQ off a q8_0 K cache)
-    {
+    //
+    // Skipped on a device without cl_khr_integer_dot_product: these kernels call
+    // dot_acc_sat_4x8packed_ss_int, the build is fatal, and the feature is opt-in at
+    // dispatch anyway -- so an unguarded build would take the whole backend down at init
+    // on a device that never intended to use it. (Found on an Adreno 642L, which has no
+    // KHR integer-dot; every other Adreno in the fleet declares it, which is why this
+    // survived.) The kernel handles stay null and the dispatch site checks them.
+    if (backend_ctx->has_integer_dot) {
 #ifdef GGML_OPENCL_EMBED_KERNELS
         const std::string kernel_src {
             #include "mul_mm_q8_0_f32_kq_dp4a.cl.h"
@@ -6041,6 +6049,13 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
     backend_ctx->has_subgroup_shuffle =
         strstr(ext_buffer, "cl_khr_subgroup_shuffle") != NULL ||
         backend_ctx->has_qcom_subgroup_shuffle;
+
+    // 4x8-packed integer dot product (dp4a), used by the KQ prefill kernels below. The
+    // kernels call dot_acc_sat_4x8packed_ss_int, so a device that does not declare it
+    // cannot build them -- and the build is fatal, so the backend would fail to come up
+    // on a device that works perfectly well without dp4a. Skip those programs there.
+    backend_ctx->has_integer_dot =
+        strstr(ext_buffer, "cl_khr_integer_dot_product") != NULL;
 
     cl_uint base_align_in_bits;
     CL_CHECK(clGetDeviceInfo(device, CL_DEVICE_MEM_BASE_ADDR_ALIGN, sizeof(cl_uint), &base_align_in_bits, NULL));
