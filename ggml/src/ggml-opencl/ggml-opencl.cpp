@@ -9152,21 +9152,22 @@ static bool adreno_art_compiler_quirks(const ggml_backend_opencl_context *backen
 }
 
 inline bool use_adreno_moe_kernels(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor) {
-    // Two independent compilers miscompile the *_trans4_ns weight-convert kernels this MoE
-    // layout depends on, and each needs a different width of decline:
-    //   - A7X (740, E031.41): the converts that type-punned a private vector are FIXED and
-    //     correct there again, so only the K-quants still need declining; everything else
-    //     keeps the Adreno MoE layout (this is what returns 81 MoE shapes to the 740's GPU).
-    //   - art.api37 / E17 (850): the UB fix does NOT move it — that one is a genuine codegen
-    //     bug in their compiler — so the layout is declined wholesale there.
-    // Quants with a general mul_mat_id kernel fall back to it; the rest are declined to CPU
-    // by ggml_opencl_supports_op. Both the convert in set_tensor and the dispatch in
-    // ggml_cl_mul_mat_id key off this predicate, so the buffer layout and the kernel reading
-    // it stay in agreement.
-    if ((backend_ctx && backend_ctx->adreno_gen == ADRENO_GPU_GEN::A7X &&
-         (tensor->type == GGML_TYPE_Q4_K ||
-          tensor->type == GGML_TYPE_Q5_K ||
-          tensor->type == GGML_TYPE_Q6_K)) ||
+    // The *_trans4_ns weight-convert kernels this MoE layout depends on are miscompiled on
+    // the A7X (740, E031.41) and on art.api37 / E17 (850) — they alias a private ushort8
+    // through a uchar* — so every expert weight routed through the layout is garbage there.
+    // Decline the layout wholesale on both: quants with a general mul_mat_id kernel fall back
+    // to it, and the rest are declined to CPU by ggml_opencl_supports_op. Both the convert in
+    // set_tensor and the dispatch in ggml_cl_mul_mat_id key off this predicate, so the buffer
+    // layout and the kernel reading it stay in agreement.
+    //
+    // ⚠️ The byte-wise rewrite of those converts (the "UB fix") is REVERTED here and the A7X
+    // decline is back to wholesale. The rewrite is byte-equivalent by inspection and it does
+    // fix the 740/A6X, but on the X2-90 it MISCOMPILES: gpt-oss-20b (mxfp4 MoE) degenerates
+    // ("conjug conjug conjug…") on upstream+fix while plain upstream answers "Paris".
+    // test-backend-ops cannot see it — use_adreno_moe_kernels() matches on tensor NAMES
+    // (ffn/exps), which no test tensor has, so the converts are never exercised there.
+    // Do not re-land the rewrite without a real MoE model check on an X2.
+    if ((backend_ctx && backend_ctx->adreno_gen == ADRENO_GPU_GEN::A7X) ||
         adreno_art_compiler_quirks(backend_ctx)) {
         return false;
     }
