@@ -198,6 +198,7 @@ static int adreno_gen_level(ADRENO_GPU_GEN gen) {
 
 enum ADRENO_CL_COMPILER_TYPE {
     E031,
+    E17,
     DX,
 };
 
@@ -341,6 +342,14 @@ static ADRENO_GPU_GEN get_adreno_gpu_gen(const char *device_name) {
     return ADRENO_GPU_GEN::ADRENO_UNKNOWN;
 }
 
+// The art.api37 (E17) shader compiler miscompiles or crashes on several kernels. These are
+// CORRECTNESS workarounds (a compiler SIGSEGV and silently garbage weights), so they are
+// keyed on the compiler class and stay ON until a fixed compiler is verified -- they do not
+// lift themselves on a version bump. GGML_OPENCL_ART_QUIRKS=0 turns them all off in one run,
+// which is how a new compiler gets re-verified without a rebuild.
+struct ggml_backend_opencl_context;
+static bool adreno_art_compiler_quirks(const ggml_backend_opencl_context *backend_ctx);
+
 static ggml_cl_compiler_version get_adreno_cl_compiler_version(const char *driver_version) {
     std::string driver_ver_str(driver_version);
     ADRENO_CL_COMPILER_TYPE type = ADRENO_CL_COMPILER_TYPE::E031;
@@ -349,6 +358,19 @@ static ggml_cl_compiler_version get_adreno_cl_compiler_version(const char *drive
     size_t compiler_major_offset = 5;
     size_t compiler_minor_offset = 8;
     size_t compiler_patch_offset = 11;
+
+    if (compiler_ver_pos == std::string::npos) {
+        // "Compiler E17.51.05.00" -- the art.api37 driver series. Its prefix is three
+        // characters, so every field sits one earlier than in the E031 layout.
+        compiler_ver_pos = driver_ver_str.find("E17");
+        if (compiler_ver_pos != std::string::npos) {
+            type = ADRENO_CL_COMPILER_TYPE::E17;
+            compiler_ver_len = 12;
+            compiler_major_offset = 4;
+            compiler_minor_offset = 7;
+            compiler_patch_offset = 10;
+        }
+    }
 
     if (compiler_ver_pos == std::string::npos) {
         compiler_ver_pos = driver_ver_str.find("DX");
@@ -2007,6 +2029,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
     // those compiler versions since it is anyway not used for Adreno.
     if (backend_ctx->gpu_family != ADRENO ||
         backend_ctx->adreno_cl_compiler_version.newer_than_or_same(E031, 38, 11, 0) ||
+        backend_ctx->adreno_cl_compiler_version.type == E17 ||
         backend_ctx->adreno_cl_compiler_version.type == DX) {
 #ifdef GGML_OPENCL_EMBED_KERNELS
         const std::string kernel_src {
@@ -8861,17 +8884,32 @@ inline bool use_adreno_kernels(const ggml_backend_opencl_context *backend_ctx, c
     return threashold_ok;
 }
 
+static bool adreno_art_compiler_quirks(const ggml_backend_opencl_context *backend_ctx) {
+    if (!backend_ctx || backend_ctx->gpu_family != GPU_FAMILY::ADRENO ||
+        backend_ctx->adreno_cl_compiler_version.type != ADRENO_CL_COMPILER_TYPE::E17) {
+        return false;
+    }
+    const char * env = getenv("GGML_OPENCL_ART_QUIRKS");
+    return !(env && env[0] == '0');
+}
+
 inline bool use_adreno_moe_kernels(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor) {
-    // The A7X compiler still miscompiles the K-quant trans4_ns converts. The block converts
-    // that type-punned a private vector are fixed (see the previous commit) and are correct
-    // there again, so only the K-quants are declined; everything else keeps the Adreno MoE
-    // weight layout. Both the convert in set_tensor and the dispatch in ggml_cl_mul_mat_id
-    // key off this predicate, so the buffer layout and the kernel reading it stay in
-    // agreement.
-    if (backend_ctx && backend_ctx->adreno_gen == ADRENO_GPU_GEN::A7X &&
-        (tensor->type == GGML_TYPE_Q4_K ||
-         tensor->type == GGML_TYPE_Q5_K ||
-         tensor->type == GGML_TYPE_Q6_K)) {
+    // Two independent compilers miscompile the *_trans4_ns weight-convert kernels this MoE
+    // layout depends on, and each needs a different width of decline:
+    //   - A7X (740, E031.41): the converts that type-punned a private vector are FIXED and
+    //     correct there again, so only the K-quants still need declining; everything else
+    //     keeps the Adreno MoE layout (this is what returns 81 MoE shapes to the 740's GPU).
+    //   - art.api37 / E17 (850): the UB fix does NOT move it — that one is a genuine codegen
+    //     bug in their compiler — so the layout is declined wholesale there.
+    // Quants with a general mul_mat_id kernel fall back to it; the rest are declined to CPU
+    // by ggml_opencl_supports_op. Both the convert in set_tensor and the dispatch in
+    // ggml_cl_mul_mat_id key off this predicate, so the buffer layout and the kernel reading
+    // it stay in agreement.
+    if ((backend_ctx && backend_ctx->adreno_gen == ADRENO_GPU_GEN::A7X &&
+         (tensor->type == GGML_TYPE_Q4_K ||
+          tensor->type == GGML_TYPE_Q5_K ||
+          tensor->type == GGML_TYPE_Q6_K)) ||
+        adreno_art_compiler_quirks(backend_ctx)) {
         return false;
     }
     int ne01 = tensor->ne[1];
@@ -9362,6 +9400,12 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
         case GGML_OP_MEAN:
             return op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_FLASH_ATTN_EXT: {
+            // The art.api37 (E17) shader compiler segfaults while building the flash_attn
+            // programs, which kills the process. Decline FA there; attention falls back to
+            // the unfused path, which is correct.
+            if (adreno_art_compiler_quirks(backend_ctx)) {
+                return false;
+            }
             const ggml_tensor * q = op->src[0];
             const ggml_tensor * k = op->src[1];
             const ggml_tensor * v = op->src[2];
