@@ -9019,9 +9019,27 @@ inline bool use_adreno_kernels(const ggml_backend_opencl_context *backend_ctx, c
     bool threashold_ok = tensor->ne[0] >= threshold_ne0 && tensor->ne[1] >= threshold_ne1 &&
             tensor->ne[2] == 1 && tensor->ne[3] == 1;
 
-    // q6_K adreno kernels requires ne1 is multiple of 128
-    if (tensor->type == GGML_TYPE_Q6_K) {
-        return threashold_ok && tensor->ne[1] % 128 == 0;
+    // The noshuffle (transposed-weight) layout packs 2 rows per 32-bit texel and the
+    // gemv reads it with a ne01/2 texel stride, so it is only correct when ne01 is a
+    // multiple of 128 -- an odd ne01 truncates the stride and misaligns every odd
+    // column of the transposed layout. That is a property of the LAYOUT, not of one
+    // quant: it was first hit on q6_K (granitemoe lm_head, odd vocab 49155) and gated
+    // there, but q4_K / q5_K / q8_0 / q1_0 read the same 2-row-texel packing and are
+    // equally wrong for an odd ne01 (test-backend-ops MUL_MAT m=6680,k=3072 -> ERR ~1.0
+    // on every one of them). Gate the layout itself.
+    //
+    // Not a perf concern in practice: real transformer weights (hidden / FFN / vocab)
+    // are multiples of 128, so this only diverts genuinely odd shapes (e.g. Falcon-H1's
+    // ssm_in, ne01=6680) to the correct general path.
+    switch (tensor->type) {
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q1_0:
+            return threashold_ok && tensor->ne[1] % 128 == 0;
+        default:
+            break;
     }
     return threashold_ok;
 }
