@@ -2586,7 +2586,14 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
     }
 
     // mul_mm_q8_0_f32_kq_dp4a (dp4a fa=0 prefill KQ off a q8_0 K cache)
-    {
+    //
+    // Skipped on a device without cl_khr_integer_dot_product: these kernels call
+    // dot_acc_sat_4x8packed_ss_int, the build is fatal, and the feature is opt-in at
+    // dispatch anyway -- so an unguarded build would take the whole backend down at init
+    // on a device that never intended to use it. (Found on an Adreno 642L, which has no
+    // KHR integer-dot; every other Adreno in the fleet declares it, which is why this
+    // survived.) The kernel handles stay null and the dispatch site checks them.
+    if (backend_ctx->has_integer_dot) {
 #ifdef GGML_OPENCL_EMBED_KERNELS
         const std::string kernel_src {
             #include "mul_mm_q8_0_f32_kq_dp4a.cl.h"
