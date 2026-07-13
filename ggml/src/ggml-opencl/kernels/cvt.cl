@@ -17,6 +17,30 @@
 #define REQD_SUBGROUP_SIZE_128 __attribute__((qcom_reqd_sub_group_size("full")))
 #endif
 
+// The trans4_ns converts move the 16 quant bytes of a block between a uchar[] and a uint4.
+// They used to do it by aliasing a private ushort8 through a uchar*, which is type punning:
+// those vectors live in registers, and an optimizer is free to keep them there and reorder
+// or drop the byte-wise accesses. Two Adreno compilers do exactly that -- E031.41 (A7X) and
+// E17.51 (Adreno 850) both emit garbage weights -- which is what forced the Adreno MoE
+// weight layout to be declined on those parts.
+//
+// Adreno is byte-addressable, so reading the block a byte at a time and assembling the
+// vector explicitly costs nothing and is defined everywhere. Little-endian byte order,
+// matching what as_uint4()/as_ushort8() produced on the compilers that were already correct
+// -- so the emitted bit patterns are unchanged.
+#define PACK_U32(p, i)    ( ((uint)(p)[(i) + 0])       | \
+                            ((uint)(p)[(i) + 1] <<  8) | \
+                            ((uint)(p)[(i) + 2] << 16) | \
+                            ((uint)(p)[(i) + 3] << 24) )
+
+#define UNPACK_U32(p, i, v)                        \
+    do {                                           \
+        (p)[(i) + 0] = (uchar)( (v)        & 0xFF); \
+        (p)[(i) + 1] = (uchar)(((v) >>  8) & 0xFF); \
+        (p)[(i) + 2] = (uchar)(((v) >> 16) & 0xFF); \
+        (p)[(i) + 3] = (uchar)(((v) >> 24) & 0xFF); \
+    } while (0)
+
 #define QK4_0                   32
 #define QR4_0                   2
 #define QK4_1                   32
@@ -320,12 +344,9 @@ kernel void kernel_convert_block_q4_0_trans4_ns(
     dst_d[dst_blk_offset] = b->d;
 
     // extract quantization and unshuffle
-    ushort8 pre_block = ((global ushort8 *)(&(b->qs[0])))[0];
-
-    ushort8 post_block = (ushort8)(0);
-
-    uchar * pre_block_ptr = (uchar *)(&pre_block);
-    uchar * post_block_ptr = (uchar *)(&post_block);
+    uchar pre_block_ptr[16];
+    for (int k = 0; k < 16; ++k) { pre_block_ptr[k] = b->qs[k]; }
+    uchar post_block_ptr[16];
 
     for (int i = 0; i < QK4_0 / 4; ++i) {
         uchar x0 = pre_block_ptr[2*i + 0];
@@ -335,7 +356,11 @@ kernel void kernel_convert_block_q4_0_trans4_ns(
         post_block_ptr[i + QK4_0 / 4] = convert_uchar((x0 & 0xF0) >> 4) | convert_uchar(x1 & 0xF0);
     }
 
-    uint4 q_block = as_uint4(post_block);
+    uint4 q_block;
+    q_block.x = PACK_U32(post_block_ptr,  0);
+    q_block.y = PACK_U32(post_block_ptr,  4);
+    q_block.z = PACK_U32(post_block_ptr,  8);
+    q_block.w = PACK_U32(post_block_ptr, 12);
 
     uint offset = i02 * ne00_blk * ne01 * 4 + i00 * ne01 * 4 + i01;
     dst_q[offset] = q_block.x;
@@ -374,11 +399,12 @@ kernel void kernel_restore_block_q4_0_trans4_ns(
     q_block.z = src_q[src_q_offset + ne01 * 2];
     q_block.w = src_q[src_q_offset + ne01 * 3];
 
-    ushort8 post_block = as_ushort8(q_block);
-    ushort8 pre_block = (ushort8)(0);
-
-    uchar * pre_block_ptr = (uchar *)(&pre_block);
-    uchar * post_block_ptr = (uchar *)(&post_block);
+    uchar post_block_ptr[16];
+    UNPACK_U32(post_block_ptr,  0, q_block.x);
+    UNPACK_U32(post_block_ptr,  4, q_block.y);
+    UNPACK_U32(post_block_ptr,  8, q_block.z);
+    UNPACK_U32(post_block_ptr, 12, q_block.w);
+    uchar pre_block_ptr[16];
 
     for (int i = 0; i < QK4_0 / 4; ++i) {
         uchar x0 = post_block_ptr[i + 0];
@@ -388,7 +414,7 @@ kernel void kernel_restore_block_q4_0_trans4_ns(
         pre_block_ptr[2 * i + 1] = convert_uchar((x0 & 0xF0) >> 4) | convert_uchar(x1 & 0xF0);
     }
 
-    ((__global ushort8 *)(&(b->qs[0])))[0] = pre_block;
+    for (int k = 0; k < 16; ++k) { b->qs[k] = pre_block_ptr[k]; }
 }
 
 //------------------------------------------------------------------------------
@@ -510,12 +536,9 @@ kernel void kernel_convert_block_q4_1_trans4_ns(
     dst_m[dst_blk_offset] = b->m;
 
     // extract quantization and unshuffle
-    ushort8 pre_block = ((global ushort8 *)(&(b->qs[0])))[0];
-
-    ushort8 post_block = (ushort8)(0);
-
-    uchar * pre_block_ptr = (uchar *)(&pre_block);
-    uchar * post_block_ptr = (uchar *)(&post_block);
+    uchar pre_block_ptr[16];
+    for (int k = 0; k < 16; ++k) { pre_block_ptr[k] = b->qs[k]; }
+    uchar post_block_ptr[16];
 
     for (int i = 0; i < QK4_1 / 4; ++i) {
         uchar x0 = pre_block_ptr[2*i + 0];
@@ -525,7 +548,11 @@ kernel void kernel_convert_block_q4_1_trans4_ns(
         post_block_ptr[i + QK4_1 / 4] = convert_uchar((x0 & 0xF0) >> 4) | convert_uchar(x1 & 0xF0);
     }
 
-    uint4 q_block = as_uint4(post_block);
+    uint4 q_block;
+    q_block.x = PACK_U32(post_block_ptr,  0);
+    q_block.y = PACK_U32(post_block_ptr,  4);
+    q_block.z = PACK_U32(post_block_ptr,  8);
+    q_block.w = PACK_U32(post_block_ptr, 12);
 
     uint offset = i02 * ne00_blk * ne01 * 4 + i00 * ne01 * 4 + i01;
     dst_q[offset] = q_block.x;
@@ -566,11 +593,12 @@ kernel void kernel_restore_block_q4_1_trans4_ns(
     q_block.z = src_q[src_q_offset + ne01 * 2];
     q_block.w = src_q[src_q_offset + ne01 * 3];
 
-    ushort8 post_block = as_ushort8(q_block);
-    ushort8 pre_block = (ushort8)(0);
-
-    uchar * pre_block_ptr = (uchar *)(&pre_block);
-    uchar * post_block_ptr = (uchar *)(&post_block);
+    uchar post_block_ptr[16];
+    UNPACK_U32(post_block_ptr,  0, q_block.x);
+    UNPACK_U32(post_block_ptr,  4, q_block.y);
+    UNPACK_U32(post_block_ptr,  8, q_block.z);
+    UNPACK_U32(post_block_ptr, 12, q_block.w);
+    uchar pre_block_ptr[16];
 
     for (int i = 0; i < QK4_0 / 4; ++i) {
         uchar x0 = post_block_ptr[i + 0];
@@ -580,7 +608,7 @@ kernel void kernel_restore_block_q4_1_trans4_ns(
         pre_block_ptr[2 * i + 1] = convert_uchar((x0 & 0xF0) >> 4) | convert_uchar(x1 & 0xF0);
     }
 
-    ((__global ushort8 *)(&(b->qs[0])))[0] = pre_block;
+    for (int k = 0; k < 16; ++k) { b->qs[k] = pre_block_ptr[k]; }
 }
 
 //------------------------------------------------------------------------------
@@ -710,11 +738,9 @@ kernel void kernel_convert_block_q5_0_trans4_ns(
     dst_qh[dst_blk_offset] = ((global uint *)(&(b->qh[0])))[0];
 
     // extract quantization and unshuffle
-    ushort8 pre_block = ((global ushort8 *)(&(b->qs[0])))[0];
-    ushort8 post_block = (ushort8)(0);
-
-    uchar * pre_block_ptr = (uchar *)(&pre_block);
-    uchar * post_block_ptr = (uchar *)(&post_block);
+    uchar pre_block_ptr[16];
+    for (int k = 0; k < 16; ++k) { pre_block_ptr[k] = b->qs[k]; }
+    uchar post_block_ptr[16];
 
     for (int i = 0; i < QK5_0 / 4; ++i) {
         uchar x0 = pre_block_ptr[2*i + 0];
@@ -724,7 +750,11 @@ kernel void kernel_convert_block_q5_0_trans4_ns(
         post_block_ptr[i + QK5_0 / 4] = convert_uchar((x0 & 0xF0) >> 4) | convert_uchar(x1 & 0xF0);
     }
 
-    uint4 q_block = as_uint4(post_block);
+    uint4 q_block;
+    q_block.x = PACK_U32(post_block_ptr,  0);
+    q_block.y = PACK_U32(post_block_ptr,  4);
+    q_block.z = PACK_U32(post_block_ptr,  8);
+    q_block.w = PACK_U32(post_block_ptr, 12);
 
     uint offset = i02 * ne00_blk * ne01 * 4 + i00 * ne01 * 4 + i01;
     dst_qs[offset] = q_block.x;
@@ -766,11 +796,12 @@ kernel void kernel_restore_block_q5_0_trans4_ns(
     q_block.z = src_qs[src_q_offset + ne01 * 2];
     q_block.w = src_qs[src_q_offset + ne01 * 3];
 
-    ushort8 post_block = as_ushort8(q_block);
-    ushort8 pre_block = (ushort8)(0);
-
-    uchar * pre_block_ptr = (uchar *)(&pre_block);
-    uchar * post_block_ptr = (uchar *)(&post_block);
+    uchar post_block_ptr[16];
+    UNPACK_U32(post_block_ptr,  0, q_block.x);
+    UNPACK_U32(post_block_ptr,  4, q_block.y);
+    UNPACK_U32(post_block_ptr,  8, q_block.z);
+    UNPACK_U32(post_block_ptr, 12, q_block.w);
+    uchar pre_block_ptr[16];
 
     for (int i = 0; i < QK5_0 / 4; ++i) {
         uchar x0 = post_block_ptr[i + 0];
@@ -780,7 +811,7 @@ kernel void kernel_restore_block_q5_0_trans4_ns(
         pre_block_ptr[2 * i + 1] = convert_uchar((x0 & 0xF0) >> 4) | convert_uchar(x1 & 0xF0);
     }
 
-    ((__global ushort8 *)(&(b->qs[0])))[0] = pre_block;
+    for (int k = 0; k < 16; ++k) { b->qs[k] = pre_block_ptr[k]; }
 }
 
 //------------------------------------------------------------------------------
@@ -924,11 +955,9 @@ kernel void kernel_convert_block_q5_1_trans4_ns(
     dst_qh[dst_blk_offset] = ((global uint *)(&(b->qh[0])))[0];
 
     // extract quantization and unshuffle
-    ushort8 pre_block = ((global ushort8 *)(&(b->qs[0])))[0];
-    ushort8 post_block = (ushort8)(0);
-
-    uchar * pre_block_ptr = (uchar *)(&pre_block);
-    uchar * post_block_ptr = (uchar *)(&post_block);
+    uchar pre_block_ptr[16];
+    for (int k = 0; k < 16; ++k) { pre_block_ptr[k] = b->qs[k]; }
+    uchar post_block_ptr[16];
 
     for (int i = 0; i < QK5_1 / 4; ++i) {
         uchar x0 = pre_block_ptr[2*i + 0];
@@ -938,7 +967,11 @@ kernel void kernel_convert_block_q5_1_trans4_ns(
         post_block_ptr[i + QK5_1 / 4] = convert_uchar((x0 & 0xF0) >> 4) | convert_uchar(x1 & 0xF0);
     }
 
-    uint4 q_block = as_uint4(post_block);
+    uint4 q_block;
+    q_block.x = PACK_U32(post_block_ptr,  0);
+    q_block.y = PACK_U32(post_block_ptr,  4);
+    q_block.z = PACK_U32(post_block_ptr,  8);
+    q_block.w = PACK_U32(post_block_ptr, 12);
 
     uint offset = i02 * ne00_blk * ne01 * 4 + i00 * ne01 * 4 + i01;
     dst_qs[offset] = q_block.x;
@@ -982,11 +1015,12 @@ kernel void kernel_restore_block_q5_1_trans4_ns(
     q_block.z = src_qs[src_q_offset + ne01 * 2];
     q_block.w = src_qs[src_q_offset + ne01 * 3];
 
-    ushort8 post_block = as_ushort8(q_block);
-    ushort8 pre_block = (ushort8)(0);
-
-    uchar * pre_block_ptr = (uchar *)(&pre_block);
-    uchar * post_block_ptr = (uchar *)(&post_block);
+    uchar post_block_ptr[16];
+    UNPACK_U32(post_block_ptr,  0, q_block.x);
+    UNPACK_U32(post_block_ptr,  4, q_block.y);
+    UNPACK_U32(post_block_ptr,  8, q_block.z);
+    UNPACK_U32(post_block_ptr, 12, q_block.w);
+    uchar pre_block_ptr[16];
 
     for (int i = 0; i < QK5_1 / 4; ++i) {
         uchar x0 = post_block_ptr[i + 0];
@@ -995,7 +1029,7 @@ kernel void kernel_restore_block_q5_1_trans4_ns(
         pre_block_ptr[2 * i + 0] = convert_uchar(x0 & 0x0F) | convert_uchar((x1 & 0x0F) << 4);
         pre_block_ptr[2 * i + 1] = convert_uchar((x0 & 0xF0) >> 4) | convert_uchar(x1 & 0xF0);
     }
-    ((__global ushort8 *)(&(b->qs[0])))[0] = pre_block;
+    for (int k = 0; k < 16; ++k) { b->qs[k] = pre_block_ptr[k]; }
 }
 
 kernel void kernel_convert_block_q4_k_trans4_ns(
@@ -1688,12 +1722,9 @@ kernel void kernel_convert_block_mxfp4_trans4_ns(
     dst_e[dst_blk_offset] = b->e;
 
     // extract quantization and unshuffle
-    ushort8 pre_block = ((global ushort8 *)(&(b->qs[0])))[0];
-
-    ushort8 post_block = (ushort8)(0);
-
-    uchar * pre_block_ptr = (uchar *)(&pre_block);
-    uchar * post_block_ptr = (uchar *)(&post_block);
+    uchar pre_block_ptr[16];
+    for (int k = 0; k < 16; ++k) { pre_block_ptr[k] = b->qs[k]; }
+    uchar post_block_ptr[16];
 
     for (int i = 0; i < QK_MXFP4 / 4; ++i) {
         uchar x0 = pre_block_ptr[2*i + 0];
@@ -1703,7 +1734,11 @@ kernel void kernel_convert_block_mxfp4_trans4_ns(
         post_block_ptr[i + QK_MXFP4 / 4] = convert_uchar((x0 & 0xF0) >> 4) | convert_uchar(x1 & 0xF0);
     }
 
-    uint4 q_block = as_uint4(post_block);
+    uint4 q_block;
+    q_block.x = PACK_U32(post_block_ptr,  0);
+    q_block.y = PACK_U32(post_block_ptr,  4);
+    q_block.z = PACK_U32(post_block_ptr,  8);
+    q_block.w = PACK_U32(post_block_ptr, 12);
 
     uint offset = i02 * ne00_blk * ne01 * 4 + i00 * ne01 * 4 + i01;
     dst_q[offset] = q_block.x;
@@ -1742,11 +1777,12 @@ kernel void kernel_restore_block_mxfp4_trans4_ns(
     q_block.z = src_q[src_q_offset + ne01 * 2];
     q_block.w = src_q[src_q_offset + ne01 * 3];
 
-    ushort8 post_block = as_ushort8(q_block);
-    ushort8 pre_block = (ushort8)(0);
-
-    uchar * pre_block_ptr = (uchar *)(&pre_block);
-    uchar * post_block_ptr = (uchar *)(&post_block);
+    uchar post_block_ptr[16];
+    UNPACK_U32(post_block_ptr,  0, q_block.x);
+    UNPACK_U32(post_block_ptr,  4, q_block.y);
+    UNPACK_U32(post_block_ptr,  8, q_block.z);
+    UNPACK_U32(post_block_ptr, 12, q_block.w);
+    uchar pre_block_ptr[16];
 
     for (int i = 0; i < QK_MXFP4 / 4; ++i) {
         uchar x0 = post_block_ptr[i + 0];
@@ -1756,7 +1792,7 @@ kernel void kernel_restore_block_mxfp4_trans4_ns(
         pre_block_ptr[2 * i + 1] = convert_uchar((x0 & 0xF0) >> 4) | convert_uchar(x1 & 0xF0);
     }
 
-    ((__global ushort8 *)(&(b->qs[0])))[0] = pre_block;
+    for (int k = 0; k < 16; ++k) { b->qs[k] = pre_block_ptr[k]; }
 }
 
 
