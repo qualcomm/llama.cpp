@@ -12742,7 +12742,7 @@ static ggml_backend_buffer_t ggml_backend_opencl_buffer_type_alloc_buffer(ggml_b
     // after model load). Four-step retry:
     //   1. normal alloc (fast path)
     //   2. clFinish + retry (drains in-flight allocs)
-    //   3. cl_qcom_large_buffer (X2-class driver only)
+    //   3. cl_qcom_large_buffer (X2-class driver only, OpenCL 3.0 only)
     //   4. ALLOC_HOST_PTR (host-pinned pool) — last-resort fallback. This
     //      buffer backs compute scratch read/written by every kernel in the
     //      graph, so kernel accesses fall to host memory and runtime perf
@@ -12752,10 +12752,16 @@ static ggml_backend_buffer_t ggml_backend_opencl_buffer_type_alloc_buffer(ggml_b
         clFinish(backend_ctx->queue);
         mem = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE, size, NULL, &err);
     }
+#if GGML_OPENCL_TARGET_VERSION >= 300
+    // clCreateBufferWithProperties and cl_mem_properties are OpenCL 3.0. Drivers older than
+    // that do not export the symbol, so a build targeting them fails to link. The large
+    // buffer extension is only ever enabled on drivers that are well past 3.0, so this path
+    // is dead there anyway.
     if (err != CL_SUCCESS && backend_ctx->adreno_use_large_buffer) {
         cl_mem_properties props[] = { 0x41A6 /* CL_LARGE_BUFFER_QCOM */, 1, 0 };
         mem = clCreateBufferWithProperties(backend_ctx->context, props, CL_MEM_READ_WRITE, size, NULL, &err);
     }
+#endif
     if (err != CL_SUCCESS) {
         mem = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR,
                              size, NULL, &err);
