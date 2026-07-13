@@ -222,10 +222,14 @@ __kernel void FA_TILE_NAME(
     // This kernel looked like it should be FMA-bound (a half4 mad does ~4 ALU ops per LDS
     // read, unlike the 1:1 of the dp4a loop), but it is NOT: a wrong-math probe that kept
     // every FMA and removed the LDS reads ran it 38.6% faster (18.92 -> 11.62 ms/op).
-    __local KV_DATA_TYPE4 l_k[DK_VEC][BLOCK_N];
+    // Explicitly 16-byte aligned: FA_LK_PAIR below reads two adjacent half4 as one float4,
+    // and the element type only obliges the compiler to align this array to 8. The indices
+    // are even so the offset is a multiple of 16, but the base has to be too, and relying
+    // on the compiler to over-align it is relying on luck.
+    __local KV_DATA_TYPE4 l_k[DK_VEC][BLOCK_N] __attribute__((aligned(16)));
 #define FA_LK(ROW, C) l_k[C][ROW]
     // Two adjacent KV rows as one 128-bit local read (half4 pair == 16 B). j is even and
-    // BLOCK_N is even, so &l_k[c][j] is 16 B aligned.
+    // BLOCK_N is even, so &l_k[c][j] is 16 B past a 16 B-aligned base.
 #define FA_LK_PAIR(C, J) as_half8(*(__local const float4 *)(&l_k[C][J]))
 #else
     __local KV_DATA_TYPE4 l_k[BLOCK_N][DK_VEC];
