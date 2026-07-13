@@ -320,6 +320,15 @@ static ggml_cl_version get_opencl_c_version(ggml_cl_version platform_version, cl
     return parse_cl_version(param_value);
 }
 
+static bool adreno_art_compiler_quirks(const ggml_backend_opencl_context *backend_ctx) {
+    if (!backend_ctx || backend_ctx->gpu_family != GPU_FAMILY::ADRENO ||
+        backend_ctx->adreno_cl_compiler_version.type != ADRENO_CL_COMPILER_TYPE::E17) {
+        return false;
+    }
+    const char * env = getenv("GGML_OPENCL_ART_QUIRKS");
+    return !(env && env[0] == '0');
+}
+
 static ADRENO_GPU_GEN get_adreno_gpu_gen(const char *device_name) {
     if (strstr(device_name, "610") || strstr(device_name, "612") ||
         strstr(device_name, "613") || strstr(device_name, "615") ||
@@ -357,6 +366,13 @@ static ADRENO_GPU_GEN get_adreno_gpu_gen(const char *device_name) {
 
     return ADRENO_GPU_GEN::ADRENO_UNKNOWN;
 }
+
+// The art.api37 (E17) shader compiler miscompiles or crashes on several kernels. These are
+// CORRECTNESS workarounds (a compiler SIGSEGV and silently garbage weights), so they are
+// keyed on the compiler class and stay ON until a fixed compiler is verified -- they do not
+// lift themselves on a version bump. GGML_OPENCL_ART_QUIRKS=0 turns them all off in one run,
+// which is how a new compiler gets re-verified without a rebuild.
+static bool adreno_art_compiler_quirks(const ggml_backend_opencl_context *backend_ctx);
 
 static ggml_cl_compiler_version get_adreno_cl_compiler_version(const char *driver_version) {
     std::string driver_ver_str(driver_version);
