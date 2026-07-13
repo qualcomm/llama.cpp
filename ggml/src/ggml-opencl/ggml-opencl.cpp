@@ -9117,25 +9117,25 @@ inline bool use_adreno_kernels(const ggml_backend_opencl_context *backend_ctx, c
     bool threashold_ok = tensor->ne[0] >= threshold_ne0 && tensor->ne[1] >= threshold_ne1 &&
             tensor->ne[2] == 1 && tensor->ne[3] == 1;
 
-    // The noshuffle (transposed-weight) layout packs 2 rows per 32-bit texel and the
-    // gemv reads it with a ne01/2 texel stride, so it is only correct when ne01 is a
-    // multiple of 128 -- an odd ne01 truncates the stride and misaligns every odd
-    // column of the transposed layout. That is a property of the LAYOUT, not of one
-    // quant: it was first hit on q6_K (granitemoe lm_head, odd vocab 49155) and gated
-    // there, but q4_K / q5_K / q8_0 / q1_0 read the same 2-row-texel packing and are
-    // equally wrong for an odd ne01 (test-backend-ops MUL_MAT m=6680,k=3072 -> ERR ~1.0
-    // on every one of them). Gate the layout itself.
+    // The noshuffle (transposed-weight) layout packs 2 rows per 32-bit texel, and the row
+    // blocking only works out when ne01 is a multiple of 64 -- otherwise the gemv reads the
+    // transposed layout at a truncated stride and returns garbage. That is a property of the
+    // LAYOUT, not of one quant: it was first hit on q6_K (granitemoe lm_head, odd vocab
+    // 49155) and gated there, but q4_K / q5_K / q8_0 / q1_0 read the same packing and are
+    // equally wrong (test-backend-ops MUL_MAT m=6680, k=3072 -> ERR ~1.0 on every one).
     //
-    // Not a perf concern in practice: real transformer weights (hidden / FFN / vocab)
-    // are multiples of 128, so this only diverts genuinely odd shapes (e.g. Falcon-H1's
-    // ssm_in, ne01=6680) to the correct general path.
+    // ⚠️ The bound is % 64, NOT % 128. Both witnesses that FAIL (6680, 49155) are not even
+    // multiples of 16, while gpt-oss-20b's q8_0 attention weights are ne01 = 2880 -- a
+    // multiple of 64 but NOT of 128 -- and are correct. Gating at % 128 declines them and
+    // costs 22% of gpt-oss prefill (pp512 626 -> 475) for nothing. Do not tighten this
+    // without a shape that actually fails.
     switch (tensor->type) {
         case GGML_TYPE_Q4_K:
         case GGML_TYPE_Q5_K:
         case GGML_TYPE_Q6_K:
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_Q1_0:
-            return threashold_ok && tensor->ne[1] % 128 == 0;
+            return threashold_ok && tensor->ne[1] % 64 == 0;
         default:
             break;
     }
