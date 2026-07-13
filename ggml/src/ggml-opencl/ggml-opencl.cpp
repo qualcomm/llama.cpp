@@ -56,6 +56,11 @@ typedef const void * (*get_adreno_bin_kernel_func_t)(
 #include <set>
 #include <unordered_set>
 
+#ifdef __linux__
+#include <dirent.h>
+#include <sched.h>
+#endif
+
 #undef MIN
 #undef MAX
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
@@ -6615,8 +6620,12 @@ static std::vector<ggml_backend_device> ggml_opencl_probe_devices(ggml_backend_r
     }
     properties.push_back(0);
 
+    const auto tids_before_context = ggml_cl_thread_ids();
+
     CL_CHECK(
         (shared_context = clCreateContext(properties.data(), device_ids.size(), device_ids.data(), NULL, NULL, &err), err));
+
+    ggml_cl_pin_driver_threads(tids_before_context);
 
     for (auto dev = candidate_devices, dev_end = candidate_devices + n_candidate_devices; dev != dev_end; dev++) {
         GGML_LOG_INFO("\nggml_opencl: device: '%s (%s)'\n", dev->name, dev->version);
