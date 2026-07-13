@@ -243,15 +243,6 @@ static ggml_cl_version get_opencl_c_version(ggml_cl_version platform_version, cl
     return parse_cl_version(param_value);
 }
 
-static bool adreno_art_compiler_quirks(const ggml_backend_opencl_context *backend_ctx) {
-    if (!backend_ctx || backend_ctx->gpu_family != GPU_FAMILY::ADRENO ||
-        backend_ctx->adreno_cl_compiler_version.type != ADRENO_CL_COMPILER_TYPE::E17) {
-        return false;
-    }
-    const char * env = getenv("GGML_OPENCL_ART_QUIRKS");
-    return !(env && env[0] == '0');
-}
-
 static ADRENO_GPU_GEN get_adreno_gpu_gen(const char *device_name) {
     if (strstr(device_name, "730") ||
         strstr(device_name, "740") ||
@@ -280,6 +271,7 @@ static ADRENO_GPU_GEN get_adreno_gpu_gen(const char *device_name) {
 // keyed on the compiler class and stay ON until a fixed compiler is verified -- they do not
 // lift themselves on a version bump. GGML_OPENCL_ART_QUIRKS=0 turns them all off in one run,
 // which is how a new compiler gets re-verified without a rebuild.
+struct ggml_backend_opencl_context;
 static bool adreno_art_compiler_quirks(const ggml_backend_opencl_context *backend_ctx);
 
 static ggml_cl_compiler_version get_adreno_cl_compiler_version(const char *driver_version) {
@@ -6954,8 +6946,25 @@ inline bool use_adreno_kernels(const ggml_backend_opencl_context *backend_ctx, c
     return threashold_ok;
 }
 
+static bool adreno_art_compiler_quirks(const ggml_backend_opencl_context *backend_ctx) {
+    if (!backend_ctx || backend_ctx->gpu_family != GPU_FAMILY::ADRENO ||
+        backend_ctx->adreno_cl_compiler_version.type != ADRENO_CL_COMPILER_TYPE::E17) {
+        return false;
+    }
+    const char * env = getenv("GGML_OPENCL_ART_QUIRKS");
+    return !(env && env[0] == '0');
+}
+
 inline bool use_adreno_moe_kernels(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor) {
-    GGML_UNUSED(backend_ctx);
+    // The art.api37 (E17) compiler miscompiles the *_trans4_ns weight-convert kernels this
+    // layout depends on, so every expert weight routed through it is garbage and MoE models
+    // emit nonsense. Decline the layout there: the quants with a general mul_mat_id kernel
+    // fall back to it, and the rest are declined to CPU by ggml_opencl_supports_op. Both the
+    // convert in set_tensor and the dispatch in ggml_cl_mul_mat_id key off this predicate,
+    // so the buffer layout and the kernel reading it stay in agreement.
+    if (adreno_art_compiler_quirks(backend_ctx)) {
+        return false;
+    }
     int ne01 = tensor->ne[1];
     return (((strstr(tensor->name, "ffn") != NULL) && (strstr(tensor->name, "exps") != NULL)) || (strstr(tensor->name, "as") != NULL)) && (ne01 % 32 == 0);
 }
