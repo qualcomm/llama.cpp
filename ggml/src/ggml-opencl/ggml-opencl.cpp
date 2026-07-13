@@ -8,6 +8,10 @@
 #endif
 
 #include "ggml-opencl.h"
+#include <chrono>
+#ifndef _WIN32
+#include <dlfcn.h>
+#endif
 #include "ggml-backend.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
@@ -1290,6 +1294,45 @@ struct ggml_backend_opencl_context {
         }
 #else
         GGML_UNUSED(tensor);
+        // Dispatch-submission profile (GGML_OPENCL_ENQ_PROF=1). Splits the per-dispatch host
+        // cost in two: time spent INSIDE clEnqueueNDRangeKernel (i.e. blocked on driver
+        // backpressure) versus the ggml host work BETWEEN enqueues. That split is what
+        // identified the OpenMP spin above -- enqueue was blocking ~440 us/call while ggml's
+        // own host work was only ~60 us -- and it is the tool for the idle time that remains
+        // (the GPU is still only ~25% busy during decode on the 850).
+        static const bool enq_prof = getenv("GGML_OPENCL_ENQ_PROF") != nullptr;
+        if (enq_prof) {
+            using clk = std::chrono::steady_clock;
+            static double   t_enq = 0, t_host = 0, t_max = 0;
+            static uint64_t n = 0, n_slow = 0;
+            static clk::time_point last_end;
+            static bool have_last = false;
+
+            const clk::time_point t0 = clk::now();
+            if (have_last) {
+                t_host += std::chrono::duration<double, std::micro>(t0 - last_end).count();
+            }
+            CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, work_dim, NULL, global_work_size, local_work_size, 0, NULL, NULL));
+            const clk::time_point t1 = clk::now();
+
+            const double dt = std::chrono::duration<double, std::micro>(t1 - t0).count();
+            t_enq += dt;
+            if (dt > t_max)   t_max = dt;
+            if (dt > 1000.0)  n_slow++;
+            last_end = t1;
+            have_last = true;
+            ++n;
+
+            if (n % 2000 == 0) {
+                fprintf(stderr,
+                    "[ENQ] n=%llu | clEnqueue: mean %7.1f us  max %8.0f us  >1ms %llu (%.1f%%) "
+                    "| ggml host between enqueues: mean %7.1f us\n",
+                    (unsigned long long) n, t_enq / n, t_max,
+                    (unsigned long long) n_slow, 100.0 * n_slow / n, t_host / n);
+                fflush(stderr);
+            }
+            return;
+        }
         CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, work_dim, NULL, global_work_size, local_work_size, 0, NULL, NULL));
 #endif
     }
@@ -6170,6 +6213,67 @@ namespace /* anonymous */ {
 extern struct ggml_backend_device_i ggml_backend_opencl_device_i;
 }
 
+// Stop the OpenMP runtime's idle worker threads from spin-waiting.
+//
+// ggml-cpu is (usually) built against libomp, whose workers spin for KMP_BLOCKTIME after
+// every parallel region before they sleep -- 200 ms by default, i.e. effectively forever
+// between tokens. Even with the graph fully offloaded the CPU backend still runs an op or
+// two per token, so every worker spins continuously, saturates the CPU, and starves the
+// GPU driver's command-submission thread. The GPU then goes idle waiting for work while
+// clEnqueueNDRangeKernel BLOCKS in the caller: on the Adreno 850 it blocked for a mean of
+// 440 us per dispatch and the GPU sat idle ~84% of decode. Dropping the blocktime lets the
+// workers sleep and hands that CPU back to the driver.
+//
+// Measured on the Adreno 850 (Qwen3-4B-Q4_0, -fa 0, interleaved A/B/B/A): tg32 3.96 ->
+// 6.59 t/s (+66.5%), prefill unaffected (pp512 349.0 -> 343.7, inside this device's
+// run-to-run wander).
+//
+// It is only demonstrated to help where the driver is actually starved, so it is not applied
+// everywhere. On a device that is NOT starved there is nothing to win back, and the CPU ops
+// the graph still runs each token pay a futex wake instead of landing on a hot spinning
+// thread. On the Adreno 840 that predicted cost did not actually materialize -- an
+// interleaved A/B/B/A at a stable clock came out NEUTRAL (tg32 17.43/17.54 with the default,
+// 17.44/17.48 with the workers asleep: no difference outside noise) -- so there is no
+// evidence it hurts either. Absent a measured win on any driver but one, default it on only
+// for the driver where the starvation was measured: the "unrecognized compiler" Adreno
+// (art.api37 / E17.xx), the same signature this file already uses to decline FA and to steer
+// the dp4a paths.
+//
+// GGML_OPENCL_KMP_BLOCKTIME=<ms> overrides the gate and applies that value on ANY device --
+// which is how the numbers above were taken, and how to try it on a device you suspect is
+// starved. Negative leaves the runtime's setting alone.
+//
+// Resolved dynamically, so this is a no-op when the process is not linked against libomp
+// (MSVC's vcomp, GOMP, or no OpenMP at all) -- there is no build-time dependency on the
+// OpenMP runtime.
+static void ggml_cl_quiesce_omp_threads(ggml_backend_opencl_context * backend_ctx) {
+    int blocktime_ms = 0;
+
+    if (const char * env = getenv("GGML_OPENCL_KMP_BLOCKTIME")) {
+        blocktime_ms = atoi(env);
+        if (blocktime_ms < 0) {
+            return;
+        }
+    } else if (!(backend_ctx->gpu_family == ADRENO &&
+                 backend_ctx->adreno_cl_compiler_version.major < 0)) {
+        return;
+    }
+
+#ifndef _WIN32
+    typedef void (*kmp_set_blocktime_t)(int);
+    kmp_set_blocktime_t set_blocktime =
+        (kmp_set_blocktime_t) dlsym(RTLD_DEFAULT, "kmp_set_blocktime");
+    if (set_blocktime) {
+        set_blocktime(blocktime_ms);
+        GGML_LOG_INFO("ggml_opencl: OpenMP blocktime set to %d ms "
+                      "(idle CPU threads would otherwise spin and starve GPU submission)\n",
+                      blocktime_ms);
+    }
+#else
+    GGML_UNUSED(blocktime_ms);
+#endif
+}
+
 // Look for available and suitable devices.
 static std::vector<ggml_backend_device> ggml_opencl_probe_devices(ggml_backend_reg * reg) {
     std::vector<ggml_backend_device> found_devices;
@@ -6646,6 +6750,9 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
     backend_ctx->driver_version = driver_version;
 
     backend_ctx->adreno_cl_compiler_version = get_adreno_cl_compiler_version(driver_version);
+
+    ggml_cl_quiesce_omp_threads(backend_ctx.get());
+
     backend_ctx->has_vector_subgroup_broadcast =
         (backend_ctx->adreno_cl_compiler_version.type == E031 && backend_ctx->adreno_cl_compiler_version.major >= 47) ||
         (backend_ctx->adreno_cl_compiler_version.type == DX   && backend_ctx->adreno_cl_compiler_version.major >= 17);
