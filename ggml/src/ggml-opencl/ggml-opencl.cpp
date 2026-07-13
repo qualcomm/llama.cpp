@@ -18691,6 +18691,19 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             // so a multi-stream batched attention op (ne03 > 1, several sequences in one
             // ubatch) would leave streams 1.. of dst unwritten while stream 0 computes
             ne03 == 1 && ne13 == 1 &&
+            // These kernels are correct on every Adreno, but they are not faster on every
+            // Adreno. Measured against the generic mul_mm path at prefill:
+            //
+            //   Adreno 740   +75% @pp512, +289% @pp2048   (the generic f16 mul_mm is
+            //                                              pathological there: 94% of GPU time)
+            //   Adreno 840   +2.6% .. +10%
+            //   Adreno X2    +4% / +9% / +11% @pp512/2048/4096
+            //   Adreno X1E   -2.8% / -8.5% / -18.4%       <-- loses, and worse with depth
+            //
+            // So decline them on X1E and let it keep the generic path. This is a carve-out
+            // for one part, not a capability level: X1E sits between two generations that
+            // both win, so there is no ordering of "capability" that expresses it.
+            backend_ctx->adreno_gen != ADRENO_GPU_GEN::X1E &&
             // dst is wrapped with image1d_buffer, the size limit applies, also src0
             (ne0 * ne1 * dst->ne[2] * dst->nb[0] / 4 <= backend_ctx->image_max_buffer_size)) {
             // For KQ
