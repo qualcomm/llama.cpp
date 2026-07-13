@@ -1244,6 +1244,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         compile_opts += " -qcom-enable-large-buffer ";
     }
 
+
     backend_ctx->kernel_compile_opts = compile_opts;
 
     GGML_LOG_INFO("ggml_opencl: loading OpenCL kernels");
@@ -6924,7 +6925,19 @@ inline bool use_adreno_kernels(const ggml_backend_opencl_context *backend_ctx, c
 }
 
 inline bool use_adreno_moe_kernels(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor) {
-    GGML_UNUSED(backend_ctx);
+    // The Adreno MoE weight layout is built by the *_trans4_ns converts in cvt.cl, which
+    // alias a private (register-resident) ushort8 through a uchar*. That is type punning of
+    // a value the optimizer is free to keep in registers, and the A7X compiler (E031.41)
+    // miscompiles it: every expert weight routed through the layout comes out garbage, and
+    // MoE models emit nonsense. Decline the layout on the A7X.
+    //
+    // The quants that have a general mul_mat_id kernel fall back to it (still on GPU); the
+    // rest are declined to CPU by ggml_opencl_supports_op. Both the convert in set_tensor
+    // and the dispatch in ggml_cl_mul_mat_id key off this one predicate, so the buffer
+    // layout and the kernel that reads it can never disagree.
+    if (backend_ctx && backend_ctx->adreno_gen == ADRENO_GPU_GEN::A7X) {
+        return false;
+    }
     int ne01 = tensor->ne[1];
     return (((strstr(tensor->name, "ffn") != NULL) && (strstr(tensor->name, "exps") != NULL)) || (strstr(tensor->name, "as") != NULL)) && (ne01 % 32 == 0);
 }
