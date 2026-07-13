@@ -699,6 +699,10 @@ struct ggml_backend_opencl_context {
     bool fp16_support;
     bool half_denorm_support = false;        // CL_DEVICE_HALF_FP_CONFIG & CL_FP_DENORM (A7X flushes f16 denorms)
     bool has_vector_subgroup_broadcast;
+    // Some Adreno compilers cannot build a program that holds more than one kernel: they
+    // crash or exhaust the host heap, while each of those kernels compiles fine on its own.
+    // Such a device gets one program per kernel.
+    bool split_kernel_programs = false;
     bool has_subgroup_shuffle = false;       // cl_khr_subgroup_shuffle or cl_qcom_subgroup_shuffle
     bool has_integer_dot      = false;       // cl_khr_integer_dot_product or cl_qcom_dot_product8
     bool has_qcom_subgroup_shuffle = false;  // specifically cl_qcom_subgroup_shuffle
@@ -1622,6 +1626,30 @@ static cl_program build_program_from_source(ggml_backend_opencl_context * backen
     }
     return p;
 }
+
+static cl_program cl_program_for_kernel(ggml_backend_opencl_context * backend_ctx,
+                                        const std::string & kernel_src,
+                                        const std::string & opts,
+                                        cl_program & shared, int idx) {
+    if (!backend_ctx->split_kernel_programs) {
+        if (!shared) {
+            shared = build_program_from_source(backend_ctx->context, backend_ctx->device,
+                                               kernel_src.c_str(), opts);
+        }
+        return shared;
+    }
+    return build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(),
+                                     opts + " -DGGML_CL_ONLY=" + std::to_string(idx));
+}
+
+// Returns the program a kernel should be created from. Where a program may hold only one
+// kernel, each kernel is compiled from its own program, selected in the .cl source with
+// -DGGML_CL_ONLY=<idx> (idx being the kernel's position in the file). Everywhere else the
+// file is built once and shared, with GGML_CL_ONLY undefined so every kernel is emitted.
+static cl_program cl_program_for_kernel(ggml_backend_opencl_context * backend_ctx,
+                                        const std::string & kernel_src,
+                                        const std::string & opts,
+                                        cl_program & shared, int idx);
 
 static cl_program build_program_from_binary(cl_context ctx, cl_device_id dev, const char* program_buffer, const std::string &compile_opts, size_t bin_size = 0) {
     cl_program p;
@@ -2630,11 +2658,11 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         backend_ctx->program_mul_mv_f16_f32_l4 =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
 
-        CL_CHECK((backend_ctx->kernel_mul_mat_f16_f32_l4   = clCreateKernel(backend_ctx->program_mul_mv_f16_f32_l4, "kernel_mul_mat_f16_f32_l4", &err), err));
-        CL_CHECK((backend_ctx->kernel_mul_mat_f16_f32_l4_dr = clCreateKernel(backend_ctx->program_mul_mv_f16_f32_l4, "kernel_mul_mat_f16_f32_l4_dr", &err), err));
+        CL_CHECK((backend_ctx->kernel_mul_mat_f16_f32_l4   = clCreateKernel(cl_program_for_kernel(backend_ctx, kernel_src, compile_opts, shared_l4, 1), "kernel_mul_mat_f16_f32_l4", &err), err));
+        CL_CHECK((backend_ctx->kernel_mul_mat_f16_f32_l4_dr = clCreateKernel(cl_program_for_kernel(backend_ctx, kernel_src, compile_opts, shared_l4, 2), "kernel_mul_mat_f16_f32_l4_dr", &err), err));
         if (backend_ctx->gpu_family == ADRENO) {
-            CL_CHECK((backend_ctx->kernel_mul_mat_f16_f32_l4_dr_ls = clCreateKernel(backend_ctx->program_mul_mv_f16_f32_l4, "kernel_mul_mat_f16_f32_l4_dr_ls", &err), err));
-            CL_CHECK((backend_ctx->kernel_mul_mat_f16_f32_l4_dr_lq = clCreateKernel(backend_ctx->program_mul_mv_f16_f32_l4, "kernel_mul_mat_f16_f32_l4_dr_lq", &err), err));
+            CL_CHECK((backend_ctx->kernel_mul_mat_f16_f32_l4_dr_ls = clCreateKernel(cl_program_for_kernel(backend_ctx, kernel_src, compile_opts, shared_l4, 3), "kernel_mul_mat_f16_f32_l4_dr_ls", &err), err));
+            CL_CHECK((backend_ctx->kernel_mul_mat_f16_f32_l4_dr_lq = clCreateKernel(cl_program_for_kernel(backend_ctx, kernel_src, compile_opts, shared_l4, 4), "kernel_mul_mat_f16_f32_l4_dr_lq", &err), err));
         }
 
         cl_int err_x8 = CL_SUCCESS;
@@ -3337,10 +3365,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
 
-        CL_CHECK((backend_ctx->kernel_mean_f32 = clCreateKernel(prog, "kernel_mean_f32", &err), err));
-        CL_CHECK((backend_ctx->kernel_mean_f32_4 = clCreateKernel(prog, "kernel_mean_f32_4", &err), err));
-
-        CL_CHECK(clReleaseProgram(prog));
+        CL_CHECK((backend_ctx->kernel_mean_f32 = clCreateKernel(cl_program_for_kernel(backend_ctx, kernel_src, compile_opts, shared_mean, 1), "kernel_mean_f32", &err), err));
+        CL_CHECK((backend_ctx->kernel_mean_f32_4 = clCreateKernel(cl_program_for_kernel(backend_ctx, kernel_src, compile_opts, shared_mean, 2), "kernel_mean_f32_4", &err), err));
         GGML_LOG_CONT(".");
     }
 
@@ -3375,8 +3401,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         backend_ctx->program_sum_rows_f32 =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
 
-        CL_CHECK((backend_ctx->kernel_sum_rows_f32 = clCreateKernel(backend_ctx->program_sum_rows_f32, "kernel_sum_rows_f32", &err), err));
-        CL_CHECK((backend_ctx->kernel_sum_rows_f32_4 = clCreateKernel(backend_ctx->program_sum_rows_f32, "kernel_sum_rows_f32_4", &err), err));
+        CL_CHECK((backend_ctx->kernel_sum_rows_f32 = clCreateKernel(cl_program_for_kernel(backend_ctx, kernel_src, compile_opts, shared_sum_rows, 1), "kernel_sum_rows_f32", &err), err));
+        CL_CHECK((backend_ctx->kernel_sum_rows_f32_4 = clCreateKernel(cl_program_for_kernel(backend_ctx, kernel_src, compile_opts, shared_sum_rows, 2), "kernel_sum_rows_f32_4", &err), err));
         GGML_LOG_CONT(".");
     }
 
@@ -3392,10 +3418,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         cl_program prog;
         prog = build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
 
-        CL_CHECK((backend_ctx->kernel_cumsum_blk = clCreateKernel(prog, "kernel_cumsum_blk", &err), err));
-        CL_CHECK((backend_ctx->kernel_cumsum_add = clCreateKernel(prog, "kernel_cumsum_add", &err), err));
+        CL_CHECK((backend_ctx->kernel_cumsum_blk = clCreateKernel(cl_program_for_kernel(backend_ctx, kernel_src, compile_opts, shared_cumsum, 1), "kernel_cumsum_blk", &err), err));
+        CL_CHECK((backend_ctx->kernel_cumsum_add = clCreateKernel(cl_program_for_kernel(backend_ctx, kernel_src, compile_opts, shared_cumsum, 2), "kernel_cumsum_add", &err), err));
         GGML_LOG_CONT(".");
-        CL_CHECK(clReleaseProgram(prog));
     }
 
     // sigmoid
@@ -3427,8 +3452,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         backend_ctx->program_group_norm =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
 
-        CL_CHECK((backend_ctx->kernel_group_norm         = clCreateKernel(backend_ctx->program_group_norm, "kernel_group_norm", &err), err));
-        CL_CHECK((backend_ctx->kernel_group_norm_mul_add = clCreateKernel(backend_ctx->program_group_norm, "kernel_group_norm_mul_add", &err), err));
+        CL_CHECK((backend_ctx->kernel_group_norm         = clCreateKernel(cl_program_for_kernel(backend_ctx, kernel_src, compile_opts, shared_group_norm, 1), "kernel_group_norm", &err), err));
+        CL_CHECK((backend_ctx->kernel_group_norm_mul_add = clCreateKernel(cl_program_for_kernel(backend_ctx, kernel_src, compile_opts, shared_group_norm, 2), "kernel_group_norm_mul_add", &err), err));
         GGML_LOG_CONT(".");
     }
 
