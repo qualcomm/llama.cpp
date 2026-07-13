@@ -602,13 +602,20 @@ struct ggml_backend_opencl_context {
     // (DK=128 = 4 blocks x 34 B) maps to exactly 34 integer pixels.
     std::map<ImagePoolKey, ImagePoolEntry> kq_img_pool_q8;
 
-    // Pool for the on-device f16 buffer backing the non-FA quantized-K (q8_0/q4_0)
-    // KV-cache dequant path. Keyed by the stable KV-cache device buffer + view offset
-    // so one buffer is reused (and grown) across decode steps instead of being
-    // allocated/freed per attention op. The per-op churn exhausts the allocator on
-    // deep-context 20 GB MoE decode (old clCreateBuffer hit GGML_ASSERT). Buffer stored
-    // in .image; .k_bytes = current capacity. Released at teardown.
-    std::map<ImagePoolKey, ImagePoolEntry> dequant_f16_pool;
+    // Single scratch buffer backing the non-FA quantized-K (q8_0/q4_0) KV-cache dequant
+    // path, reused (and grown) across every attention op and every decode step instead of
+    // being allocated/freed per op. The per-op churn exhausts the allocator on deep-context
+    // 20 GB MoE decode (old clCreateBuffer hit GGML_ASSERT).
+    //
+    // ONE buffer, not one per layer. The dequantized K is consumed by the mul_mat enqueued
+    // immediately after it on the same in-order queue and is dead from then on, so no two
+    // layers ever need their dequant live at the same time. Keying this per KV-cache view
+    // (as it once was) kept n_layers of them resident for the whole run: on Llama-3.2-3B at
+    // n_kv 16384 that is ~34 MB x 28 layers = ~940 MB of scratch, which more than ate the
+    // 0.5x saving of a q8_0 K cache and made -ctk q8_0 OOM at a depth where -ctk f16 ran
+    // (hp-hamoa, Adreno X1-85, per-context memory cap).
+    cl_mem   dequant_f16_scratch       = nullptr;
+    size_t   dequant_f16_scratch_bytes = 0;
 
     // prealloc buffers for src0 and src1
     ggml_cl_buffer prealloc_src0;
@@ -1114,10 +1121,11 @@ struct ggml_backend_opencl_context {
                 if (kv.second.sub_buffer) CL_CHECK(clReleaseMemObject(kv.second.sub_buffer));
             }
             kq_img_pool_q8.clear();
-            for (auto & kv : dequant_f16_pool) {
-                if (kv.second.image) CL_CHECK(clReleaseMemObject(kv.second.image));
+            if (dequant_f16_scratch) {
+                CL_CHECK(clReleaseMemObject(dequant_f16_scratch));
+                dequant_f16_scratch       = nullptr;
+                dequant_f16_scratch_bytes = 0;
             }
-            dequant_f16_pool.clear();
         }
     }
 };
@@ -18148,11 +18156,6 @@ static cl_mem ggml_cl_mul_mat_dequant_quant_to_f16(
     cl_ulong src_nb2;
     cl_ulong src_nb3;
 
-    // Stable identity of this KV-cache view for the dequant_f16_pool (survives the
-    // per-step graph rebuild because the underlying cache device buffer persists).
-    uintptr_t pool_key_buf = 0;
-    cl_ulong  pool_key_off = (cl_ulong) tensor->view_offs;
-
     const bool is_soa = tensor->type == GGML_TYPE_Q4_0
         ? ggml_cl_is_q4_0_soa(tensor)
         : ggml_cl_is_q8_0_soa(tensor);
@@ -18181,7 +18184,6 @@ static cl_mem ggml_cl_mul_mat_dequant_quant_to_f16(
         const int p_ne01 = (int) parent->ne[1];
         if (tensor->type == GGML_TYPE_Q8_0 && enable_adreno_trans_weight(backend_ctx, parent)) {
             auto * extra = (ggml_tensor_extra_cl_q8_0 *) soa_src->extra;
-            pool_key_buf = (uintptr_t) extra->q;
             cl_kernel kernel = backend_ctx->kernel_restore_block_q8_0_trans;
             CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &extra->q));
             CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &extra->d));
@@ -18196,7 +18198,6 @@ static cl_mem ggml_cl_mul_mat_dequant_quant_to_f16(
                    use_adreno_kernels(backend_ctx, parent) &&
                    !use_adreno_moe_kernels(backend_ctx, parent)) {
             auto * extra = (ggml_tensor_extra_cl_q4_0 *) soa_src->extra;
-            pool_key_buf = (uintptr_t) extra->q;
             const size_t size_q = (size_t) ggml_nelements(parent) / blck_size * (blck_size / 2);
             const size_t size_d = (size_t) ggml_nelements(parent) / blck_size * sizeof(ggml_fp16_t);
             cl_int err2 = CL_SUCCESS;
@@ -18230,14 +18231,12 @@ static cl_mem ggml_cl_mul_mat_dequant_quant_to_f16(
                 CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &extra->q));
                 CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &extra->d));
                 CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem), &aos));
-                pool_key_buf = (uintptr_t) extra->q;
             } else {
                 auto * extra = (ggml_tensor_extra_cl_q4_0 *) soa_src->extra;
                 kernel = backend_ctx->kernel_restore_block_q4_0;
                 CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &extra->q));
                 CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &extra->d));
                 CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem), &aos));
-                pool_key_buf = (uintptr_t) extra->q;
             }
 
             const size_t n_blocks = parent_nbytes / block_bytes;
@@ -18265,8 +18264,6 @@ static cl_mem ggml_cl_mul_mat_dequant_quant_to_f16(
         src_nb1    = tensor->nb[1];
         src_nb2    = tensor->nb[2];
         src_nb3    = tensor->nb[3];
-        pool_key_buf = (uintptr_t) extra->data_device;
-        pool_key_off = (cl_ulong) src_offset;
     }
 
     const cl_int nblk0 = (cl_int) (tensor->ne[0] / ggml_blck_size(tensor->type));
@@ -18276,30 +18273,32 @@ static cl_mem ggml_cl_mul_mat_dequant_quant_to_f16(
 
     const size_t out_bytes = (size_t) ggml_nelements(tensor) * sizeof(ggml_fp16_t);
 
-    // Reuse a pooled f16 buffer for this KV-cache view across decode steps instead of
-    // allocating one per attention op — the per-op alloc/free churn exhausts the
-    // allocator on deep-context 20 GB MoE decode. The pool owns the buffer (released at
+    // Reuse ONE grow-on-demand scratch buffer across every attention op and every decode
+    // step, instead of allocating one per op (the per-op alloc/free churn exhausts the
+    // allocator on deep-context 20 GB MoE decode). The context owns it (released at
     // teardown); the caller must NOT release the returned cl_mem.
+    //
+    // A single buffer is safe because the dequantized K is consumed by the mul_mat that is
+    // enqueued immediately after it on the same in-order queue, and is dead from then on --
+    // no two layers' dequants are ever live at once. Keying it per KV-cache view instead
+    // kept one buffer per layer resident for the whole run, which on Llama-3.2-3B at
+    // n_kv 16384 is ~34 MB x 28 layers = ~940 MB and more than ate the 0.5x saving of a
+    // q8_0 K cache: -ctk q8_0 then OOMed at a depth where -ctk f16 still ran.
     cl_mem out = nullptr;
     {
-        auto & pool = backend_ctx->dequant_f16_pool;
-        ggml_backend_opencl_context::ImagePoolKey key{pool_key_buf, (uint64_t) pool_key_off};
-        auto it = pool.find(key);
-        if (it != pool.end() && it->second.k_bytes >= out_bytes && it->second.image) {
-            out = it->second.image;
-        } else {
-            if (it != pool.end()) {
-                if (it->second.image) CL_CHECK(clReleaseMemObject(it->second.image));
-                pool.erase(it);
+        if (backend_ctx->dequant_f16_scratch_bytes < out_bytes) {
+            if (backend_ctx->dequant_f16_scratch) {
+                CL_CHECK(clReleaseMemObject(backend_ctx->dequant_f16_scratch));
+                backend_ctx->dequant_f16_scratch       = nullptr;
+                backend_ctx->dequant_f16_scratch_bytes = 0;
             }
             cl_int err = CL_SUCCESS;
-            out = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE, out_bytes, NULL, &err);
+            cl_mem buf = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE, out_bytes, NULL, &err);
             CL_CHECK(err);
-            ggml_backend_opencl_context::ImagePoolEntry entry;
-            entry.image   = out;
-            entry.k_bytes = out_bytes;
-            pool[key]     = entry;
+            backend_ctx->dequant_f16_scratch       = buf;
+            backend_ctx->dequant_f16_scratch_bytes = out_bytes;
         }
+        out = backend_ctx->dequant_f16_scratch;
     }
 
     cl_kernel dq_kernel = tensor->type == GGML_TYPE_Q8_0
@@ -18930,7 +18929,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 
         ggml_cl_mul_mat(backend, &fake_src0, src1, dst);
 
-        // f16_buf is owned by backend_ctx->dequant_f16_pool and reused across decode
+        // f16_buf is the context's shared dequant scratch, reused across ops and decode
         // steps — do NOT release it here (it is freed at backend teardown).
         return;
     }
