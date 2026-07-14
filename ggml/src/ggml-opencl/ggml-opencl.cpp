@@ -344,19 +344,22 @@ static ggml_cl_version get_opencl_c_version(ggml_cl_version platform_version, cl
 }
 
 static ADRENO_GPU_GEN get_adreno_gpu_gen(const char *device_name) {
-    // Adreno 6xx. The 64x / 65x / 66x parts and the 670 / 680 are one family for our
-    // purposes; they share a compiler generation and none of the paths gated above A7X.
-    // An Adreno 642L reports "Adreno642Lv1", so match the number, not an exact name.
-    if (strstr(device_name, "640") ||
-        strstr(device_name, "642") ||
-        strstr(device_name, "643") ||
-        strstr(device_name, "644") ||
-        strstr(device_name, "650") ||
-        strstr(device_name, "660") ||
-        strstr(device_name, "662") ||
-        strstr(device_name, "663") ||
-        strstr(device_name, "670") ||
-        strstr(device_name, "680")) {
+    // A6X (Adreno 6xx). Named here so the declines below reach it: an Adreno 642L reports
+    // "Adreno (TM) 642L" (or "Adreno642Lv1"), which matched none of the patterns and so was
+    // treated as an unrecognised -- and, by the policy below, brand-new -- part. Match the
+    // number, not an exact name. This is the union of the two lists we had: the low end
+    // (610-630) from the A6X enablement work, and 662/670 from x2ue's roster.
+    if (strstr(device_name, "610") || strstr(device_name, "612") ||
+        strstr(device_name, "613") || strstr(device_name, "615") ||
+        strstr(device_name, "616") || strstr(device_name, "618") ||
+        strstr(device_name, "619") || strstr(device_name, "620") ||
+        strstr(device_name, "630") || strstr(device_name, "640") ||
+        strstr(device_name, "642") || strstr(device_name, "643") ||
+        strstr(device_name, "644") || strstr(device_name, "650") ||
+        strstr(device_name, "660") || strstr(device_name, "662") ||
+        strstr(device_name, "663") || strstr(device_name, "670") ||
+        strstr(device_name, "680") || strstr(device_name, "685") ||
+        strstr(device_name, "690")) {
         return ADRENO_GPU_GEN::A6X;
     }
 
@@ -1711,10 +1714,14 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         compile_opts += " -qcom-enable-large-buffer ";
     }
 
-    // The A7X compiler (E031.41) does not declare the KHR-name sub_group_shuffle_xor,
-    // so the kernels that use it remap to the qcom builtin. Newer Adreno compilers do
-    // declare it and must build the original source.
-    if (backend_ctx->adreno_gen == ADRENO_GPU_GEN::A7X) {
+    // The older Adreno compilers (A7X / E031.41, and the A6X / E031.38) do not declare the
+    // KHR-name sub_group_shuffle_xor, so the kernels that use it remap to the qcom builtin.
+    // Newer Adreno compilers do declare it and must build the original source.
+    //
+    // The A6X is included deliberately: this file's kernels call sub_group_shuffle_xor in
+    // several places, and without the remap those programs fail to COMPILE on that part.
+    if (backend_ctx->adreno_gen == ADRENO_GPU_GEN::A7X ||
+        backend_ctx->adreno_gen == ADRENO_GPU_GEN::A6X) {
         compile_opts += " -DADRENO_OLD_COMPILER=1";
     }
 
@@ -9392,7 +9399,23 @@ inline bool use_adreno_moe_kernels(const ggml_backend_opencl_context *backend_ct
     // GPU_gemm(convert(W)) against CPU_gemm(restore(convert(W))). The original W never enters
     // the comparison, and the convert is only ever checked against its own inverse. Overwrite
     // this buffer with 0xA5 and 73 of 74 mxfp4 MUL_MAT_ID cases still pass.
-    if ((backend_ctx && backend_ctx->adreno_gen == ADRENO_GPU_GEN::A7X) ||
+    //
+    // WHO IS DECLINED, and why it is the union of two rules rather than either one:
+    //   - A7X (740, E031.41) and A6X (642L, E031.38): measured garbage from every MoE model.
+    //   - art.api37 / E17 (850): same, caught by the compiler-version quirk check.
+    //   - ANY UNRECOGNISED Adreno: deliberate. A 642L reports "Adreno (TM) 642L" and an 850
+    //     reports "Adreno850v2"; before the roster below learned those names they matched no
+    //     pattern, fell to ADRENO_UNKNOWN, and were therefore treated as presumed-NEW parts --
+    //     so the decline never fired on the two devices with the worst symptom.
+    //     The two guesses do not cost the same: assume a chip is new and a bad compiler
+    //     silently produces a wrong model; assume it is old and a good compiler merely loses a
+    //     fast path. OPTIMISM IS RIGHT FOR A CAPABILITY GATE AND BACKWARDS FOR A SAFETY GATE.
+    //
+    // Keep both rules. The name roster and the compiler-version quirk catch different parts,
+    // and an unknown part that neither recognises must still land on the safe side.
+    if ((backend_ctx && (backend_ctx->adreno_gen == ADRENO_GPU_GEN::A6X ||
+                         backend_ctx->adreno_gen == ADRENO_GPU_GEN::A7X ||
+                         backend_ctx->adreno_gen == ADRENO_GPU_GEN::ADRENO_UNKNOWN)) ||
         adreno_art_compiler_quirks(backend_ctx)) {
         return false;
     }
