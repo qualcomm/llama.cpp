@@ -1064,6 +1064,17 @@ struct ggml_backend_opencl_context {
     }
 
     void enqueue_ndrange_kernel(cl_kernel kernel, cl_uint work_dim, size_t *global_work_size, size_t *local_work_size, const ggml_tensor * tensor) {
+        // An empty range is a no-op, but the spec says a zero global size is
+        // CL_INVALID_GLOBAL_WORK_SIZE, so enqueuing it is an error rather than nothing. Most
+        // drivers return CL_SUCCESS and do nothing; strict drivers (Adreno 642L, 619) return
+        // -63 and the CL_CHECK below aborts the process. Skip it, which is what every other
+        // driver effectively does. A dimension that is wrongly zero still shows up as a wrong
+        // result. Check first, before the profiling path, so no mode enqueues it.
+        for (cl_uint i = 0; i < work_dim; i++) {
+            if (global_work_size[i] == 0) {
+                return;
+            }
+        }
 #ifdef GGML_OPENCL_PROFILING
         cl_event evt;
         CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, work_dim, NULL, global_work_size, local_work_size, 0, NULL, &evt));
@@ -11939,6 +11950,7 @@ static void ggml_cl_set_rows(ggml_backend_t backend, const ggml_tensor * src0, c
         (size_t)ne03};
     size_t local_work_size[] = {(size_t)nth0, (size_t)rows_per_workgroup, 1};
 
+    // ne01 == 0 makes global_work_size[0] zero here; enqueue_ndrange_kernel drops the empty range.
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
 }
 
