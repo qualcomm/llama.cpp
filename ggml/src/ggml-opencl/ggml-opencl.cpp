@@ -18450,6 +18450,22 @@ static bool ggml_cl_mm_kq_fastpath_on() {
     return on;
 }
 
+// The decode KQV image kernel is OPT-IN and default OFF -- it loses on the only shape it
+// can fire for. Its gate is ne01(DV) == 128 && r2 == 8, i.e. the Qwen3-30B-A3B family, and
+// there the image read is SLOWER than the plain _y8_gqa it replaces: profiled at d8192,
+// decode KQV GPU time 526 ms -> 866 ms (+65%), which costs ~7.5% of tg64 end to end.
+//
+// It was never meant to be on: the block still documents itself as "opt-in via
+// GGML_OPENCL_MM_KQV_GQA_IMG=1". It became default-on by accident when the decode KQ/KQV
+// env knobs were collapsed into one kill switch -- it was left keyed on the *KQ* fastpath
+// predicate, which defaults on -- and that only became visible once the KQKV env gate was
+// removed. Give it back its own knob. The KQ image kernel (a real win) is untouched.
+static bool ggml_cl_mm_kqv_img_on() {
+    static const char * env = getenv("GGML_OPENCL_MM_KQV_GQA_IMG");
+    static const bool   on  = (env != nullptr && env[0] != '0');
+    return on;
+}
+
 static cl_mem ggml_cl_mul_mat_dequant_quant_to_f16(
         ggml_backend_opencl_context * backend_ctx,
         const ggml_tensor *           tensor,
@@ -19907,8 +19923,11 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         //   src0=V (ne00=n_kv, ne01=DV=128, ne02=n_head_kv), src1=softmax(KQ).
         //   r2 = ne12/ne02 = 8 for Qwen3-30B-A3B family.
         // Same generic k_bytes formula handles V's transposed (n_kv-fast) layout.
-        // Opt-in via GGML_OPENCL_MM_KQV_GQA_IMG=1.
-        if (ggml_cl_mm_kq_fastpath_on() &&
+        // Opt-in via GGML_OPENCL_MM_KQV_GQA_IMG=1 -- default OFF, because on the only shape
+        // this can fire for (DV=128, r2=8) the image read LOSES to the plain _y8_gqa below:
+        // 526 ms -> 866 ms of decode KQV GPU time at d8192 (~7.5% of tg64). See
+        // ggml_cl_mm_kqv_img_on().
+        if (ggml_cl_mm_kqv_img_on() &&
             backend_ctx->kernel_mul_mat_f16_f32_l4_y8_gqa_img != nullptr &&
             ne11 == 1 && ne01 == 128 &&
             (ne12 % ne02) == 0 && (ne12 / ne02) == 8 && (ne13 / ne03) == 1) {
