@@ -9160,13 +9160,20 @@ inline bool use_adreno_moe_kernels(const ggml_backend_opencl_context *backend_ct
     // set_tensor and the dispatch in ggml_cl_mul_mat_id key off this predicate, so the buffer
     // layout and the kernel reading it stay in agreement.
     //
-    // ⚠️ The byte-wise rewrite of those converts (the "UB fix") is REVERTED here and the A7X
-    // decline is back to wholesale. The rewrite is byte-equivalent by inspection and it does
-    // fix the 740/A6X, but on the X2-90 it MISCOMPILES: gpt-oss-20b (mxfp4 MoE) degenerates
-    // ("conjug conjug conjug…") on upstream+fix while plain upstream answers "Paris".
-    // test-backend-ops cannot see it — use_adreno_moe_kernels() matches on tensor NAMES
-    // (ffn/exps), which no test tensor has, so the converts are never exercised there.
-    // Do not re-land the rewrite without a real MoE model check on an X2.
+    // The byte-wise rewrite of those converts (the "UB fix") is REVERTED here and the decline
+    // is wholesale. Do not re-land the rewrite: on the X2-90 it MISCOMPILES (gpt-oss-20b, an
+    // mxfp4 MoE, degenerates to "conjug conjug conjug" while plain upstream answers "Paris" --
+    // 48.65% of the converted weight words come out wrong), and it does NOT rescue the 740
+    // either: three different convert formulations produce three DIFFERENT wrong answers there,
+    // so the corruption on that part is not simply a miscompiled convert. Declining the layout
+    // is the fix; rewriting the convert is not.
+    //
+    // A REAL MoE MODEL IS THE ONLY CHECK. test-backend-ops cannot see this bug class, and not
+    // for a reason a new test case can fix: it seeds its reference backend FROM THE DEVICE
+    // (graph_copy -> tensor_copy -> get_tensor -> the restore kernel), so it compares
+    // GPU_gemm(convert(W)) against CPU_gemm(restore(convert(W))). The original W never enters
+    // the comparison, and the convert is only ever checked against its own inverse. Overwrite
+    // this buffer with 0xA5 and 73 of 74 mxfp4 MUL_MAT_ID cases still pass.
     if ((backend_ctx && backend_ctx->adreno_gen == ADRENO_GPU_GEN::A7X) ||
         adreno_art_compiler_quirks(backend_ctx)) {
         return false;
