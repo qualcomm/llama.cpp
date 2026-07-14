@@ -20,6 +20,7 @@
 
 #define N_F32_F32 4
 
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 1
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
 #endif
@@ -116,6 +117,7 @@ kernel void kernel_mul_mat_f32_f32(
         }
     }
 }
+#endif
 
 // kernel_mul_mat_f32_f32 with a fused GELU (tanh-approx) epilogue on the output.
 // Identical matmul math to the kernel above; only the two output writes apply
@@ -124,6 +126,7 @@ kernel void kernel_mul_mat_f32_f32(
 #define GELU_COEF_A    0.044715f
 #define SQRT_2_OVER_PI 0.79788456080286535587989211986876f
 
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 2
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
 #endif
@@ -222,3 +225,4 @@ kernel void kernel_mul_mat_f32_f32_gelu(
         }
     }
 }
+#endif
