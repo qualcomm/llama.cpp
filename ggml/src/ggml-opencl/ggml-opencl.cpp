@@ -114,6 +114,7 @@ enum GPU_FAMILY {
 
 enum ADRENO_GPU_GEN {
     ADRENO_UNKNOWN,
+    A6X,
     A7X,
     A8X,
     X1E,
@@ -243,6 +244,22 @@ static ggml_cl_version get_opencl_c_version(ggml_cl_version platform_version, cl
 }
 
 static ADRENO_GPU_GEN get_adreno_gpu_gen(const char *device_name) {
+    // A6X (Adreno 6xx). Named here so the declines below reach it: an Adreno 642L reports
+    // "Adreno (TM) 642L", which matched none of the patterns and so was treated as an
+    // unrecognised -- and, by the policy below, brand-new -- part.
+    if (strstr(device_name, "610") || strstr(device_name, "612") ||
+        strstr(device_name, "613") || strstr(device_name, "615") ||
+        strstr(device_name, "616") || strstr(device_name, "618") ||
+        strstr(device_name, "619") || strstr(device_name, "620") ||
+        strstr(device_name, "630") || strstr(device_name, "640") ||
+        strstr(device_name, "642") || strstr(device_name, "643") ||
+        strstr(device_name, "644") || strstr(device_name, "650") ||
+        strstr(device_name, "660") || strstr(device_name, "663") ||
+        strstr(device_name, "680") || strstr(device_name, "685") ||
+        strstr(device_name, "690")) {
+        return ADRENO_GPU_GEN::A6X;
+    }
+
     if (strstr(device_name, "730") ||
         strstr(device_name, "740") ||
         strstr(device_name, "750")) {
@@ -6927,15 +6944,30 @@ inline bool use_adreno_kernels(const ggml_backend_opencl_context *backend_ctx, c
 inline bool use_adreno_moe_kernels(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor) {
     // The Adreno MoE weight layout is built by the *_trans4_ns converts in cvt.cl, which
     // alias a private (register-resident) ushort8 through a uchar*. That is type punning of
-    // a value the optimizer is free to keep in registers, and the A7X compiler (E031.41)
+    // a value the optimizer is free to keep in registers, and more than one Adreno compiler
     // miscompiles it: every expert weight routed through the layout comes out garbage, and
-    // MoE models emit nonsense. Decline the layout on the A7X.
+    // MoE models emit nonsense. Confirmed on an Adreno 740 (E031.41) and an Adreno 642L
+    // (E031.38).
+    //
+    // Rewriting the convert does not rescue them. Three separate formulations -- the punned
+    // vector, a private staging array, and a pointer-free arithmetic form -- each produce a
+    // DIFFERENT wrong answer on the 740, while the same binary and model are correct on an
+    // Adreno 840. The convert is one of several miscompiles in that path on these compilers,
+    // so the decline is the fix rather than a stopgap.
+    //
+    // An unrecognised Adreno is declined too, and that is deliberate. The two guesses do not
+    // cost the same: assume a chip is new and a bad compiler silently produces a wrong model;
+    // assume it is old and a good compiler merely loses a fast path. Capability gates may be
+    // optimistic about an unknown part -- a new chip should not be stranded at zero
+    // optimisations -- but a safety decline must not be.
     //
     // The quants that have a general mul_mat_id kernel fall back to it (still on GPU); the
     // rest are declined to CPU by ggml_opencl_supports_op. Both the convert in set_tensor
     // and the dispatch in ggml_cl_mul_mat_id key off this one predicate, so the buffer
     // layout and the kernel that reads it can never disagree.
-    if (backend_ctx && backend_ctx->adreno_gen == ADRENO_GPU_GEN::A7X) {
+    if (backend_ctx && (backend_ctx->adreno_gen == ADRENO_GPU_GEN::A6X ||
+                        backend_ctx->adreno_gen == ADRENO_GPU_GEN::A7X ||
+                        backend_ctx->adreno_gen == ADRENO_GPU_GEN::ADRENO_UNKNOWN)) {
         return false;
     }
     int ne01 = tensor->ne[1];
