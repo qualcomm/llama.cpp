@@ -8126,6 +8126,16 @@ static bool ggml_opencl_can_fuse(const struct ggml_cgraph * cgraph, int node_idx
             !ggml_are_same_stride(gate->src[0], up->src[0])) {
             return false;
         }
+        // kernel_gemv_noshuffle_q4_k_f32_glu reads the NOSHUFFLE image layout, which is
+        // only produced at set_tensor time when use_adreno_kernels() accepts the weight.
+        // Below that threshold the weight stays in the plain q4_K layout and the fused
+        // kernel misreads it -> defer to the per-op path. Real FFN gate/up weights are far
+        // above the threshold, so production dispatch is unchanged; this closes a latent
+        // gate defect, not shipping corruption.
+        if (!use_adreno_kernels(backend_ctx, gate->src[0]) ||
+            !use_adreno_kernels(backend_ctx, up->src[0])) {
+            return false;
+        }
         // GLU must read gate as src[0] and up as src[1], no swap (the fused
         // epilogue applies the activation to gate, multiplies by up)
         if (glu->src[0] != gate || glu->src[1] != up) {
