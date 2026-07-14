@@ -1044,6 +1044,7 @@ struct ggml_backend_opencl_context {
     int       kq_dp4a_cols                   = 32;  // query cols per tile (compiled in)
     cl_kernel kernel_mul_mat_q4_0_f32, kernel_mul_mat_q4_0_f32_v;
     cl_kernel kernel_convert_block_q1_0, kernel_restore_block_q1_0;
+    cl_kernel kernel_mul_mat_q4_0_f32_kq_gen = nullptr;
     cl_kernel kernel_mul_mat_q4_0_f32_gqa8_dk128 = nullptr;
     cl_kernel kernel_mul_mat_q4_0_f32_gqa8_dk128_img = nullptr;
     cl_kernel kernel_mul_mat_q4_0_f32_gqa_r4_dk128 = nullptr;
@@ -1107,6 +1108,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mv_q6_K_f32_flat;
     cl_kernel kernel_mul_mv_mxfp4_f32, kernel_mul_mv_mxfp4_f32_flat;
     cl_kernel kernel_mul_mv_q8_0_f32, kernel_mul_mv_q8_0_f32_flat;
+    cl_kernel kernel_mul_mat_q8_0_f32_kq_gen = nullptr;
     cl_kernel kernel_mul_mat_q8_0_f32_gqa8_dk128 = nullptr;
     cl_kernel kernel_mul_mat_q8_0_f32_gqa8_dk128_img = nullptr;
     cl_kernel kernel_mul_mat_q8_0_f32_gqa_r4_dk128 = nullptr;
@@ -2086,6 +2088,11 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 
         CL_CHECK((backend_ctx->kernel_mul_mat_q4_0_f32 = clCreateKernel(backend_ctx->program_mul_mv_q4_0_f32, "kernel_mul_mat_q4_0_f32", &err), err));
         // GQA-coalesced decode KQ for a q4_0 K-cache (DK=128, r2=8). nullptr-on-fail.
+        // Generic decode KQ for a q4_0 K-cache: any GQA ratio, any DK <= 512.
+        cl_int err_q4gen = CL_SUCCESS;
+        backend_ctx->kernel_mul_mat_q4_0_f32_kq_gen =
+            clCreateKernel(backend_ctx->program_mul_mv_q4_0_f32, "kernel_mul_mat_q4_0_f32_kq_gen", &err_q4gen);
+        if (err_q4gen != CL_SUCCESS) backend_ctx->kernel_mul_mat_q4_0_f32_kq_gen = nullptr;
         cl_int err_q4gqa = CL_SUCCESS;
         backend_ctx->kernel_mul_mat_q4_0_f32_gqa8_dk128 =
             clCreateKernel(backend_ctx->program_mul_mv_q4_0_f32, "kernel_mul_mat_q4_0_f32_gqa8_dk128", &err_q4gqa);
@@ -2411,6 +2418,12 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
 
         CL_CHECK((backend_ctx->kernel_mul_mv_q8_0_f32 = clCreateKernel(backend_ctx->program_mul_mv_q8_0_f32, "kernel_mul_mv_q8_0_f32", &err), err));
+        // Generic decode KQ for a q8_0 K-cache: any GQA ratio, any DK <= 512.
+        // Catches the shapes the GQA-coalesced table below misses (e.g. Gemma-4).
+        cl_int err_q8gen = CL_SUCCESS;
+        backend_ctx->kernel_mul_mat_q8_0_f32_kq_gen =
+            clCreateKernel(backend_ctx->program_mul_mv_q8_0_f32, "kernel_mul_mat_q8_0_f32_kq_gen", &err_q8gen);
+        if (err_q8gen != CL_SUCCESS) backend_ctx->kernel_mul_mat_q8_0_f32_kq_gen = nullptr;
         // GQA-coalesced decode KQ for a q8_0 K-cache (DK=128, r2=8). Same program.
         // nullptr-on-failure so an old driver that can't compile it just falls back.
         cl_int err_q8gqa = CL_SUCCESS;
@@ -23247,6 +23260,95 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         }
     }
 
+    // Generic q8_0 decode KQ: any GQA ratio, any DK <= 512 (multiple of 32).
+    // The GQA-coalesced kernels above only cover DK in {128,256} x r2 in {4,8};
+    // a model outside that table (Gemma-4: SWA layers DK=256/r2=2, global layers
+    // DK=512/r2=8) misses every entry and falls into the dequant-to-f16 path below,
+    // which reconstructs the whole K view in f16 on every attention op. This catches
+    // those shapes so K stays q8_0. Slower per row than the coalesced kernels (K is
+    // re-read once per Q-head), hence it runs only after they miss.
+    // Opt out with GGML_OPENCL_MM_KQ_GEN_Q8_0=0.
+    if (src0t == GGML_TYPE_Q8_0 && src1t == GGML_TYPE_F32 &&
+        backend_ctx->kernel_mul_mat_q8_0_f32_kq_gen != nullptr) {
+        static const char * q8gen_env = getenv("GGML_OPENCL_MM_KQ_GEN_Q8_0");
+        static const bool   q8gen_on  = (q8gen_env == nullptr || q8gen_env[0] != '0');
+
+        const int ne00 = src0->ne[0];
+        const int ne01 = src0->ne[1];
+        const int ne02 = src0->ne[2];
+        const int ne03 = src0->ne[3];
+        const int ne11 = src1->ne[1];
+        const int ne12 = src1->ne[2];
+        const int ne13 = src1->ne[3];
+
+        // src0 must be a KV-cache K view, not a model weight: quantized weights are
+        // converted to the SOA layout at set_tensor time and do NOT hold AoS
+        // block_q8_0, which this kernel reads directly. The coalesced gates above
+        // exclude weights implicitly (a weight has r2 == 1, never 4 or 8); this one
+        // must say so explicitly -- requiring a view into the cache buffer and a
+        // real GQA ratio. Without it, test-backend-ops MUL_MAT(q8_0) reads the SOA
+        // buffer as AoS blocks and returns NaN.
+        const bool is_kv_view = (src0->view_src != nullptr) && (ne02 > 0) &&
+                                (ne12 % ne02) == 0 && (ne12 / ne02) >= 2;
+
+        if (q8gen_on && is_kv_view && ne11 == 1 && ne00 >= 32 && ne00 <= 512 && (ne00 % 32) == 0 &&
+            ne03 > 0 && (ne13 % ne03) == 0) {
+            ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *)src0->extra;
+            ggml_tensor_extra_cl * extra1 = (ggml_tensor_extra_cl *)src1->extra;
+            ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
+
+            cl_ulong offset0 = extra0->offset + src0->view_offs;
+            cl_ulong offset1 = extra1->offset + src1->view_offs;
+            cl_ulong offsetd = extrad->offset + dst->view_offs;
+
+            const cl_ulong nb01 = src0->nb[1];
+            const cl_ulong nb02 = src0->nb[2];
+            const cl_ulong nb03 = src0->nb[3];
+            const int      ne10 = src1->ne[0];
+            const cl_ulong nb10 = src1->nb[0];
+            const cl_ulong nb11 = src1->nb[1];
+            const cl_ulong nb12 = src1->nb[2];
+            const cl_ulong nb13 = src1->nb[3];
+            const int      ne0  = dst->ne[0];
+            const int      ne1  = dst->ne[1];
+            const int      r2   = ne12 / ne02;
+            const int      r3   = ne13 / ne03;
+
+            cl_kernel kernel = backend_ctx->kernel_mul_mat_q8_0_f32_kq_gen;
+            cl_uint a = 0;
+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &extra0->data_device));
+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &offset0));
+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &extra1->data_device));
+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &offset1));
+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &extrad->data_device));
+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &offsetd));
+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &ne00));
+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &ne01));
+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &ne02));
+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &nb01));
+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &nb02));
+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &nb03));
+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &ne10));
+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &ne11));
+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &ne12));
+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &nb10));
+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &nb11));
+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &nb12));
+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &nb13));
+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &ne0));
+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &ne1));
+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &r2));
+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &r3));
+
+            const int     nth0   = 64;
+            const int64_t n_wg_x = (ne01 + 3) / 4;   // N_ROWS_Q8GEN = 4
+            size_t global_work_size[] = {(size_t)n_wg_x * nth0, (size_t)1, (size_t)ne12 * ne13};
+            size_t local_work_size[]  = {(size_t)nth0, (size_t)1, 1};
+            backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+            return;
+        }
+    }
+
     // q4_0 K-cache analog of the q8_0 GQA-coalesced decode KQ above (-36% KV DDR
     // vs f16, lossier than q8). Same AoS/non-contig reasoning; must run before the
     // dequant-to-f16 interception below. Default-on; opt out GGML_OPENCL_MM_KQ_GQA_Q4_0=0.
@@ -23604,6 +23706,85 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
     if (ggml_cl_kq_dp4a_on() && !kq_dp4a_rerun && kq_dp4a_shape) {
         ggml_cl_mul_mat_kq_q8_0_dp4a_adreno(backend, src0, src1, dst);
         return;
+    }
+
+    // Generic q4_0 decode KQ: the q4_0 analog of the generic q8_0 kernel above.
+    // Same reasoning, and the same weights-vs-KV-cache guard (quantized weights are
+    // SOA-converted at set_tensor time and do not hold AoS block_q4_0). Runs only
+    // after the coalesced table misses, and before the dequant-to-f16 fallback.
+    // Opt out with GGML_OPENCL_MM_KQ_GEN_Q4_0=0.
+    if (src0t == GGML_TYPE_Q4_0 && src1t == GGML_TYPE_F32 &&
+        backend_ctx->kernel_mul_mat_q4_0_f32_kq_gen != nullptr) {
+        static const char * q4gen_env = getenv("GGML_OPENCL_MM_KQ_GEN_Q4_0");
+        static const bool   q4gen_on  = (q4gen_env == nullptr || q4gen_env[0] != '0');
+
+        const int ne00 = src0->ne[0];
+        const int ne01 = src0->ne[1];
+        const int ne02 = src0->ne[2];
+        const int ne03 = src0->ne[3];
+        const int ne11 = src1->ne[1];
+        const int ne12 = src1->ne[2];
+        const int ne13 = src1->ne[3];
+
+        const bool is_kv_view = (src0->view_src != nullptr) && (ne02 > 0) &&
+                                (ne12 % ne02) == 0 && (ne12 / ne02) >= 2;
+
+        if (q4gen_on && is_kv_view && ne11 == 1 && ne00 >= 32 && ne00 <= 512 && (ne00 % 32) == 0 &&
+            ne03 > 0 && (ne13 % ne03) == 0) {
+            ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *)src0->extra;
+            ggml_tensor_extra_cl * extra1 = (ggml_tensor_extra_cl *)src1->extra;
+            ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
+
+            cl_ulong offset0 = extra0->offset + src0->view_offs;
+            cl_ulong offset1 = extra1->offset + src1->view_offs;
+            cl_ulong offsetd = extrad->offset + dst->view_offs;
+
+            const cl_ulong nb01 = src0->nb[1];
+            const cl_ulong nb02 = src0->nb[2];
+            const cl_ulong nb03 = src0->nb[3];
+            const int      ne10 = src1->ne[0];
+            const cl_ulong nb10 = src1->nb[0];
+            const cl_ulong nb11 = src1->nb[1];
+            const cl_ulong nb12 = src1->nb[2];
+            const cl_ulong nb13 = src1->nb[3];
+            const int      ne0  = dst->ne[0];
+            const int      ne1  = dst->ne[1];
+            const int      r2   = ne12 / ne02;
+            const int      r3   = ne13 / ne03;
+
+            cl_kernel kernel = backend_ctx->kernel_mul_mat_q4_0_f32_kq_gen;
+            cl_uint a = 0;
+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &extra0->data_device));
+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &offset0));
+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &extra1->data_device));
+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &offset1));
+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &extrad->data_device));
+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &offsetd));
+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &ne00));
+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &ne01));
+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &ne02));
+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &nb01));
+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &nb02));
+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &nb03));
+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &ne10));
+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &ne11));
+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &ne12));
+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &nb10));
+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &nb11));
+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &nb12));
+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &nb13));
+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &ne0));
+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &ne1));
+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &r2));
+            CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &r3));
+
+            const int     nth0   = 64;
+            const int64_t n_wg_x = (ne01 + 3) / 4;   // N_ROWS_Q4GEN = 4
+            size_t global_work_size[] = {(size_t)n_wg_x * nth0, (size_t)1, (size_t)ne12 * ne13};
+            size_t local_work_size[]  = {(size_t)nth0, (size_t)1, 1};
+            backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+            return;
+        }
     }
 #endif // GGML_OPENCL_USE_ADRENO_KERNELS
 
