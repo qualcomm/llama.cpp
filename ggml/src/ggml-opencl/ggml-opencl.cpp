@@ -709,7 +709,6 @@ struct ggml_backend_opencl_context {
     bool half_denorm_support = false;        // CL_DEVICE_HALF_FP_CONFIG & CL_FP_DENORM (A7X flushes f16 denorms)
     bool has_vector_subgroup_broadcast;
     bool has_subgroup_shuffle = false;       // cl_khr_subgroup_shuffle or cl_qcom_subgroup_shuffle
-    bool has_integer_dot      = false;       // cl_khr_integer_dot_product or cl_qcom_dot_product8
     bool has_qcom_subgroup_shuffle = false;  // specifically cl_qcom_subgroup_shuffle
     bool has_integer_dot_product = false;    // cl_khr_integer_dot_product (dp4a); kernels #ifdef on the same name
     cl_uint compute_units = 0;               // CL_DEVICE_MAX_COMPUTE_UNITS (scale axis for tuning formulas)
@@ -4147,7 +4146,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
     }
 
     // gemm_noshuffle_q5_0_q8_1_dp4a (dp4a dense q5_0 prefill GEMM)
-    if (backend_ctx->has_integer_dot) {
+    if (backend_ctx->has_integer_dot_product) {
 #ifdef GGML_OPENCL_EMBED_KERNELS
         const std::string kernel_src {
             #include "gemm_noshuffle_q5_0_q8_1_dp4a.cl.h"
@@ -4235,7 +4234,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
     }
 
     // gemm_noshuffle_iq4_nl_q8_1_dp4a (dp4a dense IQ4_NL prefill GEMM)
-    if (backend_ctx->has_integer_dot) {
+    if (backend_ctx->has_integer_dot_product) {
 #ifdef GGML_OPENCL_EMBED_KERNELS
         const std::string kernel_src {
             #include "gemm_noshuffle_iq4_nl_q8_1_dp4a.cl.h"
@@ -4250,7 +4249,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
     }
 
     // gemm_noshuffle_q4_0_q8_1_dp4a (dp4a dense q4_0 prefill GEMM)
-    if (backend_ctx->has_integer_dot) {
+    if (backend_ctx->has_integer_dot_product) {
 #ifdef GGML_OPENCL_EMBED_KERNELS
         const std::string kernel_src {
             #include "gemm_noshuffle_q4_0_q8_1_dp4a.cl.h"
@@ -4364,7 +4363,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
     }
 
     // gemm_noshuffle_q4_k_q8_1_dp4a (dp4a dense prefill GEMM)
-    if (backend_ctx->has_integer_dot) {
+    if (backend_ctx->has_integer_dot_product) {
 #ifdef GGML_OPENCL_EMBED_KERNELS
         const std::string kernel_src {
             #include "gemm_noshuffle_q4_k_q8_1_dp4a.cl.h"
@@ -4386,7 +4385,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
     }
 
     // gemm_noshuffle_q8_0_q8_1_dp4a (dp4a dense q8_0 prefill GEMM)
-    if (backend_ctx->has_integer_dot) {
+    if (backend_ctx->has_integer_dot_product) {
 #ifdef GGML_OPENCL_EMBED_KERNELS
         const std::string kernel_src {
             #include "gemm_noshuffle_q8_0_q8_1_dp4a.cl.h"
@@ -4402,7 +4401,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
     }
 
     // gemm_noshuffle_q5_k_q8_1_dp4a (dp4a dense prefill GEMM for q5_K)
-    if (backend_ctx->has_integer_dot) {
+    if (backend_ctx->has_integer_dot_product) {
 #ifdef GGML_OPENCL_EMBED_KERNELS
         const std::string kernel_src {
             #include "gemm_noshuffle_q5_k_q8_1_dp4a.cl.h"
@@ -4417,7 +4416,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
     }
 
     // gemm_noshuffle_q6_k_q8_1_dp4a (dp4a dense prefill GEMM for q6_K ffn_down/output)
-    if (backend_ctx->has_integer_dot) {
+    if (backend_ctx->has_integer_dot_product) {
 #ifdef GGML_OPENCL_EMBED_KERNELS
         const std::string kernel_src {
             #include "gemm_noshuffle_q6_k_q8_1_dp4a.cl.h"
@@ -4828,7 +4827,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
     }
 
     // gemm_moe_q4_k_q8_1_dp4a (dp4a prefill GEMM)
-    if (backend_ctx->has_integer_dot) {
+    if (backend_ctx->has_integer_dot_product) {
 #ifdef GGML_OPENCL_EMBED_KERNELS
         const std::string kernel_src {
             #include "gemm_moe_q4_k_q8_1_dp4a.cl.h"
@@ -4845,7 +4844,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
     }
 
     // gemm_moe_mxfp4_q8_1_dp4a (dp4a prefill GEMM)
-    if (backend_ctx->has_integer_dot) {
+    if (backend_ctx->has_integer_dot_product) {
 #ifdef GGML_OPENCL_EMBED_KERNELS
         const std::string kernel_src {
             #include "gemm_moe_mxfp4_q8_1_dp4a.cl.h"
@@ -4862,7 +4861,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
     }
 
     // gemm_moe_q4_0_q8_1_dp4a (dp4a prefill GEMM)
-    if (backend_ctx->has_integer_dot) {
+    if (backend_ctx->has_integer_dot_product) {
 #ifdef GGML_OPENCL_EMBED_KERNELS
         const std::string kernel_src {
             #include "gemm_moe_q4_0_q8_1_dp4a.cl.h"
@@ -4879,7 +4878,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
     }
 
     // gemm_moe_q8_1_dp4a (generic dp4a MoE GEMM; MOE_QT=80 -> q8_0 expert variant, opt-in)
-    if (backend_ctx->has_integer_dot) {
+    if (backend_ctx->has_integer_dot_product) {
 #ifdef GGML_OPENCL_EMBED_KERNELS
         const std::string kernel_src {
             #include "gemm_moe_q8_1_dp4a.cl.h"
@@ -4993,7 +4992,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
     }
 
     // gemm_moe_q6_k_q8_1_dp4a (dp4a q6_K MoE prefill GEMM)
-    if (backend_ctx->has_integer_dot) {
+    if (backend_ctx->has_integer_dot_product) {
 #ifdef GGML_OPENCL_EMBED_KERNELS
         const std::string kernel_src {
             #include "gemm_moe_q6_k_q8_1_dp4a.cl.h"
@@ -7009,7 +7008,7 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
     // every nibble-quantized case still passes, which is what a difference in how the two
     // sign-extend their operands would look like (q8_0 is the only path that feeds them
     // the full signed int8 range). Do not map one onto the other without settling that.
-    backend_ctx->has_integer_dot =
+    backend_ctx->has_integer_dot_product =
         strstr(ext_buffer, "cl_khr_integer_dot_product") != NULL;
 
     cl_uint base_align_in_bits;
@@ -19740,9 +19739,12 @@ static void ggml_cl_mul_mat_q4_0_f32_adreno(ggml_backend_t backend, const ggml_t
         // +20%, whose codebook dequant is expensive). Kept for A/B; force on with
         // GGML_OPENCL_Q4_0_DENSE_DP4A=1. Needs N>8, K%32==0, M%64==0.
         static const char * q4_0_dense_dp4a_env = getenv("GGML_OPENCL_Q4_0_DENSE_DP4A");
-        const bool q4_0_dense_dp4a_on = q4_0_dense_dp4a_env
+        bool q4_0_dense_dp4a_on = q4_0_dense_dp4a_env
             ? (atoi(q4_0_dense_dp4a_env) != 0)
             : false;
+        // dot prod has to be available
+        q4_0_dense_dp4a_on = backend_ctx->has_integer_dot_product && q4_0_dense_dp4a_on;
+
         if (q4_0_dense_dp4a_on && backend_ctx->kernel_gemm_noshuffle_q4_0_q8_1_dp4a
                 && N > 8 && (K % 32 == 0) && (M % 64 == 0)) {
             cl_mem a_sub = nullptr;
@@ -20197,9 +20199,12 @@ static void ggml_cl_mul_mat_q5_0_f32_adreno(ggml_backend_t backend, const ggml_t
         static const char * q5_dense_dp4a_env = getenv("GGML_OPENCL_Q5_DENSE_DP4A");
         static const char * q5_dense_wimg_env = getenv("GGML_OPENCL_Q5_DENSE_DP4A_WIMG");
         const bool q5_dense_wimg_on = q5_dense_wimg_env && (atoi(q5_dense_wimg_env) != 0);
-        const bool q5_dense_dp4a_on = q5_dense_wimg_on
+              bool q5_dense_dp4a_on = q5_dense_wimg_on
             ? true
             : (q5_dense_dp4a_env && (atoi(q5_dense_dp4a_env) != 0));
+        // dot prod has to be available
+        q5_dense_dp4a_on = backend_ctx->has_integer_dot_product && q5_dense_dp4a_on;
+
         if (q5_dense_dp4a_on && backend_ctx->kernel_gemm_noshuffle_q5_0_q8_1_dp4a
                 && N > 8 && (K % 32 == 0) && (M % 64 == 0)) {
             cl_mem a_sub = nullptr;
@@ -20634,13 +20639,9 @@ static void ggml_cl_mul_mat_iq4_nl_f32_adreno(ggml_backend_t backend, const ggml
     } else {
         // dp4a (int8) dense IQ4_NL prefill GEMM. Quantizes the [N,K] activations to
         // q8_1 and runs the int8 dot instead of the f16 half-dot. Large-batch
-        // (ne1>8) only. IQ4_NL weight = kvalues[nibble]*d; the codebook value IS the
-        // int8 (no min term), so this is the q8_0 dense case plus a nibble->int8 LUT
-        // unpack. Reads the q/d buffers byte-identically to the f16 kernel. No bin
-        // kernel for IQ4_NL -> baseline is f16, default ON for X2E (like q4_K/q6_K
-        // dense dp4a). X1 stays on f16. Env: GGML_OPENCL_IQ4NL_DENSE_DP4A.
+        // (ne1>8) only
         static const char * iq4nl_dense_dp4a_env = getenv("GGML_OPENCL_IQ4NL_DENSE_DP4A");
-        const bool iq4nl_dense_dp4a_on = iq4nl_dense_dp4a_env
+        bool iq4nl_dense_dp4a_on = iq4nl_dense_dp4a_env
             ? (atoi(iq4nl_dense_dp4a_env) != 0)
             : backend_ctx->adreno_x2_class();
         if (iq4nl_dense_dp4a_on && backend_ctx->kernel_gemm_noshuffle_iq4_nl_q8_1_dp4a
@@ -22379,7 +22380,7 @@ static void ggml_cl_mul_mat_q5_K_f32_adreno(ggml_backend_t backend, const ggml_t
         // the transpose output above is unused here. DEFAULT ON Adreno X2E (same gate
         // as q4_K/q6_K dense dp4a); opt out GGML_OPENCL_Q5K_DENSE_DP4A=0.
         static const char * q5k_dense_dp4a_env = getenv("GGML_OPENCL_Q5K_DENSE_DP4A");
-        const bool          q5k_dense_dp4a_on  = q5k_dense_dp4a_env
+                     bool   q5k_dense_dp4a_on  = q5k_dense_dp4a_env
             ? (atoi(q5k_dense_dp4a_env) != 0)
             : backend_ctx->adreno_x2_class();
         if (q5k_dense_dp4a_on && ne1 > 8 && (ne00 % 32 == 0) && (ne01 % 64 == 0)) {
