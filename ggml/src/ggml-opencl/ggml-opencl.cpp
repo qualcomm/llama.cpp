@@ -15723,8 +15723,12 @@ static void ggml_cl_mul_mat_kq_kqv_adreno(ggml_backend_t backend, const ggml_ten
         // KQ
         region.size = nb01 * ne01;
     } else {
-        // KQV
-        region.size = nb02 * ne02;
+        // KQV. The kernel walks A with a per-head (D_A) batch stride of nb01*M
+        // (strideAinElements = nb01*M/2), so A spans nb01*ne01*ne02 bytes. For a
+        // standard contiguous V (nb02 == nb01*ne01) this equals nb02*ne02, but when
+        // ne02 == 1 (e.g. gemma, where nb02 collapses to nb01) nb02*ne02 under-sizes
+        // the image to a single row and every m>0 reads garbage -- size it off nb01.
+        region.size = nb01 * ne01 * ne02;
     }
 
     A_sub_buffer = clCreateSubBuffer((extra0->data_device), 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &status);
@@ -15734,9 +15738,23 @@ static void ggml_cl_mul_mat_kq_kqv_adreno(ggml_backend_t backend, const ggml_ten
 
     // create sub-buffer for B
     // <--------------------------------------------> //
-    region.origin = extra1->offset + src1->view_offs;
+    // The kernel reads B as a fully packed [D_B, N, K] buffer (vload4, no strides),
+    // so a non-contiguous src1 -- e.g. gemma's strided probs view feeding KQV -- must
+    // be packed into contiguous scratch first. This is the same copy the generic
+    // l4_lm path performs, so it is not new overhead versus the fallback it replaces.
+    cl_mem   b_data_device = extra1->data_device;
+    cl_ulong b_origin      = extra1->offset + src1->view_offs;
+    if (!ggml_is_contiguous(src1)) {
+        backend_ctx->prealloc_src1.allocate(backend_ctx->context, ggml_nbytes(src1));
+        cl_ulong cnb0, cnb1, cnb2, cnb3;
+        ggml_cl_copy_to_contiguous(backend, src1, backend_ctx->prealloc_src1.buffer,
+            cnb0, cnb1, cnb2, cnb3);
+        b_data_device = backend_ctx->prealloc_src1.buffer;
+        b_origin      = 0;
+    }
+    region.origin = b_origin;
     region.size = nb10 * ne10 * ne11 * ne12;
-    B_sub_buffer = clCreateSubBuffer((extra1->data_device), 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &status);
+    B_sub_buffer = clCreateSubBuffer(b_data_device, 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &status);
     CL_CHECK(status);
     // <--------------------------------------------> //
 
@@ -15747,7 +15765,9 @@ static void ggml_cl_mul_mat_kq_kqv_adreno(ggml_backend_t backend, const ggml_ten
         img_desc_1d.image_width = (nb01 * ne01 / 4)/4;
     }
     else {
-        img_desc_1d.image_width = (nb02 * ne02 / 4)/4;
+        // KQV: match the A span used for the sub-buffer above (nb01*ne01*ne02),
+        // not nb02*ne02, so the ne02==1 / gemma layout gets a full-size image.
+        img_desc_1d.image_width = (nb01 * ne01 * ne02 / 4)/4;
     }
     img_desc_1d.buffer = A_sub_buffer;
     A_image1d = clCreateImage(context, CL_MEM_READ_ONLY, &img_fmt_1d, &img_desc_1d, NULL, &status);
@@ -18679,8 +18699,18 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             // contiguous V (nb01 < nb02, e.g. Qwen3) is handled identically to a permuted
             // view -- gate on the KQV shape (nb01 <= nb02), not on non-contiguity, so the
             // contiguous case stops falling to the pathological generic f16 mul_mm.
-            if (nb01 <= nb02 && ggml_is_contiguous(src1) &&
-                ((nb02 * ne02 / 4)/4 <= backend_ctx->image_max_buffer_size)) {
+            //
+            // The kernel reads A by stride but B (src1) as a fully packed [D_B,N,K]
+            // buffer, so a non-contiguous src1 (e.g. gemma's strided probs view) must be
+            // packed into scratch first -- the dispatch does exactly that copy, which the
+            // generic l4_lm fallback pays anyway. Routing the non-contiguous case here is
+            // guarded by GGML_OPENCL_KQV_SRC1_COPY (default on) so a clean A/B can revert
+            // to the old "contiguous-src1 only" routing in one binary.
+            static const char * kqv_src1_copy_env = getenv("GGML_OPENCL_KQV_SRC1_COPY");
+            static const bool   kqv_src1_copy_on  =
+                (kqv_src1_copy_env == nullptr || kqv_src1_copy_env[0] != '0');
+            if (nb01 <= nb02 && (ggml_is_contiguous(src1) || kqv_src1_copy_on) &&
+                ((nb01 * ne01 * ne02 / 4)/4 <= backend_ctx->image_max_buffer_size)) {
                 ggml_cl_mul_mat_kq_kqv_adreno(backend, src0, src1, dst);
                 return;
             }
