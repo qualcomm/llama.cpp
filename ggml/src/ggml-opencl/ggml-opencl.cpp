@@ -18718,8 +18718,12 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 ggml_cl_mul_mat_kq_kqv_adreno(backend, src0, src1, dst);
                 return;
             }
-            // For KQV
-            if (!ggml_is_contiguous(src0) && ggml_is_contiguous(src1) &&
+            // For KQV. The bespoke image KQV kernel addresses A (V) through the actual
+            // nb01/nb02 strides and the internal KQ/KQV split keys off nb01 <= nb02, so a
+            // contiguous V (nb01 < nb02, e.g. Qwen3) is handled identically to a permuted
+            // view -- gate on the KQV shape (nb01 <= nb02), not on non-contiguity, so the
+            // contiguous case stops falling to the pathological generic f16 mul_mm.
+            if (nb01 <= nb02 && ggml_is_contiguous(src1) &&
                 ((nb02 * ne02 / 4)/4 <= backend_ctx->image_max_buffer_size)) {
                 ggml_cl_mul_mat_kq_kqv_adreno(backend, src0, src1, dst);
                 return;
