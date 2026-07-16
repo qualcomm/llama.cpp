@@ -19513,7 +19513,9 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 } else if (adreno_use_lane_split && ne00 >= 64 && ne00 <= 128) {
                     kernel = backend_ctx->kernel_mul_mat_f16_f32_l4_dr_lq;
                     nrows  = 1;
-                } else if (adreno_use_lane_split && r2 >= 2 && ne00 > 128 && ne00 <= 256) {
+                } else if (adreno_use_lane_split && r2 >= 2 && ne00 > 128 && ne00 <= 512) {
+                    // ne00 up to 512 covers gemma3n/gemma4 global-layer KQ (DK=512, GQA=8):
+                    // dr_ls reads each K row once and dots all r2 query heads (no GQA re-read).
                     kernel = backend_ctx->kernel_mul_mat_f16_f32_l4_dr_ls;
                     nrows  = 1;
                 } else if (ne00 >= 128 && ne01 >= 8 && ne00%4 == 0) {
@@ -19544,8 +19546,11 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                         backend_ctx->kernel_mul_mat_f16_f32_l4_x8 != nullptr) {
                         kernel = backend_ctx->kernel_mul_mat_f16_f32_l4_x8;
                         nrows = 1;
-                    } else if (can_multi_out && ne01 == 128 && r2 == 8 && r3 == 1 && mm_kqv_gqa_on &&
+                    } else if (can_multi_out && ((ne01 == 128 && mm_kqv_gqa_on) || ne01 == 512) &&
+                        r2 == 8 && r3 == 1 &&
                         backend_ctx->kernel_mul_mat_f16_f32_l4_y8_gqa != nullptr) {
+                        // ne01 == 512 covers gemma3n/gemma4 global-layer KQV (DV=512, GQA=8):
+                        // read each V slab once per K-head and emit all r2 Q-heads.
                         kernel = backend_ctx->kernel_mul_mat_f16_f32_l4_y8_gqa;
                         nrows = 1;
                     } else if (can_multi_out &&
