@@ -2325,7 +2325,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         if (backend_ctx->gpu_family == INTEL) {
             const std::string q4k_ndst8_opts = compile_opts + " -D Q4K_N_DST_OVERRIDE=8";
             cl_program prog8 =
-                build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), q4k_ndst8_opts);
+                build_program_from_source(backend_ctx, kernel_src.c_str(), q4k_ndst8_opts);
             backend_ctx->kernel_mul_mv_q4_K_f32_flat_ndst8 = clCreateKernel(prog8, "kernel_mul_mv_q4_K_f32_flat", &err);
             if (err != CL_SUCCESS) backend_ctx->kernel_mul_mv_q4_K_f32_flat_ndst8 = nullptr;
             CL_CHECK(clReleaseProgram(prog8));
@@ -2342,7 +2342,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         const std::string kernel_src = read_file("mul_mv_q4_k_q8_1.cl");
 #endif
         cl_program prog =
-            build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
+            build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
         backend_ctx->kernel_mul_mv_q4_k_q8_1 = clCreateKernel(prog, "kernel_mul_mv_q4_k_q8_1", &err);
         if (err != CL_SUCCESS) backend_ctx->kernel_mul_mv_q4_k_q8_1 = nullptr;
         CL_CHECK(clReleaseProgram(prog));
@@ -2357,7 +2357,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             const std::string qsrc = read_file("quant_a_q8_1.cl");
 #endif
             cl_program qprog =
-                build_program_from_source(backend_ctx->context, backend_ctx->device, qsrc.c_str(), compile_opts);
+                build_program_from_source(backend_ctx, qsrc.c_str(), compile_opts);
             backend_ctx->kernel_quant_a_q8_1_i = clCreateKernel(qprog, "kernel_quant_a_q8_1", &err);
             if (err != CL_SUCCESS) backend_ctx->kernel_quant_a_q8_1_i = nullptr;
             CL_CHECK(clReleaseProgram(qprog));
@@ -6223,7 +6223,7 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
                 const std::string opts_g1_c8 = opts + " -D FA_MQ_ONLY -D MQ_GQA=1";
                 cl_program prog_g1_c8 = build_program_from_source_ex(
                     backend_ctx->context, backend_ctx->device, src.c_str(), opts_g1_c8,
-                    /*fatal=*/false, "fa f32_f16 c8 g1 (gqa=1)", backend_ctx->queue);
+                    /*fatal=*/false, "fa f32_f16 c8 g1 (gqa=1)", /*bin_size=*/0, backend_ctx->queue);
                 if (prog_g1_c8) {
                     cl_kernel k_g1_c8 = clCreateKernel(prog_g1_c8, "flash_attn_f32_f16_q1_vec_mq_split_c8", &err);
                     if (err == CL_SUCCESS) {
