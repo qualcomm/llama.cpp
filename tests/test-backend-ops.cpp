@@ -8619,6 +8619,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2560, 128, 4096, {1, 1}, {4, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2560, 170, 4096, {1, 1}, {3, 1}));
 
+    // gemma3n/gemma-4 global-attention decode shapes (DK=DV=512, GQA ratio 8).
+    // KQ:  src0=K [DK=512, n_kv, n_head_kv=8], src1=Q [512, 1, n_head_q=64] -> r2=8
+    // KQV: src0=V [n_kv, DV=512, 8],           src1=softmax [n_kv, 1, 64]   -> r2=8
+    // The stock shape list jumps k=256 -> k=1024 at n=1 and has no m=512/r2=8 case,
+    // so the DK=512 GQA decode kernels are otherwise never exercised here.
+    for (int64_t n_kv : {256, 1024, 2048}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, n_kv, 1,  512, {8, 1}, {8, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32,  512, 1, n_kv, {8, 1}, {8, 1}));
+    }
+
     for (ggml_type type_a : all_types) {
         for (int i = 1; i < 10; ++i) {
             test_cases.emplace_back(new test_mul_mat(type_a,    GGML_TYPE_F32, 16,  i, 256, { 1,  1}, {1, 1}));
