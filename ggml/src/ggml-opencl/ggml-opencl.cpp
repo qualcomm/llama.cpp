@@ -7031,7 +7031,21 @@ static inline bool use_flat_gemv_for_large_m_q6_K(const ggml_tensor *tensor) {
     if ((tensor->ne[1] % 128 != 0) && tensor->ne[2] == 1 && tensor->ne[3] == 1) {
         return true;
     }
-    return tensor->ne[1] >= 32768 && tensor->ne[0] >= 2048 && tensor->ne[2] == 1 && tensor->ne[3] == 1;
+    // The gemv_noshuffle slowdown tracks TOTAL weight size, not ne0 alone; ne0 >= 2048 is a
+    // proxy for "large weight" that misses a narrow-hidden vocab-scale lm_head. gemma-4 /
+    // gemma3n E2B tie token_embd as a Q6_K [1536 x 262144] (330 MiB) lm_head: ne0 = 1536 fails
+    // the ne0 >= 2048 test, so it is stranded on gemv_noshuffle and runs at ~23 GB/s while the
+    // flat GEMV holds ~56 GB/s -- 47% of E2B decode on one dispatch. Add a direct size escape so
+    // such weights also take the flat path, without changing which weights ne0 >= 2048 already
+    // routes there. Measured per-kernel (flat vs noshuffle), Adreno X2-90:
+    //   DeepSeek-1.5B  [1536 x 151936] 191 MiB : 55.5 vs 54.9  (~neutral -- near the crossover)
+    //   gemma-4 E2B    [1536 x 262144] 330 MiB : 55.6 vs 22.9  (flat 2.4x, tg +38%)
+    //   gemma-4 E4B    [2560 x 262144] 550 MiB : 56.0 vs 12.8  (flat 4.4x; already flat via ne0)
+    // Cross-checked on the Adreno 840 (flat 1.8x at 330 MiB; neutral-to-slight-loss at 191 MiB).
+    // 256 MiB sits between the crossover and the first clear win.
+    return tensor->ne[1] >= 32768
+        && (tensor->ne[0] >= 2048 || ggml_nbytes(tensor) >= (256ull << 20))
+        && tensor->ne[2] == 1 && tensor->ne[3] == 1;
 }
 
 static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
