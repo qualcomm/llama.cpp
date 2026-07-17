@@ -8974,6 +8974,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // Vocab-scale Q6_K GEMV (tied lm_head / token_embd) at decode. On the OpenCL Adreno
+    // backend these route through use_flat_gemv_for_large_m_q6_K; the narrow-hidden case
+    // (m=262144, k=1536) is the one the size escape newly sends to the flat GEMV, so it must
+    // stay correct against the CPU reference. k=1536 (gemma-4/gemma3n E2B) and k=2560 (E4B).
+    for (int64_t k : {1536, 2560}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 262144, 1, k, {1, 1}, {1, 1}));
+    }
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 151936, 1, 1536, {1, 1}, {1, 1}));
+
     // sycl backend will limit task global_range < MAX_INT
     // test case for f16-type-convert-to-fp32 kernel with large k under fp32 compute dtype (occurs in stable-diffusion)
     // however this case needs to alloc more memory which may fail in some devices (Intel Arc770, etc.)
