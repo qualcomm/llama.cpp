@@ -48,6 +48,7 @@ typedef struct {
 #define N_SIMDWIDTH 64
 #endif
 
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 1
 #ifdef INTEL_GPU
 REQD_SUBGROUP_SIZE_16
 #elif defined (ADRENO_GPU)
@@ -135,6 +136,7 @@ kernel void kernel_mul_mv_q8_0_f32(
         }
     }
 }
+#endif
 
 // GQA-coalesced decode KQ for a q8_0 K-cache (DK=128, r2=8, r3=1, ne11==1).
 // The fa=0 quant-K analog of the f16 _x8_gqa4 coalesce: read each K-row once per
@@ -149,6 +151,7 @@ kernel void kernel_mul_mv_q8_0_f32(
 #define GQA_RATIO_Q8GQA  8
 #define DK_VEC_Q8GQA     32   // DK/4 for DK=128
 
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 2
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
 #endif
@@ -244,6 +247,7 @@ kernel void kernel_mul_mat_q8_0_f32_gqa8_dk128(
         }
     }
 }
+#endif
 
 // image1d_buffer_t (texture-cache) variant of kernel_mul_mat_q8_0_f32_gqa8_dk128.
 //
@@ -261,6 +265,7 @@ kernel void kernel_mul_mat_q8_0_f32_gqa8_dk128(
 // bytes start 2-byte-shifted for even blk (qsh=16) and pixel-aligned for odd blk
 // (qsh=0), so even-blk lanes read 5 pixels and shift-combine.
 // Opt-in via GGML_OPENCL_MM_KQ_GQA_Q8_0_IMG=1 on the host.
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 3
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
 #endif
@@ -386,6 +391,7 @@ kernel void kernel_mul_mat_q8_0_f32_gqa8_dk128_img(
         }
     }
 }
+#endif
 
 // ===========================================================================
 // DK=256, r2=8 variants for Qwen3.6-35B-A3B (n_head=16, n_head_kv=2 => r2=8,
@@ -398,6 +404,7 @@ kernel void kernel_mul_mat_q8_0_f32_gqa8_dk128_img(
 #define GQA_RATIO_Q8GQA256  8
 #define DK_VEC_Q8GQA256     64   // DK/4 for DK=256
 
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 4
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
 #endif
@@ -488,6 +495,7 @@ kernel void kernel_mul_mat_q8_0_f32_gqa8_dk256(
         }
     }
 }
+#endif
 
 // image1d_buffer_t (texture-cache) variant of kernel_mul_mat_q8_0_f32_gqa8_dk256.
 // q8_0 row (DK=256): 8 blocks x 34 B = 272 B = 68 uint32 pixels. Lane lane_q owns
@@ -495,6 +503,7 @@ kernel void kernel_mul_mat_q8_0_f32_gqa8_dk256(
 // 0 for even lane_q, 2 for odd; q_byte=34*lane_q+2 is 2-byte-shifted (q_sh=16) for
 // even lane_q and pixel-aligned (q_sh=0) for odd -- so even lanes read 9 pixels and
 // shift-combine 8 quant words.
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 5
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
 #endif
@@ -608,6 +617,7 @@ kernel void kernel_mul_mat_q8_0_f32_gqa8_dk256_img(
         }
     }
 }
+#endif
 
 // ===========================================================================
 // DK=256, r2=4 variants for Qwen3.5-9B (n_head_kv=4 => GQA r=4, head_dim=256).
@@ -620,6 +630,7 @@ kernel void kernel_mul_mat_q8_0_f32_gqa8_dk256_img(
 #define GQA_RATIO_Q8GQA_R4_256  4
 #define DK_VEC_Q8GQA_R4_256     64   // DK/4 for DK=256
 
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 6
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
 #endif
@@ -710,11 +721,13 @@ kernel void kernel_mul_mat_q8_0_f32_gqa_r4_dk256(
         }
     }
 }
+#endif
 
 // image1d_buffer_t (texture-cache) variant of kernel_mul_mat_q8_0_f32_gqa_r4_dk256.
 // Row = 8 q8_0 blocks x 34 B = 272 B = 68 px (same as the gqa8_dk256 row). Lane owns
 // a half block: blk=lane_q>>1, hoff=(lane_q&1)*16; d at byte 34*blk, qs+hoff at
 // 34*blk+2+hoff -- generic q_sh = (q_byte&3)*8 (read 5 px + shift-combine when shifted).
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 7
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
 #endif
@@ -836,6 +849,7 @@ kernel void kernel_mul_mat_q8_0_f32_gqa_r4_dk256_img(
         }
     }
 }
+#endif
 
 // ===========================================================================
 // r2=4 variants (DK=128) for Llama-3-8B (n_head=32, n_head_kv=8 => r2=4, all-
@@ -848,6 +862,7 @@ kernel void kernel_mul_mat_q8_0_f32_gqa_r4_dk256_img(
 #define GQA_RATIO_Q8GQA_R4  4
 #define DK_VEC_Q8GQA_R4     32   // DK/4 for DK=128
 
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 8
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
 #endif
@@ -934,10 +949,12 @@ kernel void kernel_mul_mat_q8_0_f32_gqa_r4_dk128(
         }
     }
 }
+#endif
 
 // image1d_buffer_t (texture-cache) variant of the r2=4 kernel above. Same q8_0
 // row->pixel mapping as the r2=8 image kernel (136-B row = 34 uint32 px; even-blk
 // half shifted 2 B). Each lane reads 8 qs bytes = 2 words (w0,w1) + its block d.
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 9
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
 #endif
@@ -1048,6 +1065,7 @@ kernel void kernel_mul_mat_q8_0_f32_gqa_r4_dk128_img(
         }
     }
 }
+#endif
 
 // Generic decode KQ for a q8_0 K-cache: any GQA ratio, any DK in [32, 512] that
 // is a multiple of 32. The GQA-coalesced kernels above bake the GQA ratio and DK
@@ -1070,6 +1088,7 @@ kernel void kernel_mul_mat_q8_0_f32_gqa_r4_dk128_img(
 #define N_ROWS_Q8GEN  4      // K rows per subgroup, to amortize the Q load
 #define DK_MAX_Q8GEN  512
 
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 10
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
 #endif
@@ -1158,3 +1177,4 @@ kernel void kernel_mul_mat_q8_0_f32_kq_gen(
         }
     }
 }
+#endif

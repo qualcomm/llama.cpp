@@ -174,6 +174,7 @@ inline void mul_vec_q_n_f32(
     }
 }
 
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 1
 #ifdef INTEL_GPU
 REQD_SUBGROUP_SIZE_16
 #elif defined (ADRENO_GPU)
@@ -202,6 +203,7 @@ kernel void kernel_mul_mat_q4_0_f32(
 
     mul_vec_q_n_f32(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3);
 }
+#endif
 
 // GQA-coalesced decode KQ for a q4_0 K-cache (DK=128, r2=8, r3=1, ne11==1) --
 // the -36% KV-DDR analog of the q8_0 _gqa8_dk128 kernels. K stays q4_0 (AoS
@@ -214,6 +216,7 @@ kernel void kernel_mul_mat_q4_0_f32(
 #define GQA_RATIO_Q4GQA  8
 #define DK_VEC_Q4GQA     32   // DK/4 for DK=128
 
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 2
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
 #endif
@@ -305,12 +308,14 @@ kernel void kernel_mul_mat_q4_0_f32_gqa8_dk128(
         }
     }
 }
+#endif
 
 // image1d_buffer_t (texture-cache) variant of kernel_mul_mat_q4_0_f32_gqa8_dk128.
 // q4_0 row (DK=128) = 4 blocks x 18 B = 72 B = exactly 18 uint32 pixels. d (2 B)
 // at byte 18*blk, qs[16] at 18*blk+2 -> same even/odd 2-byte-shift handling as the
 // q8_0 image kernel (read 5 px + shift-combine for shifted blocks), plus 4-bit
 // nibble unpack. CL_R/CL_UNSIGNED_INT32 image, opt via the host img dispatch.
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 3
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
 #endif
@@ -431,6 +436,7 @@ kernel void kernel_mul_mat_q4_0_f32_gqa8_dk128_img(
         }
     }
 }
+#endif
 
 // ===========================================================================
 // DK=256, r2=8 variants for Qwen3.6-35B-A3B (n_head_kv=2 => GQA r=8, head_dim=256).
@@ -442,6 +448,7 @@ kernel void kernel_mul_mat_q4_0_f32_gqa8_dk128_img(
 #define GQA_RATIO_Q4GQA256  8
 #define DK_VEC_Q4GQA256     64   // DK/4 for DK=256
 
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 4
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
 #endif
@@ -539,12 +546,14 @@ kernel void kernel_mul_mat_q4_0_f32_gqa8_dk256(
         }
     }
 }
+#endif
 
 // image1d_buffer_t variant of kernel_mul_mat_q4_0_f32_gqa8_dk256.
 // q4_0 row (DK=256) = 8 blocks x 18 B = 144 B = 36 uint32 pixels. Lane owns whole
 // block lane_q: d at byte 18*lane_q, qs[16] at 18*lane_q+2 (even/odd 2-byte-shift
 // as the DK=128 kernel). Unpack 16 qs bytes (4 words): low nibbles -> Q[qf4,qf4+4),
 // high nibbles -> Q[qf4+4,qf4+8).
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 5
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
 #endif
@@ -672,6 +681,7 @@ kernel void kernel_mul_mat_q4_0_f32_gqa8_dk256_img(
         }
     }
 }
+#endif
 
 // ===========================================================================
 // DK=256, r2=4 variants for Qwen3.5-9B (n_head_kv=4 => GQA r=4, head_dim=256).
@@ -684,6 +694,7 @@ kernel void kernel_mul_mat_q4_0_f32_gqa8_dk256_img(
 #define GQA_RATIO_Q4GQA_R4_256  4
 #define DK_VEC_Q4GQA_R4_256     64   // DK/4 for DK=256
 
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 6
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
 #endif
@@ -774,10 +785,12 @@ kernel void kernel_mul_mat_q4_0_f32_gqa_r4_dk256(
         }
     }
 }
+#endif
 
 // image1d_buffer_t variant of kernel_mul_mat_q4_0_f32_gqa_r4_dk256.
 // Row = 8 q4_0 blocks x 18 B = 144 B = 36 px. Lane owns a half block (one nibble
 // half): blk=lane_q>>1, nsh=(lane_q&1)*4; d at 18*blk, qs[16] at 18*blk+2.
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 7
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
 #endif
@@ -897,6 +910,7 @@ kernel void kernel_mul_mat_q4_0_f32_gqa_r4_dk256_img(
         }
     }
 }
+#endif
 
 // ===========================================================================
 // r2=4 variants (DK=128) for Llama-3-8B. 4 Q-heads x 16 lanes; each lane owns 8
@@ -907,6 +921,7 @@ kernel void kernel_mul_mat_q4_0_f32_gqa_r4_dk256_img(
 #define GQA_RATIO_Q4GQA_R4  4
 #define DK_VEC_Q4GQA_R4     32
 
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 8
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
 #endif
@@ -1001,9 +1016,11 @@ kernel void kernel_mul_mat_q4_0_f32_gqa_r4_dk128(
         }
     }
 }
+#endif
 
 // image1d_buffer_t variant of the q4_0 r2=4 kernel. q4_0 row = 72 B = 18 px;
 // lane reads 8 qs bytes = 2 words (+ block d) and unpacks one nibble each.
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 9
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
 #endif
@@ -1122,6 +1139,7 @@ kernel void kernel_mul_mat_q4_0_f32_gqa_r4_dk128_img(
         }
     }
 }
+#endif
 
 // Generic decode KQ for a q4_0 K-cache: any GQA ratio, any DK in [32, 512] that
 // is a multiple of 32. The q4_0 analog of kernel_mul_mat_q8_0_f32_kq_gen -- see
@@ -1136,6 +1154,7 @@ kernel void kernel_mul_mat_q4_0_f32_gqa_r4_dk128_img(
 // position. 64 lanes x 8 = 512, so DK <= 512 needs one pass; lanes past DK/8 idle.
 #define N_ROWS_Q4GEN  4
 
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 10
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
 #endif
@@ -1225,3 +1244,4 @@ kernel void kernel_mul_mat_q4_0_f32_kq_gen(
         }
     }
 }
+#endif

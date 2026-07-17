@@ -228,12 +228,20 @@ kernel void kernel_gemv_noshuffle_q4_k_f32(
     uint groupId = get_local_id(1);
     uint gid     = get_global_id(0);
     ushort slid  = get_sub_group_local_id();
+    // K-split factor = #subgroups in the WG. Read from the launch (NOT a compile
+    // constant) so small-M projections (Kcur/Vcur/Qcur) can dispatch a wider
+    // K-split (more waves/SP -> latency hiding) while large-M keeps 4. The
+    // physical weight layout stride below is INDEPENDENT of this (see BLOCK_STRIDE_A).
+    uint nsg = get_local_size(1);
 
     uint K = ne00;
     uint M = ne01;
 
     uint LINE_STRIDE_A  = M / 2;
-    uint BLOCK_STRIDE_A = NSUBGROUPS * M;
+    // Physical per-K-block stride in the packed image: 8 uints/block-row-pair *
+    // (M/2) row-pairs = 4*M uints. This is a layout constant, not tied to nsg.
+    uint BLOCK_STRIDE_A = 4 * M;
+    uint scales_per_row = (K / QK_K) * 12;
 
     private uint4     regA;
     private half2     regS;
@@ -242,7 +250,7 @@ kernel void kernel_gemv_noshuffle_q4_k_f32(
 
     private float2 totalSum = (float2)(0.0f);
 
-    for (uint k = groupId; k < (K / 32); k += NSUBGROUPS) {
+    for (uint k = groupId; k < (K / 32); k += nsg) {
         uint sb = k / 8;
         uint j  = k % 8;
 
@@ -286,28 +294,21 @@ kernel void kernel_gemv_noshuffle_q4_k_f32(
 #endif // VECTOR_SUB_GROUP_BROADCAST
     }
 
-    // reduction in local memory, assumes #wave=4
-    local float2 reduceLM[SUBGROUP_SIZE * 3];
-    if (groupId == 1) {
-        reduceLM[SUBGROUP_SIZE * 0 + slid] = totalSum;
-    }
-    if (groupId == 2) {
-        reduceLM[SUBGROUP_SIZE * 1 + slid] = totalSum;
-    }
-    if (groupId == 3) {
-        reduceLM[SUBGROUP_SIZE * 2 + slid] = totalSum;
+    // Cross-subgroup reduction in local memory. Generalized to nsg subgroups
+    // (was a hard-coded 4-wave unroll). Sized for up to 16 subgroups (the widest
+    // K-split we dispatch for small M). At nsg==4 the accumulation order is
+    // identical to the original unroll -> byte-identical for the large-M path.
+    local float2 reduceLM[SUBGROUP_SIZE * 15];
+    if (groupId > 0) {
+        reduceLM[SUBGROUP_SIZE * (groupId - 1) + slid] = totalSum;
     }
 
     barrier(CLK_LOCAL_MEM_FENCE);
 
     if (groupId == 0) {
-        totalSum += reduceLM[SUBGROUP_SIZE * 0 + slid];
-    }
-    if (groupId == 0) {
-        totalSum += reduceLM[SUBGROUP_SIZE * 1 + slid];
-    }
-    if (groupId == 0) {
-        totalSum += reduceLM[SUBGROUP_SIZE * 2 + slid];
+        for (uint i = 0; i < nsg - 1; ++i) {
+            totalSum += reduceLM[SUBGROUP_SIZE * i + slid];
+        }
     }
 
     // 2 outputs per fiber in wave 0

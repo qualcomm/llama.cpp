@@ -502,6 +502,7 @@ kernel void kernel_mul_mat_f16_f32_l4_x8(
 //
 // Dispatched for the same shape pattern as x8 (ne11 == 1, ne01 divisible by 8)
 // when ne00 > 256, i.e. when the x8 path can't be used.
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 6
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
 #endif
@@ -1001,6 +1002,7 @@ kernel void kernel_mul_mat_f16_f32_l4_y8_gqa(
 //
 // Dispatch (separate from _x8_gqa4): same grid as the regular variant.
 // Opt-in via env var GGML_OPENCL_MM_KQ_GQA_IMG=1 on the host.
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 10
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
 #endif
@@ -1126,6 +1128,7 @@ kernel void kernel_mul_mat_f16_f32_l4_x8_gqa4_img(
 // register-equivalent to _y8_gqa.
 //
 // Dispatch grid: same as _y8_gqa. Opt-in via env GGML_OPENCL_MM_KQV_GQA_IMG=1.
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 11
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
 #endif
@@ -1466,6 +1469,7 @@ kernel void kernel_mul_mat_f16_f32_l4_x8_gqa_r2_dk256_img(
         }
     }
 }
+#endif
 
 // DK=256, r2=8 specialization for Qwen3.6-35B-A3B (n_head=16, n_head_kv=2,
 // head_dim=256). Image/texture-cache K reads (separate BW lane from L1, where
@@ -1480,6 +1484,7 @@ kernel void kernel_mul_mat_f16_f32_l4_x8_gqa_r2_dk256_img(
 #define PIX_PER_LANE_R8_DK256   4     // 32 pixels / 8 lanes
 // DK_VEC_DK256 (= 64) reused from the r2=2 variant above.
 
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 14
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
 #endif
@@ -1575,6 +1580,7 @@ kernel void kernel_mul_mat_f16_f32_l4_x8_gqa_r8_dk256_img(
         }
     }
 }
+#endif
 
 // DK=512, r2=8 specialization for the Gemma-4 GLOBAL-attention layers
 // (gemma-4-26B-A4B: n_head=16, n_head_kv=2 on the 1-in-6 full-attention layers,
@@ -1591,6 +1597,7 @@ kernel void kernel_mul_mat_f16_f32_l4_x8_gqa_r8_dk256_img(
 #define PIX_PER_LANE_R8_DK512   8     // 64 pixels / 8 lanes
 #define DK_VEC_DK512            128   // DK / 4 for DK=512
 
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 15
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
 #endif
@@ -1686,3 +1693,4 @@ kernel void kernel_mul_mat_f16_f32_l4_x8_gqa_r8_dk512_img(
         }
     }
 }
+#endif
