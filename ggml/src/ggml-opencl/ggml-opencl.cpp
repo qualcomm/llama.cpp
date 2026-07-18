@@ -1163,6 +1163,8 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_softplus_f16, kernel_softplus_f16_4, kernel_softplus_f16_nc;
     cl_kernel kernel_upscale;
     cl_kernel kernel_upscale_bilinear;
+    cl_kernel kernel_upscale_bilinear_aa;
+    cl_kernel kernel_upscale_bicubic;
     cl_kernel kernel_concat_f32, kernel_concat_f32_pack;
     cl_kernel kernel_conv_2d_f16;
     cl_kernel kernel_conv_2d_f32;
@@ -3735,8 +3737,22 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                     GGML_LOG_WARN("ggml_opencl: kernel_upscale_bilinear not found in upscale.cl. Bilinear upscale will not be available. Error: %d\n", err_bilinear);
                     backend_ctx->kernel_upscale_bilinear = nullptr;
                 }
+                cl_int err_bicubic;
+                backend_ctx->kernel_upscale_bicubic = clCreateKernel(backend_ctx->program_upscale, "kernel_upscale_bicubic", &err_bicubic);
+                if (err_bicubic != CL_SUCCESS) {
+                    GGML_LOG_WARN("ggml_opencl: kernel_upscale_bicubic not found in upscale.cl. Bicubic upscale will not be available. Error: %d\n", err_bicubic);
+                    backend_ctx->kernel_upscale_bicubic = nullptr;
+                }
+                cl_int err_aa;
+                backend_ctx->kernel_upscale_bilinear_aa = clCreateKernel(backend_ctx->program_upscale, "kernel_upscale_bilinear_aa", &err_aa);
+                if (err_aa != CL_SUCCESS) {
+                    GGML_LOG_WARN("ggml_opencl: kernel_upscale_bilinear_aa not found in upscale.cl. Antialiased bilinear upscale will not be available. Error: %d\n", err_aa);
+                    backend_ctx->kernel_upscale_bilinear_aa = nullptr;
+                }
             } else {
                 backend_ctx->kernel_upscale_bilinear = nullptr;
+                backend_ctx->kernel_upscale_bilinear_aa = nullptr;
+                backend_ctx->kernel_upscale_bicubic = nullptr;
             }
             GGML_LOG_CONT(".");
         } else {
@@ -3744,6 +3760,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             backend_ctx->program_upscale = nullptr;
             backend_ctx->kernel_upscale = nullptr;
             backend_ctx->kernel_upscale_bilinear = nullptr;
+            backend_ctx->kernel_upscale_bilinear_aa = nullptr;
+            backend_ctx->kernel_upscale_bicubic = nullptr;
         }
     }
 
@@ -9978,8 +9996,15 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
         case GGML_OP_UPSCALE: {
             ggml_scale_mode mode = (ggml_scale_mode)(ggml_get_op_params_i32(op, 0) & 0xFF);
             const bool antialias = (ggml_scale_mode)(ggml_get_op_params_i32(op, 0) & GGML_SCALE_FLAG_ANTIALIAS);
-            return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
-                   (mode == GGML_SCALE_MODE_NEAREST || mode == GGML_SCALE_MODE_BILINEAR) && !antialias;
+            if (op->src[0]->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) {
+                return false;
+            }
+            // antialias is only defined for bilinear (matches the CPU implementation)
+            if (antialias) {
+                return mode == GGML_SCALE_MODE_BILINEAR;
+            }
+            return mode == GGML_SCALE_MODE_NEAREST || mode == GGML_SCALE_MODE_BILINEAR ||
+                   mode == GGML_SCALE_MODE_BICUBIC;
         }
         case GGML_OP_CONV_2D:
             return (op->src[0]->type == GGML_TYPE_F16 && op->src[1]->type == GGML_TYPE_F16 && op->type == GGML_TYPE_F16) ||
@@ -17872,9 +17897,18 @@ static void ggml_cl_upscale(ggml_backend_t backend, const ggml_tensor * src0, gg
             return;
         }
     } else if (mode == GGML_SCALE_MODE_BILINEAR) {
-        kernel = backend_ctx->kernel_upscale_bilinear;
+        const bool antialias = mode_flags & GGML_SCALE_FLAG_ANTIALIAS;
+        kernel = antialias ? backend_ctx->kernel_upscale_bilinear_aa
+                           : backend_ctx->kernel_upscale_bilinear;
         if (kernel == nullptr) {
-            GGML_LOG_WARN("%s: bilinear upscale kernel not available, skipping OpenCL execution.\n", __func__);
+            GGML_LOG_WARN("%s: bilinear%s upscale kernel not available, skipping OpenCL execution.\n",
+                          __func__, antialias ? " (antialias)" : "");
+            return;
+        }
+    } else if (mode == GGML_SCALE_MODE_BICUBIC) {
+        kernel = backend_ctx->kernel_upscale_bicubic;
+        if (kernel == nullptr) {
+            GGML_LOG_WARN("%s: bicubic upscale kernel not available, skipping OpenCL execution.\n", __func__);
             return;
         }
     } else {
@@ -17928,7 +17962,8 @@ static void ggml_cl_upscale(ggml_backend_t backend, const ggml_tensor * src0, gg
         CL_CHECK(clSetKernelArg(kernel, 13, sizeof(float),    &sf1));
         CL_CHECK(clSetKernelArg(kernel, 14, sizeof(float),    &sf2));
         CL_CHECK(clSetKernelArg(kernel, 15, sizeof(float),    &sf3));
-    } else if (mode == GGML_SCALE_MODE_BILINEAR) {
+    } else if (mode == GGML_SCALE_MODE_BILINEAR || mode == GGML_SCALE_MODE_BICUBIC) {
+        // bicubic shares the bilinear kernel's arg layout and coordinate transform
         if (mode_flags & GGML_SCALE_FLAG_ALIGN_CORNERS) {
             sf0 = ne0 > 1 && ne00 > 1 ? (float)(ne0 - 1) / (ne00 - 1) : sf0;
             sf1 = ne1 > 1 && ne01 > 1 ? (float)(ne1 - 1) / (ne01 - 1) : sf1;
