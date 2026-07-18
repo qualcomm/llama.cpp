@@ -287,7 +287,21 @@ __kernel void FA_TILE_NAME(
     __local KV_DATA_TYPE4 l_k[BLOCK_N][DK_VEC];
 #define FA_LK(ROW, C) l_k[ROW][C]
 #endif
+#ifdef FA_V_LDS_T
+    // V tile transposed, same trick as FA_K_LDS_T above: the PV accumulate walks 2 or 4
+    // KV rows against the same dv element, and row-major those are DV_VEC half4s apart --
+    // one 64-bit local read each. Transposed they are adjacent, so a pair is one 128-bit
+    // read. Post-K-transpose the PV loop issues MORE local reads per j-group than the QK
+    // loop (2x half4 vs 1x half8), so this closes the remaining narrow-read side.
+    // Same alignment note as l_k: FA_LV_PAIR reads two adjacent half4 as one float4.
+    __local KV_DATA_TYPE4 l_v[DV_VEC][BLOCK_N] __attribute__((aligned(16)));
+#define FA_LV(ROW, C) l_v[C][ROW]
+    // Two adjacent KV rows as one 128-bit local read (j even, BLOCK_N even).
+#define FA_LV_PAIR(C, J) as_half8(*(__local const float4 *)(&l_v[C][J]))
+#else
     __local KV_DATA_TYPE4 l_v[BLOCK_N][DV_VEC];
+#define FA_LV(ROW, C) l_v[ROW][C]
+#endif
 
 #if N_SPLIT > 1 && !defined(HAS_SUBGROUP_SHUFFLE)
     __local ACC_TYPE local_partial[BLOCK_N][WG_SIZE];
@@ -348,9 +362,9 @@ __kernel void FA_TILE_NAME(
             const int v_row_idx = k_tile_start + row;
             if (use_kv_pad || v_row_idx < n_kv) {
                 const ulong v_row_offset = batch_idx * v_tile_nb3 + head_kv_idx * v_tile_nb2 + v_row_idx * v_nb1;
-                l_v[row][col] = ((__global KV_DATA_TYPE4*)(v_tile_base + v_row_offset))[col];
+                FA_LV(row, col) = ((__global KV_DATA_TYPE4*)(v_tile_base + v_row_offset))[col];
             } else {
-                l_v[row][col] = (KV_DATA_TYPE4)(0.0h);
+                FA_LV(row, col) = (KV_DATA_TYPE4)(0.0h);
             }
         }
         barrier(CLK_LOCAL_MEM_FENCE);
@@ -431,12 +445,34 @@ __kernel void FA_TILE_NAME(
                 const ACC_TYPE p0    = native_exp(score0 - m_exp);
                 const ACC_TYPE p1    = native_exp(score1 - m_exp);
 
+#if defined(FA16_PROBE_NO_LDS_V)
+                // WRONG MATH, diagnostic: keep every FMA of the PV accumulate but feed
+                // both V operands from one register instead of 2*SPLIT_DV_VEC distinct
+                // __local reads. Sizes how much of the kernel is PV-side LDS issue.
+                const ACC_TYPE4 vprobe = CONVERT_KV_ACC4(FA_LV(j, dv_off));
+                FA_UNROLL
+                for (int i = 0; i < SPLIT_DV_VEC; ++i) {
+                    o_acc[i] = O_ST4(O_LD4(o_acc[i]) * sp
+                             + p0 * vprobe
+                             + p1 * vprobe);
+                }
+#elif defined(FA_V_LDS_T)
+                FA_UNROLL
+                for (int i = 0; i < SPLIT_DV_VEC; ++i) {
+                    // 2 KV rows adjacent in the transposed tile: one 128-bit local read.
+                    const half8 vv = FA_LV_PAIR(dv_off + i, j);
+                    o_acc[i] = O_ST4(O_LD4(o_acc[i]) * sp
+                             + p0 * CONVERT_KV_ACC4(vv.lo)
+                             + p1 * CONVERT_KV_ACC4(vv.hi));
+                }
+#else
                 FA_UNROLL
                 for (int i = 0; i < SPLIT_DV_VEC; ++i) {
                     o_acc[i] = O_ST4(O_LD4(o_acc[i]) * sp
                              + p0 * CONVERT_KV_ACC4(l_v[j  ][dv_off + i])
                              + p1 * CONVERT_KV_ACC4(l_v[j+1][dv_off + i]));
                 }
+#endif
                 l_i = l_i * sp + p0 + p1;
                 m_i = m_new;
             }
@@ -525,7 +561,7 @@ __kernel void FA_TILE_NAME(
                 const ACC_TYPE p = local_p[q_lane][j];
                 FA_UNROLL
                 for (int i = 0; i < SPLIT_DV_VEC; ++i) {
-                    o_acc[i] = O_ST4(mad(p, CONVERT_KV_ACC4(l_v[j][dv_off + i]), O_LD4(o_acc[i])));
+                    o_acc[i] = O_ST4(mad(p, CONVERT_KV_ACC4(FA_LV(j, dv_off + i)), O_LD4(o_acc[i])));
                 }
             }
         }
@@ -619,6 +655,32 @@ __kernel void FA_TILE_NAME(
                 const ACC_TYPE p2         = native_exp(s2 - m_exp);
                 const ACC_TYPE p3         = native_exp(s3 - m_exp);
 
+#if defined(FA16_PROBE_NO_LDS_V)
+                // WRONG MATH, diagnostic: same FMA count, one register instead of four
+                // distinct __local V reads per dv element.
+                const ACC_TYPE4 vprobe = CONVERT_KV_ACC4(FA_LV(j, 0));
+                FA_UNROLL
+                for (int i = 0; i < DV_VEC; ++i) {
+                    o_acc[i] = O_ST4(mad(p3, vprobe,
+                               mad(p2, vprobe,
+                               mad(p1, vprobe,
+                               mad(p0, vprobe,
+                               O_LD4(o_acc[i]) * scale_prev)))));
+                }
+#elif defined(FA_V_LDS_T)
+                FA_UNROLL
+                for (int i = 0; i < DV_VEC; ++i) {
+                    // 4 KV rows adjacent in the transposed tile: two 128-bit local reads
+                    // instead of four 64-bit ones.
+                    const half8 vv01 = FA_LV_PAIR(i, j);
+                    const half8 vv23 = FA_LV_PAIR(i, j + 2);
+                    o_acc[i] = O_ST4(mad(p3, CONVERT_KV_ACC4(vv23.hi),
+                               mad(p2, CONVERT_KV_ACC4(vv23.lo),
+                               mad(p1, CONVERT_KV_ACC4(vv01.hi),
+                               mad(p0, CONVERT_KV_ACC4(vv01.lo),
+                               O_LD4(o_acc[i]) * scale_prev)))));
+                }
+#else
                 FA_UNROLL
                 for (int i = 0; i < DV_VEC; ++i) {
                     o_acc[i] = O_ST4(mad(p3, CONVERT_KV_ACC4(l_v[j+3][i]),
@@ -627,6 +689,7 @@ __kernel void FA_TILE_NAME(
                                mad(p0, CONVERT_KV_ACC4(l_v[j][i]),
                                O_LD4(o_acc[i]) * scale_prev)))));
                 }
+#endif
                 l_i = l_i * scale_prev + p0 + p1 + p2 + p3;
                 m_i = m_new;
             }

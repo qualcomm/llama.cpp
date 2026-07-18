@@ -5572,6 +5572,14 @@ static std::string ggml_opencl_fa_compile_opts(ggml_backend_opencl_context * bac
     if (ggml_cl_env_flag("GGML_OPENCL_FA16_PROBE_NO_LDS")) {
         opts += " -D FA16_PROBE_NO_LDS";
     }
+    // NOT ggml_cl_env_flag: that is a bare presence check, and a shell that clears a
+    // flag by assigning "0" would silently leave the wrong-math probe on.
+    {
+        const char * e = getenv("GGML_OPENCL_FA16_PROBE_NO_LDS_V");
+        if (e != nullptr && e[0] != '\0' && e[0] != '0') {
+            opts += " -D FA16_PROBE_NO_LDS_V";
+        }
+    }
     // Transposed K tile in local memory: the KV rows the QK loop walks together become
     // adjacent, so a group of them is ONE 128-bit local read instead of several narrow
     // ones. The QK loop is LDS-read-issue-bound (a wrong-math probe that kept every FMA/dp4a
@@ -5587,6 +5595,16 @@ static std::string ggml_opencl_fa_compile_opts(ggml_backend_opencl_context * bac
         const char * e = getenv("GGML_OPENCL_FA_K_LDS_T");
         if ((e == nullptr || e[0] != '0') && cfg->dk <= 128) {
             opts += " -D FA_K_LDS_T";
+        }
+    }
+    // Transposed V tile: same layout trick for the PV accumulate, which post-K-transpose
+    // issues MORE narrow local reads per KV-row group than the QK loop (2/4x half4 vs
+    // 1/2x half8). Layout-only, bit-identical output. Opt-in while under A/B
+    // (GGML_OPENCL_FA_V_LDS_T=1); same DV<=128 tile-size reasoning as the K gate.
+    {
+        const char * e = getenv("GGML_OPENCL_FA_V_LDS_T");
+        if (e != nullptr && e[0] != '\0' && e[0] != '0' && cfg->dv <= 128) {
+            opts += " -D FA_V_LDS_T";
         }
     }
     return opts;
