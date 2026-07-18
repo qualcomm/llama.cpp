@@ -5599,11 +5599,13 @@ static std::string ggml_opencl_fa_compile_opts(ggml_backend_opencl_context * bac
     }
     // Transposed V tile: same layout trick for the PV accumulate, which post-K-transpose
     // issues MORE narrow local reads per KV-row group than the QK loop (2/4x half4 vs
-    // 1/2x half8). Layout-only, bit-identical output. Opt-in while under A/B
-    // (GGML_OPENCL_FA_V_LDS_T=1); same DV<=128 tile-size reasoning as the K gate.
+    // 1/2x half8). Layout-only, bit-identical output. +14.7% on the DK=DV=64 ViT prefill,
+    // neutral (+0.4-0.9%, tg canary flat) on DK=128 f16 LM prefill. Same DV<=128 gate as
+    // the K tile (DK=256 measured negative for the K transpose; not re-derived for V).
+    // Default on within that gate; GGML_OPENCL_FA_V_LDS_T=0 restores the row-major tile.
     {
         const char * e = getenv("GGML_OPENCL_FA_V_LDS_T");
-        if (e != nullptr && e[0] != '\0' && e[0] != '0' && cfg->dv <= 128) {
+        if ((e == nullptr || e[0] != '0') && cfg->dv <= 128) {
             opts += " -D FA_V_LDS_T";
         }
     }
