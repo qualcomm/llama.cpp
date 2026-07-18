@@ -1714,6 +1714,13 @@ static cl_program build_program_from_binary(cl_context ctx, cl_device_id dev, co
     return p;
 }
 
+// Runtime dp4a (cl_khr_integer_dot_product) availability, mirrored to file scope so the
+// backend_ctx-less use_q*k_tiled helpers can gate the int-dot-only tiled kernels. Some
+// Adreno compilers #define the extension macro even when the runtime does not implement
+// the builtin (e.g. Adreno 642L / E031.38), so gate on this, not on a kernel #ifdef.
+// Set in ggml_cl_init.
+static bool g_ggml_cl_has_int_dot = false;
+
 static void load_cl_kernels_argsort(ggml_backend_opencl_context *backend_ctx) {
     // compiler options for general kernels
     auto opencl_c_std =
@@ -3114,7 +3121,10 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
     }
 
     // mul_mm_q8_0_f32_kq_dp4a (dp4a fa=0 prefill KQ off a q8_0 K cache)
-    {
+    // int-dot-only (raw dot_acc_sat_4x8packed_ss_int, no fallback); gate the load on the
+    // runtime flag — an Adreno that #defines the extension macro without runtime support
+    // (642L) otherwise fails to build it (err=-11).
+    if (backend_ctx->has_integer_dot_product) {
 #ifdef GGML_OPENCL_EMBED_KERNELS
         const std::string kernel_src {
             #include "mul_mm_q8_0_f32_kq_dp4a.cl.h"
@@ -4651,7 +4661,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 
     // gemv_noshuffle_q4_k_f32_tiled — tiled-wide canonical layout, default ON
     // (opt out: GGML_OPENCL_Q4K_GEMV_TILED=0; separate convert + GEMV; weights via __global).
-    {
+    // int-dot-only kernel; gate the load on the runtime flag (mirrors use_q4k_tiled).
+    if (backend_ctx->has_integer_dot_product) {
 #ifdef GGML_OPENCL_EMBED_KERNELS
         const std::string kernel_src {
             #include "gemv_noshuffle_q4_k_f32_tiled.cl.h"
@@ -5331,7 +5342,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 
     // gemm_noshuffle_q6_k_f32_tiled — batched (N>1) GEMM over the same tiled-wide
     // canonical layout, so batched lm_head/embed stays correct + on GPU.
-    {
+    // int-dot-only kernel; gate the load on the runtime flag (mirrors use_q6k_tiled).
+    if (backend_ctx->has_integer_dot_product) {
 #ifdef GGML_OPENCL_EMBED_KERNELS
         const std::string kernel_src {
             #include "gemm_noshuffle_q6_k_f32_tiled.cl.h"
@@ -7448,6 +7460,7 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
     // the full signed int8 range). Do not map one onto the other without settling that.
     backend_ctx->has_integer_dot_product =
         strstr(ext_buffer, "cl_khr_integer_dot_product") != NULL;
+    g_ggml_cl_has_int_dot = backend_ctx->has_integer_dot_product;
 
     cl_uint base_align_in_bits;
     CL_CHECK(clGetDeviceInfo(device, CL_DEVICE_MEM_BASE_ADDR_ALIGN, sizeof(cl_uint), &base_align_in_bits, NULL));
@@ -9692,7 +9705,7 @@ inline bool q6k_gemv_tiled_enabled() {
 // Only the long-vocab lm_head/embed shapes use the tiled layout; ne01 % 64 == 0
 // is required by the 64-row tiling (no row padding in the buffers).
 inline bool use_q6k_tiled(const ggml_tensor *tensor) {
-    return q6k_gemv_tiled_enabled() && tensor->type == GGML_TYPE_Q6_K &&
+    return g_ggml_cl_has_int_dot && q6k_gemv_tiled_enabled() && tensor->type == GGML_TYPE_Q6_K &&
            tensor->ne[1] >= 32768 && tensor->ne[1] % 64 == 0;
 }
 
@@ -9709,7 +9722,7 @@ inline bool q4k_gemv_tiled_enabled() {
     return en;
 }
 inline bool use_q4k_tiled(const ggml_tensor *tensor) {
-    return q4k_gemv_tiled_enabled() && tensor->type == GGML_TYPE_Q4_K &&
+    return g_ggml_cl_has_int_dot && q4k_gemv_tiled_enabled() && tensor->type == GGML_TYPE_Q4_K &&
            tensor->ne[1] >= 32768 && tensor->ne[1] % 64 == 0;
 }
 
