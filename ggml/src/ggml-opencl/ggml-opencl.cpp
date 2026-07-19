@@ -21478,7 +21478,8 @@ static void ggml_cl_mul_mat_iq4_nl_f32_adreno(ggml_backend_t backend, const ggml
         static const char * iq4nl_dense_dp4a_env = getenv("GGML_OPENCL_IQ4NL_DENSE_DP4A");
         bool iq4nl_dense_dp4a_on = iq4nl_dense_dp4a_env
             ? (atoi(iq4nl_dense_dp4a_env) != 0)
-            : backend_ctx->adreno_x2_class();
+            // E17 (Adreno 850): same dp4a miscompile family as q4_K/q5_K (bug4). Default off there.
+            : (backend_ctx->adreno_x2_class() && !adreno_art_compiler_quirks(backend_ctx));
         if (iq4nl_dense_dp4a_on && backend_ctx->kernel_gemm_noshuffle_iq4_nl_q8_1_dp4a
                 && N > 8 && (K % 32 == 0) && (M % 64 == 0)) {
             cl_mem a_sub = nullptr;
@@ -22351,7 +22352,10 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
             ? true
             : q4k_dense_dp4a_env
             ? (atoi(q4k_dense_dp4a_env) != 0)
-            : backend_ctx->adreno_x2_class();
+            // E17/art.api37 (Adreno 850) miscompiles the dp4a q4_K/q5_K GEMM (bug4):
+            // wrong results at large N => garbage on every prefill >=~128 tokens (all VLM,
+            // long context). Keep the default off there; env override still forces it.
+            : (backend_ctx->adreno_x2_class() && !adreno_art_compiler_quirks(backend_ctx));
         // Min N for the dp4a prefill GEMM. Default 9 (ne1>8 = large-batch prefill;
         // ne1<=8 keeps the cok/mc3 small-batch kernels). Lowered via env to A/B the
         // MTP/spec-decode verify regime (ne1=2..8) -- see the q4k_smalln_dp4a path.
@@ -23217,7 +23221,8 @@ static void ggml_cl_mul_mat_q5_K_f32_adreno(ggml_backend_t backend, const ggml_t
         static const char * q5k_dense_dp4a_env = getenv("GGML_OPENCL_Q5K_DENSE_DP4A");
                      bool   q5k_dense_dp4a_on  = q5k_dense_dp4a_env
             ? (atoi(q5k_dense_dp4a_env) != 0)
-            : backend_ctx->adreno_x2_class();
+            // E17 (Adreno 850) miscompiles this dp4a GEMM (bug4) -- default off there.
+            : (backend_ctx->adreno_x2_class() && !adreno_art_compiler_quirks(backend_ctx));
         if (q5k_dense_dp4a_on && ne1 > 8 && (ne00 % 32 == 0) && (ne01 % 64 == 0)) {
             const int Mm = ne01, Nn = ne1, Kk = ne00;
             const size_t n_blocks = (size_t)Nn * (Kk / 32);
