@@ -147,6 +147,34 @@ struct clip_hparams {
         warmup_image_size = n_tok_per_side * patch_size * n_merge;
         // TODO: support warmup size for custom token numbers
     }
+
+    // Cap image tokens (and the warmup size) so the *unfused* ViT attention fits a
+    // GPU with a bounded per-context allocation. Only ever LOWERS the limit; a
+    // stricter user --image-max-tokens is preserved. Called only when the compute
+    // backend has no flash attention (e.g. Adreno 850 / E17), so FA-capable
+    // backends and the CPU backend keep their exact behavior.
+    void cap_image_tokens_for_no_fa(int hard_cap_tokens) {
+        const int patch_area = patch_size * patch_size * n_merge * n_merge;
+        if (patch_area <= 0 || hard_cap_tokens <= 0) {
+            return;
+        }
+        int cap = hard_cap_tokens;
+        if (image_max_pixels > 0) {
+            const int cur_max_tokens = image_max_pixels / patch_area;
+            if (cur_max_tokens > 0 && cur_max_tokens < cap) {
+                cap = cur_max_tokens; // never raise an already-lower model limit
+            }
+        }
+        if (custom_image_max_tokens > 0 && custom_image_max_tokens < cap) {
+            cap = custom_image_max_tokens; // respect a stricter user setting
+        }
+        custom_image_max_tokens = cap;
+        image_max_pixels = cap * patch_area;
+        const int warmup_side = static_cast<int>(std::sqrt((double) image_max_pixels));
+        if (warmup_image_size <= 0 || warmup_image_size > warmup_side) {
+            warmup_image_size = warmup_side;
+        }
+    }
     // sam vit deepseek-ocr
     std::vector<int32_t> global_attn_indices() const {
         return {  2,  5,  8, 11 };

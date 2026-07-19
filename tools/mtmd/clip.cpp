@@ -2948,7 +2948,22 @@ struct clip_model_loader {
                 LOG_WRN("%s: please report this on github as an issue\n", __func__);
                 LOG_WRN("%s: *****************************************************************\n", __func__);
                 ctx_clip.flash_attn_type = CLIP_FLASH_ATTN_TYPE_DISABLED;
-                reserve_compute_meta(ctx_clip, batch);
+                // Without flash attention the ViT attention materializes the full
+                // NxN score matrix; at native image resolution this OOMs a GPU with a
+                // bounded per-context allocation (e.g. Adreno 850, whose E17 compiler
+                // cannot build the flash_attn programs), turning -ngl 99 into a crash
+                // unless the user passes --image-max-tokens/--no-warmup. Cap image
+                // tokens so the unfused path fits and it just works. Gated on
+                // (no FA) AND (non-CPU backend): FA-capable GPUs never reach this
+                // branch and the CPU backend is excluded, so their behavior is
+                // byte-identical.
+                if (ctx_clip.backend != ctx_clip.backend_cpu) {
+                    ctx_clip.model.hparams.cap_image_tokens_for_no_fa(1024);
+                    auto capped_batch = get_dummy_batch(ctx_clip);
+                    reserve_compute_meta(ctx_clip, capped_batch);
+                } else {
+                    reserve_compute_meta(ctx_clip, batch);
+                }
             }
         } else {
             info = reserve_compute_meta(ctx_clip, batch);
