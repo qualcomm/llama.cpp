@@ -4630,18 +4630,6 @@ static std::string ggml_opencl_fa_compile_opts(ggml_backend_opencl_context * bac
     if (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X1E) {
         opts += " -D FA_C8_NO_SG_PIN";
     }
-    // WRONG MATH, diagnostic only: see FA_PROBE_* in flash_attn_f32_q8_0.cl. Note the
-    // non-empty test -- a bare getenv() presence check treats VAR="" as SET, and a shell
-    // that "clears" a flag by assigning an empty string then silently leaves it on.
-    if (ggml_cl_env_flag("GGML_OPENCL_FA_PROBE_NO_LDS")) {
-        opts += " -D FA_PROBE_NO_LDS";
-    }
-    if (ggml_cl_env_flag("GGML_OPENCL_FA_PROBE_NO_QK")) {
-        opts += " -D FA_PROBE_NO_QK";
-    }
-    if (ggml_cl_env_flag("GGML_OPENCL_FA16_PROBE_NO_LDS")) {
-        opts += " -D FA16_PROBE_NO_LDS";
-    }
     // Transposed K tile in local memory: the KV rows the QK loop walks together become
     // adjacent, so a group of them is ONE 128-bit local read instead of several narrow
     // ones. The QK loop is LDS-read-issue-bound (a wrong-math probe that kept every FMA/dp4a
