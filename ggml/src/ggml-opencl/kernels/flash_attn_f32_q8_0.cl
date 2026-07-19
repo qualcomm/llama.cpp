@@ -1579,28 +1579,7 @@ __kernel void flash_attn_f32_q8_0(
                 for (int b_local = 0; b_local < SPLIT_DK_Q8_BLOCKS; ++b_local) {
                     const int b = k_blk_base + b_local;
                     int sum0 = 0, sum1 = 0, sum2 = 0, sum3 = 0;
-#if defined(FA_PROBE_NO_QK)
-                    // WRONG MATH, diagnostic. Delete the QK dot entirely (no LDS reads, no
-                    // dp4a) to size what share of this kernel the QK loop even is -- the
-                    // kernel also does the online softmax and the PV accumulate.
-                    sum0 = (int) l_k_packed[j][b * 8];
-                    sum1 = sum0; sum2 = sum0; sum3 = sum0;
-#elif defined(FA_PROBE_NO_LDS)
-                    // WRONG MATH, diagnostic. The 4-row unroll amortizes the PRIVATE Q read,
-                    // but each dp4a still takes its K operand from a distinct __local address,
-                    // so the K side is 1 LDS read per dp4a. Hoist one K value into a register
-                    // and reuse it: same dp4a count, 32x fewer LDS reads. If that is much
-                    // faster the QK loop is LDS-issue-bound.
-                    const uint kprobe = l_k_packed[j][b * 8];
-                    #pragma unroll
-                    for (int g = 0; g < 8; ++g) {
-                        const uint qp = q_packed_pf[b_local * 8 + g];
-                        sum0 = dot_acc_sat_4x8packed_ss_int(qp, kprobe, sum0);
-                        sum1 = dot_acc_sat_4x8packed_ss_int(qp, kprobe, sum1);
-                        sum2 = dot_acc_sat_4x8packed_ss_int(qp, kprobe, sum2);
-                        sum3 = dot_acc_sat_4x8packed_ss_int(qp, kprobe, sum3);
-                    }
-#elif defined(FA_K_LDS_T)
+#if defined(FA_K_LDS_T)
                     // The 4 KV rows are adjacent in the transposed tile, so each (b, g)
                     // step is ONE 128-bit local read instead of four 32-bit ones.
                     #pragma unroll

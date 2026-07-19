@@ -315,14 +315,7 @@ __kernel void FA_TILE_NAME(
                 FA_UNROLL
                 for (int k = 0; k < SPLIT_DK_VEC; k++) {
                     const ACC_TYPE4 qk = q_priv[k];
-#if defined(FA16_PROBE_NO_LDS)
-                    // WRONG MATH, diagnostic: keep every FMA but read one K value from a
-                    // register instead of two distinct __local addresses. If this is much
-                    // faster the loop is LDS-issue-bound (as the dp4a QK loop is).
-                    const ACC_TYPE4 kprobe = CONVERT_KV_ACC4(FA_LK(j, dk_off));
-                    ACC_TYPE4 dot0 = qk * kprobe;
-                    ACC_TYPE4 dot1 = qk * kprobe;
-#elif defined(FA_K_LDS_T)
+#if defined(FA_K_LDS_T)
                     // 2 KV rows adjacent in the transposed tile: one 128-bit local read.
                     const half8 kk = FA_LK_PAIR(dk_off + k, j);
                     ACC_TYPE4 dot0 = qk * CONVERT_KV_ACC4(kk.lo);
@@ -396,11 +389,7 @@ __kernel void FA_TILE_NAME(
             ACC_TYPE4 dot_acc = (ACC_TYPE4)(0.0f);
             FA_UNROLL
             for (int k = 0; k < SPLIT_DK_VEC; k++) {
-#ifdef FA16_PROBE_NO_LDS
-                dot_acc = mad(q_priv[k], CONVERT_KV_ACC4(FA_LK(j, dk_off)), dot_acc);
-#else
                 dot_acc = mad(q_priv[k], CONVERT_KV_ACC4(FA_LK(j, dk_off + k)), dot_acc);
-#endif
             }
             local_partial[j][tid] =
                 dot_acc.s0 + dot_acc.s1 + dot_acc.s2 + dot_acc.s3;
@@ -493,15 +482,7 @@ __kernel void FA_TILE_NAME(
                 FA_UNROLL
                 for (int k = 0; k < DK_VEC; k++) {
                     const ACC_TYPE4 qk = q_priv[k];
-#if defined(FA16_PROBE_NO_LDS)
-                    // WRONG MATH, diagnostic: same FMA count, one register instead of four
-                    // distinct __local reads.
-                    const ACC_TYPE4 kprobe = CONVERT_KV_ACC4(FA_LK(j, 0));
-                    dot_acc0 = mad(qk, kprobe, dot_acc0);
-                    dot_acc1 = mad(qk, kprobe, dot_acc1);
-                    dot_acc2 = mad(qk, kprobe, dot_acc2);
-                    dot_acc3 = mad(qk, kprobe, dot_acc3);
-#elif defined(FA_K_LDS_T)
+#if defined(FA_K_LDS_T)
                     // 4 KV rows adjacent in the transposed tile: two 128-bit local reads
                     // instead of four 64-bit ones.
                     const half8 kk01 = FA_LK_PAIR(k, j);
