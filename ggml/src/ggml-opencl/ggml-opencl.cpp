@@ -857,7 +857,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_softplus_f16, kernel_softplus_f16_4, kernel_softplus_f16_nc;
     cl_kernel kernel_upscale;
     cl_kernel kernel_upscale_bilinear;
-    cl_kernel kernel_concat_f32, kernel_concat_f32_pack;
+    cl_kernel kernel_concat_b1, kernel_concat_b2, kernel_concat_b4, kernel_concat_b8, kernel_concat_b4_pack;
     cl_kernel kernel_conv_2d_f16;
     cl_kernel kernel_conv_2d_f32;
     cl_kernel kernel_conv_2d_f16_f32;
@@ -3039,8 +3039,11 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
-        CL_CHECK((backend_ctx->kernel_concat_f32 = clCreateKernel(prog, "kernel_concat_f32", &err), err));
-        CL_CHECK((backend_ctx->kernel_concat_f32_pack = clCreateKernel(prog, "kernel_concat_f32_pack", &err), err));
+        CL_CHECK((backend_ctx->kernel_concat_b1 = clCreateKernel(prog, "kernel_concat_b1", &err), err));
+        CL_CHECK((backend_ctx->kernel_concat_b2 = clCreateKernel(prog, "kernel_concat_b2", &err), err));
+        CL_CHECK((backend_ctx->kernel_concat_b4 = clCreateKernel(prog, "kernel_concat_b4", &err), err));
+        CL_CHECK((backend_ctx->kernel_concat_b8 = clCreateKernel(prog, "kernel_concat_b8", &err), err));
+        CL_CHECK((backend_ctx->kernel_concat_b4_pack = clCreateKernel(prog, "kernel_concat_b4_pack", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
@@ -7267,7 +7270,13 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                 return S_v == 16 || S_v == 32 || S_v == 64 || S_v == 128;
             }
         case GGML_OP_CONCAT:
-            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
+            {
+                const ggml_type t = op->src[0]->type;
+                return op->src[1]->type == t && op->type == t &&
+                       !ggml_is_quantized(t) && ggml_blck_size(t) == 1 &&
+                       (ggml_type_size(t) == 1 || ggml_type_size(t) == 2 ||
+                        ggml_type_size(t) == 4 || ggml_type_size(t) == 8);
+            }
         case GGML_OP_TIMESTEP_EMBEDDING:
             return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
         case GGML_OP_GROUP_NORM:
@@ -14010,9 +14019,8 @@ static void ggml_cl_concat(ggml_backend_t backend, const ggml_tensor * src0, con
     GGML_ASSERT(src1->extra);
     GGML_ASSERT(dst);
     GGML_ASSERT(dst->extra);
-    GGML_ASSERT(src0->type == GGML_TYPE_F32);
-    GGML_ASSERT(src1->type == GGML_TYPE_F32);
-    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(src0->type == src1->type);
+    GGML_ASSERT(src0->type == dst->type);
 
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
 
@@ -14054,9 +14062,21 @@ static void ggml_cl_concat(ggml_backend_t backend, const ggml_tensor * src0, con
 
     int nth = MIN(64, ne0);
 
-    const bool concat_pack = (dim == 0 && ne0 < 32);
-    cl_kernel kernel = concat_pack ? backend_ctx->kernel_concat_f32_pack
-                                   : backend_ctx->kernel_concat_f32;
+    const size_t ts = ggml_type_size(dst->type);
+    // the pack kernel copies 4-byte elements, so it is only valid for those.
+    const bool concat_pack = (dim == 0 && ne0 < 32 && ts == 4);
+    cl_kernel kernel;
+    if (concat_pack) {
+        kernel = backend_ctx->kernel_concat_b4_pack;
+    } else {
+        switch (ts) {
+            case 1:  kernel = backend_ctx->kernel_concat_b1; break;
+            case 2:  kernel = backend_ctx->kernel_concat_b2; break;
+            case 4:  kernel = backend_ctx->kernel_concat_b4; break;
+            case 8:  kernel = backend_ctx->kernel_concat_b8; break;
+            default: GGML_ABORT("unsupported concat element size: %zu", ts);
+        }
+    }
 
     CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0->data_device));
     CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_ulong), &offset0));
@@ -16217,7 +16237,6 @@ static void ggml_cl_mul_mat_q4_0_f32_adreno(ggml_backend_t backend, const ggml_t
         cl_mem b_sub_buf_trans = nullptr;
         cl_mem b_img = nullptr;
         cl_mem b_img_trans = nullptr;
-        cl_mem d_sub_buf = nullptr;
 
         // subbuffer for activations
         region.origin = offset1;
@@ -16252,11 +16271,6 @@ static void ggml_cl_mul_mat_q4_0_f32_adreno(ggml_backend_t backend, const ggml_t
         img_desc.image_width = K * (N + padding) / 4;
         img_desc.buffer = b_sub_buf_trans;
         CL_CHECK((b_img_trans = clCreateImage(context, 0, &img_fmt, &img_desc, NULL, &err), err));
-
-        // subbuffer for output
-        region.origin = extrad->offset; // Specify the starting offset (in bytes)
-        region.size = M * N * sizeof(float); // Specify the size of the sub-buffer
-        CL_CHECK((d_sub_buf = clCreateSubBuffer(extrad->data_device, CL_MEM_WRITE_ONLY, CL_BUFFER_CREATE_TYPE_REGION, &region, &err), err));
 
         // transpose activations
         int height_B = N/4;
@@ -16297,11 +16311,12 @@ static void ggml_cl_mul_mat_q4_0_f32_adreno(ggml_backend_t backend, const ggml_t
         CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),   &extra0_q4_0->q));
         CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem),   &extra0_q4_0->d));
         CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem),   &b_img_trans));
-        CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_mem),   &d_sub_buf));
-        CL_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_int),   &ne01));
-        CL_CHECK(clSetKernelArg(kernel, 5, sizeof(cl_int),   &padded_N));
-        CL_CHECK(clSetKernelArg(kernel, 6, sizeof(cl_int),   &ne00));
-        CL_CHECK(clSetKernelArg(kernel, 7, sizeof(cl_int),   &ne1));
+        CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_mem),   &extrad->data_device));
+        CL_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_ulong), &offsetd));
+        CL_CHECK(clSetKernelArg(kernel, 5, sizeof(cl_int),   &ne01));
+        CL_CHECK(clSetKernelArg(kernel, 6, sizeof(cl_int),   &padded_N));
+        CL_CHECK(clSetKernelArg(kernel, 7, sizeof(cl_int),   &ne00));
+        CL_CHECK(clSetKernelArg(kernel, 8, sizeof(cl_int),   &ne1));
 
         size_t global_work_size[3] = {(size_t)CEIL_DIV(ne1, 8), (size_t)CEIL_DIV(ne01, 4), 1};
         size_t local_work_size[3] = {1, 128, 1};
@@ -16325,7 +16340,6 @@ static void ggml_cl_mul_mat_q4_0_f32_adreno(ggml_backend_t backend, const ggml_t
         CL_CHECK(clReleaseMemObject(b_sub_buf_trans));
         CL_CHECK(clReleaseMemObject(b_img));
         CL_CHECK(clReleaseMemObject(b_img_trans));
-        CL_CHECK(clReleaseMemObject(d_sub_buf));
     }
 #else
     GGML_UNUSED(backend);
