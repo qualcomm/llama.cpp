@@ -1421,6 +1421,8 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemm_noshuffle_q4_0_f32;
     cl_kernel kernel_gemv_noshuffle_q4_0_f32;
     cl_kernel kernel_gemv_noshuffle_q4_0_f32_mc3;  // multi-column (N=3) verify GEMV (spec/MTP)
+    cl_kernel kernel_gemv_noshuffle_q4_0_f32_splitk;  // split-K across WGs (small-M decode)
+    cl_kernel kernel_gemv_noshuffle_q4_0_f32_glu;     // fused gate+up GEMV + GLU (q4_0 FFN)
     cl_kernel kernel_gemv_noshuffle_q4_0_f32_4096_1_11008;
     cl_kernel kernel_gemv_noshuffle_q4_0_f32_4096_1_4096;
     cl_kernel kernel_gemv_noshuffle_q4_0_f32_11008_1_4096;
@@ -4110,6 +4112,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 
         CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q4_0_f32 = clCreateKernel(prog, "kernel_gemv_noshuffle_q4_0_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q4_0_f32_mc3 = clCreateKernel(prog, "kernel_gemv_noshuffle_q4_0_f32_mc3", &err), err));
+        CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q4_0_f32_splitk = clCreateKernel(prog, "kernel_gemv_noshuffle_q4_0_f32_splitk", &err), err));
+        CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q4_0_f32_glu = clCreateKernel(prog, "kernel_gemv_noshuffle_q4_0_f32_glu", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
@@ -8512,8 +8516,20 @@ static bool ggml_opencl_can_fuse(const ggml_backend_opencl_context * backend_ctx
         if (gate->ne[1] != 1 || up->ne[1] != 1) {
             return false;
         }
-        // both projections must be q4_K weights, f32 activation/output
-        if (gate->src[0]->type != GGML_TYPE_Q4_K || up->src[0]->type != GGML_TYPE_Q4_K ||
+        // both projections must be q4_K (default) or q4_0, f32 activation/output.
+        // q4_0 GLU fusion: default ON for validated gens (gen_level >= X1E: X1E/A8X/X2E
+        // and newer), opt-in on A7X/A6X (unvalidated). Env overrides:
+        // GGML_OPENCL_FUSE_MM_GLU_Q40=1 forces on, =0 forces off. q4_K stays default-on.
+        const bool wg_q4_0 = gate->src[0]->type == GGML_TYPE_Q4_0;
+        const bool wg_q4_k = gate->src[0]->type == GGML_TYPE_Q4_K;
+        static const int fuse_glu_q40_env = []{ const char*e=std::getenv("GGML_OPENCL_FUSE_MM_GLU_Q40"); return (e && e[0] != '\0') ? (e[0] != '0' ? 1 : 0) : -1; }();
+        const bool fuse_glu_q40_on = fuse_glu_q40_env < 0
+            ? (backend_ctx->gen_level >= GEN_LEVEL_X1E)
+            : (fuse_glu_q40_env == 1);
+        if (wg_q4_0 && !fuse_glu_q40_on) {
+            return false;
+        }
+        if ((!wg_q4_0 && !wg_q4_k) || up->src[0]->type != gate->src[0]->type ||
             gate->src[1]->type != GGML_TYPE_F32  || up->src[1]->type != GGML_TYPE_F32  ||
             gate->type != GGML_TYPE_F32 || up->type != GGML_TYPE_F32 || glu->type != GGML_TYPE_F32) {
             return false;
@@ -8547,8 +8563,8 @@ static bool ggml_opencl_can_fuse(const ggml_backend_opencl_context * backend_ctx
             return false;
         }
         // the fused kernel reads the standard noshuffle image layout; the tiled
-        // layout packs weights differently -> defer those to the per-op path
-        if (use_q4k_tiled(gate->src[0]) || use_q4k_tiled(up->src[0])) {
+        // layout packs weights differently -> defer those to the per-op path (q4_K only)
+        if (wg_q4_k && (use_q4k_tiled(gate->src[0]) || use_q4k_tiled(up->src[0]))) {
             return false;
         }
         // that noshuffle layout is only produced at set_tensor time when
@@ -8895,6 +8911,7 @@ static void ggml_opencl_op_rms_norm_mul_add_fused(ggml_backend_t backend, ggml_t
 static void ggml_opencl_op_rms_norm_mul_add_scale_fused(ggml_backend_t backend, ggml_tensor * rms_norm_tensor, ggml_tensor * mul_tensor, ggml_tensor * add_tensor, ggml_tensor * mul2_tensor);
 static void ggml_cl_rope_rms_fused(ggml_backend_t backend, ggml_tensor * rms_norm_tensor, ggml_tensor * mul_tensor, ggml_tensor * rope_tensor);
 static void ggml_cl_mul_mat_q4_k_glu_fused(ggml_backend_t backend, ggml_tensor * gate_tensor, ggml_tensor * up_tensor, ggml_tensor * glu_tensor);
+static void ggml_cl_mul_mat_q4_0_glu_fused(ggml_backend_t backend, ggml_tensor * gate_tensor, ggml_tensor * up_tensor, ggml_tensor * glu_tensor);
 static void ggml_cl_mul_mat_id_q4_k_glu_fused(ggml_backend_t backend, ggml_tensor * mmid_tensor, ggml_tensor * glu_tensor);
 static void ggml_cl_mul_mat_id_mxfp4_glu_fused(ggml_backend_t backend, ggml_tensor * gate_mm, ggml_tensor * gate_add, ggml_tensor * up_mm, ggml_tensor * up_add, ggml_tensor * glu_tensor);
 static void ggml_cl_rope_rms_set_rows_fused(ggml_backend_t backend, ggml_tensor * rms_norm_tensor, ggml_tensor * mul_tensor, ggml_tensor * rope_tensor, ggml_tensor * set_rows_tensor);
@@ -9246,7 +9263,11 @@ static void ggml_backend_opencl_exec_graph_nodes(ggml_backend_t backend, ggml_cg
         // same scalar GLU formula). Default on, opt-out GGML_OPENCL_FUSE_MM_GLU=0.
         if (backend_ctx->fuse_mm_glu && !backend_ctx->disable_fusion &&
             ggml_opencl_can_fuse(backend_ctx, cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU })) {
-            ggml_cl_mul_mat_q4_k_glu_fused(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
+            if (node->src[0]->type == GGML_TYPE_Q4_0) {
+                ggml_cl_mul_mat_q4_0_glu_fused(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
+            } else {
+                ggml_cl_mul_mat_q4_k_glu_fused(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
+            }
             i += 2;
             continue;
         }
@@ -16335,6 +16356,91 @@ static void ggml_cl_mul_mat_q4_k_glu_fused(ggml_backend_t backend, ggml_tensor *
 #endif
 }
 
+// q4_0 variant of the fused gate+up decode GEMV + GLU. Same structure as the q4_K
+// version minus the min/6-bit-scale machinery (q4_0 has only a per-block d scale).
+static void ggml_cl_mul_mat_q4_0_glu_fused(ggml_backend_t backend, ggml_tensor * gate_tensor, ggml_tensor * up_tensor, ggml_tensor * glu_tensor) {
+#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+    GGML_ASSERT(gate_tensor && up_tensor && glu_tensor);
+    const ggml_tensor * Wg   = gate_tensor->src[0];
+    const ggml_tensor * Wu   = up_tensor->src[0];
+    const ggml_tensor * src1 = gate_tensor->src[1];   // == up_tensor->src[1]
+    const ggml_tensor * dst  = glu_tensor;
+    GGML_ASSERT(Wg && Wg->extra); GGML_ASSERT(Wu && Wu->extra);
+    GGML_ASSERT(src1 && src1->extra); GGML_ASSERT(dst && dst->extra);
+
+    ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
+    ggml_tensor_extra_cl       * extra1  = (ggml_tensor_extra_cl *)src1->extra;
+    ggml_tensor_extra_cl       * extrad  = (ggml_tensor_extra_cl *)dst->extra;
+    ggml_tensor_extra_cl_q4_0  * extra_g = (ggml_tensor_extra_cl_q4_0 *)Wg->extra;
+    ggml_tensor_extra_cl_q4_0  * extra_u = (ggml_tensor_extra_cl_q4_0 *)Wu->extra;
+
+    cl_ulong offset1 = extra1->offset + src1->view_offs;
+    cl_ulong offsetd = extrad->offset + dst->view_offs;
+
+    const int K = Wg->ne[0];
+    const int M = Wg->ne[1];
+    const int N = 1;
+    const int glu_op = (int)ggml_get_glu_op(dst);
+
+    cl_context context = backend_ctx->context;
+    cl_int           err;
+    cl_image_format  img_fmt;
+    cl_image_desc    img_desc;
+    cl_buffer_region region;
+
+    img_fmt = { CL_R, CL_UNSIGNED_INT32 };
+    memset(&img_desc, 0, sizeof(img_desc));
+    img_desc.image_type  = CL_MEM_OBJECT_IMAGE1D_BUFFER;
+    img_desc.image_width = (size_t)M * K / 2 / 4;
+    img_desc.buffer      = extra_g->q;
+    cl_mem qg_img = nullptr, qu_img = nullptr;
+    CL_CHECK((qg_img = clCreateImage(context, CL_MEM_READ_ONLY, &img_fmt, &img_desc, NULL, &err), err));
+    img_desc.buffer = extra_u->q;
+    CL_CHECK((qu_img = clCreateImage(context, CL_MEM_READ_ONLY, &img_fmt, &img_desc, NULL, &err), err));
+
+    region.origin = offset1;
+    region.size   = (size_t)K * N * sizeof(float);
+    cl_mem b_sub_buf = nullptr, b_img = nullptr;
+    CL_CHECK((b_sub_buf = clCreateSubBuffer(extra1->data_device, 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &err), err));
+    img_fmt = { CL_RGBA, CL_FLOAT };
+    memset(&img_desc, 0, sizeof(img_desc));
+    img_desc.image_type  = CL_MEM_OBJECT_IMAGE1D_BUFFER;
+    img_desc.image_width = (size_t)K * N / 4;
+    img_desc.buffer      = b_sub_buf;
+    CL_CHECK((b_img = clCreateImage(context, CL_MEM_READ_ONLY, &img_fmt, &img_desc, NULL, &err), err));
+
+    cl_kernel kernel = backend_ctx->kernel_gemv_noshuffle_q4_0_f32_glu;
+    CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),   &qg_img));
+    CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem),   &extra_g->d));
+    CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem),   &qu_img));
+    CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_mem),   &extra_u->d));
+    CL_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_mem),   &b_img));
+    CL_CHECK(clSetKernelArg(kernel, 5, sizeof(cl_mem),   &extrad->data_device));
+    CL_CHECK(clSetKernelArg(kernel, 6, sizeof(cl_ulong), &offsetd));
+    CL_CHECK(clSetKernelArg(kernel, 7, sizeof(cl_int),   &K));
+    CL_CHECK(clSetKernelArg(kernel, 8, sizeof(cl_int),   &M));
+    CL_CHECK(clSetKernelArg(kernel, 9, sizeof(cl_int),   &glu_op));
+
+    // float4 reduceLM (gate+up packed) = 2x the base LDS; cap nsg at 8 (LDS/deadlock
+    // guard, same as the q4_K GLU kernel). Kernel reduceLM is sized for nsg<=8.
+    size_t maxwg = backend_ctx->get_kernel_workgroup_size(kernel);
+    size_t nsg_y = 8;
+    while (nsg_y > 1 && 64 * nsg_y > maxwg) { nsg_y >>= 1; }
+    size_t local_work_size[3]  = { 64, nsg_y, 1 };
+    size_t global_work_size[3] = { (size_t)CEIL_DIV(M / 2, 64) * 64, nsg_y, 1 };
+
+    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+
+    CL_CHECK(clReleaseMemObject(qg_img));
+    CL_CHECK(clReleaseMemObject(qu_img));
+    CL_CHECK(clReleaseMemObject(b_img));
+    CL_CHECK(clReleaseMemObject(b_sub_buf));
+#else
+    GGML_UNUSED(backend); GGML_UNUSED(gate_tensor); GGML_UNUSED(up_tensor); GGML_UNUSED(glu_tensor);
+    GGML_ABORT("q4_0 GLU fusion requires GGML_OPENCL_USE_ADRENO_KERNELS");
+#endif
+}
+
 // Fused combined-gate_up MoE GEMV + GLU. mmid_tensor = the mul_mat_id over the
 // combined ffn_gate_up_exps weight (rows [0,n_ff)=gate, [n_ff,2n_ff)=up);
 // glu_tensor = the GLU on the two row-halves. Folds the GLU into the MoE GEMV
@@ -20293,6 +20399,72 @@ static void ggml_cl_mul_mat_q4_0_f32_adreno(ggml_backend_t backend, const ggml_t
         img_desc.image_width = K * N / 4;
         img_desc.buffer = b_sub_buf;
         CL_CHECK((b_img = clCreateImage(context, CL_MEM_READ_ONLY, &img_fmt, &img_desc, NULL, &err), err));
+
+        // Split-K across workgroups for small-M q4_0 decode GEMVs (ffn_down, attn
+        // projections). A single-token GEMV makes only CEIL_DIV(M/2,64) workgroups;
+        // for small M those under-fill the 16 CUs so the matmul is bandwidth-starved.
+        // A ksplit second grid dim spreads K across more WGs (+ a reduce pass) to raise
+        // in-flight bytes toward the DRAM streaming rate. Same layout/dequant as the
+        // base kernel -> coherent. Default ON for validated gens (gen_level >= X1E:
+        // X1E / A8X / X2E and newer); opt-in on A7X/A6X (unvalidated -- A7X compiler
+        // quirks). Env overrides: GGML_OPENCL_Q40_GEMV_SPLITK=1 forces on, =0 forces
+        // off, unset = per-gen default.
+        static const int q40_splitk_env = []{
+            const char * e = std::getenv("GGML_OPENCL_Q40_GEMV_SPLITK");
+            return (e && e[0] != '\0') ? (e[0] != '0' ? 1 : 0) : -1;   // -1 = per-gen default
+        }();
+        const bool q40_splitk_on = q40_splitk_env < 0
+            ? (backend_ctx->gen_level >= GEN_LEVEL_X1E)
+            : (q40_splitk_env == 1);
+        static const int q40_splitk_maxm = []{ const char*e=std::getenv("GGML_OPENCL_Q40_SPLITK_MAXM"); return e?atoi(e):0; }();
+        const int    splitk_maxm = q40_splitk_maxm > 0 ? q40_splitk_maxm : 2560;
+        const bool use_q40_splitk = q40_splitk_on && !use_q40_mc3 && ne1 == 1
+                                    && ne01 <= splitk_maxm && (ne01 % 2 == 0);
+        if (use_q40_splitk) {
+            static const int nsg_env = []{ const char*e=std::getenv("GGML_OPENCL_Q40_SPLITK_NSG"); return e?atoi(e):0; }();
+            static const int ks_env  = []{ const char*e=std::getenv("GGML_OPENCL_Q40_SPLITK_K");   return e?atoi(e):0; }();
+            const int    nsg    = nsg_env > 0 ? nsg_env : 4;
+            // Target ~24 total workgroups (~1.5 per CU on the 16-CU X2-90): more splits
+            // add reduce overhead and over-subscribe (K6/K8 measured at or below the
+            // non-split baseline). base_wg = CEIL_DIV(M/2,64); ksplit = ceil(24/base_wg),
+            // clamped [1,8] (M=1536->2, 2560->2, 2048->2, 512->6). Override with
+            // GGML_OPENCL_Q40_SPLITK_K.
+            const int    base_wg = (int)CEIL_DIV(ne01/2, 64);
+            int          ksplit_def = (24 + base_wg - 1) / base_wg;
+            ksplit_def = ksplit_def < 1 ? 1 : (ksplit_def > 8 ? 8 : ksplit_def);
+            const int    ksplit = ks_env > 0 ? ks_env : ksplit_def;
+            const size_t gx     = (size_t)CEIL_DIV(ne01/2, 64) * 64;
+
+            backend_ctx->prealloc_splitk_partial.allocate(
+                backend_ctx->context, (size_t)ksplit * ne01 * sizeof(float));
+            cl_mem partial = backend_ctx->prealloc_splitk_partial.buffer;
+
+            cl_kernel ks = backend_ctx->kernel_gemv_noshuffle_q4_0_f32_splitk;
+            CL_CHECK(clSetKernelArg(ks, 0, sizeof(cl_mem), &q_img));
+            CL_CHECK(clSetKernelArg(ks, 1, sizeof(cl_mem), &extra0_q4_0->d));
+            CL_CHECK(clSetKernelArg(ks, 2, sizeof(cl_mem), &b_img));
+            CL_CHECK(clSetKernelArg(ks, 3, sizeof(cl_mem), &partial));
+            CL_CHECK(clSetKernelArg(ks, 4, sizeof(cl_int), &ne00));
+            CL_CHECK(clSetKernelArg(ks, 5, sizeof(cl_int), &ne01));
+            size_t lsk[3] = {64, (size_t)nsg, 1};
+            size_t gsk[3] = {gx, (size_t)(nsg * ksplit), 1};
+            backend_ctx->enqueue_ndrange_kernel(ks, 3, gsk, lsk, dst);
+
+            cl_kernel kr = backend_ctx->kernel_gemv_splitk_reduce_f32;
+            CL_CHECK(clSetKernelArg(kr, 0, sizeof(cl_mem),   &partial));
+            CL_CHECK(clSetKernelArg(kr, 1, sizeof(cl_mem),   &extrad->data_device));
+            CL_CHECK(clSetKernelArg(kr, 2, sizeof(cl_ulong), &offsetd));
+            CL_CHECK(clSetKernelArg(kr, 3, sizeof(cl_int),   &ne01));
+            CL_CHECK(clSetKernelArg(kr, 4, sizeof(cl_int),   &ksplit));
+            size_t lr[3] = {64, 1, 1};
+            size_t gr[3] = {(size_t)CEIL_DIV(ne01, 64) * 64, 1, 1};
+            backend_ctx->enqueue_ndrange_kernel(kr, 3, gr, lr, dst);
+
+            CL_CHECK(clReleaseMemObject(q_img));
+            CL_CHECK(clReleaseMemObject(b_sub_buf));
+            CL_CHECK(clReleaseMemObject(b_img));
+            return;
+        }
 
         if (use_q40_mc3) {
             kernel = backend_ctx->kernel_gemv_noshuffle_q4_0_f32_mc3;
