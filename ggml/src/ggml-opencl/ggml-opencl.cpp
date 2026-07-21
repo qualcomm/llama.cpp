@@ -1438,6 +1438,7 @@ struct ggml_backend_opencl_context {
 
     // Gemm and Gemv related programs, kernels, etc
     cl_kernel kernel_gemm_noshuffle_q4_0_f32;
+    cl_kernel kernel_gemm_noshuffle_q4_0_f32_cok;  // cooperative-K small-batch GEMM (spec/MTP verify)
     cl_kernel kernel_gemv_noshuffle_q4_0_f32;
     cl_kernel kernel_gemv_noshuffle_q4_0_f32_mc3;  // multi-column (N=3) verify GEMV (spec/MTP)
     cl_kernel kernel_gemv_noshuffle_q4_0_f32_splitk;  // split-K across WGs (small-M decode)
@@ -4255,6 +4256,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog = build_program_from_source(backend_ctx, kernel_src_CL_gemm.c_str(), compile_opts);
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_0_f32 = clCreateKernel(prog, "kernel_gemm_noshuffle_q4_0_f32", &err), err));
+        CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_0_f32_cok = clCreateKernel(prog, "kernel_gemm_noshuffle_q4_0_f32_cok", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
@@ -20881,7 +20883,19 @@ static void ggml_cl_mul_mat_q4_0_f32_adreno(ggml_backend_t backend, const ggml_t
         backend_ctx->enqueue_ndrange_kernel(kernel, 2, global_work_size_t, local_work_size_t, dst);
 
         // gemm
-        kernel = backend_ctx->kernel_gemm_noshuffle_q4_0_f32;
+        // Cooperative-K (intra-WG K-split + reduction) for the small-batch
+        // (n_q in [2..8]) path — the q4_0 twin of the q4_K _cok gate above.
+        // OPT-IN for now: GGML_OPENCL_Q40_GEMM_COK=1. The default q4_0 GEMM has
+        // no K parallelism at small n_q, which is why q4_0's verify-batch cost
+        // is flat in k (V=5.78 at k=2/4/8 on X2-90) while q4_K sits at ~2.7 --
+        // see feature-report/mtp-verify-cost-V-restudy-2026-07-21.md. Requires
+        // ne01 % 64 == 0 (one row per lane, 64 lanes/WG) and ne00 % 32 == 0.
+        static const char * q40_cok_env = getenv("GGML_OPENCL_Q40_GEMM_COK");
+        static const bool   q40_gemm_cok = (q40_cok_env != nullptr) && (atoi(q40_cok_env) != 0);
+        const bool use_q40_cok = q40_gemm_cok && (ne1 <= 8) && (ne01 % 64 == 0) && (ne00 % 32 == 0);
+
+        kernel = use_q40_cok ? backend_ctx->kernel_gemm_noshuffle_q4_0_f32_cok
+                             : backend_ctx->kernel_gemm_noshuffle_q4_0_f32;
         int padded_N = N + padding;
 
         CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),   &extra0_q4_0->q));
@@ -20895,7 +20909,16 @@ static void ggml_cl_mul_mat_q4_0_f32_adreno(ggml_backend_t backend, const ggml_t
 
         size_t global_work_size[3] = {(size_t)CEIL_DIV(ne1, 8), (size_t)CEIL_DIV(ne01, 4), 1};
         size_t local_work_size[3] = {1, 128, 1};
-        if (ne0 == 4096 && ne1 == 128 && ne10 == 4096) {
+        if (use_q40_cok) {
+            // (COK_SG lanes x COK_NSG subgroups): one row per lane, K split
+            // across the COK_NSG subgroups.
+            global_work_size[0] = (size_t)ne01;   // rows
+            global_work_size[1] = 8;              // COK_NSG
+            global_work_size[2] = 1;
+            local_work_size[0]  = 64;             // COK_SG
+            local_work_size[1]  = 8;              // COK_NSG
+            local_work_size[2]  = 1;
+        } else if (ne0 == 4096 && ne1 == 128 && ne10 == 4096) {
             local_work_size[0] = 1;
             local_work_size[1] = 128;
         } else if (ne0 == 11008 && ne1 == 128 && ne10 == 4096) {
