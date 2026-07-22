@@ -20970,6 +20970,7 @@ static void ggml_cl_mul_mat_q4_0_f32_adreno(ggml_backend_t backend, const ggml_t
         cl_mem b_sub_buf_trans = nullptr;
         cl_mem b_img = nullptr;
         cl_mem b_img_trans = nullptr;
+        cl_mem d_sub_buf = nullptr;
 
         // subbuffer for activations
         region.origin = offset1;
@@ -21004,6 +21005,11 @@ static void ggml_cl_mul_mat_q4_0_f32_adreno(ggml_backend_t backend, const ggml_t
         img_desc.image_width = K * (N + padding) / 4;
         img_desc.buffer = b_sub_buf_trans;
         CL_CHECK((b_img_trans = clCreateImage(context, 0, &img_fmt, &img_desc, NULL, &err), err));
+
+        // subbuffer for output
+        region.origin = extrad->offset; // Specify the starting offset (in bytes)
+        region.size = M * N * sizeof(float); // Specify the size of the sub-buffer
+        CL_CHECK((d_sub_buf = clCreateSubBuffer(extrad->data_device, CL_MEM_WRITE_ONLY, CL_BUFFER_CREATE_TYPE_REGION, &region, &err), err));
 
         // transpose activations
         int height_B = N/4;
@@ -21056,12 +21062,11 @@ static void ggml_cl_mul_mat_q4_0_f32_adreno(ggml_backend_t backend, const ggml_t
         CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),   &extra0_q4_0->q));
         CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem),   &extra0_q4_0->d));
         CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem),   &b_img_trans));
-        CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_mem),   &extrad->data_device));
-        CL_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_ulong), &offsetd));
-        CL_CHECK(clSetKernelArg(kernel, 5, sizeof(cl_int),   &ne01));
-        CL_CHECK(clSetKernelArg(kernel, 6, sizeof(cl_int),   &padded_N));
-        CL_CHECK(clSetKernelArg(kernel, 7, sizeof(cl_int),   &ne00));
-        CL_CHECK(clSetKernelArg(kernel, 8, sizeof(cl_int),   &ne1));
+        CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_mem),   &d_sub_buf));
+        CL_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_int),   &ne01));
+        CL_CHECK(clSetKernelArg(kernel, 5, sizeof(cl_int),   &padded_N));
+        CL_CHECK(clSetKernelArg(kernel, 6, sizeof(cl_int),   &ne00));
+        CL_CHECK(clSetKernelArg(kernel, 7, sizeof(cl_int),   &ne1));
 
         size_t global_work_size[3] = {(size_t)CEIL_DIV(ne1, 8), (size_t)CEIL_DIV(ne01, 4), 1};
         size_t local_work_size[3] = {1, 128, 1};
@@ -21094,6 +21099,7 @@ static void ggml_cl_mul_mat_q4_0_f32_adreno(ggml_backend_t backend, const ggml_t
         CL_CHECK(clReleaseMemObject(b_sub_buf_trans));
         CL_CHECK(clReleaseMemObject(b_img));
         CL_CHECK(clReleaseMemObject(b_img_trans));
+        CL_CHECK(clReleaseMemObject(d_sub_buf));
     }
 #else
     GGML_UNUSED(backend);
