@@ -516,7 +516,7 @@ kernel void kernel_gemv_noshuffle_q4_k_f32_glu(
     ts.s1 += wq[12].s1*sy.s4; ts.s1 += wq[13].s1*sy.s5; ts.s1 += wq[14].s1*sy.s6; ts.s1 += wq[15].s1*sy.s7; \
 }
 
-// Multi-column (N=3) variant of the q4_K decode GEMV, for the speculative /
+// Multi-column (N=2..4) variant of the q4_K decode GEMV, for the speculative /
 // MTP verify batch (ne1=3 = 2 drafts + 1 bonus). Stays on the efficient GEMV
 // path (subgroup-broadcast activation, NSUBGROUPS K-split) instead of the
 // transposed-GEMM dead-zone path. Each K-block's weights (regA_hi/regA_lo) are
@@ -611,9 +611,14 @@ kernel void kernel_gemv_noshuffle_q4_k_f32_mc3(
         { if (slid < 4) { regB.s0123 = read_imagef(src1, 1*COL_STRIDE     + slid*2 + k*8);
                           regB.s4567 = read_imagef(src1, 1*COL_STRIDE + 1 + slid*2 + k*8); }
           MAC_Q4K_BLOCK(ts1, wq_hi, regB, 0, 1); MAC_Q4K_BLOCK(ts1, wq_lo, regB, 2, 3); }
+        if (n_cols > 2)
         { if (slid < 4) { regB.s0123 = read_imagef(src1, 2*COL_STRIDE     + slid*2 + k*8);
                           regB.s4567 = read_imagef(src1, 2*COL_STRIDE + 1 + slid*2 + k*8); }
           MAC_Q4K_BLOCK(ts2, wq_hi, regB, 0, 1); MAC_Q4K_BLOCK(ts2, wq_lo, regB, 2, 3); }
+        if (n_cols > 3)
+        { if (slid < 4) { regB.s0123 = read_imagef(src1, 3*COL_STRIDE     + slid*2 + k*8);
+                          regB.s4567 = read_imagef(src1, 3*COL_STRIDE + 1 + slid*2 + k*8); }
+          MAC_Q4K_BLOCK(ts3, wq_hi, regB, 0, 1); MAC_Q4K_BLOCK(ts3, wq_lo, regB, 2, 3); }
 #elif defined(Q4K_MC3_DEQUANT_LDS)
         // LDS-staged dequant: dequant a 32-block ONCE into the per-WI LDS slot
         // (hi pass then lo pass, overwriting), MAC each column from LDS. ts*
