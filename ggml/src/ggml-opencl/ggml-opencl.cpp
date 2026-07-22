@@ -16230,7 +16230,13 @@ static void ggml_cl_mul_mat_q4_0_f32_adreno(ggml_backend_t backend, const ggml_t
         CL_CHECK((b_img_trans = clCreateImage(context, 0, &img_fmt, &img_desc, NULL, &err), err));
 
         // subbuffer for output
-        region.origin = extrad->offset; // Specify the starting offset (in bytes)
+        // Honor dst->view_offs, like the q4_1 / q8_0 dense GEMMs and the GEMV path
+        // above already do. offsetd (computed at the top of this function) is
+        // extrad->offset + dst->view_offs; using extrad->offset alone writes a view
+        // at its parent's base. Completes the sweep started in #25910.
+        GGML_ASSERT((offsetd % backend_ctx->alignment) == 0 &&
+                    "q4_0 GEMM output sub-buffer origin must satisfy CL_DEVICE_MEM_BASE_ADDR_ALIGN");
+        region.origin = offsetd; // Specify the starting offset (in bytes)
         region.size = M * N * sizeof(float); // Specify the size of the sub-buffer
         CL_CHECK((d_sub_buf = clCreateSubBuffer(extrad->data_device, CL_MEM_WRITE_ONLY, CL_BUFFER_CREATE_TYPE_REGION, &region, &err), err));
 
