@@ -549,8 +549,12 @@ kernel void kernel_gemv_noshuffle_q4_k_f32_mc3(
     uint K = ne00;
     uint M = ne01;
 
+    uint nsg            = get_local_size(1);   // K-split chosen by the host
     uint LINE_STRIDE_A  = M / 2;
-    uint BLOCK_STRIDE_A = NSUBGROUPS * M;
+    // Physical per-K-block stride in the packed image: 8 uints/block-row-pair *
+    // (M/2) row-pairs = 4*M uints. A layout constant, NOT tied to nsg (it was
+    // NSUBGROUPS*M, which was only ever right because nsg was always 4).
+    uint BLOCK_STRIDE_A = 4 * M;
     uint COL_STRIDE     = K / 4;   // float4 pixels per activation column
 
     private uint4  regA_hi, regA_lo;
@@ -571,7 +575,7 @@ kernel void kernel_gemv_noshuffle_q4_k_f32_mc3(
     local half2 * ws = wstage + (groupId * SUBGROUP_SIZE + slid) * 16;
 #endif
 
-    for (uint k = groupId; k < (K / 32); k += NSUBGROUPS) {
+    for (uint k = groupId; k < (K / 32); k += nsg) {
         uint sb = k / 8;
         uint j  = k % 8;
 
@@ -692,18 +696,23 @@ kernel void kernel_gemv_noshuffle_q4_k_f32_mc3(
     }
 
     // cross-subgroup reduce: pack the up-to-4 columns' float2 into a float8.
-    local float8 reduceLM[SUBGROUP_SIZE * 3];
+    // Generalized to nsg subgroups (was a hard-coded 4-wave unroll, which silently
+    // DISCARDED subgroups 4+ whenever the host dispatched a wider K-split). Sized
+    // for nsg <= 8: this kernel's CL_KERNEL_WORK_GROUP_SIZE is 512 = 64*8, so 8 is
+    // the widest split it can be dispatched at. At nsg == 4 the accumulation order
+    // is identical to the original unroll -> byte-identical.
+    local float8 reduceLM[SUBGROUP_SIZE * 7];
     float8 acc = (float8)(ts0.s0, ts0.s1, ts1.s0, ts1.s1, ts2.s0, ts2.s1, ts3.s0, ts3.s1);
-    if (groupId == 1) { reduceLM[SUBGROUP_SIZE * 0 + slid] = acc; }
-    if (groupId == 2) { reduceLM[SUBGROUP_SIZE * 1 + slid] = acc; }
-    if (groupId == 3) { reduceLM[SUBGROUP_SIZE * 2 + slid] = acc; }
+    if (groupId > 0) {
+        reduceLM[SUBGROUP_SIZE * (groupId - 1) + slid] = acc;
+    }
 
     barrier(CLK_LOCAL_MEM_FENCE);
 
     if (groupId == 0) {
-        acc += reduceLM[SUBGROUP_SIZE * 0 + slid];
-        acc += reduceLM[SUBGROUP_SIZE * 1 + slid];
-        acc += reduceLM[SUBGROUP_SIZE * 2 + slid];
+        for (uint i = 0; i < nsg - 1; ++i) {
+            acc += reduceLM[SUBGROUP_SIZE * i + slid];
+        }
         dst = (global float*)((global char*)dst + offsetd);
         // dst is column-major [M rows x n_cols cols]: (row, col) at col*M + row.
         // Guard output rows (padded x-grid); no-op / byte-identical for ne01 % 128 == 0.

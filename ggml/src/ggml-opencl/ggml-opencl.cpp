@@ -22568,6 +22568,20 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
         }();
         const bool   splitk_wide = splitk_wide_env && !use_tiled && !use_q4k_o4 && !use_mc3;
         size_t       nsg_y       = splitk_wide ? 16 : 4;
+        // mc3 now reads its K-split from get_local_size(1) (it used to hard-code 4
+        // in the loop stride, the block stride and the reduction), so the split is
+        // tunable here. Default stays 4 == previous behaviour; the kernel's real
+        // CL_KERNEL_WORK_GROUP_SIZE caps it (512 = 64*8 on X2-90 / 840).
+        if (use_mc3) {
+            static const int mc3_nsg_env = []{
+                const char * e = std::getenv("GGML_OPENCL_Q4K_MC3_NSG");
+                return (e && e[0]) ? atoi(e) : 4;
+            }();
+            size_t want = (size_t)(mc3_nsg_env > 0 ? mc3_nsg_env : 4);
+            const size_t maxwg = backend_ctx->get_kernel_workgroup_size(kernel);
+            while (want > 1 && 64 * want > maxwg) { want >>= 1; }
+            nsg_y = want;
+        }
         // Cap the wide K-split by the kernel's real max WG. X1-class drivers cap
         // this GEMV at 768 (< 64*16 = 1024), so an uncapped lws aborts the
         // dispatch with CL_INVALID_WORK_GROUP_SIZE (-54) and breaks ALL q4_K
