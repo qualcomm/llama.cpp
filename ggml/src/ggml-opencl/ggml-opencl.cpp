@@ -604,6 +604,9 @@ struct ggml_backend_opencl_context {
     ggml_cl_buffer prealloc_quant_trans;
     ggml_cl_buffer prealloc_scales_trans;
     ggml_cl_buffer prealloc_act_trans;
+    // staging output for the dense GEMMs when dst is a view whose byte offset does
+    // not satisfy CL_DEVICE_MEM_BASE_ADDR_ALIGN (see ggml_cl_mul_mat_q4_0_f32_adreno)
+    ggml_cl_buffer prealloc_gemm_dst;
     // q8_1-quantized reordered MoE activations for the dp4a prefill GEMM.
     ggml_cl_buffer prealloc_moe_qa;   // int8 quants  [tok_slots * ne00]
     ggml_cl_buffer prealloc_moe_da;   // per-block d  [tok_slots * ne00/32] (half)
@@ -16234,9 +16237,28 @@ static void ggml_cl_mul_mat_q4_0_f32_adreno(ggml_backend_t backend, const ggml_t
         CL_CHECK((b_img_trans = clCreateImage(context, 0, &img_fmt, &img_desc, NULL, &err), err));
 
         // subbuffer for output
-        region.origin = extrad->offset; // Specify the starting offset (in bytes)
-        region.size = M * N * sizeof(float); // Specify the size of the sub-buffer
-        CL_CHECK((d_sub_buf = clCreateSubBuffer(extrad->data_device, CL_MEM_WRITE_ONLY, CL_BUFFER_CREATE_TYPE_REGION, &region, &err), err));
+        // Honor dst->view_offs, like the q4_1 / q8_0 dense GEMMs and the GEMV path
+        // above already do. offsetd (computed at the top of this function) is
+        // extrad->offset + dst->view_offs; using extrad->offset alone writes a view
+        // at its parent's base. Completes the sweep started in #25910.
+        //
+        // A view may start at any element boundary, but clCreateSubBuffer requires
+        // CL_DEVICE_MEM_BASE_ADDR_ALIGN. When offsetd is not aligned, stage the GEMM
+        // output in a scratch buffer and copy it into place afterwards. Falling
+        // through to the generic mul_mat path is not an option here: under
+        // use_adreno_kernels the q4_0 weights are held in a repacked layout that
+        // only these kernels can read.
+        const size_t dst_size    = (size_t)M * N * sizeof(float);
+        const bool   dst_aligned = (offsetd % backend_ctx->alignment) == 0;
+
+        region.origin = dst_aligned ? offsetd : 0;
+        region.size   = dst_size;
+        if (dst_aligned) {
+            CL_CHECK((d_sub_buf = clCreateSubBuffer(extrad->data_device, CL_MEM_WRITE_ONLY, CL_BUFFER_CREATE_TYPE_REGION, &region, &err), err));
+        } else {
+            backend_ctx->prealloc_gemm_dst.allocate(context, dst_size);
+            CL_CHECK((d_sub_buf = clCreateSubBuffer(backend_ctx->prealloc_gemm_dst.buffer, 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &err), err));
+        }
 
         // transpose activations
         int height_B = N/4;
@@ -16300,6 +16322,12 @@ static void ggml_cl_mul_mat_q4_0_f32_adreno(ggml_backend_t backend, const ggml_t
         }
 
         backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+
+        if (!dst_aligned) {
+            // move the staged result to the misaligned view offset
+            CL_CHECK(clEnqueueCopyBuffer(backend_ctx->queue, backend_ctx->prealloc_gemm_dst.buffer,
+                                         extrad->data_device, 0, offsetd, dst_size, 0, NULL, NULL));
+        }
 
         CL_CHECK(clReleaseMemObject(b_sub_buf));
         CL_CHECK(clReleaseMemObject(b_sub_buf_trans));
