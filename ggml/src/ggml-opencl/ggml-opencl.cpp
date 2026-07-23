@@ -303,11 +303,16 @@ static ADRENO_GPU_GEN get_adreno_gpu_gen(const char *device_name) {
     //
     // Note for whoever adds the next gen-gated fast path: this puts the 850 at the same
     // capability level as the X2, so anything gated on that level is ON for it. That is
-    // correct for every path in the tree today (verified: the 850 passes MUL_MAT with the
-    // dense dp4a paths force-enabled). But its compiler is not the 840's, and it is known to
-    // miscompile some kernels the other Adrenos build correctly -- so a new path gated purely
-    // on capability level will reach it. Gate anything the E17 compiler cannot build on the
-    // compiler, not on the gen.
+    // NOT safe on its own, and the dense dp4a GEMMs are the standing example: its compiler
+    // is not the 840's and it miscompiles kernels the other Adrenos build correctly, so a
+    // path gated purely on capability level reaches it and returns wrong results. Those
+    // GEMMs are gated on adreno_dense_dp4a_default_on(), which subtracts the E17 compiler
+    // from the level. Gate anything the E17 compiler cannot build on the compiler, not the
+    // gen.
+    //
+    // Do not re-derive "it is fine" from a passing test-backend-ops sweep: the q4_K/q5_K
+    // shapes fail there, but the q6_K one PASSES the sweep and still corrupts real models
+    // (it needs ne1>8 prefill shapes with the model's own M/K to show up).
     if (strstr(device_name, "810") ||
         strstr(device_name, "830") ||
         strstr(device_name, "840") ||
@@ -628,6 +633,38 @@ struct ggml_backend_opencl_context {
     // optimistic init default (dialable with GGML_OPENCL_GEN_LEVEL).
     bool adreno_x2_class() const {
         return gpu_family == GPU_FAMILY::ADRENO && gen_level >= GEN_LEVEL_X2;
+    }
+
+    // ...and the level alone is still not sufficient for them, because it says
+    // the ISA generation wants the path, not that the driver's compiler can
+    // build it. The art.api37 / E17 compiler (Adreno 850) miscompiles the dense
+    // dp4a kernels at ne1>8 while building the same source correctly on every
+    // other Adreno. The 850 is rostered at A8X -- i.e. X2-class -- precisely so
+    // it inherits the tuned paths, which is exactly what makes a level-only gate
+    // turn a wrong-result path on there.
+    //
+    // Measured on the 850: with the dense dp4a defaults on, any Q4_K_M model
+    // emits garbage for prompts over 8 tokens (q6_K is the ffn_down/output
+    // weight of every Q4_K_M quant). Decode and short prompts are unaffected,
+    // which is why this is easy to miss. test-backend-ops catches the q4_K/q5_K
+    // shapes (4 FAIL) but NOT q6_K -- a passing sweep does not clear this.
+    //
+    // This is a negative workaround for one known compiler, so it is keyed on
+    // the compiler type and must NOT be inherited by a newer generation -- hence
+    // a type check here rather than a level comparison. The per-type
+    // GGML_OPENCL_*_DENSE_DP4A env overrides still force either way.
+    bool adreno_e17_compiler() const {
+        if (gpu_family != GPU_FAMILY::ADRENO ||
+            adreno_cl_compiler_version.type != ADRENO_CL_COMPILER_TYPE::E17) {
+            return false;
+        }
+        const char * env = getenv("GGML_OPENCL_ART_QUIRKS");
+        return !(env && env[0] == '0');
+    }
+    // Default gate for the dense dp4a prefill GEMMs: capability level AND a
+    // compiler that can build them.
+    bool adreno_dense_dp4a_default_on() const {
+        return adreno_x2_class() && !adreno_e17_compiler();
     }
 
     // Derived FA tuning (scale axis of the capability/scale model): computed
@@ -17066,7 +17103,7 @@ static void ggml_cl_mul_mat_iq4_nl_f32_adreno(ggml_backend_t backend, const ggml
         static const char * iq4nl_dense_dp4a_env = getenv("GGML_OPENCL_IQ4NL_DENSE_DP4A");
         bool iq4nl_dense_dp4a_on = iq4nl_dense_dp4a_env
             ? (atoi(iq4nl_dense_dp4a_env) != 0)
-            : backend_ctx->adreno_x2_class();
+            : backend_ctx->adreno_dense_dp4a_default_on();
         // dot prod has to be available
         iq4nl_dense_dp4a_on = backend_ctx->has_integer_dot && iq4nl_dense_dp4a_on;
 
@@ -17322,7 +17359,7 @@ static void ggml_cl_mul_mat_q8_0_f32_adreno(ggml_backend_t backend, const ggml_t
             ? true
             : q8_dense_dp4a_env
             ? (atoi(q8_dense_dp4a_env) != 0)
-            : (backend_ctx->adreno_x2_class() && !q8_bin_loaded);
+            : (backend_ctx->adreno_dense_dp4a_default_on() && !q8_bin_loaded);
         // dot prod has to be available
         q8_dense_dp4a_on = backend_ctx->has_integer_dot && q8_dense_dp4a_on;
 
@@ -17736,7 +17773,7 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
             ? true
             : q4k_dense_dp4a_env
             ? (atoi(q4k_dense_dp4a_env) != 0)
-            : backend_ctx->adreno_x2_class();
+            : backend_ctx->adreno_dense_dp4a_default_on();
 
         // dp4 has to be available
         q4k_dense_dp4a_on = backend_ctx->has_integer_dot && q4k_dense_dp4a_on;
@@ -17965,7 +18002,7 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
         static const char * q6k_dense_dp4a_env = getenv("GGML_OPENCL_Q6K_DENSE_DP4A");
                      bool   q6k_dense_dp4a_on  = (q6k_dense_dp4a_env != nullptr)
                                                    ? (atoi(q6k_dense_dp4a_env) != 0)
-                                                   : backend_ctx->adreno_x2_class();
+                                                   : backend_ctx->adreno_dense_dp4a_default_on();
         // dot prod has to be available
         q6k_dense_dp4a_on = backend_ctx->has_integer_dot && q6k_dense_dp4a_on;
 
@@ -18260,7 +18297,7 @@ static void ggml_cl_mul_mat_q5_K_f32_adreno(ggml_backend_t backend, const ggml_t
         static const char * q5k_dense_dp4a_env = getenv("GGML_OPENCL_Q5K_DENSE_DP4A");
                      bool   q5k_dense_dp4a_on  = q5k_dense_dp4a_env
             ? (atoi(q5k_dense_dp4a_env) != 0)
-            : backend_ctx->adreno_x2_class();
+            : backend_ctx->adreno_dense_dp4a_default_on();
         // dot prod has to be available
         q5k_dense_dp4a_on = backend_ctx->has_integer_dot && q5k_dense_dp4a_on;
 
