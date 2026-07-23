@@ -376,11 +376,17 @@ static ADRENO_GPU_GEN get_adreno_gpu_gen(const char *device_name) {
     //
     // Note for whoever adds the next gen-gated fast path: this puts the 850 at the same
     // capability level as the X2, so anything gated on that level is ON for it. That is
-    // correct for every path in the tree today (verified: the 850 passes MUL_MAT with the
-    // dense dp4a paths force-enabled). But its compiler is not the 840's, and it is known to
-    // miscompile some kernels the other Adrenos build correctly -- so a new path gated purely
-    // on capability level will reach it. Gate anything the E17 compiler cannot build on the
-    // compiler, not on the gen.
+    // NOT safe by itself, and the dense dp4a GEMMs are the standing example: its compiler
+    // is not the 840's and it miscompiles kernels the other Adrenos build correctly, so a
+    // path gated purely on capability level reaches it and returns wrong results. Those
+    // GEMMs are therefore gated on adreno_dense_dp4a_default_on(), which subtracts the E17
+    // compiler from the level. Gate anything the E17 compiler cannot build on the compiler,
+    // not on the gen.
+    //
+    // (An earlier revision of this comment claimed the level was "correct for every path in
+    // the tree today, verified: the 850 passes MUL_MAT with the dense dp4a paths
+    // force-enabled". That is wrong -- the miscompile is shape-dependent and needs ne1>8
+    // prefill shapes to show up. Do not re-derive that conclusion from a passing sweep.)
     if (strstr(device_name, "830") ||
         strstr(device_name, "840") ||
         strstr(device_name, "850")) {
@@ -9734,6 +9740,30 @@ static bool adreno_art_compiler_quirks(const ggml_backend_opencl_context *backen
     }
     const char * env = getenv("GGML_OPENCL_ART_QUIRKS");
     return !(env && env[0] == '0');
+}
+
+// Default gate for the *dense* dp4a prefill GEMMs (gemm_noshuffle_*_q8_1_dp4a).
+//
+// Two questions, not one. The capability level says the ISA generation wants the
+// path; it does not say the driver's compiler can build it. The art.api37 / E17
+// compiler (Adreno 850) miscompiles these kernels at ne1>8 while building the
+// same source correctly on every other Adreno, so a level-only gate silently
+// enables a wrong-result path there. The 850 is rostered at A8X, i.e. X2-class,
+// precisely so it inherits the tuned paths — which is why this one has to be
+// keyed on the compiler instead.
+//
+// Measured on the 850 (E17.51.05.00, art.api37): with the dense dp4a defaults on,
+// any Q4_K_M model emits garbage for prompts over 8 tokens (q6_K is the ffn_down /
+// output weight of every Q4_K_M quant); decode and short prompts are unaffected,
+// which is why casual testing misses it. Turning these back on via the per-type
+// env overrides reproduces it on demand.
+//
+// This is a negative workaround for one known compiler, so it must NOT be
+// inherited by a newer generation — hence the compiler-type check rather than a
+// level comparison. The per-type GGML_OPENCL_*_DENSE_DP4A env overrides still
+// force either way, so the paths stay measurable on the 850.
+static bool adreno_dense_dp4a_default_on(const ggml_backend_opencl_context *backend_ctx) {
+    return backend_ctx && backend_ctx->adreno_x2_class() && !adreno_art_compiler_quirks(backend_ctx);
 }
 
 inline bool use_adreno_moe_kernels(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor) {
@@ -21842,7 +21872,7 @@ static void ggml_cl_mul_mat_iq4_nl_f32_adreno(ggml_backend_t backend, const ggml
         static const char * iq4nl_dense_dp4a_env = getenv("GGML_OPENCL_IQ4NL_DENSE_DP4A");
         bool iq4nl_dense_dp4a_on = iq4nl_dense_dp4a_env
             ? (atoi(iq4nl_dense_dp4a_env) != 0)
-            : backend_ctx->adreno_x2_class();
+            : adreno_dense_dp4a_default_on(backend_ctx);
         if (iq4nl_dense_dp4a_on && backend_ctx->kernel_gemm_noshuffle_iq4_nl_q8_1_dp4a
                 && N > 8 && (K % 32 == 0) && (M % 64 == 0)) {
             cl_mem a_sub = nullptr;
@@ -22105,7 +22135,7 @@ static void ggml_cl_mul_mat_q8_0_f32_adreno(ggml_backend_t backend, const ggml_t
             ? true
             : q8_dense_dp4a_env
             ? (atoi(q8_dense_dp4a_env) != 0)
-            : (backend_ctx->adreno_x2_class() && !q8_bin_loaded);
+            : (adreno_dense_dp4a_default_on(backend_ctx) && !q8_bin_loaded);
         if (q8_dense_dp4a_on && backend_ctx->kernel_gemm_noshuffle_q8_0_q8_1_dp4a
                 && N > 8 && (K % 32 == 0) && (M % 64 == 0)) {
             cl_mem a_sub = nullptr;
@@ -22729,7 +22759,7 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
             ? true
             : q4k_dense_dp4a_env
             ? (atoi(q4k_dense_dp4a_env) != 0)
-            : backend_ctx->adreno_x2_class();
+            : adreno_dense_dp4a_default_on(backend_ctx);
         // Min N for the dp4a prefill GEMM. Default 9 (ne1>8 = large-batch prefill;
         // ne1<=8 keeps the cok/mc3 small-batch kernels). Lowered via env to A/B the
         // MTP/spec-decode verify regime (ne1=2..8) -- see the q4k_smalln_dp4a path.
@@ -23250,7 +23280,7 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
         static const char * q6k_dense_dp4a_env = getenv("GGML_OPENCL_Q6K_DENSE_DP4A");
         const bool          q6k_dense_dp4a_on  = q6k_dense_dp4a_env
             ? (atoi(q6k_dense_dp4a_env) != 0)
-            : backend_ctx->adreno_x2_class();
+            : adreno_dense_dp4a_default_on(backend_ctx);
         const bool is_output_w_dp4a = strncmp(src0->name, "output", 6) == 0 ||
                                       strncmp(src0->name, "token_embd", 10) == 0;
         if (q6k_dense_dp4a_on && !is_output_w_dp4a && ne1 > 8 && (ne00 % 32 == 0) && (ne01 % 64 == 0)) {
@@ -23595,7 +23625,7 @@ static void ggml_cl_mul_mat_q5_K_f32_adreno(ggml_backend_t backend, const ggml_t
         static const char * q5k_dense_dp4a_env = getenv("GGML_OPENCL_Q5K_DENSE_DP4A");
                      bool   q5k_dense_dp4a_on  = q5k_dense_dp4a_env
             ? (atoi(q5k_dense_dp4a_env) != 0)
-            : backend_ctx->adreno_x2_class();
+            : adreno_dense_dp4a_default_on(backend_ctx);
         if (q5k_dense_dp4a_on && ne1 > 8 && (ne00 % 32 == 0) && (ne01 % 64 == 0)) {
             const int Mm = ne01, Nn = ne1, Kk = ne00;
             const size_t n_blocks = (size_t)Nn * (Kk / 32);
