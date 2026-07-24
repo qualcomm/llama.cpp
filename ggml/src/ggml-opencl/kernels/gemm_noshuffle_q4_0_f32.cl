@@ -22,11 +22,13 @@ kernel void kernel_gemm_noshuffle_q4_0_f32(
         global const half  * src0_d,        // A scales
         __read_only image1d_buffer_t src1,  // B (1d image)
         global float * dst,                 // C
+        ulong offsetd,                      // byte offset into dst
         int m,                              // M
         int n,                              // N with padding
         int k,                              // K
         int n_no_padding                    // N without padding
 ) {
+    dst = (global float *)((global char *)dst + offsetd);
 
     int m_4 = m >> 2;
     int n_4 = n >> 2;
