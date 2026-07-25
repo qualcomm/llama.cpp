@@ -25416,9 +25416,23 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 
     // GEMM using local memory
     // Current BK = 16, so ne00 % 16 == 0
+    // The A7X (E031.41) compiler executes kernel_mul_mm_f32_f32_l4_lm at ~5.6 GFLOPS --
+    // ~10x below the same silicon's f16/q4_K kernels (57-113 GFLOPS) and ~75x below the
+    // A8X on the identical dispatch (98 vs 1.3 ms; register footprint 488 vs 304 B/WI).
+    // gemma-4's per-layer LAUREL pair (inp_gate [2560x256] + proj [256x2560], kept F32 by
+    // the quantizer) lands exactly there and eats 65% of E4B prefill GPU time on the 740.
+    // Bypass the tiled path for batched f32 on the A7X and fall through to the legacy
+    // f32 kernel below; the small-N mc GEMV (ne11 <= 8) is healthy there and keeps its
+    // route. Weights stay resident on the GPU, so decode placement is untouched (a
+    // supports_op decline measured +48% prefill but -37% decode from per-layer CPU
+    // round-trips). Override with GGML_OPENCL_A7X_F32_LM_BYPASS=0.
+    static const char * a7x_f32lm_env    = getenv("GGML_OPENCL_A7X_F32_LM_BYPASS");
+    static const bool   a7x_f32lm_bypass = (a7x_f32lm_env == nullptr || a7x_f32lm_env[0] != '0');
     if (src1t == GGML_TYPE_F32 &&
         ne00 % 16 == 0 &&
-        ne11 > 1) {
+        ne11 > 1 &&
+        !(a7x_f32lm_bypass && src0t == GGML_TYPE_F32 && ne11 > 8 &&
+          backend_ctx->adreno_gen == ADRENO_GPU_GEN::A7X)) {
         switch(src0t) {
             case GGML_TYPE_F32: {
                 // Small-N f32 GEMV for the spec/MTP verify batch: the tiled GEMM
