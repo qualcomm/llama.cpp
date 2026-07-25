@@ -20312,8 +20312,13 @@ static void ggml_cl_mul_mat_kq_kqv_adreno(ggml_backend_t backend, const ggml_ten
         // KQ
         region.size = nb01 * ne01;
     } else {
-        // KQV
-        region.size = nb02 * ne02;
+        // KQV. The kernel walks A with a per-head stride of nb01*M (it receives only
+        // nb01), so the gate only admits layouts where that walk is correct: packed
+        // heads (nb02 == nb01*ne01) or a single head (ne02 == 1). Under those layouts
+        // the span the kernel touches is nb01*ne01*ne02 bytes. nb02*ne02 is NOT that
+        // span when ne02 == 1 with a degenerate view stride (gemma's V collapses
+        // nb02 to nb01, sizing the image to a single row -- every m>0 read garbage).
+        region.size = nb01 * ne01 * ne02;
     }
 
     A_sub_buffer = clCreateSubBuffer((extra0->data_device), 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &status);
@@ -20323,9 +20328,29 @@ static void ggml_cl_mul_mat_kq_kqv_adreno(ggml_backend_t backend, const ggml_ten
 
     // create sub-buffer for B
     // <--------------------------------------------> //
-    region.origin = extra1->offset + src1->view_offs;
+    // Both kernels read B without stride arguments, but they expect DIFFERENT layouts:
+    //   - KQ reads the PHYSICAL Q buffer of the permuted view and does the permutation
+    //     arithmetic itself, so a non-contiguous src1 must be bound raw. Packing it to
+    //     logical order rewrites the physical layout under the kernel and corrupts every
+    //     KQ (this exact mistake shipped once: single-stream PPL 8.67 -> 26039).
+    //   - KQV reads B as a fully packed [D_B,N,K] buffer via vload4, so a non-contiguous
+    //     src1 (gemma's permuted probs view) must be packed into contiguous scratch
+    //     first. That is the same copy the generic l4_lm fallback performs, so it is not
+    //     new overhead versus the path it replaces.
+    cl_mem   b_data_device = extra1->data_device;
+    cl_ulong b_origin      = extra1->offset + src1->view_offs;
+    if (nb01 <= nb02 && !ggml_is_contiguous(src1)) {
+        // KQV only -- never repack B for KQ.
+        backend_ctx->prealloc_src1.allocate(backend_ctx->context, ggml_nbytes(src1));
+        cl_ulong cnb0, cnb1, cnb2, cnb3;
+        ggml_cl_copy_to_contiguous(backend, src1, backend_ctx->prealloc_src1.buffer,
+            cnb0, cnb1, cnb2, cnb3);
+        b_data_device = backend_ctx->prealloc_src1.buffer;
+        b_origin      = 0;
+    }
+    region.origin = b_origin;
     region.size = nb10 * ne10 * ne11 * ne12;
-    B_sub_buffer = clCreateSubBuffer((extra1->data_device), 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &status);
+    B_sub_buffer = clCreateSubBuffer(b_data_device, 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &status);
     CL_CHECK(status);
     // <--------------------------------------------> //
 
@@ -20336,7 +20361,8 @@ static void ggml_cl_mul_mat_kq_kqv_adreno(ggml_backend_t backend, const ggml_ten
         img_desc_1d.image_width = (nb01 * ne01 / 4)/4;
     }
     else {
-        img_desc_1d.image_width = (nb02 * ne02 / 4)/4;
+        // KQV: match the A span used for the sub-buffer above.
+        img_desc_1d.image_width = (nb01 * ne01 * ne02 / 4)/4;
     }
     img_desc_1d.buffer = A_sub_buffer;
     A_image1d = clCreateImage(context, CL_MEM_READ_ONLY, &img_fmt_1d, &img_desc_1d, NULL, &status);
@@ -24898,8 +24924,28 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             // contiguous V (nb01 < nb02, e.g. Qwen3) is handled identically to a permuted
             // view -- gate on the KQV shape (nb01 <= nb02), not on non-contiguity, so the
             // contiguous case stops falling to the pathological generic f16 mul_mm.
-            if (nb01 <= nb02 && ggml_is_contiguous(src1) &&
-                ((nb02 * ne02 / 4)/4 <= backend_ctx->image_max_buffer_size)) {
+            //
+            // Layout admission: the KQV kernel receives only nb01 and walks A with a
+            // per-head stride of nb01*ne01, so only layouts where that walk is correct
+            // may route: packed heads (nb02 == nb01*ne01, every transposed-V cache
+            // view) or a single head (ne02 == 1, gemma -- whose degenerate view stride
+            // nb02 == nb01 is also why the A span must be nb01*ne01*ne02, never
+            // nb02*ne02).
+            //
+            // The kernel reads B as a fully packed [D_B,N,K] buffer, so a
+            // non-contiguous src1 (gemma's permuted probs view feeding KQV) is packed
+            // into scratch by the dispatch first -- a copy the generic l4_lm fallback
+            // pays anyway. That routing is guarded by GGML_OPENCL_KQV_SRC1_COPY
+            // (default on) so an A/B can restore the old "contiguous-src1 only"
+            // routing in one binary. The KQ path (nb01 > nb02, sibling gate above) is
+            // NOT affected: its kernel wants the raw physical buffer of the permuted Q
+            // view, and the dispatch never repacks B for it.
+            static const char * kqv_src1_copy_env = getenv("GGML_OPENCL_KQV_SRC1_COPY");
+            static const bool   kqv_src1_copy_on  =
+                (kqv_src1_copy_env == nullptr || kqv_src1_copy_env[0] != '0');
+            if (nb01 <= nb02 && (ggml_is_contiguous(src1) || kqv_src1_copy_on) &&
+                (ne02 == 1 || nb02 == nb01 * ne01) &&
+                ((nb01 * ne01 * ne02 / 4)/4 <= backend_ctx->image_max_buffer_size)) {
                 ggml_cl_mul_mat_kq_kqv_adreno(backend, src0, src1, dst);
                 return;
             }
