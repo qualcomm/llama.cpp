@@ -18907,9 +18907,30 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 
     // GEMM using local memory
     // Current BK = 16, so ne00 % 16 == 0
+    //
+    // The Adreno A7X (E031.41) compiler executes kernel_mul_mm_f32_f32_l4_lm at
+    // ~5.6 GFLOPS -- ~10x below the same silicon's f16/q4_K kernels (57-113 GFLOPS)
+    // and ~75x below the following generation on the identical dispatch (98 vs
+    // 1.3 ms; register footprint 488 vs 304 B/WI for the same source). gemma-3n's
+    // per-layer projection pair (inp_gate [2560x256] + proj [256x2560], kept F32
+    // by quantization policy) lands exactly on this kernel and dominates prefill
+    // there. Route batched f32xf32 around the tiled path on the A7X and let it
+    // fall through to the per-row f32 kernel below, which that compiler handles
+    // fine. Small batches (ne11 <= 8) keep the tiled path -- it is healthy there
+    // (43-172 GFLOPS measured). Adreno 740, gemma-3n-E4B Q4_0, fa=0, 2048-token
+    // prefill pass on this base: 382 -> 350 s (+9%); the same bypass measures
+    // +70% E4B / +47% E2B on a tree whose other prefill paths are tuned, because
+    // the f32 kernel then dominates the pass. Decode is unchanged: weights stay
+    // GPU-resident (declining the op in supports_op instead moves the weight to
+    // a CPU buffer and costs -37% decode from per-layer round-trips).
+    // Override with GGML_OPENCL_A7X_F32_LM_BYPASS=0.
+    static const char * a7x_f32lm_env    = getenv("GGML_OPENCL_A7X_F32_LM_BYPASS");
+    static const bool   a7x_f32lm_bypass = (a7x_f32lm_env == nullptr || a7x_f32lm_env[0] != '0');
     if (src1t == GGML_TYPE_F32 &&
         ne00 % 16 == 0 &&
-        ne11 > 1) {
+        ne11 > 1 &&
+        !(a7x_f32lm_bypass && src0t == GGML_TYPE_F32 && ne11 > 8 &&
+          backend_ctx->adreno_gen == ADRENO_GPU_GEN::A7X)) {
         switch(src0t) {
             case GGML_TYPE_F32: {
                 kernel = backend_ctx->kernel_mul_mm_f32_f32_l4_lm;
