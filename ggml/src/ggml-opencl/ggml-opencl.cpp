@@ -1229,6 +1229,9 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mv_id_mxfp4_f32;
     cl_kernel kernel_mul_mv_id_mxfp4_f32_flat;
     cl_kernel kernel_mul_mm_f32_f32_l4_lm;
+    // Local size for the f32 l4_lm dispatch: (BM*BN)/(TM*TN). Set at program build
+    // when the tile is overridden per-device (A8X builds with -DTN=4 -> 256).
+    int f32_lm_nth0 = 128;
     cl_kernel kernel_gemv_f32_f32_mc;  // multi-column (small-N) f32 GEMV for spec/MTP verify
     cl_kernel kernel_mul_mm_f16_f32_l4_lm;
     cl_kernel kernel_mul_mm_q1_0_f32_l4_lm;
@@ -2944,8 +2947,25 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #else
         const std::string kernel_src = read_file("mul_mm_f32_f32_l4_lm.cl");
 #endif
+        // A8X: the shipped TM4xTN8 tile (32 f32 accumulators) is past the allocator's
+        // sweet spot -- E031.50 holds 304 B/WI and caps residency at 768. TN=4 (16
+        // accumulators, 224 B/WI, cap 1024) measures +36% on the batched f32 GEMM
+        // (56.4 -> 77.0 GFLOPS, m=4096 n=512 k=14336) and improves every small-n
+        // shape too (n=2: 1.7 -> 2.8 GFLOPS). A8X-only: unmeasured on X1/X2/850, and
+        // the A7X never reaches this kernel at batch (dispatch bypass above). The
+        // host must dispatch with the matching local size -- f32_lm_nth0 below.
+        // Override with GGML_OPENCL_A8X_F32_LM_TN4=0.
+        static const char * a8x_tn4_env = getenv("GGML_OPENCL_A8X_F32_LM_TN4");
+        static const bool   a8x_tn4_on  = (a8x_tn4_env == nullptr || a8x_tn4_env[0] != '0');
+        std::string f32_lm_opts = compile_opts;
+        if (a8x_tn4_on && backend_ctx->adreno_gen == ADRENO_GPU_GEN::A8X) {
+            f32_lm_opts += " -DTN=4";
+            backend_ctx->f32_lm_nth0 = 256;   // (BM*BN)/(TM*TN) = (64*64)/(4*4)
+        } else {
+            backend_ctx->f32_lm_nth0 = 128;   // (BM*BN)/(TM*TN) = (64*64)/(4*8)
+        }
         backend_ctx->program_mul_mm_f32_f32_l4_lm =
-            build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+            build_program_from_source(backend_ctx, kernel_src.c_str(), f32_lm_opts.c_str());
 
         CL_CHECK((backend_ctx->kernel_mul_mm_f32_f32_l4_lm = clCreateKernel(backend_ctx->program_mul_mm_f32_f32_l4_lm, "kernel_mul_mm_f32_f32_l4_lm", &err), err));
         CL_CHECK((backend_ctx->kernel_gemv_f32_f32_mc = clCreateKernel(backend_ctx->program_mul_mm_f32_f32_l4_lm, "kernel_gemv_f32_f32_mc", &err), err));
@@ -25465,7 +25485,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     return;
                 }
                 kernel = backend_ctx->kernel_mul_mm_f32_f32_l4_lm;
-                nth0 = 128; // calculated as (BM*BN)/(TM*TN)
+                nth0 = backend_ctx->f32_lm_nth0; // (BM*BN)/(TM*TN); 256 when A8X builds -DTN=4
 
                 int batch_stride_a = ne00*ne01;
                 int batch_stride_b = ne10*ne11;
