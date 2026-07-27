@@ -9762,6 +9762,32 @@ static bool adreno_art_compiler_quirks(const ggml_backend_opencl_context *backen
     return !(env && env[0] == '0');
 }
 
+// Devices whose per-kernel-launch host round-trip is so expensive that any optimization
+// which ADDS a dispatch loses, even when it makes the GPU strictly faster. Measured
+// 2026-07-26: ~550 us/launch on the 850 vs ~42 us on the 840 (same A8X gen, ~13x), against
+// reduce kernels that execute in ~2.7 us. See the split-K gates and
+// llama-shared/notes/splitk-quant-coverage-survey-20260726.md.
+//
+// Keyed on the DEVICE, deliberately NOT on adreno_art_compiler_quirks(): that predicate lifts
+// when GGML_OPENCL_ART_QUIRKS=0 or when the compiler stops reporting E17, and a compiler fix
+// says nothing about dispatch cost -- riding on it would silently re-enable a measured 15-20%
+// regression the moment someone re-verified a new compiler. The two concerns are independent.
+//
+// This is still a placeholder for the right answer, which is to MEASURE launch cost at init
+// (enqueue N trivial kernels, compare wall against event time) and let callers gate on
+// "predicted kernel saving > measured launch cost". That version would also self-correct on a
+// driver update instead of needing this list edited. Override: GGML_OPENCL_HIGH_DISPATCH_COST.
+static bool adreno_high_dispatch_cost(const ggml_backend_opencl_context *backend_ctx) {
+    if (!backend_ctx || backend_ctx->gpu_family != GPU_FAMILY::ADRENO) {
+        return false;
+    }
+    const char * env = getenv("GGML_OPENCL_HIGH_DISPATCH_COST");
+    if (env && env[0] != '\0') {
+        return env[0] != '0';
+    }
+    return strstr(backend_ctx->device_name.c_str(), "850") != nullptr;
+}
+
 // Default gate for the *dense* dp4a prefill GEMMs (gemm_noshuffle_*_q8_1_dp4a).
 //
 // Two questions, not one. The capability level says the ISA generation wants the
@@ -20842,8 +20868,20 @@ static void ggml_cl_mul_mat_q4_0_f32_adreno(ggml_backend_t backend, const ggml_t
             const char * e = std::getenv("GGML_OPENCL_Q40_GEMV_SPLITK");
             return (e && e[0] != '\0') ? (e[0] != '0' ? 1 : 0) : -1;   // -1 = per-gen default
         }();
+        // 🔴 2026-07-26: subtract the 850. Split-K buys GPU time by spending a kernel LAUNCH
+        // (the reduce), and that launch is ~550 us of host round-trip there against ~2.7 us of
+        // GPU work -- measured gemma-4-E2B-it-Q4_0 tg32 4.13 -> 3.52, **-14.8%** (3 interleaved
+        // pairs), the same mechanism that costs q4_K -20% on the same part. gen_level cannot
+        // express this: A8X and X2E share GEN_LEVEL_X2, and the 840 and 850 are BOTH A8X, so
+        // the exclusion is keyed on adreno_high_dispatch_cost(), which names the real variable.
+        // Deliberately NOT the art-compiler predicate: that one lifts when a new compiler is
+        // verified, and a compiler fix says nothing about launch cost. Documented in
+        // llama-shared/notes/splitk-quant-coverage-survey-20260726.md.
+        // NOT changed: 840 and X1E keep the old default. The 840 is genuinely UNRESOLVED (wall
+        // clock spans -8%..+10% across pairs and the profiling control kernel drifts 21% between
+        // runs); it needs a cooldown-managed re-measure before it is either kept or dropped.
         const bool q40_splitk_on = q40_splitk_env < 0
-            ? (backend_ctx->gen_level >= GEN_LEVEL_X1E)
+            ? (backend_ctx->gen_level >= GEN_LEVEL_X1E && !adreno_high_dispatch_cost(backend_ctx))
             : (q40_splitk_env == 1);
         static const int q40_splitk_maxm = []{ const char*e=std::getenv("GGML_OPENCL_Q40_SPLITK_MAXM"); return e?atoi(e):0; }();
         const int    splitk_maxm = q40_splitk_maxm > 0 ? q40_splitk_maxm : 2560;
@@ -22519,10 +22557,36 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
         // reduce -> +3.36% tg E4B (6/6 paired, byte-identical). Default ON, opt-out
         // GGML_OPENCL_Q4K_GEMV_SPLITK=0. ffn_gate/up (M=10240) fill the CUs already
         // and are excluded.
+        //
+        // 🔴 DEVICE GATE (2026-07-26). The paragraph above is an X2-90 result and does NOT
+        // travel: split-K buys GPU time by spending a kernel LAUNCH (the reduce), and the
+        // launch cost is per-device. Measured, same binary, GGML_OPENCL_Q4K_GEMV_SPLITK=0/1:
+        //
+        //     X2-90   +3.36%   (as above)
+        //     840     -1.3%    (Qwen3.5-4B-Q4_K_M, 14.0 -> 13.85)
+        //     850    -20.0%    (Qwen3-1.7B-Q4_K_M, 6.97 -> 5.58, 6 interleaved reps)
+        //
+        // On the 850 the kernel is emphatically NOT the problem -- split-K makes the GPU
+        // faster (total busy 537->485 ms, this GEMV 43.7->34.0 us/call, -22%) and still
+        // costs 20% of tg, because +3696 reduce dispatches run ~550 us of HOST round-trip
+        // each against 2.7 us of GPU work (~200x; cf. the 850's ~95%-host-bound decode).
+        // The 840 pays the same tax at ~42 us/dispatch, hence the milder loss.
+        //
+        // Gate on the DISCRETE gen, not gen_level: gen_level deliberately maps A8X and X2E
+        // to the same value (GEN_LEVEL_X2, "same ISA gen"), so `gen_level >= GEN_LEVEL_X2`
+        // would still be ON for the 840 and 850 and would change nothing. Same class of
+        // axis error the dense-dp4a paths hit (fixed there by gating on the compiler).
+        // X1E is UNMEASURED and therefore excluded; widen once there is an X1-85 datapoint.
+        // The real fix is to stop adding a dispatch at all (single-kernel split-K with the
+        // last workgroup doing the reduce), which would make this a win on every device.
         static const bool splitk_wg_env = []{
             const char * e = std::getenv("GGML_OPENCL_Q4K_GEMV_SPLITK");
-            return !e || e[0] == '\0' || e[0] != '0';   // default ON, opt-out =0
+            return (e && e[0] != '\0') ? (e[0] != '0') : true;   // env forces either way
         }();
+        static const bool splitk_env_set = std::getenv("GGML_OPENCL_Q4K_GEMV_SPLITK") != nullptr
+                                        && std::getenv("GGML_OPENCL_Q4K_GEMV_SPLITK")[0] != '\0';
+        const bool splitk_dev_ok = backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E;
+        const bool splitk_on     = splitk_env_set ? splitk_wg_env : splitk_dev_ok;
         // Gate: small-M decode GEMVs that under-fill the 16 CUs even with the wide
         // intra-WG split (all 16 subgroups land on one CU). M<=2560 covers Kcur/Vcur
         // (M=1024), Qcur (2048), attn_output + ffn_down (2560). The tiny ones
@@ -22530,7 +22594,7 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
         // big-K M=2560 cases (ffn_down K=10240 @182us, attn_output @42us) have a
         // large per-call win that dwarfs the ~5us reduce, so extending to 2560 nets
         // positive end-to-end. ffn_gate/up (M=10240) already fill the CUs -> excluded.
-        const bool use_splitk = splitk_wg_env && !use_tiled && !use_q4k_o4 && !use_mc3 && ne01 <= 2560;
+        const bool use_splitk = splitk_on && !use_tiled && !use_q4k_o4 && !use_mc3 && ne01 <= 2560;
 
         if (use_splitk) {
             const int    nsg    = 8;
