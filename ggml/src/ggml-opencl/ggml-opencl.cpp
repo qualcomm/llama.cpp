@@ -10008,7 +10008,7 @@ static inline bool use_flat_gemv_for_large_m_q4_K(const ggml_tensor *tensor) {
            && !use_q4k_tiled(tensor);
 }
 
-static inline bool use_flat_gemv_for_large_m_q6_K(const ggml_tensor *tensor) {
+static inline bool use_flat_gemv_for_large_m_q6_K(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor) {
     // gemv_noshuffle variant perf drops for large M, use flat variant for large M.
     // threshold is well above typical hidden/FFN dims, but below typical vocab sizes.
     // q6_K flat gemv is worse for smaller K; 2048 seems to be a reasonable threshold.
@@ -10040,9 +10040,13 @@ static inline bool use_flat_gemv_for_large_m_q6_K(const ggml_tensor *tensor) {
     // holds ~56 GB/s -- ~47% of E2B decode on one dispatch. Add a direct size escape so such
     // weights also take the flat path; every weight ne0 >= 2048 already routes there is unchanged.
     // gemma-4 E2B Q4_0(QAT) tg128 30 -> 45 (+38%) on X2-90. (Upstream PR: hq/q6k-flat-large-m-size-gate.)
-    // Safe on the A7X because the vocab-scale K-quant lm_head is declined to CPU there (see supports_op).
+    // The escape is not taken on the A7X: its compiler miscompiles the flat K-quant GEMV on exactly
+    // these vocab-scale shapes. On this line the A7X also declines the vocab-scale K-quant lm_head
+    // to the CPU (see supports_op), so the guard is belt-and-suspenders here -- it keeps the helper
+    // identical to the upstream PR branch so future rebases converge.
     return tensor->ne[1] >= 32768
-        && (tensor->ne[0] >= 2048 || ggml_nbytes(tensor) >= (256ull << 20))
+        && (tensor->ne[0] >= 2048 ||
+            (backend_ctx->adreno_gen != ADRENO_GPU_GEN::A7X && ggml_nbytes(tensor) >= (256ull << 20)))
         && tensor->ne[2] == 1 && tensor->ne[3] == 1;
 }
 
@@ -12711,7 +12715,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         cl_kernel kernel;
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
         kernel = backend_ctx->kernel_convert_block_q6_K;
-        if (use_adreno_kernels(backend_ctx, tensor) && !use_flat_gemv_for_large_m_q6_K(tensor)) {
+        if (use_adreno_kernels(backend_ctx, tensor) && !use_flat_gemv_for_large_m_q6_K(backend_ctx, tensor)) {
             kernel = backend_ctx->kernel_convert_block_q6_K_noshuffle;
         }
 #else
@@ -12744,7 +12748,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         tensor->extra  = extra;
 
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
-        if (use_adreno_kernels(backend_ctx, tensor) && !use_flat_gemv_for_large_m_q6_K(tensor)) {
+        if (use_adreno_kernels(backend_ctx, tensor) && !use_flat_gemv_for_large_m_q6_K(backend_ctx, tensor)) {
             cl_int M = tensor->ne[1];   // ne01
             cl_int K = tensor->ne[0];   // ne00
 
@@ -13756,7 +13760,7 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
             CL_CHECK(clReleaseMemObject(data_device));
             return;
         }
-        if (use_adreno_kernels(backend_ctx, tensor) && !use_flat_gemv_for_large_m_q6_K(tensor)) {
+        if (use_adreno_kernels(backend_ctx, tensor) && !use_flat_gemv_for_large_m_q6_K(backend_ctx, tensor)) {
             static ggml_cl_buffer buf_trans_ql;
             static ggml_cl_buffer buf_trans_qh;
             static ggml_cl_buffer buf_trans_s;
@@ -25557,7 +25561,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         }
 
         // q6_K x fp32
-        if (src0t == GGML_TYPE_Q6_K && src1t == GGML_TYPE_F32 && !use_flat_gemv_for_large_m_q6_K(src0)) {
+        if (src0t == GGML_TYPE_Q6_K && src1t == GGML_TYPE_F32 && !use_flat_gemv_for_large_m_q6_K(backend_ctx, src0)) {
             ggml_cl_mul_mat_q6_K_f32_adreno(backend, src0, src1, dst);
             return;
         }
