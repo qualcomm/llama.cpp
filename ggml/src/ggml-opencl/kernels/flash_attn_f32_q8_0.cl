@@ -333,10 +333,11 @@ __kernel void flash_attn_f32_q8_0_q1(
 
 inline float4 dequant_q8_0_lane(const global char * block_ptr, int lane) {
     const float d = vload_half(0, (const global half *)block_ptr);
-    // vload4 on char only requires 1-byte alignment: one 4-byte quant load
-    // instead of four scalar char loads.
-    const char4 q4 = vload4(lane, block_ptr + 2);
-    return d * convert_float4(q4);
+    const global char * qs = block_ptr + 2 + lane * 4;
+    // Keep the scalar char loads: a vload4/convert_float4 form measured
+    // -1.6..-2.8% tg on the X2-90 (DX.50.39) - the compiler does better here
+    // than the explicit vector load.
+    return d * (float4)((float)qs[0], (float)qs[1], (float)qs[2], (float)qs[3]);
 }
 
 // dp4a QK dot for the decode (q1) kernels: staged Q rows are requantized to
