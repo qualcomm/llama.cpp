@@ -6305,6 +6305,33 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
                 }
                 clReleaseProgram(prog_g8);
             }
+            // dk=64 gqa8 (gpt-oss-class): a C=16 cluster-parallel g8 program.
+            // Every lane stays active (DK_VEC=16 = one quartet per cluster
+            // lane) and each K/V row is read once for all 8 heads, vs the
+            // q1_split fallback's per-head WGs re-reading the same KV 8x.
+            // Lighter than the fallback too (840: 784 vs 912 B/WI).
+            // The plain mq_split was measured -48% here (48/64 lanes idle) -
+            // the cluster layout is the only MQ shape that fits dk=64.
+            if (!fa_decode_only && dk == 64 && dv == 64 && backend_ctx->has_subgroup_shuffle) {
+                const std::string opts_g8c16 = opts +
+                    " -D FA_MQ_ONLY -D MQ_GQA=8 -D MQ_NSG=2 -D MQ_NSG_SPLIT=2 -D FA_CL_C=16";
+                cl_program prog_g8c16 = build_program_from_source_ex(
+                    backend_ctx->context, backend_ctx->device, src.c_str(), opts_g8c16,
+                    /*fatal=*/false, "fa f32_f16 MQ_GQA=8 c16 dk64", backend_ctx->queue);
+                if (prog_g8c16) {
+                    cl_kernel k_g8c16 = clCreateKernel(prog_g8c16, "flash_attn_f32_f16_q1_vec_mq_split_c8", &err);
+                    if (err == CL_SUCCESS) {
+                        if (ggml_opencl_fa_kernel_fits_wg(backend_ctx, k_g8c16, 128,
+                                                          "fa f32_f16 MQ_GQA=8 c16 dk64", dk, dv)) {
+                            backend_ctx->fa.f32_f16_q1_vec_mq_split_gqa[{dk, dv, 8}] = k_g8c16;
+                            ggml_opencl_log_fa_kernel_spill(backend_ctx, k_g8c16, "fa f32_f16 MQ_GQA=8 c16 dk64", dk, dv);
+                        } else {
+                            clReleaseKernel(k_g8c16);
+                        }
+                    }
+                    clReleaseProgram(prog_g8c16);
+                }
+            }
             // MQ_GQA=2/3 specializations (dk=dv=128 models only): give gqa=2/3
             // models the healthy MQ decode kernel instead of the spilled
             // q1_split fallback (1168 B/WI on DX.50, 192-thread cap).
@@ -19503,7 +19530,14 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
             // NSG2 mq_split was measured at −48% vs the spilled q1_split
             // fallback on the 840: at DK_VEC=16 the mq kernel idles 75% of
             // each subgroup, and full lane utilization beats spill relief.
-            // A dk=64 MQ kernel needs the c8 cluster layout, not this one.
+            // The C=16 cluster kernel below keeps every lane active instead.
+            } else if (nq1_only && is_mixed && gqa_ratio_dispatch == 8 &&
+                d_head_q == 64 && d_head_v == 64 &&
+                n_head == n_head_kv * 8 &&
+                backend_ctx->fa.f32_f16_q1_vec_mq_split_gqa.count({64, 64, 8}) > 0) {
+                fd_k_split = backend_ctx->fa.f32_f16_q1_vec_mq_split_gqa.at({64, 64, 8});
+                use_fd_mq  = true;
+                fd_mq_wg   = 128;
             } else if (is_mixed && gqa_ratio_dispatch == 8 &&
                 d_head_q == 128 && d_head_v == 128 &&
                 backend_ctx->fa.f32_f16_q1_vec_mq_split_g8.count(dk_dv) > 0) {
