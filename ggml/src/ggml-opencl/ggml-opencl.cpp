@@ -19499,6 +19499,11 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
                 use_fd_mq    = true;
                 fd_mq_wg     = 192;
                 use_fa_k_img = true;
+            // NOTE (2026-07-29): routing dk=64 gqa8 (gpt-oss-class) to a g8
+            // NSG2 mq_split was measured at −48% vs the spilled q1_split
+            // fallback on the 840: at DK_VEC=16 the mq kernel idles 75% of
+            // each subgroup, and full lane utilization beats spill relief.
+            // A dk=64 MQ kernel needs the c8 cluster layout, not this one.
             } else if (is_mixed && gqa_ratio_dispatch == 8 &&
                 d_head_q == 128 && d_head_v == 128 &&
                 backend_ctx->fa.f32_f16_q1_vec_mq_split_g8.count(dk_dv) > 0) {
