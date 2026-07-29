@@ -11,9 +11,11 @@
 #define NSUBGROUPS 4
 #define SUBGROUP_SIZE 64
 
+// scales are transposed: consecutive codes of a row are `stride` apart
 inline void get_scale_min_k4(
     int j,
     global const uchar * q,
+    uint stride,
     uchar * d,
     uchar * m,
     uchar mask_d6,
@@ -21,11 +23,11 @@ inline void get_scale_min_k4(
     uchar mask_hi2
 ) {
     if (j < 4) {
-        *d = q[j]   & mask_d6;
-        *m = q[j+4] & mask_d6;
+        *d = q[j*stride]     & mask_d6;
+        *m = q[(j+4)*stride] & mask_d6;
     } else {
-        *d = (q[j+4] & mask_d4) | ((q[j-4] & mask_hi2) >> 2);
-        *m = ((q[j+4] >> 4) & mask_d4) | ((q[j]   & mask_hi2) >> 2);
+        *d = (q[(j+4)*stride] & mask_d4) | ((q[(j-4)*stride] & mask_hi2) >> 2);
+        *m = ((q[(j+4)*stride] >> 4) & mask_d4) | ((q[j*stride] & mask_hi2) >> 2);
     }
 }
 
@@ -239,7 +241,6 @@ kernel void kernel_gemv_noshuffle_q4_k_f32(
     // Physical per-K-block stride in the packed image: 8 uints/block-row-pair *
     // (M/2) row-pairs = 4*M uints. This is a layout constant, not tied to nsg.
     uint BLOCK_STRIDE_A = 4 * M;
-    uint scales_per_row = (K / QK_K) * 12;
 
     private uint4     regA;
     private half2     regS;
@@ -255,12 +256,12 @@ kernel void kernel_gemv_noshuffle_q4_k_f32(
         half2 d   = src0_d[gid + sb * LINE_STRIDE_A];
         half2 dm  = src0_m[gid + sb * LINE_STRIDE_A];
 
-        global const uchar * sc0 = src0_s + 2 * gid * scales_per_row + sb * 12;
-        global const uchar * sc1 = src0_s + (2 * gid + 1) * scales_per_row + sb * 12;
+        global const uchar * sc0 = src0_s + sb * 12 * M + 2 * gid;
+        global const uchar * sc1 = sc0 + 1;
 
         uchar sv0, mn0, sv1, mn1;
-        get_scale_min_k4(j, sc0, &sv0, &mn0, mask_d6, mask_d4, mask_hi2);
-        get_scale_min_k4(j, sc1, &sv1, &mn1, mask_d6, mask_d4, mask_hi2);
+        get_scale_min_k4(j, sc0, M, &sv0, &mn0, mask_d6, mask_d4, mask_hi2);
+        get_scale_min_k4(j, sc1, M, &sv1, &mn1, mask_d6, mask_d4, mask_hi2);
 
         regS = convert_half2(convert_float2(d)  * convert_float2((uchar2)(sv0, sv1)));
         regM = convert_half2(convert_float2(dm) * convert_float2((uchar2)(mn0, mn1)));
@@ -312,7 +313,12 @@ kernel void kernel_gemv_noshuffle_q4_k_f32(
     // 2 outputs per fiber in wave 0
     if (groupId == 0) {
         dst = (global float*)((global char*)dst + offsetd);
-        vstore2(totalSum, 0, &(dst[gid * 2]));
+        // Guard the two output rows. The x-grid is padded to CEIL_DIV(ne01/2,64)*64,
+        // so when ne01 is not a multiple of 128 the tail row-pairs run past row ne01
+        // and would overrun dst into the adjacent tensor. No-op / byte-identical when
+        // ne01 % 128 == 0 (M/2 already a multiple of 64 -> no padding).
+        if (gid * 2 + 0 < M) dst[gid * 2 + 0] = totalSum.s0;
+        if (gid * 2 + 1 < M) dst[gid * 2 + 1] = totalSum.s1;
     }
 
 }
@@ -382,7 +388,6 @@ kernel void kernel_gemv_noshuffle_q4_k_f32_glu(
 
     uint LINE_STRIDE_A  = M / 2;
     uint BLOCK_STRIDE_A = 4 * M;
-    uint scales_per_row = (K / QK_K) * 12;
 
     private uint4  regA;
     private half2  regS, regM;
@@ -403,11 +408,11 @@ kernel void kernel_gemv_noshuffle_q4_k_f32_glu(
         uint j  = k % 8;                                                                       \
         half2 d   = DD[gid + sb * LINE_STRIDE_A];                                              \
         half2 dm  = MM[gid + sb * LINE_STRIDE_A];                                              \
-        global const uchar * sc0 = SS + 2 * gid * scales_per_row + sb * 12;                    \
-        global const uchar * sc1 = SS + (2 * gid + 1) * scales_per_row + sb * 12;              \
+        global const uchar * sc0 = SS + sb * 12 * M + 2 * gid;                    \
+        global const uchar * sc1 = sc0 + 1;              \
         uchar sv0, mn0, sv1, mn1;                                                              \
-        get_scale_min_k4(j, sc0, &sv0, &mn0, mask_d6, mask_d4, mask_hi2);                      \
-        get_scale_min_k4(j, sc1, &sv1, &mn1, mask_d6, mask_d4, mask_hi2);                      \
+        get_scale_min_k4(j, sc0, M, &sv0, &mn0, mask_d6, mask_d4, mask_hi2);                      \
+        get_scale_min_k4(j, sc1, M, &sv1, &mn1, mask_d6, mask_d4, mask_hi2);                      \
         regS = convert_half2(convert_float2(d)  * convert_float2((uchar2)(sv0, sv1)));         \
         regM = convert_half2(convert_float2(dm) * convert_float2((uchar2)(mn0, mn1)));         \
         if (slid < 4) {                                                                        \
@@ -456,8 +461,9 @@ kernel void kernel_gemv_noshuffle_q4_k_f32_glu(
             upSum   += p.zw;
         }
         dst = (global float*)((global char*)dst + offsetd);
-        dst[gid * 2 + 0] = glu_apply(glu_op, gateSum.s0, upSum.s0);
-        dst[gid * 2 + 1] = glu_apply(glu_op, gateSum.s1, upSum.s1);
+        // Guard output rows (padded x-grid); no-op / byte-identical for ne01 % 128 == 0.
+        if (gid * 2 + 0 < M) dst[gid * 2 + 0] = glu_apply(glu_op, gateSum.s0, upSum.s0);
+        if (gid * 2 + 1 < M) dst[gid * 2 + 1] = glu_apply(glu_op, gateSum.s1, upSum.s1);
     }
 }
 
@@ -510,7 +516,7 @@ kernel void kernel_gemv_noshuffle_q4_k_f32_glu(
     ts.s1 += wq[12].s1*sy.s4; ts.s1 += wq[13].s1*sy.s5; ts.s1 += wq[14].s1*sy.s6; ts.s1 += wq[15].s1*sy.s7; \
 }
 
-// Multi-column (N=3) variant of the q4_K decode GEMV, for the speculative /
+// Multi-column (N=2..4) variant of the q4_K decode GEMV, for the speculative /
 // MTP verify batch (ne1=3 = 2 drafts + 1 bonus). Stays on the efficient GEMV
 // path (subgroup-broadcast activation, NSUBGROUPS K-split) instead of the
 // transposed-GEMM dead-zone path. Each K-block's weights (regA_hi/regA_lo) are
@@ -543,9 +549,12 @@ kernel void kernel_gemv_noshuffle_q4_k_f32_mc3(
     uint K = ne00;
     uint M = ne01;
 
+    uint nsg            = get_local_size(1);   // K-split chosen by the host
     uint LINE_STRIDE_A  = M / 2;
-    uint BLOCK_STRIDE_A = NSUBGROUPS * M;
-    uint scales_per_row = (K / QK_K) * 12;
+    // Physical per-K-block stride in the packed image: 8 uints/block-row-pair *
+    // (M/2) row-pairs = 4*M uints. A layout constant, NOT tied to nsg (it was
+    // NSUBGROUPS*M, which was only ever right because nsg was always 4).
+    uint BLOCK_STRIDE_A = 4 * M;
     uint COL_STRIDE     = K / 4;   // float4 pixels per activation column
 
     private uint4  regA_hi, regA_lo;
@@ -566,19 +575,19 @@ kernel void kernel_gemv_noshuffle_q4_k_f32_mc3(
     local half2 * ws = wstage + (groupId * SUBGROUP_SIZE + slid) * 16;
 #endif
 
-    for (uint k = groupId; k < (K / 32); k += NSUBGROUPS) {
+    for (uint k = groupId; k < (K / 32); k += nsg) {
         uint sb = k / 8;
         uint j  = k % 8;
 
         half2 d   = src0_d[gid + sb * LINE_STRIDE_A];
         half2 dm  = src0_m[gid + sb * LINE_STRIDE_A];
 
-        global const uchar * sc0 = src0_s + 2 * gid * scales_per_row + sb * 12;
-        global const uchar * sc1 = src0_s + (2 * gid + 1) * scales_per_row + sb * 12;
+        global const uchar * sc0 = src0_s + sb * 12 * M + 2 * gid;
+        global const uchar * sc1 = sc0 + 1;
 
         uchar sv0, mn0, sv1, mn1;
-        get_scale_min_k4(j, sc0, &sv0, &mn0, mask_d6, mask_d4, mask_hi2);
-        get_scale_min_k4(j, sc1, &sv1, &mn1, mask_d6, mask_d4, mask_hi2);
+        get_scale_min_k4(j, sc0, M, &sv0, &mn0, mask_d6, mask_d4, mask_hi2);
+        get_scale_min_k4(j, sc1, M, &sv1, &mn1, mask_d6, mask_d4, mask_hi2);
 
         regS = convert_half2(convert_float2(d)  * convert_float2((uchar2)(sv0, sv1)));
         regM = convert_half2(convert_float2(dm) * convert_float2((uchar2)(mn0, mn1)));
@@ -606,9 +615,14 @@ kernel void kernel_gemv_noshuffle_q4_k_f32_mc3(
         { if (slid < 4) { regB.s0123 = read_imagef(src1, 1*COL_STRIDE     + slid*2 + k*8);
                           regB.s4567 = read_imagef(src1, 1*COL_STRIDE + 1 + slid*2 + k*8); }
           MAC_Q4K_BLOCK(ts1, wq_hi, regB, 0, 1); MAC_Q4K_BLOCK(ts1, wq_lo, regB, 2, 3); }
+        if (n_cols > 2)
         { if (slid < 4) { regB.s0123 = read_imagef(src1, 2*COL_STRIDE     + slid*2 + k*8);
                           regB.s4567 = read_imagef(src1, 2*COL_STRIDE + 1 + slid*2 + k*8); }
           MAC_Q4K_BLOCK(ts2, wq_hi, regB, 0, 1); MAC_Q4K_BLOCK(ts2, wq_lo, regB, 2, 3); }
+        if (n_cols > 3)
+        { if (slid < 4) { regB.s0123 = read_imagef(src1, 3*COL_STRIDE     + slid*2 + k*8);
+                          regB.s4567 = read_imagef(src1, 3*COL_STRIDE + 1 + slid*2 + k*8); }
+          MAC_Q4K_BLOCK(ts3, wq_hi, regB, 0, 1); MAC_Q4K_BLOCK(ts3, wq_lo, regB, 2, 3); }
 #elif defined(Q4K_MC3_DEQUANT_LDS)
         // LDS-staged dequant: dequant a 32-block ONCE into the per-WI LDS slot
         // (hi pass then lo pass, overwriting), MAC each column from LDS. ts*
@@ -682,24 +696,34 @@ kernel void kernel_gemv_noshuffle_q4_k_f32_mc3(
     }
 
     // cross-subgroup reduce: pack the up-to-4 columns' float2 into a float8.
-    local float8 reduceLM[SUBGROUP_SIZE * 3];
+    // Generalized to nsg subgroups (was a hard-coded 4-wave unroll, which silently
+    // DISCARDED subgroups 4+ whenever the host dispatched a wider K-split). Sized
+    // for nsg <= 8: this kernel's CL_KERNEL_WORK_GROUP_SIZE is 512 = 64*8, so 8 is
+    // the widest split it can be dispatched at. At nsg == 4 the accumulation order
+    // is identical to the original unroll -> byte-identical.
+    local float8 reduceLM[SUBGROUP_SIZE * 7];
     float8 acc = (float8)(ts0.s0, ts0.s1, ts1.s0, ts1.s1, ts2.s0, ts2.s1, ts3.s0, ts3.s1);
-    if (groupId == 1) { reduceLM[SUBGROUP_SIZE * 0 + slid] = acc; }
-    if (groupId == 2) { reduceLM[SUBGROUP_SIZE * 1 + slid] = acc; }
-    if (groupId == 3) { reduceLM[SUBGROUP_SIZE * 2 + slid] = acc; }
+    if (groupId > 0) {
+        reduceLM[SUBGROUP_SIZE * (groupId - 1) + slid] = acc;
+    }
 
     barrier(CLK_LOCAL_MEM_FENCE);
 
     if (groupId == 0) {
-        acc += reduceLM[SUBGROUP_SIZE * 0 + slid];
-        acc += reduceLM[SUBGROUP_SIZE * 1 + slid];
-        acc += reduceLM[SUBGROUP_SIZE * 2 + slid];
+        for (uint i = 0; i < nsg - 1; ++i) {
+            acc += reduceLM[SUBGROUP_SIZE * i + slid];
+        }
         dst = (global float*)((global char*)dst + offsetd);
-        // dst is column-major [M rows x n_cols cols]: (row, col) at col*M + row
-        vstore2((float2)(acc.s0, acc.s1), 0, &(dst[0 * M + gid * 2]));
-        vstore2((float2)(acc.s2, acc.s3), 0, &(dst[1 * M + gid * 2]));
-        if (n_cols > 2) vstore2((float2)(acc.s4, acc.s5), 0, &(dst[2 * M + gid * 2]));
-        if (n_cols > 3) vstore2((float2)(acc.s6, acc.s7), 0, &(dst[3 * M + gid * 2]));
+        // dst is column-major [M rows x n_cols cols]: (row, col) at col*M + row.
+        // Guard output rows (padded x-grid); no-op / byte-identical for ne01 % 128 == 0.
+        const bool w0 = (gid * 2 + 0 < M);
+        const bool w1 = (gid * 2 + 1 < M);
+        if (w0) dst[0 * M + gid * 2 + 0] = acc.s0;
+        if (w1) dst[0 * M + gid * 2 + 1] = acc.s1;
+        if (w0) dst[1 * M + gid * 2 + 0] = acc.s2;
+        if (w1) dst[1 * M + gid * 2 + 1] = acc.s3;
+        if (n_cols > 2) { if (w0) dst[2 * M + gid * 2 + 0] = acc.s4; if (w1) dst[2 * M + gid * 2 + 1] = acc.s5; }
+        if (n_cols > 3) { if (w0) dst[3 * M + gid * 2 + 0] = acc.s6; if (w1) dst[3 * M + gid * 2 + 1] = acc.s7; }
     }
 }
 
@@ -740,7 +764,6 @@ kernel void kernel_gemv_noshuffle_q4_k_f32_splitk(
     uint M = ne01;
     uint LINE_STRIDE_A  = M / 2;
     uint BLOCK_STRIDE_A = 4 * M;      // physical, independent of the K-split
-    uint scales_per_row = (K / QK_K) * 12;
 
     private uint4  regA;
     private half2  regS, regM;
@@ -753,11 +776,11 @@ kernel void kernel_gemv_noshuffle_q4_k_f32_splitk(
         uint j  = k % 8;
         half2 d   = src0_d[gid + sb * LINE_STRIDE_A];
         half2 dm  = src0_m[gid + sb * LINE_STRIDE_A];
-        global const uchar * sc0 = src0_s + 2 * gid * scales_per_row + sb * 12;
-        global const uchar * sc1 = src0_s + (2 * gid + 1) * scales_per_row + sb * 12;
+        global const uchar * sc0 = src0_s + sb * 12 * M + 2 * gid;
+        global const uchar * sc1 = sc0 + 1;
         uchar sv0, mn0, sv1, mn1;
-        get_scale_min_k4(j, sc0, &sv0, &mn0, mask_d6, mask_d4, mask_hi2);
-        get_scale_min_k4(j, sc1, &sv1, &mn1, mask_d6, mask_d4, mask_hi2);
+        get_scale_min_k4(j, sc0, M, &sv0, &mn0, mask_d6, mask_d4, mask_hi2);
+        get_scale_min_k4(j, sc1, M, &sv1, &mn1, mask_d6, mask_d4, mask_hi2);
         regS = convert_half2(convert_float2(d)  * convert_float2((uchar2)(sv0, sv1)));
         regM = convert_half2(convert_float2(dm) * convert_float2((uchar2)(mn0, mn1)));
         if (slid < 4) {
@@ -793,7 +816,10 @@ kernel void kernel_gemv_noshuffle_q4_k_f32_splitk(
         for (uint i = 0; i < nsg - 1; ++i) {
             totalSum += reduceLM[SUBGROUP_SIZE * i + slid];
         }
-        vstore2(totalSum, 0, &(partial[kslice * M + gid * 2]));
+        // Guard output rows: the padded x-grid tail would overrun this K-slice's
+        // partial region into the next slice. No-op / byte-identical for ne01 % 128 == 0.
+        if (gid * 2 + 0 < M) partial[kslice * M + gid * 2 + 0] = totalSum.s0;
+        if (gid * 2 + 1 < M) partial[kslice * M + gid * 2 + 1] = totalSum.s1;
     }
 }
 
@@ -907,7 +933,6 @@ inline float2 mega_q4k_gemv_fiber(
         local float2 * reduceLM) {
     uint LINE_STRIDE_A  = M / 2;
     uint BLOCK_STRIDE_A = 4 * M;
-    uint scales_per_row = (K / QK_K) * 12;
 
     private uint4  regA;
     private half2  regS, regM;
@@ -921,12 +946,12 @@ inline float2 mega_q4k_gemv_fiber(
         half2 d   = src0_d[gid + sb * LINE_STRIDE_A];
         half2 dm  = src0_m[gid + sb * LINE_STRIDE_A];
 
-        global const uchar * sc0 = src0_s + 2 * gid * scales_per_row + sb * 12;
-        global const uchar * sc1 = src0_s + (2 * gid + 1) * scales_per_row + sb * 12;
+        global const uchar * sc0 = src0_s + sb * 12 * M + 2 * gid;
+        global const uchar * sc1 = sc0 + 1;
 
         uchar sv0, mn0, sv1, mn1;
-        get_scale_min_k4(j, sc0, &sv0, &mn0, mask_d6, mask_d4, mask_hi2);
-        get_scale_min_k4(j, sc1, &sv1, &mn1, mask_d6, mask_d4, mask_hi2);
+        get_scale_min_k4(j, sc0, M, &sv0, &mn0, mask_d6, mask_d4, mask_hi2);
+        get_scale_min_k4(j, sc1, M, &sv1, &mn1, mask_d6, mask_d4, mask_hi2);
 
         regS = convert_half2(convert_float2(d)  * convert_float2((uchar2)(sv0, sv1)));
         regM = convert_half2(convert_float2(dm) * convert_float2((uchar2)(mn0, mn1)));

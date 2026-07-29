@@ -37,6 +37,7 @@ inline float softplus_f32(float x) {
 
 // d_state = 128 (most Mamba-2 models, e.g. mamba2-2.7B, Codestral-Mamba).
 // WG = 64 threads, each holds 2 state elements (tid and tid+64).
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 1
 REQD_SUBGROUP_SIZE_64
 kernel void kernel_ssm_scan_f32_mamba2_d128(
     global const char * src0_base, ulong src0_off,
@@ -124,8 +125,10 @@ kernel void kernel_ssm_scan_f32_mamba2_d128(
     s_warp[tid]      = state0;
     s_warp[tid + 64] = state1;
 }
+#endif
 
 // d_state = 256 (Falcon-H1). WG = 64 threads, each holds 4 state elements.
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 2
 REQD_SUBGROUP_SIZE_64
 kernel void kernel_ssm_scan_f32_mamba2_d256(
     global const char * src0_base, ulong src0_off,
@@ -226,3 +229,4 @@ kernel void kernel_ssm_scan_f32_mamba2_d256(
     s_warp[tid + 128] = state2;
     s_warp[tid + 192] = state3;
 }
+#endif

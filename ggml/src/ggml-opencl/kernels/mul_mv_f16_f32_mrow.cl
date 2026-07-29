@@ -31,6 +31,7 @@
 
 #define MROW 16
 
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 1
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
 #endif
@@ -92,8 +93,15 @@ kernel void kernel_mul_mat_f16_f32_mrow(
     ulong offset_src0 = r0*nb01 + (i12/r2)*nb02 + (i13/r3)*nb03;
     global half * x = (global half *) (src0 + offset_src0);
 
+    // The vector path below casts the row pointer to half4, which must be 8-byte aligned.
+    // A row address is r0*nb01 + ..., and a permuted or strided src0 leaves nb01/nb02/nb03
+    // unconstrained -- ne00 % 4 == 0 bounds the element count per row, not the byte stride
+    // between rows. Take the vector path only when this work-item's row is actually
+    // aligned; the scalar loop below has no such requirement.
+    const bool row_aligned = (((ulong) x) & 7) == 0;
+
     float sumf = 0.0f;
-    if (ne00 < 128) {
+    if (ne00 < 128 || !row_aligned) {
         for (int i = lid; i < ne00; i += get_sub_group_size()) {
             sumf += (float) x[i] * ysh[i];
         }
@@ -120,6 +128,7 @@ kernel void kernel_mul_mat_f16_f32_mrow(
         }
     }
 }
+#endif
 
 // Register-blocked variant: each 64-lane subgroup accumulates RPT consecutive
 // output rows instead of one. The staged activation is reused across all RPT rows,
@@ -230,6 +239,7 @@ kernel void kernel_mul_mat_f16_f32_mrow(
         }                                                                                 \
     }
 
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 2
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
 #endif
@@ -246,7 +256,9 @@ kernel void kernel_mul_mat_f16_f32_mrow_h8(
 ) {
     MROW_H8_BODY(1)
 }
+#endif
 
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 3
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
 #endif
@@ -263,7 +275,9 @@ kernel void kernel_mul_mat_f16_f32_mrow_h8r2(
 ) {
     MROW_H8_BODY(2)
 }
+#endif
 
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 4
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
 #endif
@@ -280,7 +294,9 @@ kernel void kernel_mul_mat_f16_f32_mrow_r2(
 ) {
     MROW_RB_BODY(2)
 }
+#endif
 
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 5
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
 #endif
@@ -297,3 +313,4 @@ kernel void kernel_mul_mat_f16_f32_mrow_r4(
 ) {
     MROW_RB_BODY(4)
 }
+#endif

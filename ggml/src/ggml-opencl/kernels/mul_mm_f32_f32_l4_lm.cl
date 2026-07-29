@@ -3,11 +3,17 @@
 #define LOAD_VEC_A 4
 #define LOAD_VEC_B 4
 
+// Tile geometry. TN is build-overridable (-DTN=...): the host must dispatch with
+// local size (BM*BN)/(TM*TN), and the register ladder is device-dependent -- the
+// shipped TM4xTN8 (32 accumulators) is past the sweet spot on the Adreno 840's
+// allocator, where TN=4 measures +36% at batched shapes (56.4 -> 77.0 GFLOPS).
 #define BM 64
 #define BN 64
 #define BK 16
 #define TM 4
+#ifndef TN
 #define TN 8
+#endif
 
 kernel void kernel_mul_mm_f32_f32_l4_lm(
     global float4 * src0,

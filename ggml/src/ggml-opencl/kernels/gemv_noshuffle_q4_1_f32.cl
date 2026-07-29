@@ -277,7 +277,12 @@ kernel void kernel_gemv_noshuffle_q4_1_f32(
     // 2 outputs per fiber in wave 0
     if (groupId == 0) {
         dst = (global float*)((global char*)dst + offsetd);
-        vstore2(totalSum, 0, &(dst[gid * 2]));
+        // Guard the two output rows. The x-grid is padded to CEIL_DIV(ne01/2,64)*64,
+        // so when ne01 is not a multiple of 128 the tail row-pairs run past row ne01
+        // and would overrun dst into the adjacent tensor. No-op / byte-identical when
+        // ne01 % 128 == 0 (M/2 already a multiple of 64 -> no padding).
+        if (gid * 2 + 0 < M) dst[gid * 2 + 0] = totalSum.s0;
+        if (gid * 2 + 1 < M) dst[gid * 2 + 1] = totalSum.s1;
     }
 
 }
@@ -367,11 +372,16 @@ kernel void kernel_gemv_noshuffle_q4_1_f32_mc3(
         acc += reduceLM[SUBGROUP_SIZE * 1 + slid];
         acc += reduceLM[SUBGROUP_SIZE * 2 + slid];
         dst = (global float*)((global char*)dst + offsetd);
-        // dst is column-major [M rows x n_cols cols]: (row, col) at col*M + row
-        vstore2((float2)(acc.s0, acc.s1), 0, &(dst[0 * M + gid * 2]));
-        vstore2((float2)(acc.s2, acc.s3), 0, &(dst[1 * M + gid * 2]));
-        if (n_cols > 2) vstore2((float2)(acc.s4, acc.s5), 0, &(dst[2 * M + gid * 2]));
-        if (n_cols > 3) vstore2((float2)(acc.s6, acc.s7), 0, &(dst[3 * M + gid * 2]));
+        // dst is column-major [M rows x n_cols cols]: (row, col) at col*M + row.
+        // Guard output rows (padded x-grid); no-op / byte-identical for ne01 % 128 == 0.
+        const bool w0 = (gid * 2 + 0 < M);
+        const bool w1 = (gid * 2 + 1 < M);
+        if (w0) dst[0 * M + gid * 2 + 0] = acc.s0;
+        if (w1) dst[0 * M + gid * 2 + 1] = acc.s1;
+        if (w0) dst[1 * M + gid * 2 + 0] = acc.s2;
+        if (w1) dst[1 * M + gid * 2 + 1] = acc.s3;
+        if (n_cols > 2) { if (w0) dst[2 * M + gid * 2 + 0] = acc.s4; if (w1) dst[2 * M + gid * 2 + 1] = acc.s5; }
+        if (n_cols > 3) { if (w0) dst[3 * M + gid * 2 + 0] = acc.s6; if (w1) dst[3 * M + gid * 2 + 1] = acc.s7; }
     }
 }
 #undef MC_COL_Q41

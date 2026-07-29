@@ -9,9 +9,11 @@
 #define QK_K         256
 #define K_SCALE_SIZE 12
 
+// scales are transposed: consecutive codes of a row are `stride` apart
 inline void get_scale_min_k4(
     int j,
     global const uchar * q,
+    int stride,
     uchar * d,
     uchar * m,
     uchar mask_d6,
@@ -19,11 +21,11 @@ inline void get_scale_min_k4(
     uchar mask_hi2
 ) {
     if (j < 4) {
-        *d = q[j]   & mask_d6;
-        *m = q[j+4] & mask_d6;
+        *d = q[j*stride]     & mask_d6;
+        *m = q[(j+4)*stride] & mask_d6;
     } else {
-        *d = (q[j+4] & mask_d4) | ((q[j-4] & mask_hi2) >> 2);
-        *m = ((q[j+4] >> 4) & mask_d4) | ((q[j]   & mask_hi2) >> 2);
+        *d = (q[(j+4)*stride] & mask_d4) | ((q[(j-4)*stride] & mask_hi2) >> 2);
+        *m = ((q[(j+4)*stride] >> 4) & mask_d4) | ((q[j*stride] & mask_hi2) >> 2);
     }
 }
 
@@ -56,7 +58,6 @@ kernel void kernel_gemm_noshuffle_q4_k_f32(
     half8 B;
     half4 dequantized_weights;
 
-    int num_blocks_K = k / QK_K;
 
     global const ushort * weight_ptr = src0_q + gx_2;
     global const half   * d_ptr      = src0_d  + gx_2;
@@ -69,16 +70,16 @@ kernel void kernel_gemm_noshuffle_q4_k_f32(
         half4 d  = vload4(0, d_ptr  + sb_idx * m);
         half4 dm = vload4(0, dm_ptr + sb_idx * m);
 
-        global const uchar * sc0 = src0_s + (gx_2+0) * num_blocks_K * K_SCALE_SIZE + sb_idx * K_SCALE_SIZE;
-        global const uchar * sc1 = src0_s + (gx_2+1) * num_blocks_K * K_SCALE_SIZE + sb_idx * K_SCALE_SIZE;
-        global const uchar * sc2 = src0_s + (gx_2+2) * num_blocks_K * K_SCALE_SIZE + sb_idx * K_SCALE_SIZE;
-        global const uchar * sc3 = src0_s + (gx_2+3) * num_blocks_K * K_SCALE_SIZE + sb_idx * K_SCALE_SIZE;
+        global const uchar * sc0 = src0_s + sb_idx * K_SCALE_SIZE * m + (gx_2+0);
+        global const uchar * sc1 = sc0 + 1;
+        global const uchar * sc2 = sc0 + 2;
+        global const uchar * sc3 = sc0 + 3;
 
         uchar sv0, mn0, sv1, mn1, sv2, mn2, sv3, mn3;
-        get_scale_min_k4(sub_idx, sc0, &sv0, &mn0, mask_d6, mask_d4, mask_hi2);
-        get_scale_min_k4(sub_idx, sc1, &sv1, &mn1, mask_d6, mask_d4, mask_hi2);
-        get_scale_min_k4(sub_idx, sc2, &sv2, &mn2, mask_d6, mask_d4, mask_hi2);
-        get_scale_min_k4(sub_idx, sc3, &sv3, &mn3, mask_d6, mask_d4, mask_hi2);
+        get_scale_min_k4(sub_idx, sc0, m, &sv0, &mn0, mask_d6, mask_d4, mask_hi2);
+        get_scale_min_k4(sub_idx, sc1, m, &sv1, &mn1, mask_d6, mask_d4, mask_hi2);
+        get_scale_min_k4(sub_idx, sc2, m, &sv2, &mn2, mask_d6, mask_d4, mask_hi2);
+        get_scale_min_k4(sub_idx, sc3, m, &sv3, &mn3, mask_d6, mask_d4, mask_hi2);
 
         half4 scale = convert_half4(convert_float4(d)  * convert_float4((uchar4)(sv0, sv1, sv2, sv3)));
         half4 mval  = convert_half4(convert_float4(dm) * convert_float4((uchar4)(mn0, mn1, mn2, mn3)));
@@ -207,7 +208,6 @@ kernel void kernel_gemm_noshuffle_q4_k_f32_r1(
     half8 B;
     half dq;
 
-    int num_blocks_K = k / QK_K;
 
     global const ushort * weight_ptr = src0_q + gx;
     global const half   * d_ptr      = src0_d  + gx;
@@ -220,10 +220,10 @@ kernel void kernel_gemm_noshuffle_q4_k_f32_r1(
         half dd  = d_ptr [sb_idx * m];
         half dmm = dm_ptr[sb_idx * m];
 
-        global const uchar * sc0 = src0_s + gx * num_blocks_K * K_SCALE_SIZE + sb_idx * K_SCALE_SIZE;
+        global const uchar * sc0 = src0_s + sb_idx * K_SCALE_SIZE * m + gx;
 
         uchar sv0, mn0;
-        get_scale_min_k4(sub_idx, sc0, &sv0, &mn0, mask_d6, mask_d4, mask_hi2);
+        get_scale_min_k4(sub_idx, sc0, m, &sv0, &mn0, mask_d6, mask_d4, mask_hi2);
 
         half scale = convert_half(convert_float(dd)  * (float)sv0);
         half mval  = convert_half(convert_float(dmm) * (float)mn0);
@@ -305,7 +305,6 @@ kernel void kernel_gemm_noshuffle_q4_k_f32_kimg(
     half8 B;
     half2 dequantized_weights;
 
-    int num_blocks_K = k / QK_K;
 
     global const half * d_ptr  = src0_d  + gx_2;
     global const half * dm_ptr = src0_dm + gx_2;
@@ -317,12 +316,12 @@ kernel void kernel_gemm_noshuffle_q4_k_f32_kimg(
         half2 d  = vload2(0, d_ptr  + sb_idx * m);
         half2 dm = vload2(0, dm_ptr + sb_idx * m);
 
-        global const uchar * sc0 = src0_s + (gx_2+0) * num_blocks_K * K_SCALE_SIZE + sb_idx * K_SCALE_SIZE;
-        global const uchar * sc1 = src0_s + (gx_2+1) * num_blocks_K * K_SCALE_SIZE + sb_idx * K_SCALE_SIZE;
+        global const uchar * sc0 = src0_s + sb_idx * K_SCALE_SIZE * m + (gx_2+0);
+        global const uchar * sc1 = sc0 + 1;
 
         uchar sv0, mn0, sv1, mn1;
-        get_scale_min_k4(sub_idx, sc0, &sv0, &mn0, mask_d6, mask_d4, mask_hi2);
-        get_scale_min_k4(sub_idx, sc1, &sv1, &mn1, mask_d6, mask_d4, mask_hi2);
+        get_scale_min_k4(sub_idx, sc0, m, &sv0, &mn0, mask_d6, mask_d4, mask_hi2);
+        get_scale_min_k4(sub_idx, sc1, m, &sv1, &mn1, mask_d6, mask_d4, mask_hi2);
 
         half2 scale = convert_half2(convert_float2(d)  * convert_float2((uchar2)(sv0, sv1)));
         half2 mval  = convert_half2(convert_float2(dm) * convert_float2((uchar2)(mn0, mn1)));
@@ -413,7 +412,6 @@ kernel void kernel_gemm_noshuffle_q4_k_f32_cok(
     int sg   = get_local_id(1);      // subgroup index (K-split lane)
     int lane = get_local_id(0);      // lane within subgroup (0..COK_SG-1)
 
-    int num_blocks_K = k / QK_K;
     int num_32blk    = k / 32;
 
     global const ushort * weight_ptr = src0_q + gx;
@@ -432,9 +430,9 @@ kernel void kernel_gemm_noshuffle_q4_k_f32_cok(
         half dd  = d_ptr [sb_idx * m];
         half dmm = dm_ptr[sb_idx * m];
 
-        global const uchar * sc0 = src0_s + gx * num_blocks_K * K_SCALE_SIZE + sb_idx * K_SCALE_SIZE;
+        global const uchar * sc0 = src0_s + sb_idx * K_SCALE_SIZE * m + gx;
         uchar sv0, mn0;
-        get_scale_min_k4(sub_idx, sc0, &sv0, &mn0, mask_d6, mask_d4, mask_hi2);
+        get_scale_min_k4(sub_idx, sc0, m, &sv0, &mn0, mask_d6, mask_d4, mask_hi2);
         half scale = convert_half(convert_float(dd)  * (float)sv0);
         half mval  = convert_half(convert_float(dmm) * (float)mn0);
 

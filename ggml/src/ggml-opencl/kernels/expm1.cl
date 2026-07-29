@@ -37,10 +37,7 @@ kernel void kernel_expm1_f16(
     src0 = (global half*)((global char*)src0 + offset0);
     dst  = (global half*)((global char*)dst + offsetd);
 
-    {
-        const float x = convert_float(src0[get_global_id(0)]);
-        dst[get_global_id(0)] = convert_half(exp(x) - 1.0f);
-    }
+    dst[get_global_id(0)] = exp(src0[get_global_id(0)]) - 1.0h;
 }
 
 kernel void kernel_expm1_f16_4(
@@ -52,10 +49,7 @@ kernel void kernel_expm1_f16_4(
     src0 = (global half4*)((global char*)src0 + offset0);
     dst  = (global half4*)((global char*)dst + offsetd);
 
-    {
-        const float4 x = convert_float4(src0[get_global_id(0)]);
-        dst[get_global_id(0)] = convert_half4(exp(x) - 1.0f);
-    }
+    dst[get_global_id(0)] = exp(src0[get_global_id(0)]) - 1.0h;
 }
 
 kernel void kernel_expm1_f32_nc(
@@ -114,7 +108,6 @@ kernel void kernel_expm1_f16_nc(
         global const half * x = (global const half *)(src0 + i3*nb03 + i2*nb02 + i1*nb01 + i0*nb00);
         global       half * y = (global       half *)(dst  + i3*nb3  + i2*nb2  + i1*nb1  + i0*nb0);
 
-        const float fx = convert_float(*x);
-        *y = convert_half(exp(fx) - 1.0f);
+        *y = exp(*x) - 1.0f;
     }
 }

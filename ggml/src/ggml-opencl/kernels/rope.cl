@@ -60,6 +60,7 @@ float2 rope_yarn_corr_dims(
     );
 }
 
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 1
 kernel void kernel_rope_norm_f32(
         global void * src0,
         ulong offset0,
@@ -138,7 +139,9 @@ kernel void kernel_rope_norm_f32(
         }
     }
 }
+#endif
 
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 2
 kernel void kernel_rope_norm_f16(
         global void * src0,
         ulong offset0,
@@ -217,7 +220,9 @@ kernel void kernel_rope_norm_f16(
         }
     }
 }
+#endif
 
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 3
 kernel void kernel_rope_neox_f32(
         global void * src0,
         ulong offset0,
@@ -296,7 +301,9 @@ kernel void kernel_rope_neox_f32(
         }
     }
 }
+#endif
 
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 4
 kernel void kernel_rope_neox_f16(
         global void * src0,
         ulong offset0,
@@ -375,7 +382,9 @@ kernel void kernel_rope_neox_f16(
         }
     }
 }
+#endif
 
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 5
 kernel void kernel_rope_multi_f32(
         global void * src0,
         ulong offset0,
@@ -486,7 +495,9 @@ kernel void kernel_rope_multi_f32(
         }
     }
 }
+#endif
 
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 6
 kernel void kernel_rope_multi_f16(
         global void * src0,
         ulong offset0,
@@ -597,7 +608,9 @@ kernel void kernel_rope_multi_f16(
         }
     }
 }
+#endif
 
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 7
 kernel void kernel_rope_vision_f32(
         global void * src0,
         ulong offset0,
@@ -680,7 +693,9 @@ kernel void kernel_rope_vision_f32(
         dst_data[n_dims] = x0*cos_sin_theta.s1 + x1*cos_sin_theta.s0;
     }
 }
+#endif
 
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 8
 kernel void kernel_rope_vision_f16(
         global void * src0,
         ulong offset0,
@@ -763,10 +778,12 @@ kernel void kernel_rope_vision_f16(
         dst_data[n_dims] = x0*cos_sin_theta.s1 + x1*cos_sin_theta.s0;
     }
 }
+#endif
 
 // Fused ROPE_NORM + VIEW + SET_ROWS for f32 source / f16 destination.
 // NORM-style rope pairs are adjacent (dst[0], dst[1]) vs NEOX split halves.
 // Mirrors the CUDA `rope_norm_cuda<float, half>(..., row_indices, set_rows_stride)` path.
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 9
 kernel void kernel_rope_norm_f32_set_rows_f16(
         global void * src0,
         ulong offset0,
@@ -847,10 +864,12 @@ kernel void kernel_rope_norm_f32_set_rows_f16(
         }
     }
 }
+#endif
 
 // Fused ROPE_NEOX + VIEW + SET_ROWS for f32 source / f16 destination.
 // Mirrors the CUDA `rope_neox_cuda<float, half>(..., row_indices, set_rows_stride)` path.
 // The rope output is redirected into the K-cache at the row indicated by row_indices[i2].
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 10
 kernel void kernel_rope_neox_f32_set_rows_f16(
         global void * src0,
         ulong offset0,
@@ -932,6 +951,7 @@ kernel void kernel_rope_neox_f32_set_rows_f16(
         }
     }
 }
+#endif
 
 //------------------------------------------------------------------------------
 // rms_norm + mul(weight) + rope, fused. Folds the per-head Q/K RMS-norm and its
@@ -942,6 +962,7 @@ kernel void kernel_rope_neox_f32_set_rows_f16(
 // heads/tokens). One WG per (head=i1, token=i2) row reduces sum(x^2) across the
 // row, then applies (rmsnorm(x)*w) followed by rope. f32 source only.
 //------------------------------------------------------------------------------
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 11
 #ifdef INTEL_GPU
 REQD_SUBGROUP_SIZE_32
 #elif defined (ADRENO_GPU)
@@ -1051,7 +1072,9 @@ kernel void kernel_rope_neox_f32_rms(
         }
     }
 }
+#endif
 
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 12
 #ifdef INTEL_GPU
 REQD_SUBGROUP_SIZE_32
 #elif defined (ADRENO_GPU)
@@ -1160,6 +1183,7 @@ kernel void kernel_rope_norm_f32_rms(
         }
     }
 }
+#endif
 
 //------------------------------------------------------------------------------
 // rms_norm + mul(weight) + rope(neox) + set_rows, fused (f32 source -> f16 cache).
@@ -1170,6 +1194,7 @@ kernel void kernel_rope_norm_f32_rms(
 // f16 cast matches the standalone SET_ROWS, so the cache is byte-identical to the
 // rms+mul+rope + set_rows path. f32 source / f16 dest, NEOX only.
 //------------------------------------------------------------------------------
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 13
 #ifdef INTEL_GPU
 REQD_SUBGROUP_SIZE_32
 #elif defined (ADRENO_GPU)
@@ -1275,4 +1300,5 @@ kernel void kernel_rope_neox_f32_rms_set_rows_f16(
         }
     }
 }
+#endif
 

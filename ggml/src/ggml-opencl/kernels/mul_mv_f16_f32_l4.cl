@@ -24,8 +24,13 @@
 #elif defined(cl_qcom_subgroup_shuffle)
 #pragma OPENCL EXTENSION cl_qcom_subgroup_shuffle : enable
 #define HAS_SUBGROUP_SHUFFLE 1
+// Adreno compilers that expose only cl_qcom_subgroup_shuffle do not declare the KHR
+// name, so calling it is an implicit declaration and the program fails to build.
+// Route it to the qcom builtin.
+#define sub_group_shuffle_xor(val, mask) qcom_sub_group_shuffle_xor((val), (mask), CLK_SUB_GROUP_SHUFFLE_WIDTH_WAVE_SIZE_QCOM, 0.0f)
 #endif
 
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 1
 // Assumes row size (ne00) is a multiple of 4
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
@@ -90,6 +95,309 @@ kernel void kernel_mul_mat_f16_f32_l4(
         }
     }
 }
+#endif
+
+// Each subgroup produces DR_NDST outputs, assumes ne11 == 1
+#define MUL_MAT_F16_F32_L4_DR_NDST 4
+
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 2
+#ifdef ADRENO_GPU
+REQD_SUBGROUP_SIZE_64
+#endif
+kernel void kernel_mul_mat_f16_f32_l4_dr(
+        global char * src0,
+        ulong offset0,
+        global char * src1,
+        ulong offset1,
+        global float * dst,
+        ulong offsetd,
+        int ne00,
+        int ne01,
+        int ne02,
+        ulong nb00,
+        ulong nb01,
+        ulong nb02,
+        ulong nb03,
+        int ne10,
+        int ne11,
+        int ne12,
+        ulong nb10,
+        ulong nb11,
+        ulong nb12,
+        ulong nb13,
+        int ne0,
+        int ne1,
+        int r2,
+        int r3
+) {
+    src0 = (global char*)((global char*)src0 + offset0);
+    src1 = (global char*)((global char*)src1 + offset1);
+    dst  = (global float*)((global char*)dst  + offsetd);
+
+    const int r0_base = get_group_id(0) * MUL_MAT_F16_F32_L4_DR_NDST;
+    const int im      = get_group_id(2);
+
+    const int i12 = im % ne12;
+    const int i13 = im / ne12;
+
+    // assume ne11 == 1
+    const ulong offset_src1 = i12*nb12 + i13*nb13;
+    global float4 * y4 = (global float4 *)(src1 + offset_src1);
+
+    global half4 * x4[MUL_MAT_F16_F32_L4_DR_NDST];
+    float          sumf[MUL_MAT_F16_F32_L4_DR_NDST];
+
+    const ulong   k_head_off = (i12/r2)*nb02 + (i13/r3)*nb03;
+
+    #pragma unroll
+    for (int n = 0; n < MUL_MAT_F16_F32_L4_DR_NDST; ++n) {
+        int       r0   = r0_base + n;
+        int       r0c  = r0 < ne01 ? r0 : 0;
+        ulong     off  = (ulong)r0c*nb01 + k_head_off;
+        x4[n]   = (global half4 *)(src0 + off);
+        sumf[n] = 0.0f;
+    }
+
+    const int n_chunks = ne00 / 4;
+    const int sg_size  = get_max_sub_group_size();
+    const int lid      = get_sub_group_local_id();
+
+    for (int i = lid; i < n_chunks; i += sg_size) {
+        float4 q = y4[i];
+        #pragma unroll
+        for (int n = 0; n < MUL_MAT_F16_F32_L4_DR_NDST; ++n) {
+            float4 k = convert_float4(x4[n][i]);
+            sumf[n] = mad(k.s0, q.s0, sumf[n]);
+            sumf[n] = mad(k.s1, q.s1, sumf[n]);
+            sumf[n] = mad(k.s2, q.s2, sumf[n]);
+            sumf[n] = mad(k.s3, q.s3, sumf[n]);
+        }
+    }
+
+    #pragma unroll
+    for (int n = 0; n < MUL_MAT_F16_F32_L4_DR_NDST; ++n) {
+        float reduced = sub_group_reduce_add(sumf[n]);
+        int   r0      = r0_base + n;
+        if (lid == 0 && r0 < ne01) {
+            dst[im*ne1*ne0 + r0] = reduced;
+        }
+    }
+}
+#endif
+
+// Kernels for decoding, Adreno only for now
+#define MUL_MAT_F16_F32_L4_DR_LS_R2_MAX 8
+
+#ifdef ADRENO_GPU
+#pragma OPENCL EXTENSION cl_qcom_subgroup_shuffle : enable
+#define sub_group_shuffle_xor(val, mask) qcom_sub_group_shuffle_xor((val), (mask), CLK_SUB_GROUP_SHUFFLE_WIDTH_WAVE_SIZE_QCOM, 0.0f)
+
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 3
+REQD_SUBGROUP_SIZE_64
+kernel void kernel_mul_mat_f16_f32_l4_dr_ls(
+        global char * src0,
+        ulong offset0,
+        global char * src1,
+        ulong offset1,
+        global float * dst,
+        ulong offsetd,
+        int ne00,
+        int ne01,
+        int ne02,
+        ulong nb00,
+        ulong nb01,
+        ulong nb02,
+        ulong nb03,
+        int ne10,
+        int ne11,
+        int ne12,
+        ulong nb10,
+        ulong nb11,
+        ulong nb12,
+        ulong nb13,
+        int ne0,
+        int ne1,
+        int r2,
+        int r3
+) {
+    src0 = (global char*)((global char*)src0 + offset0);
+    src1 = (global char*)((global char*)src1 + offset1);
+    dst  = (global float*)((global char*)dst  + offsetd);
+
+    const int r0_base = get_group_id(0) * 2;
+    const int kv_grp  = get_group_id(2);   // KV head group; im = kv_grp*r2 + q
+
+    const int i12_kv = kv_grp % ne02;
+    const int i13_kv = kv_grp / ne02;
+
+    const int lid     = get_sub_group_local_id();
+    const int subhalf = lid >> 5;          // 0 or 1 (which K row in the WG)
+    const int intra   = lid & 31;          // 0..31 (lane within the half)
+
+    const int r0  = r0_base + subhalf;
+    const int r0c = r0 < ne01 ? r0 : 0;    // clamp OOB to row 0; skip write below
+
+    // K row pointer for this lane (one K row per half-wave).
+    const ulong k_off = (ulong)r0c*nb01 + (ulong)i12_kv*nb02 + (ulong)i13_kv*nb03;
+    global half4 * x4 = (global half4 *)(src0 + k_off);
+
+    global float4 * y4[MUL_MAT_F16_F32_L4_DR_LS_R2_MAX];
+    #pragma unroll
+    for (int q = 0; q < MUL_MAT_F16_F32_L4_DR_LS_R2_MAX; ++q) {
+        const int i12_q = i12_kv*r2 + q;
+        const ulong q_off = (ulong)i12_q*nb12 + (ulong)i13_kv*nb13;
+        y4[q] = (global float4 *)(src1 + q_off);
+    }
+
+    float partial[MUL_MAT_F16_F32_L4_DR_LS_R2_MAX];
+    #pragma unroll
+    for (int q = 0; q < MUL_MAT_F16_F32_L4_DR_LS_R2_MAX; ++q) {
+        partial[q] = 0.0f;
+    }
+
+    const int n_chunks = ne00 / 4;
+
+    for (int i = intra; i < n_chunks; i += 32) {
+        float4 k = convert_float4(x4[i]);
+
+        #pragma unroll
+        for (int q = 0; q < MUL_MAT_F16_F32_L4_DR_LS_R2_MAX; ++q) {
+            if (q < r2) {
+                float4 v = y4[q][i];
+                partial[q] = mad(k.s0, v.s0, partial[q]);
+                partial[q] = mad(k.s1, v.s1, partial[q]);
+                partial[q] = mad(k.s2, v.s2, partial[q]);
+                partial[q] = mad(k.s3, v.s3, partial[q]);
+            }
+        }
+    }
+
+    // half-wave reduction
+    #pragma unroll
+    for (int q = 0; q < MUL_MAT_F16_F32_L4_DR_LS_R2_MAX; ++q) {
+        if (q < r2) {
+            partial[q] += sub_group_shuffle_xor(partial[q],  1u);
+            partial[q] += sub_group_shuffle_xor(partial[q],  2u);
+            partial[q] += sub_group_shuffle_xor(partial[q],  4u);
+            partial[q] += sub_group_shuffle_xor(partial[q],  8u);
+            partial[q] += sub_group_shuffle_xor(partial[q], 16u);
+        }
+    }
+
+    if (intra == 0 && r0 < ne01) {
+        #pragma unroll
+        for (int q = 0; q < MUL_MAT_F16_F32_L4_DR_LS_R2_MAX; ++q) {
+            if (q < r2) {
+                const int im = i12_kv*r2 + q + i13_kv*ne12;
+                dst[im*ne1*ne0 + r0] = partial[q];
+            }
+        }
+    }
+}
+#endif
+
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 4
+REQD_SUBGROUP_SIZE_64
+kernel void kernel_mul_mat_f16_f32_l4_dr_lq(
+        global char * src0,
+        ulong offset0,
+        global char * src1,
+        ulong offset1,
+        global float * dst,
+        ulong offsetd,
+        int ne00,
+        int ne01,
+        int ne02,
+        ulong nb00,
+        ulong nb01,
+        ulong nb02,
+        ulong nb03,
+        int ne10,
+        int ne11,
+        int ne12,
+        ulong nb10,
+        ulong nb11,
+        ulong nb12,
+        ulong nb13,
+        int ne0,
+        int ne1,
+        int r2,
+        int r3
+) {
+    src0 = (global char*)((global char*)src0 + offset0);
+    src1 = (global char*)((global char*)src1 + offset1);
+    dst  = (global float*)((global char*)dst  + offsetd);
+
+    const int r0_base = get_group_id(0) * 4;
+    const int kv_grp  = get_group_id(2);
+
+    const int i12_kv = kv_grp % ne02;
+    const int i13_kv = kv_grp / ne02;
+
+    const int lid   = get_sub_group_local_id();
+    const int subq  = lid >> 4;            // 0..3 (which K row)
+    const int intra = lid & 15;            // 0..15 (lane within quarter)
+
+    const int r0  = r0_base + subq;
+    const int r0c = r0 < ne01 ? r0 : 0;
+
+    const ulong k_off = (ulong)r0c*nb01 + (ulong)i12_kv*nb02 + (ulong)i13_kv*nb03;
+    global half4 * x4 = (global half4 *)(src0 + k_off);
+
+    global float4 * y4[MUL_MAT_F16_F32_L4_DR_LS_R2_MAX];
+    #pragma unroll
+    for (int q = 0; q < MUL_MAT_F16_F32_L4_DR_LS_R2_MAX; ++q) {
+        const int i12_q = i12_kv*r2 + q;
+        const ulong q_off = (ulong)i12_q*nb12 + (ulong)i13_kv*nb13;
+        y4[q] = (global float4 *)(src1 + q_off);
+    }
+
+    float partial[MUL_MAT_F16_F32_L4_DR_LS_R2_MAX];
+    #pragma unroll
+    for (int q = 0; q < MUL_MAT_F16_F32_L4_DR_LS_R2_MAX; ++q) {
+        partial[q] = 0.0f;
+    }
+
+    const int n_chunks = ne00 / 4;
+
+    for (int i = intra; i < n_chunks; i += 16) {
+        float4 k = convert_float4(x4[i]);
+
+        #pragma unroll
+        for (int q = 0; q < MUL_MAT_F16_F32_L4_DR_LS_R2_MAX; ++q) {
+            if (q < r2) {
+                float4 v = y4[q][i];
+                partial[q] = mad(k.s0, v.s0, partial[q]);
+                partial[q] = mad(k.s1, v.s1, partial[q]);
+                partial[q] = mad(k.s2, v.s2, partial[q]);
+                partial[q] = mad(k.s3, v.s3, partial[q]);
+            }
+        }
+    }
+
+    // quarter-wave reduction
+    #pragma unroll
+    for (int q = 0; q < MUL_MAT_F16_F32_L4_DR_LS_R2_MAX; ++q) {
+        if (q < r2) {
+            partial[q] += sub_group_shuffle_xor(partial[q], 1u);
+            partial[q] += sub_group_shuffle_xor(partial[q], 2u);
+            partial[q] += sub_group_shuffle_xor(partial[q], 4u);
+            partial[q] += sub_group_shuffle_xor(partial[q], 8u);
+        }
+    }
+
+    if (intra == 0 && r0 < ne01) {
+        #pragma unroll
+        for (int q = 0; q < MUL_MAT_F16_F32_L4_DR_LS_R2_MAX; ++q) {
+            if (q < r2) {
+                const int im = i12_kv*r2 + q + i13_kv*ne12;
+                dst[im*ne1*ne0 + r0] = partial[q];
+            }
+        }
+    }
+}
+#endif
+#endif // ADRENO_GPU
 
 // Multi-row variant: each workgroup processes N_ROWS_PER_WG K rows instead of
 // 1, amortizing dispatch overhead. The default kernel above launches one WG
@@ -104,6 +412,7 @@ kernel void kernel_mul_mat_f16_f32_l4(
 #define N_ROWS_PER_WG 8
 #define N_OUTS_PER_WG 8
 
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 5
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
 #endif
@@ -181,6 +490,7 @@ kernel void kernel_mul_mat_f16_f32_l4_x8(
         }
     }
 }
+#endif
 
 // Streaming-Q multi-output variant for the KQV-shaped matmul: src0 has small
 // ne01 (e.g. DV=256) but large ne00 (n_kv, up to 16384 at d=16k). The x8
@@ -192,6 +502,7 @@ kernel void kernel_mul_mat_f16_f32_l4_x8(
 //
 // Dispatched for the same shape pattern as x8 (ne11 == 1, ne01 divisible by 8)
 // when ne00 > 256, i.e. when the x8 path can't be used.
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 6
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
 #endif
@@ -274,6 +585,7 @@ kernel void kernel_mul_mat_f16_f32_l4_y8(
         }
     }
 }
+#endif
 
 // Lane-utilization variant of _x8 for the long-context KQ matmul (Adreno X2).
 //
@@ -303,6 +615,7 @@ kernel void kernel_mul_mat_f16_f32_l4_y8(
 #define N_OUTS_PAIR  8
 #define N_PAIRS_PAIR (N_OUTS_PAIR / 2)
 
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 7
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
 #endif
@@ -392,6 +705,7 @@ kernel void kernel_mul_mat_f16_f32_l4_x8_pair(
         }
     }
 }
+#endif
 
 // GQA-coalesced KQ variant for the long-context fa=0 path on Adreno X2.
 //
@@ -417,6 +731,7 @@ kernel void kernel_mul_mat_f16_f32_l4_x8_pair(
 #define LANES_PER_QH   8    // 64 / GQA_RATIO_GQA
 #define DK_VEC_GQA     32   // DK / 4 for DK=128
 
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 8
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
 #endif
@@ -460,13 +775,8 @@ kernel void kernel_mul_mat_f16_f32_l4_x8_gqa4(
     const int i02 = im_kv % ne02;           // K-head index (also K2 batch)
     const int i03 = im_kv / ne02;           // n13 batch index
 
-    // GQA Q-heads sharing this K-head: i12 ∈ [i02*r2, i02*r2 + r2).
-    // (r2 is the dispatch's guarantee == GQA_RATIO_GQA at this gate.)
     const int q_head_lo = i02 * GQA_RATIO_GQA;
 
-    // Stage all GQA_RATIO Q vectors (one per Q-head sharing the K-head) into
-    // __local. Each Q-head has DK_VEC_GQA = 32 float4 elements; 64 lanes load
-    // 2 per Q-head (32 lanes × 2) using the first 32 lanes per Q-head.
     __local float4 q_loc[GQA_RATIO_GQA * DK_VEC_GQA];   // 4 × 32 = 128 float4
     #pragma unroll
     for (int qh = 0; qh < GQA_RATIO_GQA; ++qh) {
@@ -520,6 +830,7 @@ kernel void kernel_mul_mat_f16_f32_l4_x8_gqa4(
         }
     }
 }
+#endif
 
 // GQA-coalesced KQV variant for the long-context fa=0 path on Adreno X2.
 //
@@ -548,6 +859,7 @@ kernel void kernel_mul_mat_f16_f32_l4_x8_gqa4(
 #define N_DV_ROWS_Y8GQA  8
 #define GQA_RATIO_Y8GQA  8
 
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 9
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
 #endif
@@ -660,6 +972,7 @@ kernel void kernel_mul_mat_f16_f32_l4_y8_gqa(
         }
     }
 }
+#endif
 
 // image1d_buffer_t (texture-cache) variant of _x8_gqa4.
 //
@@ -689,6 +1002,7 @@ kernel void kernel_mul_mat_f16_f32_l4_y8_gqa(
 //
 // Dispatch (separate from _x8_gqa4): same grid as the regular variant.
 // Opt-in via env var GGML_OPENCL_MM_KQ_GQA_IMG=1 on the host.
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 10
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
 #endif
@@ -789,6 +1103,7 @@ kernel void kernel_mul_mat_f16_f32_l4_x8_gqa4_img(
         }
     }
 }
+#endif
 
 // image1d_buffer_t (texture-cache) variant of _y8_gqa for KQV decode.
 //
@@ -813,6 +1128,7 @@ kernel void kernel_mul_mat_f16_f32_l4_x8_gqa4_img(
 // register-equivalent to _y8_gqa.
 //
 // Dispatch grid: same as _y8_gqa. Opt-in via env GGML_OPENCL_MM_KQV_GQA_IMG=1.
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 11
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
 #endif
@@ -854,7 +1170,7 @@ kernel void kernel_mul_mat_f16_f32_l4_y8_gqa_img(
 
     const int q_head_lo = i02 * GQA_RATIO_Y8GQA;
 
-    // Q (= softmax(KQ)) base pointers per Q-head. Streaming — no caching.
+    // Q (= softmax(KQ)) base pointers per Q-head
     global float4 * y4_q[GQA_RATIO_Y8GQA];
     #pragma unroll
     for (int qh = 0; qh < GQA_RATIO_Y8GQA; ++qh) {
@@ -926,6 +1242,7 @@ kernel void kernel_mul_mat_f16_f32_l4_y8_gqa_img(
         }
     }
 }
+#endif
 
 // r2=4 specialization of the GQA-coalesced KQ image kernel.
 //
@@ -949,6 +1266,7 @@ kernel void kernel_mul_mat_f16_f32_l4_y8_gqa_img(
 #define LANES_PER_QH_R4   16    // = 64 / GQA_RATIO_R4
 #define DK_VEC_R4         32    // DK / 4 for DK=128
 
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 12
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
 #endif
@@ -1043,6 +1361,7 @@ kernel void kernel_mul_mat_f16_f32_l4_x8_gqa_r4_img(
         }
     }
 }
+#endif
 
 // DK=256, r2=2 specialization for Gemma-3-4B (n_head=8, n_head_kv=4,
 // head_dim=256). 64-lane subgroup partitioned across 2 Q-heads (32 lanes
@@ -1056,6 +1375,7 @@ kernel void kernel_mul_mat_f16_f32_l4_x8_gqa_r4_img(
 #define LANES_PER_QH_R2         32    // = 64 / GQA_RATIO_R2
 #define DK_VEC_DK256            64    // DK / 4 for DK=256
 
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 13
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
 #endif
@@ -1149,6 +1469,7 @@ kernel void kernel_mul_mat_f16_f32_l4_x8_gqa_r2_dk256_img(
         }
     }
 }
+#endif
 
 // DK=256, r2=8 specialization for Qwen3.6-35B-A3B (n_head=16, n_head_kv=2,
 // head_dim=256). Image/texture-cache K reads (separate BW lane from L1, where
@@ -1163,6 +1484,7 @@ kernel void kernel_mul_mat_f16_f32_l4_x8_gqa_r2_dk256_img(
 #define PIX_PER_LANE_R8_DK256   4     // 32 pixels / 8 lanes
 // DK_VEC_DK256 (= 64) reused from the r2=2 variant above.
 
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 14
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
 #endif
@@ -1258,6 +1580,7 @@ kernel void kernel_mul_mat_f16_f32_l4_x8_gqa_r8_dk256_img(
         }
     }
 }
+#endif
 
 // DK=512, r2=8 specialization for the Gemma-4 GLOBAL-attention layers
 // (gemma-4-26B-A4B: n_head=16, n_head_kv=2 on the 1-in-6 full-attention layers,
@@ -1274,6 +1597,7 @@ kernel void kernel_mul_mat_f16_f32_l4_x8_gqa_r8_dk256_img(
 #define PIX_PER_LANE_R8_DK512   8     // 64 pixels / 8 lanes
 #define DK_VEC_DK512            128   // DK / 4 for DK=512
 
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 15
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
 #endif
@@ -1369,3 +1693,4 @@ kernel void kernel_mul_mat_f16_f32_l4_x8_gqa_r8_dk512_img(
         }
     }
 }
+#endif

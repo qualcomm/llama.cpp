@@ -18,6 +18,18 @@
 #define REQD_SUBGROUP_SIZE_128 __attribute__((qcom_reqd_sub_group_size("full")))
 #endif
 
+#ifdef cl_khr_subgroup_shuffle
+#pragma OPENCL EXTENSION cl_khr_subgroup_shuffle : enable
+#define HAS_SUBGROUP_SHUFFLE 1
+#elif defined(cl_qcom_subgroup_shuffle)
+#pragma OPENCL EXTENSION cl_qcom_subgroup_shuffle : enable
+#define HAS_SUBGROUP_SHUFFLE 1
+// Adreno compilers that expose only cl_qcom_subgroup_shuffle do not declare the KHR
+// name, so calling it is an implicit declaration and the program fails to build.
+// Route it to the qcom builtin.
+#define sub_group_shuffle_xor(val, mask) qcom_sub_group_shuffle_xor((val), (mask), CLK_SUB_GROUP_SHUFFLE_WIDTH_WAVE_SIZE_QCOM, 0.0f)
+#endif
+
 #define QK8_0 32
 typedef struct {
     half d;       // delta
@@ -36,6 +48,7 @@ typedef struct {
 #define N_SIMDWIDTH 64
 #endif
 
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 1
 #ifdef INTEL_GPU
 REQD_SUBGROUP_SIZE_16
 #elif defined (ADRENO_GPU)
@@ -123,6 +136,7 @@ kernel void kernel_mul_mv_q8_0_f32(
         }
     }
 }
+#endif
 
 // GQA-coalesced decode KQ for a q8_0 K-cache (DK=128, r2=8, r3=1, ne11==1).
 // The fa=0 quant-K analog of the f16 _x8_gqa4 coalesce: read each K-row once per
@@ -137,6 +151,7 @@ kernel void kernel_mul_mv_q8_0_f32(
 #define GQA_RATIO_Q8GQA  8
 #define DK_VEC_Q8GQA     32   // DK/4 for DK=128
 
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 2
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
 #endif
@@ -232,6 +247,7 @@ kernel void kernel_mul_mat_q8_0_f32_gqa8_dk128(
         }
     }
 }
+#endif
 
 // image1d_buffer_t (texture-cache) variant of kernel_mul_mat_q8_0_f32_gqa8_dk128.
 //
@@ -249,6 +265,7 @@ kernel void kernel_mul_mat_q8_0_f32_gqa8_dk128(
 // bytes start 2-byte-shifted for even blk (qsh=16) and pixel-aligned for odd blk
 // (qsh=0), so even-blk lanes read 5 pixels and shift-combine.
 // Opt-in via GGML_OPENCL_MM_KQ_GQA_Q8_0_IMG=1 on the host.
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 3
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
 #endif
@@ -374,6 +391,7 @@ kernel void kernel_mul_mat_q8_0_f32_gqa8_dk128_img(
         }
     }
 }
+#endif
 
 // ===========================================================================
 // DK=256, r2=8 variants for Qwen3.6-35B-A3B (n_head=16, n_head_kv=2 => r2=8,
@@ -386,6 +404,7 @@ kernel void kernel_mul_mat_q8_0_f32_gqa8_dk128_img(
 #define GQA_RATIO_Q8GQA256  8
 #define DK_VEC_Q8GQA256     64   // DK/4 for DK=256
 
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 4
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
 #endif
@@ -476,6 +495,7 @@ kernel void kernel_mul_mat_q8_0_f32_gqa8_dk256(
         }
     }
 }
+#endif
 
 // image1d_buffer_t (texture-cache) variant of kernel_mul_mat_q8_0_f32_gqa8_dk256.
 // q8_0 row (DK=256): 8 blocks x 34 B = 272 B = 68 uint32 pixels. Lane lane_q owns
@@ -483,6 +503,7 @@ kernel void kernel_mul_mat_q8_0_f32_gqa8_dk256(
 // 0 for even lane_q, 2 for odd; q_byte=34*lane_q+2 is 2-byte-shifted (q_sh=16) for
 // even lane_q and pixel-aligned (q_sh=0) for odd -- so even lanes read 9 pixels and
 // shift-combine 8 quant words.
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 5
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
 #endif
@@ -596,6 +617,7 @@ kernel void kernel_mul_mat_q8_0_f32_gqa8_dk256_img(
         }
     }
 }
+#endif
 
 // ===========================================================================
 // DK=256, r2=4 variants for Qwen3.5-9B (n_head_kv=4 => GQA r=4, head_dim=256).
@@ -608,6 +630,7 @@ kernel void kernel_mul_mat_q8_0_f32_gqa8_dk256_img(
 #define GQA_RATIO_Q8GQA_R4_256  4
 #define DK_VEC_Q8GQA_R4_256     64   // DK/4 for DK=256
 
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 6
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
 #endif
@@ -698,11 +721,13 @@ kernel void kernel_mul_mat_q8_0_f32_gqa_r4_dk256(
         }
     }
 }
+#endif
 
 // image1d_buffer_t (texture-cache) variant of kernel_mul_mat_q8_0_f32_gqa_r4_dk256.
 // Row = 8 q8_0 blocks x 34 B = 272 B = 68 px (same as the gqa8_dk256 row). Lane owns
 // a half block: blk=lane_q>>1, hoff=(lane_q&1)*16; d at byte 34*blk, qs+hoff at
 // 34*blk+2+hoff -- generic q_sh = (q_byte&3)*8 (read 5 px + shift-combine when shifted).
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 7
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
 #endif
@@ -824,6 +849,7 @@ kernel void kernel_mul_mat_q8_0_f32_gqa_r4_dk256_img(
         }
     }
 }
+#endif
 
 // ===========================================================================
 // r2=4 variants (DK=128) for Llama-3-8B (n_head=32, n_head_kv=8 => r2=4, all-
@@ -836,6 +862,7 @@ kernel void kernel_mul_mat_q8_0_f32_gqa_r4_dk256_img(
 #define GQA_RATIO_Q8GQA_R4  4
 #define DK_VEC_Q8GQA_R4     32   // DK/4 for DK=128
 
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 8
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
 #endif
@@ -922,10 +949,12 @@ kernel void kernel_mul_mat_q8_0_f32_gqa_r4_dk128(
         }
     }
 }
+#endif
 
 // image1d_buffer_t (texture-cache) variant of the r2=4 kernel above. Same q8_0
 // row->pixel mapping as the r2=8 image kernel (136-B row = 34 uint32 px; even-blk
 // half shifted 2 B). Each lane reads 8 qs bytes = 2 words (w0,w1) + its block d.
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 9
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
 #endif
@@ -1036,3 +1065,116 @@ kernel void kernel_mul_mat_q8_0_f32_gqa_r4_dk128_img(
         }
     }
 }
+#endif
+
+// Generic decode KQ for a q8_0 K-cache: any GQA ratio, any DK in [32, 512] that
+// is a multiple of 32. The GQA-coalesced kernels above bake the GQA ratio and DK
+// into their lane geometry (8 Q-heads x 8 lanes at DK=128), so a model whose
+// attention shape falls outside that table -- e.g. Gemma-4, whose SWA layers are
+// DK=256/r2=2 and whose global layers are DK=512/r2=8 -- misses them entirely and
+// falls back to dequantizing the whole K view to f16 on every attention op. That
+// fallback costs ~2.5x end-to-end even though the GPU does the same work, because
+// the dequant pass runs off the critical path of the GPU kernels.
+//
+// This kernel takes the other axis: instead of splitting lanes across Q-heads, it
+// splits them across DK. One subgroup owns one (row-block, Q-head, batch) and each
+// lane owns 8 contiguous elements of the K row -- lane l covers [8l, 8l+8), i.e.
+// q8_0 block l/4, byte offset (l%4)*8. 64 lanes x 8 = 512 elements, so DK<=512
+// needs at most one pass and lanes beyond DK/8 sit out. K stays q8_0: no dequant
+// pass, no per-op scratch buffer.
+//
+// Slower per row than the coalesced kernels (it re-reads K once per Q-head), so
+// the host only selects it when the coalesced table misses.
+#define N_ROWS_Q8GEN  4      // K rows per subgroup, to amortize the Q load
+#define DK_MAX_Q8GEN  512
+
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 10
+#ifdef ADRENO_GPU
+REQD_SUBGROUP_SIZE_64
+#endif
+kernel void kernel_mul_mat_q8_0_f32_kq_gen(
+        global char * src0,
+        ulong offset0,
+        global char * src1,
+        ulong offset1,
+        global float * dst,
+        ulong offsetd,
+        int ne00,
+        int ne01,
+        int ne02,
+        ulong nb01,
+        ulong nb02,
+        ulong nb03,
+        int ne10,
+        int ne11,
+        int ne12,
+        ulong nb10,
+        ulong nb11,
+        ulong nb12,
+        ulong nb13,
+        int ne0,
+        int ne1,
+        int r2,
+        int r3
+) {
+    src0 = (global char *)((global char *)src0 + offset0);
+    src1 = (global char *)((global char *)src1 + offset1);
+    dst  = (global float*)((global char *)dst  + offsetd);
+
+    const int lid = get_sub_group_local_id();   // 0..63
+
+    const int r0_base = get_group_id(0) * N_ROWS_Q8GEN;
+    const int im      = get_group_id(2);        // Q-head across batch
+
+    const int i12 = im % ne12;                  // Q-head
+    const int i13 = im / ne12;                  // batch
+    const int i02 = i12 / r2;                   // K-head this Q-head reads
+    const int i03 = i13 / r3;
+
+    // This lane's slice of the row: 8 contiguous elements.
+    const int e0   = lid * 8;                   // first element
+    const bool act = (e0 < ne00);               // lanes past DK sit out
+    const int blk  = e0 >> 5;                   // q8_0 block index (32 elems each)
+    const int boff = e0 & 31;                   // byte offset inside the block
+
+    // Q for this head: the 8 f32 this lane needs (2 float4, contiguous).
+    float4 qa = (float4)(0.0f);
+    float4 qb = (float4)(0.0f);
+    if (act) {
+        global float4 * q4 = (global float4 *)(src1 + i12 * nb12 + i13 * nb13);
+        qa = q4[(e0 >> 2) + 0];
+        qb = q4[(e0 >> 2) + 1];
+    }
+
+    const ulong head_off = i02 * nb02 + i03 * nb03;
+
+    for (int dr = 0; dr < N_ROWS_Q8GEN; ++dr) {
+        const int r0 = r0_base + dr;
+        if (r0 >= ne01) {
+            break;
+        }
+
+        float sumf = 0.0f;
+        if (act) {
+            global block_q8_0 * kb = (global block_q8_0 *)(src0 + r0 * nb01 + head_off) + blk;
+            const float d = convert_float(kb->d);
+            global char * qs = kb->qs + boff;
+
+            sumf = (float)qs[0] * qa.s0
+                 + (float)qs[1] * qa.s1
+                 + (float)qs[2] * qa.s2
+                 + (float)qs[3] * qa.s3
+                 + (float)qs[4] * qb.s0
+                 + (float)qs[5] * qb.s1
+                 + (float)qs[6] * qb.s2
+                 + (float)qs[7] * qb.s3;
+            sumf *= d;
+        }
+
+        const float tot = sub_group_reduce_add(sumf);
+        if (lid == 0) {
+            dst[im * ne1 * ne0 + r0] = tot;
+        }
+    }
+}
+#endif

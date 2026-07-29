@@ -154,6 +154,124 @@ __kernel void kernel_gemv_moe_q4_k_f32_ns(
     }
 }
 
+// --- Weight-as-texture variant of kernel_gemv_moe_q4_k_f32_ns ------------------
+// Byte-identical math; the only change is that the q4_K nibble plane is read
+// through an image1d_buffer (read_imageui -> texture/L1 cache) instead of a plain
+// __global uint buffer. Dense decode GEMVs (gemv_noshuffle_*) and the MoE prefill
+// dp4a GEMMs already read weights this way; the MoE decode GEMV was the one path
+// still on a host buffer. src0_q is the same CL_R/UINT32 q_img used by prefill
+// (1 uint/texel, index == the buffer uint index). Opt-in: GGML_OPENCL_MOE_DECODE_WIMG.
+__attribute__((qcom_reqd_sub_group_size("half")))
+__kernel void kernel_gemv_moe_q4_k_f32_ns_wimg(
+    __read_only image1d_buffer_t src0_q,
+    __global half *         src0_d,
+    __global half *         src0_dm,
+    __global uchar *        src0_s,
+    __read_only image1d_buffer_t src1,
+    __global uint *         src2,
+    __global float *        dst,
+    ulong                   offsetd,
+    int                     ne00,
+    int                     ne01,
+    int                     ne11
+) {
+    uint i01  = get_global_id(0);
+    uint i20  = get_global_id(2);
+    uint sgid = get_local_id(1);
+    uint slid = get_sub_group_local_id();
+
+    if (i01 >= ne01) {
+        return;
+    }
+
+    uint i11 = i20 % ne11;
+
+    uint expert_id = src2[i20];
+
+    int num_superblocks = ne00 / QK_K;
+    int num_subblocks = ne00 / 32;
+    int scales_per_row = num_superblocks * K_SCALE_SIZE;
+
+    uint expert_q_offset = expert_id * (ne00 / 8) * ne01;
+    uint expert_d_offset = expert_id * num_superblocks * ne01;
+
+    __private float sum = 0.0f;
+
+    for (uint ib = sgid; ib < num_subblocks; ib += N_SIMDGROUP) {
+        uint sb = ib / 8;
+        uint j  = ib % 8;
+
+        half d_val   = src0_d[expert_d_offset + sb * ne01 + i01];
+        half dm_val  = src0_dm[expert_d_offset + sb * ne01 + i01];
+
+        global const uchar * sc = src0_s + (expert_id * ne01 + i01) * scales_per_row + sb * K_SCALE_SIZE;
+        uchar sv, mn;
+        get_scale_min_k4(j, sc, &sv, &mn);
+
+        float scale = (float)d_val * (float)sv;
+        float minv  = (float)dm_val * (float)mn;
+
+        uint q_base = expert_q_offset + ib * ne01 * 4 + i01;
+
+        uint4 regQ;
+        regQ.s0 = read_imageui(src0_q, (int)(q_base)).x;
+        regQ.s1 = read_imageui(src0_q, (int)(q_base + ne01)).x;
+        regQ.s2 = read_imageui(src0_q, (int)(q_base + ne01 * 2)).x;
+        regQ.s3 = read_imageui(src0_q, (int)(q_base + ne01 * 3)).x;
+
+        uint y_offset = i11 * ne00 / 4 + ib * 8;
+
+        float8 fp32x8 = q4_k_to_fp32_packed8(as_ushort2(regQ.s0), scale, minv);
+
+        float4 shared_y4;
+        shared_y4 = read_imagef(src1, (y_offset + 0));
+        float4 acc = shared_y4 * fp32x8.lo;
+
+        shared_y4 = read_imagef(src1, (y_offset + 1));
+        acc += shared_y4 * fp32x8.hi;
+
+        fp32x8 = q4_k_to_fp32_packed8(as_ushort2(regQ.s1), scale, minv);
+
+        shared_y4 = read_imagef(src1, (y_offset + 2));
+        acc += shared_y4 * fp32x8.lo;
+
+        shared_y4 = read_imagef(src1, (y_offset + 3));
+        acc += shared_y4 * fp32x8.hi;
+
+        fp32x8 = q4_k_to_fp32_packed8(as_ushort2(regQ.s2), scale, minv);
+
+        shared_y4 = read_imagef(src1, (y_offset + 4));
+        acc += shared_y4 * fp32x8.lo;
+
+        shared_y4 = read_imagef(src1, (y_offset + 5));
+        acc += shared_y4 * fp32x8.hi;
+
+        fp32x8 = q4_k_to_fp32_packed8(as_ushort2(regQ.s3), scale, minv);
+
+        shared_y4 = read_imagef(src1, (y_offset + 6));
+        acc += shared_y4 * fp32x8.lo;
+
+        shared_y4 = read_imagef(src1, (y_offset + 7));
+        acc += shared_y4 * fp32x8.hi;
+
+        sum += ((acc.s0 + acc.s1) + (acc.s2 + acc.s3));
+    }
+
+    __local float reduceLM[SIMDGROUP_WIDTH * (N_SIMDGROUP - 1)];
+    if (sgid == 1) reduceLM[SIMDGROUP_WIDTH * 0 + slid] = sum;
+    if (sgid == 2) reduceLM[SIMDGROUP_WIDTH * 1 + slid] = sum;
+    if (sgid == 3) reduceLM[SIMDGROUP_WIDTH * 2 + slid] = sum;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (sgid == 0) sum += reduceLM[SIMDGROUP_WIDTH * 0 + slid];
+    if (sgid == 0) sum += reduceLM[SIMDGROUP_WIDTH * 1 + slid];
+    if (sgid == 0) sum += reduceLM[SIMDGROUP_WIDTH * 2 + slid];
+
+    if (sgid == 0) {
+        dst = dst + (offsetd >> 2);
+        dst[i01 + i20 * ne01] = sum;
+    }
+}
+
 // --- Fused combined-gate_up MoE GEMV + GLU epilogue ----------------------------
 // Gemma-4 (and similar) MoE FFNs fuse the gate and up projections into a SINGLE
 // expert weight `ffn_gate_up_exps` of width 2*n_ff (rows [0,n_ff) = gate,
@@ -270,6 +388,103 @@ __kernel void kernel_gemv_moe_q4_k_f32_ns_glu(
     MOE_Q4K_ROW_DOT(up_sum,   i01 + (uint)n_ff)
 
     // Cross-subgroup reduction (assumes #subgroups=4), gate (xy) + up (zw) packed.
+    __local float2 reduceLM[SIMDGROUP_WIDTH * (N_SIMDGROUP - 1)];
+    if (sgid == 1) reduceLM[SIMDGROUP_WIDTH * 0 + slid] = (float2)(gate_sum, up_sum);
+    if (sgid == 2) reduceLM[SIMDGROUP_WIDTH * 1 + slid] = (float2)(gate_sum, up_sum);
+    if (sgid == 3) reduceLM[SIMDGROUP_WIDTH * 2 + slid] = (float2)(gate_sum, up_sum);
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (sgid == 0) {
+        gate_sum += reduceLM[SIMDGROUP_WIDTH * 0 + slid].s0;
+        up_sum   += reduceLM[SIMDGROUP_WIDTH * 0 + slid].s1;
+        gate_sum += reduceLM[SIMDGROUP_WIDTH * 1 + slid].s0;
+        up_sum   += reduceLM[SIMDGROUP_WIDTH * 1 + slid].s1;
+        gate_sum += reduceLM[SIMDGROUP_WIDTH * 2 + slid].s0;
+        up_sum   += reduceLM[SIMDGROUP_WIDTH * 2 + slid].s1;
+
+        dst = dst + (offsetd >> 2);
+        dst[i01 + i20 * n_ff] = moe_glu_apply(glu_op, gate_sum, up_sum);
+    }
+}
+
+// Weight-as-texture variant of MOE_Q4K_ROW_DOT: src0_q is an image1d_buffer_t.
+#define MOE_Q4K_ROW_DOT_IMG(SUM, ROW)                                                        \
+    for (uint ib = sgid; ib < num_subblocks; ib += N_SIMDGROUP) {                            \
+        uint sb = ib / 8;                                                                    \
+        uint j  = ib % 8;                                                                    \
+        half d_val  = src0_d[expert_d_offset + sb * ne01 + (ROW)];                           \
+        half dm_val = src0_dm[expert_d_offset + sb * ne01 + (ROW)];                          \
+        global const uchar * sc = src0_s + ((uint)expert_id * ne01 + (ROW)) * scales_per_row + sb * K_SCALE_SIZE; \
+        uchar sv, mn;                                                                        \
+        get_scale_min_k4(j, sc, &sv, &mn);                                                   \
+        float scale = (float)d_val * (float)sv;                                              \
+        float minv  = (float)dm_val * (float)mn;                                             \
+        uint q_base = expert_q_offset + ib * ne01 * 4 + (ROW);                               \
+        uint4 regQ;                                                                          \
+        regQ.s0 = read_imageui(src0_q, (int)(q_base)).x;                                     \
+        regQ.s1 = read_imageui(src0_q, (int)(q_base + ne01)).x;                              \
+        regQ.s2 = read_imageui(src0_q, (int)(q_base + ne01 * 2)).x;                          \
+        regQ.s3 = read_imageui(src0_q, (int)(q_base + ne01 * 3)).x;                          \
+        uint y_offset = i11 * ne00 / 4 + ib * 8;                                             \
+        float8 fp32x8 = q4_k_to_fp32_packed8(as_ushort2(regQ.s0), scale, minv);             \
+        float4 shared_y4;                                                                    \
+        shared_y4 = read_imagef(src1, (y_offset + 0)); float4 acc = shared_y4 * fp32x8.lo;   \
+        shared_y4 = read_imagef(src1, (y_offset + 1)); acc += shared_y4 * fp32x8.hi;         \
+        fp32x8 = q4_k_to_fp32_packed8(as_ushort2(regQ.s1), scale, minv);                     \
+        shared_y4 = read_imagef(src1, (y_offset + 2)); acc += shared_y4 * fp32x8.lo;         \
+        shared_y4 = read_imagef(src1, (y_offset + 3)); acc += shared_y4 * fp32x8.hi;         \
+        fp32x8 = q4_k_to_fp32_packed8(as_ushort2(regQ.s2), scale, minv);                     \
+        shared_y4 = read_imagef(src1, (y_offset + 4)); acc += shared_y4 * fp32x8.lo;         \
+        shared_y4 = read_imagef(src1, (y_offset + 5)); acc += shared_y4 * fp32x8.hi;         \
+        fp32x8 = q4_k_to_fp32_packed8(as_ushort2(regQ.s3), scale, minv);                     \
+        shared_y4 = read_imagef(src1, (y_offset + 6)); acc += shared_y4 * fp32x8.lo;         \
+        shared_y4 = read_imagef(src1, (y_offset + 7)); acc += shared_y4 * fp32x8.hi;         \
+        SUM += ((acc.s0 + acc.s1) + (acc.s2 + acc.s3));                                      \
+    }
+
+// Weight-as-texture variant of kernel_gemv_moe_q4_k_f32_ns_glu (src0_q as image).
+// Byte-identical; Gemma-4 combined gate_up MoE decode.
+__attribute__((qcom_reqd_sub_group_size("half")))
+__kernel void kernel_gemv_moe_q4_k_f32_ns_glu_wimg(
+    __read_only image1d_buffer_t src0_q,
+    __global half *         src0_d,
+    __global half *         src0_dm,
+    __global uchar *        src0_s,
+    __read_only image1d_buffer_t src1,
+    __global uint *         src2,
+    __global float *        dst,
+    ulong                   offsetd,
+    int                     ne00,
+    int                     ne01,
+    int                     ne11,
+    int                     n_ff,
+    int                     glu_op
+) {
+    uint i01  = get_global_id(0);
+    uint i20  = get_global_id(2);
+    uint sgid = get_local_id(1);
+    uint slid = get_sub_group_local_id();
+
+    if (i01 >= (uint)n_ff) {
+        return;
+    }
+
+    uint i11 = i20 % ne11;
+
+    uint expert_id = src2[i20];
+
+    int num_superblocks = ne00 / QK_K;
+    int num_subblocks = ne00 / 32;
+    int scales_per_row = num_superblocks * K_SCALE_SIZE;
+
+    uint expert_q_offset = expert_id * (ne00 / 8) * ne01;
+    uint expert_d_offset = expert_id * num_superblocks * ne01;
+
+    __private float gate_sum = 0.0f;
+    __private float up_sum   = 0.0f;
+
+    MOE_Q4K_ROW_DOT_IMG(gate_sum, i01)
+    MOE_Q4K_ROW_DOT_IMG(up_sum,   i01 + (uint)n_ff)
+
     __local float2 reduceLM[SIMDGROUP_WIDTH * (N_SIMDGROUP - 1)];
     if (sgid == 1) reduceLM[SIMDGROUP_WIDTH * 0 + slid] = (float2)(gate_sum, up_sum);
     if (sgid == 2) reduceLM[SIMDGROUP_WIDTH * 1 + slid] = (float2)(gate_sum, up_sum);
