@@ -4615,7 +4615,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         // X1 (1152 B/WG -> few resident WGs); TILESIZE_N=8 (288 B) lifts occupancy for
         // +57% pp512 on X1-85, byte-identical. X2E keeps 32. Env override wins.
         int q4k_dp4a_ts = (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X1E) ? 8 : 32;
-        if (const char * e = getenv("GGML_OPENCL_Q4K_DP4A_TS")) q4k_dp4a_ts = atoi(e);
+        if (const char * e = getenv("GGML_OPENCL_Q4K_DP4A_TS")) { q4k_dp4a_ts = atoi(e); }
         std::string dp4a_opts = compile_opts + " -DTILESIZE_N=" + std::to_string(q4k_dp4a_ts);
         cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), dp4a_opts);
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a = clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_q8_1_dp4a", &err), err));
@@ -16081,7 +16081,7 @@ static void ggml_opencl_op_rms_norm_fused(ggml_backend_t backend, ggml_tensor * 
     ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
 
     cl_ulong offset0 = extra0->offset + src0->view_offs;
-    cl_ulong offset1 = extra1->offset + src0->view_offs;
+    cl_ulong offset1 = extra1->offset + src1->view_offs;
     cl_ulong offsetd = extrad->offset + dst->view_offs;
 
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
@@ -19240,7 +19240,11 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
 
     // Flash-Decoding K-split decision. Resolved here, before the prefill
     // prepass, because KV-pad and blk prepass are pure overhead when FD fires.
-    const int is_causal = (mask == NULL && n_q > 1 && n_q == n_kv);
+    // Do not infer causality from tensor shapes: a NULL mask means full
+    // (bidirectional) attention, e.g. ViT encoders, where n_q == n_kv as well.
+    // Causal attention in llama.cpp always comes with an explicit KQ mask.
+    // Inferring is_causal here corrupted mmproj output on OpenCL (see #23800).
+    const int is_causal = 0;
     const int fd_max_n_q = (d_head_q <= FD_MAX_DK_MULTI) ? FD_MAX_N_Q_MULTI : 1;
     cl_kernel fd_k_split = NULL;
     bool use_fd_mq = false;

@@ -2,14 +2,15 @@
 // expensive clBuildProgram-from-source step when a binary for the exact same
 // (source, compile options, device, driver, platform) was previously saved.
 //
-// Activation: DEFAULT-ON (opt-out) via GGML_OPENCL_KERNEL_CACHE_DIR:
-//   unset / empty / "1" / "default"      → platform default cache dir
+// Activation: default on via GGML_OPENCL_KERNEL_CACHE_DIR:
+//   unset / empty / "1" / "default"      : platform default cache dir
 //                                          (%LOCALAPPDATA%\llama.cpp\cl-cache,
-//                                          ~/Library/Caches/…, $XDG_CACHE_HOME/…)
-//   "0" / "off" / "none" / "disable(d)"  → disabled (all functions no-op)
-//   any other value                      → used verbatim as the cache path
+//                                          ~/Library/Caches/llama.cpp/cl-cache,
+//                                          <temp dir>/llama.cpp/cl-cache elsewhere)
+//   "0" / "off" / "none" / "disable(d)"  : disabled (all functions no-op)
+//   any other value                      : used verbatim as the cache path
 // If the chosen directory cannot be created/used, the cache silently disables
-// itself for the process and the build path falls back to source compile.
+// itself for the process and falls back to source compile.
 // GGML_OPENCL_KERNEL_CACHE_DEBUG=1 prints a HIT/MISS/SAVE trace (with a running
 // tally) straight to stderr — visible even in tools that filter INFO/WARN logs;
 // redirect stderr to record it.
@@ -38,11 +39,7 @@
 
 #pragma once
 
-// Caller is responsible for setting CL_TARGET_OPENCL_VERSION before
-// including this header (typically done at the top of ggml-opencl.cpp).
-// We do not set it here to avoid forcing a version on the includer.
 #include <CL/cl.h>
-
 #include <string>
 
 // Bumped manually if host-side OpenCL API usage changes in a way that
@@ -61,15 +58,8 @@ struct cl_program_cache_state {
     std::string key_suffix;
 };
 
-// Initialise the cache. Reads GGML_OPENCL_KERNEL_CACHE_DIR. Logs (info) the
-// directory and key suffix when enabled, or a one-line note when disabled.
-// Safe to call multiple times; returns the same state for the same device.
 cl_program_cache_state cl_program_cache_init(cl_device_id device);
 
-// Try to load a cached binary and create a built cl_program from it. Returns
-// nullptr on cache miss, on disabled cache, or on any failure (load, parse,
-// clCreateProgramWithBinary, clBuildProgram). On nullptr the caller falls
-// back to compiling from source.
 cl_program cl_program_cache_try_load(
     const cl_program_cache_state & state,
     cl_context                     context,
@@ -77,9 +67,6 @@ cl_program cl_program_cache_try_load(
     const char *                   source,
     const std::string &            compile_opts);
 
-// Save a successfully-built cl_program's binary to the cache. Best-effort:
-// failures are logged at info level and ignored. No-op if the cache is
-// disabled.
 void cl_program_cache_try_save(
     const cl_program_cache_state & state,
     cl_program                     program,
