@@ -6656,9 +6656,12 @@ extern struct ggml_backend_device_i ggml_backend_opencl_device_i;
 // interleaved A/B/B/A at a stable clock came out NEUTRAL (tg32 17.43/17.54 with the default,
 // 17.44/17.48 with the workers asleep: no difference outside noise) -- so there is no
 // evidence it hurts either. Absent a measured win on any driver but one, default it on only
-// for the driver where the starvation was measured: the "unrecognized compiler" Adreno
-// (art.api37 / E17.xx), the same signature this file already uses to decline FA and to steer
-// the dp4a paths.
+// for the driver where the starvation was measured: art.api37, which reports the E17.xx
+// compiler. Match the parsed E17 type directly (a deliberately separate test from the E17
+// workaround predicates, which can be lifted by env override -- this is a perf default, not
+// a workaround, and must not silently expire with them), and keep major < 0 so a future
+// driver the version parser cannot classify yet is treated like the starved one until it
+// is measured.
 //
 // GGML_OPENCL_KMP_BLOCKTIME=<ms> overrides the gate and applies that value on ANY device --
 // which is how the numbers above were taken, and how to try it on a device you suspect is
@@ -6676,7 +6679,8 @@ static void ggml_cl_quiesce_omp_threads(ggml_backend_opencl_context * backend_ct
             return;
         }
     } else if (!(backend_ctx->gpu_family == ADRENO &&
-                 backend_ctx->adreno_cl_compiler_version.major < 0)) {
+                 (backend_ctx->adreno_cl_compiler_version.type == ADRENO_CL_COMPILER_TYPE::E17 ||
+                  backend_ctx->adreno_cl_compiler_version.major < 0))) {
         return;
     }
 
