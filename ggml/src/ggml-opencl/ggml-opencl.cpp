@@ -5187,7 +5187,7 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
             // Second compile with MQ_GQA=8, MQ_NSG=3, MQ_NSG_SPLIT=3
             auto & m_mq_split_g8 = is_q8 ? backend_ctx->fa.f32_q8_0_q1_vec_mq_split_g8
                                          : backend_ctx->fa.f32_q4_0_q1_vec_mq_split_g8;
-            const std::string opts_mq_g8 = opts + " -D MQ_GQA=8 -D MQ_NSG=3 -D MQ_NSG_SPLIT=3";
+            const std::string opts_mq_g8 = opts + " -D MQ_GQA=8 -D MQ_NSG=3 -D MQ_NSG_SPLIT=3" + opts_q8_int;
             cl_program prog_mq_g8 = build_program_from_source_ex(
                 backend_ctx->context, backend_ctx->device, src.c_str(), opts_mq_g8,
                 /*fatal=*/false, is_q8 ? "fa q8_0 MQ_GQA=8" : "fa q4_0 MQ_GQA=8",
@@ -5211,7 +5211,7 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
                 auto & m_c8_gqa4 = is_q8 ? backend_ctx->fa.f32_q8_0_q1_vec_mq_split_c8
                                          : backend_ctx->fa.f32_q4_0_q1_vec_mq_split_c8;
                 const std::string name_c8_gqa4 = name_q1 + "_vec_mq_split_c8";
-                const std::string opts_c8_gqa4 = opts + " -D MQ_GQA=4 -D MQ_NSG=2 -D MQ_NSG_SPLIT=2" + opts_cl_c_gqa4;
+                const std::string opts_c8_gqa4 = opts + " -D MQ_GQA=4 -D MQ_NSG=2 -D MQ_NSG_SPLIT=2" + opts_cl_c_gqa4 + opts_q8_int;
                 cl_program prog_c8_gqa4 = build_program_from_source_ex(
                     backend_ctx->context, backend_ctx->device, src.c_str(), opts_c8_gqa4,
                     /*fatal=*/false, is_q8 ? "fa q8_0 c8 GQA4 NSG2" : "fa q4_0 c8 GQA4 NSG2",
