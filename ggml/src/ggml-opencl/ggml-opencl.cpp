@@ -19604,6 +19604,14 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     }
     const bool use_fd = (fd_k_split != NULL);
 
+    static const bool fa_debug = getenv("GGML_OPENCL_FA_DEBUG") != NULL;
+    if (fa_debug && use_fd) {
+        char fd_kname[128] = {0};
+        clGetKernelInfo(fd_k_split, CL_KERNEL_FUNCTION_NAME, sizeof(fd_kname) - 1, fd_kname, NULL);
+        GGML_LOG_INFO("ggml_opencl: FA-decode kernel: %s (n_q=%d n_kv=%d dk=%d dv=%d gqa=%d)\n",
+                      fd_kname, n_q, n_kv, d_head_q, d_head_v, gqa_ratio_dispatch);
+    }
+
     const int n_q_blocks = n_q > 1 ? (n_q + block_m - 1) / block_m : 0;
     const int n_kv_blocks = (n_kv > 0 && block_n > 0) ? (n_kv + block_n - 1) / block_n : 0;
     // KV pad + blk prepass are pure overhead when FD will fire — skip them.
