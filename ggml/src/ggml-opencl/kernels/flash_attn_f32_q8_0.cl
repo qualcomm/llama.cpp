@@ -348,7 +348,7 @@ inline float4 dequant_q8_0_lane(const global char * block_ptr, int lane) {
 // packed int8 once per WG (same requantization as the q1_split int path), so
 // the KV sweep replaces dequant+float-mad with one integer dot per quartet.
 // Requires each lane's quartet index to fit one sweep (DK_VEC <= subgroup).
-#if defined(FA_HAVE_INT_DOT) && (DK_VEC <= FA_SG)
+#if defined(FA_HAVE_INT_DOT) && (DK_VEC <= FA_SG) && !defined(FA_Q8_INT_QK_OFF)
 #define FA_Q8_INT_QK 1
 #endif
 

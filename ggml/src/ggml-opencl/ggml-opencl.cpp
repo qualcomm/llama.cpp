@@ -5996,6 +5996,7 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
         opts += " -D FA_DECODE_ONLY -D FA_DECODE_MINIMAL";
     }
 
+
     // c8 cluster width: value = GQA4 cluster width (kernel default 8); the g8
     // programs use 2x the value (default 16). Wider clusters halve per-lane
     // o_acc at the cost of position streams per subgroup. Derived at init into
@@ -6015,6 +6016,12 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
     const int fa_cl_c_gqa4 = (variant == FA_VARIANT_F32_F16)
         ? backend_ctx->fa_c8_cluster_f16
         : backend_ctx->fa_c8_cluster;
+
+    // dp4a QK dot in the q8_0 decode kernels: +3% tg at depth on the A8X
+    // (mq_split stays at the 512 B/WI boundary), -1..-2% on the X2E (its c8
+    // kernel sits exactly AT the boundary and the packing state pushes it
+    // over). Enable only where measured positive.
+    const bool fa_q8_int_qk = backend_ctx->adreno_gen == ADRENO_GPU_GEN::A8X;
     const std::string opts_cl_c_gqa4 = fa_cl_c_gqa4
         ? " -D FA_CL_C=" + std::to_string(fa_cl_c_gqa4) : std::string();
     // The g8 (GQA8) program doubles the BASE width, never the f16 width — a
@@ -6035,8 +6042,13 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
         case FA_VARIANT_Q4_0_SPLIT:      tag = "fa q4_0 split";      break;
         default: break;
     }
+    std::string opts_q8_int;
+    if ((variant == FA_VARIANT_Q8_0 || variant == FA_VARIANT_Q8_0_SPLIT) && !fa_q8_int_qk) {
+        opts_q8_int = " -D FA_Q8_INT_QK_OFF";
+    }
+
     cl_program prog = build_program_from_source_ex(
-        backend_ctx->context, backend_ctx->device, src.c_str(), opts + opts_cl_c_gqa4,
+        backend_ctx->context, backend_ctx->device, src.c_str(), opts + opts_cl_c_gqa4 + opts_q8_int,
         /*fatal=*/false, tag, /*bin_size=*/0, backend_ctx->queue);
     if (!prog) return false;
 
