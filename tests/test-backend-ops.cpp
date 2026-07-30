@@ -942,6 +942,7 @@ struct console_printer : public printer {
         if (!result.supported) {
             printf("not supported [%s] ", result.backend_name.c_str());
             printf("\n");
+            fflush(stdout);
             return;
         }
 
@@ -950,6 +951,7 @@ struct console_printer : public printer {
         } else {
             printf("\033[1;31mFAIL\033[0m\n");
         }
+        fflush(stdout);
     }
 
     void print_perf_console(const test_result & result) {
