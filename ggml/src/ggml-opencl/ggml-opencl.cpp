@@ -6317,7 +6317,7 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
                     " -D FA_MQ_ONLY -D MQ_GQA=8 -D MQ_NSG=2 -D MQ_NSG_SPLIT=2 -D FA_CL_C=16";
                 cl_program prog_g8c16 = build_program_from_source_ex(
                     backend_ctx->context, backend_ctx->device, src.c_str(), opts_g8c16,
-                    /*fatal=*/false, "fa f32_f16 MQ_GQA=8 c16 dk64", backend_ctx->queue);
+                    /*fatal=*/false, "fa f32_f16 MQ_GQA=8 c16 dk64", /*bin_size=*/0, backend_ctx->queue);
                 if (prog_g8c16) {
                     cl_kernel k_g8c16 = clCreateKernel(prog_g8c16, "flash_attn_f32_f16_q1_vec_mq_split_c8", &err);
                     if (err == CL_SUCCESS) {
@@ -6341,7 +6341,7 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
                     const std::string tag_gn  = "fa f32_f16 MQ_GQA=" + std::to_string(gqa_n);
                     cl_program prog_gn = build_program_from_source_ex(
                         backend_ctx->context, backend_ctx->device, src.c_str(), opts_gn,
-                        /*fatal=*/false, tag_gn.c_str(), backend_ctx->queue);
+                        /*fatal=*/false, tag_gn.c_str(), /*bin_size=*/0, backend_ctx->queue);
                     if (prog_gn) {
                         cl_kernel k_gn = clCreateKernel(prog_gn, "flash_attn_f32_f16_q1_vec_mq_split", &err);
                         if (err == CL_SUCCESS) {
@@ -6546,7 +6546,7 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
                     const std::string tag_gn  = "fa q8_0 MQ_GQA=" + std::to_string(gqa_n);
                     cl_program prog_gn = build_program_from_source_ex(
                         backend_ctx->context, backend_ctx->device, src.c_str(), opts_gn,
-                        /*fatal=*/false, tag_gn.c_str(), backend_ctx->queue);
+                        /*fatal=*/false, tag_gn.c_str(), /*bin_size=*/0, backend_ctx->queue);
                     if (prog_gn) {
                         cl_kernel k_gn = clCreateKernel(prog_gn, name_mq_split.c_str(), &err);
                         if (err == CL_SUCCESS) {
