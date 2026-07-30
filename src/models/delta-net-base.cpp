@@ -400,11 +400,6 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
 
     // K=1: output carries the final state only. state s is 4D [S_v, S_v, H_v, n_seqs].
     ggml_tensor * result = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, /*K=*/1);
-    if (n_tokens == 1) {
-        res->add_fused_node({LLM_FUSED_OP_GDN_AR, result, il});
-    } else {
-        res->add_fused_node({LLM_FUSED_OP_GDN_CH, result, il});
-    }
 
     ggml_tensor * output = ggml_view_4d(ctx0, result,
             S_v, H_v, n_tokens, n_seqs,
@@ -565,11 +560,6 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
 
     // state s is 4D [S_v, S_v, H_v, n_seqs]; K snapshot slots are written into the output.
     ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
-    if (n_seq_tokens > 1) {
-        res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});
-    } else {
-        res->add_fused_node({LLM_FUSED_OP_GDN_AR, gdn_out, il});
-    }
 
     const int64_t attn_score_elems    = S_v * H_v * n_seq_tokens * n_seqs;
     const int64_t state_size_per_snap = S_v * S_v * H_v * n_seqs;
