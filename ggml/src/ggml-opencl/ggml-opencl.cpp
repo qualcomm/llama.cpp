@@ -6338,7 +6338,9 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
             // the cluster layout is the only MQ shape that fits dk=64.
             if (!fa_decode_only && dk == 64 && dv == 64 && backend_ctx->has_subgroup_shuffle) {
                 const std::string opts_g8c16 = opts +
-                    " -D FA_MQ_ONLY -D MQ_GQA=8 -D MQ_NSG=2 -D MQ_NSG_SPLIT=2 -D FA_CL_C=16";
+                    " -D FA_MQ_ONLY -D MQ_GQA=8 -D MQ_NSG=2 -D MQ_NSG_SPLIT=2 -D FA_CL_C=16"
+                    " -D FA_CL_MASK_BCAST=1";
+
                 cl_program prog_g8c16 = build_program_from_source_ex(
                     backend_ctx->context, backend_ctx->device, src.c_str(), opts_g8c16,
                     /*fatal=*/false, "fa f32_f16 MQ_GQA=8 c16 dk64", /*bin_size=*/0, backend_ctx->queue);
@@ -20263,8 +20265,15 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
             // re-route through the matching non-image MQ path. Rare; keeps the
             // run alive instead of crashing. gqa==4 → default MQ kernel,
             // gqa==8 → MQ_G8 kernel.
+            if (getenv("GGML_OPENCL_FA_DEBUG")) {
+                GGML_LOG_INFO("ggml_opencl: FA k_img %s (pixels=%zu max=%zu)\n",
+                    k_img ? "CREATED -> texture path" : "FAILED -> buffer fallback",
+                    k_pixels, (size_t) backend_ctx->image_max_buffer_size);
+            }
             if (k_img == nullptr) {
-                if (gqa_ratio_dispatch == 4 &&
+                if (backend_ctx->fa.f32_f16_q1_vec_mq_split_gqa.count({d_head_q, d_head_v, gqa_ratio_dispatch}) > 0) {
+                    k_split = backend_ctx->fa.f32_f16_q1_vec_mq_split_gqa.at({d_head_q, d_head_v, gqa_ratio_dispatch});
+                } else if (gqa_ratio_dispatch == 4 &&
                     backend_ctx->fa.f32_f16_q1_vec_mq_split.count(dk_dv) > 0) {
                     k_split = backend_ctx->fa.f32_f16_q1_vec_mq_split.at(dk_dv);
                 } else {

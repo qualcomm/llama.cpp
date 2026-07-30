@@ -2067,7 +2067,11 @@ __kernel void flash_attn_f32_f16_q1_vec_mq_split(
 FA_C8_SG_ATTR
 __kernel void flash_attn_f32_f16_q1_vec_mq_split_c8(
     const global void * q_void, ulong q_offset,
+#ifdef FA_K_IMG
+    __read_only image1d_buffer_t k_img,
+#else
     const global void * k_void, ulong k_offset,
+#endif
     const global void * v_void, ulong v_offset,
     const float scale,
     const int n_q,
@@ -2127,7 +2131,9 @@ __kernel void flash_attn_f32_f16_q1_vec_mq_split_c8(
     }
 
     const global char * q_base = (const global char *) q_void + q_offset;
+#ifndef FA_K_IMG
     const global char * k_base = (const global char *) k_void + k_offset;
+#endif
     const global char * v_base = (const global char *) v_void + v_offset;
 
     // Stage MQ_GQA Q rows in __local once (uniform across WG).
@@ -2148,6 +2154,20 @@ __kernel void flash_attn_f32_f16_q1_vec_mq_split_c8(
         slope[h] = get_alibi_slope(max_bias, head_kv_idx * MQ_GQA + h, n_head_log2, m0, m1);
     }
 
+#ifdef FA_CL_MASK_BCAST
+    // At mask_ne2 == 1 every clustered head reads the same mask row, so keep
+    // one base and load the element once per position instead of once per
+    // head. Only a win where the saved dependent loads outweigh the extra
+    // live value: +2.9/+4.2% at dk=64 MQ_GQA=8, but -4/-5% at dk=128 MQ_GQA=4
+    // (private_mem 352 -> 368), hence the per-program gate.
+    const global char * mask_base_b = NULL;
+    if (mask_void != NULL) {
+        mask_base_b = (const global char *) mask_void + mask_offset +
+                      (batch_idx % mask_ne3) * mask_nb3 +
+                      (ulong) q_idx * mask_nb1;
+    }
+    const int mask_bcast = mask_base_b != NULL && mask_ne2 == 1;
+#else
     const global char * mask_base[MQ_GQA];
     if (mask_void != NULL) {
         const int mask_batch_idx = batch_idx % mask_ne3;
@@ -2164,6 +2184,7 @@ __kernel void flash_attn_f32_f16_q1_vec_mq_split_c8(
         #pragma unroll
         for (int h = 0; h < MQ_GQA; ++h) mask_base[h] = NULL;
     }
+#endif
 
     // Per-CLUSTER online-softmax state (uniform across the cluster's lanes);
     // o_acc holds this lane's DV slice {lic + FA_CL_C*i}.
@@ -2195,9 +2216,68 @@ __kernel void flash_attn_f32_f16_q1_vec_mq_split_c8(
         const int valid = k_idx < kv_hi;
         const int k_safe = valid ? k_idx : (kv_hi - 1);
 
+#ifdef FA_K_IMG
+        const int k_px = (int) ((kv_row_base + (ulong) k_safe * k_nb1) >> 3);
+#else
         const global KV_DATA_TYPE4 * k_ptr = (const global KV_DATA_TYPE4 *) (k_base + kv_row_base + (ulong) k_safe * k_nb1);
+#endif
         const global KV_DATA_TYPE4 * v_ptr = (const global KV_DATA_TYPE4 *) (v_base + v_row_base  + (ulong) k_safe * v_nb1);
 
+#ifdef FA_CL_MASK_BCAST
+        // Issue the broadcast mask load with the K row so both are in flight.
+        ACC_TYPE mask_val = (ACC_TYPE) 0.0f;
+        if (mask_bcast) {
+            mask_val = (ACC_TYPE) ((const global MASK_DATA_TYPE *) mask_base_b)[k_safe];
+        }
+#endif
+
+#if FA_CL_DK == 1 && FA_CL_DV == 1
+        // Single pass per head. At FA_CL_DK/DV == 1 each lane owns exactly one K and
+        // one V quartet, so score/p/sp never need to be live for all MQ_GQA heads at
+        // once, and the float4 dot accumulator collapses to a scalar. Same arithmetic,
+        // same order within a head; heads are independent.
+#ifdef FA_K_IMG
+        const ACC_TYPE4 k_vec_1 = CONVERT_KV_ACC4(read_imageh(k_img, k_px + lic));
+#else
+        const ACC_TYPE4 k_vec_1 = CONVERT_KV_ACC4(k_ptr[lic]);
+#endif
+        const ACC_TYPE4 v_vec_1 = CONVERT_KV_ACC4(v_ptr[lic]);
+        #pragma unroll
+        for (int h = 0; h < MQ_GQA; ++h) {
+            const ACC_TYPE4 d4 = mad(q_shared[h * DK_VEC + lic], k_vec_1, (ACC_TYPE4)(0.0f));
+            ACC_TYPE s = d4.s0 + d4.s1 + d4.s2 + d4.s3;
+            #pragma unroll
+            for (int step = 1; step < FA_CL_C; step <<= 1) {
+                s += sub_group_shuffle_xor(s, step);
+            }
+            s *= scale;
+#ifdef FA_CL_MASK_BCAST
+            if (mask_bcast) {
+                s += slope[h] * mask_val;
+            } else if (mask_base_b != NULL) {
+                const int mask_head_idx = (head_kv_idx * MQ_GQA + h) % mask_ne2;
+                const global MASK_DATA_TYPE * mask_ptr =
+                    (const global MASK_DATA_TYPE *) (mask_base_b + mask_head_idx * mask_nb2);
+                s += slope[h] * (ACC_TYPE) mask_ptr[k_safe];
+            }
+#else
+            if (mask_base[h] != NULL) {
+                const global MASK_DATA_TYPE * mask_ptr = (const global MASK_DATA_TYPE *) mask_base[h];
+                s += slope[h] * (ACC_TYPE) mask_ptr[k_safe];
+            }
+#endif
+            if (logit_softcap > 0.0f) {
+                s = logit_softcap * tanh(s / logit_softcap);
+            }
+            const ACC_TYPE sc    = valid ? s : FA_M_INIT;
+            const ACC_TYPE m_new = max(m_i[h], sc);
+            const ACC_TYPE sp    = native_exp(m_i[h] - m_new);
+            const ACC_TYPE p     = native_exp(sc - m_new);
+            l_i[h] = l_i[h] * sp + p;
+            m_i[h] = m_new;
+            o_acc[h][0] = mad(p, v_vec_1, o_acc[h][0] * sp);
+        }
+#else
         // Dot: this lane covers DK elements {lic + FA_CL_C*i} of the cluster's row.
         ACC_TYPE4 dot4[MQ_GQA];
         #pragma unroll
@@ -2205,7 +2285,11 @@ __kernel void flash_attn_f32_f16_q1_vec_mq_split_c8(
         #pragma unroll
         for (int i = 0; i < FA_CL_DK; ++i) {
             const int kk = lic + FA_CL_C * i;
+#ifdef FA_K_IMG
+            const ACC_TYPE4 k_vec = CONVERT_KV_ACC4(read_imageh(k_img, k_px + kk));
+#else
             const ACC_TYPE4 k_vec = CONVERT_KV_ACC4(k_ptr[kk]);
+#endif
             #pragma unroll
             for (int h = 0; h < MQ_GQA; ++h) {
                 dot4[h] = mad(q_shared[h * DK_VEC + kk], k_vec, dot4[h]);
@@ -2222,10 +2306,21 @@ __kernel void flash_attn_f32_f16_q1_vec_mq_split_c8(
                 s += sub_group_shuffle_xor(s, step);
             }
             s *= scale;
+#ifdef FA_CL_MASK_BCAST
+            if (mask_bcast) {
+                s += slope[h] * mask_val;
+            } else if (mask_base_b != NULL) {
+                const int mask_head_idx = (head_kv_idx * MQ_GQA + h) % mask_ne2;
+                const global MASK_DATA_TYPE * mask_ptr =
+                    (const global MASK_DATA_TYPE *) (mask_base_b + mask_head_idx * mask_nb2);
+                s += slope[h] * (ACC_TYPE) mask_ptr[k_safe];
+            }
+#else
             if (mask_base[h] != NULL) {
                 const global MASK_DATA_TYPE * mask_ptr = (const global MASK_DATA_TYPE *) mask_base[h];
                 s += slope[h] * (ACC_TYPE) mask_ptr[k_safe];
             }
+#endif
             if (logit_softcap > 0.0f) {
                 s = logit_softcap * tanh(s / logit_softcap);
             }
@@ -2254,6 +2349,7 @@ __kernel void flash_attn_f32_f16_q1_vec_mq_split_c8(
                 o_acc[h][i] = mad(p_h[h], v_vec, o_acc[h][i] * sp_h[h]);
             }
         }
+#endif
     }
 
     // Merge stage 1: fold the FA_CL_NCL cluster partials inside the subgroup.
