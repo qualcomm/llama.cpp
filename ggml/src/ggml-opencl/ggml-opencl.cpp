@@ -602,6 +602,7 @@ struct ggml_opencl_fa_kernels {
     // models (e.g. gqa=3 Llama-3.2) fall back to the register-spilled
     // q1_split kernels at depth.
     std::map<std::tuple<int, int, int>, cl_kernel> f32_f16_q1_vec_mq_split_gqa;
+    std::map<std::tuple<int, int, int>, cl_kernel> f32_f16_q1_vec_mq_split_gqa_k_img;
     std::map<std::tuple<int, int, int>, cl_kernel> f32_q8_0_q1_vec_mq_split_gqa;
     // K-image variant of MQ_G8 vec_mq_split: K bound as image1d_buffer_t
     // (Adreno texture cache, separate BW path from L2). Opt-in, GGML_OPENCL_FA_K_IMG=1.
@@ -6314,7 +6315,30 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
             // the cluster layout is the only MQ shape that fits dk=64.
             if (!fa_decode_only && dk == 64 && dv == 64 && backend_ctx->has_subgroup_shuffle) {
                 const std::string opts_g8c16 = opts +
-                    " -D FA_MQ_ONLY -D MQ_GQA=8 -D MQ_NSG=2 -D MQ_NSG_SPLIT=2 -D FA_CL_C=16";
+                    " -D FA_MQ_ONLY -D MQ_GQA=8 -D MQ_NSG=2 -D MQ_NSG_SPLIT=2 -D FA_CL_C=16"
+                    " -D FA_CL_MASK_BCAST=1";
+
+                // Same cluster kernel with K read through image1d_buffer_t. The buffer
+                // path streams KV at ~22 GB/s while the GEMVs in the same graph reach
+                // ~118 GB/s; the texture path is what those GEMVs use. Env-gated until
+                // measured.
+                const std::string opts_g8c16_kimg = opts_g8c16 + " -D FA_K_IMG";
+                cl_program prog_g8c16_kimg = build_program_from_source_ex(
+                    backend_ctx->context, backend_ctx->device, src.c_str(), opts_g8c16_kimg,
+                    /*fatal=*/false, "fa f32_f16 MQ_GQA=8 c16 dk64 k_img", /*bin_size=*/0, backend_ctx->queue);
+                if (prog_g8c16_kimg) {
+                    cl_kernel k_g8c16_kimg = clCreateKernel(prog_g8c16_kimg, "flash_attn_f32_f16_q1_vec_mq_split_c8", &err);
+                    if (err == CL_SUCCESS) {
+                        if (ggml_opencl_fa_kernel_fits_wg(backend_ctx, k_g8c16_kimg, 128,
+                                                          "fa f32_f16 MQ_GQA=8 c16 dk64 k_img", dk, dv)) {
+                            backend_ctx->fa.f32_f16_q1_vec_mq_split_gqa_k_img[{dk, dv, 8}] = k_g8c16_kimg;
+                            ggml_opencl_log_fa_kernel_spill(backend_ctx, k_g8c16_kimg, "fa f32_f16 MQ_GQA=8 c16 dk64 k_img", dk, dv);
+                        } else {
+                            clReleaseKernel(k_g8c16_kimg);
+                        }
+                    }
+                    clReleaseProgram(prog_g8c16_kimg);
+                }
                 cl_program prog_g8c16 = build_program_from_source_ex(
                     backend_ctx->context, backend_ctx->device, src.c_str(), opts_g8c16,
                     /*fatal=*/false, "fa f32_f16 MQ_GQA=8 c16 dk64", /*bin_size=*/0, backend_ctx->queue);
@@ -19539,7 +19563,17 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
                 d_head_q == 64 && d_head_v == 64 &&
                 n_head == n_head_kv * 8 &&
                 backend_ctx->fa.f32_f16_q1_vec_mq_split_gqa.count({64, 64, 8}) > 0) {
-                fd_k_split = backend_ctx->fa.f32_f16_q1_vec_mq_split_gqa.at({64, 64, 8});
+                static const bool gqa_k_img_env = []{
+                    const char * e = std::getenv("GGML_OPENCL_FA_GQA_K_IMG");
+                    return e && e[0] && e[0] != '0';
+                }();
+                if (gqa_k_img_env &&
+                    backend_ctx->fa.f32_f16_q1_vec_mq_split_gqa_k_img.count({64, 64, 8}) > 0) {
+                    fd_k_split   = backend_ctx->fa.f32_f16_q1_vec_mq_split_gqa_k_img.at({64, 64, 8});
+                    use_fa_k_img = true;
+                } else {
+                    fd_k_split = backend_ctx->fa.f32_f16_q1_vec_mq_split_gqa.at({64, 64, 8});
+                }
                 use_fd_mq  = true;
                 fd_mq_wg   = 128;
             } else if (is_mixed && gqa_ratio_dispatch == 8 &&
@@ -19913,8 +19947,15 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
             // re-route through the matching non-image MQ path. Rare; keeps the
             // run alive instead of crashing. gqa==4 → default MQ kernel,
             // gqa==8 → MQ_G8 kernel.
+            if (getenv("GGML_OPENCL_FA_DEBUG")) {
+                GGML_LOG_INFO("ggml_opencl: FA k_img %s (pixels=%zu max=%zu)\n",
+                    k_img ? "CREATED -> texture path" : "FAILED -> buffer fallback",
+                    k_pixels, (size_t) backend_ctx->image_max_buffer_size);
+            }
             if (k_img == nullptr) {
-                if (gqa_ratio_dispatch == 4 &&
+                if (backend_ctx->fa.f32_f16_q1_vec_mq_split_gqa.count({d_head_q, d_head_v, gqa_ratio_dispatch}) > 0) {
+                    k_split = backend_ctx->fa.f32_f16_q1_vec_mq_split_gqa.at({d_head_q, d_head_v, gqa_ratio_dispatch});
+                } else if (gqa_ratio_dispatch == 4 &&
                     backend_ctx->fa.f32_f16_q1_vec_mq_split.count(dk_dv) > 0) {
                     k_split = backend_ctx->fa.f32_f16_q1_vec_mq_split.at(dk_dv);
                 } else {
