@@ -2935,7 +2935,10 @@ struct ggml_cplan ggml_graph_plan(
                         const int64_t S_v = node->src[2]->ne[0];
                         const int64_t K   = ggml_get_op_params_i32(node, 0);
                         const int64_t per_thread = S_v + (K > 1 ? S_v * S_v : 0);
-                        cur = per_thread * sizeof(float) * n_tasks;
+                        // ggml_compute_forward_gated_delta_net_one_chunk offsets every thread's
+                        // slice by a flat CACHE_LINE_SIZE_F32 (not scaled by ith), so the buffer
+                        // must fit n_tasks slices plus that one trailing pad.
+                        cur = (per_thread * n_tasks + CACHE_LINE_SIZE_F32) * sizeof(float);
                     } break;
                 case GGML_OP_COUNT:
                     {
