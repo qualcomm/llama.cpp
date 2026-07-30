@@ -100,6 +100,13 @@
 #endif
 #define Q1_WG_SIZE FA_SG
 
+// Decode (q1) MQ kernels: when DK_VEC <= FA_SG each lane owns exactly one Q
+// quartet for the entire KV sweep, so Q lives in registers instead of a
+// staging LDS array (drops the array and the entry barrier).
+#if (DK/4) <= FA_SG
+#define FA_Q1_Q_REG 1
+#endif
+
 // The kernels are built with -cl-finite-math-only. On some older Adreno GPUs,
 // infinite operand can cause undefined behavior and miscompilation for exp.
 // Therefore, a large negative value is used instead.
@@ -1539,6 +1546,16 @@ __kernel void flash_attn_f32_f16_q1_vec_mq(
     const global char * v_base = (const global char *) v_void + v_offset;
     global       char * o_base = (global       char *) o_void + o_offset;
 
+#ifdef FA_Q1_Q_REG
+    ACC_TYPE4 q_reg[MQ_GQA];
+    #pragma unroll
+    for (int h = 0; h < MQ_GQA; ++h) {
+        const int head_idx = head_kv_idx * MQ_GQA + h;
+        const ulong q_row_offset = batch_idx * q_nb3 + head_idx * q_nb2;
+        const global Q_DATA_TYPE4 * q_ptr = (const global Q_DATA_TYPE4 *) (q_base + q_row_offset);
+        q_reg[h] = (tid_sg < DK_VEC) ? CONVERT_Q_ACC4(q_ptr[tid_sg]) : (ACC_TYPE4)(0.0f);
+    }
+#else
     __local ACC_TYPE4 q_shared[MQ_GQA * DK_VEC];
     for (int i = tid; i < MQ_GQA * DK_VEC; i += MQ_WG_SIZE) {
         const int h        = i / DK_VEC;
@@ -1549,6 +1566,7 @@ __kernel void flash_attn_f32_f16_q1_vec_mq(
         q_shared[h * DK_VEC + k] = CONVERT_Q_ACC4(q_ptr[k]);
     }
     barrier(CLK_LOCAL_MEM_FENCE);
+#endif
 
     // per-h ALiBi slope
     float slope[MQ_GQA];
@@ -1606,6 +1624,15 @@ __kernel void flash_attn_f32_f16_q1_vec_mq(
         ACC_TYPE4 dot4[MQ_GQA];
         #pragma unroll
         for (int h = 0; h < MQ_GQA; ++h) dot4[h] = (ACC_TYPE4)(0.0f);
+#ifdef FA_Q1_Q_REG
+        if (tid_sg < DK_VEC) {
+            const ACC_TYPE4 k_vec = CONVERT_KV_ACC4(k_ptr[tid_sg]);
+            #pragma unroll
+            for (int h = 0; h < MQ_GQA; ++h) {
+                dot4[h] = mad(q_reg[h], k_vec, dot4[h]);
+            }
+        }
+#else
         for (int k = tid_sg; k < DK_VEC; k += Q1_WG_SIZE) {
             const ACC_TYPE4 k_vec = CONVERT_KV_ACC4(k_ptr[k]);
             #pragma unroll
@@ -1613,6 +1640,7 @@ __kernel void flash_attn_f32_f16_q1_vec_mq(
                 dot4[h] = mad(q_shared[h * DK_VEC + k], k_vec, dot4[h]);
             }
         }
+#endif
 
         ACC_TYPE score[MQ_GQA];
         #pragma unroll
@@ -1791,6 +1819,16 @@ __kernel void flash_attn_f32_f16_q1_vec_mq_split(
     const global char * k_base = (const global char *) k_void + k_offset;
     const global char * v_base = (const global char *) v_void + v_offset;
 
+#ifdef FA_Q1_Q_REG
+    ACC_TYPE4 q_reg[MQ_GQA];
+    #pragma unroll
+    for (int h = 0; h < MQ_GQA; ++h) {
+        const int head_idx = head_kv_idx * MQ_GQA + h;
+        const ulong q_row_offset = batch_idx * q_nb3 + head_idx * q_nb2 + (ulong) q_idx * q_nb1;
+        const global Q_DATA_TYPE4 * q_ptr = (const global Q_DATA_TYPE4 *) (q_base + q_row_offset);
+        q_reg[h] = (tid_sg < DK_VEC) ? CONVERT_Q_ACC4(q_ptr[tid_sg]) : (ACC_TYPE4)(0.0f);
+    }
+#else
     // stage MQ_GQA Q rows in __local once (uniform across WG)
     __local ACC_TYPE4 q_shared[MQ_GQA * DK_VEC];
     for (int i = tid; i < MQ_GQA * DK_VEC; i += MQ_SPLIT_WG_SIZE) {
@@ -1802,6 +1840,7 @@ __kernel void flash_attn_f32_f16_q1_vec_mq_split(
         q_shared[h * DK_VEC + k] = CONVERT_Q_ACC4(q_ptr[k]);
     }
     barrier(CLK_LOCAL_MEM_FENCE);
+#endif
 
     float slope[MQ_GQA];
     #pragma unroll
@@ -1852,6 +1891,15 @@ __kernel void flash_attn_f32_f16_q1_vec_mq_split(
         ACC_TYPE4 dot4[MQ_GQA];
         #pragma unroll
         for (int h = 0; h < MQ_GQA; ++h) dot4[h] = (ACC_TYPE4)(0.0f);
+#ifdef FA_Q1_Q_REG
+        if (tid_sg < DK_VEC) {
+            const ACC_TYPE4 k_vec = CONVERT_KV_ACC4(k_ptr[tid_sg]);
+            #pragma unroll
+            for (int h = 0; h < MQ_GQA; ++h) {
+                dot4[h] = mad(q_reg[h], k_vec, dot4[h]);
+            }
+        }
+#else
         for (int k = tid_sg; k < DK_VEC; k += Q1_WG_SIZE) {
             const ACC_TYPE4 k_vec = CONVERT_KV_ACC4(k_ptr[k]);
             #pragma unroll
@@ -1859,6 +1907,7 @@ __kernel void flash_attn_f32_f16_q1_vec_mq_split(
                 dot4[h] = mad(q_shared[h * DK_VEC + k], k_vec, dot4[h]);
             }
         }
+#endif
 
         ACC_TYPE score[MQ_GQA];
         #pragma unroll

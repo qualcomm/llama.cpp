@@ -49,6 +49,7 @@ typedef const void * (*get_adreno_bin_kernel_func_t)(
 #include <string>
 #include <cmath>
 #include <map>
+#include <tuple>
 #include <memory>
 #include <charconv>
 #include <mutex>
@@ -597,6 +598,11 @@ struct ggml_opencl_fa_kernels {
     // MQ_GQA=8 specializations
     std::map<std::pair<int, int>, cl_kernel> f32_f16_q1_vec_mq_g8;
     std::map<std::pair<int, int>, cl_kernel> f32_f16_q1_vec_mq_split_g8;
+    // MQ_GQA=2/3 specializations, key {dk, dv, gqa}: without them non-GQA4
+    // models (e.g. gqa=3 Llama-3.2) fall back to the register-spilled
+    // q1_split kernels at depth.
+    std::map<std::tuple<int, int, int>, cl_kernel> f32_f16_q1_vec_mq_split_gqa;
+    std::map<std::tuple<int, int, int>, cl_kernel> f32_q8_0_q1_vec_mq_split_gqa;
     // K-image variant of MQ_G8 vec_mq_split: K bound as image1d_buffer_t
     // (Adreno texture cache, separate BW path from L2). Opt-in, GGML_OPENCL_FA_K_IMG=1.
     std::map<std::pair<int, int>, cl_kernel> f32_f16_q1_vec_mq_split_g8_k_img;
@@ -4615,7 +4621,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         // X1 (1152 B/WG -> few resident WGs); TILESIZE_N=8 (288 B) lifts occupancy for
         // +57% pp512 on X1-85, byte-identical. X2E keeps 32. Env override wins.
         int q4k_dp4a_ts = (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X1E) ? 8 : 32;
-        if (const char * e = getenv("GGML_OPENCL_Q4K_DP4A_TS")) q4k_dp4a_ts = atoi(e);
+        if (const char * e = getenv("GGML_OPENCL_Q4K_DP4A_TS")) { q4k_dp4a_ts = atoi(e); }
         std::string dp4a_opts = compile_opts + " -DTILESIZE_N=" + std::to_string(q4k_dp4a_ts);
         cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), dp4a_opts);
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a = clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_q8_1_dp4a", &err), err));
@@ -5996,6 +6002,7 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
         opts += " -D FA_DECODE_ONLY -D FA_DECODE_MINIMAL";
     }
 
+
     // c8 cluster width: value = GQA4 cluster width (kernel default 8); the g8
     // programs use 2x the value (default 16). Wider clusters halve per-lane
     // o_acc at the cost of position streams per subgroup. Derived at init into
@@ -6015,6 +6022,12 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
     const int fa_cl_c_gqa4 = (variant == FA_VARIANT_F32_F16)
         ? backend_ctx->fa_c8_cluster_f16
         : backend_ctx->fa_c8_cluster;
+
+    // dp4a QK dot in the q8_0 decode kernels: +3% tg at depth on the A8X
+    // (mq_split stays at the 512 B/WI boundary), -1..-2% on the X2E (its c8
+    // kernel sits exactly AT the boundary and the packing state pushes it
+    // over). Enable only where measured positive.
+    const bool fa_q8_int_qk = backend_ctx->adreno_gen == ADRENO_GPU_GEN::A8X;
     const std::string opts_cl_c_gqa4 = fa_cl_c_gqa4
         ? " -D FA_CL_C=" + std::to_string(fa_cl_c_gqa4) : std::string();
     // The g8 (GQA8) program doubles the BASE width, never the f16 width — a
@@ -6035,8 +6048,13 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
         case FA_VARIANT_Q4_0_SPLIT:      tag = "fa q4_0 split";      break;
         default: break;
     }
+    std::string opts_q8_int;
+    if ((variant == FA_VARIANT_Q8_0 || variant == FA_VARIANT_Q8_0_SPLIT) && !fa_q8_int_qk) {
+        opts_q8_int = " -D FA_Q8_INT_QK_OFF";
+    }
+
     cl_program prog = build_program_from_source_ex(
-        backend_ctx->context, backend_ctx->device, src.c_str(), opts + opts_cl_c_gqa4,
+        backend_ctx->context, backend_ctx->device, src.c_str(), opts + opts_cl_c_gqa4 + opts_q8_int,
         /*fatal=*/false, tag, /*bin_size=*/0, backend_ctx->queue);
     if (!prog) return false;
 
@@ -6287,6 +6305,58 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
                 }
                 clReleaseProgram(prog_g8);
             }
+            // dk=64 gqa8 (gpt-oss-class): a C=16 cluster-parallel g8 program.
+            // Every lane stays active (DK_VEC=16 = one quartet per cluster
+            // lane) and each K/V row is read once for all 8 heads, vs the
+            // q1_split fallback's per-head WGs re-reading the same KV 8x.
+            // Lighter than the fallback too (840: 784 vs 912 B/WI).
+            // The plain mq_split was measured -48% here (48/64 lanes idle) -
+            // the cluster layout is the only MQ shape that fits dk=64.
+            if (!fa_decode_only && dk == 64 && dv == 64 && backend_ctx->has_subgroup_shuffle) {
+                const std::string opts_g8c16 = opts +
+                    " -D FA_MQ_ONLY -D MQ_GQA=8 -D MQ_NSG=2 -D MQ_NSG_SPLIT=2 -D FA_CL_C=16";
+                cl_program prog_g8c16 = build_program_from_source_ex(
+                    backend_ctx->context, backend_ctx->device, src.c_str(), opts_g8c16,
+                    /*fatal=*/false, "fa f32_f16 MQ_GQA=8 c16 dk64", /*bin_size=*/0, backend_ctx->queue);
+                if (prog_g8c16) {
+                    cl_kernel k_g8c16 = clCreateKernel(prog_g8c16, "flash_attn_f32_f16_q1_vec_mq_split_c8", &err);
+                    if (err == CL_SUCCESS) {
+                        if (ggml_opencl_fa_kernel_fits_wg(backend_ctx, k_g8c16, 128,
+                                                          "fa f32_f16 MQ_GQA=8 c16 dk64", dk, dv)) {
+                            backend_ctx->fa.f32_f16_q1_vec_mq_split_gqa[{dk, dv, 8}] = k_g8c16;
+                            ggml_opencl_log_fa_kernel_spill(backend_ctx, k_g8c16, "fa f32_f16 MQ_GQA=8 c16 dk64", dk, dv);
+                        } else {
+                            clReleaseKernel(k_g8c16);
+                        }
+                    }
+                    clReleaseProgram(prog_g8c16);
+                }
+            }
+            // MQ_GQA=2/3 specializations (dk=dv=128 models only): give gqa=2/3
+            // models the healthy MQ decode kernel instead of the spilled
+            // q1_split fallback (1168 B/WI on DX.50, 192-thread cap).
+            if (!fa_decode_only && dk == 128 && dv == 128) {
+                for (int gqa_n = 2; gqa_n <= 3; ++gqa_n) {
+                    const std::string opts_gn = opts + " -D FA_MQ_ONLY -D MQ_GQA=" + std::to_string(gqa_n);
+                    const std::string tag_gn  = "fa f32_f16 MQ_GQA=" + std::to_string(gqa_n);
+                    cl_program prog_gn = build_program_from_source_ex(
+                        backend_ctx->context, backend_ctx->device, src.c_str(), opts_gn,
+                        /*fatal=*/false, tag_gn.c_str(), /*bin_size=*/0, backend_ctx->queue);
+                    if (prog_gn) {
+                        cl_kernel k_gn = clCreateKernel(prog_gn, "flash_attn_f32_f16_q1_vec_mq_split", &err);
+                        if (err == CL_SUCCESS) {
+                            if (ggml_opencl_fa_kernel_fits_wg(backend_ctx, k_gn, 256,
+                                                              tag_gn.c_str(), dk, dv)) {
+                                backend_ctx->fa.f32_f16_q1_vec_mq_split_gqa[{dk, dv, gqa_n}] = k_gn;
+                                ggml_opencl_log_fa_kernel_spill(backend_ctx, k_gn, tag_gn.c_str(), dk, dv);
+                            } else {
+                                clReleaseKernel(k_gn);
+                            }
+                        }
+                        clReleaseProgram(prog_gn);
+                    }
+                }
+            }
             // NSG_SPLIT=2 programs for the cluster-parallel kernel: its register
             // footprint caps the per-kernel WG at 128 on X2 (< the stock 256/192
             // requirement), so it can never register from the stock programs.
@@ -6449,7 +6519,7 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
             // falls back to the legacy q1 path at dispatch if missing.
             auto & m_mq_split_g8 = is_q8 ? backend_ctx->fa.f32_q8_0_q1_vec_mq_split_g8
                                          : backend_ctx->fa.f32_q4_0_q1_vec_mq_split_g8;
-            const std::string opts_mq_g8 = opts + " -D MQ_GQA=8 -D MQ_NSG=3 -D MQ_NSG_SPLIT=3";
+            const std::string opts_mq_g8 = opts + " -D MQ_GQA=8 -D MQ_NSG=3 -D MQ_NSG_SPLIT=3" + opts_q8_int;
             cl_program prog_mq_g8 = build_program_from_source_ex(
                 backend_ctx->context, backend_ctx->device, src.c_str(), opts_mq_g8,
                 /*fatal=*/false, is_q8 ? "fa q8_0 MQ_GQA=8" : "fa q4_0 MQ_GQA=8",
@@ -6468,12 +6538,36 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
                 }
                 clReleaseProgram(prog_mq_g8);
             }
+            // MQ_GQA=2/3 specializations (q8_0, dk=dv=128): replace the
+            // spilled q1_split fallback for gqa=2/3 models.
+            if (is_q8 && dk == 128 && dv == 128) {
+                for (int gqa_n = 2; gqa_n <= 3; ++gqa_n) {
+                    const std::string opts_gn = opts + " -D MQ_GQA=" + std::to_string(gqa_n) + opts_q8_int;
+                    const std::string tag_gn  = "fa q8_0 MQ_GQA=" + std::to_string(gqa_n);
+                    cl_program prog_gn = build_program_from_source_ex(
+                        backend_ctx->context, backend_ctx->device, src.c_str(), opts_gn,
+                        /*fatal=*/false, tag_gn.c_str(), /*bin_size=*/0, backend_ctx->queue);
+                    if (prog_gn) {
+                        cl_kernel k_gn = clCreateKernel(prog_gn, name_mq_split.c_str(), &err);
+                        if (err == CL_SUCCESS) {
+                            if (ggml_opencl_fa_kernel_fits_wg(backend_ctx, k_gn, 256,
+                                                              tag_gn.c_str(), dk, dv)) {
+                                backend_ctx->fa.f32_q8_0_q1_vec_mq_split_gqa[{dk, dv, gqa_n}] = k_gn;
+                                ggml_opencl_log_fa_kernel_spill(backend_ctx, k_gn, tag_gn.c_str(), dk, dv);
+                            } else {
+                                clReleaseKernel(k_gn);
+                            }
+                        }
+                        clReleaseProgram(prog_gn);
+                    }
+                }
+            }
             // GQA=4 cluster-parallel program (NSG_SPLIT=2 / WG=128)
             if (backend_ctx->has_subgroup_shuffle) {
                 auto & m_c8_gqa4 = is_q8 ? backend_ctx->fa.f32_q8_0_q1_vec_mq_split_c8
                                          : backend_ctx->fa.f32_q4_0_q1_vec_mq_split_c8;
                 const std::string name_c8_gqa4 = name_q1 + "_vec_mq_split_c8";
-                const std::string opts_c8_gqa4 = opts + " -D MQ_GQA=4 -D MQ_NSG=2 -D MQ_NSG_SPLIT=2" + opts_cl_c_gqa4;
+                const std::string opts_c8_gqa4 = opts + " -D MQ_GQA=4 -D MQ_NSG=2 -D MQ_NSG_SPLIT=2" + opts_cl_c_gqa4 + opts_q8_int;
                 cl_program prog_c8_gqa4 = build_program_from_source_ex(
                     backend_ctx->context, backend_ctx->device, src.c_str(), opts_c8_gqa4,
                     /*fatal=*/false, is_q8 ? "fa q8_0 c8 GQA4 NSG2" : "fa q4_0 c8 GQA4 NSG2",
@@ -6656,9 +6750,12 @@ extern struct ggml_backend_device_i ggml_backend_opencl_device_i;
 // interleaved A/B/B/A at a stable clock came out NEUTRAL (tg32 17.43/17.54 with the default,
 // 17.44/17.48 with the workers asleep: no difference outside noise) -- so there is no
 // evidence it hurts either. Absent a measured win on any driver but one, default it on only
-// for the driver where the starvation was measured: the "unrecognized compiler" Adreno
-// (art.api37 / E17.xx), the same signature this file already uses to decline FA and to steer
-// the dp4a paths.
+// for the driver where the starvation was measured: art.api37, which reports the E17.xx
+// compiler. Match the parsed E17 type directly (a deliberately separate test from the E17
+// workaround predicates, which can be lifted by env override -- this is a perf default, not
+// a workaround, and must not silently expire with them), and keep major < 0 so a future
+// driver the version parser cannot classify yet is treated like the starved one until it
+// is measured.
 //
 // GGML_OPENCL_KMP_BLOCKTIME=<ms> overrides the gate and applies that value on ANY device --
 // which is how the numbers above were taken, and how to try it on a device you suspect is
@@ -6676,7 +6773,8 @@ static void ggml_cl_quiesce_omp_threads(ggml_backend_opencl_context * backend_ct
             return;
         }
     } else if (!(backend_ctx->gpu_family == ADRENO &&
-                 backend_ctx->adreno_cl_compiler_version.major < 0)) {
+                 (backend_ctx->adreno_cl_compiler_version.type == ADRENO_CL_COMPILER_TYPE::E17 ||
+                  backend_ctx->adreno_cl_compiler_version.major < 0))) {
         return;
     }
 
@@ -9910,7 +10008,7 @@ static inline bool use_flat_gemv_for_large_m_q4_K(const ggml_tensor *tensor) {
            && !use_q4k_tiled(tensor);
 }
 
-static inline bool use_flat_gemv_for_large_m_q6_K(const ggml_tensor *tensor) {
+static inline bool use_flat_gemv_for_large_m_q6_K(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor) {
     // gemv_noshuffle variant perf drops for large M, use flat variant for large M.
     // threshold is well above typical hidden/FFN dims, but below typical vocab sizes.
     // q6_K flat gemv is worse for smaller K; 2048 seems to be a reasonable threshold.
@@ -9942,9 +10040,13 @@ static inline bool use_flat_gemv_for_large_m_q6_K(const ggml_tensor *tensor) {
     // holds ~56 GB/s -- ~47% of E2B decode on one dispatch. Add a direct size escape so such
     // weights also take the flat path; every weight ne0 >= 2048 already routes there is unchanged.
     // gemma-4 E2B Q4_0(QAT) tg128 30 -> 45 (+38%) on X2-90. (Upstream PR: hq/q6k-flat-large-m-size-gate.)
-    // Safe on the A7X because the vocab-scale K-quant lm_head is declined to CPU there (see supports_op).
+    // The escape is not taken on the A7X: its compiler miscompiles the flat K-quant GEMV on exactly
+    // these vocab-scale shapes. On this line the A7X also declines the vocab-scale K-quant lm_head
+    // to the CPU (see supports_op), so the guard is belt-and-suspenders here -- it keeps the helper
+    // identical to the upstream PR branch so future rebases converge.
     return tensor->ne[1] >= 32768
-        && (tensor->ne[0] >= 2048 || ggml_nbytes(tensor) >= (256ull << 20))
+        && (tensor->ne[0] >= 2048 ||
+            (backend_ctx->adreno_gen != ADRENO_GPU_GEN::A7X && ggml_nbytes(tensor) >= (256ull << 20)))
         && tensor->ne[2] == 1 && tensor->ne[3] == 1;
 }
 
@@ -12613,7 +12715,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         cl_kernel kernel;
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
         kernel = backend_ctx->kernel_convert_block_q6_K;
-        if (use_adreno_kernels(backend_ctx, tensor) && !use_flat_gemv_for_large_m_q6_K(tensor)) {
+        if (use_adreno_kernels(backend_ctx, tensor) && !use_flat_gemv_for_large_m_q6_K(backend_ctx, tensor)) {
             kernel = backend_ctx->kernel_convert_block_q6_K_noshuffle;
         }
 #else
@@ -12646,7 +12748,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         tensor->extra  = extra;
 
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
-        if (use_adreno_kernels(backend_ctx, tensor) && !use_flat_gemv_for_large_m_q6_K(tensor)) {
+        if (use_adreno_kernels(backend_ctx, tensor) && !use_flat_gemv_for_large_m_q6_K(backend_ctx, tensor)) {
             cl_int M = tensor->ne[1];   // ne01
             cl_int K = tensor->ne[0];   // ne00
 
@@ -13658,7 +13760,7 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
             CL_CHECK(clReleaseMemObject(data_device));
             return;
         }
-        if (use_adreno_kernels(backend_ctx, tensor) && !use_flat_gemv_for_large_m_q6_K(tensor)) {
+        if (use_adreno_kernels(backend_ctx, tensor) && !use_flat_gemv_for_large_m_q6_K(backend_ctx, tensor)) {
             static ggml_cl_buffer buf_trans_ql;
             static ggml_cl_buffer buf_trans_qh;
             static ggml_cl_buffer buf_trans_s;
@@ -16081,7 +16183,7 @@ static void ggml_opencl_op_rms_norm_fused(ggml_backend_t backend, ggml_tensor * 
     ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
 
     cl_ulong offset0 = extra0->offset + src0->view_offs;
-    cl_ulong offset1 = extra1->offset + src0->view_offs;
+    cl_ulong offset1 = extra1->offset + src1->view_offs;
     cl_ulong offsetd = extrad->offset + dst->view_offs;
 
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
@@ -19240,7 +19342,11 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
 
     // Flash-Decoding K-split decision. Resolved here, before the prefill
     // prepass, because KV-pad and blk prepass are pure overhead when FD fires.
-    const int is_causal = (mask == NULL && n_q > 1 && n_q == n_kv);
+    // Do not infer causality from tensor shapes: a NULL mask means full
+    // (bidirectional) attention, e.g. ViT encoders, where n_q == n_kv as well.
+    // Causal attention in llama.cpp always comes with an explicit KQ mask.
+    // Inferring is_causal here corrupted mmproj output on OpenCL (see #23800).
+    const int is_causal = 0;
     const int fd_max_n_q = (d_head_q <= FD_MAX_DK_MULTI) ? FD_MAX_N_Q_MULTI : 1;
     cl_kernel fd_k_split = NULL;
     bool use_fd_mq = false;
@@ -19424,6 +19530,18 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
                 use_fd_mq    = true;
                 fd_mq_wg     = 192;
                 use_fa_k_img = true;
+            // NOTE (2026-07-29): routing dk=64 gqa8 (gpt-oss-class) to a g8
+            // NSG2 mq_split was measured at −48% vs the spilled q1_split
+            // fallback on the 840: at DK_VEC=16 the mq kernel idles 75% of
+            // each subgroup, and full lane utilization beats spill relief.
+            // The C=16 cluster kernel below keeps every lane active instead.
+            } else if (nq1_only && is_mixed && gqa_ratio_dispatch == 8 &&
+                d_head_q == 64 && d_head_v == 64 &&
+                n_head == n_head_kv * 8 &&
+                backend_ctx->fa.f32_f16_q1_vec_mq_split_gqa.count({64, 64, 8}) > 0) {
+                fd_k_split = backend_ctx->fa.f32_f16_q1_vec_mq_split_gqa.at({64, 64, 8});
+                use_fd_mq  = true;
+                fd_mq_wg   = 128;
             } else if (is_mixed && gqa_ratio_dispatch == 8 &&
                 d_head_q == 128 && d_head_v == 128 &&
                 backend_ctx->fa.f32_f16_q1_vec_mq_split_g8.count(dk_dv) > 0) {
@@ -19449,6 +19567,20 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
                 } else {
                     fd_k_split = backend_ctx->fa.f32_q8_0_q1_vec_mq_split.at(dk_dv);
                 }
+                use_fd_mq  = true;
+            } else if (nq1_only && is_mixed &&
+                (gqa_ratio_dispatch == 2 || gqa_ratio_dispatch == 3) &&
+                n_head == n_head_kv * gqa_ratio_dispatch &&
+                d_head_q == 128 && d_head_v == 128 &&
+                backend_ctx->fa.f32_f16_q1_vec_mq_split_gqa.count({d_head_q, d_head_v, gqa_ratio_dispatch}) > 0) {
+                fd_k_split = backend_ctx->fa.f32_f16_q1_vec_mq_split_gqa.at({d_head_q, d_head_v, gqa_ratio_dispatch});
+                use_fd_mq  = true;
+            } else if (nq1_only && is_q8_0 &&
+                (gqa_ratio_dispatch == 2 || gqa_ratio_dispatch == 3) &&
+                n_head == n_head_kv * gqa_ratio_dispatch &&
+                d_head_q == 128 && d_head_v == 128 &&
+                backend_ctx->fa.f32_q8_0_q1_vec_mq_split_gqa.count({d_head_q, d_head_v, gqa_ratio_dispatch}) > 0) {
+                fd_k_split = backend_ctx->fa.f32_q8_0_q1_vec_mq_split_gqa.at({d_head_q, d_head_v, gqa_ratio_dispatch});
                 use_fd_mq  = true;
             // q4_0 KV — MQ-split dispatch is split by GQA fan-out:
             //   GQA=4 (MQ_GQA=4 kernel): default-on. Dense 4/8-class targets
@@ -19595,6 +19727,14 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         }
     }
     const bool use_fd = (fd_k_split != NULL);
+
+    static const bool fa_debug = getenv("GGML_OPENCL_FA_DEBUG") != NULL;
+    if (fa_debug && use_fd) {
+        char fd_kname[128] = {0};
+        clGetKernelInfo(fd_k_split, CL_KERNEL_FUNCTION_NAME, sizeof(fd_kname) - 1, fd_kname, NULL);
+        GGML_LOG_INFO("ggml_opencl: FA-decode kernel: %s (n_q=%d n_kv=%d dk=%d dv=%d gqa=%d)\n",
+                      fd_kname, n_q, n_kv, d_head_q, d_head_v, gqa_ratio_dispatch);
+    }
 
     const int n_q_blocks = n_q > 1 ? (n_q + block_m - 1) / block_m : 0;
     const int n_kv_blocks = (n_kv > 0 && block_n > 0) ? (n_kv + block_n - 1) / block_n : 0;
@@ -25421,7 +25561,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         }
 
         // q6_K x fp32
-        if (src0t == GGML_TYPE_Q6_K && src1t == GGML_TYPE_F32 && !use_flat_gemv_for_large_m_q6_K(src0)) {
+        if (src0t == GGML_TYPE_Q6_K && src1t == GGML_TYPE_F32 && !use_flat_gemv_for_large_m_q6_K(backend_ctx, src0)) {
             ggml_cl_mul_mat_q6_K_f32_adreno(backend, src0, src1, dst);
             return;
         }
