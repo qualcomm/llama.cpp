@@ -67,12 +67,20 @@ static inline void htp_im2col_vtcm_layout_build(struct htp_im2col_vtcm_layout * 
         const struct htp_tensor * restrict src0 = octx->src[0];                                           \
         const struct htp_tensor * restrict src1 = octx->src[1];                                           \
         const struct htp_tensor * restrict dst  = octx->dst;                                              \
-        const int32_t s0 = octx->op_params[0], s1 = octx->op_params[1];                                   \
-        const int32_t p0 = octx->op_params[2], p1 = octx->op_params[3];                                   \
-        const int32_t d0 = octx->op_params[4], d1 = octx->op_params[5];                                   \
-        const uint32_t N = src1->ne[3], IC = src1->ne[2], IH = src1->ne[1], IW = src1->ne[0];             \
-        const uint32_t KH                       = src0->ne[1], KW = src0->ne[0];                          \
-        const uint32_t OH                       = dst->ne[2];                                             \
+        const int32_t  s0                       = octx->op_params[0];                                     \
+        const int32_t  s1                       = octx->op_params[1];                                     \
+        const int32_t  p0                       = octx->op_params[2];                                     \
+        const int32_t  p1                       = octx->op_params[3];                                     \
+        const int32_t  d0                       = octx->op_params[4];                                     \
+        const int32_t  d1                       = octx->op_params[5];                                     \
+        const int32_t  is_2D                    = octx->op_params[6] == 1;                                 \
+        const uint32_t N                        = is_2D ? src1->ne[3] : src1->ne[2];                       \
+        const uint32_t IC                       = is_2D ? src1->ne[2] : src1->ne[1];                       \
+        const uint32_t IH                       = is_2D ? src1->ne[1] : 1;                                 \
+        const uint32_t IW                       = src1->ne[0];                                            \
+        const uint32_t KH                       = is_2D ? src0->ne[1] : 1;                                 \
+        const uint32_t KW                       = src0->ne[0];                                            \
+        const uint32_t OH                       = is_2D ? dst->ne[2] : 1;                                  \
         const uint32_t OW                       = dst->ne[1];                                             \
         const uint32_t patch_stride             = IC * KH * KW;                                           \
         const float * restrict src_data         = (const float *) src1->data;                             \
@@ -270,8 +278,9 @@ int op_im2col(struct htp_ops_context * octx) {
         return HTP_STATUS_OK;
     }
 
-    const uint32_t N             = src1->ne[3];
-    const uint32_t OH            = dst->ne[2];
+    const int32_t  is_2D         = octx->op_params[6] == 1;
+    const uint32_t N             = is_2D ? src1->ne[3] : src1->ne[2];
+    const uint32_t OH            = is_2D ? dst->ne[2] : 1;
     const uint32_t OW            = dst->ne[1];
     const uint32_t total_patches = N * OH * OW;
     const uint32_t total_rows    = N * OH;
