@@ -151,9 +151,15 @@ IM2COL_PATCHEMBED_BODY(im2col_patchembed_f32_thread, float, hvx_copy_f32_uu, hvx
         struct htp_thread_trace * restrict tr   = &octx->ctx->trace[ith];                                            \
         const struct htp_tensor * restrict src1 = octx->src[1];                                                      \
         const struct htp_tensor * restrict dst  = octx->dst;                                                         \
-        const uint32_t N = src1->ne[3], IC = src1->ne[2], IH = src1->ne[1], IW = src1->ne[0];                        \
-        const uint32_t KH = octx->src[0]->ne[1], KW = octx->src[0]->ne[0];                                           \
-        const uint32_t OH = dst->ne[2], OW = dst->ne[1];                                                             \
+        const int32_t  is_2D = octx->op_params[6] == 1;                                                               \
+        const uint32_t N = is_2D ? src1->ne[3] : src1->ne[2];                                                         \
+        const uint32_t IC = is_2D ? src1->ne[2] : src1->ne[1];                                                        \
+        const uint32_t IH = is_2D ? src1->ne[1] : 1;                                                                  \
+        const uint32_t IW = src1->ne[0];                                                                              \
+        const uint32_t KH = is_2D ? octx->src[0]->ne[1] : 1;                                                          \
+        const uint32_t KW = octx->src[0]->ne[0];                                                                      \
+        const uint32_t OH = is_2D ? dst->ne[2] : 1;                                                                   \
+        const uint32_t OW = dst->ne[1];                                                                              \
         const uint32_t patch_stride     = IC * KH * KW;                                                              \
         const float * restrict src_data = (const float *) src1->data;                                                \
         DST_CTYPE * restrict dst_data   = (DST_CTYPE *) dst->data;                                                   \
@@ -217,21 +223,30 @@ static bool im2col_use_patchembed_dma(const struct htp_ops_context * octx) {
     const int32_t p0 = octx->op_params[2], p1 = octx->op_params[3];
     const int32_t d0 = octx->op_params[4], d1 = octx->op_params[5];
     const int     is_2D = octx->op_params[6] == 1;
-    if (!is_2D) {
-        return false;
-    }
     if (octx->dst->type != HTP_TYPE_F16 && octx->dst->type != HTP_TYPE_F32) {
         return false;
     }
-    const uint32_t KH = octx->src[0]->ne[1], KW = octx->src[0]->ne[0];
-    if (s0 != (int32_t) KW || s1 != (int32_t) KH) {
-        return false;  // non-overlapping
+    const uint32_t KH = is_2D ? octx->src[0]->ne[1] : 1;
+    const uint32_t KW = octx->src[0]->ne[0];
+    if (s0 != (int32_t) KW) {
+        return false;  // non-overlapping (width)
     }
-    if (p0 != 0 || p1 != 0) {
-        return false;  // no padding
+    if (p0 != 0) {
+        return false;  // no padding (width)
     }
-    if (d0 != 1 || d1 != 1) {
-        return false;  // no dilation
+    if (d0 != 1) {
+        return false;  // no dilation (width)
+    }
+    if (is_2D) {
+        if (s1 != (int32_t) KH) {
+            return false;  // non-overlapping (height)
+        }
+        if (p1 != 0) {
+            return false;  // no padding (height)
+        }
+        if (d1 != 1) {
+            return false;  // no dilation (height)
+        }
     }
     return true;
 }
@@ -241,8 +256,11 @@ static bool im2col_use_patchembed_dma(const struct htp_ops_context * octx) {
 static bool im2col_patchembed_dma_fits(struct htp_ops_context *    octx,
                                        struct htp_im2col_context * ictx,
                                        uint32_t                    n_threads) {
-    const uint32_t IC = octx->src[1]->ne[2], IW = octx->src[1]->ne[0];
-    const uint32_t KH = octx->src[0]->ne[1], KW = octx->src[0]->ne[0];
+    const int32_t  is_2D = octx->op_params[6] == 1;
+    const uint32_t IC = is_2D ? octx->src[1]->ne[2] : octx->src[1]->ne[1];
+    const uint32_t IW = octx->src[1]->ne[0];
+    const uint32_t KH = is_2D ? octx->src[0]->ne[1] : 1;
+    const uint32_t KW = octx->src[0]->ne[0];
     const uint32_t OW           = octx->dst->ne[1];
     const uint32_t patch_stride = IC * KH * KW;
 
