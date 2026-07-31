@@ -75,6 +75,10 @@ int main(int argc, char ** argv) {
     const bool use_ckpt_tgt = (common_context_can_seq_rm(ctx_tgt)       == COMMON_CONTEXT_SEQ_RM_TYPE_FULL);
     const bool use_ckpt_dft = (common_context_can_seq_rm(ctx_dft) == COMMON_CONTEXT_SEQ_RM_TYPE_FULL);
 
+    // some implementations (e.g. Gemma 4 MTP) share the target's memory with the draft context
+    // in that case any ctx_dft memory operation also affects the target, so they have to be skipped
+    const bool is_mem_shared = llama_get_memory(ctx_dft) == llama_get_memory(ctx_tgt);
+
     if (use_ckpt_tgt) {
         LOG_INF("speculative decoding will use checkpoints (context does not support partial sequence removal)\n");
     }
@@ -119,10 +123,6 @@ int main(int argc, char ** argv) {
     // target model sampling context
     common_sampler_ptr smpl(common_sampler_init(model_tgt, params.sampling));
 
-    // eval the prompt
-    llama_decode(ctx_tgt,       llama_batch_get_one(inp.data(), inp.size() - 1));
-    llama_decode(ctx_dft, llama_batch_get_one(inp.data(), inp.size() - 1));
-
     // note: keep the last token separate!
     llama_token id_last = inp.back();
 
@@ -137,9 +137,29 @@ int main(int argc, char ** argv) {
 
     struct common_speculative * spec = common_speculative_init(params.speculative, 1);
 
-    common_speculative_begin(spec, seq_id, prompt_tgt);
-
     llama_batch batch_tgt = llama_batch_init(llama_n_batch(ctx_tgt), 0, 1);
+
+    // eval the prompt
+    if (inp.size() > 1) {
+        common_batch_clear(batch_tgt);
+
+        for (size_t i = 0; i + 1 < inp.size(); ++i) {
+            // request the outputs at every position - the speculator may need them
+            common_batch_add(batch_tgt, inp[i], (llama_pos) i, { seq_id }, true);
+        }
+
+        if (llama_decode(ctx_tgt, batch_tgt) != 0) {
+            LOG_ERR("%s: failed to eval the prompt\n", __func__);
+            return 1;
+        }
+
+        if (!common_speculative_process(spec, batch_tgt)) {
+            LOG_ERR("%s: failed to process the prompt with the speculator\n", __func__);
+            return 1;
+        }
+    }
+
+    common_speculative_begin(spec, seq_id, prompt_tgt);
 
     size_t n_draft = 0;
 
@@ -190,11 +210,11 @@ int main(int argc, char ** argv) {
                 }
             }
 
-            {
+            if (use_ckpt_dft) {
                 ckpt.load_dft(ctx_dft, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-
-                llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, ckpt.pos_max + 1, -1);
             }
+
+            llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, ckpt.pos_max + 1, -1);
         } else {
             // we have a previous (partial) draft to reuse from checkpoint restoration
             if (use_ckpt_tgt) {
@@ -256,11 +276,11 @@ int main(int argc, char ** argv) {
                 llama_memory_seq_rm(llama_get_memory(ctx_tgt), seq_id, ckpt.pos_max + 1, -1);
             }
 
-            {
+            if (use_ckpt_dft) {
                 ckpt.load_dft(ctx_dft, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-
-                llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, ckpt.pos_max + 1, -1);
             }
+
+            llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, ckpt.pos_max + 1, -1);
 
             prompt_tgt.resize(ckpt.n_tokens);
             smpl = std::move(smpl_save);
@@ -311,7 +331,10 @@ int main(int argc, char ** argv) {
             LOG_DBG("clear kv cache from any extra tokens, n_past = %d\n", n_past);
 
             llama_memory_seq_rm(llama_get_memory(ctx_tgt),       seq_id, n_past, -1);
-            llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, n_past, -1);
+
+            if (!is_mem_shared) {
+                llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, n_past, -1);
+            }
         }
 
         if ((params.n_predict >= 0 && n_predict > params.n_predict) || has_eos) {
@@ -352,3 +375,4 @@ int main(int argc, char ** argv) {
 
     return 0;
 }
+
