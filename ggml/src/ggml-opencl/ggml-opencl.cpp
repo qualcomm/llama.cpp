@@ -1245,7 +1245,8 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemv_moe_mxfp4_f32_ns_glu_wimg = nullptr;  // weight-as-texture variant
     cl_kernel kernel_moe_reorder_b;
     cl_kernel kernel_moe_histogram, kernel_moe_scan, kernel_moe_fill, kernel_moe_scatter;
-    cl_kernel kernel_moe_scatter_det = nullptr;   // diagnostic: deterministic slot assignment
+    cl_kernel kernel_moe_scatter_det = nullptr;      // diagnostic: deterministic slot assignment
+    cl_kernel kernel_moe_scatter_stable = nullptr;   // deterministic slot assignment, one workgroup per expert
     cl_kernel kernel_mul_mv_id_q4_0_f32_8x_flat;
     cl_kernel kernel_mul_mv_id_q8_0_f32, kernel_mul_mv_id_q8_0_f32_flat;
     cl_kernel kernel_mul_mv_id_mxfp4_f32;
@@ -5426,6 +5427,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         CL_CHECK((backend_ctx->kernel_moe_fill = clCreateKernel(prog, "kernel_moe_fill", &err), err));
         CL_CHECK((backend_ctx->kernel_moe_scatter = clCreateKernel(prog, "kernel_moe_scatter", &err), err));
         CL_CHECK((backend_ctx->kernel_moe_scatter_det = clCreateKernel(prog, "kernel_moe_scatter_det", &err), err));
+        CL_CHECK((backend_ctx->kernel_moe_scatter_stable = clCreateKernel(prog, "kernel_moe_scatter_stable", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
@@ -28334,7 +28336,20 @@ static void moe_router_reoerder(ggml_backend_t backend, const ggml_tensor * src,
     // diagnostic only (O(N*topK) per work-item), for isolating whether a result
     // depends on the atomic_inc slot ordering.
     static const bool det_scatter = []{ const char * e = getenv("GGML_OPENCL_MOE_DET_SCATTER"); return e && e[0] != '0'; }();
-    if (det_scatter) {
+    // GGML_OPENCL_MOE_STABLE_SCATTER=1 selects the production-shaped deterministic
+    // scatter (one workgroup per expert, block-ranked) instead of the racy atomic one.
+    static const bool stable_scatter = []{ const char * e = getenv("GGML_OPENCL_MOE_STABLE_SCATTER"); return e && e[0] != '0'; }();
+    if (stable_scatter) {
+        kernel = backend_ctx->kernel_moe_scatter_stable;
+        CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &original_router_buf));
+        CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &post_router_buf));
+        CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem), &emap_buf));
+        CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_mem), &tile_offset_buf));
+        CL_CHECK(clSetKernelArg(kernel, 4, sizeof(int), &ne21));
+        CL_CHECK(clSetKernelArg(kernel, 5, sizeof(int), &ne20));
+        CL_CHECK(clSetKernelArg(kernel, 6, sizeof(int), &ne02));
+
+    } else if (det_scatter) {
         kernel = backend_ctx->kernel_moe_scatter_det;
         CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &original_router_buf));
         CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &post_router_buf));
@@ -28355,7 +28370,14 @@ static void moe_router_reoerder(ggml_backend_t backend, const ggml_tensor * src,
         CL_CHECK(clSetKernelArg(kernel, 7, sizeof(int), &ne02));
     }
 
-    backend_ctx->enqueue_ndrange_kernel(kernel, 3, histogram_global_size, histogram_local_size, src);
+    if (stable_scatter) {
+        // one workgroup (one wave) per expert; each ranks its own tokens
+        size_t stable_gws[2] = { 64, (size_t)ne02 };
+        size_t stable_lws[2] = { 64, 1 };
+        backend_ctx->enqueue_ndrange_kernel(kernel, 2, stable_gws, stable_lws, src);
+    } else {
+        backend_ctx->enqueue_ndrange_kernel(kernel, 3, histogram_global_size, histogram_local_size, src);
+    }
 
     // [MOE_TILES] env-gated padding probe: read back total_tiles (= Sum_e
     // ceil(k_e/n_tile_size)) and compare to the ideal tile count for the real
