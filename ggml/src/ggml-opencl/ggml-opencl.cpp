@@ -8764,10 +8764,16 @@ static bool ggml_opencl_can_fuse_topk_moe_late_softmax(const struct ggml_cgraph 
         TOPK_MOE_DECLINE("trailing reshape is not a view of the soft_max");
     }
 
-    // the pool may place either output over the logits, which the separate kernels
-    // tolerate (logits are dead after get_rows) but a single kernel would not
-    if (ggml_cl_tensors_overlap(logits, sfm) || ggml_cl_tensors_overlap(logits, srt)) {
-        TOPK_MOE_DECLINE("output aliases the logits");
+    // The pool routinely places the soft_max output over the logits, which are dead
+    // once get_rows has run. At one token that is harmless: the dispatch is a single
+    // workgroup that copies the whole logit row into local memory and barriers before
+    // it writes anything, so there is no reader left to race. With more than one token
+    // the workgroups are independent - workgroup t's write can land in a logit row that
+    // workgroup t' has not read yet - so an alias has to decline. CUDA draws the same
+    // line (ggml_cuda_check_fusion_memory_ranges exempts topk-moe at ggml_nrows == 1).
+    if (n_tokens > 1 &&
+        (ggml_cl_tensors_overlap(logits, sfm) || ggml_cl_tensors_overlap(logits, srt))) {
+        TOPK_MOE_DECLINE("output aliases the logits at more than one token");
     }
 
     *ids_out     = ids;
