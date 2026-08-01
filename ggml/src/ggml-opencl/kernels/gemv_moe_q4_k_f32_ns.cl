@@ -308,6 +308,44 @@ static inline float moe_glu_apply(int glu_op, float g, float u) {
     return act*u;
 }
 
+// Same body as MOE_Q4K_ROW_DOT below, but with the weight base pointers passed in, for
+// the separate gate/up MoE FFN where the two projections are distinct tensors of the
+// same shape. Row is always i01 (each weight has ne01 = n_ff rows), so the expert and
+// scale offsets are the same expressions - only the four base pointers differ.
+#define MOE_Q4K_ROW_DOT_W(SUM, Q, D, DM, S)                                                  \
+    for (uint ib = sgid; ib < num_subblocks; ib += N_SIMDGROUP) {                            \
+        uint sb = ib / 8;                                                                    \
+        uint j  = ib % 8;                                                                    \
+        half d_val  = D[expert_d_offset + sb * ne01 + i01];                                  \
+        half dm_val = DM[expert_d_offset + sb * ne01 + i01];                                 \
+        global const uchar * sc = S + ((uint)expert_id * ne01 + i01) * scales_per_row + sb * K_SCALE_SIZE; \
+        uchar sv, mn;                                                                        \
+        get_scale_min_k4(j, sc, &sv, &mn);                                                   \
+        float scale = (float)d_val * (float)sv;                                              \
+        float minv  = (float)dm_val * (float)mn;                                             \
+        uint q_base = expert_q_offset + ib * ne01 * 4 + i01;                                 \
+        uint4 regQ;                                                                          \
+        regQ.s0 = Q[q_base];                                                                 \
+        regQ.s1 = Q[q_base + ne01];                                                          \
+        regQ.s2 = Q[q_base + ne01 * 2];                                                      \
+        regQ.s3 = Q[q_base + ne01 * 3];                                                      \
+        uint y_offset = i11 * ne00 / 4 + ib * 8;                                             \
+        float8 fp32x8 = q4_k_to_fp32_packed8(as_ushort2(regQ.s0), scale, minv);             \
+        float4 shared_y4;                                                                    \
+        shared_y4 = read_imagef(src1, (y_offset + 0)); float4 acc = shared_y4 * fp32x8.lo;   \
+        shared_y4 = read_imagef(src1, (y_offset + 1)); acc += shared_y4 * fp32x8.hi;         \
+        fp32x8 = q4_k_to_fp32_packed8(as_ushort2(regQ.s1), scale, minv);                     \
+        shared_y4 = read_imagef(src1, (y_offset + 2)); acc += shared_y4 * fp32x8.lo;         \
+        shared_y4 = read_imagef(src1, (y_offset + 3)); acc += shared_y4 * fp32x8.hi;         \
+        fp32x8 = q4_k_to_fp32_packed8(as_ushort2(regQ.s2), scale, minv);                     \
+        shared_y4 = read_imagef(src1, (y_offset + 4)); acc += shared_y4 * fp32x8.lo;         \
+        shared_y4 = read_imagef(src1, (y_offset + 5)); acc += shared_y4 * fp32x8.hi;         \
+        fp32x8 = q4_k_to_fp32_packed8(as_ushort2(regQ.s3), scale, minv);                     \
+        shared_y4 = read_imagef(src1, (y_offset + 6)); acc += shared_y4 * fp32x8.lo;         \
+        shared_y4 = read_imagef(src1, (y_offset + 7)); acc += shared_y4 * fp32x8.hi;         \
+        SUM += ((acc.s0 + acc.s1) + (acc.s2 + acc.s3));                                      \
+    }
+
 // One row's dot product, identical body to the standalone kernel above. ROW is the
 // physical weight row (0..ne01-1); SUM is the float accumulator for this subgroup.
 #define MOE_Q4K_ROW_DOT(SUM, ROW)                                                            \
@@ -403,6 +441,79 @@ __kernel void kernel_gemv_moe_q4_k_f32_ns_glu(
 
         dst = dst + (offsetd >> 2);
         dst[i01 + i20 * n_ff] = moe_glu_apply(glu_op, gate_sum, up_sum);
+    }
+}
+
+// Separate gate/up MoE FFN: {MUL_MAT_ID(gate), MUL_MAT_ID(up), GLU} in one dispatch.
+// This is the shape most MoE models emit (qwen3-moe, granite-moe, olmoe, ...) - two
+// distinct expert weights of identical shape over the same activation and expert list,
+// joined by a GLU. The sibling above handles the merged gate_up weight instead.
+//
+// Each row is computed exactly as kernel_gemv_moe_q4_k_f32_ns computes it (same macro
+// body, same subgroup partition, same cross-subgroup reduction order), so the two sums
+// are bit-identical to the two separate GEMVs; only the GLU epilogue is folded in and
+// the two n_ff-sized intermediates never reach memory.
+__attribute__((qcom_reqd_sub_group_size("half")))
+__kernel void kernel_gemv_moe_q4_k_f32_ns_glu2(
+    __global uint *         gate_q,
+    __global half *         gate_d,
+    __global half *         gate_dm,
+    __global uchar *        gate_s,
+    __global uint *         up_q,
+    __global half *         up_d,
+    __global half *         up_dm,
+    __global uchar *        up_s,
+    __read_only image1d_buffer_t src1,
+    __global uint *         src2,
+    __global float *        dst,
+    ulong                   offsetd,
+    int                     ne00,    // K
+    int                     ne01,    // rows per weight = n_ff
+    int                     ne11,
+    int                     glu_op
+) {
+    uint i01  = get_global_id(0);
+    uint i20  = get_global_id(2);
+    uint sgid = get_local_id(1);
+    uint slid = get_sub_group_local_id();
+
+    if (i01 >= (uint)ne01) {
+        return;
+    }
+
+    uint i11 = i20 % ne11;
+
+    uint expert_id = src2[i20];
+
+    int num_superblocks = ne00 / QK_K;
+    int num_subblocks = ne00 / 32;
+    int scales_per_row = num_superblocks * K_SCALE_SIZE;
+
+    uint expert_q_offset = expert_id * (ne00 / 8) * ne01;
+    uint expert_d_offset = expert_id * num_superblocks * ne01;
+
+    __private float gate_sum = 0.0f;
+    __private float up_sum   = 0.0f;
+
+    MOE_Q4K_ROW_DOT_W(gate_sum, gate_q, gate_d, gate_dm, gate_s)
+    MOE_Q4K_ROW_DOT_W(up_sum,   up_q,   up_d,   up_dm,   up_s)
+
+    // Cross-subgroup reduction (assumes #subgroups=4), gate (xy) + up (zw) packed.
+    __local float2 reduceLM[SIMDGROUP_WIDTH * (N_SIMDGROUP - 1)];
+    if (sgid == 1) reduceLM[SIMDGROUP_WIDTH * 0 + slid] = (float2)(gate_sum, up_sum);
+    if (sgid == 2) reduceLM[SIMDGROUP_WIDTH * 1 + slid] = (float2)(gate_sum, up_sum);
+    if (sgid == 3) reduceLM[SIMDGROUP_WIDTH * 2 + slid] = (float2)(gate_sum, up_sum);
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (sgid == 0) {
+        gate_sum += reduceLM[SIMDGROUP_WIDTH * 0 + slid].s0;
+        up_sum   += reduceLM[SIMDGROUP_WIDTH * 0 + slid].s1;
+        gate_sum += reduceLM[SIMDGROUP_WIDTH * 1 + slid].s0;
+        up_sum   += reduceLM[SIMDGROUP_WIDTH * 1 + slid].s1;
+        gate_sum += reduceLM[SIMDGROUP_WIDTH * 2 + slid].s0;
+        up_sum   += reduceLM[SIMDGROUP_WIDTH * 2 + slid].s1;
+
+        dst = dst + (offsetd >> 2);
+        dst[i01 + i20 * ne01] = moe_glu_apply(glu_op, gate_sum, up_sum);
     }
 }
 
