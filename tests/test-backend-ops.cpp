@@ -1473,6 +1473,13 @@ struct test_case {
             }
 
             double err = ud->tc->err(f1.data(), f2.data(), f1.size());
+            // GGML_TEST_PRINT_ERR=1 reports the error for every tensor, not just
+            // failures - lets two backend configurations that both pass be compared
+            // on how far each sits from the reference.
+            static const bool print_err = []{ const char * e = getenv("GGML_TEST_PRINT_ERR"); return e && e[0] != '0'; }();
+            if (print_err) {
+                printf("[ERRVAL %s %.9f] ", ggml_op_desc(t1), err);
+            }
             if (err > ud->tc->max_err(ud->backend1)) {
                 printf("[%s] ERR = %.9f > %.9f ", ggml_op_desc(t1), err, ud->tc->max_err(ud->backend1));
                 //for (int i = 0; i < (int) f1.size(); i++) {
