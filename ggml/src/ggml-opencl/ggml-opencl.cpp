@@ -8671,6 +8671,19 @@ static bool ggml_cl_tensors_overlap(const ggml_tensor * x, const ggml_tensor * y
 // Mirrors the CUDA "late softmax" topk-moe variant and Vulkan's TOPK_MOE_LATE_SOFTMAX.
 // Two tensors escape the subgraph: the ids VIEW (node_idx+1, read by mul_mat_id) and
 // the final RESHAPE (node_idx+5, read by the combine).
+// GGML_OPENCL_TOPK_MOE_PROBE=2 reports why a candidate ARGSORT was declined (once per reason).
+static void topk_moe_decline(const char * why) {
+    static const int probe = []{ const char * e = getenv("GGML_OPENCL_TOPK_MOE_PROBE"); return e ? atoi(e) : 0; }();
+    if (probe < 2) {
+        return;
+    }
+    static std::set<std::string> seen;
+    if (seen.insert(why).second) {
+        GGML_LOG_INFO("ggml_opencl: topk_moe fusion declined: %s\n", why);
+    }
+}
+#define TOPK_MOE_DECLINE(why) do { topk_moe_decline(why); return false; } while (0)
+
 static bool ggml_opencl_can_fuse_topk_moe_late_softmax(const struct ggml_cgraph * cgraph, int node_idx,
                                                        const ggml_tensor ** ids_out,
                                                        const ggml_tensor ** weights_out) {
@@ -8681,6 +8694,18 @@ static bool ggml_opencl_can_fuse_topk_moe_late_softmax(const struct ggml_cgraph 
     const int tk_out[] = { node_idx + 1, node_idx + 5 };
 
     if (!ggml_can_fuse_subgraph(cgraph, node_idx, 6, tk_ops, tk_out, 2)) {
+        if (node_idx + 6 <= cgraph->n_nodes) {
+            static const int probe = []{ const char * e = getenv("GGML_OPENCL_TOPK_MOE_PROBE"); return e ? atoi(e) : 0; }();
+            static bool once = false;
+            if (probe >= 2 && !once) {
+                once = true;
+                GGML_LOG_INFO("ggml_opencl: topk_moe subgraph mismatch at %d, ops:", node_idx);
+                for (int j = 0; j < 6 && node_idx + j < cgraph->n_nodes; ++j) {
+                    GGML_LOG_INFO(" %s", ggml_op_name(cgraph->nodes[node_idx+j]->op));
+                }
+                GGML_LOG_INFO("\n");
+            }
+        }
         return false;
     }
 
@@ -8697,7 +8722,7 @@ static bool ggml_opencl_can_fuse_topk_moe_late_softmax(const struct ggml_cgraph 
     if ((enum ggml_sort_order) srt->op_params[0] != GGML_SORT_ORDER_DESC ||
         logits->type != GGML_TYPE_F32 || !ggml_is_contiguous(logits) ||
         logits->ne[2] != 1 || logits->ne[3] != 1 || srt->type != GGML_TYPE_I32) {
-        return false;
+        TOPK_MOE_DECLINE("argsort shape/type/order");
     }
 
     const int64_t n_expert = logits->ne[0];
@@ -8707,14 +8732,14 @@ static bool ggml_opencl_can_fuse_topk_moe_late_softmax(const struct ggml_cgraph 
     // the fused kernel keeps the row in local scratch and softmaxes k values with
     // the float4 reduction of kernel_soft_max_4 — see topk_moe.cl
     if (n_expert > 512 || k > 64 || k < 1 || k > n_expert || k % 4 != 0) {
-        return false;
+        TOPK_MOE_DECLINE("n_expert/k out of range or k not a multiple of 4");
     }
 
     // ids is the leading-k view of the argsort result (ggml_argsort_top_k)
     if (ids->view_src != srt || ids->view_offs != 0 ||
         ids->type != GGML_TYPE_I32 || ids->ne[1] != n_tokens ||
         ids->nb[1] != srt->nb[1]) {
-        return false;
+        TOPK_MOE_DECLINE("ids view is not the leading-k slice of the argsort");
     }
 
     // get_rows gathers the same logits the sort ranked, reshaped to [1, n_expert, n_tokens]
@@ -8723,7 +8748,7 @@ static bool ggml_opencl_can_fuse_topk_moe_late_softmax(const struct ggml_cgraph 
         probs->type != GGML_TYPE_F32 ||
         (probs->view_src ? probs->view_src : probs) != logits ||
         probs->ne[0] != 1 || probs->ne[1] != n_expert || probs->ne[2] != n_tokens) {
-        return false;
+        TOPK_MOE_DECLINE("get_rows does not gather the ranked logits");
     }
 
     // plain softmax over the k gathered values: no mask, no sinks, unit scale
@@ -8733,16 +8758,16 @@ static bool ggml_opencl_can_fuse_topk_moe_late_softmax(const struct ggml_cgraph 
     if (sfm->src[1] || sfm->src[2] || scale != 1.0f || max_bias != 0.0f ||
         sfm->type != GGML_TYPE_F32 || sfm->src[0] != rs0 || rs0->view_src != grw ||
         sfm->ne[0] != k || sfm->ne[1] != n_tokens || !ggml_is_contiguous(sfm)) {
-        return false;
+        TOPK_MOE_DECLINE("soft_max is masked/scaled or not over the gathered values");
     }
     if (rs1->view_src != sfm) {
-        return false;
+        TOPK_MOE_DECLINE("trailing reshape is not a view of the soft_max");
     }
 
     // the pool may place either output over the logits, which the separate kernels
     // tolerate (logits are dead after get_rows) but a single kernel would not
     if (ggml_cl_tensors_overlap(logits, sfm) || ggml_cl_tensors_overlap(logits, srt)) {
-        return false;
+        TOPK_MOE_DECLINE("output aliases the logits");
     }
 
     *ids_out     = ids;
