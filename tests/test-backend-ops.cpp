@@ -4493,6 +4493,77 @@ struct test_mul_mat_id : public test_case {
 };
 
 // GGML_OP_MUL_MAT_ID + GGML_OP_ADD or GGML_OP_MUL
+// MoE FFN gate/up fusion: glu(mul_mat_id(Wg,x,ids), mul_mat_id(Wu,x,ids)).
+// The shape emitted by qwen3-moe / granite-moe / olmoe style FFNs, which backends
+// may collapse into a single MoE GEMV with the activation folded into the epilogue.
+struct test_mul_mat_id_glu_fusion : public test_case {
+    const ggml_type type_a;
+    const ggml_type type_b;
+    const int n_mats;
+    const int n_used;
+    const int64_t m;   // n_ff
+    const int64_t n;   // tokens
+    const int64_t k;   // n_embd
+    const ggml_glu_op glu_op;
+
+    std::string vars() override {
+        return VARS_TO_STR8(type_a, type_b, n_mats, n_used, m, n, k, glu_op);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2 * 2 * m * k * n * n_used;
+    }
+
+    test_mul_mat_id_glu_fusion(ggml_type type_a = GGML_TYPE_Q4_K, ggml_type type_b = GGML_TYPE_F32,
+            int n_mats = 128, int n_used = 8,
+            int64_t m = 768, int64_t n = 1, int64_t k = 2048,
+            ggml_glu_op glu_op = GGML_GLU_OP_SWIGLU)
+        : type_a(type_a), type_b(type_b), n_mats(n_mats), n_used(n_used),
+          m(m), n(n), k(k), glu_op(glu_op) {
+            GGML_ASSERT(n_used <= n_mats);
+        }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * as = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+        ggml_set_name(as, "as");
+
+        ggml_tensor * as2 = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+        ggml_set_name(as2, "as2");
+
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+        ggml_set_name(ids, "ids");
+        if (n_used != n_mats) {
+            ids = ggml_view_2d(ctx, ids, n_used, n, ids->nb[1], 0);
+            ggml_set_name(ids, "view_of_ids");
+        }
+
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, type_b, k, n_used, n);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * gate = ggml_mul_mat_id(ctx, as, b, ids);
+        ggml_set_name(gate, "gate");
+
+        ggml_tensor * up = ggml_mul_mat_id(ctx, as2, b, ids);
+        ggml_set_name(up, "up");
+
+        ggml_tensor * out = ggml_glu_split(ctx, gate, up, glu_op);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, n_mats);
+    }
+
+    bool run_whole_graph() override { return true; }
+};
+
 struct test_mul_mat_id_fusion : public test_case {
     const ggml_type type_a;
     const ggml_type type_b;
@@ -9129,6 +9200,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, type_b, 128, 8, false, 768, bs, 2048, 1, true));
             }
         }
+    }
+
+    // separate gate/up MoE FFN + GLU (qwen3-moe / granite-moe shape)
+    for (int bs : {1, 4, 512}) {
+        for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K}) {
+            test_cases.emplace_back(new test_mul_mat_id_glu_fusion(type_a, GGML_TYPE_F32, 128, 8, 768, bs, 2048));
+        }
+    }
+    for (ggml_glu_op glu_op : {GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU, GGML_GLU_OP_REGLU}) {
+        test_cases.emplace_back(new test_mul_mat_id_glu_fusion(GGML_TYPE_Q4_K, GGML_TYPE_F32, 32, 4, 512, 1, 1536, glu_op));
     }
 
     for (ggml_type type_a : base_types) {
