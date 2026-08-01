@@ -41,6 +41,9 @@
 // takes the prefix of a full bitonic descending sort, which has no defined
 // tie order, whereas this kernel resolves ties to the lowest expert index.
 // Exactly equal router logits therefore may select a different expert here.
+#ifdef ADRENO_GPU
+REQD_SUBGROUP_SIZE_64
+#endif
 kernel void kernel_topk_moe_late_softmax(
         global char * logits,
         ulong         offset_l,
