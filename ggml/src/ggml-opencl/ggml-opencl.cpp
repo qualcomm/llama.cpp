@@ -4832,6 +4832,18 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             " -cl-mad-enable "
             " -cl-fast-relaxed-math";
 
+    // Diagnostic: build the ragged MoE GEMM partial-tile loop with the same
+    // fully-unrolled compile-time-constant token index the full-tile loop uses,
+    // instead of the runtime-indexed `for t < n_real` form. Isolates whether the
+    // ragged/non-ragged numeric difference comes from that loop's codegen
+    // (private-array indexing and/or mad contraction under -cl-fast-relaxed-math)
+    // rather than from the data the tile is fed. GGML_OPENCL_MOE_RAGGED_STATICIDX=1.
+    if (const char * e = getenv("GGML_OPENCL_MOE_RAGGED_STATICIDX")) {
+        if (e[0] != '0') {
+            CL_moe_compile_opts += " -DMOE_RAGGED_STATICIDX=1";
+        }
+    }
+
     // gemv_moe_q4_1_f32_ns
     {
 #ifdef GGML_OPENCL_EMBED_KERNELS

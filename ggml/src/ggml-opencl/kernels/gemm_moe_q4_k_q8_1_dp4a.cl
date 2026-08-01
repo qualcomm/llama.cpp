@@ -184,8 +184,16 @@ kernel void kernel_gemm_moe_q4_k_q8_1_dp4a(
             #pragma unroll
             for (int t = 0; t < TILESIZE_N; ++t) { MOE_Q4K_DP4A_T(t); }
         } else {
+#ifdef MOE_RAGGED_STATICIDX
+            // Same loop shape as the full tile (constant t, fully unrolled); the
+            // guard is uniform across the workgroup so the padded slots still cost
+            // nothing. Diagnostic for the ragged/non-ragged numeric difference.
+            #pragma unroll
+            for (int t = 0; t < TILESIZE_N; ++t) { if (t < n_real) { MOE_Q4K_DP4A_T(t); } }
+#else
             #pragma unroll 4
             for (int t = 0; t < n_real; ++t) { MOE_Q4K_DP4A_T(t); }
+#endif
         }
         barrier(CLK_LOCAL_MEM_FENCE);
     }
