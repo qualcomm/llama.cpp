@@ -810,7 +810,13 @@ struct ggml_backend_opencl_context {
     bool f16_mrow = true;            // opt-out GGML_OPENCL_F16_MROW=0 (multi-row-per-WG f16 decode GEMV for attn proj + lm_head)
     int  f16_mrow_rpt = 1;           // GGML_OPENCL_F16_MROW_RPT={1,2,4} rows-per-subgroup register blocking for the mrow GEMV
     bool fuse_moe_glu = true;        // opt-out GGML_OPENCL_FUSE_MOE_GLU=0 (byte-identical combined gate_up MoE GEMV + GLU, q4_K)
-    bool fuse_moe_glu2 = true;       // opt-out GGML_OPENCL_FUSE_MOE_GLU2=0 (byte-identical separate gate/up MoE GEMV + GLU, q4_K)
+    // Separate gate/up MoE GEMV + GLU (q4_K). Correct and numerically clean, but a
+    // measured LOSS on X2: Qwen3-30B-A3B tg128 36.08 -> 34.93 (-3.2%, arms disjoint),
+    // granite-3.0-3b-a800m neutral (95.3 vs 95.1). Folding both projections into one
+    // workgroup halves the workgroup count while doubling the register and local-memory
+    // footprint per thread, and that occupancy loss outweighs the saved intermediate
+    // traffic. Kept opt-in (GGML_OPENCL_FUSE_MOE_GLU2=1) pending a split-work variant.
+    bool fuse_moe_glu2 = false;
     bool fuse_moe_glu_mxfp4 = true;  // opt-out GGML_OPENCL_FUSE_MOE_GLU_MXFP4=0 (byte-identical separate gate/up + bias + swiglu_oai MoE GEMV, gpt-oss mxfp4)
     bool fuse_moe_bias_glu = true;   // opt-out GGML_OPENCL_FUSE_MOE_BIAS_GLU=0 (fold both add_id bias passes into swiglu_oai on the MoE prefill path, gpt-oss)
     bool fuse_moe_bias_combine = true; // opt-out GGML_OPENCL_FUSE_MOE_BIAS_COMBINE=0 (fold the down-projection add_id bias pass into the MoE combine)
@@ -10110,7 +10116,7 @@ static void ggml_backend_opencl_exec_graph_nodes(ggml_backend_t backend, ggml_cg
         // one q4_K MoE GEMV with the GLU folded into the epilogue. This is the shape most
         // MoE models emit (qwen3-moe, granite-moe, olmoe); the arm above handles the
         // merged gate_up weight. q4_K decode only, byte-identical to the per-op path.
-        // Default on, opt-out GGML_OPENCL_FUSE_MOE_GLU2=0.
+        // Default OFF - it measures as a loss on X2; opt in with GGML_OPENCL_FUSE_MOE_GLU2=1.
         if (backend_ctx->fuse_moe_glu2 && !backend_ctx->disable_fusion &&
             ggml_opencl_can_fuse(backend_ctx, cgraph, i, { GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_GLU })) {
             ggml_cl_mul_mat_id_q4_k_glu2_fused(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
