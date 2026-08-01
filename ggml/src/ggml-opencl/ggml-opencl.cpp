@@ -813,6 +813,7 @@ struct ggml_backend_opencl_context {
     bool fuse_moe_glu_mxfp4 = true;  // opt-out GGML_OPENCL_FUSE_MOE_GLU_MXFP4=0 (byte-identical separate gate/up + bias + swiglu_oai MoE GEMV, gpt-oss mxfp4)
     bool fuse_moe_bias_glu = true;   // opt-out GGML_OPENCL_FUSE_MOE_BIAS_GLU=0 (fold both add_id bias passes into swiglu_oai on the MoE prefill path, gpt-oss)
     bool fuse_moe_bias_combine = true; // opt-out GGML_OPENCL_FUSE_MOE_BIAS_COMBINE=0 (fold the down-projection add_id bias pass into the MoE combine)
+    bool fuse_topk_moe = true;       // opt-out GGML_OPENCL_FUSE_TOPK_MOE=0 (router top-k + late softmax -> one kernel; replaces argsort/get_rows/soft_max)
     bool fuse_moe_combine = true;    // opt-out GGML_OPENCL_FUSE_MOE_COMBINE=0 (router-weight mul + cross-expert add chain -> one weighted-sum kernel; +4-5% MoE prefill, PPL-parity; weights copied to scratch + bails on experts/dst alias)
     bool moe_gemm_ragged = true;     // opt-out GGML_OPENCL_MOE_RAGGED=0 (skip the ~50% per-expert padded tokens in the q4_K/q6_K MoE prefill GEMM tiles; byte-identical, +8-16% pp)
 
@@ -1199,6 +1200,7 @@ struct ggml_backend_opencl_context {
     // [size_idx][kda][tgpp] where size_idx: 0=S_V=16, 1=32, 2=64, 3=128; kda: 0 or 1.
     // tgpp 0 = TG variant (COLS_PER_LANE_GROUP=1), tgpp 1 = prefill variant (COLS_PER_LANE_GROUP=4).
     cl_kernel kernel_gated_delta_net_f32[4][2][2] = {};
+    cl_kernel kernel_topk_moe_late_softmax = nullptr;  // fused router top-k + late softmax
     cl_kernel kernel_moe_combine_f32 = nullptr;   // fused router-weight mul + cross-expert sum
     cl_kernel kernel_moe_combine_bias_f32 = nullptr;  // same, with the down-projection bias add folded in
     ggml_cl_buffer prealloc_moe_combine_w;        // small scratch copy of the router weights (avoids dst-aliasing)
@@ -4079,6 +4081,22 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                 }
             }
         }
+        GGML_LOG_CONT(".");
+    }
+
+    // topk_moe (fused router top-k + late softmax)
+    {
+    #ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src {
+            #include "topk_moe.cl.h"
+        };
+    #else
+        const std::string kernel_src = read_file("topk_moe.cl");
+    #endif
+        cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        CL_CHECK((backend_ctx->kernel_topk_moe_late_softmax =
+                    clCreateKernel(prog, "kernel_topk_moe_late_softmax", &err), err));
+        CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
 
@@ -7664,6 +7682,9 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
     if (const char * env = getenv("GGML_OPENCL_FUSE_MOE_COMBINE")) {
         backend_ctx->fuse_moe_combine = atoi(env) != 0;
     }
+    if (const char * env = getenv("GGML_OPENCL_FUSE_TOPK_MOE")) {
+        backend_ctx->fuse_topk_moe = atoi(env) != 0;
+    }
     if (const char * env = getenv("GGML_OPENCL_MOE_RAGGED")) {
         backend_ctx->moe_gemm_ragged = atoi(env) != 0;
     }
@@ -8639,6 +8660,146 @@ static bool ggml_cl_tensors_overlap(const ggml_tensor * x, const ggml_tensor * y
     const cl_ulong xo = ex->offset + x->view_offs, xe = xo + ggml_nbytes(x);
     const cl_ulong yo = ey->offset + y->view_offs, ye = yo + ggml_nbytes(y);
     return xo < ye && yo < xe;
+}
+
+// Detect the MoE router gating tail with SOFTMAX_WEIGHT gating (gpt-oss):
+// {ARGSORT, VIEW, GET_ROWS, RESHAPE, SOFT_MAX, RESHAPE} — pick the top-k router
+// logits, gather them, then softmax over just those k. The three real dispatches
+// (argsort / get_rows / soft_max) are all single-wave work on a [n_expert, n_tokens]
+// row, so they cost launch latency rather than bandwidth; one kernel replaces them.
+//
+// Mirrors the CUDA "late softmax" topk-moe variant and Vulkan's TOPK_MOE_LATE_SOFTMAX.
+// Two tensors escape the subgraph: the ids VIEW (node_idx+1, read by mul_mat_id) and
+// the final RESHAPE (node_idx+5, read by the combine).
+static bool ggml_opencl_can_fuse_topk_moe_late_softmax(const struct ggml_cgraph * cgraph, int node_idx,
+                                                       const ggml_tensor ** ids_out,
+                                                       const ggml_tensor ** weights_out) {
+    static const enum ggml_op tk_ops[] = {
+        GGML_OP_ARGSORT, GGML_OP_VIEW, GGML_OP_GET_ROWS,
+        GGML_OP_RESHAPE, GGML_OP_SOFT_MAX, GGML_OP_RESHAPE
+    };
+    const int tk_out[] = { node_idx + 1, node_idx + 5 };
+
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx, 6, tk_ops, tk_out, 2)) {
+        return false;
+    }
+
+    const ggml_tensor * srt = cgraph->nodes[node_idx];
+    const ggml_tensor * ids = cgraph->nodes[node_idx+1];
+    const ggml_tensor * grw = cgraph->nodes[node_idx+2];
+    const ggml_tensor * rs0 = cgraph->nodes[node_idx+3];
+    const ggml_tensor * sfm = cgraph->nodes[node_idx+4];
+    const ggml_tensor * rs1 = cgraph->nodes[node_idx+5];
+
+    const ggml_tensor * logits = srt->src[0];
+
+    // descending sort over a contiguous f32 [n_expert, n_tokens] logit block
+    if ((enum ggml_sort_order) srt->op_params[0] != GGML_SORT_ORDER_DESC ||
+        logits->type != GGML_TYPE_F32 || !ggml_is_contiguous(logits) ||
+        logits->ne[2] != 1 || logits->ne[3] != 1 || srt->type != GGML_TYPE_I32) {
+        return false;
+    }
+
+    const int64_t n_expert = logits->ne[0];
+    const int64_t n_tokens = logits->ne[1];
+    const int64_t k        = ids->ne[0];
+
+    // the fused kernel keeps the row in local scratch and softmaxes k values with
+    // the float4 reduction of kernel_soft_max_4 — see topk_moe.cl
+    if (n_expert > 512 || k > 64 || k < 1 || k > n_expert || k % 4 != 0) {
+        return false;
+    }
+
+    // ids is the leading-k view of the argsort result (ggml_argsort_top_k)
+    if (ids->view_src != srt || ids->view_offs != 0 ||
+        ids->type != GGML_TYPE_I32 || ids->ne[1] != n_tokens ||
+        ids->nb[1] != srt->nb[1]) {
+        return false;
+    }
+
+    // get_rows gathers the same logits the sort ranked, reshaped to [1, n_expert, n_tokens]
+    const ggml_tensor * probs = grw->src[0];
+    if (grw->src[1] != ids || grw->type != GGML_TYPE_F32 ||
+        probs->type != GGML_TYPE_F32 ||
+        (probs->view_src ? probs->view_src : probs) != logits ||
+        probs->ne[0] != 1 || probs->ne[1] != n_expert || probs->ne[2] != n_tokens) {
+        return false;
+    }
+
+    // plain softmax over the k gathered values: no mask, no sinks, unit scale
+    float scale = 1.0f, max_bias = 0.0f;
+    memcpy(&scale,    (const float *) sfm->op_params + 0, sizeof(float));
+    memcpy(&max_bias, (const float *) sfm->op_params + 1, sizeof(float));
+    if (sfm->src[1] || sfm->src[2] || scale != 1.0f || max_bias != 0.0f ||
+        sfm->type != GGML_TYPE_F32 || sfm->src[0] != rs0 || rs0->view_src != grw ||
+        sfm->ne[0] != k || sfm->ne[1] != n_tokens || !ggml_is_contiguous(sfm)) {
+        return false;
+    }
+    if (rs1->view_src != sfm) {
+        return false;
+    }
+
+    // the pool may place either output over the logits, which the separate kernels
+    // tolerate (logits are dead after get_rows) but a single kernel would not
+    if (ggml_cl_tensors_overlap(logits, sfm) || ggml_cl_tensors_overlap(logits, srt)) {
+        return false;
+    }
+
+    *ids_out     = ids;
+    *weights_out = sfm;
+    return true;
+}
+
+static void ggml_cl_topk_moe_late_softmax_fused(ggml_backend_t backend, const ggml_tensor * srt,
+                                                const ggml_tensor * ids, const ggml_tensor * weights) {
+    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *)backend->context;
+    const ggml_tensor * logits = srt->src[0];
+
+    ggml_tensor_extra_cl * el = (ggml_tensor_extra_cl *)logits->extra;
+    ggml_tensor_extra_cl * ei = (ggml_tensor_extra_cl *)ids->extra;
+    ggml_tensor_extra_cl * ew = (ggml_tensor_extra_cl *)weights->extra;
+
+    cl_ulong off_l = el->offset + logits->view_offs;
+    cl_ulong off_i = ei->offset + ids->view_offs;
+    cl_ulong off_w = ew->offset + weights->view_offs;
+
+    const int n_expert = (int)logits->ne[0];
+    const int n_tokens = (int)logits->ne[1];
+    const int k        = (int)ids->ne[0];
+
+    const cl_uint l1 = (cl_uint)(logits->nb[1]  / sizeof(float));
+    const cl_uint i1 = (cl_uint)(ids->nb[1]     / sizeof(int));
+    const cl_uint w1 = (cl_uint)(weights->nb[1] / sizeof(float));
+
+    // one-shot confirmation that this arm is the one that fired (GGML_OPENCL_TOPK_MOE_PROBE=1)
+    static const bool probe = []{ const char * e = getenv("GGML_OPENCL_TOPK_MOE_PROBE"); return e && e[0] != '0'; }();
+    static bool probed = false;
+    if (probe && !probed) {
+        probed = true;
+        GGML_LOG_INFO("ggml_opencl: fused topk_moe late-softmax active (n_expert=%d, k=%d, n_tokens=%d)\n",
+                      n_expert, k, n_tokens);
+    }
+
+    cl_kernel kernel = backend_ctx->kernel_topk_moe_late_softmax;
+    int a = 0;
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &el->data_device));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &off_l));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &ei->data_device));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &off_i));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &ew->data_device));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &off_w));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &n_expert));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &k));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_uint),  &l1));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_uint),  &i1));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_uint),  &w1));
+
+    // one workgroup per token, exactly one wave wide: the kernel's cross-lane
+    // reductions are sub_group ops, so the workgroup must not exceed the wave
+    const size_t wave = backend_ctx->gpu_family == INTEL ? 32 : 64;
+    size_t lws[1] = { wave };
+    size_t gws[1] = { (size_t)n_tokens * wave };
+    backend_ctx->enqueue_ndrange_kernel(kernel, 1, gws, lws, (ggml_tensor *)weights);
 }
 
 // Detect the gpt-oss MoE bias+activation epilogue on the PREFILL path:
@@ -9874,6 +10035,19 @@ static void ggml_backend_opencl_exec_graph_nodes(ggml_backend_t backend, ggml_cg
                                        cgraph->nodes[i+3], cgraph->nodes[i+4]);
             i += 4;
             continue;
+        }
+
+        // Fuse the MoE router gating tail: argsort + view + get_rows + reshape +
+        // soft_max + reshape -> one top-k + late-softmax kernel. Three single-wave
+        // dispatches collapse to one. Opt out GGML_OPENCL_FUSE_TOPK_MOE=0.
+        if (backend_ctx->fuse_topk_moe && !backend_ctx->disable_fusion) {
+            const ggml_tensor * tk_ids = nullptr;
+            const ggml_tensor * tk_w   = nullptr;
+            if (ggml_opencl_can_fuse_topk_moe_late_softmax(cgraph, i, &tk_ids, &tk_w)) {
+                ggml_cl_topk_moe_late_softmax_fused(backend, node, tk_ids, tk_w);
+                i += 5;
+                continue;
+            }
         }
 
         // Fold the MoE down-projection bias into the combine: add_id(down_bias) +
