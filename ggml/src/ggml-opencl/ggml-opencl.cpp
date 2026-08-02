@@ -19950,6 +19950,32 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         int n_splits = (n_kv + fd_kv_per_split - 1) / fd_kv_per_split;
         if (n_splits < FD_MIN_SPLITS) n_splits = FD_MIN_SPLITS;
         if (n_splits > fd_max_splits) n_splits = fd_max_splits;
+
+        // Workgroup floor for the MQ routes. Their grid is
+        // (n_head_kv * n_batch) x n_splits workgroups, NOT one per query head:
+        // MQ_GQA query heads share a workgroup, so an 8-KV-head model at a
+        // short n_kv lands on 8 * FD_MIN_SPLITS = 16 workgroups, which is at
+        // or below the compute-unit count and leaves the device idle. Split
+        // the KV range further until every SP has work, but only while the
+        // slices stay wide enough to keep the cluster's lanes busy -- the
+        // split count is otherwise tuned for the deep layers, where raising
+        // it costs merge work and redundant Q loads (measured: a blanket
+        // kv_per_split of 64 is -2.5% at d4096, 32 is -8.7%).
+        if (use_fd_mq && backend_ctx->compute_units > 0) {
+            const int wg_per_split = n_head_kv * n_batch;
+            static const int wg_mult = []{
+                const char * e = getenv("GGML_OPENCL_FD_MQ_WG_MULT");
+                return (e && e[0]) ? atoi(e) : 4;
+            }();
+            const int wg_target    = wg_mult * (int) backend_ctx->compute_units;
+            const int min_kv_per_split = 32;
+            while (wg_per_split * n_splits < wg_target &&
+                   n_splits < fd_max_splits &&
+                   n_kv / (n_splits + 1) >= min_kv_per_split) {
+                n_splits++;
+            }
+        }
+
         const int kv_per_split = (n_kv + n_splits - 1) / n_splits;
 
         const int fa_partial_floats = 2 + d_head_v;
