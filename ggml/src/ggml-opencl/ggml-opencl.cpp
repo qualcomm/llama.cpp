@@ -6093,8 +6093,12 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
     // dp4a QK dot in the q8_0 decode kernels: +3% tg at depth on the A8X
     // (mq_split stays at the 512 B/WI boundary), -1..-2% on the X2E (its c8
     // kernel sits exactly AT the boundary and the packing state pushes it
-    // over). Enable only where measured positive.
-    const bool fa_q8_int_qk = backend_ctx->adreno_gen == ADRENO_GPU_GEN::A8X;
+    // over). Enable only where measured positive. The A8X check alone is not
+    // enough: the Adreno 850 is A8X but ships the E17 compiler (parses as
+    // version 0.0.0), which dies building these programs — require a real
+    // E031 compiler as measured on the 840 (E031.50).
+    const bool fa_q8_int_qk = backend_ctx->adreno_gen == ADRENO_GPU_GEN::A8X &&
+                              backend_ctx->adreno_cl_compiler_version.newer_than_or_same(E031, 38, 0, 0);
     const std::string opts_cl_c_gqa4 = fa_cl_c_gqa4
         ? " -D FA_CL_C=" + std::to_string(fa_cl_c_gqa4) : std::string();
     // The g8 (GQA8) program doubles the BASE width, never the f16 width — a
