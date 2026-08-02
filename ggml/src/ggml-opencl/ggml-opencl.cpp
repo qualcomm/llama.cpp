@@ -694,6 +694,15 @@ struct ggml_opencl_fa_kernels {
     // attempted (variant, (dk, dv))
     // all attempted FA kernels appear here, but those not registered failed compilation
     std::set<std::pair<int, std::pair<int, int>>> variant_attempted;
+
+    // Flash-decoding partials scratch, reused across FA calls. Decode issues
+    // one FD dispatch per attention layer, so a per-call clCreateBuffer /
+    // clReleaseMemObject pair costs one driver round-trip per layer per token.
+    // Reuse is safe on the in-order queue: the split kernel fully writes the
+    // range the immediately following merge reads, and no FA call outlives its
+    // own merge.
+    cl_mem fd_partial_pool      = nullptr;
+    size_t fd_partial_pool_size = 0;
 };
 
 // backend context
@@ -1544,6 +1553,13 @@ struct ggml_backend_opencl_context {
             if (q4k_i8_da) { CL_CHECK(clReleaseMemObject(q4k_i8_da)); q4k_i8_da = nullptr; }
             if (q4k_i8_sa) { CL_CHECK(clReleaseMemObject(q4k_i8_sa)); q4k_i8_sa = nullptr; }
             q4k_i8_cap_k = 0;
+
+            // Release the flash-decoding partials scratch.
+            if (fa.fd_partial_pool) {
+                CL_CHECK(clReleaseMemObject(fa.fd_partial_pool));
+                fa.fd_partial_pool      = nullptr;
+                fa.fd_partial_pool_size = 0;
+            }
 
             // Release pooled image1d_buffer views over KV cache layers.
             for (auto & kv : kq_img_pool) {
@@ -19907,16 +19923,52 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         const size_t partial_size_bytes =
             (size_t) n_batch * n_head * n_q * n_splits * fa_partial_floats * sizeof(float);
 
-        ggml_cl_flash_attn_temp_buffer temp_partial;
+        // Opt-out for diagnosis. Force-disabled while recordable queues are in
+        // use: a recording bakes the cl_mem handle into the captured dispatch,
+        // and a pool that grows afterwards would leave the replay pointing at a
+        // released buffer.
+        static const bool fd_pool_env_on = []{
+            const char * e = getenv("GGML_OPENCL_FD_PARTIAL_POOL");
+            return !(e && e[0] == '0');
+        }();
+        const bool fd_pool_on = fd_pool_env_on && !backend_ctx->rec_enabled;
+
+        ggml_cl_flash_attn_temp_buffer temp_partial;  // unused when pooling
+        cl_mem partial_buffer = NULL;
         cl_int err;
-        temp_partial.data = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE,
+        if (fd_pool_on) {
+            // Grow-only, so a context whose split count varies per layer does
+            // not thrash the allocator.
+            if (backend_ctx->fa.fd_partial_pool_size < partial_size_bytes) {
+                if (backend_ctx->fa.fd_partial_pool != nullptr) {
+                    CL_CHECK(clFinish(backend_ctx->queue));
+                    CL_CHECK(clReleaseMemObject(backend_ctx->fa.fd_partial_pool));
+                    backend_ctx->fa.fd_partial_pool      = nullptr;
+                    backend_ctx->fa.fd_partial_pool_size = 0;
+                }
+                cl_mem grown = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE,
+                                              partial_size_bytes, NULL, &err);
+                if (err != CL_SUCCESS) {
+                    CL_CHECK(clFinish(backend_ctx->queue));
+                    grown = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE,
                                            partial_size_bytes, NULL, &err);
-        if (err != CL_SUCCESS) {
-            CL_CHECK(clFinish(backend_ctx->queue));
+                }
+                CL_CHECK(err);
+                backend_ctx->fa.fd_partial_pool      = grown;
+                backend_ctx->fa.fd_partial_pool_size = partial_size_bytes;
+            }
+            partial_buffer = backend_ctx->fa.fd_partial_pool;
+        } else {
             temp_partial.data = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE,
                                                partial_size_bytes, NULL, &err);
+            if (err != CL_SUCCESS) {
+                CL_CHECK(clFinish(backend_ctx->queue));
+                temp_partial.data = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE,
+                                                   partial_size_bytes, NULL, &err);
+            }
+            CL_CHECK(err);
+            partial_buffer = temp_partial.data;
         }
-        CL_CHECK(err);
 
         cl_kernel k_split = fd_k_split;
         int argi = 0;
@@ -20000,7 +20052,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(cl_ulong), &mask_nb3));
         CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(int),      &mask_ne2));
         CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(int),      &mask_ne3));
-        CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(cl_mem),   &temp_partial.data));
+        CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(cl_mem),   &partial_buffer));
         CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(int),      &n_splits));
         CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(int),      &kv_per_split));
 
@@ -20017,7 +20069,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
 
         cl_kernel k_merge = backend_ctx->fa.f32_merge.at(dk_dv);
         argi = 0;
-        CL_CHECK(clSetKernelArg(k_merge, argi++, sizeof(cl_mem),   &temp_partial.data));
+        CL_CHECK(clSetKernelArg(k_merge, argi++, sizeof(cl_mem),   &partial_buffer));
         CL_CHECK(clSetKernelArg(k_merge, argi++, sizeof(cl_mem),   &extra_o->data_device));
         CL_CHECK(clSetKernelArg(k_merge, argi++, sizeof(cl_ulong), &offset_o));
         CL_CHECK(clSetKernelArg(k_merge, argi++, sizeof(int),      &n_head));
