@@ -19457,10 +19457,24 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         // TBO + coherence). NOTE the per-gen quant preference differs: X2 is
         // BW-bound (q4_0 fastest), X1 is dequant-ALU-bound (q8_0 fastest).
         const bool c8_quant_on = (c8_env_state >= 0) ? (c8_env_state == 1) : c8_default_on;
+        // Minimum n_kv for the MQ (KV-sharing) decode routes. FD_MIN_N_KV is
+        // tuned for the flash-decoding split, but the MQ kernels also buy a
+        // gqa-fold of the KV reads, which pays below that: models with
+        // alternating SWA layers (gpt-oss: swa_period=2, window 128) sit at
+        // n_kv == 256 on half their layers and so never reach any KV-sharing
+        // kernel at any depth -- they run the legacy per-head q1 instead.
+        // Opt-in (GGML_OPENCL_FD_MIN_N_KV_MQ=128): worth ~+1.2% tg32 on
+        // gpt-oss-20b/X2-90 once the partials buffer is pooled, but it changes
+        // decode routing for every model below FD_MIN_N_KV and has only been
+        // measured on one. Default is unchanged.
+        static const int fd_min_n_kv_mq = []{
+            const char * e = getenv("GGML_OPENCL_FD_MIN_N_KV_MQ");
+            return (e && e[0]) ? atoi(e) : FD_MIN_N_KV;
+        }();
         if (mq_enabled && mq_kv_ok && nq_in_vec_range && !is_causal &&
             backend_ctx->gpu_family != INTEL &&  // MQ FD-split is 64-wide-subgroup tuned; Intel uses basic q1
             !use_local_tile &&  // local-tile dispatches its own grid, skip MQ FD-split
-            n_kv >= FD_MIN_N_KV &&
+            n_kv >= fd_min_n_kv_mq &&
             backend_ctx->fa.f32_merge.count(dk_dv) > 0) {
             if (nq1_only && lmq_on && is_mixed && d_head_q == 128 && d_head_v == 128 &&
                 gqa_ratio_dispatch == 8 &&
@@ -19795,6 +19809,14 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         clGetKernelInfo(fd_k_split, CL_KERNEL_FUNCTION_NAME, sizeof(fd_kname) - 1, fd_kname, NULL);
         GGML_LOG_INFO("ggml_opencl: FA-decode kernel: %s (n_q=%d n_kv=%d dk=%d dv=%d gqa=%d)\n",
                       fd_kname, n_q, n_kv, d_head_q, d_head_v, gqa_ratio_dispatch);
+    } else if (fa_debug) {
+        // Print the non-FD dispatch too. Without this, "no line" reads as
+        // "path not taken" when it can equally mean "fell back to the generic
+        // kernel", which is what hid half of gpt-oss's layers on the legacy q1.
+        char kname[128] = {0};
+        clGetKernelInfo(kernel, CL_KERNEL_FUNCTION_NAME, sizeof(kname) - 1, kname, NULL);
+        GGML_LOG_INFO("ggml_opencl: FA kernel (no FD): %s (n_q=%d n_kv=%d dk=%d dv=%d gqa=%d)\n",
+                      kname, n_q, n_kv, d_head_q, d_head_v, gqa_ratio_dispatch);
     }
 
     const int n_q_blocks = n_q > 1 ? (n_q + block_m - 1) / block_m : 0;
