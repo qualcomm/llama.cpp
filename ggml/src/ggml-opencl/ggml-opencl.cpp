@@ -6330,9 +6330,20 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
             // The plain mq_split was measured -48% here (48/64 lanes idle) -
             // the cluster layout is the only MQ shape that fits dk=64.
             if (!fa_decode_only && dk == 64 && dv == 64 && backend_ctx->has_subgroup_shuffle) {
+                // Fold the 8 per-head cluster butterflies into one halving
+                // butterfly: 15 shuffles per KV row instead of 32, with the
+                // rounds ordered so each head's summation tree is unchanged
+                // (bit-identical scores). Applied at this one build site, so
+                // every other program compiles the byte-exact original.
+                // Opt-out for diagnosis: GGML_OPENCL_FA_MHRED=0.
+                static const bool mhred_on = []{
+                    const char * e = std::getenv("GGML_OPENCL_FA_MHRED");
+                    return !(e && e[0] == '0');
+                }();
                 const std::string opts_g8c16 = opts +
                     " -D FA_MQ_ONLY -D MQ_GQA=8 -D MQ_NSG=2 -D MQ_NSG_SPLIT=2 -D FA_CL_C=16"
-                    " -D FA_CL_MASK_BCAST=1";
+                    " -D FA_CL_MASK_BCAST=1" +
+                    (mhred_on ? " -D FA_CL_MHRED=1" : "");
 
                 // Same cluster kernel with K read through image1d_buffer_t. The buffer
                 // path streams KV at ~22 GB/s while the GEMVs in the same graph reach
