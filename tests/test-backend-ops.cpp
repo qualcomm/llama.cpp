@@ -9058,6 +9058,31 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 262144, 1, k, {1, 1}, {1, 1}));
     }
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 151936, 1, 1536, {1, 1}, {1, 1}));
+    // q4_K vocab-scale lm_head at decode (Qwen3-4B: m=151936, k=2560) — exercises the
+    // tiled q4_K lm_head GEMV where enabled (multi-superblock K).
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 151936, 1, 2560, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 151936, 1, 2048, {1, 1}, {1, 1}));
+    // q4_K noshuffle VARIANT kernels at real model shapes (none of the suite's existing
+    // shapes reach them): cok fires at n in [2..8] on >=512x512 weights; mc3 at n==3;
+    // splitk at n==1 with m<=2560 (X2E default / env-forced elsewhere).
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 2048, 4, 2560, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 2048, 8, 2560, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 2048, 3, 2560, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 2048, 1, 2560, {1, 1}, {1, 1}));
+    // flat q6_K large-m OOB bracket: m=151936 sentinels, m=262144 passes — bound the pattern
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 131072, 1, 1536, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 152064, 1, 1536, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32,  49152, 1, 1536, {1, 1}, {1, 1}));
+    // odd-(m/128) probes for the ne01 % 256 == 128 OOB family (151936/128 = 1187 is odd)
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32,  49280, 1, 1536, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 151936, 1,  256, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 151936, 1, 2560, {1, 1}, {1, 1}));
+    // minimal tiled-GEMV probes (fire with GGML_OPENCL_{Q4K,Q6K}_GEMV_TILED=1):
+    // k=256 = single superblock, k=512 = the smallest multi-superblock case
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32,  32768, 1,  256, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32,  32768, 1,  512, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32,  32768, 1,  256, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32,  32768, 1,  512, {1, 1}, {1, 1}));
 
     // sycl backend will limit task global_range < MAX_INT
     // test case for f16-type-convert-to-fp32 kernel with large k under fp32 compute dtype (occurs in stable-diffusion)
