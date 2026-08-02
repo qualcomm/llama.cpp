@@ -10103,6 +10103,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 512, 5120, {128, 1}, {1, 1}));
 #endif
 
+    // Gated delta net ssm_out projection (m = 2560, k = 4096) as chunked prefill runs it:
+    // a 2-D weight against an activation with ne12 > 1, at n = 128 and 170. n = 1 takes a
+    // backend's GEMV path and n > 1 its GEMM path; both must honour the per-slice offsets.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32, 2560, 128, 4096, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32, 2560, 128, 4096, {1, 1}, {4, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32, 2560, 170, 4096, {1, 1}, {3, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2560,   1, 4096, {1, 1}, {4, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2560, 128, 4096, {1, 1}, {4, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2560, 170, 4096, {1, 1}, {3, 1}));
+
     for (ggml_type type_a : all_types) {
         for (int i = 1; i < 10; ++i) {
             test_cases.emplace_back(new test_mul_mat(type_a,    GGML_TYPE_F32, 16,  i, 1*256, { 1,  1}, {1, 1}));
@@ -10299,6 +10309,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 128, 45,  64, { 8,  1}, {4, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 1056, 1, 193, {1,  1}, {4, 1}, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 1056, 1, 67,  {1,  1}, {4, 1}, {0, 2, 1, 3}));
+    // gemma prefill KQV: f16 A (V, single head) x f32 B (probs, permuted/non-contiguous),
+    // large N and an 8:1 GQA broadcast. On Adreno this routes to the bespoke image KQV
+    // kernel, which reads B as a packed [D_B,N,K] buffer and so needs B packed first --
+    // exercise that path against the CPU reference (previously uncovered: the other
+    // permuted f16 cases have n < 32 and miss the KQV gate).
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 256, 256, 256, {1, 1}, {8, 1}, {0, 2, 1, 3}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 256, 256, 512, {1, 1}, {8, 1}, {0, 2, 1, 3}));
+    // prefill KQ at batchable N: f16 K view and f32 Q view, both permuted, GQA 2:1 (the
+    // Qwen3-0.6B shape). A kernel that reads the physical buffer of the permuted Q view is
+    // wrong if the dispatch repacks B to logical order, and the other permuted cases
+    // (n < 32) do not reach such a kernel.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 512, 512, 128, {8, 1}, {2, 1}, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 16, 32, 32, { 1,  1}, {1, 1}, {0, 1, 2, 3}, 64, 3));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 64, 77, 77, {12,1}, {1,1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 32, 4, 96, {3, 2}, {1, 1}, {0, 1, 2, 3}, 0, 1, true));
@@ -10360,6 +10382,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+
+    // Vocab-scale q6_K GEMV (tied lm_head / token_embd) at decode.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 151936, 1, 1536, {1, 1}, {1, 1}));
+#if 0
+    // m = 262144 heads at k = 1536 / 2560. Each needs well over 1 GB of host memory to
+    // initialise. Too slow to be enabled by default.
+    for (int64_t k : {1536, 2560}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 262144, 1, k, {1, 1}, {1, 1}));
+    }
+#endif
 
     // sycl backend will limit task global_range < MAX_INT
     // test case for f16-type-convert-to-fp32 kernel with large k under fp32 compute dtype (occurs in stable-diffusion)
