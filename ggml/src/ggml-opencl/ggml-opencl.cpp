@@ -6420,8 +6420,12 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
             // Same head-split probe for the GQA4 DK=128 program (Qwen3/Llama/
             // Mistral class), which sits at exactly 512 B/WI. MQ_GQA=2 across two
             // workgroups per KV head halves o_acc/m/l/slope. Opt-in.
+            // Default on; opt-out GGML_OPENCL_FA_HS_GQA4=0. Measured X2E +4.8%
+            // (Qwen3-4B) / +3.2% (Llama-3-8B), X1E +18.0%, A8X +61/+42/+33% on
+            // Qwen3-4B / Llama-3-8B / Mistral-7B; on the A8X it also makes FA-on
+            // beat FA-off on this shape for the first time.
             if (!fa_decode_only && dk == 128 && dv == 128 && backend_ctx->has_subgroup_shuffle &&
-                getenv("GGML_OPENCL_FA_HS_GQA4") != NULL) {
+                !(getenv("GGML_OPENCL_FA_HS_GQA4") && getenv("GGML_OPENCL_FA_HS_GQA4")[0] == '0')) {
                 const std::string opts_hs4 = opts +
                     " -D FA_MQ_ONLY -D MQ_GQA=2 -D MQ_NSG=2 -D MQ_NSG_SPLIT=2"
                     " -D FA_CL_C=16 -D FA_HEAD_SUB=2 -D FA_CL_MHRED=1";
