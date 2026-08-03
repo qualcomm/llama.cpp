@@ -23336,7 +23336,7 @@ static void ggml_cl_mul_mat_q8_0_f32_adreno(ggml_backend_t backend, const ggml_t
         // -0.7% on X1E, so absence of evidence is not treated as safe here.
         static const bool q8_splitk_env_set = []{
             const char * e = std::getenv("GGML_OPENCL_Q8_GEMV_SPLITK");
-            return e && e[0] != ' ';
+            return e && e[0] != '\0';
         }();
         static const bool q8_splitk_env_on = []{
             const char * e = std::getenv("GGML_OPENCL_Q8_GEMV_SPLITK");
