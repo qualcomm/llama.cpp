@@ -660,6 +660,7 @@ struct ggml_opencl_fa_kernels {
     // (quant-KV long-context, dense GQA4 DK=128 class). Opt-in FA_C8=1.
     std::map<std::pair<int, int>, cl_kernel> f32_q8_0_q1_vec_mq_split_c8;
     std::map<std::pair<int, int>, cl_kernel> f32_q8_0_q1_vec_mq_split_g8_c8;  // GQA8 cluster (dk=64)
+    std::map<std::pair<int, int>, cl_kernel> f32_f16_q1_vec_mq_split_g8_hs2;  // gqa8 via MQ_GQA=4 x 2 WGs
     std::map<std::pair<int, int>, cl_kernel> f32_q8_0;               // prefill (baseline)
     std::map<std::pair<int, int>, cl_kernel> f32_q8_0_split;         // N_SPLIT>1 variant
     std::map<std::pair<int, int>, int>       f32_q8_0_split_wg_size;        // wg_size = bm*n_split
@@ -6383,6 +6384,38 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
                     " -D FA_MQ_ONLY -D MQ_GQA=8 -D MQ_NSG=2 -D MQ_NSG_SPLIT=2 -D FA_CL_C=16"
                     " -D FA_CL_MASK_BCAST=1" +
                     (mhred_on ? " -D FA_CL_MHRED=1" : "");
+
+                // gqa=8 served by an MQ_GQA=4 kernel across two workgroups per KV
+                // head. Halves every per-lane per-head array (o_acc, m_i, l_i,
+                // slope) and doubles the grid; costs a 2x KV re-read, which is
+                // affordable while the kernel runs at ~34 GB/s against a measured
+                // 136 GB/s streaming floor. Probe for the "waves resident per CU"
+                // hypothesis -- register footprint is the only mechanism left after
+                // spill, workgroup count, MLP and load path were all falsified.
+                {
+                    const std::string opts_hs2 = opts +
+                        " -D FA_MQ_ONLY -D MQ_GQA=4 -D MQ_NSG=2 -D MQ_NSG_SPLIT=2"
+                        " -D FA_CL_C=16 -D FA_HEAD_SUB=2 -D FA_CL_MASK_BCAST=1" +
+                        (mhred_on ? " -D FA_CL_MHRED=1" : "");
+                    cl_program prog_hs2 = build_program_from_source_ex(
+                        backend_ctx->context, backend_ctx->device, src.c_str(), opts_hs2,
+                        /*fatal=*/false, "fa f32_f16 MQ_GQA=4 c16 dk64 headsub2",
+                        /*bin_size=*/0, backend_ctx->queue);
+                    if (prog_hs2) {
+                        cl_kernel k_hs2 = clCreateKernel(prog_hs2, "flash_attn_f32_f16_q1_vec_mq_split_c8", &err);
+                        if (err == CL_SUCCESS) {
+                            if (ggml_opencl_fa_kernel_fits_wg(backend_ctx, k_hs2, 128,
+                                                              "flash_attn_f32_f16_q1_vec_mq_split_c8 (hs2)", dk, dv)) {
+                                backend_ctx->fa.f32_f16_q1_vec_mq_split_g8_hs2[{dk, dv}] = k_hs2;
+                                ggml_opencl_log_fa_kernel_spill(backend_ctx, k_hs2,
+                                    "flash_attn_f32_f16_q1_vec_mq_split_g8_hs2", dk, dv);
+                            } else {
+                                clReleaseKernel(k_hs2);
+                            }
+                        }
+                        clReleaseProgram(prog_hs2);
+                    }
+                }
 
                 // Same cluster kernel with K read through image1d_buffer_t. The buffer
                 // path streams KV at ~22 GB/s while the GEMVs in the same graph reach
@@ -19795,6 +19828,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     bool use_fd_mq = false;
     bool use_ppb   = false;  // position-parallel block-softmax kernel (finer split)
     size_t fd_mq_wg = 256;  // MQ_GQA=4 kernel: Q1_WG_SIZE(64) * MQ_NSG_SPLIT(4)
+    int    fd_head_sub = 1; // workgroups per gqa group (FA_HEAD_SUB in the kernel)
     bool use_fa_k_img = false;  // K bound as image1d_buffer_t instead of (buf, offset)
     // MQ flash-decoding gate. Bypasses FD_MAX_DK because the MQ split kernel
     // uses NSG subgroups × 64 lanes, so o_acc is DV-split — no spill at DK=DV=256.
@@ -19849,6 +19883,13 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         // TBO + coherence). NOTE the per-gen quant preference differs: X2 is
         // BW-bound (q4_0 fastest), X1 is dequant-ALU-bound (q8_0 fastest).
         const bool c8_quant_on = (c8_env_state >= 0) ? (c8_env_state == 1) : c8_default_on;
+        // dk=64 gqa8 served by an MQ_GQA=4 kernel across two workgroups per KV
+        // head: private_mem 576 -> 368 B/WI and twice the grid. Default on;
+        // opt-out GGML_OPENCL_FA_HEAD_SUB=0.
+        static const bool head_sub_on = []{
+            const char * e = getenv("GGML_OPENCL_FA_HEAD_SUB");
+            return !(e && e[0] == '0');
+        }();
         // Minimum n_kv for the MQ (KV-sharing) decode routes. FD_MIN_N_KV is
         // tuned for the flash-decoding split, but the MQ kernels also buy a
         // gqa-fold of the KV reads, which pays below that: models with
@@ -19992,6 +20033,15 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
             // fallback on the 840: at DK_VEC=16 the mq kernel idles 75% of
             // each subgroup, and full lane utilization beats spill relief.
             // The C=16 cluster kernel below keeps every lane active instead.
+            } else if (nq1_only && is_mixed && gqa_ratio_dispatch == 8 &&
+                d_head_q == 64 && d_head_v == 64 &&
+                n_head == n_head_kv * 8 &&
+                head_sub_on &&
+                backend_ctx->fa.f32_f16_q1_vec_mq_split_g8_hs2.count({64, 64}) > 0) {
+                fd_k_split   = backend_ctx->fa.f32_f16_q1_vec_mq_split_g8_hs2.at({64, 64});
+                use_fd_mq    = true;
+                fd_mq_wg     = 128;
+                fd_head_sub  = 2;
             } else if (nq1_only && is_mixed && gqa_ratio_dispatch == 8 &&
                 d_head_q == 64 && d_head_v == 64 &&
                 n_head == n_head_kv * 8 &&
@@ -20520,7 +20570,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         // matches Q1_WG_SIZE * NSG (MQ_GQA=4 -> 256; MQ_GQA=8 -> 192)
         const size_t fd_wg = use_fd_mq ? fd_mq_wg : 64;
         const size_t fd_head_dim = use_fd_mq
-            ? (size_t)(n_head_kv * n_batch)
+            ? (size_t)(n_head_kv * fd_head_sub * n_batch)
             : (size_t)(n_head     * n_batch);
         size_t fd_lws[3] = { fd_wg, 1, 1 };
         // gid(2) packs q_idx * n_splits + split_idx.
