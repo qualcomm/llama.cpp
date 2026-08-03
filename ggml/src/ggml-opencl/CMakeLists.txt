@@ -63,6 +63,7 @@ endfunction()
 set(GGML_OPENCL_KERNELS
     add
     add_id
+    moe_add_id_glu
     argsort
     tri
     fill
@@ -153,6 +154,7 @@ set(GGML_OPENCL_KERNELS
     moe_reorder_b
     moe_combine
     moe_sort_by_expert
+    topk_moe
     mul_mm_f32_f32_l4_lm
     mul_mm_f16_f32_l4_lm
     mul_mm_q1_0_f32_l4_lm
