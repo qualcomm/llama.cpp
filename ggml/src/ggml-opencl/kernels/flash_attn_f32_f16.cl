@@ -2256,6 +2256,32 @@ __kernel void flash_attn_f32_f16_q1_vec_mq_split_c8(
 #endif
         const ACC_TYPE4 v_vec_1 = CONVERT_KV_ACC4(v_ptr[lic]);
 
+#if defined(FA_CL_MHRED) && MQ_GQA == 2 && FA_CL_C == 16
+        // Multi-head fused cluster reduce, MQ_GQA=2 form: 2 values per lane fold
+        // to 1 over 2 lanes (1 shuffle), three plain steps finish the 16-lane
+        // sum, 1 shuffle expands both heads back -- 5 instead of 2*log2(16)=8.
+        const int mh_b0 = lic & 1;
+
+        ACC_TYPE mh_p[MQ_GQA];
+        #pragma unroll
+        for (int h = 0; h < MQ_GQA; ++h) {
+            const ACC_TYPE4 d4 = mad(q_shared[h * DK_VEC + lic], k_vec_1, (ACC_TYPE4)(0.0f));
+            mh_p[h] = d4.s0 + d4.s1 + d4.s2 + d4.s3;
+        }
+        ACC_TYPE mh_r1 = (mh_b0 ? mh_p[1] : mh_p[0]) +
+                         sub_group_shuffle_xor(mh_b0 ? mh_p[0] : mh_p[1], 1);
+        mh_r1 += sub_group_shuffle_xor(mh_r1, 2);
+        mh_r1 += sub_group_shuffle_xor(mh_r1, 4);
+        mh_r1 += sub_group_shuffle_xor(mh_r1, 8);
+
+        ACC_TYPE mh_s[MQ_GQA];
+        {
+            const ACC_TYPE other = sub_group_shuffle_xor(mh_r1, 1);
+            mh_s[0] = mh_b0 ? other  : mh_r1;
+            mh_s[1] = mh_b0 ? mh_r1  : other;
+        }
+#endif
+
 #if defined(FA_CL_MHRED) && MQ_GQA == 4 && FA_CL_C == 16
         // Multi-head fused cluster reduce, MQ_GQA=4 form. Same halving butterfly
         // as the MQ_GQA=8 case: 4 values per lane fold to 1 over 4 lanes (2+1
@@ -2372,7 +2398,7 @@ __kernel void flash_attn_f32_f16_q1_vec_mq_split_c8(
 
         #pragma unroll
         for (int h = 0; h < MQ_GQA; ++h) {
-#if defined(FA_CL_MHRED) && (MQ_GQA == 8 || MQ_GQA == 4) && FA_CL_C == 16
+#if defined(FA_CL_MHRED) && (MQ_GQA == 8 || MQ_GQA == 4 || MQ_GQA == 2) && FA_CL_C == 16
             ACC_TYPE s = mh_s[h];
 #else
             const ACC_TYPE4 d4 = mad(q_shared[h * DK_VEC + lic], k_vec_1, (ACC_TYPE4)(0.0f));

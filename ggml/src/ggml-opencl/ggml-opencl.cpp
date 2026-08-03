@@ -661,6 +661,8 @@ struct ggml_opencl_fa_kernels {
     std::map<std::pair<int, int>, cl_kernel> f32_q8_0_q1_vec_mq_split_c8;
     std::map<std::pair<int, int>, cl_kernel> f32_q8_0_q1_vec_mq_split_g8_c8;  // GQA8 cluster (dk=64)
     std::map<std::pair<int, int>, cl_kernel> f32_f16_q1_vec_mq_split_g8_hs2;  // gqa8 via MQ_GQA=4 x 2 WGs
+    int fa_hs_wg  = 128;  // workgroup size of the head-split program
+    int fa_hs_sub = 2;    // FA_HEAD_SUB it was built with
     std::map<std::pair<int, int>, cl_kernel> f32_q8_0;               // prefill (baseline)
     std::map<std::pair<int, int>, cl_kernel> f32_q8_0_split;         // N_SPLIT>1 variant
     std::map<std::pair<int, int>, int>       f32_q8_0_split_wg_size;        // wg_size = bm*n_split
@@ -6376,6 +6378,21 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
                 // (bit-identical scores). Applied at this one build site, so
                 // every other program compiles the byte-exact original.
                 // Opt-out for diagnosis: GGML_OPENCL_FA_MHRED=0.
+                // Tuning knobs for the head-split program (defaults = shipped config).
+                static const int fa_head_sub_n = []{
+                    const char * e = std::getenv("GGML_OPENCL_FA_HEAD_SUB_N");
+                    const int v = (e && e[0]) ? atoi(e) : 2;
+                    return (v == 2 || v == 4) ? v : 2;
+                }();
+                // One subgroup per workgroup. The kernel has a barrier (Q staging),
+                // so WG=128 forces two waves co-resident on a CU; WG=64 lets the
+                // scheduler pack independent workgroups instead. +1.5/+2.1/+4.4%
+                // over MQ_NSG_SPLIT=2 at the same 368 B/WI.
+                static const int fa_hs_nsg = []{
+                    const char * e = std::getenv("GGML_OPENCL_FA_HS_NSG");
+                    const int v = (e && e[0]) ? atoi(e) : 1;
+                    return (v == 1 || v == 2) ? v : 1;
+                }();
                 static const bool mhred_on = []{
                     const char * e = std::getenv("GGML_OPENCL_FA_MHRED");
                     return !(e && e[0] == '0');
@@ -6394,8 +6411,11 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
                 // spill, workgroup count, MLP and load path were all falsified.
                 {
                     const std::string opts_hs2 = opts +
-                        " -D FA_MQ_ONLY -D MQ_GQA=4 -D MQ_NSG=2 -D MQ_NSG_SPLIT=2"
-                        " -D FA_CL_C=16 -D FA_HEAD_SUB=2 -D FA_CL_MASK_BCAST=1" +
+                        " -D FA_MQ_ONLY -D MQ_GQA=" + std::to_string(8 / fa_head_sub_n) +
+                        " -D MQ_NSG=" + std::to_string(fa_hs_nsg) +
+                        " -D MQ_NSG_SPLIT=" + std::to_string(fa_hs_nsg) +
+                        " -D FA_CL_C=16 -D FA_HEAD_SUB=" + std::to_string(fa_head_sub_n) +
+                        " -D FA_CL_MASK_BCAST=1" +
                         (mhred_on ? " -D FA_CL_MHRED=1" : "");
                     cl_program prog_hs2 = build_program_from_source_ex(
                         backend_ctx->context, backend_ctx->device, src.c_str(), opts_hs2,
@@ -6404,9 +6424,11 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
                     if (prog_hs2) {
                         cl_kernel k_hs2 = clCreateKernel(prog_hs2, "flash_attn_f32_f16_q1_vec_mq_split_c8", &err);
                         if (err == CL_SUCCESS) {
-                            if (ggml_opencl_fa_kernel_fits_wg(backend_ctx, k_hs2, 128,
+                            if (ggml_opencl_fa_kernel_fits_wg(backend_ctx, k_hs2, (size_t)(64 * fa_hs_nsg),
                                                               "flash_attn_f32_f16_q1_vec_mq_split_c8 (hs2)", dk, dv)) {
                                 backend_ctx->fa.f32_f16_q1_vec_mq_split_g8_hs2[{dk, dv}] = k_hs2;
+                                backend_ctx->fa.fa_hs_wg  = 64 * fa_hs_nsg;
+                                backend_ctx->fa.fa_hs_sub = fa_head_sub_n;
                                 ggml_opencl_log_fa_kernel_spill(backend_ctx, k_hs2,
                                     "flash_attn_f32_f16_q1_vec_mq_split_g8_hs2", dk, dv);
                             } else {
@@ -20040,8 +20062,8 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
                 backend_ctx->fa.f32_f16_q1_vec_mq_split_g8_hs2.count({64, 64}) > 0) {
                 fd_k_split   = backend_ctx->fa.f32_f16_q1_vec_mq_split_g8_hs2.at({64, 64});
                 use_fd_mq    = true;
-                fd_mq_wg     = 128;
-                fd_head_sub  = 2;
+                fd_mq_wg     = (size_t) backend_ctx->fa.fa_hs_wg;
+                fd_head_sub  = backend_ctx->fa.fa_hs_sub;
             } else if (nq1_only && is_mixed && gqa_ratio_dispatch == 8 &&
                 d_head_q == 64 && d_head_v == 64 &&
                 n_head == n_head_kv * 8 &&
