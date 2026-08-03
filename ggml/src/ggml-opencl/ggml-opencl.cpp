@@ -659,6 +659,7 @@ struct ggml_opencl_fa_kernels {
     // Cluster-parallel q8_0 decode, GQA=4 / NSG_SPLIT=2 / WG=128 program
     // (quant-KV long-context, dense GQA4 DK=128 class). Opt-in FA_C8=1.
     std::map<std::pair<int, int>, cl_kernel> f32_q8_0_q1_vec_mq_split_c8;
+    std::map<std::pair<int, int>, cl_kernel> f32_q8_0_q1_vec_mq_split_g8_c8;  // GQA8 cluster (dk=64)
     std::map<std::pair<int, int>, cl_kernel> f32_q8_0;               // prefill (baseline)
     std::map<std::pair<int, int>, cl_kernel> f32_q8_0_split;         // N_SPLIT>1 variant
     std::map<std::pair<int, int>, int>       f32_q8_0_split_wg_size;        // wg_size = bm*n_split
@@ -6070,7 +6071,19 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
     // (mq_split stays at the 512 B/WI boundary), -1..-2% on the X2E (its c8
     // kernel sits exactly AT the boundary and the packing state pushes it
     // over). Enable only where measured positive.
-    const bool fa_q8_int_qk = backend_ctx->adreno_gen == ADRENO_GPU_GEN::A8X;
+    // dp4a int-QK in the q8_0 decode FA kernels. Default A8X-only: it measured
+    // -1.3/-2.2% on X2-90, attributed at the time to the Q-packing state pushing
+    // the kernel past a 512 B/WI spill cliff. That mechanism is now in doubt (a
+    // 216 B/WI decode FA kernel measured 31x SLOWER than the 576 B cluster one),
+    // so keep it forceable either way for re-measurement.
+    static const int fa_q8_int_env = []{
+        const char * e = getenv("GGML_OPENCL_FA_Q8_INT_QK");
+        if (e == NULL || e[0] == 0) { return -1; }
+        return (e[0] != '0') ? 1 : 0;
+    }();
+    const bool fa_q8_int_qk = (fa_q8_int_env >= 0)
+        ? (fa_q8_int_env == 1)
+        : (backend_ctx->adreno_gen == ADRENO_GPU_GEN::A8X);
     const std::string opts_cl_c_gqa4 = fa_cl_c_gqa4
         ? " -D FA_CL_C=" + std::to_string(fa_cl_c_gqa4) : std::string();
     // The g8 (GQA8) program doubles the BASE width, never the f16 width — a
@@ -6661,6 +6674,33 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
                         }
                     }
                     clReleaseProgram(prog_c8_gqa4);
+                }
+            }
+            // Cluster-parallel q8_0 GQA8 decode kernel. gpt-oss-class shapes
+            // (dk=dv=64, gqa=8) had no q8_0 MQ route at all: every q8_0 gqa8 gate
+            // required dk=128, so quantizing the KV cache dropped the model from
+            // the C=16 f16 cluster kernel onto the spilled scalar q1_split. Same
+            // FA_CL_C as the f16 dk=64 program -- at DK_VEC=16 a width of 8 would
+            // double the per-lane o_acc for MQ_GQA=8.
+            if (is_q8 && dk == 64 && dv == 64 && backend_ctx->has_subgroup_shuffle) {
+                const std::string opts_q8_g8c16 = opts +
+                    " -D MQ_GQA=8 -D MQ_NSG=2 -D MQ_NSG_SPLIT=2 -D FA_CL_C=16" + opts_q8_int;
+                cl_program prog_q8_g8c16 = build_program_from_source_ex(
+                    backend_ctx->context, backend_ctx->device, src.c_str(), opts_q8_g8c16,
+                    /*fatal=*/false, "fa q8_0 c16 GQA8 dk64", /*bin_size=*/0, backend_ctx->queue);
+                if (prog_q8_g8c16) {
+                    cl_kernel k = clCreateKernel(prog_q8_g8c16, "flash_attn_f32_q8_0_q1_vec_mq_split_c8", &err);
+                    if (err == CL_SUCCESS) {
+                        if (ggml_opencl_fa_kernel_fits_wg(backend_ctx, k, 128,
+                                                          "flash_attn_f32_q8_0_q1_vec_mq_split_c8 (g8 c16)", dk, dv)) {
+                            backend_ctx->fa.f32_q8_0_q1_vec_mq_split_g8_c8[{dk, dv}] = k;
+                            ggml_opencl_log_fa_kernel_spill(backend_ctx, k,
+                                "flash_attn_f32_q8_0_q1_vec_mq_split_g8_c8", dk, dv);
+                        } else {
+                            clReleaseKernel(k);
+                        }
+                    }
+                    clReleaseProgram(prog_q8_g8c16);
                 }
             }
             // Cluster-parallel q4_0 decode kernel
@@ -19976,6 +20016,15 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
                 use_fd_mq  = true;
                 fd_mq_wg   = 192;
             // q8_0 KV — DK=DV=128 GQA=8 (Qwen3-30B-A3B q8 KV path); n_q==1 only for now
+            } else if (nq1_only && is_q8_0 && gqa_ratio_dispatch == 8 &&
+                d_head_q == 64 && d_head_v == 64 &&
+                n_head == n_head_kv * 8 &&
+                backend_ctx->fa.f32_q8_0_q1_vec_mq_split_g8_c8.count(dk_dv) > 0) {
+                // gpt-oss-class q8_0 KV: without this the model falls all the way
+                // back to the spilled scalar q1_split.
+                fd_k_split = backend_ctx->fa.f32_q8_0_q1_vec_mq_split_g8_c8.at(dk_dv);
+                use_fd_mq  = true;
+                fd_mq_wg   = 128;
             } else if (nq1_only && is_q8_0 && gqa_ratio_dispatch == 8 &&
                 d_head_q == 128 && d_head_v == 128 &&
                 backend_ctx->fa.f32_q8_0_q1_vec_mq_split_g8.count(dk_dv) > 0) {
