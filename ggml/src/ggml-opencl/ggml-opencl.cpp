@@ -23281,10 +23281,24 @@ static void ggml_cl_mul_mat_q8_0_f32_adreno(ggml_backend_t backend, const ggml_t
         // measures 48 GB/s where the M=2880/4096 projections in the same graph
         // reach 122. Mirrors the q4_0/q4_K split-K already in tree and reuses their
         // reduce kernel. Opt-out GGML_OPENCL_Q8_GEMV_SPLITK=0.
-        static const bool q8_splitk_on = []{
+        // Enabled where it is measured to win, mirroring the q4_K split-K gate.
+        // X2-90 (16 CU): +2.8% tg32 @d4096 on gpt-oss (K/V proj ne01=512 -> 8
+        // workgroups, half the device idle). Adreno 840 (12 CU): NEUTRAL on
+        // Llama-3.2-3B-Q8_0 (+0.5% @d0, 0.0% @d4096) -- its K/V proj is ne01=1024
+        // -> 16 workgroups, which already fills 12 CUs, so there is no under-fill
+        // to recover. Not measured on X1E/A7X/A6X; the q4_K split-K measured
+        // -0.7% on X1E, so absence of evidence is not treated as safe here.
+        static const bool q8_splitk_env_set = []{
+            const char * e = std::getenv("GGML_OPENCL_Q8_GEMV_SPLITK");
+            return e && e[0] != ' ';
+        }();
+        static const bool q8_splitk_env_on = []{
             const char * e = std::getenv("GGML_OPENCL_Q8_GEMV_SPLITK");
             return !(e && e[0] == '0');
         }();
+        const bool q8_splitk_on = q8_splitk_env_set
+            ? q8_splitk_env_on
+            : (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E);
         if (q8_splitk_on && backend_ctx->kernel_gemv_noshuffle_q8_0_f32_splitk &&
             ne01 <= 1024 && ne01 % 64 == 0) {
             const int    nsg    = 8;
