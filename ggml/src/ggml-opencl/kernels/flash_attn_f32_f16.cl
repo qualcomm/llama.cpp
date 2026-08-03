@@ -2038,6 +2038,10 @@ __kernel void flash_attn_f32_f16_q1_vec_mq_split(
 #ifndef FA_CL_C
 #define FA_CL_C 8
 #endif
+// Workgroups per gqa group (1 = one WG owns all MQ_GQA heads of a KV head).
+#ifndef FA_HEAD_SUB
+#define FA_HEAD_SUB 1
+#endif
 
 // The lane striping requires DK/DV to divide evenly across the cluster;
 // otherwise (e.g. DK=40 with FA_CL_C=16 -> zero-size arrays) compile the
@@ -2107,8 +2111,17 @@ __kernel void flash_attn_f32_f16_q1_vec_mq_split_c8(
     const int split_idx        = split_q_idx % n_splits;
     const int q_idx            = split_q_idx / n_splits;
 
-    const int batch_idx   = kvhead_batch_idx / n_head_kv;
-    const int head_kv_idx = kvhead_batch_idx % n_head_kv;
+    // FA_HEAD_SUB > 1 splits the gqa group across that many workgroups, so a
+    // gqa=8 model can run an MQ_GQA=4 kernel: half the per-head state per lane
+    // (o_acc, m_i, l_i, slope) and twice the grid, at the cost of reading each
+    // KV row FA_HEAD_SUB times. At FA_HEAD_SUB == 1 this is the original
+    // indexing exactly.
+    const int hgroups     = n_head_kv * FA_HEAD_SUB;
+    const int batch_idx   = kvhead_batch_idx / hgroups;
+    const int hg          = kvhead_batch_idx % hgroups;
+    const int head_kv_idx = hg / FA_HEAD_SUB;
+    const int head_sub    = hg % FA_HEAD_SUB;
+#define FA_HEAD_IDX(h) (head_kv_idx * (MQ_GQA * FA_HEAD_SUB) + head_sub * MQ_GQA + (h))
 
     const int kv_start = split_idx * kv_per_split;
     const int kv_end   = min(kv_start + kv_per_split, n_kv);
@@ -2119,7 +2132,7 @@ __kernel void flash_attn_f32_f16_q1_vec_mq_split_c8(
         if (tid == 0) {
             #pragma unroll
             for (int h = 0; h < MQ_GQA; ++h) {
-                const int head_idx = head_kv_idx * MQ_GQA + h;
+                const int head_idx = FA_HEAD_IDX(h);
                 const ulong rec_idx = ((((ulong) batch_idx * n_head + head_idx) * n_q + q_idx)
                                        * n_splits + split_idx);
                 global float * rec = partial_void + rec_idx * record_stride;
@@ -2141,7 +2154,7 @@ __kernel void flash_attn_f32_f16_q1_vec_mq_split_c8(
     for (int i = tid; i < MQ_GQA * DK_VEC; i += MQ_SPLIT_WG_SIZE) {
         const int h        = i / DK_VEC;
         const int k        = i % DK_VEC;
-        const int head_idx = head_kv_idx * MQ_GQA + h;
+        const int head_idx = FA_HEAD_IDX(h);
         const ulong q_row_offset = batch_idx * q_nb3 + head_idx * q_nb2 + (ulong) q_idx * q_nb1;
         const global Q_DATA_TYPE4 * q_ptr = (const global Q_DATA_TYPE4 *) (q_base + q_row_offset);
         q_shared[h * DK_VEC + k] = CONVERT_Q_ACC4(q_ptr[k]);
@@ -2151,7 +2164,7 @@ __kernel void flash_attn_f32_f16_q1_vec_mq_split_c8(
     float slope[MQ_GQA];
     #pragma unroll
     for (int h = 0; h < MQ_GQA; ++h) {
-        slope[h] = get_alibi_slope(max_bias, head_kv_idx * MQ_GQA + h, n_head_log2, m0, m1);
+        slope[h] = get_alibi_slope(max_bias, FA_HEAD_IDX(h), n_head_log2, m0, m1);
     }
 
 #ifdef FA_CL_MASK_BCAST
@@ -2176,7 +2189,7 @@ __kernel void flash_attn_f32_f16_q1_vec_mq_split_c8(
                                           (ulong) q_idx * mask_nb1;
         #pragma unroll
         for (int h = 0; h < MQ_GQA; ++h) {
-            const int head_idx      = head_kv_idx * MQ_GQA + h;
+            const int head_idx      = FA_HEAD_IDX(h);
             const int mask_head_idx = head_idx % mask_ne2;
             mask_base[h] = mask_base_b + mask_head_idx * mask_nb2;
         }
@@ -2242,20 +2255,165 @@ __kernel void flash_attn_f32_f16_q1_vec_mq_split_c8(
         const ACC_TYPE4 k_vec_1 = CONVERT_KV_ACC4(k_ptr[lic]);
 #endif
         const ACC_TYPE4 v_vec_1 = CONVERT_KV_ACC4(v_ptr[lic]);
+
+#if defined(FA_CL_MHRED) && MQ_GQA == 2 && FA_CL_C == 16
+        // Multi-head fused cluster reduce, MQ_GQA=2 form: 2 values per lane fold
+        // to 1 over 2 lanes (1 shuffle), three plain steps finish the 16-lane
+        // sum, 1 shuffle expands both heads back -- 5 instead of 2*log2(16)=8.
+        const int mh_b0 = lic & 1;
+
+        ACC_TYPE mh_p[MQ_GQA];
         #pragma unroll
         for (int h = 0; h < MQ_GQA; ++h) {
+            const ACC_TYPE4 d4 = mad(q_shared[h * DK_VEC + lic], k_vec_1, (ACC_TYPE4)(0.0f));
+            mh_p[h] = d4.s0 + d4.s1 + d4.s2 + d4.s3;
+        }
+        ACC_TYPE mh_r1 = (mh_b0 ? mh_p[1] : mh_p[0]) +
+                         sub_group_shuffle_xor(mh_b0 ? mh_p[0] : mh_p[1], 1);
+        mh_r1 += sub_group_shuffle_xor(mh_r1, 2);
+        mh_r1 += sub_group_shuffle_xor(mh_r1, 4);
+        mh_r1 += sub_group_shuffle_xor(mh_r1, 8);
+
+        ACC_TYPE mh_s[MQ_GQA];
+        {
+            const ACC_TYPE other = sub_group_shuffle_xor(mh_r1, 1);
+            mh_s[0] = mh_b0 ? other  : mh_r1;
+            mh_s[1] = mh_b0 ? mh_r1  : other;
+        }
+#endif
+
+#if defined(FA_CL_MHRED) && MQ_GQA == 4 && FA_CL_C == 16
+        // Multi-head fused cluster reduce, MQ_GQA=4 form. Same halving butterfly
+        // as the MQ_GQA=8 case: 4 values per lane fold to 1 over 4 lanes (2+1
+        // shuffles), two plain steps finish the 16-lane sum, and 3 shuffles
+        // expand every head back to every lane -- 8 instead of MQ_GQA*log2(C)=16.
+        // Rounds run in increasing xor distance, so each head's summation tree is
+        // pairwise identical to the per-head butterfly's and the scores are
+        // bit-identical.
+        const int mh_b0 = lic & 1;
+        const int mh_b1 = lic & 2;
+
+        ACC_TYPE mh_p[MQ_GQA];
+        #pragma unroll
+        for (int h = 0; h < MQ_GQA; ++h) {
+            const ACC_TYPE4 d4 = mad(q_shared[h * DK_VEC + lic], k_vec_1, (ACC_TYPE4)(0.0f));
+            mh_p[h] = d4.s0 + d4.s1 + d4.s2 + d4.s3;
+        }
+
+        ACC_TYPE mh_r2[2];
+        #pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            const ACC_TYPE keep = mh_b0 ? mh_p[j + 2] : mh_p[j];
+            const ACC_TYPE send = mh_b0 ? mh_p[j]     : mh_p[j + 2];
+            mh_r2[j] = keep + sub_group_shuffle_xor(send, 1);
+        }
+        ACC_TYPE mh_r1 = (mh_b1 ? mh_r2[1] : mh_r2[0]) +
+                         sub_group_shuffle_xor(mh_b1 ? mh_r2[0] : mh_r2[1], 2);
+        mh_r1 += sub_group_shuffle_xor(mh_r1, 4);
+        mh_r1 += sub_group_shuffle_xor(mh_r1, 8);
+
+        ACC_TYPE mh_e2[2];
+        {
+            const ACC_TYPE other = sub_group_shuffle_xor(mh_r1, 2);
+            mh_e2[0] = mh_b1 ? other  : mh_r1;
+            mh_e2[1] = mh_b1 ? mh_r1  : other;
+        }
+        ACC_TYPE mh_s[MQ_GQA];
+        #pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            const ACC_TYPE other = sub_group_shuffle_xor(mh_e2[j], 1);
+            mh_s[j]     = mh_b0 ? other     : mh_e2[j];
+            mh_s[j + 2] = mh_b0 ? mh_e2[j]  : other;
+        }
+#endif
+
+#if defined(FA_CL_MHRED) && MQ_GQA == 8 && FA_CL_C == 16
+        // Multi-head fused cluster reduce.
+        //
+        // The per-head loop below runs MQ_GQA independent all-reduces over
+        // FA_CL_C lanes = MQ_GQA * log2(FA_CL_C) = 32 shuffles per KV row,
+        // against 16 bytes of KV read. Folding them into one halving butterfly
+        // -- each round halves the values a lane carries while doubling the
+        // lane span -- costs 4+2+1+1 = 8 shuffles to reduce to one head per
+        // lane and 1+2+4 = 7 to expand every head back to every lane: 15
+        // instead of 32.
+        //
+        // The rounds run in INCREASING xor distance so each head's summation
+        // tree is pairwise identical to the per-head butterfly's (distance 1,
+        // then 2, 4, 8). Same operand order => bit-identical scores, not just
+        // mathematically equivalent ones.
+        const int mh_b0 = lic & 1;
+        const int mh_b1 = lic & 2;
+        const int mh_b2 = lic & 4;
+
+        ACC_TYPE mh_p[MQ_GQA];
+        #pragma unroll
+        for (int h = 0; h < MQ_GQA; ++h) {
+            const ACC_TYPE4 d4 = mad(q_shared[h * DK_VEC + lic], k_vec_1, (ACC_TYPE4)(0.0f));
+            mh_p[h] = d4.s0 + d4.s1 + d4.s2 + d4.s3;
+        }
+
+        // Reduce 8 -> 4 -> 2 -> 1 values per lane, then one plain step to close
+        // the distance-8 pair, whose two lanes hold the same head.
+        ACC_TYPE mh_r4[4];
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const ACC_TYPE keep = mh_b0 ? mh_p[j + 4] : mh_p[j];
+            const ACC_TYPE send = mh_b0 ? mh_p[j]     : mh_p[j + 4];
+            mh_r4[j] = keep + sub_group_shuffle_xor(send, 1);
+        }
+        ACC_TYPE mh_r2[2];
+        #pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            const ACC_TYPE keep = mh_b1 ? mh_r4[j + 2] : mh_r4[j];
+            const ACC_TYPE send = mh_b1 ? mh_r4[j]     : mh_r4[j + 2];
+            mh_r2[j] = keep + sub_group_shuffle_xor(send, 2);
+        }
+        ACC_TYPE mh_r1 = (mh_b2 ? mh_r2[1] : mh_r2[0]) +
+                         sub_group_shuffle_xor(mh_b2 ? mh_r2[0] : mh_r2[1], 4);
+        mh_r1 += sub_group_shuffle_xor(mh_r1, 8);
+
+        // Expand: mirror the reduce, doubling the values a lane carries.
+        ACC_TYPE mh_e2[2];
+        {
+            const ACC_TYPE other = sub_group_shuffle_xor(mh_r1, 4);
+            mh_e2[0] = mh_b2 ? other : mh_r1;
+            mh_e2[1] = mh_b2 ? mh_r1 : other;
+        }
+        ACC_TYPE mh_e4[4];
+        #pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            const ACC_TYPE other = sub_group_shuffle_xor(mh_e2[j], 2);
+            mh_e4[j]     = mh_b1 ? other    : mh_e2[j];
+            mh_e4[j + 2] = mh_b1 ? mh_e2[j] : other;
+        }
+        ACC_TYPE mh_s[MQ_GQA];
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const ACC_TYPE other = sub_group_shuffle_xor(mh_e4[j], 1);
+            mh_s[j]     = mh_b0 ? other    : mh_e4[j];
+            mh_s[j + 4] = mh_b0 ? mh_e4[j] : other;
+        }
+#endif
+
+        #pragma unroll
+        for (int h = 0; h < MQ_GQA; ++h) {
+#if defined(FA_CL_MHRED) && (MQ_GQA == 8 || MQ_GQA == 4 || MQ_GQA == 2) && FA_CL_C == 16
+            ACC_TYPE s = mh_s[h];
+#else
             const ACC_TYPE4 d4 = mad(q_shared[h * DK_VEC + lic], k_vec_1, (ACC_TYPE4)(0.0f));
             ACC_TYPE s = d4.s0 + d4.s1 + d4.s2 + d4.s3;
             #pragma unroll
             for (int step = 1; step < FA_CL_C; step <<= 1) {
                 s += sub_group_shuffle_xor(s, step);
             }
+#endif
             s *= scale;
 #ifdef FA_CL_MASK_BCAST
             if (mask_bcast) {
                 s += slope[h] * mask_val;
             } else if (mask_base_b != NULL) {
-                const int mask_head_idx = (head_kv_idx * MQ_GQA + h) % mask_ne2;
+                const int mask_head_idx = (FA_HEAD_IDX(h)) % mask_ne2;
                 const global MASK_DATA_TYPE * mask_ptr =
                     (const global MASK_DATA_TYPE *) (mask_base_b + mask_head_idx * mask_nb2);
                 s += slope[h] * (ACC_TYPE) mask_ptr[k_safe];
@@ -2310,7 +2468,7 @@ __kernel void flash_attn_f32_f16_q1_vec_mq_split_c8(
             if (mask_bcast) {
                 s += slope[h] * mask_val;
             } else if (mask_base_b != NULL) {
-                const int mask_head_idx = (head_kv_idx * MQ_GQA + h) % mask_ne2;
+                const int mask_head_idx = (FA_HEAD_IDX(h)) % mask_ne2;
                 const global MASK_DATA_TYPE * mask_ptr =
                     (const global MASK_DATA_TYPE *) (mask_base_b + mask_head_idx * mask_nb2);
                 s += slope[h] * (ACC_TYPE) mask_ptr[k_safe];
@@ -2411,7 +2569,7 @@ __kernel void flash_attn_f32_f16_q1_vec_mq_split_c8(
         barrier(CLK_LOCAL_MEM_FENCE);
 
         if (sgid == 0) {
-            const int head_idx = head_kv_idx * MQ_GQA + h;
+            const int head_idx = FA_HEAD_IDX(h);
 
             ACC_TYPE m_c = sg_m[h][0];
             #pragma unroll
@@ -2475,6 +2633,7 @@ __kernel void flash_attn_f32_f16_q1_vec_mq_split_c8(
 // Requires DV_VEC == DK_VEC == FA_SG (DK=DV=128, FA_SG=32). Env-gated in host.
 #if defined(HAS_SUBGROUP_SHUFFLE) && (DV_VEC == FA_SG) && (DK_VEC == FA_SG)
 REQD_FA_SG
+#undef FA_HEAD_IDX
 __kernel void flash_attn_f32_f16_q1_ppb(
     const global void * q_void, ulong q_offset,
     const global void * k_void, ulong k_offset,
