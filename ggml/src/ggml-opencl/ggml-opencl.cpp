@@ -6417,13 +6417,18 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
             // Lighter than the fallback too (840: 784 vs 912 B/WI).
             // The plain mq_split was measured -48% here (48/64 lanes idle) -
             // the cluster layout is the only MQ shape that fits dk=64.
-            // Same head-split probe for the GQA4 DK=128 program (Qwen3/Llama/
+            // Same head split for the GQA4 DK=128 program (Qwen3/Llama/
             // Mistral class), which sits at exactly 512 B/WI. MQ_GQA=2 across two
-            // workgroups per KV head halves o_acc/m/l/slope. Opt-in.
+            // workgroups per KV head halves o_acc/m/l/slope.
             // Default on; opt-out GGML_OPENCL_FA_HS_GQA4=0. Measured X2E +4.8%
             // (Qwen3-4B) / +3.2% (Llama-3-8B), X1E +18.0%, A8X +61/+42/+33% on
             // Qwen3-4B / Llama-3-8B / Mistral-7B; on the A8X it also makes FA-on
             // beat FA-off on this shape for the first time.
+            // No device gate is needed because those three families are the only
+            // ones that reach this dispatch: A7X declines every mixed and
+            // quantized FA combination above (compiler SIGSEGV) and E17 declines
+            // FLASH_ATTN_EXT outright, so the kernel is unreachable on the 740
+            // and the 850 -- both confirmed on device.
             if (!fa_decode_only && dk == 128 && dv == 128 && backend_ctx->has_subgroup_shuffle &&
                 !(getenv("GGML_OPENCL_FA_HS_GQA4") && getenv("GGML_OPENCL_FA_HS_GQA4")[0] == '0')) {
                 const std::string opts_hs4 = opts +
