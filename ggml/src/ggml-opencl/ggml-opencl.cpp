@@ -661,6 +661,7 @@ struct ggml_opencl_fa_kernels {
     std::map<std::pair<int, int>, cl_kernel> f32_q8_0_q1_vec_mq_split_c8;
     std::map<std::pair<int, int>, cl_kernel> f32_q8_0_q1_vec_mq_split_g8_c8;  // GQA8 cluster (dk=64)
     std::map<std::pair<int, int>, cl_kernel> f32_f16_q1_vec_mq_split_g8_hs2;  // gqa8 via MQ_GQA=4 x 2 WGs
+    std::map<std::pair<int, int>, cl_kernel> f32_f16_q1_vec_mq_split_gqa4_hs2;  // gqa4 via MQ_GQA=2 x 2 WGs
     int fa_hs_wg  = 128;  // workgroup size of the head-split program
     int fa_hs_sub = 2;    // FA_HEAD_SUB it was built with
     std::map<std::pair<int, int>, cl_kernel> f32_q8_0;               // prefill (baseline)
@@ -6416,6 +6417,33 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
             // Lighter than the fallback too (840: 784 vs 912 B/WI).
             // The plain mq_split was measured -48% here (48/64 lanes idle) -
             // the cluster layout is the only MQ shape that fits dk=64.
+            // Same head-split probe for the GQA4 DK=128 program (Qwen3/Llama/
+            // Mistral class), which sits at exactly 512 B/WI. MQ_GQA=2 across two
+            // workgroups per KV head halves o_acc/m/l/slope. Opt-in.
+            if (!fa_decode_only && dk == 128 && dv == 128 && backend_ctx->has_subgroup_shuffle &&
+                getenv("GGML_OPENCL_FA_HS_GQA4") != NULL) {
+                const std::string opts_hs4 = opts +
+                    " -D FA_MQ_ONLY -D MQ_GQA=2 -D MQ_NSG=2 -D MQ_NSG_SPLIT=2"
+                    " -D FA_CL_C=16 -D FA_HEAD_SUB=2 -D FA_CL_MHRED=1";
+                cl_program prog_hs4 = build_program_from_source_ex(
+                    backend_ctx->context, backend_ctx->device, src.c_str(), opts_hs4,
+                    /*fatal=*/false, "fa f32_f16 MQ_GQA=2 c16 dk128 headsub2",
+                    /*bin_size=*/0, backend_ctx->queue);
+                if (prog_hs4) {
+                    cl_kernel k = clCreateKernel(prog_hs4, "flash_attn_f32_f16_q1_vec_mq_split_c8", &err);
+                    if (err == CL_SUCCESS) {
+                        if (ggml_opencl_fa_kernel_fits_wg(backend_ctx, k, 128,
+                                                          "flash_attn_f32_f16_q1_vec_mq_split_c8 (hs gqa4)", dk, dv)) {
+                            backend_ctx->fa.f32_f16_q1_vec_mq_split_gqa4_hs2[{dk, dv}] = k;
+                            ggml_opencl_log_fa_kernel_spill(backend_ctx, k,
+                                "flash_attn_f32_f16_q1_vec_mq_split_gqa4_hs2", dk, dv);
+                        } else {
+                            clReleaseKernel(k);
+                        }
+                    }
+                    clReleaseProgram(prog_hs4);
+                }
+            }
             if (!fa_decode_only && dk == 64 && dv == 64 && backend_ctx->has_subgroup_shuffle) {
                 // Fold the 8 per-head cluster butterflies into one halving
                 // butterfly: 15 shuffles per KV row instead of 32, with the
@@ -6556,7 +6584,17 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
             // registered (some other device) or shuffles are absent.
             if (!fa_decode_only && backend_ctx->has_subgroup_shuffle &&
                 backend_ctx->fa.f32_f16_q1_vec_mq_split_c8.count({dk, dv}) == 0) {
-                const std::string opts_c8_ns2 = opts + " -D FA_MQ_ONLY -D MQ_GQA=4 -D MQ_NSG=2 -D MQ_NSG_SPLIT=2" + opts_cl_c_gqa4;
+                // Fused multi-head cluster reduce for the GQA4 program too: at
+                // DK=128 the cluster kernel sits at exactly 512 B/WI and spends
+                // MQ_GQA*log2(FA_CL_C)=16 shuffles per KV row; the halving
+                // butterfly does it in 8, bit-identically. Opt-out shares the
+                // dk=64 knob.
+                static const bool mhred_gqa4_on = []{
+                    const char * e = std::getenv("GGML_OPENCL_FA_MHRED");
+                    return !(e && e[0] == '0');
+                }();
+                const std::string opts_c8_ns2 = opts + " -D FA_MQ_ONLY -D MQ_GQA=4 -D MQ_NSG=2 -D MQ_NSG_SPLIT=2" + opts_cl_c_gqa4 +
+                    (mhred_gqa4_on ? " -D FA_CL_MHRED=1" : "");
                 cl_program prog_c8 = build_program_from_source_ex(
                     backend_ctx->context, backend_ctx->device, src.c_str(), opts_c8_ns2,
                     /*fatal=*/false, "fa f32_f16 c8 NSG2", /*bin_size=*/0, backend_ctx->queue);
@@ -20347,6 +20385,14 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
                 fd_k_split = backend_ctx->fa.f32_f16_q1_local_mq_split.at(dk_dv);
                 use_fd_mq  = true;
                 fd_mq_wg   = 64;
+            } else if (nq1_only && is_mixed && gqa_ratio_dispatch == 4 &&
+                d_head_q == 128 && d_head_v == 128 &&
+                n_head == n_head_kv * 4 &&
+                backend_ctx->fa.f32_f16_q1_vec_mq_split_gqa4_hs2.count(dk_dv) > 0) {
+                fd_k_split  = backend_ctx->fa.f32_f16_q1_vec_mq_split_gqa4_hs2.at(dk_dv);
+                use_fd_mq   = true;
+                fd_mq_wg    = 128;
+                fd_head_sub = 2;
             } else if (nq1_only && is_mixed && gqa_ratio_dispatch == 4 &&
                 ((d_head_q == 256 && d_head_v == 256) ||
                  (d_head_q == 128 && d_head_v == 128)) &&

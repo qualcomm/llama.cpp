@@ -2455,14 +2455,58 @@ __kernel void flash_attn_f32_f16_q1_vec_mq_split_c8(
         }
 
         // Cluster-reduce (xor steps < FA_CL_C stay inside the cluster) + score.
+#if defined(FA_CL_MHRED) && MQ_GQA == 4 && FA_CL_C == 16
+        // Same halving butterfly as the FA_CL_DK==1 path, but fed from the
+        // multi-quartet dot accumulator, so it also covers DK=128 (FA_CL_DK=2)
+        // where that fast path does not apply. 8 shuffles per KV row instead of
+        // MQ_GQA*log2(FA_CL_C)=16, rounds in increasing xor distance so each
+        // head's summation tree — and therefore the score — is unchanged.
+        const int mh_b0 = lic & 1;
+        const int mh_b1 = lic & 2;
+
+        ACC_TYPE mh_p[MQ_GQA];
+        #pragma unroll
+        for (int h = 0; h < MQ_GQA; ++h) {
+            mh_p[h] = dot4[h].s0 + dot4[h].s1 + dot4[h].s2 + dot4[h].s3;
+        }
+        ACC_TYPE mh_r2[2];
+        #pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            const ACC_TYPE keep = mh_b0 ? mh_p[j + 2] : mh_p[j];
+            const ACC_TYPE send = mh_b0 ? mh_p[j]     : mh_p[j + 2];
+            mh_r2[j] = keep + sub_group_shuffle_xor(send, 1);
+        }
+        ACC_TYPE mh_r1 = (mh_b1 ? mh_r2[1] : mh_r2[0]) +
+                         sub_group_shuffle_xor(mh_b1 ? mh_r2[0] : mh_r2[1], 2);
+        mh_r1 += sub_group_shuffle_xor(mh_r1, 4);
+        mh_r1 += sub_group_shuffle_xor(mh_r1, 8);
+
+        ACC_TYPE mh_e2[2];
+        {
+            const ACC_TYPE other = sub_group_shuffle_xor(mh_r1, 2);
+            mh_e2[0] = mh_b1 ? other : mh_r1;
+            mh_e2[1] = mh_b1 ? mh_r1 : other;
+        }
+        ACC_TYPE mh_sg[MQ_GQA];
+        #pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            const ACC_TYPE other = sub_group_shuffle_xor(mh_e2[j], 1);
+            mh_sg[j]     = mh_b0 ? other     : mh_e2[j];
+            mh_sg[j + 2] = mh_b0 ? mh_e2[j]  : other;
+        }
+#endif
         ACC_TYPE score[MQ_GQA];
         #pragma unroll
         for (int h = 0; h < MQ_GQA; ++h) {
+#if defined(FA_CL_MHRED) && MQ_GQA == 4 && FA_CL_C == 16
+            ACC_TYPE s = mh_sg[h];
+#else
             ACC_TYPE s = dot4[h].s0 + dot4[h].s1 + dot4[h].s2 + dot4[h].s3;
             #pragma unroll
             for (int step = 1; step < FA_CL_C; step <<= 1) {
                 s += sub_group_shuffle_xor(s, step);
             }
+#endif
             s *= scale;
 #ifdef FA_CL_MASK_BCAST
             if (mask_bcast) {
