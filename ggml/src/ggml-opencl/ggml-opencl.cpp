@@ -22228,6 +22228,26 @@ static void ggml_cl_mul_mat_kq_kqv_adreno(ggml_backend_t backend, const ggml_ten
 
     GGML_ASSERT(ne00 == ne10);
 
+    // Which of the two kernels served a given shape is not observable from
+    // outside: both produce a plausible result for an attention shape, and one
+    // of them did serve KQ at n_head_kv == 1 for as long as the split was
+    // inferred from strides. Print it once per distinct shape under
+    // GGML_OPENCL_KQKV_TRACE=1, so a routing claim can be checked instead of
+    // reasoned about.
+    static const bool kqkv_trace = ggml_cl_env_flag("GGML_OPENCL_KQKV_TRACE");
+    if (kqkv_trace) {
+        static std::set<std::string> traced;
+        char line[256];
+        snprintf(line, sizeof(line),
+                 "%-3s A=[%d,%d,%d] nb01=%llu nb02=%llu B=[%d,%d,%d] N=%d",
+                 is_kq ? "kq" : "kqv", ne00, ne01, ne02,
+                 (unsigned long long) nb01, (unsigned long long) nb02,
+                 ne10, ne11, ne12, ne1);
+        if (traced.insert(line).second) {
+            GGML_LOG_INFO("ggml_opencl: kqkv dispatch %s\n", line);
+        }
+    }
+
     cl_kernel kernel;
     cl_context context = backend_ctx->context;
 
