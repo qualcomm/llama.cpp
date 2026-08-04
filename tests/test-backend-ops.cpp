@@ -9709,6 +9709,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32,   8, 1, 1, false, false, /*K=*/3));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  16, 2, 1, false, false, /*K=*/4));
 
+    // Decode-shaped FLASH_ATTN_EXT for gemma-4-26B's two attention shapes, neither
+    // of which any case in this suite reached: head size 256 at GQA ratio 2 (25 of
+    // its 30 layers) and head size 512 at ratio 8 (the other 5). Ratio 2 in
+    // particular had no coverage at any head size, so a backend that special-cases
+    // decode attention per (head size, ratio) could silently have no path for it.
+    // kv=4099 exercises the non-multiple tail.
+    for (int kv : { 4096, 4099 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 8, {2, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 8, {2, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, {8, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    }
+
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging
     test_cases.emplace_back(new test_llama(2, true));
