@@ -22196,7 +22196,14 @@ static void ggml_cl_conv_2d(ggml_backend_t backend, const ggml_tensor * src0, co
     backend_ctx->enqueue_ndrange_kernel(kernel, 2, global_work_size, local_work_size, dst);
 }
 
-static void ggml_cl_mul_mat_kq_kqv_adreno(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+// is_kq selects which of the two products this call is, and it is decided by the
+// CALLER -- the two admission arms in ggml_cl_mul_mat, each of which knows which
+// one it matched. It used to be re-derived here from nb01 > nb02, i.e. "K is
+// head-major, V^T is not". That discriminator COLLAPSES at n_head_kv == 1, where
+// the two strides are equal because there is only one head to order, so a KQ
+// arrived here and was served as a KQV. Nothing downstream can tell them apart
+// either, so the choice has to be passed in rather than inferred.
+static void ggml_cl_mul_mat_kq_kqv_adreno(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, bool is_kq) {
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
 
     ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *)src0->extra;
@@ -22238,13 +22245,8 @@ static void ggml_cl_mul_mat_kq_kqv_adreno(ggml_backend_t backend, const ggml_ten
     int N = ne1;
     int K = ne00;
 
-    if (nb01 > nb02) {
-        // KQ
-        kernel = backend_ctx->kernel_mul_mm_f16_f32_kq;
-    } else {
-        // KQV
-        kernel = backend_ctx->kernel_mul_mm_f16_f32_kqv;
-    }
+    kernel = is_kq ? backend_ctx->kernel_mul_mm_f16_f32_kq
+                   : backend_ctx->kernel_mul_mm_f16_f32_kqv;
     // create sub-buffer for A
     // <--------------------------------------------> //
     extra0 = src0->view_src ? (ggml_tensor_extra_cl *)src0->view_src->extra : (ggml_tensor_extra_cl *)src0->extra;
@@ -22253,7 +22255,7 @@ static void ggml_cl_mul_mat_kq_kqv_adreno(ggml_backend_t backend, const ggml_ten
     // stream inside it. Dropping it makes every sequence read stream 0's cache: correct for
     // a single stream (offset 0), silently wrong for any multi-sequence server.
     region.origin = extra0->offset + src0->view_offs;
-    if (nb01 > nb02) {
+    if (is_kq) {
         // KQ
         region.size = nb01 * ne01;
     } else {
@@ -22284,7 +22286,7 @@ static void ggml_cl_mul_mat_kq_kqv_adreno(ggml_backend_t backend, const ggml_ten
     //     new overhead versus the path it replaces.
     cl_mem   b_data_device = extra1->data_device;
     cl_ulong b_origin      = extra1->offset + src1->view_offs;
-    if (nb01 <= nb02 && !ggml_is_contiguous(src1)) {
+    if (!is_kq && !ggml_is_contiguous(src1)) {
         // KQV only -- never repack B for KQ.
         backend_ctx->prealloc_src1.allocate(backend_ctx->context, ggml_nbytes(src1));
         cl_ulong cnb0, cnb1, cnb2, cnb3;
@@ -22302,7 +22304,7 @@ static void ggml_cl_mul_mat_kq_kqv_adreno(ggml_backend_t backend, const ggml_ten
     img_fmt_1d = {CL_RGBA, CL_FLOAT};
     memset(&img_desc_1d, 0, sizeof(img_desc_1d));
     img_desc_1d.image_type = CL_MEM_OBJECT_IMAGE1D_BUFFER;
-    if (nb01 > nb02) {
+    if (is_kq) {
         img_desc_1d.image_width = (nb01 * ne01 / 4)/4;
     }
     else {
@@ -26946,7 +26948,21 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                                      (nb02 == (cl_ulong)ne00 * ggml_type_size(src0t));
             const bool kq_packed_b = (nb11 == (cl_ulong)ne10 * ne12 * ggml_type_size(src1t)) &&
                                      (nb12 == (cl_ulong)ne10 * ggml_type_size(src1t));
-            if (ggml_is_permuted(src0) && ggml_is_permuted(src1) &&
+            //
+            // ggml_is_permuted(src0) stood in for "K is head-major", but it is
+            // only a proxy and it COLLAPSES at n_head_kv == 1: with a single
+            // head there is no head stride to be out of order, so nb01 == nb02
+            // and the view reports itself unpermuted (gemma-4 E2B). The packed
+            // check above is the actual contract the kernel needs -- it pins
+            // both strides exactly -- so require permutedness only where there
+            // is more than one head for it to mean anything.
+            //
+            // Default on; GGML_OPENCL_KQ_NHEAD_KV1=0 restores the old proxy so
+            // the two routings can be compared in one binary.
+            static const char * kq_nhkv1_env = getenv("GGML_OPENCL_KQ_NHEAD_KV1");
+            static const bool   kq_nhkv1_on  =
+                (kq_nhkv1_env == nullptr || kq_nhkv1_env[0] != '0');
+            if ((ggml_is_permuted(src0) || (ne02 == 1 && kq_nhkv1_on)) && ggml_is_permuted(src1) &&
                 kq_packed_a && kq_packed_b &&
                 ((nb01 * ne01 / 4)/4 <= backend_ctx->image_max_buffer_size) &&
                 nb00 <= nb02 &&
@@ -26955,14 +26971,15 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 nb10 <= nb12 &&
                 nb12 <= nb11 &&
                 nb11 <= nb13) {
-                ggml_cl_mul_mat_kq_kqv_adreno(backend, src0, src1, dst);
+                ggml_cl_mul_mat_kq_kqv_adreno(backend, src0, src1, dst, /*is_kq =*/ true);
                 return;
             }
             // For KQV. The bespoke image KQV kernel addresses A (V) through the actual
-            // nb01/nb02 strides and the internal KQ/KQV split keys off nb01 <= nb02, so a
-            // contiguous V (nb01 < nb02, e.g. Qwen3) is handled identically to a permuted
-            // view -- gate on the KQV shape (nb01 <= nb02), not on non-contiguity, so the
-            // contiguous case stops falling to the pathological generic f16 mul_mm.
+            // nb01/nb02 strides, so a contiguous V (nb01 < nb02, e.g. Qwen3) is handled
+            // identically to a permuted view -- gate on the KQV shape (nb01 <= nb02), not
+            // on non-contiguity, so the contiguous case stops falling to the pathological
+            // generic f16 mul_mm. Reaching this arm is what makes the op a KQV; the callee
+            // is told so explicitly rather than re-deriving it from the same strides.
             //
             // Layout admission: the KQV kernel receives only nb01 and walks A with a
             // per-head stride of nb01*ne01, so only layouts where that walk is correct
@@ -26976,8 +26993,8 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             // into scratch by the dispatch first -- a copy the generic l4_lm fallback
             // pays anyway. That routing is guarded by GGML_OPENCL_KQV_SRC1_COPY
             // (default on) so an A/B can restore the old "contiguous-src1 only"
-            // routing in one binary. The KQ path (nb01 > nb02, sibling gate above) is
-            // NOT affected: its kernel wants the raw physical buffer of the permuted Q
+            // routing in one binary. The KQ path (the sibling gate above) is NOT
+            // affected: its kernel wants the raw physical buffer of the permuted Q
             // view, and the dispatch never repacks B for it.
             static const char * kqv_src1_copy_env = getenv("GGML_OPENCL_KQV_SRC1_COPY");
             static const bool   kqv_src1_copy_on  =
@@ -26985,7 +27002,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             if (nb01 <= nb02 && (ggml_is_contiguous(src1) || kqv_src1_copy_on) &&
                 (ne02 == 1 || nb02 == nb01 * ne01) &&
                 ((nb01 * ne01 * ne02 / 4)/4 <= backend_ctx->image_max_buffer_size)) {
-                ggml_cl_mul_mat_kq_kqv_adreno(backend, src0, src1, dst);
+                ggml_cl_mul_mat_kq_kqv_adreno(backend, src0, src1, dst, /*is_kq =*/ false);
                 return;
             }
         }
