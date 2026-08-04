@@ -973,14 +973,20 @@ struct ggml_backend_opencl_context {
             return;
         }
 
-        fprintf(fperf, "op name, kernel name, exec duration (ms), global size, local size, output size\n");
+        // The absolute timestamps are what makes the non-kernel time attributable:
+        // queued->submit is host/driver queueing, submit->start is scheduling, and
+        // the gap between one command's end and the next command's start is device idle.
+        fprintf(fperf, "op name, kernel name, exec duration (ms), global size, local size, output size,"
+                       " queued (ns), submit (ns), start (ns), end (ns), complete duration (ns)\n");
         for (const ProfilingInfo & info : profiling_results) {
-            fprintf(fperf, "%s,%s,%f,%zux%zux%zu,%zux%zux%zu,%zux%zux%zux%zu\n",
+            fprintf(fperf, "%s,%s,%f,%zux%zux%zu,%zux%zux%zu,%zux%zux%zux%zu,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 "\n",
                 info.op_name.c_str(), info.kernel_name.c_str(),
                 info.cmd_duration_ns/1.e6f,
                 info.global_size[0], info.global_size[1], info.global_size[2],
                 info.local_size[0], info.local_size[1], info.local_size[2],
-                info.output_size[0], info.output_size[1], info.output_size[2], info.output_size[3]);
+                info.output_size[0], info.output_size[1], info.output_size[2], info.output_size[3],
+                info.cmd_queued, info.cmd_submit, info.cmd_start, info.cmd_end,
+                info.cmd_complete_duration_ns);
         }
         fclose(fperf);
 
