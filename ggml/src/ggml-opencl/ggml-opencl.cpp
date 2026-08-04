@@ -20179,9 +20179,6 @@ static bool ggml_cl_flash_attn_decompose(
     }();
     const bool measured_gen = backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E ||
                               backend_ctx->adreno_gen == ADRENO_GPU_GEN::A8X;
-    if (!(env_override >= 0 ? env_override == 1 : measured_gen)) {
-        return false;
-    }
 
     const int n_q       = q->ne[1];
     const int n_kv      = k->ne[1];
@@ -20189,6 +20186,42 @@ static bool ggml_cl_flash_attn_decompose(
     const int dv        = v->ne[0];
     const int n_head    = q->ne[2];
     const int n_head_kv = k->ne[2];
+
+    // Head-size floor on the DEFAULT, for a reason that is structural rather
+    // than "not measured yet".
+    //
+    // Decomposing re-introduces the KQ tensor flash attention exists to avoid.
+    // That traffic scales as n_q*n_kv*n_head while the attention compute scales
+    // as n_q*n_kv*n_head*(dk+dv), so the cost of this whole approach falls off
+    // as 1/(dk+dv) -- independent of sequence length, batch and GQA. Against
+    // the X2-90's measured ~2.15 TFLOP/s for the tuned GEMM pair and ~120 GB/s,
+    // the re-introduced traffic is ~14% of the attention compute at dk=dv=512,
+    // ~28% at 256 (where it was measured, and won by 43-61%), ~56% at 128, and
+    // MORE THAN 100% at 64.
+    //
+    // The gain moves the same way: the fused tile is only badly structured at
+    // large dk. fa_tune gives dk<=128 N_SPLIT=2 with BLOCK_M=64 -- one shuffle
+    // step, 128-thread work-groups -- while dk=256 gets N_SPLIT=16/BLOCK_M=16
+    // and dk=512 N_SPLIT=64/BLOCK_M=8. The per-KV-row cross-lane reduction that
+    // makes the tile slow only exists at the large sizes.
+    //
+    // Both ends move against it as dk falls, so defaulting this on below the
+    // sizes it was measured at would be extrapolating in the one direction the
+    // mechanism says not to. dk=192 is the interesting exception -- its tile
+    // runs a 16-thread work-group, a quarter of a wave -- but it is untested,
+    // so it stays out of the default too.
+    //
+    // GGML_OPENCL_FA_PREFILL_DECOMPOSE=1 still reaches every size, which is how
+    // the smaller ones get measured.
+    static const int min_dk = []{
+        const char * e = getenv("GGML_OPENCL_FA_DECOMPOSE_MIN_DK");
+        return (e && e[0]) ? atoi(e) : 256;
+    }();
+    const bool measured_shape = dk >= min_dk;
+
+    if (!(env_override >= 0 ? env_override == 1 : (measured_gen && measured_shape))) {
+        return false;
+    }
 
     // Below this the fused tile is competitive and the per-chunk dispatch
     // overhead is not amortised; decode must never come here.
