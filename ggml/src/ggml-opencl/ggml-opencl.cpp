@@ -26477,7 +26477,25 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
     //   - decode-only GQA-coalesced KQ through the texture cache (ne11 == 1).
     // They cannot both match: one requires ne1 >= 32, the other ne11 == 1.
     if (src0t == GGML_TYPE_F16 && src1t == GGML_TYPE_F32) {
-        if (ne01 >= 64 && ne1 >= 32 && ne00 >= 16 && (ne12 % ne02) == 0  &&
+        // Two tiling assumptions these kernels make but nothing enforced:
+        //
+        //   ne00 % TILESIZE_K(16): the K loop has no tail, so a K that does not
+        //   divide folds 1-15 rows of whatever follows the operands into every
+        //   output.
+        //
+        //   ne01 % TILESIZE_M(64): mm_store_c_N guards the n direction with its
+        //   `mask` argument but nothing guards m -- the store walks all 64 rows
+        //   of the tile at a stride of M. When M does not divide, the last tile
+        //   does not run off the end of the buffer, it writes 64 - (M % 64)
+        //   values ON TOP OF the next column, so the result is silently wrong.
+        //   Reachable on the KQV side for any head size >= 64 that is not a
+        //   multiple of it (80, 96, 112).
+        //
+        // Attention shapes in the graph satisfy both -- head sizes are multiples
+        // of 64 and n_kv is padded -- which is why this stayed latent. Declining
+        // leaves the odd shapes on the generic GEMM, which handles them.
+        if (ne01 >= 64 && ne1 >= 32 && ne00 >= 16 &&
+            (ne00 % 16) == 0 && (ne01 % 64) == 0 && (ne12 % ne02) == 0  &&
             // the kq/kqv kernels and their dispatch are 3D only: dim 3 is never indexed,
             // so a multi-stream batched attention op (ne03 > 1, several sequences in one
             // ubatch) would leave streams 1.. of dst unwritten while stream 0 computes
@@ -26497,8 +26515,22 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             backend_ctx->adreno_gen != ADRENO_GPU_GEN::X1E &&
             // dst is wrapped with image1d_buffer, the size limit applies, also src0
             (ne0 * ne1 * dst->ne[2] * dst->nb[0] / 4 <= backend_ctx->image_max_buffer_size)) {
-            // For KQ
+            // For KQ.
+            //
+            // Layout admission, mirroring the KQV arm below. The KQ kernel takes
+            // no stride arguments for A or B: it derives them as K*D_A*2 and
+            // K*D_B*4, i.e. it assumes both operands pack exactly D heads of K
+            // elements per row. Every real KV-cache view and permuted-Q view
+            // does, but a view spanning part of a wider allocation does not, and
+            // the kernel then walks the wrong rows with nothing to range-check
+            // it. Gate on the packed layout itself rather than on the stride
+            // ORDERING, which a wider parent satisfies just as well.
+            const bool kq_packed_a = (nb01 == (cl_ulong)ne00 * ne02 * ggml_type_size(src0t)) &&
+                                     (nb02 == (cl_ulong)ne00 * ggml_type_size(src0t));
+            const bool kq_packed_b = (nb11 == (cl_ulong)ne10 * ne12 * ggml_type_size(src1t)) &&
+                                     (nb12 == (cl_ulong)ne10 * ggml_type_size(src1t));
             if (ggml_is_permuted(src0) && ggml_is_permuted(src1) &&
+                kq_packed_a && kq_packed_b &&
                 ((nb01 * ne01 / 4)/4 <= backend_ctx->image_max_buffer_size) &&
                 nb00 <= nb02 &&
                 nb02 <= nb01 &&
