@@ -20207,16 +20207,33 @@ static bool ggml_cl_flash_attn_decompose(
     //
     // Both ends move against it as dk falls, so defaulting this on below the
     // sizes it was measured at would be extrapolating in the one direction the
-    // mechanism says not to. dk=192 is the interesting exception -- its tile
-    // runs a 16-thread work-group, a quarter of a wave -- but it is untested,
-    // so it stays out of the default too.
+    // mechanism says not to.
+    //
+    // The floor is PER-GENERATION, because at dk=128 the two measured devices
+    // disagree -- and not marginally. Same model (Qwen3-4B-Q4_0, f16 KV), same
+    // matched-pair method, decomposed vs the fused tile:
+    //
+    //             pp512    pp2048   pp4096
+    //   X2-90     +4.1%     +5.6%    -1.1%   <- a wash that INVERTS with depth
+    //   840       +4.6%    +14.5%   +20.6%   <- a real win that GROWS with depth
+    //
+    // so A8X takes dk>=128 while X2E keeps dk>=256. One number for both would
+    // either give up ~20% on the 840 at the depth that matters most, or regress
+    // the X2 there. dk=192 stays out of both: its tile runs a 16-thread
+    // work-group (N_SPLIT=1, BLOCK_M=16), a quarter of a wave, so it may well
+    // behave differently again -- but there is no dk=192 model on the fleet to
+    // check it with, and an untested size does not belong in a default.
     //
     // GGML_OPENCL_FA_PREFILL_DECOMPOSE=1 still reaches every size, which is how
-    // the smaller ones get measured.
-    static const int min_dk = []{
+    // the smaller ones get measured; GGML_OPENCL_FA_DECOMPOSE_MIN_DK retunes
+    // the floor without a rebuild.
+    static const int min_dk_env = []{
         const char * e = getenv("GGML_OPENCL_FA_DECOMPOSE_MIN_DK");
-        return (e && e[0]) ? atoi(e) : 256;
+        return (e && e[0]) ? atoi(e) : 0;
     }();
+    const int min_dk = min_dk_env > 0
+                     ? min_dk_env
+                     : (backend_ctx->adreno_gen == ADRENO_GPU_GEN::A8X ? 128 : 256);
     const bool measured_shape = dk >= min_dk;
 
     if (!(env_override >= 0 ? env_override == 1 : (measured_gen && measured_shape))) {
