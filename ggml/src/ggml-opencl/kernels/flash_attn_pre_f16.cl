@@ -154,3 +154,63 @@ __kernel void flash_attn_blk_f16(
 
     blk[((ulong) mask_slice * (ulong) n_q_blocks + (ulong) q_block_idx) * (ulong) n_kv_blocks + (ulong) kv_block_idx] = res;
 }
+
+// V transpose for the decomposed prefill path.
+//
+// Flash attention receives V as [dv, n_kv, n_head_kv] (dv contiguous), but the
+// tuned image KQV GEMM (mul_mm_f16_f32_kqv) addresses A as [n_kv, dv] with n_kv
+// contiguous -- the layout the non-FA KV cache stores natively. Transposing once
+// per call is what lets the decomposition reuse that kernel unmodified.
+//
+// Tiled through local memory so both halves stay coalesced: reads walk dv (the
+// contiguous axis of V), writes walk n_kv (the contiguous axis of V^T). A direct
+// element-wise copy would issue one 2-byte read per cache line on the read side.
+// The +1 row padding breaks the bank conflict the transposed access would create.
+#define FA_VT_TILE 32
+#define FA_VT_ROWS 8
+__kernel void flash_attn_v_transpose_f16(
+    const global void * v_void, ulong v_offset,
+    global void * vt_void,
+    const int n_kv,
+    const int dv,
+    const int n_head_kv,
+    const ulong v_nb1,
+    const ulong v_nb2,
+    const ulong v_nb3
+) {
+    __local half tile[FA_VT_TILE][FA_VT_TILE + 1];
+
+    const int d0 = get_group_id(0) * FA_VT_TILE;
+    const int k0 = get_group_id(1) * FA_VT_TILE;
+    const int head_kv_idx = get_group_id(2) % n_head_kv;
+    const int batch_idx   = get_group_id(2) / n_head_kv;
+
+    const int lx = get_local_id(0);
+    const int ly = get_local_id(1);
+
+    const global char * v_head = (const global char *) v_void + v_offset +
+        (ulong) batch_idx * v_nb3 + (ulong) head_kv_idx * v_nb2;
+
+    for (int r = 0; r < FA_VT_TILE; r += FA_VT_ROWS) {
+        const int d  = d0 + lx;
+        const int kv = k0 + ly + r;
+        half val = (half) 0.0f;
+        if (d < dv && kv < n_kv) {
+            val = ((const global half *) (v_head + (ulong) kv * v_nb1))[d];
+        }
+        tile[ly + r][lx] = val;
+    }
+
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    global half * vt_head = (global half *) vt_void +
+        ((ulong) batch_idx * (ulong) n_head_kv + (ulong) head_kv_idx) * (ulong) n_kv * (ulong) dv;
+
+    for (int r = 0; r < FA_VT_TILE; r += FA_VT_ROWS) {
+        const int kv = k0 + lx;
+        const int d  = d0 + ly + r;
+        if (d < dv && kv < n_kv) {
+            vt_head[(ulong) d * (ulong) n_kv + (ulong) kv] = tile[lx][ly + r];
+        }
+    }
+}
