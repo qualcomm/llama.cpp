@@ -127,6 +127,17 @@
 #define SPLIT_DK_VEC (DK_VEC / N_SPLIT)
 #define SPLIT_DV_VEC (DV_VEC / N_SPLIT)
 
+// FA_UNROLL is switched off wholesale at DK>=192 to keep the Adreno shader
+// compiler inside its host-memory budget, but that budget is only at stake for
+// the FULL-DK loops (64 or 128 iterations). The split-path loops run
+// SPLIT_DK_VEC / SPLIT_DV_VEC iterations -- 4 at DK=256/N_SPLIT=16, 2 at
+// DK=512/N_SPLIT=64 -- so unroll those even at large DK.
+#if (SPLIT_DK_VEC <= 8) && (SPLIT_DV_VEC <= 8)
+#define FA_SPLIT_UNROLL _Pragma("unroll")
+#else
+#define FA_SPLIT_UNROLL FA_UNROLL
+#endif
+
 #if N_SPLIT > 1
 #define WG_SIZE (BLOCK_M * N_SPLIT)
 #else
@@ -369,9 +380,17 @@ __kernel void FA_TILE_NAME(
                 const int k_row0 = k_start + j;
                 const int k_row1 = k_start + j + 1;
 
-                ACC_TYPE partial0 = 0.0f;
-                ACC_TYPE partial1 = 0.0f;
-                FA_UNROLL
+                // Accumulate the DK slice in a float4 and fold it down once per KV
+                // row, instead of a multiply plus a 4-add horizontal chain on every
+                // DK step. Same FMA count, but the adds become part of the mad and
+                // the horizontal reduction is paid SPLIT_DK_VEC times less often --
+                // the N_SPLIT==1 sibling below has always been written this way.
+                // Association order changes, so this is not bit-identical to the
+                // previous split path; accuracy is unaffected (both sum SPLIT_DK_VEC
+                // products in float).
+                ACC_TYPE4 acc0 = (ACC_TYPE4)(0.0f);
+                ACC_TYPE4 acc1 = (ACC_TYPE4)(0.0f);
+                FA_SPLIT_UNROLL
                 for (int k = 0; k < SPLIT_DK_VEC; k++) {
                     const ACC_TYPE4 qk = Q_PRIV_TO_ACC4(q_priv[k]);
 #if defined(FA16_PROBE_NO_LDS)
@@ -379,20 +398,20 @@ __kernel void FA_TILE_NAME(
                     // register instead of two distinct __local addresses. If this is much
                     // faster the loop is LDS-issue-bound (as the dp4a QK loop is).
                     const ACC_TYPE4 kprobe = CONVERT_KV_ACC4(FA_LK(j, dk_off));
-                    ACC_TYPE4 dot0 = qk * kprobe;
-                    ACC_TYPE4 dot1 = qk * kprobe;
+                    acc0 = mad(qk, kprobe, acc0);
+                    acc1 = mad(qk, kprobe, acc1);
 #elif defined(FA_K_LDS_T)
                     // 2 KV rows adjacent in the transposed tile: one 128-bit local read.
                     const half8 kk = FA_LK_PAIR(dk_off + k, j);
-                    ACC_TYPE4 dot0 = qk * CONVERT_KV_ACC4(kk.lo);
-                    ACC_TYPE4 dot1 = qk * CONVERT_KV_ACC4(kk.hi);
+                    acc0 = mad(qk, CONVERT_KV_ACC4(kk.lo), acc0);
+                    acc1 = mad(qk, CONVERT_KV_ACC4(kk.hi), acc1);
 #else
-                    ACC_TYPE4 dot0 = qk * CONVERT_KV_ACC4(l_k[j  ][dk_off + k]);
-                    ACC_TYPE4 dot1 = qk * CONVERT_KV_ACC4(l_k[j+1][dk_off + k]);
+                    acc0 = mad(qk, CONVERT_KV_ACC4(l_k[j  ][dk_off + k]), acc0);
+                    acc1 = mad(qk, CONVERT_KV_ACC4(l_k[j+1][dk_off + k]), acc1);
 #endif
-                    partial0 += dot0.s0 + dot0.s1 + dot0.s2 + dot0.s3;
-                    partial1 += dot1.s0 + dot1.s1 + dot1.s2 + dot1.s3;
                 }
+                ACC_TYPE partial0 = (acc0.s0 + acc0.s1) + (acc0.s2 + acc0.s3);
+                ACC_TYPE partial1 = (acc1.s0 + acc1.s1) + (acc1.s2 + acc1.s3);
 
                 FA_UNROLL
                 for (int step = 1; step < N_SPLIT; step <<= 1) {
@@ -438,11 +457,14 @@ __kernel void FA_TILE_NAME(
                 const ACC_TYPE p0    = native_exp(score0 - m_exp);
                 const ACC_TYPE p1    = native_exp(score1 - m_exp);
 
-                FA_UNROLL
+                // Nested mad, matching the N_SPLIT==1 path below: the sum is
+                // left-associated either way, so this is bit-identical to the
+                // multiply-and-add form it replaces, with a third of the ALU ops.
+                FA_SPLIT_UNROLL
                 for (int i = 0; i < SPLIT_DV_VEC; ++i) {
-                    o_acc[i] = O_ST4(O_LD4(o_acc[i]) * sp
-                             + p0 * CONVERT_KV_ACC4(l_v[j  ][dv_off + i])
-                             + p1 * CONVERT_KV_ACC4(l_v[j+1][dv_off + i]));
+                    o_acc[i] = O_ST4(mad(p1, CONVERT_KV_ACC4(l_v[j+1][dv_off + i]),
+                                     mad(p0, CONVERT_KV_ACC4(l_v[j  ][dv_off + i]),
+                                         O_LD4(o_acc[i]) * sp)));
                 }
                 l_i = l_i * sp + p0 + p1;
                 m_i = m_new;
