@@ -20161,24 +20161,30 @@ static bool ggml_cl_flash_attn_decompose(
     //
     // GGML_OPENCL_FA_PREFILL_DECOMPOSE=0 opts out, =1 opts in elsewhere.
     //
-    // The rest of the fleet is left opt-in, and only one of them is a real
-    // question:
+    // X1E is included too, and it is the interesting one: it DECLINES the tuned
+    // image KQ/KQV GEMMs (they lose there, -2.8/-8.5/-18.4% against the generic
+    // path), so on X1E this runs BOTH its GEMMs on the generic mul_mat. That is
+    // a different code path from the one X2E/A8X exercise, which is why it was
+    // held back until measured rather than assumed to follow. Measured on
+    // hp-hamoa (Adreno X1-85), gemma-4, pp512/2048/4096 vs the fused tile:
     //
-    //  - X1E DECLINES the tuned image KQ/KQV GEMMs (measured -2.8/-8.5/-18.4%
-    //    against the generic path there), so on X1E this would run its GEMMs on
-    //    the generic mul_mat instead. That is a DIFFERENT code path from the one
-    //    measured, not merely an unmeasured device, so it needs its own A/B
-    //    rather than an assumption that a two-generation result carries over.
-    //  - A7X (740) and E17 (850) never reach this function at all: supports_op
-    //    declines f16-KV flash attention on both, so neither needs a predicate
-    //    here. Checked, rather than assumed, before leaving them out.
+    //   E2B  +11.5%  +33.7%  +54.1%
+    //   E4B   +7.4%  +20.2%  +32.6%
+    //
+    // So the win does not depend on the tuned kernels at all -- the fused tile
+    // at dk>=256 is weak enough that even the generic GEMM beats it comfortably.
+    //
+    // A7X (740) and E17 (850) never reach this function: supports_op declines
+    // f16-KV flash attention on both, so neither needs a predicate here.
+    // Checked, rather than assumed, before leaving them out.
     static const int env_override = []{
         const char * e = getenv("GGML_OPENCL_FA_PREFILL_DECOMPOSE");
         if (e == nullptr || e[0] == '\0') return -1;
         return e[0] != '0' ? 1 : 0;
     }();
     const bool measured_gen = backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E ||
-                              backend_ctx->adreno_gen == ADRENO_GPU_GEN::A8X;
+                              backend_ctx->adreno_gen == ADRENO_GPU_GEN::A8X ||
+                              backend_ctx->adreno_gen == ADRENO_GPU_GEN::X1E;
 
     const int n_q       = q->ne[1];
     const int n_kv      = k->ne[1];
@@ -20219,7 +20225,10 @@ static bool ggml_cl_flash_attn_decompose(
     //
     // so A8X takes dk>=128 while X2E keeps dk>=256. One number for both would
     // either give up ~20% on the 840 at the depth that matters most, or regress
-    // the X2 there. dk=192 stays out of both: its tile runs a 16-thread
+    // the X2 there. X1E keeps 256 as well: it is only measured at dk=256/512
+    // (gemma-4 E2B/E4B), and dk=128 there is untested, so it gets the
+    // conservative floor rather than the 840's. dk=192 stays out of all three:
+    // its tile runs a 16-thread
     // work-group (N_SPLIT=1, BLOCK_M=16), a quarter of a wave, so it may well
     // behave differently again -- but there is no dk=192 model on the fleet to
     // check it with, and an untested size does not belong in a default.
