@@ -20148,12 +20148,38 @@ static bool ggml_cl_flash_attn_decompose(
 ) {
     ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *)backend->context;
 
-    // Opt-in while it is characterised on one device and one model.
-    static const bool enabled = ggml_cl_env_flag("GGML_OPENCL_FA_PREFILL_DECOMPOSE");
-    if (!enabled) {
+    if (backend_ctx->gpu_family != ADRENO) {
         return false;
     }
-    if (backend_ctx->gpu_family != ADRENO) {
+
+    // Default on for the two generations this was measured on -- X2E (X2-90)
+    // and A8X (840) -- where it takes gemma-4-26B prefill from well behind the
+    // unfused path to parity or better:
+    //
+    //   X2-90  pp1024 +31.3%, pp2048 +43.4%, pp4096 +61.1% vs the fused tile
+    //   840    pp512  +15.5%, pp2048 +51.9%  (3/3 matched pairs agree)
+    //
+    // GGML_OPENCL_FA_PREFILL_DECOMPOSE=0 opts out, =1 opts in elsewhere.
+    //
+    // The rest of the fleet is left opt-in, and only one of them is a real
+    // question:
+    //
+    //  - X1E DECLINES the tuned image KQ/KQV GEMMs (measured -2.8/-8.5/-18.4%
+    //    against the generic path there), so on X1E this would run its GEMMs on
+    //    the generic mul_mat instead. That is a DIFFERENT code path from the one
+    //    measured, not merely an unmeasured device, so it needs its own A/B
+    //    rather than an assumption that a two-generation result carries over.
+    //  - A7X (740) and E17 (850) never reach this function at all: supports_op
+    //    declines f16-KV flash attention on both, so neither needs a predicate
+    //    here. Checked, rather than assumed, before leaving them out.
+    static const int env_override = []{
+        const char * e = getenv("GGML_OPENCL_FA_PREFILL_DECOMPOSE");
+        if (e == nullptr || e[0] == '\0') return -1;
+        return e[0] != '0' ? 1 : 0;
+    }();
+    const bool measured_gen = backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E ||
+                              backend_ctx->adreno_gen == ADRENO_GPU_GEN::A8X;
+    if (!(env_override >= 0 ? env_override == 1 : measured_gen)) {
         return false;
     }
 
