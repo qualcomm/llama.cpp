@@ -1989,14 +1989,14 @@ static bool use_adreno_bin_kernels(ggml_backend_opencl_context * backend_ctx) {
 #endif // GGML_OPENCL_USE_ADRENO_BIN_KERNELS
 }
 
-static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
-    if (backend_ctx->kernels_loaded) {
-        return;
-    }
-
-    cl_int err;
-
-    // compiler options for general kernels
+// Compile-option prefix shared by every program this backend builds.
+//
+// Built in its own function because it is needed before load_cl_kernels() runs:
+// the lazily-compiled flash_attn programs are built from supports_op (the DK=512
+// probe), and load_cl_kernels() only runs on the first buffer allocation. When
+// the probe wins that race the prefix is empty, the build loses -cl-std, and
+// every subgroup builtin in the kernel is rejected as unsupported.
+static std::string ggml_opencl_make_compile_opts(ggml_backend_opencl_context *backend_ctx) {
     auto opencl_c_std =
         std::string("CL") + std::to_string(backend_ctx->opencl_c_version.major) + "." + std::to_string(backend_ctx->opencl_c_version.minor);
     std::string compile_opts = std::string("-cl-std=") + opencl_c_std +
@@ -2018,7 +2018,25 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         compile_opts += " -DADRENO_OLD_COMPILER=1";
     }
 
-    backend_ctx->kernel_compile_opts = compile_opts;
+    return compile_opts;
+}
+
+static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+    if (backend_ctx->kernels_loaded) {
+        return;
+    }
+
+    cl_int err;
+
+    // compiler options for general kernels (normally already set by ggml_cl_init)
+    if (backend_ctx->kernel_compile_opts.empty()) {
+        backend_ctx->kernel_compile_opts = ggml_opencl_make_compile_opts(backend_ctx);
+    }
+    const std::string compile_opts = backend_ctx->kernel_compile_opts;
+
+    // the per-program option strings built further down start from the std alone
+    auto opencl_c_std =
+        std::string("CL") + std::to_string(backend_ctx->opencl_c_version.major) + "." + std::to_string(backend_ctx->opencl_c_version.minor);
 
     GGML_LOG_INFO("ggml_opencl: loading OpenCL kernels");
 
@@ -6099,6 +6117,10 @@ static bool ggml_opencl_ensure_fa_f32_f16_prefill_512(ggml_backend_opencl_contex
     static bool failed[2] = { false, false };
     if (failed[split ? 1 : 0]) return false;
 
+    // See the note in ggml_opencl_ensure_fa_f32_f16_vec_512 -- do not latch a failure
+    // from a build attempted before the shared compile options exist.
+    if (backend_ctx->kernel_compile_opts.empty()) return false;
+
     const ggml_opencl_fa_dim * cfg = nullptr;
     for (const auto & d : g_opencl_fa_dims) {
         if (d.dk == dk && d.dv == dv) { cfg = &d; break; }
@@ -6176,6 +6198,11 @@ static bool ggml_opencl_ensure_fa_f32_f16_vec_512(ggml_backend_opencl_context * 
 
     static bool failed = false;
     if (failed) return false;
+
+    // Decline without latching if the shared compile options are not up yet: a build
+    // attempted without them is missing -cl-std and fails on every subgroup builtin,
+    // and this is reachable from supports_op before load_cl_kernels() has run.
+    if (backend_ctx->kernel_compile_opts.empty()) return false;
 
     const ggml_opencl_fa_dim * cfg = nullptr;
     for (const auto & d : g_opencl_fa_dims) {
@@ -8448,6 +8475,12 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
     // determine whether to use large buffer for Adreno
     backend_ctx->adreno_use_large_buffer = getenv("GGML_OPENCL_ADRENO_USE_LARGE_BUFFER") != nullptr &&
                                            backend_ctx->gpu_family == GPU_FAMILY::ADRENO;
+
+    // Every input to the shared compile-option prefix is known by now, so populate it
+    // here rather than in load_cl_kernels(): that function only runs on the first
+    // buffer allocation, and the DK=512 flash_attn programs are built earlier than
+    // that when supports_op probes them (llama.cpp's `-fa auto`).
+    backend_ctx->kernel_compile_opts = ggml_opencl_make_compile_opts(backend_ctx.get());
 
     // ragged moe, unspecified or non-zero means enabled, set to 0 to disable
     static const char * ragged_fp16_env = getenv("GGML_OPENCL_MOE_RAGGED_FP16");
