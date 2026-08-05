@@ -143,6 +143,88 @@ static inline bool ggml_cl_env_flag(const char * name) {
     return v != nullptr && v[0] != '\0';
 }
 
+// Explicit "=0" test, for knobs that are default-ON and need an opt-out.
+// ggml_cl_env_flag above treats any non-empty value as true, so it cannot
+// express one.
+static inline bool ggml_cl_env_flag_zero(const char * name) {
+    const char * v = getenv(name);
+    return v != nullptr && v[0] == '0';
+}
+
+// gated_delta_net lane geometry. The build site and the dispatcher have to agree
+// exactly -- they were two hand-kept copies of the same heuristic, which is not a
+// safe place to add a tuning knob, so both now call these.
+//
+// LANES_PER_COLUMN: how many lanes cooperate on one column of the recurrent
+// state. The 8-for-S_V>=128 rule came across from the Vulkan shader, where it is
+// conditioned on subgroupClustered making a narrow reduce cheap. Every backend
+// that was tuned against its own hardware gives a FULL warp/sub-group to one
+// column instead -- CUDA and SYCL use min(warp_size, S_v) = 32, Metal one
+// simdgroup. At 8 lanes on a 64-wide Adreno wave each state access touches eight
+// disjoint 32-byte chunks, and the state is essentially this kernel's entire
+// traffic (S_v*S_v*H_v floats read and written per token, ~0.5 FLOP/byte).
+// Widening also divides ROWS_PER_LANE -- hence the s_shard/k_reg/q_reg/g_exp
+// register footprint -- and multiplies the work-group count by the same factor.
+// GGML_OPENCL_GDN_LANES_PER_COLUMN sweeps it without a rebuild; 0/unset keeps
+// the inherited default.
+static int ggml_opencl_gdn_lanes_per_column(int S_V, int sg_size, int cpl) {
+    static const int env = []{
+        const char * e = getenv("GGML_OPENCL_GDN_LANES_PER_COLUMN");
+        return (e && e[0]) ? atoi(e) : 0;
+    }();
+
+    // COLS_PER_WG = (sg_size / lpc) * cpl, and the dispatcher asserts
+    // S_V % COLS_PER_WG == 0. The inherited rule satisfied that only by accident:
+    // it takes min(S_V, sg_size) below S_V=128, which always leaves
+    // COLS_PER_WG == cpl. Anything that picks a narrower lpc at a small S_V --
+    // e.g. the 8 that S_V>=128 uses -- aborts the op, so validate here rather
+    // than let the assert be the check.
+    auto geometry_ok = [&](int lpc) {
+        const int cols_per_wg = (sg_size / lpc) * cpl;
+        return cols_per_wg > 0 && (S_V % cols_per_wg) == 0;
+    };
+    auto normalize = [&](int lpc) {
+        // Power-of-two, divides both S_V and sg_size.
+        while (lpc > 1 &&
+               (((lpc & (lpc - 1)) != 0) || (S_V % lpc) != 0 || (sg_size % lpc) != 0)) {
+            lpc >>= 1;
+        }
+        return lpc;
+    };
+
+    const int inherited = normalize(S_V >= 128 ? 8 : (S_V < sg_size ? S_V : sg_size));
+
+    if (env <= 0) {
+        return inherited;
+    }
+
+    int lpc = normalize(env < S_V ? env : S_V);
+    // Widen until the work-group geometry is legal; a narrower lpc means MORE
+    // columns per work-group, so widening is the direction that fixes it.
+    while (!geometry_ok(lpc) && lpc < sg_size && lpc < S_V) {
+        lpc <<= 1;
+        lpc = normalize(lpc);
+    }
+    // A non-power-of-two cpl can leave nothing legal; keep the shipped geometry
+    // rather than launching one the dispatcher will assert on.
+    return geometry_ok(lpc) ? lpc : inherited;
+}
+
+// COLS_PER_LANE_GROUP: columns each lane group carries. 1 at decode; the prompt
+// value of 4 is recorded as an Adreno 750 register-budget choice (128 registers
+// per work-item), so it is worth re-checking on other parts.
+// GGML_OPENCL_GDN_CPL_PP overrides the prompt value.
+static int ggml_opencl_gdn_cols_per_lane_group(int tgpp) {
+    static const int env = []{
+        const char * e = getenv("GGML_OPENCL_GDN_CPL_PP");
+        return (e && e[0]) ? atoi(e) : 0;
+    }();
+    if (tgpp == 0) {
+        return 1;
+    }
+    return env > 0 ? env : 4;
+}
+
 static bool ggml_cl_is_q4_0_soa(const ggml_tensor * tensor);
 static bool ggml_cl_is_q8_0_soa(const ggml_tensor * tensor);
 static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
@@ -662,7 +744,16 @@ struct ggml_opencl_fa_kernels {
     // (quant-KV long-context, dense GQA4 DK=128 class). Opt-in FA_C8=1.
     std::map<std::pair<int, int>, cl_kernel> f32_q8_0_q1_vec_mq_split_c8;
     std::map<std::pair<int, int>, cl_kernel> f32_q8_0_q1_vec_mq_split_g8_c8;  // GQA8 cluster (dk=64)
+    // Head-split sibling of the above: MQ_GQA=4 x FA_HEAD_SUB=2 workgroups per
+    // KV head, to cut the 592 B/WI the GQA8 form reports (f16's head-split
+    // kernel is at 368 for the same shape).
+    std::map<std::pair<int, int>, cl_kernel> f32_q8_0_q1_vec_mq_split_g8_c8_hs2;
     std::map<std::pair<int, int>, cl_kernel> f32_f16_q1_vec_mq_split_g8_hs2;  // gqa8 via MQ_GQA=4 x 2 WGs
+    // Per-shape workgroup size and head-split factor for the above. fa_hs_wg /
+    // fa_hs_sub below are single scalars written by the DK=64 build site; once a
+    // second head dimension builds the same family they stop being unambiguous.
+    std::map<std::pair<int, int>, int>       f32_f16_q1_vec_mq_split_g8_hs2_wg;
+    std::map<std::pair<int, int>, int>       f32_f16_q1_vec_mq_split_g8_hs2_sub;
     std::map<std::pair<int, int>, cl_kernel> f32_f16_q1_vec_mq_split_gqa4_hs2;  // gqa4 via MQ_GQA=2 x 2 WGs
     // q1_vec_mq_split built alone (FA_MQ_SPLIT_ONLY) for a specific
     // (dk, dv, gqa), with its own MQ_NSG_SPLIT / FA_HEAD_SUB. Used where the
@@ -4115,40 +4206,32 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         for (int si = 0; si < 4; si++) {
             const int S_V = gdn_sizes[si];
 
-            // MUST match the dispatcher heuristic in ggml_cl_gated_delta_net exactly.
-            int lanes_per_column;
-            if (S_V >= 128) {
-                lanes_per_column = 8;
-            } else {
-                lanes_per_column = std::min(S_V, sg_size);
-            }
-
-            // Round LANES_PER_COLUMN down until it is:
-            //  * power-of-two
-            //  * divides both S_V and sg_size
-            while (lanes_per_column > 1 &&
-                    (((lanes_per_column & (lanes_per_column - 1)) != 0) ||
-                    (S_V % lanes_per_column) != 0 ||
-                    (sg_size % lanes_per_column) != 0)) {
-                lanes_per_column >>= 1;
-            }
-
-            GGML_ASSERT(lanes_per_column >= 1);
-            GGML_ASSERT(((lanes_per_column & (lanes_per_column - 1)) == 0));
-            GGML_ASSERT((S_V % lanes_per_column) == 0);
-            GGML_ASSERT((sg_size % lanes_per_column) == 0);
-
-            const bool is_partial_reduce = (lanes_per_column != 1) && (lanes_per_column < sg_size);
-            int use_qcom_shuffle = 0;
-            if (is_partial_reduce) {
-                if (backend_ctx->has_qcom_subgroup_shuffle) {
-                    use_qcom_shuffle = 1;
-                }
-            }
             for (int kda = 0; kda < 2; kda++) {
                 for (int tgpp = 0; tgpp < 2; tgpp++) {
-                    const int cpl = (tgpp == 0) ? 1 : 4;
+                    const int cpl = ggml_opencl_gdn_cols_per_lane_group(tgpp);
                     const int spw  = (tgpp == 0) ? 1 : 1;
+
+                    // Shared with the dispatcher in ggml_cl_gated_delta_net -- the two
+                    // used to hand-copy this heuristic and had to be kept in sync by
+                    // comment. It depends on cpl (COLS_PER_WG has to divide S_V), so it
+                    // belongs inside the tgpp loop, not outside it.
+                    const int lanes_per_column =
+                        ggml_opencl_gdn_lanes_per_column(S_V, sg_size, cpl);
+
+                    GGML_ASSERT(lanes_per_column >= 1);
+                    GGML_ASSERT(((lanes_per_column & (lanes_per_column - 1)) == 0));
+                    GGML_ASSERT((S_V % lanes_per_column) == 0);
+                    GGML_ASSERT((sg_size % lanes_per_column) == 0);
+
+                    // The XOR-butterfly shuffle path is correct for the full-wave case
+                    // too -- it simply runs one more step. Gating it on
+                    // lanes_per_column < sg_size sent LANES_PER_COLUMN == SUBGROUP_SIZE
+                    // to the __local + barrier fallback, which is the one configuration
+                    // where the reduce is entirely intra-wave and needs no memory at
+                    // all. Vulkan's sibling shader takes a full subgroupAdd there for
+                    // the same reason.
+                    const int use_qcom_shuffle =
+                        (lanes_per_column != 1 && backend_ctx->has_qcom_subgroup_shuffle) ? 1 : 0;
 
                     std::string opts = compile_opts;
                     opts += " -DS_V=" + std::to_string(S_V);
@@ -4157,6 +4240,12 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                     opts += " -DLANES_PER_COLUMN=" + std::to_string(lanes_per_column);
                     opts += " -DCOLS_PER_LANE_GROUP=" + std::to_string(cpl);
                     opts += " -DUSE_QCOM_SUBGROUP_SHUFFLE=" + std::to_string(use_qcom_shuffle);
+                    // Metal's contiguous intra-lane row mapping (float2/float4-able).
+                    // Independent of LANES_PER_COLUMN, so the lane-width sweep that
+                    // closed that knob says nothing about this one. Changes the
+                    // reduction's summation order -> needs its own TBO pass.
+                    opts += ggml_cl_env_flag("GGML_OPENCL_GDN_LANE_CONTIG")
+                          ? " -DGDN_LANE_CONTIG=1" : "";
 
                     // Since spw=1 is found to be optimal, SUBGROUPS_PER_WG > 1 code in
                     // the kernel is removed. If you want to experiment with spw > 1,
@@ -6770,6 +6859,79 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
                     }
                 }
             }
+            // gqa=8 at DK=128 served by an MQ_GQA=4 kernel spread over
+            // FA_HEAD_SUB workgroups per KV head. That treatment exists only at
+            // dk=64 today, and dk=64 is where it turned gpt-oss from a loss into
+            // a win. The dk=128 evidence points the same way: every dk=128 model
+            // that GAINS from -fa 1 at depth on the X2-90 (Qwen3-4B, Qwen3-8B,
+            // Llama-3-8B, +11..17% tg @d8192) runs MQ_GQA=4, and the one that
+            // LOSES ~20% there (Qwen3-30B-A3B) is the only dk=128 shape running
+            // MQ_GQA=8. Cost is the usual head-split trade: per-lane o_acc/m_i/
+            // l_i/slope halve and the grid doubles, paying one extra read of
+            // each KV row.
+            //
+            // Deliberately the GQA4 c8 options plus FA_HEAD_SUB and nothing else
+            // -- no MHRED, no mask broadcast -- so a measurement attributes to
+            // the head split alone rather than to a bundle.
+            // DEFAULT ON; opt out with GGML_OPENCL_FA_G8_HS_DK128=0. No device
+            // predicate, matching the gqa 4 / 8 arms it sits beside: all three
+            // generations that reach this dispatch were measured and none
+            // inverts. Per-op (test-backend-ops perf, dk=128 gqa=8 f16, nb=1),
+            // route off -> on:
+            //
+            //   X2-90       kv4096  552 ->  368 us (+50%)   kv8192 1100 ->  725 (+52%)
+            //   840  (A8X)  kv4096 2082 -> 1144 us (+82%)   kv8192 3470 -> 2235 (+55%)
+            //   X1-85 (X1E) kv4096 1596 ->  751 us (+112%)  kv8192 3214 -> 1466 (+119%)
+            //
+            // FLASH_ATTN_EXT is 0 FAIL in both routings on each, matching that
+            // device's own unpatched baseline (X2 2696 OK, 840 2699, X1-85 2696).
+            // End-to-end is X2-only on purpose: Qwen3-30B-A3B is the fleet's only
+            // dk=128 gqa=8 model and neither the 840 (19.5 GB MemAvailable) nor
+            // X1-85 (~6 GB per-context cap) can hold it, so the per-op number is
+            // what carries the other two generations.
+            if (!fa_decode_only && dk == 128 && dv == 128 &&
+                backend_ctx->has_subgroup_shuffle &&
+                !ggml_cl_env_flag_zero("GGML_OPENCL_FA_G8_HS_DK128")) {
+                // 4 is the measured optimum, not an extrapolation. X2-90 tg128 at
+                // d4096/d8192: 31.1/24.7 at FA_HEAD_SUB=2, 33.0/25.7 at 4, and
+                // 30.5/23.3 at 8 -- MQ_GQA=1 overshoots and lands BELOW 2, so the
+                // grid mechanism saturates here rather than continuing.
+                static const int hs_n = []{
+                    const char * e = std::getenv("GGML_OPENCL_FA_G8_HS_DK128_SUB");
+                    const int v = (e && e[0]) ? atoi(e) : 4;
+                    return (v == 2 || v == 4 || v == 8) ? v : 4;
+                }();
+                static const int hs_nsg = []{
+                    const char * e = std::getenv("GGML_OPENCL_FA_G8_HS_DK128_NSG");
+                    const int v = (e && e[0]) ? atoi(e) : 2;
+                    return (v >= 1 && v <= 4) ? v : 2;
+                }();
+                const size_t hs_wg = (size_t) (64 * hs_nsg);
+                const std::string opts_hs = opts +
+                    " -D FA_MQ_ONLY -D MQ_GQA=" + std::to_string(8 / hs_n) +
+                    " -D MQ_NSG=" + std::to_string(hs_nsg) +
+                    " -D MQ_NSG_SPLIT=" + std::to_string(hs_nsg) +
+                    " -D FA_HEAD_SUB=" + std::to_string(hs_n) + opts_cl_c_gqa4;
+                const std::string tag_hs = "fa f32_f16 MQ_GQA=" + std::to_string(8 / hs_n) +
+                    " dk128 g8 headsub" + std::to_string(hs_n) + " wg" + std::to_string(hs_wg);
+                cl_program prog_hs = build_program_from_source_ex_cached(
+                    backend_ctx, src.c_str(), opts_hs,
+                    /*fatal=*/false, tag_hs.c_str(), /*bin_size=*/0, backend_ctx->queue);
+                if (prog_hs) {
+                    cl_kernel k_hs = clCreateKernel(prog_hs, "flash_attn_f32_f16_q1_vec_mq_split_c8", &err);
+                    if (err == CL_SUCCESS) {
+                        if (ggml_opencl_fa_kernel_fits_wg(backend_ctx, k_hs, hs_wg, tag_hs.c_str(), dk, dv)) {
+                            backend_ctx->fa.f32_f16_q1_vec_mq_split_g8_hs2[{dk, dv}]     = k_hs;
+                            backend_ctx->fa.f32_f16_q1_vec_mq_split_g8_hs2_wg[{dk, dv}]  = (int) hs_wg;
+                            backend_ctx->fa.f32_f16_q1_vec_mq_split_g8_hs2_sub[{dk, dv}] = hs_n;
+                            ggml_opencl_log_fa_kernel_spill(backend_ctx, k_hs, tag_hs.c_str(), dk, dv);
+                        } else {
+                            clReleaseKernel(k_hs);
+                        }
+                    }
+                    clReleaseProgram(prog_hs);
+                }
+            }
             // NSG_SPLIT=2 programs for the cluster-parallel kernel: its register
             // footprint caps the per-kernel WG at 128 on X2 (< the stock 256/192
             // requirement), so it can never register from the stock programs.
@@ -7016,8 +7178,60 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
             // FA_CL_C as the f16 dk=64 program -- at DK_VEC=16 a width of 8 would
             // double the per-lane o_acc for MQ_GQA=8.
             if (is_q8 && dk == 64 && dv == 64 && backend_ctx->has_subgroup_shuffle) {
+                // Timing probes for the q8_0-vs-f16 decode gap. Numerically
+                // WRONG -- they delete a load and keep everything else -- so
+                // they measure where the gap lives, they do not ship.
+                //   GGML_OPENCL_FA_Q8_PROBE=noscale  drop the per-lane scale load
+                //   GGML_OPENCL_FA_Q8_PROBE=nodeq    drop the KV read entirely
+                static const char * q8_probe = getenv("GGML_OPENCL_FA_Q8_PROBE");
+                std::string opts_q8_probe;
+                if (q8_probe != nullptr) {
+                    if (strcmp(q8_probe, "noscale") == 0) {
+                        opts_q8_probe = " -D FA_Q8_PROBE_NOSCALE";
+                    } else if (strcmp(q8_probe, "nodeq") == 0) {
+                        opts_q8_probe = " -D FA_Q8_PROBE_NODEQ";
+                    } else if (strcmp(q8_probe, "nomask") == 0) {
+                        opts_q8_probe = " -D FA_Q8_PROBE_NOMASK";
+                    }
+                }
+                // The f16 g8/c16 program has carried FA_CL_MHRED since the
+                // gpt-oss FD round; this fork never got it, and the shuffle
+                // chain it removes is what this kernel is actually spending its
+                // time on -- deleting the KV read outright (FA_Q8_PROBE=nodeq)
+                // still left it behind f16, so the gap is not the dequant.
+                // Opt out with GGML_OPENCL_FA_Q8_MHRED=0.
+                static const bool q8_mhred_on = []{
+                    const char * e = getenv("GGML_OPENCL_FA_Q8_MHRED");
+                    return !(e && e[0] == '0');
+                }();
+                // Mask broadcast + hoist. The mask was read inside the per-head
+                // score loop, after the cluster reduce: deleting it outright
+                // (FA_Q8_PROBE=nomask) measured +8.8/+14.0% at d4096/d8192,
+                // which is the entire remaining deficit against f16.
+                // GGML_OPENCL_FA_Q8_MASK_BCAST=0 opts out.
+                static const bool q8_maskb_on = []{
+                    const char * e = getenv("GGML_OPENCL_FA_Q8_MASK_BCAST");
+                    return !(e && e[0] == '0');
+                }();
+                const std::string opts_q8_maskb =
+                    q8_maskb_on ? " -D FA_CL_MASK_BCAST=1" : "";
+                // Stage the mask a subgroup-block at a time: over FA_CL_C
+                // iterations the clusters touch Q1_WG_SIZE consecutive
+                // positions, so one coalesced load plus shuffles replaces
+                // FA_CL_C scattered ones. Needs the broadcast path (that is
+                // what makes the value one-per-position). Costs no LDS, which
+                // matters because this kernel is occupancy-bound.
+                // GGML_OPENCL_FA_Q8_MASK_SG=0 opts out.
+                static const bool q8_masksg_on = []{
+                    const char * e = getenv("GGML_OPENCL_FA_Q8_MASK_SG");
+                    return !(e && e[0] == '0');
+                }();
+                const std::string opts_q8_masksg =
+                    (q8_maskb_on && q8_masksg_on) ? " -D FA_CL_MASK_SG=1" : "";
                 const std::string opts_q8_g8c16 = opts +
-                    " -D MQ_GQA=8 -D MQ_NSG=2 -D MQ_NSG_SPLIT=2 -D FA_CL_C=16" + opts_q8_int;
+                    " -D MQ_GQA=8 -D MQ_NSG=2 -D MQ_NSG_SPLIT=2 -D FA_CL_C=16" +
+                    (q8_mhred_on ? " -D FA_CL_MHRED=1" : "") + opts_q8_maskb + opts_q8_masksg +
+                    opts_q8_int + opts_q8_probe;
                 cl_program prog_q8_g8c16 = build_program_from_source_ex_cached(
                     backend_ctx, src.c_str(), opts_q8_g8c16,
                     /*fatal=*/false, "fa q8_0 c16 GQA8 dk64", /*bin_size=*/0, backend_ctx->queue);
@@ -7034,6 +7248,41 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
                         }
                     }
                     clReleaseProgram(prog_q8_g8c16);
+                }
+                // Head-split sibling: FA_HEAD_SUB=2 runs the gqa=8 shape as two
+                // MQ_GQA=4 workgroups per KV head. The measured reason to want
+                // it -- the q8 g8/c16 kernel reports private_mem 592 B/WI where
+                // the f16 head-split kernel for the same dk=64 gqa8 shape is at
+                // 368, and that occupancy gap is what the FA_Q8_PROBE=nodeq
+                // ceiling pinned the deficit on. Costs one extra read of each
+                // KV row. Opt out with GGML_OPENCL_FA_Q8_HEAD_SUB=0.
+                static const bool q8_hs_on = []{
+                    const char * e = getenv("GGML_OPENCL_FA_Q8_HEAD_SUB");
+                    return !(e && e[0] == '0');
+                }();
+                if (q8_hs_on) {
+                    const std::string opts_q8_hs2 = opts +
+                        " -D MQ_GQA=4 -D MQ_NSG=2 -D MQ_NSG_SPLIT=2 -D FA_CL_C=16"
+                        " -D FA_HEAD_SUB=2" +
+                        (q8_mhred_on ? " -D FA_CL_MHRED=1" : "") + opts_q8_maskb + opts_q8_masksg +
+                        opts_q8_int + opts_q8_probe;
+                    cl_program prog_q8_hs2 = build_program_from_source_ex_cached(
+                        backend_ctx, src.c_str(), opts_q8_hs2,
+                        /*fatal=*/false, "fa q8_0 c16 GQA4 hs2 dk64", /*bin_size=*/0, backend_ctx->queue);
+                    if (prog_q8_hs2) {
+                        cl_kernel k_hs = clCreateKernel(prog_q8_hs2, "flash_attn_f32_q8_0_q1_vec_mq_split_c8", &err);
+                        if (err == CL_SUCCESS) {
+                            if (ggml_opencl_fa_kernel_fits_wg(backend_ctx, k_hs, 128,
+                                                              "flash_attn_f32_q8_0_q1_vec_mq_split_c8 (hs2)", dk, dv)) {
+                                backend_ctx->fa.f32_q8_0_q1_vec_mq_split_g8_c8_hs2[{dk, dv}] = k_hs;
+                                ggml_opencl_log_fa_kernel_spill(backend_ctx, k_hs,
+                                    "flash_attn_f32_q8_0_q1_vec_mq_split_g8_c8_hs2", dk, dv);
+                            } else {
+                                clReleaseKernel(k_hs);
+                            }
+                        }
+                        clReleaseProgram(prog_q8_hs2);
+                    }
                 }
             }
             // Cluster-parallel q4_0 decode kernel
@@ -20240,9 +20489,25 @@ static bool ggml_cl_flash_attn_decompose(
         const char * e = getenv("GGML_OPENCL_FA_DECOMPOSE_MIN_DK");
         return (e && e[0]) ? atoi(e) : 0;
     }();
+    // 🔴 The X2E half of the table above was an ARTIFACT of the chunk budget,
+    // not a property of dk=128. Qwen3-4B's "-1.1% at pp4096" is what set X2E to
+    // 256, and at pp4096 the old 32 MB budget handed that model a 64-query chunk
+    // -- two n-tiles. With the tile floor in place (see the chunking below),
+    // X2-90 fused -> decomposed at pp2048 / pp4096 is:
+    //
+    //   Qwen3-4B      449 / 334 -> 516 / 414   (+15% / +24%)
+    //   Qwen3-8B      267 / 222 -> 288 / 253   (+8%  / +14%)
+    //   Llama-3-8B    309 / 255 -> 336 / 294   (+8%  / +15%)
+    //   Qwen3-30B-A3B 397 / 282 -> 472 / 365   (+19% / +29%)
+    //
+    // three dense models and one MoE, two reversed passes each, so X2E joins A8X
+    // at dk>=128. X1E stays at 256: it runs BOTH GEMMs on the generic mul_mat
+    // (it declines the tuned image kernels), and dk=128 has never been measured
+    // there -- a different code path, not merely a different constant.
     const int min_dk = min_dk_env > 0
                      ? min_dk_env
-                     : (backend_ctx->adreno_gen == ADRENO_GPU_GEN::A8X ? 128 : 256);
+                     : ((backend_ctx->adreno_gen == ADRENO_GPU_GEN::A8X ||
+                         backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E) ? 128 : 256);
     const bool measured_shape = dk >= min_dk;
 
     if (!(env_override >= 0 ? env_override == 1 : (measured_gen && measured_shape))) {
@@ -20300,10 +20565,38 @@ static bool ggml_cl_flash_attn_decompose(
     // Chunk the queries so the KQ scores stay bounded. Two ceilings: a byte
     // budget, and the element count of the image1d_buffer the KQ dispatch wraps
     // dst in -- overshooting the latter silently drops to the generic GEMM.
+    // 🔴 The 32 MB this defaulted to was measured, and it is too small at depth.
+    // n_q_chunk = budget / (n_kv * n_head * 4), so the chunk SHRINKS as the
+    // context grows: Qwen3-30B-A3B (n_head 32) gets 128 queries at n_kv=2048 but
+    // only 64 at 4096 -- two 32-wide n-tiles for GEMMs whose admission threshold
+    // is 32. X2-90, decomposed pp4096: 32 MB -> 323/326 t/s, 128 MB -> 360/364,
+    // 512 MB -> 364/364 (2 reversed passes). +12.2%, and it takes -fa 1 prefill
+    // from -7.9% against -fa 0 to +4.0%. pp2048 moves only +0.9%, because there
+    // the old budget already bought a usable chunk -- which is exactly why this
+    // was never caught: it only bites past the depth anyone had measured.
+    //
+    // 128 MB was already enough at 4k and 512 added nothing, so the default sits
+    // at 256 MB: one doubling of headroom for 8k, not four.
     static const size_t budget_bytes = []{
         const char * e = getenv("GGML_OPENCL_FA_DECOMPOSE_MB");
-        const int mb = (e && e[0]) ? atoi(e) : 32;
-        return (size_t)(mb > 0 ? mb : 32) * 1024 * 1024;
+        const int mb = (e && e[0]) ? atoi(e) : 256;
+        return (size_t)(mb > 0 ? mb : 256) * 1024 * 1024;
+    }();
+    // Hard floor in 32-wide n-tiles, and a hard ceiling that overrides it.
+    // The floor is what stops the budget quietly starving the GEMM at long
+    // context; the ceiling is what stops the floor allocating without bound
+    // there (the whole point of this path is that its scratch is chunk-bounded).
+    // Where they conflict the ceiling wins and the chunk shrinks -- that trade is
+    // real and unavoidable, it was just sitting at a badly chosen point.
+    static const int64_t min_tiles = []{
+        const char * e = getenv("GGML_OPENCL_FA_DECOMPOSE_MIN_TILES");
+        const int v = (e && e[0]) ? atoi(e) : 8;
+        return (int64_t)(v > 0 ? v : 8);
+    }();
+    static const size_t max_bytes = []{
+        const char * e = getenv("GGML_OPENCL_FA_DECOMPOSE_MAX_MB");
+        const int mb = (e && e[0]) ? atoi(e) : 768;
+        return (size_t)(mb > 0 ? mb : 768) * 1024 * 1024;
     }();
     const size_t kq_row_bytes = (size_t)n_kv * n_head * sizeof(float);
     if (kq_row_bytes == 0) {
@@ -20311,13 +20604,19 @@ static bool ggml_cl_flash_attn_decompose(
     }
     int64_t n_q_chunk = MIN((int64_t)(budget_bytes / kq_row_bytes), (int64_t)n_q);
     // ne1 >= 32 is the tuned KQ/KQV admission threshold. Treat the byte budget
-    // as advisory and keep at least one full n-tile even when that exceeds it:
-    // n_kv grows with the context, so a fixed budget would quietly shrink the
-    // chunk below 32 at depth, route back to the generic GEMM and give up the
-    // whole point of the path exactly where prefill hurts most. One tile of KQ
-    // at a 32k context is ~64 MB -- large, but bounded by the chunk, which is
-    // the property that matters against -fa 0's whole-ubatch allocation.
-    n_q_chunk = MAX(n_q_chunk, (int64_t)32);
+    // as advisory and keep at least min_tiles full n-tiles even when that
+    // exceeds it: n_kv grows with the context, so a fixed budget quietly shrinks
+    // the chunk at depth, and a chunk of one or two tiles hands the tuned GEMM
+    // shapes it is not tuned for (measured: 64 queries at pp4096 costs 12%).
+    // Bounded by the chunk either way, which is the property that matters
+    // against -fa 0's whole-ubatch allocation.
+    n_q_chunk = MAX(n_q_chunk, MIN(min_tiles * 32, (int64_t)n_q));
+    // ...but never past the hard scratch ceiling. KQ dominates the three
+    // buffers, so size the cap off it.
+    const int64_t ceil_chunk = (int64_t)(max_bytes / kq_row_bytes);
+    if (ceil_chunk >= 32) {
+        n_q_chunk = MIN(n_q_chunk, ceil_chunk);
+    }
     // The image1d_buffer the KQ dispatch wraps dst in is a hard device limit,
     // so it caps the chunk after the floor rather than before it.
     const int64_t img_limit = (int64_t)backend_ctx->image_max_buffer_size / ((int64_t)n_kv * n_head);
@@ -21034,13 +21333,31 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         // alternating SWA layers (gpt-oss: swa_period=2, window 128) sit at
         // n_kv == 256 on half their layers and so never reach any KV-sharing
         // kernel at any depth -- they run the legacy per-head q1 instead.
-        // Opt-in (GGML_OPENCL_FD_MIN_N_KV_MQ=128): worth ~+1.2% tg32 on
-        // gpt-oss-20b/X2-90 once the partials buffer is pooled, but it changes
-        // decode routing for every model below FD_MIN_N_KV and has only been
-        // measured on one. Default is unchanged.
+        // This defaulted to FD_MIN_N_KV (2048) and was left opt-in on the grounds
+        // that it changes decode routing for every model below that and had only
+        // been measured on one. It has now been measured on four, and inheriting
+        // the split-tuned constant was simply wrong: below 2048 the MQ routes --
+        // including the dk=128 gqa=8 head split -- did not engage AT ALL, so a
+        // model spent its whole shallow-context life on the legacy per-head q1.
+        //
+        // X2-90 tg128, floor 2048 -> 32, each arm bracketed by an off arm either
+        // side:
+        //
+        //   Qwen3-30B-A3B  d0 41.3 -> 46.5 (+12%)  d1024 25.7 -> 41.8 (+63%)
+        //   Qwen3-4B       d0 38.8 -> 42.6 (+10%)  d1024 27.2 -> 39.0 (+43%)
+        //   gpt-oss-20b    d0 39.1 -> 39.6 (+1%)   d1024 35.8 -> 38.6 (+8%)
+        //   gemma-4-26B    d0 37.7 -> 37.5         d1024 33.8 -> 33.4
+        //
+        // and d4096 is flat everywhere (-0.9% to +2.0%), which is the control:
+        // above the old floor the routing is unchanged, so those columns should
+        // not move and they do not. gemma-4-26B is the neutral case rather than a
+        // regression -- its deltas sit inside the spread of its own two off arms.
+        //
+        // 32 rather than 128 because the d0 win needs a floor below n_kv there.
+        // GGML_OPENCL_FD_MIN_N_KV_MQ restores any value, including the old 2048.
         static const int fd_min_n_kv_mq = []{
             const char * e = getenv("GGML_OPENCL_FD_MIN_N_KV_MQ");
-            return (e && e[0]) ? atoi(e) : FD_MIN_N_KV;
+            return (e && e[0]) ? atoi(e) : 32;
         }();
         // A shape with a narrow (purpose-built) MQ kernel carries its own,
         // much lower n_kv floor. Those kernels exist only for shapes whose
@@ -21131,6 +21448,20 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
                 fd_k_split = backend_ctx->fa.f32_f16_q1_vec_mq_split_g8_c32.at(dk_dv);
                 use_fd_mq  = true;
                 fd_mq_wg   = 128;
+            // Head-split g8 at DK=128 (Qwen3-30B-A3B class): MQ_GQA=4 over
+            // FA_HEAD_SUB workgroups per KV head. Checked BEFORE the stock g8
+            // cluster branch below so the A/B is one route against the other in
+            // the same binary; the program only exists when its build-side
+            // opt-in is set, so the default path is untouched.
+            } else if (nq1_only && is_mixed && gqa_ratio_dispatch == 8 &&
+                d_head_q == 128 && d_head_v == 128 &&
+                n_head == n_head_kv * 8 &&
+                backend_ctx->fa.f32_f16_q1_vec_mq_split_g8_hs2.count(dk_dv) > 0 &&
+                backend_ctx->fa.f32_f16_q1_vec_mq_split_g8_hs2_wg.count(dk_dv) > 0) {
+                fd_k_split  = backend_ctx->fa.f32_f16_q1_vec_mq_split_g8_hs2.at(dk_dv);
+                use_fd_mq   = true;
+                fd_mq_wg    = (size_t) backend_ctx->fa.f32_f16_q1_vec_mq_split_g8_hs2_wg.at(dk_dv);
+                fd_head_sub = backend_ctx->fa.f32_f16_q1_vec_mq_split_g8_hs2_sub.at(dk_dv);
             // Cluster-parallel decode for the g8
             } else if (is_mixed && gqa_ratio_dispatch == 8 &&
                 d_head_q == 128 && d_head_v == 128 &&
@@ -21246,10 +21577,22 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
             } else if (nq1_only && is_q8_0 && gqa_ratio_dispatch == 8 &&
                 d_head_q == 64 && d_head_v == 64 &&
                 n_head == n_head_kv * 8 &&
-                backend_ctx->fa.f32_q8_0_q1_vec_mq_split_g8_c8.count(dk_dv) > 0) {
+                (backend_ctx->fa.f32_q8_0_q1_vec_mq_split_g8_c8.count(dk_dv) > 0 ||
+                 backend_ctx->fa.f32_q8_0_q1_vec_mq_split_g8_c8_hs2.count(dk_dv) > 0)) {
                 // gpt-oss-class q8_0 KV: without this the model falls all the way
                 // back to the spilled scalar q1_split.
-                fd_k_split = backend_ctx->fa.f32_q8_0_q1_vec_mq_split_g8_c8.at(dk_dv);
+                //
+                // Prefer the head-split sibling where it built: the GQA8 form
+                // reports private_mem 592 B/WI against the f16 head-split
+                // kernel's 368 for this same dk=64 gqa8 shape, and that
+                // occupancy gap -- not the dequant -- is what the nodeq probe
+                // left unexplained.
+                if (backend_ctx->fa.f32_q8_0_q1_vec_mq_split_g8_c8_hs2.count(dk_dv) > 0) {
+                    fd_k_split   = backend_ctx->fa.f32_q8_0_q1_vec_mq_split_g8_c8_hs2.at(dk_dv);
+                    fd_head_sub  = 2;
+                } else {
+                    fd_k_split   = backend_ctx->fa.f32_q8_0_q1_vec_mq_split_g8_c8.at(dk_dv);
+                }
                 use_fd_mq  = true;
                 fd_mq_wg   = 128;
             } else if (nq1_only && is_q8_0 && gqa_ratio_dispatch == 8 &&
@@ -21593,7 +21936,28 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         // it costs merge work and redundant Q loads (measured: a blanket
         // kv_per_split of 64 is -2.5% at d4096, 32 is -8.7%).
         if (use_fd_mq && backend_ctx->compute_units > 0) {
-            const int wg_per_split = n_head_kv * n_batch;
+            // 🔴 This counted n_head_kv * n_batch while the grid it is sizing is
+            // (n_head_kv * fd_head_sub * n_batch) x n_splits -- see fd_gws below.
+            // With head_sub > 1 it therefore under-counts the grid and raises
+            // n_splits further than intended. That is NOT obviously a bug to fix:
+            // this round measured that more work-groups is exactly what wins on
+            // this part (head_sub 2 -> 4 is +6.1% at d4096), so the miscount may be
+            // carrying some of the gain.
+            //
+            // It is. Correcting the count is neutral on Qwen3-30B-A3B -- 4 KV heads
+            // x head_sub 4, i.e. 16 head-groups -- but costs Qwen3.6-35B-A3B 5.4%
+            // of tg128 at d4096 (25.47 -> 24.15, both arms bracketed either side).
+            // That model has 2 KV heads and head_sub 2, so with the correct count
+            // the loop's work-group target is met with half as many splits and it
+            // ends up with half the work-groups. The under-count is load-bearing
+            // exactly where the grid is smallest, which is where it is most needed.
+            //
+            // So this stays OFF: the arithmetic is wrong but the behaviour is
+            // right, and fixing it properly means giving the MQ paths a work-group
+            // target that is not derived from a miscount, not flipping this bool.
+            // GGML_OPENCL_FD_WG_HEADSUB=1 applies the corrected count.
+            static const bool wg_headsub = ggml_cl_env_flag("GGML_OPENCL_FD_WG_HEADSUB");
+            const int wg_per_split = n_head_kv * n_batch * (wg_headsub ? fd_head_sub : 1);
             static const int wg_mult = []{
                 const char * e = getenv("GGML_OPENCL_FD_MQ_WG_MULT");
                 return (e && e[0]) ? atoi(e) : 4;
@@ -22196,7 +22560,14 @@ static void ggml_cl_conv_2d(ggml_backend_t backend, const ggml_tensor * src0, co
     backend_ctx->enqueue_ndrange_kernel(kernel, 2, global_work_size, local_work_size, dst);
 }
 
-static void ggml_cl_mul_mat_kq_kqv_adreno(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+// is_kq selects which of the two products this call is, and it is decided by the
+// CALLER -- the two admission arms in ggml_cl_mul_mat, each of which knows which
+// one it matched. It used to be re-derived here from nb01 > nb02, i.e. "K is
+// head-major, V^T is not". That discriminator COLLAPSES at n_head_kv == 1, where
+// the two strides are equal because there is only one head to order, so a KQ
+// arrived here and was served as a KQV. Nothing downstream can tell them apart
+// either, so the choice has to be passed in rather than inferred.
+static void ggml_cl_mul_mat_kq_kqv_adreno(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, bool is_kq) {
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
 
     ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *)src0->extra;
@@ -22221,6 +22592,26 @@ static void ggml_cl_mul_mat_kq_kqv_adreno(ggml_backend_t backend, const ggml_ten
 
     GGML_ASSERT(ne00 == ne10);
 
+    // Which of the two kernels served a given shape is not observable from
+    // outside: both produce a plausible result for an attention shape, and one
+    // of them did serve KQ at n_head_kv == 1 for as long as the split was
+    // inferred from strides. Print it once per distinct shape under
+    // GGML_OPENCL_KQKV_TRACE=1, so a routing claim can be checked instead of
+    // reasoned about.
+    static const bool kqkv_trace = ggml_cl_env_flag("GGML_OPENCL_KQKV_TRACE");
+    if (kqkv_trace) {
+        static std::set<std::string> traced;
+        char line[256];
+        snprintf(line, sizeof(line),
+                 "%-3s A=[%d,%d,%d] nb01=%llu nb02=%llu B=[%d,%d,%d] N=%d",
+                 is_kq ? "kq" : "kqv", ne00, ne01, ne02,
+                 (unsigned long long) nb01, (unsigned long long) nb02,
+                 ne10, ne11, ne12, ne1);
+        if (traced.insert(line).second) {
+            GGML_LOG_INFO("ggml_opencl: kqkv dispatch %s\n", line);
+        }
+    }
+
     cl_kernel kernel;
     cl_context context = backend_ctx->context;
 
@@ -22238,13 +22629,8 @@ static void ggml_cl_mul_mat_kq_kqv_adreno(ggml_backend_t backend, const ggml_ten
     int N = ne1;
     int K = ne00;
 
-    if (nb01 > nb02) {
-        // KQ
-        kernel = backend_ctx->kernel_mul_mm_f16_f32_kq;
-    } else {
-        // KQV
-        kernel = backend_ctx->kernel_mul_mm_f16_f32_kqv;
-    }
+    kernel = is_kq ? backend_ctx->kernel_mul_mm_f16_f32_kq
+                   : backend_ctx->kernel_mul_mm_f16_f32_kqv;
     // create sub-buffer for A
     // <--------------------------------------------> //
     extra0 = src0->view_src ? (ggml_tensor_extra_cl *)src0->view_src->extra : (ggml_tensor_extra_cl *)src0->extra;
@@ -22253,7 +22639,7 @@ static void ggml_cl_mul_mat_kq_kqv_adreno(ggml_backend_t backend, const ggml_ten
     // stream inside it. Dropping it makes every sequence read stream 0's cache: correct for
     // a single stream (offset 0), silently wrong for any multi-sequence server.
     region.origin = extra0->offset + src0->view_offs;
-    if (nb01 > nb02) {
+    if (is_kq) {
         // KQ
         region.size = nb01 * ne01;
     } else {
@@ -22284,7 +22670,7 @@ static void ggml_cl_mul_mat_kq_kqv_adreno(ggml_backend_t backend, const ggml_ten
     //     new overhead versus the path it replaces.
     cl_mem   b_data_device = extra1->data_device;
     cl_ulong b_origin      = extra1->offset + src1->view_offs;
-    if (nb01 <= nb02 && !ggml_is_contiguous(src1)) {
+    if (!is_kq && !ggml_is_contiguous(src1)) {
         // KQV only -- never repack B for KQ.
         backend_ctx->prealloc_src1.allocate(backend_ctx->context, ggml_nbytes(src1));
         cl_ulong cnb0, cnb1, cnb2, cnb3;
@@ -22302,7 +22688,7 @@ static void ggml_cl_mul_mat_kq_kqv_adreno(ggml_backend_t backend, const ggml_ten
     img_fmt_1d = {CL_RGBA, CL_FLOAT};
     memset(&img_desc_1d, 0, sizeof(img_desc_1d));
     img_desc_1d.image_type = CL_MEM_OBJECT_IMAGE1D_BUFFER;
-    if (nb01 > nb02) {
+    if (is_kq) {
         img_desc_1d.image_width = (nb01 * ne01 / 4)/4;
     }
     else {
@@ -26946,7 +27332,21 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                                      (nb02 == (cl_ulong)ne00 * ggml_type_size(src0t));
             const bool kq_packed_b = (nb11 == (cl_ulong)ne10 * ne12 * ggml_type_size(src1t)) &&
                                      (nb12 == (cl_ulong)ne10 * ggml_type_size(src1t));
-            if (ggml_is_permuted(src0) && ggml_is_permuted(src1) &&
+            //
+            // ggml_is_permuted(src0) stood in for "K is head-major", but it is
+            // only a proxy and it COLLAPSES at n_head_kv == 1: with a single
+            // head there is no head stride to be out of order, so nb01 == nb02
+            // and the view reports itself unpermuted (gemma-4 E2B). The packed
+            // check above is the actual contract the kernel needs -- it pins
+            // both strides exactly -- so require permutedness only where there
+            // is more than one head for it to mean anything.
+            //
+            // Default on; GGML_OPENCL_KQ_NHEAD_KV1=0 restores the old proxy so
+            // the two routings can be compared in one binary.
+            static const char * kq_nhkv1_env = getenv("GGML_OPENCL_KQ_NHEAD_KV1");
+            static const bool   kq_nhkv1_on  =
+                (kq_nhkv1_env == nullptr || kq_nhkv1_env[0] != '0');
+            if ((ggml_is_permuted(src0) || (ne02 == 1 && kq_nhkv1_on)) && ggml_is_permuted(src1) &&
                 kq_packed_a && kq_packed_b &&
                 ((nb01 * ne01 / 4)/4 <= backend_ctx->image_max_buffer_size) &&
                 nb00 <= nb02 &&
@@ -26955,14 +27355,15 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 nb10 <= nb12 &&
                 nb12 <= nb11 &&
                 nb11 <= nb13) {
-                ggml_cl_mul_mat_kq_kqv_adreno(backend, src0, src1, dst);
+                ggml_cl_mul_mat_kq_kqv_adreno(backend, src0, src1, dst, /*is_kq =*/ true);
                 return;
             }
             // For KQV. The bespoke image KQV kernel addresses A (V) through the actual
-            // nb01/nb02 strides and the internal KQ/KQV split keys off nb01 <= nb02, so a
-            // contiguous V (nb01 < nb02, e.g. Qwen3) is handled identically to a permuted
-            // view -- gate on the KQV shape (nb01 <= nb02), not on non-contiguity, so the
-            // contiguous case stops falling to the pathological generic f16 mul_mm.
+            // nb01/nb02 strides, so a contiguous V (nb01 < nb02, e.g. Qwen3) is handled
+            // identically to a permuted view -- gate on the KQV shape (nb01 <= nb02), not
+            // on non-contiguity, so the contiguous case stops falling to the pathological
+            // generic f16 mul_mm. Reaching this arm is what makes the op a KQV; the callee
+            // is told so explicitly rather than re-deriving it from the same strides.
             //
             // Layout admission: the KQV kernel receives only nb01 and walks A with a
             // per-head stride of nb01*ne01, so only layouts where that walk is correct
@@ -26976,8 +27377,8 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             // into scratch by the dispatch first -- a copy the generic l4_lm fallback
             // pays anyway. That routing is guarded by GGML_OPENCL_KQV_SRC1_COPY
             // (default on) so an A/B can restore the old "contiguous-src1 only"
-            // routing in one binary. The KQ path (nb01 > nb02, sibling gate above) is
-            // NOT affected: its kernel wants the raw physical buffer of the permuted Q
+            // routing in one binary. The KQ path (the sibling gate above) is NOT
+            // affected: its kernel wants the raw physical buffer of the permuted Q
             // view, and the dispatch never repacks B for it.
             static const char * kqv_src1_copy_env = getenv("GGML_OPENCL_KQV_SRC1_COPY");
             static const bool   kqv_src1_copy_on  =
@@ -26985,7 +27386,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             if (nb01 <= nb02 && (ggml_is_contiguous(src1) || kqv_src1_copy_on) &&
                 (ne02 == 1 || nb02 == nb01 * ne01) &&
                 ((nb01 * ne01 * ne02 / 4)/4 <= backend_ctx->image_max_buffer_size)) {
-                ggml_cl_mul_mat_kq_kqv_adreno(backend, src0, src1, dst);
+                ggml_cl_mul_mat_kq_kqv_adreno(backend, src0, src1, dst, /*is_kq =*/ false);
                 return;
             }
         }
@@ -33361,7 +33762,7 @@ static void ggml_cl_gated_delta_net(ggml_backend_t backend, ggml_tensor * dst) {
     // for S_v=128.
     // Empirically found that when spw=1, we get the best performance for both tg and pp
     const int tgpp = (n_tokens == 1) ? 0 : 1;
-    const int cpl  = (tgpp == 0) ? 1 : 4;
+    const int cpl  = ggml_opencl_gdn_cols_per_lane_group(tgpp);
     // spw needs adjustment when S_v != 128
     const int spw  = (tgpp == 0) ? 1 : 1;
 
@@ -33441,28 +33842,14 @@ static void ggml_cl_gated_delta_net(ggml_backend_t backend, ggml_tensor * dst) {
         exit(1);
     }
 
-    // For the subgroup-shuffle kernel, we can safely prefer 8 lanes/column for S_v>=128
-    // For the subgroup-shuffle kernel:
-    //   S_v >= 128  -> prefer 8 lanes/column (good occupancy & register pressure tradeoff)
-    //   else        -> min(S_v, subgroup_size)
-    int lanes_per_column;
-    if ((int)S_v >= 128) {
-        lanes_per_column = 8;
-    } else {
-        lanes_per_column = std::min((int)S_v, sg_size);
-    }
+    // Same helper the programs were compiled with -- these two were previously
+    // hand-kept copies of one heuristic, and a mismatch silently launches a kernel
+    // at the wrong geometry.
+    const int lanes_per_column = ggml_opencl_gdn_lanes_per_column((int) S_v, sg_size, cpl);
 
     // Max workgroup size for Adreno 750 is 1024
     const int wg_size = sg_size * spw;
 
-    // Ensure lanes_per_column is a power-of-two and divides both S_v and subgroup_size.
-    // (Required for lane-group shuffle-xor reduction correctness.)
-    while (lanes_per_column > 1 &&
-            (((lanes_per_column & (lanes_per_column - 1)) != 0) ||
-            (((int)S_v % lanes_per_column) != 0) ||
-            (sg_size % lanes_per_column) != 0)) {
-        lanes_per_column >>= 1;
-    }
     GGML_ASSERT(lanes_per_column >= 1);
     GGML_ASSERT(((lanes_per_column & (lanes_per_column - 1)) == 0));
     GGML_ASSERT(((int)S_v % lanes_per_column) == 0);
