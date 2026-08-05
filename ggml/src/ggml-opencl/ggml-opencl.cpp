@@ -73,6 +73,81 @@ typedef const void * (*get_adreno_bin_kernel_func_t)(
 //------------------------------------------------------------------------------
 
 bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor);
+
+// gated_delta_net lane geometry. The build site and the dispatcher have to agree
+// exactly -- they were two hand-kept copies of the same heuristic, which is not a
+// safe place to add a tuning knob, so both now call these.
+//
+// LANES_PER_COLUMN: how many lanes cooperate on one column of the recurrent
+// state. The 8-for-S_V>=128 rule came across from the Vulkan shader, where it is
+// conditioned on subgroupClustered making a narrow reduce cheap. Every backend
+// that was tuned against its own hardware gives a FULL warp/sub-group to one
+// column instead -- CUDA and SYCL use min(warp_size, S_v) = 32, Metal one
+// simdgroup. At 8 lanes on a 64-wide Adreno wave each state access touches eight
+// disjoint 32-byte chunks, and the state is essentially this kernel's entire
+// traffic (S_v*S_v*H_v floats read and written per token, ~0.5 FLOP/byte).
+// Widening also divides ROWS_PER_LANE -- hence the s_shard/k_reg/q_reg/g_exp
+// register footprint -- and multiplies the work-group count by the same factor.
+// GGML_OPENCL_GDN_LANES_PER_COLUMN sweeps it without a rebuild; 0/unset keeps
+// the inherited default.
+static int ggml_opencl_gdn_lanes_per_column(int S_V, int sg_size, int cpl) {
+    static const int env = []{
+        const char * e = getenv("GGML_OPENCL_GDN_LANES_PER_COLUMN");
+        return (e && e[0]) ? atoi(e) : 0;
+    }();
+
+    // COLS_PER_WG = (sg_size / lpc) * cpl, and the dispatcher asserts
+    // S_V % COLS_PER_WG == 0. The inherited rule satisfied that only by accident:
+    // it takes min(S_V, sg_size) below S_V=128, which always leaves
+    // COLS_PER_WG == cpl. Anything that picks a narrower lpc at a small S_V --
+    // e.g. the 8 that S_V>=128 uses -- aborts the op, so validate here rather
+    // than let the assert be the check.
+    auto geometry_ok = [&](int lpc) {
+        const int cols_per_wg = (sg_size / lpc) * cpl;
+        return cols_per_wg > 0 && (S_V % cols_per_wg) == 0;
+    };
+    auto normalize = [&](int lpc) {
+        // Power-of-two, divides both S_V and sg_size.
+        while (lpc > 1 &&
+               (((lpc & (lpc - 1)) != 0) || (S_V % lpc) != 0 || (sg_size % lpc) != 0)) {
+            lpc >>= 1;
+        }
+        return lpc;
+    };
+
+    const int inherited = normalize(S_V >= 128 ? 8 : (S_V < sg_size ? S_V : sg_size));
+
+    if (env <= 0) {
+        return inherited;
+    }
+
+    int lpc = normalize(env < S_V ? env : S_V);
+    // Widen until the work-group geometry is legal; a narrower lpc means MORE
+    // columns per work-group, so widening is the direction that fixes it.
+    while (!geometry_ok(lpc) && lpc < sg_size && lpc < S_V) {
+        lpc <<= 1;
+        lpc = normalize(lpc);
+    }
+    // A non-power-of-two cpl can leave nothing legal; keep the shipped geometry
+    // rather than launching one the dispatcher will assert on.
+    return geometry_ok(lpc) ? lpc : inherited;
+}
+
+// COLS_PER_LANE_GROUP: columns each lane group carries. 1 at decode; the prompt
+// value of 4 is recorded as an Adreno 750 register-budget choice (128 registers
+// per work-item), so it is worth re-checking on other parts.
+// GGML_OPENCL_GDN_CPL_PP overrides the prompt value.
+static int ggml_opencl_gdn_cols_per_lane_group(int tgpp) {
+    static const int env = []{
+        const char * e = getenv("GGML_OPENCL_GDN_CPL_PP");
+        return (e && e[0]) ? atoi(e) : 0;
+    }();
+    if (tgpp == 0) {
+        return 1;
+    }
+    return env > 0 ? env : 4;
+}
+
 static bool ggml_cl_is_q4_0_soa(const ggml_tensor * tensor);
 static bool ggml_cl_is_q8_0_soa(const ggml_tensor * tensor);
 static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
@@ -3173,40 +3248,32 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         for (int si = 0; si < 4; si++) {
             const int S_V = gdn_sizes[si];
 
-            // MUST match the dispatcher heuristic in ggml_cl_gated_delta_net exactly.
-            int lanes_per_column;
-            if (S_V >= 128) {
-                lanes_per_column = 8;
-            } else {
-                lanes_per_column = std::min(S_V, sg_size);
-            }
-
-            // Round LANES_PER_COLUMN down until it is:
-            //  * power-of-two
-            //  * divides both S_V and sg_size
-            while (lanes_per_column > 1 &&
-                    (((lanes_per_column & (lanes_per_column - 1)) != 0) ||
-                    (S_V % lanes_per_column) != 0 ||
-                    (sg_size % lanes_per_column) != 0)) {
-                lanes_per_column >>= 1;
-            }
-
-            GGML_ASSERT(lanes_per_column >= 1);
-            GGML_ASSERT(((lanes_per_column & (lanes_per_column - 1)) == 0));
-            GGML_ASSERT((S_V % lanes_per_column) == 0);
-            GGML_ASSERT((sg_size % lanes_per_column) == 0);
-
-            const bool is_partial_reduce = (lanes_per_column != 1) && (lanes_per_column < sg_size);
-            int use_qcom_shuffle = 0;
-            if (is_partial_reduce) {
-                if (backend_ctx->has_qcom_subgroup_shuffle) {
-                    use_qcom_shuffle = 1;
-                }
-            }
             for (int kda = 0; kda < 2; kda++) {
                 for (int tgpp = 0; tgpp < 2; tgpp++) {
-                    const int cpl = (tgpp == 0) ? 1 : 4;
+                    const int cpl = ggml_opencl_gdn_cols_per_lane_group(tgpp);
                     const int spw  = (tgpp == 0) ? 1 : 1;
+
+                    // Shared with the dispatcher in ggml_cl_gated_delta_net -- the two
+                    // used to hand-copy this heuristic and had to be kept in sync by
+                    // comment. It depends on cpl (COLS_PER_WG has to divide S_V), so it
+                    // belongs inside the tgpp loop, not outside it.
+                    const int lanes_per_column =
+                        ggml_opencl_gdn_lanes_per_column(S_V, sg_size, cpl);
+
+                    GGML_ASSERT(lanes_per_column >= 1);
+                    GGML_ASSERT(((lanes_per_column & (lanes_per_column - 1)) == 0));
+                    GGML_ASSERT((S_V % lanes_per_column) == 0);
+                    GGML_ASSERT((sg_size % lanes_per_column) == 0);
+
+                    // The XOR-butterfly shuffle path is correct for the full-wave case
+                    // too -- it simply runs one more step. Gating it on
+                    // lanes_per_column < sg_size sent LANES_PER_COLUMN == SUBGROUP_SIZE
+                    // to the __local + barrier fallback, which is the one configuration
+                    // where the reduce is entirely intra-wave and needs no memory at
+                    // all. Vulkan's sibling shader takes a full subgroupAdd there for
+                    // the same reason.
+                    const int use_qcom_shuffle =
+                        (lanes_per_column != 1 && backend_ctx->has_qcom_subgroup_shuffle) ? 1 : 0;
 
                     std::string opts = compile_opts;
                     opts += " -DS_V=" + std::to_string(S_V);
@@ -3215,6 +3282,15 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                     opts += " -DLANES_PER_COLUMN=" + std::to_string(lanes_per_column);
                     opts += " -DCOLS_PER_LANE_GROUP=" + std::to_string(cpl);
                     opts += " -DUSE_QCOM_SUBGROUP_SHUFFLE=" + std::to_string(use_qcom_shuffle);
+                    // Metal's contiguous intra-lane row mapping (float2/float4-able).
+                    // Independent of LANES_PER_COLUMN, so the lane-width sweep that
+                    // closed that knob says nothing about this one. Changes the
+                    // reduction's summation order -> needs its own TBO pass.
+                    static const bool lane_contig = []{
+                        const char * e = getenv("GGML_OPENCL_GDN_LANE_CONTIG");
+                        return e != nullptr && e[0] != '\0' && e[0] != '0';
+                    }();
+                    opts += lane_contig ? " -DGDN_LANE_CONTIG=1" : "";
 
                     // Since spw=1 is found to be optimal, SUBGROUPS_PER_WG > 1 code in
                     // the kernel is removed. If you want to experiment with spw > 1,
@@ -24329,7 +24405,7 @@ static void ggml_cl_gated_delta_net(ggml_backend_t backend, ggml_tensor * dst) {
     // for S_v=128.
     // Empirically found that when spw=1, we get the best performance for both tg and pp
     const int tgpp = (n_tokens == 1) ? 0 : 1;
-    const int cpl  = (tgpp == 0) ? 1 : 4;
+    const int cpl  = ggml_opencl_gdn_cols_per_lane_group(tgpp);
     // spw needs adjustment when S_v != 128
     const int spw  = (tgpp == 0) ? 1 : 1;
 
@@ -24409,28 +24485,14 @@ static void ggml_cl_gated_delta_net(ggml_backend_t backend, ggml_tensor * dst) {
         exit(1);
     }
 
-    // For the subgroup-shuffle kernel, we can safely prefer 8 lanes/column for S_v>=128
-    // For the subgroup-shuffle kernel:
-    //   S_v >= 128  -> prefer 8 lanes/column (good occupancy & register pressure tradeoff)
-    //   else        -> min(S_v, subgroup_size)
-    int lanes_per_column;
-    if ((int)S_v >= 128) {
-        lanes_per_column = 8;
-    } else {
-        lanes_per_column = std::min((int)S_v, sg_size);
-    }
+    // Same helper the programs were compiled with -- these two were previously
+    // hand-kept copies of one heuristic, and a mismatch silently launches a kernel
+    // at the wrong geometry.
+    const int lanes_per_column = ggml_opencl_gdn_lanes_per_column((int) S_v, sg_size, cpl);
 
     // Max workgroup size for Adreno 750 is 1024
     const int wg_size = sg_size * spw;
 
-    // Ensure lanes_per_column is a power-of-two and divides both S_v and subgroup_size.
-    // (Required for lane-group shuffle-xor reduction correctness.)
-    while (lanes_per_column > 1 &&
-            (((lanes_per_column & (lanes_per_column - 1)) != 0) ||
-            (((int)S_v % lanes_per_column) != 0) ||
-            (sg_size % lanes_per_column) != 0)) {
-        lanes_per_column >>= 1;
-    }
     GGML_ASSERT(lanes_per_column >= 1);
     GGML_ASSERT(((lanes_per_column & (lanes_per_column - 1)) == 0));
     GGML_ASSERT(((int)S_v % lanes_per_column) == 0);

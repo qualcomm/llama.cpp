@@ -40,6 +40,31 @@
 #define COLS_PER_WG         (SUBGROUPS_PER_WG * COLS_PER_SG)
 #define ROWS_PER_LANE       (S_V / LANES_PER_COLUMN)
 
+// Which S_V rows a lane owns within its column.
+//
+// Default (GDN_LANE_CONTIG=0) is the inherited stride-by-lane-count mapping,
+// shared with the Vulkan sibling shader: lane L holds rows L, L+LPC, L+2*LPC...
+// A lane's own elements are then LPC apart, so nothing vectorises, and one
+// instruction's worth of a wave touches LANE_GROUPS_PER_SG disjoint runs of
+// LPC floats.
+//
+// GDN_LANE_CONTIG=1 is Metal's mapping (kernel_gated_delta_net_impl uses
+// is = tx*NSG + j): lane L holds ROWS_PER_LANE CONSECUTIVE rows, so each lane's
+// state/k/q/g run is contiguous and can be a float2/float4 load, which is the
+// Adreno guide's standing advice. Both mappings read exactly the same bytes --
+// only the lane-to-element assignment differs -- but the reduction then sums in
+// a different order, so this is not bit-identical and needs its own
+// test-backend-ops pass rather than inheriting the default's.
+#ifndef GDN_LANE_CONTIG
+#define GDN_LANE_CONTIG 0
+#endif
+
+#if GDN_LANE_CONTIG
+#define GDN_ROW(r)  ((lane) * ROWS_PER_LANE + (r))
+#else
+#define GDN_ROW(r)  ((r) * LANES_PER_COLUMN + (lane))
+#endif
+
 #if USE_QCOM_SUBGROUP_SHUFFLE
 #pragma OPENCL EXTENSION cl_qcom_subgroup_shuffle : enable
 #endif
@@ -140,7 +165,7 @@ kernel void kernel_gated_delta_net(
         const uint col = sg_col_base + cg * LANE_GROUPS_PER_SG + lane_group;
         #pragma unroll
         for (uint r = 0; r < ROWS_PER_LANE; r++) {
-            s_shard[cg][r] = data_state[state_base + col * S_V + r * LANES_PER_COLUMN + lane];
+            s_shard[cg][r] = data_state[state_base + col * S_V + GDN_ROW(r)];
         }
     }
 
@@ -161,7 +186,7 @@ kernel void kernel_gated_delta_net(
         float g_exp[ROWS_PER_LANE];
         #pragma unroll
         for (uint r = 0; r < ROWS_PER_LANE; r++) {
-            const uint i = r * LANES_PER_COLUMN + lane;
+            const uint i = GDN_ROW(r);
             k_reg[r] = data_k[k_off + i];
             q_reg[r] = data_q[q_off + i];
             g_exp[r] = exp(data_g[gb_off * S_V + i]);
@@ -171,7 +196,7 @@ kernel void kernel_gated_delta_net(
 
         #pragma unroll
         for (uint r = 0; r < ROWS_PER_LANE; r++) {
-            const uint i = r * LANES_PER_COLUMN + lane;
+            const uint i = GDN_ROW(r);
             k_reg[r] = data_k[k_off + i];
             q_reg[r] = data_q[q_off + i];
         }
@@ -229,7 +254,7 @@ kernel void kernel_gated_delta_net(
                     const uint slot_base = s_off + (uint)target_slot * state_size_per_snap + state_out_base;
                     #pragma unroll
                     for (uint r = 0; r < ROWS_PER_LANE; r++) {
-                        data_dst[slot_base + col * S_V + r * LANES_PER_COLUMN + lane] = s_shard[cg][r];
+                        data_dst[slot_base + col * S_V + GDN_ROW(r)] = s_shard[cg][r];
                     }
                 }
             }
@@ -242,7 +267,7 @@ kernel void kernel_gated_delta_net(
             const uint col = sg_col_base + cg * LANE_GROUPS_PER_SG + lane_group;
             #pragma unroll
             for (uint r = 0; r < ROWS_PER_LANE; r++) {
-                data_dst[s_off + state_base + col * S_V + r * LANES_PER_COLUMN + lane] = s_shard[cg][r];
+                data_dst[s_off + state_base + col * S_V + GDN_ROW(r)] = s_shard[cg][r];
             }
         }
     }
