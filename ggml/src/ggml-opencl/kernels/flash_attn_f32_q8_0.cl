@@ -345,6 +345,35 @@ inline float4 dequant_q8_0_lane(const global char * block_ptr, int lane) {
     return d * (float4)((float)qs[0], (float)qs[1], (float)qs[2], (float)qs[3]);
 }
 
+// Timing probes for the q8_0 decode gap. q8_0 KV moves HALF the bytes of f16
+// and is ~20% slower at depth, and the cluster kernels are structurally
+// identical apart from these two loads -- so the cost is in here, but the
+// block layout hides two candidates behind each other:
+//
+//   the 2-byte scale is loaded per LANE while only 2 distinct scales exist per
+//   cluster row (dk=64, FA_CL_C=16 => 8 lanes share a block), and
+//
+//   the payload sits at block+2, so every 4-byte quartet read is 2-byte
+//   misaligned, where the f16 twin reads aligned float4s.
+//
+// Both probes are numerically WRONG on purpose. They keep the control flow,
+// the shuffle chain and the mad count identical, so the delta is the load
+// being removed and nothing else. Same method as GGML_OPENCL_FA16_PROBE_NO_LDS.
+//
+//   FA_Q8_PROBE_NOSCALE — drop the scale load only (payload still read).
+//   FA_Q8_PROBE_NODEQ   — drop the scale AND the payload (ceiling: what the
+//                         kernel costs with the KV read removed entirely).
+inline float4 dequant_q8_0_lane_probe(const global char * block_ptr, int lane) {
+#if defined(FA_Q8_PROBE_NODEQ)
+    return (float4)(1.0f, 1.0f, 1.0f, 1.0f);
+#elif defined(FA_Q8_PROBE_NOSCALE)
+    const global char * qs = block_ptr + 2 + lane * 4;
+    return (float4)((float)qs[0], (float)qs[1], (float)qs[2], (float)qs[3]);
+#else
+    return dequant_q8_0_lane(block_ptr, lane);
+#endif
+}
+
 // dp4a QK dot for the decode (q1) kernels: staged Q rows are requantized to
 // packed int8 once per WG (same requantization as the q1_split int path), so
 // the KV sweep replaces dequant+float-mad with one integer dot per quartet.
@@ -1290,7 +1319,7 @@ __kernel void flash_attn_f32_q8_0_q1_vec_mq_split_c8(
         #pragma unroll
         for (int i = 0; i < FA_CL_DKQ; ++i) {
             const int qk = lic + FA_CL_C * i;
-            const float4 k_v = dequant_q8_0_lane(k_row + (qk / 8) * Q8_0_BLOCK_SIZE, qk % 8);
+            const float4 k_v = dequant_q8_0_lane_probe(k_row + (qk / 8) * Q8_0_BLOCK_SIZE, qk % 8);
             #pragma unroll
             for (int h = 0; h < MQ_GQA; ++h) {
                 dot4[h] = mad(q_shared[h * DK_VEC + qk], k_v, dot4[h]);
@@ -1338,7 +1367,7 @@ __kernel void flash_attn_f32_q8_0_q1_vec_mq_split_c8(
         #pragma unroll
         for (int i = 0; i < FA_CL_DVQ; ++i) {
             const int dv = lic + FA_CL_C * i;
-            const float4 v_v = dequant_q8_0_lane(v_row + (dv / 8) * Q8_0_BLOCK_SIZE, dv % 8);
+            const float4 v_v = dequant_q8_0_lane_probe(v_row + (dv / 8) * Q8_0_BLOCK_SIZE, dv % 8);
             #pragma unroll
             for (int h = 0; h < MQ_GQA; ++h) {
                 o_acc[h][i] = mad(p_h[h], v_v, o_acc[h][i] * sp_h[h]);

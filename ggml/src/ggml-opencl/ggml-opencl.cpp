@@ -7016,8 +7016,23 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
             // FA_CL_C as the f16 dk=64 program -- at DK_VEC=16 a width of 8 would
             // double the per-lane o_acc for MQ_GQA=8.
             if (is_q8 && dk == 64 && dv == 64 && backend_ctx->has_subgroup_shuffle) {
+                // Timing probes for the q8_0-vs-f16 decode gap. Numerically
+                // WRONG -- they delete a load and keep everything else -- so
+                // they measure where the gap lives, they do not ship.
+                //   GGML_OPENCL_FA_Q8_PROBE=noscale  drop the per-lane scale load
+                //   GGML_OPENCL_FA_Q8_PROBE=nodeq    drop the KV read entirely
+                static const char * q8_probe = getenv("GGML_OPENCL_FA_Q8_PROBE");
+                std::string opts_q8_probe;
+                if (q8_probe != nullptr) {
+                    if (strcmp(q8_probe, "noscale") == 0) {
+                        opts_q8_probe = " -D FA_Q8_PROBE_NOSCALE";
+                    } else if (strcmp(q8_probe, "nodeq") == 0) {
+                        opts_q8_probe = " -D FA_Q8_PROBE_NODEQ";
+                    }
+                }
                 const std::string opts_q8_g8c16 = opts +
-                    " -D MQ_GQA=8 -D MQ_NSG=2 -D MQ_NSG_SPLIT=2 -D FA_CL_C=16" + opts_q8_int;
+                    " -D MQ_GQA=8 -D MQ_NSG=2 -D MQ_NSG_SPLIT=2 -D FA_CL_C=16" +
+                    opts_q8_int + opts_q8_probe;
                 cl_program prog_q8_g8c16 = build_program_from_source_ex_cached(
                     backend_ctx, src.c_str(), opts_q8_g8c16,
                     /*fatal=*/false, "fa q8_0 c16 GQA8 dk64", /*bin_size=*/0, backend_ctx->queue);
