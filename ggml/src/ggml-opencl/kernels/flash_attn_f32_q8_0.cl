@@ -1341,10 +1341,19 @@ __kernel void flash_attn_f32_q8_0_q1_vec_mq_split_c8(
                 s += sub_group_shuffle_xor(s, step);
             }
             s *= scale;
+            // FA_Q8_PROBE_NOMASK: timing probe for whether FA_CL_MASK_BCAST is
+            // worth porting. Every lane of the cluster loads mask_ptr[k_safe]
+            // for the same k_safe, so per cluster row this is MQ_GQA*FA_CL_C =
+            // 128 loads of 8 distinct values -- the same redundancy shape as
+            // the block scale, which measured EXACTLY 0 because the lanes hit
+            // one cache line. Numerically wrong; delete the load, keep the
+            // control flow, and see whether there is anything there to win.
+#ifndef FA_Q8_PROBE_NOMASK
             if (mask_base[h] != NULL) {
                 const global MASK_DATA_TYPE * mask_ptr = (const global MASK_DATA_TYPE *) mask_base[h];
                 s += slope[h] * (ACC_TYPE) mask_ptr[k_safe];
             }
+#endif
             if (logit_softcap > 0.0f) {
                 s = logit_softcap * tanh(s / logit_softcap);
             }

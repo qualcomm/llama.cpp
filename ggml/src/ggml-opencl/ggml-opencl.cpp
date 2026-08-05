@@ -7028,6 +7028,8 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
                         opts_q8_probe = " -D FA_Q8_PROBE_NOSCALE";
                     } else if (strcmp(q8_probe, "nodeq") == 0) {
                         opts_q8_probe = " -D FA_Q8_PROBE_NODEQ";
+                    } else if (strcmp(q8_probe, "nomask") == 0) {
+                        opts_q8_probe = " -D FA_Q8_PROBE_NOMASK";
                     }
                 }
                 const std::string opts_q8_g8c16 = opts +
