@@ -143,6 +143,14 @@ static inline bool ggml_cl_env_flag(const char * name) {
     return v != nullptr && v[0] != '\0';
 }
 
+// Explicit "=0" test, for knobs that are default-ON and need an opt-out.
+// ggml_cl_env_flag above treats any non-empty value as true, so it cannot
+// express one.
+static inline bool ggml_cl_env_flag_zero(const char * name) {
+    const char * v = getenv(name);
+    return v != nullptr && v[0] == '0';
+}
+
 // gated_delta_net lane geometry. The build site and the dispatcher have to agree
 // exactly -- they were two hand-kept copies of the same heuristic, which is not a
 // safe place to add a tuning knob, so both now call these.
@@ -6865,18 +6873,33 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
             // Deliberately the GQA4 c8 options plus FA_HEAD_SUB and nothing else
             // -- no MHRED, no mask broadcast -- so a measurement attributes to
             // the head split alone rather than to a bundle.
-            // Opt-in until measured: GGML_OPENCL_FA_G8_HS_DK128=1.
+            // DEFAULT ON; opt out with GGML_OPENCL_FA_G8_HS_DK128=0. No device
+            // predicate, matching the gqa 4 / 8 arms it sits beside: all three
+            // generations that reach this dispatch were measured and none
+            // inverts. Per-op (test-backend-ops perf, dk=128 gqa=8 f16, nb=1),
+            // route off -> on:
+            //
+            //   X2-90       kv4096  552 ->  368 us (+50%)   kv8192 1100 ->  725 (+52%)
+            //   840  (A8X)  kv4096 2082 -> 1144 us (+82%)   kv8192 3470 -> 2235 (+55%)
+            //   X1-85 (X1E) kv4096 1596 ->  751 us (+112%)  kv8192 3214 -> 1466 (+119%)
+            //
+            // FLASH_ATTN_EXT is 0 FAIL in both routings on each, matching that
+            // device's own unpatched baseline (X2 2696 OK, 840 2699, X1-85 2696).
+            // End-to-end is X2-only on purpose: Qwen3-30B-A3B is the fleet's only
+            // dk=128 gqa=8 model and neither the 840 (19.5 GB MemAvailable) nor
+            // X1-85 (~6 GB per-context cap) can hold it, so the per-op number is
+            // what carries the other two generations.
             if (!fa_decode_only && dk == 128 && dv == 128 &&
                 backend_ctx->has_subgroup_shuffle &&
-                ggml_cl_env_flag("GGML_OPENCL_FA_G8_HS_DK128")) {
-                // 8 is allowed (MQ_GQA=1, one query head per work-group): hs2 -> hs4
-                // measured +6.1%/+2.9% at d4096/d8192 on top of hs2's own win, so the
-                // grid mechanism had not saturated at 4 and the next point is worth a
-                // measurement rather than an assumption.
+                !ggml_cl_env_flag_zero("GGML_OPENCL_FA_G8_HS_DK128")) {
+                // 4 is the measured optimum, not an extrapolation. X2-90 tg128 at
+                // d4096/d8192: 31.1/24.7 at FA_HEAD_SUB=2, 33.0/25.7 at 4, and
+                // 30.5/23.3 at 8 -- MQ_GQA=1 overshoots and lands BELOW 2, so the
+                // grid mechanism saturates here rather than continuing.
                 static const int hs_n = []{
                     const char * e = std::getenv("GGML_OPENCL_FA_G8_HS_DK128_SUB");
-                    const int v = (e && e[0]) ? atoi(e) : 2;
-                    return (v == 2 || v == 4 || v == 8) ? v : 2;
+                    const int v = (e && e[0]) ? atoi(e) : 4;
+                    return (v == 2 || v == 4 || v == 8) ? v : 4;
                 }();
                 static const int hs_nsg = []{
                     const char * e = std::getenv("GGML_OPENCL_FA_G8_HS_DK128_NSG");
@@ -20466,9 +20489,25 @@ static bool ggml_cl_flash_attn_decompose(
         const char * e = getenv("GGML_OPENCL_FA_DECOMPOSE_MIN_DK");
         return (e && e[0]) ? atoi(e) : 0;
     }();
+    // 🔴 The X2E half of the table above was an ARTIFACT of the chunk budget,
+    // not a property of dk=128. Qwen3-4B's "-1.1% at pp4096" is what set X2E to
+    // 256, and at pp4096 the old 32 MB budget handed that model a 64-query chunk
+    // -- two n-tiles. With the tile floor in place (see the chunking below),
+    // X2-90 fused -> decomposed at pp2048 / pp4096 is:
+    //
+    //   Qwen3-4B      449 / 334 -> 516 / 414   (+15% / +24%)
+    //   Qwen3-8B      267 / 222 -> 288 / 253   (+8%  / +14%)
+    //   Llama-3-8B    309 / 255 -> 336 / 294   (+8%  / +15%)
+    //   Qwen3-30B-A3B 397 / 282 -> 472 / 365   (+19% / +29%)
+    //
+    // three dense models and one MoE, two reversed passes each, so X2E joins A8X
+    // at dk>=128. X1E stays at 256: it runs BOTH GEMMs on the generic mul_mat
+    // (it declines the tuned image kernels), and dk=128 has never been measured
+    // there -- a different code path, not merely a different constant.
     const int min_dk = min_dk_env > 0
                      ? min_dk_env
-                     : (backend_ctx->adreno_gen == ADRENO_GPU_GEN::A8X ? 128 : 256);
+                     : ((backend_ctx->adreno_gen == ADRENO_GPU_GEN::A8X ||
+                         backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E) ? 128 : 256);
     const bool measured_shape = dk >= min_dk;
 
     if (!(env_override >= 0 ? env_override == 1 : (measured_gen && measured_shape))) {
@@ -21294,13 +21333,31 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         // alternating SWA layers (gpt-oss: swa_period=2, window 128) sit at
         // n_kv == 256 on half their layers and so never reach any KV-sharing
         // kernel at any depth -- they run the legacy per-head q1 instead.
-        // Opt-in (GGML_OPENCL_FD_MIN_N_KV_MQ=128): worth ~+1.2% tg32 on
-        // gpt-oss-20b/X2-90 once the partials buffer is pooled, but it changes
-        // decode routing for every model below FD_MIN_N_KV and has only been
-        // measured on one. Default is unchanged.
+        // This defaulted to FD_MIN_N_KV (2048) and was left opt-in on the grounds
+        // that it changes decode routing for every model below that and had only
+        // been measured on one. It has now been measured on four, and inheriting
+        // the split-tuned constant was simply wrong: below 2048 the MQ routes --
+        // including the dk=128 gqa=8 head split -- did not engage AT ALL, so a
+        // model spent its whole shallow-context life on the legacy per-head q1.
+        //
+        // X2-90 tg128, floor 2048 -> 32, each arm bracketed by an off arm either
+        // side:
+        //
+        //   Qwen3-30B-A3B  d0 41.3 -> 46.5 (+12%)  d1024 25.7 -> 41.8 (+63%)
+        //   Qwen3-4B       d0 38.8 -> 42.6 (+10%)  d1024 27.2 -> 39.0 (+43%)
+        //   gpt-oss-20b    d0 39.1 -> 39.6 (+1%)   d1024 35.8 -> 38.6 (+8%)
+        //   gemma-4-26B    d0 37.7 -> 37.5         d1024 33.8 -> 33.4
+        //
+        // and d4096 is flat everywhere (-0.9% to +2.0%), which is the control:
+        // above the old floor the routing is unchanged, so those columns should
+        // not move and they do not. gemma-4-26B is the neutral case rather than a
+        // regression -- its deltas sit inside the spread of its own two off arms.
+        //
+        // 32 rather than 128 because the d0 win needs a floor below n_kv there.
+        // GGML_OPENCL_FD_MIN_N_KV_MQ restores any value, including the old 2048.
         static const int fd_min_n_kv_mq = []{
             const char * e = getenv("GGML_OPENCL_FD_MIN_N_KV_MQ");
-            return (e && e[0]) ? atoi(e) : FD_MIN_N_KV;
+            return (e && e[0]) ? atoi(e) : 32;
         }();
         // A shape with a narrow (purpose-built) MQ kernel carries its own,
         // much lower n_kv floor. Those kernels exist only for shapes whose
@@ -21884,9 +21941,21 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
             // With head_sub > 1 it therefore under-counts the grid and raises
             // n_splits further than intended. That is NOT obviously a bug to fix:
             // this round measured that more work-groups is exactly what wins on
-            // this part (head_sub 2 -> 4 is +6.1% at d4096), so the miscount may
-            // be carrying some of the gain. GGML_OPENCL_FD_WG_HEADSUB=1 applies
-            // the corrected count so the two can be compared rather than assumed.
+            // this part (head_sub 2 -> 4 is +6.1% at d4096), so the miscount may be
+            // carrying some of the gain.
+            //
+            // It is. Correcting the count is neutral on Qwen3-30B-A3B -- 4 KV heads
+            // x head_sub 4, i.e. 16 head-groups -- but costs Qwen3.6-35B-A3B 5.4%
+            // of tg128 at d4096 (25.47 -> 24.15, both arms bracketed either side).
+            // That model has 2 KV heads and head_sub 2, so with the correct count
+            // the loop's work-group target is met with half as many splits and it
+            // ends up with half the work-groups. The under-count is load-bearing
+            // exactly where the grid is smallest, which is where it is most needed.
+            //
+            // So this stays OFF: the arithmetic is wrong but the behaviour is
+            // right, and fixing it properly means giving the MQ paths a work-group
+            // target that is not derived from a miscount, not flipping this bool.
+            // GGML_OPENCL_FD_WG_HEADSUB=1 applies the corrected count.
             static const bool wg_headsub = ggml_cl_env_flag("GGML_OPENCL_FD_WG_HEADSUB");
             const int wg_per_split = n_head_kv * n_batch * (wg_headsub ? fd_head_sub : 1);
             static const int wg_mult = []{
