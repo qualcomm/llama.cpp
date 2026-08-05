@@ -20526,10 +20526,38 @@ static bool ggml_cl_flash_attn_decompose(
     // Chunk the queries so the KQ scores stay bounded. Two ceilings: a byte
     // budget, and the element count of the image1d_buffer the KQ dispatch wraps
     // dst in -- overshooting the latter silently drops to the generic GEMM.
+    // 🔴 The 32 MB this defaulted to was measured, and it is too small at depth.
+    // n_q_chunk = budget / (n_kv * n_head * 4), so the chunk SHRINKS as the
+    // context grows: Qwen3-30B-A3B (n_head 32) gets 128 queries at n_kv=2048 but
+    // only 64 at 4096 -- two 32-wide n-tiles for GEMMs whose admission threshold
+    // is 32. X2-90, decomposed pp4096: 32 MB -> 323/326 t/s, 128 MB -> 360/364,
+    // 512 MB -> 364/364 (2 reversed passes). +12.2%, and it takes -fa 1 prefill
+    // from -7.9% against -fa 0 to +4.0%. pp2048 moves only +0.9%, because there
+    // the old budget already bought a usable chunk -- which is exactly why this
+    // was never caught: it only bites past the depth anyone had measured.
+    //
+    // 128 MB was already enough at 4k and 512 added nothing, so the default sits
+    // at 256 MB: one doubling of headroom for 8k, not four.
     static const size_t budget_bytes = []{
         const char * e = getenv("GGML_OPENCL_FA_DECOMPOSE_MB");
-        const int mb = (e && e[0]) ? atoi(e) : 32;
-        return (size_t)(mb > 0 ? mb : 32) * 1024 * 1024;
+        const int mb = (e && e[0]) ? atoi(e) : 256;
+        return (size_t)(mb > 0 ? mb : 256) * 1024 * 1024;
+    }();
+    // Hard floor in 32-wide n-tiles, and a hard ceiling that overrides it.
+    // The floor is what stops the budget quietly starving the GEMM at long
+    // context; the ceiling is what stops the floor allocating without bound
+    // there (the whole point of this path is that its scratch is chunk-bounded).
+    // Where they conflict the ceiling wins and the chunk shrinks -- that trade is
+    // real and unavoidable, it was just sitting at a badly chosen point.
+    static const int64_t min_tiles = []{
+        const char * e = getenv("GGML_OPENCL_FA_DECOMPOSE_MIN_TILES");
+        const int v = (e && e[0]) ? atoi(e) : 8;
+        return (int64_t)(v > 0 ? v : 8);
+    }();
+    static const size_t max_bytes = []{
+        const char * e = getenv("GGML_OPENCL_FA_DECOMPOSE_MAX_MB");
+        const int mb = (e && e[0]) ? atoi(e) : 768;
+        return (size_t)(mb > 0 ? mb : 768) * 1024 * 1024;
     }();
     const size_t kq_row_bytes = (size_t)n_kv * n_head * sizeof(float);
     if (kq_row_bytes == 0) {
@@ -20537,13 +20565,19 @@ static bool ggml_cl_flash_attn_decompose(
     }
     int64_t n_q_chunk = MIN((int64_t)(budget_bytes / kq_row_bytes), (int64_t)n_q);
     // ne1 >= 32 is the tuned KQ/KQV admission threshold. Treat the byte budget
-    // as advisory and keep at least one full n-tile even when that exceeds it:
-    // n_kv grows with the context, so a fixed budget would quietly shrink the
-    // chunk below 32 at depth, route back to the generic GEMM and give up the
-    // whole point of the path exactly where prefill hurts most. One tile of KQ
-    // at a 32k context is ~64 MB -- large, but bounded by the chunk, which is
-    // the property that matters against -fa 0's whole-ubatch allocation.
-    n_q_chunk = MAX(n_q_chunk, (int64_t)32);
+    // as advisory and keep at least min_tiles full n-tiles even when that
+    // exceeds it: n_kv grows with the context, so a fixed budget quietly shrinks
+    // the chunk at depth, and a chunk of one or two tiles hands the tuned GEMM
+    // shapes it is not tuned for (measured: 64 queries at pp4096 costs 12%).
+    // Bounded by the chunk either way, which is the property that matters
+    // against -fa 0's whole-ubatch allocation.
+    n_q_chunk = MAX(n_q_chunk, MIN(min_tiles * 32, (int64_t)n_q));
+    // ...but never past the hard scratch ceiling. KQ dominates the three
+    // buffers, so size the cap off it.
+    const int64_t ceil_chunk = (int64_t)(max_bytes / kq_row_bytes);
+    if (ceil_chunk >= 32) {
+        n_q_chunk = MIN(n_q_chunk, ceil_chunk);
+    }
     // The image1d_buffer the KQ dispatch wraps dst in is a hard device limit,
     // so it caps the chunk after the floor rather than before it.
     const int64_t img_limit = (int64_t)backend_ctx->image_max_buffer_size / ((int64_t)n_kv * n_head);
@@ -21845,7 +21879,16 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         // it costs merge work and redundant Q loads (measured: a blanket
         // kv_per_split of 64 is -2.5% at d4096, 32 is -8.7%).
         if (use_fd_mq && backend_ctx->compute_units > 0) {
-            const int wg_per_split = n_head_kv * n_batch;
+            // 🔴 This counted n_head_kv * n_batch while the grid it is sizing is
+            // (n_head_kv * fd_head_sub * n_batch) x n_splits -- see fd_gws below.
+            // With head_sub > 1 it therefore under-counts the grid and raises
+            // n_splits further than intended. That is NOT obviously a bug to fix:
+            // this round measured that more work-groups is exactly what wins on
+            // this part (head_sub 2 -> 4 is +6.1% at d4096), so the miscount may
+            // be carrying some of the gain. GGML_OPENCL_FD_WG_HEADSUB=1 applies
+            // the corrected count so the two can be compared rather than assumed.
+            static const bool wg_headsub = ggml_cl_env_flag("GGML_OPENCL_FD_WG_HEADSUB");
+            const int wg_per_split = n_head_kv * n_batch * (wg_headsub ? fd_head_sub : 1);
             static const int wg_mult = []{
                 const char * e = getenv("GGML_OPENCL_FD_MQ_WG_MULT");
                 return (e && e[0]) ? atoi(e) : 4;
