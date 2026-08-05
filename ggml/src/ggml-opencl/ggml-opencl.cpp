@@ -7032,8 +7032,19 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
                         opts_q8_probe = " -D FA_Q8_PROBE_NOMASK";
                     }
                 }
+                // The f16 g8/c16 program has carried FA_CL_MHRED since the
+                // gpt-oss FD round; this fork never got it, and the shuffle
+                // chain it removes is what this kernel is actually spending its
+                // time on -- deleting the KV read outright (FA_Q8_PROBE=nodeq)
+                // still left it behind f16, so the gap is not the dequant.
+                // Opt out with GGML_OPENCL_FA_Q8_MHRED=0.
+                static const bool q8_mhred_on = []{
+                    const char * e = getenv("GGML_OPENCL_FA_Q8_MHRED");
+                    return !(e && e[0] == '0');
+                }();
                 const std::string opts_q8_g8c16 = opts +
                     " -D MQ_GQA=8 -D MQ_NSG=2 -D MQ_NSG_SPLIT=2 -D FA_CL_C=16" +
+                    (q8_mhred_on ? " -D FA_CL_MHRED=1" : "") +
                     opts_q8_int + opts_q8_probe;
                 cl_program prog_q8_g8c16 = build_program_from_source_ex_cached(
                     backend_ctx, src.c_str(), opts_q8_g8c16,
