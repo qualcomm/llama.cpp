@@ -311,3 +311,10 @@ ninja
 
 - Improve flash attention
 - Improve OpenCL C kernels performance
+
+## MXFP4 MoE Models
+
+The Adreno OpenCL backend has been tuned for gpt-oss-20B (MXFP4 MoE quantization)
+on Snapdragon X2 (Adreno X2-90). Deployment on other models or hardware may require
+tuning of kernel parameters (workgroup size, tiling, etc.). See the accompanying
+customer report for performance numbers and configuration recommendations.
