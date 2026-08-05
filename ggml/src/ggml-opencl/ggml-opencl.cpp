@@ -741,6 +741,11 @@ struct ggml_opencl_fa_kernels {
     // kernel is at 368 for the same shape).
     std::map<std::pair<int, int>, cl_kernel> f32_q8_0_q1_vec_mq_split_g8_c8_hs2;
     std::map<std::pair<int, int>, cl_kernel> f32_f16_q1_vec_mq_split_g8_hs2;  // gqa8 via MQ_GQA=4 x 2 WGs
+    // Per-shape workgroup size and head-split factor for the above. fa_hs_wg /
+    // fa_hs_sub below are single scalars written by the DK=64 build site; once a
+    // second head dimension builds the same family they stop being unambiguous.
+    std::map<std::pair<int, int>, int>       f32_f16_q1_vec_mq_split_g8_hs2_wg;
+    std::map<std::pair<int, int>, int>       f32_f16_q1_vec_mq_split_g8_hs2_sub;
     std::map<std::pair<int, int>, cl_kernel> f32_f16_q1_vec_mq_split_gqa4_hs2;  // gqa4 via MQ_GQA=2 x 2 WGs
     // q1_vec_mq_split built alone (FA_MQ_SPLIT_ONLY) for a specific
     // (dk, dv, gqa), with its own MQ_NSG_SPLIT / FA_HEAD_SUB. Used where the
@@ -6844,6 +6849,64 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
                         }
                         clReleaseProgram(prog_gn);
                     }
+                }
+            }
+            // gqa=8 at DK=128 served by an MQ_GQA=4 kernel spread over
+            // FA_HEAD_SUB workgroups per KV head. That treatment exists only at
+            // dk=64 today, and dk=64 is where it turned gpt-oss from a loss into
+            // a win. The dk=128 evidence points the same way: every dk=128 model
+            // that GAINS from -fa 1 at depth on the X2-90 (Qwen3-4B, Qwen3-8B,
+            // Llama-3-8B, +11..17% tg @d8192) runs MQ_GQA=4, and the one that
+            // LOSES ~20% there (Qwen3-30B-A3B) is the only dk=128 shape running
+            // MQ_GQA=8. Cost is the usual head-split trade: per-lane o_acc/m_i/
+            // l_i/slope halve and the grid doubles, paying one extra read of
+            // each KV row.
+            //
+            // Deliberately the GQA4 c8 options plus FA_HEAD_SUB and nothing else
+            // -- no MHRED, no mask broadcast -- so a measurement attributes to
+            // the head split alone rather than to a bundle.
+            // Opt-in until measured: GGML_OPENCL_FA_G8_HS_DK128=1.
+            if (!fa_decode_only && dk == 128 && dv == 128 &&
+                backend_ctx->has_subgroup_shuffle &&
+                ggml_cl_env_flag("GGML_OPENCL_FA_G8_HS_DK128")) {
+                // 8 is allowed (MQ_GQA=1, one query head per work-group): hs2 -> hs4
+                // measured +6.1%/+2.9% at d4096/d8192 on top of hs2's own win, so the
+                // grid mechanism had not saturated at 4 and the next point is worth a
+                // measurement rather than an assumption.
+                static const int hs_n = []{
+                    const char * e = std::getenv("GGML_OPENCL_FA_G8_HS_DK128_SUB");
+                    const int v = (e && e[0]) ? atoi(e) : 2;
+                    return (v == 2 || v == 4 || v == 8) ? v : 2;
+                }();
+                static const int hs_nsg = []{
+                    const char * e = std::getenv("GGML_OPENCL_FA_G8_HS_DK128_NSG");
+                    const int v = (e && e[0]) ? atoi(e) : 2;
+                    return (v >= 1 && v <= 4) ? v : 2;
+                }();
+                const size_t hs_wg = (size_t) (64 * hs_nsg);
+                const std::string opts_hs = opts +
+                    " -D FA_MQ_ONLY -D MQ_GQA=" + std::to_string(8 / hs_n) +
+                    " -D MQ_NSG=" + std::to_string(hs_nsg) +
+                    " -D MQ_NSG_SPLIT=" + std::to_string(hs_nsg) +
+                    " -D FA_HEAD_SUB=" + std::to_string(hs_n) + opts_cl_c_gqa4;
+                const std::string tag_hs = "fa f32_f16 MQ_GQA=" + std::to_string(8 / hs_n) +
+                    " dk128 g8 headsub" + std::to_string(hs_n) + " wg" + std::to_string(hs_wg);
+                cl_program prog_hs = build_program_from_source_ex_cached(
+                    backend_ctx, src.c_str(), opts_hs,
+                    /*fatal=*/false, tag_hs.c_str(), /*bin_size=*/0, backend_ctx->queue);
+                if (prog_hs) {
+                    cl_kernel k_hs = clCreateKernel(prog_hs, "flash_attn_f32_f16_q1_vec_mq_split_c8", &err);
+                    if (err == CL_SUCCESS) {
+                        if (ggml_opencl_fa_kernel_fits_wg(backend_ctx, k_hs, hs_wg, tag_hs.c_str(), dk, dv)) {
+                            backend_ctx->fa.f32_f16_q1_vec_mq_split_g8_hs2[{dk, dv}]     = k_hs;
+                            backend_ctx->fa.f32_f16_q1_vec_mq_split_g8_hs2_wg[{dk, dv}]  = (int) hs_wg;
+                            backend_ctx->fa.f32_f16_q1_vec_mq_split_g8_hs2_sub[{dk, dv}] = hs_n;
+                            ggml_opencl_log_fa_kernel_spill(backend_ctx, k_hs, tag_hs.c_str(), dk, dv);
+                        } else {
+                            clReleaseKernel(k_hs);
+                        }
+                    }
+                    clReleaseProgram(prog_hs);
                 }
             }
             // NSG_SPLIT=2 programs for the cluster-parallel kernel: its register
@@ -21294,6 +21357,20 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
                 fd_k_split = backend_ctx->fa.f32_f16_q1_vec_mq_split_g8_c32.at(dk_dv);
                 use_fd_mq  = true;
                 fd_mq_wg   = 128;
+            // Head-split g8 at DK=128 (Qwen3-30B-A3B class): MQ_GQA=4 over
+            // FA_HEAD_SUB workgroups per KV head. Checked BEFORE the stock g8
+            // cluster branch below so the A/B is one route against the other in
+            // the same binary; the program only exists when its build-side
+            // opt-in is set, so the default path is untouched.
+            } else if (nq1_only && is_mixed && gqa_ratio_dispatch == 8 &&
+                d_head_q == 128 && d_head_v == 128 &&
+                n_head == n_head_kv * 8 &&
+                backend_ctx->fa.f32_f16_q1_vec_mq_split_g8_hs2.count(dk_dv) > 0 &&
+                backend_ctx->fa.f32_f16_q1_vec_mq_split_g8_hs2_wg.count(dk_dv) > 0) {
+                fd_k_split  = backend_ctx->fa.f32_f16_q1_vec_mq_split_g8_hs2.at(dk_dv);
+                use_fd_mq   = true;
+                fd_mq_wg    = (size_t) backend_ctx->fa.f32_f16_q1_vec_mq_split_g8_hs2_wg.at(dk_dv);
+                fd_head_sub = backend_ctx->fa.f32_f16_q1_vec_mq_split_g8_hs2_sub.at(dk_dv);
             // Cluster-parallel decode for the g8
             } else if (is_mixed && gqa_ratio_dispatch == 8 &&
                 d_head_q == 128 && d_head_v == 128 &&
