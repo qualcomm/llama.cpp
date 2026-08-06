@@ -305,7 +305,21 @@ __kernel void FA_TILE_NAME(
     __local KV_DATA_TYPE4 l_k[BLOCK_N][DK_VEC];
 #define FA_LK(ROW, C) l_k[ROW][C]
 #endif
+#ifdef FA_V_LDS_T
+    // Mirror of FA_K_LDS_T above, for the PV accumulate. The online softmax update walks
+    // 2 (split path) or 4 (N_SPLIT==1 path) KV rows against the same dv element; row-major
+    // those are DV_VEC half4s apart, i.e. one 64-bit local read each. Transposed they are
+    // adjacent, so a row pair is a single 128-bit read. Post-K-transpose the PV loop issued
+    // more narrow local reads per KV-row group than the QK loop, so this closes that side.
+    // Same alignment note as l_k: FA_LV_PAIR reads two adjacent half4 as one float4.
+    __local KV_DATA_TYPE4 l_v[DV_VEC][BLOCK_N] __attribute__((aligned(16)));
+#define FA_LV(ROW, C) l_v[C][ROW]
+    // Two adjacent KV rows as one 128-bit local read (j is even, BLOCK_N is even).
+#define FA_LV_PAIR(C, J) as_half8(*(__local const float4 *)(&l_v[C][J]))
+#else
     __local KV_DATA_TYPE4 l_v[BLOCK_N][DV_VEC];
+#define FA_LV(ROW, C) l_v[ROW][C]
+#endif
 
 #if N_SPLIT > 1 && !defined(HAS_SUBGROUP_SHUFFLE)
     __local ACC_TYPE local_partial[BLOCK_N][WG_SIZE];
@@ -366,9 +380,9 @@ __kernel void FA_TILE_NAME(
             const int v_row_idx = k_tile_start + row;
             if (use_kv_pad || v_row_idx < n_kv) {
                 const ulong v_row_offset = batch_idx * v_tile_nb3 + head_kv_idx * v_tile_nb2 + v_row_idx * v_nb1;
-                l_v[row][col] = ((__global KV_DATA_TYPE4*)(v_tile_base + v_row_offset))[col];
+                FA_LV(row, col) = ((__global KV_DATA_TYPE4*)(v_tile_base + v_row_offset))[col];
             } else {
-                l_v[row][col] = (KV_DATA_TYPE4)(0.0h);
+                FA_LV(row, col) = (KV_DATA_TYPE4)(0.0h);
             }
         }
         barrier(CLK_LOCAL_MEM_FENCE);
@@ -462,9 +476,19 @@ __kernel void FA_TILE_NAME(
                 // multiply-and-add form it replaces, with a third of the ALU ops.
                 FA_SPLIT_UNROLL
                 for (int i = 0; i < SPLIT_DV_VEC; ++i) {
+#ifdef FA_V_LDS_T
+                    // Rows j and j+1 are adjacent in the transposed tile: one 128-bit
+                    // local read replaces two 64-bit ones. Same nesting order as below,
+                    // so the sum stays left-associated and the result bit-identical.
+                    const half8 vv = FA_LV_PAIR(dv_off + i, j);
+                    o_acc[i] = O_ST4(mad(p1, CONVERT_KV_ACC4(vv.hi),
+                                     mad(p0, CONVERT_KV_ACC4(vv.lo),
+                                         O_LD4(o_acc[i]) * sp)));
+#else
                     o_acc[i] = O_ST4(mad(p1, CONVERT_KV_ACC4(l_v[j+1][dv_off + i]),
                                      mad(p0, CONVERT_KV_ACC4(l_v[j  ][dv_off + i]),
                                          O_LD4(o_acc[i]) * sp)));
+#endif
                 }
                 l_i = l_i * sp + p0 + p1;
                 m_i = m_new;
@@ -554,7 +578,7 @@ __kernel void FA_TILE_NAME(
                 const ACC_TYPE p = local_p[q_lane][j];
                 FA_UNROLL
                 for (int i = 0; i < SPLIT_DV_VEC; ++i) {
-                    o_acc[i] = O_ST4(mad(p, CONVERT_KV_ACC4(l_v[j][dv_off + i]), O_LD4(o_acc[i])));
+                    o_acc[i] = O_ST4(mad(p, CONVERT_KV_ACC4(FA_LV(j, dv_off + i)), O_LD4(o_acc[i])));
                 }
             }
         }
@@ -650,11 +674,23 @@ __kernel void FA_TILE_NAME(
 
                 FA_UNROLL
                 for (int i = 0; i < DV_VEC; ++i) {
+#ifdef FA_V_LDS_T
+                    // j steps by 4 here, so (j,j+1) and (j+2,j+3) are each one
+                    // 128-bit local read: 4 narrow reads collapse to 2 wide ones.
+                    const half8 v01 = FA_LV_PAIR(i, j);
+                    const half8 v23 = FA_LV_PAIR(i, j + 2);
+                    o_acc[i] = O_ST4(mad(p3, CONVERT_KV_ACC4(v23.hi),
+                               mad(p2, CONVERT_KV_ACC4(v23.lo),
+                               mad(p1, CONVERT_KV_ACC4(v01.hi),
+                               mad(p0, CONVERT_KV_ACC4(v01.lo),
+                               O_LD4(o_acc[i]) * scale_prev)))));
+#else
                     o_acc[i] = O_ST4(mad(p3, CONVERT_KV_ACC4(l_v[j+3][i]),
                                mad(p2, CONVERT_KV_ACC4(l_v[j+2][i]),
                                mad(p1, CONVERT_KV_ACC4(l_v[j+1][i]),
                                mad(p0, CONVERT_KV_ACC4(l_v[j][i]),
                                O_LD4(o_acc[i]) * scale_prev)))));
+#endif
                 }
                 l_i = l_i * scale_prev + p0 + p1 + p2 + p3;
                 m_i = m_new;

@@ -5958,6 +5958,20 @@ static std::string ggml_opencl_fa_compile_opts(ggml_backend_opencl_context * bac
             opts += " -D FA_K_LDS_T";
         }
     }
+
+    // V-side mirror of FA_K_LDS_T: transposes the V LDS tile so the PV accumulate reads
+    // a KV-row pair as one 128-bit local read instead of two 64-bit ones. Layout only --
+    // the mad nesting is unchanged, so output stays bit-identical.
+    //
+    // Opt-in rather than default-on like the K tile: this has only been A/B'd on ViT
+    // shapes (DK=DV=64), not across LM shapes, and the K tile's own history shows the
+    // sign can flip with the tile width (it goes 1-2% NEGATIVE at DK=256).
+    {
+        const char * e = getenv("GGML_OPENCL_FA_V_LDS_T");
+        if (e != nullptr && e[0] != '0' && cfg->dv <= 128) {
+            opts += " -D FA_V_LDS_T";
+        }
+    }
     return opts;
 }
 
