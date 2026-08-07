@@ -27994,7 +27994,44 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 // under-occupied WG at ~2.3% tile utilization. Route to a per-output
                 // (m,n) GEMV (64-thread WG, K-split + __local reduce) instead.
                 // Opt-in GGML_OPENCL_F32_MC=1; 2D contiguous, small N + skinny M only.
-                static const bool f32_mc = (getenv("GGML_OPENCL_F32_MC") != nullptr);
+                // DEFAULT ON, except on the art/E17 compiler (Adreno 850).
+                //
+                // The MoE router (ffn_moe_logits = mul_mat of the F32 ffn_gate_inp)
+                // lands here on every MoE layer, and the tiled GEMM below computes a
+                // full 64x64 tile for a <=128-wide output: at ne11=4 that is a
+                // 256x1x1 launch, i.e. 1-2 workgroups on a 16-CU part, ~3-6% tile
+                // utilisation. Routing it to the per-output GEMV takes the launch to
+                // 64x512x1 and cuts the router's GPU time ~90%.
+                //
+                // Measured (granite-3b-a800m Q4_K_M, -p 2/4/8, interleaved arms):
+                //   X2-90  +36.1/+28.9/+25.3%   740 (A7X) +38.7/+34.0/+30.5%
+                //   840    +23.4/+20.9/+14.0%   (840 quoted as medians: its ON arm
+                //                                collapses under thermal load)
+                // Also +8.9..19.4% on multi-slot serving (-np 2..8, no speculation)
+                // and +17.0% on gemma-4-26B-A4B MTP, output byte-identical.
+                //
+                // Excluded on the art/E17 compiler (Adreno 850). Not because a
+                // regression was demonstrated -- that device is UNMEASURABLE for this
+                // change: arms that share a code path differ by up to 90% run to run
+                // (forced-off alone spans 1.07-1.71 t/s), and at ne11=4 all arms are
+                // identical. What is consistent is that it never benefits, which
+                // matches its profile: host-round-trip bound (~95% round-trip, 84%
+                // GPU idle), so better GPU occupancy cannot pay there. Excluding it
+                // is the conservative reading, in line with the pessimistic default
+                // this backend already takes for that part.
+                //
+                // Keyed on the compiler, not the generation: the 850 is rostered at
+                // A8X (X2-class), so a generation gate would wrongly disable the 840
+                // as well -- the same reason the dense dp4a gate keys on E17.
+                //
+                // GGML_OPENCL_F32_MC=0 forces off, =1 forces on (overrides the gate).
+                static const int f32_mc_env = []{
+                    const char * e = std::getenv("GGML_OPENCL_F32_MC");
+                    return e ? atoi(e) : -1;
+                }();
+                const bool f32_mc = (f32_mc_env >= 0)
+                    ? (f32_mc_env != 0)
+                    : !adreno_art_compiler_quirks(backend_ctx);
                 if (f32_mc && ne11 >= 2 && ne11 <= 8 && ne01 <= 512 && (ne00 % 4 == 0) &&
                     ne02 == 1 && ne12 == 1 && ne13 == 1 &&
                     ggml_is_contiguous(src0) && ggml_is_contiguous(src1)) {

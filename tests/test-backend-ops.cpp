@@ -8911,6 +8911,28 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32,  65536, 1, 2048, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32,  32768, 1,  256, {1, 1}, {1, 1}));
 
+    // MoE-router shape: f32 x f32, m = n_expert, n = 2..8 tokens, k = n_embd.
+    // This is ffn_moe_logits (mul_mat of the F32 ffn_gate_inp), which every MoE
+    // emits once per layer. It is the small-N regime where a tiled 64x64 GEMM
+    // computes a whole tile for a <=128-wide output; the generic cases above
+    // never reach it because every n in 2..8 case there carries broadcast dims
+    // ({3,2}/{2,2}) or a permutation, while the small-N route requires
+    // ne02==ne12==ne13==1 and 2D-contiguous operands. Without these the route is
+    // NEVER exercised and an A/B over it is vacuous (both arms run the same code).
+    for (int n : {2, 4, 8}) {
+        // gemma-4-26B-A4B / Qwen3-30B-A3B: 128 experts, n_embd 2816 / 2048
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 128, n, 2816, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 128, n, 2048, {1, 1}, {1, 1}));
+        // gpt-oss-20b: 32 experts, n_embd 2880.  granite-3b-a800m: 40 experts, n_embd 1024.
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32,  32, n, 2880, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32,  40, n, 1024, {1, 1}, {1, 1}));
+        // m at the route's ne01<=512 boundary, and just past it (falls back to the tile).
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 512, n, 1024, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 513, n, 1024, {1, 1}, {1, 1}));
+    }
+    // k not a multiple of 4 -- must decline the vectorized small-N route.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 128, 4, 1026, {1, 1}, {1, 1}));
+
 #if 0
     // > 4GB A matrix. Too slow to be enabled by default.
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16,  900000,  3, 2592, {1, 1}, {1, 1}));
