@@ -23394,7 +23394,31 @@ static void ggml_cl_mul_mat_q4_0_f32_adreno(ggml_backend_t backend, const ggml_t
         // per-lane K-walk) for small M. Layout stride is fixed (4 uints/block), so only
         // the K-split count changes; the mc3 kernel reads it via get_local_size(1). The
         // ne1==1 base kernel hardcodes N_SIMDGROUP=4, so it always stays at 4.
-        int mc3_nsg = (use_q40_mc3 && ne01 < 4096) ? 8 : 4;
+        // Widen the K-split when the launch cannot fill the device. The workgroup
+        // count here is CEIL_DIV(ne01/2, 64) and does NOT depend on the K-split, so
+        // when it falls short of the device we buy parallelism inside each workgroup
+        // instead. Scale off CL_DEVICE_MAX_COMPUTE_UNITS rather than a hardcoded M:
+        // the old `ne01 < 4096` threshold was tuned on a 16-CU part and said nothing
+        // about any other. (On 16 CUs this reproduces it: ne01=2816 -> 22 WGs < 32.)
+        // ❌ A CU-scaled form of this threshold was tried and MEASURED WORSE -- do not
+        // "generalise" the constant again without re-measuring.
+        //
+        // On the 16-CU part this was tuned on, `ne01 < 4096` is exactly
+        // `wgs < 2*compute_units`, so replacing it with the CU-relative form looks
+        // like a strict generalisation. It is not: on the 12-CU Adreno 840 the 12B's
+        // projections are ne01 ~= 3840 -> 30 workgroups, so the CU form picks nsg=4
+        // where the constant picks nsg=8 -- and nsg=8 measures **+9.5%** there
+        // (auto 12.91/13.37/12.48 vs pinned 14.12/14.18/14.16, arms disjoint, 3 reps).
+        // The reasoning behind the CU form ("if the launch cannot fill the device,
+        // buy parallelism inside the workgroup") predicts the wrong direction: nsg
+        // sets work PER workgroup, and workgroup count is not what it trades against.
+        // GGML_OPENCL_Q40_MC3_NSG pins the value for A/B if this is revisited.
+        static const int mc3_nsg_force = []{
+            const char * e = std::getenv("GGML_OPENCL_Q40_MC3_NSG");
+            return e ? atoi(e) : 0;
+        }();
+        int mc3_nsg = mc3_nsg_force > 0 ? mc3_nsg_force
+                                        : ((use_q40_mc3 && ne01 < 4096) ? 8 : 4);
         // Clamp the K-split (get_local_size(1)) so 64*mc3_nsg fits the per-kernel
         // WG cap. On Adreno X1-85 the q4_0 mc3 kernel's CL_KERNEL_WORK_GROUP_SIZE
         // is < 512, so the 8-subgroup small-M path returns CL_INVALID_WORK_GROUP_SIZE.
@@ -23654,10 +23678,23 @@ static void ggml_cl_mul_mat_q4_1_f32_adreno(ggml_backend_t backend, const ggml_t
     int N = ne1;
     int K = ne00;
 
-    // Multi-column (N=3) verify GEMV for q4_1: route the spec/MTP verify batch
-    // (ne1==3) onto the efficient GEMV path instead of the transposed-GEMM dead-
-    // zone (gemm_noshuffle_q4_1). Reuses the ne1==1 GEMV image setup. Opt-in via
-    // GGML_OPENCL_Q41_MC3=1. Per-layer only (ne01 < 32768).
+    // Multi-column verify GEMV for q4_1: route the small-N batch onto the GEMV
+    // path instead of the transposed GEMM, which launches a degenerate workgroup
+    // count for a narrow output. Reuses the ne1==1 GEMV image setup. Per-layer
+    // only (ne01 < 32768).
+    //
+    // STAYS OPT-IN (GGML_OPENCL_Q41_MC3=1), unlike the q4_0 sibling -- defaulting it
+    // on was tried and MEASURED AS A REGRESSION.
+    //
+    // The workgroup-occupancy scan (llama-shared/tools/wg_scan.py) flagged the q4_1
+    // tiled GEMM as the largest remaining under-occupied launch once q4_0's mc3 was
+    // on: 5 workgroups, 10.1% of GPU on gemma-4-E4B-it-Q4_0. Routing it here anyway
+    // costs -4.2% at p=2 and -3.9% at p=4 (X2-90, 2 reps, arms disjoint, reps within
+    // 0.1%). Unlike the q4_0 kernel this one does not read its K-split from
+    // get_local_size(1), so it cannot trade workgroup count for intra-group
+    // parallelism the way the q4_0 path does -- which is the likely reason.
+    //
+    // Keep as a worked example: a low workgroup count is a SUSPICION, not a defect.
     static const bool q41_mc3 = (getenv("GGML_OPENCL_Q41_MC3") != nullptr);
     const bool use_q41_mc3 = q41_mc3 && (ne1 >= 2 && ne1 <= 4) && (ne01 < 32768);
 
@@ -23702,6 +23739,10 @@ static void ggml_cl_mul_mat_q4_1_f32_adreno(ggml_backend_t backend, const ggml_t
             CL_CHECK(clSetKernelArg(kernel, 8, sizeof(cl_int), &ne1));  // n_cols
         }
 
+        // NOTE: unlike the q4_0 sibling, this kernel does NOT read the split
+        // count via get_local_size(1) -- its K-split is fixed. Do not scale the
+        // second dimension here to chase occupancy; it would silently compute the
+        // wrong result. Widening it requires changing the kernel first.
         size_t local_work_size[3] = {64, 4, 1};
         size_t global_work_size[3] = {(size_t)CEIL_DIV(ne01/2, 64)*64, 4, 1};
 
