@@ -1621,6 +1621,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemm_noshuffle_q4_0_f32_cok;  // cooperative-K small-batch GEMM (spec/MTP verify)
     cl_kernel kernel_gemv_noshuffle_q4_0_f32;
     cl_kernel kernel_gemv_noshuffle_q4_0_f32_mc3;  // multi-column (N=3) verify GEMV (spec/MTP)
+    cl_kernel kernel_gemv_noshuffle_q4_0_f32_mc3_splitk;  // ... with the K-split across WGs
     cl_kernel kernel_gemv_noshuffle_q4_0_f32_splitk;  // split-K across WGs (small-M decode)
     cl_kernel kernel_gemv_noshuffle_q4_0_f32_glu;     // fused gate+up GEMV + GLU (q4_0 FFN)
     cl_kernel kernel_gemv_noshuffle_q4_0_f32_4096_1_11008;
@@ -4519,6 +4520,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 
         CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q4_0_f32 = clCreateKernel(prog, "kernel_gemv_noshuffle_q4_0_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q4_0_f32_mc3 = clCreateKernel(prog, "kernel_gemv_noshuffle_q4_0_f32_mc3", &err), err));
+        CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q4_0_f32_mc3_splitk = clCreateKernel(prog, "kernel_gemv_noshuffle_q4_0_f32_mc3_splitk", &err), err));
         CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q4_0_f32_splitk = clCreateKernel(prog, "kernel_gemv_noshuffle_q4_0_f32_splitk", &err), err));
         CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q4_0_f32_glu = clCreateKernel(prog, "kernel_gemv_noshuffle_q4_0_f32_glu", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -23368,6 +23370,97 @@ static void ggml_cl_mul_mat_q4_0_f32_adreno(ggml_backend_t backend, const ggml_t
             CL_CHECK(clReleaseMemObject(b_sub_buf));
             CL_CHECK(clReleaseMemObject(b_img));
             return;
+        }
+
+        // Spread the mc3 verify GEMV's K-split ACROSS workgroups. mc3 keeps its split
+        // inside one workgroup, so its launch is CEIL_DIV(M/2,64) workgroups whatever
+        // nsg is: gemma-4-26B-A4B's dense projections (ne01=2816) make 22, i.e. ~1.4
+        // per CU on the 16-CU X2-90, and the 08-07 verify profile puts that term at
+        // 1.85x its bandwidth floor (21.8 ms/cycle vs 11.8) -- the last GPU-side excess
+        // after the MoE router fix. Raising nsg cannot help (it buys parallelism inside
+        // a workgroup, and CU-scaling it measured -9.5% on the 840); more workgroups is
+        // the lever, exactly as it was for the router.
+        //
+        // Each slice's partial region is the whole column-major [M x n_cols] output, so
+        // kernel_gemv_splitk_reduce_f32 is reused verbatim with ne01 = n_cols*M.
+        // Reassociates the K-sum across slices => coherent but not byte-identical, so
+        // this is OPT-IN pending the A/B (GGML_OPENCL_Q40_MC3_SPLITK=1).
+        static const int mc3_sk_env = []{
+            const char * e = std::getenv("GGML_OPENCL_Q40_MC3_SPLITK");
+            return (e && e[0] != '\0') ? atoi(e) : -1;
+        }();
+        // Workgroup target the split aims for; ksplit is chosen to reach it.
+        static const int mc3_sk_wg = []{
+            const char * e = std::getenv("GGML_OPENCL_Q40_MC3_SPLITK_WG");
+            return e ? atoi(e) : 48;
+        }();
+        static const int mc3_sk_kforce = []{
+            const char * e = std::getenv("GGML_OPENCL_Q40_MC3_SPLITK_K");
+            return e ? atoi(e) : 0;
+        }();
+        if (use_q40_mc3 && mc3_sk_env > 0) {
+            cl_kernel ks = backend_ctx->kernel_gemv_noshuffle_q4_0_f32_mc3_splitk;
+
+            // Same nsg policy (and the same per-kernel WG-size clamp) as the base mc3.
+            int nsg = (ne01 < 4096) ? 8 : 4;
+            {
+                size_t kwg = backend_ctx->max_workgroup_size;
+                clGetKernelWorkGroupInfo(ks, backend_ctx->device, CL_KERNEL_WORK_GROUP_SIZE,
+                                         sizeof(kwg), &kwg, NULL);
+                while (nsg > 1 && (size_t)(64 * nsg) > kwg) nsg /= 2;
+            }
+            const int base_wg = (int)CEIL_DIV(ne01/2, 64);
+            const int wg_target = mc3_sk_wg > 0 ? mc3_sk_wg : 48;
+            int ksplit = mc3_sk_kforce > 0
+                       ? mc3_sk_kforce
+                       : (wg_target + base_wg - 1) / base_wg;
+            ksplit = ksplit < 1 ? 1 : (ksplit > 8 ? 8 : ksplit);
+            // Nothing to gain if we would not add workgroups, and do not create slices
+            // with no K-blocks to walk.
+            const int n_kblk = ne00 / 32;   // q4_0 block size
+            if (ksplit > 1 && n_kblk >= ksplit * nsg) {
+                // An env-gated route is only believable if it is seen to fire: print the
+                // first dispatch of each distinct shape so an A/B cannot silently be two
+                // runs of the base kernel.
+                if (ggml_cl_env_flag("GGML_OPENCL_Q40_MC3_SPLITK_TRACE")) {
+                    static std::set<std::tuple<int,int,int>> seen;
+                    if (seen.insert(std::make_tuple(ne01, ne00, (int)ne1)).second) {
+                        fprintf(stderr, "[MC3-SPLITK] M=%d K=%d N=%d nsg=%d ksplit=%d wgs=%d (base %d)\n",
+                                ne01, ne00, (int)ne1, nsg, ksplit, base_wg * ksplit, base_wg);
+                    }
+                }
+                const size_t n_out = (size_t)ne1 * ne01;   // column-major [M x n_cols]
+                backend_ctx->prealloc_splitk_partial.allocate(
+                    backend_ctx->context, (size_t)ksplit * n_out * sizeof(float));
+                cl_mem partial = backend_ctx->prealloc_splitk_partial.buffer;
+
+                CL_CHECK(clSetKernelArg(ks, 0, sizeof(cl_mem), &q_img));
+                CL_CHECK(clSetKernelArg(ks, 1, sizeof(cl_mem), &extra0_q4_0->d));
+                CL_CHECK(clSetKernelArg(ks, 2, sizeof(cl_mem), &b_img));
+                CL_CHECK(clSetKernelArg(ks, 3, sizeof(cl_mem), &partial));
+                CL_CHECK(clSetKernelArg(ks, 4, sizeof(cl_int), &ne00));
+                CL_CHECK(clSetKernelArg(ks, 5, sizeof(cl_int), &ne01));
+                CL_CHECK(clSetKernelArg(ks, 6, sizeof(cl_int), &ne1));
+                size_t lsk[3] = {64, (size_t)nsg, 1};
+                size_t gsk[3] = {(size_t)base_wg * 64, (size_t)(nsg * ksplit), 1};
+                backend_ctx->enqueue_ndrange_kernel(ks, 3, gsk, lsk, dst);
+
+                cl_int n_out_i = (cl_int)n_out;
+                cl_kernel kr = backend_ctx->kernel_gemv_splitk_reduce_f32;
+                CL_CHECK(clSetKernelArg(kr, 0, sizeof(cl_mem),   &partial));
+                CL_CHECK(clSetKernelArg(kr, 1, sizeof(cl_mem),   &extrad->data_device));
+                CL_CHECK(clSetKernelArg(kr, 2, sizeof(cl_ulong), &offsetd));
+                CL_CHECK(clSetKernelArg(kr, 3, sizeof(cl_int),   &n_out_i));
+                CL_CHECK(clSetKernelArg(kr, 4, sizeof(cl_int),   &ksplit));
+                size_t lr[3] = {64, 1, 1};
+                size_t gr[3] = {(size_t)CEIL_DIV(n_out, 64) * 64, 1, 1};
+                backend_ctx->enqueue_ndrange_kernel(kr, 3, gr, lr, dst);
+
+                CL_CHECK(clReleaseMemObject(q_img));
+                CL_CHECK(clReleaseMemObject(b_sub_buf));
+                CL_CHECK(clReleaseMemObject(b_img));
+                return;
+            }
         }
 
         if (use_q40_mc3) {
