@@ -4887,6 +4887,20 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_k_f32_r1 = clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_f32_r1", &err), err));
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_k_f32_kimg = clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_f32_kimg", &err), err));
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok = clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_f32_cok", &err), err));
+        // Register footprint of the small-batch verify GEMMs. The `ne1 <= 8` gate on
+        // the cok path is a KERNEL limit, not a tuning constant -- the accumulator is a
+        // fixed half8 -- so widening it to 16 means a second accumulator, and on Adreno
+        // private memory per work-item is what sets occupancy. Print the current
+        // footprint so that trade is decided on a number rather than an assumption.
+        if (getenv("GGML_OPENCL_MC3_PROBE")) {
+            cl_ulong pmc = 0; size_t wgc = 0, multc = 0;
+            clGetKernelWorkGroupInfo(backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok, backend_ctx->device, CL_KERNEL_PRIVATE_MEM_SIZE, sizeof(pmc), &pmc, NULL);
+            clGetKernelWorkGroupInfo(backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok, backend_ctx->device, CL_KERNEL_WORK_GROUP_SIZE, sizeof(wgc), &wgc, NULL);
+            clGetKernelWorkGroupInfo(backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok, backend_ctx->device, CL_KERNEL_PREFERRED_WORK_GROUP_SIZE_MULTIPLE, sizeof(multc), &multc, NULL);
+            fprintf(stderr, "[COK-PROBE] q4K_cok private=%llu wg_cap=%zu pref_mult=%zu\n",
+                          (unsigned long long)pmc, wgc, multc);
+            fflush(stderr);
+        }
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
@@ -5693,6 +5707,13 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             clGetKernelWorkGroupInfo(backend_ctx->kernel_gemv_noshuffle_q6_K_f32_mc3, backend_ctx->device, CL_KERNEL_PREFERRED_WORK_GROUP_SIZE_MULTIPLE, sizeof(mult), &mult, NULL);
             fprintf(stderr, "[MC3-PROBE] q4K_mc3 private=%llu wg_cap=%zu | q6K_mc3 private=%llu wg_cap=%zu | pref_mult=%zu\n",
                           (unsigned long long)pm4, wg4, (unsigned long long)pm6, wg6, mult);
+            cl_ulong pmb = 0, pms = 0; size_t wgb = 0, wgs = 0;
+            clGetKernelWorkGroupInfo(backend_ctx->kernel_gemv_noshuffle_q4_0_f32_mc3, backend_ctx->device, CL_KERNEL_PRIVATE_MEM_SIZE, sizeof(pmb), &pmb, NULL);
+            clGetKernelWorkGroupInfo(backend_ctx->kernel_gemv_noshuffle_q4_0_f32_mc3, backend_ctx->device, CL_KERNEL_WORK_GROUP_SIZE, sizeof(wgb), &wgb, NULL);
+            clGetKernelWorkGroupInfo(backend_ctx->kernel_gemv_noshuffle_q4_0_f32_mc3_splitk, backend_ctx->device, CL_KERNEL_PRIVATE_MEM_SIZE, sizeof(pms), &pms, NULL);
+            clGetKernelWorkGroupInfo(backend_ctx->kernel_gemv_noshuffle_q4_0_f32_mc3_splitk, backend_ctx->device, CL_KERNEL_WORK_GROUP_SIZE, sizeof(wgs), &wgs, NULL);
+            fprintf(stderr, "[MC3-PROBE] q40_mc3 private=%llu wg_cap=%zu | q40_mc3_splitk private=%llu wg_cap=%zu\n",
+                          (unsigned long long)pmb, wgb, (unsigned long long)pms, wgs);
             fflush(stderr);
         }
         GGML_LOG_CONT(".");
