@@ -23222,9 +23222,37 @@ static void ggml_cl_mul_mat_q4_0_f32_adreno(ggml_backend_t backend, const ggml_t
     // zone (gemm_noshuffle_q4_0 is ~50% of MTP decode on a Q4_0 model since q4_0
     // weights have no cok/mc3, unlike q4_K). Reuses the ne1==1 GEMV image setup
     // (activation image already sized by N=ne1). Byte-identical. Opt-in via
-    // GGML_OPENCL_Q40_MC3=1. Per-layer only (ne01 < 32768); q4_0 lm_head doesn't
-    // occur (token_embd/output stay Q6_K), guard kept for parity with q4_K mc3.
-    static const bool q40_mc3 = (getenv("GGML_OPENCL_Q40_MC3") != nullptr);
+    // Per-layer only (ne01 < 32768); q4_0 lm_head doesn't occur (token_embd/output
+    // stay Q6_K), guard kept for parity with q4_K mc3.
+    //
+    // DEFAULT ON, except on the art/E17 compiler -- same gate as the small-N f32
+    // route, for the same reason (that part is host-round-trip bound, so trading a
+    // degenerate launch for many workgroups cannot pay there).
+    //
+    // Profiled cause (gemma-4-E4B-it-Q4_0, X2-90): the tiled kernel this displaces,
+    // gemm_noshuffle_q4_0_f32, launches gws=1x128x1 -- ONE workgroup -- for a
+    // 512x4 output, and its cost is INDEPENDENT of problem size (0.3620 ms at
+    // out=512x4 vs 0.3638 ms at out=10240x4: 20x the output, same time). Per
+    // dispatch that is 0.513 ms batched vs 0.088 ms for the decode GEMV = 5.8x,
+    // which is exactly the measured verify-cost ratio V ~= 5. It is a fixed launch
+    // cost, not arithmetic -- dp4a would have nothing to accelerate here.
+    //
+    // Verify cost V4 (k*tg/pp_k, V(1)=0.97-1.00 on every row):
+    //   12B-q4_0 4.10 -> 1.84   E2B-q4_0 5.36 -> 1.77   E4B-q4_0 5.13 -> 2.04
+    // gemma-4-12b-it-Q4_0 + matched assistant, MTP k=3, 192 tok, 3 reps:
+    //   plain 15.43 | MTP without 11.63 (-24.6%) | MTP with 23.77 (+54.1%)
+    // Output is byte-identical to plain greedy (the tiled GEMM's is NOT): this is
+    // the decode GEMV extended to N columns, so the reduction order matches decode
+    // exactly, where the tile reduces differently and flips near-ties.
+    //
+    // GGML_OPENCL_Q40_MC3=0 forces off, =1 forces on (overrides the gate).
+    static const int q40_mc3_env = []{
+        const char * e = std::getenv("GGML_OPENCL_Q40_MC3");
+        return e ? atoi(e) : -1;
+    }();
+    const bool q40_mc3 = (q40_mc3_env >= 0)
+        ? (q40_mc3_env != 0)
+        : !adreno_art_compiler_quirks(backend_ctx);
     const bool use_q40_mc3 = q40_mc3 && (ne1 >= 2 && ne1 <= 4) && (ne01 < 32768);
 
     if (ne1 == 1 || use_q40_mc3) {

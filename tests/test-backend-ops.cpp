@@ -8933,6 +8933,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // k not a multiple of 4 -- must decline the vectorized small-N route.
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 128, 4, 1026, {1, 1}, {1, 1}));
 
+    // q4_0 small-N multi-column GEMV (the spec/MTP verify batch and 2..4-way
+    // multi-slot decode). Same blind spot as the f32 route above: the generic
+    // cases reach n in 2..8 only with broadcast dims or a permutation, so the
+    // 2D-contiguous small-n q4_0 path was never exercised either. Shapes are real
+    // per-layer projections (gemma-4 12B/E4B attn + ffn), plus the ne1 boundary
+    // (4 takes the route, 5 falls back to the GEMM) and an ne01 >= 32768
+    // lm_head-scale case that must NOT take the per-layer route.
+    for (int n : {2, 3, 4, 5}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 3840, n, 3840, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 8192, n, 2048, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 2048, n, 8192, {1, 1}, {1, 1}));
+    }
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 32768, 4, 2048, {1, 1}, {1, 1}));
+
 #if 0
     // > 4GB A matrix. Too slow to be enabled by default.
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16,  900000,  3, 2592, {1, 1}, {1, 1}));
