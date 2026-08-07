@@ -634,9 +634,20 @@ __kernel void kernel_gemv_noshuffle_q4_0_f32_glu(
 #define Q40_DEQ_HI dequantizeBlockAccum_ns_sgbroadcast_1_hi
 #define Q40_DEQ_LO dequantizeBlockAccum_ns_sgbroadcast_1_lo
 #endif
+    // The x-grid is padded to CEIL_DIV(M/2,64)*64, so when M % 128 != 0 the tail
+    // lanes hold gid >= M/2. Their outputs are discarded below, but the SCALE fetch
+    // is a raw global pointer (the weight fetches are images, which clamp), so those
+    // lanes read past the end of the scales allocation -- up to 31 half2 beyond it on
+    // the last K-block. Clamp the row used for the scale so every lane stays in
+    // bounds; the lanes remain active, which subgroup broadcast requires, and their
+    // results are still thrown away by the output guard.
+    // gemma-4-26B-A4B is the shape that exposes this: ffn_gate/ffn_up are
+    // [2816, 2112], and 2112 % 128 == 64. Models whose ffn ne01 is a multiple of 128
+    // (gemma-4-12B 15360, E4B 10240) never form a tail and were unaffected.
+    uint gid_s = min(gid, LINE_STRIDE_A - 1);
 #define Q40_GLU_LOOP(SUM, Q, DD)                                                    \
     for (uint k = groupId; k < (K / QK4_0); k += nsg) {                            \
-        regS = DD[gid + k * LINE_STRIDE_A];                                        \
+        regS = DD[gid_s + k * LINE_STRIDE_A];                                      \
         if (slid < 4) {                                                            \
             regB.s0123 = read_imagef(src1, (slid * 2 + k * 8));                    \
             regB.s4567 = read_imagef(src1, (1 + slid * 2 + k * 8));                \
