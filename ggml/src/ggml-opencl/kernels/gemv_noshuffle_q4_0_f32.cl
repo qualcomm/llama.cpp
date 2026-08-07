@@ -559,7 +559,13 @@ __kernel void kernel_gemv_noshuffle_q4_0_f32_splitk(
         for (uint i = 0; i < nsg - 1; ++i) {
             totalSum += reduceLM[SIMDGROUP_WIDTH * i + slid];
         }
-        vstore2(totalSum, 0, &(partial[kslice * M + gid * 2]));
+        // Guard output rows: the x-grid is padded to CEIL_DIV(M/2,64)*64, so when
+        // M % 128 != 0 the tail row-pairs run past row M and this vstore2 overruns
+        // this K-slice's partial region into the NEXT slice -- and past the end of
+        // the buffer entirely on the last slice. The q4_K twin already guards this;
+        // this kernel did not. No-op / byte-identical when M % 128 == 0.
+        if (gid * 2 + 0 < M) partial[kslice * M + gid * 2 + 0] = totalSum.s0;
+        if (gid * 2 + 1 < M) partial[kslice * M + gid * 2 + 1] = totalSum.s1;
     }
 }
 
