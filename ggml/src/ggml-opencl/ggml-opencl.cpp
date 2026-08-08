@@ -18155,6 +18155,17 @@ static void ggml_cl_mul_mat_q4_0_glu_fused(ggml_backend_t backend, ggml_tensor *
     size_t maxwg = backend_ctx->get_kernel_workgroup_size(kernel);
     size_t nsg_y = 8;
     while (nsg_y > 1 && 64 * nsg_y > maxwg) { nsg_y >>= 1; }
+    // GGML_OPENCL_GLU_NSG pins the subgroup count DOWN, for diagnosis. This kernel is
+    // the only q4_0 GEMV that runs nsg=8 with a barrier + LDS reduce -- the base GEMV
+    // is a single K-loop at nsg=4 and is bit-reproducible -- and it is the one
+    // implicated in the gemma-4-26B-A4B decode non-determinism. nsg=1 removes the LDS
+    // reduce and the barrier from the path entirely, separating "the reduce" from
+    // "the K-loop" as the source.
+    static const int glu_nsg_force = []{
+        const char * e = std::getenv("GGML_OPENCL_GLU_NSG");
+        return e ? atoi(e) : 0;
+    }();
+    if (glu_nsg_force > 0 && (size_t)glu_nsg_force < nsg_y) { nsg_y = (size_t)glu_nsg_force; }
     size_t local_work_size[3]  = { 64, nsg_y, 1 };
     size_t global_work_size[3] = { (size_t)CEIL_DIV(M / 2, 64) * 64, nsg_y, 1 };
 
