@@ -403,8 +403,16 @@ __kernel void kernel_gemv_moe_q4_k_f32_ns_glu(
     uint sgid = get_local_id(1);
     uint slid = get_sub_group_local_id();
 
-    if (i01 >= (uint)n_ff) {
-        return;
+    // The x-grid is padded to a multiple of 64, so when n_ff % 64 != 0 the tail lanes
+    // are out of range. They must NOT return early: there is a barrier below, and in
+    // OpenCL every work-item of a work-group has to reach the same barrier -- a
+    // partially-executed barrier is undefined behaviour. Keep every lane alive, clamp
+    // the row it reads so it stays in bounds, and drop its result at the store.
+    // (gemma-4-26B-A4B has n_ff = 704 = 11*64 and forms no tail, so this is latent
+    // there; it fires for any expert FFN whose n_ff is not a multiple of 64.)
+    const bool row_active = (i01 < (uint)n_ff);
+    if (!row_active) {
+        i01 = 0;
     }
 
     uint i11 = i20 % ne11;
@@ -440,7 +448,9 @@ __kernel void kernel_gemv_moe_q4_k_f32_ns_glu(
         up_sum   += reduceLM[SIMDGROUP_WIDTH * 2 + slid].s1;
 
         dst = dst + (offsetd >> 2);
-        dst[i01 + i20 * n_ff] = moe_glu_apply(glu_op, gate_sum, up_sum);
+        if (row_active) {
+            dst[i01 + i20 * n_ff] = moe_glu_apply(glu_op, gate_sum, up_sum);
+        }
     }
 }
 
