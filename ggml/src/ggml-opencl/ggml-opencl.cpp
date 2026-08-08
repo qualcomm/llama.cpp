@@ -18059,13 +18059,64 @@ static void ggml_cl_mul_mat_q4_k_glu_fused(ggml_backend_t backend, ggml_tensor *
     // from the standalone wide (nsg=16) GEMV, so the output is coherent but NOT
     // byte-identical to the per-op path. Keep the maxwg query as a further floor
     // for any driver that reports < 512.
+    // K-split = nsg_y subgroups. CAP AT 4, not 8.
+    //
+    // At nsg=8 this kernel returns a WRONG and RUN-VARYING result, exactly like
+    // its q4_0 twin (kernel_gemv_noshuffle_q4_0_f32_glu, capped in 81a8e7bc6).
+    // Measured on gemma-4-26B-A4B-it-Q4_K_M, decode step 0, the dense shared FFN
+    // node ffn_mlp-0 (K=2816, M=2112), as the float sum over the 2816 outputs:
+    //
+    //     nsg=1   131.7673834907182    bit-exact over 3 runs
+    //     nsg=2   131.7680146546918    bit-exact over 3 runs
+    //     nsg=4   131.76792736296193   bit-exact over 3 runs
+    //     nsg=8   103.96 .. 167.64     every run different
+    //
+    // nsg 1/2/4 are three DIFFERENT reduction orders that agree to ~5e-6 relative,
+    // which is the reassociation you expect from re-splitting a 2816-term f32 sum.
+    // nsg=8 ranges over tens of percent and does not reproduce -- five orders of
+    // magnitude further than reassociation can account for. That is not a rounding
+    // difference, so the 8-subgroup reduce is incorrect, and the whole-model
+    // symptom (greedy decode returning different completions for identical
+    // requests) is only how it became visible.
+    //
+    // Clamping the tail FETCHES does not fix it -- the arm that produced the
+    // nsg=8 numbers above already had them clamped -- but the PADDED GRID is the
+    // discriminator. With the fused kernel confirmed firing (GGML_OPENCL_FUSE_DEBUG):
+    //
+    //     gemma-4-12B-Q4_K_M   K=3840 M=15360  M % 128 == 0    deterministic at 8
+    //     gemma-4-E4B-Q4_K_M   K=2560 M=10240  M % 128 == 0    deterministic at 8
+    //     gemma-4-26B-A4B      K=2816 M=2112   M % 128 == 64   WRONG at 8
+    //
+    // So cap only when the x-grid is padded. That is not free to decide either
+    // way -- capping everywhere costs real throughput on the shapes where 8 is
+    // correct, and keeping 8 everywhere is wrong on the shapes where it is not
+    // (X2-90 tg64, matched pairs, 2 passes):
+    //
+    //     26B  nsg=8  26.86 / 21.33     nsg=4  26.96 / 26.96   <- cap is FREE, and
+    //     E4B  nsg=8  31.46 / 31.01     nsg=4  28.88 / 29.53      steadies the 26B
+    //
+    // The 26B's own nsg=8 arm swings 26.86 -> 21.33 between passes; the broken
+    // reduce is erratic in time as well as in value, so the cap costs that model
+    // nothing and removes a 20% throughput swing. E4B pays 6.3% for a cap it does
+    // not need, which is what the gate buys back.
+    //
+    // 🔴 The discriminator is NOT fully isolated -- the 26B also differs in M, in K
+    // and in workgroup count (17 vs 120) -- so `M % 128` is the *observed* broken
+    // class, not a proven mechanism, and the mechanism (why 8 subgroups) is still
+    // unexplained here as it is for the q4_0 twin. Any padded shape is capped
+    // automatically; an UNPADDED shape that ever shows drift means this gate is
+    // too narrow and the cap should go unconditional. Check with examples/nodehash,
+    // not with test-backend-ops, which has no fused gate+up+GLU case and reads
+    // 989 OK / 0 FAIL on both widths.
+    //
+    // 4 matches the base decode GEMV's N_SIMDGROUP and is always reproducible.
+    // The maxwg query stays as a further floor for any driver reporting < 512 --
+    // it cannot be the cap itself, because the Adreno per-kernel WG query
+    // over-reports here (it returns 1024, which is how 8 survived).
+    // GGML_OPENCL_GLU_NSG_Q4K overrides for A/B.
     size_t maxwg = backend_ctx->get_kernel_workgroup_size(kernel);
-    size_t nsg_y = 8;
+    size_t nsg_y = (M % 128 != 0) ? 4 : 8;
     while (nsg_y > 1 && 64 * nsg_y > maxwg) { nsg_y >>= 1; }
-    // GGML_OPENCL_GLU_NSG_Q4K pins the K-split for A/B. The q4_0 twin of this
-    // kernel is WRONG (not merely irreproducible) at nsg=8 and is capped at 4;
-    // this one is structurally identical and still dispatches 8, so the value
-    // has to be separable from the other tail-shape defect it also had.
     static const int glu_nsg_q4k_force = []{
         const char * e = std::getenv("GGML_OPENCL_GLU_NSG_Q4K");
         return (e && e[0]) ? atoi(e) : 0;
