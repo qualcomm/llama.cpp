@@ -17472,7 +17472,17 @@ static void ggml_cl_norm(ggml_backend_t backend, const ggml_tensor * src0, const
     GGML_TENSOR_LOCALS(int,      ne0, src0, ne);
     GGML_TENSOR_LOCALS(cl_ulong, nb0, src0, nb);
 
-    const int nth = MIN(64, ne00);
+    // kernel_norm reduces the row with a tree reduction that halves the work-group each step
+    // (for i = get_local_size(0)/2; i > 0; i /= 2), which only visits every element when the
+    // work-group is a power of two. MIN(64, ne00) is not, for any ne00 < 64 that is not a
+    // power of two: at ne00 = 33 the loop starts at i = 16, folds lanes 0..31, and lane 32 is
+    // never summed -- so one element of 33 is dropped from both the mean and the variance.
+    // Round the work-group up to a power of two instead; the accumulation loops are strided
+    // and bounded by ne00, so the extra lanes contribute exactly zero.
+    int nth = 1;
+    while (nth < ne00 && nth < 64) {
+        nth *= 2;
+    }
 
     cl_kernel kernel = backend_ctx->kernel_norm;
 
