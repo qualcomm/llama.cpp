@@ -18059,26 +18059,9 @@ static void ggml_cl_mul_mat_q4_k_glu_fused(ggml_backend_t backend, ggml_tensor *
     // from the standalone wide (nsg=16) GEMV, so the output is coherent but NOT
     // byte-identical to the per-op path. Keep the maxwg query as a further floor
     // for any driver that reports < 512.
-    // ... and 8 IS STILL TOO HIGH. The q4_0 twin of this kernel was measured
-    // returning a WRONG, run-varying result at nsg=8: on gemma-4-26B-A4B-it-QAT-Q4_0
-    // (X2-90) nsg 1/2/4 are three different reduction orders that agree to ~1e-7 and
-    // are each bit-exact over 12 runs, while nsg=8 lands 1.1e-4 away and differs in 4
-    // of 5 runs. The reasoning in the comment above extends: if the per-kernel WG
-    // query over-reports, then 512 work-items are not necessarily 8 co-resident
-    // subgroups either, and this reduce needs them co-resident for its barrier.
-    // Cap at 4, matching the base decode GEMV (N_SIMDGROUP 4), which is
-    // bit-reproducible. Measured free on the q4_0 side (12B tg +2.5%, E4B -1.0%).
-    // GGML_OPENCL_GLU_NSG overrides for A/B.
     size_t maxwg = backend_ctx->get_kernel_workgroup_size(kernel);
-    size_t nsg_y = 4;
+    size_t nsg_y = 8;
     while (nsg_y > 1 && 64 * nsg_y > maxwg) { nsg_y >>= 1; }
-    static const int q4k_glu_nsg_force = []{
-        const char * e = std::getenv("GGML_OPENCL_GLU_NSG");
-        return e ? atoi(e) : 0;
-    }();
-    if (q4k_glu_nsg_force > 0 && (size_t)(64 * q4k_glu_nsg_force) <= maxwg) {
-        nsg_y = (size_t)q4k_glu_nsg_force;
-    }
     size_t local_work_size[3]  = { 64, nsg_y, 1 };
     size_t global_work_size[3] = { (size_t)CEIL_DIV(M / 2, 64) * 64, nsg_y, 1 };
 
