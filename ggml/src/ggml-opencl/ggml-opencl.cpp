@@ -18150,22 +18150,33 @@ static void ggml_cl_mul_mat_q4_0_glu_fused(ggml_backend_t backend, ggml_tensor *
     CL_CHECK(clSetKernelArg(kernel, 8, sizeof(cl_int),   &M));
     CL_CHECK(clSetKernelArg(kernel, 9, sizeof(cl_int),   &glu_op));
 
-    // float4 reduceLM (gate+up packed) = 2x the base LDS; cap nsg at 8 (LDS/deadlock
-    // guard, same as the q4_K GLU kernel). Kernel reduceLM is sized for nsg<=8.
+    // float4 reduceLM (gate+up packed) = 2x the base LDS. Kernel reduceLM is sized for
+    // nsg<=8, but 8 IS NOT SAFE HERE -- cap at 4.
+    //
+    // At nsg=8 this kernel returns a WRONG and RUN-VARYING result. Measured on
+    // gemma-4-26B-A4B-it-QAT-Q4_0 (X2-90), top-1 logprob at the first decode position,
+    // 5 identical greedy requests to one server process:
+    //     nsg=1  -0.0002267  bit-exact
+    //     nsg=2  -0.0002266  bit-exact
+    //     nsg=4  -0.0002265  bit-exact
+    //     nsg=8  -0.000337 .. -0.000371   4 of 5 runs distinct
+    // nsg 1/2/4 are three different reduction orders and agree to ~1e-7, which is the
+    // reassociation you expect. nsg=8 is 1.1e-4 away -- a thousand times further -- and
+    // is not reproducible, so it is not reassociation: the 8-subgroup reduce is simply
+    // wrong. A 64x8 = 512 work-item group needs all 8 subgroups co-resident for the
+    // barrier to mean anything, and CL_KERNEL_WORK_GROUP_SIZE does not express that
+    // constraint on Adreno's streaming model, so the host clamp above cannot see it.
+    //
+    // 4 matches the base decode GEMV (N_SIMDGROUP 4), which has always been
+    // bit-reproducible. GGML_OPENCL_GLU_NSG overrides for A/B.
     size_t maxwg = backend_ctx->get_kernel_workgroup_size(kernel);
-    size_t nsg_y = 8;
+    size_t nsg_y = 4;
     while (nsg_y > 1 && 64 * nsg_y > maxwg) { nsg_y >>= 1; }
-    // GGML_OPENCL_GLU_NSG pins the subgroup count DOWN, for diagnosis. This kernel is
-    // the only q4_0 GEMV that runs nsg=8 with a barrier + LDS reduce -- the base GEMV
-    // is a single K-loop at nsg=4 and is bit-reproducible -- and it is the one
-    // implicated in the gemma-4-26B-A4B decode non-determinism. nsg=1 removes the LDS
-    // reduce and the barrier from the path entirely, separating "the reduce" from
-    // "the K-loop" as the source.
     static const int glu_nsg_force = []{
         const char * e = std::getenv("GGML_OPENCL_GLU_NSG");
         return e ? atoi(e) : 0;
     }();
-    if (glu_nsg_force > 0 && (size_t)glu_nsg_force < nsg_y) { nsg_y = (size_t)glu_nsg_force; }
+    if (glu_nsg_force > 0 && (size_t)(64 * glu_nsg_force) <= maxwg) { nsg_y = (size_t)glu_nsg_force; }
     size_t local_work_size[3]  = { 64, nsg_y, 1 };
     size_t global_work_size[3] = { (size_t)CEIL_DIV(M / 2, 64) * 64, nsg_y, 1 };
 
