@@ -6021,9 +6021,22 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
     }
 
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
-    // determine whether to use Adreno xmem GEMM
-    backend_ctx->adreno_xmem_gemm_enabled = getenv("GGML_OPENCL_ADRENO_XMEM_GEMM") != nullptr &&
-                                             backend_ctx->gpu_family == GPU_FAMILY::ADRENO;
+    // Adreno xmem F16xF32 GEMM. DEFAULT ON where it is measured, opt out with
+    // GGML_OPENCL_ADRENO_XMEM_GEMM=0.
+    //
+    // It only ever displaces kernel_mul_mm_f16_f32_l4_lm, the generic tiled GEMM, which
+    // is the slowest matmul the backend has on Adreno: on the X2-90 it runs the gpt-oss
+    // attention projections at ~1.3 TFLOP/s while the tuned q4_0 dense GEMM reaches ~5.5
+    // on the same device. That matters for any model whose non-expert weights stay f16 --
+    // gpt-oss-20b is the common case, and its prefill spends 41% of GPU time in that one
+    // kernel. Measured gpt-oss-20b pp512 X2-90: 414.9/415.1 -> 495.9/510.2 t/s (+20/+23%).
+    // Decode is untouched: the dispatch gate below needs N >= 16.
+    {
+        const char * xmem_env = getenv("GGML_OPENCL_ADRENO_XMEM_GEMM");
+        const bool   xmem_dflt = backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E;
+        backend_ctx->adreno_xmem_gemm_enabled = backend_ctx->gpu_family == GPU_FAMILY::ADRENO &&
+                                                (xmem_env ? atoi(xmem_env) != 0 : xmem_dflt);
+    }
 #endif
 
     // determine whether to use large buffer for Adreno
