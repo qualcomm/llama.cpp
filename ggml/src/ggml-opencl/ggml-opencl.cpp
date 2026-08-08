@@ -928,7 +928,15 @@ struct ggml_backend_opencl_context {
     bool fuse_rms_rope_set_rows = false; // opt-IN GGML_OPENCL_FUSE_RMS_ROPE_SET_ROWS=1 (cross-gap K-cache scatter fold)
     bool f16_mrow = true;            // opt-out GGML_OPENCL_F16_MROW=0 (multi-row-per-WG f16 decode GEMV for attn proj + lm_head)
     int  f16_mrow_rpt = 1;           // GGML_OPENCL_F16_MROW_RPT={1,2,4} rows-per-subgroup register blocking for the mrow GEMV
-    bool fuse_moe_glu = true;        // opt-out GGML_OPENCL_FUSE_MOE_GLU=0 (byte-identical combined gate_up MoE GEMV + GLU, q4_K)
+    // DEFAULT OFF: the combined gate_up MoE GEMV + GLU fusion (q4_K) is NOT
+    // byte-identical, contrary to what this comment used to claim. On
+    // gemma-4-26B-A4B-it-Q4_K_M (X2-90), 24 identical greedy requests to one
+    // llama-server process returned 5 distinct completions with it on and 1 with it
+    // off. It is also not faster there: tg64 27.42 / 21.07 on vs 28.87 / 29.42 off.
+    // The underlying defect inside kernel_gemv_moe_q4_k_f32_ns_glu is not yet found;
+    // this is a correctness-first default, not a fix. GGML_OPENCL_FUSE_MOE_GLU=1
+    // restores it.
+    bool fuse_moe_glu = false;       // opt-in GGML_OPENCL_FUSE_MOE_GLU=1
     // Separate gate/up MoE GEMV + GLU (q4_K). Correct and numerically clean, but a
     // measured LOSS on X2: Qwen3-30B-A3B tg128 36.08 -> 34.93 (-3.2%, arms disjoint),
     // granite-3.0-3b-a800m neutral (95.3 vs 95.1). Folding both projections into one
