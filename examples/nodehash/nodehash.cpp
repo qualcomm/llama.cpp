@@ -14,6 +14,19 @@
 //   LLAMA_NODEHASH_OUT    output file            (default: nodehash.txt)
 //   LLAMA_NODEHASH_STEPS  greedy decode steps    (default: 4)
 //   LLAMA_NODEHASH_SKIP_PROMPT=1  hash decode steps only
+//   LLAMA_NODEHASH_FILTER comma-separated name prefixes to hash (default: all)
+//
+// USE THE FILTER ON A FUSING BACKEND. ggml_backend_sched computes the graph one
+// node at a time for every node the callback asks for (ggml-backend.cpp: the
+// `if (!sched->callback_eval)` branch), and a backend can only fuse ops it sees
+// together in one graph. Asking for everything therefore silently DISABLES
+// fusion -- so on ggml-opencl an unfiltered run would not exercise the fused
+// GLU/MoE kernels at all, and would be measuring a different code path than the
+// one under investigation. With a filter, only the ranges ending at a matched
+// node are broken up; everything else is still handed to the backend in blocks.
+// Localize to a layer with a sparse filter first (e.g. LLAMA_NODEHASH_FILTER=l_out),
+// then narrow inside that layer. Confirm the kernel you care about still fires
+// (GGML_OPENCL_FUSE_DEBUG=1) rather than assuming it.
 //
 // Everything else (-m, -ngl, -p, --override-tensor, ...) is the usual common_params.
 
@@ -31,11 +44,24 @@
 #include <vector>
 
 struct nodehash_ctx {
-    FILE *               out   = nullptr;
-    int                  step  = -1;     // -1 = prompt eval, >=0 = decode step
-    bool                 armed = true;
-    int                  seq   = 0;      // node index within the step
-    std::vector<uint8_t> buf;
+    FILE *                   out   = nullptr;
+    int                      step  = -1;     // -1 = prompt eval, >=0 = decode step
+    bool                     armed = true;
+    int                      seq   = 0;      // node index within the step
+    std::vector<std::string> filter;         // empty = every node
+    std::vector<uint8_t>     buf;
+
+    bool wanted(const char * name) const {
+        if (filter.empty()) {
+            return true;
+        }
+        for (const auto & f : filter) {
+            if (strstr(name, f.c_str())) {
+                return true;
+            }
+        }
+        return false;
+    }
 };
 
 // FNV-1a over the raw bytes: sensitive to a single flipped mantissa bit, which is
@@ -73,7 +99,7 @@ static bool nodehash_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     auto * cb = (nodehash_ctx *) user_data;
 
     if (ask) {
-        return cb->armed;
+        return cb->armed && cb->wanted(t->name);
     }
     if (!cb->armed) {
         return true;
@@ -126,6 +152,22 @@ int main(int argc, char ** argv) {
 
     const int  n_steps     = env_int("LLAMA_NODEHASH_STEPS", 4);
     const bool skip_prompt = env_int("LLAMA_NODEHASH_SKIP_PROMPT", 0) != 0;
+
+    if (const char * f = getenv("LLAMA_NODEHASH_FILTER")) {
+        std::string s(f);
+        size_t pos = 0;
+        while (pos < s.size()) {
+            size_t c = s.find(',', pos);
+            if (c == std::string::npos) {
+                c = s.size();
+            }
+            std::string tok = s.substr(pos, c - pos);
+            if (!tok.empty()) {
+                cb.filter.push_back(tok);
+            }
+            pos = c + 1;
+        }
+    }
 
     llama_backend_init();
     llama_numa_init(params.numa);
