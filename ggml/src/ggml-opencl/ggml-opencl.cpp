@@ -18062,6 +18062,17 @@ static void ggml_cl_mul_mat_q4_k_glu_fused(ggml_backend_t backend, ggml_tensor *
     size_t maxwg = backend_ctx->get_kernel_workgroup_size(kernel);
     size_t nsg_y = 8;
     while (nsg_y > 1 && 64 * nsg_y > maxwg) { nsg_y >>= 1; }
+    // GGML_OPENCL_GLU_NSG_Q4K pins the K-split for A/B. The q4_0 twin of this
+    // kernel is WRONG (not merely irreproducible) at nsg=8 and is capped at 4;
+    // this one is structurally identical and still dispatches 8, so the value
+    // has to be separable from the other tail-shape defect it also had.
+    static const int glu_nsg_q4k_force = []{
+        const char * e = std::getenv("GGML_OPENCL_GLU_NSG_Q4K");
+        return (e && e[0]) ? atoi(e) : 0;
+    }();
+    if (glu_nsg_q4k_force > 0 && (size_t)(64 * glu_nsg_q4k_force) <= maxwg) {
+        nsg_y = (size_t) glu_nsg_q4k_force;
+    }
     size_t local_work_size[3]  = { 64, nsg_y, 1 };
     size_t global_work_size[3] = { (size_t)CEIL_DIV(M / 2, 64) * 64, nsg_y, 1 };
 
