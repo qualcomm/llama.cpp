@@ -10060,6 +10060,22 @@ static bool ggml_opencl_can_fuse(const ggml_backend_opencl_context * backend_ctx
         if (wg_q4_0 && !fuse_glu_q40_on) {
             return false;
         }
+        // kernel_gemv_noshuffle_q4_0_f32_glu dispatches ceil(M/2 / 64)*64 work-items in x, so
+        // M % 128 != 0 leaves a padded tail. On such a grid its cross-subgroup reduce returns a
+        // WRONG and run-varying result at the nsg=4 the host picks -- capping 8 -> 4 moved the
+        // defect, it did not remove it. Measured on X2-90, gemma-4-26B-A4B-it-QAT-Q4_0
+        // (n_ff = 2112, 2112 % 128 = 64), 128-token greedy completions:
+        //     nsg=1   1 distinct / 5 runs, bit-identical to the unfused path
+        //     nsg=2   1 distinct / 5 runs, bit-identical to the unfused path
+        //     nsg=4   4 distinct / 5 runs, never equal to the unfused path
+        // Unpadded shapes are correct at nsg=4 and were re-verified bit-identical to the
+        // unfused path over 4 runs each (E4B n_ff = 10240, 12B n_ff = 15360), so only the
+        // padded grid is declined.
+        // Declining is also the FASTER choice here, so there is nothing to trade off:
+        // tg128 unfused 37.6 vs 35.8 at the broken nsg=4 and 34.1 at a correct nsg=2.
+        if (wg_q4_0 && (gate->src[0]->ne[1] % 128) != 0) {
+            return false;
+        }
         if ((!wg_q4_0 && !wg_q4_k) || up->src[0]->type != gate->src[0]->type ||
             gate->src[1]->type != GGML_TYPE_F32  || up->src[1]->type != GGML_TYPE_F32  ||
             gate->type != GGML_TYPE_F32 || up->type != GGML_TYPE_F32 || glu->type != GGML_TYPE_F32) {
