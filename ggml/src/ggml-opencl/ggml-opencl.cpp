@@ -7353,8 +7353,35 @@ static void ggml_cl_mul_mat_q4_k_glu_fused(ggml_backend_t backend, ggml_tensor *
     // from the standalone wide (nsg=16) GEMV, so the output is coherent but NOT
     // byte-identical to the per-op path. Keep the maxwg query as a further floor
     // for any driver that reports < 512.
+    //
+    // 8 IS ALSO TOO HIGH WHEN THE X-GRID IS PADDED -- drop to 4 there. With
+    // ne01 % 128 != 0 the 8-subgroup reduce returns an incorrect and run-varying
+    // result, not merely a differently-ordered sum. Measured on a [2816, 2112]
+    // q4_K FFN (2112 % 128 == 64) as the float sum over the 2816 outputs of the
+    // first decode step, 3 runs per width:
+    //
+    //     nsg=1   131.7673834907182    bit-exact 3/3
+    //     nsg=2   131.7680146546918    bit-exact 3/3
+    //     nsg=4   131.76792736296193   bit-exact 3/3
+    //     nsg=8   146.2455 / 103.9639 / 144.4126   3 of 3 distinct
+    //
+    // 1/2/4 are three different reduction orders and agree to 4.8e-6 relative,
+    // which is the reassociation a re-split 2816-term f32 sum should show. nsg=8
+    // spans 32%, from 21% below that cluster to 11% above, and never repeats.
+    // The whole-model symptom was greedy decode returning different completions
+    // for identical requests; the value being wrong is the actual defect.
+    //
+    // Unpadded shapes are stable at 8 and keep it -- capping them is not free
+    // (a [2560, 10240] FFN loses 6.3% tg), while on the padded shape the cap
+    // costs nothing and also removes a 20% run-to-run throughput swing, because
+    // the broken reduce is erratic in time as well as in value. The padded grid
+    // is the observed discriminator rather than a proven mechanism (why 8
+    // subgroups specifically is not explained), so if an unpadded shape is ever
+    // seen to drift, this gate is too narrow and the cap should become
+    // unconditional. Note test-backend-ops cannot see any of this: it has no
+    // fused gate+up+GLU case and reads the same OK count at either width.
     size_t maxwg = backend_ctx->get_kernel_workgroup_size(kernel);
-    size_t nsg_y = 8;
+    size_t nsg_y = (M % 128 != 0) ? 4 : 8;
     while (nsg_y > 1 && 64 * nsg_y > maxwg) { nsg_y >>= 1; }
     size_t local_work_size[3]  = { 64, nsg_y, 1 };
     size_t global_work_size[3] = { (size_t)CEIL_DIV(M / 2, 64) * 64, nsg_y, 1 };
