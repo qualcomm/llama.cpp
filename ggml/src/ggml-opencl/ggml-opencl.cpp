@@ -585,6 +585,7 @@ struct ggml_backend_opencl_context {
     std::string kernel_compile_opts;  // cached for lazy-compiled kernels.
 
     int adreno_wave_size;
+    cl_uint compute_units = 0;   // CL_DEVICE_MAX_COMPUTE_UNITS
 
     cl_bool non_uniform_workgroups;
     size_t  image_max_buffer_size;
@@ -5845,6 +5846,9 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
         // Use wave size of 64 for all Adreno GPUs.
         backend_ctx->adreno_wave_size = 64;
     }
+
+    CL_CHECK(clGetDeviceInfo(backend_ctx->device, CL_DEVICE_MAX_COMPUTE_UNITS,
+                             sizeof(cl_uint), &backend_ctx->compute_units, NULL));
 
     // Populate backend device name
     backend_ctx->device_name = dev_ctx->device_name;
@@ -15076,7 +15080,60 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         CL_CHECK(clSetKernelArg(kernel_blk, 9, sizeof(int),       &mask_ne3));
 
         size_t global_work_size_blk[] = { (size_t) n_kv_blocks, (size_t) n_q_blocks, (size_t) (mask_ne2 * mask_ne3) };
-        backend_ctx->enqueue_ndrange_kernel(kernel_blk, 3, global_work_size_blk, NULL, dst);
+
+        // This was the one dispatch in the backend still passing a NULL local size. The
+        // driver default is a fallback, not a tuned choice, and it is not even visible in
+        // a profile (the CSV records 0x0x0), so it cannot be reasoned about.
+        //
+        // The grid counts BLOCKS, not elements, so it is tiny -- 16x8x1 = 128 work items
+        // for granite-3b at pp512 -- and there the workgroup COUNT dominates lane
+        // utilisation. Measured X2-90 (16 CU), us/call on that shape:
+        //   driver default ~247 | lws 128 -> 1 WG 277.5 | 64 -> 2 WG 198.1
+        //   32 -> 4 WG 162.5    | 16 -> 8 WG 143.7      | 8 -> 16 WG 134.5 | 4 -> 32 WG 130.1
+        // Monotonic in workgroup count until 2 per CU, then flat: a QUARTER wave wins here
+        // even though the guide's usual rule is to fill one. So size for 2 workgroups per
+        // CU and cap at a wave, which degrades to a full wave once the grid is large
+        // enough to fill the device -- rather than hard-coding what suits one shape.
+        // GGML_OPENCL_FA_BLK_WG overrides the target; 0 restores the driver default.
+        static const int fa_blk_wg_env = []{
+            const char * e = getenv("GGML_OPENCL_FA_BLK_WG");
+            return (e && e[0]) ? atoi(e) : -1;
+        }();
+        size_t wg_cap = backend_ctx->get_kernel_workgroup_size(kernel_blk);
+        size_t target;
+        if (fa_blk_wg_env >= 0) {
+            target = (size_t) fa_blk_wg_env;
+        } else {
+            const size_t items = global_work_size_blk[0] * global_work_size_blk[1] * global_work_size_blk[2];
+            const size_t cus   = backend_ctx->compute_units > 0 ? backend_ctx->compute_units : 1;
+            target = items / (2 * cus);
+            if (target < 1) {
+                target = 1;
+            }
+            if (target > (size_t) backend_ctx->adreno_wave_size) {
+                target = (size_t) backend_ctx->adreno_wave_size;
+            }
+        }
+        if (target > wg_cap) {
+            target = wg_cap;
+        }
+        if (target == 0) {
+            backend_ctx->enqueue_ndrange_kernel(kernel_blk, 3, global_work_size_blk, NULL, dst);
+        } else {
+            size_t local_work_size_blk[3] = { 1, 1, 1 };
+            size_t rem = target;
+            for (int d = 0; d < 3; d++) {
+                size_t best = 1;
+                for (size_t t = 1; t <= rem && t <= global_work_size_blk[d]; t++) {
+                    if (global_work_size_blk[d] % t == 0) {
+                        best = t;
+                    }
+                }
+                local_work_size_blk[d] = best;
+                rem /= best;
+            }
+            backend_ctx->enqueue_ndrange_kernel(kernel_blk, 3, global_work_size_blk, local_work_size_blk, dst);
+        }
     }
 
     const int n_head_log2_val = n_head > 0 ? 1u << (int)floorf(log2f((float)n_head)) : 0;
