@@ -11428,20 +11428,14 @@ static inline bool use_flat_gemv_for_large_m_q6_K(const ggml_backend_opencl_cont
     if ((tensor->ne[1] % 128 != 0) && tensor->ne[2] == 1 && tensor->ne[3] == 1) {
         return true;
     }
+
     // The gemv_noshuffle slowdown tracks TOTAL weight size, not ne0 alone; ne0 >= 2048 is a
-    // proxy for "large weight" that misses a narrow-hidden vocab-scale lm_head. gemma-4 /
-    // gemma3n E2B tie token_embd as a Q6_K [1536 x 262144] (330 MiB) lm_head: ne0 = 1536 fails
-    // the ne0 >= 2048 test, so it is stranded on gemv_noshuffle at ~23 GB/s while the flat GEMV
-    // holds ~56 GB/s -- ~47% of E2B decode on one dispatch. Add a direct size escape so such
-    // weights also take the flat path; every weight ne0 >= 2048 already routes there is unchanged.
-    // gemma-4 E2B Q4_0(QAT) tg128 30 -> 45 (+38%) on X2-90. (Upstream PR: hq/q6k-flat-large-m-size-gate.)
-    // The escape is not taken on the A7X: its compiler miscompiles the flat K-quant GEMV on exactly
-    // these vocab-scale shapes. On this line the A7X also declines the vocab-scale K-quant lm_head
-    // to the CPU (see supports_op), so the guard is belt-and-suspenders here -- it keeps the helper
-    // identical to the upstream PR branch so future rebases converge.
+    // proxy for "large weight" that misses a narrow-hidden vocab-scale lm_head.
+    // Add a direct size escape so such weights also take the flat path, without changing
+    // which weights ne0 >= 2048 already routes there.
+    // The size escape is not taken on the A7X since its compiler miscompiles the flat K-quant GEMV
     return tensor->ne[1] >= 32768
-        && (tensor->ne[0] >= 2048 ||
-            (backend_ctx->adreno_gen != ADRENO_GPU_GEN::A7X && ggml_nbytes(tensor) >= (256ull << 20)))
+        && (tensor->ne[0] >= 2048 || (backend_ctx->adreno_gen != ADRENO_GPU_GEN::A7X && ggml_nbytes(tensor) >= (256ull << 20)))
         && tensor->ne[2] == 1 && tensor->ne[3] == 1;
 }
 
@@ -12036,6 +12030,7 @@ static ggml_backend_i ggml_backend_opencl_i = {
 ggml_backend_t ggml_backend_opencl_init(void) {
     ggml_backend_dev_t dev = ggml_backend_reg_dev_get(ggml_backend_opencl_reg(), 0);
     ggml_backend_opencl_context *backend_ctx = ggml_cl_init(dev);
+    backend_ctx->ref_count++;
 
     ggml_backend_t backend = new ggml_backend {
         /* .guid    = */ ggml_backend_opencl_guid(),
@@ -34156,7 +34151,7 @@ static void ggml_cl_glu(ggml_backend_t backend, const ggml_tensor * src0, const 
     }
 
     const size_t nrows = ggml_nrows(src0);
-    size_t nth = 512;
+    size_t nth = backend_ctx->max_workgroup_size < 512 ? backend_ctx->max_workgroup_size : 512;
     size_t global_work_size[] = {nrows*nth, 1, 1};
     size_t local_work_size[] = {nth, 1, 1};
 
