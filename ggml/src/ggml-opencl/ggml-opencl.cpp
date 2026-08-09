@@ -30571,10 +30571,68 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     CL_CHECK(clReleaseMemObject(buf_src2));
 
                 } else { // for gemm
-                    kernel = backend_ctx->kernel_gemm_moe_q4_0_f32_ns;
-                    if (backend_ctx->kernel_gemm_moe_q4_0_f32_ns_bin) {
-                        kernel = backend_ctx->kernel_gemm_moe_q4_0_f32_ns_bin;
+                    // dp4a (int8) prefill GEMM variant (see the mxfp4/q4_K paths):
+                    // fused reorder + q8_1 quant of activations, then the int8 dp4a
+                    // inner-loop GEMM. Validated PPL byte-identical + ~60% prefill on
+                    // gemma-4-26B-A4B. DEFAULT ON only on Adreno X2E (mirror q4_K dp4a;
+                    // X1 stays opt-in). The explicit env forces either way.
+                    //
+                    // The prebuilt (kernel-lib) ILA GEMM wins on prefill-sized work, so
+                    // it takes precedence there. It is tuned for those shapes only: at
+                    // the size a speculative-decode verify step produces it loses to the
+                    // dp4a GEMM, and simply being present used to switch dp4a off for
+                    // every shape - which cost ~15% of speculative decode on q4_0 MoE.
+                    // Gate it on size instead, so prefill keeps the ILA kernel and the
+                    // verify batch keeps dp4a.
+                    //
+                    // The size that matters is the total routing count, ne20*ne21
+                    // (n_expert_used * n_tokens) - the same quantity max_post_router_tile
+                    // is derived from, and so the GEMM's real N. NOT ne11: for mul_mat_id
+                    // src1 is [n_embd, n_expert_used, n_tokens], so ne11 is n_expert_used
+                    // (or 1 for the down projection) and does not move with the batch at
+                    // all.
+                    static const char * q4_0_moe_dp4a_env = getenv("GGML_OPENCL_Q4_0_MOE_DP4A");
+                    //
+                    // Threshold measured on X2-90 by sweeping -ub with the kernel-lib
+                    // loaded and only this env moving (gemma-4-26B-A4B-QAT-Q4_0 and
+                    // Qwen3-30B-A3B-Q4_0, pp512, t/s, dp4a relative to ILA):
+                    //   routings   32     64    128    256    512   1024   2048   4096
+                    //   26B      +26%   +17%   +18%   +16%   +12%   +6%    +1%   -2.5%
+                    //   30B      +31%   +18%   +16%   +14%   +12%   +7%    +1%   -0.8%
+                    // The ILA kernel is ahead only at a full 512-token ubatch, so keep it
+                    // exactly there and take dp4a everywhere below, where it leads by far
+                    // more than the noise floor.
+                    static const char * moe_bin_min_env   = getenv("GGML_OPENCL_MOE_BIN_MIN_ROUTINGS");
+                    const int  moe_bin_min  = moe_bin_min_env ? atoi(moe_bin_min_env) : 4096;
+                    const int  moe_routings = (int)(ne20 * ne21);
+                    const bool bin_available = backend_ctx->kernel_gemm_moe_q4_0_f32_ns_bin != nullptr;
+                    const bool use_moe_dp4a = q4_0_moe_dp4a_env
+                        ? (atoi(q4_0_moe_dp4a_env) != 0)
+                        : (backend_ctx->adreno_dp4a_moe()
+                           && (!bin_available || moe_routings < moe_bin_min));
+                    const bool use_bin_kernel = bin_available && !use_moe_dp4a;
+
+                    // GGML_OPENCL_MOE_DISPATCH_LOG=1 names the kernel that actually
+                    // fired, once per distinct size. Without it an env-gated A/B can
+                    // silently run the same kernel in both arms and report a convincing
+                    // "no difference" - which is what happens if the kernel-lib dll is
+                    // not next to the exe, and it is also how gating on the wrong
+                    // dimension goes unnoticed.
+                    static const char * moe_dispatch_log_env = getenv("GGML_OPENCL_MOE_DISPATCH_LOG");
+                    if (moe_dispatch_log_env && atoi(moe_dispatch_log_env) != 0) {
+                        static int last_logged = -1;
+                        if (moe_routings != last_logged) {
+                            last_logged = moe_routings;
+                            GGML_LOG_INFO("ggml_opencl: mul_mat_id q4_0 gemm routings=%d (ne11=%d) -> %s (bin_available=%d, min=%d)\n",
+                                          moe_routings, ne11,
+                                          use_moe_dp4a ? "dp4a" : (use_bin_kernel ? "ila-bin" : "source-ns"),
+                                          bin_available ? 1 : 0, moe_bin_min);
+                        }
                     }
+
+                    kernel = use_bin_kernel
+                        ? backend_ctx->kernel_gemm_moe_q4_0_f32_ns_bin
+                        : backend_ctx->kernel_gemm_moe_q4_0_f32_ns;
 
                     // Reorder router if called from test-backend-ops or when new router is generated.
                     // Otherwise reuse the reordered result from previous mul_mat_id call.
@@ -30586,17 +30644,6 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     cl_mem sub_buf_src1_pre, sub_buf_dst, buf_dst_image;
                     cl_mem buf_src1_reordered = nullptr, image_src1_reordered = nullptr;
                     cl_mem buf_src2, buf_src2_emap;
-
-                    // dp4a (int8) prefill GEMM variant (see the mxfp4/q4_K paths):
-                    // fused reorder + q8_1 quant of activations, then the int8 dp4a
-                    // inner-loop GEMM. Validated PPL byte-identical + ~60% prefill on
-                    // gemma-4-26B-A4B. DEFAULT ON only on Adreno X2E (mirror q4_K dp4a;
-                    // X1 stays opt-in). Bin kernel present -> default off; env forces.
-                    static const char * q4_0_moe_dp4a_env = getenv("GGML_OPENCL_Q4_0_MOE_DP4A");
-                    const bool use_moe_dp4a = q4_0_moe_dp4a_env
-                        ? (atoi(q4_0_moe_dp4a_env) != 0)
-                        : (backend_ctx->adreno_dp4a_moe()
-                           && backend_ctx->kernel_gemm_moe_q4_0_f32_ns_bin == nullptr);
 
                     cl_buffer_region region;
                     region.origin = 0;
@@ -30636,7 +30683,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                         cl_image_desc image_desc_buf_src1;
                         image_format_buf_src1 = {CL_RGBA, CL_FLOAT};
                         image_desc_buf_src1 = {CL_MEM_OBJECT_IMAGE1D_BUFFER, static_cast<size_t>(ne00 * max_post_router_tile * n_tile_size / 4), 0,0,0,0,0,0,0, {buf_src1_reordered}};
-                        if (backend_ctx->kernel_gemm_moe_q4_0_f32_ns_bin) {
+                        if (use_bin_kernel) {
                             // bin kernel uses slightly different image format
                             image_format_buf_src1 = {CL_R, CL_FLOAT};
                             image_desc_buf_src1.image_width = static_cast<size_t>(ne00 * max_post_router_tile * n_tile_size);
@@ -30743,7 +30790,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     // prebuilt bin kernels take the ragged args only from kernel-lib
                     // 0.0.7 on; probe the selected kernel's signature (source kernels
                     // always have them)
-                    if (!backend_ctx->kernel_gemm_moe_q4_0_f32_ns_bin || cl_kernel_has_arg(kernel, arg_idx + 1)) {
+                    if (!use_bin_kernel || cl_kernel_has_arg(kernel, arg_idx + 1)) {
                         CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_uint),   &backend_ctx->adreno_use_moe_ragged));
                         CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_uint),   &backend_ctx->adreno_moe_ragged_skip_gran));
                     }
