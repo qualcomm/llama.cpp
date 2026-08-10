@@ -9751,6 +9751,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // verify-shaped cases: a handful of queries against a deep cache. This is
+    // what speculative/MTP verification and multi-slot serving (-np 2..8) hand
+    // the FA op, and it fell between the sweep above (kv <= 1024) and the
+    // prefill block (nb >= 32), so backends could route it to an untested
+    // kernel. GQA 8 at head size 128 is the Qwen3-30B-A3B shape; GQA 4 at 64
+    // is the gpt-oss one.
+    for (int kv : { 2048, 4096, }) {
+        for (int nb : { 2, 4, 8, }) {
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {8, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        }
+    }
+    for (int nb : { 2, 8, }) {
+        test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {4, 1}, 2048, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    }
+
     for (int hsk : { 40, 64, 72, 80, 96, 128, 192, 256, 320, 512, 576 }) {
         for (int hsv : { 40, 64, 72, 80, 96, 128, 192, 256, 512 }) {
             if (hsk != 192 && hsk != 320 && hsk != 576 && hsk != hsv) continue;
