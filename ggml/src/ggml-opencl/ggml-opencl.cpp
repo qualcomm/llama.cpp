@@ -21692,9 +21692,44 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         const char * lmq_env = getenv("GGML_OPENCL_FA_LOCAL_MQ_SPLIT");
         const bool   lmq_on  = (lmq_env != NULL) && (lmq_env[0] != '0');
 
+        // Upper n_q for the MQ (KV-sharing) routes. The MQ split kernel has
+        // always handled n_q > 1 -- it offsets Q by q_idx*q_nb1, the mask by
+        // q_idx*mask_nb1, and indexes its partial record by q_idx, with the
+        // grid packing q_idx*n_splits + split_idx -- and the gqa==8 f16
+        // branches below carry no n_q==1 gate. Only this constant kept the
+        // whole band on the per-query-row routes, and it had no measurement
+        // behind it.
+        //
+        // It matters because the MQ kernels fold the gqa group into one
+        // work-group: K/V is read once per (query row, KV head) instead of
+        // once per (query row, query head), i.e. 8x less KV traffic at gqa=8.
+        // Every other backend does this for the same band -- CUDA folds heads
+        // into the tile's columns (ncols2), Vulkan sets N = gqa_ratio when
+        // N <= 8, Metal routes ne01 < 20 to its head-folding vec path.
+        //
+        // X2-90, Qwen3-30B-A3B-Q4_0 (dk=dv=128, gqa=8, f16 KV), llama-bench
+        // pp<n_q>, per-row route -> MQ route, each arm bracketed by an off arm
+        // either side (18.44 / 18.15 around 37.36):
+        //
+        //           n_q=2            n_q=3            n_q=4
+        //   d2048   18.28 -> 37.39   22.43 -> 45.21   23.50 -> 50.98
+        //   d4096   12.82 -> 28.73   13.44 -> 34.43   14.20 -> 37.96
+        //
+        // i.e. +105/+102/+117% at d2048 and +124/+156/+167% at d4096. In
+        // decode-step units that takes a 4-token batch from 6.60 to 2.99, so
+        // batching finally costs less than running the tokens through decode
+        // one at a time (the break-even is V(k) < k) -- it did not, at any k
+        // below ~8, before this.
+        //
+        // Scope: 5 of the 21 MQ branches lack the n_q==1 gate and all 5 are
+        // is_mixed && gqa_ratio_dispatch == 8, so nothing else can change
+        // route. Confirmed by two null controls that must not move and do not:
+        // Qwen3-4B (dk=128 but gqa=4) and gpt-oss-20b (gqa=8 but dk=64) are
+        // flat within noise on the same sweep.
+        // ⚠️ Only Qwen3-30B-A3B actually exercises the changed path so far.
         static const char * vec_nq_env = getenv("GGML_OPENCL_FA_VEC_NQ");
         static const int N_MAX_VEC_NQ  = (vec_nq_env != NULL && vec_nq_env[0] != '\0')
-                                           ? atoi(vec_nq_env) : 1;
+                                           ? atoi(vec_nq_env) : 8;
 
         const bool nq_in_vec_range = (n_q >= 1) && (n_q <= N_MAX_VEC_NQ);
         const bool nq1_only        = (n_q == 1);
