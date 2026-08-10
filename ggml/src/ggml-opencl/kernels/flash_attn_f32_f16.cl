@@ -209,10 +209,34 @@ __kernel void FA_TILE_NAME(
     const ulong mask_pad_nb1,
     const ulong mask_pad_nb2,
     const ulong mask_pad_nb3
+#ifdef FA_TILE_KSPLIT
+    // Flash-decoding over the tile. The tile shares one K/V tile in LDS across
+    // BLOCK_M query rows, which is exactly what the per-row q1_split path does
+    // not do, but its only parallelism is over query blocks -- at n_q=2 that is
+    // one work-group walking the whole cache. Split the KV range across
+    // work-groups as well and reduce with the existing flash_attn_f32_merge, so
+    // rows keep sharing the K/V read and positions run in parallel.
+    //
+    // Partial record layout is the one the FD path already uses:
+    // [m, l, o_acc(DV)] per (batch, head, q_row, split), unnormalised, with
+    // sinks left to the merge.
+    ,
+    global float * partial_void,
+    const int n_splits,
+    const int kv_per_split
+#endif
 ) {
     const int tid = get_local_id(0);
     const int block_q_idx = get_group_id(0);
     const int head_batch_idx = get_global_id(1);
+#ifdef FA_TILE_KSPLIT
+    const int kv_split_idx = get_global_id(2);
+    // kv_per_split is a multiple of BLOCK_N (enforced host-side), so a split
+    // boundary never lands inside a KV tile and the blk/kv_pad indexing below
+    // stays exactly as it is in the unsplit tile.
+    const int kv_start = kv_split_idx * kv_per_split;
+    const int kv_end   = min(kv_start + kv_per_split, n_kv);
+#endif
 
 #if N_SPLIT > 1
     const int q_lane    = tid / N_SPLIT;
@@ -328,7 +352,32 @@ __kernel void FA_TILE_NAME(
     __local ACC_TYPE local_l_inv[BLOCK_M];
 #endif
 
+#ifdef FA_TILE_KSPLIT
+    // Record base for this (batch, head, query row, split). Computed before the
+    // empty-split bail so that bail can leave the sentinel the merge expects.
+    // Clamp the row used for the index: the last query block is padded to
+    // BLOCK_M, and those lanes must not form a pointer outside the partial
+    // buffer even though every write below is guarded by query_valid.
+    const int fa_rec_row = query_valid ? my_query_row : 0;
+    const ulong fa_rec_stride = (ulong) FA_PARTIAL_FLOATS;
+    global float * fa_rec = partial_void +
+        ((((ulong) batch_idx * n_head + head_idx) * n_q + fa_rec_row) * n_splits + kv_split_idx)
+        * fa_rec_stride;
+
+    // kv_start >= kv_end is uniform across the work-group, so every work-item
+    // returns together and no barrier is left half-reached.
+    if (kv_start >= kv_end) {
+        if (query_valid && split_idx == 0) {
+            fa_rec[0] = FA_M_INIT;
+            fa_rec[1] = 0.0f;
+        }
+        return;
+    }
+
+    for (int k_start = kv_start; k_start < kv_end; k_start += BLOCK_N) {
+#else
     for (int k_start = 0; k_start < n_kv; k_start += BLOCK_N) {
+#endif
         char blk_cur = 1;
         if (blk_base != NULL) {
             blk_cur = blk_base[k_start / BLOCK_N];
@@ -703,7 +752,29 @@ __kernel void FA_TILE_NAME(
     }
 
     // Write output.
-#if N_SPLIT > 1 && defined(HAS_SUBGROUP_SHUFFLE)
+#if defined(FA_TILE_KSPLIT)
+    // Emit the unnormalised partial; flash_attn_f32_merge combines the splits,
+    // applies sinks and divides by l. Nothing here is normalised or sink-adjusted
+    // -- doing either per split would double-count once the splits are summed.
+    //
+    // With N_SPLIT > 1 every DK-split lane carries the same m_i / l_i (they are
+    // reduced inside the KV loop), so one lane writes the scalars and each lane
+    // writes its own DV slice. The non-shuffle N_SPLIT > 1 path keeps m/l in
+    // local memory instead and is not built with FA_TILE_KSPLIT -- the host does
+    // not route to it.
+    if (query_valid) {
+        if (split_idx == 0) {
+            fa_rec[0] = (float) m_i;
+            fa_rec[1] = (float) l_i;
+        }
+        global float4 * fa_rec_o = (global float4 *)(fa_rec + 2);
+        const int dv_off = split_idx * SPLIT_DV_VEC;
+        FA_UNROLL
+        for (int i = 0; i < SPLIT_DV_VEC; ++i) {
+            fa_rec_o[dv_off + i] = convert_float4(O_LD4(o_acc[i]));
+        }
+    }
+#elif N_SPLIT > 1 && defined(HAS_SUBGROUP_SHUFFLE)
     if (query_valid) {
         ACC_TYPE sinks_sp = 1.0f;
         if (sinks_void != NULL) {

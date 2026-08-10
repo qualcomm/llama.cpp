@@ -670,6 +670,7 @@ struct ggml_opencl_fa_kernels {
     // f32 Q / f16 KV (mixed)
     std::map<std::pair<int, int>, cl_kernel> f32_f16;
     std::map<std::pair<int, int>, cl_kernel> f32_f16_split;          // N_SPLIT>1 variant
+    std::map<std::pair<int, int>, cl_kernel> f32_f16_ksplit;         // BM tile + flash-decoding KV split
     std::map<std::pair<int, int>, cl_kernel> f32_f16_split_k_img;    // DK=512 prefill split, K via image1d_buffer_t
     std::map<std::pair<int, int>, cl_kernel> f32_f16_q1;
     std::map<std::pair<int, int>, cl_kernel> f32_f16_q1_split;       // flash-decoding K-split
@@ -7400,6 +7401,36 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
             backend_ctx->fa.f32_f16_split[{dk, dv}]               = k;
             backend_ctx->fa.f32_f16_split_wg_size[{dk, dv}]       = cfg->bm * cfg->n_split;
             backend_ctx->fa.f32_f16_split_nkv_threshold[{dk, dv}] = cfg->nkv_split_threshold;
+
+            // BM tile + flash-decoding KV split (see FA_TILE_KSPLIT in the .cl).
+            // Opt-in while it is being measured, so the default build pays
+            // neither the extra compile nor a routing change. The non-shuffle
+            // N_SPLIT>1 epilogue keeps m/l in local memory rather than in every
+            // lane, which the partial emit cannot use, so require shuffle.
+            static const bool tile_ksplit_build = ggml_cl_env_flag("GGML_OPENCL_FA_TILE_KSPLIT");
+            if (tile_ksplit_build && backend_ctx->has_subgroup_shuffle &&
+                backend_ctx->fa.f32_f16_ksplit.count(dk_dv) == 0) {
+                const std::string opts_ks = opts +
+                    " -D FA_TILE_KSPLIT=1 -D FA_TILE_NAME=flash_attn_f32_f16_ksplit";
+                cl_program prog_ks = build_program_from_source_ex_cached(
+                    backend_ctx, src.c_str(), opts_ks,
+                    /*fatal=*/false, "fa f32_f16 tile ksplit", /*bin_size=*/0, backend_ctx->queue);
+                if (prog_ks) {
+                    cl_int err_ks;
+                    cl_kernel k_ks = clCreateKernel(prog_ks, "flash_attn_f32_f16_ksplit", &err_ks);
+                    if (err_ks == CL_SUCCESS) {
+                        if (ggml_opencl_fa_kernel_fits_wg(backend_ctx, k_ks, cfg->bm * cfg->n_split,
+                                                          "flash_attn_f32_f16_ksplit", dk, dv)) {
+                            backend_ctx->fa.f32_f16_ksplit[dk_dv] = k_ks;
+                            ggml_opencl_log_fa_kernel_spill(backend_ctx, k_ks,
+                                "flash_attn_f32_f16_ksplit", dk, dv);
+                        } else {
+                            clReleaseKernel(k_ks);
+                        }
+                    }
+                    clReleaseProgram(prog_ks);
+                }
+            }
             break;
         }
         case FA_VARIANT_Q8_0_SPLIT:
@@ -21292,6 +21323,20 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
             ? backend_ctx->fa.f32_f16_split_wg_size.at(dk_dv)
             : backend_ctx->fa.f32_f16_wg_size.at(dk_dv))
         : block_m;
+    // BM tile + flash-decoding KV split. The per-row flash-decoding route this
+    // band uses by default gives it KV-position parallelism but re-reads K/V
+    // once per query row, so its cost is linear in n_q; the tile shares one K/V
+    // LDS tile across BLOCK_M rows but has no KV parallelism. This variant is
+    // both: the tile, with the KV range split across work-groups and reduced by
+    // flash_attn_f32_merge. Opt-in (GGML_OPENCL_FA_TILE_KSPLIT) while measured;
+    // when on it takes the band from flash-decoding, which is what makes the
+    // three routes A/B-able on one binary.
+    static const bool fa_tile_ksplit_on = ggml_cl_env_flag("GGML_OPENCL_FA_TILE_KSPLIT");
+    const bool have_tile_ksplit = fa_tile_ksplit_on &&
+                                  backend_ctx->fa.f32_f16_ksplit.count(dk_dv) > 0 &&
+                                  backend_ctx->fa.f32_merge.count(dk_dv) > 0;
+    const bool use_tile_ksplit = have_tile_ksplit && is_mixed && n_q > 1 &&
+                                 use_split_kernel && n_kv >= FD_MIN_N_KV;
 
     ggml_tensor_extra_cl * extra_q = (ggml_tensor_extra_cl *)q->extra;
     ggml_tensor_extra_cl * extra_o = (ggml_tensor_extra_cl *)dst->extra;
@@ -21443,7 +21488,9 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
                 ? backend_ctx->fa.f32_q4_0_split.at(dk_dv)
                 : backend_ctx->fa.f32_q4_0.at(dk_dv);
         } else if (is_mixed) {
-            if (use_split_kernel) {
+            if (use_tile_ksplit) {
+                kernel = backend_ctx->fa.f32_f16_ksplit.at(dk_dv);
+            } else if (use_split_kernel) {
                 // DK=512 prefill: opt-in texture-cache K reads (image1d_buffer_t).
                 static const char * pkimg_env = getenv("GGML_OPENCL_FA_PREFILL_K_IMG");
                 const bool pkimg_on = (pkimg_env != NULL) && (pkimg_env[0] != '0');
@@ -21605,6 +21652,13 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         if (fd_max_n_q_env > 0) {
             fd_max_n_q = fd_max_n_q_env;
         }
+    }
+    // The tile KV-split serves the same n_q > 1 band from the other direction.
+    // When it is available for this shape, hand it the band outright rather than
+    // letting both claim it -- otherwise the flash-decoding gate wins by order
+    // and the tile variant would only ever be measured above its cap.
+    if (have_tile_ksplit && is_mixed && use_split_kernel) {
+        fd_max_n_q = 1;
     }
     const int fd_split_min_kv = (n_q > 1) ? fd_multiq_min_n_kv : FD_MIN_N_KV;
     cl_kernel fd_k_split = NULL;
@@ -22606,6 +22660,94 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         size_t local_work_size[]  = { wg_size, 1 };
         size_t global_work_size[] = { (size_t)((n_q + bm - 1) / bm) * wg_size, (size_t)(n_head * n_batch) };
         backend_ctx->enqueue_ndrange_kernel(kernel, 2, global_work_size, local_work_size, dst);
+    } else if (use_tile_ksplit) {
+        // Split the KV range across work-groups, then reduce the per-split
+        // partials with the flash-decoding merge kernel.
+        //
+        // kv_per_split is rounded UP to a multiple of block_n so a split
+        // boundary never lands inside a KV tile: the kernel's blk-class lookup
+        // and its ragged-tail kv_pad handling both index by whole tiles, and a
+        // mid-tile boundary would misalign them.
+        static const int ks_kv_env = []{
+            const char * e = getenv("GGML_OPENCL_FA_TILE_KSPLIT_KV");
+            return (e && e[0]) ? atoi(e) : 0;
+        }();
+        const int ks_kv_target = ks_kv_env > 0 ? ks_kv_env : FD_KV_PER_SPLIT_F16;
+        int kv_per_split = ((ks_kv_target + block_n - 1) / block_n) * block_n;
+        int n_splits     = (n_kv + kv_per_split - 1) / kv_per_split;
+        if (n_splits > FD_MAX_SPLITS) {
+            n_splits     = FD_MAX_SPLITS;
+            kv_per_split = ((n_kv + n_splits - 1) / n_splits + block_n - 1) / block_n * block_n;
+            n_splits     = (n_kv + kv_per_split - 1) / kv_per_split;
+        }
+        if (n_splits < 1) {
+            n_splits = 1;
+        }
+
+        const int    fa_partial_floats  = 2 + d_head_v;
+        const size_t partial_size_bytes =
+            (size_t) n_batch * n_head * n_q * n_splits * fa_partial_floats * sizeof(float);
+
+        cl_int err;
+        ggml_cl_flash_attn_temp_buffer temp_partial;  // unused when pooling
+        cl_mem partial_buffer = NULL;
+        const bool ks_pool_on = !backend_ctx->rec_enabled;
+        if (ks_pool_on) {
+            if (backend_ctx->fa.fd_partial_pool_size < partial_size_bytes) {
+                if (backend_ctx->fa.fd_partial_pool != nullptr) {
+                    CL_CHECK(clFinish(backend_ctx->queue));
+                    CL_CHECK(clReleaseMemObject(backend_ctx->fa.fd_partial_pool));
+                    backend_ctx->fa.fd_partial_pool      = nullptr;
+                    backend_ctx->fa.fd_partial_pool_size = 0;
+                }
+                cl_mem grown = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE,
+                                              partial_size_bytes, NULL, &err);
+                if (err != CL_SUCCESS) {
+                    CL_CHECK(clFinish(backend_ctx->queue));
+                    grown = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE,
+                                           partial_size_bytes, NULL, &err);
+                }
+                CL_CHECK(err);
+                backend_ctx->fa.fd_partial_pool      = grown;
+                backend_ctx->fa.fd_partial_pool_size = partial_size_bytes;
+            }
+            partial_buffer = backend_ctx->fa.fd_partial_pool;
+        } else {
+            temp_partial.data = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE,
+                                               partial_size_bytes, NULL, &err);
+            CL_CHECK(err);
+            partial_buffer = temp_partial.data;
+        }
+
+        CL_CHECK(clSetKernelArg(kernel, 48, sizeof(cl_mem), &partial_buffer));
+        CL_CHECK(clSetKernelArg(kernel, 49, sizeof(int),    &n_splits));
+        CL_CHECK(clSetKernelArg(kernel, 50, sizeof(int),    &kv_per_split));
+
+        const size_t wg_size = (size_t) wg_size_fa;
+        size_t local_work_size[]  = { wg_size, 1, 1 };
+        size_t global_work_size[] = { (size_t)((n_q + block_m - 1) / block_m) * wg_size,
+                                      (size_t)(n_head * n_batch),
+                                      (size_t) n_splits };
+        backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+
+        cl_kernel k_merge = backend_ctx->fa.f32_merge.at(dk_dv);
+        int argi = 0;
+        CL_CHECK(clSetKernelArg(k_merge, argi++, sizeof(cl_mem),   &partial_buffer));
+        CL_CHECK(clSetKernelArg(k_merge, argi++, sizeof(cl_mem),   &extra_o->data_device));
+        CL_CHECK(clSetKernelArg(k_merge, argi++, sizeof(cl_ulong), &offset_o));
+        CL_CHECK(clSetKernelArg(k_merge, argi++, sizeof(int),      &n_head));
+        CL_CHECK(clSetKernelArg(k_merge, argi++, sizeof(int),      &n_splits));
+        CL_CHECK(clSetKernelArg(k_merge, argi++, sizeof(cl_ulong), &o_nb1));
+        CL_CHECK(clSetKernelArg(k_merge, argi++, sizeof(cl_ulong), &o_nb2));
+        CL_CHECK(clSetKernelArg(k_merge, argi++, sizeof(cl_ulong), &o_nb3));
+        CL_CHECK(clSetKernelArg(k_merge, argi++, sizeof(cl_mem),   &sinks_buffer));
+        CL_CHECK(clSetKernelArg(k_merge, argi++, sizeof(cl_ulong), &offset_sinks));
+        CL_CHECK(clSetKernelArg(k_merge, argi++, sizeof(int),      &n_q));
+
+        const size_t merge_wg = (size_t) (d_head_v / 4);
+        size_t merge_lws[3] = { merge_wg, 1, 1 };
+        size_t merge_gws[3] = { merge_wg, (size_t)(n_head * n_batch), (size_t) n_q };
+        backend_ctx->enqueue_ndrange_kernel(k_merge, 3, merge_gws, merge_lws, dst);
     } else {
         const size_t wg_size = (size_t) wg_size_fa;
         size_t local_work_size[] = { wg_size, 1 };
