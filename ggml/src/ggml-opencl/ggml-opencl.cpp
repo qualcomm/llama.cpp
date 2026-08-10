@@ -21543,7 +21543,37 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     // Causal attention in llama.cpp always comes with an explicit KQ mask.
     // Inferring is_causal here corrupted mmproj output on OpenCL (see #23800).
     const int is_causal = 0;
-    const int fd_max_n_q = (d_head_q <= FD_MAX_DK_MULTI) ? FD_MAX_N_Q_MULTI : 1;
+    // Multi-query flash-decoding admission: head-dim cap and n_kv floor.
+    //
+    // FD_MAX_DK_MULTI (64) dates from the commit that introduced flash-decoding
+    // and carries no measurement. The split kernel's footprint does not depend
+    // on n_q -- one work-group per (q_idx, split) pair, gid(2) packing
+    // q_idx*n_splits + split_idx -- so multi-query at dk=128 costs per
+    // work-group exactly what dk=128 decode already pays on the same kernel,
+    // and that route is enabled (FD_MAX_DK is 128).
+    //
+    // What the cap actually decides is that 2 <= n_q < 64 stays on the fused
+    // tile, which has no KV-position parallelism: its grid is
+    // ceil(n_q/BLOCK_M) * (BLOCK_M*N_SPLIT), and N_SPLIT splits the DK
+    // reduction, not the KV loop. At n_q=2 one query block walks the whole
+    // cache -- measured ~1.6 GB/s effective KV read on the X2-90's ~131 GB/s
+    // (Qwen3-30B-A3B, dk=dv=128: the second token of a verify batch costs
+    // +121 ms at d2048, +268 ms at d4096). That band is exactly speculative /
+    // MTP verify and -np 2..8 multi-slot serving, and nothing else.
+    //
+    // Both knobs default to the shipped values, so the routing is unchanged
+    // until a device measurement says otherwise. The n_kv floor is applied only
+    // for n_q > 1, so n_q == 1 decode routing is untouched either way.
+    static const int fd_max_dk_multi = []{
+        const char * e = getenv("GGML_OPENCL_FA_MULTIQ_DK");
+        return (e && e[0]) ? atoi(e) : FD_MAX_DK_MULTI;
+    }();
+    static const int fd_multiq_min_n_kv = []{
+        const char * e = getenv("GGML_OPENCL_FA_MULTIQ_MIN_N_KV");
+        return (e && e[0]) ? atoi(e) : FD_MIN_N_KV;
+    }();
+    const int fd_max_n_q      = (d_head_q <= fd_max_dk_multi) ? FD_MAX_N_Q_MULTI : 1;
+    const int fd_split_min_kv = (n_q > 1) ? fd_multiq_min_n_kv : FD_MIN_N_KV;
     cl_kernel fd_k_split = NULL;
     bool use_fd_mq = false;
     bool use_ppb   = false;  // position-parallel block-softmax kernel (finer split)
@@ -22040,7 +22070,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         fd_mq_wg   = 128;
     }
     if (fd_k_split == NULL &&
-        n_q >= 1 && n_q <= fd_max_n_q && n_kv >= FD_MIN_N_KV && !is_causal &&
+        n_q >= 1 && n_q <= fd_max_n_q && n_kv >= fd_split_min_kv && !is_causal &&
         // NB: DK=512 (Gemma-4 global) is intentionally NOT routed here. Measured
         // 2026-05-29: the scalar q1_split flash-decoding path regressed DK=512
         // decode (tg@d16k 6.96→6.61) — the decode is K/V-read-bandwidth-bound,
