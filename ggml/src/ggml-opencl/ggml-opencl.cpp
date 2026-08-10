@@ -20568,8 +20568,9 @@ static bool ggml_cl_flash_attn_convert_f16_to_f32(
 // Flash-Decoding (K-split) dispatch thresholds. FD fires for non-causal
 // attention with n_kv >= FD_MIN_N_KV and d_head <= FD_MAX_DK; the KV range is
 // split into ~n_kv/FD_KV_PER_SPLIT partials, clamped to [FD_MIN_SPLITS,
-// FD_MAX_SPLITS]. Multi-query FD is restricted to small heads
-// (d_head <= FD_MAX_DK_MULTI) and capped at FD_MAX_N_Q_MULTI queries.
+// FD_MAX_SPLITS]. Multi-query FD is restricted to d_head <= FD_MAX_DK_MULTI
+// and capped at FD_MAX_N_Q_MULTI queries, or FD_MAX_N_Q_MULTI_WIDE above
+// FD_MAX_DK_MULTI_NARROW -- see the admission block in ggml_cl_flash_attn.
 static constexpr int FD_MIN_N_KV      = 2048;
 static constexpr int FD_KV_PER_SPLIT  = 2048;
 // f16 KV decode wants more splits than the 2048 default; quantized KV keeps 2048.
@@ -20577,8 +20578,17 @@ static constexpr int FD_KV_PER_SPLIT_F16 = 512;
 static constexpr int FD_MIN_SPLITS    = 2;
 static constexpr int FD_MAX_SPLITS    = 16;
 static constexpr int FD_MAX_DK        = 128;
-static constexpr int FD_MAX_DK_MULTI  = 64;
-static constexpr int FD_MAX_N_Q_MULTI = 8;
+static constexpr int FD_MAX_DK_MULTI  = 128;
+// Query cap for multi-query FD. The split kernel replicates the whole KV sweep
+// per query row while the fused tile amortises rows inside one BLOCK_M tile, so
+// FD's cost is linear in n_q and the tile's is not: there is a crossover. On the
+// X2-90 with Qwen3-30B-A3B (dk=dv=128, f16 KV) it sits between 4 and 5 at both
+// d2048 and d4096, hence 4 for the wide band. The narrow band keeps the 8 it has
+// shipped with since flash-decoding landed; that value is inherited, not
+// measured (GGML_OPENCL_FA_MULTIQ_NQ sweeps it).
+static constexpr int FD_MAX_DK_MULTI_NARROW = 64;
+static constexpr int FD_MAX_N_Q_MULTI       = 8;
+static constexpr int FD_MAX_N_Q_MULTI_WIDE  = 4;
 // Decode-time split granularity for the Multi-Query (MQ) FD kernels. An MQ
 // split work-group has only MQ_NSG_SPLIT (3-4) subgroups sweeping the KV
 // range, so the online-softmax recurrence per subgroup is kv_per_split /
@@ -21543,36 +21553,59 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     // Causal attention in llama.cpp always comes with an explicit KQ mask.
     // Inferring is_causal here corrupted mmproj output on OpenCL (see #23800).
     const int is_causal = 0;
-    // Multi-query flash-decoding admission: head-dim cap and n_kv floor.
+    // Multi-query flash-decoding admission.
     //
-    // FD_MAX_DK_MULTI (64) dates from the commit that introduced flash-decoding
-    // and carries no measurement. The split kernel's footprint does not depend
-    // on n_q -- one work-group per (q_idx, split) pair, gid(2) packing
-    // q_idx*n_splits + split_idx -- so multi-query at dk=128 costs per
-    // work-group exactly what dk=128 decode already pays on the same kernel,
-    // and that route is enabled (FD_MAX_DK is 128).
+    // The head-dim cap used to be 64, which dates from the commit that
+    // introduced flash-decoding and carries no measurement. What it decided is
+    // that 2 <= n_q < 64 at dk=128 stayed on the fused tile, and the tile has
+    // no KV-position parallelism: its grid is ceil(n_q/BLOCK_M) *
+    // (BLOCK_M*N_SPLIT), and N_SPLIT splits the DK reduction, not the KV loop,
+    // so at n_q=2 a single query block walks the whole cache. Measured on the
+    // X2-90 with Qwen3-30B-A3B (dk=dv=128, f16 KV), that is ~1.6 GB/s of
+    // effective KV read against ~131 GB/s of bandwidth. The band is exactly
+    // speculative/MTP verify and -np 2..8 multi-slot serving.
     //
-    // What the cap actually decides is that 2 <= n_q < 64 stays on the fused
-    // tile, which has no KV-position parallelism: its grid is
-    // ceil(n_q/BLOCK_M) * (BLOCK_M*N_SPLIT), and N_SPLIT splits the DK
-    // reduction, not the KV loop. At n_q=2 one query block walks the whole
-    // cache -- measured ~1.6 GB/s effective KV read on the X2-90's ~131 GB/s
-    // (Qwen3-30B-A3B, dk=dv=128: the second token of a verify batch costs
-    // +121 ms at d2048, +268 ms at d4096). That band is exactly speculative /
-    // MTP verify and -np 2..8 multi-slot serving, and nothing else.
+    // The split kernel already serves n_q > 1 -- one work-group per (q_idx,
+    // split) pair, gid(2) packing q_idx*n_splits + split_idx, partials and
+    // merge both sized by n_q -- and its per-work-group footprint does not
+    // depend on n_q, so dk=128 multi-query costs per work-group exactly what
+    // dk=128 decode already pays on the same kernel.
     //
-    // Both knobs default to the shipped values, so the routing is unchanged
-    // until a device measurement says otherwise. The n_kv floor is applied only
-    // for n_q > 1, so n_q == 1 decode routing is untouched either way.
+    // llama-bench pp<n_q>, X2-90, Qwen3-30B-A3B-Q4_0, t/s, tile -> FD, two
+    // reversed passes, with tg32 carried as a null control (flat within 1%):
+    //
+    //          n_q=2          n_q=3          n_q=4     | n_q=5   n_q=8
+    //   d2048  11.74 -> 18.20 16.86 -> 22.71 21.81 -> 23.56 | -7.0%  -28.1%
+    //   d4096   6.66 -> 12.89  9.79 -> 13.66 12.78 -> 14.22 | -7.4%  -33.9%
+    //
+    // i.e. +55/+93% at n_q=2 falling to +8/+11% at n_q=4, and a loss from 5 up
+    // -- FD is linear in n_q, the tile is not. Hence FD_MAX_N_Q_MULTI_WIDE = 4.
+    //
+    // The n_kv floor stays at the shipped FD_MIN_N_KV. Lowering it to 32 adds
+    // +33.7% at d1024 n_q=2 but costs -15.7% at d0 n_q=2 and -19.9% at d0
+    // n_q=4, so it is a knob, not a default, until it has a depth-aware form
+    // and more than one model behind it. The floor is read only for n_q > 1, so
+    // n_q == 1 decode routing is untouched by it either way.
     static const int fd_max_dk_multi = []{
         const char * e = getenv("GGML_OPENCL_FA_MULTIQ_DK");
         return (e && e[0]) ? atoi(e) : FD_MAX_DK_MULTI;
+    }();
+    static const int fd_max_n_q_env = []{
+        const char * e = getenv("GGML_OPENCL_FA_MULTIQ_NQ");
+        return (e && e[0]) ? atoi(e) : 0;
     }();
     static const int fd_multiq_min_n_kv = []{
         const char * e = getenv("GGML_OPENCL_FA_MULTIQ_MIN_N_KV");
         return (e && e[0]) ? atoi(e) : FD_MIN_N_KV;
     }();
-    const int fd_max_n_q      = (d_head_q <= fd_max_dk_multi) ? FD_MAX_N_Q_MULTI : 1;
+    int fd_max_n_q = 1;
+    if (d_head_q <= fd_max_dk_multi) {
+        fd_max_n_q = (d_head_q <= FD_MAX_DK_MULTI_NARROW)
+                       ? FD_MAX_N_Q_MULTI : FD_MAX_N_Q_MULTI_WIDE;
+        if (fd_max_n_q_env > 0) {
+            fd_max_n_q = fd_max_n_q_env;
+        }
+    }
     const int fd_split_min_kv = (n_q > 1) ? fd_multiq_min_n_kv : FD_MIN_N_KV;
     cl_kernel fd_k_split = NULL;
     bool use_fd_mq = false;
