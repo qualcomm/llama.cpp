@@ -21721,9 +21721,17 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         // one at a time (the break-even is V(k) < k) -- it did not, at any k
         // below ~8, before this.
         //
-        // Scope: 5 of the 21 MQ branches lack the n_q==1 gate and all 5 are
-        // is_mixed && gqa_ratio_dispatch == 8, so nothing else can change
-        // route. Confirmed by two null controls that must not move and do not:
+        // Scope: eight MQ branches lack the n_q==1 gate. Two are nested under a
+        // parent that has it, so they cannot fire; every one of the remaining
+        // six requires d_head_q == d_head_v == 128. Four are is_mixed with
+        // gqa_ratio_dispatch == 8 -- the measured shape -- but two are q4_0-KV
+        // branches (gqa 8 opt-in, gqa 4 default). Quant KV at dk=128 is neither
+        // measured here nor covered by test-backend-ops, whose FA sweep only
+        // builds quantized KV at hsk 64/72, so the multi-query widening is
+        // restricted to is_mixed and quant-KV decode keeps n_q == 1 exactly as
+        // before. Lift that when there is a measurement behind it.
+        //
+        // Confirmed by two null controls that must not move and do not:
         // Qwen3-4B (dk=128 but gqa=4) and gpt-oss-20b (gqa=8 but dk=64) are
         // flat within noise on the same sweep.
         // ⚠️ Only Qwen3-30B-A3B actually exercises the changed path so far.
@@ -21731,7 +21739,8 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         static const int N_MAX_VEC_NQ  = (vec_nq_env != NULL && vec_nq_env[0] != '\0')
                                            ? atoi(vec_nq_env) : 8;
 
-        const bool nq_in_vec_range = (n_q >= 1) && (n_q <= N_MAX_VEC_NQ);
+        const bool nq_in_vec_range = (n_q == 1) ||
+                                     (is_mixed && n_q >= 1 && n_q <= N_MAX_VEC_NQ);
         const bool nq1_only        = (n_q == 1);
         // Cluster-parallel decode (c8): default derived at init into
         // fa_c8_default_on (gen_level >= X1: X1E/A8X/X2E and newer; see the
