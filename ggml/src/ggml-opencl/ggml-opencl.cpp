@@ -21328,9 +21328,20 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     // once per query row, so its cost is linear in n_q; the tile shares one K/V
     // LDS tile across BLOCK_M rows but has no KV parallelism. This variant is
     // both: the tile, with the KV range split across work-groups and reduced by
-    // flash_attn_f32_merge. Opt-in (GGML_OPENCL_FA_TILE_KSPLIT) while measured;
-    // when on it takes the band from flash-decoding, which is what makes the
-    // three routes A/B-able on one binary.
+    // flash_attn_f32_merge. When on it takes the band from flash-decoding, which
+    // is what makes the three routes A/B-able on one binary.
+    //
+    // 🔴 MEASURED, DOES NOT PAY -- kept opt-in for a future revisit at other
+    // head dims, not because it won here. X2-90, Qwen3-30B-A3B-Q4_0, pp<n_q>:
+    // against the BM=64 tile it is a fairly flat +6..8%, but nearly all of that
+    // is recovered by narrowing the tile instead (see the dk=128 entry in
+    // fa_tune.h), and against the NARROW tile it is +0..5% with overlapping
+    // error bars -- i.e. inside noise. At small n_q it is far behind
+    // flash-decoding (n_q=2 d2048 12.63 vs 18.20) because the binding cost
+    // there is idle query lanes, not KV serialisation: a BM=64 tile running 2
+    // query rows wastes 62 of 64 lanes, and splitting the KV range does not
+    // give any of them work. Fix the tile shape first; KV-splitting it is
+    // second-order.
     static const bool fa_tile_ksplit_on = ggml_cl_env_flag("GGML_OPENCL_FA_TILE_KSPLIT");
     const bool have_tile_ksplit = fa_tile_ksplit_on &&
                                   backend_ctx->fa.f32_f16_ksplit.count(dk_dv) > 0 &&
