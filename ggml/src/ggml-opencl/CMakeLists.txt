@@ -204,6 +204,7 @@ set(GGML_OPENCL_KERNELS
     set_rows
     sigmoid
     silu
+    unary_mul
     softmax_4_f32
     softmax_4_f16
     softmax_f32

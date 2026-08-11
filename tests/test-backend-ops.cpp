@@ -3707,6 +3707,46 @@ struct test_relu_sqr : public test_case {
     }
 };
 
+// GGML_OP_UNARY(SIGMOID) + GGML_OP_MUL (fused operation)
+// The gated-attention epilogue: out = b * sigmoid(a). Emitted by muse-glimmer,
+// afmoe and qwen3.5; CUDA and OpenCL dispatch it as a single kernel.
+struct test_sigmoid_mul : public test_case {
+    const ggml_type type;
+    const std::array<int64_t, 4> ne;
+    const bool swap;   // whether the sigmoid output is the mul's src[0] or src[1]
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SIGMOID_MUL";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR3(type, ne, swap);
+    }
+
+    test_sigmoid_mul(ggml_type type = GGML_TYPE_F32,
+            std::array<int64_t, 4> ne = {128, 2, 2, 2}, bool swap = false)
+        : type(type), ne(ne), swap(swap) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
+        ggml_set_name(a, "a");
+
+        ggml_tensor * b = ggml_new_tensor(ctx, type, 4, ne.data());
+        ggml_set_name(b, "b");
+
+        ggml_tensor * s = ggml_sigmoid(ctx, a);
+        ggml_set_name(s, "sigmoid");
+
+        ggml_tensor * out = swap ? ggml_mul(ctx, s, b) : ggml_mul(ctx, b, s);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // SNAKE activation fusion: y = x + sin(a*x)^2 * inv_b
 // CUDA backend matches the naive 5-op chain (mul, sin, sqr, mul, add)
 // and dispatches a single fused kernel.
@@ -8144,6 +8184,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
         test_cases.emplace_back(new test_relu_sqr(type, { 128, 2, 2, 2 }));
         test_cases.emplace_back(new test_relu_sqr(type, { 5, 7, 11, 13 }));
+    }
+
+    // fused sigmoid + mul (gated attention epilogue)
+    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
+        for (bool swap : {false, true}) {
+            test_cases.emplace_back(new test_sigmoid_mul(type, { 128, 2, 2, 2 }, swap));   // power-of-two
+            test_cases.emplace_back(new test_sigmoid_mul(type, { 5, 7, 11, 13 }, swap));   // primes, sub-wave ne0
+            test_cases.emplace_back(new test_sigmoid_mul(type, { 4096, 3, 1, 1 }, swap));  // muse-glimmer prefill
+            test_cases.emplace_back(new test_sigmoid_mul(type, { 4096, 1, 1, 1 }, swap));  // muse-glimmer decode
+            test_cases.emplace_back(new test_sigmoid_mul(type, { 1025, 1, 1, 1 }, swap));  // large prime, ragged tail
+        }
     }
 
     // SNAKE activation fusion: x + sin(a*x)^2 * inv_b

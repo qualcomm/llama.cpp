@@ -927,6 +927,7 @@ struct ggml_backend_opencl_context {
     bool fuse_mm_gelu = false;       // opt-IN GGML_OPENCL_FUSE_MM_GELU=1 (not byte-identical: scalar vs vector tanh)
     bool fuse_mm_glu = true;         // opt-out GGML_OPENCL_FUSE_MM_GLU=0 (byte-identical gate+up GEMV + GLU, q4_K FFN)
     bool fuse_rms_rope_set_rows = false; // opt-IN GGML_OPENCL_FUSE_RMS_ROPE_SET_ROWS=1 (cross-gap K-cache scatter fold)
+    bool fuse_unary_mul = true;      // opt-out GGML_OPENCL_FUSE_UNARY_MUL=0 (byte-identical sigmoid+mul, gated attention)
     bool f16_mrow = true;            // opt-out GGML_OPENCL_F16_MROW=0 (multi-row-per-WG f16 decode GEMV for attn proj + lm_head)
     int  f16_mrow_rpt = 1;           // GGML_OPENCL_F16_MROW_RPT={1,2,4} rows-per-subgroup register blocking for the mrow GEMV
     bool fuse_moe_glu = true;        // opt-out GGML_OPENCL_FUSE_MOE_GLU=0 (byte-identical combined gate_up MoE GEMV + GLU, q4_K)
@@ -1112,6 +1113,7 @@ struct ggml_backend_opencl_context {
     cl_program program_rope;
     cl_program program_silu;
     cl_program program_sigmoid;
+    cl_program program_unary_mul;
     cl_program program_softmax_f32;
     cl_program program_softmax_f16;
     cl_program program_softmax_4_f32;
@@ -1150,6 +1152,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gelu_quick, kernel_gelu_quick_4;
     cl_kernel kernel_relu;
     cl_kernel kernel_sigmoid_f32, kernel_sigmoid_f16;
+    cl_kernel kernel_sigmoid_mul_f32;   // fused sigmoid + mul (gated attention)
     cl_kernel kernel_tri;
     cl_kernel kernel_fill;
     cl_kernel kernel_clamp;
@@ -3841,6 +3844,22 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 
         CL_CHECK((backend_ctx->kernel_sigmoid_f32 = clCreateKernel(backend_ctx->program_sigmoid, "kernel_sigmoid_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_sigmoid_f16 = clCreateKernel(backend_ctx->program_sigmoid, "kernel_sigmoid_f16", &err), err));
+        GGML_LOG_CONT(".");
+    }
+
+    // unary_mul (fused sigmoid + mul)
+    {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src {
+            #include "unary_mul.cl.h"
+        };
+#else
+        const std::string kernel_src = read_file("unary_mul.cl");
+#endif
+        backend_ctx->program_unary_mul =
+            build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+
+        CL_CHECK((backend_ctx->kernel_sigmoid_mul_f32 = clCreateKernel(backend_ctx->program_unary_mul, "kernel_sigmoid_mul_f32", &err), err));
         GGML_LOG_CONT(".");
     }
 
@@ -8434,6 +8453,9 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
     if (const char * env = getenv("GGML_OPENCL_FUSE_RMS_ROPE_SET_ROWS")) {
         backend_ctx->fuse_rms_rope_set_rows = atoi(env) != 0;
     }
+    if (const char * env = getenv("GGML_OPENCL_FUSE_UNARY_MUL")) {
+        backend_ctx->fuse_unary_mul = atoi(env) != 0;
+    }
     if (const char * env = getenv("GGML_OPENCL_F16_MROW")) {
         backend_ctx->f16_mrow = atoi(env) != 0;
     }
@@ -10539,6 +10561,7 @@ static void ggml_cl_rope_rms_set_rows_fused(ggml_backend_t backend, ggml_tensor 
 // but that view in the gap (so the scatter may run early).
 static int ggml_opencl_find_rope_set_rows_after(const struct ggml_cgraph * cgraph, int rope_idx);
 static void ggml_cl_mul_mat_f32_gelu_fused(ggml_backend_t backend, ggml_tensor * mm_tensor, ggml_tensor * gelu_tensor);
+static void ggml_cl_sigmoid_mul_fused(ggml_backend_t backend, const ggml_tensor * un, ggml_tensor * dst);
 static void ggml_opencl_op_norm_fused(ggml_backend_t backend, ggml_tensor * norm_tensor, ggml_tensor * mul_tensor, ggml_tensor * add_tensor);
 static void ggml_opencl_op_group_norm_fused(ggml_backend_t backend, ggml_tensor * gn_tensor, ggml_tensor * mul_tensor, ggml_tensor * add_tensor);
 static void ggml_cl_rope_set_rows(ggml_backend_t backend, ggml_tensor * rope_tensor, ggml_tensor * view_tensor, ggml_tensor * set_rows_tensor);
@@ -10547,6 +10570,58 @@ static bool ggml_opencl_can_fuse_gemma4_perlayer_block(const struct ggml_cgraph 
 static void ggml_opencl_op_gemma4_perlayer_block(ggml_backend_t backend, const struct ggml_cgraph * cgraph, const int * idx);
 #endif
 inline bool use_q4k_tiled(const ggml_tensor *tensor);   // defined below
+
+// UNARY(sigmoid) + MUL — the gated-attention epilogue emitted by muse-glimmer,
+// afmoe and qwen3.5: gate = sigmoid(Wg @ x) then attn_out * gate. Two dispatches
+// over a tensor of only n_embd_head_k*n_head elements, so the pair is almost pure
+// launch overhead (~11% of all decode dispatches on muse-glimmer-30B).
+//
+// ggml_can_fuse already guarantees the sigmoid has exactly one use, feeds the mul,
+// and matches its shape; the checks here cover what it does not: the unary sub-op,
+// f32-only, contiguity, and that the other mul operand is not a broadcast.
+static bool ggml_opencl_can_fuse_unary_mul(const struct ggml_cgraph * cgraph, int node_idx) {
+    if (!ggml_can_fuse(cgraph, node_idx, { GGML_OP_UNARY, GGML_OP_MUL })) {
+        return false;
+    }
+
+    const ggml_tensor * un  = cgraph->nodes[node_idx];
+    const ggml_tensor * mul = cgraph->nodes[node_idx + 1];
+
+    if (ggml_get_unary_op(un) != GGML_UNARY_OP_SIGMOID) {
+        return false;
+    }
+
+    // kernel_sigmoid_mul_f32 is f32-only
+    if (un->src[0]->type != GGML_TYPE_F32 || un->type != GGML_TYPE_F32 ||
+        mul->src[0]->type != GGML_TYPE_F32 || mul->src[1]->type != GGML_TYPE_F32 ||
+        mul->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    // the fused kernel indexes all three tensors with one flat global id
+    if (!ggml_is_contiguous(un->src[0]) || !ggml_is_contiguous(mul->src[0]) ||
+        !ggml_is_contiguous(mul->src[1]) || !ggml_is_contiguous(mul)) {
+        return false;
+    }
+
+    // no broadcast: the mul's two operands must have identical shape. (Only the
+    // unary side is shape-checked by ggml_can_fuse_ext.)
+    if (!ggml_are_same_shape(mul->src[0], mul->src[1])) {
+        return false;
+    }
+
+    // CRITICAL: the fused kernel reads the sigmoid's INPUT, which the per-op mul
+    // never touches. Once the sigmoid is elided that input is sequentially dead, so
+    // the pool allocator may legitimately place the mul's output over it — safe for
+    // the two separate kernels, a read/write race inside one. Bail on any overlap.
+    // (An exact in-place alias would be safe, since each work-item reads and writes
+    // the same index, but it does not occur here and is not worth special-casing.)
+    if (ggml_cl_tensors_overlap(mul, un->src[0])) {
+        return false;
+    }
+
+    return true;
+}
 
 // A graph node the dispatch loop skips (no kernel): VIEW/RESHAPE/PERMUTE/etc.
 static inline bool ggml_opencl_node_is_noop(const ggml_tensor * n) {
@@ -10869,6 +10944,16 @@ static void ggml_backend_opencl_exec_graph_nodes(ggml_backend_t backend, ggml_cg
         if (backend_ctx->fuse_mm_gelu && !backend_ctx->disable_fusion &&
             ggml_opencl_can_fuse(backend_ctx, cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_UNARY })) {
             ggml_cl_mul_mat_f32_gelu_fused(backend, node, cgraph->nodes[i+1]);
+            i += 1;
+            continue;
+        }
+
+        // Fuse unary(sigmoid) + mul — the gated-attention epilogue (muse-glimmer,
+        // afmoe, qwen3.5). Two launch-bound dispatches over a small tensor collapse
+        // into one; byte-identical to the per-op path. Opt out GGML_OPENCL_FUSE_UNARY_MUL=0.
+        if (backend_ctx->fuse_unary_mul && !backend_ctx->disable_fusion &&
+            ggml_opencl_can_fuse_unary_mul(cgraph, i)) {
+            ggml_cl_sigmoid_mul_fused(backend, node, cgraph->nodes[i+1]);
             i += 1;
             continue;
         }
@@ -17366,6 +17451,59 @@ static void ggml_cl_sigmoid(ggml_backend_t backend, const ggml_tensor * src0, co
 
     size_t global_work_size[] = {(size_t)n, 1, 1};
     size_t local_work_size[] = {64, 1, 1};
+
+    size_t * local_work_size_ptr = local_work_size;
+    if (n % 64 != 0 && !backend_ctx->non_uniform_workgroups) {
+        local_work_size_ptr = nullptr;  // Let driver choose the work-group sizes.
+    }
+
+    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size_ptr, dst);
+}
+
+// Fused UNARY(sigmoid) + MUL: dst = other * sigmoid(un->src[0]). Eligibility is
+// decided by ggml_opencl_can_fuse_unary_mul; byte-identical to the per-op path.
+static void ggml_cl_sigmoid_mul_fused(ggml_backend_t backend, const ggml_tensor * un, ggml_tensor * dst) {
+    GGML_ASSERT(un && un->src[0] && un->src[0]->extra);
+    GGML_ASSERT(dst && dst->extra);
+
+    ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
+
+    // the mul operand that is not the sigmoid output
+    const ggml_tensor * other = (dst->src[0] == un) ? dst->src[1] : dst->src[0];
+    const ggml_tensor * sig_in = un->src[0];
+    GGML_ASSERT(other && other->extra);
+
+    ggml_tensor_extra_cl * extra_a = (ggml_tensor_extra_cl *)other->extra;
+    ggml_tensor_extra_cl * extra_b = (ggml_tensor_extra_cl *)sig_in->extra;
+    ggml_tensor_extra_cl * extrad  = (ggml_tensor_extra_cl *)dst->extra;
+
+    cl_ulong offseta = extra_a->offset + other->view_offs;
+    cl_ulong offsetb = extra_b->offset + sig_in->view_offs;
+    cl_ulong offsetd = extrad->offset  + dst->view_offs;
+
+    cl_kernel kernel = backend_ctx->kernel_sigmoid_mul_f32;
+
+    // one-shot confirmation that this arm is the one that fired (GGML_OPENCL_UNARY_MUL_PROBE=1)
+    static const bool probe = []{ const char * e = getenv("GGML_OPENCL_UNARY_MUL_PROBE"); return e && e[0] != '0'; }();
+    static bool probed = false;
+    if (probe && !probed) {
+        probed = true;
+        GGML_LOG_INFO("ggml_opencl: fused sigmoid+mul active (ne=[%lld,%lld,%lld,%lld])\n",
+                      (long long)dst->ne[0], (long long)dst->ne[1],
+                      (long long)dst->ne[2], (long long)dst->ne[3]);
+    }
+
+    CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),   &extra_a->data_device));
+    CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_ulong), &offseta));
+    CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem),   &extra_b->data_device));
+    CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_ulong), &offsetb));
+    CL_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_mem),   &extrad->data_device));
+    CL_CHECK(clSetKernelArg(kernel, 5, sizeof(cl_ulong), &offsetd));
+
+    const int64_t n = ggml_nelements(dst);
+
+    size_t global_work_size[] = {(size_t)n, 1, 1};
+    size_t local_work_size[]  = {64, 1, 1};
 
     size_t * local_work_size_ptr = local_work_size;
     if (n % 64 != 0 && !backend_ctx->non_uniform_workgroups) {
