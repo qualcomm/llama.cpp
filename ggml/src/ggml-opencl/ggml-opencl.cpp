@@ -10579,45 +10579,72 @@ inline bool use_q4k_tiled(const ggml_tensor *tensor);   // defined below
 // ggml_can_fuse already guarantees the sigmoid has exactly one use, feeds the mul,
 // and matches its shape; the checks here cover what it does not: the unary sub-op,
 // f32-only, contiguity, and that the other mul operand is not a broadcast.
+// GGML_OPENCL_UNARY_MUL_PROBE=2 reports why a candidate SIGMOID was declined (once per reason).
+static void unary_mul_decline(const char * why) {
+    static const int probe = []{ const char * e = getenv("GGML_OPENCL_UNARY_MUL_PROBE"); return e ? atoi(e) : 0; }();
+    if (probe < 2) {
+        return;
+    }
+    static std::set<std::string> seen;
+    if (seen.insert(why).second) {
+        GGML_LOG_INFO("ggml_opencl: sigmoid+mul fusion declined: %s\n", why);
+    }
+}
+#define UNARY_MUL_DECLINE(why) do { unary_mul_decline(why); return false; } while (0)
+
 static bool ggml_opencl_can_fuse_unary_mul(const struct ggml_cgraph * cgraph, int node_idx) {
+    if (cgraph->nodes[node_idx]->op != GGML_OP_UNARY ||
+        ggml_get_unary_op(cgraph->nodes[node_idx]) != GGML_UNARY_OP_SIGMOID) {
+        return false;   // not a candidate at all; stay silent
+    }
+
     if (!ggml_can_fuse(cgraph, node_idx, { GGML_OP_UNARY, GGML_OP_MUL })) {
-        return false;
+        UNARY_MUL_DECLINE("not a fusable UNARY,MUL pair (op order / extra uses / shape)");
     }
 
     const ggml_tensor * un  = cgraph->nodes[node_idx];
     const ggml_tensor * mul = cgraph->nodes[node_idx + 1];
 
-    if (ggml_get_unary_op(un) != GGML_UNARY_OP_SIGMOID) {
-        return false;
-    }
-
     // kernel_sigmoid_mul_f32 is f32-only
     if (un->src[0]->type != GGML_TYPE_F32 || un->type != GGML_TYPE_F32 ||
         mul->src[0]->type != GGML_TYPE_F32 || mul->src[1]->type != GGML_TYPE_F32 ||
         mul->type != GGML_TYPE_F32) {
-        return false;
+        UNARY_MUL_DECLINE("non-f32 operand");
     }
 
     // the fused kernel indexes all three tensors with one flat global id
     if (!ggml_is_contiguous(un->src[0]) || !ggml_is_contiguous(mul->src[0]) ||
         !ggml_is_contiguous(mul->src[1]) || !ggml_is_contiguous(mul)) {
-        return false;
+        UNARY_MUL_DECLINE("non-contiguous operand");
     }
 
     // no broadcast: the mul's two operands must have identical shape. (Only the
     // unary side is shape-checked by ggml_can_fuse_ext.)
     if (!ggml_are_same_shape(mul->src[0], mul->src[1])) {
-        return false;
+        UNARY_MUL_DECLINE("broadcast mul");
     }
 
-    // CRITICAL: the fused kernel reads the sigmoid's INPUT, which the per-op mul
-    // never touches. Once the sigmoid is elided that input is sequentially dead, so
-    // the pool allocator may legitimately place the mul's output over it — safe for
-    // the two separate kernels, a read/write race inside one. Bail on any overlap.
-    // (An exact in-place alias would be safe, since each work-item reads and writes
-    // the same index, but it does not occur here and is not worth special-casing.)
+    // The fused kernel reads the sigmoid's INPUT, which the per-op mul never touches.
+    // Once the sigmoid is elided that input is sequentially dead, so the pool allocator
+    // routinely places the mul's output right on top of it -- safe for the two separate
+    // kernels, but a read/write hazard inside one.
+    //
+    // An EXACT alias is still safe: work-item i reads index i and writes index i, and no
+    // other work-item touches that element. Only a PARTIAL overlap (different offset, or
+    // a different length) can have one work-item clobber another's input, so decline just
+    // that. On muse-glimmer the allocator picks the exact alias (both tensors are
+    // [n_embd_head_k*n_head, n_tokens] f32, identical size), so rejecting all overlap
+    // would disable the fusion on the very model it targets.
     if (ggml_cl_tensors_overlap(mul, un->src[0])) {
-        return false;
+        const ggml_tensor_extra_cl * ed = (const ggml_tensor_extra_cl *)mul->extra;
+        const ggml_tensor_extra_cl * eb = (const ggml_tensor_extra_cl *)un->src[0]->extra;
+        const bool exact = ed && eb &&
+                           ed->data_device == eb->data_device &&
+                           (ed->offset + mul->view_offs) == (eb->offset + un->src[0]->view_offs) &&
+                           ggml_nbytes(mul) == ggml_nbytes(un->src[0]);
+        if (!exact) {
+            UNARY_MUL_DECLINE("dst partially overlaps the sigmoid input");
+        }
     }
 
     return true;
