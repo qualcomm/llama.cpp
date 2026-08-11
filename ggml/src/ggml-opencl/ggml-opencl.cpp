@@ -18122,9 +18122,40 @@ static void ggml_cl_mul_mat_q4_k_glu_fused(ggml_backend_t backend, ggml_tensor *
     // The maxwg query stays as a further floor for any driver reporting < 512 --
     // it cannot be the cap itself, because the Adreno per-kernel WG query
     // over-reports here (it returns 1024, which is how 8 survived).
+    // 2026-08-10: LONG-K FFNs additionally drop to nsg=1. Everything above is unchanged;
+    // this only adds a class that no previously-tuned model falls into.
+    //
+    // The 8 was fitted on gemma-shaped FFNs (K 2048-3840) and is badly wrong on a long-K
+    // one. Meta's Muse-Glimmer-30B (K=6656, M=19968) spends 65.6% of decode in this kernel
+    // and runs it at 52.5 GB/s while the q6_K down-projection beside it reaches 103.7 GB/s
+    // on the same device and run. The gap is the cross-subgroup reduce, not the fusion:
+    // disabling fusion entirely (6.36) lands on the same number as keeping it at nsg=1
+    // (6.43), so the fusion is kept and only the K-split changes.
+    //
+    // Replicated, two passes in reversed order, tg64:
+    //
+    //     model             K/M          dev   nsg8    nsg4    nsg2    nsg1
+    //     gemma-3n-E4B     2048/16384    840   best    -       -15%    -
+    //     gemma-3-4b       2560/10240    840   base    -       +6.9%   -
+    //     gemma-4-E4B      2560/10240    X2   32.01   29.47   32.42   27.31
+    //     gemma-4-12B      3840/15360    X2   15.07   15.19   15.16   14.05
+    //     gemma-4-26B      2816/2112 (padded) X2  broken  base  -6..-20%  -
+    //     Muse-Glimmer-30B 6656/19968    X2    4.56    5.95    5.91    6.43
+    //
+    // 🔴 There is NO safe universal value. A flat nsg=2 looked non-negative on the first
+    // three X2 rows and then regressed gemma-3n-E4B by 15% on the 840 and the padded 26B by
+    // 6-20% on X2. The curves are not monotone in nsg and their SHAPE differs per model --
+    // gemma-4-E4B genuinely dips at 4 and peaks at 2 (replicated, passes agree to 0.5-1.1%).
+    // So this gate deliberately changes NOTHING for any shape that was already tuned; it
+    // only rescues the long-K class, where the single member we have loses 41% to the
+    // default. K >= 4096 has margin on both sides (nearest points: 3840 and 6656).
+    //
+    // ⚠️ nsg=1 here is a ONE-MODEL extrapolation -- it is the best point on Muse's curve
+    // (monotone there) and no other model is in the class, so it costs nothing measured.
+    // A second long-K model should be swept before trusting it as a general rule.
     // GGML_OPENCL_GLU_NSG_Q4K overrides for A/B.
     size_t maxwg = backend_ctx->get_kernel_workgroup_size(kernel);
-    size_t nsg_y = (M % 128 != 0) ? 4 : 8;
+    size_t nsg_y = (K >= 4096) ? 1 : ((M % 128 != 0) ? 4 : 8);
     while (nsg_y > 1 && 64 * nsg_y > maxwg) { nsg_y >>= 1; }
     static const int glu_nsg_q4k_force = []{
         const char * e = std::getenv("GGML_OPENCL_GLU_NSG_Q4K");
