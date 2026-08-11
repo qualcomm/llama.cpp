@@ -383,6 +383,104 @@ __kernel void kernel_gemv_noshuffle_q4_0_f32_mc3(
         if (n_cols > 3) { if (w0) dst[3 * M + gid * 2 + 0] = acc.s6; if (w1) dst[3 * M + gid * 2 + 1] = acc.s7; }
     }
 }
+
+// --- mc3 with the K-split spread ACROSS workgroups -------------------------------
+// The mc3 GEMV above makes CEIL_DIV(M/2,64) workgroups and keeps its whole K-split
+// inside one of them (get_local_id(1)). For the projection shapes a verify batch
+// actually runs -- gemma-4-26B-A4B's dense Q/K/V/ffn_up at ne01=2816 -> 22 WGs -- that
+// under-fills a 16-CU part at ~1.4 WGs/CU, and the profile has the term at 1.85x its
+// bandwidth floor (21.8 ms/verify-cycle against 11.8). Raising nsg buys parallelism
+// only INSIDE a workgroup, which is not what is short here (and CU-scaling nsg
+// measured -9.5% on the 840).
+//
+// This variant moves the split to a second GRID dimension, exactly as
+// kernel_gemv_noshuffle_q4_0_f32_splitk does for the ne1==1 decode GEMV: each
+// (kslice, subgroup) pair walks a disjoint set of K-blocks and writes a per-slice
+// partial, then kernel_gemv_splitk_reduce_f32 sums the slices. The partial region for
+// one slice is the whole column-major [M x n_cols] output (n_cols*M contiguous
+// floats), so the existing scalar reduce kernel is reused verbatim with ne01 set to
+// n_cols*M -- no mc3-specific reduce needed.
+//
+// Layout, dequant and per-column accumulation are identical to the base mc3, so the
+// result is coherent; the K-sum is reassociated across slices, so it is NOT
+// byte-identical (same property the ne1==1 split-K already has). Host-gated.
+#ifdef ADRENO_GPU
+REQD_SUBGROUP_SIZE_64
+#endif
+__kernel void kernel_gemv_noshuffle_q4_0_f32_mc3_splitk(
+        __read_only  image1d_buffer_t src0_q,  // quantized A
+        global half2  * src0_d,                // A scales
+        __read_only  image1d_buffer_t src1,    // B (n_cols columns, col-major image)
+        global float * partial,                // [ksplit * n_cols * M], slice-major
+        int ne00,                              // K
+        int ne01,                              // M
+        int n_cols)                            // N (2..4)
+{
+    uint groupId = get_local_id(1);
+    uint gid     = get_global_id(0);
+    ushort slid  = get_sub_group_local_id();
+    uint nsg     = get_local_size(1);
+    uint ksplit  = get_num_groups(1);
+    uint kslice  = get_group_id(1);
+
+    uint K = ne00;
+    uint M = ne01;
+
+    uint LINE_STRIDE_A  = M / 2;
+    uint BLOCK_STRIDE_A = N_SIMDGROUP * M;   // physical, independent of the K-split
+    uint COL_STRIDE     = K / 4;
+
+    __private uint4  regA_hi, regA_lo;
+    __private half2  regS;
+    __private float8 regB;
+
+    __private float2 ts0 = (float2)(0.0f);
+    __private float2 ts1 = (float2)(0.0f);
+    __private float2 ts2 = (float2)(0.0f);
+    __private float2 ts3 = (float2)(0.0f);
+
+    // each (kslice, subgroup) pair owns a disjoint set of K-blocks
+    for (uint k = kslice * nsg + groupId; k < (K / QK4_0); k += ksplit * nsg) {
+        regS = src0_d[gid + k * LINE_STRIDE_A];
+
+        regA_hi.s0 = read_imageui(src0_q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 0)).x;
+        regA_hi.s1 = read_imageui(src0_q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 1)).x;
+        regA_hi.s2 = read_imageui(src0_q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 2)).x;
+        regA_hi.s3 = read_imageui(src0_q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 3)).x;
+        regA_lo.s0 = read_imageui(src0_q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 4)).x;
+        regA_lo.s1 = read_imageui(src0_q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 5)).x;
+        regA_lo.s2 = read_imageui(src0_q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 6)).x;
+        regA_lo.s3 = read_imageui(src0_q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 7)).x;
+
+        MC_COL_Q40(ts0, 0);
+        MC_COL_Q40(ts1, 1);
+        if (n_cols > 2) MC_COL_Q40(ts2, 2);
+        if (n_cols > 3) MC_COL_Q40(ts3, 3);
+    }
+
+    __local float8 reduceLM[SIMDGROUP_WIDTH * 8];
+    float8 acc = (float8)(ts0.s0, ts0.s1, ts1.s0, ts1.s1, ts2.s0, ts2.s1, ts3.s0, ts3.s1);
+    reduceLM[groupId * SIMDGROUP_WIDTH + slid] = acc;
+
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    if (groupId == 0) {
+        for (uint g = 1; g < nsg; g++) {
+            acc += reduceLM[g * SIMDGROUP_WIDTH + slid];
+        }
+        // This slice's partial region is the whole column-major [M x n_cols] output.
+        // Guard the padded x-grid tail so it cannot spill into the next slice.
+        global float * p = partial + (ulong)kslice * n_cols * M;
+        const bool w0 = (gid * 2 + 0 < M);
+        const bool w1 = (gid * 2 + 1 < M);
+        if (w0) p[0 * M + gid * 2 + 0] = acc.s0;
+        if (w1) p[0 * M + gid * 2 + 1] = acc.s1;
+        if (w0) p[1 * M + gid * 2 + 0] = acc.s2;
+        if (w1) p[1 * M + gid * 2 + 1] = acc.s3;
+        if (n_cols > 2) { if (w0) p[2 * M + gid * 2 + 0] = acc.s4; if (w1) p[2 * M + gid * 2 + 1] = acc.s5; }
+        if (n_cols > 3) { if (w0) p[3 * M + gid * 2 + 0] = acc.s6; if (w1) p[3 * M + gid * 2 + 1] = acc.s7; }
+    }
+}
 #undef MC_COL_Q40
 #undef MC_DQ_HI
 #undef MC_DQ_LO
@@ -461,7 +559,13 @@ __kernel void kernel_gemv_noshuffle_q4_0_f32_splitk(
         for (uint i = 0; i < nsg - 1; ++i) {
             totalSum += reduceLM[SIMDGROUP_WIDTH * i + slid];
         }
-        vstore2(totalSum, 0, &(partial[kslice * M + gid * 2]));
+        // Guard output rows: the x-grid is padded to CEIL_DIV(M/2,64)*64, so when
+        // M % 128 != 0 the tail row-pairs run past row M and this vstore2 overruns
+        // this K-slice's partial region into the NEXT slice -- and past the end of
+        // the buffer entirely on the last slice. The q4_K twin already guards this;
+        // this kernel did not. No-op / byte-identical when M % 128 == 0.
+        if (gid * 2 + 0 < M) partial[kslice * M + gid * 2 + 0] = totalSum.s0;
+        if (gid * 2 + 1 < M) partial[kslice * M + gid * 2 + 1] = totalSum.s1;
     }
 }
 
@@ -530,22 +634,33 @@ __kernel void kernel_gemv_noshuffle_q4_0_f32_glu(
 #define Q40_DEQ_HI dequantizeBlockAccum_ns_sgbroadcast_1_hi
 #define Q40_DEQ_LO dequantizeBlockAccum_ns_sgbroadcast_1_lo
 #endif
+    // The x-grid is padded to CEIL_DIV(M/2,64)*64, so when M % 128 != 0 the tail
+    // lanes hold gid >= M/2. Their outputs are discarded below, but the SCALE fetch
+    // is a raw global pointer (the weight fetches are images, which clamp), so those
+    // lanes read past the end of the scales allocation -- up to 31 half2 beyond it on
+    // the last K-block. Clamp the row used for the scale so every lane stays in
+    // bounds; the lanes remain active, which subgroup broadcast requires, and their
+    // results are still thrown away by the output guard.
+    // gemma-4-26B-A4B is the shape that exposes this: ffn_gate/ffn_up are
+    // [2816, 2112], and 2112 % 128 == 64. Models whose ffn ne01 is a multiple of 128
+    // (gemma-4-12B 15360, E4B 10240) never form a tail and were unaffected.
+    uint gid_s = min(gid, LINE_STRIDE_A - 1);
 #define Q40_GLU_LOOP(SUM, Q, DD)                                                    \
     for (uint k = groupId; k < (K / QK4_0); k += nsg) {                            \
-        regS = DD[gid + k * LINE_STRIDE_A];                                        \
+        regS = DD[gid_s + k * LINE_STRIDE_A];                                      \
         if (slid < 4) {                                                            \
             regB.s0123 = read_imagef(src1, (slid * 2 + k * 8));                    \
             regB.s4567 = read_imagef(src1, (1 + slid * 2 + k * 8));                \
         }                                                                          \
-        regA.s0 = read_imageui(Q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 0)).x;\
-        regA.s1 = read_imageui(Q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 1)).x;\
-        regA.s2 = read_imageui(Q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 2)).x;\
-        regA.s3 = read_imageui(Q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 3)).x;\
+        regA.s0 = read_imageui(Q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 0)).x;\
+        regA.s1 = read_imageui(Q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 1)).x;\
+        regA.s2 = read_imageui(Q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 2)).x;\
+        regA.s3 = read_imageui(Q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 3)).x;\
         Q40_DEQ_HI(SUM, as_ushort8(regA), regS, regB);                             \
-        regA.s0 = read_imageui(Q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 4)).x;\
-        regA.s1 = read_imageui(Q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 5)).x;\
-        regA.s2 = read_imageui(Q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 6)).x;\
-        regA.s3 = read_imageui(Q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 7)).x;\
+        regA.s0 = read_imageui(Q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 4)).x;\
+        regA.s1 = read_imageui(Q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 5)).x;\
+        regA.s2 = read_imageui(Q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 6)).x;\
+        regA.s3 = read_imageui(Q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 7)).x;\
         Q40_DEQ_LO(SUM, as_ushort8(regA), regS, regB);                             \
     }
     Q40_GLU_LOOP(gateSum, src0g_q, src0g_d)
