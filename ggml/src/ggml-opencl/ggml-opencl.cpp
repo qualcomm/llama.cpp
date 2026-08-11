@@ -25873,7 +25873,29 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
             return !e || e[0] == '\0' || e[0] != '0';
         }();
         const bool use_tiled     = !use_q6k_mc3 && use_q6k_tiled(src0);
-        const bool use_o4        = !use_tiled && !use_q6k_mc3 && gemv_o4_env && (ne01 % 4 == 0) && (ne01 >= 32768);
+        // 2026-08-11: threshold 32768 -> 4096. The 32768 gate confined o4 to long-vocab
+        // lm_head on the claim that it "regresses ~16%" per-layer, but that claim does not
+        // reproduce: at ne01=6656 (Muse Glimmer ffn_down) o4 GAINS, and at 19968 (its
+        // ffn_gate/up) it gains a lot. X2-90 tg64, matched pairs:
+        //
+        //     Muse dynamic (q6_K on gate/up 19968 + down 6656)  4.04 -> 4.43  (+9.5%)
+        //     Muse 17gb    (q6_K on down 6656 only)             6.43 -> 6.55  (+1.9%)
+        //
+        // Provably a no-op for everything previously measured: the newly-enabled band is
+        // ne01 in [4096, 32768), and no gemma-4 model has a q6_K tensor in it (E4B 512/1024/
+        // 2560; 12B 2048/3840; 26B 2048 and 262144 -- the latter already >= 32768). Their
+        // three-pair sweeps duly came back as noise with signs disagreeing.
+        //
+        // The o4 STRUCTURE is the win (activation reuse + half the workgroups), not the read
+        // path: o4 with __global weights measured -2.2% vs o4 with image reads on these
+        // shapes, so Q6K_O4_GLOBAL stays gated to lm_head where the texture cache actually
+        // binds (~22 GB/s on a 600 MB stream vs 68 GB/s here).
+        //
+        // Residual risk, stated: a q6_K tensor with ne01 in [4096, 32768) on some model we do
+        // not have is newly routed and untested. Muse Glimmer is the only member we hold.
+        // Lower still (< 4096) is NOT justified -- that is the band the original note refers
+        // to and it remains unmeasured. Opt out: GGML_OPENCL_Q6K_GEMV_O4=0.
+        const bool use_o4        = !use_tiled && !use_q6k_mc3 && gemv_o4_env && (ne01 % 4 == 0) && (ne01 >= 4096);
         const bool use_o4_global = use_o4 && o4_global_env;
 
         // ql/qh image views are only needed when NOT reading weights from global.
