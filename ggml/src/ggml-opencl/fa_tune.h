@@ -29,6 +29,20 @@ static const ggml_opencl_fa_dim g_fa_dims_adreno_default[] = {
     // and pp2048@d2048 297.2 -> 297.4, both inside run-to-run spread. Below
     // n_q=5 the flash-decoding route serves this shape and is faster than either
     // tuning. GGML_OPENCL_FA_TUNE=128:128:64:32:2:64 restores the old entry.
+    //
+    // Portability note: raising N_SPLIT also raises WG_SIZE (= BLOCK_M*N_SPLIT)
+    // from 128 to 512, and on a device WITHOUT subgroup shuffle the tile falls
+    // back to reducing through __local ACC_TYPE local_partial[BLOCK_N][WG_SIZE].
+    // That array grows 16 KB -> 64 KB, taking the kernel's local total from
+    // 32 KB (l_k 8 + l_v 8 + partial 16, exactly the Adreno budget) to 80 KB, so
+    // this entry is only viable where cl_{khr,qcom}_subgroup_shuffle is present
+    // and the shuffle reduce is compiled in. That holds on every device the tile
+    // reaches today (X2-90 and 840 verified: test-backend-ops FLASH_ATTN_EXT
+    // 2742/2742 and 2743/2743 with this entry, both matching the BM=64 arm), and
+    // an over-budget build would fail clBuildProgram, leave the variant
+    // unregistered and fall back rather than corrupt -- the FA programs are built
+    // with fatal=false. Re-check this arithmetic before widening N_SPLIT further
+    // or enabling the tile on a no-shuffle generation.
     {128, 128, 16, 32, 32, 64},
     {192, 128, 16, 16, 1, 0},
     {192, 192, 16, 16, 1, 0},
