@@ -26839,8 +26839,39 @@ static void ggml_cl_mul_mat_q5_K_f32_adreno(ggml_backend_t backend, const ggml_t
             CL_CHECK(clSetKernelArg(kernel, 13, sizeof(cl_int), &ne1));  // n_cols
         }
 
-        size_t local_work_size[3]  = {64, 4, 1};
-        size_t global_work_size[3] = {(size_t)CEIL_DIV(ne01/2, 64)*64, 4, 1};
+        // Wide K-split for the q5_K decode GEMV. An ablation of this kernel says it is
+        // LATENCY-bound, not bandwidth- or ALU-bound: dropping the dequant ALU costs
+        // -0.19%, the weight-plane reads are 53% of it, and dropping the scale path -- a
+        // dependency of the dequant -- buys 30%. Extra waves per SP hide that latency at
+        // zero per-wave register cost (issuing all 12 weight loads up front instead, i.e.
+        // more parallelism per wave, REGRESSED 3%).
+        // Measured X2-90, matched pairs, non-profiling build: muse-glimmer
+        // -kquant-dynamic (44.8% q5_K) tg128 +9.27% / +9.17% at 8, kernel time -18.0%.
+        // Null controls: the 17gb build (~no q5_K) -0.16% tg, and pp512 neutral on both
+        // (prefill uses the GEMM path). 16 caps back to 8 here anyway
+        // (CL_KERNEL_WORK_GROUP_SIZE = 512 for this kernel on X2-90).
+        // Gated on the SPECIFIC gen, not gen_level: A8X (Adreno 840) resolves to the same
+        // GEN_LEVEL_X2 as X2E, and the sibling q6_K widening REGRESSED 6.3%, so this is
+        // not safe to extrapolate to unmeasured gens. Widen once 840/740/850 are done.
+        // Opt out / sweep with GGML_OPENCL_Q5K_GEMV_WIDE=N; mc3 stays at 4 (its own
+        // reduction is still hard-coded to a 4-way split).
+        static const int q5k_wide_env = []{
+            const char * e = std::getenv("GGML_OPENCL_Q5K_GEMV_WIDE");
+            return (e && e[0]) ? atoi(e) : -1;
+        }();
+        const int q5k_wide = q5k_wide_env > 0 ? q5k_wide_env
+                           : (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E ? 8 : 4);
+        size_t nsg_y = use_q5k_mc3 ? 4 : (size_t)q5k_wide;
+        // Cap by the kernel's real max WG: an lws above CL_KERNEL_WORK_GROUP_SIZE aborts
+        // the dispatch with CL_INVALID_WORK_GROUP_SIZE (-54). nsg_y is a pure K-split, so
+        // halving it stays coherent -- just a narrower split.
+        {
+            const size_t maxwg = backend_ctx->get_kernel_workgroup_size(kernel);
+            while (nsg_y > 1 && 64 * nsg_y > maxwg) { nsg_y >>= 1; }
+        }
+
+        size_t local_work_size[3]  = {64, nsg_y, 1};
+        size_t global_work_size[3] = {(size_t)CEIL_DIV(ne01/2, 64)*64, nsg_y, 1};
 
         backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
 
