@@ -11892,11 +11892,22 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                     // GGML_OPENCL_Q6K/Q4K_GEMV_TILED=1): that routes ne1>1 to the
                     // correct dp4a tiled GEMM (the trans-weight GEMM still corrupts,
                     // so only the tiled path is exempted from the CPU pin).
+                    // The tiled escape hatch below is NOT usable: the tiled q6_K
+                    // GEMV is wrong for every shape it actually runs (measured on
+                    // X2-90, test-backend-ops MUL_MAT q6_K m=32768..262144,
+                    // k=512..2816 -> ERR ~1.95 at every K-split width), which is
+                    // why GGML_OPENCL_Q6K_GEMV_TILED defaults off. The earlier
+                    // "single-superblock k=256 is correct" reading was an artifact:
+                    // ne0=256 fails use_adreno_kernels' 512 threshold, so that case
+                    // never reaches the tiled kernel at all.
+                    //
+                    // The NON-tiled path, by contrast, is correct at the real
+                    // lm_head shape (262144 x 1 x 2816) and at ne1 = 2/3/4/8/512.
+                    // So gate GPU placement on the opt-in alone and let the normal
+                    // dispatch pick the (correct) non-tiled GEMV/GEMM.
                     static const bool lmhead_gpu = std::getenv("GGML_OPENCL_Q6K_LMHEAD_GPU") != nullptr;
                     if (op->ne[0] >= 32768 && op->src[1]->ne[1] > 1) {
-                        const bool tiled_gpu_ok = lmhead_gpu &&
-                            (use_q6k_tiled(op->src[0]) || use_q4k_tiled(op->src[0]));
-                        if (!tiled_gpu_ok) {
+                        if (!lmhead_gpu) {
                             return false;
                         }
                     }
