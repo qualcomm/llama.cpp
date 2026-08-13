@@ -8999,6 +8999,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32,  32768, 1, 2048, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32,  65536, 1, 2048, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32,  32768, 1,  256, {1, 1}, {1, 1}));
+    // nb sweep at fixed m: nb=1 passes today, nb>=2 fails. nb=4 gives every
+    // subgroup exactly one superblock (isolates the K-split reduction from the
+    // per-superblock indexing).
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32,  32768, 1,  512, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32,  32768, 1, 1024, {1, 1}, {1, 1}));
+    // gemma-4-26B-A4B ships its tied lm_head as the file's ONLY q6_K tensor,
+    // [2816 x 262144]: k = n_embd 2816 -> nb = 11 superblocks, which is NOT a
+    // multiple of NSUBGROUPS=4, so the K-split leaves subgroups with unequal
+    // trip counts. The 32768-row twin is the fast iteration shape (same nb).
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32,  32768, 1, 2816, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 262144, 1, 2816, {1, 1}, {1, 1}));
 
     // MoE-router shape: f32 x f32, m = n_expert, n = 2..8 tokens, k = n_embd.
     // This is ffn_moe_logits (mul_mat of the F32 ffn_gate_inp), which every MoE
