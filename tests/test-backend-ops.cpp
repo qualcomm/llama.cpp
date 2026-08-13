@@ -9010,6 +9010,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // trip counts. The 32768-row twin is the fast iteration shape (same nb).
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32,  32768, 1, 2816, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 262144, 1, 2816, {1, 1}, {1, 1}));
+    // Batched (ne1>1) at the same lm_head shape. Placement is decided by a
+    // ne1=512 probe, so if the weight is to live on the GPU these must be
+    // correct there too -- a decode-only fix is not enough.
+    for (int n : {2, 3, 4, 8}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 32768, n, 2816, {1, 1}, {1, 1}));
+    }
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32,  32768, 512, 2816, {1, 1}, {1, 1}));
 
     // MoE-router shape: f32 x f32, m = n_expert, n = 2..8 tokens, k = n_embd.
     // This is ffn_moe_logits (mul_mat of the F32 ffn_gate_inp), which every MoE
