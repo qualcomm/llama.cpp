@@ -1594,101 +1594,11 @@ void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adap
     llama_set_adapters_lora(ctx, loras.data(), loras.size(), scales.data());
 }
 
-// On the Adreno OpenCL backend a vocab-scale K-quant lm_head belongs on the GPU
-// for single-stream decode (neutral throughput, and it keeps the CPU from
-// streaming the whole head every token) but on the CPU as soon as the head runs
-// batched. Measured on Adreno X2-90, gemma-4-26B-A4B QAT-Q4_0, head on GPU vs CPU:
-//
-//   single stream, no speculation   pp512 -0.5%, tg128 -1.9%  (inside the CPU arm's spread)
-//   speculative decode (MTP k=3)    36.73 vs 41.29 t/s        (-11%)
-//   multi-slot -np 4                45.18 vs 53.67 agg t/s    (-15.8%)
-//
-// Placement is a single decision for the whole run -- weight_buft_supported
-// probes once at a fixed ne1 = 512 -- so it cannot follow the batch width, and
-// the backend's supports_op cannot see how the context will be used. Decide it
-// here instead, from the one signal that is both known at load time and implies
-// the head really will run batched: speculative decoding, where every step
-// verifies k+1 tokens through it.
-//
-// Deliberately NOT keyed on n_parallel. That is a CAPACITY, not a workload: the
-// server defaults it to -1 -> 4 slots (arg.cpp, and tools/server/server.cpp
-// expands the auto value), yet a single-user session still runs the head at
-// ne1 == 1, where the GPU is the right place for it. Pinning on n_parallel would
-// send every default llama-server run back to the CPU, which is exactly the
-// "why is the CPU busy" complaint this placement work exists to fix. A genuinely
-// concurrent deployment does lose ~15.8% with the head on the GPU (measured at
-// -np 4 with 4 in-flight requests) and should set GGML_OPENCL_Q6K_LMHEAD_GPU=0
-// or -ot token_embd.weight=CPU.
-//
-// Scoped to OpenCL on purpose: a discrete GPU has bandwidth the CPU cannot match
-// and wants the head on-device in every one of these shapes.
-static bool common_opencl_batched_head_pin(const common_params & params) {
-    if (params.n_gpu_layers == 0) {
-        return false;
-    }
-    // NB: speculative.types defaults to { COMMON_SPECULATIVE_TYPE_NONE }, so it is
-    // never empty -- test the contents, not the size.
-    const bool spec = std::any_of(
-        params.speculative.types.begin(), params.speculative.types.end(),
-        [](enum common_speculative_type t) { return t != COMMON_SPECULATIVE_TYPE_NONE; });
-    if (!spec) {
-        return false;
-    }
-    // Only when the run will actually offload to the OpenCL backend. With an
-    // explicit device list, that is simply whether OpenCL is in it.
-    if (!params.devices.empty()) {
-        for (ggml_backend_dev_t dev : params.devices) {
-            if (dev && strcmp(ggml_backend_dev_name(dev), "GPUOpenCL") == 0) {
-                return true;
-            }
-        }
-        return false;
-    }
-    // Auto device selection: require that OpenCL is the ONLY GPU backend present.
-    // Builds carrying several (CUDA + Vulkan + OpenCL in one binary is a real
-    // configuration here) may well run on one of the others, and this heuristic is
-    // measured on Adreno only -- a discrete GPU wants the head on-device in every
-    // shape, so guessing wrong costs it the whole placement.
-    size_t n_gpu = 0, n_gpu_opencl = 0;
-    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
-        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-        if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
-            n_gpu++;
-            if (strcmp(ggml_backend_dev_name(dev), "GPUOpenCL") == 0) {
-                n_gpu_opencl++;
-            }
-        }
-    }
-    return n_gpu > 0 && n_gpu == n_gpu_opencl;
-}
-
 struct llama_model_params common_model_params_to_llama(common_params & params) {
     auto mparams = llama_model_default_params();
 
     if (!params.devices.empty()) {
         mparams.devices = params.devices.data();
-    }
-
-    if (common_opencl_batched_head_pin(params)) {
-        const bool already_overridden = std::any_of(
-            params.tensor_buft_overrides.begin(), params.tensor_buft_overrides.end(),
-            [](const llama_model_tensor_buft_override & o) {
-                return o.pattern != nullptr && strstr(o.pattern, "token_embd") != nullptr;
-            });
-        ggml_backend_buffer_type_t cpu_buft = ggml_backend_dev_buffer_type(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU));
-        if (!already_overridden && cpu_buft != nullptr) {
-            LOG_INF("%s: OpenCL + speculative decode: keeping token_embd.weight on the CPU "
-                    "(it verifies k+1 tokens per step, where the GPU head costs ~11%%); "
-                    "override with -ot token_embd.weight=<buft>\n", __func__);
-            // Insert at the FRONT. The list is null-terminated and arg.cpp pads it out
-            // to llama_max_tensor_buft_overrides() empty entries, so appending puts the
-            // override behind a terminator where the loader never reads it.
-            params.tensor_buft_overrides.insert(params.tensor_buft_overrides.begin(),
-                                                {"token_embd.weight", cpu_buft});
-            if (params.tensor_buft_overrides.back().pattern != nullptr) {
-                params.tensor_buft_overrides.push_back({nullptr, nullptr});
-            }
-        }
     }
 
     mparams.n_gpu_layers    = params.n_gpu_layers;
