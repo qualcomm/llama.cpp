@@ -15775,6 +15775,35 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
 
     ggml_tensor_extra_cl * extra = (ggml_tensor_extra_cl *) tensor->extra;
 
+    // GGML_OPENCL_READBACK_STATS=1 accounts this path. It is the device->host
+    // copy for anything the host consumes -- most importantly the logits, which
+    // are read every step when the lm_head runs on the GPU (and not at all when
+    // it runs on the CPU). The buffer comes from the plain device pool
+    // (clCreateBuffer CL_MEM_READ_WRITE, no CL_MEM_ALLOC_HOST_PTR), so this is a
+    // real driver copy out of memory the host does not cache, not a UMA no-op.
+    static const bool rb_stats = []{
+        const char * e = std::getenv("GGML_OPENCL_READBACK_STATS");
+        return e && e[0] != '\0' && e[0] != '0';
+    }();
+    if (rb_stats) {
+        static std::atomic<uint64_t> rb_calls{0}, rb_bytes{0}, rb_ns{0};
+        const auto t0 = std::chrono::high_resolution_clock::now();
+        CL_CHECK(clEnqueueReadBuffer(
+            queue, extra->data_device, CL_TRUE, extra->offset + tensor->view_offs + offset,
+            size, data, 0, NULL, NULL));
+        const auto t1 = std::chrono::high_resolution_clock::now();
+        const uint64_t n = rb_calls.fetch_add(1) + 1;
+        rb_bytes += size;
+        rb_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+        if (n % 50 == 0) {
+            const double ms = rb_ns.load()/1e6, mb = rb_bytes.load()/1048576.0;
+            GGML_LOG_INFO("ggml_opencl: readback %llu calls, %.1f MiB, %.1f ms total (%.3f ms/call, %.2f GB/s)\n",
+                          (unsigned long long)n, mb, ms, ms/n, (rb_bytes.load()/1e9)/(rb_ns.load()/1e9));
+        }
+        GGML_UNUSED(buffer);
+        return;
+    }
+
     CL_CHECK(clEnqueueReadBuffer(
         queue, extra->data_device, CL_TRUE, extra->offset + tensor->view_offs + offset,
         size, data, 0, NULL, NULL));
