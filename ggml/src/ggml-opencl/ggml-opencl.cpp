@@ -2844,9 +2844,18 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                     }
                 }
 
+                // Whether the column tile's activations stay in registers across
+                // the row loop; 0 frees 16*N_COLS registers at the cost of N_DST
+                // times the load issue. See the kernel.
+                int y_cache = 1;
+                if (const char * e = std::getenv("GGML_OPENCL_Q6K_MC_Y_CACHE")) {
+                    y_cache = atoi(e) != 0;
+                }
+
                 const std::string mc_opts = compile_opts +
-                    " -DQ6K_MC_N_COLS=" + std::to_string(v.n_cols) +
-                    " -DQ6K_MC_N_DST="  + std::to_string(n_dst);
+                    " -DQ6K_MC_N_COLS="  + std::to_string(v.n_cols) +
+                    " -DQ6K_MC_N_DST="   + std::to_string(n_dst) +
+                    " -DQ6K_MC_Y_CACHE=" + std::to_string(y_cache);
 
                 // Non-fatal: this is a pure optimisation over a kernel that stays in
                 // the tree, and the program is built at init on every device the

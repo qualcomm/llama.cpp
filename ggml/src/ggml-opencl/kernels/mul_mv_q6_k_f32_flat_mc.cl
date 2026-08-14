@@ -59,6 +59,20 @@
 #define Q6K_MC_N_COLS 4
 #endif
 
+// Where the column tile's activations live across the row loop.
+//   1: cached in registers, loaded once per superblock and reused by all N_DST
+//      rows. Fewest load instructions, but costs 16*N_COLS registers -- at
+//      N_COLS=4 that is 64, MORE than the N_DST*N_COLS accumulator block, and it
+//      is what forces N_DST down to 4.
+//   0: re-read from global inside the row loop. Frees those 64 registers so
+//      N_DST can rise; the working set is one superblock x N_COLS = 4 KB, so the
+//      re-reads are L1 hits, but they are still N_DST times the load issue.
+// Discriminates occupancy-bound from issue-bound: if the kernel is register
+// starved, 0 with a larger N_DST wins.
+#ifndef Q6K_MC_Y_CACHE
+#define Q6K_MC_Y_CACHE 1
+#endif
+
 #ifdef INTEL_GPU
 #ifndef Q6K_MC_N_DST
 #define Q6K_MC_N_DST 4
@@ -163,6 +177,7 @@ kernel void kernel_mul_mv_q6_K_f32_flat_mc(
     }
 
     for (int ib = ix; ib < nb; ib += BLOCK_STRIDE) {
+#if Q6K_MC_Y_CACHE
         // Activations for all N_COLS columns of this super-block, loaded once and
         // reused across the N_DST rows below. This is the reuse the single-column
         // kernel cannot express.
@@ -174,6 +189,7 @@ kernel void kernel_mul_mv_q6_K_f32_flat_mc(
             y2[c] = vload4(0, y + 64);
             y3[c] = vload4(0, y + 96);
         }
+#endif
 
         for (int row = 0; row < N_DST; row++) {
             if (first_row + row < ne01) {
@@ -204,8 +220,17 @@ kernel void kernel_mul_mv_q6_K_f32_flat_mc(
                                      : (char4)(scv.s1, scv.s3, scv.s5, scv.s7);
 
                 for (int c = 0; c < N_COLS; c++) {
-                    sumf[row][c] += dall * (dot(y0[c], w0) * s4.x + dot(y1[c], w1) * s4.y +
-                                            dot(y2[c], w2) * s4.z + dot(y3[c], w3) * s4.w);
+#if Q6K_MC_Y_CACHE
+                    const float4 yc0 = y0[c], yc1 = y1[c], yc2 = y2[c], yc3 = y3[c];
+#else
+                    global float * y = yy + (ulong)ycol[c]*ne10 + ib*QK_K + 128*ip + l0;
+                    const float4 yc0 = vload4(0, y +  0);
+                    const float4 yc1 = vload4(0, y + 32);
+                    const float4 yc2 = vload4(0, y + 64);
+                    const float4 yc3 = vload4(0, y + 96);
+#endif
+                    sumf[row][c] += dall * (dot(yc0, w0) * s4.x + dot(yc1, w1) * s4.y +
+                                            dot(yc2, w2) * s4.z + dot(yc3, w3) * s4.w);
                 }
             }
         }
