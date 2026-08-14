@@ -1594,11 +1594,75 @@ void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adap
     llama_set_adapters_lora(ctx, loras.data(), loras.size(), scales.data());
 }
 
+// On the Adreno OpenCL backend a vocab-scale K-quant lm_head belongs on the GPU
+// for single-stream decode (neutral throughput, and it keeps the CPU from
+// streaming the whole head every token) but on the CPU as soon as the head runs
+// batched. Measured on Adreno X2-90, gemma-4-26B-A4B QAT-Q4_0, head on GPU vs CPU:
+//
+//   single stream, no speculation   pp512 -0.5%, tg128 -1.9%  (inside the CPU arm's spread)
+//   speculative decode (MTP k=3)    36.73 vs 41.29 t/s        (-11%)
+//   multi-slot -np 4                45.18 vs 53.67 agg t/s    (-15.8%)
+//
+// Placement is a single decision for the whole run -- weight_buft_supported
+// probes once at a fixed ne1 = 512 -- so it cannot follow the batch width, and
+// the backend's supports_op cannot see how the context will be used. Decide it
+// here instead, where both facts are known, by pinning the head back to the CPU
+// when the run will drive it batched.
+//
+// Scoped to OpenCL on purpose: a discrete GPU has bandwidth the CPU cannot match
+// and wants the head on-device in every one of these shapes. Override either way
+// with -ot token_embd.weight=... or GGML_OPENCL_Q6K_LMHEAD_GPU.
+static bool common_opencl_batched_head_pin(const common_params & params) {
+    if (params.n_gpu_layers == 0) {
+        return false;
+    }
+    const bool batched = params.n_parallel > 1 || !params.speculative.types.empty();
+    if (!batched) {
+        return false;
+    }
+    // Only when the run will actually offload to the OpenCL backend.
+    if (!params.devices.empty()) {
+        for (ggml_backend_dev_t dev : params.devices) {
+            if (dev && strcmp(ggml_backend_dev_name(dev), "GPUOpenCL") == 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU &&
+            strcmp(ggml_backend_dev_name(dev), "GPUOpenCL") == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 struct llama_model_params common_model_params_to_llama(common_params & params) {
     auto mparams = llama_model_default_params();
 
     if (!params.devices.empty()) {
         mparams.devices = params.devices.data();
+    }
+
+    if (common_opencl_batched_head_pin(params)) {
+        const bool already_overridden = std::any_of(
+            params.tensor_buft_overrides.begin(), params.tensor_buft_overrides.end(),
+            [](const llama_model_tensor_buft_override & o) {
+                return o.pattern != nullptr && strstr(o.pattern, "token_embd") != nullptr;
+            });
+        ggml_backend_buffer_type_t cpu_buft = ggml_backend_dev_buffer_type(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU));
+        if (!already_overridden && cpu_buft != nullptr) {
+            LOG_INF("%s: OpenCL + batched decode (n_parallel=%d, speculative=%d): keeping "
+                    "token_embd.weight on the CPU (override with -ot)\n",
+                    __func__, params.n_parallel, (int) !params.speculative.types.empty());
+            if (!params.tensor_buft_overrides.empty()) {
+                params.tensor_buft_overrides.pop_back();  // drop the {nullptr,nullptr} terminator
+            }
+            params.tensor_buft_overrides.push_back({"token_embd.weight", cpu_buft});
+            params.tensor_buft_overrides.push_back({nullptr, nullptr});
+        }
     }
 
     mparams.n_gpu_layers    = params.n_gpu_layers;
