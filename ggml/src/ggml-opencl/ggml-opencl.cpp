@@ -12166,23 +12166,37 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                                                         ht == GGML_TYPE_Q5_K ||
                                                         ht == GGML_TYPE_Q6_K);
                     static const char * lmhead_env = std::getenv("GGML_OPENCL_Q6K_LMHEAD_GPU");
-        (void) lmhead_type_validated;
-                    // ðŸ”´ DEFAULT-OFF AGAIN (2026-08-14). Moving the vocab-scale q6_K head to the GPU
-        // was validated only at ne1 == 1, where it measures neutral. But the head also
-        // runs at ne1 > 1 -- speculative-decode verify batches, multi-slot serving
-        // (-np 2..8) and perplexity -- and the batched vocab-scale q6_K GEMM is far
-        // slower there than the CPU, which does this head at ~116 GB/s.
-        //
-        // Measured, gemma-4-26B-A4B QAT-Q4_0 + q8_0 QAT assistant, MTP k=3, Adreno X2-90,
-        // same session, identical acceptance (181/130) and one md5 across every arm:
-        //   head on GPU (the 08-13 default) : plain 36.08  spec 32.38  (-10.3%)
-        //   head on CPU (=0)                : plain 37.59  spec 41.36  (+10.0%)
-        //   08-09 control build 59bdeb43c   : plain 36.35  spec 41.08  (+13.0%)
-        // i.e. the GPU head costs ~22% of spec decode and buys nothing at ne1 == 1.
-        // Re-enable with GGML_OPENCL_Q6K_LMHEAD_GPU=1 once the ne1 > 1 path is fixed.
-        const bool lmhead_gpu = lmhead_env
+                    // DEFAULT-ON AGAIN (2026-08-14, second pass), X2E + validated types only.
+                    //
+                    // History: default-on 08-13 on ne1 == 1 evidence, reverted the same week
+                    // because the batched path cost ~22% of speculative decode. The
+                    // multi-column GEMV (kernel_mul_mv_q6_K_f32_flat_mc) has since taken that
+                    // penalty to ~11%, and the non-speculative case -- which is what decides
+                    // placement for most users -- measures as a wash:
+                    //
+                    //   gemma-4-26B-A4B QAT-Q4_0, X2-90, llama-bench, 3 reps interleaved
+                    //     pp512   head CPU 549.87   head GPU 547.28   (-0.47%)
+                    //     tg128   head CPU  37.82   head GPU  37.10   (-1.9%)
+                    //
+                    // and the -1.9% is inside the CPU arm's own spread (38.25/36.99/38.23)
+                    // while the GPU arm holds 0.5% (37.02/37.19/37.09) -- taking the head off
+                    // the CPU also removes decode variance. Against that, GPU placement moves
+                    // 577.50 MiB out of the CPU buffer, takes graph splits 4 -> 3, and stops
+                    // the CPU streaming 0.606 GB per token, which is what customers see as
+                    // "the CPU is busy when it should be running on the GPU".
+                    //
+                    // 🔴 The trade that remains: SPECULATIVE DECODE still prefers the CPU head
+                    // (MTP k=3: 41.29 t/s head-on-CPU vs 36.73 head-on-GPU). Placement is one
+                    // decision for all widths -- the probe in weight_buft_supported is a fixed
+                    // ne1 = 512 -- so decode and verify cannot be split. Users running
+                    // speculative decode should set GGML_OPENCL_Q6K_LMHEAD_GPU=0 (or
+                    // -ot token_embd.weight=CPU) until the batched path closes the last 11%,
+                    // which needs cheaper math per weight (fp16 dot / dp4a), not more tiling:
+                    // the multi-column kernel is issue-bound, not spill-bound (measured).
+                    const bool lmhead_gpu = lmhead_env
                         ? (lmhead_env[0] != '\0' && lmhead_env[0] != '0')
-                        : false;   // opt-in only; see the note above ((void) lmhead_type_validated)
+                        : (lmhead_type_validated &&
+                           backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E);
                     if (op->ne[0] >= 32768 && op->src[1]->ne[1] > 1) {
                         if (!lmhead_gpu) {
                             return false;
