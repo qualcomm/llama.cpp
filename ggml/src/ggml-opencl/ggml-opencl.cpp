@@ -1291,6 +1291,11 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mv_q5_K_f32_flat;
     cl_kernel kernel_mul_mv_q6_K_f32;
     cl_kernel kernel_mul_mv_q6_K_f32_flat;
+    // Multi-column twin of the flat q6_K GEMV (ne1 > 1): one weight pass for
+    // q6k_mc_ncols output columns. Null when the variant is disabled.
+    cl_kernel kernel_mul_mv_q6_K_f32_flat_mc = nullptr;
+    int       q6k_mc_ncols = 0;   // N_COLS the mc kernel was built with
+    int       q6k_mc_ndst  = 0;   // N_DST   the mc kernel was built with
     cl_kernel kernel_mul_mv_mxfp4_f32, kernel_mul_mv_mxfp4_f32_flat;
     cl_kernel kernel_mul_mv_q8_0_f32, kernel_mul_mv_q8_0_f32_flat;
     cl_kernel kernel_mul_mat_q8_0_f32_kq_gen = nullptr;
@@ -2783,6 +2788,54 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         CL_CHECK((backend_ctx->kernel_mul_mv_q6_K_f32_flat = clCreateKernel(prog, "kernel_mul_mv_q6_K_f32_flat", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
+    }
+
+    // mul_mv_q6_k_f32_flat_mc -- multi-column flat q6_K GEMV (ne1 > 1).
+    // Separate program on purpose: the A6X (642L/619) compiler miscompiles any
+    // kernel defined after a subgroup-builtin kernel in the same program
+    // (see the A6X multi-kernel note), so this does not join the flat program.
+    // Opt out entirely with GGML_OPENCL_Q6K_FLAT_MC=0; the tile is tunable with
+    // GGML_OPENCL_Q6K_MC_N_DST / GGML_OPENCL_Q6K_MC_N_COLS.
+    {
+        const char * mc_env = std::getenv("GGML_OPENCL_Q6K_FLAT_MC");
+        const bool   mc_on  = !mc_env || mc_env[0] == '\0' || mc_env[0] != '0';
+        if (mc_on) {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+            const std::string kernel_src {
+                #include "mul_mv_q6_k_f32_flat_mc.cl.h"
+            };
+#else
+            const std::string kernel_src = read_file("mul_mv_q6_k_f32_flat_mc.cl");
+#endif
+            int n_cols = 4;
+            int n_dst  = backend_ctx->gpu_family == INTEL ? 4 : 8;
+            if (const char * e = std::getenv("GGML_OPENCL_Q6K_MC_N_COLS")) {
+                const int v = atoi(e);
+                if (v >= 1 && v <= 16) {
+                    n_cols = v;
+                }
+            }
+            if (const char * e = std::getenv("GGML_OPENCL_Q6K_MC_N_DST")) {
+                const int v = atoi(e);
+                if (v >= 1 && v <= 32) {
+                    n_dst = v;
+                }
+            }
+
+            std::string mc_opts = compile_opts +
+                " -DQ6K_MC_N_COLS=" + std::to_string(n_cols) +
+                " -DQ6K_MC_N_DST="  + std::to_string(n_dst);
+
+            cl_program prog_mc = build_program_from_source(backend_ctx, kernel_src.c_str(), mc_opts);
+
+            CL_CHECK((backend_ctx->kernel_mul_mv_q6_K_f32_flat_mc =
+                          clCreateKernel(prog_mc, "kernel_mul_mv_q6_K_f32_flat_mc", &err), err));
+            CL_CHECK(clReleaseProgram(prog_mc));
+
+            backend_ctx->q6k_mc_ncols = n_cols;
+            backend_ctx->q6k_mc_ndst  = n_dst;
+            GGML_LOG_CONT(".");
+        }
     }
 
     // mul_mv_q8_0_f32
@@ -28414,6 +28467,9 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
     int nrows = 1;
     // The number of values produced by each subgroup
     int ndst = 4;
+    // Output columns handled by one workgroup. 1 for every kernel that takes its
+    // column from get_group_id(1); raised by the multi-column GEMV variants.
+    int ncols_per_wg = 1;
 
     cl_kernel kernel;
 
@@ -30747,6 +30803,18 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 GGML_ASSERT(false && "TODO: Unknown GPU");
             }
 
+            // ne1 > 1 (speculative-decode verify batch, multi-slot serving,
+            // perplexity): the single-column kernel re-streams the entire weight
+            // for every output column, which for a vocab-scale lm_head means ne1
+            // full passes over hundreds of MB. Switch to the multi-column twin,
+            // which reads the weight once per N_COLS columns. Same arithmetic per
+            // (row, column), so the result is bit-identical.
+            if (ne11 > 1 && backend_ctx->kernel_mul_mv_q6_K_f32_flat_mc != nullptr) {
+                kernel        = backend_ctx->kernel_mul_mv_q6_K_f32_flat_mc;
+                ndst          = backend_ctx->q6k_mc_ndst;
+                ncols_per_wg  = backend_ctx->q6k_mc_ncols;
+            }
+
             CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0_q6_K->ql));
             CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_mem),   &extra0_q6_K->qh));
             CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),   &extra0_q6_K->s));
@@ -30908,7 +30976,10 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 
         backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
     } else if (src0t == GGML_TYPE_Q6_K) {
-        size_t global_work_size[] = {(size_t)(ne01+ndst*nth1-1)/(ndst*nth1)*nth0, (size_t)ne11*nth1, (size_t)ne12*ne13};
+        // ncols_per_wg > 1 only for the multi-column flat GEMV: one workgroup row
+        // then covers ncols_per_wg output columns instead of one.
+        const size_t n_col_tiles = (size_t)(ne11 + ncols_per_wg - 1)/ncols_per_wg;
+        size_t global_work_size[] = {(size_t)(ne01+ndst*nth1-1)/(ndst*nth1)*nth0, n_col_tiles*nth1, (size_t)ne12*ne13};
         size_t local_work_size[] = {(size_t)nth0, (size_t)nth1, 1};
 
         backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
