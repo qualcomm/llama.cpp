@@ -16726,7 +16726,31 @@ static void ggml_cl_mul(ggml_backend_t backend, const ggml_tensor * src0, const 
         backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size_ptr, dst);
     } else {
         unsigned int nth = MIN(64, ne0);
-        size_t global_work_size[] = {ne01*nth, (size_t)ne02, (size_t)ne03};
+        // This launch parallelises over ROWS only: one workgroup per ne01. A
+        // tall-narrow dst -- e.g. the MoE weighting ffn_moe_down_scaled, which is
+        // [n_embd, n_expert_used] = [2816, 8] -- therefore lands on 8 workgroups and
+        // leaves most of a 16-CU device idle while each work item strides over a
+        // whole 2816-element row (measured: 16.0 us for 22528 multiplies). Split ne0
+        // across extra workgroups when the rows alone cannot fill the device. nchunk
+        // is recovered inside the kernel as get_num_groups(0)/ne01, so the kernel
+        // signature is unchanged and nchunk == 1 reproduces the original launch.
+        static const int mul_chunk_env = []{
+            const char * e = std::getenv("GGML_OPENCL_MUL_CHUNK");
+            return (e && e[0] != '\0') ? (e[0] != '0' ? 1 : 0) : -1;   // -1 = default on
+        }();
+        size_t nchunk = 1;
+        if (mul_chunk_env != 0) {
+            const size_t rows      = (size_t)ne01 * (size_t)ne02 * (size_t)ne03;
+            const size_t target_wg = backend_ctx->compute_units > 0
+                                   ? (size_t)backend_ctx->compute_units * 2 : 32;
+            if (rows > 0 && rows < target_wg) {
+                const size_t want = (target_wg + rows - 1) / rows;
+                const size_t cap  = (size_t)ne0 / (size_t)nth;   // >= 1 full local size per chunk
+                nchunk = want < cap ? want : cap;
+                nchunk = nchunk < 1 ? 1 : nchunk;
+            }
+        }
+        size_t global_work_size[] = {(size_t)ne01*nth*nchunk, (size_t)ne02, (size_t)ne03};
         size_t local_work_size[] = {nth, 1, 1};
 
         backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
