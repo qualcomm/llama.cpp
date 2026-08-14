@@ -12174,16 +12174,25 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                     // penalty to ~11%, and the non-speculative case -- which is what decides
                     // placement for most users -- measures as a wash:
                     //
-                    //   gemma-4-26B-A4B QAT-Q4_0, X2-90, llama-bench, 3 reps interleaved
-                    //     pp512   head CPU 549.87   head GPU 547.28   (-0.47%)
-                    //     tg128   head CPU  37.82   head GPU  37.10   (-1.9%)
+                    //   gemma-4-26B-A4B QAT-Q4_0, X2-90, llama-bench -r 3, one session,
+                    //   matched pair against the 08-14 close (8dcdc5ef9) with bookends:
+                    //     8dcdc5ef9 (head CPU)      pp512 547.13   tg128 38.01
+                    //     8dcdc5ef9 bookend         pp512 549.38   tg128 37.81
+                    //     this tip, head CPU (=0)   pp512 548.49   tg128 37.99
+                    //     this tip, head GPU        pp512 549.43   tg128 36.63
                     //
-                    // and the -1.9% is inside the CPU arm's own spread (38.25/36.99/38.23)
-                    // while the GPU arm holds 0.5% (37.02/37.19/37.09) -- taking the head off
-                    // the CPU also removes decode variance. Against that, GPU placement moves
-                    // 577.50 MiB out of the CPU buffer, takes graph splits 4 -> 3, and stops
-                    // the CPU streaming 0.606 GB per token, which is what customers see as
-                    // "the CPU is busy when it should be running on the GPU".
+                    // Two readings. (a) At matched placement the tip equals the 08-14 close, so
+                    // nothing here regressed decode. (b) GPU placement costs **-3.5% of tg128**
+                    // (36.63 +/- 0.04 vs 37.99 +/- 0.41; the arms do not overlap). An earlier
+                    // note here claimed -1.9% "inside the noise" from a 3-rep interleaved run
+                    // whose CPU arm straddled (38.25/36.99/38.23) -- that understated it.
+                    // prefill is unaffected (547-549 everywhere).
+                    //
+                    // The 3.5% buys: 577.50 MiB out of the CPU buffer, graph splits 4 -> 3, the
+                    // CPU no longer streaming 0.606 GB per token (the "why is the CPU busy when
+                    // it should be on the GPU" complaint), and much steadier decode. That is a
+                    // product trade, not a free win -- revisit it if raw single-stream t/s is
+                    // the metric that matters.
                     //
                     // 🔴 The trade that remains: SPECULATIVE DECODE prefers the CPU head, by
                     // ~8 ms per verify step. Best current accounting, roughly 2:1 kernel to
