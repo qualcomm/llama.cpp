@@ -10238,6 +10238,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // Exercises the tiled q6_K dp4a decode path (use_q6k_tiled; image-qa candidate).
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 151936, 1, 2560, {1, 1}, {1, 1}));
 
+    // gemma-4-26B lm_head at the widths a speculative-decode verify batch and
+    // multi-slot serving actually run at. n=1 is the decode GEMV; 2..8 is the
+    // band where the weight is re-streamed once per output column unless a
+    // multi-column GEMV handles it, and the eval suite covers the same shapes
+    // for correctness. 32768 rows instead of the real 262144 keeps the case
+    // affordable while preserving nb and the dispatch shape.
+    for (int bs : {1, 2, 3, 4, 8}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 32768, bs, 2816, {1, 1}, {1, 1}));
+    }
+
     // Qwen3-4B decode (n=1) GEMV shapes — the real per-token matmuls (Intel/SYCL study).
     // int8-path shapes (m<=2560) FIRST so they run before any flat case (debug).
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 1024, 1, 2560, {1, 1}, {1, 1})); // K/V cur (int8)
