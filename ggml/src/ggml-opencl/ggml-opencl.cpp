@@ -12190,17 +12190,23 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                     // varying only the lm_head kernel cost with placement pinned to the GPU
                     // (five tile configs, 1218..3002 us at ne1=4): e2e tracks the kernel at a
                     // slope of 0.913 ms per ms, i.e. there is no overhead term -- the gap is
-                    // this kernel. Subtracting each GPU arm from the CPU-head arm (79.74
-                    // ms/step) puts the CPU head's EFFECTIVE cost at 1.2-3.1 ms/step, mean
-                    // ~2.0, against a serial floor of ~4.5-4.8 ms for 577 MiB: so roughly half
-                    // of it does not reach wall time. What absorbs that half is NOT established
-                    // -- overlap with the drafter does not survive inspection, since the drafter
-                    // is a separate llama_decode on its own context. On the GPU the head is
-                    // plainly not free: it serialises into the same queue at full cost. Even a
-                    // perfect kernel at the bandwidth floor (4.96 ms) stays ~3 ms/step behind,
-                    // so neither fp16 nor dp4a can win this back. The placement decision does
-                    // not rest on any of that -- it rests on the direct A/B, which reproduced
-                    // three times (41.29/40.13/41.36 CPU vs 36.73/36.44/32.38 GPU).
+                    // this kernel. And the CPU side is simply FAST: GGML_SCHED_DEBUG=2 puts the
+                    // CPU lm_head split (split #3, the last one, 1 input result_norm) at a
+                    // median of 1.28-1.53 ms, agreeing with the independent arm-to-arm
+                    // subtraction (1.2-3.1 ms, mean ~2.0). So the CPU does this op in ~1.3-2 ms
+                    // where the GPU needs ~9.7 ms, and a perfect GPU kernel at its own measured
+                    // bandwidth ceiling would still need ~4.96 ms. Neither fp16 nor dp4a can
+                    // win that back.
+                    //
+                    // NB for anyone extending this: earlier notes here claimed the CPU head was
+                    // "~90% hidden by overlap with the drafter". That was wrong twice over --
+                    // the lm_head split is last in the graph with no GPU work after it, and the
+                    // drafter is a separate llama_decode anyway. It came from assuming the CPU
+                    // must pay ~4.8 ms to stream 577 MiB; it does not. What that implies about
+                    // CPU-side bandwidth is not understood (1.3 ms would be >450 GB/s), so do
+                    // not build on the number -- but the placement decision does not rest on it.
+                    // That rests on the direct A/B, reproduced three times:
+                    // CPU 41.29/40.13/41.36 vs GPU 36.73/36.44/32.38 t/s.
                     // Speculative-decode users set GGML_OPENCL_Q6K_LMHEAD_GPU=0 (or
                     // -ot token_embd.weight=CPU). Plain decode has no drafter to overlap with,
                     // which is why it measures as a wash and why this default is still right.
