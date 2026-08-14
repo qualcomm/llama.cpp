@@ -12185,31 +12185,37 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                     // the CPU streaming 0.606 GB per token, which is what customers see as
                     // "the CPU is busy when it should be running on the GPU".
                     //
-                    // 🔴 The trade that remains: SPECULATIVE DECODE prefers the CPU head, and
-                    // PERMANENTLY so -- this is not waiting on a faster kernel. Measured by
-                    // varying only the lm_head kernel cost with placement pinned to the GPU
-                    // (five tile configs, 1218..3002 us at ne1=4): e2e tracks the kernel at a
-                    // slope of 0.913 ms per ms, i.e. there is no overhead term -- the gap is
-                    // this kernel. And the CPU side is simply FAST: GGML_SCHED_DEBUG=2 puts the
-                    // CPU lm_head at split #3 -- the last split, nodes MUL_MAT(token_embd)
-                    // -> SCALE -> TANH -> SCALE, with no GPU work after it. Its cost comes from
-                    // the clean matched-arm subtraction: ~2.0 ms (1.2-3.1 across arms). So the
-                    // CPU does this op in ~2 ms where the GPU needs ~9.7 ms, and a perfect GPU
-                    // kernel at its own measured bandwidth ceiling would still need ~4.96 ms
-                    // (122 of 130.6 GB/s, i.e. the ne1==1 kernel is already at 94% of roofline).
-                    // Neither fp16 nor dp4a can win that back.
+                    // 🔴 The trade that remains: SPECULATIVE DECODE prefers the CPU head, by
+                    // ~8 ms per verify step. Best current accounting, roughly 2:1 kernel to
+                    // fixed overhead:
                     //
-                    // NB for anyone extending this: an earlier note here claimed the CPU head was
-                    // "~90% hidden by overlap with the drafter". Wrong twice over -- the lm_head
-                    // split is last with no GPU work after it, and the drafter is a separate
-                    // llama_decode anyway. It came from assuming the CPU must pay ~4.8 ms to
-                    // stream 577 MiB; it does not. Do NOT try to time this from a
-                    // GGML_SCHED_DEBUG run either: at -lv 10 the logging dominates (that split
-                    // spans ~92-100 ms of wall clock there), so use it for structure only. Why
-                    // the CPU is this much faster per byte than the GPU's own ceiling is not
-                    // understood and is worth establishing, since it drives placement on this
-                    // part. The decision itself does not rest on it: that rests on the direct
-                    // A/B, reproduced three times, CPU 41.29/40.13/41.36 vs GPU
+                    //   GPU head ~= 9.7 ms kernel + ~5 ms fixed      CPU head ~= 5.5 ms
+                    //
+                    // The kernel term is measured: varying only the lm_head tile over five
+                    // configs (1218..3002 us at ne1=4) moves e2e at 0.913 ms per ms. The CPU
+                    // term follows from bandwidth parity -- CPU and GPU decode the same dense
+                    // 12B at 100.3 vs 103.5 GB/s effective, so the CPU streams the same 577 MiB
+                    // in about the time the GPU does. The ~5 ms fixed term is what is left over;
+                    // it exists only when the head runs on the device, and the leading suspect
+                    // is the 4 MB logits readback plus queue sync. That last part is a
+                    // hypothesis that fits the arithmetic, NOT a proven mechanism -- but it is
+                    // the only part of the gap that looks fixable, so measure it before
+                    // spending any more effort on the kernel.
+                    //
+                    // NB for anyone extending this, three claims made here earlier were WRONG:
+                    //  - "the CPU head is ~90% hidden by overlap with the drafter": no. The
+                    //    lm_head is the last split (MUL_MAT(token_embd) -> SCALE -> TANH ->
+                    //    SCALE) with no GPU work after it, and the drafter is a separate
+                    //    llama_decode besides.
+                    //  - "the CPU head costs ~2 ms": that came from reading the regression
+                    //    intercept as the rest-of-step. The intercept also absorbs any
+                    //    GPU-head-only fixed cost, so it gives C - X, not C.
+                    //  - "there is no overhead term": same error. Varying only the kernel cannot
+                    //    reveal a cost that is constant across those arms.
+                    // Also do not try to time the split from a GGML_SCHED_DEBUG run: at -lv 10
+                    // the logging dominates (that split spans ~92-100 ms there); use it for
+                    // structure only. The decision does not rest on any of this -- it rests on
+                    // the direct A/B, reproduced three times, CPU 41.29/40.13/41.36 vs GPU
                     // 36.73/36.44/32.38 t/s.
                     // Speculative-decode users set GGML_OPENCL_Q6K_LMHEAD_GPU=0 (or
                     // -ot token_embd.weight=CPU). Plain decode has no drafter to overlap with,
