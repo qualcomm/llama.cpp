@@ -11922,10 +11922,21 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                     // non-X2E part therefore keeps the historical CPU pin until measured.
                     //
                     // GGML_OPENCL_Q6K_LMHEAD_GPU=1 opts in elsewhere, =0 opts out on X2E.
+                    // Also scoped by TYPE, not just device. This branch covers
+                    // MXFP4 / IQ4_NL / Q4_1 / Q5_0 / Q5_1 as well, and none of those
+                    // has vocab-scale coverage -- the 127 correctness cases and both
+                    // measured models are Q4_K/Q5_K/Q6_K. A vocab-scale head in one of
+                    // the other formats keeps the CPU pin until it is measured.
+                    // (gpt-oss is unaffected either way: its head is F16, which returns
+                    // true far above this branch and was never pinned.)
+                    const ggml_type ht = op->src[0]->type;
+                    const bool lmhead_type_validated = (ht == GGML_TYPE_Q4_K ||
+                                                        ht == GGML_TYPE_Q5_K ||
+                                                        ht == GGML_TYPE_Q6_K);
                     static const char * lmhead_env = std::getenv("GGML_OPENCL_Q6K_LMHEAD_GPU");
                     const bool lmhead_gpu = lmhead_env
                         ? (lmhead_env[0] != '\0' && lmhead_env[0] != '0')
-                        : (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E);
+                        : (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E && lmhead_type_validated);
                     if (op->ne[0] >= 32768 && op->src[1]->ne[1] > 1) {
                         if (!lmhead_gpu) {
                             return false;
