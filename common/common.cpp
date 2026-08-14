@@ -1664,11 +1664,14 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
             LOG_INF("%s: OpenCL + batched decode (n_parallel=%d, speculative=%d): keeping "
                     "token_embd.weight on the CPU (override with -ot)\n",
                     __func__, params.n_parallel, (int) spec_on);
-            if (!params.tensor_buft_overrides.empty()) {
-                params.tensor_buft_overrides.pop_back();  // drop the {nullptr,nullptr} terminator
+            // Insert at the FRONT. The list is null-terminated and arg.cpp pads it out
+            // to llama_max_tensor_buft_overrides() empty entries, so appending puts the
+            // override behind a terminator where the loader never reads it.
+            params.tensor_buft_overrides.insert(params.tensor_buft_overrides.begin(),
+                                                {"token_embd.weight", cpu_buft});
+            if (params.tensor_buft_overrides.back().pattern != nullptr) {
+                params.tensor_buft_overrides.push_back({nullptr, nullptr});
             }
-            params.tensor_buft_overrides.push_back({"token_embd.weight", cpu_buft});
-            params.tensor_buft_overrides.push_back({nullptr, nullptr});
         }
     }
 
