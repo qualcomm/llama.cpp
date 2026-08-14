@@ -1296,6 +1296,8 @@ struct ggml_backend_opencl_context {
     // 4-column build above it -- because the accumulator block is what limits
     // occupancy, so the wider tile only pays once there are columns to fill it.
     // Null when the variant is disabled.
+    int       q6k_flat_ndst = 16;  // tile the single-column flat GEMV was built with
+    int       q6k_flat_nsg  = 2;
     cl_kernel kernel_mul_mv_q6_K_f32_flat_mc2 = nullptr;
     cl_kernel kernel_mul_mv_q6_K_f32_flat_mc4 = nullptr;
     int       q6k_mc2_ndst = 0;   // N_DST each variant was built with
@@ -2786,8 +2788,31 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #else
         const std::string kernel_src = read_file("mul_mv_q6_k_f32_flat.cl");
 #endif
+        // The ne1==1 tile is sweepable: this kernel carries the whole vocab-scale
+        // lm_head at decode. 16x2 is the shipped shape; GGML_OPENCL_Q6K_FLAT_N_DST
+        // and _NSG retune it without a rebuild. Host and kernel must agree, so the
+        // dispatch reads them back from the context.
+        std::string compile_opts_local = compile_opts;
+        {
+            int n_dst = backend_ctx->gpu_family == INTEL ? 4 : 16;
+            int nsg   = 2;
+            if (const char * e = std::getenv("GGML_OPENCL_Q6K_FLAT_N_DST")) {
+                const int v = atoi(e);
+                if (v >= 1 && v <= 32) { n_dst = v; }
+            }
+            if (const char * e = std::getenv("GGML_OPENCL_Q6K_FLAT_NSG")) {
+                const int v = atoi(e);
+                if (v >= 1 && v <= 8) { nsg = v; }
+            }
+            backend_ctx->q6k_flat_ndst = n_dst;
+            backend_ctx->q6k_flat_nsg  = nsg;
+            compile_opts_local = compile_opts +
+                " -DQ6K_FLAT_N_DST=" + std::to_string(n_dst) +
+                " -DQ6K_FLAT_NSG="   + std::to_string(nsg);
+        }
+
         cl_program prog =
-            build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+            build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts_local);
 
         CL_CHECK((backend_ctx->kernel_mul_mv_q6_K_f32_flat = clCreateKernel(prog, "kernel_mul_mv_q6_K_f32_flat", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -30921,14 +30946,16 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 #ifdef GGML_OPENCL_SOA_Q
             kernel = backend_ctx->kernel_mul_mv_q6_K_f32_flat;
 
+            // Tile comes from the values the program was built with, so host and
+            // kernel cannot drift apart when it is retuned.
             if (backend_ctx->gpu_family == INTEL) {
                 nth0 = 16;
-                nth1 = 2;
-                ndst = 4;
+                nth1 = backend_ctx->q6k_flat_nsg;
+                ndst = backend_ctx->q6k_flat_ndst;
             } else if (backend_ctx->gpu_family == ADRENO) {
                 nth0 = 64;
-                nth1 = 2;
-                ndst = 16;
+                nth1 = backend_ctx->q6k_flat_nsg;
+                ndst = backend_ctx->q6k_flat_ndst;
             } else {
                 GGML_ASSERT(false && "TODO: Unknown GPU");
             }

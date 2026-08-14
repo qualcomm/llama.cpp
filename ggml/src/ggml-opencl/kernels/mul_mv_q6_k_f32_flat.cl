@@ -91,13 +91,29 @@ inline float block_q_6_K_dot_y_flat(
 #undef N_SIMDGROUP
 #undef N_SIMDWIDTH
 
+// Rows per subgroup and subgroups per workgroup. Overridable at build time
+// (-DQ6K_FLAT_N_DST / -DQ6K_FLAT_NSG, host: GGML_OPENCL_Q6K_FLAT_N_DST/_NSG) so
+// the ne1==1 tile can be swept on device -- this kernel carries the whole
+// vocab-scale lm_head at decode, where it runs at ~122 of a measured 130.6 GB/s.
 #ifdef INTEL_GPU
-#define N_DST 4
-#define N_SIMDGROUP 2
+#ifndef Q6K_FLAT_N_DST
+#define Q6K_FLAT_N_DST 4
+#endif
+#ifndef Q6K_FLAT_NSG
+#define Q6K_FLAT_NSG 2
+#endif
+#define N_DST Q6K_FLAT_N_DST
+#define N_SIMDGROUP Q6K_FLAT_NSG
 #define N_SIMDWIDTH 16
 #elif defined (ADRENO_GPU)
-#define N_DST 16
-#define N_SIMDGROUP 2
+#ifndef Q6K_FLAT_N_DST
+#define Q6K_FLAT_N_DST 16
+#endif
+#ifndef Q6K_FLAT_NSG
+#define Q6K_FLAT_NSG 2
+#endif
+#define N_DST Q6K_FLAT_N_DST
+#define N_SIMDGROUP Q6K_FLAT_NSG
 #define N_SIMDWIDTH 64
 #endif
 
