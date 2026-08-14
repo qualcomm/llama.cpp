@@ -2848,10 +2848,27 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                     " -DQ6K_MC_N_COLS=" + std::to_string(v.n_cols) +
                     " -DQ6K_MC_N_DST="  + std::to_string(n_dst);
 
-                cl_program prog_mc = build_program_from_source(backend_ctx, kernel_src.c_str(), mc_opts);
+                // Non-fatal: this is a pure optimisation over a kernel that stays in
+                // the tree, and the program is built at init on every device the
+                // backend supports -- several of which have compilers that miscompile
+                // or refuse K-quant kernels the others build. A variant that does not
+                // build leaves its handle null and the dispatch falls back to the
+                // single-column GEMV, rather than taking the whole backend down.
+                cl_program prog_mc = build_program_from_source_ex_cached(
+                    backend_ctx, kernel_src.c_str(), mc_opts, /*fatal=*/false,
+                    "mul_mv_q6_k_f32_flat_mc");
+                if (prog_mc == nullptr) {
+                    GGML_LOG_WARN("ggml_opencl: q6_K multi-column GEMV (N_COLS=%d) did not build; "
+                                  "batched q6_K falls back to the single-column kernel\n", v.n_cols);
+                    continue;
+                }
 
-                CL_CHECK((*v.dst_k = clCreateKernel(prog_mc, "kernel_mul_mv_q6_K_f32_flat_mc", &err), err));
+                *v.dst_k = clCreateKernel(prog_mc, "kernel_mul_mv_q6_K_f32_flat_mc", &err);
                 CL_CHECK(clReleaseProgram(prog_mc));
+                if (err != CL_SUCCESS) {
+                    *v.dst_k = nullptr;
+                    continue;
+                }
 
                 *v.dst_n = n_dst;
                 GGML_LOG_CONT(".");
