@@ -12192,12 +12192,15 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                     // slope of 0.913 ms per ms with an intercept of 79.29 ms per verify step,
                     // i.e. there is no overhead term -- the gap is entirely this kernel. But
                     // the CPU-head arm lands at 79.74 ms/step, just 0.45 ms above that
-                    // intercept, while moving 577 MiB: that would be 1.3 TB/s if it were
-                    // serial, so ~90% of the CPU head OVERLAPS with GPU work (the drafter runs
-                    // on the GPU and this backend enqueues asynchronously). Putting the head on
-                    // the GPU serialises it into the same queue at its full cost. A perfect
-                    // kernel at the bandwidth floor (577 MiB / ~122 GB/s = 4.96 ms) would still
-                    // be ~4.5 ms/step behind, so neither fp16 nor dp4a can win this back.
+                    // intercept, while moving 577 MiB: serial that would be 1.3 TB/s, so ~90% of
+                    // the CPU head's cost does not appear in wall time at all. WHAT hides it is
+                    // NOT established -- the obvious candidate, overlap with the drafter, does
+                    // not survive inspection because the drafter is a separate llama_decode on
+                    // its own context. Treat "the CPU head is nearly free here" as the measured
+                    // fact and the reason as open. On the GPU it is plainly not free: it
+                    // serialises into the same queue at full cost. A perfect kernel at the
+                    // bandwidth floor (577 MiB / ~122 GB/s = 4.96 ms) would still be ~4.5 ms per
+                    // step behind, so neither fp16 nor dp4a can win this back.
                     // Speculative-decode users set GGML_OPENCL_Q6K_LMHEAD_GPU=0 (or
                     // -ot token_embd.weight=CPU). Plain decode has no drafter to overlap with,
                     // which is why it measures as a wash and why this default is still right.
