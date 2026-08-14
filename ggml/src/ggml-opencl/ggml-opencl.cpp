@@ -12195,12 +12195,14 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                     // configs (1218..3002 us at ne1=4) moves e2e at 0.913 ms per ms. The CPU
                     // term follows from bandwidth parity -- CPU and GPU decode the same dense
                     // 12B at 100.3 vs 103.5 GB/s effective, so the CPU streams the same 577 MiB
-                    // in about the time the GPU does. The ~5 ms fixed term is what is left over;
-                    // it exists only when the head runs on the device, and the leading suspect
-                    // is the 4 MB logits readback plus queue sync. That last part is a
-                    // hypothesis that fits the arithmetic, NOT a proven mechanism -- but it is
-                    // the only part of the gap that looks fixable, so measure it before
-                    // spending any more effort on the kernel.
+                    // in about the time the GPU does. Whatever is left over is NOT accounted
+                    // for, and successive guesses at it have all been wrong; do not add another
+                    // without measuring first. Specifically FALSIFIED: a per-token device->host
+                    // logits copy. GGML_OPENCL_READBACK_STATS=1 counts ZERO get_tensor readbacks
+                    // across a 192-token speculative run in BOTH placements (the counter fires
+                    // immediately under test-backend-ops, so it works). clEnqueueReadBuffer is
+                    // all over this file, but on weight/debug paths, not the decode loop --
+                    // there is no per-token copy for zero-copy techniques to remove.
                     //
                     // NB for anyone extending this, three claims made here earlier were WRONG:
                     //  - "the CPU head is ~90% hidden by overlap with the drafter": no. The
