@@ -12185,14 +12185,24 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                     // the CPU streaming 0.606 GB per token, which is what customers see as
                     // "the CPU is busy when it should be running on the GPU".
                     //
-                    // 🔴 The trade that remains: SPECULATIVE DECODE still prefers the CPU head
-                    // (MTP k=3: 41.29 t/s head-on-CPU vs 36.73 head-on-GPU). Placement is one
-                    // decision for all widths -- the probe in weight_buft_supported is a fixed
-                    // ne1 = 512 -- so decode and verify cannot be split. Users running
-                    // speculative decode should set GGML_OPENCL_Q6K_LMHEAD_GPU=0 (or
-                    // -ot token_embd.weight=CPU) until the batched path closes the last 11%,
-                    // which needs cheaper math per weight (fp16 dot / dp4a), not more tiling:
-                    // the multi-column kernel is issue-bound, not spill-bound (measured).
+                    // 🔴 The trade that remains: SPECULATIVE DECODE prefers the CPU head, and
+                    // PERMANENTLY so -- this is not waiting on a faster kernel. Measured by
+                    // varying only the lm_head kernel cost with placement pinned to the GPU
+                    // (five tile configs, 1218..3002 us at ne1=4): e2e tracks the kernel at a
+                    // slope of 0.913 ms per ms with an intercept of 79.29 ms per verify step,
+                    // i.e. there is no overhead term -- the gap is entirely this kernel. But
+                    // the CPU-head arm lands at 79.74 ms/step, just 0.45 ms above that
+                    // intercept, while moving 577 MiB: that would be 1.3 TB/s if it were
+                    // serial, so ~90% of the CPU head OVERLAPS with GPU work (the drafter runs
+                    // on the GPU and this backend enqueues asynchronously). Putting the head on
+                    // the GPU serialises it into the same queue at its full cost. A perfect
+                    // kernel at the bandwidth floor (577 MiB / ~122 GB/s = 4.96 ms) would still
+                    // be ~4.5 ms/step behind, so neither fp16 nor dp4a can win this back.
+                    // Speculative-decode users set GGML_OPENCL_Q6K_LMHEAD_GPU=0 (or
+                    // -ot token_embd.weight=CPU). Plain decode has no drafter to overlap with,
+                    // which is why it measures as a wash and why this default is still right.
+                    // Placement cannot be split per width: weight_buft_supported probes once at
+                    // a fixed ne1 = 512.
                     const bool lmhead_gpu = lmhead_env
                         ? (lmhead_env[0] != '\0' && lmhead_env[0] != '0')
                         : (lmhead_type_validated &&
