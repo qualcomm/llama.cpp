@@ -1291,11 +1291,15 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mv_q5_K_f32_flat;
     cl_kernel kernel_mul_mv_q6_K_f32;
     cl_kernel kernel_mul_mv_q6_K_f32_flat;
-    // Multi-column twin of the flat q6_K GEMV (ne1 > 1): one weight pass for
-    // q6k_mc_ncols output columns. Null when the variant is disabled.
-    cl_kernel kernel_mul_mv_q6_K_f32_flat_mc = nullptr;
-    int       q6k_mc_ncols = 0;   // N_COLS the mc kernel was built with
-    int       q6k_mc_ndst  = 0;   // N_DST   the mc kernel was built with
+    // Multi-column twins of the flat q6_K GEMV (ne1 > 1): one weight pass per
+    // N_COLS output columns. Two widths -- a 2-column build for ne1 == 2 and a
+    // 4-column build above it -- because the accumulator block is what limits
+    // occupancy, so the wider tile only pays once there are columns to fill it.
+    // Null when the variant is disabled.
+    cl_kernel kernel_mul_mv_q6_K_f32_flat_mc2 = nullptr;
+    cl_kernel kernel_mul_mv_q6_K_f32_flat_mc4 = nullptr;
+    int       q6k_mc2_ndst = 0;   // N_DST each variant was built with
+    int       q6k_mc4_ndst = 0;
     cl_kernel kernel_mul_mv_mxfp4_f32, kernel_mul_mv_mxfp4_f32_flat;
     cl_kernel kernel_mul_mv_q8_0_f32, kernel_mul_mv_q8_0_f32_flat;
     cl_kernel kernel_mul_mat_q8_0_f32_kq_gen = nullptr;
@@ -2790,12 +2794,27 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         GGML_LOG_CONT(".");
     }
 
-    // mul_mv_q6_k_f32_flat_mc -- multi-column flat q6_K GEMV (ne1 > 1).
-    // Separate program on purpose: the A6X (642L/619) compiler miscompiles any
-    // kernel defined after a subgroup-builtin kernel in the same program
-    // (see the A6X multi-kernel note), so this does not join the flat program.
-    // Opt out entirely with GGML_OPENCL_Q6K_FLAT_MC=0; the tile is tunable with
-    // GGML_OPENCL_Q6K_MC_N_DST / GGML_OPENCL_Q6K_MC_N_COLS.
+    // mul_mv_q6_k_f32_flat_mc -- multi-column flat q6_K GEMV (ne1 > 1), built
+    // twice: 2 columns x 8 rows per subgroup, and 4 columns x 4 rows.
+    //
+    // The tile is limited by the N_DST*N_COLS accumulator block plus the 4*N_COLS
+    // cached activation vectors, and the widths are not interchangeable. Measured
+    // on X2-90 (test-backend-ops perf, m=32768, k=2816, us/run, single-column
+    // kernel for reference; the n=1 column is the same kernel in every row and
+    // held at 610-618 us, which is what makes the rows comparable):
+    //
+    //   N_DST x N_COLS      n=2     n=3     n=4     n=8
+    //   single-column      1201    1781    2319    4617
+    //   8 x 2               702    1394    1384    2754
+    //   4 x 4              1183    1208    1215    2405
+    //   8 x 4              1831    1826    1839    3669   <- accumulators spill
+    //   * x 8               >5e5 (register-starved to the point of uselessness)
+    //
+    // so ne1 == 2 takes the 2-column build and everything above it the 4-column
+    // build. Separate programs, not appended to the flat one: the A6X (642L/619)
+    // compiler miscompiles any kernel defined after a subgroup-builtin kernel in
+    // the same program. Opt out of both with GGML_OPENCL_Q6K_FLAT_MC=0; retune
+    // with GGML_OPENCL_Q6K_MC2_N_DST / GGML_OPENCL_Q6K_MC4_N_DST.
     {
         const char * mc_env = std::getenv("GGML_OPENCL_Q6K_FLAT_MC");
         const bool   mc_on  = !mc_env || mc_env[0] == '\0' || mc_env[0] != '0';
@@ -2807,34 +2826,36 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #else
             const std::string kernel_src = read_file("mul_mv_q6_k_f32_flat_mc.cl");
 #endif
-            int n_cols = 4;
-            int n_dst  = backend_ctx->gpu_family == INTEL ? 4 : 8;
-            if (const char * e = std::getenv("GGML_OPENCL_Q6K_MC_N_COLS")) {
-                const int v = atoi(e);
-                if (v >= 1 && v <= 16) {
-                    n_cols = v;
+            const bool intel = backend_ctx->gpu_family == INTEL;
+
+            struct { int n_cols; int n_dst; const char * env; cl_kernel * dst_k; int * dst_n; } variants[] = {
+                { 2, intel ? 4 : 8, "GGML_OPENCL_Q6K_MC2_N_DST",
+                  &backend_ctx->kernel_mul_mv_q6_K_f32_flat_mc2, &backend_ctx->q6k_mc2_ndst },
+                { 4, intel ? 2 : 4, "GGML_OPENCL_Q6K_MC4_N_DST",
+                  &backend_ctx->kernel_mul_mv_q6_K_f32_flat_mc4, &backend_ctx->q6k_mc4_ndst },
+            };
+
+            for (auto & v : variants) {
+                int n_dst = v.n_dst;
+                if (const char * e = std::getenv(v.env)) {
+                    const int n = atoi(e);
+                    if (n >= 1 && n <= 32) {
+                        n_dst = n;
+                    }
                 }
+
+                const std::string mc_opts = compile_opts +
+                    " -DQ6K_MC_N_COLS=" + std::to_string(v.n_cols) +
+                    " -DQ6K_MC_N_DST="  + std::to_string(n_dst);
+
+                cl_program prog_mc = build_program_from_source(backend_ctx, kernel_src.c_str(), mc_opts);
+
+                CL_CHECK((*v.dst_k = clCreateKernel(prog_mc, "kernel_mul_mv_q6_K_f32_flat_mc", &err), err));
+                CL_CHECK(clReleaseProgram(prog_mc));
+
+                *v.dst_n = n_dst;
+                GGML_LOG_CONT(".");
             }
-            if (const char * e = std::getenv("GGML_OPENCL_Q6K_MC_N_DST")) {
-                const int v = atoi(e);
-                if (v >= 1 && v <= 32) {
-                    n_dst = v;
-                }
-            }
-
-            std::string mc_opts = compile_opts +
-                " -DQ6K_MC_N_COLS=" + std::to_string(n_cols) +
-                " -DQ6K_MC_N_DST="  + std::to_string(n_dst);
-
-            cl_program prog_mc = build_program_from_source(backend_ctx, kernel_src.c_str(), mc_opts);
-
-            CL_CHECK((backend_ctx->kernel_mul_mv_q6_K_f32_flat_mc =
-                          clCreateKernel(prog_mc, "kernel_mul_mv_q6_K_f32_flat_mc", &err), err));
-            CL_CHECK(clReleaseProgram(prog_mc));
-
-            backend_ctx->q6k_mc_ncols = n_cols;
-            backend_ctx->q6k_mc_ndst  = n_dst;
-            GGML_LOG_CONT(".");
         }
     }
 
@@ -30809,10 +30830,14 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             // full passes over hundreds of MB. Switch to the multi-column twin,
             // which reads the weight once per N_COLS columns. Same arithmetic per
             // (row, column), so the result is bit-identical.
-            if (ne11 > 1 && backend_ctx->kernel_mul_mv_q6_K_f32_flat_mc != nullptr) {
-                kernel        = backend_ctx->kernel_mul_mv_q6_K_f32_flat_mc;
-                ndst          = backend_ctx->q6k_mc_ndst;
-                ncols_per_wg  = backend_ctx->q6k_mc_ncols;
+            if (ne11 == 2 && backend_ctx->kernel_mul_mv_q6_K_f32_flat_mc2 != nullptr) {
+                kernel        = backend_ctx->kernel_mul_mv_q6_K_f32_flat_mc2;
+                ndst          = backend_ctx->q6k_mc2_ndst;
+                ncols_per_wg  = 2;
+            } else if (ne11 > 1 && backend_ctx->kernel_mul_mv_q6_K_f32_flat_mc4 != nullptr) {
+                kernel        = backend_ctx->kernel_mul_mv_q6_K_f32_flat_mc4;
+                ndst          = backend_ctx->q6k_mc4_ndst;
+                ncols_per_wg  = 4;
             }
 
             CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0_q6_K->ql));

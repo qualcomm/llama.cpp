@@ -33,10 +33,12 @@
 //
 // This variant loads each weight block once and dots it against N_COLS
 // activation columns, so weight traffic is 1x for any ne1 <= N_COLS. Registers
-// grow as N_DST*N_COLS accumulators + 4*N_COLS activation vectors, so N_DST is
-// halved (16 -> 8) relative to the single-column kernel to stay inside the
-// per-work-item register budget; both are overridable at build time via
-// -DQ6K_MC_N_DST / -DQ6K_MC_N_COLS (host: GGML_OPENCL_Q6K_MC_N_DST/_N_COLS).
+// grow as N_DST*N_COLS accumulators + 4*N_COLS cached activation vectors, and
+// that block -- not the weight stream -- is what limits this kernel: N_DST must
+// come down as N_COLS goes up or the tile spills and loses to the single-column
+// kernel outright. The host builds it twice (2 columns x 8 rows, 4 columns x 4
+// rows) and picks by ne1; see the measured table at the build site. Both are
+// -D overridable (Q6K_MC_N_DST / Q6K_MC_N_COLS).
 //
 // Arithmetic per (row, column) is identical to the single-column kernel --
 // same block unpack, same scale fold, same dot()/reduce order -- so results are
