@@ -2792,6 +2792,20 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         // lm_head at decode. 16x2 is the shipped shape; GGML_OPENCL_Q6K_FLAT_N_DST
         // and _NSG retune it without a rebuild. Host and kernel must agree, so the
         // dispatch reads them back from the context.
+        //
+        // SWEPT on X2-90 (n=1, m=32768, k=2816; x8 for the real 262144-row head):
+        //   N_DST  NSG=1    NSG=2    NSG=4      GB/s @NSG=2   head ms
+        //     8    604.6    607.0    604.0         124.7        4.86
+        //    16    635.7    622.4    627.7         121.6        4.98   <- shipped
+        //    32    661.2    661.8    660.8         114.4        5.29
+        // N_DST=8 is ~2.8% faster at the kernel, but it does NOT survive end to end:
+        // palindromed 16-8-16-8 tg128 gave 16 -> 37.11 (37.28/36.94) and 8 -> 36.95
+        // (36.76/37.14), i.e. fully overlapping, because the predicted gain (0.14 ms
+        // of a 27 ms token, ~0.5%) sits under this harness's ~0.9% spread. Default
+        // stays 16. ⛔ Do not re-sweep this expecting decode to move: the head runs
+        // at 122-125 of a measured 130.6 GB/s ceiling, so the whole envelope left in
+        // this kernel is ~1.2% of tg -- see the placement note below for why that
+        // cannot close the 3.5% gap to the CPU head.
         std::string compile_opts_local = compile_opts;
         {
             int n_dst = backend_ctx->gpu_family == INTEL ? 4 : 16;
