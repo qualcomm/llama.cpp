@@ -11905,7 +11905,27 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                     // lm_head shape (262144 x 1 x 2816) and at ne1 = 2/3/4/8/512.
                     // So gate GPU placement on the opt-in alone and let the normal
                     // dispatch pick the (correct) non-tiled GEMV/GEMM.
-                    static const bool lmhead_gpu = std::getenv("GGML_OPENCL_Q6K_LMHEAD_GPU") != nullptr;
+                    // DEFAULT-ON, X2E ONLY. Measured on X2-90, gemma-4-26B-A4B QAT-Q4_0 at
+                    // the shipping config (-b 512 -ub 512), palindromed: pp512 546.9 -> 543.6
+                    // (-0.6%) and tg32 35.96 -> 36.18 (+0.6%), both inside noise, CPU bookends
+                    // agreeing to 0.03%. Quality gated with KL divergence against the CPU-head
+                    // run on a templated corpus: max KLD 0.0025, RMS dp 0.209%, same-top
+                    // 99.461%, identical at lm_head ne1 = 64 and 128, with CPU-vs-CPU and
+                    // cross-ubatch controls both bit-exact at 100.000%. Removing the CPU island
+                    // takes graph splits 4 -> 3 and moves 577.50 MiB off the CPU buffer.
+                    //
+                    // Deliberately NOT gated on the capability level: the 850 shares A8X with
+                    // the 840 (see get_adreno_gpu_gen) and its E17 compiler miscompiles K-quant
+                    // kernels the other Adrenos build correctly, so a level-gated fast path
+                    // would silently reach it. The A7X already declines vocab-scale K-quant
+                    // heads below; A6X (642L/619) has its own known flat-GEMV defects. Every
+                    // non-X2E part therefore keeps the historical CPU pin until measured.
+                    //
+                    // GGML_OPENCL_Q6K_LMHEAD_GPU=1 opts in elsewhere, =0 opts out on X2E.
+                    static const char * lmhead_env = std::getenv("GGML_OPENCL_Q6K_LMHEAD_GPU");
+                    const bool lmhead_gpu = lmhead_env
+                        ? (lmhead_env[0] != '\0' && lmhead_env[0] != '0')
+                        : (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E);
                     if (op->ne[0] >= 32768 && op->src[1]->ne[1] > 1) {
                         if (!lmhead_gpu) {
                             return false;
