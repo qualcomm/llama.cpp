@@ -1616,8 +1616,12 @@ static bool common_opencl_batched_head_pin(const common_params & params) {
     if (params.n_gpu_layers == 0) {
         return false;
     }
-    const bool batched = params.n_parallel > 1 || !params.speculative.types.empty();
-    if (!batched) {
+    // NB: speculative.types defaults to { COMMON_SPECULATIVE_TYPE_NONE }, so it is
+    // never empty -- test the contents, not the size.
+    const bool spec = std::any_of(
+        params.speculative.types.begin(), params.speculative.types.end(),
+        [](enum common_speculative_type t) { return t != COMMON_SPECULATIVE_TYPE_NONE; });
+    if (params.n_parallel <= 1 && !spec) {
         return false;
     }
     // Only when the run will actually offload to the OpenCL backend.
@@ -1654,9 +1658,12 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
             });
         ggml_backend_buffer_type_t cpu_buft = ggml_backend_dev_buffer_type(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU));
         if (!already_overridden && cpu_buft != nullptr) {
+            const bool spec_on = std::any_of(
+                params.speculative.types.begin(), params.speculative.types.end(),
+                [](enum common_speculative_type t) { return t != COMMON_SPECULATIVE_TYPE_NONE; });
             LOG_INF("%s: OpenCL + batched decode (n_parallel=%d, speculative=%d): keeping "
                     "token_embd.weight on the CPU (override with -ot)\n",
-                    __func__, params.n_parallel, (int) !params.speculative.types.empty());
+                    __func__, params.n_parallel, (int) spec_on);
             if (!params.tensor_buft_overrides.empty()) {
                 params.tensor_buft_overrides.pop_back();  // drop the {nullptr,nullptr} terminator
             }
