@@ -23960,7 +23960,17 @@ static void ggml_cl_mul_mat_q4_0_f32_adreno(ggml_backend_t backend, const ggml_t
             ? (backend_ctx->gen_level >= GEN_LEVEL_X1E)
             : (q40_splitk_env == 1);
         static const int q40_splitk_maxm = []{ const char*e=std::getenv("GGML_OPENCL_Q40_SPLITK_MAXM"); return e?atoi(e):0; }();
-        const int    splitk_maxm = q40_splitk_maxm > 0 ? q40_splitk_maxm : 2560;
+        // Default M ceiling for split-K. 2560 excludes the two projections that need
+        // it most on a 16-CU part: attn_output and ffn_down are both M = n_embd = 2816,
+        // which is CEIL_DIV(2816/2,64) = 22 workgroups -- one full 16-CU wave plus a
+        // 6-CU tail with 10 CUs idle. Measured on X2-90, gemma-4-26B-A4B Q4_0: those
+        // two run at 100-106 GB/s against 124-127 GB/s for M=4096 Qcur, which moves the
+        // same bytes but lands on exactly 32 workgroups. Raising the ceiling to 4096
+        // routes them through split-K and recovers most of the gap. Kept to X2E because
+        // that is where it is measured; the tail arithmetic is CU-count dependent and
+        // GEN_LEVEL_X2 is shared with the 12-CU A8X parts.
+        const int    splitk_maxm_def = backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E ? 4096 : 2560;
+        const int    splitk_maxm = q40_splitk_maxm > 0 ? q40_splitk_maxm : splitk_maxm_def;
         const bool use_q40_splitk = q40_splitk_on && !use_q40_mc3 && ne1 == 1
                                     && ne01 <= splitk_maxm && (ne01 % 2 == 0);
         if (use_q40_splitk) {
