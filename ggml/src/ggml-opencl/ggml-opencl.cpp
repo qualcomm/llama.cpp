@@ -15795,7 +15795,7 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
         const uint64_t n = rb_calls.fetch_add(1) + 1;
         rb_bytes += size;
         rb_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
-        if (n % 50 == 0) {
+        if (n <= 3 || n % 50 == 0) {
             const double ms = rb_ns.load()/1e6, mb = rb_bytes.load()/1048576.0;
             GGML_LOG_INFO("ggml_opencl: readback %llu calls, %.1f MiB, %.1f ms total (%.3f ms/call, %.2f GB/s)\n",
                           (unsigned long long)n, mb, ms, ms/n, (rb_bytes.load()/1e9)/(rb_ns.load()/1e9));
