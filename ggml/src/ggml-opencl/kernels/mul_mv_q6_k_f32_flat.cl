@@ -48,7 +48,16 @@ inline float block_q_6_K_dot_y_flat(
     global uchar * q1 = blk_ql     + ib*128 + q_offset_l;
     global uchar * q2 = q1         + QK_K/8;
     global uchar * qh = blk_qh     + ib*64 + q_offset_h;
-    global char  * sc = blk_scales + ib*16 + is;
+
+    // Scales: the four this lane needs are is, is+2, is+4, is+6 with
+    // is = 8*ip + l0/16, i.e. all inside the 8-scale half-block at 8*ip. Fetch
+    // that half in ONE aligned 8-byte load instead of four scalar byte reads --
+    // the inner loop was issuing 8 memory instructions per (row, superblock) to
+    // move 18 bytes, five of them for six bytes of scale/d.
+    // NB: vload8 at `blk_scales + ib*16 + is` would instead run one byte past the
+    // block at is=9, overrunning the last superblock's scales.
+    char8 scv = vload8(0, blk_scales + ib*16 + 8*ip);
+    int   sj  = l0/16;   // 0 or 1; is == 8*ip + sj
 
     float dall = blk_d[ib];
 
@@ -70,8 +79,12 @@ inline float block_q_6_K_dot_y_flat(
     float4 w2 = convert_float4((q1i >> 4)  | ((qhi & Q6_K_MASK3)     )) - 32.f;
     float4 w3 = convert_float4((q2i >> 4)  | ((qhi & Q6_K_MASK4) >> 2)) - 32.f;
 
-    return dall * (dot(y0, w0) * sc[0] + dot(y1, w1) * sc[2] +
-                   dot(y2, w2) * sc[4] + dot(y3, w3) * sc[6]);
+    // sj + {0,2,4,6} is the old sc[0]/sc[2]/sc[4]/sc[6] relative to is.
+    char4 s4 = (sj == 0) ? (char4)(scv.s0, scv.s2, scv.s4, scv.s6)
+                         : (char4)(scv.s1, scv.s3, scv.s5, scv.s7);
+
+    return dall * (dot(y0, w0) * s4.x + dot(y1, w1) * s4.y +
+                   dot(y2, w2) * s4.z + dot(y3, w3) * s4.w);
 }
 
 #undef N_DST
