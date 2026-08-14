@@ -597,6 +597,20 @@ static void abs_f32(const float * restrict src,
     }
 }
 
+static void relu_f32(const float * restrict src,
+                     float * restrict dst,
+                     const uint32_t num_rows,
+                     const struct htp_unary_context * uctx) {
+    htp_unary_op_preamble;
+
+    for (uint32_t ir = 0; ir < num_rows; ir++) {
+        const uint8_t * restrict src_local = (const uint8_t *)src + (ir * src0_row_size_aligned);
+        uint8_t * restrict dst_local       = (uint8_t *)dst + (ir * dst_row_size_aligned);
+
+        hvx_max_scalar_f32(dst_local, src_local, 0.0f, ne0);
+    }
+}
+
 static void log_f32(const float * restrict src,
                     float * restrict dst,
                     const uint32_t num_rows,
@@ -785,6 +799,7 @@ DEFINE_UNARY_TASK(unary_softplus, false, false, softplus_f32(src0_vtcm, dst_vtcm
 DEFINE_UNARY_TASK(unary_tanh,     false, false, tanh_f32(src0_vtcm, dst_vtcm, block_size, uctx))
 DEFINE_UNARY_TASK(unary_abs,      false, false, abs_f32(src0_vtcm, dst_vtcm, block_size, uctx))
 DEFINE_UNARY_TASK(unary_log,      false, false, log_f32(src0_vtcm, dst_vtcm, block_size, uctx))
+DEFINE_UNARY_TASK(unary_relu,     false, false, relu_f32(src0_vtcm, dst_vtcm, block_size, uctx))
 DEFINE_UNARY_TASK(l2_norm,        false, false, l2_norm_f32(src0_vtcm, dst_vtcm, block_size, uctx))
 DEFINE_UNARY_TASK(tri,            false, true,  tri_f32(src0_vtcm, dst_vtcm, block_size, ir, uctx))
 
@@ -1046,6 +1061,7 @@ DEFINE_UNARY_TILED_TASK(unary_softplus, false, tile_unary_softplus_f32(dst_vtcm,
 DEFINE_UNARY_TILED_TASK(unary_tanh,     false, hvx_tanh_f32_aa(dst_vtcm, src_vtcm, tw))
 DEFINE_UNARY_TILED_TASK(unary_abs,      false, hvx_abs_f32_aa(dst_vtcm, src_vtcm, tw))
 DEFINE_UNARY_TILED_TASK(unary_log,      false, hvx_log_f32_aa(dst_vtcm, src_vtcm, tw))
+DEFINE_UNARY_TILED_TASK(unary_relu,     false, hvx_max_scalar_f32(dst_vtcm, src_vtcm, 0.0f, tw))
 DEFINE_UNARY_TILED_TASK(tri,            true,  tri_apply_tile_f32(src_vtcm, dst_vtcm, tw, col, i01, ne0, tri_ttype))
 
 static int execute_op_unary(struct htp_ops_context * octx) {
@@ -1075,9 +1091,9 @@ static int execute_op_unary(struct htp_ops_context * octx) {
         case HTP_OP_UNARY_TANH:      op_type = "tanh-f32";                                   break;
         case HTP_OP_UNARY_ABS:       op_type = is_f16 ? "abs-f16"      : "abs-f32";          break;
         case HTP_OP_UNARY_LOG:       op_type = is_f16 ? "log-f16"      : "log-f32";          break;
+        case HTP_OP_UNARY_RELU:      op_type = "relu-f32";                                   break;
         case HTP_OP_L2_NORM:         op_type = is_f16 ? "l2norm-f16"   : "l2norm-f32";       break;
         case HTP_OP_TRI:             op_type = "tri-f32";                                    break;
-
         default:
             FARF(ERROR, "Unsupported unary Op %u\n", octx->op);
             return HTP_STATUS_NO_SUPPORT;
@@ -1201,6 +1217,7 @@ static int execute_op_unary(struct htp_ops_context * octx) {
                 case HTP_OP_UNARY_TANH:      task_func = unary_task_f32_tiled_unary_tanh;     break;
                 case HTP_OP_UNARY_ABS:       task_func = unary_task_f32_tiled_unary_abs;      break;
                 case HTP_OP_UNARY_LOG:       task_func = unary_task_f32_tiled_unary_log;      break;
+                case HTP_OP_UNARY_RELU:      task_func = unary_task_f32_tiled_unary_relu;     break;
                 case HTP_OP_TRI:             task_func = unary_task_f32_tiled_tri;            break;
                 default:                     break;
             }
@@ -1235,6 +1252,7 @@ static int execute_op_unary(struct htp_ops_context * octx) {
                 case HTP_OP_UNARY_TANH:      task_func = unary_task_f32_unary_tanh;           break;
                 case HTP_OP_UNARY_ABS:       task_func = unary_task_f32_unary_abs;            break;
                 case HTP_OP_UNARY_LOG:       task_func = unary_task_f32_unary_log;            break;
+                case HTP_OP_UNARY_RELU:      task_func = unary_task_f32_unary_relu;           break;
                 case HTP_OP_L2_NORM:         task_func = unary_task_f32_l2_norm;              break;
                 case HTP_OP_TRI:             task_func = unary_task_f32_tri;                  break;
                 default:                     break;

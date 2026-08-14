@@ -308,6 +308,46 @@ static inline void hvx_min_scalar_f32(uint8_t * restrict dst, const uint8_t * re
     }
 }
 
+// MAX Scalar variants
+
+#define HVX_OP_MAX_SCALAR(v) Q6_Vsf_vmax_VsfVsf(val_vec, v)
+
+static inline void hvx_max_scalar_f32_aa(uint8_t * restrict dst, const uint8_t * restrict src, const float val, uint32_t n) {
+    const HVX_Vector val_vec = hvx_vec_splat_f32(val);
+    assert((unsigned long) dst % 128 == 0);
+    assert((unsigned long) src % 128 == 0);
+    hvx_scalar_loop_body(HVX_Vector, HVX_Vector, sizeof(float), hvx_vec_store_a, HVX_OP_MAX_SCALAR);
+}
+
+static inline void hvx_max_scalar_f32_au(uint8_t * restrict dst, const uint8_t * restrict src, const float val, uint32_t n) {
+    const HVX_Vector val_vec = hvx_vec_splat_f32(val);
+    assert((unsigned long) dst % 128 == 0);
+    hvx_scalar_loop_body(HVX_Vector, HVX_UVector, sizeof(float), hvx_vec_store_a, HVX_OP_MAX_SCALAR);
+}
+
+static inline void hvx_max_scalar_f32_ua(uint8_t * restrict dst, const uint8_t * restrict src, const float val, uint32_t n) {
+    const HVX_Vector val_vec = hvx_vec_splat_f32(val);
+    assert((unsigned long) src % 128 == 0);
+    hvx_scalar_loop_body(HVX_UVector, HVX_Vector, sizeof(float), hvx_vec_store_u, HVX_OP_MAX_SCALAR);
+}
+
+static inline void hvx_max_scalar_f32_uu(uint8_t * restrict dst, const uint8_t * restrict src, const float val, uint32_t n) {
+    const HVX_Vector val_vec = hvx_vec_splat_f32(val);
+    hvx_scalar_loop_body(HVX_UVector, HVX_UVector, sizeof(float), hvx_vec_store_u, HVX_OP_MAX_SCALAR);
+}
+
+static inline void hvx_max_scalar_f32(uint8_t * restrict dst, const uint8_t * restrict src, const float val, const int num_elems) {
+    if (hex_is_aligned((void *) dst, 128) && hex_is_aligned((void *) src, 128)) {
+        hvx_max_scalar_f32_aa(dst, src, val, num_elems);
+    } else if (hex_is_aligned((void *) dst, 128)) {
+        hvx_max_scalar_f32_au(dst, src, val, num_elems);
+    } else if (hex_is_aligned((void *) src, 128)) {
+        hvx_max_scalar_f32_ua(dst, src, val, num_elems);
+    } else {
+        hvx_max_scalar_f32_uu(dst, src, val, num_elems);
+    }
+}
+
 // CLAMP Scalar variants
 
 #define HVX_OP_CLAMP_SCALAR(v) \
@@ -627,6 +667,7 @@ static inline void hvx_sqr_f16(uint8_t * restrict dst, const uint8_t * restrict 
 #undef HVX_OP_MUL_SCALAR_F16
 #undef hvx_scalar_loop_body
 #undef HVX_OP_MIN_SCALAR
+#undef HVX_OP_MAX_SCALAR
 #undef HVX_OP_CLAMP_SCALAR
 #undef HVX_OP_CLAMP_SCALAR_F16
 #undef DEFINE_HVX_BINARY_OP_VARIANTS
