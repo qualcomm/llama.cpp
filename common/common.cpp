@@ -1634,7 +1634,8 @@ static bool common_opencl_batched_head_pin(const common_params & params) {
     if (!spec) {
         return false;
     }
-    // Only when the run will actually offload to the OpenCL backend.
+    // Only when the run will actually offload to the OpenCL backend. With an
+    // explicit device list, that is simply whether OpenCL is in it.
     if (!params.devices.empty()) {
         for (ggml_backend_dev_t dev : params.devices) {
             if (dev && strcmp(ggml_backend_dev_name(dev), "GPUOpenCL") == 0) {
@@ -1643,14 +1644,22 @@ static bool common_opencl_batched_head_pin(const common_params & params) {
         }
         return false;
     }
+    // Auto device selection: require that OpenCL is the ONLY GPU backend present.
+    // Builds carrying several (CUDA + Vulkan + OpenCL in one binary is a real
+    // configuration here) may well run on one of the others, and this heuristic is
+    // measured on Adreno only -- a discrete GPU wants the head on-device in every
+    // shape, so guessing wrong costs it the whole placement.
+    size_t n_gpu = 0, n_gpu_opencl = 0;
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-        if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU &&
-            strcmp(ggml_backend_dev_name(dev), "GPUOpenCL") == 0) {
-            return true;
+        if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            n_gpu++;
+            if (strcmp(ggml_backend_dev_name(dev), "GPUOpenCL") == 0) {
+                n_gpu_opencl++;
+            }
         }
     }
-    return false;
+    return n_gpu > 0 && n_gpu == n_gpu_opencl;
 }
 
 struct llama_model_params common_model_params_to_llama(common_params & params) {
