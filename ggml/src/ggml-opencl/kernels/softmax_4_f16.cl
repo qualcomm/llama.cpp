@@ -106,18 +106,28 @@ kernel void kernel_soft_max_4_f16(
         const float4 v = psrc4[i00]*scale + slope*(pmask ? convert_float4(pmask[i00]) : 0.0f);
         const float vmax = fmax(fmax(v.s0, v.s1), fmax(v.s2, v.s3));
         const float m_new = fmax(lmax, vmax);
-        // exp(-INFINITY - -INFINITY) is NaN; the first iteration always takes
-        // the m_new == vmax branch with lsum == 0, so guard the rescale.
-        const float rescale = (lsum == 0.0f) ? 0.0f : exp(lmax - m_new);
-        const float4 e = exp(v - m_new);
-        lsum = lsum*rescale + ((e.s0 + e.s1) + (e.s2 + e.s3));
-        lmax = m_new;
+        // 🔴 A fully masked chunk gives vmax == -INFINITY. With lmax also
+        // -INFINITY, exp(v - m_new) is exp(-INF - -INF) = NaN, which then
+        // poisons lsum for the whole row even if later chunks are valid. The
+        // 3-pass form cannot hit this because it reduces the max over the
+        // entire row before any exp. Masked attention rows do occur (found by
+        // FLASH_ATTN_EXT on Adreno 840: 4 NaN failures, mask=1), so skip
+        // chunks that contribute nothing instead of exponentiating them.
+        if (m_new > -INFINITY) {
+            const float rescale = (lsum == 0.0f) ? 0.0f : exp(lmax - m_new);
+            const float4 e = exp(v - m_new);
+            lsum = lsum*rescale + ((e.s0 + e.s1) + (e.s2 + e.s3));
+            lmax = m_new;
+        }
     }
 
     // Merge the per-lane (m, s) pairs: reduce the max, then rescale each lane's
-    // sum into that common max before summing.
+    // sum into that common max before summing. A lane that saw only masked
+    // values still holds lmax == -INFINITY; exp(-INF - max) would be NaN when
+    // max is also -INFINITY, so contribute its (empty) sum as zero.
     const float max = sub_group_reduce_max(lmax);
-    float sum = sub_group_reduce_add(lsum * exp(lmax - max));
+    const float lresc = (lmax > -INFINITY) ? exp(lmax - max) : 0.0f;
+    float sum = sub_group_reduce_add(lsum * lresc);
 
     if (psrc2) {
         sum += exp(psrc2[i02] - max);
