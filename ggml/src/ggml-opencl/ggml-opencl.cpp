@@ -11838,6 +11838,19 @@ inline bool enable_adreno_trans_weight(const ggml_backend_opencl_context *backen
     return ((elem_num < 128 * 1024 * 1024) && adreno_kernel && shape_ok);  // max element num: 2**27
 }
 
+inline bool enable_adreno_trans_weight_q5_K(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor) {
+    if (!use_adreno_kernels(backend_ctx, tensor)) {
+        return false;
+    }
+
+    const size_t elem_num = ggml_nelements(tensor);
+    const size_t q_img_width = elem_num / 8;
+    const size_t qh_img_width = elem_num / 16;
+
+    return q_img_width <= backend_ctx->image_max_buffer_size &&
+           qh_img_width <= backend_ctx->image_max_buffer_size;
+}
+
 static inline bool use_flat_gemv_for_large_m_q4_K(const ggml_tensor *tensor) {
     // gemv_noshuffle variant perf drops for large M, use flat variant for large M.
     // threshold is well above typical hidden/FFN dims, but below typical vocab sizes.
@@ -14482,7 +14495,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
 
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
         cl_kernel kernel = backend_ctx->kernel_convert_block_q5_K;
-        if (use_adreno_kernels(backend_ctx, tensor)) {
+        if (enable_adreno_trans_weight_q5_K(backend_ctx, tensor)) {
             kernel = backend_ctx->kernel_convert_block_q5_K_noshuffle;
         }
 #else
@@ -14517,7 +14530,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
 
         tensor->extra = extra;
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
-        if (use_adreno_kernels(backend_ctx, tensor)) {
+        if (enable_adreno_trans_weight_q5_K(backend_ctx, tensor)) {
 
             int M = tensor->ne[1];
             int K = tensor->ne[0];
@@ -15630,7 +15643,7 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
             CL_CHECK(clReleaseMemObject(data_device));
             return;
         }
-        if (use_adreno_kernels(backend_ctx, tensor)) {
+        if (enable_adreno_trans_weight_q5_K(backend_ctx, tensor)) {
             int M = tensor->ne[1];
             int K = tensor->ne[0];
 
@@ -27269,60 +27282,6 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
 #endif
 }
 
-// These Adreno mul_mat specialisations bind weights and activations as
-// image1d_buffer objects whose widths scale with the tensor, and none of them
-// checked those widths against CL_DEVICE_IMAGE_MAX_BUFFER_SIZE. clCreateImage
-// then returns CL_INVALID_IMAGE_SIZE (-40) and CL_CHECK aborts the process --
-// a hard failure, not a fallback.
-//
-// Found on q5_K: muse-glimmer-30B-kquant-dynamic has a q5_K *output head*
-// (202048 x 6656), needing 168.1 M pixels against the X2-90's 134.2 M limit, so
-// the model could not be run at all -- at any shape, including plain tg32. Its
-// other 129 q5_K tensors sit at <= 12% of the limit; only the head overflows.
-//
-// q8_0 is the tightest of the four: one uint per 4 chars makes its weight image
-// M*K/4, twice the K-quant width, so it overflows at half the tensor size.
-//
-// Return the widest image each path will request and let the caller decline the
-// specialisation, which is how the FA k_img paths already gate on this same
-// limit (see ggml-opencl.cpp image_max_buffer_size uses) and how these siblings
-// already decline on other conditions. The generic non-image mul_mat then takes
-// the shape.
-static bool adreno_mul_mat_images_fit(ggml_backend_opencl_context * backend_ctx,
-                                      const ggml_tensor * src0, const ggml_tensor * src1) {
-    const int64_t limit = (int64_t) backend_ctx->image_max_buffer_size;
-    if (limit <= 0) {
-        return false;
-    }
-
-    const int64_t M  = src0->ne[1];
-    const int64_t K  = src0->ne[0];
-    const int64_t N  = src1->ne[1];
-    const int64_t Np = N + 8;          // these paths pad N up to a multiple of 8
-
-    int64_t widest = 0;
-    switch (src0->type) {
-        case GGML_TYPE_Q8_0:
-            // weights M*K/4, plus the M*N and K*N images on the transposed-GEMM branch
-            widest = M * K / 4;
-            if (M * N > widest)       { widest = M * N; }
-            if ((K + 8) * N > widest) { widest = (K + 8) * N; }
-            break;
-        case GGML_TYPE_Q4_K:
-        case GGML_TYPE_Q5_K:
-        case GGML_TYPE_Q6_K:
-            widest = M * K / 8;
-            break;
-        default:
-            return true;               // not one of the image-based paths
-    }
-
-    const int64_t act = K * Np / 4;    // activations (padded)
-    if (act > widest) { widest = act; }
-
-    return widest <= limit;
-}
-
 static void ggml_cl_mul_mat_q5_K_f32_adreno(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
     GGML_ASSERT(src0);
@@ -29341,29 +29300,26 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 
         // q8_0 x fp32
         if (src0t == GGML_TYPE_Q8_0 && src1t == GGML_TYPE_F32 &&
-            enable_adreno_trans_weight(backend_ctx, src0) &&
-            adreno_mul_mat_images_fit(backend_ctx, src0, src1)) {
+            enable_adreno_trans_weight(backend_ctx, src0)) {
                 ggml_cl_mul_mat_q8_0_f32_adreno(backend, src0, src1, dst);
                 return;
         }
 
         // q4_k x fp32
-        if (src0t == GGML_TYPE_Q4_K && src1t == GGML_TYPE_F32 && !use_flat_gemv_for_large_m_q4_K(src0) &&
-            adreno_mul_mat_images_fit(backend_ctx, src0, src1)) {
+        if (src0t == GGML_TYPE_Q4_K && src1t == GGML_TYPE_F32 && !use_flat_gemv_for_large_m_q4_K(src0)) {
             ggml_cl_mul_mat_q4_k_f32_adreno(backend, src0, src1, dst);
             return;
         }
 
         // q6_K x fp32
-        if (src0t == GGML_TYPE_Q6_K && src1t == GGML_TYPE_F32 && !use_flat_gemv_for_large_m_q6_K(backend_ctx, src0) &&
-            adreno_mul_mat_images_fit(backend_ctx, src0, src1)) {
+        if (src0t == GGML_TYPE_Q6_K && src1t == GGML_TYPE_F32 && !use_flat_gemv_for_large_m_q6_K(backend_ctx, src0)) {
             ggml_cl_mul_mat_q6_K_f32_adreno(backend, src0, src1, dst);
             return;
         }
 
         // q5_K x fp32
         if (src0t == GGML_TYPE_Q5_K && src1t == GGML_TYPE_F32 &&
-            adreno_mul_mat_images_fit(backend_ctx, src0, src1)) {
+            enable_adreno_trans_weight_q5_K(backend_ctx, src0)) {
             ggml_cl_mul_mat_q5_K_f32_adreno(backend, src0, src1, dst);
             return;
         }
