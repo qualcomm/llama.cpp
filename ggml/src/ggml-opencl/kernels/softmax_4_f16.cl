@@ -1,5 +1,9 @@
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
 
+#ifndef FLT_MAX
+#define FLT_MAX 0x1.fffffep127f
+#endif
+
 #ifdef cl_intel_subgroups
 #pragma OPENCL EXTENSION cl_intel_subgroups : enable
 #else
@@ -105,20 +109,22 @@ kernel void kernel_soft_max_4_f16(
     for (int i00 = get_local_id(0); i00 < ne00/4; i00 += get_local_size(0)) {
         const float4 v = psrc4[i00]*scale + slope*(pmask ? convert_float4(pmask[i00]) : 0.0f);
         const float vmax = fmax(fmax(v.s0, v.s1), fmax(v.s2, v.s3));
-        const float m_new = fmax(lmax, vmax);
         // 🔴 A fully masked chunk gives vmax == -INFINITY. With lmax also
-        // -INFINITY, exp(v - m_new) is exp(-INF - -INF) = NaN, which then
-        // poisons lsum for the whole row even if later chunks are valid. The
-        // 3-pass form cannot hit this because it reduces the max over the
-        // entire row before any exp. Masked attention rows do occur (found by
-        // FLASH_ATTN_EXT on Adreno 840: 4 NaN failures, mask=1), so skip
-        // chunks that contribute nothing instead of exponentiating them.
-        if (m_new > -INFINITY) {
-            const float rescale = (lsum == 0.0f) ? 0.0f : exp(lmax - m_new);
-            const float4 e = exp(v - m_new);
-            lsum = lsum*rescale + ((e.s0 + e.s1) + (e.s2 + e.s3));
-            lmax = m_new;
-        }
+        // -INFINITY, exp(v - m_new) would be exp(-INF - -INF) = NaN, and that
+        // NaN then poisons lsum for the whole row even if later chunks are
+        // valid. The 3-pass form cannot hit this because it reduces the max
+        // over the entire row before any exp. Masked rows do occur (found by
+        // FLASH_ATTN_EXT on Adreno 840: 4 NaN failures, all mask=1).
+        // Clamping the running max to -FLT_MAX keeps it finite, so a masked
+        // -INFINITY value gives exp(-INF) == 0 and drops out on its own. This
+        // is branchless on purpose: guarding with `if (m_new > -INFINITY)`
+        // measured identically to the stock kernel on the X2-90 (582 vs 581
+        // pp512), i.e. it gave up the entire gain.
+        const float m_new = fmax(fmax(lmax, vmax), -FLT_MAX);
+        const float rescale = (lsum == 0.0f) ? 0.0f : exp(lmax - m_new);
+        const float4 e = exp(v - m_new);
+        lsum = lsum*rescale + ((e.s0 + e.s1) + (e.s2 + e.s3));
+        lmax = m_new;
     }
 
     // Merge the per-lane (m, s) pairs: reduce the max, then rescale each lane's
@@ -126,8 +132,7 @@ kernel void kernel_soft_max_4_f16(
     // values still holds lmax == -INFINITY; exp(-INF - max) would be NaN when
     // max is also -INFINITY, so contribute its (empty) sum as zero.
     const float max = sub_group_reduce_max(lmax);
-    const float lresc = (lmax > -INFINITY) ? exp(lmax - max) : 0.0f;
-    float sum = sub_group_reduce_add(lsum * lresc);
+    float sum = sub_group_reduce_add(lsum * exp(lmax - max));
 
     if (psrc2) {
         sum += exp(psrc2[i02] - max);
