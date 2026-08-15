@@ -82,10 +82,19 @@ kernel void kernel_soft_max_4_f16(
     // Online (running-max) statistics: one read pass over src+mask produces both
     // the max and the sum, then a single pass writes the normalised result. The
     // three-pass form below costs an extra read AND write of dst -- 8 of 24
-    // bytes per element, i.e. a third of this kernel's traffic, which matters
-    // because it is pure bandwidth: on Nemotron-3.5 at d16384 the decomposed
-    // attention hands it a KQ matrix of n_kv x n_q x n_head and the kernel was
-    // 9.6% of prefill GPU time.
+    // bytes per element -- and this kernel is pure bandwidth: the decomposed
+    // attention path hands it an n_kv x n_q x n_head matrix.
+    //
+    // Measured on X2-90, Nemotron-3.5-Lightning-30B-A3B Q4_0, pp512 at depth:
+    //   3-pass + per-element divide   497.1 @d4096   297.0 @d16384
+    //   3-pass + one reciprocal       497.2          297.7      (no change)
+    //   this kernel (2-pass)          589.2 (+18.5%) 348.4 (+17.3%)
+    // The per-element divide is NOT the cost -- the compiler already handles
+    // it. Dropping the pass is the whole win. Note it far exceeds what the 33%
+    // traffic saving suggests against the kernel's 9.6% share of a *profiled
+    // run*: that run is dominated by the depth-prefill ramp where n_kv is
+    // small, so softmax's share of steady-state deep prefill is much larger
+    // than its share of the run. Profile shares are not window shares.
     //
     // Per lane keep (m, s) with s = sum(exp(v - m)); merging a new value or
     // another lane's pair rescales the smaller sum by exp(dm). Same recurrence
