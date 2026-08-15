@@ -17613,6 +17613,15 @@ static void ggml_cl_ssm_scan(ggml_backend_t backend, ggml_tensor * dst) {
     int ssm_rows = 1;
     cl_kernel kernel = nullptr;
     if (d_state == 128) {
+        // Default 4, NOT the widest available. Measured on X2-90,
+        // Nemotron-3.5-Lightning-30B-A3B Q4_0, pp512 / pp2048 / tg128:
+        //   1 row  541.6 / 529.2 / 29.68
+        //   4 rows 580.0 / 568.1 / 30.43   <- default
+        //   8 rows 548.9 / 537.5 / 30.46
+        // 8 halves the remaining B/C traffic again but gives back most of the
+        // win on prefill: 16 state floats per thread pushes the kernel past the
+        // occupancy cliff. Decode does not care (it is one token, so B/C reuse
+        // is not the bottleneck there). Reachable via GGML_OPENCL_SSM_ROWS=8.
         const int want = (ssm_rows_env > 0) ? ssm_rows_env : 4;
         const bool r8_ok = want >= 8 && backend_ctx->kernel_ssm_scan_f32_mamba2_d128_r8 != nullptr &&
                            (head_dim % 8) == 0;
