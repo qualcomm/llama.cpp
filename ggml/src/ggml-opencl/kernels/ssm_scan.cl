@@ -166,6 +166,148 @@ kernel void SSM_KNAME(
 }
 #endif
 
+
+// ---------------------------------------------------------------------------
+// d_state = 128, LDS-staged B/C across several subgroups.
+//
+// The SSM_R fold above cut B/C traffic by reusing one global load across SSM_R
+// rows, but it is bounded by registers: SSM_R state floats per thread, and 8
+// rows already measured slower than 4 on the X2-90 (occupancy cliff).
+//
+// CUDA amortises the same loads through *shared* memory instead
+// (ggml-cuda/ssm-scan.cu: smemB/smemC staged once per token, reused by splitD
+// rows), which costs no registers. Its exact shape does not port -- one thread
+// there owns a whole row, i.e. d_state=128 floats = 512 B/thread, precisely
+// the Adreno cliff -- but the mechanism does.
+//
+// So: keep the 64-lane row decomposition and the register budget, put SSM_SG
+// subgroups in one workgroup, and stage B/C in LDS once per token for all of
+// them. Rows per B/C load goes from SSM_R to SSM_SG*SSM_R (4 -> 16 at the
+// defaults), so cross-workgroup redundancy drops by SSM_SG.
+//
+// Requires head_dim % (SSM_SG*SSM_R) == 0 (enforced at dispatch).
+#ifndef SSM_SG
+#define SSM_SG 4
+#endif
+#ifndef SSM_LDS_KNAME
+#define SSM_LDS_KNAME kernel_ssm_scan_f32_mamba2_d128_lds
+#endif
+
+#if defined(SSM_LDS)
+REQD_SUBGROUP_SIZE_64
+kernel void SSM_LDS_KNAME(
+    global const char * src0_base, ulong src0_off,
+    global const char * src1_base, ulong src1_off,
+    global const char * src2_base, ulong src2_off,
+    global const char * src3_base, ulong src3_off,
+    global const char * src4_base, ulong src4_off,
+    global const char * src5_base, ulong src5_off,
+    global const char * src6_base, ulong src6_off,
+    global       char * dst_base,  ulong dst_off,
+    ulong s0_nb2, ulong s0_nb3,
+    ulong x_nb2,  ulong x_nb3,
+    ulong dt_nb1, ulong dt_nb2,
+    ulong A_nb1,
+    ulong B_nb2,  ulong B_nb3,
+    ulong C_nb2,  ulong C_nb3,
+    ulong s_off_bytes,
+    int   head_dim, int n_head, int n_group, int n_tokens
+) {
+    const int d_state = 128;
+
+    const int tid    = (int) get_local_id(0);
+    const int lane   = tid & 63;
+    const int sg     = tid >> 6;
+    const int wg_x   = (int) get_group_id(0);
+    const int seq_id = (int) get_group_id(1);
+
+    const int rows_per_wg = SSM_SG * SSM_R;
+    const int wg_per_head = head_dim / rows_per_wg;
+    const int head_id     = wg_x / wg_per_head;
+    const int dim_id      = (wg_x - head_id * wg_per_head) * rows_per_wg + sg * SSM_R;
+    const int g           = head_id / (n_head / n_group);
+
+    src0_base += src0_off; src1_base += src1_off; src2_base += src2_off;
+    src3_base += src3_off; src4_base += src4_off; src5_base += src5_off;
+    src6_base += src6_off; dst_base  += dst_off;
+
+    const int seq_slot = ((global const int *) src6_base)[seq_id];
+
+    const ulong state_base_off = (ulong)seq_slot * s0_nb3 + (ulong)head_id * s0_nb2
+                               + (ulong)dim_id * d_state * sizeof(float);
+    global const float * s0_warp = (global const float *)(src0_base + state_base_off);
+    const ulong state_out_off = (ulong)seq_id * s0_nb3 + (ulong)head_id * s0_nb2
+                              + (ulong)dim_id * d_state * sizeof(float);
+    global float * s_warp = (global float *)(dst_base + s_off_bytes + state_out_off);
+
+    global const char * x_seq  = src1_base + (ulong)seq_id * x_nb3;
+    global const char * dt_seq = src2_base + (ulong)seq_id * dt_nb2;
+    global const char * B_seq  = src4_base + (ulong)seq_id * B_nb3 + (ulong)g * d_state * sizeof(float);
+    global const char * C_seq  = src5_base + (ulong)seq_id * C_nb3 + (ulong)g * d_state * sizeof(float);
+
+    const ulong y_dim_total = (ulong)n_head * head_dim;
+    global float * y_seq = (global float *)dst_base
+                           + (ulong)seq_id * (ulong)n_tokens * y_dim_total;
+
+    const float A_val = ((global const float *)src3_base)[(ulong)head_id * A_nb1 / sizeof(float)];
+
+    local float lB[128];
+    local float lC[128];
+
+    float state0[SSM_R];
+    float state1[SSM_R];
+    #pragma unroll
+    for (int r = 0; r < SSM_R; ++r) {
+        state0[r] = s0_warp[(ulong)r * d_state + lane];
+        state1[r] = s0_warp[(ulong)r * d_state + lane + 64];
+    }
+
+    const int lsz = (int) get_local_size(0);
+
+    for (int t = 0; t < n_tokens; ++t) {
+        global const float * Bt = (global const float *)(B_seq + (ulong)t * B_nb2);
+        global const float * Ct = (global const float *)(C_seq + (ulong)t * C_nb2);
+
+        barrier(CLK_LOCAL_MEM_FENCE);
+        for (int i = tid; i < d_state; i += lsz) {
+            lB[i] = Bt[i];
+            lC[i] = Ct[i];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        const float dt_h        = ((global const float *)(dt_seq + (ulong)t * dt_nb1))[head_id];
+        const float dt_softplus = softplus_f32(dt_h);
+        const float dA          = exp(dt_softplus * A_val);
+
+        const float B0 = lB[lane];
+        const float B1 = lB[lane + 64];
+        const float C0 = lC[lane];
+        const float C1 = lC[lane + 64];
+
+        global const float * x_row = (global const float *)(x_seq + (ulong)t * x_nb2)
+                                     + (ulong)head_id * head_dim + dim_id;
+
+        #pragma unroll
+        for (int r = 0; r < SSM_R; ++r) {
+            const float x_dt = x_row[r] * dt_softplus;
+            state0[r] = state0[r] * dA + B0 * x_dt;
+            state1[r] = state1[r] * dA + B1 * x_dt;
+            const float partial = state0[r] * C0 + state1[r] * C1;
+            const float sum = sub_group_reduce_add(partial);
+            if (lane == 0) {
+                y_seq[(ulong)t * y_dim_total + (ulong)head_id * head_dim + dim_id + r] = sum;
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int r = 0; r < SSM_R; ++r) {
+        s_warp[(ulong)r * d_state + lane]      = state0[r];
+        s_warp[(ulong)r * d_state + lane + 64] = state1[r];
+    }
+}
+#endif // SSM_LDS
+
 // d_state = 256 (Falcon-H1). WG = 64 threads, each holds 4 state elements.
 #if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 2
 REQD_SUBGROUP_SIZE_64

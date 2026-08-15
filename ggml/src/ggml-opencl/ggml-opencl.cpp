@@ -1362,6 +1362,8 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_ssm_scan_f32_mamba2_d128 = nullptr;
     cl_kernel kernel_ssm_scan_f32_mamba2_d128_r4 = nullptr;  // 4 dim rows per WG
     cl_kernel kernel_ssm_scan_f32_mamba2_d128_r8 = nullptr;  // 8 dim rows per WG
+    cl_kernel kernel_ssm_scan_f32_mamba2_d128_lds = nullptr; // LDS B/C, SSM_SG subgroups
+    int       ssm_lds_rows = 0;                              // SSM_SG*SSM_R of that kernel
     cl_kernel kernel_ssm_scan_f32_mamba2_d256 = nullptr;
 
     cl_kernel kernel_timestep_embedding;
@@ -4434,6 +4436,27 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                 cl_kernel k = clCreateKernel(p, "kernel_ssm_scan_f32_mamba2_d128_r8", &err_r8);
                 if (err_r8 == CL_SUCCESS && k) {
                     backend_ctx->kernel_ssm_scan_f32_mamba2_d128_r8 = k;
+                }
+            }
+        }
+        // LDS-staged B/C variant: SSM_SG subgroups of 64 in one workgroup, B/C
+        // read into local memory once per token and shared by all of them, so
+        // rows-per-B/C-load is SSM_SG*SSM_R without extra registers. This is the
+        // mechanism CUDA uses (smemB/smemC over splitD rows); its own shape --
+        // one thread per row, d_state floats in registers -- does not port to
+        // Adreno at 512 B/work-item. Opt in with GGML_OPENCL_SSM_LDS=1.
+        {
+            cl_program prog_lds = nullptr;
+            const std::string opts_lds = compile_opts +
+                " -DSSM_LDS -DSSM_R=4 -DSSM_SG=4"
+                " -DSSM_LDS_KNAME=kernel_ssm_scan_f32_mamba2_d128_lds";
+            cl_int err_lds = CL_SUCCESS;
+            cl_program p = cl_program_for_kernel(backend_ctx, kernel_src, opts_lds, prog_lds, 1);
+            if (p) {
+                cl_kernel k = clCreateKernel(p, "kernel_ssm_scan_f32_mamba2_d128_lds", &err_lds);
+                if (err_lds == CL_SUCCESS && k) {
+                    backend_ctx->kernel_ssm_scan_f32_mamba2_d128_lds = k;
+                    backend_ctx->ssm_lds_rows = 4 * 4;   // SSM_SG * SSM_R
                 }
             }
         }
@@ -17610,9 +17633,21 @@ static void ggml_cl_ssm_scan(ggml_backend_t backend, ggml_tensor * dst) {
         const char * e = getenv("GGML_OPENCL_SSM_ROWS");
         return (e && e[0]) ? atoi(e) : 0;
     }();
+    static const bool ssm_lds_on = []{
+        const char * e = getenv("GGML_OPENCL_SSM_LDS");
+        return e && e[0] && e[0] != '0';
+    }();
     int ssm_rows = 1;
+    int ssm_sg   = 1;
     cl_kernel kernel = nullptr;
-    if (d_state == 128) {
+    if (d_state == 128 && ssm_lds_on &&
+        backend_ctx->kernel_ssm_scan_f32_mamba2_d128_lds != nullptr &&
+        backend_ctx->ssm_lds_rows > 0 &&
+        (head_dim % backend_ctx->ssm_lds_rows) == 0) {
+        kernel   = backend_ctx->kernel_ssm_scan_f32_mamba2_d128_lds;
+        ssm_rows = backend_ctx->ssm_lds_rows;   // rows retired per workgroup
+        ssm_sg   = 4;                           // SSM_SG -> 64*SSM_SG threads
+    } else if (d_state == 128) {
         // Default 4, NOT the widest available. Measured on X2-90,
         // Nemotron-3.5-Lightning-30B-A3B Q4_0, pp512 / pp2048 / tg128:
         //   1 row  541.6 / 529.2 / 29.68
@@ -17685,8 +17720,9 @@ static void ggml_cl_ssm_scan(ggml_backend_t backend, ggml_tensor * dst) {
     // 64 threads (= Adreno half wave, REQD_SUBGROUP_SIZE_64) per workgroup.
     // Each thread holds ssm_rows * d_state/64 state elements in private.
     // Grid: (n_head * head_dim / ssm_rows, n_seqs).
-    size_t global_work_size[] = { (size_t)n_head * (head_dim / ssm_rows) * 64, (size_t)n_seqs, 1 };
-    size_t local_work_size[]  = { 64, 1, 1 };
+    size_t global_work_size[] = { (size_t)n_head * (head_dim / ssm_rows) * (size_t)(64 * ssm_sg),
+                                  (size_t)n_seqs, 1 };
+    size_t local_work_size[]  = { (size_t)(64 * ssm_sg), 1, 1 };
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
 }
 
