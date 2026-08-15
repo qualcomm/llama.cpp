@@ -143,18 +143,8 @@ kernel void kernel_soft_max_4_f16(
         sum += exp(psrc2[i02] - max);
     }
 
-#if defined(SOFTMAX_RECIP)
-    // Attribution arm: keep the 3-pass walk but replace the per-element
-    // division with one reciprocal, to separate "one pass fewer" from
-    // "no per-element divide" in the online kernel's win.
-    const float inv_sum_r = 1.0f / sum;
-    for (int i00 = get_local_id(0); i00 < ne00/4; i00 += get_local_size(0)) {
-        pdst4[i00] *= inv_sum_r;
-    }
-#else
     for (int i00 = get_local_id(0); i00 < ne00/4; i00 += get_local_size(0)) {
         pdst4[i00] /= sum;
     }
-#endif
 #endif
 }

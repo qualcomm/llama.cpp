@@ -1168,7 +1168,6 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_soft_max, kernel_soft_max_4;
     cl_kernel kernel_soft_max_f16, kernel_soft_max_4_f16;
     cl_kernel kernel_soft_max_4_f16_online = nullptr;  // online (2-pass) variant
-    cl_kernel kernel_soft_max_4_f16_recip  = nullptr;  // 3-pass, reciprocal (attribution)
     ggml_opencl_fa_kernels fa;
     cl_kernel kernel_get_rows_f32, kernel_get_rows_f16, kernel_get_rows_q4_0;
     cl_kernel kernel_set_rows_f32_i64, kernel_set_rows_f32_i32, kernel_set_rows_f16_i64, kernel_set_rows_f16_i32;
@@ -3854,17 +3853,6 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                 cl_kernel k = clCreateKernel(prog_on, "kernel_soft_max_4_f16", &err_on);
                 if (err_on == CL_SUCCESS && k) {
                     backend_ctx->kernel_soft_max_4_f16_online = k;
-                }
-            }
-        }
-        {
-            cl_int err_rp = CL_SUCCESS;
-            cl_program prog_rp = build_program_from_source(
-                backend_ctx, kernel_src.c_str(), compile_opts + " -DSOFTMAX_RECIP");
-            if (prog_rp) {
-                cl_kernel k = clCreateKernel(prog_rp, "kernel_soft_max_4_f16", &err_rp);
-                if (err_rp == CL_SUCCESS && k) {
-                    backend_ctx->kernel_soft_max_4_f16_recip = k;
                 }
             }
         }
@@ -34488,19 +34476,9 @@ static void ggml_cl_soft_max(ggml_backend_t backend, const ggml_tensor * src0, c
                 const char * e = getenv("GGML_OPENCL_SOFTMAX_ONLINE");
                 return e == NULL || e[0] != '0';
             }();
-            static const int softmax_mode = []{
-                const char * e = getenv("GGML_OPENCL_SOFTMAX_MODE");   // 0 stock, 1 recip, 2 online
-                return (e && e[0]) ? atoi(e) : -1;
-            }();
-            if (softmax_mode == 1 && backend_ctx->kernel_soft_max_4_f16_recip) {
-                kernel = backend_ctx->kernel_soft_max_4_f16_recip;
-            } else if (softmax_mode == 0) {
-                kernel = backend_ctx->kernel_soft_max_4_f16;
-            } else {
-                kernel = (softmax_online && backend_ctx->kernel_soft_max_4_f16_online)
-                    ? backend_ctx->kernel_soft_max_4_f16_online
-                    : backend_ctx->kernel_soft_max_4_f16;
-            }
+            kernel = (softmax_online && backend_ctx->kernel_soft_max_4_f16_online)
+                ? backend_ctx->kernel_soft_max_4_f16_online
+                : backend_ctx->kernel_soft_max_4_f16;
         } else {
             kernel = backend_ctx->kernel_soft_max_4;
         }
