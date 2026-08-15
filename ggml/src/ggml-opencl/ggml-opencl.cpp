@@ -27269,32 +27269,58 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
 #endif
 }
 
-// The q5_K Adreno path binds the weights and activations as image1d_buffer
-// objects. Their widths scale with the tensor, and nothing here checked them
-// against CL_DEVICE_IMAGE_MAX_BUFFER_SIZE, so a large enough q5_K tensor made
-// clCreateImage return CL_INVALID_IMAGE_SIZE (-40) and CL_CHECK abort the
-// process. muse-glimmer-30B-kquant-dynamic (44.8% q5_K) does exactly that on
-// the X2-90 at every shape, including plain tg32 -- the model cannot be run at
-// all. The FA k_img paths already gate on the same limit; do the same here and
-// let the generic (non-image) mul_mat path take these shapes instead, which is
-// how the q4_K and q6_K siblings decline their specialisations.
-static bool q5_k_adreno_images_fit(ggml_backend_opencl_context * backend_ctx,
-                                   const ggml_tensor * src0, const ggml_tensor * src1) {
-    const int64_t M = src0->ne[1];
-    const int64_t K = src0->ne[0];
-    const int64_t N = src1->ne[1];
-
+// These Adreno mul_mat specialisations bind weights and activations as
+// image1d_buffer objects whose widths scale with the tensor, and none of them
+// checked those widths against CL_DEVICE_IMAGE_MAX_BUFFER_SIZE. clCreateImage
+// then returns CL_INVALID_IMAGE_SIZE (-40) and CL_CHECK aborts the process --
+// a hard failure, not a fallback.
+//
+// Found on q5_K: muse-glimmer-30B-kquant-dynamic has a q5_K *output head*
+// (202048 x 6656), needing 168.1 M pixels against the X2-90's 134.2 M limit, so
+// the model could not be run at all -- at any shape, including plain tg32. Its
+// other 129 q5_K tensors sit at <= 12% of the limit; only the head overflows.
+//
+// q8_0 is the tightest of the four: one uint per 4 chars makes its weight image
+// M*K/4, twice the K-quant width, so it overflows at half the tensor size.
+//
+// Return the widest image each path will request and let the caller decline the
+// specialisation, which is how the FA k_img paths already gate on this same
+// limit (see ggml-opencl.cpp image_max_buffer_size uses) and how these siblings
+// already decline on other conditions. The generic non-image mul_mat then takes
+// the shape.
+static bool adreno_mul_mat_images_fit(ggml_backend_opencl_context * backend_ctx,
+                                      const ggml_tensor * src0, const ggml_tensor * src1) {
     const int64_t limit = (int64_t) backend_ctx->image_max_buffer_size;
     if (limit <= 0) {
         return false;
     }
 
-    // widths actually requested below: q = M*K/8, qh = M*K/16, activations = K*N/4
-    const int64_t w_q  = M * K / 8;
-    const int64_t w_qh = M * K / 16;
-    const int64_t w_b  = K * N / 4;
+    const int64_t M  = src0->ne[1];
+    const int64_t K  = src0->ne[0];
+    const int64_t N  = src1->ne[1];
+    const int64_t Np = N + 8;          // these paths pad N up to a multiple of 8
 
-    return w_q <= limit && w_qh <= limit && w_b <= limit;
+    int64_t widest = 0;
+    switch (src0->type) {
+        case GGML_TYPE_Q8_0:
+            // weights M*K/4, plus the M*N and K*N images on the transposed-GEMM branch
+            widest = M * K / 4;
+            if (M * N > widest)       { widest = M * N; }
+            if ((K + 8) * N > widest) { widest = (K + 8) * N; }
+            break;
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+            widest = M * K / 8;
+            break;
+        default:
+            return true;               // not one of the image-based paths
+    }
+
+    const int64_t act = K * Np / 4;    // activations (padded)
+    if (act > widest) { widest = act; }
+
+    return widest <= limit;
 }
 
 static void ggml_cl_mul_mat_q5_K_f32_adreno(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
@@ -29315,26 +29341,29 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 
         // q8_0 x fp32
         if (src0t == GGML_TYPE_Q8_0 && src1t == GGML_TYPE_F32 &&
-            enable_adreno_trans_weight(backend_ctx, src0)) {
+            enable_adreno_trans_weight(backend_ctx, src0) &&
+            adreno_mul_mat_images_fit(backend_ctx, src0, src1)) {
                 ggml_cl_mul_mat_q8_0_f32_adreno(backend, src0, src1, dst);
                 return;
         }
 
         // q4_k x fp32
-        if (src0t == GGML_TYPE_Q4_K && src1t == GGML_TYPE_F32 && !use_flat_gemv_for_large_m_q4_K(src0)) {
+        if (src0t == GGML_TYPE_Q4_K && src1t == GGML_TYPE_F32 && !use_flat_gemv_for_large_m_q4_K(src0) &&
+            adreno_mul_mat_images_fit(backend_ctx, src0, src1)) {
             ggml_cl_mul_mat_q4_k_f32_adreno(backend, src0, src1, dst);
             return;
         }
 
         // q6_K x fp32
-        if (src0t == GGML_TYPE_Q6_K && src1t == GGML_TYPE_F32 && !use_flat_gemv_for_large_m_q6_K(backend_ctx, src0)) {
+        if (src0t == GGML_TYPE_Q6_K && src1t == GGML_TYPE_F32 && !use_flat_gemv_for_large_m_q6_K(backend_ctx, src0) &&
+            adreno_mul_mat_images_fit(backend_ctx, src0, src1)) {
             ggml_cl_mul_mat_q6_K_f32_adreno(backend, src0, src1, dst);
             return;
         }
 
         // q5_K x fp32
         if (src0t == GGML_TYPE_Q5_K && src1t == GGML_TYPE_F32 &&
-            q5_k_adreno_images_fit(backend_ctx, src0, src1)) {
+            adreno_mul_mat_images_fit(backend_ctx, src0, src1)) {
             ggml_cl_mul_mat_q5_K_f32_adreno(backend, src0, src1, dst);
             return;
         }
