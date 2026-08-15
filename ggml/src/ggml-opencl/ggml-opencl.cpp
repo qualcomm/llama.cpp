@@ -1167,6 +1167,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_diag_f32;
     cl_kernel kernel_soft_max, kernel_soft_max_4;
     cl_kernel kernel_soft_max_f16, kernel_soft_max_4_f16;
+    cl_kernel kernel_soft_max_4_f16_online = nullptr;  // online (2-pass) variant
     ggml_opencl_fa_kernels fa;
     cl_kernel kernel_get_rows_f32, kernel_get_rows_f16, kernel_get_rows_q4_0;
     cl_kernel kernel_set_rows_f32_i64, kernel_set_rows_f32_i32, kernel_set_rows_f16_i64, kernel_set_rows_f16_i32;
@@ -3838,6 +3839,23 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
 
         CL_CHECK((backend_ctx->kernel_soft_max_4_f16 = clCreateKernel(backend_ctx->program_softmax_4_f16, "kernel_soft_max_4_f16", &err), err));
+
+        // Online (running-max) softmax: same kernel source with -DSOFTMAX_ONLINE,
+        // which replaces the 3-pass max/sum/normalise walk with a 1-pass
+        // statistics walk plus a single write pass. Saves a full read AND write
+        // of dst -- 8 of 24 bytes per element. Non-fatal: fall back to the stock
+        // kernel if it does not build. Opt out with GGML_OPENCL_SOFTMAX_ONLINE=0.
+        {
+            cl_int err_on = CL_SUCCESS;
+            cl_program prog_on = build_program_from_source(
+                backend_ctx, kernel_src.c_str(), compile_opts + " -DSOFTMAX_ONLINE");
+            if (prog_on) {
+                cl_kernel k = clCreateKernel(prog_on, "kernel_soft_max_4_f16", &err_on);
+                if (err_on == CL_SUCCESS && k) {
+                    backend_ctx->kernel_soft_max_4_f16_online = k;
+                }
+            }
+        }
         GGML_LOG_CONT(".");
     }
 
@@ -34454,7 +34472,13 @@ static void ggml_cl_soft_max(ggml_backend_t backend, const ggml_tensor * src0, c
 
     if (ne00%4 == 0) {
         if (use_f16) {
-            kernel = backend_ctx->kernel_soft_max_4_f16;
+            static const bool softmax_online = []{
+                const char * e = getenv("GGML_OPENCL_SOFTMAX_ONLINE");
+                return e == NULL || e[0] != '0';
+            }();
+            kernel = (softmax_online && backend_ctx->kernel_soft_max_4_f16_online)
+                ? backend_ctx->kernel_soft_max_4_f16_online
+                : backend_ctx->kernel_soft_max_4_f16;
         } else {
             kernel = backend_ctx->kernel_soft_max_4;
         }

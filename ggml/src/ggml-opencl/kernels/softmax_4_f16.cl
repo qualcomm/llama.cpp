@@ -78,6 +78,47 @@ kernel void kernel_soft_max_4_f16(
         slope = pow(base, exp);
     }
 
+#if defined(SOFTMAX_ONLINE)
+    // Online (running-max) statistics: one read pass over src+mask produces both
+    // the max and the sum, then a single pass writes the normalised result. The
+    // three-pass form below costs an extra read AND write of dst -- 8 of 24
+    // bytes per element, i.e. a third of this kernel's traffic, which matters
+    // because it is pure bandwidth: on Nemotron-3.5 at d16384 the decomposed
+    // attention hands it a KQ matrix of n_kv x n_q x n_head and the kernel was
+    // 9.6% of prefill GPU time.
+    //
+    // Per lane keep (m, s) with s = sum(exp(v - m)); merging a new value or
+    // another lane's pair rescales the smaller sum by exp(dm). Same recurrence
+    // flash attention uses, so the numerics are the established ones rather
+    // than a new approximation.
+    float lmax = psrc2 ? psrc2[i02] : -INFINITY;
+    float lsum = 0.0f;
+    for (int i00 = get_local_id(0); i00 < ne00/4; i00 += get_local_size(0)) {
+        const float4 v = psrc4[i00]*scale + slope*(pmask ? convert_float4(pmask[i00]) : 0.0f);
+        const float vmax = fmax(fmax(v.s0, v.s1), fmax(v.s2, v.s3));
+        const float m_new = fmax(lmax, vmax);
+        // exp(-INFINITY - -INFINITY) is NaN; the first iteration always takes
+        // the m_new == vmax branch with lsum == 0, so guard the rescale.
+        const float rescale = (lsum == 0.0f) ? 0.0f : exp(lmax - m_new);
+        const float4 e = exp(v - m_new);
+        lsum = lsum*rescale + ((e.s0 + e.s1) + (e.s2 + e.s3));
+        lmax = m_new;
+    }
+
+    // Merge the per-lane (m, s) pairs: reduce the max, then rescale each lane's
+    // sum into that common max before summing.
+    const float max = sub_group_reduce_max(lmax);
+    float sum = sub_group_reduce_add(lsum * exp(lmax - max));
+
+    if (psrc2) {
+        sum += exp(psrc2[i02] - max);
+    }
+
+    const float inv_sum = 1.0f / sum;
+    for (int i00 = get_local_id(0); i00 < ne00/4; i00 += get_local_size(0)) {
+        pdst4[i00] = exp((psrc4[i00]*scale + slope*(pmask ? convert_float4(pmask[i00]) : 0.0f)) - max) * inv_sum;
+    }
+#else
     // parallel max
     float4 lmax4 = psrc2 ? psrc2[i02] : -INFINITY;
     for (int i00 = get_local_id(0); i00 < ne00/4; i00 += get_local_size(0)) {
@@ -105,4 +146,5 @@ kernel void kernel_soft_max_4_f16(
     for (int i00 = get_local_id(0); i00 < ne00/4; i00 += get_local_size(0)) {
         pdst4[i00] /= sum;
     }
+#endif
 }
