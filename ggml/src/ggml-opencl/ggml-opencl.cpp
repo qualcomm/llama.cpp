@@ -877,6 +877,7 @@ struct ggml_backend_opencl_context {
     // tgpp 0 = TG variant (COLS_PER_LANE_GROUP=1), tgpp 1 = prefill variant (COLS_PER_LANE_GROUP=4).
     cl_kernel kernel_gated_delta_net_f32[4][2][2] = {};
     cl_kernel kernel_ssm_scan_f32_mamba2_d128 = nullptr;
+    cl_kernel kernel_ssm_scan_f32_mamba2_d128_r4 = nullptr;  // 4 dim rows per WG
     cl_kernel kernel_ssm_scan_f32_mamba2_d256 = nullptr;
 
     cl_kernel kernel_timestep_embedding;
@@ -3207,6 +3208,27 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         CL_CHECK((backend_ctx->kernel_ssm_scan_f32_mamba2_d128 = clCreateKernel(prog, "kernel_ssm_scan_f32_mamba2_d128", &err), err));
         CL_CHECK((backend_ctx->kernel_ssm_scan_f32_mamba2_d256 = clCreateKernel(prog, "kernel_ssm_scan_f32_mamba2_d256", &err), err));
         CL_CHECK(clReleaseProgram(prog));
+
+        // SSM_R=4 variant of the d128 scan: same kernel, four dim rows per
+        // workgroup, so the (group, token)-indexed B/C loads are issued once
+        // instead of once per row. Its own program because the row count is a
+        // compile-time constant. Non-fatal: if it does not build we keep the
+        // one-row kernel. Dispatch requires head_dim % 4 == 0.
+        {
+            const std::string opts_r4 = compile_opts +
+                " -DSSM_R=4 -DSSM_KNAME=kernel_ssm_scan_f32_mamba2_d128_r4";
+            cl_int err_r4 = CL_SUCCESS;
+            cl_program prog_r4 = build_program_from_source_ex(
+                backend_ctx->context, backend_ctx->device, kernel_src.c_str(), opts_r4,
+                /*fatal=*/false, "ssm_scan_r4");
+            if (prog_r4) {
+                cl_kernel k = clCreateKernel(prog_r4, "kernel_ssm_scan_f32_mamba2_d128_r4", &err_r4);
+                if (err_r4 == CL_SUCCESS && k) {
+                    backend_ctx->kernel_ssm_scan_f32_mamba2_d128_r4 = k;
+                }
+                CL_CHECK(clReleaseProgram(prog_r4));
+            }
+        }
         GGML_LOG_CONT(".");
     }
 
@@ -12738,9 +12760,28 @@ static void ggml_cl_ssm_scan(ggml_backend_t backend, ggml_tensor * dst) {
     // Mirror CPU ref: s_off = ggml_nelements(src1) * sizeof(float)
     const cl_ulong s_off_bytes = (cl_ulong) ggml_nelements(src1) * sizeof(float);
 
-    cl_kernel kernel = (d_state == 128)
-        ? backend_ctx->kernel_ssm_scan_f32_mamba2_d128
-        : backend_ctx->kernel_ssm_scan_f32_mamba2_d256;
+    // Rows of `dim` per workgroup. B and C are indexed by (group, token) only,
+    // so the one-row kernel has every head_dim * (n_head/n_group) workgroups of
+    // a group re-reading the identical B/C. Folding 4 rows into a workgroup cuts
+    // that traffic 4x. Opt out with GGML_OPENCL_SSM_ROWS=1.
+    static const int ssm_rows_env = []{
+        const char * e = getenv("GGML_OPENCL_SSM_ROWS");
+        return (e && e[0]) ? atoi(e) : 0;
+    }();
+    int ssm_rows = 1;
+    cl_kernel kernel = nullptr;
+    if (d_state == 128) {
+        const bool r4_ok = backend_ctx->kernel_ssm_scan_f32_mamba2_d128_r4 != nullptr &&
+                           (head_dim % 4) == 0 && ssm_rows_env != 1;
+        if (r4_ok) {
+            kernel    = backend_ctx->kernel_ssm_scan_f32_mamba2_d128_r4;
+            ssm_rows  = 4;
+        } else {
+            kernel = backend_ctx->kernel_ssm_scan_f32_mamba2_d128;
+        }
+    } else {
+        kernel = backend_ctx->kernel_ssm_scan_f32_mamba2_d256;
+    }
     GGML_ASSERT(kernel != nullptr);
 
     cl_ulong s0_nb2 = src0->nb[2];
@@ -12788,7 +12829,10 @@ static void ggml_cl_ssm_scan(ggml_backend_t backend, ggml_tensor * dst) {
     CL_CHECK(clSetKernelArg(kernel, 30, sizeof(int),      &n_group));
     CL_CHECK(clSetKernelArg(kernel, 31, sizeof(int),      &n_tokens));
 
-    size_t global_work_size[] = { (size_t)n_head * head_dim * 64, (size_t)n_seqs, 1 };
+    // 64 threads (= Adreno half wave, REQD_SUBGROUP_SIZE_64) per workgroup.
+    // Each thread holds ssm_rows * d_state/64 state elements in private.
+    // Grid: (n_head * head_dim / ssm_rows, n_seqs).
+    size_t global_work_size[] = { (size_t)n_head * (head_dim / ssm_rows) * 64, (size_t)n_seqs, 1 };
     size_t local_work_size[]  = { 64, 1, 1 };
 
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
