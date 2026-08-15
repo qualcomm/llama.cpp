@@ -10987,7 +10987,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                     for (int nr2 : { 1, 4, 8, 12, 16, 20, 32 }) {
                                         if (nr2 ==  8 && hsk != 192) continue;
                                         if (nr2 == 12 && hsk != 128) continue;
-                                        if (nr2 == 16 && hsk != 192) continue;
+                                        // gqa=16 was only generated for hsk=192, leaving
+                                        // hsk=128 covered at gqa 1/4/12 but never 16, a real
+                                        // model shape (32 query heads over 2 KV heads) that a
+                                        // backend may serve with a dedicated kernel.
+                                        if (nr2 == 16 && hsk != 192 && hsk != 128) continue;
                                         if (nr2 == 20 && (nh != 1 || hsk != 576)) continue;
                                         if (nr2 == 32 && (nh != 1 || hsk != 320)) continue;
                                         //for (int kv : { 1, 17, 31, 33, 61, 113, 65, 127, 129, 130, 255, 260, 371, 380, 407, 512, 1024, }) {
