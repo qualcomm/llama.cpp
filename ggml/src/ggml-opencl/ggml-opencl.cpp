@@ -1361,6 +1361,7 @@ struct ggml_backend_opencl_context {
     ggml_cl_buffer prealloc_moe_combine_w;        // small scratch copy of the router weights (avoids dst-aliasing)
     cl_kernel kernel_ssm_scan_f32_mamba2_d128 = nullptr;
     cl_kernel kernel_ssm_scan_f32_mamba2_d128_r4 = nullptr;  // 4 dim rows per WG
+    cl_kernel kernel_ssm_scan_f32_mamba2_d128_r8 = nullptr;  // 8 dim rows per WG
     cl_kernel kernel_ssm_scan_f32_mamba2_d256 = nullptr;
 
     cl_kernel kernel_timestep_embedding;
@@ -4420,6 +4421,19 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                 cl_kernel k = clCreateKernel(p, "kernel_ssm_scan_f32_mamba2_d128_r4", &err_r4);
                 if (err_r4 == CL_SUCCESS && k) {
                     backend_ctx->kernel_ssm_scan_f32_mamba2_d128_r4 = k;
+                }
+            }
+        }
+        {
+            cl_program prog_r8 = nullptr;
+            const std::string opts_r8 = compile_opts +
+                " -DSSM_R=8 -DSSM_KNAME=kernel_ssm_scan_f32_mamba2_d128_r8";
+            cl_int err_r8 = CL_SUCCESS;
+            cl_program p = cl_program_for_kernel(backend_ctx, kernel_src, opts_r8, prog_r8, 1);
+            if (p) {
+                cl_kernel k = clCreateKernel(p, "kernel_ssm_scan_f32_mamba2_d128_r8", &err_r8);
+                if (err_r8 == CL_SUCCESS && k) {
+                    backend_ctx->kernel_ssm_scan_f32_mamba2_d128_r8 = k;
                 }
             }
         }
@@ -17599,9 +17613,15 @@ static void ggml_cl_ssm_scan(ggml_backend_t backend, ggml_tensor * dst) {
     int ssm_rows = 1;
     cl_kernel kernel = nullptr;
     if (d_state == 128) {
-        const bool r4_ok = backend_ctx->kernel_ssm_scan_f32_mamba2_d128_r4 != nullptr &&
-                           (head_dim % 4) == 0 && ssm_rows_env != 1;
-        if (r4_ok) {
+        const int want = (ssm_rows_env > 0) ? ssm_rows_env : 4;
+        const bool r8_ok = want >= 8 && backend_ctx->kernel_ssm_scan_f32_mamba2_d128_r8 != nullptr &&
+                           (head_dim % 8) == 0;
+        const bool r4_ok = want >= 4 && backend_ctx->kernel_ssm_scan_f32_mamba2_d128_r4 != nullptr &&
+                           (head_dim % 4) == 0;
+        if (r8_ok) {
+            kernel    = backend_ctx->kernel_ssm_scan_f32_mamba2_d128_r8;
+            ssm_rows  = 8;
+        } else if (r4_ok) {
             kernel    = backend_ctx->kernel_ssm_scan_f32_mamba2_d128_r4;
             ssm_rows  = 4;
         } else {
