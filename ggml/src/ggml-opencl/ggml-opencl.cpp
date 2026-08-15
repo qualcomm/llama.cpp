@@ -21753,8 +21753,21 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     // (the stock g8 kernel needs a 192-thread workgroup, which the X2-90
     // refuses per-kernel). Both otherwise fall back to a per-query-head kernel
     // that re-reads the KV cache gqa times.
+    // DK=128 is admitted for gqa==16 only. That fan-out has no MQ-split arm at
+    // this head dim -- the f16 dk=128 arm below takes gqa 2/3, the gqa4/gqa8
+    // arms take theirs -- so above FD_MIN_N_KV a gqa=16 dk=128 shape falls all
+    // the way through to the scalar flash_attn_f32_f16_q1_split (1168 B/work-item
+    // against 400 B for the MQ split and 192 B for q1_vec) and spills. Nemotron-H
+    // (32 heads / 2 KV heads, 6 full-attention layers) sits exactly there and
+    // pays -7.6% at d4096 and -17.2% at d16384 against -fa 0, the loss growing
+    // with n_kv as the spill does. gemma-4-12B has the same gqa=16/dk=128
+    // geometry and does NOT hit this only because its sliding window caps n_kv
+    // below FD_MIN_N_KV, so it never leaves q1_vec.
+    // Scoped to gqa==16 so every other dk=128 fan-out keeps its current routing.
+    const bool mqn_dk_ok = d_head_q == 512 || d_head_q == 256 ||
+                           (d_head_q == 128 && n_head_kv > 0 && n_head / n_head_kv == 16);
     if (n_q == 1 && is_mixed && d_head_q == d_head_v &&
-        (d_head_q == 512 || d_head_q == 256) && n_head_kv > 0) {
+        mqn_dk_ok && n_head_kv > 0) {
         const int gqa = n_head / n_head_kv;
         // gqa == 2 is gemma-4-26B's SWA shape (n_head 16 / n_head_kv 8, 25 of its
         // 30 layers). Without this arm those layers take the per-query-head
@@ -21827,7 +21840,14 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
             // knobs exist to re-tune them elsewhere. DK=256 gqa=8 must stay at
             // a 128-thread workgroup - the stock 192-thread g8 kernel is what
             // the X2-90 refuses per-kernel.
-            int hs  = (d_head_q == 512) ? ((gqa == 8) ? 4 : ((gqa == 16) ? 8 : 1)) : ((gqa == 8) ? 2 : 1);
+            // DK=128 gqa=16 runs head_sub 4, i.e. MQ_GQA=4 across 4 workgroups.
+            // hs=1 would fold all 16 query heads into one workgroup and put the
+            // per-head lane state back over the occupancy cliff -- the same
+            // reason dk512/gqa16 runs 8 and dk512/gqa8 runs 4. MQ_GQA=4 is the
+            // width the default-on dk=128 gqa=4 arm already uses on this device.
+            int hs  = (d_head_q == 512) ? ((gqa == 8) ? 4 : ((gqa == 16) ? 8 : 1))
+                    : (d_head_q == 128 && gqa == 16) ? 4
+                    : ((gqa == 8) ? 2 : 1);
             int nsg = (d_head_q == 256 && gqa == 8) ? 2 : 4;
             static const int hs_env  = []{ const char * e = getenv("GGML_OPENCL_FA_MQN_HS");
                                            return (e && e[0]) ? atoi(e) : 0; }();
