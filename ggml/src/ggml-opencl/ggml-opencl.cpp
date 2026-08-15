@@ -1362,7 +1362,6 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_ssm_scan_f32_mamba2_d128 = nullptr;
     cl_kernel kernel_ssm_scan_f32_mamba2_d128_r4 = nullptr;  // 4 dim rows per WG
     cl_kernel kernel_ssm_scan_f32_mamba2_d128_r8 = nullptr;  // 8 dim rows per WG
-    cl_kernel kernel_ssm_scan_f32_mamba2_d128_unif = nullptr; // uniform dt/dA via broadcast
     cl_kernel kernel_ssm_scan_f32_mamba2_d256 = nullptr;
 
     cl_kernel kernel_timestep_embedding;
@@ -4435,22 +4434,6 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                 cl_kernel k = clCreateKernel(p, "kernel_ssm_scan_f32_mamba2_d128_r8", &err_r8);
                 if (err_r8 == CL_SUCCESS && k) {
                     backend_ctx->kernel_ssm_scan_f32_mamba2_d128_r8 = k;
-                }
-            }
-        }
-        // Uniform-scalar variant: dt/softplus/exp computed on one lane and
-        // broadcast instead of redundantly on all 64. Opt in with
-        // GGML_OPENCL_SSM_UNIF=1.
-        {
-            cl_program prog_u = nullptr;
-            const std::string opts_u = compile_opts +
-                " -DSSM_UNIF -DSSM_R=4 -DSSM_KNAME=kernel_ssm_scan_f32_mamba2_d128_unif";
-            cl_int err_u = CL_SUCCESS;
-            cl_program p = cl_program_for_kernel(backend_ctx, kernel_src, opts_u, prog_u, 1);
-            if (p) {
-                cl_kernel k = clCreateKernel(p, "kernel_ssm_scan_f32_mamba2_d128_unif", &err_u);
-                if (err_u == CL_SUCCESS && k) {
-                    backend_ctx->kernel_ssm_scan_f32_mamba2_d128_unif = k;
                 }
             }
         }
@@ -17627,17 +17610,9 @@ static void ggml_cl_ssm_scan(ggml_backend_t backend, ggml_tensor * dst) {
         const char * e = getenv("GGML_OPENCL_SSM_ROWS");
         return (e && e[0]) ? atoi(e) : 0;
     }();
-    static const bool ssm_unif_on = []{
-        const char * e = getenv("GGML_OPENCL_SSM_UNIF");
-        return e && e[0] && e[0] != '0';
-    }();
     int ssm_rows = 1;
     cl_kernel kernel = nullptr;
-    if (d_state == 128 && ssm_unif_on &&
-        backend_ctx->kernel_ssm_scan_f32_mamba2_d128_unif != nullptr && (head_dim % 4) == 0) {
-        kernel   = backend_ctx->kernel_ssm_scan_f32_mamba2_d128_unif;
-        ssm_rows = 4;
-    } else if (d_state == 128) {
+    if (d_state == 128) {
         // Default 4, NOT the widest available. Measured on X2-90,
         // Nemotron-3.5-Lightning-30B-A3B Q4_0, pp512 / pp2048 / tg128:
         //   1 row  541.6 / 529.2 / 29.68

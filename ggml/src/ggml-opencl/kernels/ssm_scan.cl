@@ -146,28 +146,10 @@ kernel void SSM_KNAME(
     }
 
     for (int t = 0; t < n_tokens; ++t) {
-#if defined(SSM_UNIF)
-        // dt_h, softplus and the exp() are uniform across the whole subgroup --
-        // every one of the 64 lanes loads the same address and evaluates the
-        // same transcendental. If the compiler does not already scalarise that,
-        // computing it on one lane and broadcasting turns 64 redundant loads +
-        // exps into one of each. (Constant memory is the wrong tool here: it
-        // helps broadcast reads of small static tables, and B/C below are
-        // per-lane strided and megabytes in size.)
-        float dt_h_u = (get_sub_group_local_id() == 0)
-                     ? ((global const float *)(dt_seq + (ulong)t * dt_nb1))[head_id]
-                     : 0.0f;
-        dt_h_u = sub_group_broadcast(dt_h_u, 0);
-        const float dt_h        = dt_h_u;
-        const float dt_softplus = softplus_f32(dt_h);
-        float dA_u = (get_sub_group_local_id() == 0) ? exp(dt_softplus * A_val) : 0.0f;
-        const float dA = sub_group_broadcast(dA_u, 0);
-#else
         // per-head, shared by all SSM_R rows
         const float dt_h        = ((global const float *)(dt_seq + (ulong)t * dt_nb1))[head_id];
         const float dt_softplus = softplus_f32(dt_h);
         const float dA          = exp(dt_softplus * A_val);
-#endif
 
         // per-(group, token): loaded ONCE and reused across all SSM_R rows
         const float B0 = ((global const float *)(B_seq + (ulong)t * B_nb2))[tid];
