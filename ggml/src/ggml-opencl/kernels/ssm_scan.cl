@@ -67,6 +67,19 @@ inline float softplus_f32(float x) {
 //    the win here came from issuing fewer *loads*, not from moving less data.
 //    (CUDA's own shape -- one thread per row, d_state floats in registers -- is
 //    unavailable regardless: 512 B/work-item is exactly the Adreno cliff.)
+//
+//  - Uniform-scalar broadcast. dt_h, its softplus and exp(dt*A) are uniform
+//    across the subgroup -- all 64 lanes load the same address and evaluate the
+//    same transcendental every token -- so computing them on lane 0 and using
+//    sub_group_broadcast should have removed 64x redundant work. It is SLOWER:
+//    X2-90 pp512 565 vs 581, pp2048 553 vs 568. The driver already scalarises
+//    uniform loads and the exp, so the broadcast is pure added instruction cost.
+//    Do not hand-scalarise uniform work on this compiler.
+//
+// Constant memory is also not applicable here. __constant helps *broadcast*
+// reads of small static tables (see kvalues_iq4nl in the iq4_nl kernels); B and
+// C are per-lane strided (B[lane], B[lane+64]), megabytes in size, and produced
+// dynamically by earlier kernels.
 #ifndef SSM_R
 #define SSM_R 1
 #endif
