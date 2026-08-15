@@ -446,6 +446,53 @@ static inline void hvx_clamp_scalar_f16(uint8_t * restrict dst, const uint8_t * 
     }
 }
 
+#define HVX_OP_LEAKY_RELU_SCALAR(v)                                 \
+    ({                                                              \
+        HVX_VectorPred pred_neg = Q6_Q_vcmp_gt_VsfVsf(zero_vec, v); \
+        HVX_Vector     scaled   = HVX_OP_MUL_F32(v, ns_vec);        \
+        Q6_V_vmux_QVV(pred_neg, scaled, v);                         \
+    })
+
+static inline void hvx_leaky_relu_scalar_f32_aa(uint8_t * restrict dst, const uint8_t * restrict src, const float ns, uint32_t n) {
+    const HVX_Vector zero_vec = hvx_vec_splat_f32(0.0f);
+    const HVX_Vector ns_vec   = hvx_vec_splat_f32(ns);
+    assert((unsigned long) dst % 128 == 0);
+    assert((unsigned long) src % 128 == 0);
+    hvx_scalar_loop_body(HVX_Vector, HVX_Vector, sizeof(float), hvx_vec_store_a, HVX_OP_LEAKY_RELU_SCALAR);
+}
+
+static inline void hvx_leaky_relu_scalar_f32_au(uint8_t * restrict dst, const uint8_t * restrict src, const float ns, uint32_t n) {
+    const HVX_Vector zero_vec = hvx_vec_splat_f32(0.0f);
+    const HVX_Vector ns_vec   = hvx_vec_splat_f32(ns);
+    assert((unsigned long) dst % 128 == 0);
+    hvx_scalar_loop_body(HVX_Vector, HVX_UVector, sizeof(float), hvx_vec_store_a, HVX_OP_LEAKY_RELU_SCALAR);
+}
+
+static inline void hvx_leaky_relu_scalar_f32_ua(uint8_t * restrict dst, const uint8_t * restrict src, const float ns, uint32_t n) {
+    const HVX_Vector zero_vec = hvx_vec_splat_f32(0.0f);
+    const HVX_Vector ns_vec   = hvx_vec_splat_f32(ns);
+    assert((unsigned long) src % 128 == 0);
+    hvx_scalar_loop_body(HVX_UVector, HVX_Vector, sizeof(float), hvx_vec_store_u, HVX_OP_LEAKY_RELU_SCALAR);
+}
+
+static inline void hvx_leaky_relu_scalar_f32_uu(uint8_t * restrict dst, const uint8_t * restrict src, const float ns, uint32_t n) {
+    const HVX_Vector zero_vec = hvx_vec_splat_f32(0.0f);
+    const HVX_Vector ns_vec   = hvx_vec_splat_f32(ns);
+    hvx_scalar_loop_body(HVX_UVector, HVX_UVector, sizeof(float), hvx_vec_store_u, HVX_OP_LEAKY_RELU_SCALAR);
+}
+
+static inline void hvx_leaky_relu_scalar_f32(uint8_t * restrict dst, const uint8_t * restrict src, const float ns, const int num_elems) {
+    if (hex_is_aligned((void *) dst, 128) && hex_is_aligned((void *) src, 128)) {
+        hvx_leaky_relu_scalar_f32_aa(dst, src, ns, num_elems);
+    } else if (hex_is_aligned((void *) dst, 128)) {
+        hvx_leaky_relu_scalar_f32_au(dst, src, ns, num_elems);
+    } else if (hex_is_aligned((void *) src, 128)) {
+        hvx_leaky_relu_scalar_f32_ua(dst, src, ns, num_elems);
+    } else {
+        hvx_leaky_relu_scalar_f32_uu(dst, src, ns, num_elems);
+    }
+}
+
 //
 // Abs
 //
@@ -670,6 +717,7 @@ static inline void hvx_sqr_f16(uint8_t * restrict dst, const uint8_t * restrict 
 #undef HVX_OP_MAX_SCALAR
 #undef HVX_OP_CLAMP_SCALAR
 #undef HVX_OP_CLAMP_SCALAR_F16
+#undef HVX_OP_LEAKY_RELU_SCALAR
 #undef DEFINE_HVX_BINARY_OP_VARIANTS
 #undef HVX_BINARY_DISPATCHER
 #undef UNUSED

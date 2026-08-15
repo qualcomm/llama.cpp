@@ -156,6 +156,22 @@ static void clamp_f32(const float * restrict src,
     }
 }
 
+static void leaky_relu_f32(const float * restrict src,
+                           float * restrict dst,
+                           const uint32_t num_rows,
+                           const struct htp_unary_context * uctx) {
+    htp_unary_op_preamble;
+    float negative_slope = 0.f;
+    memcpy(&negative_slope, &op_params[0], sizeof(float));
+
+    for (uint32_t ir = 0; ir < num_rows; ir++) {
+        const uint8_t * restrict src_local = (const uint8_t *)src + (ir * src0_row_size_aligned);
+        uint8_t * restrict dst_local       = (uint8_t *)dst + (ir * dst_row_size_aligned);
+
+        hvx_leaky_relu_scalar_f32(dst_local, src_local, negative_slope, ne0);
+    }
+}
+
 static void rms_norm_f32(const float * restrict src,
                          float * restrict dst,
                          const uint32_t num_rows,
@@ -788,6 +804,7 @@ DEFINE_UNARY_TASK(rms_norm,       false, false, rms_norm_f32(src0_vtcm, dst_vtcm
 DEFINE_UNARY_TASK(rms_norm_mul,   true,  false, rms_norm_mul_f32(src0_vtcm, uctx->broadcast_weight ? (const float *) src1_vtcm_data : src1_vtcm, dst_vtcm, block_size, uctx))
 DEFINE_UNARY_TASK(scale,          false, false, scale_f32(src0_vtcm, dst_vtcm, block_size, uctx))
 DEFINE_UNARY_TASK(clamp,          false, false, clamp_f32(src0_vtcm, dst_vtcm, block_size, uctx))
+DEFINE_UNARY_TASK(leaky_relu,     false, false, leaky_relu_f32(src0_vtcm, dst_vtcm, block_size, uctx))
 DEFINE_UNARY_TASK(sqr,            false, false, sqr_f32(src0_vtcm, dst_vtcm, block_size, uctx))
 DEFINE_UNARY_TASK(sqrt,           false, false, sqrt_f32(src0_vtcm, dst_vtcm, block_size, uctx))
 DEFINE_UNARY_TASK(unary_neg,      false, false, neg_f32(src0_vtcm, dst_vtcm, block_size, uctx))
@@ -952,6 +969,12 @@ static inline void tile_clamp_f32(uint8_t * dst_vtcm, const uint8_t * src_vtcm, 
     hvx_clamp_scalar_f32(dst_vtcm, src_vtcm, min, max, tw);
 }
 
+static inline void tile_leaky_relu_f32(uint8_t * dst_vtcm, const uint8_t * src_vtcm, uint32_t tw, const int32_t * op_params) {
+    float negative_slope = 0.f;
+    memcpy(&negative_slope, &op_params[0], sizeof(float));
+    hvx_leaky_relu_scalar_f32(dst_vtcm, src_vtcm, negative_slope, tw);
+}
+
 static inline void tile_unary_softplus_f32(uint8_t * dst_vtcm, const uint8_t * src_vtcm, uint32_t tw) {
     const float * restrict sf = (const float *) src_vtcm;
     float * restrict df       = (float *) dst_vtcm;
@@ -1050,6 +1073,7 @@ static inline void tri_apply_tile_f32(const uint8_t * restrict src, uint8_t * re
 
 DEFINE_UNARY_TILED_TASK(scale,          false, tile_scale_f32(dst_vtcm, src_vtcm, tw, op_params))
 DEFINE_UNARY_TILED_TASK(clamp,          false, tile_clamp_f32(dst_vtcm, src_vtcm, tw, op_params))
+DEFINE_UNARY_TILED_TASK(leaky_relu,     false, tile_leaky_relu_f32(dst_vtcm, src_vtcm, tw, op_params))
 DEFINE_UNARY_TILED_TASK(sqr,            false, hvx_sqr_f32_aa(dst_vtcm, src_vtcm, tw))
 DEFINE_UNARY_TILED_TASK(sqrt,           false, hvx_sqrt_f32_aa(dst_vtcm, src_vtcm, tw))
 DEFINE_UNARY_TILED_TASK(unary_neg,      false, hvx_scale_f32_aa(dst_vtcm, src_vtcm, tw, -1.0f))
@@ -1080,6 +1104,7 @@ static int execute_op_unary(struct htp_ops_context * octx) {
         case HTP_OP_RMS_NORM_MUL:    op_type = "rmsnorm-mul-f32";                            break;
         case HTP_OP_SCALE:           op_type = is_f16 ? "scale-f16"    : "scale-f32";        break;
         case HTP_OP_CLAMP:           op_type = is_f16 ? "clamp-f16"    : "clamp-f32";        break;
+        case HTP_OP_LEAKY_RELU:      op_type = "leaky-relu-f32";                             break;
         case HTP_OP_SQR:             op_type = is_f16 ? "sqr-f16"      : "sqr-f32";          break;
         case HTP_OP_SQRT:            op_type = is_f16 ? "sqrt-f16"     : "sqrt-f32";         break;
         case HTP_OP_UNARY_NEG:       op_type = "neg-f32";                                    break;
@@ -1206,6 +1231,7 @@ static int execute_op_unary(struct htp_ops_context * octx) {
             switch (octx->op) {
                 case HTP_OP_SCALE:           task_func = unary_task_f32_tiled_scale;          break;
                 case HTP_OP_CLAMP:           task_func = unary_task_f32_tiled_clamp;          break;
+                case HTP_OP_LEAKY_RELU:      task_func = unary_task_f32_tiled_leaky_relu;     break;
                 case HTP_OP_SQR:             task_func = unary_task_f32_tiled_sqr;            break;
                 case HTP_OP_SQRT:            task_func = unary_task_f32_tiled_sqrt;           break;
                 case HTP_OP_UNARY_NEG:       task_func = unary_task_f32_tiled_unary_neg;      break;
@@ -1241,6 +1267,7 @@ static int execute_op_unary(struct htp_ops_context * octx) {
                 case HTP_OP_RMS_NORM_MUL:    task_func = unary_task_f32_rms_norm_mul;         break;
                 case HTP_OP_SCALE:           task_func = unary_task_f32_scale;                break;
                 case HTP_OP_CLAMP:           task_func = unary_task_f32_clamp;                break;
+                case HTP_OP_LEAKY_RELU:      task_func = unary_task_f32_leaky_relu;           break;
                 case HTP_OP_SQR:             task_func = unary_task_f32_sqr;                  break;
                 case HTP_OP_SQRT:            task_func = unary_task_f32_sqrt;                 break;
                 case HTP_OP_UNARY_NEG:       task_func = unary_task_f32_unary_neg;            break;

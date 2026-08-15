@@ -4979,6 +4979,7 @@ static htp_op_code op_remap_to_htp(const ggml_tensor * t) {
         case GGML_OP_CONCAT:          return HTP_OP_CONCAT;
         case GGML_OP_SCALE:           return HTP_OP_SCALE;
         case GGML_OP_CLAMP:           return HTP_OP_CLAMP;
+        case GGML_OP_LEAKY_RELU:      return HTP_OP_LEAKY_RELU;
         case GGML_OP_SQR:             return HTP_OP_SQR;
         case GGML_OP_SQRT:            return HTP_OP_SQRT;
         case GGML_OP_LOG:             return HTP_OP_UNARY_LOG;
@@ -5872,6 +5873,7 @@ static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, cons
         case GGML_OP_RMS_NORM:
         case GGML_OP_SCALE:
         case GGML_OP_CLAMP:
+        case GGML_OP_LEAKY_RELU:
             supp = ggml_hexagon_supported_unary(sess, op);
             break;
 
