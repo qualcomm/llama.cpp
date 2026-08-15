@@ -27269,6 +27269,34 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
 #endif
 }
 
+// The q5_K Adreno path binds the weights and activations as image1d_buffer
+// objects. Their widths scale with the tensor, and nothing here checked them
+// against CL_DEVICE_IMAGE_MAX_BUFFER_SIZE, so a large enough q5_K tensor made
+// clCreateImage return CL_INVALID_IMAGE_SIZE (-40) and CL_CHECK abort the
+// process. muse-glimmer-30B-kquant-dynamic (44.8% q5_K) does exactly that on
+// the X2-90 at every shape, including plain tg32 -- the model cannot be run at
+// all. The FA k_img paths already gate on the same limit; do the same here and
+// let the generic (non-image) mul_mat path take these shapes instead, which is
+// how the q4_K and q6_K siblings decline their specialisations.
+static bool q5_k_adreno_images_fit(ggml_backend_opencl_context * backend_ctx,
+                                   const ggml_tensor * src0, const ggml_tensor * src1) {
+    const int64_t M = src0->ne[1];
+    const int64_t K = src0->ne[0];
+    const int64_t N = src1->ne[1];
+
+    const int64_t limit = (int64_t) backend_ctx->image_max_buffer_size;
+    if (limit <= 0) {
+        return false;
+    }
+
+    // widths actually requested below: q = M*K/8, qh = M*K/16, activations = K*N/4
+    const int64_t w_q  = M * K / 8;
+    const int64_t w_qh = M * K / 16;
+    const int64_t w_b  = K * N / 4;
+
+    return w_q <= limit && w_qh <= limit && w_b <= limit;
+}
+
 static void ggml_cl_mul_mat_q5_K_f32_adreno(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
     GGML_ASSERT(src0);
@@ -29305,7 +29333,8 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         }
 
         // q5_K x fp32
-        if (src0t == GGML_TYPE_Q5_K && src1t == GGML_TYPE_F32) {
+        if (src0t == GGML_TYPE_Q5_K && src1t == GGML_TYPE_F32 &&
+            q5_k_adreno_images_fit(backend_ctx, src0, src1)) {
             ggml_cl_mul_mat_q5_K_f32_adreno(backend, src0, src1, dst);
             return;
         }
