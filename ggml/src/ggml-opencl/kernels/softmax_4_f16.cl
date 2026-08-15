@@ -1,9 +1,5 @@
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
 
-#ifndef FLT_MAX
-#define FLT_MAX 0x1.fffffep127f
-#endif
-
 #ifdef cl_intel_subgroups
 #pragma OPENCL EXTENSION cl_intel_subgroups : enable
 #else
@@ -82,67 +78,6 @@ kernel void kernel_soft_max_4_f16(
         slope = pow(base, exp);
     }
 
-#if defined(SOFTMAX_ONLINE)
-    // Online (running-max) statistics: one read pass over src+mask produces both
-    // the max and the sum, then a single pass writes the normalised result. The
-    // three-pass form below costs an extra read AND write of dst -- 8 of 24
-    // bytes per element -- and this kernel is pure bandwidth: the decomposed
-    // attention path hands it an n_kv x n_q x n_head matrix.
-    //
-    // Measured on X2-90, Nemotron-3.5-Lightning-30B-A3B Q4_0, pp512 at depth:
-    //   3-pass + per-element divide   497.1 @d4096   297.0 @d16384
-    //   3-pass + one reciprocal       497.2          297.7      (no change)
-    //   this kernel (2-pass)          589.2 (+18.5%) 348.4 (+17.3%)
-    // The per-element divide is NOT the cost -- the compiler already handles
-    // it. Dropping the pass is the whole win. Note it far exceeds what the 33%
-    // traffic saving suggests against the kernel's 9.6% share of a *profiled
-    // run*: that run is dominated by the depth-prefill ramp where n_kv is
-    // small, so softmax's share of steady-state deep prefill is much larger
-    // than its share of the run. Profile shares are not window shares.
-    //
-    // Per lane keep (m, s) with s = sum(exp(v - m)); merging a new value or
-    // another lane's pair rescales the smaller sum by exp(dm). Same recurrence
-    // flash attention uses, so the numerics are the established ones rather
-    // than a new approximation.
-    float lmax = psrc2 ? psrc2[i02] : -INFINITY;
-    float lsum = 0.0f;
-    for (int i00 = get_local_id(0); i00 < ne00/4; i00 += get_local_size(0)) {
-        const float4 v = psrc4[i00]*scale + slope*(pmask ? convert_float4(pmask[i00]) : 0.0f);
-        const float vmax = fmax(fmax(v.s0, v.s1), fmax(v.s2, v.s3));
-        // 🔴 A fully masked chunk gives vmax == -INFINITY. With lmax also
-        // -INFINITY, exp(v - m_new) would be exp(-INF - -INF) = NaN, and that
-        // NaN then poisons lsum for the whole row even if later chunks are
-        // valid. The 3-pass form cannot hit this because it reduces the max
-        // over the entire row before any exp. Masked rows do occur (found by
-        // FLASH_ATTN_EXT on Adreno 840: 4 NaN failures, all mask=1).
-        // Clamping the running max to -FLT_MAX keeps it finite, so a masked
-        // -INFINITY value gives exp(-INF) == 0 and drops out on its own. This
-        // is branchless on purpose: guarding with `if (m_new > -INFINITY)`
-        // measured identically to the stock kernel on the X2-90 (582 vs 581
-        // pp512), i.e. it gave up the entire gain.
-        const float m_new = fmax(fmax(lmax, vmax), -FLT_MAX);
-        const float rescale = (lsum == 0.0f) ? 0.0f : exp(lmax - m_new);
-        const float4 e = exp(v - m_new);
-        lsum = lsum*rescale + ((e.s0 + e.s1) + (e.s2 + e.s3));
-        lmax = m_new;
-    }
-
-    // Merge the per-lane (m, s) pairs: reduce the max, then rescale each lane's
-    // sum into that common max before summing. A lane that saw only masked
-    // values still holds lmax == -INFINITY; exp(-INF - max) would be NaN when
-    // max is also -INFINITY, so contribute its (empty) sum as zero.
-    const float max = sub_group_reduce_max(lmax);
-    float sum = sub_group_reduce_add(lsum * exp(lmax - max));
-
-    if (psrc2) {
-        sum += exp(psrc2[i02] - max);
-    }
-
-    const float inv_sum = 1.0f / sum;
-    for (int i00 = get_local_id(0); i00 < ne00/4; i00 += get_local_size(0)) {
-        pdst4[i00] = exp((psrc4[i00]*scale + slope*(pmask ? convert_float4(pmask[i00]) : 0.0f)) - max) * inv_sum;
-    }
-#else
     // parallel max
     float4 lmax4 = psrc2 ? psrc2[i02] : -INFINITY;
     for (int i00 = get_local_id(0); i00 < ne00/4; i00 += get_local_size(0)) {
@@ -170,5 +105,4 @@ kernel void kernel_soft_max_4_f16(
     for (int i00 = get_local_id(0); i00 < ne00/4; i00 += get_local_size(0)) {
         pdst4[i00] /= sum;
     }
-#endif
 }
