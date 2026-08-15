@@ -50,6 +50,23 @@ inline float softplus_f32(float x) {
 // SSM_R state registers per thread plus SSM_R subgroup reductions per token.
 // dt/dA are per-head, so they stay hoisted out of the row loop.
 // Requires head_dim % SSM_R == 0 (enforced at dispatch).
+//
+// Two ways of going further were tried and are both WORSE -- do not redo them:
+//
+//  - SSM_R = 8. Halves the remaining B/C traffic again but 16 state floats per
+//    thread crosses the occupancy cliff: X2-90 pp512 548.9 vs 580.0 at SSM_R=4.
+//
+//  - CUDA's mechanism: stage B/C in LDS and put several 64-lane subgroups in one
+//    workgroup, so SSM_SG*SSM_R rows (16) share one B/C load instead of SSM_R
+//    (4), at no register cost. This is what ggml-cuda/ssm-scan.cu does with
+//    smemB/smemC over splitD rows. Correct (SSM_SCAN 6/6 on 840) but slower on
+//    both generations tested: X2-90 pp512 559 vs 581, pp2048 546 vs 570; Adreno
+//    840 on Mamba-Codestral-7B 77.0 vs 79.2. The barrier per token across 256
+//    threads costs more than the global traffic it saves, which says those
+//    "redundant" B/C reads were already being served from L2 rather than DRAM --
+//    the win here came from issuing fewer *loads*, not from moving less data.
+//    (CUDA's own shape -- one thread per row, d_state floats in registers -- is
+//    unavailable regardless: 512 B/work-item is exactly the Adreno cliff.)
 #ifndef SSM_R
 #define SSM_R 1
 #endif
