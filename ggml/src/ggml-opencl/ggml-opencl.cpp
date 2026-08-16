@@ -6505,7 +6505,17 @@ static bool ggml_opencl_ensure_fa_f32_f16_vec_512(ggml_backend_opencl_context * 
 // per-head state is large (E2B's gqa=8 form measures 752 B/work-item, past the
 // 512 B occupancy cliff) and the grid is small (E2B has a single KV head), so
 // both sides of that trade point the same way.
-static bool ggml_opencl_ensure_fa_mq_narrow(ggml_backend_opencl_context * backend_ctx,
+// nsg_split is a PREFERENCE, not a requirement. The workgroup is 64 * MQ_NSG_SPLIT and
+// MQ_NSG_SPLIT is a compile-time -D, so the same source builds at any width; what varies is
+// what the DEVICE will launch. CL_KERNEL_WORK_GROUP_SIZE is per-kernel and shrinks as register
+// pressure grows, so it cannot be predicted from the shape -- on the X2-90 a DK=256 narrow
+// kernel reports a 192-thread ceiling, which rejects the 256-thread (nsg=4) build outright.
+// Encoding that as a per-shape table (the old `nsg = (dk==256 && gqa==8) ? 2 : 4`) means every
+// new head ratio silently gets no kernel at all: gqa=6 (Qwen3.8-27B) built at nsg=4, was
+// refused, and fell back to a route with no KV split -- a -18% decode loss at d16384 that
+// looked like "the fix does not help" rather than "the kernel never launched".
+// So: try the preferred width, then halve until the device accepts one.
+static bool ggml_opencl_try_fa_mq_narrow(ggml_backend_opencl_context * backend_ctx,
                                            int dk, int dv, int gqa, int head_sub, int nsg_split,
                                            bool k_img) {
     const std::tuple<int, int, int> key = {dk, dv, gqa};
@@ -6513,8 +6523,9 @@ static bool ggml_opencl_ensure_fa_mq_narrow(ggml_backend_opencl_context * backen
     auto & target = k_img ? backend_ctx->fa.mq_narrow_k_img : backend_ctx->fa.mq_narrow;
     if (target.count(key) > 0) return true;
 
-    static std::set<std::tuple<int, int, int, int>> failed;
-    const std::tuple<int, int, int, int> fkey = {dk, dv, gqa, k_img ? 1 : 0};
+    // keyed by width as well: a refusal at nsg=4 says nothing about nsg=2
+    static std::set<std::tuple<int, int, int, int, int>> failed;
+    const std::tuple<int, int, int, int, int> fkey = {dk, dv, gqa, nsg_split, k_img ? 1 : 0};
     if (failed.count(fkey) > 0) return false;
 
     const ggml_opencl_fa_dim * cfg = nullptr;
@@ -6555,6 +6566,28 @@ static bool ggml_opencl_ensure_fa_mq_narrow(ggml_backend_opencl_context * backen
     ggml_opencl_log_fa_kernel_spill(backend_ctx, k, tag.c_str(), dk, dv);
     clReleaseProgram(prog);
     return true;
+}
+
+// Build the narrow MQ split kernel at the widest workgroup this device will actually launch.
+// Starts at the caller's preferred MQ_NSG_SPLIT and halves (4 -> 2 -> 1, i.e. 256 -> 128 -> 64
+// threads) until one registers. Every width is a legal build of the same source; only the
+// device's per-kernel ceiling decides. GGML_OPENCL_FA_MQN_NSG still pins a single width for A/B.
+static bool ggml_opencl_ensure_fa_mq_narrow(ggml_backend_opencl_context * backend_ctx,
+                                            int dk, int dv, int gqa, int head_sub, int nsg_split,
+                                            bool k_img) {
+    static const int nsg_pin = []{
+        const char * e = getenv("GGML_OPENCL_FA_MQN_NSG");
+        return (e && e[0]) ? atoi(e) : 0;
+    }();
+    if (nsg_pin > 0) {
+        return ggml_opencl_try_fa_mq_narrow(backend_ctx, dk, dv, gqa, head_sub, nsg_pin, k_img);
+    }
+    for (int nsg = nsg_split; nsg >= 1; nsg /= 2) {
+        if (ggml_opencl_try_fa_mq_narrow(backend_ctx, dk, dv, gqa, head_sub, nsg, k_img)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // Compile one (variant, dk, dv); memoised. false = compiler rejected.
