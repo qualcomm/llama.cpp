@@ -22003,10 +22003,24 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         // Q4_K_M 4.92 -> 4.09 (-16.8%), while every dk=128 model is parity-or-better.
         // Raising FD_MAX_DK is NOT the alternative: q1_split at DK=256 spills 2208 B/WI
         // (vs 384 B for the q1_vec_mq_split family), which is why that cap exists.
-        // OFF BY DEFAULT until measured -- flip with GGML_OPENCL_FA_MQN_GQA6=1.
-        static const bool mqn_gqa6 = []{
+        // DEFAULT-ON for X2E only. Measured on the X2-90, tg128 @ d16384, -fa 1, matched
+        // pairs with the arm off either side (two passes each, controls agreeing to 0.01):
+        //   Qwen3.8-27B-Q4_0    4.35 -> 5.41/5.42  (+24.5%), vs its -fa 0 baseline 5.33
+        //   Qwen3.8-27B-Q4_K_M  4.09 -> 5.00       (+22.4%), vs its -fa 0 baseline 4.92
+        // i.e. -fa 1 goes from -18.3%/-16.8% against -fa 0 to +1.5%/+1.6%. Shapes that do
+        // not use this entry are unmoved on the same build: Qwen3.6-35B-MXFP4 (dk256 gqa8)
+        // 19.56 -> 19.70 and Nemotron-30B-Q4_0 (dk128 gqa16) 20.10 -> 20.10, both still
+        // registering the widths they had before (wg128 hs2 / wg256 hs4).
+        // 🔴 X2E-SCOPED ON PURPOSE: gqa=6 exists on no other device in the fleet, so there is
+        // no second-device evidence, and this fleet has repeatedly measured device-INVERTED
+        // results (q4_K split-K: X2E +3.4%, X1-85 -0.7%, 840 -1.3%, 850 -20%). Widen only
+        // after measuring a gqa=6 model elsewhere. GGML_OPENCL_FA_MQN_GQA6=0/1 forces it.
+        // NOT static: the value depends on the DEVICE, and a function-local static would
+        // freeze whichever device initialised it first for every later context.
+        const bool mqn_gqa6 = [&]{
             const char * e = getenv("GGML_OPENCL_FA_MQN_GQA6");
-            return e != NULL && e[0] != '0';
+            if (e && e[0]) { return e[0] != '0'; }
+            return backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E;
         }();
         if (gqa == 4 || gqa == 8 || (gqa == 2 && mqn_gqa2) || (gqa == 16 && mqn_gqa16) ||
             (gqa == 6 && mqn_gqa6)) {
