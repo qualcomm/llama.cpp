@@ -116,26 +116,48 @@ static inline void rope_yarn_one(float theta, float freq_scale, float * corr_dim
     cache[i0 + 1] = sinf(theta_final) * mscale_final;
 }
 
+// 32 thetas -> 32 interleaved (cos, sin) pairs at cache[i0].
+static inline void rope_cache_hvx_32(float * cache, uint32_t i0,
+                                     HVX_Vector v_theta,
+                                     const float * freq_factors,
+                                     HVX_Vector v_freq_scale,
+                                     HVX_Vector v_mscale) {
+    if (freq_factors) {
+        HVX_Vector v_ff = hvx_vmemu(freq_factors + i0 / 2);
+        v_theta = hvx_vec_mul_f32_f32(v_theta, hvx_vec_inverse_f32(v_ff));
+    }
+
+    HVX_Vector v_theta_final = hvx_vec_mul_f32_f32(v_theta, v_freq_scale);
+    HVX_Vector vcos;
+    HVX_Vector vsin;
+    hvx_vec_sincos_f32(v_theta_final, &vcos, &vsin);
+    vcos = hvx_vec_mul_f32_f32(vcos, v_mscale);
+    vsin = hvx_vec_mul_f32_f32(vsin, v_mscale);
+    HVX_VectorPair vstore = Q6_W_vshuff_VVR(vsin, vcos, -4);
+
+    if (((uintptr_t) (cache + i0)) % 128 == 0) {
+        hvx_vmem(cache + i0 + 0)  = Q6_V_lo_W(vstore);
+        hvx_vmem(cache + i0 + 32) = Q6_V_hi_W(vstore);
+    } else {
+        hvx_vec_store_u(cache + i0 + 0,  32 * sizeof(float), Q6_V_lo_W(vstore));
+        hvx_vec_store_u(cache + i0 + 32, 32 * sizeof(float), Q6_V_hi_W(vstore));
+    }
+}
+
 static __attribute__((noinline)) void rope_cache_init(const float    theta_base,
                             const float    freq_scale,
                             const float *  freq_factors,
                             float *        corr_dims,
-                            const uint32_t ne0,
+                            const uint32_t n_cache,
                             const float    ext_factor,
                             const float    mscale,
                             float *        cache,
                             const float    theta_scale) {
     // ref: https://github.com/jquesnelle/yarn/blob/master/scaled_rope/LlamaYaRNScaledRotaryEmbedding.py
-#if __HVX_ARCH__ >= 79
-    const bool is_v79_or_newer = true;
-#else
-    const bool is_v79_or_newer = false;
-#endif
-
-    if (is_v79_or_newer && ext_factor == 0.0f) {
+    if (ext_factor == 0.0f) {
         // Fast path: fully vectorized
         // We process 32 pairs (64 elements) per iteration.
-        const uint32_t n_blocks = ne0 / 64;
+        const uint32_t n_blocks = n_cache / 64;
 
         // Initialize theta scale powers: [1.0f, theta_scale, theta_scale^2, ..., theta_scale^31]
         float __attribute__((aligned(128))) theta_powers[32];
@@ -143,7 +165,7 @@ static __attribute__((noinline)) void rope_cache_init(const float    theta_base,
         for (int j = 1; j < 32; j++) {
             theta_powers[j] = theta_powers[j - 1] * theta_scale;
         }
-        HVX_Vector v_theta_powers = hvx_vmem(theta_powers);
+        HVX_Vector v_theta_powers = hvx_vmemu(theta_powers);
 
         HVX_Vector v_freq_scale = hvx_vec_splat_f32(freq_scale);
         HVX_Vector v_mscale = hvx_vec_splat_f32(mscale);
@@ -160,51 +182,40 @@ static __attribute__((noinline)) void rope_cache_init(const float    theta_base,
             uint32_t i0 = b * 64;
             HVX_Vector v_theta_base = hvx_vec_splat_f32(theta_block);
             HVX_Vector v_theta = hvx_vec_mul_f32_f32(v_theta_base, v_theta_powers);
-
-            if (freq_factors) {
-                // Load 32 elements of freq_factors
-                HVX_Vector v_ff = hvx_vmemu(freq_factors + i0 / 2);
-                HVX_Vector v_inv_ff = hvx_vec_inverse_f32(v_ff);
-                v_theta = hvx_vec_mul_f32_f32(v_theta, v_inv_ff);
-            }
-
-            HVX_Vector v_theta_final = hvx_vec_mul_f32_f32(v_theta, v_freq_scale);
-
-            HVX_Vector vcos = hvx_vec_cos_f32(v_theta_final);
-            HVX_Vector vsin = hvx_vec_sin_f32(v_theta_final);
-
-            vcos = hvx_vec_mul_f32_f32(vcos, v_mscale);
-            vsin = hvx_vec_mul_f32_f32(vsin, v_mscale);
-
-            HVX_VectorPair vstore = Q6_W_vshuff_VVR(vsin, vcos, -4);
-
-            if (((uintptr_t)cache) % 128 == 0) {
-                hvx_vmem(cache + i0 + 0)  = Q6_V_lo_W(vstore);
-                hvx_vmem(cache + i0 + 32) = Q6_V_hi_W(vstore);
-            } else {
-                hvx_vec_store_u(cache + i0 + 0,  32 * sizeof(float), Q6_V_lo_W(vstore));
-                hvx_vec_store_u(cache + i0 + 32, 32 * sizeof(float), Q6_V_hi_W(vstore));
-            }
-
+            rope_cache_hvx_32(cache, i0, v_theta, freq_factors, v_freq_scale, v_mscale);
             theta_block *= theta_scale_32;
         }
 
         // Leftovers
         float theta = theta_block;
-        for (uint32_t i0 = n_blocks * 64; i0 < ne0; i0 += 2) {
+        for (uint32_t i0 = n_blocks * 64; i0 < n_cache; i0 += 2) {
             const float ff = freq_factors ? freq_factors[i0 / 2] : 1.0f;
             rope_yarn_one(theta / ff, freq_scale, corr_dims, i0, ext_factor, mscale, cache);
             theta *= theta_scale;
         }
     } else {
-        // Fallback to original scalar loop
         float theta = theta_base;
-        for (uint32_t i0 = 0; i0 < ne0; i0 += 2) {
+        for (uint32_t i0 = 0; i0 < n_cache; i0 += 2) {
             const float ff = freq_factors ? freq_factors[i0 / 2] : 1.0f;
             rope_yarn_one(theta / ff, freq_scale, corr_dims, i0, ext_factor, mscale, cache);
             theta *= theta_scale;
         }
     }
+}
+
+static inline float mrope_pick_theta(float theta_t, float theta_h, float theta_w, float theta_e,
+                                     int sector, const int32_t sections[4], int sec_w, int sec_e,
+                                     bool is_imrope) {
+    if (is_imrope) {
+        if      (sector % 3 == 0 && sector < 3 * sections[0]) { return theta_t; }
+        else if (sector % 3 == 1 && sector < 3 * sections[1]) { return theta_h; }
+        else if (sector % 3 == 2 && sector < 3 * sections[2]) { return theta_w; }
+        else                                                   { return theta_e; }
+    }
+    if      (sector < sections[0]) { return theta_t; }
+    else if (sector < sec_w)       { return theta_h; }
+    else if (sector < sec_e)       { return theta_w; }
+    else                           { return theta_e; }
 }
 
 // pos_t/h/w/e: the four position ids for this sequence step (t=time, h=height, w=width, e=extra).
@@ -219,7 +230,7 @@ static __attribute__((noinline)) void mrope_cache_init(const float    pos_t,
                              const float    freq_scale,
                              const float *  freq_factors,
                              float *        corr_dims,
-                             const uint32_t ne0,
+                             const uint32_t n_cache,
                              const float    ext_factor,
                              const float    mscale,
                              float *        cache,
@@ -233,9 +244,16 @@ static __attribute__((noinline)) void mrope_cache_init(const float    pos_t,
     float theta_w = pos_w;
     float theta_e = pos_e;
 
-    for (uint32_t i0 = 0; i0 < ne0; i0 += 2) {
-        const float ff     = freq_factors ? freq_factors[i0 / 2] : 1.0f;
-        const int   sector = (i0 / 2) % sect_dims;
+    const bool use_hvx = (ext_factor == 0.0f);
+    float __attribute__((aligned(128))) thetas[32];
+    uint32_t n_thetas = 0;
+    uint32_t block_i0 = 0;
+
+    HVX_Vector v_freq_scale = hvx_vec_splat_f32(freq_scale);
+    HVX_Vector v_mscale     = hvx_vec_splat_f32(mscale);
+
+    for (uint32_t i0 = 0; i0 < n_cache; i0 += 2) {
+        const int sector = (i0 / 2) % sect_dims;
 
         if (indep_sects) {
             // Reset theta when crossing into a new section.
@@ -245,27 +263,33 @@ static __attribute__((noinline)) void mrope_cache_init(const float    pos_t,
             else if (sector == sec_e)       { theta_e = pos_e; }
         }
 
-        float theta;
-        if (is_imrope) {
-            // Interleaved: sector mod 3 selects component
-            if      (sector % 3 == 0 && sector < 3 * sections[0]) { theta = theta_t; }
-            else if (sector % 3 == 1 && sector < 3 * sections[1]) { theta = theta_h; }
-            else if (sector % 3 == 2 && sector < 3 * sections[2]) { theta = theta_w; }
-            else                                                   { theta = theta_e; }
-        } else {
-            // Contiguous sections
-            if      (sector < sections[0]) { theta = theta_t; }
-            else if (sector < sec_w)       { theta = theta_h; }
-            else if (sector < sec_e)       { theta = theta_w; }
-            else                           { theta = theta_e; }
-        }
+        const float theta = mrope_pick_theta(theta_t, theta_h, theta_w, theta_e,
+                                             sector, sections, sec_w, sec_e, is_imrope);
 
-        rope_yarn_one(theta / ff, freq_scale, corr_dims, i0, ext_factor, mscale, cache);
+        if (use_hvx) {
+            if (n_thetas == 0) {
+                block_i0 = i0;
+            }
+            thetas[n_thetas++] = theta;
+            if (n_thetas == 32) {
+                rope_cache_hvx_32(cache, block_i0, hvx_vmemu(thetas), freq_factors, v_freq_scale, v_mscale);
+                n_thetas = 0;
+            }
+        } else {
+            const float ff = freq_factors ? freq_factors[i0 / 2] : 1.0f;
+            rope_yarn_one(theta / ff, freq_scale, corr_dims, i0, ext_factor, mscale, cache);
+        }
 
         theta_t *= theta_scale;
         theta_h *= theta_scale;
         theta_w *= theta_scale;
         theta_e *= theta_scale;
+    }
+
+    for (uint32_t k = 0; k < n_thetas; k++) {
+        const uint32_t i0 = block_i0 + 2 * k;
+        const float ff = freq_factors ? freq_factors[i0 / 2] : 1.0f;
+        rope_yarn_one(thetas[k] / ff, freq_scale, corr_dims, i0, ext_factor, mscale, cache);
     }
 }
 
@@ -491,6 +515,7 @@ static void rope_job_f32(unsigned int nth, unsigned int ith, void * data) {
     uint8_t * dst_spad_base  = octx->dst_spad.data + (ith * octx->dst_spad.size_per_thread);
 
     dma_queue * dma_queue = octx->ctx->dma[ith];
+    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
     const int32_t * pos = (const int32_t *) src1->data;
     const float * freq_factors = src2 ? (const float *) src2->data : NULL;
 
@@ -542,6 +567,9 @@ static void rope_job_f32(unsigned int nth, unsigned int ith, void * data) {
                 if (i2 != prev_i2) {
                     prev_i2 = i2;
 
+                    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_A_PREP, i2);
+                    // VISION rotates the full row; other modes only rotate n_dims.
+                    const uint32_t n_cache = is_vision ? ne0 : (uint32_t) rctx->n_dims;
                     const bool is_mrope = (rctx->mode & HTP_ROPE_TYPE_MROPE) != 0;
                     if (is_mrope) {
                         // src1 holds four position arrays stacked along ne0:
@@ -554,13 +582,14 @@ static void rope_job_f32(unsigned int nth, unsigned int ith, void * data) {
                             (float) pos[i2 + ne2 * 3],
                             rctx->sections, is_imrope, is_vision,
                             rctx->freq_scale, freq_factors, rctx->corr_dims,
-                            ne0, rctx->ext_factor, rctx->attn_factor,
+                            n_cache, rctx->ext_factor, rctx->attn_factor,
                             theta_cache, rctx->theta_scale);
                     } else {
                        rope_cache_init(pos[i2], rctx->freq_scale, freq_factors, rctx->corr_dims,
-                                        ne0, rctx->ext_factor, rctx->attn_factor,
+                                        n_cache, rctx->ext_factor, rctx->attn_factor,
                                         theta_cache, rctx->theta_scale);
                     }
+                    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_A_PREP, i2);
                 }
 
                 // Skip output DMA transactions from prev block (if any)
@@ -578,6 +607,7 @@ static void rope_job_f32(unsigned int nth, unsigned int ith, void * data) {
                     // FARF(HIGH, "rope-compute %u: ir %u i1 %u i2 %u i3 %u src-spad %p cnr %u : usec %u", ith, ir, i1, i2, i3, src_spad, cnr,
                     //         (unsigned) HAP_perf_qtimer_count_to_us(HAP_perf_get_qtimer_count() - rctx->t_start));
 
+                    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, ir);
                     if (is_vision) {
                         rope_vision_f32(rctx, dst_spad, src_spad, cnr, ne0, theta_cache);
                     } else if (is_neox) {
@@ -585,6 +615,7 @@ static void rope_job_f32(unsigned int nth, unsigned int ith, void * data) {
                     } else {
                         rope_basic_f32(rctx, dst_spad, src_spad, cnr, ne0, theta_cache);
                     }
+                    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, ir);
 
                     uint8_t * dst_addr = (uint8_t *) dst->data + i3 * nb3 + i2 * nb2 + i1 * nb1;
 
