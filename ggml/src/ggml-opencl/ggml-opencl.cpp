@@ -21961,7 +21961,22 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
             const char * e = getenv("GGML_OPENCL_FA_MQN_GQA16");
             return e == NULL || e[0] != '0';
         }();
-        if (gqa == 4 || gqa == 8 || (gqa == 2 && mqn_gqa2) || (gqa == 16 && mqn_gqa16)) {
+        // gqa == 6 is Qwen3.8-27B (n_head 24, n_head_kv 4, dk=dv=256). Without an
+        // mq_narrow kernel that shape matches NO MQ branch -- every dk=256 branch below
+        // wants gqa 4 or a prebuilt mq_narrow entry -- and plain flash-decoding excludes
+        // it via FD_MAX_DK=128, so decode gets NO KV split at all: one workgroup walks
+        // the whole KV range while -fa 0 parallelises it across KQ/softmax/KQV. Measured
+        // on the X2-90 at tg128 d16384, -fa 1 vs -fa 0: Q4_0 5.33 -> 4.35 (-18.3%),
+        // Q4_K_M 4.92 -> 4.09 (-16.8%), while every dk=128 model is parity-or-better.
+        // Raising FD_MAX_DK is NOT the alternative: q1_split at DK=256 spills 2208 B/WI
+        // (vs 384 B for the q1_vec_mq_split family), which is why that cap exists.
+        // OFF BY DEFAULT until measured -- flip with GGML_OPENCL_FA_MQN_GQA6=1.
+        static const bool mqn_gqa6 = []{
+            const char * e = getenv("GGML_OPENCL_FA_MQN_GQA6");
+            return e != NULL && e[0] != '0';
+        }();
+        if (gqa == 4 || gqa == 8 || (gqa == 2 && mqn_gqa2) || (gqa == 16 && mqn_gqa16) ||
+            (gqa == 6 && mqn_gqa6)) {
             // hs/nsg defaults are per-shape measurements on the X2-90; the env
             // knobs exist to re-tune them elsewhere. DK=256 gqa=8 must stay at
             // a 128-thread workgroup - the stock 192-thread g8 kernel is what
