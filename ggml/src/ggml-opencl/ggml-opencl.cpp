@@ -468,6 +468,11 @@ struct ggml_opencl_fa_kernels {
     // MQ_GQA=8 specializations
     std::map<std::pair<int, int>, cl_kernel> f32_f16_q1_vec_mq_g8;
     std::map<std::pair<int, int>, cl_kernel> f32_f16_q1_vec_mq_split_g8;
+    // MQ_GQA=<gqa> built on demand for ratios the eager MQ_GQA=4 / =8 programs
+    // cannot serve. Keyed by (dk, dv, gqa); see ggml_opencl_ensure_fa_mq_gqa().
+    // The work-group width is per entry: it is whatever the device accepted.
+    std::map<std::tuple<int, int, int>, cl_kernel> f32_f16_q1_vec_mq_split_gqa;
+    std::map<std::tuple<int, int, int>, int>       f32_f16_q1_vec_mq_split_gqa_wg;
     // k-image variant of MQ_G8 vec_mq_split
     std::map<std::pair<int, int>, cl_kernel> f32_f16_q1_vec_mq_split_g8_k_img;
     // k-image variant of MQ_GQA=4 vec_mq_split
@@ -4702,6 +4707,80 @@ static void ggml_opencl_log_fa_kernel_spill(ggml_backend_opencl_context * backen
         GGML_LOG_INFO("ggml_opencl: [%s] %s DK=%d DV=%d private_mem=%llu bytes\n",
                 tag, name, dk, dv, (unsigned long long) priv_mem);
     }
+}
+
+// Build the KV-head-coalesced decode kernel for an arbitrary GQA ratio, on first use.
+//
+// The eager MQ programs are compiled with MQ_GQA fixed to 4 and 8, and the dispatch admits a
+// model only when gqa_ratio is exactly one of those. One work-group owns MQ_GQA query heads of
+// a KV head, so the KV row is read once and shared; a model whose ratio is neither 4 nor 8 --
+// e.g. 6 (n_head 24 / n_head_kv 4) -- matches nothing and falls back to a per-query-head route
+// that re-reads the whole KV range once per head. The cost grows with context: on an Adreno
+// X2-90 that is a ~18% decode loss at n_kv 16384, and it reads as "flash attention is bad on
+// this model" rather than "no kernel was built for this shape".
+//
+// Rather than enumerate more ratios, compile MQ_GQA=<gqa> the first time such a model is seen.
+// Nothing is built for ratios no model uses, so devices with a tight compiler budget (the
+// reason FA_MQ_ONLY exists) pay only for what they run. A ratio that fails to compile, or whose
+// kernel the device will not launch at the required work-group size, is cached as failed and
+// the caller keeps its existing fallback.
+static bool ggml_opencl_ensure_fa_mq_gqa(ggml_backend_opencl_context * backend_ctx,
+                                         int dk, int dv, int gqa) {
+    const std::tuple<int, int, int> key = {dk, dv, gqa};
+    if (backend_ctx->fa.f32_f16_q1_vec_mq_split_gqa.count(key) > 0) {
+        return true;
+    }
+
+    // A failed build must not be retried on every dispatch.
+    static std::set<std::tuple<int, int, int>> failed;
+    if (failed.count(key) > 0) {
+        return false;
+    }
+
+    const ggml_opencl_fa_dim * cfg = nullptr;
+    for (const auto & d : g_opencl_fa_dims) {
+        if (d.dk == dk && d.dv == dv) { cfg = &d; break; }
+    }
+    if (cfg == nullptr) { failed.insert(key); return false; }
+
+    // MQ_NSG_SPLIT sets the work-group as 64 * nsg. CL_KERNEL_WORK_GROUP_SIZE is per-kernel and
+    // shrinks as register pressure grows, so the widest width is not always launchable -- try
+    // the widest first and halve until the device accepts one.
+    const std::string src = ggml_opencl_fa_kernel_src(FA_VARIANT_F32_F16);
+    for (int nsg = 4; nsg >= 1; nsg /= 2) {
+        const size_t wg = (size_t) 64 * nsg;
+        const std::string opts = ggml_opencl_fa_compile_opts(backend_ctx, cfg, FA_VARIANT_F32_F16) +
+                                 " -D FA_MQ_ONLY -D FA_MQ_SPLIT_ONLY" +
+                                 " -D MQ_GQA=" + std::to_string(gqa) +
+                                 " -D MQ_NSG=" + std::to_string(nsg) +
+                                 " -D MQ_NSG_SPLIT=" + std::to_string(nsg);
+        const std::string tag = "fa f32_f16 MQ_GQA=" + std::to_string(gqa) +
+                                " nsg" + std::to_string(nsg);
+
+        cl_program prog = build_program_from_source_ex(
+            backend_ctx->context, backend_ctx->device, src.c_str(), opts,
+            /*fatal=*/false, tag.c_str(), backend_ctx->queue);
+        if (!prog) { continue; }
+
+        cl_int err;
+        cl_kernel k = clCreateKernel(prog, "flash_attn_f32_f16_q1_vec_mq_split", &err);
+        if (err != CL_SUCCESS) { clReleaseProgram(prog); continue; }
+
+        if (!ggml_opencl_fa_kernel_fits_wg(backend_ctx, k, wg, tag.c_str(), dk, dv)) {
+            clReleaseKernel(k);
+            clReleaseProgram(prog);
+            continue;
+        }
+
+        backend_ctx->fa.f32_f16_q1_vec_mq_split_gqa[key]    = k;
+        backend_ctx->fa.f32_f16_q1_vec_mq_split_gqa_wg[key] = (int) wg;
+        ggml_opencl_log_fa_kernel_spill(backend_ctx, k, tag.c_str(), dk, dv);
+        clReleaseProgram(prog);
+        return true;
+    }
+
+    failed.insert(key);
+    return false;
 }
 
 static void ggml_opencl_ensure_fa_pre_kernels(ggml_backend_opencl_context * backend_ctx, int dk, int dv) {
@@ -15000,6 +15079,37 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
             use_fd_mq  = true;
             fd_mq_wg   = 64;
         }
+    }
+    // KV-head-coalesced decode for GQA ratios the MQ_GQA=4 / =8 programs above cannot serve.
+    // Those are compiled with a fixed MQ_GQA and admitted only on an exact match, so a model
+    // with e.g. gqa 6 gets no KV-sharing route at all and re-reads the KV range once per query
+    // head -- a loss that grows with context. Build MQ_GQA=<gqa> on demand instead; nothing is
+    // compiled for ratios no model uses. Runs after the tuned paths so it changes nothing for
+    // gqa 4 or 8, and before the plain (non-MQ) split so it only ever replaces the slower route.
+    static const bool mq_any_gqa_on = []{
+        const char * e = getenv("GGML_OPENCL_FA_MQ_ANY_GQA");
+        return e == NULL || e[0] != '0';   // on by default; =0 restores the 4/8-only behaviour
+    }();
+    // Capped at 8. One work-group owns all MQ_GQA query heads, so per-lane state
+    // (o_acc[MQ_GQA][...], m_i, l_i, slope) grows linearly with the ratio, and past ~8 the
+    // occupancy loss outweighs the KV traffic saved. Measured on an Adreno 840 with a gqa=16
+    // model (dk=dv=128): the device drops the launchable work-group from 256 to 128 threads
+    // and decode goes 1.339 -> 1.126 t/s (-15.9%) versus not taking this route at all. Ratios
+    // above the cap need the group split across several work-groups, which this kernel does
+    // not do, so they keep their existing path.
+    if (fd_k_split == NULL && mq_any_gqa_on &&
+        n_q == 1 && !is_causal && is_mixed &&
+        backend_ctx->gpu_family != INTEL &&
+        gqa_ratio_dispatch >= 2 && gqa_ratio_dispatch <= 8 &&
+        gqa_ratio_dispatch != 4 && gqa_ratio_dispatch != 8 &&
+        n_kv >= FD_MIN_N_KV &&
+        backend_ctx->fa.f32_merge.count(dk_dv) > 0 &&
+        ggml_opencl_ensure_fa_mq_gqa(backend_ctx, d_head_q, d_head_v, gqa_ratio_dispatch)) {
+        fd_k_split = backend_ctx->fa.f32_f16_q1_vec_mq_split_gqa.at(
+            {d_head_q, d_head_v, gqa_ratio_dispatch});
+        use_fd_mq  = true;
+        fd_mq_wg   = (size_t) backend_ctx->fa.f32_f16_q1_vec_mq_split_gqa_wg.at(
+            {d_head_q, d_head_v, gqa_ratio_dispatch});
     }
     if (fd_k_split == NULL &&
         n_q >= 1 && n_q <= fd_max_n_q && n_kv >= FD_MIN_N_KV && !is_causal &&
