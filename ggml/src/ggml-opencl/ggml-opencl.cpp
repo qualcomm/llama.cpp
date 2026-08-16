@@ -203,39 +203,69 @@ static ggml_cl_version get_opencl_platform_version(cl_platform_id platform) {
     return parse_cl_version(param_value);
 }
 
+// Returns the DEVICE's OpenCL version. On an error returns ggml_cl_version with all zeroes.
+static ggml_cl_version get_opencl_device_version(cl_device_id device) {
+    size_t param_size;
+    if (clGetDeviceInfo(device, CL_DEVICE_VERSION, 0, nullptr, &param_size) != CL_SUCCESS || !param_size) {
+        return {};
+    }
+    std::unique_ptr<char[]> param_storage(new char[param_size]);
+    if (clGetDeviceInfo(device, CL_DEVICE_VERSION, param_size, param_storage.get(), nullptr) != CL_SUCCESS) {
+        return {};
+    }
+
+    auto              param_value    = std::string_view(param_storage.get(), param_size);
+    const std::string version_prefix = "OpenCL ";  // "OpenCL <major>.<minor> <device-specific-info>"
+    if (param_value.find(version_prefix) != 0) {
+        return {};
+    }
+    param_value.remove_prefix(version_prefix.length());
+    return parse_cl_version(param_value);
+}
+
 // Return a version to use in OpenCL C compilation. On an error returns ggml_cl_version with all zeroes.
 static ggml_cl_version get_opencl_c_version(ggml_cl_version platform_version, cl_device_id device) {
     size_t param_size;
 
 #if CL_TARGET_OPENCL_VERSION >= 300
-    if (platform_version.major >= 3) {
-        CL_CHECK(clGetDeviceInfo(device, CL_DEVICE_OPENCL_C_ALL_VERSIONS, 0, nullptr, &param_size));
-        if (!param_size) {
-            return {};
+    // CL_DEVICE_OPENCL_C_ALL_VERSIONS is an OpenCL 3.0 *device* query, so gating it on the
+    // *platform* version is not enough: a 3.0 platform can expose 2.0 devices, where the
+    // query returns CL_INVALID_VALUE and the old CL_CHECK aborted during backend init.
+    // Gate on the device version, and treat a failure as "fall back to the legacy query"
+    // rather than fatal -- a device may advertise 3.0 and still refuse the property.
+    const ggml_cl_version device_version = get_opencl_device_version(device);
+    if (platform_version.major >= 3 && device_version.major >= 3) {
+        cl_int err = clGetDeviceInfo(device, CL_DEVICE_OPENCL_C_ALL_VERSIONS, 0, nullptr, &param_size);
+        if (err == CL_SUCCESS && param_size) {
+            std::unique_ptr<cl_name_version[]> versions(new cl_name_version[param_size]);
+            err = clGetDeviceInfo(device, CL_DEVICE_OPENCL_C_ALL_VERSIONS, param_size, versions.get(), nullptr);
+            if (err == CL_SUCCESS) {
+                unsigned versions_count = param_size / sizeof(cl_name_version);
+
+                cl_version version_max = 0;
+                for (unsigned i = 0; i < versions_count; i++) {
+                    version_max = std::max<cl_version>(versions[i].version, version_max);
+                }
+
+                return { CL_VERSION_MAJOR(version_max), CL_VERSION_MINOR(version_max) };
+            }
         }
-
-        std::unique_ptr<cl_name_version[]> versions(new cl_name_version[param_size]);
-        CL_CHECK(clGetDeviceInfo(device, CL_DEVICE_OPENCL_C_ALL_VERSIONS, param_size, versions.get(), nullptr));
-        unsigned versions_count = param_size / sizeof(cl_name_version);
-
-        cl_version version_max = 0;
-        for (unsigned i = 0; i < versions_count; i++) {
-            version_max = std::max<cl_version>(versions[i].version, version_max);
-        }
-
-        return { CL_VERSION_MAJOR(version_max), CL_VERSION_MINOR(version_max) };
+        // fall through to CL_DEVICE_OPENCL_C_VERSION below
     }
 #else
     GGML_UNUSED(platform_version);
 #endif  // CL_TARGET_OPENCL_VERSION >= 300
 
-    CL_CHECK(clGetDeviceInfo(device, CL_DEVICE_OPENCL_C_VERSION, 0, nullptr, &param_size));
-    if (!param_size) {
+    // This function documents "on an error returns ggml_cl_version with all zeroes", so honour
+    // that instead of aborting -- the caller can degrade, a dead process cannot.
+    if (clGetDeviceInfo(device, CL_DEVICE_OPENCL_C_VERSION, 0, nullptr, &param_size) != CL_SUCCESS || !param_size) {
         return {};
     }
 
     std::unique_ptr<char[]> param_storage(new char[param_size]);
-    CL_CHECK(clGetDeviceInfo(device, CL_DEVICE_OPENCL_C_VERSION, param_size, param_storage.get(), nullptr));
+    if (clGetDeviceInfo(device, CL_DEVICE_OPENCL_C_VERSION, param_size, param_storage.get(), nullptr) != CL_SUCCESS) {
+        return {};
+    }
     auto param_value = std::string_view(param_storage.get(), param_size);
 
     const std::string version_prefix = "OpenCL C ";  // Suffix: "XX.YY <platform-specific-info>"
