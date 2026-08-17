@@ -21416,7 +21416,21 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     // register for this (dk,dv) -- same guard style as the symmetric pairs.
     const bool use_native_q8q4_q1 = is_q8q4 && n_q == 1 &&
                                     backend_ctx->fa.f32_q8_0_q4_0_q1.count(dk_dv) > 0;
-    const bool use_native_q8q4    = is_q8q4 && n_q > 1 &&
+    // Prefill is DECLINED by default. Measured on X2-90 / gpt-oss-20b MXFP4 with
+    // -ctk q8_0 -ctv q4_0, native prefill vs the dequant-to-F32 fallback:
+    //     pp512 @ d0     356.95 vs 476.08  (-25.0%)
+    //     pp512 @ d4096   100.11 vs 361.00  (-72.3%)
+    // Decode is the opposite (tg32 @ d4096 25.90 vs 16.52, +56.8%), so the win is
+    // real but it lives entirely in the decode path. The fallback dequantises the
+    // KV tile once and then runs the heavily-tuned F32 prefill kernel, which beats
+    // reading q4 nibbles inline per tile -- and the gap widens with depth. Taking
+    // the native prefill would be a straight regression on the workload this
+    // branch exists for, so it stays behind an opt-in until it is tuned.
+    static const bool q8q4_prefill_on = []{
+        const char * e = getenv("GGML_OPENCL_FA_Q8Q4_PREFILL");
+        return e != NULL && e[0] == '1';
+    }();
+    const bool use_native_q8q4    = is_q8q4 && n_q > 1 && q8q4_prefill_on &&
                                     backend_ctx->fa.f32_q8_0_q4_0.count(dk_dv) > 0;
     const int block_m = n_q > 1
         ? (is_mixed ? backend_ctx->fa.f32_f16_bm.at(dk_dv) : backend_ctx->fa.bm.at(dk_dv))
