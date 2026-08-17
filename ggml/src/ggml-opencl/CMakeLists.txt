@@ -5,6 +5,8 @@ set(TARGET_NAME ggml-opencl)
 
 ggml_add_backend_library(${TARGET_NAME}
                          ggml-opencl.cpp
+                         cl-program-cache.cpp
+                         cl-program-cache.h
                          ../../include/ggml-opencl.h)
 target_link_libraries(${TARGET_NAME} PRIVATE ${OpenCL_LIBRARIES})
 target_include_directories(${TARGET_NAME} PRIVATE ${OpenCL_INCLUDE_DIRS})
@@ -61,36 +63,54 @@ endfunction()
 set(GGML_OPENCL_KERNELS
     add
     add_id
+    moe_add_id_glu
     argsort
+    tri
     fill
     clamp
     cpy
     cvt
     diag_mask_inf
+    diag
     div
     gelu
-    gemv_noshuffle_general
-    gemv_noshuffle
     get_rows
     glu
     group_norm
+    solve_tri
     im2col_f32
     im2col_f16
     mean
-    mul_mat_Ab_Bi_8x4
     mul_mv_f16_f16
     mul_mv_f16_f32_1row
+    mul_mv_f16_f32_mrow
     mul_mv_f16_f32_l4
     mul_mv_f16_f32
     mul_mv_f32_f32
+    mul_mv_q1_0_f32
+    mul_mv_q1_0_f32_flat
     mul_mv_q4_0_f32
     mul_mv_q4_0_f32_v
     mul_mv_q4_0_f32_8x_flat
     mul_mv_q4_0_f32_1d_8x_flat
     mul_mv_q4_0_f32_1d_16x_flat
-    mul_mv_q6_k
+    mul_mv_q4_1_f32
+    mul_mv_q4_1_f32_flat
+    mul_mv_q4_k_f32
+    mul_mv_q4_k_f32_flat
+    mul_mv_q4_k_q8_1
+    mul_mv_q5_0_f32
+    mul_mv_q5_0_f32_flat
+    mul_mv_q5_1_f32
+    mul_mv_q5_1_f32_flat
+    mul_mv_q5_k_f32
+    mul_mv_q5_k_f32_flat
+    mul_mv_q6_k_f32
+    mul_mv_q6_k_f32_flat
     mul_mv_q8_0_f32
     mul_mv_q8_0_f32_flat
+    mul_mv_iq4_nl_f32
+    mul_mv_iq4_nl_f32_flat
     mul_mv_mxfp4_f32
     mul_mv_mxfp4_f32_flat
     mul_mv_id_q4_0_f32_8x_flat
@@ -98,24 +118,86 @@ set(GGML_OPENCL_KERNELS
     mul_mv_id_q8_0_f32_flat
     mul_mv_id_mxfp4_f32
     mul_mv_id_mxfp4_f32_flat
+    gemm_moe_q4_0_f32_ns
+    gemm_moe_q4_0_q8_1_dp4a
+    gemv_moe_q4_0_f32_ns
+    gemm_moe_q8_0_f32_ns
+    gemm_moe_q4_1_f32_ns
+    gemv_moe_q4_1_f32_ns
+    gemm_moe_q5_0_f32_ns
+    gemv_moe_q5_0_f32_ns
+    gemm_moe_q5_1_f32_ns
+    gemv_moe_q5_1_f32_ns
+    gemm_moe_q4_k_f32_ns
+    gemm_moe_q4_k_q8_1_dp4a
+    gemm_moe_q6_k_q8_1_dp4a
+    gemm_moe_q8_1_dp4a
+    moe_reorder_quant_a_q8_1
+    gemm_noshuffle_q4_k_q8_1_dp4a
+    gemm_noshuffle_q5_k_q8_1_dp4a
+    gemm_noshuffle_q6_k_q8_1_dp4a
+    gemm_noshuffle_q8_0_q8_1_dp4a
+    gemm_noshuffle_q5_0_q8_1_dp4a
+    gemm_noshuffle_iq4_nl_q8_1_dp4a
+    gemm_noshuffle_q4_0_q8_1_dp4a
+    quant_a_q8_1
+    gemv_moe_q4_k_f32_ns
+    gemm_moe_q5_k_f32_ns
+    gemv_moe_q5_k_f32_ns
+    gemm_moe_q6_k_f32_ns
+    gemv_moe_q6_k_f32_ns
     gemm_moe_mxfp4_f32
     gemv_moe_mxfp4_f32
     gemm_moe_mxfp4_f32_ns
+    gemm_moe_mxfp4_q8_1_dp4a
     gemv_moe_mxfp4_f32_ns
-    gemm_moe_q4_0_f32_ns
-    gemv_moe_q4_0_f32_ns
-    gemm_moe_q4_1_f32_ns
-    gemv_moe_q4_1_f32_ns
-    gemm_noshuffle_q8_0_f32
-    gemv_noshuffle_q8_0_f32
     moe_reorder_b
+    moe_combine
     moe_sort_by_expert
+    topk_moe
     mul_mm_f32_f32_l4_lm
     mul_mm_f16_f32_l4_lm
+    mul_mm_q1_0_f32_l4_lm
+    mul_mm_q4_0_f32_l4_lm
+    mul_mm_q4_1_f32_l4_lm
+    mul_mm_q5_0_f32_l4_lm
+    mul_mm_q5_1_f32_l4_lm
     mul_mm_q8_0_f32_l4_lm
+    mul_mm_iq4_nl_f32_l4_lm
+    mul_mm_q4_k_f32_l4_lm
+    mul_mm_q5_k_f32_l4_lm
+    mul_mm_q6_k_f32_l4_lm
+    gemv_noshuffle_q1_0_f32
+    gemm_noshuffle_q1_0_f32
+    gemv_noshuffle_q4_0_f32
+    gemv_noshuffle_q4_0_f32_spec
+    gemm_noshuffle_q4_0_f32
+    gemv_noshuffle_q4_1_f32
+    gemm_noshuffle_q4_1_f32
+    gemv_noshuffle_q5_0_f32
+    gemm_noshuffle_q5_0_f32
+    gemv_noshuffle_q5_1_f32
+    gemm_noshuffle_q5_1_f32
+    gemv_noshuffle_iq4_nl_f32
+    gemm_noshuffle_iq4_nl_f32
+    gemv_noshuffle_q8_0_f32
+    gemm_noshuffle_q8_0_f32
+    gemv_noshuffle_q4_k_f32
+    gemv_noshuffle_q4_k_f32_o4
+    gemv_noshuffle_q4_k_f32_tiled
+    gemm_noshuffle_q4_k_f32
+    gemv_noshuffle_q6_k_f32
+    gemv_noshuffle_q6_k_f32_o4
+    gemv_noshuffle_q6_k_f32_tiled
+    gemm_noshuffle_q6_k_f32
+    gemm_noshuffle_q6_k_f32_tiled
+    gemv_noshuffle_q5_k_f32
+    gemm_noshuffle_q5_k_f32
     mul
+    neg
     norm
     relu
+    l2_norm
     rms_norm
     rope
     scale
@@ -129,29 +211,42 @@ set(GGML_OPENCL_KERNELS
     sqr
     sqrt
     ssm_conv
+    ssm_scan
+    # gated_delta_net omitted: GGML_OP_GATED_DELTA_NET postdates the b7725 base this
+    # branch is pinned to, so the host path is guarded off in ggml-opencl.cpp
+    # (GGML_OPENCL_HAS_GATED_DELTA_NET). The kernel source is kept in kernels/ so the
+    # next refresh from the x2-unified line stays a clean file-level copy.
     sub
     sum_rows
+    cumsum
     transpose
     concat
     tsembd
     upscale
     tanh
+    exp
     expm1
+    abs
+    unary_ext
     softplus
     pad
     repeat
     mul_mat_f16_f32
     mul_mm_f16_f32_kq_kqv
+    mul_mm_q8_0_f32_kq_dp4a
     conv2d
     conv2d_f16_f32
+    flash_attn_pre_f16
     flash_attn_f32_f16
-    flash_attn_f16
-    flash_attn_f32
     flash_attn_f32_q8_0
     flash_attn_f32_q4_0
-    flash_attn_f32_q8_0_q4_0
-    flash_attn_pre_f16
+    flash_attn_f16
+    flash_attn_f32
 )
+
+if (GGML_OPENCL_USE_ADRENO_KERNELS)
+    list(APPEND GGML_OPENCL_KERNELS gemm_xmem_f16_f32_os8)
+endif ()
 
 foreach (K ${GGML_OPENCL_KERNELS})
     ggml_opencl_add_kernel(${K})
