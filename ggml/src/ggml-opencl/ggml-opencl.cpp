@@ -5035,11 +5035,14 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_0_q8_1_dp4a = clCreateKernel(prog, "kernel_gemm_noshuffle_q4_0_q8_1_dp4a", &err), err));
         CL_CHECK(clReleaseProgram(prog));
 
-        // Narrow tile for the verify band. DEFAULT OFF -- UNMEASURED on any model.
-        // q4_0 is the MTP/spec-decode workhorse so this is worth testing on a q4_0
-        // model, but the q6_K arm proved the tile trade does NOT generalise across
-        // quant types (it regressed 1.06%), so shipping this on by analogy is not
-        // justified. Opt in with GGML_OPENCL_Q40_DP4A_TS_NARROW=16 and measure first.
+        // Narrow tile for the verify band. DEFAULT OFF, and note this one is INERT in
+        // any shipped config: the q4_0 dense dp4a HOST PATH is itself default-off
+        // (q4_0_dense_dp4a_on, see ggml_cl_mul_mat_q4_0_f32) because q4_0's dequant is
+        // trivial, so the f16 GEMM is already weight-BW-bound and the int8 ALU win has
+        // nothing to beat (qwen2-7B pp256/1024/4096: +0.8%/-1.5%/-1.3%). This tile can
+        // only ever matter behind GGML_OPENCL_Q4_0_DENSE_DP4A=1, which is a path nobody
+        // runs. Kept for symmetry with q4_K/q5_K/q6_K, costs nothing (no second program
+        // is built while ts_narrow == 32). Opt in: GGML_OPENCL_Q40_DP4A_TS_NARROW=16.
         int ts_narrow = 32;
         if (const char * e = getenv("GGML_OPENCL_Q40_DP4A_TS_NARROW")) { ts_narrow = atoi(e); }
         if (const char * e = getenv("GGML_OPENCL_Q40_DP4A_NARROW_MAX")) {
@@ -5243,11 +5246,14 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q5_k_q8_1_dp4a = clCreateKernel(prog, "kernel_gemm_noshuffle_q5_k_q8_1_dp4a", &err), err));
         CL_CHECK(clReleaseProgram(prog));
 
-        // Narrow tile for the verify band. DEFAULT OFF -- UNMEASURED on any model.
-        // q5_K is the #2 verify chunk on Qwen3.5 so this is worth testing there, but
-        // the q6_K arm proved the tile trade does NOT generalise across quant types
-        // (it regressed 1.06%), so shipping this on by analogy is not justified.
-        // Opt in with GGML_OPENCL_Q5K_DP4A_TS_NARROW=16 and measure before defaulting.
+        // Narrow tile for the verify band. DEFAULT OFF -- UNMEASURABLE so far, not
+        // "untried". The host path IS live (q5k_dense_dp4a_on defaults on for X2E), but
+        // the only q5_K model available is a 2.7B mamba2, and llama-bench on it drifts
+        // 4-11% between two IDENTICAL control arms -- larger than the effect. pp512 is
+        // a built-in control there (ne1=512 cannot reach this tile) and it moved 3.8%.
+        // A one-shot run suggested -7.9%; bracketing showed that was drift, not signal.
+        // Settling this needs a real Q5_K_M model or fixed-shape q5_K perf cases, not a
+        // whole-model bench. Opt in: GGML_OPENCL_Q5K_DP4A_TS_NARROW=16.
         int ts_narrow = 32;
         if (const char * e = getenv("GGML_OPENCL_Q5K_DP4A_TS_NARROW")) { ts_narrow = atoi(e); }
         if (const char * e = getenv("GGML_OPENCL_Q5K_DP4A_NARROW_MAX")) {
