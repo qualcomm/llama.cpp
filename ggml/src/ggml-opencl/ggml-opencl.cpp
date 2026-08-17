@@ -21278,10 +21278,19 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
             ggml_opencl_ensure_fa_variant(backend_ctx, d_head_q, d_head_v, FA_VARIANT_Q4_0_SPLIT);
         }
     } else if (is_q8q4) {
+        // BOTH variants, and F32 first. Before this branch existed, K=q8_0/V=q4_0
+        // fell through to the final else and got FA_VARIANT_F32 -- that is the
+        // kernel the dequant fallback runs. Decode now takes the native asymmetric
+        // kernel, but prefill is declined by default (see use_native_q8q4), so the
+        // F32 program must still be built or the prefill path looks up a key that
+        // was never inserted: std::out_of_range out of a .at(), which on Windows
+        // is an uncaught-exception fast-fail (0xC0000409), not a graceful error.
+        // Caught on the X2-90 only after the prefill gate went in -- the ensure
+        // branch and the dispatch predicate have to agree about who serves n_q>1.
+        ggml_opencl_ensure_fa_variant(backend_ctx, d_head_q, d_head_v, FA_VARIANT_F32);
         // The 96/96 and 256/256 split overrides above exist because the default
         // n_split is degenerate at those DK; this kernel does not register the
-        // split-override route, so only build the plain split variant and let the
-        // prefill fall back to the baseline BM tile where that is not available.
+        // split-override route, so only build the plain split variant there.
         ggml_opencl_ensure_fa_variant(backend_ctx, d_head_q, d_head_v, FA_VARIANT_Q8_0_Q4_0);
         if (!(d_head_q == 96 && d_head_v == 96) && !(d_head_q == 256 && d_head_v == 256)) {
             ggml_opencl_ensure_fa_variant(backend_ctx, d_head_q, d_head_v, FA_VARIANT_Q8_0_Q4_0_SPLIT);
