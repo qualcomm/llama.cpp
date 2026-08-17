@@ -1700,8 +1700,26 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemm_noshuffle_q4_k_f32;
     cl_kernel kernel_gemm_noshuffle_q4_k_q8_1_dp4a = nullptr;  // dp4a (int8) dense prefill GEMM
     cl_kernel kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg = nullptr;  // dp4a dense prefill GEMM, weights via texture (X1 opt-in)
+    // Same dp4a GEMM compiled at a NARROWER TILESIZE_N for the spec/MTP verify band.
+    // TILESIZE_N is a compile-time constant that sets both the accumulator count
+    // (float4 acc[TILESIZE_N/4]) and the LDS staging width, and the kernel pads
+    // unused token slots with zeros -- so a 32-wide tile does 2x the arithmetic at
+    // ne1=16 and 3.5x at ne1=9. nullptr when no second tile is needed.
+    cl_kernel kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow = nullptr;
+    cl_kernel kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow_wimg = nullptr;
+    int q4k_dp4a_ts        = 32;  // tile for prefill (ne1 > q4k_dp4a_narrow_max)
+    int q4k_dp4a_ts_narrow = 32;  // tile for the verify band; == q4k_dp4a_ts disables the split
+    int q4k_dp4a_narrow_max = 16; // widest ne1 routed to the narrow tile
     cl_kernel kernel_gemm_noshuffle_q5_k_q8_1_dp4a = nullptr;  // dp4a (int8) dense q5_K prefill GEMM
+    // Narrow-tile twin for the verify band; see the q4_K pair above for the rationale.
+    cl_kernel kernel_gemm_noshuffle_q5_k_q8_1_dp4a_narrow = nullptr;
+    int q5k_dp4a_ts_narrow  = 32;  // == 32 disables the split
+    int q5k_dp4a_narrow_max = 16;
     cl_kernel kernel_gemm_noshuffle_q6_k_q8_1_dp4a = nullptr;  // dp4a (int8) dense q6_K prefill GEMM
+    // Narrow-tile twin for the verify band; see the q4_K pair above for the rationale.
+    cl_kernel kernel_gemm_noshuffle_q6_k_q8_1_dp4a_narrow = nullptr;
+    int q6k_dp4a_ts_narrow  = 32;  // == 32 disables the split
+    int q6k_dp4a_narrow_max = 16;
     cl_kernel kernel_quant_a_q8_1;                    // plain activation q8_1 pre-pass
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_r1;
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_kimg;
@@ -1732,6 +1750,10 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemm_noshuffle_iq4_nl_f32;
     cl_kernel kernel_gemm_noshuffle_iq4_nl_q8_1_dp4a = nullptr;  // dp4a (int8) dense IQ4_NL prefill GEMM
     cl_kernel kernel_gemm_noshuffle_q4_0_q8_1_dp4a = nullptr;  // dp4a (int8) dense q4_0 prefill GEMM
+    // Narrow-tile twin for the verify band; see the q4_K pair above for the rationale.
+    cl_kernel kernel_gemm_noshuffle_q4_0_q8_1_dp4a_narrow = nullptr;
+    int q40_dp4a_ts_narrow  = 32;  // == 32 disables the split
+    int q40_dp4a_narrow_max = 16;
 #endif // GGML_OPENCL_USE_ADRENO_KERNELS
 
     void free() {
@@ -5012,6 +5034,24 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_0_q8_1_dp4a = clCreateKernel(prog, "kernel_gemm_noshuffle_q4_0_q8_1_dp4a", &err), err));
         CL_CHECK(clReleaseProgram(prog));
+
+        // Narrow tile for the verify band. DEFAULT OFF -- UNMEASURED on any model.
+        // q4_0 is the MTP/spec-decode workhorse so this is worth testing on a q4_0
+        // model, but the q6_K arm proved the tile trade does NOT generalise across
+        // quant types (it regressed 1.06%), so shipping this on by analogy is not
+        // justified. Opt in with GGML_OPENCL_Q40_DP4A_TS_NARROW=16 and measure first.
+        int ts_narrow = 32;
+        if (const char * e = getenv("GGML_OPENCL_Q40_DP4A_TS_NARROW")) { ts_narrow = atoi(e); }
+        if (const char * e = getenv("GGML_OPENCL_Q40_DP4A_NARROW_MAX")) {
+            backend_ctx->q40_dp4a_narrow_max = atoi(e);
+        }
+        backend_ctx->q40_dp4a_ts_narrow = ts_narrow;
+        if (ts_narrow != 32) {
+            std::string narrow_opts = compile_opts + " -DTILESIZE_N=" + std::to_string(ts_narrow);
+            cl_program nprog = build_program_from_source(backend_ctx, kernel_src.c_str(), narrow_opts);
+            CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_0_q8_1_dp4a_narrow = clCreateKernel(nprog, "kernel_gemm_noshuffle_q4_0_q8_1_dp4a", &err), err));
+            CL_CHECK(clReleaseProgram(nprog));
+        }
         GGML_LOG_CONT(".");
     }
 
@@ -5148,6 +5188,29 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a = clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_q8_1_dp4a", &err), err));
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg = clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg", &err), err));
         CL_CHECK(clReleaseProgram(prog));
+        backend_ctx->q4k_dp4a_ts = q4k_dp4a_ts;
+
+        // Narrow tile for the spec/MTP verify band. TILESIZE_N is compile-time: it
+        // fixes the accumulator count (float4 acc[TILESIZE_N/4]) and the LDS staging
+        // width, and token slots past ne1 are staged as zeros and computed anyway --
+        // so one 32-wide tile does 2x the work at ne1=16 and 3.5x at ne1=9, which is
+        // exactly the band a speculative verify lands in. Measured on X2-90 /
+        // muse-glimmer-30B Q4_K_M: TILESIZE_N=16 is pp9 +28.8% / pp16 +27.9%, while
+        // prefill still wants 32 (pp512 -14.1% at 16). So compile both and pick by
+        // ne1. Tiling only -- padded columns are discarded -- so output is unchanged.
+        int ts_narrow = (q4k_dp4a_ts > 16) ? 16 : q4k_dp4a_ts;
+        if (const char * e = getenv("GGML_OPENCL_Q4K_DP4A_TS_NARROW")) { ts_narrow = atoi(e); }
+        if (const char * e = getenv("GGML_OPENCL_Q4K_DP4A_NARROW_MAX")) {
+            backend_ctx->q4k_dp4a_narrow_max = atoi(e);
+        }
+        backend_ctx->q4k_dp4a_ts_narrow = ts_narrow;
+        if (ts_narrow != q4k_dp4a_ts) {
+            std::string narrow_opts = compile_opts + " -DTILESIZE_N=" + std::to_string(ts_narrow);
+            cl_program nprog = build_program_from_source(backend_ctx, kernel_src.c_str(), narrow_opts);
+            CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow = clCreateKernel(nprog, "kernel_gemm_noshuffle_q4_k_q8_1_dp4a", &err), err));
+            CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow_wimg = clCreateKernel(nprog, "kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg", &err), err));
+            CL_CHECK(clReleaseProgram(nprog));
+        }
         GGML_LOG_CONT(".");
     }
 
@@ -5179,6 +5242,24 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q5_k_q8_1_dp4a = clCreateKernel(prog, "kernel_gemm_noshuffle_q5_k_q8_1_dp4a", &err), err));
         CL_CHECK(clReleaseProgram(prog));
+
+        // Narrow tile for the verify band. DEFAULT OFF -- UNMEASURED on any model.
+        // q5_K is the #2 verify chunk on Qwen3.5 so this is worth testing there, but
+        // the q6_K arm proved the tile trade does NOT generalise across quant types
+        // (it regressed 1.06%), so shipping this on by analogy is not justified.
+        // Opt in with GGML_OPENCL_Q5K_DP4A_TS_NARROW=16 and measure before defaulting.
+        int ts_narrow = 32;
+        if (const char * e = getenv("GGML_OPENCL_Q5K_DP4A_TS_NARROW")) { ts_narrow = atoi(e); }
+        if (const char * e = getenv("GGML_OPENCL_Q5K_DP4A_NARROW_MAX")) {
+            backend_ctx->q5k_dp4a_narrow_max = atoi(e);
+        }
+        backend_ctx->q5k_dp4a_ts_narrow = ts_narrow;
+        if (ts_narrow != 32) {
+            std::string narrow_opts = compile_opts + " -DTILESIZE_N=" + std::to_string(ts_narrow);
+            cl_program nprog = build_program_from_source(backend_ctx, kernel_src.c_str(), narrow_opts);
+            CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q5_k_q8_1_dp4a_narrow = clCreateKernel(nprog, "kernel_gemm_noshuffle_q5_k_q8_1_dp4a", &err), err));
+            CL_CHECK(clReleaseProgram(nprog));
+        }
         GGML_LOG_CONT(".");
     }
 
@@ -5194,6 +5275,28 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a = clCreateKernel(prog, "kernel_gemm_noshuffle_q6_k_q8_1_dp4a", &err), err));
         CL_CHECK(clReleaseProgram(prog));
+
+        // Narrow tile for the verify band. ⛔ DEFAULT OFF: MEASURED A REGRESSION.
+        // muse-glimmer-30B carries 52 q6_K tensors (+10 in the DFlash drafter), so this
+        // looked like the one that would compound with q4_K. It does the opposite --
+        // DFlash agentic traffic, one binary, three arms: all-off 12.2108, q4_K-only
+        // 13.3545, q4_K+q6_K 13.2125. Adding q6_K costs 1.06% against q4_K alone, ~25x
+        // the harness noise floor (controls reproduce to 0.04%). The tile trade does NOT
+        // generalise across quant types -- q6_K carries more per-weight work (ql+qh+
+        // scales) than q4_K, so its register/LDS balance differs. Opt in to re-test with
+        // GGML_OPENCL_Q6K_DP4A_TS_NARROW=16.
+        int ts_narrow = 32;
+        if (const char * e = getenv("GGML_OPENCL_Q6K_DP4A_TS_NARROW")) { ts_narrow = atoi(e); }
+        if (const char * e = getenv("GGML_OPENCL_Q6K_DP4A_NARROW_MAX")) {
+            backend_ctx->q6k_dp4a_narrow_max = atoi(e);
+        }
+        backend_ctx->q6k_dp4a_ts_narrow = ts_narrow;
+        if (ts_narrow != 32) {
+            std::string narrow_opts = compile_opts + " -DTILESIZE_N=" + std::to_string(ts_narrow);
+            cl_program nprog = build_program_from_source(backend_ctx, kernel_src.c_str(), narrow_opts);
+            CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a_narrow = clCreateKernel(nprog, "kernel_gemm_noshuffle_q6_k_q8_1_dp4a", &err), err));
+            CL_CHECK(clReleaseProgram(nprog));
+        }
         GGML_LOG_CONT(".");
     }
 
@@ -24817,7 +24920,10 @@ static void ggml_cl_mul_mat_q4_0_f32_adreno(ggml_backend_t backend, const ggml_t
             size_t q_global[1] = { (size_t)(((n_blocks + 63) / 64) * 64) };
             backend_ctx->enqueue_ndrange_kernel(qk, 1, q_global, q_local, dst);
 
-            cl_kernel dk = backend_ctx->kernel_gemm_noshuffle_q4_0_q8_1_dp4a;
+            const bool use_narrow = (backend_ctx->kernel_gemm_noshuffle_q4_0_q8_1_dp4a_narrow != nullptr)
+                                 && (N <= backend_ctx->q40_dp4a_narrow_max);
+            cl_kernel dk = use_narrow ? backend_ctx->kernel_gemm_noshuffle_q4_0_q8_1_dp4a_narrow
+                                      : backend_ctx->kernel_gemm_noshuffle_q4_0_q8_1_dp4a;
             int ai = 0;
             CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_mem),   &extra0_q4_0->q));
             CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_mem),   &extra0_q4_0->d));
@@ -24829,8 +24935,10 @@ static void ggml_cl_mul_mat_q4_0_f32_adreno(ggml_backend_t backend, const ggml_t
             CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_int),   &M));
             CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_int),   &N));
             CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_int),   &K));
+            // Must match the compile-time TILESIZE_N of the kernel picked above.
+            const int q40_ts = use_narrow ? backend_ctx->q40_dp4a_ts_narrow : 32;
             size_t d_local[3]  = { 64, 1, 1 };
-            size_t d_global[3] = { 64, (size_t)(M / 64), (size_t)CEIL_DIV(N, 32) };
+            size_t d_global[3] = { 64, (size_t)(M / 64), (size_t)CEIL_DIV(N, q40_ts) };
             backend_ctx->enqueue_ndrange_kernel(dk, 3, d_global, d_local, dst);
 
             CL_CHECK(clReleaseMemObject(a_sub));
@@ -26726,8 +26834,17 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
                 }
             }
 
-            cl_kernel dk = use_wimg ? backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg
-                                    : backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a;
+            // Narrow-tile variant for the verify band. The kernel computes a full
+            // TILESIZE_N columns regardless of N (slots past n_no_padding are staged
+            // as zeros), so a 32-wide tile is 2x the work at N=16. Only taken when a
+            // second program was actually compiled.
+            const bool use_narrow = (backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow != nullptr)
+                                 && (N <= backend_ctx->q4k_dp4a_narrow_max);
+            cl_kernel dk = use_narrow
+                ? (use_wimg ? backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow_wimg
+                            : backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow)
+                : (use_wimg ? backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg
+                            : backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a);
             int ai = 0;
             if (use_wimg) {
                 CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_mem), &q4k_q_img));
@@ -26748,10 +26865,12 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
             CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_uchar), &mask_d6));
             CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_uchar), &mask_d4));
             CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_uchar), &mask_hi2));
-            // Must match the compile-time TILESIZE_N chosen at program build (per-device,
-            // X1E=8 else 32; env override). Same inputs -> same value.
-            int q4k_dp4a_ts = (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X1E) ? 8 : 32;
-            if (const char * e = getenv("GGML_OPENCL_Q4K_DP4A_TS")) q4k_dp4a_ts = atoi(e);
+            // Must match the compile-time TILESIZE_N of the kernel selected above.
+            // Read it back from the context rather than re-deriving it from the env:
+            // the grid and the program have to agree, and duplicating the rule is how
+            // they drift apart.
+            const int q4k_dp4a_ts = use_narrow ? backend_ctx->q4k_dp4a_ts_narrow
+                                               : backend_ctx->q4k_dp4a_ts;
             size_t d_local[3]  = { 64, 1, 1 };
             size_t d_global[3] = { 64, (size_t)(M / 64), (size_t)CEIL_DIV(N, q4k_dp4a_ts) };
             backend_ctx->enqueue_ndrange_kernel(dk, 3, d_global, d_local, dst);
@@ -27242,7 +27361,10 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
             size_t q_global[1] = { (size_t)(((n_blocks + 63) / 64) * 64) };
             backend_ctx->enqueue_ndrange_kernel(qk, 1, q_global, q_local, dst);
 
-            cl_kernel dk = backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a;
+            const bool use_narrow = (backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a_narrow != nullptr)
+                                 && (N <= backend_ctx->q6k_dp4a_narrow_max);
+            cl_kernel dk = use_narrow ? backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a_narrow
+                                      : backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a;
             int ai = 0;
             CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_mem),   &extra0_q6_K->ql));
             CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_mem),   &extra0_q6_K->qh));
@@ -27255,8 +27377,10 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
             CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_int),   &M));
             CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_int),   &N));
             CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_int),   &K));
+            // Must match the compile-time TILESIZE_N of the kernel picked above.
+            const int q6k_ts = use_narrow ? backend_ctx->q6k_dp4a_ts_narrow : 32;
             size_t d_local[3]  = { 64, 1, 1 };
-            size_t d_global[3] = { 64, (size_t)(M / 64), (size_t)CEIL_DIV(N, 32) };
+            size_t d_global[3] = { 64, (size_t)(M / 64), (size_t)CEIL_DIV(N, q6k_ts) };
             backend_ctx->enqueue_ndrange_kernel(dk, 3, d_global, d_local, dst);
 
             CL_CHECK(clReleaseMemObject(b_sub_buf));
@@ -27616,7 +27740,10 @@ static void ggml_cl_mul_mat_q5_K_f32_adreno(ggml_backend_t backend, const ggml_t
             size_t q_global[1] = { (size_t)(((n_blocks + 63) / 64) * 64) };
             backend_ctx->enqueue_ndrange_kernel(qk, 1, q_global, q_local, dst);
 
-            cl_kernel dk = backend_ctx->kernel_gemm_noshuffle_q5_k_q8_1_dp4a;
+            const bool use_narrow = (backend_ctx->kernel_gemm_noshuffle_q5_k_q8_1_dp4a_narrow != nullptr)
+                                 && (Nn <= backend_ctx->q5k_dp4a_narrow_max);
+            cl_kernel dk = use_narrow ? backend_ctx->kernel_gemm_noshuffle_q5_k_q8_1_dp4a_narrow
+                                      : backend_ctx->kernel_gemm_noshuffle_q5_k_q8_1_dp4a;
             int ai = 0;
             CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_mem),   &extra0_q5_k->q));
             CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_mem),   &extra0_q5_k->qh));
@@ -27635,7 +27762,9 @@ static void ggml_cl_mul_mat_q5_K_f32_adreno(ggml_backend_t backend, const ggml_t
             CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_uchar), &mask_d4));
             CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_uchar), &mask_hi2));
             size_t d_local[3]  = { 64, 1, 1 };
-            size_t d_global[3] = { 64, (size_t)(Mm / 64), (size_t)CEIL_DIV(Nn, 32) };
+            // Must match the compile-time TILESIZE_N of the kernel picked above.
+            const int q5k_ts = use_narrow ? backend_ctx->q5k_dp4a_ts_narrow : 32;
+            size_t d_global[3] = { 64, (size_t)(Mm / 64), (size_t)CEIL_DIV(Nn, q5k_ts) };
             backend_ctx->enqueue_ndrange_kernel(dk, 3, d_global, d_local, dst);
 
             CL_CHECK(clReleaseMemObject(b_sub_buf));
