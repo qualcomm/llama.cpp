@@ -5375,6 +5375,44 @@ static bool ggml_hexagon_supported_argsort(const struct ggml_hexagon_session * s
     GGML_UNUSED(sess);
 }
 
+static bool ggml_hexagon_supported_top_k(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op) {
+    const struct ggml_tensor * src0 = op->src[0]; // values
+    const struct ggml_tensor * dst  = op;         // indices
+
+    if (src0->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    if (dst->type != GGML_TYPE_I32) {
+        return false;
+    }
+
+    if (src0->ne[0] > (64*1024)) {
+        return false;
+    }
+
+    // Unlike argsort's flat 16K cap, top_k's 64K cap isn't always VTCM-safe,
+    // so we compute the actual per-thread budget here.
+    const uint32_t total_rows = (uint32_t) (src0->ne[1] * src0->ne[2] * src0->ne[3]);
+    const uint32_t n_threads  = (std::min)(total_rows, sess->n_threads);
+
+    uint32_t n_vec = (uint32_t) ((src0->ne[0] + 31) / 32);
+    uint32_t n_vec_pow2 = 1;
+    while (n_vec_pow2 < n_vec) n_vec_pow2 <<= 1;
+    const uint32_t ne0_padded = n_vec_pow2 * 32;
+
+    const size_t values_size     = hex_round_up(ne0_padded * sizeof(float),   128);
+    const size_t indices_size    = hex_round_up(ne0_padded * sizeof(int32_t), 128);
+    const size_t spad_per_thread = hex_round_up(values_size + indices_size, 256);
+    const size_t total_spad_size = spad_per_thread * n_threads;
+
+    if (total_spad_size > sess->vtcm_size) {
+        return false;
+    }
+
+    return true;
+}
+
 static bool ggml_hexagon_supported_rope(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op) {
     const struct ggml_tensor * src0 = op->src[0];
     const struct ggml_tensor * src1 = op->src[1];
@@ -5682,6 +5720,7 @@ static htp_op_code op_remap_to_htp(const ggml_tensor * t) {
         case GGML_OP_SET_ROWS:        return HTP_OP_SET_ROWS;
         case GGML_OP_SUM_ROWS:        return HTP_OP_SUM_ROWS;
         case GGML_OP_ARGSORT:         return HTP_OP_ARGSORT;
+        case GGML_OP_TOP_K:           return HTP_OP_TOP_K;
         case GGML_OP_NORM:            return HTP_OP_NORM;
         case GGML_OP_L2_NORM:         return HTP_OP_L2_NORM;
         case GGML_OP_RMS_NORM:        return HTP_OP_RMS_NORM;
@@ -6761,6 +6800,10 @@ static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, cons
 
         case GGML_OP_ARGSORT:
             supp = ggml_hexagon_supported_argsort(sess, op);
+            break;
+
+        case GGML_OP_TOP_K:
+            supp = ggml_hexagon_supported_top_k(sess, op);
             break;
 
         case GGML_OP_SSM_CONV:
