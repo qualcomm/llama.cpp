@@ -9122,6 +9122,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP4, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
 
+    // Quantized matmul at a row count that is a multiple of 64, over the small-batch
+    // band. The generic quant loop above uses m=16 for every type, so any backend that
+    // gates a wide-tile kernel on the row count being a multiple of 64 never sees one:
+    // ggml-opencl's dense int8/dp4a GEMMs dispatch on N > 8 && M % 64 == 0 && K % 32 == 0
+    // and are therefore untested for the K-quants, while n in 9..16 is exactly the batch
+    // size a speculative / multi-token-prediction verify runs at. Real weights are shaped
+    // this way (m is a multiple of 64 in every model these paths serve), so the shapes
+    // below are representative rather than synthetic.
+    for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_Q5_0, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL,
+                             GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+        for (int n : {9, 16, 32}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 512, n, 256, {1, 1}, {1, 1}));
+        }
+    }
+
     // m == 1, with n on both sides of MMVF_MAX_BATCH_SIZE (8): mmvf below, operand swap above
     for (int64_t n : {1, 7, 8, 9, 16, 128, 512}) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 1, n, 2048, {1, 1}, {1, 1}));
