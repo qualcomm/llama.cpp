@@ -101,13 +101,21 @@ kernel void kernel_gemm_noshuffle_q4_k_q8_1_dp4a(
     const uint rrow     = row_valid ? row : 0;  // clamp OOB rows; their writes are masked
 
     // Slices are superblock-aligned so the scale/min lookups stay valid inside one.
+    // Spread the remainder so EVERY slice owns at least one superblock. A ceil()
+    // split leaves trailing slices empty, and an empty slice returns without writing
+    // its partial - which the reduce then sums as uninitialised memory. That is
+    // invisible on a freshly allocated (zeroed) buffer and corrupts results once the
+    // pre-allocated buffer is reused. The host clamps ksplit <= nsb, so sb_n >= 1.
     const uint nsb   = ((uint)k + QK_K - 1) / QK_K;
-    const uint sbper = (nsb + (uint)ksplit - 1) / (uint)ksplit;
-    const uint k_lo  = ks * sbper * QK_K;
-    uint       k_hi  = k_lo + sbper * QK_K;
+    const uint base  = nsb / (uint)ksplit;
+    const uint rem   = nsb - base * (uint)ksplit;
+    const uint sb_lo = ks * base + (ks < rem ? ks : rem);
+    const uint sb_n  = base + (ks < rem ? 1u : 0u);
+    const uint k_lo  = sb_lo * QK_K;
+    uint       k_hi  = (sb_lo + sb_n) * QK_K;
     if (k_hi > (uint)k) { k_hi = (uint)k; }
     if (k_lo >= k_hi) {
-        return;   // every WI of this workgroup shares ks, so they all exit together
+        return;   // unreachable while the host clamps ksplit <= nsb; kept as a guard
     }
     dst += (size_t)ks * (size_t)n_no_padding * (size_t)m;
 
@@ -260,13 +268,21 @@ kernel void kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg(
     const uint rrow     = row_valid ? row : 0;  // clamp OOB rows; their writes are masked
 
     // Slices are superblock-aligned so the scale/min lookups stay valid inside one.
+    // Spread the remainder so EVERY slice owns at least one superblock. A ceil()
+    // split leaves trailing slices empty, and an empty slice returns without writing
+    // its partial - which the reduce then sums as uninitialised memory. That is
+    // invisible on a freshly allocated (zeroed) buffer and corrupts results once the
+    // pre-allocated buffer is reused. The host clamps ksplit <= nsb, so sb_n >= 1.
     const uint nsb   = ((uint)k + QK_K - 1) / QK_K;
-    const uint sbper = (nsb + (uint)ksplit - 1) / (uint)ksplit;
-    const uint k_lo  = ks * sbper * QK_K;
-    uint       k_hi  = k_lo + sbper * QK_K;
+    const uint base  = nsb / (uint)ksplit;
+    const uint rem   = nsb - base * (uint)ksplit;
+    const uint sb_lo = ks * base + (ks < rem ? ks : rem);
+    const uint sb_n  = base + (ks < rem ? 1u : 0u);
+    const uint k_lo  = sb_lo * QK_K;
+    uint       k_hi  = (sb_lo + sb_n) * QK_K;
     if (k_hi > (uint)k) { k_hi = (uint)k; }
     if (k_lo >= k_hi) {
-        return;   // every WI of this workgroup shares ks, so they all exit together
+        return;   // unreachable while the host clamps ksplit <= nsb; kept as a guard
     }
     dst += (size_t)ks * (size_t)n_no_padding * (size_t)m;
 
