@@ -27418,6 +27418,23 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
                                  && (N <= backend_ctx->q6k_dp4a_narrow_max);
             cl_kernel dk = use_narrow ? backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a_narrow
                                       : backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a;
+            // Split-K, same rationale as the q4_K dp4a GEMM: one column tile at the
+            // verify widths leaves the grid too small to fill the SP. Separate knob so
+            // the two quants can be measured apart. Narrow band only; default 1 = off.
+            static const char * q6k_ksplit_env = getenv("GGML_OPENCL_Q6K_DP4A_KSPLIT");
+            int ksplit = q6k_ksplit_env ? atoi(q6k_ksplit_env) : 1;
+            if (ksplit < 1) { ksplit = 1; }
+            // Gate on N, not on use_narrow: the q6_K narrow TILE is off by default, so
+            // keying off it would disable the split on exactly the widths it is for.
+            if (N > backend_ctx->q6k_dp4a_narrow_max) { ksplit = 1; }
+            const int nsb_total = CEIL_DIV(K, 256);
+            if (ksplit > nsb_total) { ksplit = nsb_total; }
+            const bool use_ksplit = ksplit > 1;
+            if (use_ksplit) {
+                backend_ctx->prealloc_splitk_partial.allocate(
+                    context, (size_t)ksplit * (size_t)M * (size_t)N * sizeof(cl_float));
+            }
+            const cl_ulong zero_off = 0;
             int ai = 0;
             CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_mem),   &extra0_q6_K->ql));
             CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_mem),   &extra0_q6_K->qh));
@@ -27425,16 +27442,39 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
             CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_mem),   &extra0_q6_K->d));
             CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_mem),   &backend_ctx->prealloc_moe_qa.buffer));
             CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_mem),   &backend_ctx->prealloc_moe_da.buffer));
-            CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_mem),   &extrad->data_device));
-            CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_ulong), &offsetd));
+            if (use_ksplit) {
+                CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_mem),   &backend_ctx->prealloc_splitk_partial.buffer));
+                CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_ulong), &zero_off));
+            } else {
+                CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_mem),   &extrad->data_device));
+                CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_ulong), &offsetd));
+            }
             CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_int),   &M));
             CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_int),   &N));
             CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_int),   &K));
+            CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_int),   &ksplit));
             // Must match the compile-time TILESIZE_N of the kernel picked above.
             const int q6k_ts = use_narrow ? backend_ctx->q6k_dp4a_ts_narrow : 32;
             size_t d_local[3]  = { 64, 1, 1 };
-            size_t d_global[3] = { 64, (size_t)(M / 64), (size_t)CEIL_DIV(N, q6k_ts) };
+            size_t d_global[3] = { 64, (size_t)(M / 64),
+                                   (size_t)CEIL_DIV(N, q6k_ts) * (size_t)ksplit };
             backend_ctx->enqueue_ndrange_kernel(dk, 3, d_global, d_local, dst);
+
+            if (use_ksplit) {
+                // The reduce is quant-agnostic; reuse the one compiled with the q4_K GEMM.
+                cl_kernel rk = backend_ctx->kernel_gemm_q4_k_splitk_reduce_f32;
+                int ri = 0;
+                CL_CHECK(clSetKernelArg(rk, ri++, sizeof(cl_mem),   &backend_ctx->prealloc_splitk_partial.buffer));
+                CL_CHECK(clSetKernelArg(rk, ri++, sizeof(cl_mem),   &extrad->data_device));
+                CL_CHECK(clSetKernelArg(rk, ri++, sizeof(cl_ulong), &offsetd));
+                CL_CHECK(clSetKernelArg(rk, ri++, sizeof(cl_int),   &M));
+                CL_CHECK(clSetKernelArg(rk, ri++, sizeof(cl_int),   &N));
+                CL_CHECK(clSetKernelArg(rk, ri++, sizeof(cl_int),   &ksplit));
+                const size_t rtot  = (size_t)M * (size_t)N;
+                size_t r_local[1]  = { 64 };
+                size_t r_global[1] = { CEIL_DIV(rtot, (size_t)64) * 64 };
+                backend_ctx->enqueue_ndrange_kernel(rk, 1, r_global, r_local, dst);
+            }
 
             CL_CHECK(clReleaseMemObject(b_sub_buf));
             return;
