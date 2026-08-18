@@ -7334,9 +7334,10 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
             if (op->type != GGML_TYPE_F32) {
                 return false;
             }
+            const int K = ggml_get_op_params_i32(op, 0);
             const int d_state = (int) op->src[0]->ne[0];
             const bool is_mamba2 = (op->src[3]->ne[0] == 1);
-            return is_mamba2 && (d_state == 128 || d_state == 256);
+            return is_mamba2 && (d_state == 128 || d_state == 256) && (K == 1);
         }
         case GGML_OP_GATED_DELTA_NET:
             {
