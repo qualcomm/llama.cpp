@@ -7326,13 +7326,14 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
             // Mamba-2 fused per-token scan. Requires src3->ne[0] == 1 (scalar
             // A per head); d_state in {128, 256}; all sources f32. Falls back
             // to CPU otherwise (incl. Mamba-1 element-wise A).
-            // GGML_OPENCL_DISABLE_SSM_SCAN=1 forces CPU fallback for A/B benching.
-            static const bool disabled = getenv("GGML_OPENCL_DISABLE_SSM_SCAN") != nullptr;
-            if (disabled) return false;
             for (int i = 0; i < 6; ++i) {
-                if (op->src[i]->type != GGML_TYPE_F32) return false;
+                if (op->src[i]->type != GGML_TYPE_F32) {
+                    return false;
+                }
             }
-            if (op->type != GGML_TYPE_F32) return false;
+            if (op->type != GGML_TYPE_F32) {
+                return false;
+            }
             const int d_state = (int) op->src[0]->ne[0];
             const bool is_mamba2 = (op->src[3]->ne[0] == 1);
             return is_mamba2 && (d_state == 128 || d_state == 256);
@@ -12342,51 +12343,54 @@ static void ggml_cl_ssm_scan(ggml_backend_t backend, ggml_tensor * dst) {
         : backend_ctx->kernel_ssm_scan_f32_mamba2_d256;
     GGML_ASSERT(kernel != nullptr);
 
-    cl_ulong s0_nb2 = src0->nb[2], s0_nb3 = src0->nb[3];
-    cl_ulong x_nb2  = src1->nb[2], x_nb3  = src1->nb[3];
-    cl_ulong dt_nb1 = src2->nb[1], dt_nb2 = src2->nb[2];
+    cl_ulong s0_nb2 = src0->nb[2];
+    cl_ulong s0_nb3 = src0->nb[3];
+    cl_ulong x_nb2  = src1->nb[2];
+    cl_ulong x_nb3  = src1->nb[3];
+    cl_ulong dt_nb1 = src2->nb[1];
+    cl_ulong dt_nb2 = src2->nb[2];
     cl_ulong A_nb1  = src3->nb[1];
-    cl_ulong B_nb2  = src4->nb[2], B_nb3  = src4->nb[3];
-    cl_ulong C_nb2  = src5->nb[2], C_nb3  = src5->nb[3];
+    cl_ulong B_nb2  = src4->nb[2];
+    cl_ulong B_nb3  = src4->nb[3];
+    cl_ulong C_nb2  = src5->nb[2];
+    cl_ulong C_nb3  = src5->nb[3];
 
-    int i = 0;
-    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_mem),   &e0->data_device));
-    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &o0));
-    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_mem),   &e1->data_device));
-    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &o1));
-    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_mem),   &e2->data_device));
-    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &o2));
-    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_mem),   &e3->data_device));
-    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &o3));
-    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_mem),   &e4->data_device));
-    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &o4));
-    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_mem),   &e5->data_device));
-    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &o5));
-    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_mem),   &e6->data_device));
-    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &o6));
-    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_mem),   &ed->data_device));
-    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &od));
-    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &s0_nb2));
-    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &s0_nb3));
-    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &x_nb2));
-    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &x_nb3));
-    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &dt_nb1));
-    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &dt_nb2));
-    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &A_nb1));
-    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &B_nb2));
-    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &B_nb3));
-    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &C_nb2));
-    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &C_nb3));
-    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &s_off_bytes));
-    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(int),      &head_dim));
-    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(int),      &n_head));
-    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(int),      &n_group));
-    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(int),      &n_tokens));
+    CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &e0->data_device));
+    CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_ulong), &o0));
+    CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),   &e1->data_device));
+    CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_ulong), &o1));
+    CL_CHECK(clSetKernelArg(kernel,  4, sizeof(cl_mem),   &e2->data_device));
+    CL_CHECK(clSetKernelArg(kernel,  5, sizeof(cl_ulong), &o2));
+    CL_CHECK(clSetKernelArg(kernel,  6, sizeof(cl_mem),   &e3->data_device));
+    CL_CHECK(clSetKernelArg(kernel,  7, sizeof(cl_ulong), &o3));
+    CL_CHECK(clSetKernelArg(kernel,  8, sizeof(cl_mem),   &e4->data_device));
+    CL_CHECK(clSetKernelArg(kernel,  9, sizeof(cl_ulong), &o4));
+    CL_CHECK(clSetKernelArg(kernel, 10, sizeof(cl_mem),   &e5->data_device));
+    CL_CHECK(clSetKernelArg(kernel, 11, sizeof(cl_ulong), &o5));
+    CL_CHECK(clSetKernelArg(kernel, 12, sizeof(cl_mem),   &e6->data_device));
+    CL_CHECK(clSetKernelArg(kernel, 13, sizeof(cl_ulong), &o6));
+    CL_CHECK(clSetKernelArg(kernel, 14, sizeof(cl_mem),   &ed->data_device));
+    CL_CHECK(clSetKernelArg(kernel, 15, sizeof(cl_ulong), &od));
+    CL_CHECK(clSetKernelArg(kernel, 16, sizeof(cl_ulong), &s0_nb2));
+    CL_CHECK(clSetKernelArg(kernel, 17, sizeof(cl_ulong), &s0_nb3));
+    CL_CHECK(clSetKernelArg(kernel, 18, sizeof(cl_ulong), &x_nb2));
+    CL_CHECK(clSetKernelArg(kernel, 19, sizeof(cl_ulong), &x_nb3));
+    CL_CHECK(clSetKernelArg(kernel, 20, sizeof(cl_ulong), &dt_nb1));
+    CL_CHECK(clSetKernelArg(kernel, 21, sizeof(cl_ulong), &dt_nb2));
+    CL_CHECK(clSetKernelArg(kernel, 22, sizeof(cl_ulong), &A_nb1));
+    CL_CHECK(clSetKernelArg(kernel, 23, sizeof(cl_ulong), &B_nb2));
+    CL_CHECK(clSetKernelArg(kernel, 24, sizeof(cl_ulong), &B_nb3));
+    CL_CHECK(clSetKernelArg(kernel, 25, sizeof(cl_ulong), &C_nb2));
+    CL_CHECK(clSetKernelArg(kernel, 26, sizeof(cl_ulong), &C_nb3));
+    CL_CHECK(clSetKernelArg(kernel, 27, sizeof(cl_ulong), &s_off_bytes));
+    CL_CHECK(clSetKernelArg(kernel, 28, sizeof(int),      &head_dim));
+    CL_CHECK(clSetKernelArg(kernel, 29, sizeof(int),      &n_head));
+    CL_CHECK(clSetKernelArg(kernel, 30, sizeof(int),      &n_group));
+    CL_CHECK(clSetKernelArg(kernel, 31, sizeof(int),      &n_tokens));
 
-    // 64 threads (= Adreno half wave, REQD_SUBGROUP_SIZE_64) per workgroup.
-    // Each thread holds d_state/64 state elements in private. Grid: (n_head * head_dim, n_seqs).
     size_t global_work_size[] = { (size_t)n_head * head_dim * 64, (size_t)n_seqs, 1 };
     size_t local_work_size[]  = { 64, 1, 1 };
+
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
 }
 

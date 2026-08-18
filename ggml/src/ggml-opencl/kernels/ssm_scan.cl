@@ -1,18 +1,6 @@
-// Mamba2 fused SSM scan kernel. One workgroup per (head, dim, seq); WG size
-// = 64 threads (= half Adreno wave, REQD_SUBGROUP_SIZE_64). Each thread owns
-// c_factor = d_state/64 state elements in private registers; the state stays
-// resident across the n_tokens t-loop, avoiding the ~260 tiny elementwise
-// dispatches per token the operator-level chunked path needs.
-//
-// 128-lane "full" wave behaviors that don't work on Adreno X2 and forced
-// the 64-lane design:
-//   - sub_group_reduce_add at REQD_SUBGROUP_SIZE_128 silently does NOT reduce
-//     across the full 128-lane subgroup.
-//   - sub_group_shuffle_xor with mask >= 32 doesn't cross the internal
-//     32-lane cluster boundary either.
-//   Conclusion: Adreno X2's "full" subgroup is internally two half-waves
-//   that don't broadcast scalars cross-half. Half-subgroup (64 lanes,
-//   REQD_SUBGROUP_SIZE_64) primitives are well-behaved.
+// Mamba2 fused SSM scan kernel. One workgroup per (head, dim, seq); WG size =
+// 64 threads. Each thread owns c_factor = d_state/64 state elements in
+// private registers; the state stays resident across the n_tokens t-loop
 //
 // References:
 //   ggml/src/ggml-cuda/ssm-scan.cu:117 ssm_scan_f32_group
