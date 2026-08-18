@@ -26780,19 +26780,25 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
         // (per-WI private-array spill, dp4a stays ~2x behind the f16 half8 path), so the
         // default is gated to X2E. Opt in/out anywhere with the env override.
         static const char * q4k_dense_dp4a_env = getenv("GGML_OPENCL_Q4K_DENSE_DP4A");
-        // Weight-as-texture dp4a variant (X1 experiment): reads the q4_K weight
-        // plane through an image1d_buffer instead of a plain global buffer, to
-        // recover the texture-cache bandwidth the f16 path uses while keeping the
-        // int8 dp4a ALU win. Opt-in; when set it also forces the dense dp4a path
-        // on (so it can be A/B'd on X1, where dp4a defaults off). See the kernel
-        // header in gemm_noshuffle_q4_k_q8_1_dp4a.cl.
+        // Weight-as-texture dp4a variant: reads the q4_K weight plane through an
+        // image1d_buffer instead of a plain global buffer. The buffer kernel gave up the
+        // texture-cache path the q4_K GEMV already uses -- profiling one muse-glimmer-30B
+        // token put the same weight bytes at 50 GB/s in this GEMM against 106 GB/s in the
+        // GEMV. DEFAULT ON wherever the dense dp4a path defaults on (X2E): muse-glimmer-30B
+        // pp16 +6.6%, pp512 +5.7%, tg128 unchanged (decode does not use this GEMM), output
+        // md5-identical over 4 prompts x 256 tokens. Opt out with =0. Setting it explicitly
+        // also forces the dense dp4a path on, so the pair can be A/B'd on X1 where dp4a
+        // defaults off. See the kernel header in gemm_noshuffle_q4_k_q8_1_dp4a.cl.
         static const char * q4k_dense_wimg_env = getenv("GGML_OPENCL_Q4K_DENSE_DP4A_WIMG");
-        const bool          q4k_dense_wimg_on  = q4k_dense_wimg_env && (atoi(q4k_dense_wimg_env) != 0);
-        const bool          q4k_dense_dp4a_on  = q4k_dense_wimg_on
+        const bool          q4k_dense_wimg_forced = q4k_dense_wimg_env && (atoi(q4k_dense_wimg_env) != 0);
+        const bool          q4k_dense_dp4a_on  = q4k_dense_wimg_forced
             ? true
             : q4k_dense_dp4a_env
             ? (atoi(q4k_dense_dp4a_env) != 0)
             : adreno_dense_dp4a_default_on(backend_ctx);
+        const bool          q4k_dense_wimg_on  = q4k_dense_wimg_env
+            ? (atoi(q4k_dense_wimg_env) != 0)
+            : (q4k_dense_dp4a_on && adreno_dense_dp4a_default_on(backend_ctx));
         // Min N for the dp4a prefill GEMM. Default 9 (ne1>8 = large-batch prefill;
         // ne1<=8 keeps the cok/mc3 small-batch kernels). Lowered via env to A/B the
         // MTP/spec-decode verify regime (ne1=2..8) -- see the q4k_smalln_dp4a path.
