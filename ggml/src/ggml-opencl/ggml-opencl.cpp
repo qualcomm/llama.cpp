@@ -6020,7 +6020,8 @@ static std::string ggml_opencl_fa_compile_opts(ggml_backend_opencl_context * bac
 
     const bool is_split = variant == FA_VARIANT_F32_F16_SPLIT ||
                           variant == FA_VARIANT_Q8_0_SPLIT    ||
-                          variant == FA_VARIANT_Q4_0_SPLIT;
+                          variant == FA_VARIANT_Q4_0_SPLIT    ||
+                          variant == FA_VARIANT_Q8_0_Q4_0_SPLIT;
     if (is_split) {
         opts += " -D N_SPLIT=" + std::to_string(cfg->n_split);
     }
@@ -6509,16 +6510,19 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
 
     const bool is_split = variant == FA_VARIANT_F32_F16_SPLIT ||
                           variant == FA_VARIANT_Q8_0_SPLIT    ||
-                          variant == FA_VARIANT_Q4_0_SPLIT;
+                          variant == FA_VARIANT_Q4_0_SPLIT    ||
+                          variant == FA_VARIANT_Q8_0_Q4_0_SPLIT;
     const bool is_quant = variant == FA_VARIANT_Q8_0 || variant == FA_VARIANT_Q8_0_SPLIT ||
-                          variant == FA_VARIANT_Q4_0 || variant == FA_VARIANT_Q4_0_SPLIT;
+                          variant == FA_VARIANT_Q4_0 || variant == FA_VARIANT_Q4_0_SPLIT ||
+                          variant == FA_VARIANT_Q8_0_Q4_0 || variant == FA_VARIANT_Q8_0_Q4_0_SPLIT;
     if (is_quant && (dk % 32 != 0 || dv % 32 != 0)) {
         return false;
     }
     if (is_split && cfg->n_split <= 1) {
         return false;
     }
-    if ((variant == FA_VARIANT_Q8_0_SPLIT || variant == FA_VARIANT_Q4_0_SPLIT) &&
+    if ((variant == FA_VARIANT_Q8_0_SPLIT || variant == FA_VARIANT_Q4_0_SPLIT ||
+         variant == FA_VARIANT_Q8_0_Q4_0_SPLIT) &&
         ((dk / 32) % cfg->n_split != 0 || (dv / 4) % cfg->n_split != 0)) {
         return false;
     }
@@ -6599,10 +6603,16 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
         case FA_VARIANT_F32_F16_SPLIT:   tag = "fa f32_f16 split";   break;
         case FA_VARIANT_Q8_0_SPLIT:      tag = "fa q8_0 split";      break;
         case FA_VARIANT_Q4_0_SPLIT:      tag = "fa q4_0 split";      break;
+        case FA_VARIANT_Q8_0_Q4_0:       tag = "fa q8_0/q4_0";       break;
+        case FA_VARIANT_Q8_0_Q4_0_SPLIT: tag = "fa q8_0/q4_0 split"; break;
         default: break;
     }
     std::string opts_q8_int;
-    if ((variant == FA_VARIANT_Q8_0 || variant == FA_VARIANT_Q8_0_SPLIT) && !fa_q8_int_qk) {
+    // The asymmetric kernel's K path IS the q8_0 dp4a path (only V differs), so the
+    // int-QK opt-out has to reach it too -- otherwise disabling the dp4a QK dot for
+    // diagnosis silently leaves the asymmetric variant still using it.
+    if ((variant == FA_VARIANT_Q8_0 || variant == FA_VARIANT_Q8_0_SPLIT ||
+         variant == FA_VARIANT_Q8_0_Q4_0 || variant == FA_VARIANT_Q8_0_Q4_0_SPLIT) && !fa_q8_int_qk) {
         opts_q8_int = " -D FA_Q8_INT_QK_OFF";
     }
 
@@ -21425,27 +21435,21 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     // register for this (dk,dv) -- same guard style as the symmetric pairs.
     const bool use_native_q8q4_q1 = is_q8q4 && n_q == 1 &&
                                     backend_ctx->fa.f32_q8_0_q4_0_q1.count(dk_dv) > 0;
-    // Prefill is DECLINED by default: the prefill entry point of this kernel is
-    // both slower AND numerically wrong, measured on X2-90 / gpt-oss-20b MXFP4,
-    // -ctk q8_0 -ctv q4_0, against the dequant-to-F32 fallback it would replace.
+    // Prefill initially measured both slower and numerically wrong (PPL 641.80 vs
+    // 423.60, pp512 -25%/-72%). That was NOT the kernel: FA_VARIANT_Q8_0_Q4_0_SPLIT
+    // was missing from the is_split predicate in ggml_opencl_fa_compile_opts, so the
+    // split program was built with the kernel's default N_SPLIT=1 -- hence
+    // WG_SIZE == BLOCK_M -- while the host launched it at bm * n_split threads. The
+    // surplus threads re-ran the `for (i = tid; i < n; i += WG_SIZE)` tile staging
+    // loops and raced on l_k / l_v, which corrupts the tile and destroys occupancy
+    // at the same time. One omission, both symptoms.
     //
-    //   wikitext-2, c=512, 8 chunks:  PPL 641.80  vs  423.60   <-- DEFECT, +51%
-    //   pp512 @ d0                    356.95 vs 476.08  (-25.0%)
-    //   pp512 @ d4096                 100.11 vs 361.00  (-72.3%)
-    //
-    // The PPL gap is far outside the +/-48 chunk spread, so it is a real error in
-    // the prefill V path (the __local l_v staging), not rounding. The decode entry
-    // point is a different story and is what this kernel was restored for:
-    // tg32 @ d4096 26.06 vs 16.66 (+56.4%) with PPL agreeing with the fallback.
-    //
-    // So decode ships and prefill does not. GGML_OPENCL_FA_Q8Q4_PREFILL=1 exists
-    // to let whoever debugs the staging reproduce it -- it is NOT a performance
-    // opt-in, it currently enables a known-wrong path.
-    static const bool q8q4_prefill_on = []{
+    // GGML_OPENCL_FA_Q8Q4_PREFILL=0 forces the dequant fallback for n_q>1.
+    static const bool q8q4_prefill_off = []{
         const char * e = getenv("GGML_OPENCL_FA_Q8Q4_PREFILL");
-        return e != NULL && e[0] == '1';
+        return e != NULL && e[0] == '0';
     }();
-    const bool use_native_q8q4    = is_q8q4 && n_q > 1 && q8q4_prefill_on &&
+    const bool use_native_q8q4    = is_q8q4 && n_q > 1 && !q8q4_prefill_off &&
                                     backend_ctx->fa.f32_q8_0_q4_0.count(dk_dv) > 0;
     const int block_m = n_q > 1
         ? (is_mixed ? backend_ctx->fa.f32_f16_bm.at(dk_dv) : backend_ctx->fa.bm.at(dk_dv))
