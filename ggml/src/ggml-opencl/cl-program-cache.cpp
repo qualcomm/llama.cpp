@@ -7,6 +7,7 @@
 
 #include "ggml-impl.h"  // GGML_LOG_INFO / WARN
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -276,6 +277,77 @@ bool write_atomic(const std::string & path, const uint8_t * data, size_t len) {
 
 }  // namespace
 
+// Bound the on-disk cache. Nothing ever evicted before this: a machine that has
+// been through a few branches accumulates entries indefinitely (201.6 MB / 2601
+// files over ~3.5 weeks on one dev box, against 180 programs actually needed by
+// a single workload), because every kernel-source or compile-option change mints
+// a new key and the old one is never reclaimed.
+//
+// GGML_OPENCL_KERNEL_CACHE_MAX_MB sets the cap; 0 / "off" / "unlimited" disables
+// pruning entirely. Runs once per process, and only over the flat cache dir.
+//
+// Eviction is oldest-mtime-first. mtime is WRITE time, not access time -- a
+// cache hit does not rewrite the file -- so this is FIFO, not true LRU, and it
+// can evict a still-hot old entry. That is deliberate: the alternative is
+// touching every file on every hit, and the cost of being wrong here is one
+// recompile that immediately re-saves itself. Correctness never depends on it.
+static void cache_prune_once(const std::string & dir) {
+    static bool pruned = false;
+    if (pruned) { return; }
+    pruned = true;
+
+    size_t cap_mb = 512;
+    if (const char * e = std::getenv("GGML_OPENCL_KERNEL_CACHE_MAX_MB")) {
+        if (!std::strcmp(e, "0") || !std::strcmp(e, "off") || !std::strcmp(e, "unlimited")) {
+            return;
+        }
+        if (*e) {
+            const long v = std::strtol(e, nullptr, 10);
+            if (v > 0) { cap_mb = (size_t) v; }
+        }
+    }
+    const uintmax_t cap = (uintmax_t) cap_mb * 1024u * 1024u;
+
+    struct entry { fs::path path; uintmax_t size; fs::file_time_type mtime; };
+    std::vector<entry> files;
+    uintmax_t total = 0;
+
+    std::error_code ec;
+    fs::directory_iterator it(fs::u8path(dir), ec), end;
+    if (ec) { return; }
+    for (; it != end; it.increment(ec)) {
+        if (ec) { return; }
+        // Only our own artifacts. Never touch .tmp.* (an in-flight atomic write
+        // from a concurrent process) or anything else that shares the directory.
+        if (it->path().extension() != ".clbin") { continue; }
+        std::error_code ec_s, ec_t;
+        const uintmax_t sz = fs::file_size(it->path(), ec_s);
+        const auto      tm = fs::last_write_time(it->path(), ec_t);
+        if (ec_s || ec_t) { continue; }
+        files.push_back({ it->path(), sz, tm });
+        total += sz;
+    }
+    if (total <= cap) { return; }
+
+    std::sort(files.begin(), files.end(),
+              [](const entry & a, const entry & b) { return a.mtime < b.mtime; });
+
+    uintmax_t freed = 0;
+    size_t    n     = 0;
+    for (const entry & f : files) {
+        if (total - freed <= cap) { break; }
+        std::error_code ec_rm;
+        // A concurrent process may hold this open; a failed remove is fine --
+        // it just stays until the next run.
+        if (fs::remove(f.path, ec_rm) && !ec_rm) { freed += f.size; ++n; }
+    }
+    if (n > 0) {
+        GGML_LOG_INFO("ggml_opencl: kernel cache pruned %zu file(s), %.1f MB freed "
+                      "(cap %zu MB, set GGML_OPENCL_KERNEL_CACHE_MAX_MB=0 to disable)\n",
+                      n, (double) freed / (1024.0 * 1024.0), cap_mb);
+    }
+}
+
 static bool cache_debug_enabled() {
     static int cached = -1;
     if (cached < 0) {
@@ -336,7 +408,18 @@ cl_program_cache_state cl_program_cache_init(cl_device_id device) {
 
     st.dir        = dir;
     st.key_suffix = compute_key_suffix(device);
-    GGML_LOG_INFO("ggml_opencl: kernel cache enabled at '%s'\n", st.dir.c_str());
+    // Announce once per process, not once per init. There are two call sites
+    // (the global cache and the per-backend one) and a host that creates and
+    // destroys backends re-runs this every time -- test-backend-ops emitted 6369
+    // copies of this line in a single run, interleaved mid-line with the test
+    // output, which makes the results genuinely hard to parse. The debug variant
+    // below is opt-in and stays per-call for whoever is tracing init order.
+    static bool announced = false;
+    if (!announced) {
+        announced = true;
+        GGML_LOG_INFO("ggml_opencl: kernel cache enabled at '%s'\n", st.dir.c_str());
+    }
+    cache_prune_once(st.dir);
     if (cache_debug_enabled()) {
         fprintf(stderr, "ggml_opencl: kernel cache enabled at '%s' "
                         "(GGML_OPENCL_KERNEL_CACHE_DIR=off to disable)\n", st.dir.c_str());
