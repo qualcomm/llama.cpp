@@ -1707,6 +1707,7 @@ struct ggml_backend_opencl_context {
     // ne1=16 and 3.5x at ne1=9. nullptr when no second tile is needed.
     cl_kernel kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow = nullptr;
     cl_kernel kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow_wimg = nullptr;
+    cl_kernel kernel_gemm_q4_k_splitk_reduce_f32 = nullptr;  // sums the split-K partials
     int q4k_dp4a_ts        = 32;  // tile for prefill (ne1 > q4k_dp4a_narrow_max)
     int q4k_dp4a_ts_narrow = 32;  // tile for the verify band; == q4k_dp4a_ts disables the split
     int q4k_dp4a_narrow_max = 16; // widest ne1 routed to the narrow tile
@@ -5190,6 +5191,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), dp4a_opts);
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a = clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_q8_1_dp4a", &err), err));
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg = clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg", &err), err));
+        CL_CHECK((backend_ctx->kernel_gemm_q4_k_splitk_reduce_f32 = clCreateKernel(prog, "kernel_gemm_q4_k_splitk_reduce_f32", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         backend_ctx->q4k_dp4a_ts = q4k_dp4a_ts;
 
@@ -26857,6 +26859,23 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
                             : backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow)
                 : (use_wimg ? backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg
                             : backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a);
+            // Split-K. At the verify widths the grid is one workgroup per 64 rows and a
+            // single column tile; the same kernel reaches ~3x the rate at N=512 purely
+            // because that grid is 32x larger. Slicing K multiplies the workgroup count
+            // without re-reading any weight bytes. Narrow band only - prefill already has
+            // enough column tiles. Opt-in while validating.
+            static const char * q4k_ksplit_env = getenv("GGML_OPENCL_Q4K_DP4A_KSPLIT");
+            int ksplit = q4k_ksplit_env ? atoi(q4k_ksplit_env) : 1;
+            if (ksplit < 1)  { ksplit = 1; }
+            if (!use_narrow) { ksplit = 1; }
+            const int nsb_total = CEIL_DIV(K, 256);
+            if (ksplit > nsb_total) { ksplit = nsb_total; }
+            const bool use_ksplit = ksplit > 1;
+            if (use_ksplit) {
+                backend_ctx->prealloc_splitk_partial.allocate(
+                    context, (size_t)ksplit * (size_t)M * (size_t)N * sizeof(cl_float));
+            }
+            const cl_ulong zero_off = 0;
             int ai = 0;
             if (use_wimg) {
                 CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_mem), &q4k_q_img));
@@ -26869,14 +26888,20 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
             CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_mem),   &backend_ctx->prealloc_moe_qa.buffer));
             CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_mem),   &backend_ctx->prealloc_moe_da.buffer));
             CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_mem),   &backend_ctx->prealloc_moe_sa.buffer));
-            CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_mem),   &extrad->data_device));
-            CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_ulong), &offsetd));
+            if (use_ksplit) {
+                CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_mem),   &backend_ctx->prealloc_splitk_partial.buffer));
+                CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_ulong), &zero_off));
+            } else {
+                CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_mem),   &extrad->data_device));
+                CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_ulong), &offsetd));
+            }
             CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_int),   &M));
             CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_int),   &N));
             CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_int),   &K));
             CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_uchar), &mask_d6));
             CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_uchar), &mask_d4));
             CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_uchar), &mask_hi2));
+            CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_int),   &ksplit));
             // Must match the compile-time TILESIZE_N of the kernel selected above.
             // Read it back from the context rather than re-deriving it from the env:
             // the grid and the program have to agree, and duplicating the rule is how
@@ -26884,8 +26909,24 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
             const int q4k_dp4a_ts = use_narrow ? backend_ctx->q4k_dp4a_ts_narrow
                                                : backend_ctx->q4k_dp4a_ts;
             size_t d_local[3]  = { 64, 1, 1 };
-            size_t d_global[3] = { 64, (size_t)(M / 64), (size_t)CEIL_DIV(N, q4k_dp4a_ts) };
+            size_t d_global[3] = { 64, (size_t)(M / 64),
+                                   (size_t)CEIL_DIV(N, q4k_dp4a_ts) * (size_t)ksplit };
             backend_ctx->enqueue_ndrange_kernel(dk, 3, d_global, d_local, dst);
+
+            if (use_ksplit) {
+                cl_kernel rk = backend_ctx->kernel_gemm_q4_k_splitk_reduce_f32;
+                int ri = 0;
+                CL_CHECK(clSetKernelArg(rk, ri++, sizeof(cl_mem),   &backend_ctx->prealloc_splitk_partial.buffer));
+                CL_CHECK(clSetKernelArg(rk, ri++, sizeof(cl_mem),   &extrad->data_device));
+                CL_CHECK(clSetKernelArg(rk, ri++, sizeof(cl_ulong), &offsetd));
+                CL_CHECK(clSetKernelArg(rk, ri++, sizeof(cl_int),   &M));
+                CL_CHECK(clSetKernelArg(rk, ri++, sizeof(cl_int),   &N));
+                CL_CHECK(clSetKernelArg(rk, ri++, sizeof(cl_int),   &ksplit));
+                const size_t rtot  = (size_t)M * (size_t)N;
+                size_t r_local[1]  = { 64 };
+                size_t r_global[1] = { CEIL_DIV(rtot, (size_t)64) * 64 };
+                backend_ctx->enqueue_ndrange_kernel(rk, 1, r_global, r_local, dst);
+            }
 
             if (q4k_q_img != nullptr) {
                 CL_CHECK(clReleaseMemObject(q4k_q_img));

@@ -80,18 +80,36 @@ kernel void kernel_gemm_noshuffle_q4_k_q8_1_dp4a(
         int    k,                          // K (== ne00)
         uchar  mask_d6,
         uchar  mask_d4,
-        uchar  mask_hi2
+        uchar  mask_hi2,
+        int    ksplit                      // K-slices spread across workgroups; 1 = off
 ) {
     dst = (global float *)((global char *)dst + offsetd);
 
     const uint lid = get_local_id(0);          // 0..63 -> row within the M-tile
     const uint block_id_m = get_global_id(1);
-    const uint block_id_n = get_global_id(2);
+    // dim2 packs (column tile, K-slice). At the verify widths there is exactly one
+    // column tile, so the grid is one workgroup per 64 rows and the SP is starved;
+    // splitting K is the only axis that adds workgroups when M and N are both fixed.
+    const uint n_tiles    = ((uint)n_no_padding + TILESIZE_N - 1) / TILESIZE_N;
+    const uint gid2       = get_global_id(2);
+    const uint block_id_n = (n_tiles > 0) ? (gid2 % n_tiles) : gid2;
+    const uint ks         = (n_tiles > 0) ? (gid2 / n_tiles) : 0u;
 
     const uint row      = block_id_m * 64 + lid;
     const uint col_base = block_id_n * TILESIZE_N;
     const bool row_valid = row < (uint)m;
     const uint rrow     = row_valid ? row : 0;  // clamp OOB rows; their writes are masked
+
+    // Slices are superblock-aligned so the scale/min lookups stay valid inside one.
+    const uint nsb   = ((uint)k + QK_K - 1) / QK_K;
+    const uint sbper = (nsb + (uint)ksplit - 1) / (uint)ksplit;
+    const uint k_lo  = ks * sbper * QK_K;
+    uint       k_hi  = k_lo + sbper * QK_K;
+    if (k_hi > (uint)k) { k_hi = (uint)k; }
+    if (k_lo >= k_hi) {
+        return;   // every WI of this workgroup shares ks, so they all exit together
+    }
+    dst += (size_t)ks * (size_t)n_no_padding * (size_t)m;
 
     const uint k_u = (uint)k >> 2;   // K in uint (int8x4) units
     const uint k_b = (uint)k >> 5;   // blocks-of-32 along K
@@ -112,7 +130,7 @@ kernel void kernel_gemm_noshuffle_q4_k_q8_1_dp4a(
     #pragma unroll
     for (int g = 0; g < NGROUPS; ++g) acc[g] = (float4)(0.0f);
 
-    for (uint step = 0; step < (uint)k; step += 32) {
+    for (uint step = k_lo; step < k_hi; step += 32) {
         const uint sub     = step >> 5;
         const uint sb_idx  = step / QK_K;
         const uint sub_idx = sub & 7;
@@ -221,18 +239,36 @@ kernel void kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg(
         int    k,                          // K (== ne00)
         uchar  mask_d6,
         uchar  mask_d4,
-        uchar  mask_hi2
+        uchar  mask_hi2,
+        int    ksplit                      // K-slices spread across workgroups; 1 = off
 ) {
     dst = (global float *)((global char *)dst + offsetd);
 
     const uint lid = get_local_id(0);          // 0..63 -> row within the M-tile
     const uint block_id_m = get_global_id(1);
-    const uint block_id_n = get_global_id(2);
+    // dim2 packs (column tile, K-slice). At the verify widths there is exactly one
+    // column tile, so the grid is one workgroup per 64 rows and the SP is starved;
+    // splitting K is the only axis that adds workgroups when M and N are both fixed.
+    const uint n_tiles    = ((uint)n_no_padding + TILESIZE_N - 1) / TILESIZE_N;
+    const uint gid2       = get_global_id(2);
+    const uint block_id_n = (n_tiles > 0) ? (gid2 % n_tiles) : gid2;
+    const uint ks         = (n_tiles > 0) ? (gid2 / n_tiles) : 0u;
 
     const uint row      = block_id_m * 64 + lid;
     const uint col_base = block_id_n * TILESIZE_N;
     const bool row_valid = row < (uint)m;
     const uint rrow     = row_valid ? row : 0;  // clamp OOB rows; their writes are masked
+
+    // Slices are superblock-aligned so the scale/min lookups stay valid inside one.
+    const uint nsb   = ((uint)k + QK_K - 1) / QK_K;
+    const uint sbper = (nsb + (uint)ksplit - 1) / (uint)ksplit;
+    const uint k_lo  = ks * sbper * QK_K;
+    uint       k_hi  = k_lo + sbper * QK_K;
+    if (k_hi > (uint)k) { k_hi = (uint)k; }
+    if (k_lo >= k_hi) {
+        return;   // every WI of this workgroup shares ks, so they all exit together
+    }
+    dst += (size_t)ks * (size_t)n_no_padding * (size_t)m;
 
     // Constant per WI: the ushort the row needs always sits in the same half of
     // its uint32 texel (m even => index parity == rrow parity). Hoist the shift.
@@ -250,7 +286,7 @@ kernel void kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg(
     #pragma unroll
     for (int g = 0; g < NGROUPS; ++g) acc[g] = (float4)(0.0f);
 
-    for (uint step = 0; step < (uint)k; step += 32) {
+    for (uint step = k_lo; step < k_hi; step += 32) {
         const uint sub     = step >> 5;
         const uint sb_idx  = step / QK_K;
         const uint sub_idx = sub & 7;
@@ -317,4 +353,27 @@ kernel void kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg(
         if (c0 + 3 < (uint)n_no_padding) dst[(c0 + 3) * (uint)m + row] = a.s3;
     }
 #undef NGROUPS
+}
+
+// Sums the per-K-slice partials written by the split-K dp4a GEMM above.
+// partial is [ksplit][n][m] contiguous; dst is the usual [n][m].
+kernel void kernel_gemm_q4_k_splitk_reduce_f32(
+        __global const float * partial,
+        __global       float * dst,
+        ulong  offsetd,
+        int    m,
+        int    n,
+        int    ksplit
+) {
+    dst = (global float *)((global char *)dst + offsetd);
+    const uint idx = get_global_id(0);
+    const uint tot = (uint)m * (uint)n;
+    if (idx >= tot) {
+        return;
+    }
+    float sum = 0.0f;
+    for (int t = 0; t < ksplit; ++t) {
+        sum += partial[(size_t)t * (size_t)tot + idx];
+    }
+    dst[idx] = sum;
 }
