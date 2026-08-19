@@ -22,7 +22,12 @@
 //
 // Large-batch (prefill) only; ne1<=8 keeps the f16 / bin small-batch path.
 
+// Guarded so a host -DTILESIZE_N=16 for a narrow variant actually takes effect. Without
+// the guard the -D is silently overridden and the "narrow" program compiles at 32, i.e.
+// not narrow at all - that bug was live in the q4_0 kernel until 2026-08-18.
+#ifndef TILESIZE_N
 #define TILESIZE_N 32
+#endif
 
 // 32-K dp4a dot of one token's int8 activations (8 packed uints in LDS) against
 // 8 packed weight uints. q8_0 weights are already dp4a-format signed int8.
