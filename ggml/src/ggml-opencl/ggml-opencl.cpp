@@ -26391,9 +26391,10 @@ static void ggml_cl_mul_mat_q8_0_f32_adreno(ggml_backend_t backend, const ggml_t
         // which at N=8 M=4096 is EIGHT workgroups for the whole GEMM; the
         // cooperative-K kernel keeps the same 4-rows-per-lane tiling and splits K
         // across 8 subgroups instead. Needs M % 256 == 0 (64 lanes x 4 rows).
-        // Opt-in while measured: GGML_OPENCL_Q80_GEMM_COK=1.
+        // DEFAULT ON; opt out with GGML_OPENCL_Q80_GEMM_COK=0.
         static const char * q80_cok_env = getenv("GGML_OPENCL_Q80_GEMM_COK");
-        const bool use_q80_cok = (q80_cok_env != nullptr) && (atoi(q80_cok_env) != 0)
+        static const bool q80_gemm_cok = (q80_cok_env == nullptr) || (atoi(q80_cok_env) != 0);
+        const bool use_q80_cok = q80_gemm_cok
                               && backend_ctx->kernel_gemm_noshuffle_q8_0_f32_cok != nullptr
                               && N <= 8 && (M % 256 == 0);
 
@@ -27253,6 +27254,23 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
         const bool use_cok_r4_sv = use_cok_r4
                                  && (q4k_cok_r4_sv_env != nullptr) && (atoi(q4k_cok_r4_sv_env) != 0)
                                  && backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_sv != nullptr;
+
+        // Which small-batch kernel this shape actually gets. Three A/Bs on this file
+        // have been vacuous because the dispatch never reached the kernel under test,
+        // so any null result here must be able to show it ran.
+        if (getenv("GGML_OPENCL_Q4K_COK_PROBE")) {
+            static int n_q4k_probe = 0;
+            if (n_q4k_probe < 24) {
+                n_q4k_probe++;
+                fprintf(stderr, "[Q4K-COK-PROBE] M=%d N=%d K=%d -> %s (r4_sv_built=%d)\n",
+                        M, N, ne00,
+                        use_cok_r8 ? "cok_r8" : use_cok_r4_sv ? "cok_r4_sv"
+                        : use_cok_r4 ? "cok_r4" : use_cok_wimg ? "cok_wimg"
+                        : use_cok ? "cok" : use_r1 ? "r1" : use_kimg ? "kimg" : "base_gemm",
+                        backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_sv != nullptr);
+                fflush(stderr);
+            }
+        }
 
         kernel = use_cok_r8    ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r8
                : use_cok_r4_sv ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_sv
