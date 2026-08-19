@@ -371,6 +371,186 @@ kernel void kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg(
 #undef NGROUPS
 }
 
+// Activation-as-texture variant of kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg.
+//
+// Same math, same weight path (texture). The ONE change is where the q8_1
+// ACTIVATIONS come from: the buffer kernels stage a TILESIZE_N x 32-K tile into
+// __local and then read it back inside the dot, so the inner loop issues
+// TILESIZE_N*8 = 128 (at TS=16) __local loads per 32-K step against 128 dp4a
+// instructions -- LDS is ~35% of the inner-loop issue slots.
+//
+// Every one of those __local reads is WAVE-UNIFORM: sh_qa[t][u] depends only on
+// loop constants, so all 64 lanes read the same address (only `qw`, the weight,
+// is per-lane). That is exactly the pattern measured on X2-90 in the cok
+// experiment (kernel_gemm_noshuffle_q4_k_f32_cok_lds): staging a wave-uniform
+// read into __local cost -50%, reproduced with a byte-identical LDS footprint,
+// i.e. it was not occupancy. The conclusion there was that a wave-uniform
+// read_image is serviced as a broadcast by the texture pipe + L1 CONCURRENTLY
+// with the ALU, while LDS competes with the ALU issue port. cok therefore reads
+// its activations from an image; every dp4a kernel in the tree still uses LDS.
+//
+// Two wins, not one:
+//   1. the 128 LDS loads/step become texture reads on the free path, and the
+//      staging loop plus both barriers per step disappear;
+//   2. the image is bound CL_RGBA/CL_UNSIGNED_INT32, so ONE read returns a uint4
+//      = the 4 packed int8x4 words a dp4a quartet needs. 8 uints per token per
+//      32-K step = 2 texel reads instead of 8 scalar loads, so the activation
+//      read COUNT also drops 4x (128 -> 32 per step).
+// Alignment for (2) is guaranteed: the host gates K%32==0, so k/4 (uints per
+// token row) is a multiple of 8, and step is a multiple of 32, hence every
+// (c*k/4 + step/4) index is a multiple of 4 and lands on a uint4 texel boundary.
+//
+// Padded token slots are clamped to the last real column rather than branched
+// or zero-filled: their accumulators are computed with the wrong activations and
+// then DISCARDED by the same n_no_padding guard that already masks the stores,
+// so a clamp is cheaper than a select and cannot read out of bounds.
+//
+// It also sidesteps a documented hazard: dp4a with a __local operand inside an
+// unrolled hot loop miscompiles on some X2 drivers (the workaround on record is
+// "keep dp4a operands in private memory"). Here they arrive in registers.
+//
+// Index arithmetic uses mad24; the host gates n*k so the products stay < 2^24.
+inline int dot8_q8a_v(uint8 qw, uint4 a0, uint4 a1) {
+    int r = 0;
+    r = dot_acc_sat_4x8packed_ss_int(qw.s0, a0.x, r);
+    r = dot_acc_sat_4x8packed_ss_int(qw.s1, a0.y, r);
+    r = dot_acc_sat_4x8packed_ss_int(qw.s2, a0.z, r);
+    r = dot_acc_sat_4x8packed_ss_int(qw.s3, a0.w, r);
+    r = dot_acc_sat_4x8packed_ss_int(qw.s4, a1.x, r);
+    r = dot_acc_sat_4x8packed_ss_int(qw.s5, a1.y, r);
+    r = dot_acc_sat_4x8packed_ss_int(qw.s6, a1.z, r);
+    r = dot_acc_sat_4x8packed_ss_int(qw.s7, a1.w, r);
+    return r;
+}
+
+__attribute__((qcom_wave_pair_mode(1)))
+kernel void kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg_aimg(
+        __read_only image1d_buffer_t src0_q_img,  // q4_K weights, CL_R/UINT32 (2 ushorts/texel)
+        __global const uchar  * src0_s,    // 6-bit scale/min codes
+        __global const half   * src0_d,    // per-superblock scale
+        __global const half   * src0_dm,   // per-superblock min
+        __read_only image1d_buffer_t src1_qa_img, // q8_1 activations, CL_RGBA/UINT32 [N, K/16]
+        __global const half   * src1_da,   // q8_1 per-block scale [N, K/32]
+        __global const half   * src1_sa,   // q8_1 per-block sum*d [N, K/32]
+        __global       float  * dst,
+        ulong  offsetd,
+        int    m,                          // output features (rows)
+        int    n_no_padding,               // tokens (cols)
+        int    k,                          // K (== ne00)
+        uchar  mask_d6,
+        uchar  mask_d4,
+        uchar  mask_hi2,
+        int    ksplit                      // K-slices spread across workgroups; 1 = off
+) {
+    dst = (global float *)((global char *)dst + offsetd);
+
+    const uint lid = get_local_id(0);          // 0..63 -> row within the M-tile
+    const uint block_id_m = get_global_id(1);
+    const uint n_tiles    = ((uint)n_no_padding + TILESIZE_N - 1) / TILESIZE_N;
+    const uint gid2       = get_global_id(2);
+    const uint block_id_n = (n_tiles > 0) ? (gid2 % n_tiles) : gid2;
+    const uint ks         = (n_tiles > 0) ? (gid2 / n_tiles) : 0u;
+
+    const uint row      = block_id_m * 64 + lid;
+    const uint col_base = block_id_n * TILESIZE_N;
+    const bool row_valid = row < (uint)m;
+    const uint rrow     = row_valid ? row : 0;  // clamp OOB rows; their writes are masked
+
+    // Superblock-aligned K slices; every slice owns at least one superblock (see
+    // the buffer kernel above for why an empty slice corrupts the reduce).
+    const uint nsb   = ((uint)k + QK_K - 1) / QK_K;
+    const uint base  = nsb / (uint)ksplit;
+    const uint rem   = nsb - base * (uint)ksplit;
+    const uint sb_lo = ks * base + (ks < rem ? ks : rem);
+    const uint sb_n  = base + (ks < rem ? 1u : 0u);
+    const uint k_lo  = sb_lo * QK_K;
+    uint       k_hi  = (sb_lo + sb_n) * QK_K;
+    if (k_hi > (uint)k) { k_hi = (uint)k; }
+    if (k_lo >= k_hi) {
+        return;
+    }
+    dst += (size_t)ks * (size_t)n_no_padding * (size_t)m;
+
+    // Constant per WI: m even => the row's ushort always sits in the same half of
+    // its uint32 weight texel. Hoist the shift.
+    const uint sel = (rrow & 1u) * 16u;
+
+    const uint k_b  = (uint)k >> 5;   // blocks-of-32 along K (da/sa stride)
+    const uint ku4  = (uint)k >> 4;   // uint4 texels per token row = (k/4)/4
+    const uint nm1  = (uint)n_no_padding - 1u;
+
+    // Clamped token index for tile slot T. Loop-invariant in `step`, so the
+    // compiler hoists the min and both multiplies out of the K sweep.
+#define TCOL(T)  min((uint)(col_base + (uint)(T)), nm1)
+#define TDOT(T)  dot8_q8a_v(qw, \
+                     read_imageui(src1_qa_img, (int)(mad24(TCOL(T), ku4, st4))), \
+                     read_imageui(src1_qa_img, (int)(mad24(TCOL(T), ku4, st4) + 1u)))
+#define TDA(T)   ((float)src1_da[mad24(TCOL(T), k_b, sub)])
+#define TSA(T)   ((float)src1_sa[mad24(TCOL(T), k_b, sub)])
+
+#define NGROUPS (TILESIZE_N / 4)
+    float4 acc[NGROUPS];
+    #pragma unroll
+    for (int g = 0; g < NGROUPS; ++g) acc[g] = (float4)(0.0f);
+
+    for (uint step = k_lo; step < k_hi; step += 32) {
+        const uint sub     = step >> 5;
+        const uint sb_idx  = step / QK_K;
+        const uint sub_idx = sub & 7;
+        const uint st4     = step >> 4;   // uint4-texel offset within a token row
+
+        const float dd  = (float)src0_d [rrow + sb_idx * m];
+        const float dmm = (float)src0_dm[rrow + sb_idx * m];
+        global const uchar * sc = src0_s + sb_idx * K_SCALE_SIZE * (uint)m + rrow;
+        uchar sv, mn;
+        get_scale_min_k4(sub_idx, sc, (uint)m, &sv, &mn, mask_d6, mask_d4, mask_hi2);
+        const float scale = dd  * (float)sv;
+        const float minv  = dmm * (float)mn;
+
+        const uint wbase = rrow + (step >> 2) * (uint)m;
+        uint8 qw;
+        qw.s0 = EXP4(read_imageui(src0_q_img, (int)((wbase + 0 * m) >> 1)).x >> sel);
+        qw.s1 = EXP4(read_imageui(src0_q_img, (int)((wbase + 1 * m) >> 1)).x >> sel);
+        qw.s2 = EXP4(read_imageui(src0_q_img, (int)((wbase + 2 * m) >> 1)).x >> sel);
+        qw.s3 = EXP4(read_imageui(src0_q_img, (int)((wbase + 3 * m) >> 1)).x >> sel);
+        qw.s4 = EXP4(read_imageui(src0_q_img, (int)((wbase + 4 * m) >> 1)).x >> sel);
+        qw.s5 = EXP4(read_imageui(src0_q_img, (int)((wbase + 5 * m) >> 1)).x >> sel);
+        qw.s6 = EXP4(read_imageui(src0_q_img, (int)((wbase + 6 * m) >> 1)).x >> sel);
+        qw.s7 = EXP4(read_imageui(src0_q_img, (int)((wbase + 7 * m) >> 1)).x >> sel);
+
+        // No __local, no barriers: the activations come straight from the texture.
+        #pragma unroll
+        for (int g = 0; g < NGROUPS; ++g) {
+            const int b = g * 4;
+            const float4 rf = (float4)((float)TDOT(b+0), (float)TDOT(b+1),
+                                       (float)TDOT(b+2), (float)TDOT(b+3));
+            const float4 ad = (float4)(TDA(b+0), TDA(b+1), TDA(b+2), TDA(b+3));
+            const float4 as = (float4)(TSA(b+0), TSA(b+1), TSA(b+2), TSA(b+3));
+            acc[g] += scale * ad * rf - minv * as;
+        }
+    }
+
+    if (!row_valid) {
+        return;
+    }
+
+    #pragma unroll
+    for (int g = 0; g < NGROUPS; ++g) {
+        const uint b = (uint)(g * 4);
+        const float4 a = acc[g];
+        const uint c0 = col_base + b;
+        if (c0 + 0 < (uint)n_no_padding) dst[(c0 + 0) * (uint)m + row] = a.s0;
+        if (c0 + 1 < (uint)n_no_padding) dst[(c0 + 1) * (uint)m + row] = a.s1;
+        if (c0 + 2 < (uint)n_no_padding) dst[(c0 + 2) * (uint)m + row] = a.s2;
+        if (c0 + 3 < (uint)n_no_padding) dst[(c0 + 3) * (uint)m + row] = a.s3;
+    }
+#undef NGROUPS
+#undef TSA
+#undef TDA
+#undef TDOT
+#undef TCOL
+}
+
 // Sums the per-K-slice partials written by the split-K dp4a GEMM above.
 // partial is [ksplit][n][m] contiguous; dst is the usual [n][m].
 kernel void kernel_gemm_q4_k_splitk_reduce_f32(

@@ -1727,6 +1727,9 @@ struct ggml_backend_opencl_context {
     // ne1=16 and 3.5x at ne1=9. nullptr when no second tile is needed.
     cl_kernel kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow = nullptr;
     cl_kernel kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow_wimg = nullptr;
+    // Activations via texture instead of __local staging (see the kernel header).
+    cl_kernel kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg_aimg = nullptr;
+    cl_kernel kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow_wimg_aimg = nullptr;
     cl_kernel kernel_gemm_q4_k_splitk_reduce_f32 = nullptr;  // sums the split-K partials
     int q4k_dp4a_ts        = 32;  // tile for prefill (ne1 > q4k_dp4a_narrow_max)
     int q4k_dp4a_ts_narrow = 32;  // tile for the verify band; == q4k_dp4a_ts disables the split
@@ -5313,6 +5316,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), dp4a_opts);
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a = clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_q8_1_dp4a", &err), err));
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg = clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg", &err), err));
+        backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg_aimg =
+            clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg_aimg", &err);
+        if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg_aimg = nullptr; }
         CL_CHECK((backend_ctx->kernel_gemm_q4_k_splitk_reduce_f32 = clCreateKernel(prog, "kernel_gemm_q4_k_splitk_reduce_f32", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         backend_ctx->q4k_dp4a_ts = q4k_dp4a_ts;
@@ -5336,6 +5342,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             cl_program nprog = build_program_from_source(backend_ctx, kernel_src.c_str(), narrow_opts);
             CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow = clCreateKernel(nprog, "kernel_gemm_noshuffle_q4_k_q8_1_dp4a", &err), err));
             CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow_wimg = clCreateKernel(nprog, "kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg", &err), err));
+            backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow_wimg_aimg =
+                clCreateKernel(nprog, "kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg_aimg", &err);
+            if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow_wimg_aimg = nullptr; }
             CL_CHECK(clReleaseProgram(nprog));
         }
         GGML_LOG_CONT(".");
@@ -27195,6 +27204,51 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
                             : backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow)
                 : (use_wimg ? backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg
                             : backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a);
+
+            // Activations from a texture instead of __local staging. The dp4a kernels
+            // stage a TILESIZE_N x 32-K q8_1 tile into __local and then read it back
+            // wave-uniformly inside the dot -- 128 __local loads per 32-K step at
+            // TS=16, against 128 dp4a instructions. On X2-90 that is the pattern the
+            // cok_lds experiment measured at -50% (a wave-uniform read_image is a free
+            // broadcast; LDS competes with the ALU issue port). Binding the q8_1 plane
+            // as CL_RGBA/UINT32 also returns a whole dp4a quartet per read, so the
+            // activation read count drops 4x on top. Composes with the weight texture
+            // rather than replacing it. Opt-in while validating:
+            // GGML_OPENCL_Q4K_DP4A_AIMG=1.
+            static const char * q4k_dp4a_aimg_env = getenv("GGML_OPENCL_Q4K_DP4A_AIMG");
+            const bool q4k_dp4a_aimg_on = q4k_dp4a_aimg_env && (atoi(q4k_dp4a_aimg_env) != 0);
+            cl_kernel aimg_k = use_narrow
+                ? backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow_wimg_aimg
+                : backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg_aimg;
+            cl_mem q4k_a_img = nullptr;
+            // The kernel's mad24 index arithmetic needs N*(K/16) to stay under 2^24.
+            bool use_aimg = q4k_dp4a_aimg_on && use_wimg && aimg_k != nullptr
+                         && ((size_t)N * (size_t)(K / 16) < (size_t)(1u << 24));
+            if (use_aimg) {
+                const size_t atex = (size_t)N * (size_t)K / 16;   // RGBA/uint32 texels
+                if (atex == 0 || atex > backend_ctx->image_max_buffer_size) {
+                    use_aimg = false;
+                } else {
+                    img_fmt = { CL_RGBA, CL_UNSIGNED_INT32 };
+                    memset(&img_desc, 0, sizeof(img_desc));
+                    img_desc.image_type  = CL_MEM_OBJECT_IMAGE1D_BUFFER;
+                    img_desc.image_width = atex;
+                    img_desc.buffer      = backend_ctx->prealloc_moe_qa.buffer;
+                    q4k_a_img = clCreateImage(context, CL_MEM_READ_ONLY, &img_fmt, &img_desc, NULL, &err);
+                    if (err != CL_SUCCESS || q4k_a_img == nullptr) {
+                        use_aimg  = false;
+                        q4k_a_img = nullptr;
+                    }
+                }
+            }
+            if (use_aimg) { dk = aimg_k; }
+            // Route probe: an env-gated A/B is worthless if the gate never fires.
+            if (getenv("GGML_OPENCL_Q4K_DP4A_PROBE")) {
+                fprintf(stderr, "[DP4A-PROBE] q4_K M=%d N=%d K=%d -> %s%s%s (aimg_built=%d)\n",
+                        M, N, K, use_narrow ? "narrow" : "wide", use_wimg ? "+wimg" : "",
+                        use_aimg ? "+aimg" : "", aimg_k != nullptr);
+                fflush(stderr);
+            }
             // Split-K. At the verify widths the grid is one workgroup per 64 rows and a
             // single column tile; the same kernel reaches ~3x the rate at N=512 purely
             // because that grid is 32x larger. Slicing K multiplies the workgroup count
@@ -27221,7 +27275,11 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
             CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_mem),   &extra0_q4_k->s));
             CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_mem),   &extra0_q4_k->d));
             CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_mem),   &extra0_q4_k->dm));
-            CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_mem),   &backend_ctx->prealloc_moe_qa.buffer));
+            if (use_aimg) {
+                CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_mem),   &q4k_a_img));
+            } else {
+                CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_mem),   &backend_ctx->prealloc_moe_qa.buffer));
+            }
             CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_mem),   &backend_ctx->prealloc_moe_da.buffer));
             CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_mem),   &backend_ctx->prealloc_moe_sa.buffer));
             if (use_ksplit) {
@@ -27266,6 +27324,9 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
 
             if (q4k_q_img != nullptr) {
                 CL_CHECK(clReleaseMemObject(q4k_q_img));
+            }
+            if (q4k_a_img != nullptr) {
+                CL_CHECK(clReleaseMemObject(q4k_a_img));
             }
             CL_CHECK(clReleaseMemObject(b_sub_buf));
             CL_CHECK(clReleaseMemObject(b_sub_buf_trans));
