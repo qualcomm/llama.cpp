@@ -1732,6 +1732,8 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow_wimg_aimg = nullptr;
     cl_kernel kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg_alds4 = nullptr;
     cl_kernel kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow_wimg_alds4 = nullptr;
+    cl_kernel kernel_gemm_noshuffle_q4_k_q8_1_dp4a_alds4 = nullptr;
+    cl_kernel kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow_alds4 = nullptr;
     cl_kernel kernel_gemm_q4_k_splitk_reduce_f32 = nullptr;  // sums the split-K partials
     int q4k_dp4a_ts        = 32;  // tile for prefill (ne1 > q4k_dp4a_narrow_max)
     int q4k_dp4a_ts_narrow = 32;  // tile for the verify band; == q4k_dp4a_ts disables the split
@@ -5324,6 +5326,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg_alds4 =
             clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg_alds4", &err);
         if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg_alds4 = nullptr; }
+        backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_alds4 =
+            clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_q8_1_dp4a_alds4", &err);
+        if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_alds4 = nullptr; }
         CL_CHECK((backend_ctx->kernel_gemm_q4_k_splitk_reduce_f32 = clCreateKernel(prog, "kernel_gemm_q4_k_splitk_reduce_f32", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         backend_ctx->q4k_dp4a_ts = q4k_dp4a_ts;
@@ -5353,6 +5358,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow_wimg_alds4 =
                 clCreateKernel(nprog, "kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg_alds4", &err);
             if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow_wimg_alds4 = nullptr; }
+            backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow_alds4 =
+                clCreateKernel(nprog, "kernel_gemm_noshuffle_q4_k_q8_1_dp4a_alds4", &err);
+            if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow_alds4 = nullptr; }
             CL_CHECK(clReleaseProgram(nprog));
         }
         // Same question the cok family needed answered: does a variant spill? A
@@ -5369,6 +5377,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                 { "q4K_nrw_wimg   ", backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow_wimg },
                 { "q4K_nrw_aimg   ", backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow_wimg_aimg },
                 { "q4K_nrw_alds4  ", backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow_wimg_alds4 },
+                { "q4K_alds4_buf  ", backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_alds4 },
+                { "q4K_nrw_alds4b ", backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow_alds4 },
             };
             for (size_t pi = 0; pi < sizeof(dprobes)/sizeof(dprobes[0]); pi++) {
                 if (dprobes[pi].k == nullptr) {
@@ -27279,16 +27289,29 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
                 }
             }
             if (use_aimg) { dk = aimg_k; }
-            // Cheaper half of the same hypothesis: keep the activations in __local
-            // but read them as uint4, cutting the inner-loop __local load count 4x
-            // without changing the address space. Mutually exclusive with aimg so
-            // the two stay separable. GGML_OPENCL_Q4K_DP4A_ALDS4=1.
+            // The staging tile read four uints at a time instead of one. The eight
+            // uints a token needs for a 32-K step are contiguous, so the scalar
+            // reads were never required; declaring the tile uint4 cuts the
+            // inner-loop local-memory load count 4x and widens the cooperative
+            // staging load from 4 to 16 bytes per lane. Identical resources
+            // (private 336 B, local 576 B, workgroup cap 384 - unchanged) and
+            // byte-identical output. muse-glimmer-30B Q4_K_M on Adreno X2-90,
+            // bracketed with controls agreeing to 0.4%:
+            //     pp9   35.4 -> 37.9  (+7.1%)
+            //     pp16  60.7 -> 65.1  (+7.4%)
+            //     pp512 96.8 -> 111.4 (+15.2%, weight texture on both arms)
+            // The wide band gains more because its tile is 32 columns, i.e. 256
+            // scalar local loads per step rather than 128.
+            // DEFAULT ON; opt out with GGML_OPENCL_Q4K_DP4A_ALDS4=0.
             static const char * q4k_dp4a_alds4_env = getenv("GGML_OPENCL_Q4K_DP4A_ALDS4");
-            cl_kernel alds4_k = use_narrow
-                ? backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow_wimg_alds4
-                : backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg_alds4;
-            const bool use_alds4 = q4k_dp4a_alds4_env && (atoi(q4k_dp4a_alds4_env) != 0)
-                                && use_wimg && !use_aimg && alds4_k != nullptr;
+            const bool q4k_dp4a_alds4_on = (q4k_dp4a_alds4_env == nullptr)
+                                        || (atoi(q4k_dp4a_alds4_env) != 0);
+            cl_kernel alds4_k = use_wimg
+                ? (use_narrow ? backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow_wimg_alds4
+                              : backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg_alds4)
+                : (use_narrow ? backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow_alds4
+                              : backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_alds4);
+            const bool use_alds4 = q4k_dp4a_alds4_on && !use_aimg && alds4_k != nullptr;
             if (use_alds4) { dk = alds4_k; }
             // Route probe: an env-gated A/B is worthless if the gate never fires.
             if (getenv("GGML_OPENCL_Q4K_DP4A_PROBE")) {

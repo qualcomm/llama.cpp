@@ -708,6 +708,139 @@ kernel void kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg_alds4(
 #undef NGROUPS
 }
 
+// Buffer-weight twin of _wimg_alds4: the uint4 staging change is independent of
+// how the weights are read, and the weight-texture gate is a narrow-band default,
+// so the plain-buffer path needs the same kernel to get the same win.
+__attribute__((qcom_wave_pair_mode(1)))
+kernel void kernel_gemm_noshuffle_q4_k_q8_1_dp4a_alds4(
+        __global const ushort * src0_q,    // q4_K weights (noshuffle, packed nibbles)
+        __global const uchar  * src0_s,
+        __global const half   * src0_d,
+        __global const half   * src0_dm,
+        __global const uint   * src1_qa,   // q8_1 activations int8 (as uint, 4/elem) [N, K]
+        __global const half   * src1_da,
+        __global const half   * src1_sa,
+        __global       float  * dst,
+        ulong  offsetd,
+        int    m,
+        int    n_no_padding,
+        int    k,
+        uchar  mask_d6,
+        uchar  mask_d4,
+        uchar  mask_hi2,
+        int    ksplit
+) {
+    dst = (global float *)((global char *)dst + offsetd);
+
+    const uint lid = get_local_id(0);
+    const uint block_id_m = get_global_id(1);
+    const uint n_tiles    = ((uint)n_no_padding + TILESIZE_N - 1) / TILESIZE_N;
+    const uint gid2       = get_global_id(2);
+    const uint block_id_n = (n_tiles > 0) ? (gid2 % n_tiles) : gid2;
+    const uint ks         = (n_tiles > 0) ? (gid2 / n_tiles) : 0u;
+
+    const uint row      = block_id_m * 64 + lid;
+    const uint col_base = block_id_n * TILESIZE_N;
+    const bool row_valid = row < (uint)m;
+    const uint rrow     = row_valid ? row : 0;
+
+    const uint nsb   = ((uint)k + QK_K - 1) / QK_K;
+    const uint base  = nsb / (uint)ksplit;
+    const uint rem   = nsb - base * (uint)ksplit;
+    const uint sb_lo = ks * base + (ks < rem ? ks : rem);
+    const uint sb_n  = base + (ks < rem ? 1u : 0u);
+    const uint k_lo  = sb_lo * QK_K;
+    uint       k_hi  = (sb_lo + sb_n) * QK_K;
+    if (k_hi > (uint)k) { k_hi = (uint)k; }
+    if (k_lo >= k_hi) {
+        return;
+    }
+    dst += (size_t)ks * (size_t)n_no_padding * (size_t)m;
+
+    const uint k_u = (uint)k >> 2;
+    const uint k_b = (uint)k >> 5;
+
+    __local uint4 sh_qa4[TILESIZE_N][2];
+    __local half  sh_d[TILESIZE_N];
+    __local half  sh_s[TILESIZE_N];
+
+#define NGROUPS (TILESIZE_N / 4)
+    float4 acc[NGROUPS];
+    #pragma unroll
+    for (int g = 0; g < NGROUPS; ++g) acc[g] = (float4)(0.0f);
+
+    for (uint step = k_lo; step < k_hi; step += 32) {
+        const uint sub     = step >> 5;
+        const uint sb_idx  = step / QK_K;
+        const uint sub_idx = sub & 7;
+
+        const float dd  = (float)src0_d [rrow + sb_idx * m];
+        const float dmm = (float)src0_dm[rrow + sb_idx * m];
+        global const uchar * sc = src0_s + sb_idx * K_SCALE_SIZE * (uint)m + rrow;
+        uchar sv, mn;
+        get_scale_min_k4(sub_idx, sc, (uint)m, &sv, &mn, mask_d6, mask_d4, mask_hi2);
+        const float scale = dd  * (float)sv;
+        const float minv  = dmm * (float)mn;
+
+        const uint wbase = rrow + (step >> 2) * (uint)m;
+        uint8 qw;
+        qw.s0 = EXP4(src0_q[wbase + 0 * m]);
+        qw.s1 = EXP4(src0_q[wbase + 1 * m]);
+        qw.s2 = EXP4(src0_q[wbase + 2 * m]);
+        qw.s3 = EXP4(src0_q[wbase + 3 * m]);
+        qw.s4 = EXP4(src0_q[wbase + 4 * m]);
+        qw.s5 = EXP4(src0_q[wbase + 5 * m]);
+        qw.s6 = EXP4(src0_q[wbase + 6 * m]);
+        qw.s7 = EXP4(src0_q[wbase + 7 * m]);
+
+        // 16-byte cooperative staging: TILESIZE_N*2 uint4s instead of TILESIZE_N*8
+        // uints. (c*k_u + step/4) is a multiple of 8, so vload4 is aligned.
+        for (uint idx = lid; idx < TILESIZE_N * 2; idx += 64) {
+            const uint t = idx >> 1;
+            const uint v = idx & 1;
+            const uint c = col_base + t;
+            sh_qa4[t][v] = (c < (uint)n_no_padding)
+                         ? vload4(0, src1_qa + c * k_u + (step >> 2) + (v << 2))
+                         : (uint4)(0u);
+        }
+        if (lid < TILESIZE_N) {
+            const uint c = col_base + lid;
+            sh_d[lid] = (c < (uint)n_no_padding) ? src1_da[c * k_b + sub] : (half)0;
+            sh_s[lid] = (c < (uint)n_no_padding) ? src1_sa[c * k_b + sub] : (half)0;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+#define LD4(arr, b) ((float4)((float)arr[(b)+0], (float)arr[(b)+1], (float)arr[(b)+2], (float)arr[(b)+3]))
+#define TDOT4(T) dot8_q8a_v(qw, (uint4)(sh_qa4[T][0]), (uint4)(sh_qa4[T][1]))
+        #pragma unroll
+        for (int g = 0; g < NGROUPS; ++g) {
+            const int b = g * 4;
+            const float4 rf = (float4)((float)TDOT4(b+0), (float)TDOT4(b+1),
+                                       (float)TDOT4(b+2), (float)TDOT4(b+3));
+            acc[g] += scale * LD4(sh_d, b) * rf - minv * LD4(sh_s, b);
+        }
+#undef TDOT4
+#undef LD4
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    if (!row_valid) {
+        return;
+    }
+
+    #pragma unroll
+    for (int g = 0; g < NGROUPS; ++g) {
+        const uint b = (uint)(g * 4);
+        const float4 a = acc[g];
+        const uint c0 = col_base + b;
+        if (c0 + 0 < (uint)n_no_padding) dst[(c0 + 0) * (uint)m + row] = a.s0;
+        if (c0 + 1 < (uint)n_no_padding) dst[(c0 + 1) * (uint)m + row] = a.s1;
+        if (c0 + 2 < (uint)n_no_padding) dst[(c0 + 2) * (uint)m + row] = a.s2;
+        if (c0 + 3 < (uint)n_no_padding) dst[(c0 + 3) * (uint)m + row] = a.s3;
+    }
+#undef NGROUPS
+}
+
 // Sums the per-K-slice partials written by the split-K dp4a GEMM above.
 // partial is [ksplit][n][m] contiguous; dst is the usual [n][m].
 kernel void kernel_gemm_q4_k_splitk_reduce_f32(
