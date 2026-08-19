@@ -27326,10 +27326,22 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
         // 8 rows per lane reaches the GEMV's 16 B load and adds only +0.08% over this,
         // so 4 is the sweet spot; the win saturates at 8 bytes per lane.
         static const char * q4k_cok_r4_env = getenv("GGML_OPENCL_Q4K_GEMM_COK_R4");
+        // 4 rows per lane divides the WORKGROUP COUNT by 4, and that is not free on
+        // narrow output tensors. The launch is ne01/4 work-items over 64-lane subgroups,
+        // so workgroups = ne01/256 -- against 16 compute units on X2-90:
+        //     ne01 19968 (ffn_gate/up) -> 78 WGs, 4.88 per CU   r4 is clearly right
+        //     ne01  6656 (attn_q/o)    -> 26 WGs, 1.62 per CU
+        //     ne01  1024 (attn_k/v)    ->  4 WGs, 0.25 per CU   three CUs in four idle
+        // The 1-row kernel launches 4x as many. GGML_OPENCL_Q4K_COK_R4_MINWG sets the
+        // workgroup count below which r4 gives way to it, so the row count can follow the
+        // shape instead of being one constant for every tensor. 0 = always r4.
+        static const char * q4k_r4_minwg_env = getenv("GGML_OPENCL_Q4K_COK_R4_MINWG");
+        static const int q4k_r4_minwg = q4k_r4_minwg_env ? atoi(q4k_r4_minwg_env) : 0;
         const bool use_cok_r4 = use_cok && !use_cok_wimg
                              && ((q4k_cok_r4_env == nullptr) || (atoi(q4k_cok_r4_env) != 0))
                              && backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4 != nullptr
-                             && (M % 4 == 0);
+                             && (M % 4 == 0)
+                             && ((M / 256) >= q4k_r4_minwg);
 
         // 8 rows per lane: the load reaches 16 B, matching the GEMV. Takes precedence
         // over r4 when both are set, so the two stay separately measurable.
@@ -28013,10 +28025,15 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
         // DEFAULT ON; opt out with GGML_OPENCL_Q6K_GEMM_COK_R4=0. Worth +5.9% on its
         // own at muse pp8 and composes with the q4_K r4 for +43.8% together.
         static const char * q6k_cok_r4_env = getenv("GGML_OPENCL_Q6K_GEMM_COK_R4");
+        // Same workgroup-count trade as the q4_K twin: r4 divides the launch by 4, and
+        // ne01/256 workgroups against 16 CUs is thin for narrow outputs.
+        static const char * q6k_r4_minwg_env = getenv("GGML_OPENCL_Q6K_COK_R4_MINWG");
+        static const int q6k_r4_minwg = q6k_r4_minwg_env ? atoi(q6k_r4_minwg_env) : 0;
         const bool use_q6k_cok_r4 = use_q6k_cok
                                  && ((q6k_cok_r4_env == nullptr) || (atoi(q6k_cok_r4_env) != 0))
                                  && backend_ctx->kernel_gemm_noshuffle_q6_K_f32_cok_r4 != nullptr
-                                 && (ne01 % 4 == 0);
+                                 && (ne01 % 4 == 0)
+                                 && ((ne01 / 256) >= q6k_r4_minwg);
         kernel = use_q6k_cok_r4 ? backend_ctx->kernel_gemm_noshuffle_q6_K_f32_cok_r4
                : use_q6k_cok    ? backend_ctx->kernel_gemm_noshuffle_q6_K_f32_cok
                                 : backend_ctx->kernel_gemm_noshuffle_q6_K_f32;
