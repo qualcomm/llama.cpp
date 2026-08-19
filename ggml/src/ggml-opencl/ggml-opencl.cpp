@@ -1740,6 +1740,7 @@ struct ggml_backend_opencl_context {
     int       q4k_cok_nsg = 8;   // K-split width the q4_K cok kernels were built with
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg = nullptr;
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr = nullptr;
+    cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r2_wimg_nr = nullptr;
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r4_nr = nullptr;
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r4_nrh = nullptr;
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r8   = nullptr;
@@ -5224,6 +5225,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr =
             clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr", &err);
         if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr = nullptr; }
+        backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r2_wimg_nr =
+            clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_f32_cok_r2_wimg_nr", &err);
+        if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r2_wimg_nr = nullptr; }
         // Named-register variants (no private float8 out[4]).
         backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_nr =
             clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_f32_cok_r4_nr", &err);
@@ -5255,6 +5259,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                 { "q4K_cok_r4_ma", backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_ma },
                 { "q4K_cok_r4wim", backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg },
                 { "q4K_r4wimg_nr", backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr },
+                { "q4K_r2wimg_nr", backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r2_wimg_nr },
                 { "q4K_cok_r4_nr", backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_nr },
                 { "q4K_cok_r4nrh", backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_nrh },
                 { "q4K_cok_r8   ", backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r8 },
@@ -27405,25 +27410,16 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
                                  && (q4k_cok_r4_ma_env != nullptr) && (atoi(q4k_cok_r4_ma_env) != 0)
                                  && backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_ma != nullptr;
 
-        // Which small-batch kernel this shape actually gets. Three A/Bs on this file
-        // have been vacuous because the dispatch never reached the kernel under test,
-        // so any null result here must be able to show it ran.
-        if (getenv("GGML_OPENCL_Q4K_COK_PROBE")) {
-            static int n_q4k_probe = 0;
-            if (n_q4k_probe < 24) {
-                n_q4k_probe++;
-                fprintf(stderr, "[Q4K-COK-PROBE] M=%d N=%d K=%d -> %s (r4_sv_built=%d)\n",
-                        M, N, ne00,
-                        use_cok_r8 ? "cok_r8" : use_cok_r4_wimg ? "cok_r4_wimg"
-                        : use_cok_r4_nrh ? "cok_r4_nrh"
-                        : use_cok_r4_nr ? "cok_r4_nr" : use_cok_r4_sv ? "cok_r4_sv"
-                        : use_cok_r4_ma ? "cok_r4_ma"
-                        : use_cok_r4 ? "cok_r4" : use_cok_wimg ? "cok_wimg"
-                        : use_cok ? "cok" : use_r1 ? "r1" : use_kimg ? "kimg" : "base_gemm",
-                        backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_sv != nullptr);
-                fflush(stderr);
-            }
-        }
+        // Two rows per lane for outputs too narrow to fill the GPU at four. Workgroups
+        // are ne01/(rows*64) against 16 CUs, and a profile of the verify pass shows 44%
+        // of cooperative-K time at under two workgroups per CU (ne01 6656 -> 1.62,
+        // ne01 4096 -> 1.00). GGML_OPENCL_Q4K_COK_R2_MAXWG selects r2 when the 4-row
+        // launch would produce fewer than that many workgroups. 0 = never.
+        static const char * q4k_r2_maxwg_env = getenv("GGML_OPENCL_Q4K_COK_R2_MAXWG");
+        static const int q4k_r2_maxwg = q4k_r2_maxwg_env ? atoi(q4k_r2_maxwg_env) : 0;
+        const bool use_r2_wimg_nr = use_cok_r4_wimg && (M % 2 == 0)
+                                  && ((M / 256) < q4k_r2_maxwg)
+                                  && backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r2_wimg_nr != nullptr;
 
         // Texture + named registers, both measured wins in one kernel.
         // DEFAULT ON; opt out with GGML_OPENCL_Q4K_GEMM_COK_R4_WIMG_NR=0. muse-glimmer-30B
@@ -27435,7 +27431,29 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
                                   && ((q4k_r4_wimg_nr_env == nullptr) || (atoi(q4k_r4_wimg_nr_env) != 0))
                                   && backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr != nullptr;
 
+        // Which small-batch kernel this shape actually gets. Three A/Bs on this file
+        // have been vacuous because the dispatch never reached the kernel under test,
+        // so any null result here must be able to show it ran.
+        if (getenv("GGML_OPENCL_Q4K_COK_PROBE")) {
+            static int n_q4k_probe = 0;
+            if (n_q4k_probe < 24) {
+                n_q4k_probe++;
+                fprintf(stderr, "[Q4K-COK-PROBE] M=%d N=%d K=%d -> %s (r4_sv_built=%d)\n",
+                        M, N, ne00,
+                        use_cok_r8 ? "cok_r8" : use_r2_wimg_nr ? "cok_r2_wimg_nr"
+                        : use_cok_r4_wimg ? "cok_r4_wimg"
+                        : use_cok_r4_nrh ? "cok_r4_nrh"
+                        : use_cok_r4_nr ? "cok_r4_nr" : use_cok_r4_sv ? "cok_r4_sv"
+                        : use_cok_r4_ma ? "cok_r4_ma"
+                        : use_cok_r4 ? "cok_r4" : use_cok_wimg ? "cok_wimg"
+                        : use_cok ? "cok" : use_r1 ? "r1" : use_kimg ? "kimg" : "base_gemm",
+                        backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_sv != nullptr);
+                fflush(stderr);
+            }
+        }
+
         kernel = use_cok_r8    ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r8
+               : use_r2_wimg_nr ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r2_wimg_nr
                : use_r4_wimg_nr ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr
                : use_cok_r4_wimg ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg
                : use_cok_r4_nrh ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_nrh
@@ -27476,6 +27494,7 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
             // across the COK_NSG subgroups. ne01 is a multiple of 64.
             // The r4 variant gives each lane 4 rows, so the row axis shrinks 4x.
             global_work_size[0] = use_cok_r8 ? (size_t)(ne01 / 8)
+                                : use_r2_wimg_nr ? (size_t)(ne01 / 2)
                                 : (use_cok_r4 || use_cok_r4_wimg) ? (size_t)(ne01 / 4)
                                              : (size_t)ne01;
             global_work_size[1] = (size_t)backend_ctx->q4k_cok_nsg;   // COK_NSG
