@@ -5215,12 +5215,33 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         // private memory per work-item is what sets occupancy. Print the current
         // footprint so that trade is decided on a number rather than an assumption.
         if (getenv("GGML_OPENCL_MC3_PROBE")) {
-            cl_ulong pmc = 0; size_t wgc = 0, multc = 0;
-            clGetKernelWorkGroupInfo(backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok, backend_ctx->device, CL_KERNEL_PRIVATE_MEM_SIZE, sizeof(pmc), &pmc, NULL);
-            clGetKernelWorkGroupInfo(backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok, backend_ctx->device, CL_KERNEL_WORK_GROUP_SIZE, sizeof(wgc), &wgc, NULL);
-            clGetKernelWorkGroupInfo(backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok, backend_ctx->device, CL_KERNEL_PREFERRED_WORK_GROUP_SIZE_MULTIPLE, sizeof(multc), &multc, NULL);
-            fprintf(stderr, "[COK-PROBE] q4K_cok private=%llu wg_cap=%zu pref_mult=%zu\n",
-                          (unsigned long long)pmc, wgc, multc);
+            // Whether these kernels SPILL is the load-bearing question for the whole
+            // family: three separate optimisations have now been beaten by register
+            // pressure, every time inferred from timings rather than measured.
+            // CL_KERNEL_PRIVATE_MEM_SIZE is the driver's own answer. The flat GEMV is
+            // the reference point -- it moves the same bytes at 117 GB/s where these
+            // manage 88.
+            struct { const char * name; cl_kernel k; } probes[] = {
+                { "q4K_gemv_flat", backend_ctx->kernel_mul_mv_q4_K_f32_flat },
+                { "q4K_cok_1row ", backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok },
+                { "q4K_cok_r4   ", backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4 },
+                { "q4K_cok_r4_sv", backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_sv },
+                { "q4K_cok_r4_ma", backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_ma },
+                { "q4K_cok_r8   ", backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r8 },
+            };
+            for (size_t pi = 0; pi < sizeof(probes)/sizeof(probes[0]); pi++) {
+                if (probes[pi].k == nullptr) {
+                    fprintf(stderr, "[COK-PROBE] %s  (not built)\n", probes[pi].name);
+                    continue;
+                }
+                cl_ulong pmc = 0, lmc = 0; size_t wgc = 0, multc = 0;
+                clGetKernelWorkGroupInfo(probes[pi].k, backend_ctx->device, CL_KERNEL_PRIVATE_MEM_SIZE, sizeof(pmc), &pmc, NULL);
+                clGetKernelWorkGroupInfo(probes[pi].k, backend_ctx->device, CL_KERNEL_LOCAL_MEM_SIZE, sizeof(lmc), &lmc, NULL);
+                clGetKernelWorkGroupInfo(probes[pi].k, backend_ctx->device, CL_KERNEL_WORK_GROUP_SIZE, sizeof(wgc), &wgc, NULL);
+                clGetKernelWorkGroupInfo(probes[pi].k, backend_ctx->device, CL_KERNEL_PREFERRED_WORK_GROUP_SIZE_MULTIPLE, sizeof(multc), &multc, NULL);
+                fprintf(stderr, "[COK-PROBE] %s private=%5llu local=%6llu wg_cap=%4zu pref_mult=%zu\n",
+                              probes[pi].name, (unsigned long long)pmc, (unsigned long long)lmc, wgc, multc);
+            }
             fflush(stderr);
         }
         CL_CHECK(clReleaseProgram(prog));
