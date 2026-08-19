@@ -1734,6 +1734,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok;
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_wimg = nullptr;
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r4   = nullptr;
+    cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r4_sv = nullptr;
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r8   = nullptr;
     cl_kernel kernel_gemv_noshuffle_q6_K_f32;
     cl_kernel kernel_gemv_noshuffle_q6_K_f32_o4;
@@ -5190,6 +5191,10 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4 =
             clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_f32_cok_r4", &err);
         if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4 = nullptr; }
+        // 4-rows-per-lane cok with vectorised scale reads. Non-fatal; falls back to r4.
+        backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_sv =
+            clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_f32_cok_r4_sv", &err);
+        if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_sv = nullptr; }
         // 8-rows-per-lane cok. Also non-fatal; the r4/1-row kernels remain.
         backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r8 =
             clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_f32_cok_r8", &err);
@@ -27231,7 +27236,17 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
                              && backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r8 != nullptr
                              && (M % 8 == 0);
 
-        kernel = use_cok_r8   ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r8
+        // Same kernel with the scale codes read as uchar4 instead of byte by byte:
+        // after r4 the weights, d and dm are all vector loads, so the four rows' scale
+        // codes were the last narrow read in the inner loop (8-12 single-byte loads per
+        // 32-K step). Opt-in while measured: GGML_OPENCL_Q4K_GEMM_COK_R4_SV=1.
+        static const char * q4k_cok_r4_sv_env = getenv("GGML_OPENCL_Q4K_GEMM_COK_R4_SV");
+        const bool use_cok_r4_sv = use_cok_r4
+                                 && (q4k_cok_r4_sv_env != nullptr) && (atoi(q4k_cok_r4_sv_env) != 0)
+                                 && backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_sv != nullptr;
+
+        kernel = use_cok_r8    ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r8
+               : use_cok_r4_sv ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_sv
                : use_cok_r4   ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4
                : use_cok_wimg ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_wimg
                : use_cok  ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok

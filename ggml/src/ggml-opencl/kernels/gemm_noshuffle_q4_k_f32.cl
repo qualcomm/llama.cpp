@@ -29,6 +29,32 @@ inline void get_scale_min_k4(
     }
 }
 
+// Four-row form of the above, for the kernels that give each lane 4 adjacent rows.
+// Codes of ONE row are `stride` apart, but the four rows' copies of a given code are
+// four ADJACENT bytes, so what the scalar version issues as 8-12 single-byte loads is
+// 2-3 uchar4 loads here. Same arithmetic, same result; only the issue count changes.
+inline void get_scale_min_k4_v4(
+    int j,
+    global const uchar * q,
+    int stride,
+    uchar4 * d,
+    uchar4 * m,
+    uchar mask_d6,
+    uchar mask_d4,
+    uchar mask_hi2
+) {
+    if (j < 4) {
+        *d = vload4(0, q + j*stride)     & (uchar4)mask_d6;
+        *m = vload4(0, q + (j+4)*stride) & (uchar4)mask_d6;
+    } else {
+        uchar4 hi = vload4(0, q + (j+4)*stride);
+        uchar4 lo = vload4(0, q + (j-4)*stride);
+        uchar4 cu = vload4(0, q + j*stride);
+        *d = (hi & (uchar4)mask_d4) | ((lo & (uchar4)mask_hi2) >> (uchar4)2);
+        *m = ((hi >> (uchar4)4) & (uchar4)mask_d4) | ((cu & (uchar4)mask_hi2) >> (uchar4)2);
+    }
+}
+
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_128
 #endif
@@ -739,6 +765,122 @@ kernel void kernel_gemm_noshuffle_q4_k_f32_cok_r4(
 
     if (sg == 0) {
         // dst is [token, feature]: four adjacent rows are contiguous, one vstore4.
+        int idx = row0;
+        if (idx < m*n_no_padding) { vstore4((float4)(out[0].s0, out[1].s0, out[2].s0, out[3].s0), 0, dst + idx); idx += m; }
+        if (idx < m*n_no_padding) { vstore4((float4)(out[0].s1, out[1].s1, out[2].s1, out[3].s1), 0, dst + idx); idx += m; }
+        if (idx < m*n_no_padding) { vstore4((float4)(out[0].s2, out[1].s2, out[2].s2, out[3].s2), 0, dst + idx); idx += m; }
+        if (idx < m*n_no_padding) { vstore4((float4)(out[0].s3, out[1].s3, out[2].s3, out[3].s3), 0, dst + idx); idx += m; }
+        if (idx < m*n_no_padding) { vstore4((float4)(out[0].s4, out[1].s4, out[2].s4, out[3].s4), 0, dst + idx); idx += m; }
+        if (idx < m*n_no_padding) { vstore4((float4)(out[0].s5, out[1].s5, out[2].s5, out[3].s5), 0, dst + idx); idx += m; }
+        if (idx < m*n_no_padding) { vstore4((float4)(out[0].s6, out[1].s6, out[2].s6, out[3].s6), 0, dst + idx); idx += m; }
+        if (idx < m*n_no_padding) { vstore4((float4)(out[0].s7, out[1].s7, out[2].s7, out[3].s7), 0, dst + idx); }
+    }
+}
+
+// _cok_r4 with the SCALE reads vectorised. Identical arithmetic to _cok_r4; the only
+// change is that the four rows' scale codes are read as uchar4 instead of one byte at
+// a time, cutting 8-12 narrow loads per 32-K step to 2-3. The weights, d and dm were
+// already vector loads after r4, so the scale codes were the last narrow read left in
+// the inner loop, and the r4 win showed this kernel family is issue bound.
+REQD_SUBGROUP_SIZE_64
+kernel void kernel_gemm_noshuffle_q4_k_f32_cok_r4_sv(
+    global const ushort * src0_q,
+    global const uchar  * src0_s,
+    global const half   * src0_d,
+    global const half   * src0_dm,
+    read_only image1d_buffer_t src1,
+    global float * dst,
+    ulong offsetd,
+    int m,
+    int n,
+    int k,
+    int n_no_padding,
+    uchar mask_d6,
+    uchar mask_d4,
+    uchar mask_hi2
+) {
+    dst = (global float *)((global char *)dst + offsetd);
+    int n_4  = n >> 2;
+    int gx   = get_global_id(0);     // 4-row group
+    int sg   = get_local_id(1);      // subgroup index (K-split lane)
+    int lane = get_local_id(0);      // lane within subgroup (0..COK_SG-1)
+
+    int row0 = gx << 2;              // first of this lane's 4 rows
+    int num_32blk = k / 32;
+
+    half8 acc0 = 0, acc1 = 0, acc2 = 0, acc3 = 0;
+    half8 B;
+
+    for (int blk = sg; blk < num_32blk; blk += COK_NSG) {
+        int i       = blk << 5;       // blk * 32
+        int sb_idx  = blk >> 3;       // (blk*32) / QK_K
+        int sub_idx = blk & 7;        // (i/32) % 8
+
+        // the four rows are adjacent, so one vector load each
+        half4 dd  = vload4(0, src0_d  + row0 + sb_idx * m);
+        half4 dmm = vload4(0, src0_dm + row0 + sb_idx * m);
+
+        global const uchar * sc = src0_s + sb_idx * K_SCALE_SIZE * m + row0;
+        uchar4 sv, mn;
+        get_scale_min_k4_v4(sub_idx, sc, m, &sv, &mn, mask_d6, mask_d4, mask_hi2);
+
+        half4 scale = convert_half4(convert_float4(dd)  * convert_float4(sv));
+        half4 mval  = convert_half4(convert_float4(dmm) * convert_float4(mn));
+
+        for (int l = 0; l < 32; l += 4) {
+            int ki = i + l;
+            // 8 bytes per lane: this lane's four rows at this K-group
+            ushort4 bits = vload4(0, src0_q + row0 + (ki >> 2) * m);
+
+            B.s0123 = read_imageh(src1,     (ki+0) * n_4);
+            B.s4567 = read_imageh(src1, 1 + (ki+0) * n_4);
+            acc0 += B * ((half)( bits.s0        & 0x000F) * scale.s0 - mval.s0);
+            acc1 += B * ((half)( bits.s1        & 0x000F) * scale.s1 - mval.s1);
+            acc2 += B * ((half)( bits.s2        & 0x000F) * scale.s2 - mval.s2);
+            acc3 += B * ((half)( bits.s3        & 0x000F) * scale.s3 - mval.s3);
+
+            B.s0123 = read_imageh(src1,     (ki+1) * n_4);
+            B.s4567 = read_imageh(src1, 1 + (ki+1) * n_4);
+            acc0 += B * ((half)((bits.s0 >> 4)  & 0x000F) * scale.s0 - mval.s0);
+            acc1 += B * ((half)((bits.s1 >> 4)  & 0x000F) * scale.s1 - mval.s1);
+            acc2 += B * ((half)((bits.s2 >> 4)  & 0x000F) * scale.s2 - mval.s2);
+            acc3 += B * ((half)((bits.s3 >> 4)  & 0x000F) * scale.s3 - mval.s3);
+
+            B.s0123 = read_imageh(src1,     (ki+2) * n_4);
+            B.s4567 = read_imageh(src1, 1 + (ki+2) * n_4);
+            acc0 += B * ((half)((bits.s0 >> 8)  & 0x000F) * scale.s0 - mval.s0);
+            acc1 += B * ((half)((bits.s1 >> 8)  & 0x000F) * scale.s1 - mval.s1);
+            acc2 += B * ((half)((bits.s2 >> 8)  & 0x000F) * scale.s2 - mval.s2);
+            acc3 += B * ((half)((bits.s3 >> 8)  & 0x000F) * scale.s3 - mval.s3);
+
+            B.s0123 = read_imageh(src1,     (ki+3) * n_4);
+            B.s4567 = read_imageh(src1, 1 + (ki+3) * n_4);
+            acc0 += B * ((half)((bits.s0 >> 12) & 0x000F) * scale.s0 - mval.s0);
+            acc1 += B * ((half)((bits.s1 >> 12) & 0x000F) * scale.s1 - mval.s1);
+            acc2 += B * ((half)((bits.s2 >> 12) & 0x000F) * scale.s2 - mval.s2);
+            acc3 += B * ((half)((bits.s3 >> 12) & 0x000F) * scale.s3 - mval.s3);
+        }
+    }
+
+    local float8 reduceLM[COK_SG * (COK_NSG - 1)];
+    float8 out[4];
+    for (int r = 0; r < 4; r++) {
+        half8 acc = (r == 0) ? acc0 : (r == 1) ? acc1 : (r == 2) ? acc2 : acc3;
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (sg > 0) {
+            reduceLM[(sg - 1) * COK_SG + lane] = convert_float8(acc);
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (sg == 0) {
+            float8 sum = convert_float8(acc);
+            for (int s = 0; s < COK_NSG - 1; s++) {
+                sum += reduceLM[s * COK_SG + lane];
+            }
+            out[r] = sum;
+        }
+    }
+
+    if (sg == 0) {
         int idx = row0;
         if (idx < m*n_no_padding) { vstore4((float4)(out[0].s0, out[1].s0, out[2].s0, out[3].s0), 0, dst + idx); idx += m; }
         if (idx < m*n_no_padding) { vstore4((float4)(out[0].s1, out[1].s1, out[2].s1, out[3].s1), 0, dst + idx); idx += m; }
