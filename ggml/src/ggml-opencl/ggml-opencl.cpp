@@ -27425,10 +27425,14 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
             }
         }
 
-        // Texture + named registers. Opt-in: GGML_OPENCL_Q4K_GEMM_COK_R4_WIMG_NR=1.
+        // Texture + named registers, both measured wins in one kernel.
+        // DEFAULT ON; opt out with GGML_OPENCL_Q4K_GEMM_COK_R4_WIMG_NR=0. muse-glimmer-30B
+        // pp5 24.11 -> 24.32, pp8 38.37 -> 38.70 (+0.9% at both) against two control arms,
+        // and it is strictly cheaper in resources: private memory 400 -> 272 B per
+        // work-item, max workgroup size 640 -> 896.
         static const char * q4k_r4_wimg_nr_env = getenv("GGML_OPENCL_Q4K_GEMM_COK_R4_WIMG_NR");
         const bool use_r4_wimg_nr = use_cok_r4_wimg
-                                  && (q4k_r4_wimg_nr_env != nullptr) && (atoi(q4k_r4_wimg_nr_env) != 0)
+                                  && ((q4k_r4_wimg_nr_env == nullptr) || (atoi(q4k_r4_wimg_nr_env) != 0))
                                   && backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr != nullptr;
 
         kernel = use_cok_r8    ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r8
