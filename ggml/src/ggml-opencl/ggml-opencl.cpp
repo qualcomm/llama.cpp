@@ -1737,6 +1737,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r4   = nullptr;
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r4_sv = nullptr;
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r4_ma = nullptr;
+    int       q4k_cok_nsg = 8;   // K-split width the q4_K cok kernels were built with
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg = nullptr;
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r4_nr = nullptr;
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r4_nrh = nullptr;
@@ -5186,7 +5187,14 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #else
         const std::string kernel_src = read_file("gemm_noshuffle_q4_k_f32.cl");
 #endif
-        cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        // K-split width for the cooperative-K kernels. It sets three things at once --
+        // workgroup size (64 x NSG), reduction depth, and LDS (64*(NSG-1)*32 B) -- and has
+        // never been swept for the 4-row kernel. GGML_OPENCL_Q4K_COK_NSG overrides.
+        static const char * q4k_cok_nsg_env = getenv("GGML_OPENCL_Q4K_COK_NSG");
+        const int q4k_cok_nsg = q4k_cok_nsg_env ? atoi(q4k_cok_nsg_env) : 8;
+        backend_ctx->q4k_cok_nsg = q4k_cok_nsg;
+        std::string q4k_opts = compile_opts + " -DCOK_NSG=" + std::to_string(q4k_cok_nsg);
+        cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), q4k_opts);
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_k_f32 = clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_k_f32_r1 = clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_f32_r1", &err), err));
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_k_f32_kimg = clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_f32_kimg", &err), err));
@@ -27443,10 +27451,10 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
             global_work_size[0] = use_cok_r8 ? (size_t)(ne01 / 8)
                                 : (use_cok_r4 || use_cok_r4_wimg) ? (size_t)(ne01 / 4)
                                              : (size_t)ne01;
-            global_work_size[1] = 8;              // COK_NSG
+            global_work_size[1] = (size_t)backend_ctx->q4k_cok_nsg;   // COK_NSG
             global_work_size[2] = 1;
             local_work_size[0] = 64;              // COK_SG
-            local_work_size[1] = 8;               // COK_NSG
+            local_work_size[1] = (size_t)backend_ctx->q4k_cok_nsg;    // COK_NSG
             local_work_size[2] = 1;
         } else if (use_r1) {
             // 1 row per WI (opt-in occupancy experiment).

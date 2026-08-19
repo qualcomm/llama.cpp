@@ -411,7 +411,11 @@ kernel void kernel_gemm_noshuffle_q4_k_f32_kimg(
 // has M/64 workgroups AND COK_NSG-way K parallelism. Uses REQD_SUBGROUP_SIZE_64
 // + barrier (same safe reduction pattern as the GEMV; never sub_group_reduce
 // at full width on X2 per the GDN miscompile note).
+// K-split width. Guarded so the host -D actually takes: an unguarded define here is
+// the bug that silently pinned TILESIZE_N at 32 in three other kernels.
+#ifndef COK_NSG
 #define COK_NSG 8
+#endif
 #define COK_SG  64
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
