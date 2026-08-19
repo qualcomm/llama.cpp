@@ -26281,6 +26281,21 @@ static void ggml_cl_mul_mat_q8_0_f32_adreno(ggml_backend_t backend, const ggml_t
             : q8_dense_dp4a_env
             ? (atoi(q8_dense_dp4a_env) != 0)
             : (adreno_dense_dp4a_default_on(backend_ctx) && !q8_bin_loaded);
+        // Same probe as the cooperative-K gate below: this is the fork that decides
+        // whether a q8_0 matmul ever reaches it, so a silent cooperative-K probe is
+        // explained here rather than costing a second build.
+        if (getenv("GGML_OPENCL_Q80_COK_PROBE")) {
+            static int n_q80_dp4a_probe = 0;
+            if (n_q80_dp4a_probe < 24) {
+                n_q80_dp4a_probe++;
+                fprintf(stderr, "[Q80-COK-PROBE] fork M=%d N=%d K=%d | dense_dp4a_on=%d "
+                                "N>8=%d -> %s\n",
+                        M, N, K, q8_dense_dp4a_on, N > 8,
+                        (q8_dense_dp4a_on && backend_ctx->kernel_gemm_noshuffle_q8_0_q8_1_dp4a
+                         && N > 8 && (K % 32 == 0) && (M % 64 == 0)) ? "dense_dp4a" : "trans_gemm");
+                fflush(stderr);
+            }
+        }
         if (q8_dense_dp4a_on && backend_ctx->kernel_gemm_noshuffle_q8_0_q8_1_dp4a
                 && N > 8 && (K % 32 == 0) && (M % 64 == 0)) {
             cl_mem a_sub = nullptr;
@@ -26520,6 +26535,24 @@ static void ggml_cl_mul_mat_q8_0_f32_adreno(ggml_backend_t backend, const ggml_t
         const bool use_q80_cok = (q80_cok_env != nullptr) && (atoi(q80_cok_env) != 0)
                               && backend_ctx->kernel_gemm_noshuffle_q8_0_f32_cok != nullptr
                               && N <= 8 && (M % 256 == 0);
+        // Reachability probe. An A/B of this kernel measured no change at any width,
+        // which is only a null result if the kernel actually ran: the gate carries
+        // three conditions beyond the env, and reaching this block at all requires
+        // the transposed-weight path plus N <= 8 (wider goes to the dense dp4a).
+        // GGML_OPENCL_Q80_COK_PROBE=1 prints each distinct shape once, so "ran and
+        // did nothing" is distinguishable from "never fired".
+        if (getenv("GGML_OPENCL_Q80_COK_PROBE")) {
+            static int n_q80_probe = 0;
+            if (n_q80_probe < 24) {
+                n_q80_probe++;
+                fprintf(stderr, "[Q80-COK-PROBE] M=%d N=%d K=%d | env=%s kernel=%s "
+                                "N<=8=%d M%%256==0=%d -> %s\n",
+                        M, N, K, q80_cok_env ? q80_cok_env : "(unset)",
+                        backend_ctx->kernel_gemm_noshuffle_q8_0_f32_cok ? "built" : "NULL",
+                        N <= 8, (M % 256 == 0), use_q80_cok ? "COK" : "base_gemm");
+                fflush(stderr);
+            }
+        }
         kernel = use_q80_cok ? backend_ctx->kernel_gemm_noshuffle_q8_0_f32_cok
                              : backend_ctx->kernel_gemm_noshuffle_q8_0_f32;
         int padded_N = N + padding;
