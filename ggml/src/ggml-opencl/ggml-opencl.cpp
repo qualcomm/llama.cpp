@@ -26612,7 +26612,19 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
     // Per-layer only (ne01 < 32768): the batched large-vocab lm_head at ne1==3
     // is left to the existing routing (corrupts on the Adreno GEMV path; x2-
     // unified routes batched Q6_K lm_head to CPU). Per-layer mc3 is byte-identical.
-    const bool use_mc3 = q4k_mc3 && (ne1 >= 2 && ne1 <= 4) && (ne01 < 32768);
+    //
+    // The upper bound is the mc3|cok crossover, and it is a MEASURED tuning point,
+    // not a structural limit (mc3 itself is capped at 4 columns). cok always pays a
+    // padded 8-column tile, so its cost is flat across ne1 2..8 while mc3's rises
+    // per column: at 1 row per lane cok was ~620 us against mc3's 341/422/518 at
+    // n=2/3/4, which put the crossover just past 4. The 4-rows-per-lane cok is ~33%
+    // cheaper, so the boundary is expected to move down; GGML_OPENCL_Q4K_MC3_MAXN
+    // makes it A/B-able without a rebuild.
+    // Clamped to 4: the mc3 GEMV emits at most 4 columns, so a larger value would
+    // drop columns rather than run slower.
+    static const char * q4k_mc3_maxn_env = getenv("GGML_OPENCL_Q4K_MC3_MAXN");
+    static const int q4k_mc3_maxn = q4k_mc3_maxn_env ? MIN(atoi(q4k_mc3_maxn_env), 4) : 4;
+    const bool use_mc3 = q4k_mc3 && (ne1 >= 2 && ne1 <= q4k_mc3_maxn) && (ne01 < 32768);
 
     if (ne1 == 1 || use_mc3) {
         cl_mem q_img = nullptr;
@@ -27149,10 +27161,16 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
         // 4 output rows per lane: the 1-row kernel loads only 2 bytes per lane per
         // step where the GEMV loads 16, so it is issue-bound rather than bandwidth-bound.
         // Four adjacent rows vector-load as one 8-byte read and share the activation
-        // vector. Opt-in while the register cost is measured.
+        // vector, so both the weight-load count and the activation-read count drop 4x.
+        // DEFAULT ON; opt out with GGML_OPENCL_Q4K_GEMM_COK_R4=0.
+        // Measured on X2-90, muse-glimmer-30B Q4_K_M: pp8 26.19 -> 34.80 (+32.9%),
+        // speculative decoding +8.3% on its own and +9.9% together with the q6_K r4,
+        // with all four output md5s and all draft/accept counts unchanged.
+        // 8 rows per lane reaches the GEMV's 16 B load and adds only +0.08% over this,
+        // so 4 is the sweet spot; the win saturates at 8 bytes per lane.
         static const char * q4k_cok_r4_env = getenv("GGML_OPENCL_Q4K_GEMM_COK_R4");
         const bool use_cok_r4 = use_cok && !use_cok_wimg
-                             && (q4k_cok_r4_env != nullptr) && (atoi(q4k_cok_r4_env) != 0)
+                             && ((q4k_cok_r4_env == nullptr) || (atoi(q4k_cok_r4_env) != 0))
                              && backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4 != nullptr
                              && (M % 4 == 0);
 
@@ -27756,10 +27774,12 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
         const bool use_q6k_cok = q6k_gemm_cok && (ne1 >= 2 && ne1 <= 8) && !is_output_w;
         // 4 output rows per lane, same change that took the q4_K cok +32.9%: ql, qh,
         // scales and d are all row-contiguous, so each becomes one vector load and the
-        // activation read is shared across the four rows. Opt-in while it is measured.
+        // activation read is shared across the four rows.
+        // DEFAULT ON; opt out with GGML_OPENCL_Q6K_GEMM_COK_R4=0. Worth +5.9% on its
+        // own at muse pp8 and composes with the q4_K r4 for +43.8% together.
         static const char * q6k_cok_r4_env = getenv("GGML_OPENCL_Q6K_GEMM_COK_R4");
         const bool use_q6k_cok_r4 = use_q6k_cok
-                                 && (q6k_cok_r4_env != nullptr) && (atoi(q6k_cok_r4_env) != 0)
+                                 && ((q6k_cok_r4_env == nullptr) || (atoi(q6k_cok_r4_env) != 0))
                                  && backend_ctx->kernel_gemm_noshuffle_q6_K_f32_cok_r4 != nullptr
                                  && (ne01 % 4 == 0);
         kernel = use_q6k_cok_r4 ? backend_ctx->kernel_gemm_noshuffle_q6_K_f32_cok_r4
