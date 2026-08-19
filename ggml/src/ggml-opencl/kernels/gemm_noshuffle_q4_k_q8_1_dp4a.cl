@@ -485,8 +485,12 @@ kernel void kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg_aimg(
 #define TDOT(T)  dot8_q8a_v(qw, \
                      read_imageui(src1_qa_img, (int)(mad24(TCOL(T), ku4, st4))), \
                      read_imageui(src1_qa_img, (int)(mad24(TCOL(T), ku4, st4) + 1u)))
-#define TDA(T)   ((float)src1_da[mad24(TCOL(T), k_b, sub)])
-#define TSA(T)   ((float)src1_sa[mad24(TCOL(T), k_b, sub)])
+
+    // The per-block q8_1 scales stay staged in __local exactly as the buffer
+    // kernel has them: 2 loads per step instead of 2*TILESIZE_N, and moving them
+    // is a separate question from moving the activations.
+    __local half sh_d[TILESIZE_N];
+    __local half sh_s[TILESIZE_N];
 
 #define NGROUPS (TILESIZE_N / 4)
     float4 acc[NGROUPS];
@@ -518,16 +522,24 @@ kernel void kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg_aimg(
         qw.s6 = EXP4(read_imageui(src0_q_img, (int)((wbase + 6 * m) >> 1)).x >> sel);
         qw.s7 = EXP4(read_imageui(src0_q_img, (int)((wbase + 7 * m) >> 1)).x >> sel);
 
-        // No __local, no barriers: the activations come straight from the texture.
+        if (lid < TILESIZE_N) {
+            const uint c = col_base + lid;
+            sh_d[lid] = (c < (uint)n_no_padding) ? src1_da[c * k_b + sub] : (half)0;
+            sh_s[lid] = (c < (uint)n_no_padding) ? src1_sa[c * k_b + sub] : (half)0;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        // The activations - and only the activations - come from the texture.
+#define LD4(arr, b) ((float4)((float)arr[(b)+0], (float)arr[(b)+1], (float)arr[(b)+2], (float)arr[(b)+3]))
         #pragma unroll
         for (int g = 0; g < NGROUPS; ++g) {
             const int b = g * 4;
             const float4 rf = (float4)((float)TDOT(b+0), (float)TDOT(b+1),
                                        (float)TDOT(b+2), (float)TDOT(b+3));
-            const float4 ad = (float4)(TDA(b+0), TDA(b+1), TDA(b+2), TDA(b+3));
-            const float4 as = (float4)(TSA(b+0), TSA(b+1), TSA(b+2), TSA(b+3));
-            acc[g] += scale * ad * rf - minv * as;
+            acc[g] += scale * LD4(sh_d, b) * rf - minv * LD4(sh_s, b);
         }
+#undef LD4
+        barrier(CLK_LOCAL_MEM_FENCE);
     }
 
     if (!row_valid) {
@@ -545,10 +557,155 @@ kernel void kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg_aimg(
         if (c0 + 3 < (uint)n_no_padding) dst[(c0 + 3) * (uint)m + row] = a.s3;
     }
 #undef NGROUPS
-#undef TSA
-#undef TDA
 #undef TDOT
 #undef TCOL
+}
+
+
+// Same question, cheaper answer: keep the activations in __local, but read them
+// FOUR AT A TIME.
+//
+// The buffer kernels declare the staging tile as `__local uint sh_qa[TS][8]` and
+// the dot reads it one uint at a time, so the inner loop issues TS*8 = 128 scalar
+// __local loads per 32-K step (TS=16). Nothing about the data requires that: the
+// eight uints a token needs for one 32-K step are contiguous, so they are two
+// uint4s. Declaring the tile as uint4 cuts the inner-loop __local load count 4x,
+// and the cooperative staging load from global widens from 4 to 16 bytes per lane
+// at the same time.
+//
+// This isolates the LOAD COUNT from the ADDRESS SPACE: the _aimg variant above
+// changes both (fewer reads AND a texture); this one changes only the count.
+// The uint4 is copied into a private temp before the dp4a, because dp4a with a
+// __local operand inside an unrolled loop is a documented miscompile on X2.
+__attribute__((qcom_wave_pair_mode(1)))
+kernel void kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg_alds4(
+        __read_only image1d_buffer_t src0_q_img,  // q4_K weights, CL_R/UINT32
+        __global const uchar  * src0_s,
+        __global const half   * src0_d,
+        __global const half   * src0_dm,
+        __global const uint   * src1_qa,   // q8_1 activations int8 (as uint, 4/elem) [N, K]
+        __global const half   * src1_da,
+        __global const half   * src1_sa,
+        __global       float  * dst,
+        ulong  offsetd,
+        int    m,
+        int    n_no_padding,
+        int    k,
+        uchar  mask_d6,
+        uchar  mask_d4,
+        uchar  mask_hi2,
+        int    ksplit
+) {
+    dst = (global float *)((global char *)dst + offsetd);
+
+    const uint lid = get_local_id(0);
+    const uint block_id_m = get_global_id(1);
+    const uint n_tiles    = ((uint)n_no_padding + TILESIZE_N - 1) / TILESIZE_N;
+    const uint gid2       = get_global_id(2);
+    const uint block_id_n = (n_tiles > 0) ? (gid2 % n_tiles) : gid2;
+    const uint ks         = (n_tiles > 0) ? (gid2 / n_tiles) : 0u;
+
+    const uint row      = block_id_m * 64 + lid;
+    const uint col_base = block_id_n * TILESIZE_N;
+    const bool row_valid = row < (uint)m;
+    const uint rrow     = row_valid ? row : 0;
+
+    const uint nsb   = ((uint)k + QK_K - 1) / QK_K;
+    const uint base  = nsb / (uint)ksplit;
+    const uint rem   = nsb - base * (uint)ksplit;
+    const uint sb_lo = ks * base + (ks < rem ? ks : rem);
+    const uint sb_n  = base + (ks < rem ? 1u : 0u);
+    const uint k_lo  = sb_lo * QK_K;
+    uint       k_hi  = (sb_lo + sb_n) * QK_K;
+    if (k_hi > (uint)k) { k_hi = (uint)k; }
+    if (k_lo >= k_hi) {
+        return;
+    }
+    dst += (size_t)ks * (size_t)n_no_padding * (size_t)m;
+
+    const uint sel = (rrow & 1u) * 16u;
+    const uint k_u = (uint)k >> 2;
+    const uint k_b = (uint)k >> 5;
+
+    __local uint4 sh_qa4[TILESIZE_N][2];
+    __local half  sh_d[TILESIZE_N];
+    __local half  sh_s[TILESIZE_N];
+
+#define NGROUPS (TILESIZE_N / 4)
+    float4 acc[NGROUPS];
+    #pragma unroll
+    for (int g = 0; g < NGROUPS; ++g) acc[g] = (float4)(0.0f);
+
+    for (uint step = k_lo; step < k_hi; step += 32) {
+        const uint sub     = step >> 5;
+        const uint sb_idx  = step / QK_K;
+        const uint sub_idx = sub & 7;
+
+        const float dd  = (float)src0_d [rrow + sb_idx * m];
+        const float dmm = (float)src0_dm[rrow + sb_idx * m];
+        global const uchar * sc = src0_s + sb_idx * K_SCALE_SIZE * (uint)m + rrow;
+        uchar sv, mn;
+        get_scale_min_k4(sub_idx, sc, (uint)m, &sv, &mn, mask_d6, mask_d4, mask_hi2);
+        const float scale = dd  * (float)sv;
+        const float minv  = dmm * (float)mn;
+
+        const uint wbase = rrow + (step >> 2) * (uint)m;
+        uint8 qw;
+        qw.s0 = EXP4(read_imageui(src0_q_img, (int)((wbase + 0 * m) >> 1)).x >> sel);
+        qw.s1 = EXP4(read_imageui(src0_q_img, (int)((wbase + 1 * m) >> 1)).x >> sel);
+        qw.s2 = EXP4(read_imageui(src0_q_img, (int)((wbase + 2 * m) >> 1)).x >> sel);
+        qw.s3 = EXP4(read_imageui(src0_q_img, (int)((wbase + 3 * m) >> 1)).x >> sel);
+        qw.s4 = EXP4(read_imageui(src0_q_img, (int)((wbase + 4 * m) >> 1)).x >> sel);
+        qw.s5 = EXP4(read_imageui(src0_q_img, (int)((wbase + 5 * m) >> 1)).x >> sel);
+        qw.s6 = EXP4(read_imageui(src0_q_img, (int)((wbase + 6 * m) >> 1)).x >> sel);
+        qw.s7 = EXP4(read_imageui(src0_q_img, (int)((wbase + 7 * m) >> 1)).x >> sel);
+
+        // 16-byte cooperative staging: TILESIZE_N*2 uint4s instead of TILESIZE_N*8
+        // uints. (c*k_u + step/4) is a multiple of 8, so vload4 is aligned.
+        for (uint idx = lid; idx < TILESIZE_N * 2; idx += 64) {
+            const uint t = idx >> 1;
+            const uint v = idx & 1;
+            const uint c = col_base + t;
+            sh_qa4[t][v] = (c < (uint)n_no_padding)
+                         ? vload4(0, src1_qa + c * k_u + (step >> 2) + (v << 2))
+                         : (uint4)(0u);
+        }
+        if (lid < TILESIZE_N) {
+            const uint c = col_base + lid;
+            sh_d[lid] = (c < (uint)n_no_padding) ? src1_da[c * k_b + sub] : (half)0;
+            sh_s[lid] = (c < (uint)n_no_padding) ? src1_sa[c * k_b + sub] : (half)0;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+#define LD4(arr, b) ((float4)((float)arr[(b)+0], (float)arr[(b)+1], (float)arr[(b)+2], (float)arr[(b)+3]))
+#define TDOT4(T) dot8_q8a_v(qw, (uint4)(sh_qa4[T][0]), (uint4)(sh_qa4[T][1]))
+        #pragma unroll
+        for (int g = 0; g < NGROUPS; ++g) {
+            const int b = g * 4;
+            const float4 rf = (float4)((float)TDOT4(b+0), (float)TDOT4(b+1),
+                                       (float)TDOT4(b+2), (float)TDOT4(b+3));
+            acc[g] += scale * LD4(sh_d, b) * rf - minv * LD4(sh_s, b);
+        }
+#undef TDOT4
+#undef LD4
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    if (!row_valid) {
+        return;
+    }
+
+    #pragma unroll
+    for (int g = 0; g < NGROUPS; ++g) {
+        const uint b = (uint)(g * 4);
+        const float4 a = acc[g];
+        const uint c0 = col_base + b;
+        if (c0 + 0 < (uint)n_no_padding) dst[(c0 + 0) * (uint)m + row] = a.s0;
+        if (c0 + 1 < (uint)n_no_padding) dst[(c0 + 1) * (uint)m + row] = a.s1;
+        if (c0 + 2 < (uint)n_no_padding) dst[(c0 + 2) * (uint)m + row] = a.s2;
+        if (c0 + 3 < (uint)n_no_padding) dst[(c0 + 3) * (uint)m + row] = a.s3;
+    }
+#undef NGROUPS
 }
 
 // Sums the per-K-slice partials written by the split-K dp4a GEMM above.

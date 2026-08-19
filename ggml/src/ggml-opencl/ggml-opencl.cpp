@@ -1730,6 +1730,8 @@ struct ggml_backend_opencl_context {
     // Activations via texture instead of __local staging (see the kernel header).
     cl_kernel kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg_aimg = nullptr;
     cl_kernel kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow_wimg_aimg = nullptr;
+    cl_kernel kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg_alds4 = nullptr;
+    cl_kernel kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow_wimg_alds4 = nullptr;
     cl_kernel kernel_gemm_q4_k_splitk_reduce_f32 = nullptr;  // sums the split-K partials
     int q4k_dp4a_ts        = 32;  // tile for prefill (ne1 > q4k_dp4a_narrow_max)
     int q4k_dp4a_ts_narrow = 32;  // tile for the verify band; == q4k_dp4a_ts disables the split
@@ -5319,6 +5321,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg_aimg =
             clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg_aimg", &err);
         if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg_aimg = nullptr; }
+        backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg_alds4 =
+            clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg_alds4", &err);
+        if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg_alds4 = nullptr; }
         CL_CHECK((backend_ctx->kernel_gemm_q4_k_splitk_reduce_f32 = clCreateKernel(prog, "kernel_gemm_q4_k_splitk_reduce_f32", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         backend_ctx->q4k_dp4a_ts = q4k_dp4a_ts;
@@ -5345,7 +5350,39 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow_wimg_aimg =
                 clCreateKernel(nprog, "kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg_aimg", &err);
             if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow_wimg_aimg = nullptr; }
+            backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow_wimg_alds4 =
+                clCreateKernel(nprog, "kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg_alds4", &err);
+            if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow_wimg_alds4 = nullptr; }
             CL_CHECK(clReleaseProgram(nprog));
+        }
+        // Same question the cok family needed answered: does a variant spill? A
+        // texture read has to be held in a register until its dp4a consumes it, so
+        // an activation path that looks cheaper in instruction count can be paid for
+        // in private memory - which on this device is uncached.
+        if (getenv("GGML_OPENCL_DP4A_PROBE_RES")) {
+            struct { const char * name; cl_kernel k; } dprobes[] = {
+                { "q4K_dp4a       ", backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a },
+                { "q4K_dp4a_wimg  ", backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg },
+                { "q4K_dp4a_aimg  ", backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg_aimg },
+                { "q4K_dp4a_alds4 ", backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg_alds4 },
+                { "q4K_nrw        ", backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow },
+                { "q4K_nrw_wimg   ", backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow_wimg },
+                { "q4K_nrw_aimg   ", backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow_wimg_aimg },
+                { "q4K_nrw_alds4  ", backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow_wimg_alds4 },
+            };
+            for (size_t pi = 0; pi < sizeof(dprobes)/sizeof(dprobes[0]); pi++) {
+                if (dprobes[pi].k == nullptr) {
+                    fprintf(stderr, "[DP4A-RES] %s (not built)\n", dprobes[pi].name);
+                    continue;
+                }
+                cl_ulong pmc = 0, lmc = 0; size_t wgc = 0;
+                clGetKernelWorkGroupInfo(dprobes[pi].k, backend_ctx->device, CL_KERNEL_PRIVATE_MEM_SIZE, sizeof(pmc), &pmc, NULL);
+                clGetKernelWorkGroupInfo(dprobes[pi].k, backend_ctx->device, CL_KERNEL_LOCAL_MEM_SIZE, sizeof(lmc), &lmc, NULL);
+                clGetKernelWorkGroupInfo(dprobes[pi].k, backend_ctx->device, CL_KERNEL_WORK_GROUP_SIZE, sizeof(wgc), &wgc, NULL);
+                fprintf(stderr, "[DP4A-RES] %s private=%5llu local=%6llu wg_cap=%4zu\n",
+                        dprobes[pi].name, (unsigned long long)pmc, (unsigned long long)lmc, wgc);
+            }
+            fflush(stderr);
         }
         GGML_LOG_CONT(".");
     }
@@ -27242,11 +27279,22 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
                 }
             }
             if (use_aimg) { dk = aimg_k; }
+            // Cheaper half of the same hypothesis: keep the activations in __local
+            // but read them as uint4, cutting the inner-loop __local load count 4x
+            // without changing the address space. Mutually exclusive with aimg so
+            // the two stay separable. GGML_OPENCL_Q4K_DP4A_ALDS4=1.
+            static const char * q4k_dp4a_alds4_env = getenv("GGML_OPENCL_Q4K_DP4A_ALDS4");
+            cl_kernel alds4_k = use_narrow
+                ? backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow_wimg_alds4
+                : backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg_alds4;
+            const bool use_alds4 = q4k_dp4a_alds4_env && (atoi(q4k_dp4a_alds4_env) != 0)
+                                && use_wimg && !use_aimg && alds4_k != nullptr;
+            if (use_alds4) { dk = alds4_k; }
             // Route probe: an env-gated A/B is worthless if the gate never fires.
             if (getenv("GGML_OPENCL_Q4K_DP4A_PROBE")) {
                 fprintf(stderr, "[DP4A-PROBE] q4_K M=%d N=%d K=%d -> %s%s%s (aimg_built=%d)\n",
                         M, N, K, use_narrow ? "narrow" : "wide", use_wimg ? "+wimg" : "",
-                        use_aimg ? "+aimg" : "", aimg_k != nullptr);
+                        use_aimg ? "+aimg" : use_alds4 ? "+alds4" : "", aimg_k != nullptr);
                 fflush(stderr);
             }
             // Split-K. At the verify widths the grid is one workgroup per 64 rows and a
