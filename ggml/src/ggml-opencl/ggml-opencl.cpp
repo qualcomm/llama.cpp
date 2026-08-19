@@ -24692,7 +24692,28 @@ static void ggml_cl_mul_mat_q4_0_f32_adreno(ggml_backend_t backend, const ggml_t
     const bool q40_mc3 = (q40_mc3_env >= 0)
         ? (q40_mc3_env != 0)
         : !adreno_art_compiler_quirks(backend_ctx);
-    const bool use_q40_mc3 = q40_mc3 && (ne1 >= 2 && ne1 <= 4) && (ne01 < 32768);
+    // Upper bound = the mc3|cooperative-K crossover, and the 4-rows-per-lane
+    // cooperative-K kernel moved it, exactly as for q4_K and q6_K. That kernel always
+    // computes a padded 8-column tile so its cost is flat across ne1 2..8, while mc3's
+    // rises per column. X2-90, q4_0 m=4096 k=14336, us/run:
+    //     ne1        2       3       4
+    //     mc3      301.7   386.9   477.3
+    //     cok r4   349.5   353.0   353.2
+    // The GEMV wins only at ne1==2. Applied only where the r4 kernel will actually
+    // run, since the 1-row fallback is slower than mc3 at 3 and 4. Override with
+    // GGML_OPENCL_Q40_MC3_MAXN, clamped to 4 (the GEMV emits at most 4 columns).
+    static const char * q40_cok_env_m    = getenv("GGML_OPENCL_Q40_GEMM_COK");
+    static const char * q40_cok_r4_env_m = getenv("GGML_OPENCL_Q40_GEMM_COK_R4");
+    static const bool q40_cok_r4_enabled =
+        ((q40_cok_env_m    == nullptr) || (atoi(q40_cok_env_m)    != 0)) &&
+        ((q40_cok_r4_env_m == nullptr) || (atoi(q40_cok_r4_env_m) != 0));
+    const bool q40_cok_r4_would_run = q40_cok_r4_enabled &&
+        (ne01 % 64 == 0) && (ne00 % 32 == 0) &&
+        backend_ctx->kernel_gemm_noshuffle_q4_0_f32_cok_r4 != nullptr;
+    static const char * q40_mc3_maxn_env = getenv("GGML_OPENCL_Q40_MC3_MAXN");
+    const int q40_mc3_maxn = q40_mc3_maxn_env ? MIN(atoi(q40_mc3_maxn_env), 4)
+                                             : (q40_cok_r4_would_run ? 2 : 4);
+    const bool use_q40_mc3 = q40_mc3 && (ne1 >= 2 && ne1 <= q40_mc3_maxn) && (ne01 < 32768);
 
     if (ne1 == 1 || use_q40_mc3) {
         cl_mem q_img = nullptr;
@@ -25170,11 +25191,13 @@ static void ggml_cl_mul_mat_q4_0_f32_adreno(ggml_backend_t backend, const ggml_t
         // 4 output rows per lane, the change that took the q4_K cooperative-K kernel
         // +32.9%: the 1-row kernel loads 2 bytes per lane where the GEMV loads 16, so
         // it is issue bound. Four adjacent rows vector-load as one 8-byte read and
-        // share the activation vector. Opt-in while measured:
-        // GGML_OPENCL_Q40_GEMM_COK_R4=1.
+        // share the activation vector.
+        // DEFAULT ON; opt out with GGML_OPENCL_Q40_GEMM_COK_R4=0. Adreno X2-90,
+        // m=4096 k=14336: ne1=5 587 -> 356 us, ne1=8 598 -> 357 us, both 1.66x,
+        // control arms within 1.2%. test-backend-ops MUL_MAT: 63 q4_0 pass, 0 fail.
         static const char * q40_cok_r4_env = getenv("GGML_OPENCL_Q40_GEMM_COK_R4");
         const bool use_q40_cok_r4 = use_q40_cok
-                                 && (q40_cok_r4_env != nullptr) && (atoi(q40_cok_r4_env) != 0)
+                                 && ((q40_cok_r4_env == nullptr) || (atoi(q40_cok_r4_env) != 0))
                                  && backend_ctx->kernel_gemm_noshuffle_q4_0_f32_cok_r4 != nullptr;
 
         kernel = use_q40_cok_r4 ? backend_ctx->kernel_gemm_noshuffle_q4_0_f32_cok_r4
