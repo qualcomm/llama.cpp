@@ -1739,6 +1739,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r4_ma = nullptr;
     int       q4k_cok_nsg = 8;   // K-split width the q4_K cok kernels were built with
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg = nullptr;
+    cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr = nullptr;
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r4_nr = nullptr;
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r4_nrh = nullptr;
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r8   = nullptr;
@@ -5220,6 +5221,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg =
             clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg", &err);
         if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg = nullptr; }
+        backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr =
+            clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr", &err);
+        if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr = nullptr; }
         // Named-register variants (no private float8 out[4]).
         backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_nr =
             clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_f32_cok_r4_nr", &err);
@@ -5250,6 +5254,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                 { "q4K_cok_r4_sv", backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_sv },
                 { "q4K_cok_r4_ma", backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_ma },
                 { "q4K_cok_r4wim", backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg },
+                { "q4K_r4wimg_nr", backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr },
                 { "q4K_cok_r4_nr", backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_nr },
                 { "q4K_cok_r4nrh", backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_nrh },
                 { "q4K_cok_r8   ", backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r8 },
@@ -27420,7 +27425,14 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
             }
         }
 
+        // Texture + named registers. Opt-in: GGML_OPENCL_Q4K_GEMM_COK_R4_WIMG_NR=1.
+        static const char * q4k_r4_wimg_nr_env = getenv("GGML_OPENCL_Q4K_GEMM_COK_R4_WIMG_NR");
+        const bool use_r4_wimg_nr = use_cok_r4_wimg
+                                  && (q4k_r4_wimg_nr_env != nullptr) && (atoi(q4k_r4_wimg_nr_env) != 0)
+                                  && backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr != nullptr;
+
         kernel = use_cok_r8    ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r8
+               : use_r4_wimg_nr ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr
                : use_cok_r4_wimg ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg
                : use_cok_r4_nrh ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_nrh
                : use_cok_r4_nr ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_nr
