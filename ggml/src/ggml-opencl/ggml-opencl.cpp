@@ -1700,6 +1700,10 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemm_noshuffle_q8_0_q8_1_dp4a_wimg = nullptr;  // q8_0 dense dp4a, weights via texture (opt-in)
     cl_kernel kernel_gemm_noshuffle_q8_0_q8_1_dp4a_narrow      = nullptr;  // same at TILESIZE_N=16, verify band
     cl_kernel kernel_gemm_noshuffle_q8_0_q8_1_dp4a_narrow_wimg = nullptr;
+    cl_kernel kernel_gemm_noshuffle_q8_0_q8_1_dp4a_alds4 = nullptr;
+    cl_kernel kernel_gemm_noshuffle_q8_0_q8_1_dp4a_narrow_alds4 = nullptr;
+    cl_kernel kernel_gemm_noshuffle_q8_0_q8_1_dp4a_wimg_alds4 = nullptr;
+    cl_kernel kernel_gemm_noshuffle_q8_0_q8_1_dp4a_narrow_wimg_alds4 = nullptr;
     int q80_dp4a_ts_narrow  = 32;   // == 32 disables the split
     int q80_dp4a_narrow_max = 16;   // widest ne1 routed to the narrow tile
     cl_kernel kernel_gemv_noshuffle_q8_0_f32;
@@ -1746,6 +1750,8 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemm_noshuffle_q6_k_q8_1_dp4a = nullptr;  // dp4a (int8) dense q6_K prefill GEMM
     // Narrow-tile twin for the verify band; see the q4_K pair above for the rationale.
     cl_kernel kernel_gemm_noshuffle_q6_k_q8_1_dp4a_narrow = nullptr;
+    cl_kernel kernel_gemm_noshuffle_q6_k_q8_1_dp4a_alds4 = nullptr;
+    cl_kernel kernel_gemm_noshuffle_q6_k_q8_1_dp4a_narrow_alds4 = nullptr;
     int q6k_dp4a_ts_narrow  = 32;  // == 32 disables the split
     int q6k_dp4a_narrow_max = 16;
     cl_kernel kernel_quant_a_q8_1;                    // plain activation q8_1 pre-pass
@@ -1794,6 +1800,14 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemm_noshuffle_q4_0_q8_1_dp4a_narrow = nullptr;
     cl_kernel kernel_gemm_noshuffle_q4_0_q8_1_dp4a_wimg        = nullptr;
     cl_kernel kernel_gemm_noshuffle_q4_0_q8_1_dp4a_narrow_wimg = nullptr;
+    // uint4 staging tile: the inner loop read the __local activation tile one
+    // uint at a time (TILESIZE_N*8 scalar loads per 32-K step against the same
+    // number of dot instructions). Measured on q4_K: pp16 +7.4%, pp512 +15.2%,
+    // byte-identical, same private/local footprint. Same defect here.
+    cl_kernel kernel_gemm_noshuffle_q4_0_q8_1_dp4a_alds4 = nullptr;
+    cl_kernel kernel_gemm_noshuffle_q4_0_q8_1_dp4a_narrow_alds4 = nullptr;
+    cl_kernel kernel_gemm_noshuffle_q4_0_q8_1_dp4a_wimg_alds4 = nullptr;
+    cl_kernel kernel_gemm_noshuffle_q4_0_q8_1_dp4a_narrow_wimg_alds4 = nullptr;
     int q40_dp4a_ts_narrow  = 32;  // == 32 disables the split
     int q40_dp4a_narrow_max = 16;
 #endif // GGML_OPENCL_USE_ADRENO_KERNELS
@@ -5084,6 +5098,12 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         backend_ctx->kernel_gemm_noshuffle_q4_0_q8_1_dp4a_wimg =
             clCreateKernel(prog, "kernel_gemm_noshuffle_q4_0_q8_1_dp4a_wimg", &err);
         if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q4_0_q8_1_dp4a_wimg = nullptr; }
+        backend_ctx->kernel_gemm_noshuffle_q4_0_q8_1_dp4a_alds4 =
+            clCreateKernel(prog, "kernel_gemm_noshuffle_q4_0_q8_1_dp4a_alds4", &err);
+        if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q4_0_q8_1_dp4a_alds4 = nullptr; }
+        backend_ctx->kernel_gemm_noshuffle_q4_0_q8_1_dp4a_wimg_alds4 =
+            clCreateKernel(prog, "kernel_gemm_noshuffle_q4_0_q8_1_dp4a_wimg_alds4", &err);
+        if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q4_0_q8_1_dp4a_wimg_alds4 = nullptr; }
         CL_CHECK(clReleaseProgram(prog));
 
         // Narrow tile for the verify band. DEFAULT OFF, and note this one is INERT in
@@ -5107,6 +5127,12 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             backend_ctx->kernel_gemm_noshuffle_q4_0_q8_1_dp4a_narrow_wimg =
                 clCreateKernel(nprog, "kernel_gemm_noshuffle_q4_0_q8_1_dp4a_wimg", &err);
             if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q4_0_q8_1_dp4a_narrow_wimg = nullptr; }
+            backend_ctx->kernel_gemm_noshuffle_q4_0_q8_1_dp4a_narrow_alds4 =
+                clCreateKernel(nprog, "kernel_gemm_noshuffle_q4_0_q8_1_dp4a_alds4", &err);
+            if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q4_0_q8_1_dp4a_narrow_alds4 = nullptr; }
+            backend_ctx->kernel_gemm_noshuffle_q4_0_q8_1_dp4a_narrow_wimg_alds4 =
+                clCreateKernel(nprog, "kernel_gemm_noshuffle_q4_0_q8_1_dp4a_wimg_alds4", &err);
+            if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q4_0_q8_1_dp4a_narrow_wimg_alds4 = nullptr; }
             CL_CHECK(clReleaseProgram(nprog));
         }
         GGML_LOG_CONT(".");
@@ -5409,6 +5435,12 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q8_0_q8_1_dp4a = clCreateKernel(prog, "kernel_gemm_noshuffle_q8_0_q8_1_dp4a", &err), err));
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q8_0_q8_1_dp4a_wimg = clCreateKernel(prog, "kernel_gemm_noshuffle_q8_0_q8_1_dp4a_wimg", &err), err));
+        backend_ctx->kernel_gemm_noshuffle_q8_0_q8_1_dp4a_alds4 =
+            clCreateKernel(prog, "kernel_gemm_noshuffle_q8_0_q8_1_dp4a_alds4", &err);
+        if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q8_0_q8_1_dp4a_alds4 = nullptr; }
+        backend_ctx->kernel_gemm_noshuffle_q8_0_q8_1_dp4a_wimg_alds4 =
+            clCreateKernel(prog, "kernel_gemm_noshuffle_q8_0_q8_1_dp4a_wimg_alds4", &err);
+        if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q8_0_q8_1_dp4a_wimg_alds4 = nullptr; }
         CL_CHECK(clReleaseProgram(prog));
 
         // Narrow tile for the verify band. q8_0 had NO small-batch kernel at all: no mc3, no
@@ -5437,6 +5469,12 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             backend_ctx->kernel_gemm_noshuffle_q8_0_q8_1_dp4a_narrow_wimg =
                 clCreateKernel(nprog, "kernel_gemm_noshuffle_q8_0_q8_1_dp4a_wimg", &err);
             if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q8_0_q8_1_dp4a_narrow_wimg = nullptr; }
+            backend_ctx->kernel_gemm_noshuffle_q8_0_q8_1_dp4a_narrow_alds4 =
+                clCreateKernel(nprog, "kernel_gemm_noshuffle_q8_0_q8_1_dp4a_alds4", &err);
+            if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q8_0_q8_1_dp4a_narrow_alds4 = nullptr; }
+            backend_ctx->kernel_gemm_noshuffle_q8_0_q8_1_dp4a_narrow_wimg_alds4 =
+                clCreateKernel(nprog, "kernel_gemm_noshuffle_q8_0_q8_1_dp4a_wimg_alds4", &err);
+            if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q8_0_q8_1_dp4a_narrow_wimg_alds4 = nullptr; }
             CL_CHECK(clReleaseProgram(nprog));
         }
         GGML_LOG_CONT(".");
@@ -5489,6 +5527,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a = clCreateKernel(prog, "kernel_gemm_noshuffle_q6_k_q8_1_dp4a", &err), err));
+        backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a_alds4 =
+            clCreateKernel(prog, "kernel_gemm_noshuffle_q6_k_q8_1_dp4a_alds4", &err);
+        if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a_alds4 = nullptr; }
         CL_CHECK(clReleaseProgram(prog));
 
         // Narrow tile for the verify band. ⛔ DEFAULT OFF: MEASURED A REGRESSION.
@@ -5510,6 +5551,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             std::string narrow_opts = compile_opts + " -DTILESIZE_N=" + std::to_string(ts_narrow);
             cl_program nprog = build_program_from_source(backend_ctx, kernel_src.c_str(), narrow_opts);
             CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a_narrow = clCreateKernel(nprog, "kernel_gemm_noshuffle_q6_k_q8_1_dp4a", &err), err));
+            backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a_narrow_alds4 =
+                clCreateKernel(nprog, "kernel_gemm_noshuffle_q6_k_q8_1_dp4a_alds4", &err);
+            if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a_narrow_alds4 = nullptr; }
             CL_CHECK(clReleaseProgram(nprog));
         }
         GGML_LOG_CONT(".");
@@ -25191,6 +25235,22 @@ static void ggml_cl_mul_mat_q4_0_f32_adreno(ggml_backend_t backend, const ggml_t
             cl_kernel dk = use_wimg   ? wk
                          : use_narrow ? backend_ctx->kernel_gemm_noshuffle_q4_0_q8_1_dp4a_narrow
                                       : backend_ctx->kernel_gemm_noshuffle_q4_0_q8_1_dp4a;
+            // uint4 staging tile (see the kernel header). DEFAULT ON; opt out with
+            // GGML_OPENCL_Q4_0_DP4A_ALDS4=0.
+            static const char * q40_alds4_env = getenv("GGML_OPENCL_Q4_0_DP4A_ALDS4");
+            const bool q40_alds4_on = (q40_alds4_env == nullptr) || (atoi(q40_alds4_env) != 0);
+            cl_kernel q40_alds4_k = use_wimg
+                ? (use_narrow ? backend_ctx->kernel_gemm_noshuffle_q4_0_q8_1_dp4a_narrow_wimg_alds4
+                              : backend_ctx->kernel_gemm_noshuffle_q4_0_q8_1_dp4a_wimg_alds4)
+                : (use_narrow ? backend_ctx->kernel_gemm_noshuffle_q4_0_q8_1_dp4a_narrow_alds4
+                              : backend_ctx->kernel_gemm_noshuffle_q4_0_q8_1_dp4a_alds4);
+            if (q40_alds4_on && q40_alds4_k != nullptr) { dk = q40_alds4_k; }
+            if (getenv("GGML_OPENCL_DP4A_ROUTE_PROBE")) {
+                fprintf(stderr, "[DP4A-ROUTE] q4_0 M=%d N=%d K=%d -> %s%s%s\n", M, N, K,
+                        use_narrow ? "narrow" : "wide", use_wimg ? "+wimg" : "",
+                        (q40_alds4_on && q40_alds4_k != nullptr) ? "+alds4" : "");
+                fflush(stderr);
+            }
             int ai = 0;
             if (use_wimg) {
                 CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_mem), &q40_img));
@@ -26521,6 +26581,24 @@ static void ggml_cl_mul_mat_q8_0_f32_adreno(ggml_backend_t backend, const ggml_t
                             : backend_ctx->kernel_gemm_noshuffle_q8_0_q8_1_dp4a_narrow)
                 : (use_wimg ? backend_ctx->kernel_gemm_noshuffle_q8_0_q8_1_dp4a_wimg
                             : backend_ctx->kernel_gemm_noshuffle_q8_0_q8_1_dp4a);
+            // uint4 staging tile (see the kernel header): the inner loop read the
+            // __local activation tile one uint at a time. DEFAULT ON; opt out with
+            // GGML_OPENCL_Q8_0_DP4A_ALDS4=0.
+            static const char * q8_0_alds4_env = getenv("GGML_OPENCL_Q8_0_DP4A_ALDS4");
+            const bool q8_0_alds4_on = (q8_0_alds4_env == nullptr) || (atoi(q8_0_alds4_env) != 0);
+            cl_kernel q8_0_alds4_k = use_wimg
+                ? (q80_use_narrow ? backend_ctx->kernel_gemm_noshuffle_q8_0_q8_1_dp4a_narrow_wimg_alds4
+                                  : backend_ctx->kernel_gemm_noshuffle_q8_0_q8_1_dp4a_wimg_alds4)
+                : (q80_use_narrow ? backend_ctx->kernel_gemm_noshuffle_q8_0_q8_1_dp4a_narrow_alds4
+                                  : backend_ctx->kernel_gemm_noshuffle_q8_0_q8_1_dp4a_alds4);
+            const bool use_q8_0_alds4 = q8_0_alds4_on && q8_0_alds4_k != nullptr;
+            if (use_q8_0_alds4) { dk = q8_0_alds4_k; }
+            if (getenv("GGML_OPENCL_DP4A_ROUTE_PROBE")) {
+                fprintf(stderr, "[DP4A-ROUTE] q8_0 M=%d N=%d K=%d -> %s%s%s\n", M, N, K,
+                        q80_use_narrow ? "narrow" : "wide", use_wimg ? "+wimg" : "",
+                        use_q8_0_alds4 ? "+alds4" : "");
+                fflush(stderr);
+            }
             int ai = 0;
             if (use_wimg) {
                 CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_mem), &q8_q_img));
@@ -28092,6 +28170,21 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
                                  && (N <= backend_ctx->q6k_dp4a_narrow_max);
             cl_kernel dk = use_narrow ? backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a_narrow
                                       : backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a;
+            // uint4 staging tile (see the kernel header): the inner loop read the
+            // __local activation tile one uint at a time. DEFAULT ON; opt out with
+            // GGML_OPENCL_Q6_K_DP4A_ALDS4=0.
+            static const char * q6_K_alds4_env = getenv("GGML_OPENCL_Q6_K_DP4A_ALDS4");
+            const bool q6_K_alds4_on = (q6_K_alds4_env == nullptr) || (atoi(q6_K_alds4_env) != 0);
+            cl_kernel q6_K_alds4_k = use_narrow ? backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a_narrow_alds4
+                                     : backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a_alds4;
+            const bool use_q6_K_alds4 = q6_K_alds4_on && q6_K_alds4_k != nullptr;
+            if (use_q6_K_alds4) { dk = q6_K_alds4_k; }
+            if (getenv("GGML_OPENCL_DP4A_ROUTE_PROBE")) {
+                fprintf(stderr, "[DP4A-ROUTE] q6_K M=%d N=%d K=%d -> %s%s%s\n", M, N, K,
+                        use_narrow ? "narrow" : "wide", false ? "+wimg" : "",
+                        use_q6_K_alds4 ? "+alds4" : "");
+                fflush(stderr);
+            }
             // Split-K, same rationale as the q4_K dp4a GEMM: one column tile at the
             // verify widths leaves the grid too small to fill the SP. Separate knob so
             // the two quants can be measured apart. Narrow band only; default 1 = off.
