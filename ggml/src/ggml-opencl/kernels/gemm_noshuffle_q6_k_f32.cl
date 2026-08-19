@@ -305,34 +305,34 @@ kernel void kernel_gemm_noshuffle_q6_K_f32_cok_r4(
         // j=0
         B.s0123 = read_imageh(src1, (i + 0)*n_4 + 0);
         B.s4567 = read_imageh(src1, (i + 0)*n_4 + 1);
-        acc0 += B * ((convert_half((bits4.s0 & 0x000F) | ((bits2.s0 & 0x03) << 4)) - 32.f) * ss0 * scd.s0);
-        acc1 += B * ((convert_half((bits4.s1 & 0x000F) | ((bits2.s1 & 0x03) << 4)) - 32.f) * ss1 * scd.s1);
-        acc2 += B * ((convert_half((bits4.s2 & 0x000F) | ((bits2.s2 & 0x03) << 4)) - 32.f) * ss2 * scd.s2);
-        acc3 += B * ((convert_half((bits4.s3 & 0x000F) | ((bits2.s3 & 0x03) << 4)) - 32.f) * ss3 * scd.s3);
+        acc0 += B * convert_half((convert_half((bits4.s0 & 0x000F) | ((bits2.s0 & 0x03) << 4)) - 32.f) * ss0 * scd.s0);
+        acc1 += B * convert_half((convert_half((bits4.s1 & 0x000F) | ((bits2.s1 & 0x03) << 4)) - 32.f) * ss1 * scd.s1);
+        acc2 += B * convert_half((convert_half((bits4.s2 & 0x000F) | ((bits2.s2 & 0x03) << 4)) - 32.f) * ss2 * scd.s2);
+        acc3 += B * convert_half((convert_half((bits4.s3 & 0x000F) | ((bits2.s3 & 0x03) << 4)) - 32.f) * ss3 * scd.s3);
 
         // j=1
         B.s0123 = read_imageh(src1, (i + 1)*n_4 + 0);
         B.s4567 = read_imageh(src1, (i + 1)*n_4 + 1);
-        acc0 += B * ((convert_half(((bits4.s0 & 0x00F0) >> 4) | ((bits2.s0 & 0x0C) << 2)) - 32.f) * ss0 * scd.s0);
-        acc1 += B * ((convert_half(((bits4.s1 & 0x00F0) >> 4) | ((bits2.s1 & 0x0C) << 2)) - 32.f) * ss1 * scd.s1);
-        acc2 += B * ((convert_half(((bits4.s2 & 0x00F0) >> 4) | ((bits2.s2 & 0x0C) << 2)) - 32.f) * ss2 * scd.s2);
-        acc3 += B * ((convert_half(((bits4.s3 & 0x00F0) >> 4) | ((bits2.s3 & 0x0C) << 2)) - 32.f) * ss3 * scd.s3);
+        acc0 += B * convert_half((convert_half(((bits4.s0 & 0x00F0) >> 4) | ((bits2.s0 & 0x0C) << 2)) - 32.f) * ss0 * scd.s0);
+        acc1 += B * convert_half((convert_half(((bits4.s1 & 0x00F0) >> 4) | ((bits2.s1 & 0x0C) << 2)) - 32.f) * ss1 * scd.s1);
+        acc2 += B * convert_half((convert_half(((bits4.s2 & 0x00F0) >> 4) | ((bits2.s2 & 0x0C) << 2)) - 32.f) * ss2 * scd.s2);
+        acc3 += B * convert_half((convert_half(((bits4.s3 & 0x00F0) >> 4) | ((bits2.s3 & 0x0C) << 2)) - 32.f) * ss3 * scd.s3);
 
         // j=2
         B.s0123 = read_imageh(src1, (i + 2)*n_4 + 0);
         B.s4567 = read_imageh(src1, (i + 2)*n_4 + 1);
-        acc0 += B * ((convert_half(((bits4.s0 & 0x0F00) >> 8) | (bits2.s0 & 0x30)) - 32.f) * ss0 * scd.s0);
-        acc1 += B * ((convert_half(((bits4.s1 & 0x0F00) >> 8) | (bits2.s1 & 0x30)) - 32.f) * ss1 * scd.s1);
-        acc2 += B * ((convert_half(((bits4.s2 & 0x0F00) >> 8) | (bits2.s2 & 0x30)) - 32.f) * ss2 * scd.s2);
-        acc3 += B * ((convert_half(((bits4.s3 & 0x0F00) >> 8) | (bits2.s3 & 0x30)) - 32.f) * ss3 * scd.s3);
+        acc0 += B * convert_half((convert_half(((bits4.s0 & 0x0F00) >> 8) | (bits2.s0 & 0x30)) - 32.f) * ss0 * scd.s0);
+        acc1 += B * convert_half((convert_half(((bits4.s1 & 0x0F00) >> 8) | (bits2.s1 & 0x30)) - 32.f) * ss1 * scd.s1);
+        acc2 += B * convert_half((convert_half(((bits4.s2 & 0x0F00) >> 8) | (bits2.s2 & 0x30)) - 32.f) * ss2 * scd.s2);
+        acc3 += B * convert_half((convert_half(((bits4.s3 & 0x0F00) >> 8) | (bits2.s3 & 0x30)) - 32.f) * ss3 * scd.s3);
 
         // j=3
         B.s0123 = read_imageh(src1, (i + 3)*n_4 + 0);
         B.s4567 = read_imageh(src1, (i + 3)*n_4 + 1);
-        acc0 += B * ((convert_half(((bits4.s0 & mask_f000) >> 12) | ((bits2.s0 & mask_c0) >> 2)) - 32.f) * ss0 * scd.s0);
-        acc1 += B * ((convert_half(((bits4.s1 & mask_f000) >> 12) | ((bits2.s1 & mask_c0) >> 2)) - 32.f) * ss1 * scd.s1);
-        acc2 += B * ((convert_half(((bits4.s2 & mask_f000) >> 12) | ((bits2.s2 & mask_c0) >> 2)) - 32.f) * ss2 * scd.s2);
-        acc3 += B * ((convert_half(((bits4.s3 & mask_f000) >> 12) | ((bits2.s3 & mask_c0) >> 2)) - 32.f) * ss3 * scd.s3);
+        acc0 += B * convert_half((convert_half(((bits4.s0 & mask_f000) >> 12) | ((bits2.s0 & mask_c0) >> 2)) - 32.f) * ss0 * scd.s0);
+        acc1 += B * convert_half((convert_half(((bits4.s1 & mask_f000) >> 12) | ((bits2.s1 & mask_c0) >> 2)) - 32.f) * ss1 * scd.s1);
+        acc2 += B * convert_half((convert_half(((bits4.s2 & mask_f000) >> 12) | ((bits2.s2 & mask_c0) >> 2)) - 32.f) * ss2 * scd.s2);
+        acc3 += B * convert_half((convert_half(((bits4.s3 & mask_f000) >> 12) | ((bits2.s3 & mask_c0) >> 2)) - 32.f) * ss3 * scd.s3);
     }
 
     // Reduce one row at a time so __local stays the size the 1-row kernel used.
