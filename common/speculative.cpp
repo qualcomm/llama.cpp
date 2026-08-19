@@ -157,6 +157,14 @@ struct common_speculative_impl {
     int64_t t_draft_us  = 0; // total time spent in generating drafts in this implementation in microseconds.
     int64_t t_accept_us = 0; // total time spent in accumulation of this implementation in microseconds.
 
+    // DFlash draft-side breakdown. The drafter is ~19% of a speculative round while being
+    // ~8% of the bytes, and it walks its decoder TWICE per round: once to inject the
+    // target's fused features as K/V for the verified rows, once for the token block.
+    // These separate the passes so the split is measured rather than assumed.
+    int64_t t_dft_enc_us    = 0; // DFlash encoder (fuses the target's extracted layers)
+    int64_t t_dft_inject_us = 0; // decoder pass that only writes K/V for the verified rows
+    int64_t t_dft_block_us  = 0; // decoder pass that produces the draft block
+
     common_speculative_impl(common_speculative_type type, uint32_t n_seq) : type(type), n_seq(n_seq) {}
 
     virtual ~common_speculative_impl() = default;
@@ -1128,7 +1136,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     /*.logits   =*/ nullptr,
                 };
 
-                int32_t rc = llama_encode(ctx_dft, enc_batch);
+                int32_t rc;
+                {
+                    common_time_meas tm(this->t_dft_enc_us, !this->gen_perf);
+                    rc = llama_encode(ctx_dft, enc_batch);
+                }
                 if (rc != 0) {
                     LOG_ERR("%s: llama_encode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
                             __func__, rc, (int) n_chunk, (int) offset);
@@ -1148,7 +1160,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     batch_inject.seq_id[i][0] = seq_id;
                     batch_inject.logits[i]    = false;
                 }
-                rc = llama_decode(ctx_dft, batch_inject);
+                {
+                    common_time_meas tm(this->t_dft_inject_us, !this->gen_perf);
+                    rc = llama_decode(ctx_dft, batch_inject);
+                }
                 if (rc != 0) {
                     LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
                             __func__, rc, (int) n_chunk, (int) offset);
@@ -1195,7 +1210,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
 
         // decode all sequence's noise block in a single batch
-        int ret = llama_decode(ctx_dft, batch);
+        int ret;
+        {
+            common_time_meas tm(this->t_dft_block_us, !this->gen_perf);
+            ret = llama_decode(ctx_dft, batch);
+        }
         if (ret != 0) {
             LOG_WRN("%s: llama_decode returned %d\n", __func__, ret);
             return;
@@ -2769,6 +2788,14 @@ void common_speculative_print_stats(const common_speculative * spec) {
             oss << std::fixed << std::setprecision(3) << impl->t_draft_us / 1000.0 << ", ";
             oss << std::fixed << std::setprecision(3) << impl->t_accept_us / 1000.0;
             str_perf = ", dur(b,g,a) = " + oss.str() + " ms";
+            if (impl->t_dft_enc_us || impl->t_dft_inject_us || impl->t_dft_block_us) {
+                std::ostringstream od;
+                od << std::fixed << std::setprecision(3)
+                   << impl->t_dft_enc_us    / 1000.0 << ", "
+                   << impl->t_dft_inject_us / 1000.0 << ", "
+                   << impl->t_dft_block_us  / 1000.0;
+                str_perf += ", dft(enc,inject,block) = " + od.str() + " ms";
+            }
         } else {
             str_perf = "";
         }
