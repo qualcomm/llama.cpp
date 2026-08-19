@@ -27300,9 +27300,15 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
 
         // Same texture read, but for the 4-rows-per-lane kernel: a lane takes two whole
         // texels there instead of half of one. Opt-in: GGML_OPENCL_Q4K_GEMM_COK_R4_WIMG=1.
+        // DEFAULT ON; opt out with GGML_OPENCL_Q4K_GEMM_COK_R4_WIMG=0. Measured on the
+        // MODEL, not the synthetic shape: muse-glimmer-30B pp5 23.66 -> 24.08 (+1.8%) and
+        // pp8 37.79 -> 38.07 (+0.75%), against control arms that agree to 0.13%. The same
+        // A/B at test-backend-ops m=4096 reads as noise, because that shape launches
+        // ne01/256 = 16 workgroups on 16 compute units and pins every variant to one
+        // workgroup's latency. test-backend-ops MUL_MAT: 43 q4_K pass, 0 fail.
         static const char * q4k_cok_r4_wimg_env = getenv("GGML_OPENCL_Q4K_GEMM_COK_R4_WIMG");
         bool use_cok_r4_wimg = use_cok && !use_cok_wimg
-                             && (q4k_cok_r4_wimg_env != nullptr) && (atoi(q4k_cok_r4_wimg_env) != 0)
+                             && ((q4k_cok_r4_wimg_env == nullptr) || (atoi(q4k_cok_r4_wimg_env) != 0))
                              && backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg != nullptr
                              && (M % 4 == 0)
                              && cok_tex > 0 && cok_tex <= backend_ctx->image_max_buffer_size;
