@@ -1735,6 +1735,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_wimg = nullptr;
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r4   = nullptr;
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r4_sv = nullptr;
+    cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r4_ma = nullptr;
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r8   = nullptr;
     cl_kernel kernel_gemv_noshuffle_q6_K_f32;
     cl_kernel kernel_gemv_noshuffle_q6_K_f32_o4;
@@ -5195,6 +5196,10 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_sv =
             clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_f32_cok_r4_sv", &err);
         if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_sv = nullptr; }
+        // 4-rows-per-lane cok with the scale/min folded out of the inner loop.
+        backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_ma =
+            clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_f32_cok_r4_ma", &err);
+        if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_ma = nullptr; }
         // 8-rows-per-lane cok. Also non-fatal; the r4/1-row kernels remain.
         backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r8 =
             clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_f32_cok_r8", &err);
@@ -27255,6 +27260,15 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
                                  && (q4k_cok_r4_sv_env != nullptr) && (atoi(q4k_cok_r4_sv_env) != 0)
                                  && backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_sv != nullptr;
 
+        // Same kernel with the per-weight scale and min folded out of the inner loop
+        // (see the kernel comment). The ALU-side counterpart to _SV: it changes no
+        // loads at all. NOT bit-identical -- products are summed before scaling.
+        // Opt-in while measured: GGML_OPENCL_Q4K_GEMM_COK_R4_MA=1.
+        static const char * q4k_cok_r4_ma_env = getenv("GGML_OPENCL_Q4K_GEMM_COK_R4_MA");
+        const bool use_cok_r4_ma = use_cok_r4 && !use_cok_r4_sv
+                                 && (q4k_cok_r4_ma_env != nullptr) && (atoi(q4k_cok_r4_ma_env) != 0)
+                                 && backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_ma != nullptr;
+
         // Which small-batch kernel this shape actually gets. Three A/Bs on this file
         // have been vacuous because the dispatch never reached the kernel under test,
         // so any null result here must be able to show it ran.
@@ -27265,6 +27279,7 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
                 fprintf(stderr, "[Q4K-COK-PROBE] M=%d N=%d K=%d -> %s (r4_sv_built=%d)\n",
                         M, N, ne00,
                         use_cok_r8 ? "cok_r8" : use_cok_r4_sv ? "cok_r4_sv"
+                        : use_cok_r4_ma ? "cok_r4_ma"
                         : use_cok_r4 ? "cok_r4" : use_cok_wimg ? "cok_wimg"
                         : use_cok ? "cok" : use_r1 ? "r1" : use_kimg ? "kimg" : "base_gemm",
                         backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_sv != nullptr);
@@ -27274,6 +27289,7 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
 
         kernel = use_cok_r8    ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r8
                : use_cok_r4_sv ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_sv
+               : use_cok_r4_ma ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_ma
                : use_cok_r4   ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4
                : use_cok_wimg ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_wimg
                : use_cok  ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok

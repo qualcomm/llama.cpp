@@ -893,6 +893,157 @@ kernel void kernel_gemm_noshuffle_q4_k_f32_cok_r4_sv(
     }
 }
 
+// _cok_r4 with the per-weight scale and min folded OUT of the inner loop.
+//
+// Two independent load-side experiments came back null on this kernel -- 8 rows per
+// lane (16 B, double r4's) and reading the four rows' scale codes as uchar4 -- so what
+// binds it is not load issue rate any more. This kernel is the ALU-side test: it cuts
+// arithmetic without moving a single byte.
+//
+// Per weight the inner loop computed  acc += B * (w*scale - mval), i.e. two scalar ops
+// per (k, row) before the half8 FMA. Over one 32-K sub-block scale and mval are
+// constant, so
+//
+//     sum_k B_k*(w_k*scale - mval) = scale * sum_k(B_k*w_k) - mval * sum_k(B_k)
+//
+// and sum_k(B_k) does not depend on the row, so the four rows share it. The inner loop
+// then costs one convert and one FMA per (k, row) plus one shared add per k, and the
+// scale/min are applied once per 32-K block instead of once per weight.
+//
+// NOT bit-identical to _cok_r4: the products are summed before scaling rather than
+// after, so half rounding falls differently. The raw accumulator is reset every 32-K
+// block, which bounds it at 32*15*|B| and keeps it in half's range.
+REQD_SUBGROUP_SIZE_64
+kernel void kernel_gemm_noshuffle_q4_k_f32_cok_r4_ma(
+    global const ushort * src0_q,
+    global const uchar  * src0_s,
+    global const half   * src0_d,
+    global const half   * src0_dm,
+    read_only image1d_buffer_t src1,
+    global float * dst,
+    ulong offsetd,
+    int m,
+    int n,
+    int k,
+    int n_no_padding,
+    uchar mask_d6,
+    uchar mask_d4,
+    uchar mask_hi2
+) {
+    dst = (global float *)((global char *)dst + offsetd);
+    int n_4  = n >> 2;
+    int gx   = get_global_id(0);
+    int sg   = get_local_id(1);
+    int lane = get_local_id(0);
+
+    int row0 = gx << 2;
+    int num_32blk = k / 32;
+
+    half8 acc0 = 0, acc1 = 0, acc2 = 0, acc3 = 0;
+    half8 B;
+
+    for (int blk = sg; blk < num_32blk; blk += COK_NSG) {
+        int i       = blk << 5;
+        int sb_idx  = blk >> 3;
+        int sub_idx = blk & 7;
+
+        half4 dd  = vload4(0, src0_d  + row0 + sb_idx * m);
+        half4 dmm = vload4(0, src0_dm + row0 + sb_idx * m);
+
+        global const uchar * sc = src0_s + sb_idx * K_SCALE_SIZE * m + row0;
+        uchar sv0, mn0, sv1, mn1, sv2, mn2, sv3, mn3;
+        get_scale_min_k4(sub_idx, sc + 0, m, &sv0, &mn0, mask_d6, mask_d4, mask_hi2);
+        get_scale_min_k4(sub_idx, sc + 1, m, &sv1, &mn1, mask_d6, mask_d4, mask_hi2);
+        get_scale_min_k4(sub_idx, sc + 2, m, &sv2, &mn2, mask_d6, mask_d4, mask_hi2);
+        get_scale_min_k4(sub_idx, sc + 3, m, &sv3, &mn3, mask_d6, mask_d4, mask_hi2);
+
+        half4 scale, mval;
+        scale.s0 = convert_half(convert_float(dd.s0)  * (float)sv0);
+        scale.s1 = convert_half(convert_float(dd.s1)  * (float)sv1);
+        scale.s2 = convert_half(convert_float(dd.s2)  * (float)sv2);
+        scale.s3 = convert_half(convert_float(dd.s3)  * (float)sv3);
+        mval.s0  = convert_half(convert_float(dmm.s0) * (float)mn0);
+        mval.s1  = convert_half(convert_float(dmm.s1) * (float)mn1);
+        mval.s2  = convert_half(convert_float(dmm.s2) * (float)mn2);
+        mval.s3  = convert_half(convert_float(dmm.s3) * (float)mn3);
+
+        // block-local sums: raw_r = sum_k B_k*w_kr, bsum = sum_k B_k (shared by the rows)
+        half8 raw0 = 0, raw1 = 0, raw2 = 0, raw3 = 0, bsum = 0;
+
+        for (int l = 0; l < 32; l += 4) {
+            int ki = i + l;
+            ushort4 bits = vload4(0, src0_q + row0 + (ki >> 2) * m);
+
+            B.s0123 = read_imageh(src1,     (ki+0) * n_4);
+            B.s4567 = read_imageh(src1, 1 + (ki+0) * n_4);
+            bsum += B;
+            raw0 += B * (half)( bits.s0        & 0x000F);
+            raw1 += B * (half)( bits.s1        & 0x000F);
+            raw2 += B * (half)( bits.s2        & 0x000F);
+            raw3 += B * (half)( bits.s3        & 0x000F);
+
+            B.s0123 = read_imageh(src1,     (ki+1) * n_4);
+            B.s4567 = read_imageh(src1, 1 + (ki+1) * n_4);
+            bsum += B;
+            raw0 += B * (half)((bits.s0 >> 4)  & 0x000F);
+            raw1 += B * (half)((bits.s1 >> 4)  & 0x000F);
+            raw2 += B * (half)((bits.s2 >> 4)  & 0x000F);
+            raw3 += B * (half)((bits.s3 >> 4)  & 0x000F);
+
+            B.s0123 = read_imageh(src1,     (ki+2) * n_4);
+            B.s4567 = read_imageh(src1, 1 + (ki+2) * n_4);
+            bsum += B;
+            raw0 += B * (half)((bits.s0 >> 8)  & 0x000F);
+            raw1 += B * (half)((bits.s1 >> 8)  & 0x000F);
+            raw2 += B * (half)((bits.s2 >> 8)  & 0x000F);
+            raw3 += B * (half)((bits.s3 >> 8)  & 0x000F);
+
+            B.s0123 = read_imageh(src1,     (ki+3) * n_4);
+            B.s4567 = read_imageh(src1, 1 + (ki+3) * n_4);
+            bsum += B;
+            raw0 += B * (half)((bits.s0 >> 12) & 0x000F);
+            raw1 += B * (half)((bits.s1 >> 12) & 0x000F);
+            raw2 += B * (half)((bits.s2 >> 12) & 0x000F);
+            raw3 += B * (half)((bits.s3 >> 12) & 0x000F);
+        }
+
+        acc0 += raw0 * scale.s0 - bsum * mval.s0;
+        acc1 += raw1 * scale.s1 - bsum * mval.s1;
+        acc2 += raw2 * scale.s2 - bsum * mval.s2;
+        acc3 += raw3 * scale.s3 - bsum * mval.s3;
+    }
+
+    local float8 reduceLM[COK_SG * (COK_NSG - 1)];
+    float8 out[4];
+    for (int r = 0; r < 4; r++) {
+        half8 acc = (r == 0) ? acc0 : (r == 1) ? acc1 : (r == 2) ? acc2 : acc3;
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (sg > 0) {
+            reduceLM[(sg - 1) * COK_SG + lane] = convert_float8(acc);
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (sg == 0) {
+            float8 sum = convert_float8(acc);
+            for (int s = 0; s < COK_NSG - 1; s++) {
+                sum += reduceLM[s * COK_SG + lane];
+            }
+            out[r] = sum;
+        }
+    }
+
+    if (sg == 0) {
+        int idx = row0;
+        if (idx < m*n_no_padding) { vstore4((float4)(out[0].s0, out[1].s0, out[2].s0, out[3].s0), 0, dst + idx); idx += m; }
+        if (idx < m*n_no_padding) { vstore4((float4)(out[0].s1, out[1].s1, out[2].s1, out[3].s1), 0, dst + idx); idx += m; }
+        if (idx < m*n_no_padding) { vstore4((float4)(out[0].s2, out[1].s2, out[2].s2, out[3].s2), 0, dst + idx); idx += m; }
+        if (idx < m*n_no_padding) { vstore4((float4)(out[0].s3, out[1].s3, out[2].s3, out[3].s3), 0, dst + idx); idx += m; }
+        if (idx < m*n_no_padding) { vstore4((float4)(out[0].s4, out[1].s4, out[2].s4, out[3].s4), 0, dst + idx); idx += m; }
+        if (idx < m*n_no_padding) { vstore4((float4)(out[0].s5, out[1].s5, out[2].s5, out[3].s5), 0, dst + idx); idx += m; }
+        if (idx < m*n_no_padding) { vstore4((float4)(out[0].s6, out[1].s6, out[2].s6, out[3].s6), 0, dst + idx); idx += m; }
+        if (idx < m*n_no_padding) { vstore4((float4)(out[0].s7, out[1].s7, out[2].s7, out[3].s7), 0, dst + idx); }
+    }
+}
+
 // 8-rows-per-lane cok. Same idea as _cok_r4, taken one step further: eight adjacent
 // rows load as a single ushort8, which is 16 bytes per lane and finally matches the
 // uint4 the q4_K GEMV issues. r4 (8 bytes) was worth +32.0% on muse pp8; the question
