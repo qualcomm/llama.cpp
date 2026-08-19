@@ -25177,10 +25177,18 @@ static void ggml_cl_mul_mat_q4_0_f32_adreno(ggml_backend_t backend, const ggml_t
         // and the int8 ALU win has nothing to beat -- same as q5_0 dense (cf. IQ4_NL
         // +20%, whose codebook dequant is expensive). Kept for A/B; force on with
         // GGML_OPENCL_Q4_0_DENSE_DP4A=1. Needs N>8, K%32==0, M%64==0.
+        // Was hard-coded off: against the scalar-staging kernel the dp4a path won the
+        // verify band but LOST 3.9% at prefill, so it was not worth defaulting on. The
+        // uint4 staging tile below removes that loss. Qwen3.8-27B-Q4_0 on Adreno X2-90,
+        // bracketed, controls agreeing to 0.14%:
+        //     pp16   28.05 -> 31.56 (dp4a) -> 34.35 (+ uint4 tile) -> 35.46 (+ texture)
+        //     pp512  96.00 -> 92.28 (dp4a) -> 105.57            -> 110.43
+        // i.e. +26.4% and +15.0% against the previous default. Now follows the same
+        // per-device gate as the q4_K / q6_K / q8_0 dense dp4a paths.
         static const char * q4_0_dense_dp4a_env = getenv("GGML_OPENCL_Q4_0_DENSE_DP4A");
         bool q4_0_dense_dp4a_on = q4_0_dense_dp4a_env
             ? (atoi(q4_0_dense_dp4a_env) != 0)
-            : false;
+            : adreno_dense_dp4a_default_on(backend_ctx);
         // dot prod has to be available
         q4_0_dense_dp4a_on = backend_ctx->has_integer_dot_product && q4_0_dense_dp4a_on;
 
@@ -25213,8 +25221,15 @@ static void ggml_cl_mul_mat_q4_0_f32_adreno(ggml_backend_t backend, const ggml_t
             // Read the weight plane through a texture, as q4_K does. Opt-in while it is
             // measured; needs an even m for the constant-parity half-select and the texel
             // count must fit the device image-buffer cap.
+            // DEFAULT ON alongside the uint4 staging tile: +3.2% pp16 / +4.6% pp512 on
+            // Qwen3.8-27B-Q4_0, measured on top of it. Opting out of the tile restores
+            // the old opt-in behaviour, so the pair stays A/B-able as a pair.
+            static const char * q40_alds4_env0 = getenv("GGML_OPENCL_Q4_0_DP4A_ALDS4");
+            const bool q40_alds4_default_on = (q40_alds4_env0 == nullptr)
+                                           || (atoi(q40_alds4_env0) != 0);
             static const char * q40_wimg_env = getenv("GGML_OPENCL_Q4_0_DENSE_DP4A_WIMG");
-            const bool q40_wimg_on = (q40_wimg_env != nullptr) && (atoi(q40_wimg_env) != 0);
+            const bool q40_wimg_on = q40_wimg_env ? (atoi(q40_wimg_env) != 0)
+                                                  : q40_alds4_default_on;
             cl_kernel wk = use_narrow ? backend_ctx->kernel_gemm_noshuffle_q4_0_q8_1_dp4a_narrow_wimg
                                       : backend_ctx->kernel_gemm_noshuffle_q4_0_q8_1_dp4a_wimg;
             const size_t q40_tex = (size_t)M * (size_t)K / 8;   // uint32 texels = bytes/4
@@ -25237,8 +25252,7 @@ static void ggml_cl_mul_mat_q4_0_f32_adreno(ggml_backend_t backend, const ggml_t
                                       : backend_ctx->kernel_gemm_noshuffle_q4_0_q8_1_dp4a;
             // uint4 staging tile (see the kernel header). DEFAULT ON; opt out with
             // GGML_OPENCL_Q4_0_DP4A_ALDS4=0.
-            static const char * q40_alds4_env = getenv("GGML_OPENCL_Q4_0_DP4A_ALDS4");
-            const bool q40_alds4_on = (q40_alds4_env == nullptr) || (atoi(q40_alds4_env) != 0);
+            const bool q40_alds4_on = q40_alds4_default_on;
             cl_kernel q40_alds4_k = use_wimg
                 ? (use_narrow ? backend_ctx->kernel_gemm_noshuffle_q4_0_q8_1_dp4a_narrow_wimg_alds4
                               : backend_ctx->kernel_gemm_noshuffle_q4_0_q8_1_dp4a_wimg_alds4)
@@ -26584,8 +26598,12 @@ static void ggml_cl_mul_mat_q8_0_f32_adreno(ggml_backend_t backend, const ggml_t
             // uint4 staging tile (see the kernel header): the inner loop read the
             // __local activation tile one uint at a time. DEFAULT ON; opt out with
             // GGML_OPENCL_Q8_0_DP4A_ALDS4=0.
+            // DEFAULT OFF - ported but UNMEASURED. The only q8_0 model on hand is a
+            // DFlash drafter that will not load standalone, and the op suite silently
+            // drops the n=512 q8_0 perf case. q6_K shows this fix does not generalise to
+            // every format, so it stays opt-in until it has a number.
             static const char * q8_0_alds4_env = getenv("GGML_OPENCL_Q8_0_DP4A_ALDS4");
-            const bool q8_0_alds4_on = (q8_0_alds4_env == nullptr) || (atoi(q8_0_alds4_env) != 0);
+            const bool q8_0_alds4_on = (q8_0_alds4_env != nullptr) && (atoi(q8_0_alds4_env) != 0);
             cl_kernel q8_0_alds4_k = use_wimg
                 ? (q80_use_narrow ? backend_ctx->kernel_gemm_noshuffle_q8_0_q8_1_dp4a_narrow_wimg_alds4
                                   : backend_ctx->kernel_gemm_noshuffle_q8_0_q8_1_dp4a_wimg_alds4)
@@ -28177,7 +28195,12 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
             const bool q6_K_alds4_on = (q6_K_alds4_env == nullptr) || (atoi(q6_K_alds4_env) != 0);
             cl_kernel q6_K_alds4_k = use_narrow ? backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a_narrow_alds4
                                      : backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a_alds4;
-            const bool use_q6_K_alds4 = q6_K_alds4_on && q6_K_alds4_k != nullptr;
+            // NARROW BAND ONLY - the one format where the uint4 tile does not
+            // generalise. muse-glimmer-30B Q4_K_M on Adreno X2-90, bracketed, controls
+            // agreeing to 0.15%: pp16 65.16 -> 65.97 (+1.2%) but pp512 111.46 -> 109.40
+            // (-1.8%). q6_K also carries a private uint qw[8] array the other kernels do
+            // not, which is the likeliest reason the wide tile cannot absorb it.
+            const bool use_q6_K_alds4 = q6_K_alds4_on && use_narrow && q6_K_alds4_k != nullptr;
             if (use_q6_K_alds4) { dk = q6_K_alds4_k; }
             if (getenv("GGML_OPENCL_DP4A_ROUTE_PROBE")) {
                 fprintf(stderr, "[DP4A-ROUTE] q6_K M=%d N=%d K=%d -> %s%s%s\n", M, N, K,
