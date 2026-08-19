@@ -1594,6 +1594,18 @@ struct ggml_backend_opencl_context {
         populateProfilingInfo(profiling_info.back(), evt, kernel, work_dim, global_work_size, local_work_size, tensor);
         if (profiling_info.size() >= 2048) {
             flush_profiling_batch();
+            // The csv is otherwise written only when the backend refcount hits zero, so a
+            // process that is killed rather than exited (llama-server) produces nothing.
+            // GGML_OPENCL_PROFILE_DUMP_EVERY=N rewrites it every N flushes, which is what
+            // makes a speculative-decoding server profilable at all.
+            static const char * dump_every_env = getenv("GGML_OPENCL_PROFILE_DUMP_EVERY");
+            static const int dump_every = dump_every_env ? atoi(dump_every_env) : 0;
+            if (dump_every > 0) {
+                static int n_flush = 0;
+                if (++n_flush % dump_every == 0) {
+                    write_profiling_info();
+                }
+            }
         }
 #else
         GGML_UNUSED(tensor);
