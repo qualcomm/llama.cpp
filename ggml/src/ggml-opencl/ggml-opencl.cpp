@@ -26613,17 +26613,33 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
     // is left to the existing routing (corrupts on the Adreno GEMV path; x2-
     // unified routes batched Q6_K lm_head to CPU). Per-layer mc3 is byte-identical.
     //
-    // The upper bound is the mc3|cok crossover, and it is a MEASURED tuning point,
-    // not a structural limit (mc3 itself is capped at 4 columns). cok always pays a
-    // padded 8-column tile, so its cost is flat across ne1 2..8 while mc3's rises
-    // per column: at 1 row per lane cok was ~620 us against mc3's 341/422/518 at
-    // n=2/3/4, which put the crossover just past 4. The 4-rows-per-lane cok is ~33%
-    // cheaper, so the boundary is expected to move down; GGML_OPENCL_Q4K_MC3_MAXN
-    // makes it A/B-able without a rebuild.
-    // Clamped to 4: the mc3 GEMV emits at most 4 columns, so a larger value would
-    // drop columns rather than run slower.
+    // The upper bound is the mc3|cooperative-K crossover, and it is a MEASURED
+    // tuning point, not a structural limit (mc3 itself emits at most 4 columns).
+    // The cooperative-K GEMM always computes a padded 8-column tile, so its cost is
+    // FLAT across ne1 2..8 while mc3's rises per column. That makes the boundary a
+    // function of the cooperative-K kernel's absolute cost, and the 4-rows-per-lane
+    // kernel moved it: X2-90, q4_K m=4096 k=14336, us/run
+    //     ne1        2       3       4
+    //     mc3      340.6   421.7   517.9
+    //     cok 1-row  ~620    ~620    ~620      -> mc3 wins through 4
+    //     cok r4    374.5   373.9   373.8      -> mc3 wins only at 2
+    // So the default follows whether the r4 kernel will actually run: the 1-row
+    // kernel is slower than mc3 at ne1 3 and 4, so a shape that falls back to it
+    // (row count not a multiple of 4, kernel unavailable, or the texture variant
+    // forced on) must keep the old bound. GGML_OPENCL_Q4K_MC3_MAXN overrides,
+    // clamped to 4 because a larger value would drop columns rather than run slower.
+    static const char * q4k_cok_r4_env_m  = getenv("GGML_OPENCL_Q4K_GEMM_COK_R4");
+    static const char * q4k_cok_env_m     = getenv("GGML_OPENCL_Q4K_GEMM_COK");
+    static const char * q4k_cok_wimg_env_m = getenv("GGML_OPENCL_Q4K_GEMM_COK_WIMG");
+    static const bool cok_r4_enabled =
+        ((q4k_cok_r4_env_m   == nullptr) || (atoi(q4k_cok_r4_env_m)   != 0)) &&
+        ((q4k_cok_env_m      == nullptr) || (atoi(q4k_cok_env_m)      != 0)) &&
+        ((q4k_cok_wimg_env_m == nullptr) || (atoi(q4k_cok_wimg_env_m) == 0));
+    const bool cok_r4_would_run = cok_r4_enabled && (ne01 % 4 == 0) &&
+        backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4 != nullptr;
     static const char * q4k_mc3_maxn_env = getenv("GGML_OPENCL_Q4K_MC3_MAXN");
-    static const int q4k_mc3_maxn = q4k_mc3_maxn_env ? MIN(atoi(q4k_mc3_maxn_env), 4) : 4;
+    const int q4k_mc3_maxn = q4k_mc3_maxn_env ? MIN(atoi(q4k_mc3_maxn_env), 4)
+                                              : (cok_r4_would_run ? 2 : 4);
     const bool use_mc3 = q4k_mc3 && (ne1 >= 2 && ne1 <= q4k_mc3_maxn) && (ne01 < 32768);
 
     if (ne1 == 1 || use_mc3) {
@@ -27308,7 +27324,30 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
     // Per-layer only (ne01 < 32768): batched large-vocab lm_head stays on the
     // existing path (x2-unified routes batched Q6_K lm_head to CPU; the Adreno
     // GEMV corrupts it). Per-layer mc3 is byte-identical.
-    const bool use_q6k_mc3 = q6k_mc3 && (ne1 >= 2 && ne1 <= 4) && (ne01 < 32768);
+    //
+    // Upper bound = the mc3|cooperative-K crossover, measured, and moved by the
+    // 4-rows-per-lane cooperative-K kernel exactly as for q4_K. Its cost is flat
+    // across ne1 2..8 (padded 8-column tile) while mc3's rises per column:
+    // X2-90, q6_K m=4096 k=14336, us/run
+    //     ne1        2       3       4
+    //     mc3      407.3   458.3   547.8
+    //     cok r4   448.7   447.9   450.1
+    // Only applied where the r4 kernel will actually run; the cooperative-K path
+    // also skips the lm_head, which must therefore keep the old bound.
+    static const char * q6k_cok_r4_env_m = getenv("GGML_OPENCL_Q6K_GEMM_COK_R4");
+    static const char * q6k_cok_env_m    = getenv("GGML_OPENCL_Q6K_GEMM_COK");
+    static const bool q6k_cok_r4_enabled =
+        ((q6k_cok_r4_env_m == nullptr) || (atoi(q6k_cok_r4_env_m) != 0)) &&
+        ((q6k_cok_env_m    == nullptr) || (atoi(q6k_cok_env_m)    != 0));
+    const bool q6k_is_output_w = strncmp(src0->name, "output", 6) == 0 ||
+                                 strncmp(src0->name, "token_embd", 10) == 0;
+    const bool q6k_cok_r4_would_run = q6k_cok_r4_enabled && !q6k_is_output_w &&
+        (ne01 % 4 == 0) &&
+        backend_ctx->kernel_gemm_noshuffle_q6_K_f32_cok_r4 != nullptr;
+    static const char * q6k_mc3_maxn_env = getenv("GGML_OPENCL_Q6K_MC3_MAXN");
+    const int q6k_mc3_maxn = q6k_mc3_maxn_env ? MIN(atoi(q6k_mc3_maxn_env), 4)
+                                              : (q6k_cok_r4_would_run ? 2 : 4);
+    const bool use_q6k_mc3 = q6k_mc3 && (ne1 >= 2 && ne1 <= q6k_mc3_maxn) && (ne01 < 32768);
     // Batched verify lm_head/embed (ne1 in [2..4], tiled layout). DEFAULT now
     // routes to the dp4a tiled GEMM (the else branch below): ~4x the float
     // multi-column tiled GEMV at ne1=2..4 (X2-90), q8_1-approx (NMSE ~1e-5, like
