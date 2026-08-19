@@ -27307,7 +27307,12 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
         // ne01/256 = 16 workgroups on 16 compute units and pins every variant to one
         // workgroup's latency. test-backend-ops MUL_MAT: 43 q4_K pass, 0 fail.
         static const char * q4k_cok_r4_wimg_env = getenv("GGML_OPENCL_Q4K_GEMM_COK_R4_WIMG");
+        // This IS a 4-row kernel, so it must honour the 4-row opt-out as well. Without
+        // that, GGML_OPENCL_Q4K_GEMM_COK_R4=0 stops disabling the 4-row path and every
+        // "1-row" control arm silently keeps running four rows per lane.
+        static const char * q4k_cok_r4_env_w = getenv("GGML_OPENCL_Q4K_GEMM_COK_R4");
         bool use_cok_r4_wimg = use_cok && !use_cok_wimg
+                             && ((q4k_cok_r4_env_w == nullptr) || (atoi(q4k_cok_r4_env_w) != 0))
                              && ((q4k_cok_r4_wimg_env == nullptr) || (atoi(q4k_cok_r4_wimg_env) != 0))
                              && backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg != nullptr
                              && (M % 4 == 0)
