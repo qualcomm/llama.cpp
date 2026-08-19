@@ -777,6 +777,309 @@ kernel void kernel_gemm_noshuffle_q4_k_f32_cok_r4(
     }
 }
 
+#ifdef ADRENO_GPU
+REQD_SUBGROUP_SIZE_64
+#endif
+kernel void kernel_gemm_noshuffle_q4_k_f32_cok_r4_nr(
+    global const ushort * src0_q,
+    global const uchar  * src0_s,
+    global const half   * src0_d,
+    global const half   * src0_dm,
+    read_only image1d_buffer_t src1,
+    global float * dst,
+    ulong offsetd,
+    int m,
+    int n,
+    int k,
+    int n_no_padding,
+    uchar mask_d6,
+    uchar mask_d4,
+    uchar mask_hi2
+) {
+    dst = (global float *)((global char *)dst + offsetd);
+    int n_4  = n >> 2;
+    int gx   = get_global_id(0);     // 4-row group
+    int sg   = get_local_id(1);      // subgroup index (K-split lane)
+    int lane = get_local_id(0);      // lane within subgroup (0..COK_SG-1)
+
+    int row0 = gx << 2;              // first of this lane's 4 rows
+    int num_32blk = k / 32;
+
+    half8 acc0 = 0, acc1 = 0, acc2 = 0, acc3 = 0;
+    half8 B;
+
+    for (int blk = sg; blk < num_32blk; blk += COK_NSG) {
+        int i       = blk << 5;       // blk * 32
+        int sb_idx  = blk >> 3;       // (blk*32) / QK_K
+        int sub_idx = blk & 7;        // (i/32) % 8
+
+        // the four rows are adjacent, so one vector load each
+        half4 dd  = vload4(0, src0_d  + row0 + sb_idx * m);
+        half4 dmm = vload4(0, src0_dm + row0 + sb_idx * m);
+
+        global const uchar * sc = src0_s + sb_idx * K_SCALE_SIZE * m + row0;
+        uchar sv0, mn0, sv1, mn1, sv2, mn2, sv3, mn3;
+        get_scale_min_k4(sub_idx, sc + 0, m, &sv0, &mn0, mask_d6, mask_d4, mask_hi2);
+        get_scale_min_k4(sub_idx, sc + 1, m, &sv1, &mn1, mask_d6, mask_d4, mask_hi2);
+        get_scale_min_k4(sub_idx, sc + 2, m, &sv2, &mn2, mask_d6, mask_d4, mask_hi2);
+        get_scale_min_k4(sub_idx, sc + 3, m, &sv3, &mn3, mask_d6, mask_d4, mask_hi2);
+
+        half4 scale, mval;
+        scale.s0 = convert_half(convert_float(dd.s0)  * (float)sv0);
+        scale.s1 = convert_half(convert_float(dd.s1)  * (float)sv1);
+        scale.s2 = convert_half(convert_float(dd.s2)  * (float)sv2);
+        scale.s3 = convert_half(convert_float(dd.s3)  * (float)sv3);
+        mval.s0  = convert_half(convert_float(dmm.s0) * (float)mn0);
+        mval.s1  = convert_half(convert_float(dmm.s1) * (float)mn1);
+        mval.s2  = convert_half(convert_float(dmm.s2) * (float)mn2);
+        mval.s3  = convert_half(convert_float(dmm.s3) * (float)mn3);
+
+        for (int l = 0; l < 32; l += 4) {
+            int ki = i + l;
+            // 8 bytes per lane: this lane's four rows at this K-group
+            ushort4 bits = vload4(0, src0_q + row0 + (ki >> 2) * m);
+
+            B.s0123 = read_imageh(src1,     (ki+0) * n_4);
+            B.s4567 = read_imageh(src1, 1 + (ki+0) * n_4);
+            acc0 += B * ((half)( bits.s0        & 0x000F) * scale.s0 - mval.s0);
+            acc1 += B * ((half)( bits.s1        & 0x000F) * scale.s1 - mval.s1);
+            acc2 += B * ((half)( bits.s2        & 0x000F) * scale.s2 - mval.s2);
+            acc3 += B * ((half)( bits.s3        & 0x000F) * scale.s3 - mval.s3);
+
+            B.s0123 = read_imageh(src1,     (ki+1) * n_4);
+            B.s4567 = read_imageh(src1, 1 + (ki+1) * n_4);
+            acc0 += B * ((half)((bits.s0 >> 4)  & 0x000F) * scale.s0 - mval.s0);
+            acc1 += B * ((half)((bits.s1 >> 4)  & 0x000F) * scale.s1 - mval.s1);
+            acc2 += B * ((half)((bits.s2 >> 4)  & 0x000F) * scale.s2 - mval.s2);
+            acc3 += B * ((half)((bits.s3 >> 4)  & 0x000F) * scale.s3 - mval.s3);
+
+            B.s0123 = read_imageh(src1,     (ki+2) * n_4);
+            B.s4567 = read_imageh(src1, 1 + (ki+2) * n_4);
+            acc0 += B * ((half)((bits.s0 >> 8)  & 0x000F) * scale.s0 - mval.s0);
+            acc1 += B * ((half)((bits.s1 >> 8)  & 0x000F) * scale.s1 - mval.s1);
+            acc2 += B * ((half)((bits.s2 >> 8)  & 0x000F) * scale.s2 - mval.s2);
+            acc3 += B * ((half)((bits.s3 >> 8)  & 0x000F) * scale.s3 - mval.s3);
+
+            B.s0123 = read_imageh(src1,     (ki+3) * n_4);
+            B.s4567 = read_imageh(src1, 1 + (ki+3) * n_4);
+            acc0 += B * ((half)((bits.s0 >> 12) & 0x000F) * scale.s0 - mval.s0);
+            acc1 += B * ((half)((bits.s1 >> 12) & 0x000F) * scale.s1 - mval.s1);
+            acc2 += B * ((half)((bits.s2 >> 12) & 0x000F) * scale.s2 - mval.s2);
+            acc3 += B * ((half)((bits.s3 >> 12) & 0x000F) * scale.s3 - mval.s3);
+        }
+    }
+
+    // Cross-subgroup reduction, with the four outputs held as NAMED REGISTERS rather
+    // than the private `float8 out[4]` that _cok_r4 uses. On Adreno an indexed
+    // per-work-item array lands in private memory: the driver reports
+    // CL_KERNEL_PRIVATE_MEM_SIZE 400 B for r4 against 128 B for the 1-row kernel,
+    // and the 8-row kernel -- twice the accumulators but all of them named --
+    // reports LESS (368 B). This changes the storage class and nothing else.
+    local float8 reduceLM[COK_SG * (COK_NSG - 1)];
+    float8 o0 = 0, o1 = 0, o2 = 0, o3 = 0;
+
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (sg > 0) { reduceLM[(sg - 1) * COK_SG + lane] = convert_float8(acc0); }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (sg == 0) {
+        float8 sum = convert_float8(acc0);
+        for (int s = 0; s < COK_NSG - 1; s++) { sum += reduceLM[s * COK_SG + lane]; }
+        o0 = sum;
+    }
+
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (sg > 0) { reduceLM[(sg - 1) * COK_SG + lane] = convert_float8(acc1); }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (sg == 0) {
+        float8 sum = convert_float8(acc1);
+        for (int s = 0; s < COK_NSG - 1; s++) { sum += reduceLM[s * COK_SG + lane]; }
+        o1 = sum;
+    }
+
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (sg > 0) { reduceLM[(sg - 1) * COK_SG + lane] = convert_float8(acc2); }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (sg == 0) {
+        float8 sum = convert_float8(acc2);
+        for (int s = 0; s < COK_NSG - 1; s++) { sum += reduceLM[s * COK_SG + lane]; }
+        o2 = sum;
+    }
+
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (sg > 0) { reduceLM[(sg - 1) * COK_SG + lane] = convert_float8(acc3); }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (sg == 0) {
+        float8 sum = convert_float8(acc3);
+        for (int s = 0; s < COK_NSG - 1; s++) { sum += reduceLM[s * COK_SG + lane]; }
+        o3 = sum;
+    }
+
+    if (sg == 0) {
+        int idx = row0;
+        if (idx < m*n_no_padding) { vstore4((float4)((float)o0.s0, (float)o1.s0, (float)o2.s0, (float)o3.s0), 0, dst + idx); idx += m; }
+        if (idx < m*n_no_padding) { vstore4((float4)((float)o0.s1, (float)o1.s1, (float)o2.s1, (float)o3.s1), 0, dst + idx); idx += m; }
+        if (idx < m*n_no_padding) { vstore4((float4)((float)o0.s2, (float)o1.s2, (float)o2.s2, (float)o3.s2), 0, dst + idx); idx += m; }
+        if (idx < m*n_no_padding) { vstore4((float4)((float)o0.s3, (float)o1.s3, (float)o2.s3, (float)o3.s3), 0, dst + idx); idx += m; }
+        if (idx < m*n_no_padding) { vstore4((float4)((float)o0.s4, (float)o1.s4, (float)o2.s4, (float)o3.s4), 0, dst + idx); idx += m; }
+        if (idx < m*n_no_padding) { vstore4((float4)((float)o0.s5, (float)o1.s5, (float)o2.s5, (float)o3.s5), 0, dst + idx); idx += m; }
+        if (idx < m*n_no_padding) { vstore4((float4)((float)o0.s6, (float)o1.s6, (float)o2.s6, (float)o3.s6), 0, dst + idx); idx += m; }
+        if (idx < m*n_no_padding) { vstore4((float4)((float)o0.s7, (float)o1.s7, (float)o2.s7, (float)o3.s7), 0, dst + idx); idx += m; }
+    }
+}
+
+#ifdef ADRENO_GPU
+REQD_SUBGROUP_SIZE_64
+#endif
+kernel void kernel_gemm_noshuffle_q4_k_f32_cok_r4_nrh(
+    global const ushort * src0_q,
+    global const uchar  * src0_s,
+    global const half   * src0_d,
+    global const half   * src0_dm,
+    read_only image1d_buffer_t src1,
+    global float * dst,
+    ulong offsetd,
+    int m,
+    int n,
+    int k,
+    int n_no_padding,
+    uchar mask_d6,
+    uchar mask_d4,
+    uchar mask_hi2
+) {
+    dst = (global float *)((global char *)dst + offsetd);
+    int n_4  = n >> 2;
+    int gx   = get_global_id(0);     // 4-row group
+    int sg   = get_local_id(1);      // subgroup index (K-split lane)
+    int lane = get_local_id(0);      // lane within subgroup (0..COK_SG-1)
+
+    int row0 = gx << 2;              // first of this lane's 4 rows
+    int num_32blk = k / 32;
+
+    half8 acc0 = 0, acc1 = 0, acc2 = 0, acc3 = 0;
+    half8 B;
+
+    for (int blk = sg; blk < num_32blk; blk += COK_NSG) {
+        int i       = blk << 5;       // blk * 32
+        int sb_idx  = blk >> 3;       // (blk*32) / QK_K
+        int sub_idx = blk & 7;        // (i/32) % 8
+
+        // the four rows are adjacent, so one vector load each
+        half4 dd  = vload4(0, src0_d  + row0 + sb_idx * m);
+        half4 dmm = vload4(0, src0_dm + row0 + sb_idx * m);
+
+        global const uchar * sc = src0_s + sb_idx * K_SCALE_SIZE * m + row0;
+        uchar sv0, mn0, sv1, mn1, sv2, mn2, sv3, mn3;
+        get_scale_min_k4(sub_idx, sc + 0, m, &sv0, &mn0, mask_d6, mask_d4, mask_hi2);
+        get_scale_min_k4(sub_idx, sc + 1, m, &sv1, &mn1, mask_d6, mask_d4, mask_hi2);
+        get_scale_min_k4(sub_idx, sc + 2, m, &sv2, &mn2, mask_d6, mask_d4, mask_hi2);
+        get_scale_min_k4(sub_idx, sc + 3, m, &sv3, &mn3, mask_d6, mask_d4, mask_hi2);
+
+        half4 scale, mval;
+        scale.s0 = convert_half(convert_float(dd.s0)  * (float)sv0);
+        scale.s1 = convert_half(convert_float(dd.s1)  * (float)sv1);
+        scale.s2 = convert_half(convert_float(dd.s2)  * (float)sv2);
+        scale.s3 = convert_half(convert_float(dd.s3)  * (float)sv3);
+        mval.s0  = convert_half(convert_float(dmm.s0) * (float)mn0);
+        mval.s1  = convert_half(convert_float(dmm.s1) * (float)mn1);
+        mval.s2  = convert_half(convert_float(dmm.s2) * (float)mn2);
+        mval.s3  = convert_half(convert_float(dmm.s3) * (float)mn3);
+
+        for (int l = 0; l < 32; l += 4) {
+            int ki = i + l;
+            // 8 bytes per lane: this lane's four rows at this K-group
+            ushort4 bits = vload4(0, src0_q + row0 + (ki >> 2) * m);
+
+            B.s0123 = read_imageh(src1,     (ki+0) * n_4);
+            B.s4567 = read_imageh(src1, 1 + (ki+0) * n_4);
+            acc0 += B * ((half)( bits.s0        & 0x000F) * scale.s0 - mval.s0);
+            acc1 += B * ((half)( bits.s1        & 0x000F) * scale.s1 - mval.s1);
+            acc2 += B * ((half)( bits.s2        & 0x000F) * scale.s2 - mval.s2);
+            acc3 += B * ((half)( bits.s3        & 0x000F) * scale.s3 - mval.s3);
+
+            B.s0123 = read_imageh(src1,     (ki+1) * n_4);
+            B.s4567 = read_imageh(src1, 1 + (ki+1) * n_4);
+            acc0 += B * ((half)((bits.s0 >> 4)  & 0x000F) * scale.s0 - mval.s0);
+            acc1 += B * ((half)((bits.s1 >> 4)  & 0x000F) * scale.s1 - mval.s1);
+            acc2 += B * ((half)((bits.s2 >> 4)  & 0x000F) * scale.s2 - mval.s2);
+            acc3 += B * ((half)((bits.s3 >> 4)  & 0x000F) * scale.s3 - mval.s3);
+
+            B.s0123 = read_imageh(src1,     (ki+2) * n_4);
+            B.s4567 = read_imageh(src1, 1 + (ki+2) * n_4);
+            acc0 += B * ((half)((bits.s0 >> 8)  & 0x000F) * scale.s0 - mval.s0);
+            acc1 += B * ((half)((bits.s1 >> 8)  & 0x000F) * scale.s1 - mval.s1);
+            acc2 += B * ((half)((bits.s2 >> 8)  & 0x000F) * scale.s2 - mval.s2);
+            acc3 += B * ((half)((bits.s3 >> 8)  & 0x000F) * scale.s3 - mval.s3);
+
+            B.s0123 = read_imageh(src1,     (ki+3) * n_4);
+            B.s4567 = read_imageh(src1, 1 + (ki+3) * n_4);
+            acc0 += B * ((half)((bits.s0 >> 12) & 0x000F) * scale.s0 - mval.s0);
+            acc1 += B * ((half)((bits.s1 >> 12) & 0x000F) * scale.s1 - mval.s1);
+            acc2 += B * ((half)((bits.s2 >> 12) & 0x000F) * scale.s2 - mval.s2);
+            acc3 += B * ((half)((bits.s3 >> 12) & 0x000F) * scale.s3 - mval.s3);
+        }
+    }
+
+    // Cross-subgroup reduction, with the four outputs held as NAMED REGISTERS rather
+    // than the private `float8 out[4]` that _cok_r4 uses. On Adreno an indexed
+    // per-work-item array lands in private memory: the driver reports
+    // CL_KERNEL_PRIVATE_MEM_SIZE 400 B for r4 against 128 B for the 1-row kernel,
+    // and the 8-row kernel -- twice the accumulators but all of them named --
+    // reports LESS (368 B). This changes the storage class and nothing else.
+    // AND the reduction buffer is half8, halving LDS from 14336 to 7168 B per
+    // workgroup. The K-split partials are summed in half, so this one is NOT
+    // bit-identical; it is the LDS-occupancy half of the experiment.
+    local half8 reduceLM[COK_SG * (COK_NSG - 1)];
+    half8 o0 = 0, o1 = 0, o2 = 0, o3 = 0;
+
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (sg > 0) { reduceLM[(sg - 1) * COK_SG + lane] = acc0; }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (sg == 0) {
+        half8 sum = acc0;
+        for (int s = 0; s < COK_NSG - 1; s++) { sum += reduceLM[s * COK_SG + lane]; }
+        o0 = sum;
+    }
+
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (sg > 0) { reduceLM[(sg - 1) * COK_SG + lane] = acc1; }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (sg == 0) {
+        half8 sum = acc1;
+        for (int s = 0; s < COK_NSG - 1; s++) { sum += reduceLM[s * COK_SG + lane]; }
+        o1 = sum;
+    }
+
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (sg > 0) { reduceLM[(sg - 1) * COK_SG + lane] = acc2; }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (sg == 0) {
+        half8 sum = acc2;
+        for (int s = 0; s < COK_NSG - 1; s++) { sum += reduceLM[s * COK_SG + lane]; }
+        o2 = sum;
+    }
+
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (sg > 0) { reduceLM[(sg - 1) * COK_SG + lane] = acc3; }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (sg == 0) {
+        half8 sum = acc3;
+        for (int s = 0; s < COK_NSG - 1; s++) { sum += reduceLM[s * COK_SG + lane]; }
+        o3 = sum;
+    }
+
+    if (sg == 0) {
+        int idx = row0;
+        if (idx < m*n_no_padding) { vstore4((float4)((float)o0.s0, (float)o1.s0, (float)o2.s0, (float)o3.s0), 0, dst + idx); idx += m; }
+        if (idx < m*n_no_padding) { vstore4((float4)((float)o0.s1, (float)o1.s1, (float)o2.s1, (float)o3.s1), 0, dst + idx); idx += m; }
+        if (idx < m*n_no_padding) { vstore4((float4)((float)o0.s2, (float)o1.s2, (float)o2.s2, (float)o3.s2), 0, dst + idx); idx += m; }
+        if (idx < m*n_no_padding) { vstore4((float4)((float)o0.s3, (float)o1.s3, (float)o2.s3, (float)o3.s3), 0, dst + idx); idx += m; }
+        if (idx < m*n_no_padding) { vstore4((float4)((float)o0.s4, (float)o1.s4, (float)o2.s4, (float)o3.s4), 0, dst + idx); idx += m; }
+        if (idx < m*n_no_padding) { vstore4((float4)((float)o0.s5, (float)o1.s5, (float)o2.s5, (float)o3.s5), 0, dst + idx); idx += m; }
+        if (idx < m*n_no_padding) { vstore4((float4)((float)o0.s6, (float)o1.s6, (float)o2.s6, (float)o3.s6), 0, dst + idx); idx += m; }
+        if (idx < m*n_no_padding) { vstore4((float4)((float)o0.s7, (float)o1.s7, (float)o2.s7, (float)o3.s7), 0, dst + idx); idx += m; }
+    }
+}
+
 // _cok_r4 with the SCALE reads vectorised. Identical arithmetic to _cok_r4; the only
 // change is that the four rows' scale codes are read as uchar4 instead of one byte at
 // a time, cutting 8-12 narrow loads per 32-K step to 2-3. The weights, d and dm were

@@ -1737,6 +1737,8 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r4   = nullptr;
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r4_sv = nullptr;
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r4_ma = nullptr;
+    cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r4_nr = nullptr;
+    cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r4_nrh = nullptr;
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r8   = nullptr;
     cl_kernel kernel_gemv_noshuffle_q6_K_f32;
     cl_kernel kernel_gemv_noshuffle_q6_K_f32_o4;
@@ -5205,6 +5207,13 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_ma =
             clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_f32_cok_r4_ma", &err);
         if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_ma = nullptr; }
+        // Named-register variants (no private float8 out[4]).
+        backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_nr =
+            clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_f32_cok_r4_nr", &err);
+        if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_nr = nullptr; }
+        backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_nrh =
+            clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_f32_cok_r4_nrh", &err);
+        if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_nrh = nullptr; }
         // 8-rows-per-lane cok. Also non-fatal; the r4/1-row kernels remain.
         backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r8 =
             clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_f32_cok_r8", &err);
@@ -5227,6 +5236,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                 { "q4K_cok_r4   ", backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4 },
                 { "q4K_cok_r4_sv", backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_sv },
                 { "q4K_cok_r4_ma", backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_ma },
+                { "q4K_cok_r4_nr", backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_nr },
+                { "q4K_cok_r4nrh", backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_nrh },
                 { "q4K_cok_r8   ", backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r8 },
             };
             for (size_t pi = 0; pi < sizeof(probes)/sizeof(probes[0]); pi++) {
@@ -27325,6 +27336,18 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
         // (see the kernel comment). The ALU-side counterpart to _SV: it changes no
         // loads at all. NOT bit-identical -- products are summed before scaling.
         // Opt-in while measured: GGML_OPENCL_Q4K_GEMM_COK_R4_MA=1.
+        // Named registers instead of the private float8 out[4] (see kernel comment);
+        // _NRH additionally halves the LDS reduce buffer. Opt-in while measured:
+        // GGML_OPENCL_Q4K_GEMM_COK_R4_NR=1 / _NRH=1.
+        static const char * q4k_cok_r4_nr_env  = getenv("GGML_OPENCL_Q4K_GEMM_COK_R4_NR");
+        static const char * q4k_cok_r4_nrh_env = getenv("GGML_OPENCL_Q4K_GEMM_COK_R4_NRH");
+        const bool use_cok_r4_nrh = use_cok_r4
+                                  && (q4k_cok_r4_nrh_env != nullptr) && (atoi(q4k_cok_r4_nrh_env) != 0)
+                                  && backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_nrh != nullptr;
+        const bool use_cok_r4_nr  = use_cok_r4 && !use_cok_r4_nrh
+                                  && (q4k_cok_r4_nr_env != nullptr) && (atoi(q4k_cok_r4_nr_env) != 0)
+                                  && backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_nr != nullptr;
+
         static const char * q4k_cok_r4_ma_env = getenv("GGML_OPENCL_Q4K_GEMM_COK_R4_MA");
         const bool use_cok_r4_ma = use_cok_r4 && !use_cok_r4_sv
                                  && (q4k_cok_r4_ma_env != nullptr) && (atoi(q4k_cok_r4_ma_env) != 0)
@@ -27339,7 +27362,8 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
                 n_q4k_probe++;
                 fprintf(stderr, "[Q4K-COK-PROBE] M=%d N=%d K=%d -> %s (r4_sv_built=%d)\n",
                         M, N, ne00,
-                        use_cok_r8 ? "cok_r8" : use_cok_r4_sv ? "cok_r4_sv"
+                        use_cok_r8 ? "cok_r8" : use_cok_r4_nrh ? "cok_r4_nrh"
+                        : use_cok_r4_nr ? "cok_r4_nr" : use_cok_r4_sv ? "cok_r4_sv"
                         : use_cok_r4_ma ? "cok_r4_ma"
                         : use_cok_r4 ? "cok_r4" : use_cok_wimg ? "cok_wimg"
                         : use_cok ? "cok" : use_r1 ? "r1" : use_kimg ? "kimg" : "base_gemm",
@@ -27349,6 +27373,8 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
         }
 
         kernel = use_cok_r8    ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r8
+               : use_cok_r4_nrh ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_nrh
+               : use_cok_r4_nr ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_nr
                : use_cok_r4_sv ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_sv
                : use_cok_r4_ma ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_ma
                : use_cok_r4   ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4
