@@ -28200,7 +28200,11 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
             // agreeing to 0.15%: pp16 65.16 -> 65.97 (+1.2%) but pp512 111.46 -> 109.40
             // (-1.8%). q6_K also carries a private uint qw[8] array the other kernels do
             // not, which is the likeliest reason the wide tile cannot absorb it.
-            const bool use_q6_K_alds4 = q6_K_alds4_on && use_narrow && q6_K_alds4_k != nullptr;
+            // Gate on the BATCH WIDTH, not on use_narrow: q6k_dp4a_ts_narrow == 32, so
+            // q6_K never compiles a second program and use_narrow is always false.
+            const bool use_q6_K_alds4 = q6_K_alds4_on
+                                     && (N <= backend_ctx->q6k_dp4a_narrow_max)
+                                     && q6_K_alds4_k != nullptr;
             if (use_q6_K_alds4) { dk = q6_K_alds4_k; }
             if (getenv("GGML_OPENCL_DP4A_ROUTE_PROBE")) {
                 fprintf(stderr, "[DP4A-ROUTE] q6_K M=%d N=%d K=%d -> %s%s%s\n", M, N, K,
