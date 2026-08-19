@@ -27226,8 +27226,19 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
             // enough column tiles to stream the weights well; the texture only pays off
             // where one weight read serves few columns. An explicit env still applies at
             // every width, so the pair stays A/B-able.
+            // The uint4 staging tile (below) re-derives this gate. The texture was a
+            // narrow-band-only win against the scalar-staging kernel; against the
+            // uint4 one it wins at every width, because the kernel no longer spends
+            // its issue slots on local-memory loads. muse-glimmer-30B on X2-90,
+            // bracketed, controls to 0.1%: pp512 105.9 -> 111.5, pp1024 104.3 ->
+            // 109.9, pp2048 100.7 -> 105.8, all +5.2 to +5.3%. Opting out of the
+            // uint4 tile restores the old narrow-only gate along with it.
+            static const char * q4k_dp4a_alds4_env0 = getenv("GGML_OPENCL_Q4K_DP4A_ALDS4");
+            const bool q4k_dp4a_alds4_default_on = (q4k_dp4a_alds4_env0 == nullptr)
+                                                || (atoi(q4k_dp4a_alds4_env0) != 0);
             cl_mem q4k_q_img = nullptr;
-            bool use_wimg = q4k_dense_wimg_on && (use_narrow || q4k_dense_wimg_env != nullptr);
+            bool use_wimg = q4k_dense_wimg_on
+                         && (q4k_dp4a_alds4_default_on || use_narrow || q4k_dense_wimg_env != nullptr);
             if (use_wimg) {
                 const size_t tex = (size_t)M * (size_t)K / 8;  // uint32 texels = bytes/4
                 if (tex == 0 || tex > backend_ctx->image_max_buffer_size) {
@@ -27303,9 +27314,7 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
             // The wide band gains more because its tile is 32 columns, i.e. 256
             // scalar local loads per step rather than 128.
             // DEFAULT ON; opt out with GGML_OPENCL_Q4K_DP4A_ALDS4=0.
-            static const char * q4k_dp4a_alds4_env = getenv("GGML_OPENCL_Q4K_DP4A_ALDS4");
-            const bool q4k_dp4a_alds4_on = (q4k_dp4a_alds4_env == nullptr)
-                                        || (atoi(q4k_dp4a_alds4_env) != 0);
+            const bool q4k_dp4a_alds4_on = q4k_dp4a_alds4_default_on;
             cl_kernel alds4_k = use_wimg
                 ? (use_narrow ? backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow_wimg_alds4
                               : backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg_alds4)
