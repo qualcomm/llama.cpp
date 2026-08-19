@@ -26379,8 +26379,26 @@ static void ggml_cl_mul_mat_q8_0_f32_adreno(ggml_backend_t backend, const ggml_t
             return;
         }
 
+        // Cooperative-K for the verify band, decided BEFORE the bin kernel so the
+        // narrow widths can opt out of it. The ILA binary kernel below returns
+        // unconditionally, which used to make the cooperative-K gate dead code on
+        // any build that loads the blob -- and it is the faster kernel there:
+        // X2-90, q8_0 m=4096 k=14336, us/run at ne1 2/3/4/5
+        //     builtin base GEMM   2328  2324  2335  2316
+        //     ILA binary kernel    728   732   753   764
+        //     cooperative-K        478   479   481   482
+        // The prefill launch is global{CEIL_DIV(N,8), CEIL_DIV(M,4)} local{2,128},
+        // which at N=8 M=4096 is EIGHT workgroups for the whole GEMM; the
+        // cooperative-K kernel keeps the same 4-rows-per-lane tiling and splits K
+        // across 8 subgroups instead. Needs M % 256 == 0 (64 lanes x 4 rows).
+        // Opt-in while measured: GGML_OPENCL_Q80_GEMM_COK=1.
+        static const char * q80_cok_env = getenv("GGML_OPENCL_Q80_GEMM_COK");
+        const bool use_q80_cok = (q80_cok_env != nullptr) && (atoi(q80_cok_env) != 0)
+                              && backend_ctx->kernel_gemm_noshuffle_q8_0_f32_cok != nullptr
+                              && N <= 8 && (M % 256 == 0);
+
         // use bin kernel if available
-        if (backend_ctx->kernel_gemm_noshuffle_q8_0_f32_bin) {
+        if (backend_ctx->kernel_gemm_noshuffle_q8_0_f32_bin && !use_q80_cok) {
             int K_pad = K;
 
             cl_mem b_sub_buf = nullptr;
@@ -26531,21 +26549,12 @@ static void ggml_cl_mul_mat_q8_0_f32_adreno(ggml_backend_t backend, const ggml_t
         backend_ctx->enqueue_ndrange_kernel(kernel, 2, global_work_size_t, local_work_size_t, dst);
 
         // gemm
-        // Cooperative-K for the verify band. The prefill launch is
-        // global{CEIL_DIV(N,8), CEIL_DIV(M,4)} local{2,128}, which at N=8 M=4096 is EIGHT
-        // workgroups for the whole GEMM. The cok kernel keeps the same 4-rows-per-lane
-        // tiling and splits K across 8 subgroups instead. Needs M % 256 == 0 (64 lanes x
-        // 4 rows). Opt-in while measured: GGML_OPENCL_Q80_GEMM_COK=1.
-        static const char * q80_cok_env = getenv("GGML_OPENCL_Q80_GEMM_COK");
-        const bool use_q80_cok = (q80_cok_env != nullptr) && (atoi(q80_cok_env) != 0)
-                              && backend_ctx->kernel_gemm_noshuffle_q8_0_f32_cok != nullptr
-                              && N <= 8 && (M % 256 == 0);
-        // Reachability probe. An A/B of this kernel measured no change at any width,
-        // which is only a null result if the kernel actually ran: the gate carries
-        // three conditions beyond the env, and reaching this block at all requires
-        // the transposed-weight path plus N <= 8 (wider goes to the dense dp4a).
-        // GGML_OPENCL_Q80_COK_PROBE=1 prints each distinct shape once, so "ran and
-        // did nothing" is distinguishable from "never fired".
+        // Reachability probe. An A/B of this kernel once measured no change at any
+        // width; the probe showed why -- the ILA binary branch above returned first,
+        // so both arms ran the same kernel and the gate here was never evaluated.
+        // Kept because the route still depends on the blob being present, the
+        // transposed-weight path, and N <= 8 (wider goes to the dense dp4a).
+        // GGML_OPENCL_Q80_COK_PROBE=1 prints the fork and the gate terms.
         if (getenv("GGML_OPENCL_Q80_COK_PROBE")) {
             static int n_q80_probe = 0;
             if (n_q80_probe < 24) {
