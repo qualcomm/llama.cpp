@@ -777,6 +777,149 @@ kernel void kernel_gemm_noshuffle_q4_k_f32_cok_r4(
     }
 }
 
+// _cok_r4 reading the WEIGHTS through the texture path instead of a plain buffer.
+// The 1-row texture variant measured -39% and the recorded reason was granularity: a
+// lane consumed only HALF a uint32 texel, so the sampler moved twice the texels for the
+// same bytes. Four rows per lane is one ushort4 = 8 B = two WHOLE texels, so that
+// premise no longer applies. Worth retrying because the q4_K GEMV reads its weights
+// through read_imageui and reaches 117 GB/s where this kernel manages 88 on identical
+// traffic, and five other explanations for that gap have now been falsified.
+// Needs an even m for the texel index; the host checks it.
+#ifdef ADRENO_GPU
+REQD_SUBGROUP_SIZE_64
+#endif
+kernel void kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg(
+    read_only image1d_buffer_t src0_q_img,
+    global const uchar  * src0_s,
+    global const half   * src0_d,
+    global const half   * src0_dm,
+    read_only image1d_buffer_t src1,
+    global float * dst,
+    ulong offsetd,
+    int m,
+    int n,
+    int k,
+    int n_no_padding,
+    uchar mask_d6,
+    uchar mask_d4,
+    uchar mask_hi2
+) {
+    dst = (global float *)((global char *)dst + offsetd);
+    int n_4  = n >> 2;
+    int gx   = get_global_id(0);     // 4-row group
+    int sg   = get_local_id(1);      // subgroup index (K-split lane)
+    int lane = get_local_id(0);      // lane within subgroup (0..COK_SG-1)
+
+    int row0 = gx << 2;              // first of this lane's 4 rows
+    int num_32blk = k / 32;
+
+    half8 acc0 = 0, acc1 = 0, acc2 = 0, acc3 = 0;
+    half8 B;
+
+    for (int blk = sg; blk < num_32blk; blk += COK_NSG) {
+        int i       = blk << 5;       // blk * 32
+        int sb_idx  = blk >> 3;       // (blk*32) / QK_K
+        int sub_idx = blk & 7;        // (i/32) % 8
+
+        // the four rows are adjacent, so one vector load each
+        half4 dd  = vload4(0, src0_d  + row0 + sb_idx * m);
+        half4 dmm = vload4(0, src0_dm + row0 + sb_idx * m);
+
+        global const uchar * sc = src0_s + sb_idx * K_SCALE_SIZE * m + row0;
+        uchar sv0, mn0, sv1, mn1, sv2, mn2, sv3, mn3;
+        get_scale_min_k4(sub_idx, sc + 0, m, &sv0, &mn0, mask_d6, mask_d4, mask_hi2);
+        get_scale_min_k4(sub_idx, sc + 1, m, &sv1, &mn1, mask_d6, mask_d4, mask_hi2);
+        get_scale_min_k4(sub_idx, sc + 2, m, &sv2, &mn2, mask_d6, mask_d4, mask_hi2);
+        get_scale_min_k4(sub_idx, sc + 3, m, &sv3, &mn3, mask_d6, mask_d4, mask_hi2);
+
+        half4 scale, mval;
+        scale.s0 = convert_half(convert_float(dd.s0)  * (float)sv0);
+        scale.s1 = convert_half(convert_float(dd.s1)  * (float)sv1);
+        scale.s2 = convert_half(convert_float(dd.s2)  * (float)sv2);
+        scale.s3 = convert_half(convert_float(dd.s3)  * (float)sv3);
+        mval.s0  = convert_half(convert_float(dmm.s0) * (float)mn0);
+        mval.s1  = convert_half(convert_float(dmm.s1) * (float)mn1);
+        mval.s2  = convert_half(convert_float(dmm.s2) * (float)mn2);
+        mval.s3  = convert_half(convert_float(dmm.s3) * (float)mn3);
+
+        for (int l = 0; l < 32; l += 4) {
+            int ki = i + l;
+            // 8 bytes per lane: this lane's four rows at this K-group
+            // 8 bytes per lane = TWO whole uint32 texels. The 1-row texture variant
+            // took half a texel per lane, which is why it lost 39%; at 4 rows that
+            // premise no longer holds, and the GEMV reaches 117 GB/s through exactly
+            // this read path where the buffer read here manages 88.
+            uint tex = ((uint)row0 + (uint)(ki >> 2) * (uint)m) >> 1;
+            uint w0 = read_imageui(src0_q_img, (int)(tex    )).x;
+            uint w1 = read_imageui(src0_q_img, (int)(tex + 1)).x;
+            ushort4 bits = (ushort4)((ushort)(w0 & 0xFFFFu), (ushort)(w0 >> 16),
+                                     (ushort)(w1 & 0xFFFFu), (ushort)(w1 >> 16));
+
+            B.s0123 = read_imageh(src1,     (ki+0) * n_4);
+            B.s4567 = read_imageh(src1, 1 + (ki+0) * n_4);
+            acc0 += B * ((half)( bits.s0        & 0x000F) * scale.s0 - mval.s0);
+            acc1 += B * ((half)( bits.s1        & 0x000F) * scale.s1 - mval.s1);
+            acc2 += B * ((half)( bits.s2        & 0x000F) * scale.s2 - mval.s2);
+            acc3 += B * ((half)( bits.s3        & 0x000F) * scale.s3 - mval.s3);
+
+            B.s0123 = read_imageh(src1,     (ki+1) * n_4);
+            B.s4567 = read_imageh(src1, 1 + (ki+1) * n_4);
+            acc0 += B * ((half)((bits.s0 >> 4)  & 0x000F) * scale.s0 - mval.s0);
+            acc1 += B * ((half)((bits.s1 >> 4)  & 0x000F) * scale.s1 - mval.s1);
+            acc2 += B * ((half)((bits.s2 >> 4)  & 0x000F) * scale.s2 - mval.s2);
+            acc3 += B * ((half)((bits.s3 >> 4)  & 0x000F) * scale.s3 - mval.s3);
+
+            B.s0123 = read_imageh(src1,     (ki+2) * n_4);
+            B.s4567 = read_imageh(src1, 1 + (ki+2) * n_4);
+            acc0 += B * ((half)((bits.s0 >> 8)  & 0x000F) * scale.s0 - mval.s0);
+            acc1 += B * ((half)((bits.s1 >> 8)  & 0x000F) * scale.s1 - mval.s1);
+            acc2 += B * ((half)((bits.s2 >> 8)  & 0x000F) * scale.s2 - mval.s2);
+            acc3 += B * ((half)((bits.s3 >> 8)  & 0x000F) * scale.s3 - mval.s3);
+
+            B.s0123 = read_imageh(src1,     (ki+3) * n_4);
+            B.s4567 = read_imageh(src1, 1 + (ki+3) * n_4);
+            acc0 += B * ((half)((bits.s0 >> 12) & 0x000F) * scale.s0 - mval.s0);
+            acc1 += B * ((half)((bits.s1 >> 12) & 0x000F) * scale.s1 - mval.s1);
+            acc2 += B * ((half)((bits.s2 >> 12) & 0x000F) * scale.s2 - mval.s2);
+            acc3 += B * ((half)((bits.s3 >> 12) & 0x000F) * scale.s3 - mval.s3);
+        }
+    }
+
+    // Cross-subgroup reduction over the K-split, one row at a time so the __local
+    // buffer stays the same size as the 1-row kernel's. Four barriers instead of one;
+    // a WG barrier is 0.154 ns/op on X2 at WG=64 (measured), so that is not a cost.
+    local float8 reduceLM[COK_SG * (COK_NSG - 1)];
+    float8 out[4];
+    for (int r = 0; r < 4; r++) {
+        half8 acc = (r == 0) ? acc0 : (r == 1) ? acc1 : (r == 2) ? acc2 : acc3;
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (sg > 0) {
+            reduceLM[(sg - 1) * COK_SG + lane] = convert_float8(acc);
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (sg == 0) {
+            float8 sum = convert_float8(acc);
+            for (int s = 0; s < COK_NSG - 1; s++) {
+                sum += reduceLM[s * COK_SG + lane];
+            }
+            out[r] = sum;
+        }
+    }
+
+    if (sg == 0) {
+        // dst is [token, feature]: four adjacent rows are contiguous, one vstore4.
+        int idx = row0;
+        if (idx < m*n_no_padding) { vstore4((float4)(out[0].s0, out[1].s0, out[2].s0, out[3].s0), 0, dst + idx); idx += m; }
+        if (idx < m*n_no_padding) { vstore4((float4)(out[0].s1, out[1].s1, out[2].s1, out[3].s1), 0, dst + idx); idx += m; }
+        if (idx < m*n_no_padding) { vstore4((float4)(out[0].s2, out[1].s2, out[2].s2, out[3].s2), 0, dst + idx); idx += m; }
+        if (idx < m*n_no_padding) { vstore4((float4)(out[0].s3, out[1].s3, out[2].s3, out[3].s3), 0, dst + idx); idx += m; }
+        if (idx < m*n_no_padding) { vstore4((float4)(out[0].s4, out[1].s4, out[2].s4, out[3].s4), 0, dst + idx); idx += m; }
+        if (idx < m*n_no_padding) { vstore4((float4)(out[0].s5, out[1].s5, out[2].s5, out[3].s5), 0, dst + idx); idx += m; }
+        if (idx < m*n_no_padding) { vstore4((float4)(out[0].s6, out[1].s6, out[2].s6, out[3].s6), 0, dst + idx); idx += m; }
+        if (idx < m*n_no_padding) { vstore4((float4)(out[0].s7, out[1].s7, out[2].s7, out[3].s7), 0, dst + idx); }
+    }
+}
+
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
 #endif

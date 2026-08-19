@@ -1737,6 +1737,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r4   = nullptr;
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r4_sv = nullptr;
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r4_ma = nullptr;
+    cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg = nullptr;
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r4_nr = nullptr;
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r4_nrh = nullptr;
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r8   = nullptr;
@@ -5207,6 +5208,10 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_ma =
             clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_f32_cok_r4_ma", &err);
         if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_ma = nullptr; }
+        // 4-rows-per-lane cok reading weights through the texture path.
+        backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg =
+            clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg", &err);
+        if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg = nullptr; }
         // Named-register variants (no private float8 out[4]).
         backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_nr =
             clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_f32_cok_r4_nr", &err);
@@ -5236,6 +5241,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                 { "q4K_cok_r4   ", backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4 },
                 { "q4K_cok_r4_sv", backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_sv },
                 { "q4K_cok_r4_ma", backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_ma },
+                { "q4K_cok_r4wim", backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg },
                 { "q4K_cok_r4_nr", backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_nr },
                 { "q4K_cok_r4nrh", backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_nrh },
                 { "q4K_cok_r8   ", backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r8 },
@@ -27284,8 +27290,17 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
                          && (M % 2 == 0)
                          && cok_tex > 0 && cok_tex <= backend_ctx->image_max_buffer_size;
 
+        // Same texture read, but for the 4-rows-per-lane kernel: a lane takes two whole
+        // texels there instead of half of one. Opt-in: GGML_OPENCL_Q4K_GEMM_COK_R4_WIMG=1.
+        static const char * q4k_cok_r4_wimg_env = getenv("GGML_OPENCL_Q4K_GEMM_COK_R4_WIMG");
+        bool use_cok_r4_wimg = use_cok && !use_cok_wimg
+                             && (q4k_cok_r4_wimg_env != nullptr) && (atoi(q4k_cok_r4_wimg_env) != 0)
+                             && backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg != nullptr
+                             && (M % 4 == 0)
+                             && cok_tex > 0 && cok_tex <= backend_ctx->image_max_buffer_size;
+
         cl_mem q_img = nullptr;
-        if (use_kimg || use_cok_wimg) {
+        if (use_kimg || use_cok_wimg || use_cok_r4_wimg) {
             img_fmt = { CL_R, CL_UNSIGNED_INT32 };
             memset(&img_desc, 0, sizeof(img_desc));
             img_desc.image_type = CL_MEM_OBJECT_IMAGE1D_BUFFER;
@@ -27296,6 +27311,7 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
                 if (use_kimg) { CL_CHECK(err); }   // kimg has no buffer fallback
                 q_img = nullptr;
                 use_cok_wimg = false;
+                use_cok_r4_wimg = false;
             }
         }
 
@@ -27362,7 +27378,8 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
                 n_q4k_probe++;
                 fprintf(stderr, "[Q4K-COK-PROBE] M=%d N=%d K=%d -> %s (r4_sv_built=%d)\n",
                         M, N, ne00,
-                        use_cok_r8 ? "cok_r8" : use_cok_r4_nrh ? "cok_r4_nrh"
+                        use_cok_r8 ? "cok_r8" : use_cok_r4_wimg ? "cok_r4_wimg"
+                        : use_cok_r4_nrh ? "cok_r4_nrh"
                         : use_cok_r4_nr ? "cok_r4_nr" : use_cok_r4_sv ? "cok_r4_sv"
                         : use_cok_r4_ma ? "cok_r4_ma"
                         : use_cok_r4 ? "cok_r4" : use_cok_wimg ? "cok_wimg"
@@ -27373,6 +27390,7 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
         }
 
         kernel = use_cok_r8    ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r8
+               : use_cok_r4_wimg ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg
                : use_cok_r4_nrh ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_nrh
                : use_cok_r4_nr ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_nr
                : use_cok_r4_sv ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_sv
@@ -27385,7 +27403,7 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
                           : backend_ctx->kernel_gemm_noshuffle_q4_k_f32;
         int padded_N = N + padding;
 
-        if (use_kimg || use_cok_wimg) {
+        if (use_kimg || use_cok_wimg || use_cok_r4_wimg) {
             CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &q_img));
         } else {
             CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &extra0_q4_k->q));
@@ -27411,7 +27429,7 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
             // across the COK_NSG subgroups. ne01 is a multiple of 64.
             // The r4 variant gives each lane 4 rows, so the row axis shrinks 4x.
             global_work_size[0] = use_cok_r8 ? (size_t)(ne01 / 8)
-                                : use_cok_r4 ? (size_t)(ne01 / 4)
+                                : (use_cok_r4 || use_cok_r4_wimg) ? (size_t)(ne01 / 4)
                                              : (size_t)ne01;
             global_work_size[1] = 8;              // COK_NSG
             global_work_size[2] = 1;
