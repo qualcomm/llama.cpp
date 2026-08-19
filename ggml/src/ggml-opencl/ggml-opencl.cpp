@@ -1669,6 +1669,7 @@ struct ggml_backend_opencl_context {
     // Gemm and Gemv related programs, kernels, etc
     cl_kernel kernel_gemm_noshuffle_q4_0_f32;
     cl_kernel kernel_gemm_noshuffle_q4_0_f32_cok;  // cooperative-K small-batch GEMM (spec/MTP verify)
+    cl_kernel kernel_gemm_noshuffle_q4_0_f32_cok_r4 = nullptr;  // same, 4 rows per lane
     cl_kernel kernel_gemv_noshuffle_q4_0_f32;
     cl_kernel kernel_gemv_noshuffle_q4_0_f32_mc3;  // multi-column (N=3) verify GEMV (spec/MTP)
     cl_kernel kernel_gemv_noshuffle_q4_0_f32_mc3_splitk;  // ... with the K-split across WGs
@@ -4877,6 +4878,10 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         cl_program prog = build_program_from_source(backend_ctx, kernel_src_CL_gemm.c_str(), compile_opts);
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_0_f32 = clCreateKernel(prog, "kernel_gemm_noshuffle_q4_0_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_0_f32_cok = clCreateKernel(prog, "kernel_gemm_noshuffle_q4_0_f32_cok", &err), err));
+        // 4-rows-per-lane variant. Not fatal: falls back to the 1-row kernel.
+        backend_ctx->kernel_gemm_noshuffle_q4_0_f32_cok_r4 =
+            clCreateKernel(prog, "kernel_gemm_noshuffle_q4_0_f32_cok_r4", &err);
+        if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q4_0_f32_cok_r4 = nullptr; }
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
@@ -25162,8 +25167,19 @@ static void ggml_cl_mul_mat_q4_0_f32_adreno(ggml_backend_t backend, const ggml_t
         static const bool   q40_gemm_cok = (q40_cok_env == nullptr) || (atoi(q40_cok_env) != 0);
         const bool use_q40_cok = q40_gemm_cok && (ne1 <= 8) && (ne01 % 64 == 0) && (ne00 % 32 == 0);
 
-        kernel = use_q40_cok ? backend_ctx->kernel_gemm_noshuffle_q4_0_f32_cok
-                             : backend_ctx->kernel_gemm_noshuffle_q4_0_f32;
+        // 4 output rows per lane, the change that took the q4_K cooperative-K kernel
+        // +32.9%: the 1-row kernel loads 2 bytes per lane where the GEMV loads 16, so
+        // it is issue bound. Four adjacent rows vector-load as one 8-byte read and
+        // share the activation vector. Opt-in while measured:
+        // GGML_OPENCL_Q40_GEMM_COK_R4=1.
+        static const char * q40_cok_r4_env = getenv("GGML_OPENCL_Q40_GEMM_COK_R4");
+        const bool use_q40_cok_r4 = use_q40_cok
+                                 && (q40_cok_r4_env != nullptr) && (atoi(q40_cok_r4_env) != 0)
+                                 && backend_ctx->kernel_gemm_noshuffle_q4_0_f32_cok_r4 != nullptr;
+
+        kernel = use_q40_cok_r4 ? backend_ctx->kernel_gemm_noshuffle_q4_0_f32_cok_r4
+               : use_q40_cok    ? backend_ctx->kernel_gemm_noshuffle_q4_0_f32_cok
+                                : backend_ctx->kernel_gemm_noshuffle_q4_0_f32;
         int padded_N = N + padding;
 
         CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),   &extra0_q4_0->q));
@@ -25180,7 +25196,8 @@ static void ggml_cl_mul_mat_q4_0_f32_adreno(ggml_backend_t backend, const ggml_t
         if (use_q40_cok) {
             // (COK_SG lanes x COK_NSG subgroups): one row per lane, K split
             // across the COK_NSG subgroups.
-            global_work_size[0] = (size_t)ne01;   // rows
+            // The r4 variant gives each lane 4 rows, so the row axis shrinks 4x.
+            global_work_size[0] = use_q40_cok_r4 ? (size_t)(ne01 / 4) : (size_t)ne01;
             global_work_size[1] = 8;              // COK_NSG
             global_work_size[2] = 1;
             local_work_size[0]  = 64;             // COK_SG
