@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
 #include <iomanip>
 #include <map>
@@ -164,6 +165,12 @@ struct common_speculative_impl {
     int64_t t_dft_enc_us    = 0; // DFlash encoder (fuses the target's extracted layers)
     int64_t t_dft_inject_us = 0; // decoder pass that only writes K/V for the verified rows
     int64_t t_dft_block_us  = 0; // decoder pass that produces the draft block
+    // The three llama_encode/llama_decode timers above cover only the calls themselves.
+    // The drafter costs 18.2% of generation wall for 9.0% of GPU matmul time, so the
+    // question is what the OTHER half is. These bracket everything else it does:
+    int64_t t_dft_proc_us   = 0; // all of process(): enc + inject + the feature gather
+    int64_t t_dft_feat_us   = 0; // gathering the target's extracted layers into features_buf
+    int64_t t_dft_smpl_us   = 0; // the per-position sampling loop that reads the block out
 
     common_speculative_impl(common_speculative_type type, uint32_t n_seq) : type(type), n_seq(n_seq) {}
 
@@ -1112,6 +1119,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
 
                 // gather this chunk's target features, interleaved by extract layer
+                {
+                common_time_meas tm(this->t_dft_feat_us, !this->gen_perf);
                 features_buf.resize((size_t) n_chunk * n_embd_enc);
                 for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
                     const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
@@ -1123,6 +1132,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         const float * src = layer + (size_t) (i_batch_beg[seq_id] + offset + i) * n_embd_tgt;
                         std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
                     }
+                }
                 }
 
                 // fuse extracted features through DFlash encoder
@@ -1175,6 +1185,28 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         return true;
     }
 
+    // Which block rows are worth an lm_head. The DFlash decoder shares the TARGET's output
+    // projection (the drafter GGUF ships no `output.weight`), which on X2 is a 202k-row Q5_K
+    // tensor pinned to the CPU by the shipping recipe -- so every logit row is a CPU GEMM
+    // plus a CPU GGML_OP_TOP_K partial_sort over 202k, and cl_profiling.csv cannot see any
+    // of it. Two rows are provably wasted today:
+    //   * row 0 is the anchor; the DFlash read-out starts at row 1 and never reads it.
+    //   * rows past the p_min break are sampled and discarded.
+    // LLAMA_DFLASH_LOGITS_N caps the rows so the marginal cost of one is measurable.
+    // 0 (default) keeps every row, i.e. exactly the historical behaviour.
+    bool logits_row(int32_t i) const {
+        static const int32_t cap = []{
+            const char * e = std::getenv("LLAMA_DFLASH_LOGITS_N");
+            return e ? std::atoi(e) : 0;
+        }();
+        if (cap <= 0) {
+            return true;
+        }
+        // dspark reads `conf` by OUTPUT index, so it must keep a contiguous run from row 0.
+        const int32_t first = (is_dspark && sample_from_anchor) ? 0 : 1;
+        return i >= first && i < first + cap;
+    }
+
     void draft(common_speculative_draft_params_vec & dparams) override {
         auto & ctx_dft = params.ctx_dft;
 
@@ -1201,7 +1233,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             i_block_beg[seq_id] = batch.n_tokens;
             n_block    [seq_id] = n_block_tokens;
             for (int32_t i = 0; i < n_block_tokens; ++i) {
-                common_batch_add(batch, i == 0 ? dp.id_last : mask_token_id, n + i, { seq_id }, true);
+                common_batch_add(batch, i == 0 ? dp.id_last : mask_token_id, n + i, { seq_id }, logits_row(i));
             }
         }
 
@@ -1220,6 +1252,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             return;
         }
 
+        // Reading the block out is pure host work: one set_logits + one candidate sort per
+        // draft position, over a 202k vocab, up to n_max times per round. Timed separately
+        // from the decode above so the drafter's non-GPU half is attributable.
+        common_time_meas tm_smpl(this->t_dft_smpl_us, !this->gen_perf);
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_block_beg[seq_id] < 0) {
                 continue;
@@ -1239,6 +1275,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 // bonus-anchor drafts read the mask positions only, like DFlash
                 const int32_t i_draft_beg = sample_from_anchor ? 0 : 1;
                 for (int32_t i = i_draft_beg; i < n_block_tokens; ++i) {
+                    if (!logits_row(i)) {
+                        break; // this row carries no lm_head output
+                    }
                     const int32_t idx = beg + i;
 
                     if (conf && conf[(size_t) idx * n_embd_dec] < params.p_min) {
@@ -1264,6 +1303,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             } else {
                 // greedily read the predicted block at this sequence's noise positions 1..n_block_tokens-1
                 for (int32_t i = 1; i < n_block_tokens; ++i) {
+                    if (!logits_row(i)) {
+                        break; // this row carries no lm_head output
+                    }
                     common_sampler_sample(smpl, ctx_dft, beg + i, true);
 
                     const auto * cur_p = common_sampler_get_candidates(smpl, true);
@@ -2627,6 +2669,7 @@ bool common_speculative_process(common_speculative * spec, const llama_batch & b
     }
 
     for (auto & impl : spec->impls) {
+        common_time_meas tm(impl->t_dft_proc_us, !impl->gen_perf);
         result = result && impl->process(batch);
     }
 
@@ -2795,6 +2838,15 @@ void common_speculative_print_stats(const common_speculative * spec) {
                    << impl->t_dft_inject_us / 1000.0 << ", "
                    << impl->t_dft_block_us  / 1000.0;
                 str_perf += ", dft(enc,inject,block) = " + od.str() + " ms";
+
+                // proc is the WHOLE of process(), so proc - enc - inject - feat is the
+                // per-call overhead the two decodes carry; smpl is the block read-out.
+                std::ostringstream oh;
+                oh << std::fixed << std::setprecision(3)
+                   << impl->t_dft_proc_us / 1000.0 << ", "
+                   << impl->t_dft_feat_us / 1000.0 << ", "
+                   << impl->t_dft_smpl_us / 1000.0;
+                str_perf += ", dft(proc,feat,smpl) = " + oh.str() + " ms";
             }
         } else {
             str_perf = "";
