@@ -12795,14 +12795,12 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
             // kernel writes the final state only, so it silently produced wrong
             // results for K > 1 -- SSM_SCAN went 6/6 to 6/8 on the Adreno 840 when
             // the K=3/K=4 cases arrived upstream, at ERR 1.13 rather than a
-            // tolerance miss. K is not in op_params; ggml_ssm_scan encodes it in the
-            // destination length as nelements(x) + K*(s->ne[0]*ne[1]*ne[2])*ids->ne[0],
-            // so recover it from there and decline anything but K == 1.
-            const int64_t snap = op->src[0]->ne[0] * op->src[0]->ne[1] *
-                                 op->src[0]->ne[2] * op->src[6]->ne[0];
-            if (snap <= 0) return false;
-            const int64_t K = (op->ne[0] - ggml_nelements(op->src[1])) / snap;
-            if (K != 1) return false;
+            // tolerance miss. K IS in op_params: ggml_ssm_scan does
+            // ggml_set_op_params_i32(result, 0, K), so read it rather than
+            // reconstructing it from the destination length. An earlier comment here
+            // claimed the opposite and derived K from shapes; that reconstruction was
+            // fragile and is not what the reviewed carve (hq/ssm-scan-r0730) does.
+            if (ggml_get_op_params_i32(op, 0) != 1) return false;
 
             const int d_state = (int) op->src[0]->ne[0];
             const bool is_mamba2 = (op->src[3]->ne[0] == 1);
