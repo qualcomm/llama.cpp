@@ -116,6 +116,10 @@ function(llama_build_and_test source)
     set_property(TEST ${TEST_TARGET} PROPERTY LABELS ${LLAMA_TEST_LABEL})
 endfunction()
 
+# Tree-shaped multi-sequence batch (the shape tree speculative decoding needs).
+# Needs a real model, so it is built but not registered as an automatic test.
+llama_build(test-tree-batch.cpp)
+
 # build test-tokenizer-0 target once and add many tests
 llama_build(test-tokenizer-0.cpp)
 
