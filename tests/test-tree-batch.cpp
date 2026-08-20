@@ -19,6 +19,11 @@
 // decoded as two ordinary linear sequences. Equal logits => tree attention works.
 //
 // Usage: test-tree-batch <model.gguf> [n_gpu_layers]
+//
+// 🔴 Everything prints to stderr on purpose. On this Windows-on-ARM box a process can exit
+// without flushing the CRT stdout buffer, so printf output is silently LOST while stderr
+// (unbuffered) survives -- the same trap that makes test-backend-ops look like it produced
+// nothing. A test whose verdict vanishes is worse than no test.
 
 #include "llama.h"
 
@@ -44,7 +49,7 @@ static void compare(const char * what, const std::vector<float> & a, const std::
         if (b[i] > b[ib]) { ib = i; }
     }
     argmax_same = (ia == ib);
-    printf("  %-28s max|dlogit| = %.6f   argmax %s (%zu vs %zu)\n",
+    fprintf(stderr, "  %-28s max|dlogit| = %.6f   argmax %s (%zu vs %zu)\n",
            what, max_abs, argmax_same ? "MATCH" : "DIFFER", ia, ib);
 }
 
@@ -164,7 +169,7 @@ int main(int argc, char ** argv) {
     const std::vector<float> tre_a1 = logits_copy(ctx, 3, n_vocab);
     const std::vector<float> tre_b1 = logits_copy(ctx, 4, n_vocab);
 
-    printf("\ntree vs linear (same tokens, same positions):\n");
+    fprintf(stderr, "\ntree vs linear (same tokens, same positions):\n");
     double d;  bool same;
     bool ok = true;
     compare("branch A depth 1 (a0)", ref_a0, tre_a0, d, same); ok = ok && same && d < 0.5;
@@ -176,10 +181,10 @@ int main(int argc, char ** argv) {
     // would prove nothing (e.g. if the mask leaked and both branches saw the same context).
     compare("control: a1 vs b1 (differ)", tre_a1, tre_b1, d, same);
     const bool control_ok = !same || d > 0.5;
-    printf("  control %s\n", control_ok ? "OK (branches are distinguishable)"
+    fprintf(stderr, "  control %s\n", control_ok ? "OK (branches are distinguishable)"
                                         : "USELESS (branches identical - test proves nothing)");
 
-    printf("\n%s\n", (ok && control_ok) ? "TREE BATCH OK" : "TREE BATCH MISMATCH");
+    fprintf(stderr, "\n%s\n", (ok && control_ok) ? "TREE BATCH OK" : "TREE BATCH MISMATCH");
 
     llama_batch_free(batch);
     llama_free(ctx);
