@@ -27553,6 +27553,26 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
             int ksplit = q4k_ksplit_env ? atoi(q4k_ksplit_env) : 1;
             if (ksplit < 1)  { ksplit = 1; }
             if (!use_narrow) { ksplit = 1; }
+            // Size the K-split PER TENSOR, by how many workgroups the M axis already
+            // provides. Split-K buys parallelism and pays for it in traffic: the GEMM writes
+            // M*N*ksplit floats of partials and the reduce reads them back, which at ne1=16
+            // is +15.4% on top of a 74.8 MB weight stream. A single global ksplit gets that
+            // trade backwards -- muse's ffn_up/ffn_gate (M=19968) already yield 312
+            // workgroups at ksplit=1 and need no split at all, yet they carry the largest
+            // partial traffic, while attn_q/gate/output (M=4096, 64 workgroups) are the ones
+            // that actually need it. An aggregate sweep cannot see this: ksplit=1 for
+            // EVERYTHING costs pp16 69.4 -> 60.8 because of the small-M tensors, which is
+            // exactly why 4 looked right for all of them.
+            // Target workgroup count; 0 keeps the single global ksplit.
+            static const char * q4k_kswg_env = getenv("GGML_OPENCL_DP4A_KSPLIT_TARGET_WGS");
+            const int kswg = q4k_kswg_env ? atoi(q4k_kswg_env) : 0;
+            if (kswg > 0 && ksplit > 1) {
+                const int wg_base = M / 64;                     // workgroups from M alone
+                int want = (wg_base >= kswg) ? 1 : CEIL_DIV(kswg, wg_base);
+                if (want < 1)      { want = 1; }
+                if (want > ksplit) { want = ksplit; }
+                ksplit = want;
+            }
             const int nsb_total = CEIL_DIV(K, 256);
             if (ksplit > nsb_total) { ksplit = nsb_total; }
             const bool use_ksplit = ksplit > 1;
@@ -28381,6 +28401,17 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
             // Gate on N, not on use_narrow: the q6_K narrow TILE is off by default, so
             // keying off it would disable the split on exactly the widths it is for.
             if (N > backend_ctx->q6k_dp4a_narrow_max) { ksplit = 1; }
+            // Same per-tensor sizing as the q4_K path above (one shared knob). muse's
+            // q6_K ffn_down is M=6656 -> 104 workgroups, so it sits between the two cases.
+            static const char * q6k_kswg_env = getenv("GGML_OPENCL_DP4A_KSPLIT_TARGET_WGS");
+            const int q6_kswg = q6k_kswg_env ? atoi(q6k_kswg_env) : 0;
+            if (q6_kswg > 0 && ksplit > 1) {
+                const int wg_base = M / 64;
+                int want = (wg_base >= q6_kswg) ? 1 : CEIL_DIV(q6_kswg, wg_base);
+                if (want < 1)      { want = 1; }
+                if (want > ksplit) { want = ksplit; }
+                ksplit = want;
+            }
             const int nsb_total = CEIL_DIV(K, 256);
             if (ksplit > nsb_total) { ksplit = nsb_total; }
             const bool use_ksplit = ksplit > 1;
