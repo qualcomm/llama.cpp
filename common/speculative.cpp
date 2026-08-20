@@ -1415,6 +1415,129 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             if (result.size() < (size_t) params.n_min) {
                 result.clear();
             }
+
+            build_tree(seq_id, dp);
+        }
+    }
+
+    // Grow a TREE around the spine that `result` already holds.
+    //
+    // DFlash denoises the whole block JOINTLY rather than autoregressively, so the tokens after
+    // a branch point do not depend on which candidate was taken there -- a branch at spine
+    // position i continues with exactly the spine's own tokens i+1, i+2, ... That is what makes
+    // a Medusa-style tree the right shape here, and it is why a stub can be built with no extra
+    // drafter work: the candidate lists are already captured for the rank probe.
+    //
+    // 🔴 The branch's KV is NOT shared with the spine (a node's key/value depends on its
+    // prefix), so a stub of length L costs L nodes. That is the whole cost model: budgeted
+    // against the measured per-position acceptance, ~9 stub nodes buy ~+0.65 tokens per round.
+    //
+    // Node budget matters more than shape. The verify pass costs a step per PADDED column tile
+    // and is flat inside one, so nodes are cheap up to the tile edge and expensive one past it:
+    // on X2-90 a column is ~1.4 ms inside the 9..16 dp4a band but ~10 ms beyond 16. Default the
+    // cap to 16 TOTAL nodes for that reason.
+    void build_tree(llama_seq_id seq_id, common_speculative_draft_params & dp) {
+        if (dp.tree == nullptr) {
+            return;
+        }
+        auto & tree = *dp.tree;
+        tree.clear();
+
+        static const int32_t cap = []{
+            const char * e = std::getenv("LLAMA_DFLASH_TREE_NODES");
+            return e ? std::atoi(e) : 0;   // 0 = linear, no branching
+        }();
+        static const int32_t stub_max = []{
+            const char * e = std::getenv("LLAMA_DFLASH_TREE_STUB");
+            return e ? std::atoi(e) : 3;
+        }();
+
+        const auto & spine = *dp.result;
+        if (cap <= 0 || spine.empty() || rank_cand.size() <= (size_t) seq_id) {
+            return;
+        }
+
+        // (token, parent, depth) built in any order, then sorted by depth below.
+        struct tmp_node { llama_token tok; int32_t par; int32_t dep; };
+        std::vector<tmp_node> nodes;
+        nodes.reserve(cap);
+
+        for (size_t i = 0; i < spine.size(); ++i) {
+            nodes.push_back({ spine[i], (int32_t) i - 1, (int32_t) i });
+        }
+        const int32_t n_spine = (int32_t) nodes.size();
+
+        // Stubs at the EARLIEST positions first: the gain from a branch scales with the chance
+        // of reaching that position at all, which decays fast (P(reach) is 1.00, 0.78, 0.55...).
+        const auto & cand = rank_cand[seq_id];
+        for (int32_t i = 0; i < n_spine && (int32_t) nodes.size() < cap; ++i) {
+            if ((size_t) (i + 1) * RANK_PROBE_K > cand.size()) {
+                break;
+            }
+            const llama_token alt = cand[(size_t) i * RANK_PROBE_K + 1];  // rank 2
+            if (alt == LLAMA_TOKEN_NULL || alt == spine[i]) {
+                continue;
+            }
+
+            int32_t par = i - 1;                       // hangs off the spine node before it
+            int32_t dep = i;
+            for (int32_t l = 0; l < stub_max && (int32_t) nodes.size() < cap; ++l) {
+                if (dep >= (int32_t) spine.size()) {
+                    break;                             // the stub cannot outrun the spine
+                }
+                const llama_token tok = (l == 0) ? alt : spine[dep];
+                nodes.push_back({ tok, par, dep });
+                par = (int32_t) nodes.size() - 1;
+                dep++;
+            }
+        }
+
+        if ((int32_t) nodes.size() <= n_spine) {
+            return;                                    // nothing branched; leave the tree empty
+        }
+
+        // Reorder by depth. llama_batch_allocr rejects a batch whose positions decrease within
+        // a sequence, and the flattened batch inherits this order. Stable, so the spine keeps
+        // its relative order and node 0 stays the first draft token.
+        std::vector<int32_t> order(nodes.size());
+        for (size_t i = 0; i < order.size(); ++i) { order[i] = (int32_t) i; }
+        std::stable_sort(order.begin(), order.end(),
+                         [&](int32_t a, int32_t b) { return nodes[a].dep < nodes[b].dep; });
+
+        std::vector<int32_t> remap(nodes.size(), -1);
+        for (size_t k = 0; k < order.size(); ++k) {
+            remap[order[k]] = (int32_t) k;
+        }
+        for (int32_t old_idx : order) {
+            const auto & n = nodes[old_idx];
+            tree.add(n.tok, n.par < 0 ? -1 : remap[n.par], n.dep);
+        }
+
+        // The consumer builds a KV-mutating batch straight from this, so a malformed tree is
+        // not a crash, it is silent corruption of the target's cache. Check the two invariants
+        // the batch layout depends on and drop the tree rather than emit a bad one; the caller
+        // then falls back to the linear spine, which is always valid.
+        for (size_t i = 0; i < tree.size(); ++i) {
+            const int32_t par = tree.parent[i];
+            const bool ok = (par < (int32_t) i)
+                         && (par >= -1)
+                         && (tree.depth[i] == (par < 0 ? 0 : tree.depth[par] + 1));
+            if (!ok) {
+                LOG_WRN("%s: malformed draft tree at node %zu (parent=%d, depth=%d); "
+                        "falling back to the linear draft\n", __func__, i, par, tree.depth[i]);
+                tree.clear();
+                return;
+            }
+        }
+
+        if (getenv("LLAMA_DFLASH_TREE_PROBE")) {
+            std::ostringstream os;
+            for (size_t i = 0; i < tree.size(); ++i) {
+                os << (i ? " " : "") << i << ":t" << tree.token[i]
+                   << ":p" << tree.parent[i] << ":d" << tree.depth[i];
+            }
+            LOG_INF("%s: seq %d spine=%d nodes=%zu leaves=%zu [%s]\n", __func__,
+                    (int) seq_id, n_spine, tree.size(), tree.leaves().size(), os.str().c_str());
         }
     }
 

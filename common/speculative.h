@@ -41,6 +41,59 @@ common_speculative * common_speculative_init(common_params_speculative & params,
 
 void common_speculative_free(common_speculative * spec);
 
+// A draft TREE, for tree speculative decoding.
+//
+// A linear draft only ever offers the drafter's rank-1 token at each position, and measurement
+// on muse-glimmer-30B says the target's own token is the drafter's RANK 2 in 44.7% of
+// rejections -- the drafter already knows the answer the linear draft throws away.
+//
+// node i carries token[i]; parent[i] is an index into these arrays, or -1 for a child of the
+// root (the root is the target's last sampled token, which is not itself a node). depth[i] is
+// the draft depth, so the batch position is pos_next + depth[i].
+//
+// 🔴 Nodes MUST be stored in non-decreasing DEPTH order. The flattened verify batch inherits
+// that order, and llama_batch_allocr rejects a batch whose positions decrease within a
+// sequence. Every path is a root-to-leaf chain, so the seq_id sets nest and the "partial
+// sequence sub-sets" rule is satisfied automatically.
+struct common_speculative_draft_tree {
+    std::vector<llama_token> token;
+    std::vector<int32_t>     parent;
+    std::vector<int32_t>     depth;
+
+    void clear() {
+        token .clear();
+        parent.clear();
+        depth .clear();
+    }
+
+    size_t size()  const { return token.empty() ? 0 : token.size(); }
+    bool   empty() const { return token.empty(); }
+
+    int32_t add(llama_token tok, int32_t par, int32_t dep) {
+        token .push_back(tok);
+        parent.push_back(par);
+        depth .push_back(dep);
+        return (int32_t) token.size() - 1;
+    }
+
+    // the leaves, i.e. one per root-to-leaf path -- each needs its own seq_id in the verify batch
+    std::vector<int32_t> leaves() const {
+        std::vector<bool> has_child(token.size(), false);
+        for (size_t i = 0; i < parent.size(); ++i) {
+            if (parent[i] >= 0) {
+                has_child[parent[i]] = true;
+            }
+        }
+        std::vector<int32_t> out;
+        for (size_t i = 0; i < token.size(); ++i) {
+            if (!has_child[i]) {
+                out.push_back((int32_t) i);
+            }
+        }
+        return out;
+    }
+};
+
 struct common_speculative_draft_params {
     // this flag is used to chain the drafts through all the available implementations
     // after the first successful draft from an implementation, we set it
@@ -60,6 +113,13 @@ struct common_speculative_draft_params {
 
     // the generated draft from the last _draft() call
     llama_tokens * result;
+
+    // Optional TREE form of the same draft. When the caller supplies this and the
+    // implementation supports branching, `result` still holds the SPINE (the rank-1 chain,
+    // exactly what a linear caller would get) and `tree` additionally holds the branches.
+    // A caller that ignores `tree` therefore behaves exactly as before.
+    // Left empty by implementations that do not branch.
+    common_speculative_draft_tree * tree = nullptr;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
