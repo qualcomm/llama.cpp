@@ -236,6 +236,7 @@ struct server_slot {
     common_speculative_draft_tree spec_tree;
     std::vector<int32_t>          spec_tree_i_batch;  // batch index per tree node
     std::vector<llama_seq_id>     spec_tree_seqs;     // scratch seq_ids in use this round (excl. canonical)
+    std::vector<llama_seq_id>     spec_tree_owner;    // seq that holds each node's KV chain
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
@@ -361,6 +362,10 @@ struct server_slot {
         if (can_speculate()) {
             spec_draft.clear();
             spec_i_batch.clear();
+            spec_tree.clear();
+            spec_tree_i_batch.clear();
+            spec_tree_owner.clear();
+            spec_tree_seqs.clear();
             spec_ckpt.clear();
         }
         generated_tokens.clear();
@@ -541,6 +546,7 @@ struct server_slot {
                 add_ok &= batch.add(this->id, sampled, pos0, true, false);
 
                 spec_tree_i_batch.assign(spec_tree.size(), -1);
+                spec_tree_owner.assign(spec_tree.size(), this->id);
                 for (size_t n = 0; n < spec_tree.size(); ++n) {
                     std::vector<llama_seq_id> extra;
                     bool on_canonical = false;
@@ -557,6 +563,7 @@ struct server_slot {
                         extra.erase(extra.begin());
                     }
                     spec_tree_i_batch[n] = batch.size();
+                    spec_tree_owner[n]   = owner;
                     add_ok &= batch.add(owner, spec_tree.token[n],
                                         pos0 + 1 + spec_tree.depth[n], true, false, extra);
                 }
@@ -3040,6 +3047,35 @@ private:
             });
         }
 
+        // Reserve the scratch sequences a draft TREE needs -- one per root-to-leaf path
+        // beyond the spine, which rides this slot's canonical sequence. This is what arms
+        // the tree path; leaving spec_tree_seqs empty keeps every round linear.
+        //
+        // Deliberately limited to a SINGLE active slot for now: the ids are borrowed from
+        // the other slots, which is only safe while they are idle. Giving each slot its own
+        // block (n_seq_max = n_parallel * n_paths, slot_id * n_paths + p) is the
+        // productionisation, and it is a server-wide change rather than a local one.
+        iterate(drafting, [&](server_slot & slot) {
+            slot.spec_tree_seqs.clear();
+            if (slot.spec_tree.empty()) {
+                return;
+            }
+            int n_busy = 0;
+            for (const auto & other : slots) {
+                if (other.state != SLOT_STATE_IDLE) { n_busy++; }
+            }
+            const int32_t n_need = (int32_t) slot.spec_tree.leaves().size() - 1;
+            if (n_busy != 1 || n_need <= 0 || n_need > params_base.n_parallel - 1) {
+                slot.spec_tree.clear();   // fall back to the linear spine
+                return;
+            }
+            for (int i = 0; i < params_base.n_parallel && (int32_t) slot.spec_tree_seqs.size() < n_need; ++i) {
+                if (i != slot.id) {
+                    slot.spec_tree_seqs.push_back(i);
+                }
+            }
+        });
+
         // make checkpoints if needed
         iterate(drafting, [&](server_slot & slot) {
             auto & draft = slot.spec_draft;
@@ -3903,9 +3939,72 @@ private:
             {
                 common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
 
-                GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
-                auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                const bool use_tree = !slot.spec_tree.empty() && !slot.spec_tree_seqs.empty();
+
+                std::vector<int32_t> acc_nodes;   // tree nodes accepted, in order
+                llama_tokens accepted;
+
+                if (use_tree) {
+                    // Walk the tree instead of a list: sample at the current node, then
+                    // descend into the CHILD carrying that token. Divergence is simply
+                    // 'no child matches', which is the tree form of the linear mismatch.
+                    const auto & tree = slot.spec_tree;
+
+                    std::vector<std::vector<int32_t>> kids(tree.size());
+                    std::vector<int32_t> root_kids;
+                    for (size_t i = 0; i < tree.size(); ++i) {
+                        if (tree.parent[i] < 0) {
+                            root_kids.push_back((int32_t) i);
+                        } else {
+                            kids[tree.parent[i]].push_back((int32_t) i);
+                        }
+                    }
+
+                    int32_t cur = -1;                        // -1 = the root (slot.sampled)
+                    int32_t idx = slot.spec_i_batch[0];
+                    for (;;) {
+                        const llama_token id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, idx, true);
+                        // Accept unconditionally, exactly as the linear walk does: the
+                        // divergent token is the target's own and joins the output, so the
+                        // sampler state has to include it.
+                        common_sampler_accept(slot.smpl.get(), id, true);
+                        accepted.push_back(id);
+
+                        const auto & cand = (cur < 0) ? root_kids : kids[cur];
+                        int32_t next = -1;
+                        for (int32_t c : cand) {
+                            if (tree.token[c] == id) { next = c; break; }
+                        }
+                        if (next < 0) {
+                            break;
+                        }
+                        acc_nodes.push_back(next);
+                        cur = next;
+                        idx = slot.spec_tree_i_batch[next];
+                    }
+                } else {
+                    GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
+                    accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                }
                 slot.spec_i_batch.clear();
+
+                // The winning path's KV lives on the sequence that owns its deepest
+                // accepted node. When that is not this slot's canonical sequence the
+                // canonical one still holds the SPINE's tokens at those positions, so it
+                // has to be replaced before anything downstream reads it.
+                if (use_tree) {
+                    const llama_pos pos0 = slot.prompt.tokens.pos_next() - (llama_pos) n_draft;
+                    if (!acc_nodes.empty()) {
+                        const llama_seq_id win = slot.spec_tree_owner[acc_nodes.back()];
+                        if (win != slot.id) {
+                            slot.mem.seq_rm(slot.id, pos0, -1);
+                            slot.mem.seq_cp(win, slot.id, pos0, pos0 + (llama_pos) acc_nodes.size());
+                        }
+                    }
+                    for (llama_seq_id sq : slot.spec_tree_seqs) {
+                        slot.mem.seq_rm(sq, -1, -1);
+                    }
+                }
 
                 GGML_ASSERT(accepted.size() >= 1);
 
