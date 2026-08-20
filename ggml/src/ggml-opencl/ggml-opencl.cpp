@@ -1775,8 +1775,13 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemm_noshuffle_q6_k_q8_1_dp4a_narrow_wimg = nullptr;
     cl_kernel kernel_gemm_noshuffle_q6_k_q8_1_dp4a_narrow_wimg_alds4 = nullptr;
     bool q6k_dense_wimg_on = false;   // resolved once at init; see the build block
+    // MID tile, the q6_K twin of the q4_K one: ne1 in (narrow_max, mid_max] would
+    // otherwise pay a full 32 padded columns. muse's ffn_down is q6_K on 26 layers.
+    cl_kernel kernel_gemm_noshuffle_q6_k_q8_1_dp4a_mid = nullptr;
     int q6k_dp4a_ts_narrow  = 32;  // == 32 disables the split
     int q6k_dp4a_narrow_max = 16;
+    int q6k_dp4a_ts_mid     = 24;
+    int q6k_dp4a_mid_max    = 24;  // <= narrow_max disables the mid tile
     cl_kernel kernel_quant_a_q8_1;                    // plain activation q8_1 pre-pass
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_r1;
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_kimg;
@@ -5657,6 +5662,31 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                     clCreateKernel(nprog, "kernel_gemm_noshuffle_q6_k_q8_1_dp4a_alds4", &err);
                 if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a_narrow_alds4 = nullptr; }
                 CL_CHECK(clReleaseProgram(nprog));
+            }
+        }
+        // Mid tile, same non-fatal treatment as the narrow one above.
+        {
+            int ts_mid = backend_ctx->q6k_dp4a_ts_mid;
+            if (const char * e = getenv("GGML_OPENCL_Q6K_DP4A_TS_MID"))  { ts_mid = atoi(e); }
+            if (const char * e = getenv("GGML_OPENCL_Q6K_DP4A_MID_MAX")) {
+                backend_ctx->q6k_dp4a_mid_max = atoi(e);
+            }
+            backend_ctx->q6k_dp4a_ts_mid = ts_mid;
+            if (backend_ctx->q6k_dp4a_mid_max > backend_ctx->q6k_dp4a_narrow_max &&
+                ts_mid > 0 && ts_mid != 32 && ts_mid != ts_narrow) {
+                std::string mid_opts = compile_opts + " -DTILESIZE_N=" + std::to_string(ts_mid);
+                cl_program mprog = build_program_from_source_ex_cached(
+                    backend_ctx, kernel_src.c_str(), mid_opts, /*fatal=*/false,
+                    "gemm_noshuffle_q6_k_q8_1_dp4a_mid");
+                if (mprog == nullptr) {
+                    GGML_LOG_WARN("ggml_opencl: q6_K mid dp4a tile (TILESIZE_N=%d) did not build; "
+                                  "that band falls back to the 32-wide tile\n", ts_mid);
+                } else {
+                    backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a_mid =
+                        clCreateKernel(mprog, "kernel_gemm_noshuffle_q6_k_q8_1_dp4a", &err);
+                    if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a_mid = nullptr; }
+                    CL_CHECK(clReleaseProgram(mprog));
+                }
             }
         }
 
@@ -28476,7 +28506,15 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
 
             const bool use_narrow = (backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a_narrow != nullptr)
                                  && (N <= backend_ctx->q6k_dp4a_narrow_max);
+            // Mid tile. Skipped when the (default-off, measured-negative) weight texture is
+            // requested: no mid wimg twin is compiled, and taking the WIDE wimg kernel here
+            // would mismatch the mid grid below.
+            const bool use_mid = !use_narrow
+                              && (backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a_mid != nullptr)
+                              && (N <= backend_ctx->q6k_dp4a_mid_max)
+                              && (getenv("GGML_OPENCL_Q6K_DENSE_DP4A_WIMG") == nullptr);
             cl_kernel dk = use_narrow ? backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a_narrow
+                         : use_mid    ? backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a_mid
                                       : backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a;
             // uint4 staging tile (see the kernel header): the inner loop read the
             // __local activation tile one uint at a time. DEFAULT ON; opt out with
@@ -28551,7 +28589,10 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
             if (ksplit < 1) { ksplit = 1; }
             // Gate on N, not on use_narrow: the q6_K narrow TILE is off by default, so
             // keying off it would disable the split on exactly the widths it is for.
-            if (N > backend_ctx->q6k_dp4a_narrow_max) { ksplit = 1; }
+            // The mid tile keeps split-K for the same reason the narrow one does: one
+            // column tile leaves the grid too small without it (q4_K twin: 282.7 vs 335.6
+            // ms/pass at ne1=24).
+            if (N > backend_ctx->q6k_dp4a_narrow_max && !use_mid) { ksplit = 1; }
             // Same per-tensor sizing as the q4_K path above (one shared knob). muse's
             // q6_K ffn_down is M=6656 -> 104 workgroups, so it sits between the two cases.
             static const char * q6k_kswg_env = getenv("GGML_OPENCL_DP4A_KSPLIT_TARGET_WGS");
@@ -28590,7 +28631,8 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
             CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_int),   &K));
             CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_int),   &ksplit));
             // Must match the compile-time TILESIZE_N of the kernel picked above.
-            const int q6k_ts = use_narrow ? backend_ctx->q6k_dp4a_ts_narrow : 32;
+            const int q6k_ts = use_narrow ? backend_ctx->q6k_dp4a_ts_narrow
+                             : use_mid    ? backend_ctx->q6k_dp4a_ts_mid : 32;
             size_t d_local[3]  = { 64, 1, 1 };
             size_t d_global[3] = { 64, (size_t)(M / 64),
                                    (size_t)CEIL_DIV(N, q6k_ts) * (size_t)ksplit };
