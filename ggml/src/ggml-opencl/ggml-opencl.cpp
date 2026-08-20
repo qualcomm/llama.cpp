@@ -5538,16 +5538,28 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a_alds4 = nullptr; }
         CL_CHECK(clReleaseProgram(prog));
 
-        // Narrow tile for the verify band. ⛔ DEFAULT OFF: MEASURED A REGRESSION.
-        // muse-glimmer-30B carries 52 q6_K tensors (+10 in the DFlash drafter), so this
-        // looked like the one that would compound with q4_K. It does the opposite --
-        // DFlash agentic traffic, one binary, three arms: all-off 12.2108, q4_K-only
-        // 13.3545, q4_K+q6_K 13.2125. Adding q6_K costs 1.06% against q4_K alone, ~25x
-        // the harness noise floor (controls reproduce to 0.04%). The tile trade does NOT
-        // generalise across quant types -- q6_K carries more per-weight work (ql+qh+
-        // scales) than q4_K, so its register/LDS balance differs. Opt in to re-test with
-        // GGML_OPENCL_Q6K_DP4A_TS_NARROW=16.
-        int ts_narrow = 32;
+        // Narrow tile for the verify band, same as q4_K: the kernel computes a full
+        // TILESIZE_N columns whatever N is (slots past n_no_padding are staged as zeros),
+        // so a 32-wide tile is 2x the work at N=16.
+        //
+        // DEFAULT ON (16). The earlier note here read "DEFAULT OFF: MEASURED A REGRESSION
+        // ... adding q6_K costs 1.06% against q4_K alone" -- that measured NOTHING. This
+        // kernel defined TILESIZE_N unconditionally, so the -DTILESIZE_N=16 below was
+        // silently overridden and the "narrow" program compiled at 32, byte-identical to
+        // the wide one. Guard added 2026-08-19; the tile is only now real, and it shows up
+        // in the resource probe as local 1088 -> 544 B, private 320 -> 256, workgroup cap
+        // 384 -> 512.
+        //
+        // Measured after the guard fix, muse-glimmer-30B Q4_K_M on Adreno X2-90, DFlash
+        // agentic traffic at --spec-draft-p-min 0.3, 4 arms x 2 interleaved passes, every
+        // arm's built-variant table captured from its own server log:
+        //     base                 17.777    (17.811 / 17.744)
+        //     narrow tile          17.959    (17.887 / 18.032)  +1.02%
+        // The arms separate cleanly -- the narrow tile's worst pass beats the base's best.
+        // Prefill is untouched (this band is N <= 16; the long-prompt prefill rate moves
+        // 97.003 -> 97.029), and test-backend-ops MUL_MAT is unchanged at 1006 OK / 0 FAIL.
+        // Opt out with GGML_OPENCL_Q6K_DP4A_TS_NARROW=32.
+        int ts_narrow = 16;
         if (const char * e = getenv("GGML_OPENCL_Q6K_DP4A_TS_NARROW")) { ts_narrow = atoi(e); }
         if (const char * e = getenv("GGML_OPENCL_Q6K_DP4A_NARROW_MAX")) {
             backend_ctx->q6k_dp4a_narrow_max = atoi(e);
@@ -5570,8 +5582,24 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         // at ~86 GB/s except this one, at 65.7 -- and its band (ne1 9..16) is now 48.7%
         // of the verify pass. Same -DQ6K_WIMG=1 body, so the two stay A/B-able.
         //
-        // OFF until measured, and the extra programs are only COMPILED when it is on:
-        // an Adreno program build is not free at startup and this doubles the count.
+        // ⛔ MEASURED, AND IT IS NOT A DECODE WIN -- kept default OFF, kept in tree as the
+        // recorded negative result. Same run as the narrow tile above (4 arms x 2
+        // interleaved passes, reachability verified per arm):
+        //     base 17.777 | narrow 17.959 (+1.02%) | texture 17.705 (-0.41%)
+        //     | narrow+texture 17.901 (+0.70%, i.e. the texture SUBTRACTS from the tile)
+        // The one thing it does help is prefill, where the wide kernel serves N > 16:
+        // long-prompt prefill 97.003 -> 97.524 (+0.54%), and +0.68% stacked on the tile.
+        // Not enough to pay for the decode loss on this model.
+        //
+        // 🔑 So the q6_K dp4a GEMM's 65.7 GB/s (against ~86 for every other dense GEMM
+        // here) is NOT explained by the weight read path, and NOT by register pressure
+        // either -- the resource probe puts q6_K at the SMALLEST private footprint in the
+        // family, 320/304 B against q4_K's 400/336. Both obvious causes are now excluded;
+        // whatever is left is in the unpack (16 narrow strided loads per 32-K step: 8
+        // ushort ql + 8 uchar qh, the qh at one byte per lane) rather than the tile shape.
+        //
+        // OFF, and the extra programs are only COMPILED when it is on: an Adreno program
+        // build is not free at startup and this doubles the count.
         static const char * q6k_wimg_env = getenv("GGML_OPENCL_Q6K_DENSE_DP4A_WIMG");
         backend_ctx->q6k_dense_wimg_on = q6k_wimg_env && (atoi(q6k_wimg_env) != 0);
         if (backend_ctx->q6k_dense_wimg_on) {
