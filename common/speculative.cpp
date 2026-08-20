@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <array>
+#include <set>
 #include <cassert>
 #include <cstdlib>
 #include <cstring>
@@ -191,6 +192,20 @@ struct common_speculative_impl {
     std::vector<std::vector<llama_token>> rank_cand;
     std::vector<size_t>                   rank_len; // positions actually drafted, per seq
 
+    // Reduced-draft-vocab feasibility. A DFlash drafter may ship its OWN small output head
+    // plus a `d2t` map (src/models/dflash.cpp:90, :170) instead of borrowing the target's --
+    // which here is a 202k-row Q5_K tensor costing ~31 ms per call on the CPU, twice a round.
+    // The catch is coverage: a target token outside the draft vocab can never be drafted, so
+    // it is a guaranteed rejection. This histograms the target's OWN output tokens by id,
+    // which for a BPE vocab is a reasonable stand-in for frequency rank (the byte alphabet
+    // first, then merges in the order they were learned). It bounds what a cutoff would cost.
+    static constexpr int TOKCOV_N = 6;
+    const int tokcov_cut[TOKCOV_N] = { 4096, 8192, 16384, 32768, 65536, 131072 };
+    std::array<size_t, TOKCOV_N> tokcov = {};   // tokens with id < cut[i]
+    size_t                       tokcov_n   = 0;
+    llama_token                  tokcov_max = 0;
+    std::set<llama_token>        tokcov_seen;
+
     void rank_reserve(llama_seq_id seq_id, size_t n_pos) {
         if (rank_cand.size() <= (size_t) seq_id) {
             rank_cand.resize(seq_id + 1);
@@ -217,6 +232,19 @@ struct common_speculative_impl {
     // `accepted` is what the target produced: n accepted draft tokens followed by the
     // target's own token at the first mismatch. Nothing to record if the whole draft held.
     void rank_record(llama_seq_id seq_id, const llama_tokens & accepted) {
+        // Vocab coverage first: every token here is one the target actually emitted, and
+        // it is counted whether or not there was a rejection to rank.
+        for (llama_token t : accepted) {
+            for (int c = 0; c < TOKCOV_N; ++c) {
+                if (t < tokcov_cut[c]) {
+                    tokcov[c]++;
+                }
+            }
+            tokcov_n++;
+            tokcov_max = std::max(tokcov_max, t);
+            tokcov_seen.insert(t);
+        }
+
         if (rank_cand.size() <= (size_t) seq_id || accepted.empty()) {
             return;
         }
@@ -3281,5 +3309,20 @@ void common_speculative_print_stats(const common_speculative * spec) {
                     common_speculative_type_to_str(impl->type).c_str(),
                     oss.str().c_str(), K, op.str().c_str(), pooled_n);
         }
+        // Reduced-vocab coverage: what share of the target's own tokens a draft vocab of
+        // each size would be able to represent at all.
+        if (impl->tokcov_n > 0) {
+            std::ostringstream oc;
+            oc << std::fixed << std::setprecision(4);
+            for (int c = 0; c < common_speculative_impl::TOKCOV_N; ++c) {
+                if (c > 0) { oc << ", "; }
+                oc << impl->tokcov_cut[c] << ":"
+                   << (double) impl->tokcov[c] / (double) impl->tokcov_n;
+            }
+            SPC_TRC("vocab-cov %16s: coverage by draft-vocab size (%s); distinct = %zu, max id = %d, n = %zu\n",
+                    common_speculative_type_to_str(impl->type).c_str(), oc.str().c_str(),
+                    impl->tokcov_seen.size(), (int) impl->tokcov_max, impl->tokcov_n);
+        }
+
     }
 }
