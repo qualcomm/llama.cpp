@@ -3862,6 +3862,10 @@ private:
                     SLT_INF(slot, "accepted %2zu/%2zu draft tokens\n", accepted.size() - 1, n_draft);
                 }
 
+                // diagnostics: where did the target's own token sit in the drafter's
+                // candidate list at the position it rejected? Bounds the tree-draft win.
+                common_speculative_rank_probe(spec.get(), slot.id, accepted);
+
                 common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
 
                 slot.spec_draft = std::move(accepted);

@@ -13,6 +13,7 @@
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cstdlib>
 #include <cstring>
@@ -171,6 +172,79 @@ struct common_speculative_impl {
     int64_t t_dft_proc_us   = 0; // all of process(): enc + inject + the feature gather
     int64_t t_dft_feat_us   = 0; // gathering the target's extracted layers into features_buf
     int64_t t_dft_smpl_us   = 0; // the per-position sampling loop that reads the block out
+
+    // --- tree-drafting yield probe -------------------------------------------------------
+    // A linear draft only ever offers the drafter's rank-1 token at each position. A tree
+    // offers the top-b. Before building the tree (multi-seq KV, branch verify, rollback --
+    // a large change), this bounds what a tree could win: when the target REJECTS a draft
+    // token, where did the target's own token actually sit in the drafter's candidate list?
+    // Rank 1 is impossible at a rejection by definition, so the histogram runs over ranks
+    // 2..RANK_PROBE_K plus a "not in the list at all" bucket. Combined with the per-position
+    // acceptance already tracked above this gives, per position:
+    //     P(target in drafter's top-b | reached) = a_i + (1 - a_i) * sum_{r=2..b} h_{i,r}
+    // which is exactly the acceptance curve a b-wide tree would see.
+    static constexpr int RANK_PROBE_K = 8;
+    // [position][rank]; rank 0 unused, rank RANK_PROBE_K means "outside the top-K"
+    std::vector<std::array<size_t, RANK_PROBE_K + 1>> rank_hist;
+    std::vector<size_t>                               rank_n;   // rejections seen per position
+    // per seq, the drafter's top-K ids for each drafted position, row-major [pos*K + rank-1]
+    std::vector<std::vector<llama_token>> rank_cand;
+    std::vector<size_t>                   rank_len; // positions actually drafted, per seq
+
+    void rank_reserve(llama_seq_id seq_id, size_t n_pos) {
+        if (rank_cand.size() <= (size_t) seq_id) {
+            rank_cand.resize(seq_id + 1);
+            rank_len  .resize(seq_id + 1, 0);
+        }
+        rank_cand[seq_id].assign(n_pos * RANK_PROBE_K, LLAMA_TOKEN_NULL);
+        rank_len [seq_id] = 0;
+    }
+
+    void rank_push(llama_seq_id seq_id, size_t pos, const llama_token_data_array * cur_p) {
+        if (rank_cand.size() <= (size_t) seq_id) {
+            return;
+        }
+        auto & c = rank_cand[seq_id];
+        if ((pos + 1) * RANK_PROBE_K > c.size()) {
+            return;
+        }
+        for (int r = 0; r < RANK_PROBE_K; ++r) {
+            c[pos * RANK_PROBE_K + r] = r < (int) cur_p->size ? cur_p->data[r].id : LLAMA_TOKEN_NULL;
+        }
+        rank_len[seq_id] = pos + 1;
+    }
+
+    // `accepted` is what the target produced: n accepted draft tokens followed by the
+    // target's own token at the first mismatch. Nothing to record if the whole draft held.
+    void rank_record(llama_seq_id seq_id, const llama_tokens & accepted) {
+        if (rank_cand.size() <= (size_t) seq_id || accepted.empty()) {
+            return;
+        }
+        const size_t n_acc = accepted.size() - 1;
+        if (n_acc >= rank_len[seq_id]) {
+            return; // the full draft was accepted, so there was no rejection to rank
+        }
+        const llama_token tgt = accepted[n_acc];
+        const auto & c = rank_cand[seq_id];
+
+        // bucket 0 = the target's token was not in the drafter's top-K at all;
+        // buckets 2..K = it was there, at that 1-based rank. Bucket 1 should stay empty
+        // (a rank-1 match is what the target just rejected) -- if it fills, something
+        // upstream is inconsistent and the probe is reporting on the wrong position.
+        int bucket = 0;
+        for (int r = 0; r < RANK_PROBE_K; ++r) {
+            if (c[n_acc * RANK_PROBE_K + r] == tgt) {
+                bucket = r + 1;
+                break;
+            }
+        }
+        if (rank_hist.size() <= n_acc) {
+            rank_hist.resize(n_acc + 1, {});
+            rank_n   .resize(n_acc + 1, 0);
+        }
+        rank_hist[n_acc][bucket]++;
+        rank_n   [n_acc]++;
+    }
 
     common_speculative_impl(common_speculative_type type, uint32_t n_seq) : type(type), n_seq(n_seq) {}
 
@@ -1230,6 +1304,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
 
             common_sampler_reset(smpls[seq_id].get());
+            rank_reserve(seq_id, (size_t) params.n_max);
 
             const int32_t n = (int32_t) dp.n_past;
 
@@ -1327,6 +1402,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     if (cur_p->data[0].p < params.p_min) {
                         break;
                     }
+
+                    // tree-yield probe: remember the whole candidate list, not just rank 1
+                    rank_push(seq_id, result.size(), cur_p);
 
                     common_sampler_accept(smpl, id, true);
 
@@ -2763,6 +2841,19 @@ void common_speculative_draft(common_speculative * spec) {
     }
 }
 
+void common_speculative_rank_probe(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & accepted) {
+    if (spec == nullptr) {
+        return;
+    }
+
+    common_speculative_impl * impl = spec->impl_last[seq_id];
+    if (impl == nullptr) {
+        return;
+    }
+
+    impl->rank_record(seq_id, accepted);
+}
+
 void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, uint16_t n_accepted) {
     common_speculative_impl * impl = spec->impl_last[seq_id];
 
@@ -2884,5 +2975,64 @@ void common_speculative_print_stats(const common_speculative * spec) {
                 impl->n_acc_tokens,
                 str_stats.c_str(),
                 str_perf.c_str());
+
+        // Tree-yield probe. Per position: a_i is the measured linear acceptance, and of the
+        // rejections at that position, h_{i,r} is the share where the target's own token sat
+        // at rank r of the drafter's list. A b-wide tree at that position would accept when
+        // the target's token is anywhere in the top-b, so
+        //     A_i(b) = a_i + (1 - a_i) * sum_{r=2..b} h_{i,r}
+        // and the expected draft length is the running product of A_i. Printing E[len] for
+        // b = 1, 2, 4, 8 says directly whether a tree is worth building.
+        if (!impl->rank_n.empty() && impl->n_call_accept > 0) {
+            const int    K   = common_speculative_impl::RANK_PROBE_K;
+            const size_t nps = impl->rank_n.size();
+
+            std::ostringstream oss;
+            oss << std::fixed << std::setprecision(3);
+
+            for (int b : {1, 2, 4, K}) {
+                double e_len = 0.0;
+                double reach = 1.0;
+                for (size_t i = 0; i < nps; ++i) {
+                    const double a_i = i < impl->n_acc_tokens_per_pos.size()
+                        ? (double) impl->n_acc_tokens_per_pos[i] / (double) impl->n_call_accept
+                        : 0.0;
+                    double extra = 0.0;
+                    if (b > 1 && impl->rank_n[i] > 0) {
+                        size_t hit = 0;
+                        for (int r = 2; r <= b; ++r) {
+                            hit += impl->rank_hist[i][r];
+                        }
+                        extra = (1.0 - a_i) * (double) hit / (double) impl->rank_n[i];
+                    }
+                    const double A_i = std::min(1.0, a_i + extra);
+                    reach *= A_i;
+                    e_len += reach;
+                }
+                oss << (b == 1 ? "" : ", ") << "b=" << b << ":" << e_len;
+            }
+
+            // where the target's token sat, pooled over all positions
+            std::array<size_t, K + 1> pooled = {};
+            size_t pooled_n = 0;
+            for (size_t i = 0; i < nps; ++i) {
+                for (int r = 0; r <= K; ++r) {
+                    pooled[r] += impl->rank_hist[i][r];
+                }
+                pooled_n += impl->rank_n[i];
+            }
+            std::ostringstream op;
+            op << std::fixed << std::setprecision(3);
+            for (int r = 0; r <= K; ++r) {
+                if (r > 0) {
+                    op << ", ";
+                }
+                op << (pooled_n ? (double) pooled[r] / (double) pooled_n : 0.0);
+            }
+
+            SPC_TRC("tree-probe %16s: E[draft len] = (%s); rejected-token rank share (miss, r1..r%d) = (%s); n = %zu\n",
+                    common_speculative_type_to_str(impl->type).c_str(),
+                    oss.str().c_str(), K, op.str().c_str(), pooled_n);
+        }
     }
 }

@@ -76,6 +76,12 @@ void common_speculative_draft(common_speculative * spec);
 // informs the speculative context that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);
 
+// diagnostics only: hand the drafter the target's own tokens so it can report where the
+// target's choice sat in its candidate list at the position the draft was rejected. That
+// bounds what a TREE draft (which would offer the top-b, not just rank 1) could win, without
+// building the tree. `accepted` is n accepted draft tokens followed by the target's token.
+void common_speculative_rank_probe(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & accepted);
+
 // (optional) get/set internal state
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);
 void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);
