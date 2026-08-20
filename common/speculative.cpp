@@ -1443,6 +1443,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         auto & tree = *dp.tree;
         tree.clear();
 
+        // 🔴 This caps TREE NODES, and the verify batch is one WIDER (the target's last
+        // sampled token leads it). 15 keeps that batch at 16 -- the top of the dp4a
+        // narrow-tile band, where a column costs ~1.4 ms; 16 would make it 17 and tip
+        // into the next tile for one node, which costs ~50 ms.
         static const int32_t cap = []{
             const char * e = std::getenv("LLAMA_DFLASH_TREE_NODES");
             return e ? std::atoi(e) : 0;   // 0 = linear, no branching
@@ -1450,6 +1454,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         static const int32_t stub_max = []{
             const char * e = std::getenv("LLAMA_DFLASH_TREE_STUB");
             return e ? std::atoi(e) : 3;
+        }();
+        // Each root-to-leaf path needs its own seq_id in the verify batch, so the leaf
+        // count is bounded by what the consumer reserved -- not by the node budget.
+        static const int32_t leaf_max = []{
+            const char * e = std::getenv("LLAMA_DFLASH_TREE_LEAVES");
+            return e ? std::atoi(e) : 4;
         }();
 
         const auto & spine = *dp.result;
@@ -1470,7 +1480,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         // Stubs at the EARLIEST positions first: the gain from a branch scales with the chance
         // of reaching that position at all, which decays fast (P(reach) is 1.00, 0.78, 0.55...).
         const auto & cand = rank_cand[seq_id];
-        for (int32_t i = 0; i < n_spine && (int32_t) nodes.size() < cap; ++i) {
+        int32_t n_leaves = 1;   // the spine's own tip
+        for (int32_t i = 0; i < n_spine && (int32_t) nodes.size() < cap && n_leaves < leaf_max; ++i) {
             if ((size_t) (i + 1) * RANK_PROBE_K > cand.size()) {
                 break;
             }
@@ -1479,6 +1490,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 continue;
             }
 
+            n_leaves++;
             int32_t par = i - 1;                       // hangs off the spine node before it
             int32_t dep = i;
             for (int32_t l = 0; l < stub_max && (int32_t) nodes.size() < cap; ++l) {
