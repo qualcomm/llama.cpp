@@ -93,18 +93,21 @@ enum htp_op_code {
     HTP_OP_CLAMP,
     HTP_OP_IM2COL,
     HTP_OP_FENCE,
+    HTP_OP_ALLREDUCE,
 
     HTP_OP_INVALID
 };
 
 #define HTP_OP_MAX_DIMS    4    // aka GGML_MAX_DIMS
-#define HTP_OP_MAX_INPUTS  6    // aka GGML_MAX_SRCS
+#define HTP_OP_MAX_INPUTS  10   // aka GGML_MAX_SRCS
 #define HTP_OP_MAX_OUTPUTS 4
 #define HTP_OP_MAX_PARAMS  16   // aka GGML_MAX_OP_PARAMS
 #define HTP_OP_MAX_KERN_PARAMS 32
 
 #define HTP_OP_MAX_BUFS    16
 #define HTP_OP_MAX_TENSORS 8192 // must stay under 64K (uint16)
+
+#define HTP_FENCE_TIMEOUT  (1000000000ULL)
 
 #define HTP_OP_MAX_VMEM_DEFAULT (3355443200u)
 
@@ -169,6 +172,7 @@ enum htp_trace_event_id {
     HTP_TRACE_EVT_L2FLUSH             = 1,
     HTP_TRACE_EVT_INIT                = 2,
     HTP_TRACE_EVT_BUFF                = 3,
+    HTP_TRACE_EVT_FENCE               = 4,
 
     HTP_TRACE_EVT_HVX_COMP            = 20,
     HTP_TRACE_EVT_HVX_A_QUANT         = 21,

@@ -171,6 +171,7 @@ static const char * htp_event_name(uint16_t id) {
         case HTP_TRACE_EVT_L2FLUSH:        return "L2FLUSH";
         case HTP_TRACE_EVT_INIT:           return "INIT";
         case HTP_TRACE_EVT_BUFF:           return "BUFF";
+        case HTP_TRACE_EVT_FENCE:          return "FENCE";
         default:                           return "UNKNOWN";
     }
 }
@@ -365,6 +366,7 @@ struct ggml_hexagon_session {
     void enqueue_op(const htp_opnode & node);
     void enqueue_cpy(const ggml_tensor * src, ggml_tensor * dst, const ggml_tensor * sync_tensor = nullptr);
     void enqueue_fence(const ggml_tensor * sync_tensor);
+    void enqueue_allreduce(const ggml_tensor * dst, const std::vector<const ggml_tensor *> & src_tensors, const std::vector<const ggml_tensor *> & sync_tensors, uint32_t rank, uint32_t n_ranks, uint32_t seq);
 
     void flush(bool all = true);
     void flush_pending(bool all = false);
@@ -1907,6 +1909,12 @@ struct ggml_hexagon_opqueue {
                     auto sbuf = static_cast<ggml_hexagon_shared_buffer *>(ops[i].src0()->buffer->context);
                     void * fence_ptr = ops[i].src0()->data;
                     sbuf->release_fence(fence_ptr);
+                } else if (ops[i].opcode == HTP_OP_ALLREDUCE) {
+                    uint32_t rank    = (uint32_t) ops[i].kernel_params[0];
+                    uint32_t n_ranks = (uint32_t) ops[i].kernel_params[1];
+                    const auto * my_fence = ops[i].inputs[n_ranks + rank];
+                    auto sbuf = static_cast<ggml_hexagon_shared_buffer *>(my_fence->buffer->context);
+                    sbuf->release_fence(my_fence->data);
                 }
             }
 
@@ -2036,6 +2044,40 @@ void ggml_hexagon_session::enqueue_fence(const ggml_tensor * sync_tensor) {
     sync_node.init(node);
     sync_node.name = "FENCE";
     this->enqueue_op(sync_node);
+}
+
+void ggml_hexagon_session::enqueue_allreduce(
+    const ggml_tensor * dst,
+    const std::vector<const ggml_tensor *> & src_tensors,
+    const std::vector<const ggml_tensor *> & sync_tensors,
+    uint32_t rank,
+    uint32_t n_ranks,
+    uint32_t seq
+) {
+    htp_opnode ar_node(HTP_OP_ALLREDUCE);
+
+    ggml_tensor* node = ar_node.add_dummy(*dst);
+    node->op = GGML_OP_NONE;
+
+    ar_node.init(node);
+
+    ar_node.inputs.clear();
+    for (size_t i = 0; i < src_tensors.size(); i++) {
+        ar_node.inputs.push_back(src_tensors[i]);
+    }
+    for (size_t i = 0; i < sync_tensors.size(); i++) {
+        ar_node.inputs.push_back(ar_node.add_dummy(*sync_tensors[i]));
+    }
+
+    ar_node.outputs.clear();
+    ar_node.outputs.push_back(node);
+
+    ar_node.kernel_params[0] = (int32_t) rank;
+    ar_node.kernel_params[1] = (int32_t) n_ranks;
+    ar_node.kernel_params[2] = (int32_t) seq;
+
+    ar_node.name = "ALLREDUCE";
+    this->enqueue_op(ar_node);
 }
 
 void ggml_hexagon_session::wait_event(uint64_t seq) {
@@ -5033,9 +5075,135 @@ static ggml_backend_dev_t ggml_backend_hexagon_reg_get_device(ggml_backend_reg_t
     return &hreg->devices[index];
 }
 
+// ** communication context for tensor-split allreduce
+
+struct ggml_backend_hexagon_comm_context {
+    std::vector<ggml_backend_t> backends;
+    size_t                      n_backends;
+};
+
+static void * ggml_backend_hexagon_comm_init(ggml_backend_t * backends, size_t n_backends) {
+    if (n_backends < 2 || n_backends > 4) {
+        return nullptr;
+    }
+
+    for (size_t i = 0; i < n_backends; ++i) {
+        if (!ggml_backend_is_hexagon(backends[i])) {
+            return nullptr;
+        }
+    }
+
+    auto * ctx = new ggml_backend_hexagon_comm_context();
+    ctx->backends.assign(backends, backends + n_backends);
+    ctx->n_backends = n_backends;
+
+    for (size_t i = 0; i < n_backends; i++) {
+        auto sess_i = static_cast<ggml_hexagon_session *>(backends[i]->context);
+        for (size_t j = 0; j < n_backends; j++) {
+            if (i != j) {
+                sess_i->add_sync_peer(static_cast<ggml_hexagon_session *>(backends[j]->context));
+            }
+        }
+    }
+
+    return ctx;
+}
+
+static void ggml_backend_hexagon_comm_free(void * comm_ctx_v) {
+    if (!comm_ctx_v) return;
+    delete static_cast<ggml_backend_hexagon_comm_context *>(comm_ctx_v);
+}
+
+static bool ggml_backend_hexagon_comm_allreduce_tensor(void * comm_ctx_v, struct ggml_tensor ** tensors) {
+    if (!comm_ctx_v) return false;
+    auto * comm_ctx = static_cast<ggml_backend_hexagon_comm_context *>(comm_ctx_v);
+    const size_t n_backends = comm_ctx->n_backends;
+
+    if (n_backends < 2 || n_backends > 4) return false;
+
+    for (size_t i = 0; i < n_backends; i++) {
+        if (!tensors[i] || !tensors[i]->buffer || !ggml_backend_buffer_is_hexagon(tensors[i]->buffer)) {
+            return false;
+        }
+        if (tensors[i]->type != tensors[0]->type) {
+            return false;
+        }
+        if (!ggml_is_contiguous(tensors[i])) {
+            return false;
+        }
+        if (ggml_nelements(tensors[i]) != ggml_nelements(tensors[0])) {
+            return false;
+        }
+    }
+
+    if (tensors[0]->type != GGML_TYPE_F16 && tensors[0]->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    auto sess0 = static_cast<ggml_hexagon_session *>(comm_ctx->backends[0]->context);
+    uint32_t sync_seq = ++sess0->sync_seq;
+
+    volatile uint32_t * sync_fences[GGML_HEXAGON_MAX_SESSIONS];
+    for (size_t i = 0; i < n_backends; i++) {
+        auto sbuf = (ggml_hexagon_shared_buffer *) tensors[i]->buffer->context;
+        while (1) {
+            sync_fences[i] = (volatile uint32_t *) sbuf->alloc_fence();
+            if (sync_fences[i]) break;
+
+            for (size_t j = 0; j < n_backends; j++) {
+                static_cast<ggml_hexagon_session *>(comm_ctx->backends[j]->context)->flush(false);
+            }
+        }
+        sync_fences[i][0] = 0;
+        sync_fences[i][1] = sync_seq;
+    }
+
+    static ggml_hexagon_tensor_extra sync_extra { {}, GGML_HEXAGON_TENSOR_WEIGHT };
+    ggml_tensor sync_tensors[GGML_HEXAGON_MAX_SESSIONS];
+    for (size_t i = 0; i < n_backends; i++) {
+        sync_tensors[i] = {};
+        sync_tensors[i].buffer = tensors[i]->buffer;
+        sync_tensors[i].extra  = &sync_extra;
+        sync_tensors[i].data   = (void *) sync_fences[i];
+        sync_tensors[i].type   = GGML_TYPE_I32;
+        sync_tensors[i].ne[0]  = 1;
+        sync_tensors[i].ne[1]  = 1;
+        sync_tensors[i].ne[2]  = 1;
+        sync_tensors[i].ne[3]  = 1;
+        sync_tensors[i].nb[0]  = sizeof(int32_t);
+        sync_tensors[i].nb[1]  = sizeof(int32_t);
+        sync_tensors[i].nb[2]  = sizeof(int32_t);
+        sync_tensors[i].nb[3]  = sizeof(int32_t);
+        sync_tensors[i].op     = GGML_OP_NONE;
+    }
+
+    std::vector<const ggml_tensor *> data_tensors(n_backends);
+    std::vector<const ggml_tensor *> fence_tensors(n_backends);
+    for (size_t i = 0; i < n_backends; i++) {
+        data_tensors[i]  = tensors[i];
+        fence_tensors[i] = &sync_tensors[i];
+    }
+
+    for (size_t r = 0; r < n_backends; r++) {
+        auto sess = static_cast<ggml_hexagon_session *>(comm_ctx->backends[r]->context);
+        sess->enqueue_allreduce(tensors[r], data_tensors, fence_tensors, (uint32_t) r, (uint32_t) n_backends, sync_seq);
+        sess->flush_batch();
+    }
+
+    return true;
+}
+
 static void * ggml_backend_hexagon_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
-    GGML_UNUSED(name);
+    if (strcmp(name, "ggml_backend_comm_init") == 0) {
+        return (void *) ggml_backend_hexagon_comm_init;
+    }
+    if (strcmp(name, "ggml_backend_comm_free") == 0) {
+        return (void *) ggml_backend_hexagon_comm_free;
+    }
+    if (strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
+        return (void *) ggml_backend_hexagon_comm_allreduce_tensor;
+    }
     return NULL;
 }
 

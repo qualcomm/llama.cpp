@@ -33,6 +33,7 @@
 #include "htp_iface.h"
 #include "work-queue.h"
 #include "hex-profile.h"
+#include "allreduce-ops.h"
 
 #define HMX_QUEUE_CAPACITY     16
 #define HMX_QUEUE_STACK_SIZE   16384
@@ -706,10 +707,11 @@ static inline void profile_stop(uint32_t mode, struct profile_data * d) {
     }
 }
 
-#define HTP_FENCE_TIMEOUT (1000000000ULL)
-
 static int op_fence(struct htp_ops_context * octx) {
     struct htp_context *ctx = octx->ctx;
+    struct htp_thread_trace * tr = &ctx->trace[0];
+
+    htp_trace_event_start(tr, HTP_TRACE_EVT_FENCE, 0);
 
     const struct htp_tensor * sync = octx->src[0];
     atomic_uint* sync_fence = (atomic_uint *)sync->data;
@@ -730,6 +732,8 @@ static int op_fence(struct htp_ops_context * octx) {
         hex_pause();
     }
 
+    htp_trace_event_stop(tr, HTP_TRACE_EVT_FENCE, 0);
+
     FARF(HIGH, "ggml-hex: sync-done : fence %p spins %llu seq %u\n", sync_fence, spins, seq);
     return HTP_STATUS_OK;
 }
@@ -738,6 +742,9 @@ static int execute_op(struct htp_ops_context * octx) {
     switch (octx->op) {
         case HTP_OP_FENCE:
             return op_fence(octx);
+
+        case HTP_OP_ALLREDUCE:
+            return op_allreduce(octx);
 
         case HTP_OP_MUL_MAT:
         case HTP_OP_MUL_MAT_ADD:
