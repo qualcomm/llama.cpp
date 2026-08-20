@@ -12203,6 +12203,15 @@ inline bool use_adreno_kernels(const ggml_backend_opencl_context *backend_ctx, c
         threshold_ne0 = 128;
         threshold_ne1 = 128;
     }
+    // The ne1 (output-row) threshold declines any weight narrower than 512 rows, which on a
+    // GQA model is exactly the K and V projections: muse-glimmer-30B has 2 KV heads x 128 =
+    // 256 rows, so attn_k/attn_v fall out of the Adreno path onto the generic flat GEMV.
+    // Profiling the ne1=16 verify pass, they run at 8.2 / 8.7 GB/s against 65-81 for every
+    // neighbouring projection -- 5.0% of the pass to move 0.7% of the bytes. Overridable so
+    // the threshold can be A/B'd without a rebuild; the %64 layout rule below still applies
+    // and is the one that is about correctness, not performance.
+    if (const char * e = getenv("GGML_OPENCL_ADRENO_MIN_NE1")) { threshold_ne1 = atoi(e); }
+    if (const char * e = getenv("GGML_OPENCL_ADRENO_MIN_NE0")) { threshold_ne0 = atoi(e); }
     bool threashold_ok = tensor->ne[0] >= threshold_ne0 && tensor->ne[1] >= threshold_ne1 &&
             tensor->ne[2] == 1 && tensor->ne[3] == 1;
 
