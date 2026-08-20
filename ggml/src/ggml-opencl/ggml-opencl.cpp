@@ -276,18 +276,10 @@ static ggml_cl_version get_opencl_c_version(ggml_cl_version platform_version, cl
 }
 
 static ADRENO_GPU_GEN get_adreno_gpu_gen(const char *device_name) {
-    if (strstr(device_name, "610") || strstr(device_name, "612") ||
-        strstr(device_name, "613") || strstr(device_name, "615") ||
-        strstr(device_name, "616") || strstr(device_name, "618") ||
-        strstr(device_name, "619") || strstr(device_name, "620") ||
-        strstr(device_name, "630") || strstr(device_name, "640") ||
-        strstr(device_name, "642") || strstr(device_name, "643") ||
-        strstr(device_name, "644") || strstr(device_name, "650") ||
-        strstr(device_name, "660") || strstr(device_name, "663") ||
-        strstr(device_name, "680") || strstr(device_name, "685") ||
-        strstr(device_name, "690")) {
-        return ADRENO_GPU_GEN::A6X;
-    }
+    // Check specific newer generations first (A7X, A8X, X1E, X2E) so that their
+    // model numbers cannot false-match the broad A6X range check below. This
+    // matters because the function is called with device_version (which may
+    // contain build/version fragments) before falling back to device_name.
 
     if (strstr(device_name, "730") ||
         strstr(device_name, "740") ||
@@ -308,6 +300,18 @@ static ADRENO_GPU_GEN get_adreno_gpu_gen(const char *device_name) {
 
     if (strstr(device_name, "X2")) {
         return ADRENO_GPU_GEN::X2E;
+    }
+
+    // A6X: range-based detection for any Adreno 6xx (600-699). Matches an
+    // isolated 3-digit number starting with '6'. Placed AFTER the specific
+    // checks above so that a device_version containing both a 6xx fragment
+    // and a newer model identifier won't false-match as A6X.
+    for (const char *p = device_name; *p; p++) {
+        if (*p == '6' && p[1] >= '0' && p[1] <= '9' && p[2] >= '0' && p[2] <= '9'
+            && (p == device_name || !isdigit((unsigned char)*(p-1)))
+            && !isdigit((unsigned char)p[3])) {
+            return ADRENO_GPU_GEN::A6X;
+        }
     }
 
     return ADRENO_GPU_GEN::ADRENO_UNKNOWN;
