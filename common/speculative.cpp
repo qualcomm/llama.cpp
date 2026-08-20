@@ -252,7 +252,10 @@ struct common_speculative_impl {
 
     virtual void begin(llama_seq_id seq_id, const llama_tokens & prompt) = 0;
 
-    virtual bool process(const llama_batch & batch) = 0;
+    // `rows`, when given, restricts processing to those batch indices (all one sequence).
+    // Tree speculative decoding needs it: the verify batch holds several BRANCHES at the
+    // same positions, and only the accepted path may be folded into the drafter's cache.
+    virtual bool process(const llama_batch & batch, const std::vector<int32_t> * rows = nullptr) = 0;
 
     virtual void draft(common_speculative_draft_params_vec & dparams) = 0;
 
@@ -346,7 +349,7 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
         // noop
     }
 
-    bool process(const llama_batch & batch) override {
+    bool process(const llama_batch & batch, const std::vector<int32_t> * rows = nullptr) override {
         auto * ctx_dft = params.ctx_dft;
 
         llama_batch batch_dft = batch;
@@ -656,7 +659,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         }
     }
 
-    bool process(const llama_batch & batch_in) override {
+    bool process(const llama_batch & batch_in, const std::vector<int32_t> * rows = nullptr) override {
         if (batch_in.n_tokens <= 0) {
             return true;
         }
@@ -1145,7 +1148,83 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
     }
 
-    bool process(const llama_batch & batch_in) override {
+    // Fold an explicit list of verify-batch rows into the drafter's KV cache.
+    // Tree drafting needs this: the verify batch carries several branches at the same
+    // positions, and injecting all of them would write conflicting K/V for one position.
+    // Only the ACCEPTED path is real context, so only it may be folded in.
+    bool process_rows(const llama_batch & batch_in, const std::vector<int32_t> & rows) {
+        if (rows.empty()) {
+            return true;
+        }
+        auto * ctx_tgt = this->params.ctx_tgt;
+        auto * ctx_dft = this->params.ctx_dft;
+
+        const llama_seq_id seq_id = batch_in.seq_id[rows[0]][0];
+        const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
+
+        for (size_t off = 0; off < rows.size(); off += (size_t) n_ubatch) {
+            const int32_t n_chunk = (int32_t) std::min((size_t) n_ubatch, rows.size() - off);
+
+            {
+                common_time_meas tm(this->t_dft_feat_us, !this->gen_perf);
+                features_buf.resize((size_t) n_chunk * n_embd_enc);
+                for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+                    const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
+                    if (!layer) {
+                        GGML_ABORT("DFlash: target layer %d input not extracted.", target_layer_ids[k]);
+                    }
+                    for (int32_t i = 0; i < n_chunk; ++i) {
+                        float       * dst = features_buf.data() + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
+                        const float * src = layer + (size_t) rows[off + i] * n_embd_tgt;
+                        std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
+                    }
+                }
+            }
+
+            llama_batch enc_batch = {
+                /*.n_tokens =*/ n_chunk,
+                /*.token    =*/ nullptr,
+                /*.embd     =*/ features_buf.data(),
+                /*.pos      =*/ nullptr,
+                /*.n_seq_id =*/ nullptr,
+                /*.seq_id   =*/ nullptr,
+                /*.logits   =*/ nullptr,
+            };
+
+            int32_t rc;
+            {
+                common_time_meas tm(this->t_dft_enc_us, !this->gen_perf);
+                rc = llama_encode(ctx_dft, enc_batch);
+            }
+            if (rc != 0) {
+                LOG_ERR("%s: llama_encode(ctx_dft) failed rc=%d (n_tokens=%d)\n", __func__, rc, (int) n_chunk);
+                return false;
+            }
+
+            const float * inp_g = llama_get_embeddings_nextn(ctx_dft);
+            GGML_ASSERT(inp_g && "DFlash encoder produced no output.");
+
+            batch_inject.n_tokens = n_chunk;
+            std::memcpy(batch_inject.embd, inp_g, (size_t) n_chunk * n_embd_dec * sizeof(float));
+            for (int32_t i = 0; i < n_chunk; ++i) {
+                batch_inject.pos[i]       = batch_in.pos[rows[off + i]];
+                batch_inject.n_seq_id[i]  = 1;
+                batch_inject.seq_id[i][0] = seq_id;
+                batch_inject.logits[i]    = false;
+            }
+            {
+                common_time_meas tm(this->t_dft_inject_us, !this->gen_perf);
+                rc = llama_decode(ctx_dft, batch_inject);
+            }
+            if (rc != 0) {
+                LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (n_tokens=%d)\n", __func__, rc, (int) n_chunk);
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool process(const llama_batch & batch_in, const std::vector<int32_t> * rows = nullptr) override {
         if (batch_in.n_tokens <= 0) {
             return true;
         }
@@ -1162,6 +1241,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
 
         const int32_t n_tokens = batch_in.n_tokens;
+
+        // Explicit row list (tree drafting): the caller has already picked the accepted
+        // path out of a branching batch, so take exactly those rows in order.
+        if (rows != nullptr) {
+            return process_rows(batch_in, *rows);
+        }
 
         // per-seq inclusive batch range (assumes each seq's tokens are contiguous in the batch)
         std::vector<int32_t> i_batch_beg(n_seq, -1);
@@ -1719,7 +1804,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
     }
 
-    bool process(const llama_batch & batch_in) override {
+    bool process(const llama_batch & batch_in, const std::vector<int32_t> * rows = nullptr) override {
         if (batch_in.n_tokens <= 0) {
             return true;
         }
@@ -2027,7 +2112,7 @@ struct common_speculative_impl_ngram_simple : public common_speculative_impl {
         // noop
     }
 
-    bool process(const llama_batch & /*batch*/) override {
+    bool process(const llama_batch & /*batch*/, const std::vector<int32_t> * /*rows*/ = nullptr) override {
         // TODO: implement
         return true;
     }
@@ -2075,7 +2160,7 @@ struct common_speculative_impl_ngram_map_k : public common_speculative_impl {
         common_ngram_map_begin(config[seq_id], prompt);
     }
 
-    bool process(const llama_batch & /*batch*/) override {
+    bool process(const llama_batch & /*batch*/, const std::vector<int32_t> * /*rows*/ = nullptr) override {
         // TODO: implement
         return true;
     }
@@ -2233,7 +2318,7 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         sinfo.n_draft_last = result.size();
     }
 
-    bool process(const llama_batch & /*batch*/) override {
+    bool process(const llama_batch & /*batch*/, const std::vector<int32_t> * /*rows*/ = nullptr) override {
         // TODO: implement
         return true;
     }
@@ -2395,7 +2480,7 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
         }
     }
 
-    bool process(const llama_batch & /*batch*/) override {
+    bool process(const llama_batch & /*batch*/, const std::vector<int32_t> * /*rows*/ = nullptr) override {
         // TODO: implement
         return true;
     }
@@ -2888,7 +2973,8 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
     }
 }
 
-bool common_speculative_process(common_speculative * spec, const llama_batch & batch) {
+bool common_speculative_process(common_speculative * spec, const llama_batch & batch,
+                                const std::vector<int32_t> * rows) {
     bool result = true;
 
     if (spec == nullptr) {
@@ -2897,7 +2983,7 @@ bool common_speculative_process(common_speculative * spec, const llama_batch & b
 
     for (auto & impl : spec->impls) {
         common_time_meas tm(impl->t_dft_proc_us, !impl->gen_perf);
-        result = result && impl->process(batch);
+        result = result && impl->process(batch, rows);
     }
 
     return result;

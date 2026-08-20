@@ -134,7 +134,11 @@ common_speculative_draft_params & common_speculative_get_draft_params(common_spe
 void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & prompt);
 
 // process the batch and update the internal state of the speculative context
-bool common_speculative_process(common_speculative * spec, const llama_batch & batch);
+// `rows`, when given, restricts processing to those batch indices (all one sequence).
+// Tree drafting must use it: the verify batch holds several BRANCHES at the same
+// positions, and only the accepted path is real context for the drafter's cache.
+bool common_speculative_process(common_speculative * spec, const llama_batch & batch,
+                                const std::vector<int32_t> * rows = nullptr);
 
 // generate drafts for the sequences specified with `common_speculative_get_draft_params`
 void common_speculative_draft(common_speculative * spec);

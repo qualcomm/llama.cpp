@@ -238,6 +238,8 @@ struct server_slot {
     std::vector<llama_seq_id>     spec_tree_seqs;     // scratch seq_ids in use this round (excl. canonical)
     std::vector<llama_seq_id>     spec_tree_owner;    // seq that holds each node's KV chain
 
+    int32_t                       spec_i_batch_root  = -1;  // root's batch index, kept past the clear
+
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
     std::unique_ptr<const server_task> task;
@@ -543,6 +545,7 @@ struct server_slot {
                 }
 
                 spec_i_batch.push_back(batch.size());
+                spec_i_batch_root = batch.size();
                 // 🔴 The root is on EVERY path, so it must carry every scratch seq_id too.
                 // Without it those sequences skip this position and the next decode is
                 // rejected: "the tokens for sequence N have a starting position of Y",
@@ -3774,7 +3777,15 @@ private:
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
         //       for now, always re-evaluate for simplicity
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
-        if (spec) {
+        // With a draft TREE the batch holds several branches at the same positions, so
+        // folding all of it into the drafter's cache would write conflicting K/V. The
+        // accepted path is not known yet, so this is deferred to the accept step below
+        // -- which is what [TAG_SPEC_AVOID_DRAFT_REEVAL] wanted anyway.
+        bool any_tree = false;
+        iterate(slots, [&](server_slot & slot) {
+            if (!slot.spec_tree.empty() && !slot.spec_tree_seqs.empty()) { any_tree = true; }
+        });
+        if (spec && !any_tree) {
             bool ok = true;
             queue_tasks.yield_to_queue([&]() {
                 ok = common_speculative_process(spec.get(), batch_view);
@@ -4008,6 +4019,18 @@ private:
                     for (llama_seq_id sq : slot.spec_tree_seqs) {
                         slot.mem.seq_rm(sq, -1, -1);
                     }
+
+                    // Now that the path is known, fold exactly it into the drafter's
+                    // cache: the root plus every accepted node, in order.
+                    std::vector<int32_t> proc_rows;
+                    proc_rows.reserve(acc_nodes.size() + 1);
+                    proc_rows.push_back(slot.spec_i_batch_root);
+                    for (int32_t n : acc_nodes) {
+                        proc_rows.push_back(slot.spec_tree_i_batch[n]);
+                    }
+                    queue_tasks.yield_to_queue([&]() {
+                        common_speculative_process(spec.get(), batch.batch, &proc_rows);
+                    });
                 }
 
                 GGML_ASSERT(accepted.size() >= 1);
