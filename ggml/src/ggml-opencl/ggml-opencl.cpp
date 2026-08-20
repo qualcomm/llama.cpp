@@ -1752,6 +1752,12 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemm_noshuffle_q6_k_q8_1_dp4a_narrow = nullptr;
     cl_kernel kernel_gemm_noshuffle_q6_k_q8_1_dp4a_alds4 = nullptr;
     cl_kernel kernel_gemm_noshuffle_q6_k_q8_1_dp4a_narrow_alds4 = nullptr;
+    // Weight-as-texture twins (-DQ6K_WIMG=1): src0_ql bound as an image1d_buffer.
+    cl_kernel kernel_gemm_noshuffle_q6_k_q8_1_dp4a_wimg = nullptr;
+    cl_kernel kernel_gemm_noshuffle_q6_k_q8_1_dp4a_wimg_alds4 = nullptr;
+    cl_kernel kernel_gemm_noshuffle_q6_k_q8_1_dp4a_narrow_wimg = nullptr;
+    cl_kernel kernel_gemm_noshuffle_q6_k_q8_1_dp4a_narrow_wimg_alds4 = nullptr;
+    bool q6k_dense_wimg_on = false;   // resolved once at init; see the build block
     int q6k_dp4a_ts_narrow  = 32;  // == 32 disables the split
     int q6k_dp4a_narrow_max = 16;
     cl_kernel kernel_quant_a_q8_1;                    // plain activation q8_1 pre-pass
@@ -5556,6 +5562,36 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a_narrow_alds4 = nullptr; }
             CL_CHECK(clReleaseProgram(nprog));
         }
+
+        // Weight-as-texture twins. The q4_K dense dp4a GEMM reads its weight plane
+        // through an image1d_buffer and the q6_K MoE dp4a GEMM reads `ql` the same way;
+        // the q6_K DENSE GEMM was the one left reading it as a plain buffer. Profiling
+        // the verify pass at --spec-draft-p-min 0.3 put every dense GEMM on this device
+        // at ~86 GB/s except this one, at 65.7 -- and its band (ne1 9..16) is now 48.7%
+        // of the verify pass. Same -DQ6K_WIMG=1 body, so the two stay A/B-able.
+        //
+        // OFF until measured, and the extra programs are only COMPILED when it is on:
+        // an Adreno program build is not free at startup and this doubles the count.
+        static const char * q6k_wimg_env = getenv("GGML_OPENCL_Q6K_DENSE_DP4A_WIMG");
+        backend_ctx->q6k_dense_wimg_on = q6k_wimg_env && (atoi(q6k_wimg_env) != 0);
+        if (backend_ctx->q6k_dense_wimg_on) {
+            const std::string wimg_opts = compile_opts + " -DQ6K_WIMG=1";
+            cl_program wprog = build_program_from_source(backend_ctx, kernel_src.c_str(), wimg_opts);
+            CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a_wimg = clCreateKernel(wprog, "kernel_gemm_noshuffle_q6_k_q8_1_dp4a", &err), err));
+            backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a_wimg_alds4 =
+                clCreateKernel(wprog, "kernel_gemm_noshuffle_q6_k_q8_1_dp4a_alds4", &err);
+            if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a_wimg_alds4 = nullptr; }
+            CL_CHECK(clReleaseProgram(wprog));
+            if (ts_narrow != 32) {
+                const std::string nw_opts = wimg_opts + " -DTILESIZE_N=" + std::to_string(ts_narrow);
+                cl_program nwprog = build_program_from_source(backend_ctx, kernel_src.c_str(), nw_opts);
+                CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a_narrow_wimg = clCreateKernel(nwprog, "kernel_gemm_noshuffle_q6_k_q8_1_dp4a", &err), err));
+                backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a_narrow_wimg_alds4 =
+                    clCreateKernel(nwprog, "kernel_gemm_noshuffle_q6_k_q8_1_dp4a_alds4", &err);
+                if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a_narrow_wimg_alds4 = nullptr; }
+                CL_CHECK(clReleaseProgram(nwprog));
+            }
+        }
         // q6_K is the ONLY dense format where the uint4 staging tile regressed at the wide
         // tile, and the only one whose inner loop holds a per-work-item array (uint qw[8],
         // on top of float4 acc[NGROUPS]). On the cok kernel that exact symptom was a spill:
@@ -5568,6 +5604,10 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                 { "q6K_dp4a_alds4 ", backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a_alds4 },
                 { "q6K_nrw        ", backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a_narrow },
                 { "q6K_nrw_alds4  ", backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a_narrow_alds4 },
+                { "q6K_wimg       ", backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a_wimg },
+                { "q6K_wimg_alds4 ", backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a_wimg_alds4 },
+                { "q6K_nrw_wimg   ", backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a_narrow_wimg },
+                { "q6K_nrw_wimg_a4", backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a_narrow_wimg_alds4 },
             };
             for (size_t pi = 0; pi < sizeof(q6probes)/sizeof(q6probes[0]); pi++) {
                 if (q6probes[pi].k == nullptr) {
@@ -28229,13 +28269,54 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
             // not, which is the likeliest reason the wide tile cannot absorb it.
             // Gate on the BATCH WIDTH, not on use_narrow: q6k_dp4a_ts_narrow == 32, so
             // q6_K never compiles a second program and use_narrow is always false.
+            // Weight plane as a texture. `ql` is 4 bits/weight, exactly the layout the
+            // q4_K dense dp4a GEMM already binds as CL_R/UINT32 (one texel = 2 ushorts),
+            // and the q6_K MoE dp4a GEMM already reads it this way. Only `ql` moves: `qh`
+            // and the scales stay buffers, so this covers 4 of the 6.5625 bits/weight.
+            // Opt in with GGML_OPENCL_Q6K_DENSE_DP4A_WIMG=1 (the kernels are not even
+            // compiled otherwise).
+            cl_mem q6k_ql_img = nullptr;
+            bool use_wimg = backend_ctx->q6k_dense_wimg_on;
+            if (use_wimg) {
+                const size_t tex = (size_t)M * (size_t)K / 8;  // uint32 texels = ql bytes/4
+                if (tex == 0 || tex > backend_ctx->image_max_buffer_size) {
+                    use_wimg = false;
+                } else {
+                    img_fmt = { CL_R, CL_UNSIGNED_INT32 };
+                    memset(&img_desc, 0, sizeof(img_desc));
+                    img_desc.image_type  = CL_MEM_OBJECT_IMAGE1D_BUFFER;
+                    img_desc.image_width = tex;
+                    img_desc.buffer      = extra0_q6_K->ql;
+                    q6k_ql_img = clCreateImage(context, CL_MEM_READ_ONLY, &img_fmt, &img_desc, NULL, &err);
+                    if (err != CL_SUCCESS || q6k_ql_img == nullptr) {
+                        use_wimg   = false;
+                        q6k_ql_img = nullptr;
+                    }
+                }
+            }
+            if (use_wimg) {
+                cl_kernel w_plain = use_narrow ? backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a_narrow_wimg
+                                               : backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a_wimg;
+                cl_kernel w_alds4 = use_narrow ? backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a_narrow_wimg_alds4
+                                               : backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a_wimg_alds4;
+                if (w_plain != nullptr) {
+                    dk            = w_plain;
+                    q6_K_alds4_k  = w_alds4;
+                } else {
+                    // The texture kernel for this tile was not built; drop back to the
+                    // buffer pair rather than binding an image to a buffer argument.
+                    CL_CHECK(clReleaseMemObject(q6k_ql_img));
+                    q6k_ql_img = nullptr;
+                    use_wimg   = false;
+                }
+            }
             const bool use_q6_K_alds4 = q6_K_alds4_on
                                      && (N <= backend_ctx->q6k_dp4a_narrow_max)
                                      && q6_K_alds4_k != nullptr;
             if (use_q6_K_alds4) { dk = q6_K_alds4_k; }
             if (getenv("GGML_OPENCL_DP4A_ROUTE_PROBE")) {
                 fprintf(stderr, "[DP4A-ROUTE] q6_K M=%d N=%d K=%d -> %s%s%s\n", M, N, K,
-                        use_narrow ? "narrow" : "wide", false ? "+wimg" : "",
+                        use_narrow ? "narrow" : "wide", use_wimg ? "+wimg" : "",
                         use_q6_K_alds4 ? "+alds4" : "");
                 fflush(stderr);
             }
@@ -28257,7 +28338,7 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
             }
             const cl_ulong zero_off = 0;
             int ai = 0;
-            CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_mem),   &extra0_q6_K->ql));
+            CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_mem),   use_wimg ? &q6k_ql_img : &extra0_q6_K->ql));
             CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_mem),   &extra0_q6_K->qh));
             CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_mem),   &extra0_q6_K->s));
             CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_mem),   &extra0_q6_K->d));
@@ -28297,6 +28378,7 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
                 backend_ctx->enqueue_ndrange_kernel(rk, 1, r_global, r_local, dst);
             }
 
+            if (q6k_ql_img != nullptr) { CL_CHECK(clReleaseMemObject(q6k_ql_img)); }
             CL_CHECK(clReleaseMemObject(b_sub_buf));
             return;
         }

@@ -13,6 +13,15 @@
 // with the q6_K weight unpack from the MoE dp4a (EXP4 nibble | EXP2 high, then
 // SIGN6 packs (q6-32) as a signed int8 so NO min/sum correction is needed).
 //
+// -DQ6K_WIMG=1 binds the low-nibble plane (`src0_ql`) as an image1d_buffer of
+// CL_R/UINT32 texels (2 ushorts each) instead of a plain global buffer, so the read
+// goes through the texture pipe + L1 rather than the general load path. Same body
+// otherwise, so the two are directly A/B-able. This is the path the q4_K dense dp4a
+// GEMM (`_wimg`) and the q6_K MoE dp4a GEMM already take; the q6_K DENSE GEMM was the
+// one left on the buffer, and profiling the verify pass put it at 65.7 GB/s against
+// ~86 for every other dense GEMM on the X2-90. `qh` and the scales stay buffers, so
+// this moves 4 of the 6.5625 bits/weight.
+//
 // q6_K has an int8 scale per 16 elements (vs q4_K's per-32), so each 32-K step is
 // split into two 16-K dp4a dots with their own scale: the first 16 K -> qw[0..3]
 // (scale0), the second 16 K -> qw[4..7] (scale1). Reuses the SAME q8_1 activation
@@ -55,7 +64,11 @@ inline int dot4_q8a(uint w0, uint w1, uint w2, uint w3,
 
 __attribute__((qcom_wave_pair_mode(1)))
 kernel void kernel_gemm_noshuffle_q6_k_q8_1_dp4a(
+#ifdef Q6K_WIMG
+        __read_only image1d_buffer_t src0_ql,  // q6_K low nibbles, CL_R/UINT32 (2 ushorts/texel)
+#else
         __global const ushort * src0_ql,   // q6_K low nibbles (noshuffle)
+#endif
         __global const uchar  * src0_qh,   // q6_K high 2-bit (uchar, 4 highs/elem)
         __global const ushort * src0_s,    // int8 scale codes (2 chars/ushort, per 16)
         __global const half   * src0_d,    // per-superblock scale
@@ -132,7 +145,14 @@ kernel void kernel_gemm_noshuffle_q6_k_q8_1_dp4a(
         #pragma unroll
         for (int u = 0; u < 8; ++u) {
             const uint o  = wbase + (uint)u * (uint)m;
+#ifdef Q6K_WIMG
+            // One texel holds two ushorts, so pick the half with a shift -- exactly the
+            // q4_K `_wimg` idiom. EXP4 only looks at the low 16 bits, so no mask is needed.
+            const uint ql_t = read_imageui(src0_ql, (int)(o >> 1)).x >> ((o & 1u) << 4);
+            qw[u] = SIGN6(EXP4(ql_t) | EXP2((uint)src0_qh[o]));
+#else
             qw[u] = SIGN6(EXP4((uint)src0_ql[o]) | EXP2((uint)src0_qh[o]));
+#endif
         }
 
         // cooperatively stage the 32-token x 32-K int8 activations + scale to LDS
@@ -204,7 +224,11 @@ kernel void kernel_gemm_noshuffle_q6_k_q8_1_dp4a(
 
 __attribute__((qcom_wave_pair_mode(1)))
 kernel void kernel_gemm_noshuffle_q6_k_q8_1_dp4a_alds4(
+#ifdef Q6K_WIMG
+        __read_only image1d_buffer_t src0_ql,  // q6_K low nibbles, CL_R/UINT32 (2 ushorts/texel)
+#else
         __global const ushort * src0_ql,   // q6_K low nibbles (noshuffle)
+#endif
         __global const uchar  * src0_qh,   // q6_K high 2-bit (uchar, 4 highs/elem)
         __global const ushort * src0_s,    // int8 scale codes (2 chars/ushort, per 16)
         __global const half   * src0_d,    // per-superblock scale
@@ -281,7 +305,14 @@ kernel void kernel_gemm_noshuffle_q6_k_q8_1_dp4a_alds4(
         #pragma unroll
         for (int u = 0; u < 8; ++u) {
             const uint o  = wbase + (uint)u * (uint)m;
+#ifdef Q6K_WIMG
+            // One texel holds two ushorts, so pick the half with a shift -- exactly the
+            // q4_K `_wimg` idiom. EXP4 only looks at the low 16 bits, so no mask is needed.
+            const uint ql_t = read_imageui(src0_ql, (int)(o >> 1)).x >> ((o & 1u) << 4);
+            qw[u] = SIGN6(EXP4(ql_t) | EXP2((uint)src0_qh[o]));
+#else
             qw[u] = SIGN6(EXP4((uint)src0_ql[o]) | EXP2((uint)src0_qh[o]));
+#endif
         }
 
         // cooperatively stage the 32-token x 32-K int8 activations + scale to LDS
