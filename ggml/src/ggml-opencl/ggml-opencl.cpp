@@ -5566,13 +5566,28 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         }
         backend_ctx->q6k_dp4a_ts_narrow = ts_narrow;
         if (ts_narrow != 32) {
+            // NON-FATAL. Until the guard above was added this program never once compiled
+            // on any device, so turning it on by default introduces genuinely new code to
+            // every Adreno at init -- and one part in the fleet has a compiler that
+            // refuses K-quant kernels the others build. A variant that does not build
+            // leaves its handles null, `use_narrow` stays false and the dispatch takes the
+            // wide tile, rather than taking the whole backend down at load time.
             std::string narrow_opts = compile_opts + " -DTILESIZE_N=" + std::to_string(ts_narrow);
-            cl_program nprog = build_program_from_source(backend_ctx, kernel_src.c_str(), narrow_opts);
-            CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a_narrow = clCreateKernel(nprog, "kernel_gemm_noshuffle_q6_k_q8_1_dp4a", &err), err));
-            backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a_narrow_alds4 =
-                clCreateKernel(nprog, "kernel_gemm_noshuffle_q6_k_q8_1_dp4a_alds4", &err);
-            if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a_narrow_alds4 = nullptr; }
-            CL_CHECK(clReleaseProgram(nprog));
+            cl_program nprog = build_program_from_source_ex_cached(
+                backend_ctx, kernel_src.c_str(), narrow_opts, /*fatal=*/false,
+                "gemm_noshuffle_q6_k_q8_1_dp4a_narrow");
+            if (nprog == nullptr) {
+                GGML_LOG_WARN("ggml_opencl: q6_K narrow dp4a tile (TILESIZE_N=%d) did not build; "
+                              "the verify band falls back to the 32-wide tile\n", ts_narrow);
+            } else {
+                backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a_narrow =
+                    clCreateKernel(nprog, "kernel_gemm_noshuffle_q6_k_q8_1_dp4a", &err);
+                if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a_narrow = nullptr; }
+                backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a_narrow_alds4 =
+                    clCreateKernel(nprog, "kernel_gemm_noshuffle_q6_k_q8_1_dp4a_alds4", &err);
+                if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a_narrow_alds4 = nullptr; }
+                CL_CHECK(clReleaseProgram(nprog));
+            }
         }
 
         // Weight-as-texture twins. The q4_K dense dp4a GEMM reads its weight plane
