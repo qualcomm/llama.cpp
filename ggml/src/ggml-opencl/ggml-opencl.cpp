@@ -1736,6 +1736,9 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow_wimg_aimg = nullptr;
     cl_kernel kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg_alds4 = nullptr;
     cl_kernel kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow_wimg_alds4 = nullptr;
+    // Activations read straight from global instead of a __local tile (no barriers).
+    cl_kernel kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg_agm = nullptr;
+    cl_kernel kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow_wimg_agm = nullptr;
     cl_kernel kernel_gemm_noshuffle_q4_k_q8_1_dp4a_alds4 = nullptr;
     cl_kernel kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow_alds4 = nullptr;
     cl_kernel kernel_gemm_q4_k_splitk_reduce_f32 = nullptr;  // sums the split-K partials
@@ -5358,6 +5361,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg_alds4 =
             clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg_alds4", &err);
         if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg_alds4 = nullptr; }
+        backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg_agm =
+            clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg_agm", &err);
+        if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg_agm = nullptr; }
         backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_alds4 =
             clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_q8_1_dp4a_alds4", &err);
         if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_alds4 = nullptr; }
@@ -5390,6 +5396,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow_wimg_alds4 =
                 clCreateKernel(nprog, "kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg_alds4", &err);
             if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow_wimg_alds4 = nullptr; }
+            backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow_wimg_agm =
+                clCreateKernel(nprog, "kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg_agm", &err);
+            if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow_wimg_agm = nullptr; }
             backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow_alds4 =
                 clCreateKernel(nprog, "kernel_gemm_noshuffle_q4_k_q8_1_dp4a_alds4", &err);
             if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow_alds4 = nullptr; }
@@ -5411,6 +5420,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                 { "q4K_nrw_alds4  ", backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow_wimg_alds4 },
                 { "q4K_alds4_buf  ", backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_alds4 },
                 { "q4K_nrw_alds4b ", backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow_alds4 },
+                { "q4K_agm        ", backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg_agm },
+                { "q4K_nrw_agm    ", backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow_wimg_agm },
             };
             for (size_t pi = 0; pi < sizeof(dprobes)/sizeof(dprobes[0]); pi++) {
                 if (dprobes[pi].k == nullptr) {
@@ -27530,6 +27541,15 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
             // scalar local loads per step rather than 128.
             // DEFAULT ON; opt out with GGML_OPENCL_Q4K_DP4A_ALDS4=0.
             const bool q4k_dp4a_alds4_on = q4k_dp4a_alds4_default_on;
+            // Activations straight from global instead of the __local tile, which also
+            // drops both barriers per 32-K step. Same kernel arguments, so it is a pure
+            // swap. Opt in: GGML_OPENCL_Q4K_DP4A_AGM=1. Only meaningful with the weight
+            // texture, since it is a twin of _wimg_alds4.
+            static const char * q4k_agm_env = getenv("GGML_OPENCL_Q4K_DP4A_AGM");
+            const bool q4k_agm_on = q4k_agm_env && (atoi(q4k_agm_env) != 0);
+            cl_kernel agm_k = use_narrow ? backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow_wimg_agm
+                                         : backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg_agm;
+            const bool use_agm = q4k_agm_on && use_wimg && agm_k != nullptr;
             cl_kernel alds4_k = use_wimg
                 ? (use_narrow ? backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow_wimg_alds4
                               : backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg_alds4)
@@ -27537,6 +27557,7 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
                               : backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_alds4);
             const bool use_alds4 = q4k_dp4a_alds4_on && !use_aimg && alds4_k != nullptr;
             if (use_alds4) { dk = alds4_k; }
+            if (use_agm) { dk = agm_k; }
             // Route probe: an env-gated A/B is worthless if the gate never fires.
             if (getenv("GGML_OPENCL_Q4K_DP4A_PROBE")) {
                 fprintf(stderr, "[DP4A-PROBE] q4_K M=%d N=%d K=%d -> %s%s%s (aimg_built=%d)\n",

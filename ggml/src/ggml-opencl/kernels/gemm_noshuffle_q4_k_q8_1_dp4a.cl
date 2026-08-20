@@ -708,6 +708,141 @@ kernel void kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg_alds4(
 #undef NGROUPS
 }
 
+// Activation-from-global twin of _wimg_alds4 (`_agm`): same weights-as-texture path, but
+// the q8_1 activation tile is read straight from the global buffer instead of being staged
+// into __local, which also removes both barriers per 32-K step.
+//
+// Rationale and the risk, both on record. The tile is wave-uniform, and on the
+// cooperative-K kernel ADDING an LDS stage to exactly this pattern measured -50%, i.e. a
+// wave-uniform broadcast read beats LDS, which competes with the ALU issue port. But the
+// texture version of this idea (`_aimg`) measured -46% here, and the cause was register
+// pressure, not the address space: a dp4a needs 8 words live before it can consume them,
+// so the compiler hoists the loads and private memory went 336 -> 528 B with the workgroup
+// cap halved. Whether a plain global load behaves like the LDS tile (addressed on demand)
+// or like the texture (hoisted) is the open question this variant answers. Check
+// GGML_OPENCL_DP4A_PROBE_RES before trusting any timing.
+
+__attribute__((qcom_wave_pair_mode(1)))
+kernel void kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg_agm(
+        __read_only image1d_buffer_t src0_q_img,  // q4_K weights, CL_R/UINT32
+        __global const uchar  * src0_s,
+        __global const half   * src0_d,
+        __global const half   * src0_dm,
+        __global const uint   * src1_qa,   // q8_1 activations int8 (as uint, 4/elem) [N, K]
+        __global const half   * src1_da,
+        __global const half   * src1_sa,
+        __global       float  * dst,
+        ulong  offsetd,
+        int    m,
+        int    n_no_padding,
+        int    k,
+        uchar  mask_d6,
+        uchar  mask_d4,
+        uchar  mask_hi2,
+        int    ksplit
+) {
+    dst = (global float *)((global char *)dst + offsetd);
+
+    const uint lid = get_local_id(0);
+    const uint block_id_m = get_global_id(1);
+    const uint n_tiles    = ((uint)n_no_padding + TILESIZE_N - 1) / TILESIZE_N;
+    const uint gid2       = get_global_id(2);
+    const uint block_id_n = (n_tiles > 0) ? (gid2 % n_tiles) : gid2;
+    const uint ks         = (n_tiles > 0) ? (gid2 / n_tiles) : 0u;
+
+    const uint row      = block_id_m * 64 + lid;
+    const uint col_base = block_id_n * TILESIZE_N;
+    const bool row_valid = row < (uint)m;
+    const uint rrow     = row_valid ? row : 0;
+
+    const uint nsb   = ((uint)k + QK_K - 1) / QK_K;
+    const uint base  = nsb / (uint)ksplit;
+    const uint rem   = nsb - base * (uint)ksplit;
+    const uint sb_lo = ks * base + (ks < rem ? ks : rem);
+    const uint sb_n  = base + (ks < rem ? 1u : 0u);
+    const uint k_lo  = sb_lo * QK_K;
+    uint       k_hi  = (sb_lo + sb_n) * QK_K;
+    if (k_hi > (uint)k) { k_hi = (uint)k; }
+    if (k_lo >= k_hi) {
+        return;
+    }
+    dst += (size_t)ks * (size_t)n_no_padding * (size_t)m;
+
+    const uint sel = (rrow & 1u) * 16u;
+    const uint k_u = (uint)k >> 2;
+    const uint k_b = (uint)k >> 5;
+
+#define NGROUPS (TILESIZE_N / 4)
+    float4 acc[NGROUPS];
+    #pragma unroll
+    for (int g = 0; g < NGROUPS; ++g) acc[g] = (float4)(0.0f);
+
+    for (uint step = k_lo; step < k_hi; step += 32) {
+        const uint sub     = step >> 5;
+        const uint sb_idx  = step / QK_K;
+        const uint sub_idx = sub & 7;
+
+        const float dd  = (float)src0_d [rrow + sb_idx * m];
+        const float dmm = (float)src0_dm[rrow + sb_idx * m];
+        global const uchar * sc = src0_s + sb_idx * K_SCALE_SIZE * (uint)m + rrow;
+        uchar sv, mn;
+        get_scale_min_k4(sub_idx, sc, (uint)m, &sv, &mn, mask_d6, mask_d4, mask_hi2);
+        const float scale = dd  * (float)sv;
+        const float minv  = dmm * (float)mn;
+
+        const uint wbase = rrow + (step >> 2) * (uint)m;
+        uint8 qw;
+        qw.s0 = EXP4(read_imageui(src0_q_img, (int)((wbase + 0 * m) >> 1)).x >> sel);
+        qw.s1 = EXP4(read_imageui(src0_q_img, (int)((wbase + 1 * m) >> 1)).x >> sel);
+        qw.s2 = EXP4(read_imageui(src0_q_img, (int)((wbase + 2 * m) >> 1)).x >> sel);
+        qw.s3 = EXP4(read_imageui(src0_q_img, (int)((wbase + 3 * m) >> 1)).x >> sel);
+        qw.s4 = EXP4(read_imageui(src0_q_img, (int)((wbase + 4 * m) >> 1)).x >> sel);
+        qw.s5 = EXP4(read_imageui(src0_q_img, (int)((wbase + 5 * m) >> 1)).x >> sel);
+        qw.s6 = EXP4(read_imageui(src0_q_img, (int)((wbase + 6 * m) >> 1)).x >> sel);
+        qw.s7 = EXP4(read_imageui(src0_q_img, (int)((wbase + 7 * m) >> 1)).x >> sel);
+
+        // Activations straight from global, no __local tile and no barriers. The tile is
+        // WAVE-UNIFORM -- it is indexed by token and K-offset, never by lid, so all 64
+        // lanes of the workgroup want the same words and the load is an L1 broadcast.
+        // Columns past n_no_padding must contribute zero; the guard is wave-uniform too.
+#define AQ(T)    (src1_qa + (size_t)(col_base + (uint)(T)) * k_u + (step >> 2))
+#define AOK(T)   ((col_base + (uint)(T)) < (uint)n_no_padding)
+#define TDOT4(T) (AOK(T) ? dot8_q8a_v(qw, vload4(0, AQ(T)), vload4(0, AQ(T) + 4)) : 0)
+#define AD(T)    (AOK(T) ? (float)src1_da[(size_t)(col_base + (uint)(T)) * k_b + sub] : 0.0f)
+#define AS(T)    (AOK(T) ? (float)src1_sa[(size_t)(col_base + (uint)(T)) * k_b + sub] : 0.0f)
+#define LD4(arr, b) ((float4)(arr(b+0), arr(b+1), arr(b+2), arr(b+3)))
+        #pragma unroll
+        for (int g = 0; g < NGROUPS; ++g) {
+            const int b = g * 4;
+            const float4 rf = (float4)((float)TDOT4(b+0), (float)TDOT4(b+1),
+                                       (float)TDOT4(b+2), (float)TDOT4(b+3));
+            acc[g] += scale * LD4(AD, b) * rf - minv * LD4(AS, b);
+        }
+#undef TDOT4
+#undef AQ
+#undef AOK
+#undef AD
+#undef AS
+#undef LD4
+    }
+
+    if (!row_valid) {
+        return;
+    }
+
+    #pragma unroll
+    for (int g = 0; g < NGROUPS; ++g) {
+        const uint b = (uint)(g * 4);
+        const float4 a = acc[g];
+        const uint c0 = col_base + b;
+        if (c0 + 0 < (uint)n_no_padding) dst[(c0 + 0) * (uint)m + row] = a.s0;
+        if (c0 + 1 < (uint)n_no_padding) dst[(c0 + 1) * (uint)m + row] = a.s1;
+        if (c0 + 2 < (uint)n_no_padding) dst[(c0 + 2) * (uint)m + row] = a.s2;
+        if (c0 + 3 < (uint)n_no_padding) dst[(c0 + 3) * (uint)m + row] = a.s3;
+    }
+#undef NGROUPS
+}
+
 // Buffer-weight twin of _wimg_alds4: the uint4 staging change is independent of
 // how the weights are read, and the weight-texture gate is a narrow-band default,
 // so the plain-buffer path needs the same kernel to get the same win.
