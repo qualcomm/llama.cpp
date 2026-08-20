@@ -27697,7 +27697,12 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
             static const char * q4k_ksplit_env = getenv("GGML_OPENCL_Q4K_DP4A_KSPLIT");
             int ksplit = q4k_ksplit_env ? atoi(q4k_ksplit_env) : 1;
             if (ksplit < 1)  { ksplit = 1; }
-            if (!use_narrow) { ksplit = 1; }
+            // Split-K applies to the MID tile too. Measured at ne1=24 on a 24-wide tile:
+            // 282.7 ms/pass with ksplit=4 against 335.6 without -- one column tile still
+            // leaves the grid too small without it. (Split-K on a tile NARROWER than N is a
+            // different and losing trade: 16-tile + ksplit at ne1=24 measured 402.8 ms,
+            // because two column tiles re-read the weights and the partial traffic stacks.)
+            if (!use_narrow && !use_mid) { ksplit = 1; }
             // Size the K-split PER TENSOR, by how many workgroups the M axis already
             // provides. Split-K buys parallelism and pays for it in traffic: the GEMM writes
             // M*N*ksplit floats of partials and the reduce reads them back, which at ne1=16
