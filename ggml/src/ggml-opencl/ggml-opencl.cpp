@@ -5556,6 +5556,33 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a_narrow_alds4 = nullptr; }
             CL_CHECK(clReleaseProgram(nprog));
         }
+        // q6_K is the ONLY dense format where the uint4 staging tile regressed at the wide
+        // tile, and the only one whose inner loop holds a per-work-item array (uint qw[8],
+        // on top of float4 acc[NGROUPS]). On the cok kernel that exact symptom was a spill:
+        // replacing float8 out[4] with four named float8 took private 400 -> 272 B and the
+        // workgroup cap 640 -> 896. Same probe as the q4_K family above, so the two are
+        // directly comparable.
+        if (getenv("GGML_OPENCL_DP4A_PROBE_RES")) {
+            struct { const char * name; cl_kernel k; } q6probes[] = {
+                { "q6K_dp4a       ", backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a },
+                { "q6K_dp4a_alds4 ", backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a_alds4 },
+                { "q6K_nrw        ", backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a_narrow },
+                { "q6K_nrw_alds4  ", backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a_narrow_alds4 },
+            };
+            for (size_t pi = 0; pi < sizeof(q6probes)/sizeof(q6probes[0]); pi++) {
+                if (q6probes[pi].k == nullptr) {
+                    fprintf(stderr, "[DP4A-RES] %s (not built)\n", q6probes[pi].name);
+                    continue;
+                }
+                cl_ulong pmc = 0, lmc = 0; size_t wgc = 0;
+                clGetKernelWorkGroupInfo(q6probes[pi].k, backend_ctx->device, CL_KERNEL_PRIVATE_MEM_SIZE, sizeof(pmc), &pmc, NULL);
+                clGetKernelWorkGroupInfo(q6probes[pi].k, backend_ctx->device, CL_KERNEL_LOCAL_MEM_SIZE, sizeof(lmc), &lmc, NULL);
+                clGetKernelWorkGroupInfo(q6probes[pi].k, backend_ctx->device, CL_KERNEL_WORK_GROUP_SIZE, sizeof(wgc), &wgc, NULL);
+                fprintf(stderr, "[DP4A-RES] %s private=%5llu local=%6llu wg_cap=%4zu\n",
+                        q6probes[pi].name, (unsigned long long)pmc, (unsigned long long)lmc, wgc);
+            }
+            fflush(stderr);
+        }
         GGML_LOG_CONT(".");
     }
 
