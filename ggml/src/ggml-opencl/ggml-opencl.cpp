@@ -1738,10 +1738,24 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow_wimg_alds4 = nullptr;
     cl_kernel kernel_gemm_noshuffle_q4_k_q8_1_dp4a_alds4 = nullptr;
     cl_kernel kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow_alds4 = nullptr;
+    // MID tile. The pass costs a STEP per PADDED column tile and is flat inside one -- measured
+    // on X2-90/muse-glimmer-30B, N=17..28 all cost 371-384 ms/pass against 232 at N=16, because
+    // a 32-wide tile computes 32 columns whatever N is. With only {16, 32} available, N=17
+    // pays for 32. A third tile at 24 takes pp24 377.4 -> 282.7 ms (t/s +33.5%), bit-exact.
+    // Nothing in single-stream decode lands in 17..31 today (verify batch ~7.4, DFlash block
+    // exactly 16) -- this is the prerequisite for TREE drafting, which needs cheap width.
+    cl_kernel kernel_gemm_noshuffle_q4_k_q8_1_dp4a_mid = nullptr;
+    cl_kernel kernel_gemm_noshuffle_q4_k_q8_1_dp4a_mid_wimg = nullptr;
+    cl_kernel kernel_gemm_noshuffle_q4_k_q8_1_dp4a_mid_wimg_aimg = nullptr;
+    cl_kernel kernel_gemm_noshuffle_q4_k_q8_1_dp4a_mid_wimg_alds4 = nullptr;
+    cl_kernel kernel_gemm_noshuffle_q4_k_q8_1_dp4a_mid_wimg_agm = nullptr;
+    cl_kernel kernel_gemm_noshuffle_q4_k_q8_1_dp4a_mid_alds4 = nullptr;
     cl_kernel kernel_gemm_q4_k_splitk_reduce_f32 = nullptr;  // sums the split-K partials
-    int q4k_dp4a_ts        = 32;  // tile for prefill (ne1 > q4k_dp4a_narrow_max)
+    int q4k_dp4a_ts        = 32;  // tile for prefill (ne1 > q4k_dp4a_mid_max)
     int q4k_dp4a_ts_narrow = 32;  // tile for the verify band; == q4k_dp4a_ts disables the split
     int q4k_dp4a_narrow_max = 16; // widest ne1 routed to the narrow tile
+    int q4k_dp4a_ts_mid    = 24;  // tile for ne1 in (narrow_max, mid_max]
+    int q4k_dp4a_mid_max   = 24;  // widest ne1 routed to the mid tile; <= narrow_max disables it
     cl_kernel kernel_gemm_noshuffle_q5_k_q8_1_dp4a = nullptr;  // dp4a (int8) dense q5_K prefill GEMM
     // Narrow-tile twin for the verify band; see the q4_K pair above for the rationale.
     cl_kernel kernel_gemm_noshuffle_q5_k_q8_1_dp4a_narrow = nullptr;
@@ -1752,8 +1766,13 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemm_noshuffle_q6_k_q8_1_dp4a_narrow = nullptr;
     cl_kernel kernel_gemm_noshuffle_q6_k_q8_1_dp4a_alds4 = nullptr;
     cl_kernel kernel_gemm_noshuffle_q6_k_q8_1_dp4a_narrow_alds4 = nullptr;
+    // MID tile, the q6_K twin of the q4_K one: ne1 in (narrow_max, mid_max] would
+    // otherwise pay a full 32 padded columns.
+    cl_kernel kernel_gemm_noshuffle_q6_k_q8_1_dp4a_mid = nullptr;
     int q6k_dp4a_ts_narrow  = 32;  // == 32 disables the split
     int q6k_dp4a_narrow_max = 16;
+    int q6k_dp4a_ts_mid     = 24;
+    int q6k_dp4a_mid_max    = 24;  // <= narrow_max disables the mid tile
     cl_kernel kernel_quant_a_q8_1;                    // plain activation q8_1 pre-pass
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_r1;
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_kimg;
@@ -5389,6 +5408,51 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow_alds4 = nullptr; }
             CL_CHECK(clReleaseProgram(nprog));
         }
+        // Mid tile, for ne1 in (narrow_max, mid_max]. Same compile-time TILESIZE_N trick as the
+        // narrow program above, one step wider: without it a 17-column batch pays for 32.
+        // Built non-fatally -- a compiler that rejects a non-power-of-two TILESIZE_N leaves the
+        // handles null and the dispatch falls back to the wide tile rather than aborting.
+        {
+            int ts_mid = backend_ctx->q4k_dp4a_ts_mid;
+            if (const char * e = getenv("GGML_OPENCL_Q4K_DP4A_TS_MID"))  { ts_mid = atoi(e); }
+            if (const char * e = getenv("GGML_OPENCL_Q4K_DP4A_MID_MAX")) {
+                backend_ctx->q4k_dp4a_mid_max = atoi(e);
+            }
+            backend_ctx->q4k_dp4a_ts_mid = ts_mid;
+            if (backend_ctx->q4k_dp4a_mid_max > backend_ctx->q4k_dp4a_narrow_max &&
+                ts_mid != q4k_dp4a_ts && ts_mid != ts_narrow && ts_mid > 0) {
+                std::string mid_opts = compile_opts + " -DTILESIZE_N=" + std::to_string(ts_mid);
+                cl_program mprog = build_program_from_source_ex_cached(
+                    backend_ctx, kernel_src.c_str(), mid_opts, /*fatal=*/false,
+                    "gemm_noshuffle_q4_k_q8_1_dp4a_mid");
+                if (mprog == nullptr) {
+                    GGML_LOG_WARN("ggml_opencl: q4_K mid dp4a tile (TILESIZE_N=%d) did not build; "
+                                  "ne1 in (%d, %d] falls back to the %d-wide tile\n",
+                                  ts_mid, backend_ctx->q4k_dp4a_narrow_max,
+                                  backend_ctx->q4k_dp4a_mid_max, q4k_dp4a_ts);
+                } else {
+                    auto mk = [&](const char * name) {
+                        cl_int e2 = CL_SUCCESS;
+                        cl_kernel k = clCreateKernel(mprog, name, &e2);
+                        return e2 == CL_SUCCESS ? k : nullptr;
+                    };
+                    backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_mid            = mk("kernel_gemm_noshuffle_q4_k_q8_1_dp4a");
+                    backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_mid_wimg       = mk("kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg");
+                    backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_mid_wimg_aimg  = mk("kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg_aimg");
+                    backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_mid_wimg_alds4 = mk("kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg_alds4");
+                    backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_mid_wimg_agm   = mk("kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg_agm");
+                    backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_mid_alds4      = mk("kernel_gemm_noshuffle_q4_k_q8_1_dp4a_alds4");
+                    CL_CHECK(clReleaseProgram(mprog));
+                }
+                // The plain kernel is the one the dispatch always has a use for; if it did not
+                // build, disable the mid tile entirely so selection stays consistent.
+                if (backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_mid == nullptr) {
+                    backend_ctx->q4k_dp4a_mid_max = backend_ctx->q4k_dp4a_narrow_max;
+                }
+            } else {
+                backend_ctx->q4k_dp4a_mid_max = backend_ctx->q4k_dp4a_narrow_max;
+            }
+        }
         // Same question the cok family needed answered: does a variant spill? A
         // texture read has to be held in a register until its dp4a consumes it, so
         // an activation path that looks cheaper in instruction count can be paid for
@@ -5532,29 +5596,81 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a_alds4 = nullptr; }
         CL_CHECK(clReleaseProgram(prog));
 
-        // Narrow tile for the verify band. ⛔ DEFAULT OFF: MEASURED A REGRESSION.
-        // muse-glimmer-30B carries 52 q6_K tensors (+10 in the DFlash drafter), so this
-        // looked like the one that would compound with q4_K. It does the opposite --
-        // DFlash agentic traffic, one binary, three arms: all-off 12.2108, q4_K-only
-        // 13.3545, q4_K+q6_K 13.2125. Adding q6_K costs 1.06% against q4_K alone, ~25x
-        // the harness noise floor (controls reproduce to 0.04%). The tile trade does NOT
-        // generalise across quant types -- q6_K carries more per-weight work (ql+qh+
-        // scales) than q4_K, so its register/LDS balance differs. Opt in to re-test with
-        // GGML_OPENCL_Q6K_DP4A_TS_NARROW=16.
-        int ts_narrow = 32;
+        // Narrow tile for the verify band, same as q4_K: the kernel computes a full
+        // TILESIZE_N columns whatever N is (slots past n_no_padding are staged as zeros),
+        // so a 32-wide tile is 2x the work at N=16.
+        //
+        // DEFAULT ON (16). The earlier note here read "DEFAULT OFF: MEASURED A REGRESSION
+        // ... adding q6_K costs 1.06% against q4_K alone" -- that measured NOTHING. This
+        // kernel defined TILESIZE_N unconditionally, so the -DTILESIZE_N=16 below was
+        // silently overridden and the "narrow" program compiled at 32, byte-identical to
+        // the wide one. Guard added 2026-08-19; the tile is only now real, and it shows up
+        // in the resource probe as local 1088 -> 544 B, private 320 -> 256, workgroup cap
+        // 384 -> 512.
+        //
+        // Measured after the guard fix, muse-glimmer-30B Q4_K_M on Adreno X2-90, DFlash
+        // agentic traffic at --spec-draft-p-min 0.3, 4 arms x 2 interleaved passes, every
+        // arm's built-variant table captured from its own server log:
+        //     base                 17.777    (17.811 / 17.744)
+        //     narrow tile          17.959    (17.887 / 18.032)  +1.02%
+        // The arms separate cleanly -- the narrow tile's worst pass beats the base's best.
+        // Prefill is untouched (this band is N <= 16; the long-prompt prefill rate moves
+        // 97.003 -> 97.029), and test-backend-ops MUL_MAT is unchanged at 1006 OK / 0 FAIL.
+        // Opt out with GGML_OPENCL_Q6K_DP4A_TS_NARROW=32.
+        int ts_narrow = 16;
         if (const char * e = getenv("GGML_OPENCL_Q6K_DP4A_TS_NARROW")) { ts_narrow = atoi(e); }
         if (const char * e = getenv("GGML_OPENCL_Q6K_DP4A_NARROW_MAX")) {
             backend_ctx->q6k_dp4a_narrow_max = atoi(e);
         }
         backend_ctx->q6k_dp4a_ts_narrow = ts_narrow;
         if (ts_narrow != 32) {
+            // NON-FATAL. Until the guard above was added this program never once compiled
+            // on any device, so turning it on by default introduces genuinely new code to
+            // every Adreno at init -- and one part in the fleet has a compiler that
+            // refuses K-quant kernels the others build. A variant that does not build
+            // leaves its handles null, `use_narrow` stays false and the dispatch takes the
+            // wide tile, rather than taking the whole backend down at load time.
             std::string narrow_opts = compile_opts + " -DTILESIZE_N=" + std::to_string(ts_narrow);
-            cl_program nprog = build_program_from_source(backend_ctx, kernel_src.c_str(), narrow_opts);
-            CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a_narrow = clCreateKernel(nprog, "kernel_gemm_noshuffle_q6_k_q8_1_dp4a", &err), err));
-            backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a_narrow_alds4 =
-                clCreateKernel(nprog, "kernel_gemm_noshuffle_q6_k_q8_1_dp4a_alds4", &err);
-            if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a_narrow_alds4 = nullptr; }
-            CL_CHECK(clReleaseProgram(nprog));
+            cl_program nprog = build_program_from_source_ex_cached(
+                backend_ctx, kernel_src.c_str(), narrow_opts, /*fatal=*/false,
+                "gemm_noshuffle_q6_k_q8_1_dp4a_narrow");
+            if (nprog == nullptr) {
+                GGML_LOG_WARN("ggml_opencl: q6_K narrow dp4a tile (TILESIZE_N=%d) did not build; "
+                              "the verify band falls back to the 32-wide tile\n", ts_narrow);
+            } else {
+                backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a_narrow =
+                    clCreateKernel(nprog, "kernel_gemm_noshuffle_q6_k_q8_1_dp4a", &err);
+                if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a_narrow = nullptr; }
+                backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a_narrow_alds4 =
+                    clCreateKernel(nprog, "kernel_gemm_noshuffle_q6_k_q8_1_dp4a_alds4", &err);
+                if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a_narrow_alds4 = nullptr; }
+                CL_CHECK(clReleaseProgram(nprog));
+            }
+        }
+        // Mid tile, same non-fatal treatment as the narrow one above.
+        {
+            int ts_mid = backend_ctx->q6k_dp4a_ts_mid;
+            if (const char * e = getenv("GGML_OPENCL_Q6K_DP4A_TS_MID"))  { ts_mid = atoi(e); }
+            if (const char * e = getenv("GGML_OPENCL_Q6K_DP4A_MID_MAX")) {
+                backend_ctx->q6k_dp4a_mid_max = atoi(e);
+            }
+            backend_ctx->q6k_dp4a_ts_mid = ts_mid;
+            if (backend_ctx->q6k_dp4a_mid_max > backend_ctx->q6k_dp4a_narrow_max &&
+                ts_mid > 0 && ts_mid != 32 && ts_mid != ts_narrow) {
+                std::string mid_opts = compile_opts + " -DTILESIZE_N=" + std::to_string(ts_mid);
+                cl_program mprog = build_program_from_source_ex_cached(
+                    backend_ctx, kernel_src.c_str(), mid_opts, /*fatal=*/false,
+                    "gemm_noshuffle_q6_k_q8_1_dp4a_mid");
+                if (mprog == nullptr) {
+                    GGML_LOG_WARN("ggml_opencl: q6_K mid dp4a tile (TILESIZE_N=%d) did not build; "
+                                  "that band falls back to the 32-wide tile\n", ts_mid);
+                } else {
+                    backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a_mid =
+                        clCreateKernel(mprog, "kernel_gemm_noshuffle_q6_k_q8_1_dp4a", &err);
+                    if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a_mid = nullptr; }
+                    CL_CHECK(clReleaseProgram(mprog));
+                }
+            }
         }
         GGML_LOG_CONT(".");
     }
@@ -27309,6 +27425,26 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
             // second program was actually compiled.
             const bool use_narrow = (backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow != nullptr)
                                  && (N <= backend_ctx->q4k_dp4a_narrow_max);
+            // MID tile, one step wider than narrow. Cost is a step per PADDED tile and is
+            // flat inside one, so N=17 on the 32-wide tile pays for 32 columns; a 24-wide
+            // tile is pp24 -25% (bit-exact). Only reachable above narrow_max, so the
+            // shipping verify band (N<=16) is byte-for-byte unchanged.
+            // Require BOTH base kernels: the grid below uses q4k_dp4a_ts_mid, so selecting a
+            // mid tile while falling back to a wide KERNEL would launch a 32-column program
+            // on a 24-column grid and silently drop columns.
+            const bool use_mid = !use_narrow
+                              && (backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_mid != nullptr)
+                              && (backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_mid_wimg != nullptr)
+                              && (N <= backend_ctx->q4k_dp4a_mid_max);
+            // Pick among the three compiled tiles. For `mid` this returns the mid kernel or
+            // NULL -- never the wide one, which would mismatch the grid. The optional
+            // activation variants (aimg / agm / alds4) all already gate on != nullptr, so a
+            // variant that did not build at this TILESIZE_N is simply not used.
+            auto pick3 = [&](cl_kernel k_narrow, cl_kernel k_mid, cl_kernel k_wide) {
+                if (use_narrow) { return k_narrow; }
+                if (use_mid)    { return k_mid; }
+                return k_wide;
+            };
 
             // Optionally bind the weight plane as a texture (image1d_buffer over
             // the same q4_K weight buffer; CL_R/UINT32, one texel = 2 ushorts).
@@ -27353,11 +27489,13 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
                 }
             }
 
-            cl_kernel dk = use_narrow
-                ? (use_wimg ? backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow_wimg
-                            : backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow)
-                : (use_wimg ? backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg
-                            : backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a);
+            cl_kernel dk = use_wimg
+                ? pick3(backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow_wimg,
+                        backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_mid_wimg,
+                        backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg)
+                : pick3(backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow,
+                        backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_mid,
+                        backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a);
 
             // Activations from a texture instead of __local staging. The dp4a kernels
             // stage a TILESIZE_N x 32-K q8_1 tile into __local and then read it back
@@ -27371,9 +27509,9 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
             // GGML_OPENCL_Q4K_DP4A_AIMG=1.
             static const char * q4k_dp4a_aimg_env = getenv("GGML_OPENCL_Q4K_DP4A_AIMG");
             const bool q4k_dp4a_aimg_on = q4k_dp4a_aimg_env && (atoi(q4k_dp4a_aimg_env) != 0);
-            cl_kernel aimg_k = use_narrow
-                ? backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow_wimg_aimg
-                : backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg_aimg;
+            cl_kernel aimg_k = pick3(backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow_wimg_aimg,
+                                     backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_mid_wimg_aimg,
+                                     backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg_aimg);
             cl_mem q4k_a_img = nullptr;
             // The kernel's mad24 index arithmetic needs N*(K/16) to stay under 2^24.
             bool use_aimg = q4k_dp4a_aimg_on && use_wimg && aimg_k != nullptr
@@ -27412,16 +27550,18 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
             // DEFAULT ON; opt out with GGML_OPENCL_Q4K_DP4A_ALDS4=0.
             const bool q4k_dp4a_alds4_on = q4k_dp4a_alds4_default_on;
             cl_kernel alds4_k = use_wimg
-                ? (use_narrow ? backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow_wimg_alds4
-                              : backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg_alds4)
-                : (use_narrow ? backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow_alds4
-                              : backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_alds4);
+                ? pick3(backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow_wimg_alds4,
+                        backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_mid_wimg_alds4,
+                        backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg_alds4)
+                : pick3(backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_narrow_alds4,
+                        backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_mid_alds4,
+                        backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_alds4);
             const bool use_alds4 = q4k_dp4a_alds4_on && !use_aimg && alds4_k != nullptr;
             if (use_alds4) { dk = alds4_k; }
             // Route probe: an env-gated A/B is worthless if the gate never fires.
             if (getenv("GGML_OPENCL_Q4K_DP4A_PROBE")) {
                 fprintf(stderr, "[DP4A-PROBE] q4_K M=%d N=%d K=%d -> %s%s%s (aimg_built=%d)\n",
-                        M, N, K, use_narrow ? "narrow" : "wide", use_wimg ? "+wimg" : "",
+                        M, N, K, use_narrow ? "narrow" : use_mid ? "mid" : "wide", use_wimg ? "+wimg" : "",
                         use_aimg ? "+aimg" : use_alds4 ? "+alds4" : "", aimg_k != nullptr);
                 fflush(stderr);
             }
@@ -27433,7 +27573,12 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
             static const char * q4k_ksplit_env = getenv("GGML_OPENCL_Q4K_DP4A_KSPLIT");
             int ksplit = q4k_ksplit_env ? atoi(q4k_ksplit_env) : 1;
             if (ksplit < 1)  { ksplit = 1; }
-            if (!use_narrow) { ksplit = 1; }
+            // Split-K applies to the MID tile too. Measured at ne1=24 on a 24-wide tile:
+            // 282.7 ms/pass with ksplit=4 against 335.6 without -- one column tile still
+            // leaves the grid too small without it. (Split-K on a tile NARROWER than N is a
+            // different and losing trade: 16-tile + ksplit at ne1=24 measured 402.8 ms,
+            // because two column tiles re-read the weights and the partial traffic stacks.)
+            if (!use_narrow && !use_mid) { ksplit = 1; }
             const int nsb_total = CEIL_DIV(K, 256);
             if (ksplit > nsb_total) { ksplit = nsb_total; }
             const bool use_ksplit = ksplit > 1;
@@ -27477,7 +27622,8 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
             // the grid and the program have to agree, and duplicating the rule is how
             // they drift apart.
             const int q4k_dp4a_ts = use_narrow ? backend_ctx->q4k_dp4a_ts_narrow
-                                               : backend_ctx->q4k_dp4a_ts;
+                                  : use_mid  ? backend_ctx->q4k_dp4a_ts_mid
+                                             : backend_ctx->q4k_dp4a_ts;
             size_t d_local[3]  = { 64, 1, 1 };
             size_t d_global[3] = { 64, (size_t)(M / 64),
                                    (size_t)CEIL_DIV(N, q4k_dp4a_ts) * (size_t)ksplit };
@@ -28186,7 +28332,12 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
 
             const bool use_narrow = (backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a_narrow != nullptr)
                                  && (N <= backend_ctx->q6k_dp4a_narrow_max);
+            // Mid tile: only reachable above narrow_max, so the verify band is untouched.
+            const bool use_mid = !use_narrow
+                              && (backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a_mid != nullptr)
+                              && (N <= backend_ctx->q6k_dp4a_mid_max);
             cl_kernel dk = use_narrow ? backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a_narrow
+                         : use_mid    ? backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a_mid
                                       : backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a;
             // uint4 staging tile (see the kernel header): the inner loop read the
             // __local activation tile one uint at a time. DEFAULT ON; opt out with
@@ -28220,7 +28371,9 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
             if (ksplit < 1) { ksplit = 1; }
             // Gate on N, not on use_narrow: the q6_K narrow TILE is off by default, so
             // keying off it would disable the split on exactly the widths it is for.
-            if (N > backend_ctx->q6k_dp4a_narrow_max) { ksplit = 1; }
+            // The mid tile keeps split-K for the same reason the narrow one does: one
+            // column tile leaves the grid too small without it.
+            if (N > backend_ctx->q6k_dp4a_narrow_max && !use_mid) { ksplit = 1; }
             const int nsb_total = CEIL_DIV(K, 256);
             if (ksplit > nsb_total) { ksplit = nsb_total; }
             const bool use_ksplit = ksplit > 1;
@@ -28248,7 +28401,8 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
             CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_int),   &K));
             CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_int),   &ksplit));
             // Must match the compile-time TILESIZE_N of the kernel picked above.
-            const int q6k_ts = use_narrow ? backend_ctx->q6k_dp4a_ts_narrow : 32;
+            const int q6k_ts = use_narrow ? backend_ctx->q6k_dp4a_ts_narrow
+                             : use_mid    ? backend_ctx->q6k_dp4a_ts_mid : 32;
             size_t d_local[3]  = { 64, 1, 1 };
             size_t d_global[3] = { 64, (size_t)(M / 64),
                                    (size_t)CEIL_DIV(N, q6k_ts) * (size_t)ksplit };
