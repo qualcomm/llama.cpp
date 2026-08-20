@@ -2976,16 +2976,32 @@ void common_speculative_print_stats(const common_speculative * spec) {
                 str_stats.c_str(),
                 str_perf.c_str());
 
-        // Tree-yield probe. Per position: a_i is the measured linear acceptance, and of the
-        // rejections at that position, h_{i,r} is the share where the target's own token sat
-        // at rank r of the drafter's list. A b-wide tree at that position would accept when
-        // the target's token is anywhere in the top-b, so
-        //     A_i(b) = a_i + (1 - a_i) * sum_{r=2..b} h_{i,r}
-        // and the expected draft length is the running product of A_i. Printing E[len] for
-        // b = 1, 2, 4, 8 says directly whether a tree is worth building.
+        // Tree-yield probe. 🔴 n_acc_tokens_per_pos[i] is CUMULATIVE -- it counts every draft
+        // whose accepted length exceeded i, so a_i = P(reach past i) and sum(a_i) is already
+        // the mean accepted length. The per-step conditional is c_i = a_i / a_{i-1}; using a_i
+        // as if it were conditional understates E[len] badly (it reported 1.41 for the linear
+        // case whose true value is 3.19).
+        //
+        // Of the rejections at position i, h_{i,r} is the share where the target's own token
+        // sat at rank r of the drafter's list. A b-wide tree there accepts whenever the
+        // target's token is anywhere in the top-b, so C_i(b) = c_i + (1 - c_i) * sum_{r=2..b}
+        // h_{i,r}, and E[len] is the running product of C_i.
+        //
+        // ⚠️ This is a CEILING, on two counts: it assumes every position can afford b
+        // candidates (a real tree has a node budget, and b at every one of n positions is b^n
+        // paths), and it assumes the positions after a branch keep their measured acceptance.
+        // The latter is the Medusa assumption and is sound for DFlash specifically, whose
+        // block positions are denoised jointly rather than autoregressively -- the token at
+        // position i+1 does not depend on which candidate was taken at position i.
         if (!impl->rank_n.empty() && impl->n_call_accept > 0) {
             const int    K   = common_speculative_impl::RANK_PROBE_K;
             const size_t nps = impl->rank_n.size();
+
+            auto acc_cum = [&](size_t i) {
+                return i < impl->n_acc_tokens_per_pos.size()
+                    ? (double) impl->n_acc_tokens_per_pos[i] / (double) impl->n_call_accept
+                    : 0.0;
+            };
 
             std::ostringstream oss;
             oss << std::fixed << std::setprecision(3);
@@ -2994,19 +3010,21 @@ void common_speculative_print_stats(const common_speculative * spec) {
                 double e_len = 0.0;
                 double reach = 1.0;
                 for (size_t i = 0; i < nps; ++i) {
-                    const double a_i = i < impl->n_acc_tokens_per_pos.size()
-                        ? (double) impl->n_acc_tokens_per_pos[i] / (double) impl->n_call_accept
-                        : 0.0;
+                    const double prev = i == 0 ? 1.0 : acc_cum(i - 1);
+                    if (prev <= 0.0) {
+                        break;
+                    }
+                    const double c_i = std::min(1.0, acc_cum(i) / prev);
+
                     double extra = 0.0;
                     if (b > 1 && impl->rank_n[i] > 0) {
                         size_t hit = 0;
                         for (int r = 2; r <= b; ++r) {
                             hit += impl->rank_hist[i][r];
                         }
-                        extra = (1.0 - a_i) * (double) hit / (double) impl->rank_n[i];
+                        extra = (1.0 - c_i) * (double) hit / (double) impl->rank_n[i];
                     }
-                    const double A_i = std::min(1.0, a_i + extra);
-                    reach *= A_i;
+                    reach *= std::min(1.0, c_i + extra);
                     e_len += reach;
                 }
                 oss << (b == 1 ? "" : ", ") << "b=" << b << ":" << e_len;
