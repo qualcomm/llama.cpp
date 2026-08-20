@@ -14,6 +14,7 @@
 #include "htp/matmul-ops.h"
 #include "htp/flash-attn-ops.h"
 #include "htp/unary-ops.h"
+#include "htp/allreduce-ops.h"
 
 struct htp_opnode {
     ggml_tensor * node   { nullptr };

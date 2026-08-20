@@ -2046,6 +2046,73 @@ void ggml_hexagon_session::enqueue_fence(const ggml_tensor * sync_tensor) {
     this->enqueue_op(sync_node);
 }
 
+static void ggml_hexagon_precompute_allreduce_params(
+    const struct ggml_hexagon_session * sess,
+    const struct ggml_tensor * dst,
+    uint32_t rank,
+    uint32_t n_ranks,
+    uint32_t seq,
+    struct htp_allreduce_kernel_params * kparams
+) {
+    memset(kparams, 0, sizeof(*kparams));
+    kparams->rank    = (int32_t) rank;
+    kparams->n_ranks = (int32_t) n_ranks;
+    kparams->seq     = (int32_t) seq;
+
+    const uint32_t nelem     = (uint32_t) ggml_nelements(dst);
+    const uint32_t elem_size = (dst->type == GGML_TYPE_F16) ? sizeof(ggml_fp16_t) : sizeof(float);
+    const bool is_contiguous = ggml_is_contiguous(dst);
+
+    const uint32_t ne0 = (uint32_t) dst->ne[0];
+    const uint32_t ne1 = (uint32_t) (dst->ne[1] * dst->ne[2] * dst->ne[3]);
+    kparams->ne0 = (int32_t) ne0;
+    kparams->ne1 = (int32_t) ne1;
+
+    if (is_contiguous) {
+        const uint32_t n_threads = (std::min)((uint32_t) sess->n_threads, (std::max)(1u, nelem / 1024));
+        kparams->n_threads = n_threads;
+
+        uint32_t block_elems = 8192;
+        if (block_elems > nelem / n_threads && nelem / n_threads > 128) {
+            block_elems = hex_round_up(nelem / (n_threads * 2), 128);
+        }
+        kparams->block_elems          = block_elems;
+        kparams->vtcm_size_per_thread = 2 * block_elems * elem_size;
+        kparams->vtcm_size            = n_threads * (n_ranks + 1) * kparams->vtcm_size_per_thread;
+
+        if (sess->vtcm_size >= (size_t) kparams->vtcm_size) {
+            kparams->elems_per_thread = hex_round_up((nelem + n_threads - 1) / n_threads, block_elems);
+            kparams->kernel_type      = HTP_ALLREDUCE_KERNEL_DMA_1D;
+        } else {
+            kparams->elems_per_thread = (nelem + n_threads - 1) / n_threads;
+            kparams->kernel_type      = HTP_ALLREDUCE_KERNEL_DIRECT_1D;
+        }
+    } else {
+        const uint32_t n_threads = (std::min)((uint32_t) sess->n_threads, (std::max)(1u, ne1));
+        kparams->n_threads = n_threads;
+
+        const uint32_t row_bytes = ne0 * elem_size;
+        const uint32_t row_size_aligned = (uint32_t) hex_align_up(row_bytes, 128);
+        kparams->row_size_aligned = row_size_aligned;
+
+        const uint32_t nrows_per_thread = (ne1 + n_threads - 1) / n_threads;
+        uint32_t block_rows = (std::min)(32u, nrows_per_thread);
+        block_rows = (std::max)(1u, block_rows);
+        kparams->block_elems = block_rows;
+
+        kparams->vtcm_size_per_thread = 2 * (block_rows * row_size_aligned);
+        kparams->vtcm_size            = n_threads * (n_ranks + 1) * kparams->vtcm_size_per_thread;
+
+        if (sess->vtcm_size >= (size_t) kparams->vtcm_size) {
+            kparams->elems_per_thread = nrows_per_thread;
+            kparams->kernel_type      = HTP_ALLREDUCE_KERNEL_DMA_2D;
+        } else {
+            kparams->elems_per_thread = nrows_per_thread;
+            kparams->kernel_type      = HTP_ALLREDUCE_KERNEL_DIRECT_2D;
+        }
+    }
+}
+
 void ggml_hexagon_session::enqueue_allreduce(
     const ggml_tensor * dst,
     const std::vector<const ggml_tensor *> & src_tensors,
@@ -2072,9 +2139,10 @@ void ggml_hexagon_session::enqueue_allreduce(
     ar_node.outputs.clear();
     ar_node.outputs.push_back(node);
 
-    ar_node.kernel_params[0] = (int32_t) rank;
-    ar_node.kernel_params[1] = (int32_t) n_ranks;
-    ar_node.kernel_params[2] = (int32_t) seq;
+    ggml_hexagon_precompute_allreduce_params(
+        this, dst, rank, n_ranks, seq,
+        (struct htp_allreduce_kernel_params *) ar_node.kernel_params
+    );
 
     ar_node.name = "ALLREDUCE";
     this->enqueue_op(ar_node);
