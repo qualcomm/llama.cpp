@@ -19,6 +19,34 @@
 #ifndef TILESIZE_N
 #define TILESIZE_N 32
 #endif
+
+// Named-register accumulators instead of `float4 acc[NGROUPS]`.
+//
+// CL_KERNEL_PRIVATE_MEM_SIZE tracks that array EXACTLY: 400 B at TILESIZE_N=32
+// (NGROUPS=8, acc = 128 B) against 336 B at TILESIZE_N=16 (NGROUPS=4, acc = 64 B).
+// An array promoted to registers would not move the private figure at all, so the
+// accumulator is living in scratch -- and it is read-modify-written once per 32-K
+// step, i.e. 208 times per workgroup on a K=6656 FFN. The identical symptom on the
+// cooperative-K kernel was cured by replacing `float8 out[4]` with four named
+// `float8` (private 400 -> 272 B, workgroup cap 640 -> 896).
+//
+// Expanding the group loop by macro rather than `#pragma unroll` is what keeps the
+// accumulator out of an array; the loop bodies below are otherwise unchanged.
+#define NGROUPS (TILESIZE_N / 4)
+#if   NGROUPS == 2
+#define ACC_FOREACH(M) M(0) M(1)
+#elif NGROUPS == 3
+#define ACC_FOREACH(M) M(0) M(1) M(2)
+#elif NGROUPS == 4
+#define ACC_FOREACH(M) M(0) M(1) M(2) M(3)
+#elif NGROUPS == 6
+#define ACC_FOREACH(M) M(0) M(1) M(2) M(3) M(4) M(5)
+#elif NGROUPS == 8
+#define ACC_FOREACH(M) M(0) M(1) M(2) M(3) M(4) M(5) M(6) M(7)
+#else
+#error "TILESIZE_N must be 8, 12, 16, 24 or 32 (NGROUPS = TILESIZE_N/4)"
+#endif
+#define ACC_DECL(g) float4 acc##g = (float4)(0.0f);
 #define QK_K 256
 #define K_SCALE_SIZE 12
 
@@ -631,10 +659,7 @@ kernel void kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg_alds4(
     __local half  sh_d[TILESIZE_N];
     __local half  sh_s[TILESIZE_N];
 
-#define NGROUPS (TILESIZE_N / 4)
-    float4 acc[NGROUPS];
-    #pragma unroll
-    for (int g = 0; g < NGROUPS; ++g) acc[g] = (float4)(0.0f);
+    ACC_FOREACH(ACC_DECL)
 
     for (uint step = k_lo; step < k_hi; step += 32) {
         const uint sub     = step >> 5;
@@ -679,13 +704,9 @@ kernel void kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg_alds4(
 
 #define LD4(arr, b) ((float4)((float)arr[(b)+0], (float)arr[(b)+1], (float)arr[(b)+2], (float)arr[(b)+3]))
 #define TDOT4(T) dot8_q8a_v(qw, (uint4)(sh_qa4[T][0]), (uint4)(sh_qa4[T][1]))
-        #pragma unroll
-        for (int g = 0; g < NGROUPS; ++g) {
-            const int b = g * 4;
-            const float4 rf = (float4)((float)TDOT4(b+0), (float)TDOT4(b+1),
-                                       (float)TDOT4(b+2), (float)TDOT4(b+3));
-            acc[g] += scale * LD4(sh_d, b) * rf - minv * LD4(sh_s, b);
-        }
+#define ACC_STEP(g) {             const int b = (g) * 4;             const float4 rf = (float4)((float)TDOT4(b+0), (float)TDOT4(b+1),                                        (float)TDOT4(b+2), (float)TDOT4(b+3));             acc##g += scale * LD4(sh_d, b) * rf - minv * LD4(sh_s, b); }
+        ACC_FOREACH(ACC_STEP)
+#undef ACC_STEP
 #undef TDOT4
 #undef LD4
         barrier(CLK_LOCAL_MEM_FENCE);
@@ -695,17 +716,9 @@ kernel void kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg_alds4(
         return;
     }
 
-    #pragma unroll
-    for (int g = 0; g < NGROUPS; ++g) {
-        const uint b = (uint)(g * 4);
-        const float4 a = acc[g];
-        const uint c0 = col_base + b;
-        if (c0 + 0 < (uint)n_no_padding) dst[(c0 + 0) * (uint)m + row] = a.s0;
-        if (c0 + 1 < (uint)n_no_padding) dst[(c0 + 1) * (uint)m + row] = a.s1;
-        if (c0 + 2 < (uint)n_no_padding) dst[(c0 + 2) * (uint)m + row] = a.s2;
-        if (c0 + 3 < (uint)n_no_padding) dst[(c0 + 3) * (uint)m + row] = a.s3;
-    }
-#undef NGROUPS
+#define ACC_OUT(g) {         const uint b = (uint)((g) * 4);         const float4 a = acc##g;         const uint c0 = col_base + b;         if (c0 + 0 < (uint)n_no_padding) dst[(c0 + 0) * (uint)m + row] = a.s0;         if (c0 + 1 < (uint)n_no_padding) dst[(c0 + 1) * (uint)m + row] = a.s1;         if (c0 + 2 < (uint)n_no_padding) dst[(c0 + 2) * (uint)m + row] = a.s2;         if (c0 + 3 < (uint)n_no_padding) dst[(c0 + 3) * (uint)m + row] = a.s3; }
+    ACC_FOREACH(ACC_OUT)
+#undef ACC_OUT
 }
 
 // Buffer-weight twin of _wimg_alds4: the uint4 staging change is independent of
