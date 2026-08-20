@@ -14,7 +14,6 @@
 
 #include <algorithm>
 #include <array>
-#include <set>
 #include <cassert>
 #include <cstdlib>
 #include <cstring>
@@ -204,7 +203,7 @@ struct common_speculative_impl {
     std::array<size_t, TOKCOV_N> tokcov = {};   // tokens with id < cut[i]
     size_t                       tokcov_n   = 0;
     llama_token                  tokcov_max = 0;
-    std::set<llama_token>        tokcov_seen;
+    std::map<llama_token, size_t> tokcov_hist;   // per-id counts; only a few hundred ids occur
 
     void rank_reserve(llama_seq_id seq_id, size_t n_pos) {
         if (rank_cand.size() <= (size_t) seq_id) {
@@ -242,7 +241,7 @@ struct common_speculative_impl {
             }
             tokcov_n++;
             tokcov_max = std::max(tokcov_max, t);
-            tokcov_seen.insert(t);
+            tokcov_hist[t]++;
         }
 
         if (rank_cand.size() <= (size_t) seq_id || accepted.empty()) {
@@ -3321,7 +3320,26 @@ void common_speculative_print_stats(const common_speculative * spec) {
             }
             SPC_TRC("vocab-cov %16s: coverage by draft-vocab size (%s); distinct = %zu, max id = %d, n = %zu\n",
                     common_speculative_type_to_str(impl->type).c_str(), oc.str().c_str(),
-                    impl->tokcov_seen.size(), (int) impl->tokcov_max, impl->tokcov_n);
+                    impl->tokcov_hist.size(), (int) impl->tokcov_max, impl->tokcov_n);
+
+            // Which HIGH ids carry the traffic. If a handful of frequently-emitted special
+            // tokens account for the tail, a real frequency-ranked vocab would simply
+            // include them and the id-cutoff figure above understates coverage badly.
+            std::vector<std::pair<size_t, llama_token>> hi;
+            for (const auto & kv : impl->tokcov_hist) {
+                if (kv.first >= 32768) { hi.push_back({ kv.second, kv.first }); }
+            }
+            std::sort(hi.begin(), hi.end(), std::greater<>());
+            std::ostringstream oh;
+            size_t hi_n = 0;
+            for (const auto & p : hi) { hi_n += p.first; }
+            for (size_t i = 0; i < hi.size() && i < 12; ++i) {
+                if (i > 0) { oh << " "; }
+                oh << hi[i].second << ":" << hi[i].first;
+            }
+            SPC_TRC("vocab-hi  %16s: %zu distinct ids >= 32768 carry %zu tokens (%.2f%%); top = [%s]\n",
+                    common_speculative_type_to_str(impl->type).c_str(),
+                    hi.size(), hi_n, 100.0 * (double) hi_n / (double) impl->tokcov_n, oh.str().c_str());
         }
 
     }
