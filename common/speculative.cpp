@@ -1202,9 +1202,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         if (cap <= 0) {
             return true;
         }
-        // dspark reads `conf` by OUTPUT index, so it must keep a contiguous run from row 0.
-        const int32_t first = (is_dspark && sample_from_anchor) ? 0 : 1;
-        return i >= first && i < first + cap;
+        // 🔴 The kept rows MUST be a contiguous run starting at row 0. Skipping row 0 --
+        // whose logits the DFlash read-out never looks at -- collapses the draft:
+        // acceptance per position went (0.775, 0.548, 0.371, ...) to
+        // (0.402, 0.001, 0.001, ...), i.e. every position past the first turned to garbage
+        // while the draft still ran ~6 tokens long. A block row therefore carries something
+        // the block needs beyond its own logits, and the batch-index == output-index
+        // identity that holds when every row is an output is load-bearing here.
+        // Cap from the END only.
+        return i < cap;
     }
 
     void draft(common_speculative_draft_params_vec & dparams) override {
