@@ -12416,7 +12416,22 @@ inline bool q5_K_weight_images_fit(const ggml_backend_opencl_context *backend_ct
 //
 // GGML_OPENCL_Q5K_BIG_HEAD_GPU=1 keeps such a weight in the transposed layout so the
 // batched shapes reach the dp4a GEMM; the GEMV branch checks the images itself and takes
-// the GEMM instead when they do not fit. DEFAULT OFF until measured.
+// the GEMM instead when they do not fit.
+//
+// ⛔ MEASURED AND KEPT OFF. muse-glimmer-30B DFlash on X2-90, 9-prompt agentic harness:
+// 18.04 -> 11.83 t/s (-34%). It does reach the dp4a GEMM -- placement verified, the
+// 881.74 MiB CPU_REPACK buffer disappears and the OpenCL one grows by exactly that --
+// and it beats the generic GEMM this guard used to fall back to (9.80 t/s), but it is
+// still far behind the CPU. The drafter's block decode goes 54.2 -> 149.4 ms per call,
+// i.e. the head runs at ~7.3 GB/s against the ~30 GB/s the CPU repack path gets.
+// Three compounding reasons, so this is not one bad constant:
+//   * the CPU arm is not naive -- llama.cpp repacks the head (CPU_REPACK) for ARM;
+//   * the TARGET's verify batch is only ~7.4 wide (mean draft 6.35 + 1), so its head
+//     falls below this path's ne1 > 8 dp4a gate and takes the slow base GEMM anyway;
+//   * with the head on the GPU the logits must be copied back to the host every round
+//     (~13 MB for the drafter's 16 rows alone); a CPU head leaves them already there.
+// Kept because the guard split is correct on its own terms and the knob documents the
+// result. DEFAULT OFF.
 inline bool q5_K_big_head_gpu_optin() {
     static const bool on = []{
         const char * e = getenv("GGML_OPENCL_Q5K_BIG_HEAD_GPU");
