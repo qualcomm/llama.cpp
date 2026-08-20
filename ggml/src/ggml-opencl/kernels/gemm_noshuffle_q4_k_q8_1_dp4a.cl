@@ -44,7 +44,7 @@
 #elif NGROUPS == 8
 #define ACC_FOREACH(M) M(0) M(1) M(2) M(3) M(4) M(5) M(6) M(7)
 #else
-#error "TILESIZE_N must be 8, 12, 16, 24 or 32 (NGROUPS = TILESIZE_N/4)"
+#error "TILESIZE_N must be 8, 12, 16, 24 or 32 so that NGROUPS is 2, 3, 4, 6 or 8"
 #endif
 #define ACC_DECL(g) float4 acc##g = (float4)(0.0f);
 #define QK_K 256
