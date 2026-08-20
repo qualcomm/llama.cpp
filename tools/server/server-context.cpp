@@ -543,7 +543,11 @@ struct server_slot {
                 }
 
                 spec_i_batch.push_back(batch.size());
-                add_ok &= batch.add(this->id, sampled, pos0, true, false);
+                // 🔴 The root is on EVERY path, so it must carry every scratch seq_id too.
+                // Without it those sequences skip this position and the next decode is
+                // rejected: "the tokens for sequence N have a starting position of Y",
+                // "it is required that the sequence positions remain consecutive".
+                add_ok &= batch.add(this->id, sampled, pos0, true, false, spec_tree_seqs);
 
                 spec_tree_i_batch.assign(spec_tree.size(), -1);
                 spec_tree_owner.assign(spec_tree.size(), this->id);
