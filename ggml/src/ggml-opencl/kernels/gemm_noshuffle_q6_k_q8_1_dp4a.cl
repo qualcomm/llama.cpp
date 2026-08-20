@@ -28,7 +28,14 @@
 // tiles as the q4_K dense dp4a (per-32 int8 + scale d); the activation sum tile is
 // unused (q6_K is symmetric).
 
+// Guarded so the host's -DTILESIZE_N=16 for the narrow variant actually takes effect.
+// Without the guard the -D is silently overridden by this definition and the "narrow"
+// program compiles at 32, i.e. it is not narrow at all. q4_K has always had the guard;
+// q4_0 and q8_0 were fixed 2026-08-18 and these two were missed in that sweep, so their
+// narrow tiles had never once run.
+#ifndef TILESIZE_N
 #define TILESIZE_N 32
+#endif
 #define QK_K 256
 
 // 4 nibbles in the low 16 bits of `u` -> 4 bytes (value 0..15, in bits 0-3).
