@@ -12397,17 +12397,42 @@ inline bool enable_adreno_trans_weight(const ggml_backend_opencl_context *backen
     return ((elem_num < 128 * 1024 * 1024) && adreno_kernel && shape_ok);  // max element num: 2**27
 }
 
+// The two WEIGHT images the q5_K Adreno path binds (q at nelem/8 pixels, qh at nelem/16).
+// Only the GEMV branch of ggml_cl_mul_mat_q5_K_f32_adreno creates them -- every GEMM
+// branch, dp4a included, reads the same bytes as plain __global buffers and images only
+// the (tiny) activations. So this limit is a property of ONE branch, not of the tensor.
+inline bool q5_K_weight_images_fit(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor) {
+    const size_t elem_num = ggml_nelements(tensor);
+    return elem_num / 8  <= backend_ctx->image_max_buffer_size &&
+           elem_num / 16 <= backend_ctx->image_max_buffer_size;
+}
+
+// A vocab-scale q5_K output head overflows the weight-image width (muse-glimmer-30B:
+// 202048 x 6656 needs 168.1 M pixels against the X2-90 limit of 134.2 M), and declining
+// the whole specialisation over it drops the head onto the generic GEMM. That path is so
+// slow the shipping recipe pins the head to the CPU instead -- where a DFlash round pays
+// it TWICE at 16 rows, once for the target verify and once for the drafter block, since
+// the DFlash drafter has no output projection of its own and borrows the target's.
+//
+// GGML_OPENCL_Q5K_BIG_HEAD_GPU=1 keeps such a weight in the transposed layout so the
+// batched shapes reach the dp4a GEMM; the GEMV branch checks the images itself and takes
+// the GEMM instead when they do not fit. DEFAULT OFF until measured.
+inline bool q5_K_big_head_gpu_optin() {
+    static const bool on = []{
+        const char * e = getenv("GGML_OPENCL_Q5K_BIG_HEAD_GPU");
+        return e && e[0] && e[0] != '0';
+    }();
+    return on;
+}
+
 inline bool enable_adreno_trans_weight_q5_K(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor) {
     if (!use_adreno_kernels(backend_ctx, tensor)) {
         return false;
     }
 
-    const size_t elem_num = ggml_nelements(tensor);
-    const size_t q_img_width = elem_num / 8;
-    const size_t qh_img_width = elem_num / 16;
-
-    return q_img_width <= backend_ctx->image_max_buffer_size &&
-           qh_img_width <= backend_ctx->image_max_buffer_size;
+    // Read once per process (a static env), so the set_tensor layout and the dispatch
+    // below can never disagree about which layout the weight is in.
+    return q5_K_weight_images_fit(backend_ctx, tensor) || q5_K_big_head_gpu_optin();
 }
 
 static inline bool use_flat_gemv_for_large_m_q4_K(const ggml_tensor *tensor) {
@@ -28677,7 +28702,11 @@ static void ggml_cl_mul_mat_q5_K_f32_adreno(ggml_backend_t backend, const ggml_t
     static const bool q5k_mc3 = (getenv("GGML_OPENCL_Q5K_MC3") != nullptr);
     const bool use_q5k_mc3 = q5k_mc3 && (ne1 >= 2 && ne1 <= 4) && (ne01 < 32768);
 
-    if (ne1 == 1 || use_q5k_mc3) {
+    // The weight images below are the only ones sized by the WEIGHT. When they do not fit
+    // (an oversized head kept on this path by GGML_OPENCL_Q5K_BIG_HEAD_GPU), fall through
+    // to the GEMM section, which reads the same transposed layout out of buffers.
+    const bool q5k_w_img_fit = q5_K_weight_images_fit(backend_ctx, src0);
+    if ((ne1 == 1 || use_q5k_mc3) && q5k_w_img_fit) {
         cl_mem q_img  = nullptr;
         cl_mem qh_img = nullptr;
         cl_mem b_sub_buf = nullptr;
