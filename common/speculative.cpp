@@ -1513,6 +1513,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             tree.add(n.tok, n.par < 0 ? -1 : remap[n.par], n.dep);
         }
 
+        // The spine occupied indices [0, n_spine) before the sort, so remap gives its new
+        // positions directly. Recorded rather than re-derived: the consumer must put the
+        // spine on the canonical sequence and guessing it from leaf order is fragile.
+        tree.spine.reserve(n_spine);
+        for (int32_t i = 0; i < n_spine; ++i) {
+            tree.spine.push_back(remap[i]);
+        }
+
         // The consumer builds a KV-mutating batch straight from this, so a malformed tree is
         // not a crash, it is silent corruption of the target's cache. Check the two invariants
         // the batch layout depends on and drop the tree rather than emit a bad one; the caller

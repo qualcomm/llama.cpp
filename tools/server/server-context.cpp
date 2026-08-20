@@ -75,10 +75,15 @@ struct server_batch {
         llama_pos pos;
         bool output;
         bool is_prompt; // for stats tracking
+        // Tree speculative decoding: an interior tree node belongs to EVERY path through
+        // it, so it carries extra seq_ids beyond id_slot. Empty for every ordinary token,
+        // which keeps the linear path byte-for-byte what it was.
+        std::vector<llama_seq_id> seq_extra;
     };
     std::vector<token> tokens;
     int32_t n_tokens_alloc = 0;
     int32_t n_embd = 0;
+    int32_t n_seq_per_token = 1;   // llama_batch_init's n_seq_max
 
     // track if given slot can be batched with slots already in the batch
     server_slot * slot_batched = nullptr;
@@ -102,21 +107,25 @@ struct server_batch {
         }
     }
 
-    void init(int32_t n_tokens_alloc, int32_t n_embd) {
+    void init(int32_t n_tokens_alloc, int32_t n_embd, int32_t n_seq_per_token = 1) {
         this->n_tokens_alloc = n_tokens_alloc;
         this->n_embd = n_embd;
-        batch = llama_batch_init(n_tokens_alloc, 0, 1);
+        this->n_seq_per_token = std::max(1, n_seq_per_token);
+        batch = llama_batch_init(n_tokens_alloc, 0, this->n_seq_per_token);
         tokens_ptr = batch.token;
         tokens.reserve(n_tokens_alloc);
     }
 
-    bool add(int32_t id_slot, llama_token token, llama_pos pos, bool output, bool is_prompt) {
+    bool add(int32_t id_slot, llama_token token, llama_pos pos, bool output, bool is_prompt,
+             std::vector<llama_seq_id> seq_extra = {}) {
         GGML_ASSERT(!has_embd); // cannot mix tokens + embd in same batch
         GGML_ASSERT(batch.pos != nullptr);
         if ((int32_t)tokens.size() >= n_tokens_alloc) {
             return false;
         }
-        tokens.push_back({ id_slot, token, pos, output, is_prompt });
+        GGML_ASSERT((int32_t) seq_extra.size() + 1 <= n_seq_per_token &&
+                    "batch was not allocated for this many seq_ids per token");
+        tokens.push_back({ id_slot, token, pos, output, is_prompt, std::move(seq_extra) });
         return true;
     }
 
@@ -125,7 +134,7 @@ struct server_batch {
         if ((int32_t)tokens.size() >= n_tokens_alloc) {
             return false;
         }
-        tokens.push_back({ id_slot, LLAMA_TOKEN_NULL, pos, output, is_prompt });
+        tokens.push_back({ id_slot, LLAMA_TOKEN_NULL, pos, output, is_prompt, {} });
         has_embd = true;
         embd.insert(embd.end(), embd_in.begin(), embd_in.end());
         return true;
@@ -161,7 +170,15 @@ struct server_batch {
         common_batch_clear(batch);
         for (int32_t i = 0; i < size(); i++) {
             const auto & t = tokens[i];
-            common_batch_add(batch, t.token, t.pos, { t.id_slot }, t.output);
+            if (t.seq_extra.empty()) {
+                common_batch_add(batch, t.token, t.pos, { t.id_slot }, t.output);
+            } else {
+                std::vector<llama_seq_id> seqs;
+                seqs.reserve(t.seq_extra.size() + 1);
+                seqs.push_back(t.id_slot);
+                seqs.insert(seqs.end(), t.seq_extra.begin(), t.seq_extra.end());
+                common_batch_add(batch, t.token, t.pos, seqs, t.output);
+            }
         }
         if (has_embd) {
             batch.token = nullptr; // will be restored on clear()
@@ -213,6 +230,12 @@ struct server_slot {
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
+
+    // Tree speculative decoding. `spec_draft` still holds the SPINE, so every existing linear
+    // path keeps working; the tree is only consulted when it is non-empty.
+    common_speculative_draft_tree spec_tree;
+    std::vector<int32_t>          spec_tree_i_batch;  // batch index per tree node
+    std::vector<llama_seq_id>     spec_tree_seqs;     // scratch seq_ids in use this round (excl. canonical)
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
@@ -478,16 +501,75 @@ struct server_slot {
 
             GGML_ASSERT(spec_i_batch.empty());
 
-            spec_i_batch.push_back(batch.size());
-            for (size_t i = 0; i < spec_draft.size(); i++) {
-                spec_i_batch.push_back(batch.size() + i + 1);
-            }
-
             auto pos0 = prompt.tokens.pos_next();
 
-            add_ok &= batch.add(id, sampled, pos0++, true, false);
-            for (auto token : spec_draft) {
-                add_ok &= batch.add(this->id, token, pos0++, true, false);
+            // spec_tree_seqs is what ARMS the tree path: it is only non-empty once the
+            // scratch sequences have been reserved for this slot. Until the tree-aware
+            // verify and rollback exist there is nothing to reserve them, so this stays
+            // inert and every round takes the linear path below.
+            if (!spec_tree.empty() && !spec_tree_seqs.empty()) {
+                // ---- TREE verify batch ------------------------------------------------
+                // Every root-to-leaf path needs its own seq_id, and an interior node
+                // carries the seq_id of every path through it. Path 0 reuses this slot's
+                // canonical seq so the common case needs no extra bookkeeping.
+                auto leaves = spec_tree.leaves();
+                // Path 0 must be the spine so it lands on the canonical sequence.
+                if (!spec_tree.spine.empty()) {
+                    const int32_t spine_leaf = spec_tree.spine.back();
+                    auto it = std::find(leaves.begin(), leaves.end(), spine_leaf);
+                    GGML_ASSERT(it != leaves.end() && "spine tip is not a leaf");
+                    std::iter_swap(leaves.begin(), it);
+                }
+
+                // paths through each node, found by walking every leaf up to the root
+                std::vector<std::vector<int32_t>> node_paths(spec_tree.size());
+                for (size_t p = 0; p < leaves.size(); ++p) {
+                    for (int32_t n = leaves[p]; n >= 0; n = spec_tree.parent[n]) {
+                        node_paths[n].push_back((int32_t) p);
+                    }
+                }
+
+                // 🔴 The scratch sequences must already hold this slot's context: a batch
+                // that couples two sequences whose cached positions have diverged is
+                // rejected outright, and an untouched seq has pos_max = -1.
+                for (llama_seq_id sq : spec_tree_seqs) {
+                    mem.seq_rm(sq, -1, -1);
+                    mem.seq_cp(this->id, sq, -1, -1);
+                }
+
+                spec_i_batch.push_back(batch.size());
+                add_ok &= batch.add(this->id, sampled, pos0, true, false);
+
+                spec_tree_i_batch.assign(spec_tree.size(), -1);
+                for (size_t n = 0; n < spec_tree.size(); ++n) {
+                    std::vector<llama_seq_id> extra;
+                    bool on_canonical = false;
+                    for (int32_t p : node_paths[n]) {
+                        if (p == 0) {
+                            on_canonical = true;
+                        } else if (p - 1 < (int32_t) spec_tree_seqs.size()) {
+                            extra.push_back(spec_tree_seqs[p - 1]);
+                        }
+                    }
+                    // A node off the canonical path is owned by its first scratch seq.
+                    const llama_seq_id owner = on_canonical ? this->id : extra.front();
+                    if (!on_canonical) {
+                        extra.erase(extra.begin());
+                    }
+                    spec_tree_i_batch[n] = batch.size();
+                    add_ok &= batch.add(owner, spec_tree.token[n],
+                                        pos0 + 1 + spec_tree.depth[n], true, false, extra);
+                }
+            } else {
+                spec_i_batch.push_back(batch.size());
+                for (size_t i = 0; i < spec_draft.size(); i++) {
+                    spec_i_batch.push_back(batch.size() + i + 1);
+                }
+
+                add_ok &= batch.add(id, sampled, pos0++, true, false);
+                for (auto token : spec_draft) {
+                    add_ok &= batch.add(this->id, token, pos0++, true, false);
+                }
             }
         }
 
@@ -1296,7 +1378,11 @@ private:
         {
             const int32_t n_batch = llama_n_batch(ctx_tgt);
             const int32_t n_embd  = llama_model_n_embd_inp(model_tgt);
-            batch.init(std::max(n_batch, params_base.n_parallel), n_embd);
+            // Tree speculative decoding puts several seq_ids on one token (an interior
+            // node belongs to every path through it), so the batch has to be allocated
+            // for that up front. Costs only the seq_id arrays; ordinary tokens still
+            // carry exactly one.
+            batch.init(std::max(n_batch, params_base.n_parallel), n_embd, params_base.n_parallel);
         }
 
         if (params_base.cache_ram_mib != 0) {
@@ -2938,6 +3024,7 @@ private:
                             /* .id_last  = */ slot.sampled,
                             /* .prompt   = */ &slot.spec_prompt,
                             /* .result   = */ &slot.spec_draft,
+                            /* .tree     = */ &slot.spec_tree,
                         };
 
                         drafting.push_back(&slot);

@@ -59,11 +59,17 @@ struct common_speculative_draft_tree {
     std::vector<llama_token> token;
     std::vector<int32_t>     parent;
     std::vector<int32_t>     depth;
+    // Node indices of the SPINE (the rank-1 chain, i.e. exactly what `result` holds), in
+    // depth order. The consumer must make this path 0 so it lands on the slot's canonical
+    // sequence: it is the likeliest path, and keeping it canonical means the common case
+    // needs no sequence copy at all. Do NOT infer it from leaves() ordering.
+    std::vector<int32_t>     spine;
 
     void clear() {
         token .clear();
         parent.clear();
         depth .clear();
+        spine .clear();
     }
 
     size_t size()  const { return token.empty() ? 0 : token.size(); }
