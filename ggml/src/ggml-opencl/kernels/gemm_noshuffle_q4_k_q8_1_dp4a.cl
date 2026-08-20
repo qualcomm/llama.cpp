@@ -718,9 +718,25 @@ kernel void kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg_alds4(
 // texture version of this idea (`_aimg`) measured -46% here, and the cause was register
 // pressure, not the address space: a dp4a needs 8 words live before it can consume them,
 // so the compiler hoists the loads and private memory went 336 -> 528 B with the workgroup
-// cap halved. Whether a plain global load behaves like the LDS tile (addressed on demand)
-// or like the texture (hoisted) is the open question this variant answers. Check
-// GGML_OPENCL_DP4A_PROBE_RES before trusting any timing.
+// cap halved.
+//
+// ANSWERED, AND IT IS WORSE THAN THE TEXTURE: pp9 40.5 -> 17.6, pp16 69.2 -> 21.8
+// (-68%), bookended to 0.2% on an Adreno X2-90. DEFAULT OFF, kept as the recorded
+// negative result alongside _aimg.
+//
+// Resources explain only half of it: private 336 -> 464 B (the compiler hoists the
+// loads, same direction as _aimg's 528 but milder), local 576 -> 0, and the workgroup
+// cap goes 384 -> 1024 because a barrier-free kernel is not register capped on this
+// part. The rest is the redundancy itself: staging loads the tile ONCE cooperatively
+// and then lets 64 lanes read it from LDS, whereas reading from global makes all 64
+// lanes issue their own load for the same words -- 64x the load instructions and L1
+// traffic, which no broadcast recovers.
+//
+// So the cok finding ("a wave-uniform read is free, LDS competes with the ALU issue
+// port") does NOT generalise to dp4a, and the reason is not the address space: cok
+// feeds its activation into a half8 MAC immediately, while a dp4a needs 8 words live
+// per token and 4 tokens per group. Any high-latency per-lane path loses here,
+// texture or buffer alike. The __local tile is earning its keep.
 
 __attribute__((qcom_wave_pair_mode(1)))
 kernel void kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg_agm(
