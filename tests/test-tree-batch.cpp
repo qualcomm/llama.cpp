@@ -72,6 +72,12 @@ int main(int argc, char ** argv) {
     cparams.n_batch   = 512;
     cparams.n_ubatch  = 512;
     cparams.n_seq_max = 4;
+    // 🔴 REQUIRED. With the default per-sequence cache llama_decode refuses the tree batch:
+    //   "split_equal: sequential split is not supported when there are coupled sequences
+    //    in the input batch (you may need to use the -kvu flag)"
+    // A tree couples sequences by construction (the shared node carries all of them), so
+    // tree drafting REQUIRES the unified KV cache -- `-kvu` / --kv-unified on the server.
+    cparams.kv_unified = true;
 
     llama_context * ctx = llama_init_from_model(model, cparams);
     if (!ctx) { fprintf(stderr, "failed to create context\n"); return 1; }
