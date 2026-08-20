@@ -3522,8 +3522,72 @@ static int ggml_cl_q2k_mv_r() {
 // slow path. So the auto-enable below is only legal while this is still zero.
 static int g_cl_programs_built = 0;
 
+// Pre-KHR Adreno compilers (E031.38-class, 2021 -- e.g. the Adreno 660's
+// E031.38.01.05) mis-lower the subgroup *arithmetic* builtins. Symptom is either a
+// null deref inside the shader compiler
+// (QGPUPeepholeOptimizer::lowerPseudoSubgroupArithOp -> ...WithAdvSubgroupFeature ->
+// SplitMBBAt, SIGSEGV killing the host process) or a spurious CL_OUT_OF_HOST_MEMORY
+// from clBuildProgram. Those devices advertise cl_khr_subgroups but report
+// cl_max_subgroups_qcom=0, i.e. the arithmetic builtins are not really implemented.
+// Shuffles lower fine, so redefine the reductions as a shuffle-xor butterfly.
+// Prepended to every program's source so all 49 kernel files are covered at once.
+static const char * GGML_CL_SG_ARITH_COMPAT_PREAMBLE = R"CLC(
+#pragma OPENCL EXTENSION cl_khr_fp16 : enable
+#pragma OPENCL EXTENSION cl_qcom_subgroup_shuffle : enable
+#define GGML_CL_SG_XOR_F(v, m) qcom_sub_group_shuffle_xor((v), (m), CLK_SUB_GROUP_SHUFFLE_WIDTH_WAVE_SIZE_QCOM, 0.0f)
+// Width is the whole wave, so the butterfly depth must follow the actual subgroup
+// size (64 for qcom_reqd_sub_group_size("half"), 128 for "full").
+static inline float ggml_cl_sg_reduce_add_f32(float v) {
+    for (uint m = 1u; m < (uint)get_max_sub_group_size(); m <<= 1) { v += GGML_CL_SG_XOR_F(v, m); }
+    return v;
+}
+static inline float ggml_cl_sg_reduce_max_f32(float v) {
+    for (uint m = 1u; m < (uint)get_max_sub_group_size(); m <<= 1) { v = fmax(v, GGML_CL_SG_XOR_F(v, m)); }
+    return v;
+}
+static inline float ggml_cl_sg_reduce_min_f32(float v) {
+    for (uint m = 1u; m < (uint)get_max_sub_group_size(); m <<= 1) { v = fmin(v, GGML_CL_SG_XOR_F(v, m)); }
+    return v;
+}
+#define sub_group_reduce_add(v) ggml_cl_sg_reduce_add_f32(v)
+#define sub_group_reduce_max(v) ggml_cl_sg_reduce_max_f32(v)
+#define sub_group_reduce_min(v) ggml_cl_sg_reduce_min_f32(v)
+// The scans are mis-lowered the same way (cumsum.cl). shuffle_up hands out
+// default_value to lanes whose source is out of range, which is exactly the
+// shift-in-zero a Hillis-Steele scan wants.
+#define GGML_CL_SG_UP_F(v, o) qcom_sub_group_shuffle_up((v), (o), CLK_SUB_GROUP_SHUFFLE_WIDTH_WAVE_SIZE_QCOM, 0.0f)
+static inline float ggml_cl_sg_scan_incl_add_f32(float v) {
+    for (uint o = 1u; o < (uint)get_max_sub_group_size(); o <<= 1) { v += GGML_CL_SG_UP_F(v, o); }
+    return v;
+}
+static inline float ggml_cl_sg_scan_excl_add_f32(float v) {
+    return GGML_CL_SG_UP_F(ggml_cl_sg_scan_incl_add_f32(v), 1u);
+}
+#define sub_group_scan_inclusive_add(v) ggml_cl_sg_scan_incl_add_f32(v)
+#define sub_group_scan_exclusive_add(v) ggml_cl_sg_scan_excl_add_f32(v)
+)CLC";
+
+// Set during device init; read by every program build. Override with
+// GGML_OPENCL_SG_ARITH_COMPAT=0/1.
+static bool g_cl_sg_arith_compat = false;
+
+static bool ggml_cl_want_sg_arith_compat() {
+    return g_cl_sg_arith_compat;
+}
+
 static cl_program build_program_from_source_ex(cl_context ctx, cl_device_id dev, const char* program_buffer, const std::string &compile_opts, bool fatal, const char *tag = nullptr, size_t bin_size = 0, cl_command_queue retry_queue = nullptr) {
     g_cl_programs_built++;
+    // Substitute the mis-lowered subgroup arithmetic builtins before anything else
+    // looks at the source: the program cache below keys on it, so the key has to
+    // describe what actually gets compiled. Precompiled-binary loads (bin_size>0)
+    // are not source and must not be prepended to.
+    std::string patched_src;
+    if (bin_size == 0 && ggml_cl_want_sg_arith_compat()) {
+        patched_src.reserve(strlen(program_buffer) + 2048);
+        patched_src.append(GGML_CL_SG_ARITH_COMPAT_PREAMBLE);
+        patched_src.append(program_buffer);
+        program_buffer = patched_src.c_str();
+    }
     // Source compiles only (bin_size==0). Precompiled-binary loads (ILA) have
     // their own path and are not source-cached. A cache hit returns a fully
     // built program and skips the online compiler entirely — which is exactly
@@ -14078,6 +14142,24 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
     backend_ctx->has_subgroup_shuffle =
         strstr(ext_buffer, "cl_khr_subgroup_shuffle") != NULL ||
         backend_ctx->has_qcom_subgroup_shuffle;
+
+    // Pre-38.11 E031 compilers mis-lower the subgroup arithmetic builtins (see the
+    // GGML_CL_SG_ARITH_COMPAT_PREAMBLE comment). Same version gate the
+    // mul_mv_q4_0_f32_1d_*x_flat skips already use. Needs the qcom shuffle
+    // extension, since the replacement reductions are built out of it.
+    g_cl_sg_arith_compat =
+        backend_ctx->gpu_family == ADRENO &&
+        backend_ctx->has_qcom_subgroup_shuffle &&
+        !backend_ctx->adreno_cl_compiler_version.newer_than_or_same(E031, 38, 11, 0) &&
+        backend_ctx->adreno_cl_compiler_version.type != E17 &&
+        backend_ctx->adreno_cl_compiler_version.type != DX;
+    if (const char * e = getenv("GGML_OPENCL_SG_ARITH_COMPAT")) {
+        g_cl_sg_arith_compat = (e[0] != '0');
+    }
+    if (g_cl_sg_arith_compat) {
+        GGML_LOG_INFO("ggml_opencl: subgroup arithmetic builtins are unreliable on this "
+                      "compiler; substituting shuffle-based reductions\n");
+    }
 
     // 4x8-packed integer dot product (dp4a), used by the int8 prefill GEMM kernels. Those
     // kernels call dot_acc_sat_4x8packed_ss_int unconditionally, so on a device that does
