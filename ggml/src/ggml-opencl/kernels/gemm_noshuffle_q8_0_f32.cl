@@ -171,13 +171,20 @@ kernel void kernel_gemm_noshuffle_q8_0_f32_cok(
     int gy   = 0;                  // one column tile: this path is ne1 <= 8
 
     int gx_2 = gx << 2;
+    // M only has to be a multiple of 4 (one lane's 4 adjacent rows). The host rounds the
+    // row grid up to a whole 64-lane workgroup, so the trailing lanes own no rows. They
+    // must still reach every barrier in the K-split reduction below -- an early return
+    // here would leave the remaining lanes waiting on a barrier those lanes never hit --
+    // so they read row 0 (harmless, in range) and are dropped at the store instead.
+    const bool row_active = (gx_2 < m);
+    const int  row_base   = row_active ? gx_2 : 0;
     dst = (global float *)((global char*)dst + offsetd);
 
     half8 c0 = 0, c1 = 0, c2 = 0, c3 = 0;
     half8 B;
 
-    __global const uint * wptr = src0_q + gx_2;
-    __global const half * sptr = src0_d + gx_2;
+    __global const uint * wptr = src0_q + row_base;
+    __global const half * sptr = src0_d + row_base;
 
     // each subgroup walks its own slice of K, stepping COK_NSG * 4 elements
     for (int i = sg << 2; i < k; i += Q80_COK_NSG << 2) {
@@ -232,7 +239,7 @@ kernel void kernel_gemm_noshuffle_q8_0_f32_cok(
     Q80_COK_RED(c3, o3)
 #undef Q80_COK_RED
 
-    if (sg != 0) {
+    if (sg != 0 || !row_active) {
         return;
     }
 

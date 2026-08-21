@@ -27157,13 +27157,16 @@ static void ggml_cl_mul_mat_q8_0_f32_adreno(ggml_backend_t backend, const ggml_t
         // The prefill launch is global{CEIL_DIV(N,8), CEIL_DIV(M,4)} local{2,128},
         // which at N=8 M=4096 is EIGHT workgroups for the whole GEMM; the
         // cooperative-K kernel keeps the same 4-rows-per-lane tiling and splits K
-        // across 8 subgroups instead. Needs M % 256 == 0 (64 lanes x 4 rows).
+        // across 8 subgroups instead. Needs only M % 4 == 0: the row grid is rounded
+        // up to a whole 64-lane workgroup and the trailing lanes are masked off at the
+        // store, so the shapes whose M is 64 or 128 past a multiple of 256 -- every
+        // large dense q8_0 tensor in Nemotron-H -- reach it instead of the binary kernel.
         // DEFAULT ON; opt out with GGML_OPENCL_Q80_GEMM_COK=0.
         static const char * q80_cok_env = getenv("GGML_OPENCL_Q80_GEMM_COK");
         static const bool q80_gemm_cok = (q80_cok_env == nullptr) || (atoi(q80_cok_env) != 0);
         const bool use_q80_cok = q80_gemm_cok
                               && backend_ctx->kernel_gemm_noshuffle_q8_0_f32_cok != nullptr
-                              && N <= 8 && (M % 256 == 0);
+                              && N <= 8 && (M % 4 == 0);
 
         // use bin kernel if available
         if (backend_ctx->kernel_gemm_noshuffle_q8_0_f32_bin && !use_q80_cok) {
@@ -27328,10 +27331,10 @@ static void ggml_cl_mul_mat_q8_0_f32_adreno(ggml_backend_t backend, const ggml_t
             if (n_q80_probe < 24) {
                 n_q80_probe++;
                 fprintf(stderr, "[Q80-COK-PROBE] M=%d N=%d K=%d | env=%s kernel=%s "
-                                "N<=8=%d M%%256==0=%d -> %s\n",
+                                "N<=8=%d M%%4==0=%d -> %s\n",
                         M, N, K, q80_cok_env ? q80_cok_env : "(unset)",
                         backend_ctx->kernel_gemm_noshuffle_q8_0_f32_cok ? "built" : "NULL",
-                        N <= 8, (M % 256 == 0), use_q80_cok ? "COK" : "base_gemm");
+                        N <= 8, (M % 4 == 0), use_q80_cok ? "COK" : "base_gemm");
                 fflush(stderr);
             }
         }
@@ -27353,7 +27356,7 @@ static void ggml_cl_mul_mat_q8_0_f32_adreno(ggml_backend_t backend, const ggml_t
         size_t local_work_size[]  = { 2, 128, 1 };
         if (use_q80_cok) {
             // (64 lanes x 8 subgroups): each lane owns 4 rows, the subgroups split K.
-            global_work_size[0] = (size_t)(M / 4);
+            global_work_size[0] = (size_t)(CEIL_DIV(M / 4, 64) * 64);
             global_work_size[1] = Q80_COK_NSG_HOST;
             global_work_size[2] = 1;
             local_work_size[0]  = 64;
