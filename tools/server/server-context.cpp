@@ -3092,6 +3092,38 @@ private:
                 slot.spec_tree.clear();
                 return;
             }
+            // 🔴 The tree copies this slot's ENTIRE context into every scratch sequence
+            // (seq_cp(id, sq, -1, -1) below). The cache then cannot place the verify batch
+            // once the context grows past roughly HALF of n_ctx: it reports "failed to find
+            // a memory slot for batch of size N", the decode fails, a position is left
+            // missing, and the request dies with "Invalid input batch" -- a 500, not a
+            // graceful degradation.
+            //
+            // Measured on muse-glimmer-30B + the official DFlash drafter, n_ctx 20480,
+            // 3 scratch sequences:
+            //     depth  1024 / 4096 / 8192  -> serves (2*prompt <= n_ctx)
+            //     depth 12288 / 16384        -> 500    (2*prompt >  n_ctx)
+            // The 2x boundary fits every measured point. The exact cache mechanism is NOT
+            // characterised -- find_slot only reuses a cell that is empty or held by ONE
+            // sequence, and the copy makes every context cell multi-sequence, but that alone
+            // does not explain a failure with thousands of empty cells still free. So this
+            // is an empirical bound, deliberately conservative, and the underlying
+            // interaction is still worth root-causing.
+            //
+            // Falling back to the linear spine here costs the tree's ~2.7% on short context
+            // and turns a failed request into a served one on long context.
+            const int32_t n_tree_ctx = (int32_t) slot.prompt.n_tokens() + (int32_t) slot.spec_draft.size();
+            if (2 * n_tree_ctx > slot.n_ctx) {
+                static bool warned_ctx = false;
+                if (!warned_ctx) {
+                    warned_ctx = true;
+                    SLT_WRN(slot, "context %d is over half of n_ctx %d; draft trees cannot be "
+                            "placed in the KV cache at that size, using the linear draft\n",
+                            n_tree_ctx, slot.n_ctx);
+                }
+                slot.spec_tree.clear();
+                return;
+            }
             int n_busy = 0;
             for (const auto & other : slots) {
                 if (other.state != SLOT_STATE_IDLE) { n_busy++; }
