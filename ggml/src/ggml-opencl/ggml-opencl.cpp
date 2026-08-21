@@ -23259,6 +23259,15 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
             const char * e = getenv("GGML_OPENCL_FA_MQN_MIN_N_KV");
             return (e && e[0]) ? atoi(e) : 128;
         }();
+        // Widen the narrow MQ split route past n_q == 1. 0 = off, 1 = default (DK <= 256,
+        // the family measured below), 2 = every head_sub == 1 shape, DK=512 included.
+        // DK=512 gqa=4 (gemma-4 global layers) is correct on that route -- test-backend-ops
+        // covers it at n_q=3 -- but no gemma-4 model was available to measure it, and this
+        // file has been burned before by assuming a shape behaves like its neighbours.
+        static const int mqn_nq_mode = []{
+            const char * e = getenv("GGML_OPENCL_FA_MQN_NQ");
+            return (e && e[0]) ? atoi(e) : 1;
+        }();
         const bool have_mq_narrow =
             backend_ctx->fa.mq_narrow.count({d_head_q, d_head_v, gqa_ratio_dispatch}) > 0;
         const int mq_n_kv_floor = have_mq_narrow
@@ -23292,8 +23301,24 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
             // Narrow one-kernel MQ split program (gemma-4 DK=512 global layers
             // and DK=256 gqa=8 SWA layers). Carries its own workgroup size and
             // FA_HEAD_SUB, both chosen when it was built.
-            } else if (nq1_only && is_mixed &&
-                backend_ctx->fa.mq_narrow.count({d_head_q, d_head_v, gqa_ratio_dispatch}) > 0) {
+            //
+            // Serves n_q > 1 as well, bounded by nq_in_vec_range. The kernel is already
+            // query-indexed -- get_global_id(2) is n_q * n_splits, and the Q row, the partial
+            // record and the mask all key off q_idx -- so the multi-query widening that reached
+            // the dk=128 branches simply never reached this one. Without it a dk=256 verify
+            // batch left the MQ route at n_q=2 and landed on the generic BM tile, which at
+            // depth 16384 on the X2-90 cost a FLAT +442 ms the moment the batch stopped being
+            // width 1: 185.5 ms at n_q=1, 627.5 at n_q=2, 644.1 at n_q=8.
+            //
+            // head_sub is held at 1. The widening is only measured where one workgroup owns the
+            // whole gqa group; FA_HEAD_SUB > 1 re-reads every KV row once per sub-group, which
+            // is a different cost model at n_q > 1.
+            // GGML_OPENCL_FA_MQN_NQ=0 restores the n_q == 1 gate.
+            } else if (is_mixed &&
+                backend_ctx->fa.mq_narrow.count({d_head_q, d_head_v, gqa_ratio_dispatch}) > 0 &&
+                (nq1_only ||
+                 ((mqn_nq_mode >= 2 || (mqn_nq_mode == 1 && d_head_q <= 256)) &&
+                  backend_ctx->fa.mq_narrow_hs.at({d_head_q, d_head_v, gqa_ratio_dispatch}) == 1))) {
                 const std::tuple<int, int, int> nk = {d_head_q, d_head_v, gqa_ratio_dispatch};
                 if (backend_ctx->fa.mq_narrow_k_img.count(nk) > 0) {
                     fd_k_split   = backend_ctx->fa.mq_narrow_k_img.at(nk);
