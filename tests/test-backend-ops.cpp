@@ -10117,8 +10117,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                 if (nh == 1 && hsk != 320 && hsk != 576) continue;
                                 for (int nr3 : { 1, 3, }) {
                                     if (hsk > 64 && nr3 > 1) continue; // skip broadcast for large head sizes
-                                    for (int nr2 : { 1, 4, 8, 12, 16, 20, 32 }) {
+                                    for (int nr2 : { 1, 4, 6, 8, 12, 16, 20, 32 }) {
                                         if (nr2 ==  8 && hsk != 192) continue;
+                                        // gqa=6 was never generated at any head size, so hsk=256
+                                        // was covered at gqa 1 and 4 only. Qwen3.5/3.6/3.8-27B are
+                                        // dk=256 with 24 heads / 4 KV heads, and the OpenCL Adreno
+                                        // backend builds a dedicated MQ kernel for that ratio --
+                                        // one no case here reached, which made every A/B on it
+                                        // vacuous.
+                                        if (nr2 ==  6 && hsk != 256) continue;
                                         if (nr2 == 12 && hsk != 128) continue;
                                         // gqa=16 was only generated for hsk=192, leaving
                                         // hsk=128 covered at gqa 1/4/12 but never 16. That is a
