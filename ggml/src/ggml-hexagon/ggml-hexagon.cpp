@@ -5165,15 +5165,6 @@ static void * ggml_backend_hexagon_comm_init(ggml_backend_t * backends, size_t n
     ctx->n_backends = n_backends;
     ctx->fence_seq  = ((uintptr_t) ctx) & 0xFFFF;
 
-    for (size_t i = 0; i < n_backends; i++) {
-        auto sess_i = static_cast<ggml_hexagon_session *>(backends[i]->context);
-        for (size_t j = 0; j < n_backends; j++) {
-            if (i != j) {
-                sess_i->add_sync_peer(static_cast<ggml_hexagon_session *>(backends[j]->context));
-            }
-        }
-    }
-
     return ctx;
 }
 
@@ -5254,7 +5245,11 @@ static bool ggml_backend_hexagon_comm_allreduce_tensor(void * comm_ctx_v, struct
     for (size_t r = 0; r < n_backends; r++) {
         auto sess = static_cast<ggml_hexagon_session *>(comm_ctx->backends[r]->context);
         sess->enqueue_allreduce(tensors[r], data_tensors, sync_tensors, (uint32_t) r, (uint32_t) n_backends);
-        sess->flush_batch();
+        for (size_t j = 0; j < n_backends; j++) {
+            if (r != j) {
+                sess->add_sync_peer(static_cast<ggml_hexagon_session *>(comm_ctx->backends[j]->context));
+            }
+        }
     }
 
     return true;

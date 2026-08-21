@@ -291,7 +291,6 @@ int op_allreduce(struct htp_ops_context * octx) {
         uint64_t spins = 0;
         while (1) {
             Q6_dccleaninva_A((void *) peer_fence);
-            asm volatile ("syncht" : : : "memory");
             if (atomic_load(&peer_fence[0]) == fence_seq) {
                 break;
             }
@@ -302,6 +301,8 @@ int op_allreduce(struct htp_ops_context * octx) {
             hex_pause();
         }
     }
+    asm volatile ("syncht" : : : "memory");
+
     htp_trace_event_stop(tr0, HTP_TRACE_EVT_FENCE, (uint16_t) rank);
 
     // 3. Multi-threaded Reduction across all ranks
