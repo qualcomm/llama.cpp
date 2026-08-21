@@ -9306,6 +9306,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 32768, 4, 2048, {1, 1}, {1, 1}));
 
+    // q4_1 small-N, the same band as the q4_0 block above. q4_1 had NO large-m case at all --
+    // every generated one is m=16, which fails the ne01 % 64 == 0 gate every small-batch q4_1
+    // route carries, so an A/B over any of them was vacuous. This is not a niche type: the
+    // quantizer promotes some ffn_down tensors to q4_1 inside an otherwise q4_0 model, so a
+    // plain "Q4_0" file exercises these shapes on every token.
+    // 5120 x 17408 is Qwen3.5/3.6/3.8-27B ffn_down verbatim; 2048 x 8192 mirrors the q4_0 set.
+    // n=9 is the boundary control: it must fall back to the dense GEMM.
+    for (int n : {2, 3, 4, 5, 8}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_1, GGML_TYPE_F32, 5120, n, 17408, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_1, GGML_TYPE_F32, 2048, n,  8192, {1, 1}, {1, 1}));
+    }
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_1, GGML_TYPE_F32, 2048, 9, 8192, {1, 1}, {1, 1}));
+
 #if 0
     // > 4GB A matrix. Too slow to be enabled by default.
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16,  900000,  3, 2592, {1, 1}, {1, 1}));
