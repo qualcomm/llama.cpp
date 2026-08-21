@@ -101,6 +101,7 @@ static bool   opt_hostbuf = false;
 
 static int    opt_mm_select = 3; // 3 = HMX -> Tiled -> Flat -> CPU, 2 = Tiled -> Flat -> CPU, 1 = Flat -> CPU
 static int    opt_fa_select = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU (unsupported)
+static int    opt_ar_select = 1; // 1 = All-Reduce, 0 = fallback to OP_FENCE/OP_CPY+FENCE
 
 // Default PMU events, if profiling with PMU (mode=2) is enabled
 // See https://docs.qualcomm.com/doc/80-N2040-60/topic/pmu-events.html
@@ -5182,7 +5183,7 @@ static void ggml_backend_hexagon_comm_free(void * comm_ctx_v) {
 }
 
 static bool ggml_backend_hexagon_comm_allreduce_tensor(void * comm_ctx_v, struct ggml_tensor ** tensors) {
-    if (!comm_ctx_v) return false;
+    if (opt_ar_select == 0 || !comm_ctx_v) return false;
     auto * comm_ctx = static_cast<ggml_backend_hexagon_comm_context *>(comm_ctx_v);
     const size_t n_backends = comm_ctx->n_backends;
 
@@ -5318,6 +5319,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_nhmx     = getenv("GGML_HEXAGON_NHMX");
     const char * str_mm_select = getenv("GGML_HEXAGON_MM_SELECT");
     const char * str_fa_select = getenv("GGML_HEXAGON_FA_SELECT");
+    const char * str_ar_select = getenv("GGML_HEXAGON_AR_SELECT");
     const char * str_ndev     = getenv("GGML_HEXAGON_NDEV");
     const char * str_arch     = getenv("GGML_HEXAGON_ARCH");
     const char * str_vmem     = getenv("GGML_HEXAGON_VMEM");
@@ -5367,6 +5369,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     opt_nhmx      = str_nhmx     ? atoi(str_nhmx)                         : opt_nhmx;
     opt_mm_select = str_mm_select ? atoi(str_mm_select)                   : opt_mm_select;
     opt_fa_select = str_fa_select ? atoi(str_fa_select)                   : opt_fa_select;
+    opt_ar_select = str_ar_select ? atoi(str_ar_select)                   : opt_ar_select;
     opt_mbuf      = str_mbuf     ? strtoul(str_mbuf, NULL, 0) * MiB       : opt_mbuf;
     opt_vmem      = str_vmem     ? strtoul(str_vmem, NULL, 0) * MiB       : opt_vmem;
     opt_hostbuf   = str_hostbuf  ? atoi(str_hostbuf) != 0                 : opt_hostbuf;
