@@ -23259,14 +23259,26 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
             const char * e = getenv("GGML_OPENCL_FA_MQN_MIN_N_KV");
             return (e && e[0]) ? atoi(e) : 128;
         }();
-        // Widen the narrow MQ split route past n_q == 1. 0 = off, 1 = default (DK <= 256,
-        // the family measured below), 2 = every head_sub == 1 shape, DK=512 included.
-        // DK=512 gqa=4 (gemma-4 global layers) is correct on that route -- test-backend-ops
-        // covers it at n_q=3 -- but no gemma-4 model was available to measure it, and this
-        // file has been burned before by assuming a shape behaves like its neighbours.
+        // Widen the narrow MQ split route past n_q == 1.
+        //   0 = off (n_q == 1 only), 1 = DK <= 256 only, 2 = every head_sub == 1 shape (default).
+        //
+        // Measured on the X2-90, one FA pass, matched arms from one binary:
+        //   Qwen3.8-27B-Q4_0 d16384  n_q 2/4/5/8: -56.2 / -40.9 / -35.7 / -22.5%
+        //   gemma-4-E4B      d4096   n_q 2/4/8:   -36.2 / -24.8 / -16.6%   (its DK=512 global
+        //                                          layers are why mode 2 beats mode 1 here:
+        //                                          -15.6 / -13.2 / -8.5% at mode 1)
+        //   gemma-4-26B      d4096   n_q 4: -10.1%, but n_q 8: +3.0%
+        //
+        // 🔴 That last row is a real crossover, not noise (A/B/A/B, arms repeating to 0.2%):
+        // this route's cost RISES with n_q -- the grid is n_splits * n_q, so each query row
+        // re-reads the KV slice -- while the BM tile is flat in n_q. So a shape whose tile is
+        // already efficient can pass it at the top of the band. Two of the three shapes still
+        // win at n_q=8, and a speculative verify batch is typically 4-5 wide, which is where
+        // the gains are largest; a per-shape crossover table is exactly the brittleness the
+        // mq_narrow width search above exists to avoid. Left at n_q <= 8 deliberately.
         static const int mqn_nq_mode = []{
             const char * e = getenv("GGML_OPENCL_FA_MQN_NQ");
-            return (e && e[0]) ? atoi(e) : 1;
+            return (e && e[0]) ? atoi(e) : 2;
         }();
         const bool have_mq_narrow =
             backend_ctx->fa.mq_narrow.count({d_head_q, d_head_v, gqa_ratio_dispatch}) > 0;
