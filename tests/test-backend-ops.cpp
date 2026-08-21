@@ -9240,6 +9240,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // Column-tile boundaries. Backends tile the N (batch) dimension of a quantized matmul and
+    // compute a whole tile whatever ne1 is, padding the unused columns. A batch one column past
+    // a tile boundary therefore costs a full extra tile, and -- more importantly here -- takes a
+    // DIFFERENT code path from the tile-aligned sizes the sweep above already covers.
+    //
+    // The n values used elsewhere in this file run 1..9, 16, 32, 45, 64, ... which steps straight
+    // over 17..31, so a backend can ship a tile serving that band with no coverage at all. These
+    // cases sit either side of the 16 / 24 / 32 boundaries that the common tilings use.
+    // m and k are large enough to reach the tiled (rather than GEMV) path on backends that
+    // dispatch on size.
+    for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K}) {
+        for (int n : {15, 16, 17, 23, 24, 25, 31, 32, 33}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1024, n, 1024, {1, 1}, {1, 1}));
+        }
+    }
     // BF16 is absent from base_types: add the 3 standard non-contig permutations explicitly
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 16,  1, 256, {2, 3}, {1, 1}, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 16,  1, 256, {2, 3}, {1, 1}, {0, 1, 3, 2}));
