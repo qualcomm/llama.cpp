@@ -17,6 +17,7 @@
 #include <cassert>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <iomanip>
 #include <map>
 #include <cinttypes>
@@ -1838,6 +1839,103 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
     }
 
+    // Run the MTP block over an explicit list of (token, h) pairs for one sequence, so the
+    // drafter's KV advances over exactly those positions. `h_of(i)` supplies the target
+    // hidden row that must be PAIRED with row i's token, i.e. the row of its predecessor.
+    bool decode_pairs(llama_seq_id seq_id, int32_t n_rows,
+                      const std::function<llama_token (int32_t)> & tok_of,
+                      const std::function<llama_pos   (int32_t)> & pos_of,
+                      const std::function<const float *(int32_t)> & h_of) {
+        auto * ctx_dft = this->params.ctx_dft;
+
+        const size_t row_bytes = (size_t) n_embd * sizeof(float);
+
+        common_batch_clear(batch);
+        for (int32_t i = 0; i < n_rows; ++i) {
+            common_batch_add(batch, tok_of(i), pos_of(i), { seq_id }, 0);
+            std::memcpy(batch.embd + (size_t) i * n_embd, h_of(i), row_bytes);
+        }
+
+        auto * mem_dft = llama_get_memory(ctx_dft);
+
+        for (int head = 0; head < n_mtp_layers; ++head) {
+            if (chain_heads) {
+                llama_memory_seq_rm(mem_dft, seq_id, pos_of(0), -1);
+                llama_set_nextn_layer_offset(ctx_dft, head);
+            }
+
+            const int32_t rc = llama_decode(ctx_dft, batch);
+            if (rc != 0) {
+                SPC_ERR("llama_decode(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
+                        head, (int) rc, (int) pos_of(0));
+                if (chain_heads) {
+                    llama_set_nextn_layer_offset(ctx_dft, 0);
+                }
+                return false;
+            }
+        }
+
+        if (chain_heads) {
+            llama_set_nextn_layer_offset(ctx_dft, 0); // restore default for non-draft decodes
+        }
+
+        return true;
+    }
+
+    // Fold an explicit list of verify-batch rows into the drafter's state.
+    //
+    // Tree drafting needs this: the verify batch carries several BRANCHES at the same
+    // positions, and only the ACCEPTED path is real context. Folding the whole batch would
+    // write conflicting K/V for one position AND would carry the wrong h forward, which is
+    // worse than a stale cache -- the h carry-over is what the next draft is conditioned on.
+    //
+    // Rows arrive in path order, root first, and all belong to one sequence logically even
+    // though a branch node's row may be listed under a scratch seq_id in the batch.
+    bool process_rows(const llama_batch & batch_in, const std::vector<int32_t> & rows) {
+        if (rows.empty()) {
+            return true;
+        }
+
+        auto * ctx_tgt = this->params.ctx_tgt;
+
+        const llama_seq_id seq_id = batch_in.seq_id[rows[0]][0];
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            SPC_ERR("process_rows: row 0 carries seq_id %d, out of range [0,%d)\n",
+                    (int) seq_id, (int) n_seq);
+            return false;
+        }
+
+        const int32_t n_rows    = (int32_t) rows.size();
+        const size_t  row_bytes = (size_t) n_embd * sizeof(float);
+
+        // With a shared KV the target already wrote the cells; there is no catch-up to do.
+        if (!is_mem_shared) {
+            // The MTP block pairs token x_{p+1} with the target's hidden row h_p, so the
+            // batch is the accepted tokens against the target's h shifted right by one.
+            // Row 0 pairs with the h carried over from the previous call.
+            if (!decode_pairs(seq_id, n_rows,
+                    [&](int32_t i) { return batch_in.token[rows[i]]; },
+                    [&](int32_t i) { return batch_in.pos  [rows[i]]; },
+                    [&](int32_t i) {
+                        return i == 0 ? pending_h[seq_id].data()
+                                      : llama_get_embeddings_nextn_ith(ctx_tgt, rows[i - 1]);
+                    })) {
+                return false;
+            }
+        }
+
+        verify_h_rows[seq_id] = n_rows;
+        verify_h[seq_id].resize((size_t) n_rows * n_embd);
+        for (int32_t i = 0; i < n_rows; ++i) {
+            std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd,
+                        llama_get_embeddings_nextn_ith(ctx_tgt, rows[i]), row_bytes);
+        }
+        std::memcpy(pending_h[seq_id].data(),
+                    verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
+
+        return true;
+    }
+
     bool process(const llama_batch & batch_in, const std::vector<int32_t> * rows = nullptr) override {
         if (batch_in.n_tokens <= 0) {
             return true;
@@ -1846,6 +1944,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // TODO: how to make it work with vision tokens?
         if (batch_in.token == nullptr || batch_in.embd != nullptr) {
             return true;
+        }
+
+        // A tree verify batch is not a linear run: the scan below would read branch columns
+        // as if they were consecutive context. Take exactly the accepted path instead.
+        if (rows != nullptr) {
+            return process_rows(batch_in, *rows);
         }
 
         const int32_t n_tokens = batch_in.n_tokens;
@@ -1977,6 +2081,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             n_drafting++;
             drafting[seq_id] = true;
             common_sampler_reset(smpls[seq_id].get());
+            // Captures the drafter's top-K at each spine position. Feeds both the rank probe
+            // and build_tree() below, so branching costs no extra drafter work.
+            rank_reserve(seq_id, std::max(1, params.n_max));
 
             common_batch_add(batch, dp.id_last, dp.n_past, { seq_id }, true);
             std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, pending_h[seq_id].data(), row_bytes);
@@ -2054,6 +2161,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 result.push_back(id);
 
+                // Kept in lockstep with `result`: entry i is the candidate list at spine
+                // depth i. Free -- the list is already sampled and sorted.
+                rank_push(seq_id, result.size() - 1, cur_p);
+
                 if (params.n_max <= (int) result.size()) {
                     drafting[seq_id] = false;
                     n_drafting--;
@@ -2104,6 +2215,148 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (dp.result->size() < (size_t) params.n_min) {
                 dp.result->clear();
             }
+
+            build_tree(seq_id, dp);
+        }
+    }
+
+    // Hang the drafter's RANK-2 candidate off each spine position.
+    //
+    // The linear draft offers only rank 1 at each position, so one wrong token ends the round
+    // even when the target's own choice was sitting at rank 2 in the same candidate list. That
+    // list is already sampled and sorted, so a branch costs the drafter NOTHING -- it costs one
+    // verify COLUMN, and a column inside the batch's existing tile is nearly free.
+    //
+    // 🔴 MTP is AUTOREGRESSIVE, unlike DFlash which denoises a whole block jointly. The
+    // drafter's continuation after a branch is therefore NOT the spine's own remaining tokens:
+    // taking the runner-up at depth i would have conditioned every later step differently. So a
+    // branch here is a single LEAF, never a multi-token stub. Extending one would need a real
+    // extra drafter decode, which is the expensive half of the round.
+    //
+    // 🔴 The node budget is a property of the TARGET's matmul tiling, not of the drafter.
+    // Measured on Adreno X2-90 / Qwen3.8-27B-Q4_0, one full verify pass:
+    //     width  1      2      3      4      5      6      7      8      9     16
+    //     ms   150.5  210.3  253.7  254.9  256.0  257.3  258.4  259.9  430.3  440.8
+    // Columns 4..8 cost ~1.2 ms each; column 9 costs 170 ms. The verify batch is one WIDER
+    // than the node count (the target's last sampled token leads it), so 7 nodes puts it at
+    // exactly 8 and 8 nodes would fall off that cliff. Hence the default.
+    void build_tree(llama_seq_id seq_id, common_speculative_draft_params & dp) {
+        if (dp.tree == nullptr) {
+            return;
+        }
+        auto & tree = *dp.tree;
+        tree.clear();
+
+        static const int32_t cap = []{
+            const char * e = std::getenv("LLAMA_MTP_TREE_NODES");
+            return e ? std::atoi(e) : 7;   // 0 = linear, no branching
+        }();
+        // Each root-to-leaf path needs its own seq_id in the verify batch, so the leaf count is
+        // bounded by what the consumer reserved, not by the node budget.
+        static const int32_t leaf_max = []{
+            const char * e = std::getenv("LLAMA_MTP_TREE_LEAVES");
+            return e ? std::atoi(e) : 4;
+        }();
+
+        // How many alternates to hang off each position: 1 = rank 2 only. Rank 3 and beyond
+        // are far less likely to be the target's choice, so they are worth a column only once
+        // every rank-2 branch is already placed -- hence the outer loop over rank below.
+        static const int32_t n_ranks = []{
+            const char * e = std::getenv("LLAMA_MTP_TREE_RANKS");
+            return e ? std::atoi(e) : 1;
+        }();
+
+        const auto & spine = *dp.result;
+        if (cap <= 0 || spine.empty() || rank_cand.size() <= (size_t) seq_id) {
+            return;
+        }
+
+        const auto & cand = rank_cand[seq_id];
+
+        // (token, parent, depth), built in any order and sorted by depth below.
+        struct tmp_node { llama_token tok; int32_t par; int32_t dep; };
+        std::vector<tmp_node> nodes;
+        nodes.reserve(cap);
+
+        for (size_t i = 0; i < spine.size(); ++i) {
+            nodes.push_back({ spine[i], (int32_t) i - 1, (int32_t) i });
+        }
+        const int32_t n_spine = (int32_t) nodes.size();
+        if (n_spine >= cap) {
+            return;                                    // the spine alone fills the budget
+        }
+
+        // Branch at the EARLIEST positions first: the value of a branch scales with the chance
+        // of reaching that position at all, which decays geometrically.
+        int32_t n_leaves = 1;                          // the spine's own tip
+        for (int32_t r = 1; r <= n_ranks && (int32_t) nodes.size() < cap && n_leaves < leaf_max; ++r) {
+            for (int32_t i = 0; i < n_spine && (int32_t) nodes.size() < cap && n_leaves < leaf_max; ++i) {
+                if (r >= RANK_PROBE_K || (size_t) (i + 1) * RANK_PROBE_K > cand.size()) {
+                    break;
+                }
+                const llama_token a = cand[(size_t) i * RANK_PROBE_K + r];
+                if (a == LLAMA_TOKEN_NULL || a == spine[i]) {
+                    continue;
+                }
+                nodes.push_back({ a, i - 1, i });      // hangs off the spine node before it
+                n_leaves++;
+            }
+        }
+
+        if ((int32_t) nodes.size() <= n_spine) {
+            return;                                    // nothing branched; leave the tree empty
+        }
+
+        // Reorder by depth. llama_batch_allocr rejects a batch whose positions decrease within a
+        // sequence, and the flattened batch inherits this order. Stable, so the spine keeps its
+        // relative order and node 0 stays the first draft token.
+        std::vector<int32_t> order(nodes.size());
+        for (size_t i = 0; i < order.size(); ++i) { order[i] = (int32_t) i; }
+        std::stable_sort(order.begin(), order.end(),
+                         [&](int32_t a, int32_t b) { return nodes[a].dep < nodes[b].dep; });
+
+        std::vector<int32_t> remap(nodes.size(), -1);
+        for (size_t k = 0; k < order.size(); ++k) {
+            remap[order[k]] = (int32_t) k;
+        }
+        for (int32_t old_idx : order) {
+            const auto & nd = nodes[old_idx];
+            tree.add(nd.tok, nd.par < 0 ? -1 : remap[nd.par], nd.dep);
+        }
+
+        // The spine occupied indices [0, n_spine) before the sort, so remap gives its new
+        // positions directly. Recorded rather than re-derived: the consumer must put the spine
+        // on the canonical sequence and guessing it from leaf order is fragile.
+        tree.spine.reserve(n_spine);
+        for (int32_t i = 0; i < n_spine; ++i) {
+            tree.spine.push_back(remap[i]);
+        }
+
+        // The consumer builds a KV-mutating batch straight from this, so a malformed tree is not
+        // a crash, it is silent corruption of the target's cache. Check the invariants the batch
+        // layout depends on and drop the tree rather than emit a bad one; the caller then falls
+        // back to the linear spine, which is always valid.
+        for (size_t i = 0; i < tree.size(); ++i) {
+            const int32_t par = tree.parent[i];
+            const bool ok = (par < (int32_t) i)
+                         && (par >= -1)
+                         && (tree.depth[i] == (par < 0 ? 0 : tree.depth[par] + 1));
+            if (!ok) {
+                LOG_WRN("%s: malformed draft tree at node %zu (parent=%d, depth=%d); "
+                        "falling back to the linear draft\n", __func__, i, par, tree.depth[i]);
+                tree.clear();
+                return;
+            }
+        }
+
+        if (getenv("LLAMA_MTP_TREE_PROBE")) {
+            std::ostringstream os;
+            for (size_t i = 0; i < tree.size(); ++i) {
+                os << (i ? " " : "") << i << ":t" << tree.token[i]
+                   << ":p" << tree.parent[i] << ":d" << tree.depth[i];
+            }
+            LOG_INF("%s: seq %d spine=%d nodes=%zu leaves=%zu [%s]\n", __func__,
+                    (int) seq_id, n_spine, tree.size(), tree.leaves().size(), os.str().c_str());
         }
     }
 
