@@ -3067,6 +3067,31 @@ private:
             if (slot.spec_tree.empty()) {
                 return;
             }
+            // 🔴 The tree's whole KV protocol assumes UNBOUNDED partial seq_rm/seq_cp: each
+            // extra root-to-leaf path is branched off this slot's cache with
+            // seq_cp(id, sq, -1, -1), the losing branches are dropped, and the winner is
+            // copied back over a position range. Only a plain attention cache can do that.
+            // A recurrent or hybrid model keeps a running STATE rather than per-position
+            // cells, so it reports FULL (whole sequences only) or RS (partial, but bounded by
+            // llama_n_rs_seq) -- and neither can hold one independent state per branch. The
+            // calls do not fail loudly: the rollback simply does not happen, every branch
+            // stays folded into the sequence, and generation degrades into garbage.
+            //
+            // Measured on Qwen3.8-27B (mamba2, attention every 4th layer, RS with
+            // n_rs_seq = 4): a 128-token request stopped after 12 tokens of unrelated text,
+            // and it did so for a tree of ONE branch. Those models roll a rejected draft back
+            // through spec_ckpt, which the tree path has no equivalent of. Widening this to RS
+            // would need a per-branch recurrent state, not a looser bound.
+            if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_PART) {
+                static bool warned = false;
+                if (!warned) {
+                    warned = true;
+                    SRV_WRN("%s", "draft trees need partial sequence removal, which this "
+                            "context does not support; using the linear draft\n");
+                }
+                slot.spec_tree.clear();
+                return;
+            }
             int n_busy = 0;
             for (const auto & other : slots) {
                 if (other.state != SLOT_STATE_IDLE) { n_busy++; }
