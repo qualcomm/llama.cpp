@@ -4045,8 +4045,19 @@ private:
                     if (!acc_nodes.empty()) {
                         const llama_seq_id win = slot.spec_tree_owner[acc_nodes.back()];
                         if (win != slot.id) {
+                            // The root sits at pos0 and a node at depth d at pos0 + 1 + d, so k
+                            // accepted nodes plus the root occupy [pos0, pos0 + k] and the
+                            // exclusive bound is pos0 + k + 1. The previous bound of pos0 + k
+                            // dropped the DEEPEST accepted node, leaving the canonical sequence
+                            // one position short. Only reachable when the accepted path ends on a
+                            // BRANCH, i.e. win is a scratch seq.
+                            //
+                            // ⚠️ This is a bound correction from the position arithmetic, NOT a
+                            // fix for the separate depth-16384 failure logged against DFlash tree
+                            // drafting: that one is preceded by "failed to find free space in the
+                            // KV cache" and reproduces identically with and without this change.
                             slot.mem.seq_rm(slot.id, pos0, -1);
-                            slot.mem.seq_cp(win, slot.id, pos0, pos0 + (llama_pos) acc_nodes.size());
+                            slot.mem.seq_cp(win, slot.id, pos0, pos0 + (llama_pos) acc_nodes.size() + 1);
                         }
                     }
                     for (llama_seq_id sq : slot.spec_tree_seqs) {
