@@ -10610,6 +10610,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32,  5120, bs, 17408, {1, 1}, {1, 1}));
             test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 17408, bs,  5120, {1, 1}, {1, 1}));
         }
+        // Qwen3.5/3.6/3.8-27B ssm_out (mamba2 output projection), q5_K verbatim. m=5120 is a
+        // row count whose workgroup total lands differently for a 1-row and a 4-row kernel
+        // (80 against 20 on a 64-lane group), which the m=4096 entry above cannot show: 4096
+        // divides cleanly either way.
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32, 5120, bs, 6144, {1, 1}, {1, 1}));
     }
 
     // qwen3-30b-a3b

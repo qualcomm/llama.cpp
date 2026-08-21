@@ -1818,6 +1818,8 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemv_noshuffle_q5_k_f32_mc3;  // multi-column (N=3) verify GEMV (spec/MTP)
     cl_kernel kernel_gemm_noshuffle_q5_k_f32;
     cl_kernel kernel_gemm_noshuffle_q5_k_f32_cok;  // cooperative-K small-batch GEMM (spec/MTP verify)
+    cl_kernel kernel_gemm_noshuffle_q5_k_f32_cok_r4 = nullptr;  // same, 4 rows per lane
+    cl_kernel kernel_gemm_noshuffle_q5_k_f32_cok_r4_splitk = nullptr;  // ... K split across WGs too
     cl_kernel kernel_gemv_noshuffle_q5_0_f32;
     cl_kernel kernel_gemm_noshuffle_q5_0_f32;
     cl_kernel kernel_gemm_noshuffle_q5_0_q8_1_dp4a = nullptr;  // dp4a (int8) dense q5_0 prefill GEMM
@@ -6656,6 +6658,13 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q5_k_f32 = clCreateKernel(prog, "kernel_gemm_noshuffle_q5_k_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q5_k_f32_cok = clCreateKernel(prog, "kernel_gemm_noshuffle_q5_k_f32_cok", &err), err));
+        // Non-fatal: a compiler that rejects r4 must fall back to the 1-row kernel, not abort.
+        backend_ctx->kernel_gemm_noshuffle_q5_k_f32_cok_r4 =
+            clCreateKernel(prog, "kernel_gemm_noshuffle_q5_k_f32_cok_r4", &err);
+        if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q5_k_f32_cok_r4 = nullptr; }
+        backend_ctx->kernel_gemm_noshuffle_q5_k_f32_cok_r4_splitk =
+            clCreateKernel(prog, "kernel_gemm_noshuffle_q5_k_f32_cok_r4_splitk", &err);
+        if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q5_k_f32_cok_r4_splitk = nullptr; }
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
@@ -29316,9 +29325,56 @@ static void ggml_cl_mul_mat_q5_K_f32_adreno(ggml_backend_t backend, const ggml_t
                                  strncmp(src0->name, "token_embd", 10) == 0;
         const bool use_q5k_cok = q5k_gemm_cok && (ne1 >= 2 && ne1 <= 8) &&
                                  !is_output_w && (ne01 % 64 == 0);
-        kernel = use_q5k_cok ? backend_ctx->kernel_gemm_noshuffle_q5_k_f32_cok
-                             : backend_ctx->kernel_gemm_noshuffle_q5_k_f32;
+
+        // 4 output rows per lane. The 1-row kernel loads 2 bytes of q and 1 of qh per lane per
+        // 4 K-values where a GEMV loads 16, so it is issue bound, not bandwidth bound: on the
+        // X2-90 it runs Qwen3.8-27B's ssm_out (21.6 MB) in 429 us, i.e. 50 GB/s against a
+        // 152 GB/s bus. Four adjacent rows vector-load together and share the activation.
+        //
+        // 🔴 r4 QUARTERS the workgroup count, which is free when the row axis is generous and
+        // ruinous when it is not. ssm_out is 5120 rows: 80 workgroups at 1 row per lane, which
+        // is 5 full waves on 16 CUs, and 20 at 4 rows per lane, which is 1.25. Measured at n=4:
+        //
+        //     shape          1-row wg   r4 wg    1-row      r4
+        //     4096 x 14336      64        16     803.3   630.8   -21.5%
+        //     5120 x  6144      80        20     432.8   508.3   +17.5%   <- ssm_out
+        //
+        // So r4 ALONE is a REGRESSION on the shape this kernel actually runs, and the m=4096
+        // entry in the perf list cannot show it because 4096 is a full wave either way. Split K
+        // back across workgroups and both effects are kept; ggml_opencl_cok_ksplit() reads the
+        // r4 workgroup count, so 4096 rows stay on the plain r4 kernel and 5120 rows get
+        // ksplit 4.
+        // DEFAULT ON; opt out with GGML_OPENCL_Q5K_GEMM_COK_R4=0.
+        static const char * q5k_cok_r4_env = getenv("GGML_OPENCL_Q5K_GEMM_COK_R4");
+        const bool use_q5k_cok_r4 = use_q5k_cok
+                                 && ((q5k_cok_r4_env == nullptr) || (atoi(q5k_cok_r4_env) != 0))
+                                 && backend_ctx->kernel_gemm_noshuffle_q5_k_f32_cok_r4 != nullptr
+                                 && (ne01 % 4 == 0);
+
+        static const int q5k_splitk_env = []{
+            const char * e = getenv("GGML_OPENCL_Q5K_COK_SPLITK"); return e ? atoi(e) : -1;
+        }();
+        const int q5k_base_wg = (int)(ne01 / 256);
+        int q5k_ksplit = 1;
+        if (use_q5k_cok_r4 && q5k_splitk_env != 0 && q5k_base_wg > 0 &&
+            backend_ctx->kernel_gemm_noshuffle_q5_k_f32_cok_r4_splitk != nullptr) {
+            q5k_ksplit = ggml_opencl_cok_ksplit(backend_ctx, q5k_base_wg, (int)(ne00 / 32));
+        }
+        const bool use_q5k_splitk = use_q5k_cok_r4 && (q5k_ksplit > 1);
+
+        kernel = use_q5k_splitk  ? backend_ctx->kernel_gemm_noshuffle_q5_k_f32_cok_r4_splitk
+               : use_q5k_cok_r4  ? backend_ctx->kernel_gemm_noshuffle_q5_k_f32_cok_r4
+               : use_q5k_cok     ? backend_ctx->kernel_gemm_noshuffle_q5_k_f32_cok
+                                 : backend_ctx->kernel_gemm_noshuffle_q5_k_f32;
         int padded_N = N + padding;
+
+        cl_mem q5k_partial = nullptr;
+        const cl_ulong q5k_zero = 0;
+        if (use_q5k_splitk) {
+            backend_ctx->prealloc_splitk_partial.allocate(
+                backend_ctx->context, (size_t)q5k_ksplit * (size_t)ne01 * (size_t)ne1 * sizeof(float));
+            q5k_partial = backend_ctx->prealloc_splitk_partial.buffer;
+        }
 
         CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0_q5_k->q));
         CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_mem),   &extra0_q5_k->qh));
@@ -29326,8 +29382,8 @@ static void ggml_cl_mul_mat_q5_K_f32_adreno(ggml_backend_t backend, const ggml_t
         CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_mem),   &extra0_q5_k->d));
         CL_CHECK(clSetKernelArg(kernel,  4, sizeof(cl_mem),   &extra0_q5_k->dm));
         CL_CHECK(clSetKernelArg(kernel,  5, sizeof(cl_mem),   &b_img_trans));
-        CL_CHECK(clSetKernelArg(kernel,  6, sizeof(cl_mem),   &extrad->data_device));
-        CL_CHECK(clSetKernelArg(kernel,  7, sizeof(cl_ulong), &offsetd));
+        CL_CHECK(clSetKernelArg(kernel,  6, sizeof(cl_mem),   use_q5k_splitk ? &q5k_partial : &extrad->data_device));
+        CL_CHECK(clSetKernelArg(kernel,  7, sizeof(cl_ulong), use_q5k_splitk ? &q5k_zero : &offsetd));
         CL_CHECK(clSetKernelArg(kernel,  8, sizeof(cl_int),   &ne01));
         CL_CHECK(clSetKernelArg(kernel,  9, sizeof(cl_int),   &padded_N));
         CL_CHECK(clSetKernelArg(kernel, 10, sizeof(cl_int),   &ne00));
@@ -29335,12 +29391,17 @@ static void ggml_cl_mul_mat_q5_K_f32_adreno(ggml_backend_t backend, const ggml_t
         CL_CHECK(clSetKernelArg(kernel, 12, sizeof(cl_uchar), &mask_d6));
         CL_CHECK(clSetKernelArg(kernel, 13, sizeof(cl_uchar), &mask_d4));
         CL_CHECK(clSetKernelArg(kernel, 14, sizeof(cl_uchar), &mask_hi2));
+        if (use_q5k_splitk) {
+            CL_CHECK(clSetKernelArg(kernel, 15, sizeof(cl_int), &q5k_ksplit));
+        }
 
         size_t global_work_size[3];
         size_t local_work_size[3];
         if (use_q5k_cok) {
-            global_work_size[0] = (size_t)ne01;   // rows (1 per lane)
-            global_work_size[1] = 8;              // COK_NSG
+            // r4 gives each lane 4 rows, so the row axis shrinks 4x; ksplit spreads the K
+            // split across workgroups to put the wave count back.
+            global_work_size[0] = use_q5k_cok_r4 ? (size_t)(ne01 / 4) : (size_t)ne01;
+            global_work_size[1] = (size_t)(8 * q5k_ksplit);   // COK_NSG x K slices
             global_work_size[2] = 1;
             local_work_size[0] = 64;              // COK_SG
             local_work_size[1] = 8;               // COK_NSG
@@ -29355,6 +29416,21 @@ static void ggml_cl_mul_mat_q5_K_f32_adreno(ggml_backend_t backend, const ggml_t
         }
 
         backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+
+        if (use_q5k_splitk) {
+            // Sum the per-slice partials; the GEMV reduce is reused verbatim over the
+            // [ne1][ne01] output region.
+            const cl_int rows = (cl_int)(ne01 * ne1);
+            cl_kernel kr = backend_ctx->kernel_gemv_splitk_reduce_f32;
+            CL_CHECK(clSetKernelArg(kr, 0, sizeof(cl_mem),   &q5k_partial));
+            CL_CHECK(clSetKernelArg(kr, 1, sizeof(cl_mem),   &extrad->data_device));
+            CL_CHECK(clSetKernelArg(kr, 2, sizeof(cl_ulong), &offsetd));
+            CL_CHECK(clSetKernelArg(kr, 3, sizeof(cl_int),   &rows));
+            CL_CHECK(clSetKernelArg(kr, 4, sizeof(cl_int),   &q5k_ksplit));
+            size_t lr[3] = {64, 1, 1};
+            size_t gr[3] = {(size_t)CEIL_DIV(rows, 64) * 64, 1, 1};
+            backend_ctx->enqueue_ndrange_kernel(kr, 3, gr, lr, dst);
+        }
 
         CL_CHECK(clReleaseMemObject(b_sub_buf));
         CL_CHECK(clReleaseMemObject(b_sub_buf_trans));
