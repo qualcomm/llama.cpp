@@ -2070,13 +2070,24 @@ static void ggml_hexagon_precompute_allreduce_params(
         const uint32_t n_threads = (std::min)((uint32_t) sess->n_threads, (std::max)(1u, nelem / 1024));
         kparams->n_threads = n_threads;
 
-        uint32_t block_elems = 8192;
+        uint32_t block_elems = 65536;
         if (block_elems > nelem / n_threads && nelem / n_threads > 128) {
             block_elems = hex_round_up(nelem / (n_threads * 2), 128);
         }
+        block_elems = (std::max)(128u, block_elems);
+
         kparams->block_elems          = block_elems;
         kparams->vtcm_size_per_thread = 2 * block_elems * elem_size;
         kparams->vtcm_size            = n_threads * (n_ranks + 1) * kparams->vtcm_size_per_thread;
+
+        if ((size_t) kparams->vtcm_size > sess->vtcm_size) {
+            const size_t max_bytes_per_buf = sess->vtcm_size / (n_threads * (n_ranks + 1) * 2);
+            block_elems = (uint32_t) hex_align_down((size_t) (max_bytes_per_buf / elem_size), 128);
+            block_elems = (std::max)(128u, block_elems);
+            kparams->block_elems          = block_elems;
+            kparams->vtcm_size_per_thread = 2 * block_elems * elem_size;
+            kparams->vtcm_size            = n_threads * (n_ranks + 1) * kparams->vtcm_size_per_thread;
+        }
 
         if (sess->vtcm_size >= (size_t) kparams->vtcm_size) {
             kparams->elems_per_thread = hex_round_up((nelem + n_threads - 1) / n_threads, block_elems);
@@ -2094,12 +2105,20 @@ static void ggml_hexagon_precompute_allreduce_params(
         kparams->row_size_aligned = row_size_aligned;
 
         const uint32_t nrows_per_thread = (ne1 + n_threads - 1) / n_threads;
-        uint32_t block_rows = (std::min)(32u, nrows_per_thread);
+        uint32_t block_rows = (std::min)(128u, nrows_per_thread);
         block_rows = (std::max)(1u, block_rows);
         kparams->block_elems = block_rows;
 
         kparams->vtcm_size_per_thread = 2 * (block_rows * row_size_aligned);
         kparams->vtcm_size            = n_threads * (n_ranks + 1) * kparams->vtcm_size_per_thread;
+
+        if ((size_t) kparams->vtcm_size > sess->vtcm_size) {
+            const size_t max_rows_per_buf = sess->vtcm_size / (n_threads * (n_ranks + 1) * 2 * row_size_aligned);
+            block_rows = (std::max)(1u, (uint32_t) max_rows_per_buf);
+            kparams->block_elems          = block_rows;
+            kparams->vtcm_size_per_thread = 2 * (block_rows * row_size_aligned);
+            kparams->vtcm_size            = n_threads * (n_ranks + 1) * kparams->vtcm_size_per_thread;
+        }
 
         if (sess->vtcm_size >= (size_t) kparams->vtcm_size) {
             kparams->elems_per_thread = nrows_per_thread;
