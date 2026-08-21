@@ -94,6 +94,7 @@ enum htp_op_code {
     HTP_OP_IM2COL,
     HTP_OP_FENCE,
     HTP_OP_ALLREDUCE,
+    HTP_OP_ALLREDUCE_ADD,
 
     HTP_OP_INVALID
 };

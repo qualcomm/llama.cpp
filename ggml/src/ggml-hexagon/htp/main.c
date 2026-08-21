@@ -744,6 +744,7 @@ static int execute_op(struct htp_ops_context * octx) {
             return op_fence(octx);
 
         case HTP_OP_ALLREDUCE:
+        case HTP_OP_ALLREDUCE_ADD:
             return op_allreduce(octx);
 
         case HTP_OP_MUL_MAT:

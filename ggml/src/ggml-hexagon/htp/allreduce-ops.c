@@ -30,9 +30,10 @@ struct htp_allreduce_context {
     uint32_t vtcm_size_per_thread;
     uint8_t * src_spad_base[HTP_ALLREDUCE_MAX_RANKS];
     uint8_t * dst_spad_base;
+    uint8_t * res_spad_base;
 };
 
-#define DEFINE_ALLREDUCE_THREAD_DMA_1D(SUFFIX, TYPE, HVX_ADD_FN)                                            \
+#define DEFINE_ALLREDUCE_THREAD_DMA_1D(SUFFIX, TYPE, HVX_ADD_FN, HAS_ADD)                                   \
 static void allreduce_thread_dma_1d_##SUFFIX(unsigned int nth, unsigned int ith, void * data) {             \
     struct htp_allreduce_context * actx = (struct htp_allreduce_context *) data;                            \
     struct htp_ops_context * octx = actx->octx;                                                             \
@@ -54,6 +55,7 @@ static void allreduce_thread_dma_1d_##SUFFIX(unsigned int nth, unsigned int ith,
         src_spad_base[s] = actx->src_spad_base[s] + (ith * actx->vtcm_size_per_thread);                     \
     }                                                                                                       \
     uint8_t * dst_spad_base = actx->dst_spad_base + (ith * actx->vtcm_size_per_thread);                     \
+    uint8_t * res_spad_base = HAS_ADD ? (actx->res_spad_base + (ith * actx->vtcm_size_per_thread)) : NULL; \
                                                                                                             \
     const size_t spad_half = actx->vtcm_size_per_thread / 2;                                                \
     uint32_t ir_prefetch = ir0;                                                                             \
@@ -70,6 +72,11 @@ static void allreduce_thread_dma_1d_##SUFFIX(unsigned int nth, unsigned int ith,
             const uint8_t * s_ddr = (const uint8_t *) octx->src[s]->data + ir_prefetch * sizeof(TYPE);      \
             dma_queue_push(q, dma_make_ptr(s_spad, s_ddr), cur_bytes, cur_bytes, cur_bytes, 1);             \
         }                                                                                                   \
+        if (HAS_ADD) {                                                                                      \
+            uint8_t * r_spad = res_spad_base + spad_idx * spad_half;                                        \
+            const uint8_t * r_ddr = (const uint8_t *) octx->src[2 * n_ranks]->data + ir_prefetch * sizeof(TYPE); \
+            dma_queue_push(q, dma_make_ptr(r_spad, r_ddr), cur_bytes, cur_bytes, cur_bytes, 1);             \
+        }                                                                                                   \
         ir_prefetch += cur_elems;                                                                           \
         spad_idx ^= 1;                                                                                      \
     }                                                                                                       \
@@ -82,10 +89,14 @@ static void allreduce_thread_dma_1d_##SUFFIX(unsigned int nth, unsigned int ith,
         for (uint32_t s = 0; s < n_ranks; s++) {                                                            \
             s_spad[s] = (uint8_t *) dma_queue_pop(q).dst;                                                   \
         }                                                                                                   \
+        uint8_t * r_spad = HAS_ADD ? (uint8_t *) dma_queue_pop(q).dst : NULL;                              \
         htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) ir);                                   \
         HVX_ADD_FN(d_spad, s_spad[0], s_spad[1], cur_elems);                                                \
         for (uint32_t s = 2; s < n_ranks; s++) {                                                            \
             HVX_ADD_FN(d_spad, d_spad, s_spad[s], cur_elems);                                               \
+        }                                                                                                   \
+        if (HAS_ADD) {                                                                                      \
+            HVX_ADD_FN(d_spad, d_spad, r_spad, cur_elems);                                                  \
         }                                                                                                   \
         htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) ir);                                    \
         uint8_t * d_ddr = (uint8_t *) octx->dst->data + ir * sizeof(TYPE);                                  \
@@ -97,6 +108,10 @@ static void allreduce_thread_dma_1d_##SUFFIX(unsigned int nth, unsigned int ith,
                 const uint8_t * s_next = (const uint8_t *) octx->src[s]->data + ir_prefetch * sizeof(TYPE); \
                 dma_queue_push(q, dma_make_ptr(s_spad[s], s_next), next_bytes, next_bytes, next_bytes, 1);  \
             }                                                                                               \
+            if (HAS_ADD) {                                                                                  \
+                const uint8_t * r_next = (const uint8_t *) octx->src[2 * n_ranks]->data + ir_prefetch * sizeof(TYPE); \
+                dma_queue_push(q, dma_make_ptr(r_spad, r_next), next_bytes, next_bytes, next_bytes, 1);     \
+            }                                                                                               \
             ir_prefetch += next_elems;                                                                      \
         }                                                                                                   \
         ir += cur_elems;                                                                                    \
@@ -104,39 +119,42 @@ static void allreduce_thread_dma_1d_##SUFFIX(unsigned int nth, unsigned int ith,
     dma_queue_flush(q);                                                                                     \
 }
 
-DEFINE_ALLREDUCE_THREAD_DMA_1D(f16, __fp16, hvx_add_f16_aaa)
-DEFINE_ALLREDUCE_THREAD_DMA_1D(f32, float,  hvx_add_f32_aaa)
+DEFINE_ALLREDUCE_THREAD_DMA_1D(f16,     __fp16, hvx_add_f16_aaa, 0)
+DEFINE_ALLREDUCE_THREAD_DMA_1D(f32,     float,  hvx_add_f32_aaa, 0)
+DEFINE_ALLREDUCE_THREAD_DMA_1D(add_f16, __fp16, hvx_add_f16_aaa, 1)
+DEFINE_ALLREDUCE_THREAD_DMA_1D(add_f32, float,  hvx_add_f32_aaa, 1)
 
-#define DEFINE_ALLREDUCE_THREAD_DMA_2D(SUFFIX, TYPE, HVX_ADD_FN)                                                                 \
+#define DEFINE_ALLREDUCE_THREAD_DMA_2D(SUFFIX, TYPE, HVX_ADD_FN, HAS_ADD)                                                        \
 static void allreduce_thread_dma_2d_##SUFFIX(unsigned int nth, unsigned int ith, void * data) {                                  \
     struct htp_allreduce_context * actx = (struct htp_allreduce_context *) data;                                                 \
     struct htp_ops_context * octx = actx->octx;                                                                                  \
-                                                                                                                                 \
+                                                                                                                                  \
     const uint32_t n_ranks          = actx->n_ranks;                                                                             \
     const uint32_t ne0              = actx->ne0;                                                                                 \
     const uint32_t ne1              = actx->ne1;                                                                                 \
     const uint32_t block_rows       = actx->block_elems;                                                                         \
     const uint32_t row_size_aligned = actx->row_size_aligned;                                                                    \
     const uint32_t row_bytes        = ne0 * sizeof(TYPE);                                                                        \
-                                                                                                                                 \
+                                                                                                                                  \
     const uint32_t dr  = actx->elems_per_thread;                                                                                 \
     const uint32_t r0  = dr * ith;                                                                                               \
     const uint32_t r1  = MIN(r0 + dr, ne1);                                                                                      \
     if (r0 >= r1) return;                                                                                                        \
-                                                                                                                                 \
+                                                                                                                                  \
     struct htp_thread_trace * tr = &octx->ctx->trace[ith];                                                                       \
     dma_queue * q = octx->ctx->dma[ith];                                                                                         \
-                                                                                                                                 \
+                                                                                                                                  \
     uint8_t * src_spad_base[HTP_ALLREDUCE_MAX_RANKS];                                                                            \
     for (uint32_t s = 0; s < n_ranks; s++) {                                                                                     \
         src_spad_base[s] = actx->src_spad_base[s] + (ith * actx->vtcm_size_per_thread);                                          \
     }                                                                                                                            \
     uint8_t * dst_spad_base = actx->dst_spad_base + (ith * actx->vtcm_size_per_thread);                                          \
-                                                                                                                                 \
+    uint8_t * res_spad_base = HAS_ADD ? (actx->res_spad_base + (ith * actx->vtcm_size_per_thread)) : NULL;                       \
+                                                                                                                                  \
     const size_t spad_half = actx->vtcm_size_per_thread / 2;                                                                     \
     uint32_t r_prefetch = r0;                                                                                                    \
     int spad_idx = 0;                                                                                                            \
-                                                                                                                                 \
+                                                                                                                                  \
     for (int k = 0; k < 2 && r_prefetch < r1; k++) {                                                                             \
         uint32_t cur_rows = MIN(block_rows, r1 - r_prefetch);                                                                    \
         uint8_t * d_spad = dst_spad_base + spad_idx * spad_half;                                                                 \
@@ -147,10 +165,15 @@ static void allreduce_thread_dma_2d_##SUFFIX(unsigned int nth, unsigned int ith,
             const uint8_t * s_ddr = (const uint8_t *) octx->src[s]->data + r_prefetch * octx->src[s]->nb[1];                     \
             dma_queue_push(q, dma_make_ptr(s_spad, s_ddr), row_size_aligned, octx->src[s]->nb[1], row_bytes, cur_rows);          \
         }                                                                                                                        \
+        if (HAS_ADD) {                                                                                                           \
+            uint8_t * r_spad = res_spad_base + spad_idx * spad_half;                                                             \
+            const uint8_t * r_ddr = (const uint8_t *) octx->src[2 * n_ranks]->data + r_prefetch * octx->src[2 * n_ranks]->nb[1];   \
+            dma_queue_push(q, dma_make_ptr(r_spad, r_ddr), row_size_aligned, octx->src[2 * n_ranks]->nb[1], row_bytes, cur_rows); \
+        }                                                                                                                        \
         r_prefetch += cur_rows;                                                                                                  \
         spad_idx ^= 1;                                                                                                           \
     }                                                                                                                            \
-                                                                                                                                 \
+                                                                                                                                  \
     for (uint32_t r = r0; r < r1; ) {                                                                                            \
         uint32_t cur_rows = MIN(block_rows, r1 - r);                                                                             \
         uint8_t * d_spad = (uint8_t *) dma_queue_pop(q).src;                                                                     \
@@ -158,6 +181,7 @@ static void allreduce_thread_dma_2d_##SUFFIX(unsigned int nth, unsigned int ith,
         for (uint32_t s = 0; s < n_ranks; s++) {                                                                                 \
             s_spad[s] = (uint8_t *) dma_queue_pop(q).dst;                                                                        \
         }                                                                                                                        \
+        uint8_t * r_spad = HAS_ADD ? (uint8_t *) dma_queue_pop(q).dst : NULL;                                                    \
         htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) r);                                                         \
         for (uint32_t row = 0; row < cur_rows; row++) {                                                                          \
             uint8_t * d_row = d_spad + row * row_size_aligned;                                                                   \
@@ -167,6 +191,10 @@ static void allreduce_thread_dma_2d_##SUFFIX(unsigned int nth, unsigned int ith,
             for (uint32_t s = 2; s < n_ranks; s++) {                                                                             \
                 const uint8_t * ss_row = s_spad[s] + row * row_size_aligned;                                                     \
                 HVX_ADD_FN(d_row, d_row, ss_row, ne0);                                                                           \
+            }                                                                                                                    \
+            if (HAS_ADD) {                                                                                                       \
+                const uint8_t * res_row = r_spad + row * row_size_aligned;                                                       \
+                HVX_ADD_FN(d_row, d_row, res_row, ne0);                                                                          \
             }                                                                                                                    \
         }                                                                                                                        \
         htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) r);                                                          \
@@ -178,6 +206,10 @@ static void allreduce_thread_dma_2d_##SUFFIX(unsigned int nth, unsigned int ith,
                 const uint8_t * s_next = (const uint8_t *) octx->src[s]->data + r_prefetch * octx->src[s]->nb[1];                \
                 dma_queue_push(q, dma_make_ptr(s_spad[s], s_next), row_size_aligned, octx->src[s]->nb[1], row_bytes, next_rows); \
             }                                                                                                                    \
+            if (HAS_ADD) {                                                                                                       \
+                const uint8_t * r_next = (const uint8_t *) octx->src[2 * n_ranks]->data + r_prefetch * octx->src[2 * n_ranks]->nb[1]; \
+                dma_queue_push(q, dma_make_ptr(r_spad, r_next), row_size_aligned, octx->src[2 * n_ranks]->nb[1], row_bytes, next_rows); \
+            }                                                                                                                    \
             r_prefetch += next_rows;                                                                                             \
         }                                                                                                                        \
         r += cur_rows;                                                                                                           \
@@ -185,10 +217,12 @@ static void allreduce_thread_dma_2d_##SUFFIX(unsigned int nth, unsigned int ith,
     dma_queue_flush(q);                                                                                                          \
 }
 
-DEFINE_ALLREDUCE_THREAD_DMA_2D(f16, __fp16, hvx_add_f16_aaa)
-DEFINE_ALLREDUCE_THREAD_DMA_2D(f32, float,  hvx_add_f32_aaa)
+DEFINE_ALLREDUCE_THREAD_DMA_2D(f16,     __fp16, hvx_add_f16_aaa, 0)
+DEFINE_ALLREDUCE_THREAD_DMA_2D(f32,     float,  hvx_add_f32_aaa, 0)
+DEFINE_ALLREDUCE_THREAD_DMA_2D(add_f16, __fp16, hvx_add_f16_aaa, 1)
+DEFINE_ALLREDUCE_THREAD_DMA_2D(add_f32, float,  hvx_add_f32_aaa, 1)
 
-#define DEFINE_ALLREDUCE_THREAD_DIRECT_1D(SUFFIX, TYPE, HVX_ADD_FN)                                \
+#define DEFINE_ALLREDUCE_THREAD_DIRECT_1D(SUFFIX, TYPE, HVX_ADD_FN, HAS_ADD)                       \
 static void allreduce_thread_direct_1d_##SUFFIX(unsigned int nth, unsigned int ith, void * data) { \
     struct htp_allreduce_context * actx = (struct htp_allreduce_context *) data;                   \
     struct htp_ops_context * octx = actx->octx;                                                    \
@@ -212,13 +246,19 @@ static void allreduce_thread_direct_1d_##SUFFIX(unsigned int nth, unsigned int i
         const uint8_t * srcs_ptr = (const uint8_t *) octx->src[s]->data + elem_off * sizeof(TYPE); \
         HVX_ADD_FN(dst_ptr, dst_ptr, srcs_ptr, n_elems);                                           \
     }                                                                                              \
+    if (HAS_ADD) {                                                                                 \
+        const uint8_t * res_ptr = (const uint8_t *) octx->src[2 * actx->n_ranks]->data + elem_off * sizeof(TYPE); \
+        HVX_ADD_FN(dst_ptr, dst_ptr, res_ptr, n_elems);                                            \
+    }                                                                                              \
     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) ir0);                              \
 }
 
-DEFINE_ALLREDUCE_THREAD_DIRECT_1D(f16, __fp16, hvx_add_f16_uuu)
-DEFINE_ALLREDUCE_THREAD_DIRECT_1D(f32, float,  hvx_add_f32_uuu)
+DEFINE_ALLREDUCE_THREAD_DIRECT_1D(f16,     __fp16, hvx_add_f16_uuu, 0)
+DEFINE_ALLREDUCE_THREAD_DIRECT_1D(f32,     float,  hvx_add_f32_uuu, 0)
+DEFINE_ALLREDUCE_THREAD_DIRECT_1D(add_f16, __fp16, hvx_add_f16_uuu, 1)
+DEFINE_ALLREDUCE_THREAD_DIRECT_1D(add_f32, float,  hvx_add_f32_uuu, 1)
 
-#define DEFINE_ALLREDUCE_THREAD_DIRECT_2D(SUFFIX, TYPE, HVX_ADD_FN)                                    \
+#define DEFINE_ALLREDUCE_THREAD_DIRECT_2D(SUFFIX, TYPE, HVX_ADD_FN, HAS_ADD)                           \
 static void allreduce_thread_direct_2d_##SUFFIX(unsigned int nth, unsigned int ith, void * data) {     \
     struct htp_allreduce_context * actx = (struct htp_allreduce_context *) data;                       \
     struct htp_ops_context * octx = actx->octx;                                                        \
@@ -244,12 +284,18 @@ static void allreduce_thread_direct_2d_##SUFFIX(unsigned int nth, unsigned int i
             const uint8_t * srcs_ptr = (const uint8_t *) octx->src[s]->data + r * octx->src[s]->nb[1]; \
             HVX_ADD_FN(dst_ptr, dst_ptr, srcs_ptr, ne0);                                               \
         }                                                                                              \
+        if (HAS_ADD) {                                                                                 \
+            const uint8_t * res_ptr = (const uint8_t *) octx->src[2 * n_ranks]->data + r * octx->src[2 * n_ranks]->nb[1]; \
+            HVX_ADD_FN(dst_ptr, dst_ptr, res_ptr, ne0);                                                \
+        }                                                                                              \
     }                                                                                                  \
     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) r0);                                   \
 }
 
-DEFINE_ALLREDUCE_THREAD_DIRECT_2D(f16, __fp16, hvx_add_f16_uuu)
-DEFINE_ALLREDUCE_THREAD_DIRECT_2D(f32, float,  hvx_add_f32_uuu)
+DEFINE_ALLREDUCE_THREAD_DIRECT_2D(f16,     __fp16, hvx_add_f16_uuu, 0)
+DEFINE_ALLREDUCE_THREAD_DIRECT_2D(f32,     float,  hvx_add_f32_uuu, 0)
+DEFINE_ALLREDUCE_THREAD_DIRECT_2D(add_f16, __fp16, hvx_add_f16_uuu, 1)
+DEFINE_ALLREDUCE_THREAD_DIRECT_2D(add_f32, float,  hvx_add_f32_uuu, 1)
 
 int op_allreduce(struct htp_ops_context * octx) {
     const struct htp_allreduce_kernel_params * kparams = (const struct htp_allreduce_kernel_params *) octx->kernel_params;
@@ -268,8 +314,9 @@ int op_allreduce(struct htp_ops_context * octx) {
 
     const uint32_t nelem = dst->ne[0] * dst->ne[1] * dst->ne[2] * dst->ne[3];
 
-    // 1. Flush local output to DDR so peers can read it
-    htp_tensor_flush_all(octx->ctx, (const struct htp_tensor * const *) &dst, 1);
+    // 1. Flush local partial tensor to DDR so peers can read it
+    const struct htp_tensor * local_src = octx->src[rank];
+    htp_tensor_flush_all(octx->ctx, &local_src, 1);
 
     // 2. Single Barrier: Synchronize all ranks
     struct htp_thread_trace * tr0 = &octx->ctx->trace[0];
@@ -312,6 +359,8 @@ int op_allreduce(struct htp_ops_context * octx) {
         const uint32_t elems_per_thread     = (uint32_t) kparams->elems_per_thread;
         const uint32_t vtcm_size_per_thread = (uint32_t) kparams->vtcm_size_per_thread;
 
+        const bool has_add = (octx->op == HTP_OP_ALLREDUCE_ADD);
+
         struct htp_allreduce_context actx;
         actx.octx                 = octx;
         actx.n_ranks              = n_ranks;
@@ -326,16 +375,32 @@ int op_allreduce(struct htp_ops_context * octx) {
         worker_callback_t reduce_fun = NULL;
         switch (kparams->kernel_type) {
             case HTP_ALLREDUCE_KERNEL_DMA_1D:
-                reduce_fun = (dst->type == HTP_TYPE_F16) ? allreduce_thread_dma_1d_f16 : allreduce_thread_dma_1d_f32;
+                if (has_add) {
+                    reduce_fun = (dst->type == HTP_TYPE_F16) ? allreduce_thread_dma_1d_add_f16 : allreduce_thread_dma_1d_add_f32;
+                } else {
+                    reduce_fun = (dst->type == HTP_TYPE_F16) ? allreduce_thread_dma_1d_f16 : allreduce_thread_dma_1d_f32;
+                }
                 break;
             case HTP_ALLREDUCE_KERNEL_DMA_2D:
-                reduce_fun = (dst->type == HTP_TYPE_F16) ? allreduce_thread_dma_2d_f16 : allreduce_thread_dma_2d_f32;
+                if (has_add) {
+                    reduce_fun = (dst->type == HTP_TYPE_F16) ? allreduce_thread_dma_2d_add_f16 : allreduce_thread_dma_2d_add_f32;
+                } else {
+                    reduce_fun = (dst->type == HTP_TYPE_F16) ? allreduce_thread_dma_2d_f16 : allreduce_thread_dma_2d_f32;
+                }
                 break;
             case HTP_ALLREDUCE_KERNEL_DIRECT_1D:
-                reduce_fun = (dst->type == HTP_TYPE_F16) ? allreduce_thread_direct_1d_f16 : allreduce_thread_direct_1d_f32;
+                if (has_add) {
+                    reduce_fun = (dst->type == HTP_TYPE_F16) ? allreduce_thread_direct_1d_add_f16 : allreduce_thread_direct_1d_add_f32;
+                } else {
+                    reduce_fun = (dst->type == HTP_TYPE_F16) ? allreduce_thread_direct_1d_f16 : allreduce_thread_direct_1d_f32;
+                }
                 break;
             case HTP_ALLREDUCE_KERNEL_DIRECT_2D:
-                reduce_fun = (dst->type == HTP_TYPE_F16) ? allreduce_thread_direct_2d_f16 : allreduce_thread_direct_2d_f32;
+                if (has_add) {
+                    reduce_fun = (dst->type == HTP_TYPE_F16) ? allreduce_thread_direct_2d_add_f16 : allreduce_thread_direct_2d_add_f32;
+                } else {
+                    reduce_fun = (dst->type == HTP_TYPE_F16) ? allreduce_thread_direct_2d_f16 : allreduce_thread_direct_2d_f32;
+                }
                 break;
             default:
                 return HTP_STATUS_NO_SUPPORT;
@@ -348,6 +413,11 @@ int op_allreduce(struct htp_ops_context * octx) {
                 vtcm_ptr += n_threads * vtcm_size_per_thread;
             }
             actx.dst_spad_base = vtcm_ptr;
+            vtcm_ptr += n_threads * vtcm_size_per_thread;
+            if (has_add) {
+                actx.res_spad_base = vtcm_ptr;
+                vtcm_ptr += n_threads * vtcm_size_per_thread;
+            }
         }
 
         worker_pool_run_func(octx->ctx->worker_pool, reduce_fun, &actx, n_threads);

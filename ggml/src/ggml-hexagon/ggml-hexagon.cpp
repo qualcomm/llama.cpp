@@ -297,6 +297,15 @@ static void ggml_hexagon_precompute_fused_ffn_params(
     struct htp_mm_kernel_params * kparams
 );
 
+static void ggml_hexagon_precompute_allreduce_params(
+    const struct ggml_hexagon_session * sess,
+    const struct ggml_tensor * dst,
+    uint32_t rank,
+    uint32_t n_ranks,
+    bool has_add,
+    struct htp_allreduce_kernel_params * kparams
+);
+
 // ** backend sessions
 
 struct ggml_hexagon_tensor_extra {
@@ -1730,6 +1739,92 @@ struct ggml_hexagon_opbatch {
             o.dst[i] = (i < outputs.size() && outputs[i]) ? add_tensor(outputs[i]) : 0xffff;
         }
     }
+
+    bool try_fuse_allreduce_add(const htp_opnode & node) {
+        if (n_ops == 0) return false;
+        if (node.opcode != HTP_OP_ADD) return false;
+
+        htp_opnode & last_node = ops[n_ops - 1];
+        if (last_node.opcode != HTP_OP_ALLREDUCE) return false;
+
+        const ggml_tensor * ar_dst = last_node.dst();
+        const ggml_tensor * add_src0 = node.src0();
+        const ggml_tensor * add_src1 = node.src1();
+
+        if (!add_src0 || !add_src1 || !ar_dst) return false;
+
+        const ggml_tensor * res_tensor = nullptr;
+        if (add_src0 == ar_dst || add_src0->data == ar_dst->data) {
+            res_tensor = add_src1;
+        } else if (add_src1 == ar_dst || add_src1->data == ar_dst->data) {
+            res_tensor = add_src0;
+        } else {
+            return false;
+        }
+
+        if (!res_tensor || !res_tensor->data) return false;
+
+        if (ar_dst->type != res_tensor->type) return false;
+        if (ar_dst->ne[0] != res_tensor->ne[0] || ar_dst->ne[1] != res_tensor->ne[1] ||
+            ar_dst->ne[2] != res_tensor->ne[2] || ar_dst->ne[3] != res_tensor->ne[3]) {
+            return false;
+        }
+
+        auto * ar_kparams = (struct htp_allreduce_kernel_params *) last_node.kernel_params;
+        struct htp_allreduce_kernel_params new_kparams;
+        ggml_hexagon_precompute_allreduce_params(
+            sess, node.dst(), (uint32_t) ar_kparams->rank, (uint32_t) ar_kparams->n_ranks, true, &new_kparams
+        );
+
+        if ((size_t) new_kparams.vtcm_size > sess->vtcm_size) {
+            HEX_VERBOSE("ggml-hex: %s skip ALLREDUCE_ADD fusion: VTCM needed %d > budget %zu\n",
+                        sess->c_name(), new_kparams.vtcm_size, sess->vtcm_size);
+            return false;
+        }
+
+        size_t extra_bufs = 0, extra_vmem = 0, extra_tens = 0;
+        auto fit_t = [&](const ggml_tensor * t) {
+            if (!t) return;
+            if (!t_map.count(t)) {
+                extra_tens++;
+                auto sbuf = static_cast<ggml_hexagon_shared_buffer *>(t->buffer->context);
+                if (!b_map.count(sbuf->fd())) {
+                    extra_vmem += sbuf->size();
+                    extra_bufs += 1;
+                }
+            }
+        };
+        fit_t(res_tensor);
+        fit_t(node.dst());
+        if ((extra_bufs + n_bufs) > n_bufs_max || (extra_tens + n_tens) > n_tens_max || (extra_vmem + b_vmem) > b_vmem_max) {
+            return false;
+        }
+
+        last_node.opcode = HTP_OP_ALLREDUCE_ADD;
+        last_node.name   = "ALLREDUCE+ADD";
+        last_node.inputs.push_back(res_tensor);
+        last_node.outputs.clear();
+        last_node.outputs.push_back(node.dst());
+        last_node.fused.push_back(node.node);
+        memcpy(last_node.kernel_params, &new_kparams, sizeof(new_kparams));
+
+        htp_op_desc & o = h_ops[n_ops - 1];
+        o.opcode = HTP_OP_ALLREDUCE_ADD;
+        memcpy(o.kernel_params, &new_kparams, sizeof(new_kparams));
+
+        const uint32_t n_ranks = (uint32_t) ar_kparams->n_ranks;
+        o.src[2 * n_ranks] = add_tensor(res_tensor);
+        o.dst[0]           = add_tensor(node.dst());
+
+        HEX_VERBOSE("ggml-hex: %s fused ALLREDUCE+ADD (#%u)\n", sess->c_name(), n_ops - 1);
+        return true;
+    }
+
+    bool try_fuse(const htp_opnode & node) {
+        if (!opt_opfusion) return false;
+        if (try_fuse_allreduce_add(node)) return true;
+        return false;
+    }
 };
 
 struct ggml_hexagon_registry {
@@ -1909,7 +2004,7 @@ struct ggml_hexagon_opqueue {
                     auto sbuf = static_cast<ggml_hexagon_shared_buffer *>(ops[i].src0()->buffer->context);
                     void * fence_ptr = ops[i].src0()->data;
                     sbuf->release_fence(fence_ptr);
-                } else if (ops[i].opcode == HTP_OP_ALLREDUCE) {
+                } else if (ops[i].opcode == HTP_OP_ALLREDUCE || ops[i].opcode == HTP_OP_ALLREDUCE_ADD) {
                     uint32_t rank    = (uint32_t) ops[i].kernel_params[0];
                     uint32_t n_ranks = (uint32_t) ops[i].kernel_params[1];
                     const auto * my_fence = ops[i].inputs[n_ranks + rank];
@@ -2013,6 +2108,10 @@ void ggml_hexagon_session::enqueue_op(const htp_opnode & node) {
         }
     }
 
+    if (opt_opfusion && op_batch->try_fuse(node)) {
+        return;
+    }
+
     if (!op_batch->fit_op(node)) {
         flush_batch();
     }
@@ -2051,12 +2150,14 @@ static void ggml_hexagon_precompute_allreduce_params(
     const struct ggml_tensor * dst,
     uint32_t rank,
     uint32_t n_ranks,
+    bool has_add,
     struct htp_allreduce_kernel_params * kparams
 ) {
     memset(kparams, 0, sizeof(*kparams));
     kparams->rank    = (int32_t) rank;
     kparams->n_ranks = (int32_t) n_ranks;
 
+    const uint32_t n_bufs    = n_ranks + 1 + (has_add ? 1 : 0);
     const uint32_t nelem     = (uint32_t) ggml_nelements(dst);
     const uint32_t elem_size = (dst->type == GGML_TYPE_F16) ? sizeof(ggml_fp16_t) : sizeof(float);
     const bool is_contiguous = ggml_is_contiguous(dst);
@@ -2078,15 +2179,15 @@ static void ggml_hexagon_precompute_allreduce_params(
 
         kparams->block_elems          = block_elems;
         kparams->vtcm_size_per_thread = 2 * block_elems * elem_size;
-        kparams->vtcm_size            = n_threads * (n_ranks + 1) * kparams->vtcm_size_per_thread;
+        kparams->vtcm_size            = n_threads * n_bufs * kparams->vtcm_size_per_thread;
 
         if ((size_t) kparams->vtcm_size > sess->vtcm_size) {
-            const size_t max_bytes_per_buf = sess->vtcm_size / (n_threads * (n_ranks + 1) * 2);
+            const size_t max_bytes_per_buf = sess->vtcm_size / (n_threads * n_bufs * 2);
             block_elems = (uint32_t) hex_align_down((size_t) (max_bytes_per_buf / elem_size), 128);
             block_elems = (std::max)(128u, block_elems);
             kparams->block_elems          = block_elems;
             kparams->vtcm_size_per_thread = 2 * block_elems * elem_size;
-            kparams->vtcm_size            = n_threads * (n_ranks + 1) * kparams->vtcm_size_per_thread;
+            kparams->vtcm_size            = n_threads * n_bufs * kparams->vtcm_size_per_thread;
         }
 
         if (sess->vtcm_size >= (size_t) kparams->vtcm_size) {
@@ -2110,14 +2211,14 @@ static void ggml_hexagon_precompute_allreduce_params(
         kparams->block_elems = block_rows;
 
         kparams->vtcm_size_per_thread = 2 * (block_rows * row_size_aligned);
-        kparams->vtcm_size            = n_threads * (n_ranks + 1) * kparams->vtcm_size_per_thread;
+        kparams->vtcm_size            = n_threads * n_bufs * kparams->vtcm_size_per_thread;
 
         if ((size_t) kparams->vtcm_size > sess->vtcm_size) {
-            const size_t max_rows_per_buf = sess->vtcm_size / (n_threads * (n_ranks + 1) * 2 * row_size_aligned);
+            const size_t max_rows_per_buf = sess->vtcm_size / (n_threads * n_bufs * 2 * row_size_aligned);
             block_rows = (std::max)(1u, (uint32_t) max_rows_per_buf);
             kparams->block_elems          = block_rows;
             kparams->vtcm_size_per_thread = 2 * (block_rows * row_size_aligned);
-            kparams->vtcm_size            = n_threads * (n_ranks + 1) * kparams->vtcm_size_per_thread;
+            kparams->vtcm_size            = n_threads * n_bufs * kparams->vtcm_size_per_thread;
         }
 
         if (sess->vtcm_size >= (size_t) kparams->vtcm_size) {
@@ -2156,7 +2257,7 @@ void ggml_hexagon_session::enqueue_allreduce(
     ar_node.outputs.push_back(node);
 
     ggml_hexagon_precompute_allreduce_params(
-        this, dst, rank, n_ranks,
+        this, dst, rank, n_ranks, false,
         (struct htp_allreduce_kernel_params *) ar_node.kernel_params
     );
 
