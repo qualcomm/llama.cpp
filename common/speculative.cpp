@@ -1559,9 +1559,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         // sampled token leads it). 15 keeps that batch at 16 -- the top of the dp4a
         // narrow-tile band, where a column costs ~1.4 ms; 16 would make it 17 and tip
         // into the next tile for one node, which costs ~50 ms.
+        // Default 7. Measured on Adreno X2-90 / muse-glimmer-30B against the official Meta
+        // drafter, RDP detached, n=3: MEAN_TG4 18.506 against 18.023 linear (+2.7%), peak
+        // 23.263 against 22.975 (+1.2%), aggregate over all nine prompts +3.5%. The gain
+        // concentrates in the LOWER-acceptance prompts, where a rank-2 branch is most likely
+        // to be the token the target actually wants. 15 and 23 nodes both measured WORSE
+        // (17.964 and 15.733) -- a wider tree buys tokens with verify columns, and past the
+        // narrow-tile band a column stops being cheap. Set 0 to go back to a linear spine.
         static const int32_t cap = []{
             const char * e = std::getenv("LLAMA_DFLASH_TREE_NODES");
-            return e ? std::atoi(e) : 0;   // 0 = linear, no branching
+            return e ? std::atoi(e) : 7;   // 0 = linear, no branching
         }();
         static const int32_t stub_max = []{
             const char * e = std::getenv("LLAMA_DFLASH_TREE_STUB");

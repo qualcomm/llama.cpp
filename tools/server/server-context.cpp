@@ -3978,7 +3978,15 @@ private:
                     int32_t cur = -1;                        // -1 = the root (slot.sampled)
                     int32_t idx = slot.spec_i_batch[0];
                     for (;;) {
-                        const llama_token id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, idx, true);
+                        // grammar_first must match the linear path, which reaches
+                        // common_sampler_sample() through common_sampler_sample_and_accept_n()
+                        // with the parameter left at its default of FALSE. Passing true here
+                        // applies the grammar BEFORE the sampling chain instead of using
+                        // grammar-based rejection sampling after it, so the two paths could
+                        // pick different tokens for the same logits once a grammar is active
+                        // -- which is exactly the tool-calling/JSON-schema traffic this tree
+                        // is meant to speed up. Inert without a grammar, wrong with one.
+                        const llama_token id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, idx, false);
                         // Accept unconditionally, exactly as the linear walk does: the
                         // divergent token is the target's own and joins the output, so the
                         // sampler state has to include it.
