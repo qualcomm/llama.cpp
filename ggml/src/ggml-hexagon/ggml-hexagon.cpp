@@ -64,7 +64,6 @@ using uintvec = std::vector<unsigned int>;
 using u32vec  = std::vector<uint32_t>;
 
 #define GGML_HEXAGON_MAX_SESSIONS          16
-#define GGML_HEXAGON_GRAPH_FLUSH_THRESHOLD 16
 
 #define GGML_HEXAGON_FENCE_BUFFER_SIZE     8192
 #define GGML_HEXAGON_FENCE_SLOT_SIZE       128
@@ -4381,10 +4380,6 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
     for (const auto & node : *nodes_ptr) {
         sess->enqueue_op(node);
     }
-
-    // Submit the current batch to the NPU asynchronously
-    // Coalesce tiny graphs to reduce dispatch overhead
-    sess->flush_batch(GGML_HEXAGON_GRAPH_FLUSH_THRESHOLD);
 
     return GGML_STATUS_SUCCESS;
 }
