@@ -10600,6 +10600,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // The SAME FFN weight in both orientations, so a kernel can be judged on M/K shape rather
+    // than on size. These are Qwen3.5/3.6/3.8-27B verbatim: ffn_down is M=5120 K=17408 and
+    // ffn_gate/ffn_up are M=17408 K=5120, identical element counts. On the Adreno cooperative-K
+    // kernel the low-M orientation measured 25% slower per call than the high-M one in a decode
+    // profile, which is invisible to a list that carries only one orientation of one size.
+    for (int bs : {2, 4, 5, 8}) {
+        for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_Q4_1}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32,  5120, bs, 17408, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 17408, bs,  5120, {1, 1}, {1, 1}));
+        }
+    }
+
     // qwen3-30b-a3b
     for (int bs : {1, 4, 8, 32, 64, 128, 256, 512}) {
         for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ2_XS}) {

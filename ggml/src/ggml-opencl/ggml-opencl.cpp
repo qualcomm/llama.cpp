@@ -1682,6 +1682,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemm_noshuffle_q4_0_f32;
     cl_kernel kernel_gemm_noshuffle_q4_0_f32_cok;  // cooperative-K small-batch GEMM (spec/MTP verify)
     cl_kernel kernel_gemm_noshuffle_q4_0_f32_cok_r4 = nullptr;  // same, 4 rows per lane
+    cl_kernel kernel_gemm_noshuffle_q4_0_f32_cok_r4_splitk = nullptr;  // ... K split across WGs too
     cl_kernel kernel_gemv_noshuffle_q4_0_f32;
     cl_kernel kernel_gemv_noshuffle_q4_0_f32_mc3;  // multi-column (N=3) verify GEMV (spec/MTP)
     cl_kernel kernel_gemv_noshuffle_q4_0_f32_mc3_splitk;  // ... with the K-split across WGs
@@ -4951,6 +4952,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         backend_ctx->kernel_gemm_noshuffle_q4_0_f32_cok_r4 =
             clCreateKernel(prog, "kernel_gemm_noshuffle_q4_0_f32_cok_r4", &err);
         if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q4_0_f32_cok_r4 = nullptr; }
+        backend_ctx->kernel_gemm_noshuffle_q4_0_f32_cok_r4_splitk =
+            clCreateKernel(prog, "kernel_gemm_noshuffle_q4_0_f32_cok_r4_splitk", &err);
+        if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q4_0_f32_cok_r4_splitk = nullptr; }
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
@@ -25702,19 +25706,88 @@ static void ggml_cl_mul_mat_q4_0_f32_adreno(ggml_backend_t backend, const ggml_t
                                  && ((q40_cok_r4_env == nullptr) || (atoi(q40_cok_r4_env) != 0))
                                  && backend_ctx->kernel_gemm_noshuffle_q4_0_f32_cok_r4 != nullptr;
 
-        kernel = use_q40_cok_r4 ? backend_ctx->kernel_gemm_noshuffle_q4_0_f32_cok_r4
-               : use_q40_cok    ? backend_ctx->kernel_gemm_noshuffle_q4_0_f32_cok
-                                : backend_ctx->kernel_gemm_noshuffle_q4_0_f32;
+        // Spread the cooperative-K split ACROSS workgroups when the row axis alone cannot
+        // fill the device. The r4 kernel launches exactly ne01/256 workgroups whatever COK_NSG
+        // is -- its split lives INSIDE a workgroup -- so a low-M shape runs a short tail on an
+        // idle device. The same FFN weight in both orientations, X2-90 (16 CUs), us/run:
+        //
+        //     n                    2       4       5       8
+        //     M=5120  K=17408   624.1   839.2   841.3   848.3   (20 workgroups)
+        //     M=17408 K=5120    486.1   661.5   664.5   675.0   (68 workgroups)
+        //
+        // Identical element counts and identical weight traffic; the 1.27x is 20 workgroups
+        // being 1.25 waves on 16 CUs. Same lever as the mc3 GEMV's split: more workgroups, not
+        // wider ones.
+        //
+        // 🔴 The target is NOT a workgroup COUNT, it is the TAIL. Picking ksplit to reach "about
+        // 3 per CU" gets the low-M shape most of the way and leaves the high-M one alone, but
+        // 68 workgroups is 4 full waves plus 4, i.e. a last wave using 4 of 16 CUs -- 85%, and
+        // worth another 7%. Measured, us/run at n=5 (ksplit pinned):
+        //
+        //     shape            base wg   eff    k=1     k=2     k=4
+        //     4096  x 14336      16     100%   363.0   368.9   387.2   <- splitting COSTS 6.7%
+        //     5120  x 17408      20    62.5%   841.3   649.2   590.4   <- -29.8%
+        //     17408 x  5120      68    85.0%   669.1   622.5   622.3   <- -7.0%
+        //
+        // So: choose the ksplit that maximises wg / (ceil(wg/CU) * CU), and prefer the SMALLER
+        // ksplit unless a larger one gains real occupancy -- the extra slices cost a partial
+        // write plus a reduce pass, both proportional to ksplit * M * n, which is exactly why
+        // an already-full shape (base 16) regresses when split. The 6-point margin reproduces
+        // every optimum above: base 16 -> 1, base 20 -> 4, base 68 -> 2.
+        // DEFAULT ON; GGML_OPENCL_Q40_COK_SPLITK=0 opts out, ..._K pins ksplit.
+        static const int q40_cok_splitk_env = []{
+            const char * e = getenv("GGML_OPENCL_Q40_COK_SPLITK"); return e ? atoi(e) : -1;
+        }();
+        static const int q40_cok_splitk_k = []{
+            const char * e = getenv("GGML_OPENCL_Q40_COK_SPLITK_K"); return e ? atoi(e) : 0;
+        }();
+        const int cok_base_wg = (int)(ne01 / 256);
+        int cok_ksplit = 1;
+        if (use_q40_cok_r4 && q40_cok_splitk_env != 0 && cok_base_wg > 0 &&
+            backend_ctx->kernel_gemm_noshuffle_q4_0_f32_cok_r4_splitk != nullptr) {
+            if (q40_cok_splitk_k > 0) {
+                cok_ksplit = q40_cok_splitk_k;
+            } else {
+                const int cu = backend_ctx->compute_units > 0 ? (int)backend_ctx->compute_units : 16;
+                float best_eff = -1.0f;
+                for (int kk = 1; kk <= 8; ++kk) {
+                    const int   wg    = cok_base_wg * kk;
+                    const int   waves = (wg + cu - 1) / cu;
+                    const float eff   = (float) wg / (float)(waves * cu);
+                    if (eff > best_eff + 0.06f) { best_eff = eff; cok_ksplit = kk; }
+                }
+            }
+            cok_ksplit = cok_ksplit < 1 ? 1 : (cok_ksplit > 8 ? 8 : cok_ksplit);
+            // at least one 32-block per slice, or a slice would be empty work
+            const int n_32blk = ne00 / 32;
+            if (cok_ksplit > n_32blk) { cok_ksplit = n_32blk > 0 ? n_32blk : 1; }
+        }
+        const bool use_q40_cok_splitk = (cok_ksplit > 1);
+
+        kernel = use_q40_cok_splitk ? backend_ctx->kernel_gemm_noshuffle_q4_0_f32_cok_r4_splitk
+               : use_q40_cok_r4     ? backend_ctx->kernel_gemm_noshuffle_q4_0_f32_cok_r4
+               : use_q40_cok        ? backend_ctx->kernel_gemm_noshuffle_q4_0_f32_cok
+                                    : backend_ctx->kernel_gemm_noshuffle_q4_0_f32;
         int padded_N = N + padding;
+
+        cl_mem cok_partial = nullptr;
+        if (use_q40_cok_splitk) {
+            backend_ctx->prealloc_splitk_partial.allocate(
+                backend_ctx->context, (size_t)cok_ksplit * (size_t)ne01 * (size_t)ne1 * sizeof(float));
+            cok_partial = backend_ctx->prealloc_splitk_partial.buffer;
+        }
 
         CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),   &extra0_q4_0->q));
         CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem),   &extra0_q4_0->d));
         CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem),   &b_img_trans));
-        CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_mem),   &d_sub_buf));
+        CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_mem),   use_q40_cok_splitk ? &cok_partial : &d_sub_buf));
         CL_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_int),   &ne01));
         CL_CHECK(clSetKernelArg(kernel, 5, sizeof(cl_int),   &padded_N));
         CL_CHECK(clSetKernelArg(kernel, 6, sizeof(cl_int),   &ne00));
         CL_CHECK(clSetKernelArg(kernel, 7, sizeof(cl_int),   &ne1));
+        if (use_q40_cok_splitk) {
+            CL_CHECK(clSetKernelArg(kernel, 8, sizeof(cl_int), &cok_ksplit));
+        }
 
         size_t global_work_size[3] = {(size_t)CEIL_DIV(ne1, 8), (size_t)CEIL_DIV(ne01, 4), 1};
         size_t local_work_size[3] = {1, 128, 1};
@@ -25723,7 +25796,7 @@ static void ggml_cl_mul_mat_q4_0_f32_adreno(ggml_backend_t backend, const ggml_t
             // across the COK_NSG subgroups.
             // The r4 variant gives each lane 4 rows, so the row axis shrinks 4x.
             global_work_size[0] = use_q40_cok_r4 ? (size_t)(ne01 / 4) : (size_t)ne01;
-            global_work_size[1] = 8;              // COK_NSG
+            global_work_size[1] = (size_t)(8 * cok_ksplit);   // COK_NSG x K slices
             global_work_size[2] = 1;
             local_work_size[0]  = 64;             // COK_SG
             local_work_size[1]  = 8;              // COK_NSG
@@ -25743,6 +25816,24 @@ static void ggml_cl_mul_mat_q4_0_f32_adreno(ggml_backend_t backend, const ggml_t
         }
 
         backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+
+        if (use_q40_cok_splitk) {
+            // Sum the per-slice partials. The output region is [ne1][ne01] with the same
+            // row-contiguous layout the non-split kernel writes, so the GEMV reduce is reused
+            // verbatim with ne01 = ne1 * ne01 and offsetd = 0 -- d_sub_buf is already the
+            // output's sub-region.
+            const cl_int   rows = (cl_int)(ne01 * ne1);
+            const cl_ulong zero = 0;
+            cl_kernel kr = backend_ctx->kernel_gemv_splitk_reduce_f32;
+            CL_CHECK(clSetKernelArg(kr, 0, sizeof(cl_mem),   &cok_partial));
+            CL_CHECK(clSetKernelArg(kr, 1, sizeof(cl_mem),   &d_sub_buf));
+            CL_CHECK(clSetKernelArg(kr, 2, sizeof(cl_ulong), &zero));
+            CL_CHECK(clSetKernelArg(kr, 3, sizeof(cl_int),   &rows));
+            CL_CHECK(clSetKernelArg(kr, 4, sizeof(cl_int),   &cok_ksplit));
+            size_t lr[3] = {64, 1, 1};
+            size_t gr[3] = {(size_t)CEIL_DIV(rows, 64) * 64, 1, 1};
+            backend_ctx->enqueue_ndrange_kernel(kr, 3, gr, lr, dst);
+        }
 
         CL_CHECK(clReleaseMemObject(b_sub_buf));
         CL_CHECK(clReleaseMemObject(b_sub_buf_trans));
