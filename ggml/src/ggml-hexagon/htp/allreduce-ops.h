@@ -20,7 +20,6 @@ enum htp_allreduce_kernel_type {
 struct htp_allreduce_kernel_params {
     int32_t rank;
     int32_t n_ranks;
-    int32_t seq;
     int32_t n_threads;
     int32_t block_elems;          // 1D: block_elems, 2D: block_rows
     int32_t elems_per_thread;     // 1D: nelem_per_thread, 2D: nrows_per_thread

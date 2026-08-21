@@ -257,7 +257,6 @@ int op_allreduce(struct htp_ops_context * octx) {
 
     const uint32_t rank    = (uint32_t) kparams->rank;
     const uint32_t n_ranks = (uint32_t) kparams->n_ranks;
-    const uint32_t seq     = (uint32_t) kparams->seq;
 
     if (n_ranks < 2 || n_ranks > HTP_ALLREDUCE_MAX_RANKS || rank >= n_ranks) {
         return HTP_STATUS_INVAL_PARAMS;
@@ -279,7 +278,9 @@ int op_allreduce(struct htp_ops_context * octx) {
     const struct htp_tensor * my_sync = octx->src[n_ranks + rank];
     atomic_uint * my_fence = (atomic_uint *) my_sync->data;
     Q6_dccleaninva_A((void *) my_fence);
-    atomic_store(my_fence, seq);
+    const uint32_t fence_seq = atomic_load(&my_fence[1]);
+
+    atomic_store(&my_fence[0], fence_seq);
     asm volatile ("syncht" : : : "memory");
     Q6_dccleaninva_A((void *) my_fence);
 
@@ -291,11 +292,11 @@ int op_allreduce(struct htp_ops_context * octx) {
         while (1) {
             Q6_dccleaninva_A((void *) peer_fence);
             asm volatile ("syncht" : : : "memory");
-            if (atomic_load(peer_fence) == seq) {
+            if (atomic_load(&peer_fence[0]) == fence_seq) {
                 break;
             }
             if (++spins > HTP_FENCE_TIMEOUT) {
-                FARF(ERROR, "ggml-hex: allreduce sync-wait TIMEOUT: rank %u waiting on %u (fence %p seq %u)\n", rank, j, peer_fence, seq);
+                FARF(ERROR, "ggml-hex: allreduce fence-wait TIMEOUT: rank %u waiting on %u (fence %p seq %u)\n", rank, j, peer_fence, fence_seq);
                 return HTP_STATUS_INTERNAL_ERR;
             }
             hex_pause();

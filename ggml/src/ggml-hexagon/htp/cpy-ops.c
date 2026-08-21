@@ -336,13 +336,13 @@ int op_cpy(struct htp_ops_context * octx) {
             qurt_mem_cache_clean((qurt_addr_t) 0, 0, QURT_MEM_CACHE_FLUSH_INVALIDATE_ALL, QURT_MEM_DCACHE);
         }
 
-        atomic_uint* sync_fence = (atomic_uint *)sync->data;
+        atomic_uint * sync_fence = (atomic_uint *) sync->data;
 
-        Q6_dccleaninva_A((void *)sync_fence);
-        uint32_t seq = ((uint32_t *)sync_fence)[1];
-        atomic_store(sync_fence, seq);
+        Q6_dccleaninva_A((void *) sync_fence);
+        uint32_t seq = atomic_load(&sync_fence[1]);
+        atomic_store(&sync_fence[0], seq);
         asm volatile ("syncht" : : : "memory");
-        Q6_dccleaninva_A((void *)sync_fence);
+        Q6_dccleaninva_A((void *) sync_fence);
 
         FARF(HIGH, "ggml-hex: sync-release : fence %p seq %u\n", sync_fence, seq);
     }

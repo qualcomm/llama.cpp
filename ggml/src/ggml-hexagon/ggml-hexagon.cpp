@@ -348,7 +348,7 @@ struct ggml_hexagon_session {
     uint64_t vtcm_size   = 0;
     size_t   max_vmem    = 0;
     size_t   max_bufsize = 0;
-    uint32_t sync_seq;
+    uint32_t fence_seq;
 
     uint64_t                cached_uid = 0;
     std::vector<htp_opnode> cached_nodes;
@@ -366,7 +366,7 @@ struct ggml_hexagon_session {
     void enqueue_op(const htp_opnode & node);
     void enqueue_cpy(const ggml_tensor * src, ggml_tensor * dst, const ggml_tensor * sync_tensor = nullptr);
     void enqueue_fence(const ggml_tensor * sync_tensor);
-    void enqueue_allreduce(const ggml_tensor * dst, const std::vector<const ggml_tensor *> & src_tensors, const std::vector<const ggml_tensor *> & sync_tensors, uint32_t rank, uint32_t n_ranks, uint32_t seq);
+    void enqueue_allreduce(const ggml_tensor * dst, const std::vector<const ggml_tensor *> & src_tensors, const std::vector<const ggml_tensor *> & sync_tensors, uint32_t rank, uint32_t n_ranks);
 
     void flush(bool all = true);
     void flush_pending(bool all = false);
@@ -2051,13 +2051,11 @@ static void ggml_hexagon_precompute_allreduce_params(
     const struct ggml_tensor * dst,
     uint32_t rank,
     uint32_t n_ranks,
-    uint32_t seq,
     struct htp_allreduce_kernel_params * kparams
 ) {
     memset(kparams, 0, sizeof(*kparams));
     kparams->rank    = (int32_t) rank;
     kparams->n_ranks = (int32_t) n_ranks;
-    kparams->seq     = (int32_t) seq;
 
     const uint32_t nelem     = (uint32_t) ggml_nelements(dst);
     const uint32_t elem_size = (dst->type == GGML_TYPE_F16) ? sizeof(ggml_fp16_t) : sizeof(float);
@@ -2118,8 +2116,7 @@ void ggml_hexagon_session::enqueue_allreduce(
     const std::vector<const ggml_tensor *> & src_tensors,
     const std::vector<const ggml_tensor *> & sync_tensors,
     uint32_t rank,
-    uint32_t n_ranks,
-    uint32_t seq
+    uint32_t n_ranks
 ) {
     htp_opnode ar_node(HTP_OP_ALLREDUCE);
 
@@ -2140,7 +2137,7 @@ void ggml_hexagon_session::enqueue_allreduce(
     ar_node.outputs.push_back(node);
 
     ggml_hexagon_precompute_allreduce_params(
-        this, dst, rank, n_ranks, seq,
+        this, dst, rank, n_ranks,
         (struct htp_allreduce_kernel_params *) ar_node.kernel_params
     );
 
@@ -2461,7 +2458,7 @@ ggml_hexagon_session::ggml_hexagon_session(int dev_id, ggml_backend_dev_t dev) n
 
     op_batch = nullptr;
     op_queue = nullptr;
-    sync_seq = ((uintptr_t)this) & 0xFFFF;
+    fence_seq = ((uintptr_t)this) & 0xFFFF;
 
     try {
         allocate(dev_id);
@@ -4527,44 +4524,44 @@ static bool ggml_hexagon_cpy_tensor_async_phys(ggml_backend_t backend_src, ggml_
     auto sess_dst = static_cast<ggml_hexagon_session *>(backend_dst->context);
     auto sbuf_dst = (ggml_hexagon_shared_buffer *) dst->buffer->context;
 
-    uint32_t sync_seq = sess_dst->sync_seq++;
-    volatile uint32_t* sync_fence;
+    uint32_t fence_seq = sess_dst->fence_seq++;
+    volatile uint32_t * fence;
 
     HEX_VERBOSE("ggml-hex: %s cpy-tensor-async %s -> %s size %zu : seq %u\n",
-                sess_dst->name.c_str(), src->name, dst->name, ggml_nbytes(src), sync_seq);
+                sess_dst->name.c_str(), src->name, dst->name, ggml_nbytes(src), fence_seq);
 
     while (1) {
-        sync_fence = (volatile uint32_t*)sbuf_dst->alloc_fence();
-        if (sync_fence) break;
+        fence = (volatile uint32_t *) sbuf_dst->alloc_fence();
+        if (fence) break;
 
-        // out of sync fence slots; flush both sessions to release old fences
+        // out of fence slots; flush both sessions to release old fences
         sess_src->flush(false);
         sess_dst->flush(false);
     }
 
-    sync_fence[0] = 0;
-    sync_fence[1] = sync_seq;
+    fence[0] = 0;
+    fence[1] = fence_seq;
 
     // dummy extra (must be static)
-    static ggml_hexagon_tensor_extra sync_extra { {}, GGML_HEXAGON_TENSOR_WEIGHT };
+    static ggml_hexagon_tensor_extra fence_extra { {}, GGML_HEXAGON_TENSOR_WEIGHT };
 
-    ggml_tensor sync_tensor {};
-    sync_tensor.buffer = dst->buffer;
-    sync_tensor.extra  = &sync_extra;
-    sync_tensor.data   = (void*) sync_fence;
-    sync_tensor.type   = GGML_TYPE_I32;
-    sync_tensor.ne[0]  = 1;
-    sync_tensor.ne[1]  = 1;
-    sync_tensor.ne[2]  = 1;
-    sync_tensor.ne[3]  = 1;
-    sync_tensor.nb[0]  = sizeof(int32_t);
-    sync_tensor.nb[1]  = sizeof(int32_t);
-    sync_tensor.nb[2]  = sizeof(int32_t);
-    sync_tensor.nb[3]  = sizeof(int32_t);
-    sync_tensor.op     = GGML_OP_NONE;
+    ggml_tensor fence_tensor {};
+    fence_tensor.buffer = dst->buffer;
+    fence_tensor.extra  = &fence_extra;
+    fence_tensor.data   = (void *) fence;
+    fence_tensor.type   = GGML_TYPE_I32;
+    fence_tensor.ne[0]  = 1;
+    fence_tensor.ne[1]  = 1;
+    fence_tensor.ne[2]  = 1;
+    fence_tensor.ne[3]  = 1;
+    fence_tensor.nb[0]  = sizeof(int32_t);
+    fence_tensor.nb[1]  = sizeof(int32_t);
+    fence_tensor.nb[2]  = sizeof(int32_t);
+    fence_tensor.nb[3]  = sizeof(int32_t);
+    fence_tensor.op     = GGML_OP_NONE;
 
-    sess_src->enqueue_cpy(src, dst, &sync_tensor);
-    sess_dst->enqueue_fence(&sync_tensor);
+    sess_src->enqueue_cpy(src, dst, &fence_tensor);
+    sess_dst->enqueue_fence(&fence_tensor);
 
     sess_dst->add_sync_peer(sess_src);
 
@@ -5148,6 +5145,7 @@ static ggml_backend_dev_t ggml_backend_hexagon_reg_get_device(ggml_backend_reg_t
 struct ggml_backend_hexagon_comm_context {
     std::vector<ggml_backend_t> backends;
     size_t                      n_backends;
+    uint32_t                    fence_seq;
 };
 
 static void * ggml_backend_hexagon_comm_init(ggml_backend_t * backends, size_t n_backends) {
@@ -5164,6 +5162,7 @@ static void * ggml_backend_hexagon_comm_init(ggml_backend_t * backends, size_t n
     auto * ctx = new ggml_backend_hexagon_comm_context();
     ctx->backends.assign(backends, backends + n_backends);
     ctx->n_backends = n_backends;
+    ctx->fence_seq  = ((uintptr_t) ctx) & 0xFFFF;
 
     for (size_t i = 0; i < n_backends; i++) {
         auto sess_i = static_cast<ggml_hexagon_session *>(backends[i]->context);
@@ -5208,53 +5207,52 @@ static bool ggml_backend_hexagon_comm_allreduce_tensor(void * comm_ctx_v, struct
         return false;
     }
 
-    auto sess0 = static_cast<ggml_hexagon_session *>(comm_ctx->backends[0]->context);
-    uint32_t sync_seq = ++sess0->sync_seq;
+    uint32_t fence_seq = comm_ctx->fence_seq++;
 
-    volatile uint32_t * sync_fences[GGML_HEXAGON_MAX_SESSIONS];
+    volatile uint32_t * fences[GGML_HEXAGON_MAX_SESSIONS];
     for (size_t i = 0; i < n_backends; i++) {
         auto sbuf = (ggml_hexagon_shared_buffer *) tensors[i]->buffer->context;
         while (1) {
-            sync_fences[i] = (volatile uint32_t *) sbuf->alloc_fence();
-            if (sync_fences[i]) break;
+            fences[i] = (volatile uint32_t *) sbuf->alloc_fence();
+            if (fences[i]) break;
 
             for (size_t j = 0; j < n_backends; j++) {
                 static_cast<ggml_hexagon_session *>(comm_ctx->backends[j]->context)->flush(false);
             }
         }
-        sync_fences[i][0] = 0;
-        sync_fences[i][1] = sync_seq;
+        fences[i][0] = 0;
+        fences[i][1] = fence_seq;
     }
 
-    static ggml_hexagon_tensor_extra sync_extra { {}, GGML_HEXAGON_TENSOR_WEIGHT };
-    ggml_tensor sync_tensors[GGML_HEXAGON_MAX_SESSIONS];
+    static ggml_hexagon_tensor_extra fence_extra { {}, GGML_HEXAGON_TENSOR_WEIGHT };
+    ggml_tensor fence_tensors[GGML_HEXAGON_MAX_SESSIONS];
     for (size_t i = 0; i < n_backends; i++) {
-        sync_tensors[i] = {};
-        sync_tensors[i].buffer = tensors[i]->buffer;
-        sync_tensors[i].extra  = &sync_extra;
-        sync_tensors[i].data   = (void *) sync_fences[i];
-        sync_tensors[i].type   = GGML_TYPE_I32;
-        sync_tensors[i].ne[0]  = 1;
-        sync_tensors[i].ne[1]  = 1;
-        sync_tensors[i].ne[2]  = 1;
-        sync_tensors[i].ne[3]  = 1;
-        sync_tensors[i].nb[0]  = sizeof(int32_t);
-        sync_tensors[i].nb[1]  = sizeof(int32_t);
-        sync_tensors[i].nb[2]  = sizeof(int32_t);
-        sync_tensors[i].nb[3]  = sizeof(int32_t);
-        sync_tensors[i].op     = GGML_OP_NONE;
+        fence_tensors[i] = {};
+        fence_tensors[i].buffer = tensors[i]->buffer;
+        fence_tensors[i].extra  = &fence_extra;
+        fence_tensors[i].data   = (void *) fences[i];
+        fence_tensors[i].type   = GGML_TYPE_I32;
+        fence_tensors[i].ne[0]  = 1;
+        fence_tensors[i].ne[1]  = 1;
+        fence_tensors[i].ne[2]  = 1;
+        fence_tensors[i].ne[3]  = 1;
+        fence_tensors[i].nb[0]  = sizeof(int32_t);
+        fence_tensors[i].nb[1]  = sizeof(int32_t);
+        fence_tensors[i].nb[2]  = sizeof(int32_t);
+        fence_tensors[i].nb[3]  = sizeof(int32_t);
+        fence_tensors[i].op     = GGML_OP_NONE;
     }
 
     std::vector<const ggml_tensor *> data_tensors(n_backends);
-    std::vector<const ggml_tensor *> fence_tensors(n_backends);
+    std::vector<const ggml_tensor *> sync_tensors(n_backends);
     for (size_t i = 0; i < n_backends; i++) {
-        data_tensors[i]  = tensors[i];
-        fence_tensors[i] = &sync_tensors[i];
+        data_tensors[i] = tensors[i];
+        sync_tensors[i] = &fence_tensors[i];
     }
 
     for (size_t r = 0; r < n_backends; r++) {
         auto sess = static_cast<ggml_hexagon_session *>(comm_ctx->backends[r]->context);
-        sess->enqueue_allreduce(tensors[r], data_tensors, fence_tensors, (uint32_t) r, (uint32_t) n_backends, sync_seq);
+        sess->enqueue_allreduce(tensors[r], data_tensors, sync_tensors, (uint32_t) r, (uint32_t) n_backends);
         sess->flush_batch();
     }
 

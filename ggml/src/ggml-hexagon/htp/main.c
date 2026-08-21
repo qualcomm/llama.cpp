@@ -714,15 +714,15 @@ static int op_fence(struct htp_ops_context * octx) {
     htp_trace_event_start(tr, HTP_TRACE_EVT_FENCE, 0);
 
     const struct htp_tensor * sync = octx->src[0];
-    atomic_uint* sync_fence = (atomic_uint *)sync->data;
+    atomic_uint * sync_fence = (atomic_uint *) sync->data;
 
-    Q6_dccleaninva_A((void *)sync_fence);
-    uint32_t seq   = sync_fence[1];
+    Q6_dccleaninva_A((void *) sync_fence);
+    uint32_t seq   = atomic_load(&sync_fence[1]);
     uint64_t spins = 0;
     while (1) {
-        Q6_dccleaninva_A((void *)sync_fence);
+        Q6_dccleaninva_A((void *) sync_fence);
         asm volatile ("syncht" : : : "memory");
-        if (atomic_load(sync_fence) == seq) {
+        if (atomic_load(&sync_fence[0]) == seq) {
             break;
         }
         if (++spins > HTP_FENCE_TIMEOUT) {
