@@ -354,3 +354,122 @@ kernel void kernel_gemm_noshuffle_q4_1_f32_cok_r4(
         if (idx < m*n_no_padding) { vstore4((float4)(out[0].s7, out[1].s7, out[2].s7, out[3].s7), 0, dst + idx); }
     }
 }
+
+// q4_1 twin of kernel_gemm_noshuffle_q4_0_f32_cok_r4_splitk: the K split spread ACROSS
+// workgroups as well as inside one.
+//
+// The r4 kernel launches exactly ne01/256 workgroups whatever COK_NSG is, so a low-M shape
+// leaves most of the device idle in its tail. That is precisely the shape q4_1 appears in: the
+// tensors an otherwise-q4_0 quantisation promotes to q4_1 are ffn_down, which is the low-M
+// orientation (Qwen3.5/3.6/3.8-27B: M=5120, K=17408, i.e. 20 workgroups on a 16-CU part).
+// Measured on Adreno X2-90 before this kernel, the same weight in both orientations:
+// q4_1 M=5120 806-830 us against M=17408 636-649 us, the same 1.27x the q4_0 kernel showed.
+//
+// Each of the ksplit workgroup-rows owns a contiguous slice of the 32-element blocks and
+// writes a per-slice partial; kernel_gemv_splitk_reduce_f32 sums the slices. A slice whose
+// range is empty still writes its zeroed accumulator -- the reduce sums every slice
+// unconditionally, so a skipped write would leave whatever the scratch buffer held.
+REQD_SUBGROUP_SIZE_64
+kernel void kernel_gemm_noshuffle_q4_1_f32_cok_r4_splitk(
+        global const ushort * src0_q,
+        global const half   * src0_d,
+        global const half   * src0_m,
+        read_only image1d_buffer_t src1,
+        global float * partial,          // [ksplit][n_no_padding][m]
+        ulong offsetd,                   // always 0 here; kept so the arg order matches the
+                                         // non-split kernel and the host swaps one buffer
+        int m,
+        int n,
+        int k,
+        int n_no_padding,
+        int ksplit
+) {
+    partial = (global float *)((global char *)partial + offsetd);
+
+    int n_4  = n >> 2;
+    int gx   = get_global_id(0);     // 4-row group
+    int sg   = get_local_id(1);
+    int lane = get_local_id(0);
+    int ks   = get_group_id(1);      // which K slice
+
+    int row0 = gx << 2;
+    int num_32blk = k / 32;
+
+    int chunk   = (num_32blk + ksplit - 1) / ksplit;
+    int blk_beg = ks * chunk;
+    int blk_end = min(blk_beg + chunk, num_32blk);
+
+    half8 acc0 = 0, acc1 = 0, acc2 = 0, acc3 = 0;
+    half8 B;
+
+    for (int blk = blk_beg + sg; blk < blk_end; blk += COK_NSG) {
+        int i = blk << 5;
+
+        half4 scale = vload4(0, src0_d + row0 + blk * m);
+        half4 minv  = vload4(0, src0_m + row0 + blk * m);
+
+        for (int l = 0; l < 32; l += 4) {
+            int ki = i + l;
+            ushort4 bits = vload4(0, src0_q + row0 + (ki >> 2) * m);
+
+            B.s0123 = read_imageh(src1,     (ki+0) * n_4);
+            B.s4567 = read_imageh(src1, 1 + (ki+0) * n_4);
+            acc0 += B * (half)(( bits.s0        & 0x000F) * scale.s0 + minv.s0);
+            acc1 += B * (half)(( bits.s1        & 0x000F) * scale.s1 + minv.s1);
+            acc2 += B * (half)(( bits.s2        & 0x000F) * scale.s2 + minv.s2);
+            acc3 += B * (half)(( bits.s3        & 0x000F) * scale.s3 + minv.s3);
+
+            B.s0123 = read_imageh(src1,     (ki+1) * n_4);
+            B.s4567 = read_imageh(src1, 1 + (ki+1) * n_4);
+            acc0 += B * (half)((((bits.s0 & 0x00F0) >> 4)) * scale.s0 + minv.s0);
+            acc1 += B * (half)((((bits.s1 & 0x00F0) >> 4)) * scale.s1 + minv.s1);
+            acc2 += B * (half)((((bits.s2 & 0x00F0) >> 4)) * scale.s2 + minv.s2);
+            acc3 += B * (half)((((bits.s3 & 0x00F0) >> 4)) * scale.s3 + minv.s3);
+
+            B.s0123 = read_imageh(src1,     (ki+2) * n_4);
+            B.s4567 = read_imageh(src1, 1 + (ki+2) * n_4);
+            acc0 += B * (half)((((bits.s0 & 0x0F00) >> 8)) * scale.s0 + minv.s0);
+            acc1 += B * (half)((((bits.s1 & 0x0F00) >> 8)) * scale.s1 + minv.s1);
+            acc2 += B * (half)((((bits.s2 & 0x0F00) >> 8)) * scale.s2 + minv.s2);
+            acc3 += B * (half)((((bits.s3 & 0x0F00) >> 8)) * scale.s3 + minv.s3);
+
+            B.s0123 = read_imageh(src1,     (ki+3) * n_4);
+            B.s4567 = read_imageh(src1, 1 + (ki+3) * n_4);
+            acc0 += B * (half)((((bits.s0 & 0xF000) >> 12)) * scale.s0 + minv.s0);
+            acc1 += B * (half)((((bits.s1 & 0xF000) >> 12)) * scale.s1 + minv.s1);
+            acc2 += B * (half)((((bits.s2 & 0xF000) >> 12)) * scale.s2 + minv.s2);
+            acc3 += B * (half)((((bits.s3 & 0xF000) >> 12)) * scale.s3 + minv.s3);
+        }
+    }
+
+    local float8 reduceLM[COK_SG * (COK_NSG - 1)];
+    float8 out[4];
+    for (int r = 0; r < 4; r++) {
+        half8 acc = (r == 0) ? acc0 : (r == 1) ? acc1 : (r == 2) ? acc2 : acc3;
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (sg > 0) {
+            reduceLM[(sg - 1) * COK_SG + lane] = convert_float8(acc);
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (sg == 0) {
+            float8 sum = convert_float8(acc);
+            for (int s = 0; s < COK_NSG - 1; s++) {
+                sum += reduceLM[s * COK_SG + lane];
+            }
+            out[r] = sum;
+        }
+    }
+
+    if (sg == 0) {
+        global float * p = partial + (size_t)ks * (size_t)m * (size_t)n_no_padding;
+        int idx = row0;
+        if (idx < m*n_no_padding) { vstore4((float4)(out[0].s0, out[1].s0, out[2].s0, out[3].s0), 0, p + idx); idx += m; }
+        if (idx < m*n_no_padding) { vstore4((float4)(out[0].s1, out[1].s1, out[2].s1, out[3].s1), 0, p + idx); idx += m; }
+        if (idx < m*n_no_padding) { vstore4((float4)(out[0].s2, out[1].s2, out[2].s2, out[3].s2), 0, p + idx); idx += m; }
+        if (idx < m*n_no_padding) { vstore4((float4)(out[0].s3, out[1].s3, out[2].s3, out[3].s3), 0, p + idx); idx += m; }
+        if (idx < m*n_no_padding) { vstore4((float4)(out[0].s4, out[1].s4, out[2].s4, out[3].s4), 0, p + idx); idx += m; }
+        if (idx < m*n_no_padding) { vstore4((float4)(out[0].s5, out[1].s5, out[2].s5, out[3].s5), 0, p + idx); idx += m; }
+        if (idx < m*n_no_padding) { vstore4((float4)(out[0].s6, out[1].s6, out[2].s6, out[3].s6), 0, p + idx); idx += m; }
+        if (idx < m*n_no_padding) { vstore4((float4)(out[0].s7, out[1].s7, out[2].s7, out[3].s7), 0, p + idx); }
+    }
+}
