@@ -1718,6 +1718,8 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemv_noshuffle_q4_1_f32;
     cl_kernel kernel_gemv_noshuffle_q4_1_f32_mc3;  // multi-column (N=3) verify GEMV (spec/MTP)
     cl_kernel kernel_gemm_noshuffle_q4_1_f32;
+    cl_kernel kernel_gemm_noshuffle_q4_1_f32_cok    = nullptr;  // cooperative-K, ne1 in [2..8]
+    cl_kernel kernel_gemm_noshuffle_q4_1_f32_cok_r4 = nullptr;  // same, 4 rows per lane
     cl_kernel kernel_gemm_noshuffle_q8_0_f32, kernel_gemm_noshuffle_q8_0_f32_bin;
     cl_kernel kernel_gemm_noshuffle_q8_0_f32_cok = nullptr;  // cooperative-K, ne1 in [2..8]
     cl_kernel kernel_gemm_noshuffle_q8_0_q8_1_dp4a = nullptr;  // dp4a (int8) dense q8_0 prefill GEMM (opt-in)
@@ -5083,6 +5085,14 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_1_f32 = clCreateKernel(prog, "kernel_gemm_noshuffle_q4_1_f32", &err), err));
+        // Non-fatal: a compiler that rejects these must fall back, not abort. The q6_K r4
+        // kernel once failed to build on Adreno 850 and took its whole program down with it.
+        backend_ctx->kernel_gemm_noshuffle_q4_1_f32_cok =
+            clCreateKernel(prog, "kernel_gemm_noshuffle_q4_1_f32_cok", &err);
+        if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q4_1_f32_cok = nullptr; }
+        backend_ctx->kernel_gemm_noshuffle_q4_1_f32_cok_r4 =
+            clCreateKernel(prog, "kernel_gemm_noshuffle_q4_1_f32_cok_r4", &err);
+        if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q4_1_f32_cok_r4 = nullptr; }
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
@@ -26078,7 +26088,36 @@ static void ggml_cl_mul_mat_q4_1_f32_adreno(ggml_backend_t backend, const ggml_t
         backend_ctx->enqueue_ndrange_kernel(kernel, 2, global_work_size_t, local_work_size_t, dst);
 
         // gemm
-        kernel = backend_ctx->kernel_gemm_noshuffle_q4_1_f32;
+        // Cooperative-K (intra-WG K-split + reduction) for the small-batch (n_q in [2..8])
+        // path -- the q4_1 twin of the q4_0 gate. DEFAULT ON, opt out with
+        // GGML_OPENCL_Q41_GEMM_COK=0.
+        //
+        // Without it q4_1 has NO kernel for that band at all: its mc3 GEMV covers 2..4 but is
+        // opt-in and measured as a regression when defaulted on, and the dense dp4a path needs
+        // N > 8, so the whole band fell through to the tiled GEMM above. That matters well
+        // beyond q4_1-labelled files: llama.cpp promotes some ffn_down tensors to q4_1 inside
+        // an otherwise q4_0 quantisation, so a "Q4_0" model carries a handful of them on the
+        // slow path. On Qwen3.8-27B-Q4_0 the eight such tensors are 2.8% of the weights and
+        // were 8.1% of decode GPU time.
+        //
+        // Requires ne01 % 64 == 0 (one row per lane, 64 lanes/WG) and ne00 % 32 == 0.
+        static const char * q41_cok_env = getenv("GGML_OPENCL_Q41_GEMM_COK");
+        static const bool   q41_gemm_cok = (q41_cok_env == nullptr) || (atoi(q41_cok_env) != 0);
+        const bool use_q41_cok = q41_gemm_cok && (ne1 <= 8) && (ne01 % 64 == 0) && (ne00 % 32 == 0)
+                              && backend_ctx->kernel_gemm_noshuffle_q4_1_f32_cok != nullptr;
+
+        // 4 output rows per lane: the 1-row kernel loads 2 bytes per lane per 4 K-values where
+        // a GEMV loads 16, so it is issue bound. Four adjacent rows vector-load as one 8-byte
+        // read and share the activation vector.
+        // DEFAULT ON; opt out with GGML_OPENCL_Q41_GEMM_COK_R4=0.
+        static const char * q41_cok_r4_env = getenv("GGML_OPENCL_Q41_GEMM_COK_R4");
+        const bool use_q41_cok_r4 = use_q41_cok
+                                 && ((q41_cok_r4_env == nullptr) || (atoi(q41_cok_r4_env) != 0))
+                                 && backend_ctx->kernel_gemm_noshuffle_q4_1_f32_cok_r4 != nullptr;
+
+        kernel = use_q41_cok_r4 ? backend_ctx->kernel_gemm_noshuffle_q4_1_f32_cok_r4
+               : use_q41_cok    ? backend_ctx->kernel_gemm_noshuffle_q4_1_f32_cok
+                                : backend_ctx->kernel_gemm_noshuffle_q4_1_f32;
         int padded_N = N + padding;
 
         CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),   &extra0_q4_1->q));
@@ -26094,6 +26133,17 @@ static void ggml_cl_mul_mat_q4_1_f32_adreno(ggml_backend_t backend, const ggml_t
 
         size_t global_work_size[3] = {(size_t)CEIL_DIV(ne1, 8), (size_t)CEIL_DIV(ne01, 4), 1};
         size_t local_work_size[3] = {1, 128, 1};
+        if (use_q41_cok) {
+            // (COK_SG lanes x COK_NSG subgroups): one row per lane, K split across the
+            // COK_NSG subgroups. The r4 variant gives each lane 4 rows, so the row axis
+            // shrinks 4x.
+            global_work_size[0] = use_q41_cok_r4 ? (size_t)(ne01 / 4) : (size_t)ne01;
+            global_work_size[1] = 8;              // COK_NSG
+            global_work_size[2] = 1;
+            local_work_size[0]  = 64;             // COK_SG
+            local_work_size[1]  = 8;              // COK_NSG
+            local_work_size[2]  = 1;
+        }
 
         backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
 
