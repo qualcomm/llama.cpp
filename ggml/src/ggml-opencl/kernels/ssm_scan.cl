@@ -105,7 +105,8 @@ kernel void SSM_KNAME(
     ulong B_nb2,  ulong B_nb3,
     ulong C_nb2,  ulong C_nb3,
     ulong s_off_bytes,
-    int   head_dim, int n_head, int n_group, int n_tokens
+    int   head_dim, int n_head, int n_group, int n_tokens,
+    int   K,        int n_seqs
 ) {
     const int d_state = 128;
 
@@ -186,6 +187,24 @@ kernel void SSM_KNAME(
                 y_seq[(ulong)t * y_dim_total + (ulong)head_id * head_dim + dim_id + r] = sum;
             }
         }
+
+        // Rollback snapshots. Slot 0 is the final state, written after the loop;
+        // slots 1..K-1 hold the state as it stood after each of the last K-1
+        // tokens, so a speculative verify can rewind when a drafted token is
+        // rejected. `slot` counts back from the last token, matching the CUDA
+        // reference. K == 1 (every non-speculative graph) leaves this dead.
+        const int slot = n_tokens - 1 - t;
+        if (slot > 0 && slot < K) {
+            global float * snap = (global float *)(dst_base + s_off_bytes
+                + ((ulong)slot * (ulong)n_seqs + (ulong)seq_id) * s0_nb3
+                + (ulong)head_id * s0_nb2
+                + (ulong)dim_id * d_state * sizeof(float));
+            #pragma unroll
+            for (int r = 0; r < SSM_R; ++r) {
+                snap[(ulong)r * d_state + tid]      = state0[r];
+                snap[(ulong)r * d_state + tid + 64] = state1[r];
+            }
+        }
     }
 
     #pragma unroll
@@ -215,7 +234,8 @@ kernel void kernel_ssm_scan_f32_mamba2_d256(
     ulong B_nb2,  ulong B_nb3,
     ulong C_nb2,  ulong C_nb3,
     ulong s_off_bytes,
-    int   head_dim, int n_head, int n_group, int n_tokens
+    int   head_dim, int n_head, int n_group, int n_tokens,
+    int   K,        int n_seqs
 ) {
     const int d_state = 256;
 
@@ -290,6 +310,19 @@ kernel void kernel_ssm_scan_f32_mamba2_d256(
         const float sum = sub_group_reduce_add(partial);
         if (tid == 0) {
             y_seq[(ulong)t * y_dim_total + (ulong)head_id * head_dim + dim_id] = sum;
+        }
+
+        // Rollback snapshots -- see the d128 kernel above.
+        const int slot = n_tokens - 1 - t;
+        if (slot > 0 && slot < K) {
+            global float * snap = (global float *)(dst_base + s_off_bytes
+                + ((ulong)slot * (ulong)n_seqs + (ulong)seq_id) * s0_nb3
+                + (ulong)head_id * s0_nb2
+                + (ulong)dim_id * d_state * sizeof(float));
+            snap[tid]       = state0;
+            snap[tid + 64]  = state1;
+            snap[tid + 128] = state2;
+            snap[tid + 192] = state3;
         }
     }
 

@@ -12818,16 +12818,29 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
             }
             if (op->type != GGML_TYPE_F32) return false;
             // Rollback snapshots (ggml_ssm_scan's K argument) ask the op to emit K
-            // intermediate copies of the state, not just the final one. The fused
-            // kernel writes the final state only, so it silently produced wrong
-            // results for K > 1 -- SSM_SCAN went 6/6 to 6/8 on the Adreno 840 when
-            // the K=3/K=4 cases arrived upstream, at ERR 1.13 rather than a
-            // tolerance miss. K IS in op_params: ggml_ssm_scan does
-            // ggml_set_op_params_i32(result, 0, K), so read it rather than
-            // reconstructing it from the destination length. An earlier comment here
-            // claimed the opposite and derived K from shapes; that reconstruction was
-            // fragile and is not what the reviewed carve (hq/ssm-scan-r0730) does.
-            if (ggml_get_op_params_i32(op, 0) != 1) return false;
+            // intermediate copies of the state, not just the final one. The kernel
+            // writes slots 1..K-1 inside its token loop, so any K >= 1 is served.
+            // K IS in op_params: ggml_ssm_scan does ggml_set_op_params_i32(result, 0, K),
+            // so read it rather than reconstructing it from the destination length.
+            // Speculative decoding on a hybrid model is the only producer of K > 1
+            // (K = n_rs_seq + 1); before the kernel emitted them, every verify batch
+            // fell back to the CPU for each SSM layer, which cost 35.6% of decode
+            // throughput on the X2-90 and was invisible to the GPU profile.
+            const int K = ggml_get_op_params_i32(op, 0);
+            if (K < 1) return false;
+
+            // Snapshots cover only the last K-1 tokens, which is the regime a speculative
+            // verify runs in: the draft is at most n_max tokens and K = n_max + 1, so the
+            // batch is never wider than K. Wider batches -- a prefill ubatch under an armed
+            // drafter -- are held back to the CPU because the Adreno compiler miscompiles the
+            // snapshot store for some of them: K=3 with 8 tokens aborts the process, while
+            // the same code at K=3/512 tokens and K=4/4 tokens is fine, and storing a
+            // constant to the identical addresses is fine. Those batches already ran on the
+            // CPU before this kernel emitted snapshots, so the restriction costs nothing
+            // against the previous behaviour; lifting it is worth about 3.7% of prefill in a
+            // speculative server, once that miscompile is understood.
+            const int n_tokens = (int) op->src[1]->ne[2];
+            if (K > 1 && n_tokens > K) return false;
 
             const int d_state = (int) op->src[0]->ne[0];
             const bool is_mamba2 = (op->src[3]->ne[0] == 1);
@@ -18342,6 +18355,14 @@ static void ggml_cl_ssm_scan(ggml_backend_t backend, ggml_tensor * dst) {
     const int n_tokens = (int) src1->ne[2];
     const int n_seqs   = (int) src1->ne[3];
 
+    // Rollback snapshots: the op is asked for K state copies, not just the final
+    // one. K > 1 comes from speculative decoding (K = n_rs_seq + 1), where a
+    // rejected draft token has to rewind the recurrent state.
+    const int K_param = ggml_get_op_params_i32(dst, 0);
+    const int K       = K_param > 0 ? K_param : 1;
+    GGML_ASSERT((cl_long) ggml_nelements(src1) +
+                (cl_long) K * d_state * head_dim * n_head * n_seqs == (cl_long) ggml_nelements(dst));
+
     // Mirror CPU ref: s_off = ggml_nelements(src1) * sizeof(float)
     const cl_ulong s_off_bytes = (cl_ulong) ggml_nelements(src1) * sizeof(float);
 
@@ -18424,6 +18445,8 @@ static void ggml_cl_ssm_scan(ggml_backend_t backend, ggml_tensor * dst) {
     CL_CHECK(clSetKernelArg(kernel, i++, sizeof(int),      &n_head));
     CL_CHECK(clSetKernelArg(kernel, i++, sizeof(int),      &n_group));
     CL_CHECK(clSetKernelArg(kernel, i++, sizeof(int),      &n_tokens));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(int),      &K));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(int),      &n_seqs));
 
     // 64 threads (= Adreno half wave, REQD_SUBGROUP_SIZE_64) per workgroup.
     // Each thread holds ssm_rows * d_state/64 state elements in private.
