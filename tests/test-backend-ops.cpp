@@ -10090,6 +10090,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id_w4a8(GGML_TYPE_MXFP4, GGML_TYPE_F32, 8, 2, false, 32, 32, 256));
     test_cases.emplace_back(new test_mul_mat_id_w4a4(GGML_TYPE_MXFP4, GGML_TYPE_F32, 8, 2, false, 32, 32, 256));
 
+    // q8_0 at n = 2..8, the batch a speculative or MTP verify emits, on wide weights.
+    // Every generated q8_0 case in this band is m = 16, so a backend that routes small-N
+    // q8_0 by the weight's row count has no coverage. The shapes are the dense q8_0 tensors
+    // of a 30B hybrid model, none of which has m % 256 == 0.
+    for (int n : {2, 3, 4, 5, 8}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 10304, n, 2688, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  2688, n, 4096, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  3712, n, 2688, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  2688, n, 3712, {1, 1}, {1, 1}));
+    }
+    // Boundary controls: m % 256 == 0, m % 4 != 0, and n past the small-N band.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 4096, 4, 2688, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2690, 4, 2688, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2688, 9, 4096, {1, 1}, {1, 1}));
+
 #if 0
     // > 4GB A matrix. Too slow to be enabled by default.
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16,  900000,  3, 2592, {1, 1}, {1, 1}));
@@ -11706,6 +11721,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                     test_cases.emplace_back(new test_flash_attn_ext(hs, hsv, 8, {nr, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, v_view));
                 }
             }
+        }
+    }
+
+    // 2 KV heads at gqa 16, dk = dv = 128 (32 query heads). The loop above fixes nh at 8,
+    // so it reaches gqa 1/4/8 only on a wide KV grid, never this narrow one, which is where
+    // a backend chooses how to split a gqa group across sub-groups.
+    // nb 1 is plain decode; nb 2..8 is the speculative verify batch.
+    for (int kv : { 4096, 16384, }) {
+        for (int nb : { 1, 2, 4, 8, }) {
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {16, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
         }
     }
 
