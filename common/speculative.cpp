@@ -1896,6 +1896,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return true;
         }
 
+        // Diagnostics only. NOOP leaves the drafter's cache and h carry-over stale, which
+        // costs acceptance but cannot touch the TARGET's state -- so if a corrupted output
+        // survives it, the fault is in the shared tree/verify path, not here. NODEC keeps the
+        // h bookkeeping and skips only the catch-up decode, separating the two halves.
+        static const bool rows_noop  = std::getenv("LLAMA_MTP_ROWS_NOOP")  != nullptr;
+        static const bool rows_nodec = std::getenv("LLAMA_MTP_ROWS_NODEC") != nullptr;
+        if (rows_noop) {
+            return true;
+        }
+
         auto * ctx_tgt = this->params.ctx_tgt;
 
         const llama_seq_id seq_id = batch_in.seq_id[rows[0]][0];
@@ -1909,7 +1919,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const size_t  row_bytes = (size_t) n_embd * sizeof(float);
 
         // With a shared KV the target already wrote the cells; there is no catch-up to do.
-        if (!is_mem_shared) {
+        if (!is_mem_shared && !rows_nodec) {
             // The MTP block pairs token x_{p+1} with the target's hidden row h_p, so the
             // batch is the accepted tokens against the target's h shifted right by one.
             // Row 0 pairs with the h carried over from the previous call.
