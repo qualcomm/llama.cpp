@@ -30,6 +30,7 @@ struct htp_allreduce_kernel_params {
     int32_t rank_elem_start;
     int32_t rank_nelem;
     int32_t n_dsts;
+    int32_t is_row_bcast;
 };
 
 #ifdef __cplusplus

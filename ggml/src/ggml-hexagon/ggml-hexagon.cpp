@@ -304,6 +304,7 @@ static bool ggml_hexagon_precompute_allreduce_params(
     uint32_t rank,
     uint32_t n_ranks,
     bool has_add,
+    bool is_row_bcast,
     struct htp_allreduce_kernel_params * kparams
 );
 
@@ -1780,28 +1781,31 @@ struct ggml_hexagon_opbatch {
 
         if (!res_tensor || !res_tensor->data) return false;
 
-        auto * res_extra = (const ggml_hexagon_tensor_extra *) res_tensor->extra;
-        if (res_extra && (res_extra->flags & GGML_HEXAGON_TENSOR_WEIGHT)) {
-            return false;
-        }
-
         if (ar_local->type != res_tensor->type) return false;
-        if (ar_local->ne[0] != res_tensor->ne[0] || ar_local->ne[1] != res_tensor->ne[1] ||
-            ar_local->ne[2] != res_tensor->ne[2] || ar_local->ne[3] != res_tensor->ne[3]) {
-            return false;
+
+        const bool is_same_shape = (ar_local->ne[0] == res_tensor->ne[0] && ar_local->ne[1] == res_tensor->ne[1] &&
+                                    ar_local->ne[2] == res_tensor->ne[2] && ar_local->ne[3] == res_tensor->ne[3]);
+        const bool is_row_bcast  = (ar_local->ne[0] == res_tensor->ne[0] &&
+                                    res_tensor->ne[1] == 1 && res_tensor->ne[2] == 1 && res_tensor->ne[3] == 1);
+
+        if (!is_same_shape && !is_row_bcast) return false;
+
+        if (is_same_shape) {
+            if (ar_local->nb[1] != res_tensor->nb[1] || ar_local->nb[2] != res_tensor->nb[2] ||
+                ar_local->nb[3] != res_tensor->nb[3]) {
+                return false;
+            }
+            if (ggml_is_contiguous(ar_local) != ggml_is_contiguous(res_tensor)) {
+                return false;
+            }
         }
-        if (ar_local->nb[1] != res_tensor->nb[1] || ar_local->nb[2] != res_tensor->nb[2] ||
-            ar_local->nb[3] != res_tensor->nb[3]) {
-            return false;
-        }
-        if (ggml_is_contiguous(ar_local) != ggml_is_contiguous(res_tensor) ||
-            ggml_is_contiguous(ar_local) != ggml_is_contiguous(node.dst())) {
+        if (ggml_is_contiguous(ar_local) != ggml_is_contiguous(node.dst())) {
             return false;
         }
 
         struct htp_allreduce_kernel_params new_kparams;
         if (!ggml_hexagon_precompute_allreduce_params(
-            sess, node.dst(), (uint32_t) ar_kparams->rank, (uint32_t) ar_kparams->n_ranks, true, &new_kparams
+            sess, node.dst(), (uint32_t) ar_kparams->rank, (uint32_t) ar_kparams->n_ranks, true, is_row_bcast, &new_kparams
         )) {
             HEX_VERBOSE("ggml-hex: %s skip ALLREDUCE_ADD fusion: solver failed\n", sess->c_name());
             return false;
@@ -2178,11 +2182,13 @@ static bool ggml_hexagon_precompute_allreduce_params(
     uint32_t rank,
     uint32_t n_ranks,
     bool has_add,
+    bool is_row_bcast,
     struct htp_allreduce_kernel_params * kparams
 ) {
     memset(kparams, 0, sizeof(*kparams));
-    kparams->rank    = (int32_t) rank;
-    kparams->n_ranks = (int32_t) n_ranks;
+    kparams->rank         = (int32_t) rank;
+    kparams->n_ranks      = (int32_t) n_ranks;
+    kparams->is_row_bcast = (has_add && is_row_bcast) ? 1 : 0;
 
     const uint32_t n_bufs    = n_ranks + 1 + (has_add ? 1 : 0);
     const uint32_t nelem     = (uint32_t) ggml_nelements(dst);
@@ -2194,9 +2200,11 @@ static bool ggml_hexagon_precompute_allreduce_params(
     kparams->ne0 = (int32_t) ne0;
     kparams->ne1 = (int32_t) ne1;
 
+    const bool use_1d = is_contiguous && !(has_add && is_row_bcast && ne1 > 1);
+
     if (has_add) {
         kparams->n_dsts = 1;
-        if (is_contiguous) {
+        if (use_1d) {
             kparams->rank_elem_start = 0;
             kparams->rank_nelem      = (int32_t) nelem;
         } else {
@@ -2205,7 +2213,7 @@ static bool ggml_hexagon_precompute_allreduce_params(
         }
     } else {
         kparams->n_dsts = (int32_t) n_ranks;
-        if (is_contiguous) {
+        if (use_1d) {
             const uint32_t rank_chunk_elems = hex_round_up((nelem + n_ranks - 1) / n_ranks, 128);
             const uint32_t rank_elem_start  = (std::min)(rank * rank_chunk_elems, nelem);
             const uint32_t rank_elem_end    = (std::min)(rank_elem_start + rank_chunk_elems, nelem);
@@ -2222,7 +2230,7 @@ static bool ggml_hexagon_precompute_allreduce_params(
         }
     }
 
-    if (is_contiguous) {
+    if (use_1d) {
         const uint32_t rank_nelem = (uint32_t) kparams->rank_nelem;
         const uint32_t n_threads  = (std::min)((uint32_t) sess->n_threads, (std::max)(1u, rank_nelem / 128));
         kparams->n_threads = n_threads;
@@ -2321,7 +2329,7 @@ void ggml_hexagon_session::enqueue_allreduce(
     }
 
     ggml_hexagon_precompute_allreduce_params(
-        this, dst, rank, n_ranks, false,
+        this, dst, rank, n_ranks, false, false,
         (struct htp_allreduce_kernel_params *) ar_node.kernel_params
     );
 
@@ -5379,7 +5387,7 @@ static bool ggml_backend_hexagon_comm_allreduce_tensor(void * comm_ctx_v, struct
     for (size_t r = 0; r < n_backends; r++) {
         auto sess = static_cast<ggml_hexagon_session *>(comm_ctx->backends[r]->context);
         struct htp_allreduce_kernel_params kparams;
-        if (!ggml_hexagon_precompute_allreduce_params(sess, tensors[r], (uint32_t) r, (uint32_t) n_backends, false, &kparams)) {
+        if (!ggml_hexagon_precompute_allreduce_params(sess, tensors[r], (uint32_t) r, (uint32_t) n_backends, false, false, &kparams)) {
             return false;
         }
     }
