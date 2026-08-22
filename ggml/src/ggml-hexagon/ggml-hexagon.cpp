@@ -100,7 +100,7 @@ static bool   opt_hostbuf = false;
 
 static int    opt_mm_select = 3; // 3 = HMX -> Tiled -> Flat -> CPU, 2 = Tiled -> Flat -> CPU, 1 = Flat -> CPU
 static int    opt_fa_select = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU (unsupported)
-static int    opt_ar_select = 4; // 4 = fused DMA (default), 3 = fused DIRECT, 2 = unfused DMA, 1 = unfused DIRECT, 0 = fallback to CPY+FENCE
+static int    opt_ar_select = 2; // 2 = fused ALLREDUCE+ADD (DMA, default), 1 = unfused ALLREDUCE (DMA), 0 = fallback to CPY+FENCE
 
 // Default PMU events, if profiling with PMU (mode=2) is enabled
 // See https://docs.qualcomm.com/doc/80-N2040-60/topic/pmu-events.html
@@ -298,7 +298,7 @@ static void ggml_hexagon_precompute_fused_ffn_params(
     struct htp_mm_kernel_params * kparams
 );
 
-static void ggml_hexagon_precompute_allreduce_params(
+static bool ggml_hexagon_precompute_allreduce_params(
     const struct ggml_hexagon_session * sess,
     const struct ggml_tensor * dst,
     uint32_t rank,
@@ -1755,7 +1755,7 @@ struct ggml_hexagon_opbatch {
     }
 
     bool try_fuse_allreduce_add(const htp_opnode & node) {
-        if (n_ops == 0 || opt_ar_select < 3) return false;
+        if (n_ops == 0 || opt_ar_select != 2) return false;
         if (node.opcode != HTP_OP_ADD) return false;
 
         htp_opnode & last_node = ops[n_ops - 1];
@@ -1800,16 +1800,11 @@ struct ggml_hexagon_opbatch {
         }
 
         struct htp_allreduce_kernel_params new_kparams;
-        ggml_hexagon_precompute_allreduce_params(
+        if (!ggml_hexagon_precompute_allreduce_params(
             sess, node.dst(), (uint32_t) ar_kparams->rank, (uint32_t) ar_kparams->n_ranks, true, &new_kparams
-        );
-
-        if (new_kparams.kernel_type == HTP_ALLREDUCE_KERNEL_DMA_1D || new_kparams.kernel_type == HTP_ALLREDUCE_KERNEL_DMA_2D) {
-            if ((size_t) new_kparams.vtcm_size > sess->vtcm_size) {
-                HEX_VERBOSE("ggml-hex: %s skip ALLREDUCE_ADD fusion: VTCM needed %d > budget %zu\n",
-                            sess->c_name(), new_kparams.vtcm_size, sess->vtcm_size);
-                return false;
-            }
+        )) {
+            HEX_VERBOSE("ggml-hex: %s skip ALLREDUCE_ADD fusion: solver failed\n", sess->c_name());
+            return false;
         }
 
         size_t extra_bufs = 0, extra_vmem = 0, extra_tens = 0;
@@ -2177,7 +2172,7 @@ void ggml_hexagon_session::enqueue_fence(const ggml_tensor * sync_tensor) {
     this->enqueue_op(sync_node);
 }
 
-static void ggml_hexagon_precompute_allreduce_params(
+static bool ggml_hexagon_precompute_allreduce_params(
     const struct ggml_hexagon_session * sess,
     const struct ggml_tensor * dst,
     uint32_t rank,
@@ -2227,11 +2222,9 @@ static void ggml_hexagon_precompute_allreduce_params(
         }
     }
 
-    const bool force_direct = (opt_ar_select == 1 || opt_ar_select == 3);
-
     if (is_contiguous) {
         const uint32_t rank_nelem = (uint32_t) kparams->rank_nelem;
-        const uint32_t n_threads  = (std::min)((uint32_t) sess->n_threads, (std::max)(1u, rank_nelem / 1024));
+        const uint32_t n_threads  = (std::min)((uint32_t) sess->n_threads, (std::max)(1u, rank_nelem / 128));
         kparams->n_threads = n_threads;
 
         uint32_t block_elems = 65536;
@@ -2244,23 +2237,24 @@ static void ggml_hexagon_precompute_allreduce_params(
         kparams->vtcm_size_per_thread = 2 * block_elems * elem_size;
         kparams->vtcm_size            = n_threads * n_bufs * kparams->vtcm_size_per_thread;
 
-        if ((size_t) kparams->vtcm_size > sess->vtcm_size) {
+        while ((size_t) kparams->vtcm_size > sess->vtcm_size && block_elems > 128) {
             const size_t max_bytes_per_buf = sess->vtcm_size / (n_threads * n_bufs * 2);
             block_elems = (uint32_t) hex_align_down((size_t) (max_bytes_per_buf / elem_size), 128);
-            block_elems = (std::max)(128u, block_elems);
+            if (block_elems < 128) break;
             kparams->block_elems          = block_elems;
             kparams->vtcm_size_per_thread = 2 * block_elems * elem_size;
             kparams->vtcm_size            = n_threads * n_bufs * kparams->vtcm_size_per_thread;
         }
 
-        if (!force_direct && sess->vtcm_size >= (size_t) kparams->vtcm_size) {
-            kparams->elems_per_thread = hex_round_up((rank_nelem + n_threads - 1) / n_threads, block_elems);
-            kparams->kernel_type      = HTP_ALLREDUCE_KERNEL_DMA_1D;
-        } else {
-            const uint32_t align_elems = (dst->type == GGML_TYPE_F16) ? 64 : 32;
-            kparams->elems_per_thread = hex_round_up((rank_nelem + n_threads - 1) / n_threads, align_elems);
-            kparams->kernel_type      = HTP_ALLREDUCE_KERNEL_DIRECT_1D;
+        if (sess->vtcm_size < (size_t) kparams->vtcm_size || block_elems < 128) {
+            HEX_VERBOSE("ggml-hex: %s allreduce 1D solver failed to fit VTCM (%d > %zu)\n",
+                        sess->c_name(), kparams->vtcm_size, sess->vtcm_size);
+            return false;
         }
+
+        kparams->elems_per_thread = hex_round_up((rank_nelem + n_threads - 1) / n_threads, block_elems);
+        kparams->kernel_type      = HTP_ALLREDUCE_KERNEL_DMA_1D;
+        return true;
     } else {
         const uint32_t rank_nrows = (uint32_t) kparams->rank_nelem;
         const uint32_t n_threads  = (std::min)((uint32_t) sess->n_threads, (std::max)(1u, rank_nrows));
@@ -2278,21 +2272,24 @@ static void ggml_hexagon_precompute_allreduce_params(
         kparams->vtcm_size_per_thread = 2 * (block_rows * row_size_aligned);
         kparams->vtcm_size            = n_threads * n_bufs * kparams->vtcm_size_per_thread;
 
-        if ((size_t) kparams->vtcm_size > sess->vtcm_size) {
+        while ((size_t) kparams->vtcm_size > sess->vtcm_size && block_rows > 1) {
             const size_t max_rows_per_buf = sess->vtcm_size / (n_threads * n_bufs * 2 * row_size_aligned);
             block_rows = (std::max)(1u, (uint32_t) max_rows_per_buf);
             kparams->block_elems          = block_rows;
             kparams->vtcm_size_per_thread = 2 * (block_rows * row_size_aligned);
             kparams->vtcm_size            = n_threads * n_bufs * kparams->vtcm_size_per_thread;
+            if (max_rows_per_buf == 0) break;
         }
 
-        if (!force_direct && sess->vtcm_size >= (size_t) kparams->vtcm_size) {
-            kparams->elems_per_thread = nrows_per_thread;
-            kparams->kernel_type      = HTP_ALLREDUCE_KERNEL_DMA_2D;
-        } else {
-            kparams->elems_per_thread = nrows_per_thread;
-            kparams->kernel_type      = HTP_ALLREDUCE_KERNEL_DIRECT_2D;
+        if (sess->vtcm_size < (size_t) kparams->vtcm_size || block_rows < 1) {
+            HEX_VERBOSE("ggml-hex: %s allreduce 2D solver failed to fit VTCM (%d > %zu)\n",
+                        sess->c_name(), kparams->vtcm_size, sess->vtcm_size);
+            return false;
         }
+
+        kparams->elems_per_thread = nrows_per_thread;
+        kparams->kernel_type      = HTP_ALLREDUCE_KERNEL_DMA_2D;
+        return true;
     }
 }
 
@@ -5377,6 +5374,14 @@ static bool ggml_backend_hexagon_comm_allreduce_tensor(void * comm_ctx_v, struct
 
     if (tensors[0]->type != GGML_TYPE_F16 && tensors[0]->type != GGML_TYPE_F32) {
         return false;
+    }
+
+    for (size_t r = 0; r < n_backends; r++) {
+        auto sess = static_cast<ggml_hexagon_session *>(comm_ctx->backends[r]->context);
+        struct htp_allreduce_kernel_params kparams;
+        if (!ggml_hexagon_precompute_allreduce_params(sess, tensors[r], (uint32_t) r, (uint32_t) n_backends, false, &kparams)) {
+            return false;
+        }
     }
 
     if (comm_ctx->fence_seq == 0) comm_ctx->fence_seq = 1;

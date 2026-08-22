@@ -13,8 +13,6 @@ enum htp_allreduce_kernel_type {
     HTP_ALLREDUCE_KERNEL_UNSUPPORTED = 0,
     HTP_ALLREDUCE_KERNEL_DMA_1D,
     HTP_ALLREDUCE_KERNEL_DMA_2D,
-    HTP_ALLREDUCE_KERNEL_DIRECT_1D,
-    HTP_ALLREDUCE_KERNEL_DIRECT_2D,
 };
 
 struct htp_allreduce_kernel_params {
