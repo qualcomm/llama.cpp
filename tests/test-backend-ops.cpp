@@ -9139,6 +9139,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 32, 1, 32)); // too small (N<64)
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 1024, 1, 1024)); // too big (N>512)
 
+    // q8_0 small-N cooperative-K GEMM, the shape a speculative or MTP verify batch emits.
+    // Every generated q8_0 case in this band is m=16, so a backend routing small-N q8_0 on
+    // an m predicate has no coverage. Shapes taken from a real 30B hybrid model, whose dense
+    // q8_0 tensors all have m % 256 != 0.
+    for (int n : {2, 3, 4, 5, 8}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 10304, n, 2688, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  2688, n, 4096, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  3712, n, 2688, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  2688, n, 3712, {1, 1}, {1, 1}));
+    }
+    // Boundary controls: m % 256 == 0, m % 4 != 0, and n past the small-N band.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 4096, 4, 2688, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2690, 4, 2688, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2688, 9, 4096, {1, 1}, {1, 1}));
+
 #if 0
     // > 4GB A matrix. Too slow to be enabled by default.
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16,  900000,  3, 2592, {1, 1}, {1, 1}));
@@ -10499,6 +10514,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             for (int nr : { 1, 4, }) {
                 test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 8, {nr, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
             }
+        }
+    }
+
+    // NVIDIA-Nemotron-3.5-Lightning-30B-A3B and muse-glimmer-30B attention: 2 KV heads,
+    // gqa 16, dk = dv = 128. The loop above fixes nh at 8, so it reaches gqa 1/4/8 with a
+    // WIDE KV grid and never the narrow one -- yet it is the narrow grid that decides how
+    // this backend splits a gqa group across sub-groups, and two end-to-end harnesses
+    // disagree about that width by 8.6% while the suite says nothing at all.
+    // nb 1 is plain decode; nb 2..8 is the speculative verify batch, whose scaling in nb
+    // is the whole question for KV-sharing across query rows.
+    for (int kv : { 4096, 16384, }) {
+        for (int nb : { 1, 2, 4, 8, }) {
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {16, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
         }
     }
 
