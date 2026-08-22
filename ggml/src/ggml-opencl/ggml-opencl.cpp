@@ -7729,10 +7729,25 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
             if (op->type != GGML_TYPE_F32) {
                 return false;
             }
+            // Rollback snapshots (ggml_ssm_scan's K argument) ask the op to emit K intermediate
+            // copies of the state, not just the final one. The kernel now writes slots 1..K-1
+            // inside its token loop, so any K >= 1 is served. Speculative decoding on a hybrid
+            // model is the only producer of K > 1 (K = n_rs_seq + 1); previously every verify
+            // batch fell back to the CPU for each SSM layer.
             const int K = ggml_get_op_params_i32(op, 0);
+            if (K < 1) {
+                return false;
+            }
+            // Snapshots cover the last K-1 tokens, which is the regime a speculative verify runs
+            // in: the draft is at most n_max tokens and K = n_max + 1, so the batch is never
+            // wider than K. Wider batches keep the existing CPU path.
+            const int n_tokens_ssm = (int) op->src[1]->ne[2];
+            if (K > 1 && n_tokens_ssm > K) {
+                return false;
+            }
             const int d_state = (int) op->src[0]->ne[0];
             const bool is_mamba2 = (op->src[3]->ne[0] == 1);
-            return is_mamba2 && (d_state == 128 || d_state == 256) && (K == 1);
+            return is_mamba2 && (d_state == 128 || d_state == 256);
         }
         case GGML_OP_GATED_DELTA_NET:
             {
@@ -12757,6 +12772,14 @@ static void ggml_cl_ssm_scan(ggml_backend_t backend, ggml_tensor * dst) {
     const int n_tokens = (int) src1->ne[2];
     const int n_seqs   = (int) src1->ne[3];
 
+    // Rollback snapshots: the op is asked for K state copies, not just the final
+    // one. K > 1 comes from speculative decoding (K = n_rs_seq + 1), where a
+    // rejected draft token has to rewind the recurrent state.
+    const int K_param = ggml_get_op_params_i32(dst, 0);
+    const int K       = K_param > 0 ? K_param : 1;
+    GGML_ASSERT((cl_long) ggml_nelements(src1) +
+                (cl_long) K * d_state * head_dim * n_head * n_seqs == (cl_long) ggml_nelements(dst));
+
     // Mirror CPU ref: s_off = ggml_nelements(src1) * sizeof(float)
     const cl_ulong s_off_bytes = (cl_ulong) ggml_nelements(src1) * sizeof(float);
 
@@ -12828,6 +12851,8 @@ static void ggml_cl_ssm_scan(ggml_backend_t backend, ggml_tensor * dst) {
     CL_CHECK(clSetKernelArg(kernel, 29, sizeof(int),      &n_head));
     CL_CHECK(clSetKernelArg(kernel, 30, sizeof(int),      &n_group));
     CL_CHECK(clSetKernelArg(kernel, 31, sizeof(int),      &n_tokens));
+    CL_CHECK(clSetKernelArg(kernel, 32, sizeof(int),      &K));
+    CL_CHECK(clSetKernelArg(kernel, 33, sizeof(int),      &n_seqs));
 
     // 64 threads (= Adreno half wave, REQD_SUBGROUP_SIZE_64) per workgroup.
     // Each thread holds ssm_rows * d_state/64 state elements in private.
