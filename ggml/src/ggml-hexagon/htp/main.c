@@ -720,7 +720,8 @@ static int op_fence(struct htp_ops_context * octx) {
     while (1) {
         Q6_dccleaninva_A((void *) sync_fence);
         asm volatile ("syncht" : : : "memory");
-        if (atomic_load(&sync_fence[0]) == seq) {
+        uint32_t val = atomic_load(&sync_fence[0]);
+        if ((int32_t)(val - seq) >= 0) {
             break;
         }
         if (++spins > HTP_FENCE_TIMEOUT) {
