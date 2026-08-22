@@ -5752,6 +5752,21 @@ static std::vector<ggml_backend_device> ggml_opencl_probe_devices(ggml_backend_r
     return found_devices;
 }
 
+// Advertising an extension and being able to build for it are different questions: a driver can
+// report cl_qcom_large_buffer and then reject -qcom-enable-large-buffer as an invalid option,
+// which fails every kernel build and takes the process down. Build a trivial program and ask.
+static bool ggml_opencl_compiler_accepts(cl_context context, cl_device_id device, const char * opt) {
+    const char * src = "__kernel void ggml_cl_probe(void) {}\n";
+    cl_int err = CL_SUCCESS;
+    cl_program p = clCreateProgramWithSource(context, 1, &src, NULL, &err);
+    if (err != CL_SUCCESS || p == NULL) {
+        return false;
+    }
+    err = clBuildProgram(p, 1, &device, opt, NULL, NULL);
+    clReleaseProgram(p);
+    return err == CL_SUCCESS;
+}
+
 static void ggml_opencl_print_backend_info(ggml_backend_opencl_device_context * dev_ctx) {
     GGML_ASSERT(dev_ctx);
     GGML_ASSERT(dev_ctx->backend_ctx);
@@ -5806,6 +5821,10 @@ static void ggml_opencl_print_backend_info(ggml_backend_opencl_device_context * 
     if (backend_ctx->adreno_use_large_buffer) {
         if (!backend_ctx->adreno_has_large_buffer) {
             GGML_LOG_INFO("ggml_opencl: Adreno large buffer requested but not supported by driver, will use regular buffer\n");
+            backend_ctx->adreno_use_large_buffer = false;
+        } else if (!ggml_opencl_compiler_accepts(backend_ctx->context, backend_ctx->device,
+                                                 " -qcom-enable-large-buffer ")) {
+            GGML_LOG_INFO("ggml_opencl: Adreno large buffer advertised but rejected by the compiler, will use regular buffer\n");
             backend_ctx->adreno_use_large_buffer = false;
         } else {
             GGML_LOG_INFO("ggml_opencl: Adreno large buffer enabled\n");
