@@ -715,9 +715,7 @@ static int op_fence(struct htp_ops_context * octx) {
 
     const struct htp_tensor * sync = octx->src[0];
     atomic_uint * sync_fence = (atomic_uint *) sync->data;
-
-    Q6_dccleaninva_A((void *) sync_fence);
-    uint32_t seq   = atomic_load(&sync_fence[1]);
+    const uint32_t seq = (uint32_t) octx->op_params[0];
     uint64_t spins = 0;
     while (1) {
         Q6_dccleaninva_A((void *) sync_fence);

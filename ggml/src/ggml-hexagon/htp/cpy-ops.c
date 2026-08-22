@@ -337,9 +337,8 @@ int op_cpy(struct htp_ops_context * octx) {
         }
 
         atomic_uint * sync_fence = (atomic_uint *) sync->data;
+        const uint32_t seq = (uint32_t) octx->op_params[0];
 
-        Q6_dccleaninva_A((void *) sync_fence);
-        uint32_t seq = atomic_load(&sync_fence[1]);
         atomic_store(&sync_fence[0], seq);
         asm volatile ("syncht" : : : "memory");
         Q6_dccleaninva_A((void *) sync_fence);

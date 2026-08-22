@@ -275,8 +275,7 @@ int op_allreduce(struct htp_ops_context * octx) {
 
     const struct htp_tensor * my_sync = octx->src[n_ranks + rank];
     atomic_uint * my_fence = (atomic_uint *) my_sync->data;
-    Q6_dccleaninva_A((void *) my_fence);
-    const uint32_t fence_seq_entry = atomic_load(&my_fence[1]);
+    const uint32_t fence_seq_entry = (uint32_t) octx->op_params[0];
 
     atomic_store(&my_fence[0], fence_seq_entry);
     asm volatile ("syncht" : : : "memory");
@@ -369,8 +368,7 @@ int op_allreduce(struct htp_ops_context * octx) {
     // 4. Exit Barrier: Synchronize all ranks after writing
     htp_trace_event_start(tr0, HTP_TRACE_EVT_FENCE, (uint16_t) rank);
 
-    Q6_dccleaninva_A((void *) my_fence);
-    const uint32_t fence_seq_exit = atomic_load(&my_fence[2]);
+    const uint32_t fence_seq_exit = (uint32_t) octx->op_params[1];
 
     atomic_store(&my_fence[0], fence_seq_exit);
     asm volatile ("syncht" : : : "memory");
