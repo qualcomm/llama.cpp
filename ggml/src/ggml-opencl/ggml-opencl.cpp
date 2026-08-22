@@ -23380,7 +23380,21 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
                 backend_ctx->fa.mq_narrow.count({d_head_q, d_head_v, gqa_ratio_dispatch}) > 0 &&
                 (nq1_only ||
                  ((mqn_nq_mode >= 2 || (mqn_nq_mode == 1 && d_head_q <= 256)) &&
-                  backend_ctx->fa.mq_narrow_hs.at({d_head_q, d_head_v, gqa_ratio_dispatch}) == 1))) {
+                  // head_sub > 1 re-reads every KV row once per sub-group, which is a
+                  // different cost model at n_q > 1, so the widening was held to hs == 1.
+                  // At DK=128 that measured wrong: Nemotron-H (gqa 16, hs 8) spends 43.6%
+                  // of a speculative verify in attention, and admitting it here takes that
+                  // model from 13.48 to 19.81 t/s at depth 16384 (+46.9%). hs 8 is the
+                  // width to pair with it -- hs 4 and hs 16 both measure ~2.5 t/s lower on
+                  // the verify, the reverse of the hs 16 that wins plain decode.
+                  // DK=512 keeps the old rule: gemma-4-12B's global layers are hs 8 there
+                  // and have no measurement. muse-glimmer is DK=128/gqa 16 too but is
+                  // unaffected either way -- its DFlash drafter proposes 16 tokens, so the
+                  // verify batch is past the n_q <= 8 cap above and never reaches here
+                  // (measured: identical output and 301.2 vs 301.4 ms per round).
+                  // GGML_OPENCL_FA_MQN_NQ=3 forces it for every head dim, =0 restores n_q == 1.
+                  (mqn_nq_mode >= 3 || d_head_q == 128 ||
+                   backend_ctx->fa.mq_narrow_hs.at({d_head_q, d_head_v, gqa_ratio_dispatch}) == 1)))) {
                 const std::tuple<int, int, int> nk = {d_head_q, d_head_v, gqa_ratio_dispatch};
                 if (backend_ctx->fa.mq_narrow_k_img.count(nk) > 0) {
                     fd_k_split   = backend_ctx->fa.mq_narrow_k_img.at(nk);
