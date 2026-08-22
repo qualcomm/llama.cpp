@@ -22736,20 +22736,33 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
             // knobs exist to re-tune them elsewhere. DK=256 gqa=8 must stay at
             // a 128-thread workgroup - the stock 192-thread g8 kernel is what
             // the X2-90 refuses per-kernel.
-            // DK=128 gqa=16 runs head_sub 8, i.e. MQ_GQA=2. With only 2 KV heads this
-            // shape is bound by per-workgroup accumulator registers rather than by KV
-            // traffic, so splitting further pays even though each sub-group re-reads the
-            // KV rows -- the opposite of the reasoning that put it at 4. Nemotron-H Q4_0,
-            // X2-90, 128 tokens after a 16384-token prompt, bracketed A/B/A/B in one
-            // server run: hs 8 21.624 / 22.179 against hs 16 20.035 / 20.307, and hs 4
-            // measures 19.6 -- so 8 is +11.9% over the old default and +8.6% over 16.
-            // ⚠️ llama-bench ranks 8 and 16 the other way round at the same depth
-            // (22.82 vs 23.09). The two harnesses disagree reproducibly; this follows the
-            // server, both because it is the deployed shape and because its margin is
-            // ~9x larger. A width-2 verify batch also prefers 8 (15.7% over 16), so one
-            // width serves both regimes and no per-batch selection is needed.
+            // DK=128 gqa=16 runs head_sub 16, i.e. MQ_GQA=1. head_sub splits one gqa group
+            // across that many sub-groups, and every one of them re-reads the whole KV range,
+            // so the wide end looks wasteful -- but with only 2 KV heads the grid is otherwise
+            // too small to fill the device, and the extra parallelism wins by more than the
+            // re-reads cost. It is not close, and it holds at every batch width, so one width
+            // serves decode and a speculative verify alike. test-backend-ops perf, X2-90,
+            // dk=dv=128 / 2 KV heads / gqa 16, us/run:
+            //                    hs 4     hs 8    hs 16
+            //   kv  4096, nb 1   574.7    457.1    445.4
+            //   kv 16384, nb 1  2539.9   1832.2   1783.9
+            //   kv 16384, nb 4  9932.4   7108.8   6881.0
+            // End to end, Nemotron-H Q4_0 tg128 after a 16384-token prompt, bracketed on one
+            // binary: hs 8 22.852 against hs 16 23.113 / 23.146. muse-glimmer-30B, the only
+            // other model of this shape here, agrees at tg64 / depth 16384: hs 4 4.862 and
+            // 4.867, hs 8 5.219, hs 16 5.256. On a speculative verify at the same depth the
+            // two widths produce byte-identical output at the same acceptance, so the
+            // comparison is pure speed: round cost 113.88 / 113.85 ms at hs 8 against
+            // 111.50 / 112.18 at hs 16.
+            // 🔴 An earlier revision picked 8 here from a server run that set
+            // GGML_OPENCL_ADRENO_USE_LARGE_BUFFER. That env appends -qcom-enable-large-buffer
+            // to EVERY program. It costs this kernel about 4% at hs 4 and hs 8 but 32-40% at
+            // hs 16 -- a cliff at MQ_GQA == 1, not a smooth scaling, and the reason for it is
+            // not established -- which is enough to invert the ranking. Do not tune this shape
+            // with that env set: it is not the default, and it is only worth paying when an
+            // allocation actually exceeds the device cap.
             int hs  = (d_head_q == 512) ? ((gqa == 8) ? 4 : ((gqa == 16) ? 8 : 1))
-                    : (d_head_q == 128 && gqa == 16) ? 8
+                    : (d_head_q == 128 && gqa == 16) ? 16
                     : ((gqa == 8) ? 2 : 1);
             int nsg = (d_head_q == 256 && gqa == 8) ? 2 : 4;
             static const int hs_env  = []{ const char * e = getenv("GGML_OPENCL_FA_MQN_HS");
