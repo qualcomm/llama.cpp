@@ -9306,6 +9306,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_1, GGML_TYPE_F32, 2048, 9, 8192, {1, 1}, {1, 1}));
 
+    // q8_0 small-N cooperative-K GEMM (the spec/MTP verify batch). Same blind spot again:
+    // every generated q8_0 case in this band is m=16, so the Adreno cooperative-K route --
+    // 64 lanes x 4 rows, gated on m % 4 -- is not reached by a single one of them, and an
+    // A/B over the suite measured nothing while reporting a clean pass. Shapes are
+    // NVIDIA-Nemotron-3.5-Lightning-30B-A3B verbatim: its entire dense q8_0 mass
+    // (ssm_in / ssm_out / ffn_*_shexp, ~1.43 GB, hit on every verify token) has
+    // m % 256 != 0, which is exactly what the earlier form of that gate excluded.
+    for (int n : {2, 3, 4, 5, 8}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 10304, n, 2688, {1, 1}, {1, 1})); // ssm_in
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  2688, n, 4096, {1, 1}, {1, 1})); // ssm_out
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  3712, n, 2688, {1, 1}, {1, 1})); // ffn_up_shexp
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  2688, n, 3712, {1, 1}, {1, 1})); // ffn_down_shexp
+    }
+    // Boundary controls: m % 256 == 0 is the one shape the old gate did admit, m % 4 != 0 must
+    // decline the 4-row route outright, and n = 9 must fall back to the dense GEMM.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 4096, 4, 2688, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2690, 4, 2688, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2688, 9, 4096, {1, 1}, {1, 1}));
+
 #if 0
     // > 4GB A matrix. Too slow to be enabled by default.
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16,  900000,  3, 2592, {1, 1}, {1, 1}));
@@ -10674,6 +10693,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             for (int nr : { 1, 4, 8, }) {
                 test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 8, {nr, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
             }
+        }
+    }
+
+    // NVIDIA-Nemotron-3.5-Lightning-30B-A3B and muse-glimmer-30B attention: 2 KV heads,
+    // gqa 16, dk = dv = 128. The loop above fixes nh at 8, so it reaches gqa 1/4/8 with a
+    // WIDE KV grid and never the narrow one -- yet it is the narrow grid that decides how
+    // this backend splits a gqa group across sub-groups, and two end-to-end harnesses
+    // disagree about that width by 8.6% while the suite says nothing at all.
+    // nb 1 is plain decode; nb 2..8 is the speculative verify batch, whose scaling in nb
+    // is the whole question for KV-sharing across query rows.
+    for (int kv : { 4096, 16384, }) {
+        for (int nb : { 1, 2, 4, 8, }) {
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {16, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
         }
     }
 
