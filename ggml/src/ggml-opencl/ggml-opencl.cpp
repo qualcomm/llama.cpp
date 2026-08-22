@@ -984,6 +984,8 @@ struct ggml_backend_opencl_context {
 
     bool adreno_has_large_buffer;
     bool adreno_use_large_buffer;
+    bool adreno_large_buffer_requested = false;  // env asked for it (may be declined below)
+    bool adreno_large_buffer_used = false;  // the >2 GB retry actually fired at least once
     bool adreno_use_bin_kernels;
     get_adreno_bin_kernel_func_t get_adreno_bin_kernel_func = nullptr;
     ggml_cl_compiler_version adreno_cl_compiler_version;
@@ -9000,10 +9002,9 @@ static void ggml_opencl_print_backend_info(ggml_backend_opencl_device_context * 
     }
 #endif // GGML_OPENCL_USE_ADRENO_KERNELS
 
-    if (backend_ctx->adreno_use_large_buffer) {
-        if (!backend_ctx->adreno_has_large_buffer) {
+    if (backend_ctx->adreno_large_buffer_requested) {
+        if (!backend_ctx->adreno_use_large_buffer) {
             GGML_LOG_INFO("ggml_opencl: Adreno large buffer requested but not supported by driver, will use regular buffer\n");
-            backend_ctx->adreno_use_large_buffer = false;
         } else {
             GGML_LOG_INFO("ggml_opencl: Adreno large buffer enabled\n");
         }
@@ -9396,8 +9397,16 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
 #endif
 
     // determine whether to use large buffer for Adreno
-    backend_ctx->adreno_use_large_buffer = getenv("GGML_OPENCL_ADRENO_USE_LARGE_BUFFER") != nullptr &&
-                                           backend_ctx->gpu_family == GPU_FAMILY::ADRENO;
+    // The capability check has to happen HERE, not at the info print in
+    // ggml_opencl_print_backend_info(): kernel_compile_opts is baked a few lines below, and
+    // that function only runs after ggml_cl_init() has returned. Deciding there left a device
+    // WITHOUT cl_qcom_large_buffer carrying -qcom-enable-large-buffer on every program while
+    // the log said the request had been declined.
+    backend_ctx->adreno_large_buffer_requested =
+        getenv("GGML_OPENCL_ADRENO_USE_LARGE_BUFFER") != nullptr &&
+        backend_ctx->gpu_family == GPU_FAMILY::ADRENO;
+    backend_ctx->adreno_use_large_buffer =
+        backend_ctx->adreno_large_buffer_requested && backend_ctx->adreno_has_large_buffer;
 
     // Every input to the shared compile-option prefix is known by now, so populate it
     // here rather than in load_cl_kernels(): that function only runs on the first
@@ -16731,6 +16740,17 @@ static ggml_backend_buffer_t ggml_backend_opencl_buffer_type_alloc_buffer(ggml_b
     if (err != CL_SUCCESS && backend_ctx->adreno_use_large_buffer) {
         cl_mem_properties props[] = { 0x41A6 /* CL_LARGE_BUFFER_QCOM */, 1, 0 };
         mem = clCreateBufferWithProperties(backend_ctx->context, props, CL_MEM_READ_WRITE, size, NULL, &err);
+        // Say so the first time it actually fires. Enabling the extension costs throughput
+        // on every kernel -- it puts -qcom-enable-large-buffer on every program, which
+        // widens address arithmetic -- while this retry only runs when a single allocation
+        // exceeds the device cap. Without this line there is no way to tell a run that
+        // needed the extension from one that paid for it and never used it.
+        if (err == CL_SUCCESS && !backend_ctx->adreno_large_buffer_used) {
+            backend_ctx->adreno_large_buffer_used = true;
+            GGML_LOG_INFO("%s: %.2f MiB allocated via cl_qcom_large_buffer -- the "
+                          "extension is doing real work in this run.\n",
+                          __func__, size / 1024.0 / 1024.0);
+        }
     }
 #endif
     if (err != CL_SUCCESS) {
@@ -16741,6 +16761,18 @@ static ggml_backend_buffer_t ggml_backend_opencl_buffer_type_alloc_buffer(ggml_b
                           "device pool exhausted; runtime perf will be degraded. "
                           "Consider lowering -ngl or context size.\n",
                           __func__, size / 1024.0 / 1024.0);
+            // This is the one situation that justifies paying the large-buffer codegen
+            // tax, and it is exactly where the user cannot guess it: the run does not
+            // fail, it silently moves the graph's compute scratch to host memory. Name
+            // the knob here rather than leaving "required for large models" as folklore.
+            if (backend_ctx->adreno_has_large_buffer && !backend_ctx->adreno_use_large_buffer) {
+                GGML_LOG_WARN("%s: this device supports cl_qcom_large_buffer; setting "
+                              "GGML_OPENCL_ADRENO_USE_LARGE_BUFFER=1 would keep this "
+                              "allocation on the device. It is not free -- it adds "
+                              "-qcom-enable-large-buffer to every kernel and costs a few "
+                              "percent of throughput -- so set it only when this warning "
+                              "appears.\n", __func__);
+            }
         }
     }
 
