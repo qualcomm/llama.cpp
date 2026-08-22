@@ -1214,6 +1214,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_rope_neox_f32_rms_set_rows_f16;
     cl_kernel kernel_rope_multi_f32, kernel_rope_multi_f16, kernel_rope_vision_f32, kernel_rope_vision_f16;
     cl_kernel kernel_cpy_f16_f16, kernel_cpy_f16_f32, kernel_cpy_f32_f16, kernel_cpy_f32_f32, kernel_cpy_f32_f32_pack, kernel_cpy_i32_i32;
+    cl_kernel kernel_cpy_f32_f32_flat = nullptr;  // contiguous fast path, see ggml_cl_cpy
     cl_kernel kernel_mul_mat_f32_f32;
     cl_kernel kernel_mul_mat_f32_f32_gelu;
     cl_kernel kernel_mul_mat_f16_f16;
@@ -2326,6 +2327,13 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         CL_CHECK((backend_ctx->kernel_cpy_f32_f16 = clCreateKernel(prog, "kernel_cpy_f32_f16", &err), err));
         CL_CHECK((backend_ctx->kernel_cpy_f32_f32 = clCreateKernel(prog, "kernel_cpy_f32_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_cpy_f32_f32_pack = clCreateKernel(prog, "kernel_cpy_f32_f32_pack", &err), err));
+        {   // Non-fatal on purpose: without it ggml_cl_cpy keeps the row-mapped kernel.
+            cl_int err_flat = CL_SUCCESS;
+            cl_kernel k = clCreateKernel(prog, "kernel_cpy_f32_f32_flat", &err_flat);
+            if (err_flat == CL_SUCCESS) {
+                backend_ctx->kernel_cpy_f32_f32_flat = k;
+            }
+        }
         CL_CHECK((backend_ctx->kernel_cpy_i32_i32 = clCreateKernel(prog, "kernel_cpy_i32_i32", &err), err));
         GGML_LOG_CONT(".");
     }
@@ -36025,6 +36033,53 @@ static void ggml_cl_cpy(ggml_backend_t backend, const ggml_tensor * src0, const 
 
     cl_ulong offset0 = extra0->offset + src0->view_offs;
     cl_ulong offset1 = extra1->offset + src1->view_offs;
+
+    // Contiguous f32 -> f32 is a pure linear move, and the row-mapped kernel below is a bad
+    // fit for it: that one puts ONE WORKGROUP on each (i01,i02,i03) row, so a tensor with few
+    // enormous rows runs on a single compute unit. The mamba2 / gated-delta-net recurrent
+    // state cache is exactly that shape -- one 524288-element row, 2 MB -- and Nemotron-H
+    // copies 23 of them per graph. Dispatch those over the whole device instead.
+    // GGML_OPENCL_CPY_FLAT=0 restores the row-mapped kernel.
+    static const bool cpy_flat_on = []{
+        const char * e = getenv("GGML_OPENCL_CPY_FLAT");
+        return !(e && e[0] == '0');
+    }();
+    if (cpy_flat_on && backend_ctx->kernel_cpy_f32_f32_flat != nullptr &&
+        src0t == GGML_TYPE_F32 && src1t == GGML_TYPE_F32 &&
+        ggml_is_contiguous(src0) && ggml_is_contiguous(src1) &&
+        ggml_nelements(src0) == ggml_nelements(src1)) {
+        cl_kernel k = backend_ctx->kernel_cpy_f32_f32_flat;
+        const cl_ulong nelem = (cl_ulong) ggml_nelements(src0);
+        const cl_ulong n4    = nelem / 4;
+
+        CL_CHECK(clSetKernelArg(k, 0, sizeof(cl_mem),   &extra0->data_device));
+        CL_CHECK(clSetKernelArg(k, 1, sizeof(cl_ulong), &offset0));
+        CL_CHECK(clSetKernelArg(k, 2, sizeof(cl_mem),   &extra1->data_device));
+        CL_CHECK(clSetKernelArg(k, 3, sizeof(cl_ulong), &offset1));
+        CL_CHECK(clSetKernelArg(k, 4, sizeof(cl_ulong), &nelem));
+        CL_CHECK(clSetKernelArg(k, 5, sizeof(cl_ulong), &n4));
+
+        // one work item per float4, plus one for the (at most three) trailing scalars
+        const size_t items = (size_t) n4 + ((nelem % 4) ? 1 : 0);
+        const size_t lsz   = MIN((size_t) 64, backend_ctx->max_workgroup_size);
+        size_t global_work_size[] = { ((items + lsz - 1) / lsz) * lsz, 1, 1 };
+        size_t local_work_size[]  = { lsz, 1, 1 };
+
+        // GGML_OPENCL_CPY_PROBE=1 prints the fork. An A/B on this gate is worthless without
+        // it: the row-mapped path below is also correct, so a miss looks like 'no effect'.
+        if (getenv("GGML_OPENCL_CPY_PROBE")) {
+            fprintf(stderr, "[CPY-PROBE] FLAT ne=%llu items=%zu lws=%zu\n",
+                    (unsigned long long) nelem, items, lsz);
+            fflush(stderr);
+        }
+        backend_ctx->enqueue_ndrange_kernel(k, 1, global_work_size, local_work_size, src1);
+        return;
+    }
+    if (getenv("GGML_OPENCL_CPY_PROBE")) {
+        fprintf(stderr, "[CPY-PROBE] row-mapped %s->%s ne00=%d rows=%d\n",
+                ggml_type_name(src0t), ggml_type_name(src1t), ne00, ne01*ne02*ne03);
+        fflush(stderr);
+    }
 
     cl_kernel kernel;
 

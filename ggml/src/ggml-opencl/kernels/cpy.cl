@@ -286,3 +286,37 @@ kernel void kernel_cpy_i32_i32(
         dst_data[i00] = src[0];
     }
 }
+
+// Flat contiguous f32 copy.
+//
+// The row-mapped kernels above put ONE WORKGROUP on each (i01,i02,i03) row and stride that
+// row across the workgroup lanes. A copy whose rows are few and enormous therefore runs on
+// one compute unit however wide the workgroup is: the mamba2 / gated-delta-net recurrent
+// state cache is 524288 x 1, i.e. a single 2 MB row, and lands on 1024 work items total.
+// When source and destination are both contiguous the copy is a pure linear move, so give
+// it a grid over the whole tensor and 16 bytes per work item instead of 4.
+//
+// vload4/vstore4 rather than a float4* cast on purpose: they only require the natural
+// alignment of the SCALAR type, and these buffers carry an arbitrary 4-byte view offset.
+kernel void kernel_cpy_f32_f32_flat(
+        global float * src0,
+        ulong offset0,
+        global float * dst,
+        ulong offsetd,
+        ulong ne,          // total elements
+        ulong n4           // ne / 4, precomputed on the host
+) {
+    src0 = (global float*)((global char*)src0 + offset0);
+    dst  = (global float*)((global char*)dst  + offsetd);
+
+    const ulong i = get_global_id(0);
+
+    if (i < n4) {
+        vstore4(vload4(i, src0), i, dst);
+    } else if (i == n4) {
+        // ne % 4 leftovers, at most three, handled by one work item
+        for (ulong t = n4 * 4; t < ne; ++t) {
+            dst[t] = src0[t];
+        }
+    }
+}
