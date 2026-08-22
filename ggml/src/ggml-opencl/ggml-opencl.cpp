@@ -764,6 +764,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_rope_norm_f32, kernel_rope_norm_f16, kernel_rope_neox_f32, kernel_rope_neox_f16;
     cl_kernel kernel_rope_multi_f32, kernel_rope_multi_f16, kernel_rope_vision_f32, kernel_rope_vision_f16;
     cl_kernel kernel_cpy_f16_f16, kernel_cpy_f16_f32, kernel_cpy_f32_f16, kernel_cpy_f32_f32, kernel_cpy_f32_f32_pack, kernel_cpy_i32_i32;
+    cl_kernel kernel_cpy_f32_f32_flat = nullptr;
     cl_kernel kernel_mul_mat_f32_f32;
     cl_kernel kernel_mul_mat_f16_f16;
     cl_kernel kernel_mul_mat_f16_f32_1row;
@@ -1441,6 +1442,13 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         CL_CHECK((backend_ctx->kernel_cpy_f32_f16 = clCreateKernel(prog, "kernel_cpy_f32_f16", &err), err));
         CL_CHECK((backend_ctx->kernel_cpy_f32_f32 = clCreateKernel(prog, "kernel_cpy_f32_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_cpy_f32_f32_pack = clCreateKernel(prog, "kernel_cpy_f32_f32_pack", &err), err));
+        {   // optional: without it ggml_cl_cpy keeps the row-mapped kernel
+            cl_int err_flat = CL_SUCCESS;
+            cl_kernel k = clCreateKernel(prog, "kernel_cpy_f32_f32_flat", &err_flat);
+            if (err_flat == CL_SUCCESS) {
+                backend_ctx->kernel_cpy_f32_f32_flat = k;
+            }
+        }
         CL_CHECK((backend_ctx->kernel_cpy_i32_i32 = clCreateKernel(prog, "kernel_cpy_i32_i32", &err), err));
         GGML_LOG_CONT(".");
     }
@@ -23809,6 +23817,38 @@ static void ggml_cl_cpy(ggml_backend_t backend, const ggml_tensor * src0, const 
 
     cl_ulong offset0 = extra0->offset + src0->view_offs;
     cl_ulong offset1 = extra1->offset + src1->view_offs;
+
+    // A contiguous f32 -> f32 copy is a linear move. The kernel below maps one workgroup to
+    // each row, so a tensor with few long rows runs on a single compute unit; dispatch those
+    // over the whole device instead. GGML_OPENCL_CPY_FLAT=0 restores the row-mapped path.
+    static const bool cpy_flat_on = []{
+        const char * e = getenv("GGML_OPENCL_CPY_FLAT");
+        return !(e && e[0] == '0');
+    }();
+    if (cpy_flat_on && backend_ctx->kernel_cpy_f32_f32_flat != nullptr &&
+        src0t == GGML_TYPE_F32 && src1t == GGML_TYPE_F32 &&
+        ggml_is_contiguous(src0) && ggml_is_contiguous(src1) &&
+        ggml_nelements(src0) == ggml_nelements(src1)) {
+        cl_kernel k = backend_ctx->kernel_cpy_f32_f32_flat;
+        const cl_ulong nelem = (cl_ulong) ggml_nelements(src0);
+        const cl_ulong n4    = nelem / 4;
+
+        CL_CHECK(clSetKernelArg(k, 0, sizeof(cl_mem),   &extra0->data_device));
+        CL_CHECK(clSetKernelArg(k, 1, sizeof(cl_ulong), &offset0));
+        CL_CHECK(clSetKernelArg(k, 2, sizeof(cl_mem),   &extra1->data_device));
+        CL_CHECK(clSetKernelArg(k, 3, sizeof(cl_ulong), &offset1));
+        CL_CHECK(clSetKernelArg(k, 4, sizeof(cl_ulong), &nelem));
+        CL_CHECK(clSetKernelArg(k, 5, sizeof(cl_ulong), &n4));
+
+        // one work item per float4, plus one for the trailing scalars
+        const size_t items = (size_t) n4 + ((nelem % 4) ? 1 : 0);
+        const size_t lsz   = MIN((size_t) 64, backend_ctx->max_workgroup_size);
+        size_t global_work_size[] = { ((items + lsz - 1) / lsz) * lsz, 1, 1 };
+        size_t local_work_size[]  = { lsz, 1, 1 };
+
+        backend_ctx->enqueue_ndrange_kernel(k, 1, global_work_size, local_work_size, src1);
+        return;
+    }
 
     cl_kernel kernel;
 
