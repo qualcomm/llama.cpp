@@ -22704,13 +22704,20 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
             // knobs exist to re-tune them elsewhere. DK=256 gqa=8 must stay at
             // a 128-thread workgroup - the stock 192-thread g8 kernel is what
             // the X2-90 refuses per-kernel.
-            // DK=128 gqa=16 runs head_sub 4, i.e. MQ_GQA=4 across 4 workgroups.
-            // hs=1 would fold all 16 query heads into one workgroup and put the
-            // per-head lane state back over the occupancy cliff -- the same
-            // reason dk512/gqa16 runs 8 and dk512/gqa8 runs 4. MQ_GQA=4 is the
-            // width the default-on dk=128 gqa=4 arm already uses on this device.
+            // DK=128 gqa=16 runs head_sub 8, i.e. MQ_GQA=2. With only 2 KV heads this
+            // shape is bound by per-workgroup accumulator registers rather than by KV
+            // traffic, so splitting further pays even though each sub-group re-reads the
+            // KV rows -- the opposite of the reasoning that put it at 4. Nemotron-H Q4_0,
+            // X2-90, 128 tokens after a 16384-token prompt, bracketed A/B/A/B in one
+            // server run: hs 8 21.624 / 22.179 against hs 16 20.035 / 20.307, and hs 4
+            // measures 19.6 -- so 8 is +11.9% over the old default and +8.6% over 16.
+            // ⚠️ llama-bench ranks 8 and 16 the other way round at the same depth
+            // (22.82 vs 23.09). The two harnesses disagree reproducibly; this follows the
+            // server, both because it is the deployed shape and because its margin is
+            // ~9x larger. A width-2 verify batch also prefers 8 (15.7% over 16), so one
+            // width serves both regimes and no per-batch selection is needed.
             int hs  = (d_head_q == 512) ? ((gqa == 8) ? 4 : ((gqa == 16) ? 8 : 1))
-                    : (d_head_q == 128 && gqa == 16) ? 4
+                    : (d_head_q == 128 && gqa == 16) ? 8
                     : ((gqa == 8) ? 2 : 1);
             int nsg = (d_head_q == 256 && gqa == 8) ? 2 : 4;
             static const int hs_env  = []{ const char * e = getenv("GGML_OPENCL_FA_MQN_HS");
