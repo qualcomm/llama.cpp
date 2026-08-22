@@ -29,6 +29,9 @@ struct htp_allreduce_kernel_params {
     int32_t ne0;
     int32_t ne1;
     int32_t row_size_aligned;
+    int32_t rank_elem_start;
+    int32_t rank_nelem;
+    int32_t n_dsts;
 };
 
 #ifdef __cplusplus

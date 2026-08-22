@@ -100,7 +100,7 @@ static bool   opt_hostbuf = false;
 
 static int    opt_mm_select = 3; // 3 = HMX -> Tiled -> Flat -> CPU, 2 = Tiled -> Flat -> CPU, 1 = Flat -> CPU
 static int    opt_fa_select = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU (unsupported)
-static int    opt_ar_select = 1; // 1 = All-Reduce, 0 = fallback to OP_FENCE/OP_CPY+FENCE
+static int    opt_ar_select = 4; // 4 = fused DMA (default), 3 = fused DIRECT, 2 = unfused DMA, 1 = unfused DIRECT, 0 = fallback to CPY+FENCE
 
 // Default PMU events, if profiling with PMU (mode=2) is enabled
 // See https://docs.qualcomm.com/doc/80-N2040-60/topic/pmu-events.html
@@ -321,6 +321,12 @@ struct ggml_hexagon_opbatch;
 struct ggml_hexagon_opqueue;
 struct ggml_hexagon_shared_buffer;
 struct ggml_hexagon_session;
+
+struct ggml_backend_hexagon_comm_context {
+    std::vector<ggml_backend_t> backends;
+    size_t                      n_backends = 0;
+    uint32_t                    fence_seq  = 0;
+};
 
 struct ggml_hexagon_event {
     ggml_hexagon_session * sess = nullptr;
@@ -1749,22 +1755,24 @@ struct ggml_hexagon_opbatch {
     }
 
     bool try_fuse_allreduce_add(const htp_opnode & node) {
-        if (n_ops == 0) return false;
+        if (n_ops == 0 || opt_ar_select < 3) return false;
         if (node.opcode != HTP_OP_ADD) return false;
 
         htp_opnode & last_node = ops[n_ops - 1];
         if (last_node.opcode != HTP_OP_ALLREDUCE) return false;
 
-        const ggml_tensor * ar_dst = last_node.dst();
+        auto * ar_kparams = (struct htp_allreduce_kernel_params *) last_node.kernel_params;
+        const uint32_t rank = (uint32_t) ar_kparams->rank;
+        const ggml_tensor * ar_local = (rank < last_node.inputs.size()) ? last_node.inputs[rank] : nullptr;
         const ggml_tensor * add_src0 = node.src0();
         const ggml_tensor * add_src1 = node.src1();
 
-        if (!add_src0 || !add_src1 || !ar_dst) return false;
+        if (!add_src0 || !add_src1 || !ar_local) return false;
 
         const ggml_tensor * res_tensor = nullptr;
-        if (add_src0 == ar_dst || add_src0->data == ar_dst->data) {
+        if (add_src0 == ar_local || add_src0->data == ar_local->data) {
             res_tensor = add_src1;
-        } else if (add_src1 == ar_dst || add_src1->data == ar_dst->data) {
+        } else if (add_src1 == ar_local || add_src1->data == ar_local->data) {
             res_tensor = add_src0;
         } else {
             return false;
@@ -1772,22 +1780,36 @@ struct ggml_hexagon_opbatch {
 
         if (!res_tensor || !res_tensor->data) return false;
 
-        if (ar_dst->type != res_tensor->type) return false;
-        if (ar_dst->ne[0] != res_tensor->ne[0] || ar_dst->ne[1] != res_tensor->ne[1] ||
-            ar_dst->ne[2] != res_tensor->ne[2] || ar_dst->ne[3] != res_tensor->ne[3]) {
+        auto * res_extra = (const ggml_hexagon_tensor_extra *) res_tensor->extra;
+        if (res_extra && (res_extra->flags & GGML_HEXAGON_TENSOR_WEIGHT)) {
             return false;
         }
 
-        auto * ar_kparams = (struct htp_allreduce_kernel_params *) last_node.kernel_params;
+        if (ar_local->type != res_tensor->type) return false;
+        if (ar_local->ne[0] != res_tensor->ne[0] || ar_local->ne[1] != res_tensor->ne[1] ||
+            ar_local->ne[2] != res_tensor->ne[2] || ar_local->ne[3] != res_tensor->ne[3]) {
+            return false;
+        }
+        if (ar_local->nb[1] != res_tensor->nb[1] || ar_local->nb[2] != res_tensor->nb[2] ||
+            ar_local->nb[3] != res_tensor->nb[3]) {
+            return false;
+        }
+        if (ggml_is_contiguous(ar_local) != ggml_is_contiguous(res_tensor) ||
+            ggml_is_contiguous(ar_local) != ggml_is_contiguous(node.dst())) {
+            return false;
+        }
+
         struct htp_allreduce_kernel_params new_kparams;
         ggml_hexagon_precompute_allreduce_params(
             sess, node.dst(), (uint32_t) ar_kparams->rank, (uint32_t) ar_kparams->n_ranks, true, &new_kparams
         );
 
-        if ((size_t) new_kparams.vtcm_size > sess->vtcm_size) {
-            HEX_VERBOSE("ggml-hex: %s skip ALLREDUCE_ADD fusion: VTCM needed %d > budget %zu\n",
-                        sess->c_name(), new_kparams.vtcm_size, sess->vtcm_size);
-            return false;
+        if (new_kparams.kernel_type == HTP_ALLREDUCE_KERNEL_DMA_1D || new_kparams.kernel_type == HTP_ALLREDUCE_KERNEL_DMA_2D) {
+            if ((size_t) new_kparams.vtcm_size > sess->vtcm_size) {
+                HEX_VERBOSE("ggml-hex: %s skip ALLREDUCE_ADD fusion: VTCM needed %d > budget %zu\n",
+                            sess->c_name(), new_kparams.vtcm_size, sess->vtcm_size);
+                return false;
+            }
         }
 
         size_t extra_bufs = 0, extra_vmem = 0, extra_tens = 0;
@@ -1823,6 +1845,9 @@ struct ggml_hexagon_opbatch {
         const uint32_t n_ranks = (uint32_t) ar_kparams->n_ranks;
         o.src[2 * n_ranks] = add_tensor(res_tensor);
         o.dst[0]           = add_tensor(node.dst());
+        for (uint32_t d = 1; d < HTP_OP_MAX_OUTPUTS; d++) {
+            o.dst[d] = 0xffff;
+        }
 
         HEX_VERBOSE("ggml-hex: %s fused ALLREDUCE+ADD (#%u)\n", sess->c_name(), n_ops - 1);
         return true;
@@ -2174,13 +2199,44 @@ static void ggml_hexagon_precompute_allreduce_params(
     kparams->ne0 = (int32_t) ne0;
     kparams->ne1 = (int32_t) ne1;
 
+    if (has_add) {
+        kparams->n_dsts = 1;
+        if (is_contiguous) {
+            kparams->rank_elem_start = 0;
+            kparams->rank_nelem      = (int32_t) nelem;
+        } else {
+            kparams->rank_elem_start = 0;
+            kparams->rank_nelem      = (int32_t) ne1;
+        }
+    } else {
+        kparams->n_dsts = (int32_t) n_ranks;
+        if (is_contiguous) {
+            const uint32_t rank_chunk_elems = hex_round_up((nelem + n_ranks - 1) / n_ranks, 128);
+            const uint32_t rank_elem_start  = (std::min)(rank * rank_chunk_elems, nelem);
+            const uint32_t rank_elem_end    = (std::min)(rank_elem_start + rank_chunk_elems, nelem);
+            const uint32_t rank_nelem       = rank_elem_end - rank_elem_start;
+            kparams->rank_elem_start        = (int32_t) rank_elem_start;
+            kparams->rank_nelem             = (int32_t) rank_nelem;
+        } else {
+            const uint32_t rank_chunk_rows = (ne1 + n_ranks - 1) / n_ranks;
+            const uint32_t rank_r0         = (std::min)(rank * rank_chunk_rows, ne1);
+            const uint32_t rank_r1         = (std::min)(rank_r0 + rank_chunk_rows, ne1);
+            const uint32_t rank_nrows      = rank_r1 - rank_r0;
+            kparams->rank_elem_start       = (int32_t) rank_r0;
+            kparams->rank_nelem            = (int32_t) rank_nrows;
+        }
+    }
+
+    const bool force_direct = (opt_ar_select == 1 || opt_ar_select == 3);
+
     if (is_contiguous) {
-        const uint32_t n_threads = (std::min)((uint32_t) sess->n_threads, (std::max)(1u, nelem / 1024));
+        const uint32_t rank_nelem = (uint32_t) kparams->rank_nelem;
+        const uint32_t n_threads  = (std::min)((uint32_t) sess->n_threads, (std::max)(1u, rank_nelem / 1024));
         kparams->n_threads = n_threads;
 
         uint32_t block_elems = 65536;
-        if (block_elems > nelem / n_threads && nelem / n_threads > 128) {
-            block_elems = hex_round_up(nelem / (n_threads * 2), 128);
+        if (block_elems > rank_nelem / n_threads && rank_nelem / n_threads > 128) {
+            block_elems = hex_round_up(rank_nelem / (n_threads * 2), 128);
         }
         block_elems = (std::max)(128u, block_elems);
 
@@ -2197,22 +2253,24 @@ static void ggml_hexagon_precompute_allreduce_params(
             kparams->vtcm_size            = n_threads * n_bufs * kparams->vtcm_size_per_thread;
         }
 
-        if (sess->vtcm_size >= (size_t) kparams->vtcm_size) {
-            kparams->elems_per_thread = hex_round_up((nelem + n_threads - 1) / n_threads, block_elems);
+        if (!force_direct && sess->vtcm_size >= (size_t) kparams->vtcm_size) {
+            kparams->elems_per_thread = hex_round_up((rank_nelem + n_threads - 1) / n_threads, block_elems);
             kparams->kernel_type      = HTP_ALLREDUCE_KERNEL_DMA_1D;
         } else {
-            kparams->elems_per_thread = (nelem + n_threads - 1) / n_threads;
+            const uint32_t align_elems = (dst->type == GGML_TYPE_F16) ? 64 : 32;
+            kparams->elems_per_thread = hex_round_up((rank_nelem + n_threads - 1) / n_threads, align_elems);
             kparams->kernel_type      = HTP_ALLREDUCE_KERNEL_DIRECT_1D;
         }
     } else {
-        const uint32_t n_threads = (std::min)((uint32_t) sess->n_threads, (std::max)(1u, ne1));
+        const uint32_t rank_nrows = (uint32_t) kparams->rank_nelem;
+        const uint32_t n_threads  = (std::min)((uint32_t) sess->n_threads, (std::max)(1u, rank_nrows));
         kparams->n_threads = n_threads;
 
         const uint32_t row_bytes = ne0 * elem_size;
         const uint32_t row_size_aligned = (uint32_t) hex_align_up(row_bytes, 128);
         kparams->row_size_aligned = row_size_aligned;
 
-        const uint32_t nrows_per_thread = (ne1 + n_threads - 1) / n_threads;
+        const uint32_t nrows_per_thread = (rank_nrows + n_threads - 1) / n_threads;
         uint32_t block_rows = (std::min)(128u, nrows_per_thread);
         block_rows = (std::max)(1u, block_rows);
         kparams->block_elems = block_rows;
@@ -2228,7 +2286,7 @@ static void ggml_hexagon_precompute_allreduce_params(
             kparams->vtcm_size            = n_threads * n_bufs * kparams->vtcm_size_per_thread;
         }
 
-        if (sess->vtcm_size >= (size_t) kparams->vtcm_size) {
+        if (!force_direct && sess->vtcm_size >= (size_t) kparams->vtcm_size) {
             kparams->elems_per_thread = nrows_per_thread;
             kparams->kernel_type      = HTP_ALLREDUCE_KERNEL_DMA_2D;
         } else {
@@ -2261,7 +2319,9 @@ void ggml_hexagon_session::enqueue_allreduce(
     }
 
     ar_node.outputs.clear();
-    ar_node.outputs.push_back(node);
+    for (size_t i = 0; i < src_tensors.size(); i++) {
+        ar_node.outputs.push_back(src_tensors[i]);
+    }
 
     ggml_hexagon_precompute_allreduce_params(
         this, dst, rank, n_ranks, false,
@@ -5269,12 +5329,6 @@ static ggml_backend_dev_t ggml_backend_hexagon_reg_get_device(ggml_backend_reg_t
 
 // ** communication context for tensor-split allreduce
 
-struct ggml_backend_hexagon_comm_context {
-    std::vector<ggml_backend_t> backends;
-    size_t                      n_backends;
-    uint32_t                    fence_seq;
-};
-
 static void * ggml_backend_hexagon_comm_init(ggml_backend_t * backends, size_t n_backends) {
     if (n_backends < 2 || n_backends > 4) {
         return nullptr;
@@ -5289,7 +5343,7 @@ static void * ggml_backend_hexagon_comm_init(ggml_backend_t * backends, size_t n
     auto * ctx = new ggml_backend_hexagon_comm_context();
     ctx->backends.assign(backends, backends + n_backends);
     ctx->n_backends = n_backends;
-    ctx->fence_seq  = ((uintptr_t) ctx) & 0xFFFF;
+    ctx->fence_seq  = (((uintptr_t) ctx) & 0xFFFF) | 1;
 
     return ctx;
 }
@@ -5325,7 +5379,11 @@ static bool ggml_backend_hexagon_comm_allreduce_tensor(void * comm_ctx_v, struct
         return false;
     }
 
-    uint32_t fence_seq = comm_ctx->fence_seq++;
+    if (comm_ctx->fence_seq == 0) comm_ctx->fence_seq = 1;
+    uint32_t fence_seq_entry = comm_ctx->fence_seq++;
+    if (comm_ctx->fence_seq == 0) comm_ctx->fence_seq = 1;
+    uint32_t fence_seq_exit  = comm_ctx->fence_seq++;
+    if (comm_ctx->fence_seq == 0) comm_ctx->fence_seq = 1;
 
     volatile uint32_t * fences[GGML_HEXAGON_MAX_SESSIONS];
     for (size_t i = 0; i < n_backends; i++) {
@@ -5343,7 +5401,8 @@ static bool ggml_backend_hexagon_comm_allreduce_tensor(void * comm_ctx_v, struct
             }
         }
         fences[i][0] = 0;
-        fences[i][1] = fence_seq;
+        fences[i][1] = fence_seq_entry;
+        fences[i][2] = fence_seq_exit;
     }
 
     static ggml_hexagon_tensor_extra fence_extra { {}, 0, GGML_HEXAGON_TENSOR_FENCE };
@@ -5354,7 +5413,7 @@ static bool ggml_backend_hexagon_comm_allreduce_tensor(void * comm_ctx_v, struct
         fence_tensors[i].extra  = &fence_extra;
         fence_tensors[i].data   = (void *) fences[i];
         fence_tensors[i].type   = GGML_TYPE_I32;
-        fence_tensors[i].ne[0]  = 1;
+        fence_tensors[i].ne[0]  = 4;
         fence_tensors[i].ne[1]  = 1;
         fence_tensors[i].ne[2]  = 1;
         fence_tensors[i].ne[3]  = 1;
