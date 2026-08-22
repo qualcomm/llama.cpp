@@ -2162,6 +2162,22 @@ static bool use_adreno_bin_kernels(ggml_backend_opencl_context * backend_ctx) {
 // probe), and load_cl_kernels() only runs on the first buffer allocation. When
 // the probe wins that race the prefix is empty, the build loses -cl-std, and
 // every subgroup builtin in the kernel is rejected as unsupported.
+// Does this compiler actually ACCEPT a build option? Advertising an extension is not the same
+// as being able to build for it: the Adreno 850 (E17.51) reports cl_qcom_large_buffer and then
+// rejects -qcom-enable-large-buffer with "invalid option", which fails EVERY kernel build and
+// takes the process down. Build a trivial program once and ask.
+static bool ggml_opencl_compiler_accepts(ggml_backend_opencl_context *backend_ctx, const char * opt) {
+    const char * src = "__kernel void ggml_cl_probe(void) {}\n";
+    cl_int err = CL_SUCCESS;
+    cl_program p = clCreateProgramWithSource(backend_ctx->context, 1, &src, NULL, &err);
+    if (err != CL_SUCCESS || p == NULL) {
+        return false;
+    }
+    err = clBuildProgram(p, 0, NULL, opt, NULL, NULL);
+    clReleaseProgram(p);
+    return err == CL_SUCCESS;
+}
+
 static std::string ggml_opencl_make_compile_opts(ggml_backend_opencl_context *backend_ctx) {
     auto opencl_c_std =
         std::string("CL") + std::to_string(backend_ctx->opencl_c_version.major) + "." + std::to_string(backend_ctx->opencl_c_version.minor);
@@ -9415,6 +9431,15 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
         backend_ctx->gpu_family == GPU_FAMILY::ADRENO;
     backend_ctx->adreno_use_large_buffer =
         backend_ctx->adreno_large_buffer_requested && backend_ctx->adreno_has_large_buffer;
+    // ...and the compiler has to accept the option, which is a separate question from the
+    // device advertising the extension -- see ggml_opencl_compiler_accepts().
+    if (backend_ctx->adreno_use_large_buffer &&
+        !ggml_opencl_compiler_accepts(backend_ctx.get(), " -qcom-enable-large-buffer ")) {
+        GGML_LOG_WARN("ggml_opencl: this driver advertises cl_qcom_large_buffer but its "
+                      "compiler rejects -qcom-enable-large-buffer; large buffer mode is off. "
+                      "Allocations over the device cap will fall back to host memory.\n");
+        backend_ctx->adreno_use_large_buffer = false;
+    }
 
     // Every input to the shared compile-option prefix is known by now, so populate it
     // here rather than in load_cl_kernels(): that function only runs on the first
