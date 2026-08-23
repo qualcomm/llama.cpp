@@ -156,7 +156,7 @@ kernel void kernel_mul_mm_iq3_xxs_f32_l4_lm(
                 // one vec4 is exactly one whole grid entry
                 int ib32 = e >> 5;
                 int rem  = e & 31;
-                int l    = rem >> 3;
+                int lg    = rem >> 3;
                 int m    = rem & 7;
                 int which = (m >> 2) & 1;
 
@@ -166,8 +166,8 @@ kernel void kernel_mul_mm_iq3_xxs_f32_l4_lm(
 
                 float db = (float)xb->d * (0.5f + (float)(aux32 >> 28)) * 0.5f;
 
-                uchar signs = ksigns_iq2xs[(aux32 >> (7*l)) & 127];
-                uint  g     = iq3xxs_grid[xb->qs[8*ib32 + 2*l + which]];
+                uchar signs = ksigns_iq2xs[(aux32 >> (7*lg)) & 127];
+                uint  g     = iq3xxs_grid[xb->qs[8*ib32 + 2*lg + which]];
 
                 float4 v1;
                 v1.s0 = db * (float)((g >>  0) & 0xFF) * ((signs & (1 << (m+0))) ? -1.f : 1.f);

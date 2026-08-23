@@ -177,17 +177,17 @@ kernel void kernel_mul_mm_iq3_s_f32_l4_lm(
 
                 int sb   = e >> 5;
                 int rem  = e & 31;
-                int l    = rem >> 3;
+                int lg    = rem >> 3;
                 int m    = rem & 7;
                 int which = (m >> 2) & 1;
 
                 uchar nib = (sb & 1) ? (xb->scales[sb >> 1] >> 4) : (xb->scales[sb >> 1] & 0xf);
                 float db  = (float)xb->d * (float)(1 + 2*nib);
 
-                uint gi = (uint)xb->qs[8*sb + 2*l + which]
-                        | (((uint)xb->qh[sb] << (8 - 2*l - which)) & 256);
+                uint gi = (uint)xb->qs[8*sb + 2*lg + which]
+                        | (((uint)xb->qh[sb] << (8 - 2*lg - which)) & 256);
                 uint  g  = iq3s_grid[gi];
-                uchar sg = xb->signs[4*sb + l];
+                uchar sg = xb->signs[4*sb + lg];
 
                 float4 v1;
                 v1.s0 = db * (float)((g >>  0) & 0xFF) * ((sg & (1 << (m+0))) ? -1.f : 1.f);
