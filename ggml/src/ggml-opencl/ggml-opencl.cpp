@@ -15585,6 +15585,37 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
             }
 #endif // GGML_OPENCL_USE_ADRENO_KERNELS
 
+            // One-shot readback check of the plane split. `data` is still the
+            // original AoS block array, so every plane entry has a known answer.
+            if (getenv("GGML_OPENCL_IQ4XS_SOA_VERIFY")) {
+                const int Mv = (int)tensor->ne[1];
+                const int Kv = (int)tensor->ne[0];
+                const int nbr = Kv / (int)blck;            // blocks per row
+                const unsigned char * src = (const unsigned char *)data;
+
+                std::vector<uint16_t> gd(n_blk), gsh(n_blk);
+                std::vector<uint32_t> gsl(n_blk);
+                CL_CHECK(clEnqueueReadBuffer(queue, extra->d,  CL_TRUE, 0, size_d,  gd.data(),  0, NULL, NULL));
+                CL_CHECK(clEnqueueReadBuffer(queue, extra->sh, CL_TRUE, 0, size_sh, gsh.data(), 0, NULL, NULL));
+                CL_CHECK(clEnqueueReadBuffer(queue, extra->sl, CL_TRUE, 0, size_sl, gsl.data(), 0, NULL, NULL));
+
+                size_t bad_d = 0, bad_sh = 0, bad_sl = 0;
+                for (int y = 0; y < Mv; ++y) {
+                    for (int x = 0; x < nbr; ++x) {
+                        const unsigned char * b = src + (size_t)((size_t)y*nbr + x) * 136;
+                        const uint16_t e_d  = (uint16_t)(b[0] | (b[1] << 8));
+                        const uint16_t e_sh = (uint16_t)(b[2] | (b[3] << 8));
+                        const uint32_t e_sl = (uint32_t)b[4] | ((uint32_t)b[5] << 8)
+                                            | ((uint32_t)b[6] << 16) | ((uint32_t)b[7] << 24);
+                        const size_t idx = (size_t)x * Mv + y;   // feature-major
+                        if (gd [idx] != e_d ) bad_d++;
+                        if (gsh[idx] != e_sh) bad_sh++;
+                        if (gsl[idx] != e_sl) bad_sl++;
+                    }
+                }
+                GGML_LOG_INFO("iq4_xs VERIFY %s: n_blk=%zu bad d=%zu sh=%zu sl=%zu\n",
+                              tensor->name, (size_t)n_blk, bad_d, bad_sh, bad_sl);
+            }
             if (getenv("GGML_OPENCL_IQ4XS_SOA_LOG")) {
                 GGML_LOG_INFO("iq4_xs SOA convert: %s  ne=[%lld,%lld,%lld,%lld]\n",
                               tensor->name, (long long)tensor->ne[0], (long long)tensor->ne[1],
