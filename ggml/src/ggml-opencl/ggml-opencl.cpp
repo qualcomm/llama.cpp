@@ -1454,6 +1454,8 @@ struct ggml_backend_opencl_context {
     // Local size for the f32 l4_lm dispatch: (BM*BN)/(TM*TN). Set at program build
     // when the tile is overridden per-device (A8X builds with -DTN=4 -> 256).
     int f32_lm_nth0 = 128;
+    // Same, for the quantized l4_lm GEMMs. Overridable via GGML_OPENCL_LM_*.
+    int quant_lm_nth0 = 128;
     cl_kernel kernel_gemv_f32_f32_mc;  // multi-column (small-N) f32 GEMV for spec/MTP verify
     cl_kernel kernel_mul_mm_f16_f32_l4_lm;
     cl_kernel kernel_mul_mm_f16_f32_l4_lm_n8 = nullptr;  // narrow-N variant, ne11 <= 8
@@ -3838,6 +3840,27 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         GGML_LOG_CONT(".");
     }
 
+    // The quantized l4_lm tile is overridable so the register/LDS trade can be
+    // swept without a rebuild, the way the f32 kernel already takes -DTN=4 on
+    // A8X. The host local size has to track it: (BM*BN)/(TM*TN).
+    std::string lm_opts = compile_opts;
+    {
+        const char * e_tm = getenv("GGML_OPENCL_LM_TM");
+        const char * e_tn = getenv("GGML_OPENCL_LM_TN");
+        const char * e_bk = getenv("GGML_OPENCL_LM_BK");
+        const int lm_tm = e_tm ? atoi(e_tm) : 4;
+        const int lm_tn = e_tn ? atoi(e_tn) : 8;
+        const int lm_bk = e_bk ? atoi(e_bk) : 32;
+        if (lm_tm != 4)  { lm_opts += " -DTM=" + std::to_string(lm_tm); }
+        if (lm_tn != 8)  { lm_opts += " -DTN=" + std::to_string(lm_tn); }
+        if (lm_bk != 32) { lm_opts += " -DBK=" + std::to_string(lm_bk); }
+        backend_ctx->quant_lm_nth0 = (64 * 64) / (lm_tm * lm_tn);
+        if (lm_tm != 4 || lm_tn != 8 || lm_bk != 32) {
+            GGML_LOG_INFO("ggml_opencl: l4_lm tile TM=%d TN=%d BK=%d -> local size %d\n",
+                          lm_tm, lm_tn, lm_bk, backend_ctx->quant_lm_nth0);
+        }
+    }
+
     // mul_mm_q4_0_f32_l4_lm
     {
 #ifdef GGML_OPENCL_EMBED_KERNELS
@@ -3848,7 +3871,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         const std::string kernel_src = read_file("mul_mm_q4_0_f32_l4_lm.cl");
 #endif
         cl_program prog =
-            build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+            build_program_from_source(backend_ctx, kernel_src.c_str(), lm_opts);
 
         CL_CHECK((backend_ctx->kernel_mul_mm_q4_0_f32_l4_lm = clCreateKernel(prog, "kernel_mul_mm_q4_0_f32_l4_lm", &err), err));
         GGML_LOG_CONT(".");
@@ -3864,7 +3887,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         const std::string kernel_src = read_file("mul_mm_q4_1_f32_l4_lm.cl");
 #endif
         cl_program prog =
-            build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+            build_program_from_source(backend_ctx, kernel_src.c_str(), lm_opts);
 
         CL_CHECK((backend_ctx->kernel_mul_mm_q4_1_f32_l4_lm = clCreateKernel(prog, "kernel_mul_mm_q4_1_f32_l4_lm", &err), err));
         GGML_LOG_CONT(".");
@@ -3880,7 +3903,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         const std::string kernel_src = read_file("mul_mm_q5_0_f32_l4_lm.cl");
 #endif
         cl_program prog =
-            build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+            build_program_from_source(backend_ctx, kernel_src.c_str(), lm_opts);
 
         CL_CHECK((backend_ctx->kernel_mul_mm_q5_0_f32_l4_lm = clCreateKernel(prog, "kernel_mul_mm_q5_0_f32_l4_lm", &err), err));
         GGML_LOG_CONT(".");
@@ -3896,7 +3919,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         const std::string kernel_src = read_file("mul_mm_q5_1_f32_l4_lm.cl");
 #endif
         cl_program prog =
-            build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+            build_program_from_source(backend_ctx, kernel_src.c_str(), lm_opts);
 
         CL_CHECK((backend_ctx->kernel_mul_mm_q5_1_f32_l4_lm = clCreateKernel(prog, "kernel_mul_mm_q5_1_f32_l4_lm", &err), err));
         GGML_LOG_CONT(".");
@@ -3912,7 +3935,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         const std::string kernel_src = read_file("mul_mm_q8_0_f32_l4_lm.cl");
 #endif
         backend_ctx->program_mul_mm_q8_0_f32_l4_lm =
-            build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+            build_program_from_source(backend_ctx, kernel_src.c_str(), lm_opts);
 
         CL_CHECK((backend_ctx->kernel_mul_mm_q8_0_f32_l4_lm = clCreateKernel(backend_ctx->program_mul_mm_q8_0_f32_l4_lm, "kernel_mul_mm_q8_0_f32_l4_lm", &err), err));
         GGML_LOG_CONT(".");
@@ -3928,7 +3951,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         const std::string kernel_src = read_file("mul_mm_q1_0_f32_l4_lm.cl");
 #endif
         cl_program prog =
-            build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+            build_program_from_source(backend_ctx, kernel_src.c_str(), lm_opts);
 
         CL_CHECK((backend_ctx->kernel_mul_mm_q1_0_f32_l4_lm = clCreateKernel(prog, "kernel_mul_mm_q1_0_f32_l4_lm", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -3945,7 +3968,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         const std::string kernel_src = read_file("mul_mm_iq4_nl_f32_l4_lm.cl");
 #endif
         cl_program prog =
-            build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+            build_program_from_source(backend_ctx, kernel_src.c_str(), lm_opts);
 
         CL_CHECK((backend_ctx->kernel_mul_mm_iq4_nl_f32_l4_lm = clCreateKernel(prog, "kernel_mul_mm_iq4_nl_f32_l4_lm", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -3962,7 +3985,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         const std::string kernel_src = read_file("mul_mm_q2_0_f32_l4_lm.cl");
 #endif
         cl_program prog =
-            build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+            build_program_from_source(backend_ctx, kernel_src.c_str(), lm_opts);
 
         CL_CHECK((backend_ctx->kernel_mul_mm_q2_0_f32_l4_lm = clCreateKernel(prog, "kernel_mul_mm_q2_0_f32_l4_lm", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -3979,7 +4002,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         const std::string kernel_src = read_file("mul_mm_tq2_0_f32_l4_lm.cl");
 #endif
         cl_program prog =
-            build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+            build_program_from_source(backend_ctx, kernel_src.c_str(), lm_opts);
 
         CL_CHECK((backend_ctx->kernel_mul_mm_tq2_0_f32_l4_lm = clCreateKernel(prog, "kernel_mul_mm_tq2_0_f32_l4_lm", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -3996,7 +4019,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         const std::string kernel_src = read_file("mul_mm_nvfp4_f32_l4_lm.cl");
 #endif
         cl_program prog =
-            build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+            build_program_from_source(backend_ctx, kernel_src.c_str(), lm_opts);
 
         CL_CHECK((backend_ctx->kernel_mul_mm_nvfp4_f32_l4_lm = clCreateKernel(prog, "kernel_mul_mm_nvfp4_f32_l4_lm", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -4012,7 +4035,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         const std::string kernel_src = read_file("mul_mm_iq3_xxs_f32_l4_lm.cl");
 #endif
         cl_program prog =
-            build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+            build_program_from_source(backend_ctx, kernel_src.c_str(), lm_opts);
 
         CL_CHECK((backend_ctx->kernel_mul_mm_iq3_xxs_f32_l4_lm = clCreateKernel(prog, "kernel_mul_mm_iq3_xxs_f32_l4_lm", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -4028,7 +4051,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         const std::string kernel_src = read_file("mul_mm_iq3_s_f32_l4_lm.cl");
 #endif
         cl_program prog =
-            build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+            build_program_from_source(backend_ctx, kernel_src.c_str(), lm_opts);
 
         CL_CHECK((backend_ctx->kernel_mul_mm_iq3_s_f32_l4_lm = clCreateKernel(prog, "kernel_mul_mm_iq3_s_f32_l4_lm", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -4045,7 +4068,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         const std::string kernel_src = read_file("mul_mm_iq2_xxs_f32_l4_lm.cl");
 #endif
         cl_program prog =
-            build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+            build_program_from_source(backend_ctx, kernel_src.c_str(), lm_opts);
 
         CL_CHECK((backend_ctx->kernel_mul_mm_iq2_xxs_f32_l4_lm = clCreateKernel(prog, "kernel_mul_mm_iq2_xxs_f32_l4_lm", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -4062,7 +4085,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         const std::string kernel_src = read_file("mul_mm_iq2_xs_f32_l4_lm.cl");
 #endif
         cl_program prog =
-            build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+            build_program_from_source(backend_ctx, kernel_src.c_str(), lm_opts);
 
         CL_CHECK((backend_ctx->kernel_mul_mm_iq2_xs_f32_l4_lm = clCreateKernel(prog, "kernel_mul_mm_iq2_xs_f32_l4_lm", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -4079,7 +4102,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         const std::string kernel_src = read_file("mul_mm_iq2_s_f32_l4_lm.cl");
 #endif
         cl_program prog =
-            build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+            build_program_from_source(backend_ctx, kernel_src.c_str(), lm_opts);
 
         CL_CHECK((backend_ctx->kernel_mul_mm_iq2_s_f32_l4_lm = clCreateKernel(prog, "kernel_mul_mm_iq2_s_f32_l4_lm", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -4095,7 +4118,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         const std::string kernel_src = read_file("mul_mm_iq1_s_f32_l4_lm.cl");
 #endif
         cl_program prog =
-            build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+            build_program_from_source(backend_ctx, kernel_src.c_str(), lm_opts);
 
         CL_CHECK((backend_ctx->kernel_mul_mm_iq1_s_f32_l4_lm = clCreateKernel(prog, "kernel_mul_mm_iq1_s_f32_l4_lm", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -4112,7 +4135,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         const std::string kernel_src = read_file("mul_mm_iq1_m_f32_l4_lm.cl");
 #endif
         cl_program prog =
-            build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+            build_program_from_source(backend_ctx, kernel_src.c_str(), lm_opts);
 
         CL_CHECK((backend_ctx->kernel_mul_mm_iq1_m_f32_l4_lm = clCreateKernel(prog, "kernel_mul_mm_iq1_m_f32_l4_lm", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -4129,7 +4152,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         const std::string kernel_src = read_file("mul_mm_tq1_0_f32_l4_lm.cl");
 #endif
         cl_program prog =
-            build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+            build_program_from_source(backend_ctx, kernel_src.c_str(), lm_opts);
 
         CL_CHECK((backend_ctx->kernel_mul_mm_tq1_0_f32_l4_lm = clCreateKernel(prog, "kernel_mul_mm_tq1_0_f32_l4_lm", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -4145,7 +4168,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         const std::string kernel_src = read_file("mul_mm_iq4_xs_f32_l4_lm.cl");
 #endif
         cl_program prog =
-            build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+            build_program_from_source(backend_ctx, kernel_src.c_str(), lm_opts);
 
         CL_CHECK((backend_ctx->kernel_mul_mm_iq4_xs_f32_l4_lm = clCreateKernel(prog, "kernel_mul_mm_iq4_xs_f32_l4_lm", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -4162,7 +4185,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         const std::string kernel_src = read_file("mul_mm_q2_k_f32_l4_lm.cl");
 #endif
         cl_program prog =
-            build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+            build_program_from_source(backend_ctx, kernel_src.c_str(), lm_opts);
 
         CL_CHECK((backend_ctx->kernel_mul_mm_q2_k_f32_l4_lm = clCreateKernel(prog, "kernel_mul_mm_q2_k_f32_l4_lm", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -4179,7 +4202,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         const std::string kernel_src = read_file("mul_mm_q3_k_f32_l4_lm.cl");
 #endif
         cl_program prog =
-            build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+            build_program_from_source(backend_ctx, kernel_src.c_str(), lm_opts);
 
         CL_CHECK((backend_ctx->kernel_mul_mm_q3_k_f32_l4_lm = clCreateKernel(prog, "kernel_mul_mm_q3_k_f32_l4_lm", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -4196,7 +4219,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         const std::string kernel_src = read_file("mul_mm_q4_k_f32_l4_lm.cl");
 #endif
         cl_program prog =
-            build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+            build_program_from_source(backend_ctx, kernel_src.c_str(), lm_opts);
 
         CL_CHECK((backend_ctx->kernel_mul_mm_q4_k_f32_l4_lm = clCreateKernel(prog, "kernel_mul_mm_q4_k_f32_l4_lm", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -4213,7 +4236,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         const std::string kernel_src = read_file("mul_mm_q6_k_f32_l4_lm.cl");
 #endif
         cl_program prog =
-            build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+            build_program_from_source(backend_ctx, kernel_src.c_str(), lm_opts);
 
         CL_CHECK((backend_ctx->kernel_mul_mm_q6_k_f32_l4_lm = clCreateKernel(prog, "kernel_mul_mm_q6_k_f32_l4_lm", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -4230,7 +4253,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         const std::string kernel_src = read_file("mul_mm_q5_k_f32_l4_lm.cl");
 #endif
         cl_program prog =
-            build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+            build_program_from_source(backend_ctx, kernel_src.c_str(), lm_opts);
 
         CL_CHECK((backend_ctx->kernel_mul_mm_q5_k_f32_l4_lm = clCreateKernel(prog, "kernel_mul_mm_q5_k_f32_l4_lm", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -32079,7 +32102,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 }
 
                 kernel = backend_ctx->kernel_mul_mm_q1_0_f32_l4_lm;
-                nth0 = 128; // calculated as (BM*BN)/(TM*TN)
+                nth0 = backend_ctx->quant_lm_nth0; // (BM*BN)/(TM*TN), see GGML_OPENCL_LM_*
 
                 int batch_stride_a = ne00*ne01;
                 int batch_stride_b = ne10*ne11;
@@ -32121,7 +32144,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 }
 
                 kernel = backend_ctx->kernel_mul_mm_q4_0_f32_l4_lm;
-                nth0 = 128; // calculated as (BM*BN)/(TM*TN)
+                nth0 = backend_ctx->quant_lm_nth0; // (BM*BN)/(TM*TN), see GGML_OPENCL_LM_*
 
                 int batch_stride_a = ne00*ne01;
                 int batch_stride_b = ne10*ne11;
@@ -32163,7 +32186,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 }
 
                 kernel = backend_ctx->kernel_mul_mm_q4_1_f32_l4_lm;
-                nth0 = 128; // calculated as (BM*BN)/(TM*TN)
+                nth0 = backend_ctx->quant_lm_nth0; // (BM*BN)/(TM*TN), see GGML_OPENCL_LM_*
 
                 int batch_stride_a = ne00*ne01;
                 int batch_stride_b = ne10*ne11;
@@ -32206,7 +32229,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 }
 
                 kernel = backend_ctx->kernel_mul_mm_q5_0_f32_l4_lm;
-                nth0 = 128; // calculated as (BM*BN)/(TM*TN)
+                nth0 = backend_ctx->quant_lm_nth0; // (BM*BN)/(TM*TN), see GGML_OPENCL_LM_*
 
                 int batch_stride_a = ne00*ne01;
                 int batch_stride_b = ne10*ne11;
@@ -32249,7 +32272,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 }
 
                 kernel = backend_ctx->kernel_mul_mm_q5_1_f32_l4_lm;
-                nth0 = 128; // calculated as (BM*BN)/(TM*TN)
+                nth0 = backend_ctx->quant_lm_nth0; // (BM*BN)/(TM*TN), see GGML_OPENCL_LM_*
 
                 int batch_stride_a = ne00*ne01;
                 int batch_stride_b = ne10*ne11;
@@ -32293,7 +32316,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 }
 
                 kernel = backend_ctx->kernel_mul_mm_q8_0_f32_l4_lm;
-                nth0 = 128; // calculated as (BM*BN)/(TM*TN)
+                nth0 = backend_ctx->quant_lm_nth0; // (BM*BN)/(TM*TN), see GGML_OPENCL_LM_*
 
                 int batch_stride_a = ne00*ne01;
                 int batch_stride_b = ne10*ne11;
@@ -32335,7 +32358,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 }
 
                 kernel = backend_ctx->kernel_mul_mm_iq4_nl_f32_l4_lm;
-                nth0 = 128; // calculated as (BM*BN)/(TM*TN)
+                nth0 = backend_ctx->quant_lm_nth0; // (BM*BN)/(TM*TN), see GGML_OPENCL_LM_*
 
                 int batch_stride_a = ne00*ne01;
                 int batch_stride_b = ne10*ne11;
@@ -32377,7 +32400,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 }
 
                 kernel = backend_ctx->kernel_mul_mm_q2_0_f32_l4_lm;
-                nth0 = 128; // calculated as (BM*BN)/(TM*TN)
+                nth0 = backend_ctx->quant_lm_nth0; // (BM*BN)/(TM*TN), see GGML_OPENCL_LM_*
 
                 int batch_stride_a = ne00*ne01;
                 int batch_stride_b = ne10*ne11;
@@ -32419,7 +32442,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 }
 
                 kernel = backend_ctx->kernel_mul_mm_tq2_0_f32_l4_lm;
-                nth0 = 128; // calculated as (BM*BN)/(TM*TN)
+                nth0 = backend_ctx->quant_lm_nth0; // (BM*BN)/(TM*TN), see GGML_OPENCL_LM_*
 
                 int batch_stride_a = ne00*ne01;
                 int batch_stride_b = ne10*ne11;
@@ -32461,7 +32484,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 }
 
                 kernel = backend_ctx->kernel_mul_mm_nvfp4_f32_l4_lm;
-                nth0 = 128; // calculated as (BM*BN)/(TM*TN)
+                nth0 = backend_ctx->quant_lm_nth0; // (BM*BN)/(TM*TN), see GGML_OPENCL_LM_*
 
                 int batch_stride_a = ne00*ne01;
                 int batch_stride_b = ne10*ne11;
@@ -32503,7 +32526,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 }
 
                 kernel = backend_ctx->kernel_mul_mm_iq3_xxs_f32_l4_lm;
-                nth0 = 128; // calculated as (BM*BN)/(TM*TN)
+                nth0 = backend_ctx->quant_lm_nth0; // (BM*BN)/(TM*TN), see GGML_OPENCL_LM_*
 
                 int batch_stride_a = ne00*ne01;
                 int batch_stride_b = ne10*ne11;
@@ -32545,7 +32568,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 }
 
                 kernel = backend_ctx->kernel_mul_mm_iq3_s_f32_l4_lm;
-                nth0 = 128; // calculated as (BM*BN)/(TM*TN)
+                nth0 = backend_ctx->quant_lm_nth0; // (BM*BN)/(TM*TN), see GGML_OPENCL_LM_*
 
                 int batch_stride_a = ne00*ne01;
                 int batch_stride_b = ne10*ne11;
@@ -32587,7 +32610,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 }
 
                 kernel = backend_ctx->kernel_mul_mm_iq2_xxs_f32_l4_lm;
-                nth0 = 128; // calculated as (BM*BN)/(TM*TN)
+                nth0 = backend_ctx->quant_lm_nth0; // (BM*BN)/(TM*TN), see GGML_OPENCL_LM_*
 
                 int batch_stride_a = ne00*ne01;
                 int batch_stride_b = ne10*ne11;
@@ -32629,7 +32652,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 }
 
                 kernel = backend_ctx->kernel_mul_mm_iq2_xs_f32_l4_lm;
-                nth0 = 128; // calculated as (BM*BN)/(TM*TN)
+                nth0 = backend_ctx->quant_lm_nth0; // (BM*BN)/(TM*TN), see GGML_OPENCL_LM_*
 
                 int batch_stride_a = ne00*ne01;
                 int batch_stride_b = ne10*ne11;
@@ -32671,7 +32694,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 }
 
                 kernel = backend_ctx->kernel_mul_mm_iq2_s_f32_l4_lm;
-                nth0 = 128; // calculated as (BM*BN)/(TM*TN)
+                nth0 = backend_ctx->quant_lm_nth0; // (BM*BN)/(TM*TN), see GGML_OPENCL_LM_*
 
                 int batch_stride_a = ne00*ne01;
                 int batch_stride_b = ne10*ne11;
@@ -32713,7 +32736,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 }
 
                 kernel = backend_ctx->kernel_mul_mm_iq1_s_f32_l4_lm;
-                nth0 = 128; // calculated as (BM*BN)/(TM*TN)
+                nth0 = backend_ctx->quant_lm_nth0; // (BM*BN)/(TM*TN), see GGML_OPENCL_LM_*
 
                 int batch_stride_a = ne00*ne01;
                 int batch_stride_b = ne10*ne11;
@@ -32755,7 +32778,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 }
 
                 kernel = backend_ctx->kernel_mul_mm_iq1_m_f32_l4_lm;
-                nth0 = 128; // calculated as (BM*BN)/(TM*TN)
+                nth0 = backend_ctx->quant_lm_nth0; // (BM*BN)/(TM*TN), see GGML_OPENCL_LM_*
 
                 int batch_stride_a = ne00*ne01;
                 int batch_stride_b = ne10*ne11;
@@ -32797,7 +32820,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 }
 
                 kernel = backend_ctx->kernel_mul_mm_tq1_0_f32_l4_lm;
-                nth0 = 128; // calculated as (BM*BN)/(TM*TN)
+                nth0 = backend_ctx->quant_lm_nth0; // (BM*BN)/(TM*TN), see GGML_OPENCL_LM_*
 
                 int batch_stride_a = ne00*ne01;
                 int batch_stride_b = ne10*ne11;
@@ -32839,7 +32862,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 }
 
                 kernel = backend_ctx->kernel_mul_mm_iq4_xs_f32_l4_lm;
-                nth0 = 128; // calculated as (BM*BN)/(TM*TN)
+                nth0 = backend_ctx->quant_lm_nth0; // (BM*BN)/(TM*TN), see GGML_OPENCL_LM_*
 
                 int batch_stride_a = ne00*ne01;
                 int batch_stride_b = ne10*ne11;
@@ -32881,7 +32904,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 }
 
                 kernel = backend_ctx->kernel_mul_mm_q2_k_f32_l4_lm;
-                nth0 = 128; // calculated as (BM*BN)/(TM*TN)
+                nth0 = backend_ctx->quant_lm_nth0; // (BM*BN)/(TM*TN), see GGML_OPENCL_LM_*
 
                 int batch_stride_a = ne00*ne01;
                 int batch_stride_b = ne10*ne11;
@@ -32923,7 +32946,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 }
 
                 kernel = backend_ctx->kernel_mul_mm_q3_k_f32_l4_lm;
-                nth0 = 128; // calculated as (BM*BN)/(TM*TN)
+                nth0 = backend_ctx->quant_lm_nth0; // (BM*BN)/(TM*TN), see GGML_OPENCL_LM_*
 
                 int batch_stride_a = ne00*ne01;
                 int batch_stride_b = ne10*ne11;
@@ -32966,7 +32989,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 
                 kernel = backend_ctx->kernel_mul_mm_q4_k_f32_l4_lm;
                 // (BM*BN)/(TM*TN): Intel uses an 8x8 microtile (WG=64), others 4x8 (WG=128)
-                nth0 = (backend_ctx->gpu_family == INTEL) ? 64 : 128;
+                nth0 = (backend_ctx->gpu_family == INTEL) ? 64 : backend_ctx->quant_lm_nth0;
 
                 int batch_stride_a = ne00*ne01;
                 int batch_stride_b = ne10*ne11;
@@ -33010,7 +33033,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 }
 
                 kernel = backend_ctx->kernel_mul_mm_q5_k_f32_l4_lm;
-                nth0 = (backend_ctx->gpu_family == INTEL) ? 64 : 128; // Intel 8x8 microtile
+                nth0 = (backend_ctx->gpu_family == INTEL) ? 64 : backend_ctx->quant_lm_nth0; // Intel 8x8 microtile
 
                 int batch_stride_a = ne00*ne01;
                 int batch_stride_b = ne10*ne11;
@@ -33055,7 +33078,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 }
 
                 kernel = backend_ctx->kernel_mul_mm_q6_k_f32_l4_lm;
-                nth0 = 128; // calculated as (BM*BN)/(TM*TN)
+                nth0 = backend_ctx->quant_lm_nth0; // (BM*BN)/(TM*TN), see GGML_OPENCL_LM_*
 
                 int batch_stride_a = ne00*ne01;
                 int batch_stride_b = ne10*ne11;

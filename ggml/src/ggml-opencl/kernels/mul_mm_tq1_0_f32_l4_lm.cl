@@ -20,12 +20,17 @@ constant uchar pow3[6] = { 1, 3, 9, 27, 81, 243 };
 
 #define BM 64
 #define BN 64
+#ifndef BK
 #define BK 32
+#endif
+#ifndef TM
 #ifdef INTEL_GPU
 #define TM 8
-#define TN 8
 #else
 #define TM 4
+#endif
+#endif
+#ifndef TN
 #define TN 8
 #endif
 

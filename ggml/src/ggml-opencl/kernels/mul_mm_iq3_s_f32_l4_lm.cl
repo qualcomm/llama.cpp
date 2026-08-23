@@ -88,12 +88,17 @@ constant uint iq3s_grid[512] = {
 
 #define BM 64
 #define BN 64
+#ifndef BK
 #define BK 32
+#endif
+#ifndef TM
 #ifdef INTEL_GPU
 #define TM 8
-#define TN 8
 #else
 #define TM 4
+#endif
+#endif
+#ifndef TN
 #define TN 8
 #endif
 

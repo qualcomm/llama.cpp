@@ -5,9 +5,15 @@
 
 #define BM 64
 #define BN 64
+#ifndef BK
 #define BK 32
+#endif
+#ifndef TM
 #define TM 4
+#endif
+#ifndef TN
 #define TN 8
+#endif
 
 kernel void kernel_mul_mm_q8_0_f32_l4_lm(
     global char4  * src0_q,

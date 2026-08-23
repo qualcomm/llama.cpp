@@ -5,9 +5,15 @@
 
 #define BM 64
 #define BN 64
+#ifndef BK
 #define BK 32
+#endif
+#ifndef TM
 #define TM 4
+#endif
+#ifndef TN
 #define TN 8
+#endif
 
 constant float kvalues_iq4nl[16] = {
     -127.f, -104.f, -83.f, -65.f, -49.f, -35.f, -22.f, -10.f,
