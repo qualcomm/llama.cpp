@@ -10208,20 +10208,22 @@ static void transpose_2d_as_16b(
     ggml_backend_opencl_context * backend_ctx,
     cl_mem src, cl_mem dst, size_t size,
     cl_int stride, cl_int rows,
-    bool blocking = true
+    bool blocking = true,
+    bool auto_local = false
 ) {
     transpose_2d(backend_ctx, backend_ctx->kernel_transpose_16_buf,
-        src, dst, size, stride, rows, blocking);
+        src, dst, size, stride, rows, blocking, auto_local);
 }
 
 static void transpose_2d_as_32b(
     ggml_backend_opencl_context * backend_ctx,
     cl_mem src, cl_mem dst, size_t size,
     cl_int stride, cl_int rows,
-    bool blocking = true
+    bool blocking = true,
+    bool auto_local = false
 ) {
     transpose_2d(backend_ctx, backend_ctx->kernel_transpose_32_buf,
-        src, dst, size, stride, rows, blocking);
+        src, dst, size, stride, rows, blocking, auto_local);
 }
 #endif // GGML_OPENCL_USE_ADRENO_KERNELS
 
@@ -15570,10 +15572,16 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
                 const int M = tensor->ne[1];
                 const int K = tensor->ne[0];
                 // q is K/4 ushorts per row; the scale planes are K/blck each
-                transpose_2d_as_16b(backend_ctx, extra->q,  extra->q,  size_q,  K/4,           M);
-                transpose_2d_as_16b(backend_ctx, extra->d,  extra->d,  size_d,  K/(int)blck,   M);
-                transpose_2d_as_16b(backend_ctx, extra->sh, extra->sh, size_sh, K/(int)blck,   M);
-                transpose_2d_as_32b(backend_ctx, extra->sl, extra->sl, size_sl, K/(int)blck,   M);
+                // q's stride (K/4) is a multiple of 64, so it takes the fixed local
+                // size. The scale planes are only K/256 wide -- 20, 24, 68 on this
+                // model, i.e. BELOW the hardcoded local size of 64 -- so they must
+                // let the driver choose it (auto_local), or the transpose is
+                // enqueued with an invalid work-group shape and the planes are left
+                // block-major while the GEMM reads them feature-major.
+                transpose_2d_as_16b(backend_ctx, extra->q,  extra->q,  size_q,  K/4,         M);
+                transpose_2d_as_16b(backend_ctx, extra->d,  extra->d,  size_d,  K/(int)blck, M, true, true);
+                transpose_2d_as_16b(backend_ctx, extra->sh, extra->sh, size_sh, K/(int)blck, M, true, true);
+                transpose_2d_as_32b(backend_ctx, extra->sl, extra->sl, size_sl, K/(int)blck, M, true, true);
             }
 #endif // GGML_OPENCL_USE_ADRENO_KERNELS
 
