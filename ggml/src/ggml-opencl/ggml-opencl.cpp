@@ -32367,6 +32367,11 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 return;
             }
             case GGML_TYPE_IQ3_XXS: {
+                // The grid dequant in this GEMM is only correct from A8X on:
+                // Adreno 740 and 619 return +-inf for it. Older parts use the GEMV.
+                if (adreno_gen_level(backend_ctx->adreno_gen) < GEN_LEVEL_X2) {
+                    break;
+                }
                 if (ne11 < 32) {
                     break;
                 }
@@ -32409,6 +32414,11 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 return;
             }
             case GGML_TYPE_IQ3_S: {
+                // The grid dequant in this GEMM is only correct from A8X on:
+                // Adreno 740 and 619 return +-inf for it. Older parts use the GEMV.
+                if (adreno_gen_level(backend_ctx->adreno_gen) < GEN_LEVEL_X2) {
+                    break;
+                }
                 if (ne11 < 32) {
                     break;
                 }
@@ -32451,6 +32461,11 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 return;
             }
             case GGML_TYPE_IQ2_XXS: {
+                // The grid dequant in this GEMM is only correct from A8X on:
+                // Adreno 740 and 619 return +-inf for it. Older parts use the GEMV.
+                if (adreno_gen_level(backend_ctx->adreno_gen) < GEN_LEVEL_X2) {
+                    break;
+                }
                 if (ne11 < 32) {
                     break;
                 }
@@ -32493,6 +32508,11 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 return;
             }
             case GGML_TYPE_IQ2_XS: {
+                // The grid dequant in this GEMM is only correct from A8X on:
+                // Adreno 740 and 619 return +-inf for it. Older parts use the GEMV.
+                if (adreno_gen_level(backend_ctx->adreno_gen) < GEN_LEVEL_X2) {
+                    break;
+                }
                 if (ne11 < 32) {
                     break;
                 }
@@ -32535,6 +32555,11 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 return;
             }
             case GGML_TYPE_IQ2_S: {
+                // The grid dequant in this GEMM is only correct from A8X on:
+                // Adreno 740 and 619 return +-inf for it. Older parts use the GEMV.
+                if (adreno_gen_level(backend_ctx->adreno_gen) < GEN_LEVEL_X2) {
+                    break;
+                }
                 if (ne11 < 32) {
                     break;
                 }

@@ -117,7 +117,8 @@ kernel void kernel_mul_mv_nvfp4_f32(
 
         global char * xrow = (global char *)(x + ib);
 
-        for (int row = 0; row < N_DST; row++) {
+        // only ne01 output rows exist; reading past them can pull in an inf scale
+        for (int row = 0; row < N_DST && first_row + row < ne01; row++) {
             global block_nvfp4 * xb = (global block_nvfp4 *)(xrow + row*nb01);
 
             // one 16 element sub block per thread

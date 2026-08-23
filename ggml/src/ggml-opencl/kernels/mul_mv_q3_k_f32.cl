@@ -138,7 +138,8 @@ kernel void kernel_mul_mv_q3_K_f32(
         global ushort * a = (global ushort *)(x[i].scales);
         global half   * dh = &x[i].d;
 
-        for (int row = 0; row < N_DST; ++row) {
+        // only ne01 output rows exist; reading past them can pull in an inf scale
+        for (int row = 0; row < N_DST && first_row + row < ne01; ++row) {
             float d_all = dh[0];
 
             uint s32   = (uint)a[4] | ((uint)a[5] << 16);

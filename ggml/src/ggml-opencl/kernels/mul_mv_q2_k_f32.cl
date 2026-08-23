@@ -116,7 +116,8 @@ kernel void kernel_mul_mv_q2_K_f32(
         global ushort * qs = (global ushort *)x[ib].qs + 16 * iq + 4 * ir;
         global half   * dh = &x[ib].d;
 
-        for (int row = 0; row < N_DST; row++) {
+        // only ne01 output rows exist; reading past them can pull in an inf scale
+        for (int row = 0; row < N_DST && first_row + row < ne01; row++) {
             float4 acc1 = {0.f, 0.f, 0.f, 0.f};
             float4 acc2 = {0.f, 0.f, 0.f, 0.f};
             for (int i = 0; i < 8; i += 2) {

@@ -100,7 +100,8 @@ kernel void kernel_mul_mv_q2_0_f32(
 
         global char * xrow = (global char *)(x + ib);
 
-        for (int row = 0; row < N_DST; row++) {
+        // only ne01 output rows exist; reading past them can pull in an inf scale
+        for (int row = 0; row < N_DST && first_row + row < ne01; row++) {
             global block_q2_0 * xb = (global block_q2_0 *)(xrow + row*nb01);
 
             global uchar * q = xb->qs + 4*it;
