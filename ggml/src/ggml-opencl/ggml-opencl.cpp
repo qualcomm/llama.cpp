@@ -15613,8 +15613,36 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
                         if (gsl[idx] != e_sl) bad_sl++;
                     }
                 }
-                GGML_LOG_INFO("iq4_xs VERIFY %s: n_blk=%zu bad d=%zu sh=%zu sl=%zu\n",
-                              tensor->name, (size_t)n_blk, bad_d, bad_sh, bad_sl);
+                size_t bad_q = 0, chk_q = 0;
+                {
+                    const int rmax = Mv  < 32 ? Mv  : 32;
+                    const int cmax = nbr <  4 ? nbr : 4;
+                    std::vector<uint16_t> gq((size_t)cmax * 64 * Mv);
+                    CL_CHECK(clEnqueueReadBuffer(queue, extra->q, CL_TRUE, 0,
+                        (size_t)cmax * 64 * Mv * sizeof(uint16_t), gq.data(), 0, NULL, NULL));
+                    unsigned char pl[128];
+                    for (int y = 0; y < rmax; ++y) {
+                        for (int c = 0; c < cmax; ++c) {
+                            const unsigned char * qsp = src + (size_t)((size_t)y*nbr + c) * 136 + 8;
+                            for (int sb2 = 0; sb2 < 8; ++sb2) {
+                                for (int i2 = 0; i2 < 8; ++i2) {
+                                    const unsigned char x0 = qsp[16*sb2 + 2*i2 + 0];
+                                    const unsigned char x1 = qsp[16*sb2 + 2*i2 + 1];
+                                    pl[16*sb2 + i2 + 0] = (unsigned char)((x0 & 0x0F) | ((x1 & 0x0F) << 4));
+                                    pl[16*sb2 + i2 + 8] = (unsigned char)(((x0 & 0xF0) >> 4) | (x1 & 0xF0));
+                                }
+                            }
+                            for (int g = 0; g < 64; ++g) {
+                                const uint16_t e_q = (uint16_t)(pl[2*g] | (pl[2*g+1] << 8));
+                                const size_t idx = (size_t)(c*64 + g) * Mv + y;
+                                if (idx < gq.size() && gq[idx] != e_q) bad_q++;
+                                chk_q++;
+                            }
+                        }
+                    }
+                }
+                GGML_LOG_INFO("iq4_xs VERIFY %s: n_blk=%zu bad d=%zu sh=%zu sl=%zu q=%zu/%zu\n",
+                              tensor->name, (size_t)n_blk, bad_d, bad_sh, bad_sl, bad_q, chk_q);
             }
             if (getenv("GGML_OPENCL_IQ4XS_SOA_LOG")) {
                 GGML_LOG_INFO("iq4_xs SOA convert: %s  ne=[%lld,%lld,%lld,%lld]\n",
