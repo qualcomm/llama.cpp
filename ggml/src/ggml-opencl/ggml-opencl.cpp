@@ -32881,17 +32881,30 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     break;
                 }
 
-                // dp4a (int8) fast path. The l4_lm kernel below expands the
-                // weights to f32 in local memory (16 KB/workgroup) and is
-                // occupancy bound; this keeps them quantized and stages only
-                // the q8_1 activations (~1.1 KB), the way the CUDA MMQ loader
-                // and the other dense dp4a GEMMs here do. Prefill shapes only.
-                // Opt out with GGML_OPENCL_IQ4XS_DENSE_DP4A=0.
+                // dp4a (int8) path, OFF by default: measured slower than the
+                // l4_lm kernel below and kept only as a correctness reference
+                // for the SoA version that should replace it.
+                //
+                // It keeps the weights quantized (about 1.1 KB of local memory
+                // for the q8_1 activations) instead of expanding them to f32
+                // (16 KB), which is the right idea -- shape-matched on X2-90 the
+                // SoA dp4a GEMMs beat l4_lm by 3-8x (out=17408x512: q4_K dp4a
+                // 13.66 ms/call, q5_K 24.72, iq4_xs l4_lm 73.81).
+                //
+                // But reading the weights in their AoS block layout, the way the
+                // CUDA MMQ loader does, does NOT carry over to Adreno: every lane
+                // owns one row and strides by nb01, so the weight reads never
+                // coalesce. Measured 67.29 ms/call against 53.42 for l4_lm on the
+                // same tensors, i.e. 26% slower and ~5-10x off the SoA kernels.
+                // That feature-major SoA layout is exactly what the noshuffle
+                // upload path exists to provide; IQ4_XS needs one of its own
+                // (its SoA form is 144 bytes per 256 weights against 136 packed,
+                // so it cannot reuse the in-place subbuffer trick).
+                //
+                // Enable with GGML_OPENCL_IQ4XS_DENSE_DP4A=1 to re-measure.
                 {
                     static const char * iq4xs_dp4a_env = getenv("GGML_OPENCL_IQ4XS_DENSE_DP4A");
-                    const bool iq4xs_dp4a_on = iq4xs_dp4a_env
-                        ? (atoi(iq4xs_dp4a_env) != 0)
-                        : adreno_dense_dp4a_default_on(backend_ctx);
+                    const bool iq4xs_dp4a_on = iq4xs_dp4a_env && atoi(iq4xs_dp4a_env) != 0;
                     if (iq4xs_dp4a_on && backend_ctx->kernel_mul_mm_iq4_xs_q8_1_dp4a
                             && ne00 % 256 == 0
                             && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1) {
