@@ -5,12 +5,12 @@
 
 #define BM 64
 #define BN 64
-// NOTE: BK must stay 32 here. This loader splits each 32-element block into low
-// nibbles at k+0..3 and high nibbles at k+16..19, so a 16-wide K tile would
-// write past the end of buf_a. The block-reading kernels use BK=16.
-#ifndef BK
+// BK must stay 32 here, and is deliberately NOT overridable: this loader splits
+// each 32-element block into low nibbles at k+0..3 and high nibbles at k+16..19,
+// so a 16-wide K tile writes past the end of buf_a. The #undef makes a stray
+// -DBK from GGML_OPENCL_LM_BK harmless. The block-reading kernels use BK=16.
+#undef  BK
 #define BK 32
-#endif
 #ifndef TM
 #define TM 4
 #endif

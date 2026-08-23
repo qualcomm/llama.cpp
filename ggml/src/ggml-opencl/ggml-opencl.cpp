@@ -3852,11 +3852,15 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         const int lm_tm = e_tm ? atoi(e_tm) : 4;
         const int lm_tn = e_tn ? atoi(e_tn) : 8;
         const int lm_bk = e_bk ? atoi(e_bk) : 32;
-        if (lm_tm != 4)  { lm_opts += " -DTM=" + std::to_string(lm_tm); }
-        if (lm_tn != 8)  { lm_opts += " -DTN=" + std::to_string(lm_tn); }
-        if (lm_bk != 32) { lm_opts += " -DBK=" + std::to_string(lm_bk); }
+        // Emit whenever the variable is set: the kernels carry their own
+        // defaults (BK=16 for the block-reading ones, 32 for the five that
+        // split nibbles across a 32-wide tile), so comparing against a
+        // hardcoded default here would silently drop the override.
+        if (e_tm) { lm_opts += " -DTM=" + std::to_string(lm_tm); }
+        if (e_tn) { lm_opts += " -DTN=" + std::to_string(lm_tn); }
+        if (e_bk) { lm_opts += " -DBK=" + std::to_string(lm_bk); }
         backend_ctx->quant_lm_nth0 = (64 * 64) / (lm_tm * lm_tn);
-        if (lm_tm != 4 || lm_tn != 8 || lm_bk != 32) {
+        if (e_tm || e_tn || e_bk) {
             GGML_LOG_INFO("ggml_opencl: l4_lm tile TM=%d TN=%d BK=%d -> local size %d\n",
                           lm_tm, lm_tn, lm_bk, backend_ctx->quant_lm_nth0);
         }
@@ -32893,6 +32897,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                             && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1) {
                         const int M = ne01, N = ne11, K = ne00;
                         cl_context ctx_cl = backend_ctx->context;
+                        cl_int err = CL_SUCCESS;
 
                         cl_buffer_region areg;
                         areg.origin = offset1;
