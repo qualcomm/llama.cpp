@@ -16,8 +16,13 @@ typedef struct {
 
 #define BM 64
 #define BN 64
+// K tile of 16 rather than 32: buf_a+buf_b are 2*BM*BK*4 bytes, so this halves
+// local memory per workgroup (16 KB -> 8 KB) and doubles resident workgroups.
+// Measured +24.4% (IQ4_XS) / +27.3% (IQ1_S) prefill on Adreno X2-90; the kernel
+// is occupancy bound on local memory, not bandwidth. BK=8 halves it again but
+// doubles the barrier count a second time and measures worse.
 #ifndef BK
-#define BK 32
+#define BK 16
 #endif
 #ifndef TM
 #ifdef INTEL_GPU

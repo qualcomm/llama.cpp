@@ -5,6 +5,9 @@
 
 #define BM 64
 #define BN 64
+// NOTE: BK must stay 32 here. This loader splits each 32-element block into low
+// nibbles at k+0..3 and high nibbles at k+16..19, so a 16-wide K tile would
+// write past the end of buf_a. The block-reading kernels use BK=16.
 #ifndef BK
 #define BK 32
 #endif

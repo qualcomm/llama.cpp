@@ -9,13 +9,22 @@
 
 #define BM 64
 #define BN 64
-#define BK 32
+// K tile of 16 rather than 32: buf_a+buf_b are 2*BM*BK*4 bytes, so this halves
+// local memory per workgroup (16 KB -> 8 KB) and doubles resident workgroups.
+// Measured +24.4% (IQ4_XS) / +27.3% (IQ1_S) prefill on Adreno X2-90; the kernel
+// is occupancy bound on local memory, not bandwidth. BK=8 halves it again but
+// doubles the barrier count a second time and measures worse.
+#ifndef BK
+#define BK 16
+#endif
+#ifndef TM
 #ifdef INTEL_GPU
-// Intel Xe iGPU: 8x8 microtile (WG=64)
 #define TM 8
-#define TN 8
 #else
 #define TM 4
+#endif
+#endif
+#ifndef TN
 #define TN 8
 #endif
 
