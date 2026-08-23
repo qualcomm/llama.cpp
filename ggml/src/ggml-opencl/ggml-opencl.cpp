@@ -15571,7 +15571,6 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
             {
                 const int M = tensor->ne[1];
                 const int K = tensor->ne[0];
-                // q is K/4 ushorts per row; the scale planes are K/blck each
                 // q's stride (K/4) is a multiple of 64, so it takes the fixed local
                 // size. The scale planes are only K/256 wide -- 20, 24, 68 on this
                 // model, i.e. BELOW the hardcoded local size of 64 -- so they must
@@ -15585,7 +15584,6 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
             }
 #endif // GGML_OPENCL_USE_ADRENO_KERNELS
 
-            }
             extra->size_q  = size_q;
             extra->size_d  = size_d;
             extra->size_sh = size_sh;
