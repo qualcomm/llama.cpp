@@ -32793,8 +32793,6 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 #endif // GGML_OPENCL_SOA_Q
             break;
         }
-        case GGML_TYPE_Q2_K:
-        case GGML_TYPE_Q3_K:
         case GGML_TYPE_Q4_K: {
 #ifdef GGML_OPENCL_SOA_Q
             // Intel int8 q8_1 decode GEMV (SYCL-style MMVQ): quantize the single
@@ -33191,8 +33189,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         src0t == GGML_TYPE_Q5_1 ||
         src0t == GGML_TYPE_Q8_0 ||
         src0t == GGML_TYPE_Q1_0 ||
-        src0t == GGML_TYPE_IQ4_NL ||
-        src0t == GGML_TYPE_Q2_K) {
+        src0t == GGML_TYPE_IQ4_NL) {
         // Each SIMD group produces N_DST values in the result. Assuming each
         // workgroup has N_SIMDGROUP SIMD groups, then each workgroup will
         // produce N_DST*N_SIMDGROUP values in the result. Hence, the grid size
@@ -33209,8 +33206,6 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         size_t local_work_size[] = {(size_t)nth0, (size_t)nth1, 1};
 
         backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
-    } else if (src0t == GGML_TYPE_Q3_K) {
-        GGML_ASSERT(false && "not implemented");
     } else if (src0t == GGML_TYPE_Q5_K) {
         size_t global_work_size[] = {(size_t)(ne01+ndst*nth1-1)/(ndst*nth1)*nth0, (size_t)ne11*nth1, (size_t)ne12*ne13};
         size_t local_work_size[] = {(size_t)nth0, (size_t)nth1, 1};
