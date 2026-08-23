@@ -81,12 +81,15 @@ kernel void kernel_mul_mm_q5_k_f32_l4_lm(
     int pos_a = (batch_idx_a * batch_stride_a + ir * BM * stride_a) / LOAD_VEC_A;
     int pos_b = (batch_idx   * batch_stride_b + ic * BN * stride_b) / LOAD_VEC_B;
 
-    float sums[TM * TN];
-    float cache_a[TM];
-    float cache_b[TN];
+    // Accumulate four rows at a time. buf_a is contiguous in the row index, so a
+    // whole TM slice arrives as float4 loads instead of TM scalar ones, and each
+    // vector mad replaces four scalar ones. Same operands in the same order, so
+    // the result is unchanged.
+    float4 sums4[(TM/4) * TN];
+    float4 cache_a4[TM/4];
 
-    for (int i = 0; i < TM * TN; i++) {
-        sums[i] = 0.0f;
+    for (int i = 0; i < (TM/4) * TN; i++) {
+        sums4[i] = (float4)(0.0f);
     }
 
     for (int block = 0; block < ne00; block += BK) {
@@ -169,18 +172,15 @@ kernel void kernel_mul_mm_q5_k_f32_l4_lm(
         pos_b += BK / LOAD_VEC_B;
 
         for (int i = 0; i < BK; i++) {
-            for (int j = 0; j < TM; j++) {
-                cache_a[j] = buf_a[(i) * BM + th_r * TM + j];
-            }
-
-            for (int j = 0; j < TN; j++) {
-                cache_b[j] = buf_b[(i) * BN + th_c * TN + j];
+            for (int a = 0; a < TM/4; a++) {
+                cache_a4[a] = vload4(a, buf_a + (i) * BM + th_r * TM);
             }
 
             for (int cc = 0; cc < TN; cc++) {
-                for (int cr = 0; cr < TM; cr++) {
-                    const int sums_idx = cc*TM + cr;
-                    sums[sums_idx] = mad(cache_a[cr], cache_b[cc], sums[sums_idx]);
+                const float cache_b = buf_b[(i) * BN + th_c * TN + cc];
+                for (int a = 0; a < TM/4; a++) {
+                    const int sums_idx = cc*(TM/4) + a;
+                    sums4[sums_idx] = mad(cache_a4[a], (float4)cache_b, sums4[sums_idx]);
                 }
             }
         }
@@ -193,9 +193,13 @@ kernel void kernel_mul_mm_q5_k_f32_l4_lm(
     const int offsets = batch_idx * batch_stride_d;
 
     for (int cc = 0; cc < TN; cc++) {
-        for (int cr = 0; cr < TM; cr++) {
-            if (dr + cr < ne01 && dc + cc < ne11) {
-                dst[offsets + (dc + cc) * stride_d + dr + cr] = sums[cc * TM + cr];
+        for (int a = 0; a < TM/4; a++) {
+            const float4 v = sums4[cc * (TM/4) + a];
+            const float  vs[4] = { v.s0, v.s1, v.s2, v.s3 };
+            for (int k = 0; k < 4; k++) {
+                if (dr + 4*a + k < ne01 && dc + cc < ne11) {
+                    dst[offsets + (dc + cc) * stride_d + dr + 4*a + k] = vs[k];
+                }
             }
         }
     }
