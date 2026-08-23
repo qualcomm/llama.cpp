@@ -128,6 +128,17 @@ struct block_iq4_nl
 };
 
 //------------------------------------------------------------------------------
+// block_iq4_xs
+//------------------------------------------------------------------------------
+struct block_iq4_xs
+{
+    half     d;
+    ushort   scales_h;
+    uint8_t  scales_l[QK_K/64];
+    uint8_t  qs[QK_K/2];
+};
+
+//------------------------------------------------------------------------------
 // bf16 to f16
 //------------------------------------------------------------------------------
 kernel void kernel_convert_bf16_to_f16(
@@ -2516,6 +2527,56 @@ kernel void kernel_convert_block_iq4_nl_noshuffle(
 
         q[i + 0       ] = convert_uchar(x0 & mask_0F) | convert_uchar((x1 & mask_0F) << 4);
         q[i + QK4_NL/4] = convert_uchar((x0 & mask_F0) >> 4) | convert_uchar(x1 & mask_F0);
+    }
+}
+
+//------------------------------------------------------------------------------
+// IQ4_XS -> planes, in the layout the dp4a GEMM wants.
+//
+// IQ4_XS is IQ4_NL's codebook plus a 256 super-block with eight 6-bit sub-scales,
+// and its 32-element sub-blocks are nibble-ordered exactly like IQ4_NL: elements
+// 0..15 are the low nibbles of qs[0..15], 16..31 the high ones. So the quant
+// plane is the IQ4_NL repack applied once per sub-block, and comes out with the
+// same meaning: ushort j holds the four codebook indices for K = 4j..4j+3.
+//
+// The split is size preserving -- 128 + 2 + 2 + 4 == sizeof(block_iq4_xs) -- so
+// the planes fit as subbuffers of the tensor's own allocation, the way q4_K does.
+// That is why the scales stay packed as scales_h/scales_l instead of being
+// flattened to one half per 32: flattening would need 144 bytes per 256 and no
+// longer fit.
+kernel void kernel_convert_block_iq4_xs_ns(
+    global struct block_iq4_xs * src0,
+    global uchar  * dst_q,     // QK_K/2 bytes per block
+    global half   * dst_d,     // 1 per block
+    global ushort * dst_sh,    // 1 per block
+    global uint   * dst_sl,    // 1 per block, the four scales_l bytes
+    uchar           mask_0F,
+    uchar           mask_F0,
+    ulong           n_blk
+) {
+    const ulong i = get_global_id(0);
+    if (i >= n_blk) {
+        return;
+    }
+    global struct block_iq4_xs * b = (global struct block_iq4_xs *) src0 + i;
+    global uchar * q = (global uchar *) dst_q + (QK_K/2) * i;
+
+    dst_d[i]  = b->d;
+    dst_sh[i] = b->scales_h;
+    dst_sl[i] = ((uint)b->scales_l[0])
+              | ((uint)b->scales_l[1] <<  8)
+              | ((uint)b->scales_l[2] << 16)
+              | ((uint)b->scales_l[3] << 24);
+
+    for (int sb = 0; sb < QK_K/32; ++sb) {
+        global uchar * src = b->qs + 16*sb;
+        global uchar * qo  = q     + 16*sb;
+        for (int i2 = 0; i2 < 8; ++i2) {
+            uchar x0 = src[2*i2 + 0];
+            uchar x1 = src[2*i2 + 1];
+            qo[i2 + 0] = convert_uchar(x0 & mask_0F) | convert_uchar((x1 & mask_0F) << 4);
+            qo[i2 + 8] = convert_uchar((x0 & mask_F0) >> 4) | convert_uchar(x1 & mask_F0);
+        }
     }
 }
 
