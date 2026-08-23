@@ -15577,6 +15577,11 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
             }
 #endif // GGML_OPENCL_USE_ADRENO_KERNELS
 
+            if (getenv("GGML_OPENCL_IQ4XS_SOA_LOG")) {
+                GGML_LOG_INFO("iq4_xs SOA convert: %s  ne=[%lld,%lld,%lld,%lld]\n",
+                              tensor->name, (long long)tensor->ne[0], (long long)tensor->ne[1],
+                              (long long)tensor->ne[2], (long long)tensor->ne[3]);
+            }
             extra->size_q  = size_q;
             extra->size_d  = size_d;
             extra->size_sh = size_sh;
@@ -33197,6 +33202,12 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     }
                 }
 
+                if (getenv("GGML_OPENCL_IQ4XS_SOA_LOG")
+                        && getenv("GGML_OPENCL_IQ4XS_SOA")
+                        && use_adreno_kernels(backend_ctx, src0)) {
+                    GGML_LOG_INFO("iq4_xs LEAK (l4_lm on converted): %s ne00=%d ne01=%d ne11=%d ne02=%d ne12=%d\n",
+                                  src0->name, ne00, ne01, ne11, ne02, ne12);
+                }
                 kernel = backend_ctx->kernel_mul_mm_iq4_xs_f32_l4_lm;
                 nth0 = backend_ctx->quant_lm_nth0; // (BM*BN)/(TM*TN), see GGML_OPENCL_LM_*
 
