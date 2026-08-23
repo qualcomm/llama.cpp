@@ -149,9 +149,11 @@ kernel void kernel_mul_mv_iq3_xxs_f32(
 
         global char * xrow = (global char *)(x + ib);
 
-        // only ne01 output rows exist; reading past them can pull in an inf scale
-        for (int row = 0; row < N_DST && first_row + row < ne01; row++) {
-            global block_iq3_xxs * xb = (global block_iq3_xxs *)(xrow + row*nb01);
+        // keep the trip count fixed and clamp instead of skipping: rows past
+        // ne01 re-read row 0, and their sums are dropped at the store
+        for (int row = 0; row < N_DST; row++) {
+            int rsafe = (first_row + row < ne01) ? row : 0;
+            global block_iq3_xxs * xb = (global block_iq3_xxs *)(xrow + rsafe*nb01);
 
             global uchar * qs = xb->qs + 8*it;
 
