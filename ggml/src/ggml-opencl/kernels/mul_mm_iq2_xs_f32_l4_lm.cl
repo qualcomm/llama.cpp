@@ -250,12 +250,12 @@ kernel void kernel_mul_mm_iq2_xs_f32_l4_lm(
 
                 int ib32 = e >> 5;
                 int rem  = e & 31;
-                int l    = rem >> 3;
+                int lg    = rem >> 3;
                 int j0   = rem & 7;
 
-                ushort q  = xb->qs[4*ib32 + l];
+                ushort q  = xb->qs[4*ib32 + lg];
                 uchar  scb = xb->scales[ib32];
-                float  db  = (float)xb->d * (0.5f + (float)((l < 2) ? (scb & 0xf) : (scb >> 4))) * 0.25f;
+                float  db  = (float)xb->d * (0.5f + (float)((lg < 2) ? (scb & 0xf) : (scb >> 4))) * 0.25f;
 
                 uchar sg = ksigns_iq2xs[q >> 9];
                 uint  g  = iq2xs_grid[2*(q & 511) + (j0 >> 2)];

@@ -369,7 +369,7 @@ kernel void kernel_mul_mm_iq1_s_f32_l4_lm(
 
                 int sb = e >> 5;
                 int r  = e & 31;
-                int l  = r >> 3;
+                int lg  = r >> 3;
                 int j0 = r & 7;                 // 0 or 4: low or high nibbles
                 int sh = (j0 >> 2) * 4;
 
@@ -377,7 +377,7 @@ kernel void kernel_mul_mm_iq1_s_f32_l4_lm(
                 float  dl  = (float)xb->d * (float)(2*((qhb >> 12) & 7) + 1);
                 float  dlt = (qhb & 0x8000) ? (-1.f - IQ1S_DELTA) : (-1.f + IQ1S_DELTA);
 
-                uint gi = (uint)xb->qs[4*sb+l] | ((((uint)qhb >> (3*l)) & 7) << 8);
+                uint gi = (uint)xb->qs[4*sb+lg] | ((((uint)qhb >> (3*lg)) & 7) << 8);
                 uint g  = iq1s_grid_gpu[gi];
 
                 float4 v1;

@@ -368,14 +368,14 @@ kernel void kernel_mul_mm_iq2_s_f32_l4_lm(
 
                 int ib32 = e >> 5;
                 int rem  = e & 31;
-                int l    = rem >> 3;
+                int lg    = rem >> 3;
                 int j0   = rem & 7;
 
                 uchar scb = xb->scales[ib32];
-                float db  = (float)xb->d * (0.5f + (float)((l < 2) ? (scb & 0xf) : (scb >> 4))) * 0.25f;
+                float db  = (float)xb->d * (0.5f + (float)((lg < 2) ? (scb & 0xf) : (scb >> 4))) * 0.25f;
 
-                uint  gi = (uint)xb->qs[4*ib32 + l] | (((uint)xb->qh[ib32] << (8-2*l)) & 0x300);
-                uchar sg = xb->qs[32 + 4*ib32 + l];
+                uint  gi = (uint)xb->qs[4*ib32 + lg] | (((uint)xb->qh[ib32] << (8-2*lg)) & 0x300);
+                uchar sg = xb->qs[32 + 4*ib32 + lg];
                 uint  g  = iq2s_grid[2*gi + (j0 >> 2)];
 
                 float4 v1;

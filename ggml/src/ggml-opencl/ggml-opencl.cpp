@@ -2724,9 +2724,23 @@ static bool ggml_opencl_compiler_accepts(ggml_backend_opencl_context *backend_ct
 static std::string ggml_opencl_make_compile_opts(ggml_backend_opencl_context *backend_ctx) {
     auto opencl_c_std =
         std::string("CL") + std::to_string(backend_ctx->opencl_c_version.major) + "." + std::to_string(backend_ctx->opencl_c_version.minor);
-    std::string compile_opts = std::string("-cl-std=") + opencl_c_std +
-                               " -cl-mad-enable -cl-unsafe-math-optimizations"
-                               " -cl-finite-math-only -cl-fast-relaxed-math";
+    std::string compile_opts = std::string("-cl-std=") + opencl_c_std;
+
+    // GGML_OPENCL_NO_FAST_MATH=1 keeps the math flags off. -cl-finite-math-only in
+    // particular lets the compiler assume no inf or NaN, so an inf result under it
+    // is undefined - worth being able to take out when chasing one.
+    static const bool no_fast_math = getenv("GGML_OPENCL_NO_FAST_MATH") != nullptr;
+    if (!no_fast_math) {
+        compile_opts += " -cl-mad-enable -cl-unsafe-math-optimizations"
+                        " -cl-finite-math-only -cl-fast-relaxed-math";
+    }
+
+    // GGML_OPENCL_OPT_DISABLE=1 builds every kernel unoptimised. Slow; for telling a
+    // codegen bug apart from a source bug.
+    static const bool opt_disable = getenv("GGML_OPENCL_OPT_DISABLE") != nullptr;
+    if (opt_disable) {
+        compile_opts += " -cl-opt-disable";
+    }
 
     if (backend_ctx->adreno_use_large_buffer) {
         compile_opts += " -qcom-enable-large-buffer ";
@@ -3329,6 +3343,11 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         backend_ctx->kernel_compile_opts = ggml_opencl_make_compile_opts(backend_ctx);
     }
     const std::string compile_opts = backend_ctx->kernel_compile_opts;
+
+    // GGML_OPENCL_IQ_OPT_DISABLE=1 builds only the IQ grid GEMVs unoptimised.
+    // Applying -cl-opt-disable to every program segfaults the Adreno compiler.
+    static const bool iq_opt_disable = getenv("GGML_OPENCL_IQ_OPT_DISABLE") != nullptr;
+    const std::string compile_opts_iq = iq_opt_disable ? (compile_opts + " -cl-opt-disable") : compile_opts;
 
     // the per-program option strings built further down start from the std alone
     auto opencl_c_std =
@@ -3938,7 +3957,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         const std::string kernel_src = read_file("mul_mv_iq3_xxs_f32.cl");
 #endif
         cl_program prog =
-            build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+            build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts_iq);
 
         CL_CHECK((backend_ctx->kernel_mul_mv_iq3_xxs_f32 = clCreateKernel(prog, "kernel_mul_mv_iq3_xxs_f32", &err), err));
         CL_CHECK(clReleaseProgram(prog));

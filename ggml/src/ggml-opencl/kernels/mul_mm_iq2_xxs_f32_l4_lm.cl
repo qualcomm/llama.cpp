@@ -185,7 +185,7 @@ kernel void kernel_mul_mm_iq2_xxs_f32_l4_lm(
 
                 int ib32 = e >> 5;
                 int rem  = e & 31;
-                int l    = rem >> 3;
+                int lg    = rem >> 3;
                 int j0   = rem & 7;                 // 0 or 4: which half of the grid entry
 
                 global ushort * q16 = xb->qs + 4*ib32;
@@ -194,8 +194,8 @@ kernel void kernel_mul_mm_iq2_xxs_f32_l4_lm(
 
                 float db = (float)xb->d * (0.5f + (float)(a1 >> 28)) * 0.25f;
 
-                uint  gi = (a0 >> (8*l)) & 0xFF;
-                uchar sg = ksigns_iq2xs[(a1 >> (7*l)) & 127];
+                uint  gi = (a0 >> (8*lg)) & 0xFF;
+                uchar sg = ksigns_iq2xs[(a1 >> (7*lg)) & 127];
                 uint  g  = iq2xxs_grid[2*gi + (j0 >> 2)];
 
                 float4 v1;
