@@ -117,6 +117,16 @@ struct block_q6_K {
 };
 
 //------------------------------------------------------------------------------
+// block_q3_K
+//------------------------------------------------------------------------------
+struct block_q3_K {
+    uint8_t hmask[QK_K/8];   // quants, high bit
+    uint8_t qs[QK_K/4];      // quants, low 2 bits
+    uint8_t scales[12];      // 16 six-bit scales, interleaved
+    half d;                  // super-block scale
+};
+
+//------------------------------------------------------------------------------
 // block_iq4_nl
 //------------------------------------------------------------------------------
 #define QK4_NL 32
@@ -2764,6 +2774,128 @@ kernel void kernel_restore_block_iq3_xxs_ns(
         p[1] = (uchar)((w >>  8) & 0xFF);
         p[2] = (uchar)((w >> 16) & 0xFF);
         p[3] = (uchar)((w >> 24) & 0xFF);
+    }
+}
+
+//------------------------------------------------------------------------------
+// Q3_K -> planes. Unlike the IQ splits this one REORDERS, because q3_K's storage
+// is transposed relative to K: byte qs[l] holds four weights that are 32 apart
+// (one per 2-bit field), so four ADJACENT weights -- one dp4a operand -- live in
+// four different bytes at the same shift. Weight e of a super-block is
+//
+//   sb = e/32, ee = e%32
+//   low  2 bits = (qs[32*(sb/4) + ee] >> (2*(sb%4))) & 3
+//   high 1 bit  = (hmask[ee] >> sb) & 1
+//   value       = low - 4 + 4*high        (so -4..3, comfortably int8)
+//
+// The planes below re-lay that out by K, one element per group of 4 weights:
+//
+//   dst_qs[k/4]  uchar  four 2-bit lows, weight 4g+t in bits 2t..2t+1
+//   dst_hm[k/8]  uchar  two groups' high bits, group 2t+s in bits 4s..4s+3
+//   dst_sc       uint   the 12 scale bytes kept packed, three per super-block
+//   dst_d        half   super-block scale
+//
+// Still size preserving -- 64 + 32 + 12 + 2 == 110 == sizeof(block_q3_K) -- so
+// the planes are subbuffers of the tensor's own allocation. The scales stay
+// packed for exactly that reason: unpacked they would be 16 bytes, not 12.
+//------------------------------------------------------------------------------
+kernel void kernel_convert_block_q3_k_ns(
+    global struct block_q3_K * src0,
+    global uchar * dst_qs,      // QK_K/4 per block
+    global uchar * dst_hm,      // QK_K/8 per block
+    global uint  * dst_sc,      // 3 per block
+    global half  * dst_d,       // 1
+    ulong          n_blk
+) {
+    const ulong i = get_global_id(0);
+    if (i >= n_blk) {
+        return;
+    }
+    global struct block_q3_K * b = (global struct block_q3_K *) src0 + i;
+
+    dst_d[i] = b->d;
+
+    for (int w = 0; w < 3; ++w) {
+        global const uchar * p = b->scales + 4*w;
+        dst_sc[3*i + w] = (uint)p[0] | ((uint)p[1] << 8) | ((uint)p[2] << 16) | ((uint)p[3] << 24);
+    }
+
+    for (int g = 0; g < QK_K/4; ++g) {
+        uint pk = 0;
+        for (int t = 0; t < 4; ++t) {
+            const int e  = 4*g + t;
+            const int sb = e >> 5;
+            const int ee = e & 31;
+            pk |= (uint)(((b->qs[32*(sb >> 2) + ee] >> (2*(sb & 3))) & 3) << (2*t));
+        }
+        dst_qs[(QK_K/4) * i + g] = (uchar)pk;
+    }
+
+    // two groups per hmask byte, so this loop owns the byte and cannot race
+    for (int t = 0; t < QK_K/8; ++t) {
+        uint v = 0;
+        for (int s = 0; s < 2; ++s) {
+            const int g = 2*t + s;
+            for (int u = 0; u < 4; ++u) {
+                const int e  = 4*g + u;
+                const int sb = e >> 5;
+                const int ee = e & 31;
+                v |= (uint)(((b->hmask[ee] >> sb) & 1) << (4*s + u));
+            }
+        }
+        dst_hm[(QK_K/8) * i + t] = (uchar)v;
+    }
+}
+
+//------------------------------------------------------------------------------
+// Q3_K planes -> AoS blocks. Exact inverse of the reorder above; the caller must
+// un-transpose the four planes back to block-major first.
+//------------------------------------------------------------------------------
+kernel void kernel_restore_block_q3_k_ns(
+    global uchar * src_qs,
+    global uchar * src_hm,
+    global uint  * src_sc,
+    global half  * src_d,
+    global struct block_q3_K * dst,
+    ulong          n_blk
+) {
+    const ulong i = get_global_id(0);
+    if (i >= n_blk) {
+        return;
+    }
+    global struct block_q3_K * b = (global struct block_q3_K *) dst + i;
+
+    b->d = src_d[i];
+
+    for (int w = 0; w < 3; ++w) {
+        const uint x = src_sc[3*i + w];
+        global uchar * p = b->scales + 4*w;
+        p[0] = (uchar)( x        & 0xFF);
+        p[1] = (uchar)((x >>  8) & 0xFF);
+        p[2] = (uchar)((x >> 16) & 0xFF);
+        p[3] = (uchar)((x >> 24) & 0xFF);
+    }
+
+    for (int n2 = 0; n2 < 2; ++n2) {
+        for (int ee = 0; ee < 32; ++ee) {
+            uint v = 0;
+            for (int j = 0; j < 4; ++j) {
+                const int sb = 4*n2 + j;
+                const int e  = 32*sb + ee;
+                v |= ((uint)(src_qs[(QK_K/4) * i + (e >> 2)] >> (2*(e & 3))) & 3u) << (2*j);
+            }
+            b->qs[32*n2 + ee] = (uchar)v;
+        }
+    }
+
+    for (int ee = 0; ee < 32; ++ee) {
+        uint v = 0;
+        for (int sb = 0; sb < 8; ++sb) {
+            const int e = 32*sb + ee;
+            const int g = e >> 2;
+            v |= ((uint)(src_hm[(QK_K/8) * i + (g >> 1)] >> (4*(g & 1) + (e & 3))) & 1u) << sb;
+        }
+        b->hmask[ee] = (uchar)v;
     }
 }
 
