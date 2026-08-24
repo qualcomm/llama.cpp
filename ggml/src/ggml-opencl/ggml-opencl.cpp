@@ -2280,6 +2280,10 @@ static std::string ggml_opencl_make_compile_opts(ggml_backend_opencl_context *ba
     // two can be A/B'd from one binary.
     compile_opts += " -DIQ_MV_VEC=" + std::to_string(ggml_cl_iq_mv_vec());
     compile_opts += " -DLM_HALF="   + std::to_string(ggml_cl_lm_half(backend_ctx) ? 1 : 0);
+    // Cost probe only: drops the grid/sign math from the l4_lm tile loader while
+    // keeping every global load, to separate tile-loader ALU from the inner loop.
+    // WRONG RESULTS when set.
+    compile_opts += " -DLM_ABL="    + std::to_string(ggml_cl_env_int("GGML_OPENCL_LM_ABL", 0));
 
     // GGML_OPENCL_OPT_DISABLE=1 builds every kernel unoptimised. Slow; for telling a
     // codegen bug apart from a source bug.

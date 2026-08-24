@@ -111,6 +111,10 @@ constant uint iq3s_grid[512] = {
 // 2*BM*BK*sizeof(elem), so this halves local memory per workgroup again --
 // and unlike shrinking BK it does NOT double the barrier count, which is what
 // made BK=8 lose. Accumulation stays in float; only the staged operands narrow.
+#ifndef LM_ABL
+#define LM_ABL 0
+#endif
+
 #ifndef LM_HALF
 #define LM_HALF 0
 #endif
@@ -217,6 +221,14 @@ kernel void kernel_mul_mm_iq3_s_f32_l4_lm(
                 uint  g  = iq3s_grid[gi];
                 uchar sg = xb->signs[4*sb + lg];
 
+#if LM_ABL
+                // cost probe: same loads, no grid/sign math (WRONG results)
+                float4 v1 = (float4)(db * (float)(gi & 0xFF) + (float)sg);
+                buf_a[(loadr_a * LOAD_VEC_A + 0) * BM + loadc_a + l] = v1.s0;
+                buf_a[(loadr_a * LOAD_VEC_A + 1) * BM + loadc_a + l] = v1.s1;
+                buf_a[(loadr_a * LOAD_VEC_A + 2) * BM + loadc_a + l] = v1.s2;
+                buf_a[(loadr_a * LOAD_VEC_A + 3) * BM + loadc_a + l] = v1.s3;
+#else
                 float4 v1;
                 v1.s0 = db * (float)((g >>  0) & 0xFF) * ((sg & (1 << (m+0))) ? -1.f : 1.f);
                 v1.s1 = db * (float)((g >>  8) & 0xFF) * ((sg & (1 << (m+1))) ? -1.f : 1.f);
@@ -227,6 +239,7 @@ kernel void kernel_mul_mm_iq3_s_f32_l4_lm(
                 buf_a[(loadr_a * LOAD_VEC_A + 1) * BM + loadc_a + l] = v1.s1;
                 buf_a[(loadr_a * LOAD_VEC_A + 2) * BM + loadc_a + l] = v1.s2;
                 buf_a[(loadr_a * LOAD_VEC_A + 3) * BM + loadc_a + l] = v1.s3;
+#endif
             } else {
                 buf_a[(loadr_a * LOAD_VEC_A + 0) * BM + loadc_a + l] = 0.0f;
                 buf_a[(loadr_a * LOAD_VEC_A + 1) * BM + loadc_a + l] = 0.0f;
