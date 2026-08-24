@@ -16,16 +16,21 @@
 // reason this kernel exists: the AoS kernel_mul_mv_iq4_xs_f32 gives every lane
 // a 16 byte slice at a 136 byte stride instead.
 //
+// 🔴 One row per lane on its own is 2.5x SLOWER than the AoS kernel, because it
+// launches only M work items where the AoS one launches 16*M and the GPU is
+// left with ~48 waves. K is therefore split across IQ4XS_MV_NSG subgroups whose
+// partials are reduced through local memory -- the same trick, and the same
+// reason, as kernel_gemv_noshuffle_q4_k_f32's lws=64xNSG.
+//
 // The sub-scale is rebuilt exactly as the dp4a GEMM does:
 //   ls  = scales_l nibble | ((scales_h >> 2*sb) & 3) << 4
 //   d_w = d * (ls - 32)
 
 #define QK_K 256
 
-// Rows each work item accumulates, strided by 64 so every row still lands in a
-// coalesced wave read. More rows means more loads in flight per lane.
-#ifndef IQ4XS_MV_ROWS
-#define IQ4XS_MV_ROWS 1
+// Subgroups per workgroup; each takes every NSG'th super-block along K.
+#ifndef IQ4XS_MV_NSG
+#define IQ4XS_MV_NSG 8
 #endif
 
 constant float kvalues_iq4nl[16] = {
@@ -54,26 +59,17 @@ kernel void kernel_mul_mv_iq4_xs_f32_flat(
     const uint K   = (uint)ne00;
     const uint nsb = K / QK_K;                  // super blocks along K
 
-    // Each workgroup owns 64*IQ4XS_MV_ROWS consecutive rows; derive the base from
-    // the group id, NOT from get_global_id(0), or the row blocks overlap when
-    // IQ4XS_MV_ROWS > 1.
-    const uint row0 = get_group_id(0) * (64u * IQ4XS_MV_ROWS) + get_local_id(0);
-    const uint col  = get_group_id(1);          // token
+    const uint lid = get_local_id(0);           // lane == row within the block
+    const uint sg  = get_local_id(1);           // K-split slice
+    const uint row = get_group_id(0) * 64u + lid;
+    const uint col = get_group_id(1);           // token
 
     global const float * y = src1 + (ulong)col * (uint)ne10;
 
-    float sumf[IQ4XS_MV_ROWS];
-    for (int j = 0; j < IQ4XS_MV_ROWS; ++j) {
-        sumf[j] = 0.f;
-    }
+    float sumf = 0.f;
 
-    for (uint ib = 0; ib < nsb; ++ib) {
-        for (int j = 0; j < IQ4XS_MV_ROWS; ++j) {
-            const uint row = row0 + (uint)j * 64u;
-            if (row >= m) {
-                continue;
-            }
-
+    if (row < m) {
+        for (uint ib = sg; ib < nsb; ib += IQ4XS_MV_NSG) {
             const uint  base = row + ib * m;
             const uint  slv  = src0_sl[base];
             const uint  shv  = (uint)src0_sh[base];
@@ -99,14 +95,23 @@ kernel void kernel_mul_mv_iq4_xs_f32_flat(
                 }
                 acc += (float)(ls - 32) * a;
             }
-            sumf[j] += d * acc;
+            sumf += d * acc;
         }
     }
 
-    for (int j = 0; j < IQ4XS_MV_ROWS; ++j) {
-        const uint row = row0 + (uint)j * 64u;
-        if (row < m) {
-            dst[(ulong)col * (uint)ne0 + row] = sumf[j];
-        }
+#if IQ4XS_MV_NSG > 1
+    __local float part[IQ4XS_MV_NSG][64];
+    part[sg][lid] = sumf;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (sg != 0) {
+        return;
+    }
+    for (uint s = 1; s < IQ4XS_MV_NSG; ++s) {
+        sumf += part[s][lid];
+    }
+#endif
+
+    if (row < m) {
+        dst[(ulong)col * (uint)ne0 + row] = sumf;
     }
 }

@@ -1991,9 +1991,11 @@ static int ggml_cl_iq_mv_vec() {
     return v;
 }
 
-// Rows per work item in the IQ4_XS plane-split decode GEMV.
-static int ggml_cl_iq4xs_mv_rows() {
-    static const int v = ggml_cl_env_int("GGML_OPENCL_IQ4XS_MV_ROWS", 1);
+// Subgroups the IQ4_XS plane-split decode GEMV splits K across. One row per
+// lane alone leaves only M work items, which is 2.5x slower than the AoS
+// kernel; the K-split is what puts the wave count back.
+static int ggml_cl_iq4xs_mv_nsg() {
+    static const int v = ggml_cl_env_int("GGML_OPENCL_IQ4XS_MV_NSG", 8);
     return v;
 }
 
@@ -3042,7 +3044,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         const std::string kernel_src = read_file("mul_mv_iq4_xs_f32_flat.cl");
 #endif
         std::string opts = compile_opts;
-        opts += " -DIQ4XS_MV_ROWS=" + std::to_string(ggml_cl_iq4xs_mv_rows());
+        opts += " -DIQ4XS_MV_NSG=" + std::to_string(ggml_cl_iq4xs_mv_nsg());
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), opts);
 
@@ -33298,7 +33300,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                         ggml_tensor_extra_cl_iq4_xs * ex0 =
                             (ggml_tensor_extra_cl_iq4_xs *)src0->extra;
                         cl_kernel fk = backend_ctx->kernel_mul_mv_iq4_xs_f32_flat;
-                        const int rows = ggml_cl_iq4xs_mv_rows();
+                        const int nsg = ggml_cl_iq4xs_mv_nsg();
                         cl_int ai = 0;
                         CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->q));
                         CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->d));
@@ -33313,10 +33315,9 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                         CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne10));
                         CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne0));
 
-                        const size_t rows_per_wg = (size_t)64 * (size_t)rows;
-                        size_t f_global[3] = { CEIL_DIV((size_t)ne01, rows_per_wg) * 64,
-                                               (size_t)ne11, 1 };
-                        size_t f_local[3]  = { 64, 1, 1 };
+                        size_t f_global[3] = { CEIL_DIV((size_t)ne01, (size_t)64) * 64,
+                                               (size_t)ne11 * (size_t)nsg, 1 };
+                        size_t f_local[3]  = { 64, (size_t)nsg, 1 };
                         backend_ctx->enqueue_ndrange_kernel(fk, 3, f_global, f_local, dst);
                         return;
                     }
@@ -34812,7 +34813,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 ggml_tensor_extra_cl_iq4_xs * ex0 =
                     (ggml_tensor_extra_cl_iq4_xs *)src0->extra;
                 cl_kernel fk = backend_ctx->kernel_mul_mv_iq4_xs_f32_flat;
-                const int rows = ggml_cl_iq4xs_mv_rows();
+                const int nsg = ggml_cl_iq4xs_mv_nsg();
                 cl_int ai = 0;
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->q));
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->d));
@@ -34827,10 +34828,9 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne10));
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne0));
 
-                const size_t rows_per_wg = (size_t)64 * (size_t)rows;
-                size_t f_global[3] = { CEIL_DIV((size_t)ne01, rows_per_wg) * 64,
-                               (size_t)ne11, 1 };
-                size_t f_local[3]  = { 64, 1, 1 };
+                size_t f_global[3] = { CEIL_DIV((size_t)ne01, (size_t)64) * 64,
+                               (size_t)ne11 * (size_t)nsg, 1 };
+                size_t f_local[3]  = { 64, (size_t)nsg, 1 };
                 backend_ctx->enqueue_ndrange_kernel(fk, 3, f_global, f_local, dst);
                 return;
             }
