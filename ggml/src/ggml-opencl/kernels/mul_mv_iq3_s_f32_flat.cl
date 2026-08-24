@@ -18,20 +18,14 @@
 //   sign of value j         = bit (4*(u&1) + j) of sg[u/2]
 //   sub-scale of block sb   = nibble (sb&1) of sc[sb/2], then d * (1 + 2*nib)
 //
-// Both structural lessons from the IQ4_XS kernel carry over:
+// Same two structural lessons as the IQ4_XS kernel, both measured there:
 //   - one row per lane alone launches only M work items and LOSES to the AoS
 //     kernel outright, so K is split across IQ3S_MV_NSG subgroups and the
 //     partials reduced through local memory;
-//   - a lane must move a whole word per plane load. Every IQ3_S plane but the
-//     scale is one BYTE per row, where IQ4_XS's quant plane is a ushort, so a
-//     lane has to own IQ3S_MV_R adjacent rows to read a uint. Measured on
-//     Qwen3.5-4B, tg64: R=1 15.14, R=2 19.73, R=4 <see below>, against the AoS
-//     kernel's 20.55 -- the pairing is worth 30% on its own.
-//
-// IQ3S_MV_R rows per lane are read as one IQ3S_PACK_T; byte r of that word is
-// row+r. m must be a multiple of it, which ggml_cl_iq3s_is_split() enforces at
-// conversion time rather than here: a tensor that gets split into a layout some
-// path cannot read is silent garbage.
+//   - a lane must move more than one plane element per load. IQ3_S is worse off
+//     than IQ4_XS here -- its quant plane is one uchar per 4 weights, not a
+//     ushort -- so IQ3S_MV_R2 pairs adjacent rows and reads every plane through
+//     a ushort view, taking a 64-lane wave from 64 bytes to 128 per weight load.
 
 #define QK_K 256
 
@@ -40,19 +34,19 @@
 #define IQ3S_MV_NSG 8
 #endif
 
-// Rows per work item: 1, 2 or 4.
-#ifndef IQ3S_MV_R
-#define IQ3S_MV_R 4
-#endif
-
-#if IQ3S_MV_R == 4
-#define IQ3S_PACK_T uint
-#elif IQ3S_MV_R == 2
-#define IQ3S_PACK_T ushort
-#elif IQ3S_MV_R == 1
-#define IQ3S_PACK_T uchar
-#else
-#error "IQ3S_MV_R must be 1, 2 or 4"
+// IQ3S_MV_R2=1: one lane owns TWO adjacent rows. Needs m even, which
+// ggml_cl_iq3s_is_split() declines at conversion time rather than here.
+// Qwen3.5-4B tg64: 1 row 15.14, 2 rows 19.73, against the AoS kernel's 20.55.
+//
+// FOUR rows per lane -- what it would take to read a whole uint, the width
+// IQ4_XS already gets from two -- was built and is a REGRESSION: 17.71 against
+// 18.06 for two rows in the same generic form. It quarters the grid, and this
+// kernel is short of work items to begin with; that is the whole reason the
+// K-split across subgroups exists. The per-lane row count and the launch shape
+// are ONE decision, not two. Generalising the hand-written pair to an unrolled
+// r-loop also cost 8% by itself (19.73 -> 18.06), so the pair is what ships.
+#ifndef IQ3S_MV_R2
+#define IQ3S_MV_R2 1
 #endif
 
 constant uint iq3s_grid[512] = {
@@ -161,87 +155,130 @@ kernel void kernel_mul_mv_iq3_s_f32_flat(
 
     global const float * y = src1 + (ulong)col * (uint)ne10;
 
-    const uint mr  = m / IQ3S_MV_R;                 // row groups, == plane row length
-    const uint j   = get_group_id(0) * 64u + lid;   // row group this lane owns
-    const uint row = j * IQ3S_MV_R;
+#if IQ3S_MV_R2
+    const uint mh  = m >> 1;                        // rows per plane row, as ushorts
+    const uint j   = get_group_id(0) * 64u + lid;   // row pair index
+    const uint row = j << 1;
 
-    float sumf[IQ3S_MV_R];
-    #pragma unroll
-    for (uint r = 0; r < IQ3S_MV_R; ++r) { sumf[r] = 0.f; }
+    float sumf  = 0.f;
+    float sumf1 = 0.f;
 
-    if (j < mr) {
-        global const IQ3S_PACK_T * qsp = (global const IQ3S_PACK_T *)src0_qs;
-        global const IQ3S_PACK_T * qhp = (global const IQ3S_PACK_T *)src0_qh;
-        global const IQ3S_PACK_T * sgp = (global const IQ3S_PACK_T *)src0_sg;
-        global const IQ3S_PACK_T * scp = (global const IQ3S_PACK_T *)src0_sc;
+    if (j < mh) {
+        global const ushort * qsu = (global const ushort *)src0_qs;
+        global const ushort * qhu = (global const ushort *)src0_qh;
+        global const ushort * sgu = (global const ushort *)src0_sg;
+        global const ushort * scu = (global const ushort *)src0_sc;
 
         for (uint ib = sgi; ib < nsb; ib += IQ3S_MV_NSG) {
-            float dv[IQ3S_MV_R];
-            #pragma unroll
-            for (uint r = 0; r < IQ3S_MV_R; ++r) { dv[r] = (float)src0_d[row + r + ib * m]; }
+            const half2 dh = vload2(j + ib * mh, src0_d);
+            const float d0 = (float)dh.s0;
+            const float d1 = (float)dh.s1;
 
-            const uint scbase = j + ib * 4u * mr;
-            uint sc4[4];
-            #pragma unroll
-            for (uint t = 0; t < 4u; ++t) { sc4[t] = (uint)scp[scbase + t * mr]; }
+            const uint scbase = j + ib * 4u * mh;
+            ushort sc4[4];
+            sc4[0] = scu[scbase + 0u * mh];
+            sc4[1] = scu[scbase + 1u * mh];
+            sc4[2] = scu[scbase + 2u * mh];
+            sc4[3] = scu[scbase + 3u * mh];
 
-            float acc[IQ3S_MV_R];
-            #pragma unroll
-            for (uint r = 0; r < IQ3S_MV_R; ++r) { acc[r] = 0.f; }
-
+            float acc0 = 0.f, acc1 = 0.f;
             for (uint sb = 0; sb < 8u; ++sb) {
-                const uint scv = sc4[sb >> 1];
-                const uint qhv = (uint)qhp[j + (ib * 8u + sb) * mr];
+                const uint scv  = (uint)sc4[sb >> 1];
+                const uint nib0 = (sb & 1u) ? ((scv >>  4) & 0xFu) : ( scv        & 0xFu);
+                const uint nib1 = (sb & 1u) ? ((scv >> 12) & 0xFu) : ((scv >>  8) & 0xFu);
+
+                const uint qhv = (uint)qhu[j + (ib * 8u + sb) * mh];
+                const uint qh0 = qhv & 0xFFu;
+                const uint qh1 = qhv >> 8;
 
                 const uint grp = ib * 64u + sb * 8u;
-                const uint qsb = j + grp * mr;
-                const uint sgb = j + (ib * 32u + sb * 4u) * mr;
+                const uint qsb = j + grp * mh;
+                const uint sgb = j + (ib * 32u + sb * 4u) * mh;
 
-                float a[IQ3S_MV_R];
-                #pragma unroll
-                for (uint r = 0; r < IQ3S_MV_R; ++r) { a[r] = 0.f; }
-
+                float a0 = 0.f, a1 = 0.f;
                 for (uint u = 0; u < 8u; ++u) {
-                    const uint qsv  = (uint)qsp[qsb + u * mr];   // IQ3S_MV_R rows, one load
-                    const uint sgv  = (uint)sgp[sgb + (u >> 1) * mr];
+                    const uint qsv = (uint)qsu[qsb + u * mh];   // row pair, one load
+                    const uint sgv = (uint)sgu[sgb + (u >> 1) * mh];
+                    const uint g0  = ( qsv       & 0xFFu) | (((qh0 >> u) & 1u) << 8);
+                    const uint g1  = ((qsv >> 8) & 0xFFu) | (((qh1 >> u) & 1u) << 8);
                     const uint base = (u & 1u) * 4u;
                     const float4 yv = vload4(grp + u, y);
-                    #pragma unroll
-                    for (uint r = 0; r < IQ3S_MV_R; ++r) {
-                        const uint sh = 8u * r;
-                        const uint g  = ((qsv >> sh) & 0xFFu) | ((((qhv >> sh) >> u) & 1u) << 8);
-                        a[r] += dot(yv, iq3s_vals(iq3s_grid[g], (sgv >> sh) & 0xFFu, base));
-                    }
+                    a0 += dot(yv, iq3s_vals(iq3s_grid[g0],  sgv       & 0xFFu, base));
+                    a1 += dot(yv, iq3s_vals(iq3s_grid[g1], (sgv >> 8) & 0xFFu, base));
                 }
-                #pragma unroll
-                for (uint r = 0; r < IQ3S_MV_R; ++r) {
-                    const uint nib = ((scv >> (8u * r)) >> (4u * (sb & 1u))) & 0xFu;
-                    acc[r] += (float)(1u + 2u * nib) * a[r];
-                }
+                acc0 += (float)(1u + 2u * nib0) * a0;
+                acc1 += (float)(1u + 2u * nib1) * a1;
             }
-            #pragma unroll
-            for (uint r = 0; r < IQ3S_MV_R; ++r) { sumf[r] += dv[r] * acc[r]; }
+            sumf  += d0 * acc0;
+            sumf1 += d1 * acc1;
         }
     }
+#else
+    const uint row = get_group_id(0) * 64u + lid;
+
+    float sumf = 0.f;
+
+    if (row < m) {
+        for (uint ib = sgi; ib < nsb; ib += IQ3S_MV_NSG) {
+            const float d = (float)src0_d[row + ib * m];
+
+            float acc = 0.f;
+            for (uint sb = 0; sb < 8u; ++sb) {
+                const uint scv = (uint)src0_sc[row + (ib * 4u + (sb >> 1)) * m];
+                const uint nib = (sb & 1u) ? (scv >> 4) : (scv & 0xFu);
+                const uint qhv = (uint)src0_qh[row + (ib * 8u + sb) * m];
+
+                const uint grp = ib * 64u + sb * 8u;
+                const uint qsb = row + grp * m;
+                const uint sgb = row + (ib * 32u + sb * 4u) * m;
+
+                float a = 0.f;
+                for (uint u = 0; u < 8u; ++u) {
+                    const uint g   = (uint)src0_qs[qsb + u * m] | (((qhv >> u) & 1u) << 8);
+                    const uint sgv = (uint)src0_sg[sgb + (u >> 1) * m];
+                    const float4 yv = vload4(grp + u, y);
+                    a += dot(yv, iq3s_vals(iq3s_grid[g], sgv, (u & 1u) * 4u));
+                }
+                acc += (float)(1u + 2u * nib) * a;
+            }
+            sumf += d * acc;
+        }
+    }
+#endif
 
 #if IQ3S_MV_NSG > 1
-    // [slice][row-in-group][lane] so that consecutive lanes stay adjacent.
-    __local float part[IQ3S_MV_NSG][IQ3S_MV_R][64];
-    #pragma unroll
-    for (uint r = 0; r < IQ3S_MV_R; ++r) { part[sgi][r][lid] = sumf[r]; }
+#if IQ3S_MV_R2
+    __local float2 part[IQ3S_MV_NSG][64];
+    part[sgi][lid] = (float2)(sumf, sumf1);
     barrier(CLK_LOCAL_MEM_FENCE);
     if (sgi != 0) {
         return;
     }
     for (uint s = 1; s < IQ3S_MV_NSG; ++s) {
-        #pragma unroll
-        for (uint r = 0; r < IQ3S_MV_R; ++r) { sumf[r] += part[s][r][lid]; }
+        const float2 p = part[s][lid];
+        sumf  += p.s0;
+        sumf1 += p.s1;
+    }
+#else
+    __local float part[IQ3S_MV_NSG][64];
+    part[sgi][lid] = sumf;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (sgi != 0) {
+        return;
+    }
+    for (uint s = 1; s < IQ3S_MV_NSG; ++s) {
+        sumf += part[s][lid];
     }
 #endif
+#endif
 
-    if (j < mr) {
-        global float * o = dst + (ulong)col * (uint)ne0 + row;
-        #pragma unroll
-        for (uint r = 0; r < IQ3S_MV_R; ++r) { o[r] = sumf[r]; }
+#if IQ3S_MV_R2
+    if (j < mh) {
+        vstore2((float2)(sumf, sumf1), 0, dst + (ulong)col * (uint)ne0 + row);
     }
+#else
+    if (row < m) {
+        dst[(ulong)col * (uint)ne0 + row] = sumf;
+    }
+#endif
 }
