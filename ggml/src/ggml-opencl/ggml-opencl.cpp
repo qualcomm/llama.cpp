@@ -1315,6 +1315,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mv_q3_K_f32;
     cl_kernel kernel_mul_mv_iq4_xs_f32;
     cl_kernel kernel_mul_mv_iq4_xs_f32_flat;
+    cl_kernel kernel_mul_mv_iq4_xs_f32_flat_wimg = nullptr;  // same, quant plane through a texture (opt-in)
     cl_kernel kernel_mul_mv_iq1_s_f32;
     cl_kernel kernel_mul_mv_iq1_m_f32;
     cl_kernel kernel_mul_mv_tq1_0_f32;
@@ -2051,6 +2052,15 @@ static bool ggml_cl_iq4xs_wimg_on(const ggml_backend_opencl_context * backend_ct
         return atoi(e) != 0;
     }
     return backend_ctx->adreno_x2_class();
+}
+
+// Weights through the texture in the DECODE GEMV. Separate knob from the prefill
+// one: the two kernels have different lane-to-texel mappings, and the standing
+// rule that a texture pays only when a lane takes a whole texel is satisfied here
+// (a lane owns a row pair == one uint) but not there.
+static int ggml_cl_iq4xs_mv_wimg() {
+    static const int v = ggml_cl_env_int("GGML_OPENCL_IQ4XS_MV_WIMG", 0);
+    return v;
 }
 
 static int ggml_cl_iq4xs_mv_nsg() {
@@ -3251,6 +3261,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             build_program_from_source(backend_ctx, kernel_src.c_str(), opts);
 
         CL_CHECK((backend_ctx->kernel_mul_mv_iq4_xs_f32_flat = clCreateKernel(prog, "kernel_mul_mv_iq4_xs_f32_flat", &err), err));
+        CL_CHECK((backend_ctx->kernel_mul_mv_iq4_xs_f32_flat_wimg = clCreateKernel(prog, "kernel_mul_mv_iq4_xs_f32_flat_wimg", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
@@ -35753,10 +35764,15 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                             && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1) {
                         ggml_tensor_extra_cl_iq4_xs * ex0 =
                             (ggml_tensor_extra_cl_iq4_xs *)src0->extra;
-                        cl_kernel fk = backend_ctx->kernel_mul_mv_iq4_xs_f32_flat;
+                        const bool mv_wimg = ggml_cl_iq4xs_mv_wimg()
+                            && ex0->q_img != nullptr
+                            && backend_ctx->kernel_mul_mv_iq4_xs_f32_flat_wimg;
+                        cl_kernel fk = mv_wimg
+                            ? backend_ctx->kernel_mul_mv_iq4_xs_f32_flat_wimg
+                            : backend_ctx->kernel_mul_mv_iq4_xs_f32_flat;
                         const int nsg = ggml_cl_iq4xs_mv_nsg();
                         cl_int ai = 0;
-                        CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->q));
+                        CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   mv_wimg ? &ex0->q_img : &ex0->q));
                         CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->d));
                         CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->sh));
                         CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->sl));
@@ -37612,10 +37628,15 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1) {
                 ggml_tensor_extra_cl_iq4_xs * ex0 =
                     (ggml_tensor_extra_cl_iq4_xs *)src0->extra;
-                cl_kernel fk = backend_ctx->kernel_mul_mv_iq4_xs_f32_flat;
+                const bool mv_wimg = ggml_cl_iq4xs_mv_wimg()
+                    && ex0->q_img != nullptr
+                    && backend_ctx->kernel_mul_mv_iq4_xs_f32_flat_wimg;
+                cl_kernel fk = mv_wimg
+                    ? backend_ctx->kernel_mul_mv_iq4_xs_f32_flat_wimg
+                    : backend_ctx->kernel_mul_mv_iq4_xs_f32_flat;
                 const int nsg = ggml_cl_iq4xs_mv_nsg();
                 cl_int ai = 0;
-                CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->q));
+                CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   mv_wimg ? &ex0->q_img : &ex0->q));
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->d));
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->sh));
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->sl));
