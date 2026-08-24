@@ -2058,9 +2058,15 @@ static bool ggml_cl_iq4xs_wimg_on(const ggml_backend_opencl_context * backend_ct
 // one: the two kernels have different lane-to-texel mappings, and the standing
 // rule that a texture pays only when a lane takes a whole texel is satisfied here
 // (a lane owns a row pair == one uint) but not there.
-static int ggml_cl_iq4xs_mv_wimg() {
-    static const int v = ggml_cl_env_int("GGML_OPENCL_IQ4XS_MV_WIMG", 0);
-    return v;
+// Measured on X2-90: 3B tg32 27.66 -> 29.50 (+7%), Qwen3.8-27B 4.30 -> 4.44
+// (+3.3%), decode-path perplexity identical. Gated with the rest of the X2
+// defaults -- a texture path is a per-generation question.
+static bool ggml_cl_iq4xs_mv_wimg_on(const ggml_backend_opencl_context * backend_ctx) {
+    static const char * const e = getenv("GGML_OPENCL_IQ4XS_MV_WIMG");
+    if (e && *e) {
+        return atoi(e) != 0;
+    }
+    return backend_ctx->adreno_x2_class();
 }
 
 // Codebook from a packed uint array by shift rather than a float[16] indexed by
@@ -35779,7 +35785,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                             && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1) {
                         ggml_tensor_extra_cl_iq4_xs * ex0 =
                             (ggml_tensor_extra_cl_iq4_xs *)src0->extra;
-                        const bool mv_wimg = ggml_cl_iq4xs_mv_wimg()
+                        const bool mv_wimg = ggml_cl_iq4xs_mv_wimg_on(backend_ctx)
                             && ex0->q_img != nullptr
                             && backend_ctx->kernel_mul_mv_iq4_xs_f32_flat_wimg;
                         cl_kernel fk = mv_wimg
@@ -37643,7 +37649,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1) {
                 ggml_tensor_extra_cl_iq4_xs * ex0 =
                     (ggml_tensor_extra_cl_iq4_xs *)src0->extra;
-                const bool mv_wimg = ggml_cl_iq4xs_mv_wimg()
+                const bool mv_wimg = ggml_cl_iq4xs_mv_wimg_on(backend_ctx)
                     && ex0->q_img != nullptr
                     && backend_ctx->kernel_mul_mv_iq4_xs_f32_flat_wimg;
                 cl_kernel fk = mv_wimg
