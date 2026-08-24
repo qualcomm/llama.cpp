@@ -14138,8 +14138,34 @@ inline bool q5_K_big_head_gpu_optin() {
     return on;
 }
 
+// GGML_OPENCL_Q5K_HEAD_SOA=<rows>: keep a weight with at least that many rows OUT of
+// the transposed layout, so it lands on the plane-split kernels instead. 0 = off.
+//
+// Why a vocab-scale head is the case for it: the transposed layout exists to feed the
+// batched dp4a GEMM, but an output head is a GEMV even during prefill -- only the last
+// token's logits are computed -- so it never reaches the batched shapes, and at head
+// scale the tuned GEMV is the SLOWER of the two. Measured on Llama-3.2-3B UD-IQ1_S,
+// whose q5_K head is 128256 x 3072, against the 27B whose 248320-row head does NOT fit
+// the weight images and therefore already takes the plane-split kernel:
+//   gemv_noshuffle_q5_k_f32   61.5 GB/s  (after the row-aware K-split fix)
+//   mul_mv_q5_K_f32_flat      87.7 GB/s  (27B head, shape-matched by role)
+// i.e. the "images fit" case is the slow one, which is the wrong way round.
+inline bool q5_K_head_soa(const ggml_tensor *tensor) {
+    static const long thr = []{
+        const char * e = getenv("GGML_OPENCL_Q5K_HEAD_SOA");
+        return (e && e[0]) ? atol(e) : 0L;
+    }();
+    return thr > 0 && tensor->ne[1] >= thr;
+}
+
 inline bool enable_adreno_trans_weight_q5_K(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor) {
     if (!use_adreno_kernels(backend_ctx, tensor)) {
+        return false;
+    }
+
+    // Checked before the image-fit test so the upload layout and every dispatch that
+    // asks this question stay in agreement -- they all route through here.
+    if (q5_K_head_soa(tensor)) {
         return false;
     }
 
