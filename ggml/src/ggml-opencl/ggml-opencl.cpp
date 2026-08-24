@@ -2095,6 +2095,13 @@ static int ggml_cl_iq4xs_mv_r2() {
     return v;
 }
 
+// Four rows per lane instead of two -- a uint2 weight load rather than a uint.
+// Opt-in until measured; see the kernel header. Assumes ne01 % 4 == 0.
+static int ggml_cl_iq4xs_mv_r4() {
+    static const int v = ggml_cl_env_int("GGML_OPENCL_IQ4XS_MV_R4", 0);
+    return v;
+}
+
 // Same two knobs for the IQ3_S plane-split decode GEMV. Its quant plane is one
 // uchar per 4 weights rather than a ushort, so the row pairing only gets a wave
 // to 128 bytes per weight load where IQ4_XS reaches 256.
@@ -3291,6 +3298,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         std::string opts = compile_opts;
         opts += " -DIQ4XS_MV_NSG=" + std::to_string(ggml_cl_iq4xs_mv_nsg());
         opts += " -DIQ4XS_MV_R2="  + std::to_string(ggml_cl_iq4xs_mv_r2());
+        opts += " -DIQ4XS_MV_R4="  + std::to_string(ggml_cl_iq4xs_mv_r4());
         opts += " -DIQ4XS_MV_ABL=" + std::to_string(ggml_cl_iq4xs_mv_abl());
         opts += " -DIQ4XS_MV_CB=" + std::to_string(ggml_cl_iq4xs_mv_cb());
         cl_program prog =
@@ -35823,7 +35831,8 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                         CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne10));
                         CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne0));
 
-                        const size_t rows_wg = ggml_cl_iq4xs_mv_r2() ? 128 : 64;
+                        const size_t rows_wg = ggml_cl_iq4xs_mv_r4() ? 256
+                                             : ggml_cl_iq4xs_mv_r2() ? 128 : 64;
                         size_t f_global[3] = { CEIL_DIV((size_t)ne01, rows_wg) * 64,
                                                (size_t)ne11 * (size_t)nsg, 1 };
                         size_t f_local[3]  = { 64, (size_t)nsg, 1 };
@@ -37687,7 +37696,8 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne10));
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne0));
 
-                const size_t rows_wg = ggml_cl_iq4xs_mv_r2() ? 128 : 64;
+                const size_t rows_wg = ggml_cl_iq4xs_mv_r4() ? 256
+                                     : ggml_cl_iq4xs_mv_r2() ? 128 : 64;
                 size_t f_global[3] = { CEIL_DIV((size_t)ne01, rows_wg) * 64,
                                (size_t)ne11 * (size_t)nsg, 1 };
                 size_t f_local[3]  = { 64, (size_t)nsg, 1 };

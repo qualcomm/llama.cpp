@@ -40,6 +40,21 @@
 #define IQ4XS_MV_R2 1
 #endif
 
+// IQ4XS_MV_R4=1: four rows per lane instead of two, so a lane's weight load is a
+// uint2 (8 bytes) and a 64-lane wave moves 512 bytes instead of 256.
+//
+// The reason to expect anything: the same move on the q4_K/q6_K cok kernels was
+// +43.8%, because those GEMVs were ISSUE-bound rather than bandwidth-bound at 2
+// bytes per lane. It was also tried on the IQ3_S GEMV and LOST -- but that was
+// register pressure from four live grid indices, and IQ4_XS no longer has a grid
+// to be live: under IQ4XS_MV_CB=3 the codebook is immediates.
+//
+// Needs m % 4 == 0, the same kind of assumption R2 already makes about m being
+// even; the %64 rule on the split path covers both.
+#ifndef IQ4XS_MV_R4
+#define IQ4XS_MV_R4 0
+#endif
+
 // IQ4XS_MV_ABL=1: COST PROBE, WRONG MATH. Replaces the per-operand activation
 // load with a constant, keeping every weight load and all the ALU. The question
 // it answers: this kernel reads 128 bytes of f32 activations per 32-K step per
@@ -221,7 +236,49 @@ kernel void kernel_mul_mv_iq4_xs_f32_flat(
 
     IQ4XS_CB_DECL
 
-#if IQ4XS_MV_R2
+#if IQ4XS_MV_R4
+    const uint mq  = m >> 2;                    // rows per plane row, as uint2s
+    const uint j   = get_group_id(0) * 64u + lid;   // row quad index
+    const uint row = j << 2;
+
+    float4 sum4 = (float4)(0.f);
+
+    if (j < mq) {
+        global const uint * qu = (global const uint *)src0_q;
+        global const uint * su = (global const uint *)src0_sh;
+
+        for (uint ib = sg; ib < nsb; ib += IQ4XS_MV_NSG) {
+            const uint  sbase = j + ib * mq;
+            const uint4 slv   = vload4(sbase, src0_sl);
+            const uint2 shp   = vload2(sbase, su);
+            const half4 dh    = vload4(sbase, src0_d);
+
+            float4 acc = (float4)(0.f);
+            for (uint sb = 0; sb < 8u; ++sb) {
+                const uint lo = (8u * (sb >> 1)) + (4u * (sb & 1u));
+                const float4 ls = (float4)(
+                    (float)((int)((slv.s0 >> lo) & 0xFu) | (int)((((shp.s0      ) >> (2u * sb)) & 3u) << 4)) - 32.f,
+                    (float)((int)((slv.s1 >> lo) & 0xFu) | (int)((((shp.s0 >> 16) >> (2u * sb)) & 3u) << 4)) - 32.f,
+                    (float)((int)((slv.s2 >> lo) & 0xFu) | (int)((((shp.s1      ) >> (2u * sb)) & 3u) << 4)) - 32.f,
+                    (float)((int)((slv.s3 >> lo) & 0xFu) | (int)((((shp.s1 >> 16) >> (2u * sb)) & 3u) << 4)) - 32.f);
+
+                const uint grp = ib * 64u + sb * 8u;
+
+                float4 a = (float4)(0.f);
+                for (uint u = 0; u < 8u; ++u) {
+                    const uint2  w  = vload2(j + (grp + u) * mq, qu);   // four rows, one load
+                    const float4 yv = IQ4XS_YV(grp + u, y);
+                    IQ4XS_ACC(a.s0, yv, (w.s0      ) & 0xFFFFu);
+                    IQ4XS_ACC(a.s1, yv, (w.s0 >> 16)         );
+                    IQ4XS_ACC(a.s2, yv, (w.s1      ) & 0xFFFFu);
+                    IQ4XS_ACC(a.s3, yv, (w.s1 >> 16)         );
+                }
+                acc += ls * a;
+            }
+            sum4 += convert_float4(dh) * acc;
+        }
+    }
+#elif IQ4XS_MV_R2
     const uint mh  = m >> 1;                    // rows per plane row, as uints
     const uint j   = get_group_id(0) * 64u + lid;   // row pair index
     const uint row = j << 1;
@@ -301,7 +358,17 @@ kernel void kernel_mul_mv_iq4_xs_f32_flat(
 #endif
 
 #if IQ4XS_MV_NSG > 1
-#if IQ4XS_MV_R2
+#if IQ4XS_MV_R4
+    __local float4 part4[IQ4XS_MV_NSG][64];
+    part4[sg][lid] = sum4;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (sg != 0) {
+        return;
+    }
+    for (uint s = 1; s < IQ4XS_MV_NSG; ++s) {
+        sum4 += part4[s][lid];
+    }
+#elif IQ4XS_MV_R2
     __local float2 part[IQ4XS_MV_NSG][64];
     part[sg][lid] = (float2)(sumf, sumf1);
     barrier(CLK_LOCAL_MEM_FENCE);
@@ -326,7 +393,11 @@ kernel void kernel_mul_mv_iq4_xs_f32_flat(
 #endif
 #endif
 
-#if IQ4XS_MV_R2
+#if IQ4XS_MV_R4
+    if (j < mq) {
+        vstore4(sum4, 0, dst + (ulong)col * (uint)ne0 + row);
+    }
+#elif IQ4XS_MV_R2
     if (j < mh) {
         vstore2((float2)(sumf, sumf1), 0, dst + (ulong)col * (uint)ne0 + row);
     }
@@ -383,7 +454,51 @@ kernel void kernel_mul_mv_iq4_xs_f32_flat_wimg(
 
     IQ4XS_CB_DECL
 
-#if IQ4XS_MV_R2
+#if IQ4XS_MV_R4
+    const uint mq  = m >> 2;                    // rows per plane row, as uint2s
+    const uint j   = get_group_id(0) * 64u + lid;   // row quad index
+    const uint row = j << 2;
+
+    float4 sum4 = (float4)(0.f);
+
+    if (j < mq) {
+        global const uint * su = (global const uint *)src0_sh;
+
+        for (uint ib = sg; ib < nsb; ib += IQ4XS_MV_NSG) {
+            const uint  sbase = j + ib * mq;
+            const uint4 slv   = vload4(sbase, src0_sl);
+            const uint2 shp   = vload2(sbase, su);
+            const half4 dh    = vload4(sbase, src0_d);
+
+            float4 acc = (float4)(0.f);
+            for (uint sb = 0; sb < 8u; ++sb) {
+                const uint lo = (8u * (sb >> 1)) + (4u * (sb & 1u));
+                const float4 ls = (float4)(
+                    (float)((int)((slv.s0 >> lo) & 0xFu) | (int)((((shp.s0      ) >> (2u * sb)) & 3u) << 4)) - 32.f,
+                    (float)((int)((slv.s1 >> lo) & 0xFu) | (int)((((shp.s0 >> 16) >> (2u * sb)) & 3u) << 4)) - 32.f,
+                    (float)((int)((slv.s2 >> lo) & 0xFu) | (int)((((shp.s1      ) >> (2u * sb)) & 3u) << 4)) - 32.f,
+                    (float)((int)((slv.s3 >> lo) & 0xFu) | (int)((((shp.s1 >> 16) >> (2u * sb)) & 3u) << 4)) - 32.f);
+
+                const uint grp = ib * 64u + sb * 8u;
+
+                float4 a = (float4)(0.f);
+                for (uint u = 0; u < 8u; ++u) {
+                    // four rows are two whole texels
+                    const uint   wi = 2u * (j + (grp + u) * mq);
+                    const uint2  w  = (uint2)(read_imageui(src0_q_img, (int)(wi     )).x,
+                                              read_imageui(src0_q_img, (int)(wi + 1)).x);
+                    const float4 yv = IQ4XS_YV(grp + u, y);
+                    IQ4XS_ACC(a.s0, yv, (w.s0      ) & 0xFFFFu);
+                    IQ4XS_ACC(a.s1, yv, (w.s0 >> 16)         );
+                    IQ4XS_ACC(a.s2, yv, (w.s1      ) & 0xFFFFu);
+                    IQ4XS_ACC(a.s3, yv, (w.s1 >> 16)         );
+                }
+                acc += ls * a;
+            }
+            sum4 += convert_float4(dh) * acc;
+        }
+    }
+#elif IQ4XS_MV_R2
     const uint mh  = m >> 1;                    // rows per plane row, as uints
     const uint j   = get_group_id(0) * 64u + lid;   // row pair index
     const uint row = j << 1;
@@ -466,7 +581,17 @@ kernel void kernel_mul_mv_iq4_xs_f32_flat_wimg(
 #endif
 
 #if IQ4XS_MV_NSG > 1
-#if IQ4XS_MV_R2
+#if IQ4XS_MV_R4
+    __local float4 part4[IQ4XS_MV_NSG][64];
+    part4[sg][lid] = sum4;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (sg != 0) {
+        return;
+    }
+    for (uint s = 1; s < IQ4XS_MV_NSG; ++s) {
+        sum4 += part4[s][lid];
+    }
+#elif IQ4XS_MV_R2
     __local float2 part[IQ4XS_MV_NSG][64];
     part[sg][lid] = (float2)(sumf, sumf1);
     barrier(CLK_LOCAL_MEM_FENCE);
@@ -491,7 +616,11 @@ kernel void kernel_mul_mv_iq4_xs_f32_flat_wimg(
 #endif
 #endif
 
-#if IQ4XS_MV_R2
+#if IQ4XS_MV_R4
+    if (j < mq) {
+        vstore4(sum4, 0, dst + (ulong)col * (uint)ne0 + row);
+    }
+#elif IQ4XS_MV_R2
     if (j < mh) {
         vstore2((float2)(sumf, sumf1), 0, dst + (ulong)col * (uint)ne0 + row);
     }
