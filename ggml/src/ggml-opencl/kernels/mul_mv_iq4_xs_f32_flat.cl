@@ -51,10 +51,20 @@
 #define IQ4XS_MV_ABL 0
 #endif
 
-#if IQ4XS_MV_ABL
+// 1 = drop the activation load. 2 = drop the CODEBOOK lookup (use the raw nibble),
+// keeping every load. Probe 1 measured only +1.9% (3B) / +4.7% (27B), i.e. the
+// wave-uniform activation read is almost free -- so probe 2 asks whether the 16
+// divergent kvalues_iq4nl[] lookups per operand pair are what is left.
+#if IQ4XS_MV_ABL == 1
 #define IQ4XS_YV(g, y) ((float4)(1.0f))
 #else
 #define IQ4XS_YV(g, y) vload4((g), (y))
+#endif
+
+#if IQ4XS_MV_ABL == 2
+#define IQ4XS_CB(n) ((float)(n))
+#else
+#define IQ4XS_CB(n) kvalues_iq4nl[(n)]
 #endif
 
 constant float kvalues_iq4nl[16] = {
@@ -125,14 +135,14 @@ kernel void kernel_mul_mv_iq4_xs_f32_flat(
                     const ushort w0 = (ushort)(w & 0xFFFFu);
                     const ushort w1 = (ushort)(w >> 16);
                     const float4 yv = IQ4XS_YV(grp + u, y);
-                    a0 += yv.s0 * kvalues_iq4nl[(w0      ) & 0xF];
-                    a0 += yv.s1 * kvalues_iq4nl[(w0 >>  4) & 0xF];
-                    a0 += yv.s2 * kvalues_iq4nl[(w0 >>  8) & 0xF];
-                    a0 += yv.s3 * kvalues_iq4nl[(w0 >> 12) & 0xF];
-                    a1 += yv.s0 * kvalues_iq4nl[(w1      ) & 0xF];
-                    a1 += yv.s1 * kvalues_iq4nl[(w1 >>  4) & 0xF];
-                    a1 += yv.s2 * kvalues_iq4nl[(w1 >>  8) & 0xF];
-                    a1 += yv.s3 * kvalues_iq4nl[(w1 >> 12) & 0xF];
+                    a0 += yv.s0 * IQ4XS_CB((w0      ) & 0xF);
+                    a0 += yv.s1 * IQ4XS_CB((w0 >>  4) & 0xF);
+                    a0 += yv.s2 * IQ4XS_CB((w0 >>  8) & 0xF);
+                    a0 += yv.s3 * IQ4XS_CB((w0 >> 12) & 0xF);
+                    a1 += yv.s0 * IQ4XS_CB((w1      ) & 0xF);
+                    a1 += yv.s1 * IQ4XS_CB((w1 >>  4) & 0xF);
+                    a1 += yv.s2 * IQ4XS_CB((w1 >>  8) & 0xF);
+                    a1 += yv.s3 * IQ4XS_CB((w1 >> 12) & 0xF);
                 }
                 acc0 += (float)(ls0 - 32) * a0;
                 acc1 += (float)(ls1 - 32) * a1;
@@ -165,10 +175,10 @@ kernel void kernel_mul_mv_iq4_xs_f32_flat(
                 for (uint u = 0; u < 8u; ++u) {
                     const ushort w  = src0_q[qb + u * m];
                     const float4 yv = IQ4XS_YV(grp + u, y);
-                    a += yv.s0 * kvalues_iq4nl[(w      ) & 0xF];
-                    a += yv.s1 * kvalues_iq4nl[(w >>  4) & 0xF];
-                    a += yv.s2 * kvalues_iq4nl[(w >>  8) & 0xF];
-                    a += yv.s3 * kvalues_iq4nl[(w >> 12) & 0xF];
+                    a += yv.s0 * IQ4XS_CB((w      ) & 0xF);
+                    a += yv.s1 * IQ4XS_CB((w >>  4) & 0xF);
+                    a += yv.s2 * IQ4XS_CB((w >>  8) & 0xF);
+                    a += yv.s3 * IQ4XS_CB((w >> 12) & 0xF);
                 }
                 acc += (float)(ls - 32) * a;
             }
@@ -295,14 +305,14 @@ kernel void kernel_mul_mv_iq4_xs_f32_flat_wimg(
                     const ushort w0 = (ushort)(w & 0xFFFFu);
                     const ushort w1 = (ushort)(w >> 16);
                     const float4 yv = IQ4XS_YV(grp + u, y);
-                    a0 += yv.s0 * kvalues_iq4nl[(w0      ) & 0xF];
-                    a0 += yv.s1 * kvalues_iq4nl[(w0 >>  4) & 0xF];
-                    a0 += yv.s2 * kvalues_iq4nl[(w0 >>  8) & 0xF];
-                    a0 += yv.s3 * kvalues_iq4nl[(w0 >> 12) & 0xF];
-                    a1 += yv.s0 * kvalues_iq4nl[(w1      ) & 0xF];
-                    a1 += yv.s1 * kvalues_iq4nl[(w1 >>  4) & 0xF];
-                    a1 += yv.s2 * kvalues_iq4nl[(w1 >>  8) & 0xF];
-                    a1 += yv.s3 * kvalues_iq4nl[(w1 >> 12) & 0xF];
+                    a0 += yv.s0 * IQ4XS_CB((w0      ) & 0xF);
+                    a0 += yv.s1 * IQ4XS_CB((w0 >>  4) & 0xF);
+                    a0 += yv.s2 * IQ4XS_CB((w0 >>  8) & 0xF);
+                    a0 += yv.s3 * IQ4XS_CB((w0 >> 12) & 0xF);
+                    a1 += yv.s0 * IQ4XS_CB((w1      ) & 0xF);
+                    a1 += yv.s1 * IQ4XS_CB((w1 >>  4) & 0xF);
+                    a1 += yv.s2 * IQ4XS_CB((w1 >>  8) & 0xF);
+                    a1 += yv.s3 * IQ4XS_CB((w1 >> 12) & 0xF);
                 }
                 acc0 += (float)(ls0 - 32) * a0;
                 acc1 += (float)(ls1 - 32) * a1;
@@ -337,10 +347,10 @@ kernel void kernel_mul_mv_iq4_xs_f32_flat_wimg(
                     const ushort w  = (ushort)((read_imageui(src0_q_img, (int)(we >> 1)).x
                                                 >> ((we & 1u) * 16u)) & 0xFFFFu);
                     const float4 yv = IQ4XS_YV(grp + u, y);
-                    a += yv.s0 * kvalues_iq4nl[(w      ) & 0xF];
-                    a += yv.s1 * kvalues_iq4nl[(w >>  4) & 0xF];
-                    a += yv.s2 * kvalues_iq4nl[(w >>  8) & 0xF];
-                    a += yv.s3 * kvalues_iq4nl[(w >> 12) & 0xF];
+                    a += yv.s0 * IQ4XS_CB((w      ) & 0xF);
+                    a += yv.s1 * IQ4XS_CB((w >>  4) & 0xF);
+                    a += yv.s2 * IQ4XS_CB((w >>  8) & 0xF);
+                    a += yv.s3 * IQ4XS_CB((w >> 12) & 0xF);
                 }
                 acc += (float)(ls - 32) * a;
             }
