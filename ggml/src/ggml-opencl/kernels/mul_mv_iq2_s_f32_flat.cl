@@ -295,13 +295,16 @@ constant uint iq2s_grid[2048] = {
 // kernels after the grid lookup, and ahead of the activation load at 5.5. The
 // three grid types share this helper verbatim and are together about 30 percent
 // of Qwen3.8-27B decode.
-#ifndef IQ_MV_SIGNXOR
-#define IQ_MV_SIGNXOR 0
+//
+// Unmeasured on this kernel. The identical helper is +4.6% on IQ3_XXS and -4.7%
+// on IQ3_S, so it gets its own knob and its own measurement.
+#ifndef IQ2S_MV_SIGNXOR
+#define IQ2S_MV_SIGNXOR 0
 #endif
 
 // Four grid values with their signs applied, as floats.
 inline float4 iq2s_vals(uint gv, uint sg, uint base) {
-#if IQ_MV_SIGNXOR
+#if IQ2S_MV_SIGNXOR
     // A sign flip is bit 31, so the four conditional negations collapse to one
     // XOR once the four sign bits are spread into place. Exact, not approximate.
     const uint  s   = sg >> base;

@@ -103,12 +103,16 @@ inline uint iq3xxs_pack(uint gv, uint sg, uint base) {
 // kernels after the grid lookup, and ahead of the activation load at 5.5. The
 // three grid types share this helper verbatim and are together about 30 percent
 // of Qwen3.8-27B decode.
-#ifndef IQ_MV_SIGNXOR
-#define IQ_MV_SIGNXOR 0
+//
+// MEASURED: q4b-IQ3_XXS tg64 15.46 -> 16.16, +4.6%. On. Note that the IDENTICAL
+// helper is -4.7% in the IQ3_S GEMV, so this knob is per-kernel on purpose --
+// do not re-merge them.
+#ifndef IQ3XXS_MV_SIGNXOR
+#define IQ3XXS_MV_SIGNXOR 1
 #endif
 
 inline float4 iq3xxs_vals(uint gv, uint sgv, uint base) {
-#if IQ_MV_SIGNXOR
+#if IQ3XXS_MV_SIGNXOR
     // A sign flip is bit 31, so the four conditional negations collapse to one
     // XOR once the four sign bits are spread into place. Exact, not approximate.
     const uint  s   = sgv >> base;
