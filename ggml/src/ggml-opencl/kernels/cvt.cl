@@ -117,6 +117,16 @@ struct block_q6_K {
 };
 
 //------------------------------------------------------------------------------
+// block_iq2_s
+//------------------------------------------------------------------------------
+struct block_iq2_s {
+    half     d;
+    uint8_t  qs[QK_K/4];      // first QK_K/8 are grid low bytes, then QK_K/8 of signs
+    uint8_t  qh[QK_K/32];     // two high index bits per grid entry
+    uint8_t  scales[QK_K/32]; // two 4-bit sub-scales
+};
+
+//------------------------------------------------------------------------------
 // block_q2_K
 //------------------------------------------------------------------------------
 struct block_q2_K {
@@ -2785,6 +2795,70 @@ kernel void kernel_restore_block_iq3_xxs_ns(
         p[2] = (uchar)((w >> 16) & 0xFF);
         p[3] = (uchar)((w >> 24) & 0xFF);
     }
+}
+
+//------------------------------------------------------------------------------
+// IQ2_S -> planes. A straight field split, no reordering. The AoS block packs two
+// different payloads into one qs array -- QK_K/8 grid low bytes then QK_K/8 sign
+// bytes -- exactly like IQ3_XXS, so splitting them apart is free:
+//
+//   dst_qs[k/8]   uchar  grid index low 8 bits, one per EIGHT weights
+//   dst_sg[k/8]   uchar  8 sign bits, one per grid entry
+//   dst_qh[k/32]  uchar  four 2-bit index highs
+//   dst_sc[k/32]  uchar  two 4-bit sub-scales
+//   dst_d [k/256] half
+//
+// Size preserving: 32 + 32 + 8 + 8 + 2 == 82 == sizeof(block_iq2_s).
+//
+// One iq2s_grid entry is EIGHT values, i.e. two dp4a operands, so a 32-block needs
+// only four lookups. Grid values top out at 43, well inside int8.
+//------------------------------------------------------------------------------
+kernel void kernel_convert_block_iq2_s_ns(
+    global struct block_iq2_s * src0,
+    global uchar * dst_qs,      // QK_K/8 per block
+    global uchar * dst_sg,      // QK_K/8
+    global uchar * dst_qh,      // QK_K/32
+    global uchar * dst_sc,      // QK_K/32
+    global half  * dst_d,       // 1
+    ulong          n_blk
+) {
+    const ulong i = get_global_id(0);
+    if (i >= n_blk) {
+        return;
+    }
+    global struct block_iq2_s * b = (global struct block_iq2_s *) src0 + i;
+
+    dst_d[i] = b->d;
+    for (int j = 0; j < QK_K/8;  ++j) { dst_qs[(QK_K/8)  * i + j] = b->qs[j];            }
+    for (int j = 0; j < QK_K/8;  ++j) { dst_sg[(QK_K/8)  * i + j] = b->qs[QK_K/8 + j];   }
+    for (int j = 0; j < QK_K/32; ++j) { dst_qh[(QK_K/32) * i + j] = b->qh[j];            }
+    for (int j = 0; j < QK_K/32; ++j) { dst_sc[(QK_K/32) * i + j] = b->scales[j];        }
+}
+
+//------------------------------------------------------------------------------
+// IQ2_S planes -> AoS blocks. Exact inverse of the split above; the caller must
+// un-transpose the five planes back to block-major first.
+//------------------------------------------------------------------------------
+kernel void kernel_restore_block_iq2_s_ns(
+    global uchar * src_qs,
+    global uchar * src_sg,
+    global uchar * src_qh,
+    global uchar * src_sc,
+    global half  * src_d,
+    global struct block_iq2_s * dst,
+    ulong          n_blk
+) {
+    const ulong i = get_global_id(0);
+    if (i >= n_blk) {
+        return;
+    }
+    global struct block_iq2_s * b = (global struct block_iq2_s *) dst + i;
+
+    b->d = src_d[i];
+    for (int j = 0; j < QK_K/8;  ++j) { b->qs[j]          = src_qs[(QK_K/8)  * i + j]; }
+    for (int j = 0; j < QK_K/8;  ++j) { b->qs[QK_K/8 + j] = src_sg[(QK_K/8)  * i + j]; }
+    for (int j = 0; j < QK_K/32; ++j) { b->qh[j]          = src_qh[(QK_K/32) * i + j]; }
+    for (int j = 0; j < QK_K/32; ++j) { b->scales[j]      = src_sc[(QK_K/32) * i + j]; }
 }
 
 //------------------------------------------------------------------------------
