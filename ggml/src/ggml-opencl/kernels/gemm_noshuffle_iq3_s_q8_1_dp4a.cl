@@ -103,6 +103,14 @@ inline uint iq3s_pack(uint gv, uint sg, uint base) {
          | (((uint)v2 & 0xFFu) << 16) | (((uint)v3 & 0xFFu) << 24);
 }
 
+// Operand u of a 32-block: the grid index is qs[u] with its 9th bit taken from
+// bit u of the sub-block's qh byte; base picks the nibble of sgv holding its signs.
+inline uint iq3s_load(__global const uchar * qs, uint qsb, uint qhb, uint m,
+                      uint u, uint sgv, uint base) {
+    const uint gidx = (uint)qs[qsb + u * m] | (((qhb >> u) & 1u) << 8);
+    return iq3s_pack(iq3s_grid[gidx], sgv, base);
+}
+
 inline int dot8_q8a(uint8 qw, __local const uint * a) {
     int r = 0;
     r = dot_acc_sat_4x8packed_ss_int(qw.s0, a[0], r);
@@ -167,11 +175,22 @@ kernel void kernel_gemm_noshuffle_iq3_s_q8_1_dp4a(
         const uint qsb  = rrow + (ib*(QK_K/4) + 8*sb) * (uint)m;
         const uint sgb  = rrow + (ib*(QK_K/8) + 4*sb) * (uint)m;
 
+        // Four sign bytes cover the eight operands: operand u takes nibble
+        // (u & 1) of sign byte u/2.
+        const uint sg0 = (uint)src0_sg[sgb + 0 * (uint)m];
+        const uint sg1 = (uint)src0_sg[sgb + 1 * (uint)m];
+        const uint sg2 = (uint)src0_sg[sgb + 2 * (uint)m];
+        const uint sg3 = (uint)src0_sg[sgb + 3 * (uint)m];
+
         uint8 qw;
-#define IQ3S_OP(U, F)                                                            \n        {                                                                        \n            const uint gidx = (uint)src0_qs[qsb + (U) * (uint)m]                  \n                            | (((qhb >> (U)) & 1u) << 8);                         \n            const uint sgv  = (uint)src0_sg[sgb + ((U) >> 1) * (uint)m];          \n            qw.F = iq3s_pack(iq3s_grid[gidx], sgv, ((U) & 1u) * 4u);              \n        }
-        IQ3S_OP(0, s0) IQ3S_OP(1, s1) IQ3S_OP(2, s2) IQ3S_OP(3, s3)
-        IQ3S_OP(4, s4) IQ3S_OP(5, s5) IQ3S_OP(6, s6) IQ3S_OP(7, s7)
-#undef IQ3S_OP
+        qw.s0 = iq3s_load(src0_qs, qsb, qhb, (uint)m, 0u, sg0, 0u);
+        qw.s1 = iq3s_load(src0_qs, qsb, qhb, (uint)m, 1u, sg0, 4u);
+        qw.s2 = iq3s_load(src0_qs, qsb, qhb, (uint)m, 2u, sg1, 0u);
+        qw.s3 = iq3s_load(src0_qs, qsb, qhb, (uint)m, 3u, sg1, 4u);
+        qw.s4 = iq3s_load(src0_qs, qsb, qhb, (uint)m, 4u, sg2, 0u);
+        qw.s5 = iq3s_load(src0_qs, qsb, qhb, (uint)m, 5u, sg2, 4u);
+        qw.s6 = iq3s_load(src0_qs, qsb, qhb, (uint)m, 6u, sg3, 0u);
+        qw.s7 = iq3s_load(src0_qs, qsb, qhb, (uint)m, 7u, sg3, 4u);
 
         // cooperatively stage the 32-token x 32-K int8 activations to LDS
         for (uint idx = lid; idx < TILESIZE_N * 8; idx += 64) {
