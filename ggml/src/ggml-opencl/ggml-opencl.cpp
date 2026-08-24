@@ -1995,9 +1995,17 @@ static int ggml_cl_iq_mv_vec() {
 // The quantized l4_lm GEMM stages both tiles in local memory as float. It is
 // occupancy bound on local-memory CAPACITY (that is what BK 32->16 bought,
 // +24.6%), so staging them as half halves the footprint again.
-static int ggml_cl_lm_half() {
-    static const int v = ggml_cl_env_int("GGML_OPENCL_LM_HALF", 0);
-    return v;
+//
+// X2-class only, and for the same reason as the IQ4_XS plane split: measured on
+// Llama-3.2-3B, an X2-90 gains 13-15% (Q2_K 217->250, Q3_K_M 294->334, IQ3_M
+// 240->273) while an X1 LOSES 11% (IQ4_XS 99.9 -> 88.9). Occupancy headroom is
+// not a portable property. PPL is unmoved on X2 (10.4207 -> 10.4149).
+static bool ggml_cl_lm_half(const ggml_backend_opencl_context * backend_ctx) {
+    static const char * const e = getenv("GGML_OPENCL_LM_HALF");
+    if (e && *e) {
+        return atoi(e) != 0;
+    }
+    return backend_ctx->adreno_x2_class();
 }
 
 // Subgroups the IQ4_XS plane-split decode GEMV splits K across. One row per
@@ -2271,7 +2279,7 @@ static std::string ggml_opencl_make_compile_opts(ggml_backend_opencl_context *ba
     // uchar at a time; GGML_OPENCL_IQ_MV_VEC=0 puts the scalar loads back so the
     // two can be A/B'd from one binary.
     compile_opts += " -DIQ_MV_VEC=" + std::to_string(ggml_cl_iq_mv_vec());
-    compile_opts += " -DLM_HALF="   + std::to_string(ggml_cl_lm_half());
+    compile_opts += " -DLM_HALF="   + std::to_string(ggml_cl_lm_half(backend_ctx) ? 1 : 0);
 
     // GGML_OPENCL_OPT_DISABLE=1 builds every kernel unoptimised. Slow; for telling a
     // codegen bug apart from a source bug.
