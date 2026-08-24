@@ -11014,9 +11014,17 @@ inline bool use_adreno_kernels(const ggml_backend_opencl_context *backend_ctx, c
 // conversion and every consumer must agree exactly -- if one thinks a tensor is
 // plane-split and another reads it as AoS blocks, the result is silent garbage.
 // So they all go through this one predicate.
-static bool ggml_cl_iq4xs_soa_on() {
-    static const int v = ggml_cl_env_int("GGML_OPENCL_IQ4XS_SOA", 0);
-    return v != 0;
+// Default ON for X2-class only. The prefill half of this path is the q8_1 dp4a
+// GEMM, and it does not carry across generations: on an X2-90 the split is
+// pp512 215 -> 674 (3.13x) on Llama-3.2-3B-IQ4_XS, while on an X1 the SAME
+// model and binary goes 99.8 -> 82.9, a 17% REGRESSION. Decode is a wash on
+// both. GGML_OPENCL_IQ4XS_SOA forces either way.
+static bool ggml_cl_iq4xs_soa_on(const ggml_backend_opencl_context * backend_ctx) {
+    static const char * const e = getenv("GGML_OPENCL_IQ4XS_SOA");
+    if (e && *e) {
+        return atoi(e) != 0;
+    }
+    return backend_ctx->adreno_x2_class();
 }
 
 static bool ggml_cl_iq4xs_is_split(const ggml_backend_opencl_context * backend_ctx, const ggml_tensor * t);
@@ -13099,7 +13107,7 @@ inline bool use_adreno_kernels(const ggml_backend_opencl_context *backend_ctx, c
 
 static bool ggml_cl_iq4xs_is_split(const ggml_backend_opencl_context * backend_ctx, const ggml_tensor * t) {
     return t->type == GGML_TYPE_IQ4_XS
-        && ggml_cl_iq4xs_soa_on()
+        && ggml_cl_iq4xs_soa_on(backend_ctx)
         && backend_ctx->kernel_convert_block_iq4_xs_ns != nullptr
         // the decode GEMV pairs adjacent rows into one uint load, so an odd row
         // count is declined HERE rather than per dispatch: a tensor that gets
