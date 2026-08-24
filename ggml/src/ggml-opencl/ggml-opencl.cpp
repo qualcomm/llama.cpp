@@ -1281,6 +1281,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemv_noshuffle_q8_0_f32_splitk;  // split-K across WGs (small-M decode)
     cl_kernel kernel_gemm_noshuffle_q1_0_f32;
     cl_kernel kernel_gemv_noshuffle_q1_0_f32;
+    cl_kernel kernel_gemv_noshuffle_q1_0_f32_ns1 = nullptr;  // no K-split, for tall M
     cl_kernel kernel_gemv_noshuffle_q4_k_f32;
     cl_kernel kernel_gemv_noshuffle_q4_k_f32_o4;  // 4-output-per-WI, long-vocab lm_head
     cl_kernel kernel_gemv_noshuffle_q4_k_f32_tiled;  // tiled-wide layout (opt-in)
@@ -1979,6 +1980,16 @@ static bool ggml_cl_cok_have_q4k_cok8(ggml_backend_opencl_context * backend_ctx)
     return backend_ctx->kernel_gemm_cok8_q4_k_q8_1_dp4a_bin != nullptr;
 }
 #endif // GGML_OPENCL_USE_ADRENO_KERNELS
+
+// Minimum M at which the q1_0 GEMV skips its K-split; 0 disables it. The default
+// was tuned on X2E only, so other GPUs keep the split unless the env var asks.
+static int ggml_cl_q1_0_gemv_ns1_min_m(const ggml_backend_opencl_context * backend_ctx) {
+    static const char * env = getenv("GGML_OPENCL_Q10_GEMV_NS1_MIN_M");
+    if (env != nullptr) {
+        return atoi(env);
+    }
+    return backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E ? 8192 : 0;
+}
 
 static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
     if (backend_ctx->kernels_loaded) {
@@ -4300,6 +4311,14 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 
         CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q1_0_f32 = clCreateKernel(prog, "kernel_gemv_noshuffle_q1_0_f32", &err), err));
         CL_CHECK(clReleaseProgram(prog));
+
+        // Same source with the K-split off; tall-M shapes do not need it.
+        if (ggml_cl_q1_0_gemv_ns1_min_m(backend_ctx) > 0) {
+            std::string ns1_opts = CL_gemv_compile_opts + " -DN_SIMDGROUP=1";
+            cl_program prog_ns1 = build_program_from_source(backend_ctx, kernel_src_CL_gemv_general.c_str(), ns1_opts);
+            CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q1_0_f32_ns1 = clCreateKernel(prog_ns1, "kernel_gemv_noshuffle_q1_0_f32", &err), err));
+            CL_CHECK(clReleaseProgram(prog_ns1));
+        }
         GGML_LOG_CONT(".");
     }
 
@@ -19974,7 +19993,12 @@ static void ggml_cl_mul_mat_q1_0_f32_adreno(ggml_backend_t backend, const ggml_t
         img_desc.buffer = b_sub_buf;
         CL_CHECK((b_img = clCreateImage(context, CL_MEM_READ_ONLY, &img_fmt, &img_desc, NULL, &err), err));
 
-        kernel = backend_ctx->kernel_gemv_noshuffle_q1_0_f32;
+        // Tall M has ample row parallelism, so skip the K-split and its reduction.
+        const int ns1_min_m = ggml_cl_q1_0_gemv_ns1_min_m(backend_ctx);
+        const bool use_ns1 = backend_ctx->kernel_gemv_noshuffle_q1_0_f32_ns1 &&
+                             ns1_min_m > 0 && (int)M >= ns1_min_m;
+        kernel = use_ns1 ? backend_ctx->kernel_gemv_noshuffle_q1_0_f32_ns1
+                         : backend_ctx->kernel_gemv_noshuffle_q1_0_f32;
 
         int r2 = 1;
         int r3 = 1;
@@ -19996,8 +20020,9 @@ static void ggml_cl_mul_mat_q1_0_f32_adreno(ggml_backend_t backend, const ggml_t
         CL_CHECK(clSetKernelArg(kernel, 14, sizeof(int),      &r3));
 
         size_t wavesize = backend_ctx->adreno_wave_size;
-        size_t local_work_size[]  = { wavesize, 4, 1 };
-        size_t global_work_size[] = { CEIL_DIV(M, wavesize)*wavesize, 4, 1 };
+        const size_t nsg = use_ns1 ? 1 : 4;
+        size_t local_work_size[]  = { wavesize, nsg, 1 };
+        size_t global_work_size[] = { CEIL_DIV(M, wavesize)*wavesize, nsg, 1 };
 
         backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
 
