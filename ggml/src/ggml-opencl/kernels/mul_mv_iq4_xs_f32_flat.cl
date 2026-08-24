@@ -61,8 +61,32 @@
 #define IQ4XS_YV(g, y) vload4((g), (y))
 #endif
 
+// IQ4XS_MV_CBPACK=1: take the codebook from a packed __constant UINT array by
+// shift instead of a __constant FLOAT[16] indexed by the nibble.
+//
+// The ABL=2 probe says the lookup is what this kernel is spending its time on:
+// dropping it entirely is +51% on a 3B and +21% on the 27B. That is also why the
+// tuned gemv_noshuffle_q4_k_f32 is 1.72x faster at matched shapes -- q4_K is a
+// LINEAR quant and has no table at all, so this is a cost the IQ types carry
+// rather than a trick that was copied wrong.
+//
+// The packing is the one the dp4a GEMM already uses, and its header records why:
+// a divergent lookup should read a small __constant *uint* array and shift.
+#ifndef IQ4XS_MV_CBPACK
+#define IQ4XS_MV_CBPACK 1
+#endif
+
+__constant uint kvalues_iq4nl_i8x4[4] = {
+    0xBFAD9881u, 0xF6EADDCFu, 0x26190D01u, 0x71594535u
+};
+inline float iq4nl_cbf(uint n) {
+    return (float)(char)((kvalues_iq4nl_i8x4[n >> 2] >> ((n & 3u) * 8u)) & 0xFFu);
+}
+
 #if IQ4XS_MV_ABL == 2
 #define IQ4XS_CB(n) ((float)(n))
+#elif IQ4XS_MV_CBPACK
+#define IQ4XS_CB(n) iq4nl_cbf((n))
 #else
 #define IQ4XS_CB(n) kvalues_iq4nl[(n)]
 #endif

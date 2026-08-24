@@ -2063,6 +2063,13 @@ static int ggml_cl_iq4xs_mv_wimg() {
     return v;
 }
 
+// Codebook from a packed uint array by shift rather than a float[16] indexed by
+// the nibble; see the kernel header for the probe that motivated it.
+static int ggml_cl_iq4xs_mv_cbpack() {
+    static const int v = ggml_cl_env_int("GGML_OPENCL_IQ4XS_MV_CBPACK", 1);
+    return v;
+}
+
 // Cost probe only, wrong math -- see the kernel header.
 static int ggml_cl_iq4xs_mv_abl() {
     static const int v = ggml_cl_env_int("GGML_OPENCL_IQ4XS_MV_ABL", 0);
@@ -3264,6 +3271,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         opts += " -DIQ4XS_MV_NSG=" + std::to_string(ggml_cl_iq4xs_mv_nsg());
         opts += " -DIQ4XS_MV_R2="  + std::to_string(ggml_cl_iq4xs_mv_r2());
         opts += " -DIQ4XS_MV_ABL=" + std::to_string(ggml_cl_iq4xs_mv_abl());
+        opts += " -DIQ4XS_MV_CBPACK=" + std::to_string(ggml_cl_iq4xs_mv_cbpack());
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), opts);
 
