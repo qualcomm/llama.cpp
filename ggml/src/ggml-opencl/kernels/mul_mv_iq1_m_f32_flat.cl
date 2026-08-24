@@ -366,47 +366,47 @@ kernel void kernel_mul_mv_iq1_m_f32_flat(
                                         (w2 >> 16) & 0xFFFFu, (w3 >> 16) & 0xFFFFu);
 
             float acc0 = 0.f, acc1 = 0.f;
-            // outer over the four scale words, inner over the two 32-blocks each
-            // covers, so every shift below is a compile-time constant
-            #pragma unroll
-            for (uint w = 0; w < 4u; ++w) {
-                const uint scw = (w == 0u) ? w0 : (w == 1u) ? w1 : (w == 2u) ? w2 : w3;
-                #pragma unroll
-                for (uint hb = 0; hb < 2u; ++hb) {
-                    const uint sub = ib * 8u + 2u*w + hb;
-                    const uint grp = sub * 8u;                 // K/4 group base
+            // The scale word is RE-READ per 32-block rather than selected from
+            // four live registers. Holding w0..w3 across a fully unrolled 4x2x4
+            // body pushed register use past what a 512-thread workgroup allows,
+            // and the dispatch was refused outright with -54
+            // (CL_INVALID_WORK_GROUP_SIZE) -- pp measured fine while the tg row
+            // simply never appeared.
+            for (uint sub_l = 0; sub_l < 8u; ++sub_l) {
+                const uint sub = ib * 8u + sub_l;
+                const uint scw = scu[j + (ib * 4u + (sub_l >> 1)) * mh];
+                const uint grp = sub * 8u;                 // K/4 group base
+                const uint shb = 3u * (2u * (sub_l & 1u));
 
-                    #pragma unroll
-                    for (uint l = 0; l < 4u; ++l) {
-                        const uint sh  = 3u * (2u*hb + (l >> 1));
-                        const float s0 = (float)(2u * (((scw       ) >> sh) & 7u) + 1u);
-                        const float s1 = (float)(2u * (((scw >> 16) >> sh) & 7u) + 1u);
+                for (uint l = 0; l < 4u; ++l) {
+                    const uint sh  = shb + 3u * (l >> 1);
+                    const float s0 = (float)(2u * (((scw       ) >> sh) & 7u) + 1u);
+                    const float s1 = (float)(2u * (((scw >> 16) >> sh) & 7u) + 1u);
 
-                        const uint qhv = (uint)qhu[j + (sub * 2u + (l >> 1)) * mh];
-                        const uint h0  =  qhv       & 0xFFu;
-                        const uint h1  = (qhv >> 8) & 0xFFu;
-                        const uint qsv = (uint)qsu[j + (sub * 4u + l) * mh];
+                    const uint qhv = (uint)qhu[j + (sub * 2u + (l >> 1)) * mh];
+                    const uint h0  =  qhv       & 0xFFu;
+                    const uint h1  = (qhv >> 8) & 0xFFu;
+                    const uint qsv = (uint)qsu[j + (sub * 4u + l) * mh];
 
-                        const uint msk = 0x08u << (4u * (l & 1u));
-                        const float t0 = (h0 & msk) ? (-1.f - IQ1M_DELTA) : (-1.f + IQ1M_DELTA);
-                        const float t1 = (h1 & msk) ? (-1.f - IQ1M_DELTA) : (-1.f + IQ1M_DELTA);
+                    const uint msk = 0x08u << (4u * (l & 1u));
+                    const float t0 = (h0 & msk) ? (-1.f - IQ1M_DELTA) : (-1.f + IQ1M_DELTA);
+                    const float t1 = (h1 & msk) ? (-1.f - IQ1M_DELTA) : (-1.f + IQ1M_DELTA);
 
-                        const uint g0 = IQ1M_GRID(( qsv       & 0xFFu)
-                                                  | ((((h0 >> (4u*(l & 1u))) & 7u) << 8)));
-                        const uint g1 = IQ1M_GRID(((qsv >> 8) & 0xFFu)
-                                                  | ((((h1 >> (4u*(l & 1u))) & 7u) << 8)));
+                    const uint g0 = IQ1M_GRID(( qsv       & 0xFFu)
+                                              | ((((h0 >> (4u*(l & 1u))) & 7u) << 8)));
+                    const uint g1 = IQ1M_GRID(((qsv >> 8) & 0xFFu)
+                                              | ((((h1 >> (4u*(l & 1u))) & 7u) << 8)));
 
-                        const float4 y0 = vload4(grp + 2u*l + 0u, y);
-                        const float4 y1 = vload4(grp + 2u*l + 1u, y);
-                        // one activation sum per 8 weights, shared by both rows
-                        const float4 ys = y0 + y1;
-                        const float  as = ys.s0 + ys.s1 + ys.s2 + ys.s3;
+                    const float4 y0 = vload4(grp + 2u*l + 0u, y);
+                    const float4 y1 = vload4(grp + 2u*l + 1u, y);
+                    // one activation sum per 8 weights, shared by both rows
+                    const float4 ys = y0 + y1;
+                    const float  as = ys.s0 + ys.s1 + ys.s2 + ys.s3;
 
-                        const float a0 = dot(y0, iq1m_vals(g0)) + dot(y1, iq1m_vals(g0 >> 4));
-                        const float a1 = dot(y0, iq1m_vals(g1)) + dot(y1, iq1m_vals(g1 >> 4));
-                        acc0 += s0 * (a0 + t0 * as);
-                        acc1 += s1 * (a1 + t1 * as);
-                    }
+                    const float a0 = dot(y0, iq1m_vals(g0)) + dot(y1, iq1m_vals(g0 >> 4));
+                    const float a1 = dot(y0, iq1m_vals(g1)) + dot(y1, iq1m_vals(g1 >> 4));
+                    acc0 += s0 * (a0 + t0 * as);
+                    acc1 += s1 * (a1 + t1 * as);
                 }
             }
             sumf  += d0 * acc0;
@@ -428,29 +428,25 @@ kernel void kernel_mul_mv_iq1_m_f32_flat(
             const float d = iq1m_super(w0, w1, w2, w3);
 
             float acc = 0.f;
-            #pragma unroll
-            for (uint w = 0; w < 4u; ++w) {
-                const uint scw = (w == 0u) ? w0 : (w == 1u) ? w1 : (w == 2u) ? w2 : w3;
-                #pragma unroll
-                for (uint hb = 0; hb < 2u; ++hb) {
-                    const uint sub = ib * 8u + 2u*w + hb;
-                    const uint grp = sub * 8u;
-                    #pragma unroll
-                    for (uint l = 0; l < 4u; ++l) {
-                        const uint  sh = 3u * (2u*hb + (l >> 1));
-                        const float sc = (float)(2u * ((scw >> sh) & 7u) + 1u);
-                        const uint  h  = (uint)src0_qh[row + (sub * 2u + (l >> 1)) * m];
-                        const uint  msk = 0x08u << (4u * (l & 1u));
-                        const float t  = (h & msk) ? (-1.f - IQ1M_DELTA) : (-1.f + IQ1M_DELTA);
-                        const uint  g  = IQ1M_GRID((uint)src0_qs[row + (sub * 4u + l) * m]
-                                                   | ((((h >> (4u*(l & 1u))) & 7u) << 8)));
-                        const float4 y0 = vload4(grp + 2u*l + 0u, y);
-                        const float4 y1 = vload4(grp + 2u*l + 1u, y);
-                        const float4 ys = y0 + y1;
-                        const float  as = ys.s0 + ys.s1 + ys.s2 + ys.s3;
-                        const float  a  = dot(y0, iq1m_vals(g)) + dot(y1, iq1m_vals(g >> 4));
-                        acc += sc * (a + t * as);
-                    }
+            for (uint sub_l = 0; sub_l < 8u; ++sub_l) {
+                const uint sub = ib * 8u + sub_l;
+                const uint scw = (uint)src0_sc[row + (ib * 4u + (sub_l >> 1)) * m];
+                const uint grp = sub * 8u;
+                const uint shb = 3u * (2u * (sub_l & 1u));
+                for (uint l = 0; l < 4u; ++l) {
+                    const uint  sh = shb + 3u * (l >> 1);
+                    const float sc = (float)(2u * ((scw >> sh) & 7u) + 1u);
+                    const uint  h  = (uint)src0_qh[row + (sub * 2u + (l >> 1)) * m];
+                    const uint  msk = 0x08u << (4u * (l & 1u));
+                    const float t  = (h & msk) ? (-1.f - IQ1M_DELTA) : (-1.f + IQ1M_DELTA);
+                    const uint  g  = IQ1M_GRID((uint)src0_qs[row + (sub * 4u + l) * m]
+                                               | ((((h >> (4u*(l & 1u))) & 7u) << 8)));
+                    const float4 y0 = vload4(grp + 2u*l + 0u, y);
+                    const float4 y1 = vload4(grp + 2u*l + 1u, y);
+                    const float4 ys = y0 + y1;
+                    const float  as = ys.s0 + ys.s1 + ys.s2 + ys.s3;
+                    const float  a  = dot(y0, iq1m_vals(g)) + dot(y1, iq1m_vals(g >> 4));
+                    acc += sc * (a + t * as);
                 }
             }
             sumf += d * acc;
