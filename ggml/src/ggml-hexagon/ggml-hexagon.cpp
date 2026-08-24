@@ -4680,6 +4680,21 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
     if (cache_hit) {
         nodes_ptr = &sess->cached_nodes;
     } else {
+        // Tag fusable tensors in graph
+        for (int i = 0; i < graph->n_nodes; i++) {
+            auto * extra = (ggml_hexagon_tensor_extra *) graph->nodes[i]->extra;
+            if (!extra) continue;
+
+            if (graph->nodes[i]->op == GGML_OP_RMS_NORM && ggml_can_fuse(graph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL })) {
+                extra->flags |= GGML_HEXAGON_TENSOR_FUSEABLE;
+            } else if (graph->nodes[i]->op == GGML_OP_MUL_MAT) {
+                if ((i + 1 < graph->n_nodes && graph->nodes[i + 1]->op == GGML_OP_ADD && ggml_can_fuse(graph, i, { GGML_OP_MUL_MAT, GGML_OP_ADD })) ||
+                    ggml_node_has_n_uses(graph, i, 1)) {
+                    extra->flags |= GGML_HEXAGON_TENSOR_FUSEABLE;
+                }
+            }
+        }
+
         computed_nodes.reserve(graph->n_nodes);
 
         for (int i = 0; i < graph->n_nodes; ++i) {
@@ -4914,21 +4929,6 @@ static void ggml_backend_hexagon_graph_optimize(ggml_backend_t backend, ggml_cgr
 
     std::vector<htp_opnode> nodes;
     nodes.reserve(gf->n_nodes);
-
-    // Tag fusable tensors
-    for (int i = 0; i < n; i++) {
-        auto * extra = (ggml_hexagon_tensor_extra *) gf->nodes[i]->extra;
-        if (!extra) continue;
-
-        if (gf->nodes[i]->op == GGML_OP_RMS_NORM && ggml_can_fuse(gf, i, { GGML_OP_RMS_NORM, GGML_OP_MUL })) {
-            extra->flags |= GGML_HEXAGON_TENSOR_FUSEABLE;
-        } else if (gf->nodes[i]->op == GGML_OP_MUL_MAT) {
-            if ((i + 1 < n && gf->nodes[i + 1]->op == GGML_OP_ADD && ggml_can_fuse(gf, i, { GGML_OP_MUL_MAT, GGML_OP_ADD })) ||
-                ggml_node_has_n_uses(gf, i, 1)) {
-                extra->flags |= GGML_HEXAGON_TENSOR_FUSEABLE;
-            }
-        }
-    }
 
     // Pack nodes for reordering
     for (int i = 0; i < n; i++) {
