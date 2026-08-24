@@ -1992,6 +1992,14 @@ static int ggml_cl_iq_mv_vec() {
     return v;
 }
 
+// The quantized l4_lm GEMM stages both tiles in local memory as float. It is
+// occupancy bound on local-memory CAPACITY (that is what BK 32->16 bought,
+// +24.6%), so staging them as half halves the footprint again.
+static int ggml_cl_lm_half() {
+    static const int v = ggml_cl_env_int("GGML_OPENCL_LM_HALF", 0);
+    return v;
+}
+
 // Subgroups the IQ4_XS plane-split decode GEMV splits K across. One row per
 // lane alone leaves only M work items, which is 2.5x slower than the AoS
 // kernel; the K-split is what puts the wave count back.
@@ -2263,6 +2271,7 @@ static std::string ggml_opencl_make_compile_opts(ggml_backend_opencl_context *ba
     // uchar at a time; GGML_OPENCL_IQ_MV_VEC=0 puts the scalar loads back so the
     // two can be A/B'd from one binary.
     compile_opts += " -DIQ_MV_VEC=" + std::to_string(ggml_cl_iq_mv_vec());
+    compile_opts += " -DLM_HALF="   + std::to_string(ggml_cl_lm_half());
 
     // GGML_OPENCL_OPT_DISABLE=1 builds every kernel unoptimised. Slow; for telling a
     // codegen bug apart from a source bug.

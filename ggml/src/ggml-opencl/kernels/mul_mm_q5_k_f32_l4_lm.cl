@@ -28,6 +28,21 @@
 #define TN 8
 #endif
 
+// LM_HALF=1 keeps the two LDS tiles in half instead of float. buf_a+buf_b are
+// 2*BM*BK*sizeof(elem), so this halves local memory per workgroup again --
+// and unlike shrinking BK it does NOT double the barrier count, which is what
+// made BK=8 lose. Accumulation stays in float; only the staged operands narrow.
+#ifndef LM_HALF
+#define LM_HALF 0
+#endif
+#if LM_HALF
+typedef half lm_st;
+#define LM_LD4(p, i) convert_float4(vload4((i), (p)))
+#else
+typedef float lm_st;
+#define LM_LD4(p, i) vload4((i), (p))
+#endif
+
 kernel void kernel_mul_mm_q5_k_f32_l4_lm(
     global uchar4 * src0_q,
     global uchar  * src0_qh,
@@ -59,8 +74,8 @@ kernel void kernel_mul_mm_q5_k_f32_l4_lm(
     src1 = (global float4*)((global char*)src1 + offset1);
     dst  = (global float *)((global char*)dst  + offsetd);
 
-    local float buf_a[BM * BK];
-    local float buf_b[BN * BK];
+    local lm_st buf_a[BM * BK];
+    local lm_st buf_b[BN * BK];
 
     const int batch_idx = get_global_id(2);
 
@@ -182,7 +197,7 @@ kernel void kernel_mul_mm_q5_k_f32_l4_lm(
 
         for (int i = 0; i < BK; i++) {
             for (int a = 0; a < TM/4; a++) {
-                cache_a4[a] = vload4(a, buf_a + (i) * BM + th_r * TM);
+                cache_a4[a] = LM_LD4(buf_a + (i) * BM + th_r * TM, a);
             }
 
             for (int cc = 0; cc < TN; cc++) {
