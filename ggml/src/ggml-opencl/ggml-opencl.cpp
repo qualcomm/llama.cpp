@@ -1974,6 +1974,22 @@ inline std::string read_file(const std::string &path) {
 // through every caller. Set once at backend init.
 static cl_program_cache_state g_cl_program_cache;
 
+static int ggml_cl_env_int(const char * name, int fallback) {
+    const char * v = getenv(name);
+    if (!v || !*v) {
+        return fallback;
+    }
+    return atoi(v);
+}
+
+// The AoS decode GEMVs read their quant bytes one uchar at a time, which costs
+// more than the arithmetic around them. IQ_MV_VEC=1 reads them through vloadn.
+// GGML_OPENCL_IQ_MV_VEC=0 restores the scalar loads for an A/B from one binary.
+static int ggml_cl_iq_mv_vec() {
+    static const int v = ggml_cl_env_int("GGML_OPENCL_IQ_MV_VEC", 1);
+    return v;
+}
+
 static cl_program build_program_from_source_ex(cl_context ctx, cl_device_id dev, const char* program_buffer, const std::string &compile_opts, bool fatal, const char *tag = nullptr, size_t bin_size = 0, cl_command_queue retry_queue = nullptr) {
     // Source compiles only (bin_size==0). Precompiled-binary loads (ILA) have
     // their own path and are not source-cached. A cache hit returns a fully
@@ -2225,6 +2241,11 @@ static std::string ggml_opencl_make_compile_opts(ggml_backend_opencl_context *ba
         compile_opts += " -cl-mad-enable -cl-unsafe-math-optimizations"
                         " -cl-finite-math-only -cl-fast-relaxed-math";
     }
+
+    // The AoS decode GEMVs read their quant bytes through vloadn rather than one
+    // uchar at a time; GGML_OPENCL_IQ_MV_VEC=0 puts the scalar loads back so the
+    // two can be A/B'd from one binary.
+    compile_opts += " -DIQ_MV_VEC=" + std::to_string(ggml_cl_iq_mv_vec());
 
     // GGML_OPENCL_OPT_DISABLE=1 builds every kernel unoptimised. Slow; for telling a
     // codegen bug apart from a source bug.

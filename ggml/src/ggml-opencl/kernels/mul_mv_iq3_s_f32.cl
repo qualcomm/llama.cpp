@@ -13,6 +13,10 @@
 #endif
 
 #define QK_K 256
+
+#ifndef IQ_MV_VEC
+#define IQ_MV_VEC 1
+#endif
 #define IQ3S_N_SCALE (QK_K/64)
 
 typedef struct {
@@ -185,12 +189,26 @@ kernel void kernel_mul_mv_iq3_s_f32(
             global uchar * sgb = xb->signs + 4*it;
 
             float acc = 0.f;
+#if IQ_MV_VEC
+            // block is 110 bytes: qs starts at +2 and signs at +74, so both runs
+            // are ushort aligned but not uint aligned
+            ushort4 qv = vload4(0, (global ushort *)qsb);
+            ushort2 sv = vload2(0, (global ushort *)sgb);
+            ushort  qp[4] = { qv.s0, qv.s1, qv.s2, qv.s3 };
+            ushort  sp[2] = { sv.s0, sv.s1 };
+#endif
             for (int l = 0; l < 4; ++l) {
+#if IQ_MV_VEC
+                uint i1 = (uint)(qp[l] & 0xff) | (((uint)qhb << (8-2*l)) & 256);
+                uint i2 = (uint)(qp[l] >>    8) | (((uint)qhb << (7-2*l)) & 256);
+                uchar sg = (l & 1) ? (uchar)(sp[l>>1] >> 8) : (uchar)(sp[l>>1] & 0xff);
+#else
                 uint i1 = (uint)qsb[2*l+0] | (((uint)qhb << (8-2*l)) & 256);
                 uint i2 = (uint)qsb[2*l+1] | (((uint)qhb << (7-2*l)) & 256);
+                uchar sg = sgb[l];
+#endif
                 uint g1 = iq3s_grid[i1];
                 uint g2 = iq3s_grid[i2];
-                uchar sg = sgb[l];
                 for (int j = 0; j < 4; ++j) {
                     acc += yl[8*l+j+0] * (float)((g1 >> (8*j)) & 0xFF) * ((sg & (1 << j))     ? -1.f : 1.f);
                     acc += yl[8*l+j+4] * (float)((g2 >> (8*j)) & 0xFF) * ((sg & (1 << (j+4))) ? -1.f : 1.f);
