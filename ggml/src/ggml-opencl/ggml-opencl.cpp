@@ -2138,6 +2138,14 @@ static int ggml_cl_iq2s_mv_signxor() {
     return v;
 }
 
+// Address space for the 512-entry iq3s grid: 0 __constant, 1 program-scope
+// __global. Asks whether the __constant path is what the divergent index costs,
+// the way the IQ4_XS codebook did. See the kernel header.
+static int ggml_cl_iq3s_mv_gridsrc() {
+    static const int v = ggml_cl_env_int("GGML_OPENCL_IQ3S_MV_GRIDSRC", 0);
+    return v;
+}
+
 // Cost probe only, wrong math -- see the kernel header.
 static int ggml_cl_iq3s_mv_abl() {
     static const int v = ggml_cl_env_int("GGML_OPENCL_IQ3S_MV_ABL", 0);
@@ -3350,6 +3358,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         opts += " -DIQ3S_MV_LDSGRID=" + std::to_string(ggml_cl_iq3s_mv_ldsgrid());
         opts += " -DIQ3S_MV_SIGNXOR=" + std::to_string(ggml_cl_iq3s_mv_signxor());
         opts += " -DIQ3S_MV_ABL=" + std::to_string(ggml_cl_iq3s_mv_abl());
+        opts += " -DIQ3S_MV_GRIDSRC=" + std::to_string(ggml_cl_iq3s_mv_gridsrc());
         opts += " -DIQ3S_MV_R2="  + std::to_string(ggml_cl_iq3s_mv_r2());
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), opts);

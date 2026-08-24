@@ -63,7 +63,30 @@
 #ifndef IQ3S_MV_LDSGRID
 #define IQ3S_MV_LDSGRID 0
 #endif
-constant uint iq3s_grid[512] = {
+// IQ3S_MV_GRIDSRC=1: put the grid in the __global address space at program scope
+// instead of __constant.
+//
+// The question this asks is the one the IQ4_XS codebook answered: Adreno takes
+// __constant through the uniform path only for a wave-uniform index, and this
+// index is per weight. There the fix was to leave memory entirely, which a
+// 512-entry table cannot do, and local memory is already measured at -16.5% here.
+// A program-scope __global array is the remaining way to ask whether the
+// __constant PATH is the cost, and it needs no host plumbing at all.
+//
+// Program-scope variables in __global are OpenCL C 2.0; the backend compiles with
+// -cl-std=CL<device version>, so this arm simply fails to build on a device that
+// does not support them. That is a legitimate answer, not a crash.
+#ifndef IQ3S_MV_GRIDSRC
+#define IQ3S_MV_GRIDSRC 0
+#endif
+
+#if IQ3S_MV_GRIDSRC == 1
+#define IQ3S_GRID_AS __global
+#else
+#define IQ3S_GRID_AS constant
+#endif
+
+IQ3S_GRID_AS uint iq3s_grid[512] = {
     0x01010101, 0x01010103, 0x01010105, 0x0101010b, 0x0101010f, 0x01010301, 0x01010303, 0x01010305,
     0x01010309, 0x0101030d, 0x01010501, 0x01010503, 0x0101050b, 0x01010707, 0x01010901, 0x01010905,
     0x0101090b, 0x0101090f, 0x01010b03, 0x01010b07, 0x01010d01, 0x01010d05, 0x01010f03, 0x01010f09,
