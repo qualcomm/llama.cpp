@@ -117,6 +117,16 @@ struct block_q6_K {
 };
 
 //------------------------------------------------------------------------------
+// block_iq1_m -- note there is NO d field; the super-block scale is assembled
+// from the top nibbles of the four scale ushorts.
+//------------------------------------------------------------------------------
+struct block_iq1_m {
+    uint8_t qs[QK_K/8];      // grid index low 8 bits, one per 8 weights
+    uint8_t qh[QK_K/16];     // two 3-bit index highs and two delta signs
+    uint8_t scales[QK_K/32]; // four ushorts: 4x 3-bit scale each + a super nibble
+};
+
+//------------------------------------------------------------------------------
 // block_iq1_s
 //------------------------------------------------------------------------------
 struct block_iq1_s {
@@ -2803,6 +2813,63 @@ kernel void kernel_restore_block_iq3_xxs_ns(
         p[1] = (uchar)((w >>  8) & 0xFF);
         p[2] = (uchar)((w >> 16) & 0xFF);
         p[3] = (uchar)((w >> 24) & 0xFF);
+    }
+}
+
+//------------------------------------------------------------------------------
+// IQ1_M -> planes. A straight field split, three planes and no scale plane of
+// its own -- IQ1_M has no d field, the super-block scale is assembled from the
+// top nibbles of the four scale ushorts.
+//
+//   dst_qs[k/8]   uchar   grid index low 8 bits
+//   dst_qh[k/16]  uchar   two 3-bit index highs and two delta signs
+//   dst_sc[k/64]  ushort  four 3-bit sub-scales plus one nibble of the super scale
+//
+// Size preserving: 32 + 16 + 8 == 56 == sizeof(block_iq1_m).
+//------------------------------------------------------------------------------
+kernel void kernel_convert_block_iq1_m_ns(
+    global struct block_iq1_m * src0,
+    global uchar  * dst_qs,     // QK_K/8 per block
+    global uchar  * dst_qh,     // QK_K/16
+    global ushort * dst_sc,     // QK_K/64
+    ulong           n_blk
+) {
+    const ulong i = get_global_id(0);
+    if (i >= n_blk) {
+        return;
+    }
+    global struct block_iq1_m * b = (global struct block_iq1_m *) src0 + i;
+
+    for (int j = 0; j < QK_K/8;  ++j) { dst_qs[(QK_K/8)  * i + j] = b->qs[j]; }
+    for (int j = 0; j < QK_K/16; ++j) { dst_qh[(QK_K/16) * i + j] = b->qh[j]; }
+    // the scale bytes are only byte-aligned inside the block, so pair them here
+    for (int j = 0; j < QK_K/64; ++j) {
+        dst_sc[(QK_K/64) * i + j] = (ushort)((uint)b->scales[2*j] | ((uint)b->scales[2*j+1] << 8));
+    }
+}
+
+//------------------------------------------------------------------------------
+// IQ1_M planes -> AoS blocks. Exact inverse; the caller must un-transpose first.
+//------------------------------------------------------------------------------
+kernel void kernel_restore_block_iq1_m_ns(
+    global uchar  * src_qs,
+    global uchar  * src_qh,
+    global ushort * src_sc,
+    global struct block_iq1_m * dst,
+    ulong           n_blk
+) {
+    const ulong i = get_global_id(0);
+    if (i >= n_blk) {
+        return;
+    }
+    global struct block_iq1_m * b = (global struct block_iq1_m *) dst + i;
+
+    for (int j = 0; j < QK_K/8;  ++j) { b->qs[j] = src_qs[(QK_K/8)  * i + j]; }
+    for (int j = 0; j < QK_K/16; ++j) { b->qh[j] = src_qh[(QK_K/16) * i + j]; }
+    for (int j = 0; j < QK_K/64; ++j) {
+        const uint w = (uint)src_sc[(QK_K/64) * i + j];
+        b->scales[2*j + 0] = (uchar)( w       & 0xFF);
+        b->scales[2*j + 1] = (uchar)((w >> 8) & 0xFF);
     }
 }
 
