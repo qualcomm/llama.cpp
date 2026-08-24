@@ -2041,10 +2041,16 @@ static bool ggml_cl_lm_half(const ggml_backend_opencl_context * backend_ctx) {
 // lane alone leaves only M work items, which is 2.5x slower than the AoS
 // kernel; the K-split is what puts the wave count back.
 // Read the IQ4_XS quant plane through an image1d_buffer in the prefill GEMM.
-// q4_K ships the equivalent by default; opt-in here until measured.
-static int ggml_cl_iq4xs_wimg() {
-    static const int v = ggml_cl_env_int("GGML_OPENCL_IQ4XS_WIMG", 0);
-    return v;
+// q4_K ships the equivalent by default and so does this now: measured on X2-90,
+// 3B pp512 776.7 -> 843.4 (+8.6%) and Qwen3.8-27B 79.78 -> 83.25 (+4.3%), with
+// perplexity identical to four decimals. Gated with the rest of the X2 defaults
+// because a texture path is a per-generation question, not a portable win.
+static bool ggml_cl_iq4xs_wimg_on(const ggml_backend_opencl_context * backend_ctx) {
+    static const char * const e = getenv("GGML_OPENCL_IQ4XS_WIMG");
+    if (e && *e) {
+        return atoi(e) != 0;
+    }
+    return backend_ctx->adreno_x2_class();
 }
 
 static int ggml_cl_iq4xs_mv_nsg() {
@@ -35634,7 +35640,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                         size_t q_global[1] = { (size_t)(((n_blocks + 63) / 64) * 64) };
                         backend_ctx->enqueue_ndrange_kernel(qk, 1, q_global, q_local, dst);
 
-                        const bool use_wimg = ggml_cl_iq4xs_wimg()
+                        const bool use_wimg = ggml_cl_iq4xs_wimg_on(backend_ctx)
                             && ex0->q_img != nullptr
                             && backend_ctx->kernel_gemm_noshuffle_iq4_xs_q8_1_dp4a_wimg;
                         cl_kernel dk = use_wimg
