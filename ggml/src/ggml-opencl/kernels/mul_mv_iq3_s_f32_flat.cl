@@ -130,8 +130,37 @@ constant uint iq3s_grid[512] = {
     0x0f090307, 0x0f090501, 0x0f090b01, 0x0f0b0505, 0x0f0b0905, 0x0f0d0105, 0x0f0d0703, 0x0f0f0101
 };
 
+// IQ3S_MV_ABL: COST PROBE, WRONG MATH. Answers which of this kernel's three
+// per-operand costs it is actually paying for, before anything gets built.
+//
+// Why ask: shape-matched in one 27B decode profile at out=17408, this kernel is
+// 0.7925 ms/call where q3_K -- the SAME 3.4375 bits per weight, but a linear
+// quant with no grid -- is 0.5186, and the tuned q4_K GEMV is 0.4217. That is
+// 48 GB/s of a 152 GB/s bus. The IQ4_XS GEMV had the same signature and it was
+// entirely the codebook, so the grid is the suspect here; but the IQ4_XS round
+// also began with two wrong hypotheses that one probe each killed cheaply.
+//
+//   1  drop the activation load (expected near-null; it was +1.9/+4.7% there)
+//   2  drop the GRID lookup, keeping every weight and sign load
+//   3  drop the SIGN application, keeping the grid lookup
+//
+// Never enable in a real run.
+#ifndef IQ3S_MV_ABL
+#define IQ3S_MV_ABL 0
+#endif
+
+#if IQ3S_MV_ABL == 1
+#define IQ3S_YV(g, y) ((float4)(1.0f))
+#else
+#define IQ3S_YV(g, y) vload4((g), (y))
+#endif
+
 // Four grid values with their signs applied. base picks the nibble of sgv.
 inline float4 iq3s_vals(uint gv, uint sgv, uint base) {
+#if IQ3S_MV_ABL == 3
+    return (float4)((float)((gv      ) & 0xFFu), (float)((gv >>  8) & 0xFFu),
+                    (float)((gv >> 16) & 0xFFu), (float)((gv >> 24) & 0xFFu));
+#else
     const uint s = sgv >> base;
     float4 v;
     v.s0 = (float)((gv      ) & 0xFFu); if (s & 1u) { v.s0 = -v.s0; }
@@ -139,6 +168,7 @@ inline float4 iq3s_vals(uint gv, uint sgv, uint base) {
     v.s2 = (float)((gv >> 16) & 0xFFu); if (s & 4u) { v.s2 = -v.s2; }
     v.s3 = (float)((gv >> 24) & 0xFFu); if (s & 8u) { v.s3 = -v.s3; }
     return v;
+#endif
 }
 
 kernel void kernel_mul_mv_iq3_s_f32_flat(
@@ -180,6 +210,8 @@ kernel void kernel_mul_mv_iq3_s_f32_flat(
     }
     barrier(CLK_LOCAL_MEM_FENCE);
 #define IQ3S_GRID(i) sh_grid[(i)]
+#elif IQ3S_MV_ABL == 2
+#define IQ3S_GRID(i) (0x01030507u)
 #else
 #define IQ3S_GRID(i) iq3s_grid[(i)]
 #endif
@@ -231,7 +263,7 @@ kernel void kernel_mul_mv_iq3_s_f32_flat(
                     const uint g0  = ( qsv       & 0xFFu) | (((qh0 >> u) & 1u) << 8);
                     const uint g1  = ((qsv >> 8) & 0xFFu) | (((qh1 >> u) & 1u) << 8);
                     const uint base = (u & 1u) * 4u;
-                    const float4 yv = vload4(grp + u, y);
+                    const float4 yv = IQ3S_YV(grp + u, y);
                     a0 += dot(yv, iq3s_vals(IQ3S_GRID(g0),  sgv       & 0xFFu, base));
                     a1 += dot(yv, iq3s_vals(IQ3S_GRID(g1), (sgv >> 8) & 0xFFu, base));
                 }
@@ -265,7 +297,7 @@ kernel void kernel_mul_mv_iq3_s_f32_flat(
                 for (uint u = 0; u < 8u; ++u) {
                     const uint g   = (uint)src0_qs[qsb + u * m] | (((qhv >> u) & 1u) << 8);
                     const uint sgv = (uint)src0_sg[sgb + (u >> 1) * m];
-                    const float4 yv = vload4(grp + u, y);
+                    const float4 yv = IQ3S_YV(grp + u, y);
                     a += dot(yv, iq3s_vals(IQ3S_GRID(g), sgv, (u & 1u) * 4u));
                 }
                 acc += (float)(1u + 2u * nib) * a;
