@@ -2146,6 +2146,13 @@ static int ggml_cl_iq3s_mv_gridsrc() {
     return v;
 }
 
+// Cost probe only, wrong math: vary the WORK with the LOADS held fixed, to tell
+// compute-bound from memory-bound. See the kernel header.
+static int ggml_cl_iq3s_mv_work() {
+    static const int v = ggml_cl_env_int("GGML_OPENCL_IQ3S_MV_WORK", 0);
+    return v;
+}
+
 // Cost probe only, wrong math -- see the kernel header.
 static int ggml_cl_iq3s_mv_abl() {
     static const int v = ggml_cl_env_int("GGML_OPENCL_IQ3S_MV_ABL", 0);
@@ -3359,6 +3366,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         opts += " -DIQ3S_MV_SIGNXOR=" + std::to_string(ggml_cl_iq3s_mv_signxor());
         opts += " -DIQ3S_MV_ABL=" + std::to_string(ggml_cl_iq3s_mv_abl());
         opts += " -DIQ3S_MV_GRIDSRC=" + std::to_string(ggml_cl_iq3s_mv_gridsrc());
+        opts += " -DIQ3S_MV_WORK=" + std::to_string(ggml_cl_iq3s_mv_work());
         opts += " -DIQ3S_MV_R2="  + std::to_string(ggml_cl_iq3s_mv_r2());
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), opts);

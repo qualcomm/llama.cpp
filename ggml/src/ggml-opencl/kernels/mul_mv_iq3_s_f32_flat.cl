@@ -233,6 +233,26 @@ inline float4 iq3s_vals(uint gv, uint sgv, uint base) {
 #endif
 }
 
+// IQ3S_MV_WORK: COST PROBE, WRONG MATH. Settles "is this compute-bound or
+// memory-bound" by varying the WORK while holding the LOADS fixed -- the one
+// discriminator the ablation probes above cannot give, because each of those
+// removes work AND its load together.
+//
+//   2  do the grid read + sign + dot TWICE per operand (2x lookups, 2x ALU,
+//      loads of qs/qh/sg/sc unchanged)
+//   3  do the sign + dot twice on the ALREADY-FETCHED grid word (1x lookup,
+//      2x ALU, same loads)
+//
+// Reading it: 2 vs 1 is total compute sensitivity, 3 vs 1 is pure ALU
+// sensitivity, and 2 vs 3 isolates the divergent grid lookup. If a kernel is
+// bandwidth-bound all three are flat. Indices/signs are perturbed so the
+// compiler cannot common-subexpression the duplicate away.
+//
+// Never enable in a real run.
+#ifndef IQ3S_MV_WORK
+#define IQ3S_MV_WORK 0
+#endif
+
 kernel void kernel_mul_mv_iq3_s_f32_flat(
         global const uchar * src0_qs,
         global const uchar * src0_qh,
@@ -328,8 +348,17 @@ kernel void kernel_mul_mv_iq3_s_f32_flat(
                     const uint g1  = ((qsv >> 8) & 0xFFu) | (((qh1 >> u) & 1u) << 8);
                     const uint base = (u & 1u) * 4u;
                     const float4 yv = IQ3S_YV(grp + u, y);
-                    a0 += dot(yv, iq3s_vals(IQ3S_GRID(g0),  sgv       & 0xFFu, base));
-                    a1 += dot(yv, iq3s_vals(IQ3S_GRID(g1), (sgv >> 8) & 0xFFu, base));
+                    const uint gw0 = IQ3S_GRID(g0);
+                    const uint gw1 = IQ3S_GRID(g1);
+                    a0 += dot(yv, iq3s_vals(gw0,  sgv       & 0xFFu, base));
+                    a1 += dot(yv, iq3s_vals(gw1, (sgv >> 8) & 0xFFu, base));
+#if IQ3S_MV_WORK == 2
+                    a0 += dot(yv, iq3s_vals(IQ3S_GRID(g0 ^ 1u),  (sgv + 1u) & 0xFFu, base));
+                    a1 += dot(yv, iq3s_vals(IQ3S_GRID(g1 ^ 1u), ((sgv >> 8) + 1u) & 0xFFu, base));
+#elif IQ3S_MV_WORK == 3
+                    a0 += dot(yv, iq3s_vals(gw0,  (sgv + 1u) & 0xFFu, base));
+                    a1 += dot(yv, iq3s_vals(gw1, ((sgv >> 8) + 1u) & 0xFFu, base));
+#endif
                 }
                 acc0 += (float)(1u + 2u * nib0) * a0;
                 acc1 += (float)(1u + 2u * nib1) * a1;
@@ -362,7 +391,13 @@ kernel void kernel_mul_mv_iq3_s_f32_flat(
                     const uint g   = (uint)src0_qs[qsb + u * m] | (((qhv >> u) & 1u) << 8);
                     const uint sgv = (uint)src0_sg[sgb + (u >> 1) * m];
                     const float4 yv = IQ3S_YV(grp + u, y);
-                    a += dot(yv, iq3s_vals(IQ3S_GRID(g), sgv, (u & 1u) * 4u));
+                    const uint gw = IQ3S_GRID(g);
+                    a += dot(yv, iq3s_vals(gw, sgv, (u & 1u) * 4u));
+#if IQ3S_MV_WORK == 2
+                    a += dot(yv, iq3s_vals(IQ3S_GRID(g ^ 1u), sgv + 1u, (u & 1u) * 4u));
+#elif IQ3S_MV_WORK == 3
+                    a += dot(yv, iq3s_vals(gw, sgv + 1u, (u & 1u) * 4u));
+#endif
                 }
                 acc += (float)(1u + 2u * nib) * a;
             }
