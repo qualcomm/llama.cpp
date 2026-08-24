@@ -2119,6 +2119,13 @@ static int ggml_cl_iq3s_mv_r2() {
 // Stage the 2 KB iq3s_grid in local memory rather than reading it from
 // __constant at a divergent index, as the IQ2_S GEMV does with its 8 KB table.
 // Measured at -16.5% and left off; see the kernel header.
+// Apply the per-weight signs with one XOR of the float sign bit rather than four
+// conditional negations. Shared by the three grid GEMVs, which are the same code.
+static int ggml_cl_iq_mv_signxor() {
+    static const int v = ggml_cl_env_int("GGML_OPENCL_IQ_MV_SIGNXOR", 0);
+    return v;
+}
+
 // Cost probe only, wrong math -- see the kernel header.
 static int ggml_cl_iq3s_mv_abl() {
     static const int v = ggml_cl_env_int("GGML_OPENCL_IQ3S_MV_ABL", 0);
@@ -3329,6 +3336,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         std::string opts = compile_opts;
         opts += " -DIQ3S_MV_NSG=" + std::to_string(ggml_cl_iq3s_mv_nsg());
         opts += " -DIQ3S_MV_LDSGRID=" + std::to_string(ggml_cl_iq3s_mv_ldsgrid());
+        opts += " -DIQ_MV_SIGNXOR=" + std::to_string(ggml_cl_iq_mv_signxor());
         opts += " -DIQ3S_MV_ABL=" + std::to_string(ggml_cl_iq3s_mv_abl());
         opts += " -DIQ3S_MV_R2="  + std::to_string(ggml_cl_iq3s_mv_r2());
         cl_program prog =
@@ -3351,6 +3359,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         std::string opts = compile_opts;
         opts += " -DIQ3XXS_MV_NSG=" + std::to_string(ggml_cl_iq3xxs_mv_nsg());
         opts += " -DIQ3XXS_MV_LDSGRID=" + std::to_string(ggml_cl_iq3xxs_mv_ldsgrid());
+        opts += " -DIQ_MV_SIGNXOR=" + std::to_string(ggml_cl_iq_mv_signxor());
         opts += " -DIQ3XXS_MV_R2="  + std::to_string(ggml_cl_iq3xxs_mv_r2());
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), opts);
@@ -3413,6 +3422,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         opts += " -DIQ2S_MV_NSG=" + std::to_string(ggml_cl_iq2s_mv_nsg());
         opts += " -DIQ2S_MV_R2="  + std::to_string(ggml_cl_iq2s_mv_r2());
         opts += " -DIQ2S_MV_LDSGRID=" + std::to_string(ggml_cl_iq2s_mv_ldsgrid());
+        opts += " -DIQ_MV_SIGNXOR=" + std::to_string(ggml_cl_iq_mv_signxor());
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), opts);
 

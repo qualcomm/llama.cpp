@@ -95,7 +95,26 @@ inline uint iq3xxs_pack(uint gv, uint sg, uint base) {
 }
 
 // Four grid values with their signs applied, as floats.
+// IQ_MV_SIGNXOR=1: apply the per-weight signs by XOR-ing the float sign bit
+// rather than by four conditional negations.
+//
+// Why: the IQ3_S cost probe (GGML_OPENCL_IQ3S_MV_ABL=3) says dropping the sign
+// application entirely is worth 13.6 percent -- the second-largest cost in these
+// kernels after the grid lookup, and ahead of the activation load at 5.5. The
+// three grid types share this helper verbatim and are together about 30 percent
+// of Qwen3.8-27B decode.
+#ifndef IQ_MV_SIGNXOR
+#define IQ_MV_SIGNXOR 0
+#endif
+
 inline float4 iq3xxs_vals(uint gv, uint sgv, uint base) {
+#if IQ_MV_SIGNXOR
+    // A sign flip is bit 31, so the four conditional negations collapse to one
+    // XOR once the four sign bits are spread into place. Exact, not approximate.
+    const uint  s   = sgv >> base;
+    const uint4 sgn = (uint4)(s << 31, s << 30, s << 29, s << 28) & 0x80000000u;
+    return as_float4(as_uint4(convert_float4(as_uchar4(gv))) ^ sgn);
+#else
     const uint s = sgv >> base;
     float4 v;
     v.s0 = (float)((gv      ) & 0xFFu); if (s & 1u) { v.s0 = -v.s0; }
@@ -103,6 +122,7 @@ inline float4 iq3xxs_vals(uint gv, uint sgv, uint base) {
     v.s2 = (float)((gv >> 16) & 0xFFu); if (s & 4u) { v.s2 = -v.s2; }
     v.s3 = (float)((gv >> 24) & 0xFFu); if (s & 8u) { v.s3 = -v.s3; }
     return v;
+#endif
 }
 
 kernel void kernel_mul_mv_iq3_xxs_f32_flat(
