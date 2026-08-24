@@ -1326,6 +1326,11 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mv_q2_k_f32_flat;
     cl_kernel kernel_mul_mv_iq2_s_f32_flat;
     cl_kernel kernel_mul_mv_iq1_s_f32_flat;
+    // Grid tables as image1d_buffer, filled once at init from the table the kernel
+    // itself compiles in (see the *_grid_export kernels). Singletons; the backing
+    // buffer is kept alongside so the image can never outlive it.
+    cl_mem iq2s_grid_buf = nullptr, iq2s_grid_img = nullptr;
+    cl_mem iq1s_grid_buf = nullptr, iq1s_grid_img = nullptr;
     cl_kernel kernel_mul_mv_iq1_m_f32_flat;
     cl_kernel kernel_mul_mv_iq2_xxs_f32;
     cl_kernel kernel_mul_mv_iq2_xs_f32;
@@ -2146,6 +2151,20 @@ static int ggml_cl_iq3s_mv_gridsrc() {
     return v;
 }
 
+// Read the grid through an image1d_buffer instead of staging it in local memory.
+// The staged grid is worth +20-25% over __constant, so the divergent grid read is
+// what these kernels cost; the texture path is the remaining tier that serves a
+// gather. See the kernel headers.
+static int ggml_cl_iq1s_mv_gridimg() {
+    static const int v = ggml_cl_env_int("GGML_OPENCL_IQ1S_MV_GRIDIMG", 0);
+    return v;
+}
+
+static int ggml_cl_iq2s_mv_gridimg() {
+    static const int v = ggml_cl_env_int("GGML_OPENCL_IQ2S_MV_GRIDIMG", 0);
+    return v;
+}
+
 // Cost probe only, wrong math: repeat a kernel's per-operand ARITHMETIC on data
 // already in registers, adding no loads. Shared by the q6_K, q2_K and IQ1_S decode
 // GEMVs so one bit-width sweep can be run with a high-bandwidth positive control.
@@ -2565,6 +2584,37 @@ static std::string ggml_opencl_make_compile_opts(ggml_backend_opencl_context *ba
     }
 
     return compile_opts;
+}
+
+// Fill a device buffer from a grid table compiled into `prog` and wrap it in an
+// image1d_buffer. Running an export kernel rather than duplicating the table on the
+// host means the image can never drift from what the GEMV compiles against.
+static void ggml_cl_make_grid_image(ggml_backend_opencl_context * backend_ctx,
+                                    cl_program prog, const char * export_name,
+                                    size_t n_uints, cl_mem * out_buf, cl_mem * out_img) {
+    if (*out_img) {
+        return;
+    }
+    cl_int err;
+    cl_kernel k;
+    CL_CHECK((k = clCreateKernel(prog, export_name, &err), err));
+    CL_CHECK((*out_buf = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE,
+                                        n_uints * sizeof(cl_uint), NULL, &err), err));
+    CL_CHECK(clSetKernelArg(k, 0, sizeof(cl_mem), out_buf));
+    size_t gws = n_uints;
+    size_t lws = 64;
+    CL_CHECK(clEnqueueNDRangeKernel(backend_ctx->queue, k, 1, NULL, &gws, &lws, 0, NULL, NULL));
+    CL_CHECK(clFinish(backend_ctx->queue));
+    CL_CHECK(clReleaseKernel(k));
+
+    cl_image_format fmt = { CL_R, CL_UNSIGNED_INT32 };
+    cl_image_desc   desc;
+    memset(&desc, 0, sizeof(desc));
+    desc.image_type  = CL_MEM_OBJECT_IMAGE1D_BUFFER;
+    desc.image_width = n_uints;
+    desc.buffer      = *out_buf;
+    CL_CHECK((*out_img = clCreateImage(backend_ctx->context, CL_MEM_READ_ONLY,
+                                       &fmt, &desc, NULL, &err), err));
 }
 
 static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
@@ -3460,11 +3510,14 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         opts += " -DIQ2S_MV_NSG=" + std::to_string(ggml_cl_iq2s_mv_nsg());
         opts += " -DIQ2S_MV_R2="  + std::to_string(ggml_cl_iq2s_mv_r2());
         opts += " -DIQ2S_MV_LDSGRID=" + std::to_string(ggml_cl_iq2s_mv_ldsgrid());
+        opts += " -DIQ2S_MV_GRIDIMG=" + std::to_string(ggml_cl_iq2s_mv_gridimg());
         opts += " -DIQ2S_MV_SIGNXOR=" + std::to_string(ggml_cl_iq2s_mv_signxor());
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), opts);
 
         CL_CHECK((backend_ctx->kernel_mul_mv_iq2_s_f32_flat = clCreateKernel(prog, "kernel_mul_mv_iq2_s_f32_flat", &err), err));
+        ggml_cl_make_grid_image(backend_ctx, prog, "kernel_iq2s_grid_export", 2048,
+                                &backend_ctx->iq2s_grid_buf, &backend_ctx->iq2s_grid_img);
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
@@ -3482,11 +3535,14 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         opts += " -DIQ1S_MV_NSG=" + std::to_string(ggml_cl_iq1s_mv_nsg());
         opts += " -DIQ1S_MV_R2="  + std::to_string(ggml_cl_iq1s_mv_r2());
         opts += " -DIQ1S_MV_LDSGRID=" + std::to_string(ggml_cl_iq1s_mv_ldsgrid());
+        opts += " -DIQ1S_MV_GRIDIMG=" + std::to_string(ggml_cl_iq1s_mv_gridimg());
         opts += " -DMV_WORK2=" + std::to_string(ggml_cl_mv_work2());
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), opts);
 
         CL_CHECK((backend_ctx->kernel_mul_mv_iq1_s_f32_flat = clCreateKernel(prog, "kernel_mul_mv_iq1_s_f32_flat", &err), err));
+        ggml_cl_make_grid_image(backend_ctx, prog, "kernel_iq1s_grid_export", 2048,
+                                &backend_ctx->iq1s_grid_buf, &backend_ctx->iq1s_grid_img);
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
@@ -35409,6 +35465,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     cl_kernel fk = backend_ctx->kernel_mul_mv_iq2_s_f32_flat;
                     const int nsg = ggml_cl_iq2s_mv_nsg();
                     cl_int ai = 0;
+                    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &backend_ctx->iq2s_grid_img));
                     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->qs));
                     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->sg));
                     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->qh));
@@ -35542,6 +35599,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     cl_kernel fk = backend_ctx->kernel_mul_mv_iq1_s_f32_flat;
                     const int nsg = ggml_cl_iq1s_mv_nsg();
                     cl_int ai = 0;
+                    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &backend_ctx->iq1s_grid_img));
                     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->qs));
                     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->qh));
                     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->d));
@@ -37553,6 +37611,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 cl_kernel fk = backend_ctx->kernel_mul_mv_iq2_s_f32_flat;
                 const int nsg = ggml_cl_iq2s_mv_nsg();
                 cl_int ai = 0;
+                CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &backend_ctx->iq2s_grid_img));
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->qs));
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->sg));
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->qh));
@@ -37623,6 +37682,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 cl_kernel fk = backend_ctx->kernel_mul_mv_iq1_s_f32_flat;
                 const int nsg = ggml_cl_iq1s_mv_nsg();
                 cl_int ai = 0;
+                CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &backend_ctx->iq1s_grid_img));
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->qs));
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->qh));
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->d));

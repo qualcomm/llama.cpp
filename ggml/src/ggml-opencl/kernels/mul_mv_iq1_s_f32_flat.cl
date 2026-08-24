@@ -305,7 +305,33 @@ inline float4 iq1s_vals(uint g) {
                     (float)((g >> 16) & 0xFu), (float)((g >> 24) & 0xFu));
 }
 
+// IQ1S_MV_GRIDIMG=1: read the grid through an image1d_buffer instead of staging it
+// in LOCAL memory.
+//
+// Why: the staged grid is worth +20-25% over __constant here, so the divergent grid
+// read is this kernel's cost -- but LDS is then the tier serving it, and a divergent
+// LDS read is bank-conflict serialised. The texture path has its own cache and is
+// built for gather access, so it is the remaining tier to try. The Adreno guide's
+// tier note rules __constant out for a data-dependent index and does not cover
+// images, so this has to be measured rather than reasoned.
+//
+// The image is filled by kernel_iq1s_grid_export below, so the table never has to be
+// duplicated on the host and cannot drift from the one this kernel compiles in.
+#ifndef IQ1S_MV_GRIDIMG
+#define IQ1S_MV_GRIDIMG 0
+#endif
+
+// Copies the compiled-in grid into a plain buffer once at init; the backend wraps
+// that buffer in the image1d_buffer the GEMV reads.
+kernel void kernel_iq1s_grid_export(global uint * out) {
+    const uint i = get_global_id(0);
+    if (i < 2048u) {
+        out[i] = iq1s_grid_gpu[i];
+    }
+}
+
 kernel void kernel_mul_mv_iq1_s_f32_flat(
+        __read_only image1d_buffer_t grid_img,
         global const uchar  * src0_qs,
         global const ushort * src0_qh,
         global const half   * src0_d,
@@ -331,7 +357,9 @@ kernel void kernel_mul_mv_iq1_s_f32_flat(
 
     global const float * y = src1 + (ulong)col * (uint)ne10;
 
-#if IQ1S_MV_LDSGRID
+#if IQ1S_MV_GRIDIMG
+#define IQ1S_GRID(i) (read_imageui(grid_img, (int)(i)).x)
+#elif IQ1S_MV_LDSGRID
     __local uint sh_grid[2048];
     {
         const uint tid  = sgi * 64u + lid;
