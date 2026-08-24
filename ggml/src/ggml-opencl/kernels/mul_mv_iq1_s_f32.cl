@@ -13,6 +13,10 @@
 #endif
 
 #define QK_K 256
+
+#ifndef IQ_MV_VEC
+#define IQ_MV_VEC 1
+#endif
 #define IQ1S_DELTA 0.125f
 
 typedef struct {
@@ -376,8 +380,19 @@ kernel void kernel_mul_mv_iq1_s_f32(
             global uchar * qsb = xb->qs + 4*it;
 
             float acc = 0.f;
+#if IQ_MV_VEC
+            // block is 50 bytes with qs at +2, so the four quant bytes are
+            // ushort aligned but not uint aligned
+            ushort2 qv = vload2(0, (global ushort *)qsb);
+            ushort  qp[2] = { qv.s0, qv.s1 };
+#endif
             for (int l = 0; l < 4; ++l) {
+#if IQ_MV_VEC
+                uchar qb = (l & 1) ? (uchar)(qp[l>>1] >> 8) : (uchar)(qp[l>>1] & 0xff);
+                uint gi = (uint)qb | ((((uint)qhb >> (3*l)) & 7) << 8);
+#else
                 uint gi = (uint)qsb[l] | ((((uint)qhb >> (3*l)) & 7) << 8);
+#endif
                 uint g  = iq1s_grid_gpu[gi];
                 for (int j = 0; j < 4; ++j) {
                     acc += yl[8*l+j+0] * ((float)((g >> (8*j+0)) & 0xF) + dlt);

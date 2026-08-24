@@ -14,6 +14,10 @@
 
 #define QK_K 256
 
+#ifndef IQ_MV_VEC
+#define IQ_MV_VEC 1
+#endif
+
 // qs holds 32 grid low bytes then 32 sign bytes
 typedef struct {
     half  d;
@@ -377,9 +381,22 @@ kernel void kernel_mul_mv_iq2_s_f32(
             global uchar * sgb = xb->qs + 32 + 4*it;
 
             float alo = 0.f, ahi = 0.f;
+#if IQ_MV_VEC
+            // block is 82 bytes with qs at +2, so both runs are ushort aligned
+            ushort2 qv = vload2(0, (global ushort *)qsb);
+            ushort2 sv = vload2(0, (global ushort *)sgb);
+            ushort  qp[2] = { qv.s0, qv.s1 };
+            ushort  sp[2] = { sv.s0, sv.s1 };
+#endif
             for (int l = 0; l < 4; ++l) {
+#if IQ_MV_VEC
+                uchar qb = (l & 1) ? (uchar)(qp[l>>1] >> 8) : (uchar)(qp[l>>1] & 0xff);
+                uchar sg = (l & 1) ? (uchar)(sp[l>>1] >> 8) : (uchar)(sp[l>>1] & 0xff);
+                uint  gi = (uint)qb | (((uint)qhb << (8-2*l)) & 0x300);
+#else
                 uint  gi = (uint)qsb[l] | (((uint)qhb << (8-2*l)) & 0x300);
                 uchar sg = sgb[l];
+#endif
                 uint  lo = iq2s_grid[2*gi+0];
                 uint  hi = iq2s_grid[2*gi+1];
                 float a  = 0.f;
