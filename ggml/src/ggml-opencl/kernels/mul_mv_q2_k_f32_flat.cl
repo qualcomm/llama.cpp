@@ -26,6 +26,16 @@
 #endif
 
 // Four weights of one group as floats (0..3).
+// MV_WORK2=1: COST PROBE, WRONG MATH. Repeat this kernel's per-operand ARITHMETIC
+// on data that is already in registers -- no extra loads at all. Doubling the work
+// while holding the loads fixed is the only way to tell a compute-bound kernel from
+// a bandwidth-bound one; every ablation probe removes a computation AND its load
+// together and therefore cannot. A bandwidth-bound kernel is flat under this.
+// Operands are perturbed so the duplicate cannot be common-subexpression eliminated.
+#ifndef MV_WORK2
+#define MV_WORK2 0
+#endif
+
 inline float4 q2k_vals(uint pk) {
     return (float4)((float)( pk       & 3u), (float)((pk >> 2) & 3u),
                     (float)((pk >> 4) & 3u), (float)((pk >> 6) & 3u));
@@ -92,6 +102,9 @@ kernel void kernel_mul_mv_q2_k_f32_flat(
                         const float4 yv = vload4(grp + gg, y);
                         as += yv;
                         a0 += dot(yv, q2k_vals( qsv        & 0xFFu));
+#if MV_WORK2
+                        a0 += dot(yv, q2k_vals((qsv + 1u)  & 0xFFu));
+#endif
                         a1 += dot(yv, q2k_vals((qsv >>  8) & 0xFFu));
                         a2 += dot(yv, q2k_vals((qsv >> 16) & 0xFFu));
                         a3 += dot(yv, q2k_vals((qsv >> 24) & 0xFFu));
@@ -162,6 +175,9 @@ kernel void kernel_mul_mv_q2_k_f32_flat(
                         const float4 yv = vload4(grp + gg, y);
                         as += yv;
                         a0 += dot(yv, q2k_vals( qsv       & 0xFFu));
+#if MV_WORK2
+                        a0 += dot(yv, q2k_vals((qsv + 1u) & 0xFFu));
+#endif
                         a1 += dot(yv, q2k_vals((qsv >> 8) & 0xFFu));
                     }
                     const float asum = as.s0 + as.s1 + as.s2 + as.s3;
@@ -212,7 +228,11 @@ kernel void kernel_mul_mv_q2_k_f32_flat(
                         const uint gg = 4u*h + u;
                         const float4 yv = vload4(grp + gg, y);
                         as += yv;
-                        a += dot(yv, q2k_vals((uint)src0_qs[qsb + gg * m]));
+                        const uint pkv = (uint)src0_qs[qsb + gg * m];
+                        a += dot(yv, q2k_vals(pkv));
+#if MV_WORK2
+                        a += dot(yv, q2k_vals(pkv + 1u));
+#endif
                     }
                     const float asum = as.s0 + as.s1 + as.s2 + as.s3;
                     ad += (float)(sc & 0xFu) * a;   am += (float)(sc >> 4) * asum;

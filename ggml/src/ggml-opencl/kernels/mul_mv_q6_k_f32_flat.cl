@@ -28,6 +28,16 @@
 
 #define QK_K       256
 
+// MV_WORK2=1: COST PROBE, WRONG MATH. Repeat this kernel's per-operand ARITHMETIC
+// on data that is already in registers -- no extra loads at all. Doubling the work
+// while holding the loads fixed is the only way to tell a compute-bound kernel from
+// a bandwidth-bound one; every ablation probe removes a computation AND its load
+// together and therefore cannot. A bandwidth-bound kernel is flat under this.
+// Operands are perturbed so the duplicate cannot be common-subexpression eliminated.
+#ifndef MV_WORK2
+#define MV_WORK2 0
+#endif
+
 inline float block_q_6_K_dot_y_flat(
     global uchar * blk_ql,
     global uchar * blk_qh,
@@ -83,8 +93,17 @@ inline float block_q_6_K_dot_y_flat(
     char4 s4 = (sj == 0) ? (char4)(scv.s0, scv.s2, scv.s4, scv.s6)
                          : (char4)(scv.s1, scv.s3, scv.s5, scv.s7);
 
-    return dall * (dot(y0, w0) * s4.x + dot(y1, w1) * s4.y +
-                   dot(y2, w2) * s4.z + dot(y3, w3) * s4.w);
+    float r = dall * (dot(y0, w0) * s4.x + dot(y1, w1) * s4.y +
+                      dot(y2, w2) * s4.z + dot(y3, w3) * s4.w);
+#if MV_WORK2
+    float4 v0 = convert_float4(((q1i + 1) & 0xF) | ((qhi & Q6_K_MASK1) << 4)) - 32.f;
+    float4 v1 = convert_float4(((q2i + 1) & 0xF) | ((qhi & Q6_K_MASK2) << 2)) - 32.f;
+    float4 v2 = convert_float4(((q1i + 1) >> 4) | ((qhi & Q6_K_MASK3)     )) - 32.f;
+    float4 v3 = convert_float4(((q2i + 1) >> 4) | ((qhi & Q6_K_MASK4) >> 2)) - 32.f;
+    r += dall * (dot(y0, v0) * s4.x + dot(y1, v1) * s4.y +
+                 dot(y2, v2) * s4.z + dot(y3, v3) * s4.w);
+#endif
+    return r;
 }
 
 #undef N_DST

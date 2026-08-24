@@ -290,6 +290,16 @@ constant uint iq1s_grid_gpu[2048] = {
 };
 
 // Four stored grid values (0..2) of one operand, as floats.
+// MV_WORK2=1: COST PROBE, WRONG MATH. Repeat this kernel's per-operand ARITHMETIC
+// on data that is already in registers -- no extra loads at all. Doubling the work
+// while holding the loads fixed is the only way to tell a compute-bound kernel from
+// a bandwidth-bound one; every ablation probe removes a computation AND its load
+// together and therefore cannot. A bandwidth-bound kernel is flat under this.
+// Operands are perturbed so the duplicate cannot be common-subexpression eliminated.
+#ifndef MV_WORK2
+#define MV_WORK2 0
+#endif
+
 inline float4 iq1s_vals(uint g) {
     return (float4)((float)( g        & 0xFu), (float)((g >>  8) & 0xFu),
                     (float)((g >> 16) & 0xFu), (float)((g >> 24) & 0xFu));
@@ -374,6 +384,9 @@ kernel void kernel_mul_mv_iq1_s_f32_flat(
                     const float4 y1 = vload4(grp + 2u*l + 1u, y);
                     as += y0 + y1;
                     a0 += dot(y0, iq1s_vals(g0)) + dot(y1, iq1s_vals(g0 >> 4));
+#if MV_WORK2
+                    a0 += dot(y0, iq1s_vals(g0 + 1u)) + dot(y1, iq1s_vals((g0 >> 4) + 1u));
+#endif
                     a1 += dot(y0, iq1s_vals(g1)) + dot(y1, iq1s_vals(g1 >> 4));
                 }
                 // one activation sum, both rows
@@ -413,6 +426,9 @@ kernel void kernel_mul_mv_iq1_s_f32_flat(
                     const float4 y1 = vload4(grp + 2u*l + 1u, y);
                     as += y0 + y1;
                     a += dot(y0, iq1s_vals(g)) + dot(y1, iq1s_vals(g >> 4));
+#if MV_WORK2
+                    a += dot(y0, iq1s_vals(g + 1u)) + dot(y1, iq1s_vals((g >> 4) + 1u));
+#endif
                 }
                 const float asum = as.s0 + as.s1 + as.s2 + as.s3;
                 acc += sc * (a + t * asum);
