@@ -211,7 +211,9 @@ kernel void kernel_mul_mv_iq3_s_f32_flat(
     barrier(CLK_LOCAL_MEM_FENCE);
 #define IQ3S_GRID(i) sh_grid[(i)]
 #elif IQ3S_MV_ABL == 2
-#define IQ3S_GRID(i) (0x01030507u)
+// must still CONSUME the index, or the qs/qh loads that compute it are dead
+// code and the probe silently measures "no grid AND no weights".
+#define IQ3S_GRID(i) (((i) * 0x01010101u) | 0x01010101u)
 #else
 #define IQ3S_GRID(i) iq3s_grid[(i)]
 #endif
