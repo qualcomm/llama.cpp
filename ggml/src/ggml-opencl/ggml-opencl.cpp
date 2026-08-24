@@ -2082,9 +2082,13 @@ static int ggml_cl_q2k_mv_nsg() {
     return v;
 }
 
-static int ggml_cl_q2k_mv_r2() {
-    static const int v = ggml_cl_env_int("GGML_OPENCL_Q2K_MV_R2", 1);
-    return v;
+// Q2_K wants FOUR rows per lane where the other split types want two: its min
+// term needs a per-16 activation sum that does not depend on the row, so more
+// rows per lane amortise it. The AoS kernel this replaces reuses that sum across
+// N_DST = 4 rows, and at 2 the flat kernel lost 12% of decode.
+static int ggml_cl_q2k_mv_r() {
+    static const int v = ggml_cl_env_int("GGML_OPENCL_Q2K_MV_R", 4);
+    return (v == 1 || v == 2 || v == 4) ? v : 4;
 }
 
 static cl_program build_program_from_source_ex(cl_context ctx, cl_device_id dev, const char* program_buffer, const std::string &compile_opts, bool fatal, const char *tag = nullptr, size_t bin_size = 0, cl_command_queue retry_queue = nullptr) {
@@ -3223,7 +3227,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         std::string opts = compile_opts;
         opts += " -DQ2K_MV_NSG=" + std::to_string(ggml_cl_q2k_mv_nsg());
-        opts += " -DQ2K_MV_R2="  + std::to_string(ggml_cl_q2k_mv_r2());
+        opts += " -DQ2K_MV_R="   + std::to_string(ggml_cl_q2k_mv_r());
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), opts);
 
@@ -13447,8 +13451,11 @@ static bool ggml_cl_q2k_is_split(const ggml_backend_opencl_context * backend_ctx
     return t->type == GGML_TYPE_Q2_K
         && ggml_cl_q2k_soa_on(backend_ctx)
         && backend_ctx->kernel_convert_block_q2_k_ns != nullptr
-        // the decode GEMV reads adjacent rows as one word; see the IQ3_S note
-        && t->ne[1] % 2 == 0
+        // the decode GEMV reads Q2K_MV_R adjacent rows as one word, so a row
+        // count that is not a multiple of it is declined HERE rather than per
+        // dispatch: a tensor that gets split but that some path cannot read is
+        // silent garbage.
+        && t->ne[1] % ggml_cl_q2k_mv_r() == 0
         && use_adreno_kernels(backend_ctx, t);
 }
 
@@ -34778,7 +34785,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne10));
                     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne0));
 
-                    const size_t rows_wg = ggml_cl_q2k_mv_r2() ? 128 : 64;
+                    const size_t rows_wg = 64u * (size_t)ggml_cl_q2k_mv_r();
                     size_t f_global[3] = { CEIL_DIV((size_t)ne01, rows_wg) * 64,
                                            (size_t)ne11 * (size_t)nsg, 1 };
                     size_t f_local[3]  = { 64, (size_t)nsg, 1 };
@@ -36477,7 +36484,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne10));
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne0));
 
-                const size_t rows_wg = ggml_cl_q2k_mv_r2() ? 128 : 64;
+                const size_t rows_wg = 64u * (size_t)ggml_cl_q2k_mv_r();
                 size_t f_global[3] = { CEIL_DIV((size_t)ne01, rows_wg) * 64,
                                        (size_t)ne11 * (size_t)nsg, 1 };
                 size_t f_local[3]  = { 64, (size_t)nsg, 1 };
