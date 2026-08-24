@@ -49,6 +49,16 @@
 #define IQ3S_MV_R2 1
 #endif
 
+// IQ3S_MV_LDSGRID=1: stage iq3s_grid into local memory once per workgroup and
+// read it from there.
+//
+// iq3s_grid is 512 uints = 2 KB and every lane indexes it divergently with a
+// 9-bit index. The IQ2_S GEMV took +55% from this move, but its grid is 8 KB --
+// a table a quarter the size may simply sit in the constant cache, so measure.
+//
+#ifndef IQ3S_MV_LDSGRID
+#define IQ3S_MV_LDSGRID 0
+#endif
 constant uint iq3s_grid[512] = {
     0x01010101, 0x01010103, 0x01010105, 0x0101010b, 0x0101010f, 0x01010301, 0x01010303, 0x01010305,
     0x01010309, 0x0101030d, 0x01010501, 0x01010503, 0x0101050b, 0x01010707, 0x01010901, 0x01010905,
@@ -155,6 +165,21 @@ kernel void kernel_mul_mv_iq3_s_f32_flat(
 
     global const float * y = src1 + (ulong)col * (uint)ne10;
 
+#if IQ3S_MV_LDSGRID
+    __local uint sh_grid[512];
+    {
+        const uint tid  = sgi * 64u + lid;
+        const uint nthr = (uint)(get_local_size(0) * get_local_size(1));
+        for (uint i = tid; i < 512u; i += nthr) {
+            sh_grid[i] = iq3s_grid[i];
+        }
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+#define IQ3S_GRID(i) sh_grid[(i)]
+#else
+#define IQ3S_GRID(i) iq3s_grid[(i)]
+#endif
+
 #if IQ3S_MV_R2
     const uint mh  = m >> 1;                        // rows per plane row, as ushorts
     const uint j   = get_group_id(0) * 64u + lid;   // row pair index
@@ -203,8 +228,8 @@ kernel void kernel_mul_mv_iq3_s_f32_flat(
                     const uint g1  = ((qsv >> 8) & 0xFFu) | (((qh1 >> u) & 1u) << 8);
                     const uint base = (u & 1u) * 4u;
                     const float4 yv = vload4(grp + u, y);
-                    a0 += dot(yv, iq3s_vals(iq3s_grid[g0],  sgv       & 0xFFu, base));
-                    a1 += dot(yv, iq3s_vals(iq3s_grid[g1], (sgv >> 8) & 0xFFu, base));
+                    a0 += dot(yv, iq3s_vals(IQ3S_GRID(g0),  sgv       & 0xFFu, base));
+                    a1 += dot(yv, iq3s_vals(IQ3S_GRID(g1), (sgv >> 8) & 0xFFu, base));
                 }
                 acc0 += (float)(1u + 2u * nib0) * a0;
                 acc1 += (float)(1u + 2u * nib1) * a1;
@@ -237,7 +262,7 @@ kernel void kernel_mul_mv_iq3_s_f32_flat(
                     const uint g   = (uint)src0_qs[qsb + u * m] | (((qhv >> u) & 1u) << 8);
                     const uint sgv = (uint)src0_sg[sgb + (u >> 1) * m];
                     const float4 yv = vload4(grp + u, y);
-                    a += dot(yv, iq3s_vals(iq3s_grid[g], sgv, (u & 1u) * 4u));
+                    a += dot(yv, iq3s_vals(IQ3S_GRID(g), sgv, (u & 1u) * 4u));
                 }
                 acc += (float)(1u + 2u * nib) * a;
             }

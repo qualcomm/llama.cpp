@@ -2108,11 +2108,25 @@ static int ggml_cl_iq3s_mv_r2() {
     return v;
 }
 
+// Stage the 2 KB iq3s_grid in local memory rather than reading it from
+// __constant at a divergent index, as the IQ2_S GEMV already does with its 8 KB
+// table; see the kernel header.
+static int ggml_cl_iq3s_mv_ldsgrid() {
+    static const int v = ggml_cl_env_int("GGML_OPENCL_IQ3S_MV_LDSGRID", 0);
+    return v;
+}
+
 // Same two knobs again for IQ3_XXS. Its quant plane is also one uchar per 4
 // weights, so it takes the same row pairing; do NOT try four rows, that was
 // measured on IQ3_S and LOSES (it quarters the grid).
 static int ggml_cl_iq3xxs_mv_nsg() {
     static const int v = ggml_cl_env_int("GGML_OPENCL_IQ3XXS_MV_NSG", 8);
+    return v;
+}
+
+// Same for IQ3_XXS, whose grid is 1 KB -- the smallest of the split types'.
+static int ggml_cl_iq3xxs_mv_ldsgrid() {
+    static const int v = ggml_cl_env_int("GGML_OPENCL_IQ3XXS_MV_LDSGRID", 0);
     return v;
 }
 
@@ -3299,6 +3313,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         std::string opts = compile_opts;
         opts += " -DIQ3S_MV_NSG=" + std::to_string(ggml_cl_iq3s_mv_nsg());
+        opts += " -DIQ3S_MV_LDSGRID=" + std::to_string(ggml_cl_iq3s_mv_ldsgrid());
         opts += " -DIQ3S_MV_R2="  + std::to_string(ggml_cl_iq3s_mv_r2());
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), opts);
@@ -3319,6 +3334,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         std::string opts = compile_opts;
         opts += " -DIQ3XXS_MV_NSG=" + std::to_string(ggml_cl_iq3xxs_mv_nsg());
+        opts += " -DIQ3XXS_MV_LDSGRID=" + std::to_string(ggml_cl_iq3xxs_mv_ldsgrid());
         opts += " -DIQ3XXS_MV_R2="  + std::to_string(ggml_cl_iq3xxs_mv_r2());
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), opts);

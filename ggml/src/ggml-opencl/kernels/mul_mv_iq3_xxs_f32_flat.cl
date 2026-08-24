@@ -22,6 +22,15 @@
 #define IQ3XXS_MV_R2 1
 #endif
 
+// IQ3XXS_MV_LDSGRID=1: stage iq3xxs_grid into local memory once per workgroup and
+// read it from there.
+//
+// iq3xxs_grid is 256 uints = 1 KB, the smallest of the split types' tables, so
+// this is the arm most likely to come back a null.
+//
+#ifndef IQ3XXS_MV_LDSGRID
+#define IQ3XXS_MV_LDSGRID 0
+#endif
 constant uint iq3xxs_grid[256] = {
     0x04040404, 0x04040414, 0x04040424, 0x04040c0c, 0x04040c1c, 0x04040c3e, 0x04041404, 0x04041414,
     0x04041c0c, 0x04042414, 0x04043e1c, 0x04043e2c, 0x040c040c, 0x040c041c, 0x040c0c04, 0x040c0c14,
@@ -120,6 +129,21 @@ kernel void kernel_mul_mv_iq3_xxs_f32_flat(
 
     global const float * y = src1 + (ulong)col * (uint)ne10;
 
+#if IQ3XXS_MV_LDSGRID
+    __local uint sh_grid[256];
+    {
+        const uint tid  = sgi * 64u + lid;
+        const uint nthr = (uint)(get_local_size(0) * get_local_size(1));
+        for (uint i = tid; i < 256u; i += nthr) {
+            sh_grid[i] = iq3xxs_grid[i];
+        }
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+#define IQ3XXS_GRID(i) sh_grid[(i)]
+#else
+#define IQ3XXS_GRID(i) iq3xxs_grid[(i)]
+#endif
+
 #if IQ3XXS_MV_R2
     const uint mh  = m >> 1;                        // rows per plane row, as pairs
     const uint j   = get_group_id(0) * 64u + lid;   // row pair index
@@ -150,9 +174,9 @@ kernel void kernel_mul_mv_iq3_xxs_f32_flat(
                     const uint sh   = 7u * (u >> 1);
                     const uint base = (u & 1u) * 4u;
                     const float4 yv = vload4(grp + u, y);
-                    a0 += dot(yv, iq3xxs_vals(iq3xxs_grid[ qsv        & 0xFFu],
+                    a0 += dot(yv, iq3xxs_vals(IQ3XXS_GRID( qsv        & 0xFFu),
                                               iq3xxs_signs((aux.s0 >> sh) & 127u), base));
-                    a1 += dot(yv, iq3xxs_vals(iq3xxs_grid[(qsv >> 8)  & 0xFFu],
+                    a1 += dot(yv, iq3xxs_vals(IQ3XXS_GRID((qsv >> 8)  & 0xFFu),
                                               iq3xxs_signs((aux.s1 >> sh) & 127u), base));
                 }
                 acc0 += (0.5f + (float)(aux.s0 >> 28)) * a0;
@@ -185,7 +209,7 @@ kernel void kernel_mul_mv_iq3_xxs_f32_flat(
                     const uint sh   = 7u * (u >> 1);
                     const uint base = (u & 1u) * 4u;
                     const float4 yv = vload4(grp + u, y);
-                    a += dot(yv, iq3xxs_vals(iq3xxs_grid[g],
+                    a += dot(yv, iq3xxs_vals(IQ3XXS_GRID(g),
                                              iq3xxs_signs((aux >> sh) & 127u), base));
                 }
                 acc += (0.5f + (float)(aux >> 28)) * a;
