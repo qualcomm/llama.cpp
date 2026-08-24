@@ -1873,6 +1873,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemm_noshuffle_iq4_nl_q8_1_dp4a = nullptr;  // dp4a (int8) dense IQ4_NL prefill GEMM
     cl_kernel kernel_mul_mm_iq4_xs_q8_1_dp4a = nullptr;  // dp4a (int8) dense IQ4_XS prefill GEMM, reads AoS blocks
     cl_kernel kernel_gemm_noshuffle_iq4_xs_q8_1_dp4a = nullptr;  // same, reading the feature-major plane split
+    cl_kernel kernel_gemm_noshuffle_iq4_xs_q8_1_dp4a_wimg = nullptr;  // same, quant plane through a texture (opt-in)
     cl_kernel kernel_convert_block_iq4_xs_ns = nullptr;  // IQ4_XS AoS -> planes
     cl_kernel kernel_restore_block_iq4_xs_ns = nullptr;  // IQ4_XS planes -> AoS
     cl_kernel kernel_convert_block_iq3_s_ns  = nullptr;  // IQ3_S AoS -> planes
@@ -2039,6 +2040,13 @@ static bool ggml_cl_lm_half(const ggml_backend_opencl_context * backend_ctx) {
 // Subgroups the IQ4_XS plane-split decode GEMV splits K across. One row per
 // lane alone leaves only M work items, which is 2.5x slower than the AoS
 // kernel; the K-split is what puts the wave count back.
+// Read the IQ4_XS quant plane through an image1d_buffer in the prefill GEMM.
+// q4_K ships the equivalent by default; opt-in here until measured.
+static int ggml_cl_iq4xs_wimg() {
+    static const int v = ggml_cl_env_int("GGML_OPENCL_IQ4XS_WIMG", 0);
+    return v;
+}
+
 static int ggml_cl_iq4xs_mv_nsg() {
     static const int v = ggml_cl_env_int("GGML_OPENCL_IQ4XS_MV_NSG", 8);
     return v;
@@ -6101,6 +6109,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_iq4_xs_q8_1_dp4a = clCreateKernel(prog, "kernel_gemm_noshuffle_iq4_xs_q8_1_dp4a", &err), err));
+        CL_CHECK((backend_ctx->kernel_gemm_noshuffle_iq4_xs_q8_1_dp4a_wimg = clCreateKernel(prog, "kernel_gemm_noshuffle_iq4_xs_q8_1_dp4a_wimg", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
@@ -11277,6 +11286,7 @@ struct ggml_tensor_extra_cl_iq4_nl {
 // longer fit.
 struct ggml_tensor_extra_cl_iq4_xs {
     cl_mem q  = nullptr;   // 4 codebook indices per ushort, feature-major
+    cl_mem q_img = nullptr; // the same plane as CL_R/UINT32 texels (prefill GEMM)
     cl_mem d  = nullptr;   // super-block scale
     cl_mem sh = nullptr;   // scales_h
     cl_mem sl = nullptr;   // scales_l, 4 bytes packed into a uint
@@ -11286,6 +11296,7 @@ struct ggml_tensor_extra_cl_iq4_xs {
     ~ggml_tensor_extra_cl_iq4_xs() { reset(); }
 
     void reset() {
+        if (q_img != nullptr) { CL_CHECK(clReleaseMemObject(q_img)); q_img = nullptr; }
         if (q  != nullptr) { CL_CHECK(clReleaseMemObject(q));  q  = nullptr; }
         if (d  != nullptr) { CL_CHECK(clReleaseMemObject(d));  d  = nullptr; }
         if (sh != nullptr) { CL_CHECK(clReleaseMemObject(sh)); sh = nullptr; }
@@ -16612,6 +16623,25 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
             extra->size_d  = size_d;
             extra->size_sh = size_sh;
             extra->size_sl = size_sl;
+
+            // A CL_R/UINT32 view of the quant plane for the _wimg prefill GEMM.
+            // The plane is one ushort per 4 weights, so it is nelements/8 texels,
+            // and two adjacent ROWS share a texel -- the same packing q4_K's
+            // weight image uses.
+            {
+                cl_image_format ifmt = { CL_R, CL_UNSIGNED_INT32 };
+                cl_image_desc   idesc = {
+                    CL_MEM_OBJECT_IMAGE1D_BUFFER,
+                    static_cast<size_t>(ggml_nelements(tensor) / 8),
+                    0, 0, 0, 0, 0, 0, 0,
+                    { extra->q }
+                };
+                cl_int ierr = CL_SUCCESS;
+                extra->q_img = clCreateImage(context, CL_MEM_READ_ONLY, &ifmt, &idesc, NULL, &ierr);
+                if (ierr != CL_SUCCESS) {
+                    extra->q_img = nullptr;   // the buffer path stays available
+                }
+            }
 
             tensor->extra = extra;
 
@@ -35604,9 +35634,14 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                         size_t q_global[1] = { (size_t)(((n_blocks + 63) / 64) * 64) };
                         backend_ctx->enqueue_ndrange_kernel(qk, 1, q_global, q_local, dst);
 
-                        cl_kernel dk = backend_ctx->kernel_gemm_noshuffle_iq4_xs_q8_1_dp4a;
+                        const bool use_wimg = ggml_cl_iq4xs_wimg()
+                            && ex0->q_img != nullptr
+                            && backend_ctx->kernel_gemm_noshuffle_iq4_xs_q8_1_dp4a_wimg;
+                        cl_kernel dk = use_wimg
+                            ? backend_ctx->kernel_gemm_noshuffle_iq4_xs_q8_1_dp4a_wimg
+                            : backend_ctx->kernel_gemm_noshuffle_iq4_xs_q8_1_dp4a;
                         int ai = 0;
-                        CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_mem),   &ex0->q));
+                        CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_mem),   use_wimg ? &ex0->q_img : &ex0->q));
                         CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_mem),   &ex0->d));
                         CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_mem),   &ex0->sh));
                         CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_mem),   &ex0->sl));

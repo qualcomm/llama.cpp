@@ -179,3 +179,121 @@ kernel void kernel_gemm_noshuffle_iq4_xs_q8_1_dp4a(
     }
 #undef NGROUPS
 }
+
+
+// Weights-as-texture twin of the kernel above (`_wimg`). Identical arithmetic;
+// the quant plane is read through an image1d_buffer (read_imageui -> texture
+// cache) instead of a global ushort pointer. Two adjacent rows share one uint
+// texel, exactly as in gemm_noshuffle_q4_k_q8_1_dp4a's _wimg variants -- which is
+// what q4_K ships by default, paired with the same uint4 activation staging this
+// kernel now has.
+//
+// Opt-in with GGML_OPENCL_IQ4XS_WIMG until measured.
+__attribute__((qcom_wave_pair_mode(1)))
+kernel void kernel_gemm_noshuffle_iq4_xs_q8_1_dp4a_wimg(
+        __read_only image1d_buffer_t src0_q_img, // the same plane as CL_R/UINT32 texels
+        __global const half   * src0_d,    // per-256 super-block scale, feature-major
+        __global const ushort * src0_sh,   // scales_h, feature-major
+        __global const uint   * src0_sl,   // scales_l (4 bytes packed), feature-major
+        __global const uint   * src1_qa,   // q8_1 activations int8 (as uint, 4/elem) [N, K]
+        __global const half   * src1_da,   // q8_1 per-block scale [N, K/32]
+        __global       float  * dst,
+        ulong  offsetd,
+        int    m,                          // output features (rows)
+        int    n_no_padding,               // tokens (cols)
+        int    k                           // K (== ne00)
+) {
+    dst = (global float *)((global char *)dst + offsetd);
+
+    const uint lid = get_local_id(0);          // 0..63 -> row within the M-tile
+    const uint block_id_m = get_global_id(1);
+    const uint block_id_n = get_global_id(2);
+
+    const uint row      = block_id_m * 64 + lid;
+    const uint col_base = block_id_n * TILESIZE_N;
+    const bool row_valid = row < (uint)m;
+    const uint rrow     = row_valid ? row : 0;  // clamp OOB rows; their writes are masked
+
+    // two adjacent ROWS share one uint texel, so sel picks this row's ushort.
+    // That needs m even, which ggml_cl_iq4xs_is_split() already requires.
+    const uint sel = (rrow & 1u) * 16u;
+    const uint k_u = (uint)k >> 2;   // K in uint (int8x4) units
+    const uint k_b = (uint)k >> 5;   // blocks-of-32 along K
+
+    __local uint4 sh_qa4[TILESIZE_N][2];
+    __local half sh_d[TILESIZE_N];
+
+#define NGROUPS (TILESIZE_N / 4)
+    float4 acc[NGROUPS];
+    #pragma unroll
+    for (int g = 0; g < NGROUPS; ++g) acc[g] = (float4)(0.0f);
+
+    for (uint step = 0; step < (uint)k; step += 32) {
+        const uint sub = step >> 5;
+
+        // rebuild the 6-bit sub-scale for this 32-block
+        const uint   ib  = sub >> 3;              // super-block along K
+        const uint   sb  = sub & 7u;              // sub-block inside it
+        const uint   sl  = src0_sl[rrow + ib * (uint)m];
+        const uint   shv = (uint)src0_sh[rrow + ib * (uint)m];
+        const int    ls  = (int)(((sl >> (8u * (sb >> 1))) >> (4u * (sb & 1u))) & 0xFu)
+                         | (int)(((shv >> (2u * sb)) & 3u) << 4);
+        const float d_w = (float)src0_d[rrow + ib * (uint)m] * (float)(ls - 32);
+
+        // 8 weight uints (32 codebook int8) for this row, this 32-block.
+        const uint qsbase = rrow + (step >> 2) * (uint)m;
+        uint8 qw;
+#define WQ(U) iq4nl_pack((ushort)((read_imageui(src0_q_img, \
+                (int)((qsbase + (U) * m) >> 1)).x >> sel) & 0xFFFFu))
+        qw.s0 = WQ(0u);  qw.s1 = WQ(1u);  qw.s2 = WQ(2u);  qw.s3 = WQ(3u);
+        qw.s4 = WQ(4u);  qw.s5 = WQ(5u);  qw.s6 = WQ(6u);  qw.s7 = WQ(7u);
+#undef WQ
+
+        // cooperatively stage the 32-token x 32-K int8 activations to LDS
+        // 16-byte cooperative staging: TILESIZE_N*2 uint4s instead of TILESIZE_N*8
+        // uints. (c*k_u + step/4) is a multiple of 8, so vload4 is aligned.
+        for (uint idx = lid; idx < TILESIZE_N * 2; idx += 64) {
+            const uint t = idx >> 1;
+            const uint v = idx & 1;
+            const uint c = col_base + t;
+            sh_qa4[t][v] = (c < (uint)n_no_padding)
+                         ? vload4(0, src1_qa + c * k_u + (step >> 2) + (v << 2))
+                         : (uint4)(0u);
+        }
+        if (lid < TILESIZE_N) {
+            const uint c = col_base + lid;
+            sh_d[lid] = (c < (uint)n_no_padding) ? src1_da[c * k_b + sub] : (half)0;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+#define LD4(arr, b) ((float4)((float)arr[(b)+0], (float)arr[(b)+1], (float)arr[(b)+2], (float)arr[(b)+3]))
+#define TDOT4(T) dot8_q8a_v(qw, (uint4)(sh_qa4[T][0]), (uint4)(sh_qa4[T][1]))
+        #pragma unroll
+        for (int g = 0; g < NGROUPS; ++g) {
+            const int b = g * 4;
+            const float4 rf = (float4)((float)TDOT4(b+0), (float)TDOT4(b+1),
+                                       (float)TDOT4(b+2), (float)TDOT4(b+3));
+            acc[g] += d_w * LD4(sh_d, b) * rf;
+        }
+#undef TDOT4
+#undef LD4
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    if (!row_valid) {
+        return;
+    }
+
+    // dst is [token, feature] row-major (stride m): dst[col*m + row].
+    #pragma unroll
+    for (int g = 0; g < NGROUPS; ++g) {
+        const uint b = (uint)(g * 4);
+        const float4 a = acc[g];
+        const uint c0 = col_base + b;
+        if (c0 + 0 < (uint)n_no_padding) dst[(c0 + 0) * (uint)m + row] = a.s0;
+        if (c0 + 1 < (uint)n_no_padding) dst[(c0 + 1) * (uint)m + row] = a.s1;
+        if (c0 + 2 < (uint)n_no_padding) dst[(c0 + 2) * (uint)m + row] = a.s2;
+        if (c0 + 3 < (uint)n_no_padding) dst[(c0 + 3) * (uint)m + row] = a.s3;
+    }
+#undef NGROUPS
+}
