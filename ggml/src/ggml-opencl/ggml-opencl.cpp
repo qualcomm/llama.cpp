@@ -2179,15 +2179,18 @@ static int ggml_cl_iq2s_mv_gridimg(const ggml_backend_opencl_context * backend_c
     return ggml_cl_gridimg_default(backend_ctx, "GGML_OPENCL_IQ2S_MV_GRIDIMG");
 }
 
-// These two are still on __constant and unmeasured against the image; off for now.
-static int ggml_cl_iq3s_mv_gridimg() {
-    static const int v = ggml_cl_env_int("GGML_OPENCL_IQ3S_MV_GRIDIMG", 0);
-    return v;
+// These two kept their grids in __constant because LOCAL memory lost on them
+// (-16.5% and -5.3%; the tables are 2 KB and 1 KB, too small to earn the traffic).
+// The image is a third tier and it beats both: q4b-IQ3_S tg64 19.59 -> 21.61
+// (+10.4%), q4b-IQ3_XXS 18.92 -> 22.46 (+18.8%).
+// 🔑 So "local memory lost" did NOT imply "__constant is the best available" --
+// the three tiers had to be measured separately, per kernel.
+static int ggml_cl_iq3s_mv_gridimg(const ggml_backend_opencl_context * backend_ctx) {
+    return ggml_cl_gridimg_default(backend_ctx, "GGML_OPENCL_IQ3S_MV_GRIDIMG");
 }
 
-static int ggml_cl_iq3xxs_mv_gridimg() {
-    static const int v = ggml_cl_env_int("GGML_OPENCL_IQ3XXS_MV_GRIDIMG", 0);
-    return v;
+static int ggml_cl_iq3xxs_mv_gridimg(const ggml_backend_opencl_context * backend_ctx) {
+    return ggml_cl_gridimg_default(backend_ctx, "GGML_OPENCL_IQ3XXS_MV_GRIDIMG");
 }
 
 // Cost probe only, wrong math: repeat a kernel's per-operand ARITHMETIC on data
@@ -3446,7 +3449,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         std::string opts = compile_opts;
         opts += " -DIQ3S_MV_NSG=" + std::to_string(ggml_cl_iq3s_mv_nsg());
         opts += " -DIQ3S_MV_LDSGRID=" + std::to_string(ggml_cl_iq3s_mv_ldsgrid());
-        opts += " -DIQ3S_MV_GRIDIMG=" + std::to_string(ggml_cl_iq3s_mv_gridimg());
+        opts += " -DIQ3S_MV_GRIDIMG=" + std::to_string(ggml_cl_iq3s_mv_gridimg(backend_ctx));
         opts += " -DIQ3S_MV_SIGNXOR=" + std::to_string(ggml_cl_iq3s_mv_signxor());
         opts += " -DIQ3S_MV_ABL=" + std::to_string(ggml_cl_iq3s_mv_abl());
         opts += " -DIQ3S_MV_GRIDSRC=" + std::to_string(ggml_cl_iq3s_mv_gridsrc());
@@ -3474,7 +3477,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         std::string opts = compile_opts;
         opts += " -DIQ3XXS_MV_NSG=" + std::to_string(ggml_cl_iq3xxs_mv_nsg());
         opts += " -DIQ3XXS_MV_LDSGRID=" + std::to_string(ggml_cl_iq3xxs_mv_ldsgrid());
-        opts += " -DIQ3XXS_MV_GRIDIMG=" + std::to_string(ggml_cl_iq3xxs_mv_gridimg());
+        opts += " -DIQ3XXS_MV_GRIDIMG=" + std::to_string(ggml_cl_iq3xxs_mv_gridimg(backend_ctx));
         opts += " -DIQ3XXS_MV_SIGNXOR=" + std::to_string(ggml_cl_iq3xxs_mv_signxor());
         opts += " -DIQ3XXS_MV_R2="  + std::to_string(ggml_cl_iq3xxs_mv_r2());
         cl_program prog =
