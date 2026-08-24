@@ -2109,6 +2109,12 @@ static int ggml_cl_iq2s_mv_ldsgrid() {
     return v;
 }
 
+// Same for the prefill GEMM. Off by default -- see the kernel header.
+static int ggml_cl_iq2s_gemm_ldsgrid() {
+    static const int v = ggml_cl_env_int("GGML_OPENCL_IQ2S_GEMM_LDSGRID", 0);
+    return v;
+}
+
 static int ggml_cl_q2k_mv_r() {
     static const int v = ggml_cl_env_int("GGML_OPENCL_Q2K_MV_R", 4);
     return (v == 1 || v == 2 || v == 4) ? v : 4;
@@ -6072,7 +6078,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #else
         const std::string kernel_src = read_file("gemm_noshuffle_iq2_s_q8_1_dp4a.cl");
 #endif
-        cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        std::string opts = compile_opts;
+        opts += " -DIQ2S_GEMM_LDSGRID=" + std::to_string(ggml_cl_iq2s_gemm_ldsgrid());
+        cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), opts);
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_iq2_s_q8_1_dp4a = clCreateKernel(prog, "kernel_gemm_noshuffle_iq2_s_q8_1_dp4a", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");

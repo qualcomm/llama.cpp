@@ -23,6 +23,16 @@
 #define QK_K 256
 
 #define TILESIZE_N 32
+
+// IQ2S_GEMM_LDSGRID=1: stage the 8 KB iq2s_grid in local memory, as the decode
+// GEMV does (there it is worth +55%). OFF by default here: this kernel runs a
+// 64-thread workgroup, so 8 KB of extra LDS costs far more occupancy than it does
+// in the 512-thread GEMV, and each grid lookup already feeds 32 columns of dp4a
+// rather than one row of a GEMV -- about 32x less constant pressure per unit of
+// work. Measure before flipping.
+#ifndef IQ2S_GEMM_LDSGRID
+#define IQ2S_GEMM_LDSGRID 0
+#endif
 constant uint iq2s_grid[2048] = {
     0x08080808, 0x08080808, 0x0808082b, 0x08080808, 0x08081919, 0x08080808, 0x08082b08, 0x08080808,
     0x08082b2b, 0x08080808, 0x08190819, 0x08080808, 0x08191908, 0x08080808, 0x0819192b, 0x08080808,
@@ -334,6 +344,17 @@ kernel void kernel_gemm_noshuffle_iq2_s_q8_1_dp4a(
     __local uint sh_qa[TILESIZE_N][8];
     __local half sh_d[TILESIZE_N];
 
+#if IQ2S_GEMM_LDSGRID
+    __local uint sh_grid[2048];
+    for (uint i = lid; i < 2048u; i += 64u) {
+        sh_grid[i] = iq2s_grid[i];
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+#define IQ2S_GRID(i) sh_grid[(i)]
+#else
+#define IQ2S_GRID(i) iq2s_grid[(i)]
+#endif
+
 #define NGROUPS (TILESIZE_N / 4)
     float4 acc[NGROUPS];
     #pragma unroll
@@ -361,14 +382,14 @@ kernel void kernel_gemm_noshuffle_iq2_s_q8_1_dp4a(
             const uint s1  = (uint)src0_sg[gb + 1u * (uint)m];
             const uint s2  = (uint)src0_sg[gb + 2u * (uint)m];
             const uint s3  = (uint)src0_sg[gb + 3u * (uint)m];
-            qlo.s0 = iq2s_pack(iq2s_grid[2u*gi0 + 0u], s0, 0u);
-            qlo.s1 = iq2s_pack(iq2s_grid[2u*gi0 + 1u], s0, 4u);
-            qlo.s2 = iq2s_pack(iq2s_grid[2u*gi1 + 0u], s1, 0u);
-            qlo.s3 = iq2s_pack(iq2s_grid[2u*gi1 + 1u], s1, 4u);
-            qhi.s0 = iq2s_pack(iq2s_grid[2u*gi2 + 0u], s2, 0u);
-            qhi.s1 = iq2s_pack(iq2s_grid[2u*gi2 + 1u], s2, 4u);
-            qhi.s2 = iq2s_pack(iq2s_grid[2u*gi3 + 0u], s3, 0u);
-            qhi.s3 = iq2s_pack(iq2s_grid[2u*gi3 + 1u], s3, 4u);
+            qlo.s0 = iq2s_pack(IQ2S_GRID(2u*gi0 + 0u), s0, 0u);
+            qlo.s1 = iq2s_pack(IQ2S_GRID(2u*gi0 + 1u), s0, 4u);
+            qlo.s2 = iq2s_pack(IQ2S_GRID(2u*gi1 + 0u), s1, 0u);
+            qlo.s3 = iq2s_pack(IQ2S_GRID(2u*gi1 + 1u), s1, 4u);
+            qhi.s0 = iq2s_pack(IQ2S_GRID(2u*gi2 + 0u), s2, 0u);
+            qhi.s1 = iq2s_pack(IQ2S_GRID(2u*gi2 + 1u), s2, 4u);
+            qhi.s2 = iq2s_pack(IQ2S_GRID(2u*gi3 + 0u), s3, 0u);
+            qhi.s3 = iq2s_pack(IQ2S_GRID(2u*gi3 + 1u), s3, 4u);
         }
 
         for (uint idx = lid; idx < TILESIZE_N * 8; idx += 64) {
@@ -413,4 +434,5 @@ kernel void kernel_gemm_noshuffle_iq2_s_q8_1_dp4a(
         if (c0 + 3 < (uint)n_no_padding) dst[(c0 + 3) * (uint)m + row] = a.s3;
     }
 #undef NGROUPS
+#undef IQ2S_GRID
 }
