@@ -741,6 +741,7 @@ static void repack_tiled_q4_0(void * data, const ggml_tensor * t, size_t offset,
     const size_t matrix_size = n_col_tiles * n_k_tiles * tile_size;
 
     size_t slice_size = ne1 * ggml_row_size(t->type, ne0);
+    size_t row_size_bytes = ggml_row_size(t->type, ne0);
     int64_t start_slice = offset / slice_size;
     int64_t end_slice = (offset + size + slice_size - 1) / slice_size;
     if (end_slice > ne2 * ne3) {
@@ -748,10 +749,23 @@ static void repack_tiled_q4_0(void * data, const ggml_tensor * t, size_t offset,
     }
 
     for (int64_t slice_idx = start_slice; slice_idx < end_slice; slice_idx++) {
-        block_q4_0 * dst_expert = dst_matrix + (slice_idx - start_slice) * (ne1 * (ne0 / 32));
+        size_t cur_start_byte = (std::max)(offset, (size_t) slice_idx * slice_size);
+        size_t cur_end_byte   = (std::min)(offset + size, (size_t) (slice_idx + 1) * slice_size);
+        size_t slice_offset_start = cur_start_byte - (size_t) slice_idx * slice_size;
+        size_t slice_offset_end   = cur_end_byte - (size_t) slice_idx * slice_size;
+
+        int64_t start_row = slice_offset_start / row_size_bytes;
+        int64_t end_row   = (slice_offset_end + row_size_bytes - 1) / row_size_bytes;
+        end_row = (std::min)(end_row, ne1);
+
+        int start_ct = start_row / 32;
+        int end_ct   = (end_row + 31) / 32;
+        end_ct = (std::min)(end_ct, n_col_tiles);
+
+        block_q4_0 * dst_slice = dst_matrix + (cur_start_byte - offset) / sizeof(block_q4_0);
         const uint8_t * matrix_src = (const uint8_t *) t->data + slice_idx * matrix_size;
 
-        for (int ct = 0; ct < n_col_tiles; ct++) {
+        for (int ct = start_ct; ct < end_ct; ct++) {
             for (int kt = 0; kt < n_k_tiles; kt++) {
                 const uint8_t * tile_src = matrix_src + (ct * n_k_tiles + kt) * tile_size;
 
@@ -766,16 +780,16 @@ static void repack_tiled_q4_0(void * data, const ggml_tensor * t, size_t offset,
 
                 for (int row = 0; row < 32; row++) {
                     int64_t r = ct * 32 + row;
-                    if (r < ne1 && kt < ne0 / 32) {
-                        pack_q4_0_quants(&dst_expert[r * (ne0 / 32) + kt], tile_quants[row], 0);
+                    if (r >= start_row && r < end_row && kt < ne0 / 32) {
+                        pack_q4_0_quants(&dst_slice[(r - start_row) * (ne0 / 32) + kt], tile_quants[row], 0);
                     }
                 }
 
                 const ggml_half * scale_src = (const ggml_half *)(tile_src + 512);
                 for (int row = 0; row < 32; row++) {
                     int64_t r = ct * 32 + row;
-                    if (r < ne1 && kt < ne0 / 32) {
-                        dst_expert[r * (ne0 / 32) + kt].d = scale_src[row];
+                    if (r >= start_row && r < end_row && kt < ne0 / 32) {
+                        dst_slice[(r - start_row) * (ne0 / 32) + kt].d = scale_src[row];
                     }
                 }
             }
@@ -861,6 +875,7 @@ static void repack_tiled_q4_1(void * data, const ggml_tensor * t, size_t offset,
     const size_t matrix_size = n_col_tiles * n_k_tiles * tile_size;
 
     size_t slice_size = ne1 * ggml_row_size(t->type, ne0);
+    size_t row_size_bytes = ggml_row_size(t->type, ne0);
     int64_t start_slice = offset / slice_size;
     int64_t end_slice = (offset + size + slice_size - 1) / slice_size;
     if (end_slice > ne2 * ne3) {
@@ -868,10 +883,23 @@ static void repack_tiled_q4_1(void * data, const ggml_tensor * t, size_t offset,
     }
 
     for (int64_t slice_idx = start_slice; slice_idx < end_slice; slice_idx++) {
-        block_q4_1 * dst_expert = dst_matrix + (slice_idx - start_slice) * (ne1 * (ne0 / 32));
+        size_t cur_start_byte = (std::max)(offset, (size_t) slice_idx * slice_size);
+        size_t cur_end_byte   = (std::min)(offset + size, (size_t) (slice_idx + 1) * slice_size);
+        size_t slice_offset_start = cur_start_byte - (size_t) slice_idx * slice_size;
+        size_t slice_offset_end   = cur_end_byte - (size_t) slice_idx * slice_size;
+
+        int64_t start_row = slice_offset_start / row_size_bytes;
+        int64_t end_row   = (slice_offset_end + row_size_bytes - 1) / row_size_bytes;
+        end_row = (std::min)(end_row, ne1);
+
+        int start_ct = start_row / 32;
+        int end_ct   = (end_row + 31) / 32;
+        end_ct = (std::min)(end_ct, n_col_tiles);
+
+        block_q4_1 * dst_slice = dst_matrix + (cur_start_byte - offset) / sizeof(block_q4_1);
         const uint8_t * matrix_src = (const uint8_t *) t->data + slice_idx * matrix_size;
 
-        for (int ct = 0; ct < n_col_tiles; ct++) {
+        for (int ct = start_ct; ct < end_ct; ct++) {
             for (int kt = 0; kt < n_k_tiles; kt++) {
                 const uint8_t * tile_src = matrix_src + (ct * n_k_tiles + kt) * tile_size;
 
@@ -886,17 +914,17 @@ static void repack_tiled_q4_1(void * data, const ggml_tensor * t, size_t offset,
 
                 for (int row = 0; row < 32; row++) {
                     int64_t r = ct * 32 + row;
-                    if (r < ne1 && kt < ne0 / 32) {
-                        pack_q4_1_quants(&dst_expert[r * (ne0 / 32) + kt], tile_quants[row], 0);
+                    if (r >= start_row && r < end_row && kt < ne0 / 32) {
+                        pack_q4_1_quants(&dst_slice[(r - start_row) * (ne0 / 32) + kt], tile_quants[row], 0);
                     }
                 }
 
                 const ggml_half * scale_src = (const ggml_half *)(tile_src + 512);
                 for (int row = 0; row < 32; row++) {
                     int64_t r = ct * 32 + row;
-                    if (r < ne1 && kt < ne0 / 32) {
-                        dst_expert[r * (ne0 / 32) + kt].d = scale_src[2 * row];
-                        dst_expert[r * (ne0 / 32) + kt].m = scale_src[2 * row + 1];
+                    if (r >= start_row && r < end_row && kt < ne0 / 32) {
+                        dst_slice[(r - start_row) * (ne0 / 32) + kt].d = scale_src[2 * row];
+                        dst_slice[(r - start_row) * (ne0 / 32) + kt].m = scale_src[2 * row + 1];
                     }
                 }
             }
@@ -971,6 +999,7 @@ static void repack_tiled_q8_0(void * data, const ggml_tensor * t, size_t offset,
     const size_t matrix_size = n_col_tiles * n_k_tiles * tile_size;
 
     size_t slice_size = ne1 * ggml_row_size(t->type, ne0);
+    size_t row_size_bytes = ggml_row_size(t->type, ne0);
     int64_t start_slice = offset / slice_size;
     int64_t end_slice = (offset + size + slice_size - 1) / slice_size;
     if (end_slice > ne2 * ne3) {
@@ -978,10 +1007,23 @@ static void repack_tiled_q8_0(void * data, const ggml_tensor * t, size_t offset,
     }
 
     for (int64_t slice_idx = start_slice; slice_idx < end_slice; slice_idx++) {
-        block_q8_0 * dst_expert = dst_matrix + (slice_idx - start_slice) * (ne1 * (ne0 / 32));
+        size_t cur_start_byte = (std::max)(offset, (size_t) slice_idx * slice_size);
+        size_t cur_end_byte   = (std::min)(offset + size, (size_t) (slice_idx + 1) * slice_size);
+        size_t slice_offset_start = cur_start_byte - (size_t) slice_idx * slice_size;
+        size_t slice_offset_end   = cur_end_byte - (size_t) slice_idx * slice_size;
+
+        int64_t start_row = slice_offset_start / row_size_bytes;
+        int64_t end_row   = (slice_offset_end + row_size_bytes - 1) / row_size_bytes;
+        end_row = (std::min)(end_row, ne1);
+
+        int start_ct = start_row / 32;
+        int end_ct   = (end_row + 31) / 32;
+        end_ct = (std::min)(end_ct, n_col_tiles);
+
+        block_q8_0 * dst_slice = dst_matrix + (cur_start_byte - offset) / sizeof(block_q8_0);
         const uint8_t * matrix_src = (const uint8_t *) t->data + slice_idx * matrix_size;
 
-        for (int ct = 0; ct < n_col_tiles; ct++) {
+        for (int ct = start_ct; ct < end_ct; ct++) {
             for (int kt = 0; kt < n_k_tiles; kt++) {
                 const uint8_t * tile_src = matrix_src + (ct * n_k_tiles + kt) * tile_size;
 
@@ -990,8 +1032,8 @@ static void repack_tiled_q8_0(void * data, const ggml_tensor * t, size_t offset,
                     int col1 = col0 + 1;
                     for (int row = 0; row < 32; row++) {
                         int64_t r = ct * 32 + row;
-                        if (r < ne1 && kt < ne0 / 32) {
-                            block_q8_0 & b = dst_expert[r * (ne0 / 32) + kt];
+                        if (r >= start_row && r < end_row && kt < ne0 / 32) {
+                            block_q8_0 & b = dst_slice[(r - start_row) * (ne0 / 32) + kt];
                             b.qs[col0] = tile_src[cp * 64 + 2 * row + 0];
                             b.qs[col1] = tile_src[cp * 64 + 2 * row + 1];
                         }
@@ -1001,8 +1043,8 @@ static void repack_tiled_q8_0(void * data, const ggml_tensor * t, size_t offset,
                 const ggml_half * scale_src = (const ggml_half *)(tile_src + 1024);
                 for (int row = 0; row < 32; row++) {
                     int64_t r = ct * 32 + row;
-                    if (r < ne1 && kt < ne0 / 32) {
-                        dst_expert[r * (ne0 / 32) + kt].d = scale_src[row];
+                    if (r >= start_row && r < end_row && kt < ne0 / 32) {
+                        dst_slice[(r - start_row) * (ne0 / 32) + kt].d = scale_src[row];
                     }
                 }
             }
@@ -1082,6 +1124,7 @@ static void repack_tiled_mxfp4(void * data, const ggml_tensor * t, size_t offset
     const size_t matrix_size = n_col_tiles * n_k_tiles * tile_size;
 
     size_t slice_size = ne1 * ggml_row_size(t->type, ne0);
+    size_t row_size_bytes = ggml_row_size(t->type, ne0);
     int64_t start_slice = offset / slice_size;
     int64_t end_slice = (offset + size + slice_size - 1) / slice_size;
     if (end_slice > ne2 * ne3) {
@@ -1089,10 +1132,23 @@ static void repack_tiled_mxfp4(void * data, const ggml_tensor * t, size_t offset
     }
 
     for (int64_t slice_idx = start_slice; slice_idx < end_slice; slice_idx++) {
-        block_mxfp4 * dst_expert = dst_matrix + (slice_idx - start_slice) * (ne1 * (ne0 / 32));
+        size_t cur_start_byte = (std::max)(offset, (size_t) slice_idx * slice_size);
+        size_t cur_end_byte   = (std::min)(offset + size, (size_t) (slice_idx + 1) * slice_size);
+        size_t slice_offset_start = cur_start_byte - (size_t) slice_idx * slice_size;
+        size_t slice_offset_end   = cur_end_byte - (size_t) slice_idx * slice_size;
+
+        int64_t start_row = slice_offset_start / row_size_bytes;
+        int64_t end_row   = (slice_offset_end + row_size_bytes - 1) / row_size_bytes;
+        end_row = (std::min)(end_row, ne1);
+
+        int start_ct = start_row / 32;
+        int end_ct   = (end_row + 31) / 32;
+        end_ct = (std::min)(end_ct, n_col_tiles);
+
+        block_mxfp4 * dst_slice = dst_matrix + (cur_start_byte - offset) / sizeof(block_mxfp4);
         const uint8_t * matrix_src = (const uint8_t *) t->data + slice_idx * matrix_size;
 
-        for (int ct = 0; ct < n_col_tiles; ct++) {
+        for (int ct = start_ct; ct < end_ct; ct++) {
             for (int kt = 0; kt < n_k_tiles; kt++) {
                 const uint8_t * tile_src = matrix_src + (ct * n_k_tiles + kt) * tile_size;
 
@@ -1107,16 +1163,16 @@ static void repack_tiled_mxfp4(void * data, const ggml_tensor * t, size_t offset
 
                 for (int row = 0; row < 32; row++) {
                     int64_t r = ct * 32 + row;
-                    if (r < ne1 && kt < ne0 / 32) {
-                        pack_mxfp4_quants(&dst_expert[r * (ne0 / 32) + kt], tile_quants[row], 0);
+                    if (r >= start_row && r < end_row && kt < ne0 / 32) {
+                        pack_mxfp4_quants(&dst_slice[(r - start_row) * (ne0 / 32) + kt], tile_quants[row], 0);
                     }
                 }
 
                 const uint8_t * scale_src = tile_src + 512;
                 for (int row = 0; row < 32; row++) {
                     int64_t r = ct * 32 + row;
-                    if (r < ne1 && kt < ne0 / 32) {
-                        dst_expert[r * (ne0 / 32) + kt].e = scale_src[row];
+                    if (r >= start_row && r < end_row && kt < ne0 / 32) {
+                        dst_slice[(r - start_row) * (ne0 / 32) + kt].e = scale_src[row];
                     }
                 }
             }
