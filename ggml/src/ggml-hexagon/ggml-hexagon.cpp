@@ -234,9 +234,10 @@ static void ggml_hexagon_dump_trace_events(const std::string & sess_name, const 
 }
 
 enum ggml_hexagon_tensor_flags {
-    GGML_HEXAGON_TENSOR_REPACK = (1 << 0),
-    GGML_HEXAGON_TENSOR_WEIGHT = (1 << 1),
-    GGML_HEXAGON_TENSOR_FENCE  = (1 << 2),
+    GGML_HEXAGON_TENSOR_REPACK    = (1 << 0),
+    GGML_HEXAGON_TENSOR_WEIGHT    = (1 << 1),
+    GGML_HEXAGON_TENSOR_FENCE     = (1 << 2),
+    GGML_HEXAGON_TENSOR_FUSEABLE  = (1 << 3),
 };
 
 static inline bool ggml_hexagon_is_repack_type(enum ggml_type type) {
@@ -329,6 +330,12 @@ struct ggml_hexagon_tensor_extra {
     size_t               shadow_size { 0 };
     uint32_t             flags { 0 };
 };
+
+static inline bool ggml_hexagon_tensor_is_fuseable(const struct ggml_tensor * t) {
+    if (!t || !t->extra) return false;
+    auto extra = (const struct ggml_hexagon_tensor_extra *) t->extra;
+    return (extra->flags & GGML_HEXAGON_TENSOR_FUSEABLE) != 0;
+}
 
 struct htp_opnode;
 
@@ -1760,6 +1767,7 @@ struct ggml_hexagon_opbatch {
         const ggml_tensor * add_src1 = node.src1();
 
         if (!add_src0 || !add_src1 || !ar_local) return false;
+        if (!ggml_hexagon_tensor_is_fuseable(ar_local)) return false;
 
         const ggml_tensor * res_tensor = nullptr;
         if (add_src0 == ar_local || add_src0->data == ar_local->data) {
@@ -1855,6 +1863,7 @@ struct ggml_hexagon_opbatch {
         const ggml_tensor * rms_out  = last_node.dst();
 
         if (!mul_src0 || !mul_src1 || !rms_out) return false;
+        if (!ggml_hexagon_tensor_is_fuseable(rms_out)) return false;
 
         const ggml_tensor * weight = nullptr;
         if (mul_src0 == rms_out || mul_src0->data == rms_out->data) {
@@ -1955,6 +1964,7 @@ struct ggml_hexagon_opbatch {
         const ggml_tensor * mm_out   = last_node.dst();
 
         if (!add_src0 || !add_src1 || !mm_out) return false;
+        if (!ggml_hexagon_tensor_is_fuseable(mm_out)) return false;
 
         const ggml_tensor * src2 = nullptr;
         if (add_src0 == mm_out || add_src0->data == mm_out->data) {
@@ -2169,13 +2179,27 @@ struct ggml_hexagon_opbatch {
         return true;
     }
 
+enum ggml_hexagon_fusion_flags {
+    GGML_HEXAGON_FUSE_ALLREDUCE_ADD = (1 << 1), // 2
+    GGML_HEXAGON_FUSE_RMS_NORM_MUL  = (1 << 2), // 4
+    GGML_HEXAGON_FUSE_MUL_MAT_ADD   = (1 << 3), // 8
+    GGML_HEXAGON_FUSE_MUL_MAT_QKV   = (1 << 4), // 16
+    GGML_HEXAGON_FUSE_MUL_MAT_FFN   = (1 << 5), // 32
+};
+
+static inline bool ggml_hexagon_is_fusion_enabled(int flag) {
+    if (opt_opfusion <= 0) return false;
+    if (opt_opfusion == 1) return true; // 1 enables all
+    return (opt_opfusion & flag) != 0;
+}
+
     bool try_fuse(const htp_opnode & node) {
         if (!opt_opfusion) return false;
-        if (try_fuse_allreduce_add(node)) return true;
-        if (try_fuse_rms_norm_mul(node))  return true;
-        if (try_fuse_mul_mat_add(node))   return true;
-        if (try_fuse_mul_mat_qkv(node))   return true;
-        if (try_fuse_mul_mat_ffn(node))   return true;
+        if (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_ALLREDUCE_ADD) && try_fuse_allreduce_add(node)) return true;
+        if (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_RMS_NORM_MUL)  && try_fuse_rms_norm_mul(node))  return true;
+        if (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_MUL_MAT_ADD)   && try_fuse_mul_mat_add(node))   return true;
+        if (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_MUL_MAT_QKV)   && try_fuse_mul_mat_qkv(node))   return true;
+        if (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_MUL_MAT_FFN)   && try_fuse_mul_mat_ffn(node))   return true;
         return false;
     }
 };
@@ -4809,6 +4833,106 @@ static void ggml_backend_hexagon_synchronize(ggml_backend_t backend) {
     sess->flush();
 }
 
+enum ggml_hexagon_mem_range_type {
+    HEXAGON_MEM_RANGE_TYPE_SRC,
+    HEXAGON_MEM_RANGE_TYPE_DST,
+};
+
+struct ggml_hexagon_mem_range {
+    uint64_t pb;
+    uint64_t p0;
+    uint64_t p1;
+    ggml_hexagon_mem_range_type pt;
+};
+
+struct ggml_hexagon_mem_ranges {
+    std::vector<ggml_hexagon_mem_range> ranges;
+
+    void reset() {
+        ranges.clear();
+    }
+
+    void add(const ggml_hexagon_mem_range & mr) {
+        ranges.push_back(mr);
+    }
+
+    bool check(const ggml_hexagon_mem_range & mr) const {
+        for (const auto & cmp : ranges) {
+            if (mr.pb != cmp.pb) {
+                continue;
+            }
+            if (mr.pt == HEXAGON_MEM_RANGE_TYPE_SRC && cmp.pt == HEXAGON_MEM_RANGE_TYPE_SRC) {
+                continue;
+            }
+            if (mr.p0 < cmp.p1 && mr.p1 > cmp.p0) {
+                return false;
+            }
+        }
+        return true;
+    }
+};
+
+static ggml_hexagon_mem_range ggml_hexagon_mem_range_from_tensor(const ggml_tensor * tensor, ggml_hexagon_mem_range_type pt) {
+    const ggml_tensor * base = tensor->view_src ? tensor->view_src : tensor;
+    ggml_hexagon_mem_range mr;
+    if (tensor->buffer) {
+        mr = {
+            /*.pb =*/ (uint64_t) tensor->buffer,
+            /*.p0 =*/ (uint64_t) tensor->data,
+            /*.p1 =*/ (uint64_t) tensor->data + ggml_backend_buft_get_alloc_size(tensor->buffer->buft, (ggml_tensor *)tensor),
+            /*.pt =*/ pt,
+        };
+    } else {
+        mr = {
+            /*.pb =*/ (uint64_t) base,
+            /*.p0 =*/ 0,
+            /*.p1 =*/ 1024,
+            /*.pt =*/ pt,
+        };
+    }
+    return mr;
+}
+
+static void ggml_hexagon_mem_ranges_add_node(ggml_hexagon_mem_ranges & mrs, const htp_opnode & node) {
+    if (node.is_empty()) return;
+
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        if (node.node->src[i]) {
+            mrs.add(ggml_hexagon_mem_range_from_tensor(node.node->src[i], HEXAGON_MEM_RANGE_TYPE_SRC));
+        }
+    }
+    for (const auto * fused : node.fused) {
+        for (int i = 0; i < GGML_MAX_SRC; i++) {
+            if (fused->src[i]) {
+                mrs.add(ggml_hexagon_mem_range_from_tensor(fused->src[i], HEXAGON_MEM_RANGE_TYPE_SRC));
+            }
+        }
+    }
+    mrs.add(ggml_hexagon_mem_range_from_tensor(node.dst(), HEXAGON_MEM_RANGE_TYPE_DST));
+}
+
+static bool ggml_hexagon_mem_ranges_check_node(const ggml_hexagon_mem_ranges & mrs, const htp_opnode & node) {
+    if (node.is_empty()) return true;
+
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        if (node.node->src[i]) {
+            if (!mrs.check(ggml_hexagon_mem_range_from_tensor(node.node->src[i], HEXAGON_MEM_RANGE_TYPE_SRC))) {
+                return false;
+            }
+        }
+    }
+    for (const auto * fused : node.fused) {
+        for (int i = 0; i < GGML_MAX_SRC; i++) {
+            if (fused->src[i]) {
+                if (!mrs.check(ggml_hexagon_mem_range_from_tensor(fused->src[i], HEXAGON_MEM_RANGE_TYPE_SRC))) {
+                    return false;
+                }
+            }
+        }
+    }
+    return mrs.check(ggml_hexagon_mem_range_from_tensor(node.dst(), HEXAGON_MEM_RANGE_TYPE_DST));
+}
+
 static std::vector<int> ggml_hexagon_graph_optimize_reorder(const std::vector<htp_opnode> & nodes) {
     const int n = nodes.size();
 
@@ -4817,11 +4941,10 @@ static std::vector<int> ggml_hexagon_graph_optimize_reorder(const std::vector<ht
 
     std::vector<bool> used(n, false);
 
-    // The main goal here is to stack the MUL_MAT ops with the same src1 input.
-    // This allows use to reuse dynamically quantized src1 in VTCM.
+    ggml_hexagon_mem_ranges mrs;
 
-    // TODO: the current version might do incorrect reordering in cases where quantized src0
-    //       input is an output of another Op.
+    // The main goal here is to stack the MUL_MAT ops with the same src1 input.
+    // This allows us to reuse dynamically quantized src1 in VTCM.
 
     for (int i0 = 0; i0 < n; i0++) {
         if (used[i0]) {
@@ -4842,6 +4965,8 @@ static std::vector<int> ggml_hexagon_graph_optimize_reorder(const std::vector<ht
         std::vector<int> stack;
         stack.push_back(i0);
 
+        mrs.reset();
+
         for (int i1 = i0 + 1; i1 < i0 + N_FORWARD && i1 < n; i1++) {
             if (used[i1]) {
                 continue;
@@ -4849,24 +4974,16 @@ static std::vector<int> ggml_hexagon_graph_optimize_reorder(const std::vector<ht
 
             const auto & node1 = nodes[i1];
 
-            if (node1.stackable() && node1.same_input(node0)) {
+            if (node1.stackable() && node1.same_input(node0) && ggml_hexagon_mem_ranges_check_node(mrs, node1)) {
                 stack.push_back(i1);
+            } else {
+                ggml_hexagon_mem_ranges_add_node(mrs, node1);
             }
         }
 
-        if (stack.size() == 3 && is_qkv_mergeable(nodes[stack[0]].node, nodes[stack[1]].node, nodes[stack[2]].node)) {
-            // Reorder to KVQ: K (stack[1]), V (stack[2]), Q (stack[0])
-            res.push_back(stack[1]);
-            res.push_back(stack[2]);
-            res.push_back(stack[0]);
-            used[stack[0]] = true;
-            used[stack[1]] = true;
-            used[stack[2]] = true;
-        } else {
-            for (int idx : stack) {
-                res.push_back(idx);
-                used[idx] = true;
-            }
+        for (int idx : stack) {
+            res.push_back(idx);
+            used[idx] = true;
         }
     }
 
@@ -4883,9 +5000,22 @@ static void ggml_backend_hexagon_graph_optimize(ggml_backend_t backend, ggml_cgr
     std::vector<htp_opnode> nodes;
     nodes.reserve(gf->n_nodes);
 
-    // fuse nodes:
-    // we don't want to make reorders that break fusing, so we first pack all fusable tensors
-    //   and perform the reorder over the fused nodes. after the reorder is done, we unfuse
+    // Tag fusable tensors
+    for (int i = 0; i < n; i++) {
+        auto * extra = (ggml_hexagon_tensor_extra *) gf->nodes[i]->extra;
+        if (!extra) continue;
+
+        if (gf->nodes[i]->op == GGML_OP_RMS_NORM && ggml_can_fuse(gf, i, { GGML_OP_RMS_NORM, GGML_OP_MUL })) {
+            extra->flags |= GGML_HEXAGON_TENSOR_FUSEABLE;
+        } else if (gf->nodes[i]->op == GGML_OP_MUL_MAT) {
+            if ((i + 1 < n && gf->nodes[i + 1]->op == GGML_OP_ADD && ggml_can_fuse(gf, i, { GGML_OP_MUL_MAT, GGML_OP_ADD })) ||
+                ggml_node_has_n_uses(gf, i, 1)) {
+                extra->flags |= GGML_HEXAGON_TENSOR_FUSEABLE;
+            }
+        }
+    }
+
+    // Pack nodes for reordering
     for (int i = 0; i < n; i++) {
         htp_opnode node(HTP_OP_INVALID, gf->nodes[i]);
 
