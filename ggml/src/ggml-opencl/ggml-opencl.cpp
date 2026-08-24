@@ -2146,6 +2146,14 @@ static int ggml_cl_iq3s_mv_gridsrc() {
     return v;
 }
 
+// Cost probe only, wrong math: repeat a kernel's per-operand ARITHMETIC on data
+// already in registers, adding no loads. Shared by the q6_K, q2_K and IQ1_S decode
+// GEMVs so one bit-width sweep can be run with a high-bandwidth positive control.
+static int ggml_cl_mv_work2() {
+    static const int v = ggml_cl_env_int("GGML_OPENCL_MV_WORK2", 0);
+    return v;
+}
+
 // Cost probe only, wrong math: vary the WORK with the LOADS held fixed, to tell
 // compute-bound from memory-bound. See the kernel header.
 static int ggml_cl_iq3s_mv_work() {
@@ -3430,6 +3438,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         std::string opts = compile_opts;
         opts += " -DQ2K_MV_NSG=" + std::to_string(ggml_cl_q2k_mv_nsg());
         opts += " -DQ2K_MV_R="   + std::to_string(ggml_cl_q2k_mv_r());
+        opts += " -DMV_WORK2=" + std::to_string(ggml_cl_mv_work2());
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), opts);
 
@@ -3473,6 +3482,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         opts += " -DIQ1S_MV_NSG=" + std::to_string(ggml_cl_iq1s_mv_nsg());
         opts += " -DIQ1S_MV_R2="  + std::to_string(ggml_cl_iq1s_mv_r2());
         opts += " -DIQ1S_MV_LDSGRID=" + std::to_string(ggml_cl_iq1s_mv_ldsgrid());
+        opts += " -DMV_WORK2=" + std::to_string(ggml_cl_mv_work2());
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), opts);
 
@@ -3777,7 +3787,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             backend_ctx->q6k_flat_nsg  = nsg;
             compile_opts_local = compile_opts +
                 " -DQ6K_FLAT_N_DST=" + std::to_string(n_dst) +
-                " -DQ6K_FLAT_NSG="   + std::to_string(nsg);
+                " -DQ6K_FLAT_NSG="   + std::to_string(nsg) +
+                " -DMV_WORK2="       + std::to_string(ggml_cl_mv_work2());
         }
 
         cl_program prog =
