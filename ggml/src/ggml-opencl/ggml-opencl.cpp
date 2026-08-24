@@ -1999,6 +1999,13 @@ static int ggml_cl_iq4xs_mv_nsg() {
     return v;
 }
 
+// One work item per row pair, reading both rows' ushorts as one uint, so a wave
+// moves 256 bytes per weight load instead of 128.
+static int ggml_cl_iq4xs_mv_r2() {
+    static const int v = ggml_cl_env_int("GGML_OPENCL_IQ4XS_MV_R2", 1);
+    return v;
+}
+
 static cl_program build_program_from_source_ex(cl_context ctx, cl_device_id dev, const char* program_buffer, const std::string &compile_opts, bool fatal, const char *tag = nullptr, size_t bin_size = 0, cl_command_queue retry_queue = nullptr) {
     // Source compiles only (bin_size==0). Precompiled-binary loads (ILA) have
     // their own path and are not source-cached. A cache hit returns a fully
@@ -3045,6 +3052,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         std::string opts = compile_opts;
         opts += " -DIQ4XS_MV_NSG=" + std::to_string(ggml_cl_iq4xs_mv_nsg());
+        opts += " -DIQ4XS_MV_R2="  + std::to_string(ggml_cl_iq4xs_mv_r2());
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), opts);
 
@@ -13090,6 +13098,10 @@ static bool ggml_cl_iq4xs_is_split(const ggml_backend_opencl_context * backend_c
     return t->type == GGML_TYPE_IQ4_XS
         && ggml_cl_iq4xs_soa_on()
         && backend_ctx->kernel_convert_block_iq4_xs_ns != nullptr
+        // the decode GEMV pairs adjacent rows into one uint load, so an odd row
+        // count is declined HERE rather than per dispatch: a tensor that gets
+        // split but that some path then cannot read is silent garbage.
+        && t->ne[1] % 2 == 0
         && use_adreno_kernels(backend_ctx, t);
 }
 
@@ -33315,7 +33327,8 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                         CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne10));
                         CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne0));
 
-                        size_t f_global[3] = { CEIL_DIV((size_t)ne01, (size_t)64) * 64,
+                        const size_t rows_wg = ggml_cl_iq4xs_mv_r2() ? 128 : 64;
+                        size_t f_global[3] = { CEIL_DIV((size_t)ne01, rows_wg) * 64,
                                                (size_t)ne11 * (size_t)nsg, 1 };
                         size_t f_local[3]  = { 64, (size_t)nsg, 1 };
                         backend_ctx->enqueue_ndrange_kernel(fk, 3, f_global, f_local, dst);
@@ -34828,7 +34841,8 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne10));
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne0));
 
-                size_t f_global[3] = { CEIL_DIV((size_t)ne01, (size_t)64) * 64,
+                const size_t rows_wg = ggml_cl_iq4xs_mv_r2() ? 128 : 64;
+                size_t f_global[3] = { CEIL_DIV((size_t)ne01, rows_wg) * 64,
                                (size_t)ne11 * (size_t)nsg, 1 };
                 size_t f_local[3]  = { 64, (size_t)nsg, 1 };
                 backend_ctx->enqueue_ndrange_kernel(fk, 3, f_global, f_local, dst);
