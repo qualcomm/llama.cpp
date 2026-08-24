@@ -139,6 +139,18 @@ struct block_iq4_xs
 };
 
 //------------------------------------------------------------------------------
+// block_iq3_s
+//------------------------------------------------------------------------------
+struct block_iq3_s
+{
+    half     d;
+    uint8_t  qs[QK_K/4];
+    uint8_t  qh[QK_K/32];
+    uint8_t  signs[QK_K/8];
+    uint8_t  scales[QK_K/64];
+};
+
+//------------------------------------------------------------------------------
 // bf16 to f16
 //------------------------------------------------------------------------------
 kernel void kernel_convert_bf16_to_f16(
@@ -2578,6 +2590,36 @@ kernel void kernel_convert_block_iq4_xs_ns(
             qo[i2 + 8] = convert_uchar((x0 & mask_F0) >> 4) | convert_uchar(x1 & mask_F0);
         }
     }
+}
+
+//------------------------------------------------------------------------------
+// IQ3_S -> planes. A straight field split, no reordering: for a 32-sub-block sb,
+// `qs[8*sb + u]` is already the grid index for dp4a operand u, because one
+// iq3s_grid entry is a uint holding 4 values, i.e. exactly the 4 weights of
+// K = 4u..4u+3. The 9th index bit is bit u of qh[sb].
+//
+// Size preserving by construction (same five fields), 110 bytes per 256 weights,
+// so the planes are subbuffers of the tensor's own allocation.
+kernel void kernel_convert_block_iq3_s_ns(
+    global struct block_iq3_s * src0,
+    global uchar * dst_qs,      // QK_K/4 per block
+    global uchar * dst_qh,      // QK_K/32
+    global uchar * dst_sg,      // QK_K/8
+    global uchar * dst_sc,      // QK_K/64
+    global half  * dst_d,       // 1
+    ulong          n_blk
+) {
+    const ulong i = get_global_id(0);
+    if (i >= n_blk) {
+        return;
+    }
+    global struct block_iq3_s * b = (global struct block_iq3_s *) src0 + i;
+
+    dst_d[i] = b->d;
+    for (int j = 0; j < QK_K/4;  ++j) { dst_qs[(QK_K/4)  * i + j] = b->qs[j];     }
+    for (int j = 0; j < QK_K/32; ++j) { dst_qh[(QK_K/32) * i + j] = b->qh[j];     }
+    for (int j = 0; j < QK_K/8;  ++j) { dst_sg[(QK_K/8)  * i + j] = b->signs[j];  }
+    for (int j = 0; j < QK_K/64; ++j) { dst_sc[(QK_K/64) * i + j] = b->scales[j]; }
 }
 
 kernel void kernel_restore_block_iq4_nl_noshuffle(

@@ -12982,8 +12982,14 @@ inline bool use_adreno_kernels(const ggml_backend_opencl_context *backend_ctx, c
     // neighbouring projection -- 5.0% of the pass to move 0.7% of the bytes. Overridable so
     // the threshold can be A/B'd without a rebuild; the %64 layout rule below still applies
     // and is the one that is about correctness, not performance.
-    if (const char * e = getenv("GGML_OPENCL_ADRENO_MIN_NE1")) { threshold_ne1 = atoi(e); }
-    if (const char * e = getenv("GGML_OPENCL_ADRENO_MIN_NE0")) { threshold_ne0 = atoi(e); }
+    // Cached: this runs on the per-dispatch path (35 call sites, ~400 matmul
+    // dispatches per decoded token), and decode is host bound -- ggml host work
+    // between enqueues measures ~43 us/dispatch against ~93 ms/token of GPU work,
+    // so uncached getenv here is paid hundreds of times per token.
+    static const char * const e_ne1 = getenv("GGML_OPENCL_ADRENO_MIN_NE1");
+    static const char * const e_ne0 = getenv("GGML_OPENCL_ADRENO_MIN_NE0");
+    if (e_ne1) { threshold_ne1 = atoi(e_ne1); }
+    if (e_ne0) { threshold_ne0 = atoi(e_ne0); }
     bool threashold_ok = tensor->ne[0] >= threshold_ne0 && tensor->ne[1] >= threshold_ne1 &&
             tensor->ne[2] == 1 && tensor->ne[3] == 1;
 
@@ -31099,7 +31105,8 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
     // Indices come from ggml's tensor semantics (nb[] strides + view_offs), NOT from the
     // kernel's own index math -- a reference that mirrors the kernel's assumptions is
     // self-consistent and blind to exactly the bug class worth catching.
-    if (getenv("KQ_DP4A_CPUREF") && !kq_dp4a_rerun && kq_dp4a_shape) {
+    static const bool kq_dp4a_cpuref_on = getenv("KQ_DP4A_CPUREF") != nullptr;
+    if (kq_dp4a_cpuref_on && !kq_dp4a_rerun && kq_dp4a_shape) {
         ggml_cl_mul_mat_kq_q8_0_dp4a_adreno(backend, src0, src1, dst);
         CL_CHECK(clFinish(backend_ctx->queue));
 
@@ -31237,7 +31244,8 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
     // Numeric oracle vs the stock path. NOTE: this compares int8-Q math against f32-Q math, so
     // a nonzero delta is EXPECTED (it is the quantization loss, ~0.2% of score magnitude). Use
     // KQ_DP4A_CPUREF above to judge correctness; use this one to size the accuracy cost.
-    if (getenv("KQ_DP4A_VERIFY") && !kq_dp4a_rerun && kq_dp4a_shape) {
+    static const bool kq_dp4a_verify_on = getenv("KQ_DP4A_VERIFY") != nullptr;
+    if (kq_dp4a_verify_on && !kq_dp4a_rerun && kq_dp4a_shape) {
         const size_t nb_dst = ggml_nbytes(dst);
         std::vector<float> a(nb_dst / 4), b(nb_dst / 4);
         ggml_tensor_extra_cl * ed = (ggml_tensor_extra_cl *)dst->extra;
@@ -32115,7 +32123,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 //
                 // GGML_OPENCL_F32_MC=0 forces off, =1 forces on (overrides the gate).
                 static const int f32_mc_env = []{
-                    const char * e = std::getenv("GGML_OPENCL_F32_MC");
+                    static const char * const e = std::getenv("GGML_OPENCL_F32_MC");
                     return e ? atoi(e) : -1;
                 }();
                 const bool f32_mc = (f32_mc_env >= 0)
@@ -33703,7 +33711,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     // Minimum n_kv for the coalesced KQV to pay off (see the gate below).
                     // GGML_OPENCL_MM_KQV_GQA_MIN_KV retunes it per device.
                     static const int mm_kqv_gqa_min_kv = []{
-                        const char * e = getenv("GGML_OPENCL_MM_KQV_GQA_MIN_KV");
+                        static const char * const e = getenv("GGML_OPENCL_MM_KQV_GQA_MIN_KV");
                         const int v = (e && e[0]) ? atoi(e) : 0;
                         return v > 0 ? v : 8192;
                     }();
