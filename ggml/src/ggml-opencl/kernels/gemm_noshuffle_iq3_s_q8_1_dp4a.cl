@@ -111,16 +111,24 @@ inline uint iq3s_load(__global const uchar * qs, uint qsb, uint qhb, uint m,
     return iq3s_pack(iq3s_grid[gidx], sgv, base);
 }
 
-inline int dot8_q8a(uint8 qw, __local const uint * a) {
+// The activation tile is staged as uint4, not uint: the eight uints a token needs
+// for one 32-K step are contiguous, so they are two uint4s. That cuts the inner
+// loop's __local load count 4x and widens the cooperative staging load from 4 to
+// 16 bytes per lane. Measured on the IQ4_XS twin of this kernel: 3B pp512
+// 675 -> 780 (+15.6%), 27B 72.2 -> 78.2.
+//
+// The uint4s are copied into private temps at the call site -- dp4a with a
+// __local operand inside an unrolled loop is a documented miscompile on X2.
+inline int dot8_q8a_v(uint8 qw, uint4 a0, uint4 a1) {
     int r = 0;
-    r = dot_acc_sat_4x8packed_ss_int(qw.s0, a[0], r);
-    r = dot_acc_sat_4x8packed_ss_int(qw.s1, a[1], r);
-    r = dot_acc_sat_4x8packed_ss_int(qw.s2, a[2], r);
-    r = dot_acc_sat_4x8packed_ss_int(qw.s3, a[3], r);
-    r = dot_acc_sat_4x8packed_ss_int(qw.s4, a[4], r);
-    r = dot_acc_sat_4x8packed_ss_int(qw.s5, a[5], r);
-    r = dot_acc_sat_4x8packed_ss_int(qw.s6, a[6], r);
-    r = dot_acc_sat_4x8packed_ss_int(qw.s7, a[7], r);
+    r = dot_acc_sat_4x8packed_ss_int(qw.s0, a0.x, r);
+    r = dot_acc_sat_4x8packed_ss_int(qw.s1, a0.y, r);
+    r = dot_acc_sat_4x8packed_ss_int(qw.s2, a0.z, r);
+    r = dot_acc_sat_4x8packed_ss_int(qw.s3, a0.w, r);
+    r = dot_acc_sat_4x8packed_ss_int(qw.s4, a1.x, r);
+    r = dot_acc_sat_4x8packed_ss_int(qw.s5, a1.y, r);
+    r = dot_acc_sat_4x8packed_ss_int(qw.s6, a1.z, r);
+    r = dot_acc_sat_4x8packed_ss_int(qw.s7, a1.w, r);
     return r;
 }
 
@@ -153,7 +161,7 @@ kernel void kernel_gemm_noshuffle_iq3_s_q8_1_dp4a(
     const uint k_u = (uint)k >> 2;   // K in uint (int8x4) units
     const uint k_b = (uint)k >> 5;   // blocks-of-32 along K
 
-    __local uint sh_qa[TILESIZE_N][8];
+    __local uint4 sh_qa4[TILESIZE_N][2];
     __local half sh_d[TILESIZE_N];
 
 #define NGROUPS (TILESIZE_N / 4)
@@ -193,11 +201,15 @@ kernel void kernel_gemm_noshuffle_iq3_s_q8_1_dp4a(
         qw.s7 = iq3s_load(src0_qs, qsb, qhb, (uint)m, 7u, sg3, 4u);
 
         // cooperatively stage the 32-token x 32-K int8 activations to LDS
-        for (uint idx = lid; idx < TILESIZE_N * 8; idx += 64) {
-            const uint t = idx >> 3;
-            const uint u = idx & 7;
+        // 16-byte cooperative staging: TILESIZE_N*2 uint4s instead of TILESIZE_N*8
+        // uints. (c*k_u + step/4) is a multiple of 8, so vload4 is aligned.
+        for (uint idx = lid; idx < TILESIZE_N * 2; idx += 64) {
+            const uint t = idx >> 1;
+            const uint v = idx & 1;
             const uint c = col_base + t;
-            sh_qa[t][u] = (c < (uint)n_no_padding) ? src1_qa[c * k_u + (step >> 2) + u] : 0u;
+            sh_qa4[t][v] = (c < (uint)n_no_padding)
+                         ? vload4(0, src1_qa + c * k_u + (step >> 2) + (v << 2))
+                         : (uint4)(0u);
         }
         if (lid < TILESIZE_N) {
             const uint c = col_base + lid;
@@ -210,10 +222,12 @@ kernel void kernel_gemm_noshuffle_iq3_s_q8_1_dp4a(
         for (int g = 0; g < NGROUPS; ++g) {
             const int b = g * 4;
             float4 rf;
-            rf.s0 = (float)dot8_q8a(qw, sh_qa[b+0]);  rf.s1 = (float)dot8_q8a(qw, sh_qa[b+1]);
-            rf.s2 = (float)dot8_q8a(qw, sh_qa[b+2]);  rf.s3 = (float)dot8_q8a(qw, sh_qa[b+3]);
+#define TDOT4(T) dot8_q8a_v(qw, (uint4)(sh_qa4[T][0]), (uint4)(sh_qa4[T][1]))
+            rf.s0 = (float)TDOT4(b+0);  rf.s1 = (float)TDOT4(b+1);
+            rf.s2 = (float)TDOT4(b+2);  rf.s3 = (float)TDOT4(b+3);
             acc[g] += d_w * LD4(sh_d, b) * rf;
         }
+#undef TDOT4
 #undef LD4
         barrier(CLK_LOCAL_MEM_FENCE);
     }

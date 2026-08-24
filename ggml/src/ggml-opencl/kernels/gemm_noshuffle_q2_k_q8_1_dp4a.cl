@@ -39,12 +39,20 @@ inline uint q2k_pack(uint pk) {
          | (((pk >> 6) & 3u) << 24);
 }
 
-inline int dot4_q8a(uint4 qw, __local const uint * a) {
+// The activation tile is staged as uint4, not uint: the eight uints a token needs
+// for one 32-K step are contiguous, so they are two uint4s. That cuts the inner
+// loop's __local load count 4x and widens the cooperative staging load from 4 to
+// 16 bytes per lane. Measured on the IQ4_XS twin of this kernel: 3B pp512
+// 675 -> 780 (+15.6%), 27B 72.2 -> 78.2.
+//
+// The uint4s are copied into private temps at the call site -- dp4a with a
+// __local operand inside an unrolled loop is a documented miscompile on X2.
+inline int dot4_q8a_v(uint4 qw, uint4 a) {
     int r = 0;
-    r = dot_acc_sat_4x8packed_ss_int(qw.s0, a[0], r);
-    r = dot_acc_sat_4x8packed_ss_int(qw.s1, a[1], r);
-    r = dot_acc_sat_4x8packed_ss_int(qw.s2, a[2], r);
-    r = dot_acc_sat_4x8packed_ss_int(qw.s3, a[3], r);
+    r = dot_acc_sat_4x8packed_ss_int(qw.s0, a.x, r);
+    r = dot_acc_sat_4x8packed_ss_int(qw.s1, a.y, r);
+    r = dot_acc_sat_4x8packed_ss_int(qw.s2, a.z, r);
+    r = dot_acc_sat_4x8packed_ss_int(qw.s3, a.w, r);
     return r;
 }
 
@@ -75,7 +83,7 @@ kernel void kernel_gemm_noshuffle_q2_k_q8_1_dp4a(
     const uint k_u = (uint)k >> 2;
     const uint k_b = (uint)k >> 5;
 
-    __local uint  sh_qa[TILESIZE_N][8];
+    __local uint4 sh_qa4[TILESIZE_N][2];
     __local float sh_s [TILESIZE_N][2];   // per-16 activation sums, in qa units
     __local half  sh_d [TILESIZE_N];
 
@@ -118,13 +126,16 @@ kernel void kernel_gemm_noshuffle_q2_k_q8_1_dp4a(
             const uint h  = lid & 1u;
             const uint c  = col_base + t;
             const bool ok = c < (uint)n_no_padding;
+            // the lane's whole half is ONE uint4, so the sum now falls out of a
+            // single 16-byte load rather than four 4-byte ones
+            const uint4 w = ok ? vload4(0, src1_qa + c * k_u + (step >> 2) + (h << 2))
+                               : (uint4)(0u);
+            sh_qa4[t][h] = w;
             int s = 0;
-            #pragma unroll
-            for (uint u = 0; u < 4u; ++u) {
-                const uint w = ok ? src1_qa[c * k_u + (step >> 2) + 4u*h + u] : 0u;
-                sh_qa[t][4u*h + u] = w;
-                s = dot_acc_sat_4x8packed_ss_int(w, 0x01010101u, s);
-            }
+            s = dot_acc_sat_4x8packed_ss_int(w.x, 0x01010101u, s);
+            s = dot_acc_sat_4x8packed_ss_int(w.y, 0x01010101u, s);
+            s = dot_acc_sat_4x8packed_ss_int(w.z, 0x01010101u, s);
+            s = dot_acc_sat_4x8packed_ss_int(w.w, 0x01010101u, s);
             sh_s[t][h] = (float)s;
             if (h == 0u) {
                 sh_d[t] = ok ? src1_da[c * k_b + sub] : (half)0;
@@ -133,8 +144,8 @@ kernel void kernel_gemm_noshuffle_q2_k_q8_1_dp4a(
         barrier(CLK_LOCAL_MEM_FENCE);
 
 #define LD4(arr, b) ((float4)((float)arr[(b)+0], (float)arr[(b)+1], (float)arr[(b)+2], (float)arr[(b)+3]))
-#define Q2K_COL(b) (dl0 * (float)dot4_q8a(qlo, sh_qa[b])     - ml0 * sh_s[b][0] +          \
-                    dl1 * (float)dot4_q8a(qhi, sh_qa[b] + 4) - ml1 * sh_s[b][1])
+#define Q2K_COL(b) (dl0 * (float)dot4_q8a_v(qlo, (uint4)(sh_qa4[b][0])) - ml0 * sh_s[b][0] + \
+                    dl1 * (float)dot4_q8a_v(qhi, (uint4)(sh_qa4[b][1])) - ml1 * sh_s[b][1])
         #pragma unroll
         for (int g = 0; g < NGROUPS; ++g) {
             const int b = g * 4;

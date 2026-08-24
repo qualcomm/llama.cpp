@@ -305,12 +305,20 @@ inline uint iq2s_pack(uint gv, uint sg, uint base) {
          | (((uint)v2 & 0xFFu) << 16) | (((uint)v3 & 0xFFu) << 24);
 }
 
-inline int dot4_q8a(uint4 qw, __local const uint * a) {
+// The activation tile is staged as uint4, not uint: the eight uints a token needs
+// for one 32-K step are contiguous, so they are two uint4s. That cuts the inner
+// loop's __local load count 4x and widens the cooperative staging load from 4 to
+// 16 bytes per lane. Measured on the IQ4_XS twin of this kernel: 3B pp512
+// 675 -> 780 (+15.6%), 27B 72.2 -> 78.2.
+//
+// The uint4s are copied into private temps at the call site -- dp4a with a
+// __local operand inside an unrolled loop is a documented miscompile on X2.
+inline int dot4_q8a_v(uint4 qw, uint4 a) {
     int r = 0;
-    r = dot_acc_sat_4x8packed_ss_int(qw.s0, a[0], r);
-    r = dot_acc_sat_4x8packed_ss_int(qw.s1, a[1], r);
-    r = dot_acc_sat_4x8packed_ss_int(qw.s2, a[2], r);
-    r = dot_acc_sat_4x8packed_ss_int(qw.s3, a[3], r);
+    r = dot_acc_sat_4x8packed_ss_int(qw.s0, a.x, r);
+    r = dot_acc_sat_4x8packed_ss_int(qw.s1, a.y, r);
+    r = dot_acc_sat_4x8packed_ss_int(qw.s2, a.z, r);
+    r = dot_acc_sat_4x8packed_ss_int(qw.s3, a.w, r);
     return r;
 }
 
@@ -343,7 +351,7 @@ kernel void kernel_gemm_noshuffle_iq2_s_q8_1_dp4a(
     const uint k_u = (uint)k >> 2;
     const uint k_b = (uint)k >> 5;
 
-    __local uint sh_qa[TILESIZE_N][8];
+    __local uint4 sh_qa4[TILESIZE_N][2];
     __local half sh_d[TILESIZE_N];
 
 #if IQ2S_GEMM_LDSGRID
@@ -394,11 +402,15 @@ kernel void kernel_gemm_noshuffle_iq2_s_q8_1_dp4a(
             qhi.s3 = iq2s_pack(IQ2S_GRID(2u*gi3 + 1u), s3, 4u);
         }
 
-        for (uint idx = lid; idx < TILESIZE_N * 8; idx += 64) {
-            const uint t = idx >> 3;
-            const uint u = idx & 7;
+        // 16-byte cooperative staging: TILESIZE_N*2 uint4s instead of TILESIZE_N*8
+        // uints. (c*k_u + step/4) is a multiple of 8, so vload4 is aligned.
+        for (uint idx = lid; idx < TILESIZE_N * 2; idx += 64) {
+            const uint t = idx >> 1;
+            const uint v = idx & 1;
             const uint c = col_base + t;
-            sh_qa[t][u] = (c < (uint)n_no_padding) ? src1_qa[c * k_u + (step >> 2) + u] : 0u;
+            sh_qa4[t][v] = (c < (uint)n_no_padding)
+                         ? vload4(0, src1_qa + c * k_u + (step >> 2) + (v << 2))
+                         : (uint4)(0u);
         }
         if (lid < TILESIZE_N) {
             const uint c = col_base + lid;
@@ -407,7 +419,8 @@ kernel void kernel_gemm_noshuffle_iq2_s_q8_1_dp4a(
         barrier(CLK_LOCAL_MEM_FENCE);
 
 #define LD4(arr, b) ((float4)((float)arr[(b)+0], (float)arr[(b)+1], (float)arr[(b)+2], (float)arr[(b)+3]))
-#define IQ2S_COL(b) (dl0 * (float)dot4_q8a(qlo, sh_qa[b]) + dl1 * (float)dot4_q8a(qhi, sh_qa[b] + 4))
+#define IQ2S_COL(b) (dl0 * (float)dot4_q8a_v(qlo, (uint4)(sh_qa4[b][0]))  \
+                   + dl1 * (float)dot4_q8a_v(qhi, (uint4)(sh_qa4[b][1])))
         #pragma unroll
         for (int g = 0; g < NGROUPS; ++g) {
             const int b = g * 4;
