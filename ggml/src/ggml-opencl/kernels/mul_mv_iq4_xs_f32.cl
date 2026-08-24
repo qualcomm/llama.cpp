@@ -125,9 +125,20 @@ kernel void kernel_mul_mv_iq4_xs_f32(
     global float * y4 = y + ix * QK_K + 32 * it;
 
     for (int ib = ix; ib < nb; ib += BLOCK_STRIDE) {
+#if IQ_MV_VEC
+        // y4 starts at a multiple of 32 floats, so float4 alignment holds
+        for (int i = 0; i < 8; ++i) {
+            float4 yv = ((global float4 *)y4)[i];
+            yl[4*i+0] = yv.s0;
+            yl[4*i+1] = yv.s1;
+            yl[4*i+2] = yv.s2;
+            yl[4*i+3] = yv.s3;
+        }
+#else
         for (int i = 0; i < 32; ++i) {
             yl[i] = y4[i];
         }
+#endif
 
         global char * xrow = (global char *)(x + ib);
 
