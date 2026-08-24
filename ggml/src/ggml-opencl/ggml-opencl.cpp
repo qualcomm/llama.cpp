@@ -2102,6 +2102,13 @@ static int ggml_cl_iq2s_mv_r2() {
     return v;
 }
 
+// Stage the 8 KB iq2s_grid in local memory rather than reading it from
+// __constant at a divergent index; see the kernel header for the measurement.
+static int ggml_cl_iq2s_mv_ldsgrid() {
+    static const int v = ggml_cl_env_int("GGML_OPENCL_IQ2S_MV_LDSGRID", 1);
+    return v;
+}
+
 static int ggml_cl_q2k_mv_r() {
     static const int v = ggml_cl_env_int("GGML_OPENCL_Q2K_MV_R", 4);
     return (v == 1 || v == 2 || v == 4) ? v : 4;
@@ -3266,6 +3273,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         std::string opts = compile_opts;
         opts += " -DIQ2S_MV_NSG=" + std::to_string(ggml_cl_iq2s_mv_nsg());
         opts += " -DIQ2S_MV_R2="  + std::to_string(ggml_cl_iq2s_mv_r2());
+        opts += " -DIQ2S_MV_LDSGRID=" + std::to_string(ggml_cl_iq2s_mv_ldsgrid());
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), opts);
 

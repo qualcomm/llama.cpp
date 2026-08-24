@@ -15,6 +15,19 @@
 #ifndef IQ2S_MV_R2
 #define IQ2S_MV_R2 1
 #endif
+
+// IQ2S_MV_LDSGRID=1: stage iq2s_grid into local memory once per workgroup and
+// read it from there.
+//
+// iq2s_grid is 2048 uints = 8 KB, four times IQ3_S's table, and every lane
+// indexes it divergently with a 10-bit index. Read from __constant the kernel
+// showed the signature of a serialized resource rather than a latency-bound one:
+// tg32 was FLAT across IQ2S_MV_NSG 2/4/8/16 (12.17-12.41) where every other split
+// type moves several percent, and IQ2S_MV_R2=0 BEAT R2=1 (13.58 vs 12.28) because
+// pairing rows doubles the distinct grid indices a lane holds live.
+#ifndef IQ2S_MV_LDSGRID
+#define IQ2S_MV_LDSGRID 1
+#endif
 constant uint iq2s_grid[2048] = {
     0x08080808, 0x08080808, 0x0808082b, 0x08080808, 0x08081919, 0x08080808, 0x08082b08, 0x08080808,
     0x08082b2b, 0x08080808, 0x08190819, 0x08080808, 0x08191908, 0x08080808, 0x0819192b, 0x08080808,
@@ -313,6 +326,21 @@ kernel void kernel_mul_mv_iq2_s_f32_flat(
 
     global const float * y = src1 + (ulong)col * (uint)ne10;
 
+#if IQ2S_MV_LDSGRID
+    __local uint sh_grid[2048];
+    {
+        const uint tid  = sgi * 64u + lid;
+        const uint nthr = (uint)(get_local_size(0) * get_local_size(1));
+        for (uint i = tid; i < 2048u; i += nthr) {
+            sh_grid[i] = iq2s_grid[i];
+        }
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+#define IQ2S_GRID(i) sh_grid[(i)]
+#else
+#define IQ2S_GRID(i) iq2s_grid[(i)]
+#endif
+
 #if IQ2S_MV_R2
     const uint mh  = m >> 1;
     const uint j   = get_group_id(0) * 64u + lid;
@@ -353,10 +381,10 @@ kernel void kernel_mul_mv_iq2_s_f32_flat(
                         const uint grp = (ib * 64u + sb * 8u) + l * 2u;   // K/4 group
                         const float4 y0 = vload4(grp + 0u, y);
                         const float4 y1 = vload4(grp + 1u, y);
-                        a0 += dot(y0, iq2s_vals(iq2s_grid[2u*gi0 + 0u], s0, 0u));
-                        a0 += dot(y1, iq2s_vals(iq2s_grid[2u*gi0 + 1u], s0, 4u));
-                        a1 += dot(y0, iq2s_vals(iq2s_grid[2u*gi1 + 0u], s1, 0u));
-                        a1 += dot(y1, iq2s_vals(iq2s_grid[2u*gi1 + 1u], s1, 4u));
+                        a0 += dot(y0, iq2s_vals(IQ2S_GRID(2u*gi0 + 0u), s0, 0u));
+                        a0 += dot(y1, iq2s_vals(IQ2S_GRID(2u*gi0 + 1u), s0, 4u));
+                        a1 += dot(y0, iq2s_vals(IQ2S_GRID(2u*gi1 + 0u), s1, 0u));
+                        a1 += dot(y1, iq2s_vals(IQ2S_GRID(2u*gi1 + 1u), s1, 4u));
                     }
                     acc0 += (0.5f + (float)n0) * a0;
                     acc1 += (0.5f + (float)n1) * a1;
@@ -392,8 +420,8 @@ kernel void kernel_mul_mv_iq2_s_f32_flat(
                         const uint sgv = (uint)src0_sg[gb + l * m];
 
                         const uint grp = (ib * 64u + sb * 8u) + l * 2u;
-                        a += dot(vload4(grp + 0u, y), iq2s_vals(iq2s_grid[2u*gi + 0u], sgv, 0u));
-                        a += dot(vload4(grp + 1u, y), iq2s_vals(iq2s_grid[2u*gi + 1u], sgv, 4u));
+                        a += dot(vload4(grp + 0u, y), iq2s_vals(IQ2S_GRID(2u*gi + 0u), sgv, 0u));
+                        a += dot(vload4(grp + 1u, y), iq2s_vals(IQ2S_GRID(2u*gi + 1u), sgv, 4u));
                     }
                     acc += (0.5f + (float)nib) * a;
                 }
@@ -438,4 +466,5 @@ kernel void kernel_mul_mv_iq2_s_f32_flat(
         dst[(ulong)col * (uint)ne0 + row] = sumf;
     }
 #endif
+#undef IQ2S_GRID
 }
