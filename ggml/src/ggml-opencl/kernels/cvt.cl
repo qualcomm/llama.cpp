@@ -117,6 +117,15 @@ struct block_q6_K {
 };
 
 //------------------------------------------------------------------------------
+// block_iq1_s
+//------------------------------------------------------------------------------
+struct block_iq1_s {
+    half     d;
+    uint8_t  qs[QK_K/8];   // grid index low 8 bits, one per 8 weights
+    ushort   qh[QK_K/32];  // 3 index highs each x4, then a 3-bit scale and a sign
+};
+
+//------------------------------------------------------------------------------
 // block_iq2_s
 //------------------------------------------------------------------------------
 struct block_iq2_s {
@@ -2795,6 +2804,54 @@ kernel void kernel_restore_block_iq3_xxs_ns(
         p[2] = (uchar)((w >> 16) & 0xFF);
         p[3] = (uchar)((w >> 24) & 0xFF);
     }
+}
+
+//------------------------------------------------------------------------------
+// IQ1_S -> planes. A straight field split, three planes:
+//
+//   dst_qs[k/8]   uchar   grid index low 8 bits
+//   dst_qh[k/32]  ushort  four 3-bit index highs, a 3-bit scale, a delta sign
+//   dst_d [k/256] half
+//
+// Size preserving: 32 + 16 + 2 == 50 == sizeof(block_iq1_s).
+//------------------------------------------------------------------------------
+kernel void kernel_convert_block_iq1_s_ns(
+    global struct block_iq1_s * src0,
+    global uchar  * dst_qs,     // QK_K/8 per block
+    global ushort * dst_qh,     // QK_K/32
+    global half   * dst_d,      // 1
+    ulong           n_blk
+) {
+    const ulong i = get_global_id(0);
+    if (i >= n_blk) {
+        return;
+    }
+    global struct block_iq1_s * b = (global struct block_iq1_s *) src0 + i;
+
+    dst_d[i] = b->d;
+    for (int j = 0; j < QK_K/8;  ++j) { dst_qs[(QK_K/8)  * i + j] = b->qs[j]; }
+    for (int j = 0; j < QK_K/32; ++j) { dst_qh[(QK_K/32) * i + j] = b->qh[j]; }
+}
+
+//------------------------------------------------------------------------------
+// IQ1_S planes -> AoS blocks. Exact inverse; the caller must un-transpose first.
+//------------------------------------------------------------------------------
+kernel void kernel_restore_block_iq1_s_ns(
+    global uchar  * src_qs,
+    global ushort * src_qh,
+    global half   * src_d,
+    global struct block_iq1_s * dst,
+    ulong           n_blk
+) {
+    const ulong i = get_global_id(0);
+    if (i >= n_blk) {
+        return;
+    }
+    global struct block_iq1_s * b = (global struct block_iq1_s *) dst + i;
+
+    b->d = src_d[i];
+    for (int j = 0; j < QK_K/8;  ++j) { b->qs[j] = src_qs[(QK_K/8)  * i + j]; }
+    for (int j = 0; j < QK_K/32; ++j) { b->qh[j] = src_qh[(QK_K/32) * i + j]; }
 }
 
 //------------------------------------------------------------------------------
