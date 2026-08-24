@@ -92,12 +92,23 @@
 // 4 and 5 sum with dot() rather than four sequential adds, so they are not
 // bit-identical to the others; anything that ships has to clear the decode-path
 // perplexity oracle, not just llama-bench.
+//
+// Measured X2-90, Llama-3.2-3B IQ4_XS tg64 / Qwen3.8-27B UD-IQ4_XS tg32, one
+// binary, arms bracketed:
+//
+//   mode      0      1      2      3      4      5      6   | ABL=2 ceiling
+//   3B    29.61  33.28  20.84  40.15  27.09  33.76  27.27   |   44.86
+//   27B      --   4.81     --   5.28     --     --     --   |    5.40
+//
+// 3 is the default: +20.6% on the 3B and +9.7% on the 27B over the shipped
+// mode 1, which is 59% and 79% of what dropping the lookup entirely would buy.
+// Three results worth not re-deriving:
+//   - 5 vs 1 is +1.4%, so the float4 restructuring is not the lever
+//   - 4 vs 5 is -20%: there is no byte-permute here and shuffle() scalarizes
+//   - 2 is -37%. LOCAL memory is the wrong tool at 64 bytes; the +55% the IQ2_S
+//     GEMV took from the same move was a 8 KB table, a different regime
 #ifndef IQ4XS_MV_CB
-#ifdef  IQ4XS_MV_CBPACK
-#define IQ4XS_MV_CB IQ4XS_MV_CBPACK
-#else
-#define IQ4XS_MV_CB 1
-#endif
+#define IQ4XS_MV_CB 3
 #endif
 
 constant float kvalues_iq4nl[16] = {

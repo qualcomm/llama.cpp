@@ -2070,12 +2070,10 @@ static bool ggml_cl_iq4xs_mv_wimg_on(const ggml_backend_opencl_context * backend
 }
 
 // How a nibble becomes its codebook value -- the kernel's dominant cost. The
-// modes are listed in the kernel header; 1 is the packed-__constant form that
-// shipped on 2026-08-24. GGML_OPENCL_IQ4XS_MV_CBPACK stays accepted as the old
-// name for it.
+// modes and their measurements are in the kernel header. 3 holds the table as
+// immediates behind a select chain so it never reaches memory at all.
 static int ggml_cl_iq4xs_mv_cb() {
-    static const int v = ggml_cl_env_int(
-        "GGML_OPENCL_IQ4XS_MV_CB", ggml_cl_env_int("GGML_OPENCL_IQ4XS_MV_CBPACK", 1));
+    static const int v = ggml_cl_env_int("GGML_OPENCL_IQ4XS_MV_CB", 3);
     return v;
 }
 
