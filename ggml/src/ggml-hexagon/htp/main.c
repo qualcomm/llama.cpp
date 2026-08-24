@@ -753,11 +753,8 @@ static int execute_op(struct htp_ops_context * octx) {
         case HTP_OP_MUL_MAT_ID:
             return op_matmul_id(octx);
 
-        case HTP_OP_MUL_MAT_QKV:
-            return op_matmul_qkv(octx);
-
-        case HTP_OP_MUL_MAT_FFN:
-            return op_matmul_ffn(octx);
+        case HTP_OP_MUL_MAT_NX:
+            return op_matmul_nx(octx);
 
         case HTP_OP_MUL:
         case HTP_OP_ADD:
