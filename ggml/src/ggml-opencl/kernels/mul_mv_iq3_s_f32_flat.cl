@@ -253,7 +253,26 @@ inline float4 iq3s_vals(uint gv, uint sgv, uint base) {
 #define IQ3S_MV_WORK 0
 #endif
 
+// IQ3S_MV_GRIDIMG=1: read the grid through an image1d_buffer.
+//
+// This grid is still on __constant, where local memory was measured NEGATIVE
+// (-16.5% on IQ3_S, -5.3% on IQ3_XXS -- the table is too small to earn the LDS
+// traffic). The image is the remaining tier, and on the two kernels big enough to
+// want LDS it is better than LDS: IQ1_S +2.5%, IQ2_S +4.4%. So it is worth asking
+// here even though the LDS answer was no.
+#ifndef IQ3S_MV_GRIDIMG
+#define IQ3S_MV_GRIDIMG 0
+#endif
+
+kernel void kernel_iq3s_grid_export(global uint * out) {
+    const uint i = get_global_id(0);
+    if (i < 512u) {
+        out[i] = iq3s_grid[i];
+    }
+}
+
 kernel void kernel_mul_mv_iq3_s_f32_flat(
+        __read_only image1d_buffer_t grid_img,
         global const uchar * src0_qs,
         global const uchar * src0_qh,
         global const uchar * src0_sg,
@@ -281,7 +300,9 @@ kernel void kernel_mul_mv_iq3_s_f32_flat(
 
     global const float * y = src1 + (ulong)col * (uint)ne10;
 
-#if IQ3S_MV_LDSGRID
+#if IQ3S_MV_GRIDIMG
+#define IQ3S_GRID(i) (read_imageui(grid_img, (int)(i)).x)
+#elif IQ3S_MV_LDSGRID
     __local uint sh_grid[512];
     {
         const uint tid  = sgi * 64u + lid;
