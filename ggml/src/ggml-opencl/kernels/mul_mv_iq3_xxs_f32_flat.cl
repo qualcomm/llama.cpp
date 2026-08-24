@@ -25,8 +25,10 @@
 // IQ3XXS_MV_LDSGRID=1: stage iq3xxs_grid into local memory once per workgroup and
 // read it from there.
 //
-// iq3xxs_grid is 256 uints = 1 KB, the smallest of the split types' tables, so
-// this is the arm most likely to come back a null.
+// iq3xxs_grid is 256 uints = 1 KB, the smallest of the split types' tables.
+//
+// MEASURED AND REFUTED: X2-90, q4b-IQ3_XXS tg64 15.57 -> 14.73, -5.3%. Stays
+// off; see the IQ3_S GEMV header for why the table size decides this.
 //
 #ifndef IQ3XXS_MV_LDSGRID
 #define IQ3XXS_MV_LDSGRID 0

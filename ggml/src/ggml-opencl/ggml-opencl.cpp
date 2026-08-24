@@ -2109,8 +2109,8 @@ static int ggml_cl_iq3s_mv_r2() {
 }
 
 // Stage the 2 KB iq3s_grid in local memory rather than reading it from
-// __constant at a divergent index, as the IQ2_S GEMV already does with its 8 KB
-// table; see the kernel header.
+// __constant at a divergent index, as the IQ2_S GEMV does with its 8 KB table.
+// Measured at -16.5% and left off; see the kernel header.
 static int ggml_cl_iq3s_mv_ldsgrid() {
     static const int v = ggml_cl_env_int("GGML_OPENCL_IQ3S_MV_LDSGRID", 0);
     return v;
@@ -2124,7 +2124,7 @@ static int ggml_cl_iq3xxs_mv_nsg() {
     return v;
 }
 
-// Same for IQ3_XXS, whose grid is 1 KB -- the smallest of the split types'.
+// Same for IQ3_XXS, whose grid is 1 KB. Measured at -5.3% and left off.
 static int ggml_cl_iq3xxs_mv_ldsgrid() {
     static const int v = ggml_cl_env_int("GGML_OPENCL_IQ3XXS_MV_LDSGRID", 0);
     return v;

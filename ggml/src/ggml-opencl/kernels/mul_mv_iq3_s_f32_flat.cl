@@ -53,8 +53,12 @@
 // read it from there.
 //
 // iq3s_grid is 512 uints = 2 KB and every lane indexes it divergently with a
-// 9-bit index. The IQ2_S GEMV took +55% from this move, but its grid is 8 KB --
-// a table a quarter the size may simply sit in the constant cache, so measure.
+// 9-bit index. The IQ2_S GEMV took +55% from this move, but its grid is 8 KB.
+//
+// MEASURED AND REFUTED: X2-90, q4b-IQ3_S tg64 19.68 -> 16.44, -16.5%. Stays off.
+// The table size is the whole story -- the same move is -5.3% on IQ3_XXS's 1 KB
+// grid and -37% on the IQ4_XS GEMV's 64-byte codebook. IQ2_S at 8 KB is the only
+// table big enough to be worth the local-memory traffic and the extra barrier.
 //
 #ifndef IQ3S_MV_LDSGRID
 #define IQ3S_MV_LDSGRID 0
