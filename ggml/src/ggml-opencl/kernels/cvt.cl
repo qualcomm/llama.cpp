@@ -2667,6 +2667,33 @@ kernel void kernel_convert_block_iq3_s_ns(
     for (int j = 0; j < QK_K/64; ++j) { dst_sc[(QK_K/64) * i + j] = b->scales[j]; }
 }
 
+//------------------------------------------------------------------------------
+// IQ3_S planes -> AoS blocks. Exact inverse of kernel_convert_block_iq3_s_ns
+// above (a straight field split, so the restore is the same copy reversed); the
+// caller must un-transpose the five planes back to block-major first.
+//------------------------------------------------------------------------------
+kernel void kernel_restore_block_iq3_s_ns(
+    global uchar * src_qs,
+    global uchar * src_qh,
+    global uchar * src_sg,
+    global uchar * src_sc,
+    global half  * src_d,
+    global struct block_iq3_s * dst,
+    ulong          n_blk
+) {
+    const ulong i = get_global_id(0);
+    if (i >= n_blk) {
+        return;
+    }
+    global struct block_iq3_s * b = (global struct block_iq3_s *) dst + i;
+
+    b->d = src_d[i];
+    for (int j = 0; j < QK_K/4;  ++j) { b->qs[j]     = src_qs[(QK_K/4)  * i + j]; }
+    for (int j = 0; j < QK_K/32; ++j) { b->qh[j]     = src_qh[(QK_K/32) * i + j]; }
+    for (int j = 0; j < QK_K/8;  ++j) { b->signs[j]  = src_sg[(QK_K/8)  * i + j]; }
+    for (int j = 0; j < QK_K/64; ++j) { b->scales[j] = src_sc[(QK_K/64) * i + j]; }
+}
+
 kernel void kernel_restore_block_iq4_nl_noshuffle(
     global uchar * src_q,
     global half  * src_d,
