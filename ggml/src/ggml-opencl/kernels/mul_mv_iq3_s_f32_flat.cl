@@ -76,6 +76,22 @@
 // Program-scope variables in __global are OpenCL C 2.0; the backend compiles with
 // -cl-std=CL<device version>, so this arm simply fails to build on a device that
 // does not support them. That is a legitimate answer, not a crash.
+//
+// MEASURED AND REFUTED on X2-90: it builds, so the device does support it, and it
+// is SLOWER -- q4b-IQ3_S tg64 19.68 -> 18.20, -7.5%. Left off.
+//
+// 🔑 So a 2 KB table is not paying for the __constant PATH the way the 16-entry
+// IQ4_XS codebook was. That one was fixable because it was small enough to become
+// immediates; this one is not, and the address space is not the lever. Together
+// with the local-memory arm (-16.5%) and the two knobs below, this kernel is at a
+// local optimum for its current algorithm:
+//
+//   IQ3S_MV_NSG   2 / 4 / 8 / 16  ->  14.19 / 17.75 / 19.70 / 19.26  (8 is best)
+//   IQ3S_MV_R2    0 / 1           ->  15.12 / 19.68
+//
+// NSG flat-to-worse above 8 says the grid's dependent load is not latency more
+// occupancy can hide. What is left is algorithmic -- fewer ALU ops per weight via
+// dp4a over quantised activations -- not another way to read the same table.
 #ifndef IQ3S_MV_GRIDSRC
 #define IQ3S_MV_GRIDSRC 0
 #endif

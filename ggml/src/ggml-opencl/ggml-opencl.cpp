@@ -2139,8 +2139,8 @@ static int ggml_cl_iq2s_mv_signxor() {
 }
 
 // Address space for the 512-entry iq3s grid: 0 __constant, 1 program-scope
-// __global. Asks whether the __constant path is what the divergent index costs,
-// the way the IQ4_XS codebook did. See the kernel header.
+// __global. Measured at -7.5% and left off -- a 2 KB table does not pay for the
+// __constant path the way the 16-entry IQ4_XS codebook did. See the kernel header.
 static int ggml_cl_iq3s_mv_gridsrc() {
     static const int v = ggml_cl_env_int("GGML_OPENCL_IQ3S_MV_GRIDSRC", 0);
     return v;
