@@ -14140,6 +14140,21 @@ inline bool q5_K_big_head_gpu_optin() {
 
 // GGML_OPENCL_Q5K_HEAD_SOA=<rows>: keep a weight with at least that many rows OUT of
 // the transposed layout, so it lands on the plane-split kernels instead. 0 = off.
+// DEFAULT 65536 -- a row count only an output head reaches.
+//
+// MEASURED on X2-90, on top of the row-aware K-split: Llama-3.2-3B UD-IQ1_S tg64
+// 23.91 -> 24.49 (+2.4%), UD-IQ2_M 22.94 -> 23.45 (+2.2%), and that is exactly what
+// the head's share predicts (4.40 ms/call at 10.8% of GPU busy, 61.5 -> 87.7 GB/s
+// => ~3%). pp512 is NEUTRAL on both (618 -> 621, 682 -> 680), which is the direct
+// confirmation that the head really is a GEMV during prefill too. Decode PPL 9.8306
+// -> 9.8307, i.e. float summation order only.
+//
+// 🔴 RESIDUAL RISK, not measurable with llama-bench: a head between this threshold
+// and the image limit (~349K rows at K=3072) that IS evaluated batched -- a
+// spec-decode or MTP verify projects several draft rows through it -- loses the dp4a
+// GEMM this layout feeds. Set GGML_OPENCL_Q5K_HEAD_SOA=0 for such a run. The one
+// batched-head case that has been measured, muse-glimmer's 202048-row head, is
+// already off this path because its weight images do not fit at all.
 //
 // Why a vocab-scale head is the case for it: the transposed layout exists to feed the
 // batched dp4a GEMM, but an output head is a GEMV even during prefill -- only the last
@@ -14153,7 +14168,7 @@ inline bool q5_K_big_head_gpu_optin() {
 inline bool q5_K_head_soa(const ggml_tensor *tensor) {
     static const long thr = []{
         const char * e = getenv("GGML_OPENCL_Q5K_HEAD_SOA");
-        return (e && e[0]) ? atol(e) : 0L;
+        return (e && e[0]) ? atol(e) : 65536L;
     }();
     return thr > 0 && tensor->ne[1] >= thr;
 }
