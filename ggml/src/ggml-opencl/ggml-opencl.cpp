@@ -2035,9 +2035,13 @@ static int ggml_cl_iq3s_mv_nsg() {
     return v;
 }
 
-static int ggml_cl_iq3s_mv_r2() {
-    static const int v = ggml_cl_env_int("GGML_OPENCL_IQ3S_MV_R2", 1);
-    return v;
+// Rows per work item in that GEMV. Every IQ3_S plane but the scale is one BYTE
+// per row, where IQ4_XS's quant plane is a ushort, so a lane needs FOUR adjacent
+// rows to read a whole uint. Measured on Qwen3.5-4B tg64: 1 -> 15.14,
+// 2 -> 19.73, against the AoS kernel's 20.55.
+static int ggml_cl_iq3s_mv_r() {
+    static const int v = ggml_cl_env_int("GGML_OPENCL_IQ3S_MV_R", 4);
+    return (v == 1 || v == 2 || v == 4) ? v : 4;
 }
 
 static cl_program build_program_from_source_ex(cl_context ctx, cl_device_id dev, const char* program_buffer, const std::string &compile_opts, bool fatal, const char *tag = nullptr, size_t bin_size = 0, cl_command_queue retry_queue = nullptr) {
@@ -3110,7 +3114,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         std::string opts = compile_opts;
         opts += " -DIQ3S_MV_NSG=" + std::to_string(ggml_cl_iq3s_mv_nsg());
-        opts += " -DIQ3S_MV_R2="  + std::to_string(ggml_cl_iq3s_mv_r2());
+        opts += " -DIQ3S_MV_R="   + std::to_string(ggml_cl_iq3s_mv_r());
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), opts);
 
@@ -13212,10 +13216,11 @@ static bool ggml_cl_iq3s_is_split(const ggml_backend_opencl_context * backend_ct
     return t->type == GGML_TYPE_IQ3_S
         && ggml_cl_iq3s_soa_on(backend_ctx)
         && backend_ctx->kernel_convert_block_iq3_s_ns != nullptr
-        // the decode GEMV pairs adjacent rows into one ushort load, so an odd
-        // row count is declined HERE rather than per dispatch: a tensor that
-        // gets split but that some path then cannot read is silent garbage.
-        && t->ne[1] % 2 == 0
+        // the decode GEMV reads IQ3S_MV_R adjacent rows as one word, so a row
+        // count that is not a multiple of it is declined HERE rather than per
+        // dispatch: a tensor that gets split but that some path then cannot
+        // read is silent garbage.
+        && t->ne[1] % ggml_cl_iq3s_mv_r() == 0
         && use_adreno_kernels(backend_ctx, t);
 }
 
@@ -33336,7 +33341,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne10));
                     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne0));
 
-                    const size_t rows_wg = ggml_cl_iq3s_mv_r2() ? 128 : 64;
+                    const size_t rows_wg = 64u * (size_t)ggml_cl_iq3s_mv_r();
                     size_t f_global[3] = { CEIL_DIV((size_t)ne01, rows_wg) * 64,
                                            (size_t)ne11 * (size_t)nsg, 1 };
                     size_t f_local[3]  = { 64, (size_t)nsg, 1 };
@@ -35063,7 +35068,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne10));
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne0));
 
-                const size_t rows_wg = ggml_cl_iq3s_mv_r2() ? 128 : 64;
+                const size_t rows_wg = 64u * (size_t)ggml_cl_iq3s_mv_r();
                 size_t f_global[3] = { CEIL_DIV((size_t)ne01, rows_wg) * 64,
                                        (size_t)ne11 * (size_t)nsg, 1 };
                 size_t f_local[3]  = { 64, (size_t)nsg, 1 };
