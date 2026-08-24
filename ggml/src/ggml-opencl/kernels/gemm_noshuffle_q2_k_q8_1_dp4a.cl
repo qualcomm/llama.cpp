@@ -1,0 +1,166 @@
+#pragma OPENCL EXTENSION cl_khr_fp16 : enable
+#pragma OPENCL EXTENSION cl_khr_subgroups : enable
+#ifdef cl_khr_integer_dot_product
+#pragma OPENCL EXTENSION cl_khr_integer_dot_product : enable
+#endif
+
+// Dense Q2_K prefill GEMM, dp4a (int8) inner loop, over the feature-major plane
+// split produced by kernel_convert_block_q2_k_ns:
+//
+//   src0_qs[row + (k/4)*m]     uchar  four 2-bit values (0..3)
+//   src0_sc[row + (k/16)*m]    uchar  low nibble scale, high nibble min
+//   src0_dm[row + (k/256)*m]   half2  d, dmin
+//
+// Unlike q3_K this type carries a MIN, so per 16-weight run
+//
+//   sum_k a_k*(dl*q_k - ml) = da * ( dl*<q,qa> - ml*sum(qa) )
+//
+// with a_k = da*qa_k for q8_1 activations. The kernel therefore needs a per-16
+// activation sum. q8_1's own `sa` plane is per-32 and cannot supply it, and
+// recomputing it per row (as CUDA's MMQ does, by dp4a'ing a replicated min) would
+// double the dp4a count. It does not depend on the row, so instead the LDS
+// staging is restructured: each of the 64 lanes owns exactly one (column, half)
+// = 4 uints, and sums them as it stores them. The sum costs 4 dp4a per column
+// half per WORKGROUP rather than per row, and adds no barrier.
+//
+// That mapping is why TILESIZE_N must stay 32 with a 64-lane workgroup:
+// 2 halves * 32 columns == 64 lanes exactly.
+
+#define QK_K 256
+
+#define TILESIZE_N 32
+
+// Four weights of one group as packed int8. Q2_K values are UNSIGNED 0..3; the
+// offset lives in the separate min term, not in the quant.
+inline uint q2k_pack(uint pk) {
+    return ( (pk      ) & 3u)
+         | (((pk >> 2) & 3u) <<  8)
+         | (((pk >> 4) & 3u) << 16)
+         | (((pk >> 6) & 3u) << 24);
+}
+
+inline int dot4_q8a(uint4 qw, __local const uint * a) {
+    int r = 0;
+    r = dot_acc_sat_4x8packed_ss_int(qw.s0, a[0], r);
+    r = dot_acc_sat_4x8packed_ss_int(qw.s1, a[1], r);
+    r = dot_acc_sat_4x8packed_ss_int(qw.s2, a[2], r);
+    r = dot_acc_sat_4x8packed_ss_int(qw.s3, a[3], r);
+    return r;
+}
+
+__attribute__((qcom_wave_pair_mode(1)))
+kernel void kernel_gemm_noshuffle_q2_k_q8_1_dp4a(
+        __global const uchar  * src0_qs,
+        __global const uchar  * src0_sc,
+        __global const half   * src0_dm,   // half pairs: d, dmin
+        __global const uint   * src1_qa,   // q8_1 activations int8 (as uint, 4/elem) [N, K]
+        __global const half   * src1_da,   // q8_1 per-block scale [N, K/32]
+        __global       float  * dst,
+        ulong  offsetd,
+        int    m,
+        int    n_no_padding,
+        int    k
+) {
+    dst = (global float *)((global char *)dst + offsetd);
+
+    const uint lid = get_local_id(0);
+    const uint block_id_m = get_global_id(1);
+    const uint block_id_n = get_global_id(2);
+
+    const uint row      = block_id_m * 64 + lid;
+    const uint col_base = block_id_n * TILESIZE_N;
+    const bool row_valid = row < (uint)m;
+    const uint rrow     = row_valid ? row : 0;
+
+    const uint k_u = (uint)k >> 2;
+    const uint k_b = (uint)k >> 5;
+
+    __local uint  sh_qa[TILESIZE_N][8];
+    __local float sh_s [TILESIZE_N][2];   // per-16 activation sums, in qa units
+    __local half  sh_d [TILESIZE_N];
+
+#define NGROUPS (TILESIZE_N / 4)
+    float4 acc[NGROUPS];
+    #pragma unroll
+    for (int g = 0; g < NGROUPS; ++g) acc[g] = (float4)(0.0f);
+
+    for (uint step = 0; step < (uint)k; step += 32) {
+        const uint sub = step >> 5;
+        const uint ib  = sub >> 3;
+
+        const half2 dm  = vload2(rrow + ib * (uint)m, src0_dm);
+        const float dv  = (float)dm.s0;
+        const float dmv = (float)dm.s1;
+
+        const uint  scb = rrow + (sub << 1) * (uint)m;
+        const uint  sc0 = (uint)src0_sc[scb + 0u * (uint)m];
+        const uint  sc1 = (uint)src0_sc[scb + 1u * (uint)m];
+        const float dl0 = dv  * (float)( sc0       & 0xFu);
+        const float ml0 = dmv * (float)( sc0 >> 4);
+        const float dl1 = dv  * (float)( sc1       & 0xFu);
+        const float ml1 = dmv * (float)( sc1 >> 4);
+
+        const uint qsb = rrow + (step >> 2) * (uint)m;
+        uint4 qlo, qhi;
+        qlo.s0 = q2k_pack((uint)src0_qs[qsb + 0u * (uint)m]);
+        qlo.s1 = q2k_pack((uint)src0_qs[qsb + 1u * (uint)m]);
+        qlo.s2 = q2k_pack((uint)src0_qs[qsb + 2u * (uint)m]);
+        qlo.s3 = q2k_pack((uint)src0_qs[qsb + 3u * (uint)m]);
+        qhi.s0 = q2k_pack((uint)src0_qs[qsb + 4u * (uint)m]);
+        qhi.s1 = q2k_pack((uint)src0_qs[qsb + 5u * (uint)m]);
+        qhi.s2 = q2k_pack((uint)src0_qs[qsb + 6u * (uint)m]);
+        qhi.s3 = q2k_pack((uint)src0_qs[qsb + 7u * (uint)m]);
+
+        // one (column, half) per lane, so the half's activation sum falls out of
+        // the same four loads -- see the header note
+        {
+            const uint t  = lid >> 1;
+            const uint h  = lid & 1u;
+            const uint c  = col_base + t;
+            const bool ok = c < (uint)n_no_padding;
+            int s = 0;
+            #pragma unroll
+            for (uint u = 0; u < 4u; ++u) {
+                const uint w = ok ? src1_qa[c * k_u + (step >> 2) + 4u*h + u] : 0u;
+                sh_qa[t][4u*h + u] = w;
+                s = dot_acc_sat_4x8packed_ss_int(w, 0x01010101u, s);
+            }
+            sh_s[t][h] = (float)s;
+            if (h == 0u) {
+                sh_d[t] = ok ? src1_da[c * k_b + sub] : (half)0;
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+#define LD4(arr, b) ((float4)((float)arr[(b)+0], (float)arr[(b)+1], (float)arr[(b)+2], (float)arr[(b)+3]))
+#define Q2K_COL(b) (dl0 * (float)dot4_q8a(qlo, sh_qa[b])     - ml0 * sh_s[b][0] +          \
+                    dl1 * (float)dot4_q8a(qhi, sh_qa[b] + 4) - ml1 * sh_s[b][1])
+        #pragma unroll
+        for (int g = 0; g < NGROUPS; ++g) {
+            const int b = g * 4;
+            float4 rf;
+            rf.s0 = Q2K_COL(b+0);  rf.s1 = Q2K_COL(b+1);
+            rf.s2 = Q2K_COL(b+2);  rf.s3 = Q2K_COL(b+3);
+            acc[g] += LD4(sh_d, b) * rf;
+        }
+#undef Q2K_COL
+#undef LD4
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    if (!row_valid) {
+        return;
+    }
+
+    #pragma unroll
+    for (int g = 0; g < NGROUPS; ++g) {
+        const uint b = (uint)(g * 4);
+        const float4 a = acc[g];
+        const uint c0 = col_base + b;
+        if (c0 + 0 < (uint)n_no_padding) dst[(c0 + 0) * (uint)m + row] = a.s0;
+        if (c0 + 1 < (uint)n_no_padding) dst[(c0 + 1) * (uint)m + row] = a.s1;
+        if (c0 + 2 < (uint)n_no_padding) dst[(c0 + 2) * (uint)m + row] = a.s2;
+        if (c0 + 3 < (uint)n_no_padding) dst[(c0 + 3) * (uint)m + row] = a.s3;
+    }
+#undef NGROUPS
+}

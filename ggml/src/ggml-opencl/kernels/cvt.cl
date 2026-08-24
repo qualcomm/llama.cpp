@@ -117,6 +117,16 @@ struct block_q6_K {
 };
 
 //------------------------------------------------------------------------------
+// block_q2_K
+//------------------------------------------------------------------------------
+struct block_q2_K {
+    uint8_t scales[QK_K/16]; // low nibble scale, high nibble min, one per 16 weights
+    uint8_t qs[QK_K/4];      // quants, 2 bits each
+    half d;                  // super-block scale for the quantized scales
+    half dmin;               // super-block scale for the quantized mins
+};
+
+//------------------------------------------------------------------------------
 // block_q3_K
 //------------------------------------------------------------------------------
 struct block_q3_K {
@@ -2774,6 +2784,86 @@ kernel void kernel_restore_block_iq3_xxs_ns(
         p[1] = (uchar)((w >>  8) & 0xFF);
         p[2] = (uchar)((w >> 16) & 0xFF);
         p[3] = (uchar)((w >> 24) & 0xFF);
+    }
+}
+
+//------------------------------------------------------------------------------
+// Q2_K -> planes. Same reorder as Q3_K and for the same reason: byte qs[l] holds
+// four weights that are 32 apart, one per 2-bit field, so four ADJACENT weights
+// -- one dp4a operand -- live in four different bytes at the same shift.
+//
+//   dst_qs[k/4]   uchar  four 2-bit values, weight 4g+t in bits 2t..2t+1 (0..3)
+//   dst_sc[k/16]  uchar  low nibble = scale, high nibble = min
+//   dst_dm[k/256] half2  d then dmin
+//
+// Size preserving: 64 + 16 + 4 == 84 == sizeof(block_q2_K).
+//
+// Q2_K is unsigned (values 0..3) and carries a MIN, so the dot product is
+// dl*<q,a> - ml*sum(a). See gemm_noshuffle_q2_k_q8_1_dp4a for how the per-16
+// activation sum is produced for free during the LDS staging.
+//------------------------------------------------------------------------------
+kernel void kernel_convert_block_q2_k_ns(
+    global struct block_q2_K * src0,
+    global uchar * dst_qs,      // QK_K/4 per block
+    global uchar * dst_sc,      // QK_K/16 per block
+    global half  * dst_dm,      // 2 per block (d, dmin)
+    ulong          n_blk
+) {
+    const ulong i = get_global_id(0);
+    if (i >= n_blk) {
+        return;
+    }
+    global struct block_q2_K * b = (global struct block_q2_K *) src0 + i;
+
+    dst_dm[2*i + 0] = b->d;
+    dst_dm[2*i + 1] = b->dmin;
+
+    for (int j = 0; j < QK_K/16; ++j) { dst_sc[(QK_K/16) * i + j] = b->scales[j]; }
+
+    for (int g = 0; g < QK_K/4; ++g) {
+        uint pk = 0;
+        for (int t = 0; t < 4; ++t) {
+            const int e  = 4*g + t;
+            const int sb = e >> 5;
+            const int ee = e & 31;
+            pk |= (uint)(((b->qs[32*(sb >> 2) + ee] >> (2*(sb & 3))) & 3) << (2*t));
+        }
+        dst_qs[(QK_K/4) * i + g] = (uchar)pk;
+    }
+}
+
+//------------------------------------------------------------------------------
+// Q2_K planes -> AoS blocks. Exact inverse of the reorder above; the caller must
+// un-transpose the three planes back to block-major first.
+//------------------------------------------------------------------------------
+kernel void kernel_restore_block_q2_k_ns(
+    global uchar * src_qs,
+    global uchar * src_sc,
+    global half  * src_dm,
+    global struct block_q2_K * dst,
+    ulong          n_blk
+) {
+    const ulong i = get_global_id(0);
+    if (i >= n_blk) {
+        return;
+    }
+    global struct block_q2_K * b = (global struct block_q2_K *) dst + i;
+
+    b->d    = src_dm[2*i + 0];
+    b->dmin = src_dm[2*i + 1];
+
+    for (int j = 0; j < QK_K/16; ++j) { b->scales[j] = src_sc[(QK_K/16) * i + j]; }
+
+    for (int n2 = 0; n2 < 2; ++n2) {
+        for (int ee = 0; ee < 32; ++ee) {
+            uint v = 0;
+            for (int j = 0; j < 4; ++j) {
+                const int sb = 4*n2 + j;
+                const int e  = 32*sb + ee;
+                v |= ((uint)(src_qs[(QK_K/4) * i + (e >> 2)] >> (2*(e & 3))) & 3u) << (2*j);
+            }
+            b->qs[32*n2 + ee] = (uchar)v;
+        }
     }
 }
 
