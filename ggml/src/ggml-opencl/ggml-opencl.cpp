@@ -32239,8 +32239,27 @@ static void ggml_cl_mul_mat_q5_K_f32_adreno(ggml_backend_t backend, const ggml_t
             const char * e = std::getenv("GGML_OPENCL_Q5K_GEMV_WIDE");
             return (e && e[0]) ? atoi(e) : -1;
         }();
+        //
+        // ...but 8 is a per-LAYER number, and nsg_y is a pure K-split: it only pays
+        // when the ROW dimension leaves the GPU short of work. A vocab-scale output
+        // head already launches ~1000 workgroups from rows alone, so extra K-split
+        // subgroups buy no parallelism and cost a wider local-memory reduction.
+        //
+        // Measured X2-90, and the two ends disagree, which is why this is keyed on
+        // the row count rather than being one constant:
+        //   Llama-3.2-3B UD-IQ1_S, q5_K head 128256 x 3072 = 1002 row-workgroups
+        //     8 -> 2: head 11.21 -> 4.40 ms/call (2.55x, 27.8 -> 61.5 GB/s),
+        //     GPU busy 1561 -> 1340 ms, tg64 20.93 -> 23.93 (+14.4%);
+        //     UD-IQ2_M the same, +13.2%
+        //   Qwen3.8-27B UD-IQ4_XS, q5_K per-layer 17408 and 5120 = 136 and 40
+        //     8 -> 2: tg32 5.328 -> 5.091, -4.4%. 8 stays correct here.
+        // The threshold sits between those two, at a row count only an output head
+        // reaches. Narrowing is applied only where the 8 was measured (X2E); other
+        // gens default to 4 already and are not measured at head scale.
+        const size_t q5k_row_wgs = CEIL_DIV((size_t)ne01 / 2, (size_t)64);
+        const int q5k_wide_gen = (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E ? 8 : 4);
         const int q5k_wide = q5k_wide_env > 0 ? q5k_wide_env
-                           : (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E ? 8 : 4);
+                           : (q5k_wide_gen == 8 && q5k_row_wgs >= 512 ? 2 : q5k_wide_gen);
         size_t nsg_y = use_q5k_mc3 ? 4 : (size_t)q5k_wide;
         // Cap by the kernel's real max WG: an lws above CL_KERNEL_WORK_GROUP_SIZE aborts
         // the dispatch with CL_INVALID_WORK_GROUP_SIZE (-54). nsg_y is a pure K-split, so
