@@ -1314,6 +1314,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mv_q2_K_f32;
     cl_kernel kernel_mul_mv_q3_K_f32;
     cl_kernel kernel_mul_mv_iq4_xs_f32;
+    cl_kernel kernel_mul_mv_iq4_xs_f32_flat;
     cl_kernel kernel_mul_mv_iq1_s_f32;
     cl_kernel kernel_mul_mv_iq1_m_f32;
     cl_kernel kernel_mul_mv_tq1_0_f32;
@@ -1987,6 +1988,12 @@ static int ggml_cl_env_int(const char * name, int fallback) {
 // GGML_OPENCL_IQ_MV_VEC=0 restores the scalar loads for an A/B from one binary.
 static int ggml_cl_iq_mv_vec() {
     static const int v = ggml_cl_env_int("GGML_OPENCL_IQ_MV_VEC", 1);
+    return v;
+}
+
+// Rows per work item in the IQ4_XS plane-split decode GEMV.
+static int ggml_cl_iq4xs_mv_rows() {
+    static const int v = ggml_cl_env_int("GGML_OPENCL_IQ4XS_MV_ROWS", 1);
     return v;
 }
 
@@ -3022,6 +3029,24 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
 
         CL_CHECK((backend_ctx->kernel_mul_mv_iq4_xs_f32 = clCreateKernel(prog, "kernel_mul_mv_iq4_xs_f32", &err), err));
+        CL_CHECK(clReleaseProgram(prog));
+        GGML_LOG_CONT(".");
+    }
+    // mul_mv_iq4_xs_f32_flat -- decode GEMV over the plane split
+    {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src {
+            #include "mul_mv_iq4_xs_f32_flat.cl.h"
+        };
+#else
+        const std::string kernel_src = read_file("mul_mv_iq4_xs_f32_flat.cl");
+#endif
+        std::string opts = compile_opts;
+        opts += " -DIQ4XS_MV_ROWS=" + std::to_string(ggml_cl_iq4xs_mv_rows());
+        cl_program prog =
+            build_program_from_source(backend_ctx, kernel_src.c_str(), opts);
+
+        CL_CHECK((backend_ctx->kernel_mul_mv_iq4_xs_f32_flat = clCreateKernel(prog, "kernel_mul_mv_iq4_xs_f32_flat", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
@@ -10973,6 +10998,17 @@ inline bool use_q4k_tiled(const ggml_tensor *tensor);   // defined below
 inline bool use_adreno_moe_kernels(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor);   // defined below
 inline bool use_adreno_kernels(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor);   // defined below
 
+// GGML_OPENCL_IQ4XS_SOA: split IQ4_XS into feature-major planes at upload. The
+// conversion and every consumer must agree exactly -- if one thinks a tensor is
+// plane-split and another reads it as AoS blocks, the result is silent garbage.
+// So they all go through this one predicate.
+static bool ggml_cl_iq4xs_soa_on() {
+    static const int v = ggml_cl_env_int("GGML_OPENCL_IQ4XS_SOA", 0);
+    return v != 0;
+}
+
+static bool ggml_cl_iq4xs_is_split(const ggml_backend_opencl_context * backend_ctx, const ggml_tensor * t);
+
 // True if two tensors share a device buffer with overlapping byte ranges. The pool
 // allocator may place a fused op's output over a sequentially-dead input (safe for the
 // original separate kernels, but a read/write race inside one fused kernel).
@@ -13046,6 +13082,13 @@ inline bool use_adreno_kernels(const ggml_backend_opencl_context *backend_ctx, c
             break;
     }
     return threashold_ok;
+}
+
+static bool ggml_cl_iq4xs_is_split(const ggml_backend_opencl_context * backend_ctx, const ggml_tensor * t) {
+    return t->type == GGML_TYPE_IQ4_XS
+        && ggml_cl_iq4xs_soa_on()
+        && backend_ctx->kernel_convert_block_iq4_xs_ns != nullptr
+        && use_adreno_kernels(backend_ctx, t);
 }
 
 static bool adreno_art_compiler_quirks(const ggml_backend_opencl_context *backend_ctx) {
@@ -15530,11 +15573,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
     // The split is size preserving (128 + 2 + 2 + 4 == 136 == sizeof(block_iq4_xs))
     // so the planes are subbuffers of the tensor's own allocation, as q4_K's are.
     {
-        static const char * iq4xs_soa_env = getenv("GGML_OPENCL_IQ4XS_SOA");
-        const bool iq4xs_soa_on = iq4xs_soa_env && atoi(iq4xs_soa_env) != 0;
-        if (tensor->type == GGML_TYPE_IQ4_XS && iq4xs_soa_on
-                && use_adreno_kernels(backend_ctx, tensor)
-                && backend_ctx->kernel_convert_block_iq4_xs_ns) {
+        if (ggml_cl_iq4xs_is_split(backend_ctx, tensor)) {
             ggml_tensor_extra_cl * extra_orig = (ggml_tensor_extra_cl *)tensor->extra;
             GGML_ASSERT(extra_orig && "Tensors in OpenCL backend should have been allocated and initialized");
 
@@ -33117,11 +33156,8 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 // across the 64 lanes -- which is what the AoS attempt below could not
                 // do. Same predicate as the conversion, so the two cannot disagree.
                 {
-                    static const char * iq4xs_soa_env = getenv("GGML_OPENCL_IQ4XS_SOA");
-                    const bool iq4xs_soa_on = iq4xs_soa_env && atoi(iq4xs_soa_env) != 0;
-                    if (iq4xs_soa_on
+                    if (ggml_cl_iq4xs_is_split(backend_ctx, src0)
                             && backend_ctx->kernel_gemm_noshuffle_iq4_xs_q8_1_dp4a
-                            && use_adreno_kernels(backend_ctx, src0)
                             && ne00 % 256 == 0
                             && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1) {
                         ggml_tensor_extra_cl_iq4_xs * ex0 =
@@ -33250,6 +33286,40 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                         return;
                     }
                 }
+
+                    // Plane-split decode GEMV (GGML_OPENCL_IQ4XS_SOA=1). The weights are
+                    // feature-major, so one work item per output row makes a wave's read
+                    // one contiguous run. Must fire for EVERY ne11 the dp4a GEMM declines
+                    // -- the AoS kernels below would read the planes as blocks.
+                    if (ggml_cl_iq4xs_is_split(backend_ctx, src0)
+                            && backend_ctx->kernel_mul_mv_iq4_xs_f32_flat
+                            && ne00 % 256 == 0
+                            && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1) {
+                        ggml_tensor_extra_cl_iq4_xs * ex0 =
+                            (ggml_tensor_extra_cl_iq4_xs *)src0->extra;
+                        cl_kernel fk = backend_ctx->kernel_mul_mv_iq4_xs_f32_flat;
+                        const int rows = ggml_cl_iq4xs_mv_rows();
+                        cl_int ai = 0;
+                        CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->q));
+                        CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->d));
+                        CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->sh));
+                        CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->sl));
+                        CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &extra1->data_device));
+                        CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_ulong), &offset1));
+                        CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &extrad->data_device));
+                        CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_ulong), &offsetd));
+                        CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne00));
+                        CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne01));
+                        CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne10));
+                        CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne0));
+
+                        const size_t rows_per_wg = (size_t)64 * (size_t)rows;
+                        size_t f_global[3] = { CEIL_DIV((size_t)ne01, rows_per_wg) * 64,
+                                               (size_t)ne11, 1 };
+                        size_t f_local[3]  = { 64, 1, 1 };
+                        backend_ctx->enqueue_ndrange_kernel(fk, 3, f_global, f_local, dst);
+                        return;
+                    }
 
                 kernel = backend_ctx->kernel_mul_mm_iq4_xs_f32_l4_lm;
                 nth0 = backend_ctx->quant_lm_nth0; // (BM*BN)/(TM*TN), see GGML_OPENCL_LM_*
@@ -34731,6 +34801,40 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             break;
         }
         case GGML_TYPE_IQ4_XS: {
+            // Plane-split decode GEMV (GGML_OPENCL_IQ4XS_SOA=1). The weights are
+            // feature-major, so one work item per output row makes a wave's read
+            // one contiguous run. Must fire for EVERY ne11 the dp4a GEMM declines
+            // -- the AoS kernels below would read the planes as blocks.
+            if (ggml_cl_iq4xs_is_split(backend_ctx, src0)
+                    && backend_ctx->kernel_mul_mv_iq4_xs_f32_flat
+                    && ne00 % 256 == 0
+                    && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1) {
+                ggml_tensor_extra_cl_iq4_xs * ex0 =
+                    (ggml_tensor_extra_cl_iq4_xs *)src0->extra;
+                cl_kernel fk = backend_ctx->kernel_mul_mv_iq4_xs_f32_flat;
+                const int rows = ggml_cl_iq4xs_mv_rows();
+                cl_int ai = 0;
+                CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->q));
+                CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->d));
+                CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->sh));
+                CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->sl));
+                CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &extra1->data_device));
+                CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_ulong), &offset1));
+                CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &extrad->data_device));
+                CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_ulong), &offsetd));
+                CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne00));
+                CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne01));
+                CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne10));
+                CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne0));
+
+                const size_t rows_per_wg = (size_t)64 * (size_t)rows;
+                size_t f_global[3] = { CEIL_DIV((size_t)ne01, rows_per_wg) * 64,
+                               (size_t)ne11, 1 };
+                size_t f_local[3]  = { 64, 1, 1 };
+                backend_ctx->enqueue_ndrange_kernel(fk, 3, f_global, f_local, dst);
+                return;
+            }
+
             kernel = backend_ctx->kernel_mul_mv_iq4_xs_f32;
 
             if (backend_ctx->gpu_family == INTEL) {
