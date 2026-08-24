@@ -2593,6 +2593,51 @@ kernel void kernel_convert_block_iq4_xs_ns(
 }
 
 //------------------------------------------------------------------------------
+// block_iq4_xs plane split -> AoS blocks. Exact inverse of
+// kernel_convert_block_iq4_xs_ns above; the caller must un-transpose the four
+// planes back to block-major first.
+//------------------------------------------------------------------------------
+kernel void kernel_restore_block_iq4_xs_ns(
+    global uchar  * src_q,     // QK_K/2 bytes per block
+    global half   * src_d,     // 1 per block
+    global ushort * src_sh,    // 1 per block
+    global uint   * src_sl,    // 1 per block, the four scales_l bytes
+    global struct block_iq4_xs * dst,
+    uchar           mask_0F,
+    uchar           mask_F0,
+    ulong           n_blk
+) {
+    const ulong i = get_global_id(0);
+    if (i >= n_blk) {
+        return;
+    }
+    global struct block_iq4_xs * b = (global struct block_iq4_xs *) dst + i;
+    global uchar * q = (global uchar *) src_q + (QK_K/2) * i;
+
+    b->d        = src_d[i];
+    b->scales_h = src_sh[i];
+    const uint sl = src_sl[i];
+    b->scales_l[0] = (uchar)( sl        & 0xFF);
+    b->scales_l[1] = (uchar)((sl >>  8) & 0xFF);
+    b->scales_l[2] = (uchar)((sl >> 16) & 0xFF);
+    b->scales_l[3] = (uchar)((sl >> 24) & 0xFF);
+
+    for (int sb = 0; sb < QK_K/32; ++sb) {
+        global uchar * qi  = q     + 16*sb;
+        global uchar * out = b->qs + 16*sb;
+        for (int i2 = 0; i2 < 8; ++i2) {
+            // convert wrote:
+            //   qi[i2]   = (x0 & 0x0F) | ((x1 & 0x0F) << 4)
+            //   qi[i2+8] = ((x0 & 0xF0) >> 4) | (x1 & 0xF0)
+            uchar a = qi[i2 + 0];
+            uchar b8 = qi[i2 + 8];
+            out[2*i2 + 0] = convert_uchar(a & mask_0F) | convert_uchar((b8 & mask_0F) << 4);
+            out[2*i2 + 1] = convert_uchar((a & mask_F0) >> 4) | convert_uchar(b8 & mask_F0);
+        }
+    }
+}
+
+//------------------------------------------------------------------------------
 // IQ3_S -> planes. A straight field split, no reordering: for a 32-sub-block sb,
 // `qs[8*sb + u]` is already the grid index for dp4a operand u, because one
 // iq3s_grid entry is a uint holding 4 values, i.e. exactly the 4 weights of

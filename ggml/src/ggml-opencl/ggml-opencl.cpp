@@ -1867,6 +1867,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mm_iq4_xs_q8_1_dp4a = nullptr;  // dp4a (int8) dense IQ4_XS prefill GEMM, reads AoS blocks
     cl_kernel kernel_gemm_noshuffle_iq4_xs_q8_1_dp4a = nullptr;  // same, reading the feature-major plane split
     cl_kernel kernel_convert_block_iq4_xs_ns = nullptr;  // IQ4_XS AoS -> planes
+    cl_kernel kernel_restore_block_iq4_xs_ns = nullptr;  // IQ4_XS planes -> AoS
     cl_kernel kernel_gemm_noshuffle_q4_0_q8_1_dp4a = nullptr;  // dp4a (int8) dense q4_0 prefill GEMM
     // Narrow-tile twin for the verify band; see the q4_K pair above for the rationale.
     cl_kernel kernel_gemm_noshuffle_q4_0_q8_1_dp4a_narrow = nullptr;
@@ -2526,6 +2527,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         CL_CHECK((backend_ctx->kernel_restore_block_iq4_nl = clCreateKernel(backend_ctx->program_cvt, "kernel_restore_block_iq4_nl", &err), err));
         CL_CHECK((backend_ctx->kernel_convert_block_iq4_nl_noshuffle = clCreateKernel(backend_ctx->program_cvt, "kernel_convert_block_iq4_nl_noshuffle", &err), err));
         CL_CHECK((backend_ctx->kernel_convert_block_iq4_xs_ns = clCreateKernel(backend_ctx->program_cvt, "kernel_convert_block_iq4_xs_ns", &err), err));
+        CL_CHECK((backend_ctx->kernel_restore_block_iq4_xs_ns = clCreateKernel(backend_ctx->program_cvt, "kernel_restore_block_iq4_xs_ns", &err), err));
         CL_CHECK((backend_ctx->kernel_restore_block_iq4_nl_noshuffle = clCreateKernel(backend_ctx->program_cvt, "kernel_restore_block_iq4_nl_noshuffle", &err), err));
         CL_CHECK((backend_ctx->kernel_convert_bf16_to_f16 = clCreateKernel(backend_ctx->program_cvt, "kernel_convert_bf16_to_f16", &err), err));
         CL_CHECK((backend_ctx->kernel_convert_f16_to_bf16 = clCreateKernel(backend_ctx->program_cvt, "kernel_convert_f16_to_bf16", &err), err));
@@ -11018,6 +11020,7 @@ static bool ggml_cl_iq4xs_soa_on() {
 }
 
 static bool ggml_cl_iq4xs_is_split(const ggml_backend_opencl_context * backend_ctx, const ggml_tensor * t);
+static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size);
 
 // True if two tensors share a device buffer with overlapping byte ranges. The pool
 // allocator may place a fused op's output over a sequentially-dead input (safe for the
@@ -15679,6 +15682,24 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
             extra->size_sl = size_sl;
 
             tensor->extra = extra;
+
+            // GGML_OPENCL_IQ4XS_VERIFY=1: round-trip the tensor straight back out
+            // through the restore path and compare against the bytes we were
+            // handed. A benchmark cannot see a layout bug here -- the broken
+            // kernel runs at full speed and emits garbage -- so this is the only
+            // cheap oracle for the plane split.
+            if (getenv("GGML_OPENCL_IQ4XS_VERIFY") && offset == 0 && size == ggml_nbytes(tensor)) {
+                std::vector<char> back(ggml_nbytes(tensor));
+                ggml_backend_opencl_buffer_get_tensor(buffer, tensor, back.data(), 0, back.size());
+                size_t bad = 0;
+                for (size_t bi = 0; bi < back.size(); ++bi) {
+                    if (back[bi] != ((const char *)data)[bi]) {
+                        bad++;
+                    }
+                }
+                GGML_LOG_INFO("iq4_xs verify %-32s %zu / %zu bytes differ\n",
+                    tensor->name, bad, back.size());
+            }
             return;
         }
     }
@@ -17060,6 +17081,61 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
             queue, data_device, CL_TRUE, offset,
             size, data, 0, NULL, NULL));
         CL_CHECK(clReleaseMemObject(data_device));
+        return;
+    }
+    // IQ4_XS plane split: un-transpose the four planes, then reassemble the AoS
+    // blocks. Without this, a readback of a split tensor returns the planes
+    // reinterpreted as blocks. Gated on the same predicate as the conversion.
+    if (ggml_cl_iq4xs_is_split(backend_ctx, tensor)) {
+        ggml_tensor_extra_cl_iq4_xs * extra = (ggml_tensor_extra_cl_iq4_xs *)tensor->extra;
+
+        const cl_int M    = tensor->ne[1];
+        const cl_int K    = tensor->ne[0];
+        const size_t blck = (size_t)ggml_blck_size(tensor->type);
+
+        ggml_cl_buffer buf_q, buf_d, buf_sh, buf_sl, buf_unpacked;
+        buf_q.allocate (backend_ctx->context, extra->size_q);
+        buf_d.allocate (backend_ctx->context, extra->size_d);
+        buf_sh.allocate(backend_ctx->context, extra->size_sh);
+        buf_sl.allocate(backend_ctx->context, extra->size_sl);
+        buf_unpacked.allocate(backend_ctx->context, ggml_nbytes(tensor));
+
+#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+        // Mirror of the set_tensor transposes with the dimensions swapped. The
+        // three scale planes are only K/256 wide, i.e. below the hardcoded local
+        // size, so they need auto_local exactly as the forward direction does.
+        transpose_2d_as_16b(backend_ctx, extra->q,  buf_q.buffer,  extra->size_q,  M, K/4);
+        transpose_2d_as_16b(backend_ctx, extra->d,  buf_d.buffer,  extra->size_d,  M, K/(cl_int)blck, true, true);
+        transpose_2d_as_16b(backend_ctx, extra->sh, buf_sh.buffer, extra->size_sh, M, K/(cl_int)blck, true, true);
+        transpose_2d_as_32b(backend_ctx, extra->sl, buf_sl.buffer, extra->size_sl, M, K/(cl_int)blck, true, true);
+#else
+        CL_CHECK(clEnqueueCopyBuffer(queue, extra->q,  buf_q.buffer,  0, 0, extra->size_q,  0, NULL, NULL));
+        CL_CHECK(clEnqueueCopyBuffer(queue, extra->d,  buf_d.buffer,  0, 0, extra->size_d,  0, NULL, NULL));
+        CL_CHECK(clEnqueueCopyBuffer(queue, extra->sh, buf_sh.buffer, 0, 0, extra->size_sh, 0, NULL, NULL));
+        CL_CHECK(clEnqueueCopyBuffer(queue, extra->sl, buf_sl.buffer, 0, 0, extra->size_sl, 0, NULL, NULL));
+#endif
+
+        const size_t n_blk = (size_t)ggml_nelements(tensor) / blck;
+        cl_uchar mask_0F = 0x0F;
+        cl_uchar mask_F0 = 0xF0;
+        cl_ulong nb_arg  = (cl_ulong)n_blk;
+
+        cl_kernel kernel = backend_ctx->kernel_restore_block_iq4_xs_ns;
+        CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),   &buf_q.buffer));
+        CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem),   &buf_d.buffer));
+        CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem),   &buf_sh.buffer));
+        CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_mem),   &buf_sl.buffer));
+        CL_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_mem),   &buf_unpacked.buffer));
+        CL_CHECK(clSetKernelArg(kernel, 5, sizeof(cl_uchar), &mask_0F));
+        CL_CHECK(clSetKernelArg(kernel, 6, sizeof(cl_uchar), &mask_F0));
+        CL_CHECK(clSetKernelArg(kernel, 7, sizeof(cl_ulong), &nb_arg));
+
+        size_t gws[] = { (n_blk + 63) / 64 * 64 };
+        size_t lws[] = { 64 };
+        cl_event evt;
+        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 1, NULL, gws, lws, 0, NULL, &evt));
+        CL_CHECK(clWaitForEvents(1, &evt));
+        CL_CHECK(clEnqueueReadBuffer(queue, buf_unpacked.buffer, CL_TRUE, offset, size, data, 0, NULL, NULL));
         return;
     }
     if (tensor->type == GGML_TYPE_IQ4_NL) {
