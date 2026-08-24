@@ -17,10 +17,6 @@
 //------------------------------------------------------------------------------
 #define QK_K 256
 
-#ifndef IQ_MV_VEC
-#define IQ_MV_VEC 1
-#endif
-
 // 16 blocks of 16 elements each
 // weight is represented as x = a * q
 typedef struct {
@@ -152,36 +148,15 @@ kernel void kernel_mul_mv_q3_K_f32(
             s32 = ((s32 >> s_shift1) & 0x0f0f0f0fu) | aux32;
             char4 sc = as_char4(s32);
 
-#if IQ_MV_VEC
-            // the block is 110 bytes so these runs are only ushort aligned;
-            // four vloads replace sixteen scalar reads per row
-            ushort4 qlo = vload4(0, q);
-            ushort4 qhi = vload4(0, q + 8);
-            ushort4 hlo = vload4(0, h);
-            ushort4 hhi = vload4(0, h + 8);
-            ushort  qv[8] = { qlo.s0, qlo.s1, qlo.s2, qlo.s3, qhi.s0, qhi.s1, qhi.s2, qhi.s3 };
-            ushort  hv[8] = { hlo.s0, hlo.s1, hlo.s2, hlo.s3, hhi.s0, hhi.s1, hhi.s2, hhi.s3 };
-#define Q3K_Q0(i) qv[i]
-#define Q3K_H0(i) hv[i]
-#define Q3K_Q1(i) qv[(i)+4]
-#define Q3K_H1(i) hv[(i)+4]
-#else
-#define Q3K_Q0(i) q[i]
-#define Q3K_H0(i) h[i]
-#define Q3K_Q1(i) q[(i)+8]
-#define Q3K_H1(i) h[(i)+8]
-#endif
-
             float s1 = 0, s2 = 0, s3 = 0, s4 = 0, s5 = 0, s6 = 0;
             for (int l = 0; l < 8; l += 2) {
-                int qs = Q3K_Q0(l/2);
-                int hs = Q3K_H0(l/2);
+                int qs = q[l/2];
                 s1 += yl[l+0] * (qs & qm.s0);
                 s2 += yl[l+1] * (qs & qm.s1);
-                s3 += ((hs & hm.s0) ? 0.f : yl[l+0]) + ((hs & hm.s1) ? 0.f : yl[l+1]);
+                s3 += ((h[l/2] & hm.s0) ? 0.f : yl[l+0]) + ((h[l/2] & hm.s1) ? 0.f : yl[l+1]);
                 s4 += yl[l+16] * (qs & qm.s2);
                 s5 += yl[l+17] * (qs & qm.s3);
-                s6 += ((hs & hm.s2) ? 0.f : yl[l+16]) + ((hs & hm.s3) ? 0.f : yl[l+17]);
+                s6 += ((h[l/2] & hm.s2) ? 0.f : yl[l+16]) + ((h[l/2] & hm.s3) ? 0.f : yl[l+17]);
             }
             float d1 = d_all * (s1 + 1.f/256.f * s2 - s3*v1);
             float d2 = d_all * (s4 + 1.f/256.f * s5 - s6*v2);
@@ -190,19 +165,14 @@ kernel void kernel_mul_mv_q3_K_f32(
 
             s1 = s2 = s3 = s4 = s5 = s6 = 0;
             for (int l = 0; l < 8; l += 2) {
-                int qs = Q3K_Q1(l/2);
-                int hs = Q3K_H1(l/2);
+                int qs = q[l/2+8];
                 s1 += yl[l+8] * (qs & qm.s0);
                 s2 += yl[l+9] * (qs & qm.s1);
-                s3 += ((hs & hm.s0) ? 0.f : yl[l+8]) + ((hs & hm.s1) ? 0.f : yl[l+9]);
+                s3 += ((h[l/2+8] & hm.s0) ? 0.f : yl[l+8]) + ((h[l/2+8] & hm.s1) ? 0.f : yl[l+9]);
                 s4 += yl[l+24] * (qs & qm.s2);
                 s5 += yl[l+25] * (qs & qm.s3);
-                s6 += ((hs & hm.s2) ? 0.f : yl[l+24]) + ((hs & hm.s3) ? 0.f : yl[l+25]);
+                s6 += ((h[l/2+8] & hm.s2) ? 0.f : yl[l+24]) + ((h[l/2+8] & hm.s3) ? 0.f : yl[l+25]);
             }
-#undef Q3K_Q0
-#undef Q3K_H0
-#undef Q3K_Q1
-#undef Q3K_H1
             d1 = d_all * (s1 + 1.f/256.f * s2 - s3*v1);
             d2 = d_all * (s4 + 1.f/256.f * s5 - s6*v2);
             sumf1[row] += d1 * (sc.s1 - 32);
