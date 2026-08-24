@@ -110,6 +110,7 @@ set(GGML_OPENCL_KERNELS
     mul_mv_iq4_xs_f32
     mul_mv_iq4_xs_f32_flat
     mul_mv_iq3_s_f32_flat
+    mul_mv_iq3_xxs_f32_flat
     mul_mv_q2_k_f32
     mul_mv_q3_k_f32
     mul_mv_q4_k_f32
@@ -159,6 +160,7 @@ set(GGML_OPENCL_KERNELS
     mul_mm_iq4_xs_q8_1_dp4a
     gemm_noshuffle_iq4_xs_q8_1_dp4a
     gemm_noshuffle_iq3_s_q8_1_dp4a
+    gemm_noshuffle_iq3_xxs_q8_1_dp4a
     gemm_noshuffle_q4_0_q8_1_dp4a
     quant_a_q8_1
     gemv_moe_q4_k_f32_ns

@@ -151,6 +151,15 @@ struct block_iq3_s
 };
 
 //------------------------------------------------------------------------------
+// block_iq3_xxs
+//------------------------------------------------------------------------------
+struct block_iq3_xxs
+{
+    half     d;
+    uint8_t  qs[3*QK_K/8];
+};
+
+//------------------------------------------------------------------------------
 // bf16 to f16
 //------------------------------------------------------------------------------
 kernel void kernel_convert_bf16_to_f16(
@@ -2692,6 +2701,70 @@ kernel void kernel_restore_block_iq3_s_ns(
     for (int j = 0; j < QK_K/32; ++j) { b->qh[j]     = src_qh[(QK_K/32) * i + j]; }
     for (int j = 0; j < QK_K/8;  ++j) { b->signs[j]  = src_sg[(QK_K/8)  * i + j]; }
     for (int j = 0; j < QK_K/64; ++j) { b->scales[j] = src_sc[(QK_K/64) * i + j]; }
+}
+
+//------------------------------------------------------------------------------
+// IQ3_XXS -> planes. The AoS block packs two different things into one qs array:
+// the first QK_K/4 bytes are grid indices (one per 4 weights, so one index IS one
+// dp4a operand), and the last QK_K/8 bytes are one uint32 per 32-block carrying
+// the 4-bit scale in bits 28..31 and four 7-bit sign codes below it.
+//
+// Those uint32s sit at a 2-aligned offset inside the block, so they are assembled
+// a byte at a time here; the plane itself is a properly aligned uint array.
+//
+// Size preserving: QK_K/4 + 4*(QK_K/32) + 2 == 64 + 32 + 2 == 98 ==
+// sizeof(block_iq3_xxs), so the planes are subbuffers of the tensor's own
+// allocation.
+//------------------------------------------------------------------------------
+kernel void kernel_convert_block_iq3_xxs_ns(
+    global struct block_iq3_xxs * src0,
+    global uchar * dst_qs,      // QK_K/4 per block
+    global uint  * dst_sas,     // QK_K/32 per block: scale nibble + 4 sign codes
+    global half  * dst_d,       // 1
+    ulong          n_blk
+) {
+    const ulong i = get_global_id(0);
+    if (i >= n_blk) {
+        return;
+    }
+    global struct block_iq3_xxs * b = (global struct block_iq3_xxs *) src0 + i;
+
+    dst_d[i] = b->d;
+    for (int j = 0; j < QK_K/4; ++j) { dst_qs[(QK_K/4) * i + j] = b->qs[j]; }
+    for (int j = 0; j < QK_K/32; ++j) {
+        global const uchar * p = b->qs + QK_K/4 + 4*j;
+        dst_sas[(QK_K/32) * i + j] = (uint)p[0] | ((uint)p[1] << 8)
+                                   | ((uint)p[2] << 16) | ((uint)p[3] << 24);
+    }
+}
+
+//------------------------------------------------------------------------------
+// IQ3_XXS planes -> AoS blocks. Exact inverse of the convert above; the caller
+// must un-transpose the three planes back to block-major first.
+//------------------------------------------------------------------------------
+kernel void kernel_restore_block_iq3_xxs_ns(
+    global uchar * src_qs,
+    global uint  * src_sas,
+    global half  * src_d,
+    global struct block_iq3_xxs * dst,
+    ulong          n_blk
+) {
+    const ulong i = get_global_id(0);
+    if (i >= n_blk) {
+        return;
+    }
+    global struct block_iq3_xxs * b = (global struct block_iq3_xxs *) dst + i;
+
+    b->d = src_d[i];
+    for (int j = 0; j < QK_K/4; ++j) { b->qs[j] = src_qs[(QK_K/4) * i + j]; }
+    for (int j = 0; j < QK_K/32; ++j) {
+        const uint w = src_sas[(QK_K/32) * i + j];
+        global uchar * p = b->qs + QK_K/4 + 4*j;
+        p[0] = (uchar)( w        & 0xFF);
+        p[1] = (uchar)((w >>  8) & 0xFF);
+        p[2] = (uchar)((w >> 16) & 0xFF);
+        p[3] = (uchar)((w >> 24) & 0xFF);
+    }
 }
 
 kernel void kernel_restore_block_iq4_nl_noshuffle(
