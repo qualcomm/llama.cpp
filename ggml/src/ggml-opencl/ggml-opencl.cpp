@@ -2121,8 +2121,8 @@ static int ggml_cl_iq3s_mv_r2() {
 // Measured at -16.5% and left off; see the kernel header.
 // Apply the per-weight signs with one XOR of the float sign bit rather than four
 // conditional negations. The three grid GEMVs share the helper verbatim, but the
-// change does NOT share a sign: measured +4.6% on IQ3_XXS and -4.7% on IQ3_S. One
-// knob per kernel, each set by its own measurement.
+// change does NOT share a sign: +4.6% on IQ3_XXS and +1.6% on IQ2_S, but -4.7% on
+// IQ3_S. One knob per kernel, each set by its own measurement.
 static int ggml_cl_iq3s_mv_signxor() {
     static const int v = ggml_cl_env_int("GGML_OPENCL_IQ3S_MV_SIGNXOR", 0);
     return v;
@@ -2134,7 +2134,7 @@ static int ggml_cl_iq3xxs_mv_signxor() {
 }
 
 static int ggml_cl_iq2s_mv_signxor() {
-    static const int v = ggml_cl_env_int("GGML_OPENCL_IQ2S_MV_SIGNXOR", 0);
+    static const int v = ggml_cl_env_int("GGML_OPENCL_IQ2S_MV_SIGNXOR", 1);
     return v;
 }
 

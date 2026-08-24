@@ -296,10 +296,11 @@ constant uint iq2s_grid[2048] = {
 // three grid types share this helper verbatim and are together about 30 percent
 // of Qwen3.8-27B decode.
 //
-// Unmeasured on this kernel. The identical helper is +4.6% on IQ3_XXS and -4.7%
-// on IQ3_S, so it gets its own knob and its own measurement.
+// MEASURED: Qwen3.8-27B UD-IQ2_S tg32 2.389 -> 2.428, +1.6%. On.
+// The identical helper is +4.6% on IQ3_XXS and -4.7% on IQ3_S, which is why each
+// of the three carries its own knob. Do not re-merge them.
 #ifndef IQ2S_MV_SIGNXOR
-#define IQ2S_MV_SIGNXOR 0
+#define IQ2S_MV_SIGNXOR 1
 #endif
 
 // Four grid values with their signs applied, as floats.

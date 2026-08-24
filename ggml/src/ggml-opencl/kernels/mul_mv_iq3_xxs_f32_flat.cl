@@ -104,9 +104,10 @@ inline uint iq3xxs_pack(uint gv, uint sg, uint base) {
 // three grid types share this helper verbatim and are together about 30 percent
 // of Qwen3.8-27B decode.
 //
-// MEASURED: q4b-IQ3_XXS tg64 15.46 -> 16.16, +4.6%. On. Note that the IDENTICAL
-// helper is -4.7% in the IQ3_S GEMV, so this knob is per-kernel on purpose --
-// do not re-merge them.
+// MEASURED: q4b-IQ3_XXS tg64 15.46 -> 16.16 (+4.6%), and it holds at scale --
+// Qwen3.8-27B UD-IQ3_XXS tg32 3.410 -> 3.468 (+1.7%, smaller because that file
+// is a hybrid). On. The IDENTICAL helper is -4.7% in the IQ3_S GEMV, so this
+// knob is per-kernel on purpose -- do not re-merge them.
 #ifndef IQ3XXS_MV_SIGNXOR
 #define IQ3XXS_MV_SIGNXOR 1
 #endif
