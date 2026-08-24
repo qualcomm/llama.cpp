@@ -2069,10 +2069,13 @@ static bool ggml_cl_iq4xs_mv_wimg_on(const ggml_backend_opencl_context * backend
     return backend_ctx->adreno_x2_class();
 }
 
-// Codebook from a packed uint array by shift rather than a float[16] indexed by
-// the nibble; see the kernel header for the probe that motivated it.
-static int ggml_cl_iq4xs_mv_cbpack() {
-    static const int v = ggml_cl_env_int("GGML_OPENCL_IQ4XS_MV_CBPACK", 1);
+// How a nibble becomes its codebook value -- the kernel's dominant cost. The
+// modes are listed in the kernel header; 1 is the packed-__constant form that
+// shipped on 2026-08-24. GGML_OPENCL_IQ4XS_MV_CBPACK stays accepted as the old
+// name for it.
+static int ggml_cl_iq4xs_mv_cb() {
+    static const int v = ggml_cl_env_int(
+        "GGML_OPENCL_IQ4XS_MV_CB", ggml_cl_env_int("GGML_OPENCL_IQ4XS_MV_CBPACK", 1));
     return v;
 }
 
@@ -3277,7 +3280,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         opts += " -DIQ4XS_MV_NSG=" + std::to_string(ggml_cl_iq4xs_mv_nsg());
         opts += " -DIQ4XS_MV_R2="  + std::to_string(ggml_cl_iq4xs_mv_r2());
         opts += " -DIQ4XS_MV_ABL=" + std::to_string(ggml_cl_iq4xs_mv_abl());
-        opts += " -DIQ4XS_MV_CBPACK=" + std::to_string(ggml_cl_iq4xs_mv_cbpack());
+        opts += " -DIQ4XS_MV_CB=" + std::to_string(ggml_cl_iq4xs_mv_cb());
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), opts);
 

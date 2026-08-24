@@ -61,40 +61,125 @@
 #define IQ4XS_YV(g, y) vload4((g), (y))
 #endif
 
-// IQ4XS_MV_CBPACK=1: take the codebook from a packed __constant UINT array by
-// shift instead of a __constant FLOAT[16] indexed by the nibble.
+// IQ4XS_MV_CB: how a nibble becomes its codebook value. This, and not the loads
+// or the activations, is what the kernel spends its time on.
 //
-// The ABL=2 probe says the lookup is what this kernel is spending its time on:
-// dropping it entirely is +51% on a 3B and +21% on the 27B. That is also why the
-// tuned gemv_noshuffle_q4_k_f32 is 1.72x faster at matched shapes -- q4_K is a
-// LINEAR quant and has no table at all, so this is a cost the IQ types carry
-// rather than a trick that was copied wrong.
+// The ABL=2 probe settles it: dropping the lookup entirely (wrong math) is +51%
+// on a 3B and +21% on the 27B. It is also why the tuned gemv_noshuffle_q4_k_f32
+// is 1.72x faster at matched shapes -- q4_K is a LINEAR quant with no table at
+// all, so this is a cost the IQ types carry, not a trick copied wrong.
 //
-// The packing is the one the dp4a GEMM already uses, and its header records why:
-// a divergent lookup should read a small __constant *uint* array and shift.
-#ifndef IQ4XS_MV_CBPACK
-#define IQ4XS_MV_CBPACK 1
-#endif
-
-__constant uint kvalues_iq4nl_i8x4[4] = {
-    0xBFAD9881u, 0xF6EADDCFu, 0x26190D01u, 0x71594535u
-};
-inline float iq4nl_cbf(uint n) {
-    return (float)(char)((kvalues_iq4nl_i8x4[n >> 2] >> ((n & 3u) * 8u)) & 0xFFu);
-}
-
-#if IQ4XS_MV_ABL == 2
-#define IQ4XS_CB(n) ((float)(n))
-#elif IQ4XS_MV_CBPACK
-#define IQ4XS_CB(n) iq4nl_cbf((n))
+// The index is per weight and therefore DIVERGENT, which is the part that hurts.
+// Adreno only takes __constant through the uniform path when the index is
+// wave-uniform, so each of these is a real cache load, and at eight nibbles per
+// uint of weights they outnumber the weight loads 8:1.
+//
+//   0  __constant float[16] indexed by the nibble (the metal-derived original)
+//   1  __constant uint[4], byte-extracted by shift -- shipped 2026-08-24 for
+//      +8.1% on the 27B, i.e. only ~40% of the ABL=2 ceiling, so 1 is not the end
+//   2  the same float[16] staged in LOCAL memory. Sixteen consecutive floats sit
+//      in sixteen different LDS banks, so a fully divergent read is conflict
+//      free; precedent is the IQ2_S grid, where __constant -> LDS was +55%
+//   3  the four uints as IMMEDIATES, picked by a select chain, so the table never
+//      leaves the register file. Three selects per nibble, zero memory traffic
+//   4  OpenCL shuffle() over a uchar16 register table -- one builtin per FOUR
+//      nibbles, the closest thing available to CUDA's byte-permute
+//   5  control for 4: the same float4-at-a-time restructuring over the mode-1
+//      table. 4 vs 5 isolates shuffle(), 5 vs 1 isolates the restructuring
+//   6  one ulong immediate pair, picked by a single select and byte-extracted by
+//      a 64-bit variable shift
+//
+// 4 and 5 sum with dot() rather than four sequential adds, so they are not
+// bit-identical to the others; anything that ships has to clear the decode-path
+// perplexity oracle, not just llama-bench.
+#ifndef IQ4XS_MV_CB
+#ifdef  IQ4XS_MV_CBPACK
+#define IQ4XS_MV_CB IQ4XS_MV_CBPACK
 #else
-#define IQ4XS_CB(n) kvalues_iq4nl[(n)]
+#define IQ4XS_MV_CB 1
+#endif
 #endif
 
 constant float kvalues_iq4nl[16] = {
     -127.f, -104.f, -83.f, -65.f, -49.f, -35.f, -22.f, -10.f,
       1.f,   13.f,  25.f,  38.f,  53.f,  69.f,  89.f, 113.f
 };
+
+__constant uint kvalues_iq4nl_i8x4[4] = {
+    0xBFAD9881u, 0xF6EADDCFu, 0x26190D01u, 0x71594535u
+};
+
+inline float iq4nl_cbf(uint n) {
+    return (float)(char)((kvalues_iq4nl_i8x4[n >> 2] >> ((n & 3u) * 8u)) & 0xFFu);
+}
+
+// n >> 2 picks the uint; its two bits are (n & 4) and (n & 8).
+inline float iq4nl_cbsel(uint n) {
+    const uint t01 = (n & 4u) ? 0xF6EADDCFu : 0xBFAD9881u;
+    const uint t23 = (n & 4u) ? 0x71594535u : 0x26190D01u;
+    const uint t   = (n & 8u) ? t23 : t01;
+    return (float)(char)((t >> ((n & 3u) * 8u)) & 0xFFu);
+}
+
+inline float iq4nl_cbsel64(uint n) {
+    const ulong t = (n & 8u) ? 0x7159453526190D01ul : 0xF6EADDCFBFAD9881ul;
+    return (float)(char)((uint)((t >> ((n & 7u) * 8u)) & 0xFFul));
+}
+
+inline float4 iq4nl_cb4_pack(uint w) {
+    return (float4)(iq4nl_cbf( w        & 0xFu), iq4nl_cbf((w >>  4) & 0xFu),
+                    iq4nl_cbf((w >>  8) & 0xFu), iq4nl_cbf((w >> 12) & 0xFu));
+}
+
+// shuffle() indexes by the four low bits of each mask element, which is exactly a
+// 16-entry byte table held in registers.
+inline float4 iq4nl_cb4_shuf(uint w) {
+    const uchar16 tbl = (uchar16)(0x81, 0x98, 0xAD, 0xBF, 0xCF, 0xDD, 0xEA, 0xF6,
+                                  0x01, 0x0D, 0x19, 0x26, 0x35, 0x45, 0x59, 0x71);
+    const uchar4  idx = (uchar4)((uchar)( w        & 0xFu), (uchar)((w >>  4) & 0xFu),
+                                 (uchar)((w >>  8) & 0xFu), (uchar)((w >> 12) & 0xFu));
+    return convert_float4(as_char4(shuffle(tbl, idx)));
+}
+
+#if IQ4XS_MV_ABL == 2
+#define IQ4XS_CB_DECL
+#define IQ4XS_CB(n) ((float)(n))
+#elif IQ4XS_MV_CB == 0
+#define IQ4XS_CB_DECL
+#define IQ4XS_CB(n) kvalues_iq4nl[(n)]
+#elif IQ4XS_MV_CB == 2
+#define IQ4XS_CB_DECL                                                          \
+    __local float iq4nl_lds[16];                                               \
+    if (get_local_id(1) == 0 && get_local_id(0) < 16) {                        \
+        iq4nl_lds[get_local_id(0)] = kvalues_iq4nl[get_local_id(0)];           \
+    }                                                                          \
+    barrier(CLK_LOCAL_MEM_FENCE);
+#define IQ4XS_CB(n) iq4nl_lds[(n)]
+#elif IQ4XS_MV_CB == 3
+#define IQ4XS_CB_DECL
+#define IQ4XS_CB(n) iq4nl_cbsel((n))
+#elif IQ4XS_MV_CB == 6
+#define IQ4XS_CB_DECL
+#define IQ4XS_CB(n) iq4nl_cbsel64((n))
+#else
+#define IQ4XS_CB_DECL
+#define IQ4XS_CB(n) iq4nl_cbf((n))
+#endif
+
+// One super-block quarter: four nibbles of `w` against the float4 `yv`.
+#if IQ4XS_MV_ABL != 2 && IQ4XS_MV_CB == 4
+#define IQ4XS_ACC(a, yv, w) a += dot((yv), iq4nl_cb4_shuf((uint)(w)))
+#elif IQ4XS_MV_ABL != 2 && IQ4XS_MV_CB == 5
+#define IQ4XS_ACC(a, yv, w) a += dot((yv), iq4nl_cb4_pack((uint)(w)))
+#else
+#define IQ4XS_ACC(a, yv, w)                                    \
+    do {                                                       \
+        a += (yv).s0 * IQ4XS_CB(((uint)(w)      ) & 0xFu);     \
+        a += (yv).s1 * IQ4XS_CB(((uint)(w) >>  4) & 0xFu);     \
+        a += (yv).s2 * IQ4XS_CB(((uint)(w) >>  8) & 0xFu);     \
+        a += (yv).s3 * IQ4XS_CB(((uint)(w) >> 12) & 0xFu);     \
+    } while (0)
+#endif
 
 kernel void kernel_mul_mv_iq4_xs_f32_flat(
         global const ushort * src0_q,
@@ -122,6 +207,8 @@ kernel void kernel_mul_mv_iq4_xs_f32_flat(
     const uint col = get_group_id(1);           // token
 
     global const float * y = src1 + (ulong)col * (uint)ne10;
+
+    IQ4XS_CB_DECL
 
 #if IQ4XS_MV_R2
     const uint mh  = m >> 1;                    // rows per plane row, as uints
@@ -159,14 +246,8 @@ kernel void kernel_mul_mv_iq4_xs_f32_flat(
                     const ushort w0 = (ushort)(w & 0xFFFFu);
                     const ushort w1 = (ushort)(w >> 16);
                     const float4 yv = IQ4XS_YV(grp + u, y);
-                    a0 += yv.s0 * IQ4XS_CB((w0      ) & 0xF);
-                    a0 += yv.s1 * IQ4XS_CB((w0 >>  4) & 0xF);
-                    a0 += yv.s2 * IQ4XS_CB((w0 >>  8) & 0xF);
-                    a0 += yv.s3 * IQ4XS_CB((w0 >> 12) & 0xF);
-                    a1 += yv.s0 * IQ4XS_CB((w1      ) & 0xF);
-                    a1 += yv.s1 * IQ4XS_CB((w1 >>  4) & 0xF);
-                    a1 += yv.s2 * IQ4XS_CB((w1 >>  8) & 0xF);
-                    a1 += yv.s3 * IQ4XS_CB((w1 >> 12) & 0xF);
+                    IQ4XS_ACC(a0, yv, w0);
+                    IQ4XS_ACC(a1, yv, w1);
                 }
                 acc0 += (float)(ls0 - 32) * a0;
                 acc1 += (float)(ls1 - 32) * a1;
@@ -199,10 +280,7 @@ kernel void kernel_mul_mv_iq4_xs_f32_flat(
                 for (uint u = 0; u < 8u; ++u) {
                     const ushort w  = src0_q[qb + u * m];
                     const float4 yv = IQ4XS_YV(grp + u, y);
-                    a += yv.s0 * IQ4XS_CB((w      ) & 0xF);
-                    a += yv.s1 * IQ4XS_CB((w >>  4) & 0xF);
-                    a += yv.s2 * IQ4XS_CB((w >>  8) & 0xF);
-                    a += yv.s3 * IQ4XS_CB((w >> 12) & 0xF);
+                    IQ4XS_ACC(a, yv, w);
                 }
                 acc += (float)(ls - 32) * a;
             }
@@ -292,6 +370,8 @@ kernel void kernel_mul_mv_iq4_xs_f32_flat_wimg(
 
     global const float * y = src1 + (ulong)col * (uint)ne10;
 
+    IQ4XS_CB_DECL
+
 #if IQ4XS_MV_R2
     const uint mh  = m >> 1;                    // rows per plane row, as uints
     const uint j   = get_group_id(0) * 64u + lid;   // row pair index
@@ -329,14 +409,8 @@ kernel void kernel_mul_mv_iq4_xs_f32_flat_wimg(
                     const ushort w0 = (ushort)(w & 0xFFFFu);
                     const ushort w1 = (ushort)(w >> 16);
                     const float4 yv = IQ4XS_YV(grp + u, y);
-                    a0 += yv.s0 * IQ4XS_CB((w0      ) & 0xF);
-                    a0 += yv.s1 * IQ4XS_CB((w0 >>  4) & 0xF);
-                    a0 += yv.s2 * IQ4XS_CB((w0 >>  8) & 0xF);
-                    a0 += yv.s3 * IQ4XS_CB((w0 >> 12) & 0xF);
-                    a1 += yv.s0 * IQ4XS_CB((w1      ) & 0xF);
-                    a1 += yv.s1 * IQ4XS_CB((w1 >>  4) & 0xF);
-                    a1 += yv.s2 * IQ4XS_CB((w1 >>  8) & 0xF);
-                    a1 += yv.s3 * IQ4XS_CB((w1 >> 12) & 0xF);
+                    IQ4XS_ACC(a0, yv, w0);
+                    IQ4XS_ACC(a1, yv, w1);
                 }
                 acc0 += (float)(ls0 - 32) * a0;
                 acc1 += (float)(ls1 - 32) * a1;
@@ -371,10 +445,7 @@ kernel void kernel_mul_mv_iq4_xs_f32_flat_wimg(
                     const ushort w  = (ushort)((read_imageui(src0_q_img, (int)(we >> 1)).x
                                                 >> ((we & 1u) * 16u)) & 0xFFFFu);
                     const float4 yv = IQ4XS_YV(grp + u, y);
-                    a += yv.s0 * IQ4XS_CB((w      ) & 0xF);
-                    a += yv.s1 * IQ4XS_CB((w >>  4) & 0xF);
-                    a += yv.s2 * IQ4XS_CB((w >>  8) & 0xF);
-                    a += yv.s3 * IQ4XS_CB((w >> 12) & 0xF);
+                    IQ4XS_ACC(a, yv, w);
                 }
                 acc += (float)(ls - 32) * a;
             }
