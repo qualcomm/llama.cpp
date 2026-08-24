@@ -29,7 +29,9 @@
 // 64-thread workgroup, so 8 KB of extra LDS costs far more occupancy than it does
 // in the 512-thread GEMV, and each grid lookup already feeds 32 columns of dp4a
 // rather than one row of a GEMV -- about 32x less constant pressure per unit of
-// work. Measure before flipping.
+// work. MEASURED and it is a small regression, as that reasoning predicts:
+// Llama-3.2-3B IQ2_M pp512 606.0 with it off against 593.3 with it on, bracketed.
+// Kept only so the next grid type can re-test cheaply.
 #ifndef IQ2S_GEMM_LDSGRID
 #define IQ2S_GEMM_LDSGRID 0
 #endif
