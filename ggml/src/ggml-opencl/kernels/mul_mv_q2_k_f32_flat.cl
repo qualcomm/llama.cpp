@@ -69,8 +69,10 @@ kernel void kernel_mul_mv_q2_k_f32_flat(
         global const uint * scu = (global const uint *)src0_sc;
 
         for (uint ib = sgi; ib < nsb; ib += Q2K_MV_NSG) {
-            const half4 dma = vload4(2u*j + 0u, src0_dm);   // d0, dmin0, d1, dmin1
-            const half4 dmb = vload4(2u*j + 1u, src0_dm);   // d2, dmin2, d3, dmin3
+            // the d/dmin plane element is a half PAIR, so four rows of one
+            // super-block are eight halves starting at 2*(j + ib*mr) half4s
+            const half4 dma = vload4(2u*(j + ib*mr) + 0u, src0_dm);  // d0, dmin0, d1, dmin1
+            const half4 dmb = vload4(2u*(j + ib*mr) + 1u, src0_dm);  // d2, dmin2, d3, dmin3
 
             float ad0 = 0.f, am0 = 0.f, ad1 = 0.f, am1 = 0.f;
             float ad2 = 0.f, am2 = 0.f, ad3 = 0.f, am3 = 0.f;
