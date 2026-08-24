@@ -13200,12 +13200,15 @@ inline bool use_adreno_kernels(const ggml_backend_opencl_context *backend_ctx, c
 
 // Same contract as ggml_cl_iq4xs_is_split: the conversion and every consumer
 // share ONE predicate so they cannot disagree about the layout of a tensor.
+// Default ON for X2-class only, for the same reason as IQ4_XS above: the prefill
+// half is the q8_1 dp4a GEMM and dp4a does not carry across Adreno generations.
+// GGML_OPENCL_IQ3S_SOA forces either way.
 static bool ggml_cl_iq3s_soa_on(const ggml_backend_opencl_context * backend_ctx) {
-    GGML_UNUSED(backend_ctx);
-    // OFF until the dp4a GEMM and the plane GEMV exist: converting the tensor
-    // invalidates every kernel that still reads IQ3_S as AoS blocks.
-    static const int v = ggml_cl_env_int("GGML_OPENCL_IQ3S_SOA", 0);
-    return v != 0;
+    static const char * const e = getenv("GGML_OPENCL_IQ3S_SOA");
+    if (e && *e) {
+        return atoi(e) != 0;
+    }
+    return backend_ctx->adreno_x2_class();
 }
 
 static bool ggml_cl_iq3s_is_split(const ggml_backend_opencl_context * backend_ctx, const ggml_tensor * t) {
