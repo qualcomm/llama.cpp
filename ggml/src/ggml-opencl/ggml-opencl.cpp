@@ -2096,7 +2096,8 @@ static int ggml_cl_iq4xs_mv_r2() {
 }
 
 // Four rows per lane instead of two -- a uint2 weight load rather than a uint.
-// Opt-in until measured; see the kernel header. Assumes ne01 % 4 == 0.
+// Measured +1.5% on a 3B and -3.0% on a 27B, so it stays off; see the kernel
+// header, including why turning it on needs more than this flag.
 static int ggml_cl_iq4xs_mv_r4() {
     static const int v = ggml_cl_env_int("GGML_OPENCL_IQ4XS_MV_R4", 0);
     return v;

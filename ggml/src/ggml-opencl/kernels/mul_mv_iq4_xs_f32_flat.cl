@@ -49,8 +49,15 @@
 // register pressure from four live grid indices, and IQ4_XS no longer has a grid
 // to be live: under IQ4XS_MV_CB=3 the codebook is immediates.
 //
-// Needs m % 4 == 0, the same kind of assumption R2 already makes about m being
-// even; the %64 rule on the split path covers both.
+// MEASURED, AND IT DOES NOT SETTLE: X2-90 tg, Llama-3.2-3B IQ4_XS 40.09 -> 40.69
+// (+1.5%) but Qwen3.8-27B UD-IQ4_XS 5.279 -> 5.118 (-3.0%). Same device, same
+// kernel, opposite sign by model shape -- 256 rows per workgroup halves the
+// workgroup count, and the float4 partials double this kernel's local memory to
+// 8 KB. Left off; a shape-dependent default is not worth 1.5%.
+//
+// If it is ever turned on: the split gate only requires ne01 % 2 == 0, so a
+// tensor with ne01 % 4 == 2 would drop its tail rows silently. That needs a
+// per-dispatch choice between an R2 and an R4 kernel, not just this flag.
 #ifndef IQ4XS_MV_R4
 #define IQ4XS_MV_R4 0
 #endif
