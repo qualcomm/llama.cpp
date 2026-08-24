@@ -2063,6 +2063,12 @@ static int ggml_cl_iq4xs_mv_wimg() {
     return v;
 }
 
+// Cost probe only, wrong math -- see the kernel header.
+static int ggml_cl_iq4xs_mv_abl() {
+    static const int v = ggml_cl_env_int("GGML_OPENCL_IQ4XS_MV_ABL", 0);
+    return v;
+}
+
 static int ggml_cl_iq4xs_mv_nsg() {
     static const int v = ggml_cl_env_int("GGML_OPENCL_IQ4XS_MV_NSG", 8);
     return v;
@@ -3257,6 +3263,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         std::string opts = compile_opts;
         opts += " -DIQ4XS_MV_NSG=" + std::to_string(ggml_cl_iq4xs_mv_nsg());
         opts += " -DIQ4XS_MV_R2="  + std::to_string(ggml_cl_iq4xs_mv_r2());
+        opts += " -DIQ4XS_MV_ABL=" + std::to_string(ggml_cl_iq4xs_mv_abl());
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), opts);
 

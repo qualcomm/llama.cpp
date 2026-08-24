@@ -40,6 +40,23 @@
 #define IQ4XS_MV_R2 1
 #endif
 
+// IQ4XS_MV_ABL=1: COST PROBE, WRONG MATH. Replaces the per-operand activation
+// load with a constant, keeping every weight load and all the ALU. The question
+// it answers: this kernel reads 128 bytes of f32 activations per 32-K step per
+// LANE against ~34 bytes of weights for its row pair, and all 64 lanes of a wave
+// read the SAME addresses. The tuned gemv_noshuffle_q4_k_f32 loads them on four
+// lanes and sub_group_broadcasts instead. If that redundancy is already free on
+// X2 the probe changes nothing and the broadcast rewrite is not worth doing.
+#ifndef IQ4XS_MV_ABL
+#define IQ4XS_MV_ABL 0
+#endif
+
+#if IQ4XS_MV_ABL
+#define IQ4XS_YV(g, y) ((float4)(1.0f))
+#else
+#define IQ4XS_YV(g, y) vload4((g), (y))
+#endif
+
 constant float kvalues_iq4nl[16] = {
     -127.f, -104.f, -83.f, -65.f, -49.f, -35.f, -22.f, -10.f,
       1.f,   13.f,  25.f,  38.f,  53.f,  69.f,  89.f, 113.f
@@ -107,7 +124,7 @@ kernel void kernel_mul_mv_iq4_xs_f32_flat(
                     const uint   w  = qu[qb + u * mh];   // row pair, one load
                     const ushort w0 = (ushort)(w & 0xFFFFu);
                     const ushort w1 = (ushort)(w >> 16);
-                    const float4 yv = vload4(grp + u, y);
+                    const float4 yv = IQ4XS_YV(grp + u, y);
                     a0 += yv.s0 * kvalues_iq4nl[(w0      ) & 0xF];
                     a0 += yv.s1 * kvalues_iq4nl[(w0 >>  4) & 0xF];
                     a0 += yv.s2 * kvalues_iq4nl[(w0 >>  8) & 0xF];
@@ -147,7 +164,7 @@ kernel void kernel_mul_mv_iq4_xs_f32_flat(
                 float a = 0.f;
                 for (uint u = 0; u < 8u; ++u) {
                     const ushort w  = src0_q[qb + u * m];
-                    const float4 yv = vload4(grp + u, y);
+                    const float4 yv = IQ4XS_YV(grp + u, y);
                     a += yv.s0 * kvalues_iq4nl[(w      ) & 0xF];
                     a += yv.s1 * kvalues_iq4nl[(w >>  4) & 0xF];
                     a += yv.s2 * kvalues_iq4nl[(w >>  8) & 0xF];
@@ -277,7 +294,7 @@ kernel void kernel_mul_mv_iq4_xs_f32_flat_wimg(
                     const uint   w  = read_imageui(src0_q_img, (int)(qb + u * mh)).x;
                     const ushort w0 = (ushort)(w & 0xFFFFu);
                     const ushort w1 = (ushort)(w >> 16);
-                    const float4 yv = vload4(grp + u, y);
+                    const float4 yv = IQ4XS_YV(grp + u, y);
                     a0 += yv.s0 * kvalues_iq4nl[(w0      ) & 0xF];
                     a0 += yv.s1 * kvalues_iq4nl[(w0 >>  4) & 0xF];
                     a0 += yv.s2 * kvalues_iq4nl[(w0 >>  8) & 0xF];
@@ -319,7 +336,7 @@ kernel void kernel_mul_mv_iq4_xs_f32_flat_wimg(
                     const uint   we = qb + u * m;
                     const ushort w  = (ushort)((read_imageui(src0_q_img, (int)(we >> 1)).x
                                                 >> ((we & 1u) * 16u)) & 0xFFFFu);
-                    const float4 yv = vload4(grp + u, y);
+                    const float4 yv = IQ4XS_YV(grp + u, y);
                     a += yv.s0 * kvalues_iq4nl[(w      ) & 0xF];
                     a += yv.s1 * kvalues_iq4nl[(w >>  4) & 0xF];
                     a += yv.s2 * kvalues_iq4nl[(w >>  8) & 0xF];
