@@ -340,6 +340,32 @@ inline float4 iq2s_vals(uint gv, uint sg, uint base) {
 
 // Copies the compiled-in grid into a plain buffer once at init; the backend wraps
 // that buffer in the image1d_buffer the GEMV reads.
+// IQ2S_MV_AIMG=1: read the ACTIVATION through an image1d_buffer.
+//
+// The IQ3_S twin of this is +10.5% on a 3B and +2.8% on a 27B. The mechanism is
+// structural and identical here: `grp` carries no row index, so every lane of a
+// subgroup reads the SAME activation address -- a 64x redundant, wave-uniform
+// load, and a wave-uniform image read is established as free on this part while
+// LDS staging of the same redundancy measured -50%.
+//
+// One CL_RGBA/CL_FLOAT texel IS the float4 the scalar path loads, over src1's own
+// buffer, so there is no copy and no pre-pass. y_tex is this token's row:
+// (offset1/16) + col*ne10/4, and the host declines unless offset1 lands on a
+// texel and ne10 is a whole number of them.
+//
+// Applied to ALL THREE kernels in this file. Unlike IQ3_S, whose fused GLU is
+// default off, the IQ2_S fusion is default ON and serves ffn_gate+ffn_up -- so
+// texturing only the plain GEMV would leave most of the frame untouched.
+#ifndef IQ2S_MV_AIMG
+#define IQ2S_MV_AIMG 0
+#endif
+
+#if IQ2S_MV_AIMG
+#define IQ2S_YV(g) read_imagef(y_img, (int)(y_tex + (g)))
+#else
+#define IQ2S_YV(g) vload4((g), y)
+#endif
+
 kernel void kernel_iq2s_grid_export(global uint * out) {
     const uint i = get_global_id(0);
     if (i < 2048u) {
@@ -349,6 +375,7 @@ kernel void kernel_iq2s_grid_export(global uint * out) {
 
 kernel void kernel_mul_mv_iq2_s_f32_flat(
         __read_only image1d_buffer_t grid_img,
+        __read_only image1d_buffer_t y_img,   // see IQ2S_MV_AIMG
         global const uchar * src0_qs,
         global const uchar * src0_sg,
         global const uchar * src0_qh,
@@ -361,7 +388,8 @@ kernel void kernel_mul_mv_iq2_s_f32_flat(
         int ne00,
         int ne01,
         int ne10,
-        int ne0
+        int ne0,
+        uint y_off   // offset1/16, in float4 texels (IQ2S_MV_AIMG only)
 ) {
     src1 = (global const float *)((global const char *)src1 + offset1);
     dst  = (global float       *)((global char       *)dst  + offsetd);
@@ -375,6 +403,9 @@ kernel void kernel_mul_mv_iq2_s_f32_flat(
     const uint col = get_group_id(1);
 
     global const float * y = src1 + (ulong)col * (uint)ne10;
+#if IQ2S_MV_AIMG
+    const uint y_tex = y_off + col * ((uint)ne10 >> 2);
+#endif
 
 #if IQ2S_MV_GRIDIMG
 #define IQ2S_GRID(i) (read_imageui(grid_img, (int)(i)).x)
@@ -431,8 +462,8 @@ kernel void kernel_mul_mv_iq2_s_f32_flat(
                         const uint s1  = (sgv >> 8) & 0xFFu;
 
                         const uint grp = (ib * 64u + sb * 8u) + l * 2u;   // K/4 group
-                        const float4 y0 = vload4(grp + 0u, y);
-                        const float4 y1 = vload4(grp + 1u, y);
+                        const float4 y0 = IQ2S_YV(grp + 0u);
+                        const float4 y1 = IQ2S_YV(grp + 1u);
                         a0 += dot(y0, iq2s_vals(IQ2S_GRID(2u*gi0 + 0u), s0, 0u));
                         a0 += dot(y1, iq2s_vals(IQ2S_GRID(2u*gi0 + 1u), s0, 4u));
                         a1 += dot(y0, iq2s_vals(IQ2S_GRID(2u*gi1 + 0u), s1, 0u));
@@ -472,8 +503,8 @@ kernel void kernel_mul_mv_iq2_s_f32_flat(
                         const uint sgv = (uint)src0_sg[gb + l * m];
 
                         const uint grp = (ib * 64u + sb * 8u) + l * 2u;
-                        a += dot(vload4(grp + 0u, y), iq2s_vals(IQ2S_GRID(2u*gi + 0u), sgv, 0u));
-                        a += dot(vload4(grp + 1u, y), iq2s_vals(IQ2S_GRID(2u*gi + 1u), sgv, 4u));
+                        a += dot(IQ2S_YV(grp + 0u), iq2s_vals(IQ2S_GRID(2u*gi + 0u), sgv, 0u));
+                        a += dot(IQ2S_YV(grp + 1u), iq2s_vals(IQ2S_GRID(2u*gi + 1u), sgv, 4u));
                     }
                     acc += (0.5f + (float)nib) * a;
                 }
@@ -579,6 +610,7 @@ inline float iq2s_glu_apply(int glu_op, float g, float u) {
 
 kernel void kernel_mul_mv_iq2_s_f32_flat_glu(
         __read_only image1d_buffer_t grid_img,
+        __read_only image1d_buffer_t y_img,   // see IQ2S_MV_AIMG
         global const uchar * g_qs,
         global const uchar * g_sg,
         global const uchar * g_qh,
@@ -597,7 +629,8 @@ kernel void kernel_mul_mv_iq2_s_f32_flat_glu(
         int ne01,
         int ne10,
         int ne0,
-        int glu_op
+        int glu_op,
+        uint y_off   // offset1/16, in float4 texels (IQ2S_MV_AIMG only)
 ) {
     src1 = (global const float *)((global const char *)src1 + offset1);
     dst  = (global float       *)((global char       *)dst  + offsetd);
@@ -611,6 +644,9 @@ kernel void kernel_mul_mv_iq2_s_f32_flat_glu(
     const uint col = get_group_id(1);
 
     global const float * y = src1 + (ulong)col * (uint)ne10;
+#if IQ2S_MV_AIMG
+    const uint y_tex = y_off + col * ((uint)ne10 >> 2);
+#endif
 
 #if IQ2S_MV_GRIDIMG
 #define IQ2S_GGRID(i) (read_imageui(grid_img, (int)(i)).x)
@@ -659,8 +695,8 @@ kernel void kernel_mul_mv_iq2_s_f32_flat_glu(
 
                         // the activation is read ONCE and used by both streams
                         const uint grp = (ib * 64u + sb * 8u) + l * 2u;
-                        const float4 y0 = vload4(grp + 0u, y);
-                        const float4 y1 = vload4(grp + 1u, y);
+                        const float4 y0 = IQ2S_YV(grp + 0u);
+                        const float4 y1 = IQ2S_YV(grp + 1u);
 
                         const uint gqsv = (uint)gqsu[gb + l * mh];
                         const uint gsgv = (uint)gsgu[gb + l * mh];
@@ -759,6 +795,7 @@ kernel void kernel_mul_mv_iq2_s_f32_flat_glu(
 
 kernel void kernel_mul_mv_iq2_s_f32_flat_splitk(
         __read_only image1d_buffer_t grid_img,
+        __read_only image1d_buffer_t y_img,   // see IQ2S_MV_AIMG
         global const uchar * src0_qs,
         global const uchar * src0_sg,
         global const uchar * src0_qh,
@@ -769,7 +806,8 @@ kernel void kernel_mul_mv_iq2_s_f32_flat_splitk(
         global float * partial,
         int ne00,
         int ne01,
-        int ne10
+        int ne10,
+        uint y_off   // offset1/16, in float4 texels (IQ2S_MV_AIMG only)
 ) {
     src1 = (global const float *)((global const char *)src1 + offset1);
 
@@ -788,6 +826,9 @@ kernel void kernel_mul_mv_iq2_s_f32_flat_splitk(
     const uint ib1 = (nsb * (ks + 1u)) / nks;
 
     global const float * y = src1 + (ulong)col * (uint)ne10;
+#if IQ2S_MV_AIMG
+    const uint y_tex = y_off + col * ((uint)ne10 >> 2);
+#endif
 
 #if IQ2S_MV_GRIDIMG
 #define IQ2S_SKGRID(i) (read_imageui(grid_img, (int)(i)).x)
@@ -832,8 +873,8 @@ kernel void kernel_mul_mv_iq2_s_f32_flat_splitk(
                         const uint s1  = (sgv >> 8) & 0xFFu;
 
                         const uint grp = (ib * 64u + sb * 8u) + l * 2u;
-                        const float4 y0 = vload4(grp + 0u, y);
-                        const float4 y1 = vload4(grp + 1u, y);
+                        const float4 y0 = IQ2S_YV(grp + 0u);
+                        const float4 y1 = IQ2S_YV(grp + 1u);
                         a0 += dot(y0, iq2s_vals(IQ2S_SKGRID(2u*gi0 + 0u), s0, 0u));
                         a0 += dot(y1, iq2s_vals(IQ2S_SKGRID(2u*gi0 + 1u), s0, 4u));
                         a1 += dot(y0, iq2s_vals(IQ2S_SKGRID(2u*gi1 + 0u), s1, 0u));

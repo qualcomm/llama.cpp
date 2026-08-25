@@ -2186,6 +2186,13 @@ static int ggml_cl_iq4xs_mv_r4() {
 // like every other texture path here.
 static int ggml_cl_gridimg_default(const ggml_backend_opencl_context * backend_ctx, const char * env);
 
+// The IQ2_S twin. Same wave-uniform activation read, and applied to all three
+// kernels in that file -- its fused GLU is default ON and serves ffn_gate+ffn_up,
+// so texturing only the plain GEMV would leave most of the decode frame alone.
+static int ggml_cl_iq2s_mv_aimg(const ggml_backend_opencl_context * backend_ctx) {
+    return ggml_cl_gridimg_default(backend_ctx, "GGML_OPENCL_IQ2S_MV_AIMG");
+}
+
 static int ggml_cl_iq3s_mv_aimg(const ggml_backend_opencl_context * backend_ctx) {
     return ggml_cl_gridimg_default(backend_ctx, "GGML_OPENCL_IQ3S_MV_AIMG");
 }
@@ -3073,6 +3080,41 @@ static void ggml_cl_make_grid_image(ggml_backend_opencl_context * backend_ctx,
 // Not every device exposes every channel order for an image1d_buffer, and
 // clCreateImage failing inside CL_CHECK would abort the process at init. Ask
 // first, once, and let the caller decline instead.
+// An image1d_buffer view of an activation tensor, for the decode GEMVs whose
+// activation read is wave-uniform (every lane of a subgroup reads the same
+// address). One CL_RGBA/CL_FLOAT texel is exactly the float4 those kernels load,
+// and the view is over src1's OWN buffer, so there is no copy and no pre-pass.
+//
+// Returns nullptr when the shape cannot be expressed as whole texels; callers
+// pass their grid image instead, since the kernel argument must be a valid image
+// either way, and the kernel ignores it when its AIMG define is 0.
+// *tex_off receives the texel index of the tensor's first element.
+static cl_mem ggml_cl_activation_image(ggml_backend_opencl_context * backend_ctx,
+                                       cl_mem buf, cl_ulong offset1,
+                                       int ne10, int ne11, cl_uint * tex_off) {
+    *tex_off = 0;
+    if ((offset1 % 16) != 0 || (ne10 % 4) != 0) {
+        return nullptr;
+    }
+    const size_t texels = (size_t)(offset1 / 16) + (size_t)ne11 * (size_t)(ne10 / 4);
+    if (texels == 0 || texels > backend_ctx->image_max_buffer_size) {
+        return nullptr;
+    }
+    cl_image_format fmt = { CL_RGBA, CL_FLOAT };
+    cl_image_desc   desc;
+    memset(&desc, 0, sizeof(desc));
+    desc.image_type  = CL_MEM_OBJECT_IMAGE1D_BUFFER;
+    desc.image_width = texels;
+    desc.buffer      = buf;
+    cl_int err = CL_SUCCESS;
+    cl_mem img = clCreateImage(backend_ctx->context, CL_MEM_READ_ONLY, &fmt, &desc, NULL, &err);
+    if (err != CL_SUCCESS) {
+        return nullptr;
+    }
+    *tex_off = (cl_uint)(offset1 / 16);
+    return img;
+}
+
 static bool ggml_cl_has_rg_uint32_image(ggml_backend_opencl_context * backend_ctx) {
     static int cached = -1;
     if (cached >= 0) {
@@ -4154,6 +4196,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         opts += " -DIQ2S_MV_LDSGRID=" + std::to_string(ggml_cl_iq2s_mv_ldsgrid());
         opts += " -DIQ2S_MV_GRIDIMG=" + std::to_string(ggml_cl_iq2s_mv_gridimg(backend_ctx));
         opts += " -DIQ2S_MV_SIGNXOR=" + std::to_string(ggml_cl_iq2s_mv_signxor());
+        opts += " -DIQ2S_MV_AIMG=" + std::to_string(ggml_cl_iq2s_mv_aimg(backend_ctx));
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), opts);
 
@@ -24298,7 +24341,13 @@ static void ggml_cl_mul_mat_iq2_s_glu_fused(ggml_backend_t backend, ggml_tensor 
     const int nsg = ggml_cl_iq2s_mv_nsg();
 
     cl_int ai = 0;
+    cl_uint iq2s_y_off = 0;
+    cl_mem  iq2s_y_img = ggml_cl_iq2s_mv_aimg(backend_ctx)
+        ? ggml_cl_activation_image(backend_ctx, extra1->data_device, offset1, ne10, ne11, &iq2s_y_off)
+        : nullptr;
+    cl_mem  iq2s_y_arg = iq2s_y_img ? iq2s_y_img : backend_ctx->iq2s_grid_img;
     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &backend_ctx->iq2s_grid_img));
+    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &iq2s_y_arg));
     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex_g->qs));
     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex_g->sg));
     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex_g->qh));
@@ -24323,7 +24372,9 @@ static void ggml_cl_mul_mat_iq2_s_glu_fused(ggml_backend_t backend, ggml_tensor 
     size_t f_global[3] = { CEIL_DIV((size_t)ne01, (size_t)128) * 64,
                            (size_t)ne11 * (size_t)nsg, 1 };
     size_t f_local[3]  = { 64, (size_t)nsg, 1 };
+    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_uint), &iq2s_y_off));
     backend_ctx->enqueue_ndrange_kernel(fk, 3, f_global, f_local, (ggml_tensor *)dst);
+    if (iq2s_y_img) { CL_CHECK(clReleaseMemObject(iq2s_y_img)); }
 #else
     GGML_UNUSED(backend); GGML_UNUSED(gate_tensor);
     GGML_UNUSED(up_tensor); GGML_UNUSED(glu_tensor);
@@ -36872,30 +36923,11 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     cl_kernel fk = backend_ctx->kernel_mul_mv_iq3_s_f32_flat;
                     const int nsg = ggml_cl_iq3s_mv_nsg();
                     cl_int ai = 0;
-                    // Activation as a texture. One CL_RGBA/CL_FLOAT texel IS the float4 the
-                    // scalar path loads, over src1's own buffer, so there is no copy. Declined
-                    // unless the offset lands on a texel and the row stride is a whole number
-                    // of them; the kernel argument still has to be a valid image either way,
-                    // so the grid image stands in when the path is off.
-                    cl_mem   iq3s_y_img = nullptr;
-                    cl_uint  iq3s_y_off = 0;
-                    if (ggml_cl_iq3s_mv_aimg(backend_ctx) && (offset1 % 16) == 0 && (ne10 % 4) == 0) {
-                        const size_t texels = (size_t)(offset1 / 16)
-                                            + (size_t)ne11 * (size_t)(ne10 / 4);
-                        if (texels > 0 && texels <= backend_ctx->image_max_buffer_size) {
-                            cl_image_format yf = { CL_RGBA, CL_FLOAT };
-                            cl_image_desc   yd;
-                            memset(&yd, 0, sizeof(yd));
-                            yd.image_type  = CL_MEM_OBJECT_IMAGE1D_BUFFER;
-                            yd.image_width = texels;
-                            yd.buffer      = extra1->data_device;
-                            cl_int yerr = CL_SUCCESS;
-                            iq3s_y_img = clCreateImage(backend_ctx->context, CL_MEM_READ_ONLY, &yf, &yd, NULL, &yerr);
-                            if (yerr != CL_SUCCESS) { iq3s_y_img = nullptr; }
-                            else { iq3s_y_off = (cl_uint)(offset1 / 16); }
-                        }
-                    }
-                    cl_mem iq3s_y_arg = iq3s_y_img ? iq3s_y_img : backend_ctx->iq3s_grid_img;
+                    cl_uint iq3s_y_off = 0;
+                    cl_mem  iq3s_y_img = ggml_cl_iq3s_mv_aimg(backend_ctx)
+                        ? ggml_cl_activation_image(backend_ctx, extra1->data_device, offset1, ne10, ne11, &iq3s_y_off)
+                        : nullptr;
+                    cl_mem  iq3s_y_arg = iq3s_y_img ? iq3s_y_img : backend_ctx->iq3s_grid_img;
                     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &backend_ctx->iq3s_grid_img));
                     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &iq3s_y_arg));
                     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->qs));
@@ -37308,7 +37340,13 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     cl_kernel fk = backend_ctx->kernel_mul_mv_iq2_s_f32_flat;
                     const int nsg = ggml_cl_iq2s_mv_nsg();
                     cl_int ai = 0;
+                    cl_uint iq2s_y_off = 0;
+                    cl_mem  iq2s_y_img = ggml_cl_iq2s_mv_aimg(backend_ctx)
+                        ? ggml_cl_activation_image(backend_ctx, extra1->data_device, offset1, ne10, ne11, &iq2s_y_off)
+                        : nullptr;
+                    cl_mem  iq2s_y_arg = iq2s_y_img ? iq2s_y_img : backend_ctx->iq2s_grid_img;
                     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &backend_ctx->iq2s_grid_img));
+                    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &iq2s_y_arg));
                     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->qs));
                     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->sg));
                     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->qh));
@@ -37327,7 +37365,9 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     size_t f_global[3] = { CEIL_DIV((size_t)ne01, rows_wg) * 64,
                                            (size_t)ne11 * (size_t)nsg, 1 };
                     size_t f_local[3]  = { 64, (size_t)nsg, 1 };
+                    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_uint), &iq2s_y_off));
                     backend_ctx->enqueue_ndrange_kernel(fk, 3, f_global, f_local, dst);
+                    if (iq2s_y_img) { CL_CHECK(clReleaseMemObject(iq2s_y_img)); }
                     return;
                 }
 
@@ -39433,30 +39473,11 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 cl_kernel fk = backend_ctx->kernel_mul_mv_iq3_s_f32_flat;
                 const int nsg = ggml_cl_iq3s_mv_nsg();
                 cl_int ai = 0;
-                // Activation as a texture. One CL_RGBA/CL_FLOAT texel IS the float4 the
-                // scalar path loads, over src1's own buffer, so there is no copy. Declined
-                // unless the offset lands on a texel and the row stride is a whole number
-                // of them; the kernel argument still has to be a valid image either way,
-                // so the grid image stands in when the path is off.
-                cl_mem   iq3s_y_img = nullptr;
-                cl_uint  iq3s_y_off = 0;
-                if (ggml_cl_iq3s_mv_aimg(backend_ctx) && (offset1 % 16) == 0 && (ne10 % 4) == 0) {
-                    const size_t texels = (size_t)(offset1 / 16)
-                                        + (size_t)ne11 * (size_t)(ne10 / 4);
-                    if (texels > 0 && texels <= backend_ctx->image_max_buffer_size) {
-                        cl_image_format yf = { CL_RGBA, CL_FLOAT };
-                        cl_image_desc   yd;
-                        memset(&yd, 0, sizeof(yd));
-                        yd.image_type  = CL_MEM_OBJECT_IMAGE1D_BUFFER;
-                        yd.image_width = texels;
-                        yd.buffer      = extra1->data_device;
-                        cl_int yerr = CL_SUCCESS;
-                        iq3s_y_img = clCreateImage(backend_ctx->context, CL_MEM_READ_ONLY, &yf, &yd, NULL, &yerr);
-                        if (yerr != CL_SUCCESS) { iq3s_y_img = nullptr; }
-                        else { iq3s_y_off = (cl_uint)(offset1 / 16); }
-                    }
-                }
-                cl_mem iq3s_y_arg = iq3s_y_img ? iq3s_y_img : backend_ctx->iq3s_grid_img;
+                cl_uint iq3s_y_off = 0;
+                cl_mem  iq3s_y_img = ggml_cl_iq3s_mv_aimg(backend_ctx)
+                    ? ggml_cl_activation_image(backend_ctx, extra1->data_device, offset1, ne10, ne11, &iq3s_y_off)
+                    : nullptr;
+                cl_mem  iq3s_y_arg = iq3s_y_img ? iq3s_y_img : backend_ctx->iq3s_grid_img;
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &backend_ctx->iq3s_grid_img));
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &iq3s_y_arg));
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->qs));
@@ -39681,7 +39702,13 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 
                     cl_kernel sk = backend_ctx->kernel_mul_mv_iq2_s_f32_flat_splitk;
                     cl_int ai = 0;
+                    cl_uint iq2s_y_off = 0;
+                    cl_mem  iq2s_y_img = ggml_cl_iq2s_mv_aimg(backend_ctx)
+                        ? ggml_cl_activation_image(backend_ctx, extra1->data_device, offset1, ne10, ne11, &iq2s_y_off)
+                        : nullptr;
+                    cl_mem  iq2s_y_arg = iq2s_y_img ? iq2s_y_img : backend_ctx->iq2s_grid_img;
                     CL_CHECK(clSetKernelArg(sk, ai++, sizeof(cl_mem),   &backend_ctx->iq2s_grid_img));
+                    CL_CHECK(clSetKernelArg(sk, ai++, sizeof(cl_mem),   &iq2s_y_arg));
                     CL_CHECK(clSetKernelArg(sk, ai++, sizeof(cl_mem),   &ex0->qs));
                     CL_CHECK(clSetKernelArg(sk, ai++, sizeof(cl_mem),   &ex0->sg));
                     CL_CHECK(clSetKernelArg(sk, ai++, sizeof(cl_mem),   &ex0->qh));
@@ -39695,7 +39722,9 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     CL_CHECK(clSetKernelArg(sk, ai++, sizeof(int),      &ne10));
                     size_t s_global[3] = { (size_t)base_wg * 64, (size_t)nsg, (size_t)ksplit };
                     size_t s_local[3]  = { 64, (size_t)nsg, 1 };
+                    CL_CHECK(clSetKernelArg(sk, ai++, sizeof(cl_uint), &iq2s_y_off));
                     backend_ctx->enqueue_ndrange_kernel(sk, 3, s_global, s_local, dst);
+                    if (iq2s_y_img) { CL_CHECK(clReleaseMemObject(iq2s_y_img)); }
 
                     cl_kernel rk = backend_ctx->kernel_gemv_splitk_reduce_f32;
                     cl_int ri = 0;
@@ -39720,7 +39749,13 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 cl_kernel fk = backend_ctx->kernel_mul_mv_iq2_s_f32_flat;
                 const int nsg = ggml_cl_iq2s_mv_nsg();
                 cl_int ai = 0;
+                cl_uint iq2s_y_off = 0;
+                cl_mem  iq2s_y_img = ggml_cl_iq2s_mv_aimg(backend_ctx)
+                    ? ggml_cl_activation_image(backend_ctx, extra1->data_device, offset1, ne10, ne11, &iq2s_y_off)
+                    : nullptr;
+                cl_mem  iq2s_y_arg = iq2s_y_img ? iq2s_y_img : backend_ctx->iq2s_grid_img;
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &backend_ctx->iq2s_grid_img));
+                CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &iq2s_y_arg));
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->qs));
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->sg));
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->qh));
@@ -39739,7 +39774,9 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 size_t f_global[3] = { CEIL_DIV((size_t)ne01, rows_wg) * 64,
                                        (size_t)ne11 * (size_t)nsg, 1 };
                 size_t f_local[3]  = { 64, (size_t)nsg, 1 };
+                CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_uint), &iq2s_y_off));
                 backend_ctx->enqueue_ndrange_kernel(fk, 3, f_global, f_local, dst);
+                if (iq2s_y_img) { CL_CHECK(clReleaseMemObject(iq2s_y_img)); }
                 return;
             }
 
