@@ -9579,6 +9579,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                              GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M,
                              GGML_TYPE_Q2_K, GGML_TYPE_Q3_K}) {
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 6680, 1, 3072, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 6656, 1, 3072, {1, 1}, {1, 1}));
     }
 
     // sycl backend will limit task global_range < MAX_INT
