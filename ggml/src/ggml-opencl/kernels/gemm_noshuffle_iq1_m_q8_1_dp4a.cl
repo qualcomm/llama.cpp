@@ -93,6 +93,37 @@
 #ifndef IQ1M_GEMM_FOLD
 #define IQ1M_GEMM_FOLD 1
 #endif
+
+// IQ1M_GEMM_BIAS=1: read a PRE-BIASED dp4a operand and drop the delta correction
+// entirely.
+//
+// After the fold this kernel is 8 dp4a + 9 float ops per column per 32-K step,
+// and four of those nine are the delta term -- dt_j * s8[c][j], the per-8-weight
+// activation sum times a row-dependent sign. It exists because the weight value
+// is dl*(g - 1 +- 0.125), which is not an integer, so the dp4a can only carry the
+// g part and the rest has to be added back.
+//
+// Multiply through by eight and it IS an integer: 8g - 8 +- 1, with g in {0,1,2},
+// so the operand is one of {-9,-7,-1,1,7,9} and fits int8 with room to spare
+// (|acc| <= 9*127*32 = 36576 across a whole 32-block, and dot_acc_sat saturates
+// anyway). Fold the 1/8 into dl and the dot is EXACT: no correction, no per-8
+// activation sums, no sh_s8 staging and no LDS for it.
+//
+// It cannot be computed from the packed grid in registers -- subtracting a
+// constant from each byte borrows across byte lanes -- so it is a TABLE, built
+// once at init by kernel_iq1m_bias_export and indexed by (grid entry, sign bit).
+//
+// 🔑 The table is CL_RG, not CL_R. One texel carries BOTH operand halves, so a
+// group still costs ONE image fetch. That matters more than the arithmetic: this
+// family's kernels are gather-bound, and doubling the codebook gather is exactly
+// what sank the IQ3_S GLU fusion (-4.9%). A CL_R table would have needed two
+// fetches per group and would probably have lost for the same reason.
+//
+// Costs 32 KB of device memory for the table, built once, shared by every IQ1_M
+// tensor.
+#ifndef IQ1M_GEMM_BIAS
+#define IQ1M_GEMM_BIAS 0
+#endif
 constant uint iq1s_grid_gpu[2048] = {
     0x00000000, 0x00000002, 0x00000101, 0x00000200, 0x00000202, 0x00010001, 0x00010101, 0x00020000,
     0x00020002, 0x00020200, 0x00020202, 0x01000101, 0x01010001, 0x01010100, 0x01010102, 0x01020101,
@@ -381,9 +412,33 @@ inline int dot4_q8a_v(uint a0, uint a1, uint a2, uint a3, uint4 y) {
     return r;
 }
 
+// Builds the pre-biased dp4a operand table described above. One work item per
+// texel: t = 2*grid_index + sign_bit, out[2t] = weights 0..3, out[2t+1] = 4..7,
+// each byte 8*g - 8 -+ 1. The grid uint packs weight n in the low nibble of byte n
+// and weight n+4 in the high nibble, which is how the kernel below unpacks it.
+kernel void kernel_iq1m_bias_export(global uint * out) {
+    const uint t = get_global_id(0);
+    if (t >= 4096u) {
+        return;
+    }
+    const uint g = iq1s_grid_gpu[t >> 1];
+    // sign bit set -> dt = -1 - 0.125 -> 8g - 9;  clear -> 8g - 7
+    const int  b = (t & 1u) ? -9 : -7;
+    uint lo = 0u, hi = 0u;
+    for (uint n = 0; n < 4u; ++n) {
+        const int v0 = 8 * (int)((g >> (8u*n     )) & 0xFu) + b;
+        const int v1 = 8 * (int)((g >> (8u*n + 4u)) & 0xFu) + b;
+        lo |= ((uint)(v0 & 0xFF)) << (8u*n);
+        hi |= ((uint)(v1 & 0xFF)) << (8u*n);
+    }
+    out[2u*t + 0u] = lo;
+    out[2u*t + 1u] = hi;
+}
+
 __attribute__((qcom_wave_pair_mode(1)))
 kernel void kernel_gemm_noshuffle_iq1_m_q8_1_dp4a(
         __read_only image1d_buffer_t grid_img,   // see IQ1M_GEMM_GRIDIMG
+        __read_only image1d_buffer_t bias_img,   // see IQ1M_GEMM_BIAS (CL_RG)
         __global const uchar  * src0_qs,
         __global const uchar  * src0_qh,
         __global const ushort * src0_sc,
@@ -410,7 +465,9 @@ kernel void kernel_gemm_noshuffle_iq1_m_q8_1_dp4a(
     const uint k_b = (uint)k >> 5;
 
     __local uint4 sh_qa4[TILESIZE_N][2];
+#if !IQ1M_GEMM_BIAS
     __local float sh_s8[TILESIZE_N][4];   // per-8-weight activation sums, in qa units
+#endif
     __local half  sh_da[TILESIZE_N];
 
 #if IQ1M_GEMM_GRIDIMG
@@ -463,6 +520,36 @@ kernel void kernel_gemm_noshuffle_iq1_m_q8_1_dp4a(
         uint  qa0, qb0, qa1, qb1, qa2, qb2, qa3, qb3;
         // dl is per SIXTEEN weights: groups 0,1 share one and groups 2,3 the other
         float dl0, dl2;
+#if IQ1M_GEMM_BIAS
+        // one CL_RG fetch per group: .x = weights 0..3, .y = 4..7, pre-biased.
+        // The 1/8 that makes 8g-8+-1 an integer is folded into the scale.
+        {
+            const uint i0 = 2u * ((uint)src0_qs[qsb + 0u * (uint)m] | ((qh0 & 7u) << 8))
+                          + ((qh0 >> 3) & 1u);
+            const uint2 v = read_imageui(bias_img, (int)i0).xy;
+            qa0 = v.x; qb0 = v.y;
+            dl0 = dsuper * (float)(2u * ((scw >> shb) & 7u) + 1u) * 0.125f;
+        }
+        {
+            const uint i1 = 2u * ((uint)src0_qs[qsb + 1u * (uint)m] | (((qh0 >> 4) & 7u) << 8))
+                          + ((qh0 >> 7) & 1u);
+            const uint2 v = read_imageui(bias_img, (int)i1).xy;
+            qa1 = v.x; qb1 = v.y;
+        }
+        {
+            const uint i2 = 2u * ((uint)src0_qs[qsb + 2u * (uint)m] | ((qh1 & 7u) << 8))
+                          + ((qh1 >> 3) & 1u);
+            const uint2 v = read_imageui(bias_img, (int)i2).xy;
+            qa2 = v.x; qb2 = v.y;
+            dl2 = dsuper * (float)(2u * ((scw >> (shb + 3u)) & 7u) + 1u) * 0.125f;
+        }
+        {
+            const uint i3 = 2u * ((uint)src0_qs[qsb + 3u * (uint)m] | (((qh1 >> 4) & 7u) << 8))
+                          + ((qh1 >> 7) & 1u);
+            const uint2 v = read_imageui(bias_img, (int)i3).xy;
+            qa3 = v.x; qb3 = v.y;
+        }
+#else
         float dt0, dt1, dt2, dt3;
         {
             const uint g = IQ1M_GRID((uint)src0_qs[qsb + 0u * (uint)m] | (((qh0 & 7u) << 8)));
@@ -486,6 +573,7 @@ kernel void kernel_gemm_noshuffle_iq1_m_q8_1_dp4a(
             qa3 = g & 0x0F0F0F0Fu;  qb3 = (g >> 4) & 0x0F0F0F0Fu;
             dt3 = (qh1 & 0x80u) ? (-1.f - IQ1M_DELTA) : (-1.f + IQ1M_DELTA);
         }
+#endif
 
         // one (column, uint4) slot per lane -- 32 columns x 2 uint4s is exactly the
         // 64 lanes -- and each uint4 covers TWO 8-weight groups, so both of their
@@ -498,6 +586,7 @@ kernel void kernel_gemm_noshuffle_iq1_m_q8_1_dp4a(
             const uint4 w = ok ? vload4(0, src1_qa + c * k_u + (step >> 2) + (v << 2))
                                : (uint4)(0u);
             sh_qa4[t][v] = w;
+#if !IQ1M_GEMM_BIAS
             int s0 = 0, s1 = 0;
             s0 = dot_acc_sat_4x8packed_ss_int(w.x, 0x01010101u, s0);
             s0 = dot_acc_sat_4x8packed_ss_int(w.y, 0x01010101u, s0);
@@ -505,6 +594,7 @@ kernel void kernel_gemm_noshuffle_iq1_m_q8_1_dp4a(
             s1 = dot_acc_sat_4x8packed_ss_int(w.w, 0x01010101u, s1);
             sh_s8[t][2u*v + 0u] = (float)s0;
             sh_s8[t][2u*v + 1u] = (float)s1;
+#endif
         }
         if (lid < TILESIZE_N) {
             const uint c = col_base + lid;
@@ -513,7 +603,10 @@ kernel void kernel_gemm_noshuffle_iq1_m_q8_1_dp4a(
         barrier(CLK_LOCAL_MEM_FENCE);
 
 #define LD4(arr, b) ((float4)((float)arr[(b)+0], (float)arr[(b)+1], (float)arr[(b)+2], (float)arr[(b)+3]))
-#if IQ1M_GEMM_FOLD
+#if IQ1M_GEMM_BIAS
+#define IQ1M_COL(b) ( dl0 * (float)dot4_q8a_v(qa0, qb0, qa1, qb1, (uint4)(sh_qa4[b][0])) \
+                    + dl2 * (float)dot4_q8a_v(qa2, qb2, qa3, qb3, (uint4)(sh_qa4[b][1])) )
+#elif IQ1M_GEMM_FOLD
 #define IQ1M_COL(b) ( dl0 * ((float)dot4_q8a_v(qa0, qb0, qa1, qb1, (uint4)(sh_qa4[b][0])) \
                              + dt0 * sh_s8[b][0] + dt1 * sh_s8[b][1]) \
                     + dl2 * ((float)dot4_q8a_v(qa2, qb2, qa3, qb3, (uint4)(sh_qa4[b][1])) \

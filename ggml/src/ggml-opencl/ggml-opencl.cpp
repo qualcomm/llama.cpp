@@ -1930,6 +1930,8 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_convert_block_iq1_m_ns = nullptr;  // IQ1_M AoS -> planes
     cl_kernel kernel_restore_block_iq1_m_ns = nullptr;  // IQ1_M planes -> AoS
     cl_kernel kernel_gemm_noshuffle_iq1_m_q8_1_dp4a = nullptr;  // dp4a (int8) dense IQ1_M prefill GEMM over the plane split
+    cl_mem    iq1m_bias_buf = nullptr;   // pre-biased dp4a operand table, CL_RG (see IQ1M_GEMM_BIAS)
+    cl_mem    iq1m_bias_img = nullptr;
     cl_kernel kernel_gemm_noshuffle_q4_0_q8_1_dp4a = nullptr;  // dp4a (int8) dense q4_0 prefill GEMM
     // Narrow-tile twin for the verify band; see the q4_K pair above for the rationale.
     cl_kernel kernel_gemm_noshuffle_q4_0_q8_1_dp4a_narrow = nullptr;
@@ -2551,6 +2553,14 @@ static int ggml_cl_iq1m_gemm_gridimg(const ggml_backend_opencl_context * backend
 // as dp4a ops. Its scale is per sixteen though, so two of the four terms were
 // multiplied by a value they already had. Folding the pairs costs nothing and
 // is not a texture question, so it is not on the per-generation gate.
+// The pre-biased operand table: deletes IQ1_M's delta correction from the prefill
+// GEMM outright rather than making it cheaper. See the kernel header for why the
+// table is CL_RG. Measured before the default stands.
+static int ggml_cl_iq1m_gemm_bias() {
+    static const int v = ggml_cl_env_int("GGML_OPENCL_IQ1M_GEMM_BIAS", 0);
+    return v;
+}
+
 static int ggml_cl_iq1m_gemm_fold() {
     static const int v = ggml_cl_env_int("GGML_OPENCL_IQ1M_GEMM_FOLD", 1);
     return v;
@@ -3047,6 +3057,38 @@ static void ggml_cl_make_grid_image(ggml_backend_opencl_context * backend_ctx,
     memset(&desc, 0, sizeof(desc));
     desc.image_type  = CL_MEM_OBJECT_IMAGE1D_BUFFER;
     desc.image_width = n_uints;
+    desc.buffer      = *out_buf;
+    CL_CHECK((*out_img = clCreateImage(backend_ctx->context, CL_MEM_READ_ONLY,
+                                       &fmt, &desc, NULL, &err), err));
+}
+
+// Two-channel twin of ggml_cl_make_grid_image. One texel carries two uints, which
+// is the whole point where it is used: a table that has to deliver a PAIR of dp4a
+// operands per lookup still costs one fetch, so a gather-bound kernel does not pay
+// twice for it.
+static void ggml_cl_make_grid_image_rg(ggml_backend_opencl_context * backend_ctx,
+                                       cl_program prog, const char * export_name,
+                                       size_t n_texels, cl_mem * out_buf, cl_mem * out_img) {
+    if (*out_img) {
+        return;
+    }
+    cl_int err;
+    cl_kernel k;
+    CL_CHECK((k = clCreateKernel(prog, export_name, &err), err));
+    CL_CHECK((*out_buf = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE,
+                                        n_texels * 2 * sizeof(cl_uint), NULL, &err), err));
+    CL_CHECK(clSetKernelArg(k, 0, sizeof(cl_mem), out_buf));
+    size_t gws = n_texels;
+    size_t lws = 64;
+    CL_CHECK(clEnqueueNDRangeKernel(backend_ctx->queue, k, 1, NULL, &gws, &lws, 0, NULL, NULL));
+    CL_CHECK(clFinish(backend_ctx->queue));
+    CL_CHECK(clReleaseKernel(k));
+
+    cl_image_format fmt = { CL_RG, CL_UNSIGNED_INT32 };
+    cl_image_desc   desc;
+    memset(&desc, 0, sizeof(desc));
+    desc.image_type  = CL_MEM_OBJECT_IMAGE1D_BUFFER;
+    desc.image_width = n_texels;
     desc.buffer      = *out_buf;
     CL_CHECK((*out_img = clCreateImage(backend_ctx->context, CL_MEM_READ_ONLY,
                                        &fmt, &desc, NULL, &err), err));
@@ -7046,8 +7088,12 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         opts += " -DIQ1M_GEMM_LDSGRID=" + std::to_string(ggml_cl_iq1m_gemm_ldsgrid());
         opts += " -DIQ1M_GEMM_GRIDIMG=" + std::to_string(ggml_cl_iq1m_gemm_gridimg(backend_ctx));
         opts += " -DIQ1M_GEMM_FOLD=" + std::to_string(ggml_cl_iq1m_gemm_fold());
+        opts += " -DIQ1M_GEMM_BIAS=" + std::to_string(ggml_cl_iq1m_gemm_bias());
         cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), opts);
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_iq1_m_q8_1_dp4a = clCreateKernel(prog, "kernel_gemm_noshuffle_iq1_m_q8_1_dp4a", &err), err));
+        // 4096 texels = 2048 grid entries x 2 delta signs, 32 KB, built once
+        ggml_cl_make_grid_image_rg(backend_ctx, prog, "kernel_iq1m_bias_export", 4096,
+                                   &backend_ctx->iq1m_bias_buf, &backend_ctx->iq1m_bias_img);
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
@@ -37512,6 +37558,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                         cl_kernel dk = backend_ctx->kernel_gemm_noshuffle_iq1_m_q8_1_dp4a;
                         int ai = 0;
                         CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_mem),   &backend_ctx->iq1m_grid_img));
+                        CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_mem),   &backend_ctx->iq1m_bias_img));
                         CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_mem),   &ex0->qs));
                         CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_mem),   &ex0->qh));
                         CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_mem),   &ex0->sc));
