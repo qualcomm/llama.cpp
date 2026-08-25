@@ -49,6 +49,11 @@
 // The IQ3_S twin of this change is +43.0% prefill on a model made of the type
 // and +8.0% on a hybrid, with perplexity identical to four decimals. Same
 // defect, same fix, here. Default follows the per-generation texture gate.
+// MEASURED: Llama-3.2-3B-UD-IQ1_M pp512 617.2 -> 675.1 (+9.4%), wikitext PPL
+// 56.7210 both ways. The smallest gain of the six, and IQ1_M is 57.9% of that
+// file, so this kernel keeps a cost the image does not address -- it has no d
+// field and assembles its super-block scale from four nibbles. Left as the
+// obvious next thing to look at in this family.
 #ifndef IQ1M_GEMM_GRIDIMG
 #define IQ1M_GEMM_GRIDIMG 0
 #endif

@@ -43,6 +43,8 @@
 // The IQ3_S twin of this change is +43.0% prefill on a model made of the type
 // and +8.0% on a hybrid, with perplexity identical to four decimals. Same
 // defect, same fix, here. Default follows the per-generation texture gate.
+// MEASURED: Llama-3.2-3B-UD-IQ1_S pp512 788.7 -> 945.8 (+19.9%), wikitext PPL
+// 96.9777 both ways. IQ1_S is 51% of that file's prefill GPU time.
 #ifndef IQ1S_GEMM_GRIDIMG
 #define IQ1S_GEMM_GRIDIMG 0
 #endif

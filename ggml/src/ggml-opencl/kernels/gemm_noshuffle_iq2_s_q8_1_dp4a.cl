@@ -44,6 +44,8 @@
 // The IQ3_S twin of this change is +43.0% prefill on a model made of the type
 // and +8.0% on a hybrid, with perplexity identical to four decimals. Same
 // defect, same fix, here. Default follows the per-generation texture gate.
+// MEASURED: Llama-3.2-3B-UD-IQ2_M pp512 690.2 -> 861.2 (+24.8%), wikitext PPL
+// 14.8367 both ways. IQ2_S is the largest share of that file.
 #ifndef IQ2S_GEMM_GRIDIMG
 #define IQ2S_GEMM_GRIDIMG 0
 #endif

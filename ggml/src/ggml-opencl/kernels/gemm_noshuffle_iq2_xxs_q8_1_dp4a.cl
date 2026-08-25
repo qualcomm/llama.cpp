@@ -45,6 +45,9 @@
 // The IQ3_S twin of this change is +43.0% prefill on a model made of the type
 // and +8.0% on a hybrid, with perplexity identical to four decimals. Same
 // defect, same fix, here. Default follows the per-generation texture gate.
+// PARTIAL COVERAGE: no model on hand is mostly IQ2_XXS at prefill. It is 11.6%
+// of UD-IQ1_S and 14.0% of UD-IQ1_M, both of which gained overall (+19.9% and
+// +9.4%), so this kernel is included in those numbers but not isolated by them.
 #ifndef IQ2XXS_GEMM_GRIDIMG
 #define IQ2XXS_GEMM_GRIDIMG 0
 #endif
