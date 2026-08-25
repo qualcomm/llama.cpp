@@ -37619,6 +37619,66 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             break;
         }
         case GGML_TYPE_IQ3_S: {
+            // dp4a twin; see the sibling site and the kernel header. This is the
+            // dispatch DECODE actually reaches, so it must carry the branch too --
+            // grafting it onto only one of the two made the whole A/B vacuous.
+            if (ggml_cl_iq3s_mv_dp4a()
+                    && backend_ctx->kernel_mul_mv_iq3_s_f32_flat_dp4a
+                    && backend_ctx->has_integer_dot_product
+                    && ggml_cl_iq3s_is_split(backend_ctx, src0)
+                    && ne00 % 256 == 0
+                    && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1) {
+                ggml_tensor_extra_cl_iq3_s * exq =
+                    (ggml_tensor_extra_cl_iq3_s *)src0->extra;
+                const size_t nblk = (size_t)ne11 * ((size_t)ne00 / 32);
+                cl_int qerr = CL_SUCCESS;
+                cl_mem a_sub = nullptr;
+                cl_buffer_region reg;
+                reg.origin = offset1;
+                reg.size   = (size_t)ne00 * (size_t)ne11 * sizeof(float);
+                CL_CHECK((a_sub = clCreateSubBuffer(extra1->data_device, 0,
+                    CL_BUFFER_CREATE_TYPE_REGION, &reg, &qerr), qerr));
+                backend_ctx->prealloc_moe_qa.allocate(backend_ctx->context,
+                    (size_t)ne00 * (size_t)ne11 * sizeof(cl_char));
+                backend_ctx->prealloc_moe_da.allocate(backend_ctx->context, nblk * sizeof(cl_half));
+                backend_ctx->prealloc_moe_sa.allocate(backend_ctx->context, nblk * sizeof(cl_half));
+
+                cl_int tb = (cl_int)nblk;
+                cl_kernel qk = backend_ctx->kernel_quant_a_q8_1;
+                CL_CHECK(clSetKernelArg(qk, 0, sizeof(cl_mem), &a_sub));
+                CL_CHECK(clSetKernelArg(qk, 1, sizeof(cl_mem), &backend_ctx->prealloc_moe_qa.buffer));
+                CL_CHECK(clSetKernelArg(qk, 2, sizeof(cl_mem), &backend_ctx->prealloc_moe_da.buffer));
+                CL_CHECK(clSetKernelArg(qk, 3, sizeof(cl_mem), &backend_ctx->prealloc_moe_sa.buffer));
+                CL_CHECK(clSetKernelArg(qk, 4, sizeof(cl_int), &tb));
+                size_t ql[1] = { 64 };
+                size_t qg[1] = { (size_t)(((nblk + 63) / 64) * 64) };
+                backend_ctx->enqueue_ndrange_kernel(qk, 1, qg, ql, dst);
+
+                cl_kernel dk = backend_ctx->kernel_mul_mv_iq3_s_f32_flat_dp4a;
+                const int nsgd = ggml_cl_iq3s_mv_nsg();
+                cl_int di = 0;
+                CL_CHECK(clSetKernelArg(dk, di++, sizeof(cl_mem),   &backend_ctx->iq3s_grid_img));
+                CL_CHECK(clSetKernelArg(dk, di++, sizeof(cl_mem),   &exq->qs));
+                CL_CHECK(clSetKernelArg(dk, di++, sizeof(cl_mem),   &exq->qh));
+                CL_CHECK(clSetKernelArg(dk, di++, sizeof(cl_mem),   &exq->sg));
+                CL_CHECK(clSetKernelArg(dk, di++, sizeof(cl_mem),   &exq->sc));
+                CL_CHECK(clSetKernelArg(dk, di++, sizeof(cl_mem),   &exq->d));
+                CL_CHECK(clSetKernelArg(dk, di++, sizeof(cl_mem),   &backend_ctx->prealloc_moe_qa.buffer));
+                CL_CHECK(clSetKernelArg(dk, di++, sizeof(cl_mem),   &backend_ctx->prealloc_moe_da.buffer));
+                CL_CHECK(clSetKernelArg(dk, di++, sizeof(cl_mem),   &extrad->data_device));
+                CL_CHECK(clSetKernelArg(dk, di++, sizeof(cl_ulong), &offsetd));
+                CL_CHECK(clSetKernelArg(dk, di++, sizeof(int),      &ne00));
+                CL_CHECK(clSetKernelArg(dk, di++, sizeof(int),      &ne01));
+                CL_CHECK(clSetKernelArg(dk, di++, sizeof(int),      &ne0));
+
+                size_t dg[3] = { CEIL_DIV((size_t)ne01, (size_t)128) * 64,
+                                 (size_t)ne11 * (size_t)nsgd, 1 };
+                size_t dl[3] = { 64, (size_t)nsgd, 1 };
+                backend_ctx->enqueue_ndrange_kernel(dk, 3, dg, dl, dst);
+                CL_CHECK(clReleaseMemObject(a_sub));
+                return;
+            }
+
             // Plane-split decode GEMV (GGML_OPENCL_IQ3S_SOA=1). The weights are
             // feature-major, so one work item per row pair makes a wave's read
             // one contiguous run. Must fire for EVERY ne11 that reaches here --
