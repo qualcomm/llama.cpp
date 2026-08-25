@@ -77,10 +77,29 @@
 // keeping every load. Probe 1 measured only +1.9% (3B) / +4.7% (27B), i.e. the
 // wave-uniform activation read is almost free -- so probe 2 asks whether the 16
 // divergent kvalues_iq4nl[] lookups per operand pair are what is left.
+// IQ4XS_MV_AIMG=1: read the ACTIVATION through an image1d_buffer.
+//
+// The IQ3_S and IQ2_S twins of this are +10.5% and +20.0% on a 3B. The mechanism
+// is structural: `grp` carries no row index, so every lane of a subgroup reads the
+// SAME activation address -- a 64x redundant wave-uniform load, free through a
+// texture on this part where LDS staging of the same redundancy measured -50%.
+//
+// One CL_RGBA/CL_FLOAT texel IS the float4 the scalar path loads, over src1's own
+// buffer, so there is no copy. Every kernel in this file takes the image and the
+// texel offset, because they share the IQ4XS_YV macro -- including the fused GLU
+// and split-K ones, which are default off here as measured negatives.
+#ifndef IQ4XS_MV_AIMG
+#define IQ4XS_MV_AIMG 0
+#endif
+
 #if IQ4XS_MV_ABL == 1
 #define IQ4XS_YV(g, y) ((float4)(1.0f))
 #else
+#if IQ4XS_MV_AIMG
+#define IQ4XS_YV(g, y) read_imagef(y_img, (int)(y_tex + (g)))
+#else
 #define IQ4XS_YV(g, y) vload4((g), (y))
+#endif
 #endif
 
 // IQ4XS_MV_CB: how a nibble becomes its codebook value. This, and not the loads
@@ -215,6 +234,8 @@ inline float4 iq4nl_cb4_shuf(uint w) {
 #endif
 
 kernel void kernel_mul_mv_iq4_xs_f32_flat(
+        __read_only image1d_buffer_t y_img,   // see IQ4XS_MV_AIMG
+        uint y_off,                           // offset1/16, in float4 texels
         global const ushort * src0_q,
         global const half   * src0_d,
         global const ushort * src0_sh,
@@ -240,6 +261,9 @@ kernel void kernel_mul_mv_iq4_xs_f32_flat(
     const uint col = get_group_id(1);           // token
 
     global const float * y = src1 + (ulong)col * (uint)ne10;
+#if IQ4XS_MV_AIMG
+    const uint y_tex = y_off + col * ((uint)ne10 >> 2);
+#endif
 
     IQ4XS_CB_DECL
 
@@ -433,6 +457,8 @@ kernel void kernel_mul_mv_iq4_xs_f32_flat(
 //
 // Opt-in with GGML_OPENCL_IQ4XS_MV_WIMG until measured.
 kernel void kernel_mul_mv_iq4_xs_f32_flat_wimg(
+        __read_only image1d_buffer_t y_img,   // see IQ4XS_MV_AIMG
+        uint y_off,                           // offset1/16, in float4 texels
         __read_only image1d_buffer_t src0_q_img,
         global const half   * src0_d,
         global const ushort * src0_sh,
@@ -458,6 +484,9 @@ kernel void kernel_mul_mv_iq4_xs_f32_flat_wimg(
     const uint col = get_group_id(1);           // token
 
     global const float * y = src1 + (ulong)col * (uint)ne10;
+#if IQ4XS_MV_AIMG
+    const uint y_tex = y_off + col * ((uint)ne10 >> 2);
+#endif
 
     IQ4XS_CB_DECL
 
@@ -681,6 +710,8 @@ inline float iq4xs_glu_apply(int glu_op, float g, float u) {
 // and feeds gate and up in the same iteration -- that is the point, not just the
 // saved dispatch. Costs four accumulators instead of two.
 kernel void kernel_mul_mv_iq4_xs_f32_flat_glu(
+        __read_only image1d_buffer_t y_img,   // see IQ4XS_MV_AIMG
+        uint y_off,                           // offset1/16, in float4 texels
         global const ushort * g_q,
         global const half   * g_d,
         global const ushort * g_sh,
@@ -711,6 +742,9 @@ kernel void kernel_mul_mv_iq4_xs_f32_flat_glu(
     const uint col = get_group_id(1);
 
     global const float * y = src1 + (ulong)col * (uint)ne10;
+#if IQ4XS_MV_AIMG
+    const uint y_tex = y_off + col * ((uint)ne10 >> 2);
+#endif
 
     IQ4XS_CB_DECL
 
@@ -809,6 +843,8 @@ kernel void kernel_mul_mv_iq4_xs_f32_flat_glu(
 // them. ksplit comes from the same occupancy heuristic the IQ1/IQ2 splits use, so
 // a shape that already fills the device stays at 1 and never reaches this kernel.
 kernel void kernel_mul_mv_iq4_xs_f32_flat_splitk(
+        __read_only image1d_buffer_t y_img,   // see IQ4XS_MV_AIMG
+        uint y_off,                           // offset1/16, in float4 texels
         global const ushort * src0_q,
         global const half   * src0_d,
         global const ushort * src0_sh,
@@ -837,6 +873,9 @@ kernel void kernel_mul_mv_iq4_xs_f32_flat_splitk(
     const uint ib1 = (nsb * (ks + 1u)) / nks;
 
     global const float * y = src1 + (ulong)col * (uint)ne10;
+#if IQ4XS_MV_AIMG
+    const uint y_tex = y_off + col * ((uint)ne10 >> 2);
+#endif
 
     IQ4XS_CB_DECL
 
