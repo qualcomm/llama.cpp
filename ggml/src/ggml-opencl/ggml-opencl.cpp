@@ -2650,7 +2650,7 @@ static int ggml_cl_q2k_mv_nsg() {
 // rows per lane amortise it. The AoS kernel this replaces reuses that sum across
 // N_DST = 4 rows, and at 2 the flat kernel lost 12% of decode.
 static int ggml_cl_iq1m_mv_nsg() {
-    static const int v = ggml_cl_env_int("GGML_OPENCL_IQ1M_MV_NSG", 8);
+    static const int v = ggml_cl_env_int("GGML_OPENCL_IQ1M_MV_NSG", 4);
     return v;
 }
 
@@ -2669,8 +2669,26 @@ static int ggml_cl_iq1m_gemm_ldsgrid() {
     return v;
 }
 
+// FOUR, not the 8 every other split type uses, and it is measured rather than
+// inherited. These two kernels do the most work per weight in the family and have
+// the largest per-lane footprint, so a 512-work-item group costs more in
+// occupancy than the extra wave buys in latency hiding.
+//
+// MEASURED on X2-90, tg64/tg32, arms repeated:
+//                     NSG=1    NSG=2    NSG=4    NSG=8
+//     3B UD-IQ1_M     30.11    33.77    35.01    34.30
+//     3B UD-IQ1_S     31.81    35.09    36.20    35.24
+//     27B UD-IQ1_M                       4.144    4.094   (3 bracketed pairs)
+//     27B UD-IQ1_S                       4.423    4.088
+//
+// 🔴 It does NOT generalise -- every other decode GEMV is WORSE at 4, and one of
+// them badly: IQ4_XS 39.87 -> 32.93 (-17.4%), IQ3_M -12.3%, Q3_K -5.5%,
+// UD-IQ2_M -6.0%, Q2_K -2.1%. This is a per-type constant, not a family rule.
+//
+// The split-K boundary was re-checked at the new width and still pays
+// (+8.0% IQ1_M, +5.6% IQ1_S at NSG=4), and prefill is untouched: 1012.4 either way.
 static int ggml_cl_iq1s_mv_nsg() {
-    static const int v = ggml_cl_env_int("GGML_OPENCL_IQ1S_MV_NSG", 8);
+    static const int v = ggml_cl_env_int("GGML_OPENCL_IQ1S_MV_NSG", 4);
     return v;
 }
 
