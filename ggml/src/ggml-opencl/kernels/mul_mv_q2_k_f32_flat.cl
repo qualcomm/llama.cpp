@@ -259,3 +259,164 @@ kernel void kernel_mul_mv_q2_k_f32_flat(
     }
 #endif
 }
+
+
+// ---------------------------------------------------------------------------
+// Fused ffn_gate + ffn_up + GLU for Q2_K.
+//
+// Q2_K is the type this fusion should suit best, and the reason is written at the
+// top of this file already: it carries a MIN, so every 16-weight run needs that
+// run's activation SUM, and that sum does not depend on the row. The whole reason
+// Q2K_MV_R defaults to 4 is to amortise it -- at 2 rows per lane the plain kernel
+// paid it twice as often per row and lost 12% of decode.
+//
+// The 2026-08-25 round found that the GLU fusion pays exactly where it shares
+// COMPUTATION rather than merely an activation load: IQ1_S, IQ1_M and IQ2_S each
+// have a delta or min term multiplied by such a sum and gained 10-13%, while
+// IQ4_XS, which has no such term, was a measured wash. Q2_K has the term.
+//
+// 🔑 WHY THIS KERNEL IS R2 WHERE THE PLAIN ONE IS R4. Fusing shares `asum` between
+// the gate and up streams, so at 2 rows per lane a fused lane amortises it over
+// FOUR row-streams -- exactly the amortisation R4 was introduced to get, and at
+// half the accumulator count (4 running pairs instead of 8) and half the LDS for
+// the cross-subgroup reduce. R4 here would need eight accumulator pairs and a
+// float8 reduce, 16 KB of local memory, on a kernel already at 304 B/WI.
+//
+// So the host dispatches this one at 128 rows per workgroup, not 256.
+// ---------------------------------------------------------------------------
+
+// Fifth copy of the shared GLU epilogue -- each .cl is its own program and cannot
+// include the others. Op numbering and expressions are identical to
+// q40_glu_apply, iq2s_glu_apply, iq1s_glu_apply, iq1m_glu_apply and
+// iq4xs_glu_apply on purpose; if one is ever changed, change all of them.
+#define Q2K_GLU_GEGLU_COEF_A   0.044715f
+#define Q2K_GLU_SQRT_2_OVER_PI 0.79788456080286535587989211986876f
+#define Q2K_GLU_SQRT_2_INV     0.70710678118654752440084436210484f
+#define Q2K_GLU_QUICK_COEF    -1.702f
+inline float q2k_glu_apply(int glu_op, float g, float u) {
+    float act;
+    if (glu_op == 1) {        // GEGLU (tanh-approx gelu)
+        act = 0.5f*g*(1.0f + tanh(Q2K_GLU_SQRT_2_OVER_PI*g*(1.0f + Q2K_GLU_GEGLU_COEF_A*g*g)));
+    } else if (glu_op == 2) { // SWIGLU (silu)
+        act = g / (1.0f + exp(-g));
+    } else if (glu_op == 0) { // REGLU
+        return g*u*(g > 0.0f);
+    } else if (glu_op == 4) { // GEGLU_ERF
+        act = 0.5f*g*(1.0f + erf(g*Q2K_GLU_SQRT_2_INV));
+    } else {                  // GEGLU_QUICK
+        act = g*(1.0f/(1.0f + exp(Q2K_GLU_QUICK_COEF*g)));
+    }
+    return act*u;
+}
+
+kernel void kernel_mul_mv_q2_k_f32_flat_glu(
+        global const uchar * g_qs,
+        global const uchar * g_sc,
+        global const half  * g_dm,
+        global const uchar * u_qs,
+        global const uchar * u_sc,
+        global const half  * u_dm,
+        global const float * src1,
+        ulong offset1,
+        global float * dst,
+        ulong offsetd,
+        int ne00,
+        int ne01,
+        int ne10,
+        int ne0,
+        int glu_op
+) {
+    src1 = (global const float *)((global const char *)src1 + offset1);
+    dst  = (global float       *)((global char       *)dst  + offsetd);
+
+    const uint m   = (uint)ne01;
+    const uint K   = (uint)ne00;
+    const uint nsb = K / QK_K;
+
+    const uint lid = get_local_id(0);
+    const uint sgi = get_local_id(1);
+    const uint col = get_group_id(1);
+
+    global const float * y = src1 + (ulong)col * (uint)ne10;
+
+    const uint mr  = m >> 1;                        // row pairs
+    const uint j   = get_group_id(0) * 64u + lid;
+    const uint row = j << 1;
+
+    float gs0 = 0.f, gs1 = 0.f, us0 = 0.f, us1 = 0.f;
+
+    if (j < mr) {
+        global const ushort * gqsu = (global const ushort *)g_qs;
+        global const ushort * gscu = (global const ushort *)g_sc;
+        global const ushort * uqsu = (global const ushort *)u_qs;
+        global const ushort * uscu = (global const ushort *)u_sc;
+
+        for (uint ib = sgi; ib < nsb; ib += Q2K_MV_NSG) {
+            const half4 gdm = vload4(j + ib * mr, g_dm);   // d0, dmin0, d1, dmin1
+            const half4 udm = vload4(j + ib * mr, u_dm);
+
+            float gad0 = 0.f, gam0 = 0.f, gad1 = 0.f, gam1 = 0.f;
+            float uad0 = 0.f, uam0 = 0.f, uad1 = 0.f, uam1 = 0.f;
+
+            for (uint sb = 0; sb < 8u; ++sb) {
+                const uint grp = ib * 64u + sb * 8u;
+                const uint qsb = j + grp * mr;
+
+                for (uint h = 0; h < 2u; ++h) {
+                    const uint gscv = (uint)gscu[j + (2u * (ib * 8u + sb) + h) * mr];
+                    const uint uscv = (uint)uscu[j + (2u * (ib * 8u + sb) + h) * mr];
+
+                    float ga0 = 0.f, ga1 = 0.f, ua0 = 0.f, ua1 = 0.f;
+                    float4 as = (float4)(0.f);
+                    for (uint u = 0; u < 4u; ++u) {
+                        const uint gg = 4u*h + u;
+                        // activation float4 read ONCE, and its running sum
+                        // accumulated ONCE, for both streams and both rows
+                        const float4 yv = vload4(grp + gg, y);
+                        as += yv;
+
+                        const uint gqsv = (uint)gqsu[qsb + gg * mr];
+                        ga0 += dot(yv, q2k_vals( gqsv       & 0xFFu));
+                        ga1 += dot(yv, q2k_vals((gqsv >> 8) & 0xFFu));
+
+                        const uint uqsv = (uint)uqsu[qsb + gg * mr];
+                        ua0 += dot(yv, q2k_vals( uqsv       & 0xFFu));
+                        ua1 += dot(yv, q2k_vals((uqsv >> 8) & 0xFFu));
+                    }
+                    // ONE activation sum, four row-streams -- the point of the fusion
+                    const float asum = as.s0 + as.s1 + as.s2 + as.s3;
+
+                    const uint gs_0 = gscv & 0xFFu, gs_1 = gscv >> 8;
+                    const uint us_0 = uscv & 0xFFu, us_1 = uscv >> 8;
+                    gad0 += (float)(gs_0 & 0xFu) * ga0;  gam0 += (float)(gs_0 >> 4) * asum;
+                    gad1 += (float)(gs_1 & 0xFu) * ga1;  gam1 += (float)(gs_1 >> 4) * asum;
+                    uad0 += (float)(us_0 & 0xFu) * ua0;  uam0 += (float)(us_0 >> 4) * asum;
+                    uad1 += (float)(us_1 & 0xFu) * ua1;  uam1 += (float)(us_1 >> 4) * asum;
+                }
+            }
+            gs0 += (float)gdm.s0 * gad0 - (float)gdm.s1 * gam0;
+            gs1 += (float)gdm.s2 * gad1 - (float)gdm.s3 * gam1;
+            us0 += (float)udm.s0 * uad0 - (float)udm.s1 * uam0;
+            us1 += (float)udm.s2 * uad1 - (float)udm.s3 * uam1;
+        }
+    }
+
+#if Q2K_MV_NSG > 1
+    __local float4 gpart[Q2K_MV_NSG][64];
+    gpart[sgi][lid] = (float4)(gs0, gs1, us0, us1);
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (sgi != 0) {
+        return;
+    }
+    for (uint s = 1; s < Q2K_MV_NSG; ++s) {
+        const float4 p = gpart[s][lid];
+        gs0 += p.s0; gs1 += p.s1; us0 += p.s2; us1 += p.s3;
+    }
+#endif
+
+    if (j < mr) {
+        global float * o = dst + (ulong)col * (uint)ne0 + row;
+        o[0] = q2k_glu_apply(glu_op, gs0, us0);
+        o[1] = q2k_glu_apply(glu_op, gs1, us1);
+    }
+}
