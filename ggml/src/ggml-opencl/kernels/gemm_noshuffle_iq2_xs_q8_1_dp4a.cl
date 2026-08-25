@@ -27,6 +27,22 @@
 // the IQ2_S twin for the measurement and the reason (a 64-thread workgroup pays
 // far more occupancy for the LDS than the 512-thread GEMV does, and each lookup
 // here already feeds 32 columns).
+// IQ2XS_GEMM_GRIDIMG=1: read the codebook through an image1d_buffer.
+//
+// In a GEMM every one of the 64 lanes owns a different row, so the grid reads in
+// a 32-K step are a DIVERGENT gather, and byte/word indexed __constant loads
+// serialize on Adreno under exactly that pattern. Local memory was measured on
+// the IQ2_S twin and lost, because the staged table costs occupancy in a
+// 64-thread workgroup; an image costs no occupancy and no memory, since it is
+// the singleton the decode GEMV already builds at init.
+//
+// The IQ3_S twin of this change is +43.0% prefill on a model made of the type
+// and +8.0% on a hybrid, with perplexity identical to four decimals. Same
+// defect, same fix, here. Default follows the per-generation texture gate.
+#ifndef IQ2XS_GEMM_GRIDIMG
+#define IQ2XS_GEMM_GRIDIMG 0
+#endif
+
 #ifndef IQ2XS_GEMM_LDSGRID
 #define IQ2XS_GEMM_LDSGRID 0
 #endif
@@ -192,6 +208,7 @@ inline int dot4_q8a_v(uint4 qw, uint4 a) {
 
 __attribute__((qcom_wave_pair_mode(1)))
 kernel void kernel_gemm_noshuffle_iq2_xs_q8_1_dp4a(
+        __read_only image1d_buffer_t grid_img,   // see IQ2XS_GEMM_GRIDIMG
         __global const ushort * src0_qs,
         __global const uchar  * src0_sc,
         __global const half   * src0_d,
@@ -220,7 +237,9 @@ kernel void kernel_gemm_noshuffle_iq2_xs_q8_1_dp4a(
     __local uint4 sh_qa4[TILESIZE_N][2];
     __local half sh_d[TILESIZE_N];
 
-#if IQ2XS_GEMM_LDSGRID
+#if IQ2XS_GEMM_GRIDIMG
+#define IQ2XS_GRID(i) (read_imageui(grid_img, (int)(i)).x)
+#elif IQ2XS_GEMM_LDSGRID
     __local uint sh_grid[1024];
     for (uint i = lid; i < 1024u; i += 64u) {
         sh_grid[i] = iq2xs_grid[i];
