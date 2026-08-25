@@ -681,3 +681,145 @@ kernel void kernel_mul_mv_iq1_s_f32_flat_glu(
     }
 #undef IQ1S_GGRID
 }
+
+
+// ---------------------------------------------------------------------------
+// Workgroup-level K split, the IQ1_S twin of kernel_mul_mv_iq2_s_f32_flat_splitk.
+//
+// The plain GEMV above launches ceil(M/128) workgroups because its K split lives
+// INSIDE a workgroup (IQ1S_MV_NSG subgroups), so the low-M projections run a
+// short tail on a half-idle device. Slice ks accumulates its own range of
+// super-blocks and writes partial[ks*M + row]; the existing generic
+// kernel_gemv_splitk_reduce_f32 sums them.
+//
+// It is not free -- the partial write plus the reduce pass cost ksplit*M and add
+// a dispatch -- so the host picks ksplit from the same occupancy heuristic the
+// IQ2_S twin uses and leaves already-full shapes at 1.
+//
+// Why IQ1_S is the next one to try after IQ2_S: on this type the gate/up fusion
+// paid the MOST of the family (+12.4% on a 3B, +10.3% on a 27B), so the tensors
+// the fusion does NOT cover -- ffn_out, attn_out, Qcur/Kcur/Vcur -- are the same
+// under-filled dispatches the IQ2_S split found. The IQ3_S result says this does
+// not carry across types by argument, so it is measured per type.
+//
+// R2 only, like the plain kernel's default path and the IQ2_S twin.
+// ---------------------------------------------------------------------------
+
+kernel void kernel_mul_mv_iq1_s_f32_flat_splitk(
+        __read_only image1d_buffer_t grid_img,
+        global const uchar  * src0_qs,
+        global const ushort * src0_qh,
+        global const half   * src0_d,
+        global const float  * src1,
+        ulong offset1,
+        global float * partial,
+        int ne00,
+        int ne01,
+        int ne10
+) {
+    src1 = (global const float *)((global const char *)src1 + offset1);
+
+    const uint m   = (uint)ne01;
+    const uint K   = (uint)ne00;
+    const uint nsb = K / QK_K;
+
+    const uint lid = get_local_id(0);
+    const uint sgi = get_local_id(1);
+    const uint col = get_group_id(1);
+    const uint ks  = get_group_id(2);
+    const uint nks = get_num_groups(2);
+
+    // this slice's super-block range; the subgroups stride within it
+    const uint ib0 = (nsb * ks)        / nks;
+    const uint ib1 = (nsb * (ks + 1u)) / nks;
+
+    global const float * y = src1 + (ulong)col * (uint)ne10;
+
+#if IQ1S_MV_GRIDIMG
+#define IQ1S_SKGRID(i) (read_imageui(grid_img, (int)(i)).x)
+#elif IQ1S_MV_LDSGRID
+    __local uint sk_grid[2048];
+    {
+        const uint tid  = sgi * 64u + lid;
+        const uint nthr = (uint)(get_local_size(0) * get_local_size(1));
+        for (uint i = tid; i < 2048u; i += nthr) {
+            sk_grid[i] = iq1s_grid_gpu[i];
+        }
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+#define IQ1S_SKGRID(i) sk_grid[(i)]
+#else
+#define IQ1S_SKGRID(i) iq1s_grid_gpu[(i)]
+#endif
+
+    const uint mh  = m >> 1;
+    const uint j   = get_group_id(0) * 64u + lid;
+    const uint row = j << 1;
+
+    float sumf = 0.f, sumf1 = 0.f;
+
+    if (j < mh) {
+        global const ushort * qsu = (global const ushort *)src0_qs;
+
+        for (uint ib = ib0 + sgi; ib < ib1; ib += IQ1S_MV_NSG) {
+            const half2 dh = vload2(j + ib * mh, src0_d);
+
+            float acc0 = 0.f, acc1 = 0.f;
+            for (uint sb = 0; sb < 8u; ++sb) {
+                const uint  sub = ib * 8u + sb;
+                const ushort2 qhv = vload2(j + sub * mh, src0_qh); // row pair, one load
+                const uint  h0  = (uint)qhv.s0, h1 = (uint)qhv.s1;
+
+                const float s0  = (float)(2u * ((h0 >> 12) & 7u) + 1u);
+                const float s1  = (float)(2u * ((h1 >> 12) & 7u) + 1u);
+                const float t0  = ((h0 & 0x8000u) ? -0.125f : 0.125f) - 1.0f;
+                const float t1  = ((h1 & 0x8000u) ? -0.125f : 0.125f) - 1.0f;
+
+                const uint gb  = j + (sub * 4u) * mh;
+                const uint grp = sub * 8u;
+
+                float a0 = 0.f, a1 = 0.f;
+                float4 as = (float4)(0.f);
+                for (uint l = 0; l < 4u; ++l) {
+                    const uint qsv = (uint)qsu[gb + l * mh];       // row pair, one load
+                    const uint g0  = IQ1S_SKGRID(( qsv       & 0xFFu) | ((((h0 >> (3u*l)) & 7u) << 8)));
+                    const uint g1  = IQ1S_SKGRID(((qsv >> 8) & 0xFFu) | ((((h1 >> (3u*l)) & 7u) << 8)));
+
+                    const float4 y0 = vload4(grp + 2u*l + 0u, y);
+                    const float4 y1 = vload4(grp + 2u*l + 1u, y);
+                    as += y0 + y1;
+                    a0 += dot(y0, iq1s_vals(g0)) + dot(y1, iq1s_vals(g0 >> 4));
+                    a1 += dot(y0, iq1s_vals(g1)) + dot(y1, iq1s_vals(g1 >> 4));
+                }
+                // one activation sum, both rows
+                const float asum = as.s0 + as.s1 + as.s2 + as.s3;
+                acc0 += s0 * (a0 + t0 * asum);
+                acc1 += s1 * (a1 + t1 * asum);
+            }
+            sumf  += (float)dh.s0 * acc0;
+            sumf1 += (float)dh.s1 * acc1;
+        }
+    }
+
+#if IQ1S_MV_NSG > 1
+    __local float2 skpart[IQ1S_MV_NSG][64];
+    skpart[sgi][lid] = (float2)(sumf, sumf1);
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (sgi != 0) {
+        return;
+    }
+    for (uint s = 1; s < IQ1S_MV_NSG; ++s) {
+        const float2 p = skpart[s][lid];
+        sumf  += p.s0;
+        sumf1 += p.s1;
+    }
+#endif
+
+    if (j < mh) {
+        // [ksplit][M], the layout kernel_gemv_splitk_reduce_f32 expects
+        global float * o = partial + (ulong)ks * m + row;
+        o[0] = sumf;
+        o[1] = sumf1;
+    }
+#undef IQ1S_SKGRID
+}
