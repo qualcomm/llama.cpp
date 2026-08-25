@@ -1316,6 +1316,8 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mv_iq4_xs_f32;
     cl_kernel kernel_mul_mv_iq4_xs_f32_flat;
     cl_kernel kernel_mul_mv_iq4_xs_f32_flat_wimg = nullptr;  // same, quant plane through a texture (opt-in)
+    cl_kernel kernel_mul_mv_iq4_xs_f32_flat_glu = nullptr;     // fused ffn_gate+ffn_up+GLU
+    cl_kernel kernel_mul_mv_iq4_xs_f32_flat_splitk = nullptr;  // K split across workgroups
     cl_kernel kernel_mul_mv_iq1_s_f32;
     cl_kernel kernel_mul_mv_iq1_m_f32;
     cl_kernel kernel_mul_mv_tq1_0_f32;
@@ -2243,6 +2245,28 @@ static int ggml_cl_iq1s_splitk_on(const ggml_backend_opencl_context * backend_ct
 // (fuse where the codebook gather is cheap) puts IQ1_M with IQ1_S and IQ2_S at
 // four gathers per sub-block, but that rule is a predictor, so this default only
 // stands on a measurement at both scales.
+// IQ4_XS had NEITHER the GLU fusion nor the K split, which is why it is the next
+// one worth doing: on a 3B roster it is the fastest decode after Q4_0 (40.0
+// against 47.7) and those two things are much of Q4_0's advantage. It is a LINEAR
+// quant, not a codebook one, so the q4_0 precedent (+10.2%) is the right prior,
+// not the weaker codebook-family results. R2 only -- the host declines both when
+// GGML_OPENCL_IQ4XS_MV_R4 is on.
+static int ggml_cl_iq4xs_fuse_glu(const ggml_backend_opencl_context * backend_ctx) {
+    static const char * const e = getenv("GGML_OPENCL_IQ4XS_FUSE_GLU");
+    if (e && *e) {
+        return atoi(e) != 0;
+    }
+    return backend_ctx->adreno_x2_class();
+}
+
+static int ggml_cl_iq4xs_splitk_on(const ggml_backend_opencl_context * backend_ctx) {
+    static const char * const e = getenv("GGML_OPENCL_IQ4XS_SPLITK");
+    if (e && *e) {
+        return atoi(e) != 0;
+    }
+    return backend_ctx->adreno_x2_class();
+}
+
 static int ggml_cl_iq1m_fuse_glu(const ggml_backend_opencl_context * backend_ctx) {
     static const char * const e = getenv("GGML_OPENCL_IQ1M_FUSE_GLU");
     if (e && *e) {
@@ -3758,6 +3782,14 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 
         CL_CHECK((backend_ctx->kernel_mul_mv_iq4_xs_f32_flat = clCreateKernel(prog, "kernel_mul_mv_iq4_xs_f32_flat", &err), err));
         CL_CHECK((backend_ctx->kernel_mul_mv_iq4_xs_f32_flat_wimg = clCreateKernel(prog, "kernel_mul_mv_iq4_xs_f32_flat_wimg", &err), err));
+        if (ggml_cl_iq4xs_mv_r2() && !ggml_cl_iq4xs_mv_r4()) {
+            backend_ctx->kernel_mul_mv_iq4_xs_f32_flat_glu =
+                clCreateKernel(prog, "kernel_mul_mv_iq4_xs_f32_flat_glu", &err);
+            if (err != CL_SUCCESS) { backend_ctx->kernel_mul_mv_iq4_xs_f32_flat_glu = nullptr; }
+            backend_ctx->kernel_mul_mv_iq4_xs_f32_flat_splitk =
+                clCreateKernel(prog, "kernel_mul_mv_iq4_xs_f32_flat_splitk", &err);
+            if (err != CL_SUCCESS) { backend_ctx->kernel_mul_mv_iq4_xs_f32_flat_splitk = nullptr; }
+        }
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
@@ -13159,6 +13191,16 @@ static bool ggml_opencl_can_fuse(const ggml_backend_opencl_context * backend_ctx
                 return false;
             }
         }
+        const bool wg_iq4_xs = gate->src[0]->type == GGML_TYPE_IQ4_XS;
+        if (wg_iq4_xs) {
+            if (!ggml_cl_iq4xs_fuse_glu(backend_ctx) ||
+                backend_ctx->kernel_mul_mv_iq4_xs_f32_flat_glu == nullptr ||
+                !ggml_cl_iq4xs_is_split(backend_ctx, gate->src[0]) ||
+                !ggml_cl_iq4xs_is_split(backend_ctx, up->src[0]) ||
+                gate->src[0]->ne[0] % 256 != 0) {
+                return false;
+            }
+        }
         const bool wg_iq1_m = gate->src[0]->type == GGML_TYPE_IQ1_M;
         if (wg_iq1_m) {
             if (!ggml_cl_iq1m_fuse_glu(backend_ctx) ||
@@ -13181,7 +13223,7 @@ static bool ggml_opencl_can_fuse(const ggml_backend_opencl_context * backend_ctx
                 return false;
             }
         }
-        if ((!wg_q4_0 && !wg_q4_k && !wg_iq2_s && !wg_iq1_s && !wg_iq1_m && !wg_iq2_xxs && !wg_iq3_s) ||
+        if ((!wg_q4_0 && !wg_q4_k && !wg_iq2_s && !wg_iq1_s && !wg_iq1_m && !wg_iq4_xs && !wg_iq2_xxs && !wg_iq3_s) ||
             up->src[0]->type != gate->src[0]->type ||
             gate->src[1]->type != GGML_TYPE_F32  || up->src[1]->type != GGML_TYPE_F32  ||
             gate->type != GGML_TYPE_F32 || up->type != GGML_TYPE_F32 || glu->type != GGML_TYPE_F32) {
@@ -13624,6 +13666,7 @@ static void ggml_cl_mul_mat_iq2_xxs_glu_fused(ggml_backend_t backend, ggml_tenso
 static void ggml_cl_mul_mat_iq3_s_glu_fused(ggml_backend_t backend, ggml_tensor * gate_tensor, ggml_tensor * up_tensor, ggml_tensor * glu_tensor);
 static void ggml_cl_mul_mat_iq1_s_glu_fused(ggml_backend_t backend, ggml_tensor * gate_tensor, ggml_tensor * up_tensor, ggml_tensor * glu_tensor);
 static void ggml_cl_mul_mat_iq1_m_glu_fused(ggml_backend_t backend, ggml_tensor * gate_tensor, ggml_tensor * up_tensor, ggml_tensor * glu_tensor);
+static void ggml_cl_mul_mat_iq4_xs_glu_fused(ggml_backend_t backend, ggml_tensor * gate_tensor, ggml_tensor * up_tensor, ggml_tensor * glu_tensor);
 static void ggml_cl_mul_mat_iq2_s_glu_fused(ggml_backend_t backend, ggml_tensor * gate_tensor, ggml_tensor * up_tensor, ggml_tensor * glu_tensor);
 static void ggml_cl_mul_mat_q4_0_glu_fused(ggml_backend_t backend, ggml_tensor * gate_tensor, ggml_tensor * up_tensor, ggml_tensor * glu_tensor);
 static void ggml_cl_mul_mat_id_q4_k_glu_fused(ggml_backend_t backend, ggml_tensor * mmid_tensor, ggml_tensor * glu_tensor);
@@ -14076,6 +14119,8 @@ static void ggml_backend_opencl_exec_graph_nodes(ggml_backend_t backend, ggml_cg
                 ggml_cl_mul_mat_iq1_s_glu_fused(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
             } else if (node->src[0]->type == GGML_TYPE_IQ1_M) {
                 ggml_cl_mul_mat_iq1_m_glu_fused(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
+            } else if (node->src[0]->type == GGML_TYPE_IQ4_XS) {
+                ggml_cl_mul_mat_iq4_xs_glu_fused(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
             } else if (node->src[0]->type == GGML_TYPE_IQ2_S) {
                 ggml_cl_mul_mat_iq2_s_glu_fused(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
             } else if (node->src[0]->type == GGML_TYPE_Q4_0) {
@@ -23968,6 +24013,65 @@ static void ggml_cl_mul_mat_iq1_m_glu_fused(ggml_backend_t backend, ggml_tensor 
     GGML_UNUSED(backend); GGML_UNUSED(gate_tensor);
     GGML_UNUSED(up_tensor); GGML_UNUSED(glu_tensor);
     GGML_ASSERT(false && "IQ1_M fused GLU needs the Adreno kernels");
+#endif
+}
+
+static void ggml_cl_mul_mat_iq4_xs_glu_fused(ggml_backend_t backend, ggml_tensor * gate_tensor, ggml_tensor * up_tensor, ggml_tensor * glu_tensor) {
+#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+    GGML_ASSERT(gate_tensor && up_tensor && glu_tensor);
+    const ggml_tensor * Wg   = gate_tensor->src[0];
+    const ggml_tensor * Wu   = up_tensor->src[0];
+    const ggml_tensor * src1 = gate_tensor->src[1];
+    const ggml_tensor * dst  = glu_tensor;
+    GGML_ASSERT(Wg && Wg->extra); GGML_ASSERT(Wu && Wu->extra);
+    GGML_ASSERT(src1 && src1->extra); GGML_ASSERT(dst && dst->extra);
+
+    ggml_backend_opencl_context  * backend_ctx = (ggml_backend_opencl_context *)backend->context;
+    ggml_tensor_extra_cl         * extra1 = (ggml_tensor_extra_cl *)src1->extra;
+    ggml_tensor_extra_cl         * extrad = (ggml_tensor_extra_cl *)dst->extra;
+    ggml_tensor_extra_cl_iq4_xs  * ex_g   = (ggml_tensor_extra_cl_iq4_xs *)Wg->extra;
+    ggml_tensor_extra_cl_iq4_xs  * ex_u   = (ggml_tensor_extra_cl_iq4_xs *)Wu->extra;
+
+    const cl_ulong offset1 = extra1->offset + src1->view_offs;
+    const cl_ulong offsetd = extrad->offset + dst->view_offs;
+
+    const int ne00 = Wg->ne[0];
+    const int ne01 = Wg->ne[1];
+    const int ne10 = src1->ne[0];
+    const int ne0  = dst->ne[0];
+    const int ne11 = src1->ne[1];
+    const int glu_op = (int)ggml_get_glu_op(dst);
+
+    cl_kernel fk  = backend_ctx->kernel_mul_mv_iq4_xs_f32_flat_glu;
+    const int nsg = ggml_cl_iq4xs_mv_nsg();
+
+    cl_int ai = 0;
+    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex_g->q));
+    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex_g->d));
+    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex_g->sh));
+    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex_g->sl));
+    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex_u->q));
+    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex_u->d));
+    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex_u->sh));
+    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex_u->sl));
+    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &extra1->data_device));
+    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_ulong), &offset1));
+    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &extrad->data_device));
+    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_ulong), &offsetd));
+    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne00));
+    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne01));
+    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne10));
+    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne0));
+    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &glu_op));
+
+    size_t f_global[3] = { CEIL_DIV((size_t)ne01, (size_t)128) * 64,
+                           (size_t)ne11 * (size_t)nsg, 1 };
+    size_t f_local[3]  = { 64, (size_t)nsg, 1 };
+    backend_ctx->enqueue_ndrange_kernel(fk, 3, f_global, f_local, (ggml_tensor *)dst);
+#else
+    GGML_UNUSED(backend); GGML_UNUSED(gate_tensor);
+    GGML_UNUSED(up_tensor); GGML_UNUSED(glu_tensor);
+    GGML_ASSERT(false && "IQ4_XS fused GLU needs the Adreno kernels");
 #endif
 }
 
@@ -39695,6 +39799,55 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             break;
         }
         case GGML_TYPE_IQ4_XS: {
+            // Workgroup-level K split, in front of the plain plane GEMV. Only for
+            // shapes the occupancy heuristic says are under-filled; ksplit == 1 falls
+            // through to the kernel below unchanged.
+            if (ggml_cl_iq4xs_is_split(backend_ctx, src0)
+                    && backend_ctx->kernel_mul_mv_iq4_xs_f32_flat_splitk
+                    && backend_ctx->kernel_gemv_splitk_reduce_f32
+                    && ggml_cl_iq4xs_splitk_on(backend_ctx)
+                    && ne00 % 256 == 0 && ne11 == 1
+                    && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1) {
+                const int nsb     = ne00 / 256;
+                const int base_wg = (int)CEIL_DIV((size_t)ne01, (size_t)128);
+                const int ksplit  = ggml_cl_iq_mv_ksplit(backend_ctx, base_wg, nsb);
+                if (ksplit > 1) {
+                    ggml_tensor_extra_cl_iq4_xs * ex0 =
+                        (ggml_tensor_extra_cl_iq4_xs *)src0->extra;
+                    const int nsg = ggml_cl_iq4xs_mv_nsg();
+                    backend_ctx->prealloc_splitk_partial.allocate(
+                        backend_ctx->context, (size_t)ksplit * (size_t)ne01 * sizeof(float));
+
+                    cl_kernel sk = backend_ctx->kernel_mul_mv_iq4_xs_f32_flat_splitk;
+                    cl_int ai = 0;
+                    CL_CHECK(clSetKernelArg(sk, ai++, sizeof(cl_mem),   &ex0->q));
+                    CL_CHECK(clSetKernelArg(sk, ai++, sizeof(cl_mem),   &ex0->d));
+                    CL_CHECK(clSetKernelArg(sk, ai++, sizeof(cl_mem),   &ex0->sh));
+                    CL_CHECK(clSetKernelArg(sk, ai++, sizeof(cl_mem),   &ex0->sl));
+                    CL_CHECK(clSetKernelArg(sk, ai++, sizeof(cl_mem),   &extra1->data_device));
+                    CL_CHECK(clSetKernelArg(sk, ai++, sizeof(cl_ulong), &offset1));
+                    CL_CHECK(clSetKernelArg(sk, ai++, sizeof(cl_mem),   &backend_ctx->prealloc_splitk_partial.buffer));
+                    CL_CHECK(clSetKernelArg(sk, ai++, sizeof(int),      &ne00));
+                    CL_CHECK(clSetKernelArg(sk, ai++, sizeof(int),      &ne01));
+                    CL_CHECK(clSetKernelArg(sk, ai++, sizeof(int),      &ne10));
+                    size_t s_global[3] = { (size_t)base_wg * 64, (size_t)nsg, (size_t)ksplit };
+                    size_t s_local[3]  = { 64, (size_t)nsg, 1 };
+                    backend_ctx->enqueue_ndrange_kernel(sk, 3, s_global, s_local, dst);
+
+                    cl_kernel rk = backend_ctx->kernel_gemv_splitk_reduce_f32;
+                    cl_int ri = 0;
+                    CL_CHECK(clSetKernelArg(rk, ri++, sizeof(cl_mem),   &backend_ctx->prealloc_splitk_partial.buffer));
+                    CL_CHECK(clSetKernelArg(rk, ri++, sizeof(cl_mem),   &extrad->data_device));
+                    CL_CHECK(clSetKernelArg(rk, ri++, sizeof(cl_ulong), &offsetd));
+                    CL_CHECK(clSetKernelArg(rk, ri++, sizeof(int),      &ne01));
+                    CL_CHECK(clSetKernelArg(rk, ri++, sizeof(int),      &ksplit));
+                    size_t r_global[1] = { CEIL_DIV((size_t)ne01, (size_t)64) * 64 };
+                    size_t r_local[1]  = { 64 };
+                    backend_ctx->enqueue_ndrange_kernel(rk, 1, r_global, r_local, dst);
+                    return;
+                }
+            }
+
             // Plane-split decode GEMV (GGML_OPENCL_IQ4XS_SOA=1). The weights are
             // feature-major, so one work item per output row makes a wave's read
             // one contiguous run. Must fire for EVERY ne11 the dp4a GEMM declines

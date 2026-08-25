@@ -637,3 +637,272 @@ kernel void kernel_mul_mv_iq4_xs_f32_flat_wimg(
     }
 #endif
 }
+
+
+// ---------------------------------------------------------------------------
+// Fused ffn_gate + ffn_up + GLU, and a workgroup-level K split, for IQ4_XS.
+//
+// IQ4_XS had NEITHER, which is why it is worth doing: on a Llama-3.2-3B roster it
+// is the fastest decode after Q4_0 (tg64 40.0 against 47.7) and Q4_0's advantage
+// is largely these two things. Unlike the IQ1/IQ2/IQ3 family this is a LINEAR
+// quant, not a codebook one, so the q4_0 precedent (+10.2% from the fusion) is
+// the right prior rather than the weaker codebook-type results.
+//
+// Both kernels are R2 only -- one lane owns a row pair -- which is the default
+// (IQ4XS_MV_R4 measured +1.5% on a 3B and -3.0% on a 27B and stays off). The host
+// declines both when R4 is on.
+// ---------------------------------------------------------------------------
+
+// Fifth copy of the shared GLU epilogue: each .cl is its own program and cannot
+// include the others. Op numbering and expressions are identical to
+// q40_glu_apply, iq2s_glu_apply, iq1s_glu_apply and iq1m_glu_apply on purpose --
+// if one of these is ever changed, change all of them.
+#define IQ4XS_GLU_GEGLU_COEF_A   0.044715f
+#define IQ4XS_GLU_SQRT_2_OVER_PI 0.79788456080286535587989211986876f
+#define IQ4XS_GLU_SQRT_2_INV     0.70710678118654752440084436210484f
+#define IQ4XS_GLU_QUICK_COEF    -1.702f
+inline float iq4xs_glu_apply(int glu_op, float g, float u) {
+    float act;
+    if (glu_op == 1) {        // GEGLU (tanh-approx gelu)
+        act = 0.5f*g*(1.0f + tanh(IQ4XS_GLU_SQRT_2_OVER_PI*g*(1.0f + IQ4XS_GLU_GEGLU_COEF_A*g*g)));
+    } else if (glu_op == 2) { // SWIGLU (silu)
+        act = g / (1.0f + exp(-g));
+    } else if (glu_op == 0) { // REGLU
+        return g*u*(g > 0.0f);
+    } else if (glu_op == 4) { // GEGLU_ERF
+        act = 0.5f*g*(1.0f + erf(g*IQ4XS_GLU_SQRT_2_INV));
+    } else {                  // GEGLU_QUICK
+        act = g*(1.0f/(1.0f + exp(IQ4XS_GLU_QUICK_COEF*g)));
+    }
+    return act*u;
+}
+
+// The two weight streams are interleaved so each activation float4 is loaded ONCE
+// and feeds gate and up in the same iteration -- that is the point, not just the
+// saved dispatch. Costs four accumulators instead of two.
+kernel void kernel_mul_mv_iq4_xs_f32_flat_glu(
+        global const ushort * g_q,
+        global const half   * g_d,
+        global const ushort * g_sh,
+        global const uint   * g_sl,
+        global const ushort * u_q,
+        global const half   * u_d,
+        global const ushort * u_sh,
+        global const uint   * u_sl,
+        global const float  * src1,
+        ulong offset1,
+        global float * dst,
+        ulong offsetd,
+        int ne00,
+        int ne01,
+        int ne10,
+        int ne0,
+        int glu_op
+) {
+    src1 = (global const float *)((global const char *)src1 + offset1);
+    dst  = (global float       *)((global char       *)dst  + offsetd);
+
+    const uint m   = (uint)ne01;
+    const uint K   = (uint)ne00;
+    const uint nsb = K / QK_K;
+
+    const uint lid = get_local_id(0);
+    const uint sg  = get_local_id(1);
+    const uint col = get_group_id(1);
+
+    global const float * y = src1 + (ulong)col * (uint)ne10;
+
+    IQ4XS_CB_DECL
+
+    const uint mh  = m >> 1;
+    const uint j   = get_group_id(0) * 64u + lid;
+    const uint row = j << 1;
+
+    float gs0 = 0.f, gs1 = 0.f, us0 = 0.f, us1 = 0.f;
+
+    if (j < mh) {
+        global const uint * gqu = (global const uint *)g_q;
+        global const uint * gsu = (global const uint *)g_sh;
+        global const uint * uqu = (global const uint *)u_q;
+        global const uint * usu = (global const uint *)u_sh;
+
+        for (uint ib = sg; ib < nsb; ib += IQ4XS_MV_NSG) {
+            const uint  sbase = j + ib * mh;
+
+            const uint2 gslv = vload2(sbase, g_sl);
+            const uint  gshp = gsu[sbase];
+            const half2 gdh  = vload2(sbase, g_d);
+            const float gd0  = (float)gdh.s0;
+            const float gd1  = (float)gdh.s1;
+
+            const uint2 uslv = vload2(sbase, u_sl);
+            const uint  ushp = usu[sbase];
+            const half2 udh  = vload2(sbase, u_d);
+            const float ud0  = (float)udh.s0;
+            const float ud1  = (float)udh.s1;
+
+            float gacc0 = 0.f, gacc1 = 0.f, uacc0 = 0.f, uacc1 = 0.f;
+            for (uint sb = 0; sb < 8u; ++sb) {
+                const int gls0 = (int)(((gslv.s0 >> (8u * (sb >> 1))) >> (4u * (sb & 1u))) & 0xFu)
+                               | (int)((((gshp      ) >> (2u * sb)) & 3u) << 4);
+                const int gls1 = (int)(((gslv.s1 >> (8u * (sb >> 1))) >> (4u * (sb & 1u))) & 0xFu)
+                               | (int)((((gshp >> 16) >> (2u * sb)) & 3u) << 4);
+                const int uls0 = (int)(((uslv.s0 >> (8u * (sb >> 1))) >> (4u * (sb & 1u))) & 0xFu)
+                               | (int)((((ushp      ) >> (2u * sb)) & 3u) << 4);
+                const int uls1 = (int)(((uslv.s1 >> (8u * (sb >> 1))) >> (4u * (sb & 1u))) & 0xFu)
+                               | (int)((((ushp >> 16) >> (2u * sb)) & 3u) << 4);
+
+                const uint grp = ib * 64u + sb * 8u;
+                const uint qb  = j + grp * mh;
+
+                float ga0 = 0.f, ga1 = 0.f, ua0 = 0.f, ua1 = 0.f;
+                for (uint u = 0; u < 8u; ++u) {
+                    // activation float4 read ONCE for both streams and both rows
+                    const float4 yv = IQ4XS_YV(grp + u, y);
+
+                    const uint   gw  = gqu[qb + u * mh];
+                    const ushort gw0 = (ushort)(gw & 0xFFFFu);
+                    const ushort gw1 = (ushort)(gw >> 16);
+                    IQ4XS_ACC(ga0, yv, gw0);
+                    IQ4XS_ACC(ga1, yv, gw1);
+
+                    const uint   uw  = uqu[qb + u * mh];
+                    const ushort uw0 = (ushort)(uw & 0xFFFFu);
+                    const ushort uw1 = (ushort)(uw >> 16);
+                    IQ4XS_ACC(ua0, yv, uw0);
+                    IQ4XS_ACC(ua1, yv, uw1);
+                }
+                gacc0 += (float)(gls0 - 32) * ga0;
+                gacc1 += (float)(gls1 - 32) * ga1;
+                uacc0 += (float)(uls0 - 32) * ua0;
+                uacc1 += (float)(uls1 - 32) * ua1;
+            }
+            gs0 += gd0 * gacc0;
+            gs1 += gd1 * gacc1;
+            us0 += ud0 * uacc0;
+            us1 += ud1 * uacc1;
+        }
+    }
+
+#if IQ4XS_MV_NSG > 1
+    __local float4 gpart[IQ4XS_MV_NSG][64];
+    gpart[sg][lid] = (float4)(gs0, gs1, us0, us1);
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (sg != 0) {
+        return;
+    }
+    for (uint s = 1; s < IQ4XS_MV_NSG; ++s) {
+        const float4 p = gpart[s][lid];
+        gs0 += p.s0; gs1 += p.s1; us0 += p.s2; us1 += p.s3;
+    }
+#endif
+
+    if (j < mh) {
+        global float * o = dst + (ulong)col * (uint)ne0 + row;
+        o[0] = iq4xs_glu_apply(glu_op, gs0, us0);
+        o[1] = iq4xs_glu_apply(glu_op, gs1, us1);
+    }
+}
+
+// Slice ks accumulates its own range of super-blocks and writes
+// partial[ks*M + row]; the existing generic kernel_gemv_splitk_reduce_f32 sums
+// them. ksplit comes from the same occupancy heuristic the IQ1/IQ2 splits use, so
+// a shape that already fills the device stays at 1 and never reaches this kernel.
+kernel void kernel_mul_mv_iq4_xs_f32_flat_splitk(
+        global const ushort * src0_q,
+        global const half   * src0_d,
+        global const ushort * src0_sh,
+        global const uint   * src0_sl,
+        global const float  * src1,
+        ulong offset1,
+        global float * partial,
+        int ne00,
+        int ne01,
+        int ne10
+) {
+    src1 = (global const float *)((global const char *)src1 + offset1);
+
+    const uint m   = (uint)ne01;
+    const uint K   = (uint)ne00;
+    const uint nsb = K / QK_K;
+
+    const uint lid = get_local_id(0);
+    const uint sg  = get_local_id(1);
+    const uint col = get_group_id(1);
+    const uint ks  = get_group_id(2);
+    const uint nks = get_num_groups(2);
+
+    // this slice's super-block range; the subgroups stride within it
+    const uint ib0 = (nsb * ks)        / nks;
+    const uint ib1 = (nsb * (ks + 1u)) / nks;
+
+    global const float * y = src1 + (ulong)col * (uint)ne10;
+
+    IQ4XS_CB_DECL
+
+    const uint mh  = m >> 1;
+    const uint j   = get_group_id(0) * 64u + lid;
+    const uint row = j << 1;
+
+    float sumf = 0.f, sumf1 = 0.f;
+
+    if (j < mh) {
+        global const uint * qu = (global const uint *)src0_q;
+        global const uint * su = (global const uint *)src0_sh;
+
+        for (uint ib = ib0 + sg; ib < ib1; ib += IQ4XS_MV_NSG) {
+            const uint  sbase = j + ib * mh;
+            const uint2 slv   = vload2(sbase, src0_sl);
+            const uint  shp   = su[sbase];
+            const half2 dh    = vload2(sbase, src0_d);
+            const float d0    = (float)dh.s0;
+            const float d1    = (float)dh.s1;
+
+            float acc0 = 0.f, acc1 = 0.f;
+            for (uint sb = 0; sb < 8u; ++sb) {
+                const int ls0 = (int)(((slv.s0 >> (8u * (sb >> 1))) >> (4u * (sb & 1u))) & 0xFu)
+                              | (int)((((shp      ) >> (2u * sb)) & 3u) << 4);
+                const int ls1 = (int)(((slv.s1 >> (8u * (sb >> 1))) >> (4u * (sb & 1u))) & 0xFu)
+                              | (int)((((shp >> 16) >> (2u * sb)) & 3u) << 4);
+
+                const uint grp = ib * 64u + sb * 8u;
+                const uint qb  = j + grp * mh;
+
+                float a0 = 0.f, a1 = 0.f;
+                for (uint u = 0; u < 8u; ++u) {
+                    const uint   w  = qu[qb + u * mh];
+                    const ushort w0 = (ushort)(w & 0xFFFFu);
+                    const ushort w1 = (ushort)(w >> 16);
+                    const float4 yv = IQ4XS_YV(grp + u, y);
+                    IQ4XS_ACC(a0, yv, w0);
+                    IQ4XS_ACC(a1, yv, w1);
+                }
+                acc0 += (float)(ls0 - 32) * a0;
+                acc1 += (float)(ls1 - 32) * a1;
+            }
+            sumf  += d0 * acc0;
+            sumf1 += d1 * acc1;
+        }
+    }
+
+#if IQ4XS_MV_NSG > 1
+    __local float2 skpart[IQ4XS_MV_NSG][64];
+    skpart[sg][lid] = (float2)(sumf, sumf1);
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (sg != 0) {
+        return;
+    }
+    for (uint s = 1; s < IQ4XS_MV_NSG; ++s) {
+        const float2 p = skpart[s][lid];
+        sumf  += p.s0;
+        sumf1 += p.s1;
+    }
+#endif
+
+    if (j < mh) {
+        // [ksplit][M], the layout kernel_gemv_splitk_reduce_f32 expects
+        global float * o = partial + (ulong)ks * m + row;
+        o[0] = sumf;
+        o[1] = sumf1;
+    }
+}
