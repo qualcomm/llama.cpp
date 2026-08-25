@@ -489,6 +489,23 @@ kernel void kernel_mul_mv_iq3_s_f32_flat(
 // IQ3S_MV_DP4A_FASTPACK=1 replaces iq3s_pack's four branches with a packed
 // two's-complement negate. Safe ONLY because iq3s_grid values are odd 1..15 and
 // never 0: (b ^ 0xFF) + 1 would carry into the next byte iff b == 0.
+// MEASURED RESULT: this loses, and it is the kernel that loses, not the
+// pre-pass. At matched dispatch counts (5544 each) the float GEMV takes
+// 1086 ms of GPU time and this one 1183 ms (+8.9%); kernel_quant_a_q8_1 adds
+// only 15 ms on top, so amortising the activation quantisation across GEMVs
+// that share an activation could not close the gap. End to end it is -6.6%
+// on a 3B and -2.6% on a 27B, the difference being the fixed pre-pass cost
+// spread over more rows.
+//
+// The reason is the operand, not the dot. dp4a pays when the int8 weight
+// falls out of the stored bits with a shift and a mask, as it does for the
+// linear quants. A codebook quant has to SYNTHESISE the operand -- table
+// lookup, then a packed sign flip -- and that synthesis costs more than the
+// four multiply-accumulates the dot removes. FASTPACK being worth +13.6%
+// over the branchy pack is the same fact seen from the other side.
+//
+// Left in, default off, so the next person can re-measure rather than
+// re-derive it.
 #ifndef IQ3S_MV_DP4A_FASTPACK
 #define IQ3S_MV_DP4A_FASTPACK 1
 #endif
