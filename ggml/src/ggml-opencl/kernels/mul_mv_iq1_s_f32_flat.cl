@@ -518,6 +518,17 @@ kernel void kernel_mul_mv_iq1_s_f32_flat(
 // gate and up, so it is computed once here instead of twice.
 //
 // R2 only, like its twin. See the IQ2_S kernel header for the accuracy note.
+//
+// MEASURED on X2-90, fired-checked (476 fused dispatches in a 16-token profile),
+// both arms repeated:
+//   Llama-3.2-3B-UD-IQ1_S  tg64  29.775 -> 33.471  (+12.4%)
+//   Qwen3.8-27B-UD-IQ1_S   tg32   4.235 ->  4.672  (+10.3%)
+// wikitext PPL 96.9777 either way.
+//
+// Note the 27B baseline here (4.235) is above the 3.712 recorded for the same
+// file earlier in the round: the IQ2_S fusion landed in between and that model
+// carries IQ2_S tensors too. The A/B is still clean, it isolates IQ1_S, but do
+// not read the two absolute numbers as a single before/after.
 // ---------------------------------------------------------------------------
 
 // Third copy of the shared GLU epilogue: each .cl is its own program, so it
