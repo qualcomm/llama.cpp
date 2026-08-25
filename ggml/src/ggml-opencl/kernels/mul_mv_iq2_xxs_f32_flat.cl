@@ -56,6 +56,23 @@
 #define IQ2XXS_MV_GRIDIMG 1
 #endif
 
+// IQ2XXS_MV_ABL: COST PROBE ONLY, WRONG MATH. Attributes the inner loop so the
+// value of removing the codebook can be known BEFORE paying for it.
+//
+//   0  normal
+//   1  the grid fetch becomes an arithmetic function of the index: the gather
+//      disappears and every load around it stays. This is the UPPER BOUND on
+//      what any codebook rework can win, including folding the codes into the
+//      quant plane at upload (which would cost 2.06 -> 3.06 bits per weight).
+//   2  as 1, and the per-weight sign application is dropped as well.
+//
+// The arithmetic MUST consume the index. An earlier version of this probe on
+// IQ3_S used a literal, which let the compiler delete the qs load as well, so
+// that arm measured "no grid AND no weights" and read +53% against a true +20%.
+#ifndef IQ2XXS_MV_ABL
+#define IQ2XXS_MV_ABL 0
+#endif
+
 constant uint iq2xxs_grid[512] = {
     0x08080808, 0x08080808, 0x0808082b, 0x08080808, 0x08081919, 0x08080808, 0x08082b08, 0x08080808,
     0x08082b2b, 0x08080808, 0x08190819, 0x08080808, 0x08191908, 0x08080808, 0x082b0808, 0x08080808,
@@ -130,7 +147,12 @@ constant uint iq2xxs_grid[512] = {
 // loads serialize on Adreno, the same reason the codebook in the IQ4_XS kernels
 // is packed into a uint array rather than indexed as bytes.
 inline uint iq2xxs_signs(uint code7) {
+#if IQ2XXS_MV_ABL >= 2
+    // aux is still loaded for the scale, so this drops arithmetic only
+    return code7 & 0u;
+#else
     return code7 | ((uint)(popcount(code7) & 1u) << 7);
+#endif
 }
 
 // IQ2XXS_MV_SIGNXOR=1: apply the four per-weight signs by XOR-ing the float sign
@@ -188,7 +210,10 @@ kernel void kernel_mul_mv_iq2_xxs_f32_flat(
 
     global const float * y = src1 + (ulong)col * (uint)ne10;
 
-#if IQ2XXS_MV_GRIDIMG
+#if IQ2XXS_MV_ABL >= 1
+// consumes the index, so the qs load it came from cannot be eliminated
+#define IQ2XXS_GRID(i) (((uint)(i) * 0x01010101u) | 0x01010101u)
+#elif IQ2XXS_MV_GRIDIMG
 #define IQ2XXS_GRID(i) (read_imageui(grid_img, (int)(i)).x)
 #else
 #define IQ2XXS_GRID(i) iq2xxs_grid[(i)]

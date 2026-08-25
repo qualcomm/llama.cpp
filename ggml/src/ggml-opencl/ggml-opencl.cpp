@@ -2243,6 +2243,14 @@ static int ggml_cl_iq2xxs_flat_gridimg(const ggml_backend_opencl_context * backe
     return ggml_cl_gridimg_default(backend_ctx, "GGML_OPENCL_IQ2XXS_FLAT_GRIDIMG");
 }
 
+// Cost probe only, wrong math: 1 removes the codebook gather, 2 also removes the
+// sign application. See the kernel header for why the probe has to consume the
+// index. Bounds the payoff of a codebook rework before one gets built.
+static int ggml_cl_iq2xxs_mv_abl() {
+    static const int v = ggml_cl_env_int("GGML_OPENCL_IQ2XXS_MV_ABL", 0);
+    return v;
+}
+
 static int ggml_cl_iq2xs_mv_nsg() {
     static const int v = ggml_cl_env_int("GGML_OPENCL_IQ2XS_MV_NSG", 8);
     return v;
@@ -3623,6 +3631,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         opts += " -DIQ2XXS_MV_GRIDIMG=" + std::to_string(ggml_cl_iq2xxs_flat_gridimg(backend_ctx));
         opts += " -DIQ2XXS_MV_SIGNXOR=" + std::to_string(ggml_cl_iq2xxs_mv_signxor());
         opts += " -DIQ2XXS_MV_R2=" + std::to_string(ggml_cl_iq2xxs_mv_r2());
+        opts += " -DIQ2XXS_MV_ABL=" + std::to_string(ggml_cl_iq2xxs_mv_abl());
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), opts);
 
