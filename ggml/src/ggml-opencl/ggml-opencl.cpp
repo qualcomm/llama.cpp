@@ -2303,17 +2303,34 @@ static int ggml_cl_iq1s_splitk_on(const ggml_backend_opencl_context * backend_ct
 //
 // ⇒ For the types still missing a fusion, ask whether it shares WORK, not just a
 // load: q2_K has mins and is a candidate; q3_K, q5_K, q6_K and q8_0 do not.
-// Q2_K is the type the 2026-08-25 rule points at hardest: the fusion pays where it
-// shares COMPUTATION rather than an activation load, and Q2_K carries a MIN, so
-// every 16-weight run needs that run's activation sum -- row-independent, and
-// therefore shareable between the gate and up streams. It is also the slowest
-// prefill in the 3B roster and had neither this nor a K split.
+// MEASURED NEGATIVE: -1.3%. Llama-3.2-3B-Q2_K tg64 on an X2-90, arms repeated,
+// and fired-checked against the master fusion switch, which separates cleanly:
+//
+//     fused reachable          38.09
+//     master fusion OFF        38.89   (fused path unreachable)
+//     Q2K gate OFF             38.59   (matched control)
+//
+// PPL 9.9523 either way, prefill unchanged. DEFAULT OFF; the kernel stays so this
+// is re-measurable rather than re-derived.
+//
+// 🔑 WHY, and it sharpens the rule rather than breaking it. Q2_K does have the
+// shared-computation term the rule asks for -- a min times a row-independent
+// activation sum -- but its PLAIN kernel is R4, and R4 exists precisely to
+// amortise that sum over four rows. The fused kernel at R2 amortises it over four
+// row-STREAMS, which is the same amount. So the fusion adds no sharing this
+// baseline did not already have; what is left is the activation load and one
+// dispatch, and IQ4_XS already showed that alone is worth nothing.
+//
+// ⇒ REFINED RULE: the fusion pays only where it provides sharing the BASELINE
+// KERNEL DOES NOT ALREADY HAVE. IQ1_S / IQ1_M / IQ2_S were R2 with no cross-row
+// amortisation beyond their two rows, so fusing doubled it and they gained
+// 10-13%. Q2_K had already collected it. This closes the question for the rest:
+// q3_K, q5_K, q6_K and q8_0 have no such term at all, so there is nothing to
+// share and no candidate left in the backend.
 static int ggml_cl_q2k_fuse_glu(const ggml_backend_opencl_context * backend_ctx) {
-    static const char * const e = getenv("GGML_OPENCL_Q2K_FUSE_GLU");
-    if (e && *e) {
-        return atoi(e) != 0;
-    }
-    return backend_ctx->adreno_x2_class();
+    GGML_UNUSED(backend_ctx);
+    static const int v = ggml_cl_env_int("GGML_OPENCL_Q2K_FUSE_GLU", 0);
+    return v;
 }
 
 static int ggml_cl_iq4xs_fuse_glu(const ggml_backend_opencl_context * backend_ctx) {
