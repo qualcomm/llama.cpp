@@ -2177,11 +2177,17 @@ static int ggml_cl_iq4xs_mv_r4() {
 // cost probe says the codebook gather is 0.2% of that loop while the activation
 // load is 13.2%, and the load is 64x redundant (every lane of a subgroup reads the
 // same address). A wave-uniform image read is established free on this part.
-// Off until measured; the image is built per dispatch, so the measurement has to
-// clear that overhead as well as win the 13.2%.
-static int ggml_cl_iq3s_mv_aimg() {
-    static const int v = ggml_cl_env_int("GGML_OPENCL_IQ3S_MV_AIMG", 0);
-    return v;
+// MEASURED, arms repeated, and it clears the per-dispatch image creation easily:
+//     3B IQ3_M      tg64  32.408 / 32.310  ->  35.758 / 35.778   +10.5%
+//     27B UD-IQ3_S  tg32   5.106 /  5.097  ->   5.242 /  5.246    +2.8%
+// wikitext PPL 7.3619 either way, prefill unchanged (887.7 -> 884.8, noise).
+// +10.5% against a 13.2% ceiling means the image creation costs little even at
+// ~100 dispatches per token. Default follows the per-generation texture gate,
+// like every other texture path here.
+static int ggml_cl_gridimg_default(const ggml_backend_opencl_context * backend_ctx, const char * env);
+
+static int ggml_cl_iq3s_mv_aimg(const ggml_backend_opencl_context * backend_ctx) {
+    return ggml_cl_gridimg_default(backend_ctx, "GGML_OPENCL_IQ3S_MV_AIMG");
 }
 
 static int ggml_cl_iq3s_mv_nsg() {
@@ -3985,7 +3991,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         std::string opts = compile_opts;
         opts += " -DIQ3S_MV_NSG=" + std::to_string(ggml_cl_iq3s_mv_nsg());
-        opts += " -DIQ3S_MV_AIMG=" + std::to_string(ggml_cl_iq3s_mv_aimg());
+        opts += " -DIQ3S_MV_AIMG=" + std::to_string(ggml_cl_iq3s_mv_aimg(backend_ctx));
         opts += " -DIQ3S_MV_LDSGRID=" + std::to_string(ggml_cl_iq3s_mv_ldsgrid());
         opts += " -DIQ3S_MV_GRIDIMG=" + std::to_string(ggml_cl_iq3s_mv_gridimg(backend_ctx));
         opts += " -DIQ3S_MV_DP4A_FASTPACK=" + std::to_string(ggml_cl_iq3s_mv_dp4a_fastpack());
@@ -36873,7 +36879,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     // so the grid image stands in when the path is off.
                     cl_mem   iq3s_y_img = nullptr;
                     cl_uint  iq3s_y_off = 0;
-                    if (ggml_cl_iq3s_mv_aimg() && (offset1 % 16) == 0 && (ne10 % 4) == 0) {
+                    if (ggml_cl_iq3s_mv_aimg(backend_ctx) && (offset1 % 16) == 0 && (ne10 % 4) == 0) {
                         const size_t texels = (size_t)(offset1 / 16)
                                             + (size_t)ne11 * (size_t)(ne10 / 4);
                         if (texels > 0 && texels <= backend_ctx->image_max_buffer_size) {
@@ -39434,7 +39440,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 // so the grid image stands in when the path is off.
                 cl_mem   iq3s_y_img = nullptr;
                 cl_uint  iq3s_y_off = 0;
-                if (ggml_cl_iq3s_mv_aimg() && (offset1 % 16) == 0 && (ne10 % 4) == 0) {
+                if (ggml_cl_iq3s_mv_aimg(backend_ctx) && (offset1 % 16) == 0 && (ne10 % 4) == 0) {
                     const size_t texels = (size_t)(offset1 / 16)
                                         + (size_t)ne11 * (size_t)(ne10 / 4);
                     if (texels > 0 && texels <= backend_ctx->image_max_buffer_size) {
