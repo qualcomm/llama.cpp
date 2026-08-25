@@ -538,9 +538,17 @@ kernel void kernel_mul_mv_iq2_s_f32_flat(
 // matters twice over because X2 decode is host and GPU co-bottlenecked.
 //
 // Cost: four accumulators instead of two under IQ2S_MV_R2 (gate/up x row pair).
-// Coherent but not byte-identical to the unfused path, for the same reason the
-// q4_0 fusion is not -- the K-sum order is unchanged but the GLU is applied in
-// registers instead of after a round trip through global memory.
+// MEASURED on X2-90, fired-checked (391 fused dispatches in a 16-token profile,
+// so the A/B is not vacuous), both arms repeated:
+//     Llama-3.2-3B-UD-IQ2_M  tg64  25.773 -> 29.166  (+13.2%)
+// wikitext PPL 14.8367 either way.
+//
+// On accuracy: the per-row K-sum order and the cross-subgroup reduce shape are
+// unchanged from the base GEMV, and the GLU expression is the same one q40_glu_apply
+// uses, so the only difference is that the activation is applied in registers
+// instead of after a round trip. PPL agreeing to four decimals is consistent with
+// bit-identical but does NOT prove it, and it was not checked bit-wise -- treat it
+// as coherent, not as byte-identical.
 //
 // R2 ONLY. The host declines odd row counts before it gets here, exactly as the
 // plane split itself does.

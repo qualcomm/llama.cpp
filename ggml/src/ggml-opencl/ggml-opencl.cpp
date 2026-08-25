@@ -2191,9 +2191,12 @@ static int ggml_cl_iq1s_mv_gridimg(const ggml_backend_opencl_context * backend_c
 // Fuse ffn_gate + ffn_up + GLU for IQ2_S decode. Both GEMVs read the same
 // activation and are 31.1% of a UD-IQ2_M decode frame between them; the q4_0
 // equivalent is worth +10.2%. Coherent but not byte-identical, like that one.
-static int ggml_cl_iq2s_fuse_glu() {
-    static const int v = ggml_cl_env_int("GGML_OPENCL_IQ2S_FUSE_GLU", 0);
-    return v;
+static int ggml_cl_iq2s_fuse_glu(const ggml_backend_opencl_context * backend_ctx) {
+    static const char * const e = getenv("GGML_OPENCL_IQ2S_FUSE_GLU");
+    if (e && *e) {
+        return atoi(e) != 0;
+    }
+    return backend_ctx->adreno_x2_class();
 }
 
 static int ggml_cl_iq2s_mv_gridimg(const ggml_backend_opencl_context * backend_ctx) {
@@ -12966,7 +12969,7 @@ static bool ggml_opencl_can_fuse(const ggml_backend_opencl_context * backend_ctx
         // IQ2_S rides the same gate. It needs the plane split (the fused kernel
         // reads planes), the R2 row pairing it was written for, and its own opt-in.
         if (wg_iq2_s) {
-            if (!ggml_cl_iq2s_fuse_glu() ||
+            if (!ggml_cl_iq2s_fuse_glu(backend_ctx) ||
                 backend_ctx->kernel_mul_mv_iq2_s_f32_flat_glu == nullptr ||
                 !ggml_cl_iq2s_is_split(backend_ctx, gate->src[0]) ||
                 !ggml_cl_iq2s_is_split(backend_ctx, up->src[0]) ||
