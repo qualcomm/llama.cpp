@@ -304,7 +304,9 @@ inline float iq1m_super(uint w0, uint w1, uint w2, uint w3) {
 // IQ1M_MV_GRIDIMG=1: read the grid through an image1d_buffer.
 //
 // The image tier beat local memory on IQ1_S (+2.5%) and IQ2_S (+4.4%), and beat
-// __constant on IQ3_S (+10.4%) and IQ3_XXS (+18.8%). This one currently stages in local memory, the case where the image won by less.
+// __constant on IQ3_S (+10.4%) and IQ3_XXS (+18.8%). This one stages in local
+// memory, and the image wins here too: Llama-3.2-3B UD-IQ1_M tg64 21.95 -> 22.69,
+// +3.4%. On for X2-class with the other plane-split grid types.
 //
 // Filled by kernel_iq1m_grid_export from the table this kernel compiles in, so the
 // host never duplicates it and the two cannot drift.
