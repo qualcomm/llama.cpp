@@ -21,6 +21,19 @@
 // entry is EIGHT bytes rather than four, so one lookup feeds two float4 dots and
 // the table is indexed as uint pairs (lo, hi) instead of single uints.
 
+// MEASURED on X2-90, bracketed, both arms repeated:
+//
+//   Qwen3.8-27B-UD-IQ2_XXS   pp512  42.2 -> 80.9 (1.92x)   tg32  2.18 -> 3.72 (1.71x)
+//   Llama-3.2-3B-UD-IQ1_S    pp512 617.8 -> 785.3 (+27.1%) tg64 25.72 -> 29.39 (+14.3%)
+//
+// The 3B carries only 43 IQ2_XXS tensors, which is why it gains less than the
+// 27B, where the type is the whole model. Prefill also picks up the dp4a GEMM
+// in gemm_noshuffle_iq2_xxs_q8_1_dp4a; the GEMV alone accounts for decode.
+//
+// Correctness: the plane round trip is byte exact on all 43 tensors, and
+// wikitext PPL agrees within its error bar (3B 109.21 -> 108.82 +/- 5.9,
+// 27B 7.1547 -> 7.1440 +/- 0.46) -- float reassociation, not a numerics change.
+
 #define QK_K 256
 
 #ifndef IQ2XXS_MV_NSG

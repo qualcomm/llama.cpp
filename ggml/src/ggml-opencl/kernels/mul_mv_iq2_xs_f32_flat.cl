@@ -16,6 +16,16 @@
 // The grid is twice as long (512 entries) and is indexed the same way, as uint
 // pairs, because one entry is eight bytes.
 
+// MEASURED on X2-90: Llama-3.2-3B-UD-IQ2_M pp512 679.5 -> 685.1 (+0.8%),
+// tg64 25.55 -> 25.69 (+0.6%). Small because that file holds only five IQ2_XS
+// tensors -- the rest is IQ2_S, which was already split. No model on hand is
+// IQ2_XS-dominant, so the large-gain case for this kernel is still unmeasured;
+// its twin one step down, IQ2_XXS, is 1.92x prefill and 1.71x decode on a model
+// made of it.
+//
+// Correctness: the plane round trip is byte exact on all five tensors, and
+// wikitext PPL agrees within its error bar (17.078 -> 17.099 +/- 0.88).
+
 #define QK_K 256
 
 #ifndef IQ2XS_MV_NSG
