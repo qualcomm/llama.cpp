@@ -2556,9 +2556,13 @@ static int ggml_cl_iq1m_gemm_gridimg(const ggml_backend_opencl_context * backend
 // The pre-biased operand table: deletes IQ1_M's delta correction from the prefill
 // GEMM outright rather than making it cheaper. See the kernel header for why the
 // table is CL_RG. Measured before the default stands.
-static int ggml_cl_iq1m_gemm_bias() {
-    static const int v = ggml_cl_env_int("GGML_OPENCL_IQ1M_GEMM_BIAS", 0);
-    return v;
+static bool ggml_cl_has_rg_uint32_image(ggml_backend_opencl_context * backend_ctx);
+
+static int ggml_cl_iq1m_gemm_bias(ggml_backend_opencl_context * backend_ctx) {
+    if (!ggml_cl_has_rg_uint32_image(backend_ctx)) {
+        return 0;
+    }
+    return ggml_cl_gridimg_default(backend_ctx, "GGML_OPENCL_IQ1M_GEMM_BIAS");
 }
 
 static int ggml_cl_iq1m_gemm_fold() {
@@ -3060,6 +3064,35 @@ static void ggml_cl_make_grid_image(ggml_backend_opencl_context * backend_ctx,
     desc.buffer      = *out_buf;
     CL_CHECK((*out_img = clCreateImage(backend_ctx->context, CL_MEM_READ_ONLY,
                                        &fmt, &desc, NULL, &err), err));
+}
+
+// Not every device exposes every channel order for an image1d_buffer, and
+// clCreateImage failing inside CL_CHECK would abort the process at init. Ask
+// first, once, and let the caller decline instead.
+static bool ggml_cl_has_rg_uint32_image(ggml_backend_opencl_context * backend_ctx) {
+    static int cached = -1;
+    if (cached >= 0) {
+        return cached != 0;
+    }
+    cached = 0;
+    cl_uint n = 0;
+    if (clGetSupportedImageFormats(backend_ctx->context, CL_MEM_READ_ONLY,
+                                   CL_MEM_OBJECT_IMAGE1D_BUFFER, 0, NULL, &n) == CL_SUCCESS && n > 0) {
+        std::vector<cl_image_format> fmts(n);
+        if (clGetSupportedImageFormats(backend_ctx->context, CL_MEM_READ_ONLY,
+                                       CL_MEM_OBJECT_IMAGE1D_BUFFER, n, fmts.data(), NULL) == CL_SUCCESS) {
+            for (const auto & f : fmts) {
+                if (f.image_channel_order == CL_RG && f.image_channel_data_type == CL_UNSIGNED_INT32) {
+                    cached = 1;
+                    break;
+                }
+            }
+        }
+    }
+    if (!cached) {
+        GGML_LOG_WARN("ggml_opencl: no CL_RG/UINT32 image1d_buffer; IQ1_M biased operand unavailable\n");
+    }
+    return cached != 0;
 }
 
 // Two-channel twin of ggml_cl_make_grid_image. One texel carries two uints, which
@@ -7088,12 +7121,14 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         opts += " -DIQ1M_GEMM_LDSGRID=" + std::to_string(ggml_cl_iq1m_gemm_ldsgrid());
         opts += " -DIQ1M_GEMM_GRIDIMG=" + std::to_string(ggml_cl_iq1m_gemm_gridimg(backend_ctx));
         opts += " -DIQ1M_GEMM_FOLD=" + std::to_string(ggml_cl_iq1m_gemm_fold());
-        opts += " -DIQ1M_GEMM_BIAS=" + std::to_string(ggml_cl_iq1m_gemm_bias());
+        opts += " -DIQ1M_GEMM_BIAS=" + std::to_string(ggml_cl_iq1m_gemm_bias(backend_ctx));
         cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), opts);
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_iq1_m_q8_1_dp4a = clCreateKernel(prog, "kernel_gemm_noshuffle_iq1_m_q8_1_dp4a", &err), err));
         // 4096 texels = 2048 grid entries x 2 delta signs, 32 KB, built once
-        ggml_cl_make_grid_image_rg(backend_ctx, prog, "kernel_iq1m_bias_export", 4096,
-                                   &backend_ctx->iq1m_bias_buf, &backend_ctx->iq1m_bias_img);
+        if (ggml_cl_iq1m_gemm_bias(backend_ctx)) {
+            ggml_cl_make_grid_image_rg(backend_ctx, prog, "kernel_iq1m_bias_export", 4096,
+                                       &backend_ctx->iq1m_bias_buf, &backend_ctx->iq1m_bias_img);
+        }
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
@@ -37558,7 +37593,11 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                         cl_kernel dk = backend_ctx->kernel_gemm_noshuffle_iq1_m_q8_1_dp4a;
                         int ai = 0;
                         CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_mem),   &backend_ctx->iq1m_grid_img));
-                        CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_mem),   &backend_ctx->iq1m_bias_img));
+                        // when the biased path is off the kernel ignores this arg, but it
+                        // still has to be a valid object
+                        cl_mem bias_arg = backend_ctx->iq1m_bias_img
+                                        ? backend_ctx->iq1m_bias_img : backend_ctx->iq1m_grid_img;
+                        CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_mem),   &bias_arg));
                         CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_mem),   &ex0->qs));
                         CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_mem),   &ex0->qh));
                         CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_mem),   &ex0->sc));
