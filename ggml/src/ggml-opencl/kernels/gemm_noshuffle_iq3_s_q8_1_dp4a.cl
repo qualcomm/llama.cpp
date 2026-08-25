@@ -103,12 +103,36 @@ inline uint iq3s_pack(uint gv, uint sg, uint base) {
          | (((uint)v2 & 0xFFu) << 16) | (((uint)v3 & 0xFFu) << 24);
 }
 
+// IQ3S_GEMM_GRIDIMG=1: read the grid through an image1d_buffer instead of from
+// __constant.
+//
+// Why this and not the LDS variant tried on the IQ2_S twin: in a GEMM every one
+// of the 64 lanes owns a different row, so the eight grid reads per 32-K step are
+// a DIVERGENT gather, and byte/uint-indexed __constant loads serialize on Adreno
+// under exactly that pattern. Local memory lost here because 8 KB of it costs
+// occupancy in a 64-thread workgroup; an image costs no occupancy at all, and it
+// is what won on every one of the five decode GEMVs (IQ3_S +10.4%, IQ3_XXS
+// +18.8%, IQ2_S +4.4%, IQ1_M +3.4%, IQ1_S +2.5%). The GEMMs were never asked.
+//
+// The image is the singleton the decode GEMV already builds at init, so this
+// costs no extra memory. Default off until measured.
+#ifndef IQ3S_GEMM_GRIDIMG
+#define IQ3S_GEMM_GRIDIMG 0
+#endif
+
+#if IQ3S_GEMM_GRIDIMG
+#define IQ3S_GEMM_GRID(img, i) (read_imageui((img), (int)(i)).x)
+#else
+#define IQ3S_GEMM_GRID(img, i) iq3s_grid[(i)]
+#endif
+
 // Operand u of a 32-block: the grid index is qs[u] with its 9th bit taken from
 // bit u of the sub-block's qh byte; base picks the nibble of sgv holding its signs.
-inline uint iq3s_load(__global const uchar * qs, uint qsb, uint qhb, uint m,
+inline uint iq3s_load(__read_only image1d_buffer_t grid_img,
+                      __global const uchar * qs, uint qsb, uint qhb, uint m,
                       uint u, uint sgv, uint base) {
     const uint gidx = (uint)qs[qsb + u * m] | (((qhb >> u) & 1u) << 8);
-    return iq3s_pack(iq3s_grid[gidx], sgv, base);
+    return iq3s_pack(IQ3S_GEMM_GRID(grid_img, gidx), sgv, base);
 }
 
 // The activation tile is staged as uint4, not uint: the eight uints a token needs
@@ -134,6 +158,7 @@ inline int dot8_q8a_v(uint8 qw, uint4 a0, uint4 a1) {
 
 __attribute__((qcom_wave_pair_mode(1)))
 kernel void kernel_gemm_noshuffle_iq3_s_q8_1_dp4a(
+        __read_only image1d_buffer_t grid_img,   // iq3s_grid, see IQ3S_GEMM_GRIDIMG
         __global const uchar  * src0_qs,   // grid index low bits, feature-major
         __global const uchar  * src0_qh,   // 9th index bit
         __global const uchar  * src0_sg,   // signs
@@ -191,14 +216,14 @@ kernel void kernel_gemm_noshuffle_iq3_s_q8_1_dp4a(
         const uint sg3 = (uint)src0_sg[sgb + 3 * (uint)m];
 
         uint8 qw;
-        qw.s0 = iq3s_load(src0_qs, qsb, qhb, (uint)m, 0u, sg0, 0u);
-        qw.s1 = iq3s_load(src0_qs, qsb, qhb, (uint)m, 1u, sg0, 4u);
-        qw.s2 = iq3s_load(src0_qs, qsb, qhb, (uint)m, 2u, sg1, 0u);
-        qw.s3 = iq3s_load(src0_qs, qsb, qhb, (uint)m, 3u, sg1, 4u);
-        qw.s4 = iq3s_load(src0_qs, qsb, qhb, (uint)m, 4u, sg2, 0u);
-        qw.s5 = iq3s_load(src0_qs, qsb, qhb, (uint)m, 5u, sg2, 4u);
-        qw.s6 = iq3s_load(src0_qs, qsb, qhb, (uint)m, 6u, sg3, 0u);
-        qw.s7 = iq3s_load(src0_qs, qsb, qhb, (uint)m, 7u, sg3, 4u);
+        qw.s0 = iq3s_load(grid_img, src0_qs, qsb, qhb, (uint)m, 0u, sg0, 0u);
+        qw.s1 = iq3s_load(grid_img, src0_qs, qsb, qhb, (uint)m, 1u, sg0, 4u);
+        qw.s2 = iq3s_load(grid_img, src0_qs, qsb, qhb, (uint)m, 2u, sg1, 0u);
+        qw.s3 = iq3s_load(grid_img, src0_qs, qsb, qhb, (uint)m, 3u, sg1, 4u);
+        qw.s4 = iq3s_load(grid_img, src0_qs, qsb, qhb, (uint)m, 4u, sg2, 0u);
+        qw.s5 = iq3s_load(grid_img, src0_qs, qsb, qhb, (uint)m, 5u, sg2, 4u);
+        qw.s6 = iq3s_load(grid_img, src0_qs, qsb, qhb, (uint)m, 6u, sg3, 0u);
+        qw.s7 = iq3s_load(grid_img, src0_qs, qsb, qhb, (uint)m, 7u, sg3, 4u);
 
         // cooperatively stage the 32-token x 32-K int8 activations to LDS
         // 16-byte cooperative staging: TILESIZE_N*2 uint4s instead of TILESIZE_N*8

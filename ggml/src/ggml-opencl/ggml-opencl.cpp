@@ -2288,6 +2288,14 @@ static int ggml_cl_iq3s_mv_dp4a_fastpack() {
     return v;
 }
 
+// The prefill GEMM twin of the decode knob below. The GEMMs all read their grid
+// from __constant, which nobody ever revisited after the image won on every one
+// of the decode GEMVs -- and a GEMM gathers MORE divergently, one row per lane.
+static int ggml_cl_iq3s_gemm_gridimg() {
+    static const int v = ggml_cl_env_int("GGML_OPENCL_IQ3S_GEMM_GRIDIMG", 0);
+    return v;
+}
+
 static int ggml_cl_iq3s_mv_gridimg(const ggml_backend_opencl_context * backend_ctx) {
     return ggml_cl_gridimg_default(backend_ctx, "GGML_OPENCL_IQ3S_MV_GRIDIMG");
 }
@@ -6511,7 +6519,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #else
         const std::string kernel_src = read_file("gemm_noshuffle_iq3_s_q8_1_dp4a.cl");
 #endif
-        cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        std::string opts_i3g = compile_opts
+            + " -DIQ3S_GEMM_GRIDIMG=" + std::to_string(ggml_cl_iq3s_gemm_gridimg());
+        cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), opts_i3g);
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_iq3_s_q8_1_dp4a = clCreateKernel(prog, "kernel_gemm_noshuffle_iq3_s_q8_1_dp4a", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
@@ -35847,6 +35857,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 
                         cl_kernel dk = backend_ctx->kernel_gemm_noshuffle_iq3_s_q8_1_dp4a;
                         int ai = 0;
+                        CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_mem),   &backend_ctx->iq3s_grid_img));
                         CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_mem),   &ex0->qs));
                         CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_mem),   &ex0->qh));
                         CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_mem),   &ex0->sg));
