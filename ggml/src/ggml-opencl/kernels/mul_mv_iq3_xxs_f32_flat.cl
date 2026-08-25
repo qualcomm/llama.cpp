@@ -141,6 +141,30 @@ inline float4 iq3xxs_vals(uint gv, uint sgv, uint base) {
 #define IQ3XXS_MV_GRIDIMG 0
 #endif
 
+// IQ3XXS_MV_AIMG=1: read the ACTIVATION through an image1d_buffer.
+//
+// Measured on the siblings: IQ2_S +20.0%, IQ3_S +10.5%, and IQ4_XS -3.7%. The
+// boundary is how heavy the kernel is per weight, not how redundant the read is:
+// the redundancy is identical everywhere (`grp` carries no row index, so every
+// lane of a subgroup reads the SAME address, 64x over), but it only pays where
+// that load is a large share of a large total. This type has a codebook gather
+// and a delta term per 8 weights, which puts it on the winning side -- measured,
+// not assumed.
+//
+// One CL_RGBA/CL_FLOAT texel IS the float4 the scalar path loads, over src1's own
+// buffer, so there is no copy and no pre-pass. Applied to every kernel in the
+// file, because whichever ones this type's fusion and split-K defaults route
+// through are the ones carrying the frame.
+#ifndef IQ3XXS_MV_AIMG
+#define IQ3XXS_MV_AIMG 0
+#endif
+
+#if IQ3XXS_MV_AIMG
+#define IQ3XXS_YV(g) read_imagef(y_img, (int)(y_tex + (g)))
+#else
+#define IQ3XXS_YV(g) vload4((g), y)
+#endif
+
 kernel void kernel_iq3xxs_grid_export(global uint * out) {
     const uint i = get_global_id(0);
     if (i < 256u) {
@@ -150,6 +174,8 @@ kernel void kernel_iq3xxs_grid_export(global uint * out) {
 
 kernel void kernel_mul_mv_iq3_xxs_f32_flat(
         __read_only image1d_buffer_t grid_img,
+        __read_only image1d_buffer_t y_img,   // see IQ3XXS_MV_AIMG
+        uint y_off,                           // offset1/16, in float4 texels
         global const uchar * src0_qs,
         global const uint  * src0_sas,
         global const half  * src0_d,
@@ -174,6 +200,9 @@ kernel void kernel_mul_mv_iq3_xxs_f32_flat(
     const uint col = get_group_id(1);           // token
 
     global const float * y = src1 + (ulong)col * (uint)ne10;
+#if IQ3XXS_MV_AIMG
+    const uint y_tex = y_off + col * ((uint)ne10 >> 2);
+#endif
 
 #if IQ3XXS_MV_GRIDIMG
 #define IQ3XXS_GRID(i) (read_imageui(grid_img, (int)(i)).x)
@@ -221,7 +250,7 @@ kernel void kernel_mul_mv_iq3_xxs_f32_flat(
                     const uint qsv  = (uint)qsu[qsb + u * mh];      // row pair, one load
                     const uint sh   = 7u * (u >> 1);
                     const uint base = (u & 1u) * 4u;
-                    const float4 yv = vload4(grp + u, y);
+                    const float4 yv = IQ3XXS_YV(grp + u);
                     a0 += dot(yv, iq3xxs_vals(IQ3XXS_GRID( qsv        & 0xFFu),
                                               iq3xxs_signs((aux.s0 >> sh) & 127u), base));
                     a1 += dot(yv, iq3xxs_vals(IQ3XXS_GRID((qsv >> 8)  & 0xFFu),
@@ -256,7 +285,7 @@ kernel void kernel_mul_mv_iq3_xxs_f32_flat(
                     const uint g    = (uint)src0_qs[qsb + u * m];
                     const uint sh   = 7u * (u >> 1);
                     const uint base = (u & 1u) * 4u;
-                    const float4 yv = vload4(grp + u, y);
+                    const float4 yv = IQ3XXS_YV(grp + u);
                     a += dot(yv, iq3xxs_vals(IQ3XXS_GRID(g),
                                              iq3xxs_signs((aux >> sh) & 127u), base));
                 }

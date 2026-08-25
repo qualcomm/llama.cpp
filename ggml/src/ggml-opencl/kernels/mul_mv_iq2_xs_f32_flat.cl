@@ -208,8 +208,34 @@ inline float4 iq2xs_vals(uint gv, uint sgv, uint base) {
 #endif
 }
 
+// IQ2XS_MV_AIMG=1: read the ACTIVATION through an image1d_buffer.
+//
+// Measured on the siblings: IQ2_S +20.0%, IQ3_S +10.5%, and IQ4_XS -3.7%. The
+// boundary is how heavy the kernel is per weight, not how redundant the read is:
+// the redundancy is identical everywhere (`grp` carries no row index, so every
+// lane of a subgroup reads the SAME address, 64x over), but it only pays where
+// that load is a large share of a large total. This type has a codebook gather
+// and a delta term per 8 weights, which puts it on the winning side -- measured,
+// not assumed.
+//
+// One CL_RGBA/CL_FLOAT texel IS the float4 the scalar path loads, over src1's own
+// buffer, so there is no copy and no pre-pass. Applied to every kernel in the
+// file, because whichever ones this type's fusion and split-K defaults route
+// through are the ones carrying the frame.
+#ifndef IQ2XS_MV_AIMG
+#define IQ2XS_MV_AIMG 0
+#endif
+
+#if IQ2XS_MV_AIMG
+#define IQ2XS_YV(g) read_imagef(y_img, (int)(y_tex + (g)))
+#else
+#define IQ2XS_YV(g) vload4((g), y)
+#endif
+
 kernel void kernel_mul_mv_iq2_xs_f32_flat(
         __read_only image1d_buffer_t grid_img,
+        __read_only image1d_buffer_t y_img,   // see IQ2XS_MV_AIMG
+        uint y_off,                           // offset1/16, in float4 texels
         global const ushort * src0_qs,
         global const uchar  * src0_sc,
         global const half   * src0_d,
@@ -234,6 +260,9 @@ kernel void kernel_mul_mv_iq2_xs_f32_flat(
     const uint col = get_group_id(1);           // token
 
     global const float * y = src1 + (ulong)col * (uint)ne10;
+#if IQ2XS_MV_AIMG
+    const uint y_tex = y_off + col * ((uint)ne10 >> 2);
+#endif
 
 #if IQ2XS_MV_GRIDIMG
 #define IQ2XS_GRID(i) (read_imageui(grid_img, (int)(i)).x)
@@ -282,8 +311,8 @@ kernel void kernel_mul_mv_iq2_xs_f32_flat(
                     const uint sg0 = iq2xs_signs(q0 >> 9);
                     const uint sg1 = iq2xs_signs(q1 >> 9);
 
-                    const float4 yl = vload4(sub * 8u + u * 2u + 0u, y);
-                    const float4 yh = vload4(sub * 8u + u * 2u + 1u, y);
+                    const float4 yl = IQ2XS_YV(sub * 8u + u * 2u + 0u);
+                    const float4 yh = IQ2XS_YV(sub * 8u + u * 2u + 1u);
 
                     const float a0 = dot(yl, iq2xs_vals(IQ2XS_GRID(g0    ), sg0, 0u))
                                    + dot(yh, iq2xs_vals(IQ2XS_GRID(g0 + 1), sg0, 4u));
@@ -326,8 +355,8 @@ kernel void kernel_mul_mv_iq2_xs_f32_flat(
                     const uint g  = (q & 511u) << 1;
                     const uint sg = iq2xs_signs(q >> 9);
 
-                    const float4 yl = vload4(sub * 8u + u * 2u + 0u, y);
-                    const float4 yh = vload4(sub * 8u + u * 2u + 1u, y);
+                    const float4 yl = IQ2XS_YV(sub * 8u + u * 2u + 0u);
+                    const float4 yh = IQ2XS_YV(sub * 8u + u * 2u + 1u);
 
                     const float a = dot(yl, iq2xs_vals(IQ2XS_GRID(g    ), sg, 0u))
                                   + dot(yh, iq2xs_vals(IQ2XS_GRID(g + 1), sg, 4u));

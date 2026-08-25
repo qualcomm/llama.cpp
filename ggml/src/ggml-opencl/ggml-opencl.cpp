@@ -2222,6 +2222,24 @@ static int ggml_cl_iq1m_mv_aimg(const ggml_backend_opencl_context * backend_ctx)
     return ggml_cl_gridimg_default(backend_ctx, "GGML_OPENCL_IQ1M_MV_AIMG");
 }
 
+// The IQ2XXS twin. Codebook gather plus a delta term per 8 weights puts it on the
+// paying side of the boundary IQ4_XS drew; applied to every kernel in its file.
+static int ggml_cl_iq2xxs_mv_aimg(const ggml_backend_opencl_context * backend_ctx) {
+    return ggml_cl_gridimg_default(backend_ctx, "GGML_OPENCL_IQ2XXS_MV_AIMG");
+}
+
+// The IQ2XS twin. Codebook gather plus a delta term per 8 weights puts it on the
+// paying side of the boundary IQ4_XS drew; applied to every kernel in its file.
+static int ggml_cl_iq2xs_mv_aimg(const ggml_backend_opencl_context * backend_ctx) {
+    return ggml_cl_gridimg_default(backend_ctx, "GGML_OPENCL_IQ2XS_MV_AIMG");
+}
+
+// The IQ3XXS twin. Codebook gather plus a delta term per 8 weights puts it on the
+// paying side of the boundary IQ4_XS drew; applied to every kernel in its file.
+static int ggml_cl_iq3xxs_mv_aimg(const ggml_backend_opencl_context * backend_ctx) {
+    return ggml_cl_gridimg_default(backend_ctx, "GGML_OPENCL_IQ3XXS_MV_AIMG");
+}
+
 static int ggml_cl_iq2s_mv_aimg(const ggml_backend_opencl_context * backend_ctx) {
     return ggml_cl_gridimg_default(backend_ctx, "GGML_OPENCL_IQ2S_MV_AIMG");
 }
@@ -4110,6 +4128,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         opts += " -DIQ3XXS_MV_NSG=" + std::to_string(ggml_cl_iq3xxs_mv_nsg());
         opts += " -DIQ3XXS_MV_LDSGRID=" + std::to_string(ggml_cl_iq3xxs_mv_ldsgrid());
         opts += " -DIQ3XXS_MV_GRIDIMG=" + std::to_string(ggml_cl_iq3xxs_mv_gridimg(backend_ctx));
+        opts += " -DIQ3XXS_MV_AIMG=" + std::to_string(ggml_cl_iq3xxs_mv_aimg(backend_ctx));
         opts += " -DIQ3XXS_MV_SIGNXOR=" + std::to_string(ggml_cl_iq3xxs_mv_signxor());
         opts += " -DIQ3XXS_MV_R2="  + std::to_string(ggml_cl_iq3xxs_mv_r2());
         cl_program prog =
@@ -4134,6 +4153,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         std::string opts = compile_opts;
         opts += " -DIQ2XXS_MV_NSG=" + std::to_string(ggml_cl_iq2xxs_mv_nsg());
         opts += " -DIQ2XXS_MV_GRIDIMG=" + std::to_string(ggml_cl_iq2xxs_flat_gridimg(backend_ctx));
+        opts += " -DIQ2XXS_MV_AIMG=" + std::to_string(ggml_cl_iq2xxs_mv_aimg(backend_ctx));
         opts += " -DIQ2XXS_MV_SIGNXOR=" + std::to_string(ggml_cl_iq2xxs_mv_signxor());
         opts += " -DIQ2XXS_MV_R2=" + std::to_string(ggml_cl_iq2xxs_mv_r2());
         opts += " -DIQ2XXS_MV_ABL=" + std::to_string(ggml_cl_iq2xxs_mv_abl());
@@ -4164,6 +4184,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         std::string opts = compile_opts;
         opts += " -DIQ2XS_MV_NSG=" + std::to_string(ggml_cl_iq2xs_mv_nsg());
         opts += " -DIQ2XS_MV_GRIDIMG=" + std::to_string(ggml_cl_iq2xs_flat_gridimg(backend_ctx));
+        opts += " -DIQ2XS_MV_AIMG=" + std::to_string(ggml_cl_iq2xs_mv_aimg(backend_ctx));
         opts += " -DIQ2XS_MV_SIGNXOR=" + std::to_string(ggml_cl_iq2xs_mv_signxor());
         opts += " -DIQ2XS_MV_R2=" + std::to_string(ggml_cl_iq2xs_mv_r2());
         cl_program prog =
@@ -24082,7 +24103,14 @@ static void ggml_cl_mul_mat_iq2_xxs_glu_fused(ggml_backend_t backend, ggml_tenso
     const int nsg = ggml_cl_iq2xxs_mv_nsg();
 
     cl_int ai = 0;
+    cl_uint iq2xxs_y_off = 0;
+    cl_mem  iq2xxs_y_img = ggml_cl_iq2xxs_mv_aimg(backend_ctx)
+        ? ggml_cl_activation_image(backend_ctx, extra1->data_device, offset1, ne10, ne11, &iq2xxs_y_off)
+        : nullptr;
+    cl_mem  iq2xxs_y_arg = iq2xxs_y_img ? iq2xxs_y_img : backend_ctx->iq2xxs_grid_img;
     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &backend_ctx->iq2xxs_grid_img));
+    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),  &iq2xxs_y_arg));
+    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_uint), &iq2xxs_y_off));
     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex_g->qs));
     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex_g->sas));
     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex_g->d));
@@ -24103,6 +24131,7 @@ static void ggml_cl_mul_mat_iq2_xxs_glu_fused(ggml_backend_t backend, ggml_tenso
                            (size_t)ne11 * (size_t)nsg, 1 };
     size_t f_local[3]  = { 64, (size_t)nsg, 1 };
     backend_ctx->enqueue_ndrange_kernel(fk, 3, f_global, f_local, (ggml_tensor *)dst);
+    if (iq2xxs_y_img) { CL_CHECK(clReleaseMemObject(iq2xxs_y_img)); }
 #else
     GGML_UNUSED(backend); GGML_UNUSED(gate_tensor);
     GGML_UNUSED(up_tensor); GGML_UNUSED(glu_tensor);
@@ -36785,7 +36814,14 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     cl_kernel fk = backend_ctx->kernel_mul_mv_iq3_xxs_f32_flat;
                     const int nsg = ggml_cl_iq3xxs_mv_nsg();
                     cl_int ai = 0;
+                    cl_uint iq3xxs_y_off = 0;
+                    cl_mem  iq3xxs_y_img = ggml_cl_iq3xxs_mv_aimg(backend_ctx)
+                        ? ggml_cl_activation_image(backend_ctx, extra1->data_device, offset1, ne10, ne11, &iq3xxs_y_off)
+                        : nullptr;
+                    cl_mem  iq3xxs_y_arg = iq3xxs_y_img ? iq3xxs_y_img : backend_ctx->iq3xxs_grid_img;
                     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &backend_ctx->iq3xxs_grid_img));
+                    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),  &iq3xxs_y_arg));
+                    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_uint), &iq3xxs_y_off));
                     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->qs));
                     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->sas));
                     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->d));
@@ -36803,6 +36839,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                                            (size_t)ne11 * (size_t)nsg, 1 };
                     size_t f_local[3]  = { 64, (size_t)nsg, 1 };
                     backend_ctx->enqueue_ndrange_kernel(fk, 3, f_global, f_local, dst);
+                    if (iq3xxs_y_img) { CL_CHECK(clReleaseMemObject(iq3xxs_y_img)); }
                     return;
                 }
 
@@ -37129,7 +37166,14 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     cl_kernel fk = backend_ctx->kernel_mul_mv_iq2_xxs_f32_flat;
                     const int nsg = ggml_cl_iq2xxs_mv_nsg();
                     cl_int ai = 0;
+                    cl_uint iq2xxs_y_off = 0;
+                    cl_mem  iq2xxs_y_img = ggml_cl_iq2xxs_mv_aimg(backend_ctx)
+                        ? ggml_cl_activation_image(backend_ctx, extra1->data_device, offset1, ne10, ne11, &iq2xxs_y_off)
+                        : nullptr;
+                    cl_mem  iq2xxs_y_arg = iq2xxs_y_img ? iq2xxs_y_img : backend_ctx->iq2xxs_grid_img;
                     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &backend_ctx->iq2xxs_grid_img));
+                    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),  &iq2xxs_y_arg));
+                    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_uint), &iq2xxs_y_off));
                     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->qs));
                     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->sas));
                     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->d));
@@ -37147,6 +37191,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                                            (size_t)ne11 * (size_t)nsg, 1 };
                     size_t f_local[3]  = { 64, (size_t)nsg, 1 };
                     backend_ctx->enqueue_ndrange_kernel(fk, 3, f_global, f_local, dst);
+                    if (iq2xxs_y_img) { CL_CHECK(clReleaseMemObject(iq2xxs_y_img)); }
                     return;
                 }
 
@@ -37265,7 +37310,14 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     cl_kernel fk = backend_ctx->kernel_mul_mv_iq2_xs_f32_flat;
                     const int nsg = ggml_cl_iq2xs_mv_nsg();
                     cl_int ai = 0;
+                    cl_uint iq2xs_y_off = 0;
+                    cl_mem  iq2xs_y_img = ggml_cl_iq2xs_mv_aimg(backend_ctx)
+                        ? ggml_cl_activation_image(backend_ctx, extra1->data_device, offset1, ne10, ne11, &iq2xs_y_off)
+                        : nullptr;
+                    cl_mem  iq2xs_y_arg = iq2xs_y_img ? iq2xs_y_img : backend_ctx->iq2xs_grid_img;
                     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &backend_ctx->iq2xs_grid_img));
+                    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),  &iq2xs_y_arg));
+                    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_uint), &iq2xs_y_off));
                     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->qs));
                     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->sc));
                     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->d));
@@ -37283,6 +37335,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                                            (size_t)ne11 * (size_t)nsg, 1 };
                     size_t f_local[3]  = { 64, (size_t)nsg, 1 };
                     backend_ctx->enqueue_ndrange_kernel(fk, 3, f_global, f_local, dst);
+                    if (iq2xs_y_img) { CL_CHECK(clReleaseMemObject(iq2xs_y_img)); }
                     return;
                 }
 
@@ -39378,7 +39431,14 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 cl_kernel fk = backend_ctx->kernel_mul_mv_iq3_xxs_f32_flat;
                 const int nsg = ggml_cl_iq3xxs_mv_nsg();
                 cl_int ai = 0;
+                cl_uint iq3xxs_y_off = 0;
+                cl_mem  iq3xxs_y_img = ggml_cl_iq3xxs_mv_aimg(backend_ctx)
+                    ? ggml_cl_activation_image(backend_ctx, extra1->data_device, offset1, ne10, ne11, &iq3xxs_y_off)
+                    : nullptr;
+                cl_mem  iq3xxs_y_arg = iq3xxs_y_img ? iq3xxs_y_img : backend_ctx->iq3xxs_grid_img;
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &backend_ctx->iq3xxs_grid_img));
+                CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),  &iq3xxs_y_arg));
+                CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_uint), &iq3xxs_y_off));
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->qs));
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->sas));
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->d));
@@ -39396,6 +39456,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                                        (size_t)ne11 * (size_t)nsg, 1 };
                 size_t f_local[3]  = { 64, (size_t)nsg, 1 };
                 backend_ctx->enqueue_ndrange_kernel(fk, 3, f_global, f_local, dst);
+                if (iq3xxs_y_img) { CL_CHECK(clReleaseMemObject(iq3xxs_y_img)); }
                 return;
             }
 
@@ -39635,7 +39696,14 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 cl_kernel fk = backend_ctx->kernel_mul_mv_iq2_xxs_f32_flat;
                 const int nsg = ggml_cl_iq2xxs_mv_nsg();
                 cl_int ai = 0;
+                cl_uint iq2xxs_y_off = 0;
+                cl_mem  iq2xxs_y_img = ggml_cl_iq2xxs_mv_aimg(backend_ctx)
+                    ? ggml_cl_activation_image(backend_ctx, extra1->data_device, offset1, ne10, ne11, &iq2xxs_y_off)
+                    : nullptr;
+                cl_mem  iq2xxs_y_arg = iq2xxs_y_img ? iq2xxs_y_img : backend_ctx->iq2xxs_grid_img;
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &backend_ctx->iq2xxs_grid_img));
+                CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),  &iq2xxs_y_arg));
+                CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_uint), &iq2xxs_y_off));
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->qs));
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->sas));
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->d));
@@ -39653,6 +39721,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                                        (size_t)ne11 * (size_t)nsg, 1 };
                 size_t f_local[3]  = { 64, (size_t)nsg, 1 };
                 backend_ctx->enqueue_ndrange_kernel(fk, 3, f_global, f_local, dst);
+                if (iq2xxs_y_img) { CL_CHECK(clReleaseMemObject(iq2xxs_y_img)); }
                 return;
             }
 
@@ -39704,7 +39773,14 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 cl_kernel fk = backend_ctx->kernel_mul_mv_iq2_xs_f32_flat;
                 const int nsg = ggml_cl_iq2xs_mv_nsg();
                 cl_int ai = 0;
+                cl_uint iq2xs_y_off = 0;
+                cl_mem  iq2xs_y_img = ggml_cl_iq2xs_mv_aimg(backend_ctx)
+                    ? ggml_cl_activation_image(backend_ctx, extra1->data_device, offset1, ne10, ne11, &iq2xs_y_off)
+                    : nullptr;
+                cl_mem  iq2xs_y_arg = iq2xs_y_img ? iq2xs_y_img : backend_ctx->iq2xs_grid_img;
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &backend_ctx->iq2xs_grid_img));
+                CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),  &iq2xs_y_arg));
+                CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_uint), &iq2xs_y_off));
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->qs));
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->sc));
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->d));
@@ -39722,6 +39798,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                                        (size_t)ne11 * (size_t)nsg, 1 };
                 size_t f_local[3]  = { 64, (size_t)nsg, 1 };
                 backend_ctx->enqueue_ndrange_kernel(fk, 3, f_global, f_local, dst);
+                if (iq2xs_y_img) { CL_CHECK(clReleaseMemObject(iq2xs_y_img)); }
                 return;
             }
 
