@@ -2205,12 +2205,14 @@ static int ggml_cl_iq1s_mv_gridimg(const ggml_backend_opencl_context * backend_c
 // The IQ3_S twin. Note this is an OCCUPANCY change, so the reason the GLU
 // fusion regressed on IQ3_S (it doubled that kernel's dominant codebook gather)
 // does not apply here: splitting K leaves gathers per unit of work unchanged.
+// MEASURED and it does not pay: +0.6% on a 3B (noise) and -1.5% on the 27B where
+// IQ3_S is the whole model. DEFAULT OFF. The prediction written here beforehand --
+// that split-K would behave unlike the GLU fusion because it is an occupancy change
+// and leaves gathers per unit of work alone -- was WRONG for this kernel too.
 static int ggml_cl_iq3s_splitk_on(const ggml_backend_opencl_context * backend_ctx) {
-    static const char * const e = getenv("GGML_OPENCL_IQ3S_SPLITK");
-    if (e && *e) {
-        return atoi(e) != 0;
-    }
-    return backend_ctx->adreno_x2_class();
+    GGML_UNUSED(backend_ctx);
+    static const int v = ggml_cl_env_int("GGML_OPENCL_IQ3S_SPLITK", 0);
+    return v;
 }
 
 static int ggml_cl_iq2s_splitk_on(const ggml_backend_opencl_context * backend_ctx) {

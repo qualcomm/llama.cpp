@@ -869,6 +869,22 @@ kernel void kernel_mul_mv_iq3_s_f32_flat_glu(
 //
 // On the profiled UD-IQ2_M frame IQ3_S serves attn_out (8.9%, 24 wg, 75%),
 // Vcur (7.4%, 8 wg, 50%) and part of ffn_out (2.8%).
+//
+// MEASURED and it does NOT pay. DEFAULT OFF.
+//     Llama-3.2-3B-UD-IQ2_M  tg64  31.172 -> 31.359  (+0.6%, noise)
+//     Qwen3.8-27B-UD-IQ3_S   tg32   5.092 ->  5.015  (-1.5%)
+// Fired-checked at 1020 dispatches, PPL 14.8367 either way.
+//
+// The prediction above -- that the mechanism which sank the GLU fusion on this
+// kernel would not apply, because splitting K leaves gathers per unit of work
+// alone -- was WRONG. Two predictions about this kernel, both wrong.
+//
+// AND THE MECHANISM IS STILL OPEN. The same split on the IQ2_S GEMV is +7.1% on
+// the 3B and +1.1% / +0.9% on two 27Bs, so it is not simply "split-K is bad" nor
+// "large models lose". The obvious stories do not survive: the partial and reduce
+// traffic is ksplit*M for both types, and IQ3_S serves the WORST-filled dispatch
+// in the frame (Vcur at 8 workgroups, 50%), which should favour it most. Do not
+// invent a reason -- measure per type. The kernel stays so this is re-measurable.
 // ---------------------------------------------------------------------------
 
 kernel void kernel_mul_mv_iq3_s_f32_flat_splitk(
