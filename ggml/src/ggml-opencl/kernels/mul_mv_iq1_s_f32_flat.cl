@@ -323,6 +323,30 @@ inline float4 iq1s_vals(uint g) {
 
 // Copies the compiled-in grid into a plain buffer once at init; the backend wraps
 // that buffer in the image1d_buffer the GEMV reads.
+// IQ1S_MV_AIMG=1: read the ACTIVATION through an image1d_buffer.
+//
+// Measured on the siblings: IQ2_S +20.0%, IQ3_S +10.5%, and IQ4_XS -3.7%. The
+// boundary is how heavy the kernel is per weight, not how redundant the read is:
+// the redundancy is identical everywhere (`grp` carries no row index, so every
+// lane of a subgroup reads the SAME address, 64x over), but it only pays where
+// that load is a large share of a large total. This type has a codebook gather
+// and a delta term per 8 weights, which puts it on the winning side -- measured,
+// not assumed.
+//
+// One CL_RGBA/CL_FLOAT texel IS the float4 the scalar path loads, over src1's own
+// buffer, so there is no copy and no pre-pass. Applied to every kernel in the
+// file, because whichever ones this type's fusion and split-K defaults route
+// through are the ones carrying the frame.
+#ifndef IQ1S_MV_AIMG
+#define IQ1S_MV_AIMG 0
+#endif
+
+#if IQ1S_MV_AIMG
+#define IQ1S_YV(g) read_imagef(y_img, (int)(y_tex + (g)))
+#else
+#define IQ1S_YV(g) vload4((g), y)
+#endif
+
 kernel void kernel_iq1s_grid_export(global uint * out) {
     const uint i = get_global_id(0);
     if (i < 2048u) {
@@ -332,6 +356,8 @@ kernel void kernel_iq1s_grid_export(global uint * out) {
 
 kernel void kernel_mul_mv_iq1_s_f32_flat(
         __read_only image1d_buffer_t grid_img,
+        __read_only image1d_buffer_t y_img,   // see IQ1S_MV_AIMG
+        uint y_off,                           // offset1/16, in float4 texels
         global const uchar  * src0_qs,
         global const ushort * src0_qh,
         global const half   * src0_d,
@@ -356,6 +382,9 @@ kernel void kernel_mul_mv_iq1_s_f32_flat(
     const uint col = get_group_id(1);
 
     global const float * y = src1 + (ulong)col * (uint)ne10;
+#if IQ1S_MV_AIMG
+    const uint y_tex = y_off + col * ((uint)ne10 >> 2);
+#endif
 
 #if IQ1S_MV_GRIDIMG
 #define IQ1S_GRID(i) (read_imageui(grid_img, (int)(i)).x)
@@ -408,8 +437,8 @@ kernel void kernel_mul_mv_iq1_s_f32_flat(
                     const uint g0  = IQ1S_GRID(( qsv       & 0xFFu) | ((((h0 >> (3u*l)) & 7u) << 8)));
                     const uint g1  = IQ1S_GRID(((qsv >> 8) & 0xFFu) | ((((h1 >> (3u*l)) & 7u) << 8)));
 
-                    const float4 y0 = vload4(grp + 2u*l + 0u, y);
-                    const float4 y1 = vload4(grp + 2u*l + 1u, y);
+                    const float4 y0 = IQ1S_YV(grp + 2u*l + 0u);
+                    const float4 y1 = IQ1S_YV(grp + 2u*l + 1u);
                     as += y0 + y1;
                     a0 += dot(y0, iq1s_vals(g0)) + dot(y1, iq1s_vals(g0 >> 4));
 #if MV_WORK2
@@ -450,8 +479,8 @@ kernel void kernel_mul_mv_iq1_s_f32_flat(
                 for (uint l = 0; l < 4u; ++l) {
                     const uint g = IQ1S_GRID((uint)src0_qs[gb + l * m]
                                              | ((((h >> (3u*l)) & 7u) << 8)));
-                    const float4 y0 = vload4(grp + 2u*l + 0u, y);
-                    const float4 y1 = vload4(grp + 2u*l + 1u, y);
+                    const float4 y0 = IQ1S_YV(grp + 2u*l + 0u);
+                    const float4 y1 = IQ1S_YV(grp + 2u*l + 1u);
                     as += y0 + y1;
                     a += dot(y0, iq1s_vals(g)) + dot(y1, iq1s_vals(g >> 4));
 #if MV_WORK2
@@ -557,6 +586,8 @@ inline float iq1s_glu_apply(int glu_op, float g, float u) {
 
 kernel void kernel_mul_mv_iq1_s_f32_flat_glu(
         __read_only image1d_buffer_t grid_img,
+        __read_only image1d_buffer_t y_img,   // see IQ1S_MV_AIMG
+        uint y_off,                           // offset1/16, in float4 texels
         global const uchar  * g_qs,
         global const ushort * g_qh,
         global const half   * g_d,
@@ -585,6 +616,9 @@ kernel void kernel_mul_mv_iq1_s_f32_flat_glu(
     const uint col = get_group_id(1);
 
     global const float * y = src1 + (ulong)col * (uint)ne10;
+#if IQ1S_MV_AIMG
+    const uint y_tex = y_off + col * ((uint)ne10 >> 2);
+#endif
 
 #if IQ1S_MV_GRIDIMG
 #define IQ1S_GGRID(i) (read_imageui(grid_img, (int)(i)).x)
@@ -632,8 +666,8 @@ kernel void kernel_mul_mv_iq1_s_f32_flat_glu(
                 for (uint l = 0; l < 4u; ++l) {
                     // activation read ONCE, and its running sum accumulated ONCE,
                     // for both weight streams and both rows
-                    const float4 y0 = vload4(grp + 2u*l + 0u, y);
-                    const float4 y1 = vload4(grp + 2u*l + 1u, y);
+                    const float4 y0 = IQ1S_YV(grp + 2u*l + 0u);
+                    const float4 y1 = IQ1S_YV(grp + 2u*l + 1u);
                     as += y0 + y1;
 
                     const uint gqsv = (uint)gqsu[gb + l * mh];
@@ -707,6 +741,8 @@ kernel void kernel_mul_mv_iq1_s_f32_flat_glu(
 
 kernel void kernel_mul_mv_iq1_s_f32_flat_splitk(
         __read_only image1d_buffer_t grid_img,
+        __read_only image1d_buffer_t y_img,   // see IQ1S_MV_AIMG
+        uint y_off,                           // offset1/16, in float4 texels
         global const uchar  * src0_qs,
         global const ushort * src0_qh,
         global const half   * src0_d,
@@ -734,6 +770,9 @@ kernel void kernel_mul_mv_iq1_s_f32_flat_splitk(
     const uint ib1 = (nsb * (ks + 1u)) / nks;
 
     global const float * y = src1 + (ulong)col * (uint)ne10;
+#if IQ1S_MV_AIMG
+    const uint y_tex = y_off + col * ((uint)ne10 >> 2);
+#endif
 
 #if IQ1S_MV_GRIDIMG
 #define IQ1S_SKGRID(i) (read_imageui(grid_img, (int)(i)).x)
@@ -785,8 +824,8 @@ kernel void kernel_mul_mv_iq1_s_f32_flat_splitk(
                     const uint g0  = IQ1S_SKGRID(( qsv       & 0xFFu) | ((((h0 >> (3u*l)) & 7u) << 8)));
                     const uint g1  = IQ1S_SKGRID(((qsv >> 8) & 0xFFu) | ((((h1 >> (3u*l)) & 7u) << 8)));
 
-                    const float4 y0 = vload4(grp + 2u*l + 0u, y);
-                    const float4 y1 = vload4(grp + 2u*l + 1u, y);
+                    const float4 y0 = IQ1S_YV(grp + 2u*l + 0u);
+                    const float4 y1 = IQ1S_YV(grp + 2u*l + 1u);
                     as += y0 + y1;
                     a0 += dot(y0, iq1s_vals(g0)) + dot(y1, iq1s_vals(g0 >> 4));
                     a1 += dot(y0, iq1s_vals(g1)) + dot(y1, iq1s_vals(g1 >> 4));
