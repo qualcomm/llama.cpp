@@ -2189,11 +2189,25 @@ static int ggml_cl_gridimg_default(const ggml_backend_opencl_context * backend_c
 // The IQ2_S twin. Same wave-uniform activation read, and applied to all three
 // kernels in that file -- its fused GLU is default ON and serves ffn_gate+ffn_up,
 // so texturing only the plain GEMV would leave most of the decode frame alone.
-// The IQ4_XS twin. Same wave-uniform activation read; its fused GLU and split-K
-// are default off here (measured negatives) so the plain and wimg kernels carry
-// the frame, but all four take the image because they share the IQ4XS_YV macro.
+// MEASURED NEGATIVE on IQ4_XS: -3.7%, arms repeated.
+//     3B IQ4_XS tg64  39.961 / 39.877  ->  38.322 / 38.452
+// PPL 7.2534 either way, prefill unchanged. DEFAULT OFF.
+//
+// 🔑 This is where the activation texture stops paying, and the boundary is the
+// weight of the kernel per weight, not the redundancy of the read -- which is
+// identical in all of them. IQ2_S (+20.0%) and IQ3_S (+10.5%) spend a codebook
+// gather, a sign table and several float ops per 8 weights, so the activation
+// load is a large share and hiding it behind the texture unit wins. IQ4_XS is a
+// LINEAR quant with none of that: it is the fastest IQ decode in the roster at
+// 40.0, the activation is a correspondingly bigger fraction of a much smaller
+// total, and the texture path's own latency plus the per-dispatch image no longer
+// clears it.
+//
+// ⇒ Try this on the heavy codebook types; do not assume it for the light ones.
 static int ggml_cl_iq4xs_mv_aimg(const ggml_backend_opencl_context * backend_ctx) {
-    return ggml_cl_gridimg_default(backend_ctx, "GGML_OPENCL_IQ4XS_MV_AIMG");
+    GGML_UNUSED(backend_ctx);
+    static const int v = ggml_cl_env_int("GGML_OPENCL_IQ4XS_MV_AIMG", 0);
+    return v;
 }
 
 static int ggml_cl_iq2s_mv_aimg(const ggml_backend_opencl_context * backend_ctx) {
