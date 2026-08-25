@@ -100,6 +100,31 @@ typedef float lm_st;
 #define LM_LD4(p, i) vload4((i), (p))
 #endif
 
+// IQ3XXS_LM_GRIDIMG=1: read the codebook through an image1d_buffer instead of
+// from __constant.
+//
+// This kernel is the fallback prefill GEMM, and on every generation where the
+// feature-major plane split is off it is the ONLY prefill path for this type.
+// The index comes from the thread's own block, so the read is a DIVERGENT gather
+// -- the pattern under which byte and word indexed __constant loads serialize on
+// Adreno. The dp4a twin of this kernel had the identical defect and the image was
+// worth up to +42.3% of prefill there, with perplexity bit-identical because only
+// the memory tier changes and never a value read from it.
+//
+// The image is the singleton the decode GEMV already builds at init on every
+// device, so this costs no memory. Default follows the per-generation texture
+// gate; it is UNMEASURED outside X2-class, and X2-class barely uses this kernel
+// because the split claims those tensors first, so the gate is where the value is.
+#ifndef IQ3XXS_LM_GRIDIMG
+#define IQ3XXS_LM_GRIDIMG 0
+#endif
+
+#if IQ3XXS_LM_GRIDIMG
+#define IQ3XXS_LM_GRID(i) (read_imageui(grid_img, (int)(i)).x)
+#else
+#define IQ3XXS_LM_GRID(i) iq3xxs_grid[(i)]
+#endif
+
 kernel void kernel_mul_mm_iq3_xxs_f32_l4_lm(
     global char   * src0,
     ulong offset0,
@@ -123,7 +148,8 @@ kernel void kernel_mul_mm_iq3_xxs_f32_l4_lm(
     int batch_stride_d,
 
     int r2,
-    int r3
+    int r3,
+    __read_only image1d_buffer_t grid_img   // see IQ3XXS_LM_GRIDIMG
 ) {
     global block_iq3_xxs * src0_b = (global block_iq3_xxs *)(src0 + offset0);
     src1 = (global float4*)((global char*)src1 + offset1);
@@ -195,7 +221,7 @@ kernel void kernel_mul_mm_iq3_xxs_f32_l4_lm(
                 float db = (float)xb->d * (0.5f + (float)(aux32 >> 28)) * 0.5f;
 
                 uchar signs = ksigns_iq2xs[(aux32 >> (7*lg)) & 127];
-                uint  g     = iq3xxs_grid[xb->qs[8*ib32 + 2*lg + which]];
+                uint  g     = IQ3XXS_LM_GRID(xb->qs[8*ib32 + 2*lg + which]);
 
                 float4 v1;
                 v1.s0 = db * (float)((g >>  0) & 0xFF) * ((signs & (1 << (m+0))) ? -1.f : 1.f);

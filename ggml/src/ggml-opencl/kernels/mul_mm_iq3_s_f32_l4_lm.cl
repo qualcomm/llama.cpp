@@ -122,6 +122,31 @@ typedef float lm_st;
 #define LM_LD4(p, i) vload4((i), (p))
 #endif
 
+// IQ3S_LM_GRIDIMG=1: read the codebook through an image1d_buffer instead of
+// from __constant.
+//
+// This kernel is the fallback prefill GEMM, and on every generation where the
+// feature-major plane split is off it is the ONLY prefill path for this type.
+// The index comes from the thread's own block, so the read is a DIVERGENT gather
+// -- the pattern under which byte and word indexed __constant loads serialize on
+// Adreno. The dp4a twin of this kernel had the identical defect and the image was
+// worth up to +42.3% of prefill there, with perplexity bit-identical because only
+// the memory tier changes and never a value read from it.
+//
+// The image is the singleton the decode GEMV already builds at init on every
+// device, so this costs no memory. Default follows the per-generation texture
+// gate; it is UNMEASURED outside X2-class, and X2-class barely uses this kernel
+// because the split claims those tensors first, so the gate is where the value is.
+#ifndef IQ3S_LM_GRIDIMG
+#define IQ3S_LM_GRIDIMG 0
+#endif
+
+#if IQ3S_LM_GRIDIMG
+#define IQ3S_LM_GRID(i) (read_imageui(grid_img, (int)(i)).x)
+#else
+#define IQ3S_LM_GRID(i) iq3s_grid[(i)]
+#endif
+
 kernel void kernel_mul_mm_iq3_s_f32_l4_lm(
     global char   * src0,
     ulong offset0,
@@ -145,7 +170,8 @@ kernel void kernel_mul_mm_iq3_s_f32_l4_lm(
     int batch_stride_d,
 
     int r2,
-    int r3
+    int r3,
+    __read_only image1d_buffer_t grid_img   // see IQ3S_LM_GRIDIMG
 ) {
     global block_iq3_s * src0_b = (global block_iq3_s *)(src0 + offset0);
     src1 = (global float4*)((global char*)src1 + offset1);
@@ -214,7 +240,7 @@ kernel void kernel_mul_mm_iq3_s_f32_l4_lm(
 
                 uint gi = (uint)xb->qs[8*sb + 2*lg + which]
                         | (((uint)xb->qh[sb] << (8 - 2*lg - which)) & 256);
-                uint  g  = iq3s_grid[gi];
+                uint  g  = IQ3S_LM_GRID(gi);
                 uchar sg = xb->signs[4*sb + lg];
 
                 float4 v1;

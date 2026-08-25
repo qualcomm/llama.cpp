@@ -2319,6 +2319,34 @@ static int ggml_cl_iq2xs_gemm_gridimg(const ggml_backend_opencl_context * backen
     return ggml_cl_gridimg_default(backend_ctx, "GGML_OPENCL_IQ2XS_GEMM_GRIDIMG");
 }
 
+static int ggml_cl_iq1m_lm_gridimg(const ggml_backend_opencl_context * backend_ctx) {
+    return ggml_cl_gridimg_default(backend_ctx, "GGML_OPENCL_IQ1M_LM_GRIDIMG");
+}
+
+static int ggml_cl_iq1s_lm_gridimg(const ggml_backend_opencl_context * backend_ctx) {
+    return ggml_cl_gridimg_default(backend_ctx, "GGML_OPENCL_IQ1S_LM_GRIDIMG");
+}
+
+static int ggml_cl_iq2s_lm_gridimg(const ggml_backend_opencl_context * backend_ctx) {
+    return ggml_cl_gridimg_default(backend_ctx, "GGML_OPENCL_IQ2S_LM_GRIDIMG");
+}
+
+static int ggml_cl_iq2xs_lm_gridimg(const ggml_backend_opencl_context * backend_ctx) {
+    return ggml_cl_gridimg_default(backend_ctx, "GGML_OPENCL_IQ2XS_LM_GRIDIMG");
+}
+
+static int ggml_cl_iq2xxs_lm_gridimg(const ggml_backend_opencl_context * backend_ctx) {
+    return ggml_cl_gridimg_default(backend_ctx, "GGML_OPENCL_IQ2XXS_LM_GRIDIMG");
+}
+
+static int ggml_cl_iq3s_lm_gridimg(const ggml_backend_opencl_context * backend_ctx) {
+    return ggml_cl_gridimg_default(backend_ctx, "GGML_OPENCL_IQ3S_LM_GRIDIMG");
+}
+
+static int ggml_cl_iq3xxs_lm_gridimg(const ggml_backend_opencl_context * backend_ctx) {
+    return ggml_cl_gridimg_default(backend_ctx, "GGML_OPENCL_IQ3XXS_LM_GRIDIMG");
+}
+
 static int ggml_cl_iq3s_mv_gridimg(const ggml_backend_opencl_context * backend_ctx) {
     return ggml_cl_gridimg_default(backend_ctx, "GGML_OPENCL_IQ3S_MV_GRIDIMG");
 }
@@ -4849,8 +4877,10 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #else
         const std::string kernel_src = read_file("mul_mm_iq3_xxs_f32_l4_lm.cl");
 #endif
+        std::string opts_lm_iq3xxs = lm_opts
+            + " -DIQ3XXS_LM_GRIDIMG=" + std::to_string(ggml_cl_iq3xxs_lm_gridimg(backend_ctx));
         cl_program prog =
-            build_program_from_source(backend_ctx, kernel_src.c_str(), lm_opts);
+            build_program_from_source(backend_ctx, kernel_src.c_str(), opts_lm_iq3xxs);
 
         CL_CHECK((backend_ctx->kernel_mul_mm_iq3_xxs_f32_l4_lm = clCreateKernel(prog, "kernel_mul_mm_iq3_xxs_f32_l4_lm", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -4865,8 +4895,10 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #else
         const std::string kernel_src = read_file("mul_mm_iq3_s_f32_l4_lm.cl");
 #endif
+        std::string opts_lm_iq3s = lm_opts
+            + " -DIQ3S_LM_GRIDIMG=" + std::to_string(ggml_cl_iq3s_lm_gridimg(backend_ctx));
         cl_program prog =
-            build_program_from_source(backend_ctx, kernel_src.c_str(), lm_opts);
+            build_program_from_source(backend_ctx, kernel_src.c_str(), opts_lm_iq3s);
 
         CL_CHECK((backend_ctx->kernel_mul_mm_iq3_s_f32_l4_lm = clCreateKernel(prog, "kernel_mul_mm_iq3_s_f32_l4_lm", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -4882,8 +4914,10 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #else
         const std::string kernel_src = read_file("mul_mm_iq2_xxs_f32_l4_lm.cl");
 #endif
+        std::string opts_lm_iq2xxs = lm_opts
+            + " -DIQ2XXS_LM_GRIDIMG=" + std::to_string(ggml_cl_iq2xxs_lm_gridimg(backend_ctx));
         cl_program prog =
-            build_program_from_source(backend_ctx, kernel_src.c_str(), lm_opts);
+            build_program_from_source(backend_ctx, kernel_src.c_str(), opts_lm_iq2xxs);
 
         CL_CHECK((backend_ctx->kernel_mul_mm_iq2_xxs_f32_l4_lm = clCreateKernel(prog, "kernel_mul_mm_iq2_xxs_f32_l4_lm", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -4899,8 +4933,10 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #else
         const std::string kernel_src = read_file("mul_mm_iq2_xs_f32_l4_lm.cl");
 #endif
+        std::string opts_lm_iq2xs = lm_opts
+            + " -DIQ2XS_LM_GRIDIMG=" + std::to_string(ggml_cl_iq2xs_lm_gridimg(backend_ctx));
         cl_program prog =
-            build_program_from_source(backend_ctx, kernel_src.c_str(), lm_opts);
+            build_program_from_source(backend_ctx, kernel_src.c_str(), opts_lm_iq2xs);
 
         CL_CHECK((backend_ctx->kernel_mul_mm_iq2_xs_f32_l4_lm = clCreateKernel(prog, "kernel_mul_mm_iq2_xs_f32_l4_lm", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -4916,8 +4952,10 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #else
         const std::string kernel_src = read_file("mul_mm_iq2_s_f32_l4_lm.cl");
 #endif
+        std::string opts_lm_iq2s = lm_opts
+            + " -DIQ2S_LM_GRIDIMG=" + std::to_string(ggml_cl_iq2s_lm_gridimg(backend_ctx));
         cl_program prog =
-            build_program_from_source(backend_ctx, kernel_src.c_str(), lm_opts);
+            build_program_from_source(backend_ctx, kernel_src.c_str(), opts_lm_iq2s);
 
         CL_CHECK((backend_ctx->kernel_mul_mm_iq2_s_f32_l4_lm = clCreateKernel(prog, "kernel_mul_mm_iq2_s_f32_l4_lm", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -4932,8 +4970,10 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #else
         const std::string kernel_src = read_file("mul_mm_iq1_s_f32_l4_lm.cl");
 #endif
+        std::string opts_lm_iq1s = lm_opts
+            + " -DIQ1S_LM_GRIDIMG=" + std::to_string(ggml_cl_iq1s_lm_gridimg(backend_ctx));
         cl_program prog =
-            build_program_from_source(backend_ctx, kernel_src.c_str(), lm_opts);
+            build_program_from_source(backend_ctx, kernel_src.c_str(), opts_lm_iq1s);
 
         CL_CHECK((backend_ctx->kernel_mul_mm_iq1_s_f32_l4_lm = clCreateKernel(prog, "kernel_mul_mm_iq1_s_f32_l4_lm", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -4949,8 +4989,10 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #else
         const std::string kernel_src = read_file("mul_mm_iq1_m_f32_l4_lm.cl");
 #endif
+        std::string opts_lm_iq1m = lm_opts
+            + " -DIQ1M_LM_GRIDIMG=" + std::to_string(ggml_cl_iq1m_lm_gridimg(backend_ctx));
         cl_program prog =
-            build_program_from_source(backend_ctx, kernel_src.c_str(), lm_opts);
+            build_program_from_source(backend_ctx, kernel_src.c_str(), opts_lm_iq1m);
 
         CL_CHECK((backend_ctx->kernel_mul_mm_iq1_m_f32_l4_lm = clCreateKernel(prog, "kernel_mul_mm_iq1_m_f32_l4_lm", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -35833,6 +35875,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 CL_CHECK(clSetKernelArg(kernel, 16, sizeof(int),      &batch_stride_d));
                 CL_CHECK(clSetKernelArg(kernel, 17, sizeof(int),      &r2));
                 CL_CHECK(clSetKernelArg(kernel, 18, sizeof(int),      &r3));
+                CL_CHECK(clSetKernelArg(kernel, 19, sizeof(cl_mem),   &backend_ctx->iq3xxs_grid_img));
 
                 // 64 is block tile size BM and BN - change here when BM and BN in the kernel are changed.
                 size_t global_work_size[] = {(size_t)(CEIL_DIV(ne01, 64)*nth0), (size_t)(CEIL_DIV(ne11, 64)), (size_t)ne12*ne13};
@@ -36032,6 +36075,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 CL_CHECK(clSetKernelArg(kernel, 16, sizeof(int),      &batch_stride_d));
                 CL_CHECK(clSetKernelArg(kernel, 17, sizeof(int),      &r2));
                 CL_CHECK(clSetKernelArg(kernel, 18, sizeof(int),      &r3));
+                CL_CHECK(clSetKernelArg(kernel, 19, sizeof(cl_mem),   &backend_ctx->iq3s_grid_img));
 
                 // 64 is block tile size BM and BN - change here when BM and BN in the kernel are changed.
                 size_t global_work_size[] = {(size_t)(CEIL_DIV(ne01, 64)*nth0), (size_t)(CEIL_DIV(ne11, 64)), (size_t)ne12*ne13};
@@ -36167,6 +36211,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 CL_CHECK(clSetKernelArg(kernel, 16, sizeof(int),      &batch_stride_d));
                 CL_CHECK(clSetKernelArg(kernel, 17, sizeof(int),      &r2));
                 CL_CHECK(clSetKernelArg(kernel, 18, sizeof(int),      &r3));
+                CL_CHECK(clSetKernelArg(kernel, 19, sizeof(cl_mem),   &backend_ctx->iq2xxs_grid_img));
 
                 // 64 is block tile size BM and BN - change here when BM and BN in the kernel are changed.
                 size_t global_work_size[] = {(size_t)(CEIL_DIV(ne01, 64)*nth0), (size_t)(CEIL_DIV(ne11, 64)), (size_t)ne12*ne13};
@@ -36302,6 +36347,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 CL_CHECK(clSetKernelArg(kernel, 16, sizeof(int),      &batch_stride_d));
                 CL_CHECK(clSetKernelArg(kernel, 17, sizeof(int),      &r2));
                 CL_CHECK(clSetKernelArg(kernel, 18, sizeof(int),      &r3));
+                CL_CHECK(clSetKernelArg(kernel, 19, sizeof(cl_mem),   &backend_ctx->iq2xs_grid_img));
 
                 // 64 is block tile size BM and BN - change here when BM and BN in the kernel are changed.
                 size_t global_work_size[] = {(size_t)(CEIL_DIV(ne01, 64)*nth0), (size_t)(CEIL_DIV(ne11, 64)), (size_t)ne12*ne13};
@@ -36438,6 +36484,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 CL_CHECK(clSetKernelArg(kernel, 16, sizeof(int),      &batch_stride_d));
                 CL_CHECK(clSetKernelArg(kernel, 17, sizeof(int),      &r2));
                 CL_CHECK(clSetKernelArg(kernel, 18, sizeof(int),      &r3));
+                CL_CHECK(clSetKernelArg(kernel, 19, sizeof(cl_mem),   &backend_ctx->iq2s_grid_img));
 
                 // 64 is block tile size BM and BN - change here when BM and BN in the kernel are changed.
                 size_t global_work_size[] = {(size_t)(CEIL_DIV(ne01, 64)*nth0), (size_t)(CEIL_DIV(ne11, 64)), (size_t)ne12*ne13};
@@ -36571,6 +36618,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 CL_CHECK(clSetKernelArg(kernel, 16, sizeof(int),      &batch_stride_d));
                 CL_CHECK(clSetKernelArg(kernel, 17, sizeof(int),      &r2));
                 CL_CHECK(clSetKernelArg(kernel, 18, sizeof(int),      &r3));
+                CL_CHECK(clSetKernelArg(kernel, 19, sizeof(cl_mem),   &backend_ctx->iq1s_grid_img));
 
                 // 64 is block tile size BM and BN - change here when BM and BN in the kernel are changed.
                 size_t global_work_size[] = {(size_t)(CEIL_DIV(ne01, 64)*nth0), (size_t)(CEIL_DIV(ne11, 64)), (size_t)ne12*ne13};
@@ -36704,6 +36752,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 CL_CHECK(clSetKernelArg(kernel, 16, sizeof(int),      &batch_stride_d));
                 CL_CHECK(clSetKernelArg(kernel, 17, sizeof(int),      &r2));
                 CL_CHECK(clSetKernelArg(kernel, 18, sizeof(int),      &r3));
+                CL_CHECK(clSetKernelArg(kernel, 19, sizeof(cl_mem),   &backend_ctx->iq1m_grid_img));
 
                 // 64 is block tile size BM and BN - change here when BM and BN in the kernel are changed.
                 size_t global_work_size[] = {(size_t)(CEIL_DIV(ne01, 64)*nth0), (size_t)(CEIL_DIV(ne11, 64)), (size_t)ne12*ne13};
