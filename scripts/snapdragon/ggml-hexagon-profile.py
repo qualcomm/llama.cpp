@@ -111,7 +111,7 @@ def parse_log(file_path, pmu_index=None, limit=None, device_filter=None, op_filt
             ops_count_per_device[target.strip()] = 0
     limit_reached = False
 
-    timestamp_pattern = re.compile(r"^(?P<min>\d+)\.(?P<sec>\d+)\.(?P<ms>\d+)\.(?P<us>\d+)\s+[A-Z]\s+")
+    timestamp_pattern = re.compile(r"(?P<min>\d+)\.(?P<sec>\d+)\.(?P<ms>\d+)\.(?P<us>\d+)\s+[A-Z]\s+")
     unwrappers = {}
     trace_unwrappers = {}
 
@@ -119,7 +119,7 @@ def parse_log(file_path, pmu_index=None, limit=None, device_filter=None, op_filt
         if "profile-op" not in line and "trace-evt" not in line:
             continue
 
-        ts_match = timestamp_pattern.match(line)
+        ts_match = timestamp_pattern.search(line)
         abs_usec = 0
         if ts_match:
             abs_usec = (
@@ -130,8 +130,9 @@ def parse_log(file_path, pmu_index=None, limit=None, device_filter=None, op_filt
 
         device = extract_device(line)
 
-        if "|" in line and "profile-op" in line:
-            parts = [p.strip() for p in line.split("|")]
+        idx = line.find("profile-op")
+        if idx != -1 and "|" in line[idx:]:
+            parts = [p.strip() for p in line[idx:].split("|")]
             prefix = parts[0]
             prefix_match = re.search(r"profile-op\s+(?P<op_name>[A-Z_0-9+]+)", prefix)
             if not prefix_match:
@@ -195,8 +196,7 @@ def parse_log(file_path, pmu_index=None, limit=None, device_filter=None, op_filt
                     if device_unwrapper is not None:
                         unwrapped_cycles_start = device_unwrapper.unwrap(int(cycles_start_raw))
 
-            idx = line.find("profile-op ")
-            op_text = line[idx + 11:].strip() if idx != -1 else line.strip()
+            op_text = re.sub(r"^profile-op\s+", "", line[idx:]).strip() if idx != -1 else line.strip()
 
             current_op = {
                 'name':         op_name,

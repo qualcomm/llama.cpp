@@ -343,11 +343,11 @@ def main():
         env_str = " ".join(env_parts)
 
         cmd_str = shlex_join(cmd_args)
-        adb_shell_cmd = f"cd {target_dir} && ulimit -c unlimited && {env_str} {cmd_str} 2>&1"
+        adb_shell_cmd = f"cd {target_dir} && ulimit -c unlimited && {env_str} {cmd_str}"
         full_cmd = adb_base + ["shell", adb_shell_cmd]
 
         logger.info(f"+ {' '.join(full_cmd)}")
-        res = subprocess.run(full_cmd, stderr=subprocess.STDOUT)
+        res = subprocess.run(full_cmd)
         sys.exit(res.returncode)
 
     elif target_type == "linux":
@@ -366,11 +366,11 @@ def main():
         env_str = " ".join(env_parts)
 
         cmd_str = shlex_join(cmd_args)
-        ssh_shell_cmd = f"cd {target_dir} && ulimit -c unlimited && {env_str} {cmd_str} 2>&1"
+        ssh_shell_cmd = f"cd {target_dir} && ulimit -c unlimited && {env_str} {cmd_str}"
         full_cmd = ["ssh", ssh_host, ssh_shell_cmd]
 
         logger.info(f"+ {' '.join(full_cmd)}")
-        res = subprocess.run(full_cmd, stderr=subprocess.STDOUT)
+        res = subprocess.run(full_cmd)
         sys.exit(res.returncode)
 
     elif target_type == "windows":
@@ -391,7 +391,7 @@ def main():
             local_env[k] = v
 
         logger.info(f"+ {shlex_join(cmd_args)}")
-        res = subprocess.run(cmd_args, env=local_env, stderr=subprocess.STDOUT)
+        res = subprocess.run(cmd_args, env=local_env)
         sys.exit(res.returncode)
 
 
