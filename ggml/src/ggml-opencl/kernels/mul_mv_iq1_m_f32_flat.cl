@@ -301,7 +301,26 @@ inline float iq1m_super(uint w0, uint w1, uint w2, uint w3) {
     return (float)as_half(u16);
 }
 
+// IQ1M_MV_GRIDIMG=1: read the grid through an image1d_buffer.
+//
+// The image tier beat local memory on IQ1_S (+2.5%) and IQ2_S (+4.4%), and beat
+// __constant on IQ3_S (+10.4%) and IQ3_XXS (+18.8%). This one currently stages in local memory, the case where the image won by less.
+//
+// Filled by kernel_iq1m_grid_export from the table this kernel compiles in, so the
+// host never duplicates it and the two cannot drift.
+#ifndef IQ1M_MV_GRIDIMG
+#define IQ1M_MV_GRIDIMG 0
+#endif
+
+kernel void kernel_iq1m_grid_export(global uint * out) {
+    const uint i = get_global_id(0);
+    if (i < 2048u) {
+        out[i] = iq1s_grid_gpu[i];
+    }
+}
+
 kernel void kernel_mul_mv_iq1_m_f32_flat(
+        __read_only image1d_buffer_t grid_img,
         global const uchar  * src0_qs,
         global const uchar  * src0_qh,
         global const ushort * src0_sc,
@@ -327,7 +346,9 @@ kernel void kernel_mul_mv_iq1_m_f32_flat(
 
     global const float * y = src1 + (ulong)col * (uint)ne10;
 
-#if IQ1M_MV_LDSGRID
+#if IQ1M_MV_GRIDIMG
+#define IQ1M_GRID(i) (read_imageui(grid_img, (int)(i)).x)
+#elif IQ1M_MV_LDSGRID
     __local uint sh_grid[2048];
     {
         const uint tid  = sgi * 64u + lid;
