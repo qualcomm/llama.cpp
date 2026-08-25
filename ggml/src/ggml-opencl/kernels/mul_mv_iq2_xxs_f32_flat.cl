@@ -73,6 +73,36 @@
 #define IQ2XXS_MV_ABL 0
 #endif
 
+// MEASURED, and it settles the question the probe was built to ask.
+//
+//   Qwen3.8-27B-UD-IQ2_XXS   tg32  3.697 -> 3.994 (+8.0%) -> 4.101 (+10.9%)
+//   Llama-3.2-3B-UD-IQ1_S    tg64 29.266 -> 30.071 (+2.8%) -> 30.287 (+3.5%)
+//
+// The 3B holds 43 IQ2_XXS tensors against a 27B made of the type, so the effect
+// scaling with that share is the expected shape, not a per-model quirk.
+//
+// So the ENTIRE codebook -- the gather AND the sign application, everything that
+// separates this type from a linear quant -- is worth 11 percent. It is NOT what
+// makes the low-bit types slow. On the same part and the same commit this kernel
+// runs at 17% of memory bandwidth while q4_0 runs at 69%, and closing the
+// codebook completely would move it to about 19%.
+//
+// Two reworks were on the table before this ran; the numbers refuse both:
+//   - Fold the grid codes into the quant plane at upload so the inner loop has no
+//     table at all. Costs 2.06 -> 3.06 bits per weight (+48% bytes) to buy at
+//     most the +8% above, which nets 3.697 * 1.08 * (6.76/9.95) = 2.71 t/s, a
+//     27 percent REGRESSION. Dead.
+//   - Pack the codebook to 2 bits per weight so each lookup fetches a ushort
+//     instead of eight bytes. No memory cost, but the gather count is unchanged
+//     and only its width shrinks, so it can capture only part of the +8%.
+//     Not worth the complexity.
+//
+// HYPOTHESIS for where the rest of the gap actually is, untested: MAC density per
+// issued instruction. One step here covers 8 weights and issues a quant load, two
+// codebook fetches, two activation vload4s, about ten ALU ops and two dots. The
+// q4_0 GEMV covers a 32-weight block per step with wide vector loads. That is the
+// same issue-bound shape found in the cok GEMM, and it is a rewrite, not a knob.
+
 constant uint iq2xxs_grid[512] = {
     0x08080808, 0x08080808, 0x0808082b, 0x08080808, 0x08081919, 0x08080808, 0x08082b08, 0x08080808,
     0x08082b2b, 0x08080808, 0x08190819, 0x08080808, 0x08191908, 0x08080808, 0x082b0808, 0x08080808,
