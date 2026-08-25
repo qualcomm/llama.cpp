@@ -740,6 +740,21 @@ kernel void kernel_mul_mv_iq2_s_f32_flat_glu(
 // add a dispatch, which on this part costs host time as well as GPU time. A shape
 // that already fills the device gets SLOWER when split, which is why the host
 // picks ksplit from an occupancy heuristic and leaves well-filled shapes at 1.
+//
+// MEASURED on X2-90, fired-checked (1088 split dispatches and 1088 reduces in a
+// 16-token profile), arms repeated, ON TOP of the gate/up fusion:
+//     Llama-3.2-3B-UD-IQ2_M  tg64  29.147 -> 31.223  (+7.1%)
+// wikitext PPL 14.8367 either way.
+//
+// The pinned sweep confirms the heuristic picks the optimum, and confirms the
+// occupancy model rather than just agreeing with it. base_wg is 24 here:
+//     auto  31.223      k=2  31.188   48 wg, 3 waves, 48/48 = 100%
+//                       k=3  29.956   72 wg, 5 waves, 72/80 =  90%
+//                       k=4  30.363   96 wg, 6 waves, 96/96 = 100%
+// k=3 is WORSE than k=4 -- non-monotonic, and exactly where the model says the
+// occupancy dips. k=4 matches k=2 on occupancy but pays more partial and reduce
+// traffic, so it loses to it. Both facts fall out of "maximise wg/(waves*CU),
+// prefer the smaller factor", which is why that rule is reused verbatim.
 // ---------------------------------------------------------------------------
 
 kernel void kernel_mul_mv_iq2_s_f32_flat_splitk(
