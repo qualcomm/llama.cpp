@@ -79,6 +79,78 @@ class CycleUnwrapper:
         return raw + self.high_part
 
 
+class DeviceTimeMapper:
+    def __init__(self, dev, ops):
+        self.dev = dev
+        self.batches = []
+        for op in ops:
+            if op.get('device') == dev and op.get('name') == 'OPBATCH' and op.get('unwrapped_cycles_start') is not None:
+                cycles = op.get('cycles', 0)
+                usec = op.get('usec', 0)
+                start_cyc = op['unwrapped_cycles_start']
+                freq = (cycles / usec) if usec > 0 and cycles > 0 else 1000.0
+                if freq <= 0:
+                    freq = 1000.0
+                self.batches.append({
+                    'start_cycles': start_cyc,
+                    'cycles': cycles,
+                    'end_cycles': start_cyc + cycles,
+                    'usec': usec,
+                    'dur_ns': usec * 1000,
+                    'freq_mhz': freq,
+                })
+
+        self.batches.sort(key=lambda b: b['start_cycles'])
+
+        for i, b in enumerate(self.batches):
+            if i == 0:
+                b['start_time_ns'] = 0
+            else:
+                prev = self.batches[i - 1]
+                idle_cyc = max(0, b['start_cycles'] - prev['end_cycles'])
+                idle_ns = int(round((idle_cyc / prev['freq_mhz']) * 1000))
+                b['start_time_ns'] = prev['start_time_ns'] + prev['dur_ns'] + idle_ns
+
+        self.batch_starts = [b['start_cycles'] for b in self.batches]
+
+        valid_starts = [op['unwrapped_cycles_start'] for op in ops if op.get('device') == dev and op.get('unwrapped_cycles_start') is not None]
+        self.min_cyc = min(valid_starts) if valid_starts else 0
+        if self.batches:
+            self.default_freq = self.batches[0]['freq_mhz']
+        else:
+            freqs = [op['cycles'] / op['usec'] for op in ops if op.get('device') == dev and op.get('usec', 0) > 0 and op.get('cycles', 0) > 0]
+            self.default_freq = statistics.mean(freqs) if freqs else 1000.0
+
+    def get_batch(self, cyc):
+        if not self.batches:
+            return None
+        idx = bisect.bisect_right(self.batch_starts, cyc) - 1
+        if idx >= 0:
+            return self.batches[idx]
+        return self.batches[0]
+
+    def get_freq(self, cyc=None):
+        if cyc is not None:
+            b = self.get_batch(cyc)
+            if b is not None:
+                return b['freq_mhz']
+        return self.default_freq
+
+    def cycle_to_ns(self, cyc):
+        if cyc is None:
+            return 0
+        b = self.get_batch(cyc)
+        if b is not None:
+            return b['start_time_ns'] + int(round(((cyc - b['start_cycles']) / b['freq_mhz']) * 1000))
+        return int(round(((cyc - self.min_cyc) / self.default_freq) * 1000))
+
+    def dur_cycles_to_ns(self, cyc_start, cyc_dur):
+        if cyc_dur is None:
+            return 0
+        freq = self.get_freq(cyc_start)
+        return int(round((cyc_dur / freq) * 1000))
+
+
 def parse_log(file_path, limit=None, device_filter=None, op_filter_re=None):
     try:
         if file_path != "-":
@@ -98,6 +170,7 @@ def parse_log(file_path, limit=None, device_filter=None, op_filter_re=None):
             ops_count_per_device[target.strip()] = 0
     limit_reached = False
     unwrappers = {}
+    last_batch_start = {}
     trace_unwrappers = {}
     line_idx = 0
 
@@ -151,7 +224,10 @@ def parse_log(file_path, limit=None, device_filter=None, op_filter_re=None):
                 if cycles_start_raw:
                     unwrapped_cycles_start = int(cycles_start_raw)
                     unwrappers[device] = CycleUnwrapper(unwrapped_cycles_start)
-                    trace_unwrappers[device] = CycleUnwrapper(unwrapped_cycles_start)
+                    last_batch_start[device] = unwrapped_cycles_start
+                    for k in list(trace_unwrappers.keys()):
+                        if k[0] == device:
+                            del trace_unwrappers[k]
             else:
                 if cycles_start_raw:
                     device_unwrapper = unwrappers.get(device)
@@ -214,13 +290,16 @@ def parse_log(file_path, limit=None, device_filter=None, op_filter_re=None):
 
         trace_match = trace_pattern.search(line)
         if trace_match:
+            thread = int(trace_match.group('thread'))
             raw_cyc = int(trace_match.group('cycles'))
             unwrapped_cyc = None
-            device_trace_unwrapper = trace_unwrappers.get(device)
-            if device_trace_unwrapper is not None:
-                unwrapped_cyc = device_trace_unwrapper.unwrap(raw_cyc)
+            th_key = (device, thread)
+            if th_key not in trace_unwrappers:
+                batch_start = last_batch_start.get(device)
+                trace_unwrappers[th_key] = CycleUnwrapper(batch_start)
+            unwrapped_cyc = trace_unwrappers[th_key].unwrap(raw_cyc)
             all_traces.append({
-                'thread': int(trace_match.group('thread')),
+                'thread': thread,
                 'event':  trace_match.group('event'),
                 'info':   int(trace_match.group('info')),
                 'cycles': raw_cyc,
@@ -349,26 +428,7 @@ def generate_perfetto_trace(filtered_ops, trace_events, output_path):
     # Get list of unique devices present in the operations
     unique_devices = sorted(list(set(op['device'] for op in filtered_ops)))
     device_to_idx = {dev: idx for idx, dev in enumerate(unique_devices)}
-
-    # Compute average frequency per device
-    device_freq_mhz = {}
-    for dev in unique_devices:
-        dev_ops = [op for op in filtered_ops if op['device'] == dev]
-        frequencies = []
-        for op in dev_ops:
-            if op['usec'] > 0 and op['cycles'] > 0:
-                frequencies.append(op['cycles'] / op['usec'])
-        avg_freq = statistics.mean(frequencies) if frequencies else 1000.0
-        if avg_freq <= 0:
-            avg_freq = 1000.0
-        device_freq_mhz[dev] = avg_freq
-
-    # Compute minimum cycle count per device for relative time alignment
-    device_min_cyc = {}
-    for dev in unique_devices:
-        dev_ops = [op for op in filtered_ops if op['device'] == dev]
-        valid_starts = [op['start_cycles'] for op in dev_ops if op['start_cycles'] is not None]
-        device_min_cyc[dev] = min(valid_starts) if valid_starts else 0
+    time_mappers = {dev: DeviceTimeMapper(dev, filtered_ops) for dev in unique_devices}
 
     # Process events
     completed_events = []
@@ -377,7 +437,7 @@ def generate_perfetto_trace(filtered_ops, trace_events, output_path):
 
         one_usec_cycles = {}
         for dev in unique_devices:
-            one_usec_cycles[dev] = max(device_freq_mhz[dev], 1.0)
+            one_usec_cycles[dev] = max(time_mappers[dev].get_freq(), 1.0)
 
         active_starts = {}
         for e in trace_events:
@@ -442,15 +502,13 @@ def generate_perfetto_trace(filtered_ops, trace_events, output_path):
 
     completed_events.sort(key=lambda e: e['start_cyc'])
 
-    # Convert event times to microseconds and apply clamp rounded to 1ns resolution (3 decimals)
+    # Convert event times to nanoseconds using per-device / per-batch time mapper
     for e in completed_events:
         dev = e['device']
-        min_cyc = device_min_cyc.get(dev, 0)
-        freq = device_freq_mhz.get(dev, 1000.0)
-        start_us = (e['start_cyc'] - min_cyc) / freq
-        dur_us = (e['end_cyc'] - e['start_cyc']) / freq
-        e['ts_ns'] = int(round(start_us * 1000))
-        e['dur_ns'] = int(round(max(dur_us, 0.1) * 1000))
+        tm = time_mappers[dev]
+        e['ts_ns'] = tm.cycle_to_ns(e['start_cyc'])
+        dur_ns = tm.dur_cycles_to_ns(e['start_cyc'], e['end_cyc'] - e['start_cyc'])
+        e['dur_ns'] = max(dur_ns, 100)
 
     # Allocate slots (sub-tracks) to prevent overlaps on same virtual track
     active_slots = defaultdict(list)
@@ -580,10 +638,9 @@ def generate_perfetto_trace(filtered_ops, trace_events, output_path):
         for op in filtered_ops:
             dev = op['device']
             dev_idx = device_to_idx[dev]
-            min_cyc = device_min_cyc.get(dev, 0)
-            freq = device_freq_mhz.get(dev, 1000.0)
-            op_start_ns = int(round(((op['start_cycles'] - min_cyc) / freq) * 1000))
-            op_dur_ns = int(round((op['cycles'] / freq) * 1000))
+            tm = time_mappers[dev]
+            op_start_ns = tm.cycle_to_ns(op['start_cycles'])
+            op_dur_ns = tm.dur_cycles_to_ns(op['start_cycles'], op['cycles'])
             if op['name'] != "OPBATCH":
                 if op_start_ns < last_op_end_ns[dev]:
                     op_start_ns = last_op_end_ns[dev]
@@ -681,10 +738,20 @@ def main():
             sys.exit(1)
         ops = [op for op in ops if filter_re.search(op['op_text'])]
 
-    if args.head is not None:
-        ops = ops[:args.head]
-    elif args.tail is not None:
-        ops = ops[-args.tail:]
+    if args.head is not None or args.tail is not None:
+        ops_by_dev = defaultdict(list)
+        for op in ops:
+            ops_by_dev[op['device']].append(op)
+
+        filtered_ops = []
+        for dev in sorted(ops_by_dev.keys()):
+            dev_ops = ops_by_dev[dev]
+            if args.head is not None:
+                dev_ops = dev_ops[:args.head]
+            elif args.tail is not None:
+                dev_ops = dev_ops[-args.tail:]
+            filtered_ops.extend(dev_ops)
+        ops = filtered_ops
 
     if args.filter or args.head is not None or args.tail is not None:
         # Group valid ranges by device

@@ -113,6 +113,7 @@ def parse_log(file_path, pmu_index=None, limit=None, device_filter=None, op_filt
 
     timestamp_pattern = re.compile(r"(?P<min>\d+)\.(?P<sec>\d+)\.(?P<ms>\d+)\.(?P<us>\d+)\s+[A-Z]\s+")
     unwrappers = {}
+    last_batch_start = {}
     trace_unwrappers = {}
 
     for line in f:
@@ -189,7 +190,10 @@ def parse_log(file_path, pmu_index=None, limit=None, device_filter=None, op_filt
                 if cycles_start_raw:
                     unwrapped_cycles_start = int(cycles_start_raw)
                     unwrappers[device] = CycleUnwrapper(unwrapped_cycles_start)
-                    trace_unwrappers[device] = CycleUnwrapper(unwrapped_cycles_start)
+                    last_batch_start[device] = unwrapped_cycles_start
+                    for k in list(trace_unwrappers.keys()):
+                        if k[0] == device:
+                            del trace_unwrappers[k]
             else:
                 if cycles_start_raw:
                     device_unwrapper = unwrappers.get(device)
@@ -247,13 +251,16 @@ def parse_log(file_path, pmu_index=None, limit=None, device_filter=None, op_filt
 
         trace_match = trace_pattern.search(line)
         if trace_match:
+            thread = int(trace_match.group('thread'))
             raw_cyc = int(trace_match.group('cycles'))
             unwrapped_cyc = None
-            device_trace_unwrapper = trace_unwrappers.get(device)
-            if device_trace_unwrapper is not None:
-                unwrapped_cyc = device_trace_unwrapper.unwrap(raw_cyc)
+            th_key = (device, thread)
+            if th_key not in trace_unwrappers:
+                batch_start = last_batch_start.get(device)
+                trace_unwrappers[th_key] = CycleUnwrapper(batch_start)
+            unwrapped_cyc = trace_unwrappers[th_key].unwrap(raw_cyc)
             all_traces.append({
-                'thread': int(trace_match.group('thread')),
+                'thread': thread,
                 'event':  trace_match.group('event'),
                 'info':   int(trace_match.group('info')),
                 'cycles': raw_cyc,
@@ -710,10 +717,20 @@ def main():
                 sys.exit(1)
             ops = [op for op in ops if filter_re.search(op['op_text'])]
 
-        if args.head is not None:
-            ops = ops[:args.head]
-        elif args.tail is not None:
-            ops = ops[-args.tail:]
+        if args.head is not None or args.tail is not None:
+            ops_by_dev = defaultdict(list)
+            for op in ops:
+                ops_by_dev[op['device']].append(op)
+
+            filtered_ops = []
+            for dev in sorted(ops_by_dev.keys()):
+                dev_ops = ops_by_dev[dev]
+                if args.head is not None:
+                    dev_ops = dev_ops[:args.head]
+                elif args.tail is not None:
+                    dev_ops = dev_ops[-args.tail:]
+                filtered_ops.extend(dev_ops)
+            ops = filtered_ops
 
         if args.timeline:
             for op in ops:
