@@ -2189,6 +2189,13 @@ static int ggml_cl_gridimg_default(const ggml_backend_opencl_context * backend_c
 // The IQ2_S twin. Same wave-uniform activation read, and applied to all three
 // kernels in that file -- its fused GLU is default ON and serves ffn_gate+ffn_up,
 // so texturing only the plain GEMV would leave most of the decode frame alone.
+// The IQ4_XS twin. Same wave-uniform activation read; its fused GLU and split-K
+// are default off here (measured negatives) so the plain and wimg kernels carry
+// the frame, but all four take the image because they share the IQ4XS_YV macro.
+static int ggml_cl_iq4xs_mv_aimg(const ggml_backend_opencl_context * backend_ctx) {
+    return ggml_cl_gridimg_default(backend_ctx, "GGML_OPENCL_IQ4XS_MV_AIMG");
+}
+
 static int ggml_cl_iq2s_mv_aimg(const ggml_backend_opencl_context * backend_ctx) {
     return ggml_cl_gridimg_default(backend_ctx, "GGML_OPENCL_IQ2S_MV_AIMG");
 }
@@ -3983,6 +3990,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             opts += " -DIQ4XS_MV_R4="  + std::to_string(ggml_cl_iq4xs_mv_r4());
             opts += " -DIQ4XS_MV_ABL=" + std::to_string(ggml_cl_iq4xs_mv_abl());
             opts += " -DIQ4XS_MV_CB=" + std::to_string(ggml_cl_iq4xs_mv_cb());
+        opts += " -DIQ4XS_MV_AIMG=" + std::to_string(ggml_cl_iq4xs_mv_aimg(backend_ctx));
             prog = build_program_from_source(backend_ctx, kernel_src.c_str(), opts);
 
             // Probe EVERY kernel in this program that is dispatched at 64*NSG and
@@ -24282,6 +24290,13 @@ static void ggml_cl_mul_mat_iq4_xs_glu_fused(ggml_backend_t backend, ggml_tensor
     const int nsg = backend_ctx->iq4xs_mv_nsg_eff;
 
     cl_int ai = 0;
+    cl_uint iq4xs_y_off = 0;
+    cl_mem  iq4xs_y_img = ggml_cl_iq4xs_mv_aimg(backend_ctx)
+        ? ggml_cl_activation_image(backend_ctx, extra1->data_device, offset1, ne10, ne11, &iq4xs_y_off)
+        : nullptr;
+    cl_mem  iq4xs_y_arg = iq4xs_y_img ? iq4xs_y_img : backend_ctx->iq1s_grid_img;
+    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),  &iq4xs_y_arg));
+    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_uint), &iq4xs_y_off));
     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex_g->q));
     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex_g->d));
     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex_g->sh));
@@ -24304,6 +24319,7 @@ static void ggml_cl_mul_mat_iq4_xs_glu_fused(ggml_backend_t backend, ggml_tensor
                            (size_t)ne11 * (size_t)nsg, 1 };
     size_t f_local[3]  = { 64, (size_t)nsg, 1 };
     backend_ctx->enqueue_ndrange_kernel(fk, 3, f_global, f_local, (ggml_tensor *)dst);
+    if (iq4xs_y_img) { CL_CHECK(clReleaseMemObject(iq4xs_y_img)); }
 #else
     GGML_UNUSED(backend); GGML_UNUSED(gate_tensor);
     GGML_UNUSED(up_tensor); GGML_UNUSED(glu_tensor);
@@ -37888,6 +37904,13 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                             : backend_ctx->kernel_mul_mv_iq4_xs_f32_flat;
                         const int nsg = backend_ctx->iq4xs_mv_nsg_eff;
                         cl_int ai = 0;
+                        cl_uint iq4xs_y_off = 0;
+                        cl_mem  iq4xs_y_img = ggml_cl_iq4xs_mv_aimg(backend_ctx)
+                            ? ggml_cl_activation_image(backend_ctx, extra1->data_device, offset1, ne10, ne11, &iq4xs_y_off)
+                            : nullptr;
+                        cl_mem  iq4xs_y_arg = iq4xs_y_img ? iq4xs_y_img : backend_ctx->iq1s_grid_img;
+                        CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),  &iq4xs_y_arg));
+                        CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_uint), &iq4xs_y_off));
                         CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   mv_wimg ? &ex0->q_img : &ex0->q));
                         CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->d));
                         CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->sh));
@@ -37907,6 +37930,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                                                (size_t)ne11 * (size_t)nsg, 1 };
                         size_t f_local[3]  = { 64, (size_t)nsg, 1 };
                         backend_ctx->enqueue_ndrange_kernel(fk, 3, f_global, f_local, dst);
+                        if (iq4xs_y_img) { CL_CHECK(clReleaseMemObject(iq4xs_y_img)); }
                         return;
                     }
 
@@ -40109,6 +40133,13 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 
                     cl_kernel sk = backend_ctx->kernel_mul_mv_iq4_xs_f32_flat_splitk;
                     cl_int ai = 0;
+                    cl_uint iq4xs_y_off = 0;
+                    cl_mem  iq4xs_y_img = ggml_cl_iq4xs_mv_aimg(backend_ctx)
+                        ? ggml_cl_activation_image(backend_ctx, extra1->data_device, offset1, ne10, ne11, &iq4xs_y_off)
+                        : nullptr;
+                    cl_mem  iq4xs_y_arg = iq4xs_y_img ? iq4xs_y_img : backend_ctx->iq1s_grid_img;
+                    CL_CHECK(clSetKernelArg(sk, ai++, sizeof(cl_mem),  &iq4xs_y_arg));
+                    CL_CHECK(clSetKernelArg(sk, ai++, sizeof(cl_uint), &iq4xs_y_off));
                     CL_CHECK(clSetKernelArg(sk, ai++, sizeof(cl_mem),   &ex0->q));
                     CL_CHECK(clSetKernelArg(sk, ai++, sizeof(cl_mem),   &ex0->d));
                     CL_CHECK(clSetKernelArg(sk, ai++, sizeof(cl_mem),   &ex0->sh));
@@ -40122,6 +40153,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     size_t s_global[3] = { (size_t)base_wg * 64, (size_t)nsg, (size_t)ksplit };
                     size_t s_local[3]  = { 64, (size_t)nsg, 1 };
                     backend_ctx->enqueue_ndrange_kernel(sk, 3, s_global, s_local, dst);
+                    if (iq4xs_y_img) { CL_CHECK(clReleaseMemObject(iq4xs_y_img)); }
 
                     cl_kernel rk = backend_ctx->kernel_gemv_splitk_reduce_f32;
                     cl_int ri = 0;
@@ -40155,6 +40187,13 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     : backend_ctx->kernel_mul_mv_iq4_xs_f32_flat;
                 const int nsg = backend_ctx->iq4xs_mv_nsg_eff;
                 cl_int ai = 0;
+                cl_uint iq4xs_y_off = 0;
+                cl_mem  iq4xs_y_img = ggml_cl_iq4xs_mv_aimg(backend_ctx)
+                    ? ggml_cl_activation_image(backend_ctx, extra1->data_device, offset1, ne10, ne11, &iq4xs_y_off)
+                    : nullptr;
+                cl_mem  iq4xs_y_arg = iq4xs_y_img ? iq4xs_y_img : backend_ctx->iq1s_grid_img;
+                CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),  &iq4xs_y_arg));
+                CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_uint), &iq4xs_y_off));
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   mv_wimg ? &ex0->q_img : &ex0->q));
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->d));
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->sh));
@@ -40174,6 +40213,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                                (size_t)ne11 * (size_t)nsg, 1 };
                 size_t f_local[3]  = { 64, (size_t)nsg, 1 };
                 backend_ctx->enqueue_ndrange_kernel(fk, 3, f_global, f_local, dst);
+                if (iq4xs_y_img) { CL_CHECK(clReleaseMemObject(iq4xs_y_img)); }
                 return;
             }
 
