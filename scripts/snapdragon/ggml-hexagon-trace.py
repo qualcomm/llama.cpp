@@ -305,6 +305,7 @@ def parse_log(file_path, limit=None, device_filter=None, op_filter_re=None):
                 'cycles': raw_cyc,
                 'unwrapped_cycles': unwrapped_cyc,
                 'state':  trace_match.group('state'),
+                'line_num': line_idx,
                 'device': device
             })
 
@@ -452,27 +453,29 @@ def generate_perfetto_trace(filtered_ops, trace_events, output_path):
             if state == 'start':
                 # Handle missing stop (start followed by another start)
                 if key in active_starts:
-                    prev_start = active_starts[key]
+                    prev_e = active_starts[key]
                     completed_events.append({
                         'thread': t,
                         'event': evt,
                         'info': info,
-                        'start_cyc': prev_start,
-                        'end_cyc': prev_start + one_usec_cycles.get(dev, 1000.0),
+                        'start_cyc': prev_e['unwrapped_cycles'],
+                        'end_cyc': prev_e['unwrapped_cycles'] + one_usec_cycles.get(dev, 1000.0),
+                        'line_num': prev_e.get('line_num'),
                         'missing_stop': True,
                         'device': dev
                     })
-                active_starts[key] = cyc
+                active_starts[key] = e
             elif state == 'stop':
                 if key in active_starts:
-                    start_cyc = active_starts[key]
+                    prev_e = active_starts[key]
                     del active_starts[key]
                     completed_events.append({
                         'thread': t,
                         'event': evt,
                         'info': info,
-                        'start_cyc': start_cyc,
+                        'start_cyc': prev_e['unwrapped_cycles'],
                         'end_cyc': cyc,
+                        'line_num': prev_e.get('line_num'),
                         'device': dev
                     })
                 else:
@@ -483,19 +486,21 @@ def generate_perfetto_trace(filtered_ops, trace_events, output_path):
                         'info': info,
                         'start_cyc': cyc - one_usec_cycles.get(dev, 1000.0),
                         'end_cyc': cyc,
+                        'line_num': e.get('line_num'),
                         'missing_start': True,
                         'device': dev
                     })
 
         # Clear remaining unmatched starts
-        for key, start_cyc in active_starts.items():
+        for key, prev_e in active_starts.items():
             dev, t, evt, info = key
             completed_events.append({
                 'thread': t,
                 'event': evt,
                 'info': info,
-                'start_cyc': start_cyc,
-                'end_cyc': start_cyc + one_usec_cycles.get(dev, 1000.0),
+                'start_cyc': prev_e['unwrapped_cycles'],
+                'end_cyc': prev_e['unwrapped_cycles'] + one_usec_cycles.get(dev, 1000.0),
+                'line_num': prev_e.get('line_num'),
                 'missing_stop': True,
                 'device': dev
             })
@@ -677,11 +682,26 @@ def generate_perfetto_trace(filtered_ops, trace_events, output_path):
         # Emit Thread Trace Events
         for e in completed_events:
             norm_name = normalize_event_name(e['event'], e['info'])
-            name = f"DMA {e['info']}" if norm_name == "DMA" else norm_name
+            if norm_name == "DMA":
+                name = f"DMA {e['info']}"
+            elif norm_name == "FENCE":
+                name = f"FENCE {e['info']}" if e.get('info') is not None and e['info'] != 0 else "FENCE"
+            else:
+                name = norm_name
+
             if e.get('missing_start') or e.get('missing_stop'):
                 name += "!"
 
             debug_annots = []
+            if 'line_num' in e and e['line_num'] is not None:
+                debug_annots.append(make_debug_annotation("line", int_val=e['line_num']))
+            if norm_name == "FENCE" and e.get('info') is not None:
+                debug_annots.append(make_debug_annotation("seq", int_val=e['info']))
+            elif norm_name == "DMA" and e.get('info') is not None:
+                debug_annots.append(make_debug_annotation("channel", int_val=e['info']))
+            elif e.get('info') is not None and e['info'] != 0:
+                debug_annots.append(make_debug_annotation("info", int_val=e['info']))
+
             if e.get('missing_start'):
                 debug_annots.append(make_debug_annotation("missing_start", string_val="true"))
             if e.get('missing_stop'):

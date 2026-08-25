@@ -258,15 +258,15 @@ int op_allreduce(struct htp_ops_context * octx) {
     }
 
     const uint32_t nelem = dst->ne[0] * dst->ne[1] * dst->ne[2] * dst->ne[3];
+    const uint32_t fence_seq_entry = (uint32_t) octx->op_params[0];
+    const uint32_t fence_seq_exit  = (uint32_t) octx->op_params[1];
 
     // 1. Entry Barrier: Synchronize all ranks before reading
     struct htp_thread_trace * tr0 = &octx->ctx->trace[0];
-    htp_trace_event_start(tr0, HTP_TRACE_EVT_FENCE, (uint16_t) rank);
+    htp_trace_event_start(tr0, HTP_TRACE_EVT_FENCE, (uint16_t) fence_seq_entry);
 
     const struct htp_tensor * my_sync = octx->src[n_ranks + rank];
     atomic_uint * my_fence = (atomic_uint *) my_sync->data;
-    const uint32_t fence_seq_entry = (uint32_t) octx->op_params[0];
-    const uint32_t fence_seq_exit  = (uint32_t) octx->op_params[1];
 
     atomic_store(&my_fence[0], fence_seq_entry);
     asm volatile ("syncht" : : : "memory");
@@ -292,7 +292,7 @@ int op_allreduce(struct htp_ops_context * octx) {
     }
     asm volatile ("syncht" : : : "memory");
 
-    htp_trace_event_stop(tr0, HTP_TRACE_EVT_FENCE, (uint16_t) rank);
+    htp_trace_event_stop(tr0, HTP_TRACE_EVT_FENCE, (uint16_t) fence_seq_entry);
 
     // 2. Multi-threaded Reduction across assigned rank chunk
     if (nelem > 0) {
@@ -366,7 +366,7 @@ int op_allreduce(struct htp_ops_context * octx) {
     }
 
     // 4. Exit Barrier: Synchronize all ranks after writing
-    htp_trace_event_start(tr0, HTP_TRACE_EVT_FENCE, (uint16_t) rank);
+    htp_trace_event_start(tr0, HTP_TRACE_EVT_FENCE, (uint16_t) fence_seq_exit);
 
     atomic_store(&my_fence[0], fence_seq_exit);
     asm volatile ("syncht" : : : "memory");
@@ -392,7 +392,7 @@ int op_allreduce(struct htp_ops_context * octx) {
     }
     asm volatile ("syncht" : : : "memory");
 
-    htp_trace_event_stop(tr0, HTP_TRACE_EVT_FENCE, (uint16_t) rank);
+    htp_trace_event_stop(tr0, HTP_TRACE_EVT_FENCE, (uint16_t) fence_seq_exit);
 
     return HTP_STATUS_OK;
 }
