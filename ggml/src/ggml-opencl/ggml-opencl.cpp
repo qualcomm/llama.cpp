@@ -1322,6 +1322,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mv_iq3_s_f32;
     cl_kernel kernel_mul_mv_iq3_s_f32_flat;
     cl_kernel kernel_mul_mv_iq3_s_f32_flat_glu = nullptr;  // fused ffn_gate+ffn_up+GLU
+    cl_kernel kernel_mul_mv_iq3_s_f32_flat_splitk = nullptr;  // K split across workgroups
     cl_kernel kernel_mul_mv_iq3_s_f32_flat_dp4a = nullptr;
     cl_kernel kernel_mul_mv_iq3_xxs_f32_flat;
     cl_kernel kernel_mul_mv_iq2_xxs_f32_flat = nullptr;
@@ -2201,6 +2202,17 @@ static int ggml_cl_iq1s_mv_gridimg(const ggml_backend_opencl_context * backend_c
 // workgroups because their K split is internal, so a low-M projection runs a short
 // tail on a half-idle device. Profiled on a UD-IQ2_M decode frame after the gate/up
 // fusion, 52% of the frame sits at 50-75% occupancy on this 16-CU part.
+// The IQ3_S twin. Note this is an OCCUPANCY change, so the reason the GLU
+// fusion regressed on IQ3_S (it doubled that kernel's dominant codebook gather)
+// does not apply here: splitting K leaves gathers per unit of work unchanged.
+static int ggml_cl_iq3s_splitk_on(const ggml_backend_opencl_context * backend_ctx) {
+    static const char * const e = getenv("GGML_OPENCL_IQ3S_SPLITK");
+    if (e && *e) {
+        return atoi(e) != 0;
+    }
+    return backend_ctx->adreno_x2_class();
+}
+
 static int ggml_cl_iq2s_splitk_on(const ggml_backend_opencl_context * backend_ctx) {
     static const char * const e = getenv("GGML_OPENCL_IQ2S_SPLITK");
     if (e && *e) {
@@ -3728,6 +3740,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             backend_ctx->kernel_mul_mv_iq3_s_f32_flat_glu =
                 clCreateKernel(prog, "kernel_mul_mv_iq3_s_f32_flat_glu", &err);
             if (err != CL_SUCCESS) { backend_ctx->kernel_mul_mv_iq3_s_f32_flat_glu = nullptr; }
+            backend_ctx->kernel_mul_mv_iq3_s_f32_flat_splitk =
+                clCreateKernel(prog, "kernel_mul_mv_iq3_s_f32_flat_splitk", &err);
+            if (err != CL_SUCCESS) { backend_ctx->kernel_mul_mv_iq3_s_f32_flat_splitk = nullptr; }
         }
         backend_ctx->kernel_mul_mv_iq3_s_f32_flat_dp4a =
             clCreateKernel(prog, "kernel_mul_mv_iq3_s_f32_flat_dp4a", &err);
@@ -38899,6 +38914,55 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             // feature-major, so one work item per row pair makes a wave's read
             // one contiguous run. Must fire for EVERY ne11 that reaches here --
             // the AoS kernel below would read the planes as blocks.
+            // Workgroup-level K split; ksplit == 1 falls through unchanged.
+            if (ggml_cl_iq3s_is_split(backend_ctx, src0)
+                    && backend_ctx->kernel_mul_mv_iq3_s_f32_flat_splitk
+                    && backend_ctx->kernel_gemv_splitk_reduce_f32
+                    && ggml_cl_iq3s_splitk_on(backend_ctx)
+                    && ne00 % 256 == 0 && ne11 == 1
+                    && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1) {
+                const int nsb     = ne00 / 256;
+                const int base_wg = (int)CEIL_DIV((size_t)ne01, (size_t)128);
+                const int ksplit  = ggml_cl_iq_mv_ksplit(backend_ctx, base_wg, nsb);
+                if (ksplit > 1) {
+                    ggml_tensor_extra_cl_iq3_s * ex0 =
+                        (ggml_tensor_extra_cl_iq3_s *)src0->extra;
+                    const int nsg = ggml_cl_iq3s_mv_nsg();
+                    backend_ctx->prealloc_splitk_partial.allocate(
+                        backend_ctx->context, (size_t)ksplit * (size_t)ne01 * sizeof(float));
+
+                    cl_kernel sk = backend_ctx->kernel_mul_mv_iq3_s_f32_flat_splitk;
+                    cl_int ai = 0;
+                    CL_CHECK(clSetKernelArg(sk, ai++, sizeof(cl_mem),   &backend_ctx->iq3s_grid_img));
+                    CL_CHECK(clSetKernelArg(sk, ai++, sizeof(cl_mem),   &ex0->qs));
+                    CL_CHECK(clSetKernelArg(sk, ai++, sizeof(cl_mem),   &ex0->qh));
+                    CL_CHECK(clSetKernelArg(sk, ai++, sizeof(cl_mem),   &ex0->sg));
+                    CL_CHECK(clSetKernelArg(sk, ai++, sizeof(cl_mem),   &ex0->sc));
+                    CL_CHECK(clSetKernelArg(sk, ai++, sizeof(cl_mem),   &ex0->d));
+                    CL_CHECK(clSetKernelArg(sk, ai++, sizeof(cl_mem),   &extra1->data_device));
+                    CL_CHECK(clSetKernelArg(sk, ai++, sizeof(cl_ulong), &offset1));
+                    CL_CHECK(clSetKernelArg(sk, ai++, sizeof(cl_mem),   &backend_ctx->prealloc_splitk_partial.buffer));
+                    CL_CHECK(clSetKernelArg(sk, ai++, sizeof(int),      &ne00));
+                    CL_CHECK(clSetKernelArg(sk, ai++, sizeof(int),      &ne01));
+                    CL_CHECK(clSetKernelArg(sk, ai++, sizeof(int),      &ne10));
+                    size_t s_global[3] = { (size_t)base_wg * 64, (size_t)nsg, (size_t)ksplit };
+                    size_t s_local[3]  = { 64, (size_t)nsg, 1 };
+                    backend_ctx->enqueue_ndrange_kernel(sk, 3, s_global, s_local, dst);
+
+                    cl_kernel rk = backend_ctx->kernel_gemv_splitk_reduce_f32;
+                    cl_int ri = 0;
+                    CL_CHECK(clSetKernelArg(rk, ri++, sizeof(cl_mem),   &backend_ctx->prealloc_splitk_partial.buffer));
+                    CL_CHECK(clSetKernelArg(rk, ri++, sizeof(cl_mem),   &extrad->data_device));
+                    CL_CHECK(clSetKernelArg(rk, ri++, sizeof(cl_ulong), &offsetd));
+                    CL_CHECK(clSetKernelArg(rk, ri++, sizeof(int),      &ne01));
+                    CL_CHECK(clSetKernelArg(rk, ri++, sizeof(int),      &ksplit));
+                    size_t r_global[1] = { CEIL_DIV((size_t)ne01, (size_t)64) * 64 };
+                    size_t r_local[1]  = { 64 };
+                    backend_ctx->enqueue_ndrange_kernel(rk, 1, r_global, r_local, dst);
+                    return;
+                }
+            }
+
             if (ggml_cl_iq3s_is_split(backend_ctx, src0)
                     && backend_ctx->kernel_mul_mv_iq3_s_f32_flat
                     && ne00 % 256 == 0
