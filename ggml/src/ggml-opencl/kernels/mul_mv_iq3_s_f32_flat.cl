@@ -670,12 +670,32 @@ kernel void kernel_mul_mv_iq3_s_f32_flat_dp4a(
 //     IQ2_XXS   +4.5%   4 lookups, but measured on a 27B
 //     IQ3_S     -4.9%   EIGHT lookups per sub-block
 //
-// HYPOTHESIS, untested: register pressure. This kernel already carries the most
-// live state per sub-block of the four, and fusing doubles the weight-side state
-// (four accumulators, two grid streams, two sign streams) while only halving the
-// activation traffic, which is the smaller term here. Confirming would mean
-// reading CL_KERNEL_PRIVATE_MEM_SIZE for both kernels; the 512 B/WI cliff on this
-// part is documented and this is exactly the shape that would cross it.
+// REGISTER PRESSURE WAS THE WRONG ANSWER. That hypothesis was written here, then
+// tested with kinfo against the X2-90 compiler, and it is backwards:
+//
+//     kernel                base -> fused   private B/WI    wg cap    fusion
+//     IQ2_S                   320 -> 472              472   768->512   +13.2%
+//     IQ1_S                   288 -> 424              424   896->512   +12.4%
+//     IQ2_XXS                 288 -> 456              456   896->512    +4.5%
+//     IQ3_S                   256 -> 328              328  1024->768    -4.9%
+//
+// The kernel that REGRESSED has the LOWEST footprint of the four fused kernels and
+// the HIGHEST workgroup cap, so the best occupancy. Nothing spills, and all four
+// clear the 512 work-item dispatch.
+//
+// WHAT FITS INSTEAD: the codebook gather is this kernel's dominant term, and
+// fusing DOUBLES it. Per 32 weights per row every one of these does 8 dots and 8
+// activation loads, so the fusion saves the same activation traffic in all four --
+// but IQ3_S does EIGHT codebook lookups where the others do four, and fusing takes
+// it from 16 to 32 gathers per sub-block per row pair against 8 to 16 elsewhere.
+//
+// The cross-check is the grid-image measurement, which is a ready-made proxy for
+// how gather-dominated each kernel is, and it anti-correlates almost perfectly:
+//     GRIDIMG was worth   IQ1_S +2.5%   IQ2_S +4.4%   IQ3_S +10.4%   IQ3_XXS +18.8%
+//     fusion is worth     IQ1_S +12.4%  IQ2_S +13.2%  IQ3_S  -4.9%   IQ3_XXS   ?
+//
+// PREDICTION, UNTESTED: IQ3_XXS should regress HARDER than IQ3_S, since the image
+// was worth the most there. That is why the fused IQ3_XXS kernel was never built.
 // ---------------------------------------------------------------------------
 
 // Fifthth copy of the shared GLU epilogue: each .cl is its own program and cannot
