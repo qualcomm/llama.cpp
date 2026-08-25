@@ -2194,6 +2194,10 @@ static int ggml_cl_iq1m_mv_gridimg(const ggml_backend_opencl_context * backend_c
 
 // IQ2_XXS and IQ2_XS never got a plane split, so these are the AoS kernels and they
 // run on EVERY device, not just X2-class. Off by default until each gen is measured.
+// MEASURED A NULL on both AoS kernels: UD-IQ1_S 26.05 -> 26.06 (iq2_xxs) and
+// Qwen3.8-27B 5.635 -> 5.653 (iq2_xs). The image wins on all five PLANE-SPLIT grid
+// GEMVs (+2.5 to +18.8%) and does nothing on these two -- a different kernel family
+// with a different access pattern. Left off, and the image is not even created.
 static int ggml_cl_iq2xxs_mv_gridimg() {
     static const int v = ggml_cl_env_int("GGML_OPENCL_IQ2XXS_MV_GRIDIMG", 0);
     return v;
@@ -3330,8 +3334,13 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             build_program_from_source(backend_ctx, kernel_src.c_str(), opts_iq2xxs);
 
         CL_CHECK((backend_ctx->kernel_mul_mv_iq2_xxs_f32 = clCreateKernel(prog, "kernel_mul_mv_iq2_xxs_f32", &err), err));
-        ggml_cl_make_grid_image(backend_ctx, prog, "kernel_iq2xxs_grid_export", 512,
-                                &backend_ctx->iq2xxs_grid_buf, &backend_ctx->iq2xxs_grid_img);
+        // Measured a NULL on this AoS kernel, and it runs on EVERY device rather than
+        // only X2-class -- so do not create the image unless someone asks for it. The
+        // kernel arg is then a null cl_mem, which is legal and never read.
+        if (ggml_cl_iq2xxs_mv_gridimg()) {
+            ggml_cl_make_grid_image(backend_ctx, prog, "kernel_iq2xxs_grid_export", 512,
+                                    &backend_ctx->iq2xxs_grid_buf, &backend_ctx->iq2xxs_grid_img);
+        }
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
@@ -3350,8 +3359,13 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             build_program_from_source(backend_ctx, kernel_src.c_str(), opts_iq2xs);
 
         CL_CHECK((backend_ctx->kernel_mul_mv_iq2_xs_f32 = clCreateKernel(prog, "kernel_mul_mv_iq2_xs_f32", &err), err));
-        ggml_cl_make_grid_image(backend_ctx, prog, "kernel_iq2xs_grid_export", 1024,
-                                &backend_ctx->iq2xs_grid_buf, &backend_ctx->iq2xs_grid_img);
+        // Measured a NULL on this AoS kernel, and it runs on EVERY device rather than
+        // only X2-class -- so do not create the image unless someone asks for it. The
+        // kernel arg is then a null cl_mem, which is legal and never read.
+        if (ggml_cl_iq2xs_mv_gridimg()) {
+            ggml_cl_make_grid_image(backend_ctx, prog, "kernel_iq2xs_grid_export", 1024,
+                                    &backend_ctx->iq2xs_grid_buf, &backend_ctx->iq2xs_grid_img);
+        }
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
