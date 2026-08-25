@@ -210,6 +210,23 @@ typedef float lm_st;
 // device, so this costs no memory. Default follows the per-generation texture
 // gate; it is UNMEASURED outside X2-class, and X2-class barely uses this kernel
 // because the split claims those tensors first, so the gate is where the value is.
+// MEASURED, and it is NOT the win the dp4a twin was. With the plane split forced
+// off so this kernel carries the prefill, X2-90:
+//   Llama-3.2-3B-IQ3_M     272.98 -> 274.75  (+0.6%)
+//   Llama-3.2-3B-UD-IQ2_M  236.22 -> 243.17  (+2.9%)
+//   Llama-3.2-3B-UD-IQ1_S  246.86 -> 255.99  (+3.7%)
+// PPL 11.6371 either way.
+//
+// So the same defect is worth 42%% in the dp4a GEMM and ~2%% here. The refinement:
+// a divergent __constant gather costs in proportion to how TIGHT the loop around
+// it is. The dp4a kernel builds eight operands per 32-K step in a very short
+// inner loop; this one computes a TM x TN output tile per thread, so each
+// dequantized weight feeds many multiply-accumulates and the gather amortizes.
+// This kernel is also 2.3x slower than the dp4a GEMM before either change
+// (273 against 618 on IQ3_M), so the codebook was never its limit.
+//
+// Small, consistent and never negative, so it stays on where the gate says so,
+// but do not expect the GEMM number from it.
 #ifndef IQ2XS_LM_GRIDIMG
 #define IQ2XS_LM_GRIDIMG 0
 #endif
