@@ -2245,26 +2245,38 @@ static int ggml_cl_iq1s_splitk_on(const ggml_backend_opencl_context * backend_ct
 // (fuse where the codebook gather is cheap) puts IQ1_M with IQ1_S and IQ2_S at
 // four gathers per sub-block, but that rule is a predictor, so this default only
 // stands on a measurement at both scales.
-// IQ4_XS had NEITHER the GLU fusion nor the K split, which is why it is the next
-// one worth doing: on a 3B roster it is the fastest decode after Q4_0 (40.0
-// against 47.7) and those two things are much of Q4_0's advantage. It is a LINEAR
-// quant, not a codebook one, so the q4_0 precedent (+10.2%) is the right prior,
-// not the weaker codebook-family results. R2 only -- the host declines both when
-// GGML_OPENCL_IQ4XS_MV_R4 is on.
+// MEASURED NEGATIVE, both of them. Llama-3.2-3B-IQ4_XS tg64 on an X2-90, arms
+// repeated, and FIRED-CHECKED (the fused kernel logs ~400 dispatches in a
+// 16-token run -- llama-bench hides the backend log without -v, which made the
+// first check read as "never fires"):
+//
+//     fusion   39.98 / 39.91  ->  39.77 / 40.03   a wash, arms straddle
+//     split-K  39.98          ->  39.26           -1.8%  (-2.1% with fusion on)
+//
+// PPL 7.2534 -> 7.2533, prefill unchanged at 843. Both DEFAULT OFF; the kernels
+// stay so the result can be re-measured rather than re-derived.
+//
+// 🔑 WHY, and it refines the family rule. The wins on IQ1_S/IQ1_M/IQ2_S came from
+// sharing COMPUTATION: each has a delta or min term multiplied by a per-block sum
+// of activations, and that sum is identical for gate and up, so fusing computes it
+// once instead of twice. IQ4_XS has no such term -- fusing shares only the
+// activation LOAD, which is negligible against the weight traffic that dominates a
+// linear quant's decode. The q4_0 precedent (+10.2%) does not transfer either:
+// q4_0 is the fastest type here and therefore the most host-bound, so what it
+// gained was the halved dispatch count, and IQ4_XS at 40 t/s is not there yet.
+//
+// ⇒ For the types still missing a fusion, ask whether it shares WORK, not just a
+// load: q2_K has mins and is a candidate; q3_K, q5_K, q6_K and q8_0 do not.
 static int ggml_cl_iq4xs_fuse_glu(const ggml_backend_opencl_context * backend_ctx) {
-    static const char * const e = getenv("GGML_OPENCL_IQ4XS_FUSE_GLU");
-    if (e && *e) {
-        return atoi(e) != 0;
-    }
-    return backend_ctx->adreno_x2_class();
+    GGML_UNUSED(backend_ctx);
+    static const int v = ggml_cl_env_int("GGML_OPENCL_IQ4XS_FUSE_GLU", 0);
+    return v;
 }
 
 static int ggml_cl_iq4xs_splitk_on(const ggml_backend_opencl_context * backend_ctx) {
-    static const char * const e = getenv("GGML_OPENCL_IQ4XS_SPLITK");
-    if (e && *e) {
-        return atoi(e) != 0;
-    }
-    return backend_ctx->adreno_x2_class();
+    GGML_UNUSED(backend_ctx);
+    static const int v = ggml_cl_env_int("GGML_OPENCL_IQ4XS_SPLITK", 0);
+    return v;
 }
 
 static int ggml_cl_iq1m_fuse_glu(const ggml_backend_opencl_context * backend_ctx) {
