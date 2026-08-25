@@ -378,6 +378,16 @@ kernel void kernel_mul_mv_iq2_xxs_f32_flat(
 //
 // The two weight streams are interleaved so each activation pair is loaded once
 // and feeds gate and up in the same iteration. R2 only.
+//
+// MEASURED: Qwen3.8-27B-UD-IQ2_XXS tg32 3.850 -> 4.025 (+4.5%), fired-checked at
+// 144 dispatches, PPL 7.1440 either way. A real win but a third of what the IQ2_S
+// and IQ1_S twins gave; the IQ3_S twin with twice the lookups per sub-block goes
+// NEGATIVE, so this family's payoff falls as the base kernel gets heavier. See
+// the IQ3_S kernel header for the whole ladder.
+//
+// The baseline here (3.850) is above the 3.618 recorded for this file earlier in
+// the round -- other fusions landed in between and this file is a mixed quant.
+// The A/B isolates IQ2_XXS; the absolutes are not one before/after.
 // ---------------------------------------------------------------------------
 
 // Fourthth copy of the shared GLU epilogue: each .cl is its own program and cannot

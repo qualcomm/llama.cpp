@@ -655,10 +655,27 @@ kernel void kernel_mul_mv_iq3_s_f32_flat_dp4a(
 // share an activation, so the streams are interleaved and each activation vector
 // is read once. R2 only.
 //
-// The cost probes on this kernel say the arithmetic is a large independent term
-// here (doubling it costs 33% of throughput), so halving the ACTIVATION traffic
-// is expected to matter less for IQ3_S than for the lower-bit twins. Measured,
-// not assumed.
+// MEASURED, and it LOSES. Qwen3.8-27B-UD-IQ3_S tg32 5.076 -> 4.829, -4.9%,
+// fired-checked at 135 dispatches so the arms really differ, PPL 6.0921 either
+// way. DEFAULT OFF. The kernel is kept so the result is re-measurable.
+//
+// The prediction written here beforehand was that IQ3_S would gain LESS than the
+// lower-bit twins, because its cost probe says the arithmetic is a large
+// independent term (doubling it costs 33% of throughput). That was the right
+// direction and the wrong magnitude: it does not gain less, it goes negative.
+//
+// Where the family lands, all on the same construction:
+//     IQ2_S    +13.2%   4 codebook lookups per 32-weight sub-block
+//     IQ1_S    +12.4% / +10.3%
+//     IQ2_XXS   +4.5%   4 lookups, but measured on a 27B
+//     IQ3_S     -4.9%   EIGHT lookups per sub-block
+//
+// HYPOTHESIS, untested: register pressure. This kernel already carries the most
+// live state per sub-block of the four, and fusing doubles the weight-side state
+// (four accumulators, two grid streams, two sign streams) while only halving the
+// activation traffic, which is the smaller term here. Confirming would mean
+// reading CL_KERNEL_PRIVATE_MEM_SIZE for both kernels; the 512 B/WI cliff on this
+// part is documented and this is exactly the shape that would cross it.
 // ---------------------------------------------------------------------------
 
 // Fifthth copy of the shared GLU epilogue: each .cl is its own program and cannot

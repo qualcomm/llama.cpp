@@ -2204,12 +2204,13 @@ static int ggml_cl_iq2xxs_fuse_glu(const ggml_backend_opencl_context * backend_c
     return backend_ctx->adreno_x2_class();
 }
 
+// MEASURED NEGATIVE: -4.9% on Qwen3.8-27B-UD-IQ3_S. Default OFF everywhere; the
+// kernel stays so the result can be re-measured instead of re-derived. See the
+// kernel header for the ladder and the register-pressure hypothesis.
 static int ggml_cl_iq3s_fuse_glu(const ggml_backend_opencl_context * backend_ctx) {
-    static const char * const e = getenv("GGML_OPENCL_IQ3S_FUSE_GLU");
-    if (e && *e) {
-        return atoi(e) != 0;
-    }
-    return backend_ctx->adreno_x2_class();
+    GGML_UNUSED(backend_ctx);
+    static const int v = ggml_cl_env_int("GGML_OPENCL_IQ3S_FUSE_GLU", 0);
+    return v;
 }
 
 static int ggml_cl_iq1s_fuse_glu(const ggml_backend_opencl_context * backend_ctx) {
