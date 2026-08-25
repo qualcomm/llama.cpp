@@ -56,7 +56,7 @@ def main():
     parser.add_argument("--target-dir", help="Target directory on the device (default: /data/local/tmp/llama.cpp for Android, ~/llama.cpp for Linux)")
     parser.add_argument("--install-dir", help="Install directory name (defaults to pkg-TARGET or pkg-TARGET-dbg prefix based on target)")
     parser.add_argument("--debug", action="store_true", help="Use debug build (defaults to pkg-TARGET-dbg folder)")
-    parser.add_argument("--devices", "--device", "-d", help="Select execution devices (split into NPU and OpenCL GPUs automatically, default: HTP0:0)")
+    parser.add_argument("--devices", "--device", "-d", help="Select execution devices (split into NPU and OpenCL GPUs automatically, default: HTP0)")
     parser.add_argument("--verbose", help="Verbose level (enables both Hexagon and OpenCL kernel cache debugging)")
     parser.add_argument("--profile", help="Profiling flag (enables Hexagon profiling and OpenCL autotuning)")
     parser.add_argument("--sched-debug", action="store_true", help="Enable GGML/llama.cpp scheduler debug output (GGML_SCHED_DEBUG=2)")
@@ -146,15 +146,17 @@ def main():
             env_vars[env_name] = os.environ[env_name]
 
     # Resolve and filter devices (HTP vs OpenCL)
-    devices_val = args.devices if args.devices is not None else "HTP0:0"
-    parts = [p.strip() for p in devices_val.split(",")]
-
-    # Any device containing "htp" is Hexagon, rest is OpenCL
-    hex_parts = [p for p in parts if "htp" in p.lower()]
-    cl_parts = [p for p in parts if "htp" not in p.lower()]
-
-    hex_devices = ",".join(hex_parts)
-    cl_device = ",".join(cl_parts)
+    devices_val = args.devices if args.devices is not None else "HTP0"
+    if devices_val.isdigit():
+        hex_devices = devices_val
+        cl_device = ""
+    else:
+        parts = [p.strip() for p in devices_val.split(",")]
+        # Any device containing "htp" is Hexagon, rest is OpenCL
+        hex_parts = [p for p in parts if "htp" in p.lower()]
+        cl_parts = [p for p in parts if "htp" not in p.lower()]
+        hex_devices = ",".join(hex_parts)
+        cl_device = ",".join(cl_parts)
 
     # Set Hexagon devices
     if hex_devices:
@@ -268,7 +270,7 @@ def main():
             if args.devices:
                 if args.devices.isdigit():
                     n = int(args.devices)
-                    device_val = ",".join(f"HTP{i}:0" for i in range(n))
+                    device_val = ",".join(f"HTP{i}" for i in range(n))
                 else:
                     device_val = args.devices
             elif "D" in os.environ:
@@ -276,7 +278,7 @@ def main():
             elif "DEVICE" in os.environ:
                 device_val = os.environ["DEVICE"]
             else:
-                device_val = "HTP0:0"
+                device_val = "HTP0"
             if device_val:
                 cmd_args += ["-b", device_val]
     else:
@@ -285,7 +287,7 @@ def main():
             if args.devices:
                 if args.devices.isdigit():
                     n = int(args.devices)
-                    device_val = ",".join(f"HTP{i}:0" for i in range(n))
+                    device_val = ",".join(f"HTP{i}" for i in range(n))
                 else:
                     device_val = args.devices
             elif "D" in os.environ:
@@ -293,7 +295,7 @@ def main():
             elif "DEVICE" in os.environ:
                 device_val = os.environ["DEVICE"]
             else:
-                device_val = "HTP0:0"
+                device_val = "HTP0"
             if device_val:
                 cmd_args += ["--device", device_val]
 

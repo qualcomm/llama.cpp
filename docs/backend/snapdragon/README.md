@@ -217,8 +217,8 @@ ggml-hex: new session: HTP0 : session-id 0 domain-id 3 uri file:///libggml-htp-v
 
 - `GGML_HEXAGON_DEVICES` (default: not set, defaults to HTP0 session)
   Controls which NPU devices and sessions to allocate. Can be configured as:
-  - A single integer `N`: Allocates `N` sessions on physical NPUs `0` to `N-1`, named `HTP0:0`, `HTP1:0`, etc. (used for dual NPU systems).
-  - A comma-separated list of device names in `HTP<physical_idx>:<virtual_idx>` format. For example, `HTP0:0,HTP0:1` creates two virtual
+  - A single integer `N`: Allocates `N` sessions named `HTP0`, `HTP1`, ..., `HTP<N-1>` (behaves identically to `GGML_HEXAGON_NDEV=N`).
+  - A comma-separated list of device names in `HTP<physical_idx>:<virtual_idx>` format (or legacy `HTP<idx>` format). For example, `HTP0:0,HTP0:1` creates two virtual
     sessions on the first physical NPU (useful for memory limits). `HTP0:0,HTP1:0` allocates one session on each of the two physical NPUs
     on a dual-NPU device.
 

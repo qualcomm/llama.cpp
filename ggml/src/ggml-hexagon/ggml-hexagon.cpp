@@ -5888,6 +5888,11 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
 
     // Parse device configuration
     const char * str_devices  = getenv("GGML_HEXAGON_DEVICES");
+    if (!str_devices && str_ndev && str_ndev[0] != '\0') {
+        GGML_LOG_WARN("DEPRECATED: GGML_HEXAGON_NDEV is deprecated. use GGML_HEXAGON_DEVICES instead\n");
+        str_devices = str_ndev;
+    }
+
     if (str_devices && str_devices[0] != '\0') {
         bool is_single_number = true;
         for (int i = 0; str_devices[i] != '\0'; i++) {
@@ -5902,9 +5907,9 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
             if (n > GGML_HEXAGON_MAX_SESSIONS) n = GGML_HEXAGON_MAX_SESSIONS;
             opt_ndev = n;
             for (size_t i = 0; i < opt_ndev; i++) {
-                opt_device_configs[i].physical_idx = (int)i;
-                opt_device_configs[i].virtual_idx  = 0;
-                opt_device_configs[i].name         = "HTP" + std::to_string(i) + ":0";
+                opt_device_configs[i].physical_idx = 0;
+                opt_device_configs[i].virtual_idx  = (int)i;
+                opt_device_configs[i].name         = "HTP" + std::to_string(i);
             }
         } else {
             std::string s_devices(str_devices);
@@ -5940,7 +5945,9 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
                     if (opt_ndev < GGML_HEXAGON_MAX_SESSIONS) {
                         opt_device_configs[opt_ndev].physical_idx = phys;
                         opt_device_configs[opt_ndev].virtual_idx  = virt;
-                        opt_device_configs[opt_ndev].name         = "HTP" + std::to_string(phys) + ":" + std::to_string(virt);
+                        opt_device_configs[opt_ndev].name         = colon_pos == std::string::npos
+                            ? "HTP" + std::to_string(phys)
+                            : "HTP" + std::to_string(phys) + ":" + std::to_string(virt);
                         opt_ndev++;
                     } else {
                         GGML_LOG_WARN("ggml-hex: max sessions limit reached (%d), ignoring device %s\n", GGML_HEXAGON_MAX_SESSIONS, item.c_str());
@@ -5949,17 +5956,6 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
                     GGML_LOG_WARN("ggml-hex: invalid device name format '%s', must start with HTP\n", item.c_str());
                 }
             }
-        }
-    } else if (str_ndev && str_ndev[0] != '\0') {
-        GGML_LOG_WARN("DEPRECATED: GGML_HEXAGON_NDEV is deprecated. use GGML_HEXAGON_DEVICES instead\n");
-        int n = atoi(str_ndev);
-        if (n < 1) n = 1;
-        if (n > GGML_HEXAGON_MAX_SESSIONS) n = GGML_HEXAGON_MAX_SESSIONS;
-        opt_ndev = n;
-        for (size_t i = 0; i < opt_ndev; i++) {
-            opt_device_configs[i].physical_idx = 0;
-            opt_device_configs[i].virtual_idx  = (int)i;
-            opt_device_configs[i].name         = "HTP" + std::to_string(i);
         }
     } else {
         opt_ndev = 1;
