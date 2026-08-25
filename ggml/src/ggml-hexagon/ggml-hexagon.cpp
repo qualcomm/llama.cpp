@@ -77,7 +77,13 @@ struct ggml_hexagon_device_config {
 static ggml_hexagon_device_config opt_device_configs[GGML_HEXAGON_MAX_SESSIONS];
 
 static int get_domain_id(int physical_idx) {
-    return CDSP_DOMAIN_ID + physical_idx;
+    switch (physical_idx) {
+        case 0:  return 3;  // CDSP0 (all devices)
+        case 1:  return 4;  // CDSP1 (IQ9, IQ10)
+        case 2:  return 18; // CDSP2 (IQ10)
+        case 3:  return 19; // CDSP3 (IQ10)
+        default: return CDSP_DOMAIN_ID + physical_idx;
+    }
 }
 
 static std::string get_domain_name(int physical_idx) {
