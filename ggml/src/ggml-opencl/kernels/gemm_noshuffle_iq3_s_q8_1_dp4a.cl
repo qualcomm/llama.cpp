@@ -115,7 +115,18 @@ inline uint iq3s_pack(uint gv, uint sg, uint base) {
 // +18.8%, IQ2_S +4.4%, IQ1_M +3.4%, IQ1_S +2.5%). The GEMMs were never asked.
 //
 // The image is the singleton the decode GEMV already builds at init, so this
-// costs no extra memory. Default off until measured.
+// costs no extra memory.
+//
+// MEASURED on X2-90, bracketed, both arms repeated:
+//   Llama-3.2-3B-IQ3_M    pp512  616.4 -> 881.2  (+43.0%)
+//   Qwen3.8-27B-UD-IQ3_S  pp512   77.2 ->  83.4   (+8.0%)
+// wikitext PPL 11.6400 -> 11.6400, IDENTICAL to four decimals: same table, a
+// different memory tier, so the arithmetic cannot change.
+//
+// The 3B is nearly all IQ3_S while the 27B file is a hybrid, which is why the
+// gains differ by that much; the effect tracks the share of weights of the type.
+// +43% took IQ3_M from the SLOWEST prefill in the 3B roster to second only to
+// q4_0. Default on for X2-class, per generation like every other texture path.
 #ifndef IQ3S_GEMM_GRIDIMG
 #define IQ3S_GEMM_GRIDIMG 0
 #endif
