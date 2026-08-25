@@ -1321,6 +1321,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mv_tq1_0_f32;
     cl_kernel kernel_mul_mv_iq3_s_f32;
     cl_kernel kernel_mul_mv_iq3_s_f32_flat;
+    cl_kernel kernel_mul_mv_iq3_s_f32_flat_dp4a = nullptr;
     cl_kernel kernel_mul_mv_iq3_xxs_f32_flat;
     cl_kernel kernel_mul_mv_q3_k_f32_flat;
     cl_kernel kernel_mul_mv_q2_k_f32_flat;
@@ -2205,6 +2206,17 @@ static int ggml_cl_iq2xxs_mv_gridimg() {
 
 static int ggml_cl_iq2xs_mv_gridimg() {
     static const int v = ggml_cl_env_int("GGML_OPENCL_IQ2XS_MV_GRIDIMG", 0);
+    return v;
+}
+
+// dp4a (int8) decode GEMV for IQ3_S. Justified by the additive work probe: this
+// kernel loses 33% of its throughput when its arithmetic is doubled with the
+// loads held fixed, and still 33% after the grid became an image, so the ALU is a
+// large independent term. IQ1_S is +-0.0% under the same probe, which is why this
+// is IQ3_S-only. Needs an activation q8_1 pre-pass, so it costs one extra
+// dispatch per GEMV -- off until that trade is measured.
+static int ggml_cl_iq3s_mv_dp4a() {
+    static const int v = ggml_cl_env_int("GGML_OPENCL_IQ3S_MV_DP4A", 0);
     return v;
 }
 
@@ -3498,6 +3510,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             build_program_from_source(backend_ctx, kernel_src.c_str(), opts);
 
         CL_CHECK((backend_ctx->kernel_mul_mv_iq3_s_f32_flat = clCreateKernel(prog, "kernel_mul_mv_iq3_s_f32_flat", &err), err));
+        backend_ctx->kernel_mul_mv_iq3_s_f32_flat_dp4a =
+            clCreateKernel(prog, "kernel_mul_mv_iq3_s_f32_flat_dp4a", &err);
+        if (err != CL_SUCCESS) { backend_ctx->kernel_mul_mv_iq3_s_f32_flat_dp4a = nullptr; }
         ggml_cl_make_grid_image(backend_ctx, prog, "kernel_iq3s_grid_export", 512,
                                 &backend_ctx->iq3s_grid_buf, &backend_ctx->iq3s_grid_img);
         CL_CHECK(clReleaseProgram(prog));
@@ -35311,6 +35326,65 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                         CL_CHECK(clReleaseMemObject(a_sub));
                         return;
                     }
+                }
+
+                // dp4a twin: quantise the activation to q8_1 first, then run the int8
+                // GEMV. One sub-block of that kernel is 32 K-values == one q8_1 block,
+                // so the per-block activation scale lands without interpolation.
+                if (ggml_cl_iq3s_mv_dp4a()
+                        && backend_ctx->kernel_mul_mv_iq3_s_f32_flat_dp4a
+                        && backend_ctx->has_integer_dot_product
+                        && ggml_cl_iq3s_is_split(backend_ctx, src0)
+                        && ne00 % 256 == 0
+                        && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1) {
+                    ggml_tensor_extra_cl_iq3_s * exq =
+                        (ggml_tensor_extra_cl_iq3_s *)src0->extra;
+                    const size_t nblk = (size_t)ne11 * ((size_t)ne00 / 32);
+                    cl_mem a_sub = nullptr;
+                    cl_buffer_region reg;
+                    reg.origin = offset1;
+                    reg.size   = (size_t)ne00 * (size_t)ne11 * sizeof(float);
+                    CL_CHECK((a_sub = clCreateSubBuffer(extra1->data_device, 0,
+                        CL_BUFFER_CREATE_TYPE_REGION, &reg, &err), err));
+                    backend_ctx->prealloc_moe_qa.allocate(backend_ctx->context,
+                        (size_t)ne00 * (size_t)ne11 * sizeof(cl_char));
+                    backend_ctx->prealloc_moe_da.allocate(backend_ctx->context, nblk * sizeof(cl_half));
+                    backend_ctx->prealloc_moe_sa.allocate(backend_ctx->context, nblk * sizeof(cl_half));
+
+                    cl_int tb = (cl_int)nblk;
+                    cl_kernel qk = backend_ctx->kernel_quant_a_q8_1;
+                    CL_CHECK(clSetKernelArg(qk, 0, sizeof(cl_mem), &a_sub));
+                    CL_CHECK(clSetKernelArg(qk, 1, sizeof(cl_mem), &backend_ctx->prealloc_moe_qa.buffer));
+                    CL_CHECK(clSetKernelArg(qk, 2, sizeof(cl_mem), &backend_ctx->prealloc_moe_da.buffer));
+                    CL_CHECK(clSetKernelArg(qk, 3, sizeof(cl_mem), &backend_ctx->prealloc_moe_sa.buffer));
+                    CL_CHECK(clSetKernelArg(qk, 4, sizeof(cl_int), &tb));
+                    size_t ql[1] = { 64 };
+                    size_t qg[1] = { (size_t)(((nblk + 63) / 64) * 64) };
+                    backend_ctx->enqueue_ndrange_kernel(qk, 1, qg, ql, dst);
+
+                    cl_kernel dk = backend_ctx->kernel_mul_mv_iq3_s_f32_flat_dp4a;
+                    const int nsgd = ggml_cl_iq3s_mv_nsg();
+                    cl_int di = 0;
+                    CL_CHECK(clSetKernelArg(dk, di++, sizeof(cl_mem),   &backend_ctx->iq3s_grid_img));
+                    CL_CHECK(clSetKernelArg(dk, di++, sizeof(cl_mem),   &exq->qs));
+                    CL_CHECK(clSetKernelArg(dk, di++, sizeof(cl_mem),   &exq->qh));
+                    CL_CHECK(clSetKernelArg(dk, di++, sizeof(cl_mem),   &exq->sg));
+                    CL_CHECK(clSetKernelArg(dk, di++, sizeof(cl_mem),   &exq->sc));
+                    CL_CHECK(clSetKernelArg(dk, di++, sizeof(cl_mem),   &exq->d));
+                    CL_CHECK(clSetKernelArg(dk, di++, sizeof(cl_mem),   &backend_ctx->prealloc_moe_qa.buffer));
+                    CL_CHECK(clSetKernelArg(dk, di++, sizeof(cl_mem),   &backend_ctx->prealloc_moe_da.buffer));
+                    CL_CHECK(clSetKernelArg(dk, di++, sizeof(cl_mem),   &extrad->data_device));
+                    CL_CHECK(clSetKernelArg(dk, di++, sizeof(cl_ulong), &offsetd));
+                    CL_CHECK(clSetKernelArg(dk, di++, sizeof(int),      &ne00));
+                    CL_CHECK(clSetKernelArg(dk, di++, sizeof(int),      &ne01));
+                    CL_CHECK(clSetKernelArg(dk, di++, sizeof(int),      &ne0));
+
+                    size_t dg[3] = { CEIL_DIV((size_t)ne01, (size_t)128) * 64,
+                                     (size_t)ne11 * (size_t)nsgd, 1 };
+                    size_t dl[3] = { 64, (size_t)nsgd, 1 };
+                    backend_ctx->enqueue_ndrange_kernel(dk, 3, dg, dl, dst);
+                    CL_CHECK(clReleaseMemObject(a_sub));
+                    return;
                 }
 
                 // Plane-split GEMV, for every ne11 the dp4a GEMM above declines.

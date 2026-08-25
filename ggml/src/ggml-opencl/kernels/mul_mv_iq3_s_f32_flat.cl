@@ -1,4 +1,7 @@
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
+#ifdef cl_khr_integer_dot_product
+#pragma OPENCL EXTENSION cl_khr_integer_dot_product : enable
+#endif
 
 // IQ3_S decode GEMV over the feature-major plane split.
 //
@@ -462,4 +465,168 @@ kernel void kernel_mul_mv_iq3_s_f32_flat(
         dst[(ulong)col * (uint)ne0 + row] = sumf;
     }
 #endif
+}
+
+
+// ---------------------------------------------------------------------------
+// dp4a (int8) twin of the GEMV above.
+//
+// Why this and not the other levers: an additive work probe
+// (GGML_OPENCL_IQ3S_MV_WORK=3, which DOUBLES the arithmetic while holding every
+// load fixed) costs this kernel 33% of its throughput, and it still costs 33%
+// after the grid moved to an image -- so the arithmetic is a large, INDEPENDENT
+// term here, not something hiding in the grid read's shadow. IQ1_S by contrast
+// is +-0.0% under the same probe, which is why this port is IQ3_S-only.
+// The ceiling is visible: q3_K, linear and at the IDENTICAL 3.4375 bits per
+// weight, is 1.53x faster at matched shapes in the same run.
+//
+// What changes: four float converts + four conditional negates + a float4 dot
+// become one packed int8x4 and one dot_acc_sat. The activation arrives already
+// quantised to q8_1 by kernel_quant_a_q8_1, and the block geometry lines up
+// exactly -- one sub-block of this kernel is 32 K-values, which is one q8_1
+// block, so the per-block activation scale needs no interpolation.
+//
+// IQ3S_MV_DP4A_FASTPACK=1 replaces iq3s_pack's four branches with a packed
+// two's-complement negate. Safe ONLY because iq3s_grid values are odd 1..15 and
+// never 0: (b ^ 0xFF) + 1 would carry into the next byte iff b == 0.
+#ifndef IQ3S_MV_DP4A_FASTPACK
+#define IQ3S_MV_DP4A_FASTPACK 1
+#endif
+
+inline uint iq3s_pack_ref(uint gv, uint sg, uint base) {
+    int v0 = (int)((gv >>  0) & 0xFF); if (sg & (1u << (base + 0))) { v0 = -v0; }
+    int v1 = (int)((gv >>  8) & 0xFF); if (sg & (1u << (base + 1))) { v1 = -v1; }
+    int v2 = (int)((gv >> 16) & 0xFF); if (sg & (1u << (base + 2))) { v2 = -v2; }
+    int v3 = (int)((gv >> 24) & 0xFF); if (sg & (1u << (base + 3))) { v3 = -v3; }
+    return ((uint)v0 & 0xFFu) | (((uint)v1 & 0xFFu) <<  8)
+         | (((uint)v2 & 0xFFu) << 16) | (((uint)v3 & 0xFFu) << 24);
+}
+
+// Spread the four sign bits into four 0x00/0xFF bytes with two multiplies, then
+// negate all four lanes at once. The multiply-spread cannot carry between bytes
+// because each byte holds only 0 or 1 before the expand.
+inline uint iq3s_pack_packed(uint gv, uint sg, uint base) {
+    const uint s = (sg >> base) & 0xFu;
+    const uint m = (((s * 0x00204081u) & 0x01010101u) * 0xFFu);
+    return (gv ^ m) + (m & 0x01010101u);
+}
+
+#if IQ3S_MV_DP4A_FASTPACK
+#define IQ3S_PACK(g, s, b) iq3s_pack_packed((g), (s), (b))
+#else
+#define IQ3S_PACK(g, s, b) iq3s_pack_ref((g), (s), (b))
+#endif
+
+kernel void kernel_mul_mv_iq3_s_f32_flat_dp4a(
+        __read_only image1d_buffer_t grid_img,
+        global const uchar * src0_qs,
+        global const uchar * src0_qh,
+        global const uchar * src0_sg,
+        global const uchar * src0_sc,
+        global const half  * src0_d,
+        global const uint  * qa,      // q8_1 activation quants, four int8 per uint
+        global const half  * da,      // per-32 activation scale
+        global float * dst,
+        ulong offsetd,
+        int ne00,      // K
+        int ne01,      // M
+        int ne0        // dst row stride
+) {
+    dst = (global float *)((global char *)dst + offsetd);
+
+    const uint m   = (uint)ne01;
+    const uint K   = (uint)ne00;
+    const uint nsb = K / QK_K;
+
+    const uint lid = get_local_id(0);
+    const uint sgi = get_local_id(1);
+    const uint col = get_group_id(1);
+
+    const uint qbase = col * (K >> 2);     // uints of qa per token
+    const uint dbase = col * (K >> 5);     // q8_1 blocks per token
+
+#if IQ3S_MV_GRIDIMG
+#define IQ3S_GRID_D(i) (read_imageui(grid_img, (int)(i)).x)
+#else
+#define IQ3S_GRID_D(i) iq3s_grid[(i)]
+#endif
+
+    const uint mh  = m >> 1;
+    const uint j   = get_group_id(0) * 64u + lid;
+    const uint row = j << 1;
+
+    float sumf  = 0.f;
+    float sumf1 = 0.f;
+
+    if (j < mh) {
+        global const ushort * qsu = (global const ushort *)src0_qs;
+        global const ushort * qhu = (global const ushort *)src0_qh;
+        global const ushort * sgu = (global const ushort *)src0_sg;
+        global const ushort * scu = (global const ushort *)src0_sc;
+
+        for (uint ib = sgi; ib < nsb; ib += IQ3S_MV_NSG) {
+            const half2 dh = vload2(j + ib * mh, src0_d);
+            const float d0 = (float)dh.s0;
+            const float d1 = (float)dh.s1;
+
+            const uint scbase = j + ib * 4u * mh;
+            ushort sc4[4];
+            sc4[0] = scu[scbase + 0u * mh];
+            sc4[1] = scu[scbase + 1u * mh];
+            sc4[2] = scu[scbase + 2u * mh];
+            sc4[3] = scu[scbase + 3u * mh];
+
+            float acc0 = 0.f, acc1 = 0.f;
+            for (uint sb = 0; sb < 8u; ++sb) {
+                const uint scv  = (uint)sc4[sb >> 1];
+                const uint nib0 = (sb & 1u) ? ((scv >>  4) & 0xFu) : ( scv        & 0xFu);
+                const uint nib1 = (sb & 1u) ? ((scv >> 12) & 0xFu) : ((scv >>  8) & 0xFu);
+
+                const uint qhv = (uint)qhu[j + (ib * 8u + sb) * mh];
+                const uint qh0 = qhv & 0xFFu;
+                const uint qh1 = qhv >> 8;
+
+                const uint grp = ib * 64u + sb * 8u;
+                const uint qsb = j + grp * mh;
+                const uint sgb = j + (ib * 32u + sb * 4u) * mh;
+
+                // one sub-block == 32 K-values == exactly one q8_1 block
+                const float dy = (float)da[dbase + ib * 8u + sb];
+
+                int ia0 = 0, ia1 = 0;
+                for (uint u = 0; u < 8u; ++u) {
+                    const uint qsv  = (uint)qsu[qsb + u * mh];
+                    const uint sgv  = (uint)sgu[sgb + (u >> 1) * mh];
+                    const uint g0   = ( qsv       & 0xFFu) | (((qh0 >> u) & 1u) << 8);
+                    const uint g1   = ((qsv >> 8) & 0xFFu) | (((qh1 >> u) & 1u) << 8);
+                    const uint base = (u & 1u) * 4u;
+                    const uint ay   = qa[qbase + grp + u];
+                    ia0 = dot_acc_sat_4x8packed_ss_int(IQ3S_PACK(IQ3S_GRID_D(g0),  sgv       & 0xFFu, base), ay, ia0);
+                    ia1 = dot_acc_sat_4x8packed_ss_int(IQ3S_PACK(IQ3S_GRID_D(g1), (sgv >> 8) & 0xFFu, base), ay, ia1);
+                }
+                acc0 += (float)(1u + 2u * nib0) * dy * (float)ia0;
+                acc1 += (float)(1u + 2u * nib1) * dy * (float)ia1;
+            }
+            sumf  += d0 * acc0;
+            sumf1 += d1 * acc1;
+        }
+    }
+
+#if IQ3S_MV_NSG > 1
+    __local float2 partd[IQ3S_MV_NSG][64];
+    partd[sgi][lid] = (float2)(sumf, sumf1);
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (sgi != 0) {
+        return;
+    }
+    for (uint t = 1; t < IQ3S_MV_NSG; ++t) {
+        const float2 p = partd[t][lid];
+        sumf  += p.s0;
+        sumf1 += p.s1;
+    }
+#endif
+
+    if (j < mh) {
+        vstore2((float2)(sumf, sumf1), 0, dst + (ulong)col * (uint)ne0 + row);
+    }
 }
