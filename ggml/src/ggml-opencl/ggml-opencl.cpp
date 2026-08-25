@@ -1314,6 +1314,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mv_q2_K_f32;
     cl_kernel kernel_mul_mv_q3_K_f32;
     cl_kernel kernel_mul_mv_iq4_xs_f32;
+    int       iq4xs_mv_nsg_eff = 0;   // NSG the device actually accepts; see ggml_cl_nsg_fit
     cl_kernel kernel_mul_mv_iq4_xs_f32_flat;
     cl_kernel kernel_mul_mv_iq4_xs_f32_flat_wimg = nullptr;  // same, quant plane through a texture (opt-in)
     cl_kernel kernel_mul_mv_iq4_xs_f32_flat_glu = nullptr;     // fused ffn_gate+ffn_up+GLU
@@ -2111,6 +2112,40 @@ static int ggml_cl_iq4xs_mv_cb() {
 static int ggml_cl_iq4xs_mv_abl() {
     static const int v = ggml_cl_env_int("GGML_OPENCL_IQ4XS_MV_ABL", 0);
     return v;
+}
+
+// A plane-split GEMV's workgroup is 64 * NSG and NSG is a compile-time -D, so the
+// same source builds at any width -- what varies is what the DEVICE will launch.
+// CL_KERNEL_WORK_GROUP_SIZE is PER-KERNEL and shrinks as register pressure grows,
+// so it cannot be predicted from the shape or from another device.
+//
+// 🔴 This was not hypothetical. kernel_mul_mv_iq4_xs_f32_flat at the default
+// NSG=8 (512 work items) is REFUSED on an Adreno 850 -- clEnqueueNDRangeKernel
+// returns -54 CL_INVALID_WORK_GROUP_SIZE and the backend's GGML_ASSERT kills the
+// process. The same kernel and binary launch fine on the 840 and the X2-90; it is
+// the 850's E17.51 compiler spending more registers. It went unnoticed because no
+// MUL_MAT test reached this kernel until the IQ types were added to the large
+// decode-GEMV case, and because a model would simply crash rather than run slowly.
+//
+// Same shape of fix as ggml_opencl_try_fa_mq_narrow: ask the device, then narrow.
+// Returns the largest w <= nsg with 64*w within the kernel's ceiling.
+static int ggml_cl_nsg_fit(ggml_backend_opencl_context * backend_ctx, cl_kernel k,
+                           int nsg, const char * what) {
+    size_t cap = 0;
+    if (k == nullptr ||
+        clGetKernelWorkGroupInfo(k, backend_ctx->device, CL_KERNEL_WORK_GROUP_SIZE,
+                                 sizeof(cap), &cap, NULL) != CL_SUCCESS || cap == 0) {
+        return nsg;   // cannot tell: leave the preference alone
+    }
+    int w = nsg;
+    while (w > 1 && (size_t) 64 * w > cap) {
+        w >>= 1;
+    }
+    if (w != nsg) {
+        GGML_LOG_WARN("ggml_opencl: %s workgroup %d refused (kernel max %zu), using %d\n",
+                      what, 64 * nsg, cap, 64 * w);
+    }
+    return w;
 }
 
 static int ggml_cl_iq4xs_mv_nsg() {
@@ -3783,14 +3818,43 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #else
         const std::string kernel_src = read_file("mul_mv_iq4_xs_f32_flat.cl");
 #endif
-        std::string opts = compile_opts;
-        opts += " -DIQ4XS_MV_NSG=" + std::to_string(ggml_cl_iq4xs_mv_nsg());
-        opts += " -DIQ4XS_MV_R2="  + std::to_string(ggml_cl_iq4xs_mv_r2());
-        opts += " -DIQ4XS_MV_R4="  + std::to_string(ggml_cl_iq4xs_mv_r4());
-        opts += " -DIQ4XS_MV_ABL=" + std::to_string(ggml_cl_iq4xs_mv_abl());
-        opts += " -DIQ4XS_MV_CB=" + std::to_string(ggml_cl_iq4xs_mv_cb());
-        cl_program prog =
-            build_program_from_source(backend_ctx, kernel_src.c_str(), opts);
+        // Built at the widest NSG the device will actually launch. The first build
+        // is a probe: if its kernel refuses 64*NSG work items the program is thrown
+        // away and rebuilt narrower, because NSG is compile-time (the cross-subgroup
+        // reduce iterates it) and cannot be narrowed at dispatch.
+        int nsg_eff = ggml_cl_iq4xs_mv_nsg();
+        cl_program prog = nullptr;
+        for (;;) {
+            std::string opts = compile_opts;
+            opts += " -DIQ4XS_MV_NSG=" + std::to_string(nsg_eff);
+            opts += " -DIQ4XS_MV_R2="  + std::to_string(ggml_cl_iq4xs_mv_r2());
+            opts += " -DIQ4XS_MV_R4="  + std::to_string(ggml_cl_iq4xs_mv_r4());
+            opts += " -DIQ4XS_MV_ABL=" + std::to_string(ggml_cl_iq4xs_mv_abl());
+            opts += " -DIQ4XS_MV_CB=" + std::to_string(ggml_cl_iq4xs_mv_cb());
+            prog = build_program_from_source(backend_ctx, kernel_src.c_str(), opts);
+
+            // Probe EVERY kernel in this program that is dispatched at 64*NSG and
+            // take the narrowest. They share the compile-time NSG but not the
+            // register count, so the plain kernel fitting says nothing about the
+            // texture or fused ones.
+            int fit = nsg_eff;
+            for (const char * kn : { "kernel_mul_mv_iq4_xs_f32_flat",
+                                     "kernel_mul_mv_iq4_xs_f32_flat_wimg",
+                                     "kernel_mul_mv_iq4_xs_f32_flat_glu",
+                                     "kernel_mul_mv_iq4_xs_f32_flat_splitk" }) {
+                cl_int perr = CL_SUCCESS;
+                cl_kernel probe = clCreateKernel(prog, kn, &perr);
+                if (perr != CL_SUCCESS || probe == nullptr) { continue; }
+                fit = std::min(fit, ggml_cl_nsg_fit(backend_ctx, probe, nsg_eff, kn));
+                CL_CHECK(clReleaseKernel(probe));
+            }
+            if (fit >= nsg_eff) {
+                break;
+            }
+            CL_CHECK(clReleaseProgram(prog));
+            nsg_eff = fit;
+        }
+        backend_ctx->iq4xs_mv_nsg_eff = nsg_eff;
 
         CL_CHECK((backend_ctx->kernel_mul_mv_iq4_xs_f32_flat = clCreateKernel(prog, "kernel_mul_mv_iq4_xs_f32_flat", &err), err));
         CL_CHECK((backend_ctx->kernel_mul_mv_iq4_xs_f32_flat_wimg = clCreateKernel(prog, "kernel_mul_mv_iq4_xs_f32_flat_wimg", &err), err));
@@ -24055,7 +24119,7 @@ static void ggml_cl_mul_mat_iq4_xs_glu_fused(ggml_backend_t backend, ggml_tensor
     const int glu_op = (int)ggml_get_glu_op(dst);
 
     cl_kernel fk  = backend_ctx->kernel_mul_mv_iq4_xs_f32_flat_glu;
-    const int nsg = ggml_cl_iq4xs_mv_nsg();
+    const int nsg = backend_ctx->iq4xs_mv_nsg_eff;
 
     cl_int ai = 0;
     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex_g->q));
@@ -37633,7 +37697,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                         cl_kernel fk = mv_wimg
                             ? backend_ctx->kernel_mul_mv_iq4_xs_f32_flat_wimg
                             : backend_ctx->kernel_mul_mv_iq4_xs_f32_flat;
-                        const int nsg = ggml_cl_iq4xs_mv_nsg();
+                        const int nsg = backend_ctx->iq4xs_mv_nsg_eff;
                         cl_int ai = 0;
                         CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   mv_wimg ? &ex0->q_img : &ex0->q));
                         CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->d));
@@ -39826,7 +39890,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 if (ksplit > 1) {
                     ggml_tensor_extra_cl_iq4_xs * ex0 =
                         (ggml_tensor_extra_cl_iq4_xs *)src0->extra;
-                    const int nsg = ggml_cl_iq4xs_mv_nsg();
+                    const int nsg = backend_ctx->iq4xs_mv_nsg_eff;
                     backend_ctx->prealloc_splitk_partial.allocate(
                         backend_ctx->context, (size_t)ksplit * (size_t)ne01 * sizeof(float));
 
@@ -39876,7 +39940,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 cl_kernel fk = mv_wimg
                     ? backend_ctx->kernel_mul_mv_iq4_xs_f32_flat_wimg
                     : backend_ctx->kernel_mul_mv_iq4_xs_f32_flat;
-                const int nsg = ggml_cl_iq4xs_mv_nsg();
+                const int nsg = backend_ctx->iq4xs_mv_nsg_eff;
                 cl_int ai = 0;
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   mv_wimg ? &ex0->q_img : &ex0->q));
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->d));
