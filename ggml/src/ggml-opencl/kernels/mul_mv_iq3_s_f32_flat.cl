@@ -534,6 +534,22 @@ inline uint iq3s_pack_packed(uint gv, uint sg, uint base) {
 #define IQ3S_PACK(g, s, b) iq3s_pack_ref((g), (s), (b))
 #endif
 
+// 🔴 GUARDED. This kernel calls dot_acc_sat_4x8packed_ss_int, and it lives in the
+// SAME program as the plain GEMV, the fused GLU and the split-K kernel. On a device
+// without cl_khr_integer_dot_product the call is an implicit declaration, which is
+// an ERROR under -Werror, so the WHOLE PROGRAM fails to build and every kernel in
+// this file is lost -- not just this one.
+//
+// Caught by the fleet gate on the Adreno 642L (dp4a false, E031.38):
+//   kernel compile error (err=-11): implicit declaration of function
+//   'dot_acc_sat_4x8packed_ss_int' is invalid in C99
+// It was latent for the whole round because every other device in the fleet, and
+// the development part, report the extension.
+//
+// The host already tolerates a null handle for this kernel, so guarding the SOURCE
+// is the whole fix: the program builds everywhere and only the dp4a variant is
+// absent where the extension is.
+#ifdef cl_khr_integer_dot_product
 kernel void kernel_mul_mv_iq3_s_f32_flat_dp4a(
         __read_only image1d_buffer_t grid_img,
         global const uchar * src0_qs,
@@ -647,6 +663,7 @@ kernel void kernel_mul_mv_iq3_s_f32_flat_dp4a(
         vstore2((float2)(sumf, sumf1), 0, dst + (ulong)col * (uint)ne0 + row);
     }
 }
+#endif  // cl_khr_integer_dot_product
 
 // ---------------------------------------------------------------------------
 // Fused ffn_gate + ffn_up + GLU for IQ3_S, the fourth of this family.
