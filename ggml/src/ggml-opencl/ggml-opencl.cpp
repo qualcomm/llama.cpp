@@ -35352,8 +35352,9 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     cl_buffer_region reg;
                     reg.origin = offset1;
                     reg.size   = (size_t)ne00 * (size_t)ne11 * sizeof(float);
+                    cl_int qerr = CL_SUCCESS;
                     CL_CHECK((a_sub = clCreateSubBuffer(extra1->data_device, 0,
-                        CL_BUFFER_CREATE_TYPE_REGION, &reg, &err), err));
+                        CL_BUFFER_CREATE_TYPE_REGION, &reg, &qerr), qerr));
                     backend_ctx->prealloc_moe_qa.allocate(backend_ctx->context,
                         (size_t)ne00 * (size_t)ne11 * sizeof(cl_char));
                     backend_ctx->prealloc_moe_da.allocate(backend_ctx->context, nblk * sizeof(cl_half));
