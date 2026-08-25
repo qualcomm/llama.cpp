@@ -2407,6 +2407,16 @@ static int ggml_cl_iq1m_gemm_gridimg(const ggml_backend_opencl_context * backend
     return ggml_cl_gridimg_default(backend_ctx, "GGML_OPENCL_IQ1M_GEMM_GRIDIMG");
 }
 
+// IQ1_M is the only member of the family whose delta correction is per EIGHT
+// weights, so its prefill GEMM spends about twice as many float ops per column
+// as dp4a ops. Its scale is per sixteen though, so two of the four terms were
+// multiplied by a value they already had. Folding the pairs costs nothing and
+// is not a texture question, so it is not on the per-generation gate.
+static int ggml_cl_iq1m_gemm_fold() {
+    static const int v = ggml_cl_env_int("GGML_OPENCL_IQ1M_GEMM_FOLD", 1);
+    return v;
+}
+
 static int ggml_cl_iq2xxs_gemm_gridimg(const ggml_backend_opencl_context * backend_ctx) {
     return ggml_cl_gridimg_default(backend_ctx, "GGML_OPENCL_IQ2XXS_GEMM_GRIDIMG");
 }
@@ -6844,6 +6854,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         std::string opts = compile_opts;
         opts += " -DIQ1M_GEMM_LDSGRID=" + std::to_string(ggml_cl_iq1m_gemm_ldsgrid());
         opts += " -DIQ1M_GEMM_GRIDIMG=" + std::to_string(ggml_cl_iq1m_gemm_gridimg(backend_ctx));
+        opts += " -DIQ1M_GEMM_FOLD=" + std::to_string(ggml_cl_iq1m_gemm_fold());
         cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), opts);
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_iq1_m_q8_1_dp4a = clCreateKernel(prog, "kernel_gemm_noshuffle_iq1_m_q8_1_dp4a", &err), err));
         CL_CHECK(clReleaseProgram(prog));

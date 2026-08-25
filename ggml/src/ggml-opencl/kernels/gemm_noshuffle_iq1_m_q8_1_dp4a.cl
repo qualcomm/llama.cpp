@@ -61,6 +61,38 @@
 #ifndef IQ1M_GEMM_LDSGRID
 #define IQ1M_GEMM_LDSGRID 0
 #endif
+
+// IQ1M_GEMM_FOLD=1: fold the four per-8-weight terms of a 32-block onto the two
+// distinct scales it actually has.
+//
+// This kernel carries an arithmetic cost none of its siblings do, and that cost
+// is what the codebook image did NOT address (+9.4% here against +42.3% on
+// IQ3_S). Counting the inner loop per column per 32-K step:
+//
+//     IQ1_S   8 dp4a  +  ~3 float ops   (one delta correction, per 32 weights)
+//     IQ1_M   8 dp4a  + ~15 float ops   (four of them, per 8 weights)
+//
+// so on IQ1_M nearly two thirds of the issue slots in the hottest loop in the
+// file are not the dot product. Two of those fifteen are pure waste: the scale
+// is per SIXTEEN weights, so dl1 == dl0 and dl3 == dl2 always, and writing the
+// four terms out separately made the compiler multiply by each of them.
+//
+// Folding pairs the two 8-weight groups that share a scale into ONE dp4a
+// accumulator chain -- the four uints they consume are exactly the four
+// components of the uint4 already staged for them -- and applies the scale once:
+//
+//     8 dp4a + 2 int->float + 4 fma + 2 mul + 1 add  =  9 float ops
+//
+// The delta terms stay. They are genuinely per-8 and their signs are row data,
+// so nothing collapses them; removing them needs a codebook holding the biased
+// operand (8g-8+-1 as int8), which is a second table and a separate question.
+//
+// NOT bit-identical, and strictly MORE accurate: the two group dots are now
+// summed exactly in int32 before the single conversion, where before each was
+// rounded to float on its own.
+#ifndef IQ1M_GEMM_FOLD
+#define IQ1M_GEMM_FOLD 1
+#endif
 constant uint iq1s_grid_gpu[2048] = {
     0x00000000, 0x00000002, 0x00000101, 0x00000200, 0x00000202, 0x00010001, 0x00010101, 0x00020000,
     0x00020002, 0x00020200, 0x00020202, 0x01000101, 0x01010001, 0x01010100, 0x01010102, 0x01020101,
@@ -338,6 +370,17 @@ inline int dot2_q8a_v(uint a0, uint a1, uint2 y) {
     return r;
 }
 
+// The two 8-weight groups that share a scale, in one accumulator chain. Four
+// products of a nibble (0..2) by an int8 saturate nothing: |acc| <= 4064.
+inline int dot4_q8a_v(uint a0, uint a1, uint a2, uint a3, uint4 y) {
+    int r = 0;
+    r = dot_acc_sat_4x8packed_ss_int(a0, y.x, r);
+    r = dot_acc_sat_4x8packed_ss_int(a1, y.y, r);
+    r = dot_acc_sat_4x8packed_ss_int(a2, y.z, r);
+    r = dot_acc_sat_4x8packed_ss_int(a3, y.w, r);
+    return r;
+}
+
 __attribute__((qcom_wave_pair_mode(1)))
 kernel void kernel_gemm_noshuffle_iq1_m_q8_1_dp4a(
         __read_only image1d_buffer_t grid_img,   // see IQ1M_GEMM_GRIDIMG
@@ -418,7 +461,8 @@ kernel void kernel_gemm_noshuffle_iq1_m_q8_1_dp4a(
         // private uint8 through a pointer forces it out of registers into scratch
         const uint shb = 3u * (2u * (sub_l & 1u));
         uint  qa0, qb0, qa1, qb1, qa2, qb2, qa3, qb3;
-        float dl0, dl1, dl2, dl3;
+        // dl is per SIXTEEN weights: groups 0,1 share one and groups 2,3 the other
+        float dl0, dl2;
         float dt0, dt1, dt2, dt3;
         {
             const uint g = IQ1M_GRID((uint)src0_qs[qsb + 0u * (uint)m] | (((qh0 & 7u) << 8)));
@@ -429,7 +473,6 @@ kernel void kernel_gemm_noshuffle_iq1_m_q8_1_dp4a(
         {
             const uint g = IQ1M_GRID((uint)src0_qs[qsb + 1u * (uint)m] | ((((qh0 >> 4) & 7u) << 8)));
             qa1 = g & 0x0F0F0F0Fu;  qb1 = (g >> 4) & 0x0F0F0F0Fu;
-            dl1 = dl0;
             dt1 = (qh0 & 0x80u) ? (-1.f - IQ1M_DELTA) : (-1.f + IQ1M_DELTA);
         }
         {
@@ -441,7 +484,6 @@ kernel void kernel_gemm_noshuffle_iq1_m_q8_1_dp4a(
         {
             const uint g = IQ1M_GRID((uint)src0_qs[qsb + 3u * (uint)m] | ((((qh1 >> 4) & 7u) << 8)));
             qa3 = g & 0x0F0F0F0Fu;  qb3 = (g >> 4) & 0x0F0F0F0Fu;
-            dl3 = dl2;
             dt3 = (qh1 & 0x80u) ? (-1.f - IQ1M_DELTA) : (-1.f + IQ1M_DELTA);
         }
 
@@ -471,10 +513,17 @@ kernel void kernel_gemm_noshuffle_iq1_m_q8_1_dp4a(
         barrier(CLK_LOCAL_MEM_FENCE);
 
 #define LD4(arr, b) ((float4)((float)arr[(b)+0], (float)arr[(b)+1], (float)arr[(b)+2], (float)arr[(b)+3]))
+#if IQ1M_GEMM_FOLD
+#define IQ1M_COL(b) ( dl0 * ((float)dot4_q8a_v(qa0, qb0, qa1, qb1, (uint4)(sh_qa4[b][0])) \
+                             + dt0 * sh_s8[b][0] + dt1 * sh_s8[b][1]) \
+                    + dl2 * ((float)dot4_q8a_v(qa2, qb2, qa3, qb3, (uint4)(sh_qa4[b][1])) \
+                             + dt2 * sh_s8[b][2] + dt3 * sh_s8[b][3]) )
+#else
 #define IQ1M_COL(b) ( dl0 * ((float)dot2_q8a_v(qa0, qb0, (uint2)(sh_qa4[b][0].xy)) + dt0 * sh_s8[b][0]) \
-                    + dl1 * ((float)dot2_q8a_v(qa1, qb1, (uint2)(sh_qa4[b][0].zw)) + dt1 * sh_s8[b][1]) \
+                    + dl0 * ((float)dot2_q8a_v(qa1, qb1, (uint2)(sh_qa4[b][0].zw)) + dt1 * sh_s8[b][1]) \
                     + dl2 * ((float)dot2_q8a_v(qa2, qb2, (uint2)(sh_qa4[b][1].xy)) + dt2 * sh_s8[b][2]) \
-                    + dl3 * ((float)dot2_q8a_v(qa3, qb3, (uint2)(sh_qa4[b][1].zw)) + dt3 * sh_s8[b][3]) )
+                    + dl2 * ((float)dot2_q8a_v(qa3, qb3, (uint2)(sh_qa4[b][1].zw)) + dt3 * sh_s8[b][3]) )
+#endif
         #pragma unroll
         for (int g = 0; g < NGROUPS; ++g) {
             const int b = g * 4;
