@@ -3334,13 +3334,13 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             build_program_from_source(backend_ctx, kernel_src.c_str(), opts_iq2xxs);
 
         CL_CHECK((backend_ctx->kernel_mul_mv_iq2_xxs_f32 = clCreateKernel(prog, "kernel_mul_mv_iq2_xxs_f32", &err), err));
-        // Measured a NULL on this AoS kernel, and it runs on EVERY device rather than
-        // only X2-class -- so do not create the image unless someone asks for it. The
-        // kernel arg is then a null cl_mem, which is legal and never read.
-        if (ggml_cl_iq2xxs_mv_gridimg()) {
-            ggml_cl_make_grid_image(backend_ctx, prog, "kernel_iq2xxs_grid_export", 512,
-                                    &backend_ctx->iq2xxs_grid_buf, &backend_ctx->iq2xxs_grid_img);
-        }
+        // 🔴 Created UNCONDITIONALLY even though the knob defaults off and the image is
+        // a measured null here. clSetKernelArg accepts a null cl_mem for a BUFFER
+        // argument but NOT for an IMAGE one -- making this conditional aborted every
+        // model carrying an iq2_xxs tensor (caught on Llama-3.2-3B UD-IQ1_M). The
+        // image is 2-4 KB; creating it always is the cheap, correct option.
+        ggml_cl_make_grid_image(backend_ctx, prog, "kernel_iq2xxs_grid_export", 512,
+                                &backend_ctx->iq2xxs_grid_buf, &backend_ctx->iq2xxs_grid_img);
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
@@ -3359,13 +3359,13 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             build_program_from_source(backend_ctx, kernel_src.c_str(), opts_iq2xs);
 
         CL_CHECK((backend_ctx->kernel_mul_mv_iq2_xs_f32 = clCreateKernel(prog, "kernel_mul_mv_iq2_xs_f32", &err), err));
-        // Measured a NULL on this AoS kernel, and it runs on EVERY device rather than
-        // only X2-class -- so do not create the image unless someone asks for it. The
-        // kernel arg is then a null cl_mem, which is legal and never read.
-        if (ggml_cl_iq2xs_mv_gridimg()) {
-            ggml_cl_make_grid_image(backend_ctx, prog, "kernel_iq2xs_grid_export", 1024,
-                                    &backend_ctx->iq2xs_grid_buf, &backend_ctx->iq2xs_grid_img);
-        }
+        // 🔴 Created UNCONDITIONALLY even though the knob defaults off and the image is
+        // a measured null here. clSetKernelArg accepts a null cl_mem for a BUFFER
+        // argument but NOT for an IMAGE one -- making this conditional aborted every
+        // model carrying an iq2_xxs tensor (caught on Llama-3.2-3B UD-IQ1_M). The
+        // image is 2-4 KB; creating it always is the cheap, correct option.
+        ggml_cl_make_grid_image(backend_ctx, prog, "kernel_iq2xs_grid_export", 1024,
+                                &backend_ctx->iq2xs_grid_buf, &backend_ctx->iq2xs_grid_img);
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
