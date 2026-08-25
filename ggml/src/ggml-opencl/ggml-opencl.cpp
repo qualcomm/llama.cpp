@@ -2173,6 +2173,17 @@ static int ggml_cl_iq4xs_mv_r4() {
 // Same two knobs for the IQ3_S plane-split decode GEMV. Its quant plane is one
 // uchar per 4 weights rather than a ushort, so the row pairing only gets a wave
 // to 128 bytes per weight load where IQ4_XS reaches 256.
+// Read the ACTIVATION through an image in the IQ3_S decode GEMV. The kernel's own
+// cost probe says the codebook gather is 0.2% of that loop while the activation
+// load is 13.2%, and the load is 64x redundant (every lane of a subgroup reads the
+// same address). A wave-uniform image read is established free on this part.
+// Off until measured; the image is built per dispatch, so the measurement has to
+// clear that overhead as well as win the 13.2%.
+static int ggml_cl_iq3s_mv_aimg() {
+    static const int v = ggml_cl_env_int("GGML_OPENCL_IQ3S_MV_AIMG", 0);
+    return v;
+}
+
 static int ggml_cl_iq3s_mv_nsg() {
     static const int v = ggml_cl_env_int("GGML_OPENCL_IQ3S_MV_NSG", 8);
     return v;
@@ -3974,6 +3985,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         std::string opts = compile_opts;
         opts += " -DIQ3S_MV_NSG=" + std::to_string(ggml_cl_iq3s_mv_nsg());
+        opts += " -DIQ3S_MV_AIMG=" + std::to_string(ggml_cl_iq3s_mv_aimg());
         opts += " -DIQ3S_MV_LDSGRID=" + std::to_string(ggml_cl_iq3s_mv_ldsgrid());
         opts += " -DIQ3S_MV_GRIDIMG=" + std::to_string(ggml_cl_iq3s_mv_gridimg(backend_ctx));
         opts += " -DIQ3S_MV_DP4A_FASTPACK=" + std::to_string(ggml_cl_iq3s_mv_dp4a_fastpack());
@@ -36854,7 +36866,32 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     cl_kernel fk = backend_ctx->kernel_mul_mv_iq3_s_f32_flat;
                     const int nsg = ggml_cl_iq3s_mv_nsg();
                     cl_int ai = 0;
+                    // Activation as a texture. One CL_RGBA/CL_FLOAT texel IS the float4 the
+                    // scalar path loads, over src1's own buffer, so there is no copy. Declined
+                    // unless the offset lands on a texel and the row stride is a whole number
+                    // of them; the kernel argument still has to be a valid image either way,
+                    // so the grid image stands in when the path is off.
+                    cl_mem   iq3s_y_img = nullptr;
+                    cl_uint  iq3s_y_off = 0;
+                    if (ggml_cl_iq3s_mv_aimg() && (offset1 % 16) == 0 && (ne10 % 4) == 0) {
+                        const size_t texels = (size_t)(offset1 / 16)
+                                            + (size_t)ne11 * (size_t)(ne10 / 4);
+                        if (texels > 0 && texels <= backend_ctx->image_max_buffer_size) {
+                            cl_image_format yf = { CL_RGBA, CL_FLOAT };
+                            cl_image_desc   yd;
+                            memset(&yd, 0, sizeof(yd));
+                            yd.image_type  = CL_MEM_OBJECT_IMAGE1D_BUFFER;
+                            yd.image_width = texels;
+                            yd.buffer      = extra1->data_device;
+                            cl_int yerr = CL_SUCCESS;
+                            iq3s_y_img = clCreateImage(backend_ctx->context, CL_MEM_READ_ONLY, &yf, &yd, NULL, &yerr);
+                            if (yerr != CL_SUCCESS) { iq3s_y_img = nullptr; }
+                            else { iq3s_y_off = (cl_uint)(offset1 / 16); }
+                        }
+                    }
+                    cl_mem iq3s_y_arg = iq3s_y_img ? iq3s_y_img : backend_ctx->iq3s_grid_img;
                     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &backend_ctx->iq3s_grid_img));
+                    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &iq3s_y_arg));
                     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->qs));
                     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->qh));
                     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->sg));
@@ -36868,12 +36905,14 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne01));
                     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne10));
                     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne0));
+                    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_uint),  &iq3s_y_off));
 
                     const size_t rows_wg = ggml_cl_iq3s_mv_r2() ? 128 : 64;
                     size_t f_global[3] = { CEIL_DIV((size_t)ne01, rows_wg) * 64,
                                            (size_t)ne11 * (size_t)nsg, 1 };
                     size_t f_local[3]  = { 64, (size_t)nsg, 1 };
                     backend_ctx->enqueue_ndrange_kernel(fk, 3, f_global, f_local, dst);
+                    if (iq3s_y_img) { CL_CHECK(clReleaseMemObject(iq3s_y_img)); }
                     return;
                 }
 
@@ -39388,7 +39427,32 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 cl_kernel fk = backend_ctx->kernel_mul_mv_iq3_s_f32_flat;
                 const int nsg = ggml_cl_iq3s_mv_nsg();
                 cl_int ai = 0;
+                // Activation as a texture. One CL_RGBA/CL_FLOAT texel IS the float4 the
+                // scalar path loads, over src1's own buffer, so there is no copy. Declined
+                // unless the offset lands on a texel and the row stride is a whole number
+                // of them; the kernel argument still has to be a valid image either way,
+                // so the grid image stands in when the path is off.
+                cl_mem   iq3s_y_img = nullptr;
+                cl_uint  iq3s_y_off = 0;
+                if (ggml_cl_iq3s_mv_aimg() && (offset1 % 16) == 0 && (ne10 % 4) == 0) {
+                    const size_t texels = (size_t)(offset1 / 16)
+                                        + (size_t)ne11 * (size_t)(ne10 / 4);
+                    if (texels > 0 && texels <= backend_ctx->image_max_buffer_size) {
+                        cl_image_format yf = { CL_RGBA, CL_FLOAT };
+                        cl_image_desc   yd;
+                        memset(&yd, 0, sizeof(yd));
+                        yd.image_type  = CL_MEM_OBJECT_IMAGE1D_BUFFER;
+                        yd.image_width = texels;
+                        yd.buffer      = extra1->data_device;
+                        cl_int yerr = CL_SUCCESS;
+                        iq3s_y_img = clCreateImage(backend_ctx->context, CL_MEM_READ_ONLY, &yf, &yd, NULL, &yerr);
+                        if (yerr != CL_SUCCESS) { iq3s_y_img = nullptr; }
+                        else { iq3s_y_off = (cl_uint)(offset1 / 16); }
+                    }
+                }
+                cl_mem iq3s_y_arg = iq3s_y_img ? iq3s_y_img : backend_ctx->iq3s_grid_img;
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &backend_ctx->iq3s_grid_img));
+                CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &iq3s_y_arg));
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->qs));
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->qh));
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->sg));
@@ -39402,12 +39466,14 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne01));
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne10));
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne0));
+                CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_uint),  &iq3s_y_off));
 
                 const size_t rows_wg = ggml_cl_iq3s_mv_r2() ? 128 : 64;
                 size_t f_global[3] = { CEIL_DIV((size_t)ne01, rows_wg) * 64,
                                        (size_t)ne11 * (size_t)nsg, 1 };
                 size_t f_local[3]  = { 64, (size_t)nsg, 1 };
                 backend_ctx->enqueue_ndrange_kernel(fk, 3, f_global, f_local, dst);
+                if (iq3s_y_img) { CL_CHECK(clReleaseMemObject(iq3s_y_img)); }
                 return;
             }
 

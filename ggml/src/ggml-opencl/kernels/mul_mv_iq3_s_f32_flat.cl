@@ -191,8 +191,32 @@ IQ3S_GRID_AS uint iq3s_grid[512] = {
 #define IQ3S_MV_ABL 0
 #endif
 
+// IQ3S_MV_AIMG=1: read the ACTIVATION through an image1d_buffer instead of the
+// global pointer.
+//
+// Why this one and not the grid: the kernel's own cost probe prices every term of
+// this loop on a 3B IQ3_M, and the answer is not what the header above assumed.
+//     ABL=2, drop the GRID lookup      32.480 vs 32.402   0.2%
+//     ABL=1, drop the ACTIVATION load  36.666 vs 32.402  13.2%
+//     ABL=3, drop the SIGN application 37.005 vs 32.402  14.2%
+// The codebook gather is FREE here. The activation load is not, and it is
+// 64x REDUNDANT: `grp` carries no row index, so every lane of a subgroup reads
+// the identical address. A wave-uniform image read is established as free on this
+// part, where LDS staging of the same redundancy measured -50%
+// (see the cok weight-texture note), so the texture path is the one to try.
+//
+// The image is CL_RGBA/CL_FLOAT over src1's own buffer, so one texel is exactly
+// the float4 the scalar path loads and no copy is involved. y_tex is the texel
+// index of this token's row: (offset1/16) + col*ne10/4. The host declines unless
+// offset1 is 16-byte aligned and ne10 is a multiple of 4.
+#ifndef IQ3S_MV_AIMG
+#define IQ3S_MV_AIMG 0
+#endif
+
 #if IQ3S_MV_ABL == 1
 #define IQ3S_YV(g, y) ((float4)(1.0f))
+#elif IQ3S_MV_AIMG
+#define IQ3S_YV(g, y) read_imagef(y_img, (int)(y_tex + (g)))
 #else
 #define IQ3S_YV(g, y) vload4((g), (y))
 #endif
@@ -276,6 +300,7 @@ kernel void kernel_iq3s_grid_export(global uint * out) {
 
 kernel void kernel_mul_mv_iq3_s_f32_flat(
         __read_only image1d_buffer_t grid_img,
+        __read_only image1d_buffer_t y_img,      // see IQ3S_MV_AIMG
         global const uchar * src0_qs,
         global const uchar * src0_qh,
         global const uchar * src0_sg,
@@ -288,7 +313,8 @@ kernel void kernel_mul_mv_iq3_s_f32_flat(
         int ne00,      // K
         int ne01,      // M, the number of output rows
         int ne10,      // activation row stride, == K
-        int ne0        // dst row stride
+        int ne0,       // dst row stride
+        uint y_off     // offset1/16, in float4 texels (IQ3S_MV_AIMG only)
 ) {
     src1 = (global const float *)((global const char *)src1 + offset1);
     dst  = (global float       *)((global char       *)dst  + offsetd);
@@ -302,6 +328,10 @@ kernel void kernel_mul_mv_iq3_s_f32_flat(
     const uint col = get_group_id(1);           // token
 
     global const float * y = src1 + (ulong)col * (uint)ne10;
+#if IQ3S_MV_AIMG
+    // texel index of this token's activation row; y_off is offset1/16 from the host
+    const uint y_tex = y_off + col * ((uint)ne10 >> 2);
+#endif
 
 #if IQ3S_MV_GRIDIMG
 #define IQ3S_GRID(i) (read_imageui(grid_img, (int)(i)).x)
