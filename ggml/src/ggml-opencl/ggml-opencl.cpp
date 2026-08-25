@@ -2220,6 +2220,13 @@ static int ggml_cl_iq3s_mv_dp4a() {
     return v;
 }
 
+// Packed two's-complement negate instead of iq3s_pack's four branches; see the
+// kernel header for why it is safe here and nowhere the grid can hold a zero.
+static int ggml_cl_iq3s_mv_dp4a_fastpack() {
+    static const int v = ggml_cl_env_int("GGML_OPENCL_IQ3S_MV_DP4A_FASTPACK", 1);
+    return v;
+}
+
 static int ggml_cl_iq3s_mv_gridimg(const ggml_backend_opencl_context * backend_ctx) {
     return ggml_cl_gridimg_default(backend_ctx, "GGML_OPENCL_IQ3S_MV_GRIDIMG");
 }
@@ -3501,6 +3508,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         opts += " -DIQ3S_MV_NSG=" + std::to_string(ggml_cl_iq3s_mv_nsg());
         opts += " -DIQ3S_MV_LDSGRID=" + std::to_string(ggml_cl_iq3s_mv_ldsgrid());
         opts += " -DIQ3S_MV_GRIDIMG=" + std::to_string(ggml_cl_iq3s_mv_gridimg(backend_ctx));
+        opts += " -DIQ3S_MV_DP4A_FASTPACK=" + std::to_string(ggml_cl_iq3s_mv_dp4a_fastpack());
         opts += " -DIQ3S_MV_SIGNXOR=" + std::to_string(ggml_cl_iq3s_mv_signxor());
         opts += " -DIQ3S_MV_ABL=" + std::to_string(ggml_cl_iq3s_mv_abl());
         opts += " -DIQ3S_MV_GRIDSRC=" + std::to_string(ggml_cl_iq3s_mv_gridsrc());
