@@ -116,9 +116,9 @@ __attribute__((qcom_wave_pair_mode(1)))
 // The IQ3_S twin of this change is +43.0% prefill on a model made of the type
 // and +8.0% on a hybrid, with perplexity identical to four decimals. Same
 // defect, same fix, here. Default follows the per-generation texture gate.
-// COVERAGE GAP AT THE TIME OF WRITING: none of the 3B roster contains IQ3_XXS,
-// so this port shipped on the mechanism plus its siblings' numbers, with a
-// 27B UD-IQ3_XXS measurement following separately.
+// MEASURED: Qwen3.8-27B-UD-IQ3_XXS pp512 90.2 -> 100.1 (+11.0%), wikitext PPL
+// 6.2547 both ways. None of the 3B roster contains IQ3_XXS, so this is the
+// model that covers this kernel.
 #ifndef IQ3XXS_GEMM_GRIDIMG
 #define IQ3XXS_GEMM_GRIDIMG 0
 #endif
