@@ -3325,8 +3325,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #else
         const std::string kernel_src = read_file("mul_mv_iq2_xxs_f32.cl");
 #endif
-        cl_program prog =
         std::string opts_iq2xxs = compile_opts + " -DIQ2XXS_MV_GRIDIMG=" + std::to_string(ggml_cl_iq2xxs_mv_gridimg());
+        cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), opts_iq2xxs);
 
         CL_CHECK((backend_ctx->kernel_mul_mv_iq2_xxs_f32 = clCreateKernel(prog, "kernel_mul_mv_iq2_xxs_f32", &err), err));
@@ -3345,8 +3345,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #else
         const std::string kernel_src = read_file("mul_mv_iq2_xs_f32.cl");
 #endif
-        cl_program prog =
         std::string opts_iq2xs = compile_opts + " -DIQ2XS_MV_GRIDIMG=" + std::to_string(ggml_cl_iq2xs_mv_gridimg());
+        cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), opts_iq2xs);
 
         CL_CHECK((backend_ctx->kernel_mul_mv_iq2_xs_f32 = clCreateKernel(prog, "kernel_mul_mv_iq2_xs_f32", &err), err));
