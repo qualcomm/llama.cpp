@@ -1321,9 +1321,11 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mv_tq1_0_f32;
     cl_kernel kernel_mul_mv_iq3_s_f32;
     cl_kernel kernel_mul_mv_iq3_s_f32_flat;
+    cl_kernel kernel_mul_mv_iq3_s_f32_flat_glu = nullptr;  // fused ffn_gate+ffn_up+GLU
     cl_kernel kernel_mul_mv_iq3_s_f32_flat_dp4a = nullptr;
     cl_kernel kernel_mul_mv_iq3_xxs_f32_flat;
     cl_kernel kernel_mul_mv_iq2_xxs_f32_flat = nullptr;
+    cl_kernel kernel_mul_mv_iq2_xxs_f32_flat_glu = nullptr;  // fused ffn_gate+ffn_up+GLU
     cl_kernel kernel_mul_mv_iq2_xs_f32_flat  = nullptr;
     cl_kernel kernel_mul_mv_q3_k_f32_flat;
     cl_kernel kernel_mul_mv_q2_k_f32_flat;
@@ -2194,6 +2196,22 @@ static int ggml_cl_iq1s_mv_gridimg(const ggml_backend_opencl_context * backend_c
 // equivalent is worth +10.2%. Coherent but not byte-identical, like that one.
 // Same fusion for IQ1_S, where gate+up are an even larger share: 717 ms of a
 // 2138 ms UD-IQ1_S decode frame, 33.5%.
+static int ggml_cl_iq2xxs_fuse_glu(const ggml_backend_opencl_context * backend_ctx) {
+    static const char * const e = getenv("GGML_OPENCL_IQ2XXS_FUSE_GLU");
+    if (e && *e) {
+        return atoi(e) != 0;
+    }
+    return backend_ctx->adreno_x2_class();
+}
+
+static int ggml_cl_iq3s_fuse_glu(const ggml_backend_opencl_context * backend_ctx) {
+    static const char * const e = getenv("GGML_OPENCL_IQ3S_FUSE_GLU");
+    if (e && *e) {
+        return atoi(e) != 0;
+    }
+    return backend_ctx->adreno_x2_class();
+}
+
 static int ggml_cl_iq1s_fuse_glu(const ggml_backend_opencl_context * backend_ctx) {
     static const char * const e = getenv("GGML_OPENCL_IQ1S_FUSE_GLU");
     if (e && *e) {
@@ -3665,6 +3683,11 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             build_program_from_source(backend_ctx, kernel_src.c_str(), opts);
 
         CL_CHECK((backend_ctx->kernel_mul_mv_iq3_s_f32_flat = clCreateKernel(prog, "kernel_mul_mv_iq3_s_f32_flat", &err), err));
+        if (ggml_cl_iq3s_mv_r2()) {
+            backend_ctx->kernel_mul_mv_iq3_s_f32_flat_glu =
+                clCreateKernel(prog, "kernel_mul_mv_iq3_s_f32_flat_glu", &err);
+            if (err != CL_SUCCESS) { backend_ctx->kernel_mul_mv_iq3_s_f32_flat_glu = nullptr; }
+        }
         backend_ctx->kernel_mul_mv_iq3_s_f32_flat_dp4a =
             clCreateKernel(prog, "kernel_mul_mv_iq3_s_f32_flat_dp4a", &err);
         if (err != CL_SUCCESS) { backend_ctx->kernel_mul_mv_iq3_s_f32_flat_dp4a = nullptr; }
@@ -3720,6 +3743,11 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         // The grid image is the one the AoS program already created -- same table,
         // and both kernels index it as uint pairs.
         CL_CHECK((backend_ctx->kernel_mul_mv_iq2_xxs_f32_flat = clCreateKernel(prog, "kernel_mul_mv_iq2_xxs_f32_flat", &err), err));
+        if (ggml_cl_iq2xxs_mv_r2()) {
+            backend_ctx->kernel_mul_mv_iq2_xxs_f32_flat_glu =
+                clCreateKernel(prog, "kernel_mul_mv_iq2_xxs_f32_flat_glu", &err);
+            if (err != CL_SUCCESS) { backend_ctx->kernel_mul_mv_iq2_xxs_f32_flat_glu = nullptr; }
+        }
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
@@ -12981,6 +13009,26 @@ static bool ggml_opencl_can_fuse(const ggml_backend_opencl_context * backend_ctx
         if (wg_q4_0 && (gate->src[0]->ne[1] % 128) != 0) {
             return false;
         }
+        const bool wg_iq2_xxs = gate->src[0]->type == GGML_TYPE_IQ2_XXS;
+        if (wg_iq2_xxs) {
+            if (!ggml_cl_iq2xxs_fuse_glu(backend_ctx) ||
+                backend_ctx->kernel_mul_mv_iq2_xxs_f32_flat_glu == nullptr ||
+                !ggml_cl_iq2xxs_is_split(backend_ctx, gate->src[0]) ||
+                !ggml_cl_iq2xxs_is_split(backend_ctx, up->src[0]) ||
+                gate->src[0]->ne[0] % 256 != 0) {
+                return false;
+            }
+        }
+        const bool wg_iq3_s = gate->src[0]->type == GGML_TYPE_IQ3_S;
+        if (wg_iq3_s) {
+            if (!ggml_cl_iq3s_fuse_glu(backend_ctx) ||
+                backend_ctx->kernel_mul_mv_iq3_s_f32_flat_glu == nullptr ||
+                !ggml_cl_iq3s_is_split(backend_ctx, gate->src[0]) ||
+                !ggml_cl_iq3s_is_split(backend_ctx, up->src[0]) ||
+                gate->src[0]->ne[0] % 256 != 0) {
+                return false;
+            }
+        }
         const bool wg_iq1_s = gate->src[0]->type == GGML_TYPE_IQ1_S;
         if (wg_iq1_s) {
             if (!ggml_cl_iq1s_fuse_glu(backend_ctx) ||
@@ -13003,7 +13051,8 @@ static bool ggml_opencl_can_fuse(const ggml_backend_opencl_context * backend_ctx
                 return false;
             }
         }
-        if ((!wg_q4_0 && !wg_q4_k && !wg_iq2_s && !wg_iq1_s) || up->src[0]->type != gate->src[0]->type ||
+        if ((!wg_q4_0 && !wg_q4_k && !wg_iq2_s && !wg_iq1_s && !wg_iq2_xxs && !wg_iq3_s) ||
+            up->src[0]->type != gate->src[0]->type ||
             gate->src[1]->type != GGML_TYPE_F32  || up->src[1]->type != GGML_TYPE_F32  ||
             gate->type != GGML_TYPE_F32 || up->type != GGML_TYPE_F32 || glu->type != GGML_TYPE_F32) {
             return false;
@@ -13441,6 +13490,8 @@ static void ggml_opencl_op_rms_norm_mul_add_fused(ggml_backend_t backend, ggml_t
 static void ggml_opencl_op_rms_norm_mul_add_scale_fused(ggml_backend_t backend, ggml_tensor * rms_norm_tensor, ggml_tensor * mul_tensor, ggml_tensor * add_tensor, ggml_tensor * mul2_tensor);
 static void ggml_cl_rope_rms_fused(ggml_backend_t backend, ggml_tensor * rms_norm_tensor, ggml_tensor * mul_tensor, ggml_tensor * rope_tensor);
 static void ggml_cl_mul_mat_q4_k_glu_fused(ggml_backend_t backend, ggml_tensor * gate_tensor, ggml_tensor * up_tensor, ggml_tensor * glu_tensor);
+static void ggml_cl_mul_mat_iq2_xxs_glu_fused(ggml_backend_t backend, ggml_tensor * gate_tensor, ggml_tensor * up_tensor, ggml_tensor * glu_tensor);
+static void ggml_cl_mul_mat_iq3_s_glu_fused(ggml_backend_t backend, ggml_tensor * gate_tensor, ggml_tensor * up_tensor, ggml_tensor * glu_tensor);
 static void ggml_cl_mul_mat_iq1_s_glu_fused(ggml_backend_t backend, ggml_tensor * gate_tensor, ggml_tensor * up_tensor, ggml_tensor * glu_tensor);
 static void ggml_cl_mul_mat_iq2_s_glu_fused(ggml_backend_t backend, ggml_tensor * gate_tensor, ggml_tensor * up_tensor, ggml_tensor * glu_tensor);
 static void ggml_cl_mul_mat_q4_0_glu_fused(ggml_backend_t backend, ggml_tensor * gate_tensor, ggml_tensor * up_tensor, ggml_tensor * glu_tensor);
@@ -13886,7 +13937,11 @@ static void ggml_backend_opencl_exec_graph_nodes(ggml_backend_t backend, ggml_cg
         // same scalar GLU formula). Default on, opt-out GGML_OPENCL_FUSE_MM_GLU=0.
         if (backend_ctx->fuse_mm_glu && !backend_ctx->disable_fusion &&
             ggml_opencl_can_fuse(backend_ctx, cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU })) {
-            if (node->src[0]->type == GGML_TYPE_IQ1_S) {
+            if (node->src[0]->type == GGML_TYPE_IQ2_XXS) {
+                ggml_cl_mul_mat_iq2_xxs_glu_fused(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
+            } else if (node->src[0]->type == GGML_TYPE_IQ3_S) {
+                ggml_cl_mul_mat_iq3_s_glu_fused(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
+            } else if (node->src[0]->type == GGML_TYPE_IQ1_S) {
                 ggml_cl_mul_mat_iq1_s_glu_fused(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
             } else if (node->src[0]->type == GGML_TYPE_IQ2_S) {
                 ggml_cl_mul_mat_iq2_s_glu_fused(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
@@ -23547,6 +23602,126 @@ static void ggml_cl_mul_mat_q4_k_glu_fused(ggml_backend_t backend, ggml_tensor *
 
 // q4_0 variant of the fused gate+up decode GEMV + GLU. Same structure as the q4_K
 // version minus the min/6-bit-scale machinery (q4_0 has only a per-block d scale).
+static void ggml_cl_mul_mat_iq2_xxs_glu_fused(ggml_backend_t backend, ggml_tensor * gate_tensor, ggml_tensor * up_tensor, ggml_tensor * glu_tensor) {
+#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+    GGML_ASSERT(gate_tensor && up_tensor && glu_tensor);
+    const ggml_tensor * Wg   = gate_tensor->src[0];
+    const ggml_tensor * Wu   = up_tensor->src[0];
+    const ggml_tensor * src1 = gate_tensor->src[1];
+    const ggml_tensor * dst  = glu_tensor;
+    GGML_ASSERT(Wg && Wg->extra); GGML_ASSERT(Wu && Wu->extra);
+    GGML_ASSERT(src1 && src1->extra); GGML_ASSERT(dst && dst->extra);
+
+    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *)backend->context;
+    ggml_tensor_extra_cl        * extra1 = (ggml_tensor_extra_cl *)src1->extra;
+    ggml_tensor_extra_cl        * extrad = (ggml_tensor_extra_cl *)dst->extra;
+    ggml_tensor_extra_cl_iq2_xxs * ex_g = (ggml_tensor_extra_cl_iq2_xxs *)Wg->extra;
+    ggml_tensor_extra_cl_iq2_xxs * ex_u = (ggml_tensor_extra_cl_iq2_xxs *)Wu->extra;
+
+    const cl_ulong offset1 = extra1->offset + src1->view_offs;
+    const cl_ulong offsetd = extrad->offset + dst->view_offs;
+
+    const int ne00 = Wg->ne[0];
+    const int ne01 = Wg->ne[1];
+    const int ne10 = src1->ne[0];
+    const int ne0  = dst->ne[0];
+    const int ne11 = src1->ne[1];
+    const int glu_op = (int)ggml_get_glu_op(dst);
+
+    cl_kernel fk  = backend_ctx->kernel_mul_mv_iq2_xxs_f32_flat_glu;
+    const int nsg = ggml_cl_iq2xxs_mv_nsg();
+
+    cl_int ai = 0;
+    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &backend_ctx->iq2xxs_grid_img));
+    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex_g->qs));
+    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex_g->sas));
+    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex_g->d));
+    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex_u->qs));
+    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex_u->sas));
+    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex_u->d));
+    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &extra1->data_device));
+    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_ulong), &offset1));
+    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &extrad->data_device));
+    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_ulong), &offsetd));
+    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne00));
+    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne01));
+    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne10));
+    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne0));
+    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &glu_op));
+
+    size_t f_global[3] = { CEIL_DIV((size_t)ne01, (size_t)128) * 64,
+                           (size_t)ne11 * (size_t)nsg, 1 };
+    size_t f_local[3]  = { 64, (size_t)nsg, 1 };
+    backend_ctx->enqueue_ndrange_kernel(fk, 3, f_global, f_local, (ggml_tensor *)dst);
+#else
+    GGML_UNUSED(backend); GGML_UNUSED(gate_tensor);
+    GGML_UNUSED(up_tensor); GGML_UNUSED(glu_tensor);
+    GGML_ASSERT(false && "fused GLU needs the Adreno kernels");
+#endif
+}
+
+static void ggml_cl_mul_mat_iq3_s_glu_fused(ggml_backend_t backend, ggml_tensor * gate_tensor, ggml_tensor * up_tensor, ggml_tensor * glu_tensor) {
+#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+    GGML_ASSERT(gate_tensor && up_tensor && glu_tensor);
+    const ggml_tensor * Wg   = gate_tensor->src[0];
+    const ggml_tensor * Wu   = up_tensor->src[0];
+    const ggml_tensor * src1 = gate_tensor->src[1];
+    const ggml_tensor * dst  = glu_tensor;
+    GGML_ASSERT(Wg && Wg->extra); GGML_ASSERT(Wu && Wu->extra);
+    GGML_ASSERT(src1 && src1->extra); GGML_ASSERT(dst && dst->extra);
+
+    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *)backend->context;
+    ggml_tensor_extra_cl        * extra1 = (ggml_tensor_extra_cl *)src1->extra;
+    ggml_tensor_extra_cl        * extrad = (ggml_tensor_extra_cl *)dst->extra;
+    ggml_tensor_extra_cl_iq3_s * ex_g = (ggml_tensor_extra_cl_iq3_s *)Wg->extra;
+    ggml_tensor_extra_cl_iq3_s * ex_u = (ggml_tensor_extra_cl_iq3_s *)Wu->extra;
+
+    const cl_ulong offset1 = extra1->offset + src1->view_offs;
+    const cl_ulong offsetd = extrad->offset + dst->view_offs;
+
+    const int ne00 = Wg->ne[0];
+    const int ne01 = Wg->ne[1];
+    const int ne10 = src1->ne[0];
+    const int ne0  = dst->ne[0];
+    const int ne11 = src1->ne[1];
+    const int glu_op = (int)ggml_get_glu_op(dst);
+
+    cl_kernel fk  = backend_ctx->kernel_mul_mv_iq3_s_f32_flat_glu;
+    const int nsg = ggml_cl_iq3s_mv_nsg();
+
+    cl_int ai = 0;
+    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &backend_ctx->iq3s_grid_img));
+    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex_g->qs));
+    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex_g->qh));
+    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex_g->sg));
+    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex_g->sc));
+    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex_g->d));
+    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex_u->qs));
+    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex_u->qh));
+    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex_u->sg));
+    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex_u->sc));
+    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex_u->d));
+    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &extra1->data_device));
+    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_ulong), &offset1));
+    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &extrad->data_device));
+    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_ulong), &offsetd));
+    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne00));
+    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne01));
+    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne10));
+    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne0));
+    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &glu_op));
+
+    size_t f_global[3] = { CEIL_DIV((size_t)ne01, (size_t)128) * 64,
+                           (size_t)ne11 * (size_t)nsg, 1 };
+    size_t f_local[3]  = { 64, (size_t)nsg, 1 };
+    backend_ctx->enqueue_ndrange_kernel(fk, 3, f_global, f_local, (ggml_tensor *)dst);
+#else
+    GGML_UNUSED(backend); GGML_UNUSED(gate_tensor);
+    GGML_UNUSED(up_tensor); GGML_UNUSED(glu_tensor);
+    GGML_ASSERT(false && "fused GLU needs the Adreno kernels");
+#endif
+}
+
 static void ggml_cl_mul_mat_iq1_s_glu_fused(ggml_backend_t backend, ggml_tensor * gate_tensor, ggml_tensor * up_tensor, ggml_tensor * glu_tensor) {
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
     GGML_ASSERT(gate_tensor && up_tensor && glu_tensor);

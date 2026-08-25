@@ -647,3 +647,175 @@ kernel void kernel_mul_mv_iq3_s_f32_flat_dp4a(
         vstore2((float2)(sumf, sumf1), 0, dst + (ulong)col * (uint)ne0 + row);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Fused ffn_gate + ffn_up + GLU for IQ3_S, the fourth of this family.
+//
+// Same shape as the IQ2_S, IQ1_S and IQ2_XXS twins: the two FFN projections
+// share an activation, so the streams are interleaved and each activation vector
+// is read once. R2 only.
+//
+// The cost probes on this kernel say the arithmetic is a large independent term
+// here (doubling it costs 33% of throughput), so halving the ACTIVATION traffic
+// is expected to matter less for IQ3_S than for the lower-bit twins. Measured,
+// not assumed.
+// ---------------------------------------------------------------------------
+
+// Fifthth copy of the shared GLU epilogue: each .cl is its own program and cannot
+// include the others. Op numbering and expressions match q40_glu_apply exactly --
+// if one copy is ever changed, change them all.
+#define IQ3S_GLU_GEGLU_COEF_A   0.044715f
+#define IQ3S_GLU_SQRT_2_OVER_PI 0.79788456080286535587989211986876f
+#define IQ3S_GLU_SQRT_2_INV     0.70710678118654752440084436210484f
+#define IQ3S_GLU_QUICK_COEF    -1.702f
+inline float iq3s_glu_apply(int glu_op, float g, float u) {
+    float act;
+    if (glu_op == 1) {        // GEGLU (tanh-approx gelu)
+        act = 0.5f*g*(1.0f + tanh(IQ3S_GLU_SQRT_2_OVER_PI*g*(1.0f + IQ3S_GLU_GEGLU_COEF_A*g*g)));
+    } else if (glu_op == 2) { // SWIGLU (silu)
+        act = g / (1.0f + exp(-g));
+    } else if (glu_op == 0) { // REGLU
+        return g*u*(g > 0.0f);
+    } else if (glu_op == 4) { // GEGLU_ERF
+        act = 0.5f*g*(1.0f + erf(g*IQ3S_GLU_SQRT_2_INV));
+    } else {                  // GEGLU_QUICK
+        act = g*(1.0f/(1.0f + exp(IQ3S_GLU_QUICK_COEF*g)));
+    }
+    return act*u;
+}
+
+kernel void kernel_mul_mv_iq3_s_f32_flat_glu(
+        __read_only image1d_buffer_t grid_img,
+        global const uchar * g_qs,
+        global const uchar * g_qh,
+        global const uchar * g_sg,
+        global const uchar * g_sc,
+        global const half  * g_d,
+        global const uchar * u_qs,
+        global const uchar * u_qh,
+        global const uchar * u_sg,
+        global const uchar * u_sc,
+        global const half  * u_d,
+        global const float * src1,
+        ulong offset1,
+        global float * dst,
+        ulong offsetd,
+        int ne00,
+        int ne01,
+        int ne10,
+        int ne0,
+        int glu_op
+) {
+    src1 = (global const float *)((global const char *)src1 + offset1);
+    dst  = (global float       *)((global char       *)dst  + offsetd);
+
+    const uint m   = (uint)ne01;
+    const uint K   = (uint)ne00;
+    const uint nsb = K / QK_K;
+
+    const uint lid = get_local_id(0);
+    const uint sgi = get_local_id(1);
+    const uint col = get_group_id(1);
+
+    global const float * y = src1 + (ulong)col * (uint)ne10;
+
+#if IQ3S_MV_GRIDIMG
+#define IQ3S_GGRID(i) (read_imageui(grid_img, (int)(i)).x)
+#else
+#define IQ3S_GGRID(i) iq3s_grid[(i)]
+#endif
+
+    const uint mh  = m >> 1;
+    const uint j   = get_group_id(0) * 64u + lid;
+    const uint row = j << 1;
+
+    float gs0 = 0.f, gs1 = 0.f, us0 = 0.f, us1 = 0.f;
+
+    if (j < mh) {
+        global const ushort * gqsu = (global const ushort *)g_qs;
+        global const ushort * gqhu = (global const ushort *)g_qh;
+        global const ushort * gsgu = (global const ushort *)g_sg;
+        global const ushort * gscu = (global const ushort *)g_sc;
+        global const ushort * uqsu = (global const ushort *)u_qs;
+        global const ushort * uqhu = (global const ushort *)u_qh;
+        global const ushort * usgu = (global const ushort *)u_sg;
+        global const ushort * uscu = (global const ushort *)u_sc;
+
+        for (uint ib = sgi; ib < nsb; ib += IQ3S_MV_NSG) {
+            const half2 gdh = vload2(j + ib * mh, g_d);
+            const half2 udh = vload2(j + ib * mh, u_d);
+
+            const uint scbase = j + ib * 4u * mh;
+            ushort gsc4[4], usc4[4];
+            for (uint t = 0; t < 4u; ++t) {
+                gsc4[t] = gscu[scbase + t * mh];
+                usc4[t] = uscu[scbase + t * mh];
+            }
+
+            float gacc0 = 0.f, gacc1 = 0.f, uacc0 = 0.f, uacc1 = 0.f;
+            for (uint sb = 0; sb < 8u; ++sb) {
+                const uint gscv  = (uint)gsc4[sb >> 1];
+                const uint uscv  = (uint)usc4[sb >> 1];
+                const uint gnib0 = (sb & 1u) ? ((gscv >>  4) & 0xFu) : ( gscv        & 0xFu);
+                const uint gnib1 = (sb & 1u) ? ((gscv >> 12) & 0xFu) : ((gscv >>  8) & 0xFu);
+                const uint unib0 = (sb & 1u) ? ((uscv >>  4) & 0xFu) : ( uscv        & 0xFu);
+                const uint unib1 = (sb & 1u) ? ((uscv >> 12) & 0xFu) : ((uscv >>  8) & 0xFu);
+
+                const uint gqhv = (uint)gqhu[j + (ib * 8u + sb) * mh];
+                const uint uqhv = (uint)uqhu[j + (ib * 8u + sb) * mh];
+
+                const uint grp = ib * 64u + sb * 8u;
+                const uint qsb = j + grp * mh;
+                const uint sgb = j + (ib * 32u + sb * 4u) * mh;
+
+                float ga0 = 0.f, ga1 = 0.f, ua0 = 0.f, ua1 = 0.f;
+                for (uint u = 0; u < 8u; ++u) {
+                    const float4 yv   = vload4(grp + u, y);   // once, both streams
+                    const uint   base = (u & 1u) * 4u;
+
+                    const uint gqsv = (uint)gqsu[qsb + u * mh];
+                    const uint gsgv = (uint)gsgu[sgb + (u >> 1) * mh];
+                    const uint gg0  = ( gqsv       & 0xFFu) | ((((gqhv & 0xFFu) >> u) & 1u) << 8);
+                    const uint gg1  = ((gqsv >> 8) & 0xFFu) | ((((gqhv >> 8)    >> u) & 1u) << 8);
+                    ga0 += dot(yv, iq3s_vals(IQ3S_GGRID(gg0),  gsgv       & 0xFFu, base));
+                    ga1 += dot(yv, iq3s_vals(IQ3S_GGRID(gg1), (gsgv >> 8) & 0xFFu, base));
+
+                    const uint uqsv = (uint)uqsu[qsb + u * mh];
+                    const uint usgv = (uint)usgu[sgb + (u >> 1) * mh];
+                    const uint ug0  = ( uqsv       & 0xFFu) | ((((uqhv & 0xFFu) >> u) & 1u) << 8);
+                    const uint ug1  = ((uqsv >> 8) & 0xFFu) | ((((uqhv >> 8)    >> u) & 1u) << 8);
+                    ua0 += dot(yv, iq3s_vals(IQ3S_GGRID(ug0),  usgv       & 0xFFu, base));
+                    ua1 += dot(yv, iq3s_vals(IQ3S_GGRID(ug1), (usgv >> 8) & 0xFFu, base));
+                }
+                gacc0 += (float)(1u + 2u * gnib0) * ga0;
+                gacc1 += (float)(1u + 2u * gnib1) * ga1;
+                uacc0 += (float)(1u + 2u * unib0) * ua0;
+                uacc1 += (float)(1u + 2u * unib1) * ua1;
+            }
+            gs0 += (float)gdh.s0 * gacc0;
+            gs1 += (float)gdh.s1 * gacc1;
+            us0 += (float)udh.s0 * uacc0;
+            us1 += (float)udh.s1 * uacc1;
+        }
+    }
+
+#if IQ3S_MV_NSG > 1
+    __local float4 gpart[IQ3S_MV_NSG][64];
+    gpart[sgi][lid] = (float4)(gs0, gs1, us0, us1);
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (sgi != 0) {
+        return;
+    }
+    for (uint s = 1; s < IQ3S_MV_NSG; ++s) {
+        const float4 p = gpart[s][lid];
+        gs0 += p.s0; gs1 += p.s1; us0 += p.s2; us1 += p.s3;
+    }
+#endif
+
+    if (j < mh) {
+        global float * o = dst + (ulong)col * (uint)ne0 + row;
+        o[0] = iq3s_glu_apply(glu_op, gs0, us0);
+        o[1] = iq3s_glu_apply(glu_op, gs1, us1);
+    }
+#undef IQ3S_GGRID
+}
