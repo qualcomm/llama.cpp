@@ -576,6 +576,182 @@ kernel void kernel_mul_mv_iq1_m_f32_flat(
 
 
 // ---------------------------------------------------------------------------
+// Two COLUMNS per workgroup, for the ne11 = 2..31 band. The IQ1_M twin of
+// kernel_mul_mv_iq1_s_f32_flat_mc; see that kernel for the full rationale.
+//
+// The plain GEMV takes its column from get_group_id(1), so at ne11 = N it reads
+// the whole weight matrix N times and gathers the codebook N times. Nothing else
+// covers that band: split-K is gated ne11 == 1 and the prefill GEMM starts at
+// ne11 >= 32.
+//
+// This type should gain the most of the family: routing its codebook through a
+// texture was worth +17.1% here against +2.5% on IQ1_S, which is the measurement
+// that says the grid read is IQ1_M's dominant term. The size of the multi-column
+// win tracks exactly that -- IQ2_S (four gathers per step) +26.7..50.2%, IQ1_S
+// (two, no signs) +8.5..17.3%, IQ3_S (gather is 0.2%, compute bound) a wash.
+//
+// The grid entries are gathered once and the float4s rebuilt per column, as on
+// IQ1_S: iq1m_vals is a shift and a convert, and this kernel has the least
+// register headroom in the family -- holding the four scale words across an
+// unrolled body already cost it a -54 refusal once, and R=4 was refused on the
+// IQ1_S twin for the same reason.
+//
+// An odd trailing column is computed against a duplicate of its partner and
+// dropped at the store, so the inner loop has no divergent branch. That wastes
+// one column of 2*ceil(n/2); the host declines ne11 == 3, the only width where
+// that outweighs the saving.
+// ---------------------------------------------------------------------------
+
+#if IQ1M_MV_AIMG
+#define IQ1M_MCYA(g) read_imagef(y_img, (int)(y_tex_a + (g)))
+#define IQ1M_MCYB(g) read_imagef(y_img, (int)(y_tex_b + (g)))
+#else
+#define IQ1M_MCYA(g) vload4((g), ya)
+#define IQ1M_MCYB(g) vload4((g), yb)
+#endif
+
+kernel void kernel_mul_mv_iq1_m_f32_flat_mc(
+        __read_only image1d_buffer_t grid_img,
+        __read_only image1d_buffer_t y_img,   // see IQ1M_MV_AIMG
+        uint y_off,                           // offset1/16, in float4 texels
+        global const uchar  * src0_qs,
+        global const uchar  * src0_qh,
+        global const ushort * src0_sc,
+        global const float  * src1,
+        ulong offset1,
+        global float * dst,
+        ulong offsetd,
+        int ne00,
+        int ne01,
+        int ne10,
+        int ne0,
+        int ne11
+) {
+    src1 = (global const float *)((global const char *)src1 + offset1);
+    dst  = (global float       *)((global char       *)dst  + offsetd);
+
+    const uint m   = (uint)ne01;
+    const uint K   = (uint)ne00;
+    const uint nsb = K / QK_K;
+
+    const uint lid = get_local_id(0);
+    const uint sgi = get_local_id(1);
+
+    const uint nc    = (uint)ne11;
+    const uint ca    = get_group_id(1) * 2u;
+    const uint has_b = (ca + 1u < nc) ? 1u : 0u;
+    const uint cb    = ca + has_b;        // duplicate of ca when the pair is odd
+
+    global const float * ya = src1 + (ulong)ca * (uint)ne10;
+    global const float * yb = src1 + (ulong)cb * (uint)ne10;
+#if IQ1M_MV_AIMG
+    const uint y_tex_a = y_off + ca * ((uint)ne10 >> 2);
+    const uint y_tex_b = y_off + cb * ((uint)ne10 >> 2);
+#endif
+
+#if IQ1M_MV_GRIDIMG
+#define IQ1M_MCGRID(i) (read_imageui(grid_img, (int)(i)).x)
+#else
+#define IQ1M_MCGRID(i) iq1s_grid_gpu[(i)]
+#endif
+
+    const uint mh  = m >> 1;
+    const uint j   = get_group_id(0) * 64u + lid;
+    const uint row = j << 1;
+
+    float sa0 = 0.f, sa1 = 0.f, sb0 = 0.f, sb1 = 0.f;   // [column][row]
+
+    if (j < mh) {
+        global const ushort * qsu = (global const ushort *)src0_qs;
+        global const ushort * qhu = (global const ushort *)src0_qh;
+        global const uint   * scu = (global const uint   *)src0_sc;
+
+        for (uint ib = sgi; ib < nsb; ib += IQ1M_MV_NSG) {
+            const uint sbb = j + (ib * 4u) * mh;
+            const uint w0 = scu[sbb + 0u * mh];
+            const uint w1 = scu[sbb + 1u * mh];
+            const uint w2 = scu[sbb + 2u * mh];
+            const uint w3 = scu[sbb + 3u * mh];
+            const float d0 = iq1m_super( w0        & 0xFFFFu,  w1        & 0xFFFFu,
+                                         w2        & 0xFFFFu,  w3        & 0xFFFFu);
+            const float d1 = iq1m_super((w0 >> 16) & 0xFFFFu, (w1 >> 16) & 0xFFFFu,
+                                        (w2 >> 16) & 0xFFFFu, (w3 >> 16) & 0xFFFFu);
+
+            float aa0 = 0.f, aa1 = 0.f, ab0 = 0.f, ab1 = 0.f;
+            // scale word re-read per 32-block, as in the plain kernel: holding
+            // w0..w3 live across this body is what cost that one a -54.
+            for (uint sub_l = 0; sub_l < 8u; ++sub_l) {
+                const uint sub = ib * 8u + sub_l;
+                const uint scw = scu[j + (ib * 4u + (sub_l >> 1)) * mh];
+                const uint grp = sub * 8u;                 // K/4 group base
+                const uint shb = 3u * (2u * (sub_l & 1u));
+
+                for (uint l = 0; l < 4u; ++l) {
+                    const uint sh  = shb + 3u * (l >> 1);
+                    const float s0 = (float)(2u * (((scw       ) >> sh) & 7u) + 1u);
+                    const float s1 = (float)(2u * (((scw >> 16) >> sh) & 7u) + 1u);
+
+                    const uint qhv = (uint)qhu[j + (sub * 2u + (l >> 1)) * mh];
+                    const uint h0  =  qhv       & 0xFFu;
+                    const uint h1  = (qhv >> 8) & 0xFFu;
+                    const uint qsv = (uint)qsu[j + (sub * 4u + l) * mh];
+
+                    const uint msk = 0x08u << (4u * (l & 1u));
+                    const float t0 = (h0 & msk) ? (-1.f - IQ1M_DELTA) : (-1.f + IQ1M_DELTA);
+                    const float t1 = (h1 & msk) ? (-1.f - IQ1M_DELTA) : (-1.f + IQ1M_DELTA);
+
+                    // TWO gathers, serving BOTH columns -- the whole point
+                    const uint g0 = IQ1M_MCGRID(( qsv       & 0xFFu)
+                                                | ((((h0 >> (4u*(l & 1u))) & 7u) << 8)));
+                    const uint g1 = IQ1M_MCGRID(((qsv >> 8) & 0xFFu)
+                                                | ((((h1 >> (4u*(l & 1u))) & 7u) << 8)));
+
+                    const float4 a0v = IQ1M_MCYA(grp + 2u*l + 0u);
+                    const float4 a1v = IQ1M_MCYA(grp + 2u*l + 1u);
+                    const float4 asv = a0v + a1v;
+                    const float  asa = (asv.s0 + asv.s1) + (asv.s2 + asv.s3);
+                    aa0 += s0 * ((dot(a0v, iq1m_vals(g0)) + dot(a1v, iq1m_vals(g0 >> 4))) + t0 * asa);
+                    aa1 += s1 * ((dot(a0v, iq1m_vals(g1)) + dot(a1v, iq1m_vals(g1 >> 4))) + t1 * asa);
+
+                    const float4 b0v = IQ1M_MCYB(grp + 2u*l + 0u);
+                    const float4 b1v = IQ1M_MCYB(grp + 2u*l + 1u);
+                    const float4 bsv = b0v + b1v;
+                    const float  asb = (bsv.s0 + bsv.s1) + (bsv.s2 + bsv.s3);
+                    ab0 += s0 * ((dot(b0v, iq1m_vals(g0)) + dot(b1v, iq1m_vals(g0 >> 4))) + t0 * asb);
+                    ab1 += s1 * ((dot(b0v, iq1m_vals(g1)) + dot(b1v, iq1m_vals(g1 >> 4))) + t1 * asb);
+                }
+            }
+            sa0 += d0 * aa0;
+            sa1 += d1 * aa1;
+            sb0 += d0 * ab0;
+            sb1 += d1 * ab1;
+        }
+    }
+
+#if IQ1M_MV_NSG > 1
+    __local float4 mcpart[IQ1M_MV_NSG][64];
+    mcpart[sgi][lid] = (float4)(sa0, sa1, sb0, sb1);
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (sgi != 0) {
+        return;
+    }
+    for (uint s = 1; s < IQ1M_MV_NSG; ++s) {
+        const float4 p = mcpart[s][lid];
+        sa0 += p.s0; sa1 += p.s1; sb0 += p.s2; sb1 += p.s3;
+    }
+#endif
+
+    if (j < mh) {
+        vstore2((float2)(sa0, sa1), 0, dst + (ulong)ca * (uint)ne0 + row);
+        if (has_b) {
+            vstore2((float2)(sb0, sb1), 0, dst + (ulong)cb * (uint)ne0 + row);
+        }
+    }
+#undef IQ1M_MCGRID
+}
+
+
+// ---------------------------------------------------------------------------
 // Fused ffn_gate + ffn_up + GLU, the IQ1_S / IQ2_S / IQ2_XXS twin.
 //
 // IQ1_M was the last type in the family running ffn_gate and ffn_up as two
