@@ -66,6 +66,42 @@
 // roofline. Roughly two thirds of the time is in neither the arithmetic nor the
 // activation nor occupancy. The next instrument is a frame profile -- dispatch
 // count, GPU busy against idle -- not another kernel micro-optimisation.
+// Q2K_MV_PF=1: issue a half sub-block's four weight words before consuming any
+// of them, rather than walking load -> unpack -> dot four times in series.
+//
+// plane_bw replays this kernel's exact plane addressing with no arithmetic and
+// reaches 141 GB/s at the ffn shape -- 93% of this part's 152.4 GB/s roofline --
+// while the kernel itself runs at 44%. So the layout, the multi-plane split and
+// the hardware are all cleared; what is left is that each load is followed by
+// dependent work before the next one issues, and the latency is exposed.
+//
+// MEASURED, and DEFAULT OFF. 3B Q2_K tg64, with kinfo alongside:
+//
+//   variant                                   private/WI  wg_cap    tg64
+//   baseline, interleaved                            304     768   44.79
+//   this, weights + 4 activations, balanced tree     560     384   45.50  +1.7%
+//   weights only, activations one at a time,
+//     serial accumulate                              448     512   41.75  -6.8%
+//
+// +1.7% is not worth crossing the 512-byte spill cliff: wg_cap falls to 384, so
+// the kernel only still launches because NSG=4 asks for 256 work items, and any
+// future widening would be refused outright.
+//
+// 🔑 The pair is the interesting part. The LIGHTER variant is WORSE. It holds
+// fewer registers and still loses 6.8%, and the only other thing it changed was
+// consuming the four activations one at a time with `a0 += ...` four times in
+// series instead of a balanced `(d+d)+(d+d)` tree. So what the heavy version
+// bought was breaking the ACCUMULATOR dependency chain, not hoisting the loads.
+//
+// ⇒ the untried variant is the tree WITHOUT the hoist: keep the loads
+// interleaved exactly as the baseline has them and only rewrite the four
+// accumulations as a balanced tree. That costs no registers at all. Neither
+// variant here isolates it, and the plane_bw ceiling (93% of roofline for this
+// access pattern) says there is roughly 2x still on the table.
+#ifndef Q2K_MV_PF
+#define Q2K_MV_PF 0
+#endif
+
 #ifndef Q2K_MV_ABL
 #define Q2K_MV_ABL 0
 #endif
@@ -136,6 +172,36 @@ kernel void kernel_mul_mv_q2_k_f32_flat(
 
                     float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
                     float4 as = (float4)(0.f);
+#if Q2K_MV_PF
+                    // Issue this half's four weight words BEFORE consuming any of
+                    // them, instead of load -> unpack -> dot four times in series.
+                    // Hand unrolled so a compiler that declines to unroll cannot
+                    // spill an indexed array to private memory.
+                    //
+                    // Why: plane_bw replays this exact addressing with no
+                    // arithmetic and reaches 141 GB/s, 93% of this part's
+                    // roofline, while the kernel itself runs at 44%. The layout is
+                    // not the limit; the dependent chain load -> unpack -> dot is.
+                    const uint w0 = qsu[qsb + (4u*h + 0u) * mr];
+                    const uint w1 = qsu[qsb + (4u*h + 1u) * mr];
+                    const uint w2 = qsu[qsb + (4u*h + 2u) * mr];
+                    const uint w3 = qsu[qsb + (4u*h + 3u) * mr];
+                    {
+                        const float4 y0 = Q2K_YV(grp + 4u*h + 0u);
+                        const float4 y1 = Q2K_YV(grp + 4u*h + 1u);
+                        const float4 y2 = Q2K_YV(grp + 4u*h + 2u);
+                        const float4 y3 = Q2K_YV(grp + 4u*h + 3u);
+                        as = ((y0 + y1) + (y2 + y3));
+                        a0 = ((dot(y0, q2k_vals( w0        & 0xFFu))  + dot(y1, q2k_vals( w1        & 0xFFu)))
+                            + (dot(y2, q2k_vals( w2        & 0xFFu))  + dot(y3, q2k_vals( w3        & 0xFFu))));
+                        a1 = ((dot(y0, q2k_vals((w0 >>  8) & 0xFFu))  + dot(y1, q2k_vals((w1 >>  8) & 0xFFu)))
+                            + (dot(y2, q2k_vals((w2 >>  8) & 0xFFu))  + dot(y3, q2k_vals((w3 >>  8) & 0xFFu))));
+                        a2 = ((dot(y0, q2k_vals((w0 >> 16) & 0xFFu))  + dot(y1, q2k_vals((w1 >> 16) & 0xFFu)))
+                            + (dot(y2, q2k_vals((w2 >> 16) & 0xFFu))  + dot(y3, q2k_vals((w3 >> 16) & 0xFFu))));
+                        a3 = ((dot(y0, q2k_vals((w0 >> 24) & 0xFFu))  + dot(y1, q2k_vals((w1 >> 24) & 0xFFu)))
+                            + (dot(y2, q2k_vals((w2 >> 24) & 0xFFu))  + dot(y3, q2k_vals((w3 >> 24) & 0xFFu))));
+                    }
+#else
                     for (uint u = 0; u < 4u; ++u) {
                         const uint gg  = 4u*h + u;
                         const uint qsv = qsu[qsb + gg * mr];   // four rows, one load
@@ -149,6 +215,7 @@ kernel void kernel_mul_mv_q2_k_f32_flat(
                         a2 += dot(yv, q2k_vals((qsv >> 16) & 0xFFu));
                         a3 += dot(yv, q2k_vals((qsv >> 24) & 0xFFu));
                     }
+#endif
                     // one activation sum, four rows -- this is the whole point
                     const float asum = as.s0 + as.s1 + as.s2 + as.s3;
 
@@ -381,6 +448,36 @@ kernel void kernel_mul_mv_q2_k_f32_flat_splitk(
 
                     float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
                     float4 as = (float4)(0.f);
+#if Q2K_MV_PF
+                    // Issue this half's four weight words BEFORE consuming any of
+                    // them, instead of load -> unpack -> dot four times in series.
+                    // Hand unrolled so a compiler that declines to unroll cannot
+                    // spill an indexed array to private memory.
+                    //
+                    // Why: plane_bw replays this exact addressing with no
+                    // arithmetic and reaches 141 GB/s, 93% of this part's
+                    // roofline, while the kernel itself runs at 44%. The layout is
+                    // not the limit; the dependent chain load -> unpack -> dot is.
+                    const uint w0 = qsu[qsb + (4u*h + 0u) * mr];
+                    const uint w1 = qsu[qsb + (4u*h + 1u) * mr];
+                    const uint w2 = qsu[qsb + (4u*h + 2u) * mr];
+                    const uint w3 = qsu[qsb + (4u*h + 3u) * mr];
+                    {
+                        const float4 y0 = Q2K_YV(grp + 4u*h + 0u);
+                        const float4 y1 = Q2K_YV(grp + 4u*h + 1u);
+                        const float4 y2 = Q2K_YV(grp + 4u*h + 2u);
+                        const float4 y3 = Q2K_YV(grp + 4u*h + 3u);
+                        as = ((y0 + y1) + (y2 + y3));
+                        a0 = ((dot(y0, q2k_vals( w0        & 0xFFu))  + dot(y1, q2k_vals( w1        & 0xFFu)))
+                            + (dot(y2, q2k_vals( w2        & 0xFFu))  + dot(y3, q2k_vals( w3        & 0xFFu))));
+                        a1 = ((dot(y0, q2k_vals((w0 >>  8) & 0xFFu))  + dot(y1, q2k_vals((w1 >>  8) & 0xFFu)))
+                            + (dot(y2, q2k_vals((w2 >>  8) & 0xFFu))  + dot(y3, q2k_vals((w3 >>  8) & 0xFFu))));
+                        a2 = ((dot(y0, q2k_vals((w0 >> 16) & 0xFFu))  + dot(y1, q2k_vals((w1 >> 16) & 0xFFu)))
+                            + (dot(y2, q2k_vals((w2 >> 16) & 0xFFu))  + dot(y3, q2k_vals((w3 >> 16) & 0xFFu))));
+                        a3 = ((dot(y0, q2k_vals((w0 >> 24) & 0xFFu))  + dot(y1, q2k_vals((w1 >> 24) & 0xFFu)))
+                            + (dot(y2, q2k_vals((w2 >> 24) & 0xFFu))  + dot(y3, q2k_vals((w3 >> 24) & 0xFFu))));
+                    }
+#else
                     for (uint u = 0; u < 4u; ++u) {
                         const uint gg  = 4u*h + u;
                         const uint qsv = qsu[qsb + gg * mr];   // four rows, one load
@@ -394,6 +491,7 @@ kernel void kernel_mul_mv_q2_k_f32_flat_splitk(
                         a2 += dot(yv, q2k_vals((qsv >> 16) & 0xFFu));
                         a3 += dot(yv, q2k_vals((qsv >> 24) & 0xFFu));
                     }
+#endif
                     // one activation sum, four rows -- this is the whole point
                     const float asum = as.s0 + as.s1 + as.s2 + as.s3;
 

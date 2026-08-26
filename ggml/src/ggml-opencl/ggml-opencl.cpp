@@ -3049,6 +3049,12 @@ static int ggml_cl_iq2s_gemm_ldsgrid() {
 // bandwidth or ALU bound.
 // Wrong-math cost probe for the Q2_K decode GEMV; see the kernel header.
 // 1 prices the activation load. Never non-zero in a shipped configuration.
+// Hoist a half sub-block's weight loads ahead of the dots; see the kernel header.
+static int ggml_cl_q2k_mv_pf() {
+    static const int v = ggml_cl_env_int("GGML_OPENCL_Q2K_PF", 0);
+    return v ? 1 : 0;
+}
+
 static int ggml_cl_q2k_mv_abl() {
     static const int v = ggml_cl_env_int("GGML_OPENCL_Q2K_MV_ABL", 0);
     return (v >= 0 && v <= 1) ? v : 0;
@@ -4518,6 +4524,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         opts += " -DQ2K_MV_NSG=" + std::to_string(ggml_cl_q2k_mv_nsg());
         opts += " -DQ2K_MV_R="   + std::to_string(ggml_cl_q2k_mv_r());
         opts += " -DQ2K_MV_ABL=" + std::to_string(ggml_cl_q2k_mv_abl());
+        opts += " -DQ2K_MV_PF="  + std::to_string(ggml_cl_q2k_mv_pf());
         opts += " -DMV_WORK2=" + std::to_string(ggml_cl_mv_work2());
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), opts);
