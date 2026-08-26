@@ -9470,6 +9470,48 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat(type_a, type_b, 16, 1, 256, {1,  1}, {1, 1}));
         }
     }
+
+    // Narrow-batch band, n = 2..8, at WEIGHT-SIZED m and k.
+    //
+    // Backends commonly route this band to a different kernel from both n == 1 and
+    // a full prefill GEMM: CUDA compiles mat-vec for ncols_dst 1..8, Vulkan for
+    // NUM_COLS 1..4, and ggml-opencl has a multi-column GEMV for it. Everything in
+    // other_types above is only exercised at n == 1, so that whole band was
+    // reachable in a model and by no test.
+    //
+    // 🔴 m and k are 512, not the 16 and 256 used above, and that is the point.
+    // ggml-opencl declines its tuned paths for any weight with ne0 or ne1 below
+    // 512, so a case at m = 16 silently measures the generic fallback no matter
+    // which type it names -- it cannot reach the kernel it appears to be testing.
+    // A small case here is not a weaker test, it is a different one.
+    //
+    // n = 5 and 7 are deliberate: a kernel that folds two or four columns per
+    // workgroup has a tail when the fold does not divide n, and the tail is where
+    // an off-by-one lands. Batch dims stay {1,1} because the narrow-batch kernels
+    // commonly decline anything broadcast.
+    // Both lists, so a type is not skipped merely for living in base_types --
+    // q4_K does, and it shares a narrow-batch route with q6_K, which this band
+    // caught returning garbage on one device.
+    {
+        std::vector<ggml_type> narrow_batch_types;
+        for (ggml_type t : base_types)  { narrow_batch_types.push_back(t); }
+        for (ggml_type t : other_types) { narrow_batch_types.push_back(t); }
+        std::sort(narrow_batch_types.begin(), narrow_batch_types.end());
+        narrow_batch_types.erase(std::unique(narrow_batch_types.begin(), narrow_batch_types.end()),
+                                 narrow_batch_types.end());
+        for (ggml_type type_a : narrow_batch_types) {
+            if (ggml_blck_size(type_a) != 256) {
+                continue;   // the routes this targets are all super-block types
+            }
+            for (int n : {2, 4, 5, 7, 8}) {
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 512, n, 512, {1, 1}, {1, 1}));
+            }
+            // and once at a row count that is not a multiple of 64, so a
+            // row-blocked layout cannot hide a truncated stride behind a tidy
+            // shape
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 514, 2, 512, {1, 1}, {1, 1}));
+        }
+    }
 #else
     // m = a rows
     // n = b rows

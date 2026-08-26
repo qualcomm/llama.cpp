@@ -40156,9 +40156,12 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 CL_CHECK(clSetKernelArg(mk, ai++, sizeof(int),      &ne0));
                 CL_CHECK(clSetKernelArg(mk, ai++, sizeof(int),      &ne11));
 
-                static bool iq2xxs_mc_logged = false;
-                if (!iq2xxs_mc_logged) {
-                    iq2xxs_mc_logged = true;
+                // keyed on the column width, not just the type: a one-shot per
+                // type logs whichever width happens to dispatch first and leaves
+                // the other looking untested
+                static bool iq2xxs_mc_logged[2] = { false, false };
+                if (!iq2xxs_mc_logged[use4 ? 1 : 0]) {
+                    iq2xxs_mc_logged[use4 ? 1 : 0] = true;
                     GGML_LOG_INFO("ggml_opencl: iq2_xxs multi-column GEMV active (ne11=%d, %d cols)\n", ne11, (int)ncol);
                 }
 
@@ -40433,9 +40436,12 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 CL_CHECK(clSetKernelArg(mk, ai++, sizeof(cl_uint),  &iq2s_y_off));
                 CL_CHECK(clSetKernelArg(mk, ai++, sizeof(int),      &ne11));
 
-                static bool iq2s_mc_logged = false;
-                if (!iq2s_mc_logged) {
-                    iq2s_mc_logged = true;
+                // keyed on the column width, not just the type: a one-shot per
+                // type logs whichever width happens to dispatch first and leaves
+                // the other looking untested
+                static bool iq2s_mc_logged[2] = { false, false };
+                if (!iq2s_mc_logged[use4 ? 1 : 0]) {
+                    iq2s_mc_logged[use4 ? 1 : 0] = true;
                     GGML_LOG_INFO("ggml_opencl: iq2_s multi-column GEMV active (ne11=%d, %d cols)\n", ne11, (int)ncol);
                 }
 
@@ -40838,9 +40844,12 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 CL_CHECK(clSetKernelArg(mk, ai++, sizeof(int),      &ne0));
                 CL_CHECK(clSetKernelArg(mk, ai++, sizeof(int),      &ne11));
 
-                static bool iq1m_mc_logged = false;
-                if (!iq1m_mc_logged) {
-                    iq1m_mc_logged = true;
+                // keyed on the column width, not just the type: a one-shot per
+                // type logs whichever width happens to dispatch first and leaves
+                // the other looking untested
+                static bool iq1m_mc_logged[2] = { false, false };
+                if (!iq1m_mc_logged[use4 ? 1 : 0]) {
+                    iq1m_mc_logged[use4 ? 1 : 0] = true;
                     GGML_LOG_INFO("ggml_opencl: iq1_m multi-column GEMV active (ne11=%d, %d cols)\n", ne11, (int)ncol);
                 }
 
