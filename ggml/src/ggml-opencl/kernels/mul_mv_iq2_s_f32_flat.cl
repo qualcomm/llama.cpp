@@ -554,6 +554,176 @@ kernel void kernel_mul_mv_iq2_s_f32_flat(
 
 
 // ---------------------------------------------------------------------------
+// Two COLUMNS per workgroup, for the ne11 = 2..31 band. The IQ2_S twin of
+// kernel_mul_mv_iq1_s_f32_flat_mc; see that kernel for the full rationale.
+//
+// The plain GEMV takes its column from get_group_id(1), so at ne11 = N it reads
+// the whole weight matrix N times and gathers the grid N times. Nothing else
+// covers that band: split-K is gated ne11 == 1 and the prefill GEMM starts at
+// ne11 >= 32.
+//
+// MEASURED on IQ1_S, which shares this shape: +8.5% at ne11 2 rising to +17.3%
+// at ne11 8, and it gains MORE on a 27B than on a 3B rather than inverting.
+// Unlike the row fold and the codebook prefetch, this removes redundant weight
+// READS instead of spending registers, so a device that is already full has
+// nothing to give back.
+//
+// The four grid entries of a step are gathered once and held; their sign-applied
+// float4s are rebuilt per column rather than kept, because iq2s_vals is a shift
+// and an XOR and these kernels are flat under doubled arithmetic, while holding
+// eight float4s would spend exactly the register budget that is the constraint.
+//
+// An odd trailing column is computed against a duplicate of its partner and
+// dropped at the store, so the inner loop has no divergent branch. That wastes
+// one column of 2*ceil(n/2); the host declines ne11 == 3, the only width where
+// that outweighs the saving.
+// ---------------------------------------------------------------------------
+
+#if IQ2S_MV_AIMG
+#define IQ2S_MCYA(g) read_imagef(y_img, (int)(y_tex_a + (g)))
+#define IQ2S_MCYB(g) read_imagef(y_img, (int)(y_tex_b + (g)))
+#else
+#define IQ2S_MCYA(g) vload4((g), ya)
+#define IQ2S_MCYB(g) vload4((g), yb)
+#endif
+
+kernel void kernel_mul_mv_iq2_s_f32_flat_mc(
+        __read_only image1d_buffer_t grid_img,
+        __read_only image1d_buffer_t y_img,   // see IQ2S_MV_AIMG
+        global const uchar * src0_qs,
+        global const uchar * src0_sg,
+        global const uchar * src0_qh,
+        global const uchar * src0_sc,
+        global const half  * src0_d,
+        global const float * src1,
+        ulong offset1,
+        global float * dst,
+        ulong offsetd,
+        int ne00,
+        int ne01,
+        int ne10,
+        int ne0,
+        uint y_off,   // offset1/16, in float4 texels (IQ2S_MV_AIMG only)
+        int ne11
+) {
+    src1 = (global const float *)((global const char *)src1 + offset1);
+    dst  = (global float       *)((global char       *)dst  + offsetd);
+
+    const uint m   = (uint)ne01;
+    const uint K   = (uint)ne00;
+    const uint nsb = K / QK_K;
+
+    const uint lid = get_local_id(0);
+    const uint sgi = get_local_id(1);
+
+    const uint nc    = (uint)ne11;
+    const uint ca    = get_group_id(1) * 2u;
+    const uint has_b = (ca + 1u < nc) ? 1u : 0u;
+    const uint cb    = ca + has_b;        // duplicate of ca when the pair is odd
+
+    global const float * ya = src1 + (ulong)ca * (uint)ne10;
+    global const float * yb = src1 + (ulong)cb * (uint)ne10;
+#if IQ2S_MV_AIMG
+    const uint y_tex_a = y_off + ca * ((uint)ne10 >> 2);
+    const uint y_tex_b = y_off + cb * ((uint)ne10 >> 2);
+#endif
+
+#if IQ2S_MV_GRIDIMG
+#define IQ2S_MCGRID(i) (read_imageui(grid_img, (int)(i)).x)
+#else
+#define IQ2S_MCGRID(i) iq2s_grid[(i)]
+#endif
+
+    const uint mh  = m >> 1;
+    const uint j   = get_group_id(0) * 64u + lid;
+    const uint row = j << 1;
+
+    float sa0 = 0.f, sa1 = 0.f, sb0 = 0.f, sb1 = 0.f;   // [column][row]
+
+    if (j < mh) {
+        global const ushort * qsu = (global const ushort *)src0_qs;
+        global const ushort * sgu = (global const ushort *)src0_sg;
+        global const ushort * qhu = (global const ushort *)src0_qh;
+        global const ushort * scu = (global const ushort *)src0_sc;
+
+        for (uint ib = sgi; ib < nsb; ib += IQ2S_MV_NSG) {
+            const half2 dh = vload2(j + ib * mh, src0_d);
+
+            float aa0 = 0.f, aa1 = 0.f, ab0 = 0.f, ab1 = 0.f;
+            for (uint sb = 0; sb < 8u; ++sb) {
+                const uint sub = ib * 8u + sb;
+                const uint qhv = (uint)qhu[j + sub * mh];
+                const uint scv = (uint)scu[j + sub * mh];
+                const uint gb  = j + (sub * 4u) * mh;
+
+                for (uint h = 0; h < 2u; ++h) {
+                    const uint n0 = (h == 0u) ? ( scv        & 0xFu) : (( scv        >> 4) & 0xFu);
+                    const uint n1 = (h == 0u) ? ((scv >> 8)  & 0xFu) : (((scv >> 8)  >> 4) & 0xFu);
+
+                    float pa0 = 0.f, pa1 = 0.f, pb0 = 0.f, pb1 = 0.f;
+                    for (uint t = 0; t < 2u; ++t) {
+                        const uint l   = 2u*h + t;
+                        const uint qsv = (uint)qsu[gb + l * mh];   // row pair, one load
+                        const uint sgv = (uint)sgu[gb + l * mh];
+                        const uint gi0 = ( qsv       & 0xFFu) | ((((qhv      ) >> (2u*l)) & 3u) << 8);
+                        const uint gi1 = ((qsv >> 8) & 0xFFu) | ((((qhv >> 8) >> (2u*l)) & 3u) << 8);
+                        const uint s0  =  sgv       & 0xFFu;
+                        const uint s1  = (sgv >> 8) & 0xFFu;
+
+                        // FOUR gathers, serving BOTH columns -- the whole point
+                        const uint g00 = IQ2S_MCGRID(2u*gi0 + 0u);
+                        const uint g01 = IQ2S_MCGRID(2u*gi0 + 1u);
+                        const uint g10 = IQ2S_MCGRID(2u*gi1 + 0u);
+                        const uint g11 = IQ2S_MCGRID(2u*gi1 + 1u);
+
+                        const uint grp = (ib * 64u + sb * 8u) + l * 2u;   // K/4 group
+                        const float4 a0v = IQ2S_MCYA(grp + 0u);
+                        const float4 a1v = IQ2S_MCYA(grp + 1u);
+                        pa0 += dot(a0v, iq2s_vals(g00, s0, 0u)) + dot(a1v, iq2s_vals(g01, s0, 4u));
+                        pa1 += dot(a0v, iq2s_vals(g10, s1, 0u)) + dot(a1v, iq2s_vals(g11, s1, 4u));
+
+                        const float4 b0v = IQ2S_MCYB(grp + 0u);
+                        const float4 b1v = IQ2S_MCYB(grp + 1u);
+                        pb0 += dot(b0v, iq2s_vals(g00, s0, 0u)) + dot(b1v, iq2s_vals(g01, s0, 4u));
+                        pb1 += dot(b0v, iq2s_vals(g10, s1, 0u)) + dot(b1v, iq2s_vals(g11, s1, 4u));
+                    }
+                    aa0 += (0.5f + (float)n0) * pa0;
+                    aa1 += (0.5f + (float)n1) * pa1;
+                    ab0 += (0.5f + (float)n0) * pb0;
+                    ab1 += (0.5f + (float)n1) * pb1;
+                }
+            }
+            sa0 += (float)dh.s0 * 0.25f * aa0;
+            sa1 += (float)dh.s1 * 0.25f * aa1;
+            sb0 += (float)dh.s0 * 0.25f * ab0;
+            sb1 += (float)dh.s1 * 0.25f * ab1;
+        }
+    }
+
+#if IQ2S_MV_NSG > 1
+    __local float4 mcpart[IQ2S_MV_NSG][64];
+    mcpart[sgi][lid] = (float4)(sa0, sa1, sb0, sb1);
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (sgi != 0) {
+        return;
+    }
+    for (uint s = 1; s < IQ2S_MV_NSG; ++s) {
+        const float4 p = mcpart[s][lid];
+        sa0 += p.s0; sa1 += p.s1; sb0 += p.s2; sb1 += p.s3;
+    }
+#endif
+
+    if (j < mh) {
+        vstore2((float2)(sa0, sa1), 0, dst + (ulong)ca * (uint)ne0 + row);
+        if (has_b) {
+            vstore2((float2)(sb0, sb1), 0, dst + (ulong)cb * (uint)ne0 + row);
+        }
+    }
+#undef IQ2S_MCGRID
+}
+
+
+// ---------------------------------------------------------------------------
 // Fused ffn_gate + ffn_up + GLU.
 //
 // Profiled on Llama-3.2-3B-UD-IQ2_M decode: ffn_gate and ffn_up are BOTH served
