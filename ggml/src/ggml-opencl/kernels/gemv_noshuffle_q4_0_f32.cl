@@ -597,8 +597,8 @@ __kernel void kernel_gemv_noshuffle_q4_0_f32_splitk(
 
 // --- Fused gate+up decode GEMV + GLU (q4_0 FFN) ---------------------------------
 // Folds the FFN's two q4_0 decode GEMVs (ffn_gate, ffn_up) and the GLU into one
-// dispatch: two sequential K-loops accumulate gate and up over the SHARED activation
-// (read once), then a float4-packed cross-subgroup reduce and the GLU epilogue emit
+// dispatch: one K-loop accumulates gate and up over the SHARED activation (read once per
+// k), then a float4-packed cross-subgroup reduce and the GLU epilogue emit
 // silu/gelu(gate)*up directly. Removes the separate geglu kernel's global round-trip
 // (gate/up intermediate writes + re-reads) and two dispatches. Coherent (the K-sum
 // order matches the base GEMV; nsg<16 makes it not byte-identical). Mirrors the q4_K
@@ -671,25 +671,39 @@ __kernel void kernel_gemv_noshuffle_q4_0_f32_glu(
     // [2816, 2112], and 2112 % 128 == 64. Models whose ffn ne01 is a multiple of 128
     // (gemma-4-12B 15360, E4B 10240) never form a tail and were unaffected.
     uint gid_s = min(gid, LINE_STRIDE_A - 1);
-#define Q40_GLU_LOOP(SUM, Q, DD)                                                    \
-    for (uint k = groupId; k < (K / QK4_0); k += nsg) {                            \
-        regS = DD[gid_s + k * LINE_STRIDE_A];                                      \
-        if (slid < 4) {                                                            \
-            regB.s0123 = read_imagef(src1, (slid * 2 + k * 8));                    \
-            regB.s4567 = read_imagef(src1, (1 + slid * 2 + k * 8));                \
-        }                                                                          \
-        Q40_LD2(regA.s0, regA.s1, Q, 0); \
-        Q40_LD2(regA.s2, regA.s3, Q, 2); \
-        Q40_DEQ_HI(SUM, as_ushort8(regA), regS, regB);                             \
-        Q40_LD2(regA.s0, regA.s1, Q, 4); \
-        Q40_LD2(regA.s2, regA.s3, Q, 6); \
-        Q40_DEQ_LO(SUM, as_ushort8(regA), regS, regB);                             \
+    // Single K-loop shared by gate and up: regB (the activation) depends only on
+    // (k, slid), not on which projection, so the original two independent K-loops
+    // (gate then up) each re-read the SAME texels from src1 -- a fully redundant
+    // second pass over the activation. Load regB once per k here and reuse it for
+    // both gate and up dequant. Weight reads (regA, from src0g_q/src0u_q, via
+    // Q40_LD2) are unchanged. Gate and up each keep their own brace scope so the dequant
+    // macros' `shared_y` decl is re-scoped (same reason MC_COL_Q40 does this).
+    for (uint k = groupId; k < (K / QK4_0); k += nsg) {
+        if (slid < 4) {
+            regB.s0123 = read_imagef(src1, (slid * 2 + k * 8));
+            regB.s4567 = read_imagef(src1, (1 + slid * 2 + k * 8));
+        }
+        {   // gate
+            regS = src0g_d[gid_s + k * LINE_STRIDE_A];
+            Q40_LD2(regA.s0, regA.s1, src0g_q, 0);
+            Q40_LD2(regA.s2, regA.s3, src0g_q, 2);
+            Q40_DEQ_HI(gateSum, as_ushort8(regA), regS, regB);
+            Q40_LD2(regA.s0, regA.s1, src0g_q, 4);
+            Q40_LD2(regA.s2, regA.s3, src0g_q, 6);
+            Q40_DEQ_LO(gateSum, as_ushort8(regA), regS, regB);
+        }
+        {   // up
+            regS = src0u_d[gid_s + k * LINE_STRIDE_A];
+            Q40_LD2(regA.s0, regA.s1, src0u_q, 0);
+            Q40_LD2(regA.s2, regA.s3, src0u_q, 2);
+            Q40_DEQ_HI(upSum, as_ushort8(regA), regS, regB);
+            Q40_LD2(regA.s0, regA.s1, src0u_q, 4);
+            Q40_LD2(regA.s2, regA.s3, src0u_q, 6);
+            Q40_DEQ_LO(upSum, as_ushort8(regA), regS, regB);
+        }
     }
-    Q40_GLU_LOOP(gateSum, src0g_q, src0g_d)
-    Q40_GLU_LOOP(upSum,   src0u_q, src0u_d)
 #undef Q40_DEQ_HI
 #undef Q40_DEQ_LO
-#undef Q40_GLU_LOOP
 
     __local float4 reduceLM[SIMDGROUP_WIDTH * 7];
     if (groupId > 0) {
