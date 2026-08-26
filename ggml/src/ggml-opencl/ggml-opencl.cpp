@@ -1336,7 +1336,8 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mv_q3_k_f32_flat;
     cl_kernel kernel_mul_mv_q2_k_f32_flat;
     cl_kernel kernel_mul_mv_iq2_s_f32_flat;
-    cl_kernel kernel_mul_mv_iq2_s_f32_flat_mc = nullptr;   // two columns per workgroup, ne11 2..31
+    cl_kernel kernel_mul_mv_iq2_s_f32_flat_mc  = nullptr;  // 2 columns per workgroup, ne11 2..31
+    cl_kernel kernel_mul_mv_iq2_s_f32_flat_mc4 = nullptr;  // 4 columns, used when 4 divides ne11
     cl_kernel kernel_mul_mv_iq2_s_f32_flat_glu = nullptr;  // fused ffn_gate+ffn_up+GLU
     cl_kernel kernel_mul_mv_iq2_s_f32_flat_splitk = nullptr;  // K split across workgroups
     cl_kernel kernel_mul_mv_iq1_s_f32_flat;
@@ -2915,6 +2916,22 @@ static int ggml_cl_iq1s_gemm_ldsgrid() {
 
 // The IQ2_S twin of ggml_cl_iq1s_mv_mc; same band, same shape, same reason.
 // Default on -- see the IQ1_S knob for the numbers that justify it.
+// Subgroups in the 4-column IQ2_S kernel. It does not fit a 512-work-item group
+// -- the driver refuses the enqueue outright, the same ceiling the 4-row fold hit
+// on IQ1_S -- so its program is built at 4 rather than the 8 the narrow kernels
+// use. The reduction array is sized by the compile-time constant, so the launch
+// width must match the build width; that is why this is a separate program and
+// not just a smaller launch.
+static int ggml_cl_iq2s_mv_mc4_nsg() {
+    return 4;
+}
+
+// Columns per workgroup for the IQ2_S multi-column GEMV: 2 or 4.
+static int ggml_cl_iq2s_mv_nc() {
+    static const int v = ggml_cl_env_int("GGML_OPENCL_IQ2S_NC", 4);
+    return (v == 2 || v == 4) ? v : 4;
+}
+
 static int ggml_cl_iq2s_mv_mc() {
     static const int v = ggml_cl_env_int("GGML_OPENCL_IQ2S_MC", 1);
     return v ? 1 : 0;
@@ -4398,6 +4415,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         opts += " -DIQ2S_MV_GRIDIMG=" + std::to_string(ggml_cl_iq2s_mv_gridimg(backend_ctx));
         opts += " -DIQ2S_MV_SIGNXOR=" + std::to_string(ggml_cl_iq2s_mv_signxor());
         opts += " -DIQ2S_MV_AIMG=" + std::to_string(ggml_cl_iq2s_mv_aimg(backend_ctx));
+        opts += " -DIQ2S_MV_NC=2";
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), opts);
 
@@ -4406,6 +4424,25 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             backend_ctx->kernel_mul_mv_iq2_s_f32_flat_mc =
                 clCreateKernel(prog, "kernel_mul_mv_iq2_s_f32_flat_mc", &err);
             if (err != CL_SUCCESS) { backend_ctx->kernel_mul_mv_iq2_s_f32_flat_mc = nullptr; }
+
+            // Second build of the same source at four columns; the host then
+            // dispatches whichever width divides ne11, so neither kernel
+            // computes a column it discards. See the IQ1_M twin for why this is
+            // two entry points and not one kernel branching on the width.
+            if (ggml_cl_iq2s_mv_nc() == 4) {
+                std::string opts4 = opts;
+                const std::string two = " -DIQ2S_MV_NC=2";
+                opts4.replace(opts4.find(two), two.size(), " -DIQ2S_MV_NC=4");
+                const std::string nsg8 = " -DIQ2S_MV_NSG=" + std::to_string(ggml_cl_iq2s_mv_nsg());
+                opts4.replace(opts4.find(nsg8), nsg8.size(),
+                              " -DIQ2S_MV_NSG=" + std::to_string(ggml_cl_iq2s_mv_mc4_nsg()));
+                cl_program prog4 =
+                    build_program_from_source(backend_ctx, kernel_src.c_str(), opts4);
+                backend_ctx->kernel_mul_mv_iq2_s_f32_flat_mc4 =
+                    clCreateKernel(prog4, "kernel_mul_mv_iq2_s_f32_flat_mc", &err);
+                if (err != CL_SUCCESS) { backend_ctx->kernel_mul_mv_iq2_s_f32_flat_mc4 = nullptr; }
+                CL_CHECK(clReleaseProgram(prog4));
+            }
             // R2 only; neither variant has a scalar-row form
             backend_ctx->kernel_mul_mv_iq2_s_f32_flat_glu =
                 clCreateKernel(prog, "kernel_mul_mv_iq2_s_f32_flat_glu", &err);
@@ -40227,8 +40264,14 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1) {
                 ggml_tensor_extra_cl_iq2_s * ex0 =
                     (ggml_tensor_extra_cl_iq2_s *)src0->extra;
-                cl_kernel mk = backend_ctx->kernel_mul_mv_iq2_s_f32_flat_mc;
-                const int nsg = ggml_cl_iq2s_mv_nsg();
+                // widest fold that divides ne11 exactly
+                const bool use4 = backend_ctx->kernel_mul_mv_iq2_s_f32_flat_mc4 != nullptr
+                                  && (ne11 % 4) == 0;
+                const size_t ncol = use4 ? 4u : 2u;
+                cl_kernel mk = use4 ? backend_ctx->kernel_mul_mv_iq2_s_f32_flat_mc4
+                                    : backend_ctx->kernel_mul_mv_iq2_s_f32_flat_mc;
+                // must match the width its program was built at
+                const int nsg = use4 ? ggml_cl_iq2s_mv_mc4_nsg() : ggml_cl_iq2s_mv_nsg();
                 cl_int ai = 0;
                 cl_uint iq2s_y_off = 0;
                 cl_mem  iq2s_y_img = ggml_cl_iq2s_mv_aimg(backend_ctx)
@@ -40256,12 +40299,12 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 static bool iq2s_mc_logged = false;
                 if (!iq2s_mc_logged) {
                     iq2s_mc_logged = true;
-                    GGML_LOG_INFO("ggml_opencl: iq2_s multi-column GEMV active (ne11=%d)\n", ne11);
+                    GGML_LOG_INFO("ggml_opencl: iq2_s multi-column GEMV active (ne11=%d, %d cols)\n", ne11, (int)ncol);
                 }
 
                 const size_t rows_wg = ggml_cl_iq2s_mv_r2() ? 128 : 64;
                 size_t m_global[3] = { CEIL_DIV((size_t)ne01, rows_wg) * 64,
-                                       CEIL_DIV((size_t)ne11, (size_t)2) * (size_t)nsg, 1 };
+                                       CEIL_DIV((size_t)ne11, ncol) * (size_t)nsg, 1 };
                 size_t m_local[3]  = { 64, (size_t)nsg, 1 };
                 backend_ctx->enqueue_ndrange_kernel(mk, 3, m_global, m_local, dst);
                 if (iq2s_y_img) { CL_CHECK(clReleaseMemObject(iq2s_y_img)); }

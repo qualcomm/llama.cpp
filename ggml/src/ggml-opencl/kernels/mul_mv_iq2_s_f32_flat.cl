@@ -579,12 +579,24 @@ kernel void kernel_mul_mv_iq2_s_f32_flat(
 // that outweighs the saving.
 // ---------------------------------------------------------------------------
 
+// Columns per workgroup: 2 or 4. The file is compiled TWICE so both exist as
+// separate kernels and the host dispatches whichever width divides ne11 -- see
+// the IQ1_M twin, where guarding the trailing columns inside one kernel instead
+// cost 7-9% at the widths that had no tail to guard.
+#ifndef IQ2S_MV_NC
+#define IQ2S_MV_NC 2
+#endif
+
 #if IQ2S_MV_AIMG
 #define IQ2S_MCYA(g) read_imagef(y_img, (int)(y_tex_a + (g)))
 #define IQ2S_MCYB(g) read_imagef(y_img, (int)(y_tex_b + (g)))
+#define IQ2S_MCYC(g) read_imagef(y_img, (int)(y_tex_c + (g)))
+#define IQ2S_MCYD(g) read_imagef(y_img, (int)(y_tex_d + (g)))
 #else
 #define IQ2S_MCYA(g) vload4((g), ya)
 #define IQ2S_MCYB(g) vload4((g), yb)
+#define IQ2S_MCYC(g) vload4((g), yc)
+#define IQ2S_MCYD(g) vload4((g), yd)
 #endif
 
 kernel void kernel_mul_mv_iq2_s_f32_flat_mc(
@@ -617,7 +629,7 @@ kernel void kernel_mul_mv_iq2_s_f32_flat_mc(
     const uint sgi = get_local_id(1);
 
     const uint nc    = (uint)ne11;
-    const uint ca    = get_group_id(1) * 2u;
+    const uint ca    = get_group_id(1) * IQ2S_MV_NC;
     const uint has_b = (ca + 1u < nc) ? 1u : 0u;
     const uint cb    = ca + has_b;        // duplicate of ca when the pair is odd
 
@@ -626,6 +638,18 @@ kernel void kernel_mul_mv_iq2_s_f32_flat_mc(
 #if IQ2S_MV_AIMG
     const uint y_tex_a = y_off + ca * ((uint)ne10 >> 2);
     const uint y_tex_b = y_off + cb * ((uint)ne10 >> 2);
+#endif
+#if IQ2S_MV_NC == 4
+    const uint has_c = (ca + 2u < nc) ? 1u : 0u;
+    const uint has_d = (ca + 3u < nc) ? 1u : 0u;
+    const uint cc    = ca + (has_c ? 2u : 0u);
+    const uint cd    = ca + (has_d ? 3u : 0u);
+    global const float * yc = src1 + (ulong)cc * (uint)ne10;
+    global const float * yd = src1 + (ulong)cd * (uint)ne10;
+#if IQ2S_MV_AIMG
+    const uint y_tex_c = y_off + cc * ((uint)ne10 >> 2);
+    const uint y_tex_d = y_off + cd * ((uint)ne10 >> 2);
+#endif
 #endif
 
 #if IQ2S_MV_GRIDIMG
@@ -639,6 +663,9 @@ kernel void kernel_mul_mv_iq2_s_f32_flat_mc(
     const uint row = j << 1;
 
     float sa0 = 0.f, sa1 = 0.f, sb0 = 0.f, sb1 = 0.f;   // [column][row]
+#if IQ2S_MV_NC == 4
+    float sc0 = 0.f, sc1 = 0.f, sd0 = 0.f, sd1 = 0.f;
+#endif
 
     if (j < mh) {
         global const ushort * qsu = (global const ushort *)src0_qs;
@@ -650,6 +677,9 @@ kernel void kernel_mul_mv_iq2_s_f32_flat_mc(
             const half2 dh = vload2(j + ib * mh, src0_d);
 
             float aa0 = 0.f, aa1 = 0.f, ab0 = 0.f, ab1 = 0.f;
+#if IQ2S_MV_NC == 4
+            float ac0 = 0.f, ac1 = 0.f, ad0 = 0.f, ad1 = 0.f;
+#endif
             for (uint sb = 0; sb < 8u; ++sb) {
                 const uint sub = ib * 8u + sb;
                 const uint qhv = (uint)qhu[j + sub * mh];
@@ -661,6 +691,9 @@ kernel void kernel_mul_mv_iq2_s_f32_flat_mc(
                     const uint n1 = (h == 0u) ? ((scv >> 8)  & 0xFu) : (((scv >> 8)  >> 4) & 0xFu);
 
                     float pa0 = 0.f, pa1 = 0.f, pb0 = 0.f, pb1 = 0.f;
+#if IQ2S_MV_NC == 4
+                    float pc0 = 0.f, pc1 = 0.f, pd0 = 0.f, pd1 = 0.f;
+#endif
                     for (uint t = 0; t < 2u; ++t) {
                         const uint l   = 2u*h + t;
                         const uint qsv = (uint)qsu[gb + l * mh];   // row pair, one load
@@ -686,22 +719,49 @@ kernel void kernel_mul_mv_iq2_s_f32_flat_mc(
                         const float4 b1v = IQ2S_MCYB(grp + 1u);
                         pb0 += dot(b0v, iq2s_vals(g00, s0, 0u)) + dot(b1v, iq2s_vals(g01, s0, 4u));
                         pb1 += dot(b0v, iq2s_vals(g10, s1, 0u)) + dot(b1v, iq2s_vals(g11, s1, 4u));
+#if IQ2S_MV_NC == 4
+                        const float4 c0v = IQ2S_MCYC(grp + 0u);
+                        const float4 c1v = IQ2S_MCYC(grp + 1u);
+                        pc0 += dot(c0v, iq2s_vals(g00, s0, 0u)) + dot(c1v, iq2s_vals(g01, s0, 4u));
+                        pc1 += dot(c0v, iq2s_vals(g10, s1, 0u)) + dot(c1v, iq2s_vals(g11, s1, 4u));
+
+                        const float4 d0v = IQ2S_MCYD(grp + 0u);
+                        const float4 d1v = IQ2S_MCYD(grp + 1u);
+                        pd0 += dot(d0v, iq2s_vals(g00, s0, 0u)) + dot(d1v, iq2s_vals(g01, s0, 4u));
+                        pd1 += dot(d0v, iq2s_vals(g10, s1, 0u)) + dot(d1v, iq2s_vals(g11, s1, 4u));
+#endif
                     }
                     aa0 += (0.5f + (float)n0) * pa0;
                     aa1 += (0.5f + (float)n1) * pa1;
                     ab0 += (0.5f + (float)n0) * pb0;
                     ab1 += (0.5f + (float)n1) * pb1;
+#if IQ2S_MV_NC == 4
+                    ac0 += (0.5f + (float)n0) * pc0;
+                    ac1 += (0.5f + (float)n1) * pc1;
+                    ad0 += (0.5f + (float)n0) * pd0;
+                    ad1 += (0.5f + (float)n1) * pd1;
+#endif
                 }
             }
             sa0 += (float)dh.s0 * 0.25f * aa0;
             sa1 += (float)dh.s1 * 0.25f * aa1;
             sb0 += (float)dh.s0 * 0.25f * ab0;
             sb1 += (float)dh.s1 * 0.25f * ab1;
+#if IQ2S_MV_NC == 4
+            sc0 += (float)dh.s0 * 0.25f * ac0;
+            sc1 += (float)dh.s1 * 0.25f * ac1;
+            sd0 += (float)dh.s0 * 0.25f * ad0;
+            sd1 += (float)dh.s1 * 0.25f * ad1;
+#endif
         }
     }
 
 #if IQ2S_MV_NSG > 1
     __local float4 mcpart[IQ2S_MV_NSG][64];
+#if IQ2S_MV_NC == 4
+    __local float4 mcpart2[IQ2S_MV_NSG][64];
+    mcpart2[sgi][lid] = (float4)(sc0, sc1, sd0, sd1);
+#endif
     mcpart[sgi][lid] = (float4)(sa0, sa1, sb0, sb1);
     barrier(CLK_LOCAL_MEM_FENCE);
     if (sgi != 0) {
@@ -710,6 +770,10 @@ kernel void kernel_mul_mv_iq2_s_f32_flat_mc(
     for (uint s = 1; s < IQ2S_MV_NSG; ++s) {
         const float4 p = mcpart[s][lid];
         sa0 += p.s0; sa1 += p.s1; sb0 += p.s2; sb1 += p.s3;
+#if IQ2S_MV_NC == 4
+        const float4 q = mcpart2[s][lid];
+        sc0 += q.s0; sc1 += q.s1; sd0 += q.s2; sd1 += q.s3;
+#endif
     }
 #endif
 
@@ -718,6 +782,14 @@ kernel void kernel_mul_mv_iq2_s_f32_flat_mc(
         if (has_b) {
             vstore2((float2)(sb0, sb1), 0, dst + (ulong)cb * (uint)ne0 + row);
         }
+#if IQ2S_MV_NC == 4
+        if (has_c) {
+            vstore2((float2)(sc0, sc1), 0, dst + (ulong)cc * (uint)ne0 + row);
+        }
+        if (has_d) {
+            vstore2((float2)(sd0, sd1), 0, dst + (ulong)cd * (uint)ne0 + row);
+        }
+#endif
     }
 #undef IQ2S_MCGRID
 }
