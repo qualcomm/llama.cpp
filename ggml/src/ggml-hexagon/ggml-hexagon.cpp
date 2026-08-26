@@ -76,7 +76,72 @@ struct ggml_hexagon_device_config {
 
 static ggml_hexagon_device_config opt_device_configs[GGML_HEXAGON_MAX_SESSIONS];
 
+struct ggml_hexagon_domain_info {
+    int         id;
+    std::string name;
+};
+
+// Enumerate NSP domains via FASTRPC_GET_DOMAINS if supported.
+// Filters to FASTRPC_NSP type only so non-compute domains are excluded.
+static const std::vector<ggml_hexagon_domain_info> & ggml_hexagon_discover_domains() {
+    static std::vector<ggml_hexagon_domain_info> cached;
+    static bool                                  discovered = false;
+    if (discovered) {
+        return cached;
+    }
+    discovered = true;
+
+    system_req_payload domain_info = {};
+    domain_info.id              = FASTRPC_GET_DOMAINS;
+    domain_info.sys.domains     = nullptr;
+    domain_info.sys.max_domains = 0;
+    domain_info.sys.flags       = DOMAINS_LIST_FLAGS_SET_TYPE(0, FASTRPC_NSP);
+
+    int err = remote_system_request(&domain_info);
+    if (err != AEE_SUCCESS) {
+        GGML_LOG_DEBUG("ggml-hex: FASTRPC_GET_DOMAINS query failed (0x%x), using static CDSP domains\n", (unsigned) err);
+        return cached;
+    }
+
+    if (domain_info.sys.num_domains <= 0) {
+        GGML_LOG_DEBUG("ggml-hex: FASTRPC_GET_DOMAINS reported 0 domains, using static CDSP domains\n");
+        return cached;
+    }
+
+    std::vector<fastrpc_domain> domains(domain_info.sys.num_domains);
+    domain_info.sys.domains     = domains.data();
+    domain_info.sys.max_domains = (int) domains.size();
+
+    err = remote_system_request(&domain_info);
+    if (err != AEE_SUCCESS) {
+        GGML_LOG_WARN("ggml-hex: FASTRPC_GET_DOMAINS fetch failed (0x%x), using static CDSP domains\n", (unsigned) err);
+        return cached;
+    }
+
+    const int n_domains = std::min(domain_info.sys.num_domains, (int) domains.size());
+    for (int i = 0; i < n_domains; i++) {
+        GGML_LOG_INFO("ggml-hex: FASTRPC_GET_DOMAINS[%d]: type=%d id=%d name='%s' status=%d instance_id=%d\n",
+                      i, (int) domains[i].type, domains[i].id, domains[i].name, domains[i].status, domains[i].instance_id);
+        if (domains[i].type != FASTRPC_NSP) {
+            GGML_LOG_DEBUG("ggml-hex:   skipping non-NSP domain (type=%d)\n", (int) domains[i].type);
+            continue;
+        }
+        if (!domains[i].status) {
+            GGML_LOG_WARN("ggml-hex:   skipping NSP domain id=%d (status=down)\n", domains[i].id);
+            continue;
+        }
+        cached.push_back({ domains[i].id, std::string(domains[i].name) });
+        GGML_LOG_INFO("ggml-hex: using NSP domain[%zu]: id=%d name='%s'\n",
+                      cached.size() - 1, domains[i].id, domains[i].name);
+    }
+    return cached;
+}
+
 static int get_domain_id(int physical_idx) {
+    const auto & domains = ggml_hexagon_discover_domains();
+    if (physical_idx >= 0 && physical_idx < (int) domains.size()) {
+        return domains[physical_idx].id;
+    }
     switch (physical_idx) {
         case 0:  return 3;  // CDSP0 (all devices)
         case 1:  return 4;  // CDSP1 (IQ9, IQ10)
@@ -87,6 +152,10 @@ static int get_domain_id(int physical_idx) {
 }
 
 static std::string get_domain_name(int physical_idx) {
+    const auto & domains = ggml_hexagon_discover_domains();
+    if (physical_idx >= 0 && physical_idx < (int) domains.size()) {
+        return domains[physical_idx].name;
+    }
     if (physical_idx == 0) {
         return CDSP_DOMAIN_NAME;
     }
@@ -2874,12 +2943,20 @@ void ggml_hexagon_session::allocate(int dev_id) noexcept(false) {
     GGML_LOG_DEBUG("ggml-hex: %s allocating new session\n", this->name.c_str());
 
     domain * my_domain = htpdrv_get_domain(this->domain_id);
-    if (my_domain == NULL) {
-        GGML_LOG_ERROR("ggml-hex: unable to get domain struct for CDSP (domain_id %d)\n", this->domain_id);
-        throw std::runtime_error("ggml-hex: failed to get CDSP domain (see log for details)");
-    }
 
     std::string dom_name = get_domain_name(phys_idx);
+
+    // Enable Unsigned PD for all domains
+    {
+        struct remote_rpc_control_unsigned_module u;
+        u.domain = -1;
+        u.enable = 1;
+        int err  = remote_session_control(DSPRPC_CONTROL_UNSIGNED_MODULE, (void *) &u, sizeof(u));
+        if (err != AEE_SUCCESS) {
+            GGML_LOG_ERROR("ggml-hex: failed to enable unsigned PD for session %d : error 0x%x\n", dev_id, err);
+            throw std::runtime_error("ggml-hex: remote_session_control(unsign) failed (see log for details)");
+        }
+    }
 
     // Create new session if virtual_idx > 0
     if (virt_idx > 0) {
@@ -2899,6 +2976,19 @@ void ggml_hexagon_session::allocate(int dev_id) noexcept(false) {
         this->session_id    = n.session_id;
         this->domain_id     = n.effective_domain_id;
         this->valid_session = true;
+    } else {
+        struct remote_rpc_effective_domain_id eff = {};
+        eff.domain_name     = const_cast<char *>(dom_name.c_str());
+        eff.domain_name_len = dom_name.size();
+        eff.session_id      = 0;
+
+        int err = remote_session_control(FASTRPC_GET_EFFECTIVE_DOMAIN_ID, (void *) &eff, sizeof(eff));
+        if (err == AEE_SUCCESS) {
+            this->domain_id = eff.effective_domain_id;
+        } else {
+            GGML_LOG_DEBUG("ggml-hex: %s FASTRPC_GET_EFFECTIVE_DOMAIN_ID returned 0x%x, using domain_id %d\n",
+                           this->name.c_str(), err, this->domain_id);
+        }
     }
 
     // Get session URI
@@ -2919,24 +3009,19 @@ void ggml_hexagon_session::allocate(int dev_id) noexcept(false) {
 
         int err = remote_session_control(FASTRPC_GET_URI, (void *) &u, sizeof(u));
         if (err != AEE_SUCCESS) {
+            if (my_domain == NULL) {
+                GGML_LOG_ERROR("ggml-hex: failed to get URI for session %d (physical %d, virtual %d) : error 0x%x, "
+                               "and no static fallback URI is known for domain_id %d\n",
+                               dev_id, phys_idx, virt_idx, err, this->domain_id);
+                throw std::runtime_error("ggml-hex: failed to get session URI (see log for details)");
+            }
+
             // fallback to single session uris
             int htp_URI_domain_len = strlen(htp_uri) + MAX_DOMAIN_NAMELEN;
 
             snprintf(session_uri, htp_URI_domain_len, "%s%s", htp_uri, my_domain->uri);
 
             GGML_LOG_WARN("ggml-hex: failed to get URI for session %d (physical %d, virtual %d) : error 0x%x. Falling back to single session URI: %s\n", dev_id, phys_idx, virt_idx, err, session_uri);
-        }
-    }
-
-    // Enable Unsigned PD
-    {
-        struct remote_rpc_control_unsigned_module u;
-        u.domain = this->domain_id;
-        u.enable = 1;
-        int err  = remote_session_control(DSPRPC_CONTROL_UNSIGNED_MODULE, (void *) &u, sizeof(u));
-        if (err != AEE_SUCCESS) {
-            GGML_LOG_ERROR("ggml-hex: failed to enable unsigned PD for session %d : error 0x%x\n", dev_id, err);
-            throw std::runtime_error("ggml-hex: remote_session_control(unsign) failed (see log for details)");
         }
     }
 
