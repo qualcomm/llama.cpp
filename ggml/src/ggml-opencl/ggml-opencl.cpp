@@ -2799,6 +2799,14 @@ static int ggml_cl_iq1s_mv_nsg() {
 // 2 is still the default: IQ1_S has the largest per-lane footprint in the family
 // (it is why NSG=4 beats 8 here and nowhere else), so 4 has to be measured, not
 // argued. GGML_OPENCL_IQ1S_MV_R forces either way.
+// Wrong-math cost probe for the IQ1_S decode GEMVs; see the kernel header.
+// 1 prices the codebook gather, 2 the activation load. Never non-zero in a
+// shipped configuration -- the numbers it produces are wrong on purpose.
+static int ggml_cl_iq1s_mv_abl() {
+    static const int v = ggml_cl_env_int("GGML_OPENCL_IQ1S_MV_ABL", 0);
+    return (v >= 0 && v <= 2) ? v : 0;
+}
+
 static int ggml_cl_iq1s_mv_r() {
     static const int v = ggml_cl_env_int("GGML_OPENCL_IQ1S_MV_R", 2);
     return (v == 1 || v == 2 || v == 4) ? v : 2;
@@ -4324,6 +4332,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         opts += " -DIQ1S_MV_GRIDIMG=" + std::to_string(ggml_cl_iq1s_mv_gridimg(backend_ctx));
         opts += " -DIQ1S_MV_AIMG=" + std::to_string(ggml_cl_iq1s_mv_aimg(backend_ctx));
         opts += " -DMV_WORK2=" + std::to_string(ggml_cl_mv_work2());
+        opts += " -DIQ1S_MV_ABL=" + std::to_string(ggml_cl_iq1s_mv_abl());
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), opts);
 

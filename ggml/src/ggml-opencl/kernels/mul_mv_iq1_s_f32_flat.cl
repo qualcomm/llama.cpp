@@ -374,10 +374,38 @@ inline float4 iq1s_vals(uint g) {
 #define IQ1S_MV_AIMG 0
 #endif
 
-#if IQ1S_MV_AIMG
+// IQ1S_MV_ABL: COST PROBE, WRONG MATH, default off. Prices one term of the inner
+// loop by removing THAT term's memory traffic while leaving the surrounding
+// arithmetic and the loop structure intact. This is the IQ1_S twin of
+// IQ3S_MV_ABL, and it exists because the two knobs already here cannot answer
+// the question: MV_WORK2 doubles ARITHMETIC holding loads fixed (IQ1_S is flat
+// under it), and the grid tier knobs move the codebook between LDS, __constant
+// and a texture without changing how much of it is read.
+//
+//   1 = codebook gather removed. The index is still computed and still XORed in,
+//       so the qs/qh loads stay live and only the divergent table read goes.
+//   2 = activation load removed, replaced by a value derived from the group
+//       index so the loop cannot be folded away.
+//
+// Both produce WRONG NUMBERS. Never ship non-zero; read the tg delta as the
+// upper bound on what optimising that term can buy.
+#ifndef IQ1S_MV_ABL
+#define IQ1S_MV_ABL 0
+#endif
+
+#if IQ1S_MV_ABL == 2
+#define IQ1S_YV(g) ((float4)((float)((g) & 3u)))
+#elif IQ1S_MV_AIMG
 #define IQ1S_YV(g) read_imagef(y_img, (int)(y_tex + (g)))
 #else
 #define IQ1S_YV(g) vload4((g), y)
+#endif
+
+// Wraps whichever grid tier a kernel selected; see IQ1S_MV_ABL above.
+#if IQ1S_MV_ABL == 1
+#define IQ1S_ABL(read, idx) (0x11111111u ^ (uint)(idx))
+#else
+#define IQ1S_ABL(read, idx) (read)
 #endif
 
 kernel void kernel_iq1s_grid_export(global uint * out) {
@@ -420,7 +448,7 @@ kernel void kernel_mul_mv_iq1_s_f32_flat(
 #endif
 
 #if IQ1S_MV_GRIDIMG
-#define IQ1S_GRID(i) (read_imageui(grid_img, (int)(i)).x)
+#define IQ1S_GRID(i) IQ1S_ABL((read_imageui(grid_img, (int)(i)).x), (i))
 #elif IQ1S_MV_LDSGRID
     __local uint sh_grid[2048];
     {
@@ -431,9 +459,9 @@ kernel void kernel_mul_mv_iq1_s_f32_flat(
         }
     }
     barrier(CLK_LOCAL_MEM_FENCE);
-#define IQ1S_GRID(i) sh_grid[(i)]
+#define IQ1S_GRID(i) IQ1S_ABL(sh_grid[(i)], (i))
 #else
-#define IQ1S_GRID(i) iq1s_grid_gpu[(i)]
+#define IQ1S_GRID(i) IQ1S_ABL(iq1s_grid_gpu[(i)], (i))
 #endif
 
 #if IQ1S_MV_R == 4
@@ -737,9 +765,9 @@ kernel void kernel_mul_mv_iq1_s_f32_flat_glu(
 #endif
 
 #if IQ1S_MV_GRIDIMG
-#define IQ1S_GGRID(i) (read_imageui(grid_img, (int)(i)).x)
+#define IQ1S_GGRID(i) IQ1S_ABL((read_imageui(grid_img, (int)(i)).x), (i))
 #else
-#define IQ1S_GGRID(i) iq1s_grid_gpu[(i)]
+#define IQ1S_GGRID(i) IQ1S_ABL(iq1s_grid_gpu[(i)], (i))
 #endif
 
 #if IQ1S_MV_R == 4
@@ -1018,7 +1046,7 @@ kernel void kernel_mul_mv_iq1_s_f32_flat_splitk(
 #endif
 
 #if IQ1S_MV_GRIDIMG
-#define IQ1S_SKGRID(i) (read_imageui(grid_img, (int)(i)).x)
+#define IQ1S_SKGRID(i) IQ1S_ABL((read_imageui(grid_img, (int)(i)).x), (i))
 #elif IQ1S_MV_LDSGRID
     __local uint sk_grid[2048];
     {
@@ -1029,9 +1057,9 @@ kernel void kernel_mul_mv_iq1_s_f32_flat_splitk(
         }
     }
     barrier(CLK_LOCAL_MEM_FENCE);
-#define IQ1S_SKGRID(i) sk_grid[(i)]
+#define IQ1S_SKGRID(i) IQ1S_ABL(sk_grid[(i)], (i))
 #else
-#define IQ1S_SKGRID(i) iq1s_grid_gpu[(i)]
+#define IQ1S_SKGRID(i) IQ1S_ABL(iq1s_grid_gpu[(i)], (i))
 #endif
 
 #if IQ1S_MV_R == 4
