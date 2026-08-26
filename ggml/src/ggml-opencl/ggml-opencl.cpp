@@ -2804,6 +2804,17 @@ static int ggml_cl_iq1s_mv_nsg() {
 // Wrong-math cost probe for the IQ1_S decode GEMVs; see the kernel header.
 // 1 prices the codebook gather, 2 the activation load. Never non-zero in a
 // shipped configuration -- the numbers it produces are wrong on purpose.
+// IQ1S_MV_PF: hoist a sub-block's loads ahead of its dot products in the IQ1_S
+// decode GEMVs, so the codebook gathers overlap instead of serialising behind
+// one another. 1 = plain and split-K kernels, worth +4.0% of decode where they
+// carry the frame. 2 additionally applies it to the fused gate+up kernel, which
+// measured -3.3% on its own -- kept reachable, not reached by 1. See the kernel
+// header.
+static int ggml_cl_iq1s_mv_pf() {
+    static const int v = ggml_cl_env_int("GGML_OPENCL_IQ1S_PF", 0);
+    return (v >= 0 && v <= 2) ? v : 0;
+}
+
 // IQ1S_MV_G2: read the IQ1_S codebook as 2 bits per weight rather than 4,
 // halving the hot table to 4 KB. Aimed at the term IQ1S_MV_ABL prices at 11.5%
 // of decode. Off until measured; GGML_OPENCL_IQ1S_G2 forces either way.
@@ -4351,6 +4362,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         opts += " -DMV_WORK2=" + std::to_string(ggml_cl_mv_work2());
         opts += " -DIQ1S_MV_ABL=" + std::to_string(ggml_cl_iq1s_mv_abl());
         opts += " -DIQ1S_MV_G2=" + std::to_string(ggml_cl_iq1s_mv_g2());
+        opts += " -DIQ1S_MV_PF=" + std::to_string(ggml_cl_iq1s_mv_pf());
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), opts);
 

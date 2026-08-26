@@ -60,6 +60,61 @@
 #define IQ1S_MV_R 2
 #endif
 
+// IQ1S_MV_PF=1: issue every load of a 32-weight sub-block before consuming any
+// of it, instead of walking load -> gather -> dot four times in series.
+//
+// This is the one lever the round's three measurements leave standing. The
+// codebook gather costs 11.5% (IQ1S_MV_ABL=1); the cost is NOT arithmetic
+// (doubling it is free), NOT the table's size (halving it is -1.9%) and NOT
+// occupancy in the workgroup sense (the shape already runs full). What is left
+// is the DEPENDENT chain qs load -> index -> table read -> unpack, walked once
+// per l with nothing else in flight to cover it. Widening the row fold would
+// have covered it too, and that is exactly what ran out of registers.
+//
+// So this buys latency overlap for ~12 registers rather than by doubling the
+// per-lane state: four qs bytes and eight grid entries live at once, and the
+// eight gathers become independent of each other the moment the four qs loads
+// land.
+//
+// MEASURED, and the sign is PER MODEL -- default off for that reason.
+//
+//   3B  Llama-3.2 UD-IQ1_S   tg64   50.38 -> 51.19   **+1.6%**  (shipped config)
+//                                   45.71 -> 47.52    +4.0%     (fusion off, so
+//                                                                the hoisted
+//                                                                kernels carry it)
+//   27B Qwen3.8 UD-IQ1_S     tg32    6.088 ->  6.002   **-1.4%** (shipped config)
+//                                    6.082 ->  5.641    -7.25%   (split-K off, so
+//                                                                the plain kernel
+//                                                                carries it)
+//
+// Both 27B figures are order-balanced (0,1 then 1,0), and the loss holds in both
+// orders, so it is not thermal drift.
+//
+// KEY: the mechanism is real -- the hoist does buy the latency overlap, and a
+// third of the gather's 11.5% on the 3B. But it BUYS IT WITH REGISTERS, and
+// registers only come free where the shape is occupancy-starved. The 3B's IQ1_S
+// projections are small enough to leave slack; the 27B's expert matrices already
+// fill the device, so the same twelve registers come straight out of resident
+// waves. That is the same budget the 4-row fold exhausted and the same reason
+// the fused kernel refuses it.
+//
+// => a register-spending optimisation is not a property of the kernel, it is a
+// property of the kernel AND the shape. Do not ship one on a small-model A/B.
+//
+// 1 = plain and split-K kernels. 2 = those plus the fused gate+up kernel, which
+// is a MEASURED NEGATIVE even on the 3B (-3.3% shipped); see that kernel's note.
+//
+// Correctness: wikitext PPL on the decode path (-b 1 -ub 1, so every token goes
+// through this GEMV) is 64.4436 off vs 64.4437 on -- the hoist reassociates the
+// per-sub-block sums into a balanced tree, nothing more.
+//
+// R=2 only -- the shipped fold. R=1 and R=4 keep the interleaved form; R=4 has
+// no registers to spare for this anyway. The MV_WORK2 arithmetic probe is not
+// wired into this path; the two are not meaningful together.
+#ifndef IQ1S_MV_PF
+#define IQ1S_MV_PF 0
+#endif
+
 #ifndef IQ1S_MV_LDSGRID
 #define IQ1S_MV_LDSGRID 1
 #endif
@@ -649,6 +704,47 @@ kernel void kernel_mul_mv_iq1_s_f32_flat(
 
                 float a0 = 0.f, a1 = 0.f;
                 float4 as = (float4)(0.f);
+#if IQ1S_MV_PF
+                // Every load of this sub-block is ISSUED before any of it is
+                // consumed: the four qs bytes first, then the eight codebook
+                // gathers they index. See IQ1S_MV_PF -- the chain being broken
+                // is qs load -> index -> table read, which the interleaved form
+                // below walks four times in series.
+                //
+                // Hand-unrolled rather than an indexed array on purpose: an
+                // array subscripted by a loop variable becomes PRIVATE MEMORY if
+                // the compiler declines to unroll, which would turn a register
+                // experiment into a scratch-memory one.
+                const uint qv0 = (uint)qsu[gb + 0u * mh];
+                const uint qv1 = (uint)qsu[gb + 1u * mh];
+                const uint qv2 = (uint)qsu[gb + 2u * mh];
+                const uint qv3 = (uint)qsu[gb + 3u * mh];
+
+                const uint g00 = IQ1S_GRID(( qv0       & 0xFFu) | (((h0      ) & 7u) << 8));
+                const uint g01 = IQ1S_GRID(( qv1       & 0xFFu) | (((h0 >>  3) & 7u) << 8));
+                const uint g02 = IQ1S_GRID(( qv2       & 0xFFu) | (((h0 >>  6) & 7u) << 8));
+                const uint g03 = IQ1S_GRID(( qv3       & 0xFFu) | (((h0 >>  9) & 7u) << 8));
+                const uint g10 = IQ1S_GRID(((qv0 >> 8) & 0xFFu) | (((h1      ) & 7u) << 8));
+                const uint g11 = IQ1S_GRID(((qv1 >> 8) & 0xFFu) | (((h1 >>  3) & 7u) << 8));
+                const uint g12 = IQ1S_GRID(((qv2 >> 8) & 0xFFu) | (((h1 >>  6) & 7u) << 8));
+                const uint g13 = IQ1S_GRID(((qv3 >> 8) & 0xFFu) | (((h1 >>  9) & 7u) << 8));
+
+                {
+                    const float4 y00 = IQ1S_YV(grp + 0u), y01 = IQ1S_YV(grp + 1u);
+                    const float4 y10 = IQ1S_YV(grp + 2u), y11 = IQ1S_YV(grp + 3u);
+                    const float4 y20 = IQ1S_YV(grp + 4u), y21 = IQ1S_YV(grp + 5u);
+                    const float4 y30 = IQ1S_YV(grp + 6u), y31 = IQ1S_YV(grp + 7u);
+                    as = ((y00 + y01) + (y10 + y11)) + ((y20 + y21) + (y30 + y31));
+                    a0 = (dot(y00, IQ1S_GVEC(g00)) + dot(y01, IQ1S_GVEC_HI(g00)))
+                       + (dot(y10, IQ1S_GVEC(g01)) + dot(y11, IQ1S_GVEC_HI(g01)))
+                       + (dot(y20, IQ1S_GVEC(g02)) + dot(y21, IQ1S_GVEC_HI(g02)))
+                       + (dot(y30, IQ1S_GVEC(g03)) + dot(y31, IQ1S_GVEC_HI(g03)));
+                    a1 = (dot(y00, IQ1S_GVEC(g10)) + dot(y01, IQ1S_GVEC_HI(g10)))
+                       + (dot(y10, IQ1S_GVEC(g11)) + dot(y11, IQ1S_GVEC_HI(g11)))
+                       + (dot(y20, IQ1S_GVEC(g12)) + dot(y21, IQ1S_GVEC_HI(g12)))
+                       + (dot(y30, IQ1S_GVEC(g13)) + dot(y31, IQ1S_GVEC_HI(g13)));
+                }
+#else
                 for (uint l = 0; l < 4u; ++l) {
                     const uint qsv = (uint)qsu[gb + l * mh];       // row pair, one load
                     const uint g0  = IQ1S_GRID(( qsv       & 0xFFu) | ((((h0 >> (3u*l)) & 7u) << 8)));
@@ -663,6 +759,7 @@ kernel void kernel_mul_mv_iq1_s_f32_flat(
 #endif
                     a1 += dot(y0, IQ1S_GVEC(g1)) + dot(y1, IQ1S_GVEC_HI(g1));
                 }
+#endif
                 // one activation sum, both rows
                 const float asum = as.s0 + as.s1 + as.s2 + as.s3;
                 acc0 += s0 * (a0 + t0 * asum);
@@ -1027,6 +1124,78 @@ kernel void kernel_mul_mv_iq1_s_f32_flat_glu(
 
                 float ga0 = 0.f, ga1 = 0.f, ua0 = 0.f, ua1 = 0.f;
                 float4 as = (float4)(0.f);
+#if IQ1S_MV_PF >= 2
+                // ⛔ MEASURED NEGATIVE, which is why it takes PF=2 rather than
+                // riding along with PF=1. 3B UD-IQ1_S tg64 in the shipped
+                // configuration: 50.74 -> 49.05, -3.3%, where the same hoist in
+                // the plain and split-K kernels is +4.0%.
+                //
+                // 🔑 This kernel has the least register headroom of the three --
+                // two weight streams x two rows of accumulators -- and it already
+                // has the instruction-level parallelism the hoist buys, because
+                // the gate and up chains are independent of each other. So it
+                // pays the registers and gets nothing back. Same budget the
+                // 4-row fold exhausted; see IQ1S_MV_R.
+                //
+                // Lighter hoist than the other two kernels: the eight qs bytes
+                // only, so all four gathers of an l are issuable the moment the
+                // loop body starts, but sixteen grid entries never have to be
+                // live at once. This kernel already carries two independent
+                // weight streams, so it has ILP the plain one does not, and it
+                // has the least register headroom of the three.
+                const uint gq0 = (uint)gqsu[gb + 0u * mh], uq0 = (uint)uqsu[gb + 0u * mh];
+                const uint gq1 = (uint)gqsu[gb + 1u * mh], uq1 = (uint)uqsu[gb + 1u * mh];
+                const uint gq2 = (uint)gqsu[gb + 2u * mh], uq2 = (uint)uqsu[gb + 2u * mh];
+                const uint gq3 = (uint)gqsu[gb + 3u * mh], uq3 = (uint)uqsu[gb + 3u * mh];
+                {
+                    const float4 y0 = IQ1S_YV(grp + 0u), y1 = IQ1S_YV(grp + 1u);
+                    as += y0 + y1;
+                    const uint gg0 = IQ1S_GGRID(( gq0       & 0xFFu) | (((gh0 >>  0) & 7u) << 8));
+                    const uint gg1 = IQ1S_GGRID(((gq0 >> 8) & 0xFFu) | (((gh1 >>  0) & 7u) << 8));
+                    const uint ug0 = IQ1S_GGRID(( uq0       & 0xFFu) | (((uh0 >>  0) & 7u) << 8));
+                    const uint ug1 = IQ1S_GGRID(((uq0 >> 8) & 0xFFu) | (((uh1 >>  0) & 7u) << 8));
+                    ga0 += dot(y0, IQ1S_GVEC(gg0)) + dot(y1, IQ1S_GVEC_HI(gg0));
+                    ga1 += dot(y0, IQ1S_GVEC(gg1)) + dot(y1, IQ1S_GVEC_HI(gg1));
+                    ua0 += dot(y0, IQ1S_GVEC(ug0)) + dot(y1, IQ1S_GVEC_HI(ug0));
+                    ua1 += dot(y0, IQ1S_GVEC(ug1)) + dot(y1, IQ1S_GVEC_HI(ug1));
+                }
+                {
+                    const float4 y0 = IQ1S_YV(grp + 2u), y1 = IQ1S_YV(grp + 3u);
+                    as += y0 + y1;
+                    const uint gg0 = IQ1S_GGRID(( gq1       & 0xFFu) | (((gh0 >>  3) & 7u) << 8));
+                    const uint gg1 = IQ1S_GGRID(((gq1 >> 8) & 0xFFu) | (((gh1 >>  3) & 7u) << 8));
+                    const uint ug0 = IQ1S_GGRID(( uq1       & 0xFFu) | (((uh0 >>  3) & 7u) << 8));
+                    const uint ug1 = IQ1S_GGRID(((uq1 >> 8) & 0xFFu) | (((uh1 >>  3) & 7u) << 8));
+                    ga0 += dot(y0, IQ1S_GVEC(gg0)) + dot(y1, IQ1S_GVEC_HI(gg0));
+                    ga1 += dot(y0, IQ1S_GVEC(gg1)) + dot(y1, IQ1S_GVEC_HI(gg1));
+                    ua0 += dot(y0, IQ1S_GVEC(ug0)) + dot(y1, IQ1S_GVEC_HI(ug0));
+                    ua1 += dot(y0, IQ1S_GVEC(ug1)) + dot(y1, IQ1S_GVEC_HI(ug1));
+                }
+                {
+                    const float4 y0 = IQ1S_YV(grp + 4u), y1 = IQ1S_YV(grp + 5u);
+                    as += y0 + y1;
+                    const uint gg0 = IQ1S_GGRID(( gq2       & 0xFFu) | (((gh0 >>  6) & 7u) << 8));
+                    const uint gg1 = IQ1S_GGRID(((gq2 >> 8) & 0xFFu) | (((gh1 >>  6) & 7u) << 8));
+                    const uint ug0 = IQ1S_GGRID(( uq2       & 0xFFu) | (((uh0 >>  6) & 7u) << 8));
+                    const uint ug1 = IQ1S_GGRID(((uq2 >> 8) & 0xFFu) | (((uh1 >>  6) & 7u) << 8));
+                    ga0 += dot(y0, IQ1S_GVEC(gg0)) + dot(y1, IQ1S_GVEC_HI(gg0));
+                    ga1 += dot(y0, IQ1S_GVEC(gg1)) + dot(y1, IQ1S_GVEC_HI(gg1));
+                    ua0 += dot(y0, IQ1S_GVEC(ug0)) + dot(y1, IQ1S_GVEC_HI(ug0));
+                    ua1 += dot(y0, IQ1S_GVEC(ug1)) + dot(y1, IQ1S_GVEC_HI(ug1));
+                }
+                {
+                    const float4 y0 = IQ1S_YV(grp + 6u), y1 = IQ1S_YV(grp + 7u);
+                    as += y0 + y1;
+                    const uint gg0 = IQ1S_GGRID(( gq3       & 0xFFu) | (((gh0 >>  9) & 7u) << 8));
+                    const uint gg1 = IQ1S_GGRID(((gq3 >> 8) & 0xFFu) | (((gh1 >>  9) & 7u) << 8));
+                    const uint ug0 = IQ1S_GGRID(( uq3       & 0xFFu) | (((uh0 >>  9) & 7u) << 8));
+                    const uint ug1 = IQ1S_GGRID(((uq3 >> 8) & 0xFFu) | (((uh1 >>  9) & 7u) << 8));
+                    ga0 += dot(y0, IQ1S_GVEC(gg0)) + dot(y1, IQ1S_GVEC_HI(gg0));
+                    ga1 += dot(y0, IQ1S_GVEC(gg1)) + dot(y1, IQ1S_GVEC_HI(gg1));
+                    ua0 += dot(y0, IQ1S_GVEC(ug0)) + dot(y1, IQ1S_GVEC_HI(ug0));
+                    ua1 += dot(y0, IQ1S_GVEC(ug1)) + dot(y1, IQ1S_GVEC_HI(ug1));
+                }
+#else
                 for (uint l = 0; l < 4u; ++l) {
                     // activation read ONCE, and its running sum accumulated ONCE,
                     // for both weight streams and both rows
@@ -1046,6 +1215,7 @@ kernel void kernel_mul_mv_iq1_s_f32_flat_glu(
                     ua0 += dot(y0, IQ1S_GVEC(ug0)) + dot(y1, IQ1S_GVEC_HI(ug0));
                     ua1 += dot(y0, IQ1S_GVEC(ug1)) + dot(y1, IQ1S_GVEC_HI(ug1));
                 }
+#endif
                 const float asum = as.s0 + as.s1 + as.s2 + as.s3;
                 gacc0 += gsc0 * (ga0 + gt0 * asum);
                 gacc1 += gsc1 * (ga1 + gt1 * asum);
@@ -1271,6 +1441,38 @@ kernel void kernel_mul_mv_iq1_s_f32_flat_splitk(
 
                 float a0 = 0.f, a1 = 0.f;
                 float4 as = (float4)(0.f);
+#if IQ1S_MV_PF
+                // Same hoist as the plain kernel; see IQ1S_MV_PF.
+                const uint qv0 = (uint)qsu[gb + 0u * mh];
+                const uint qv1 = (uint)qsu[gb + 1u * mh];
+                const uint qv2 = (uint)qsu[gb + 2u * mh];
+                const uint qv3 = (uint)qsu[gb + 3u * mh];
+
+                const uint g00 = IQ1S_SKGRID(( qv0       & 0xFFu) | (((h0      ) & 7u) << 8));
+                const uint g01 = IQ1S_SKGRID(( qv1       & 0xFFu) | (((h0 >>  3) & 7u) << 8));
+                const uint g02 = IQ1S_SKGRID(( qv2       & 0xFFu) | (((h0 >>  6) & 7u) << 8));
+                const uint g03 = IQ1S_SKGRID(( qv3       & 0xFFu) | (((h0 >>  9) & 7u) << 8));
+                const uint g10 = IQ1S_SKGRID(((qv0 >> 8) & 0xFFu) | (((h1      ) & 7u) << 8));
+                const uint g11 = IQ1S_SKGRID(((qv1 >> 8) & 0xFFu) | (((h1 >>  3) & 7u) << 8));
+                const uint g12 = IQ1S_SKGRID(((qv2 >> 8) & 0xFFu) | (((h1 >>  6) & 7u) << 8));
+                const uint g13 = IQ1S_SKGRID(((qv3 >> 8) & 0xFFu) | (((h1 >>  9) & 7u) << 8));
+
+                {
+                    const float4 y00 = IQ1S_YV(grp + 0u), y01 = IQ1S_YV(grp + 1u);
+                    const float4 y10 = IQ1S_YV(grp + 2u), y11 = IQ1S_YV(grp + 3u);
+                    const float4 y20 = IQ1S_YV(grp + 4u), y21 = IQ1S_YV(grp + 5u);
+                    const float4 y30 = IQ1S_YV(grp + 6u), y31 = IQ1S_YV(grp + 7u);
+                    as = ((y00 + y01) + (y10 + y11)) + ((y20 + y21) + (y30 + y31));
+                    a0 = (dot(y00, IQ1S_GVEC(g00)) + dot(y01, IQ1S_GVEC_HI(g00)))
+                       + (dot(y10, IQ1S_GVEC(g01)) + dot(y11, IQ1S_GVEC_HI(g01)))
+                       + (dot(y20, IQ1S_GVEC(g02)) + dot(y21, IQ1S_GVEC_HI(g02)))
+                       + (dot(y30, IQ1S_GVEC(g03)) + dot(y31, IQ1S_GVEC_HI(g03)));
+                    a1 = (dot(y00, IQ1S_GVEC(g10)) + dot(y01, IQ1S_GVEC_HI(g10)))
+                       + (dot(y10, IQ1S_GVEC(g11)) + dot(y11, IQ1S_GVEC_HI(g11)))
+                       + (dot(y20, IQ1S_GVEC(g12)) + dot(y21, IQ1S_GVEC_HI(g12)))
+                       + (dot(y30, IQ1S_GVEC(g13)) + dot(y31, IQ1S_GVEC_HI(g13)));
+                }
+#else
                 for (uint l = 0; l < 4u; ++l) {
                     const uint qsv = (uint)qsu[gb + l * mh];       // row pair, one load
                     const uint g0  = IQ1S_SKGRID(( qsv       & 0xFFu) | ((((h0 >> (3u*l)) & 7u) << 8)));
@@ -1282,6 +1484,7 @@ kernel void kernel_mul_mv_iq1_s_f32_flat_splitk(
                     a0 += dot(y0, IQ1S_GVEC(g0)) + dot(y1, IQ1S_GVEC_HI(g0));
                     a1 += dot(y0, IQ1S_GVEC(g1)) + dot(y1, IQ1S_GVEC_HI(g1));
                 }
+#endif
                 // one activation sum, both rows
                 const float asum = as.s0 + as.s1 + as.s2 + as.s3;
                 acc0 += s0 * (a0 + t0 * asum);
