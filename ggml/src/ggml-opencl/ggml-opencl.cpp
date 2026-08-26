@@ -3052,7 +3052,7 @@ static int ggml_cl_iq2s_gemm_ldsgrid() {
 // Hoist a half sub-block's weight loads ahead of the dots; see the kernel header.
 static int ggml_cl_q2k_mv_pf() {
     static const int v = ggml_cl_env_int("GGML_OPENCL_Q2K_PF", 0);
-    return v ? 1 : 0;
+    return (v >= 0 && v <= 2) ? v : 0;
 }
 
 static int ggml_cl_q2k_mv_abl() {

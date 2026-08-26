@@ -87,17 +87,32 @@
 // the kernel only still launches because NSG=4 asks for 256 work items, and any
 // future widening would be refused outright.
 //
-// 🔑 The pair is the interesting part. The LIGHTER variant is WORSE. It holds
-// fewer registers and still loses 6.8%, and the only other thing it changed was
-// consuming the four activations one at a time with `a0 += ...` four times in
-// series instead of a balanced `(d+d)+(d+d)` tree. So what the heavy version
-// bought was breaking the ACCUMULATOR dependency chain, not hoisting the loads.
+// 🔑 THE ISOLATING EXPERIMENT WAS RUN, AND IT REFUTED THE OBVIOUS READING.
 //
-// ⇒ the untried variant is the tree WITHOUT the hoist: keep the loads
-// interleaved exactly as the baseline has them and only rewrite the four
-// accumulations as a balanced tree. That costs no registers at all. Neither
-// variant here isolates it, and the plane_bw ceiling (93% of roofline for this
-// access pattern) says there is roughly 2x still on the table.
+// From the first two variants it looked as though the heavy one won by breaking
+// the accumulator dependency chain rather than by hoisting loads. PF=2 tests
+// exactly that -- balanced summation, loads left where the baseline has them:
+//
+//   variant                                    priv/WI  wg_cap    tg64
+//   PF=0  baseline, serial accumulate              304     768   44.68
+//   PF=1  hoist + balanced tree                    560     384   45.41  +1.6%
+//   PF=2  balanced tree, NO hoist                  448     512   41.23  -7.7%
+//   (earlier) hoist, serial accumulate             448     512   41.75  -6.8%
+//
+// PF=2 and the earlier light variant changed OPPOSITE things -- one the
+// summation, one the load order -- and landed on the SAME footprint (448) and
+// the SAME loss (~-7%). So neither the summation shape nor the load order is
+// the variable. **The variable is the register footprint.** 304 -> 448 crosses a
+// cliff and costs more occupancy than either restructuring returns; PF=1 goes
+// further to 560 and only nets +1.6% because its extra parallelism just about
+// pays back the spill.
+//
+// ⇒ this kernel is REGISTER-CLIFF BOUND at the shape it runs. Adding live state
+// loses regardless of what the state is for. The route to the plane_bw ceiling
+// (93% of roofline for this access pattern) is to REDUCE the footprint below 304
+// so more waves are resident, or to change the decomposition -- not to add ILP.
+// Note R=2 halves the rows per lane and also loses badly (-18%), so simply
+// shrinking the fold is not the answer either.
 #ifndef Q2K_MV_PF
 #define Q2K_MV_PF 0
 #endif
@@ -172,7 +187,33 @@ kernel void kernel_mul_mv_q2_k_f32_flat(
 
                     float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
                     float4 as = (float4)(0.f);
-#if Q2K_MV_PF
+#if Q2K_MV_PF == 2
+                    // Break the ACCUMULATOR chain, hold nothing extra from memory.
+                    //
+                    // The baseline runs a0 += dot(...) four times in series, so each
+                    // accumulator is a four-deep chain of dependent float adds, and
+                    // the same for a1..a3. Two partials per accumulator halve that
+                    // to two, and the loads stay exactly where the baseline has
+                    // them -- one activation live at a time, no hoist.
+                    //
+                    // This is the variant the other two could not isolate: the
+                    // heavy hoist changed BOTH the load order and the summation
+                    // shape and gained 1.7%; the light one changed only the load
+                    // order and lost 6.8%, which pointed at the summation. Costs
+                    // eight floats, against sixteen for holding four activations.
+                    float a0a = 0.f, a0b = 0.f, a1a = 0.f, a1b = 0.f;
+                    float a2a = 0.f, a2b = 0.f, a3a = 0.f, a3b = 0.f;
+                    #define Q2K_ACC(U, P)                                                                        {                                                                                                const uint   w  = qsu[qsb + (4u*h + (U)) * mr];                                              const float4 yv = Q2K_YV(grp + 4u*h + (U));                                                  as += yv;                                                                                    a0##P += dot(yv, q2k_vals( w        & 0xFFu));                                               a1##P += dot(yv, q2k_vals((w >>  8) & 0xFFu));                                               a2##P += dot(yv, q2k_vals((w >> 16) & 0xFFu));                                               a3##P += dot(yv, q2k_vals((w >> 24) & 0xFFu));                                           }
+                    Q2K_ACC(0u, a)
+                    Q2K_ACC(1u, b)
+                    Q2K_ACC(2u, a)
+                    Q2K_ACC(3u, b)
+                    #undef Q2K_ACC
+                    a0 = a0a + a0b;
+                    a1 = a1a + a1b;
+                    a2 = a2a + a2b;
+                    a3 = a3a + a3b;
+#elif Q2K_MV_PF == 1
                     // Issue this half's four weight words BEFORE consuming any of
                     // them, instead of load -> unpack -> dot four times in series.
                     // Hand unrolled so a compiler that declines to unroll cannot
@@ -448,7 +489,33 @@ kernel void kernel_mul_mv_q2_k_f32_flat_splitk(
 
                     float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
                     float4 as = (float4)(0.f);
-#if Q2K_MV_PF
+#if Q2K_MV_PF == 2
+                    // Break the ACCUMULATOR chain, hold nothing extra from memory.
+                    //
+                    // The baseline runs a0 += dot(...) four times in series, so each
+                    // accumulator is a four-deep chain of dependent float adds, and
+                    // the same for a1..a3. Two partials per accumulator halve that
+                    // to two, and the loads stay exactly where the baseline has
+                    // them -- one activation live at a time, no hoist.
+                    //
+                    // This is the variant the other two could not isolate: the
+                    // heavy hoist changed BOTH the load order and the summation
+                    // shape and gained 1.7%; the light one changed only the load
+                    // order and lost 6.8%, which pointed at the summation. Costs
+                    // eight floats, against sixteen for holding four activations.
+                    float a0a = 0.f, a0b = 0.f, a1a = 0.f, a1b = 0.f;
+                    float a2a = 0.f, a2b = 0.f, a3a = 0.f, a3b = 0.f;
+                    #define Q2K_ACC(U, P)                                                                        {                                                                                                const uint   w  = qsu[qsb + (4u*h + (U)) * mr];                                              const float4 yv = Q2K_YV(grp + 4u*h + (U));                                                  as += yv;                                                                                    a0##P += dot(yv, q2k_vals( w        & 0xFFu));                                               a1##P += dot(yv, q2k_vals((w >>  8) & 0xFFu));                                               a2##P += dot(yv, q2k_vals((w >> 16) & 0xFFu));                                               a3##P += dot(yv, q2k_vals((w >> 24) & 0xFFu));                                           }
+                    Q2K_ACC(0u, a)
+                    Q2K_ACC(1u, b)
+                    Q2K_ACC(2u, a)
+                    Q2K_ACC(3u, b)
+                    #undef Q2K_ACC
+                    a0 = a0a + a0b;
+                    a1 = a1a + a1b;
+                    a2 = a2a + a2b;
+                    a3 = a3a + a3b;
+#elif Q2K_MV_PF == 1
                     // Issue this half's four weight words BEFORE consuming any of
                     // them, instead of load -> unpack -> dot four times in series.
                     // Hand unrolled so a compiler that declines to unroll cannot
