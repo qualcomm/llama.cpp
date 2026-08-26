@@ -23,8 +23,41 @@
 #define IQ1S_MV_NSG 8
 #endif
 
-#ifndef IQ1S_MV_R2
-#define IQ1S_MV_R2 1
+// Rows per work item: 1, 2 or 4. Each is hand-written -- an unrolled generic
+// r-loop was measured on IQ3_S and cost 8% by itself.
+//
+// Why 4 is worth trying: the activation read and its running sum are BOTH
+// row-independent, so widening the fold halves the activation traffic per
+// weight. That load is this kernel's largest priced term -- routing it through
+// a texture was +21.6% here -- and every other backend already folds wider than
+// two (Metal N_R0_IQ1_S=4, Vulkan rm_iq=4..8, CUDA 1..8 by arch). Q2_K's own
+// 2 -> 4 step on this part was +22%.
+//
+// ⛔ MEASURED AND REFUTED FOR THIS TYPE. Llama-3.2-3B-UD-IQ1_S tg64, X2-90,
+// both arms repeated, NSG re-swept because widening the fold invalidates that
+// boundary:
+//
+//     R \ NSG        2        4        8
+//        2       47.83   *50.60*   47.29        * = shipped default
+//        4       48.89    49.26    REFUSED
+//
+// R=4 is -2.7% at its own best NSG, and the NSG optimum did NOT move. At NSG=8
+// the driver refuses the enqueue with CL_INVALID_WORK_GROUP_SIZE (-54): a
+// 512-work-item group of the 4-row kernel does not fit, which is the register
+// pressure showing up as a hard refusal rather than a slowdown. The host caps
+// NSG at 4 when R=4 for that reason.
+//
+// 🔑 WHY IT INVERTS vs its siblings, where 2 -> 4 was +22% (Q2_K), +43.8% (q4_K,
+// q6_K cok) and 1.66x (q4_0): those kernels were ISSUE-bound with spare
+// registers, so folding rows bought free reuse. This one is already at the
+// register ceiling at R=2/NSG=4 -- it does the most work per weight in the
+// family, which is the same fact that makes NSG=4 beat 8 here and nowhere else.
+// A wider fold has to BUY more than the occupancy it spends, and here it cannot.
+//
+// Kept behind the knob, default 2, so the boundary is recorded rather than
+// re-derived. GGML_OPENCL_IQ1S_MV_R forces either way.
+#ifndef IQ1S_MV_R
+#define IQ1S_MV_R 2
 #endif
 
 #ifndef IQ1S_MV_LDSGRID
@@ -403,7 +436,72 @@ kernel void kernel_mul_mv_iq1_s_f32_flat(
 #define IQ1S_GRID(i) iq1s_grid_gpu[(i)]
 #endif
 
-#if IQ1S_MV_R2
+#if IQ1S_MV_R == 4
+    const uint mq  = m >> 2;
+    const uint j   = get_group_id(0) * 64u + lid;
+    const uint row = j << 2;
+
+    float sumf = 0.f, sumf1 = 0.f, sumf2 = 0.f, sumf3 = 0.f;
+
+    if (j < mq) {
+        global const uint * qsu = (global const uint *)src0_qs;
+
+        for (uint ib = sgi; ib < nsb; ib += IQ1S_MV_NSG) {
+            const half4 dh = vload4(j + ib * mq, src0_d);
+
+            float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f, acc3 = 0.f;
+            for (uint sb = 0; sb < 8u; ++sb) {
+                const uint  sub = ib * 8u + sb;
+                const ushort4 qhv = vload4(j + sub * mq, src0_qh); // four rows, one load
+                const uint  h0 = (uint)qhv.s0, h1 = (uint)qhv.s1;
+                const uint  h2 = (uint)qhv.s2, h3 = (uint)qhv.s3;
+
+                const float s0 = (float)(2u * ((h0 >> 12) & 7u) + 1u);
+                const float s1 = (float)(2u * ((h1 >> 12) & 7u) + 1u);
+                const float s2 = (float)(2u * ((h2 >> 12) & 7u) + 1u);
+                const float s3 = (float)(2u * ((h3 >> 12) & 7u) + 1u);
+                const float t0 = ((h0 & 0x8000u) ? -0.125f : 0.125f) - 1.0f;
+                const float t1 = ((h1 & 0x8000u) ? -0.125f : 0.125f) - 1.0f;
+                const float t2 = ((h2 & 0x8000u) ? -0.125f : 0.125f) - 1.0f;
+                const float t3 = ((h3 & 0x8000u) ? -0.125f : 0.125f) - 1.0f;
+
+                const uint gb  = j + (sub * 4u) * mq;
+                const uint grp = sub * 8u;
+
+                float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+                float4 as = (float4)(0.f);
+                for (uint l = 0; l < 4u; ++l) {
+                    const uint qsv = qsu[gb + l * mq];             // four rows, one load
+                    const uint g0  = IQ1S_GRID(( qsv        & 0xFFu) | (((h0 >> (3u*l)) & 7u) << 8));
+                    const uint g1  = IQ1S_GRID(((qsv >>  8) & 0xFFu) | (((h1 >> (3u*l)) & 7u) << 8));
+                    const uint g2  = IQ1S_GRID(((qsv >> 16) & 0xFFu) | (((h2 >> (3u*l)) & 7u) << 8));
+                    const uint g3  = IQ1S_GRID(( qsv >> 24)          | (((h3 >> (3u*l)) & 7u) << 8));
+
+                    const float4 y0 = IQ1S_YV(grp + 2u*l + 0u);
+                    const float4 y1 = IQ1S_YV(grp + 2u*l + 1u);
+                    as += y0 + y1;
+                    a0 += dot(y0, iq1s_vals(g0)) + dot(y1, iq1s_vals(g0 >> 4));
+#if MV_WORK2
+                    a0 += dot(y0, iq1s_vals(g0 + 1u)) + dot(y1, iq1s_vals((g0 >> 4) + 1u));
+#endif
+                    a1 += dot(y0, iq1s_vals(g1)) + dot(y1, iq1s_vals(g1 >> 4));
+                    a2 += dot(y0, iq1s_vals(g2)) + dot(y1, iq1s_vals(g2 >> 4));
+                    a3 += dot(y0, iq1s_vals(g3)) + dot(y1, iq1s_vals(g3 >> 4));
+                }
+                // one activation sum, four rows -- this is the whole point
+                const float asum = as.s0 + as.s1 + as.s2 + as.s3;
+                acc0 += s0 * (a0 + t0 * asum);
+                acc1 += s1 * (a1 + t1 * asum);
+                acc2 += s2 * (a2 + t2 * asum);
+                acc3 += s3 * (a3 + t3 * asum);
+            }
+            sumf  += (float)dh.s0 * acc0;
+            sumf1 += (float)dh.s1 * acc1;
+            sumf2 += (float)dh.s2 * acc2;
+            sumf3 += (float)dh.s3 * acc3;
+        }
+    }
+#elif IQ1S_MV_R == 2
     const uint mh  = m >> 1;
     const uint j   = get_group_id(0) * 64u + lid;
     const uint row = j << 1;
@@ -496,7 +594,21 @@ kernel void kernel_mul_mv_iq1_s_f32_flat(
 #endif
 
 #if IQ1S_MV_NSG > 1
-#if IQ1S_MV_R2
+#if IQ1S_MV_R == 4
+    __local float4 part[IQ1S_MV_NSG][64];
+    part[sgi][lid] = (float4)(sumf, sumf1, sumf2, sumf3);
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (sgi != 0) {
+        return;
+    }
+    for (uint s = 1; s < IQ1S_MV_NSG; ++s) {
+        const float4 p = part[s][lid];
+        sumf  += p.s0;
+        sumf1 += p.s1;
+        sumf2 += p.s2;
+        sumf3 += p.s3;
+    }
+#elif IQ1S_MV_R == 2
     __local float2 part[IQ1S_MV_NSG][64];
     part[sgi][lid] = (float2)(sumf, sumf1);
     barrier(CLK_LOCAL_MEM_FENCE);
@@ -521,7 +633,11 @@ kernel void kernel_mul_mv_iq1_s_f32_flat(
 #endif
 #endif
 
-#if IQ1S_MV_R2
+#if IQ1S_MV_R == 4
+    if (j < mq) {
+        vstore4((float4)(sumf, sumf1, sumf2, sumf3), 0, dst + (ulong)col * (uint)ne0 + row);
+    }
+#elif IQ1S_MV_R == 2
     if (j < mh) {
         vstore2((float2)(sumf, sumf1), 0, dst + (ulong)col * (uint)ne0 + row);
     }
@@ -626,6 +742,132 @@ kernel void kernel_mul_mv_iq1_s_f32_flat_glu(
 #define IQ1S_GGRID(i) iq1s_grid_gpu[(i)]
 #endif
 
+#if IQ1S_MV_R == 4
+    const uint mq  = m >> 2;
+    const uint j   = get_group_id(0) * 64u + lid;
+    const uint row = j << 2;
+
+    float gs0 = 0.f, gs1 = 0.f, gs2 = 0.f, gs3 = 0.f;
+    float us0 = 0.f, us1 = 0.f, us2 = 0.f, us3 = 0.f;
+
+    if (j < mq) {
+        global const uint * gqsu = (global const uint *)g_qs;
+        global const uint * uqsu = (global const uint *)u_qs;
+
+        for (uint ib = sgi; ib < nsb; ib += IQ1S_MV_NSG) {
+            const half4 gdh = vload4(j + ib * mq, g_d);
+            const half4 udh = vload4(j + ib * mq, u_d);
+
+            float gacc0 = 0.f, gacc1 = 0.f, gacc2 = 0.f, gacc3 = 0.f;
+            float uacc0 = 0.f, uacc1 = 0.f, uacc2 = 0.f, uacc3 = 0.f;
+            for (uint sb = 0; sb < 8u; ++sb) {
+                const uint sub = ib * 8u + sb;
+
+                const ushort4 gqhv = vload4(j + sub * mq, g_qh);
+                const ushort4 uqhv = vload4(j + sub * mq, u_qh);
+                const uint gh0 = (uint)gqhv.s0, gh1 = (uint)gqhv.s1;
+                const uint gh2 = (uint)gqhv.s2, gh3 = (uint)gqhv.s3;
+                const uint uh0 = (uint)uqhv.s0, uh1 = (uint)uqhv.s1;
+                const uint uh2 = (uint)uqhv.s2, uh3 = (uint)uqhv.s3;
+
+                const float gsc0 = (float)(2u * ((gh0 >> 12) & 7u) + 1u);
+                const float gsc1 = (float)(2u * ((gh1 >> 12) & 7u) + 1u);
+                const float gsc2 = (float)(2u * ((gh2 >> 12) & 7u) + 1u);
+                const float gsc3 = (float)(2u * ((gh3 >> 12) & 7u) + 1u);
+                const float usc0 = (float)(2u * ((uh0 >> 12) & 7u) + 1u);
+                const float usc1 = (float)(2u * ((uh1 >> 12) & 7u) + 1u);
+                const float usc2 = (float)(2u * ((uh2 >> 12) & 7u) + 1u);
+                const float usc3 = (float)(2u * ((uh3 >> 12) & 7u) + 1u);
+                const float gt0 = ((gh0 & 0x8000u) ? -0.125f : 0.125f) - 1.0f;
+                const float gt1 = ((gh1 & 0x8000u) ? -0.125f : 0.125f) - 1.0f;
+                const float gt2 = ((gh2 & 0x8000u) ? -0.125f : 0.125f) - 1.0f;
+                const float gt3 = ((gh3 & 0x8000u) ? -0.125f : 0.125f) - 1.0f;
+                const float ut0 = ((uh0 & 0x8000u) ? -0.125f : 0.125f) - 1.0f;
+                const float ut1 = ((uh1 & 0x8000u) ? -0.125f : 0.125f) - 1.0f;
+                const float ut2 = ((uh2 & 0x8000u) ? -0.125f : 0.125f) - 1.0f;
+                const float ut3 = ((uh3 & 0x8000u) ? -0.125f : 0.125f) - 1.0f;
+
+                const uint gb  = j + (sub * 4u) * mq;
+                const uint grp = sub * 8u;
+
+                float ga0 = 0.f, ga1 = 0.f, ga2 = 0.f, ga3 = 0.f;
+                float ua0 = 0.f, ua1 = 0.f, ua2 = 0.f, ua3 = 0.f;
+                float4 as = (float4)(0.f);
+                for (uint l = 0; l < 4u; ++l) {
+                    // activation read ONCE, and its running sum accumulated ONCE,
+                    // for both weight streams and all four rows
+                    const float4 y0 = IQ1S_YV(grp + 2u*l + 0u);
+                    const float4 y1 = IQ1S_YV(grp + 2u*l + 1u);
+                    as += y0 + y1;
+
+                    const uint gqsv = gqsu[gb + l * mq];
+                    const uint gg0  = IQ1S_GGRID(( gqsv        & 0xFFu) | (((gh0 >> (3u*l)) & 7u) << 8));
+                    const uint gg1  = IQ1S_GGRID(((gqsv >>  8) & 0xFFu) | (((gh1 >> (3u*l)) & 7u) << 8));
+                    const uint gg2  = IQ1S_GGRID(((gqsv >> 16) & 0xFFu) | (((gh2 >> (3u*l)) & 7u) << 8));
+                    const uint gg3  = IQ1S_GGRID(( gqsv >> 24)          | (((gh3 >> (3u*l)) & 7u) << 8));
+                    ga0 += dot(y0, iq1s_vals(gg0)) + dot(y1, iq1s_vals(gg0 >> 4));
+                    ga1 += dot(y0, iq1s_vals(gg1)) + dot(y1, iq1s_vals(gg1 >> 4));
+                    ga2 += dot(y0, iq1s_vals(gg2)) + dot(y1, iq1s_vals(gg2 >> 4));
+                    ga3 += dot(y0, iq1s_vals(gg3)) + dot(y1, iq1s_vals(gg3 >> 4));
+
+                    const uint uqsv = uqsu[gb + l * mq];
+                    const uint ug0  = IQ1S_GGRID(( uqsv        & 0xFFu) | (((uh0 >> (3u*l)) & 7u) << 8));
+                    const uint ug1  = IQ1S_GGRID(((uqsv >>  8) & 0xFFu) | (((uh1 >> (3u*l)) & 7u) << 8));
+                    const uint ug2  = IQ1S_GGRID(((uqsv >> 16) & 0xFFu) | (((uh2 >> (3u*l)) & 7u) << 8));
+                    const uint ug3  = IQ1S_GGRID(( uqsv >> 24)          | (((uh3 >> (3u*l)) & 7u) << 8));
+                    ua0 += dot(y0, iq1s_vals(ug0)) + dot(y1, iq1s_vals(ug0 >> 4));
+                    ua1 += dot(y0, iq1s_vals(ug1)) + dot(y1, iq1s_vals(ug1 >> 4));
+                    ua2 += dot(y0, iq1s_vals(ug2)) + dot(y1, iq1s_vals(ug2 >> 4));
+                    ua3 += dot(y0, iq1s_vals(ug3)) + dot(y1, iq1s_vals(ug3 >> 4));
+                }
+                const float asum = as.s0 + as.s1 + as.s2 + as.s3;
+                gacc0 += gsc0 * (ga0 + gt0 * asum);
+                gacc1 += gsc1 * (ga1 + gt1 * asum);
+                gacc2 += gsc2 * (ga2 + gt2 * asum);
+                gacc3 += gsc3 * (ga3 + gt3 * asum);
+                uacc0 += usc0 * (ua0 + ut0 * asum);
+                uacc1 += usc1 * (ua1 + ut1 * asum);
+                uacc2 += usc2 * (ua2 + ut2 * asum);
+                uacc3 += usc3 * (ua3 + ut3 * asum);
+            }
+            gs0 += (float)gdh.s0 * gacc0;
+            gs1 += (float)gdh.s1 * gacc1;
+            gs2 += (float)gdh.s2 * gacc2;
+            gs3 += (float)gdh.s3 * gacc3;
+            us0 += (float)udh.s0 * uacc0;
+            us1 += (float)udh.s1 * uacc1;
+            us2 += (float)udh.s2 * uacc2;
+            us3 += (float)udh.s3 * uacc3;
+        }
+    }
+
+#if IQ1S_MV_NSG > 1
+    // eight partials per lane: two float4 planes rather than one float8, so the
+    // LDS traffic stays in the widest store this part has
+    __local float4 gpart[IQ1S_MV_NSG][64];
+    __local float4 upart[IQ1S_MV_NSG][64];
+    gpart[sgi][lid] = (float4)(gs0, gs1, gs2, gs3);
+    upart[sgi][lid] = (float4)(us0, us1, us2, us3);
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (sgi != 0) {
+        return;
+    }
+    for (uint s = 1; s < IQ1S_MV_NSG; ++s) {
+        const float4 gp = gpart[s][lid];
+        const float4 up = upart[s][lid];
+        gs0 += gp.s0; gs1 += gp.s1; gs2 += gp.s2; gs3 += gp.s3;
+        us0 += up.s0; us1 += up.s1; us2 += up.s2; us3 += up.s3;
+    }
+#endif
+
+    if (j < mq) {
+        global float * o = dst + (ulong)col * (uint)ne0 + row;
+        o[0] = iq1s_glu_apply(glu_op, gs0, us0);
+        o[1] = iq1s_glu_apply(glu_op, gs1, us1);
+        o[2] = iq1s_glu_apply(glu_op, gs2, us2);
+        o[3] = iq1s_glu_apply(glu_op, gs3, us3);
+    }
+#else
     const uint mh  = m >> 1;
     const uint j   = get_group_id(0) * 64u + lid;
     const uint row = j << 1;
@@ -713,6 +955,7 @@ kernel void kernel_mul_mv_iq1_s_f32_flat_glu(
         o[0] = iq1s_glu_apply(glu_op, gs0, us0);
         o[1] = iq1s_glu_apply(glu_op, gs1, us1);
     }
+#endif
 #undef IQ1S_GGRID
 }
 
@@ -791,6 +1034,90 @@ kernel void kernel_mul_mv_iq1_s_f32_flat_splitk(
 #define IQ1S_SKGRID(i) iq1s_grid_gpu[(i)]
 #endif
 
+#if IQ1S_MV_R == 4
+    const uint mq  = m >> 2;
+    const uint j   = get_group_id(0) * 64u + lid;
+    const uint row = j << 2;
+
+    float sumf = 0.f, sumf1 = 0.f, sumf2 = 0.f, sumf3 = 0.f;
+
+    if (j < mq) {
+        global const uint * qsu = (global const uint *)src0_qs;
+
+        for (uint ib = ib0 + sgi; ib < ib1; ib += IQ1S_MV_NSG) {
+            const half4 dh = vload4(j + ib * mq, src0_d);
+
+            float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f, acc3 = 0.f;
+            for (uint sb = 0; sb < 8u; ++sb) {
+                const uint  sub = ib * 8u + sb;
+                const ushort4 qhv = vload4(j + sub * mq, src0_qh); // four rows, one load
+                const uint  h0 = (uint)qhv.s0, h1 = (uint)qhv.s1;
+                const uint  h2 = (uint)qhv.s2, h3 = (uint)qhv.s3;
+
+                const float s0 = (float)(2u * ((h0 >> 12) & 7u) + 1u);
+                const float s1 = (float)(2u * ((h1 >> 12) & 7u) + 1u);
+                const float s2 = (float)(2u * ((h2 >> 12) & 7u) + 1u);
+                const float s3 = (float)(2u * ((h3 >> 12) & 7u) + 1u);
+                const float t0 = ((h0 & 0x8000u) ? -0.125f : 0.125f) - 1.0f;
+                const float t1 = ((h1 & 0x8000u) ? -0.125f : 0.125f) - 1.0f;
+                const float t2 = ((h2 & 0x8000u) ? -0.125f : 0.125f) - 1.0f;
+                const float t3 = ((h3 & 0x8000u) ? -0.125f : 0.125f) - 1.0f;
+
+                const uint gb  = j + (sub * 4u) * mq;
+                const uint grp = sub * 8u;
+
+                float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+                float4 as = (float4)(0.f);
+                for (uint l = 0; l < 4u; ++l) {
+                    const uint qsv = qsu[gb + l * mq];             // four rows, one load
+                    const uint g0  = IQ1S_SKGRID(( qsv        & 0xFFu) | (((h0 >> (3u*l)) & 7u) << 8));
+                    const uint g1  = IQ1S_SKGRID(((qsv >>  8) & 0xFFu) | (((h1 >> (3u*l)) & 7u) << 8));
+                    const uint g2  = IQ1S_SKGRID(((qsv >> 16) & 0xFFu) | (((h2 >> (3u*l)) & 7u) << 8));
+                    const uint g3  = IQ1S_SKGRID(( qsv >> 24)          | (((h3 >> (3u*l)) & 7u) << 8));
+
+                    const float4 y0 = IQ1S_YV(grp + 2u*l + 0u);
+                    const float4 y1 = IQ1S_YV(grp + 2u*l + 1u);
+                    as += y0 + y1;
+                    a0 += dot(y0, iq1s_vals(g0)) + dot(y1, iq1s_vals(g0 >> 4));
+                    a1 += dot(y0, iq1s_vals(g1)) + dot(y1, iq1s_vals(g1 >> 4));
+                    a2 += dot(y0, iq1s_vals(g2)) + dot(y1, iq1s_vals(g2 >> 4));
+                    a3 += dot(y0, iq1s_vals(g3)) + dot(y1, iq1s_vals(g3 >> 4));
+                }
+                // one activation sum, four rows
+                const float asum = as.s0 + as.s1 + as.s2 + as.s3;
+                acc0 += s0 * (a0 + t0 * asum);
+                acc1 += s1 * (a1 + t1 * asum);
+                acc2 += s2 * (a2 + t2 * asum);
+                acc3 += s3 * (a3 + t3 * asum);
+            }
+            sumf  += (float)dh.s0 * acc0;
+            sumf1 += (float)dh.s1 * acc1;
+            sumf2 += (float)dh.s2 * acc2;
+            sumf3 += (float)dh.s3 * acc3;
+        }
+    }
+
+#if IQ1S_MV_NSG > 1
+    __local float4 skpart[IQ1S_MV_NSG][64];
+    skpart[sgi][lid] = (float4)(sumf, sumf1, sumf2, sumf3);
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (sgi != 0) {
+        return;
+    }
+    for (uint s = 1; s < IQ1S_MV_NSG; ++s) {
+        const float4 p = skpart[s][lid];
+        sumf  += p.s0;
+        sumf1 += p.s1;
+        sumf2 += p.s2;
+        sumf3 += p.s3;
+    }
+#endif
+
+    if (j < mq) {
+        // [ksplit][M], the layout kernel_gemv_splitk_reduce_f32 expects
+        vstore4((float4)(sumf, sumf1, sumf2, sumf3), 0, partial + (ulong)ks * m + row);
+    }
+#else
     const uint mh  = m >> 1;
     const uint j   = get_group_id(0) * 64u + lid;
     const uint row = j << 1;
@@ -860,5 +1187,6 @@ kernel void kernel_mul_mv_iq1_s_f32_flat_splitk(
         o[0] = sumf;
         o[1] = sumf1;
     }
+#endif
 #undef IQ1S_SKGRID
 }

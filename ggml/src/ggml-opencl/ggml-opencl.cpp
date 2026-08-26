@@ -2776,14 +2776,32 @@ static int ggml_cl_iq1m_gemm_ldsgrid() {
 //
 // The split-K boundary was re-checked at the new width and still pays
 // (+8.0% IQ1_M, +5.6% IQ1_S at NSG=4), and prefill is untouched: 1012.4 either way.
+static int ggml_cl_iq1s_mv_r();
+
 static int ggml_cl_iq1s_mv_nsg() {
     static const int v = ggml_cl_env_int("GGML_OPENCL_IQ1S_MV_NSG", 4);
+    // The 4-row kernels do not fit a 512-work-item group: the X2-90 driver
+    // refuses the enqueue outright with CL_INVALID_WORK_GROUP_SIZE rather than
+    // failing the build, so the cap has to be applied here or the first decode
+    // dispatch aborts. Measured, not defensive.
+    if (ggml_cl_iq1s_mv_r() == 4 && v > 4) {
+        return 4;
+    }
     return v;
 }
 
-static int ggml_cl_iq1s_mv_r2() {
-    static const int v = ggml_cl_env_int("GGML_OPENCL_IQ1S_MV_R2", 1);
-    return v;
+// Rows folded into one work item by the decode GEMVs: 1, 2 or 4. The activation
+// read and the per-block activation SUM are both row-independent, so a wider
+// fold divides that traffic by the fold. Every other backend already folds
+// wider than two (Metal N_R0_IQ1_S=4, Vulkan rm_iq=4..8, CUDA 1..8 by arch) and
+// Q2_K's own 2 -> 4 step on this part was +22%.
+//
+// 2 is still the default: IQ1_S has the largest per-lane footprint in the family
+// (it is why NSG=4 beats 8 here and nowhere else), so 4 has to be measured, not
+// argued. GGML_OPENCL_IQ1S_MV_R forces either way.
+static int ggml_cl_iq1s_mv_r() {
+    static const int v = ggml_cl_env_int("GGML_OPENCL_IQ1S_MV_R", 2);
+    return (v == 1 || v == 2 || v == 4) ? v : 2;
 }
 
 // iq1s_grid_gpu is 8 KB, the same size as iq2s_grid, so it gets the same LDS
@@ -4301,7 +4319,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         std::string opts = compile_opts;
         opts += " -DIQ1S_MV_NSG=" + std::to_string(ggml_cl_iq1s_mv_nsg());
-        opts += " -DIQ1S_MV_R2="  + std::to_string(ggml_cl_iq1s_mv_r2());
+        opts += " -DIQ1S_MV_R="   + std::to_string(ggml_cl_iq1s_mv_r());
         opts += " -DIQ1S_MV_LDSGRID=" + std::to_string(ggml_cl_iq1s_mv_ldsgrid());
         opts += " -DIQ1S_MV_GRIDIMG=" + std::to_string(ggml_cl_iq1s_mv_gridimg(backend_ctx));
         opts += " -DIQ1S_MV_AIMG=" + std::to_string(ggml_cl_iq1s_mv_aimg(backend_ctx));
@@ -4310,7 +4328,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             build_program_from_source(backend_ctx, kernel_src.c_str(), opts);
 
         CL_CHECK((backend_ctx->kernel_mul_mv_iq1_s_f32_flat = clCreateKernel(prog, "kernel_mul_mv_iq1_s_f32_flat", &err), err));
-        if (ggml_cl_iq1s_mv_r2()) {
+        // The fused-GLU and split-K twins carry a 4-row and a 2-row path only;
+        // at R=1 they are not built and the plain GEMV serves those shapes.
+        if (ggml_cl_iq1s_mv_r() >= 2) {
             backend_ctx->kernel_mul_mv_iq1_s_f32_flat_glu =
                 clCreateKernel(prog, "kernel_mul_mv_iq1_s_f32_flat_glu", &err);
             if (err != CL_SUCCESS) { backend_ctx->kernel_mul_mv_iq1_s_f32_flat_glu = nullptr; }
@@ -14897,8 +14917,11 @@ static bool ggml_cl_iq1s_is_split(const ggml_backend_opencl_context * backend_ct
     return t->type == GGML_TYPE_IQ1_S
         && ggml_cl_iq1s_soa_on(backend_ctx)
         && backend_ctx->kernel_convert_block_iq1_s_ns != nullptr
-        // the decode GEMV reads adjacent rows as one word; see the IQ3_S note
-        && t->ne[1] % 2 == 0
+        // the decode GEMV reads IQ1S_MV_R adjacent rows as one word, so a row
+        // count that is not a multiple of it is declined HERE rather than per
+        // dispatch: a tensor that gets split but that some path cannot read is
+        // silent garbage. See the IQ3_S note.
+        && t->ne[1] % ggml_cl_iq1s_mv_r() == 0
         && use_adreno_kernels(backend_ctx, t);
 }
 
@@ -24274,7 +24297,7 @@ static void ggml_cl_mul_mat_iq1_s_glu_fused(ggml_backend_t backend, ggml_tensor 
     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne0));
     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &glu_op));
 
-    size_t f_global[3] = { CEIL_DIV((size_t)ne01, (size_t)128) * 64,
+    size_t f_global[3] = { CEIL_DIV((size_t)ne01, 64u * (size_t)ggml_cl_iq1s_mv_r()) * 64,
                            (size_t)ne11 * (size_t)nsg, 1 };
     size_t f_local[3]  = { 64, (size_t)nsg, 1 };
     backend_ctx->enqueue_ndrange_kernel(fk, 3, f_global, f_local, (ggml_tensor *)dst);
@@ -37637,7 +37660,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne10));
                     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne0));
 
-                    const size_t rows_wg = ggml_cl_iq1s_mv_r2() ? 128 : 64;
+                    const size_t rows_wg = 64u * (size_t)ggml_cl_iq1s_mv_r();
                     size_t f_global[3] = { CEIL_DIV((size_t)ne01, rows_wg) * 64,
                                            (size_t)ne11 * (size_t)nsg, 1 };
                     size_t f_local[3]  = { 64, (size_t)nsg, 1 };
@@ -40067,7 +40090,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     && ne00 % 256 == 0 && ne11 == 1
                     && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1) {
                 const int nsb     = ne00 / 256;
-                const int base_wg = (int)CEIL_DIV((size_t)ne01, (size_t)128);
+                const int base_wg = (int)CEIL_DIV((size_t)ne01, 64u * (size_t)ggml_cl_iq1s_mv_r());
                 const int ksplit  = ggml_cl_iq_mv_ksplit(backend_ctx, base_wg, nsb);
                 if (ksplit > 1) {
                     ggml_tensor_extra_cl_iq1_s * ex0 =
@@ -40143,7 +40166,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne10));
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne0));
 
-                const size_t rows_wg = ggml_cl_iq1s_mv_r2() ? 128 : 64;
+                const size_t rows_wg = 64u * (size_t)ggml_cl_iq1s_mv_r();
                 size_t f_global[3] = { CEIL_DIV((size_t)ne01, rows_wg) * 64,
                                        (size_t)ne11 * (size_t)nsg, 1 };
                 size_t f_local[3]  = { 64, (size_t)nsg, 1 };
