@@ -2781,8 +2781,29 @@ static int ggml_cl_q3k_mv_r2() {
 }
 
 // And again for Q2_K.
+// Four subgroups, not eight. The K loop strides by the subgroup count, so the
+// fit against nsb = K/256 is what matters: a 3072-wide weight gives nsb = 12,
+// and at eight subgroups four of them sit idle through the second half of every
+// such tensor -- which on a 3B is attn_q/k/v/output and both ffn projections.
+// Four divides 12 and 32 exactly.
+//
+// Llama-3.2-3B-Q2_K tg64, sweeping both this and the row fold:
+//     NSG  R=2      R=4
+//       2  30.14    35.95
+//       4  31.99   *41.38*
+//       8  31.68    39.05   (was shipped)
+// So +6.0% at R=4, and R=2 is 18-23% worse everywhere -- four rows per lane is
+// right, and the kernel is not carrying too much work per item; carrying less is
+// far worse.
+//
+// 🔴 An earlier round measured this at -2.1% and left it at 8. That was taken on
+// a model where q2_K is 17.7 MiB of 862 -- about 2% of the bytes. Sweep a
+// per-type width on a model the type actually dominates.
+//
+// 🔴 Does NOT transfer to q3_K, which has the same nsb=12 misfit and measures
+// -12.8% at four. Per type, always.
 static int ggml_cl_q2k_mv_nsg() {
-    static const int v = ggml_cl_env_int("GGML_OPENCL_Q2K_MV_NSG", 8);
+    static const int v = ggml_cl_env_int("GGML_OPENCL_Q2K_MV_NSG", 4);
     return v;
 }
 
