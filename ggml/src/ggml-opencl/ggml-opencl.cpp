@@ -1336,6 +1336,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mv_iq2_xxs_f32_flat_glu = nullptr;  // fused ffn_gate+ffn_up+GLU
     cl_kernel kernel_mul_mv_iq2_xs_f32_flat  = nullptr;
     cl_kernel kernel_mul_mv_q3_k_f32_flat;
+    cl_kernel kernel_mul_mv_q3_k_f32_flat_splitk = nullptr;   // workgroup-level K split
     cl_kernel kernel_mul_mv_q2_k_f32_flat;
     cl_kernel kernel_mul_mv_q2_k_f32_flat_splitk = nullptr;   // workgroup-level K split
     cl_kernel kernel_mul_mv_iq2_s_f32_flat;
@@ -2770,6 +2771,18 @@ static int ggml_cl_iq3xxs_mv_r2() {
 }
 
 // And again for Q3_K.
+// Workgroup-level K split for the Q3_K decode GEMV. A frame profile of a 3B
+// Q2_K decode puts this kernel at 46.6% of GPU time for 33.5% of the bytes --
+// 42.5 GB/s, 28% of roofline, the least efficient of the three that matter --
+// and its 1024-wide attn_v launches only 8 workgroups against the ~16 needed.
+static int ggml_cl_q3k_splitk_on(const ggml_backend_opencl_context * backend_ctx) {
+    static const char * const e = getenv("GGML_OPENCL_Q3K_SPLITK");
+    if (e && *e) {
+        return atoi(e) != 0;
+    }
+    return backend_ctx->adreno_x2_class();
+}
+
 static int ggml_cl_q3k_mv_nsg() {
     static const int v = ggml_cl_env_int("GGML_OPENCL_Q3K_MV_NSG", 8);
     return v;
@@ -4482,6 +4495,12 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             build_program_from_source(backend_ctx, kernel_src.c_str(), opts);
 
         CL_CHECK((backend_ctx->kernel_mul_mv_q3_k_f32_flat = clCreateKernel(prog, "kernel_mul_mv_q3_k_f32_flat", &err), err));
+        if (ggml_cl_q3k_mv_r2()) {
+            // the split-K twin carries the paired-row fold only
+            backend_ctx->kernel_mul_mv_q3_k_f32_flat_splitk =
+                clCreateKernel(prog, "kernel_mul_mv_q3_k_f32_flat_splitk", &err);
+            if (err != CL_SUCCESS) { backend_ctx->kernel_mul_mv_q3_k_f32_flat_splitk = nullptr; }
+        }
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
@@ -41291,6 +41310,65 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             // Plane-split decode GEMV (GGML_OPENCL_Q3K_SOA). Must fire for EVERY
             // ne11 that reaches here -- the AoS kernel below would read the
             // planes as blocks.
+            // Workgroup-level K split, in front of the plain plane GEMV. Only for
+            // shapes the occupancy heuristic says are under-filled; ksplit == 1
+            // falls through to the kernel below unchanged.
+            if (ggml_cl_q3k_is_split(backend_ctx, src0)
+                    && backend_ctx->kernel_mul_mv_q3_k_f32_flat_splitk
+                    && backend_ctx->kernel_gemv_splitk_reduce_f32
+                    && ggml_cl_q3k_splitk_on(backend_ctx)
+                    && ne00 % 256 == 0 && ne11 == 1
+                    && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1) {
+                const int nsb     = ne00 / 256;
+                const int base_wg = (int)CEIL_DIV((size_t)ne01,
+                                        (size_t)(ggml_cl_q3k_mv_r2() ? 128 : 64));
+                const int ksplit  = ggml_cl_iq_mv_ksplit(backend_ctx, base_wg, nsb);
+                if (ksplit > 1) {
+                    ggml_tensor_extra_cl_q3_K_ns * ex0 =
+                        (ggml_tensor_extra_cl_q3_K_ns *)src0->extra;
+                    const int nsg = ggml_cl_q3k_mv_nsg();
+                    backend_ctx->prealloc_splitk_partial.allocate(
+                        backend_ctx->context, (size_t)ksplit * (size_t)ne01 * sizeof(float));
+
+                    cl_kernel sk = backend_ctx->kernel_mul_mv_q3_k_f32_flat_splitk;
+                    cl_int si = 0;
+                    CL_CHECK(clSetKernelArg(sk, si++, sizeof(cl_mem),   &ex0->qs));
+                    CL_CHECK(clSetKernelArg(sk, si++, sizeof(cl_mem),   &ex0->hm));
+                    CL_CHECK(clSetKernelArg(sk, si++, sizeof(cl_mem),   &ex0->sc));
+                    CL_CHECK(clSetKernelArg(sk, si++, sizeof(cl_mem),   &ex0->d));
+                    CL_CHECK(clSetKernelArg(sk, si++, sizeof(cl_mem),   &extra1->data_device));
+                    CL_CHECK(clSetKernelArg(sk, si++, sizeof(cl_ulong), &offset1));
+                    CL_CHECK(clSetKernelArg(sk, si++, sizeof(cl_mem),   &backend_ctx->prealloc_splitk_partial.buffer));
+                    CL_CHECK(clSetKernelArg(sk, si++, sizeof(int),      &ne00));
+                    CL_CHECK(clSetKernelArg(sk, si++, sizeof(int),      &ne01));
+                    CL_CHECK(clSetKernelArg(sk, si++, sizeof(int),      &ne10));
+
+                    static bool q3k_sk_logged = false;
+                    if (!q3k_sk_logged) {
+                        q3k_sk_logged = true;
+                        GGML_LOG_INFO("ggml_opencl: q3_k split-K decode GEMV active (ksplit=%d)\n", ksplit);
+                    }
+
+                    const size_t rows_wg = ggml_cl_q3k_mv_r2() ? 128 : 64;
+                    size_t s_global[3] = { CEIL_DIV((size_t)ne01, rows_wg) * 64,
+                                           (size_t)nsg, (size_t)ksplit };
+                    size_t s_local[3]  = { 64, (size_t)nsg, 1 };
+                    backend_ctx->enqueue_ndrange_kernel(sk, 3, s_global, s_local, dst);
+
+                    cl_kernel rk = backend_ctx->kernel_gemv_splitk_reduce_f32;
+                    cl_int ri = 0;
+                    CL_CHECK(clSetKernelArg(rk, ri++, sizeof(cl_mem),   &backend_ctx->prealloc_splitk_partial.buffer));
+                    CL_CHECK(clSetKernelArg(rk, ri++, sizeof(cl_mem),   &extrad->data_device));
+                    CL_CHECK(clSetKernelArg(rk, ri++, sizeof(cl_ulong), &offsetd));
+                    CL_CHECK(clSetKernelArg(rk, ri++, sizeof(int),      &ne01));
+                    CL_CHECK(clSetKernelArg(rk, ri++, sizeof(int),      &ksplit));
+                    size_t r_global[1] = { CEIL_DIV((size_t)ne01, (size_t)64) * 64 };
+                    size_t r_local[1]  = { 64 };
+                    backend_ctx->enqueue_ndrange_kernel(rk, 1, r_global, r_local, dst);
+                    return;
+                }
+            }
+
             if (ggml_cl_q3k_is_split(backend_ctx, src0)
                     && backend_ctx->kernel_mul_mv_q3_k_f32_flat
                     && ne00 % 256 == 0

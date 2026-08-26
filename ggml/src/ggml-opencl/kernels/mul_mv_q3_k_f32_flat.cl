@@ -198,3 +198,125 @@ kernel void kernel_mul_mv_q3_k_f32_flat(
     }
 #endif
 }
+
+
+// ---------------------------------------------------------------------------
+// Workgroup-level K split for the Q3_K decode GEMV, the twin of the Q2_K one.
+//
+// Frame profile of Llama-3.2-3B-Q2_K decode (17 tokens, 363.6 ms GPU) says this
+// kernel is the single largest consumer and the least efficient of the three
+// that matter:
+//
+//     kernel                 ms    %GPU    MiB   %bytes    GB/s   %roofline
+//     q3_K flat           169.3   46.6%  433.1    33.5%    42.5      28%
+//     q2_K flat+splitk    137.8   37.9%  551.2    42.6%    66.4      44%
+//     q6_K flat (head)     43.4   11.9%  308.2    23.8%   117.9      77%
+//
+// So it burns 46.6% of decode GPU to move 33.5% of the bytes. The plain kernel
+// splits K only inside a workgroup and pairs rows, so it launches ceil(M/128)
+// workgroups -- 24 for a 3072-wide weight but 8 for the 1024-wide attn_v, under
+// the ~16 this part needs to fill.
+//
+// Same construction as the Q2_K twin: slice ks accumulates its own range of
+// super-blocks into partial[ks*M + row] and the existing generic reduce kernel
+// sums them. The host takes ksplit from the shared occupancy heuristic and
+// leaves already-full shapes at 1, falling through to the plain kernel.
+//
+// R2 only, the shipped fold.
+// ---------------------------------------------------------------------------
+
+kernel void kernel_mul_mv_q3_k_f32_flat_splitk(
+        global const uchar * src0_qs,
+        global const uchar * src0_hm,
+        global const uint  * src0_sc,
+        global const half  * src0_d,
+        global const float * src1,
+        ulong offset1,
+        global float * partial,
+        int ne00,      // K
+        int ne01,      // M
+        int ne10       // activation row stride, == K
+) {
+    src1 = (global const float *)((global const char *)src1 + offset1);
+
+    const uint m   = (uint)ne01;
+    const uint K   = (uint)ne00;
+    const uint nsb = K / QK_K;
+
+    const uint lid = get_local_id(0);
+    const uint sgi = get_local_id(1);
+    const uint col = get_group_id(1);
+    const uint ks  = get_group_id(2);
+    const uint nks = get_num_groups(2);
+
+    // this slice's super-block range; the subgroups stride within it
+    const uint ib0 = (nsb * ks)        / nks;
+    const uint ib1 = (nsb * (ks + 1u)) / nks;
+
+    global const float * y = src1 + (ulong)col * (uint)ne10;
+
+    const uint mh  = m >> 1;
+    const uint j   = get_group_id(0) * 64u + lid;
+    const uint row = j << 1;
+
+    float sumf  = 0.f;
+    float sumf1 = 0.f;
+
+    if (j < mh) {
+        global const ushort * qsu = (global const ushort *)src0_qs;
+        global const ushort * hmu = (global const ushort *)src0_hm;
+
+        for (uint ib = ib0 + sgi; ib < ib1; ib += Q3K_MV_NSG) {
+            const half2 dh = vload2(j + ib * mh, src0_d);
+            const uint2 s0 = vload2(j + (3u * ib + 0u) * mh, src0_sc);
+            const uint2 s1 = vload2(j + (3u * ib + 1u) * mh, src0_sc);
+            const uint2 s2 = vload2(j + (3u * ib + 2u) * mh, src0_sc);
+
+            float acc0 = 0.f, acc1 = 0.f;
+            for (uint sb = 0; sb < 8u; ++sb) {
+                const uint grp = ib * 64u + sb * 8u;
+                const uint qsb = j + grp * mh;
+                const uint hmb = j + (grp >> 1) * mh;
+
+                for (uint h = 0; h < 2u; ++h) {         // two 16-weight halves
+                    const int l0 = q3k_scale(s0.s0, s1.s0, s2.s0, 2u*sb + h);
+                    const int l1 = q3k_scale(s0.s1, s1.s1, s2.s1, 2u*sb + h);
+
+                    float a0 = 0.f, a1 = 0.f;
+                    for (uint u = 0; u < 4u; ++u) {
+                        const uint gg  = 4u*h + u;
+                        const uint qsv = (uint)qsu[qsb + gg * mh];
+                        const uint hmv = (uint)hmu[hmb + (gg >> 1) * mh];
+                        const uint hsh = 4u * (gg & 1u);
+                        const float4 yv = vload4(grp + gg, y);
+                        a0 += dot(yv, q3k_vals( qsv       & 0xFFu, ( hmv        >> hsh) & 0xFu));
+                        a1 += dot(yv, q3k_vals((qsv >> 8) & 0xFFu, ((hmv >> 8)  >> hsh) & 0xFu));
+                    }
+                    acc0 += (float)l0 * a0;
+                    acc1 += (float)l1 * a1;
+                }
+            }
+            sumf  += (float)dh.s0 * acc0;
+            sumf1 += (float)dh.s1 * acc1;
+        }
+    }
+
+#if Q3K_MV_NSG > 1
+    __local float2 skpart[Q3K_MV_NSG][64];
+    skpart[sgi][lid] = (float2)(sumf, sumf1);
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (sgi != 0) {
+        return;
+    }
+    for (uint s = 1; s < Q3K_MV_NSG; ++s) {
+        const float2 p = skpart[s][lid];
+        sumf  += p.s0;
+        sumf1 += p.s1;
+    }
+#endif
+
+    if (j < mh) {
+        // [ksplit][M], the layout kernel_gemv_splitk_reduce_f32 expects
+        vstore2((float2)(sumf, sumf1), 0, partial + (ulong)ks * m + row);
+    }
+}
