@@ -36,6 +36,46 @@
 #define MV_WORK2 0
 #endif
 
+// Q2K_MV_ABL: COST PROBE, WRONG MATH, default off. Prices the ACTIVATION LOAD by
+// removing it while leaving the loop and every arithmetic operation in place.
+//
+// Why this term and why a probe first. This kernel is not compute bound
+// (MV_WORK2 doubles the arithmetic for 1.3%), not bandwidth bound (tg64 runs at
+// 34% of this part's roofline) and not starved (adding a workgroup K split was
+// worth 1.0%). What is left is a dependent-load latency, and the activation read
+// is the candidate: `grp` carries no row index, so every lane of a subgroup
+// reads the SAME address, 64x over.
+//
+// Routing that read through a texture was +20.0% on IQ2_S and +21.6% on IQ1_S,
+// but -3.7% on IQ4_XS -- the boundary is how heavy the kernel is per weight, and
+// q2_K is light like IQ4_XS: a 2-bit unpack with no codebook gather. So it could
+// go either way, and this probe decides it for one run instead of a build.
+//
+// The replacement value depends on the group index so the loop cannot be folded
+// away. Never ship non-zero; read the tg delta as the ceiling on what optimising
+// the activation read can buy.
+//
+// MEASURED, Llama-3.2-3B-Q2_K tg64: 39.08 -> 40.81, so the activation read is
+// **4.4%** of decode. For comparison IQ3_S prices its own at 13.2% and the
+// texture there delivered +10.5%. A 4.4% ceiling makes the texture worth at most
+// two or three percent here, against a precedent (IQ4_XS, equally light) where
+// the same change measured -3.7%. Not built on that basis.
+//
+// 🔑 And the arithmetic does not close: ALU 1.3% + activation 4.4% + the
+// workgroup K split 1.0% is about 7%, against a kernel running at 34% of
+// roofline. Roughly two thirds of the time is in neither the arithmetic nor the
+// activation nor occupancy. The next instrument is a frame profile -- dispatch
+// count, GPU busy against idle -- not another kernel micro-optimisation.
+#ifndef Q2K_MV_ABL
+#define Q2K_MV_ABL 0
+#endif
+
+#if Q2K_MV_ABL == 1
+#define Q2K_YV(g) ((float4)((float)((g) & 3u)))
+#else
+#define Q2K_YV(g) vload4((g), y)
+#endif
+
 inline float4 q2k_vals(uint pk) {
     return (float4)((float)( pk       & 3u), (float)((pk >> 2) & 3u),
                     (float)((pk >> 4) & 3u), (float)((pk >> 6) & 3u));
@@ -99,7 +139,7 @@ kernel void kernel_mul_mv_q2_k_f32_flat(
                     for (uint u = 0; u < 4u; ++u) {
                         const uint gg  = 4u*h + u;
                         const uint qsv = qsu[qsb + gg * mr];   // four rows, one load
-                        const float4 yv = vload4(grp + gg, y);
+                        const float4 yv = Q2K_YV(grp + gg);
                         as += yv;
                         a0 += dot(yv, q2k_vals( qsv        & 0xFFu));
 #if MV_WORK2
@@ -172,7 +212,7 @@ kernel void kernel_mul_mv_q2_k_f32_flat(
                     for (uint u = 0; u < 4u; ++u) {
                         const uint gg  = 4u*h + u;
                         const uint qsv = (uint)qsu[qsb + gg * mr];
-                        const float4 yv = vload4(grp + gg, y);
+                        const float4 yv = Q2K_YV(grp + gg);
                         as += yv;
                         a0 += dot(yv, q2k_vals( qsv       & 0xFFu));
 #if MV_WORK2
@@ -226,7 +266,7 @@ kernel void kernel_mul_mv_q2_k_f32_flat(
                     float4 as = (float4)(0.f);
                     for (uint u = 0; u < 4u; ++u) {
                         const uint gg = 4u*h + u;
-                        const float4 yv = vload4(grp + gg, y);
+                        const float4 yv = Q2K_YV(grp + gg);
                         as += yv;
                         const uint pkv = (uint)src0_qs[qsb + gg * m];
                         a += dot(yv, q2k_vals(pkv));
@@ -344,7 +384,7 @@ kernel void kernel_mul_mv_q2_k_f32_flat_splitk(
                     for (uint u = 0; u < 4u; ++u) {
                         const uint gg  = 4u*h + u;
                         const uint qsv = qsu[qsb + gg * mr];   // four rows, one load
-                        const float4 yv = vload4(grp + gg, y);
+                        const float4 yv = Q2K_YV(grp + gg);
                         as += yv;
                         a0 += dot(yv, q2k_vals( qsv        & 0xFFu));
 #if MV_WORK2
