@@ -1330,6 +1330,8 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mv_iq3_s_f32_flat_dp4a = nullptr;
     cl_kernel kernel_mul_mv_iq3_xxs_f32_flat;
     cl_kernel kernel_mul_mv_iq2_xxs_f32_flat = nullptr;
+    cl_kernel kernel_mul_mv_iq2_xxs_f32_flat_mc  = nullptr;  // 2 columns per workgroup, ne11 2..31
+    cl_kernel kernel_mul_mv_iq2_xxs_f32_flat_mc4 = nullptr;  // 4 columns, used when 4 divides ne11
     cl_kernel kernel_mul_mv_iq2_xxs_f32_flat_splitk = nullptr;  // K split across workgroups
     cl_kernel kernel_mul_mv_iq2_xxs_f32_flat_glu = nullptr;  // fused ffn_gate+ffn_up+GLU
     cl_kernel kernel_mul_mv_iq2_xs_f32_flat  = nullptr;
@@ -2548,6 +2550,26 @@ static int ggml_cl_iq2xs_mv_gridimg() {
 // plane GEMVs. Both quant planes are one unit per 8 weights, so both take the row
 // pairing; the grid image is on by default because it won on all five split grid
 // GEMVs that came before.
+// The IQ2_XXS twin of ggml_cl_iq1s_mv_mc. This type gathers four times per step
+// like IQ2_S, where the same change was +26.3% at ne11 2 and +59.2% at 8.
+static int ggml_cl_iq2xxs_mv_mc() {
+    static const int v = ggml_cl_env_int("GGML_OPENCL_IQ2XXS_MC", 1);
+    return v ? 1 : 0;
+}
+
+// Columns per workgroup: 2 or 4.
+static int ggml_cl_iq2xxs_mv_nc() {
+    static const int v = ggml_cl_env_int("GGML_OPENCL_IQ2XXS_NC", 4);
+    return (v == 2 || v == 4) ? v : 4;
+}
+
+// The 4-column kernel does not fit a 512-work-item group, exactly as on IQ2_S,
+// so its program is built and launched at four subgroups. The reduction array is
+// sized by the compile-time count, so launch width must match build width.
+static int ggml_cl_iq2xxs_mv_mc4_nsg() {
+    return 4;
+}
+
 static int ggml_cl_iq2xxs_mv_nsg() {
     static const int v = ggml_cl_env_int("GGML_OPENCL_IQ2XXS_MV_NSG", 8);
     return v;
@@ -4337,12 +4359,33 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         opts += " -DIQ2XXS_MV_SIGNXOR=" + std::to_string(ggml_cl_iq2xxs_mv_signxor());
         opts += " -DIQ2XXS_MV_R2=" + std::to_string(ggml_cl_iq2xxs_mv_r2());
         opts += " -DIQ2XXS_MV_ABL=" + std::to_string(ggml_cl_iq2xxs_mv_abl());
+        opts += " -DIQ2XXS_MV_NC=2";
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), opts);
 
         // The grid image is the one the AoS program already created -- same table,
         // and both kernels index it as uint pairs.
         CL_CHECK((backend_ctx->kernel_mul_mv_iq2_xxs_f32_flat = clCreateKernel(prog, "kernel_mul_mv_iq2_xxs_f32_flat", &err), err));
+        if (ggml_cl_iq2xxs_mv_r2()) {
+            backend_ctx->kernel_mul_mv_iq2_xxs_f32_flat_mc =
+                clCreateKernel(prog, "kernel_mul_mv_iq2_xxs_f32_flat_mc", &err);
+            if (err != CL_SUCCESS) { backend_ctx->kernel_mul_mv_iq2_xxs_f32_flat_mc = nullptr; }
+
+            if (ggml_cl_iq2xxs_mv_nc() == 4) {
+                std::string opts4 = opts;
+                const std::string nc2 = " -DIQ2XXS_MV_NC=2";
+                opts4.replace(opts4.find(nc2), nc2.size(), " -DIQ2XXS_MV_NC=4");
+                const std::string nsgc = " -DIQ2XXS_MV_NSG=" + std::to_string(ggml_cl_iq2xxs_mv_nsg());
+                opts4.replace(opts4.find(nsgc), nsgc.size(),
+                              " -DIQ2XXS_MV_NSG=" + std::to_string(ggml_cl_iq2xxs_mv_mc4_nsg()));
+                cl_program prog4 =
+                    build_program_from_source(backend_ctx, kernel_src.c_str(), opts4);
+                backend_ctx->kernel_mul_mv_iq2_xxs_f32_flat_mc4 =
+                    clCreateKernel(prog4, "kernel_mul_mv_iq2_xxs_f32_flat_mc", &err);
+                if (err != CL_SUCCESS) { backend_ctx->kernel_mul_mv_iq2_xxs_f32_flat_mc4 = nullptr; }
+                CL_CHECK(clReleaseProgram(prog4));
+            }
+        }
         if (ggml_cl_iq2xxs_mv_r2()) {
             backend_ctx->kernel_mul_mv_iq2_xxs_f32_flat_splitk =
                 clCreateKernel(prog, "kernel_mul_mv_iq2_xxs_f32_flat_splitk", &err);
@@ -40071,6 +40114,63 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         }
             // Plane-split decode GEMV (GGML_OPENCL_IQ2XXS_SOA). Must fire for
             // EVERY ne11 that reaches here -- the AoS kernel below would read the planes as blocks.
+            // Two or four columns per workgroup for ne11 >= 2: the grid gather
+            // and the pass over the weights serve every column of the group.
+            // n=3 is declined because an odd width would waste one column of
+            // 2*ceil(n/2). This lives HERE and not in the batched switch: that
+            // switch's IQ2_XXS case opens with `if (ne11 < 32) break;`.
+            if (ggml_cl_iq2xxs_mv_mc()
+                    && ggml_cl_iq2xxs_is_split(backend_ctx, src0)
+                    && backend_ctx->kernel_mul_mv_iq2_xxs_f32_flat_mc
+                    && ne11 >= 2 && ne11 != 3
+                    && ne00 % 256 == 0
+                    && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1) {
+                ggml_tensor_extra_cl_iq2_xxs * ex0 =
+                    (ggml_tensor_extra_cl_iq2_xxs *)src0->extra;
+                const bool use4 = backend_ctx->kernel_mul_mv_iq2_xxs_f32_flat_mc4 != nullptr
+                                  && (ne11 % 4) == 0;
+                const size_t ncol = use4 ? 4u : 2u;
+                cl_kernel mk = use4 ? backend_ctx->kernel_mul_mv_iq2_xxs_f32_flat_mc4
+                                    : backend_ctx->kernel_mul_mv_iq2_xxs_f32_flat_mc;
+                // must match the width its program was built at
+                const int nsg = use4 ? ggml_cl_iq2xxs_mv_mc4_nsg() : ggml_cl_iq2xxs_mv_nsg();
+                cl_int ai = 0;
+                cl_uint iq2xxs_y_off = 0;
+                cl_mem  iq2xxs_y_img = ggml_cl_iq2xxs_mv_aimg(backend_ctx)
+                    ? ggml_cl_activation_image(backend_ctx, extra1->data_device, offset1, ne10, ne11, &iq2xxs_y_off)
+                    : nullptr;
+                cl_mem  iq2xxs_y_arg = iq2xxs_y_img ? iq2xxs_y_img : backend_ctx->iq2xxs_grid_img;
+                CL_CHECK(clSetKernelArg(mk, ai++, sizeof(cl_mem),   &backend_ctx->iq2xxs_grid_img));
+                CL_CHECK(clSetKernelArg(mk, ai++, sizeof(cl_mem),   &iq2xxs_y_arg));
+                CL_CHECK(clSetKernelArg(mk, ai++, sizeof(cl_uint),  &iq2xxs_y_off));
+                CL_CHECK(clSetKernelArg(mk, ai++, sizeof(cl_mem),   &ex0->qs));
+                CL_CHECK(clSetKernelArg(mk, ai++, sizeof(cl_mem),   &ex0->sas));
+                CL_CHECK(clSetKernelArg(mk, ai++, sizeof(cl_mem),   &ex0->d));
+                CL_CHECK(clSetKernelArg(mk, ai++, sizeof(cl_mem),   &extra1->data_device));
+                CL_CHECK(clSetKernelArg(mk, ai++, sizeof(cl_ulong), &offset1));
+                CL_CHECK(clSetKernelArg(mk, ai++, sizeof(cl_mem),   &extrad->data_device));
+                CL_CHECK(clSetKernelArg(mk, ai++, sizeof(cl_ulong), &offsetd));
+                CL_CHECK(clSetKernelArg(mk, ai++, sizeof(int),      &ne00));
+                CL_CHECK(clSetKernelArg(mk, ai++, sizeof(int),      &ne01));
+                CL_CHECK(clSetKernelArg(mk, ai++, sizeof(int),      &ne10));
+                CL_CHECK(clSetKernelArg(mk, ai++, sizeof(int),      &ne0));
+                CL_CHECK(clSetKernelArg(mk, ai++, sizeof(int),      &ne11));
+
+                static bool iq2xxs_mc_logged = false;
+                if (!iq2xxs_mc_logged) {
+                    iq2xxs_mc_logged = true;
+                    GGML_LOG_INFO("ggml_opencl: iq2_xxs multi-column GEMV active (ne11=%d, %d cols)\n", ne11, (int)ncol);
+                }
+
+                const size_t rows_wg = ggml_cl_iq2xxs_mv_r2() ? 128 : 64;
+                size_t m_global[3] = { CEIL_DIV((size_t)ne01, rows_wg) * 64,
+                                       CEIL_DIV((size_t)ne11, ncol) * (size_t)nsg, 1 };
+                size_t m_local[3]  = { 64, (size_t)nsg, 1 };
+                backend_ctx->enqueue_ndrange_kernel(mk, 3, m_global, m_local, dst);
+                if (iq2xxs_y_img) { CL_CHECK(clReleaseMemObject(iq2xxs_y_img)); }
+                return;
+            }
+
             if (ggml_cl_iq2xxs_is_split(backend_ctx, src0)
                     && backend_ctx->kernel_mul_mv_iq2_xxs_f32_flat
                     && ne00 % 256 == 0
