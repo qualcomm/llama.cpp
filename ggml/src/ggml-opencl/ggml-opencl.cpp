@@ -9,6 +9,7 @@
 
 #include "ggml-opencl.h"
 #include <cstdarg>
+#include <atomic>
 #include <chrono>
 #ifndef _WIN32
 #include <dlfcn.h>
