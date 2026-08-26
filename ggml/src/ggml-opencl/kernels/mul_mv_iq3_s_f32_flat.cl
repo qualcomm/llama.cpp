@@ -499,6 +499,188 @@ kernel void kernel_mul_mv_iq3_s_f32_flat(
 
 
 // ---------------------------------------------------------------------------
+// Two COLUMNS per workgroup, for the ne11 = 2..31 band. The IQ3_S twin of
+// kernel_mul_mv_iq1_s_f32_flat_mc; see that kernel for the full rationale.
+//
+// The plain GEMV takes its column from get_group_id(1), so at ne11 = N it reads
+// the whole weight matrix N times and gathers the grid N times. Nothing else
+// covers that band: split-K is gated ne11 == 1 and the prefill GEMM starts at
+// ne11 >= 32.
+//
+// This type gathers twice per step, one entry per row of the pair, and applies a
+// sign table on top. IQ1_S, which gathers twice with no signs, measured +8.5% at
+// ne11 2 rising to +17.3% at 8; IQ2_S, which gathers four times, +26.7% to
+// +50.2%. More per-step weight work to amortise means a larger win.
+//
+// The two grid entries are gathered once and held; their sign-applied float4s
+// are rebuilt per column rather than kept, because iq3s_vals is a shift and an
+// XOR and holding four float4s would spend the register budget that the row fold
+// and the codebook prefetch both proved is the binding constraint on this family.
+//
+// An odd trailing column is computed against a duplicate of its partner and
+// dropped at the store, so the inner loop has no divergent branch. That wastes
+// one column of 2*ceil(n/2); the host declines ne11 == 3, the only width where
+// that outweighs the saving.
+// ---------------------------------------------------------------------------
+
+#if IQ3S_MV_AIMG
+#define IQ3S_MCYA(g) read_imagef(y_img, (int)(y_tex_a + (g)))
+#define IQ3S_MCYB(g) read_imagef(y_img, (int)(y_tex_b + (g)))
+#else
+#define IQ3S_MCYA(g) vload4((g), ya)
+#define IQ3S_MCYB(g) vload4((g), yb)
+#endif
+
+kernel void kernel_mul_mv_iq3_s_f32_flat_mc(
+        __read_only image1d_buffer_t grid_img,
+        __read_only image1d_buffer_t y_img,      // see IQ3S_MV_AIMG
+        global const uchar * src0_qs,
+        global const uchar * src0_qh,
+        global const uchar * src0_sg,
+        global const uchar * src0_sc,
+        global const half  * src0_d,
+        global const float * src1,
+        ulong offset1,
+        global float * dst,
+        ulong offsetd,
+        int ne00,
+        int ne01,
+        int ne10,
+        int ne0,
+        uint y_off,    // offset1/16, in float4 texels (IQ3S_MV_AIMG only)
+        int ne11
+) {
+    src1 = (global const float *)((global const char *)src1 + offset1);
+    dst  = (global float       *)((global char       *)dst  + offsetd);
+
+    const uint m   = (uint)ne01;
+    const uint K   = (uint)ne00;
+    const uint nsb = K / QK_K;
+
+    const uint lid = get_local_id(0);
+    const uint sgi = get_local_id(1);
+
+    const uint nc    = (uint)ne11;
+    const uint ca    = get_group_id(1) * 2u;
+    const uint has_b = (ca + 1u < nc) ? 1u : 0u;
+    const uint cb    = ca + has_b;        // duplicate of ca when the pair is odd
+
+    global const float * ya = src1 + (ulong)ca * (uint)ne10;
+    global const float * yb = src1 + (ulong)cb * (uint)ne10;
+#if IQ3S_MV_AIMG
+    const uint y_tex_a = y_off + ca * ((uint)ne10 >> 2);
+    const uint y_tex_b = y_off + cb * ((uint)ne10 >> 2);
+#endif
+
+#if IQ3S_MV_GRIDIMG
+#define IQ3S_MCGRID(i) (read_imageui(grid_img, (int)(i)).x)
+#else
+#define IQ3S_MCGRID(i) iq3s_grid[(i)]
+#endif
+
+    const uint mh  = m >> 1;
+    const uint j   = get_group_id(0) * 64u + lid;
+    const uint row = j << 1;
+
+    float sa0 = 0.f, sa1 = 0.f, sb0 = 0.f, sb1 = 0.f;   // [column][row]
+
+    if (j < mh) {
+        global const ushort * qsu = (global const ushort *)src0_qs;
+        global const ushort * qhu = (global const ushort *)src0_qh;
+        global const ushort * sgu = (global const ushort *)src0_sg;
+        global const ushort * scu = (global const ushort *)src0_sc;
+
+        for (uint ib = sgi; ib < nsb; ib += IQ3S_MV_NSG) {
+            const half2 dh = vload2(j + ib * mh, src0_d);
+            const float d0 = (float)dh.s0;
+            const float d1 = (float)dh.s1;
+
+            const uint scbase = j + ib * 4u * mh;
+            ushort sc4[4];
+            sc4[0] = scu[scbase + 0u * mh];
+            sc4[1] = scu[scbase + 1u * mh];
+            sc4[2] = scu[scbase + 2u * mh];
+            sc4[3] = scu[scbase + 3u * mh];
+
+            float aa0 = 0.f, aa1 = 0.f, ab0 = 0.f, ab1 = 0.f;
+            for (uint sb = 0; sb < 8u; ++sb) {
+                const uint scv  = (uint)sc4[sb >> 1];
+                const uint nib0 = (sb & 1u) ? ((scv >>  4) & 0xFu) : ( scv        & 0xFu);
+                const uint nib1 = (sb & 1u) ? ((scv >> 12) & 0xFu) : ((scv >>  8) & 0xFu);
+
+                const uint qhv = (uint)qhu[j + (ib * 8u + sb) * mh];
+                const uint qh0 = qhv & 0xFFu;
+                const uint qh1 = qhv >> 8;
+
+                const uint grp = ib * 64u + sb * 8u;
+                const uint qsb = j + grp * mh;
+                const uint sgb = j + (ib * 32u + sb * 4u) * mh;
+
+                float pa0 = 0.f, pa1 = 0.f, pb0 = 0.f, pb1 = 0.f;
+                for (uint u = 0; u < 8u; ++u) {
+                    const uint qsv = (uint)qsu[qsb + u * mh];   // row pair, one load
+                    const uint sgv = (uint)sgu[sgb + (u >> 1) * mh];
+                    const uint g0  = ( qsv       & 0xFFu) | (((qh0 >> u) & 1u) << 8);
+                    const uint g1  = ((qsv >> 8) & 0xFFu) | (((qh1 >> u) & 1u) << 8);
+                    const uint base = (u & 1u) * 4u;
+                    const uint s0   =  sgv       & 0xFFu;
+                    const uint s1   = (sgv >> 8) & 0xFFu;
+
+                    // Two gathers AND their sign application, shared by both
+                    // columns. The siblings rebuild the float4 per column to save
+                    // registers, because for them the gather is the cost. IQ3_S is
+                    // the opposite: its own ablation prices the grid lookup at
+                    // 0.2% and the SIGN APPLICATION at 14.2%, and it is the one
+                    // type in the family that loses under doubled arithmetic at
+                    // fixed loads. So here the value is what must be shared;
+                    // rebuilding it per column measured -4 to -7%.
+                    const float4 w0 = iq3s_vals(IQ3S_MCGRID(g0), s0, base);
+                    const float4 w1 = iq3s_vals(IQ3S_MCGRID(g1), s1, base);
+
+                    const float4 av = IQ3S_MCYA(grp + u);
+                    pa0 += dot(av, w0);
+                    pa1 += dot(av, w1);
+
+                    const float4 bv = IQ3S_MCYB(grp + u);
+                    pb0 += dot(bv, w0);
+                    pb1 += dot(bv, w1);
+                }
+                aa0 += (float)(1u + 2u * nib0) * pa0;
+                aa1 += (float)(1u + 2u * nib1) * pa1;
+                ab0 += (float)(1u + 2u * nib0) * pb0;
+                ab1 += (float)(1u + 2u * nib1) * pb1;
+            }
+            sa0 += d0 * aa0;
+            sa1 += d1 * aa1;
+            sb0 += d0 * ab0;
+            sb1 += d1 * ab1;
+        }
+    }
+
+#if IQ3S_MV_NSG > 1
+    __local float4 mcpart[IQ3S_MV_NSG][64];
+    mcpart[sgi][lid] = (float4)(sa0, sa1, sb0, sb1);
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (sgi != 0) {
+        return;
+    }
+    for (uint s = 1; s < IQ3S_MV_NSG; ++s) {
+        const float4 p = mcpart[s][lid];
+        sa0 += p.s0; sa1 += p.s1; sb0 += p.s2; sb1 += p.s3;
+    }
+#endif
+
+    if (j < mh) {
+        vstore2((float2)(sa0, sa1), 0, dst + (ulong)ca * (uint)ne0 + row);
+        if (has_b) {
+            vstore2((float2)(sb0, sb1), 0, dst + (ulong)cb * (uint)ne0 + row);
+        }
+    }
+#undef IQ3S_MCGRID
+}
+
+
+// ---------------------------------------------------------------------------
 // dp4a (int8) twin of the GEMV above.
 //
 // Why this and not the other levers: an additive work probe

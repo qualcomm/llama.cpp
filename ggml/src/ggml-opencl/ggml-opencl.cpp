@@ -1324,6 +1324,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mv_tq1_0_f32;
     cl_kernel kernel_mul_mv_iq3_s_f32;
     cl_kernel kernel_mul_mv_iq3_s_f32_flat;
+    cl_kernel kernel_mul_mv_iq3_s_f32_flat_mc = nullptr;   // two columns per workgroup, ne11 2..31
     cl_kernel kernel_mul_mv_iq3_s_f32_flat_glu = nullptr;  // fused ffn_gate+ffn_up+GLU
     cl_kernel kernel_mul_mv_iq3_s_f32_flat_splitk = nullptr;  // K split across workgroups
     cl_kernel kernel_mul_mv_iq3_s_f32_flat_dp4a = nullptr;
@@ -2251,6 +2252,26 @@ static int ggml_cl_iq2s_mv_aimg(const ggml_backend_opencl_context * backend_ctx)
 
 static int ggml_cl_iq3s_mv_aimg(const ggml_backend_opencl_context * backend_ctx) {
     return ggml_cl_gridimg_default(backend_ctx, "GGML_OPENCL_IQ3S_MV_AIMG");
+}
+
+// The IQ3_S twin of ggml_cl_iq1s_mv_mc -- same band and same shape, but DEFAULT
+// OFF, because on this type there is nothing to amortise.
+//
+// 3B IQ3_M, prompt t/s, sharing the sign-applied values: n=2 -0.3%, n=4 +2.3%,
+// n=8 +0.1%, n=16 -0.9%. A wash. Sharing only the GATHER (what the siblings do)
+// was -4 to -7%, because the per-column iq3s_vals then doubles the sign work.
+//
+// The size of this win tracks how much per-step WEIGHT work a type has to
+// amortise, which its own ablation already reports:
+//   IQ2_S   four gathers per step        +26.7% .. +50.2%
+//   IQ1_S   two gathers, no signs         +8.5% .. +17.3%
+//   IQ3_S   gather is 0.2% of decode      wash
+// IQ3_S is the one type in the family that is COMPUTE bound -- it loses 33%
+// under doubled arithmetic at fixed loads where IQ1_S is flat -- so halving its
+// weight traffic buys almost nothing. Kept reachable so the boundary is recorded.
+static int ggml_cl_iq3s_mv_mc() {
+    static const int v = ggml_cl_env_int("GGML_OPENCL_IQ3S_MC", 0);
+    return v ? 1 : 0;
 }
 
 static int ggml_cl_iq3s_mv_nsg() {
@@ -4197,6 +4218,11 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             build_program_from_source(backend_ctx, kernel_src.c_str(), opts);
 
         CL_CHECK((backend_ctx->kernel_mul_mv_iq3_s_f32_flat = clCreateKernel(prog, "kernel_mul_mv_iq3_s_f32_flat", &err), err));
+        if (ggml_cl_iq3s_mv_r2()) {
+            backend_ctx->kernel_mul_mv_iq3_s_f32_flat_mc =
+                clCreateKernel(prog, "kernel_mul_mv_iq3_s_f32_flat_mc", &err);
+            if (err != CL_SUCCESS) { backend_ctx->kernel_mul_mv_iq3_s_f32_flat_mc = nullptr; }
+        }
         if (ggml_cl_iq3s_mv_r2()) {
             backend_ctx->kernel_mul_mv_iq3_s_f32_flat_glu =
                 clCreateKernel(prog, "kernel_mul_mv_iq3_s_f32_flat_glu", &err);
@@ -39737,6 +39763,63 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     backend_ctx->enqueue_ndrange_kernel(rk, 1, r_global, r_local, dst);
                     return;
                 }
+            }
+
+            // Two columns per workgroup for ne11 >= 2: one grid gather and one
+            // pass over the weights serve the pair. The IQ3_S twin of the IQ1_S
+            // path; n=3 is declined because an odd width wastes one column of
+            // 2*ceil(n/2), which only outweighs the saving there.
+            //
+            // This has to live HERE and not in the batched switch: that switch's
+            // IQ3_S case opens with `if (ne11 < 32) break;`, so anything below it
+            // is unreachable for exactly this band.
+            if (ggml_cl_iq3s_mv_mc()
+                    && ggml_cl_iq3s_is_split(backend_ctx, src0)
+                    && backend_ctx->kernel_mul_mv_iq3_s_f32_flat_mc
+                    && ne11 >= 2 && ne11 != 3
+                    && ne00 % 256 == 0
+                    && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1) {
+                ggml_tensor_extra_cl_iq3_s * ex0 =
+                    (ggml_tensor_extra_cl_iq3_s *)src0->extra;
+                cl_kernel mk = backend_ctx->kernel_mul_mv_iq3_s_f32_flat_mc;
+                const int nsg = ggml_cl_iq3s_mv_nsg();
+                cl_int ai = 0;
+                cl_uint iq3s_y_off = 0;
+                cl_mem  iq3s_y_img = ggml_cl_iq3s_mv_aimg(backend_ctx)
+                    ? ggml_cl_activation_image(backend_ctx, extra1->data_device, offset1, ne10, ne11, &iq3s_y_off)
+                    : nullptr;
+                cl_mem  iq3s_y_arg = iq3s_y_img ? iq3s_y_img : backend_ctx->iq3s_grid_img;
+                CL_CHECK(clSetKernelArg(mk, ai++, sizeof(cl_mem),   &backend_ctx->iq3s_grid_img));
+                CL_CHECK(clSetKernelArg(mk, ai++, sizeof(cl_mem),   &iq3s_y_arg));
+                CL_CHECK(clSetKernelArg(mk, ai++, sizeof(cl_mem),   &ex0->qs));
+                CL_CHECK(clSetKernelArg(mk, ai++, sizeof(cl_mem),   &ex0->qh));
+                CL_CHECK(clSetKernelArg(mk, ai++, sizeof(cl_mem),   &ex0->sg));
+                CL_CHECK(clSetKernelArg(mk, ai++, sizeof(cl_mem),   &ex0->sc));
+                CL_CHECK(clSetKernelArg(mk, ai++, sizeof(cl_mem),   &ex0->d));
+                CL_CHECK(clSetKernelArg(mk, ai++, sizeof(cl_mem),   &extra1->data_device));
+                CL_CHECK(clSetKernelArg(mk, ai++, sizeof(cl_ulong), &offset1));
+                CL_CHECK(clSetKernelArg(mk, ai++, sizeof(cl_mem),   &extrad->data_device));
+                CL_CHECK(clSetKernelArg(mk, ai++, sizeof(cl_ulong), &offsetd));
+                CL_CHECK(clSetKernelArg(mk, ai++, sizeof(int),      &ne00));
+                CL_CHECK(clSetKernelArg(mk, ai++, sizeof(int),      &ne01));
+                CL_CHECK(clSetKernelArg(mk, ai++, sizeof(int),      &ne10));
+                CL_CHECK(clSetKernelArg(mk, ai++, sizeof(int),      &ne0));
+                CL_CHECK(clSetKernelArg(mk, ai++, sizeof(cl_uint),  &iq3s_y_off));
+                CL_CHECK(clSetKernelArg(mk, ai++, sizeof(int),      &ne11));
+
+                static bool iq3s_mc_logged = false;
+                if (!iq3s_mc_logged) {
+                    iq3s_mc_logged = true;
+                    GGML_LOG_INFO("ggml_opencl: iq3_s multi-column GEMV active (ne11=%d)\n", ne11);
+                }
+
+                const size_t rows_wg = ggml_cl_iq3s_mv_r2() ? 128 : 64;
+                size_t m_global[3] = { CEIL_DIV((size_t)ne01, rows_wg) * 64,
+                                       CEIL_DIV((size_t)ne11, (size_t)2) * (size_t)nsg, 1 };
+                size_t m_local[3]  = { 64, (size_t)nsg, 1 };
+                backend_ctx->enqueue_ndrange_kernel(mk, 3, m_global, m_local, dst);
+                if (iq3s_y_img) { CL_CHECK(clReleaseMemObject(iq3s_y_img)); }
+                return;
             }
 
             if (ggml_cl_iq3s_is_split(backend_ctx, src0)
