@@ -1928,6 +1928,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemm_noshuffle_iq2_s_q8_1_dp4a = nullptr;  // dp4a (int8) dense IQ2_S prefill GEMM over the plane split
     cl_kernel kernel_convert_block_iq1_s_ns = nullptr;  // IQ1_S AoS -> planes
     cl_kernel kernel_restore_block_iq1_s_ns = nullptr;  // IQ1_S planes -> AoS
+    cl_kernel kernel_mul_mv_iq1_s_f32_flat_mc = nullptr;   // two columns per workgroup, ne11 2..31
     cl_kernel kernel_gemm_noshuffle_iq1_s_q8_1_dp4a = nullptr;  // dp4a (int8) dense IQ1_S prefill GEMM over the plane split
     cl_kernel kernel_convert_block_iq1_m_ns = nullptr;  // IQ1_M AoS -> planes
     cl_kernel kernel_restore_block_iq1_m_ns = nullptr;  // IQ1_M planes -> AoS
@@ -2804,6 +2805,28 @@ static int ggml_cl_iq1s_mv_nsg() {
 // Wrong-math cost probe for the IQ1_S decode GEMVs; see the kernel header.
 // 1 prices the codebook gather, 2 the activation load. Never non-zero in a
 // shipped configuration -- the numbers it produces are wrong on purpose.
+// Two columns per workgroup for the ne11 = 2..31 band, so one codebook gather
+// and one pass over the weights serve a pair of columns instead of one. Nothing
+// else covers that band: split-K is gated ne11 == 1 and the prefill GEMM starts
+// at ne11 >= 32, so it used to run as N stacked decode GEMVs.
+//
+// DEFAULT ON. Prompt t/s, both arms repeated, 27B order-balanced:
+//   3B  Llama-3.2 UD-IQ1_S  n=2 +8.7%  n=4 +9.8%  n=8 +14.3%  n=16 +15.1%
+//   27B Qwen3.8   UD-IQ1_S  n=2 +8.0%  n=4 +15.3% n=8 +17.3%
+//
+// Unlike the row fold and the codebook prefetch, this one does NOT invert on the
+// larger model -- it gains MORE there. Those two bought their win with registers
+// and lost it again wherever the shape already filled the device; this removes
+// redundant weight READS instead, so there is nothing for a full device to give
+// back. Correctness: wikitext PPL at -b 4 -ub 4, so every token goes through this
+// kernel, 64.4432 vs 64.4424.
+//
+// n=3 is excluded at the dispatch; see the note there.
+static int ggml_cl_iq1s_mv_mc() {
+    static const int v = ggml_cl_env_int("GGML_OPENCL_IQ1S_MC", 1);
+    return v ? 1 : 0;
+}
+
 // IQ1S_MV_PF: hoist a sub-block's loads ahead of its dot products in the IQ1_S
 // decode GEMVs, so the codebook gathers overlap instead of serialising behind
 // one another. 1 = plain and split-K kernels, worth +4.0% of decode where they
@@ -4367,6 +4390,13 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             build_program_from_source(backend_ctx, kernel_src.c_str(), opts);
 
         CL_CHECK((backend_ctx->kernel_mul_mv_iq1_s_f32_flat = clCreateKernel(prog, "kernel_mul_mv_iq1_s_f32_flat", &err), err));
+        // The multi-column kernel is written for the 2-row fold only.
+        if (ggml_cl_iq1s_mv_r() == 2) {
+            backend_ctx->kernel_mul_mv_iq1_s_f32_flat_mc =
+                clCreateKernel(prog, "kernel_mul_mv_iq1_s_f32_flat_mc", &err);
+            if (err != CL_SUCCESS) { backend_ctx->kernel_mul_mv_iq1_s_f32_flat_mc = nullptr; }
+        }
+
         // The fused-GLU and split-K twins carry a 4-row and a 2-row path only;
         // at R=1 they are not built and the plain GEMV serves those shapes.
         if (ggml_cl_iq1s_mv_r() >= 2) {
@@ -37675,6 +37705,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 }
 
                 // Plane-split GEMV, for every ne11 the dp4a GEMM above declines.
+
                 if (ggml_cl_iq1s_is_split(backend_ctx, src0)
                         && backend_ctx->kernel_mul_mv_iq1_s_f32_flat
                         && ne00 % 256 == 0
@@ -40181,6 +40212,71 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     backend_ctx->enqueue_ndrange_kernel(rk, 1, r_global, r_local, dst);
                     return;
                 }
+            }
+
+            // Two columns per workgroup for ne11 >= 2: one codebook gather
+            // and one pass over the weights serve the pair, where the
+            // single-column kernel below reads the whole matrix once per
+            // column.
+            //
+            // This has to live HERE and not in the batched switch: that
+            // switch's IQ1_S case opens with `if (ne11 < 32) break;`, so
+            // anything below it is unreachable for exactly this band.
+            if (ggml_cl_iq1s_mv_mc()
+                    && ggml_cl_iq1s_is_split(backend_ctx, src0)
+                    && backend_ctx->kernel_mul_mv_iq1_s_f32_flat_mc
+                    // An odd width computes one duplicate column and throws it
+                    // away, which is 1 of 2*ceil(n/2) columns of work. That is
+                    // 25% at n=3 and shrinks from there, and 3 is the only width
+                    // where it outweighs the saving. Measured on a 3B, prompt t/s:
+                    //   n     2     3     4     5     6     7     8    12    16
+                    //   d  +8.7  -1.5  +9.8  +4.2 +10.3  +8.3 +14.3 +16.0 +15.1
+                    && ne11 >= 2 && ne11 != 3
+                    && ne00 % 256 == 0
+                    && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1) {
+                ggml_tensor_extra_cl_iq1_s * ex0 =
+                    (ggml_tensor_extra_cl_iq1_s *)src0->extra;
+                cl_kernel mk = backend_ctx->kernel_mul_mv_iq1_s_f32_flat_mc;
+                const int nsg = ggml_cl_iq1s_mv_nsg();
+                cl_int ai = 0;
+                cl_uint iq1s_y_off = 0;
+                cl_mem  iq1s_y_img = ggml_cl_iq1s_mv_aimg(backend_ctx)
+                    ? ggml_cl_activation_image(backend_ctx, extra1->data_device, offset1, ne10, ne11, &iq1s_y_off)
+                    : nullptr;
+                cl_mem  iq1s_y_arg = iq1s_y_img ? iq1s_y_img : ggml_cl_iq1s_mv_grid_img(backend_ctx);
+                cl_mem  iq1s_grid_arg = ggml_cl_iq1s_mv_grid_img(backend_ctx);
+                CL_CHECK(clSetKernelArg(mk, ai++, sizeof(cl_mem),   &iq1s_grid_arg));
+                CL_CHECK(clSetKernelArg(mk, ai++, sizeof(cl_mem),   &iq1s_y_arg));
+                CL_CHECK(clSetKernelArg(mk, ai++, sizeof(cl_uint),  &iq1s_y_off));
+                CL_CHECK(clSetKernelArg(mk, ai++, sizeof(cl_mem),   &ex0->qs));
+                CL_CHECK(clSetKernelArg(mk, ai++, sizeof(cl_mem),   &ex0->qh));
+                CL_CHECK(clSetKernelArg(mk, ai++, sizeof(cl_mem),   &ex0->d));
+                CL_CHECK(clSetKernelArg(mk, ai++, sizeof(cl_mem),   &extra1->data_device));
+                CL_CHECK(clSetKernelArg(mk, ai++, sizeof(cl_ulong), &offset1));
+                CL_CHECK(clSetKernelArg(mk, ai++, sizeof(cl_mem),   &extrad->data_device));
+                CL_CHECK(clSetKernelArg(mk, ai++, sizeof(cl_ulong), &offsetd));
+                CL_CHECK(clSetKernelArg(mk, ai++, sizeof(int),      &ne00));
+                CL_CHECK(clSetKernelArg(mk, ai++, sizeof(int),      &ne01));
+                CL_CHECK(clSetKernelArg(mk, ai++, sizeof(int),      &ne10));
+                CL_CHECK(clSetKernelArg(mk, ai++, sizeof(int),      &ne0));
+                CL_CHECK(clSetKernelArg(mk, ai++, sizeof(int),      &ne11));
+
+                // One-shot proof that this fired. A wash is the signature of a
+                // gate that never ran, and the first placement of this block was
+                // exactly that -- below an `if (ne11 < 32) break;`.
+                static bool iq1s_mc_logged = false;
+                if (!iq1s_mc_logged) {
+                    iq1s_mc_logged = true;
+                    GGML_LOG_INFO("ggml_opencl: iq1_s multi-column GEMV active (ne11=%d)\n", ne11);
+                }
+
+                const size_t rows_wg = 64u * (size_t)ggml_cl_iq1s_mv_r();
+                size_t m_global[3] = { CEIL_DIV((size_t)ne01, rows_wg) * 64,
+                                       CEIL_DIV((size_t)ne11, (size_t)2) * (size_t)nsg, 1 };
+                size_t m_local[3]  = { 64, (size_t)nsg, 1 };
+                backend_ctx->enqueue_ndrange_kernel(mk, 3, m_global, m_local, dst);
+                if (iq1s_y_img) { CL_CHECK(clReleaseMemObject(iq1s_y_img)); }
+                return;
             }
 
             if (ggml_cl_iq1s_is_split(backend_ctx, src0)
