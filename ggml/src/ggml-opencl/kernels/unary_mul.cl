@@ -29,3 +29,30 @@ kernel void kernel_sigmoid_mul_f32(
 
     dst[i] = a[i] * (1.0f / (1.0f + exp(-b[i])));
 }
+
+//------------------------------------------------------------------------------
+// Fused silu + mul: dst = a * silu(b), silu(b) = b / (1 + exp(-b))
+//
+// Gated delta net blocks (qwen3.5's build_norm_gated: RMSNorm(x) then
+// silu(gate) then mul) emit the same launch-bound tiny-tensor SILU+MUL pair
+// as the sigmoid+mul case above, just with the other activation. Kept in the
+// exact expression form of kernel_silu followed by a plain float multiply,
+// so the result is bit-identical to the per-op path.
+//------------------------------------------------------------------------------
+kernel void kernel_silu_mul_f32(
+        global float * a,
+        ulong offseta,
+        global float * b,
+        ulong offsetb,
+        global float * dst,
+        ulong offsetd
+) {
+    a   = (global float*)((global char*)a   + offseta);
+    b   = (global float*)((global char*)b   + offsetb);
+    dst = (global float*)((global char*)dst + offsetd);
+
+    const int i = get_global_id(0);
+
+    const float x = b[i];
+    dst[i] = a[i] * (x / (1.0f + exp(-x)));
+}

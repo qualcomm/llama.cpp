@@ -1392,6 +1392,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_sigmoid_f32, kernel_sigmoid_f16;
     cl_kernel kernel_sigmoid_mul_f32;   // fused sigmoid + mul (gated attention)
     cl_kernel kernel_sigmoid_f32_nc, kernel_sigmoid_f16_nc;
+    cl_kernel kernel_silu_mul_f32;      // fused silu + mul (gated delta net)
     cl_kernel kernel_tri;
     cl_kernel kernel_fill;
     cl_kernel kernel_clamp, kernel_clamp_nc;
@@ -8497,7 +8498,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         GGML_LOG_CONT(".");
     }
 
-    // unary_mul (fused sigmoid + mul)
+    // unary_mul (fused sigmoid/silu + mul)
     {
 #ifdef GGML_OPENCL_EMBED_KERNELS
         const std::string kernel_src {
@@ -8510,6 +8511,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
 
         CL_CHECK((backend_ctx->kernel_sigmoid_mul_f32 = clCreateKernel(backend_ctx->program_unary_mul, "kernel_sigmoid_mul_f32", &err), err));
+        CL_CHECK((backend_ctx->kernel_silu_mul_f32 = clCreateKernel(backend_ctx->program_unary_mul, "kernel_silu_mul_f32", &err), err));
         GGML_LOG_CONT(".");
     }
 
@@ -17754,7 +17756,7 @@ static void ggml_cl_rope_rms_set_rows_fused(ggml_backend_t backend, ggml_tensor 
 // but that view in the gap (so the scatter may run early).
 static int ggml_opencl_find_rope_set_rows_after(const struct ggml_cgraph * cgraph, int rope_idx);
 static void ggml_cl_mul_mat_f32_gelu_fused(ggml_backend_t backend, ggml_tensor * mm_tensor, ggml_tensor * gelu_tensor);
-static void ggml_cl_sigmoid_mul_fused(ggml_backend_t backend, const ggml_tensor * un, ggml_tensor * dst);
+static void ggml_cl_unary_mul_fused(ggml_backend_t backend, const ggml_tensor * un, ggml_tensor * dst);
 static void ggml_opencl_op_norm_fused(ggml_backend_t backend, ggml_tensor * norm_tensor, ggml_tensor * mul_tensor, ggml_tensor * add_tensor);
 static void ggml_opencl_op_group_norm_fused(ggml_backend_t backend, ggml_tensor * gn_tensor, ggml_tensor * mul_tensor, ggml_tensor * add_tensor);
 static void ggml_cl_rope_set_rows(ggml_backend_t backend, ggml_tensor * rope_tensor, ggml_tensor * view_tensor, ggml_tensor * set_rows_tensor);
@@ -17764,15 +17766,17 @@ static void ggml_opencl_op_gemma4_perlayer_block(ggml_backend_t backend, const s
 #endif
 inline bool use_q4k_tiled(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor);   // defined below
 
-// UNARY(sigmoid) + MUL — the gated-attention epilogue emitted by muse-glimmer,
-// afmoe and qwen3.5: gate = sigmoid(Wg @ x) then attn_out * gate. Two dispatches
-// over a tensor of only n_embd_head_k*n_head elements, so the pair is almost pure
-// launch overhead (~11% of all decode dispatches on muse-glimmer-30B).
+// UNARY(sigmoid|silu) + MUL — the gated epilogue emitted by muse-glimmer, afmoe
+// and qwen3.5: either gate = sigmoid(Wg @ x) then attn_out * gate (gated
+// attention), or gate = silu(Wg @ x) then y * gate (the gated delta net blocks'
+// build_norm_gated). Two dispatches over a tensor of only n_embd_head_k*n_head
+// elements, so the pair is almost pure launch overhead (~11% of all decode
+// dispatches on muse-glimmer-30B).
 //
-// ggml_can_fuse already guarantees the sigmoid has exactly one use, feeds the mul,
+// ggml_can_fuse already guarantees the unary has exactly one use, feeds the mul,
 // and matches its shape; the checks here cover what it does not: the unary sub-op,
 // f32-only, contiguity, and that the other mul operand is not a broadcast.
-// GGML_OPENCL_UNARY_MUL_PROBE=2 reports why a candidate SIGMOID was declined (once per reason).
+// GGML_OPENCL_UNARY_MUL_PROBE=2 reports why a candidate was declined (once per reason).
 static void unary_mul_decline(const char * why) {
     static const int probe = []{ const char * e = getenv("GGML_OPENCL_UNARY_MUL_PROBE"); return e ? atoi(e) : 0; }();
     if (probe < 2) {
@@ -17780,15 +17784,18 @@ static void unary_mul_decline(const char * why) {
     }
     static std::set<std::string> seen;
     if (seen.insert(why).second) {
-        GGML_LOG_INFO("ggml_opencl: sigmoid+mul fusion declined: %s\n", why);
+        GGML_LOG_INFO("ggml_opencl: unary+mul fusion declined: %s\n", why);
     }
 }
 #define UNARY_MUL_DECLINE(why) do { unary_mul_decline(why); return false; } while (0)
 
 static bool ggml_opencl_can_fuse_unary_mul(const struct ggml_cgraph * cgraph, int node_idx) {
-    if (cgraph->nodes[node_idx]->op != GGML_OP_UNARY ||
-        ggml_get_unary_op(cgraph->nodes[node_idx]) != GGML_UNARY_OP_SIGMOID) {
+    if (cgraph->nodes[node_idx]->op != GGML_OP_UNARY) {
         return false;   // not a candidate at all; stay silent
+    }
+    const ggml_unary_op uop = ggml_get_unary_op(cgraph->nodes[node_idx]);
+    if (uop != GGML_UNARY_OP_SIGMOID && uop != GGML_UNARY_OP_SILU) {
+        return false;   // no fused kernel for this activation; stay silent
     }
 
     if (!ggml_can_fuse(cgraph, node_idx, { GGML_OP_UNARY, GGML_OP_MUL })) {
@@ -17798,7 +17805,7 @@ static bool ggml_opencl_can_fuse_unary_mul(const struct ggml_cgraph * cgraph, in
     const ggml_tensor * un  = cgraph->nodes[node_idx];
     const ggml_tensor * mul = cgraph->nodes[node_idx + 1];
 
-    // kernel_sigmoid_mul_f32 is f32-only
+    // kernel_sigmoid_mul_f32 / kernel_silu_mul_f32 are f32-only
     if (un->src[0]->type != GGML_TYPE_F32 || un->type != GGML_TYPE_F32 ||
         mul->src[0]->type != GGML_TYPE_F32 || mul->src[1]->type != GGML_TYPE_F32 ||
         mul->type != GGML_TYPE_F32) {
@@ -18241,12 +18248,13 @@ static void ggml_backend_opencl_exec_graph_nodes(ggml_backend_t backend, ggml_cg
             continue;
         }
 
-        // Fuse unary(sigmoid) + mul — the gated-attention epilogue (muse-glimmer,
-        // afmoe, qwen3.5). Two launch-bound dispatches over a small tensor collapse
-        // into one; byte-identical to the per-op path. Opt out GGML_OPENCL_FUSE_UNARY_MUL=0.
+        // Fuse unary(sigmoid|silu) + mul — the gated-attention epilogue (muse-glimmer,
+        // afmoe, qwen3.5) and the gated delta net's norm-gate. Two launch-bound dispatches
+        // over a small tensor collapse into one; byte-identical to the per-op path.
+        // Opt out GGML_OPENCL_FUSE_UNARY_MUL=0.
         if (backend_ctx->fuse_unary_mul && !backend_ctx->disable_fusion &&
             ggml_opencl_can_fuse_unary_mul(cgraph, i)) {
-            ggml_cl_sigmoid_mul_fused(backend, node, cgraph->nodes[i+1]);
+            ggml_cl_unary_mul_fused(backend, node, cgraph->nodes[i+1]);
             i += 1;
             continue;
         }
@@ -28610,15 +28618,15 @@ static void ggml_cl_sigmoid(ggml_backend_t backend, const ggml_tensor * src0, co
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size_ptr, dst);
 }
 
-// Fused UNARY(sigmoid) + MUL: dst = other * sigmoid(un->src[0]). Eligibility is
+// Fused UNARY(sigmoid|silu) + MUL: dst = other * act(un->src[0]). Eligibility is
 // decided by ggml_opencl_can_fuse_unary_mul; byte-identical to the per-op path.
-static void ggml_cl_sigmoid_mul_fused(ggml_backend_t backend, const ggml_tensor * un, ggml_tensor * dst) {
+static void ggml_cl_unary_mul_fused(ggml_backend_t backend, const ggml_tensor * un, ggml_tensor * dst) {
     GGML_ASSERT(un && un->src[0] && un->src[0]->extra);
     GGML_ASSERT(dst && dst->extra);
 
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
 
-    // the mul operand that is not the sigmoid output
+    // the mul operand that is not the unary output
     const ggml_tensor * other = (dst->src[0] == un) ? dst->src[1] : dst->src[0];
     const ggml_tensor * sig_in = un->src[0];
     GGML_ASSERT(other && other->extra);
@@ -28631,14 +28639,21 @@ static void ggml_cl_sigmoid_mul_fused(ggml_backend_t backend, const ggml_tensor 
     cl_ulong offsetb = extra_b->offset + sig_in->view_offs;
     cl_ulong offsetd = extrad->offset  + dst->view_offs;
 
-    cl_kernel kernel = backend_ctx->kernel_sigmoid_mul_f32;
+    const bool is_silu = ggml_get_unary_op(un) == GGML_UNARY_OP_SILU;
 
-    // one-shot confirmation that this arm is the one that fired (GGML_OPENCL_UNARY_MUL_PROBE=1)
+    cl_kernel kernel = is_silu ? backend_ctx->kernel_silu_mul_f32
+                               : backend_ctx->kernel_sigmoid_mul_f32;
+
+    // one-shot confirmation that this arm is the one that fired, per activation
+    // (GGML_OPENCL_UNARY_MUL_PROBE=1)
     static const bool probe = []{ const char * e = getenv("GGML_OPENCL_UNARY_MUL_PROBE"); return e && e[0] != '0'; }();
-    static bool probed = false;
+    static bool probed_sigmoid = false;
+    static bool probed_silu    = false;
+    bool & probed = is_silu ? probed_silu : probed_sigmoid;
     if (probe && !probed) {
         probed = true;
-        GGML_LOG_INFO("ggml_opencl: fused sigmoid+mul active (ne=[%lld,%lld,%lld,%lld])\n",
+        GGML_LOG_INFO("ggml_opencl: fused %s+mul active (ne=[%lld,%lld,%lld,%lld])\n",
+                      is_silu ? "silu" : "sigmoid",
                       (long long)dst->ne[0], (long long)dst->ne[1],
                       (long long)dst->ne[2], (long long)dst->ne[3]);
     }
