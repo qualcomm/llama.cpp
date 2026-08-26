@@ -1933,7 +1933,8 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemm_noshuffle_iq2_s_q8_1_dp4a = nullptr;  // dp4a (int8) dense IQ2_S prefill GEMM over the plane split
     cl_kernel kernel_convert_block_iq1_s_ns = nullptr;  // IQ1_S AoS -> planes
     cl_kernel kernel_restore_block_iq1_s_ns = nullptr;  // IQ1_S planes -> AoS
-    cl_kernel kernel_mul_mv_iq1_s_f32_flat_mc = nullptr;   // two columns per workgroup, ne11 2..31
+    cl_kernel kernel_mul_mv_iq1_s_f32_flat_mc  = nullptr;  // 2 columns per workgroup, ne11 2..31
+    cl_kernel kernel_mul_mv_iq1_s_f32_flat_mc4 = nullptr;  // 4 columns, used when 4 divides ne11
     cl_kernel kernel_gemm_noshuffle_iq1_s_q8_1_dp4a = nullptr;  // dp4a (int8) dense IQ1_S prefill GEMM over the plane split
     cl_kernel kernel_convert_block_iq1_m_ns = nullptr;  // IQ1_M AoS -> planes
     cl_kernel kernel_restore_block_iq1_m_ns = nullptr;  // IQ1_M planes -> AoS
@@ -2861,6 +2862,27 @@ static int ggml_cl_iq1s_mv_nsg() {
 // kernel, 64.4432 vs 64.4424.
 //
 // n=3 is excluded at the dispatch; see the note there.
+// Columns per workgroup for the IQ1_S multi-column GEMV: 2 or 4. DEFAULT 2 --
+// the wider fold is a measured negative on this type, which is not what its
+// siblings do.
+//
+//   3B UD-IQ1_S, prompt t/s, one column -> two -> four
+//     ne11=4    85.86 ->  94.99 (+10.6%) ->  93.63 (+9.0%)
+//     ne11=8   102.34 -> 117.85 (+15.2%) -> 116.84 (+14.2%)
+//     ne11=16  111.08 -> 129.30 (+16.4%) -> 127.32 (+14.6%)
+//
+// IQ1_M went +14.0% -> +34.2% on the same change and IQ2_S +50.2% -> +59.2%, so
+// this was expected to gain and did not. It fits the group -- this type already
+// runs four subgroups, so unlike IQ2_S there is no enqueue refusal and no K-split
+// to give up -- it simply does not pay. IQ1_S does the least weight work per step
+// of the three (two gathers, no sign table, a nibble unpack), so it has the least
+// left to amortise once the first halving is done, and the extra accumulators
+// cost more than the second halving returns.
+static int ggml_cl_iq1s_mv_nc() {
+    static const int v = ggml_cl_env_int("GGML_OPENCL_IQ1S_NC", 2);
+    return (v == 2 || v == 4) ? v : 2;
+}
+
 static int ggml_cl_iq1s_mv_mc() {
     static const int v = ggml_cl_env_int("GGML_OPENCL_IQ1S_MC", 1);
     return v ? 1 : 0;
@@ -4476,6 +4498,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         opts += " -DIQ1S_MV_ABL=" + std::to_string(ggml_cl_iq1s_mv_abl());
         opts += " -DIQ1S_MV_G2=" + std::to_string(ggml_cl_iq1s_mv_g2());
         opts += " -DIQ1S_MV_PF=" + std::to_string(ggml_cl_iq1s_mv_pf());
+        opts += " -DIQ1S_MV_NC=2";
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), opts);
 
@@ -4485,6 +4508,20 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             backend_ctx->kernel_mul_mv_iq1_s_f32_flat_mc =
                 clCreateKernel(prog, "kernel_mul_mv_iq1_s_f32_flat_mc", &err);
             if (err != CL_SUCCESS) { backend_ctx->kernel_mul_mv_iq1_s_f32_flat_mc = nullptr; }
+
+            // Second build at four columns; the host dispatches whichever width
+            // divides ne11, so neither kernel computes a column it discards.
+            if (ggml_cl_iq1s_mv_nc() == 4) {
+                std::string opts4 = opts;
+                const std::string two = " -DIQ1S_MV_NC=2";
+                opts4.replace(opts4.find(two), two.size(), " -DIQ1S_MV_NC=4");
+                cl_program prog4 =
+                    build_program_from_source(backend_ctx, kernel_src.c_str(), opts4);
+                backend_ctx->kernel_mul_mv_iq1_s_f32_flat_mc4 =
+                    clCreateKernel(prog4, "kernel_mul_mv_iq1_s_f32_flat_mc", &err);
+                if (err != CL_SUCCESS) { backend_ctx->kernel_mul_mv_iq1_s_f32_flat_mc4 = nullptr; }
+                CL_CHECK(clReleaseProgram(prog4));
+            }
         }
 
         // The fused-GLU and split-K twins carry a 4-row and a 2-row path only;
@@ -40470,7 +40507,12 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1) {
                 ggml_tensor_extra_cl_iq1_s * ex0 =
                     (ggml_tensor_extra_cl_iq1_s *)src0->extra;
-                cl_kernel mk = backend_ctx->kernel_mul_mv_iq1_s_f32_flat_mc;
+                // widest fold that divides ne11 exactly
+                const bool use4 = backend_ctx->kernel_mul_mv_iq1_s_f32_flat_mc4 != nullptr
+                                  && (ne11 % 4) == 0;
+                const size_t ncol = use4 ? 4u : 2u;
+                cl_kernel mk = use4 ? backend_ctx->kernel_mul_mv_iq1_s_f32_flat_mc4
+                                    : backend_ctx->kernel_mul_mv_iq1_s_f32_flat_mc;
                 const int nsg = ggml_cl_iq1s_mv_nsg();
                 cl_int ai = 0;
                 cl_uint iq1s_y_off = 0;
@@ -40501,12 +40543,12 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 static bool iq1s_mc_logged = false;
                 if (!iq1s_mc_logged) {
                     iq1s_mc_logged = true;
-                    GGML_LOG_INFO("ggml_opencl: iq1_s multi-column GEMV active (ne11=%d)\n", ne11);
+                    GGML_LOG_INFO("ggml_opencl: iq1_s multi-column GEMV active (ne11=%d, %d cols)\n", ne11, (int)ncol);
                 }
 
                 const size_t rows_wg = 64u * (size_t)ggml_cl_iq1s_mv_r();
                 size_t m_global[3] = { CEIL_DIV((size_t)ne01, rows_wg) * 64,
-                                       CEIL_DIV((size_t)ne11, (size_t)2) * (size_t)nsg, 1 };
+                                       CEIL_DIV((size_t)ne11, ncol) * (size_t)nsg, 1 };
                 size_t m_local[3]  = { 64, (size_t)nsg, 1 };
                 backend_ctx->enqueue_ndrange_kernel(mk, 3, m_global, m_local, dst);
                 if (iq1s_y_img) { CL_CHECK(clReleaseMemObject(iq1s_y_img)); }

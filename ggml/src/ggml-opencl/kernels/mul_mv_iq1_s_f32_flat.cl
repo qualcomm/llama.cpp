@@ -892,12 +892,25 @@ kernel void kernel_mul_mv_iq1_s_f32_flat(
 // the store, so there is no divergent branch in the inner loop.
 // ---------------------------------------------------------------------------
 
+// Columns per workgroup: 2 or 4. The file is compiled TWICE so both exist as
+// separate kernels and the host dispatches whichever width divides ne11. Two
+// entry points rather than one kernel branching on the width: guarding the
+// trailing columns cost 7-9% on the IQ1_M twin where there was no tail to
+// guard, because the branch blocks the scheduling of the loop body.
+#ifndef IQ1S_MV_NC
+#define IQ1S_MV_NC 2
+#endif
+
 #if IQ1S_MV_AIMG
 #define IQ1S_MCYA(g) read_imagef(y_img, (int)(y_tex_a + (g)))
 #define IQ1S_MCYB(g) read_imagef(y_img, (int)(y_tex_b + (g)))
+#define IQ1S_MCYC(g) read_imagef(y_img, (int)(y_tex_c + (g)))
+#define IQ1S_MCYD(g) read_imagef(y_img, (int)(y_tex_d + (g)))
 #else
 #define IQ1S_MCYA(g) vload4((g), ya)
 #define IQ1S_MCYB(g) vload4((g), yb)
+#define IQ1S_MCYC(g) vload4((g), yc)
+#define IQ1S_MCYD(g) vload4((g), yd)
 #endif
 
 inline float iq1s_hsum(float4 v) { return (v.s0 + v.s1) + (v.s2 + v.s3); }
@@ -930,7 +943,7 @@ kernel void kernel_mul_mv_iq1_s_f32_flat_mc(
     const uint sgi = get_local_id(1);
 
     const uint nc  = (uint)ne11;
-    const uint ca  = get_group_id(1) * 2u;
+    const uint ca  = get_group_id(1) * IQ1S_MV_NC;
     const uint has_b = (ca + 1u < nc) ? 1u : 0u;
     const uint cb  = ca + has_b;          // duplicate of ca when the pair is odd
 
@@ -939,6 +952,18 @@ kernel void kernel_mul_mv_iq1_s_f32_flat_mc(
 #if IQ1S_MV_AIMG
     const uint y_tex_a = y_off + ca * ((uint)ne10 >> 2);
     const uint y_tex_b = y_off + cb * ((uint)ne10 >> 2);
+#endif
+#if IQ1S_MV_NC == 4
+    const uint has_c = (ca + 2u < nc) ? 1u : 0u;
+    const uint has_d = (ca + 3u < nc) ? 1u : 0u;
+    const uint cc    = ca + (has_c ? 2u : 0u);
+    const uint cd    = ca + (has_d ? 3u : 0u);
+    global const float * yc = src1 + (ulong)cc * (uint)ne10;
+    global const float * yd = src1 + (ulong)cd * (uint)ne10;
+#if IQ1S_MV_AIMG
+    const uint y_tex_c = y_off + cc * ((uint)ne10 >> 2);
+    const uint y_tex_d = y_off + cd * ((uint)ne10 >> 2);
+#endif
 #endif
 
 #if IQ1S_MV_G2
@@ -954,6 +979,9 @@ kernel void kernel_mul_mv_iq1_s_f32_flat_mc(
     const uint row = j << 1;
 
     float sa0 = 0.f, sa1 = 0.f, sb0 = 0.f, sb1 = 0.f;   // [column][row]
+#if IQ1S_MV_NC == 4
+    float sc0 = 0.f, sc1 = 0.f, sd0 = 0.f, sd1 = 0.f;
+#endif
 
     if (j < mh) {
         global const ushort * qsu = (global const ushort *)src0_qs;
@@ -962,6 +990,9 @@ kernel void kernel_mul_mv_iq1_s_f32_flat_mc(
             const half2 dh = vload2(j + ib * mh, src0_d);
 
             float aa0 = 0.f, aa1 = 0.f, ab0 = 0.f, ab1 = 0.f;
+#if IQ1S_MV_NC == 4
+            float ac0 = 0.f, ac1 = 0.f, ad0 = 0.f, ad1 = 0.f;
+#endif
             for (uint sb = 0; sb < 8u; ++sb) {
                 const uint    sub = ib * 8u + sb;
                 const ushort2 qhv = vload2(j + sub * mh, src0_qh);   // row pair, one load
@@ -977,6 +1008,10 @@ kernel void kernel_mul_mv_iq1_s_f32_flat_mc(
 
                 float pa0 = 0.f, pa1 = 0.f, pb0 = 0.f, pb1 = 0.f;
                 float qa  = 0.f, qb  = 0.f;              // per-column activation sums
+#if IQ1S_MV_NC == 4
+                float pc0 = 0.f, pc1 = 0.f, pd0 = 0.f, pd1 = 0.f;
+                float qc  = 0.f, qd  = 0.f;
+#endif
                 for (uint l = 0; l < 4u; ++l) {
                     const uint qsv = (uint)qsu[gb + l * mh];   // row pair, one load
                     // ONE gather pair for BOTH columns -- the whole point
@@ -994,21 +1029,50 @@ kernel void kernel_mul_mv_iq1_s_f32_flat_mc(
                     qb  += iq1s_hsum(b0v) + iq1s_hsum(b1v);
                     pb0 += dot(b0v, IQ1S_GVEC(g0)) + dot(b1v, IQ1S_GVEC_HI(g0));
                     pb1 += dot(b0v, IQ1S_GVEC(g1)) + dot(b1v, IQ1S_GVEC_HI(g1));
+#if IQ1S_MV_NC == 4
+                    const float4 c0v = IQ1S_MCYC(grp + 2u*l + 0u);
+                    const float4 c1v = IQ1S_MCYC(grp + 2u*l + 1u);
+                    qc  += iq1s_hsum(c0v) + iq1s_hsum(c1v);
+                    pc0 += dot(c0v, IQ1S_GVEC(g0)) + dot(c1v, IQ1S_GVEC_HI(g0));
+                    pc1 += dot(c0v, IQ1S_GVEC(g1)) + dot(c1v, IQ1S_GVEC_HI(g1));
+
+                    const float4 d0v = IQ1S_MCYD(grp + 2u*l + 0u);
+                    const float4 d1v = IQ1S_MCYD(grp + 2u*l + 1u);
+                    qd  += iq1s_hsum(d0v) + iq1s_hsum(d1v);
+                    pd0 += dot(d0v, IQ1S_GVEC(g0)) + dot(d1v, IQ1S_GVEC_HI(g0));
+                    pd1 += dot(d0v, IQ1S_GVEC(g1)) + dot(d1v, IQ1S_GVEC_HI(g1));
+#endif
                 }
                 aa0 += s0 * (pa0 + t0 * qa);
                 aa1 += s1 * (pa1 + t1 * qa);
                 ab0 += s0 * (pb0 + t0 * qb);
                 ab1 += s1 * (pb1 + t1 * qb);
+#if IQ1S_MV_NC == 4
+                ac0 += s0 * (pc0 + t0 * qc);
+                ac1 += s1 * (pc1 + t1 * qc);
+                ad0 += s0 * (pd0 + t0 * qd);
+                ad1 += s1 * (pd1 + t1 * qd);
+#endif
             }
             sa0 += (float)dh.s0 * aa0;
             sa1 += (float)dh.s1 * aa1;
             sb0 += (float)dh.s0 * ab0;
             sb1 += (float)dh.s1 * ab1;
+#if IQ1S_MV_NC == 4
+            sc0 += (float)dh.s0 * ac0;
+            sc1 += (float)dh.s1 * ac1;
+            sd0 += (float)dh.s0 * ad0;
+            sd1 += (float)dh.s1 * ad1;
+#endif
         }
     }
 
 #if IQ1S_MV_NSG > 1
     __local float4 mcpart[IQ1S_MV_NSG][64];
+#if IQ1S_MV_NC == 4
+    __local float4 mcpart2[IQ1S_MV_NSG][64];
+    mcpart2[sgi][lid] = (float4)(sc0, sc1, sd0, sd1);
+#endif
     mcpart[sgi][lid] = (float4)(sa0, sa1, sb0, sb1);
     barrier(CLK_LOCAL_MEM_FENCE);
     if (sgi != 0) {
@@ -1017,6 +1081,10 @@ kernel void kernel_mul_mv_iq1_s_f32_flat_mc(
     for (uint s = 1; s < IQ1S_MV_NSG; ++s) {
         const float4 p = mcpart[s][lid];
         sa0 += p.s0; sa1 += p.s1; sb0 += p.s2; sb1 += p.s3;
+#if IQ1S_MV_NC == 4
+        const float4 q = mcpart2[s][lid];
+        sc0 += q.s0; sc1 += q.s1; sd0 += q.s2; sd1 += q.s3;
+#endif
     }
 #endif
 
@@ -1025,6 +1093,14 @@ kernel void kernel_mul_mv_iq1_s_f32_flat_mc(
         if (has_b) {
             vstore2((float2)(sb0, sb1), 0, dst + (ulong)cb * (uint)ne0 + row);
         }
+#if IQ1S_MV_NC == 4
+        if (has_c) {
+            vstore2((float2)(sc0, sc1), 0, dst + (ulong)cc * (uint)ne0 + row);
+        }
+        if (has_d) {
+            vstore2((float2)(sd0, sd1), 0, dst + (ulong)cd * (uint)ne0 + row);
+        }
+#endif
     }
 #undef IQ1S_MCGRID
 }
