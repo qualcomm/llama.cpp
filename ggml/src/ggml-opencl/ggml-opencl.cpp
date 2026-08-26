@@ -1345,6 +1345,8 @@ struct ggml_backend_opencl_context {
     // buffer is kept alongside so the image can never outlive it.
     cl_mem iq2s_grid_buf = nullptr, iq2s_grid_img = nullptr;
     cl_mem iq1s_grid_buf = nullptr, iq1s_grid_img = nullptr;
+    // 2-bit twin of the above, half the bytes; see IQ1S_MV_G2
+    cl_mem iq1s_grid2_buf = nullptr, iq1s_grid2_img = nullptr;
     cl_mem iq3s_grid_buf = nullptr, iq3s_grid_img = nullptr;
     cl_mem iq3xxs_grid_buf = nullptr, iq3xxs_grid_img = nullptr;
     cl_mem iq1m_grid_buf = nullptr, iq1m_grid_img = nullptr;
@@ -2802,6 +2804,21 @@ static int ggml_cl_iq1s_mv_nsg() {
 // Wrong-math cost probe for the IQ1_S decode GEMVs; see the kernel header.
 // 1 prices the codebook gather, 2 the activation load. Never non-zero in a
 // shipped configuration -- the numbers it produces are wrong on purpose.
+// IQ1S_MV_G2: read the IQ1_S codebook as 2 bits per weight rather than 4,
+// halving the hot table to 4 KB. Aimed at the term IQ1S_MV_ABL prices at 11.5%
+// of decode. Off until measured; GGML_OPENCL_IQ1S_G2 forces either way.
+static int ggml_cl_iq1s_mv_g2() {
+    static const int v = ggml_cl_env_int("GGML_OPENCL_IQ1S_G2", 0);
+    return v ? 1 : 0;
+}
+
+// Which codebook encoding the IQ1_S flat GEMVs were compiled to read. The
+// prefill dp4a GEMM and the AoS kernel always want the 4-bit table -- they hand
+// its nibbles straight to dp4a -- so they keep using iq1s_grid_img directly.
+static cl_mem ggml_cl_iq1s_mv_grid_img(const ggml_backend_opencl_context * backend_ctx) {
+    return ggml_cl_iq1s_mv_g2() ? backend_ctx->iq1s_grid2_img : backend_ctx->iq1s_grid_img;
+}
+
 static int ggml_cl_iq1s_mv_abl() {
     static const int v = ggml_cl_env_int("GGML_OPENCL_IQ1S_MV_ABL", 0);
     return (v >= 0 && v <= 2) ? v : 0;
@@ -4333,6 +4350,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         opts += " -DIQ1S_MV_AIMG=" + std::to_string(ggml_cl_iq1s_mv_aimg(backend_ctx));
         opts += " -DMV_WORK2=" + std::to_string(ggml_cl_mv_work2());
         opts += " -DIQ1S_MV_ABL=" + std::to_string(ggml_cl_iq1s_mv_abl());
+        opts += " -DIQ1S_MV_G2=" + std::to_string(ggml_cl_iq1s_mv_g2());
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), opts);
 
@@ -4349,6 +4367,10 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         }
         ggml_cl_make_grid_image(backend_ctx, prog, "kernel_iq1s_grid_export", 2048,
                                 &backend_ctx->iq1s_grid_buf, &backend_ctx->iq1s_grid_img);
+        // 1024 texels, two entries each. Built even when off: it is 4 KB and it
+        // keeps the enable path free of a first-dispatch allocation.
+        ggml_cl_make_grid_image(backend_ctx, prog, "kernel_iq1s_grid2_export", 1024,
+                                &backend_ctx->iq1s_grid2_buf, &backend_ctx->iq1s_grid2_img);
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
@@ -24286,8 +24308,9 @@ static void ggml_cl_mul_mat_iq1_s_glu_fused(ggml_backend_t backend, ggml_tensor 
     cl_mem  iq1s_y_img = ggml_cl_iq1s_mv_aimg(backend_ctx)
         ? ggml_cl_activation_image(backend_ctx, extra1->data_device, offset1, ne10, ne11, &iq1s_y_off)
         : nullptr;
-    cl_mem  iq1s_y_arg = iq1s_y_img ? iq1s_y_img : backend_ctx->iq1s_grid_img;
-    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &backend_ctx->iq1s_grid_img));
+    cl_mem  iq1s_y_arg = iq1s_y_img ? iq1s_y_img : ggml_cl_iq1s_mv_grid_img(backend_ctx);
+    cl_mem  iq1s_grid_arg = ggml_cl_iq1s_mv_grid_img(backend_ctx);
+    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &iq1s_grid_arg));
     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),  &iq1s_y_arg));
     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_uint), &iq1s_y_off));
     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex_g->qs));
@@ -37653,8 +37676,9 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     cl_mem  iq1s_y_img = ggml_cl_iq1s_mv_aimg(backend_ctx)
                         ? ggml_cl_activation_image(backend_ctx, extra1->data_device, offset1, ne10, ne11, &iq1s_y_off)
                         : nullptr;
-                    cl_mem  iq1s_y_arg = iq1s_y_img ? iq1s_y_img : backend_ctx->iq1s_grid_img;
-                    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &backend_ctx->iq1s_grid_img));
+                    cl_mem  iq1s_y_arg = iq1s_y_img ? iq1s_y_img : ggml_cl_iq1s_mv_grid_img(backend_ctx);
+                    cl_mem  iq1s_grid_arg = ggml_cl_iq1s_mv_grid_img(backend_ctx);
+                    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &iq1s_grid_arg));
                     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),  &iq1s_y_arg));
                     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_uint), &iq1s_y_off));
                     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->qs));
@@ -40114,8 +40138,9 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     cl_mem  iq1s_y_img = ggml_cl_iq1s_mv_aimg(backend_ctx)
                         ? ggml_cl_activation_image(backend_ctx, extra1->data_device, offset1, ne10, ne11, &iq1s_y_off)
                         : nullptr;
-                    cl_mem  iq1s_y_arg = iq1s_y_img ? iq1s_y_img : backend_ctx->iq1s_grid_img;
-                    CL_CHECK(clSetKernelArg(sk, ai++, sizeof(cl_mem),   &backend_ctx->iq1s_grid_img));
+                    cl_mem  iq1s_y_arg = iq1s_y_img ? iq1s_y_img : ggml_cl_iq1s_mv_grid_img(backend_ctx);
+                    cl_mem  iq1s_grid_arg = ggml_cl_iq1s_mv_grid_img(backend_ctx);
+                    CL_CHECK(clSetKernelArg(sk, ai++, sizeof(cl_mem),   &iq1s_grid_arg));
                     CL_CHECK(clSetKernelArg(sk, ai++, sizeof(cl_mem),  &iq1s_y_arg));
                     CL_CHECK(clSetKernelArg(sk, ai++, sizeof(cl_uint), &iq1s_y_off));
                     CL_CHECK(clSetKernelArg(sk, ai++, sizeof(cl_mem),   &ex0->qs));
@@ -40159,8 +40184,9 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 cl_mem  iq1s_y_img = ggml_cl_iq1s_mv_aimg(backend_ctx)
                     ? ggml_cl_activation_image(backend_ctx, extra1->data_device, offset1, ne10, ne11, &iq1s_y_off)
                     : nullptr;
-                cl_mem  iq1s_y_arg = iq1s_y_img ? iq1s_y_img : backend_ctx->iq1s_grid_img;
-                CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &backend_ctx->iq1s_grid_img));
+                cl_mem  iq1s_y_arg = iq1s_y_img ? iq1s_y_img : ggml_cl_iq1s_mv_grid_img(backend_ctx);
+                cl_mem  iq1s_grid_arg = ggml_cl_iq1s_mv_grid_img(backend_ctx);
+                CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &iq1s_grid_arg));
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),  &iq1s_y_arg));
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_uint), &iq1s_y_off));
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->qs));

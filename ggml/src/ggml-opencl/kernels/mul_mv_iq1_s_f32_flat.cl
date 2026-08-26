@@ -338,6 +338,71 @@ inline float4 iq1s_vals(uint g) {
                     (float)((g >> 16) & 0xFu), (float)((g >> 24) & 0xFu));
 }
 
+// Four TRUE signed weights (-1, 0, 1) packed two bits each into one byte, low
+// pair first. Two's complement, so each extract is a shift pair on a signed int
+// and costs exactly what the nibble unpack above costs.
+inline float4 iq1s_vals2(uint b) {
+    const int x = (int)b;
+    return (float4)((float)((x << 30) >> 30), (float)((x << 28) >> 30),
+                    (float)((x << 26) >> 30), (float)((x << 24) >> 30));
+}
+
+// IQ1S_MV_G2=1: read the codebook as 2 BITS per weight instead of 4, halving the
+// hot table from 8 KB to 4 KB.
+//
+// Why this term: IQ1S_MV_ABL prices the codebook gather at 11.5% of decode on a
+// 3B and the activation load at 0.6%, so the table is what is left worth
+// attacking here. A gather-bound kernel wants a SMALLER hot table, and the grid
+// stores only three distinct values per weight -- four bits is one more than the
+// encoding needs. Vulkan's float mat-vec and WebGPU both carry the 2-bit form for
+// this reason and keep the 4-bit one only for their integer-dot paths, which hand
+// two dp4a operands per fetch. This kernel is not one of those.
+//
+// Two entries share one 32-bit texel, so the table is 1024 texels: entry i is at
+// texel i>>1, half i&1. Within an entry the low byte carries weights 0..3 and the
+// high byte weights 4..7 -- the same split the nibble form has, so the two paths
+// differ only in the extract and in IQ1S_DBIAS.
+//
+// The 2-bit values are true signed rather than the nibble form's +1 bias, so the
+// delta term loses the -1 that used to cancel that bias.
+//
+// Built from iq1s_grid_gpu at init by kernel_iq1s_grid2_export, so the table is
+// never duplicated on the host and cannot drift from the one compiled in here.
+//
+// ⛔ MEASURED AND REFUTED. Llama-3.2-3B-UD-IQ1_S on X2-90, both arms repeated:
+// tg64 50.57 -> 49.59 (-1.9%), pp512 1014.8 -> 1015.0 (unchanged, the prefill
+// GEMM keeps the 4-bit table).
+//
+// 🔑 WHAT THIS RULES OUT, and it is the useful part. The gather costs 11.5%
+// (IQ1S_MV_ABL=1) but the table's FOOTPRINT is not why: 8 KB already sits in
+// whatever tier serves it, so halving it buys nothing and the half-select shift
+// is a small net loss. Together with the two results either side of it --
+// doubling the arithmetic is free (MV_WORK2), and folding four rows instead of
+// two LOSES 2.7% and cannot even be enqueued at NSG=8 -- the cost is a
+// serialized DEPENDENT-FETCH LATENCY (qs load -> index -> table read -> unpack)
+// that occupancy would normally hide and this kernel cannot, because it is at
+// the register ceiling. Anything that adds per-lane state loses; anything that
+// only removes bytes or ALU does nothing.
+//
+// ⇒ the remaining lever is more gathers IN FLIGHT per lane at equal register
+// cost -- software-pipelining the codebook fetch one iteration ahead -- not a
+// smaller table, not fewer instructions, and not a wider row fold.
+//
+// Kept behind the knob so the boundary is recorded rather than re-derived.
+#ifndef IQ1S_MV_G2
+#define IQ1S_MV_G2 0
+#endif
+
+#if IQ1S_MV_G2
+#define IQ1S_DBIAS      0.0f
+#define IQ1S_GVEC(g)    iq1s_vals2((g) & 0xFFu)
+#define IQ1S_GVEC_HI(g) iq1s_vals2(((g) >> 8) & 0xFFu)
+#else
+#define IQ1S_DBIAS      1.0f
+#define IQ1S_GVEC(g)    iq1s_vals(g)
+#define IQ1S_GVEC_HI(g) iq1s_vals((g) >> 4)
+#endif
+
 // IQ1S_MV_GRIDIMG=1: read the grid through an image1d_buffer instead of staging it
 // in LOCAL memory.
 //
@@ -415,6 +480,29 @@ kernel void kernel_iq1s_grid_export(global uint * out) {
     }
 }
 
+// Packs iq1s_grid_gpu into the 2-bit form IQ1S_MV_G2 reads: two entries per uint,
+// and within an entry weights 0..3 in the low byte, 4..7 in the high byte. The
+// nibble is biased by +1, so `nib - 1` masked to two bits is the value in two's
+// complement: 0 -> 3 (-1), 1 -> 0, 2 -> 1.
+kernel void kernel_iq1s_grid2_export(global uint * out) {
+    const uint i = get_global_id(0);
+    if (i < 1024u) {
+        uint packed = 0u;
+        for (uint h = 0; h < 2u; ++h) {
+            const uint g = iq1s_grid_gpu[2u * i + h];
+            uint e = 0u;
+            for (uint b = 0; b < 4u; ++b) {
+                const uint lo = ((g >> (8u * b))        & 0xFu) - 1u;  // weight b
+                const uint hi = ((g >> (8u * b + 4u))   & 0xFu) - 1u;  // weight b+4
+                e |= (lo & 3u) << (2u * b);
+                e |= (hi & 3u) << (8u + 2u * b);
+            }
+            packed |= e << (16u * h);
+        }
+        out[i] = packed;
+    }
+}
+
 kernel void kernel_mul_mv_iq1_s_f32_flat(
         __read_only image1d_buffer_t grid_img,
         __read_only image1d_buffer_t y_img,   // see IQ1S_MV_AIMG
@@ -447,7 +535,10 @@ kernel void kernel_mul_mv_iq1_s_f32_flat(
     const uint y_tex = y_off + col * ((uint)ne10 >> 2);
 #endif
 
-#if IQ1S_MV_GRIDIMG
+#if IQ1S_MV_G2
+// one texel carries TWO entries; i>>1 selects it, i&1 the half
+#define IQ1S_GRID(i) IQ1S_ABL((read_imageui(grid_img, (int)((i) >> 1)).x >> (((i) & 1u) << 4)), (i))
+#elif IQ1S_MV_GRIDIMG
 #define IQ1S_GRID(i) IQ1S_ABL((read_imageui(grid_img, (int)(i)).x), (i))
 #elif IQ1S_MV_LDSGRID
     __local uint sh_grid[2048];
@@ -488,10 +579,10 @@ kernel void kernel_mul_mv_iq1_s_f32_flat(
                 const float s1 = (float)(2u * ((h1 >> 12) & 7u) + 1u);
                 const float s2 = (float)(2u * ((h2 >> 12) & 7u) + 1u);
                 const float s3 = (float)(2u * ((h3 >> 12) & 7u) + 1u);
-                const float t0 = ((h0 & 0x8000u) ? -0.125f : 0.125f) - 1.0f;
-                const float t1 = ((h1 & 0x8000u) ? -0.125f : 0.125f) - 1.0f;
-                const float t2 = ((h2 & 0x8000u) ? -0.125f : 0.125f) - 1.0f;
-                const float t3 = ((h3 & 0x8000u) ? -0.125f : 0.125f) - 1.0f;
+                const float t0 = ((h0 & 0x8000u) ? -0.125f : 0.125f) - IQ1S_DBIAS;
+                const float t1 = ((h1 & 0x8000u) ? -0.125f : 0.125f) - IQ1S_DBIAS;
+                const float t2 = ((h2 & 0x8000u) ? -0.125f : 0.125f) - IQ1S_DBIAS;
+                const float t3 = ((h3 & 0x8000u) ? -0.125f : 0.125f) - IQ1S_DBIAS;
 
                 const uint gb  = j + (sub * 4u) * mq;
                 const uint grp = sub * 8u;
@@ -508,13 +599,13 @@ kernel void kernel_mul_mv_iq1_s_f32_flat(
                     const float4 y0 = IQ1S_YV(grp + 2u*l + 0u);
                     const float4 y1 = IQ1S_YV(grp + 2u*l + 1u);
                     as += y0 + y1;
-                    a0 += dot(y0, iq1s_vals(g0)) + dot(y1, iq1s_vals(g0 >> 4));
+                    a0 += dot(y0, IQ1S_GVEC(g0)) + dot(y1, IQ1S_GVEC_HI(g0));
 #if MV_WORK2
-                    a0 += dot(y0, iq1s_vals(g0 + 1u)) + dot(y1, iq1s_vals((g0 >> 4) + 1u));
+                    a0 += dot(y0, IQ1S_GVEC(g0 + 1u)) + dot(y1, IQ1S_GVEC_HI(g0 + 1u));
 #endif
-                    a1 += dot(y0, iq1s_vals(g1)) + dot(y1, iq1s_vals(g1 >> 4));
-                    a2 += dot(y0, iq1s_vals(g2)) + dot(y1, iq1s_vals(g2 >> 4));
-                    a3 += dot(y0, iq1s_vals(g3)) + dot(y1, iq1s_vals(g3 >> 4));
+                    a1 += dot(y0, IQ1S_GVEC(g1)) + dot(y1, IQ1S_GVEC_HI(g1));
+                    a2 += dot(y0, IQ1S_GVEC(g2)) + dot(y1, IQ1S_GVEC_HI(g2));
+                    a3 += dot(y0, IQ1S_GVEC(g3)) + dot(y1, IQ1S_GVEC_HI(g3));
                 }
                 // one activation sum, four rows -- this is the whole point
                 const float asum = as.s0 + as.s1 + as.s2 + as.s3;
@@ -550,8 +641,8 @@ kernel void kernel_mul_mv_iq1_s_f32_flat(
 
                 const float s0  = (float)(2u * ((h0 >> 12) & 7u) + 1u);
                 const float s1  = (float)(2u * ((h1 >> 12) & 7u) + 1u);
-                const float t0  = ((h0 & 0x8000u) ? -0.125f : 0.125f) - 1.0f;
-                const float t1  = ((h1 & 0x8000u) ? -0.125f : 0.125f) - 1.0f;
+                const float t0  = ((h0 & 0x8000u) ? -0.125f : 0.125f) - IQ1S_DBIAS;
+                const float t1  = ((h1 & 0x8000u) ? -0.125f : 0.125f) - IQ1S_DBIAS;
 
                 const uint gb  = j + (sub * 4u) * mh;
                 const uint grp = sub * 8u;
@@ -566,11 +657,11 @@ kernel void kernel_mul_mv_iq1_s_f32_flat(
                     const float4 y0 = IQ1S_YV(grp + 2u*l + 0u);
                     const float4 y1 = IQ1S_YV(grp + 2u*l + 1u);
                     as += y0 + y1;
-                    a0 += dot(y0, iq1s_vals(g0)) + dot(y1, iq1s_vals(g0 >> 4));
+                    a0 += dot(y0, IQ1S_GVEC(g0)) + dot(y1, IQ1S_GVEC_HI(g0));
 #if MV_WORK2
-                    a0 += dot(y0, iq1s_vals(g0 + 1u)) + dot(y1, iq1s_vals((g0 >> 4) + 1u));
+                    a0 += dot(y0, IQ1S_GVEC(g0 + 1u)) + dot(y1, IQ1S_GVEC_HI(g0 + 1u));
 #endif
-                    a1 += dot(y0, iq1s_vals(g1)) + dot(y1, iq1s_vals(g1 >> 4));
+                    a1 += dot(y0, IQ1S_GVEC(g1)) + dot(y1, IQ1S_GVEC_HI(g1));
                 }
                 // one activation sum, both rows
                 const float asum = as.s0 + as.s1 + as.s2 + as.s3;
@@ -595,7 +686,7 @@ kernel void kernel_mul_mv_iq1_s_f32_flat(
                 const uint  sub = ib * 8u + sb;
                 const uint  h   = (uint)src0_qh[row + sub * m];
                 const float sc  = (float)(2u * ((h >> 12) & 7u) + 1u);
-                const float t   = ((h & 0x8000u) ? -0.125f : 0.125f) - 1.0f;
+                const float t   = ((h & 0x8000u) ? -0.125f : 0.125f) - IQ1S_DBIAS;
 
                 const uint gb  = row + (sub * 4u) * m;
                 const uint grp = sub * 8u;
@@ -608,9 +699,9 @@ kernel void kernel_mul_mv_iq1_s_f32_flat(
                     const float4 y0 = IQ1S_YV(grp + 2u*l + 0u);
                     const float4 y1 = IQ1S_YV(grp + 2u*l + 1u);
                     as += y0 + y1;
-                    a += dot(y0, iq1s_vals(g)) + dot(y1, iq1s_vals(g >> 4));
+                    a += dot(y0, IQ1S_GVEC(g)) + dot(y1, IQ1S_GVEC_HI(g));
 #if MV_WORK2
-                    a += dot(y0, iq1s_vals(g + 1u)) + dot(y1, iq1s_vals((g >> 4) + 1u));
+                    a += dot(y0, IQ1S_GVEC(g + 1u)) + dot(y1, IQ1S_GVEC_HI(g + 1u));
 #endif
                 }
                 const float asum = as.s0 + as.s1 + as.s2 + as.s3;
@@ -764,7 +855,10 @@ kernel void kernel_mul_mv_iq1_s_f32_flat_glu(
     const uint y_tex = y_off + col * ((uint)ne10 >> 2);
 #endif
 
-#if IQ1S_MV_GRIDIMG
+#if IQ1S_MV_G2
+// one texel carries TWO entries; i>>1 selects it, i&1 the half
+#define IQ1S_GGRID(i) IQ1S_ABL((read_imageui(grid_img, (int)((i) >> 1)).x >> (((i) & 1u) << 4)), (i))
+#elif IQ1S_MV_GRIDIMG
 #define IQ1S_GGRID(i) IQ1S_ABL((read_imageui(grid_img, (int)(i)).x), (i))
 #else
 #define IQ1S_GGRID(i) IQ1S_ABL(iq1s_grid_gpu[(i)], (i))
@@ -806,14 +900,14 @@ kernel void kernel_mul_mv_iq1_s_f32_flat_glu(
                 const float usc1 = (float)(2u * ((uh1 >> 12) & 7u) + 1u);
                 const float usc2 = (float)(2u * ((uh2 >> 12) & 7u) + 1u);
                 const float usc3 = (float)(2u * ((uh3 >> 12) & 7u) + 1u);
-                const float gt0 = ((gh0 & 0x8000u) ? -0.125f : 0.125f) - 1.0f;
-                const float gt1 = ((gh1 & 0x8000u) ? -0.125f : 0.125f) - 1.0f;
-                const float gt2 = ((gh2 & 0x8000u) ? -0.125f : 0.125f) - 1.0f;
-                const float gt3 = ((gh3 & 0x8000u) ? -0.125f : 0.125f) - 1.0f;
-                const float ut0 = ((uh0 & 0x8000u) ? -0.125f : 0.125f) - 1.0f;
-                const float ut1 = ((uh1 & 0x8000u) ? -0.125f : 0.125f) - 1.0f;
-                const float ut2 = ((uh2 & 0x8000u) ? -0.125f : 0.125f) - 1.0f;
-                const float ut3 = ((uh3 & 0x8000u) ? -0.125f : 0.125f) - 1.0f;
+                const float gt0 = ((gh0 & 0x8000u) ? -0.125f : 0.125f) - IQ1S_DBIAS;
+                const float gt1 = ((gh1 & 0x8000u) ? -0.125f : 0.125f) - IQ1S_DBIAS;
+                const float gt2 = ((gh2 & 0x8000u) ? -0.125f : 0.125f) - IQ1S_DBIAS;
+                const float gt3 = ((gh3 & 0x8000u) ? -0.125f : 0.125f) - IQ1S_DBIAS;
+                const float ut0 = ((uh0 & 0x8000u) ? -0.125f : 0.125f) - IQ1S_DBIAS;
+                const float ut1 = ((uh1 & 0x8000u) ? -0.125f : 0.125f) - IQ1S_DBIAS;
+                const float ut2 = ((uh2 & 0x8000u) ? -0.125f : 0.125f) - IQ1S_DBIAS;
+                const float ut3 = ((uh3 & 0x8000u) ? -0.125f : 0.125f) - IQ1S_DBIAS;
 
                 const uint gb  = j + (sub * 4u) * mq;
                 const uint grp = sub * 8u;
@@ -833,20 +927,20 @@ kernel void kernel_mul_mv_iq1_s_f32_flat_glu(
                     const uint gg1  = IQ1S_GGRID(((gqsv >>  8) & 0xFFu) | (((gh1 >> (3u*l)) & 7u) << 8));
                     const uint gg2  = IQ1S_GGRID(((gqsv >> 16) & 0xFFu) | (((gh2 >> (3u*l)) & 7u) << 8));
                     const uint gg3  = IQ1S_GGRID(( gqsv >> 24)          | (((gh3 >> (3u*l)) & 7u) << 8));
-                    ga0 += dot(y0, iq1s_vals(gg0)) + dot(y1, iq1s_vals(gg0 >> 4));
-                    ga1 += dot(y0, iq1s_vals(gg1)) + dot(y1, iq1s_vals(gg1 >> 4));
-                    ga2 += dot(y0, iq1s_vals(gg2)) + dot(y1, iq1s_vals(gg2 >> 4));
-                    ga3 += dot(y0, iq1s_vals(gg3)) + dot(y1, iq1s_vals(gg3 >> 4));
+                    ga0 += dot(y0, IQ1S_GVEC(gg0)) + dot(y1, IQ1S_GVEC_HI(gg0));
+                    ga1 += dot(y0, IQ1S_GVEC(gg1)) + dot(y1, IQ1S_GVEC_HI(gg1));
+                    ga2 += dot(y0, IQ1S_GVEC(gg2)) + dot(y1, IQ1S_GVEC_HI(gg2));
+                    ga3 += dot(y0, IQ1S_GVEC(gg3)) + dot(y1, IQ1S_GVEC_HI(gg3));
 
                     const uint uqsv = uqsu[gb + l * mq];
                     const uint ug0  = IQ1S_GGRID(( uqsv        & 0xFFu) | (((uh0 >> (3u*l)) & 7u) << 8));
                     const uint ug1  = IQ1S_GGRID(((uqsv >>  8) & 0xFFu) | (((uh1 >> (3u*l)) & 7u) << 8));
                     const uint ug2  = IQ1S_GGRID(((uqsv >> 16) & 0xFFu) | (((uh2 >> (3u*l)) & 7u) << 8));
                     const uint ug3  = IQ1S_GGRID(( uqsv >> 24)          | (((uh3 >> (3u*l)) & 7u) << 8));
-                    ua0 += dot(y0, iq1s_vals(ug0)) + dot(y1, iq1s_vals(ug0 >> 4));
-                    ua1 += dot(y0, iq1s_vals(ug1)) + dot(y1, iq1s_vals(ug1 >> 4));
-                    ua2 += dot(y0, iq1s_vals(ug2)) + dot(y1, iq1s_vals(ug2 >> 4));
-                    ua3 += dot(y0, iq1s_vals(ug3)) + dot(y1, iq1s_vals(ug3 >> 4));
+                    ua0 += dot(y0, IQ1S_GVEC(ug0)) + dot(y1, IQ1S_GVEC_HI(ug0));
+                    ua1 += dot(y0, IQ1S_GVEC(ug1)) + dot(y1, IQ1S_GVEC_HI(ug1));
+                    ua2 += dot(y0, IQ1S_GVEC(ug2)) + dot(y1, IQ1S_GVEC_HI(ug2));
+                    ua3 += dot(y0, IQ1S_GVEC(ug3)) + dot(y1, IQ1S_GVEC_HI(ug3));
                 }
                 const float asum = as.s0 + as.s1 + as.s2 + as.s3;
                 gacc0 += gsc0 * (ga0 + gt0 * asum);
@@ -923,10 +1017,10 @@ kernel void kernel_mul_mv_iq1_s_f32_flat_glu(
                 const float gsc1 = (float)(2u * ((gh1 >> 12) & 7u) + 1u);
                 const float usc0 = (float)(2u * ((uh0 >> 12) & 7u) + 1u);
                 const float usc1 = (float)(2u * ((uh1 >> 12) & 7u) + 1u);
-                const float gt0  = ((gh0 & 0x8000u) ? -0.125f : 0.125f) - 1.0f;
-                const float gt1  = ((gh1 & 0x8000u) ? -0.125f : 0.125f) - 1.0f;
-                const float ut0  = ((uh0 & 0x8000u) ? -0.125f : 0.125f) - 1.0f;
-                const float ut1  = ((uh1 & 0x8000u) ? -0.125f : 0.125f) - 1.0f;
+                const float gt0  = ((gh0 & 0x8000u) ? -0.125f : 0.125f) - IQ1S_DBIAS;
+                const float gt1  = ((gh1 & 0x8000u) ? -0.125f : 0.125f) - IQ1S_DBIAS;
+                const float ut0  = ((uh0 & 0x8000u) ? -0.125f : 0.125f) - IQ1S_DBIAS;
+                const float ut1  = ((uh1 & 0x8000u) ? -0.125f : 0.125f) - IQ1S_DBIAS;
 
                 const uint gb  = j + (sub * 4u) * mh;
                 const uint grp = sub * 8u;
@@ -943,14 +1037,14 @@ kernel void kernel_mul_mv_iq1_s_f32_flat_glu(
                     const uint gqsv = (uint)gqsu[gb + l * mh];
                     const uint gg0  = IQ1S_GGRID(( gqsv       & 0xFFu) | ((((gh0 >> (3u*l)) & 7u) << 8)));
                     const uint gg1  = IQ1S_GGRID(((gqsv >> 8) & 0xFFu) | ((((gh1 >> (3u*l)) & 7u) << 8)));
-                    ga0 += dot(y0, iq1s_vals(gg0)) + dot(y1, iq1s_vals(gg0 >> 4));
-                    ga1 += dot(y0, iq1s_vals(gg1)) + dot(y1, iq1s_vals(gg1 >> 4));
+                    ga0 += dot(y0, IQ1S_GVEC(gg0)) + dot(y1, IQ1S_GVEC_HI(gg0));
+                    ga1 += dot(y0, IQ1S_GVEC(gg1)) + dot(y1, IQ1S_GVEC_HI(gg1));
 
                     const uint uqsv = (uint)uqsu[gb + l * mh];
                     const uint ug0  = IQ1S_GGRID(( uqsv       & 0xFFu) | ((((uh0 >> (3u*l)) & 7u) << 8)));
                     const uint ug1  = IQ1S_GGRID(((uqsv >> 8) & 0xFFu) | ((((uh1 >> (3u*l)) & 7u) << 8)));
-                    ua0 += dot(y0, iq1s_vals(ug0)) + dot(y1, iq1s_vals(ug0 >> 4));
-                    ua1 += dot(y0, iq1s_vals(ug1)) + dot(y1, iq1s_vals(ug1 >> 4));
+                    ua0 += dot(y0, IQ1S_GVEC(ug0)) + dot(y1, IQ1S_GVEC_HI(ug0));
+                    ua1 += dot(y0, IQ1S_GVEC(ug1)) + dot(y1, IQ1S_GVEC_HI(ug1));
                 }
                 const float asum = as.s0 + as.s1 + as.s2 + as.s3;
                 gacc0 += gsc0 * (ga0 + gt0 * asum);
@@ -1045,7 +1139,10 @@ kernel void kernel_mul_mv_iq1_s_f32_flat_splitk(
     const uint y_tex = y_off + col * ((uint)ne10 >> 2);
 #endif
 
-#if IQ1S_MV_GRIDIMG
+#if IQ1S_MV_G2
+// one texel carries TWO entries; i>>1 selects it, i&1 the half
+#define IQ1S_SKGRID(i) IQ1S_ABL((read_imageui(grid_img, (int)((i) >> 1)).x >> (((i) & 1u) << 4)), (i))
+#elif IQ1S_MV_GRIDIMG
 #define IQ1S_SKGRID(i) IQ1S_ABL((read_imageui(grid_img, (int)(i)).x), (i))
 #elif IQ1S_MV_LDSGRID
     __local uint sk_grid[2048];
@@ -1086,10 +1183,10 @@ kernel void kernel_mul_mv_iq1_s_f32_flat_splitk(
                 const float s1 = (float)(2u * ((h1 >> 12) & 7u) + 1u);
                 const float s2 = (float)(2u * ((h2 >> 12) & 7u) + 1u);
                 const float s3 = (float)(2u * ((h3 >> 12) & 7u) + 1u);
-                const float t0 = ((h0 & 0x8000u) ? -0.125f : 0.125f) - 1.0f;
-                const float t1 = ((h1 & 0x8000u) ? -0.125f : 0.125f) - 1.0f;
-                const float t2 = ((h2 & 0x8000u) ? -0.125f : 0.125f) - 1.0f;
-                const float t3 = ((h3 & 0x8000u) ? -0.125f : 0.125f) - 1.0f;
+                const float t0 = ((h0 & 0x8000u) ? -0.125f : 0.125f) - IQ1S_DBIAS;
+                const float t1 = ((h1 & 0x8000u) ? -0.125f : 0.125f) - IQ1S_DBIAS;
+                const float t2 = ((h2 & 0x8000u) ? -0.125f : 0.125f) - IQ1S_DBIAS;
+                const float t3 = ((h3 & 0x8000u) ? -0.125f : 0.125f) - IQ1S_DBIAS;
 
                 const uint gb  = j + (sub * 4u) * mq;
                 const uint grp = sub * 8u;
@@ -1106,10 +1203,10 @@ kernel void kernel_mul_mv_iq1_s_f32_flat_splitk(
                     const float4 y0 = IQ1S_YV(grp + 2u*l + 0u);
                     const float4 y1 = IQ1S_YV(grp + 2u*l + 1u);
                     as += y0 + y1;
-                    a0 += dot(y0, iq1s_vals(g0)) + dot(y1, iq1s_vals(g0 >> 4));
-                    a1 += dot(y0, iq1s_vals(g1)) + dot(y1, iq1s_vals(g1 >> 4));
-                    a2 += dot(y0, iq1s_vals(g2)) + dot(y1, iq1s_vals(g2 >> 4));
-                    a3 += dot(y0, iq1s_vals(g3)) + dot(y1, iq1s_vals(g3 >> 4));
+                    a0 += dot(y0, IQ1S_GVEC(g0)) + dot(y1, IQ1S_GVEC_HI(g0));
+                    a1 += dot(y0, IQ1S_GVEC(g1)) + dot(y1, IQ1S_GVEC_HI(g1));
+                    a2 += dot(y0, IQ1S_GVEC(g2)) + dot(y1, IQ1S_GVEC_HI(g2));
+                    a3 += dot(y0, IQ1S_GVEC(g3)) + dot(y1, IQ1S_GVEC_HI(g3));
                 }
                 // one activation sum, four rows
                 const float asum = as.s0 + as.s1 + as.s2 + as.s3;
@@ -1166,8 +1263,8 @@ kernel void kernel_mul_mv_iq1_s_f32_flat_splitk(
 
                 const float s0  = (float)(2u * ((h0 >> 12) & 7u) + 1u);
                 const float s1  = (float)(2u * ((h1 >> 12) & 7u) + 1u);
-                const float t0  = ((h0 & 0x8000u) ? -0.125f : 0.125f) - 1.0f;
-                const float t1  = ((h1 & 0x8000u) ? -0.125f : 0.125f) - 1.0f;
+                const float t0  = ((h0 & 0x8000u) ? -0.125f : 0.125f) - IQ1S_DBIAS;
+                const float t1  = ((h1 & 0x8000u) ? -0.125f : 0.125f) - IQ1S_DBIAS;
 
                 const uint gb  = j + (sub * 4u) * mh;
                 const uint grp = sub * 8u;
@@ -1182,8 +1279,8 @@ kernel void kernel_mul_mv_iq1_s_f32_flat_splitk(
                     const float4 y0 = IQ1S_YV(grp + 2u*l + 0u);
                     const float4 y1 = IQ1S_YV(grp + 2u*l + 1u);
                     as += y0 + y1;
-                    a0 += dot(y0, iq1s_vals(g0)) + dot(y1, iq1s_vals(g0 >> 4));
-                    a1 += dot(y0, iq1s_vals(g1)) + dot(y1, iq1s_vals(g1 >> 4));
+                    a0 += dot(y0, IQ1S_GVEC(g0)) + dot(y1, IQ1S_GVEC_HI(g0));
+                    a1 += dot(y0, IQ1S_GVEC(g1)) + dot(y1, IQ1S_GVEC_HI(g1));
                 }
                 // one activation sum, both rows
                 const float asum = as.s0 + as.s1 + as.s2 + as.s3;
