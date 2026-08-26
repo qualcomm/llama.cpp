@@ -1355,7 +1355,8 @@ struct ggml_backend_opencl_context {
     cl_mem iq2xxs_grid_buf = nullptr, iq2xxs_grid_img = nullptr;
     cl_mem iq2xs_grid_buf = nullptr, iq2xs_grid_img = nullptr;
     cl_kernel kernel_mul_mv_iq1_m_f32_flat;
-    cl_kernel kernel_mul_mv_iq1_m_f32_flat_mc = nullptr;   // two columns per workgroup, ne11 2..31
+    cl_kernel kernel_mul_mv_iq1_m_f32_flat_mc  = nullptr;  // 2 columns per workgroup, ne11 2..31
+    cl_kernel kernel_mul_mv_iq1_m_f32_flat_mc4 = nullptr;  // 4 columns, used when 4 divides ne11
     cl_kernel kernel_mul_mv_iq1_m_f32_flat_glu = nullptr;  // fused ffn_gate+ffn_up+GLU
     cl_kernel kernel_mul_mv_iq1_m_f32_flat_splitk = nullptr;  // K split across workgroups
     cl_kernel kernel_mul_mv_iq2_xxs_f32;
@@ -2767,6 +2768,12 @@ static int ggml_cl_q2k_mv_nsg() {
 // The IQ1_M twin of ggml_cl_iq1s_mv_mc. This type routes its codebook through a
 // texture for +17.1% against IQ1_S's +2.5%, i.e. the grid read is its dominant
 // term, so it should amortise best of the family.
+// Columns per workgroup for the IQ1_M multi-column GEMV: 2 or 4.
+static int ggml_cl_iq1m_mv_nc() {
+    static const int v = ggml_cl_env_int("GGML_OPENCL_IQ1M_NC", 4);
+    return (v == 2 || v == 4) ? v : 2;
+}
+
 static int ggml_cl_iq1m_mv_mc() {
     static const int v = ggml_cl_env_int("GGML_OPENCL_IQ1M_MC", 1);
     return v ? 1 : 0;
@@ -4474,6 +4481,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         std::string opts = compile_opts;
         opts += " -DIQ1M_MV_NSG=" + std::to_string(ggml_cl_iq1m_mv_nsg());
+        opts += " -DIQ1M_MV_NC=2";
         opts += " -DIQ1M_MV_R2="  + std::to_string(ggml_cl_iq1m_mv_r2());
         opts += " -DIQ1M_MV_LDSGRID=" + std::to_string(ggml_cl_iq1m_mv_ldsgrid());
         opts += " -DIQ1M_MV_GRIDIMG=" + std::to_string(ggml_cl_iq1m_mv_gridimg(backend_ctx));
@@ -4486,6 +4494,24 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             backend_ctx->kernel_mul_mv_iq1_m_f32_flat_mc =
                 clCreateKernel(prog, "kernel_mul_mv_iq1_m_f32_flat_mc", &err);
             if (err != CL_SUCCESS) { backend_ctx->kernel_mul_mv_iq1_m_f32_flat_mc = nullptr; }
+
+            // Second build of the same source at four columns. Two entry points
+            // rather than one kernel branching on the width: guarding the
+            // trailing columns at runtime cost 7-9% where there was no tail
+            // (pp8 120.4 -> 111.3), because the branch blocks the scheduling of
+            // the loop body. The host then dispatches whichever width divides
+            // ne11, so neither kernel ever computes a column it discards.
+            if (ggml_cl_iq1m_mv_nc() == 4) {
+                std::string opts4 = opts;
+                const std::string two = " -DIQ1M_MV_NC=2";
+                opts4.replace(opts4.find(two), two.size(), " -DIQ1M_MV_NC=4");
+                cl_program prog4 =
+                    build_program_from_source(backend_ctx, kernel_src.c_str(), opts4);
+                backend_ctx->kernel_mul_mv_iq1_m_f32_flat_mc4 =
+                    clCreateKernel(prog4, "kernel_mul_mv_iq1_m_f32_flat_mc", &err);
+                if (err != CL_SUCCESS) { backend_ctx->kernel_mul_mv_iq1_m_f32_flat_mc4 = nullptr; }
+                CL_CHECK(clReleaseProgram(prog4));
+            }
         }
         if (ggml_cl_iq1m_mv_r2()) {
             backend_ctx->kernel_mul_mv_iq1_m_f32_flat_splitk =
@@ -40590,12 +40616,20 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             if (ggml_cl_iq1m_mv_mc()
                     && ggml_cl_iq1m_is_split(backend_ctx, src0)
                     && backend_ctx->kernel_mul_mv_iq1_m_f32_flat_mc
+                    // an odd tail duplicates columns it then discards; decline
+                    // the widths where that waste outweighs the saving
                     && ne11 >= 2 && ne11 != 3
                     && ne00 % 256 == 0
                     && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1) {
                 ggml_tensor_extra_cl_iq1_m * ex0 =
                     (ggml_tensor_extra_cl_iq1_m *)src0->extra;
-                cl_kernel mk = backend_ctx->kernel_mul_mv_iq1_m_f32_flat_mc;
+                // widest fold that divides ne11 exactly -- a group that runs
+                // past the last column would compute one it then discards
+                const bool use4 = backend_ctx->kernel_mul_mv_iq1_m_f32_flat_mc4 != nullptr
+                                  && (ne11 % 4) == 0;
+                const size_t ncol = use4 ? 4u : 2u;
+                cl_kernel mk = use4 ? backend_ctx->kernel_mul_mv_iq1_m_f32_flat_mc4
+                                    : backend_ctx->kernel_mul_mv_iq1_m_f32_flat_mc;
                 const int nsg = ggml_cl_iq1m_mv_nsg();
                 cl_int ai = 0;
                 cl_uint iq1m_y_off = 0;
@@ -40622,12 +40656,12 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 static bool iq1m_mc_logged = false;
                 if (!iq1m_mc_logged) {
                     iq1m_mc_logged = true;
-                    GGML_LOG_INFO("ggml_opencl: iq1_m multi-column GEMV active (ne11=%d)\n", ne11);
+                    GGML_LOG_INFO("ggml_opencl: iq1_m multi-column GEMV active (ne11=%d, %d cols)\n", ne11, (int)ncol);
                 }
 
                 const size_t rows_wg = ggml_cl_iq1m_mv_r2() ? 128 : 64;
                 size_t m_global[3] = { CEIL_DIV((size_t)ne01, rows_wg) * 64,
-                                       CEIL_DIV((size_t)ne11, (size_t)2) * (size_t)nsg, 1 };
+                                       CEIL_DIV((size_t)ne11, ncol) * (size_t)nsg, 1 };
                 size_t m_local[3]  = { 64, (size_t)nsg, 1 };
                 backend_ctx->enqueue_ndrange_kernel(mk, 3, m_global, m_local, dst);
                 if (iq1m_y_img) { CL_CHECK(clReleaseMemObject(iq1m_y_img)); }
