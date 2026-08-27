@@ -2923,6 +2923,16 @@ static int ggml_cl_q2k_mv_nsg() {
     return v;
 }
 
+// Bisect knob for the A7X miscompile of the Q2_K/Q3_K plane dp4a prefill GEMMs.
+// 0 = the kernel as written, 1 = staged activations reach dp4a through a
+// by-value parameter, 2 = and scalar-indexed staging instead of vload4. Both
+// are REFUTED as repairs and 0 is the default; see the header of
+// gemm_noshuffle_q3_k_q8_1_dp4a.cl for the numbers.
+static int ggml_cl_kquant_dp4a_wa() {
+    static const int v = ggml_cl_env_int("GGML_OPENCL_KQUANT_DP4A_WA", 0);
+    return v;
+}
+
 // Q2_K wants FOUR rows per lane where the other split types want two: its min
 // term needs a per-16 activation sum that does not depend on the row, so more
 // rows per lane amortise it. The AoS kernel this replaces reuses that sum across
@@ -7753,7 +7763,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #else
         const std::string kernel_src = read_file("gemm_noshuffle_q3_k_q8_1_dp4a.cl");
 #endif
-        cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        const std::string opts = compile_opts
+            + " -DKQ_DP4A_WA=" + std::to_string(ggml_cl_kquant_dp4a_wa());
+        cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), opts);
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q3_k_q8_1_dp4a = clCreateKernel(prog, "kernel_gemm_noshuffle_q3_k_q8_1_dp4a", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
@@ -7768,7 +7780,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #else
         const std::string kernel_src = read_file("gemm_noshuffle_q2_k_q8_1_dp4a.cl");
 #endif
-        cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        const std::string opts = compile_opts
+            + " -DKQ_DP4A_WA=" + std::to_string(ggml_cl_kquant_dp4a_wa());
+        cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), opts);
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q2_k_q8_1_dp4a = clCreateKernel(prog, "kernel_gemm_noshuffle_q2_k_q8_1_dp4a", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
@@ -13273,11 +13287,12 @@ static bool ggml_cl_plane_split_gen_on(const ggml_backend_opencl_context * backe
 // plane-split and another reads it as AoS blocks, the result is silent garbage.
 // So they all go through this one predicate.
 // Default ON for the generations ggml_cl_plane_split_gen_on names. The prefill
-// half of this path is the q8_1 dp4a
-// GEMM, and it does not carry across generations: on an X2-90 the split is
-// pp512 215 -> 674 (3.13x) on Llama-3.2-3B-IQ4_XS, while on an X1 the SAME
-// model and binary goes 99.8 -> 82.9, a 17% REGRESSION. Decode is a wash on
-// both. GGML_OPENCL_IQ4XS_SOA forces either way.
+// half of this path is the q8_1 dp4a GEMM, and it does not carry across
+// generations: on an X2-90 the split is pp512 215 -> 674 (3.13x) on
+// Llama-3.2-3B-IQ4_XS, while on an X1 the SAME model and binary goes
+// 99.8 -> 82.9, a 17% REGRESSION. Decode is a wash on both. On an A7X it is
+// pp512 157.7 -> 209.8 and tg64 12.05 -> 30.58, which is why that generation
+// is in. GGML_OPENCL_IQ4XS_SOA forces either way.
 static bool ggml_cl_iq4xs_soa_on(const ggml_backend_opencl_context * backend_ctx) {
     static const char * const e = getenv("GGML_OPENCL_IQ4XS_SOA");
     if (e && *e) {

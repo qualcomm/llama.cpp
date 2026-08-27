@@ -47,6 +47,40 @@ inline uint q2k_pack(uint pk) {
 //
 // The uint4s are copied into private temps at the call site -- dp4a with a
 // __local operand inside an unrolled loop is a documented miscompile on X2.
+// KQ_DP4A_WA: two attempts at the A7X (E031.41) miscompile of this kernel, both
+// REFUTED. The plane-split GEMV over the same weights is exact on that device,
+// so the defect is in this kernel and not in the layout, but neither of these
+// is where it lives:
+//   1  take the staged activation through a by-value parameter, so the dp4a
+//      operand is a private copy rather than a __local reference. The X2 needed
+//      the same thing; the (uint4)(...) cast that satisfied it is a no-op cast
+//      and need not force a copy.
+//   2  and stage the tile with scalar indexing instead of vload4 (playbook
+//      bug 3: vload4 miscompiles on this compiler).
+//
+// Adreno 740, tinyllama-1.1B IQ1_S mix, 4 chunks, this GEMM forced on:
+// 197.5796 at WA=0, WA=1 and WA=2 alike, against a CPU reference of 180.1043.
+// Not a near miss -- the same wrong number, so neither construct is involved.
+// Both are exactly semantics-preserving: an Adreno 840 reads 27.6391 on
+// tinyllama-Q3_K_M at all three settings, which is what makes the 740 result
+// interpretable at all.
+//
+// Kept so the boundary is recorded rather than rebuilt. What is left from the
+// playbook is bug 5, the accumulation optimizer, and the scale/pack helpers.
+// ggml_cl_kquant_plane_dp4a_gemm_on declines this kernel on A7X meanwhile.
+#ifndef KQ_DP4A_WA
+#define KQ_DP4A_WA 0
+#endif
+
+#if KQ_DP4A_WA >= 2
+#define KQ_STAGE(p) kq_load4(p)
+inline uint4 kq_load4(const __global uint * p) {
+    return (uint4)(p[0], p[1], p[2], p[3]);
+}
+#else
+#define KQ_STAGE(p) vload4(0, (p))
+#endif
+
 inline int dot4_q8a_v(uint4 qw, uint4 a) {
     int r = 0;
     r = dot_acc_sat_4x8packed_ss_int(qw.s0, a.x, r);
@@ -54,6 +88,15 @@ inline int dot4_q8a_v(uint4 qw, uint4 a) {
     r = dot_acc_sat_4x8packed_ss_int(qw.s2, a.z, r);
     r = dot_acc_sat_4x8packed_ss_int(qw.s3, a.w, r);
     return r;
+}
+
+// One output column. The staged operands arrive by value, so they are
+// private here whatever the caller passed.
+inline float q2k_col(uint4 qlo, uint4 qhi, float dl0, float dl1,
+                     float ml0, float ml1, uint4 a0, uint4 a1,
+                     float s0, float s1) {
+    return dl0 * (float)dot4_q8a_v(qlo, a0) - ml0 * s0
+         + dl1 * (float)dot4_q8a_v(qhi, a1) - ml1 * s1;
 }
 
 __attribute__((qcom_wave_pair_mode(1)))
@@ -128,7 +171,7 @@ kernel void kernel_gemm_noshuffle_q2_k_q8_1_dp4a(
             const bool ok = c < (uint)n_no_padding;
             // the lane's whole half is ONE uint4, so the sum now falls out of a
             // single 16-byte load rather than four 4-byte ones
-            const uint4 w = ok ? vload4(0, src1_qa + c * k_u + (step >> 2) + (h << 2))
+            const uint4 w = ok ? KQ_STAGE(src1_qa + c * k_u + (step >> 2) + (h << 2))
                                : (uint4)(0u);
             sh_qa4[t][h] = w;
             int s = 0;
@@ -144,8 +187,12 @@ kernel void kernel_gemm_noshuffle_q2_k_q8_1_dp4a(
         barrier(CLK_LOCAL_MEM_FENCE);
 
 #define LD4(arr, b) ((float4)((float)arr[(b)+0], (float)arr[(b)+1], (float)arr[(b)+2], (float)arr[(b)+3]))
+#if KQ_DP4A_WA >= 1
+#define Q2K_COL(b) q2k_col(qlo, qhi, dl0, dl1, ml0, ml1, sh_qa4[b][0], sh_qa4[b][1], sh_s[b][0], sh_s[b][1])
+#else
 #define Q2K_COL(b) (dl0 * (float)dot4_q8a_v(qlo, (uint4)(sh_qa4[b][0])) - ml0 * sh_s[b][0] + \
                     dl1 * (float)dot4_q8a_v(qhi, (uint4)(sh_qa4[b][1])) - ml1 * sh_s[b][1])
+#endif
         #pragma unroll
         for (int g = 0; g < NGROUPS; ++g) {
             const int b = g * 4;

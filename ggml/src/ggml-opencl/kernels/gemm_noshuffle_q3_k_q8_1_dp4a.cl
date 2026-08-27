@@ -60,6 +60,40 @@ inline uint q3k_pack(uint pk, uint hb) {
 //
 // The uint4s are copied into private temps at the call site -- dp4a with a
 // __local operand inside an unrolled loop is a documented miscompile on X2.
+// KQ_DP4A_WA: two attempts at the A7X (E031.41) miscompile of this kernel, both
+// REFUTED. The plane-split GEMV over the same weights is exact on that device,
+// so the defect is in this kernel and not in the layout, but neither of these
+// is where it lives:
+//   1  take the staged activation through a by-value parameter, so the dp4a
+//      operand is a private copy rather than a __local reference. The X2 needed
+//      the same thing; the (uint4)(...) cast that satisfied it is a no-op cast
+//      and need not force a copy.
+//   2  and stage the tile with scalar indexing instead of vload4 (playbook
+//      bug 3: vload4 miscompiles on this compiler).
+//
+// Adreno 740, tinyllama-1.1B IQ1_S mix, 4 chunks, this GEMM forced on:
+// 197.5796 at WA=0, WA=1 and WA=2 alike, against a CPU reference of 180.1043.
+// Not a near miss -- the same wrong number, so neither construct is involved.
+// Both are exactly semantics-preserving: an Adreno 840 reads 27.6391 on
+// tinyllama-Q3_K_M at all three settings, which is what makes the 740 result
+// interpretable at all.
+//
+// Kept so the boundary is recorded rather than rebuilt. What is left from the
+// playbook is bug 5, the accumulation optimizer, and the scale/pack helpers.
+// ggml_cl_kquant_plane_dp4a_gemm_on declines this kernel on A7X meanwhile.
+#ifndef KQ_DP4A_WA
+#define KQ_DP4A_WA 0
+#endif
+
+#if KQ_DP4A_WA >= 2
+#define KQ_STAGE(p) kq_load4(p)
+inline uint4 kq_load4(const __global uint * p) {
+    return (uint4)(p[0], p[1], p[2], p[3]);
+}
+#else
+#define KQ_STAGE(p) vload4(0, (p))
+#endif
+
 inline int dot4_q8a_v(uint4 qw, uint4 a) {
     int r = 0;
     r = dot_acc_sat_4x8packed_ss_int(qw.s0, a.x, r);
@@ -67,6 +101,13 @@ inline int dot4_q8a_v(uint4 qw, uint4 a) {
     r = dot_acc_sat_4x8packed_ss_int(qw.s2, a.z, r);
     r = dot_acc_sat_4x8packed_ss_int(qw.s3, a.w, r);
     return r;
+}
+
+// One output column. a0/a1 arrive by value, so they are private here whatever
+// the caller passed.
+inline float q3k_col(uint4 qlo, uint4 qhi, float dl0, float dl1,
+                     uint4 a0, uint4 a1) {
+    return dl0 * (float)dot4_q8a_v(qlo, a0) + dl1 * (float)dot4_q8a_v(qhi, a1);
 }
 
 __attribute__((qcom_wave_pair_mode(1)))
@@ -146,7 +187,7 @@ kernel void kernel_gemm_noshuffle_q3_k_q8_1_dp4a(
             const uint v = idx & 1;
             const uint c = col_base + t;
             sh_qa4[t][v] = (c < (uint)n_no_padding)
-                         ? vload4(0, src1_qa + c * k_u + (step >> 2) + (v << 2))
+                         ? KQ_STAGE(src1_qa + c * k_u + (step >> 2) + (v << 2))
                          : (uint4)(0u);
         }
         if (lid < TILESIZE_N) {
@@ -160,8 +201,12 @@ kernel void kernel_gemm_noshuffle_q3_k_q8_1_dp4a(
         for (int g = 0; g < NGROUPS; ++g) {
             const int b = g * 4;
             float4 rf;
+#if KQ_DP4A_WA >= 1
+#define Q3K_COL(T) q3k_col(qlo, qhi, dl0, dl1, sh_qa4[T][0], sh_qa4[T][1])
+#else
 #define Q3K_COL(T) (dl0 * (float)dot4_q8a_v(qlo, (uint4)(sh_qa4[T][0]))  \
                   + dl1 * (float)dot4_q8a_v(qhi, (uint4)(sh_qa4[T][1])))
+#endif
             rf.s0 = Q3K_COL(b+0);  rf.s1 = Q3K_COL(b+1);
             rf.s2 = Q3K_COL(b+2);  rf.s3 = Q3K_COL(b+3);
 #undef Q3K_COL
