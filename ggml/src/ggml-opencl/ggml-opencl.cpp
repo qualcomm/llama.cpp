@@ -38913,6 +38913,14 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                         size_t q_global[1] = { (size_t)(((n_blocks + 63) / 64) * 64) };
                         backend_ctx->enqueue_ndrange_kernel(qk, 1, q_global, q_local, dst);
 
+                        {
+                            static bool logged = false;
+                            if (!logged) {
+                                logged = true;
+                                GGML_LOG_INFO("ggml_opencl: q2_k plane dp4a prefill GEMM active (M=%d N=%d K=%d)\n",
+                                              (int)ne01, (int)ne11, (int)ne00);
+                            }
+                        }
                         cl_kernel dk = backend_ctx->kernel_gemm_noshuffle_q2_k_q8_1_dp4a;
                         int ai = 0;
                         CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_mem),   &ex0->qs));
@@ -39046,6 +39054,14 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                         size_t q_global[1] = { (size_t)(((n_blocks + 63) / 64) * 64) };
                         backend_ctx->enqueue_ndrange_kernel(qk, 1, q_global, q_local, dst);
 
+                        {
+                            static bool logged = false;
+                            if (!logged) {
+                                logged = true;
+                                GGML_LOG_INFO("ggml_opencl: q3_k plane dp4a prefill GEMM active (M=%d N=%d K=%d)\n",
+                                              (int)ne01, (int)ne11, (int)ne00);
+                            }
+                        }
                         cl_kernel dk = backend_ctx->kernel_gemm_noshuffle_q3_k_q8_1_dp4a;
                         int ai = 0;
                         CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_mem),   &ex0->qs));

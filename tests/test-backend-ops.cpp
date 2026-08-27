@@ -9624,6 +9624,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 6656, 1, 3072, {1, 1}, {1, 1}));
     }
 
+    // Prefill GEMM at an ffn_down shape, which is the one that separates backends
+    // routing K-quants through a plane-split int8 GEMM from those that do not.
+    // n = 512 clears the ne11 >= 32 those GEMMs require, and k = 5632 is the shape
+    // a real ffn_down has -- 22 super-blocks per row, so it is neither a power of
+    // two nor a multiple of the tiling. Every other large case here is k = 3072,
+    // and a k = 2048 or 3072 tensor of the same type can be correct while this one
+    // is not: an Adreno 740 miscompiles the q2_K and q3_K plane GEMMs at k = 5632
+    // and returns right answers at k = 2048, so a suite without this shape reports
+    // the type as covered.
+    for (ggml_type type_a : {GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K,
+                             GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS}) {
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 2048, 512, 5632, {1, 1}, {1, 1}));
+    }
+
     // sycl backend will limit task global_range < MAX_INT
     // test case for f16-type-convert-to-fp32 kernel with large k under fp32 compute dtype (occurs in stable-diffusion)
     // however this case needs to alloc more memory which may fail in some devices (Intel Arc770, etc.)
