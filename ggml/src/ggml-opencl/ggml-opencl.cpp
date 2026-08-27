@@ -12098,17 +12098,36 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
     //    fails MUL_MAT(q8_0, m=2880, n=32, k=2880) with ERR 1.50 while every nibble case
     //    passes. It is a signature mismatch, not a driver quirk.
     //
-    // 2. It does not build anyway. Adreno 840, 740 and 642L all advertise
-    //    cl_qcom_dot_product8 in CL_DEVICE_EXTENSIONS and all three reject it: the
-    //    builtins give "requires 'cl_qcom_dot_product8' extension" without the pragma, and
-    //    the pragma gives "unsupported OpenCL extension". The extension is superseded by
-    //    the KHR one in its own spec.
+    // 2. It DOES build and it works -- but only with its pragma AND -cl-std=CL2.0 or
+    //    later. At CL1.2, which is what clBuildProgram defaults to when no -cl-std is
+    //    passed, the pragma is rejected as an unsupported extension; that is what made it
+    //    look dead. Every Adreno is CL2.0 or later and this backend always passes a
+    //    -cl-std derived from CL_DEVICE_OPENCL_C_VERSION, so it is available in practice.
+    //    Verified building at CL2.0 AND CL3.0 on an Adreno 840 and a 642L.
+    //    Note the Adreno 619 compiles and runs the builtins while advertising NEITHER
+    //    extension, so the extension string understates what is there.
     //
     // The KHR builtins themselves are exact: on an Adreno 840 both _ss_ and _su_ match a
     // host reference over the full signed range, (127,-128,1,-1) squared included.
     //
-    // Consequence worth knowing: a device reporting cl_khr_integer_dot_product = false has
-    // no usable dp4a at all, so every kernel gated below is genuinely unavailable there.
+    // So a device without the KHR extension is NOT without int8 dot. Signed x signed is
+    // recoverable from the signed x unsigned form exactly, by biasing the unsigned operand
+    // and correcting with the signed operand's byte sum:
+    //
+    //     ss(a,b) == qcom_dot8_acc(a, b ^ 0x80808080, acc) - 128 * sbytesum(a)
+    //
+    // since b_i == (b_i ^ 0x80) - 128 reading the left as int8 and the right as uint8.
+    // Verified bit-exact on the 619, the 642L and the 840 over cases chosen to separate
+    // the three interpretations, saturation edges included: (-128)^2 x4 gives 65536 and
+    // 127 x -128 x4 gives -65024, both matching a host reference.
+    //
+    // That correction is affordable in a GEMM -- the bias is one XOR that folds into the
+    // q8_1 quantisation, and sbytesum over the WEIGHT operand is per block and can be
+    // precomputed into a plane at upload like the existing scale planes, leaving the inner
+    // loop at the same builtin count as the KHR form.
+    //
+    // NOT wired up: the plane prefill GEMMs below are still gated on the KHR name, so they
+    // stay off on A6X. Opening that is a per-kernel change, not a gate flip.
     backend_ctx->has_integer_dot_product =
         strstr(ext_buffer, "cl_khr_integer_dot_product") != NULL;
     g_ggml_cl_has_int_dot = backend_ctx->has_integer_dot_product;
