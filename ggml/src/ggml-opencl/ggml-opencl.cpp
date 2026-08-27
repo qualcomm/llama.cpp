@@ -2748,6 +2748,14 @@ static cl_mem ggml_cl_iq3s_mv_grid_arg(ggml_backend_opencl_context * backend_ctx
                                               : backend_ctx->iq3s_grid_img;
 }
 
+// Apply the IQ3_S signs as one multiply by a +-1 float4 from a 256-byte table,
+// rather than four conditional negations. Same target as the pre-signed table but
+// without growing the hot table, which is why that one was a wash.
+static int ggml_cl_iq3s_mv_sgnmul(void) {
+    static const int v = ggml_cl_env_int("GGML_OPENCL_IQ3S_MV_SGNMUL", 0);
+    return v;
+}
+
 static int ggml_cl_iq3xxs_mv_gridimg(const ggml_backend_opencl_context * backend_ctx) {
     return ggml_cl_gridimg_default(backend_ctx, "GGML_OPENCL_IQ3XXS_MV_GRIDIMG");
 }
@@ -4375,6 +4383,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         opts += " -DIQ3S_MV_LDSGRID=" + std::to_string(ggml_cl_iq3s_mv_ldsgrid());
         opts += " -DIQ3S_MV_GRIDIMG=" + std::to_string(ggml_cl_iq3s_mv_gridimg(backend_ctx));
         opts += " -DIQ3S_MV_SGRID=" + std::to_string(ggml_cl_iq3s_mv_sgrid(backend_ctx));
+        opts += " -DIQ3S_MV_SGNMUL=" + std::to_string(ggml_cl_iq3s_mv_sgnmul());
         opts += " -DIQ3S_MV_DP4A_FASTPACK=" + std::to_string(ggml_cl_iq3s_mv_dp4a_fastpack());
         opts += " -DIQ3S_MV_SIGNXOR=" + std::to_string(ggml_cl_iq3s_mv_signxor());
         opts += " -DIQ3S_MV_ABL=" + std::to_string(ggml_cl_iq3s_mv_abl());

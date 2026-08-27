@@ -236,13 +236,48 @@ IQ3S_GRID_AS uint iq3s_grid[512] = {
 #define IQ3S_MV_SIGNXOR 0
 #endif
 
+// IQ3S_MV_SGNMUL=1: apply the four signs as ONE vector multiply by a +-1 float4
+// taken from a 16-entry table, instead of four conditional negations.
+//
+// This is the third form of the same idea, and it exists because the other two
+// bracket it. IQ3S_MV_SIGNXOR spreads the sign bits by hand (four shifts, a uint4
+// build and an as_float4 round trip) and measures -28.5% here. The pre-signed
+// table (IQ3S_MV_SGRID) removes the arithmetic outright and is a WASH, because at
+// 32 KB it stops being cache-resident and the gather costs back what it saved.
+//
+// So the target is the arithmetic, and the constraint is the HOT TABLE SIZE.
+// iq3s_sgn4 is 16 float4 = 256 bytes, which is an order of magnitude inside the
+// 1-2 KB tier that the fleet's __constant probe measured as fastest, and it is
+// per-nibble rather than per (grid entry, nibble) -- so it does not scale with the
+// grid the way the pre-signed table did.
+#ifndef IQ3S_MV_SGNMUL
+#define IQ3S_MV_SGNMUL 0
+#endif
+
+#if IQ3S_MV_SGNMUL
+// Bit k of the index negates lane k, matching the four `if (s & 1<<k)` below.
+constant float4 iq3s_sgn4[16] = {
+    (float4)( 1.f, 1.f, 1.f, 1.f), (float4)(-1.f, 1.f, 1.f, 1.f),
+    (float4)( 1.f,-1.f, 1.f, 1.f), (float4)(-1.f,-1.f, 1.f, 1.f),
+    (float4)( 1.f, 1.f,-1.f, 1.f), (float4)(-1.f, 1.f,-1.f, 1.f),
+    (float4)( 1.f,-1.f,-1.f, 1.f), (float4)(-1.f,-1.f,-1.f, 1.f),
+    (float4)( 1.f, 1.f, 1.f,-1.f), (float4)(-1.f, 1.f, 1.f,-1.f),
+    (float4)( 1.f,-1.f, 1.f,-1.f), (float4)(-1.f,-1.f, 1.f,-1.f),
+    (float4)( 1.f, 1.f,-1.f,-1.f), (float4)(-1.f, 1.f,-1.f,-1.f),
+    (float4)( 1.f,-1.f,-1.f,-1.f), (float4)(-1.f,-1.f,-1.f,-1.f),
+};
+#endif
+
 // Four grid values with their signs applied. base picks the nibble of sgv.
 inline float4 iq3s_vals(uint gv, uint sgv, uint base) {
 #if IQ3S_MV_ABL == 3
     return (float4)((float)((gv      ) & 0xFFu), (float)((gv >>  8) & 0xFFu),
                     (float)((gv >> 16) & 0xFFu), (float)((gv >> 24) & 0xFFu));
 #else
-#if IQ3S_MV_SIGNXOR
+#if IQ3S_MV_SGNMUL
+    // Exact: multiplying a float by +-1.0f is a sign flip, no rounding.
+    return convert_float4(as_uchar4(gv)) * iq3s_sgn4[(sgv >> base) & 0xFu];
+#elif IQ3S_MV_SIGNXOR
     // A sign flip is bit 31, so the four conditional negations collapse to one
     // XOR once the four sign bits are spread into place. Exact, not approximate.
     const uint  s   = sgv >> base;
