@@ -15536,10 +15536,38 @@ static bool ggml_cl_iq2xs_is_split(const ggml_backend_opencl_context * backend_c
         && use_adreno_kernels(backend_ctx, t);
 }
 
+// The plane dp4a prefill GEMMs for Q2_K and Q3_K miscompile on the A7X E031.41
+// compiler. The plane LAYOUT is fine there and so is the decode GEMV over it --
+// with both splits on, decode-only perplexity (-b 1 -ub 1) is 151.5866 against
+// 151.5791 with them off, i.e. the same answer. It is only the GEMM: at -b 512
+// the same model reads 202.38 against 179.74, and an Adreno 840 running the
+// identical binary and shape reads 179.96 against a CPU reference of 180.10.
+//
+// So decline the GEMM rather than the split. The dispatch already falls through
+// to the plane-split GEMV for every ne11 the GEMM declines, which is the path
+// the decode-only run above proves correct.
+//
+// 🔴 The earlier verdict here was "declining the GEMM costs more prefill than
+// the decode win is worth". That compared against the GEMM being ON -- a
+// configuration that returns wrong answers, and therefore not a baseline. The
+// real comparison is against the AoS path, which is what this replaces.
+//
+// 🔴 The defect is SHAPE-dependent and a per-ftype GGUF is a MIX, so it hides:
+// tinyllama-Q2_K matched the CPU to 0.005% on A7X with the GEMM on, because its
+// Q2_K tensors are all K=2048. The models that expose it are IQ mixes carrying
+// three Q2_K tensors, two of them ffn_down at K=5632. MUL_MAT coverage sees
+// none of it -- use_adreno_kernels declines the shapes test-backend-ops asks for.
+static bool ggml_cl_kquant_plane_dp4a_gemm_on(const ggml_backend_opencl_context * backend_ctx) {
+    static const char * const e = getenv("GGML_OPENCL_KQUANT_PLANE_DP4A_GEMM");
+    if (e && *e) {
+        return atoi(e) != 0;
+    }
+    return backend_ctx->adreno_gen != ADRENO_GPU_GEN::A7X;
+}
+
 // Q2_K, same contract, but A7X joins X2-class here. Without the split its decode
 // GEMV is slower than the CPU fallback (tinyllama-1.1B on an Adreno 740: tg64
-// 4.44 against the CPU 9.96); with it, tg64 is 14.39 and pp512 also rises,
-// 153.7 -> 167.0. Perplexity over the same model matches the CPU to 0.005%.
+// 4.44 against the CPU 9.96); with it, tg64 is 34.5.
 static bool ggml_cl_q2k_soa_on(const ggml_backend_opencl_context * backend_ctx) {
     static const char * const e = getenv("GGML_OPENCL_Q2K_SOA");
     if (e && *e) {
@@ -15561,20 +15589,18 @@ static bool ggml_cl_q2k_is_split(const ggml_backend_opencl_context * backend_ctx
         && use_adreno_kernels(backend_ctx, t);
 }
 
-// Q3_K, same contract and the same per-generation gate. A7X cannot join Q2_K
-// above yet: the split itself is fine there (the decode GEMV over the planes is
-// bit-identical to the AoS one), but the plane dp4a prefill GEMM miscompiles on
-// that compiler. test-backend-ops MUL_MAT does not catch it; perplexity does
-// (Adreno 740, tinyllama-1.1B q2_K mix: 34.67 -> 36.51 against a CPU reference
-// of 34.67, while an Adreno 840 stays within 0.3%). Declining just the GEMM
-// there costs more prefill than the decode win is worth, so the whole split
-// waits on a fix to that kernel.
+// Q3_K, same contract and the same gate as Q2_K, including A7X. Its own decode
+// GEMV was 9.32 there against the CPU's 12.96; over the planes it is 34.3.
+// A7X gets here only because ggml_cl_kquant_plane_dp4a_gemm_on declines the
+// prefill GEMM for it as well -- that kernel miscompiles on the same compiler,
+// and it is what kept this gate closed.
 static bool ggml_cl_q3k_soa_on(const ggml_backend_opencl_context * backend_ctx) {
     static const char * const e = getenv("GGML_OPENCL_Q3K_SOA");
     if (e && *e) {
         return atoi(e) != 0;
     }
-    return backend_ctx->adreno_x2_class();
+    return backend_ctx->adreno_x2_class()
+        || backend_ctx->adreno_gen == ADRENO_GPU_GEN::A7X;
 }
 
 static bool ggml_cl_q3k_is_split(const ggml_backend_opencl_context * backend_ctx, const ggml_tensor * t) {
@@ -38716,6 +38742,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 // the GEMM produces that during LDS staging at no extra barrier.
                 {
                     if (ggml_cl_q2k_is_split(backend_ctx, src0)
+                            && ggml_cl_kquant_plane_dp4a_gemm_on(backend_ctx)
                             && backend_ctx->kernel_gemm_noshuffle_q2_k_q8_1_dp4a
                             && ne00 % 256 == 0
                             && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1) {
@@ -38848,6 +38875,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 // halves and scales them apart.
                 {
                     if (ggml_cl_q3k_is_split(backend_ctx, src0)
+                            && ggml_cl_kquant_plane_dp4a_gemm_on(backend_ctx)
                             && backend_ctx->kernel_gemm_noshuffle_q3_k_q8_1_dp4a
                             && ne00 % 256 == 0
                             && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1) {
