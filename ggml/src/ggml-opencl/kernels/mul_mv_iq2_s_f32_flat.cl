@@ -312,6 +312,15 @@ constant uint iq2s_grid[2048] = {
 //   1  drop the ACTIVATION load  (keeps the grid gather and the signs)
 //   2  drop the GRID lookup      (keeps every weight/sign load and the index math)
 //   3  drop the SIGN application (keeps the grid gather)
+//   4  drop ALL THREE at once    (only the weight-plane loads and the loop remain)
+//
+// 🔑 4 IS THE ONE THAT MATTERS, and it is why the arm exists. Ablating one term at
+// a time measures its MARGINAL cost, which understates a chain whose terms overlap:
+// here the grid gather DEPENDS on the qs load and the dot DEPENDS on the gather, so
+// removing any single link lets the others keep their latency hidden. 1+2+3 sum to
+// ~17% while the kernel runs at 38% of roofline and a pure replay of this same plane
+// addressing reaches 93%. If arm 4 is worth far more than the sum, the loop is
+// LATENCY-bound on that dependent chain, not bound by any one term.
 //
 // Never enable in a real run.
 #ifndef IQ2S_MV_ABL
@@ -352,7 +361,7 @@ constant uint iq2s_grid[2048] = {
 
 // Four grid values with their signs applied, as floats.
 inline float4 iq2s_vals(uint gv, uint sg, uint base) {
-#if IQ2S_MV_ABL == 3
+#if IQ2S_MV_ABL == 3 || IQ2S_MV_ABL == 4
     return (float4)((float)((gv      ) & 0xFFu), (float)((gv >>  8) & 0xFFu),
                     (float)((gv >> 16) & 0xFFu), (float)((gv >> 24) & 0xFFu));
 #elif IQ2S_MV_SIGNXOR
@@ -410,7 +419,7 @@ inline float4 iq2s_vals(uint gv, uint sg, uint base) {
 #define IQ2S_MV_AIMG 0
 #endif
 
-#if IQ2S_MV_ABL == 1
+#if IQ2S_MV_ABL == 1 || IQ2S_MV_ABL == 4
 #define IQ2S_YV(g) ((float4)(1.0f))
 #elif IQ2S_MV_AIMG
 #define IQ2S_YV(g) read_imagef(y_img, (int)(y_tex + (g)))
@@ -459,7 +468,7 @@ kernel void kernel_mul_mv_iq2_s_f32_flat(
     const uint y_tex = y_off + col * ((uint)ne10 >> 2);
 #endif
 
-#if IQ2S_MV_ABL == 2
+#if IQ2S_MV_ABL == 2 || IQ2S_MV_ABL == 4
 // keeps the index math, drops the gather
 #define IQ2S_GRID(i) (((i) * 0x01010101u) | 0x01010101u)
 #elif IQ2S_MV_GRIDIMG
@@ -707,7 +716,7 @@ kernel void kernel_mul_mv_iq2_s_f32_flat_mc(
 #endif
 #endif
 
-#if IQ2S_MV_ABL == 2
+#if IQ2S_MV_ABL == 2 || IQ2S_MV_ABL == 4
 // keeps the index math, drops the gather
 #define IQ2S_MCGRID(i) (((i) * 0x01010101u) | 0x01010101u)
 #elif IQ2S_MV_GRIDIMG
@@ -948,7 +957,7 @@ kernel void kernel_mul_mv_iq2_s_f32_flat_glu(
     const uint y_tex = y_off + col * ((uint)ne10 >> 2);
 #endif
 
-#if IQ2S_MV_ABL == 2
+#if IQ2S_MV_ABL == 2 || IQ2S_MV_ABL == 4
 // keeps the index math, drops the gather
 #define IQ2S_GGRID(i) (((i) * 0x01010101u) | 0x01010101u)
 #elif IQ2S_MV_GRIDIMG
@@ -1135,7 +1144,7 @@ kernel void kernel_mul_mv_iq2_s_f32_flat_splitk(
     const uint y_tex = y_off + col * ((uint)ne10 >> 2);
 #endif
 
-#if IQ2S_MV_ABL == 2
+#if IQ2S_MV_ABL == 2 || IQ2S_MV_ABL == 4
 // keeps the index math, drops the gather
 #define IQ2S_SKGRID(i) (((i) * 0x01010101u) | 0x01010101u)
 #elif IQ2S_MV_GRIDIMG
