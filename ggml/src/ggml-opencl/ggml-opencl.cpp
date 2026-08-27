@@ -1351,6 +1351,9 @@ struct ggml_backend_opencl_context {
     // itself compiles in (see the *_grid_export kernels). Singletons; the backing
     // buffer is kept alongside so the image can never outlive it.
     cl_mem iq2s_grid_buf = nullptr, iq2s_grid_img = nullptr;
+    // plane buffer -> its 16-bit image1d_buffer view. Weight planes live for the
+    // model's lifetime, so the view is built once rather than per dispatch.
+    std::map<cl_mem, cl_mem> plane_img_u16;
     cl_mem iq1s_grid_buf = nullptr, iq1s_grid_img = nullptr;
     // 2-bit twin of the above, half the bytes; see IQ1S_MV_G2
     cl_mem iq1s_grid2_buf = nullptr, iq1s_grid2_img = nullptr;
@@ -3530,6 +3533,52 @@ static cl_mem ggml_cl_activation_image(ggml_backend_opencl_context * backend_ctx
     return img;
 }
 
+// A CL_R/CL_UNSIGNED_INT16 image1d_buffer view over a weight PLANE, for the decode
+// GEMVs whose lane owns a row pair and therefore reads exactly one ushort: one
+// texel IS the load, which is the precondition the cok weight texture failed.
+// The plane's own buffer backs it, so there is no copy. Returns nullptr when the
+// plane does not fit the device's image1d_buffer limit; the caller then declines
+// the textured path rather than reading the wrong thing.
+static cl_mem ggml_cl_plane_image_u16(ggml_backend_opencl_context * backend_ctx, cl_mem plane) {
+    // Cached, and deliberately so: creating this per dispatch costs more than the
+    // texture path saves. The split-K GEMV runs ~1000 dispatches per token on a 3B,
+    // so a per-dispatch clCreateImage pair is ~2000 driver calls per token.
+    auto it = backend_ctx->plane_img_u16.find(plane);
+    if (it != backend_ctx->plane_img_u16.end()) {
+        return it->second;
+    }
+    size_t bytes = 0;
+    if (clGetMemObjectInfo(plane, CL_MEM_SIZE, sizeof(bytes), &bytes, NULL) != CL_SUCCESS) {
+        return nullptr;
+    }
+    const size_t texels = bytes / sizeof(cl_ushort);
+    if (texels == 0 || texels > backend_ctx->image_max_buffer_size) {
+        return nullptr;
+    }
+    cl_image_format fmt = { CL_R, CL_UNSIGNED_INT16 };
+    cl_image_desc   desc;
+    memset(&desc, 0, sizeof(desc));
+    desc.image_type  = CL_MEM_OBJECT_IMAGE1D_BUFFER;
+    desc.image_width = texels;
+    desc.buffer      = plane;
+    cl_int err = CL_SUCCESS;
+    cl_mem img = clCreateImage(backend_ctx->context, CL_MEM_READ_ONLY, &fmt, &desc, NULL, &err);
+    if (err != CL_SUCCESS) {
+        return nullptr;
+    }
+    backend_ctx->plane_img_u16[plane] = img;
+    GGML_LOG_INFO("ggml_opencl: plane image u16 created (%zu texels, %zu cached)\n",
+                   texels, backend_ctx->plane_img_u16.size());
+    return img;
+}
+
+// Read the IQ2_S qs and signs planes through those images in the split-K decode
+// GEMV. Off by default until measured.
+static int ggml_cl_iq2s_mv_wimg(void) {
+    static const int v = ggml_cl_env_int("GGML_OPENCL_IQ2S_MV_WIMG", 0);
+    return v;
+}
+
 static bool ggml_cl_has_rg_uint32_image(ggml_backend_opencl_context * backend_ctx) {
     static int cached = -1;
     if (cached >= 0) {
@@ -4670,6 +4719,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         opts += " -DIQ2S_MV_SIGNXOR=" + std::to_string(ggml_cl_iq2s_mv_signxor());
         opts += " -DIQ2S_MV_ABL=" + std::to_string(ggml_cl_env_int("GGML_OPENCL_IQ2S_MV_ABL", 0));
         opts += " -DIQ2S_MV_WORK=" + std::to_string(ggml_cl_env_int("GGML_OPENCL_IQ2S_MV_WORK", 0));
+        opts += " -DIQ2S_MV_WIMG=" + std::to_string(ggml_cl_iq2s_mv_wimg());
         opts += " -DIQ2S_MV_AIMG=" + std::to_string(ggml_cl_iq2s_mv_aimg(backend_ctx));
         opts += " -DIQ2S_MV_NC=2";
         cl_program prog =
@@ -40560,6 +40610,24 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                         ? ggml_cl_activation_image(backend_ctx, extra1->data_device, offset1, ne10, ne11, &iq2s_y_off)
                         : nullptr;
                     cl_mem  iq2s_y_arg = iq2s_y_img ? iq2s_y_img : backend_ctx->iq2s_grid_img;
+                    // Plane textures. The kernel argument has to be a valid image
+                    // either way, so the grid image stands in when the mode is off
+                    // or a plane does not fit the device's image limit -- and when
+                    // it does not fit, the mode is skipped rather than mis-read.
+                    cl_mem iq2s_qs_img = nullptr, iq2s_sg_img = nullptr;
+                    if (ggml_cl_iq2s_mv_wimg()) {
+                        // cached on the context; not owned here
+                        iq2s_qs_img = ggml_cl_plane_image_u16(backend_ctx, ex0->qs);
+                        iq2s_sg_img = ggml_cl_plane_image_u16(backend_ctx, ex0->sg);
+                        if (!iq2s_qs_img || !iq2s_sg_img) {
+                            iq2s_qs_img = nullptr;
+                            iq2s_sg_img = nullptr;
+                        }
+                    }
+                    cl_mem iq2s_qs_arg = iq2s_qs_img ? iq2s_qs_img : backend_ctx->iq2s_grid_img;
+                    cl_mem iq2s_sg_arg = iq2s_sg_img ? iq2s_sg_img : backend_ctx->iq2s_grid_img;
+                    CL_CHECK(clSetKernelArg(sk, ai++, sizeof(cl_mem),   &iq2s_qs_arg));
+                    CL_CHECK(clSetKernelArg(sk, ai++, sizeof(cl_mem),   &iq2s_sg_arg));
                     CL_CHECK(clSetKernelArg(sk, ai++, sizeof(cl_mem),   &backend_ctx->iq2s_grid_img));
                     CL_CHECK(clSetKernelArg(sk, ai++, sizeof(cl_mem),   &iq2s_y_arg));
                     CL_CHECK(clSetKernelArg(sk, ai++, sizeof(cl_mem),   &ex0->qs));
@@ -40577,7 +40645,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     size_t s_local[3]  = { 64, (size_t)nsg, 1 };
                     CL_CHECK(clSetKernelArg(sk, ai++, sizeof(cl_uint), &iq2s_y_off));
                     backend_ctx->enqueue_ndrange_kernel(sk, 3, s_global, s_local, dst);
-                    if (iq2s_y_img) { CL_CHECK(clReleaseMemObject(iq2s_y_img)); }
+                    if (iq2s_y_img)  { CL_CHECK(clReleaseMemObject(iq2s_y_img)); }
 
                     cl_kernel rk = backend_ctx->kernel_gemv_splitk_reduce_f32;
                     cl_int ri = 0;

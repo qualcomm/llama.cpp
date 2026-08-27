@@ -326,6 +326,30 @@ constant uint iq2s_grid[2048] = {
 #define IQ2S_MV_WORK 0
 #endif
 
+// IQ2S_MV_WIMG=1: read the qs and signs PLANES through image1d_buffers instead of
+// as global ushort pointers. Split-K kernel only, which carries most of this
+// type's decode frame.
+//
+// Why the weight side and not another arithmetic lever: this kernel's own cost
+// probe says the activation load is 3.7%, the grid lookup 6.7% and the sign
+// application 6.4% -- about 17% in total -- while doubling the arithmetic costs
+// only 2.6%. It is not compute-bound and no inner-loop lever can be worth more
+// than that 17%, yet it runs at 38% of the part's bandwidth roofline. What is
+// left is how the weights are fetched: the tuned q4_K GEMV reads its quant plane
+// as whole texels through an image1d_buffer at 106-118 GB/s where the same bytes
+// read as a buffer get 50.
+//
+// 🔑 THE PRECONDITION IS A WHOLE TEXEL PER LANE, and that is why the format is
+// 16-bit. The cok weight texture was refuted at -39% because a lane took only
+// part of a texel; here a lane owns a ROW PAIR and reads exactly one ushort, so
+// the image is CL_R/CL_UNSIGNED_INT16 -- one texel IS the load. Probed on the
+// X2-90: it is one of 87 supported image1d_buffer formats, and the 134.2 M pixel
+// limit is far above any plane here. Consecutive lanes read consecutive ushorts,
+// which is the coalesced pattern the q4_K path relies on.
+#ifndef IQ2S_MV_WIMG
+#define IQ2S_MV_WIMG 0
+#endif
+
 // Four grid values with their signs applied, as floats.
 inline float4 iq2s_vals(uint gv, uint sg, uint base) {
 #if IQ2S_MV_ABL == 3
@@ -1073,6 +1097,8 @@ kernel void kernel_mul_mv_iq2_s_f32_flat_glu(
 // ---------------------------------------------------------------------------
 
 kernel void kernel_mul_mv_iq2_s_f32_flat_splitk(
+        __read_only image1d_buffer_t qs_img,   // see IQ2S_MV_WIMG
+        __read_only image1d_buffer_t sg_img,   // see IQ2S_MV_WIMG
         __read_only image1d_buffer_t grid_img,
         __read_only image1d_buffer_t y_img,   // see IQ2S_MV_AIMG
         global const uchar * src0_qs,
@@ -1147,8 +1173,14 @@ kernel void kernel_mul_mv_iq2_s_f32_flat_splitk(
                     float a0 = 0.f, a1 = 0.f;
                     for (uint t = 0; t < 2u; ++t) {
                         const uint l   = 2u*h + t;
+#if IQ2S_MV_WIMG
+                        // one CL_R/UNSIGNED_INT16 texel IS the ushort a lane owns
+                        const uint qsv = read_imageui(qs_img, (int)(gb + l * mh)).x;
+                        const uint sgv = read_imageui(sg_img, (int)(gb + l * mh)).x;
+#else
                         const uint qsv = (uint)qsu[gb + l * mh];
                         const uint sgv = (uint)sgu[gb + l * mh];
+#endif
                         const uint gi0 = ( qsv       & 0xFFu) | ((((qhv      ) >> (2u*l)) & 3u) << 8);
                         const uint gi1 = ((qsv >> 8) & 0xFFu) | ((((qhv >> 8) >> (2u*l)) & 3u) << 8);
                         const uint s0  =  sgv       & 0xFFu;
