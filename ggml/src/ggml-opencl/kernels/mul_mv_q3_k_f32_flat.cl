@@ -2,9 +2,22 @@
 
 // Q3_K decode GEMV over the feature-major plane split. Same structure as
 // mul_mv_iq3_s_f32_flat: K split across Q3K_MV_NSG subgroups because one row per
-// lane leaves the GPU short of work items, and Q3K_MV_R2 gives a lane two
-// adjacent rows so the uchar planes are read a ushort at a time. Four rows was
-// measured on IQ3_S and LOSES -- it quarters the grid -- so it is not offered.
+// lane leaves the GPU short of work items, and Q3K_MV_R gives a lane that many
+// adjacent rows, so the uchar planes are read a ushort or a uint at a time.
+//
+// Every plane here is [position][row] with the row as the FASTEST axis, so
+// widening the load is all it takes to pick up more rows, and the four rows also
+// share the activation vload4 and the y-side work.
+//
+// 🔴 R=4 USED TO SAY "measured on IQ3_S and LOSES -- it quarters the grid".
+// That was a per-type constant imported from a codebook type onto a linear one,
+// and the grid argument has since expired: this kernel gained a workgroup-level
+// K split, which puts ksplit in the z dimension and restores the occupancy the
+// quartering costs. Q2_K -- a linear quant like this one -- ships R=4 and
+// measures R=2 as 18-23% WORSE. So it is offered here and swept per type.
+//
+// R=4 needs ne01 % 4 == 0; the host declines the whole plane split otherwise, so
+// a tensor that cannot be read this way is never split in the first place.
 
 #define QK_K 256
 
@@ -12,8 +25,9 @@
 #define Q3K_MV_NSG 8
 #endif
 
-#ifndef Q3K_MV_R2
-#define Q3K_MV_R2 1
+// rows per lane: 1, 2 or 4
+#ifndef Q3K_MV_R
+#define Q3K_MV_R 2
 #endif
 
 // The 16 six-bit sub-scales live in 12 bytes, interleaved the way
@@ -80,7 +94,60 @@ kernel void kernel_mul_mv_q3_k_f32_flat(
 
     global const float * y = src1 + (ulong)col * (uint)ne10;
 
-#if Q3K_MV_R2
+#if Q3K_MV_R == 4
+    const uint mq  = m >> 2;
+    const uint j   = get_group_id(0) * 64u + lid;
+    const uint row = j << 2;
+
+    float sumf = 0.f, sumf1 = 0.f, sumf2 = 0.f, sumf3 = 0.f;
+
+    if (j < mq) {
+        global const uint * qsw = (global const uint *)src0_qs;
+        global const uint * hmw = (global const uint *)src0_hm;
+
+        for (uint ib = sgi; ib < nsb; ib += Q3K_MV_NSG) {
+            const half4 dh = vload4(j + ib * mq, src0_d);
+            const uint4 s0 = vload4(j + (3u * ib + 0u) * mq, src0_sc);
+            const uint4 s1 = vload4(j + (3u * ib + 1u) * mq, src0_sc);
+            const uint4 s2 = vload4(j + (3u * ib + 2u) * mq, src0_sc);
+
+            float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f, acc3 = 0.f;
+            for (uint sb = 0; sb < 8u; ++sb) {
+                const uint grp = ib * 64u + sb * 8u;
+                const uint qsb = j + grp * mq;
+                const uint hmb = j + (grp >> 1) * mq;
+
+                for (uint h = 0; h < 2u; ++h) {         // two 16-weight halves
+                    const int l0 = q3k_scale(s0.s0, s1.s0, s2.s0, 2u*sb + h);
+                    const int l1 = q3k_scale(s0.s1, s1.s1, s2.s1, 2u*sb + h);
+                    const int l2 = q3k_scale(s0.s2, s1.s2, s2.s2, 2u*sb + h);
+                    const int l3 = q3k_scale(s0.s3, s1.s3, s2.s3, 2u*sb + h);
+
+                    float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+                    for (uint u = 0; u < 4u; ++u) {
+                        const uint gg  = 4u*h + u;
+                        const uint qsv = qsw[qsb + gg * mq];        // four rows, one load
+                        const uint hmv = hmw[hmb + (gg >> 1) * mq];
+                        const uint hsh = 4u * (gg & 1u);
+                        const float4 yv = vload4(grp + gg, y);      // shared by all four
+                        a0 += dot(yv, q3k_vals((qsv      ) & 0xFFu, ((hmv      ) >> hsh) & 0xFu));
+                        a1 += dot(yv, q3k_vals((qsv >>  8) & 0xFFu, ((hmv >>  8) >> hsh) & 0xFu));
+                        a2 += dot(yv, q3k_vals((qsv >> 16) & 0xFFu, ((hmv >> 16) >> hsh) & 0xFu));
+                        a3 += dot(yv, q3k_vals((qsv >> 24) & 0xFFu, ((hmv >> 24) >> hsh) & 0xFu));
+                    }
+                    acc0 += (float)l0 * a0;
+                    acc1 += (float)l1 * a1;
+                    acc2 += (float)l2 * a2;
+                    acc3 += (float)l3 * a3;
+                }
+            }
+            sumf  += (float)dh.s0 * acc0;
+            sumf1 += (float)dh.s1 * acc1;
+            sumf2 += (float)dh.s2 * acc2;
+            sumf3 += (float)dh.s3 * acc3;
+        }
+    }
+#elif Q3K_MV_R == 2
     const uint mh  = m >> 1;
     const uint j   = get_group_id(0) * 64u + lid;
     const uint row = j << 1;
@@ -163,7 +230,21 @@ kernel void kernel_mul_mv_q3_k_f32_flat(
 #endif
 
 #if Q3K_MV_NSG > 1
-#if Q3K_MV_R2
+#if Q3K_MV_R == 4
+    __local float4 part[Q3K_MV_NSG][64];
+    part[sgi][lid] = (float4)(sumf, sumf1, sumf2, sumf3);
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (sgi != 0) {
+        return;
+    }
+    for (uint s = 1; s < Q3K_MV_NSG; ++s) {
+        const float4 p = part[s][lid];
+        sumf  += p.s0;
+        sumf1 += p.s1;
+        sumf2 += p.s2;
+        sumf3 += p.s3;
+    }
+#elif Q3K_MV_R == 2
     __local float2 part[Q3K_MV_NSG][64];
     part[sgi][lid] = (float2)(sumf, sumf1);
     barrier(CLK_LOCAL_MEM_FENCE);
@@ -188,7 +269,11 @@ kernel void kernel_mul_mv_q3_k_f32_flat(
 #endif
 #endif
 
-#if Q3K_MV_R2
+#if Q3K_MV_R == 4
+    if (j < mq) {
+        vstore4((float4)(sumf, sumf1, sumf2, sumf3), 0, dst + (ulong)col * (uint)ne0 + row);
+    }
+#elif Q3K_MV_R == 2
     if (j < mh) {
         vstore2((float2)(sumf, sumf1), 0, dst + (ulong)col * (uint)ne0 + row);
     }
@@ -255,6 +340,60 @@ kernel void kernel_mul_mv_q3_k_f32_flat_splitk(
 
     global const float * y = src1 + (ulong)col * (uint)ne10;
 
+#if Q3K_MV_R == 4
+    const uint mq  = m >> 2;
+    const uint j   = get_group_id(0) * 64u + lid;
+    const uint row = j << 2;
+
+    float sumf = 0.f, sumf1 = 0.f, sumf2 = 0.f, sumf3 = 0.f;
+
+    if (j < mq) {
+        global const uint * qsw = (global const uint *)src0_qs;
+        global const uint * hmw = (global const uint *)src0_hm;
+
+        for (uint ib = ib0 + sgi; ib < ib1; ib += Q3K_MV_NSG) {
+            const half4 dh = vload4(j + ib * mq, src0_d);
+            const uint4 s0 = vload4(j + (3u * ib + 0u) * mq, src0_sc);
+            const uint4 s1 = vload4(j + (3u * ib + 1u) * mq, src0_sc);
+            const uint4 s2 = vload4(j + (3u * ib + 2u) * mq, src0_sc);
+
+            float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f, acc3 = 0.f;
+            for (uint sb = 0; sb < 8u; ++sb) {
+                const uint grp = ib * 64u + sb * 8u;
+                const uint qsb = j + grp * mq;
+                const uint hmb = j + (grp >> 1) * mq;
+
+                for (uint h = 0; h < 2u; ++h) {         // two 16-weight halves
+                    const int l0 = q3k_scale(s0.s0, s1.s0, s2.s0, 2u*sb + h);
+                    const int l1 = q3k_scale(s0.s1, s1.s1, s2.s1, 2u*sb + h);
+                    const int l2 = q3k_scale(s0.s2, s1.s2, s2.s2, 2u*sb + h);
+                    const int l3 = q3k_scale(s0.s3, s1.s3, s2.s3, 2u*sb + h);
+
+                    float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+                    for (uint u = 0; u < 4u; ++u) {
+                        const uint gg  = 4u*h + u;
+                        const uint qsv = qsw[qsb + gg * mq];        // four rows, one load
+                        const uint hmv = hmw[hmb + (gg >> 1) * mq];
+                        const uint hsh = 4u * (gg & 1u);
+                        const float4 yv = vload4(grp + gg, y);      // shared by all four
+                        a0 += dot(yv, q3k_vals((qsv      ) & 0xFFu, ((hmv      ) >> hsh) & 0xFu));
+                        a1 += dot(yv, q3k_vals((qsv >>  8) & 0xFFu, ((hmv >>  8) >> hsh) & 0xFu));
+                        a2 += dot(yv, q3k_vals((qsv >> 16) & 0xFFu, ((hmv >> 16) >> hsh) & 0xFu));
+                        a3 += dot(yv, q3k_vals((qsv >> 24) & 0xFFu, ((hmv >> 24) >> hsh) & 0xFu));
+                    }
+                    acc0 += (float)l0 * a0;
+                    acc1 += (float)l1 * a1;
+                    acc2 += (float)l2 * a2;
+                    acc3 += (float)l3 * a3;
+                }
+            }
+            sumf  += (float)dh.s0 * acc0;
+            sumf1 += (float)dh.s1 * acc1;
+            sumf2 += (float)dh.s2 * acc2;
+            sumf3 += (float)dh.s3 * acc3;
+        }
+    }
+#else
     const uint mh  = m >> 1;
     const uint j   = get_group_id(0) * 64u + lid;
     const uint row = j << 1;
@@ -300,8 +439,24 @@ kernel void kernel_mul_mv_q3_k_f32_flat_splitk(
             sumf1 += (float)dh.s1 * acc1;
         }
     }
+#endif
 
 #if Q3K_MV_NSG > 1
+#if Q3K_MV_R == 4
+    __local float4 skpart[Q3K_MV_NSG][64];
+    skpart[sgi][lid] = (float4)(sumf, sumf1, sumf2, sumf3);
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (sgi != 0) {
+        return;
+    }
+    for (uint s = 1; s < Q3K_MV_NSG; ++s) {
+        const float4 p = skpart[s][lid];
+        sumf  += p.s0;
+        sumf1 += p.s1;
+        sumf2 += p.s2;
+        sumf3 += p.s3;
+    }
+#else
     __local float2 skpart[Q3K_MV_NSG][64];
     skpart[sgi][lid] = (float2)(sumf, sumf1);
     barrier(CLK_LOCAL_MEM_FENCE);
@@ -314,9 +469,17 @@ kernel void kernel_mul_mv_q3_k_f32_flat_splitk(
         sumf1 += p.s1;
     }
 #endif
+#endif
 
+#if Q3K_MV_R == 4
+    if (j < mq) {
+        // [ksplit][M], the layout kernel_gemv_splitk_reduce_f32 expects
+        vstore4((float4)(sumf, sumf1, sumf2, sumf3), 0, partial + (ulong)ks * m + row);
+    }
+#else
     if (j < mh) {
         // [ksplit][M], the layout kernel_gemv_splitk_reduce_f32 expects
         vstore2((float2)(sumf, sumf1), 0, partial + (ulong)ks * m + row);
     }
+#endif
 }
