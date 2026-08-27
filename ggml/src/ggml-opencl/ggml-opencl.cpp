@@ -2818,9 +2818,19 @@ static int ggml_cl_q3k_splitk_on(const ggml_backend_opencl_context * backend_ctx
     return backend_ctx->adreno_x2_class();
 }
 
-static int ggml_cl_q3k_mv_nsg() {
-    static const int v = ggml_cl_env_int("GGML_OPENCL_Q3K_MV_NSG", 8);
-    return v;
+// Four subgroups, not eight, and this only became right once the row fold moved.
+// The two are ONE decision: at two rows per lane eight wins (four measured -2.9%
+// on Q3_K_M), at four rows per lane four wins on every model tried. Sweeping them
+// independently picks the wrong corner.
+// It is also the safer width off X2: 64*4 = 256 work items, which the A7X accepts
+// where 512 aborts with CL_INVALID_WORK_GROUP_SIZE.
+static int ggml_cl_q3k_mv_nsg(const ggml_backend_opencl_context * backend_ctx) {
+    if (const char * e = getenv("GGML_OPENCL_Q3K_MV_NSG")) {
+        if (e[0]) {
+            return atoi(e);
+        }
+    }
+    return backend_ctx->adreno_x2_class() ? 4 : 8;
 }
 
 // Rows per lane for the Q3_K decode GEMV: 1, 2 or 4. Q2_K -- a linear quant like
@@ -2828,13 +2838,24 @@ static int ggml_cl_q3k_mv_nsg() {
 // this kernel used to carry was measured on IQ3_S, a codebook type, and its
 // occupancy argument expired when this kernel gained a workgroup K split.
 // GGML_OPENCL_Q3K_MV_R2=0 is still honoured and means one row per lane.
-static int ggml_cl_q3k_mv_r() {
-    static const int v = ggml_cl_env_int("GGML_OPENCL_Q3K_MV_R", 0);
+//
+// 🔴 Four rows means ggml_cl_q3k_is_split declines ne01 % 4 != 0, so a tensor
+// with a row count that is even but not a multiple of four now keeps the AoS
+// path instead of the plane split. Q2_K carries exactly the same trade and every
+// row count in the models measured here is a multiple of 64.
+static int ggml_cl_q3k_mv_r(const ggml_backend_opencl_context * backend_ctx) {
+    const int v = ggml_cl_env_int("GGML_OPENCL_Q3K_MV_R", 0);
     if (v == 1 || v == 2 || v == 4) {
         return v;
     }
-    static const int legacy = ggml_cl_env_int("GGML_OPENCL_Q3K_MV_R2", 1);
-    return legacy ? 2 : 1;
+    const int legacy = ggml_cl_env_int("GGML_OPENCL_Q3K_MV_R2", -1);
+    if (legacy == 0) {
+        return 1;
+    }
+    if (legacy > 0) {
+        return 2;
+    }
+    return backend_ctx->adreno_x2_class() ? 4 : 2;
 }
 
 
@@ -4547,13 +4568,13 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         const std::string kernel_src = read_file("mul_mv_q3_k_f32_flat.cl");
 #endif
         std::string opts = compile_opts;
-        opts += " -DQ3K_MV_NSG=" + std::to_string(ggml_cl_q3k_mv_nsg());
-        opts += " -DQ3K_MV_R="   + std::to_string(ggml_cl_q3k_mv_r());
+        opts += " -DQ3K_MV_NSG=" + std::to_string(ggml_cl_q3k_mv_nsg(backend_ctx));
+        opts += " -DQ3K_MV_R="   + std::to_string(ggml_cl_q3k_mv_r(backend_ctx));
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), opts);
 
         CL_CHECK((backend_ctx->kernel_mul_mv_q3_k_f32_flat = clCreateKernel(prog, "kernel_mul_mv_q3_k_f32_flat", &err), err));
-        if (ggml_cl_q3k_mv_r() >= 2) {
+        if (ggml_cl_q3k_mv_r(backend_ctx) >= 2) {
             // the split-K twin carries the paired-row fold only
             backend_ctx->kernel_mul_mv_q3_k_f32_flat_splitk =
                 clCreateKernel(prog, "kernel_mul_mv_q3_k_f32_flat_splitk", &err);
@@ -15410,7 +15431,7 @@ static bool ggml_cl_q3k_is_split(const ggml_backend_opencl_context * backend_ctx
         // the decode GEMV reads Q3K_MV_R adjacent rows as one word, so a row
         // count that is not a multiple of it is declined HERE rather than per
         // dispatch, exactly as Q2_K does above
-        && t->ne[1] % ggml_cl_q3k_mv_r() == 0
+        && t->ne[1] % ggml_cl_q3k_mv_r(backend_ctx) == 0
         && use_adreno_kernels(backend_ctx, t);
 }
 
@@ -38735,7 +38756,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     ggml_tensor_extra_cl_q3_K_ns * ex0 =
                         (ggml_tensor_extra_cl_q3_K_ns *)src0->extra;
                     cl_kernel fk = backend_ctx->kernel_mul_mv_q3_k_f32_flat;
-                    const int nsg = ggml_cl_q3k_mv_nsg();
+                    const int nsg = ggml_cl_q3k_mv_nsg(backend_ctx);
                     cl_int ai = 0;
                     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->qs));
                     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->hm));
@@ -38750,7 +38771,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne10));
                     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne0));
 
-                    const size_t rows_wg = 64u * (size_t)ggml_cl_q3k_mv_r();
+                    const size_t rows_wg = 64u * (size_t)ggml_cl_q3k_mv_r(backend_ctx);
                     size_t f_global[3] = { CEIL_DIV((size_t)ne01, rows_wg) * 64,
                                            (size_t)ne11 * (size_t)nsg, 1 };
                     size_t f_local[3]  = { 64, (size_t)nsg, 1 };
@@ -41392,12 +41413,12 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1) {
                 const int nsb     = ne00 / 256;
                 const int base_wg = (int)CEIL_DIV((size_t)ne01,
-                                        64u * (size_t)ggml_cl_q3k_mv_r());
+                                        64u * (size_t)ggml_cl_q3k_mv_r(backend_ctx));
                 const int ksplit  = ggml_cl_iq_mv_ksplit(backend_ctx, base_wg, nsb);
                 if (ksplit > 1) {
                     ggml_tensor_extra_cl_q3_K_ns * ex0 =
                         (ggml_tensor_extra_cl_q3_K_ns *)src0->extra;
-                    const int nsg = ggml_cl_q3k_mv_nsg();
+                    const int nsg = ggml_cl_q3k_mv_nsg(backend_ctx);
                     backend_ctx->prealloc_splitk_partial.allocate(
                         backend_ctx->context, (size_t)ksplit * (size_t)ne01 * sizeof(float));
 
@@ -41420,7 +41441,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                         GGML_LOG_INFO("ggml_opencl: q3_k split-K decode GEMV active (ksplit=%d)\n", ksplit);
                     }
 
-                    const size_t rows_wg = 64u * (size_t)ggml_cl_q3k_mv_r();
+                    const size_t rows_wg = 64u * (size_t)ggml_cl_q3k_mv_r(backend_ctx);
                     size_t s_global[3] = { CEIL_DIV((size_t)ne01, rows_wg) * 64,
                                            (size_t)nsg, (size_t)ksplit };
                     size_t s_local[3]  = { 64, (size_t)nsg, 1 };
@@ -41447,7 +41468,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 ggml_tensor_extra_cl_q3_K_ns * ex0 =
                     (ggml_tensor_extra_cl_q3_K_ns *)src0->extra;
                 cl_kernel fk = backend_ctx->kernel_mul_mv_q3_k_f32_flat;
-                const int nsg = ggml_cl_q3k_mv_nsg();
+                const int nsg = ggml_cl_q3k_mv_nsg(backend_ctx);
                 cl_int ai = 0;
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->qs));
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->hm));
@@ -41462,7 +41483,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne10));
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne0));
 
-                const size_t rows_wg = 64u * (size_t)ggml_cl_q3k_mv_r();
+                const size_t rows_wg = 64u * (size_t)ggml_cl_q3k_mv_r(backend_ctx);
                 size_t f_global[3] = { CEIL_DIV((size_t)ne01, rows_wg) * 64,
                                        (size_t)ne11 * (size_t)nsg, 1 };
                 size_t f_local[3]  = { 64, (size_t)nsg, 1 };
