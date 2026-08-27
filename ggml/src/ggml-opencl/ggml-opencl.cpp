@@ -1315,6 +1315,23 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mv_q3_K_f32;
     cl_kernel kernel_mul_mv_iq4_xs_f32;
     int       iq4xs_mv_nsg_eff = 0;   // NSG the device actually accepts; see ggml_cl_nsg_fit
+
+    // Same, for every other plane-split decode GEMV. Each of those programs is
+    // compiled with a fixed NSG -- it sizes the local reduction array -- and is
+    // then dispatched at 64*NSG work items, so a device that refuses that
+    // workgroup cannot be accommodated at dispatch and the program has to be
+    // rebuilt narrower. Zero means the program was never built.
+    int       iq3s_mv_nsg_eff    = 0;
+    int       iq3xxs_mv_nsg_eff  = 0;
+    int       iq2xxs_mv_nsg_eff  = 0;
+    int       iq2xxs_mc4_nsg_eff = 0;   // the mc4 variant is a program of its own
+    int       iq2xs_mv_nsg_eff   = 0;
+    int       iq2s_mv_nsg_eff    = 0;
+    int       iq2s_mc4_nsg_eff   = 0;
+    int       iq1s_mv_nsg_eff    = 0;
+    int       iq1m_mv_nsg_eff    = 0;
+    int       q2k_mv_nsg_eff     = 0;
+    int       q3k_mv_nsg_eff     = 0;
     cl_kernel kernel_mul_mv_iq4_xs_f32_flat;
     cl_kernel kernel_mul_mv_iq4_xs_f32_flat_wimg = nullptr;  // same, quant plane through a texture (opt-in)
     cl_kernel kernel_mul_mv_iq4_xs_f32_flat_glu = nullptr;     // fused ffn_gate+ffn_up+GLU
@@ -3276,6 +3293,71 @@ static cl_program build_program_from_source(ggml_backend_opencl_context * backen
     return p;
 }
 
+// Build one of the plane-split decode-GEMV programs and narrow its NSG until
+// every GEMV it exports accepts a 64*NSG workgroup on this device.
+//
+// NSG is a compile-time define -- it sizes the local reduction array -- so a
+// CL_INVALID_WORK_GROUP_SIZE refusal cannot be repaired at dispatch; the program
+// has to be built again. Probe EVERY "kernel_mul_mv_*" the program exports and
+// take the narrowest fit: they share the define but not the register count, so
+// the plain kernel fitting says nothing about the texture, fused or split-K
+// ones. Kernels that are not GEMVs (the grid exporters) are dispatched at their
+// own size and are deliberately skipped -- narrowing on them would be
+// pessimistic for no reason.
+//
+// The result goes on the context, and every dispatch site reads it from there
+// rather than the requested value; see ggml_cl_nsg_fit for what this cost when
+// only one site did.
+static cl_program ggml_cl_build_mv_program_nsg(ggml_backend_opencl_context * backend_ctx,
+                                               const char * kernel_src,
+                                               const std::string & opts_base,
+                                               const char * nsg_define,
+                                               int nsg_req,
+                                               int * nsg_eff_out) {
+    int nsg_eff = nsg_req < 1 ? 1 : nsg_req;
+    for (;;) {
+        const std::string opts =
+            opts_base + " -D" + nsg_define + "=" + std::to_string(nsg_eff);
+        cl_program prog = build_program_from_source(backend_ctx, kernel_src, opts);
+
+        size_t names_len = 0;
+        std::string names;
+        if (clGetProgramInfo(prog, CL_PROGRAM_KERNEL_NAMES, 0, NULL, &names_len) == CL_SUCCESS
+            && names_len > 1) {
+            names.resize(names_len);
+            if (clGetProgramInfo(prog, CL_PROGRAM_KERNEL_NAMES, names_len,
+                                 &names[0], NULL) != CL_SUCCESS) {
+                names.clear();
+            }
+            // The returned length counts the terminator; drop it so the last
+            // name does not come back with a trailing NUL attached.
+            while (!names.empty() && names.back() == 0) { names.pop_back(); }
+        }
+
+        int fit = nsg_eff;
+        for (size_t b = 0, e; b < names.size(); b = e + 1) {
+            e = names.find(';', b);
+            if (e == std::string::npos) { e = names.size(); }
+            const std::string kn = names.substr(b, e - b);
+            if (kn.compare(0, 14, "kernel_mul_mv_") != 0) {
+                continue;
+            }
+            cl_int perr = CL_SUCCESS;
+            cl_kernel probe = clCreateKernel(prog, kn.c_str(), &perr);
+            if (perr != CL_SUCCESS || probe == nullptr) { continue; }
+            fit = std::min(fit, ggml_cl_nsg_fit(backend_ctx, probe, nsg_eff, kn.c_str()));
+            CL_CHECK(clReleaseKernel(probe));
+        }
+
+        if (fit >= nsg_eff) {
+            if (nsg_eff_out != nullptr) { *nsg_eff_out = nsg_eff; }
+            return prog;
+        }
+        CL_CHECK(clReleaseProgram(prog));
+        nsg_eff = fit;
+    }
+}
+
 // Cache-aware form of build_program_from_source_ex, for the programs that are
 // compiled lazily on first use (the FA variants). Without it every process pays
 // the full clBuildProgram on the first token that reaches the op, which is where
@@ -4434,44 +4516,15 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #else
         const std::string kernel_src = read_file("mul_mv_iq4_xs_f32_flat.cl");
 #endif
-        // Built at the widest NSG the device will actually launch. The first build
-        // is a probe: if its kernel refuses 64*NSG work items the program is thrown
-        // away and rebuilt narrower, because NSG is compile-time (the cross-subgroup
-        // reduce iterates it) and cannot be narrowed at dispatch.
-        int nsg_eff = ggml_cl_iq4xs_mv_nsg();
-        cl_program prog = nullptr;
-        for (;;) {
-            std::string opts = compile_opts;
-            opts += " -DIQ4XS_MV_NSG=" + std::to_string(nsg_eff);
-            opts += " -DIQ4XS_MV_R2="  + std::to_string(ggml_cl_iq4xs_mv_r2());
-            opts += " -DIQ4XS_MV_R4="  + std::to_string(ggml_cl_iq4xs_mv_r4());
-            opts += " -DIQ4XS_MV_ABL=" + std::to_string(ggml_cl_iq4xs_mv_abl());
-            opts += " -DIQ4XS_MV_CB=" + std::to_string(ggml_cl_iq4xs_mv_cb());
+        std::string opts = compile_opts;
+        opts += " -DIQ4XS_MV_R2="  + std::to_string(ggml_cl_iq4xs_mv_r2());
+        opts += " -DIQ4XS_MV_R4="  + std::to_string(ggml_cl_iq4xs_mv_r4());
+        opts += " -DIQ4XS_MV_ABL=" + std::to_string(ggml_cl_iq4xs_mv_abl());
+        opts += " -DIQ4XS_MV_CB=" + std::to_string(ggml_cl_iq4xs_mv_cb());
         opts += " -DIQ4XS_MV_AIMG=" + std::to_string(ggml_cl_iq4xs_mv_aimg(backend_ctx));
-            prog = build_program_from_source(backend_ctx, kernel_src.c_str(), opts);
-
-            // Probe EVERY kernel in this program that is dispatched at 64*NSG and
-            // take the narrowest. They share the compile-time NSG but not the
-            // register count, so the plain kernel fitting says nothing about the
-            // texture or fused ones.
-            int fit = nsg_eff;
-            for (const char * kn : { "kernel_mul_mv_iq4_xs_f32_flat",
-                                     "kernel_mul_mv_iq4_xs_f32_flat_wimg",
-                                     "kernel_mul_mv_iq4_xs_f32_flat_glu",
-                                     "kernel_mul_mv_iq4_xs_f32_flat_splitk" }) {
-                cl_int perr = CL_SUCCESS;
-                cl_kernel probe = clCreateKernel(prog, kn, &perr);
-                if (perr != CL_SUCCESS || probe == nullptr) { continue; }
-                fit = std::min(fit, ggml_cl_nsg_fit(backend_ctx, probe, nsg_eff, kn));
-                CL_CHECK(clReleaseKernel(probe));
-            }
-            if (fit >= nsg_eff) {
-                break;
-            }
-            CL_CHECK(clReleaseProgram(prog));
-            nsg_eff = fit;
-        }
-        backend_ctx->iq4xs_mv_nsg_eff = nsg_eff;
+        cl_program prog = ggml_cl_build_mv_program_nsg(
+            backend_ctx, kernel_src.c_str(), opts, "IQ4XS_MV_NSG",
+            ggml_cl_iq4xs_mv_nsg(), &backend_ctx->iq4xs_mv_nsg_eff);
 
         CL_CHECK((backend_ctx->kernel_mul_mv_iq4_xs_f32_flat = clCreateKernel(prog, "kernel_mul_mv_iq4_xs_f32_flat", &err), err));
         CL_CHECK((backend_ctx->kernel_mul_mv_iq4_xs_f32_flat_wimg = clCreateKernel(prog, "kernel_mul_mv_iq4_xs_f32_flat_wimg", &err), err));
@@ -4497,7 +4550,6 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         const std::string kernel_src = read_file("mul_mv_iq3_s_f32_flat.cl");
 #endif
         std::string opts = compile_opts;
-        opts += " -DIQ3S_MV_NSG=" + std::to_string(ggml_cl_iq3s_mv_nsg());
         opts += " -DIQ3S_MV_AIMG=" + std::to_string(ggml_cl_iq3s_mv_aimg(backend_ctx));
         opts += " -DIQ3S_MV_LDSGRID=" + std::to_string(ggml_cl_iq3s_mv_ldsgrid());
         opts += " -DIQ3S_MV_GRIDIMG=" + std::to_string(ggml_cl_iq3s_mv_gridimg(backend_ctx));
@@ -4510,8 +4562,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         opts += " -DIQ3S_MV_WORK=" + std::to_string(ggml_cl_iq3s_mv_work());
         opts += " -DIQ3S_MV_R2="  + std::to_string(ggml_cl_iq3s_mv_r2());
         opts += " -DIQ3S_MV_R4="  + std::to_string(ggml_cl_iq3s_mv_r4());
-        cl_program prog =
-            build_program_from_source(backend_ctx, kernel_src.c_str(), opts);
+        cl_program prog = ggml_cl_build_mv_program_nsg(
+            backend_ctx, kernel_src.c_str(), opts, "IQ3S_MV_NSG",
+            ggml_cl_iq3s_mv_nsg(), &backend_ctx->iq3s_mv_nsg_eff);
 
         CL_CHECK((backend_ctx->kernel_mul_mv_iq3_s_f32_flat = clCreateKernel(prog, "kernel_mul_mv_iq3_s_f32_flat", &err), err));
         if (ggml_cl_iq3s_mv_r2()) {
@@ -4551,14 +4604,14 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         const std::string kernel_src = read_file("mul_mv_iq3_xxs_f32_flat.cl");
 #endif
         std::string opts = compile_opts;
-        opts += " -DIQ3XXS_MV_NSG=" + std::to_string(ggml_cl_iq3xxs_mv_nsg());
         opts += " -DIQ3XXS_MV_LDSGRID=" + std::to_string(ggml_cl_iq3xxs_mv_ldsgrid());
         opts += " -DIQ3XXS_MV_GRIDIMG=" + std::to_string(ggml_cl_iq3xxs_mv_gridimg(backend_ctx));
         opts += " -DIQ3XXS_MV_AIMG=" + std::to_string(ggml_cl_iq3xxs_mv_aimg(backend_ctx));
         opts += " -DIQ3XXS_MV_SIGNXOR=" + std::to_string(ggml_cl_iq3xxs_mv_signxor());
         opts += " -DIQ3XXS_MV_R2="  + std::to_string(ggml_cl_iq3xxs_mv_r2());
-        cl_program prog =
-            build_program_from_source(backend_ctx, kernel_src.c_str(), opts);
+        cl_program prog = ggml_cl_build_mv_program_nsg(
+            backend_ctx, kernel_src.c_str(), opts, "IQ3XXS_MV_NSG",
+            ggml_cl_iq3xxs_mv_nsg(), &backend_ctx->iq3xxs_mv_nsg_eff);
 
         CL_CHECK((backend_ctx->kernel_mul_mv_iq3_xxs_f32_flat = clCreateKernel(prog, "kernel_mul_mv_iq3_xxs_f32_flat", &err), err));
         ggml_cl_make_grid_image(backend_ctx, prog, "kernel_iq3xxs_grid_export", 256,
@@ -4577,15 +4630,15 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         const std::string kernel_src = read_file("mul_mv_iq2_xxs_f32_flat.cl");
 #endif
         std::string opts = compile_opts;
-        opts += " -DIQ2XXS_MV_NSG=" + std::to_string(ggml_cl_iq2xxs_mv_nsg());
         opts += " -DIQ2XXS_MV_GRIDIMG=" + std::to_string(ggml_cl_iq2xxs_flat_gridimg(backend_ctx));
         opts += " -DIQ2XXS_MV_AIMG=" + std::to_string(ggml_cl_iq2xxs_mv_aimg(backend_ctx));
         opts += " -DIQ2XXS_MV_SIGNXOR=" + std::to_string(ggml_cl_iq2xxs_mv_signxor());
         opts += " -DIQ2XXS_MV_R2=" + std::to_string(ggml_cl_iq2xxs_mv_r2());
         opts += " -DIQ2XXS_MV_ABL=" + std::to_string(ggml_cl_iq2xxs_mv_abl());
         opts += " -DIQ2XXS_MV_NC=2";
-        cl_program prog =
-            build_program_from_source(backend_ctx, kernel_src.c_str(), opts);
+        cl_program prog = ggml_cl_build_mv_program_nsg(
+            backend_ctx, kernel_src.c_str(), opts, "IQ2XXS_MV_NSG",
+            ggml_cl_iq2xxs_mv_nsg(), &backend_ctx->iq2xxs_mv_nsg_eff);
 
         // The grid image is the one the AoS program already created -- same table,
         // and both kernels index it as uint pairs.
@@ -4599,11 +4652,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                 std::string opts4 = opts;
                 const std::string nc2 = " -DIQ2XXS_MV_NC=2";
                 opts4.replace(opts4.find(nc2), nc2.size(), " -DIQ2XXS_MV_NC=4");
-                const std::string nsgc = " -DIQ2XXS_MV_NSG=" + std::to_string(ggml_cl_iq2xxs_mv_nsg());
-                opts4.replace(opts4.find(nsgc), nsgc.size(),
-                              " -DIQ2XXS_MV_NSG=" + std::to_string(ggml_cl_iq2xxs_mv_mc4_nsg()));
-                cl_program prog4 =
-                    build_program_from_source(backend_ctx, kernel_src.c_str(), opts4);
+                cl_program prog4 = ggml_cl_build_mv_program_nsg(
+                    backend_ctx, kernel_src.c_str(), opts4, "IQ2XXS_MV_NSG",
+                    ggml_cl_iq2xxs_mv_mc4_nsg(), &backend_ctx->iq2xxs_mc4_nsg_eff);
                 backend_ctx->kernel_mul_mv_iq2_xxs_f32_flat_mc4 =
                     clCreateKernel(prog4, "kernel_mul_mv_iq2_xxs_f32_flat_mc", &err);
                 if (err != CL_SUCCESS) { backend_ctx->kernel_mul_mv_iq2_xxs_f32_flat_mc4 = nullptr; }
@@ -4634,13 +4685,13 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         const std::string kernel_src = read_file("mul_mv_iq2_xs_f32_flat.cl");
 #endif
         std::string opts = compile_opts;
-        opts += " -DIQ2XS_MV_NSG=" + std::to_string(ggml_cl_iq2xs_mv_nsg());
         opts += " -DIQ2XS_MV_GRIDIMG=" + std::to_string(ggml_cl_iq2xs_flat_gridimg(backend_ctx));
         opts += " -DIQ2XS_MV_AIMG=" + std::to_string(ggml_cl_iq2xs_mv_aimg(backend_ctx));
         opts += " -DIQ2XS_MV_SIGNXOR=" + std::to_string(ggml_cl_iq2xs_mv_signxor());
         opts += " -DIQ2XS_MV_R2=" + std::to_string(ggml_cl_iq2xs_mv_r2());
-        cl_program prog =
-            build_program_from_source(backend_ctx, kernel_src.c_str(), opts);
+        cl_program prog = ggml_cl_build_mv_program_nsg(
+            backend_ctx, kernel_src.c_str(), opts, "IQ2XS_MV_NSG",
+            ggml_cl_iq2xs_mv_nsg(), &backend_ctx->iq2xs_mv_nsg_eff);
 
         CL_CHECK((backend_ctx->kernel_mul_mv_iq2_xs_f32_flat = clCreateKernel(prog, "kernel_mul_mv_iq2_xs_f32_flat", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -4657,10 +4708,10 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         const std::string kernel_src = read_file("mul_mv_q3_k_f32_flat.cl");
 #endif
         std::string opts = compile_opts;
-        opts += " -DQ3K_MV_NSG=" + std::to_string(ggml_cl_q3k_mv_nsg(backend_ctx));
         opts += " -DQ3K_MV_R="   + std::to_string(ggml_cl_q3k_mv_r(backend_ctx));
-        cl_program prog =
-            build_program_from_source(backend_ctx, kernel_src.c_str(), opts);
+        cl_program prog = ggml_cl_build_mv_program_nsg(
+            backend_ctx, kernel_src.c_str(), opts, "Q3K_MV_NSG",
+            ggml_cl_q3k_mv_nsg(backend_ctx), &backend_ctx->q3k_mv_nsg_eff);
 
         CL_CHECK((backend_ctx->kernel_mul_mv_q3_k_f32_flat = clCreateKernel(prog, "kernel_mul_mv_q3_k_f32_flat", &err), err));
         if (ggml_cl_q3k_mv_r(backend_ctx) >= 2) {
@@ -4683,13 +4734,13 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         const std::string kernel_src = read_file("mul_mv_q2_k_f32_flat.cl");
 #endif
         std::string opts = compile_opts;
-        opts += " -DQ2K_MV_NSG=" + std::to_string(ggml_cl_q2k_mv_nsg());
         opts += " -DQ2K_MV_R="   + std::to_string(ggml_cl_q2k_mv_r());
         opts += " -DQ2K_MV_ABL=" + std::to_string(ggml_cl_q2k_mv_abl());
         opts += " -DQ2K_MV_PF="  + std::to_string(ggml_cl_q2k_mv_pf());
         opts += " -DMV_WORK2=" + std::to_string(ggml_cl_mv_work2());
-        cl_program prog =
-            build_program_from_source(backend_ctx, kernel_src.c_str(), opts);
+        cl_program prog = ggml_cl_build_mv_program_nsg(
+            backend_ctx, kernel_src.c_str(), opts, "Q2K_MV_NSG",
+            ggml_cl_q2k_mv_nsg(), &backend_ctx->q2k_mv_nsg_eff);
 
         CL_CHECK((backend_ctx->kernel_mul_mv_q2_k_f32_flat = clCreateKernel(prog, "kernel_mul_mv_q2_k_f32_flat", &err), err));
         if (ggml_cl_q2k_mv_r() == 4) {
@@ -4712,7 +4763,6 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         const std::string kernel_src = read_file("mul_mv_iq2_s_f32_flat.cl");
 #endif
         std::string opts = compile_opts;
-        opts += " -DIQ2S_MV_NSG=" + std::to_string(ggml_cl_iq2s_mv_nsg());
         opts += " -DIQ2S_MV_R2="  + std::to_string(ggml_cl_iq2s_mv_r2());
         opts += " -DIQ2S_MV_LDSGRID=" + std::to_string(ggml_cl_iq2s_mv_ldsgrid());
         opts += " -DIQ2S_MV_GRIDIMG=" + std::to_string(ggml_cl_iq2s_mv_gridimg(backend_ctx));
@@ -4722,8 +4772,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         opts += " -DIQ2S_MV_WIMG=" + std::to_string(ggml_cl_iq2s_mv_wimg());
         opts += " -DIQ2S_MV_AIMG=" + std::to_string(ggml_cl_iq2s_mv_aimg(backend_ctx));
         opts += " -DIQ2S_MV_NC=2";
-        cl_program prog =
-            build_program_from_source(backend_ctx, kernel_src.c_str(), opts);
+        cl_program prog = ggml_cl_build_mv_program_nsg(
+            backend_ctx, kernel_src.c_str(), opts, "IQ2S_MV_NSG",
+            ggml_cl_iq2s_mv_nsg(), &backend_ctx->iq2s_mv_nsg_eff);
 
         CL_CHECK((backend_ctx->kernel_mul_mv_iq2_s_f32_flat = clCreateKernel(prog, "kernel_mul_mv_iq2_s_f32_flat", &err), err));
         if (ggml_cl_iq2s_mv_r2()) {
@@ -4739,11 +4790,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                 std::string opts4 = opts;
                 const std::string two = " -DIQ2S_MV_NC=2";
                 opts4.replace(opts4.find(two), two.size(), " -DIQ2S_MV_NC=4");
-                const std::string nsg8 = " -DIQ2S_MV_NSG=" + std::to_string(ggml_cl_iq2s_mv_nsg());
-                opts4.replace(opts4.find(nsg8), nsg8.size(),
-                              " -DIQ2S_MV_NSG=" + std::to_string(ggml_cl_iq2s_mv_mc4_nsg()));
-                cl_program prog4 =
-                    build_program_from_source(backend_ctx, kernel_src.c_str(), opts4);
+                cl_program prog4 = ggml_cl_build_mv_program_nsg(
+                    backend_ctx, kernel_src.c_str(), opts4, "IQ2S_MV_NSG",
+                    ggml_cl_iq2s_mv_mc4_nsg(), &backend_ctx->iq2s_mc4_nsg_eff);
                 backend_ctx->kernel_mul_mv_iq2_s_f32_flat_mc4 =
                     clCreateKernel(prog4, "kernel_mul_mv_iq2_s_f32_flat_mc", &err);
                 if (err != CL_SUCCESS) { backend_ctx->kernel_mul_mv_iq2_s_f32_flat_mc4 = nullptr; }
@@ -4773,7 +4822,6 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         const std::string kernel_src = read_file("mul_mv_iq1_s_f32_flat.cl");
 #endif
         std::string opts = compile_opts;
-        opts += " -DIQ1S_MV_NSG=" + std::to_string(ggml_cl_iq1s_mv_nsg());
         opts += " -DIQ1S_MV_R="   + std::to_string(ggml_cl_iq1s_mv_r());
         opts += " -DIQ1S_MV_R_GLU=" + std::to_string(ggml_cl_iq1s_mv_r_glu());
         opts += " -DIQ1S_MV_LDSGRID=" + std::to_string(ggml_cl_iq1s_mv_ldsgrid());
@@ -4784,8 +4832,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         opts += " -DIQ1S_MV_G2=" + std::to_string(ggml_cl_iq1s_mv_g2());
         opts += " -DIQ1S_MV_PF=" + std::to_string(ggml_cl_iq1s_mv_pf());
         opts += " -DIQ1S_MV_NC=2";
-        cl_program prog =
-            build_program_from_source(backend_ctx, kernel_src.c_str(), opts);
+        cl_program prog = ggml_cl_build_mv_program_nsg(
+            backend_ctx, kernel_src.c_str(), opts, "IQ1S_MV_NSG",
+            ggml_cl_iq1s_mv_nsg(), &backend_ctx->iq1s_mv_nsg_eff);
 
         CL_CHECK((backend_ctx->kernel_mul_mv_iq1_s_f32_flat = clCreateKernel(prog, "kernel_mul_mv_iq1_s_f32_flat", &err), err));
         // The multi-column kernel is written for the 2-row fold only.
@@ -4839,14 +4888,14 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         const std::string kernel_src = read_file("mul_mv_iq1_m_f32_flat.cl");
 #endif
         std::string opts = compile_opts;
-        opts += " -DIQ1M_MV_NSG=" + std::to_string(ggml_cl_iq1m_mv_nsg());
         opts += " -DIQ1M_MV_NC=2";
         opts += " -DIQ1M_MV_R2="  + std::to_string(ggml_cl_iq1m_mv_r2());
         opts += " -DIQ1M_MV_LDSGRID=" + std::to_string(ggml_cl_iq1m_mv_ldsgrid());
         opts += " -DIQ1M_MV_GRIDIMG=" + std::to_string(ggml_cl_iq1m_mv_gridimg(backend_ctx));
         opts += " -DIQ1M_MV_AIMG=" + std::to_string(ggml_cl_iq1m_mv_aimg(backend_ctx));
-        cl_program prog =
-            build_program_from_source(backend_ctx, kernel_src.c_str(), opts);
+        cl_program prog = ggml_cl_build_mv_program_nsg(
+            backend_ctx, kernel_src.c_str(), opts, "IQ1M_MV_NSG",
+            ggml_cl_iq1m_mv_nsg(), &backend_ctx->iq1m_mv_nsg_eff);
 
         CL_CHECK((backend_ctx->kernel_mul_mv_iq1_m_f32_flat = clCreateKernel(prog, "kernel_mul_mv_iq1_m_f32_flat", &err), err));
         if (ggml_cl_iq1m_mv_r2()) {
@@ -24665,7 +24714,7 @@ static void ggml_cl_mul_mat_iq2_xxs_glu_fused(ggml_backend_t backend, ggml_tenso
     const int glu_op = (int)ggml_get_glu_op(dst);
 
     cl_kernel fk  = backend_ctx->kernel_mul_mv_iq2_xxs_f32_flat_glu;
-    const int nsg = ggml_cl_iq2xxs_mv_nsg();
+    const int nsg = backend_ctx->iq2xxs_mv_nsg_eff;
 
     cl_int ai = 0;
     cl_uint iq2xxs_y_off = 0;
@@ -24731,7 +24780,7 @@ static void ggml_cl_mul_mat_iq3_s_glu_fused(ggml_backend_t backend, ggml_tensor 
     const int glu_op = (int)ggml_get_glu_op(dst);
 
     cl_kernel fk  = backend_ctx->kernel_mul_mv_iq3_s_f32_flat_glu;
-    const int nsg = ggml_cl_iq3s_mv_nsg();
+    const int nsg = backend_ctx->iq3s_mv_nsg_eff;
 
     cl_int ai = 0;
     cl_mem iq3s_sgrid_arg = ggml_cl_iq3s_mv_grid_arg(backend_ctx);
@@ -24795,7 +24844,7 @@ static void ggml_cl_mul_mat_iq1_s_glu_fused(ggml_backend_t backend, ggml_tensor 
     const int glu_op = (int)ggml_get_glu_op(dst);
 
     cl_kernel fk  = backend_ctx->kernel_mul_mv_iq1_s_f32_flat_glu;
-    const int nsg = ggml_cl_iq1s_mv_nsg();
+    const int nsg = backend_ctx->iq1s_mv_nsg_eff;
 
     cl_int ai = 0;
     cl_uint iq1s_y_off = 0;
@@ -24862,7 +24911,7 @@ static void ggml_cl_mul_mat_iq1_m_glu_fused(ggml_backend_t backend, ggml_tensor 
     const int glu_op = (int)ggml_get_glu_op(dst);
 
     cl_kernel fk  = backend_ctx->kernel_mul_mv_iq1_m_f32_flat_glu;
-    const int nsg = ggml_cl_iq1m_mv_nsg();
+    const int nsg = backend_ctx->iq1m_mv_nsg_eff;
 
     cl_int ai = 0;
     cl_uint iq1m_y_off = 0;
@@ -24995,7 +25044,7 @@ static void ggml_cl_mul_mat_iq2_s_glu_fused(ggml_backend_t backend, ggml_tensor 
     const int glu_op = (int)ggml_get_glu_op(dst);
 
     cl_kernel fk  = backend_ctx->kernel_mul_mv_iq2_s_f32_flat_glu;
-    const int nsg = ggml_cl_iq2s_mv_nsg();
+    const int nsg = backend_ctx->iq2s_mv_nsg_eff;
 
     cl_int ai = 0;
     cl_uint iq2s_y_off = 0;
@@ -37380,7 +37429,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     ggml_tensor_extra_cl_iq3_xxs * ex0 =
                         (ggml_tensor_extra_cl_iq3_xxs *)src0->extra;
                     cl_kernel fk = backend_ctx->kernel_mul_mv_iq3_xxs_f32_flat;
-                    const int nsg = ggml_cl_iq3xxs_mv_nsg();
+                    const int nsg = backend_ctx->iq3xxs_mv_nsg_eff;
                     cl_int ai = 0;
                     cl_uint iq3xxs_y_off = 0;
                     cl_mem  iq3xxs_y_img = ggml_cl_iq3xxs_mv_aimg(backend_ctx)
@@ -37553,7 +37602,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     backend_ctx->enqueue_ndrange_kernel(qk, 1, qg, ql, dst);
 
                     cl_kernel dk = backend_ctx->kernel_mul_mv_iq3_s_f32_flat_dp4a;
-                    const int nsgd = ggml_cl_iq3s_mv_nsg();
+                    const int nsgd = backend_ctx->iq3s_mv_nsg_eff;
                     cl_int di = 0;
                     CL_CHECK(clSetKernelArg(dk, di++, sizeof(cl_mem),   &backend_ctx->iq3s_grid_img));
                     CL_CHECK(clSetKernelArg(dk, di++, sizeof(cl_mem),   &exq->qs));
@@ -37586,7 +37635,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     ggml_tensor_extra_cl_iq3_s * ex0 =
                         (ggml_tensor_extra_cl_iq3_s *)src0->extra;
                     cl_kernel fk = backend_ctx->kernel_mul_mv_iq3_s_f32_flat;
-                    const int nsg = ggml_cl_iq3s_mv_nsg();
+                    const int nsg = backend_ctx->iq3s_mv_nsg_eff;
                     cl_int ai = 0;
                     cl_uint iq3s_y_off = 0;
                     cl_mem  iq3s_y_img = ggml_cl_iq3s_mv_aimg(backend_ctx)
@@ -37735,7 +37784,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     ggml_tensor_extra_cl_iq2_xxs * ex0 =
                         (ggml_tensor_extra_cl_iq2_xxs *)src0->extra;
                     cl_kernel fk = backend_ctx->kernel_mul_mv_iq2_xxs_f32_flat;
-                    const int nsg = ggml_cl_iq2xxs_mv_nsg();
+                    const int nsg = backend_ctx->iq2xxs_mv_nsg_eff;
                     cl_int ai = 0;
                     cl_uint iq2xxs_y_off = 0;
                     cl_mem  iq2xxs_y_img = ggml_cl_iq2xxs_mv_aimg(backend_ctx)
@@ -37879,7 +37928,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     ggml_tensor_extra_cl_iq2_xs * ex0 =
                         (ggml_tensor_extra_cl_iq2_xs *)src0->extra;
                     cl_kernel fk = backend_ctx->kernel_mul_mv_iq2_xs_f32_flat;
-                    const int nsg = ggml_cl_iq2xs_mv_nsg();
+                    const int nsg = backend_ctx->iq2xs_mv_nsg_eff;
                     cl_int ai = 0;
                     cl_uint iq2xs_y_off = 0;
                     cl_mem  iq2xs_y_img = ggml_cl_iq2xs_mv_aimg(backend_ctx)
@@ -38022,7 +38071,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     ggml_tensor_extra_cl_iq2_s * ex0 =
                         (ggml_tensor_extra_cl_iq2_s *)src0->extra;
                     cl_kernel fk = backend_ctx->kernel_mul_mv_iq2_s_f32_flat;
-                    const int nsg = ggml_cl_iq2s_mv_nsg();
+                    const int nsg = backend_ctx->iq2s_mv_nsg_eff;
                     cl_int ai = 0;
                     cl_uint iq2s_y_off = 0;
                     cl_mem  iq2s_y_img = ggml_cl_iq2s_mv_aimg(backend_ctx)
@@ -38167,7 +38216,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     ggml_tensor_extra_cl_iq1_s * ex0 =
                         (ggml_tensor_extra_cl_iq1_s *)src0->extra;
                     cl_kernel fk = backend_ctx->kernel_mul_mv_iq1_s_f32_flat;
-                    const int nsg = ggml_cl_iq1s_mv_nsg();
+                    const int nsg = backend_ctx->iq1s_mv_nsg_eff;
                     cl_int ai = 0;
                     cl_uint iq1s_y_off = 0;
                     cl_mem  iq1s_y_img = ggml_cl_iq1s_mv_aimg(backend_ctx)
@@ -38315,7 +38364,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     ggml_tensor_extra_cl_iq1_m * ex0 =
                         (ggml_tensor_extra_cl_iq1_m *)src0->extra;
                     cl_kernel fk = backend_ctx->kernel_mul_mv_iq1_m_f32_flat;
-                    const int nsg = ggml_cl_iq1m_mv_nsg();
+                    const int nsg = backend_ctx->iq1m_mv_nsg_eff;
                     cl_int ai = 0;
                     cl_uint iq1m_y_off = 0;
                     cl_mem  iq1m_y_img = ggml_cl_iq1m_mv_aimg(backend_ctx)
@@ -38728,7 +38777,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     ggml_tensor_extra_cl_q2_K_ns * ex0 =
                         (ggml_tensor_extra_cl_q2_K_ns *)src0->extra;
                     cl_kernel fk = backend_ctx->kernel_mul_mv_q2_k_f32_flat;
-                    const int nsg = ggml_cl_q2k_mv_nsg();
+                    const int nsg = backend_ctx->q2k_mv_nsg_eff;
                     cl_int ai = 0;
                     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->qs));
                     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->sc));
@@ -38861,7 +38910,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     ggml_tensor_extra_cl_q3_K_ns * ex0 =
                         (ggml_tensor_extra_cl_q3_K_ns *)src0->extra;
                     cl_kernel fk = backend_ctx->kernel_mul_mv_q3_k_f32_flat;
-                    const int nsg = ggml_cl_q3k_mv_nsg(backend_ctx);
+                    const int nsg = backend_ctx->q3k_mv_nsg_eff;
                     cl_int ai = 0;
                     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->qs));
                     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->hm));
@@ -40002,7 +40051,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 ggml_tensor_extra_cl_iq3_xxs * ex0 =
                     (ggml_tensor_extra_cl_iq3_xxs *)src0->extra;
                 cl_kernel fk = backend_ctx->kernel_mul_mv_iq3_xxs_f32_flat;
-                const int nsg = ggml_cl_iq3xxs_mv_nsg();
+                const int nsg = backend_ctx->iq3xxs_mv_nsg_eff;
                 cl_int ai = 0;
                 cl_uint iq3xxs_y_off = 0;
                 cl_mem  iq3xxs_y_img = ggml_cl_iq3xxs_mv_aimg(backend_ctx)
@@ -40105,7 +40154,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 backend_ctx->enqueue_ndrange_kernel(qk, 1, qg, ql, dst);
 
                 cl_kernel dk = backend_ctx->kernel_mul_mv_iq3_s_f32_flat_dp4a;
-                const int nsgd = ggml_cl_iq3s_mv_nsg();
+                const int nsgd = backend_ctx->iq3s_mv_nsg_eff;
                 cl_int di = 0;
                 CL_CHECK(clSetKernelArg(dk, di++, sizeof(cl_mem),   &backend_ctx->iq3s_grid_img));
                 CL_CHECK(clSetKernelArg(dk, di++, sizeof(cl_mem),   &exq->qs));
@@ -40146,7 +40195,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 if (ksplit > 1) {
                     ggml_tensor_extra_cl_iq3_s * ex0 =
                         (ggml_tensor_extra_cl_iq3_s *)src0->extra;
-                    const int nsg = ggml_cl_iq3s_mv_nsg();
+                    const int nsg = backend_ctx->iq3s_mv_nsg_eff;
                     backend_ctx->prealloc_splitk_partial.allocate(
                         backend_ctx->context, (size_t)ksplit * (size_t)ne01 * sizeof(float));
 
@@ -40201,7 +40250,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 ggml_tensor_extra_cl_iq3_s * ex0 =
                     (ggml_tensor_extra_cl_iq3_s *)src0->extra;
                 cl_kernel mk = backend_ctx->kernel_mul_mv_iq3_s_f32_flat_mc;
-                const int nsg = ggml_cl_iq3s_mv_nsg();
+                const int nsg = backend_ctx->iq3s_mv_nsg_eff;
                 cl_int ai = 0;
                 cl_uint iq3s_y_off = 0;
                 cl_mem  iq3s_y_img = ggml_cl_iq3s_mv_aimg(backend_ctx)
@@ -40250,7 +40299,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 ggml_tensor_extra_cl_iq3_s * ex0 =
                     (ggml_tensor_extra_cl_iq3_s *)src0->extra;
                 cl_kernel fk = backend_ctx->kernel_mul_mv_iq3_s_f32_flat;
-                const int nsg = ggml_cl_iq3s_mv_nsg();
+                const int nsg = backend_ctx->iq3s_mv_nsg_eff;
                 cl_int ai = 0;
                 cl_uint iq3s_y_off = 0;
                 cl_mem  iq3s_y_img = ggml_cl_iq3s_mv_aimg(backend_ctx)
@@ -40336,7 +40385,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             if (ksplit > 1) {
                 ggml_tensor_extra_cl_iq2_xxs * ex0 =
                     (ggml_tensor_extra_cl_iq2_xxs *)src0->extra;
-                const int nsg = ggml_cl_iq2xxs_mv_nsg();
+                const int nsg = backend_ctx->iq2xxs_mv_nsg_eff;
                 backend_ctx->prealloc_splitk_partial.allocate(
                     backend_ctx->context, (size_t)ksplit * (size_t)ne01 * sizeof(float));
 
@@ -40399,7 +40448,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 cl_kernel mk = use4 ? backend_ctx->kernel_mul_mv_iq2_xxs_f32_flat_mc4
                                     : backend_ctx->kernel_mul_mv_iq2_xxs_f32_flat_mc;
                 // must match the width its program was built at
-                const int nsg = use4 ? ggml_cl_iq2xxs_mv_mc4_nsg() : ggml_cl_iq2xxs_mv_nsg();
+                const int nsg = use4 ? backend_ctx->iq2xxs_mc4_nsg_eff : backend_ctx->iq2xxs_mv_nsg_eff;
                 cl_int ai = 0;
                 cl_uint iq2xxs_y_off = 0;
                 cl_mem  iq2xxs_y_img = ggml_cl_iq2xxs_mv_aimg(backend_ctx)
@@ -40447,7 +40496,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 ggml_tensor_extra_cl_iq2_xxs * ex0 =
                     (ggml_tensor_extra_cl_iq2_xxs *)src0->extra;
                 cl_kernel fk = backend_ctx->kernel_mul_mv_iq2_xxs_f32_flat;
-                const int nsg = ggml_cl_iq2xxs_mv_nsg();
+                const int nsg = backend_ctx->iq2xxs_mv_nsg_eff;
                 cl_int ai = 0;
                 cl_uint iq2xxs_y_off = 0;
                 cl_mem  iq2xxs_y_img = ggml_cl_iq2xxs_mv_aimg(backend_ctx)
@@ -40524,7 +40573,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 ggml_tensor_extra_cl_iq2_xs * ex0 =
                     (ggml_tensor_extra_cl_iq2_xs *)src0->extra;
                 cl_kernel fk = backend_ctx->kernel_mul_mv_iq2_xs_f32_flat;
-                const int nsg = ggml_cl_iq2xs_mv_nsg();
+                const int nsg = backend_ctx->iq2xs_mv_nsg_eff;
                 cl_int ai = 0;
                 cl_uint iq2xs_y_off = 0;
                 cl_mem  iq2xs_y_img = ggml_cl_iq2xs_mv_aimg(backend_ctx)
@@ -40610,7 +40659,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 if (ksplit > 1) {
                     ggml_tensor_extra_cl_iq2_s * ex0 =
                         (ggml_tensor_extra_cl_iq2_s *)src0->extra;
-                    const int nsg = ggml_cl_iq2s_mv_nsg();
+                    const int nsg = backend_ctx->iq2s_mv_nsg_eff;
                     backend_ctx->prealloc_splitk_partial.allocate(
                         backend_ctx->context, (size_t)ksplit * (size_t)ne01 * sizeof(float));
 
@@ -40695,7 +40744,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 cl_kernel mk = use4 ? backend_ctx->kernel_mul_mv_iq2_s_f32_flat_mc4
                                     : backend_ctx->kernel_mul_mv_iq2_s_f32_flat_mc;
                 // must match the width its program was built at
-                const int nsg = use4 ? ggml_cl_iq2s_mv_mc4_nsg() : ggml_cl_iq2s_mv_nsg();
+                const int nsg = use4 ? backend_ctx->iq2s_mc4_nsg_eff : backend_ctx->iq2s_mv_nsg_eff;
                 cl_int ai = 0;
                 cl_uint iq2s_y_off = 0;
                 cl_mem  iq2s_y_img = ggml_cl_iq2s_mv_aimg(backend_ctx)
@@ -40745,7 +40794,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 ggml_tensor_extra_cl_iq2_s * ex0 =
                     (ggml_tensor_extra_cl_iq2_s *)src0->extra;
                 cl_kernel fk = backend_ctx->kernel_mul_mv_iq2_s_f32_flat;
-                const int nsg = ggml_cl_iq2s_mv_nsg();
+                const int nsg = backend_ctx->iq2s_mv_nsg_eff;
                 cl_int ai = 0;
                 cl_uint iq2s_y_off = 0;
                 cl_mem  iq2s_y_img = ggml_cl_iq2s_mv_aimg(backend_ctx)
@@ -40832,7 +40881,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 if (ksplit > 1) {
                     ggml_tensor_extra_cl_iq1_s * ex0 =
                         (ggml_tensor_extra_cl_iq1_s *)src0->extra;
-                    const int nsg = ggml_cl_iq1s_mv_nsg();
+                    const int nsg = backend_ctx->iq1s_mv_nsg_eff;
                     backend_ctx->prealloc_splitk_partial.allocate(
                         backend_ctx->context, (size_t)ksplit * (size_t)ne01 * sizeof(float));
 
@@ -40903,7 +40952,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 const size_t ncol = use4 ? 4u : 2u;
                 cl_kernel mk = use4 ? backend_ctx->kernel_mul_mv_iq1_s_f32_flat_mc4
                                     : backend_ctx->kernel_mul_mv_iq1_s_f32_flat_mc;
-                const int nsg = ggml_cl_iq1s_mv_nsg();
+                const int nsg = backend_ctx->iq1s_mv_nsg_eff;
                 cl_int ai = 0;
                 cl_uint iq1s_y_off = 0;
                 cl_mem  iq1s_y_img = ggml_cl_iq1s_mv_aimg(backend_ctx)
@@ -40952,7 +41001,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 ggml_tensor_extra_cl_iq1_s * ex0 =
                     (ggml_tensor_extra_cl_iq1_s *)src0->extra;
                 cl_kernel fk = backend_ctx->kernel_mul_mv_iq1_s_f32_flat;
-                const int nsg = ggml_cl_iq1s_mv_nsg();
+                const int nsg = backend_ctx->iq1s_mv_nsg_eff;
                 cl_int ai = 0;
                 cl_uint iq1s_y_off = 0;
                 cl_mem  iq1s_y_img = ggml_cl_iq1s_mv_aimg(backend_ctx)
@@ -41038,7 +41087,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 if (ksplit > 1) {
                     ggml_tensor_extra_cl_iq1_m * ex0 =
                         (ggml_tensor_extra_cl_iq1_m *)src0->extra;
-                    const int nsg = ggml_cl_iq1m_mv_nsg();
+                    const int nsg = backend_ctx->iq1m_mv_nsg_eff;
                     backend_ctx->prealloc_splitk_partial.allocate(
                         backend_ctx->context, (size_t)ksplit * (size_t)ne01 * sizeof(float));
 
@@ -41105,7 +41154,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 const size_t ncol = use4 ? 4u : 2u;
                 cl_kernel mk = use4 ? backend_ctx->kernel_mul_mv_iq1_m_f32_flat_mc4
                                     : backend_ctx->kernel_mul_mv_iq1_m_f32_flat_mc;
-                const int nsg = ggml_cl_iq1m_mv_nsg();
+                const int nsg = backend_ctx->iq1m_mv_nsg_eff;
                 cl_int ai = 0;
                 cl_uint iq1m_y_off = 0;
                 cl_mem  iq1m_y_img = ggml_cl_iq1m_mv_aimg(backend_ctx)
@@ -41153,7 +41202,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 ggml_tensor_extra_cl_iq1_m * ex0 =
                     (ggml_tensor_extra_cl_iq1_m *)src0->extra;
                 cl_kernel fk = backend_ctx->kernel_mul_mv_iq1_m_f32_flat;
-                const int nsg = ggml_cl_iq1m_mv_nsg();
+                const int nsg = backend_ctx->iq1m_mv_nsg_eff;
                 cl_int ai = 0;
                 cl_uint iq1m_y_off = 0;
                 cl_mem  iq1m_y_img = ggml_cl_iq1m_mv_aimg(backend_ctx)
@@ -41415,7 +41464,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 if (ksplit > 1) {
                     ggml_tensor_extra_cl_q2_K_ns * ex0 =
                         (ggml_tensor_extra_cl_q2_K_ns *)src0->extra;
-                    const int nsg = ggml_cl_q2k_mv_nsg();
+                    const int nsg = backend_ctx->q2k_mv_nsg_eff;
                     backend_ctx->prealloc_splitk_partial.allocate(
                         backend_ctx->context, (size_t)ksplit * (size_t)ne01 * sizeof(float));
 
@@ -41464,7 +41513,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 ggml_tensor_extra_cl_q2_K_ns * ex0 =
                     (ggml_tensor_extra_cl_q2_K_ns *)src0->extra;
                 cl_kernel fk = backend_ctx->kernel_mul_mv_q2_k_f32_flat;
-                const int nsg = ggml_cl_q2k_mv_nsg();
+                const int nsg = backend_ctx->q2k_mv_nsg_eff;
                 cl_int ai = 0;
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->qs));
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->sc));
@@ -41541,7 +41590,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 if (ksplit > 1) {
                     ggml_tensor_extra_cl_q3_K_ns * ex0 =
                         (ggml_tensor_extra_cl_q3_K_ns *)src0->extra;
-                    const int nsg = ggml_cl_q3k_mv_nsg(backend_ctx);
+                    const int nsg = backend_ctx->q3k_mv_nsg_eff;
                     backend_ctx->prealloc_splitk_partial.allocate(
                         backend_ctx->context, (size_t)ksplit * (size_t)ne01 * sizeof(float));
 
@@ -41591,7 +41640,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 ggml_tensor_extra_cl_q3_K_ns * ex0 =
                     (ggml_tensor_extra_cl_q3_K_ns *)src0->extra;
                 cl_kernel fk = backend_ctx->kernel_mul_mv_q3_k_f32_flat;
-                const int nsg = ggml_cl_q3k_mv_nsg(backend_ctx);
+                const int nsg = backend_ctx->q3k_mv_nsg_eff;
                 cl_int ai = 0;
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->qs));
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->hm));
