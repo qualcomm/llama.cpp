@@ -12083,13 +12083,32 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
     // not declare it the program fails to build -- and since the build is fatal, the whole
     // backend fails to initialize. Skip those programs there instead (see load_cl_kernels).
     //
-    // Only the KHR name is accepted. Qualcomm exposes an equivalent-looking builtin under
-    // cl_qcom_dot_product8, but it is NOT a drop-in: forcing the kernels onto it on an
-    // Adreno X2-90 (which advertises both) fails test-backend-ops
-    // MUL_MAT(q8_0, m=2880, n=32, k=2880) with ERR 1.50 -- garbage, not precision -- while
-    // every nibble-quantized case still passes, which is what a difference in how the two
-    // sign-extend their operands would look like (q8_0 is the only path that feeds them
-    // the full signed int8 range). Do not map one onto the other without settling that.
+    // Only the KHR name is accepted, and that is not a conservatism -- there is nothing
+    // else to accept. Two separate reasons, both checked rather than assumed:
+    //
+    // 1. cl_qcom_dot_product8 declares only
+    //        int qcom_udot8_acc(uint, uint, int);   // unsigned x unsigned
+    //        int qcom_dot8_acc (uint, uint, int);   // signed x UNSIGNED
+    //    and the kernels here call dot_acc_sat_4x8packed_ss_int, signed x SIGNED. So
+    //    qcom_dot8_acc is the analogue of KHR's _su_ form, not _ss_, and substituting it
+    //    silently reinterprets the second operand. Nibble-quantized types put 0..15 there,
+    //    where the two agree; q8_0 spans the full signed range and its negatives read as
+    //    128..255. That is exactly the failure this comment used to attribute to a
+    //    sign-EXTENSION difference: forcing the swap on an X2-90 (which advertises both)
+    //    fails MUL_MAT(q8_0, m=2880, n=32, k=2880) with ERR 1.50 while every nibble case
+    //    passes. It is a signature mismatch, not a driver quirk.
+    //
+    // 2. It does not build anyway. Adreno 840, 740 and 642L all advertise
+    //    cl_qcom_dot_product8 in CL_DEVICE_EXTENSIONS and all three reject it: the
+    //    builtins give "requires 'cl_qcom_dot_product8' extension" without the pragma, and
+    //    the pragma gives "unsupported OpenCL extension". The extension is superseded by
+    //    the KHR one in its own spec.
+    //
+    // The KHR builtins themselves are exact: on an Adreno 840 both _ss_ and _su_ match a
+    // host reference over the full signed range, (127,-128,1,-1) squared included.
+    //
+    // Consequence worth knowing: a device reporting cl_khr_integer_dot_product = false has
+    // no usable dp4a at all, so every kernel gated below is genuinely unavailable there.
     backend_ctx->has_integer_dot_product =
         strstr(ext_buffer, "cl_khr_integer_dot_product") != NULL;
     g_ggml_cl_has_int_dot = backend_ctx->has_integer_dot_product;
