@@ -4628,6 +4628,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         opts += " -DIQ2S_MV_LDSGRID=" + std::to_string(ggml_cl_iq2s_mv_ldsgrid());
         opts += " -DIQ2S_MV_GRIDIMG=" + std::to_string(ggml_cl_iq2s_mv_gridimg(backend_ctx));
         opts += " -DIQ2S_MV_SIGNXOR=" + std::to_string(ggml_cl_iq2s_mv_signxor());
+        opts += " -DIQ2S_MV_ABL=" + std::to_string(ggml_cl_env_int("GGML_OPENCL_IQ2S_MV_ABL", 0));
+        opts += " -DIQ2S_MV_WORK=" + std::to_string(ggml_cl_env_int("GGML_OPENCL_IQ2S_MV_WORK", 0));
         opts += " -DIQ2S_MV_AIMG=" + std::to_string(ggml_cl_iq2s_mv_aimg(backend_ctx));
         opts += " -DIQ2S_MV_NC=2";
         cl_program prog =

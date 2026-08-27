@@ -303,9 +303,35 @@ constant uint iq2s_grid[2048] = {
 #define IQ2S_MV_SIGNXOR 1
 #endif
 
+// IQ2S_MV_ABL: COST PROBE, WRONG MATH. Prices the three per-operand costs of this
+// kernel's inner loop so a lever is chosen from a measurement instead of a guess.
+// The IQ3_S twin of this probe overturned that kernel's own header -- it assumed
+// the codebook gather dominated, and the gather turned out to be 0.2% while the
+// sign application was 14.2%. IQ2_S has never been priced.
+//
+//   1  drop the ACTIVATION load  (keeps the grid gather and the signs)
+//   2  drop the GRID lookup      (keeps every weight/sign load and the index math)
+//   3  drop the SIGN application (keeps the grid gather)
+//
+// Never enable in a real run.
+#ifndef IQ2S_MV_ABL
+#define IQ2S_MV_ABL 0
+#endif
+
+// IQ2S_MV_WORK=1: do the sign+dot TWICE on the ALREADY-FETCHED grid word, so the
+// ARITHMETIC doubles while every load is held fixed. Flat means not compute-bound.
+// IQ1_S and Q2_K measure 0.6-1.1% here; IQ3_S measures 33%.
+// Never enable in a real run.
+#ifndef IQ2S_MV_WORK
+#define IQ2S_MV_WORK 0
+#endif
+
 // Four grid values with their signs applied, as floats.
 inline float4 iq2s_vals(uint gv, uint sg, uint base) {
-#if IQ2S_MV_SIGNXOR
+#if IQ2S_MV_ABL == 3
+    return (float4)((float)((gv      ) & 0xFFu), (float)((gv >>  8) & 0xFFu),
+                    (float)((gv >> 16) & 0xFFu), (float)((gv >> 24) & 0xFFu));
+#elif IQ2S_MV_SIGNXOR
     // A sign flip is bit 31, so the four conditional negations collapse to one
     // XOR once the four sign bits are spread into place. Exact, not approximate.
     const uint  s   = sg >> base;
@@ -360,7 +386,9 @@ inline float4 iq2s_vals(uint gv, uint sg, uint base) {
 #define IQ2S_MV_AIMG 0
 #endif
 
-#if IQ2S_MV_AIMG
+#if IQ2S_MV_ABL == 1
+#define IQ2S_YV(g) ((float4)(1.0f))
+#elif IQ2S_MV_AIMG
 #define IQ2S_YV(g) read_imagef(y_img, (int)(y_tex + (g)))
 #else
 #define IQ2S_YV(g) vload4((g), y)
@@ -407,7 +435,10 @@ kernel void kernel_mul_mv_iq2_s_f32_flat(
     const uint y_tex = y_off + col * ((uint)ne10 >> 2);
 #endif
 
-#if IQ2S_MV_GRIDIMG
+#if IQ2S_MV_ABL == 2
+// keeps the index math, drops the gather
+#define IQ2S_GRID(i) (((i) * 0x01010101u) | 0x01010101u)
+#elif IQ2S_MV_GRIDIMG
 #define IQ2S_GRID(i) (read_imageui(grid_img, (int)(i)).x)
 #elif IQ2S_MV_LDSGRID
     __local uint sh_grid[2048];
@@ -652,7 +683,10 @@ kernel void kernel_mul_mv_iq2_s_f32_flat_mc(
 #endif
 #endif
 
-#if IQ2S_MV_GRIDIMG
+#if IQ2S_MV_ABL == 2
+// keeps the index math, drops the gather
+#define IQ2S_MCGRID(i) (((i) * 0x01010101u) | 0x01010101u)
+#elif IQ2S_MV_GRIDIMG
 #define IQ2S_MCGRID(i) (read_imageui(grid_img, (int)(i)).x)
 #else
 #define IQ2S_MCGRID(i) iq2s_grid[(i)]
@@ -890,7 +924,10 @@ kernel void kernel_mul_mv_iq2_s_f32_flat_glu(
     const uint y_tex = y_off + col * ((uint)ne10 >> 2);
 #endif
 
-#if IQ2S_MV_GRIDIMG
+#if IQ2S_MV_ABL == 2
+// keeps the index math, drops the gather
+#define IQ2S_GGRID(i) (((i) * 0x01010101u) | 0x01010101u)
+#elif IQ2S_MV_GRIDIMG
 #define IQ2S_GGRID(i) (read_imageui(grid_img, (int)(i)).x)
 #else
 #define IQ2S_GGRID(i) iq2s_grid[(i)]
@@ -1072,7 +1109,10 @@ kernel void kernel_mul_mv_iq2_s_f32_flat_splitk(
     const uint y_tex = y_off + col * ((uint)ne10 >> 2);
 #endif
 
-#if IQ2S_MV_GRIDIMG
+#if IQ2S_MV_ABL == 2
+// keeps the index math, drops the gather
+#define IQ2S_SKGRID(i) (((i) * 0x01010101u) | 0x01010101u)
+#elif IQ2S_MV_GRIDIMG
 #define IQ2S_SKGRID(i) (read_imageui(grid_img, (int)(i)).x)
 #else
 #define IQ2S_SKGRID(i) iq2s_grid[(i)]
@@ -1117,10 +1157,27 @@ kernel void kernel_mul_mv_iq2_s_f32_flat_splitk(
                         const uint grp = (ib * 64u + sb * 8u) + l * 2u;
                         const float4 y0 = IQ2S_YV(grp + 0u);
                         const float4 y1 = IQ2S_YV(grp + 1u);
+#if IQ2S_MV_WORK
+                        // same four grid words, sign+dot done twice: ARITHMETIC
+                        // doubles, every load is held fixed
+                        const uint gw00 = IQ2S_SKGRID(2u*gi0 + 0u);
+                        const uint gw01 = IQ2S_SKGRID(2u*gi0 + 1u);
+                        const uint gw10 = IQ2S_SKGRID(2u*gi1 + 0u);
+                        const uint gw11 = IQ2S_SKGRID(2u*gi1 + 1u);
+                        a0 += dot(y0, iq2s_vals(gw00, s0, 0u));
+                        a0 += dot(y1, iq2s_vals(gw01, s0, 4u));
+                        a1 += dot(y0, iq2s_vals(gw10, s1, 0u));
+                        a1 += dot(y1, iq2s_vals(gw11, s1, 4u));
+                        a0 += dot(y0, iq2s_vals(gw00, s0 + 1u, 0u));
+                        a0 += dot(y1, iq2s_vals(gw01, s0 + 1u, 4u));
+                        a1 += dot(y0, iq2s_vals(gw10, s1 + 1u, 0u));
+                        a1 += dot(y1, iq2s_vals(gw11, s1 + 1u, 4u));
+#else
                         a0 += dot(y0, iq2s_vals(IQ2S_SKGRID(2u*gi0 + 0u), s0, 0u));
                         a0 += dot(y1, iq2s_vals(IQ2S_SKGRID(2u*gi0 + 1u), s0, 4u));
                         a1 += dot(y0, iq2s_vals(IQ2S_SKGRID(2u*gi1 + 0u), s1, 0u));
                         a1 += dot(y1, iq2s_vals(IQ2S_SKGRID(2u*gi1 + 1u), s1, 4u));
+#endif
                     }
                     acc0 += (0.5f + (float)n0) * a0;
                     acc1 += (0.5f + (float)n1) * a1;
