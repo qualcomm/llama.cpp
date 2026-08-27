@@ -13250,11 +13250,30 @@ inline bool use_q4k_tiled(const ggml_tensor *tensor);   // defined below
 inline bool use_adreno_moe_kernels(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor);   // defined below
 inline bool use_adreno_kernels(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor);   // defined below
 
+// Which generations run the feature-major plane split at all. Every per-type
+// gate below returns this, so a generation is added in one place rather than
+// ten -- the previous shape of that was ten copies of adreno_x2_class().
+//
+// A7X joins X2-class here. Off the split its decode GEMV for these types is at
+// or below the CPU on an Adreno 740 -- tinyllama-1.1B tg64 IQ1_S 4.43, IQ3_XXS
+// 4.29, Q2_K 4.44 against a CPU that does 9.81, 8.52 and 9.96 -- and over the
+// planes the same model reads 25.16, 19.21 and 34.50. Perplexity over each type
+// tracks a CPU reference on that device to about 1%.
+//
+// It needs ggml_cl_kquant_plane_dp4a_gemm_on to decline the Q2_K/Q3_K prefill
+// GEMMs there; see that predicate. A6X stays out: the split wins its decode too
+// but costs more prefill than it returns, and that wants its own measurement.
+static bool ggml_cl_plane_split_gen_on(const ggml_backend_opencl_context * backend_ctx) {
+    return backend_ctx->adreno_x2_class()
+        || backend_ctx->adreno_gen == ADRENO_GPU_GEN::A7X;
+}
+
 // GGML_OPENCL_IQ4XS_SOA: split IQ4_XS into feature-major planes at upload. The
 // conversion and every consumer must agree exactly -- if one thinks a tensor is
 // plane-split and another reads it as AoS blocks, the result is silent garbage.
 // So they all go through this one predicate.
-// Default ON for X2-class only. The prefill half of this path is the q8_1 dp4a
+// Default ON for the generations ggml_cl_plane_split_gen_on names. The prefill
+// half of this path is the q8_1 dp4a
 // GEMM, and it does not carry across generations: on an X2-90 the split is
 // pp512 215 -> 674 (3.13x) on Llama-3.2-3B-IQ4_XS, while on an X1 the SAME
 // model and binary goes 99.8 -> 82.9, a 17% REGRESSION. Decode is a wash on
@@ -13264,7 +13283,7 @@ static bool ggml_cl_iq4xs_soa_on(const ggml_backend_opencl_context * backend_ctx
     if (e && *e) {
         return atoi(e) != 0;
     }
-    return backend_ctx->adreno_x2_class();
+    return ggml_cl_plane_split_gen_on(backend_ctx);
 }
 
 static bool ggml_cl_iq4xs_is_split(const ggml_backend_opencl_context * backend_ctx, const ggml_tensor * t);
@@ -15445,7 +15464,7 @@ static bool ggml_cl_iq3s_soa_on(const ggml_backend_opencl_context * backend_ctx)
     if (e && *e) {
         return atoi(e) != 0;
     }
-    return backend_ctx->adreno_x2_class();
+    return ggml_cl_plane_split_gen_on(backend_ctx);
 }
 
 // IQ1_M, same contract and the same per-generation gate.
@@ -15454,7 +15473,7 @@ static bool ggml_cl_iq1m_soa_on(const ggml_backend_opencl_context * backend_ctx)
     if (e && *e) {
         return atoi(e) != 0;
     }
-    return backend_ctx->adreno_x2_class();
+    return ggml_cl_plane_split_gen_on(backend_ctx);
 }
 
 static bool ggml_cl_iq1m_is_split(const ggml_backend_opencl_context * backend_ctx, const ggml_tensor * t) {
@@ -15472,7 +15491,7 @@ static bool ggml_cl_iq1s_soa_on(const ggml_backend_opencl_context * backend_ctx)
     if (e && *e) {
         return atoi(e) != 0;
     }
-    return backend_ctx->adreno_x2_class();
+    return ggml_cl_plane_split_gen_on(backend_ctx);
 }
 
 static bool ggml_cl_iq1s_is_split(const ggml_backend_opencl_context * backend_ctx, const ggml_tensor * t) {
@@ -15493,7 +15512,7 @@ static bool ggml_cl_iq2s_soa_on(const ggml_backend_opencl_context * backend_ctx)
     if (e && *e) {
         return atoi(e) != 0;
     }
-    return backend_ctx->adreno_x2_class();
+    return ggml_cl_plane_split_gen_on(backend_ctx);
 }
 
 static bool ggml_cl_iq2s_is_split(const ggml_backend_opencl_context * backend_ctx, const ggml_tensor * t) {
@@ -15511,7 +15530,7 @@ static bool ggml_cl_iq2xxs_soa_on(const ggml_backend_opencl_context * backend_ct
     if (e && *e) {
         return atoi(e) != 0;
     }
-    return backend_ctx->adreno_x2_class();
+    return ggml_cl_plane_split_gen_on(backend_ctx);
 }
 
 static bool ggml_cl_iq2xxs_is_split(const ggml_backend_opencl_context * backend_ctx, const ggml_tensor * t) {
@@ -15528,7 +15547,7 @@ static bool ggml_cl_iq2xs_soa_on(const ggml_backend_opencl_context * backend_ctx
     if (e && *e) {
         return atoi(e) != 0;
     }
-    return backend_ctx->adreno_x2_class();
+    return ggml_cl_plane_split_gen_on(backend_ctx);
 }
 
 static bool ggml_cl_iq2xs_is_split(const ggml_backend_opencl_context * backend_ctx, const ggml_tensor * t) {
@@ -15577,8 +15596,7 @@ static bool ggml_cl_q2k_soa_on(const ggml_backend_opencl_context * backend_ctx) 
     if (e && *e) {
         return atoi(e) != 0;
     }
-    return backend_ctx->adreno_x2_class()
-        || backend_ctx->adreno_gen == ADRENO_GPU_GEN::A7X;
+    return ggml_cl_plane_split_gen_on(backend_ctx);
 }
 
 static bool ggml_cl_q2k_is_split(const ggml_backend_opencl_context * backend_ctx, const ggml_tensor * t) {
@@ -15603,8 +15621,7 @@ static bool ggml_cl_q3k_soa_on(const ggml_backend_opencl_context * backend_ctx) 
     if (e && *e) {
         return atoi(e) != 0;
     }
-    return backend_ctx->adreno_x2_class()
-        || backend_ctx->adreno_gen == ADRENO_GPU_GEN::A7X;
+    return ggml_cl_plane_split_gen_on(backend_ctx);
 }
 
 static bool ggml_cl_q3k_is_split(const ggml_backend_opencl_context * backend_ctx, const ggml_tensor * t) {
@@ -15624,7 +15641,7 @@ static bool ggml_cl_iq3xxs_soa_on(const ggml_backend_opencl_context * backend_ct
     if (e && *e) {
         return atoi(e) != 0;
     }
-    return backend_ctx->adreno_x2_class();
+    return ggml_cl_plane_split_gen_on(backend_ctx);
 }
 
 static bool ggml_cl_iq3xxs_is_split(const ggml_backend_opencl_context * backend_ctx, const ggml_tensor * t) {
