@@ -58,5 +58,5 @@ def validate_windows_sdks():
     if missing:
         raise RuntimeError(
             f"Missing or invalid Windows SDK paths: {', '.join(missing)}. "
-            "Run scripts/snapdragon/setup_sdk.py first."
+            "Run scripts/snapdragon/setup-sdk.py first."
         )

@@ -74,7 +74,7 @@ def get_sdk_release(config, version):
             return release
     raise RuntimeError(
         f"No Windows on Snapdragon release for {config['name']} {version}. "
-        "Run scripts/snapdragon/setup_sdk.py --list-sdk-releases to see available versions."
+        "Run scripts/snapdragon/setup-sdk.py --list-sdk-releases to see available versions."
     )
 
 

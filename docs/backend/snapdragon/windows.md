@@ -26,11 +26,11 @@ to allow for test signatures (aka test-signing).
 
 ## Install Windows SDKs
 
-The recommended method is `setup_sdk.py`:
+The recommended method is `setup-sdk.py`:
 
 ```
-> python scripts\snapdragon\setup_sdk.py --list-sdk-releases
-> python scripts\snapdragon\setup_sdk.py --hexagon --opencl
+> python scripts\snapdragon\setup-sdk.py --list-sdk-releases
+> python scripts\snapdragon\setup-sdk.py --hexagon --opencl
 ```
 
 It installs the selected SDKs under `C:\Qualcomm` and sets their corresponding environment variables for the current user. Start a new terminal after it completes; native Windows builds check all SDK paths before CMake runs.
