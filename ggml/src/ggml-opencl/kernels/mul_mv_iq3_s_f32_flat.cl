@@ -298,6 +298,71 @@ kernel void kernel_iq3s_grid_export(global uint * out) {
     }
 }
 
+// IQ3S_MV_SGRID=1: read the four weights with their SIGNS ALREADY APPLIED, out of
+// a pre-signed table, instead of applying the signs in the inner loop.
+//
+// Why here and not on the types this was rejected for. The cost probe above says
+// the sign application is 14.2% of this kernel while the grid gather is 0.2%
+// (ABL=3 vs ABL=2 on a 3B IQ3_M), and IQ3S_MV_WORK=3 costs 33%, so IQ3_S is
+// COMPUTE-bound -- the opposite of IQ1_S/Q2_K, which are flat under doubled
+// arithmetic. A pre-signed table trades table size, which is nearly free here,
+// for the one term that is not.
+//
+// 🔑 THE SIZE ARGUMENT THAT KILLED THIS BEFORE WAS ARITHMETIC, AND IT WAS WRONG.
+// It was recorded as "the operand depends on (grid entry, sign byte), which is
+// 512 x 256 combinations" = 128 K entries, obviously too big. But a grid entry is
+// FOUR weights, so only FOUR sign bits ever apply to it -- `iq3s_vals` takes a
+// nibble, not a byte. The real product is 512 x 16 = 8192 entries = 32 KB, the
+// same size as the IQ1_M biased operand table that shipped.
+//
+// The table is int8, which the grid's value range allows outright: every byte of
+// iq3s_grid is in {1,3,5,7,9,11,13,15}, so negating it stays inside int8. One
+// convert_float4(as_char4(v)) then replaces four extracts plus four conditional
+// negations.
+//
+// Entry (g, s) is iq3s_grid[g] with byte k negated when bit k of s is set, laid
+// out at index g*16 + s so that the 16 sign variants of one grid entry are
+// contiguous -- consecutive indices for a fixed g, which is the access pattern
+// when a row's sign nibble changes and its grid index does not.
+//
+// Needs the image tier: 32 KB is past the 2-4 KB __constant cache cliff measured
+// on this fleet, so the host binds it as an image1d_buffer and declines the mode
+// otherwise.
+#ifndef IQ3S_MV_SGRID
+#define IQ3S_MV_SGRID 0
+#endif
+
+kernel void kernel_iq3s_signed_grid_export(global uint * out) {
+    const uint i = get_global_id(0);
+    if (i < 8192u) {
+        const uint g = i >> 4;          // grid entry
+        const uint s = i & 0xFu;        // sign nibble
+        const uint gv = iq3s_grid[g];
+        char4 v;
+        v.s0 = (char)((gv      ) & 0xFFu); if (s & 1u) { v.s0 = -v.s0; }
+        v.s1 = (char)((gv >>  8) & 0xFFu); if (s & 2u) { v.s1 = -v.s1; }
+        v.s2 = (char)((gv >> 16) & 0xFFu); if (s & 4u) { v.s2 = -v.s2; }
+        v.s3 = (char)((gv >> 24) & 0xFFu); if (s & 8u) { v.s3 = -v.s3; }
+        out[i] = as_uint(v);
+    }
+}
+
+// One signed-table fetch: index by grid entry and sign nibble, unpack four int8.
+#define IQ3S_SVALS(g, sgv, base) \
+    convert_float4(as_char4(read_imageui(sgrid_img, \
+        (int)(((g) << 4) | (((sgv) >> (base)) & 0xFu))).x))
+
+// One weight quad, from whichever tier is enabled. `g` is the grid index and
+// `gw` the already-fetched grid word; the signed table needs the former, the
+// sign-applying path the latter, so both are passed and one is discarded.
+#if IQ3S_MV_SGRID
+#define IQ3S_W(g, gw, sgv, base) IQ3S_SVALS(g, sgv, base)
+#define IQ3S_GW(g, expr)         (0u)
+#else
+#define IQ3S_W(g, gw, sgv, base) iq3s_vals(gw, sgv, base)
+#define IQ3S_GW(g, expr)         (expr)
+#endif
+
 kernel void kernel_mul_mv_iq3_s_f32_flat(
         __read_only image1d_buffer_t grid_img,
         __read_only image1d_buffer_t y_img,      // see IQ3S_MV_AIMG
@@ -314,7 +379,8 @@ kernel void kernel_mul_mv_iq3_s_f32_flat(
         int ne01,      // M, the number of output rows
         int ne10,      // activation row stride, == K
         int ne0,       // dst row stride
-        uint y_off     // offset1/16, in float4 texels (IQ3S_MV_AIMG only)
+        uint y_off,     // offset1/16, in float4 texels (IQ3S_MV_AIMG only)
+        __read_only image1d_buffer_t sgrid_img   // see IQ3S_MV_SGRID
 ) {
     src1 = (global const float *)((global const char *)src1 + offset1);
     dst  = (global float       *)((global char       *)dst  + offsetd);
@@ -402,10 +468,10 @@ kernel void kernel_mul_mv_iq3_s_f32_flat(
                     const uint g1  = ((qsv >> 8) & 0xFFu) | (((qh1 >> u) & 1u) << 8);
                     const uint base = (u & 1u) * 4u;
                     const float4 yv = IQ3S_YV(grp + u, y);
-                    const uint gw0 = IQ3S_GRID(g0);
-                    const uint gw1 = IQ3S_GRID(g1);
-                    a0 += dot(yv, iq3s_vals(gw0,  sgv       & 0xFFu, base));
-                    a1 += dot(yv, iq3s_vals(gw1, (sgv >> 8) & 0xFFu, base));
+                    const uint gw0 = IQ3S_GW(g0, IQ3S_GRID(g0));
+                    const uint gw1 = IQ3S_GW(g1, IQ3S_GRID(g1));
+                    a0 += dot(yv, IQ3S_W(g0, gw0,  sgv       & 0xFFu, base));
+                    a1 += dot(yv, IQ3S_W(g1, gw1, (sgv >> 8) & 0xFFu, base));
 #if IQ3S_MV_WORK == 2
                     a0 += dot(yv, iq3s_vals(IQ3S_GRID(g0 ^ 1u),  (sgv + 1u) & 0xFFu, base));
                     a1 += dot(yv, iq3s_vals(IQ3S_GRID(g1 ^ 1u), ((sgv >> 8) + 1u) & 0xFFu, base));
@@ -445,8 +511,8 @@ kernel void kernel_mul_mv_iq3_s_f32_flat(
                     const uint g   = (uint)src0_qs[qsb + u * m] | (((qhv >> u) & 1u) << 8);
                     const uint sgv = (uint)src0_sg[sgb + (u >> 1) * m];
                     const float4 yv = IQ3S_YV(grp + u, y);
-                    const uint gw = IQ3S_GRID(g);
-                    a += dot(yv, iq3s_vals(gw, sgv, (u & 1u) * 4u));
+                    const uint gw = IQ3S_GW(g, IQ3S_GRID(g));
+                    a += dot(yv, IQ3S_W(g, gw, sgv, (u & 1u) * 4u));
 #if IQ3S_MV_WORK == 2
                     a += dot(yv, iq3s_vals(IQ3S_GRID(g ^ 1u), sgv + 1u, (u & 1u) * 4u));
 #elif IQ3S_MV_WORK == 3
@@ -548,7 +614,8 @@ kernel void kernel_mul_mv_iq3_s_f32_flat_mc(
         int ne10,
         int ne0,
         uint y_off,    // offset1/16, in float4 texels (IQ3S_MV_AIMG only)
-        int ne11
+        int ne11,
+        __read_only image1d_buffer_t sgrid_img   // see IQ3S_MV_SGRID
 ) {
     src1 = (global const float *)((global const char *)src1 + offset1);
     dst  = (global float       *)((global char       *)dst  + offsetd);
@@ -634,8 +701,8 @@ kernel void kernel_mul_mv_iq3_s_f32_flat_mc(
                     // type in the family that loses under doubled arithmetic at
                     // fixed loads. So here the value is what must be shared;
                     // rebuilding it per column measured -4 to -7%.
-                    const float4 w0 = iq3s_vals(IQ3S_MCGRID(g0), s0, base);
-                    const float4 w1 = iq3s_vals(IQ3S_MCGRID(g1), s1, base);
+                    const float4 w0 = IQ3S_W(g0, IQ3S_MCGRID(g0), s0, base);
+                    const float4 w1 = IQ3S_W(g1, IQ3S_MCGRID(g1), s1, base);
 
                     const float4 av = IQ3S_MCYA(grp + u);
                     pa0 += dot(av, w0);
@@ -970,7 +1037,8 @@ kernel void kernel_mul_mv_iq3_s_f32_flat_glu(
         int ne01,
         int ne10,
         int ne0,
-        int glu_op
+        int glu_op,
+        __read_only image1d_buffer_t sgrid_img   // see IQ3S_MV_SGRID
 ) {
     src1 = (global const float *)((global const char *)src1 + offset1);
     dst  = (global float       *)((global char       *)dst  + offsetd);
@@ -1043,15 +1111,15 @@ kernel void kernel_mul_mv_iq3_s_f32_flat_glu(
                     const uint gsgv = (uint)gsgu[sgb + (u >> 1) * mh];
                     const uint gg0  = ( gqsv       & 0xFFu) | ((((gqhv & 0xFFu) >> u) & 1u) << 8);
                     const uint gg1  = ((gqsv >> 8) & 0xFFu) | ((((gqhv >> 8)    >> u) & 1u) << 8);
-                    ga0 += dot(yv, iq3s_vals(IQ3S_GGRID(gg0),  gsgv       & 0xFFu, base));
-                    ga1 += dot(yv, iq3s_vals(IQ3S_GGRID(gg1), (gsgv >> 8) & 0xFFu, base));
+                    ga0 += dot(yv, IQ3S_W(gg0, IQ3S_GGRID(gg0),  gsgv       & 0xFFu, base));
+                    ga1 += dot(yv, IQ3S_W(gg1, IQ3S_GGRID(gg1), (gsgv >> 8) & 0xFFu, base));
 
                     const uint uqsv = (uint)uqsu[qsb + u * mh];
                     const uint usgv = (uint)usgu[sgb + (u >> 1) * mh];
                     const uint ug0  = ( uqsv       & 0xFFu) | ((((uqhv & 0xFFu) >> u) & 1u) << 8);
                     const uint ug1  = ((uqsv >> 8) & 0xFFu) | ((((uqhv >> 8)    >> u) & 1u) << 8);
-                    ua0 += dot(yv, iq3s_vals(IQ3S_GGRID(ug0),  usgv       & 0xFFu, base));
-                    ua1 += dot(yv, iq3s_vals(IQ3S_GGRID(ug1), (usgv >> 8) & 0xFFu, base));
+                    ua0 += dot(yv, IQ3S_W(ug0, IQ3S_GGRID(ug0),  usgv       & 0xFFu, base));
+                    ua1 += dot(yv, IQ3S_W(ug1, IQ3S_GGRID(ug1), (usgv >> 8) & 0xFFu, base));
                 }
                 gacc0 += (float)(1u + 2u * gnib0) * ga0;
                 gacc1 += (float)(1u + 2u * gnib1) * ga1;
@@ -1128,7 +1196,8 @@ kernel void kernel_mul_mv_iq3_s_f32_flat_splitk(
         global float * partial,
         int ne00,
         int ne01,
-        int ne10
+        int ne10,
+        __read_only image1d_buffer_t sgrid_img   // see IQ3S_MV_SGRID
 ) {
     src1 = (global const float *)((global const char *)src1 + offset1);
 
@@ -1199,8 +1268,8 @@ kernel void kernel_mul_mv_iq3_s_f32_flat_splitk(
                     const uint g1  = ((qsv >> 8) & 0xFFu) | (((qh1 >> u) & 1u) << 8);
                     const uint base = (u & 1u) * 4u;
                     const float4 yv = vload4(grp + u, y);
-                    a0 += dot(yv, iq3s_vals(IQ3S_SKGRID(g0),  sgv       & 0xFFu, base));
-                    a1 += dot(yv, iq3s_vals(IQ3S_SKGRID(g1), (sgv >> 8) & 0xFFu, base));
+                    a0 += dot(yv, IQ3S_W(g0, IQ3S_SKGRID(g0),  sgv       & 0xFFu, base));
+                    a1 += dot(yv, IQ3S_W(g1, IQ3S_SKGRID(g1), (sgv >> 8) & 0xFFu, base));
                 }
                 acc0 += (float)(1u + 2u * nib0) * a0;
                 acc1 += (float)(1u + 2u * nib1) * a1;

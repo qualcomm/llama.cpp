@@ -1355,6 +1355,8 @@ struct ggml_backend_opencl_context {
     // 2-bit twin of the above, half the bytes; see IQ1S_MV_G2
     cl_mem iq1s_grid2_buf = nullptr, iq1s_grid2_img = nullptr;
     cl_mem iq3s_grid_buf = nullptr, iq3s_grid_img = nullptr;
+    // pre-signed IQ3_S table, 512 grid entries x 16 sign nibbles. See IQ3S_MV_SGRID.
+    cl_mem iq3s_sgrid_buf = nullptr, iq3s_sgrid_img = nullptr;
     cl_mem iq3xxs_grid_buf = nullptr, iq3xxs_grid_img = nullptr;
     cl_mem iq1m_grid_buf = nullptr, iq1m_grid_img = nullptr;
     cl_mem iq2xxs_grid_buf = nullptr, iq2xxs_grid_img = nullptr;
@@ -2719,6 +2721,31 @@ static int ggml_cl_iq3xxs_lm_gridimg(const ggml_backend_opencl_context * backend
 
 static int ggml_cl_iq3s_mv_gridimg(const ggml_backend_opencl_context * backend_ctx) {
     return ggml_cl_gridimg_default(backend_ctx, "GGML_OPENCL_IQ3S_MV_GRIDIMG");
+}
+
+// Read the IQ3_S weights with their signs already applied, out of a 32 KB
+// pre-signed table, instead of applying the signs in the inner loop. IQ3_S is
+// the one type in this family that is COMPUTE-bound (doubling its arithmetic
+// costs 33%, against 0.6-1.1% on IQ1_S/Q2_K), and its own cost probe prices the
+// sign application at 14.2% against 0.2% for the grid gather -- so trading table
+// size for sign arithmetic is the right direction here and only here.
+// Requires the image tier: 32 KB is well past the __constant cache cliff.
+static int ggml_cl_iq3s_mv_sgrid(const ggml_backend_opencl_context * backend_ctx) {
+    int v = 0;
+    if (const char * e = getenv("GGML_OPENCL_IQ3S_MV_SGRID")) {
+        if (e[0]) {
+            v = atoi(e);
+        }
+    }
+    return (v && ggml_cl_iq3s_mv_gridimg(backend_ctx)) ? 1 : 0;
+}
+
+// The image the IQ3_S decode GEMVs bind for their weight quads. The kernel
+// argument must be a valid image either way, so the plain grid stands in when the
+// signed table is off (the kernel then ignores it).
+static cl_mem ggml_cl_iq3s_mv_grid_arg(ggml_backend_opencl_context * backend_ctx) {
+    return ggml_cl_iq3s_mv_sgrid(backend_ctx) ? backend_ctx->iq3s_sgrid_img
+                                              : backend_ctx->iq3s_grid_img;
 }
 
 static int ggml_cl_iq3xxs_mv_gridimg(const ggml_backend_opencl_context * backend_ctx) {
@@ -4347,6 +4374,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         opts += " -DIQ3S_MV_AIMG=" + std::to_string(ggml_cl_iq3s_mv_aimg(backend_ctx));
         opts += " -DIQ3S_MV_LDSGRID=" + std::to_string(ggml_cl_iq3s_mv_ldsgrid());
         opts += " -DIQ3S_MV_GRIDIMG=" + std::to_string(ggml_cl_iq3s_mv_gridimg(backend_ctx));
+        opts += " -DIQ3S_MV_SGRID=" + std::to_string(ggml_cl_iq3s_mv_sgrid(backend_ctx));
         opts += " -DIQ3S_MV_DP4A_FASTPACK=" + std::to_string(ggml_cl_iq3s_mv_dp4a_fastpack());
         opts += " -DIQ3S_MV_SIGNXOR=" + std::to_string(ggml_cl_iq3s_mv_signxor());
         opts += " -DIQ3S_MV_ABL=" + std::to_string(ggml_cl_iq3s_mv_abl());
@@ -4375,6 +4403,11 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         if (err != CL_SUCCESS) { backend_ctx->kernel_mul_mv_iq3_s_f32_flat_dp4a = nullptr; }
         ggml_cl_make_grid_image(backend_ctx, prog, "kernel_iq3s_grid_export", 512,
                                 &backend_ctx->iq3s_grid_buf, &backend_ctx->iq3s_grid_img);
+        if (ggml_cl_iq3s_mv_sgrid(backend_ctx)) {
+            ggml_cl_make_grid_image(backend_ctx, prog, "kernel_iq3s_signed_grid_export", 8192,
+                                    &backend_ctx->iq3s_sgrid_buf, &backend_ctx->iq3s_sgrid_img);
+            GGML_LOG_INFO("ggml_opencl: iq3_s pre-signed weight table active (8192 entries, 32 KB)\n");
+        }
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
@@ -24554,6 +24587,7 @@ static void ggml_cl_mul_mat_iq3_s_glu_fused(ggml_backend_t backend, ggml_tensor 
     const int nsg = ggml_cl_iq3s_mv_nsg();
 
     cl_int ai = 0;
+    cl_mem iq3s_sgrid_arg = ggml_cl_iq3s_mv_grid_arg(backend_ctx);
     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &backend_ctx->iq3s_grid_img));
     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex_g->qs));
     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex_g->qh));
@@ -24574,6 +24608,7 @@ static void ggml_cl_mul_mat_iq3_s_glu_fused(ggml_backend_t backend, ggml_tensor 
     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne10));
     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne0));
     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &glu_op));
+    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &iq3s_sgrid_arg));
 
     size_t f_global[3] = { CEIL_DIV((size_t)ne01, (size_t)128) * 64,
                            (size_t)ne11 * (size_t)nsg, 1 };
@@ -37411,6 +37446,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                         ? ggml_cl_activation_image(backend_ctx, extra1->data_device, offset1, ne10, ne11, &iq3s_y_off)
                         : nullptr;
                     cl_mem  iq3s_y_arg = iq3s_y_img ? iq3s_y_img : backend_ctx->iq3s_grid_img;
+                    cl_mem iq3s_sgrid_arg = ggml_cl_iq3s_mv_grid_arg(backend_ctx);
                     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &backend_ctx->iq3s_grid_img));
                     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &iq3s_y_arg));
                     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->qs));
@@ -37427,6 +37463,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne10));
                     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne0));
                     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_uint),  &iq3s_y_off));
+                    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &iq3s_sgrid_arg));
 
                     const size_t rows_wg = ggml_cl_iq3s_mv_r2() ? 128 : 64;
                     size_t f_global[3] = { CEIL_DIV((size_t)ne01, rows_wg) * 64,
@@ -39968,6 +40005,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 
                     cl_kernel sk = backend_ctx->kernel_mul_mv_iq3_s_f32_flat_splitk;
                     cl_int ai = 0;
+                    cl_mem iq3s_sgrid_arg = ggml_cl_iq3s_mv_grid_arg(backend_ctx);
                     CL_CHECK(clSetKernelArg(sk, ai++, sizeof(cl_mem),   &backend_ctx->iq3s_grid_img));
                     CL_CHECK(clSetKernelArg(sk, ai++, sizeof(cl_mem),   &ex0->qs));
                     CL_CHECK(clSetKernelArg(sk, ai++, sizeof(cl_mem),   &ex0->qh));
@@ -39980,6 +40018,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     CL_CHECK(clSetKernelArg(sk, ai++, sizeof(int),      &ne00));
                     CL_CHECK(clSetKernelArg(sk, ai++, sizeof(int),      &ne01));
                     CL_CHECK(clSetKernelArg(sk, ai++, sizeof(int),      &ne10));
+                    CL_CHECK(clSetKernelArg(sk, ai++, sizeof(cl_mem),   &iq3s_sgrid_arg));
                     size_t s_global[3] = { (size_t)base_wg * 64, (size_t)nsg, (size_t)ksplit };
                     size_t s_local[3]  = { 64, (size_t)nsg, 1 };
                     backend_ctx->enqueue_ndrange_kernel(sk, 3, s_global, s_local, dst);
@@ -40022,6 +40061,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     ? ggml_cl_activation_image(backend_ctx, extra1->data_device, offset1, ne10, ne11, &iq3s_y_off)
                     : nullptr;
                 cl_mem  iq3s_y_arg = iq3s_y_img ? iq3s_y_img : backend_ctx->iq3s_grid_img;
+                cl_mem iq3s_sgrid_arg = ggml_cl_iq3s_mv_grid_arg(backend_ctx);
                 CL_CHECK(clSetKernelArg(mk, ai++, sizeof(cl_mem),   &backend_ctx->iq3s_grid_img));
                 CL_CHECK(clSetKernelArg(mk, ai++, sizeof(cl_mem),   &iq3s_y_arg));
                 CL_CHECK(clSetKernelArg(mk, ai++, sizeof(cl_mem),   &ex0->qs));
@@ -40039,6 +40079,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 CL_CHECK(clSetKernelArg(mk, ai++, sizeof(int),      &ne0));
                 CL_CHECK(clSetKernelArg(mk, ai++, sizeof(cl_uint),  &iq3s_y_off));
                 CL_CHECK(clSetKernelArg(mk, ai++, sizeof(int),      &ne11));
+                CL_CHECK(clSetKernelArg(mk, ai++, sizeof(cl_mem),   &iq3s_sgrid_arg));
 
                 static bool iq3s_mc_logged = false;
                 if (!iq3s_mc_logged) {
@@ -40069,6 +40110,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     ? ggml_cl_activation_image(backend_ctx, extra1->data_device, offset1, ne10, ne11, &iq3s_y_off)
                     : nullptr;
                 cl_mem  iq3s_y_arg = iq3s_y_img ? iq3s_y_img : backend_ctx->iq3s_grid_img;
+                cl_mem iq3s_sgrid_arg = ggml_cl_iq3s_mv_grid_arg(backend_ctx);
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &backend_ctx->iq3s_grid_img));
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &iq3s_y_arg));
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &ex0->qs));
@@ -40085,6 +40127,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne10));
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne0));
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_uint),  &iq3s_y_off));
+                CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &iq3s_sgrid_arg));
 
                 const size_t rows_wg = ggml_cl_iq3s_mv_r2() ? 128 : 64;
                 size_t f_global[3] = { CEIL_DIV((size_t)ne01, rows_wg) * 64,
