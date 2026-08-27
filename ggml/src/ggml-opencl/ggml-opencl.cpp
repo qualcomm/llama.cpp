@@ -2924,6 +2924,60 @@ static int ggml_cl_q2k_mv_nsg() {
     return v;
 }
 
+// GGML_OPENCL_Q2K_GEMM_VERIFY=1: run the Q2_K plane dp4a prefill GEMM and the
+// plane-split GEMV over the SAME real weights and compare them element by element.
+//
+// This exists because the defect it hunts is DATA-DEPENDENT: on an A7X the GEMM
+// returns wrong answers for a real model and correct ones for test-backend-ops at
+// the identical type, shape and device. No synthetic test can reach it, so the
+// oracle has to run inside a real model, and the GEMV is the reference because the
+// same weights through it are known good (decode-only perplexity matches the CPU).
+//
+// The GEMM runs first and is read back; the GEMV then overwrites dst, so the model
+// continues on the CORRECT result and a verify run stays numerically sane.
+static int ggml_cl_q2k_gemm_verify() {
+    static const int v = ggml_cl_env_int("GGML_OPENCL_Q2K_GEMM_VERIFY", 0);
+    return v;
+}
+
+// Report where two dst buffers disagree, in enough detail to tell a codegen fault
+// from an arithmetic one: how many elements differ, by how much, and WHERE -- if
+// the damage sits in particular rows, particular columns, or grows along k, that
+// says something quite different in each case.
+static void ggml_cl_report_gemm_vs_gemv(const float * a, const float * b,
+                                        int M, int N, const char * tag) {
+    double  max_abs = 0.0, sum_abs = 0.0, ref_mag = 0.0;
+    int     worst_r = -1, worst_c = -1, n_bad = 0;
+    int     rows_bad = 0, cols_bad = 0;
+    std::vector<char> row_bad((size_t)M, 0), col_bad((size_t)N, 0);
+    for (int c = 0; c < N; ++c) {
+        for (int r = 0; r < M; ++r) {
+            const size_t i  = (size_t)c * (size_t)M + (size_t)r;
+            const double d  = std::fabs((double)a[i] - (double)b[i]);
+            const double mg = std::fabs((double)b[i]);
+            sum_abs += d;
+            ref_mag += mg;
+            if (d > max_abs) { max_abs = d; worst_r = r; worst_c = c; }
+            if (d > 1e-3 * (mg + 1e-6)) {
+                ++n_bad;
+                if (!row_bad[r]) { row_bad[r] = 1; ++rows_bad; }
+                if (!col_bad[c]) { col_bad[c] = 1; ++cols_bad; }
+            }
+        }
+    }
+    const size_t total = (size_t)M * (size_t)N;
+    GGML_LOG_INFO("ggml_opencl: %s M=%d N=%d  differing %d/%zu (%.2f%%)  "
+                  "rows %d/%d  cols %d/%d  max|d| %.6g  mean|d|/mean|ref| %.3g\n",
+                  tag, M, N, n_bad, total, 100.0 * (double)n_bad / (double)total,
+                  rows_bad, M, cols_bad, N, max_abs,
+                  ref_mag > 0.0 ? sum_abs / ref_mag : 0.0);
+    if (worst_r >= 0) {
+        const size_t i = (size_t)worst_c * (size_t)M + (size_t)worst_r;
+        GGML_LOG_INFO("ggml_opencl: %s worst at row %d col %d: gemm %.6f gemv %.6f\n",
+                      tag, worst_r, worst_c, a[i], b[i]);
+    }
+}
+
 // Bisect knob for the A7X miscompile of the Q2_K/Q3_K plane dp4a prefill GEMMs.
 // 0 = the kernel as written, 1 = staged activations reach dp4a through a
 // by-value parameter, 2 = and scalar-indexed staging instead of vload4. Both
@@ -38871,6 +38925,9 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 if (ne11 < 32) {
                     break;
                 }
+                // Holds the dp4a GEMM output while the GEMV recomputes it,
+                // in verify mode only; empty otherwise.
+                std::vector<float> q2k_verify_gemm;
                 if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1)) {
                     break;
                 }
@@ -38938,7 +38995,19 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                         backend_ctx->enqueue_ndrange_kernel(dk, 3, d_global, d_local, dst);
 
                         CL_CHECK(clReleaseMemObject(a_sub));
-                        return;
+
+                        // Verify mode reads this result back and falls THROUGH to the
+                        // GEMV below, which overwrites dst with the reference; the
+                        // comparison happens there. See ggml_cl_q2k_gemm_verify.
+                        if (ggml_cl_q2k_gemm_verify()) {
+                            q2k_verify_gemm.resize((size_t)M * (size_t)N);
+                            CL_CHECK(clFinish(backend_ctx->queue));
+                            CL_CHECK(clEnqueueReadBuffer(backend_ctx->queue, extrad->data_device,
+                                CL_TRUE, offsetd, q2k_verify_gemm.size() * sizeof(float),
+                                q2k_verify_gemm.data(), 0, NULL, NULL));
+                        } else {
+                            return;
+                        }
                     }
                 }
 
@@ -38969,6 +39038,15 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                                            (size_t)ne11 * (size_t)nsg, 1 };
                     size_t f_local[3]  = { 64, (size_t)nsg, 1 };
                     backend_ctx->enqueue_ndrange_kernel(fk, 3, f_global, f_local, dst);
+                    if (!q2k_verify_gemm.empty()) {
+                        std::vector<float> gemv((size_t)ne0 * (size_t)ne1);
+                        CL_CHECK(clFinish(backend_ctx->queue));
+                        CL_CHECK(clEnqueueReadBuffer(backend_ctx->queue, extrad->data_device,
+                            CL_TRUE, offsetd, gemv.size() * sizeof(float),
+                            gemv.data(), 0, NULL, NULL));
+                        ggml_cl_report_gemm_vs_gemv(q2k_verify_gemm.data(), gemv.data(),
+                                                    (int)ne0, (int)ne1, "q2_k gemm-vs-gemv");
+                    }
                     return;
                 }
 

@@ -214,10 +214,33 @@ kernel void kernel_gemm_noshuffle_q2_k_q8_1_dp4a(
                                : (uint4)(0u);
             sh_qa4[t][h] = w;
             int s = 0;
+#if KQ_DP4A_WA == 4
+            // Deliberately wrong. Kept because "the arm I just added changed
+            // nothing" and "the define never reached the kernel" look identical
+            // from the outside, and this separates them in one run: WA=4 must
+            // move the output, and if it does not, the plumbing is broken rather
+            // than the hypothesis being wrong.
+            s = 12345;
+#elif KQ_DP4A_WA >= 3
+            // The activation sum without a dp4a whose second operand is an
+            // IMMEDIATE. Passing a hex constant straight to a builtin is A7X
+            // playbook bug 4, and this is the only place in the kernel that does
+            // it -- q3_K has no min term, so it has no activation sum, and q3_K is
+            // also the one that barely misbehaves on that part.
+            {
+                const char4 b0 = as_char4(w.x), b1 = as_char4(w.y);
+                const char4 b2 = as_char4(w.z), b3 = as_char4(w.w);
+                s = (int)b0.x + (int)b0.y + (int)b0.z + (int)b0.w
+                  + (int)b1.x + (int)b1.y + (int)b1.z + (int)b1.w
+                  + (int)b2.x + (int)b2.y + (int)b2.z + (int)b2.w
+                  + (int)b3.x + (int)b3.y + (int)b3.z + (int)b3.w;
+            }
+#else
             s = dot_acc_sat_4x8packed_ss_int(w.x, 0x01010101u, s);
             s = dot_acc_sat_4x8packed_ss_int(w.y, 0x01010101u, s);
             s = dot_acc_sat_4x8packed_ss_int(w.z, 0x01010101u, s);
             s = dot_acc_sat_4x8packed_ss_int(w.w, 0x01010101u, s);
+#endif
             sh_s[t][h] = (float)s;
             if (h == 0u) {
                 sh_d[t] = ok ? src1_da[c * k_b + sub] : (half)0;
