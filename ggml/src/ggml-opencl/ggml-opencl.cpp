@@ -2943,6 +2943,7 @@ static int ggml_cl_iq1m_gemm_ldsgrid() {
 // The split-K boundary was re-checked at the new width and still pays
 // (+8.0% IQ1_M, +5.6% IQ1_S at NSG=4), and prefill is untouched: 1012.4 either way.
 static int ggml_cl_iq1s_mv_r();
+static int ggml_cl_iq1s_mv_r_glu();
 
 static int ggml_cl_iq1s_mv_nsg() {
     static const int v = ggml_cl_env_int("GGML_OPENCL_IQ1S_MV_NSG", 4);
@@ -2950,7 +2951,11 @@ static int ggml_cl_iq1s_mv_nsg() {
     // refuses the enqueue outright with CL_INVALID_WORK_GROUP_SIZE rather than
     // failing the build, so the cap has to be applied here or the first decode
     // dispatch aborts. Measured, not defensive.
-    if (ggml_cl_iq1s_mv_r() == 4 && v > 4) {
+    // It is the FUSED GLU kernel that forces this: at four rows it is the one
+    // that crosses the spill cliff and its cap falls to 384, below the 512 work
+    // items eight subgroups ask for. With that kernel left at two rows the cap
+    // does not apply, so key it on the fold that kernel actually uses.
+    if (ggml_cl_iq1s_mv_r_glu() == 4 && v > 4) {
         return 4;
     }
     return v;
@@ -3045,6 +3050,25 @@ static int ggml_cl_iq1s_mv_abl() {
 static int ggml_cl_iq1s_mv_r() {
     static const int v = ggml_cl_env_int("GGML_OPENCL_IQ1S_MV_R", 2);
     return (v == 1 || v == 2 || v == 4) ? v : 2;
+}
+
+// Rows per lane for the FUSED GLU kernel only. The fold is a per-KERNEL decision
+// because the boundary is the ~512 B/WI spill cliff, not the type: at four rows
+// this kernel goes 408 -> 648 B/WI and its workgroup cap 640 -> 384, while the
+// plain and split-K kernels go 272 -> 400/384 and stay under. Measured on 3B
+// UD-IQ1_S tg64 with the fusion off, so the frame runs through those two, the
+// fold is worth +9.9%; with the fusion on and this kernel folded too it reads
+// -2.6%, which is how the fold came to be recorded as refuted for the type.
+static int ggml_cl_iq1s_mv_r_glu() {
+    const int v = ggml_cl_env_int("GGML_OPENCL_IQ1S_MV_R_GLU", 2);
+    return (v == 1 || v == 2 || v == 4) ? v : 2;
+}
+
+// A tensor may be served by either fold, so the plane split has to satisfy the
+// wider of the two.
+static int ggml_cl_iq1s_mv_r_max() {
+    return ggml_cl_iq1s_mv_r() > ggml_cl_iq1s_mv_r_glu()
+         ? ggml_cl_iq1s_mv_r() : ggml_cl_iq1s_mv_r_glu();
 }
 
 // iq1s_grid_gpu is 8 KB, the same size as iq2s_grid, so it gets the same LDS
@@ -4685,6 +4709,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         std::string opts = compile_opts;
         opts += " -DIQ1S_MV_NSG=" + std::to_string(ggml_cl_iq1s_mv_nsg());
         opts += " -DIQ1S_MV_R="   + std::to_string(ggml_cl_iq1s_mv_r());
+        opts += " -DIQ1S_MV_R_GLU=" + std::to_string(ggml_cl_iq1s_mv_r_glu());
         opts += " -DIQ1S_MV_LDSGRID=" + std::to_string(ggml_cl_iq1s_mv_ldsgrid());
         opts += " -DIQ1S_MV_GRIDIMG=" + std::to_string(ggml_cl_iq1s_mv_gridimg(backend_ctx));
         opts += " -DIQ1S_MV_AIMG=" + std::to_string(ggml_cl_iq1s_mv_aimg(backend_ctx));
@@ -15339,7 +15364,7 @@ static bool ggml_cl_iq1s_is_split(const ggml_backend_opencl_context * backend_ct
         // count that is not a multiple of it is declined HERE rather than per
         // dispatch: a tensor that gets split but that some path cannot read is
         // silent garbage. See the IQ3_S note.
-        && t->ne[1] % ggml_cl_iq1s_mv_r() == 0
+        && t->ne[1] % ggml_cl_iq1s_mv_r_max() == 0
         && use_adreno_kernels(backend_ctx, t);
 }
 
@@ -24720,7 +24745,7 @@ static void ggml_cl_mul_mat_iq1_s_glu_fused(ggml_backend_t backend, ggml_tensor 
     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne0));
     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &glu_op));
 
-    size_t f_global[3] = { CEIL_DIV((size_t)ne01, 64u * (size_t)ggml_cl_iq1s_mv_r()) * 64,
+    size_t f_global[3] = { CEIL_DIV((size_t)ne01, 64u * (size_t)ggml_cl_iq1s_mv_r_glu()) * 64,
                            (size_t)ne11 * (size_t)nsg, 1 };
     size_t f_local[3]  = { 64, (size_t)nsg, 1 };
     backend_ctx->enqueue_ndrange_kernel(fk, 3, f_global, f_local, (ggml_tensor *)dst);

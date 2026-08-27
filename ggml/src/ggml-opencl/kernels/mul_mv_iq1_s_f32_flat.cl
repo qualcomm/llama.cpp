@@ -60,6 +60,27 @@
 #define IQ1S_MV_R 2
 #endif
 
+// Rows per lane for the FUSED GLU kernel, separately from the other three.
+//
+// 🔑 THE FOLD IS PER KERNEL, NOT PER TYPE, AND THE BOUNDARY IS THE SPILL CLIFF.
+// The 4-row fold was recorded as a -2.7% loss for this type. It is not: measured
+// on 3B UD-IQ1_S tg64 with the fusion turned off, so the frame runs through the
+// plain and split-K kernels, 2 -> 4 rows is worth **+9.9%** (46.94/47.15 ->
+// 51.72/51.74). With the fusion on it reads as -2.6%, because this kernel alone
+// crosses the ~512 B/WI cliff at four rows:
+//
+//   kernel      R=2 priv/WI  wg_cap    R=4 priv/WI  wg_cap
+//   _glu            408        640         648        384   <-- over the cliff
+//   plain           272        896         400        640
+//   _splitk         272        896         384        640
+//
+// One kernel over the cliff dragged the whole model negative and the fold was
+// filed as refuted for the type. Keeping this one at two rows is what lets the
+// other three take four.
+#ifndef IQ1S_MV_R_GLU
+#define IQ1S_MV_R_GLU 2
+#endif
+
 // IQ1S_MV_PF=1: issue every load of a 32-weight sub-block before consuming any
 // of it, instead of walking load -> gather -> dot four times in series.
 //
@@ -1201,7 +1222,7 @@ kernel void kernel_mul_mv_iq1_s_f32_flat_glu(
 #define IQ1S_GGRID(i) IQ1S_ABL(iq1s_grid_gpu[(i)], (i))
 #endif
 
-#if IQ1S_MV_R == 4
+#if IQ1S_MV_R_GLU == 4
     const uint mq  = m >> 2;
     const uint j   = get_group_id(0) * 64u + lid;
     const uint row = j << 2;
