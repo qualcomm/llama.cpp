@@ -15487,13 +15487,17 @@ static bool ggml_cl_iq2xs_is_split(const ggml_backend_opencl_context * backend_c
         && use_adreno_kernels(backend_ctx, t);
 }
 
-// Q2_K, same contract and the same per-generation gate.
+// Q2_K, same contract, but A7X joins X2-class here. Without the split its decode
+// GEMV is slower than the CPU fallback (tinyllama-1.1B on an Adreno 740: tg64
+// 4.44 against the CPU 9.96); with it, tg64 is 14.39 and pp512 also rises,
+// 153.7 -> 167.0. Perplexity over the same model matches the CPU to 0.005%.
 static bool ggml_cl_q2k_soa_on(const ggml_backend_opencl_context * backend_ctx) {
     static const char * const e = getenv("GGML_OPENCL_Q2K_SOA");
     if (e && *e) {
         return atoi(e) != 0;
     }
-    return backend_ctx->adreno_x2_class();
+    return backend_ctx->adreno_x2_class()
+        || backend_ctx->adreno_gen == ADRENO_GPU_GEN::A7X;
 }
 
 static bool ggml_cl_q2k_is_split(const ggml_backend_opencl_context * backend_ctx, const ggml_tensor * t) {
@@ -15508,7 +15512,14 @@ static bool ggml_cl_q2k_is_split(const ggml_backend_opencl_context * backend_ctx
         && use_adreno_kernels(backend_ctx, t);
 }
 
-// Q3_K, same contract and the same per-generation gate.
+// Q3_K, same contract and the same per-generation gate. A7X cannot join Q2_K
+// above yet: the split itself is fine there (the decode GEMV over the planes is
+// bit-identical to the AoS one), but the plane dp4a prefill GEMM miscompiles on
+// that compiler. test-backend-ops MUL_MAT does not catch it; perplexity does
+// (Adreno 740, tinyllama-1.1B q2_K mix: 34.67 -> 36.51 against a CPU reference
+// of 34.67, while an Adreno 840 stays within 0.3%). Declining just the GEMM
+// there costs more prefill than the decode win is worth, so the whole split
+// waits on a fix to that kernel.
 static bool ggml_cl_q3k_soa_on(const ggml_backend_opencl_context * backend_ctx) {
     static const char * const e = getenv("GGML_OPENCL_Q3K_SOA");
     if (e && *e) {
