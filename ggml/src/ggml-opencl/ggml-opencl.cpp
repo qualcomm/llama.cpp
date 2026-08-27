@@ -15595,12 +15595,24 @@ static bool ggml_cl_iq2xs_is_split(const ggml_backend_opencl_context * backend_c
 // Q2_K tensors are all K=2048. The models that expose it are IQ mixes carrying
 // three Q2_K tensors, two of them ffn_down at K=5632. MUL_MAT coverage sees
 // none of it -- use_adreno_kernels declines the shapes test-backend-ops asks for.
+// Gated on the capability LEVEL and not on chip identity, following the rest of
+// the A7X compiler carve-outs: the bug belongs to that compiler generation and
+// older, so a part we have not seen before that reports an older level should
+// decline too. The gpu_family test is load-bearing -- gen_level is only assigned
+// inside the Adreno branch, so a bare <= would decline this on every non-Adreno
+// device, which is the trap that caught the q6_K workarounds.
+//
+// A6X reaches this only if its plane-split gate is ever opened; today the split
+// is off there, so the kernel is unreachable and this costs it nothing. Its own
+// GEMM is UNMEASURED -- an A/B on the 619 returned the identical number in both
+// arms, which means the kernel never dispatched, not that it passed.
 static bool ggml_cl_kquant_plane_dp4a_gemm_on(const ggml_backend_opencl_context * backend_ctx) {
     static const char * const e = getenv("GGML_OPENCL_KQUANT_PLANE_DP4A_GEMM");
     if (e && *e) {
         return atoi(e) != 0;
     }
-    return backend_ctx->adreno_gen != ADRENO_GPU_GEN::A7X;
+    return !(backend_ctx->gpu_family == GPU_FAMILY::ADRENO
+             && backend_ctx->gen_level <= GEN_LEVEL_A7X);
 }
 
 // Q2_K, same contract, but A7X joins X2-class here. Without the split its decode
