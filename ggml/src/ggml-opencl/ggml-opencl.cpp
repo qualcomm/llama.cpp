@@ -1329,7 +1329,9 @@ struct ggml_backend_opencl_context {
     int       iq2s_mv_nsg_eff    = 0;
     int       iq2s_mc4_nsg_eff   = 0;
     int       iq1s_mv_nsg_eff    = 0;
+    int       iq1s_mc4_nsg_eff   = 0;
     int       iq1m_mv_nsg_eff    = 0;
+    int       iq1m_mc4_nsg_eff   = 0;
     int       q2k_mv_nsg_eff     = 0;
     int       q3k_mv_nsg_eff     = 0;
     cl_kernel kernel_mul_mv_iq4_xs_f32_flat;
@@ -4849,8 +4851,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                 std::string opts4 = opts;
                 const std::string two = " -DIQ1S_MV_NC=2";
                 opts4.replace(opts4.find(two), two.size(), " -DIQ1S_MV_NC=4");
-                cl_program prog4 =
-                    build_program_from_source(backend_ctx, kernel_src.c_str(), opts4);
+                cl_program prog4 = ggml_cl_build_mv_program_nsg(
+                    backend_ctx, kernel_src.c_str(), opts4, "IQ1S_MV_NSG",
+                    ggml_cl_iq1s_mv_nsg(), &backend_ctx->iq1s_mc4_nsg_eff);
                 backend_ctx->kernel_mul_mv_iq1_s_f32_flat_mc4 =
                     clCreateKernel(prog4, "kernel_mul_mv_iq1_s_f32_flat_mc", &err);
                 if (err != CL_SUCCESS) { backend_ctx->kernel_mul_mv_iq1_s_f32_flat_mc4 = nullptr; }
@@ -4913,8 +4916,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                 std::string opts4 = opts;
                 const std::string two = " -DIQ1M_MV_NC=2";
                 opts4.replace(opts4.find(two), two.size(), " -DIQ1M_MV_NC=4");
-                cl_program prog4 =
-                    build_program_from_source(backend_ctx, kernel_src.c_str(), opts4);
+                cl_program prog4 = ggml_cl_build_mv_program_nsg(
+                    backend_ctx, kernel_src.c_str(), opts4, "IQ1M_MV_NSG",
+                    ggml_cl_iq1m_mv_nsg(), &backend_ctx->iq1m_mc4_nsg_eff);
                 backend_ctx->kernel_mul_mv_iq1_m_f32_flat_mc4 =
                     clCreateKernel(prog4, "kernel_mul_mv_iq1_m_f32_flat_mc", &err);
                 if (err != CL_SUCCESS) { backend_ctx->kernel_mul_mv_iq1_m_f32_flat_mc4 = nullptr; }
@@ -40980,7 +40984,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 const size_t ncol = use4 ? 4u : 2u;
                 cl_kernel mk = use4 ? backend_ctx->kernel_mul_mv_iq1_s_f32_flat_mc4
                                     : backend_ctx->kernel_mul_mv_iq1_s_f32_flat_mc;
-                const int nsg = backend_ctx->iq1s_mv_nsg_eff;
+                const int nsg = use4 ? backend_ctx->iq1s_mc4_nsg_eff : backend_ctx->iq1s_mv_nsg_eff;
                 cl_int ai = 0;
                 cl_uint iq1s_y_off = 0;
                 cl_mem  iq1s_y_img = ggml_cl_iq1s_mv_aimg(backend_ctx)
@@ -41182,7 +41186,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 const size_t ncol = use4 ? 4u : 2u;
                 cl_kernel mk = use4 ? backend_ctx->kernel_mul_mv_iq1_m_f32_flat_mc4
                                     : backend_ctx->kernel_mul_mv_iq1_m_f32_flat_mc;
-                const int nsg = backend_ctx->iq1m_mv_nsg_eff;
+                const int nsg = use4 ? backend_ctx->iq1m_mc4_nsg_eff : backend_ctx->iq1m_mv_nsg_eff;
                 cl_int ai = 0;
                 cl_uint iq1m_y_off = 0;
                 cl_mem  iq1m_y_img = ggml_cl_iq1m_mv_aimg(backend_ctx)
