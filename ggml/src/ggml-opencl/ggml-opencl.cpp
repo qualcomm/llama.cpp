@@ -2294,6 +2294,21 @@ static int ggml_cl_iq3s_mv_r2() {
     return v;
 }
 
+// Four rows per lane for the PLAIN IQ3_S decode GEMV only. Per kernel on purpose:
+// the fold is bounded by the ~512 B/WI spill cliff and IQ1_S showed that one
+// kernel crossing it takes a whole type negative. The plain kernel is also the
+// only one that matters here -- it is 100% of the iq3_s time in a 3B IQ3_M
+// decode, because the fusion is default off for this type and the split-K
+// heuristic leaves that shape at ksplit=1.
+static int ggml_cl_iq3s_mv_r4() {
+    return ggml_cl_env_int("GGML_OPENCL_IQ3S_MV_R4", 0) ? 1 : 0;
+}
+
+// Rows the widest IQ3_S fold reads as one word; the plane split has to satisfy it.
+static int ggml_cl_iq3s_mv_r_max() {
+    return ggml_cl_iq3s_mv_r4() ? 4 : (ggml_cl_iq3s_mv_r2() ? 2 : 1);
+}
+
 // Stage the 2 KB iq3s_grid in local memory rather than reading it from
 // __constant at a divergent index, as the IQ2_S GEMV does with its 8 KB table.
 // Measured at -16.5% and left off; see the kernel header.
@@ -4445,6 +4460,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         opts += " -DIQ3S_MV_GRIDSRC=" + std::to_string(ggml_cl_iq3s_mv_gridsrc());
         opts += " -DIQ3S_MV_WORK=" + std::to_string(ggml_cl_iq3s_mv_work());
         opts += " -DIQ3S_MV_R2="  + std::to_string(ggml_cl_iq3s_mv_r2());
+        opts += " -DIQ3S_MV_R4="  + std::to_string(ggml_cl_iq3s_mv_r4());
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), opts);
 
@@ -15487,7 +15503,8 @@ static bool ggml_cl_iq3s_is_split(const ggml_backend_opencl_context * backend_ct
         // the decode GEMV pairs adjacent rows into one ushort load, so an odd
         // row count is declined HERE rather than per dispatch: a tensor that
         // gets split but that some path then cannot read is silent garbage.
-        && t->ne[1] % 2 == 0
+        // (the plain kernel may fold FOUR, so this is the WIDEST fold in the file)
+        && t->ne[1] % ggml_cl_iq3s_mv_r_max() == 0
         && use_adreno_kernels(backend_ctx, t);
 }
 
@@ -37534,7 +37551,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_uint),  &iq3s_y_off));
                     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &iq3s_sgrid_arg));
 
-                    const size_t rows_wg = ggml_cl_iq3s_mv_r2() ? 128 : 64;
+                    const size_t rows_wg = 64u * (size_t)ggml_cl_iq3s_mv_r_max();
                     size_t f_global[3] = { CEIL_DIV((size_t)ne01, rows_wg) * 64,
                                            (size_t)ne11 * (size_t)nsg, 1 };
                     size_t f_local[3]  = { 64, (size_t)nsg, 1 };
@@ -40198,7 +40215,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_uint),  &iq3s_y_off));
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &iq3s_sgrid_arg));
 
-                const size_t rows_wg = ggml_cl_iq3s_mv_r2() ? 128 : 64;
+                const size_t rows_wg = 64u * (size_t)ggml_cl_iq3s_mv_r_max();
                 size_t f_global[3] = { CEIL_DIV((size_t)ne01, rows_wg) * 64,
                                        (size_t)ne11 * (size_t)nsg, 1 };
                 size_t f_local[3]  = { 64, (size_t)nsg, 1 };

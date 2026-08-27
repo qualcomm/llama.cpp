@@ -52,6 +52,32 @@
 #define IQ3S_MV_R2 1
 #endif
 
+// IQ3S_MV_R4=1: the PLAIN decode GEMV folds FOUR rows into a work item instead
+// of two, so every plane is read a uint at a time and one activation vload4
+// serves four rows.
+//
+// 🔑 PER KERNEL ON PURPOSE. The fold is bounded by the ~512 B/WI spill cliff, and
+// crossing it costs more occupancy than the fold returns however the extra state
+// is spent: IQ1_S's fused-GLU kernel goes 408 -> 648 B/WI at four rows and took
+// that whole type's fold negative, while its plain and split-K kernels went
+// 272 -> 400/384 and gained. So this applies to the plain kernel only, which is
+// also the one that matters: it is 100% of the iq3_s time in a 3B IQ3_M decode
+// (3425 dispatches, 487.6 ms) because the fusion is default off here and the
+// split-K heuristic leaves this shape at ksplit=1.
+//
+// 🔑 WHY THIS TYPE AND NOT ITS SIBLINGS. The fold and the fused GLU are
+// SUBSTITUTES -- both exist to collect the same row-independent activation read,
+// so whichever lands first takes the win and the other finds nothing left. IQ1_S
+// and IQ2_S run their fusion by default and measure the fold as a wash; IQ3_S's
+// fusion is default OFF (it measured -4.9%), so nothing has collected it here.
+//
+// ⚠ Unlike its siblings this kernel IS compute-bound -- IQ3S_MV_WORK=3 costs 33%
+// -- so the fold does not reduce total work, it only widens the loads and shares
+// the activation. Measured, not assumed.
+#ifndef IQ3S_MV_R4
+#define IQ3S_MV_R4 0
+#endif
+
 // IQ3S_MV_LDSGRID=1: stage iq3s_grid into local memory once per workgroup and
 // read it from there.
 //
@@ -455,7 +481,75 @@ kernel void kernel_mul_mv_iq3_s_f32_flat(
 #define IQ3S_GRID(i) iq3s_grid[(i)]
 #endif
 
-#if IQ3S_MV_R2
+#if IQ3S_MV_R4
+    const uint mq  = m >> 2;                        // rows per plane row, as uints
+    const uint j   = get_group_id(0) * 64u + lid;   // row quad index
+    const uint row = j << 2;
+
+    float sumf = 0.f, sumf1 = 0.f, sumf2 = 0.f, sumf3 = 0.f;
+
+    if (j < mq) {
+        global const uint * qsw = (global const uint *)src0_qs;
+        global const uint * qhw = (global const uint *)src0_qh;
+        global const uint * sgw = (global const uint *)src0_sg;
+        global const uint * scw = (global const uint *)src0_sc;
+
+        for (uint ib = sgi; ib < nsb; ib += IQ3S_MV_NSG) {
+            const half4 dh = vload4(j + ib * mq, src0_d);
+
+            const uint scbase = j + ib * 4u * mq;
+            uint sc4[4];
+            sc4[0] = scw[scbase + 0u * mq];
+            sc4[1] = scw[scbase + 1u * mq];
+            sc4[2] = scw[scbase + 2u * mq];
+            sc4[3] = scw[scbase + 3u * mq];
+
+            float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f, acc3 = 0.f;
+            for (uint sb = 0; sb < 8u; ++sb) {
+                const uint scv = sc4[sb >> 1];
+                const uint sh  = (sb & 1u) ? 4u : 0u;   // which nibble of each row's byte
+                const uint nib0 = ((scv      ) >> sh) & 0xFu;
+                const uint nib1 = ((scv >>  8) >> sh) & 0xFu;
+                const uint nib2 = ((scv >> 16) >> sh) & 0xFu;
+                const uint nib3 = ((scv >> 24) >> sh) & 0xFu;
+
+                const uint qhv = qhw[j + (ib * 8u + sb) * mq];
+                const uint qh0 = (qhv      ) & 0xFFu;
+                const uint qh1 = (qhv >>  8) & 0xFFu;
+                const uint qh2 = (qhv >> 16) & 0xFFu;
+                const uint qh3 = (qhv >> 24) & 0xFFu;
+
+                const uint grp = ib * 64u + sb * 8u;
+                const uint qsb = j + grp * mq;
+                const uint sgb = j + (ib * 32u + sb * 4u) * mq;
+
+                float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+                for (uint u = 0; u < 8u; ++u) {
+                    const uint qsv = qsw[qsb + u * mq];             // four rows, one load
+                    const uint sgv = sgw[sgb + (u >> 1) * mq];
+                    const uint g0  = ((qsv      ) & 0xFFu) | (((qh0 >> u) & 1u) << 8);
+                    const uint g1  = ((qsv >>  8) & 0xFFu) | (((qh1 >> u) & 1u) << 8);
+                    const uint g2  = ((qsv >> 16) & 0xFFu) | (((qh2 >> u) & 1u) << 8);
+                    const uint g3  = ((qsv >> 24) & 0xFFu) | (((qh3 >> u) & 1u) << 8);
+                    const uint base = (u & 1u) * 4u;
+                    const float4 yv = IQ3S_YV(grp + u, y);          // shared by all four
+                    a0 += dot(yv, IQ3S_W(g0, IQ3S_GW(g0, IQ3S_GRID(g0)), (sgv      ) & 0xFFu, base));
+                    a1 += dot(yv, IQ3S_W(g1, IQ3S_GW(g1, IQ3S_GRID(g1)), (sgv >>  8) & 0xFFu, base));
+                    a2 += dot(yv, IQ3S_W(g2, IQ3S_GW(g2, IQ3S_GRID(g2)), (sgv >> 16) & 0xFFu, base));
+                    a3 += dot(yv, IQ3S_W(g3, IQ3S_GW(g3, IQ3S_GRID(g3)), (sgv >> 24) & 0xFFu, base));
+                }
+                acc0 += (float)(1u + 2u * nib0) * a0;
+                acc1 += (float)(1u + 2u * nib1) * a1;
+                acc2 += (float)(1u + 2u * nib2) * a2;
+                acc3 += (float)(1u + 2u * nib3) * a3;
+            }
+            sumf  += (float)dh.s0 * acc0;
+            sumf1 += (float)dh.s1 * acc1;
+            sumf2 += (float)dh.s2 * acc2;
+            sumf3 += (float)dh.s3 * acc3;
+        }
+    }
+#elif IQ3S_MV_R2
     const uint mh  = m >> 1;                        // rows per plane row, as ushorts
     const uint j   = get_group_id(0) * 64u + lid;   // row pair index
     const uint row = j << 1;
@@ -562,7 +656,21 @@ kernel void kernel_mul_mv_iq3_s_f32_flat(
 #endif
 
 #if IQ3S_MV_NSG > 1
-#if IQ3S_MV_R2
+#if IQ3S_MV_R4
+    __local float4 part[IQ3S_MV_NSG][64];
+    part[sgi][lid] = (float4)(sumf, sumf1, sumf2, sumf3);
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (sgi != 0) {
+        return;
+    }
+    for (uint s = 1; s < IQ3S_MV_NSG; ++s) {
+        const float4 p = part[s][lid];
+        sumf  += p.s0;
+        sumf1 += p.s1;
+        sumf2 += p.s2;
+        sumf3 += p.s3;
+    }
+#elif IQ3S_MV_R2
     __local float2 part[IQ3S_MV_NSG][64];
     part[sgi][lid] = (float2)(sumf, sumf1);
     barrier(CLK_LOCAL_MEM_FENCE);
@@ -587,7 +695,11 @@ kernel void kernel_mul_mv_iq3_s_f32_flat(
 #endif
 #endif
 
-#if IQ3S_MV_R2
+#if IQ3S_MV_R4
+    if (j < mq) {
+        vstore4((float4)(sumf, sumf1, sumf2, sumf3), 0, dst + (ulong)col * (uint)ne0 + row);
+    }
+#elif IQ3S_MV_R2
     if (j < mh) {
         vstore2((float2)(sumf, sumf1), 0, dst + (ulong)col * (uint)ne0 + row);
     }
