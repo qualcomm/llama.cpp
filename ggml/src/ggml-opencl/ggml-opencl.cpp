@@ -902,6 +902,7 @@ struct ggml_backend_opencl_context {
     bool has_integer_dot      = false;       // cl_khr_integer_dot_product or cl_qcom_dot_product8
     bool has_qcom_subgroup_shuffle = false;  // specifically cl_qcom_subgroup_shuffle
     bool has_integer_dot_product = false;    // cl_khr_integer_dot_product (dp4a); kernels #ifdef on the same name
+    int  qcom_int_dot = -1;                  // -1 unknown, 0 no, 1 yes; BUILD-probed, see ggml_cl_qcom_int_dot_ok
     cl_uint compute_units = 0;               // CL_DEVICE_MAX_COMPUTE_UNITS (scale axis for tuning formulas)
     int gen_level = GEN_LEVEL_NONE;          // ordered capability level (see adreno_gen_level); set at init,
                                              // ADRENO_UNKNOWN -> optimistic highest-known + GGML_OPENCL_GEN_LEVEL override
@@ -3303,6 +3304,50 @@ static cl_program build_program_from_source(ggml_backend_opencl_context * backen
         cl_program_cache_try_save(backend_ctx->program_cache, p, dev, program_buffer, compile_opts);
     }
     return p;
+}
+
+// Can this device run the cl_qcom_dot_product8 builtins?
+//
+// Probed by COMPILING, not by reading CL_DEVICE_EXTENSIONS, because that string is
+// wrong in both directions here: an Adreno 619 advertises neither dot extension and
+// runs the QCOM builtins correctly, while every device that does advertise them
+// rejects the pragma unless -cl-std is CL2.0 or later (clBuildProgram assumes CL1.2
+// when none is passed). compile_opts already carries the device's own -cl-std, so
+// probing with it answers the question that actually matters: will the kernels build.
+//
+// Only asked when cl_khr_integer_dot_product is absent -- where it is present the
+// KHR builtins are the ones to use, and they carry a signed x signed form that the
+// QCOM extension does not have.
+static bool ggml_cl_qcom_int_dot_ok(ggml_backend_opencl_context * backend_ctx,
+                                    const std::string & compile_opts) {
+    // Opt-in. The path is correct but currently SLOWER than the plane-split GEMV it
+    // would replace -- Adreno 619, tinyllama-Q2_K, matched pairs: pp512 15.58 with the
+    // GEMV against 10.90 with this GEMM, decode identical to four digits either way.
+    // The suspect is the per-word byte sum below; until that is hoisted to a per-block
+    // plane there is nothing to gain, and building the program costs init time on a
+    // compiler as slow as the A6X's. GGML_OPENCL_QCOM_INT_DOT=1 turns it on.
+    if (!ggml_cl_env_int("GGML_OPENCL_QCOM_INT_DOT", 0)) {
+        return false;
+    }
+    if (backend_ctx->qcom_int_dot >= 0) {
+        return backend_ctx->qcom_int_dot != 0;
+    }
+    static const char * const src =
+        "#pragma OPENCL EXTENSION cl_qcom_dot_product8 : enable\n"
+        "kernel void probe(global int * o, global const uint * a, global const uint * b) {\n"
+        "    o[0] = qcom_dot8_acc(a[0], b[0], 0);\n"
+        "}\n";
+    cl_program p = build_program_from_source_ex(backend_ctx->context, backend_ctx->device,
+                                                src, compile_opts, /*fatal=*/false,
+                                                /*tag=*/"qcom_int_dot_probe");
+    backend_ctx->qcom_int_dot = (p != nullptr) ? 1 : 0;
+    if (p != nullptr) {
+        CL_CHECK(clReleaseProgram(p));
+    }
+    GGML_LOG_INFO("ggml_opencl: cl_qcom_dot_product8 builtins %s\n",
+                  backend_ctx->qcom_int_dot ? "usable (int8 dot via the QCOM path)"
+                                            : "not usable");
+    return backend_ctx->qcom_int_dot != 0;
 }
 
 // Build one of the plane-split decode-GEMV programs and narrow its NSG until
@@ -7771,8 +7816,13 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         GGML_LOG_CONT(".");
     }
 
-    // gemm_noshuffle_q2_k_q8_1_dp4a (dp4a dense Q2_K prefill GEMM, plane split)
-    if (backend_ctx->has_integer_dot_product) {
+    // gemm_noshuffle_q2_k_q8_1_dp4a (dp4a dense Q2_K prefill GEMM, plane split).
+    // Takes the KHR int-dot builtins where they exist, and otherwise reconstructs the
+    // signed x signed form over cl_qcom_dot_product8 -- see KQ_INT_DOT in the kernel.
+    // The QCOM route is what puts this GEMM within reach of the A6X parts, which
+    // advertise no KHR int-dot at all; it is the first of the ten plane GEMMs to get it.
+    if (backend_ctx->has_integer_dot_product
+            || ggml_cl_qcom_int_dot_ok(backend_ctx, compile_opts)) {
 #ifdef GGML_OPENCL_EMBED_KERNELS
         const std::string kernel_src {
             #include "gemm_noshuffle_q2_k_q8_1_dp4a.cl.h"
@@ -7780,8 +7830,10 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #else
         const std::string kernel_src = read_file("gemm_noshuffle_q2_k_q8_1_dp4a.cl");
 #endif
+        const int int_dot = backend_ctx->has_integer_dot_product ? 0 : 1;
         const std::string opts = compile_opts
-            + " -DKQ_DP4A_WA=" + std::to_string(ggml_cl_kquant_dp4a_wa());
+            + " -DKQ_DP4A_WA=" + std::to_string(ggml_cl_kquant_dp4a_wa())
+            + " -DKQ_INT_DOT=" + std::to_string(int_dot);
         cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), opts);
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q2_k_q8_1_dp4a = clCreateKernel(prog, "kernel_gemm_noshuffle_q2_k_q8_1_dp4a", &err), err));
         CL_CHECK(clReleaseProgram(prog));

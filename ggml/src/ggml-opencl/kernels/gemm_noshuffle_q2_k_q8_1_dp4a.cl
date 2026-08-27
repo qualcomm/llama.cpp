@@ -4,6 +4,45 @@
 #pragma OPENCL EXTENSION cl_khr_integer_dot_product : enable
 #endif
 
+// KQ_INT_DOT selects where the 4x8-packed signed x signed dot comes from.
+//   0  cl_khr_integer_dot_product's dot_acc_sat_4x8packed_ss_int (the default)
+//   1  cl_qcom_dot_product8, which has NO signed x signed form -- only
+//      unsigned x unsigned and signed x UNSIGNED -- so the signed form is
+//      reconstructed from the latter.
+//
+// The identity, since b_i == (b_i ^ 0x80) - 128 reading the left as int8 and the
+// right as uint8:
+//
+//     sum a_i*b_i == qcom_dot8_acc(a, b ^ 0x80808080, acc) - 128 * sum(a_i)
+//
+// Verified bit-exact against a host reference on an Adreno 619, 642L and 840 over
+// cases chosen to separate the three interpretations, saturation edges included:
+// four lanes of (-128)^2 gives 65536 and four of 127 x -128 gives -65024.
+//
+// This exists because no A6X advertises the KHR extension while both A6X parts in
+// the fleet run the QCOM builtins fine. NOTE the QCOM builtins need BOTH this
+// pragma and -cl-std=CL2.0 or later; at CL1.2 the pragma is rejected outright,
+// and CL1.2 is what clBuildProgram assumes when no -cl-std is passed.
+#ifndef KQ_INT_DOT
+#define KQ_INT_DOT 0
+#endif
+
+#if KQ_INT_DOT == 1
+#pragma OPENCL EXTENSION cl_qcom_dot_product8 : enable
+
+inline int kq_sbytesum(uint v) {
+    char4 c = as_char4(v);
+    return (int)c.x + (int)c.y + (int)c.z + (int)c.w;
+}
+// The correction rides on the SIGNED operand, which here is the weight. Slice 1
+// recomputes it from the already-loaded word; it is per weight-word and does not
+// depend on the token, so it wants hoisting to a per-block plane once this path
+// is shown to be worth keeping.
+#define KQ_DOT_SS(a, b, acc)     (qcom_dot8_acc((a), (b) ^ 0x80808080u, (acc)) - 128 * kq_sbytesum(a))
+#else
+#define KQ_DOT_SS(a, b, acc) dot_acc_sat_4x8packed_ss_int((a), (b), (acc))
+#endif
+
 // Dense Q2_K prefill GEMM, dp4a (int8) inner loop, over the feature-major plane
 // split produced by kernel_convert_block_q2_k_ns:
 //
@@ -83,10 +122,10 @@ inline uint4 kq_load4(const __global uint * p) {
 
 inline int dot4_q8a_v(uint4 qw, uint4 a) {
     int r = 0;
-    r = dot_acc_sat_4x8packed_ss_int(qw.s0, a.x, r);
-    r = dot_acc_sat_4x8packed_ss_int(qw.s1, a.y, r);
-    r = dot_acc_sat_4x8packed_ss_int(qw.s2, a.z, r);
-    r = dot_acc_sat_4x8packed_ss_int(qw.s3, a.w, r);
+    r = KQ_DOT_SS(qw.s0, a.x, r);
+    r = KQ_DOT_SS(qw.s1, a.y, r);
+    r = KQ_DOT_SS(qw.s2, a.z, r);
+    r = KQ_DOT_SS(qw.s3, a.w, r);
     return r;
 }
 
