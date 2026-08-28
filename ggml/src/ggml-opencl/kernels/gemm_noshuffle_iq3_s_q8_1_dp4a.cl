@@ -23,7 +23,20 @@
 
 #define QK_K 256
 
+// TILESIZE_N is the token tile: it fixes the accumulator count (float4
+// acc[TILESIZE_N/4]) and the LDS staging width, so it is compile-time. Left
+// overridable because the right value is PER DEVICE, not per kernel -- the
+// X2-tuned 32 over-occupies LDS on an X1-85 and starves it of resident
+// workgroups, where q4_K already ships TILESIZE_N=8 for +57% pp512.
+//
+// Safe to vary here: this kernel stages its activation tile with a strided
+// `for (idx = lid; idx < TILESIZE_N*N; idx += 64)` loop, which is correct for
+// any tile. Do NOT copy this guard to the q2_K twin -- that one maps a lane
+// straight onto (column, half) with `lid >> 1`, so it is only correct when
+// TILESIZE_N*2 == 64, and a -D there would silently compute wrong answers.
+#ifndef TILESIZE_N
 #define TILESIZE_N 32
+#endif
 
 constant uint iq3s_grid[512] = {
     0x01010101, 0x01010103, 0x01010105, 0x0101010b, 0x0101010f, 0x01010301, 0x01010303, 0x01010305,

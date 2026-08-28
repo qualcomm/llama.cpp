@@ -67,6 +67,12 @@ inline int kq_sbytesum(uint v) {
 
 #define QK_K 256
 
+// TILESIZE_N is deliberately NOT #ifndef-guarded here, unlike its q3_K and IQ
+// siblings. This kernel assigns one (column, half) per lane directly --
+// `t = lid >> 1; h = lid & 1u` with no strided loop -- so it is correct only
+// when TILESIZE_N*2 == 64. A -DTILESIZE_N would compile and return wrong
+// answers. Varying the tile here needs that staging rewritten as a strided
+// loop first; see the note above sh_s.
 #define TILESIZE_N 32
 
 // Four weights of one group as packed int8. Q2_K values are UNSIGNED 0..3; the

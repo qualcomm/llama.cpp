@@ -1864,6 +1864,11 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemm_noshuffle_q4_k_q8_1_dp4a_mid_alds4 = nullptr;
     cl_kernel kernel_gemm_q4_k_splitk_reduce_f32 = nullptr;  // sums the split-K partials
     int q4k_dp4a_ts        = 32;  // tile for prefill (ne1 > q4k_dp4a_mid_max)
+    // Tile the low-bit plane dp4a GEMMs were COMPILED with. The dispatch must use
+    // this and not a literal: TILESIZE_N sets how many columns one workgroup covers,
+    // so a host that launches CEIL_DIV(N, 32) against a kernel built at 8 covers a
+    // quarter of the columns and silently returns wrong answers for large N.
+    int lowbit_dp4a_ts     = 32;
     int q4k_dp4a_ts_narrow = 32;  // tile for the verify band; == q4k_dp4a_ts disables the split
     int q4k_dp4a_narrow_max = 16; // widest ne1 routed to the narrow tile
     int q4k_dp4a_ts_mid    = 24;  // tile for ne1 in (narrow_max, mid_max]
@@ -2976,6 +2981,25 @@ static void ggml_cl_report_gemm_vs_gemv(const float * a, const float * b,
         GGML_LOG_INFO("ggml_opencl: %s worst at row %d col %d: gemm %.6f gemv %.6f\n",
                       tag, worst_r, worst_c, a[i], b[i]);
     }
+}
+
+// Token tile for the low-bit plane dp4a prefill GEMMs, per DEVICE rather than per
+// kernel. TILESIZE_N sets both the accumulator count and the LDS staging width, so
+// the X2-tuned 32 costs an X1-85 1088-1344 B of LDS per workgroup and starves it of
+// resident ones; at 8 the same kernel needs 272 B and its workgroup ceiling rises
+// from 256 to 384. q4_K already ships exactly this, X1E-only, for +57% pp512, and
+// these types simply never got it -- their TILESIZE_N was hard-coded rather than
+// #ifndef-guarded, so the -D was silently inert. That is the fourth recurrence of
+// that guard defect.
+//
+// ⚠ q2_K is NOT in this set: it maps a lane straight onto (column, half), so it is
+// only correct at 32. See the note in its kernel.
+static int ggml_cl_lowbit_dp4a_ts(const ggml_backend_opencl_context * backend_ctx) {
+    int ts = (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X1E) ? 8 : 32;
+    if (const char * e = getenv("GGML_OPENCL_LOWBIT_DP4A_TS")) {
+        ts = atoi(e);
+    }
+    return ts;
 }
 
 // Bisect knob for the A7X miscompile of the Q2_K/Q3_K plane dp4a prefill GEMMs.
@@ -7778,7 +7802,10 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #else
         const std::string kernel_src = read_file("gemm_noshuffle_iq4_xs_q8_1_dp4a.cl");
 #endif
-        cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        backend_ctx->lowbit_dp4a_ts = ggml_cl_lowbit_dp4a_ts(backend_ctx);
+        const std::string ts_opts = compile_opts
+            + " -DTILESIZE_N=" + std::to_string(backend_ctx->lowbit_dp4a_ts);
+        cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), ts_opts);
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_iq4_xs_q8_1_dp4a = clCreateKernel(prog, "kernel_gemm_noshuffle_iq4_xs_q8_1_dp4a", &err), err));
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_iq4_xs_q8_1_dp4a_wimg = clCreateKernel(prog, "kernel_gemm_noshuffle_iq4_xs_q8_1_dp4a_wimg", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -7796,7 +7823,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         std::string opts_i3g = compile_opts
             + " -DIQ3S_GEMM_GRIDIMG=" + std::to_string(ggml_cl_iq3s_gemm_gridimg(backend_ctx));
-        cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), opts_i3g);
+        const std::string ts_opts = opts_i3g
+            + " -DTILESIZE_N=" + std::to_string(ggml_cl_lowbit_dp4a_ts(backend_ctx));
+        cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), ts_opts);
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_iq3_s_q8_1_dp4a = clCreateKernel(prog, "kernel_gemm_noshuffle_iq3_s_q8_1_dp4a", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
@@ -7864,7 +7893,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         const std::string opts = compile_opts
             + " -DKQ_DP4A_WA=" + std::to_string(ggml_cl_kquant_dp4a_wa());
-        cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), opts);
+        const std::string ts_opts = opts
+            + " -DTILESIZE_N=" + std::to_string(ggml_cl_lowbit_dp4a_ts(backend_ctx));
+        cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), ts_opts);
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q3_k_q8_1_dp4a = clCreateKernel(prog, "kernel_gemm_noshuffle_q3_k_q8_1_dp4a", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
@@ -7906,7 +7937,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         std::string opts = compile_opts;
         opts += " -DIQ2S_GEMM_LDSGRID=" + std::to_string(ggml_cl_iq2s_gemm_ldsgrid());
         opts += " -DIQ2S_GEMM_GRIDIMG=" + std::to_string(ggml_cl_iq2s_gemm_gridimg(backend_ctx));
-        cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), opts);
+        const std::string ts_opts = opts
+            + " -DTILESIZE_N=" + std::to_string(ggml_cl_lowbit_dp4a_ts(backend_ctx));
+        cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), ts_opts);
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_iq2_s_q8_1_dp4a = clCreateKernel(prog, "kernel_gemm_noshuffle_iq2_s_q8_1_dp4a", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
@@ -37776,7 +37809,10 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                         CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_int),   &N));
                         CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_int),   &K));
                         size_t d_local[3]  = { 64, 1, 1 };
-                        size_t d_global[3] = { 64, (size_t)CEIL_DIV(M, 64), (size_t)CEIL_DIV(N, 32) };
+                        // columns per workgroup == the tile the program was COMPILED with;
+                        // a literal here silently under-launches when that tile is narrowed
+                        size_t d_global[3] = { 64, (size_t)CEIL_DIV(M, 64),
+                                               (size_t)CEIL_DIV(N, backend_ctx->lowbit_dp4a_ts) };
                         backend_ctx->enqueue_ndrange_kernel(dk, 3, d_global, d_local, dst);
 
                         CL_CHECK(clReleaseMemObject(a_sub));
@@ -38273,7 +38309,10 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                         CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_int),   &N));
                         CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_int),   &K));
                         size_t d_local[3]  = { 64, 1, 1 };
-                        size_t d_global[3] = { 64, (size_t)CEIL_DIV(M, 64), (size_t)CEIL_DIV(N, 32) };
+                        // columns per workgroup == the tile the program was COMPILED with;
+                        // a literal here silently under-launches when that tile is narrowed
+                        size_t d_global[3] = { 64, (size_t)CEIL_DIV(M, 64),
+                                               (size_t)CEIL_DIV(N, backend_ctx->lowbit_dp4a_ts) };
                         backend_ctx->enqueue_ndrange_kernel(dk, 3, d_global, d_local, dst);
 
                         CL_CHECK(clReleaseMemObject(a_sub));
@@ -38755,7 +38794,10 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                         CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_int),   &N));
                         CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_int),   &K));
                         size_t d_local[3]  = { 64, 1, 1 };
-                        size_t d_global[3] = { 64, (size_t)CEIL_DIV(M, 64), (size_t)CEIL_DIV(N, 32) };
+                        // columns per workgroup == the tile the program was COMPILED with;
+                        // a literal here silently under-launches when that tile is narrowed
+                        size_t d_global[3] = { 64, (size_t)CEIL_DIV(M, 64),
+                                               (size_t)CEIL_DIV(N, backend_ctx->lowbit_dp4a_ts) };
                         backend_ctx->enqueue_ndrange_kernel(dk, 3, d_global, d_local, dst);
 
                         CL_CHECK(clReleaseMemObject(a_sub));
@@ -39154,7 +39196,10 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                         CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_int),   &N));
                         CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_int),   &K));
                         size_t d_local[3]  = { 64, 1, 1 };
-                        size_t d_global[3] = { 64, (size_t)CEIL_DIV(M, 64), (size_t)CEIL_DIV(N, 32) };
+                        // columns per workgroup == the tile the program was COMPILED with;
+                        // a literal here silently under-launches when that tile is narrowed
+                        size_t d_global[3] = { 64, (size_t)CEIL_DIV(M, 64),
+                                               (size_t)CEIL_DIV(N, backend_ctx->lowbit_dp4a_ts) };
                         backend_ctx->enqueue_ndrange_kernel(dk, 3, d_global, d_local, dst);
 
                         CL_CHECK(clReleaseMemObject(a_sub));
