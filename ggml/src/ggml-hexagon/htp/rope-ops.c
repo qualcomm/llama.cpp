@@ -390,52 +390,67 @@ static void rope_corr_dims(int     n_dims,
     dims[1]     = MIN(n_dims - 1, end);
 }
 
+// Inverse of the (cos, sin) interleave stored by rope_cache_hvx_32.
+// Full 32-pair blocks become [cos[32] | sin[32]]. Leftover pairs stay interleaved.
+static inline void rope_cache_deinterleave(float * cache, uint32_t n_cache) {
+    const uint32_t n_blocks = n_cache / 64;
+    for (uint32_t b = 0; b < n_blocks; b++) {
+        HVX_Vector * v = (HVX_Vector *) (cache + b * 64);
+        HVX_VectorPair cs = Q6_W_vdeal_VVR(v[1], v[0], -4);
+        v[0] = Q6_V_lo_W(cs);
+        v[1] = Q6_V_hi_W(cs);
+    }
+}
+
+static inline void hvx_rope_neox_mul(HVX_Vector v0, HVX_Vector v1, HVX_Vector vcos, HVX_Vector vsin,
+                                     HVX_Vector * o0, HVX_Vector * o1) {
+    HVX_Vector vx0_c = Q6_Vqf32_vmpy_VsfVsf(v0, vcos);
+    HVX_Vector vx0_s = Q6_Vqf32_vmpy_VsfVsf(v0, vsin);
+    HVX_Vector vx1_c = Q6_Vqf32_vmpy_VsfVsf(v1, vcos);
+    HVX_Vector vx1_s = Q6_Vqf32_vmpy_VsfVsf(v1, vsin);
+    *o0 = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vsub_Vqf32Vqf32(vx0_c, vx1_s));
+    *o1 = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vqf32(vx0_s, vx1_c));
+}
+
+// theta_cache full 32-pair blocks are deinterleaved [cos | sin].
 static inline void hvx_rope_neox_f32_aa(float * restrict dst, const float * restrict src0, uint32_t ne, const float * restrict theta_cache) {
     const uint32_t he = ne / 2;
     const uint32_t nvec = he / 32;
     const uint32_t nloe = he % 32;
 
+    if (nloe == 0) {
+        const HVX_Vector * vs = (const HVX_Vector *) src0;
+        const HVX_Vector * vt = (const HVX_Vector *) theta_cache;
+        HVX_Vector * vd = (HVX_Vector *) dst;
+        for (uint32_t i = 0; i < nvec; i++) {
+            HVX_Vector o0, o1;
+            hvx_rope_neox_mul(vs[i], vs[nvec + i], vt[i * 2 + 0], vt[i * 2 + 1], &o0, &o1);
+            vd[i] = o0;
+            vd[nvec + i] = o1;
+        }
+        return;
+    }
+
     for (uint32_t i = 0; i < nvec; i++) {
-        HVX_Vector v0 = ((const HVX_Vector *) src0)[i];
-        HVX_Vector v1 = hvx_vmemu(src0 + he + i * 32);
-
-        HVX_Vector v2 = ((const HVX_Vector *) theta_cache)[i * 2 + 0];
-        HVX_Vector v3 = ((const HVX_Vector *) theta_cache)[i * 2 + 1];
-
-        HVX_VectorPair vcos_sin = Q6_W_vdeal_VVR(v3, v2, -4);
-
-        HVX_Vector vx0_c = Q6_Vqf32_vmpy_VsfVsf(v0, Q6_V_lo_W(vcos_sin));
-        HVX_Vector vx0_s = Q6_Vqf32_vmpy_VsfVsf(v0, Q6_V_hi_W(vcos_sin));
-        HVX_Vector vx1_c = Q6_Vqf32_vmpy_VsfVsf(v1, Q6_V_lo_W(vcos_sin));
-        HVX_Vector vx1_s = Q6_Vqf32_vmpy_VsfVsf(v1, Q6_V_hi_W(vcos_sin));
-
-        HVX_Vector v4 = Q6_Vqf32_vsub_Vqf32Vqf32(vx0_c, vx1_s);
-        HVX_Vector v5 = Q6_Vqf32_vadd_Vqf32Vqf32(vx0_s, vx1_c);
-
-        ((HVX_Vector *) dst)[i] = Q6_Vsf_equals_Vqf32(v4);
-        hvx_vmemu(dst + he + i * 32) = Q6_Vsf_equals_Vqf32(v5);
+        HVX_Vector o0, o1;
+        hvx_rope_neox_mul(((const HVX_Vector *) src0)[i],
+                          hvx_vmemu(src0 + he + i * 32),
+                          ((const HVX_Vector *) theta_cache)[i * 2 + 0],
+                          ((const HVX_Vector *) theta_cache)[i * 2 + 1],
+                          &o0, &o1);
+        ((HVX_Vector *) dst)[i] = o0;
+        hvx_vmemu(dst + he + i * 32) = o1;
     }
 
-    if (nloe > 0) {
-        HVX_Vector v0 = hvx_vmemu(src0 + nvec * 32);
-        HVX_Vector v1 = hvx_vmemu(src0 + he + nvec * 32);
-
-        HVX_Vector v2 = ((const HVX_Vector *) theta_cache)[nvec * 2 + 0];
-        HVX_Vector v3 = ((const HVX_Vector *) theta_cache)[nvec * 2 + 1];
-
-        HVX_VectorPair vcos_sin = Q6_W_vdeal_VVR(v3, v2, -4);
-
-        HVX_Vector vx0_c = Q6_Vqf32_vmpy_VsfVsf(v0, Q6_V_lo_W(vcos_sin));
-        HVX_Vector vx0_s = Q6_Vqf32_vmpy_VsfVsf(v0, Q6_V_hi_W(vcos_sin));
-        HVX_Vector vx1_c = Q6_Vqf32_vmpy_VsfVsf(v1, Q6_V_lo_W(vcos_sin));
-        HVX_Vector vx1_s = Q6_Vqf32_vmpy_VsfVsf(v1, Q6_V_hi_W(vcos_sin));
-
-        HVX_Vector v4 = Q6_Vqf32_vsub_Vqf32Vqf32(vx0_c, vx1_s);
-        HVX_Vector v5 = Q6_Vqf32_vadd_Vqf32Vqf32(vx0_s, vx1_c);
-
-        hvx_vec_store_u(dst + nvec * 32, nloe * sizeof(float), Q6_Vsf_equals_Vqf32(v4));
-        hvx_vec_store_u(dst + he + nvec * 32, nloe * sizeof(float), Q6_Vsf_equals_Vqf32(v5));
-    }
+    HVX_Vector v0 = hvx_vmemu(src0 + nvec * 32);
+    HVX_Vector v1 = hvx_vmemu(src0 + he + nvec * 32);
+    HVX_Vector v2 = hvx_vmemu(theta_cache + nvec * 64);
+    HVX_Vector v3 = hvx_vmemu(theta_cache + nvec * 64 + 32);
+    HVX_VectorPair vcos_sin = Q6_W_vdeal_VVR(v3, v2, -4);
+    HVX_Vector o0, o1;
+    hvx_rope_neox_mul(v0, v1, Q6_V_lo_W(vcos_sin), Q6_V_hi_W(vcos_sin), &o0, &o1);
+    hvx_vec_store_u(dst + nvec * 32, nloe * sizeof(float), o0);
+    hvx_vec_store_u(dst + he + nvec * 32, nloe * sizeof(float), o1);
 }
 
 static inline void hvx_rope_f32_aa(float * restrict dst, const float * restrict src0, uint32_t ne, const float * restrict theta_cache) {
@@ -512,42 +527,47 @@ static inline void hvx_rope_f32_aa(float * restrict dst, const float * restrict 
 }
 
 static void inline rope_basic_f32(struct htp_rope_context * rctx, uint8_t * restrict dst, uint8_t * restrict src,
-                   uint32_t nr, uint32_t ne0, const float * restrict theta_cache) {
-    const uint32_t n_offs = rctx->n_offs; // VLEN-aligned (enforced by supports_op)
+                   uint32_t nr, const float * restrict theta_cache) {
+    // Only reached when there is no pass-through region (n_dims == ne0, hence n_offs == 0);
+    // the n_offs>0 / partial-n_dims cases go through the *_inplace path (see rope_job_f32).
     #pragma unroll(4)
     for (uint32_t i = 0; i < nr; i++) {
         float * d = (float *) (dst + i * rctx->dst_row_size_aligned);
         float * s = (float *) (src + i * rctx->src0_row_size_aligned);
-
-        hvx_rope_f32_aa(d + n_offs, s + n_offs, rctx->n_dims, theta_cache);
-
-        // fill the remain channels with data from src tensor
-        if (n_offs > 0) {
-            hvx_copy_f32_uu((uint8_t *) d, (uint8_t *) s, n_offs);
-        }
-        if (n_offs + rctx->n_dims < ne0) {
-            hvx_copy_f32_uu((uint8_t *)(d + n_offs + rctx->n_dims), (uint8_t *)(s + n_offs + rctx->n_dims), ne0 - n_offs - rctx->n_dims);
-        }
+        hvx_rope_f32_aa(d, s, rctx->n_dims, theta_cache);
     }
 }
 
 static void inline rope_neox_f32(struct htp_rope_context * rctx, uint8_t * restrict dst, uint8_t * restrict src,
-                   uint32_t nr, uint32_t ne0, const float * restrict theta_cache) {
-    const uint32_t n_offs = rctx->n_offs; // VLEN-aligned (enforced by supports_op)
+                   uint32_t nr, const float * restrict theta_cache) {
+    // See rope_basic_f32: only the full-row (n_offs == 0) case reaches here.
     #pragma unroll(4)
     for (uint32_t i = 0; i < nr; i++) {
         float * d = (float *) (dst + i * rctx->dst_row_size_aligned);
         float * s = (float *) (src + i * rctx->src0_row_size_aligned);
+        hvx_rope_neox_f32_aa(d, s, rctx->n_dims, theta_cache);
+    }
+}
 
-        hvx_rope_neox_f32_aa(d + n_offs, s + n_offs, rctx->n_dims, theta_cache);
+static void inline rope_basic_f32_inplace(struct htp_rope_context * rctx, uint8_t * src,
+                   uint32_t nr, const float * restrict theta_cache) {
+    const uint32_t n_offs = rctx->n_offs; // VLEN-aligned (enforced by supports_op)
+    #pragma unroll(4)
+    for (uint32_t i = 0; i < nr; i++) {
+        float * s = (float *) (src + i * rctx->src0_row_size_aligned);
+        // Rotate the n_dims window at offset n_offs in place; the pass-through prefix [0,n_offs)
+        // and tail [n_offs+n_dims,ne0) stay untouched in src_spad and survive the whole-row writeback.
+        hvx_rope_f32_aa(s + n_offs, s + n_offs, rctx->n_dims, theta_cache);
+    }
+}
 
-        // fill the remain channels with data from src tensor
-        if (n_offs > 0) {
-            hvx_copy_f32_uu((uint8_t *) d, (uint8_t *) s, n_offs);
-        }
-        if (n_offs + rctx->n_dims < ne0) {
-            hvx_copy_f32_uu((uint8_t *)(d + n_offs + rctx->n_dims), (uint8_t *)(s + n_offs + rctx->n_dims), ne0 - n_offs - rctx->n_dims);
-        }
+static void inline rope_neox_f32_inplace(struct htp_rope_context * rctx, uint8_t * src,
+                   uint32_t nr, const float * restrict theta_cache) {
+    const uint32_t n_offs = rctx->n_offs; // VLEN-aligned (enforced by supports_op)
+    #pragma unroll(4)
+    for (uint32_t i = 0; i < nr; i++) {
+        float * s = (float *) (src + i * rctx->src0_row_size_aligned);
+        hvx_rope_neox_f32_aa(s + n_offs, s + n_offs, rctx->n_dims, theta_cache);
     }
 }
 
@@ -557,7 +577,6 @@ static void inline rope_vision_f32(struct htp_rope_context * rctx, uint8_t * res
     for (uint32_t i = 0; i < nr; i++) {
         float * d = (float *) (dst + i * rctx->dst_row_size_aligned);
         float * s = (float *) (src + i * rctx->src0_row_size_aligned);
-
         hvx_rope_neox_f32_aa(d, s, ne0, theta_cache);
     }
 }
@@ -590,6 +609,7 @@ static void rope_job_f32(unsigned int nth, unsigned int ith, void * data) {
     // MROPE, IMROPE and VISION use NEOX-style pairing for the rotation
     const bool    is_neox = (mode & HTP_ROPE_TYPE_NEOX) || (mode & HTP_ROPE_TYPE_MROPE);
     const bool    is_vision = (mode == HTP_ROPE_TYPE_VISION);
+    const bool    inplace_tail = !is_vision && rctx->n_dims < (int32_t) ne0;
 
     // VTCM setup
     uint8_t * src0_spad_base = octx->src0_spad.data + (ith * octx->src0_spad.size_per_thread);
@@ -672,6 +692,9 @@ static void rope_job_f32(unsigned int nth, unsigned int ith, void * data) {
                                         n_cache, rctx->ext_factor, rctx->attn_factor,
                                         theta_cache, rctx->theta_scale, rctx->theta_powers, rctx->theta_scale_32);
                     }
+                    if (is_neox) {
+                        rope_cache_deinterleave(theta_cache, n_cache);
+                    }
                     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_A_PREP, i2);
                 }
 
@@ -693,18 +716,25 @@ static void rope_job_f32(unsigned int nth, unsigned int ith, void * data) {
                     htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, ir);
                     if (is_vision) {
                         rope_vision_f32(rctx, dst_spad, src_spad, cnr, ne0, theta_cache);
+                    } else if (inplace_tail) {
+                        if (is_neox) {
+                            rope_neox_f32_inplace(rctx, src_spad, cnr, theta_cache);
+                        } else {
+                            rope_basic_f32_inplace(rctx, src_spad, cnr, theta_cache);
+                        }
                     } else if (is_neox) {
-                        rope_neox_f32(rctx, dst_spad, src_spad, cnr, ne0, theta_cache);
+                        rope_neox_f32(rctx, dst_spad, src_spad, cnr, theta_cache);
                     } else {
-                        rope_basic_f32(rctx, dst_spad, src_spad, cnr, ne0, theta_cache);
+                        rope_basic_f32(rctx, dst_spad, src_spad, cnr, theta_cache);
                     }
                     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, ir);
 
                     uint8_t * dst_addr = (uint8_t *) dst->data + i3 * nb3 + i2 * nb2 + i1 * nb1;
+                    uint8_t * wr_spad  = inplace_tail ? src_spad : dst_spad;
+                    const size_t wr_pitch = inplace_tail ? rctx->src0_row_size_aligned : rctx->dst_row_size_aligned;
 
-                    // Write only the row payload while striding the DDR dst
-                    dma_queue_push(dma_queue, dma_make_ptr(dst_addr, dst_spad),
-                        rctx->dst_row_stride, rctx->dst_row_size_aligned, rctx->dst_row_size, cnr);
+                    dma_queue_push(dma_queue, dma_make_ptr(dst_addr, wr_spad),
+                        rctx->dst_row_stride, wr_pitch, rctx->dst_row_size, cnr);
 
                     // Prefetch more rows (if any)
                     if ((cr + HTP_ROPE_SPAD_NROWS) < nrows) {
@@ -713,8 +743,14 @@ static void rope_job_f32(unsigned int nth, unsigned int ith, void * data) {
                         uint32_t pir = ir + HTP_ROPE_SPAD_NROWS;
 
                         const uint8_t * src_addr = (const uint8_t *) src0->data + i3 * nb03 + i2 * nb02 + pi1 * nb01;
-                        dma_queue_push(dma_queue, dma_make_ptr(src_spad, src_addr),
-                            rctx->src0_row_size_aligned, rctx->src0_row_stride, rctx->src0_row_size, pnr);
+                        if (inplace_tail) {
+                            // Write and this fetch share src_spad, so the fetch waits for the write.
+                            dma_queue_push_single_2d_ordered(dma_queue, dma_make_ptr(src_spad, src_addr),
+                                rctx->src0_row_size_aligned, rctx->src0_row_stride, rctx->src0_row_size, pnr);
+                        } else {
+                            dma_queue_push(dma_queue, dma_make_ptr(src_spad, src_addr),
+                                rctx->src0_row_size_aligned, rctx->src0_row_stride, rctx->src0_row_size, pnr);
+                        }
 
                         // FARF(HIGH, "rope-prefetch %u: pr %u i1 %u i2 %u i3 %u src-spad %p src-addr %p pnr %u", ith, pir, pi1, i2, i3, src_spad, src_addr, pnr);
                     }
