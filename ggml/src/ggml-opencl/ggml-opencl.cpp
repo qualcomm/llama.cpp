@@ -7927,7 +7927,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         const std::string opts = compile_opts
             + " -DKQ_DP4A_WA=" + std::to_string(ggml_cl_kquant_dp4a_wa())
             + " -DKQ_INT_DOT=" + std::to_string(int_dot);
-        cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), opts);
+        const std::string ts_opts = opts
+            + " -DTILESIZE_N=" + std::to_string(ggml_cl_lowbit_dp4a_ts(backend_ctx));
+        cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), ts_opts);
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q2_k_q8_1_dp4a = clCreateKernel(prog, "kernel_gemm_noshuffle_q2_k_q8_1_dp4a", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
@@ -7987,7 +7989,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         opts += " -DIQ1M_GEMM_GRIDIMG=" + std::to_string(ggml_cl_iq1m_gemm_gridimg(backend_ctx));
         opts += " -DIQ1M_GEMM_FOLD=" + std::to_string(ggml_cl_iq1m_gemm_fold());
         opts += " -DIQ1M_GEMM_BIAS=" + std::to_string(ggml_cl_iq1m_gemm_bias(backend_ctx));
-        cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), opts);
+        const std::string ts_opts = opts
+            + " -DTILESIZE_N=" + std::to_string(ggml_cl_lowbit_dp4a_ts(backend_ctx));
+        cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), ts_opts);
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_iq1_m_q8_1_dp4a = clCreateKernel(prog, "kernel_gemm_noshuffle_iq1_m_q8_1_dp4a", &err), err));
         // 4096 texels = 2048 grid entries x 2 delta signs, 32 KB, built once
         if (ggml_cl_iq1m_gemm_bias(backend_ctx)) {
@@ -38632,7 +38636,10 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                         CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_int),   &N));
                         CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_int),   &K));
                         size_t d_local[3]  = { 64, 1, 1 };
-                        size_t d_global[3] = { 64, (size_t)CEIL_DIV(M, 64), (size_t)CEIL_DIV(N, 32) };
+                        // columns per workgroup == the tile the program was COMPILED with;
+                        // a literal here silently under-launches when that tile is narrowed
+                        size_t d_global[3] = { 64, (size_t)CEIL_DIV(M, 64),
+                                               (size_t)CEIL_DIV(N, backend_ctx->lowbit_dp4a_ts) };
                         backend_ctx->enqueue_ndrange_kernel(dk, 3, d_global, d_local, dst);
 
                         CL_CHECK(clReleaseMemObject(a_sub));
@@ -39063,7 +39070,10 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                         CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_int),   &N));
                         CL_CHECK(clSetKernelArg(dk, ai++, sizeof(cl_int),   &K));
                         size_t d_local[3]  = { 64, 1, 1 };
-                        size_t d_global[3] = { 64, (size_t)CEIL_DIV(M, 64), (size_t)CEIL_DIV(N, 32) };
+                        // columns per workgroup == the tile the program was COMPILED with;
+                        // a literal here silently under-launches when that tile is narrowed
+                        size_t d_global[3] = { 64, (size_t)CEIL_DIV(M, 64),
+                                               (size_t)CEIL_DIV(N, backend_ctx->lowbit_dp4a_ts) };
                         backend_ctx->enqueue_ndrange_kernel(dk, 3, d_global, d_local, dst);
 
                         CL_CHECK(clReleaseMemObject(a_sub));

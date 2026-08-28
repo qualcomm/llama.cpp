@@ -67,13 +67,14 @@ inline int kq_sbytesum(uint v) {
 
 #define QK_K 256
 
-// TILESIZE_N is deliberately NOT #ifndef-guarded here, unlike its q3_K and IQ
-// siblings. This kernel assigns one (column, half) per lane directly --
-// `t = lid >> 1; h = lid & 1u` with no strided loop -- so it is correct only
-// when TILESIZE_N*2 == 64. A -DTILESIZE_N would compile and return wrong
-// answers. Varying the tile here needs that staging rewritten as a strided
-// loop first; see the note above sh_s.
+// TILESIZE_N is the token tile: it fixes the accumulator count and the LDS
+// staging width, so it is compile-time, and the right value is PER DEVICE.
+// This kernel used to be locked at 32 because it mapped one (column, half) per
+// lane; that staging is now a strided loop, so any tile is correct. The
+// dispatch must pass the SAME value -- see ggml_cl_lowbit_dp4a_ts.
+#ifndef TILESIZE_N
 #define TILESIZE_N 32
+#endif
 
 // Four weights of one group as packed int8. Q2_K values are UNSIGNED 0..3; the
 // offset lives in the separate min term, not in the quant.
@@ -209,9 +210,14 @@ kernel void kernel_gemm_noshuffle_q2_k_q8_1_dp4a(
 
         // one (column, half) per lane, so the half's activation sum falls out of
         // the same four loads -- see the header note
-        {
-            const uint t  = lid >> 1;
-            const uint h  = lid & 1u;
+        // Strided over (column, half) rather than one slot per lane. At
+        // TILESIZE_N=32 that is TILESIZE_N*2 == 64 == the workgroup, so idx==lid
+        // once and this is byte-identical to the direct map it replaces -- but it
+        // is now correct at any tile, which is what lets this kernel take the
+        // per-device TILESIZE_N the others already take.
+        for (uint idx = lid; idx < TILESIZE_N * 2u; idx += 64u) {
+            const uint t  = idx >> 1;
+            const uint h  = idx & 1u;
             const uint c  = col_base + t;
             const bool ok = c < (uint)n_no_padding;
             // the lane's whole half is ONE uint4, so the sum now falls out of a

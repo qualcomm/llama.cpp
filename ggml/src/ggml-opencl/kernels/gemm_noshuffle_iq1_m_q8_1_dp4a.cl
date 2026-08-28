@@ -31,7 +31,13 @@
 
 #define QK_K 256
 
+// TILESIZE_N is the token tile: compile-time, and the right value is PER
+// DEVICE. This kernel used to be locked at 32 by a one-slot-per-lane staging
+// map; that is now strided, so any tile is correct. The dispatch must pass the
+// SAME value -- see ggml_cl_lowbit_dp4a_ts.
+#ifndef TILESIZE_N
 #define TILESIZE_N 32
+#endif
 
 #define IQ1M_DELTA 0.125f
 
@@ -578,9 +584,12 @@ kernel void kernel_gemm_noshuffle_iq1_m_q8_1_dp4a(
         // one (column, uint4) slot per lane -- 32 columns x 2 uint4s is exactly the
         // 64 lanes -- and each uint4 covers TWO 8-weight groups, so both of their
         // activation sums fall out of the same 16-byte load
-        {
-            const uint t  = lid >> 1;
-            const uint v  = lid & 1u;
+        // Strided over (column, half); at TILESIZE_N=32 that is idx==lid once, so
+        // byte-identical to the direct lane map it replaces, and correct at any
+        // tile so this kernel can take the per-device TILESIZE_N.
+        for (uint idx = lid; idx < TILESIZE_N * 2u; idx += 64u) {
+            const uint t  = idx >> 1;
+            const uint v  = idx & 1u;
             const uint c  = col_base + t;
             const bool ok = c < (uint)n_no_padding;
             const uint4 w = ok ? vload4(0, src1_qa + c * k_u + (step >> 2) + (v << 2))
@@ -596,9 +605,9 @@ kernel void kernel_gemm_noshuffle_iq1_m_q8_1_dp4a(
             sh_s8[t][2u*v + 1u] = (float)s1;
 #endif
         }
-        if (lid < TILESIZE_N) {
-            const uint c = col_base + lid;
-            sh_da[lid] = (c < (uint)n_no_padding) ? src1_da[c * k_b + sub] : (half)0;
+        for (uint cc = lid; cc < TILESIZE_N; cc += 64u) {
+            const uint c = col_base + cc;
+            sh_da[cc] = (c < (uint)n_no_padding) ? src1_da[c * k_b + sub] : (half)0;
         }
         barrier(CLK_LOCAL_MEM_FENCE);
 
