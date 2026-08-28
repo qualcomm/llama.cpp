@@ -55,13 +55,13 @@ def get_sdk_releases(config):
 
 def list_sdk_releases():
     for config in SDK_CONFIGS:
-        print(f"{config['name']}:")
+        logger.info("%s:", config["name"])
         releases = get_sdk_releases(config)
         if not releases:
-            print("  no Windows on Snapdragon releases found")
+            logger.info("  no Windows on Snapdragon releases found")
             continue
         for release in releases:
-            print(f"  {release['version']}: {release['name']}")
+            logger.info("  %s: %s", release["version"], release["name"])
 
 
 def get_sdk_release(config, version):
