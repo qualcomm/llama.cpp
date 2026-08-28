@@ -36,7 +36,15 @@ typedef struct {
     uchar  qs[QK_K/2];
 } block_iq4_xs;
 
+// TILESIZE_N is the token tile: it fixes the accumulator count and the LDS
+// staging width, so it is compile-time, and the right value is PER DEVICE -- the
+// X2-tuned 32 over-occupies LDS on an X1-85. Safe to vary here: the activation
+// tile is staged with a strided `for (idx = lid; idx < TILESIZE_N*8; idx += 64)`
+// loop, correct at any tile. The dispatch must pass the SAME value; see
+// ggml_cl_lowbit_dp4a_ts and the note at its d_global.
+#ifndef TILESIZE_N
 #define TILESIZE_N 32
+#endif
 
 // IQ4_NL codebook as signed int8, packed 4 codes per uint. A divergent nibble
 // lookup must read a __constant *uint* array and shift; a __constant byte array
