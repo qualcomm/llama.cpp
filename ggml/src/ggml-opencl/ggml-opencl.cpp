@@ -13461,18 +13461,32 @@ inline bool use_adreno_kernels(const ggml_backend_opencl_context *backend_ctx, c
 // gate below returns this, so a generation is added in one place rather than
 // ten -- the previous shape of that was ten copies of adreno_x2_class().
 //
-// A7X joins X2-class here. Off the split its decode GEMV for these types is at
-// or below the CPU on an Adreno 740 -- tinyllama-1.1B tg64 IQ1_S 4.43, IQ3_XXS
-// 4.29, Q2_K 4.44 against a CPU that does 9.81, 8.52 and 9.96 -- and over the
-// planes the same model reads 25.16, 19.21 and 34.50. Perplexity over each type
-// tracks a CPU reference on that device to about 1%.
+// A7X and X1E join X2-class. Expressed as a LEVEL rather than a list of gens,
+// so a part between them inherits the decision instead of falling out of it;
+// the gpu_family test is load-bearing because gen_level is only assigned inside
+// the Adreno branch, and a bare >= would admit every non-Adreno device.
 //
-// It needs ggml_cl_kquant_plane_dp4a_gemm_on to decline the Q2_K/Q3_K prefill
-// GEMMs there; see that predicate. A6X stays out: the split wins its decode too
-// but costs more prefill than it returns, and that wants its own measurement.
+// A7X: off the split its decode GEMV is at or below the CPU on an Adreno 740 --
+// tinyllama-1.1B tg64 IQ1_S 4.43, IQ3_XXS 4.29, Q2_K 4.44 against a CPU doing
+// 9.81, 8.52 and 9.96 -- and over the planes the same model reads 25.16, 19.21
+// and 34.50. It needs ggml_cl_kquant_plane_dp4a_gemm_on to decline the Q2_K and
+// Q3_K prefill GEMMs, which miscompile on that compiler; see that predicate.
+//
+// X1E: the split was excluded here on a prefill-only number (IQ4_XS pp512
+// 99.8 -> 82.9). Decode was never measured, and it gains 40%. The prefill cost
+// was not the split but LDS over-occupancy at the X2-tuned TILESIZE_N=32, which
+// ggml_cl_lowbit_dp4a_ts now narrows to 8 on this part. Measured on an X1-85,
+// Llama-3.2-3B IQ4_XS, split-OFF reference taken twice in the same run:
+// pp512 99.74 -> 97.06 (-2.7%) and tg64 15.98 -> 21.98 (+37.5%), so the point
+// where split-ON overtakes split-OFF falls from 111 generated tokens to about 8.
+// ⚠ Its own CPU still beats its GPU on a 3B model; that is a separate question
+// about model size, not about this gate.
+//
+// A6X stays out: the split wins its decode too but costs more prefill than it
+// returns there, and its plane prefill GEMMs need the QCOM int-dot path first.
 static bool ggml_cl_plane_split_gen_on(const ggml_backend_opencl_context * backend_ctx) {
-    return backend_ctx->adreno_x2_class()
-        || backend_ctx->adreno_gen == ADRENO_GPU_GEN::A7X;
+    return backend_ctx->gpu_family == GPU_FAMILY::ADRENO
+        && backend_ctx->gen_level >= GEN_LEVEL_A7X;
 }
 
 // GGML_OPENCL_IQ4XS_SOA: split IQ4_XS into feature-major planes at upload. The
