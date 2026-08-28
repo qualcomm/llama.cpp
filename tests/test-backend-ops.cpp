@@ -9352,6 +9352,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+
+    // Q2_K / Q3_K at shapes a real model uses, which is where a backend may swap
+    // the AoS block layout for a feature-major plane split. The random quant
+    // cases above top out at m = 128, below the row count such a path needs, so
+    // without these the split is never reached and reports as covered.
+    //
+    // Decode (n = 1) exercises the plane GEMV; n = 512 at an ffn_down k = 5632
+    // exercises the prefill GEMM. k = 5632 is 22 super-blocks per row -- neither
+    // a power of two nor a multiple of the tiling -- and it separates backends
+    // that are correct at k = 2048 or 3072 from those that are not.
+    for (ggml_type type_a : {GGML_TYPE_Q2_K, GGML_TYPE_Q3_K}) {
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 6656, 1, 3072, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 512, 1, 512, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 2048, 512, 5632, {1, 1}, {1, 1}));
+        for (int n : {2, 4, 8, 16, 32}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1024, n, 2048, {1, 1}, {1, 1}));
+        }
+    }
     // sycl backend will limit task global_range < MAX_INT
     // test case for f16-type-convert-to-fp32 kernel with large k under fp32 compute dtype (occurs in stable-diffusion)
     // however this case needs to alloc more memory which may fail in some devices (Intel Arc770, etc.)
