@@ -1651,7 +1651,28 @@ struct ggml_backend_opencl_context {
             }
             return;
         }
-        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, work_dim, NULL, global_work_size, local_work_size, 0, NULL, NULL));
+        {
+            const cl_int enq_err = clEnqueueNDRangeKernel(queue, kernel, work_dim, NULL,
+                                                          global_work_size, local_work_size,
+                                                          0, NULL, NULL);
+            if (enq_err != CL_SUCCESS) {
+                // A bare error code here costs a bisect. -54 in particular says a
+                // workgroup was refused, and the only thing worth knowing is WHICH
+                // kernel and by how much, so ask the driver before dying.
+                char kname[128] = {0};
+                size_t kmax = 0;
+                clGetKernelInfo(kernel, CL_KERNEL_FUNCTION_NAME, sizeof(kname) - 1, kname, NULL);
+                clGetKernelWorkGroupInfo(kernel, device, CL_KERNEL_WORK_GROUP_SIZE,
+                                         sizeof(kmax), &kmax, NULL);
+                size_t req = 1;
+                for (cl_uint d = 0; d < work_dim; ++d) {
+                    req *= local_work_size ? local_work_size[d] : 1;
+                }
+                GGML_LOG_ERROR("ggml_opencl: enqueue of '%s' failed (%d); local %zu work items, "
+                               "kernel max %zu\n", kname[0] ? kname : "?", enq_err, req, kmax);
+            }
+            CL_CHECK(enq_err);
+        }
 #endif
     }
 
