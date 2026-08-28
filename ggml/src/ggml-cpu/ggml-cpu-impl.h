@@ -78,7 +78,18 @@ struct ggml_compute_params {
 #if defined(__ARM_NEON)
 
 // ref: https://github.com/ggml-org/llama.cpp/pull/5404
-#ifdef _MSC_VER
+//
+// The two-element form is for MSVC's uint32x4_t, which is a union whose first
+// member is uint64_t[2]. clang targeting Windows also defines _MSC_VER, but its
+// uint32x4_t is a native 4-lane vector: the same braces then initialise lanes 0
+// and 1 with the two 64-bit values TRUNCATED to 32 bits and leave lanes 2 and 3
+// zero, so { w, x, y, z } silently becomes { w, y, 0, 0 }.
+//
+// That is a wrong answer, not a slow one. It reaches the three CPU dot products
+// that gather a codebook this way -- IQ3_XXS, IQ3_S and IQ1_M -- and on a
+// Snapdragon X Elite (clang 20, aarch64-pc-windows-msvc) a 3B IQ3_XXS scores
+// PPL 419896 on wikitext against 10.55 for the same model on the GPU.
+#if defined(_MSC_VER) && !defined(__clang__)
 #define ggml_vld1q_u32(w,x,y,z) { ((w) + ((uint64_t)(x) << 32)), ((y) + ((uint64_t)(z) << 32)) }
 #else
 #define ggml_vld1q_u32(w,x,y,z) { (w), (x), (y), (z) }
