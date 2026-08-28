@@ -184,7 +184,16 @@ kernel void kernel_gemm_noshuffle_q5_k_f32(
 // dequant. Closes the q5_K medium-batch dead-zone the same way q4_K/q6_K cok
 // did; q5_K is the #2 verify chunk on Qwen3.5 spec/MTP. REQD_SUBGROUP_SIZE_64
 // + barrier (never full-width sub_group_reduce on X2).
+// COK_NSG is the subgroup count of a (COK_SG x COK_NSG) workgroup, so it is what
+// sets the launch to 64*COK_NSG work items -- and it is compile-time, because it
+// sizes the __local reduction array. Left overridable so a device that refuses
+// that workgroup can be given a narrower one: an Adreno X1-85 caps this kernel at
+// 384 work items and the default 8 asks for 512, which is a hard -54 abort at the
+// first dispatch. The host must launch the SAME value it compiled; see
+// ggml_cl_cok_nsg_eff.
+#ifndef COK_NSG
 #define COK_NSG 8
+#endif
 #define COK_SG  64
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64

@@ -1890,6 +1890,11 @@ struct ggml_backend_opencl_context {
     // so a host that launches CEIL_DIV(N, 32) against a kernel built at 8 covers a
     // quarter of the columns and silently returns wrong answers for large N.
     int lowbit_dp4a_ts     = 32;
+    // COK_NSG the cok programs were COMPILED with, after narrowing to what the
+    // device will launch. The dispatch must use this: it sets both the workgroup
+    // (64 x COK_NSG) and the K-slice axis, so a host that launches 8 against a
+    // kernel built at 4 is a -54 abort, and the reverse silently drops slices.
+    int cok_nsg_eff        = 8;
     int q4k_dp4a_ts_narrow = 32;  // tile for the verify band; == q4k_dp4a_ts disables the split
     int q4k_dp4a_narrow_max = 16; // widest ne1 routed to the narrow tile
     int q4k_dp4a_ts_mid    = 24;  // tile for ne1 in (narrow_max, mid_max]
@@ -3447,6 +3452,65 @@ static bool ggml_cl_qcom_int_dot_ok(ggml_backend_opencl_context * backend_ctx,
                   backend_ctx->qcom_int_dot ? "usable (int8 dot via the QCOM path)"
                                             : "not usable");
     return backend_ctx->qcom_int_dot != 0;
+}
+
+// Build a cok program and narrow COK_NSG until the device will actually launch
+// its (64 x COK_NSG) workgroup. Same shape as ggml_cl_build_mv_program_nsg and
+// same reason: COK_NSG is compile-time, so a refusal cannot be repaired at
+// dispatch and the program has to be built again.
+//
+// This was not hypothetical. kernel_gemm_noshuffle_q4_0_f32_cok_r4_splitk asks
+// for 64*8 = 512 work items; an Adreno X1-85 caps it at 384 and returns
+// CL_INVALID_WORK_GROUP_SIZE, which the backend's assert turns into a hard abort
+// at the first q4_0 matmul. The r4 cok path is default-on fleet-wide, so that
+// abort shipped -- it went unnoticed because nothing had run the op suite on an
+// X1 until now.
+static cl_program ggml_cl_build_cok_program(ggml_backend_opencl_context * backend_ctx,
+                                            const char * kernel_src,
+                                            const std::string & opts_base,
+                                            int nsg_req,
+                                            int * nsg_eff_out) {
+    int nsg_eff = nsg_req < 1 ? 1 : nsg_req;
+    for (;;) {
+        const std::string opts = opts_base + " -DCOK_NSG=" + std::to_string(nsg_eff);
+        cl_program prog = build_program_from_source(backend_ctx, kernel_src, opts);
+
+        size_t names_len = 0;
+        std::string names;
+        if (clGetProgramInfo(prog, CL_PROGRAM_KERNEL_NAMES, 0, NULL, &names_len) == CL_SUCCESS
+            && names_len > 1) {
+            names.resize(names_len);
+            if (clGetProgramInfo(prog, CL_PROGRAM_KERNEL_NAMES, names_len,
+                                 &names[0], NULL) != CL_SUCCESS) {
+                names.clear();
+            }
+            while (!names.empty() && names.back() == 0) { names.pop_back(); }
+        }
+
+        int fit = nsg_eff;
+        for (size_t b = 0, e; b < names.size(); b = e + 1) {
+            e = names.find(';', b);
+            if (e == std::string::npos) { e = names.size(); }
+            const std::string kn = names.substr(b, e - b);
+            // only the cok kernels launch 64*COK_NSG; the others in this program
+            // carry their own geometry and must not narrow it
+            if (kn.find("_cok") == std::string::npos) {
+                continue;
+            }
+            cl_int perr = CL_SUCCESS;
+            cl_kernel probe = clCreateKernel(prog, kn.c_str(), &perr);
+            if (perr != CL_SUCCESS || probe == nullptr) { continue; }
+            fit = std::min(fit, ggml_cl_nsg_fit(backend_ctx, probe, nsg_eff, kn.c_str()));
+            CL_CHECK(clReleaseKernel(probe));
+        }
+
+        if (fit >= nsg_eff) {
+            if (nsg_eff_out != nullptr) { *nsg_eff_out = nsg_eff; }
+            return prog;
+        }
+        CL_CHECK(clReleaseProgram(prog));
+        nsg_eff = fit;
+    }
 }
 
 // Build one of the plane-split decode-GEMV programs and narrow its NSG until
@@ -7632,7 +7696,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #else
         const std::string kernel_src_CL_gemm = read_file("gemm_noshuffle_q4_0_f32.cl");
 #endif
-        cl_program prog = build_program_from_source(backend_ctx, kernel_src_CL_gemm.c_str(), compile_opts);
+        cl_program prog = ggml_cl_build_cok_program(backend_ctx, kernel_src_CL_gemm.c_str(),
+                                                    compile_opts, 8, &backend_ctx->cok_nsg_eff);
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_0_f32 = clCreateKernel(prog, "kernel_gemm_noshuffle_q4_0_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_0_f32_cok = clCreateKernel(prog, "kernel_gemm_noshuffle_q4_0_f32_cok", &err), err));
         // 4-rows-per-lane variant. Not fatal: falls back to the 1-row kernel.
@@ -31620,11 +31685,14 @@ static void ggml_cl_mul_mat_q4_0_f32_adreno(ggml_backend_t backend, const ggml_t
             // (COK_SG lanes x COK_NSG subgroups): one row per lane, K split
             // across the COK_NSG subgroups.
             // The r4 variant gives each lane 4 rows, so the row axis shrinks 4x.
+            // COK_NSG comes from the program, not a literal: the device may have
+            // refused 64x8 at build time and been given a narrower workgroup.
+            const size_t cok_nsg = (size_t)backend_ctx->cok_nsg_eff;
             global_work_size[0] = use_q40_cok_r4 ? (size_t)(ne01 / 4) : (size_t)ne01;
-            global_work_size[1] = (size_t)(8 * cok_ksplit);   // COK_NSG x K slices
+            global_work_size[1] = cok_nsg * (size_t)cok_ksplit;   // COK_NSG x K slices
             global_work_size[2] = 1;
             local_work_size[0]  = 64;             // COK_SG
-            local_work_size[1]  = 8;              // COK_NSG
+            local_work_size[1]  = cok_nsg;        // COK_NSG
             local_work_size[2]  = 1;
         } else if (ne0 == 4096 && ne1 == 128 && ne10 == 4096) {
             local_work_size[0] = 1;

@@ -162,7 +162,16 @@ kernel void kernel_gemm_noshuffle_q4_0_f32(
 //
 // Uses REQD_SUBGROUP_SIZE_64 + barrier (same safe reduction pattern as the
 // GEMV; never sub_group_reduce at full width on X2 per the GDN miscompile note).
+// COK_NSG is the subgroup count of a (COK_SG x COK_NSG) workgroup, so it is what
+// sets the launch to 64*COK_NSG work items -- and it is compile-time, because it
+// sizes the __local reduction array. Left overridable so a device that refuses
+// that workgroup can be given a narrower one: an Adreno X1-85 caps this kernel at
+// 384 work items and the default 8 asks for 512, which is a hard -54 abort at the
+// first dispatch. The host must launch the SAME value it compiled; see
+// ggml_cl_cok_nsg_eff.
+#ifndef COK_NSG
 #define COK_NSG 8
+#endif
 #define COK_SG  64
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
