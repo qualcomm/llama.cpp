@@ -1823,6 +1823,7 @@ struct ggml_backend_opencl_context {
     // built at 4 is a -54 abort, and the reverse silently drops K slices. Separate
     // programs, so a device is free to refuse them at different widths.
     int       q40_cok_nsg_eff = 8;
+    int       q41_cok_nsg_eff = 8;
     int       q5k_cok_nsg_eff = 8;
     int       q6k_cok_nsg_eff = 8;
     int       q80_cok_nsg_eff = 8;
@@ -5083,7 +5084,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #else
         const std::string kernel_src = read_file("gemm_noshuffle_q4_1_f32.cl");
 #endif
-        cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        cl_program prog = ggml_cl_build_cok_program(backend_ctx, kernel_src.c_str(), compile_opts, 8,
+                                                    &backend_ctx->q41_cok_nsg_eff);
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_1_f32 = clCreateKernel(prog, "kernel_gemm_noshuffle_q4_1_f32", &err), err));
         // Non-fatal: a compiler that rejects these must fall back, not abort. The q6_K r4
         // kernel once failed to build on Adreno 850 and took its whole program down with it.
@@ -26138,10 +26140,10 @@ static void ggml_cl_mul_mat_q4_1_f32_adreno(ggml_backend_t backend, const ggml_t
             // COK_NSG subgroups. The r4 variant gives each lane 4 rows, so the row axis
             // shrinks 4x.
             global_work_size[0] = use_q41_cok_r4 ? (size_t)(ne01 / 4) : (size_t)ne01;
-            global_work_size[1] = 8;              // COK_NSG
+            global_work_size[1] = (size_t)backend_ctx->q41_cok_nsg_eff;   // COK_NSG
             global_work_size[2] = 1;
             local_work_size[0]  = 64;             // COK_SG
-            local_work_size[1]  = 8;              // COK_NSG
+            local_work_size[1]  = (size_t)backend_ctx->q41_cok_nsg_eff;   // COK_NSG
             local_work_size[2]  = 1;
         }
 
