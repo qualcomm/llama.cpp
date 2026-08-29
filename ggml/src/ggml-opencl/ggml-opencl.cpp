@@ -987,6 +987,8 @@ struct ggml_backend_opencl_context {
     bool adreno_use_bin_kernels;
     get_adreno_bin_kernel_func_t get_adreno_bin_kernel_func = nullptr;
     ggml_cl_compiler_version adreno_cl_compiler_version;
+    // The q6_K flat mul_mat codegen workarounds are needed by old E031 compilers only.
+    bool q6_k_flat_old_compiler;
 
     std::string kernel_compile_opts;  // cached for lazy-compiled kernels.
 
@@ -1425,6 +1427,8 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemm_moe_q4_0_q8_1_dp4a = nullptr;    // dp4a (int8) q4_0 MoE prefill GEMM
     cl_kernel kernel_gemv_moe_mxfp4_f32_ns_glu;
     cl_kernel kernel_gemv_moe_mxfp4_f32_ns_glu_wimg = nullptr;  // weight-as-texture variant
+    cl_kernel kernel_gemm_moe_mxfp4_q8_1_dp4a_bin = nullptr;   // binary dp4a (int8) mxfp4 MoE prefill GEMM
+    cl_kernel kernel_gemm_moe_q4_0_q8_1_dp4a_bin = nullptr;    // binary dp4a (int8) q4_0 MoE prefill GEMM
     cl_kernel kernel_moe_reorder_b;
     cl_kernel kernel_moe_histogram, kernel_moe_scan, kernel_moe_fill, kernel_moe_scatter;
     cl_kernel kernel_moe_scatter_det = nullptr;      // diagnostic: deterministic slot assignment
@@ -2963,6 +2967,12 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                 " -DQ6K_FLAT_NSG="   + std::to_string(nsg);
         }
 
+        // The codegen workarounds in this kernel are a measured 13-20% loss on
+        // compilers that do not need them, so only the affected ones build them;
+        // everyone else gets the original source.
+        if (backend_ctx->q6_k_flat_old_compiler) {
+            compile_opts_local += " -DADRENO_OLD_COMPILER=1";
+        }
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts_local);
 
@@ -6195,6 +6205,24 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         GGML_LOG_CONT(".");
     }
 
+    // gemm_moe_mxfp4_q8_1_dp4a_bin (dp4a prefill GEMM)
+    if (backend_ctx->has_integer_dot_product) {
+        size_t bin_size = 0;
+        backend_ctx->kernel_gemm_moe_mxfp4_q8_1_dp4a_bin = nullptr;
+
+        if (use_adreno_bin_kernels(backend_ctx)) {
+            const char * kernel_bin = (const char *)backend_ctx->get_adreno_bin_kernel("gemm_moe_mxfp4_q8_1_dp4a_ila", &bin_size);
+            if (kernel_bin && bin_size > 0) {
+                cl_program prog =
+                    build_program_from_binary(backend_ctx->context, backend_ctx->device, kernel_bin, CL_moe_compile_opts, bin_size);
+
+                CL_CHECK((backend_ctx->kernel_gemm_moe_mxfp4_q8_1_dp4a_bin = clCreateKernel(prog, "kernel_gemm_moe_mxfp4_q8_1_dp4a_ila", &err), err));
+                CL_CHECK(clReleaseProgram(prog));
+                GGML_LOG_CONT(".");
+            }
+        }
+    }
+
     // gemm_moe_q4_0_q8_1_dp4a (dp4a prefill GEMM)
     if (backend_ctx->has_integer_dot_product) {
 #ifdef GGML_OPENCL_EMBED_KERNELS
@@ -6211,6 +6239,25 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
+
+    // gemm_moe_q4_0_q8_1_dp4a_bin (dp4a prefill GEMM)
+    if (backend_ctx->has_integer_dot_product) {
+        size_t bin_size = 0;
+        backend_ctx->kernel_gemm_moe_q4_0_q8_1_dp4a_bin = nullptr;
+
+        if (use_adreno_bin_kernels(backend_ctx)) {
+            const char * kernel_bin = (const char *)backend_ctx->get_adreno_bin_kernel("gemm_moe_q4_0_q8_1_dp4a_ila", &bin_size);
+            if (kernel_bin && bin_size > 0) {
+                cl_program prog =
+                    build_program_from_binary(backend_ctx->context, backend_ctx->device, kernel_bin, CL_moe_compile_opts, bin_size);
+
+                CL_CHECK((backend_ctx->kernel_gemm_moe_q4_0_q8_1_dp4a_bin = clCreateKernel(prog, "kernel_gemm_moe_q4_0_q8_1_dp4a_ila", &err), err));
+                CL_CHECK(clReleaseProgram(prog));
+                GGML_LOG_CONT(".");
+            }
+        }
+    }
+
 
     // gemm_moe_q8_1_dp4a (generic dp4a MoE GEMM; MOE_QT=80 -> q8_0 expert variant, opt-in)
     if (backend_ctx->has_integer_dot_product) {
@@ -9165,6 +9212,16 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
         (backend_ctx->adreno_cl_compiler_version.type == E031 && backend_ctx->adreno_cl_compiler_version.major >= 47) ||
         (backend_ctx->adreno_cl_compiler_version.type == DX   && backend_ctx->adreno_cl_compiler_version.major >= 17);
 
+    // The q6_K flat mul_mat miscompile is a defect of the older E031 compilers, not a
+    // property of any GPU generation: it reproduces on E031.38 (Adreno 642L) and E031.41
+    // (Adreno 740) and is fixed by E031.45 (Adreno 619). Gate on the compiler so parts
+    // that do not need the workarounds do not pay for them. The explicit type check is
+    // required: newer_than_or_same() is false for every non-E031 compiler, so negating it
+    // alone would enable the workarounds on E17/DX.
+    backend_ctx->q6_k_flat_old_compiler =
+        backend_ctx->adreno_cl_compiler_version.type == E031 &&
+        !backend_ctx->adreno_cl_compiler_version.newer_than_or_same(E031, 45, 0, 0);
+
     size_t ext_str_size;
     clGetDeviceInfo(device, CL_DEVICE_EXTENSIONS, 0, NULL, &ext_str_size);
     char *ext_buffer = (char *)alloca(ext_str_size + 1);
@@ -10262,6 +10319,13 @@ static bool ggml_opencl_should_fuse_rope_set_rows(const ggml_tensor * rope,
     }
     const int mode = ((const int32_t *) rope->op_params)[2];
     if (mode != GGML_ROPE_TYPE_NORMAL && mode != GGML_ROPE_TYPE_NEOX) {
+        return false;
+    }
+    // ggml_rope_set_offset (op_params[15]) rotates a sub-range of the row. The fused
+    // rope+set_rows kernels predate it and have no n_offs argument, so they would apply
+    // the full-row rotation and silently drop the offset. supports_op used to reject
+    // every offset rope outright; since it stopped doing that the decline belongs here.
+    if (((const int32_t *) rope->op_params)[15] != 0) {
         return false;
     }
     return true;
@@ -11419,6 +11483,14 @@ static bool ggml_opencl_can_fuse(const ggml_backend_opencl_context * backend_ctx
         // only plain NORM / NEOX rope; mrope/vision have extra section params
         const int mode = ((const int32_t *) rope->op_params)[2];
         if ((mode & GGML_ROPE_TYPE_MROPE) || mode == GGML_ROPE_TYPE_VISION) {
+            return false;
+        }
+
+        // ggml_rope_set_offset (op_params[15]) rotates a sub-range of the row. The
+        // fused rms+rope kernels predate it and take no n_offs argument, so they would
+        // rotate the whole row and silently drop the offset. supports_op used to reject
+        // every offset rope outright; since it stopped doing that the decline is here.
+        if (((const int32_t *) rope->op_params)[15] != 0) {
             return false;
         }
 
@@ -13097,9 +13169,6 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
         case GGML_OP_DIAG_MASK_INF:
             return op->ne[3] == 1;
         case GGML_OP_ROPE: {
-            if (((const int32_t *) op->op_params)[15] != 0) {
-                return false; // FIXME: support ggml_rope_set_offset
-            }
             const int mode = ((const int32_t *) op->op_params)[2];
             const bool is_mrope = mode & GGML_ROPE_TYPE_MROPE;
             const bool is_vision = mode == GGML_ROPE_TYPE_VISION;
@@ -13185,12 +13254,28 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                                      v->type == GGML_TYPE_F16 && op->type == GGML_TYPE_F16;
             const bool is_f32_f16  = q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16 &&
                                      v->type == GGML_TYPE_F16 && op->type == GGML_TYPE_F32;
+
             const bool is_f32_q8_0 = q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_Q8_0 &&
                                      v->type == GGML_TYPE_Q8_0 && op->type == GGML_TYPE_F32 &&
                                      dk % 32 == 0 && dv % 32 == 0;
             const bool is_f32_q4_0 = q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_Q4_0 &&
                                      v->type == GGML_TYPE_Q4_0 && op->type == GGML_TYPE_F32 &&
                                      dk % 32 == 0 && dv % 32 == 0;
+
+            // A7X (Adreno 740, compiler E031.41) SIGSEGVs inside clBuildProgram
+            // building the flash_attn programs whose KV path is mixed-type or
+            // dequantized — f32_f16, q8_0, q4_0 (reproduced at DK=40 and DK=64; it
+            // is DK-independent). It is a driver crash, not codegen-wrong-output, so
+            // it cannot be caught in-process (fatal=false only handles clean compile
+            // errors). The uniform f16_f16 / f32_f32 programs compile fine on this
+            // compiler, so decline only the KV-convert variants; ggml then runs
+            // those (f16-KV / quant-KV) attention layers on the CPU backend.
+            // Negative compiler carve-out, same idiom as the Intel DK=512 decline
+            // below and the X1E driver-quirk guards.
+            if (backend_ctx && backend_ctx->adreno_gen == ADRENO_GPU_GEN::A7X &&
+                (is_f32_f16 || is_f32_q8_0 || is_f32_q4_0)) {
+                return false;
+            }
 
             // Asymmetric KV: host-dequants both sides to F32, uses f32 kernel.
             auto is_kv_type_ok = [](ggml_type t) {
@@ -32636,6 +32721,12 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             CL_CHECK(clSetKernelArg(kernel, 14, sizeof(int),      &ne1));
             CL_CHECK(clSetKernelArg(kernel, 15, sizeof(int),      &r2));
             CL_CHECK(clSetKernelArg(kernel, 16, sizeof(int),      &r3));
+            // The optimizer-barrier arg exists only in the ADRENO_OLD_COMPILER build of
+            // this kernel; conformant compilers get the original 17-arg signature.
+            if (backend_ctx->q6_k_flat_old_compiler) {
+                cl_uchar q6k_mask = 0xFF;   // never 0xFE in prod; see the kernel note
+                CL_CHECK(clSetKernelArg(kernel, 17, sizeof(cl_uchar), &q6k_mask));
+            }
 #else
             kernel = backend_ctx->kernel_mul_mv_q6_K_f32;
 
@@ -33213,10 +33304,14 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     const int  moe_bin_min  = moe_bin_min_env ? atoi(moe_bin_min_env) : 4096;
                     const int  moe_routings = (int)(ne20 * ne21);
                     const bool bin_available = backend_ctx->kernel_gemm_moe_q4_0_f32_ns_bin != nullptr;
+                    // A dp4a ILA kernel outranks the plain ILA bin kernel outright (upstream
+                    // #27768); the routing threshold above only arbitrates between the SOURCE
+                    // dp4a GEMM and the ILA bin kernel, which is what it was measured against.
+                    const bool dp4a_bin_available = backend_ctx->kernel_gemm_moe_q4_0_q8_1_dp4a_bin != nullptr;
                     const bool use_moe_dp4a = q4_0_moe_dp4a_env
                         ? (atoi(q4_0_moe_dp4a_env) != 0)
                         : (backend_ctx->adreno_dp4a_moe()
-                           && (!bin_available || moe_routings < moe_bin_min));
+                           && (dp4a_bin_available || !bin_available || moe_routings < moe_bin_min));
                     const bool use_bin_kernel = bin_available && !use_moe_dp4a;
 
                     // GGML_OPENCL_MOE_DISPATCH_LOG=1 names the kernel that actually
@@ -33356,6 +33451,10 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
 
                         // dp4a GEMM
                         cl_kernel dk = backend_ctx->kernel_gemm_moe_q4_0_q8_1_dp4a;
+                        if (backend_ctx->kernel_gemm_moe_q4_0_q8_1_dp4a_bin) {
+                            dk = backend_ctx->kernel_gemm_moe_q4_0_q8_1_dp4a_bin;
+                        }
+
                         int aidx = 0;
                         CL_CHECK(clSetKernelArg(dk, aidx++, sizeof(cl_mem), &extra0_q4_0->q_img));
                         CL_CHECK(clSetKernelArg(dk, aidx++, sizeof(cl_mem), &extra0_q4_0->d));
@@ -35267,7 +35366,9 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     const bool use_moe_dp4a = mxfp4_moe_dp4a_env
                         ? (atoi(mxfp4_moe_dp4a_env) != 0)
                         : (backend_ctx->adreno_dp4a_moe()
-                           && backend_ctx->kernel_gemm_moe_mxfp4_f32_ns_bin == nullptr);
+                           // the dp4a bin kernel outranks the plain ILA bin kernel
+                           && (backend_ctx->kernel_gemm_moe_mxfp4_q8_1_dp4a_bin != nullptr ||
+                               backend_ctx->kernel_gemm_moe_mxfp4_f32_ns_bin == nullptr));
 
                     cl_buffer_region region;
                     region.origin = 0;
@@ -35376,6 +35477,10 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
 
                         // dp4a GEMM
                         cl_kernel dk = backend_ctx->kernel_gemm_moe_mxfp4_q8_1_dp4a;
+                        if (backend_ctx->kernel_gemm_moe_mxfp4_q8_1_dp4a_bin) {
+                            dk = backend_ctx->kernel_gemm_moe_mxfp4_q8_1_dp4a_bin;
+                        }
+
                         int aidx = 0;
                         CL_CHECK(clSetKernelArg(dk, aidx++, sizeof(cl_mem), &extra0_mxfp4->q_img));
                         CL_CHECK(clSetKernelArg(dk, aidx++, sizeof(cl_mem), &extra0_mxfp4->e));
@@ -36095,6 +36200,7 @@ static void ggml_cl_rope(ggml_backend_t backend, const ggml_tensor * src0, const
     const int n_dims     = ((int *) dst->op_params)[1];
     const int mode       = ((int *) dst->op_params)[2];
     const int n_ctx_orig = ((int32_t *) dst->op_params)[4];
+    const int n_offs     = ((int32_t *) dst->op_params)[15];
 
     float freq_base;
     float freq_scale;
@@ -36123,6 +36229,7 @@ static void ggml_cl_rope(ggml_backend_t backend, const ggml_tensor * src0, const
 
     if (is_vision) {
         GGML_ASSERT(n_dims == ne00/2);
+        GGML_ASSERT(n_offs == 0); // offset not supported for vision, as the rotated pairs span the whole row
     }
 
     cl_kernel kernel;
@@ -36213,6 +36320,12 @@ static void ggml_cl_rope(ggml_backend_t backend, const ggml_tensor * src0, const
     // only mrope has is_imrope
     if (is_mrope && !is_vision) {
         CL_CHECK(clSetKernelArg(kernel, 34, sizeof(int), &is_imrope));
+    }
+    // norm and neox have n_offs after beta_slow, mrope has it after is_imrope
+    if (!is_mrope && !is_vision) {
+        CL_CHECK(clSetKernelArg(kernel, 33, sizeof(int), &n_offs));
+    } else if (is_mrope && !is_vision) {
+        CL_CHECK(clSetKernelArg(kernel, 35, sizeof(int), &n_offs));
     }
 
     size_t global_work_size[] = {(size_t)ne01*nth, (size_t)ne02, (size_t)ne03};
