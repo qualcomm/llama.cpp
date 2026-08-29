@@ -32694,7 +32694,17 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             // full passes over hundreds of MB. Switch to the multi-column twin,
             // which reads the weight once per N_COLS columns. Same arithmetic per
             // (row, column), so the result is bit-identical.
-            if (ne11 == 2 && backend_ctx->kernel_mul_mv_q6_K_f32_flat_mc2 != nullptr) {
+            //
+            // NOT on the old E031 compilers. The multi-column twins are x2ue-only and
+            // upstream never had to consider them: they carry their own copy of the
+            // vectorised vload4/convert_float4/dot() dequant, which is exactly the idiom
+            // ADRENO_OLD_COMPILER exists to avoid, and they have no -D variant and no
+            // optimizer-barrier argument. Selecting one here both miscompiles and then
+            // trips the arg-17 set below with CL_INVALID_ARG_INDEX. Fall back to the
+            // single-column flat kernel, which does carry the workaround.
+            if (backend_ctx->q6_k_flat_old_compiler) {
+                // keep the single-column kernel selected above
+            } else if (ne11 == 2 && backend_ctx->kernel_mul_mv_q6_K_f32_flat_mc2 != nullptr) {
                 kernel        = backend_ctx->kernel_mul_mv_q6_K_f32_flat_mc2;
                 ndst          = backend_ctx->q6k_mc2_ndst;
                 ncols_per_wg  = 2;
