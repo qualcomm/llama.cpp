@@ -162,7 +162,11 @@ kernel void kernel_gemm_noshuffle_q4_0_f32(
 //
 // Uses REQD_SUBGROUP_SIZE_64 + barrier (same safe reduction pattern as the
 // GEMV; never sub_group_reduce at full width on X2 per the GDN miscompile note).
+// COK_NSG is overridable so the host can narrow it when a device refuses the
+// 64 x COK_NSG workgroup; see ggml_cl_build_cok_program.
+#ifndef COK_NSG
 #define COK_NSG 8
+#endif
 #define COK_SG  64
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
