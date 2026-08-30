@@ -33793,7 +33793,12 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
         if (q4k_cok_dp4a_env && atoi(q4k_cok_dp4a_env) != 0
             && backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a != nullptr
             && ne1 >= 2 && ne1 <= 8
-            && ne01 % 4 == 0 && K % 32 == 0) {
+            && ne01 % 256 == 0 && K % 32 == 0) {
+            // ne01 % 256, not % 4: one lane covers 4 rows and the workgroup is 64
+            // lanes wide, so the row axis must divide evenly. Padding the global size
+            // instead would create lanes with row0 >= ne01, and the kernel guards the
+            // column at the store but not the row -- they would write out of bounds.
+            // An early return cannot rescue that either: the kernel has barriers.
             // The kernel reads a fixed 8 columns per lane, so the activation side is
             // sized at 8 whatever ne1 is; the padded columns are computed and dropped at
             // the store. Zero the pad rather than letting uninitialised memory into
@@ -33861,7 +33866,7 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
             // the dispatch must use the value the program was actually built at.
             const size_t cok_nsg = (size_t)backend_ctx->q4k_cok_dp4a_nsg_eff;
             size_t c_local[3]  = { 64, cok_nsg, 1 };
-            size_t c_global[3] = { (size_t)CEIL_DIV(ne01 / 4, 64) * 64, cok_nsg, 1 };
+            size_t c_global[3] = { (size_t)(ne01 / 4), cok_nsg, 1 };
             backend_ctx->enqueue_ndrange_kernel(ck, 3, c_global, c_local, dst);
 
             CL_CHECK(clReleaseMemObject(b_sub_buf));
