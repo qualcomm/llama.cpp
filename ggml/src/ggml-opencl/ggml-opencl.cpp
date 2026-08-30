@@ -8435,27 +8435,45 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         int nsg_req = 8;
         if (const char * e = getenv("GGML_OPENCL_Q4K_COK_DP4A_NSG")) { nsg_req = atoi(e); }
-        cl_program prog = ggml_cl_build_cok_program(
-            backend_ctx, kernel_src.c_str(), compile_opts, nsg_req,
-            &backend_ctx->q4k_cok_dp4a_nsg_eff);
-        backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a =
-            clCreateKernel(prog, "kernel_gemm_cok_q4_k_q8_1_dp4a", &err);
-        if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a = nullptr; }
-        if (backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a) {
-            // Register pressure decides this kernel, so keep reading it back rather
-            // than trusting that it stayed where it was measured: 496 B/lane against
-            // a 512 B/WI spill cliff leaves very little margin.
-            cl_ulong pmc = 0, lmc = 0; size_t wgc = 0;
-            cl_kernel kk = backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a;
-            clGetKernelWorkGroupInfo(kk, backend_ctx->device, CL_KERNEL_PRIVATE_MEM_SIZE, sizeof(pmc), &pmc, NULL);
-            clGetKernelWorkGroupInfo(kk, backend_ctx->device, CL_KERNEL_LOCAL_MEM_SIZE,   sizeof(lmc), &lmc, NULL);
-            clGetKernelWorkGroupInfo(kk, backend_ctx->device, CL_KERNEL_WORK_GROUP_SIZE,  sizeof(wgc), &wgc, NULL);
-            fprintf(stderr, "[COK-DP4A] private=%llu local=%llu wg_cap=%zu nsg=%d\n",
-                    (unsigned long long)pmc, (unsigned long long)lmc, wgc,
-                    backend_ctx->q4k_cok_dp4a_nsg_eff);
-            fflush(stderr);
+
+        // The two unroll axes were first measured only together (both on vs both off),
+        // which hid the case that matters: s0..s3 are indexed by COLUMN, so with the
+        // column loop rolled they cannot be registers at all and every dp4a takes a
+        // scratch round-trip. Price all four.
+        struct { const char * name; const char * defs; } variants[] = {
+            { "col+K   ", " -DCOK_UNROLL_U"                     },
+            { "col only", ""                                    },
+            { "K only  ", " -DCOK_UNROLL_U -DCOK_NO_UNROLL_C"   },
+            { "neither ", " -DCOK_NO_UNROLL_C"                  },
+        };
+        const char * want = getenv("GGML_OPENCL_Q4K_COK_DP4A_VARIANT");
+        const int    wanti = want ? atoi(want) : 1;   // default: column only
+        for (int vi = 0; vi < 4; vi++) {
+            int nsg_eff = nsg_req;
+            cl_program vprog = ggml_cl_build_cok_program(
+                backend_ctx, kernel_src.c_str(), compile_opts + variants[vi].defs,
+                nsg_req, &nsg_eff);
+            cl_kernel vk = clCreateKernel(vprog, "kernel_gemm_cok_q4_k_q8_1_dp4a", &err);
+            if (err != CL_SUCCESS) { vk = nullptr; }
+            if (vk) {
+                cl_ulong pmc = 0, lmc = 0; size_t wgc = 0;
+                clGetKernelWorkGroupInfo(vk, backend_ctx->device, CL_KERNEL_PRIVATE_MEM_SIZE, sizeof(pmc), &pmc, NULL);
+                clGetKernelWorkGroupInfo(vk, backend_ctx->device, CL_KERNEL_LOCAL_MEM_SIZE,   sizeof(lmc), &lmc, NULL);
+                clGetKernelWorkGroupInfo(vk, backend_ctx->device, CL_KERNEL_WORK_GROUP_SIZE,  sizeof(wgc), &wgc, NULL);
+                fprintf(stderr, "[COK-DP4A] unroll %s private=%5llu local=%6llu wg_cap=%4zu nsg=%d%s\n",
+                        variants[vi].name, (unsigned long long)pmc,
+                        (unsigned long long)lmc, wgc, nsg_eff,
+                        vi == wanti ? "  <= USED" : "");
+            }
+            if (vi == wanti && vk) {
+                backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a = vk;
+                backend_ctx->q4k_cok_dp4a_nsg_eff = nsg_eff;
+            } else if (vk) {
+                CL_CHECK(clReleaseKernel(vk));
+            }
+            CL_CHECK(clReleaseProgram(vprog));
         }
-        CL_CHECK(clReleaseProgram(prog));
+        fflush(stderr);
         GGML_LOG_INFO("ggml_opencl: q4_K cok+dp4a narrow GEMM %s (COK_NSG=%d)\n",
                       backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a ? "loaded" : "UNAVAILABLE",
                       backend_ctx->q4k_cok_dp4a_nsg_eff);

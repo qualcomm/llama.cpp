@@ -113,12 +113,14 @@ kernel void kernel_gemm_cok_q4_k_q8_1_dp4a(
 
         // 8 sub-steps of 4 K values each.
         //
-        // Deliberately NOT unrolled, here or over the columns below. Measured on X2-90:
-        // unrolling both takes private memory from 496 to 928 B/lane, past the 512 B/WI
-        // spill cliff, and drops the kernel's launchable workgroup from 512 to 256 --
-        // which halves COK_NSG, so the K-split loses half its parallelism as well. The
-        // 1.67x arithmetic advantage this kernel exists to test is far smaller than what
-        // that cliff costs.
+        // The two unroll axes are SEPARATE decisions and were first measured together,
+        // which was a mistake. Unrolling the COLUMN loop below is what lets s0..s3 be
+        // register-allocated at all: they are indexed by the column, so leaving that loop
+        // rolled forces them into private memory and puts a scratch round-trip on every
+        // dp4a. Unrolling THIS loop only adds live values.
+#ifdef COK_UNROLL_U
+        #pragma unroll
+#endif
         for (int u = 0; u < 8; ++u) {
             const int ku = (i >> 2) + u;                       // K/4 index
             ushort4 bits = vload4(0, src0_q + row0 + ku * m);  // 4 rows x 4 K nibbles
@@ -127,6 +129,9 @@ kernel void kernel_gemm_cok_q4_k_q8_1_dp4a(
             const uint w2 = EXP4(bits.s2);
             const uint w3 = EXP4(bits.s3);
 
+#ifndef COK_NO_UNROLL_C
+            #pragma unroll
+#endif
             for (int c = 0; c < 8; ++c) {
                 // Columns past n_no_padding are computed and thrown away at the store.
                 // Clamping to a real column keeps every read in bounds and initialised,
