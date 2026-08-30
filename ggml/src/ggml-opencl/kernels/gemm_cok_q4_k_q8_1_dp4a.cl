@@ -112,7 +112,9 @@ kernel void kernel_gemm_cok_q4_k_q8_1_dp4a(
         for (int c = 0; c < 8; ++c) { s0[c] = 0; s1[c] = 0; s2[c] = 0; s3[c] = 0; }
 
         // 8 sub-steps of 4 K values each
+#ifndef COK_NO_UNROLL
         #pragma unroll
+#endif
         for (int u = 0; u < 8; ++u) {
             const int ku = (i >> 2) + u;                       // K/4 index
             ushort4 bits = vload4(0, src0_q + row0 + ku * m);  // 4 rows x 4 K nibbles
@@ -121,7 +123,9 @@ kernel void kernel_gemm_cok_q4_k_q8_1_dp4a(
             const uint w2 = EXP4(bits.s2);
             const uint w3 = EXP4(bits.s3);
 
+#ifndef COK_NO_UNROLL
             #pragma unroll
+#endif
             for (int c = 0; c < 8; ++c) {
                 const uint a = src1_qa[(uint)c * k_u + ku];
                 s0[c] = dot_acc_sat_4x8packed_ss_int(w0, a, s0[c]);
@@ -147,6 +151,42 @@ kernel void kernel_gemm_cok_q4_k_q8_1_dp4a(
         da.s6 = (float)src1_da[6*k_b + blk];  sa.s6 = (float)src1_sa[6*k_b + blk];
         da.s7 = (float)src1_da[7*k_b + blk];  sa.s7 = (float)src1_sa[7*k_b + blk];
 
+#ifdef COK_FUSE_CONVERT
+        // Convert straight into the accumulator: the four float8 temporaries below are
+        // pure liveness, and this kernel is over the 512 B/WI spill cliff.
+        acc0.s0 += sc0 * da.s0 * (float)s0[0] - mv0 * sa.s0;
+        acc0.s1 += sc0 * da.s1 * (float)s0[1] - mv0 * sa.s1;
+        acc0.s2 += sc0 * da.s2 * (float)s0[2] - mv0 * sa.s2;
+        acc0.s3 += sc0 * da.s3 * (float)s0[3] - mv0 * sa.s3;
+        acc0.s4 += sc0 * da.s4 * (float)s0[4] - mv0 * sa.s4;
+        acc0.s5 += sc0 * da.s5 * (float)s0[5] - mv0 * sa.s5;
+        acc0.s6 += sc0 * da.s6 * (float)s0[6] - mv0 * sa.s6;
+        acc0.s7 += sc0 * da.s7 * (float)s0[7] - mv0 * sa.s7;
+        acc1.s0 += sc1 * da.s0 * (float)s1[0] - mv1 * sa.s0;
+        acc1.s1 += sc1 * da.s1 * (float)s1[1] - mv1 * sa.s1;
+        acc1.s2 += sc1 * da.s2 * (float)s1[2] - mv1 * sa.s2;
+        acc1.s3 += sc1 * da.s3 * (float)s1[3] - mv1 * sa.s3;
+        acc1.s4 += sc1 * da.s4 * (float)s1[4] - mv1 * sa.s4;
+        acc1.s5 += sc1 * da.s5 * (float)s1[5] - mv1 * sa.s5;
+        acc1.s6 += sc1 * da.s6 * (float)s1[6] - mv1 * sa.s6;
+        acc1.s7 += sc1 * da.s7 * (float)s1[7] - mv1 * sa.s7;
+        acc2.s0 += sc2 * da.s0 * (float)s2[0] - mv2 * sa.s0;
+        acc2.s1 += sc2 * da.s1 * (float)s2[1] - mv2 * sa.s1;
+        acc2.s2 += sc2 * da.s2 * (float)s2[2] - mv2 * sa.s2;
+        acc2.s3 += sc2 * da.s3 * (float)s2[3] - mv2 * sa.s3;
+        acc2.s4 += sc2 * da.s4 * (float)s2[4] - mv2 * sa.s4;
+        acc2.s5 += sc2 * da.s5 * (float)s2[5] - mv2 * sa.s5;
+        acc2.s6 += sc2 * da.s6 * (float)s2[6] - mv2 * sa.s6;
+        acc2.s7 += sc2 * da.s7 * (float)s2[7] - mv2 * sa.s7;
+        acc3.s0 += sc3 * da.s0 * (float)s3[0] - mv3 * sa.s0;
+        acc3.s1 += sc3 * da.s1 * (float)s3[1] - mv3 * sa.s1;
+        acc3.s2 += sc3 * da.s2 * (float)s3[2] - mv3 * sa.s2;
+        acc3.s3 += sc3 * da.s3 * (float)s3[3] - mv3 * sa.s3;
+        acc3.s4 += sc3 * da.s4 * (float)s3[4] - mv3 * sa.s4;
+        acc3.s5 += sc3 * da.s5 * (float)s3[5] - mv3 * sa.s5;
+        acc3.s6 += sc3 * da.s6 * (float)s3[6] - mv3 * sa.s6;
+        acc3.s7 += sc3 * da.s7 * (float)s3[7] - mv3 * sa.s7;
+#else
         float8 d0, d1, d2, d3;
         d0.s0 = (float)s0[0]; d0.s1 = (float)s0[1]; d0.s2 = (float)s0[2]; d0.s3 = (float)s0[3];
         d0.s4 = (float)s0[4]; d0.s5 = (float)s0[5]; d0.s6 = (float)s0[6]; d0.s7 = (float)s0[7];
@@ -161,6 +201,7 @@ kernel void kernel_gemm_cok_q4_k_q8_1_dp4a(
         acc1 += sc1 * da * d1 - mv1 * sa;
         acc2 += sc2 * da * d2 - mv2 * sa;
         acc3 += sc3 * da * d3 - mv3 * sa;
+#endif
     }
 
     // Cross-subgroup reduction over the K-split, one row at a time so the __local buffer
