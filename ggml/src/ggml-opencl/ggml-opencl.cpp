@@ -33811,6 +33811,17 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
             backend_ctx->prealloc_moe_da.allocate(context, nb * sizeof(cl_half));
             backend_ctx->prealloc_moe_sa.allocate(context, nb * sizeof(cl_half));
 
+            // Debug-only, env-gated: a clFinish after each enqueue so a stall names the
+            // kernel that caused it rather than just the dispatch. The earlier version of
+            // this probe was spliced away by a later edit, and its silence was then
+            // misread as "the kernel never ran".
+            const bool cok_trace = getenv("GGML_OPENCL_Q4K_COK_DP4A_TRACE") != nullptr;
+            if (cok_trace) {
+                fprintf(stderr, "[COK-DP4A] ENTER M=%d N=%d K=%d nsg=%d\n",
+                        ne01, (int)ne1, K, backend_ctx->q4k_cok_dp4a_nsg_eff);
+                fflush(stderr);
+            }
+
             cl_int tbq = (cl_int)((size_t)N * (K / 32));
             cl_kernel qk = backend_ctx->kernel_quant_a_q8_1;
             CL_CHECK(clSetKernelArg(qk, 0, sizeof(cl_mem), &b_sub_buf));
@@ -33821,6 +33832,10 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
             size_t q_local[1]  = { 64 };
             size_t q_global[1] = { (size_t)((((size_t)tbq + 63) / 64) * 64) };
             backend_ctx->enqueue_ndrange_kernel(qk, 1, q_global, q_local, dst);
+            if (cok_trace) {
+                CL_CHECK(clFinish(backend_ctx->queue));
+                fprintf(stderr, "[COK-DP4A] quant_a_q8_1 done\n"); fflush(stderr);
+            }
 
             cl_kernel ck = backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a;
             CL_CHECK(clSetKernelArg(ck,  0, sizeof(cl_mem),   &extra0_q4_k->q));
@@ -33847,6 +33862,10 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
             size_t c_local[3]  = { 64, cok_nsg, 1 };
             size_t c_global[3] = { (size_t)(ne01 / 4), cok_nsg, 1 };
             backend_ctx->enqueue_ndrange_kernel(ck, 3, c_global, c_local, dst);
+            if (cok_trace) {
+                CL_CHECK(clFinish(backend_ctx->queue));
+                fprintf(stderr, "[COK-DP4A] gemm done\n"); fflush(stderr);
+            }
 
             CL_CHECK(clReleaseMemObject(b_sub_buf));
             return;
