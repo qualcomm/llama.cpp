@@ -3096,8 +3096,9 @@ static int hmx_mm_id_2d_f32(struct htp_context *ctx,
     htp_mm_hmx_get_2d_chunk_costs(weight_type, k, /*pipeline=*/false, aligned_tile_size,
                                   &size_per_n, &size_per_m, &size_per_mn);
 
+    const size_t overhead = htp_mm_hmx_get_2d_overhead(/*pipeline=*/false, /*is_matmul_id=*/true);
     size_t m_chunk_n_rows = 0, n_chunk_n_cols = 0;
-    if (htp_mm_hmx_compute_chunks(vtcm_budget, /*overhead=*/256, size_per_n, size_per_m, size_per_mn,
+    if (htp_mm_hmx_compute_chunks(vtcm_budget, overhead, size_per_n, size_per_m, size_per_mn,
                            m_padded, n,
                            /*m_block_cost=*/(size_t) n * HTP_MM_HMX_COST_W_DEQUANT,
                            /*n_block_cost=*/(size_t) m_padded * HTP_MM_HMX_COST_A_CONVERT, &m_chunk_n_rows, &n_chunk_n_cols, &vtcm_used)) {

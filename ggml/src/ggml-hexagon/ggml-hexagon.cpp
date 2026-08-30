@@ -3411,7 +3411,8 @@ static bool ggml_hexagon_matmul_is_hmx_eligible(
         return false;
     }
 
-    // M alignment: Use HMX when M > HTP_MM_HMX_MIN_NROWS
+    // M alignment: Use HMX when M > HTP_MM_HMX_MIN_NROWS.
+    // For MUL_MAT_ID, src1 shape is [K, n_expert_used, n_tokens, 1], so n_tokens is ne12.
     const int m = is_matmul_id ? ne12 : ne11;
     if (m <= HTP_MM_HMX_MIN_NROWS) {
         return false;

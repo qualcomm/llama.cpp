@@ -300,6 +300,15 @@ static inline void htp_mm_hmx_get_batched_chunk_costs(
     *size_per_mn_out = sizeof(uint16_t);
 }
 
+static inline size_t htp_mm_hmx_get_2d_overhead(bool pipeline, bool is_matmul_id) {
+    size_t num_regions = pipeline ? 7 : (is_matmul_id ? 4 : 5);
+    return num_regions * HTP_MM_HMX_TILE_SIZE + 256;
+}
+
+static inline size_t htp_mm_hmx_get_batched_overhead(void) {
+    return 5 * HTP_MM_HMX_TILE_SIZE + 256;
+}
+
 struct htp_mm_hmx_vtcm_layout {
     // Byte offsets from vtcm_base for each region
     size_t off_weight[2];     // [1] is only used when pipelined
@@ -655,7 +664,7 @@ static inline bool htp_mm_hmx_solve_batched_params(
 
     int act_threads = n_threads;
     while (act_threads >= 1) {
-        size_t group_overhead = 256;
+        size_t group_overhead = htp_mm_hmx_get_batched_overhead();
         size_t group_size_per_n, group_size_per_m, group_size_per_mn;
         htp_mm_hmx_get_batched_chunk_costs(k, group_size, &group_size_per_n, &group_size_per_m, &group_size_per_mn);
 
@@ -722,7 +731,7 @@ static inline bool htp_mm_hmx_solve_2d_params(
 
     int act_threads = n_threads;
     while (act_threads >= 1) {
-        size_t simple_2d_overhead = 256;
+        size_t simple_2d_overhead = htp_mm_hmx_get_2d_overhead(pipeline, is_matmul_id);
         size_t simple_2d_size_per_n, simple_2d_size_per_m, simple_2d_size_per_mn;
         htp_mm_hmx_get_2d_chunk_costs(wtype, k, pipeline, aligned_tile_size, &simple_2d_size_per_n, &simple_2d_size_per_m, &simple_2d_size_per_mn);
 
