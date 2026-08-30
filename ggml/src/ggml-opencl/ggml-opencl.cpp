@@ -528,6 +528,17 @@ static ADRENO_GPU_GEN get_adreno_gpu_gen(const char *device_name) {
 struct ggml_backend_opencl_context;
 static bool adreno_art_compiler_quirks(const ggml_backend_opencl_context *backend_ctx);
 
+// Should the narrow cok+dp4a programs (q4_K / q6_K / q4_0, ne1 2..4) be BUILT at all?
+// Default yes; GGML_OPENCL_COK_DP4A=0 skips the build as well as the dispatch, so opting
+// out costs nothing at init either. The dispatch-side test is
+// ggml_cl_cok_dp4a_narrow_on(), which additionally declines two compilers -- it lives
+// further down because it needs the context.
+static bool ggml_cl_cok_dp4a_build_on() {
+    static const char * const e = getenv("GGML_OPENCL_COK_DP4A");
+    return !(e && *e && atoi(e) == 0);
+}
+
+
 static ggml_cl_compiler_version get_adreno_cl_compiler_version(const char *driver_version) {
     std::string driver_ver_str(driver_version);
     ADRENO_CL_COMPILER_TYPE type = ADRENO_CL_COMPILER_TYPE::E031;
@@ -8438,7 +8449,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
     // Built only when asked for. It is an experiment against the default cok dispatch,
     // and an unconditional build would cost a program compile at init on every device
     // that will never dispatch it.
-    if (backend_ctx->has_integer_dot_product && getenv("GGML_OPENCL_Q4K_COK_DP4A")) {
+    if (backend_ctx->has_integer_dot_product && ggml_cl_cok_dp4a_build_on()) {
 #ifdef GGML_OPENCL_EMBED_KERNELS
         const std::string kernel_src {
             #include "gemm_cok_q4_k_q8_1_dp4a.cl.h"
@@ -8514,7 +8525,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
     // muse-glimmer-30B is q6_K on 26 of 52 layers (ffn_down), so a q4_K-only arm leaves
     // half the narrow-band matmul time untouched -- which is why the q4_K win measured
     // +4% at the kernel and only +3.3% on the model.
-    if (backend_ctx->has_integer_dot_product && getenv("GGML_OPENCL_Q4K_COK_DP4A")) {
+    if (backend_ctx->has_integer_dot_product && ggml_cl_cok_dp4a_build_on()) {
 #ifdef GGML_OPENCL_EMBED_KERNELS
         const std::string kernel_src {
             #include "gemm_cok_q6_k_q8_1_dp4a.cl.h"
@@ -8561,7 +8572,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
     //
     // muse is q4_K + q6_K and is covered by the two above. Qwen3.8-27B-Q4_0 and
     // Nemotron-30B-A3B-Q4_0 are q4_0 and are covered by neither.
-    if (backend_ctx->has_integer_dot_product && getenv("GGML_OPENCL_Q4K_COK_DP4A")) {
+    if (backend_ctx->has_integer_dot_product && ggml_cl_cok_dp4a_build_on()) {
 #ifdef GGML_OPENCL_EMBED_KERNELS
         const std::string kernel_src {
             #include "gemm_cok_q4_0_q8_1_dp4a.cl.h"
@@ -16162,6 +16173,37 @@ static bool ggml_cl_iq2xs_is_split(const ggml_backend_opencl_context * backend_c
 // is off there, so the kernel is unreachable and this costs it nothing. Its own
 // GEMM is UNMEASURED -- an A/B on the 619 returned the identical number in both
 // arms, which means the kernel never dispatched, not that it passed.
+// Is this shape one the narrow cok+dp4a GEMMs (q4_K / q6_K / q4_0) will serve?
+//
+// DEFAULT ON; opt out with GGML_OPENCL_COK_DP4A=0. Measured against the previous default
+// dispatch on an Adreno X2-90:
+//   Qwen3.8-27B-Q4_0   pp2 +10.8%  pp3 +9.0%   pp4 +10.5%   pp8 unchanged
+//   muse-glimmer-30B   pp2 +3.0%   pp3 +3.9%   pp4 +3.9%    pp8 unchanged
+// The q4_0 figure is larger only because that model is entirely q4_0; muse splits across
+// q4_K and q6_K, so its gain is the coverage-weighted average.
+//
+// ne1 2..4 and no wider: per row per 32-K block a half8 FMA issues 32 ops (eight columns
+// wide whatever ne1 is) while dp4a issues 8 x ne1, so int8 wins at 2, ties at 4 and loses
+// at 8. That crossover is the instruction set, not a tuning constant.
+//
+// DECLINED on two unrelated compilers, and they need two different tests: A7X and older
+// (E031.41) by capability level, and the 850's E17 by compiler class -- the 850 is classed
+// A8X, a NEWER level, so the level test alone lets it straight through. Both miscompile
+// this kernel family; see the callers' comments for the failing shapes.
+static bool ggml_cl_cok_dp4a_narrow_on(const ggml_backend_opencl_context * backend_ctx,
+                                       int64_t ne1, int64_t ne01, int64_t ne00, int rows) {
+    static const char * const e = getenv("GGML_OPENCL_COK_DP4A");
+    if (e && *e && atoi(e) == 0) {
+        return false;
+    }
+    return backend_ctx->has_integer_dot_product
+        && ggml_cl_kquant_plane_dp4a_gemm_on(backend_ctx)
+        && !adreno_art_compiler_quirks(backend_ctx)
+        && ne1 >= 2 && ne1 <= 4
+        && rows > 0 && (ne01 % (64 * rows)) == 0
+        && (ne00 % 32) == 0;
+}
+
 static bool ggml_cl_kquant_plane_dp4a_gemm_on(const ggml_backend_opencl_context * backend_ctx) {
     static const char * const e = getenv("GGML_OPENCL_KQUANT_PLANE_DP4A_GEMM");
     if (e && *e) {
@@ -31458,7 +31500,13 @@ static void ggml_cl_mul_mat_q4_0_f32_adreno(ggml_backend_t backend, const ggml_t
     static const char * q40_mc3_maxn_env = getenv("GGML_OPENCL_Q40_MC3_MAXN");
     const int q40_mc3_maxn = q40_mc3_maxn_env ? MIN(atoi(q40_mc3_maxn_env), 4)
                                              : (q40_cok_r4_would_run ? 2 : 4);
-    const bool use_q40_mc3 = q40_mc3 && (ne1 >= 2 && ne1 <= q40_mc3_maxn) && (ne01 < 32768);
+    // Same yield as the q4_K path: the narrow cok+dp4a GEMM is downstream of this branch.
+    const bool q40_cok_dp4a_takes_it =
+        ggml_cl_cok_dp4a_narrow_on(backend_ctx, ne1, ne01, ne00, backend_ctx->q40_cok_dp4a_rows)
+        && ((ne1 <= 2) ? backend_ctx->kernel_gemm_cok_q4_0_q8_1_dp4a_c2
+                       : backend_ctx->kernel_gemm_cok_q4_0_q8_1_dp4a) != nullptr;
+    const bool use_q40_mc3 = q40_mc3 && !q40_cok_dp4a_takes_it
+                          && (ne1 >= 2 && ne1 <= q40_mc3_maxn) && (ne01 < 32768);
 
     if (ne1 == 1 || use_q40_mc3) {
         cl_mem q_img = nullptr;
@@ -31770,15 +31818,10 @@ static void ggml_cl_mul_mat_q4_0_f32_adreno(ggml_backend_t backend, const ggml_t
         //
         // q4_0 is the simplest of the three: (q - 8) * d with one scale per 32-K block and
         // no min, so no sum_act correction and a single dot flush per block.
-        static const char * q40_cok_dp4a_env = getenv("GGML_OPENCL_Q4K_COK_DP4A");
-        if (q40_cok_dp4a_env && atoi(q40_cok_dp4a_env) != 0
-            && ggml_cl_kquant_plane_dp4a_gemm_on(backend_ctx)
-            && !adreno_art_compiler_quirks(backend_ctx)
-            && backend_ctx->has_integer_dot_product
-            && ne1 >= 2 && ne1 <= 4
+
+        if (ggml_cl_cok_dp4a_narrow_on(backend_ctx, ne1, ne01, ne00, backend_ctx->q40_cok_dp4a_rows)
             && ((ne1 <= 2) ? backend_ctx->kernel_gemm_cok_q4_0_q8_1_dp4a_c2
-                           : backend_ctx->kernel_gemm_cok_q4_0_q8_1_dp4a) != nullptr
-            && ne01 % (64 * backend_ctx->q40_cok_dp4a_rows) == 0 && ne00 % 32 == 0) {
+                           : backend_ctx->kernel_gemm_cok_q4_0_q8_1_dp4a) != nullptr) {
             const int N40 = (int)ne1, K40 = (int)ne00;
             const int w40 = (N40 <= 2) ? 2 : 4;
 
@@ -33758,7 +33801,15 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
     static const char * q4k_mc3_maxn_env = getenv("GGML_OPENCL_Q4K_MC3_MAXN");
     const int q4k_mc3_maxn = q4k_mc3_maxn_env ? MIN(atoi(q4k_mc3_maxn_env), 4)
                                               : (cok_r4_would_run ? 2 : 4);
-    const bool use_mc3 = q4k_mc3 && (ne1 >= 2 && ne1 <= q4k_mc3_maxn) && (ne01 < 32768);
+    // The narrow cok+dp4a GEMM sits in the ELSE of the branch below, so mc3 would intercept
+    // ne1 2..4 and return before it ever ran. Yield: the A/B that measured the dp4a win used
+    // the default (mc3 on) as its control, so this is the comparison that was made.
+    const bool cok_dp4a_takes_it =
+        ggml_cl_cok_dp4a_narrow_on(backend_ctx, ne1, ne01, ne00, backend_ctx->q4k_cok_dp4a_rows)
+        && ((ne1 <= 2) ? backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a_c2
+                       : backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a) != nullptr;
+    const bool use_mc3 = q4k_mc3 && !cok_dp4a_takes_it
+                      && (ne1 >= 2 && ne1 <= q4k_mc3_maxn) && (ne01 < 32768);
 
     if (ne1 == 1 || use_mc3) {
         cl_mem q_img = nullptr;
@@ -34018,7 +34069,7 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
         // inner product, so it pays for the q8_1 activation pre-pass cok avoids
         // entirely. Whether that pre-pass eats the 1.67x arithmetic advantage is the
         // whole question; see feature-report/cok-dp4a-scope-2026-08-30.md.
-        static const char * q4k_cok_dp4a_env = getenv("GGML_OPENCL_Q4K_COK_DP4A");
+
         // Upper end of the band. 4 by default: ne1 5..8 goes through the 8-column
         // build, which is not yet competitive. Adjustable so that half can be swept
         // without a rebuild.
@@ -34034,12 +34085,10 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
         //    is the compiler; this is the same pairing the Q2_K/Q3_K plane GEMMs already use.
         //
         // An Adreno 840 and an X2-90 run the identical binary and shapes clean.
-        if (q4k_cok_dp4a_env && atoi(q4k_cok_dp4a_env) != 0
-            && ggml_cl_kquant_plane_dp4a_gemm_on(backend_ctx)
-            && !adreno_art_compiler_quirks(backend_ctx)
-            && backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a != nullptr
-            && ne1 >= 2 && ne1 <= q4k_cok_dp4a_maxn
-            && ne01 % (64 * backend_ctx->q4k_cok_dp4a_rows) == 0 && K % 32 == 0) {
+        if (ggml_cl_cok_dp4a_narrow_on(backend_ctx, ne1, ne01, ne00, backend_ctx->q4k_cok_dp4a_rows)
+            && ne1 <= q4k_cok_dp4a_maxn
+            && ((ne1 <= 2) ? backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a_c2
+                           : backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a) != nullptr) {
             // ne1 2..4. Measured against the default dispatch (test-backend-ops perf,
             // m=4096 k=14336): 325/351/357 us against 341/366/368, so +4.7/+4.1/+3.0%.
             //
@@ -35197,20 +35246,16 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
         // q6_K needs no min term: a value is (q - 32) * ss * d, so the q8_1 block sum the
         // q4_K kernel carries is not used here. Only the scale is finer -- ss is per 16 K,
         // so the dp4a accumulator flushes twice per 32-K block.
-        static const char * q6k_cok_dp4a_env = getenv("GGML_OPENCL_Q4K_COK_DP4A");
+
         const bool is_output_w_cok = strncmp(src0->name, "output", 6) == 0 ||
                                      strncmp(src0->name, "token_embd", 10) == 0;
         // Same decline as the q4_K twin. The q6_K shapes test-backend-ops asks for do not
         // meet this path's ne01 % 256 gate, so on A7X this kernel is UNTESTED rather than
         // known good -- and the sibling kernel demonstrably miscompiles on that compiler.
-        if (q6k_cok_dp4a_env && atoi(q6k_cok_dp4a_env) != 0
-            && ggml_cl_kquant_plane_dp4a_gemm_on(backend_ctx)
-            && !adreno_art_compiler_quirks(backend_ctx)
-            && ((ne1 <= 2) ? backend_ctx->kernel_gemm_cok_q6_k_q8_1_dp4a_c2
-                           : backend_ctx->kernel_gemm_cok_q6_k_q8_1_dp4a) != nullptr
+        if (ggml_cl_cok_dp4a_narrow_on(backend_ctx, ne1, ne01, ne00, backend_ctx->q6k_cok_dp4a_rows)
             && !is_output_w_cok
-            && ne1 >= 2 && ne1 <= 4
-            && ne01 % (64 * backend_ctx->q6k_cok_dp4a_rows) == 0 && ne00 % 32 == 0) {
+            && ((ne1 <= 2) ? backend_ctx->kernel_gemm_cok_q6_k_q8_1_dp4a_c2
+                           : backend_ctx->kernel_gemm_cok_q6_k_q8_1_dp4a) != nullptr) {
             const int    N6   = (int)ne1, K6 = (int)ne00;
             const int    w6   = (N6 <= 2) ? 2 : 4;
             const size_t nb6  = (size_t)w6 * (K6 / 32);
