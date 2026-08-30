@@ -61,13 +61,12 @@
 #define COK_COLS 8
 #endif
 
-// Activation load width, in K-groups per load. A 32-K block is 8 K-groups, so 8 loads the
-// whole block for one column in a single vload8 and halves the load count against two
-// vload4. It doubles the live activation registers, which is why it is a switch: the
-// 8-column build holds 8 of them.
-#ifndef COK_KWIDE
-#define COK_KWIDE 4
-#endif
+// LOADS ARE 16 BYTES. vload4 of a 32-bit type is the widest useful load here: the native
+// access is 128-bit, so a vload8 of uint (32 B) splits into two transactions anyway and
+// buys nothing, while doubling the live registers. Measured: the 8-column build with
+// vload8 STALLED outright -- 8 x uint8 is 256 B of live activation, over the spill cliff.
+// If 8 values of a 16-bit type are wanted, load 16 bytes and reinterpret (as_half8), do
+// not issue a wider vload.
 
 // Debug bisect: 1 = launch geometry only, 2 = K loop without the reduction, 3 = full.
 #ifndef COK_STAGE
@@ -258,27 +257,6 @@ kernel void kernel_gemm_cok_q4_k_q8_1_dp4a(
         cok_dotv s2 = (cok_dotv)(0), s3 = (cok_dotv)(0);
 #endif
 
-#if COK_KWIDE == 8
-        // One load covers the whole 32-K block for a column: 8 loads for 8 columns rather
-        // than 16. Costs twice the live activation registers.
-        {
-            const int ku0 = i >> 2;
-            uint8 A0 = vload8(0, src1_qa + (uint)c0 * k_u + ku0);
-            uint8 A1 = vload8(0, src1_qa + (uint)c1 * k_u + ku0);
-#if COK_COLS >= 4
-            uint8 A2 = vload8(0, src1_qa + (uint)c2 * k_u + ku0);
-            uint8 A3 = vload8(0, src1_qa + (uint)c3 * k_u + ku0);
-#endif
-#if COK_COLS == 8
-            uint8 A4 = vload8(0, src1_qa + (uint)c4 * k_u + ku0);
-            uint8 A5 = vload8(0, src1_qa + (uint)c5 * k_u + ku0);
-            uint8 A6 = vload8(0, src1_qa + (uint)c6 * k_u + ku0);
-            uint8 A7 = vload8(0, src1_qa + (uint)c7 * k_u + ku0);
-#endif
-            COK_KSTEP(0) COK_KSTEP(1) COK_KSTEP(2) COK_KSTEP(3)
-            COK_KSTEP(4) COK_KSTEP(5) COK_KSTEP(6) COK_KSTEP(7)
-        }
-#else
         // Two groups of four K-groups. The activation for one column across four
         // consecutive K-groups is contiguous, so it is one vload4 rather than four
         // scalar loads.
@@ -302,7 +280,6 @@ kernel void kernel_gemm_cok_q4_k_q8_1_dp4a(
             COK_KSTEP(2)
             COK_KSTEP(3)
         }
-#endif
 
         // q4_K value is (q*scale - min), so per 32-block:
         //   out += scale * d_act * dot(q, a)  -  min * sum_act
