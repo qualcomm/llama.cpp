@@ -8442,8 +8442,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             clCreateKernel(prog, "kernel_gemm_cok_q4_k_q8_1_dp4a", &err);
         if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a = nullptr; }
         CL_CHECK(clReleaseProgram(prog));
-        GGML_LOG_INFO("ggml_opencl: q4_K cok+dp4a narrow GEMM %s (COK_NSG=%d)
-",
+        GGML_LOG_INFO("ggml_opencl: q4_K cok+dp4a narrow GEMM %s (COK_NSG=%d)\n",
                       backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a ? "loaded" : "UNAVAILABLE",
                       backend_ctx->q4k_cok_dp4a_nsg_eff);
         GGML_LOG_CONT(".");
