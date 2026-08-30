@@ -16173,6 +16173,15 @@ static bool ggml_cl_iq2xs_is_split(const ggml_backend_opencl_context * backend_c
 // is off there, so the kernel is unreachable and this costs it nothing. Its own
 // GEMM is UNMEASURED -- an A/B on the 619 returned the identical number in both
 // arms, which means the kernel never dispatched, not that it passed.
+static bool ggml_cl_kquant_plane_dp4a_gemm_on(const ggml_backend_opencl_context * backend_ctx) {
+    static const char * const e = getenv("GGML_OPENCL_KQUANT_PLANE_DP4A_GEMM");
+    if (e && *e) {
+        return atoi(e) != 0;
+    }
+    return !(backend_ctx->gpu_family == GPU_FAMILY::ADRENO
+             && backend_ctx->gen_level <= GEN_LEVEL_A7X);
+}
+
 // Is this shape one the narrow cok+dp4a GEMMs (q4_K / q6_K / q4_0) will serve?
 //
 // DEFAULT ON; opt out with GGML_OPENCL_COK_DP4A=0. Measured against the previous default
@@ -16202,15 +16211,6 @@ static bool ggml_cl_cok_dp4a_narrow_on(const ggml_backend_opencl_context * backe
         && ne1 >= 2 && ne1 <= 4
         && rows > 0 && (ne01 % (64 * rows)) == 0
         && (ne00 % 32) == 0;
-}
-
-static bool ggml_cl_kquant_plane_dp4a_gemm_on(const ggml_backend_opencl_context * backend_ctx) {
-    static const char * const e = getenv("GGML_OPENCL_KQUANT_PLANE_DP4A_GEMM");
-    if (e && *e) {
-        return atoi(e) != 0;
-    }
-    return !(backend_ctx->gpu_family == GPU_FAMILY::ADRENO
-             && backend_ctx->gen_level <= GEN_LEVEL_A7X);
 }
 
 // Q2_K, same contract, but A7X joins X2-class here. Without the split its decode
