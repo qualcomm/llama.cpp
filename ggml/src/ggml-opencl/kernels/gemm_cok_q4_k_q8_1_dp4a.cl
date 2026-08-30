@@ -35,6 +35,15 @@
 #ifndef COK_NSG
 #define COK_NSG 8
 #endif
+
+// Debug bisect, selected at build time from GGML_OPENCL_Q4K_COK_DP4A_STAGE:
+//   1 = launch geometry only (store zeros, no K loop)
+//   2 = K loop, no cross-subgroup reduction
+//   3 = full kernel (default)
+// One build serves all three, so localising a stall costs three runs and no rebuild.
+#ifndef COK_STAGE
+#define COK_STAGE 3
+#endif
 #define COK_SG  64
 
 // One packed q4_K ushort holds 4 consecutive-K nibbles for one row; spread them into the
@@ -103,6 +112,14 @@ kernel void kernel_gemm_cok_q4_k_q8_1_dp4a(
     // Scaled results, one float8 per folded row: 8 columns in the vector lanes, as cok.
     float8 acc0 = (float8)(0.0f), acc1 = (float8)(0.0f);
     float8 acc2 = (float8)(0.0f), acc3 = (float8)(0.0f);
+
+#if COK_STAGE == 1
+    // Every work-item returns, so this is uniform and the barriers below are not reached.
+    if (sg == 0 && row0 < m) {
+        vstore4((float4)(0.0f, 0.0f, 0.0f, 0.0f), 0, dst + row0);
+    }
+    return;
+#endif
 
     for (int blk = sg; blk < num_32blk; blk += COK_NSG) {
         const int i       = blk << 5;
@@ -202,6 +219,13 @@ kernel void kernel_gemm_cok_q4_k_q8_1_dp4a(
         acc2 += sc2 * da * convert_float8(s2) - mv2 * sa;
         acc3 += sc3 * da * convert_float8(s3) - mv3 * sa;
     }
+
+#if COK_STAGE == 2
+    if (sg == 0 && row0 < m) {
+        vstore4((float4)(acc0.s0, acc1.s0, acc2.s0, acc3.s0), 0, dst + row0);
+    }
+    return;
+#endif
 
     // Cross-subgroup reduction over the K-split, one row at a time so the __local buffer
     // stays the size of the 1-row kernel's -- same shape as cok_r4. Written out per row
