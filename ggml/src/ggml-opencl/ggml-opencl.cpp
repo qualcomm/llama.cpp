@@ -8849,8 +8849,10 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         GGML_LOG_CONT(".");
     }
 
-    // gemv_noshuffle_q4_k_f32_tiled — tiled-wide canonical layout, default ON
-    // (opt out: GGML_OPENCL_Q4K_GEMV_TILED=0; separate convert + GEMV; weights via __global).
+    // gemv_noshuffle_q4_k_f32_tiled — tiled-wide canonical layout, default OFF
+    // (opt IN: GGML_OPENCL_Q4K_GEMV_TILED=1; separate convert + GEMV; weights via __global).
+    // q4k_gemv_tiled_enabled() requires the env var to be set and non-zero, and
+    // use_q4k_tiled() further restricts it to ne1 >= 32768 (vocab-scale heads only).
     // int-dot-only kernel; gate the load on the runtime flag (mirrors use_q4k_tiled).
     if (backend_ctx->has_integer_dot_product) {
 #ifdef GGML_OPENCL_EMBED_KERNELS
