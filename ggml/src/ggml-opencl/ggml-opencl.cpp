@@ -33828,9 +33828,14 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
         // entirely. Whether that pre-pass eats the 1.67x arithmetic advantage is the
         // whole question; see feature-report/cok-dp4a-scope-2026-08-30.md.
         static const char * q4k_cok_dp4a_env = getenv("GGML_OPENCL_Q4K_COK_DP4A");
+        // Upper end of the band. 4 by default: ne1 5..8 goes through the 8-column
+        // build, which is not yet competitive. Adjustable so that half can be swept
+        // without a rebuild.
+        static const char * q4k_cok_maxn_env = getenv("GGML_OPENCL_Q4K_COK_DP4A_MAXN");
+        static const int q4k_cok_dp4a_maxn = q4k_cok_maxn_env ? atoi(q4k_cok_maxn_env) : 4;
         if (q4k_cok_dp4a_env && atoi(q4k_cok_dp4a_env) != 0
             && backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a != nullptr
-            && ne1 >= 2 && ne1 <= 4
+            && ne1 >= 2 && ne1 <= q4k_cok_dp4a_maxn
             && ne01 % (64 * backend_ctx->q4k_cok_dp4a_rows) == 0 && K % 32 == 0) {
             // ne1 2..4. Measured against the default dispatch (test-backend-ops perf,
             // m=4096 k=14336): 325/351/357 us against 341/366/368, so +4.7/+4.1/+3.0%.
@@ -33869,7 +33874,7 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
             // pad, so one fill per size keeps it zero for every later dispatch. Growth is
             // rare, which also keeps this off the recordable-queue capture path where a
             // buffer fill would not be legal.
-            const int    cok_w    = (ne1 <= 2) ? 2 : 4;
+            const int    cok_w    = (ne1 <= 2) ? 2 : (ne1 <= 4 ? 4 : 8);
             const size_t qa_bytes = (size_t)cok_w * K * sizeof(cl_char);
             const size_t nb       = (size_t)cok_w * (K / 32);
             const size_t qa_was = backend_ctx->prealloc_moe_qa.size;
