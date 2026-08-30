@@ -34614,7 +34614,17 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
             : adreno_dense_dp4a_default_on(backend_ctx);
         const bool is_output_w_dp4a = strncmp(src0->name, "output", 6) == 0 ||
                                       strncmp(src0->name, "token_embd", 10) == 0;
-        if (q6k_dense_dp4a_on && !is_output_w_dp4a && ne1 > 8 && (ne00 % 32 == 0) && (ne01 % 64 == 0)) {
+        // Min N for the dp4a prefill GEMM, the twin of GGML_OPENCL_Q4K_DP4A_MINN.
+        // Default 9 preserves the previous `ne1 > 8`. Lowered via env to A/B the
+        // verify regime (ne1=2..8), which needs BOTH quants moved together: on
+        // muse-glimmer-30B ffn_down is q6_K on 26 of 52 layers, so a q4_K-only arm
+        // measures a diluted delta (the same trap as the mid-tile round).
+        // Pair it with GGML_OPENCL_Q6K_DP4A_TS_NARROW=8 / _NARROW_MAX=8 -- the
+        // kernel computes a full padded tile, so routing ne1=2 to a 16-wide tile
+        // pays 8x the columns and is why the first 2..8 probe lost.
+        static const char * q6k_dp4a_minn_env = getenv("GGML_OPENCL_Q6K_DP4A_MINN");
+        const int           q6k_dp4a_minn     = q6k_dp4a_minn_env ? atoi(q6k_dp4a_minn_env) : 9;
+        if (q6k_dense_dp4a_on && !is_output_w_dp4a && ne1 >= q6k_dp4a_minn && (ne00 % 32 == 0) && (ne01 % 64 == 0)) {
             const int M = ne01, N = ne1, K = ne00;
             const size_t n_blocks = (size_t)N * (K / 32);
             backend_ctx->prealloc_moe_qa.allocate(context, (size_t)N * K * sizeof(cl_char));
