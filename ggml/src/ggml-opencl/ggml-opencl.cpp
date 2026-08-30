@@ -36249,7 +36249,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             unsigned long long n[8]  = {0};
             unsigned long long q4[8] = {0};
             unsigned long long q6[8] = {0};
-            ~ne1_hist() {
+            void dump() {
                 static const char * lbl[8] = {"1","2","3","4","5-8","9-16","17-64",">64"};
                 unsigned long long tot = 0;
                 for (int i = 0; i < 8; i++) { tot += n[i]; }
@@ -36263,6 +36263,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             }
         };
         static ne1_hist H;
+        static unsigned long long seen = 0;
         const int64_t w = dst->ne[1];
         const int b = (w <= 4) ? (int)(w - 1)
                     : (w <= 8) ? 4 : (w <= 16) ? 5 : (w <= 64) ? 6 : 7;
@@ -36270,6 +36271,9 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             H.n[b]++;
             if (src0->type == GGML_TYPE_Q4_K) { H.q4[b]++; }
             if (src0->type == GGML_TYPE_Q6_K) { H.q6[b]++; }
+            // Periodic, not a destructor: llama-cli's exit path does not run it, and a run
+            // that produced the answer but printed nothing wasted a whole cycle.
+            if (++seen % 20000 == 0) { H.dump(); }
         }
     }
 
