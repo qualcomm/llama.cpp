@@ -33890,7 +33890,13 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
         // without a rebuild.
         static const char * q4k_cok_maxn_env = getenv("GGML_OPENCL_Q4K_COK_DP4A_MAXN");
         static const int q4k_cok_dp4a_maxn = q4k_cok_maxn_env ? atoi(q4k_cok_maxn_env) : 4;
+        // Declined on A7X and older, alongside the plane dp4a prefill GEMMs. This kernel
+        // has the same defect on the same compiler: an Adreno 740 fails MUL_MAT q4_K at
+        // m=512 n=2 and n=4 with the arm on and passes with it off, while an Adreno 840 and
+        // an X2-90 running the identical binary and shapes are clean. Correctness, not
+        // performance -- so it is a decline, not a tuning gate.
         if (q4k_cok_dp4a_env && atoi(q4k_cok_dp4a_env) != 0
+            && ggml_cl_kquant_plane_dp4a_gemm_on(backend_ctx)
             && backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a != nullptr
             && ne1 >= 2 && ne1 <= q4k_cok_dp4a_maxn
             && ne01 % (64 * backend_ctx->q4k_cok_dp4a_rows) == 0 && K % 32 == 0) {
@@ -35054,7 +35060,11 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
         static const char * q6k_cok_dp4a_env = getenv("GGML_OPENCL_Q4K_COK_DP4A");
         const bool is_output_w_cok = strncmp(src0->name, "output", 6) == 0 ||
                                      strncmp(src0->name, "token_embd", 10) == 0;
+        // Same decline as the q4_K twin. The q6_K shapes test-backend-ops asks for do not
+        // meet this path's ne01 % 256 gate, so on A7X this kernel is UNTESTED rather than
+        // known good -- and the sibling kernel demonstrably miscompiles on that compiler.
         if (q6k_cok_dp4a_env && atoi(q6k_cok_dp4a_env) != 0
+            && ggml_cl_kquant_plane_dp4a_gemm_on(backend_ctx)
             && ((ne1 <= 2) ? backend_ctx->kernel_gemm_cok_q6_k_q8_1_dp4a_c2
                            : backend_ctx->kernel_gemm_cok_q6_k_q8_1_dp4a) != nullptr
             && !is_output_w_cok
