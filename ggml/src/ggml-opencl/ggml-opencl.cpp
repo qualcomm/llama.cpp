@@ -1908,6 +1908,11 @@ struct ggml_backend_opencl_context {
     int q5k_cok_nsg_eff    = 8;
     int q6k_cok_nsg_eff    = 8;
     int q80_cok_nsg_eff    = 8;
+    // cok-shaped q4_K GEMM with a dp4a inner dot, for the narrow band ne1 = 2..8.
+    // Opt-in (GGML_OPENCL_Q4K_COK_DP4A): it exists to test whether int8 arithmetic
+    // beats the f16 cok kernel there, so it must not displace the default dispatch.
+    cl_kernel kernel_gemm_cok_q4_k_q8_1_dp4a = nullptr;
+    int       q4k_cok_dp4a_nsg_eff = 8;
     int q4k_dp4a_ts_narrow = 32;  // tile for the verify band; == q4k_dp4a_ts disables the split
     int q4k_dp4a_narrow_max = 16; // widest ne1 routed to the narrow tile
     int q4k_dp4a_ts_mid    = 24;  // tile for ne1 in (narrow_max, mid_max]
@@ -8412,6 +8417,35 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             fflush(stderr);
         }
         CL_CHECK(clReleaseProgram(prog));
+        GGML_LOG_CONT(".");
+    }
+
+    // gemm_cok_q4_k_q8_1_dp4a (cok-shaped narrow GEMM, dp4a inner dot; ne1 = 2..8)
+    //
+    // Built only when asked for. It is an experiment against the default cok dispatch,
+    // and an unconditional build would cost a program compile at init on every device
+    // that will never dispatch it.
+    if (backend_ctx->has_integer_dot_product && getenv("GGML_OPENCL_Q4K_COK_DP4A")) {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src {
+            #include "gemm_cok_q4_k_q8_1_dp4a.cl.h"
+        };
+#else
+        const std::string kernel_src = read_file("gemm_cok_q4_k_q8_1_dp4a.cl");
+#endif
+        int nsg_req = 8;
+        if (const char * e = getenv("GGML_OPENCL_Q4K_COK_DP4A_NSG")) { nsg_req = atoi(e); }
+        cl_program prog = ggml_cl_build_cok_program(
+            backend_ctx, kernel_src.c_str(), compile_opts, nsg_req,
+            &backend_ctx->q4k_cok_dp4a_nsg_eff);
+        backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a =
+            clCreateKernel(prog, "kernel_gemm_cok_q4_k_q8_1_dp4a", &err);
+        if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a = nullptr; }
+        CL_CHECK(clReleaseProgram(prog));
+        GGML_LOG_INFO("ggml_opencl: q4_K cok+dp4a narrow GEMM %s (COK_NSG=%d)
+",
+                      backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a ? "loaded" : "UNAVAILABLE",
+                      backend_ctx->q4k_cok_dp4a_nsg_eff);
         GGML_LOG_CONT(".");
     }
 
