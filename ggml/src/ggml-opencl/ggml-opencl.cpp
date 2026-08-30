@@ -33817,6 +33817,16 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
                                              &z16, sizeof(z16), 0, nb_pad * sizeof(cl_half), 0, NULL, NULL));
             }
 
+            // An env-gated arm on this file has been vacuous three times because the
+            // dispatch never reached the kernel under test. Say so, once.
+            static int n_cok_dp4a_fired = 0;
+            if (n_cok_dp4a_fired < 8) {
+                n_cok_dp4a_fired++;
+                fprintf(stderr, "[COK-DP4A] FIRED M=%d N=%d K=%d nsg=%d\n",
+                        ne01, (int)ne1, K, backend_ctx->q4k_cok_dp4a_nsg_eff);
+                fflush(stderr);
+            }
+
             cl_int tbq = (cl_int)((size_t)N * (K / 32));
             cl_kernel qk = backend_ctx->kernel_quant_a_q8_1;
             CL_CHECK(clSetKernelArg(qk, 0, sizeof(cl_mem), &b_sub_buf));
