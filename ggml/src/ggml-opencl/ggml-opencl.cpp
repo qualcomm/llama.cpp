@@ -33830,8 +33830,15 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
         static const char * q4k_cok_dp4a_env = getenv("GGML_OPENCL_Q4K_COK_DP4A");
         if (q4k_cok_dp4a_env && atoi(q4k_cok_dp4a_env) != 0
             && backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a != nullptr
-            && ne1 >= 2 && ne1 <= 8
+            && (ne1 == 2 || ne1 == 4)
             && ne01 % (64 * backend_ctx->q4k_cok_dp4a_rows) == 0 && K % 32 == 0) {
+            // EXACT width only, and that is a measurement, not a simplification. A lane
+            // computes its whole column width whatever ne1 is, and the 4-column build costs
+            // 483 us at ne1=2, 443 at ne1=3 and 353 at ne1=4 for identical work -- it is
+            // fastest precisely when the batch fills it. Against a 368 us control that is a
+            // win at 4 and a loss at 3, so only the widths that are actually built get the
+            // arm. ne1 5..8 stays on cok: the 8-column build needs COK_NSG 8 to compete and
+            // deadlocks there, and at 4 it runs 692/576 us against a 370/374 control.
             // ne01 % 256, not % 4: one lane covers 4 rows and the workgroup is 64
             // lanes wide, so the row axis must divide evenly. Padding the global size
             // instead would create lanes with row0 >= ne01, and the kernel guards the
