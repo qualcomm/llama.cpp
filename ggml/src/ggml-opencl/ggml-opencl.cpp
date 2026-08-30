@@ -33890,6 +33890,15 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
                                              &z16, sizeof(z16), 0, backend_ctx->prealloc_moe_sa.size, 0, NULL, NULL));
             }
 
+            // Debug-only: a clFinish after each enqueue so a stall names the kernel
+            // that caused it rather than just the dispatch.
+            const bool cok_trace = getenv("GGML_OPENCL_Q4K_COK_DP4A_TRACE") != nullptr;
+            if (cok_trace) {
+                fprintf(stderr, "[COK-DP4A] ENTER M=%d N=%d K=%d cols=%d nsg=%d\n",
+                        ne01, (int)ne1, K, cok_w, cok_nsg_sel);
+                fflush(stderr);
+            }
+
             cl_int tbq = (cl_int)((size_t)N * (K / 32));
             cl_kernel qk = backend_ctx->kernel_quant_a_q8_1;
             CL_CHECK(clSetKernelArg(qk, 0, sizeof(cl_mem), &b_sub_buf));
