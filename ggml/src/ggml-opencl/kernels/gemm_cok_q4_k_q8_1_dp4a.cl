@@ -15,13 +15,19 @@
 // kernel answers is whether that beats the q8_1 activation pre-pass it forces, which cok
 // avoids entirely -- a fixed per-dispatch cost, and fixed costs hurt most at narrow batch.
 //
-// REGISTER BUDGET IS THE TOP RISK. The same microbench measured half8 collapsing 43x
-// (3113 -> 72.6 GMAC/s) purely from crossing the 512 B/WI spill cliff. This kernel holds
-// 32 int dot accumulators (128 B) + 4 float8 (128 B) + operands ~= 320 B/lane. That is
-// under the cliff but only by ~1.6x, so do not widen it without re-measuring.
+// NO DYNAMICALLY INDEXED PRIVATE ARRAYS, ANYWHERE. This is not a style preference. The
+// accumulators are indexed by column; written as `int s0[8]` they are dynamically indexed,
+// which puts them in private memory and costs a scratch round-trip on every single dp4a.
+// That build never finished one pp2 pass on muse-glimmer-30B -- the process sat on the GPU
+// with its CPU time frozen for minutes. A `#pragma unroll` on the column loop is only a
+// hint and did NOT rescue it. Vector components are addressed by name and cannot be
+// spilled that way, so the column dimension is written out explicitly, and the reduction
+// uses named registers rather than a `float8 out[4]` indexed by the row loop variable.
 
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
+#ifdef cl_khr_integer_dot_product
 #pragma OPENCL EXTENSION cl_khr_integer_dot_product : enable
+#endif
 
 #define QK_K          256
 #define K_SCALE_SIZE   12
@@ -50,7 +56,6 @@ inline void get_scale_min_k4_c(int j, global const uchar * q, int stride,
     }
 }
 
-__attribute__((qcom_wave_pair_mode(1)))
 kernel void kernel_gemm_cok_q4_k_q8_1_dp4a(
     global const ushort * src0_q,     // q4_K nibble plane   [row + (K/4)*m]
     global const uchar  * src0_s,     // packed scales/mins
@@ -80,6 +85,21 @@ kernel void kernel_gemm_cok_q4_k_q8_1_dp4a(
     const int k_u = k >> 2;              // K in uint (int8x4) units
     const int k_b = k >> 5;              // 32-blocks along K
 
+    // Columns past n_no_padding are computed and discarded at the store. Clamp them to a
+    // real column so every read stays in bounds and initialised -- the host then needs no
+    // zero-padded activation buffer, which it could not fill with clEnqueueFillBuffer
+    // anyway while a recordable queue is capturing. Hoisted out of the K loop: these
+    // depend only on the dispatch.
+    const int nl = n_no_padding - 1;
+    const int c0 = 0;
+    const int c1 = (1 < n_no_padding) ? 1 : nl;
+    const int c2 = (2 < n_no_padding) ? 2 : nl;
+    const int c3 = (3 < n_no_padding) ? 3 : nl;
+    const int c4 = (4 < n_no_padding) ? 4 : nl;
+    const int c5 = (5 < n_no_padding) ? 5 : nl;
+    const int c6 = (6 < n_no_padding) ? 6 : nl;
+    const int c7 = (7 < n_no_padding) ? 7 : nl;
+
     // Scaled results, one float8 per folded row: 8 columns in the vector lanes, as cok.
     float8 acc0 = (float8)(0.0f), acc1 = (float8)(0.0f);
     float8 acc2 = (float8)(0.0f), acc3 = (float8)(0.0f);
@@ -105,22 +125,11 @@ kernel void kernel_gemm_cok_q4_k_q8_1_dp4a(
         const float sc2 = (float)dd.s2 * (float)sv2, mv2 = (float)dmm.s2 * (float)mn2;
         const float sc3 = (float)dd.s3 * (float)sv3, mv3 = (float)dmm.s3 * (float)mn3;
 
-        // raw int dot per (folded row, column), reset each 32-block because the weight
-        // scale/min below are per 32-block
-        int s0[8], s1[8], s2[8], s3[8];
-        #pragma unroll
-        for (int c = 0; c < 8; ++c) { s0[c] = 0; s1[c] = 0; s2[c] = 0; s3[c] = 0; }
+        // Raw int dot per (folded row, column), reset each 32-block because the weight
+        // scale and min above are per 32-block. int8 VECTORS, not int[8]: the column index
+        // has to be a name, never a variable (see the header).
+        int8 s0 = (int8)(0), s1 = (int8)(0), s2 = (int8)(0), s3 = (int8)(0);
 
-        // 8 sub-steps of 4 K values each.
-        //
-        // The two unroll axes are SEPARATE decisions and were first measured together,
-        // which was a mistake. Unrolling the COLUMN loop below is what lets s0..s3 be
-        // register-allocated at all: they are indexed by the column, so leaving that loop
-        // rolled forces them into private memory and puts a scratch round-trip on every
-        // dp4a. Unrolling THIS loop only adds live values.
-#ifdef COK_UNROLL_U
-        #pragma unroll
-#endif
         for (int u = 0; u < 8; ++u) {
             const int ku = (i >> 2) + u;                       // K/4 index
             ushort4 bits = vload4(0, src0_q + row0 + ku * m);  // 4 rows x 4 K nibbles
@@ -129,40 +138,57 @@ kernel void kernel_gemm_cok_q4_k_q8_1_dp4a(
             const uint w2 = EXP4(bits.s2);
             const uint w3 = EXP4(bits.s3);
 
-#ifndef COK_NO_UNROLL_C
-            #pragma unroll
-#endif
-            for (int c = 0; c < 8; ++c) {
-                // Columns past n_no_padding are computed and thrown away at the store.
-                // Clamping to a real column keeps every read in bounds and initialised,
-                // so the host does not have to zero a pad -- which it could not do with
-                // a buffer fill anyway while a recordable queue is capturing.
-                const int  cc = (c < n_no_padding) ? c : (n_no_padding - 1);
-                const uint a  = src1_qa[(uint)cc * k_u + ku];
-                s0[c] = dot_acc_sat_4x8packed_ss_int(w0, a, s0[c]);
-                s1[c] = dot_acc_sat_4x8packed_ss_int(w1, a, s1[c]);
-                s2[c] = dot_acc_sat_4x8packed_ss_int(w2, a, s2[c]);
-                s3[c] = dot_acc_sat_4x8packed_ss_int(w3, a, s3[c]);
-            }
+            const uint a0 = src1_qa[(uint)c0 * k_u + ku];
+            const uint a1 = src1_qa[(uint)c1 * k_u + ku];
+            const uint a2 = src1_qa[(uint)c2 * k_u + ku];
+            const uint a3 = src1_qa[(uint)c3 * k_u + ku];
+            const uint a4 = src1_qa[(uint)c4 * k_u + ku];
+            const uint a5 = src1_qa[(uint)c5 * k_u + ku];
+            const uint a6 = src1_qa[(uint)c6 * k_u + ku];
+            const uint a7 = src1_qa[(uint)c7 * k_u + ku];
+
+            s0.s0 = dot_acc_sat_4x8packed_ss_int(w0, a0, s0.s0);
+            s0.s1 = dot_acc_sat_4x8packed_ss_int(w0, a1, s0.s1);
+            s0.s2 = dot_acc_sat_4x8packed_ss_int(w0, a2, s0.s2);
+            s0.s3 = dot_acc_sat_4x8packed_ss_int(w0, a3, s0.s3);
+            s0.s4 = dot_acc_sat_4x8packed_ss_int(w0, a4, s0.s4);
+            s0.s5 = dot_acc_sat_4x8packed_ss_int(w0, a5, s0.s5);
+            s0.s6 = dot_acc_sat_4x8packed_ss_int(w0, a6, s0.s6);
+            s0.s7 = dot_acc_sat_4x8packed_ss_int(w0, a7, s0.s7);
+
+            s1.s0 = dot_acc_sat_4x8packed_ss_int(w1, a0, s1.s0);
+            s1.s1 = dot_acc_sat_4x8packed_ss_int(w1, a1, s1.s1);
+            s1.s2 = dot_acc_sat_4x8packed_ss_int(w1, a2, s1.s2);
+            s1.s3 = dot_acc_sat_4x8packed_ss_int(w1, a3, s1.s3);
+            s1.s4 = dot_acc_sat_4x8packed_ss_int(w1, a4, s1.s4);
+            s1.s5 = dot_acc_sat_4x8packed_ss_int(w1, a5, s1.s5);
+            s1.s6 = dot_acc_sat_4x8packed_ss_int(w1, a6, s1.s6);
+            s1.s7 = dot_acc_sat_4x8packed_ss_int(w1, a7, s1.s7);
+
+            s2.s0 = dot_acc_sat_4x8packed_ss_int(w2, a0, s2.s0);
+            s2.s1 = dot_acc_sat_4x8packed_ss_int(w2, a1, s2.s1);
+            s2.s2 = dot_acc_sat_4x8packed_ss_int(w2, a2, s2.s2);
+            s2.s3 = dot_acc_sat_4x8packed_ss_int(w2, a3, s2.s3);
+            s2.s4 = dot_acc_sat_4x8packed_ss_int(w2, a4, s2.s4);
+            s2.s5 = dot_acc_sat_4x8packed_ss_int(w2, a5, s2.s5);
+            s2.s6 = dot_acc_sat_4x8packed_ss_int(w2, a6, s2.s6);
+            s2.s7 = dot_acc_sat_4x8packed_ss_int(w2, a7, s2.s7);
+
+            s3.s0 = dot_acc_sat_4x8packed_ss_int(w3, a0, s3.s0);
+            s3.s1 = dot_acc_sat_4x8packed_ss_int(w3, a1, s3.s1);
+            s3.s2 = dot_acc_sat_4x8packed_ss_int(w3, a2, s3.s2);
+            s3.s3 = dot_acc_sat_4x8packed_ss_int(w3, a3, s3.s3);
+            s3.s4 = dot_acc_sat_4x8packed_ss_int(w3, a4, s3.s4);
+            s3.s5 = dot_acc_sat_4x8packed_ss_int(w3, a5, s3.s5);
+            s3.s6 = dot_acc_sat_4x8packed_ss_int(w3, a6, s3.s6);
+            s3.s7 = dot_acc_sat_4x8packed_ss_int(w3, a7, s3.s7);
         }
 
         // q4_K value is (q*scale - min), so per 32-block:
         //   out += scale * d_act * dot(q, a)  -  min * sum_act
         // where sum_act is q8_1's block sum (already carrying d_act).
-        // Component assignment, NOT a pointer cast into the vector: taking the address
-        // of a private vector forces it to memory and would spill the register budget
-        // this kernel deliberately keeps under the 512 B/WI cliff.
-        // Same clamp as the dot loop above, for the same reason.
-        const int c1 = (1 < n_no_padding) ? 1 : (n_no_padding - 1);
-        const int c2 = (2 < n_no_padding) ? 2 : (n_no_padding - 1);
-        const int c3 = (3 < n_no_padding) ? 3 : (n_no_padding - 1);
-        const int c4 = (4 < n_no_padding) ? 4 : (n_no_padding - 1);
-        const int c5 = (5 < n_no_padding) ? 5 : (n_no_padding - 1);
-        const int c6 = (6 < n_no_padding) ? 6 : (n_no_padding - 1);
-        const int c7 = (7 < n_no_padding) ? 7 : (n_no_padding - 1);
-
         float8 da, sa;
-        da.s0 = (float)src1_da[0*k_b + blk];  sa.s0 = (float)src1_sa[0*k_b + blk];
+        da.s0 = (float)src1_da[c0*k_b + blk];  sa.s0 = (float)src1_sa[c0*k_b + blk];
         da.s1 = (float)src1_da[c1*k_b + blk];  sa.s1 = (float)src1_sa[c1*k_b + blk];
         da.s2 = (float)src1_da[c2*k_b + blk];  sa.s2 = (float)src1_sa[c2*k_b + blk];
         da.s3 = (float)src1_da[c3*k_b + blk];  sa.s3 = (float)src1_sa[c3*k_b + blk];
@@ -171,52 +197,49 @@ kernel void kernel_gemm_cok_q4_k_q8_1_dp4a(
         da.s6 = (float)src1_da[c6*k_b + blk];  sa.s6 = (float)src1_sa[c6*k_b + blk];
         da.s7 = (float)src1_da[c7*k_b + blk];  sa.s7 = (float)src1_sa[c7*k_b + blk];
 
-        float8 d0, d1, d2, d3;
-        d0.s0 = (float)s0[0]; d0.s1 = (float)s0[1]; d0.s2 = (float)s0[2]; d0.s3 = (float)s0[3];
-        d0.s4 = (float)s0[4]; d0.s5 = (float)s0[5]; d0.s6 = (float)s0[6]; d0.s7 = (float)s0[7];
-        d1.s0 = (float)s1[0]; d1.s1 = (float)s1[1]; d1.s2 = (float)s1[2]; d1.s3 = (float)s1[3];
-        d1.s4 = (float)s1[4]; d1.s5 = (float)s1[5]; d1.s6 = (float)s1[6]; d1.s7 = (float)s1[7];
-        d2.s0 = (float)s2[0]; d2.s1 = (float)s2[1]; d2.s2 = (float)s2[2]; d2.s3 = (float)s2[3];
-        d2.s4 = (float)s2[4]; d2.s5 = (float)s2[5]; d2.s6 = (float)s2[6]; d2.s7 = (float)s2[7];
-        d3.s0 = (float)s3[0]; d3.s1 = (float)s3[1]; d3.s2 = (float)s3[2]; d3.s3 = (float)s3[3];
-        d3.s4 = (float)s3[4]; d3.s5 = (float)s3[5]; d3.s6 = (float)s3[6]; d3.s7 = (float)s3[7];
-
-        acc0 += sc0 * da * d0 - mv0 * sa;
-        acc1 += sc1 * da * d1 - mv1 * sa;
-        acc2 += sc2 * da * d2 - mv2 * sa;
-        acc3 += sc3 * da * d3 - mv3 * sa;
+        acc0 += sc0 * da * convert_float8(s0) - mv0 * sa;
+        acc1 += sc1 * da * convert_float8(s1) - mv1 * sa;
+        acc2 += sc2 * da * convert_float8(s2) - mv2 * sa;
+        acc3 += sc3 * da * convert_float8(s3) - mv3 * sa;
     }
 
     // Cross-subgroup reduction over the K-split, one row at a time so the __local buffer
-    // stays the size of the 1-row kernel's -- same shape as cok_r4.
+    // stays the size of the 1-row kernel's -- same shape as cok_r4. Written out per row
+    // rather than looping over a `float8 out[4]`: that array was indexed by the loop
+    // variable, which is the private-memory trap this kernel exists to avoid.
     local float8 reduceLM[COK_SG * (COK_NSG - 1)];
-    float8 out[4];
-    for (int r = 0; r < 4; r++) {
-        float8 acc = (r == 0) ? acc0 : (r == 1) ? acc1 : (r == 2) ? acc2 : acc3;
-        barrier(CLK_LOCAL_MEM_FENCE);
-        if (sg > 0) {
-            reduceLM[(sg - 1) * COK_SG + lane] = acc;
-        }
-        barrier(CLK_LOCAL_MEM_FENCE);
-        if (sg == 0) {
-            float8 sum = acc;
-            for (int s = 0; s < COK_NSG - 1; s++) {
-                sum += reduceLM[s * COK_SG + lane];
-            }
-            out[r] = sum;
-        }
+    float8 out0 = (float8)(0.0f), out1 = (float8)(0.0f);
+    float8 out2 = (float8)(0.0f), out3 = (float8)(0.0f);
+
+#define COK_REDUCE(accv, outv)                                       \
+    barrier(CLK_LOCAL_MEM_FENCE);                                    \
+    if (sg > 0) { reduceLM[(sg - 1) * COK_SG + lane] = (accv); }     \
+    barrier(CLK_LOCAL_MEM_FENCE);                                    \
+    if (sg == 0) {                                                   \
+        float8 sum = (accv);                                         \
+        for (int s = 0; s < COK_NSG - 1; s++) {                      \
+            sum += reduceLM[s * COK_SG + lane];                      \
+        }                                                            \
+        (outv) = sum;                                                \
     }
+
+    COK_REDUCE(acc0, out0)
+    COK_REDUCE(acc1, out1)
+    COK_REDUCE(acc2, out2)
+    COK_REDUCE(acc3, out3)
+
+#undef COK_REDUCE
 
     if (sg == 0) {
         // dst is [token, feature]: four adjacent rows are contiguous, one vstore4.
         int idx = row0;
-        if (idx < m*n_no_padding) { vstore4((float4)(out[0].s0, out[1].s0, out[2].s0, out[3].s0), 0, dst + idx); idx += m; }
-        if (idx < m*n_no_padding) { vstore4((float4)(out[0].s1, out[1].s1, out[2].s1, out[3].s1), 0, dst + idx); idx += m; }
-        if (idx < m*n_no_padding) { vstore4((float4)(out[0].s2, out[1].s2, out[2].s2, out[3].s2), 0, dst + idx); idx += m; }
-        if (idx < m*n_no_padding) { vstore4((float4)(out[0].s3, out[1].s3, out[2].s3, out[3].s3), 0, dst + idx); idx += m; }
-        if (idx < m*n_no_padding) { vstore4((float4)(out[0].s4, out[1].s4, out[2].s4, out[3].s4), 0, dst + idx); idx += m; }
-        if (idx < m*n_no_padding) { vstore4((float4)(out[0].s5, out[1].s5, out[2].s5, out[3].s5), 0, dst + idx); idx += m; }
-        if (idx < m*n_no_padding) { vstore4((float4)(out[0].s6, out[1].s6, out[2].s6, out[3].s6), 0, dst + idx); idx += m; }
-        if (idx < m*n_no_padding) { vstore4((float4)(out[0].s7, out[1].s7, out[2].s7, out[3].s7), 0, dst + idx); }
+        if (idx < m*n_no_padding) { vstore4((float4)(out0.s0, out1.s0, out2.s0, out3.s0), 0, dst + idx); idx += m; }
+        if (idx < m*n_no_padding) { vstore4((float4)(out0.s1, out1.s1, out2.s1, out3.s1), 0, dst + idx); idx += m; }
+        if (idx < m*n_no_padding) { vstore4((float4)(out0.s2, out1.s2, out2.s2, out3.s2), 0, dst + idx); idx += m; }
+        if (idx < m*n_no_padding) { vstore4((float4)(out0.s3, out1.s3, out2.s3, out3.s3), 0, dst + idx); idx += m; }
+        if (idx < m*n_no_padding) { vstore4((float4)(out0.s4, out1.s4, out2.s4, out3.s4), 0, dst + idx); idx += m; }
+        if (idx < m*n_no_padding) { vstore4((float4)(out0.s5, out1.s5, out2.s5, out3.s5), 0, dst + idx); idx += m; }
+        if (idx < m*n_no_padding) { vstore4((float4)(out0.s6, out1.s6, out2.s6, out3.s6), 0, dst + idx); idx += m; }
+        if (idx < m*n_no_padding) { vstore4((float4)(out0.s7, out1.s7, out2.s7, out3.s7), 0, dst + idx); }
     }
 }
