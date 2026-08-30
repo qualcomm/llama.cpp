@@ -69,9 +69,15 @@
 #if COK_COLS == 8
 typedef float8 cok_accv;
 typedef int8   cok_dotv;
-#else
+#define COK_CONVF convert_float8
+#elif COK_COLS == 4
 typedef float4 cok_accv;
 typedef int4   cok_dotv;
+#define COK_CONVF convert_float4
+#else
+typedef float2 cok_accv;
+typedef int2   cok_dotv;
+#define COK_CONVF convert_float2
 #endif
 
 // One packed q4_K ushort holds 4 consecutive-K nibbles for one row; spread them into the
@@ -103,9 +109,14 @@ typedef int4   cok_dotv;
     COK_DOT(0,t) COK_DOT(1,t) COK_DOT(2,t) COK_DOT(3,t)                \
     COK_DOT(4,t) COK_DOT(5,t) COK_DOT(6,t) COK_DOT(7,t)
 #define COK_FOR_COLS(F) F(0) F(1) F(2) F(3) F(4) F(5) F(6) F(7)
-#else
+#elif COK_COLS == 4
 #define COK_DOTS_AT(t)  COK_DOT(0,t) COK_DOT(1,t) COK_DOT(2,t) COK_DOT(3,t)
 #define COK_FOR_COLS(F) F(0) F(1) F(2) F(3)
+#else
+// ne1 = 2 is a real width in this band: a 4-column build computes two columns it then
+// discards, and n2 is where the arm is furthest behind.
+#define COK_DOTS_AT(t)  COK_DOT(0,t) COK_DOT(1,t)
+#define COK_FOR_COLS(F) F(0) F(1)
 #endif
 
 // One K-group: unpack the weight nibbles for the folded rows, then dot every column.
@@ -178,8 +189,10 @@ kernel void kernel_gemm_cok_q4_k_q8_1_dp4a(
     const int nl = n_no_padding - 1;
     const int c0 = 0;
     const int c1 = (1 < n_no_padding) ? 1 : nl;
+#if COK_COLS >= 4
     const int c2 = (2 < n_no_padding) ? 2 : nl;
     const int c3 = (3 < n_no_padding) ? 3 : nl;
+#endif
 #if COK_COLS == 8
     const int c4 = (4 < n_no_padding) ? 4 : nl;
     const int c5 = (5 < n_no_padding) ? 5 : nl;
@@ -239,8 +252,10 @@ kernel void kernel_gemm_cok_q4_k_q8_1_dp4a(
 
             uint4 A0 = vload4(0, src1_qa + (uint)c0 * k_u + ku0);
             uint4 A1 = vload4(0, src1_qa + (uint)c1 * k_u + ku0);
+#if COK_COLS >= 4
             uint4 A2 = vload4(0, src1_qa + (uint)c2 * k_u + ku0);
             uint4 A3 = vload4(0, src1_qa + (uint)c3 * k_u + ku0);
+#endif
 #if COK_COLS == 8
             uint4 A4 = vload4(0, src1_qa + (uint)c4 * k_u + ku0);
             uint4 A5 = vload4(0, src1_qa + (uint)c5 * k_u + ku0);
@@ -259,8 +274,10 @@ kernel void kernel_gemm_cok_q4_k_q8_1_dp4a(
         cok_accv da, sa;
         da.s0 = (float)src1_da[c0*k_b + blk];  sa.s0 = (float)src1_sa[c0*k_b + blk];
         da.s1 = (float)src1_da[c1*k_b + blk];  sa.s1 = (float)src1_sa[c1*k_b + blk];
+#if COK_COLS >= 4
         da.s2 = (float)src1_da[c2*k_b + blk];  sa.s2 = (float)src1_sa[c2*k_b + blk];
         da.s3 = (float)src1_da[c3*k_b + blk];  sa.s3 = (float)src1_sa[c3*k_b + blk];
+#endif
 #if COK_COLS == 8
         da.s4 = (float)src1_da[c4*k_b + blk];  sa.s4 = (float)src1_sa[c4*k_b + blk];
         da.s5 = (float)src1_da[c5*k_b + blk];  sa.s5 = (float)src1_sa[c5*k_b + blk];
@@ -268,20 +285,11 @@ kernel void kernel_gemm_cok_q4_k_q8_1_dp4a(
         da.s7 = (float)src1_da[c7*k_b + blk];  sa.s7 = (float)src1_sa[c7*k_b + blk];
 #endif
 
-#if COK_COLS == 8
-        acc0 += sc0 * da * convert_float8(s0) - mv0 * sa;
-        acc1 += sc1 * da * convert_float8(s1) - mv1 * sa;
+        acc0 += sc0 * da * COK_CONVF(s0) - mv0 * sa;
+        acc1 += sc1 * da * COK_CONVF(s1) - mv1 * sa;
 #if COK_ROWS == 4
-        acc2 += sc2 * da * convert_float8(s2) - mv2 * sa;
-        acc3 += sc3 * da * convert_float8(s3) - mv3 * sa;
-#endif
-#else
-        acc0 += sc0 * da * convert_float4(s0) - mv0 * sa;
-        acc1 += sc1 * da * convert_float4(s1) - mv1 * sa;
-#if COK_ROWS == 4
-        acc2 += sc2 * da * convert_float4(s2) - mv2 * sa;
-        acc3 += sc3 * da * convert_float4(s3) - mv3 * sa;
-#endif
+        acc2 += sc2 * da * COK_CONVF(s2) - mv2 * sa;
+        acc3 += sc3 * da * COK_CONVF(s3) - mv3 * sa;
 #endif
     }
 

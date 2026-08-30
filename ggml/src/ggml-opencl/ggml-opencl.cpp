@@ -1912,7 +1912,10 @@ struct ggml_backend_opencl_context {
     // Opt-in (GGML_OPENCL_Q4K_COK_DP4A): it exists to test whether int8 arithmetic
     // beats the f16 cok kernel there, so it must not displace the default dispatch.
     cl_kernel kernel_gemm_cok_q4_k_q8_1_dp4a = nullptr;
-    cl_kernel kernel_gemm_cok_q4_k_q8_1_dp4a_c4 = nullptr;  // 4-column build for ne1 <= 4
+    cl_kernel kernel_gemm_cok_q4_k_q8_1_dp4a_c4 = nullptr;  // 4-column build for ne1 3..4
+    cl_kernel kernel_gemm_cok_q4_k_q8_1_dp4a_c2 = nullptr;  // 2-column build for ne1 == 2
+    int       q4k_cok_dp4a_nsg_c8  = 4;   // the 8-column build deadlocks at 8
+    int       q4k_cok_dp4a_nsg_narrow = 8;
     int       q4k_cok_dp4a_nsg_eff = 4;
     int       q4k_cok_dp4a_rows    = 4;
     int q4k_dp4a_ts_narrow = 32;  // tile for the verify band; == q4k_dp4a_ts disables the split
@@ -8450,6 +8453,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         // workgroup and minimises how many can be resident, so it is tuned, not adopted.
         int nsg_req = 4;
         if (const char * e = getenv("GGML_OPENCL_Q4K_COK_DP4A_NSG")) { nsg_req = atoi(e); }
+        int nsg_narrow = 8;
+        if (const char * e = getenv("GGML_OPENCL_Q4K_COK_DP4A_NSGN")) { nsg_narrow = atoi(e); }
 
         // Two column widths. The band is ne1 = 2..8 and an 8-column lane computes 8
         // columns whatever ne1 is, so at ne1=2 six are discarded -- and that is where
@@ -8458,11 +8463,14 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         const std::string base_opts = compile_opts
             + " -DCOK_STAGE=" + std::to_string(cok_stage)
             + " -DCOK_ROWS="  + std::to_string(cok_rows);
-        for (int cols : {8, 4}) {
-            int nsg_eff = nsg_req;
+        // NSG is per column width, not global. The narrow builds hold far fewer live
+        // values and run best at 8 (n4: 357 us against 510 at nsg 4, and against a
+        // 368 us control); the 8-column build deadlocks at 8 and takes 4.
+        for (int cols : {8, 4, 2}) {
+            int nsg_eff = (cols == 8) ? nsg_req : nsg_narrow;
             cl_program prog = ggml_cl_build_cok_program(
                 backend_ctx, kernel_src.c_str(),
-                base_opts + " -DCOK_COLS=" + std::to_string(cols), nsg_req, &nsg_eff);
+                base_opts + " -DCOK_COLS=" + std::to_string(cols), nsg_eff, &nsg_eff);
             cl_kernel kk = clCreateKernel(prog, "kernel_gemm_cok_q4_k_q8_1_dp4a", &err);
             if (err != CL_SUCCESS) { kk = nullptr; }
             if (kk) {
@@ -8477,9 +8485,11 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                         cok_rows, cols, nsg_eff, (unsigned long long)pmc,
                         (unsigned long long)lmc, wgc);
             }
-            if (cols == 8) { backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a    = kk; }
-            else           { backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a_c4 = kk; }
-            backend_ctx->q4k_cok_dp4a_nsg_eff = nsg_eff;
+            if      (cols == 8) { backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a    = kk;
+                                  backend_ctx->q4k_cok_dp4a_nsg_c8 = nsg_eff; }
+            else if (cols == 4) { backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a_c4 = kk;
+                                  backend_ctx->q4k_cok_dp4a_nsg_narrow = nsg_eff; }
+            else                { backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a_c2 = kk; }
             backend_ctx->q4k_cok_dp4a_rows    = cok_rows;
             CL_CHECK(clReleaseProgram(prog));
         }
@@ -33868,9 +33878,21 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
             // Pick the column width by the actual batch. An 8-column lane computes 8
             // columns whatever ne1 is, so ne1<=4 was paying for six discarded columns --
             // and ne1=2 is where this arm lost worst.
-            cl_kernel ck = (ne1 <= 4 && backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a_c4)
-                         ? backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a_c4
-                         : backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a;
+            // Narrowest build that still covers ne1. A lane computes its full column width
+            // whatever ne1 is, so a wider build than needed is pure discarded work -- and
+            // ne1=2 through a 4-column build was the worst point in the band.
+            cl_kernel ck;
+            int cok_nsg_sel;
+            if (ne1 <= 2 && backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a_c2) {
+                ck = backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a_c2;
+                cok_nsg_sel = backend_ctx->q4k_cok_dp4a_nsg_narrow;
+            } else if (ne1 <= 4 && backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a_c4) {
+                ck = backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a_c4;
+                cok_nsg_sel = backend_ctx->q4k_cok_dp4a_nsg_narrow;
+            } else {
+                ck = backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a;
+                cok_nsg_sel = backend_ctx->q4k_cok_dp4a_nsg_c8;
+            }
             CL_CHECK(clSetKernelArg(ck,  0, sizeof(cl_mem),   &extra0_q4_k->q));
             CL_CHECK(clSetKernelArg(ck,  1, sizeof(cl_mem),   &extra0_q4_k->s));
             CL_CHECK(clSetKernelArg(ck,  2, sizeof(cl_mem),   &extra0_q4_k->d));
@@ -33891,7 +33913,7 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
             // One lane per 4 output rows, COK_NSG subgroups splitting K -- the geometry
             // cok_r4 uses. COK_NSG is compile-time (it sizes the LDS reduce buffer), so
             // the dispatch must use the value the program was actually built at.
-            const size_t cok_nsg = (size_t)backend_ctx->q4k_cok_dp4a_nsg_eff;
+            const size_t cok_nsg = (size_t)cok_nsg_sel;
             size_t c_local[3]  = { 64, cok_nsg, 1 };
             size_t c_global[3] = { (size_t)(ne01 / backend_ctx->q4k_cok_dp4a_rows), cok_nsg, 1 };
             backend_ctx->enqueue_ndrange_kernel(ck, 3, c_global, c_local, dst);
