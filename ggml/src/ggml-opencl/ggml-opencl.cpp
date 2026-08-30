@@ -33890,13 +33890,19 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
         // without a rebuild.
         static const char * q4k_cok_maxn_env = getenv("GGML_OPENCL_Q4K_COK_DP4A_MAXN");
         static const int q4k_cok_dp4a_maxn = q4k_cok_maxn_env ? atoi(q4k_cok_maxn_env) : 4;
-        // Declined on A7X and older, alongside the plane dp4a prefill GEMMs. This kernel
-        // has the same defect on the same compiler: an Adreno 740 fails MUL_MAT q4_K at
-        // m=512 n=2 and n=4 with the arm on and passes with it off, while an Adreno 840 and
-        // an X2-90 running the identical binary and shapes are clean. Correctness, not
-        // performance -- so it is a decline, not a tuning gate.
+        // Declined on TWO unrelated compilers, and they need two different tests.
+        //
+        //  - A7X and older (E031.41): an Adreno 740 fails MUL_MAT q4_K at m=512 n=2 and n=4
+        //    with the arm on and passes with it off (14 -> 16 failures).
+        //  - The 850's E17 / art.api37 compiler: ERR = 181.7 on q4_K m=512 n=4, then the
+        //    suite stalls on that shape. The 850 is classed A8X -- a NEWER level than A7X --
+        //    so a level-only gate lets it straight through. Gate the compiler when the defect
+        //    is the compiler; this is the same pairing the Q2_K/Q3_K plane GEMMs already use.
+        //
+        // An Adreno 840 and an X2-90 run the identical binary and shapes clean.
         if (q4k_cok_dp4a_env && atoi(q4k_cok_dp4a_env) != 0
             && ggml_cl_kquant_plane_dp4a_gemm_on(backend_ctx)
+            && !adreno_art_compiler_quirks(backend_ctx)
             && backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a != nullptr
             && ne1 >= 2 && ne1 <= q4k_cok_dp4a_maxn
             && ne01 % (64 * backend_ctx->q4k_cok_dp4a_rows) == 0 && K % 32 == 0) {
@@ -35065,6 +35071,7 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
         // known good -- and the sibling kernel demonstrably miscompiles on that compiler.
         if (q6k_cok_dp4a_env && atoi(q6k_cok_dp4a_env) != 0
             && ggml_cl_kquant_plane_dp4a_gemm_on(backend_ctx)
+            && !adreno_art_compiler_quirks(backend_ctx)
             && ((ne1 <= 2) ? backend_ctx->kernel_gemm_cok_q6_k_q8_1_dp4a_c2
                            : backend_ctx->kernel_gemm_cok_q6_k_q8_1_dp4a) != nullptr
             && !is_output_w_cok
