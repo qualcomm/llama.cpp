@@ -4377,6 +4377,13 @@ static bool ggml_hexagon_supported_get_rows(const struct ggml_hexagon_session * 
     const struct ggml_tensor * src1 = op->src[1]; // indices
     const struct ggml_tensor * dst  = op;
 
+    if (src0->extra) {
+        const auto * extra = (const ggml_hexagon_tensor_extra *) src0->extra;
+        if (extra->flags & GGML_HEXAGON_TENSOR_REPACK) {
+            return false;
+        }
+    }
+
     if (src0->type != GGML_TYPE_F32 && src0->ne[0] < 32) {
         return false;
     }
