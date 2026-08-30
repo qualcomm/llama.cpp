@@ -8433,7 +8433,15 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #else
         const std::string kernel_src = read_file("gemm_cok_q4_k_q8_1_dp4a.cl");
 #endif
-        int nsg_req = 8;
+        // 4, not 8. The driver reports CL_KERNEL_WORK_GROUP_SIZE = 512 for this kernel
+        // and accepts the launch, but a 64x8 workgroup DEADLOCKS in the cross-subgroup
+        // reduction: the GEMM never returns and the process sits on the GPU with its CPU
+        // time frozen. Bisected by construction -- the same kernel with the reduction
+        // removed completes 568 dispatches at 64x8, and the full kernel completes at 64x4
+        // and 64x2. So the workgroup query is optimistic here and cannot be the only
+        // bound; ggml_cl_build_cok_program narrows against it and still lands on a size
+        // that hangs.
+        int nsg_req = 4;
         if (const char * e = getenv("GGML_OPENCL_Q4K_COK_DP4A_NSG")) { nsg_req = atoi(e); }
         // Debug bisect: 1 = launch geometry only, 2 = K loop without the reduction,
         // 3 = full kernel. Build-time, but selected from the environment so localising
