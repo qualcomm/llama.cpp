@@ -303,22 +303,25 @@ static inline void bitonic_sort_generic_hvx(uint8_t * values, uint8_t * indices,
     }
 }
 
-// Generalizes bitonic_sort_generic_hvx() to arbitrary power-of-2 n_vec for
-// op_top_k()'s fallback (rows > 1024). Re-reads/writes VTCM per stage instead
-// of keeping vectors resident, to stay fully vectorized on large rows.
-// Always descending. Caller pads `values` to n_vec*32 with -INFINITY;
-// `indices` is filled from scratch (0..n_vec*32-1 ramp), not read.
-static void bitonic_sort_vtcm_desc(uint8_t * values, uint8_t * indices, uint32_t n_vec) {
+
+// Sorts descending; values pre-padded with -INFINITY. init_indices=true resets
+// indices to a fresh ramp (normal full-row sort); false leaves caller-supplied
+// indices in place and only permutes them (used when merging candidates, to
+// preserve their original global index).
+
+static void bitonic_sort_vtcm_desc(uint8_t * values, uint8_t * indices, uint32_t n_vec, bool init_indices) {
     HVX_Vector zero_vec = Q6_V_vzero();
     HVX_Vector idx_vec = *(HVX_Vector *)argosrt_ramp_lut;
 
     HVX_VectorPred pred_all_1s = Q6_Q_vcmp_eq_VwVw(zero_vec, zero_vec);
     HVX_VectorPred pred_all_0s = Q6_Q_not_Q(pred_all_1s);
 
-    // Initialize indices ramp (values are already populated by the caller)
-    for (uint32_t v = 0; v < n_vec; v++) {
-        HVX_Vector idx = Q6_Vw_vadd_VwVw(idx_vec, Q6_V_vsplat_R(v * 32));
-        *(HVX_Vector *)(indices + v * 128) = idx;
+    if (init_indices) {
+        // Initialize indices ramp (values are already populated by the caller)
+        for (uint32_t v = 0; v < n_vec; v++) {
+            HVX_Vector idx = Q6_Vw_vadd_VwVw(idx_vec, Q6_V_vsplat_R(v * 32));
+            *(HVX_Vector *)(indices + v * 128) = idx;
+        }
     }
 
     int M = 5;
@@ -715,19 +718,171 @@ static void htp_top_k_f32_fallback(unsigned int n, unsigned int i, void * data) 
         hex_l2fetch(src_ptr, ne00 * sizeof(float), ne00 * sizeof(float), 1);
         hvx_copy_f32_au((uint8_t*)values_buf, src_ptr, ne00);
 
+        // Fills the indices ramp itself, so no init needed here.
         if (ne00_padded > ne00) {
             hvx_splat_f32_u((uint8_t *)(values_buf + ne00), -INFINITY, ne00_padded - ne00);
         }
-
-        // Fully vectorized bitonic top-k: sort the (padded) row descending,
-        // then keep only the first k indices.
-        bitonic_sort_vtcm_desc((uint8_t*)values_buf, (uint8_t*)indices_buf, n_vec_pow2);
+        bitonic_sort_vtcm_desc((uint8_t*)values_buf, (uint8_t*)indices_buf, n_vec_pow2, true);
 
         // Copy top-k indices back to DDR
         hvx_copy_f32_ua(dst_ptr, (const uint8_t *) indices_buf, k);
     }
 
     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, start_row);
+}
+
+// Single row (ne01=ne02=ne03=1) + large ne00 would otherwise run on one
+// HVX thread while the rest sit idle. Split the row into n_chunks
+// power-of-two chunks, sort each in parallel with bitonic_sort_vtcm_desc,
+// then merge the n_chunks*local_k winners with one more sort that carries
+// the global index through instead of re-deriving it.
+struct htp_top_k_chunk_ctx {
+    struct htp_ops_context * octx;
+    uint8_t *                vtcm_base;
+    size_t                    phase1_slot_size;
+    uint32_t                  ne00;
+    uint32_t                  chunk_elems;
+    uint32_t                  local_k;
+    size_t                    merge_values_off;
+    size_t                    merge_indices_off;
+};
+
+static void htp_top_k_chunk_job(unsigned int n, unsigned int i, void * data) {
+    struct htp_top_k_chunk_ctx * cctx = (struct htp_top_k_chunk_ctx *) data;
+    struct htp_ops_context * octx = cctx->octx;
+    const struct htp_tensor * src0 = octx->src[0];
+
+    uint32_t chunk_elems = cctx->chunk_elems;
+    uint32_t ne00        = cctx->ne00;
+    uint32_t local_k     = cctx->local_k;
+    uint32_t chunk_base  = i * chunk_elems;
+
+    uint8_t * spad = cctx->vtcm_base + cctx->phase1_slot_size * i;
+    size_t values_size = hex_round_up(chunk_elems * sizeof(float), 128);
+    float *   values_buf  = (float *) spad;
+    int32_t * indices_buf = (int32_t *) (spad + values_size);
+
+    uint32_t real_count = (chunk_base < ne00) ? MIN(chunk_elems, ne00 - chunk_base) : 0;
+
+    if (real_count > 0) {
+        uint8_t * src_ptr = (uint8_t *) src0->data + (size_t) chunk_base * sizeof(float);
+        hex_l2fetch(src_ptr, real_count * sizeof(float), real_count * sizeof(float), 1);
+        hvx_copy_f32_au((uint8_t *) values_buf, src_ptr, real_count);
+    }
+    if (chunk_elems > real_count) {
+        hvx_splat_f32_u((uint8_t *) (values_buf + real_count), -INFINITY, chunk_elems - real_count);
+    }
+
+    // chunk_elems is always a power-of-two multiple of 32
+    bitonic_sort_vtcm_desc((uint8_t *) values_buf, (uint8_t *) indices_buf, chunk_elems / 32, true);
+
+    float *   merge_values  = (float *)   (cctx->vtcm_base + cctx->merge_values_off);
+    int32_t * merge_indices = (int32_t *) (cctx->vtcm_base + cctx->merge_indices_off);
+
+    for (uint32_t j = 0; j < local_k; j++) {
+        merge_values[i * local_k + j]  = values_buf[j];
+        merge_indices[i * local_k + j] = indices_buf[j] + (int32_t) chunk_base;
+    }
+}
+
+struct htp_top_k_merge_ctx {
+    struct htp_ops_context * octx;
+    uint8_t *                vtcm_base;
+    size_t                    merge_values_off;
+    size_t                    merge_indices_off;
+    uint32_t                  merge_elems;
+    uint32_t                  total_candidates;
+    uint32_t                  k;
+};
+
+static void htp_top_k_merge_job(unsigned int n, unsigned int i, void * data) {
+    struct htp_top_k_merge_ctx * mctx = (struct htp_top_k_merge_ctx *) data;
+    struct htp_ops_context * octx = mctx->octx;
+    const struct htp_tensor * dst = octx->dst;
+
+    float *   merge_values  = (float *)   (mctx->vtcm_base + mctx->merge_values_off);
+    int32_t * merge_indices = (int32_t *) (mctx->vtcm_base + mctx->merge_indices_off);
+
+    if (mctx->merge_elems > mctx->total_candidates) {
+        uint32_t pad = mctx->merge_elems - mctx->total_candidates;
+        hvx_splat_f32_u((uint8_t *) (merge_values + mctx->total_candidates), -INFINITY, pad);
+        for (uint32_t j = mctx->total_candidates; j < mctx->merge_elems; j++) {
+            merge_indices[j] = 0;
+        }
+    }
+
+    // Preserve the global indices computed in phase 1 -- init_indices=false
+    // so they aren't overwritten with a local ramp.
+    bitonic_sort_vtcm_desc((uint8_t *) merge_values, (uint8_t *) merge_indices, mctx->merge_elems / 32, false);
+
+    hvx_copy_f32_ua((uint8_t *) dst->data, (const uint8_t *) merge_indices, mctx->k);
+}
+
+static int op_top_k_single_row_threaded(struct htp_ops_context * octx, uint32_t ne00, uint32_t k) {
+    uint32_t n_threads_avail = octx->n_threads;
+
+    uint32_t n_vec = hmx_ceil_div(ne00, 32);
+    uint32_t n_vec_pow2 = 1;
+    while (n_vec_pow2 < n_vec) n_vec_pow2 <<= 1;
+
+    // Largest power-of-two chunk count that both fits the available
+    // threads and evenly divides n_vec_pow2
+    uint32_t n_chunks = 1;
+    while (n_chunks * 2 <= n_threads_avail && n_chunks * 2 <= n_vec_pow2) {
+        n_chunks *= 2;
+    }
+
+    uint32_t chunk_n_vec = n_vec_pow2 / n_chunks;
+    uint32_t chunk_elems = chunk_n_vec * 32;
+    uint32_t local_k     = MIN(k, chunk_elems);
+
+    uint32_t total_candidates = n_chunks * local_k;
+    uint32_t merge_n_vec = hmx_ceil_div(total_candidates, 32);
+    uint32_t merge_n_vec_pow2 = 1;
+    while (merge_n_vec_pow2 < merge_n_vec) merge_n_vec_pow2 <<= 1;
+    uint32_t merge_elems = merge_n_vec_pow2 * 32;
+
+    size_t phase1_values_size  = hex_round_up(chunk_elems * sizeof(float), 128);
+    size_t phase1_indices_size = hex_round_up(chunk_elems * sizeof(int32_t), 128);
+    size_t phase1_slot_size    = hex_round_up(phase1_values_size + phase1_indices_size, 256);
+    size_t phase1_total_size   = phase1_slot_size * n_chunks;
+
+    size_t merge_values_size  = hex_round_up(merge_elems * sizeof(float), 128);
+    size_t merge_indices_size = hex_round_up(merge_elems * sizeof(int32_t), 128);
+    size_t merge_values_off   = phase1_total_size;
+    size_t merge_indices_off  = merge_values_off + merge_values_size;
+
+    size_t total_vtcm = phase1_total_size + merge_values_size + merge_indices_size;
+    if (octx->ctx->vtcm_size < total_vtcm) {
+        return HTP_STATUS_VTCM_TOO_SMALL;
+    }
+
+    uint8_t * vtcm_base = (uint8_t *) octx->ctx->vtcm_base;
+
+    struct htp_top_k_chunk_ctx cctx;
+    cctx.octx              = octx;
+    cctx.vtcm_base         = vtcm_base;
+    cctx.phase1_slot_size  = phase1_slot_size;
+    cctx.ne00              = ne00;
+    cctx.chunk_elems       = chunk_elems;
+    cctx.local_k           = local_k;
+    cctx.merge_values_off  = merge_values_off;
+    cctx.merge_indices_off = merge_indices_off;
+
+    worker_pool_run_func(octx->ctx->worker_pool, htp_top_k_chunk_job, &cctx, n_chunks);
+
+    struct htp_top_k_merge_ctx mctx;
+    mctx.octx              = octx;
+    mctx.vtcm_base         = vtcm_base;
+    mctx.merge_values_off  = merge_values_off;
+    mctx.merge_indices_off = merge_indices_off;
+    mctx.merge_elems       = merge_elems;
+    mctx.total_candidates  = total_candidates;
+    mctx.k                 = k;
+
+    worker_pool_run_func(octx->ctx->worker_pool, htp_top_k_merge_job, &mctx, 1);
+
+    return HTP_STATUS_OK;
 }
 
 int op_top_k(struct htp_ops_context * octx) {
@@ -737,14 +892,24 @@ int op_top_k(struct htp_ops_context * octx) {
     }
 
     const uint32_t total_rows = octx->src[0]->ne[1] * octx->src[0]->ne[2] * octx->src[0]->ne[3];
-    const uint32_t n_threads = MIN(total_rows, octx->n_threads);
-
-    // Scratchpad layout matches argsort. Difference: sized to the padded
-    // row (n_vec*32) for the fallback's bitonic sort, not ne00 directly --
-    // a no-op when ne00 already matches a fixed size below.
     uint32_t ne00 = octx->src[0]->ne[0];
     uint32_t k = octx->dst->ne[0];
 
+    // Single row + large ne00: the per-row dispatch below would run on one
+    // HVX thread while the rest sit idle. Split the row across threads.
+    if (total_rows == 1 && ne00 > 1024) {
+        int status = op_top_k_single_row_threaded(octx, ne00, k);
+        if (status != HTP_STATUS_VTCM_TOO_SMALL) {
+            return status;
+        }
+        // else: fall through to the single-thread path below.
+    }
+
+    const uint32_t n_threads = MIN(total_rows, octx->n_threads);
+
+    // Scratchpad layout: values + indices
+    // For bitonic: need padding to power-of-2 size
+    // Allocate for worst case (bitonic with padding)
     uint32_t n_vec = hmx_ceil_div(ne00, 32);
     uint32_t n_vec_pow2 = 1;
     while (n_vec_pow2 < n_vec) n_vec_pow2 <<= 1;

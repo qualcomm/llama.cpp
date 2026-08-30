@@ -5387,26 +5387,13 @@ static bool ggml_hexagon_supported_top_k(const struct ggml_hexagon_session * ses
         return false;
     }
 
-    if (src0->ne[0] > (64*1024)) {
-        return false;
-    }
+// Single row uses the threaded chunk+merge path, which splits rather than
+// multiplies the scratch buffer -- 256K needs only ~2MB. Multi-row still
+// uses one full buffer per thread, so it keeps the tighter 64K cap
+    const bool single_row = (src0->ne[1] == 1 && src0->ne[2] == 1 && src0->ne[3] == 1);
+    const int64_t max_ne00 = single_row ? (256*1024) : (64*1024);
 
-    // Unlike argsort's flat 16K cap, top_k's 64K cap isn't always VTCM-safe,
-    // so we compute the actual per-thread budget here.
-    const uint32_t total_rows = (uint32_t) (src0->ne[1] * src0->ne[2] * src0->ne[3]);
-    const uint32_t n_threads  = (std::min)(total_rows, sess->n_threads);
-
-    uint32_t n_vec = (uint32_t) ((src0->ne[0] + 31) / 32);
-    uint32_t n_vec_pow2 = 1;
-    while (n_vec_pow2 < n_vec) n_vec_pow2 <<= 1;
-    const uint32_t ne0_padded = n_vec_pow2 * 32;
-
-    const size_t values_size     = hex_round_up(ne0_padded * sizeof(float),   128);
-    const size_t indices_size    = hex_round_up(ne0_padded * sizeof(int32_t), 128);
-    const size_t spad_per_thread = hex_round_up(values_size + indices_size, 256);
-    const size_t total_spad_size = spad_per_thread * n_threads;
-
-    if (total_spad_size > sess->vtcm_size) {
+    if (src0->ne[0] > max_ne00) {
         return false;
     }
 
