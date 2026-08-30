@@ -134,7 +134,8 @@ static inline int htp_mm_hmx_compute_chunks(size_t   vtcm_total,
     size_t best_mn   = 0;
     size_t best_m = 0, best_n = 0;
 
-    const size_t n_max = hex_align_down((size_t)n, HTP_MM_HMX_TILE_N_COLS);
+    const size_t max_nc_budget = (usable / per_n_cost);
+    const size_t n_max = hex_align_down(hex_smin((size_t)n, max_nc_budget), HTP_MM_HMX_TILE_N_COLS);
     for (size_t nc = n_max; nc >= HTP_MM_HMX_TILE_N_COLS; nc -= HTP_MM_HMX_TILE_N_COLS) {
         size_t n_fixed = 0, ncmn = 0, mc_denom = 0;
         if (hex_mul_overflow(nc, per_n_cost, &n_fixed)) continue;
@@ -568,10 +569,8 @@ static inline void htp_mm_hvx_vtcm_layout_build(
                 }
 
                 size_t quant_scratch_size_per_thread = htp_mm_round_up(ne10 * sizeof(float), QK_Q8_0_TILED * sizeof(float));
-                size_t dst_size_per_thread = dst_nrows > 0 ? htp_mm_round_up(dst_row_size, 128) : 0;
-                if (dst_size_per_thread < quant_scratch_size_per_thread) {
-                    dst_size_per_thread = quant_scratch_size_per_thread;
-                }
+                size_t dst_slice_per_thread = (dst_nrows > 0 && src1_nrows == 1) ? htp_mm_round_up((dst_row_size + n_threads - 1) / n_threads, 128) : 0;
+                size_t dst_size_per_thread = (dst_slice_per_thread > quant_scratch_size_per_thread) ? dst_slice_per_thread : quant_scratch_size_per_thread;
                 dst_sz = dst_size_per_thread * n_threads;
                 break;
             }
@@ -592,10 +591,8 @@ static inline void htp_mm_hvx_vtcm_layout_build(
                 }
 
                 size_t quant_scratch_size_per_thread = htp_mm_round_up(ne10 * sizeof(float), QK_Q8_0_TILED * sizeof(float));
-                size_t dst_size_per_thread = dst_nrows > 0 ? htp_mm_round_up(dst_row_size, 128) : 0;
-                if (dst_size_per_thread < quant_scratch_size_per_thread) {
-                    dst_size_per_thread = quant_scratch_size_per_thread;
-                }
+                size_t dst_slice_per_thread = dst_nrows > 0 ? htp_mm_round_up((dst_row_size + n_threads - 1) / n_threads, 128) : 0;
+                size_t dst_size_per_thread = (dst_slice_per_thread > quant_scratch_size_per_thread) ? dst_slice_per_thread : quant_scratch_size_per_thread;
                 dst_sz = dst_size_per_thread * n_threads;
                 break;
             }
