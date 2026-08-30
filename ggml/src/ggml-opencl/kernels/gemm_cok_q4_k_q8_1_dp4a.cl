@@ -81,23 +81,52 @@ typedef int4   cok_dotv;
                   (((uint)((u) & 0x0F00u)) << 8)  | \
                   (((uint)((u) & 0xF000u)) << 12) )
 
-// Per-column work, expanded by name so no index is ever a variable.
+// Per-column work, expanded by name so no index is ever a variable. The activation comes
+// from a uint4 component: four consecutive K-groups for one column are contiguous, so one
+// vload4 replaces four scalar loads. That is the cost this kernel actually pays against
+// cok -- cok takes eight columns in a single read_imageh because its activation is
+// N-major, while dp4a needs K-major int8 and so cannot share a load across columns.
 #if COK_ROWS == 4
-#define COK_DOT_COL(ci)                                                     \
-    s0.s##ci = dot_acc_sat_4x8packed_ss_int(w0, a##ci, s0.s##ci);           \
-    s1.s##ci = dot_acc_sat_4x8packed_ss_int(w1, a##ci, s1.s##ci);           \
-    s2.s##ci = dot_acc_sat_4x8packed_ss_int(w2, a##ci, s2.s##ci);           \
-    s3.s##ci = dot_acc_sat_4x8packed_ss_int(w3, a##ci, s3.s##ci);
+#define COK_DOT(ci, t)                                                 \
+    s0.s##ci = dot_acc_sat_4x8packed_ss_int(w0, A##ci.s##t, s0.s##ci);    \
+    s1.s##ci = dot_acc_sat_4x8packed_ss_int(w1, A##ci.s##t, s1.s##ci);    \
+    s2.s##ci = dot_acc_sat_4x8packed_ss_int(w2, A##ci.s##t, s2.s##ci);    \
+    s3.s##ci = dot_acc_sat_4x8packed_ss_int(w3, A##ci.s##t, s3.s##ci);
 #else
-#define COK_DOT_COL(ci)                                                     \
-    s0.s##ci = dot_acc_sat_4x8packed_ss_int(w0, a##ci, s0.s##ci);           \
-    s1.s##ci = dot_acc_sat_4x8packed_ss_int(w1, a##ci, s1.s##ci);
+#define COK_DOT(ci, t)                                                 \
+    s0.s##ci = dot_acc_sat_4x8packed_ss_int(w0, A##ci.s##t, s0.s##ci);    \
+    s1.s##ci = dot_acc_sat_4x8packed_ss_int(w1, A##ci.s##t, s1.s##ci);
 #endif
 
 #if COK_COLS == 8
+#define COK_DOTS_AT(t)                                                 \
+    COK_DOT(0,t) COK_DOT(1,t) COK_DOT(2,t) COK_DOT(3,t)                \
+    COK_DOT(4,t) COK_DOT(5,t) COK_DOT(6,t) COK_DOT(7,t)
 #define COK_FOR_COLS(F) F(0) F(1) F(2) F(3) F(4) F(5) F(6) F(7)
 #else
+#define COK_DOTS_AT(t)  COK_DOT(0,t) COK_DOT(1,t) COK_DOT(2,t) COK_DOT(3,t)
 #define COK_FOR_COLS(F) F(0) F(1) F(2) F(3)
+#endif
+
+// One K-group: unpack the weight nibbles for the folded rows, then dot every column.
+#if COK_ROWS == 4
+#define COK_KSTEP(t)                                                   \
+    {                                                                     \
+    ushort4 bits = vload4(0, src0_q + row0 + (ku0 + t) * m);              \
+    const uint w0 = EXP4(bits.s0);                                        \
+    const uint w1 = EXP4(bits.s1);                                        \
+    const uint w2 = EXP4(bits.s2);                                        \
+    const uint w3 = EXP4(bits.s3);                                        \
+    COK_DOTS_AT(t)                                                        \
+    }
+#else
+#define COK_KSTEP(t)                                                   \
+    {                                                                     \
+    ushort2 bits = vload2(0, src0_q + row0 + (ku0 + t) * m);              \
+    const uint w0 = EXP4(bits.s0);                                        \
+    const uint w1 = EXP4(bits.s1);                                        \
+    COK_DOTS_AT(t)                                                        \
+    }
 #endif
 
 inline void get_scale_min_k4_c(int j, global const uchar * q, int stride,
@@ -202,29 +231,26 @@ kernel void kernel_gemm_cok_q4_k_q8_1_dp4a(
         cok_dotv s2 = (cok_dotv)(0), s3 = (cok_dotv)(0);
 #endif
 
-        for (int u = 0; u < 8; ++u) {
-            const int ku = (i >> 2) + u;                       // K/4 index
-#if COK_ROWS == 4
-            ushort4 bits = vload4(0, src0_q + row0 + ku * m);
-            const uint w2 = EXP4(bits.s2);
-            const uint w3 = EXP4(bits.s3);
-#else
-            ushort2 bits = vload2(0, src0_q + row0 + ku * m);
-#endif
-            const uint w0 = EXP4(bits.s0);
-            const uint w1 = EXP4(bits.s1);
+        // Two groups of four K-groups. The activation for one column across four
+        // consecutive K-groups is contiguous, so it is one vload4 rather than four
+        // scalar loads -- 2 vector loads per column per 32-block instead of 8 scalar.
+        for (int uq = 0; uq < 2; ++uq) {
+            const int ku0 = (i >> 2) + uq * 4;
 
-            const uint a0 = src1_qa[(uint)c0 * k_u + ku];
-            const uint a1 = src1_qa[(uint)c1 * k_u + ku];
-            const uint a2 = src1_qa[(uint)c2 * k_u + ku];
-            const uint a3 = src1_qa[(uint)c3 * k_u + ku];
+            uint4 A0 = vload4(0, src1_qa + (uint)c0 * k_u + ku0);
+            uint4 A1 = vload4(0, src1_qa + (uint)c1 * k_u + ku0);
+            uint4 A2 = vload4(0, src1_qa + (uint)c2 * k_u + ku0);
+            uint4 A3 = vload4(0, src1_qa + (uint)c3 * k_u + ku0);
 #if COK_COLS == 8
-            const uint a4 = src1_qa[(uint)c4 * k_u + ku];
-            const uint a5 = src1_qa[(uint)c5 * k_u + ku];
-            const uint a6 = src1_qa[(uint)c6 * k_u + ku];
-            const uint a7 = src1_qa[(uint)c7 * k_u + ku];
+            uint4 A4 = vload4(0, src1_qa + (uint)c4 * k_u + ku0);
+            uint4 A5 = vload4(0, src1_qa + (uint)c5 * k_u + ku0);
+            uint4 A6 = vload4(0, src1_qa + (uint)c6 * k_u + ku0);
+            uint4 A7 = vload4(0, src1_qa + (uint)c7 * k_u + ku0);
 #endif
-            COK_FOR_COLS(COK_DOT_COL)
+            COK_KSTEP(0)
+            COK_KSTEP(1)
+            COK_KSTEP(2)
+            COK_KSTEP(3)
         }
 
         // q4_K value is (q*scale - min), so per 32-block:
