@@ -33779,6 +33779,85 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
             return;
         }
 
+        // cok-shaped dp4a GEMM for the narrow band (opt-in: GGML_OPENCL_Q4K_COK_DP4A).
+        //
+        // ne1 = 2..8 runs the f16 cok kernel today. The dp4a prefill GEMM loses there,
+        // but that kernel amortises its weight read and scale unpack across a
+        // TILESIZE_N-wide tile, so narrowing it to 8 makes the amortisation four times
+        // worse -- it tests a wide kernel narrowed, not whether int8 helps at narrow
+        // batch. This arm keeps cok's shape (4-row fold, K-split) and changes only the
+        // inner product, so it pays for the q8_1 activation pre-pass cok avoids
+        // entirely. Whether that pre-pass eats the 1.67x arithmetic advantage is the
+        // whole question; see feature-report/cok-dp4a-scope-2026-08-30.md.
+        static const char * q4k_cok_dp4a_env = getenv("GGML_OPENCL_Q4K_COK_DP4A");
+        if (q4k_cok_dp4a_env && atoi(q4k_cok_dp4a_env) != 0
+            && backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a != nullptr
+            && ne1 >= 2 && ne1 <= 8
+            && ne01 % 4 == 0 && K % 32 == 0) {
+            // The kernel reads a fixed 8 columns per lane, so the activation side is
+            // sized at 8 whatever ne1 is; the padded columns are computed and dropped at
+            // the store. Zero the pad rather than letting uninitialised memory into
+            // lanes nobody reads: the lanes are independent so it could not corrupt a
+            // real column, but a run that is not deterministic cannot be A/B'd, and the
+            // validation here is decode PPL against a control.
+            const int    NPAD      = 8;
+            const size_t qa_bytes  = (size_t)NPAD * K * sizeof(cl_char);
+            const size_t nb_pad    = (size_t)NPAD * (K / 32);
+            backend_ctx->prealloc_moe_qa.allocate(context, qa_bytes);
+            backend_ctx->prealloc_moe_da.allocate(context, nb_pad * sizeof(cl_half));
+            backend_ctx->prealloc_moe_sa.allocate(context, nb_pad * sizeof(cl_half));
+            if (N < NPAD) {
+                const cl_char  z8  = 0;
+                const cl_half  z16 = 0;
+                CL_CHECK(clEnqueueFillBuffer(backend_ctx->queue, backend_ctx->prealloc_moe_qa.buffer,
+                                             &z8,  sizeof(z8),  0, qa_bytes, 0, NULL, NULL));
+                CL_CHECK(clEnqueueFillBuffer(backend_ctx->queue, backend_ctx->prealloc_moe_da.buffer,
+                                             &z16, sizeof(z16), 0, nb_pad * sizeof(cl_half), 0, NULL, NULL));
+                CL_CHECK(clEnqueueFillBuffer(backend_ctx->queue, backend_ctx->prealloc_moe_sa.buffer,
+                                             &z16, sizeof(z16), 0, nb_pad * sizeof(cl_half), 0, NULL, NULL));
+            }
+
+            cl_int tbq = (cl_int)((size_t)N * (K / 32));
+            cl_kernel qk = backend_ctx->kernel_quant_a_q8_1;
+            CL_CHECK(clSetKernelArg(qk, 0, sizeof(cl_mem), &b_sub_buf));
+            CL_CHECK(clSetKernelArg(qk, 1, sizeof(cl_mem), &backend_ctx->prealloc_moe_qa.buffer));
+            CL_CHECK(clSetKernelArg(qk, 2, sizeof(cl_mem), &backend_ctx->prealloc_moe_da.buffer));
+            CL_CHECK(clSetKernelArg(qk, 3, sizeof(cl_mem), &backend_ctx->prealloc_moe_sa.buffer));
+            CL_CHECK(clSetKernelArg(qk, 4, sizeof(cl_int), &tbq));
+            size_t q_local[1]  = { 64 };
+            size_t q_global[1] = { (size_t)((((size_t)tbq + 63) / 64) * 64) };
+            backend_ctx->enqueue_ndrange_kernel(qk, 1, q_global, q_local, dst);
+
+            cl_kernel ck = backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a;
+            CL_CHECK(clSetKernelArg(ck,  0, sizeof(cl_mem),   &extra0_q4_k->q));
+            CL_CHECK(clSetKernelArg(ck,  1, sizeof(cl_mem),   &extra0_q4_k->s));
+            CL_CHECK(clSetKernelArg(ck,  2, sizeof(cl_mem),   &extra0_q4_k->d));
+            CL_CHECK(clSetKernelArg(ck,  3, sizeof(cl_mem),   &extra0_q4_k->dm));
+            CL_CHECK(clSetKernelArg(ck,  4, sizeof(cl_mem),   &backend_ctx->prealloc_moe_qa.buffer));
+            CL_CHECK(clSetKernelArg(ck,  5, sizeof(cl_mem),   &backend_ctx->prealloc_moe_da.buffer));
+            CL_CHECK(clSetKernelArg(ck,  6, sizeof(cl_mem),   &backend_ctx->prealloc_moe_sa.buffer));
+            CL_CHECK(clSetKernelArg(ck,  7, sizeof(cl_mem),   &extrad->data_device));
+            CL_CHECK(clSetKernelArg(ck,  8, sizeof(cl_ulong), &offsetd));
+            CL_CHECK(clSetKernelArg(ck,  9, sizeof(cl_int),   &ne01));
+            CL_CHECK(clSetKernelArg(ck, 10, sizeof(cl_int),   &N));
+            CL_CHECK(clSetKernelArg(ck, 11, sizeof(cl_int),   &ne00));
+            CL_CHECK(clSetKernelArg(ck, 12, sizeof(cl_int),   &ne1));
+            CL_CHECK(clSetKernelArg(ck, 13, sizeof(cl_uchar), &mask_d6));
+            CL_CHECK(clSetKernelArg(ck, 14, sizeof(cl_uchar), &mask_d4));
+            CL_CHECK(clSetKernelArg(ck, 15, sizeof(cl_uchar), &mask_hi2));
+
+            // One lane per 4 output rows, COK_NSG subgroups splitting K -- the geometry
+            // cok_r4 uses. COK_NSG is compile-time (it sizes the LDS reduce buffer), so
+            // the dispatch must use the value the program was actually built at.
+            const size_t cok_nsg = (size_t)backend_ctx->q4k_cok_dp4a_nsg_eff;
+            size_t c_local[3]  = { 64, cok_nsg, 1 };
+            size_t c_global[3] = { (size_t)CEIL_DIV(ne01 / 4, 64) * 64, cok_nsg, 1 };
+            backend_ctx->enqueue_ndrange_kernel(ck, 3, c_global, c_local, dst);
+
+            CL_CHECK(clReleaseMemObject(b_sub_buf));
+            return;
+        }
+
         // image for activations
         img_fmt = {CL_RGBA, CL_FLOAT};
         memset(&img_desc, 0, sizeof(img_desc));
