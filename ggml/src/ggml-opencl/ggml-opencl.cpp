@@ -36236,6 +36236,43 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
 
+    // Which batch widths does the real workload actually run at?
+    //
+    // The narrow dp4a kernels serve ne1 2..4, and that is only worth having if the
+    // workload lands there. A speculative-decode verify step runs at the accepted draft
+    // width, and this backend has previously tuned a dp4a tile for ne1 9..16 -- so the
+    // answer is an open question, not an assumption. GGML_OPENCL_NE1_HIST=1 counts every
+    // matmul by width and quant, and prints at exit.
+    if (getenv("GGML_OPENCL_NE1_HIST")) {
+        struct ne1_hist {
+            // [0]=1, [1]=2, [2]=3, [3]=4, [4]=5..8, [5]=9..16, [6]=17..64, [7]=>64
+            unsigned long long n[8]  = {0};
+            unsigned long long q4[8] = {0};
+            unsigned long long q6[8] = {0};
+            ~ne1_hist() {
+                static const char * lbl[8] = {"1","2","3","4","5-8","9-16","17-64",">64"};
+                unsigned long long tot = 0;
+                for (int i = 0; i < 8; i++) { tot += n[i]; }
+                if (!tot) { return; }
+                fprintf(stderr, "[NE1-HIST] matmul dispatches by batch width (total %llu)\n", tot);
+                for (int i = 0; i < 8; i++) {
+                    fprintf(stderr, "[NE1-HIST] %-6s %10llu  %5.1f%%   q4_K %8llu  q6_K %8llu\n",
+                            lbl[i], n[i], 100.0 * (double)n[i] / (double)tot, q4[i], q6[i]);
+                }
+                fflush(stderr);
+            }
+        };
+        static ne1_hist H;
+        const int64_t w = dst->ne[1];
+        const int b = (w <= 4) ? (int)(w - 1)
+                    : (w <= 8) ? 4 : (w <= 16) ? 5 : (w <= 64) ? 6 : 7;
+        if (b >= 0 && b < 8) {
+            H.n[b]++;
+            if (src0->type == GGML_TYPE_Q4_K) { H.q4[b]++; }
+            if (src0->type == GGML_TYPE_Q6_K) { H.q6[b]++; }
+        }
+    }
+
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
     // GQA-coalesced decode KQ for a q8_0 K-cache (DK=128, r2=8, ne11==1) -- the
     // fa=0 quant-K analog of the f16 _x8_gqa4 image coalesce. The K cache is an
