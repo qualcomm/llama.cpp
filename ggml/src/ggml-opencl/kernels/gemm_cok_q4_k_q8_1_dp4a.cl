@@ -50,6 +50,7 @@ inline void get_scale_min_k4_c(int j, global const uchar * q, int stride,
     }
 }
 
+__attribute__((qcom_wave_pair_mode(1)))
 kernel void kernel_gemm_cok_q4_k_q8_1_dp4a(
     global const ushort * src0_q,     // q4_K nibble plane   [row + (K/4)*m]
     global const uchar  * src0_s,     // packed scales/mins
@@ -110,11 +111,8 @@ kernel void kernel_gemm_cok_q4_k_q8_1_dp4a(
         #pragma unroll
         for (int c = 0; c < 8; ++c) { s0[c] = 0; s1[c] = 0; s2[c] = 0; s3[c] = 0; }
 
-        // 8 sub-steps of 4 K values each.
-        // NOT unrolled: unrolling both this and the column loop inlines 256 dp4a plus 32
-        // nibble expansions into one body, which crashes the Adreno online compiler
-        // (0xC0000005 inside clBuildProgram). Same fragility class as the DK>=256 FA
-        // programs that had to drop their unroll hints.
+        // 8 sub-steps of 4 K values each
+        #pragma unroll
         for (int u = 0; u < 8; ++u) {
             const int ku = (i >> 2) + u;                       // K/4 index
             ushort4 bits = vload4(0, src0_q + row0 + ku * m);  // 4 rows x 4 K nibbles
@@ -123,6 +121,7 @@ kernel void kernel_gemm_cok_q4_k_q8_1_dp4a(
             const uint w2 = EXP4(bits.s2);
             const uint w3 = EXP4(bits.s3);
 
+            #pragma unroll
             for (int c = 0; c < 8; ++c) {
                 const uint a = src1_qa[(uint)c * k_u + ku];
                 s0[c] = dot_acc_sat_4x8packed_ss_int(w0, a, s0[c]);

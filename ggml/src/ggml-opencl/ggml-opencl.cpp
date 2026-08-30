@@ -8445,6 +8445,19 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         GGML_LOG_INFO("ggml_opencl: q4_K cok+dp4a narrow GEMM %s (COK_NSG=%d)\n",
                       backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a ? "loaded" : "UNAVAILABLE",
                       backend_ctx->q4k_cok_dp4a_nsg_eff);
+        if (backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a) {
+            // The scope's top risk is register pressure, not arithmetic: a half8 kernel
+            // measured a 43x collapse purely from crossing the 512 B/WI spill cliff. Ask
+            // the driver rather than inferring it from timings.
+            cl_ulong pmc = 0, lmc = 0; size_t wgc = 0;
+            cl_kernel kk = backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a;
+            clGetKernelWorkGroupInfo(kk, backend_ctx->device, CL_KERNEL_PRIVATE_MEM_SIZE, sizeof(pmc), &pmc, NULL);
+            clGetKernelWorkGroupInfo(kk, backend_ctx->device, CL_KERNEL_LOCAL_MEM_SIZE,   sizeof(lmc), &lmc, NULL);
+            clGetKernelWorkGroupInfo(kk, backend_ctx->device, CL_KERNEL_WORK_GROUP_SIZE,  sizeof(wgc), &wgc, NULL);
+            fprintf(stderr, "[COK-DP4A] private=%llu local=%llu wg_cap=%zu\n",
+                    (unsigned long long)pmc, (unsigned long long)lmc, wgc);
+            fflush(stderr);
+        }
         GGML_LOG_CONT(".");
     }
 
