@@ -1912,7 +1912,9 @@ struct ggml_backend_opencl_context {
     // Opt-in (GGML_OPENCL_Q4K_COK_DP4A): it exists to test whether int8 arithmetic
     // beats the f16 cok kernel there, so it must not displace the default dispatch.
     cl_kernel kernel_gemm_cok_q4_k_q8_1_dp4a = nullptr;
-    int       q4k_cok_dp4a_nsg_eff = 8;
+    cl_kernel kernel_gemm_cok_q4_k_q8_1_dp4a_c4 = nullptr;  // 4-column build for ne1 <= 4
+    int       q4k_cok_dp4a_nsg_eff = 4;
+    int       q4k_cok_dp4a_rows    = 4;
     int q4k_dp4a_ts_narrow = 32;  // tile for the verify band; == q4k_dp4a_ts disables the split
     int q4k_dp4a_narrow_max = 16; // widest ne1 routed to the narrow tile
     int q4k_dp4a_ts_mid    = 24;  // tile for ne1 in (narrow_max, mid_max]
@@ -8444,35 +8446,54 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         int nsg_req = 4;
         if (const char * e = getenv("GGML_OPENCL_Q4K_COK_DP4A_NSG")) { nsg_req = atoi(e); }
         // Debug bisect: 1 = launch geometry only, 2 = K loop without the reduction,
-        // 3 = full kernel. Build-time, but selected from the environment so localising
-        // a stall costs three runs and no rebuild.
+        // 3 = full kernel. Build-time, selected from the environment.
         int cok_stage = 3;
         if (const char * e = getenv("GGML_OPENCL_Q4K_COK_DP4A_STAGE")) { cok_stage = atoi(e); }
-        cl_program prog = ggml_cl_build_cok_program(
-            backend_ctx, kernel_src.c_str(),
-            compile_opts + " -DCOK_STAGE=" + std::to_string(cok_stage), nsg_req,
-            &backend_ctx->q4k_cok_dp4a_nsg_eff);
-        backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a =
-            clCreateKernel(prog, "kernel_gemm_cok_q4_k_q8_1_dp4a", &err);
-        if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a = nullptr; }
-        if (backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a) {
-            // Private memory is the number to watch, and not only for the 512 B/WI
-            // spill cliff: the build whose accumulators landed in private memory
-            // rather than registers could not finish a single narrow pass at all.
-            cl_ulong pmc = 0, lmc = 0; size_t wgc = 0;
-            cl_kernel kk = backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a;
-            clGetKernelWorkGroupInfo(kk, backend_ctx->device, CL_KERNEL_PRIVATE_MEM_SIZE, sizeof(pmc), &pmc, NULL);
-            clGetKernelWorkGroupInfo(kk, backend_ctx->device, CL_KERNEL_LOCAL_MEM_SIZE,   sizeof(lmc), &lmc, NULL);
-            clGetKernelWorkGroupInfo(kk, backend_ctx->device, CL_KERNEL_WORK_GROUP_SIZE,  sizeof(wgc), &wgc, NULL);
-            fprintf(stderr, "[COK-DP4A] private=%llu local=%llu wg_cap=%zu nsg=%d\n",
-                    (unsigned long long)pmc, (unsigned long long)lmc, wgc,
-                    backend_ctx->q4k_cok_dp4a_nsg_eff);
-            fflush(stderr);
+        int cok_rows = 4;
+        if (const char * e = getenv("GGML_OPENCL_Q4K_COK_DP4A_ROWS")) { cok_rows = atoi(e); }
+        // 4, not 8. The driver reports CL_KERNEL_WORK_GROUP_SIZE = 512 for this kernel
+        // and accepts a 64x8 launch, then the reduction deadlocks. That query is a
+        // MAXIMUM in any case, not an optimum: taking it maximises register demand per
+        // workgroup and minimises how many can be resident, so it is tuned, not adopted.
+        int nsg_req = 4;
+        if (const char * e = getenv("GGML_OPENCL_Q4K_COK_DP4A_NSG")) { nsg_req = atoi(e); }
+
+        // Two column widths. The band is ne1 = 2..8 and an 8-column lane computes 8
+        // columns whatever ne1 is, so at ne1=2 six are discarded -- and that is where
+        // the 8-column build loses worst. The 4-column build halves the accumulator and
+        // dot registers and the work; the dispatch picks by ne1.
+        const std::string base_opts = compile_opts
+            + " -DCOK_STAGE=" + std::to_string(cok_stage)
+            + " -DCOK_ROWS="  + std::to_string(cok_rows);
+        for (int cols : {8, 4}) {
+            int nsg_eff = nsg_req;
+            cl_program prog = ggml_cl_build_cok_program(
+                backend_ctx, kernel_src.c_str(),
+                base_opts + " -DCOK_COLS=" + std::to_string(cols), nsg_req, &nsg_eff);
+            cl_kernel kk = clCreateKernel(prog, "kernel_gemm_cok_q4_k_q8_1_dp4a", &err);
+            if (err != CL_SUCCESS) { kk = nullptr; }
+            if (kk) {
+                // PRIVATE MEM IS SCRATCH, NOT REGISTER COUNT: a kernel that keeps
+                // everything in registers reports 0. Any nonzero figure here is spill
+                // traffic on every access, so it is the number to tune against.
+                cl_ulong pmc = 0, lmc = 0; size_t wgc = 0;
+                clGetKernelWorkGroupInfo(kk, backend_ctx->device, CL_KERNEL_PRIVATE_MEM_SIZE, sizeof(pmc), &pmc, NULL);
+                clGetKernelWorkGroupInfo(kk, backend_ctx->device, CL_KERNEL_LOCAL_MEM_SIZE,   sizeof(lmc), &lmc, NULL);
+                clGetKernelWorkGroupInfo(kk, backend_ctx->device, CL_KERNEL_WORK_GROUP_SIZE,  sizeof(wgc), &wgc, NULL);
+                fprintf(stderr, "[COK-DP4A] rows=%d cols=%d nsg=%d  private=%5llu (spill) local=%6llu wg_cap=%4zu\n",
+                        cok_rows, cols, nsg_eff, (unsigned long long)pmc,
+                        (unsigned long long)lmc, wgc);
+            }
+            if (cols == 8) { backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a    = kk; }
+            else           { backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a_c4 = kk; }
+            backend_ctx->q4k_cok_dp4a_nsg_eff = nsg_eff;
+            backend_ctx->q4k_cok_dp4a_rows    = cok_rows;
+            CL_CHECK(clReleaseProgram(prog));
         }
-        CL_CHECK(clReleaseProgram(prog));
-        GGML_LOG_INFO("ggml_opencl: q4_K cok+dp4a narrow GEMM %s (COK_NSG=%d)\n",
+        fflush(stderr);
+        GGML_LOG_INFO("ggml_opencl: q4_K cok+dp4a narrow GEMM %s (rows=%d COK_NSG=%d)\n",
                       backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a ? "loaded" : "UNAVAILABLE",
-                      backend_ctx->q4k_cok_dp4a_nsg_eff);
+                      backend_ctx->q4k_cok_dp4a_rows, backend_ctx->q4k_cok_dp4a_nsg_eff);
         GGML_LOG_CONT(".");
     }
 
@@ -33807,7 +33828,7 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
         if (q4k_cok_dp4a_env && atoi(q4k_cok_dp4a_env) != 0
             && backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a != nullptr
             && ne1 >= 2 && ne1 <= 8
-            && ne01 % 256 == 0 && K % 32 == 0) {
+            && ne01 % (64 * backend_ctx->q4k_cok_dp4a_rows) == 0 && K % 32 == 0) {
             // ne01 % 256, not % 4: one lane covers 4 rows and the workgroup is 64
             // lanes wide, so the row axis must divide evenly. Padding the global size
             // instead would create lanes with row0 >= ne01, and the kernel guards the
@@ -33851,7 +33872,12 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
                 fprintf(stderr, "[COK-DP4A] quant_a_q8_1 done\n"); fflush(stderr);
             }
 
-            cl_kernel ck = backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a;
+            // Pick the column width by the actual batch. An 8-column lane computes 8
+            // columns whatever ne1 is, so ne1<=4 was paying for six discarded columns --
+            // and ne1=2 is where this arm lost worst.
+            cl_kernel ck = (ne1 <= 4 && backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a_c4)
+                         ? backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a_c4
+                         : backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a;
             CL_CHECK(clSetKernelArg(ck,  0, sizeof(cl_mem),   &extra0_q4_k->q));
             CL_CHECK(clSetKernelArg(ck,  1, sizeof(cl_mem),   &extra0_q4_k->s));
             CL_CHECK(clSetKernelArg(ck,  2, sizeof(cl_mem),   &extra0_q4_k->d));
@@ -33874,7 +33900,7 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
             // the dispatch must use the value the program was actually built at.
             const size_t cok_nsg = (size_t)backend_ctx->q4k_cok_dp4a_nsg_eff;
             size_t c_local[3]  = { 64, cok_nsg, 1 };
-            size_t c_global[3] = { (size_t)(ne01 / 4), cok_nsg, 1 };
+            size_t c_global[3] = { (size_t)(ne01 / backend_ctx->q4k_cok_dp4a_rows), cok_nsg, 1 };
             backend_ctx->enqueue_ndrange_kernel(ck, 3, c_global, c_local, dst);
             if (cok_trace) {
                 CL_CHECK(clFinish(backend_ctx->queue));

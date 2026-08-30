@@ -23,6 +23,23 @@
 // hint and did NOT rescue it. Vector components are addressed by name and cannot be
 // spilled that way, so the column dimension is written out explicitly, and the reduction
 // uses named registers rather than a `float8 out[4]` indexed by the row loop variable.
+//
+// TWO TUNING AXES, because the first measurement of this kernel was confounded by both.
+//
+//   COK_ROWS (4 or 2) -- output rows folded per lane. 4 shares one weight read and one
+//   scale unpack across four rows, but holds 4 accumulators plus 4 dot vectors live.
+//
+//   COK_COLS (8 or 4) -- columns per lane. The band is ne1 = 2..8 and a float8 lane
+//   computes 8 columns whatever ne1 is, so at ne1=2 SIX of the eight are discarded at the
+//   store. A 4-column build halves both the accumulator and the dot registers AND the
+//   work for the low half of the band, which is exactly where the 8-column build loses
+//   worst (2.69x at pp2 against 1.58x at pp8).
+//
+// Both matter because CL_KERNEL_PRIVATE_MEM_SIZE for this kernel is not 0: it spills.
+// A kernel that keeps everything in registers reports 0, so any nonzero figure here is
+// scratch traffic, and the workgroup size must be TUNED against it rather than set to
+// whatever CL_KERNEL_WORK_GROUP_SIZE reports -- that is a maximum, and taking it
+// maximises register demand per workgroup and minimises how many can be resident.
 
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
 #ifdef cl_khr_integer_dot_product
@@ -33,18 +50,29 @@
 #define K_SCALE_SIZE   12
 
 #ifndef COK_NSG
-#define COK_NSG 8
+#define COK_NSG 4
+#endif
+#define COK_SG  64
+
+#ifndef COK_ROWS
+#define COK_ROWS 4
+#endif
+#ifndef COK_COLS
+#define COK_COLS 8
 #endif
 
-// Debug bisect, selected at build time from GGML_OPENCL_Q4K_COK_DP4A_STAGE:
-//   1 = launch geometry only (store zeros, no K loop)
-//   2 = K loop, no cross-subgroup reduction
-//   3 = full kernel (default)
-// One build serves all three, so localising a stall costs three runs and no rebuild.
+// Debug bisect: 1 = launch geometry only, 2 = K loop without the reduction, 3 = full.
 #ifndef COK_STAGE
 #define COK_STAGE 3
 #endif
-#define COK_SG  64
+
+#if COK_COLS == 8
+typedef float8 cok_accv;
+typedef int8   cok_dotv;
+#else
+typedef float4 cok_accv;
+typedef int4   cok_dotv;
+#endif
 
 // One packed q4_K ushort holds 4 consecutive-K nibbles for one row; spread them into the
 // 4 bytes of a uint so dp4a can take it directly. Same expansion the prefill GEMM uses.
@@ -52,6 +80,25 @@
                   (((uint)((u) & 0x00F0u)) << 4)  | \
                   (((uint)((u) & 0x0F00u)) << 8)  | \
                   (((uint)((u) & 0xF000u)) << 12) )
+
+// Per-column work, expanded by name so no index is ever a variable.
+#if COK_ROWS == 4
+#define COK_DOT_COL(ci)                                                     \
+    s0.s##ci = dot_acc_sat_4x8packed_ss_int(w0, a##ci, s0.s##ci);           \
+    s1.s##ci = dot_acc_sat_4x8packed_ss_int(w1, a##ci, s1.s##ci);           \
+    s2.s##ci = dot_acc_sat_4x8packed_ss_int(w2, a##ci, s2.s##ci);           \
+    s3.s##ci = dot_acc_sat_4x8packed_ss_int(w3, a##ci, s3.s##ci);
+#else
+#define COK_DOT_COL(ci)                                                     \
+    s0.s##ci = dot_acc_sat_4x8packed_ss_int(w0, a##ci, s0.s##ci);           \
+    s1.s##ci = dot_acc_sat_4x8packed_ss_int(w1, a##ci, s1.s##ci);
+#endif
+
+#if COK_COLS == 8
+#define COK_FOR_COLS(F) F(0) F(1) F(2) F(3) F(4) F(5) F(6) F(7)
+#else
+#define COK_FOR_COLS(F) F(0) F(1) F(2) F(3)
+#endif
 
 inline void get_scale_min_k4_c(int j, global const uchar * q, int stride,
                                uchar * d, uchar * m,
@@ -85,11 +132,11 @@ kernel void kernel_gemm_cok_q4_k_q8_1_dp4a(
 ) {
     dst = (global float *)((global char *)dst + offsetd);
 
-    const int gx   = get_global_id(0);   // 4-row group
+    const int gx   = get_global_id(0);   // row group
     const int sg   = get_local_id(1);    // K-split subgroup
     const int lane = get_local_id(0);
 
-    const int row0 = gx << 2;
+    const int row0 = gx * COK_ROWS;
     const int num_32blk = k / 32;
     const int k_u = k >> 2;              // K in uint (int8x4) units
     const int k_b = k >> 5;              // 32-blocks along K
@@ -97,26 +144,29 @@ kernel void kernel_gemm_cok_q4_k_q8_1_dp4a(
     // Columns past n_no_padding are computed and discarded at the store. Clamp them to a
     // real column so every read stays in bounds and initialised -- the host then needs no
     // zero-padded activation buffer, which it could not fill with clEnqueueFillBuffer
-    // anyway while a recordable queue is capturing. Hoisted out of the K loop: these
-    // depend only on the dispatch.
+    // anyway while a recordable queue is capturing. Hoisted: these depend only on the
+    // dispatch, not on the K loop.
     const int nl = n_no_padding - 1;
     const int c0 = 0;
     const int c1 = (1 < n_no_padding) ? 1 : nl;
     const int c2 = (2 < n_no_padding) ? 2 : nl;
     const int c3 = (3 < n_no_padding) ? 3 : nl;
+#if COK_COLS == 8
     const int c4 = (4 < n_no_padding) ? 4 : nl;
     const int c5 = (5 < n_no_padding) ? 5 : nl;
     const int c6 = (6 < n_no_padding) ? 6 : nl;
     const int c7 = (7 < n_no_padding) ? 7 : nl;
+#endif
 
-    // Scaled results, one float8 per folded row: 8 columns in the vector lanes, as cok.
-    float8 acc0 = (float8)(0.0f), acc1 = (float8)(0.0f);
-    float8 acc2 = (float8)(0.0f), acc3 = (float8)(0.0f);
+    cok_accv acc0 = (cok_accv)(0.0f), acc1 = (cok_accv)(0.0f);
+#if COK_ROWS == 4
+    cok_accv acc2 = (cok_accv)(0.0f), acc3 = (cok_accv)(0.0f);
+#endif
 
 #if COK_STAGE == 1
     // Every work-item returns, so this is uniform and the barriers below are not reached.
     if (sg == 0 && row0 < m) {
-        vstore4((float4)(0.0f, 0.0f, 0.0f, 0.0f), 0, dst + row0);
+        dst[row0] = 0.0f;
     }
     return;
 #endif
@@ -126,121 +176,111 @@ kernel void kernel_gemm_cok_q4_k_q8_1_dp4a(
         const int sb_idx  = blk >> 3;
         const int sub_idx = blk & 7;
 
-        // one vector load each: the four rows are adjacent
-        half4 dd  = vload4(0, src0_d  + row0 + sb_idx * m);
-        half4 dmm = vload4(0, src0_dm + row0 + sb_idx * m);
-
         global const uchar * sc = src0_s + sb_idx * K_SCALE_SIZE * m + row0;
-        uchar sv0, mn0, sv1, mn1, sv2, mn2, sv3, mn3;
+        uchar sv0, mn0, sv1, mn1;
         get_scale_min_k4_c(sub_idx, sc + 0, m, &sv0, &mn0, mask_d6, mask_d4, mask_hi2);
         get_scale_min_k4_c(sub_idx, sc + 1, m, &sv1, &mn1, mask_d6, mask_d4, mask_hi2);
+#if COK_ROWS == 4
+        half4 dd  = vload4(0, src0_d  + row0 + sb_idx * m);
+        half4 dmm = vload4(0, src0_dm + row0 + sb_idx * m);
+        uchar sv2, mn2, sv3, mn3;
         get_scale_min_k4_c(sub_idx, sc + 2, m, &sv2, &mn2, mask_d6, mask_d4, mask_hi2);
         get_scale_min_k4_c(sub_idx, sc + 3, m, &sv3, &mn3, mask_d6, mask_d4, mask_hi2);
-
-        const float sc0 = (float)dd.s0 * (float)sv0, mv0 = (float)dmm.s0 * (float)mn0;
-        const float sc1 = (float)dd.s1 * (float)sv1, mv1 = (float)dmm.s1 * (float)mn1;
         const float sc2 = (float)dd.s2 * (float)sv2, mv2 = (float)dmm.s2 * (float)mn2;
         const float sc3 = (float)dd.s3 * (float)sv3, mv3 = (float)dmm.s3 * (float)mn3;
+#else
+        half2 dd  = vload2(0, src0_d  + row0 + sb_idx * m);
+        half2 dmm = vload2(0, src0_dm + row0 + sb_idx * m);
+#endif
+        const float sc0 = (float)dd.s0 * (float)sv0, mv0 = (float)dmm.s0 * (float)mn0;
+        const float sc1 = (float)dd.s1 * (float)sv1, mv1 = (float)dmm.s1 * (float)mn1;
 
-        // Raw int dot per (folded row, column), reset each 32-block because the weight
-        // scale and min above are per 32-block. int8 VECTORS, not int[8]: the column index
-        // has to be a name, never a variable (see the header).
-        int8 s0 = (int8)(0), s1 = (int8)(0), s2 = (int8)(0), s3 = (int8)(0);
+        // Raw int dot per (folded row, column). Reset each 32-block because the weight
+        // scale and min above are per 32-block. Vectors, never arrays.
+        cok_dotv s0 = (cok_dotv)(0), s1 = (cok_dotv)(0);
+#if COK_ROWS == 4
+        cok_dotv s2 = (cok_dotv)(0), s3 = (cok_dotv)(0);
+#endif
 
         for (int u = 0; u < 8; ++u) {
             const int ku = (i >> 2) + u;                       // K/4 index
-            ushort4 bits = vload4(0, src0_q + row0 + ku * m);  // 4 rows x 4 K nibbles
-            const uint w0 = EXP4(bits.s0);
-            const uint w1 = EXP4(bits.s1);
+#if COK_ROWS == 4
+            ushort4 bits = vload4(0, src0_q + row0 + ku * m);
             const uint w2 = EXP4(bits.s2);
             const uint w3 = EXP4(bits.s3);
+#else
+            ushort2 bits = vload2(0, src0_q + row0 + ku * m);
+#endif
+            const uint w0 = EXP4(bits.s0);
+            const uint w1 = EXP4(bits.s1);
 
             const uint a0 = src1_qa[(uint)c0 * k_u + ku];
             const uint a1 = src1_qa[(uint)c1 * k_u + ku];
             const uint a2 = src1_qa[(uint)c2 * k_u + ku];
             const uint a3 = src1_qa[(uint)c3 * k_u + ku];
+#if COK_COLS == 8
             const uint a4 = src1_qa[(uint)c4 * k_u + ku];
             const uint a5 = src1_qa[(uint)c5 * k_u + ku];
             const uint a6 = src1_qa[(uint)c6 * k_u + ku];
             const uint a7 = src1_qa[(uint)c7 * k_u + ku];
-
-            s0.s0 = dot_acc_sat_4x8packed_ss_int(w0, a0, s0.s0);
-            s0.s1 = dot_acc_sat_4x8packed_ss_int(w0, a1, s0.s1);
-            s0.s2 = dot_acc_sat_4x8packed_ss_int(w0, a2, s0.s2);
-            s0.s3 = dot_acc_sat_4x8packed_ss_int(w0, a3, s0.s3);
-            s0.s4 = dot_acc_sat_4x8packed_ss_int(w0, a4, s0.s4);
-            s0.s5 = dot_acc_sat_4x8packed_ss_int(w0, a5, s0.s5);
-            s0.s6 = dot_acc_sat_4x8packed_ss_int(w0, a6, s0.s6);
-            s0.s7 = dot_acc_sat_4x8packed_ss_int(w0, a7, s0.s7);
-
-            s1.s0 = dot_acc_sat_4x8packed_ss_int(w1, a0, s1.s0);
-            s1.s1 = dot_acc_sat_4x8packed_ss_int(w1, a1, s1.s1);
-            s1.s2 = dot_acc_sat_4x8packed_ss_int(w1, a2, s1.s2);
-            s1.s3 = dot_acc_sat_4x8packed_ss_int(w1, a3, s1.s3);
-            s1.s4 = dot_acc_sat_4x8packed_ss_int(w1, a4, s1.s4);
-            s1.s5 = dot_acc_sat_4x8packed_ss_int(w1, a5, s1.s5);
-            s1.s6 = dot_acc_sat_4x8packed_ss_int(w1, a6, s1.s6);
-            s1.s7 = dot_acc_sat_4x8packed_ss_int(w1, a7, s1.s7);
-
-            s2.s0 = dot_acc_sat_4x8packed_ss_int(w2, a0, s2.s0);
-            s2.s1 = dot_acc_sat_4x8packed_ss_int(w2, a1, s2.s1);
-            s2.s2 = dot_acc_sat_4x8packed_ss_int(w2, a2, s2.s2);
-            s2.s3 = dot_acc_sat_4x8packed_ss_int(w2, a3, s2.s3);
-            s2.s4 = dot_acc_sat_4x8packed_ss_int(w2, a4, s2.s4);
-            s2.s5 = dot_acc_sat_4x8packed_ss_int(w2, a5, s2.s5);
-            s2.s6 = dot_acc_sat_4x8packed_ss_int(w2, a6, s2.s6);
-            s2.s7 = dot_acc_sat_4x8packed_ss_int(w2, a7, s2.s7);
-
-            s3.s0 = dot_acc_sat_4x8packed_ss_int(w3, a0, s3.s0);
-            s3.s1 = dot_acc_sat_4x8packed_ss_int(w3, a1, s3.s1);
-            s3.s2 = dot_acc_sat_4x8packed_ss_int(w3, a2, s3.s2);
-            s3.s3 = dot_acc_sat_4x8packed_ss_int(w3, a3, s3.s3);
-            s3.s4 = dot_acc_sat_4x8packed_ss_int(w3, a4, s3.s4);
-            s3.s5 = dot_acc_sat_4x8packed_ss_int(w3, a5, s3.s5);
-            s3.s6 = dot_acc_sat_4x8packed_ss_int(w3, a6, s3.s6);
-            s3.s7 = dot_acc_sat_4x8packed_ss_int(w3, a7, s3.s7);
+#endif
+            COK_FOR_COLS(COK_DOT_COL)
         }
 
         // q4_K value is (q*scale - min), so per 32-block:
         //   out += scale * d_act * dot(q, a)  -  min * sum_act
         // where sum_act is q8_1's block sum (already carrying d_act).
-        float8 da, sa;
+        cok_accv da, sa;
         da.s0 = (float)src1_da[c0*k_b + blk];  sa.s0 = (float)src1_sa[c0*k_b + blk];
         da.s1 = (float)src1_da[c1*k_b + blk];  sa.s1 = (float)src1_sa[c1*k_b + blk];
         da.s2 = (float)src1_da[c2*k_b + blk];  sa.s2 = (float)src1_sa[c2*k_b + blk];
         da.s3 = (float)src1_da[c3*k_b + blk];  sa.s3 = (float)src1_sa[c3*k_b + blk];
+#if COK_COLS == 8
         da.s4 = (float)src1_da[c4*k_b + blk];  sa.s4 = (float)src1_sa[c4*k_b + blk];
         da.s5 = (float)src1_da[c5*k_b + blk];  sa.s5 = (float)src1_sa[c5*k_b + blk];
         da.s6 = (float)src1_da[c6*k_b + blk];  sa.s6 = (float)src1_sa[c6*k_b + blk];
         da.s7 = (float)src1_da[c7*k_b + blk];  sa.s7 = (float)src1_sa[c7*k_b + blk];
+#endif
 
+#if COK_COLS == 8
         acc0 += sc0 * da * convert_float8(s0) - mv0 * sa;
         acc1 += sc1 * da * convert_float8(s1) - mv1 * sa;
+#if COK_ROWS == 4
         acc2 += sc2 * da * convert_float8(s2) - mv2 * sa;
         acc3 += sc3 * da * convert_float8(s3) - mv3 * sa;
+#endif
+#else
+        acc0 += sc0 * da * convert_float4(s0) - mv0 * sa;
+        acc1 += sc1 * da * convert_float4(s1) - mv1 * sa;
+#if COK_ROWS == 4
+        acc2 += sc2 * da * convert_float4(s2) - mv2 * sa;
+        acc3 += sc3 * da * convert_float4(s3) - mv3 * sa;
+#endif
+#endif
     }
 
 #if COK_STAGE == 2
     if (sg == 0 && row0 < m) {
-        vstore4((float4)(acc0.s0, acc1.s0, acc2.s0, acc3.s0), 0, dst + row0);
+        dst[row0] = acc0.s0;
     }
     return;
 #endif
 
     // Cross-subgroup reduction over the K-split, one row at a time so the __local buffer
     // stays the size of the 1-row kernel's -- same shape as cok_r4. Written out per row
-    // rather than looping over a `float8 out[4]`: that array was indexed by the loop
-    // variable, which is the private-memory trap this kernel exists to avoid.
-    local float8 reduceLM[COK_SG * (COK_NSG - 1)];
-    float8 out0 = (float8)(0.0f), out1 = (float8)(0.0f);
-    float8 out2 = (float8)(0.0f), out3 = (float8)(0.0f);
+    // rather than looping over an out[] array indexed by the loop variable.
+    local cok_accv reduceLM[COK_SG * (COK_NSG - 1)];
+    cok_accv out0 = (cok_accv)(0.0f), out1 = (cok_accv)(0.0f);
+#if COK_ROWS == 4
+    cok_accv out2 = (cok_accv)(0.0f), out3 = (cok_accv)(0.0f);
+#endif
 
 #define COK_REDUCE(accv, outv)                                       \
     barrier(CLK_LOCAL_MEM_FENCE);                                    \
     if (sg > 0) { reduceLM[(sg - 1) * COK_SG + lane] = (accv); }     \
     barrier(CLK_LOCAL_MEM_FENCE);                                    \
     if (sg == 0) {                                                   \
-        float8 sum = (accv);                                         \
+        cok_accv sum = (accv);                                       \
         for (int s = 0; s < COK_NSG - 1; s++) {                      \
             sum += reduceLM[s * COK_SG + lane];                      \
         }                                                            \
@@ -249,21 +289,32 @@ kernel void kernel_gemm_cok_q4_k_q8_1_dp4a(
 
     COK_REDUCE(acc0, out0)
     COK_REDUCE(acc1, out1)
+#if COK_ROWS == 4
     COK_REDUCE(acc2, out2)
     COK_REDUCE(acc3, out3)
+#endif
 
 #undef COK_REDUCE
 
-    if (sg == 0) {
-        // dst is [token, feature]: four adjacent rows are contiguous, one vstore4.
-        int idx = row0;
-        if (idx < m*n_no_padding) { vstore4((float4)(out0.s0, out1.s0, out2.s0, out3.s0), 0, dst + idx); idx += m; }
-        if (idx < m*n_no_padding) { vstore4((float4)(out0.s1, out1.s1, out2.s1, out3.s1), 0, dst + idx); idx += m; }
-        if (idx < m*n_no_padding) { vstore4((float4)(out0.s2, out1.s2, out2.s2, out3.s2), 0, dst + idx); idx += m; }
-        if (idx < m*n_no_padding) { vstore4((float4)(out0.s3, out1.s3, out2.s3, out3.s3), 0, dst + idx); idx += m; }
-        if (idx < m*n_no_padding) { vstore4((float4)(out0.s4, out1.s4, out2.s4, out3.s4), 0, dst + idx); idx += m; }
-        if (idx < m*n_no_padding) { vstore4((float4)(out0.s5, out1.s5, out2.s5, out3.s5), 0, dst + idx); idx += m; }
-        if (idx < m*n_no_padding) { vstore4((float4)(out0.s6, out1.s6, out2.s6, out3.s6), 0, dst + idx); idx += m; }
-        if (idx < m*n_no_padding) { vstore4((float4)(out0.s7, out1.s7, out2.s7, out3.s7), 0, dst + idx); }
+#if COK_ROWS == 4
+#define COK_STORE_COL(ci)                                                                   \
+    if (idx < m*n_no_padding) {                                                             \
+        vstore4((float4)(out0.s##ci, out1.s##ci, out2.s##ci, out3.s##ci), 0, dst + idx);    \
+        idx += m;                                                                           \
     }
+#else
+#define COK_STORE_COL(ci)                                                                   \
+    if (idx < m*n_no_padding) {                                                             \
+        vstore2((float2)(out0.s##ci, out1.s##ci), 0, dst + idx);                            \
+        idx += m;                                                                           \
+    }
+#endif
+
+    if (sg == 0) {
+        // dst is [token, feature]: the folded rows are adjacent, so one vector store.
+        int idx = row0;
+        COK_FOR_COLS(COK_STORE_COL)
+    }
+
+#undef COK_STORE_COL
 }
