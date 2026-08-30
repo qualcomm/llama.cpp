@@ -31770,8 +31770,8 @@ static void ggml_cl_mul_mat_q4_0_f32_adreno(ggml_backend_t backend, const ggml_t
         //
         // q4_0 is the simplest of the three: (q - 8) * d with one scale per 32-K block and
         // no min, so no sum_act correction and a single dot flush per block.
-        static const char * q40_cok_env = getenv("GGML_OPENCL_Q4K_COK_DP4A");
-        if (q40_cok_env && atoi(q40_cok_env) != 0
+        static const char * q40_cok_dp4a_env = getenv("GGML_OPENCL_Q4K_COK_DP4A");
+        if (q40_cok_dp4a_env && atoi(q40_cok_dp4a_env) != 0
             && ggml_cl_kquant_plane_dp4a_gemm_on(backend_ctx)
             && !adreno_art_compiler_quirks(backend_ctx)
             && backend_ctx->has_integer_dot_product
