@@ -8460,9 +8460,12 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         // columns whatever ne1 is, so at ne1=2 six are discarded -- and that is where
         // the 8-column build loses worst. The 4-column build halves the accumulator and
         // dot registers and the work; the dispatch picks by ne1.
+        int cok_kwide = 4;
+        if (const char * e = getenv("GGML_OPENCL_Q4K_COK_DP4A_KWIDE")) { cok_kwide = atoi(e); }
         const std::string base_opts = compile_opts
             + " -DCOK_STAGE=" + std::to_string(cok_stage)
-            + " -DCOK_ROWS="  + std::to_string(cok_rows);
+            + " -DCOK_ROWS="  + std::to_string(cok_rows)
+            + " -DCOK_KWIDE=" + std::to_string(cok_kwide);
         // NSG is per column width, not global. The narrow builds hold far fewer live
         // values and run best at 8 (n4: 357 us against 510 at nsg 4, and against a
         // 368 us control); the 8-column build deadlocks at 8 and takes 4.
