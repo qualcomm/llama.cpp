@@ -8529,7 +8529,10 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                 backend_ctx, kernel_src.c_str(),
                 base6 + " -DCOK_COLS=" + std::to_string(cols), nsg_eff, &nsg_eff);
             cl_kernel kk = clCreateKernel(prog, "kernel_gemm_cok_q6_k_q8_1_dp4a", &err);
-            if (err != CL_SUCCESS) { kk = nullptr; }
+            if (err != CL_SUCCESS) {
+                fprintf(stderr, "[COK-DP4A-q6K] cols=%d clCreateKernel FAILED err=%d\n", cols, err);
+                kk = nullptr;
+            }
             if (kk) {
                 cl_ulong pmc = 0, lmc = 0; size_t wgc = 0;
                 clGetKernelWorkGroupInfo(kk, backend_ctx->device, CL_KERNEL_PRIVATE_MEM_SIZE, sizeof(pmc), &pmc, NULL);
@@ -35052,7 +35055,8 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
         const bool is_output_w_cok = strncmp(src0->name, "output", 6) == 0 ||
                                      strncmp(src0->name, "token_embd", 10) == 0;
         if (q6k_cok_dp4a_env && atoi(q6k_cok_dp4a_env) != 0
-            && backend_ctx->kernel_gemm_cok_q6_k_q8_1_dp4a != nullptr
+            && ((ne1 <= 2) ? backend_ctx->kernel_gemm_cok_q6_k_q8_1_dp4a_c2
+                           : backend_ctx->kernel_gemm_cok_q6_k_q8_1_dp4a) != nullptr
             && !is_output_w_cok
             && ne1 >= 2 && ne1 <= 4
             && ne01 % (64 * backend_ctx->q6k_cok_dp4a_rows) == 0 && ne00 % 32 == 0) {
@@ -35091,9 +35095,8 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
             size_t q6_global[1] = { (size_t)((((size_t)tbq6 + 63) / 64) * 64) };
             backend_ctx->enqueue_ndrange_kernel(qk6, 1, q6_global, q6_local, dst);
 
-            cl_kernel ck6 = (N6 <= 2 && backend_ctx->kernel_gemm_cok_q6_k_q8_1_dp4a_c2)
-                          ? backend_ctx->kernel_gemm_cok_q6_k_q8_1_dp4a_c2
-                          : backend_ctx->kernel_gemm_cok_q6_k_q8_1_dp4a;
+            cl_kernel ck6 = (N6 <= 2) ? backend_ctx->kernel_gemm_cok_q6_k_q8_1_dp4a_c2
+                                      : backend_ctx->kernel_gemm_cok_q6_k_q8_1_dp4a;
             cl_ushort mf6 = 0xF000;
             cl_uchar  mc6 = 0xC0;
             const cl_int clamp6 = w6;
