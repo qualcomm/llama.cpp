@@ -33830,7 +33830,8 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
         static const char * q4k_cok_dp4a_env = getenv("GGML_OPENCL_Q4K_COK_DP4A");
         if (q4k_cok_dp4a_env && atoi(q4k_cok_dp4a_env) != 0
             && backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a != nullptr
-            && (ne1 == 2 || ne1 == 4)
+            && (ne1 == 2 || ne1 == 4 ||
+                (getenv("GGML_OPENCL_Q4K_COK_DP4A_WIDEA") && ne1 <= 4))
             && ne01 % (64 * backend_ctx->q4k_cok_dp4a_rows) == 0 && K % 32 == 0) {
             // EXACT width only, and that is a measurement, not a simplification. A lane
             // computes its whole column width whatever ne1 is, and the 4-column build costs
@@ -33850,8 +33851,17 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
             // beyond tidiness: while a recordable queue is capturing, only NDRange
             // enqueues are legal, so a clEnqueueFillBuffer here would be unordered
             // against the kernels around it or rejected outright.
-            const size_t qa_bytes = (size_t)N * K * sizeof(cl_char);
-            const size_t nb       = (size_t)N * (K / 32);
+            // Clamped columns make several lanes load the SAME address, and this build
+            // costs 483/443/353 us at ne1 2/3/4 for identical work. Over-allocating to the
+            // kernel's column width lets every column read a distinct address, testing
+            // whether that pattern is the gap. The pad is never written by the pre-pass, so
+            // it carries stale bytes -- harmless (the columns are discarded at the store and
+            // the accumulator lanes are independent) but not deterministic, hence opt-in.
+            static const char * cok_wide_env = getenv("GGML_OPENCL_Q4K_COK_DP4A_WIDEA");
+            const int cok_w = (ne1 <= 2) ? 2 : (ne1 <= 4 ? 4 : 8);
+            const int alloc_n = (cok_wide_env && atoi(cok_wide_env) != 0) ? cok_w : (int)N;
+            const size_t qa_bytes = (size_t)alloc_n * K * sizeof(cl_char);
+            const size_t nb       = (size_t)alloc_n * (K / 32);
             backend_ctx->prealloc_moe_qa.allocate(context, qa_bytes);
             backend_ctx->prealloc_moe_da.allocate(context, nb * sizeof(cl_half));
             backend_ctx->prealloc_moe_sa.allocate(context, nb * sizeof(cl_half));
@@ -33910,7 +33920,10 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
             CL_CHECK(clSetKernelArg(ck,  7, sizeof(cl_mem),   &extrad->data_device));
             CL_CHECK(clSetKernelArg(ck,  8, sizeof(cl_ulong), &offsetd));
             CL_CHECK(clSetKernelArg(ck,  9, sizeof(cl_int),   &ne01));
-            CL_CHECK(clSetKernelArg(ck, 10, sizeof(cl_int),   &N));
+            // arg 10 is the CLAMP bound (how many columns are readable), arg 12 the
+            // STORE bound. They differ when the activation is over-allocated.
+            const cl_int clamp_n = alloc_n;
+            CL_CHECK(clSetKernelArg(ck, 10, sizeof(cl_int),   &clamp_n));
             CL_CHECK(clSetKernelArg(ck, 11, sizeof(cl_int),   &ne00));
             CL_CHECK(clSetKernelArg(ck, 12, sizeof(cl_int),   &ne1));
             CL_CHECK(clSetKernelArg(ck, 13, sizeof(cl_uchar), &mask_d6));

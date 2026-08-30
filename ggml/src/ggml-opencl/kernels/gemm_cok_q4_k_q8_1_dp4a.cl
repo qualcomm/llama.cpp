@@ -186,18 +186,24 @@ kernel void kernel_gemm_cok_q4_k_q8_1_dp4a(
     // zero-padded activation buffer, which it could not fill with clEnqueueFillBuffer
     // anyway while a recordable queue is capturing. Hoisted: these depend only on the
     // dispatch, not on the K loop.
-    const int nl = n_no_padding - 1;
+    // Clamp bound comes from `n`, not n_no_padding, so the two roles are separable: the
+    // store still uses n_no_padding, while `n` says how many columns are READABLE. When the
+    // host over-allocates the activation to the kernel width it passes the width here and
+    // the clamp becomes a no-op -- which matters because clamped columns make several lanes
+    // load the SAME address, and this build costs 483/443/353 us at ne1 2/3/4 for identical
+    // work. Distinct addresses are the hypothesis for that gap.
+    const int nl = n - 1;
     const int c0 = 0;
-    const int c1 = (1 < n_no_padding) ? 1 : nl;
+    const int c1 = (1 < n) ? 1 : nl;
 #if COK_COLS >= 4
-    const int c2 = (2 < n_no_padding) ? 2 : nl;
-    const int c3 = (3 < n_no_padding) ? 3 : nl;
+    const int c2 = (2 < n) ? 2 : nl;
+    const int c3 = (3 < n) ? 3 : nl;
 #endif
 #if COK_COLS == 8
-    const int c4 = (4 < n_no_padding) ? 4 : nl;
-    const int c5 = (5 < n_no_padding) ? 5 : nl;
-    const int c6 = (6 < n_no_padding) ? 6 : nl;
-    const int c7 = (7 < n_no_padding) ? 7 : nl;
+    const int c4 = (4 < n) ? 4 : nl;
+    const int c5 = (5 < n) ? 5 : nl;
+    const int c6 = (6 < n) ? 6 : nl;
+    const int c7 = (7 < n) ? 7 : nl;
 #endif
 
     cok_accv acc0 = (cok_accv)(0.0f), acc1 = (cok_accv)(0.0f);
