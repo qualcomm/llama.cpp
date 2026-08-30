@@ -1914,6 +1914,10 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemm_cok_q4_k_q8_1_dp4a = nullptr;
     cl_kernel kernel_gemm_cok_q4_k_q8_1_dp4a_c4 = nullptr;  // 4-column build for ne1 3..4
     cl_kernel kernel_gemm_cok_q4_k_q8_1_dp4a_c2 = nullptr;  // 2-column build for ne1 == 2
+    cl_kernel kernel_gemm_cok_q6_k_q8_1_dp4a    = nullptr;  // q6_K twin, 4-column
+    cl_kernel kernel_gemm_cok_q6_k_q8_1_dp4a_c2 = nullptr;  // q6_K twin, 2-column
+    int       q6k_cok_dp4a_nsg  = 4;
+    int       q6k_cok_dp4a_rows = 4;
     int       q4k_cok_dp4a_nsg_c8  = 4;   // the 8-column build deadlocks at 8
     int       q4k_cok_dp4a_nsg_narrow = 8;
     int       q4k_cok_dp4a_nsg_eff = 4;
@@ -8500,6 +8504,53 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         GGML_LOG_INFO("ggml_opencl: q4_K cok+dp4a narrow GEMM %s (rows=%d COK_NSG=%d)\n",
                       backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a ? "loaded" : "UNAVAILABLE",
                       backend_ctx->q4k_cok_dp4a_rows, backend_ctx->q4k_cok_dp4a_nsg_eff);
+
+    // gemm_cok_q6_k_q8_1_dp4a (q6_K twin of the narrow dp4a GEMM; ne1 = 2..4)
+    //
+    // muse-glimmer-30B is q6_K on 26 of 52 layers (ffn_down), so a q4_K-only arm leaves
+    // half the narrow-band matmul time untouched -- which is why the q4_K win measured
+    // +4% at the kernel and only +3.3% on the model.
+    if (backend_ctx->has_integer_dot_product && getenv("GGML_OPENCL_Q4K_COK_DP4A")) {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src {
+            #include "gemm_cok_q6_k_q8_1_dp4a.cl.h"
+        };
+#else
+        const std::string kernel_src = read_file("gemm_cok_q6_k_q8_1_dp4a.cl");
+#endif
+        int rows6 = 4;
+        if (const char * e = getenv("GGML_OPENCL_Q6K_COK_DP4A_ROWS")) { rows6 = atoi(e); }
+        int nsg6 = 8;
+        if (const char * e = getenv("GGML_OPENCL_Q6K_COK_DP4A_NSG")) { nsg6 = atoi(e); }
+        const std::string base6 = compile_opts + " -DCOK_ROWS=" + std::to_string(rows6);
+        for (int cols : {4, 2}) {
+            int nsg_eff = nsg6;
+            cl_program prog = ggml_cl_build_cok_program(
+                backend_ctx, kernel_src.c_str(),
+                base6 + " -DCOK_COLS=" + std::to_string(cols), nsg_eff, &nsg_eff);
+            cl_kernel kk = clCreateKernel(prog, "kernel_gemm_cok_q6_k_q8_1_dp4a", &err);
+            if (err != CL_SUCCESS) { kk = nullptr; }
+            if (kk) {
+                cl_ulong pmc = 0, lmc = 0; size_t wgc = 0;
+                clGetKernelWorkGroupInfo(kk, backend_ctx->device, CL_KERNEL_PRIVATE_MEM_SIZE, sizeof(pmc), &pmc, NULL);
+                clGetKernelWorkGroupInfo(kk, backend_ctx->device, CL_KERNEL_LOCAL_MEM_SIZE,   sizeof(lmc), &lmc, NULL);
+                clGetKernelWorkGroupInfo(kk, backend_ctx->device, CL_KERNEL_WORK_GROUP_SIZE,  sizeof(wgc), &wgc, NULL);
+                fprintf(stderr, "[COK-DP4A-q6K] rows=%d cols=%d nsg=%d  private=%5llu (spill) local=%6llu wg_cap=%4zu\n",
+                        rows6, cols, nsg_eff, (unsigned long long)pmc,
+                        (unsigned long long)lmc, wgc);
+            }
+            if (cols == 4) { backend_ctx->kernel_gemm_cok_q6_k_q8_1_dp4a    = kk;
+                             backend_ctx->q6k_cok_dp4a_nsg = nsg_eff; }
+            else           { backend_ctx->kernel_gemm_cok_q6_k_q8_1_dp4a_c2 = kk; }
+            CL_CHECK(clReleaseProgram(prog));
+        }
+        fflush(stderr);
+        backend_ctx->q6k_cok_dp4a_rows = rows6;
+        GGML_LOG_INFO("ggml_opencl: q6_K cok+dp4a narrow GEMM %s (rows=%d COK_NSG=%d)\n",
+                      backend_ctx->kernel_gemm_cok_q6_k_q8_1_dp4a ? "loaded" : "UNAVAILABLE",
+                      backend_ctx->q6k_cok_dp4a_rows, backend_ctx->q6k_cok_dp4a_nsg);
+        GGML_LOG_CONT(".");
+    }
         GGML_LOG_CONT(".");
     }
 
@@ -34985,6 +35036,90 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
         region.origin = offset1;
         region.size = ne00 * ne1 * sizeof(float);
         CL_CHECK((b_sub_buf = clCreateSubBuffer(extra1->data_device, 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &err), err));
+
+        // q6_K cok+dp4a for the narrow band (ne1 = 2..4), the twin of the q4_K path.
+        //
+        // Same shape and the same sizing decisions (SKILL.md 11): serve only 2..4, because
+        // per row per 32-K block a half8 FMA issues 32 ops eight columns wide whatever ne1
+        // is, while dp4a issues 8C -- so int8 wins at C=2, ties at C=4 and loses at C=8.
+        // Column width is matched to the batch and the activation allocated at that width,
+        // so no column index is clamped and the address arithmetic stays affine.
+        //
+        // q6_K needs no min term: a value is (q - 32) * ss * d, so the q8_1 block sum the
+        // q4_K kernel carries is not used here. Only the scale is finer -- ss is per 16 K,
+        // so the dp4a accumulator flushes twice per 32-K block.
+        static const char * q6k_cok_dp4a_env = getenv("GGML_OPENCL_Q4K_COK_DP4A");
+        const bool is_output_w_cok = strncmp(src0->name, "output", 6) == 0 ||
+                                     strncmp(src0->name, "token_embd", 10) == 0;
+        if (q6k_cok_dp4a_env && atoi(q6k_cok_dp4a_env) != 0
+            && backend_ctx->kernel_gemm_cok_q6_k_q8_1_dp4a != nullptr
+            && !is_output_w_cok
+            && ne1 >= 2 && ne1 <= 4
+            && ne01 % (64 * backend_ctx->q6k_cok_dp4a_rows) == 0 && ne00 % 32 == 0) {
+            const int    N6   = (int)ne1, K6 = (int)ne00;
+            const int    w6   = (N6 <= 2) ? 2 : 4;
+            const size_t nb6  = (size_t)w6 * (K6 / 32);
+            const size_t qa6  = (size_t)w6 * K6 * sizeof(cl_char);
+            const size_t was6 = backend_ctx->prealloc_moe_qa.size;
+            const size_t wasd6 = backend_ctx->prealloc_moe_da.size;
+            backend_ctx->prealloc_moe_qa.allocate(context, qa6);
+            backend_ctx->prealloc_moe_da.allocate(context, nb6 * sizeof(cl_half));
+            backend_ctx->prealloc_moe_sa.allocate(context, nb6 * sizeof(cl_half));
+            // Zero on growth only, so the columns past ne1 are deterministic without a
+            // per-dispatch fill (which would not be legal under recordable-queue capture).
+            if (backend_ctx->prealloc_moe_qa.size != was6) {
+                const cl_char z8 = 0;
+                CL_CHECK(clEnqueueFillBuffer(backend_ctx->queue, backend_ctx->prealloc_moe_qa.buffer,
+                                             &z8, sizeof(z8), 0, backend_ctx->prealloc_moe_qa.size, 0, NULL, NULL));
+            }
+            if (backend_ctx->prealloc_moe_da.size != wasd6) {
+                const cl_half z16 = 0;
+                CL_CHECK(clEnqueueFillBuffer(backend_ctx->queue, backend_ctx->prealloc_moe_da.buffer,
+                                             &z16, sizeof(z16), 0, backend_ctx->prealloc_moe_da.size, 0, NULL, NULL));
+                CL_CHECK(clEnqueueFillBuffer(backend_ctx->queue, backend_ctx->prealloc_moe_sa.buffer,
+                                             &z16, sizeof(z16), 0, backend_ctx->prealloc_moe_sa.size, 0, NULL, NULL));
+            }
+
+            cl_int tbq6 = (cl_int)((size_t)N6 * (K6 / 32));
+            cl_kernel qk6 = backend_ctx->kernel_quant_a_q8_1;
+            CL_CHECK(clSetKernelArg(qk6, 0, sizeof(cl_mem), &b_sub_buf));
+            CL_CHECK(clSetKernelArg(qk6, 1, sizeof(cl_mem), &backend_ctx->prealloc_moe_qa.buffer));
+            CL_CHECK(clSetKernelArg(qk6, 2, sizeof(cl_mem), &backend_ctx->prealloc_moe_da.buffer));
+            CL_CHECK(clSetKernelArg(qk6, 3, sizeof(cl_mem), &backend_ctx->prealloc_moe_sa.buffer));
+            CL_CHECK(clSetKernelArg(qk6, 4, sizeof(cl_int), &tbq6));
+            size_t q6_local[1]  = { 64 };
+            size_t q6_global[1] = { (size_t)((((size_t)tbq6 + 63) / 64) * 64) };
+            backend_ctx->enqueue_ndrange_kernel(qk6, 1, q6_global, q6_local, dst);
+
+            cl_kernel ck6 = (N6 <= 2 && backend_ctx->kernel_gemm_cok_q6_k_q8_1_dp4a_c2)
+                          ? backend_ctx->kernel_gemm_cok_q6_k_q8_1_dp4a_c2
+                          : backend_ctx->kernel_gemm_cok_q6_k_q8_1_dp4a;
+            cl_ushort mf6 = 0xF000;
+            cl_uchar  mc6 = 0xC0;
+            const cl_int clamp6 = w6;
+            CL_CHECK(clSetKernelArg(ck6,  0, sizeof(cl_mem),   &extra0_q6_K->ql));
+            CL_CHECK(clSetKernelArg(ck6,  1, sizeof(cl_mem),   &extra0_q6_K->qh));
+            CL_CHECK(clSetKernelArg(ck6,  2, sizeof(cl_mem),   &extra0_q6_K->s));
+            CL_CHECK(clSetKernelArg(ck6,  3, sizeof(cl_mem),   &extra0_q6_K->d));
+            CL_CHECK(clSetKernelArg(ck6,  4, sizeof(cl_mem),   &backend_ctx->prealloc_moe_qa.buffer));
+            CL_CHECK(clSetKernelArg(ck6,  5, sizeof(cl_mem),   &backend_ctx->prealloc_moe_da.buffer));
+            CL_CHECK(clSetKernelArg(ck6,  6, sizeof(cl_mem),   &extrad->data_device));
+            CL_CHECK(clSetKernelArg(ck6,  7, sizeof(cl_ulong), &offsetd));
+            CL_CHECK(clSetKernelArg(ck6,  8, sizeof(cl_int),   &ne01));
+            CL_CHECK(clSetKernelArg(ck6,  9, sizeof(cl_int),   &clamp6));
+            CL_CHECK(clSetKernelArg(ck6, 10, sizeof(cl_int),   &ne00));
+            CL_CHECK(clSetKernelArg(ck6, 11, sizeof(cl_int),   &ne1));
+            CL_CHECK(clSetKernelArg(ck6, 12, sizeof(cl_ushort),&mf6));
+            CL_CHECK(clSetKernelArg(ck6, 13, sizeof(cl_uchar), &mc6));
+
+            const size_t nsg6d = (size_t)backend_ctx->q6k_cok_dp4a_nsg;
+            size_t c6_local[3]  = { 64, nsg6d, 1 };
+            size_t c6_global[3] = { (size_t)(ne01 / backend_ctx->q6k_cok_dp4a_rows), nsg6d, 1 };
+            backend_ctx->enqueue_ndrange_kernel(ck6, 3, c6_global, c6_local, dst);
+
+            CL_CHECK(clReleaseMemObject(b_sub_buf));
+            return;
+        }
 
         // dp4a (int8) dense q6_K prefill GEMM (ffn_down/attn_v). Quantizes the
         // [N,K] activations to q8_1 and runs the int8 dp4a GEMM instead of the
