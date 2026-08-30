@@ -33799,38 +33799,17 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
             // instead would create lanes with row0 >= ne01, and the kernel guards the
             // column at the store but not the row -- they would write out of bounds.
             // An early return cannot rescue that either: the kernel has barriers.
-            // The kernel reads a fixed 8 columns per lane, so the activation side is
-            // sized at 8 whatever ne1 is; the padded columns are computed and dropped at
-            // the store. Zero the pad rather than letting uninitialised memory into
-            // lanes nobody reads: the lanes are independent so it could not corrupt a
-            // real column, but a run that is not deterministic cannot be A/B'd, and the
-            // validation here is decode PPL against a control.
-            const int    NPAD      = 8;
-            const size_t qa_bytes  = (size_t)NPAD * K * sizeof(cl_char);
-            const size_t nb_pad    = (size_t)NPAD * (K / 32);
+            // The kernel reads a fixed 8 columns per lane and clamps any column past
+            // ne1 to the last real one, so the activation buffers only need to hold the
+            // real columns -- no pad, and no buffer fill to zero it. That matters
+            // beyond tidiness: while a recordable queue is capturing, only NDRange
+            // enqueues are legal, so a clEnqueueFillBuffer here would be unordered
+            // against the kernels around it or rejected outright.
+            const size_t qa_bytes = (size_t)N * K * sizeof(cl_char);
+            const size_t nb       = (size_t)N * (K / 32);
             backend_ctx->prealloc_moe_qa.allocate(context, qa_bytes);
-            backend_ctx->prealloc_moe_da.allocate(context, nb_pad * sizeof(cl_half));
-            backend_ctx->prealloc_moe_sa.allocate(context, nb_pad * sizeof(cl_half));
-            if (N < NPAD) {
-                const cl_char  z8  = 0;
-                const cl_half  z16 = 0;
-                CL_CHECK(clEnqueueFillBuffer(backend_ctx->queue, backend_ctx->prealloc_moe_qa.buffer,
-                                             &z8,  sizeof(z8),  0, qa_bytes, 0, NULL, NULL));
-                CL_CHECK(clEnqueueFillBuffer(backend_ctx->queue, backend_ctx->prealloc_moe_da.buffer,
-                                             &z16, sizeof(z16), 0, nb_pad * sizeof(cl_half), 0, NULL, NULL));
-                CL_CHECK(clEnqueueFillBuffer(backend_ctx->queue, backend_ctx->prealloc_moe_sa.buffer,
-                                             &z16, sizeof(z16), 0, nb_pad * sizeof(cl_half), 0, NULL, NULL));
-            }
-
-            // An env-gated arm on this file has been vacuous three times because the
-            // dispatch never reached the kernel under test. Say so, once.
-            static int n_cok_dp4a_fired = 0;
-            if (n_cok_dp4a_fired < 8) {
-                n_cok_dp4a_fired++;
-                fprintf(stderr, "[COK-DP4A] FIRED M=%d N=%d K=%d nsg=%d\n",
-                        ne01, (int)ne1, K, backend_ctx->q4k_cok_dp4a_nsg_eff);
-                fflush(stderr);
-            }
+            backend_ctx->prealloc_moe_da.allocate(context, nb * sizeof(cl_half));
+            backend_ctx->prealloc_moe_sa.allocate(context, nb * sizeof(cl_half));
 
             cl_int tbq = (cl_int)((size_t)N * (K / 32));
             cl_kernel qk = backend_ctx->kernel_quant_a_q8_1;

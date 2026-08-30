@@ -128,7 +128,12 @@ kernel void kernel_gemm_cok_q4_k_q8_1_dp4a(
             const uint w3 = EXP4(bits.s3);
 
             for (int c = 0; c < 8; ++c) {
-                const uint a = src1_qa[(uint)c * k_u + ku];
+                // Columns past n_no_padding are computed and thrown away at the store.
+                // Clamping to a real column keeps every read in bounds and initialised,
+                // so the host does not have to zero a pad -- which it could not do with
+                // a buffer fill anyway while a recordable queue is capturing.
+                const int  cc = (c < n_no_padding) ? c : (n_no_padding - 1);
+                const uint a  = src1_qa[(uint)cc * k_u + ku];
                 s0[c] = dot_acc_sat_4x8packed_ss_int(w0, a, s0[c]);
                 s1[c] = dot_acc_sat_4x8packed_ss_int(w1, a, s1[c]);
                 s2[c] = dot_acc_sat_4x8packed_ss_int(w2, a, s2[c]);
@@ -142,15 +147,24 @@ kernel void kernel_gemm_cok_q4_k_q8_1_dp4a(
         // Component assignment, NOT a pointer cast into the vector: taking the address
         // of a private vector forces it to memory and would spill the register budget
         // this kernel deliberately keeps under the 512 B/WI cliff.
+        // Same clamp as the dot loop above, for the same reason.
+        const int c1 = (1 < n_no_padding) ? 1 : (n_no_padding - 1);
+        const int c2 = (2 < n_no_padding) ? 2 : (n_no_padding - 1);
+        const int c3 = (3 < n_no_padding) ? 3 : (n_no_padding - 1);
+        const int c4 = (4 < n_no_padding) ? 4 : (n_no_padding - 1);
+        const int c5 = (5 < n_no_padding) ? 5 : (n_no_padding - 1);
+        const int c6 = (6 < n_no_padding) ? 6 : (n_no_padding - 1);
+        const int c7 = (7 < n_no_padding) ? 7 : (n_no_padding - 1);
+
         float8 da, sa;
         da.s0 = (float)src1_da[0*k_b + blk];  sa.s0 = (float)src1_sa[0*k_b + blk];
-        da.s1 = (float)src1_da[1*k_b + blk];  sa.s1 = (float)src1_sa[1*k_b + blk];
-        da.s2 = (float)src1_da[2*k_b + blk];  sa.s2 = (float)src1_sa[2*k_b + blk];
-        da.s3 = (float)src1_da[3*k_b + blk];  sa.s3 = (float)src1_sa[3*k_b + blk];
-        da.s4 = (float)src1_da[4*k_b + blk];  sa.s4 = (float)src1_sa[4*k_b + blk];
-        da.s5 = (float)src1_da[5*k_b + blk];  sa.s5 = (float)src1_sa[5*k_b + blk];
-        da.s6 = (float)src1_da[6*k_b + blk];  sa.s6 = (float)src1_sa[6*k_b + blk];
-        da.s7 = (float)src1_da[7*k_b + blk];  sa.s7 = (float)src1_sa[7*k_b + blk];
+        da.s1 = (float)src1_da[c1*k_b + blk];  sa.s1 = (float)src1_sa[c1*k_b + blk];
+        da.s2 = (float)src1_da[c2*k_b + blk];  sa.s2 = (float)src1_sa[c2*k_b + blk];
+        da.s3 = (float)src1_da[c3*k_b + blk];  sa.s3 = (float)src1_sa[c3*k_b + blk];
+        da.s4 = (float)src1_da[c4*k_b + blk];  sa.s4 = (float)src1_sa[c4*k_b + blk];
+        da.s5 = (float)src1_da[c5*k_b + blk];  sa.s5 = (float)src1_sa[c5*k_b + blk];
+        da.s6 = (float)src1_da[c6*k_b + blk];  sa.s6 = (float)src1_sa[c6*k_b + blk];
+        da.s7 = (float)src1_da[c7*k_b + blk];  sa.s7 = (float)src1_sa[c7*k_b + blk];
 
         float8 d0, d1, d2, d3;
         d0.s0 = (float)s0[0]; d0.s1 = (float)s0[1]; d0.s2 = (float)s0[2]; d0.s3 = (float)s0[3];
