@@ -33830,16 +33830,19 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
         static const char * q4k_cok_dp4a_env = getenv("GGML_OPENCL_Q4K_COK_DP4A");
         if (q4k_cok_dp4a_env && atoi(q4k_cok_dp4a_env) != 0
             && backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a != nullptr
-            && (ne1 == 2 || ne1 == 4 ||
-                (getenv("GGML_OPENCL_Q4K_COK_DP4A_WIDEA") && ne1 <= 4))
+            && ne1 >= 2 && ne1 <= 4
             && ne01 % (64 * backend_ctx->q4k_cok_dp4a_rows) == 0 && K % 32 == 0) {
-            // EXACT width only, and that is a measurement, not a simplification. A lane
-            // computes its whole column width whatever ne1 is, and the 4-column build costs
-            // 483 us at ne1=2, 443 at ne1=3 and 353 at ne1=4 for identical work -- it is
-            // fastest precisely when the batch fills it. Against a 368 us control that is a
-            // win at 4 and a loss at 3, so only the widths that are actually built get the
-            // arm. ne1 5..8 stays on cok: the 8-column build needs COK_NSG 8 to compete and
-            // deadlocks there, and at 4 it runs 692/576 us against a 370/374 control.
+            // ne1 2..4. Measured against the default dispatch (test-backend-ops perf,
+            // m=4096 k=14336): 325/351/357 us against 341/366/368, so +4.7/+4.1/+3.0%.
+            //
+            // The width no longer has to match the batch exactly. It did while the surplus
+            // columns were clamped to the last real one -- that made several lanes load the
+            // same address and cost 483/443/353 us at ne1 2/3/4 for identical work. With the
+            // activation over-allocated so every column reads a distinct address the
+            // dependence on ne1 largely goes away.
+            //
+            // ne1 5..8 stays on cok: the 8-column build needs COK_NSG 8 to be competitive
+            // and deadlocks there, and at 4 it runs 692/576 us against a 370/374 control.
             // ne01 % 256, not % 4: one lane covers 4 rows and the workgroup is 64
             // lanes wide, so the row axis must divide evenly. Padding the global size
             // instead would create lanes with row0 >= ne01, and the kernel guards the
@@ -33851,30 +33854,40 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
             // beyond tidiness: while a recordable queue is capturing, only NDRange
             // enqueues are legal, so a clEnqueueFillBuffer here would be unordered
             // against the kernels around it or rejected outright.
-            // Clamped columns make several lanes load the SAME address, and this build
-            // costs 483/443/353 us at ne1 2/3/4 for identical work. Over-allocating to the
-            // kernel's column width lets every column read a distinct address, testing
-            // whether that pattern is the gap. The pad is never written by the pre-pass, so
-            // it carries stale bytes -- harmless (the columns are discarded at the store and
-            // the accumulator lanes are independent) but not deterministic, hence opt-in.
-            static const char * cok_wide_env = getenv("GGML_OPENCL_Q4K_COK_DP4A_WIDEA");
-            const int cok_w = (ne1 <= 2) ? 2 : (ne1 <= 4 ? 4 : 8);
-            const int alloc_n = (cok_wide_env && atoi(cok_wide_env) != 0) ? cok_w : (int)N;
-            const size_t qa_bytes = (size_t)alloc_n * K * sizeof(cl_char);
-            const size_t nb       = (size_t)alloc_n * (K / 32);
+            // Over-allocate the activation to the kernel's column width so every column
+            // reads a DISTINCT address. Clamping the surplus columns to the last real one
+            // makes several lanes load the same address, and that was the whole narrow-width
+            // penalty: the 4-column build cost 483/443/353 us at ne1 2/3/4 for identical
+            // work clamped, and 325/351/357 with distinct addresses -- ne1=3 alone moves
+            // 443 -> 351, from a 20% loss to a 4% win.
+            //
+            // The pre-pass only writes the real columns, so the pad has to be zeroed or the
+            // kernel folds stale bytes into lanes it discards. That is harmless for the
+            // result (the columns never reach the store and the accumulator lanes are
+            // independent) but it would make runs non-reproducible, which cannot be A/B'd.
+            // Zero on GROWTH only: the buffers are reused, the pre-pass never writes the
+            // pad, so one fill per size keeps it zero for every later dispatch. Growth is
+            // rare, which also keeps this off the recordable-queue capture path where a
+            // buffer fill would not be legal.
+            const int    cok_w    = (ne1 <= 2) ? 2 : 4;
+            const size_t qa_bytes = (size_t)cok_w * K * sizeof(cl_char);
+            const size_t nb       = (size_t)cok_w * (K / 32);
+            const size_t qa_was = backend_ctx->prealloc_moe_qa.size;
+            const size_t da_was = backend_ctx->prealloc_moe_da.size;
             backend_ctx->prealloc_moe_qa.allocate(context, qa_bytes);
             backend_ctx->prealloc_moe_da.allocate(context, nb * sizeof(cl_half));
             backend_ctx->prealloc_moe_sa.allocate(context, nb * sizeof(cl_half));
-
-            // Debug-only, env-gated: a clFinish after each enqueue so a stall names the
-            // kernel that caused it rather than just the dispatch. The earlier version of
-            // this probe was spliced away by a later edit, and its silence was then
-            // misread as "the kernel never ran".
-            const bool cok_trace = getenv("GGML_OPENCL_Q4K_COK_DP4A_TRACE") != nullptr;
-            if (cok_trace) {
-                fprintf(stderr, "[COK-DP4A] ENTER M=%d N=%d K=%d nsg=%d\n",
-                        ne01, (int)ne1, K, backend_ctx->q4k_cok_dp4a_nsg_eff);
-                fflush(stderr);
+            if (backend_ctx->prealloc_moe_qa.size != qa_was) {
+                const cl_char z8 = 0;
+                CL_CHECK(clEnqueueFillBuffer(backend_ctx->queue, backend_ctx->prealloc_moe_qa.buffer,
+                                             &z8, sizeof(z8), 0, backend_ctx->prealloc_moe_qa.size, 0, NULL, NULL));
+            }
+            if (backend_ctx->prealloc_moe_da.size != da_was) {
+                const cl_half z16 = 0;
+                CL_CHECK(clEnqueueFillBuffer(backend_ctx->queue, backend_ctx->prealloc_moe_da.buffer,
+                                             &z16, sizeof(z16), 0, backend_ctx->prealloc_moe_da.size, 0, NULL, NULL));
+                CL_CHECK(clEnqueueFillBuffer(backend_ctx->queue, backend_ctx->prealloc_moe_sa.buffer,
+                                             &z16, sizeof(z16), 0, backend_ctx->prealloc_moe_sa.size, 0, NULL, NULL));
             }
 
             cl_int tbq = (cl_int)((size_t)N * (K / 32));
@@ -33907,6 +33920,9 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
                 ck = backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a_c4;
                 cok_nsg_sel = backend_ctx->q4k_cok_dp4a_nsg_narrow;
             } else {
+                // Unreachable while the gate stops at ne1 4. Kept because ne1 5..8 becomes
+                // reachable the moment the 8-column build can run at COK_NSG 8, which is
+                // the one thing still blocking the top half of the band.
                 ck = backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a;
                 cok_nsg_sel = backend_ctx->q4k_cok_dp4a_nsg_c8;
             }
@@ -33922,7 +33938,7 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
             CL_CHECK(clSetKernelArg(ck,  9, sizeof(cl_int),   &ne01));
             // arg 10 is the CLAMP bound (how many columns are readable), arg 12 the
             // STORE bound. They differ when the activation is over-allocated.
-            const cl_int clamp_n = alloc_n;
+            const cl_int clamp_n = cok_w;
             CL_CHECK(clSetKernelArg(ck, 10, sizeof(cl_int),   &clamp_n));
             CL_CHECK(clSetKernelArg(ck, 11, sizeof(cl_int),   &ne00));
             CL_CHECK(clSetKernelArg(ck, 12, sizeof(cl_int),   &ne1));
