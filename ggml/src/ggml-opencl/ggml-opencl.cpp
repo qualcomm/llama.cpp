@@ -8520,7 +8520,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         }
         fflush(stderr);
         GGML_LOG_INFO("ggml_opencl: q4_K cok+dp4a narrow GEMM %s (rows=%d COK_NSG=%d)\n",
-                      backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a ? "loaded" : "UNAVAILABLE",
+                      backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a_c4 ? "loaded" : "UNAVAILABLE",
                       backend_ctx->q4k_cok_dp4a_rows, backend_ctx->q4k_cok_dp4a_nsg_eff);
 
     // gemm_cok_q6_k_q8_1_dp4a (q6_K twin of the narrow dp4a GEMM; ne1 = 2..4)
@@ -33820,7 +33820,7 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
     const bool cok_dp4a_takes_it =
         ggml_cl_cok_dp4a_narrow_on(backend_ctx, ne1, ne01, ne00, backend_ctx->q4k_cok_dp4a_rows)
         && ((ne1 <= 2) ? backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a_c2
-                       : backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a) != nullptr;
+                       : backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a_c4) != nullptr;
     const bool use_mc3 = q4k_mc3 && !cok_dp4a_takes_it
                       && (ne1 >= 2 && ne1 <= q4k_mc3_maxn) && (ne01 < 32768);
 
@@ -34101,7 +34101,7 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
         if (ggml_cl_cok_dp4a_narrow_on(backend_ctx, ne1, ne01, ne00, backend_ctx->q4k_cok_dp4a_rows)
             && ne1 <= q4k_cok_dp4a_maxn
             && ((ne1 <= 2) ? backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a_c2
-                           : backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a) != nullptr) {
+                           : backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a_c4) != nullptr) {
             // ne1 2..4. Measured against the default dispatch (test-backend-ops perf,
             // m=4096 k=14336): 325/351/357 us against 341/366/368, so +4.7/+4.1/+3.0%.
             //
