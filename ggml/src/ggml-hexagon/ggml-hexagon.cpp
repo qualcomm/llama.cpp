@@ -98,8 +98,8 @@ static int    opt_ar_select = 2; // 2 = fused ALLREDUCE+ADD (DMA, default), 1 = 
 //     https://docs.qualcomm.com/doc/80-N2040-61/topic/hvx-pmu-events.html
 static u32vec opt_pmu_evt { 0x3, 0x111, 0x100, 0x105, 0x240, 0x256, 0x7D, 0x8C };
 
-static int opt_opbatch  = 1024; // max number of ops in a batch
-static int opt_opqueue  = 64;   // max number of pending batches
+static int opt_opbatch  = 1280; // max number of ops in a batch
+static int opt_opqueue  = 32;   // max number of pending batches
 static int opt_optrace  = 0;    // trace buffer size per thread (0 means default)
 static int opt_oppoll   = 0;    // polling for batch completions
 static int opt_opfusion = 1;    // enable/disable op fusion
@@ -2527,6 +2527,8 @@ struct ggml_hexagon_opqueue {
         delete shm_buf;
     }
 
+    size_t shm_size() const { return shm_buf ? shm_buf->size() : 0; }
+
     // push new batch
     bool push(htp_opbatch_req& req, dspqueue_buffer& dbuf, ggml_hexagon_opbatch* op_batch) {
         static_assert(sizeof(htp_opbatch_req) % 8 == 0, "sizeof(htp_opbatch_req) must be multiple of 8");
@@ -3195,7 +3197,8 @@ void ggml_hexagon_session::allocate(const ggml_hexagon_device_config & config) n
         opt_vmem = ggml_hexagon_measure_max_vmem(this);
         GGML_LOG_INFO("ggml-hex: %s measured max vmem %zu\n", this->c_name(), opt_vmem);
     }
-    this->max_vmem = opt_vmem;
+    const size_t shm_size = this->op_queue->shm_size();
+    this->max_vmem = (opt_vmem > shm_size) ? (opt_vmem - shm_size) : opt_vmem;
 
     this->op_batch = new ggml_hexagon_opbatch(this, opt_opbatch, this->max_vmem);
 
