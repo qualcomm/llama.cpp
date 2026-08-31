@@ -535,7 +535,7 @@ static bool adreno_art_compiler_quirks(const ggml_backend_opencl_context *backen
 // further down because it needs the context.
 static bool ggml_cl_cok_dp4a_build_on() {
     static const char * const e = getenv("GGML_OPENCL_COK_DP4A");
-    return e && *e && atoi(e) != 0;
+    return !(e && *e && atoi(e) == 0);
 }
 
 
@@ -16187,40 +16187,35 @@ static bool ggml_cl_kquant_plane_dp4a_gemm_on(const ggml_backend_opencl_context 
 
 // Is this shape one the narrow cok+dp4a GEMMs (q4_K / q6_K / q4_0) will serve?
 //
-// OPT-IN: GGML_OPENCL_COK_DP4A=1. It was briefly default-on and that was withdrawn.
+// DEFAULT ON; opt out with GGML_OPENCL_COK_DP4A=0.
 //
-// The matmul win is real and reproducible (Adreno X2-90, llama-bench, A/B/A):
+// Matmul level (Adreno X2-90, llama-bench, A/B/A):
 //   Qwen3.8-27B-Q4_0   pp2 +10.6%  pp3 +10.3%  pp4 +10.2%  pp8 unchanged
 //   muse-glimmer-30B   pp2  +3.1%  pp3  +4.4%  pp4  +4.1%  pp8 unchanged
 //
-// 🔴 But ne1 2..4 is a SPECULATIVE-DECODE VERIFY width, not a prompt anyone types, and the
-// win does NOT reach speculative-decode throughput -- on either model. With startup
-// subtracted, both arms warmed, and acceptance averaged over six prompts:
-//   muse-glimmer-30B (+4% kernel)   generation: a wash
-//   Qwen3.8-27B-Q4_0 (+10% kernel)  generation: -0.7% (8.00 vs 8.06 tok/s), spread -4.9..+2.7%
-// The expected round-level effect is only ~4% -- a ~188 ms verify step saving 21 ms inside a
-// ~500 ms round -- which is at or below the noise floor of a wall-clock comparison, because
-// acceptance rate dominates throughput and the arm perturbs it by changing matmul rounding.
+// End to end it is worth +8.2% t/s on Qwen3.8-27B-Q4_0 with a DFlash2 drafter (11.67/11.63/
+// 11.64 against 12.62, A/A bracket 0.3%, faster on every prompt, acceptance identical at
+// 77.2 against 77.3%), and NOTHING on muse with a DFlash drafter -- where it is also not a
+// regression (12.75 against a 12.71 control mean, inside a 1.9% A/A bracket).
 //
-// So the benefit is UNPROVEN end to end, which is why this is opt-in. It is not a cost
-// argument: warm, the arm costs nothing (-0.6 s). An earlier "+1.4 to +1.9 s startup penalty"
-// was a COLD KERNEL CACHE artifact -- the first run after a rebuild compiles these programs
-// and took 180 s against 21 s, once, cached thereafter.
+// COVERAGE EXPLAINS BOTH, because the two speculative schemes verify at different widths:
+//   Qwen DFlash2   96.2% of matmuls at ne1=4, 98.0% in 2..4  ->  +8.2%
+//   muse DFlash    80.6% at ne1 5..8, only 15.6% in 2..4     ->  nothing
+// 5..8 is where dp4a structurally loses: a half8 FMA issues 32 ops per row per 32-K block,
+// eight columns wide whatever ne1 is, while dp4a issues 8C. So this serves the band DFlash2
+// uses and not the one DFlash uses.
 //
-// Settling a 4% round-level effect needs verify-step GPU time (cl_profiling), not wall clock.
+// ne1 2..4 and no wider, for that same reason -- the crossover is the instruction set, not a
+// tuning constant.
 //
-// ne1 2..4 and no wider: per row per 32-K block a half8 FMA issues 32 ops (eight columns
-// wide whatever ne1 is) while dp4a issues 8 x ne1, so int8 wins at 2, ties at 4 and loses
-// at 8. That crossover is the instruction set, not a tuning constant.
-//
-// DECLINED on two unrelated compilers, and they need two different tests: A7X and older
-// (E031.41) by capability level, and the 850's E17 by compiler class -- the 850 is classed
-// A8X, a NEWER level, so the level test alone lets it straight through. Both miscompile
-// this kernel family; see the callers' comments for the failing shapes.
+// DECLINED on two unrelated compilers needing two different tests: A7X and older (E031.41)
+// by capability level, and the 850's E17 by compiler class -- the 850 is classed A8X, a
+// NEWER level, so the level test alone lets it straight through. Both miscompile this kernel
+// family; see the callers for the failing shapes.
 static bool ggml_cl_cok_dp4a_narrow_on(const ggml_backend_opencl_context * backend_ctx,
                                        int64_t ne1, int64_t ne01, int64_t ne00, int rows) {
     static const char * const e = getenv("GGML_OPENCL_COK_DP4A");
-    if (!(e && *e && atoi(e) != 0)) {
+    if (e && *e && atoi(e) == 0) {
         return false;
     }
     return backend_ctx->has_integer_dot_product
