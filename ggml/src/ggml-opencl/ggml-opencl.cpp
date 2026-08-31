@@ -16194,14 +16194,20 @@ static bool ggml_cl_kquant_plane_dp4a_gemm_on(const ggml_backend_opencl_context 
 //   muse-glimmer-30B   pp2  +3.1%  pp3  +4.4%  pp4  +4.1%  pp8 unchanged
 //
 // 🔴 But ne1 2..4 is a SPECULATIVE-DECODE VERIFY width, not a prompt anyone types, and the
-// win does NOT show up in speculative-decode throughput. Splitting startup from generation
-// on muse + dflash-kquant: startup costs a consistent +1.4 to +1.9 s (these program builds),
-// while generation reads -8.5% then -0.2% across two reps -- i.e. noise. Acceptance rate
-// dominates that number, and the arm perturbs it by changing matmul rounding, so a
-// throughput A/B across arms is comparing different generated text.
+// win does NOT reach speculative-decode throughput -- on either model. With startup
+// subtracted, both arms warmed, and acceptance averaged over six prompts:
+//   muse-glimmer-30B (+4% kernel)   generation: a wash
+//   Qwen3.8-27B-Q4_0 (+10% kernel)  generation: -0.7% (8.00 vs 8.06 tok/s), spread -4.9..+2.7%
+// The expected round-level effect is only ~4% -- a ~188 ms verify step saving 21 ms inside a
+// ~500 ms round -- which is at or below the noise floor of a wall-clock comparison, because
+// acceptance rate dominates throughput and the arm perturbs it by changing matmul rounding.
 //
-// So: a measurable startup cost for an unproven end-to-end benefit. Opt-in until the
-// verify-step time is measured directly (cl_profiling) rather than inferred from wall clock.
+// So the benefit is UNPROVEN end to end, which is why this is opt-in. It is not a cost
+// argument: warm, the arm costs nothing (-0.6 s). An earlier "+1.4 to +1.9 s startup penalty"
+// was a COLD KERNEL CACHE artifact -- the first run after a rebuild compiles these programs
+// and took 180 s against 21 s, once, cached thereafter.
+//
+// Settling a 4% round-level effect needs verify-step GPU time (cl_profiling), not wall clock.
 //
 // ne1 2..4 and no wider: per row per 32-K block a half8 FMA issues 32 ops (eight columns
 // wide whatever ne1 is) while dp4a issues 8 x ne1, so int8 wins at 2, ties at 4 and loses
