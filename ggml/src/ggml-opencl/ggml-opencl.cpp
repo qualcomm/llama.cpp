@@ -535,7 +535,7 @@ static bool adreno_art_compiler_quirks(const ggml_backend_opencl_context *backen
 // further down because it needs the context.
 static bool ggml_cl_cok_dp4a_build_on() {
     static const char * const e = getenv("GGML_OPENCL_COK_DP4A");
-    return !(e && *e && atoi(e) == 0);
+    return e && *e && atoi(e) != 0;
 }
 
 
@@ -8488,8 +8488,11 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         // NSG is per column width, not global. The narrow builds hold far fewer live
         // values and run best at 8 (n4: 357 us against 510 at nsg 4, and against a
         // 368 us control); the 8-column build deadlocks at 8 and takes 4.
-        for (int cols : {8, 4, 2}) {
-            int nsg_eff = (cols == 8) ? nsg_req : nsg_narrow;
+        // No 8-column build: the dispatch gate stops at ne1 4, so it could never run --
+        // and each program build costs ~200 ms of startup, which is the arm's only
+        // measurable end-to-end effect on a short run.
+        for (int cols : {4, 2}) {
+            int nsg_eff = nsg_narrow;
             cl_program prog = ggml_cl_build_cok_program(
                 backend_ctx, kernel_src.c_str(),
                 base_opts + " -DCOK_COLS=" + std::to_string(cols), nsg_eff, &nsg_eff);
@@ -16184,12 +16187,21 @@ static bool ggml_cl_kquant_plane_dp4a_gemm_on(const ggml_backend_opencl_context 
 
 // Is this shape one the narrow cok+dp4a GEMMs (q4_K / q6_K / q4_0) will serve?
 //
-// DEFAULT ON; opt out with GGML_OPENCL_COK_DP4A=0. Measured against the previous default
-// dispatch on an Adreno X2-90:
-//   Qwen3.8-27B-Q4_0   pp2 +10.8%  pp3 +9.0%   pp4 +10.5%   pp8 unchanged
-//   muse-glimmer-30B   pp2 +3.0%   pp3 +3.9%   pp4 +3.9%    pp8 unchanged
-// The q4_0 figure is larger only because that model is entirely q4_0; muse splits across
-// q4_K and q6_K, so its gain is the coverage-weighted average.
+// OPT-IN: GGML_OPENCL_COK_DP4A=1. It was briefly default-on and that was withdrawn.
+//
+// The matmul win is real and reproducible (Adreno X2-90, llama-bench, A/B/A):
+//   Qwen3.8-27B-Q4_0   pp2 +10.6%  pp3 +10.3%  pp4 +10.2%  pp8 unchanged
+//   muse-glimmer-30B   pp2  +3.1%  pp3  +4.4%  pp4  +4.1%  pp8 unchanged
+//
+// 🔴 But ne1 2..4 is a SPECULATIVE-DECODE VERIFY width, not a prompt anyone types, and the
+// win does NOT show up in speculative-decode throughput. Splitting startup from generation
+// on muse + dflash-kquant: startup costs a consistent +1.4 to +1.9 s (these program builds),
+// while generation reads -8.5% then -0.2% across two reps -- i.e. noise. Acceptance rate
+// dominates that number, and the arm perturbs it by changing matmul rounding, so a
+// throughput A/B across arms is comparing different generated text.
+//
+// So: a measurable startup cost for an unproven end-to-end benefit. Opt-in until the
+// verify-step time is measured directly (cl_profiling) rather than inferred from wall clock.
 //
 // ne1 2..4 and no wider: per row per 32-K block a half8 FMA issues 32 ops (eight columns
 // wide whatever ne1 is) while dp4a issues 8 x ne1, so int8 wins at 2, ties at 4 and loses
@@ -16202,7 +16214,7 @@ static bool ggml_cl_kquant_plane_dp4a_gemm_on(const ggml_backend_opencl_context 
 static bool ggml_cl_cok_dp4a_narrow_on(const ggml_backend_opencl_context * backend_ctx,
                                        int64_t ne1, int64_t ne01, int64_t ne00, int rows) {
     static const char * const e = getenv("GGML_OPENCL_COK_DP4A");
-    if (e && *e && atoi(e) == 0) {
+    if (!(e && *e && atoi(e) != 0)) {
         return false;
     }
     return backend_ctx->has_integer_dot_product
