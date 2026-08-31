@@ -29243,10 +29243,15 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
         // Same decline as the q4_K twin. The q6_K shapes test-backend-ops asks for do not
         // meet this path's ne01 % 256 gate, so on A7X this kernel is UNTESTED rather than
         // known good -- and the sibling kernel demonstrably miscompiles on that compiler.
+        // ne1 >= 3, unlike q4_K and q4_0. At ne1 == 2 the 2-column q6_K build measures
+        // 412.2 us against 384.3 for the kernel it would replace (Adreno X2-90, m=4096
+        // k=14336), a 6.8% LOSS, while ne1 3 and 4 gain 8.4% and 8.8%. q6_K unpacks two
+        // operands per block where q4_K unpacks one, so its fixed per-block cost is higher
+        // and two columns do not amortise it.
         if (ggml_cl_cok_dp4a_narrow_on(backend_ctx, ne1, ne01, ne00, backend_ctx->q6k_cok_dp4a_rows)
+            && ne1 >= 3
             && !is_output_w_cok
-            && ((ne1 <= 2) ? backend_ctx->kernel_gemm_cok_q6_k_q8_1_dp4a_c2
-                           : backend_ctx->kernel_gemm_cok_q6_k_q8_1_dp4a) != nullptr) {
+            && backend_ctx->kernel_gemm_cok_q6_k_q8_1_dp4a != nullptr) {
             const int    N6   = (int)ne1, K6 = (int)ne00;
             const int    w6   = (N6 <= 2) ? 2 : 4;
             const size_t nb6  = (size_t)w6 * (K6 / 32);
