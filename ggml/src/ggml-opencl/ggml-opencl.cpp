@@ -1810,6 +1810,9 @@ struct ggml_backend_opencl_context {
     int       q4k_cok_dp4a_nsg_narrow = 8;
     int       q4k_cok_dp4a_nsg_eff = 4;
     int       q4k_cok_dp4a_rows    = 4;
+    bool      q4k_cok_built = false;   // the cok programs are built on first use
+    bool      q6k_cok_built = false;
+    bool      q40_cok_built = false;
     int q4k_dp4a_ts_narrow = 32;  // tile for the verify band; == q4k_dp4a_ts disables the split
     int q4k_dp4a_narrow_max = 16; // widest ne1 routed to the narrow tile
     int q4k_dp4a_ts_mid    = 24;  // tile for ne1 in (narrow_max, mid_max]
@@ -2320,6 +2323,219 @@ static cl_program ggml_cl_build_cok_program(ggml_backend_opencl_context * backen
         CL_CHECK(clReleaseProgram(prog));
         nsg_eff = fit;
     }
+}
+
+// The narrow cok+dp4a programs are built ON FIRST USE, not at load.
+//
+// Building them at load cost measurably on kernels that never touch this band: on an
+// Adreno X2-90 the six programs (three types x two column widths) slowed q6_K ne1=2 by
+// 6.5% and q5_K ne1=2 by 4.6% with nothing ever dispatched to them, while dispatching
+// them was nearly free. A model outside the ne1 2..4 band paid the whole cost for a
+// feature it never used. Building lazily also makes the opt-out genuinely free.
+//
+// Each builder runs at most once per context; the *_have_* accessors do the ensure and
+// report whether the kernel exists, so the dispatch sites cannot forget to build.
+
+// gemm_cok_q4_k_q8_1_dp4a (narrow-band q4_K GEMM, ne1 = 2..4)
+static void ggml_cl_cok_build_q4k(ggml_backend_opencl_context * backend_ctx) {
+    cl_int err;
+    const std::string compile_opts = ggml_opencl_make_compile_opts(backend_ctx);
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src {
+            #include "gemm_cok_q4_k_q8_1_dp4a.cl.h"
+        };
+#else
+        const std::string kernel_src = read_file("gemm_cok_q4_k_q8_1_dp4a.cl");
+#endif
+        // Debug bisect: 1 = launch geometry only, 2 = K loop without the reduction,
+        // 3 = full kernel. Build-time, selected from the environment.
+        int cok_stage = 3;
+        if (const char * e = getenv("GGML_OPENCL_Q4K_COK_DP4A_STAGE")) { cok_stage = atoi(e); }
+        int cok_rows = 4;
+        if (const char * e = getenv("GGML_OPENCL_Q4K_COK_DP4A_ROWS")) { cok_rows = atoi(e); }
+        // 4, not 8. The driver reports CL_KERNEL_WORK_GROUP_SIZE = 512 for this kernel and
+        // accepts a 64x8 launch, then the reduction deadlocks -- bisected by construction:
+        // with the reduction removed the same kernel completes 568 dispatches at 64x8, and
+        // the full kernel completes at 64x4 and 64x2. ggml_cl_build_cok_program narrows
+        // against that query and still selected 8. That query is a
+        // MAXIMUM in any case, not an optimum: taking it maximises register demand per
+        // workgroup and minimises how many can be resident, so it is tuned, not adopted.
+        int nsg_req = 4;
+        if (const char * e = getenv("GGML_OPENCL_Q4K_COK_DP4A_NSG")) { nsg_req = atoi(e); }
+        int nsg_narrow = 8;
+        if (const char * e = getenv("GGML_OPENCL_Q4K_COK_DP4A_NSGN")) { nsg_narrow = atoi(e); }
+
+        // Two column widths. The band is ne1 = 2..8 and an 8-column lane computes 8
+        // columns whatever ne1 is, so at ne1=2 six are discarded -- and that is where
+        // the 8-column build loses worst. The 4-column build halves the accumulator and
+        // dot registers and the work; the dispatch picks by ne1.
+        int cok_kwide = 4;
+        if (const char * e = getenv("GGML_OPENCL_Q4K_COK_DP4A_KWIDE")) { cok_kwide = atoi(e); }
+        const std::string base_opts = compile_opts
+            + " -DCOK_STAGE=" + std::to_string(cok_stage)
+            + " -DCOK_ROWS="  + std::to_string(cok_rows)
+            + " -DCOK_KWIDE=" + std::to_string(cok_kwide);
+        // NSG is per column width, not global. The narrow builds hold far fewer live
+        // values and run best at 8 (n4: 357 us against 510 at nsg 4, and against a
+        // 368 us control); the 8-column build deadlocks at 8 and takes 4.
+        // No 8-column build: the dispatch gate stops at ne1 4, so it could never run --
+        // and each program build costs ~200 ms of startup, which is the arm's only
+        // measurable end-to-end effect on a short run.
+        for (int cols : {4, 2}) {
+            int nsg_eff = nsg_narrow;
+            cl_program prog = ggml_cl_build_cok_program(
+                backend_ctx, kernel_src.c_str(),
+                base_opts + " -DCOK_COLS=" + std::to_string(cols), nsg_eff, &nsg_eff);
+            cl_kernel kk = clCreateKernel(prog, "kernel_gemm_cok_q4_k_q8_1_dp4a", &err);
+            if (err != CL_SUCCESS) { kk = nullptr; }
+            if (kk) {
+                // PRIVATE MEM IS SCRATCH, NOT REGISTER COUNT: a kernel that keeps
+                // everything in registers reports 0. Any nonzero figure here is spill
+                // traffic on every access, so it is the number to tune against.
+                cl_ulong pmc = 0, lmc = 0; size_t wgc = 0;
+                clGetKernelWorkGroupInfo(kk, backend_ctx->device, CL_KERNEL_PRIVATE_MEM_SIZE, sizeof(pmc), &pmc, NULL);
+                clGetKernelWorkGroupInfo(kk, backend_ctx->device, CL_KERNEL_LOCAL_MEM_SIZE,   sizeof(lmc), &lmc, NULL);
+                clGetKernelWorkGroupInfo(kk, backend_ctx->device, CL_KERNEL_WORK_GROUP_SIZE,  sizeof(wgc), &wgc, NULL);
+                fprintf(stderr, "[COK-DP4A] rows=%d cols=%d nsg=%d  private=%5llu (spill) local=%6llu wg_cap=%4zu\n",
+                        cok_rows, cols, nsg_eff, (unsigned long long)pmc,
+                        (unsigned long long)lmc, wgc);
+            }
+            if      (cols == 8) { backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a    = kk;
+                                  backend_ctx->q4k_cok_dp4a_nsg_c8 = nsg_eff; }
+            else if (cols == 4) { backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a_c4 = kk;
+                                  backend_ctx->q4k_cok_dp4a_nsg_narrow = nsg_eff; }
+            else                { backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a_c2 = kk; }
+            backend_ctx->q4k_cok_dp4a_rows    = cok_rows;
+            CL_CHECK(clReleaseProgram(prog));
+        }
+        fflush(stderr);
+        GGML_LOG_INFO("ggml_opencl: q4_K cok+dp4a narrow GEMM %s (rows=%d COK_NSG=%d)\n",
+                      backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a_c4 ? "loaded" : "UNAVAILABLE",
+                      backend_ctx->q4k_cok_dp4a_rows, backend_ctx->q4k_cok_dp4a_nsg_eff);
+}
+
+// gemm_cok_q6_k_q8_1_dp4a (q6_K twin; ne1 = 3..4)
+static void ggml_cl_cok_build_q6k(ggml_backend_opencl_context * backend_ctx) {
+    cl_int err;
+    const std::string compile_opts = ggml_opencl_make_compile_opts(backend_ctx);
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src {
+            #include "gemm_cok_q6_k_q8_1_dp4a.cl.h"
+        };
+#else
+        const std::string kernel_src = read_file("gemm_cok_q6_k_q8_1_dp4a.cl");
+#endif
+        int rows6 = 4;
+        if (const char * e = getenv("GGML_OPENCL_Q6K_COK_DP4A_ROWS")) { rows6 = atoi(e); }
+        int nsg6 = 8;
+        if (const char * e = getenv("GGML_OPENCL_Q6K_COK_DP4A_NSG")) { nsg6 = atoi(e); }
+        const std::string base6 = compile_opts + " -DCOK_ROWS=" + std::to_string(rows6);
+        for (int cols : {4, 2}) {
+            int nsg_eff = nsg6;
+            cl_program prog = ggml_cl_build_cok_program(
+                backend_ctx, kernel_src.c_str(),
+                base6 + " -DCOK_COLS=" + std::to_string(cols), nsg_eff, &nsg_eff);
+            cl_kernel kk = clCreateKernel(prog, "kernel_gemm_cok_q6_k_q8_1_dp4a", &err);
+            if (err != CL_SUCCESS) {
+                fprintf(stderr, "[COK-DP4A-q6K] cols=%d clCreateKernel FAILED err=%d\n", cols, err);
+                kk = nullptr;
+            }
+            if (kk) {
+                cl_ulong pmc = 0, lmc = 0; size_t wgc = 0;
+                clGetKernelWorkGroupInfo(kk, backend_ctx->device, CL_KERNEL_PRIVATE_MEM_SIZE, sizeof(pmc), &pmc, NULL);
+                clGetKernelWorkGroupInfo(kk, backend_ctx->device, CL_KERNEL_LOCAL_MEM_SIZE,   sizeof(lmc), &lmc, NULL);
+                clGetKernelWorkGroupInfo(kk, backend_ctx->device, CL_KERNEL_WORK_GROUP_SIZE,  sizeof(wgc), &wgc, NULL);
+                fprintf(stderr, "[COK-DP4A-q6K] rows=%d cols=%d nsg=%d  private=%5llu (spill) local=%6llu wg_cap=%4zu\n",
+                        rows6, cols, nsg_eff, (unsigned long long)pmc,
+                        (unsigned long long)lmc, wgc);
+            }
+            if (cols == 4) { backend_ctx->kernel_gemm_cok_q6_k_q8_1_dp4a    = kk;
+                             backend_ctx->q6k_cok_dp4a_nsg = nsg_eff; }
+            else           { backend_ctx->kernel_gemm_cok_q6_k_q8_1_dp4a_c2 = kk; }
+            CL_CHECK(clReleaseProgram(prog));
+        }
+        fflush(stderr);
+        backend_ctx->q6k_cok_dp4a_rows = rows6;
+        GGML_LOG_INFO("ggml_opencl: q6_K cok+dp4a narrow GEMM %s (rows=%d COK_NSG=%d)\n",
+                      backend_ctx->kernel_gemm_cok_q6_k_q8_1_dp4a ? "loaded" : "UNAVAILABLE",
+                      backend_ctx->q6k_cok_dp4a_rows, backend_ctx->q6k_cok_dp4a_nsg);
+}
+
+// gemm_cok_q4_0_q8_1_dp4a (q4_0 twin; ne1 = 2..4)
+static void ggml_cl_cok_build_q40(ggml_backend_opencl_context * backend_ctx) {
+    cl_int err;
+    const std::string compile_opts = ggml_opencl_make_compile_opts(backend_ctx);
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src {
+            #include "gemm_cok_q4_0_q8_1_dp4a.cl.h"
+        };
+#else
+        const std::string kernel_src = read_file("gemm_cok_q4_0_q8_1_dp4a.cl");
+#endif
+        int rows40 = 4;
+        if (const char * e = getenv("GGML_OPENCL_Q40_COK_DP4A_ROWS")) { rows40 = atoi(e); }
+        int nsg40 = 8;
+        if (const char * e = getenv("GGML_OPENCL_Q40_COK_DP4A_NSG")) { nsg40 = atoi(e); }
+        const std::string base40 = compile_opts + " -DCOK_ROWS=" + std::to_string(rows40);
+        for (int cols : {4, 2}) {
+            int nsg_eff = nsg40;
+            cl_program prog = ggml_cl_build_cok_program(
+                backend_ctx, kernel_src.c_str(),
+                base40 + " -DCOK_COLS=" + std::to_string(cols), nsg_eff, &nsg_eff);
+            cl_kernel kk = clCreateKernel(prog, "kernel_gemm_cok_q4_0_q8_1_dp4a", &err);
+            if (err != CL_SUCCESS) {
+                fprintf(stderr, "[COK-DP4A-q40] cols=%d clCreateKernel FAILED err=%d\n", cols, err);
+                kk = nullptr;
+            }
+            if (kk) {
+                cl_ulong pmc = 0, lmc = 0; size_t wgc = 0;
+                clGetKernelWorkGroupInfo(kk, backend_ctx->device, CL_KERNEL_PRIVATE_MEM_SIZE, sizeof(pmc), &pmc, NULL);
+                clGetKernelWorkGroupInfo(kk, backend_ctx->device, CL_KERNEL_LOCAL_MEM_SIZE,   sizeof(lmc), &lmc, NULL);
+                clGetKernelWorkGroupInfo(kk, backend_ctx->device, CL_KERNEL_WORK_GROUP_SIZE,  sizeof(wgc), &wgc, NULL);
+                fprintf(stderr, "[COK-DP4A-q40] rows=%d cols=%d nsg=%d  private=%5llu (spill) local=%6llu wg_cap=%4zu\n",
+                        rows40, cols, nsg_eff, (unsigned long long)pmc,
+                        (unsigned long long)lmc, wgc);
+            }
+            if (cols == 4) { backend_ctx->kernel_gemm_cok_q4_0_q8_1_dp4a    = kk;
+                             backend_ctx->q40_cok_dp4a_nsg = nsg_eff; }
+            else           { backend_ctx->kernel_gemm_cok_q4_0_q8_1_dp4a_c2 = kk; }
+            CL_CHECK(clReleaseProgram(prog));
+        }
+        fflush(stderr);
+        backend_ctx->q40_cok_dp4a_rows = rows40;
+        GGML_LOG_INFO("ggml_opencl: q4_0 cok+dp4a narrow GEMM %s (rows=%d COK_NSG=%d)\n",
+                      backend_ctx->kernel_gemm_cok_q4_0_q8_1_dp4a ? "loaded" : "UNAVAILABLE",
+                      backend_ctx->q40_cok_dp4a_rows, backend_ctx->q40_cok_dp4a_nsg);
+}
+
+static bool ggml_cl_cok_have_q4k(ggml_backend_opencl_context * backend_ctx) {
+    if (!backend_ctx->q4k_cok_built) {
+        backend_ctx->q4k_cok_built = true;
+        if (backend_ctx->has_integer_dot_product && ggml_cl_cok_dp4a_build_on()) {
+            ggml_cl_cok_build_q4k(backend_ctx);
+        }
+    }
+    return backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a_c4 != nullptr;
+}
+
+static bool ggml_cl_cok_have_q6k(ggml_backend_opencl_context * backend_ctx) {
+    if (!backend_ctx->q6k_cok_built) {
+        backend_ctx->q6k_cok_built = true;
+        if (backend_ctx->has_integer_dot_product && ggml_cl_cok_dp4a_build_on()) {
+            ggml_cl_cok_build_q6k(backend_ctx);
+        }
+    }
+    return backend_ctx->kernel_gemm_cok_q6_k_q8_1_dp4a != nullptr;
+}
+
+static bool ggml_cl_cok_have_q40(ggml_backend_opencl_context * backend_ctx) {
+    if (!backend_ctx->q40_cok_built) {
+        backend_ctx->q40_cok_built = true;
+        if (backend_ctx->has_integer_dot_product && ggml_cl_cok_dp4a_build_on()) {
+            ggml_cl_cok_build_q40(backend_ctx);
+        }
+    }
+    return backend_ctx->kernel_gemm_cok_q4_0_q8_1_dp4a != nullptr;
 }
 
 static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
@@ -5522,180 +5738,6 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
     // Built only when asked for. It is an experiment against the default cok dispatch,
     // and an unconditional build would cost a program compile at init on every device
     // that will never dispatch it.
-    if (backend_ctx->has_integer_dot_product && ggml_cl_cok_dp4a_build_on()) {
-#ifdef GGML_OPENCL_EMBED_KERNELS
-        const std::string kernel_src {
-            #include "gemm_cok_q4_k_q8_1_dp4a.cl.h"
-        };
-#else
-        const std::string kernel_src = read_file("gemm_cok_q4_k_q8_1_dp4a.cl");
-#endif
-        // Debug bisect: 1 = launch geometry only, 2 = K loop without the reduction,
-        // 3 = full kernel. Build-time, selected from the environment.
-        int cok_stage = 3;
-        if (const char * e = getenv("GGML_OPENCL_Q4K_COK_DP4A_STAGE")) { cok_stage = atoi(e); }
-        int cok_rows = 4;
-        if (const char * e = getenv("GGML_OPENCL_Q4K_COK_DP4A_ROWS")) { cok_rows = atoi(e); }
-        // 4, not 8. The driver reports CL_KERNEL_WORK_GROUP_SIZE = 512 for this kernel and
-        // accepts a 64x8 launch, then the reduction deadlocks -- bisected by construction:
-        // with the reduction removed the same kernel completes 568 dispatches at 64x8, and
-        // the full kernel completes at 64x4 and 64x2. ggml_cl_build_cok_program narrows
-        // against that query and still selected 8. That query is a
-        // MAXIMUM in any case, not an optimum: taking it maximises register demand per
-        // workgroup and minimises how many can be resident, so it is tuned, not adopted.
-        int nsg_req = 4;
-        if (const char * e = getenv("GGML_OPENCL_Q4K_COK_DP4A_NSG")) { nsg_req = atoi(e); }
-        int nsg_narrow = 8;
-        if (const char * e = getenv("GGML_OPENCL_Q4K_COK_DP4A_NSGN")) { nsg_narrow = atoi(e); }
-
-        // Two column widths. The band is ne1 = 2..8 and an 8-column lane computes 8
-        // columns whatever ne1 is, so at ne1=2 six are discarded -- and that is where
-        // the 8-column build loses worst. The 4-column build halves the accumulator and
-        // dot registers and the work; the dispatch picks by ne1.
-        int cok_kwide = 4;
-        if (const char * e = getenv("GGML_OPENCL_Q4K_COK_DP4A_KWIDE")) { cok_kwide = atoi(e); }
-        const std::string base_opts = compile_opts
-            + " -DCOK_STAGE=" + std::to_string(cok_stage)
-            + " -DCOK_ROWS="  + std::to_string(cok_rows)
-            + " -DCOK_KWIDE=" + std::to_string(cok_kwide);
-        // NSG is per column width, not global. The narrow builds hold far fewer live
-        // values and run best at 8 (n4: 357 us against 510 at nsg 4, and against a
-        // 368 us control); the 8-column build deadlocks at 8 and takes 4.
-        // No 8-column build: the dispatch gate stops at ne1 4, so it could never run --
-        // and each program build costs ~200 ms of startup, which is the arm's only
-        // measurable end-to-end effect on a short run.
-        for (int cols : {4, 2}) {
-            int nsg_eff = nsg_narrow;
-            cl_program prog = ggml_cl_build_cok_program(
-                backend_ctx, kernel_src.c_str(),
-                base_opts + " -DCOK_COLS=" + std::to_string(cols), nsg_eff, &nsg_eff);
-            cl_kernel kk = clCreateKernel(prog, "kernel_gemm_cok_q4_k_q8_1_dp4a", &err);
-            if (err != CL_SUCCESS) { kk = nullptr; }
-            if (kk) {
-                // PRIVATE MEM IS SCRATCH, NOT REGISTER COUNT: a kernel that keeps
-                // everything in registers reports 0. Any nonzero figure here is spill
-                // traffic on every access, so it is the number to tune against.
-                cl_ulong pmc = 0, lmc = 0; size_t wgc = 0;
-                clGetKernelWorkGroupInfo(kk, backend_ctx->device, CL_KERNEL_PRIVATE_MEM_SIZE, sizeof(pmc), &pmc, NULL);
-                clGetKernelWorkGroupInfo(kk, backend_ctx->device, CL_KERNEL_LOCAL_MEM_SIZE,   sizeof(lmc), &lmc, NULL);
-                clGetKernelWorkGroupInfo(kk, backend_ctx->device, CL_KERNEL_WORK_GROUP_SIZE,  sizeof(wgc), &wgc, NULL);
-                fprintf(stderr, "[COK-DP4A] rows=%d cols=%d nsg=%d  private=%5llu (spill) local=%6llu wg_cap=%4zu\n",
-                        cok_rows, cols, nsg_eff, (unsigned long long)pmc,
-                        (unsigned long long)lmc, wgc);
-            }
-            if      (cols == 8) { backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a    = kk;
-                                  backend_ctx->q4k_cok_dp4a_nsg_c8 = nsg_eff; }
-            else if (cols == 4) { backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a_c4 = kk;
-                                  backend_ctx->q4k_cok_dp4a_nsg_narrow = nsg_eff; }
-            else                { backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a_c2 = kk; }
-            backend_ctx->q4k_cok_dp4a_rows    = cok_rows;
-            CL_CHECK(clReleaseProgram(prog));
-        }
-        fflush(stderr);
-        GGML_LOG_INFO("ggml_opencl: q4_K cok+dp4a narrow GEMM %s (rows=%d COK_NSG=%d)\n",
-                      backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a_c4 ? "loaded" : "UNAVAILABLE",
-                      backend_ctx->q4k_cok_dp4a_rows, backend_ctx->q4k_cok_dp4a_nsg_eff);
-
-    // gemm_cok_q6_k_q8_1_dp4a (q6_K twin of the narrow dp4a GEMM; ne1 = 2..4)
-    //
-    // muse-glimmer-30B is q6_K on 26 of 52 layers (ffn_down), so a q4_K-only arm leaves
-    // half the narrow-band matmul time untouched -- which is why the q4_K win measured
-    // +4% at the kernel and only +3.3% on the model.
-    if (backend_ctx->has_integer_dot_product && ggml_cl_cok_dp4a_build_on()) {
-#ifdef GGML_OPENCL_EMBED_KERNELS
-        const std::string kernel_src {
-            #include "gemm_cok_q6_k_q8_1_dp4a.cl.h"
-        };
-#else
-        const std::string kernel_src = read_file("gemm_cok_q6_k_q8_1_dp4a.cl");
-#endif
-        int rows6 = 4;
-        if (const char * e = getenv("GGML_OPENCL_Q6K_COK_DP4A_ROWS")) { rows6 = atoi(e); }
-        int nsg6 = 8;
-        if (const char * e = getenv("GGML_OPENCL_Q6K_COK_DP4A_NSG")) { nsg6 = atoi(e); }
-        const std::string base6 = compile_opts + " -DCOK_ROWS=" + std::to_string(rows6);
-        for (int cols : {4, 2}) {
-            int nsg_eff = nsg6;
-            cl_program prog = ggml_cl_build_cok_program(
-                backend_ctx, kernel_src.c_str(),
-                base6 + " -DCOK_COLS=" + std::to_string(cols), nsg_eff, &nsg_eff);
-            cl_kernel kk = clCreateKernel(prog, "kernel_gemm_cok_q6_k_q8_1_dp4a", &err);
-            if (err != CL_SUCCESS) {
-                fprintf(stderr, "[COK-DP4A-q6K] cols=%d clCreateKernel FAILED err=%d\n", cols, err);
-                kk = nullptr;
-            }
-            if (kk) {
-                cl_ulong pmc = 0, lmc = 0; size_t wgc = 0;
-                clGetKernelWorkGroupInfo(kk, backend_ctx->device, CL_KERNEL_PRIVATE_MEM_SIZE, sizeof(pmc), &pmc, NULL);
-                clGetKernelWorkGroupInfo(kk, backend_ctx->device, CL_KERNEL_LOCAL_MEM_SIZE,   sizeof(lmc), &lmc, NULL);
-                clGetKernelWorkGroupInfo(kk, backend_ctx->device, CL_KERNEL_WORK_GROUP_SIZE,  sizeof(wgc), &wgc, NULL);
-                fprintf(stderr, "[COK-DP4A-q6K] rows=%d cols=%d nsg=%d  private=%5llu (spill) local=%6llu wg_cap=%4zu\n",
-                        rows6, cols, nsg_eff, (unsigned long long)pmc,
-                        (unsigned long long)lmc, wgc);
-            }
-            if (cols == 4) { backend_ctx->kernel_gemm_cok_q6_k_q8_1_dp4a    = kk;
-                             backend_ctx->q6k_cok_dp4a_nsg = nsg_eff; }
-            else           { backend_ctx->kernel_gemm_cok_q6_k_q8_1_dp4a_c2 = kk; }
-            CL_CHECK(clReleaseProgram(prog));
-        }
-        fflush(stderr);
-        backend_ctx->q6k_cok_dp4a_rows = rows6;
-        GGML_LOG_INFO("ggml_opencl: q6_K cok+dp4a narrow GEMM %s (rows=%d COK_NSG=%d)\n",
-                      backend_ctx->kernel_gemm_cok_q6_k_q8_1_dp4a ? "loaded" : "UNAVAILABLE",
-                      backend_ctx->q6k_cok_dp4a_rows, backend_ctx->q6k_cok_dp4a_nsg);
-
-    // gemm_cok_q4_0_q8_1_dp4a (q4_0 twin; ne1 = 2..4)
-    //
-    // muse is q4_K + q6_K and is covered by the two above. Qwen3.8-27B-Q4_0 and
-    // Nemotron-30B-A3B-Q4_0 are q4_0 and are covered by neither.
-    if (backend_ctx->has_integer_dot_product && ggml_cl_cok_dp4a_build_on()) {
-#ifdef GGML_OPENCL_EMBED_KERNELS
-        const std::string kernel_src {
-            #include "gemm_cok_q4_0_q8_1_dp4a.cl.h"
-        };
-#else
-        const std::string kernel_src = read_file("gemm_cok_q4_0_q8_1_dp4a.cl");
-#endif
-        int rows40 = 4;
-        if (const char * e = getenv("GGML_OPENCL_Q40_COK_DP4A_ROWS")) { rows40 = atoi(e); }
-        int nsg40 = 8;
-        if (const char * e = getenv("GGML_OPENCL_Q40_COK_DP4A_NSG")) { nsg40 = atoi(e); }
-        const std::string base40 = compile_opts + " -DCOK_ROWS=" + std::to_string(rows40);
-        for (int cols : {4, 2}) {
-            int nsg_eff = nsg40;
-            cl_program prog = ggml_cl_build_cok_program(
-                backend_ctx, kernel_src.c_str(),
-                base40 + " -DCOK_COLS=" + std::to_string(cols), nsg_eff, &nsg_eff);
-            cl_kernel kk = clCreateKernel(prog, "kernel_gemm_cok_q4_0_q8_1_dp4a", &err);
-            if (err != CL_SUCCESS) {
-                fprintf(stderr, "[COK-DP4A-q40] cols=%d clCreateKernel FAILED err=%d\n", cols, err);
-                kk = nullptr;
-            }
-            if (kk) {
-                cl_ulong pmc = 0, lmc = 0; size_t wgc = 0;
-                clGetKernelWorkGroupInfo(kk, backend_ctx->device, CL_KERNEL_PRIVATE_MEM_SIZE, sizeof(pmc), &pmc, NULL);
-                clGetKernelWorkGroupInfo(kk, backend_ctx->device, CL_KERNEL_LOCAL_MEM_SIZE,   sizeof(lmc), &lmc, NULL);
-                clGetKernelWorkGroupInfo(kk, backend_ctx->device, CL_KERNEL_WORK_GROUP_SIZE,  sizeof(wgc), &wgc, NULL);
-                fprintf(stderr, "[COK-DP4A-q40] rows=%d cols=%d nsg=%d  private=%5llu (spill) local=%6llu wg_cap=%4zu\n",
-                        rows40, cols, nsg_eff, (unsigned long long)pmc,
-                        (unsigned long long)lmc, wgc);
-            }
-            if (cols == 4) { backend_ctx->kernel_gemm_cok_q4_0_q8_1_dp4a    = kk;
-                             backend_ctx->q40_cok_dp4a_nsg = nsg_eff; }
-            else           { backend_ctx->kernel_gemm_cok_q4_0_q8_1_dp4a_c2 = kk; }
-            CL_CHECK(clReleaseProgram(prog));
-        }
-        fflush(stderr);
-        backend_ctx->q40_cok_dp4a_rows = rows40;
-        GGML_LOG_INFO("ggml_opencl: q4_0 cok+dp4a narrow GEMM %s (rows=%d COK_NSG=%d)\n",
-                      backend_ctx->kernel_gemm_cok_q4_0_q8_1_dp4a ? "loaded" : "UNAVAILABLE",
-                      backend_ctx->q40_cok_dp4a_rows, backend_ctx->q40_cok_dp4a_nsg);
-        GGML_LOG_CONT(".");
-    }
-        GGML_LOG_CONT(".");
-    }
-        GGML_LOG_CONT(".");
-    }
 
     // gemm_noshuffle_q4_k_q8_1_dp4a (dp4a dense prefill GEMM)
     if (backend_ctx->has_integer_dot_product) {
@@ -25601,6 +25643,7 @@ static void ggml_cl_mul_mat_q4_0_f32_adreno(ggml_backend_t backend, const ggml_t
     // Same yield as the q4_K path: the narrow cok+dp4a GEMM is downstream of this branch.
     const bool q40_cok_dp4a_takes_it =
         ggml_cl_cok_dp4a_narrow_on(backend_ctx, ne1, ne01, ne00, backend_ctx->q40_cok_dp4a_rows)
+        && ggml_cl_cok_have_q40(backend_ctx)
         && ((ne1 <= 2) ? backend_ctx->kernel_gemm_cok_q4_0_q8_1_dp4a_c2
                        : backend_ctx->kernel_gemm_cok_q4_0_q8_1_dp4a) != nullptr;
     const bool use_q40_mc3 = q40_mc3 && !q40_cok_dp4a_takes_it
@@ -25918,6 +25961,7 @@ static void ggml_cl_mul_mat_q4_0_f32_adreno(ggml_backend_t backend, const ggml_t
         // no min, so no sum_act correction and a single dot flush per block.
 
         if (ggml_cl_cok_dp4a_narrow_on(backend_ctx, ne1, ne01, ne00, backend_ctx->q40_cok_dp4a_rows)
+            && ggml_cl_cok_have_q40(backend_ctx)
             && ((ne1 <= 2) ? backend_ctx->kernel_gemm_cok_q4_0_q8_1_dp4a_c2
                            : backend_ctx->kernel_gemm_cok_q4_0_q8_1_dp4a) != nullptr) {
             const int N40 = (int)ne1, K40 = (int)ne00;
@@ -27797,6 +27841,7 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
     // the default (mc3 on) as its control, so this is the comparison that was made.
     const bool cok_dp4a_takes_it =
         ggml_cl_cok_dp4a_narrow_on(backend_ctx, ne1, ne01, ne00, backend_ctx->q4k_cok_dp4a_rows)
+        && ggml_cl_cok_have_q4k(backend_ctx)
         && ((ne1 <= 2) ? backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a_c2
                        : backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a_c4) != nullptr;
     const bool use_mc3 = q4k_mc3 && !cok_dp4a_takes_it
@@ -28077,6 +28122,7 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
         //
         // An Adreno 840 and an X2-90 run the identical binary and shapes clean.
         if (ggml_cl_cok_dp4a_narrow_on(backend_ctx, ne1, ne01, ne00, backend_ctx->q4k_cok_dp4a_rows)
+            && ggml_cl_cok_have_q4k(backend_ctx)
             && ne1 <= q4k_cok_dp4a_maxn
             && ((ne1 <= 2) ? backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a_c2
                            : backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a_c4) != nullptr) {
@@ -28138,14 +28184,6 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
                                              &z16, sizeof(z16), 0, backend_ctx->prealloc_moe_sa.size, 0, NULL, NULL));
             }
 
-            // Debug-only: a clFinish after each enqueue so a stall names the kernel
-            // that caused it rather than just the dispatch.
-            const bool cok_trace = getenv("GGML_OPENCL_Q4K_COK_DP4A_TRACE") != nullptr;
-            if (cok_trace) {
-                fprintf(stderr, "[COK-DP4A] ENTER M=%d N=%d K=%d cols=%d\n",
-                        ne01, (int)ne1, K, cok_w);
-                fflush(stderr);
-            }
 
             cl_int tbq = (cl_int)((size_t)N * (K / 32));
             cl_kernel qk = backend_ctx->kernel_quant_a_q8_1;
@@ -28157,10 +28195,6 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
             size_t q_local[1]  = { 64 };
             size_t q_global[1] = { (size_t)((((size_t)tbq + 63) / 64) * 64) };
             backend_ctx->enqueue_ndrange_kernel(qk, 1, q_global, q_local, dst);
-            if (cok_trace) {
-                CL_CHECK(clFinish(backend_ctx->queue));
-                fprintf(stderr, "[COK-DP4A] quant_a_q8_1 done\n"); fflush(stderr);
-            }
 
             // Pick the column width by the actual batch. An 8-column lane computes 8
             // columns whatever ne1 is, so ne1<=4 was paying for six discarded columns --
@@ -28210,10 +28244,6 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
             size_t c_local[3]  = { 64, cok_nsg, 1 };
             size_t c_global[3] = { (size_t)(ne01 / backend_ctx->q4k_cok_dp4a_rows), cok_nsg, 1 };
             backend_ctx->enqueue_ndrange_kernel(ck, 3, c_global, c_local, dst);
-            if (cok_trace) {
-                CL_CHECK(clFinish(backend_ctx->queue));
-                fprintf(stderr, "[COK-DP4A] gemm done\n"); fflush(stderr);
-            }
 
             CL_CHECK(clReleaseMemObject(b_sub_buf));
             return;
@@ -29251,7 +29281,7 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
         if (ggml_cl_cok_dp4a_narrow_on(backend_ctx, ne1, ne01, ne00, backend_ctx->q6k_cok_dp4a_rows)
             && ne1 >= 3
             && !is_output_w_cok
-            && backend_ctx->kernel_gemm_cok_q6_k_q8_1_dp4a != nullptr) {
+            && ggml_cl_cok_have_q6k(backend_ctx)) {
             const int    N6   = (int)ne1, K6 = (int)ne00;
             const int    w6   = (N6 <= 2) ? 2 : 4;
             const size_t nb6  = (size_t)w6 * (K6 / 32);
@@ -30331,47 +30361,6 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
     const enum ggml_type src1t = src1->type;
 
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
-
-    // Which batch widths does the real workload actually run at?
-    //
-    // The narrow dp4a kernels serve ne1 2..4, and that is only worth having if the
-    // workload lands there. A speculative-decode verify step runs at the accepted draft
-    // width, and this backend has previously tuned a dp4a tile for ne1 9..16 -- so the
-    // answer is an open question, not an assumption. GGML_OPENCL_NE1_HIST=1 counts every
-    // matmul by width and quant, and prints at exit.
-    if (getenv("GGML_OPENCL_NE1_HIST")) {
-        struct ne1_hist {
-            // [0]=1, [1]=2, [2]=3, [3]=4, [4]=5..8, [5]=9..16, [6]=17..64, [7]=>64
-            unsigned long long n[8]  = {0};
-            unsigned long long q4[8] = {0};
-            unsigned long long q6[8] = {0};
-            void dump() {
-                static const char * lbl[8] = {"1","2","3","4","5-8","9-16","17-64",">64"};
-                unsigned long long tot = 0;
-                for (int i = 0; i < 8; i++) { tot += n[i]; }
-                if (!tot) { return; }
-                fprintf(stderr, "[NE1-HIST] matmul dispatches by batch width (total %llu)\n", tot);
-                for (int i = 0; i < 8; i++) {
-                    fprintf(stderr, "[NE1-HIST] %-6s %10llu  %5.1f%%   q4_K %8llu  q6_K %8llu\n",
-                            lbl[i], n[i], 100.0 * (double)n[i] / (double)tot, q4[i], q6[i]);
-                }
-                fflush(stderr);
-            }
-        };
-        static ne1_hist H;
-        static unsigned long long seen = 0;
-        const int64_t w = dst->ne[1];
-        const int b = (w <= 4) ? (int)(w - 1)
-                    : (w <= 8) ? 4 : (w <= 16) ? 5 : (w <= 64) ? 6 : 7;
-        if (b >= 0 && b < 8) {
-            H.n[b]++;
-            if (src0->type == GGML_TYPE_Q4_K) { H.q4[b]++; }
-            if (src0->type == GGML_TYPE_Q6_K) { H.q6[b]++; }
-            // Periodic, not a destructor: llama-cli's exit path does not run it, and a run
-            // that produced the answer but printed nothing wasted a whole cycle.
-            if (++seen % 20000 == 0) { H.dump(); }
-        }
-    }
 
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
     // GQA-coalesced decode KQ for a q8_0 K-cache (DK=128, r2=8, ne11==1) -- the
