@@ -1857,6 +1857,42 @@ struct ggml_hexagon_opbatch {
         }
     }
 
+    void sort_buffers() {
+        if (n_bufs <= 1) return;
+
+        std::vector<int> order(n_bufs);
+        for (unsigned int i = 0; i < n_bufs; i++) { order[i] = (int) i; }
+
+        std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
+            return h_bufs[a].size > h_bufs[b].size;
+        });
+
+        bool already_sorted = true;
+        for (unsigned int i = 0; i < n_bufs; i++) {
+            if (order[i] != (int) i) {
+                already_sorted = false;
+                break;
+            }
+        }
+        if (already_sorted) return;
+
+        std::vector<uint16_t> remap(n_bufs);
+        std::vector<htp_buf_desc> sorted_bufs(n_bufs);
+        for (unsigned int new_bi = 0; new_bi < n_bufs; new_bi++) {
+            int old_bi = order[new_bi];
+            remap[old_bi] = (uint16_t) new_bi;
+            sorted_bufs[new_bi] = h_bufs[old_bi];
+        }
+
+        for (unsigned int i = 0; i < n_bufs; i++) {
+            h_bufs[i] = sorted_bufs[i];
+        }
+
+        for (unsigned int i = 0; i < n_tens; i++) {
+            h_tens[i].bi = remap[h_tens[i].bi];
+        }
+    }
+
     bool try_fuse_allreduce_add(const htp_opnode & node) {
         if (n_ops == 0 || opt_ar_select != 2) return false;
         if (node.opcode != HTP_OP_ADD) return false;
@@ -2574,6 +2610,8 @@ struct ggml_hexagon_opqueue {
         uint8_t * b_ptr = m_ptr; m_ptr += b_size;
         uint8_t * t_ptr = m_ptr; m_ptr += t_size;
         uint8_t * o_ptr = m_ptr;
+
+        op_batch->sort_buffers();
 
         memcpy(b_ptr, (void *) op_batch->h_bufs.data(), b_size);
         memcpy(t_ptr, (void *) op_batch->h_tens.data(), t_size);
