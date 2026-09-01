@@ -58,8 +58,22 @@ typedef int2   cok_dotv;
     | (((uint)((int)((((l) & 0x0F00u) >>  8)        - 8) & 0xFF)) << 16)              \
     | (((uint)((int)((((l) & 0xF000u) >> 12)        - 8) & 0xFF)) << 24) )
 
-#if COK_ROWS == 4
-#define COK_DOT(ci, t)                                                 \
+// 8 rows per lane. The weight load reaches 16 B per lane, matching the q4_0 GEMV that
+// sustains ~117 GB/s where this kernel manages ~88 on identical traffic; 4 rows loads 8 B
+// and 1 row loads 2. Costs 8 accumulators and 8 dot registers, which spills -- acceptable
+// only if the kernel really is load-bound. Needs ne01 % (64*8) == 0; the host gates it.
+#if COK_ROWS == 8
+#define COK_DOT(ci, t)                                                \
+    d0.s##ci = dot_acc_sat_4x8packed_ss_int(w0, A##ci.s##t, d0.s##ci);\
+    d1.s##ci = dot_acc_sat_4x8packed_ss_int(w1, A##ci.s##t, d1.s##ci);\
+    d2.s##ci = dot_acc_sat_4x8packed_ss_int(w2, A##ci.s##t, d2.s##ci);\
+    d3.s##ci = dot_acc_sat_4x8packed_ss_int(w3, A##ci.s##t, d3.s##ci);\
+    d4.s##ci = dot_acc_sat_4x8packed_ss_int(w4, A##ci.s##t, d4.s##ci);\
+    d5.s##ci = dot_acc_sat_4x8packed_ss_int(w5, A##ci.s##t, d5.s##ci);\
+    d6.s##ci = dot_acc_sat_4x8packed_ss_int(w6, A##ci.s##t, d6.s##ci);\
+    d7.s##ci = dot_acc_sat_4x8packed_ss_int(w7, A##ci.s##t, d7.s##ci);
+#elif COK_ROWS == 4
+#define COK_DOT(ci, t)                                                \
     d0.s##ci = dot_acc_sat_4x8packed_ss_int(w0, A##ci.s##t, d0.s##ci); \
     d1.s##ci = dot_acc_sat_4x8packed_ss_int(w1, A##ci.s##t, d1.s##ci); \
     d2.s##ci = dot_acc_sat_4x8packed_ss_int(w2, A##ci.s##t, d2.s##ci); \
@@ -70,66 +84,30 @@ typedef int2   cok_dotv;
     d1.s##ci = dot_acc_sat_4x8packed_ss_int(w1, A##ci.s##t, d1.s##ci);
 #endif
 
-#if COK_ROWS == 4
-#define COK_DOT_PS(ci)                                                \
-    d0.s##ci = dot_acc_sat_4x8packed_ss_int(w0, a##ci, d0.s##ci);     \
-    d1.s##ci = dot_acc_sat_4x8packed_ss_int(w1, a##ci, d1.s##ci);     \
-    d2.s##ci = dot_acc_sat_4x8packed_ss_int(w2, a##ci, d2.s##ci);     \
-    d3.s##ci = dot_acc_sat_4x8packed_ss_int(w3, a##ci, d3.s##ci);
-#else
-#define COK_DOT_PS(ci)                                                \
-    d0.s##ci = dot_acc_sat_4x8packed_ss_int(w0, a##ci, d0.s##ci);     \
-    d1.s##ci = dot_acc_sat_4x8packed_ss_int(w1, a##ci, d1.s##ci);
-#endif
-
 #if COK_COLS == 4
 #define COK_DOTS_AT(t)  COK_DOT(0,t) COK_DOT(1,t) COK_DOT(2,t) COK_DOT(3,t)
-#define COK_DOTS_PS     COK_DOT_PS(0) COK_DOT_PS(1) COK_DOT_PS(2) COK_DOT_PS(3)
 #define COK_FOR_COLS(F) F(0) F(1) F(2) F(3)
 #else
 #define COK_DOTS_AT(t)  COK_DOT(0,t) COK_DOT(1,t)
-#define COK_DOTS_PS     COK_DOT_PS(0) COK_DOT_PS(1)
 #define COK_FOR_COLS(F) F(0) F(1)
 #endif
 
 // One K-group (4 K values): unpack the folded rows' weights, then dot every column.
-#ifdef COK_A_PERSTEP
-// Per-step activation loads: 4 live registers instead of the 16 that four uint4 carry
-// across the four K-steps, of which each step consumes one component.
-#if COK_COLS == 4
-#define COK_A23(t)                                                    \
-    const uint a2 = src1_qa[(uint)c2 * k_u + ku0 + (t)];              \
-    const uint a3 = src1_qa[(uint)c3 * k_u + ku0 + (t)];
-#else
-#define COK_A23(t)
-#endif
-#if COK_ROWS == 4
+#if COK_ROWS == 8
 #define COK_KSTEP(t)                                                  \
     {                                                                 \
-    ushort4 bl = vload4(0, src0_q + row0 + (ku0 + t) * m);            \
+    ushort8 bl = vload8(0, src0_q + row0 + (ku0 + t) * m);            \
     const uint w0 = EXP40(bl.s0);                                     \
     const uint w1 = EXP40(bl.s1);                                     \
     const uint w2 = EXP40(bl.s2);                                     \
     const uint w3 = EXP40(bl.s3);                                     \
-    const uint a0 = src1_qa[(uint)c0 * k_u + ku0 + (t)];              \
-    const uint a1 = src1_qa[(uint)c1 * k_u + ku0 + (t)];              \
-    COK_A23(t)                                                        \
-    COK_DOTS_PS                                                       \
+    const uint w4 = EXP40(bl.s4);                                     \
+    const uint w5 = EXP40(bl.s5);                                     \
+    const uint w6 = EXP40(bl.s6);                                     \
+    const uint w7 = EXP40(bl.s7);                                     \
+    COK_DOTS_AT(t)                                                    \
     }
-#else
-#define COK_KSTEP(t)                                                  \
-    {                                                                 \
-    ushort2 bl = vload2(0, src0_q + row0 + (ku0 + t) * m);            \
-    const uint w0 = EXP40(bl.s0);                                     \
-    const uint w1 = EXP40(bl.s1);                                     \
-    const uint a0 = src1_qa[(uint)c0 * k_u + ku0 + (t)];              \
-    const uint a1 = src1_qa[(uint)c1 * k_u + ku0 + (t)];              \
-    COK_A23(t)                                                        \
-    COK_DOTS_PS                                                       \
-    }
-#endif
-#else
-#if COK_ROWS == 4
+#elif COK_ROWS == 4
 #define COK_KSTEP(t)                                                   \
     {                                                                  \
     ushort4 bl = vload4(0, src0_q + row0 + (ku0 + t) * m);             \
@@ -148,7 +126,6 @@ typedef int2   cok_dotv;
     COK_DOTS_AT(t)                                                     \
     }
 #endif
-#endif  // COK_A_PERSTEP
 
 kernel void kernel_gemm_cok_q4_0_q8_1_dp4a(
     global const ushort * src0_q,     // q4_0 nibble plane [row + (K/4)*m]
@@ -181,12 +158,18 @@ kernel void kernel_gemm_cok_q4_0_q8_1_dp4a(
 #endif
 
     cok_accv acc0 = (cok_accv)(0.0f), acc1 = (cok_accv)(0.0f);
-#if COK_ROWS == 4
+#if COK_ROWS == 8
+    cok_accv acc2 = (cok_accv)(0.0f), acc3 = (cok_accv)(0.0f);
+    cok_accv acc4 = (cok_accv)(0.0f), acc5 = (cok_accv)(0.0f);
+    cok_accv acc6 = (cok_accv)(0.0f), acc7 = (cok_accv)(0.0f);
+#elif COK_ROWS == 4
     cok_accv acc2 = (cok_accv)(0.0f), acc3 = (cok_accv)(0.0f);
 #endif
 
     for (int blk = sg; blk < num_32blk; blk += COK_NSG) {
-#if COK_ROWS == 4
+#if COK_ROWS == 8
+        half8 scale = vload8(0, src0_d + row0 + blk * m);
+#elif COK_ROWS == 4
         half4 scale = vload4(0, src0_d + row0 + blk * m);
 #else
         half2 scale = vload2(0, src0_d + row0 + blk * m);
@@ -204,19 +187,21 @@ kernel void kernel_gemm_cok_q4_0_q8_1_dp4a(
         // dot accumulates across both halves and is scaled once. (q6_K needs two flushes
         // because its scale changes every 16 K; q4_K needs a min term as well.)
         cok_dotv d0 = (cok_dotv)(0), d1 = (cok_dotv)(0);
-#if COK_ROWS == 4
+#if COK_ROWS == 8
+        cok_dotv d2 = (cok_dotv)(0), d3 = (cok_dotv)(0);
+        cok_dotv d4 = (cok_dotv)(0), d5 = (cok_dotv)(0);
+        cok_dotv d6 = (cok_dotv)(0), d7 = (cok_dotv)(0);
+#elif COK_ROWS == 4
         cok_dotv d2 = (cok_dotv)(0), d3 = (cok_dotv)(0);
 #endif
         for (int half_idx = 0; half_idx < 2; ++half_idx) {
             const int ku0 = (blk << 3) + half_idx * 4;
 
-#ifndef COK_A_PERSTEP
             uint4 A0 = vload4(0, src1_qa + (uint)c0 * k_u + ku0);
             uint4 A1 = vload4(0, src1_qa + (uint)c1 * k_u + ku0);
 #if COK_COLS == 4
             uint4 A2 = vload4(0, src1_qa + (uint)c2 * k_u + ku0);
             uint4 A3 = vload4(0, src1_qa + (uint)c3 * k_u + ku0);
-#endif
 #endif
             COK_KSTEP(0)
             COK_KSTEP(1)
@@ -226,7 +211,14 @@ kernel void kernel_gemm_cok_q4_0_q8_1_dp4a(
 
         acc0 += (float)scale.s0 * da * COK_CONVF(d0);
         acc1 += (float)scale.s1 * da * COK_CONVF(d1);
-#if COK_ROWS == 4
+#if COK_ROWS == 8
+        acc2 += (float)scale.s2 * da * COK_CONVF(d2);
+        acc3 += (float)scale.s3 * da * COK_CONVF(d3);
+        acc4 += (float)scale.s4 * da * COK_CONVF(d4);
+        acc5 += (float)scale.s5 * da * COK_CONVF(d5);
+        acc6 += (float)scale.s6 * da * COK_CONVF(d6);
+        acc7 += (float)scale.s7 * da * COK_CONVF(d7);
+#elif COK_ROWS == 4
         acc2 += (float)scale.s2 * da * COK_CONVF(d2);
         acc3 += (float)scale.s3 * da * COK_CONVF(d3);
 #endif
@@ -236,7 +228,11 @@ kernel void kernel_gemm_cok_q4_0_q8_1_dp4a(
     // out[] array indexed by the loop variable.
     local cok_accv reduceLM[COK_SG * (COK_NSG - 1)];
     cok_accv out0 = (cok_accv)(0.0f), out1 = (cok_accv)(0.0f);
-#if COK_ROWS == 4
+#if COK_ROWS == 8
+    cok_accv out2 = (cok_accv)(0.0f), out3 = (cok_accv)(0.0f);
+    cok_accv out4 = (cok_accv)(0.0f), out5 = (cok_accv)(0.0f);
+    cok_accv out6 = (cok_accv)(0.0f), out7 = (cok_accv)(0.0f);
+#elif COK_ROWS == 4
     cok_accv out2 = (cok_accv)(0.0f), out3 = (cok_accv)(0.0f);
 #endif
 
@@ -254,14 +250,29 @@ kernel void kernel_gemm_cok_q4_0_q8_1_dp4a(
 
     COK_REDUCE(acc0, out0)
     COK_REDUCE(acc1, out1)
-#if COK_ROWS == 4
+#if COK_ROWS == 8
+    COK_REDUCE(acc2, out2)
+    COK_REDUCE(acc3, out3)
+    COK_REDUCE(acc4, out4)
+    COK_REDUCE(acc5, out5)
+    COK_REDUCE(acc6, out6)
+    COK_REDUCE(acc7, out7)
+#elif COK_ROWS == 4
     COK_REDUCE(acc2, out2)
     COK_REDUCE(acc3, out3)
 #endif
 
 #undef COK_REDUCE
 
-#if COK_ROWS == 4
+#if COK_ROWS == 8
+#define COK_STORE_COL(ci)                                             \
+    if (idx < m*n_no_padding) {                                       \
+        vstore8((float8)(out0.s##ci, out1.s##ci, out2.s##ci, out3.s##ci,\
+                         out4.s##ci, out5.s##ci, out6.s##ci, out7.s##ci),\
+                0, dst + idx);                                        \
+        idx += m;                                                     \
+    }
+#elif COK_ROWS == 4
 #define COK_STORE_COL(ci)                                                                 \
     if (idx < m*n_no_padding) {                                                           \
         vstore4((float4)(out0.s##ci, out1.s##ci, out2.s##ci, out3.s##ci), 0, dst + idx);  \
