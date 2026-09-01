@@ -1871,6 +1871,7 @@ struct ggml_backend_opencl_context {
     int       q80_cok_nsg_eff = 8;
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg = nullptr;
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr = nullptr;
+    cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_w8 = nullptr;
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r2_wimg_nr = nullptr;
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r4_nr = nullptr;
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r4_nrh = nullptr;
@@ -5734,6 +5735,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr =
             clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr", &err);
         if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr = nullptr; }
+        backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_w8 =
+            clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_w8", &err);
+        if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_w8 = nullptr; }
         backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r2_wimg_nr =
             clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_f32_cok_r2_wimg_nr", &err);
         if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r2_wimg_nr = nullptr; }
@@ -28930,6 +28934,28 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
                                   && ((q4k_r4_wimg_nr_env == nullptr) || (atoi(q4k_r4_wimg_nr_env) != 0))
                                   && backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr != nullptr;
 
+        // Same kernel reading the ACTIVATION through a 16 B texel instead of two 8 B
+        // ones. The transposed activations are still written through b_img_trans by
+        // kernel_transpose_32_16; this binds a SECOND view over the same sub-buffer as
+        // CL_RGBA/CL_UNSIGNED_INT32 so the reader takes a whole texel per read and the
+        // inner loop issues one image read per K element rather than two. Same bytes,
+        // half the issue slots. Opt-in while measured:
+        // GGML_OPENCL_Q4K_GEMM_COK_R4_WIMG_NR_W8=1.
+        static const char * q4k_r4_wimg_nr_w8_env = getenv("GGML_OPENCL_Q4K_GEMM_COK_R4_WIMG_NR_W8");
+        const bool use_r4_wimg_nr_w8 = use_r4_wimg_nr
+                                     && (q4k_r4_wimg_nr_w8_env != nullptr) && (atoi(q4k_r4_wimg_nr_w8_env) != 0)
+                                     && backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_w8 != nullptr;
+        cl_mem b_img_trans_w8 = nullptr;
+        if (use_r4_wimg_nr_w8) {
+            // (N + padding) is a multiple of 8, so the width divides exactly.
+            img_fmt = {CL_RGBA, CL_UNSIGNED_INT32};
+            memset(&img_desc, 0, sizeof(img_desc));
+            img_desc.image_type = CL_MEM_OBJECT_IMAGE1D_BUFFER;
+            img_desc.image_width = K * (N + padding) / 8;
+            img_desc.buffer = b_sub_buf_trans;
+            CL_CHECK((b_img_trans_w8 = clCreateImage(context, CL_MEM_READ_ONLY, &img_fmt, &img_desc, NULL, &err), err));
+        }
+
         // Which small-batch kernel this shape actually gets. Three A/Bs on this file
         // have been vacuous because the dispatch never reached the kernel under test,
         // so any null result here must be able to show it ran.
@@ -28939,7 +28965,9 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
                 n_q4k_probe++;
                 fprintf(stderr, "[Q4K-COK-PROBE] M=%d N=%d K=%d -> %s (r4_sv_built=%d)\n",
                         M, N, ne00,
-                        use_cok_r8 ? "cok_r8" : use_r2_wimg_nr ? "cok_r2_wimg_nr"
+                        use_r4_wimg_nr_w8 ? "cok_r4_wimg_nr_w8"
+                        : use_cok_r8 ? "cok_r8" : use_r2_wimg_nr ? "cok_r2_wimg_nr"
+                        : use_r4_wimg_nr ? "cok_r4_wimg_nr"
                         : use_cok_r4_wimg ? "cok_r4_wimg"
                         : use_cok_r4_nrh ? "cok_r4_nrh"
                         : use_cok_r4_nr ? "cok_r4_nr" : use_cok_r4_sv ? "cok_r4_sv"
@@ -28951,7 +28979,8 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
             }
         }
 
-        kernel = use_cok_r8    ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r8
+        kernel = use_r4_wimg_nr_w8 ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_w8
+               : use_cok_r8    ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r8
                : use_r2_wimg_nr ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r2_wimg_nr
                : use_r4_wimg_nr ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr
                : use_cok_r4_wimg ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg
@@ -28975,7 +29004,7 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
         CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem),   &extra0_q4_k->s));
         CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem),   &extra0_q4_k->d));
         CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_mem),   &extra0_q4_k->dm));
-        CL_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_mem),   &b_img_trans));
+        CL_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_mem),   use_r4_wimg_nr_w8 ? &b_img_trans_w8 : &b_img_trans));
         CL_CHECK(clSetKernelArg(kernel, 5, sizeof(cl_mem),   &extrad->data_device));
         CL_CHECK(clSetKernelArg(kernel, 6, sizeof(cl_ulong), &offsetd));
         CL_CHECK(clSetKernelArg(kernel, 7, sizeof(cl_int),   &ne01));
@@ -29033,6 +29062,7 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
         CL_CHECK(clReleaseMemObject(b_sub_buf_trans));
         CL_CHECK(clReleaseMemObject(b_img));
         CL_CHECK(clReleaseMemObject(b_img_trans));
+        if (b_img_trans_w8 != nullptr) { CL_CHECK(clReleaseMemObject(b_img_trans_w8)); }
     }
 #else
     GGML_UNUSED(backend);
