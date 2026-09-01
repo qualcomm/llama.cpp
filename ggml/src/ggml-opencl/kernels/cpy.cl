@@ -286,3 +286,34 @@ kernel void kernel_cpy_i32_i32(
         dst_data[i00] = src[0];
     }
 }
+
+//------------------------------------------------------------------------------
+// kernel_cpy_f32_f32_flat
+//------------------------------------------------------------------------------
+// Contiguous f32 -> f32 copy as a flat float4 stream.
+//
+// kernel_cpy_f32_f32 launches ONE workgroup per (i01,i02,i03) row with
+// min(64, ne00) threads, each striding the whole row. ne00 past 64 therefore adds
+// no parallelism at all -- it only makes every thread loop longer. A mamba2 SSM
+// state copy (ne00 32768, ne01 16) gets 16 workgroups of 64 threads, one per
+// compute unit, each thread doing 512 scalar 4-byte loads: ~22 GB/s against a
+// device that sustains ~152.
+//
+// When both sides are contiguous the addressing collapses to an identity map, so
+// the copy becomes a flat vector stream over the whole tensor. The host gates on
+// contiguity and on the element count dividing by 4.
+kernel void kernel_cpy_f32_f32_flat(
+        global float4 * src0,
+        ulong offset0,
+        global float4 * dst,
+        ulong offsetd,
+        int n4
+) {
+    src0 = (global float4 *)((global char *)src0 + offset0);
+    dst  = (global float4 *)((global char *)dst  + offsetd);
+
+    int i = get_global_id(0);
+    if (i < n4) {
+        dst[i] = src0[i];
+    }
+}

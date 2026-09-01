@@ -1231,6 +1231,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_rope_neox_f32_rms_set_rows_f16;
     cl_kernel kernel_rope_multi_f32, kernel_rope_multi_f16, kernel_rope_vision_f32, kernel_rope_vision_f16;
     cl_kernel kernel_cpy_f16_f16, kernel_cpy_f16_f32, kernel_cpy_f32_f16, kernel_cpy_f32_f32, kernel_cpy_f32_f32_pack, kernel_cpy_i32_i32;
+    cl_kernel kernel_cpy_f32_f32_flat = nullptr;
     cl_kernel kernel_mul_mat_f32_f32;
     cl_kernel kernel_mul_mat_f32_f32_gelu;
     cl_kernel kernel_mul_mat_f16_f16;
@@ -2808,6 +2809,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         CL_CHECK((backend_ctx->kernel_cpy_f32_f16 = clCreateKernel(prog, "kernel_cpy_f32_f16", &err), err));
         CL_CHECK((backend_ctx->kernel_cpy_f32_f32 = clCreateKernel(prog, "kernel_cpy_f32_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_cpy_f32_f32_pack = clCreateKernel(prog, "kernel_cpy_f32_f32_pack", &err), err));
+        CL_CHECK((backend_ctx->kernel_cpy_f32_f32_flat = clCreateKernel(prog, "kernel_cpy_f32_f32_flat", &err), err));
         CL_CHECK((backend_ctx->kernel_cpy_i32_i32 = clCreateKernel(prog, "kernel_cpy_i32_i32", &err), err));
         GGML_LOG_CONT(".");
     }
@@ -36870,6 +36872,30 @@ static void ggml_cl_cpy(ggml_backend_t backend, const ggml_tensor * src0, const 
     CL_CHECK(clSetKernelArg(kernel, 17, sizeof(cl_ulong), &nb11));
     CL_CHECK(clSetKernelArg(kernel, 18, sizeof(cl_ulong), &nb12));
     CL_CHECK(clSetKernelArg(kernel, 19, sizeof(cl_ulong), &nb13));
+
+    // Fully contiguous f32 -> f32: the addressing above collapses to an identity map, so
+    // copy the tensor as a flat float4 stream. The row-per-workgroup default launches
+    // ne01*ne02*ne03 workgroups whatever ne00 is, so a mamba2 SSM state (ne00 32768,
+    // 16 rows) gets 16 workgroups of 64 lanes -- one per compute unit, each lane copying
+    // 512 elements at ~22 GB/s. The widening below only reaches copies of <= 8 rows.
+    if (src0t == GGML_TYPE_F32 && src1t == GGML_TYPE_F32
+        && backend_ctx->kernel_cpy_f32_f32_flat != nullptr
+        && ggml_is_contiguous(src0) && ggml_is_contiguous(src1)
+        && ggml_nelements(src0) == ggml_nelements(src1)
+        && (ggml_nelements(src0) % 4) == 0) {
+        cl_kernel fk  = backend_ctx->kernel_cpy_f32_f32_flat;
+        const int n4  = (int)(ggml_nelements(src0) / 4);
+        CL_CHECK(clSetKernelArg(fk, 0, sizeof(cl_mem),   &extra0->data_device));
+        CL_CHECK(clSetKernelArg(fk, 1, sizeof(cl_ulong), &offset0));
+        CL_CHECK(clSetKernelArg(fk, 2, sizeof(cl_mem),   &extra1->data_device));
+        CL_CHECK(clSetKernelArg(fk, 3, sizeof(cl_ulong), &offset1));
+        CL_CHECK(clSetKernelArg(fk, 4, sizeof(int),      &n4));
+        const size_t lsz = MIN((size_t)256, backend_ctx->max_workgroup_size);
+        size_t global_work_size[] = { (((size_t)n4 + lsz - 1) / lsz) * lsz, 1, 1 };
+        size_t local_work_size[]  = { lsz, 1, 1 };
+        backend_ctx->enqueue_ndrange_kernel(fk, 1, global_work_size, local_work_size, src1);
+        return;
+    }
 
     if (kernel == backend_ctx->kernel_cpy_f32_f32_pack) {
         const int maxwg = (int)backend_ctx->get_kernel_workgroup_size(kernel);
