@@ -886,6 +886,9 @@ struct ggml_backend_opencl_context {
     // argsort is loaded in supports_op because its availability depends on how
     // many workgroups are allowed, which requires kernel compilation.
     bool kernels_loaded_argsort = false;
+    // TOP_K is loaded from supports_op for the same reason as argsort: whether a
+    // row is servable depends on the workgroup the compiled kernel can launch.
+    bool kernels_loaded_top_k = false;
     // rest of the kernels are currently always loaded in alloc_buffer.
     bool kernels_loaded = false;
 
@@ -1041,6 +1044,9 @@ struct ggml_backend_opencl_context {
     ggml_cl_buffer prealloc_splitk_partial;  // [ksplit * M] partials for split-K GEMV
     // q8_1-quantized reordered MoE activations for the dp4a prefill GEMM.
     ggml_cl_buffer prealloc_moe_qa;   // int8 quants  [tok_slots * ne00]
+    ggml_cl_buffer prealloc_topk_val;  // TOP_K stage-1 candidate values  [nrows * ncand]
+    ggml_cl_buffer prealloc_topk_idx;  // TOP_K stage-1 candidate columns [nrows * ncand]
+    ggml_cl_buffer prealloc_topk_ord;  // TOP_K stage-2 argsort output    [nrows * ncand]
     ggml_cl_buffer prealloc_moe_da;   // per-block d  [tok_slots * ne00/32] (half)
     ggml_cl_buffer prealloc_moe_sa;   // per-block s  [tok_slots * ne00/32] (half)
 
@@ -1164,6 +1170,7 @@ struct ggml_backend_opencl_context {
     cl_program program_softmax_4_f32;
     cl_program program_softmax_4_f16;
     cl_program program_argsort_f32_i32;
+    cl_program program_top_k = nullptr;
     cl_program program_sum_rows_f32;
     cl_program program_pad;
     cl_program program_upscale;
@@ -1362,6 +1369,9 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_solve_tri_f32;
     cl_kernel kernel_im2col_f32, kernel_im2col_f16;
     cl_kernel kernel_argsort_f32_i32;
+    cl_kernel kernel_top_k_tile_16  = nullptr;   // TOP_K stage 1, ITEMS_PER_LANE=16
+    cl_kernel kernel_top_k_tile_32  = nullptr;   // TOP_K stage 1, ITEMS_PER_LANE=32
+    cl_kernel kernel_top_k_unmap    = nullptr;   // TOP_K stage 3
     cl_kernel kernel_sum_rows_f32, kernel_sum_rows_f32_4;
     cl_kernel kernel_cumsum_blk, kernel_cumsum_add;
     cl_kernel kernel_repeat_f32;
@@ -2200,6 +2210,55 @@ static void load_cl_kernels_argsort(ggml_backend_opencl_context *backend_ctx) {
 
         CL_CHECK((backend_ctx->kernel_argsort_f32_i32 = clCreateKernel(backend_ctx->program_argsort_f32_i32, "kernel_argsort_f32_i32", &err), err));
         backend_ctx->kernels_loaded_argsort = true;
+    }
+}
+
+// TOP_K stage 1 + stage 3. Built non-fatally: a compiler that rejects the
+// program leaves the handles null, supports_op then declines and the op stays on
+// the CPU, which is the behaviour before this path existed.
+static void load_cl_kernels_top_k(ggml_backend_opencl_context * backend_ctx) {
+    if (backend_ctx->kernels_loaded_top_k) {
+        return;
+    }
+    backend_ctx->kernels_loaded_top_k = true;
+
+    const auto opencl_c_std =
+        std::string("CL") + std::to_string(backend_ctx->opencl_c_version.major) + "." +
+        std::to_string(backend_ctx->opencl_c_version.minor);
+    // No fast-math: the key packing is a bit-level reinterpretation of the float
+    // and must not be reassociated or flushed.
+    const std::string compile_opts = std::string("-cl-std=") + opencl_c_std + " -cl-mad-enable";
+
+#ifdef GGML_OPENCL_EMBED_KERNELS
+    const std::string kernel_src {
+        #include "top_k.cl.h"
+    };
+#else
+    const std::string kernel_src = read_file("top_k.cl");
+#endif
+
+    // Two variants so the host can widen the tile when ntiles*k would otherwise
+    // exceed the workgroup the stage-2 argsort can launch.
+    cl_int err;
+    for (int items : {16, 32}) {
+        const std::string opts = compile_opts + " -DITEMS_PER_LANE=" + std::to_string(items);
+        cl_program prog = build_program_from_source_ex(
+            backend_ctx->context, backend_ctx->device, kernel_src.c_str(), opts,
+            /*fatal=*/false, "top_k");
+        if (!prog) {
+            GGML_LOG_WARN("ggml_opencl: TOP_K program (ITEMS_PER_LANE=%d) failed to build; "
+                          "op stays on CPU\n", items);
+            continue;
+        }
+        cl_kernel tile = clCreateKernel(prog, "kernel_top_k_tile", &err);
+        if (err != CL_SUCCESS) { CL_CHECK(clReleaseProgram(prog)); continue; }
+        if (items == 16) { backend_ctx->kernel_top_k_tile_16 = tile; }
+        else             { backend_ctx->kernel_top_k_tile_32 = tile; }
+        if (backend_ctx->kernel_top_k_unmap == nullptr) {
+            backend_ctx->kernel_top_k_unmap = clCreateKernel(prog, "kernel_top_k_unmap", &err);
+            if (err != CL_SUCCESS) { backend_ctx->kernel_top_k_unmap = nullptr; }
+        }
+        backend_ctx->program_top_k = prog;
     }
 }
 
@@ -13075,6 +13134,67 @@ static inline bool use_flat_gemv_for_large_m_q6_K(const ggml_backend_opencl_cont
         && tensor->ne[2] == 1 && tensor->ne[3] == 1;
 }
 
+// TOP_K plan. ncand = ntiles*k has to fit the workgroup the stage-2 argsort can
+// actually launch, so the tile widens with k rather than being a constant (the
+// CUDA reference fixes 4096/8192, which does not survive a 512-item cap).
+// Returns false when no variant fits; the op then stays on the CPU.
+struct ggml_cl_top_k_plan {
+    cl_kernel tile_kernel = nullptr;
+    int items_per_lane    = 0;
+    int block             = 0;
+    int ntiles            = 0;
+    int ncand             = 0;
+};
+
+static bool ggml_cl_top_k_plan_for(ggml_backend_opencl_context * backend_ctx,
+                                   int ncols, int k, ggml_cl_top_k_plan * out) {
+    if (backend_ctx->kernel_top_k_unmap == nullptr) {
+        return false;
+    }
+    // Widest row the stage-2 argsort can rank in one workgroup.
+    const int sort_cap = (int)backend_ctx->get_kernel_workgroup_size(backend_ctx->kernel_argsort_f32_i32);
+    if (sort_cap <= 0) {
+        return false;
+    }
+
+    const std::pair<cl_kernel, int> variants[2] = {
+        { backend_ctx->kernel_top_k_tile_16, 16 },
+        { backend_ctx->kernel_top_k_tile_32, 32 },
+    };
+
+    for (const auto & v : variants) {
+        if (v.first == nullptr) {
+            continue;
+        }
+        int block = (int)backend_ctx->get_kernel_workgroup_size(v.first);
+        if (block <= 0) {
+            continue;
+        }
+        // Power of two: the stage-1 reduction halves the workgroup.
+        int b = 1;
+        while (b * 2 <= block && b < 256) { b *= 2; }
+        block = b;
+
+        const long tile_w = (long)block * v.second;
+        const int  ntiles = (int)((ncols + tile_w - 1) / tile_w);
+        const long ncand  = (long)ntiles * k;
+
+        // Stage 2 pads to a power of two, so that is what has to fit.
+        long padded = 1;
+        while (padded < ncand) { padded *= 2; }
+        if (padded > sort_cap) {
+            continue;
+        }
+        out->tile_kernel    = v.first;
+        out->items_per_lane = v.second;
+        out->block          = block;
+        out->ntiles         = ntiles;
+        out->ncand          = (int)ncand;
+        return true;
+    }
+    return false;
+}
+
 static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     ggml_backend_opencl_device_context * dev_ctx     = (ggml_backend_opencl_device_context *)dev->context;
     ggml_backend_opencl_context *        backend_ctx = dev_ctx->backend_ctx;
@@ -13609,6 +13729,29 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
             return op->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]);
         case GGML_OP_IM2COL:
             return true;
+        case GGML_OP_TOP_K: {
+            if (op->src[0]->type != GGML_TYPE_F32 || op->type != GGML_TYPE_I32) {
+                return false;
+            }
+            if (!ggml_is_contiguous(op->src[0])) {
+                return false;
+            }
+            load_cl_kernels_argsort(backend_ctx);   // stage 2 reuses it
+            load_cl_kernels_top_k(backend_ctx);
+
+            const int ncols = (int)op->src[0]->ne[0];
+            const int k     = (int)op->ne[0];
+
+            // Narrow rows: rank the whole row with the argsort alone.
+            int padded = 1;
+            while (padded < ncols) { padded *= 2; }
+            if (padded <= (int)backend_ctx->get_kernel_workgroup_size(backend_ctx->kernel_argsort_f32_i32)) {
+                return true;
+            }
+
+            ggml_cl_top_k_plan plan;
+            return ggml_cl_top_k_plan_for(backend_ctx, ncols, k, &plan);
+        }
         case GGML_OP_ARGSORT: {
             load_cl_kernels_argsort(backend_ctx);
 
@@ -37408,6 +37551,103 @@ static void ggml_cl_im2col(ggml_backend_t backend, const ggml_tensor * src0, con
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
 }
 
+static void ggml_cl_top_k(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    GGML_ASSERT(src0 && src0->extra);
+    GGML_ASSERT(dst  && dst->extra);
+    GGML_UNUSED(src1);
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT( dst->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(src0));
+
+    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *)backend->context;
+
+    ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *)src0->extra;
+    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
+
+    const cl_ulong offset0 = extra0->offset + src0->view_offs;
+    const cl_ulong offsetd = extrad->offset + dst->view_offs;
+
+    const int ncols = (int)src0->ne[0];
+    const int nrows = (int)ggml_nrows(src0);
+    const int k     = (int)dst->ne[0];
+
+    ggml_cl_top_k_plan plan;
+    const bool ok = ggml_cl_top_k_plan_for(backend_ctx, ncols, k, &plan);
+    GGML_ASSERT(ok && "ggml_cl_top_k dispatched for a shape supports_op rejected");
+
+    const size_t cand_n = (size_t)nrows * plan.ncand;
+    backend_ctx->prealloc_topk_val.allocate(backend_ctx->context, cand_n * sizeof(cl_float));
+    backend_ctx->prealloc_topk_idx.allocate(backend_ctx->context, cand_n * sizeof(cl_int));
+    backend_ctx->prealloc_topk_ord.allocate(backend_ctx->context, cand_n * sizeof(cl_int));
+
+    cl_mem   cand_val = backend_ctx->prealloc_topk_val.buffer;
+    cl_mem   cand_idx = backend_ctx->prealloc_topk_idx.buffer;
+    cl_mem   order    = backend_ctx->prealloc_topk_ord.buffer;
+    cl_ulong zero     = 0;
+
+    // ---- stage 1: per-tile top-k
+    {
+        cl_kernel kernel = plan.tile_kernel;
+        int aidx = 0;
+        CL_CHECK(clSetKernelArg(kernel, aidx++, sizeof(cl_mem),   &extra0->data_device));
+        CL_CHECK(clSetKernelArg(kernel, aidx++, sizeof(cl_ulong), &offset0));
+        CL_CHECK(clSetKernelArg(kernel, aidx++, sizeof(cl_mem),   &cand_val));
+        CL_CHECK(clSetKernelArg(kernel, aidx++, sizeof(cl_ulong), &zero));
+        CL_CHECK(clSetKernelArg(kernel, aidx++, sizeof(cl_mem),   &cand_idx));
+        CL_CHECK(clSetKernelArg(kernel, aidx++, sizeof(cl_ulong), &zero));
+        CL_CHECK(clSetKernelArg(kernel, aidx++, sizeof(int),      &ncols));
+        CL_CHECK(clSetKernelArg(kernel, aidx++, sizeof(int),      &plan.ntiles));
+        CL_CHECK(clSetKernelArg(kernel, aidx++, sizeof(int),      &k));
+        CL_CHECK(clSetKernelArg(kernel, aidx++, plan.block * sizeof(cl_ulong), NULL));
+
+        size_t gws[] = { (size_t)plan.block * nrows * plan.ntiles, 1, 1 };
+        size_t lws[] = { (size_t)plan.block, 1, 1 };
+        backend_ctx->enqueue_ndrange_kernel(plan.tile_kernel, 3, gws, lws, dst);
+    }
+
+    // ---- stage 2: rank the candidates with the existing bitonic argsort
+    {
+        int padded = 1;
+        while (padded < plan.ncand) { padded *= 2; }
+        const int order_desc = (int)GGML_SORT_ORDER_DESC;
+
+        cl_kernel kernel = backend_ctx->kernel_argsort_f32_i32;
+        int aidx = 0;
+        CL_CHECK(clSetKernelArg(kernel, aidx++, sizeof(cl_mem),   &cand_val));
+        CL_CHECK(clSetKernelArg(kernel, aidx++, sizeof(cl_ulong), &zero));
+        CL_CHECK(clSetKernelArg(kernel, aidx++, sizeof(cl_mem),   &order));
+        CL_CHECK(clSetKernelArg(kernel, aidx++, sizeof(cl_ulong), &zero));
+        CL_CHECK(clSetKernelArg(kernel, aidx++, sizeof(int),      &plan.ncand));
+        CL_CHECK(clSetKernelArg(kernel, aidx++, sizeof(int),      &padded));
+        CL_CHECK(clSetKernelArg(kernel, aidx++, sizeof(int),      &order_desc));
+        CL_CHECK(clSetKernelArg(kernel, aidx++, padded * sizeof(int), NULL));
+
+        size_t gws[] = { (size_t)padded, (size_t)nrows, 1 };
+        size_t lws[] = { (size_t)padded, 1, 1 };
+        backend_ctx->enqueue_ndrange_kernel(kernel, 3, gws, lws, dst);
+    }
+
+    // ---- stage 3: candidate positions -> source columns
+    {
+        cl_kernel kernel = backend_ctx->kernel_top_k_unmap;
+        const int lws0 = (k < 64) ? 1 : 64;
+        int aidx = 0;
+        CL_CHECK(clSetKernelArg(kernel, aidx++, sizeof(cl_mem),   &cand_idx));
+        CL_CHECK(clSetKernelArg(kernel, aidx++, sizeof(cl_ulong), &zero));
+        CL_CHECK(clSetKernelArg(kernel, aidx++, sizeof(cl_mem),   &order));
+        CL_CHECK(clSetKernelArg(kernel, aidx++, sizeof(cl_ulong), &zero));
+        CL_CHECK(clSetKernelArg(kernel, aidx++, sizeof(cl_mem),   &extrad->data_device));
+        CL_CHECK(clSetKernelArg(kernel, aidx++, sizeof(cl_ulong), &offsetd));
+        CL_CHECK(clSetKernelArg(kernel, aidx++, sizeof(int),      &plan.ncand));
+        CL_CHECK(clSetKernelArg(kernel, aidx++, sizeof(int),      &k));
+
+        size_t gws[] = { (size_t)lws0 * nrows, 1, 1 };
+        size_t lws[] = { (size_t)lws0, 1, 1 };
+        backend_ctx->enqueue_ndrange_kernel(kernel, 3, gws, lws, dst);
+    }
+}
+
 static void ggml_cl_argsort(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_ASSERT(src0);
     GGML_ASSERT(src0->extra);
@@ -38291,6 +38531,12 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
                 return false;
             }
             func = ggml_cl_argsort;
+            break;
+        case GGML_OP_TOP_K:
+            if (!any_on_device) {
+                return false;
+            }
+            func = ggml_cl_top_k;
             break;
         case GGML_OP_SUM_ROWS:
             if (!any_on_device) {
