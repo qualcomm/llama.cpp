@@ -1061,9 +1061,6 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     const int32_t * target_layer_ids   = nullptr; // model_dft's extract layer indices
     uint32_t        target_layer_ids_n = 0;
 
-    // scratch buffer for concatenated target features [n_tokens, n_embd_enc]
-    std::vector<float> features_buf;
-
     common_speculative_impl_draft_dflash(const common_params_speculative & params, uint32_t n_seq,
             common_speculative_type type = COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)
         : common_speculative_impl(type, n_seq, params.draft.n_max)
@@ -1227,53 +1224,41 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         for (size_t off = 0; off < rows.size(); off += (size_t) n_ubatch) {
             const int32_t n_chunk = (int32_t) std::min((size_t) n_ubatch, rows.size() - off);
 
+            // Gather this chunk's target features straight into the injection batch. The
+            // decode graph fuses the encoder (fc + output_norm_enc) onto whatever arrives
+            // in embd, so the features must be RAW here -- running llama_encode first and
+            // injecting its output would push them through fc twice.
             {
                 common_time_meas tm(this->t_dft_feat_us, !this->gen_perf);
-                features_buf.resize((size_t) n_chunk * n_embd_enc);
+                batch_inject.n_tokens = n_chunk;
                 for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
                     const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
                     if (!layer) {
                         GGML_ABORT("DFlash: target layer %d input not extracted.", target_layer_ids[k]);
                     }
                     for (int32_t i = 0; i < n_chunk; ++i) {
-                        float       * dst = features_buf.data() + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
+                        float       * dst = batch_inject.embd + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
                         const float * src = layer + (size_t) rows[off + i] * n_embd_tgt;
                         std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
                     }
                 }
             }
 
-            llama_batch enc_batch = {
-                /*.n_tokens =*/ n_chunk,
-                /*.token    =*/ nullptr,
-                /*.embd     =*/ features_buf.data(),
-                /*.pos      =*/ nullptr,
-                /*.n_seq_id =*/ nullptr,
-                /*.seq_id   =*/ nullptr,
-                /*.logits   =*/ nullptr,
-            };
-
-            int32_t rc;
-            {
-                common_time_meas tm(this->t_dft_enc_us, !this->gen_perf);
-                rc = llama_encode(ctx_dft, enc_batch);
-            }
-            if (rc != 0) {
-                LOG_ERR("%s: llama_encode(ctx_dft) failed rc=%d (n_tokens=%d)\n", __func__, rc, (int) n_chunk);
-                return false;
-            }
-
-            const float * inp_g = llama_get_embeddings_nextn(ctx_dft);
-            GGML_ASSERT(inp_g && "DFlash encoder produced no output.");
-
-            batch_inject.n_tokens = n_chunk;
-            std::memcpy(batch_inject.embd, inp_g, (size_t) n_chunk * n_embd_dec * sizeof(float));
             for (int32_t i = 0; i < n_chunk; ++i) {
-                batch_inject.pos[i]       = batch_in.pos[rows[off + i]];
+                const llama_pos p = batch_in.pos[rows[off + i]];
+                batch_inject.pos[i] = p;
+                if (is_mrope) {
+                    // M-RoPE drafts read 4 position rows per token from an embd batch
+                    batch_inject.pos[1 * n_chunk + i] = p;
+                    batch_inject.pos[2 * n_chunk + i] = p;
+                    batch_inject.pos[3 * n_chunk + i] = 0;
+                }
                 batch_inject.n_seq_id[i]  = 1;
                 batch_inject.seq_id[i][0] = seq_id;
                 batch_inject.logits[i]    = false;
             }
+
+            int32_t rc;
             {
                 common_time_meas tm(this->t_dft_inject_us, !this->gen_perf);
                 rc = llama_decode(ctx_dft, batch_inject);
@@ -1339,10 +1324,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             for (int32_t offset = 0; offset < n_rows; offset += n_ubatch) {
                 const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
 
-                // gather this chunk's target features, interleaved by extract layer
+                // Gather this chunk's target features straight into the injection batch.
+                // The decode graph fuses the encoder (fc + output_norm_enc) onto whatever
+                // arrives in embd, so these must stay RAW: encoding first and injecting the
+                // encoder output would push them through fc twice.
                 {
                 common_time_meas tm(this->t_dft_feat_us, !this->gen_perf);
-                features_buf.resize((size_t) n_chunk * n_embd_enc);
+                batch_inject.n_tokens = n_chunk;
                 for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
                     const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
                     if (!layer) {
@@ -1356,47 +1344,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 }
                 }
 
-                // fuse extracted features through DFlash encoder
-                // M-RoPE drafts read 4 position rows per token from embd batches, so pass them explicitly
-                std::vector<llama_pos> enc_pos;
-                if (is_mrope) {
-                    enc_pos.resize((size_t) 4 * n_chunk);
-                    for (int32_t i = 0; i < n_chunk; ++i) {
-                        const llama_pos p = batch_in.pos[i_batch_beg[seq_id] + offset + i];
-                        enc_pos[0 * n_chunk + i] = p;
-                        enc_pos[1 * n_chunk + i] = p;
-                        enc_pos[2 * n_chunk + i] = p;
-                        enc_pos[3 * n_chunk + i] = 0;
-                    }
-                }
-
-                llama_batch enc_batch = {
-                    /*.n_tokens =*/ n_chunk,
-                    /*.token    =*/ nullptr,
-                    /*.embd     =*/ features_buf.data(),
-                    /*.pos      =*/ is_mrope ? enc_pos.data() : nullptr,
-                    /*.n_seq_id =*/ nullptr,
-                    /*.seq_id   =*/ nullptr,
-                    /*.logits   =*/ nullptr,
-                };
-
                 int32_t rc;
-                {
-                    common_time_meas tm(this->t_dft_enc_us, !this->gen_perf);
-                    rc = llama_encode(ctx_dft, enc_batch);
-                }
-                if (rc != 0) {
-                    LOG_ERR("%s: llama_encode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
-                            __func__, rc, (int) n_chunk, (int) offset);
-                    return false;
-                }
-
-                const float * inp_g = llama_get_embeddings_nextn(ctx_dft);
-                GGML_ASSERT(inp_g && "DFlash encoder produced no output.");
-
-                // inject the DFlash decoder K/V cache at the tokens' target positions
-                batch_inject.n_tokens = n_chunk;
-                std::memcpy(batch_inject.embd, inp_g, (size_t) n_chunk * n_embd_dec * sizeof(float));
 
                 for (int32_t i = 0; i < n_chunk; ++i) {
                     const llama_pos p = batch_in.pos[i_batch_beg[seq_id] + offset + i];
