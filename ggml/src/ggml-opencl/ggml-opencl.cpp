@@ -1811,13 +1811,19 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemm_cok_q6_k_q8_1_dp4a    = nullptr;  // q6_K twin, 4-column
     cl_kernel kernel_gemm_cok_q6_k_q8_1_dp4a_c2 = nullptr;  // q6_K twin, 2-column
     int       q6k_cok_dp4a_nsg  = 4;
+    // Each column-width build narrows its K-split independently, so the launch must use
+    // the one belonging to the width it dispatches. Sharing a single value silently
+    // launches the wrong subgroup count whenever the widths narrow differently.
+    int       q6k_cok_dp4a_nsg_c2 = 4;
     int       q6k_cok_dp4a_rows = 4;
     cl_kernel kernel_gemm_cok_q4_0_q8_1_dp4a    = nullptr;  // q4_0 twin, 4-column
     cl_kernel kernel_gemm_cok_q4_0_q8_1_dp4a_c2 = nullptr;  // q4_0 twin, 2-column
     int       q40_cok_dp4a_nsg  = 4;
+    int       q40_cok_dp4a_nsg_c2 = 4;
     int       q40_cok_dp4a_rows = 4;
     int       q4k_cok_dp4a_nsg_c8  = 4;   // the 8-column build deadlocks at 8
     int       q4k_cok_dp4a_nsg_narrow = 8;
+    int       q4k_cok_dp4a_nsg_c2 = 8;
     int       q4k_cok_dp4a_nsg_eff = 4;
     int       q4k_cok_dp4a_rows    = 4;
     bool      q4k_cok_built = false;   // the cok programs are built on first use
@@ -2469,7 +2475,8 @@ static void ggml_cl_cok_build_q4k(ggml_backend_opencl_context * backend_ctx) {
                                   backend_ctx->q4k_cok_dp4a_nsg_c8 = nsg_eff; }
             else if (cols == 4) { backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a_c4 = kk;
                                   backend_ctx->q4k_cok_dp4a_nsg_narrow = nsg_eff; }
-            else                { backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a_c2 = kk; }
+            else                { backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a_c2 = kk;
+                                  backend_ctx->q4k_cok_dp4a_nsg_c2 = nsg_eff; }
             backend_ctx->q4k_cok_dp4a_rows    = cok_rows;
             CL_CHECK(clReleaseProgram(prog));
         }
@@ -2516,7 +2523,8 @@ static void ggml_cl_cok_build_q6k(ggml_backend_opencl_context * backend_ctx) {
             }
             if (cols == 4) { backend_ctx->kernel_gemm_cok_q6_k_q8_1_dp4a    = kk;
                              backend_ctx->q6k_cok_dp4a_nsg = nsg_eff; }
-            else           { backend_ctx->kernel_gemm_cok_q6_k_q8_1_dp4a_c2 = kk; }
+            else           { backend_ctx->kernel_gemm_cok_q6_k_q8_1_dp4a_c2 = kk;
+                             backend_ctx->q6k_cok_dp4a_nsg_c2 = nsg_eff; }
             CL_CHECK(clReleaseProgram(prog));
         }
         fflush(stderr);
@@ -2570,7 +2578,8 @@ static void ggml_cl_cok_build_q40(ggml_backend_opencl_context * backend_ctx) {
             }
             if (cols == 4) { backend_ctx->kernel_gemm_cok_q4_0_q8_1_dp4a    = kk;
                              backend_ctx->q40_cok_dp4a_nsg = nsg_eff; }
-            else           { backend_ctx->kernel_gemm_cok_q4_0_q8_1_dp4a_c2 = kk; }
+            else           { backend_ctx->kernel_gemm_cok_q4_0_q8_1_dp4a_c2 = kk;
+                             backend_ctx->q40_cok_dp4a_nsg_c2 = nsg_eff; }
             CL_CHECK(clReleaseProgram(prog));
         }
         fflush(stderr);
@@ -26252,7 +26261,8 @@ static void ggml_cl_mul_mat_q4_0_f32_adreno(ggml_backend_t backend, const ggml_t
             CL_CHECK(clSetKernelArg(ck40, 8, sizeof(cl_int),   &ne00));
             CL_CHECK(clSetKernelArg(ck40, 9, sizeof(cl_int),   &ne1));
 
-            const size_t nsg40d = (size_t)backend_ctx->q40_cok_dp4a_nsg;
+            const size_t nsg40d = (size_t)((N40 <= 2) ? backend_ctx->q40_cok_dp4a_nsg_c2
+                                                      : backend_ctx->q40_cok_dp4a_nsg);
             size_t c40_local[3]  = { 64, nsg40d, 1 };
             size_t c40_global[3] = { (size_t)(ne01 / backend_ctx->q40_cok_dp4a_rows), nsg40d, 1 };
             backend_ctx->enqueue_ndrange_kernel(ck40, 3, c40_global, c40_local, dst);
@@ -28453,7 +28463,7 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
             int cok_nsg_sel;
             if (ne1 <= 2 && backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a_c2) {
                 ck = backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a_c2;
-                cok_nsg_sel = backend_ctx->q4k_cok_dp4a_nsg_narrow;
+                cok_nsg_sel = backend_ctx->q4k_cok_dp4a_nsg_c2;
             } else if (ne1 <= 4 && backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a_c4) {
                 ck = backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a_c4;
                 cok_nsg_sel = backend_ctx->q4k_cok_dp4a_nsg_narrow;
@@ -29650,7 +29660,8 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
             CL_CHECK(clSetKernelArg(ck6, 12, sizeof(cl_ushort),&mf6));
             CL_CHECK(clSetKernelArg(ck6, 13, sizeof(cl_uchar), &mc6));
 
-            const size_t nsg6d = (size_t)backend_ctx->q6k_cok_dp4a_nsg;
+            const size_t nsg6d = (size_t)((ne1 <= 2) ? backend_ctx->q6k_cok_dp4a_nsg_c2
+                                                     : backend_ctx->q6k_cok_dp4a_nsg);
             size_t c6_local[3]  = { 64, nsg6d, 1 };
             size_t c6_global[3] = { (size_t)(ne01 / backend_ctx->q6k_cok_dp4a_rows), nsg6d, 1 };
             backend_ctx->enqueue_ndrange_kernel(ck6, 3, c6_global, c6_local, dst);
