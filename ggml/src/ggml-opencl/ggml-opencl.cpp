@@ -28293,7 +28293,7 @@ static void ggml_cl_mul_mat_q8_0_f32_adreno(ggml_backend_t backend, const ggml_t
         if (use_q80_cok) {
             // (64 lanes x 8 subgroups): each lane owns 4 rows, the subgroups split K.
             global_work_size[0] = (size_t)(CEIL_DIV(M / 4, 64) * 64);
-            global_work_size[1] = Q80_COK_NSG_HOST;
+            global_work_size[1] = (size_t)backend_ctx->q80_cok_nsg_eff;
             global_work_size[2] = 1;
             local_work_size[0]  = 64;
             local_work_size[1]  = (size_t)backend_ctx->q80_cok_nsg_eff;
