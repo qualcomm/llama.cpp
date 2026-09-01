@@ -9270,6 +9270,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32,  32768, 512, 2816, {1, 1}, {1, 1}));
 
+    // Small-batch (ne1 2..8) at REAL FFN shapes. The OpenCL backend routes this band
+    // to its own cooperative-K GEMMs, and nothing in the eval list reached them: the
+    // existing q4_K/q6_K ne1=2..8 cases are all m<=6680, k<=3072, which take a
+    // different path, so those kernels were exercised only by the perf sweep, which
+    // checks no results. m=4096 k=14336 is the perf-list shape; m=6656 k=19968 and
+    // m=19968 k=6656 are muse-glimmer-30B ffn_down / ffn_gate.
+    for (int n : {2, 3, 4, 5, 8}) {
+        for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_Q4_0}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32,  4096, n, 14336, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32,  6656, n, 19968, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 19968, n,  6656, {1, 1}, {1, 1}));
+        }
+    }
+
     // MoE-router shape: f32 x f32, m = n_expert, n = 2..8 tokens, k = n_embd.
     // This is ffn_moe_logits (mul_mat of the F32 ffn_gate_inp), which every MoE
     // emits once per layer. It is the small-N regime where a tiled 64x64 GEMM
