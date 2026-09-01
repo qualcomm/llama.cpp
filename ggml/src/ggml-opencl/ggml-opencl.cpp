@@ -2608,8 +2608,7 @@ static void ggml_cl_cok_build_q4k_nsg_alt(ggml_backend_opencl_context * backend_
     backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_alt =
         clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr", &err);
     if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_alt = nullptr; }
-    GGML_LOG_INFO("ggml_opencl: q4_K cok narrow-K-split program %s (COK_NSG=%d)
-",
+    GGML_LOG_INFO("ggml_opencl: q4_K cok narrow-K-split program %s (COK_NSG=%d)\n",
                   backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_alt ? "loaded" : "UNAVAILABLE",
                   nsg_eff);
 }
