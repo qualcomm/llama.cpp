@@ -26467,6 +26467,20 @@ static void ggml_cl_mul_mat_q4_0_f32_adreno(ggml_backend_t backend, const ggml_t
                                  && ((q40_cok_r4_env == nullptr) || (atoi(q40_cok_r4_env) != 0))
                                  && backend_ctx->kernel_gemm_noshuffle_q4_0_f32_cok_r4 != nullptr;
 
+        // Which small-batch kernel this q4_0 shape actually gets. The q4_K twin of this
+        // probe caught an A/B that had never dispatched the kernel under test.
+        if (getenv("GGML_OPENCL_Q40_COK_PROBE")) {
+            static int n_q40_probe = 0;
+            if (n_q40_probe < 24) {
+                n_q40_probe++;
+                fprintf(stderr, "[Q40-COK-PROBE] M=%d N=%d K=%d -> %s (nsg=%d)\n",
+                        (int)ne01, (int)ne1, (int)ne00,
+                        use_q40_cok_r4 ? "q40_cok_r4" : use_q40_cok ? "q40_cok" : "other",
+                        backend_ctx->q40_cok_nsg_eff);
+                fflush(stderr);
+            }
+        }
+
         kernel = use_q40_cok_r4 ? backend_ctx->kernel_gemm_noshuffle_q4_0_f32_cok_r4
                : use_q40_cok    ? backend_ctx->kernel_gemm_noshuffle_q4_0_f32_cok
                                 : backend_ctx->kernel_gemm_noshuffle_q4_0_f32;
