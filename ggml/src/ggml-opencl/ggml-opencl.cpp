@@ -2541,7 +2541,14 @@ static void ggml_cl_cok_build_q40(ggml_backend_opencl_context * backend_ctx) {
         if (const char * e = getenv("GGML_OPENCL_Q40_COK_DP4A_ROWS")) { rows40 = atoi(e); }
         int nsg40 = 8;
         if (const char * e = getenv("GGML_OPENCL_Q40_COK_DP4A_NSG")) { nsg40 = atoi(e); }
-        const std::string base40 = compile_opts + " -DCOK_ROWS=" + std::to_string(rows40);
+        // Per-step activation loads: holds 4 registers instead of the 16 the uint4
+        // preload carries across the four K-steps. The cols=4 kernel spills 416 B and
+        // is capped at a 512 work-item group because of it, which is what pins ne1 3..4.
+        // GGML_OPENCL_Q40_COK_DP4A_APERSTEP=1 to build it.
+        static const char * a_ps_env = getenv("GGML_OPENCL_Q40_COK_DP4A_APERSTEP");
+        const bool a_ps_on = (a_ps_env != nullptr) && (atoi(a_ps_env) != 0);
+        const std::string base40 = compile_opts + " -DCOK_ROWS=" + std::to_string(rows40)
+                                 + (a_ps_on ? " -DCOK_A_PERSTEP=1" : "");
         for (int cols : {4, 2}) {
             int nsg_eff = nsg40;
             cl_program prog = ggml_cl_build_cok_program(

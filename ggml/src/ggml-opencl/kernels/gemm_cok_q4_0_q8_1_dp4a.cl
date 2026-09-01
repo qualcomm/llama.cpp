@@ -70,16 +70,57 @@ typedef int2   cok_dotv;
     d1.s##ci = dot_acc_sat_4x8packed_ss_int(w1, A##ci.s##t, d1.s##ci);
 #endif
 
+// Per-step activation form. The uint4 A0..A3 are held live across all four K-steps
+// while each step consumes ONE component of each -- 16 vector registers carrying the
+// 4 actually in use. Loading a uint per column per step holds 4 instead. Same bytes,
+// same order, contiguous within a column; the cost is narrower loads.
+// Build with -DCOK_A_PERSTEP=1.
+#if COK_ROWS == 4
+#define COK_DOT_PS(ci)                                                \
+    d0.s##ci = dot_acc_sat_4x8packed_ss_int(w0, a##ci, d0.s##ci);     \
+    d1.s##ci = dot_acc_sat_4x8packed_ss_int(w1, a##ci, d1.s##ci);     \
+    d2.s##ci = dot_acc_sat_4x8packed_ss_int(w2, a##ci, d2.s##ci);     \
+    d3.s##ci = dot_acc_sat_4x8packed_ss_int(w3, a##ci, d3.s##ci);     
+#else
+#define COK_DOT_PS(ci)                                                \
+    d0.s##ci = dot_acc_sat_4x8packed_ss_int(w0, a##ci, d0.s##ci);     \
+    d1.s##ci = dot_acc_sat_4x8packed_ss_int(w1, a##ci, d1.s##ci);     
+#endif
+
 #if COK_COLS == 4
 #define COK_DOTS_AT(t)  COK_DOT(0,t) COK_DOT(1,t) COK_DOT(2,t) COK_DOT(3,t)
+#define COK_DOTS_PS     COK_DOT_PS(0) COK_DOT_PS(1) COK_DOT_PS(2) COK_DOT_PS(3)
 #define COK_FOR_COLS(F) F(0) F(1) F(2) F(3)
 #else
 #define COK_DOTS_AT(t)  COK_DOT(0,t) COK_DOT(1,t)
+#define COK_DOTS_PS     COK_DOT_PS(0) COK_DOT_PS(1)
 #define COK_FOR_COLS(F) F(0) F(1)
 #endif
 
 // One K-group (4 K values): unpack the folded rows' weights, then dot every column.
 #if COK_ROWS == 4
+#if COK_COLS == 4
+#define COK_A23(t)                                                    \
+    const uint a2 = src1_qa[(uint)c2 * k_u + ku0 + (t)];              \
+    const uint a3 = src1_qa[(uint)c3 * k_u + ku0 + (t)];
+#else
+#define COK_A23(t)
+#endif
+
+#ifdef COK_A_PERSTEP
+#define COK_KSTEP(t)                                                  \
+    {                                                                 \
+    ushort4 bl = vload4(0, src0_q + row0 + (ku0 + t) * m);            \
+    const uint w0 = EXP40(bl.s0);                                     \
+    const uint w1 = EXP40(bl.s1);                                     \
+    const uint w2 = EXP40(bl.s2);                                     \
+    const uint w3 = EXP40(bl.s3);                                     \
+    const uint a0 = src1_qa[(uint)c0 * k_u + ku0 + (t)];              \
+    const uint a1 = src1_qa[(uint)c1 * k_u + ku0 + (t)];              \
+    COK_A23(t)                                                        \
+    COK_DOTS_PS                                                       \
+    }
+#else
 #define COK_KSTEP(t)                                                   \
     {                                                                  \
     ushort4 bl = vload4(0, src0_q + row0 + (ku0 + t) * m);             \
@@ -98,6 +139,7 @@ typedef int2   cok_dotv;
     COK_DOTS_AT(t)                                                     \
     }
 #endif
+#endif  // COK_A_PERSTEP
 
 kernel void kernel_gemm_cok_q4_0_q8_1_dp4a(
     global const ushort * src0_q,     // q4_0 nibble plane [row + (K/4)*m]
@@ -159,11 +201,13 @@ kernel void kernel_gemm_cok_q4_0_q8_1_dp4a(
         for (int half_idx = 0; half_idx < 2; ++half_idx) {
             const int ku0 = (blk << 3) + half_idx * 4;
 
+#ifndef COK_A_PERSTEP
             uint4 A0 = vload4(0, src1_qa + (uint)c0 * k_u + ku0);
             uint4 A1 = vload4(0, src1_qa + (uint)c1 * k_u + ku0);
 #if COK_COLS == 4
             uint4 A2 = vload4(0, src1_qa + (uint)c2 * k_u + ku0);
             uint4 A3 = vload4(0, src1_qa + (uint)c3 * k_u + ku0);
+#endif
 #endif
             COK_KSTEP(0)
             COK_KSTEP(1)
