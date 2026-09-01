@@ -5435,7 +5435,13 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         // more than one workgroup per compute unit, and q6_K measured the OPPOSITE, so
         // this must be swept rather than assumed either way.
         static const char * q40_cok_nsg_env = getenv("GGML_OPENCL_Q40_COK_NSG");
-        const int q40_cok_nsg_req = q40_cok_nsg_env ? atoi(q40_cok_nsg_env) : 8;
+        // Swept on the Q4_0 targets' own shapes (Qwen3.8-27B, ne1 5..8): 10 beats the
+        // old 8 at EVERY shape -- 17408x5120 -10.7/-11.4%, 5120x17408 -8.2/-6.9%,
+        // 6144x5120 -5.9%, and even 1024x5120 (4 workgroups) -5.1%. Unlike q4_K there is
+        // no crossover with workgroup count, so this is a plain default rather than an
+        // adaptive rule. 12 (768 work items) is refused by the program cap and narrows.
+        // ggml_cl_build_cok_program narrows for devices that cannot launch 640.
+        const int q40_cok_nsg_req = q40_cok_nsg_env ? atoi(q40_cok_nsg_env) : 10;
         cl_program prog = ggml_cl_build_cok_program(backend_ctx, kernel_src_CL_gemm.c_str(),
                                                     compile_opts, q40_cok_nsg_req, &backend_ctx->q40_cok_nsg_eff);
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_0_f32 = clCreateKernel(prog, "kernel_gemm_noshuffle_q4_0_f32", &err), err));
