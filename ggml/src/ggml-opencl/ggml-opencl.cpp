@@ -5430,8 +5430,14 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #else
         const std::string kernel_src_CL_gemm = read_file("gemm_noshuffle_q4_0_f32.cl");
 #endif
+        // COK_NSG sets workgroup size (64 x NSG), reduction depth and LDS together, and
+        // was fixed at 8 here. The q4_K twin measured -16..19% at 6 on shapes launching
+        // more than one workgroup per compute unit, and q6_K measured the OPPOSITE, so
+        // this must be swept rather than assumed either way.
+        static const char * q40_cok_nsg_env = getenv("GGML_OPENCL_Q40_COK_NSG");
+        const int q40_cok_nsg_req = q40_cok_nsg_env ? atoi(q40_cok_nsg_env) : 8;
         cl_program prog = ggml_cl_build_cok_program(backend_ctx, kernel_src_CL_gemm.c_str(),
-                                                    compile_opts, 8, &backend_ctx->q40_cok_nsg_eff);
+                                                    compile_opts, q40_cok_nsg_req, &backend_ctx->q40_cok_nsg_eff);
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_0_f32 = clCreateKernel(prog, "kernel_gemm_noshuffle_q4_0_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_0_f32_cok = clCreateKernel(prog, "kernel_gemm_noshuffle_q4_0_f32_cok", &err), err));
         // 4-rows-per-lane variant. Not fatal: falls back to the 1-row kernel.
