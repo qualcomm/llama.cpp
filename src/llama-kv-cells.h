@@ -35,6 +35,8 @@ struct llama_kv_cell_ext {
 // TODO: add unit tests
 class llama_kv_cells {
 public:
+    using seq_set_t = std::bitset<LLAMA_MAX_SEQ>;
+
     void reset() {
         for (uint32_t i = 0; i < pos.size(); ++i) {
             pos[i]   = -1;
@@ -301,6 +303,13 @@ public:
         return seq[i].count();
     }
 
+    // the full set of sequences this cell is visible to
+    const seq_set_t & seq_get_all(uint32_t i) const {
+        assert(i < pos.size());
+
+        return seq[i];
+    }
+
     // check if the cell contains seq_id
     bool seq_has(uint32_t i, llama_seq_id seq_id) const {
         assert(i < pos.size());
@@ -320,13 +329,14 @@ public:
             }
 
             const auto m = seq[i] & seqs;
-            if (m.none()) {
-                continue;
-            }
 
-            for (llama_seq_id s = 0; s < LLAMA_MAX_SEQ; ++s) {
+            // a cell carries a handful of sequences at most, out of LLAMA_MAX_SEQ
+            size_t left = m.count();
+
+            for (llama_seq_id s = 0; left > 0 && s < (llama_seq_id) LLAMA_MAX_SEQ; ++s) {
                 if (m.test(s)) {
                     f(s, pos[i], ext[i].tok);
+                    --left;
                 }
             }
         }
@@ -509,8 +519,6 @@ private:
     //   }
     //
     std::vector<llama_pos> shift;
-
-    using seq_set_t = std::bitset<LLAMA_MAX_SEQ>;
 
     // the bitset seq[i] tells us which sequences are currently occupying the i-th cell
     std::vector<seq_set_t> seq;
