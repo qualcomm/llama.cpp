@@ -13033,6 +13033,25 @@ inline bool use_adreno_kernels(const ggml_backend_opencl_context *backend_ctx, c
 // by capability level, and the 850's E17 by compiler class -- the 850 is classed A8X, a
 // NEWER level, so the level test alone lets it straight through. Both miscompile this kernel
 // family; see the callers for the failing shapes.
+// The multi-column GEMV twins (gemv_noshuffle_*_mc3, mul_mv_q6_K_f32_flat_mc) compute
+// N output columns per weight read. They carry their own vectorised vload4 /
+// convert_float4 / dot() dequant, and two compilers get that wrong: the Adreno 619
+// (capability level 60, E031.45) and the 850 (E17). Both return garbage rather than
+// failing to build -- ERR ~0.9 against the CPU at ne1 = 2 on 4096x14336, 6656x19968 and
+// 19968x6656, i.e. wholly wrong, not a tolerance miss.
+//
+// A7X (level 70, E031.41) and A8X/X2 run the same source correctly and MUST keep it: it
+// is the small-batch decode path. So this is neither a pure generation gate nor a pure
+// compiler gate -- level 60 and E17 are simply the two that miscompile it.
+// GGML_OPENCL_MC_GEMV=1 forces them back on for measurement.
+static bool ggml_cl_mc_gemv_ok(const ggml_backend_opencl_context * backend_ctx) {
+    static const char * const e = getenv("GGML_OPENCL_MC_GEMV");
+    if (e && *e) { return atoi(e) != 0; }
+    if (backend_ctx->gpu_family != GPU_FAMILY::ADRENO) { return true; }
+    if (backend_ctx->gen_level > 0 && backend_ctx->gen_level <= GEN_LEVEL_A6X) { return false; }
+    return !adreno_art_compiler_quirks(backend_ctx);
+}
+
 static bool ggml_cl_cok_dp4a_narrow_on(const ggml_backend_opencl_context * backend_ctx,
                                        int64_t ne1, int64_t ne01, int64_t ne00, int rows) {
     static const char * const e = getenv("GGML_OPENCL_COK_DP4A");
@@ -26109,7 +26128,7 @@ static void ggml_cl_mul_mat_q4_0_f32_adreno(ggml_backend_t backend, const ggml_t
         && ggml_cl_cok_have_q40(backend_ctx)
         && ((ne1 <= 2) ? backend_ctx->kernel_gemm_cok_q4_0_q8_1_dp4a_c2
                        : backend_ctx->kernel_gemm_cok_q4_0_q8_1_dp4a) != nullptr;
-    const bool use_q40_mc3 = q40_mc3 && !q40_cok_dp4a_takes_it
+    const bool use_q40_mc3 = ggml_cl_mc_gemv_ok(backend_ctx) && q40_mc3 && !q40_cok_dp4a_takes_it
                           && (ne1 >= 2 && ne1 <= q40_mc3_maxn) && (ne01 < 32768);
 
     if (ne1 == 1 || use_q40_mc3) {
@@ -26874,7 +26893,7 @@ static void ggml_cl_mul_mat_q4_1_f32_adreno(ggml_backend_t backend, const ggml_t
     //
     // Keep as a worked example: a low workgroup count is a SUSPICION, not a defect.
     static const bool q41_mc3 = (getenv("GGML_OPENCL_Q41_MC3") != nullptr);
-    const bool use_q41_mc3 = q41_mc3 && (ne1 >= 2 && ne1 <= 4) && (ne01 < 32768);
+    const bool use_q41_mc3 = ggml_cl_mc_gemv_ok(backend_ctx) && q41_mc3 && (ne1 >= 2 && ne1 <= 4) && (ne01 < 32768);
 
     if (ne1 == 1 || use_q41_mc3) {
         cl_mem q_img = nullptr;
@@ -28415,7 +28434,7 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
         && ggml_cl_cok_have_q4k(backend_ctx)
         && ((ne1 <= 2) ? backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a_c2
                        : backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a_c4) != nullptr;
-    const bool use_mc3 = q4k_mc3 && !cok_dp4a_takes_it
+    const bool use_mc3 = ggml_cl_mc_gemv_ok(backend_ctx) && q4k_mc3 && !cok_dp4a_takes_it
                       && (ne1 >= 2 && ne1 <= q4k_mc3_maxn) && (ne01 < 32768);
 
     if (ne1 == 1 || use_mc3) {
@@ -29563,7 +29582,7 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
     static const char * q6k_mc3_maxn_env = getenv("GGML_OPENCL_Q6K_MC3_MAXN");
     const int q6k_mc3_maxn = q6k_mc3_maxn_env ? MIN(atoi(q6k_mc3_maxn_env), 4)
                                               : (q6k_cok_r4_would_run ? 2 : 4);
-    const bool use_q6k_mc3 = q6k_mc3 && (ne1 >= 2 && ne1 <= q6k_mc3_maxn) && (ne01 < 32768);
+    const bool use_q6k_mc3 = ggml_cl_mc_gemv_ok(backend_ctx) && q6k_mc3 && (ne1 >= 2 && ne1 <= q6k_mc3_maxn) && (ne01 < 32768);
     // Batched verify lm_head/embed (ne1 in [2..4], tiled layout). DEFAULT now
     // routes to the dp4a tiled GEMM (the else branch below): ~4x the float
     // multi-column tiled GEMV at ne1=2..4 (X2-90), q8_1-approx (NMSE ~1e-5, like
@@ -30327,7 +30346,7 @@ static void ggml_cl_mul_mat_q5_K_f32_adreno(ggml_backend_t backend, const ggml_t
     // after q4_0 mc3). Reuses the ne1==1 GEMV image setup (q + qh + activations).
     // Opt-in via GGML_OPENCL_Q5K_MC3=1. Per-layer only (ne01 < 32768).
     static const bool q5k_mc3 = (getenv("GGML_OPENCL_Q5K_MC3") != nullptr);
-    const bool use_q5k_mc3 = q5k_mc3 && (ne1 >= 2 && ne1 <= 4) && (ne01 < 32768);
+    const bool use_q5k_mc3 = ggml_cl_mc_gemv_ok(backend_ctx) && q5k_mc3 && (ne1 >= 2 && ne1 <= 4) && (ne01 < 32768);
 
     // The weight images below are the only ones sized by the WEIGHT. When they do not fit
     // (an oversized head kept on this path by GGML_OPENCL_Q5K_BIG_HEAD_GPU), fall through
@@ -34169,11 +34188,13 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             // single-column flat kernel, which does carry the workaround.
             if (backend_ctx->q6_k_flat_old_compiler) {
                 // keep the single-column kernel selected above
-            } else if (ne11 == 2 && backend_ctx->kernel_mul_mv_q6_K_f32_flat_mc2 != nullptr) {
+            } else if (ne11 == 2 && ggml_cl_mc_gemv_ok(backend_ctx) &&
+                       backend_ctx->kernel_mul_mv_q6_K_f32_flat_mc2 != nullptr) {
                 kernel        = backend_ctx->kernel_mul_mv_q6_K_f32_flat_mc2;
                 ndst          = backend_ctx->q6k_mc2_ndst;
                 ncols_per_wg  = 2;
-            } else if (ne11 > 1 && backend_ctx->kernel_mul_mv_q6_K_f32_flat_mc4 != nullptr) {
+            } else if (ne11 > 1 && ggml_cl_mc_gemv_ok(backend_ctx) &&
+                       backend_ctx->kernel_mul_mv_q6_K_f32_flat_mc4 != nullptr) {
                 kernel        = backend_ctx->kernel_mul_mv_q6_K_f32_flat_mc4;
                 ndst          = backend_ctx->q6k_mc4_ndst;
                 ncols_per_wg  = 4;
