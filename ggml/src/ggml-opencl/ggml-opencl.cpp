@@ -1859,6 +1859,11 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r4_sv = nullptr;
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r4_ma = nullptr;
     int       q4k_cok_nsg = 8;   // K-split width the q4_K cok kernels were built with
+    // Second q4_K cok program at a narrower K-split, for shapes that launch enough
+    // workgroups to prefer residency over reduction depth. Built lazily on first use.
+    int       q4k_cok_nsg_alt = 6;
+    bool      q4k_cok_alt_built = false;
+    cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_alt = nullptr;
     // COK_NSG each cok program was COMPILED with, after narrowing to what the device
     // will actually launch. The dispatch must use these: COK_NSG sets both the
     // workgroup (64 x COK_NSG) and the K-slice axis, so launching 8 against a kernel
@@ -2566,6 +2571,55 @@ static void ggml_cl_cok_build_q40(ggml_backend_opencl_context * backend_ctx) {
         GGML_LOG_INFO("ggml_opencl: q4_0 cok+dp4a narrow GEMM %s (rows=%d COK_NSG=%d)\n",
                       backend_ctx->kernel_gemm_cok_q4_0_q8_1_dp4a ? "loaded" : "UNAVAILABLE",
                       backend_ctx->q40_cok_dp4a_rows, backend_ctx->q40_cok_dp4a_nsg);
+}
+
+// Second copy of the q4_K cok program at a NARROWER K-split. COK_NSG sets three things at
+// once -- workgroup size (64 x NSG), reduction depth, and LDS (64*(NSG-1)*32 B) -- and the
+// best value depends on how many workgroups the shape launches. At one workgroup per compute
+// unit the deep split is the only thing filling the machine; above that, the smaller group
+// fits more workgroups per CU and wins. Measured on X2-90, q4_K ne1 5..8, NSG 6 vs 8:
+//     ne01  4096 -> 16 WGs (1.00/CU):  370 vs 415 us   deep split wins
+//     ne01  6656 -> 26 WGs (1.63/CU):  990 vs 825 us   narrow wins, -16.7%
+//     ne01 19968 -> 78 WGs (4.88/CU):  853 vs 690 us   narrow wins, -19.1%
+// End to end on muse DFlash that is -3.87% ms/round on 9 of 9 prompts, +4.66% token-weighted.
+//
+// Built LAZILY: a resident program costs ~5% on unrelated kernels even when never dispatched,
+// which is why the narrow cok+dp4a programs moved to first-use building.
+static void ggml_cl_cok_build_q4k_nsg_alt(ggml_backend_opencl_context * backend_ctx) {
+    cl_int err;
+    const std::string compile_opts = ggml_opencl_make_compile_opts(backend_ctx);
+#ifdef GGML_OPENCL_EMBED_KERNELS
+    const std::string kernel_src {
+        #include "gemm_noshuffle_q4_k_f32.cl.h"
+    };
+#else
+    const std::string kernel_src = read_file("gemm_noshuffle_q4_k_f32.cl");
+#endif
+    static const char * nsg_alt_env = getenv("GGML_OPENCL_Q4K_COK_NSG_ALT");
+    const int nsg_req = nsg_alt_env ? atoi(nsg_alt_env) : 6;
+    if (nsg_req < 1) { return; }
+    int nsg_eff = nsg_req;
+    cl_program prog = ggml_cl_build_cok_program(backend_ctx, kernel_src.c_str(),
+                                                compile_opts, nsg_req, &nsg_eff);
+    if (prog == nullptr) { return; }
+    backend_ctx->q4k_cok_nsg_alt = nsg_eff;
+    // Only the default-selected kernel is taken from this program; the rest of the file
+    // builds with it but nothing else needs a second handle.
+    backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_alt =
+        clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr", &err);
+    if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_alt = nullptr; }
+    GGML_LOG_INFO("ggml_opencl: q4_K cok narrow-K-split program %s (COK_NSG=%d)
+",
+                  backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_alt ? "loaded" : "UNAVAILABLE",
+                  nsg_eff);
+}
+
+static bool ggml_cl_cok_have_q4k_nsg_alt(ggml_backend_opencl_context * backend_ctx) {
+    if (!backend_ctx->q4k_cok_alt_built) {
+        backend_ctx->q4k_cok_alt_built = true;
+        ggml_cl_cok_build_q4k_nsg_alt(backend_ctx);
+    }
+    return backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_alt != nullptr;
 }
 
 static bool ggml_cl_cok_have_q4k(ggml_backend_opencl_context * backend_ctx) {
@@ -7073,8 +7127,13 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #else
         const std::string kernel_src = read_file("gemm_noshuffle_q6_k_f32.cl");
 #endif
+        // COK_NSG sets workgroup size (64 x NSG), reduction depth and LDS together. The
+        // q4_K twin of this knob measured -16..19% at 6 rather than 8 on shapes launching
+        // more than one workgroup per compute unit; q6_K is unswept, so expose it.
+        static const char * q6k_cok_nsg_env = getenv("GGML_OPENCL_Q6K_COK_NSG");
+        const int q6k_cok_nsg_req = q6k_cok_nsg_env ? atoi(q6k_cok_nsg_env) : 8;
         cl_program prog = ggml_cl_build_cok_program(backend_ctx, kernel_src.c_str(),
-                                                    CL_moe_compile_opts, 8,
+                                                    CL_moe_compile_opts, q6k_cok_nsg_req,
                                                     &backend_ctx->q6k_cok_nsg_eff);
 
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q6_K_f32 = clCreateKernel(prog, "kernel_gemm_noshuffle_q6_K_f32", &err), err));
@@ -28965,6 +29024,26 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
             CL_CHECK((b_img_trans_w8 = clCreateImage(context, CL_MEM_READ_ONLY, &img_fmt, &img_desc, NULL, &err), err));
         }
 
+        // Shape-adaptive K-split. The r4 launch is ne01/4 global over a 64-wide group, so it
+        // produces ne01/256 workgroups. At or below one per compute unit the deep K-split is
+        // what fills the machine; above it the narrower group fits more workgroups per CU and
+        // wins by 16-19% (see ggml_cl_cok_build_q4k_nsg_alt). The threshold is expressed in
+        // compute units so it follows the device rather than one measured constant.
+        // GGML_OPENCL_Q4K_COK_NSG_ALT=0 opts out; _WGPCU scales the threshold.
+        static const char * q4k_nsg_alt_env   = getenv("GGML_OPENCL_Q4K_COK_NSG_ALT");
+        static const char * q4k_nsg_wgpcu_env = getenv("GGML_OPENCL_Q4K_COK_NSG_ALT_WGPCU");
+        const int  q4k_nsg_wgpcu = q4k_nsg_wgpcu_env ? atoi(q4k_nsg_wgpcu_env) : 1;
+        const bool q4k_nsg_alt_on = (q4k_nsg_alt_env == nullptr) || (atoi(q4k_nsg_alt_env) != 0);
+        const size_t q4k_cok_wgs = (size_t)ne01 / 256;
+        // Three arms outrank this one in the chain below and are compiled against the
+        // MAIN program's COK_NSG, so the alt must decline whenever one of them wins --
+        // otherwise the launch geometry would not match the kernel that ran.
+        const bool use_r4_wimg_nr_alt = use_r4_wimg_nr && q4k_nsg_alt_on
+                                      && !run_w8 && !use_cok_r8 && !use_r2_wimg_nr
+                                      && backend_ctx->compute_units > 0 && q4k_nsg_wgpcu > 0
+                                      && q4k_cok_wgs > (size_t)backend_ctx->compute_units * (size_t)q4k_nsg_wgpcu
+                                      && ggml_cl_cok_have_q4k_nsg_alt(backend_ctx);
+
         // Which small-batch kernel this shape actually gets. Three A/Bs on this file
         // have been vacuous because the dispatch never reached the kernel under test,
         // so any null result here must be able to show it ran.
@@ -28977,6 +29056,7 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
                         run_w8 ? "cok_r4_wimg_nr_w8"
                         : use_r4_wimg_nr_w8 ? "cok_r4_wimg_nr+w8img"
                         : use_cok_r8 ? "cok_r8" : use_r2_wimg_nr ? "cok_r2_wimg_nr"
+                        : use_r4_wimg_nr_alt ? "cok_r4_wimg_nr_altnsg"
                         : use_r4_wimg_nr ? "cok_r4_wimg_nr"
                         : use_cok_r4_wimg ? "cok_r4_wimg"
                         : use_cok_r4_nrh ? "cok_r4_nrh"
@@ -28992,6 +29072,7 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
         kernel = run_w8 ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_w8
                : use_cok_r8    ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r8
                : use_r2_wimg_nr ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r2_wimg_nr
+               : use_r4_wimg_nr_alt ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_alt
                : use_r4_wimg_nr ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr
                : use_cok_r4_wimg ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg
                : use_cok_r4_nrh ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_nrh
@@ -29035,10 +29116,14 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
                                 : use_r2_wimg_nr ? (size_t)(ne01 / 2)
                                 : (use_cok_r4 || use_cok_r4_wimg) ? (size_t)(ne01 / 4)
                                              : (size_t)ne01;
-            global_work_size[1] = (size_t)backend_ctx->q4k_cok_nsg;   // COK_NSG
+            // the alt program was compiled with its own COK_NSG; the launch must match it
+            const size_t cok_nsg_launch = use_r4_wimg_nr_alt
+                                        ? (size_t)backend_ctx->q4k_cok_nsg_alt
+                                        : (size_t)backend_ctx->q4k_cok_nsg;
+            global_work_size[1] = cok_nsg_launch;   // COK_NSG
             global_work_size[2] = 1;
             local_work_size[0] = 64;              // COK_SG
-            local_work_size[1] = (size_t)backend_ctx->q4k_cok_nsg;    // COK_NSG
+            local_work_size[1] = cok_nsg_launch;    // COK_NSG
             local_work_size[2] = 1;
         } else if (use_r1) {
             // 1 row per WI (opt-in occupancy experiment).
