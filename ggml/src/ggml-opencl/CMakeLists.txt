@@ -65,6 +65,7 @@ set(GGML_OPENCL_KERNELS
     add_id
     moe_add_id_glu
     argsort
+    top_k
     tri
     fill
     clamp
@@ -121,6 +122,9 @@ set(GGML_OPENCL_KERNELS
     mul_mv_id_mxfp4_f32_flat
     gemm_moe_q4_0_f32_ns
     gemm_moe_q4_0_q8_1_dp4a
+    gemm_cok_q4_k_q8_1_dp4a
+    gemm_cok_q6_k_q8_1_dp4a
+    gemm_cok_q4_0_q8_1_dp4a
     gemv_moe_q4_0_f32_ns
     gemm_moe_q8_0_f32_ns
     gemm_moe_q4_1_f32_ns

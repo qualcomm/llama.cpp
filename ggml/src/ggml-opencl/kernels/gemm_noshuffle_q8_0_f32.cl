@@ -147,7 +147,11 @@ kernel void kernel_gemm_noshuffle_q8_0_f32(
 //
 // Measured headroom: q8_0 runs 81-86 GB/s at n=2..8 against 123.4 at n=1 through its own GEMV,
 // so about 1.45x is on the table and none of it is row tiling.
+// Q80_COK_NSG is overridable so the host can narrow it when a device refuses the
+// 64 x Q80_COK_NSG workgroup; see ggml_cl_build_cok_program.
+#ifndef Q80_COK_NSG
 #define Q80_COK_NSG 8
+#endif
 #define Q80_COK_SG  64
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64

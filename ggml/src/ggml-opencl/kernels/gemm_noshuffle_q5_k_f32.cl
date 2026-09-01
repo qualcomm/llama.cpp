@@ -184,7 +184,11 @@ kernel void kernel_gemm_noshuffle_q5_k_f32(
 // dequant. Closes the q5_K medium-batch dead-zone the same way q4_K/q6_K cok
 // did; q5_K is the #2 verify chunk on Qwen3.5 spec/MTP. REQD_SUBGROUP_SIZE_64
 // + barrier (never full-width sub_group_reduce on X2).
+// COK_NSG is overridable so the host can narrow it when a device refuses the
+// 64 x COK_NSG workgroup; see ggml_cl_build_cok_program.
+#ifndef COK_NSG
 #define COK_NSG 8
+#endif
 #define COK_SG  64
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64

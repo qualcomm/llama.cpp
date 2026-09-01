@@ -147,7 +147,11 @@ kernel void kernel_gemm_noshuffle_q6_K_f32(
 // reduction. Replaces the default 4-row-per-WI tile that walked all of K alone
 // (~M/512 WGs + serial reduction) at small n_q. REQD_SUBGROUP_SIZE_64 +
 // barrier (never sub_group_reduce at full width on X2).
+// COK_NSG is overridable so the host can narrow it when a device refuses the
+// 64 x COK_NSG workgroup; see ggml_cl_build_cok_program.
+#ifndef COK_NSG
 #define COK_NSG 8
+#endif
 #define COK_SG  64
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64

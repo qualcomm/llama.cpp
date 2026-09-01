@@ -227,7 +227,6 @@ static int ggml_opencl_gdn_cols_per_lane_group(int tgpp) {
 
 static bool ggml_cl_is_q4_0_soa(const ggml_tensor * tensor);
 static bool ggml_cl_is_q8_0_soa(const ggml_tensor * tensor);
-#define Q80_COK_NSG_HOST 8   // must match Q80_COK_NSG in gemm_noshuffle_q8_0_f32.cl
 
 static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
 static void ggml_cl_soft_max(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
@@ -528,6 +527,17 @@ static ADRENO_GPU_GEN get_adreno_gpu_gen(const char *device_name) {
 // which is how a new compiler gets re-verified without a rebuild.
 struct ggml_backend_opencl_context;
 static bool adreno_art_compiler_quirks(const ggml_backend_opencl_context *backend_ctx);
+
+// Should the narrow cok+dp4a programs (q4_K / q6_K / q4_0, ne1 2..4) be BUILT at all?
+// Default yes; GGML_OPENCL_COK_DP4A=0 skips the build as well as the dispatch, so opting
+// out costs nothing at init either. The dispatch-side test is
+// ggml_cl_cok_dp4a_narrow_on(), which additionally declines two compilers -- it lives
+// further down because it needs the context.
+static bool ggml_cl_cok_dp4a_build_on() {
+    static const char * const e = getenv("GGML_OPENCL_COK_DP4A");
+    return !(e && *e && atoi(e) == 0);
+}
+
 
 static ggml_cl_compiler_version get_adreno_cl_compiler_version(const char *driver_version) {
     std::string driver_ver_str(driver_version);
@@ -876,6 +886,9 @@ struct ggml_backend_opencl_context {
     // argsort is loaded in supports_op because its availability depends on how
     // many workgroups are allowed, which requires kernel compilation.
     bool kernels_loaded_argsort = false;
+    // TOP_K is loaded from supports_op for the same reason as argsort: whether a
+    // row is servable depends on the workgroup the compiled kernel can launch.
+    bool kernels_loaded_top_k = false;
     // rest of the kernels are currently always loaded in alloc_buffer.
     bool kernels_loaded = false;
 
@@ -989,6 +1002,8 @@ struct ggml_backend_opencl_context {
     bool adreno_use_bin_kernels;
     get_adreno_bin_kernel_func_t get_adreno_bin_kernel_func = nullptr;
     ggml_cl_compiler_version adreno_cl_compiler_version;
+    // The q6_K flat mul_mat codegen workarounds are needed by old E031 compilers only.
+    bool q6_k_flat_old_compiler;
 
     std::string kernel_compile_opts;  // cached for lazy-compiled kernels.
 
@@ -1031,6 +1046,9 @@ struct ggml_backend_opencl_context {
     ggml_cl_buffer prealloc_splitk_partial;  // [ksplit * M] partials for split-K GEMV
     // q8_1-quantized reordered MoE activations for the dp4a prefill GEMM.
     ggml_cl_buffer prealloc_moe_qa;   // int8 quants  [tok_slots * ne00]
+    ggml_cl_buffer prealloc_topk_val;  // TOP_K stage-1 candidate values  [nrows * ncand]
+    ggml_cl_buffer prealloc_topk_idx;  // TOP_K stage-1 candidate columns [nrows * ncand]
+    ggml_cl_buffer prealloc_topk_ord;  // TOP_K stage-2 argsort output    [nrows * ncand]
     ggml_cl_buffer prealloc_moe_da;   // per-block d  [tok_slots * ne00/32] (half)
     ggml_cl_buffer prealloc_moe_sa;   // per-block s  [tok_slots * ne00/32] (half)
 
@@ -1154,6 +1172,7 @@ struct ggml_backend_opencl_context {
     cl_program program_softmax_4_f32;
     cl_program program_softmax_4_f16;
     cl_program program_argsort_f32_i32;
+    cl_program program_top_k = nullptr;
     cl_program program_sum_rows_f32;
     cl_program program_pad;
     cl_program program_upscale;
@@ -1353,6 +1372,9 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_solve_tri_f32;
     cl_kernel kernel_im2col_f32, kernel_im2col_f16;
     cl_kernel kernel_argsort_f32_i32;
+    cl_kernel kernel_top_k_tile_16  = nullptr;   // TOP_K stage 1, ITEMS_PER_LANE=16
+    cl_kernel kernel_top_k_tile_32  = nullptr;   // TOP_K stage 1, ITEMS_PER_LANE=32
+    cl_kernel kernel_top_k_unmap    = nullptr;   // TOP_K stage 3
     cl_kernel kernel_sum_rows_f32, kernel_sum_rows_f32_4;
     cl_kernel kernel_cumsum_blk, kernel_cumsum_add;
     cl_kernel kernel_repeat_f32;
@@ -1428,6 +1450,8 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemm_moe_q4_0_q8_1_dp4a = nullptr;    // dp4a (int8) q4_0 MoE prefill GEMM
     cl_kernel kernel_gemv_moe_mxfp4_f32_ns_glu;
     cl_kernel kernel_gemv_moe_mxfp4_f32_ns_glu_wimg = nullptr;  // weight-as-texture variant
+    cl_kernel kernel_gemm_moe_mxfp4_q8_1_dp4a_bin = nullptr;   // binary dp4a (int8) mxfp4 MoE prefill GEMM
+    cl_kernel kernel_gemm_moe_q4_0_q8_1_dp4a_bin = nullptr;    // binary dp4a (int8) q4_0 MoE prefill GEMM
     cl_kernel kernel_moe_reorder_b;
     cl_kernel kernel_moe_histogram, kernel_moe_scan, kernel_moe_fill, kernel_moe_scatter;
     cl_kernel kernel_moe_scatter_det = nullptr;      // diagnostic: deterministic slot assignment
@@ -1651,7 +1675,28 @@ struct ggml_backend_opencl_context {
             }
             return;
         }
-        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, work_dim, NULL, global_work_size, local_work_size, 0, NULL, NULL));
+        {
+            const cl_int enq_err = clEnqueueNDRangeKernel(queue, kernel, work_dim, NULL,
+                                                          global_work_size, local_work_size,
+                                                          0, NULL, NULL);
+            if (enq_err != CL_SUCCESS) {
+                // A bare error code here costs a bisect. -54 in particular says a
+                // workgroup was refused, and the only thing worth knowing is WHICH
+                // kernel and by how much, so ask the driver before dying.
+                char kname[128] = {0};
+                size_t kmax = 0;
+                clGetKernelInfo(kernel, CL_KERNEL_FUNCTION_NAME, sizeof(kname) - 1, kname, NULL);
+                clGetKernelWorkGroupInfo(kernel, device, CL_KERNEL_WORK_GROUP_SIZE,
+                                         sizeof(kmax), &kmax, NULL);
+                size_t req = 1;
+                for (cl_uint d = 0; d < work_dim; ++d) {
+                    req *= local_work_size ? local_work_size[d] : 1;
+                }
+                GGML_LOG_ERROR("ggml_opencl: enqueue of '%s' failed (%d); local %zu work items, "
+                               "kernel max %zu\n", kname[0] ? kname : "?", enq_err, req, kmax);
+            }
+            CL_CHECK(enq_err);
+        }
 #endif
     }
 
@@ -1762,6 +1807,33 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemm_noshuffle_q4_k_q8_1_dp4a_mid_alds4 = nullptr;
     cl_kernel kernel_gemm_q4_k_splitk_reduce_f32 = nullptr;  // sums the split-K partials
     int q4k_dp4a_ts        = 32;  // tile for prefill (ne1 > q4k_dp4a_mid_max)
+    // cok-shaped q4_K GEMM with a dp4a inner dot, for the narrow band ne1 = 2..8.
+    // Opt-in (GGML_OPENCL_Q4K_COK_DP4A): it exists to test whether int8 arithmetic
+    // beats the f16 cok kernel there, so it must not displace the default dispatch.
+    cl_kernel kernel_gemm_cok_q4_k_q8_1_dp4a = nullptr;
+    cl_kernel kernel_gemm_cok_q4_k_q8_1_dp4a_c4 = nullptr;  // 4-column build for ne1 3..4
+    cl_kernel kernel_gemm_cok_q4_k_q8_1_dp4a_c2 = nullptr;  // 2-column build for ne1 == 2
+    cl_kernel kernel_gemm_cok_q6_k_q8_1_dp4a    = nullptr;  // q6_K twin, 4-column
+    cl_kernel kernel_gemm_cok_q6_k_q8_1_dp4a_c2 = nullptr;  // q6_K twin, 2-column
+    int       q6k_cok_dp4a_nsg  = 4;
+    // Each column-width build narrows its K-split independently, so the launch must use
+    // the one belonging to the width it dispatches. Sharing a single value silently
+    // launches the wrong subgroup count whenever the widths narrow differently.
+    int       q6k_cok_dp4a_nsg_c2 = 4;
+    int       q6k_cok_dp4a_rows = 4;
+    cl_kernel kernel_gemm_cok_q4_0_q8_1_dp4a    = nullptr;  // q4_0 twin, 4-column
+    cl_kernel kernel_gemm_cok_q4_0_q8_1_dp4a_c2 = nullptr;  // q4_0 twin, 2-column
+    int       q40_cok_dp4a_nsg  = 4;
+    int       q40_cok_dp4a_nsg_c2 = 4;
+    int       q40_cok_dp4a_rows = 4;
+    int       q4k_cok_dp4a_nsg_c8  = 4;   // the 8-column build deadlocks at 8
+    int       q4k_cok_dp4a_nsg_narrow = 8;
+    int       q4k_cok_dp4a_nsg_c2 = 8;
+    int       q4k_cok_dp4a_nsg_eff = 4;
+    int       q4k_cok_dp4a_rows    = 4;
+    bool      q4k_cok_built = false;   // the cok programs are built on first use
+    bool      q6k_cok_built = false;
+    bool      q40_cok_built = false;
     int q4k_dp4a_ts_narrow = 32;  // tile for the verify band; == q4k_dp4a_ts disables the split
     int q4k_dp4a_narrow_max = 16; // widest ne1 routed to the narrow tile
     int q4k_dp4a_ts_mid    = 24;  // tile for ne1 in (narrow_max, mid_max]
@@ -1798,6 +1870,21 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r4_sv = nullptr;
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r4_ma = nullptr;
     int       q4k_cok_nsg = 8;   // K-split width the q4_K cok kernels were built with
+    // Second q4_K cok program at a narrower K-split, for shapes that launch enough
+    // workgroups to prefer residency over reduction depth. Built lazily on first use.
+    int       q4k_cok_nsg_alt = 6;
+    bool      q4k_cok_alt_built = false;
+    cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_alt = nullptr;
+    // COK_NSG each cok program was COMPILED with, after narrowing to what the device
+    // will actually launch. The dispatch must use these: COK_NSG sets both the
+    // workgroup (64 x COK_NSG) and the K-slice axis, so launching 8 against a kernel
+    // built at 4 is a -54 abort, and the reverse silently drops K slices. Separate
+    // programs, so a device is free to refuse them at different widths.
+    int       q40_cok_nsg_eff = 8;
+    int       q41_cok_nsg_eff = 8;
+    int       q5k_cok_nsg_eff = 8;
+    int       q6k_cok_nsg_eff = 8;
+    int       q80_cok_nsg_eff = 8;
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg = nullptr;
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr = nullptr;
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r2_wimg_nr = nullptr;
@@ -2144,6 +2231,55 @@ static void load_cl_kernels_argsort(ggml_backend_opencl_context *backend_ctx) {
     }
 }
 
+// TOP_K stage 1 + stage 3. Built non-fatally: a compiler that rejects the
+// program leaves the handles null, supports_op then declines and the op stays on
+// the CPU, which is the behaviour before this path existed.
+static void load_cl_kernels_top_k(ggml_backend_opencl_context * backend_ctx) {
+    if (backend_ctx->kernels_loaded_top_k) {
+        return;
+    }
+    backend_ctx->kernels_loaded_top_k = true;
+
+    const auto opencl_c_std =
+        std::string("CL") + std::to_string(backend_ctx->opencl_c_version.major) + "." +
+        std::to_string(backend_ctx->opencl_c_version.minor);
+    // No fast-math: the key packing is a bit-level reinterpretation of the float
+    // and must not be reassociated or flushed.
+    const std::string compile_opts = std::string("-cl-std=") + opencl_c_std + " -cl-mad-enable";
+
+#ifdef GGML_OPENCL_EMBED_KERNELS
+    const std::string kernel_src {
+        #include "top_k.cl.h"
+    };
+#else
+    const std::string kernel_src = read_file("top_k.cl");
+#endif
+
+    // Two variants so the host can widen the tile when ntiles*k would otherwise
+    // exceed the workgroup the stage-2 argsort can launch.
+    cl_int err;
+    for (int items : {16, 32}) {
+        const std::string opts = compile_opts + " -DITEMS_PER_LANE=" + std::to_string(items);
+        cl_program prog = build_program_from_source_ex(
+            backend_ctx->context, backend_ctx->device, kernel_src.c_str(), opts,
+            /*fatal=*/false, "top_k");
+        if (!prog) {
+            GGML_LOG_WARN("ggml_opencl: TOP_K program (ITEMS_PER_LANE=%d) failed to build; "
+                          "op stays on CPU\n", items);
+            continue;
+        }
+        cl_kernel tile = clCreateKernel(prog, "kernel_top_k_tile", &err);
+        if (err != CL_SUCCESS) { CL_CHECK(clReleaseProgram(prog)); continue; }
+        if (items == 16) { backend_ctx->kernel_top_k_tile_16 = tile; }
+        else             { backend_ctx->kernel_top_k_tile_32 = tile; }
+        if (backend_ctx->kernel_top_k_unmap == nullptr) {
+            backend_ctx->kernel_top_k_unmap = clCreateKernel(prog, "kernel_top_k_unmap", &err);
+            if (err != CL_SUCCESS) { backend_ctx->kernel_top_k_unmap = nullptr; }
+        }
+        backend_ctx->program_top_k = prog;
+    }
+}
+
 static bool use_adreno_bin_kernels(ggml_backend_opencl_context * backend_ctx) {
 #ifndef GGML_OPENCL_USE_ADRENO_BIN_KERNELS
     return false;
@@ -2201,6 +2337,358 @@ static std::string ggml_opencl_make_compile_opts(ggml_backend_opencl_context *ba
     }
 
     return compile_opts;
+}
+
+// Largest NSG whose 64*NSG workgroup this kernel will actually accept on this device.
+// Halves until it fits; returns the request unchanged when the device will not say.
+static int ggml_cl_nsg_fit(ggml_backend_opencl_context * backend_ctx, cl_kernel k,
+                           int nsg, const char * what) {
+    size_t cap = 0;
+    if (k == nullptr ||
+        clGetKernelWorkGroupInfo(k, backend_ctx->device, CL_KERNEL_WORK_GROUP_SIZE,
+                                 sizeof(cap), &cap, NULL) != CL_SUCCESS || cap == 0) {
+        return nsg;   // cannot tell: leave the preference alone
+    }
+    int w = nsg;
+    while (w > 1 && (size_t) 64 * w > cap) {
+        w >>= 1;
+    }
+    if (w != nsg) {
+        GGML_LOG_WARN("ggml_opencl: %s workgroup %d refused (kernel max %zu), using %d\n",
+                      what, 64 * nsg, cap, 64 * w);
+    }
+    return w;
+}
+
+// Build a cok program and narrow COK_NSG until the device will actually launch its
+// (64 x COK_NSG) workgroup. COK_NSG is compile-time, so a refusal cannot be repaired
+// at dispatch -- the program has to be built again.
+//
+// This is not hypothetical. kernel_gemm_noshuffle_q4_0_f32_cok_r4 asks for 64*8 = 512
+// work items; an Adreno X1-85 caps it at 384 and returns CL_INVALID_WORK_GROUP_SIZE,
+// which the backend assert turns into a hard abort at the first q4_0 matmul. The cok
+// path is default-on fleet-wide, so that abort shipped -- unnoticed because nothing had
+// run the op suite on an X1.
+static cl_program ggml_cl_build_cok_program(ggml_backend_opencl_context * backend_ctx,
+                                            const char * kernel_src,
+                                            const std::string & opts_base,
+                                            int nsg_req,
+                                            int * nsg_eff_out,
+                                            const char * nsg_macro = "COK_NSG") {
+    int nsg_eff = nsg_req < 1 ? 1 : nsg_req;
+    for (;;) {
+        const std::string opts = opts_base + " -D" + nsg_macro + "=" + std::to_string(nsg_eff);
+        cl_program prog = build_program_from_source(backend_ctx, kernel_src, opts);
+
+        size_t names_len = 0;
+        std::string names;
+        if (clGetProgramInfo(prog, CL_PROGRAM_KERNEL_NAMES, 0, NULL, &names_len) == CL_SUCCESS
+            && names_len > 1) {
+            names.resize(names_len);
+            if (clGetProgramInfo(prog, CL_PROGRAM_KERNEL_NAMES, names_len,
+                                 &names[0], NULL) != CL_SUCCESS) {
+                names.clear();
+            }
+            while (!names.empty() && names.back() == 0) { names.pop_back(); }
+        }
+
+        int fit = nsg_eff;
+        for (size_t b = 0, e; b < names.size(); b = e + 1) {
+            e = names.find(0x3b, b);
+            if (e == std::string::npos) { e = names.size(); }
+            const std::string kn = names.substr(b, e - b);
+            // only the cok kernels launch 64*COK_NSG; the others in these programs
+            // carry their own geometry and must not narrow it
+            if (kn.find("_cok") == std::string::npos) {
+                continue;
+            }
+            cl_int perr = CL_SUCCESS;
+            cl_kernel probe = clCreateKernel(prog, kn.c_str(), &perr);
+            if (perr != CL_SUCCESS || probe == nullptr) { continue; }
+            fit = std::min(fit, ggml_cl_nsg_fit(backend_ctx, probe, nsg_eff, kn.c_str()));
+            CL_CHECK(clReleaseKernel(probe));
+        }
+
+        if (fit >= nsg_eff) {
+            if (nsg_eff_out != nullptr) { *nsg_eff_out = nsg_eff; }
+            return prog;
+        }
+        CL_CHECK(clReleaseProgram(prog));
+        nsg_eff = fit;
+    }
+}
+
+// The narrow cok+dp4a programs are built ON FIRST USE, not at load.
+//
+// Building them at load cost measurably on kernels that never touch this band: on an
+// Adreno X2-90 the six programs (three types x two column widths) slowed q6_K ne1=2 by
+// 6.5% and q5_K ne1=2 by 4.6% with nothing ever dispatched to them, while dispatching
+// them was nearly free. A model outside the ne1 2..4 band paid the whole cost for a
+// feature it never used. Building lazily also makes the opt-out genuinely free.
+//
+// Each builder runs at most once per context; the *_have_* accessors do the ensure and
+// report whether the kernel exists, so the dispatch sites cannot forget to build.
+
+// gemm_cok_q4_k_q8_1_dp4a (narrow-band q4_K GEMM, ne1 = 2..4)
+static void ggml_cl_cok_build_q4k(ggml_backend_opencl_context * backend_ctx) {
+    cl_int err;
+    const std::string compile_opts = ggml_opencl_make_compile_opts(backend_ctx);
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src {
+            #include "gemm_cok_q4_k_q8_1_dp4a.cl.h"
+        };
+#else
+        const std::string kernel_src = read_file("gemm_cok_q4_k_q8_1_dp4a.cl");
+#endif
+        // Debug bisect: 1 = launch geometry only, 2 = K loop without the reduction,
+        // 3 = full kernel. Build-time, selected from the environment.
+        int cok_stage = 3;
+        if (const char * e = getenv("GGML_OPENCL_Q4K_COK_DP4A_STAGE")) { cok_stage = atoi(e); }
+        int cok_rows = 4;
+        if (const char * e = getenv("GGML_OPENCL_Q4K_COK_DP4A_ROWS")) { cok_rows = atoi(e); }
+        // 4, not 8. The driver reports CL_KERNEL_WORK_GROUP_SIZE = 512 for this kernel and
+        // accepts a 64x8 launch, then the reduction deadlocks -- bisected by construction:
+        // with the reduction removed the same kernel completes 568 dispatches at 64x8, and
+        // the full kernel completes at 64x4 and 64x2. ggml_cl_build_cok_program narrows
+        // against that query and still selected 8. That query is a
+        // MAXIMUM in any case, not an optimum: taking it maximises register demand per
+        // workgroup and minimises how many can be resident, so it is tuned, not adopted.
+        int nsg_req = 4;
+        if (const char * e = getenv("GGML_OPENCL_Q4K_COK_DP4A_NSG")) { nsg_req = atoi(e); }
+        int nsg_narrow = 8;
+        if (const char * e = getenv("GGML_OPENCL_Q4K_COK_DP4A_NSGN")) { nsg_narrow = atoi(e); }
+
+        // Two column widths. The band is ne1 = 2..8 and an 8-column lane computes 8
+        // columns whatever ne1 is, so at ne1=2 six are discarded -- and that is where
+        // the 8-column build loses worst. The 4-column build halves the accumulator and
+        // dot registers and the work; the dispatch picks by ne1.
+        int cok_kwide = 4;
+        if (const char * e = getenv("GGML_OPENCL_Q4K_COK_DP4A_KWIDE")) { cok_kwide = atoi(e); }
+        const std::string base_opts = compile_opts
+            + " -DCOK_STAGE=" + std::to_string(cok_stage)
+            + " -DCOK_ROWS="  + std::to_string(cok_rows)
+            + " -DCOK_KWIDE=" + std::to_string(cok_kwide);
+        // NSG is per column width, not global. The narrow builds hold far fewer live
+        // values and run best at 8 (n4: 357 us against 510 at nsg 4, and against a
+        // 368 us control); the 8-column build deadlocks at 8 and takes 4.
+        // No 8-column build: the dispatch gate stops at ne1 4, so it could never run --
+        // and each program build costs ~200 ms of startup, which is the arm's only
+        // measurable end-to-end effect on a short run.
+        for (int cols : {4, 2}) {
+            int nsg_eff = nsg_narrow;
+            cl_program prog = ggml_cl_build_cok_program(
+                backend_ctx, kernel_src.c_str(),
+                base_opts + " -DCOK_COLS=" + std::to_string(cols), nsg_eff, &nsg_eff);
+            cl_kernel kk = clCreateKernel(prog, "kernel_gemm_cok_q4_k_q8_1_dp4a", &err);
+            if (err != CL_SUCCESS) { kk = nullptr; }
+            if (kk) {
+                // PRIVATE MEM IS SCRATCH, NOT REGISTER COUNT: a kernel that keeps
+                // everything in registers reports 0. Any nonzero figure here is spill
+                // traffic on every access, so it is the number to tune against.
+                cl_ulong pmc = 0, lmc = 0; size_t wgc = 0;
+                clGetKernelWorkGroupInfo(kk, backend_ctx->device, CL_KERNEL_PRIVATE_MEM_SIZE, sizeof(pmc), &pmc, NULL);
+                clGetKernelWorkGroupInfo(kk, backend_ctx->device, CL_KERNEL_LOCAL_MEM_SIZE,   sizeof(lmc), &lmc, NULL);
+                clGetKernelWorkGroupInfo(kk, backend_ctx->device, CL_KERNEL_WORK_GROUP_SIZE,  sizeof(wgc), &wgc, NULL);
+                fprintf(stderr, "[COK-DP4A] rows=%d cols=%d nsg=%d  private=%5llu (spill) local=%6llu wg_cap=%4zu\n",
+                        cok_rows, cols, nsg_eff, (unsigned long long)pmc,
+                        (unsigned long long)lmc, wgc);
+            }
+            if      (cols == 8) { backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a    = kk;
+                                  backend_ctx->q4k_cok_dp4a_nsg_c8 = nsg_eff; }
+            else if (cols == 4) { backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a_c4 = kk;
+                                  backend_ctx->q4k_cok_dp4a_nsg_narrow = nsg_eff; }
+            else                { backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a_c2 = kk;
+                                  backend_ctx->q4k_cok_dp4a_nsg_c2 = nsg_eff; }
+            backend_ctx->q4k_cok_dp4a_rows    = cok_rows;
+            CL_CHECK(clReleaseProgram(prog));
+        }
+        fflush(stderr);
+        GGML_LOG_INFO("ggml_opencl: q4_K cok+dp4a narrow GEMM %s (rows=%d COK_NSG=%d)\n",
+                      backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a_c4 ? "loaded" : "UNAVAILABLE",
+                      backend_ctx->q4k_cok_dp4a_rows, backend_ctx->q4k_cok_dp4a_nsg_eff);
+}
+
+// gemm_cok_q6_k_q8_1_dp4a (q6_K twin; ne1 = 3..4)
+static void ggml_cl_cok_build_q6k(ggml_backend_opencl_context * backend_ctx) {
+    cl_int err;
+    const std::string compile_opts = ggml_opencl_make_compile_opts(backend_ctx);
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src {
+            #include "gemm_cok_q6_k_q8_1_dp4a.cl.h"
+        };
+#else
+        const std::string kernel_src = read_file("gemm_cok_q6_k_q8_1_dp4a.cl");
+#endif
+        int rows6 = 4;
+        if (const char * e = getenv("GGML_OPENCL_Q6K_COK_DP4A_ROWS")) { rows6 = atoi(e); }
+        int nsg6 = 8;
+        if (const char * e = getenv("GGML_OPENCL_Q6K_COK_DP4A_NSG")) { nsg6 = atoi(e); }
+        const std::string base6 = compile_opts + " -DCOK_ROWS=" + std::to_string(rows6);
+        for (int cols : {4, 2}) {
+            int nsg_eff = nsg6;
+            cl_program prog = ggml_cl_build_cok_program(
+                backend_ctx, kernel_src.c_str(),
+                base6 + " -DCOK_COLS=" + std::to_string(cols), nsg_eff, &nsg_eff);
+            cl_kernel kk = clCreateKernel(prog, "kernel_gemm_cok_q6_k_q8_1_dp4a", &err);
+            if (err != CL_SUCCESS) {
+                fprintf(stderr, "[COK-DP4A-q6K] cols=%d clCreateKernel FAILED err=%d\n", cols, err);
+                kk = nullptr;
+            }
+            if (kk) {
+                cl_ulong pmc = 0, lmc = 0; size_t wgc = 0;
+                clGetKernelWorkGroupInfo(kk, backend_ctx->device, CL_KERNEL_PRIVATE_MEM_SIZE, sizeof(pmc), &pmc, NULL);
+                clGetKernelWorkGroupInfo(kk, backend_ctx->device, CL_KERNEL_LOCAL_MEM_SIZE,   sizeof(lmc), &lmc, NULL);
+                clGetKernelWorkGroupInfo(kk, backend_ctx->device, CL_KERNEL_WORK_GROUP_SIZE,  sizeof(wgc), &wgc, NULL);
+                fprintf(stderr, "[COK-DP4A-q6K] rows=%d cols=%d nsg=%d  private=%5llu (spill) local=%6llu wg_cap=%4zu\n",
+                        rows6, cols, nsg_eff, (unsigned long long)pmc,
+                        (unsigned long long)lmc, wgc);
+            }
+            if (cols == 4) { backend_ctx->kernel_gemm_cok_q6_k_q8_1_dp4a    = kk;
+                             backend_ctx->q6k_cok_dp4a_nsg = nsg_eff; }
+            else           { backend_ctx->kernel_gemm_cok_q6_k_q8_1_dp4a_c2 = kk;
+                             backend_ctx->q6k_cok_dp4a_nsg_c2 = nsg_eff; }
+            CL_CHECK(clReleaseProgram(prog));
+        }
+        fflush(stderr);
+        backend_ctx->q6k_cok_dp4a_rows = rows6;
+        GGML_LOG_INFO("ggml_opencl: q6_K cok+dp4a narrow GEMM %s (rows=%d COK_NSG=%d)\n",
+                      backend_ctx->kernel_gemm_cok_q6_k_q8_1_dp4a ? "loaded" : "UNAVAILABLE",
+                      backend_ctx->q6k_cok_dp4a_rows, backend_ctx->q6k_cok_dp4a_nsg);
+}
+
+// gemm_cok_q4_0_q8_1_dp4a (q4_0 twin; ne1 = 2..4)
+static void ggml_cl_cok_build_q40(ggml_backend_opencl_context * backend_ctx) {
+    cl_int err;
+    const std::string compile_opts = ggml_opencl_make_compile_opts(backend_ctx);
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src {
+            #include "gemm_cok_q4_0_q8_1_dp4a.cl.h"
+        };
+#else
+        const std::string kernel_src = read_file("gemm_cok_q4_0_q8_1_dp4a.cl");
+#endif
+        int rows40 = 4;
+        if (const char * e = getenv("GGML_OPENCL_Q40_COK_DP4A_ROWS")) { rows40 = atoi(e); }
+        int nsg40 = 8;
+        if (const char * e = getenv("GGML_OPENCL_Q40_COK_DP4A_NSG")) { nsg40 = atoi(e); }
+        const std::string base40 = compile_opts + " -DCOK_ROWS=" + std::to_string(rows40);
+        for (int cols : {4, 2}) {
+            int nsg_eff = nsg40;
+            cl_program prog = ggml_cl_build_cok_program(
+                backend_ctx, kernel_src.c_str(),
+                base40 + " -DCOK_COLS=" + std::to_string(cols), nsg_eff, &nsg_eff);
+            cl_kernel kk = clCreateKernel(prog, "kernel_gemm_cok_q4_0_q8_1_dp4a", &err);
+            if (err != CL_SUCCESS) {
+                fprintf(stderr, "[COK-DP4A-q40] cols=%d clCreateKernel FAILED err=%d\n", cols, err);
+                kk = nullptr;
+            }
+            if (kk) {
+                cl_ulong pmc = 0, lmc = 0; size_t wgc = 0;
+                clGetKernelWorkGroupInfo(kk, backend_ctx->device, CL_KERNEL_PRIVATE_MEM_SIZE, sizeof(pmc), &pmc, NULL);
+                clGetKernelWorkGroupInfo(kk, backend_ctx->device, CL_KERNEL_LOCAL_MEM_SIZE,   sizeof(lmc), &lmc, NULL);
+                clGetKernelWorkGroupInfo(kk, backend_ctx->device, CL_KERNEL_WORK_GROUP_SIZE,  sizeof(wgc), &wgc, NULL);
+                fprintf(stderr, "[COK-DP4A-q40] rows=%d cols=%d nsg=%d  private=%5llu (spill) local=%6llu wg_cap=%4zu\n",
+                        rows40, cols, nsg_eff, (unsigned long long)pmc,
+                        (unsigned long long)lmc, wgc);
+            }
+            if (cols == 4) { backend_ctx->kernel_gemm_cok_q4_0_q8_1_dp4a    = kk;
+                             backend_ctx->q40_cok_dp4a_nsg = nsg_eff; }
+            else           { backend_ctx->kernel_gemm_cok_q4_0_q8_1_dp4a_c2 = kk;
+                             backend_ctx->q40_cok_dp4a_nsg_c2 = nsg_eff; }
+            CL_CHECK(clReleaseProgram(prog));
+        }
+        fflush(stderr);
+        backend_ctx->q40_cok_dp4a_rows = rows40;
+        GGML_LOG_INFO("ggml_opencl: q4_0 cok+dp4a narrow GEMM %s (rows=%d COK_NSG=%d)\n",
+                      backend_ctx->kernel_gemm_cok_q4_0_q8_1_dp4a ? "loaded" : "UNAVAILABLE",
+                      backend_ctx->q40_cok_dp4a_rows, backend_ctx->q40_cok_dp4a_nsg);
+}
+
+// Second copy of the q4_K cok program at a NARROWER K-split. COK_NSG sets three things at
+// once -- workgroup size (64 x NSG), reduction depth, and LDS (64*(NSG-1)*32 B) -- and the
+// best value depends on how many workgroups the shape launches. At one workgroup per compute
+// unit the deep split is the only thing filling the machine; above that, the smaller group
+// fits more workgroups per CU and wins. Measured on X2-90, q4_K ne1 5..8, NSG 6 vs 8:
+//     ne01  4096 -> 16 WGs (1.00/CU):  370 vs 415 us   deep split wins
+//     ne01  6656 -> 26 WGs (1.63/CU):  990 vs 825 us   narrow wins, -16.7%
+//     ne01 19968 -> 78 WGs (4.88/CU):  853 vs 690 us   narrow wins, -19.1%
+// End to end on muse DFlash that is -3.87% ms/round on 9 of 9 prompts, +4.66% token-weighted.
+//
+// Built LAZILY: a resident program costs ~5% on unrelated kernels even when never dispatched,
+// which is why the narrow cok+dp4a programs moved to first-use building.
+static void ggml_cl_cok_build_q4k_nsg_alt(ggml_backend_opencl_context * backend_ctx) {
+    cl_int err;
+    const std::string compile_opts = ggml_opencl_make_compile_opts(backend_ctx);
+#ifdef GGML_OPENCL_EMBED_KERNELS
+    const std::string kernel_src {
+        #include "gemm_noshuffle_q4_k_f32.cl.h"
+    };
+#else
+    const std::string kernel_src = read_file("gemm_noshuffle_q4_k_f32.cl");
+#endif
+    // Build ONLY the kernel this program is consulted for. Two effects, both measured
+    // separately from the K-split change: the driver stops capping the launch at the
+    // minimum work-group size over sibling kernels that never run (640 -> its own 896),
+    // and the compiler spends its per-program time budget on one kernel instead of 15.
+    // GGML_OPENCL_Q4K_COK_MINIMAL=0 builds the whole file into the alt program instead.
+    static const char * minimal_env = getenv("GGML_OPENCL_Q4K_COK_MINIMAL");
+    const bool minimal_on = (minimal_env == nullptr) || (atoi(minimal_env) != 0);
+    const std::string alt_opts = minimal_on ? (compile_opts + " -DQ4K_COK_MINIMAL=1")
+                                            : compile_opts;
+    static const char * nsg_alt_env = getenv("GGML_OPENCL_Q4K_COK_NSG_ALT");
+    const int nsg_req = nsg_alt_env ? atoi(nsg_alt_env) : 6;
+    if (nsg_req < 1) { return; }
+    int nsg_eff = nsg_req;
+    cl_program prog = ggml_cl_build_cok_program(backend_ctx, kernel_src.c_str(),
+                                                alt_opts, nsg_req, &nsg_eff);
+    if (prog == nullptr) { return; }
+    backend_ctx->q4k_cok_nsg_alt = nsg_eff;
+    // Only the default-selected kernel is taken from this program; the rest of the file
+    // builds with it but nothing else needs a second handle.
+    backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_alt =
+        clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr", &err);
+    if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_alt = nullptr; }
+    GGML_LOG_INFO("ggml_opencl: q4_K cok narrow-K-split program %s (COK_NSG=%d)\n",
+                  backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_alt ? "loaded" : "UNAVAILABLE",
+                  nsg_eff);
+}
+
+static bool ggml_cl_cok_have_q4k_nsg_alt(ggml_backend_opencl_context * backend_ctx) {
+    if (!backend_ctx->q4k_cok_alt_built) {
+        backend_ctx->q4k_cok_alt_built = true;
+        ggml_cl_cok_build_q4k_nsg_alt(backend_ctx);
+    }
+    return backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_alt != nullptr;
+}
+
+static bool ggml_cl_cok_have_q4k(ggml_backend_opencl_context * backend_ctx) {
+    if (!backend_ctx->q4k_cok_built) {
+        backend_ctx->q4k_cok_built = true;
+        if (backend_ctx->has_integer_dot_product && ggml_cl_cok_dp4a_build_on()) {
+            ggml_cl_cok_build_q4k(backend_ctx);
+        }
+    }
+    return backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a_c4 != nullptr;
+}
+
+static bool ggml_cl_cok_have_q6k(ggml_backend_opencl_context * backend_ctx) {
+    if (!backend_ctx->q6k_cok_built) {
+        backend_ctx->q6k_cok_built = true;
+        if (backend_ctx->has_integer_dot_product && ggml_cl_cok_dp4a_build_on()) {
+            ggml_cl_cok_build_q6k(backend_ctx);
+        }
+    }
+    return backend_ctx->kernel_gemm_cok_q6_k_q8_1_dp4a != nullptr;
+}
+
+static bool ggml_cl_cok_have_q40(ggml_backend_opencl_context * backend_ctx) {
+    if (!backend_ctx->q40_cok_built) {
+        backend_ctx->q40_cok_built = true;
+        if (backend_ctx->has_integer_dot_product && ggml_cl_cok_dp4a_build_on()) {
+            ggml_cl_cok_build_q40(backend_ctx);
+        }
+    }
+    return backend_ctx->kernel_gemm_cok_q4_0_q8_1_dp4a != nullptr;
 }
 
 static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
@@ -2995,6 +3483,12 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                 " -DQ6K_FLAT_NSG="   + std::to_string(nsg);
         }
 
+        // The codegen workarounds in this kernel are a measured 13-20% loss on
+        // compilers that do not need them, so only the affected ones build them;
+        // everyone else gets the original source.
+        if (backend_ctx->q6_k_flat_old_compiler) {
+            compile_opts_local += " -DADRENO_OLD_COMPILER=1";
+        }
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts_local);
 
@@ -4974,7 +5468,20 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #else
         const std::string kernel_src_CL_gemm = read_file("gemm_noshuffle_q4_0_f32.cl");
 #endif
-        cl_program prog = build_program_from_source(backend_ctx, kernel_src_CL_gemm.c_str(), compile_opts);
+        // COK_NSG sets workgroup size (64 x NSG), reduction depth and LDS together, and
+        // was fixed at 8 here. The q4_K twin measured -16..19% at 6 on shapes launching
+        // more than one workgroup per compute unit, and q6_K measured the OPPOSITE, so
+        // this must be swept rather than assumed either way.
+        static const char * q40_cok_nsg_env = getenv("GGML_OPENCL_Q40_COK_NSG");
+        // Swept on the Q4_0 targets' own shapes (Qwen3.8-27B, ne1 5..8): 10 beats the
+        // old 8 at EVERY shape -- 17408x5120 -10.7/-11.4%, 5120x17408 -8.2/-6.9%,
+        // 6144x5120 -5.9%, and even 1024x5120 (4 workgroups) -5.1%. Unlike q4_K there is
+        // no crossover with workgroup count, so this is a plain default rather than an
+        // adaptive rule. 12 (768 work items) is refused by the program cap and narrows.
+        // ggml_cl_build_cok_program narrows for devices that cannot launch 640.
+        const int q40_cok_nsg_req = q40_cok_nsg_env ? atoi(q40_cok_nsg_env) : 10;
+        cl_program prog = ggml_cl_build_cok_program(backend_ctx, kernel_src_CL_gemm.c_str(),
+                                                    compile_opts, q40_cok_nsg_req, &backend_ctx->q40_cok_nsg_eff);
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_0_f32 = clCreateKernel(prog, "kernel_gemm_noshuffle_q4_0_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_0_f32_cok = clCreateKernel(prog, "kernel_gemm_noshuffle_q4_0_f32_cok", &err), err));
         // 4-rows-per-lane variant. Not fatal: falls back to the 1-row kernel.
@@ -4997,7 +5504,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #else
         const std::string kernel_src = read_file("gemm_noshuffle_q4_1_f32.cl");
 #endif
-        cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        cl_program prog = ggml_cl_build_cok_program(backend_ctx, kernel_src.c_str(), compile_opts, 8,
+                                                    &backend_ctx->q41_cok_nsg_eff);
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_1_f32 = clCreateKernel(prog, "kernel_gemm_noshuffle_q4_1_f32", &err), err));
         // Non-fatal: a compiler that rejects these must fall back, not abort. The q6_K r4
         // kernel once failed to build on Adreno 850 and took its whole program down with it.
@@ -5244,7 +5752,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #else
         const std::string kernel_src = read_file("gemm_noshuffle_q8_0_f32.cl");
 #endif
-        cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        cl_program prog = ggml_cl_build_cok_program(backend_ctx, kernel_src.c_str(), compile_opts, 8,
+                                                    &backend_ctx->q80_cok_nsg_eff, "Q80_COK_NSG");
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q8_0_f32 = clCreateKernel(prog, "kernel_gemm_noshuffle_q8_0_f32", &err), err));
         // Cooperative-K twin for the verify band. Non-fatal: without it ne1 2..8 keeps
         // falling to the prefill GEMM, which is what shipped until now.
@@ -5314,8 +5823,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         static const char * q4k_cok_nsg_env = getenv("GGML_OPENCL_Q4K_COK_NSG");
         const int q4k_cok_nsg = q4k_cok_nsg_env ? atoi(q4k_cok_nsg_env) : 8;
         backend_ctx->q4k_cok_nsg = q4k_cok_nsg;
-        std::string q4k_opts = compile_opts + " -DCOK_NSG=" + std::to_string(q4k_cok_nsg);
-        cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), q4k_opts);
+        cl_program prog = ggml_cl_build_cok_program(backend_ctx, kernel_src.c_str(), compile_opts,
+                                                    q4k_cok_nsg, &backend_ctx->q4k_cok_nsg);
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_k_f32 = clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_k_f32_r1 = clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_f32_r1", &err), err));
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_k_f32_kimg = clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_f32_kimg", &err), err));
@@ -5401,6 +5910,12 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
+
+    // gemm_cok_q4_k_q8_1_dp4a (cok-shaped narrow GEMM, dp4a inner dot; ne1 = 2..8)
+    //
+    // Built only when asked for. It is an experiment against the default cok dispatch,
+    // and an unconditional build would cost a program compile at init on every device
+    // that will never dispatch it.
 
     // gemm_noshuffle_q4_k_q8_1_dp4a (dp4a dense prefill GEMM)
     if (backend_ctx->has_integer_dot_product) {
@@ -6241,6 +6756,24 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         GGML_LOG_CONT(".");
     }
 
+    // gemm_moe_mxfp4_q8_1_dp4a_bin (dp4a prefill GEMM)
+    if (backend_ctx->has_integer_dot_product) {
+        size_t bin_size = 0;
+        backend_ctx->kernel_gemm_moe_mxfp4_q8_1_dp4a_bin = nullptr;
+
+        if (use_adreno_bin_kernels(backend_ctx)) {
+            const char * kernel_bin = (const char *)backend_ctx->get_adreno_bin_kernel("gemm_moe_mxfp4_q8_1_dp4a_ila", &bin_size);
+            if (kernel_bin && bin_size > 0) {
+                cl_program prog =
+                    build_program_from_binary(backend_ctx->context, backend_ctx->device, kernel_bin, CL_moe_compile_opts, bin_size);
+
+                CL_CHECK((backend_ctx->kernel_gemm_moe_mxfp4_q8_1_dp4a_bin = clCreateKernel(prog, "kernel_gemm_moe_mxfp4_q8_1_dp4a_ila", &err), err));
+                CL_CHECK(clReleaseProgram(prog));
+                GGML_LOG_CONT(".");
+            }
+        }
+    }
+
     // gemm_moe_q4_0_q8_1_dp4a (dp4a prefill GEMM)
     if (backend_ctx->has_integer_dot_product) {
 #ifdef GGML_OPENCL_EMBED_KERNELS
@@ -6257,6 +6790,25 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
+
+    // gemm_moe_q4_0_q8_1_dp4a_bin (dp4a prefill GEMM)
+    if (backend_ctx->has_integer_dot_product) {
+        size_t bin_size = 0;
+        backend_ctx->kernel_gemm_moe_q4_0_q8_1_dp4a_bin = nullptr;
+
+        if (use_adreno_bin_kernels(backend_ctx)) {
+            const char * kernel_bin = (const char *)backend_ctx->get_adreno_bin_kernel("gemm_moe_q4_0_q8_1_dp4a_ila", &bin_size);
+            if (kernel_bin && bin_size > 0) {
+                cl_program prog =
+                    build_program_from_binary(backend_ctx->context, backend_ctx->device, kernel_bin, CL_moe_compile_opts, bin_size);
+
+                CL_CHECK((backend_ctx->kernel_gemm_moe_q4_0_q8_1_dp4a_bin = clCreateKernel(prog, "kernel_gemm_moe_q4_0_q8_1_dp4a_ila", &err), err));
+                CL_CHECK(clReleaseProgram(prog));
+                GGML_LOG_CONT(".");
+            }
+        }
+    }
+
 
     // gemm_moe_q8_1_dp4a (generic dp4a MoE GEMM; MOE_QT=80 -> q8_0 expert variant, opt-in)
     if (backend_ctx->has_integer_dot_product) {
@@ -6636,8 +7188,14 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #else
         const std::string kernel_src = read_file("gemm_noshuffle_q6_k_f32.cl");
 #endif
-        cl_program prog =
-            build_program_from_source(backend_ctx, kernel_src.c_str(), CL_moe_compile_opts);
+        // COK_NSG sets workgroup size (64 x NSG), reduction depth and LDS together. The
+        // q4_K twin of this knob measured -16..19% at 6 rather than 8 on shapes launching
+        // more than one workgroup per compute unit; q6_K is unswept, so expose it.
+        static const char * q6k_cok_nsg_env = getenv("GGML_OPENCL_Q6K_COK_NSG");
+        const int q6k_cok_nsg_req = q6k_cok_nsg_env ? atoi(q6k_cok_nsg_env) : 8;
+        cl_program prog = ggml_cl_build_cok_program(backend_ctx, kernel_src.c_str(),
+                                                    CL_moe_compile_opts, q6k_cok_nsg_req,
+                                                    &backend_ctx->q6k_cok_nsg_eff);
 
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q6_K_f32 = clCreateKernel(prog, "kernel_gemm_noshuffle_q6_K_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q6_K_f32_cok = clCreateKernel(prog, "kernel_gemm_noshuffle_q6_K_f32_cok", &err), err));
@@ -6681,7 +7239,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #else
         const std::string kernel_src = read_file("gemm_noshuffle_q5_k_f32.cl");
 #endif
-        cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        cl_program prog = ggml_cl_build_cok_program(backend_ctx, kernel_src.c_str(), compile_opts, 8,
+                                                    &backend_ctx->q5k_cok_nsg_eff);
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q5_k_f32 = clCreateKernel(prog, "kernel_gemm_noshuffle_q5_k_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q5_k_f32_cok = clCreateKernel(prog, "kernel_gemm_noshuffle_q5_k_f32_cok", &err), err));
         // Non-fatal: a compiler that rejects r4 must fall back to the 1-row kernel, not abort.
@@ -9217,6 +9776,16 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
         (backend_ctx->adreno_cl_compiler_version.type == E031 && backend_ctx->adreno_cl_compiler_version.major >= 47) ||
         (backend_ctx->adreno_cl_compiler_version.type == DX   && backend_ctx->adreno_cl_compiler_version.major >= 17);
 
+    // The q6_K flat mul_mat miscompile is a defect of the older E031 compilers, not a
+    // property of any GPU generation: it reproduces on E031.38 (Adreno 642L) and E031.41
+    // (Adreno 740) and is fixed by E031.45 (Adreno 619). Gate on the compiler so parts
+    // that do not need the workarounds do not pay for them. The explicit type check is
+    // required: newer_than_or_same() is false for every non-E031 compiler, so negating it
+    // alone would enable the workarounds on E17/DX.
+    backend_ctx->q6_k_flat_old_compiler =
+        backend_ctx->adreno_cl_compiler_version.type == E031 &&
+        !backend_ctx->adreno_cl_compiler_version.newer_than_or_same(E031, 45, 0, 0);
+
     size_t ext_str_size;
     clGetDeviceInfo(device, CL_DEVICE_EXTENSIONS, 0, NULL, &ext_str_size);
     char *ext_buffer = (char *)alloca(ext_str_size + 1);
@@ -10331,6 +10900,13 @@ static bool ggml_opencl_should_fuse_rope_set_rows(const ggml_tensor * rope,
     }
     const int mode = ((const int32_t *) rope->op_params)[2];
     if (mode != GGML_ROPE_TYPE_NORMAL && mode != GGML_ROPE_TYPE_NEOX) {
+        return false;
+    }
+    // ggml_rope_set_offset (op_params[15]) rotates a sub-range of the row. The fused
+    // rope+set_rows kernels predate it and have no n_offs argument, so they would apply
+    // the full-row rotation and silently drop the offset. supports_op used to reject
+    // every offset rope outright; since it stopped doing that the decline belongs here.
+    if (((const int32_t *) rope->op_params)[15] != 0) {
         return false;
     }
     return true;
@@ -11491,6 +12067,14 @@ static bool ggml_opencl_can_fuse(const ggml_backend_opencl_context * backend_ctx
             return false;
         }
 
+        // ggml_rope_set_offset (op_params[15]) rotates a sub-range of the row. The
+        // fused rms+rope kernels predate it and take no n_offs argument, so they would
+        // rotate the whole row and silently drop the offset. supports_op used to reject
+        // every offset rope outright; since it stopped doing that the decline is here.
+        if (((const int32_t *) rope->op_params)[15] != 0) {
+            return false;
+        }
+
         // the reduction runs one 64-wide subgroup per row
         if (rms_norm->src[0]->ne[0] % 4 != 0 || rms_norm->src[0]->ne[0] < 64) {
             return false;
@@ -12409,6 +12993,48 @@ inline bool use_adreno_kernels(const ggml_backend_opencl_context *backend_ctx, c
     return threashold_ok;
 }
 
+// Is this shape one the narrow cok+dp4a GEMMs (q4_K / q6_K / q4_0) will serve?
+//
+// DEFAULT ON; opt out with GGML_OPENCL_COK_DP4A=0.
+//
+// Matmul level (Adreno X2-90, llama-bench, A/B/A):
+//   Qwen3.8-27B-Q4_0   pp2 +10.6%  pp3 +10.3%  pp4 +10.2%  pp8 unchanged
+//   muse-glimmer-30B   pp2  +3.1%  pp3  +4.4%  pp4  +4.1%  pp8 unchanged
+//
+// End to end it is worth +8.2% t/s on Qwen3.8-27B-Q4_0 with a DFlash2 drafter (11.67/11.63/
+// 11.64 against 12.62, A/A bracket 0.3%, faster on every prompt, acceptance identical at
+// 77.2 against 77.3%), and NOTHING on muse with a DFlash drafter -- where it is also not a
+// regression (12.75 against a 12.71 control mean, inside a 1.9% A/A bracket).
+//
+// COVERAGE EXPLAINS BOTH, because the two speculative schemes verify at different widths:
+//   Qwen DFlash2   96.2% of matmuls at ne1=4, 98.0% in 2..4  ->  +8.2%
+//   muse DFlash    80.6% at ne1 5..8, only 15.6% in 2..4     ->  nothing
+// 5..8 is where dp4a structurally loses: a half8 FMA issues 32 ops per row per 32-K block,
+// eight columns wide whatever ne1 is, while dp4a issues 8C. So this serves the band DFlash2
+// uses and not the one DFlash uses.
+//
+// ne1 2..4 and no wider, for that same reason -- the crossover is the instruction set, not a
+// tuning constant.
+//
+// DECLINED on two unrelated compilers needing two different tests: A7X and older (E031.41)
+// by capability level, and the 850's E17 by compiler class -- the 850 is classed A8X, a
+// NEWER level, so the level test alone lets it straight through. Both miscompile this kernel
+// family; see the callers for the failing shapes.
+static bool ggml_cl_cok_dp4a_narrow_on(const ggml_backend_opencl_context * backend_ctx,
+                                       int64_t ne1, int64_t ne01, int64_t ne00, int rows) {
+    static const char * const e = getenv("GGML_OPENCL_COK_DP4A");
+    if (e && *e && atoi(e) == 0) {
+        return false;
+    }
+    return backend_ctx->has_integer_dot_product
+        && !(backend_ctx->gpu_family == GPU_FAMILY::ADRENO
+             && backend_ctx->gen_level <= GEN_LEVEL_A7X)
+        && !adreno_art_compiler_quirks(backend_ctx)
+        && ne1 >= 2 && ne1 <= 4
+        && rows > 0 && (ne01 % (64 * rows)) == 0
+        && (ne00 % 32) == 0;
+}
+
 static bool adreno_art_compiler_quirks(const ggml_backend_opencl_context *backend_ctx) {
     if (!backend_ctx || backend_ctx->gpu_family != GPU_FAMILY::ADRENO ||
         backend_ctx->adreno_cl_compiler_version.type != ADRENO_CL_COMPILER_TYPE::E17) {
@@ -12653,6 +13279,67 @@ static inline bool use_flat_gemv_for_large_m_q6_K(const ggml_backend_opencl_cont
     return tensor->ne[1] >= 32768
         && (tensor->ne[0] >= 2048 || (backend_ctx->adreno_gen != ADRENO_GPU_GEN::A7X && ggml_nbytes(tensor) >= (256ull << 20)))
         && tensor->ne[2] == 1 && tensor->ne[3] == 1;
+}
+
+// TOP_K plan. ncand = ntiles*k has to fit the workgroup the stage-2 argsort can
+// actually launch, so the tile widens with k rather than being a constant (the
+// CUDA reference fixes 4096/8192, which does not survive a 512-item cap).
+// Returns false when no variant fits; the op then stays on the CPU.
+struct ggml_cl_top_k_plan {
+    cl_kernel tile_kernel = nullptr;
+    int items_per_lane    = 0;
+    int block             = 0;
+    int ntiles            = 0;
+    int ncand             = 0;
+};
+
+static bool ggml_cl_top_k_plan_for(ggml_backend_opencl_context * backend_ctx,
+                                   int ncols, int k, ggml_cl_top_k_plan * out) {
+    if (backend_ctx->kernel_top_k_unmap == nullptr) {
+        return false;
+    }
+    // Widest row the stage-2 argsort can rank in one workgroup.
+    const int sort_cap = (int)backend_ctx->get_kernel_workgroup_size(backend_ctx->kernel_argsort_f32_i32);
+    if (sort_cap <= 0) {
+        return false;
+    }
+
+    const std::pair<cl_kernel, int> variants[2] = {
+        { backend_ctx->kernel_top_k_tile_16, 16 },
+        { backend_ctx->kernel_top_k_tile_32, 32 },
+    };
+
+    for (const auto & v : variants) {
+        if (v.first == nullptr) {
+            continue;
+        }
+        int block = (int)backend_ctx->get_kernel_workgroup_size(v.first);
+        if (block <= 0) {
+            continue;
+        }
+        // Power of two: the stage-1 reduction halves the workgroup.
+        int b = 1;
+        while (b * 2 <= block && b < 256) { b *= 2; }
+        block = b;
+
+        const long tile_w = (long)block * v.second;
+        const int  ntiles = (int)((ncols + tile_w - 1) / tile_w);
+        const long ncand  = (long)ntiles * k;
+
+        // Stage 2 pads to a power of two, so that is what has to fit.
+        long padded = 1;
+        while (padded < ncand) { padded *= 2; }
+        if (padded > sort_cap) {
+            continue;
+        }
+        out->tile_kernel    = v.first;
+        out->items_per_lane = v.second;
+        out->block          = block;
+        out->ntiles         = ntiles;
+        out->ncand          = (int)ncand;
+        return true;
+    }
+    return false;
 }
 
 static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
@@ -13179,9 +13866,6 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
         case GGML_OP_DIAG_MASK_INF:
             return op->ne[3] == 1;
         case GGML_OP_ROPE: {
-            if (((const int32_t *) op->op_params)[15] != 0) {
-                return false; // FIXME: support ggml_rope_set_offset
-            }
             const int mode = ((const int32_t *) op->op_params)[2];
             const bool is_mrope = mode & GGML_ROPE_TYPE_MROPE;
             const bool is_vision = mode == GGML_ROPE_TYPE_VISION;
@@ -13205,6 +13889,29 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
             return op->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]);
         case GGML_OP_IM2COL:
             return true;
+        case GGML_OP_TOP_K: {
+            if (op->src[0]->type != GGML_TYPE_F32 || op->type != GGML_TYPE_I32) {
+                return false;
+            }
+            if (!ggml_is_contiguous(op->src[0])) {
+                return false;
+            }
+            load_cl_kernels_argsort(backend_ctx);   // stage 2 reuses it
+            load_cl_kernels_top_k(backend_ctx);
+
+            const int ncols = (int)op->src[0]->ne[0];
+            const int k     = (int)op->ne[0];
+
+            // Narrow rows: rank the whole row with the argsort alone.
+            int padded = 1;
+            while (padded < ncols) { padded *= 2; }
+            if (padded <= (int)backend_ctx->get_kernel_workgroup_size(backend_ctx->kernel_argsort_f32_i32)) {
+                return true;
+            }
+
+            ggml_cl_top_k_plan plan;
+            return ggml_cl_top_k_plan_for(backend_ctx, ncols, k, &plan);
+        }
         case GGML_OP_ARGSORT: {
             load_cl_kernels_argsort(backend_ctx);
 
@@ -13267,12 +13974,28 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                                      v->type == GGML_TYPE_F16 && op->type == GGML_TYPE_F16;
             const bool is_f32_f16  = q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16 &&
                                      v->type == GGML_TYPE_F16 && op->type == GGML_TYPE_F32;
+
             const bool is_f32_q8_0 = q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_Q8_0 &&
                                      v->type == GGML_TYPE_Q8_0 && op->type == GGML_TYPE_F32 &&
                                      dk % 32 == 0 && dv % 32 == 0;
             const bool is_f32_q4_0 = q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_Q4_0 &&
                                      v->type == GGML_TYPE_Q4_0 && op->type == GGML_TYPE_F32 &&
                                      dk % 32 == 0 && dv % 32 == 0;
+
+            // A7X (Adreno 740, compiler E031.41) SIGSEGVs inside clBuildProgram
+            // building the flash_attn programs whose KV path is mixed-type or
+            // dequantized — f32_f16, q8_0, q4_0 (reproduced at DK=40 and DK=64; it
+            // is DK-independent). It is a driver crash, not codegen-wrong-output, so
+            // it cannot be caught in-process (fatal=false only handles clean compile
+            // errors). The uniform f16_f16 / f32_f32 programs compile fine on this
+            // compiler, so decline only the KV-convert variants; ggml then runs
+            // those (f16-KV / quant-KV) attention layers on the CPU backend.
+            // Negative compiler carve-out, same idiom as the Intel DK=512 decline
+            // below and the X1E driver-quirk guards.
+            if (backend_ctx && backend_ctx->adreno_gen == ADRENO_GPU_GEN::A7X &&
+                (is_f32_f16 || is_f32_q8_0 || is_f32_q4_0)) {
+                return false;
+            }
 
             // Asymmetric KV: host-dequants both sides to F32, uses f32 kernel.
             auto is_kv_type_ok = [](ggml_type t) {
@@ -25367,7 +26090,14 @@ static void ggml_cl_mul_mat_q4_0_f32_adreno(ggml_backend_t backend, const ggml_t
     static const char * q40_mc3_maxn_env = getenv("GGML_OPENCL_Q40_MC3_MAXN");
     const int q40_mc3_maxn = q40_mc3_maxn_env ? MIN(atoi(q40_mc3_maxn_env), 4)
                                              : (q40_cok_r4_would_run ? 2 : 4);
-    const bool use_q40_mc3 = q40_mc3 && (ne1 >= 2 && ne1 <= q40_mc3_maxn) && (ne01 < 32768);
+    // Same yield as the q4_K path: the narrow cok+dp4a GEMM is downstream of this branch.
+    const bool q40_cok_dp4a_takes_it =
+        ggml_cl_cok_dp4a_narrow_on(backend_ctx, ne1, ne01, ne00, backend_ctx->q40_cok_dp4a_rows)
+        && ggml_cl_cok_have_q40(backend_ctx)
+        && ((ne1 <= 2) ? backend_ctx->kernel_gemm_cok_q4_0_q8_1_dp4a_c2
+                       : backend_ctx->kernel_gemm_cok_q4_0_q8_1_dp4a) != nullptr;
+    const bool use_q40_mc3 = q40_mc3 && !q40_cok_dp4a_takes_it
+                          && (ne1 >= 2 && ne1 <= q40_mc3_maxn) && (ne01 < 32768);
 
     if (ne1 == 1 || use_q40_mc3) {
         cl_mem q_img = nullptr;
@@ -25671,6 +26401,84 @@ static void ggml_cl_mul_mat_q4_0_f32_adreno(ggml_backend_t backend, const ggml_t
         //     pp512  96.00 -> 92.28 (dp4a) -> 105.57            -> 110.43
         // i.e. +26.4% and +15.0% against the previous default. Now follows the same
         // per-device gate as the q4_K / q6_K / q8_0 dense dp4a paths.
+        // q4_0 cok+dp4a for the narrow band (ne1 = 2..4), third of the family.
+        //
+        // Same sizing and the same two declines as the q4_K and q6_K twins: A7X and older
+        // (E031.41) and the 850's E17 compiler both miscompile this kernel family, and the
+        // 850 is classed A8X so the capability-level test alone does not catch it.
+        //
+        // q4_0 is the simplest of the three: (q - 8) * d with one scale per 32-K block and
+        // no min, so no sum_act correction and a single dot flush per block.
+
+        if (ggml_cl_cok_dp4a_narrow_on(backend_ctx, ne1, ne01, ne00, backend_ctx->q40_cok_dp4a_rows)
+            && ggml_cl_cok_have_q40(backend_ctx)
+            && ((ne1 <= 2) ? backend_ctx->kernel_gemm_cok_q4_0_q8_1_dp4a_c2
+                           : backend_ctx->kernel_gemm_cok_q4_0_q8_1_dp4a) != nullptr) {
+            const int N40 = (int)ne1, K40 = (int)ne00;
+            const int w40 = (N40 <= 2) ? 2 : 4;
+
+            cl_mem a_sub40 = nullptr;
+            region.origin = offset1;
+            region.size   = (size_t)K40 * N40 * sizeof(float);
+            CL_CHECK((a_sub40 = clCreateSubBuffer(extra1->data_device, 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &err), err));
+
+            // Allocated at the KERNEL's width so no column index is clamped -- clamping made
+            // several lanes load the same address and cost 20% at one width.
+            const size_t nb40  = (size_t)w40 * (K40 / 32);
+            const size_t qa40  = (size_t)w40 * K40 * sizeof(cl_char);
+            const size_t was40 = backend_ctx->prealloc_moe_qa.size;
+            const size_t wasd40 = backend_ctx->prealloc_moe_da.size;
+            backend_ctx->prealloc_moe_qa.allocate(context, qa40);
+            backend_ctx->prealloc_moe_da.allocate(context, nb40 * sizeof(cl_half));
+            backend_ctx->prealloc_moe_sa.allocate(context, nb40 * sizeof(cl_half));
+            if (backend_ctx->prealloc_moe_qa.size != was40) {
+                const cl_char z8 = 0;
+                CL_CHECK(clEnqueueFillBuffer(backend_ctx->queue, backend_ctx->prealloc_moe_qa.buffer,
+                                             &z8, sizeof(z8), 0, backend_ctx->prealloc_moe_qa.size, 0, NULL, NULL));
+            }
+            if (backend_ctx->prealloc_moe_da.size != wasd40) {
+                const cl_half z16 = 0;
+                CL_CHECK(clEnqueueFillBuffer(backend_ctx->queue, backend_ctx->prealloc_moe_da.buffer,
+                                             &z16, sizeof(z16), 0, backend_ctx->prealloc_moe_da.size, 0, NULL, NULL));
+                CL_CHECK(clEnqueueFillBuffer(backend_ctx->queue, backend_ctx->prealloc_moe_sa.buffer,
+                                             &z16, sizeof(z16), 0, backend_ctx->prealloc_moe_sa.size, 0, NULL, NULL));
+            }
+
+            cl_int tbq40 = (cl_int)((size_t)N40 * (K40 / 32));
+            cl_kernel qk40 = backend_ctx->kernel_quant_a_q8_1;
+            CL_CHECK(clSetKernelArg(qk40, 0, sizeof(cl_mem), &a_sub40));
+            CL_CHECK(clSetKernelArg(qk40, 1, sizeof(cl_mem), &backend_ctx->prealloc_moe_qa.buffer));
+            CL_CHECK(clSetKernelArg(qk40, 2, sizeof(cl_mem), &backend_ctx->prealloc_moe_da.buffer));
+            CL_CHECK(clSetKernelArg(qk40, 3, sizeof(cl_mem), &backend_ctx->prealloc_moe_sa.buffer));
+            CL_CHECK(clSetKernelArg(qk40, 4, sizeof(cl_int), &tbq40));
+            size_t q40_local[1]  = { 64 };
+            size_t q40_global[1] = { (size_t)((((size_t)tbq40 + 63) / 64) * 64) };
+            backend_ctx->enqueue_ndrange_kernel(qk40, 1, q40_global, q40_local, dst);
+
+            cl_kernel ck40 = (N40 <= 2) ? backend_ctx->kernel_gemm_cok_q4_0_q8_1_dp4a_c2
+                                        : backend_ctx->kernel_gemm_cok_q4_0_q8_1_dp4a;
+            const cl_int clamp40 = w40;
+            CL_CHECK(clSetKernelArg(ck40, 0, sizeof(cl_mem),   &extra0_q4_0->q));
+            CL_CHECK(clSetKernelArg(ck40, 1, sizeof(cl_mem),   &extra0_q4_0->d));
+            CL_CHECK(clSetKernelArg(ck40, 2, sizeof(cl_mem),   &backend_ctx->prealloc_moe_qa.buffer));
+            CL_CHECK(clSetKernelArg(ck40, 3, sizeof(cl_mem),   &backend_ctx->prealloc_moe_da.buffer));
+            CL_CHECK(clSetKernelArg(ck40, 4, sizeof(cl_mem),   &extrad->data_device));
+            CL_CHECK(clSetKernelArg(ck40, 5, sizeof(cl_ulong), &offsetd));
+            CL_CHECK(clSetKernelArg(ck40, 6, sizeof(cl_int),   &ne01));
+            CL_CHECK(clSetKernelArg(ck40, 7, sizeof(cl_int),   &clamp40));
+            CL_CHECK(clSetKernelArg(ck40, 8, sizeof(cl_int),   &ne00));
+            CL_CHECK(clSetKernelArg(ck40, 9, sizeof(cl_int),   &ne1));
+
+            const size_t nsg40d = (size_t)((N40 <= 2) ? backend_ctx->q40_cok_dp4a_nsg_c2
+                                                      : backend_ctx->q40_cok_dp4a_nsg);
+            size_t c40_local[3]  = { 64, nsg40d, 1 };
+            size_t c40_global[3] = { (size_t)(ne01 / backend_ctx->q40_cok_dp4a_rows), nsg40d, 1 };
+            backend_ctx->enqueue_ndrange_kernel(ck40, 3, c40_global, c40_local, dst);
+
+            CL_CHECK(clReleaseMemObject(a_sub40));
+            return;
+        }
+
         static const char * q4_0_dense_dp4a_env = getenv("GGML_OPENCL_Q4_0_DENSE_DP4A");
         bool q4_0_dense_dp4a_on = q4_0_dense_dp4a_env
             ? (atoi(q4_0_dense_dp4a_env) != 0)
@@ -25942,10 +26750,13 @@ static void ggml_cl_mul_mat_q4_0_f32_adreno(ggml_backend_t backend, const ggml_t
             // across the COK_NSG subgroups.
             // The r4 variant gives each lane 4 rows, so the row axis shrinks 4x.
             global_work_size[0] = use_q40_cok_r4 ? (size_t)(ne01 / 4) : (size_t)ne01;
-            global_work_size[1] = (size_t)(8 * cok_ksplit);   // COK_NSG x K slices
+            // COK_NSG x K slices. The 8 was the value the program was built with before
+            // GGML_OPENCL_Q40_COK_NSG made it configurable; take it from the build so the
+            // launch cannot disagree with the compiled K stride.
+            global_work_size[1] = (size_t)(backend_ctx->q40_cok_nsg_eff * cok_ksplit);
             global_work_size[2] = 1;
             local_work_size[0]  = 64;             // COK_SG
-            local_work_size[1]  = 8;              // COK_NSG
+            local_work_size[1]  = (size_t)backend_ctx->q40_cok_nsg_eff;   // COK_NSG
             local_work_size[2]  = 1;
         } else if (ne0 == 4096 && ne1 == 128 && ne10 == 4096) {
             local_work_size[0] = 1;
@@ -26243,10 +27054,13 @@ static void ggml_cl_mul_mat_q4_1_f32_adreno(ggml_backend_t backend, const ggml_t
             // COK_NSG subgroups. The r4 variant gives each lane 4 rows, so the row axis
             // shrinks 4x, and ksplit spreads the K split across workgroups as well.
             global_work_size[0] = use_q41_cok_r4 ? (size_t)(ne01 / 4) : (size_t)ne01;
-            global_work_size[1] = (size_t)(8 * q41_ksplit);   // COK_NSG x K slices
+            // Take COK_NSG from the build: ggml_cl_build_cok_program narrows it against
+            // CL_KERNEL_WORK_GROUP_SIZE, so a device that cannot launch 64x8 compiles a
+            // different K stride than a hardcoded 8 would launch.
+            global_work_size[1] = (size_t)(backend_ctx->q41_cok_nsg_eff * q41_ksplit);
             global_work_size[2] = 1;
             local_work_size[0]  = 64;             // COK_SG
-            local_work_size[1]  = 8;              // COK_NSG
+            local_work_size[1]  = (size_t)backend_ctx->q41_cok_nsg_eff;   // COK_NSG
             local_work_size[2]  = 1;
         }
 
@@ -27482,7 +28296,7 @@ static void ggml_cl_mul_mat_q8_0_f32_adreno(ggml_backend_t backend, const ggml_t
             global_work_size[1] = Q80_COK_NSG_HOST;
             global_work_size[2] = 1;
             local_work_size[0]  = 64;
-            local_work_size[1]  = Q80_COK_NSG_HOST;
+            local_work_size[1]  = (size_t)backend_ctx->q80_cok_nsg_eff;
             local_work_size[2]  = 1;
         }
 
@@ -27580,7 +28394,16 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
     static const char * q4k_mc3_maxn_env = getenv("GGML_OPENCL_Q4K_MC3_MAXN");
     const int q4k_mc3_maxn = q4k_mc3_maxn_env ? MIN(atoi(q4k_mc3_maxn_env), 4)
                                               : (cok_r4_would_run ? 2 : 4);
-    const bool use_mc3 = q4k_mc3 && (ne1 >= 2 && ne1 <= q4k_mc3_maxn) && (ne01 < 32768);
+    // The narrow cok+dp4a GEMM sits in the ELSE of the branch below, so mc3 would intercept
+    // ne1 2..4 and return before it ever ran. Yield: the A/B that measured the dp4a win used
+    // the default (mc3 on) as its control, so this is the comparison that was made.
+    const bool cok_dp4a_takes_it =
+        ggml_cl_cok_dp4a_narrow_on(backend_ctx, ne1, ne01, ne00, backend_ctx->q4k_cok_dp4a_rows)
+        && ggml_cl_cok_have_q4k(backend_ctx)
+        && ((ne1 <= 2) ? backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a_c2
+                       : backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a_c4) != nullptr;
+    const bool use_mc3 = q4k_mc3 && !cok_dp4a_takes_it
+                      && (ne1 >= 2 && ne1 <= q4k_mc3_maxn) && (ne01 < 32768);
 
     if (ne1 == 1 || use_mc3) {
         cl_mem q_img = nullptr;
@@ -27825,6 +28648,160 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
             size_t dlocal[3]  = {64, 4, 1};
             size_t dglobal[3] = {(size_t)CEIL_DIV(ne01, WROWS_D) * 64, 4, (size_t)CEIL_DIV(ne1, BN_DP)};
             backend_ctx->enqueue_ndrange_kernel(dk, 3, dglobal, dlocal, dst);
+
+            CL_CHECK(clReleaseMemObject(b_sub_buf));
+            return;
+        }
+
+        // cok-shaped dp4a GEMM for the narrow band (opt-in: GGML_OPENCL_Q4K_COK_DP4A).
+        //
+        // ne1 = 2..8 runs the f16 cok kernel today. The dp4a prefill GEMM loses there,
+        // but that kernel amortises its weight read and scale unpack across a
+        // TILESIZE_N-wide tile, so narrowing it to 8 makes the amortisation four times
+        // worse -- it tests a wide kernel narrowed, not whether int8 helps at narrow
+        // batch. This arm keeps cok's shape (4-row fold, K-split) and changes only the
+        // inner product, so it pays for the q8_1 activation pre-pass cok avoids
+        // entirely. Whether that pre-pass eats the 1.67x arithmetic advantage is the
+        // whole question; see feature-report/cok-dp4a-scope-2026-08-30.md.
+
+        // Upper end of the band. 4 by default: ne1 5..8 goes through the 8-column
+        // build, which is not yet competitive. Adjustable so that half can be swept
+        // without a rebuild.
+        static const char * q4k_cok_maxn_env = getenv("GGML_OPENCL_Q4K_COK_DP4A_MAXN");
+        static const int q4k_cok_dp4a_maxn = q4k_cok_maxn_env ? atoi(q4k_cok_maxn_env) : 4;
+        // Declined on TWO unrelated compilers, and they need two different tests.
+        //
+        //  - A7X and older (E031.41): an Adreno 740 fails MUL_MAT q4_K at m=512 n=2 and n=4
+        //    with the arm on and passes with it off (14 -> 16 failures).
+        //  - The 850's E17 / art.api37 compiler: ERR = 181.7 on q4_K m=512 n=4, then the
+        //    suite stalls on that shape. The 850 is classed A8X -- a NEWER level than A7X --
+        //    so a level-only gate lets it straight through. Gate the compiler when the defect
+        //    is the compiler; this is the same pairing the Q2_K/Q3_K plane GEMMs already use.
+        //
+        // An Adreno 840 and an X2-90 run the identical binary and shapes clean.
+        if (ggml_cl_cok_dp4a_narrow_on(backend_ctx, ne1, ne01, ne00, backend_ctx->q4k_cok_dp4a_rows)
+            && ggml_cl_cok_have_q4k(backend_ctx)
+            && ne1 <= q4k_cok_dp4a_maxn
+            && ((ne1 <= 2) ? backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a_c2
+                           : backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a_c4) != nullptr) {
+            // ne1 2..4. Measured against the default dispatch (test-backend-ops perf,
+            // m=4096 k=14336): 325/351/357 us against 341/366/368, so +4.7/+4.1/+3.0%.
+            //
+            // The width no longer has to match the batch exactly. It did while the surplus
+            // columns were clamped to the last real one -- that made several lanes load the
+            // same address and cost 483/443/353 us at ne1 2/3/4 for identical work. With the
+            // activation over-allocated so every column reads a distinct address the
+            // dependence on ne1 largely goes away.
+            //
+            // ne1 5..8 stays on cok: the 8-column build needs COK_NSG 8 to be competitive
+            // and deadlocks there, and at 4 it runs 692/576 us against a 370/374 control.
+            // ne01 % 256, not % 4: one lane covers 4 rows and the workgroup is 64
+            // lanes wide, so the row axis must divide evenly. Padding the global size
+            // instead would create lanes with row0 >= ne01, and the kernel guards the
+            // column at the store but not the row -- they would write out of bounds.
+            // An early return cannot rescue that either: the kernel has barriers.
+            // The kernel reads a fixed 8 columns per lane and clamps any column past
+            // ne1 to the last real one, so the activation buffers only need to hold the
+            // real columns -- no pad, and no buffer fill to zero it. That matters
+            // beyond tidiness: while a recordable queue is capturing, only NDRange
+            // enqueues are legal, so a clEnqueueFillBuffer here would be unordered
+            // against the kernels around it or rejected outright.
+            // Over-allocate the activation to the kernel's column width so every column
+            // reads a DISTINCT address. Clamping the surplus columns to the last real one
+            // makes several lanes load the same address, and that was the whole narrow-width
+            // penalty: the 4-column build cost 483/443/353 us at ne1 2/3/4 for identical
+            // work clamped, and 325/351/357 with distinct addresses -- ne1=3 alone moves
+            // 443 -> 351, from a 20% loss to a 4% win.
+            //
+            // The pre-pass only writes the real columns, so the pad has to be zeroed or the
+            // kernel folds stale bytes into lanes it discards. That is harmless for the
+            // result (the columns never reach the store and the accumulator lanes are
+            // independent) but it would make runs non-reproducible, which cannot be A/B'd.
+            // Zero on GROWTH only: the buffers are reused, the pre-pass never writes the
+            // pad, so one fill per size keeps it zero for every later dispatch. Growth is
+            // rare, which also keeps this off the recordable-queue capture path where a
+            // buffer fill would not be legal.
+            const int    cok_w    = (ne1 <= 2) ? 2 : (ne1 <= 4 ? 4 : 8);
+            const size_t qa_bytes = (size_t)cok_w * K * sizeof(cl_char);
+            const size_t nb       = (size_t)cok_w * (K / 32);
+            const size_t qa_was = backend_ctx->prealloc_moe_qa.size;
+            const size_t da_was = backend_ctx->prealloc_moe_da.size;
+            backend_ctx->prealloc_moe_qa.allocate(context, qa_bytes);
+            backend_ctx->prealloc_moe_da.allocate(context, nb * sizeof(cl_half));
+            backend_ctx->prealloc_moe_sa.allocate(context, nb * sizeof(cl_half));
+            if (backend_ctx->prealloc_moe_qa.size != qa_was) {
+                const cl_char z8 = 0;
+                CL_CHECK(clEnqueueFillBuffer(backend_ctx->queue, backend_ctx->prealloc_moe_qa.buffer,
+                                             &z8, sizeof(z8), 0, backend_ctx->prealloc_moe_qa.size, 0, NULL, NULL));
+            }
+            if (backend_ctx->prealloc_moe_da.size != da_was) {
+                const cl_half z16 = 0;
+                CL_CHECK(clEnqueueFillBuffer(backend_ctx->queue, backend_ctx->prealloc_moe_da.buffer,
+                                             &z16, sizeof(z16), 0, backend_ctx->prealloc_moe_da.size, 0, NULL, NULL));
+                CL_CHECK(clEnqueueFillBuffer(backend_ctx->queue, backend_ctx->prealloc_moe_sa.buffer,
+                                             &z16, sizeof(z16), 0, backend_ctx->prealloc_moe_sa.size, 0, NULL, NULL));
+            }
+
+
+            cl_int tbq = (cl_int)((size_t)N * (K / 32));
+            cl_kernel qk = backend_ctx->kernel_quant_a_q8_1;
+            CL_CHECK(clSetKernelArg(qk, 0, sizeof(cl_mem), &b_sub_buf));
+            CL_CHECK(clSetKernelArg(qk, 1, sizeof(cl_mem), &backend_ctx->prealloc_moe_qa.buffer));
+            CL_CHECK(clSetKernelArg(qk, 2, sizeof(cl_mem), &backend_ctx->prealloc_moe_da.buffer));
+            CL_CHECK(clSetKernelArg(qk, 3, sizeof(cl_mem), &backend_ctx->prealloc_moe_sa.buffer));
+            CL_CHECK(clSetKernelArg(qk, 4, sizeof(cl_int), &tbq));
+            size_t q_local[1]  = { 64 };
+            size_t q_global[1] = { (size_t)((((size_t)tbq + 63) / 64) * 64) };
+            backend_ctx->enqueue_ndrange_kernel(qk, 1, q_global, q_local, dst);
+
+            // Pick the column width by the actual batch. An 8-column lane computes 8
+            // columns whatever ne1 is, so ne1<=4 was paying for six discarded columns --
+            // and ne1=2 is where this arm lost worst.
+            // Narrowest build that still covers ne1. A lane computes its full column width
+            // whatever ne1 is, so a wider build than needed is pure discarded work -- and
+            // ne1=2 through a 4-column build was the worst point in the band.
+            cl_kernel ck;
+            int cok_nsg_sel;
+            if (ne1 <= 2 && backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a_c2) {
+                ck = backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a_c2;
+                cok_nsg_sel = backend_ctx->q4k_cok_dp4a_nsg_c2;
+            } else if (ne1 <= 4 && backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a_c4) {
+                ck = backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a_c4;
+                cok_nsg_sel = backend_ctx->q4k_cok_dp4a_nsg_narrow;
+            } else {
+                // Unreachable while the gate stops at ne1 4. Kept because ne1 5..8 becomes
+                // reachable the moment the 8-column build can run at COK_NSG 8, which is
+                // the one thing still blocking the top half of the band.
+                ck = backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a;
+                cok_nsg_sel = backend_ctx->q4k_cok_dp4a_nsg_c8;
+            }
+            CL_CHECK(clSetKernelArg(ck,  0, sizeof(cl_mem),   &extra0_q4_k->q));
+            CL_CHECK(clSetKernelArg(ck,  1, sizeof(cl_mem),   &extra0_q4_k->s));
+            CL_CHECK(clSetKernelArg(ck,  2, sizeof(cl_mem),   &extra0_q4_k->d));
+            CL_CHECK(clSetKernelArg(ck,  3, sizeof(cl_mem),   &extra0_q4_k->dm));
+            CL_CHECK(clSetKernelArg(ck,  4, sizeof(cl_mem),   &backend_ctx->prealloc_moe_qa.buffer));
+            CL_CHECK(clSetKernelArg(ck,  5, sizeof(cl_mem),   &backend_ctx->prealloc_moe_da.buffer));
+            CL_CHECK(clSetKernelArg(ck,  6, sizeof(cl_mem),   &backend_ctx->prealloc_moe_sa.buffer));
+            CL_CHECK(clSetKernelArg(ck,  7, sizeof(cl_mem),   &extrad->data_device));
+            CL_CHECK(clSetKernelArg(ck,  8, sizeof(cl_ulong), &offsetd));
+            CL_CHECK(clSetKernelArg(ck,  9, sizeof(cl_int),   &ne01));
+            // arg 10 is the CLAMP bound (how many columns are readable), arg 12 the
+            // STORE bound. They differ when the activation is over-allocated.
+            const cl_int clamp_n = cok_w;
+            CL_CHECK(clSetKernelArg(ck, 10, sizeof(cl_int),   &clamp_n));
+            CL_CHECK(clSetKernelArg(ck, 11, sizeof(cl_int),   &ne00));
+            CL_CHECK(clSetKernelArg(ck, 12, sizeof(cl_int),   &ne1));
+            CL_CHECK(clSetKernelArg(ck, 13, sizeof(cl_uchar), &mask_d6));
+            CL_CHECK(clSetKernelArg(ck, 14, sizeof(cl_uchar), &mask_d4));
+            CL_CHECK(clSetKernelArg(ck, 15, sizeof(cl_uchar), &mask_hi2));
+
+            // One lane per 4 output rows, COK_NSG subgroups splitting K -- the geometry
+            // cok_r4 uses. COK_NSG is compile-time (it sizes the LDS reduce buffer), so
+            // the dispatch must use the value the program was actually built at.
+            const size_t cok_nsg = (size_t)cok_nsg_sel;
+            size_t c_local[3]  = { 64, cok_nsg, 1 };
+            size_t c_global[3] = { (size_t)(ne01 / backend_ctx->q4k_cok_dp4a_rows), cok_nsg, 1 };
+            backend_ctx->enqueue_ndrange_kernel(ck, 3, c_global, c_local, dst);
 
             CL_CHECK(clReleaseMemObject(b_sub_buf));
             return;
@@ -28368,6 +29345,26 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
                                   && ((q4k_r4_wimg_nr_env == nullptr) || (atoi(q4k_r4_wimg_nr_env) != 0))
                                   && backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr != nullptr;
 
+        // Shape-adaptive K-split. The r4 launch is ne01/4 global over a 64-wide group, so it
+        // produces ne01/256 workgroups. At or below one per compute unit the deep K-split is
+        // what fills the machine; above it the narrower group fits more workgroups per CU and
+        // wins by 16-19% (see ggml_cl_cok_build_q4k_nsg_alt). The threshold is expressed in
+        // compute units so it follows the device rather than one measured constant.
+        // GGML_OPENCL_Q4K_COK_NSG_ALT=0 opts out; _WGPCU scales the threshold.
+        static const char * q4k_nsg_alt_env   = getenv("GGML_OPENCL_Q4K_COK_NSG_ALT");
+        static const char * q4k_nsg_wgpcu_env = getenv("GGML_OPENCL_Q4K_COK_NSG_ALT_WGPCU");
+        const int  q4k_nsg_wgpcu = q4k_nsg_wgpcu_env ? atoi(q4k_nsg_wgpcu_env) : 1;
+        const bool q4k_nsg_alt_on = (q4k_nsg_alt_env == nullptr) || (atoi(q4k_nsg_alt_env) != 0);
+        const size_t q4k_cok_wgs = (size_t)ne01 / 256;
+        // Three arms outrank this one in the chain below and are compiled against the
+        // MAIN program's COK_NSG, so the alt must decline whenever one of them wins --
+        // otherwise the launch geometry would not match the kernel that ran.
+        const bool use_r4_wimg_nr_alt = use_r4_wimg_nr && q4k_nsg_alt_on
+                                      && !use_cok_r8 && !use_r2_wimg_nr
+                                      && backend_ctx->compute_units > 0 && q4k_nsg_wgpcu > 0
+                                      && q4k_cok_wgs > (size_t)backend_ctx->compute_units * (size_t)q4k_nsg_wgpcu
+                                      && ggml_cl_cok_have_q4k_nsg_alt(backend_ctx);
+
         // Which small-batch kernel this shape actually gets. Three A/Bs on this file
         // have been vacuous because the dispatch never reached the kernel under test,
         // so any null result here must be able to show it ran.
@@ -28378,6 +29375,8 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
                 fprintf(stderr, "[Q4K-COK-PROBE] M=%d N=%d K=%d -> %s (r4_sv_built=%d)\n",
                         M, N, ne00,
                         use_cok_r8 ? "cok_r8" : use_r2_wimg_nr ? "cok_r2_wimg_nr"
+                        : use_r4_wimg_nr_alt ? "cok_r4_wimg_nr_altnsg"
+                        : use_r4_wimg_nr ? "cok_r4_wimg_nr"
                         : use_cok_r4_wimg ? "cok_r4_wimg"
                         : use_cok_r4_nrh ? "cok_r4_nrh"
                         : use_cok_r4_nr ? "cok_r4_nr" : use_cok_r4_sv ? "cok_r4_sv"
@@ -28391,6 +29390,7 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
 
         kernel = use_cok_r8    ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r8
                : use_r2_wimg_nr ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r2_wimg_nr
+               : use_r4_wimg_nr_alt ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_alt
                : use_r4_wimg_nr ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr
                : use_cok_r4_wimg ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg
                : use_cok_r4_nrh ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_nrh
@@ -28434,10 +29434,14 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
                                 : use_r2_wimg_nr ? (size_t)(ne01 / 2)
                                 : (use_cok_r4 || use_cok_r4_wimg) ? (size_t)(ne01 / 4)
                                              : (size_t)ne01;
-            global_work_size[1] = (size_t)backend_ctx->q4k_cok_nsg;   // COK_NSG
+            // the alt program was compiled with its own COK_NSG; the launch must match it
+            const size_t cok_nsg_launch = use_r4_wimg_nr_alt
+                                        ? (size_t)backend_ctx->q4k_cok_nsg_alt
+                                        : (size_t)backend_ctx->q4k_cok_nsg;
+            global_work_size[1] = cok_nsg_launch;   // COK_NSG
             global_work_size[2] = 1;
             local_work_size[0] = 64;              // COK_SG
-            local_work_size[1] = (size_t)backend_ctx->q4k_cok_nsg;    // COK_NSG
+            local_work_size[1] = cok_nsg_launch;    // COK_NSG
             local_work_size[2] = 1;
         } else if (use_r1) {
             // 1 row per WI (opt-in occupancy experiment).
@@ -28837,6 +29841,101 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
         region.size = ne00 * ne1 * sizeof(float);
         CL_CHECK((b_sub_buf = clCreateSubBuffer(extra1->data_device, 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &err), err));
 
+        // q6_K cok+dp4a for the narrow band (ne1 = 2..4), the twin of the q4_K path.
+        //
+        // Same shape and the same sizing decisions (SKILL.md 11): serve only 2..4, because
+        // per row per 32-K block a half8 FMA issues 32 ops eight columns wide whatever ne1
+        // is, while dp4a issues 8C -- so int8 wins at C=2, ties at C=4 and loses at C=8.
+        // Column width is matched to the batch and the activation allocated at that width,
+        // so no column index is clamped and the address arithmetic stays affine.
+        //
+        // q6_K needs no min term: a value is (q - 32) * ss * d, so the q8_1 block sum the
+        // q4_K kernel carries is not used here. Only the scale is finer -- ss is per 16 K,
+        // so the dp4a accumulator flushes twice per 32-K block.
+
+        const bool is_output_w_cok = strncmp(src0->name, "output", 6) == 0 ||
+                                     strncmp(src0->name, "token_embd", 10) == 0;
+        // Same decline as the q4_K twin. The q6_K shapes test-backend-ops asks for do not
+        // meet this path's ne01 % 256 gate, so on A7X this kernel is UNTESTED rather than
+        // known good -- and the sibling kernel demonstrably miscompiles on that compiler.
+        // ne1 >= 3, unlike q4_K and q4_0. At ne1 == 2 the 2-column q6_K build measures
+        // 412.2 us against 384.3 for the kernel it would replace (Adreno X2-90, m=4096
+        // k=14336), a 6.8% LOSS, while ne1 3 and 4 gain 8.4% and 8.8%. q6_K unpacks two
+        // operands per block where q4_K unpacks one, so its fixed per-block cost is higher
+        // and two columns do not amortise it.
+        if (ggml_cl_cok_dp4a_narrow_on(backend_ctx, ne1, ne01, ne00, backend_ctx->q6k_cok_dp4a_rows)
+        // Re-tested at muse-glimmer-30B real layer shapes (6656x19968, 19968x6656,
+        // 6656x4096): at ne1=2 the arm is NEUTRAL there (+0.05 to +0.3% over not running
+        // it), so this bound costs those shapes nothing. It is kept for the shape family
+        // where ne1=2 measured a 6.8% LOSS (m=4096 k=14336). ne1 3..4 wins either way.
+            && ne1 >= 3
+            && !is_output_w_cok
+            && ggml_cl_cok_have_q6k(backend_ctx)) {
+            const int    N6   = (int)ne1, K6 = (int)ne00;
+            const int    w6   = (N6 <= 2) ? 2 : 4;
+            const size_t nb6  = (size_t)w6 * (K6 / 32);
+            const size_t qa6  = (size_t)w6 * K6 * sizeof(cl_char);
+            const size_t was6 = backend_ctx->prealloc_moe_qa.size;
+            const size_t wasd6 = backend_ctx->prealloc_moe_da.size;
+            backend_ctx->prealloc_moe_qa.allocate(context, qa6);
+            backend_ctx->prealloc_moe_da.allocate(context, nb6 * sizeof(cl_half));
+            backend_ctx->prealloc_moe_sa.allocate(context, nb6 * sizeof(cl_half));
+            // Zero on growth only, so the columns past ne1 are deterministic without a
+            // per-dispatch fill (which would not be legal under recordable-queue capture).
+            if (backend_ctx->prealloc_moe_qa.size != was6) {
+                const cl_char z8 = 0;
+                CL_CHECK(clEnqueueFillBuffer(backend_ctx->queue, backend_ctx->prealloc_moe_qa.buffer,
+                                             &z8, sizeof(z8), 0, backend_ctx->prealloc_moe_qa.size, 0, NULL, NULL));
+            }
+            if (backend_ctx->prealloc_moe_da.size != wasd6) {
+                const cl_half z16 = 0;
+                CL_CHECK(clEnqueueFillBuffer(backend_ctx->queue, backend_ctx->prealloc_moe_da.buffer,
+                                             &z16, sizeof(z16), 0, backend_ctx->prealloc_moe_da.size, 0, NULL, NULL));
+                CL_CHECK(clEnqueueFillBuffer(backend_ctx->queue, backend_ctx->prealloc_moe_sa.buffer,
+                                             &z16, sizeof(z16), 0, backend_ctx->prealloc_moe_sa.size, 0, NULL, NULL));
+            }
+
+            cl_int tbq6 = (cl_int)((size_t)N6 * (K6 / 32));
+            cl_kernel qk6 = backend_ctx->kernel_quant_a_q8_1;
+            CL_CHECK(clSetKernelArg(qk6, 0, sizeof(cl_mem), &b_sub_buf));
+            CL_CHECK(clSetKernelArg(qk6, 1, sizeof(cl_mem), &backend_ctx->prealloc_moe_qa.buffer));
+            CL_CHECK(clSetKernelArg(qk6, 2, sizeof(cl_mem), &backend_ctx->prealloc_moe_da.buffer));
+            CL_CHECK(clSetKernelArg(qk6, 3, sizeof(cl_mem), &backend_ctx->prealloc_moe_sa.buffer));
+            CL_CHECK(clSetKernelArg(qk6, 4, sizeof(cl_int), &tbq6));
+            size_t q6_local[1]  = { 64 };
+            size_t q6_global[1] = { (size_t)((((size_t)tbq6 + 63) / 64) * 64) };
+            backend_ctx->enqueue_ndrange_kernel(qk6, 1, q6_global, q6_local, dst);
+
+            cl_kernel ck6 = (N6 <= 2) ? backend_ctx->kernel_gemm_cok_q6_k_q8_1_dp4a_c2
+                                      : backend_ctx->kernel_gemm_cok_q6_k_q8_1_dp4a;
+            cl_ushort mf6 = 0xF000;
+            cl_uchar  mc6 = 0xC0;
+            const cl_int clamp6 = w6;
+            CL_CHECK(clSetKernelArg(ck6,  0, sizeof(cl_mem),   &extra0_q6_K->ql));
+            CL_CHECK(clSetKernelArg(ck6,  1, sizeof(cl_mem),   &extra0_q6_K->qh));
+            CL_CHECK(clSetKernelArg(ck6,  2, sizeof(cl_mem),   &extra0_q6_K->s));
+            CL_CHECK(clSetKernelArg(ck6,  3, sizeof(cl_mem),   &extra0_q6_K->d));
+            CL_CHECK(clSetKernelArg(ck6,  4, sizeof(cl_mem),   &backend_ctx->prealloc_moe_qa.buffer));
+            CL_CHECK(clSetKernelArg(ck6,  5, sizeof(cl_mem),   &backend_ctx->prealloc_moe_da.buffer));
+            CL_CHECK(clSetKernelArg(ck6,  6, sizeof(cl_mem),   &extrad->data_device));
+            CL_CHECK(clSetKernelArg(ck6,  7, sizeof(cl_ulong), &offsetd));
+            CL_CHECK(clSetKernelArg(ck6,  8, sizeof(cl_int),   &ne01));
+            CL_CHECK(clSetKernelArg(ck6,  9, sizeof(cl_int),   &clamp6));
+            CL_CHECK(clSetKernelArg(ck6, 10, sizeof(cl_int),   &ne00));
+            CL_CHECK(clSetKernelArg(ck6, 11, sizeof(cl_int),   &ne1));
+            CL_CHECK(clSetKernelArg(ck6, 12, sizeof(cl_ushort),&mf6));
+            CL_CHECK(clSetKernelArg(ck6, 13, sizeof(cl_uchar), &mc6));
+
+            const size_t nsg6d = (size_t)((ne1 <= 2) ? backend_ctx->q6k_cok_dp4a_nsg_c2
+                                                     : backend_ctx->q6k_cok_dp4a_nsg);
+            size_t c6_local[3]  = { 64, nsg6d, 1 };
+            size_t c6_global[3] = { (size_t)(ne01 / backend_ctx->q6k_cok_dp4a_rows), nsg6d, 1 };
+            backend_ctx->enqueue_ndrange_kernel(ck6, 3, c6_global, c6_local, dst);
+
+            CL_CHECK(clReleaseMemObject(b_sub_buf));
+            return;
+        }
+
         // dp4a (int8) dense q6_K prefill GEMM (ffn_down/attn_v). Quantizes the
         // [N,K] activations to q8_1 and runs the int8 dp4a GEMM instead of the
         // f16 half-dot kernel — no activation transpose needed. Large-batch
@@ -29141,10 +30240,10 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
         if (use_q6k_cok) {
             // r4 gives each lane 4 rows, so the row axis shrinks 4x.
             global_work_size[0] = use_q6k_cok_r4 ? (size_t)(ne01 / 4) : (size_t)ne01;
-            global_work_size[1] = 8;              // COK_NSG
+            global_work_size[1] = (size_t)backend_ctx->q6k_cok_nsg_eff;   // COK_NSG
             global_work_size[2] = 1;
             local_work_size[0] = 64;              // COK_SG
-            local_work_size[1] = 8;               // COK_NSG
+            local_work_size[1] = (size_t)backend_ctx->q6k_cok_nsg_eff;    // COK_NSG
             local_work_size[2] = 1;
         } else {
             global_work_size[0] = (size_t)CEIL_DIV(ne1, 8);
@@ -29526,10 +30625,11 @@ static void ggml_cl_mul_mat_q5_K_f32_adreno(ggml_backend_t backend, const ggml_t
             // r4 gives each lane 4 rows, so the row axis shrinks 4x; ksplit spreads the K
             // split across workgroups to put the wave count back.
             global_work_size[0] = use_q5k_cok_r4 ? (size_t)(ne01 / 4) : (size_t)ne01;
-            global_work_size[1] = (size_t)(8 * q5k_ksplit);   // COK_NSG x K slices
+            // COK_NSG x K slices, from the build rather than a literal (see q4_1 above).
+            global_work_size[1] = (size_t)(backend_ctx->q5k_cok_nsg_eff * q5k_ksplit);
             global_work_size[2] = 1;
             local_work_size[0] = 64;              // COK_SG
-            local_work_size[1] = 8;               // COK_NSG
+            local_work_size[1] = (size_t)backend_ctx->q5k_cok_nsg_eff;    // COK_NSG
             local_work_size[2] = 1;
         } else {
             global_work_size[0] = (size_t)CEIL_DIV(ne1, 8);
@@ -33046,7 +34146,17 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             // full passes over hundreds of MB. Switch to the multi-column twin,
             // which reads the weight once per N_COLS columns. Same arithmetic per
             // (row, column), so the result is bit-identical.
-            if (ne11 == 2 && backend_ctx->kernel_mul_mv_q6_K_f32_flat_mc2 != nullptr) {
+            //
+            // NOT on the old E031 compilers. The multi-column twins are x2ue-only and
+            // upstream never had to consider them: they carry their own copy of the
+            // vectorised vload4/convert_float4/dot() dequant, which is exactly the idiom
+            // ADRENO_OLD_COMPILER exists to avoid, and they have no -D variant and no
+            // optimizer-barrier argument. Selecting one here both miscompiles and then
+            // trips the arg-17 set below with CL_INVALID_ARG_INDEX. Fall back to the
+            // single-column flat kernel, which does carry the workaround.
+            if (backend_ctx->q6_k_flat_old_compiler) {
+                // keep the single-column kernel selected above
+            } else if (ne11 == 2 && backend_ctx->kernel_mul_mv_q6_K_f32_flat_mc2 != nullptr) {
                 kernel        = backend_ctx->kernel_mul_mv_q6_K_f32_flat_mc2;
                 ndst          = backend_ctx->q6k_mc2_ndst;
                 ncols_per_wg  = 2;
@@ -33073,6 +34183,12 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             CL_CHECK(clSetKernelArg(kernel, 14, sizeof(int),      &ne1));
             CL_CHECK(clSetKernelArg(kernel, 15, sizeof(int),      &r2));
             CL_CHECK(clSetKernelArg(kernel, 16, sizeof(int),      &r3));
+            // The optimizer-barrier arg exists only in the ADRENO_OLD_COMPILER build of
+            // this kernel; conformant compilers get the original 17-arg signature.
+            if (backend_ctx->q6_k_flat_old_compiler) {
+                cl_uchar q6k_mask = 0xFF;   // never 0xFE in prod; see the kernel note
+                CL_CHECK(clSetKernelArg(kernel, 17, sizeof(cl_uchar), &q6k_mask));
+            }
 #else
             kernel = backend_ctx->kernel_mul_mv_q6_K_f32;
 
@@ -33650,10 +34766,14 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     const int  moe_bin_min  = moe_bin_min_env ? atoi(moe_bin_min_env) : 4096;
                     const int  moe_routings = (int)(ne20 * ne21);
                     const bool bin_available = backend_ctx->kernel_gemm_moe_q4_0_f32_ns_bin != nullptr;
+                    // A dp4a ILA kernel outranks the plain ILA bin kernel outright (upstream
+                    // #27768); the routing threshold above only arbitrates between the SOURCE
+                    // dp4a GEMM and the ILA bin kernel, which is what it was measured against.
+                    const bool dp4a_bin_available = backend_ctx->kernel_gemm_moe_q4_0_q8_1_dp4a_bin != nullptr;
                     const bool use_moe_dp4a = q4_0_moe_dp4a_env
                         ? (atoi(q4_0_moe_dp4a_env) != 0)
                         : (backend_ctx->adreno_dp4a_moe()
-                           && (!bin_available || moe_routings < moe_bin_min));
+                           && (dp4a_bin_available || !bin_available || moe_routings < moe_bin_min));
                     const bool use_bin_kernel = bin_available && !use_moe_dp4a;
 
                     // GGML_OPENCL_MOE_DISPATCH_LOG=1 names the kernel that actually
@@ -33793,6 +34913,10 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
 
                         // dp4a GEMM
                         cl_kernel dk = backend_ctx->kernel_gemm_moe_q4_0_q8_1_dp4a;
+                        if (backend_ctx->kernel_gemm_moe_q4_0_q8_1_dp4a_bin) {
+                            dk = backend_ctx->kernel_gemm_moe_q4_0_q8_1_dp4a_bin;
+                        }
+
                         int aidx = 0;
                         CL_CHECK(clSetKernelArg(dk, aidx++, sizeof(cl_mem), &extra0_q4_0->q_img));
                         CL_CHECK(clSetKernelArg(dk, aidx++, sizeof(cl_mem), &extra0_q4_0->d));
@@ -35704,7 +36828,9 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     const bool use_moe_dp4a = mxfp4_moe_dp4a_env
                         ? (atoi(mxfp4_moe_dp4a_env) != 0)
                         : (backend_ctx->adreno_dp4a_moe()
-                           && backend_ctx->kernel_gemm_moe_mxfp4_f32_ns_bin == nullptr);
+                           // the dp4a bin kernel outranks the plain ILA bin kernel
+                           && (backend_ctx->kernel_gemm_moe_mxfp4_q8_1_dp4a_bin != nullptr ||
+                               backend_ctx->kernel_gemm_moe_mxfp4_f32_ns_bin == nullptr));
 
                     cl_buffer_region region;
                     region.origin = 0;
@@ -35813,6 +36939,10 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
 
                         // dp4a GEMM
                         cl_kernel dk = backend_ctx->kernel_gemm_moe_mxfp4_q8_1_dp4a;
+                        if (backend_ctx->kernel_gemm_moe_mxfp4_q8_1_dp4a_bin) {
+                            dk = backend_ctx->kernel_gemm_moe_mxfp4_q8_1_dp4a_bin;
+                        }
+
                         int aidx = 0;
                         CL_CHECK(clSetKernelArg(dk, aidx++, sizeof(cl_mem), &extra0_mxfp4->q_img));
                         CL_CHECK(clSetKernelArg(dk, aidx++, sizeof(cl_mem), &extra0_mxfp4->e));
@@ -36167,6 +37297,30 @@ static void ggml_cl_cpy(ggml_backend_t backend, const ggml_tensor * src0, const 
     CL_CHECK(clSetKernelArg(kernel, 17, sizeof(cl_ulong), &nb11));
     CL_CHECK(clSetKernelArg(kernel, 18, sizeof(cl_ulong), &nb12));
     CL_CHECK(clSetKernelArg(kernel, 19, sizeof(cl_ulong), &nb13));
+
+    // Fully contiguous f32 -> f32: the addressing above collapses to an identity map, so
+    // copy the tensor as a flat float4 stream. The row-per-workgroup default launches
+    // ne01*ne02*ne03 workgroups whatever ne00 is, so a mamba2 SSM state (ne00 32768,
+    // 16 rows) gets 16 workgroups of 64 lanes -- one per compute unit, each lane copying
+    // 512 elements at ~22 GB/s. The widening below only reaches copies of <= 8 rows.
+    if (src0t == GGML_TYPE_F32 && src1t == GGML_TYPE_F32
+        && backend_ctx->kernel_cpy_f32_f32_flat != nullptr
+        && ggml_is_contiguous(src0) && ggml_is_contiguous(src1)
+        && ggml_nelements(src0) == ggml_nelements(src1)
+        && (ggml_nelements(src0) % 4) == 0) {
+        cl_kernel fk  = backend_ctx->kernel_cpy_f32_f32_flat;
+        const int n4  = (int)(ggml_nelements(src0) / 4);
+        CL_CHECK(clSetKernelArg(fk, 0, sizeof(cl_mem),   &extra0->data_device));
+        CL_CHECK(clSetKernelArg(fk, 1, sizeof(cl_ulong), &offset0));
+        CL_CHECK(clSetKernelArg(fk, 2, sizeof(cl_mem),   &extra1->data_device));
+        CL_CHECK(clSetKernelArg(fk, 3, sizeof(cl_ulong), &offset1));
+        CL_CHECK(clSetKernelArg(fk, 4, sizeof(int),      &n4));
+        const size_t lsz = MIN((size_t)256, backend_ctx->max_workgroup_size);
+        size_t global_work_size[] = { (((size_t)n4 + lsz - 1) / lsz) * lsz, 1, 1 };
+        size_t local_work_size[]  = { lsz, 1, 1 };
+        backend_ctx->enqueue_ndrange_kernel(fk, 1, global_work_size, local_work_size, src1);
+        return;
+    }
 
     if (kernel == backend_ctx->kernel_cpy_f32_f32_pack) {
         const int maxwg = (int)backend_ctx->get_kernel_workgroup_size(kernel);
@@ -36579,6 +37733,7 @@ static void ggml_cl_rope(ggml_backend_t backend, const ggml_tensor * src0, const
     const int n_dims     = ((int *) dst->op_params)[1];
     const int mode       = ((int *) dst->op_params)[2];
     const int n_ctx_orig = ((int32_t *) dst->op_params)[4];
+    const int n_offs     = ((int32_t *) dst->op_params)[15];
 
     float freq_base;
     float freq_scale;
@@ -36607,6 +37762,7 @@ static void ggml_cl_rope(ggml_backend_t backend, const ggml_tensor * src0, const
 
     if (is_vision) {
         GGML_ASSERT(n_dims == ne00/2);
+        GGML_ASSERT(n_offs == 0); // offset not supported for vision, as the rotated pairs span the whole row
     }
 
     cl_kernel kernel;
@@ -36697,6 +37853,12 @@ static void ggml_cl_rope(ggml_backend_t backend, const ggml_tensor * src0, const
     // only mrope has is_imrope
     if (is_mrope && !is_vision) {
         CL_CHECK(clSetKernelArg(kernel, 34, sizeof(int), &is_imrope));
+    }
+    // norm and neox have n_offs after beta_slow, mrope has it after is_imrope
+    if (!is_mrope && !is_vision) {
+        CL_CHECK(clSetKernelArg(kernel, 33, sizeof(int), &n_offs));
+    } else if (is_mrope && !is_vision) {
+        CL_CHECK(clSetKernelArg(kernel, 35, sizeof(int), &n_offs));
     }
 
     size_t global_work_size[] = {(size_t)ne01*nth, (size_t)ne02, (size_t)ne03};
@@ -36973,6 +38135,103 @@ static void ggml_cl_im2col(ggml_backend_t backend, const ggml_tensor * src0, con
     size_t local_work_size[] = {256, 1, 1};
 
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+}
+
+static void ggml_cl_top_k(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    GGML_ASSERT(src0 && src0->extra);
+    GGML_ASSERT(dst  && dst->extra);
+    GGML_UNUSED(src1);
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT( dst->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(src0));
+
+    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *)backend->context;
+
+    ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *)src0->extra;
+    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
+
+    const cl_ulong offset0 = extra0->offset + src0->view_offs;
+    const cl_ulong offsetd = extrad->offset + dst->view_offs;
+
+    const int ncols = (int)src0->ne[0];
+    const int nrows = (int)ggml_nrows(src0);
+    const int k     = (int)dst->ne[0];
+
+    ggml_cl_top_k_plan plan;
+    const bool ok = ggml_cl_top_k_plan_for(backend_ctx, ncols, k, &plan);
+    GGML_ASSERT(ok && "ggml_cl_top_k dispatched for a shape supports_op rejected");
+
+    const size_t cand_n = (size_t)nrows * plan.ncand;
+    backend_ctx->prealloc_topk_val.allocate(backend_ctx->context, cand_n * sizeof(cl_float));
+    backend_ctx->prealloc_topk_idx.allocate(backend_ctx->context, cand_n * sizeof(cl_int));
+    backend_ctx->prealloc_topk_ord.allocate(backend_ctx->context, cand_n * sizeof(cl_int));
+
+    cl_mem   cand_val = backend_ctx->prealloc_topk_val.buffer;
+    cl_mem   cand_idx = backend_ctx->prealloc_topk_idx.buffer;
+    cl_mem   order    = backend_ctx->prealloc_topk_ord.buffer;
+    cl_ulong zero     = 0;
+
+    // ---- stage 1: per-tile top-k
+    {
+        cl_kernel kernel = plan.tile_kernel;
+        int aidx = 0;
+        CL_CHECK(clSetKernelArg(kernel, aidx++, sizeof(cl_mem),   &extra0->data_device));
+        CL_CHECK(clSetKernelArg(kernel, aidx++, sizeof(cl_ulong), &offset0));
+        CL_CHECK(clSetKernelArg(kernel, aidx++, sizeof(cl_mem),   &cand_val));
+        CL_CHECK(clSetKernelArg(kernel, aidx++, sizeof(cl_ulong), &zero));
+        CL_CHECK(clSetKernelArg(kernel, aidx++, sizeof(cl_mem),   &cand_idx));
+        CL_CHECK(clSetKernelArg(kernel, aidx++, sizeof(cl_ulong), &zero));
+        CL_CHECK(clSetKernelArg(kernel, aidx++, sizeof(int),      &ncols));
+        CL_CHECK(clSetKernelArg(kernel, aidx++, sizeof(int),      &plan.ntiles));
+        CL_CHECK(clSetKernelArg(kernel, aidx++, sizeof(int),      &k));
+        CL_CHECK(clSetKernelArg(kernel, aidx++, plan.block * sizeof(cl_ulong), NULL));
+
+        size_t gws[] = { (size_t)plan.block * nrows * plan.ntiles, 1, 1 };
+        size_t lws[] = { (size_t)plan.block, 1, 1 };
+        backend_ctx->enqueue_ndrange_kernel(plan.tile_kernel, 3, gws, lws, dst);
+    }
+
+    // ---- stage 2: rank the candidates with the existing bitonic argsort
+    {
+        int padded = 1;
+        while (padded < plan.ncand) { padded *= 2; }
+        const int order_desc = (int)GGML_SORT_ORDER_DESC;
+
+        cl_kernel kernel = backend_ctx->kernel_argsort_f32_i32;
+        int aidx = 0;
+        CL_CHECK(clSetKernelArg(kernel, aidx++, sizeof(cl_mem),   &cand_val));
+        CL_CHECK(clSetKernelArg(kernel, aidx++, sizeof(cl_ulong), &zero));
+        CL_CHECK(clSetKernelArg(kernel, aidx++, sizeof(cl_mem),   &order));
+        CL_CHECK(clSetKernelArg(kernel, aidx++, sizeof(cl_ulong), &zero));
+        CL_CHECK(clSetKernelArg(kernel, aidx++, sizeof(int),      &plan.ncand));
+        CL_CHECK(clSetKernelArg(kernel, aidx++, sizeof(int),      &padded));
+        CL_CHECK(clSetKernelArg(kernel, aidx++, sizeof(int),      &order_desc));
+        CL_CHECK(clSetKernelArg(kernel, aidx++, padded * sizeof(int), NULL));
+
+        size_t gws[] = { (size_t)padded, (size_t)nrows, 1 };
+        size_t lws[] = { (size_t)padded, 1, 1 };
+        backend_ctx->enqueue_ndrange_kernel(kernel, 3, gws, lws, dst);
+    }
+
+    // ---- stage 3: candidate positions -> source columns
+    {
+        cl_kernel kernel = backend_ctx->kernel_top_k_unmap;
+        const int lws0 = (k < 64) ? 1 : 64;
+        int aidx = 0;
+        CL_CHECK(clSetKernelArg(kernel, aidx++, sizeof(cl_mem),   &cand_idx));
+        CL_CHECK(clSetKernelArg(kernel, aidx++, sizeof(cl_ulong), &zero));
+        CL_CHECK(clSetKernelArg(kernel, aidx++, sizeof(cl_mem),   &order));
+        CL_CHECK(clSetKernelArg(kernel, aidx++, sizeof(cl_ulong), &zero));
+        CL_CHECK(clSetKernelArg(kernel, aidx++, sizeof(cl_mem),   &extrad->data_device));
+        CL_CHECK(clSetKernelArg(kernel, aidx++, sizeof(cl_ulong), &offsetd));
+        CL_CHECK(clSetKernelArg(kernel, aidx++, sizeof(int),      &plan.ncand));
+        CL_CHECK(clSetKernelArg(kernel, aidx++, sizeof(int),      &k));
+
+        size_t gws[] = { (size_t)lws0 * nrows, 1, 1 };
+        size_t lws[] = { (size_t)lws0, 1, 1 };
+        backend_ctx->enqueue_ndrange_kernel(kernel, 3, gws, lws, dst);
+    }
 }
 
 static void ggml_cl_argsort(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
@@ -37858,6 +39117,12 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
                 return false;
             }
             func = ggml_cl_argsort;
+            break;
+        case GGML_OP_TOP_K:
+            if (!any_on_device) {
+                return false;
+            }
+            func = ggml_cl_top_k;
             break;
         case GGML_OP_SUM_ROWS:
             if (!any_on_device) {
