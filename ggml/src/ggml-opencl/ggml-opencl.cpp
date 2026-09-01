@@ -28945,6 +28945,15 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
         const bool use_r4_wimg_nr_w8 = use_r4_wimg_nr
                                      && (q4k_r4_wimg_nr_w8_env != nullptr) && (atoi(q4k_r4_wimg_nr_w8_env) != 0)
                                      && backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_w8 != nullptr;
+
+        // Orthogonal knob: build the wide view but dispatch the BASELINE kernel. The
+        // wide view costs one extra clCreateImage per matmul, so a plain on/off A/B
+        // charges that host cost to the kernel. With this set, arm B (image, no w8
+        // dispatch) isolates it: B - A is the image cost, C - B the kernel effect.
+        static const char * q4k_w8_nodisp_env = getenv("GGML_OPENCL_Q4K_W8_NO_DISPATCH");
+        const bool w8_no_dispatch = (q4k_w8_nodisp_env != nullptr) && (atoi(q4k_w8_nodisp_env) != 0);
+        const bool run_w8 = use_r4_wimg_nr_w8 && !w8_no_dispatch;
+
         cl_mem b_img_trans_w8 = nullptr;
         if (use_r4_wimg_nr_w8) {
             // (N + padding) is a multiple of 8, so the width divides exactly.
@@ -28965,7 +28974,8 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
                 n_q4k_probe++;
                 fprintf(stderr, "[Q4K-COK-PROBE] M=%d N=%d K=%d -> %s (r4_sv_built=%d)\n",
                         M, N, ne00,
-                        use_r4_wimg_nr_w8 ? "cok_r4_wimg_nr_w8"
+                        run_w8 ? "cok_r4_wimg_nr_w8"
+                        : use_r4_wimg_nr_w8 ? "cok_r4_wimg_nr+w8img"
                         : use_cok_r8 ? "cok_r8" : use_r2_wimg_nr ? "cok_r2_wimg_nr"
                         : use_r4_wimg_nr ? "cok_r4_wimg_nr"
                         : use_cok_r4_wimg ? "cok_r4_wimg"
@@ -28979,7 +28989,7 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
             }
         }
 
-        kernel = use_r4_wimg_nr_w8 ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_w8
+        kernel = run_w8 ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_w8
                : use_cok_r8    ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r8
                : use_r2_wimg_nr ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r2_wimg_nr
                : use_r4_wimg_nr ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr
@@ -29004,7 +29014,7 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
         CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem),   &extra0_q4_k->s));
         CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem),   &extra0_q4_k->d));
         CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_mem),   &extra0_q4_k->dm));
-        CL_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_mem),   use_r4_wimg_nr_w8 ? &b_img_trans_w8 : &b_img_trans));
+        CL_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_mem),   run_w8 ? &b_img_trans_w8 : &b_img_trans));
         CL_CHECK(clSetKernelArg(kernel, 5, sizeof(cl_mem),   &extrad->data_device));
         CL_CHECK(clSetKernelArg(kernel, 6, sizeof(cl_ulong), &offsetd));
         CL_CHECK(clSetKernelArg(kernel, 7, sizeof(cl_int),   &ne01));
