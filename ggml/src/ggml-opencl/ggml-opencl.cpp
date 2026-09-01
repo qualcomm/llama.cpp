@@ -2029,7 +2029,22 @@ inline std::string read_file(const std::string &path) {
 // through every caller. Set once at backend init.
 static cl_program_cache_state g_cl_program_cache;
 
+// How many SOURCE-COMPILED programs this backend has built or loaded from the source cache,
+// ever. Every source build funnels through build_program_from_source_ex, so this covers the
+// eager load_cl_kernels path and the lazy FA / cok paths alike. Precompiled QPM/ILA blob
+// programs are deliberately excluded -- they have fixed codegen and take no compile options,
+// so they are unaffected by the option this counter governs.
+//
+// It exists for one decision: -qcom-enable-large-buffer is baked into the option string of
+// EVERY program compiled from source (see ggml_opencl_make_compile_opts), and those programs
+// are released as soon as their kernels are created, so the option can never be retrofitted.
+// Turning it on once one exists would leave a mixed build -- some kernels addressing the same
+// buffer with narrow arithmetic and some with wide -- which is a correctness hazard, not a
+// slow path. So the auto-enable below is only legal while this is still zero.
+static int g_cl_programs_built = 0;
+
 static cl_program build_program_from_source_ex(cl_context ctx, cl_device_id dev, const char* program_buffer, const std::string &compile_opts, bool fatal, const char *tag = nullptr, size_t bin_size = 0, cl_command_queue retry_queue = nullptr) {
+    g_cl_programs_built++;
     // Source compiles only (bin_size==0). Precompiled-binary loads (ILA) have
     // their own path and are not source-cached. A cache hit returns a fully
     // built program and skips the online compiler entirely — which is exactly
@@ -2175,6 +2190,16 @@ static cl_program cl_program_for_kernel(ggml_backend_opencl_context * backend_ct
 }
 
 static cl_program build_program_from_binary(cl_context ctx, cl_device_id dev, const char* program_buffer, const std::string &compile_opts, size_t bin_size = 0) {
+    // Deliberately NOT counted in g_cl_programs_built. The QPM/ILA kernels are prebuilt with
+    // fixed codegen and cannot accept compile options at all, so -qcom-enable-large-buffer
+    // never applies to them: loading one neither constrains the large-buffer decision nor is
+    // affected by it. Counting it here would wrongly veto the auto-enable on exactly the ILA
+    // builds that ship.
+    //
+    // Nor do they need a guard against the mixed build that implies. The ILA kernels serve
+    // PREFILL only, where it is technically impossible for a buffer over the per-allocation
+    // cap to reach them -- so a blob kernel can never be handed an address its fixed codegen
+    // cannot form. (Confirmed by the QPM kernel owner, 2026-09-01.)
     cl_program p;
     char *program_log;
     size_t log_size;
@@ -17498,6 +17523,63 @@ static const char * ggml_backend_opencl_buffer_type_get_name(ggml_backend_buffer
     GGML_UNUSED(buffer_type);
 }
 
+// Enable large-buffer mode ONLY when an allocation genuinely cannot fit under the device cap,
+// and only while it is still safe to do so.
+//
+// GGML_OPENCL_ADRENO_USE_LARGE_BUFFER is a poor fit for the job it was given: it is a launch-time
+// global that appends -qcom-enable-large-buffer to every program, widening address arithmetic and
+// so costing registers and occupancy on every kernel -- while the thing it buys is step 3 of the
+// 4-step retry ladder below, which only runs when ONE allocation exceeds the cap. Measured on
+// X2-90 (2026-09-01, 5 models, prefill 512/1k/16k and decode to 16k): the retry never fired once,
+// including gemma-4-26B at pp16384, and dropping the flag was worth +22% (gemma-26B) and +27%
+// (Nemotron) at tg128 d16384. Paying that globally for a path that does not run is the wrong
+// default, so decide it from the allocation in hand instead of from an env var set in advance.
+//
+// This runs BEFORE load_cl_kernels() in the same function, which is the only window where the
+// decision is still free: see g_cl_programs_built for why it cannot be made later. An allocation
+// that overflows the cap AFTER kernels exist still falls through to the ALLOC_HOST_PTR path,
+// which warns and names the env var for a pre-armed re-run.
+static void ggml_opencl_maybe_enable_large_buffer(ggml_backend_opencl_context * backend_ctx, size_t size) {
+    if (backend_ctx->adreno_use_large_buffer) {
+        return;  // already on, from the env or from an earlier allocation
+    }
+    if (size <= backend_ctx->max_alloc_size) {
+        return;  // fits without it; the flag would be pure cost
+    }
+    if (!backend_ctx->adreno_has_large_buffer) {
+        return;  // driver cannot do it at all
+    }
+    if (g_cl_programs_built != 0) {
+        GGML_LOG_WARN("ggml_opencl: a %.2f MiB allocation exceeds the %.2f MiB device cap, but "
+                      "%d program(s) are already built without -qcom-enable-large-buffer, so it "
+                      "cannot be enabled now. Re-run with GGML_OPENCL_ADRENO_USE_LARGE_BUFFER=1 "
+                      "to arm it from the start if this allocation fails.\n",
+                      size / 1024.0 / 1024.0, backend_ctx->max_alloc_size / 1024.0 / 1024.0,
+                      g_cl_programs_built);
+        return;
+    }
+    // Advertising the extension is not the same as being able to build for it: the Adreno 850
+    // (E17.51) reports cl_qcom_large_buffer and then rejects the option, which would fail EVERY
+    // kernel build and take the process down.
+    if (!ggml_opencl_compiler_accepts(backend_ctx, " -qcom-enable-large-buffer ")) {
+        GGML_LOG_WARN("ggml_opencl: a %.2f MiB allocation exceeds the %.2f MiB device cap and this "
+                      "driver advertises cl_qcom_large_buffer, but its compiler rejects "
+                      "-qcom-enable-large-buffer; continuing without it.\n",
+                      size / 1024.0 / 1024.0, backend_ctx->max_alloc_size / 1024.0 / 1024.0);
+        return;
+    }
+    backend_ctx->adreno_use_large_buffer   = true;
+    backend_ctx->adreno_large_buffer_requested = true;
+    // Rebake the cached option string: it was baked at ggml_cl_init, before this was known, and
+    // the lazy FA/cok builds read it directly.
+    backend_ctx->kernel_compile_opts = ggml_opencl_make_compile_opts(backend_ctx);
+    GGML_LOG_INFO("ggml_opencl: large buffer mode enabled automatically -- a %.2f MiB allocation "
+                  "exceeds the %.2f MiB per-allocation cap. This widens address arithmetic in "
+                  "every kernel and costs throughput; it is on because this model needs it, not "
+                  "by default.\n",
+                  size / 1024.0 / 1024.0, backend_ctx->max_alloc_size / 1024.0 / 1024.0);
+}
+
 static ggml_backend_buffer_t ggml_backend_opencl_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buffer_type, size_t size) {
     ggml_backend_opencl_context *backend_ctx = ggml_cl_init(buffer_type->device);
 
@@ -17505,6 +17587,9 @@ static ggml_backend_buffer_t ggml_backend_opencl_buffer_type_alloc_buffer(ggml_b
     // Must be initialised before load_cl_kernels() so it can intercept the
     // build_program_from_source path that load_cl_kernels triggers.
     backend_ctx->program_cache = cl_program_cache_init(backend_ctx->device);
+
+    // Must precede load_cl_kernels(): the large-buffer compile option cannot be retrofitted.
+    ggml_opencl_maybe_enable_large_buffer(backend_ctx, size);
 
     load_cl_kernels(backend_ctx);
 
