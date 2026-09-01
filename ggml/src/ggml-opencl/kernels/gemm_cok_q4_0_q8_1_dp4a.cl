@@ -70,21 +70,16 @@ typedef int2   cok_dotv;
     d1.s##ci = dot_acc_sat_4x8packed_ss_int(w1, A##ci.s##t, d1.s##ci);
 #endif
 
-// Per-step activation form. The uint4 A0..A3 are held live across all four K-steps
-// while each step consumes ONE component of each -- 16 vector registers carrying the
-// 4 actually in use. Loading a uint per column per step holds 4 instead. Same bytes,
-// same order, contiguous within a column; the cost is narrower loads.
-// Build with -DCOK_A_PERSTEP=1.
 #if COK_ROWS == 4
 #define COK_DOT_PS(ci)                                                \
     d0.s##ci = dot_acc_sat_4x8packed_ss_int(w0, a##ci, d0.s##ci);     \
     d1.s##ci = dot_acc_sat_4x8packed_ss_int(w1, a##ci, d1.s##ci);     \
     d2.s##ci = dot_acc_sat_4x8packed_ss_int(w2, a##ci, d2.s##ci);     \
-    d3.s##ci = dot_acc_sat_4x8packed_ss_int(w3, a##ci, d3.s##ci);     
+    d3.s##ci = dot_acc_sat_4x8packed_ss_int(w3, a##ci, d3.s##ci);
 #else
 #define COK_DOT_PS(ci)                                                \
     d0.s##ci = dot_acc_sat_4x8packed_ss_int(w0, a##ci, d0.s##ci);     \
-    d1.s##ci = dot_acc_sat_4x8packed_ss_int(w1, a##ci, d1.s##ci);     
+    d1.s##ci = dot_acc_sat_4x8packed_ss_int(w1, a##ci, d1.s##ci);
 #endif
 
 #if COK_COLS == 4
@@ -98,7 +93,9 @@ typedef int2   cok_dotv;
 #endif
 
 // One K-group (4 K values): unpack the folded rows' weights, then dot every column.
-#if COK_ROWS == 4
+#ifdef COK_A_PERSTEP
+// Per-step activation loads: 4 live registers instead of the 16 that four uint4 carry
+// across the four K-steps, of which each step consumes one component.
 #if COK_COLS == 4
 #define COK_A23(t)                                                    \
     const uint a2 = src1_qa[(uint)c2 * k_u + ku0 + (t)];              \
@@ -106,8 +103,7 @@ typedef int2   cok_dotv;
 #else
 #define COK_A23(t)
 #endif
-
-#ifdef COK_A_PERSTEP
+#if COK_ROWS == 4
 #define COK_KSTEP(t)                                                  \
     {                                                                 \
     ushort4 bl = vload4(0, src0_q + row0 + (ku0 + t) * m);            \
@@ -121,6 +117,19 @@ typedef int2   cok_dotv;
     COK_DOTS_PS                                                       \
     }
 #else
+#define COK_KSTEP(t)                                                  \
+    {                                                                 \
+    ushort2 bl = vload2(0, src0_q + row0 + (ku0 + t) * m);            \
+    const uint w0 = EXP40(bl.s0);                                     \
+    const uint w1 = EXP40(bl.s1);                                     \
+    const uint a0 = src1_qa[(uint)c0 * k_u + ku0 + (t)];              \
+    const uint a1 = src1_qa[(uint)c1 * k_u + ku0 + (t)];              \
+    COK_A23(t)                                                        \
+    COK_DOTS_PS                                                       \
+    }
+#endif
+#else
+#if COK_ROWS == 4
 #define COK_KSTEP(t)                                                   \
     {                                                                  \
     ushort4 bl = vload4(0, src0_q + row0 + (ku0 + t) * m);             \
