@@ -26758,6 +26758,24 @@ static void ggml_cl_mul_mat_q4_0_f32_adreno(ggml_backend_t backend, const ggml_t
         }
         const bool use_q40_cok_splitk = (cok_ksplit > 1);
 
+        // Which small-batch kernel this q4_0 shape actually gets, and at what K-split.
+        // Its q4_K twin caught an A/B that had never dispatched the kernel under test, and
+        // several results on this file have been vacuous for exactly that reason -- so the
+        // probe has to name the arm AND the launch geometry, including the splitk arm.
+        if (getenv("GGML_OPENCL_Q40_COK_PROBE")) {
+            static int n_q40_probe = 0;
+            if (n_q40_probe < 24) {
+                n_q40_probe++;
+                fprintf(stderr, "[Q40-COK-PROBE] M=%d N=%d K=%d -> %s (nsg=%d ksplit=%d)\n",
+                        (int)ne01, (int)ne1, (int)ne00,
+                        use_q40_cok_splitk ? "q40_cok_r4_splitk"
+                        : use_q40_cok_r4   ? "q40_cok_r4"
+                        : use_q40_cok      ? "q40_cok" : "other",
+                        backend_ctx->q40_cok_nsg_eff, cok_ksplit);
+                fflush(stderr);
+            }
+        }
+
         kernel = use_q40_cok_splitk ? backend_ctx->kernel_gemm_noshuffle_q4_0_f32_cok_r4_splitk
                : use_q40_cok_r4     ? backend_ctx->kernel_gemm_noshuffle_q4_0_f32_cok_r4
                : use_q40_cok        ? backend_ctx->kernel_gemm_noshuffle_q4_0_f32_cok
