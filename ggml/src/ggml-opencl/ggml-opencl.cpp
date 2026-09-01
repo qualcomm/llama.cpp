@@ -29422,6 +29422,10 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
         // operands per block where q4_K unpacks one, so its fixed per-block cost is higher
         // and two columns do not amortise it.
         if (ggml_cl_cok_dp4a_narrow_on(backend_ctx, ne1, ne01, ne00, backend_ctx->q6k_cok_dp4a_rows)
+        // Re-tested at muse-glimmer-30B real layer shapes (6656x19968, 19968x6656,
+        // 6656x4096): at ne1=2 the arm is NEUTRAL there (+0.05 to +0.3% over not running
+        // it), so this bound costs those shapes nothing. It is kept for the shape family
+        // where ne1=2 measured a 6.8% LOSS (m=4096 k=14336). ne1 3..4 wins either way.
             && ne1 >= 3
             && !is_output_w_cok
             && ggml_cl_cok_have_q6k(backend_ctx)) {
