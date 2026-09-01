@@ -1,3 +1,9 @@
+// Q4K_COK_MINIMAL builds ONLY the kernel the dispatch actually selects by default.
+// Two reasons. The driver narrows the launch to the MINIMUM CL_KERNEL_WORK_GROUP_SIZE
+// over every _cok kernel in the program, so siblings that never run were capping the
+// dispatched one (640 vs its own 896). And an OpenCL compiler works to a per-PROGRAM
+// time budget, so fifteen kernels in one program each get a fraction of the
+// optimisation effort that one kernel would get alone.
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
 
 #ifdef cl_qcom_reqd_sub_group_size
@@ -57,6 +63,7 @@ inline void get_scale_min_k4_v4(
 
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_128
+#ifndef Q4K_COK_MINIMAL
 #endif
 kernel void kernel_gemm_noshuffle_q4_k_f32(
     global const ushort * src0_q,
@@ -198,6 +205,7 @@ kernel void kernel_gemm_noshuffle_q4_k_f32(
         vstore4((float4)(c0.s7, c1.s7, c2.s7, c3.s7), 0, dst + idx);
     }
 }
+#endif  // !Q4K_COK_MINIMAL
 
 // 1x8 per-WI tile (1 output row x 8 output cols). For the small-batch
 // (medium n_q, e.g. MTP/spec verify) path where the 2x8 kernel is starved:
@@ -208,6 +216,7 @@ kernel void kernel_gemm_noshuffle_q4_k_f32(
 // traffic as 2x8 (rows never share weights); the win is pure occupancy.
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_128
+#ifndef Q4K_COK_MINIMAL
 #endif
 kernel void kernel_gemm_noshuffle_q4_k_f32_r1(
     global const ushort * src0_q,
@@ -292,6 +301,7 @@ kernel void kernel_gemm_noshuffle_q4_k_f32_r1(
     if (idx < m*n_no_padding) { dst[idx] = c0.s6; idx += m; }
     if (idx < m*n_no_padding) { dst[idx] = c0.s7; }
 }
+#endif  // !Q4K_COK_MINIMAL
 
 // 2x8 tile, but weights read through an image1d_buffer (CL_R/UINT32 over the
 // same packed-q buffer) instead of a plain global buffer. The ne1==1 GEMV
@@ -303,6 +313,7 @@ kernel void kernel_gemm_noshuffle_q4_k_f32_r1(
 // so the vload2 becomes a single read_imageui at index gx + (ki/4)*(m/2).
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_128
+#ifndef Q4K_COK_MINIMAL
 #endif
 kernel void kernel_gemm_noshuffle_q4_k_f32_kimg(
     read_only image1d_buffer_t src0_q_img,
@@ -401,6 +412,7 @@ kernel void kernel_gemm_noshuffle_q4_k_f32_kimg(
     if (idx+1 < m*n_no_padding) { vstore2((float2)(c0.s6, c1.s6), 0, dst + idx); idx += m; }
     if (idx+1 < m*n_no_padding) { vstore2((float2)(c0.s7, c1.s7), 0, dst + idx); }
 }
+#endif  // !Q4K_COK_MINIMAL
 
 // Cooperative-K GEMM for the small-batch (n_q in [2..8]) path. Mirrors the
 // ne1==1 GEMV's structure: a WG is (COK_SG lanes x COK_NSG subgroups); each
@@ -417,6 +429,7 @@ kernel void kernel_gemm_noshuffle_q4_k_f32_kimg(
 #define COK_NSG 8
 #endif
 #define COK_SG  64
+#ifndef Q4K_COK_MINIMAL
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
 #endif
@@ -515,6 +528,7 @@ kernel void kernel_gemm_noshuffle_q4_k_f32_cok(
         if (idx < m*n_no_padding) { dst[idx] = sum.s7; }
     }
 }
+#endif  // !Q4K_COK_MINIMAL
 
 // Weights-as-texture variant of kernel_gemm_noshuffle_q4_k_f32_cok.
 //
@@ -533,6 +547,7 @@ kernel void kernel_gemm_noshuffle_q4_k_f32_cok(
 // the _kimg and dp4a _wimg kernels use. The host only selects this variant when m
 // is even, so (gx + (ki>>2)*m) has constant ushort parity per row: the wanted half
 // is picked with one hoisted shift, and adjacent lanes share each uint32 texel.
+#ifndef Q4K_COK_MINIMAL
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
 #endif
@@ -633,6 +648,7 @@ kernel void kernel_gemm_noshuffle_q4_k_f32_cok_wimg(
         if (idx < m*n_no_padding) { dst[idx] = sum.s7; }
     }
 }
+#endif  // !Q4K_COK_MINIMAL
 
 // 4-rows-per-lane cok. Same cooperative-K structure; the only change is that each
 // lane owns FOUR adjacent output rows instead of one.
@@ -654,6 +670,7 @@ kernel void kernel_gemm_noshuffle_q4_k_f32_cok_wimg(
 // register pressure, not ALU, has governed every previous attempt on this kernel.
 //
 // Needs m % 4 == 0 for the vector loads and the row-group split; the host checks it.
+#ifndef Q4K_COK_MINIMAL
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
 #endif
@@ -780,6 +797,7 @@ kernel void kernel_gemm_noshuffle_q4_k_f32_cok_r4(
         if (idx < m*n_no_padding) { vstore4((float4)(out[0].s7, out[1].s7, out[2].s7, out[3].s7), 0, dst + idx); }
     }
 }
+#endif  // !Q4K_COK_MINIMAL
 
 // _cok_r4 reading the WEIGHTS through the texture path instead of a plain buffer.
 // The 1-row texture variant measured -39% and the recorded reason was granularity: a
@@ -789,6 +807,7 @@ kernel void kernel_gemm_noshuffle_q4_k_f32_cok_r4(
 // through read_imageui and reaches 117 GB/s where this kernel manages 88 on identical
 // traffic, and five other explanations for that gap have now been falsified.
 // Needs an even m for the texel index; the host checks it.
+#ifndef Q4K_COK_MINIMAL
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
 #endif
@@ -923,6 +942,7 @@ kernel void kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg(
         if (idx < m*n_no_padding) { vstore4((float4)(out[0].s7, out[1].s7, out[2].s7, out[3].s7), 0, dst + idx); }
     }
 }
+#endif  // !Q4K_COK_MINIMAL
 
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
@@ -1095,6 +1115,7 @@ kernel void kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr(
 // kernel_transpose_32_16; the host binds a second, wider image over the same
 // sub-buffer for this kernel to read. n is padded to a multiple of 8, so n>>3 is exact.
 // Opt-in while measured: GGML_OPENCL_Q4K_GEMM_COK_R4_WIMG_NR_W8=1.
+#ifndef Q4K_COK_MINIMAL
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
 #endif
@@ -1245,6 +1266,7 @@ kernel void kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_w8(
         if (idx < m*n_no_padding) { vstore4((float4)(o0.s7, o1.s7, o2.s7, o3.s7), 0, dst + idx); idx += m; }
     }
 }
+#endif  // !Q4K_COK_MINIMAL
 
 // 2 rows per lane: the shape-adaptive middle point between the 1-row and 4-row
 // kernels, for OUTPUTS TOO NARROW TO FILL THE GPU AT 4 ROWS. Workgroups = ne01/(rows*64),
@@ -1257,6 +1279,7 @@ kernel void kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_w8(
 // lane it consumes EXACTLY ONE whole uint32 texel - no half-texel waste, which is what
 // sank the 1-row texture variant.
 // Weights through the texture and outputs in named registers, matching the 4-row default.
+#ifndef Q4K_COK_MINIMAL
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
 #endif
@@ -1368,7 +1391,9 @@ kernel void kernel_gemm_noshuffle_q4_k_f32_cok_r2_wimg_nr(
         if (idx < m*n_no_padding) { vstore2((float2)(o0.s7, o1.s7), 0, dst + idx); }
     }
 }
+#endif  // !Q4K_COK_MINIMAL
 
+#ifndef Q4K_COK_MINIMAL
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
 #endif
@@ -1518,7 +1543,9 @@ kernel void kernel_gemm_noshuffle_q4_k_f32_cok_r4_nr(
         if (idx < m*n_no_padding) { vstore4((float4)((float)o0.s7, (float)o1.s7, (float)o2.s7, (float)o3.s7), 0, dst + idx); idx += m; }
     }
 }
+#endif  // !Q4K_COK_MINIMAL
 
+#ifndef Q4K_COK_MINIMAL
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
 #endif
@@ -1671,12 +1698,14 @@ kernel void kernel_gemm_noshuffle_q4_k_f32_cok_r4_nrh(
         if (idx < m*n_no_padding) { vstore4((float4)((float)o0.s7, (float)o1.s7, (float)o2.s7, (float)o3.s7), 0, dst + idx); idx += m; }
     }
 }
+#endif  // !Q4K_COK_MINIMAL
 
 // _cok_r4 with the SCALE reads vectorised. Identical arithmetic to _cok_r4; the only
 // change is that the four rows' scale codes are read as uchar4 instead of one byte at
 // a time, cutting 8-12 narrow loads per 32-K step to 2-3. The weights, d and dm were
 // already vector loads after r4, so the scale codes were the last narrow read left in
 // the inner loop, and the r4 win showed this kernel family is issue bound.
+#ifndef Q4K_COK_MINIMAL
 REQD_SUBGROUP_SIZE_64
 kernel void kernel_gemm_noshuffle_q4_k_f32_cok_r4_sv(
     global const ushort * src0_q,
@@ -1787,6 +1816,7 @@ kernel void kernel_gemm_noshuffle_q4_k_f32_cok_r4_sv(
         if (idx < m*n_no_padding) { vstore4((float4)(out[0].s7, out[1].s7, out[2].s7, out[3].s7), 0, dst + idx); }
     }
 }
+#endif  // !Q4K_COK_MINIMAL
 
 // _cok_r4 with the per-weight scale and min folded OUT of the inner loop.
 //
@@ -1808,6 +1838,7 @@ kernel void kernel_gemm_noshuffle_q4_k_f32_cok_r4_sv(
 // NOT bit-identical to _cok_r4: the products are summed before scaling rather than
 // after, so half rounding falls differently. The raw accumulator is reset every 32-K
 // block, which bounds it at 32*15*|B| and keeps it in half's range.
+#ifndef Q4K_COK_MINIMAL
 REQD_SUBGROUP_SIZE_64
 kernel void kernel_gemm_noshuffle_q4_k_f32_cok_r4_ma(
     global const ushort * src0_q,
@@ -1938,6 +1969,7 @@ kernel void kernel_gemm_noshuffle_q4_k_f32_cok_r4_ma(
         if (idx < m*n_no_padding) { vstore4((float4)(out[0].s7, out[1].s7, out[2].s7, out[3].s7), 0, dst + idx); }
     }
 }
+#endif  // !Q4K_COK_MINIMAL
 
 // 8-rows-per-lane cok. Same idea as _cok_r4, taken one step further: eight adjacent
 // rows load as a single ushort8, which is 16 bytes per lane and finally matches the
@@ -1975,6 +2007,7 @@ kernel void kernel_gemm_noshuffle_q4_k_f32_cok_r4_ma(
         OUT = sum;                                                                \
     }
 
+#ifndef Q4K_COK_MINIMAL
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
 #endif
@@ -2078,3 +2111,4 @@ kernel void kernel_gemm_noshuffle_q4_k_f32_cok_r8(
         if (idx < m*n_no_padding) { vstore8((float8)(o0.s7,o1.s7,o2.s7,o3.s7,o4.s7,o5.s7,o6.s7,o7.s7), 0, dst + idx); }
     }
 }
+#endif  // !Q4K_COK_MINIMAL

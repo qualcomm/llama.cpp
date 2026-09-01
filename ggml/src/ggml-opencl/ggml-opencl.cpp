@@ -2595,12 +2595,21 @@ static void ggml_cl_cok_build_q4k_nsg_alt(ggml_backend_opencl_context * backend_
 #else
     const std::string kernel_src = read_file("gemm_noshuffle_q4_k_f32.cl");
 #endif
+    // Build ONLY the kernel this program is consulted for. Two effects, both measured
+    // separately from the K-split change: the driver stops capping the launch at the
+    // minimum work-group size over sibling kernels that never run (640 -> its own 896),
+    // and the compiler spends its per-program time budget on one kernel instead of 15.
+    // GGML_OPENCL_Q4K_COK_MINIMAL=0 builds the whole file into the alt program instead.
+    static const char * minimal_env = getenv("GGML_OPENCL_Q4K_COK_MINIMAL");
+    const bool minimal_on = (minimal_env == nullptr) || (atoi(minimal_env) != 0);
+    const std::string alt_opts = minimal_on ? (compile_opts + " -DQ4K_COK_MINIMAL=1")
+                                            : compile_opts;
     static const char * nsg_alt_env = getenv("GGML_OPENCL_Q4K_COK_NSG_ALT");
     const int nsg_req = nsg_alt_env ? atoi(nsg_alt_env) : 6;
     if (nsg_req < 1) { return; }
     int nsg_eff = nsg_req;
     cl_program prog = ggml_cl_build_cok_program(backend_ctx, kernel_src.c_str(),
-                                                compile_opts, nsg_req, &nsg_eff);
+                                                alt_opts, nsg_req, &nsg_eff);
     if (prog == nullptr) { return; }
     backend_ctx->q4k_cok_nsg_alt = nsg_eff;
     // Only the default-selected kernel is taken from this program; the rest of the file
