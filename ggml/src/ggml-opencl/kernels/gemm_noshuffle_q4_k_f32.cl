@@ -1098,7 +1098,6 @@ kernel void kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr(
         if (idx < m*n_no_padding) { vstore4((float4)(o0.s7, o1.s7, o2.s7, o3.s7), 0, dst + idx); idx += m; }
     }
 }
-#endif  // !Q4K_COK_MINIMAL
 
 // 2 rows per lane: the shape-adaptive middle point between the 1-row and 4-row
 // kernels, for OUTPUTS TOO NARROW TO FILL THE GPU AT 4 ROWS. Workgroups = ne01/(rows*64),
