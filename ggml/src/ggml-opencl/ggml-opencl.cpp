@@ -1003,7 +1003,7 @@ struct ggml_backend_opencl_context {
     get_adreno_bin_kernel_func_t get_adreno_bin_kernel_func = nullptr;
     ggml_cl_compiler_version adreno_cl_compiler_version;
     // The q6_K flat mul_mat codegen workarounds are needed by old E031 compilers only.
-    bool q6_k_flat_old_compiler;
+    bool q6_k_flat_old_compiler = false;
 
     std::string kernel_compile_opts;  // cached for lazy-compiled kernels.
 
@@ -1352,6 +1352,7 @@ struct ggml_backend_opencl_context {
     // Null when the variant is disabled.
     int       q6k_flat_ndst = 16;  // tile the single-column flat GEMV was built with
     int       q6k_flat_nsg  = 2;
+    int       q6k_flat_num_args = 17;  // 18 when built with ADRENO_OLD_COMPILER
     cl_kernel kernel_mul_mv_q6_K_f32_flat_mc2 = nullptr;
     cl_kernel kernel_mul_mv_q6_K_f32_flat_mc4 = nullptr;
     int       q6k_mc2_ndst = 0;   // N_DST each variant was built with
@@ -3493,6 +3494,18 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts_local);
 
         CL_CHECK((backend_ctx->kernel_mul_mv_q6_K_f32_flat = clCreateKernel(prog, "kernel_mul_mv_q6_K_f32_flat", &err), err));
+        {   // The optimizer-barrier argument exists only when this program was built
+            // with ADRENO_OLD_COMPILER. Two INDEPENDENT conditions add that define -- the
+            // generation test in the shared compile options (A7X/A6X, for the
+            // sub_group_shuffle_xor remap) and the compiler-version test below -- so
+            // re-deriving it at dispatch is wrong wherever they disagree. The Adreno 619
+            // is exactly that device: A6X generation, but an E031.45 compiler. Ask the
+            // built kernel how many arguments it has instead.
+            cl_uint na = 0;
+            clGetKernelInfo(backend_ctx->kernel_mul_mv_q6_K_f32_flat, CL_KERNEL_NUM_ARGS,
+                            sizeof(na), &na, NULL);
+            backend_ctx->q6k_flat_num_args = (int)na;
+        }
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
@@ -34185,7 +34198,8 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             CL_CHECK(clSetKernelArg(kernel, 16, sizeof(int),      &r3));
             // The optimizer-barrier arg exists only in the ADRENO_OLD_COMPILER build of
             // this kernel; conformant compilers get the original 17-arg signature.
-            if (backend_ctx->q6_k_flat_old_compiler) {
+            if (kernel == backend_ctx->kernel_mul_mv_q6_K_f32_flat &&
+                backend_ctx->q6k_flat_num_args > 17) {
                 cl_uchar q6k_mask = 0xFF;   // never 0xFE in prod; see the kernel note
                 CL_CHECK(clSetKernelArg(kernel, 17, sizeof(cl_uchar), &q6k_mask));
             }
