@@ -246,7 +246,7 @@ int op_concat(struct htp_ops_context * octx) {
         const uint32_t total_rows = dst->ne[1];
         uint32_t mdev_row_start, mdev_nrows;
         if (octx->mdev_count > 1) {
-            const uint32_t rows_per_mdev = (total_rows + octx->mdev_count - 1) / octx->mdev_count;
+            const uint32_t rows_per_mdev = fastdiv(total_rows + octx->mdev_count - 1, &octx->mdev_count_div);
             mdev_row_start = MIN(octx->mdev_idx * rows_per_mdev, total_rows);
             mdev_nrows     = MIN(rows_per_mdev, total_rows - mdev_row_start);
         } else {
@@ -261,13 +261,9 @@ int op_concat(struct htp_ops_context * octx) {
         cctx.mdev_row_start = mdev_row_start;
         cctx.mdev_nrows     = mdev_nrows;
 
-        n_threads = MIN(mdev_nrows, n_threads);
-        if (n_threads < 1) {
-            n_threads = 1;
-        }
         uint32_t block_i = (type_size == 4) ? 32 : 64;
 
-        cctx.nrows_per_thread = hmx_ceil_div(mdev_nrows, n_threads);
+        cctx.nrows_per_thread = fastdiv(mdev_nrows + n_threads - 1, &octx->n_threads_div);
 
         // Allocate VTCM
         uint32_t spad1_stride = block_i * type_size;
@@ -300,7 +296,7 @@ int op_concat(struct htp_ops_context * octx) {
         uint32_t mdev_elem_start, mdev_nelems;
         if (octx->mdev_count > 1) {
             const uint32_t elems_per_line = MAX(1u, (uint32_t) HEX_L2_LINE_SIZE / type_size);
-            uint32_t elems_per_mdev = (total_elements + octx->mdev_count - 1) / octx->mdev_count;
+            uint32_t elems_per_mdev = fastdiv(total_elements + octx->mdev_count - 1, &octx->mdev_count_div);
             elems_per_mdev = ((elems_per_mdev + elems_per_line - 1) / elems_per_line) * elems_per_line;
             mdev_elem_start = MIN(octx->mdev_idx * elems_per_mdev, total_elements);
             mdev_nelems     = MIN(elems_per_mdev, total_elements - mdev_elem_start);

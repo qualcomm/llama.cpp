@@ -277,7 +277,7 @@ int op_im2col(struct htp_ops_context * octx) {
     uint32_t patch_base, dev_npatches;
     if (octx->mdev_count > 1) {
         const uint32_t patches_per_line = MAX(1, (uint32_t) HEX_L2_LINE_SIZE / dst->nb[1]);
-        uint32_t patches_per_mdev = (npatches + octx->mdev_count - 1) / octx->mdev_count;
+        uint32_t patches_per_mdev = fastdiv(npatches + octx->mdev_count - 1, &octx->mdev_count_div);
         patches_per_mdev = ((patches_per_mdev + patches_per_line - 1) / patches_per_line) * patches_per_line;
         patch_base    = MIN(octx->mdev_idx * patches_per_mdev, npatches);
         dev_npatches  = MIN(patches_per_mdev, npatches - patch_base);
@@ -289,7 +289,7 @@ int op_im2col(struct htp_ops_context * octx) {
     uint32_t row_base, mdev_nrows;
     if (octx->mdev_count > 1) {
         const uint32_t rows_per_line = MAX(1, (uint32_t) HEX_L2_LINE_SIZE / dst->nb[2]);
-        uint32_t rows_per_mdev = (nrows + octx->mdev_count - 1) / octx->mdev_count;
+        uint32_t rows_per_mdev = fastdiv(nrows + octx->mdev_count - 1, &octx->mdev_count_div);
         rows_per_mdev = ((rows_per_mdev + rows_per_line - 1) / rows_per_line) * rows_per_line;
         row_base   = MIN(octx->mdev_idx * rows_per_mdev, nrows);
         mdev_nrows  = MIN(rows_per_mdev, nrows - row_base);

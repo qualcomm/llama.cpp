@@ -453,7 +453,7 @@ int op_argsort(struct htp_ops_context * octx) {
 
     uint32_t mdev_row_start, mdev_row_end;
     if (octx->mdev_count > 1) {
-        const uint32_t rows_per_mdev = (total_rows + octx->mdev_count - 1) / octx->mdev_count;
+        const uint32_t rows_per_mdev = fastdiv(total_rows + octx->mdev_count - 1, &octx->mdev_count_div);
         mdev_row_start = MIN(octx->mdev_idx * rows_per_mdev, total_rows);
         mdev_row_end   = MIN(mdev_row_start + rows_per_mdev, total_rows);
     } else {
@@ -466,7 +466,7 @@ int op_argsort(struct htp_ops_context * octx) {
         return HTP_STATUS_OK;
     }
 
-    const uint32_t n_threads = MIN(mdev_nrows, octx->n_threads);
+    const uint32_t n_threads = octx->n_threads;
 
     // Allocate scratchpad
     // We need 1 row of float + 1 row of int32 per thread.
@@ -492,7 +492,7 @@ int op_argsort(struct htp_ops_context * octx) {
 
     struct htp_argsort_context actx;
     actx.octx = octx;
-    actx.nrows_per_thread = (mdev_nrows + n_threads - 1) / n_threads;
+    actx.nrows_per_thread = fastdiv(mdev_nrows + n_threads - 1, &octx->n_threads_div);
     actx.total_rows       = mdev_nrows;
     actx.mdev_row_start   = mdev_row_start;
     actx.mdev_row_end     = mdev_row_end;

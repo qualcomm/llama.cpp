@@ -989,6 +989,8 @@ static int proc_op_req(struct htp_ops_context * octx, struct htp_tensor *tens, u
     memcpy(octx->kernel_params, op->kernel_params, sizeof(octx->kernel_params));
     octx->flags = op->flags;
     octx->op    = op->opcode;
+    octx->n_threads     = octx->ctx->n_threads;
+    octx->n_threads_div = octx->ctx->n_threads_div;
 
     FARF(HIGH, "proc-op #%u: opcode %u flags 0x%x", idx, octx->op, octx->flags);
 
@@ -1096,10 +1098,14 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
 
     struct htp_ops_context *octx = &ctx->octx;
     memset(octx, 0, sizeof(*octx));
-    octx->n_threads = ctx->n_threads;
-    octx->ctx       = ctx;
-    octx->mdev_idx   = req->mdev_idx;
-    octx->mdev_count = req->mdev_count;
+    octx->n_threads     = ctx->n_threads;
+    octx->n_threads_div = ctx->n_threads_div;
+    octx->ctx           = ctx;
+    octx->mdev_idx      = req->mdev_idx;
+    octx->mdev_count    = req->mdev_count;
+    if (octx->mdev_count > 1) {
+        octx->mdev_count_div = init_fastdiv_values(octx->mdev_count);
+    }
 
     work_queue_wakeup(ctx->work_queue);
     if (ctx->hmx_queue) {

@@ -276,7 +276,7 @@ int op_cpy(struct htp_ops_context * octx) {
 
     uint32_t mdev_row_start, mdev_nrows;
     if (octx->mdev_count > 1) {
-        const uint32_t rows_per_mdev = (nr + octx->mdev_count - 1) / octx->mdev_count;
+        const uint32_t rows_per_mdev = fastdiv(nr + octx->mdev_count - 1, &octx->mdev_count_div);
         mdev_row_start = MIN(octx->mdev_idx * rows_per_mdev, nr);
         mdev_nrows     = MIN(rows_per_mdev, nr - mdev_row_start);
     } else {
@@ -288,7 +288,7 @@ int op_cpy(struct htp_ops_context * octx) {
         return HTP_STATUS_OK;
     }
 
-    const uint32_t n_threads = MIN(mdev_nrows, octx->n_threads);
+    const uint32_t n_threads = octx->n_threads;
 
     struct htp_copy_context ct;
     ct.octx = octx;
@@ -315,7 +315,7 @@ int op_cpy(struct htp_ops_context * octx) {
     const bool transposed = (nb00 > nb01) || (nb0 > nb1);
     const bool sameshape  = !transposed && (ne00 == ne0 && ne01 == ne1 && ne02 == ne2 && ne03 == ne3);
 
-    ct.src0_nrows_per_thread = (mdev_nrows + n_threads - 1) / n_threads;
+    ct.src0_nrows_per_thread = fastdiv(mdev_nrows + n_threads - 1, &octx->n_threads_div);
     ct.mdev_row_start = mdev_row_start;
     ct.mdev_nrows     = mdev_nrows;
 

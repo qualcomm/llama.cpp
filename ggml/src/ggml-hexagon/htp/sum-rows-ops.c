@@ -113,7 +113,7 @@ int op_sum_rows(struct htp_ops_context * octx) {
             multi-device uses.
         */
         const uint32_t rows_per_line = MAX(1, (uint32_t) HEX_L2_LINE_SIZE / nb1);
-        uint32_t rows_per_mdev = (src0_nrows + octx->mdev_count - 1) / octx->mdev_count;
+        uint32_t rows_per_mdev = fastdiv(src0_nrows + octx->mdev_count - 1, &octx->mdev_count_div);
         rows_per_mdev = ((rows_per_mdev + rows_per_line - 1) / rows_per_line) * rows_per_line;
         mdev_row_start = MIN(octx->mdev_idx * rows_per_mdev, src0_nrows);
         mdev_nrows     = MIN(rows_per_mdev, src0_nrows - mdev_row_start);
@@ -126,8 +126,8 @@ int op_sum_rows(struct htp_ops_context * octx) {
         return HTP_STATUS_OK;
     }
 
-    const uint32_t n_threads = MIN(octx->n_threads, mdev_nrows);
-    const uint32_t rows_per_thread = (mdev_nrows + n_threads - 1) / n_threads;
+    const uint32_t n_threads = octx->n_threads;
+    const uint32_t rows_per_thread = fastdiv(mdev_nrows + n_threads - 1, &octx->n_threads_div);
 
     bool opt_path = false;
     if ((0 == hex_is_aligned((void *) src0->data, VLEN)) && !(nb01 & (VLEN - 1))) {

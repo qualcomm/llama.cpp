@@ -66,9 +66,11 @@ struct htp_ops_context {
     struct htp_spad dst_spad;
 
     uint32_t n_threads;
+    struct fastdiv_values n_threads_div;
     uint32_t flags;
     uint16_t mdev_idx;
     uint16_t mdev_count;
+    struct fastdiv_values mdev_count_div;
 };
 
 // Main context for htp DSP backend

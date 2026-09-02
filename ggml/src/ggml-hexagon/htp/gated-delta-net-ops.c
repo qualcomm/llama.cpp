@@ -1132,7 +1132,7 @@ int op_gated_delta_net(struct htp_ops_context * octx) {
 
     uint32_t mdev_row_start, mdev_nrows;
     if (octx->mdev_count > 1) {
-        const uint32_t rows_per_mdev = (total_rows + octx->mdev_count - 1) / octx->mdev_count;
+        const uint32_t rows_per_mdev = fastdiv(total_rows + octx->mdev_count - 1, &octx->mdev_count_div);
         mdev_row_start = MIN(octx->mdev_idx * rows_per_mdev, total_rows);
         mdev_nrows     = MIN(rows_per_mdev, total_rows - mdev_row_start);
     } else {
@@ -1144,13 +1144,13 @@ int op_gated_delta_net(struct htp_ops_context * octx) {
         return HTP_STATUS_OK;
     }
 
-    const uint32_t n_threads = MIN(octx->n_threads, mdev_nrows);
+    const uint32_t n_threads = octx->n_threads;
 
     struct htp_gdn_context gctx;
     gctx.octx = octx;
-    gctx.mdev_row_start   = mdev_row_start;
-    gctx.mdev_nrows       = mdev_nrows;
-    gctx.rows_per_thread = (mdev_nrows + n_threads - 1) / n_threads;
+    gctx.mdev_row_start  = mdev_row_start;
+    gctx.mdev_nrows      = mdev_nrows;
+    gctx.rows_per_thread = fastdiv(mdev_nrows + n_threads - 1, &octx->n_threads_div);
     gctx.state_bytes = (size_t) S_v * S_v * sizeof(float);
 
     size_t state_aligned = (size_t) S_v * S_v * sizeof(float);

@@ -51,6 +51,10 @@ static void fill_thread(unsigned int nth, unsigned int ith, void * data) {
     const uint32_t ir0 = fctx->mdev_row_start + fctx->nrows_per_thread * ith;
     const uint32_t ir1 = MIN(ir0 + fctx->nrows_per_thread, fctx->mdev_row_start + fctx->total_rows);
 
+    if (ir0 >= ir1) {
+        return;
+    }
+
     uint64_t t1 = HAP_perf_get_qtimer_count();
 
     if (fctx->opt_path) {
@@ -88,7 +92,7 @@ int op_fill(struct htp_ops_context * octx) {
 
     uint32_t mdev_row_start, mdev_nrows;
     if (octx->mdev_count > 1) {
-        const uint32_t rows_per_mdev = (nr + octx->mdev_count - 1) / octx->mdev_count;
+        const uint32_t rows_per_mdev = fastdiv(nr + octx->mdev_count - 1, &octx->mdev_count_div);
         mdev_row_start = MIN(octx->mdev_idx * rows_per_mdev, nr);
         mdev_nrows     = MIN(rows_per_mdev, nr - mdev_row_start);
     } else {
@@ -101,7 +105,7 @@ int op_fill(struct htp_ops_context * octx) {
     }
 
     // nr = ne1*ne2*ne3 (flat row count across all outer dims); parallelise over it.
-    const uint32_t n_threads = MIN(mdev_nrows, octx->n_threads);
+    const uint32_t n_threads = octx->n_threads;
 
     // Optimize if fully contiguous: skip stride arithmetic, treat as flat array
     const bool opt_path = (nb2 == nb1 * ne1) && (nb3 == nb2 * ne2);
@@ -114,9 +118,9 @@ int op_fill(struct htp_ops_context * octx) {
 
     struct htp_fill_context fctx = {
         .octx             = octx,
-        .nrows_per_thread = (mdev_nrows + n_threads - 1) / n_threads,
+        .nrows_per_thread = fastdiv(mdev_nrows + n_threads - 1, &octx->n_threads_div),
         .total_rows       = mdev_nrows,
-        .mdev_row_start    = mdev_row_start,
+        .mdev_row_start   = mdev_row_start,
         .opt_path         = opt_path,
     };
 

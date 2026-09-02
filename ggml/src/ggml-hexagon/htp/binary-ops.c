@@ -728,7 +728,7 @@ static int execute_op_binary(struct htp_ops_context * octx) {
 
     uint32_t mdev_row_start, mdev_nrows;
     if (octx->mdev_count > 1) {
-        const uint32_t rows_per_mdev = (src0_nrows + octx->mdev_count - 1) / octx->mdev_count;
+        const uint32_t rows_per_mdev = fastdiv(src0_nrows + octx->mdev_count - 1, &octx->mdev_count_div);
         mdev_row_start = MIN(octx->mdev_idx * rows_per_mdev, src0_nrows);
         mdev_nrows     = MIN(rows_per_mdev, src0_nrows - mdev_row_start);
     } else {
@@ -740,7 +740,7 @@ static int execute_op_binary(struct htp_ops_context * octx) {
         return HTP_STATUS_OK;
     }
 
-    const uint32_t n_threads  = MIN(octx->n_threads, mdev_nrows);
+    const uint32_t n_threads = octx->n_threads;
 
     // Use packed row sizes for VTCM allocation
     const uint32_t src0_type = octx->src[0]->type;
@@ -826,7 +826,7 @@ static int execute_op_binary(struct htp_ops_context * octx) {
 
     struct htp_binary_context bctx;
     bctx.octx                  = octx;
-    bctx.nrows_per_thread      = (mdev_nrows + n_threads - 1) / n_threads;
+    bctx.nrows_per_thread      = fastdiv(mdev_nrows + n_threads - 1, &octx->n_threads_div);
     bctx.total_rows            = mdev_nrows;
     bctx.mdev_row_start         = mdev_row_start;
     bctx.block_max             = rows_per_buffer;

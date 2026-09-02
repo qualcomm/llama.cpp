@@ -128,7 +128,7 @@ int op_repeat(struct htp_ops_context * octx) {
 
     uint32_t mdev_row_start, mdev_nrows;
     if (octx->mdev_count > 1) {
-        const uint32_t rows_per_mdev = (total_dst_rows + octx->mdev_count - 1) / octx->mdev_count;
+        const uint32_t rows_per_mdev = fastdiv(total_dst_rows + octx->mdev_count - 1, &octx->mdev_count_div);
         mdev_row_start = MIN(octx->mdev_idx * rows_per_mdev, total_dst_rows);
         mdev_nrows     = MIN(rows_per_mdev, total_dst_rows - mdev_row_start);
     } else {
@@ -140,7 +140,7 @@ int op_repeat(struct htp_ops_context * octx) {
         return HTP_STATUS_OK;
     }
 
-    const uint32_t n_threads = MIN(octx->n_threads, mdev_nrows);
+    const uint32_t n_threads = octx->n_threads;
 
     struct htp_repeat_context rctx = {
         .octx             = octx,
@@ -148,9 +148,9 @@ int op_repeat(struct htp_ops_context * octx) {
         .nr1              = dst->ne[1] / src0->ne[1],
         .nr2              = dst->ne[2] / src0->ne[2],
         .nr3              = dst->ne[3] / src0->ne[3],
-        .nrows_per_thread = (mdev_nrows + n_threads - 1) / n_threads,
+        .nrows_per_thread = fastdiv(mdev_nrows + n_threads - 1, &octx->n_threads_div),
         .total_dst_rows   = mdev_nrows,
-        .mdev_row_start    = mdev_row_start,
+        .mdev_row_start   = mdev_row_start,
         .type_size        = type_size,
     };
 

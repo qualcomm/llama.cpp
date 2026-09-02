@@ -1153,7 +1153,7 @@ static int execute_op_unary(struct htp_ops_context * octx) {
 
     uint32_t mdev_row_start, mdev_nrows;
     if (octx->mdev_count > 1) {
-        const uint32_t rows_per_mdev = (src0_nrows + octx->mdev_count - 1) / octx->mdev_count;
+        const uint32_t rows_per_mdev = fastdiv(src0_nrows + octx->mdev_count - 1, &octx->mdev_count_div);
         mdev_row_start = MIN(octx->mdev_idx * rows_per_mdev, src0_nrows);
         mdev_nrows     = MIN(rows_per_mdev, src0_nrows - mdev_row_start);
     } else {
@@ -1165,7 +1165,7 @@ static int execute_op_unary(struct htp_ops_context * octx) {
         return HTP_STATUS_OK;
     }
 
-    const uint32_t n_threads  = MIN(kparams->n_threads, mdev_nrows);
+    const uint32_t n_threads = octx->n_threads;
 
     const size_t elem_size = is_f16 ? sizeof(_Float16) : sizeof(float);
 
@@ -1209,7 +1209,7 @@ static int execute_op_unary(struct htp_ops_context * octx) {
         struct htp_unary_context uctx = {
             .octx                  = octx,
             .kparams               = kparams,
-            .src0_nrows_per_thread = (mdev_nrows + n_threads - 1) / n_threads,
+            .src0_nrows_per_thread = fastdiv(mdev_nrows + n_threads - 1, &octx->n_threads_div),
             .src0_nrows            = mdev_nrows,
             .mdev_row_start         = mdev_row_start,
 

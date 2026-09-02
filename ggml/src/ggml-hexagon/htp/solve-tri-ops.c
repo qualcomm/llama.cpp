@@ -236,7 +236,7 @@ int op_solve_tri(struct htp_ops_context * octx) {
     if (batched) {
         uint32_t mdev_job_start, mdev_njobs;
         if (octx->mdev_count > 1) {
-            const uint32_t jobs_per_mdev = (total_batches + octx->mdev_count - 1) / octx->mdev_count;
+            const uint32_t jobs_per_mdev = fastdiv(total_batches + octx->mdev_count - 1, &octx->mdev_count_div);
             mdev_job_start = MIN(octx->mdev_idx * jobs_per_mdev, total_batches);
             mdev_njobs     = MIN(jobs_per_mdev, total_batches - mdev_job_start);
         } else {
@@ -249,13 +249,13 @@ int op_solve_tri(struct htp_ops_context * octx) {
         }
 
         // Batch-level parallelism
-        const uint32_t n_threads = MIN((uint32_t) octx->n_threads, mdev_njobs);
+        const uint32_t n_threads = octx->n_threads;
 
         struct htp_solve_tri_context sctx = {
             .octx            = octx,
-            .jobs_per_thread = (mdev_njobs + n_threads - 1) / n_threads,
+            .jobs_per_thread = fastdiv(mdev_njobs + n_threads - 1, &octx->n_threads_div),
             .total_jobs      = mdev_njobs,
-            .mdev_job_start   = mdev_job_start,
+            .mdev_job_start  = mdev_job_start,
             .k_chunks        = k_chunks,
             .col_block       = col_block,
         };
@@ -267,7 +267,7 @@ int op_solve_tri(struct htp_ops_context * octx) {
 
         uint32_t mdev_job_start, mdev_njobs;
         if (octx->mdev_count > 1) {
-            const uint32_t jobs_per_mdev = (total_jobs + octx->mdev_count - 1) / octx->mdev_count;
+            const uint32_t jobs_per_mdev = fastdiv(total_jobs + octx->mdev_count - 1, &octx->mdev_count_div);
             mdev_job_start = MIN(octx->mdev_idx * jobs_per_mdev, total_jobs);
             mdev_njobs     = MIN(jobs_per_mdev, total_jobs - mdev_job_start);
         } else {
@@ -279,13 +279,13 @@ int op_solve_tri(struct htp_ops_context * octx) {
             return HTP_STATUS_OK;
         }
 
-        const uint32_t n_threads  = MIN((uint32_t) octx->n_threads, mdev_njobs);
+        const uint32_t n_threads = octx->n_threads;
 
         struct htp_solve_tri_context sctx = {
             .octx            = octx,
-            .jobs_per_thread = (mdev_njobs + n_threads - 1) / n_threads,
+            .jobs_per_thread = fastdiv(mdev_njobs + n_threads - 1, &octx->n_threads_div),
             .total_jobs      = mdev_njobs,
-            .mdev_job_start   = mdev_job_start,
+            .mdev_job_start  = mdev_job_start,
             .k_chunks        = k_chunks,
             .col_block       = col_block,
         };

@@ -164,7 +164,7 @@ int op_diag_f32(struct htp_ops_context * octx) {
 
     uint32_t mdev_batch_start, mdev_nbatches;
     if (octx->mdev_count > 1) {
-        const uint32_t batches_per_mdev = (total_batches + octx->mdev_count - 1) / octx->mdev_count;
+        const uint32_t batches_per_mdev = fastdiv(total_batches + octx->mdev_count - 1, &octx->mdev_count_div);
         mdev_batch_start = MIN(octx->mdev_idx * batches_per_mdev, total_batches);
         mdev_nbatches    = MIN(batches_per_mdev, total_batches - mdev_batch_start);
     } else {
@@ -176,7 +176,7 @@ int op_diag_f32(struct htp_ops_context * octx) {
         return HTP_STATUS_OK;
     }
 
-    const uint32_t n_threads     = MIN(octx->n_threads, mdev_nbatches);
+    const uint32_t n_threads     = octx->n_threads;
 
     const size_t src_batch_size         = src0->ne[0] * sizeof(float);
     const size_t dst_row_size           = dst->ne[0] * sizeof(float);
@@ -201,7 +201,7 @@ int op_diag_f32(struct htp_ops_context * octx) {
         .dst_row_size           = dst_row_size,
         .src_batch_size_aligned = src_batch_size_aligned,
         .dst_row_size_aligned   = dst_row_size_aligned,
-        .batches_per_thread     = (mdev_nbatches + n_threads - 1) / n_threads,
+        .batches_per_thread     = fastdiv(mdev_nbatches + n_threads - 1, &octx->n_threads_div),
         .total_batches          = mdev_nbatches,
         .mdev_batch_start       = mdev_batch_start,
     };

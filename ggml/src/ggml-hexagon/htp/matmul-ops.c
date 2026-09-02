@@ -240,16 +240,18 @@ static void hvx_mm_4d(unsigned int nth, unsigned int ith, void * data) {
     // This is the size of the rest of the dimensions of the result
     const uint32_t nr1 = ne1 * ne2 * ne3;
 
+    const uint32_t mdev_nrows = mmctx->mdev_row_end - mmctx->mdev_row_start;
+
     // distribute the thread work across the inner or outer loop based on which one is larger
     uint32_t dr0, dr1, ith0, ith1;
     if (nr0 > nr1) {
-        dr0  = fastdiv(nr0 + nth - 1, &octx->ctx->n_threads_div);
+        dr0  = fastdiv(mdev_nrows + nth - 1, &octx->n_threads_div);
         dr1  = nr1;
         ith0 = ith;
         ith1 = 0;
     } else {
-        dr0  = nr0;
-        dr1  = fastdiv(nr1 + nth - 1, &octx->ctx->n_threads_div);
+        dr0  = mdev_nrows;
+        dr1  = fastdiv(nr1 + nth - 1, &octx->n_threads_div);
         ith0 = 0;
         ith1 = ith;
     }
@@ -553,7 +555,7 @@ static void hvx_mm_nx_2d_repacked_##SUFFIX(unsigned int nth, unsigned int ith, v
                                                                                                                                   \
         uint32_t mdev_start_row, mdev_end_row;                                                                                \
         if (octx->mdev_count > 1) {                                                                                           \
-            const uint32_t rows_per_mdev = (ne01 + octx->mdev_count - 1) / octx->mdev_count;                                  \
+            const uint32_t rows_per_mdev = fastdiv(ne01 + octx->mdev_count - 1, &octx->mdev_count_div);                        \
             mdev_start_row = MIN(octx->mdev_idx * rows_per_mdev, ne01);                                                       \
             mdev_end_row   = MIN(mdev_start_row + rows_per_mdev, ne01);                                                       \
         } else {                                                                                                              \
@@ -562,7 +564,7 @@ static void hvx_mm_nx_2d_repacked_##SUFFIX(unsigned int nth, unsigned int ith, v
         }                                                                                                                     \
                                                                                                                               \
         const uint32_t mdev_nrows = mdev_end_row - mdev_start_row;                                                            \
-        uint32_t src0_nrows_per_thread = fastdiv(mdev_nrows + nth - 1, &octx->ctx->n_threads_div);                            \
+        uint32_t src0_nrows_per_thread = fastdiv(mdev_nrows + nth - 1, &octx->n_threads_div);                                \
         src0_nrows_per_thread = hex_round_up(src0_nrows_per_thread, 32);                                                          \
                                                                                                                                   \
         const uint32_t start_row = mdev_start_row + src0_nrows_per_thread * ith;                                           \
@@ -1158,7 +1160,7 @@ static void hvx_mv_id_nx(unsigned int nth, unsigned int ith, void * data) {
             const uint32_t ne01 = src_w->ne[1];
             uint32_t mdev_start_row, mdev_end_row;
             if (octx->mdev_count > 1) {
-                const uint32_t rows_per_mdev = (ne01 + octx->mdev_count - 1) / octx->mdev_count;
+                const uint32_t rows_per_mdev = fastdiv(ne01 + octx->mdev_count - 1, &octx->mdev_count_div);
                 mdev_start_row = MIN(octx->mdev_idx * rows_per_mdev, ne01);
                 mdev_end_row   = MIN(mdev_start_row + rows_per_mdev, ne01);
             } else {
@@ -1167,7 +1169,7 @@ static void hvx_mv_id_nx(unsigned int nth, unsigned int ith, void * data) {
             }
 
             const uint32_t mdev_nrows = mdev_end_row - mdev_start_row;
-            uint32_t src0_nrows_per_thread = fastdiv(mdev_nrows + nth - 1, &octx->ctx->n_threads_div);
+            uint32_t src0_nrows_per_thread = fastdiv(mdev_nrows + nth - 1, &octx->n_threads_div);
             src0_nrows_per_thread = hex_round_up(src0_nrows_per_thread, 32);
 
             const uint32_t src0_start_row = mdev_start_row + src0_nrows_per_thread * ith;
@@ -1253,7 +1255,7 @@ static void hvx_mm_id_nx(unsigned int nth, unsigned int ith, void * data) {
             const uint32_t ne01 = src_w->ne[1];
             uint32_t mdev_start_row, mdev_end_row;
             if (octx->mdev_count > 1) {
-                const uint32_t rows_per_mdev = (ne01 + octx->mdev_count - 1) / octx->mdev_count;
+                const uint32_t rows_per_mdev = fastdiv(ne01 + octx->mdev_count - 1, &octx->mdev_count_div);
                 mdev_start_row = MIN(octx->mdev_idx * rows_per_mdev, ne01);
                 mdev_end_row   = MIN(mdev_start_row + rows_per_mdev, ne01);
             } else {
@@ -1262,7 +1264,7 @@ static void hvx_mm_id_nx(unsigned int nth, unsigned int ith, void * data) {
             }
 
             const uint32_t mdev_nrows = mdev_end_row - mdev_start_row;
-            uint32_t src0_nrows_per_thread = fastdiv(mdev_nrows + nth - 1, &octx->ctx->n_threads_div);
+            uint32_t src0_nrows_per_thread = fastdiv(mdev_nrows + nth - 1, &octx->n_threads_div);
             src0_nrows_per_thread = hex_round_up(src0_nrows_per_thread, 32);
 
             const uint32_t src0_start_row = mdev_start_row + src0_nrows_per_thread * ith;
@@ -1357,12 +1359,12 @@ static int hvx_mm_matmul(struct htp_ops_context * octx) {
 
     const struct htp_mm_kernel_params * kparams = (const struct htp_mm_kernel_params *) octx->kernel_params;
 
-    const uint32_t src0_nrows = ne01 * ne02 * ne03;
+    const uint32_t src0_nrows = ne01;
     const uint32_t src1_nrows = ne11 * ne12 * ne13;
 
     uint32_t mdev_row_start, mdev_row_end;
     if (octx->mdev_count > 1) {
-        const uint32_t rows_per_mdev = (src0_nrows + octx->mdev_count - 1) / octx->mdev_count;
+        const uint32_t rows_per_mdev = fastdiv(src0_nrows + octx->mdev_count - 1, &octx->mdev_count_div);
         mdev_row_start = MIN(octx->mdev_idx * rows_per_mdev, src0_nrows);
         mdev_row_end   = MIN(mdev_row_start + rows_per_mdev, src0_nrows);
     } else {
@@ -1383,7 +1385,7 @@ static int hvx_mm_matmul(struct htp_ops_context * octx) {
                         src0->type == HTP_TYPE_MXFP4);
 
     // Compute src0_nrows_per_thread
-    mmctx->src0_nrows_per_thread  = fastdiv(mdev_nrows + octx->n_threads - 1, &octx->ctx->n_threads_div);
+    mmctx->src0_nrows_per_thread  = fastdiv(mdev_nrows + octx->n_threads - 1, &octx->n_threads_div);
     if (is_repacked) {
         mmctx->src0_nrows_per_thread = hex_round_up(mmctx->src0_nrows_per_thread, 32);
     } else {
@@ -1555,11 +1557,11 @@ static int hvx_mm_matmul(struct htp_ops_context * octx) {
         kparams->kernel_type == HTP_MM_KERNEL_HVX_QUANT_BLOCK) {
         mmctx->vtcm_src1_size_per_thread = L.src1_bytes;
     } else {
-        mmctx->vtcm_src1_size_per_thread = fastdiv(L.src1_bytes, &octx->ctx->n_threads_div);
+        mmctx->vtcm_src1_size_per_thread = fastdiv(L.src1_bytes, &octx->n_threads_div);
     }
 
-    mmctx->vtcm_src0_size_per_thread = fastdiv(L.src0_bytes, &octx->ctx->n_threads_div);
-    mmctx->vtcm_dst_size_per_thread  = fastdiv(L.dst_bytes, &octx->ctx->n_threads_div);
+    mmctx->vtcm_src0_size_per_thread = fastdiv(L.src0_bytes, &octx->n_threads_div);
+    mmctx->vtcm_dst_size_per_thread  = fastdiv(L.dst_bytes, &octx->n_threads_div);
 
     size_t vtcm_size = kparams->vtcm_size > 0 ? (size_t)kparams->vtcm_size : L.total_bytes;
 
@@ -1637,7 +1639,7 @@ static void hvx_mm_nx_2d(unsigned int nth, unsigned int ith, void * data) {
         const uint32_t ne01 = src_w->ne[1];
         uint32_t mdev_start_row, mdev_end_row;
         if (octx->mdev_count > 1) {
-            const uint32_t rows_per_mdev = (ne01 + octx->mdev_count - 1) / octx->mdev_count;
+            const uint32_t rows_per_mdev = fastdiv(ne01 + octx->mdev_count - 1, &octx->mdev_count_div);
             mdev_start_row = MIN(octx->mdev_idx * rows_per_mdev, ne01);
             mdev_end_row   = MIN(mdev_start_row + rows_per_mdev, ne01);
         } else {
@@ -1646,7 +1648,7 @@ static void hvx_mm_nx_2d(unsigned int nth, unsigned int ith, void * data) {
         }
 
         const uint32_t mdev_nrows = mdev_end_row - mdev_start_row;
-        uint32_t src0_nrows_per_thread = fastdiv(mdev_nrows + nth - 1, &octx->ctx->n_threads_div);
+        uint32_t src0_nrows_per_thread = fastdiv(mdev_nrows + nth - 1, &octx->n_threads_div);
         src0_nrows_per_thread += (src0_nrows_per_thread & 1);
 
         const uint32_t src0_start_row  = mdev_start_row + src0_nrows_per_thread * ith;
@@ -2778,7 +2780,7 @@ static int hmx_mm_nx_2d_f32(struct htp_ops_context * octx, const struct htp_mm_k
     int m_start = 0;
     int m_core  = m;
     if (octx->mdev_count > 1) {
-        const int rows_per_mdev = (m + octx->mdev_count - 1) / octx->mdev_count;
+        const int rows_per_mdev = (int) fastdiv(m + octx->mdev_count - 1, &octx->mdev_count_div);
         m_start = MIN((int)(octx->mdev_idx * rows_per_mdev), m);
         m_core  = MIN(rows_per_mdev, m - m_start);
     }
@@ -3447,7 +3449,7 @@ static int hmx_mm_op_matmul(struct htp_ops_context * octx, const struct htp_mm_k
 
     int m_start, m_dev;
     if (octx->mdev_count > 1) {
-        const int rows_per_mdev = (m_total + octx->mdev_count - 1) / octx->mdev_count;
+        const int rows_per_mdev = (int) fastdiv(m_total + octx->mdev_count - 1, &octx->mdev_count_div);
         m_start = MIN((int)(octx->mdev_idx * rows_per_mdev), m_total);
         m_dev   = MIN(rows_per_mdev, m_total - m_start);
     } else {
@@ -3561,7 +3563,7 @@ static int hmx_mm_op_matmul_id(
         const int m_padded = hex_align_up(cne1, 32);
         int m_start = 0, m_end = m_padded;
         if (octx->mdev_count > 1) {
-            const int rows_per_mdev = (m_padded + (int) octx->mdev_count - 1) / (int) octx->mdev_count;
+            const int rows_per_mdev = (int) fastdiv(m_padded + octx->mdev_count - 1, &octx->mdev_count_div);
             m_start = MIN((int)(octx->mdev_idx * rows_per_mdev), m_padded);
             m_end   = MIN(m_start + rows_per_mdev, m_padded);
         }
@@ -3659,10 +3661,10 @@ static int hvx_mm_matmul_id(
     mmctx->vtcm_src0_stride = src0_row_size_padded;
     mmctx->vtcm_src1_stride = src1_row_size;
 
-    mmctx->vtcm_src0_size_per_thread = fastdiv(L.src0_bytes, &octx->ctx->n_threads_div);
+    mmctx->vtcm_src0_size_per_thread = fastdiv(L.src0_bytes, &octx->n_threads_div);
     mmctx->vtcm_src1_size_per_thread = L.src1_bytes;
     mmctx->vtcm_src2_size_per_thread = 0;
-    mmctx->vtcm_dst_size_per_thread  = fastdiv(L.dst_bytes, &octx->ctx->n_threads_div);
+    mmctx->vtcm_dst_size_per_thread  = fastdiv(L.dst_bytes, &octx->n_threads_div);
 
     mmctx->n_quant_rows_per_thread = (src1_nrows + n_quant_tasks - 1) / n_quant_tasks;
     mmctx->quant_task_func = quant_task_func;
@@ -3695,7 +3697,7 @@ static int hmx_mm_op_matmul_id_nx(
         const int m_padded = hex_align_up(cne1, 32);
         int m_start = 0, m_end = m_padded;
         if (octx->mdev_count > 1) {
-            const int rows_per_mdev = (m_padded + (int) octx->mdev_count - 1) / (int) octx->mdev_count;
+            const int rows_per_mdev = (int) fastdiv(m_padded + octx->mdev_count - 1, &octx->mdev_count_div);
             m_start = MIN((int)(octx->mdev_idx * rows_per_mdev), m_padded);
             m_end   = MIN(m_start + rows_per_mdev, m_padded);
         }
@@ -3793,9 +3795,9 @@ static int hvx_mm_matmul_id_nx(
     mmctx->vtcm_src0_stride = 0;
     mmctx->vtcm_src1_stride = src1_row_size;
 
-    mmctx->vtcm_src0_size_per_thread = fastdiv(L.src0_bytes, &octx->ctx->n_threads_div);
+    mmctx->vtcm_src0_size_per_thread = fastdiv(L.src0_bytes, &octx->n_threads_div);
     mmctx->vtcm_src1_size_per_thread = L.src1_bytes;
-    mmctx->vtcm_dst_size_per_thread  = fastdiv(L.dst_bytes, &octx->ctx->n_threads_div);
+    mmctx->vtcm_dst_size_per_thread  = fastdiv(L.dst_bytes, &octx->n_threads_div);
 
     mmctx->n_quant_rows_per_thread = (src1_nrows + n_quant_tasks - 1) / n_quant_tasks;
     mmctx->quant_task_func         = quant_task_func;
@@ -3906,7 +3908,7 @@ int op_matmul_id(struct htp_ops_context * octx) {
 
     uint32_t mdev_row_start, mdev_row_end;
     if (octx->mdev_count > 1) {
-        const uint32_t rows_per_mdev = (src0_nrows + octx->mdev_count - 1) / octx->mdev_count;
+        const uint32_t rows_per_mdev = fastdiv(src0_nrows + octx->mdev_count - 1, &octx->mdev_count_div);
         mdev_row_start = MIN(octx->mdev_idx * rows_per_mdev, src0_nrows);
         mdev_row_end   = MIN(mdev_row_start + rows_per_mdev, src0_nrows);
     } else {
@@ -3922,7 +3924,7 @@ int op_matmul_id(struct htp_ops_context * octx) {
     mmctx->mdev_row_start = mdev_row_start;
     mmctx->mdev_row_end   = mdev_row_end;
 
-    mmctx->src0_nrows_per_thread = fastdiv(mdev_nrows + octx->n_threads - 1, &octx->ctx->n_threads_div);
+    mmctx->src0_nrows_per_thread = fastdiv(mdev_nrows + octx->n_threads - 1, &octx->n_threads_div);
     mmctx->src0_nrows_per_thread = hex_round_up(mmctx->src0_nrows_per_thread, 32);
 
     // row groups
@@ -4163,9 +4165,9 @@ int op_matmul_nx(struct htp_ops_context * octx) {
     mmctx->vtcm_src0_stride = is_repacked ? 0 : src0_row_size_padded;
     mmctx->vtcm_src1_stride = src1_row_size;
 
-    mmctx->vtcm_src0_size_per_thread = fastdiv(L.src0_bytes, &octx->ctx->n_threads_div);
+    mmctx->vtcm_src0_size_per_thread = fastdiv(L.src0_bytes, &octx->n_threads_div);
     mmctx->vtcm_src1_size_per_thread = L.src1_bytes;
-    mmctx->vtcm_dst_size_per_thread  = fastdiv(L.dst_bytes, &octx->ctx->n_threads_div);
+    mmctx->vtcm_dst_size_per_thread  = fastdiv(L.dst_bytes, &octx->n_threads_div);
 
     mmctx->n_quant_rows_per_thread = (src1_nrows + n_quant_tasks - 1) / n_quant_tasks;
     mmctx->quant_task_func = quant_task_func;

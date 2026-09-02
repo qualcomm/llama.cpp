@@ -477,7 +477,7 @@ static int execute_op_activations_f32(struct htp_ops_context * octx) {
 
     uint32_t mdev_row_start, mdev_nrows;
     if (octx->mdev_count > 1) {
-        const uint32_t rows_per_mdev = (src0_nrows + octx->mdev_count - 1) / octx->mdev_count;
+        const uint32_t rows_per_mdev = fastdiv(src0_nrows + octx->mdev_count - 1, &octx->mdev_count_div);
         mdev_row_start = MIN(octx->mdev_idx * rows_per_mdev, src0_nrows);
         mdev_nrows     = MIN(rows_per_mdev, src0_nrows - mdev_row_start);
     } else {
@@ -489,7 +489,7 @@ static int execute_op_activations_f32(struct htp_ops_context * octx) {
         return HTP_STATUS_OK;
     }
 
-    const uint32_t n_threads  = MIN(octx->n_threads, mdev_nrows);
+    const uint32_t n_threads = octx->n_threads;
 
     // row_size   = bytes of useful data per row (what the kernel touches / what DMA copies).
     // row_stride = bytes between successive rows in DDR (may exceed row_size for non-contig src).
@@ -534,7 +534,7 @@ static int execute_op_activations_f32(struct htp_ops_context * octx) {
     struct htp_act_context actx;
     actx.octx = octx;
 
-    actx.src0_nrows_per_thread = (mdev_nrows + n_threads - 1) / n_threads;
+    actx.src0_nrows_per_thread = fastdiv(mdev_nrows + n_threads - 1, &octx->n_threads_div);
 
     actx.src0_row_size = src0_row_size;
     actx.src1_row_size = src1_row_size;
