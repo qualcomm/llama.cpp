@@ -145,15 +145,30 @@ kernel void kernel_mul_mv_q4_K_f32_flat(
         }
 
         global ushort * q1 = (global ushort *)(blk_q + ib * (QK_K/2)) + (16 * iq + 4 * ir);
-        global ushort * sc = (global ushort *)(blk_s + ib * K_SCALE_SIZE) + iq;
+        // The three scales this lane needs are ushorts iq, iq+2, iq+4 of the block's
+        // 6. K_SCALE_SIZE is 12 bytes == exactly uint3, and both offset_src0*12 and
+        // ib*12 are 4-aligned, so one vload3 fetches the whole scale block in a
+        // single instruction instead of three scalar ushort reads. iq then just
+        // selects the low or high half of each uint. Same fix as the q6_K flat GEMV
+        // (+21% there): this inner loop was issuing 9 memory instructions per
+        // (row, superblock) to move ~26 bytes.
+        // NB: a vload8 on the ushort pointer would read 16 bytes out of a 12-byte
+        // block and overrun the last superblock's scales.
+        global uint   * scu = (global uint *)(blk_s + ib * K_SCALE_SIZE);
+        const uint      shsel = (uint)iq * 16u;   // 0 -> low half, 1 -> high half
         global half   * d  = blk_d + ib;
         global half   * dm = blk_dm + ib;
 
         for (int row = 0; row < N_DST; row++) {
-            sc16[0] = sc[0] & kmask1;
-            sc16[1] = sc[2] & kmask1;
-            sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
-            sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
+            uint3  sv = vload3(0, scu);
+            ushort s0 = (ushort)((sv.x >> shsel) & 0xFFFFu);   // was sc[0]
+            ushort s2 = (ushort)((sv.y >> shsel) & 0xFFFFu);   // was sc[2]
+            ushort s4 = (ushort)((sv.z >> shsel) & 0xFFFFu);   // was sc[4]
+
+            sc16[0] = s0 & kmask1;
+            sc16[1] = s2 & kmask1;
+            sc16[2] = ((s4 >> 0) & kmask2) | ((s0 & kmask3) >> 2);
+            sc16[3] = ((s4 >> 4) & kmask2) | ((s2 & kmask3) >> 2);
 
             global ushort * q2 = q1 + 32;
 
@@ -187,10 +202,10 @@ kernel void kernel_mul_mv_q4_K_f32_flat(
                                  (acc2.s2 + 1.f/256.f * acc2.s3) * sc8[5] * 1.f/16.f) -
                          dmin * (sumy.s0 * sc8[2] + sumy.s1 * sc8[3] + sumy.s2 * sc8[6] + sumy.s3 * sc8[7]);
 
-            q1 += blk*64;
-            sc += blk*6;
-            d  += blk;
-            dm += blk;
+            q1  += blk*64;
+            scu += blk*3;   // blk*6 ushorts == blk*3 uints
+            d   += blk;
+            dm  += blk;
         }
 
         y4 += BLOCK_STRIDE * QK_K;

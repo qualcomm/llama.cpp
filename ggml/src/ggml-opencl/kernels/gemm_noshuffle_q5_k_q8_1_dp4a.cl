@@ -17,7 +17,14 @@
 // major) q5_K SoA: q ushort [row + Kgroup*m], qh uchar [row + bytegroup*m] (one
 // byte = 8 elements' high bits), matching the float kernel's exact layout usage.
 
+// Guarded so the host's -DTILESIZE_N=16 for the narrow variant actually takes effect.
+// Without the guard the -D is silently overridden by this definition and the "narrow"
+// program compiles at 32, i.e. it is not narrow at all. q4_K has always had the guard;
+// q4_0 and q8_0 were fixed 2026-08-18 and these two were missed in that sweep, so their
+// narrow tiles had never once run.
+#ifndef TILESIZE_N
 #define TILESIZE_N 32
+#endif
 #define QK_K 256
 #define K_SCALE_SIZE 12
 

@@ -25,7 +25,12 @@
 //   src0_qh[row + (k/8)*m]  uchar  = 8 high bits  (one per element)
 //   src0_d [row + (k/32)*m] half   = per-32-block scale
 
+// Guarded so a host -DTILESIZE_N=16 for a narrow variant actually takes effect. Without
+// the guard the -D is silently overridden and the "narrow" program compiles at 32, i.e.
+// not narrow at all - that bug was live in the q4_0 kernel until 2026-08-18.
+#ifndef TILESIZE_N
 #define TILESIZE_N 32
+#endif
 
 // 4 nibbles in low 16 bits of u -> 4 bytes (value 0..15)
 #define EXP4(u)  ( ((uint)((u) & 0x000Fu))        | \
