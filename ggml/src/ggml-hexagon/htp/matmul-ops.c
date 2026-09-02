@@ -314,11 +314,11 @@ static void hvx_mm_4d(unsigned int nth, unsigned int ith, void * data) {
 static void hvx_mm_2d_repacked_##SUFFIX(unsigned int nth, unsigned int ith, void * data) {                                        \
     htp_matmul_preamble;                                                                                                          \
                                                                                                                                   \
-    const uint32_t src0_nrows = mmctx->dev_row_end - mmctx->dev_row_start;                                                      \
+    const uint32_t src0_nrows = mmctx->dev_row_end - mmctx->dev_row_start;                                                        \
     const uint32_t src1_nrows = ne11 * ne12 * ne13;                                                                               \
                                                                                                                                   \
-    const uint32_t src0_start_row  = mmctx->dev_row_start + src0_nrows_per_thread * ith;                                         \
-    const uint32_t src0_end_row    = MIN(src0_start_row + src0_nrows_per_thread, mmctx->dev_row_end);                            \
+    const uint32_t src0_start_row  = mmctx->dev_row_start + src0_nrows_per_thread * ith;                                          \
+    const uint32_t src0_end_row    = MIN(src0_start_row + src0_nrows_per_thread, mmctx->dev_row_end);                             \
                                                                                                                                   \
     struct htp_thread_trace * tr = &octx->ctx->trace[ith];                                                                        \
                                                                                                                                   \
@@ -416,10 +416,10 @@ static void hvx_mm_2d_repacked_##SUFFIX(unsigned int nth, unsigned int ith, void
 static void hvx_mv_2d_repacked_##SUFFIX(unsigned int nth, unsigned int ith, void * data) {                                        \
     htp_matmul_preamble;                                                                                                          \
                                                                                                                                   \
-    const uint32_t src0_nrows = mmctx->dev_row_end - mmctx->dev_row_start;                                                      \
+    const uint32_t src0_nrows = mmctx->dev_row_end - mmctx->dev_row_start;                                                        \
                                                                                                                                   \
-    const uint32_t src0_start_row  = mmctx->dev_row_start + src0_nrows_per_thread * ith;                                         \
-    const uint32_t src0_end_row    = MIN(src0_start_row + src0_nrows_per_thread, mmctx->dev_row_end);                            \
+    const uint32_t src0_start_row  = mmctx->dev_row_start + src0_nrows_per_thread * ith;                                          \
+    const uint32_t src0_end_row    = MIN(src0_start_row + src0_nrows_per_thread, mmctx->dev_row_end);                             \
                                                                                                                                   \
     struct htp_thread_trace * tr = &octx->ctx->trace[ith];                                                                        \
                                                                                                                                   \
@@ -551,12 +551,12 @@ static void hvx_mm_nx_2d_repacked_##SUFFIX(unsigned int nth, unsigned int ith, v
         uint32_t n_k_tiles_w = ne00 / 32;                                                                                         \
         uint32_t tile_row_stride = n_k_tiles_w * tile_size;                                                                       \
                                                                                                                                   \
-        const uint32_t src0_nrows = ne01 * src_w->ne[2] * src_w->ne[3];                                                           \
-        uint32_t src0_nrows_per_thread = fastdiv(src0_nrows + nth - 1, &octx->ctx->n_threads_div);                                \
+        const uint32_t dev_nrows = mmctx->dev_row_end - mmctx->dev_row_start;                                                     \
+        uint32_t src0_nrows_per_thread = fastdiv(dev_nrows + nth - 1, &octx->ctx->n_threads_div);                                 \
         src0_nrows_per_thread = hex_round_up(src0_nrows_per_thread, 32);                                                          \
                                                                                                                                   \
-        const uint32_t start_row = src0_nrows_per_thread * ith;                                                                   \
-        const uint32_t end_row   = MIN(start_row + src0_nrows_per_thread, src0_nrows);                                            \
+        const uint32_t start_row = mmctx->dev_row_start + src0_nrows_per_thread * ith;                                            \
+        const uint32_t end_row   = MIN(start_row + src0_nrows_per_thread, mmctx->dev_row_end);                                    \
         if (start_row >= end_row) continue;                                                                                       \
                                                                                                                                   \
         uint32_t ct_start = start_row / 32;                                                                                       \
@@ -1603,13 +1603,12 @@ static void hvx_mm_nx_2d(unsigned int nth, unsigned int ith, void * data) {
 
         const uint32_t ne00 = src_w->ne[0];
         const uint32_t ne01 = src_w->ne[1];
-        const uint32_t src0_nrows = ne01 * src_w->ne[2] * src_w->ne[3];
-
-        uint32_t src0_nrows_per_thread = fastdiv(src0_nrows + nth - 1, &octx->ctx->n_threads_div);
+        const uint32_t dev_nrows = mmctx->dev_row_end - mmctx->dev_row_start;
+        uint32_t src0_nrows_per_thread = fastdiv(dev_nrows + nth - 1, &octx->ctx->n_threads_div);
         src0_nrows_per_thread += (src0_nrows_per_thread & 1);
 
-        const uint32_t src0_start_row  = src0_nrows_per_thread * ith;
-        const uint32_t src0_end_row    = MIN(src0_start_row + src0_nrows_per_thread, src0_nrows);
+        const uint32_t src0_start_row  = mmctx->dev_row_start + src0_nrows_per_thread * ith;
+        const uint32_t src0_end_row    = MIN(src0_start_row + src0_nrows_per_thread, mmctx->dev_row_end);
         const uint32_t src0_end_row_x2 = src0_start_row + ((src0_end_row - src0_start_row) & ~1U);
         if (src0_start_row >= src0_end_row) continue;
 
@@ -2734,16 +2733,30 @@ static int hmx_mm_nx_2d_f32(struct htp_ops_context * octx, const struct htp_mm_k
 
     hmx_init_column_scales(vtcm_scales, Q6_V_vsplat_R(0x3c00));  // scale: 1.0, bias: 0.0 in FP16
 
-    FARF(HIGH, "hmx-mm-nx-2d: n_weights %u m %d k %d wtype %d mc %d nc %d vtcm %zu/%zu",
-         n_weights, m, k, weight_type, m_chunk_n_rows, n_chunk_n_cols, L.total_bytes, vtcm_budget);
+    int m_start = 0;
+    int m_core  = m;
+    if (octx->ndev > 1) {
+        const int rows_per_dev = (m + octx->ndev - 1) / octx->ndev;
+        m_start = MIN((int)(octx->idev * rows_per_dev), m);
+        m_core  = MIN(rows_per_dev, m - m_start);
+    }
+
+    if (m_core == 0) {
+        return HTP_STATUS_OK;
+    }
+
+    FARF(HIGH, "hmx-mm-nx-2d: n_weights %u m %d (%d..%d) k %d wtype %d mc %d nc %d vtcm %zu/%zu",
+         n_weights, m, m_start, m_start + m_core, k, weight_type, m_chunk_n_rows, n_chunk_n_cols, L.total_bytes, vtcm_budget);
 
     htp_trace_event_stop(tr, HTP_TRACE_EVT_INIT, 0);
+
+    const size_t mr_end = (size_t)(m_start + m_core);
 
     if (pipeline) {
         hmx_matmul_job_t job_slots[2];
 
-        for (size_t mr = 0; mr < (size_t) m; mr += m_chunk_n_rows) {
-            const size_t n_rows = hex_smin(m - mr, m_chunk_n_rows);
+        for (size_t mr = (size_t) m_start; mr < mr_end; mr += m_chunk_n_rows) {
+            const size_t n_rows = hex_smin(mr_end - mr, m_chunk_n_rows);
 
             void *vtcm_weight_bufs[2] = { vtcm_scratch0, vtcm_scratch1 };
             void *vtcm_output_bufs[2] = { vtcm_output,   vtcm_scratch2 };
@@ -2842,8 +2855,8 @@ static int hmx_mm_nx_2d_f32(struct htp_ops_context * octx, const struct htp_mm_k
         }
     } else {
         hmx_matmul_job_t job;
-        for (size_t mr = 0; mr < (size_t) m; mr += m_chunk_n_rows) {
-            const size_t n_rows = hex_smin(m - mr, m_chunk_n_rows);
+        for (size_t mr = (size_t) m_start; mr < mr_end; mr += m_chunk_n_rows) {
+            const size_t n_rows = hex_smin(mr_end - mr, m_chunk_n_rows);
 
             struct activation_transfer_params act_params = {
                 .ctx = ctx,
@@ -3236,7 +3249,9 @@ static int hmx_mm_id_2d_f32(struct htp_context *ctx,
                                          int weight_type,
                                          const struct mmid_row_mapping *matrix_rows,
                                          int cur_a,
-                                         int mapping_stride) {
+                                         int mapping_stride,
+                                         int m_start,
+                                         int m_end) {
     struct htp_thread_trace * tr = &ctx->trace[0];
     htp_trace_event_start(tr, HTP_TRACE_EVT_INIT, 0);
 
@@ -3323,8 +3338,8 @@ static int hmx_mm_id_2d_f32(struct htp_context *ctx,
 
     hmx_matmul_job_t job;
 
-    for (size_t mr = 0; mr < (size_t) m_padded; mr += m_chunk_n_rows) {
-        const size_t n_rows = hex_smin(m_padded - mr, m_chunk_n_rows);
+    for (size_t mr = (size_t) m_start; mr < (size_t) m_end; mr += m_chunk_n_rows) {
+        const size_t n_rows = hex_smin((size_t) m_end - mr, m_chunk_n_rows);
         const size_t n_row_tiles = hmx_ceil_div(n_rows, HTP_MM_HMX_TILE_N_ROWS);
 
         transfer_activation_chunk_gathered_threaded(
@@ -3501,6 +3516,15 @@ static int hmx_mm_op_matmul_id(
         const int32_t cne1 = matrix_row_counts[cur_a];
         if (cne1 == 0) continue;
 
+        const int m_padded = hex_align_up(cne1, 32);
+        int m_start = 0, m_end = m_padded;
+        if (octx->ndev > 1) {
+            const int rows_per_dev = (m_padded + (int) octx->ndev - 1) / (int) octx->ndev;
+            m_start = MIN((int)(octx->idev * rows_per_dev), m_padded);
+            m_end   = MIN(m_start + rows_per_dev, m_padded);
+        }
+        if (m_start >= m_end) continue;
+
         int ret = hmx_mm_id_2d_f32(octx->ctx, (float*) dst->data, (float*) src1->data,
                                    (const uint8_t *) src0->data + cur_a * nb02,
                                    cne1, ne00, ne01,
@@ -3509,7 +3533,8 @@ static int hmx_mm_op_matmul_id(
                                    nb11, nb12,
                                    nb1, nb2,
                                    (int) src0->nb[1], (int) src0->type,
-                                   matrix_rows, cur_a, mmctx->mapping_stride);
+                                   matrix_rows, cur_a, mmctx->mapping_stride,
+                                   m_start, m_end);
         if (ret != 0) {
             FARF(ERROR, "HMX matmul failed for expert %u, error %d\n", cur_a, ret);
             return HTP_STATUS_NO_SUPPORT;
@@ -3625,6 +3650,15 @@ static int hmx_mm_op_matmul_id_nx(
         const int32_t cne1 = matrix_row_counts[cur_a];
         if (cne1 == 0) continue;
 
+        const int m_padded = hex_align_up(cne1, 32);
+        int m_start = 0, m_end = m_padded;
+        if (octx->ndev > 1) {
+            const int rows_per_dev = (m_padded + (int) octx->ndev - 1) / (int) octx->ndev;
+            m_start = MIN((int)(octx->idev * rows_per_dev), m_padded);
+            m_end   = MIN(m_start + rows_per_dev, m_padded);
+        }
+        if (m_start >= m_end) continue;
+
         for (uint32_t p = 0; p < n_weights; ++p) {
             const struct htp_tensor * restrict src_w = octx->src[p];
             const struct htp_tensor * restrict dst   = octx->dsts[p];
@@ -3638,7 +3672,8 @@ static int hmx_mm_op_matmul_id_nx(
                                        act->nb[1], act->nb[2],
                                        dst->nb[1], dst->nb[2],
                                        (int) src_w->nb[1], (int) src_w->type,
-                                       matrix_rows, cur_a, mmctx->mapping_stride);
+                                       matrix_rows, cur_a, mmctx->mapping_stride,
+                                       m_start, m_end);
             if (ret != 0) {
                 FARF(ERROR, "HMX matmul ID NX failed for expert %u weight %u, error %d\n", cur_a, p, ret);
                 return HTP_STATUS_NO_SUPPORT;
@@ -4042,6 +4077,25 @@ int op_matmul_nx(struct htp_ops_context * octx) {
     mmctx->act  = act;
 
     const uint32_t src1_nrows = act->ne[1] * act->ne[2] * act->ne[3];
+
+    const uint32_t src0_nrows = src0->ne[1];
+
+    uint32_t dev_row_start, dev_row_end;
+    if (octx->ndev > 1) {
+        const uint32_t rows_per_dev = (src0_nrows + octx->ndev - 1) / octx->ndev;
+        dev_row_start = MIN(octx->idev * rows_per_dev, src0_nrows);
+        dev_row_end   = MIN(dev_row_start + rows_per_dev, src0_nrows);
+    } else {
+        dev_row_start = 0;
+        dev_row_end   = src0_nrows;
+    }
+
+    if (dev_row_start >= dev_row_end) {
+        return HTP_STATUS_OK;
+    }
+
+    mmctx->dev_row_start = dev_row_start;
+    mmctx->dev_row_end   = dev_row_end;
 
     const size_t src0_row_size = src0->nb[1];
     const size_t src0_row_size_padded = hex_round_up(src0_row_size, 128);
