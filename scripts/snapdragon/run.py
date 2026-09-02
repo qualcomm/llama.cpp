@@ -317,20 +317,28 @@ def main():
             else:
                 device_val = "HTP0"
 
-            # In row-split mode, llama.cpp only needs the main device passed to --device;
-            # the backend manages all devices via GGML_HEXAGON_DEVICES.
-            is_row_split = False
-            for i, arg in enumerate(cmd_args):
-                if arg in ("--split-mode", "-sm") and i + 1 < len(cmd_args):
-                    if cmd_args[i + 1].lower() == "row":
-                        is_row_split = True
-                elif arg.startswith("--split-mode=") and arg.split("=", 1)[1].lower() == "row":
-                    is_row_split = True
-                elif arg.startswith("-sm=") and arg.split("=", 1)[1].lower() == "row":
-                    is_row_split = True
-
-            if is_row_split and device_val:
-                device_val = device_val.split(",")[0]
+            # If bracket syntax is used in device_val (e.g. HTP0[0-1:0],HTP1[0-1:1]), extract device names for --device
+            if "[" in device_val:
+                names = []
+                depth = 0
+                curr = []
+                for ch in device_val:
+                    if ch == '[':
+                        depth += 1
+                    elif ch == ']':
+                        if depth > 0:
+                            depth -= 1
+                    elif ch == ',' and depth == 0:
+                        part = "".join(curr).strip()
+                        if part:
+                            names.append(part.split("[")[0].strip())
+                        curr = []
+                    elif depth == 0:
+                        curr.append(ch)
+                part = "".join(curr).strip()
+                if part:
+                    names.append(part.split("[")[0].strip())
+                device_val = ",".join(names)
 
             if device_val:
                 cmd_args += ["--device", device_val]

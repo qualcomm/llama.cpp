@@ -75,6 +75,8 @@ struct ggml_hexagon_device_config {
     int         domain_id    = 0;
     std::string domain_name;
     std::string name;
+
+    std::vector<ggml_hexagon_device_config> mdev_group;
 };
 
 static ggml_hexagon_device_config opt_device_configs[GGML_HEXAGON_MAX_SESSIONS];
@@ -457,11 +459,9 @@ struct ggml_backend_hexagon_device_context {
     ggml_hexagon_device_config config;
     ggml_backend_dev_t         dev = nullptr;
     size_t                     max_bufsize = 0;
-    bool                       enable_row_split = false;
 
     ggml_backend_buffer_type buffer_type       = {};
     ggml_backend_buffer_type host_buffer_type  = {};
-    ggml_backend_buffer_type split_buffer_type = {};
 
     std::unique_ptr<ggml_hexagon_session> sess;
 
@@ -472,7 +472,7 @@ struct ggml_backend_hexagon_device_context {
 
     ggml_hexagon_session * session() {
         if (!sess) {
-            uint32_t mdev_count = (enable_row_split && opt_ndev > 1) ? (uint32_t) opt_ndev : 1;
+            uint32_t mdev_count = (uint32_t) (1 + config.mdev_group.size());
             sess = std::make_unique<ggml_hexagon_session>(config, dev, dev_id, mdev_count);
         }
         return sess.get();
@@ -1620,7 +1620,7 @@ static ggml_backend_buffer_type_i ggml_backend_hexagon_host_buffer_type_interfac
 };
 
 ggml_backend_hexagon_device_context::ggml_backend_hexagon_device_context(int dev_id, const ggml_hexagon_device_config & config, ggml_backend_dev_t dev)
-    : dev_id(dev_id), config(config), dev(dev), max_bufsize(opt_mbuf), enable_row_split(false) {
+    : dev_id(dev_id), config(config), dev(dev), max_bufsize(opt_mbuf) {
     buffer_type.device  = dev;
     buffer_type.iface   = ggml_backend_hexagon_buffer_type_interface;
     buffer_type.context = new ggml_backend_hexagon_buffer_type_context(config.name, this);
@@ -1628,16 +1628,11 @@ ggml_backend_hexagon_device_context::ggml_backend_hexagon_device_context(int dev
     host_buffer_type.device  = dev;
     host_buffer_type.iface   = ggml_backend_hexagon_host_buffer_type_interface;
     host_buffer_type.context = new ggml_backend_hexagon_buffer_type_context(config.name + "-HOST", this);
-
-    split_buffer_type.device  = dev;
-    split_buffer_type.iface   = ggml_backend_hexagon_buffer_type_interface;
-    split_buffer_type.context = new ggml_backend_hexagon_buffer_type_context(config.name + "-SPLIT", this);
 }
 
 ggml_backend_hexagon_device_context::~ggml_backend_hexagon_device_context() {
     delete static_cast<ggml_backend_hexagon_buffer_type_context *>(buffer_type.context);
     delete static_cast<ggml_backend_hexagon_buffer_type_context *>(host_buffer_type.context);
-    delete static_cast<ggml_backend_hexagon_buffer_type_context *>(split_buffer_type.context);
 }
 
 static bool ggml_backend_buffer_is_hexagon(const struct ggml_backend_buffer * b) {
@@ -3385,29 +3380,10 @@ ggml_hexagon_session::ggml_hexagon_session(const ggml_hexagon_device_config & co
 
     try {
         allocate(config);
-        if (mdev_idx == 0 && mdev_count > 1) {
-            std::unordered_set<int> phys_set;
-            phys_set.insert(config.physical_idx);
-
-            std::vector<const ggml_hexagon_device_config *> sub_configs;
-            for (size_t i = 1; i < mdev_count; i++) {
-                if (i < opt_ndev) {
-                    const auto & cfg = opt_device_configs[i];
-                    if (phys_set.count(cfg.physical_idx) == 0) {
-                        phys_set.insert(cfg.physical_idx);
-                        sub_configs.push_back(&cfg);
-                    } else {
-                        GGML_LOG_WARN("ggml-hex: %s skipping device %s with duplicate physical index %d for row-split\n",
-                                      this->c_name(), cfg.name.c_str(), cfg.physical_idx);
-                    }
-                }
-            }
-
-            const uint32_t actual_mdev_count = (uint32_t) (1 + sub_configs.size());
-            this->mdev_count = actual_mdev_count;
-
-            for (size_t i = 0; i < sub_configs.size(); i++) {
-                mdev_sessions.push_back(std::make_unique<ggml_hexagon_session>(*sub_configs[i], nullptr, (uint32_t) (i + 1), actual_mdev_count));
+        if (mdev_idx == 0 && !config.mdev_group.empty()) {
+            for (size_t i = 0; i < config.mdev_group.size(); i++) {
+                mdev_sessions.push_back(std::make_unique<ggml_hexagon_session>(
+                    config.mdev_group[i], nullptr, (uint32_t) (i + 1), mdev_count));
             }
         }
     } catch (const std::exception & exc) {
@@ -6161,7 +6137,7 @@ static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, cons
 static bool ggml_backend_hexagon_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
     auto dev_ctx = static_cast<ggml_backend_hexagon_device_context *>(dev->context);
 
-    bool supp = (buft == &dev_ctx->host_buffer_type) || (buft == &dev_ctx->buffer_type) || (buft == &dev_ctx->split_buffer_type);
+    bool supp = (buft == &dev_ctx->host_buffer_type) || (buft == &dev_ctx->buffer_type);
 
     HEX_VERBOSE("ggml-hex: %s device-supports-buft %s %s\n", dev_ctx->c_name(), ggml_backend_buft_name(buft), supp ? "yes" : "no");
     return supp;
@@ -6194,6 +6170,19 @@ ggml_hexagon_registry::ggml_hexagon_registry(ggml_backend_reg_t reg) {
 
     // Create devices
     for (size_t i = 0; i < opt_ndev; i++) {
+        const auto & cfg = opt_device_configs[i];
+        if (cfg.mdev_group.empty()) {
+            GGML_LOG_INFO("ggml-hex: device %zu: %s (phys=%d, virt=%d, domain=%s:%d)\n",
+                          i, cfg.name.c_str(), cfg.physical_idx, cfg.virtual_idx, cfg.domain_name.c_str(), cfg.domain_id);
+        } else {
+            std::string peers_str;
+            for (const auto & p : cfg.mdev_group) {
+                if (!peers_str.empty()) peers_str += ", ";
+                peers_str += p.name + " (phys=" + std::to_string(p.physical_idx) + ")";
+            }
+            GGML_LOG_INFO("ggml-hex: device %zu: %s (phys=%d, virt=%d, domain=%s:%d) [mdev peers: %s]\n",
+                          i, cfg.name.c_str(), cfg.physical_idx, cfg.virtual_idx, cfg.domain_name.c_str(), cfg.domain_id, peers_str.c_str());
+        }
         devices[i].iface   = ggml_backend_hexagon_device_i;
         devices[i].reg     = reg;
         devices[i].context = new ggml_backend_hexagon_device_context(i, opt_device_configs[i], &devices[i]);
@@ -6351,8 +6340,7 @@ static ggml_backend_buffer_type_t ggml_backend_hexagon_split_buffer_type(int mai
     }
     if (!dev) return nullptr;
     auto dev_ctx = static_cast<ggml_backend_hexagon_device_context *>(dev->context);
-    dev_ctx->enable_row_split = true;
-    return &dev_ctx->split_buffer_type;
+    return &dev_ctx->buffer_type;
 }
 
 static void * ggml_backend_hexagon_get_proc_address(ggml_backend_reg_t reg, const char * name) {
@@ -6390,6 +6378,41 @@ template<typename T, int BASE=10> std::string vec_to_str(std::vector<T> v) {
     for (auto i : v) { ss << i << ','; }
     auto str = ss.str(); str.pop_back(); // drop last comma
     return str;
+}
+
+static void ggml_hexagon_resolve_device_domain(ggml_hexagon_device_config & cfg, bool discovery_supported, const std::unordered_map<int, fastrpc_domain> & cdsp_map) {
+    if (discovery_supported) {
+        auto it = cdsp_map.find(cfg.physical_idx);
+        if (it != cdsp_map.end()) {
+            cfg.domain_id   = it->second.id;
+            cfg.domain_name = it->second.name;
+        } else {
+            GGML_LOG_ERROR("ggml-hex: physical CDSP core %d not found on device (%zu CDSP core(s) available)\n",
+                           cfg.physical_idx, cdsp_map.size());
+            cfg.domain_id   = -1;
+            cfg.domain_name = "";
+        }
+    } else {
+        switch (cfg.physical_idx) {
+            case 0:
+                cfg.domain_id   = 3;
+                cfg.domain_name = CDSP_DOMAIN_NAME;
+                break;
+            case 1:
+                cfg.domain_id   = 4;
+                cfg.domain_name = "cdsp1";
+                break;
+            default:
+                GGML_LOG_ERROR("ggml-hex: physical CDSP core %d not supported without dynamic discovery\n",
+                               cfg.physical_idx);
+                cfg.domain_id   = -1;
+                cfg.domain_name = "";
+                break;
+        }
+    }
+    for (auto & sub_cfg : cfg.mdev_group) {
+        ggml_hexagon_resolve_device_domain(sub_cfg, discovery_supported, cdsp_map);
+    }
 }
 
 // Enumerate NPU (aka CDSP) domains via FASTRPC_GET_DOMAINS if supported,
@@ -6438,36 +6461,7 @@ static void ggml_hexagon_discover_devices() {
 
     // Populate domain IDs and names for all configured devices
     for (size_t i = 0; i < opt_ndev; i++) {
-        auto & cfg = opt_device_configs[i];
-        if (discovery_supported) {
-            auto it = cdsp_map.find(cfg.physical_idx);
-            if (it != cdsp_map.end()) {
-                cfg.domain_id   = it->second.id;
-                cfg.domain_name = it->second.name;
-            } else {
-                GGML_LOG_ERROR("ggml-hex: physical CDSP core %d not found on device (%zu CDSP core(s) available)\n",
-                               cfg.physical_idx, cdsp_map.size());
-                cfg.domain_id   = -1;
-                cfg.domain_name = "";
-            }
-        } else {
-            switch (cfg.physical_idx) {
-                case 0:
-                    cfg.domain_id   = 3;
-                    cfg.domain_name = CDSP_DOMAIN_NAME;
-                    break;
-                case 1:
-                    cfg.domain_id   = 4;
-                    cfg.domain_name = "cdsp1";
-                    break;
-                default:
-                    GGML_LOG_ERROR("ggml-hex: physical CDSP core %d not supported without dynamic discovery\n",
-                                   cfg.physical_idx);
-                    cfg.domain_id   = -1;
-                    cfg.domain_name = "";
-                    break;
-            }
-        }
+        ggml_hexagon_resolve_device_domain(opt_device_configs[i], discovery_supported, cdsp_map);
     }
 }
 
@@ -6575,21 +6569,126 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
                 opt_device_configs[i].physical_idx = 0;
                 opt_device_configs[i].virtual_idx  = (int)i;
                 opt_device_configs[i].name         = "HTP" + std::to_string(i);
+                opt_device_configs[i].mdev_group.clear();
             }
         } else {
             std::string s_devices(str_devices);
-            std::stringstream ss(s_devices);
-            std::string item;
-            opt_ndev = 0;
-            while (std::getline(ss, item, ',')) {
-                size_t start = item.find_first_not_of(" \t\r\n");
-                size_t end = item.find_last_not_of(" \t\r\n");
-                if (start == std::string::npos) {
-                    continue;
+            std::vector<std::string> items;
+            std::string curr_item;
+            int bracket_depth = 0;
+            for (char ch : s_devices) {
+                if (ch == '[') {
+                    bracket_depth++;
+                    curr_item += ch;
+                } else if (ch == ']') {
+                    if (bracket_depth > 0) bracket_depth--;
+                    curr_item += ch;
+                } else if (ch == ',' && bracket_depth == 0) {
+                    size_t s = curr_item.find_first_not_of(" \t\r\n");
+                    size_t e = curr_item.find_last_not_of(" \t\r\n");
+                    if (s != std::string::npos) {
+                        items.push_back(curr_item.substr(s, e - s + 1));
+                    }
+                    curr_item.clear();
+                } else {
+                    curr_item += ch;
                 }
-                item = item.substr(start, end - start + 1);
+            }
+            size_t s = curr_item.find_first_not_of(" \t\r\n");
+            size_t e = curr_item.find_last_not_of(" \t\r\n");
+            if (s != std::string::npos) {
+                items.push_back(curr_item.substr(s, e - s + 1));
+            }
 
-                if (item.rfind("HTP", 0) == 0) {
+            opt_ndev = 0;
+            for (const auto & item : items) {
+                size_t b_open  = item.find('[');
+                size_t b_close = item.rfind(']');
+
+                if (b_open != std::string::npos && b_close != std::string::npos && b_close > b_open) {
+                    // Grouped / composite syntax: Name[phys_spec:virt] or Name[phys_spec]
+                    std::string dev_name = item.substr(0, b_open);
+                    std::string content  = item.substr(b_open + 1, b_close - b_open - 1);
+
+                    int virt = 0;
+                    std::string phys_spec = content;
+                    size_t colon_pos = content.find(':');
+                    if (colon_pos != std::string::npos) {
+                        phys_spec = content.substr(0, colon_pos);
+                        try {
+                            virt = std::stoi(content.substr(colon_pos + 1));
+                        } catch (...) {
+                            virt = 0;
+                        }
+                    } else {
+                        size_t dev_colon = dev_name.find(':');
+                        if (dev_colon != std::string::npos) {
+                            try {
+                                virt = std::stoi(dev_name.substr(dev_colon + 1));
+                            } catch (...) {
+                                virt = 0;
+                            }
+                        }
+                    }
+
+                    // Parse physical indices from phys_spec (e.g. 0-1, 0,1, 0-3, etc.)
+                    std::vector<int> phys_list;
+                    std::stringstream pss(phys_spec);
+                    std::string p_part;
+                    while (std::getline(pss, p_part, ',')) {
+                        size_t ps = p_part.find_first_not_of(" \t\r\n");
+                        size_t pe = p_part.find_last_not_of(" \t\r\n");
+                        if (ps == std::string::npos) continue;
+                        p_part = p_part.substr(ps, pe - ps + 1);
+
+                        size_t dash_pos = p_part.find('-');
+                        if (dash_pos != std::string::npos) {
+                            try {
+                                int p_start = std::stoi(p_part.substr(0, dash_pos));
+                                int p_end   = std::stoi(p_part.substr(dash_pos + 1));
+                                for (int p = p_start; p <= p_end; p++) {
+                                    if (std::find(phys_list.begin(), phys_list.end(), p) == phys_list.end()) {
+                                        phys_list.push_back(p);
+                                    }
+                                }
+                            } catch (...) {
+                                GGML_LOG_WARN("ggml-hex: failed to parse physical range in '%s'\n", p_part.c_str());
+                            }
+                        } else {
+                            try {
+                                int p = std::stoi(p_part);
+                                if (std::find(phys_list.begin(), phys_list.end(), p) == phys_list.end()) {
+                                    phys_list.push_back(p);
+                                }
+                            } catch (...) {
+                                GGML_LOG_WARN("ggml-hex: failed to parse physical index in '%s'\n", p_part.c_str());
+                            }
+                        }
+                    }
+
+                    if (phys_list.empty()) {
+                        phys_list.push_back(0);
+                    }
+
+                    if (opt_ndev < GGML_HEXAGON_MAX_SESSIONS) {
+                        auto & cfg = opt_device_configs[opt_ndev];
+                        cfg.name         = dev_name;
+                        cfg.physical_idx = phys_list[0];
+                        cfg.virtual_idx  = virt;
+                        cfg.mdev_group.clear();
+
+                        for (size_t k = 1; k < phys_list.size(); k++) {
+                            ggml_hexagon_device_config sub_cfg;
+                            sub_cfg.physical_idx = phys_list[k];
+                            sub_cfg.virtual_idx  = virt;
+                            sub_cfg.name         = "HTP" + std::to_string(phys_list[k]) + ":" + std::to_string(virt);
+                            cfg.mdev_group.push_back(sub_cfg);
+                        }
+                        opt_ndev++;
+                    } else {
+                        GGML_LOG_WARN("ggml-hex: max sessions limit reached (%d), ignoring device %s\n", GGML_HEXAGON_MAX_SESSIONS, item.c_str());
+                    }
+                } else if (item.rfind("HTP", 0) == 0) {
                     std::string rest = item.substr(3);
                     size_t colon_pos = rest.find(':');
                     int phys = 0;
@@ -6613,6 +6712,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
                         opt_device_configs[opt_ndev].name         = colon_pos == std::string::npos
                             ? "HTP" + std::to_string(phys)
                             : "HTP" + std::to_string(phys) + ":" + std::to_string(virt);
+                        opt_device_configs[opt_ndev].mdev_group.clear();
                         opt_ndev++;
                     } else {
                         GGML_LOG_WARN("ggml-hex: max sessions limit reached (%d), ignoring device %s\n", GGML_HEXAGON_MAX_SESSIONS, item.c_str());
@@ -6627,6 +6727,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
         opt_device_configs[0].physical_idx = 0;
         opt_device_configs[0].virtual_idx  = 0;
         opt_device_configs[0].name         = "HTP0";
+        opt_device_configs[0].mdev_group.clear();
     }
 
 #if defined(__ANDROID__)
