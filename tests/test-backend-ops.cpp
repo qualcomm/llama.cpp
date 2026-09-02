@@ -10626,6 +10626,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // overflow: n_tokens > K — only the last K snapshots kept.
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32,   8, 1, 1, false, false, /*K=*/3));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  16, 2, 1, false, false, /*K=*/4));
+    // Production spec-decode verify geometry (Qwen3.5/3.8 linear layers: 48 heads, d=128,
+    // n_rs_seq=7 -> K=8) at the widths a width-8 drafter actually submits.
+    for (int nt : { 1, 4, 8 }) {
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 48, 128, nt, 1, 1, false, false, /*K=*/8));
+    }
 
     // Long-KV decode FA at the production DK=128 GQA=4 shape with f16 and
     // quantized (q4_0/q8_0) KV. Exercises the flash-decoding MQ/cluster
@@ -11158,6 +11163,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 512, 1));  // 4h PP-512
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1024, 1)); // 4h PP-1024
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1, 1, false, true)); // KDA PP-64
+    // Spec-decode verify: Qwen3.8-27B linear layers (48 heads, d=128) with K=8 rollback snapshots
+    // at verify widths 1..8, plus the K=1 control at each width to separate the snapshot
+    // store from the recurrence.
+    for (int nt : { 1, 2, 4, 8 }) {
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 48, 128, nt, 1, 1, false, false, /*K=*/8));
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 48, 128, nt, 1, 1, false, false, /*K=*/1));
+    }
 
     // lightning_indexer
     for (int kv : { 256, 4096, 65536 }) {
