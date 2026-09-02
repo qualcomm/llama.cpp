@@ -72,9 +72,10 @@ __kernel void kernel_moe_scatter(
 //
 // kernel_moe_scatter takes each token's slot from atomic_inc(slot_counter[expert]),
 // so the token -> slot packing inside an expert depends on which work-item wins the
-// atomic and changes run to run. The ragged prefill GEMM is sensitive to that packing
-// (the non-ragged path is not, since its padded slots alias slot 0), which is what
-// makes MoE prefill non-reproducible.
+// atomic and changes from run to run. The ragged prefill GEMM path is sensitive to
+// that packing (the non-ragged path is not, since its padded slots alias slot 0 and
+// are overwritten last), which makes MoE prompt processing non-reproducible: the same
+// binary on the same prompt returns one of several outputs.
 //
 // Here the slot is the token's rank in flat (n, k) order among the tokens routed to
 // the same expert - a fixed function of the routing input. One workgroup per expert

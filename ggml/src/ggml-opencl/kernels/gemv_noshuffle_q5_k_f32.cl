@@ -231,11 +231,20 @@ kernel void kernel_gemv_noshuffle_q5_k_f32(
     uint K = ne00;
     uint M = ne01;
 
+    // K-split width, chosen by the host (was hard-coded to NSUBGROUPS == 4).
+    uint nsg = get_local_size(1);
+
+    // The two block strides are PHYSICAL properties of the packed layout: one k-step
+    // covers 8 q lines and 4 qh lines. They were written as NSUBGROUPS*M and
+    // NSUBGROUPS*M/2, which is only correct because nsg happened to always be 4
+    // (8*(M/2) == 4M == NSUBGROUPS*M). Deriving them from nsg would silently address
+    // the wrong block the moment the K-split is widened. mc3 keeps its own copy and
+    // stays at a 4-way split, so it is deliberately left alone.
     uint LINE_STRIDE_A     = M / 2;
-    uint BLOCK_STRIDE_A    = NSUBGROUPS * M;
+    uint BLOCK_STRIDE_A    = 8 * LINE_STRIDE_A;
 
     uint LINE_STRIDE_A_QH  = M / 2;
-    uint BLOCK_STRIDE_A_QH = NSUBGROUPS * M / 2;
+    uint BLOCK_STRIDE_A_QH = 4 * LINE_STRIDE_A_QH;
     uint scales_per_row    = (K / QK_K) * 12;
 
     private uint4     regA;
@@ -246,7 +255,7 @@ kernel void kernel_gemv_noshuffle_q5_k_f32(
 
     private float2 totalSum = (float2)(0.0f);
 
-    for (uint k = groupId; k < (K / 32); k += NSUBGROUPS) {
+    for (uint k = groupId; k < (K / 32); k += nsg) {
         uint sb = k / 8;
         uint j  = k % 8;
 
@@ -294,28 +303,23 @@ kernel void kernel_gemv_noshuffle_q5_k_f32(
 #endif // VECTOR_SUB_GROUP_BROADCAST
     }
 
-    // reduction in local memory, assumes #wave=4
-    local float2 reduceLM[SUBGROUP_SIZE * 3];
-    if (groupId == 1) {
-        reduceLM[SUBGROUP_SIZE * 0 + slid] = totalSum;
-    }
-    if (groupId == 2) {
-        reduceLM[SUBGROUP_SIZE * 1 + slid] = totalSum;
-    }
-    if (groupId == 3) {
-        reduceLM[SUBGROUP_SIZE * 2 + slid] = totalSum;
+    // Cross-subgroup reduction. Sized for the widest K-split the host can ask for
+    // (16 subgroups = the 1024-lane Adreno WG max) and driven by nsg rather than a
+    // hard-coded 4 -- the old form wrote reduceLM[SUBGROUP_SIZE*3] and unrolled three
+    // groupId tests, so widening the dispatch alone would have overrun the array
+    // (silent corruption, not a crash). Accumulation order is unchanged at nsg == 4:
+    // subgroup 0's partial, then 1, 2, 3 in that order -> byte-identical there.
+    local float2 reduceLM[SUBGROUP_SIZE * 15];
+    if (groupId > 0) {
+        reduceLM[SUBGROUP_SIZE * (groupId - 1) + slid] = totalSum;
     }
 
     barrier(CLK_LOCAL_MEM_FENCE);
 
     if (groupId == 0) {
-        totalSum += reduceLM[SUBGROUP_SIZE * 0 + slid];
-    }
-    if (groupId == 0) {
-        totalSum += reduceLM[SUBGROUP_SIZE * 1 + slid];
-    }
-    if (groupId == 0) {
-        totalSum += reduceLM[SUBGROUP_SIZE * 2 + slid];
+        for (uint i = 0; i + 1 < nsg; ++i) {
+            totalSum += reduceLM[SUBGROUP_SIZE * i + slid];
+        }
     }
 
     // 2 outputs per fiber in wave 0
