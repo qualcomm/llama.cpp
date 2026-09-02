@@ -75,6 +75,7 @@ struct htp_fa_context {
 
     uint32_t qrows;
     uint32_t qrows_per_thread;
+    uint32_t dev_qrow_start;
 
     bool is_q_fp32;
 
@@ -206,10 +207,9 @@ static void flash_attn_ext_f16_thread(unsigned int nth, unsigned int ith, void *
     const uint32_t nb3 = dst->nb[3];
 
     // total rows in q
-    const uint32_t nr = factx->qrows;
-    const uint32_t dr = factx->qrows_per_thread;
-    const uint32_t ir0 = dr * ith;
-    const uint32_t ir1 = MIN(ir0 + dr, nr);
+    const uint32_t dr  = factx->qrows_per_thread;
+    const uint32_t ir0 = factx->dev_qrow_start + dr * ith;
+    const uint32_t ir1 = MIN(ir0 + dr, factx->dev_qrow_start + factx->qrows);
 
     if (ir0 >= ir1) return;
 
@@ -1888,6 +1888,24 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
     const uint32_t n_threads = factx.n_threads;
     const uint32_t G = factx.G;
 
+    // Multi-device: split Q blocks across devices
+    const uint32_t n_q_blocks = (neq1 + Br - 1) / Br;
+    uint32_t dev_q_start = 0;
+    uint32_t dev_q_end   = neq1;
+
+    if (octx->ndev > 1) {
+        const uint32_t blocks_per_dev  = (n_q_blocks + octx->ndev - 1) / octx->ndev;
+        const uint32_t dev_block_start = MIN(octx->idev * blocks_per_dev, n_q_blocks);
+        const uint32_t dev_block_end   = MIN(dev_block_start + blocks_per_dev, n_q_blocks);
+
+        if (dev_block_start >= dev_block_end) {
+            return HTP_STATUS_OK;
+        }
+
+        dev_q_start = dev_block_start * Br;
+        dev_q_end   = MIN(dev_block_end * Br, neq1);
+    }
+
     // ======== VTCM allocation (GQA-aware) ========
     // K/V row sizes drive the DMA descriptors (not the VTCM layout) and are used
     // throughout the KV loop below.
@@ -1977,7 +1995,7 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
     // ======== Main loop ========
     for (uint32_t ib3 = 0; ib3 < neq3; ++ib3) {
         const uint32_t im3 = mask ? fastmodulo(ib3, mask->ne[3], &factx.src3_div3) : 0;
-        for (uint32_t q_start = 0; q_start < neq1; q_start += Br) {
+        for (uint32_t q_start = dev_q_start; q_start < dev_q_end; q_start += Br) {
             const uint32_t n_rows_q    = hex_smin(Br, neq1 - q_start);
             const size_t   n_rows_g    = n_rows_q * G;
             const size_t   g_br_actual = hex_align_up(n_rows_g, HMX_FP16_TILE_N_ROWS);
@@ -1991,8 +2009,9 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
 
                 // 1. Push Q and KV DMAs for the very first iteration.
                 // Subsequent iterations are enqueued early at the end of the previous iteration.
-                if (ib3 == 0 && q_start == 0 && kv_head == 0) {
-                    const uint8_t * q_ptr = (const uint8_t *) q->data;
+                if (ib3 == 0 && q_start == dev_q_start && kv_head == 0) {
+                    const uint8_t * q_ptr = (const uint8_t *) q->data + q_start * q->nb[1] +
+                                            (kv_head * factx.G) * q->nb[2] + ib3 * q->nb[3];
                     const size_t q_row_bytes = q_transposed ? n_rows_q * q_row_bytes_trans_factor : q_row_bytes_untransposed;
                     const size_t n_rows      = q_transposed ? factx.G : n_rows_q;
                     dma_queue_push(dma, dma_make_ptr(factx.vtcm_q_dma, q_ptr), q_row_bytes, hex_smax(q_src_stride, q_row_bytes), q_row_bytes, n_rows);
@@ -2311,8 +2330,8 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                 if (next_kv_head >= n_kv_heads) {
                     next_kv_head = 0;
                     next_q_start = q_start + Br;
-                    if (next_q_start >= neq1) {
-                        next_q_start = 0;
+                    if (next_q_start >= dev_q_end) {
+                        next_q_start = dev_q_start;
                         next_ib3     = ib3 + 1;
                     }
                 }
@@ -2451,8 +2470,30 @@ int op_flash_attn_ext(struct htp_ops_context * octx) {
     }
 
     // total rows in q
-    factx.qrows = kparams->qrows;
-    factx.qrows_per_thread = kparams->qrows_per_thread;
+    const uint32_t neq1 = q->ne[1];
+    const uint32_t neq2 = q->ne[2];
+    const uint32_t neq3 = q->ne[3];
+    const uint32_t total_qrows = neq1 * neq2 * neq3;
+
+    uint32_t dev_qrow_start, dev_qrows;
+    if (octx->ndev > 1) {
+        const uint32_t rows_per_dev = (total_qrows + octx->ndev - 1) / octx->ndev;
+        dev_qrow_start = MIN(octx->idev * rows_per_dev, total_qrows);
+        dev_qrows      = MIN(rows_per_dev, total_qrows - dev_qrow_start);
+    } else {
+        dev_qrow_start = 0;
+        dev_qrows      = total_qrows;
+    }
+
+    if (dev_qrows == 0) {
+        return HTP_STATUS_OK;
+    }
+
+    const uint32_t n_threads = MIN(dev_qrows, octx->n_threads);
+
+    factx.qrows            = dev_qrows;
+    factx.dev_qrow_start   = dev_qrow_start;
+    factx.qrows_per_thread = (dev_qrows + n_threads - 1) / n_threads;
 
     size_t size_vkq_acc = hex_round_up(v->ne[0] * sizeof(float), 128); // VKQ32
 
@@ -2461,18 +2502,18 @@ int op_flash_attn_ext(struct htp_ops_context * octx) {
 
     uint8_t * vtcm_cur = octx->ctx->vtcm_base;
 
-    factx.spad_q = vtcm_seq_alloc(&vtcm_cur, size_q_block * octx->n_threads);
-    factx.spad_k = vtcm_seq_alloc(&vtcm_cur, factx.size_k_block * 2 * octx->n_threads);
-    factx.spad_v = vtcm_seq_alloc(&vtcm_cur, factx.size_v_block * 2 * octx->n_threads);
-    factx.spad_m = vtcm_seq_alloc(&vtcm_cur, (mask ? factx.size_m_block * HVX_FA_DMA_CACHE_SIZE : 0) * octx->n_threads);
-    factx.spad_a = vtcm_seq_alloc(&vtcm_cur, size_vkq_acc * octx->n_threads);
+    factx.spad_q = vtcm_seq_alloc(&vtcm_cur, size_q_block * n_threads);
+    factx.spad_k = vtcm_seq_alloc(&vtcm_cur, factx.size_k_block * 2 * n_threads);
+    factx.spad_v = vtcm_seq_alloc(&vtcm_cur, factx.size_v_block * 2 * n_threads);
+    factx.spad_m = vtcm_seq_alloc(&vtcm_cur, (mask ? factx.size_m_block * HVX_FA_DMA_CACHE_SIZE : 0) * n_threads);
+    factx.spad_a = vtcm_seq_alloc(&vtcm_cur, size_vkq_acc * n_threads);
 
     if ((size_t) (vtcm_cur - octx->ctx->vtcm_base) > octx->ctx->vtcm_size) {
         return HTP_STATUS_VTCM_TOO_SMALL;
     }
 
     if (!(octx->flags & HTP_OPFLAGS_SKIP_COMPUTE)) {
-        work_queue_run(octx->ctx->work_queue, flash_attn_ext_f16_thread, &factx, octx->n_threads);
+        work_queue_run(octx->ctx->work_queue, flash_attn_ext_f16_thread, &factx, n_threads);
     }
 
     return HTP_STATUS_OK;

@@ -46,6 +46,7 @@ struct htp_cumsum_context {
     size_t          dst_row_size_aligned;
     uint32_t        rows_per_thread;
     uint32_t        total_rows;
+    uint32_t        dev_row_start;
 };
 
 #define htp_cumsum_preamble                                                \
@@ -119,8 +120,8 @@ static void cumsum_thread_f32_dma(unsigned int nth, unsigned int ith, void * dat
     uint64_t t1, t2;
     t1 = HAP_perf_get_qtimer_count();
 
-    const uint32_t ir0 = cctx->rows_per_thread * ith;
-    const uint32_t ir1 = MIN(ir0 + cctx->rows_per_thread, cctx->total_rows);
+    const uint32_t ir0 = cctx->dev_row_start + cctx->rows_per_thread * ith;
+    const uint32_t ir1 = MIN(ir0 + cctx->rows_per_thread, cctx->dev_row_start + cctx->total_rows);
 
     if (ir0 >= ir1) {
         return;
@@ -189,8 +190,8 @@ static void cumsum_thread_f32(unsigned int nth, unsigned int ith, void * data) {
     const uint8_t * src_data = (const uint8_t *) src0->data;
     uint8_t *       dst_data = (uint8_t *) dst->data;
 
-    const uint32_t ir0 = cctx->rows_per_thread * ith;
-    const uint32_t ir1 = MIN(ir0 + cctx->rows_per_thread, cctx->total_rows);
+    const uint32_t ir0 = cctx->dev_row_start + cctx->rows_per_thread * ith;
+    const uint32_t ir1 = MIN(ir0 + cctx->rows_per_thread, cctx->dev_row_start + cctx->total_rows);
 
     for (uint32_t ir = ir0; ir < ir1; ir++) {
         const float * restrict src_row = (const float *) (src_data + ir * cctx->src_row_size);
@@ -215,7 +216,22 @@ int op_cumsum_f32(struct htp_ops_context * octx) {
     }
 
     const uint32_t total_rows = src0->ne[1] * src0->ne[2] * src0->ne[3];
-    const uint32_t n_threads  = MIN(octx->n_threads, total_rows);
+
+    uint32_t dev_row_start, dev_nrows;
+    if (octx->ndev > 1) {
+        const uint32_t rows_per_dev = (total_rows + octx->ndev - 1) / octx->ndev;
+        dev_row_start = MIN(octx->idev * rows_per_dev, total_rows);
+        dev_nrows     = MIN(rows_per_dev, total_rows - dev_row_start);
+    } else {
+        dev_row_start = 0;
+        dev_nrows     = total_rows;
+    }
+
+    if (dev_nrows == 0) {
+        return HTP_STATUS_OK;
+    }
+
+    const uint32_t n_threads  = MIN(octx->n_threads, dev_nrows);
 
     const size_t src_row_size         = src0->nb[1];
     const size_t dst_row_size         = dst->nb[1];
@@ -240,8 +256,9 @@ int op_cumsum_f32(struct htp_ops_context * octx) {
         .dst_row_size         = dst_row_size,
         .src_row_size_aligned = src_row_size_aligned,
         .dst_row_size_aligned = dst_row_size_aligned,
-        .rows_per_thread      = (total_rows + n_threads - 1) / n_threads,
-        .total_rows           = total_rows,
+        .rows_per_thread      = (dev_nrows + n_threads - 1) / n_threads,
+        .total_rows           = dev_nrows,
+        .dev_row_start       = dev_row_start,
     };
 
     if (octx->ctx->vtcm_size < spad_per_thread * n_threads) {

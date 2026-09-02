@@ -80,6 +80,7 @@ struct htp_act_context {
     uint32_t                 block;
     uint32_t                 src0_nrows;
     uint32_t                 src0_nrows_per_thread;
+    uint32_t                 dev_row_start;
     int                      nc;
 
     uint8_t *                vtcm_src0;
@@ -346,8 +347,8 @@ static void geglu_f32(const float * restrict src0,
         const uint32_t src0_nrows            = actx->src0_nrows;                                                       \
         const uint32_t src0_nrows_per_thread = actx->src0_nrows_per_thread;                                            \
                                                                                                                        \
-        const uint32_t src0_start_row = src0_nrows_per_thread * ith;                                                   \
-        const uint32_t src0_end_row   = MIN(src0_start_row + src0_nrows_per_thread, src0_nrows);                       \
+        const uint32_t src0_start_row = actx->dev_row_start + src0_nrows_per_thread * ith;                             \
+        const uint32_t src0_end_row   = MIN(src0_start_row + src0_nrows_per_thread, actx->dev_row_start + src0_nrows); \
                                                                                                                        \
         /* no work for this thread */                                                                                  \
         if (src0_start_row >= src0_end_row) {                                                                          \
@@ -473,7 +474,22 @@ static int execute_op_activations_f32(struct htp_ops_context * octx) {
     }
 
     const uint32_t src0_nrows = src0->ne[1] * src0->ne[2] * src0->ne[3];
-    const uint32_t n_threads  = MIN(octx->n_threads, src0_nrows);
+
+    uint32_t dev_row_start, dev_nrows;
+    if (octx->ndev > 1) {
+        const uint32_t rows_per_dev = (src0_nrows + octx->ndev - 1) / octx->ndev;
+        dev_row_start = MIN(octx->idev * rows_per_dev, src0_nrows);
+        dev_nrows     = MIN(rows_per_dev, src0_nrows - dev_row_start);
+    } else {
+        dev_row_start = 0;
+        dev_nrows     = src0_nrows;
+    }
+
+    if (dev_nrows == 0) {
+        return HTP_STATUS_OK;
+    }
+
+    const uint32_t n_threads  = MIN(octx->n_threads, dev_nrows);
 
     // row_size   = bytes of useful data per row (what the kernel touches / what DMA copies).
     // row_stride = bytes between successive rows in DDR (may exceed row_size for non-contig src).
@@ -518,7 +534,7 @@ static int execute_op_activations_f32(struct htp_ops_context * octx) {
     struct htp_act_context actx;
     actx.octx = octx;
 
-    actx.src0_nrows_per_thread = (src0_nrows + n_threads - 1) / n_threads;
+    actx.src0_nrows_per_thread = (dev_nrows + n_threads - 1) / n_threads;
 
     actx.src0_row_size = src0_row_size;
     actx.src1_row_size = src1_row_size;
@@ -545,7 +561,8 @@ static int execute_op_activations_f32(struct htp_ops_context * octx) {
     actx.dst_spad_half_size  = L.dst_bytes_per_thread / 2;
 
     actx.block = actx.src0_spad_half_size / actx.src0_row_size_aligned;
-    actx.src0_nrows = src0_nrows;
+    actx.src0_nrows = dev_nrows;
+    actx.dev_row_start = dev_row_start;
 
     actx.nc = dst->ne[0];
 

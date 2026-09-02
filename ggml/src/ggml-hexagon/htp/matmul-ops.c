@@ -89,6 +89,8 @@ struct htp_mm_context {
 
     // Precomputed values
     uint32_t src0_nrows_per_thread;
+    uint32_t dev_row_start;
+    uint32_t dev_row_end;
     uint32_t src0_row_size_padded;
     uint32_t src1_nrows;
 
@@ -252,8 +254,8 @@ static void hvx_mm_4d(unsigned int nth, unsigned int ith, void * data) {
         ith1 = ith;
     }
 
-    const uint32_t ir0_start = dr0 * ith0;
-    const uint32_t ir0_end   = MIN(ir0_start + dr0, nr0);
+    const uint32_t ir0_start = mmctx->dev_row_start + dr0 * ith0;
+    const uint32_t ir0_end   = MIN(ir0_start + dr0, mmctx->dev_row_end);
 
     const uint32_t ir1_start = dr1 * ith1;
     const uint32_t ir1_end   = MIN(ir1_start + dr1, nr1);
@@ -312,11 +314,11 @@ static void hvx_mm_4d(unsigned int nth, unsigned int ith, void * data) {
 static void hvx_mm_2d_repacked_##SUFFIX(unsigned int nth, unsigned int ith, void * data) {                                        \
     htp_matmul_preamble;                                                                                                          \
                                                                                                                                   \
-    const uint32_t src0_nrows = ne01 * ne02 * ne03;                                                                               \
+    const uint32_t src0_nrows = mmctx->dev_row_end - mmctx->dev_row_start;                                                      \
     const uint32_t src1_nrows = ne11 * ne12 * ne13;                                                                               \
                                                                                                                                   \
-    const uint32_t src0_start_row  = src0_nrows_per_thread * ith;                                                                 \
-    const uint32_t src0_end_row    = MIN(src0_start_row + src0_nrows_per_thread, src0_nrows);                                     \
+    const uint32_t src0_start_row  = mmctx->dev_row_start + src0_nrows_per_thread * ith;                                         \
+    const uint32_t src0_end_row    = MIN(src0_start_row + src0_nrows_per_thread, mmctx->dev_row_end);                            \
                                                                                                                                   \
     struct htp_thread_trace * tr = &octx->ctx->trace[ith];                                                                        \
                                                                                                                                   \
@@ -414,10 +416,10 @@ static void hvx_mm_2d_repacked_##SUFFIX(unsigned int nth, unsigned int ith, void
 static void hvx_mv_2d_repacked_##SUFFIX(unsigned int nth, unsigned int ith, void * data) {                                        \
     htp_matmul_preamble;                                                                                                          \
                                                                                                                                   \
-    const uint32_t src0_nrows = ne01;                                                                                             \
+    const uint32_t src0_nrows = mmctx->dev_row_end - mmctx->dev_row_start;                                                      \
                                                                                                                                   \
-    const uint32_t src0_start_row  = src0_nrows_per_thread * ith;                                                                 \
-    const uint32_t src0_end_row    = MIN(src0_start_row + src0_nrows_per_thread, src0_nrows);                                     \
+    const uint32_t src0_start_row  = mmctx->dev_row_start + src0_nrows_per_thread * ith;                                         \
+    const uint32_t src0_end_row    = MIN(src0_start_row + src0_nrows_per_thread, mmctx->dev_row_end);                            \
                                                                                                                                   \
     struct htp_thread_trace * tr = &octx->ctx->trace[ith];                                                                        \
                                                                                                                                   \
@@ -735,11 +737,11 @@ static void hvx_mm_2d(unsigned int nth, unsigned int ith, void * data) {
     assert(n_prefetch >= 2 && n_prefetch <= HTP_MM_MAX_PREFETCH && (n_prefetch & (n_prefetch - 1)) == 0);
     const uint32_t prefetch_mask = n_prefetch - 1;
 
-    const uint32_t src0_nrows = ne01 * ne02 * ne03;  // src0 rows
-    const uint32_t src1_nrows = ne11 * ne12 * ne13;  // src1 rows
+    const uint32_t src0_nrows = mmctx->dev_row_end - mmctx->dev_row_start;  // src0 rows
+    const uint32_t src1_nrows = ne11 * ne12 * ne13;                          // src1 rows
 
-    const uint32_t src0_start_row  = src0_nrows_per_thread * ith;
-    const uint32_t src0_end_row    = MIN(src0_start_row + src0_nrows_per_thread, src0_nrows);
+    const uint32_t src0_start_row  = mmctx->dev_row_start + src0_nrows_per_thread * ith;
+    const uint32_t src0_end_row    = MIN(src0_start_row + src0_nrows_per_thread, mmctx->dev_row_end);
     const uint32_t src0_end_row_x2 = src0_start_row + ((src0_end_row - src0_start_row) & ~1U);
 
     struct htp_thread_trace * tr = &octx->ctx->trace[ith];
@@ -833,10 +835,10 @@ static void hvx_mm_2d(unsigned int nth, unsigned int ith, void * data) {
 static void hvx_mv_2d(unsigned int nth, unsigned int ith, void * data) {
     htp_matmul_preamble;
 
-    const uint32_t src0_nrows = ne01;
+    const uint32_t src0_nrows = mmctx->dev_row_end - mmctx->dev_row_start;
 
-    const uint32_t src0_start_row  = src0_nrows_per_thread * ith;
-    const uint32_t src0_end_row    = MIN(src0_start_row + src0_nrows_per_thread, src0_nrows);
+    const uint32_t src0_start_row  = mmctx->dev_row_start + src0_nrows_per_thread * ith;
+    const uint32_t src0_end_row    = MIN(src0_start_row + src0_nrows_per_thread, mmctx->dev_row_end);
 
     struct htp_thread_trace * tr = &octx->ctx->trace[ith];
 
@@ -946,10 +948,10 @@ static void hvx_mm_id(unsigned int nth, unsigned int ith, void * data) {
     uint64_t t1, t2;
     t1 = HAP_perf_get_qtimer_count();
 
-    const uint32_t src0_nrows      = ne01;  // src0 rows per expert
+    const uint32_t src0_nrows      = mmctx->dev_row_end - mmctx->dev_row_start;  // src0 rows per expert
     const uint32_t src1_nrows      = ne11;
-    const uint32_t src0_start_row  = src0_nrows_per_thread * ith;
-    const uint32_t src0_end_row    = MIN(src0_start_row + src0_nrows_per_thread, src0_nrows);
+    const uint32_t src0_start_row  = mmctx->dev_row_start + src0_nrows_per_thread * ith;
+    const uint32_t src0_end_row    = MIN(src0_start_row + src0_nrows_per_thread, mmctx->dev_row_end);
 
     hvx_mm_run_quant_task(mmctx, ith);
 
@@ -1036,9 +1038,9 @@ static void hvx_mv_id(unsigned int nth, unsigned int ith, void * data) {
 
     const struct htp_tensor * restrict ids = octx->src[2];
 
-    const uint32_t src0_nrows      = ne01;  // src0 rows per expert
-    const uint32_t src0_start_row  = src0_nrows_per_thread * ith;
-    const uint32_t src0_end_row    = MIN(src0_start_row + src0_nrows_per_thread, src0_nrows);
+    const uint32_t src0_nrows      = mmctx->dev_row_end - mmctx->dev_row_start;  // src0 rows per expert
+    const uint32_t src0_start_row  = mmctx->dev_row_start + src0_nrows_per_thread * ith;
+    const uint32_t src0_end_row    = MIN(src0_start_row + src0_nrows_per_thread, mmctx->dev_row_end);
 
     hvx_mm_run_quant_task(mmctx, ith);
 
@@ -1143,12 +1145,12 @@ static void hvx_mv_id_nx(unsigned int nth, unsigned int ith, void * data) {
             const struct htp_tensor * restrict dst   = octx->dsts[p];
             if (!src_w || !dst) continue;
 
-            const uint32_t src0_nrows = src_w->ne[1];
+            const uint32_t src0_nrows = mmctx->dev_row_end - mmctx->dev_row_start;
             uint32_t src0_nrows_per_thread = fastdiv(src0_nrows + nth - 1, &octx->ctx->n_threads_div);
             src0_nrows_per_thread = hex_round_up(src0_nrows_per_thread, 32);
 
-            const uint32_t src0_start_row = src0_nrows_per_thread * ith;
-            const uint32_t src0_end_row   = MIN(src0_start_row + src0_nrows_per_thread, src0_nrows);
+            const uint32_t src0_start_row = mmctx->dev_row_start + src0_nrows_per_thread * ith;
+            const uint32_t src0_end_row   = MIN(src0_start_row + src0_nrows_per_thread, mmctx->dev_row_end);
             if (src0_start_row >= src0_end_row) continue;
 
             const uint8_t * restrict src0_row = (const uint8_t *) src_w->data + eid * src_w->nb[2];
@@ -1227,12 +1229,12 @@ static void hvx_mm_id_nx(unsigned int nth, unsigned int ith, void * data) {
             const struct htp_tensor * restrict dst   = octx->dsts[p];
             if (!src_w || !dst) continue;
 
-            const uint32_t src0_nrows = src_w->ne[1];
+            const uint32_t src0_nrows = mmctx->dev_row_end - mmctx->dev_row_start;
             uint32_t src0_nrows_per_thread = fastdiv(src0_nrows + nth - 1, &octx->ctx->n_threads_div);
             src0_nrows_per_thread = hex_round_up(src0_nrows_per_thread, 32);
 
-            const uint32_t src0_start_row = src0_nrows_per_thread * ith;
-            const uint32_t src0_end_row   = MIN(src0_start_row + src0_nrows_per_thread, src0_nrows);
+            const uint32_t src0_start_row = mmctx->dev_row_start + src0_nrows_per_thread * ith;
+            const uint32_t src0_end_row   = MIN(src0_start_row + src0_nrows_per_thread, mmctx->dev_row_end);
             if (src0_start_row >= src0_end_row) continue;
 
             const uint8_t * src0_row = (const uint8_t *) src_w->data + cur_a * src_w->nb[2];
@@ -1326,12 +1328,30 @@ static int hvx_mm_matmul(struct htp_ops_context * octx) {
     const uint32_t src0_nrows = ne01 * ne02 * ne03;
     const uint32_t src1_nrows = ne11 * ne12 * ne13;
 
+    uint32_t dev_row_start, dev_row_end;
+    if (octx->ndev > 1) {
+        const uint32_t rows_per_dev = (src0_nrows + octx->ndev - 1) / octx->ndev;
+        dev_row_start = MIN(octx->idev * rows_per_dev, src0_nrows);
+        dev_row_end   = MIN(dev_row_start + rows_per_dev, src0_nrows);
+    } else {
+        dev_row_start = 0;
+        dev_row_end   = src0_nrows;
+    }
+
+    if (dev_row_start >= dev_row_end) {
+        return HTP_STATUS_OK;
+    }
+
+    const uint32_t dev_nrows = dev_row_end - dev_row_start;
+    mmctx->dev_row_start = dev_row_start;
+    mmctx->dev_row_end   = dev_row_end;
+
     bool is_repacked = (src0->type == HTP_TYPE_Q4_0 || src0->type == HTP_TYPE_Q4_1 ||
                         src0->type == HTP_TYPE_Q8_0 || src0->type == HTP_TYPE_IQ4_NL ||
                         src0->type == HTP_TYPE_MXFP4);
 
     // Compute src0_nrows_per_thread
-    mmctx->src0_nrows_per_thread  = fastdiv(src0_nrows + octx->n_threads - 1, &octx->ctx->n_threads_div);
+    mmctx->src0_nrows_per_thread  = fastdiv(dev_nrows + octx->n_threads - 1, &octx->ctx->n_threads_div);
     if (is_repacked) {
         mmctx->src0_nrows_per_thread = hex_round_up(mmctx->src0_nrows_per_thread, 32);
     } else {
@@ -3368,31 +3388,49 @@ static int hmx_mm_op_matmul(struct htp_ops_context * octx, const struct htp_mm_k
     const int act_stride = (int)(src1->nb[1] / sizeof(float));
     const int wgt_stride = (int)(src0->nb[1] / sizeof(__fp16));
 
+    int m_start, m_dev;
+    if (octx->ndev > 1) {
+        const int rows_per_dev = (m_total + octx->ndev - 1) / octx->ndev;
+        m_start = MIN((int)(octx->idev * rows_per_dev), m_total);
+        m_dev   = MIN(rows_per_dev, m_total - m_start);
+    } else {
+        m_start = 0;
+        m_dev   = m_total;
+    }
+
+    if (m_dev == 0) {
+        return HTP_STATUS_OK;
+    }
+
     const float * src2_ptr = NULL;
     uint32_t src2_stride = 0;
     size_t src2_nb2 = 0;
     size_t src2_nb3 = 0;
     if (src2) {
-        src2_ptr = (const float *) src2->data;
         src2_stride = (src2->ne[1] == 1) ? 0 : (uint32_t) (src2->nb[1] / sizeof(float));
+        src2_ptr = (const float *) src2->data + m_start * src2_stride;
         src2_nb2 = (src2->ne[2] == 1) ? 0 : src2->nb[2];
         src2_nb3 = (src2->ne[3] == 1) ? 0 : src2->nb[3];
     }
+
+    const int dst_stride = (int)(dst->nb[1] / sizeof(float));
+    float       * dst_ptr = (float *)       dst->data  + m_start * dst_stride;
+    const float * act_ptr = (const float *) src1->data + m_start * act_stride;
 
     int ret = -1;
     const int n_threads = MIN(kparams->n_threads, (int) octx->n_threads);
     if (kparams->kernel_type == HTP_MM_KERNEL_HMX_F16_BATCHED) {
         hmx_mm_f16_f32_batched_params_t batch_params = {
-            .dst             = (float *) dst->data,
+            .dst             = dst_ptr,
             .src2            = src2_ptr,
-            .activation      = (float *) src1->data,
+            .activation      = act_ptr,
             .weight          = (const __fp16 *) src0->data,
-            .m               = m_total,
+            .m               = m_dev,
             .k               = k,
             .n               = n,
             .act_stride      = act_stride,
             .weight_stride   = wgt_stride,
-            .dst_stride      = (int) (dst->nb[1] / sizeof(float)),
+            .dst_stride      = dst_stride,
             .src2_stride     = src2_stride,
             .ne02            = ne02,
             .ne03            = ne03,
@@ -3420,9 +3458,9 @@ static int hmx_mm_op_matmul(struct htp_ops_context * octx, const struct htp_mm_k
                                      kparams->vtcm_size);
     } else {
         ret = hmx_mm_2d_f32(
-            octx->ctx, (float*) dst->data, src2_ptr, (float*) src1->data, (const uint8_t *) src0->data,
-            m_total, k, n, act_stride, (int) src0->nb[1], (int) src0->type, (int) src1->ne[0],
-            (int)(dst->nb[1] / sizeof(float)), src2_stride, (int)dst->ne[0],
+            octx->ctx, dst_ptr, src2_ptr, act_ptr, (const uint8_t *) src0->data,
+            m_dev, k, n, act_stride, (int) src0->nb[1], (int) src0->type, (int) src1->ne[0],
+            dst_stride, src2_stride, (int)dst->ne[0],
             kparams->m_chunk, kparams->n_chunk, kparams->pipeline, n_threads,
             kparams->n_act_threads,
             &kparams->div_n_act_threads,
@@ -3789,7 +3827,25 @@ int op_matmul_id(struct htp_ops_context * octx) {
     const uint32_t src0_nrows = ne01;  // per expert
     const uint32_t src1_nrows = ne11 * ne12 * ne13;
 
-    mmctx->src0_nrows_per_thread = fastdiv(src0_nrows + octx->n_threads - 1, &octx->ctx->n_threads_div);
+    uint32_t dev_row_start, dev_row_end;
+    if (octx->ndev > 1) {
+        const uint32_t rows_per_dev = (src0_nrows + octx->ndev - 1) / octx->ndev;
+        dev_row_start = MIN(octx->idev * rows_per_dev, src0_nrows);
+        dev_row_end   = MIN(dev_row_start + rows_per_dev, src0_nrows);
+    } else {
+        dev_row_start = 0;
+        dev_row_end   = src0_nrows;
+    }
+
+    if (dev_row_start >= dev_row_end) {
+        return HTP_STATUS_OK;
+    }
+
+    const uint32_t dev_nrows = dev_row_end - dev_row_start;
+    mmctx->dev_row_start = dev_row_start;
+    mmctx->dev_row_end   = dev_row_end;
+
+    mmctx->src0_nrows_per_thread = fastdiv(dev_nrows + octx->n_threads - 1, &octx->ctx->n_threads_div);
     mmctx->src0_nrows_per_thread = hex_round_up(mmctx->src0_nrows_per_thread, 32);
 
     // row groups
@@ -3878,7 +3934,25 @@ int op_matmul_id_nx(struct htp_ops_context * octx) {
     const uint32_t src0_nrows = src0->ne[1];
     const uint32_t src1_nrows = act->ne[1] * act->ne[2] * act->ne[3];
 
-    mmctx->src0_nrows_per_thread = fastdiv(src0_nrows + octx->n_threads - 1, &octx->ctx->n_threads_div);
+    uint32_t dev_row_start, dev_row_end;
+    if (octx->ndev > 1) {
+        const uint32_t rows_per_dev = (src0_nrows + octx->ndev - 1) / octx->ndev;
+        dev_row_start = MIN(octx->idev * rows_per_dev, src0_nrows);
+        dev_row_end   = MIN(dev_row_start + rows_per_dev, src0_nrows);
+    } else {
+        dev_row_start = 0;
+        dev_row_end   = src0_nrows;
+    }
+
+    if (dev_row_start >= dev_row_end) {
+        return HTP_STATUS_OK;
+    }
+
+    const uint32_t dev_nrows = dev_row_end - dev_row_start;
+    mmctx->dev_row_start = dev_row_start;
+    mmctx->dev_row_end   = dev_row_end;
+
+    mmctx->src0_nrows_per_thread = fastdiv(dev_nrows + octx->n_threads - 1, &octx->ctx->n_threads_div);
     mmctx->src0_nrows_per_thread = hex_round_up(mmctx->src0_nrows_per_thread, 32);
 
     const int n_ids = ids->ne[0];

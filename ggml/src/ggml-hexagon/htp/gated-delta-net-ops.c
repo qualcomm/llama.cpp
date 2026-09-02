@@ -22,6 +22,8 @@ struct htp_gdn_context {
     size_t   state_bytes;
     uint8_t * vtcm_base;
     size_t   vtcm_per_thread;
+    uint32_t dev_row_start;
+    uint32_t dev_nrows;
 };
 
 static inline HVX_Vector gdn_mul_dot_f32(float * restrict dst, const float * restrict mul, const float * restrict dot, uint32_t n) {
@@ -586,8 +588,9 @@ static void gated_delta_net_f32_pp_thread(unsigned int nth, unsigned int ith, vo
     const uint32_t n_seqs   = v->ne[3];
     const uint32_t K        = octx->op_params[0];
 
-    const uint32_t total_rows = H * n_seqs;
-    if (ith >= total_rows) {
+    const uint32_t row_end = gctx->dev_row_start + gctx->dev_nrows;
+
+    if (ith >= gctx->dev_nrows) {
         return;
     }
 
@@ -621,11 +624,11 @@ static void gated_delta_net_f32_pp_thread(unsigned int nth, unsigned int ith, vo
     const uint64_t state_seq_stride = state->nb[3] / sizeof(float);
     const uint64_t state_size_per_snap = (uint64_t) S_v * S_v * H * n_seqs;
 
-    uint32_t ir_prefetch = ith;
+    uint32_t ir_prefetch = gctx->dev_row_start + ith;
     int spad_idx = 0;
 
     // Prefetch preamble (up to 2 steps)
-    for (int k = 0; k < 2 && ir_prefetch < total_rows; k++) {
+    for (int k = 0; k < 2 && ir_prefetch < row_end; k++) {
         const uint32_t piv1 = fastmodulo(ir_prefetch, H, &fd_H);
         const uint32_t piv3 = fastdiv(ir_prefetch, &fd_H);
         const float * ps_in = state_in_base + (uint64_t) piv3 * state_seq_stride + (uint64_t) piv1 * S_v * S_v;
@@ -647,7 +650,7 @@ static void gated_delta_net_f32_pp_thread(unsigned int nth, unsigned int ith, vo
     }
 
     int curr_spad_idx = 0;
-    for (uint32_t ir = ith; ir < total_rows; ir += nth) {
+    for (uint32_t ir = gctx->dev_row_start + ith; ir < row_end; ir += nth) {
         dma_queue_pop(dma);
         dma_queue_pop(dma);
 
@@ -812,7 +815,7 @@ static void gated_delta_net_f32_pp_thread(unsigned int nth, unsigned int ith, vo
                        S_v * sizeof(float), S_v);
 
         // Prefetch next block (if any)
-        if (ir_prefetch < total_rows) {
+        if (ir_prefetch < row_end) {
             const uint32_t piv1 = fastmodulo(ir_prefetch, H, &fd_H);
             const uint32_t piv3 = fastdiv(ir_prefetch, &fd_H);
             const float * ps_in = state_in_base + (uint64_t) piv3 * state_seq_stride + (uint64_t) piv1 * S_v * S_v;
@@ -847,8 +850,9 @@ static void gated_delta_net_f32_tg_thread(unsigned int nth, unsigned int ith, vo
     const uint32_t H        = v->ne[1];
     const uint32_t n_seqs   = v->ne[3];
 
-    const uint32_t total_rows = H * n_seqs;
-    if (ith >= total_rows) {
+    const uint32_t row_end = gctx->dev_row_start + gctx->dev_nrows;
+
+    if (ith >= gctx->dev_nrows) {
         return;
     }
 
@@ -881,11 +885,11 @@ static void gated_delta_net_f32_tg_thread(unsigned int nth, unsigned int ith, vo
 
     const uint64_t state_seq_stride = state->nb[3] / sizeof(float);
 
-    uint32_t ir_prefetch = ith;
+    uint32_t ir_prefetch = gctx->dev_row_start + ith;
     int spad_idx = 0;
 
     // Prefetch preamble (up to 2 steps)
-    for (int k = 0; k < 2 && ir_prefetch < total_rows; k++) {
+    for (int k = 0; k < 2 && ir_prefetch < row_end; k++) {
         const uint32_t piv1 = fastmodulo(ir_prefetch, H, &fd_H);
         const uint32_t piv3 = fastdiv(ir_prefetch, &fd_H);
         const float * ps_in = state_in_base + (uint64_t) piv3 * state_seq_stride + (uint64_t) piv1 * S_v * S_v;
@@ -907,7 +911,7 @@ static void gated_delta_net_f32_tg_thread(unsigned int nth, unsigned int ith, vo
     }
 
     int curr_spad_idx = 0;
-    for (uint32_t ir = ith; ir < total_rows; ir += nth) {
+    for (uint32_t ir = gctx->dev_row_start + ith; ir < row_end; ir += nth) {
         dma_queue_pop(dma);
         dma_queue_pop(dma);
 
@@ -1057,7 +1061,7 @@ static void gated_delta_net_f32_tg_thread(unsigned int nth, unsigned int ith, vo
                        S_v * sizeof(float), S_v);
 
         // Prefetch next block (if any)
-        if (ir_prefetch < total_rows) {
+        if (ir_prefetch < row_end) {
             const uint32_t piv1 = fastmodulo(ir_prefetch, H, &fd_H);
             const uint32_t piv3 = fastdiv(ir_prefetch, &fd_H);
             const float * ps_in = state_in_base + (uint64_t) piv3 * state_seq_stride + (uint64_t) piv1 * S_v * S_v;
@@ -1124,16 +1128,36 @@ int op_gated_delta_net(struct htp_ops_context * octx) {
         return HTP_STATUS_OK;
     }
 
+    const uint32_t total_rows = H * n_seqs;
+
+    uint32_t dev_row_start, dev_nrows;
+    if (octx->ndev > 1) {
+        const uint32_t rows_per_dev = (total_rows + octx->ndev - 1) / octx->ndev;
+        dev_row_start = MIN(octx->idev * rows_per_dev, total_rows);
+        dev_nrows     = MIN(rows_per_dev, total_rows - dev_row_start);
+    } else {
+        dev_row_start = 0;
+        dev_nrows     = total_rows;
+    }
+
+    if (dev_nrows == 0) {
+        return HTP_STATUS_OK;
+    }
+
+    const uint32_t n_threads = MIN(octx->n_threads, dev_nrows);
+
     struct htp_gdn_context gctx;
     gctx.octx = octx;
-    gctx.rows_per_thread = (H * n_seqs + octx->n_threads - 1) / octx->n_threads;
+    gctx.dev_row_start   = dev_row_start;
+    gctx.dev_nrows       = dev_nrows;
+    gctx.rows_per_thread = (dev_nrows + n_threads - 1) / n_threads;
     gctx.state_bytes = (size_t) S_v * S_v * sizeof(float);
 
     size_t state_aligned = (size_t) S_v * S_v * sizeof(float);
     state_aligned = (state_aligned + 127) & ~(size_t)127;
 
     assert(octx->ctx->vtcm_base != NULL);
-    assert(octx->ctx->vtcm_size >= 2 * state_aligned * octx->n_threads);
+    assert(octx->ctx->vtcm_size >= 2 * state_aligned * n_threads);
 
     gctx.vtcm_base = octx->ctx->vtcm_base;
     gctx.vtcm_per_thread = 2 * state_aligned;
@@ -1148,9 +1172,9 @@ int op_gated_delta_net(struct htp_ops_context * octx) {
          gctx.vtcm_per_thread * octx->n_threads, octx->n_threads);
 
     if (n_tokens == 1) {
-        worker_pool_run_func(octx->ctx->worker_pool, gated_delta_net_f32_tg_thread, &gctx, octx->n_threads);
+        worker_pool_run_func(octx->ctx->worker_pool, gated_delta_net_f32_tg_thread, &gctx, n_threads);
     } else {
-        worker_pool_run_func(octx->ctx->worker_pool, gated_delta_net_f32_pp_thread, &gctx, octx->n_threads);
+        worker_pool_run_func(octx->ctx->worker_pool, gated_delta_net_f32_pp_thread, &gctx, n_threads);
     }
 
     return HTP_STATUS_OK;

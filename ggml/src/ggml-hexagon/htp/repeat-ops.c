@@ -25,6 +25,7 @@ struct htp_repeat_context {
 
     uint32_t nrows_per_thread;
     uint32_t total_dst_rows;  // ne1 * ne2 * ne3
+    uint32_t dev_row_start;
 
     size_t   type_size;
 };
@@ -62,8 +63,8 @@ static void repeat_job_per_thread(unsigned int nth, unsigned int ith, void * dat
 
     const size_t row_bytes = ne00 * rctx->type_size;
 
-    const uint32_t row_start = rctx->nrows_per_thread * ith;
-    const uint32_t row_end   = MIN(row_start + rctx->nrows_per_thread, rctx->total_dst_rows);
+    const uint32_t row_start = rctx->dev_row_start + rctx->nrows_per_thread * ith;
+    const uint32_t row_end   = MIN(row_start + rctx->nrows_per_thread, rctx->dev_row_start + rctx->total_dst_rows);
 
     uint64_t t1, t2;
     t1 = HAP_perf_get_qtimer_count();
@@ -119,12 +120,27 @@ int op_repeat(struct htp_ops_context * octx) {
             return HTP_STATUS_NO_SUPPORT;
     }
 
-    const uint32_t total_dst_rows = dst->ne[1] * dst->ne[2] * dst->ne[3];
-    const uint32_t n_threads = MIN(octx->n_threads, total_dst_rows);
-
     if (octx->flags & HTP_OPFLAGS_SKIP_COMPUTE) {
         return HTP_STATUS_OK;
     }
+
+    const uint32_t total_dst_rows = dst->ne[1] * dst->ne[2] * dst->ne[3];
+
+    uint32_t dev_row_start, dev_nrows;
+    if (octx->ndev > 1) {
+        const uint32_t rows_per_dev = (total_dst_rows + octx->ndev - 1) / octx->ndev;
+        dev_row_start = MIN(octx->idev * rows_per_dev, total_dst_rows);
+        dev_nrows     = MIN(rows_per_dev, total_dst_rows - dev_row_start);
+    } else {
+        dev_row_start = 0;
+        dev_nrows     = total_dst_rows;
+    }
+
+    if (dev_nrows == 0) {
+        return HTP_STATUS_OK;
+    }
+
+    const uint32_t n_threads = MIN(octx->n_threads, dev_nrows);
 
     struct htp_repeat_context rctx = {
         .octx             = octx,
@@ -132,8 +148,9 @@ int op_repeat(struct htp_ops_context * octx) {
         .nr1              = dst->ne[1] / src0->ne[1],
         .nr2              = dst->ne[2] / src0->ne[2],
         .nr3              = dst->ne[3] / src0->ne[3],
-        .nrows_per_thread = (total_dst_rows + n_threads - 1) / n_threads,
-        .total_dst_rows   = total_dst_rows,
+        .nrows_per_thread = (dev_nrows + n_threads - 1) / n_threads,
+        .total_dst_rows   = dev_nrows,
+        .dev_row_start    = dev_row_start,
         .type_size        = type_size,
     };
 

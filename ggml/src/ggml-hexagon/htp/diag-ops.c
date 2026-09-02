@@ -36,6 +36,7 @@ struct htp_diag_context {
     size_t          dst_row_size_aligned;
     uint32_t        batches_per_thread;
     uint32_t        total_batches;
+    uint32_t        dev_batch_start;
 };
 
 #define htp_diag_preamble                                              \
@@ -60,8 +61,8 @@ static void diag_thread_f32_dma(unsigned int nth, unsigned int ith, void * data)
     uint64_t t1, t2;
     t1 = HAP_perf_get_qtimer_count();
 
-    const uint32_t ib0 = dctx->batches_per_thread * ith;
-    const uint32_t ib1 = MIN(ib0 + dctx->batches_per_thread, dctx->total_batches);
+    const uint32_t ib0 = dctx->dev_batch_start + dctx->batches_per_thread * ith;
+    const uint32_t ib1 = MIN(ib0 + dctx->batches_per_thread, dctx->dev_batch_start + dctx->total_batches);
 
     if (ib0 >= ib1) {
         return;
@@ -128,8 +129,8 @@ static void diag_thread_f32(unsigned int nth, unsigned int ith, void * data) {
     const uint8_t * src_data = (const uint8_t *) src0->data;
     uint8_t *       dst_data = (uint8_t *) dst->data;
 
-    const uint32_t ib0 = dctx->batches_per_thread * ith;
-    const uint32_t ib1 = MIN(ib0 + dctx->batches_per_thread, dctx->total_batches);
+    const uint32_t ib0 = dctx->dev_batch_start + dctx->batches_per_thread * ith;
+    const uint32_t ib1 = MIN(ib0 + dctx->batches_per_thread, dctx->dev_batch_start + dctx->total_batches);
 
     for (uint32_t ib = ib0; ib < ib1; ib++) {
         const uint32_t i3 = ib / ne02;
@@ -160,7 +161,22 @@ int op_diag_f32(struct htp_ops_context * octx) {
     }
 
     const uint32_t total_batches = src0->ne[2] * src0->ne[3];
-    const uint32_t n_threads     = MIN(octx->n_threads, total_batches);
+
+    uint32_t dev_batch_start, dev_nbatches;
+    if (octx->ndev > 1) {
+        const uint32_t batches_per_dev = (total_batches + octx->ndev - 1) / octx->ndev;
+        dev_batch_start = MIN(octx->idev * batches_per_dev, total_batches);
+        dev_nbatches    = MIN(batches_per_dev, total_batches - dev_batch_start);
+    } else {
+        dev_batch_start = 0;
+        dev_nbatches    = total_batches;
+    }
+
+    if (dev_nbatches == 0) {
+        return HTP_STATUS_OK;
+    }
+
+    const uint32_t n_threads     = MIN(octx->n_threads, dev_nbatches);
 
     const size_t src_batch_size         = src0->ne[0] * sizeof(float);
     const size_t dst_row_size           = dst->ne[0] * sizeof(float);
@@ -185,8 +201,9 @@ int op_diag_f32(struct htp_ops_context * octx) {
         .dst_row_size           = dst_row_size,
         .src_batch_size_aligned = src_batch_size_aligned,
         .dst_row_size_aligned   = dst_row_size_aligned,
-        .batches_per_thread     = (total_batches + n_threads - 1) / n_threads,
-        .total_batches          = total_batches,
+        .batches_per_thread     = (dev_nbatches + n_threads - 1) / n_threads,
+        .total_batches          = dev_nbatches,
+        .dev_batch_start       = dev_batch_start,
     };
 
     if (octx->ctx->vtcm_size < spad_per_thread * n_threads) {

@@ -316,6 +316,22 @@ def main():
                 device_val = os.environ["DEVICE"]
             else:
                 device_val = "HTP0"
+
+            # In row-split mode, llama.cpp only needs the main device passed to --device;
+            # the backend manages all devices via GGML_HEXAGON_DEVICES.
+            is_row_split = False
+            for i, arg in enumerate(cmd_args):
+                if arg in ("--split-mode", "-sm") and i + 1 < len(cmd_args):
+                    if cmd_args[i + 1].lower() == "row":
+                        is_row_split = True
+                elif arg.startswith("--split-mode=") and arg.split("=", 1)[1].lower() == "row":
+                    is_row_split = True
+                elif arg.startswith("-sm=") and arg.split("=", 1)[1].lower() == "row":
+                    is_row_split = True
+
+            if is_row_split and device_val:
+                device_val = device_val.split(",")[0]
+
             if device_val:
                 cmd_args += ["--device", device_val]
 

@@ -46,6 +46,7 @@ struct htp_unary_context {
     uint32_t                  block;
     uint32_t                  src0_nrows;
     uint32_t                  src0_nrows_per_thread;
+    uint32_t                  dev_row_start;
     uint32_t                  nc;
     uint32_t                  col_tile;             // tiled mode
     bool                      broadcast_weight;
@@ -661,8 +662,8 @@ static void unary_task_##SUFFIX##_##NAME(unsigned int nth, unsigned int ith, voi
     const size_t dst_row_size_aligned  = uctx->dst_row_size_aligned;                                                \
                                                                                                                     \
     const uint32_t src0_nrows = uctx->src0_nrows;                                                                   \
-    const uint32_t src0_start_row = src0_nrows_per_thread * ith;                                                    \
-    const uint32_t src0_end_row   = MIN(src0_start_row + src0_nrows_per_thread, src0_nrows);                        \
+    const uint32_t src0_start_row = uctx->dev_row_start + src0_nrows_per_thread * ith;                             \
+    const uint32_t src0_end_row   = MIN(src0_start_row + src0_nrows_per_thread, uctx->dev_row_start + src0_nrows); \
                                                                                                                     \
     if (src0_start_row >= src0_end_row) {                                                                           \
         return;                                                                                                     \
@@ -843,12 +844,14 @@ static void unary_task_f32_tiled_##NAME(unsigned int nth, unsigned int ith, void
                                                                                                                     \
     htp_unary_preamble;                                                                                             \
                                                                                                                     \
+    uint32_t     src0_nrows_per_thread = uctx->src0_nrows_per_thread;                                               \
+                                                                                                                    \
     int32_t *      op_params = octx->op_params;                                                                     \
     const uint32_t col_tile  = uctx->col_tile;                                                                      \
                                                                                                                     \
-    const uint32_t src0_nrows     = uctx->src0_nrows;                                                               \
-    const uint32_t src0_start_row = uctx->src0_nrows_per_thread * ith;                                              \
-    const uint32_t src0_end_row   = MIN(src0_start_row + uctx->src0_nrows_per_thread, src0_nrows);                  \
+    const uint32_t src0_nrows = uctx->src0_nrows;                                                                   \
+    const uint32_t src0_start_row = uctx->dev_row_start + src0_nrows_per_thread * ith;                             \
+    const uint32_t src0_end_row   = MIN(src0_start_row + src0_nrows_per_thread, uctx->dev_row_start + src0_nrows); \
                                                                                                                     \
     if (src0_start_row >= src0_end_row) {                                                                           \
         return;                                                                                                     \
@@ -1147,7 +1150,22 @@ static int execute_op_unary(struct htp_ops_context * octx) {
     const struct htp_unary_kernel_params * kparams = (const struct htp_unary_kernel_params *) octx->kernel_params;
 
     const uint32_t src0_nrows = src0->ne[1] * src0->ne[2] * src0->ne[3];
-    const uint32_t n_threads  = kparams->n_threads;
+
+    uint32_t dev_row_start, dev_nrows;
+    if (octx->ndev > 1) {
+        const uint32_t rows_per_dev = (src0_nrows + octx->ndev - 1) / octx->ndev;
+        dev_row_start = MIN(octx->idev * rows_per_dev, src0_nrows);
+        dev_nrows     = MIN(rows_per_dev, src0_nrows - dev_row_start);
+    } else {
+        dev_row_start = 0;
+        dev_nrows     = src0_nrows;
+    }
+
+    if (dev_nrows == 0) {
+        return HTP_STATUS_OK;
+    }
+
+    const uint32_t n_threads  = MIN(kparams->n_threads, dev_nrows);
 
     const size_t elem_size = is_f16 ? sizeof(_Float16) : sizeof(float);
 
@@ -1191,8 +1209,9 @@ static int execute_op_unary(struct htp_ops_context * octx) {
         struct htp_unary_context uctx = {
             .octx                  = octx,
             .kparams               = kparams,
-            .src0_nrows_per_thread = (src0_nrows + n_threads - 1) / n_threads,
-            .src0_nrows            = src0_nrows,
+            .src0_nrows_per_thread = (dev_nrows + n_threads - 1) / n_threads,
+            .src0_nrows            = dev_nrows,
+            .dev_row_start         = dev_row_start,
 
             .data_src0             = (const uint8_t *)src0->data,
             .data_src1             = (octx->op == HTP_OP_RMS_NORM_MUL) ? (const uint8_t *)src1->data : NULL,

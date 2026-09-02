@@ -68,6 +68,7 @@ struct htp_pad_context {
 
     uint32_t nrows_per_thread;
     uint32_t total_dst_rows;
+    uint32_t dev_row_start;
 
     size_t   type_size;
 
@@ -101,8 +102,8 @@ struct htp_pad_context {
                                                     \
     const size_t type_size = pctx->type_size;       \
                                                     \
-    const uint32_t row_start = pctx->nrows_per_thread * ith;                                 \
-    const uint32_t row_end   = MIN(row_start + pctx->nrows_per_thread, pctx->total_dst_rows);
+    const uint32_t row_start = pctx->dev_row_start + pctx->nrows_per_thread * ith;                           \
+    const uint32_t row_end   = MIN(row_start + pctx->nrows_per_thread, pctx->dev_row_start + pctx->total_dst_rows);
 
 
 #define htp_pad_dma_preamble                                        \
@@ -489,7 +490,22 @@ int op_pad(struct htp_ops_context * octx) {
     const uint32_t ne00 = src0->ne[0];
 
     const uint32_t total_dst_rows = dst->ne[1] * dst->ne[2] * dst->ne[3];
-    const uint32_t n_threads = MIN(octx->n_threads, total_dst_rows > 0 ? total_dst_rows : 1);
+
+    uint32_t dev_row_start, dev_nrows;
+    if (octx->ndev > 1) {
+        const uint32_t rows_per_dev = (total_dst_rows + octx->ndev - 1) / octx->ndev;
+        dev_row_start = MIN(octx->idev * rows_per_dev, total_dst_rows);
+        dev_nrows     = MIN(rows_per_dev, total_dst_rows - dev_row_start);
+    } else {
+        dev_row_start = 0;
+        dev_nrows     = total_dst_rows;
+    }
+
+    if (dev_nrows == 0) {
+        return HTP_STATUS_OK;
+    }
+
+    const uint32_t n_threads = MIN(octx->n_threads, dev_nrows);
 
     const size_t src_row_size         = (size_t)ne00 * type_size;
     const size_t dst_row_size         = (size_t)ne0  * type_size;
@@ -521,8 +537,9 @@ int op_pad(struct htp_ops_context * octx) {
         .lp1 = lp1, .rp1 = rp1,
         .lp2 = lp2, .rp2 = rp2,
         .lp3 = lp3, .rp3 = rp3,
-        .nrows_per_thread = (total_dst_rows + n_threads - 1) / n_threads,
-        .total_dst_rows   = total_dst_rows,
+        .nrows_per_thread = (dev_nrows + n_threads - 1) / n_threads,
+        .total_dst_rows   = dev_nrows,
+        .dev_row_start    = dev_row_start,
         .type_size        = type_size,
         .src_row_size         = src_row_size,
         .src_row_size_aligned = src_row_size_aligned,

@@ -36,6 +36,8 @@ struct htp_binary_context {
 
     uint32_t block_max;
     uint32_t nrows_per_thread;
+    uint32_t total_rows;
+    uint32_t dev_row_start;
     size_t   src0_row_size_aligned;
     size_t   src1_row_size_aligned;
     size_t   dst_row_size_aligned;
@@ -184,9 +186,8 @@ static void binary_job_scalar(unsigned int nth, unsigned int ith, void * data) {
 
     const uint32_t src0_type = octx->src[0]->type;
     const uint32_t row_size_bytes = (src0_type == HTP_TYPE_F32) ? ne00 * sizeof(float) : ne00 * sizeof(_Float16);
-    const uint32_t total_rows = ne01 * ne02 * ne03;
-    const uint32_t start_row = bctx->nrows_per_thread * ith;
-    const uint32_t end_row   = MIN(start_row + bctx->nrows_per_thread, total_rows);
+    const uint32_t start_row = bctx->dev_row_start + bctx->nrows_per_thread * ith;
+    const uint32_t end_row   = MIN(start_row + bctx->nrows_per_thread, bctx->dev_row_start + bctx->total_rows);
     if (start_row >= end_row) return;
 
     FARF(HIGH, "binary-scalar: %d/%d (%u:%u) row-size %u (%u)", ith, nth, start_row, end_row, nb01, bctx->dst_row_size_aligned);
@@ -277,9 +278,8 @@ static void binary_job_vector_same_shape(unsigned int nth, unsigned int ith, voi
 
     const uint32_t src0_type = octx->src[0]->type;
     const uint32_t row_size_bytes = (src0_type == HTP_TYPE_F32) ? ne00 * sizeof(float) : ne00 * sizeof(_Float16);
-    const uint32_t total_rows = ne01 * ne02 * ne03;
-    const uint32_t start_row = bctx->nrows_per_thread * ith;
-    const uint32_t end_row   = MIN(start_row + bctx->nrows_per_thread, total_rows);
+    const uint32_t start_row = bctx->dev_row_start + bctx->nrows_per_thread * ith;
+    const uint32_t end_row   = MIN(start_row + bctx->nrows_per_thread, bctx->dev_row_start + bctx->total_rows);
     if (start_row >= end_row) return;
 
     FARF(HIGH, "binary-same-shape: %d/%d (%u:%u) row-size %u (%u)", ith, nth, start_row, end_row, nb01, bctx->dst_row_size_aligned);
@@ -377,9 +377,8 @@ static void binary_job_vector_row_broadcast(unsigned int nth, unsigned int ith, 
 
     const uint32_t src0_type  = octx->src[0]->type;
     const uint32_t row_size_bytes = (src0_type == HTP_TYPE_F32) ? ne00 * sizeof(float) : ne00 * sizeof(_Float16);
-    const uint32_t total_rows = ne01 * ne02 * ne03;
-    const uint32_t start_row  = bctx->nrows_per_thread * ith;
-    const uint32_t end_row    = MIN(start_row + bctx->nrows_per_thread, total_rows);
+    const uint32_t start_row  = bctx->dev_row_start + bctx->nrows_per_thread * ith;
+    const uint32_t end_row    = MIN(start_row + bctx->nrows_per_thread, bctx->dev_row_start + bctx->total_rows);
     if (start_row >= end_row) return;
 
     FARF(HIGH, "binary-row-bcast: %d/%d (%u:%u) row-size %u (%u)", ith, nth, start_row, end_row, nb01, bctx->dst_row_size_aligned);
@@ -458,9 +457,8 @@ static void binary_job_vector_complex(unsigned int nth, unsigned int ith, void *
 
     const uint32_t src0_type = octx->src[0]->type;
     const uint32_t row_size_bytes = (src0_type == HTP_TYPE_F32) ? ne00 * sizeof(float) : ne00 * sizeof(_Float16);
-    const uint32_t total_rows = ne01 * ne02 * ne03;
-    const uint32_t start_row  = bctx->nrows_per_thread * ith;
-    const uint32_t end_row    = MIN(start_row + bctx->nrows_per_thread, total_rows);
+    const uint32_t start_row  = bctx->dev_row_start + bctx->nrows_per_thread * ith;
+    const uint32_t end_row    = MIN(start_row + bctx->nrows_per_thread, bctx->dev_row_start + bctx->total_rows);
     if (start_row >= end_row) return;
 
     FARF(HIGH, "binary-complex: %d/%d (%u:%u) row-size %u (%u)", ith, nth, start_row, end_row, nb01, bctx->dst_row_size_aligned);
@@ -544,9 +542,8 @@ static void binary_job_element_repeat(unsigned int nth, unsigned int ith, void *
     const uint32_t src0_type = octx->src[0]->type;
     const uint32_t elem_size_bytes = (src0_type == HTP_TYPE_F32) ? sizeof(float) : sizeof(_Float16);
     const uint32_t row_size_bytes = ne00 * elem_size_bytes;;
-    const uint32_t total_rows = ne01 * ne02 * ne03;
-    const uint32_t start_row  = bctx->nrows_per_thread * ith;
-    const uint32_t end_row    = MIN(start_row + bctx->nrows_per_thread, total_rows);
+    const uint32_t start_row  = bctx->dev_row_start + bctx->nrows_per_thread * ith;
+    const uint32_t end_row    = MIN(start_row + bctx->nrows_per_thread, bctx->dev_row_start + bctx->total_rows);
     if (start_row >= end_row) return;
 
     uint8_t * src0_spad_base = octx->src0_spad.data + (ith * octx->src0_spad.size_per_thread);
@@ -650,9 +647,8 @@ static void binary_job_add_id(unsigned int nth, unsigned int ith, void * data) {
     const uint32_t nb2 = dst->nb[2];
     const uint32_t nb3 = dst->nb[3];
 
-    const uint32_t total_rows = ne01 * ne02 * ne03;
-    const uint32_t start_row = bctx->nrows_per_thread * ith;
-    const uint32_t end_row   = MIN(start_row + bctx->nrows_per_thread, total_rows);
+    const uint32_t start_row = bctx->dev_row_start + bctx->nrows_per_thread * ith;
+    const uint32_t end_row   = MIN(start_row + bctx->nrows_per_thread, bctx->dev_row_start + bctx->total_rows);
     if (start_row >= end_row) return;
 
     uint8_t * src0_spad_base = octx->src0_spad.data + (ith * octx->src0_spad.size_per_thread);
@@ -729,7 +725,22 @@ static int execute_op_binary(struct htp_ops_context * octx) {
     const struct htp_tensor * dst  = octx->dst;
 
     const uint32_t src0_nrows = src0->ne[1] * src0->ne[2] * src0->ne[3];
-    const uint32_t n_threads  = MIN(octx->n_threads, src0_nrows);
+
+    uint32_t dev_row_start, dev_nrows;
+    if (octx->ndev > 1) {
+        const uint32_t rows_per_dev = (src0_nrows + octx->ndev - 1) / octx->ndev;
+        dev_row_start = MIN(octx->idev * rows_per_dev, src0_nrows);
+        dev_nrows     = MIN(rows_per_dev, src0_nrows - dev_row_start);
+    } else {
+        dev_row_start = 0;
+        dev_nrows     = src0_nrows;
+    }
+
+    if (dev_nrows == 0) {
+        return HTP_STATUS_OK;
+    }
+
+    const uint32_t n_threads  = MIN(octx->n_threads, dev_nrows);
 
     // Use packed row sizes for VTCM allocation
     const uint32_t src0_type = octx->src[0]->type;
@@ -815,7 +826,9 @@ static int execute_op_binary(struct htp_ops_context * octx) {
 
     struct htp_binary_context bctx;
     bctx.octx                  = octx;
-    bctx.nrows_per_thread      = (src0_nrows + n_threads - 1) / n_threads;
+    bctx.nrows_per_thread      = (dev_nrows + n_threads - 1) / n_threads;
+    bctx.total_rows            = dev_nrows;
+    bctx.dev_row_start         = dev_row_start;
     bctx.block_max             = rows_per_buffer;
     bctx.src0_row_size_aligned = src0_row_size_aligned;
     bctx.src1_row_size_aligned = src1_row_size_aligned;

@@ -400,14 +400,18 @@ struct ggml_hexagon_session {
     uint64_t vtcm_size   = 0;
     size_t   max_vmem    = 0;
     size_t   max_bufsize = 0;
-    uint32_t fence_seq;
+    uint32_t fence_seq   = 0;
 
     uint64_t                cached_uid = 0;
     std::vector<htp_opnode> cached_nodes;
 
     mutable std::unordered_set<const ggml_tensor *> needs_repack;
 
-    ggml_hexagon_session(const ggml_hexagon_device_config & config, ggml_backend_dev_t dev = nullptr) noexcept(false);
+    uint32_t idev        = 0;
+    uint32_t ndev        = 1;
+    std::vector<std::unique_ptr<ggml_hexagon_session>> subsessions;
+
+    ggml_hexagon_session(const ggml_hexagon_device_config & config, ggml_backend_dev_t dev = nullptr, uint32_t idev = 0, uint32_t ndev = 1) noexcept(false);
     ~ggml_hexagon_session() noexcept(true);
 
     const char* c_name() const { return name.c_str(); }
@@ -434,12 +438,15 @@ struct ggml_hexagon_session {
     }
 
     void flush_sync_peers() {
-        if (sync_peers.empty()) return;
-
-        for (auto * peer : sync_peers) {
-            peer->flush_batch();
+        if (!sync_peers.empty()) {
+            for (auto * peer : sync_peers) {
+                peer->flush_batch();
+            }
+            sync_peers.clear();
         }
-        sync_peers.clear();
+        for (auto & sub : subsessions) {
+            if (sub) sub->flush_sync_peers();
+        }
     }
 };
 
@@ -450,9 +457,11 @@ struct ggml_backend_hexagon_device_context {
     ggml_hexagon_device_config config;
     ggml_backend_dev_t         dev = nullptr;
     size_t                     max_bufsize = 0;
+    bool                       enable_row_split = false;
 
-    ggml_backend_buffer_type buffer_type      = {};
-    ggml_backend_buffer_type host_buffer_type = {};
+    ggml_backend_buffer_type buffer_type       = {};
+    ggml_backend_buffer_type host_buffer_type  = {};
+    ggml_backend_buffer_type split_buffer_type = {};
 
     std::unique_ptr<ggml_hexagon_session> sess;
 
@@ -463,7 +472,8 @@ struct ggml_backend_hexagon_device_context {
 
     ggml_hexagon_session * session() {
         if (!sess) {
-            sess = std::make_unique<ggml_hexagon_session>(config, dev);
+            uint32_t ndev = (enable_row_split && opt_ndev > 1) ? (uint32_t) opt_ndev : 1;
+            sess = std::make_unique<ggml_hexagon_session>(config, dev, dev_id, ndev);
         }
         return sess.get();
     }
@@ -1610,7 +1620,7 @@ static ggml_backend_buffer_type_i ggml_backend_hexagon_host_buffer_type_interfac
 };
 
 ggml_backend_hexagon_device_context::ggml_backend_hexagon_device_context(int dev_id, const ggml_hexagon_device_config & config, ggml_backend_dev_t dev)
-    : dev_id(dev_id), config(config), dev(dev), max_bufsize(opt_mbuf) {
+    : dev_id(dev_id), config(config), dev(dev), max_bufsize(opt_mbuf), enable_row_split(false) {
     buffer_type.device  = dev;
     buffer_type.iface   = ggml_backend_hexagon_buffer_type_interface;
     buffer_type.context = new ggml_backend_hexagon_buffer_type_context(config.name, this);
@@ -1618,11 +1628,16 @@ ggml_backend_hexagon_device_context::ggml_backend_hexagon_device_context(int dev
     host_buffer_type.device  = dev;
     host_buffer_type.iface   = ggml_backend_hexagon_host_buffer_type_interface;
     host_buffer_type.context = new ggml_backend_hexagon_buffer_type_context(config.name + "-HOST", this);
+
+    split_buffer_type.device  = dev;
+    split_buffer_type.iface   = ggml_backend_hexagon_buffer_type_interface;
+    split_buffer_type.context = new ggml_backend_hexagon_buffer_type_context(config.name + "-SPLIT", this);
 }
 
 ggml_backend_hexagon_device_context::~ggml_backend_hexagon_device_context() {
     delete static_cast<ggml_backend_hexagon_buffer_type_context *>(buffer_type.context);
     delete static_cast<ggml_backend_hexagon_buffer_type_context *>(host_buffer_type.context);
+    delete static_cast<ggml_backend_hexagon_buffer_type_context *>(split_buffer_type.context);
 }
 
 static bool ggml_backend_buffer_is_hexagon(const struct ggml_backend_buffer * b) {
@@ -2721,6 +2736,12 @@ struct ggml_hexagon_opqueue {
 
 // Flush HTP response queue i.e wait for all outstanding requests to complete
 void ggml_hexagon_session::flush_pending(bool all) {
+    for (auto & sub : subsessions) {
+        if (sub) {
+            sub->flush_pending(all);
+        }
+    }
+
     while (this->op_pending) {
         struct htp_opbatch_rsp rsp;
         uint32_t               rsp_size;
@@ -2760,6 +2781,12 @@ void ggml_hexagon_session::flush_pending(bool all) {
 }
 
 void ggml_hexagon_session::flush_batch(size_t min_ops) {
+    for (auto & sub : subsessions) {
+        if (sub) {
+            sub->flush_batch(min_ops);
+        }
+    }
+
     if (op_batch->n_ops < min_ops) { return; }
 
     htp_opbatch_req req {};
@@ -2770,10 +2797,13 @@ void ggml_hexagon_session::flush_batch(size_t min_ops) {
         op_queue->push(req, dbuf, op_batch);
     }
 
+    req.idev = (uint16_t) this->idev;
+    req.ndev = (uint16_t) this->ndev;
+
     // Bump pending flag (cleared in the session::flush once we get the response)
     this->op_pending++;  // atomic inc
 
-    HEX_VERBOSE("ggml-hex: %s queue-opbatch: %p size %u\n", this->c_name(), dbuf.ptr, dbuf.size);
+    HEX_VERBOSE("ggml-hex: %s queue-opbatch: %p size %u idev %u ndev %u\n", this->c_name(), dbuf.ptr, dbuf.size, req.idev, req.ndev);
 
     int err = dspqueue_write(this->queue, 0, 1, &dbuf, sizeof(req), (const uint8_t*) &req, DSPQUEUE_TIMEOUT);
     if (err != 0) {
@@ -2800,6 +2830,12 @@ void ggml_hexagon_session::enqueue_op(const htp_opnode & node) {
             if (ggml_backend_hexagon_buffer_get_sess(t->buffer) != this) {
                 this->clone_buffer(static_cast<const ggml_hexagon_shared_buffer *>(t->buffer->context));
             }
+        }
+    }
+
+    for (auto & sub : subsessions) {
+        if (sub) {
+            sub->enqueue_op(node);
         }
     }
 
@@ -3283,6 +3319,8 @@ void ggml_hexagon_session::allocate(const ggml_hexagon_device_config & config) n
 void ggml_hexagon_session::release() noexcept(true) {
     GGML_LOG_INFO("ggml-hex: releasing session: %s\n", this->name.c_str());
 
+    subsessions.clear();
+
     int err;
 
     if (this->valid_iface) {
@@ -3325,13 +3363,40 @@ void ggml_hexagon_session::release() noexcept(true) {
     this->cloned_buffers.clear();
 }
 
-ggml_hexagon_session::ggml_hexagon_session(const ggml_hexagon_device_config & config, ggml_backend_dev_t dev) noexcept(false) {
+ggml_hexagon_session::ggml_hexagon_session(const ggml_hexagon_device_config & config, ggml_backend_dev_t dev, uint32_t idev, uint32_t ndev) noexcept(false) {
+    this->idev = idev;
+    this->ndev = ndev;
     op_batch = nullptr;
     op_queue = nullptr;
     fence_seq = ((uintptr_t)this) & 0xFFFF;
 
     try {
         allocate(config);
+        if (idev == 0 && ndev > 1) {
+            std::unordered_set<int> phys_set;
+            phys_set.insert(config.physical_idx);
+
+            std::vector<const ggml_hexagon_device_config *> sub_configs;
+            for (size_t i = 1; i < ndev; i++) {
+                if (i < opt_ndev) {
+                    const auto & cfg = opt_device_configs[i];
+                    if (phys_set.count(cfg.physical_idx) == 0) {
+                        phys_set.insert(cfg.physical_idx);
+                        sub_configs.push_back(&cfg);
+                    } else {
+                        GGML_LOG_WARN("ggml-hex: %s skipping device %s with duplicate physical index %d for row-split\n",
+                                      this->c_name(), cfg.name.c_str(), cfg.physical_idx);
+                    }
+                }
+            }
+
+            const uint32_t actual_ndev = (uint32_t) (1 + sub_configs.size());
+            this->ndev = actual_ndev;
+
+            for (size_t i = 0; i < sub_configs.size(); i++) {
+                subsessions.push_back(std::make_unique<ggml_hexagon_session>(*sub_configs[i], nullptr, (uint32_t) (i + 1), actual_ndev));
+            }
+        }
     } catch (const std::exception & exc) {
         release();
         throw;
@@ -6083,13 +6148,7 @@ static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, cons
 static bool ggml_backend_hexagon_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
     auto dev_ctx = static_cast<ggml_backend_hexagon_device_context *>(dev->context);
 
-    // Technically we can clone hexagon buffers from any session but for some reason the output is garbled with layer-split,
-    // tensor-split works correctly, so it needs mode debugging and investigation. For now accept only our own buffers.
-#if 0
-    bool supp = (buft->iface.get_alignment == ggml_backend_hexagon_buffer_type_get_alignment);
-#else
-    bool supp = (buft == &dev_ctx->host_buffer_type) || (buft == &dev_ctx->buffer_type);
-#endif
+    bool supp = (buft == &dev_ctx->host_buffer_type) || (buft == &dev_ctx->buffer_type) || (buft == &dev_ctx->split_buffer_type);
 
     HEX_VERBOSE("ggml-hex: %s device-supports-buft %s %s\n", dev_ctx->c_name(), ggml_backend_buft_name(buft), supp ? "yes" : "no");
     return supp;
@@ -6270,8 +6329,24 @@ static bool ggml_backend_hexagon_comm_allreduce_tensor(void * comm_ctx_v, struct
     return true;
 }
 
+static ggml_backend_buffer_type_t ggml_backend_hexagon_split_buffer_type(int main_device, const float * tensor_split) {
+    GGML_UNUSED(tensor_split);
+    auto reg = ggml_backend_hexagon_reg();
+    auto dev = ggml_backend_reg_dev_get(reg, main_device);
+    if (!dev) {
+        dev = ggml_backend_reg_dev_get(reg, 0);
+    }
+    if (!dev) return nullptr;
+    auto dev_ctx = static_cast<ggml_backend_hexagon_device_context *>(dev->context);
+    dev_ctx->enable_row_split = true;
+    return &dev_ctx->split_buffer_type;
+}
+
 static void * ggml_backend_hexagon_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_split_buffer_type") == 0) {
+        return (void *) ggml_backend_hexagon_split_buffer_type;
+    }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *) ggml_backend_hexagon_comm_init;
     }

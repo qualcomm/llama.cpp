@@ -58,6 +58,9 @@ struct set_rows_context {
     const struct htp_set_rows_kernel_params * kparams;
     struct htp_set_rows_vtcm_layout vtcm_layout;
     uint8_t * vtcm_base;
+    uint32_t dev_task_start;
+    uint32_t dev_tasks;
+    uint32_t tasks_per_thread;
 };
 
 #define SET_ROWS_THREAD_DMA_FN(TYPE_NAME, IDX_TYPE, COMPUTE_EXPR)                                                \
@@ -67,12 +70,12 @@ static void set_rows_thread_dma_##TYPE_NAME##_##IDX_TYPE(unsigned int nth, unsig
     const struct htp_set_rows_kernel_params * kparams = srctx->kparams;                                          \
     set_rows_preamble;                                                                                           \
     struct htp_thread_trace * tr = &octx->ctx->trace[ith];                                                       \
-    const uint32_t dr  = kparams->tasks_per_thread;                                                              \
-    const uint32_t ir0 = dr * ith;                                                                               \
-    if (ir0 >= kparams->total_tasks) {                                                                           \
+    const uint32_t dr  = srctx->tasks_per_thread;                                                                \
+    const uint32_t ir0 = srctx->dev_task_start + dr * ith;                                                       \
+    if (ir0 >= srctx->dev_task_start + srctx->dev_tasks) {                                                       \
         return;                                                                                                  \
     }                                                                                                            \
-    const uint32_t ir1 = MIN(ir0 + dr, kparams->total_tasks);                                                    \
+    const uint32_t ir1 = MIN(ir0 + dr, srctx->dev_task_start + srctx->dev_tasks);                                \
     dma_queue * dma_queue = octx->ctx->dma[ith];                                                                 \
     const struct htp_set_rows_vtcm_layout * vtcm_layout = &srctx->vtcm_layout;                                   \
     uint8_t * vtcm_src0 = srctx->vtcm_base + vtcm_layout->off_src0 + ith * vtcm_layout->src0_bytes_per_thread;   \
@@ -192,9 +195,28 @@ int op_set_rows(struct htp_ops_context * octx) {
         return HTP_STATUS_NO_SUPPORT;
     }
 
-    if (octx->src[1]->type != HTP_TYPE_I32 && octx->src[1]->type != HTP_TYPE_I64) {
-        return HTP_STATUS_NO_SUPPORT;
+    if (octx->flags & HTP_OPFLAGS_SKIP_COMPUTE) {
+        return HTP_STATUS_OK;
     }
+
+    const uint32_t total_tasks = kparams->total_tasks;
+    uint32_t dev_task_start, dev_tasks;
+    if (octx->ndev > 1) {
+        const uint32_t rows_per_line = MAX(1, (uint32_t) 128 / octx->dst->nb[1]);
+        uint32_t tasks_per_dev = (total_tasks + octx->ndev - 1) / octx->ndev;
+        tasks_per_dev = ((tasks_per_dev + rows_per_line - 1) / rows_per_line) * rows_per_line;
+        dev_task_start = MIN(octx->idev * tasks_per_dev, total_tasks);
+        dev_tasks      = MIN(tasks_per_dev, total_tasks - dev_task_start);
+    } else {
+        dev_task_start = 0;
+        dev_tasks      = total_tasks;
+    }
+
+    if (dev_tasks == 0) {
+        return HTP_STATUS_OK;
+    }
+
+    const uint32_t n_threads = MIN(kparams->n_threads, dev_tasks);
 
     // l2fetch the src1 (indices) tensor in the main thread
     hex_l2fetch_block((const void *)octx->src[1]->data, octx->src[1]->ne[3] * octx->src[1]->nb[3]);
@@ -202,8 +224,11 @@ int op_set_rows(struct htp_ops_context * octx) {
     struct set_rows_context srctx;
     srctx.octx = octx;
     srctx.kparams = kparams;
+    srctx.dev_task_start = dev_task_start;
+    srctx.dev_tasks = dev_tasks;
+    srctx.tasks_per_thread = (dev_tasks + n_threads - 1) / n_threads;
 
-    htp_set_rows_vtcm_layout_build(&srctx.vtcm_layout, octx->dst->type, ne00, kparams->n_threads);
+    htp_set_rows_vtcm_layout_build(&srctx.vtcm_layout, octx->dst->type, ne00, n_threads);
     srctx.vtcm_base = (uint8_t *)octx->ctx->vtcm_base;
 
     work_queue_func_t q_func = NULL;
@@ -216,15 +241,15 @@ int op_set_rows(struct htp_ops_context * octx) {
         default:            return HTP_STATUS_NO_SUPPORT;
     }
 
-    FARF(HIGH, "set-rows: (%ux%ux%ux%u) x (%ux%ux%ux%u) -> (%ux%ux%ux%u) : src0-vtcm-size %zu dst-vtcm-size %zu n_threads %d\n",
+    FARF(HIGH, "set-rows: (%ux%ux%ux%u) x (%ux%ux%ux%u) -> (%ux%ux%ux%u) : src0-vtcm-size %zu dst-vtcm-size %zu n-threads %d\n",
          octx->src[0]->ne[0], octx->src[0]->ne[1], octx->src[0]->ne[2], octx->src[0]->ne[3],
          octx->src[1]->ne[0], octx->src[1]->ne[1], octx->src[1]->ne[2], octx->src[1]->ne[3],
          octx->dst->ne[0], octx->dst->ne[1], octx->dst->ne[2], octx->dst->ne[3],
-         srctx.vtcm_layout.src0_bytes_per_thread * kparams->n_threads,
-         srctx.vtcm_layout.dst_bytes_per_thread  * kparams->n_threads,
-         kparams->n_threads);
+         srctx.vtcm_layout.src0_bytes_per_thread * n_threads,
+         srctx.vtcm_layout.dst_bytes_per_thread  * n_threads,
+         n_threads);
 
-    work_queue_run(octx->ctx->work_queue, q_func, &srctx, kparams->n_threads);
+    work_queue_run(octx->ctx->work_queue, q_func, &srctx, n_threads);
 
     return HTP_STATUS_OK;
 }

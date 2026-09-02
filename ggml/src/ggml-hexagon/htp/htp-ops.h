@@ -114,6 +114,7 @@ enum htp_op_code {
 #define HTP_OP_MAX_TENSORS 8192 // must stay under 64K (uint16)
 
 #define HTP_FENCE_TIMEOUT  (1000000000ULL)
+#define HTP_FENCE_SLOT_SIZE 128
 
 #define HTP_OP_MAX_VMEM_DEFAULT (3355443200u)
 
@@ -219,7 +220,8 @@ struct htp_opbatch_req {
     uint32_t n_tensors;   // Number of tensors
     uint32_t n_ops;       // Number of ops
     uint32_t n_traces;    // Number of trace descriptors per thread
-    uint32_t pad;         // unused
+    uint16_t idev;        // Device index (0..ndev-1)
+    uint16_t ndev;        // Number of devices
     uint64_t seq;         // Sequence number
     // struct htp_buf_desc  bufs[];    -- dspqueue buf 0
     // struct htp_tensor    tensors[]; -- dspqueue buf 0
