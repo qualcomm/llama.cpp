@@ -413,7 +413,7 @@ struct ggml_hexagon_session {
     uint32_t mdev_count  = 1;
     std::vector<std::unique_ptr<ggml_hexagon_session>> mdev_sessions;
 
-    ggml_hexagon_session(const ggml_hexagon_device_config & config, ggml_backend_dev_t dev = nullptr, uint32_t mdev_idx = 0, uint32_t mdev_count = 1) noexcept(false);
+    ggml_hexagon_session(const ggml_hexagon_device_config & config, ggml_backend_dev_t dev = nullptr, uint32_t mdev_idx = 0, uint32_t mdev_count = 0) noexcept(false);
     ~ggml_hexagon_session() noexcept(true);
 
     const char* c_name() const { return name.c_str(); }
@@ -472,8 +472,7 @@ struct ggml_backend_hexagon_device_context {
 
     ggml_hexagon_session * session() {
         if (!sess) {
-            uint32_t mdev_count = (uint32_t) (1 + config.mdev_group.size());
-            sess = std::make_unique<ggml_hexagon_session>(config, dev, dev_id, mdev_count);
+            sess = std::make_unique<ggml_hexagon_session>(config, dev);
         }
         return sess.get();
     }
@@ -3373,7 +3372,7 @@ void ggml_hexagon_session::release() noexcept(true) {
 
 ggml_hexagon_session::ggml_hexagon_session(const ggml_hexagon_device_config & config, ggml_backend_dev_t dev, uint32_t mdev_idx, uint32_t mdev_count) noexcept(false) {
     this->mdev_idx   = mdev_idx;
-    this->mdev_count = mdev_count;
+    this->mdev_count = mdev_count > 0 ? mdev_count : (uint32_t) (1 + config.mdev_group.size());
     op_batch = nullptr;
     op_queue = nullptr;
     fence_seq = ((uintptr_t)this) & 0xFFFF;
@@ -3383,7 +3382,7 @@ ggml_hexagon_session::ggml_hexagon_session(const ggml_hexagon_device_config & co
         if (mdev_idx == 0 && !config.mdev_group.empty()) {
             for (size_t i = 0; i < config.mdev_group.size(); i++) {
                 mdev_sessions.push_back(std::make_unique<ggml_hexagon_session>(
-                    config.mdev_group[i], nullptr, (uint32_t) (i + 1), mdev_count));
+                    config.mdev_group[i], nullptr, (uint32_t) (i + 1), this->mdev_count));
             }
         }
     } catch (const std::exception & exc) {
