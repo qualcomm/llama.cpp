@@ -36,10 +36,60 @@ inline float softplus_f32(float x) {
 }
 
 // d_state = 128 (most Mamba-2 models, e.g. mamba2-2.7B, Codestral-Mamba).
-// WG = 64 threads, each holds 2 state elements (tid and tid+64).
+// WG = 64 threads, each holds 2 state elements (tid and tid+64) per row.
+//
+// SSM_R = rows of `dim` handled per workgroup (compile-time; default 1 keeps
+// the original one-row kernel bit-identical). B and C are indexed by
+// (group, token) only -- NOT by dim -- so with one row per workgroup every
+// head_dim workgroups of a head, times n_head/n_group heads in that group,
+// re-read the identical B/C rows. On Nemotron-3.5 (n_head 64, head_dim 64,
+// n_group 8) that is 512 workgroups loading the same 1 KB per token: 2.15 GB
+// of B/C traffic per layer-call against 4.2 MB of distinct data, which is why
+// the kernel measured ~113 GFLOP/s while the model's GEMMs run ~3.8 TFLOP/s.
+// Handling SSM_R rows per workgroup cuts that traffic by SSM_R and costs
+// SSM_R state registers per thread plus SSM_R subgroup reductions per token.
+// dt/dA are per-head, so they stay hoisted out of the row loop.
+// Requires head_dim % SSM_R == 0 (enforced at dispatch).
+//
+// Two ways of going further were tried and are both WORSE -- do not redo them:
+//
+//  - SSM_R = 8. Halves the remaining B/C traffic again but 16 state floats per
+//    thread crosses the occupancy cliff: X2-90 pp512 548.9 vs 580.0 at SSM_R=4.
+//
+//  - CUDA's mechanism: stage B/C in LDS and put several 64-lane subgroups in one
+//    workgroup, so SSM_SG*SSM_R rows (16) share one B/C load instead of SSM_R
+//    (4), at no register cost. This is what ggml-cuda/ssm-scan.cu does with
+//    smemB/smemC over splitD rows. Correct (SSM_SCAN 6/6 on 840) but slower on
+//    both generations tested: X2-90 pp512 559 vs 581, pp2048 546 vs 570; Adreno
+//    840 on Mamba-Codestral-7B 77.0 vs 79.2. The barrier per token across 256
+//    threads costs more than the global traffic it saves, which says those
+//    "redundant" B/C reads were already being served from L2 rather than DRAM --
+//    the win here came from issuing fewer *loads*, not from moving less data.
+//    (CUDA's own shape -- one thread per row, d_state floats in registers -- is
+//    unavailable regardless: 512 B/work-item is exactly the Adreno cliff.)
+//
+//  - Uniform-scalar broadcast. dt_h, its softplus and exp(dt*A) are uniform
+//    across the subgroup -- all 64 lanes load the same address and evaluate the
+//    same transcendental every token -- so computing them on lane 0 and using
+//    sub_group_broadcast should have removed 64x redundant work. It is SLOWER:
+//    X2-90 pp512 565 vs 581, pp2048 553 vs 568. The driver already scalarises
+//    uniform loads and the exp, so the broadcast is pure added instruction cost.
+//    Do not hand-scalarise uniform work on this compiler.
+//
+// Constant memory is also not applicable here. __constant helps *broadcast*
+// reads of small static tables (see kvalues_iq4nl in the iq4_nl kernels); B and
+// C are per-lane strided (B[lane], B[lane+64]), megabytes in size, and produced
+// dynamically by earlier kernels.
+#ifndef SSM_R
+#define SSM_R 1
+#endif
+#ifndef SSM_KNAME
+#define SSM_KNAME kernel_ssm_scan_f32_mamba2_d128
+#endif
+
 #if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 1
 REQD_SUBGROUP_SIZE_64
-kernel void kernel_ssm_scan_f32_mamba2_d128(
+kernel void SSM_KNAME(
     global const char * src0_base, ulong src0_off,
     global const char * src1_base, ulong src1_off,
     global const char * src2_base, ulong src2_off,
@@ -55,7 +105,8 @@ kernel void kernel_ssm_scan_f32_mamba2_d128(
     ulong B_nb2,  ulong B_nb3,
     ulong C_nb2,  ulong C_nb3,
     ulong s_off_bytes,
-    int   head_dim, int n_head, int n_group, int n_tokens
+    int   head_dim, int n_head, int n_group, int n_tokens,
+    int   K,        int n_seqs
 ) {
     const int d_state = 128;
 
@@ -63,8 +114,11 @@ kernel void kernel_ssm_scan_f32_mamba2_d128(
     const int wg_x    = (int) get_group_id(0);
     const int seq_id  = (int) get_group_id(1);
 
-    const int head_id = wg_x / head_dim;
-    const int dim_id  = wg_x - head_id * head_dim;
+    // Each workgroup owns SSM_R consecutive dim rows of one head, so the B/C
+    // loads below are issued once and reused across all SSM_R rows.
+    const int rows_per_head = head_dim / SSM_R;
+    const int head_id = wg_x / rows_per_head;
+    const int dim_id  = (wg_x - head_id * rows_per_head) * SSM_R;
     const int g       = head_id / (n_head / n_group);
 
     src0_base += src0_off;
@@ -96,34 +150,68 @@ kernel void kernel_ssm_scan_f32_mamba2_d128(
 
     const float A_val = ((global const float *)src3_base)[(ulong)head_id * A_nb1 / sizeof(float)];
 
-    // c_factor = 2: each thread owns 2 state elements (tid and tid+64).
-    float state0 = s0_warp[tid];
-    float state1 = s0_warp[tid + 64];
+    // c_factor = 2: each thread owns 2 state elements (tid and tid+64) per row.
+    float state0[SSM_R];
+    float state1[SSM_R];
+    #pragma unroll
+    for (int r = 0; r < SSM_R; ++r) {
+        state0[r] = s0_warp[(ulong)r * d_state + tid];
+        state1[r] = s0_warp[(ulong)r * d_state + tid + 64];
+    }
 
     for (int t = 0; t < n_tokens; ++t) {
+        // per-head, shared by all SSM_R rows
         const float dt_h        = ((global const float *)(dt_seq + (ulong)t * dt_nb1))[head_id];
         const float dt_softplus = softplus_f32(dt_h);
         const float dA          = exp(dt_softplus * A_val);
-        const float x_val       = ((global const float *)(x_seq + (ulong)t * x_nb2))[(ulong)head_id * head_dim + dim_id];
-        const float x_dt        = x_val * dt_softplus;
 
+        // per-(group, token): loaded ONCE and reused across all SSM_R rows
         const float B0 = ((global const float *)(B_seq + (ulong)t * B_nb2))[tid];
         const float B1 = ((global const float *)(B_seq + (ulong)t * B_nb2))[tid + 64];
         const float C0 = ((global const float *)(C_seq + (ulong)t * C_nb2))[tid];
         const float C1 = ((global const float *)(C_seq + (ulong)t * C_nb2))[tid + 64];
 
-        state0 = state0 * dA + B0 * x_dt;
-        state1 = state1 * dA + B1 * x_dt;
-        const float partial = state0 * C0 + state1 * C1;
+        global const float * x_row = (global const float *)(x_seq + (ulong)t * x_nb2)
+                                     + (ulong)head_id * head_dim + dim_id;
 
-        const float sum = sub_group_reduce_add(partial);
-        if (tid == 0) {
-            y_seq[(ulong)t * y_dim_total + (ulong)head_id * head_dim + dim_id] = sum;
+        #pragma unroll
+        for (int r = 0; r < SSM_R; ++r) {
+            const float x_dt = x_row[r] * dt_softplus;
+
+            state0[r] = state0[r] * dA + B0 * x_dt;
+            state1[r] = state1[r] * dA + B1 * x_dt;
+            const float partial = state0[r] * C0 + state1[r] * C1;
+
+            const float sum = sub_group_reduce_add(partial);
+            if (tid == 0) {
+                y_seq[(ulong)t * y_dim_total + (ulong)head_id * head_dim + dim_id + r] = sum;
+            }
+        }
+
+        // Rollback snapshots. Slot 0 is the final state, written after the loop;
+        // slots 1..K-1 hold the state as it stood after each of the last K-1
+        // tokens, so a speculative verify can rewind when a drafted token is
+        // rejected. `slot` counts back from the last token, matching the CUDA
+        // reference. K == 1 (every non-speculative graph) leaves this dead.
+        const int slot = n_tokens - 1 - t;
+        if (slot > 0 && slot < K) {
+            global float * snap = (global float *)(dst_base + s_off_bytes
+                + ((ulong)slot * (ulong)n_seqs + (ulong)seq_id) * s0_nb3
+                + (ulong)head_id * s0_nb2
+                + (ulong)dim_id * d_state * sizeof(float));
+            #pragma unroll
+            for (int r = 0; r < SSM_R; ++r) {
+                snap[(ulong)r * d_state + tid]      = state0[r];
+                snap[(ulong)r * d_state + tid + 64] = state1[r];
+            }
         }
     }
 
-    s_warp[tid]      = state0;
-    s_warp[tid + 64] = state1;
+    #pragma unroll
+    for (int r = 0; r < SSM_R; ++r) {
+        s_warp[(ulong)r * d_state + tid]      = state0[r];
+        s_warp[(ulong)r * d_state + tid + 64] = state1[r];
+    }
 }
 #endif
 
@@ -146,7 +234,8 @@ kernel void kernel_ssm_scan_f32_mamba2_d256(
     ulong B_nb2,  ulong B_nb3,
     ulong C_nb2,  ulong C_nb3,
     ulong s_off_bytes,
-    int   head_dim, int n_head, int n_group, int n_tokens
+    int   head_dim, int n_head, int n_group, int n_tokens,
+    int   K,        int n_seqs
 ) {
     const int d_state = 256;
 
@@ -221,6 +310,19 @@ kernel void kernel_ssm_scan_f32_mamba2_d256(
         const float sum = sub_group_reduce_add(partial);
         if (tid == 0) {
             y_seq[(ulong)t * y_dim_total + (ulong)head_id * head_dim + dim_id] = sum;
+        }
+
+        // Rollback snapshots -- see the d128 kernel above.
+        const int slot = n_tokens - 1 - t;
+        if (slot > 0 && slot < K) {
+            global float * snap = (global float *)(dst_base + s_off_bytes
+                + ((ulong)slot * (ulong)n_seqs + (ulong)seq_id) * s0_nb3
+                + (ulong)head_id * s0_nb2
+                + (ulong)dim_id * d_state * sizeof(float));
+            snap[tid]       = state0;
+            snap[tid + 64]  = state1;
+            snap[tid + 128] = state2;
+            snap[tid + 192] = state3;
         }
     }
 
