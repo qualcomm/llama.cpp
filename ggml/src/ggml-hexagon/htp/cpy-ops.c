@@ -30,8 +30,8 @@ struct htp_copy_context {
     uint32_t          dst_blocks_per_row;
 
     uint32_t          src0_nrows_per_thread;
-    uint32_t          dev_row_start;
-    uint32_t          dev_nrows;
+    uint32_t          mdev_row_start;
+    uint32_t          mdev_nrows;
 };
 
 #define cpy_preamble                              \
@@ -66,9 +66,9 @@ static void cpy_thread_##NAME##_sameshape(unsigned int nth, unsigned int ith, vo
     struct htp_ops_context * octx = ct->octx;                                                                  \
     cpy_preamble;                                                                                              \
     const uint32_t dr  = ct->src0_nrows_per_thread;                                                            \
-    const uint32_t ir0 = ct->dev_row_start + dr * ith;                                                        \
-    const uint32_t ir1 = MIN(ir0 + dr, ct->dev_row_start + ct->dev_nrows);                                   \
-    if (ir0 >= ct->dev_row_start + ct->dev_nrows) return;                                                     \
+    const uint32_t ir0 = ct->mdev_row_start + dr * ith;                                                        \
+    const uint32_t ir1 = MIN(ir0 + dr, ct->mdev_row_start + ct->mdev_nrows);                                   \
+    if (ir0 >= ct->mdev_row_start + ct->mdev_nrows) return;                                                    \
     for (uint32_t i03 = 0; i03 < ne03; i03++) {                                                                \
         for (uint32_t i02 = 0; i02 < ne02; i02++) {                                                            \
             _Pragma("unroll(4)")                                                                               \
@@ -91,9 +91,9 @@ static void cpy_thread_##NAME##_reshape(unsigned int nth, unsigned int ith, void
     struct htp_ops_context * octx = ct->octx;                                                                  \
     cpy_preamble;                                                                                              \
     const uint32_t dr  = ct->src0_nrows_per_thread;                                                            \
-    const uint32_t ir0 = ct->dev_row_start + dr * ith;                                                        \
-    const uint32_t ir1 = MIN(ir0 + dr, ct->dev_row_start + ct->dev_nrows);                                   \
-    if (ir0 >= ct->dev_row_start + ct->dev_nrows) return;                                                                                     \
+    const uint32_t ir0 = ct->mdev_row_start + dr * ith;                                                        \
+    const uint32_t ir1 = MIN(ir0 + dr, ct->mdev_row_start + ct->mdev_nrows);                                   \
+    if (ir0 >= ct->mdev_row_start + ct->mdev_nrows) return;                                                    \
     const bool src0_contig = (nb00 == ELEM_SIZE)   &&                                                          \
                              (nb01 == ne00 * nb00) &&                                                          \
                              (nb02 == ne01 * nb01) &&                                                          \
@@ -193,9 +193,9 @@ static void cpy_thread_f16_f32_sameshape(unsigned int nth, unsigned int ith, voi
 
     // parallelize by src0 rows
     const uint32_t dr  = ct->src0_nrows_per_thread;
-    const uint32_t ir0 = ct->dev_row_start + dr * ith;
-    const uint32_t ir1 = MIN(ir0 + dr, ct->dev_row_start + ct->dev_nrows);
-    if (ir0 >= ct->dev_row_start + ct->dev_nrows) return;
+    const uint32_t ir0 = ct->mdev_row_start + dr * ith;
+    const uint32_t ir1 = MIN(ir0 + dr, ct->mdev_row_start + ct->mdev_nrows);
+    if (ir0 >= ct->mdev_row_start + ct->mdev_nrows) return;
 
     // copy by rows
     for (uint32_t i03 = 0; i03 < ne03; i03++) {
@@ -218,9 +218,9 @@ static void cpy_thread_f32_f16_sameshape(unsigned int nth, unsigned int ith, voi
 
     // parallelize by src0 rows
     const uint32_t dr  = ct->src0_nrows_per_thread;
-    const uint32_t ir0 = ct->dev_row_start + dr * ith;
-    const uint32_t ir1 = MIN(ir0 + dr, ct->dev_row_start + ct->dev_nrows);
-    if (ir0 >= ct->dev_row_start + ct->dev_nrows) return;
+    const uint32_t ir0 = ct->mdev_row_start + dr * ith;
+    const uint32_t ir1 = MIN(ir0 + dr, ct->mdev_row_start + ct->mdev_nrows);
+    if (ir0 >= ct->mdev_row_start + ct->mdev_nrows) return;
 
     // copy by rows
     for (uint32_t i03 = 0; i03 < ne03; i03++) {
@@ -274,21 +274,21 @@ static inline void cpy_dma_sametype_sameshape(
 int op_cpy(struct htp_ops_context * octx) {
     cpy_preamble;
 
-    uint32_t dev_row_start, dev_nrows;
-    if (octx->ndev > 1) {
-        const uint32_t rows_per_dev = (nr + octx->ndev - 1) / octx->ndev;
-        dev_row_start = MIN(octx->idev * rows_per_dev, nr);
-        dev_nrows     = MIN(rows_per_dev, nr - dev_row_start);
+    uint32_t mdev_row_start, mdev_nrows;
+    if (octx->mdev_count > 1) {
+        const uint32_t rows_per_mdev = (nr + octx->mdev_count - 1) / octx->mdev_count;
+        mdev_row_start = MIN(octx->mdev_idx * rows_per_mdev, nr);
+        mdev_nrows     = MIN(rows_per_mdev, nr - mdev_row_start);
     } else {
-        dev_row_start = 0;
-        dev_nrows     = nr;
+        mdev_row_start = 0;
+        mdev_nrows     = nr;
     }
 
-    if (dev_nrows == 0) {
+    if (mdev_nrows == 0) {
         return HTP_STATUS_OK;
     }
 
-    const uint32_t n_threads = MIN(dev_nrows, octx->n_threads);
+    const uint32_t n_threads = MIN(mdev_nrows, octx->n_threads);
 
     struct htp_copy_context ct;
     ct.octx = octx;
@@ -315,14 +315,14 @@ int op_cpy(struct htp_ops_context * octx) {
     const bool transposed = (nb00 > nb01) || (nb0 > nb1);
     const bool sameshape  = !transposed && (ne00 == ne0 && ne01 == ne1 && ne02 == ne2 && ne03 == ne3);
 
-    ct.src0_nrows_per_thread = (dev_nrows + n_threads - 1) / n_threads;
-    ct.dev_row_start = dev_row_start;
-    ct.dev_nrows     = dev_nrows;
+    ct.src0_nrows_per_thread = (mdev_nrows + n_threads - 1) / n_threads;
+    ct.mdev_row_start = mdev_row_start;
+    ct.mdev_nrows     = mdev_nrows;
 
     worker_callback_t copy_fun = NULL;
     bool use_dma = false;
 
-    if (sametype && sameshape && octx->ndev <= 1) {
+    if (sametype && sameshape && octx->mdev_count <= 1) {
         use_dma = true;
     } else if (sameshape) {
         if (sametype) {

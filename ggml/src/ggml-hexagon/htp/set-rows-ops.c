@@ -58,8 +58,8 @@ struct set_rows_context {
     const struct htp_set_rows_kernel_params * kparams;
     struct htp_set_rows_vtcm_layout vtcm_layout;
     uint8_t * vtcm_base;
-    uint32_t dev_task_start;
-    uint32_t dev_tasks;
+    uint32_t mdev_task_start;
+    uint32_t mdev_tasks;
     uint32_t tasks_per_thread;
 };
 
@@ -71,11 +71,11 @@ static void set_rows_thread_dma_##TYPE_NAME##_##IDX_TYPE(unsigned int nth, unsig
     set_rows_preamble;                                                                                           \
     struct htp_thread_trace * tr = &octx->ctx->trace[ith];                                                       \
     const uint32_t dr  = srctx->tasks_per_thread;                                                                \
-    const uint32_t ir0 = srctx->dev_task_start + dr * ith;                                                       \
-    if (ir0 >= srctx->dev_task_start + srctx->dev_tasks) {                                                       \
+    const uint32_t ir0 = srctx->mdev_task_start + dr * ith;                                                      \
+    if (ir0 >= srctx->mdev_task_start + srctx->mdev_tasks) {                                                     \
         return;                                                                                                  \
     }                                                                                                            \
-    const uint32_t ir1 = MIN(ir0 + dr, srctx->dev_task_start + srctx->dev_tasks);                                \
+    const uint32_t ir1 = MIN(ir0 + dr, srctx->mdev_task_start + srctx->mdev_tasks);                              \
     dma_queue * dma_queue = octx->ctx->dma[ith];                                                                 \
     const struct htp_set_rows_vtcm_layout * vtcm_layout = &srctx->vtcm_layout;                                   \
     uint8_t * vtcm_src0 = srctx->vtcm_base + vtcm_layout->off_src0 + ith * vtcm_layout->src0_bytes_per_thread;   \
@@ -200,23 +200,23 @@ int op_set_rows(struct htp_ops_context * octx) {
     }
 
     const uint32_t total_tasks = kparams->total_tasks;
-    uint32_t dev_task_start, dev_tasks;
-    if (octx->ndev > 1) {
+    uint32_t mdev_task_start, mdev_tasks;
+    if (octx->mdev_count > 1) {
         const uint32_t rows_per_line = MAX(1, (uint32_t) 128 / octx->dst->nb[1]);
-        uint32_t tasks_per_dev = (total_tasks + octx->ndev - 1) / octx->ndev;
-        tasks_per_dev = ((tasks_per_dev + rows_per_line - 1) / rows_per_line) * rows_per_line;
-        dev_task_start = MIN(octx->idev * tasks_per_dev, total_tasks);
-        dev_tasks      = MIN(tasks_per_dev, total_tasks - dev_task_start);
+        uint32_t tasks_per_mdev = (total_tasks + octx->mdev_count - 1) / octx->mdev_count;
+        tasks_per_mdev = ((tasks_per_mdev + rows_per_line - 1) / rows_per_line) * rows_per_line;
+        mdev_task_start = MIN(octx->mdev_idx * tasks_per_mdev, total_tasks);
+        mdev_tasks      = MIN(tasks_per_mdev, total_tasks - mdev_task_start);
     } else {
-        dev_task_start = 0;
-        dev_tasks      = total_tasks;
+        mdev_task_start = 0;
+        mdev_tasks      = total_tasks;
     }
 
-    if (dev_tasks == 0) {
+    if (mdev_tasks == 0) {
         return HTP_STATUS_OK;
     }
 
-    const uint32_t n_threads = MIN(kparams->n_threads, dev_tasks);
+    const uint32_t n_threads = MIN(kparams->n_threads, mdev_tasks);
 
     // l2fetch the src1 (indices) tensor in the main thread
     hex_l2fetch_block((const void *)octx->src[1]->data, octx->src[1]->ne[3] * octx->src[1]->nb[3]);
@@ -224,9 +224,9 @@ int op_set_rows(struct htp_ops_context * octx) {
     struct set_rows_context srctx;
     srctx.octx = octx;
     srctx.kparams = kparams;
-    srctx.dev_task_start = dev_task_start;
-    srctx.dev_tasks = dev_tasks;
-    srctx.tasks_per_thread = (dev_tasks + n_threads - 1) / n_threads;
+    srctx.mdev_task_start = mdev_task_start;
+    srctx.mdev_tasks = mdev_tasks;
+    srctx.tasks_per_thread = (mdev_tasks + n_threads - 1) / n_threads;
 
     htp_set_rows_vtcm_layout_build(&srctx.vtcm_layout, octx->dst->type, ne00, n_threads);
     srctx.vtcm_base = (uint8_t *)octx->ctx->vtcm_base;

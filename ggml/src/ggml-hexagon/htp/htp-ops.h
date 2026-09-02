@@ -220,8 +220,8 @@ struct htp_opbatch_req {
     uint32_t n_tensors;   // Number of tensors
     uint32_t n_ops;       // Number of ops
     uint32_t n_traces;    // Number of trace descriptors per thread
-    uint16_t idev;        // Device index (0..ndev-1)
-    uint16_t ndev;        // Number of devices
+    uint16_t mdev_idx;   // Device index (0..mdev_count-1)
+    uint16_t mdev_count; // Number of devices
     uint64_t seq;         // Sequence number
     // struct htp_buf_desc  bufs[];    -- dspqueue buf 0
     // struct htp_tensor    tensors[]; -- dspqueue buf 0

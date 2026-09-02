@@ -36,7 +36,7 @@ struct htp_fill_context {
     struct htp_ops_context * octx;
     uint32_t nrows_per_thread;
     uint32_t total_rows;  // ne1 * ne2 * ne3
-    uint32_t dev_row_start;
+    uint32_t mdev_row_start;
     bool     opt_path;
     HVX_Vector splat_vec;
     uint32_t   elem_size;
@@ -48,8 +48,8 @@ static void fill_thread(unsigned int nth, unsigned int ith, void * data) {
     fill_preamble;
 
     // Parallelise over the flat row index spanning ne1*ne2*ne3
-    const uint32_t ir0 = fctx->dev_row_start + fctx->nrows_per_thread * ith;
-    const uint32_t ir1 = MIN(ir0 + fctx->nrows_per_thread, fctx->dev_row_start + fctx->total_rows);
+    const uint32_t ir0 = fctx->mdev_row_start + fctx->nrows_per_thread * ith;
+    const uint32_t ir1 = MIN(ir0 + fctx->nrows_per_thread, fctx->mdev_row_start + fctx->total_rows);
 
     uint64_t t1 = HAP_perf_get_qtimer_count();
 
@@ -86,22 +86,22 @@ int op_fill(struct htp_ops_context * octx) {
         return HTP_STATUS_OK;
     }
 
-    uint32_t dev_row_start, dev_nrows;
-    if (octx->ndev > 1) {
-        const uint32_t rows_per_dev = (nr + octx->ndev - 1) / octx->ndev;
-        dev_row_start = MIN(octx->idev * rows_per_dev, nr);
-        dev_nrows     = MIN(rows_per_dev, nr - dev_row_start);
+    uint32_t mdev_row_start, mdev_nrows;
+    if (octx->mdev_count > 1) {
+        const uint32_t rows_per_mdev = (nr + octx->mdev_count - 1) / octx->mdev_count;
+        mdev_row_start = MIN(octx->mdev_idx * rows_per_mdev, nr);
+        mdev_nrows     = MIN(rows_per_mdev, nr - mdev_row_start);
     } else {
-        dev_row_start = 0;
-        dev_nrows     = nr;
+        mdev_row_start = 0;
+        mdev_nrows     = nr;
     }
 
-    if (dev_nrows == 0) {
+    if (mdev_nrows == 0) {
         return HTP_STATUS_OK;
     }
 
     // nr = ne1*ne2*ne3 (flat row count across all outer dims); parallelise over it.
-    const uint32_t n_threads = MIN(dev_nrows, octx->n_threads);
+    const uint32_t n_threads = MIN(mdev_nrows, octx->n_threads);
 
     // Optimize if fully contiguous: skip stride arithmetic, treat as flat array
     const bool opt_path = (nb2 == nb1 * ne1) && (nb3 == nb2 * ne2);
@@ -114,9 +114,9 @@ int op_fill(struct htp_ops_context * octx) {
 
     struct htp_fill_context fctx = {
         .octx             = octx,
-        .nrows_per_thread = (dev_nrows + n_threads - 1) / n_threads,
-        .total_rows       = dev_nrows,
-        .dev_row_start    = dev_row_start,
+        .nrows_per_thread = (mdev_nrows + n_threads - 1) / n_threads,
+        .total_rows       = mdev_nrows,
+        .mdev_row_start    = mdev_row_start,
         .opt_path         = opt_path,
     };
 

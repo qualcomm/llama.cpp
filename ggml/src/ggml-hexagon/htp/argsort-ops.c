@@ -23,8 +23,8 @@ struct htp_argsort_context {
     struct htp_ops_context * octx;
     uint32_t                 nrows_per_thread;
     uint32_t                 total_rows;
-    uint32_t                 dev_row_start;
-    uint32_t                 dev_row_end;
+    uint32_t                 mdev_row_start;
+    uint32_t                 mdev_row_end;
     uint8_t *                vtcm_base;
     size_t                   vtcm_per_thread;
 };
@@ -340,8 +340,8 @@ static void htp_argsort_f32_##ne00##_##order_name(unsigned int n, unsigned int i
     const struct htp_tensor * dst = octx->dst;                                                                 \
     uint8_t * spad = actx->vtcm_base + actx->vtcm_per_thread * i;                                              \
     uint32_t rows_per_thread = actx->nrows_per_thread;                                                         \
-    uint32_t start_row = actx->dev_row_start + rows_per_thread * i;                                            \
-    uint32_t end_row = MIN(start_row + rows_per_thread, actx->dev_row_end);                                     \
+    uint32_t start_row = actx->mdev_row_start + rows_per_thread * i;                                           \
+    uint32_t end_row = MIN(start_row + rows_per_thread, actx->mdev_row_end);                                   \
     size_t values_size = hex_round_up(ne00 * sizeof(float), 128);                                              \
     float * values_buf = (float *) spad;                                                                       \
     int32_t * indices_buf = (int32_t *) (spad + values_size);                                                  \
@@ -398,8 +398,8 @@ static void htp_argsort_f32_fallback(unsigned int n, unsigned int i, void * data
 
     // Rows to process
     uint32_t rows_per_thread = actx->nrows_per_thread;
-    uint32_t start_row = actx->dev_row_start + rows_per_thread * i;
-    uint32_t end_row = MIN(start_row + rows_per_thread, actx->dev_row_end);
+    uint32_t start_row = actx->mdev_row_start + rows_per_thread * i;
+    uint32_t end_row = MIN(start_row + rows_per_thread, actx->mdev_row_end);
 
     size_t values_size = hex_round_up(ne00 * sizeof(float), 128);
     uint32_t num_vec_ind_values = hmx_ceil_div(ne00, VLEN/(sizeof(int32_t)));
@@ -451,22 +451,22 @@ int op_argsort(struct htp_ops_context * octx) {
 
     const uint32_t total_rows = octx->src[0]->ne[1] * octx->src[0]->ne[2] * octx->src[0]->ne[3];
 
-    uint32_t dev_row_start, dev_row_end;
-    if (octx->ndev > 1) {
-        const uint32_t rows_per_dev = (total_rows + octx->ndev - 1) / octx->ndev;
-        dev_row_start = MIN(octx->idev * rows_per_dev, total_rows);
-        dev_row_end   = MIN(dev_row_start + rows_per_dev, total_rows);
+    uint32_t mdev_row_start, mdev_row_end;
+    if (octx->mdev_count > 1) {
+        const uint32_t rows_per_mdev = (total_rows + octx->mdev_count - 1) / octx->mdev_count;
+        mdev_row_start = MIN(octx->mdev_idx * rows_per_mdev, total_rows);
+        mdev_row_end   = MIN(mdev_row_start + rows_per_mdev, total_rows);
     } else {
-        dev_row_start = 0;
-        dev_row_end   = total_rows;
+        mdev_row_start = 0;
+        mdev_row_end   = total_rows;
     }
 
-    const uint32_t dev_nrows = dev_row_end - dev_row_start;
-    if (dev_nrows == 0) {
+    const uint32_t mdev_nrows = mdev_row_end - mdev_row_start;
+    if (mdev_nrows == 0) {
         return HTP_STATUS_OK;
     }
 
-    const uint32_t n_threads = MIN(dev_nrows, octx->n_threads);
+    const uint32_t n_threads = MIN(mdev_nrows, octx->n_threads);
 
     // Allocate scratchpad
     // We need 1 row of float + 1 row of int32 per thread.
@@ -492,10 +492,10 @@ int op_argsort(struct htp_ops_context * octx) {
 
     struct htp_argsort_context actx;
     actx.octx = octx;
-    actx.nrows_per_thread = (dev_nrows + n_threads - 1) / n_threads;
-    actx.total_rows       = dev_nrows;
-    actx.dev_row_start   = dev_row_start;
-    actx.dev_row_end     = dev_row_end;
+    actx.nrows_per_thread = (mdev_nrows + n_threads - 1) / n_threads;
+    actx.total_rows       = mdev_nrows;
+    actx.mdev_row_start   = mdev_row_start;
+    actx.mdev_row_end     = mdev_row_end;
     actx.vtcm_base = (uint8_t *) octx->ctx->vtcm_base;
     actx.vtcm_per_thread = spad_per_thread;
 

@@ -22,8 +22,8 @@ struct htp_gdn_context {
     size_t   state_bytes;
     uint8_t * vtcm_base;
     size_t   vtcm_per_thread;
-    uint32_t dev_row_start;
-    uint32_t dev_nrows;
+    uint32_t mdev_row_start;
+    uint32_t mdev_nrows;
 };
 
 static inline HVX_Vector gdn_mul_dot_f32(float * restrict dst, const float * restrict mul, const float * restrict dot, uint32_t n) {
@@ -588,9 +588,9 @@ static void gated_delta_net_f32_pp_thread(unsigned int nth, unsigned int ith, vo
     const uint32_t n_seqs   = v->ne[3];
     const uint32_t K        = octx->op_params[0];
 
-    const uint32_t row_end = gctx->dev_row_start + gctx->dev_nrows;
+    const uint32_t row_end = gctx->mdev_row_start + gctx->mdev_nrows;
 
-    if (ith >= gctx->dev_nrows) {
+    if (ith >= gctx->mdev_nrows) {
         return;
     }
 
@@ -624,7 +624,7 @@ static void gated_delta_net_f32_pp_thread(unsigned int nth, unsigned int ith, vo
     const uint64_t state_seq_stride = state->nb[3] / sizeof(float);
     const uint64_t state_size_per_snap = (uint64_t) S_v * S_v * H * n_seqs;
 
-    uint32_t ir_prefetch = gctx->dev_row_start + ith;
+    uint32_t ir_prefetch = gctx->mdev_row_start + ith;
     int spad_idx = 0;
 
     // Prefetch preamble (up to 2 steps)
@@ -650,7 +650,7 @@ static void gated_delta_net_f32_pp_thread(unsigned int nth, unsigned int ith, vo
     }
 
     int curr_spad_idx = 0;
-    for (uint32_t ir = gctx->dev_row_start + ith; ir < row_end; ir += nth) {
+    for (uint32_t ir = gctx->mdev_row_start + ith; ir < row_end; ir += nth) {
         dma_queue_pop(dma);
         dma_queue_pop(dma);
 
@@ -850,9 +850,9 @@ static void gated_delta_net_f32_tg_thread(unsigned int nth, unsigned int ith, vo
     const uint32_t H        = v->ne[1];
     const uint32_t n_seqs   = v->ne[3];
 
-    const uint32_t row_end = gctx->dev_row_start + gctx->dev_nrows;
+    const uint32_t row_end = gctx->mdev_row_start + gctx->mdev_nrows;
 
-    if (ith >= gctx->dev_nrows) {
+    if (ith >= gctx->mdev_nrows) {
         return;
     }
 
@@ -885,7 +885,7 @@ static void gated_delta_net_f32_tg_thread(unsigned int nth, unsigned int ith, vo
 
     const uint64_t state_seq_stride = state->nb[3] / sizeof(float);
 
-    uint32_t ir_prefetch = gctx->dev_row_start + ith;
+    uint32_t ir_prefetch = gctx->mdev_row_start + ith;
     int spad_idx = 0;
 
     // Prefetch preamble (up to 2 steps)
@@ -911,7 +911,7 @@ static void gated_delta_net_f32_tg_thread(unsigned int nth, unsigned int ith, vo
     }
 
     int curr_spad_idx = 0;
-    for (uint32_t ir = gctx->dev_row_start + ith; ir < row_end; ir += nth) {
+    for (uint32_t ir = gctx->mdev_row_start + ith; ir < row_end; ir += nth) {
         dma_queue_pop(dma);
         dma_queue_pop(dma);
 
@@ -1130,27 +1130,27 @@ int op_gated_delta_net(struct htp_ops_context * octx) {
 
     const uint32_t total_rows = H * n_seqs;
 
-    uint32_t dev_row_start, dev_nrows;
-    if (octx->ndev > 1) {
-        const uint32_t rows_per_dev = (total_rows + octx->ndev - 1) / octx->ndev;
-        dev_row_start = MIN(octx->idev * rows_per_dev, total_rows);
-        dev_nrows     = MIN(rows_per_dev, total_rows - dev_row_start);
+    uint32_t mdev_row_start, mdev_nrows;
+    if (octx->mdev_count > 1) {
+        const uint32_t rows_per_mdev = (total_rows + octx->mdev_count - 1) / octx->mdev_count;
+        mdev_row_start = MIN(octx->mdev_idx * rows_per_mdev, total_rows);
+        mdev_nrows     = MIN(rows_per_mdev, total_rows - mdev_row_start);
     } else {
-        dev_row_start = 0;
-        dev_nrows     = total_rows;
+        mdev_row_start = 0;
+        mdev_nrows     = total_rows;
     }
 
-    if (dev_nrows == 0) {
+    if (mdev_nrows == 0) {
         return HTP_STATUS_OK;
     }
 
-    const uint32_t n_threads = MIN(octx->n_threads, dev_nrows);
+    const uint32_t n_threads = MIN(octx->n_threads, mdev_nrows);
 
     struct htp_gdn_context gctx;
     gctx.octx = octx;
-    gctx.dev_row_start   = dev_row_start;
-    gctx.dev_nrows       = dev_nrows;
-    gctx.rows_per_thread = (dev_nrows + n_threads - 1) / n_threads;
+    gctx.mdev_row_start   = mdev_row_start;
+    gctx.mdev_nrows       = mdev_nrows;
+    gctx.rows_per_thread = (mdev_nrows + n_threads - 1) / n_threads;
     gctx.state_bytes = (size_t) S_v * S_v * sizeof(float);
 
     size_t state_aligned = (size_t) S_v * S_v * sizeof(float);

@@ -407,11 +407,11 @@ struct ggml_hexagon_session {
 
     mutable std::unordered_set<const ggml_tensor *> needs_repack;
 
-    uint32_t idev        = 0;
-    uint32_t ndev        = 1;
-    std::vector<std::unique_ptr<ggml_hexagon_session>> subsessions;
+    uint32_t mdev_idx    = 0;
+    uint32_t mdev_count  = 1;
+    std::vector<std::unique_ptr<ggml_hexagon_session>> mdev_sessions;
 
-    ggml_hexagon_session(const ggml_hexagon_device_config & config, ggml_backend_dev_t dev = nullptr, uint32_t idev = 0, uint32_t ndev = 1) noexcept(false);
+    ggml_hexagon_session(const ggml_hexagon_device_config & config, ggml_backend_dev_t dev = nullptr, uint32_t mdev_idx = 0, uint32_t mdev_count = 1) noexcept(false);
     ~ggml_hexagon_session() noexcept(true);
 
     const char* c_name() const { return name.c_str(); }
@@ -444,7 +444,7 @@ struct ggml_hexagon_session {
             }
             sync_peers.clear();
         }
-        for (auto & sub : subsessions) {
+        for (auto & sub : mdev_sessions) {
             sub->flush_sync_peers();
         }
     }
@@ -472,8 +472,8 @@ struct ggml_backend_hexagon_device_context {
 
     ggml_hexagon_session * session() {
         if (!sess) {
-            uint32_t ndev = (enable_row_split && opt_ndev > 1) ? (uint32_t) opt_ndev : 1;
-            sess = std::make_unique<ggml_hexagon_session>(config, dev, dev_id, ndev);
+            uint32_t mdev_count = (enable_row_split && opt_ndev > 1) ? (uint32_t) opt_ndev : 1;
+            sess = std::make_unique<ggml_hexagon_session>(config, dev, dev_id, mdev_count);
         }
         return sess.get();
     }
@@ -2732,7 +2732,7 @@ struct ggml_hexagon_opqueue {
 
 // Flush HTP response queue i.e wait for all outstanding requests to complete
 void ggml_hexagon_session::flush_pending(bool all) {
-    for (auto & sub : subsessions) {
+    for (auto & sub : mdev_sessions) {
         sub->flush_pending(all);
     }
 
@@ -2779,7 +2779,7 @@ void ggml_hexagon_session::flush_batch(size_t min_ops) {
 
     op_batch->sort_buffers();
 
-    for (auto & sub : subsessions) {
+    for (auto & sub : mdev_sessions) {
         htp_opbatch_req sub_req {};
         dspqueue_buffer sub_dbuf{};
 
@@ -2788,13 +2788,13 @@ void ggml_hexagon_session::flush_batch(size_t min_ops) {
             sub->op_queue->push(sub_req, sub_dbuf, op_batch);
         }
 
-        sub_req.idev = (uint16_t) sub->idev;
-        sub_req.ndev = (uint16_t) sub->ndev;
+        sub_req.mdev_idx   = (uint16_t) sub->mdev_idx;
+        sub_req.mdev_count = (uint16_t) sub->mdev_count;
 
         sub->op_pending++;
 
-        HEX_VERBOSE("ggml-hex: %s queue-opbatch: %p size %u idev %u ndev %u\n",
-                    sub->c_name(), sub_dbuf.ptr, sub_dbuf.size, sub_req.idev, sub_req.ndev);
+        HEX_VERBOSE("ggml-hex: %s queue-opbatch: %p size %u mdev-idx %u mdev-count %u\n",
+                    sub->c_name(), sub_dbuf.ptr, sub_dbuf.size, sub_req.mdev_idx, sub_req.mdev_count);
 
         int err = dspqueue_write(sub->queue, 0, 1, &sub_dbuf, sizeof(sub_req), (const uint8_t*) &sub_req, DSPQUEUE_TIMEOUT);
         if (err != 0) {
@@ -2810,13 +2810,13 @@ void ggml_hexagon_session::flush_batch(size_t min_ops) {
         op_queue->push(req, dbuf, op_batch);
     }
 
-    req.idev = (uint16_t) this->idev;
-    req.ndev = (uint16_t) this->ndev;
+    req.mdev_idx   = (uint16_t) this->mdev_idx;
+    req.mdev_count = (uint16_t) this->mdev_count;
 
     // Bump pending flag (cleared in the session::flush once we get the response)
     this->op_pending++;  // atomic inc
 
-    HEX_VERBOSE("ggml-hex: %s queue-opbatch: %p size %u idev %u ndev %u\n", this->c_name(), dbuf.ptr, dbuf.size, req.idev, req.ndev);
+    HEX_VERBOSE("ggml-hex: %s queue-opbatch: %p size %u mdev-idx %u mdev-count %u\n", this->c_name(), dbuf.ptr, dbuf.size, req.mdev_idx, req.mdev_count);
 
     int err = dspqueue_write(this->queue, 0, 1, &dbuf, sizeof(req), (const uint8_t*) &req, DSPQUEUE_TIMEOUT);
     if (err != 0) {
@@ -2839,7 +2839,7 @@ void ggml_hexagon_session::enqueue_op(const htp_opnode & node) {
             if (ggml_backend_hexagon_buffer_get_sess(t->buffer) != this) {
                 this->clone_buffer(sbuf);
             }
-            for (auto & sub : subsessions) {
+            for (auto & sub : mdev_sessions) {
                 sub->clone_buffer(sbuf);
             }
         }
@@ -3332,7 +3332,7 @@ void ggml_hexagon_session::allocate(const ggml_hexagon_device_config & config) n
 void ggml_hexagon_session::release() noexcept(true) {
     GGML_LOG_INFO("ggml-hex: releasing session: %s\n", this->name.c_str());
 
-    subsessions.clear();
+    mdev_sessions.clear();
 
     int err;
 
@@ -3376,21 +3376,21 @@ void ggml_hexagon_session::release() noexcept(true) {
     this->cloned_buffers.clear();
 }
 
-ggml_hexagon_session::ggml_hexagon_session(const ggml_hexagon_device_config & config, ggml_backend_dev_t dev, uint32_t idev, uint32_t ndev) noexcept(false) {
-    this->idev = idev;
-    this->ndev = ndev;
+ggml_hexagon_session::ggml_hexagon_session(const ggml_hexagon_device_config & config, ggml_backend_dev_t dev, uint32_t mdev_idx, uint32_t mdev_count) noexcept(false) {
+    this->mdev_idx   = mdev_idx;
+    this->mdev_count = mdev_count;
     op_batch = nullptr;
     op_queue = nullptr;
     fence_seq = ((uintptr_t)this) & 0xFFFF;
 
     try {
         allocate(config);
-        if (idev == 0 && ndev > 1) {
+        if (mdev_idx == 0 && mdev_count > 1) {
             std::unordered_set<int> phys_set;
             phys_set.insert(config.physical_idx);
 
             std::vector<const ggml_hexagon_device_config *> sub_configs;
-            for (size_t i = 1; i < ndev; i++) {
+            for (size_t i = 1; i < mdev_count; i++) {
                 if (i < opt_ndev) {
                     const auto & cfg = opt_device_configs[i];
                     if (phys_set.count(cfg.physical_idx) == 0) {
@@ -3403,11 +3403,11 @@ ggml_hexagon_session::ggml_hexagon_session(const ggml_hexagon_device_config & co
                 }
             }
 
-            const uint32_t actual_ndev = (uint32_t) (1 + sub_configs.size());
-            this->ndev = actual_ndev;
+            const uint32_t actual_mdev_count = (uint32_t) (1 + sub_configs.size());
+            this->mdev_count = actual_mdev_count;
 
             for (size_t i = 0; i < sub_configs.size(); i++) {
-                subsessions.push_back(std::make_unique<ggml_hexagon_session>(*sub_configs[i], nullptr, (uint32_t) (i + 1), actual_ndev));
+                mdev_sessions.push_back(std::make_unique<ggml_hexagon_session>(*sub_configs[i], nullptr, (uint32_t) (i + 1), actual_mdev_count));
             }
         }
     } catch (const std::exception & exc) {

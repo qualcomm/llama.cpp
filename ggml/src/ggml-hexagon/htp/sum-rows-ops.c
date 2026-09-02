@@ -104,8 +104,8 @@ int op_sum_rows(struct htp_ops_context * octx) {
 
     const uint32_t src0_nrows = ne01 * ne02 * ne03;
 
-    uint32_t dev_row_start, dev_nrows;
-    if (octx->ndev > 1) {
+    uint32_t mdev_row_start, mdev_nrows;
+    if (octx->mdev_count > 1) {
         /*
             This op may write to a very small number of rows. If multiple devices split
             up the rows, they may race to write to the same cache line, leading to
@@ -113,21 +113,21 @@ int op_sum_rows(struct htp_ops_context * octx) {
             multi-device uses.
         */
         const uint32_t rows_per_line = MAX(1, (uint32_t) HEX_L2_LINE_SIZE / nb1);
-        uint32_t rows_per_dev = (src0_nrows + octx->ndev - 1) / octx->ndev;
-        rows_per_dev = ((rows_per_dev + rows_per_line - 1) / rows_per_line) * rows_per_line;
-        dev_row_start = MIN(octx->idev * rows_per_dev, src0_nrows);
-        dev_nrows     = MIN(rows_per_dev, src0_nrows - dev_row_start);
+        uint32_t rows_per_mdev = (src0_nrows + octx->mdev_count - 1) / octx->mdev_count;
+        rows_per_mdev = ((rows_per_mdev + rows_per_line - 1) / rows_per_line) * rows_per_line;
+        mdev_row_start = MIN(octx->mdev_idx * rows_per_mdev, src0_nrows);
+        mdev_nrows     = MIN(rows_per_mdev, src0_nrows - mdev_row_start);
     } else {
-        dev_row_start = 0;
-        dev_nrows     = src0_nrows;
+        mdev_row_start = 0;
+        mdev_nrows     = src0_nrows;
     }
 
-    if (dev_nrows == 0) {
+    if (mdev_nrows == 0) {
         return HTP_STATUS_OK;
     }
 
-    const uint32_t n_threads = MIN(octx->n_threads, dev_nrows);
-    const uint32_t rows_per_thread = (dev_nrows + n_threads - 1) / n_threads;
+    const uint32_t n_threads = MIN(octx->n_threads, mdev_nrows);
+    const uint32_t rows_per_thread = (mdev_nrows + n_threads - 1) / n_threads;
 
     bool opt_path = false;
     if ((0 == hex_is_aligned((void *) src0->data, VLEN)) && !(nb01 & (VLEN - 1))) {
@@ -135,13 +135,13 @@ int op_sum_rows(struct htp_ops_context * octx) {
     }
 
     struct sum_rows_context smctx = {
-        .src_data        = (const uint8_t *) src0->data + dev_row_start * nb01,
-        .dst_data        = (uint8_t *) dst->data + dev_row_start * nb1,
+        .src_data        = (const uint8_t *) src0->data + mdev_row_start * nb01,
+        .dst_data        = (uint8_t *) dst->data + mdev_row_start * nb1,
         .ne00            = ne00,
         .src_stride      = nb01,
         .dst_stride      = nb1,
         .rows_per_thread = rows_per_thread,
-        .total_rows      = dev_nrows,
+        .total_rows      = mdev_nrows,
         .opt_path        = opt_path,
     };
 

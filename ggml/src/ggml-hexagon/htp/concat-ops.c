@@ -13,10 +13,10 @@ struct htp_concat_context {
     struct htp_ops_context * octx;
     uint32_t dim;
     uint32_t nrows_per_thread;
-    uint32_t dev_row_start;
-    uint32_t dev_nrows;
-    uint32_t dev_elem_start;
-    uint32_t dev_nelems;
+    uint32_t mdev_row_start;
+    uint32_t mdev_nrows;
+    uint32_t mdev_elem_start;
+    uint32_t mdev_nelems;
     struct fastdiv_values div_ne0;
     struct fastdiv_values div_ne1;
     struct fastdiv_values div_ne2;
@@ -33,9 +33,9 @@ static void concat_2d_f32_transposed(unsigned int nth, unsigned int ith, void * 
     const uint32_t src0_ne0 = src0->ne[0];
     const uint32_t src1_ne0 = src1->ne[0];
 
-    const uint32_t dev_row_end = cctx->dev_row_start + cctx->dev_nrows;
-    const uint32_t start_i = cctx->dev_row_start + ith * cctx->nrows_per_thread;
-    const uint32_t end_i   = (start_i + cctx->nrows_per_thread < dev_row_end) ? (start_i + cctx->nrows_per_thread) : dev_row_end;
+    const uint32_t mdev_row_end = cctx->mdev_row_start + cctx->mdev_nrows;
+    const uint32_t start_i = cctx->mdev_row_start + ith * cctx->nrows_per_thread;
+    const uint32_t end_i   = (start_i + cctx->nrows_per_thread < mdev_row_end) ? (start_i + cctx->nrows_per_thread) : mdev_row_end;
     if (start_i >= end_i) return;
 
     dma_queue * q = octx->ctx->dma[ith];
@@ -100,9 +100,9 @@ static void concat_2d_f16_transposed(unsigned int nth, unsigned int ith, void * 
     const uint32_t src0_ne0 = src0->ne[0];
     const uint32_t src1_ne0 = src1->ne[0];
 
-    const uint32_t dev_row_end = cctx->dev_row_start + cctx->dev_nrows;
-    const uint32_t start_i = cctx->dev_row_start + ith * cctx->nrows_per_thread;
-    const uint32_t end_i   = (start_i + cctx->nrows_per_thread < dev_row_end) ? (start_i + cctx->nrows_per_thread) : dev_row_end;
+    const uint32_t mdev_row_end = cctx->mdev_row_start + cctx->mdev_nrows;
+    const uint32_t start_i = cctx->mdev_row_start + ith * cctx->nrows_per_thread;
+    const uint32_t end_i   = (start_i + cctx->nrows_per_thread < mdev_row_end) ? (start_i + cctx->nrows_per_thread) : mdev_row_end;
     if (start_i >= end_i) return;
 
     dma_queue * q = octx->ctx->dma[ith];
@@ -170,12 +170,12 @@ static void concat_generic(unsigned int nth, unsigned int ith, void * data) {
     const uint32_t ne[4] = {dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3]};
 
     // Per-device element range aligned to prevent false sharing
-    const uint32_t dev_elem_start = cctx->dev_elem_start;
-    const uint32_t dev_nelems     = cctx->dev_nelems;
-    const uint32_t chunk_size = (dev_nelems + nth - 1) / nth;
+    const uint32_t mdev_elem_start = cctx->mdev_elem_start;
+    const uint32_t mdev_nelems     = cctx->mdev_nelems;
+    const uint32_t chunk_size = (mdev_nelems + nth - 1) / nth;
 
-    const uint32_t start_idx = MIN(dev_elem_start + ith * chunk_size, dev_elem_start + dev_nelems);
-    const uint32_t end_idx   = MIN(start_idx + chunk_size, dev_elem_start + dev_nelems);
+    const uint32_t start_idx = MIN(mdev_elem_start + ith * chunk_size, mdev_elem_start + mdev_nelems);
+    const uint32_t end_idx   = MIN(start_idx + chunk_size, mdev_elem_start + mdev_nelems);
 
     // Naive scalar element-wise copy
     for (uint32_t idx = start_idx; idx < end_idx; idx++) {
@@ -244,30 +244,30 @@ int op_concat(struct htp_ops_context * octx) {
 
     if (dim == 0 && is_2d && is_src1_transposed && !is_src0_transposed) {
         const uint32_t total_rows = dst->ne[1];
-        uint32_t dev_row_start, dev_nrows;
-        if (octx->ndev > 1) {
-            const uint32_t rows_per_dev = (total_rows + octx->ndev - 1) / octx->ndev;
-            dev_row_start = MIN(octx->idev * rows_per_dev, total_rows);
-            dev_nrows     = MIN(rows_per_dev, total_rows - dev_row_start);
+        uint32_t mdev_row_start, mdev_nrows;
+        if (octx->mdev_count > 1) {
+            const uint32_t rows_per_mdev = (total_rows + octx->mdev_count - 1) / octx->mdev_count;
+            mdev_row_start = MIN(octx->mdev_idx * rows_per_mdev, total_rows);
+            mdev_nrows     = MIN(rows_per_mdev, total_rows - mdev_row_start);
         } else {
-            dev_row_start = 0;
-            dev_nrows     = total_rows;
+            mdev_row_start = 0;
+            mdev_nrows     = total_rows;
         }
 
-        if (dev_nrows == 0) {
+        if (mdev_nrows == 0) {
             return HTP_STATUS_OK;
         }
 
-        cctx.dev_row_start = dev_row_start;
-        cctx.dev_nrows     = dev_nrows;
+        cctx.mdev_row_start = mdev_row_start;
+        cctx.mdev_nrows     = mdev_nrows;
 
-        n_threads = MIN(dev_nrows, n_threads);
+        n_threads = MIN(mdev_nrows, n_threads);
         if (n_threads < 1) {
             n_threads = 1;
         }
         uint32_t block_i = (type_size == 4) ? 32 : 64;
 
-        cctx.nrows_per_thread = hmx_ceil_div(dev_nrows, n_threads);
+        cctx.nrows_per_thread = hmx_ceil_div(mdev_nrows, n_threads);
 
         // Allocate VTCM
         uint32_t spad1_stride = block_i * type_size;
@@ -297,24 +297,24 @@ int op_concat(struct htp_ops_context * octx) {
         }
     } else {
         const uint32_t total_elements = dst->ne[0] * dst->ne[1] * dst->ne[2] * dst->ne[3];
-        uint32_t dev_elem_start, dev_nelems;
-        if (octx->ndev > 1) {
+        uint32_t mdev_elem_start, mdev_nelems;
+        if (octx->mdev_count > 1) {
             const uint32_t elems_per_line = MAX(1u, (uint32_t) HEX_L2_LINE_SIZE / type_size);
-            uint32_t elems_per_dev = (total_elements + octx->ndev - 1) / octx->ndev;
-            elems_per_dev = ((elems_per_dev + elems_per_line - 1) / elems_per_line) * elems_per_line;
-            dev_elem_start = MIN(octx->idev * elems_per_dev, total_elements);
-            dev_nelems     = MIN(elems_per_dev, total_elements - dev_elem_start);
+            uint32_t elems_per_mdev = (total_elements + octx->mdev_count - 1) / octx->mdev_count;
+            elems_per_mdev = ((elems_per_mdev + elems_per_line - 1) / elems_per_line) * elems_per_line;
+            mdev_elem_start = MIN(octx->mdev_idx * elems_per_mdev, total_elements);
+            mdev_nelems     = MIN(elems_per_mdev, total_elements - mdev_elem_start);
         } else {
-            dev_elem_start = 0;
-            dev_nelems     = total_elements;
+            mdev_elem_start = 0;
+            mdev_nelems     = total_elements;
         }
 
-        if (dev_nelems == 0) {
+        if (mdev_nelems == 0) {
             return HTP_STATUS_OK;
         }
 
-        cctx.dev_elem_start = dev_elem_start;
-        cctx.dev_nelems     = dev_nelems;
+        cctx.mdev_elem_start = mdev_elem_start;
+        cctx.mdev_nelems     = mdev_nelems;
     }
 
     worker_pool_run_func(octx->ctx->worker_pool, worker_func, &cctx, n_threads);

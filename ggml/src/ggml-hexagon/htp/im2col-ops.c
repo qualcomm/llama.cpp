@@ -152,12 +152,12 @@ IM2COL_PATCHEMBED_BODY(im2col_patchembed_f32_thread, float, hvx_copy_f32_uu, hvx
         uint8_t *      dst_base         = ictx->pe_vtcm_dst + ith * ictx->pe_dst_size_per_thread;                    \
         float *        srcb             = (float *) src_base;                                                        \
         DST_CTYPE *    dstb             = (DST_CTYPE *) dst_base;                                                    \
-        const uint32_t dev_row_end      = ictx->pe_row_base + ictx->dev_nrows_dma;                                    \
-        const uint32_t per_thread       = ictx->pe_rows_per_thread;                                                   \
-        const uint32_t row_start        = ictx->pe_row_base + per_thread * ith;                                       \
-        const uint32_t row_end          = MIN(row_start + per_thread, dev_row_end);                                  \
-        if (row_start >= row_end)                                                                                     \
-            return;                                                                                                   \
+        const uint32_t mdev_row_end      = ictx->pe_row_base + ictx->dev_nrows_dma;                                  \
+        const uint32_t per_thread       = ictx->pe_rows_per_thread;                                                  \
+        const uint32_t row_start        = ictx->pe_row_base + per_thread * ith;                                      \
+        const uint32_t row_end          = MIN(row_start + per_thread, mdev_row_end);                                 \
+        if (row_start >= row_end)                                                                                    \
+            return;                                                                                                  \
         for (uint32_t r = row_start; r < row_end; r++) {                                                             \
             const uint32_t in  = r / OH;                                                                             \
             const uint32_t ioh = r % OH;                                                                             \
@@ -275,30 +275,30 @@ int op_im2col(struct htp_ops_context * octx) {
     const uint32_t nrows    = N * OH;
 
     uint32_t patch_base, dev_npatches;
-    if (octx->ndev > 1) {
+    if (octx->mdev_count > 1) {
         const uint32_t patches_per_line = MAX(1, (uint32_t) HEX_L2_LINE_SIZE / dst->nb[1]);
-        uint32_t patches_per_dev = (npatches + octx->ndev - 1) / octx->ndev;
-        patches_per_dev = ((patches_per_dev + patches_per_line - 1) / patches_per_line) * patches_per_line;
-        patch_base    = MIN(octx->idev * patches_per_dev, npatches);
-        dev_npatches  = MIN(patches_per_dev, npatches - patch_base);
+        uint32_t patches_per_mdev = (npatches + octx->mdev_count - 1) / octx->mdev_count;
+        patches_per_mdev = ((patches_per_mdev + patches_per_line - 1) / patches_per_line) * patches_per_line;
+        patch_base    = MIN(octx->mdev_idx * patches_per_mdev, npatches);
+        dev_npatches  = MIN(patches_per_mdev, npatches - patch_base);
     } else {
         patch_base    = 0;
         dev_npatches  = npatches;
     }
 
-    uint32_t row_base, dev_nrows;
-    if (octx->ndev > 1) {
+    uint32_t row_base, mdev_nrows;
+    if (octx->mdev_count > 1) {
         const uint32_t rows_per_line = MAX(1, (uint32_t) HEX_L2_LINE_SIZE / dst->nb[2]);
-        uint32_t rows_per_dev = (nrows + octx->ndev - 1) / octx->ndev;
-        rows_per_dev = ((rows_per_dev + rows_per_line - 1) / rows_per_line) * rows_per_line;
-        row_base   = MIN(octx->idev * rows_per_dev, nrows);
-        dev_nrows  = MIN(rows_per_dev, nrows - row_base);
+        uint32_t rows_per_mdev = (nrows + octx->mdev_count - 1) / octx->mdev_count;
+        rows_per_mdev = ((rows_per_mdev + rows_per_line - 1) / rows_per_line) * rows_per_line;
+        row_base   = MIN(octx->mdev_idx * rows_per_mdev, nrows);
+        mdev_nrows  = MIN(rows_per_mdev, nrows - row_base);
     } else {
         row_base   = 0;
-        dev_nrows  = nrows;
+        mdev_nrows  = nrows;
     }
 
-    if (dev_npatches == 0 && dev_nrows == 0) {
+    if (dev_npatches == 0 && mdev_nrows == 0) {
         return HTP_STATUS_OK;
     }
 
@@ -312,12 +312,12 @@ int op_im2col(struct htp_ops_context * octx) {
 
     // Clean non-overlapping patch-embed -> DMA kernel (if it fits VTCM);
     // everything else (padding/dilation/stride edges) -> pure-DDR kernel.
-    if (im2col_use_patchembed_dma(octx) && dev_nrows > 0) {
-        const uint32_t pth = MIN(octx->n_threads, dev_nrows);
+    if (im2col_use_patchembed_dma(octx) && mdev_nrows > 0) {
+        const uint32_t pth = MIN(octx->n_threads, mdev_nrows);
         if (pth > 0 && im2col_patchembed_dma_fits(octx, &ictx, pth)) {
             ictx.pe_row_base        = row_base;
-            ictx.dev_nrows_dma      = dev_nrows;
-            ictx.pe_rows_per_thread = (dev_nrows + pth - 1) / pth;
+            ictx.dev_nrows_dma      = mdev_nrows;
+            ictx.pe_rows_per_thread = (mdev_nrows + pth - 1) / pth;
             if (dst->type == HTP_TYPE_F16) {
                 work_queue_run(octx->ctx->work_queue, im2col_patchembed_dma_thread, &ictx, pth);
             } else {

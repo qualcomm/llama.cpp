@@ -63,8 +63,8 @@ struct htp_ssm_conv_context {
     uint32_t nrows_per_thread;
     uint32_t d_inner_tile;
     uint64_t t_start;
-    uint32_t dev_row_start;
-    uint32_t dev_nrows;
+    uint32_t mdev_row_start;
+    uint32_t mdev_nrows;
 };
 
 #define htp_ssm_conv_preamble                                                   \
@@ -97,8 +97,8 @@ static void ssm_conv_thread_f32_f32(unsigned int nth, unsigned int ith, void *da
 
     // Calculate row range for this thread
     const uint32_t d_inner_per_thread = scctx->nrows_per_thread;
-    const uint32_t d_inner_start = scctx->dev_row_start + d_inner_per_thread * ith;
-    const uint32_t d_inner_end   = MIN(d_inner_start + d_inner_per_thread, scctx->dev_row_start + scctx->dev_nrows);
+    const uint32_t d_inner_start = scctx->mdev_row_start + d_inner_per_thread * ith;
+    const uint32_t d_inner_end   = MIN(d_inner_start + d_inner_per_thread, scctx->mdev_row_start + scctx->mdev_nrows);
 
     // No work for this thread
     if (d_inner_start >= d_inner_end) {
@@ -275,8 +275,8 @@ static void ssm_conv_thread_f32_f32_hvx(unsigned int nth, unsigned int ith, void
     const uint32_t dst_stride_seq    = dst->nb[2]  / sizeof(float);
 
     const uint32_t dr  = scctx->nrows_per_thread;
-    const uint32_t ir0 = scctx->dev_row_start + dr * ith;
-    const uint32_t ir1 = MIN(ir0 + dr, scctx->dev_row_start + scctx->dev_nrows);
+    const uint32_t ir0 = scctx->mdev_row_start + dr * ith;
+    const uint32_t ir1 = MIN(ir0 + dr, scctx->mdev_row_start + scctx->mdev_nrows);
 
     if (ir0 >= ir1) {
         return;
@@ -361,33 +361,33 @@ int op_ssm_conv_f32(struct htp_ops_context * octx) {
         return HTP_STATUS_OK;
     }
 
-    uint32_t dev_row_start, dev_nrows;
-    if (octx->ndev > 1) {
-        const uint32_t rows_per_dev = (d_inner + octx->ndev - 1) / octx->ndev;
-        dev_row_start = MIN(octx->idev * rows_per_dev, d_inner);
-        dev_nrows     = MIN(rows_per_dev, d_inner - dev_row_start);
+    uint32_t mdev_row_start, mdev_nrows;
+    if (octx->mdev_count > 1) {
+        const uint32_t rows_per_mdev = (d_inner + octx->mdev_count - 1) / octx->mdev_count;
+        mdev_row_start = MIN(octx->mdev_idx * rows_per_mdev, d_inner);
+        mdev_nrows     = MIN(rows_per_mdev, d_inner - mdev_row_start);
     } else {
-        dev_row_start = 0;
-        dev_nrows     = d_inner;
+        mdev_row_start = 0;
+        mdev_nrows     = d_inner;
     }
 
-    if (dev_nrows == 0) {
+    if (mdev_nrows == 0) {
         return HTP_STATUS_OK;
     }
 
-    const uint32_t n_threads = MIN(octx->n_threads, dev_nrows);
+    const uint32_t n_threads = MIN(octx->n_threads, mdev_nrows);
 
     struct htp_ssm_conv_context scctx = { 0 };
     scctx.octx          = octx;
-    scctx.dev_row_start = dev_row_start;
-    scctx.dev_nrows     = dev_nrows;
+    scctx.mdev_row_start = mdev_row_start;
+    scctx.mdev_nrows     = mdev_nrows;
 
     uint32_t use_hvx = 0;
-    if (dev_nrows >= VLEN_FP32 && n_t >= VLEN_FP32) {
+    if (mdev_nrows >= VLEN_FP32 && n_t >= VLEN_FP32) {
         use_hvx = 1;
     }
 
-    scctx.nrows_per_thread = hex_round_up((dev_nrows + n_threads - 1) / n_threads, VLEN_FP32);
+    scctx.nrows_per_thread = hex_round_up((mdev_nrows + n_threads - 1) / n_threads, VLEN_FP32);
 
     const uint32_t d_inner_per_thread = scctx.nrows_per_thread;
     const uint32_t ncs                = src0->ne[0];

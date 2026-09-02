@@ -69,8 +69,8 @@ struct htp_softmax_context {
     struct fastdiv_values fastdiv_ne13; // For mask broadcasting
 
     uint32_t src0_nrows_per_thread;
-    uint32_t dev_row_start;
-    uint32_t dev_nrows;
+    uint32_t mdev_row_start;
+    uint32_t mdev_nrows;
 };
 
 static void apply_mask(float * restrict wp0,
@@ -225,11 +225,11 @@ static void softmax_job_f32(unsigned int nth, unsigned int ith, void * data) {
 
     htp_softmax_preamble3;
 
-    const uint32_t src0_nrows            = smctx->dev_nrows;
+    const uint32_t src0_nrows            = smctx->mdev_nrows;
     const uint32_t src0_nrows_per_thread = smctx->src0_nrows_per_thread;
 
-    const uint32_t src0_start_row = smctx->dev_row_start + src0_nrows_per_thread * ith;
-    const uint32_t src0_end_row   = MIN(src0_start_row + src0_nrows_per_thread, smctx->dev_row_start + src0_nrows);
+    const uint32_t src0_start_row = smctx->mdev_row_start + src0_nrows_per_thread * ith;
+    const uint32_t src0_end_row   = MIN(src0_start_row + src0_nrows_per_thread, smctx->mdev_row_start + src0_nrows);
 
     // no work for this thread
     if (src0_start_row >= src0_end_row) {
@@ -345,25 +345,25 @@ static int execute_op_softmax_f32(struct htp_ops_context * octx) {
 
     const uint32_t src0_nrows = src0->ne[1] * src0->ne[2] * src0->ne[3];
 
-    uint32_t dev_row_start, dev_nrows;
-    if (octx->ndev > 1) {
-        const uint32_t rows_per_dev = (src0_nrows + octx->ndev - 1) / octx->ndev;
-        dev_row_start = MIN(octx->idev * rows_per_dev, src0_nrows);
-        dev_nrows     = MIN(rows_per_dev, src0_nrows - dev_row_start);
+    uint32_t mdev_row_start, mdev_nrows;
+    if (octx->mdev_count > 1) {
+        const uint32_t rows_per_mdev = (src0_nrows + octx->mdev_count - 1) / octx->mdev_count;
+        mdev_row_start = MIN(octx->mdev_idx * rows_per_mdev, src0_nrows);
+        mdev_nrows     = MIN(rows_per_mdev, src0_nrows - mdev_row_start);
     } else {
-        dev_row_start = 0;
-        dev_nrows     = src0_nrows;
+        mdev_row_start = 0;
+        mdev_nrows     = src0_nrows;
     }
 
-    if (dev_nrows == 0) {
+    if (mdev_nrows == 0) {
         return HTP_STATUS_OK;
     }
 
-    const uint32_t n_threads  = MIN(octx->n_threads, dev_nrows);
+    const uint32_t n_threads  = MIN(octx->n_threads, mdev_nrows);
 
-    smctx.src0_nrows_per_thread = (dev_nrows + n_threads - 1) / n_threads;
-    smctx.dev_row_start         = dev_row_start;
-    smctx.dev_nrows             = dev_nrows;
+    smctx.src0_nrows_per_thread = (mdev_nrows + n_threads - 1) / n_threads;
+    smctx.mdev_row_start         = mdev_row_start;
+    smctx.mdev_nrows             = mdev_nrows;
 
     const size_t src0_row_size = src0->nb[1];
     const size_t src1_row_size = src0_row_size;

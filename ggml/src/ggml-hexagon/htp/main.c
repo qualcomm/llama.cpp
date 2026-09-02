@@ -1098,8 +1098,8 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
     memset(octx, 0, sizeof(*octx));
     octx->n_threads = ctx->n_threads;
     octx->ctx       = ctx;
-    octx->idev      = req->idev;
-    octx->ndev      = req->ndev;
+    octx->mdev_idx   = req->mdev_idx;
+    octx->mdev_count = req->mdev_count;
 
     work_queue_wakeup(ctx->work_queue);
     if (ctx->hmx_queue) {
@@ -1127,20 +1127,20 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
         }
 
         // Multi-device FENCE synchronization between ops
-        if (octx->ndev > 1 && n_bufs > 0 && bufs[0].base != 0) {
-            const uint32_t gen     = (uint32_t)(req->seq * n_ops + i + 1);
-            const uint32_t my_idev = octx->idev;
-            const uint32_t ndev    = octx->ndev;
+        if (octx->mdev_count > 1 && n_bufs > 0 && bufs[0].base != 0) {
+            const uint32_t gen         = (uint32_t)(req->seq * n_ops + i + 1);
+            const uint32_t my_mdev_idx = octx->mdev_idx;
+            const uint32_t mdev_count  = octx->mdev_count;
 
-            uint8_t * fence_base = (uint8_t *) bufs[0].base + bufs[0].size - (ndev * HTP_FENCE_SLOT_SIZE);
-            atomic_uint * my_fence = (atomic_uint *) (fence_base + my_idev * HTP_FENCE_SLOT_SIZE);
+            uint8_t * fence_base = (uint8_t *) bufs[0].base + bufs[0].size - (mdev_count * HTP_FENCE_SLOT_SIZE);
+            atomic_uint * my_fence = (atomic_uint *) (fence_base + my_mdev_idx * HTP_FENCE_SLOT_SIZE);
 
             atomic_store(my_fence, gen);
             asm volatile ("syncht" : : : "memory");
             Q6_dccleaninva_A((void *) my_fence);
 
-            for (uint32_t d = 0; d < ndev; d++) {
-                if (d == my_idev) continue;
+            for (uint32_t d = 0; d < mdev_count; d++) {
+                if (d == my_mdev_idx) continue;
                 atomic_uint * peer_fence = (atomic_uint *) (fence_base + d * HTP_FENCE_SLOT_SIZE);
                 uint64_t spins = 0;
                 while (1) {
@@ -1150,8 +1150,8 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
                         break;
                     }
                     if (++spins > HTP_FENCE_TIMEOUT) {
-                        FARF(ERROR, "ggml-hex: dev %u timeout waiting for dev %u at op %u (seq %llu gen %u)\n",
-                             my_idev, d, i, (unsigned long long)req->seq, gen);
+                        FARF(ERROR, "ggml-hex: mdev %u timeout waiting for mdev %u at op %u (seq %llu gen %u)\n",
+                             my_mdev_idx, d, i, (unsigned long long)req->seq, gen);
                         break;
                     }
                     hex_pause();
