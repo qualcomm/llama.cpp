@@ -327,6 +327,8 @@ static bool ggml_hexagon_precompute_allreduce_params(
 );
 
 static bool mm_is_hmx_eligible(const ggml_tensor * t);
+static bool is_supported_mul_mat_nx_kernel(const ggml_tensor * src0, const struct htp_mm_kernel_params * kparams);
+static bool is_supported_mul_mat_id_nx_kernel(const ggml_tensor * src0, const struct htp_mm_kernel_params * kparams);
 static bool is_mergeable_mul_mat(const ggml_tensor * t);
 static bool is_mergeable_mul_mat_pair(const ggml_tensor * n1, const ggml_tensor * n2);
 static bool is_mergeable_mul_mat_id(const ggml_tensor * t);
@@ -2211,6 +2213,9 @@ struct ggml_hexagon_opbatch {
 
             struct htp_mm_kernel_params kparams;
             ggml_hexagon_precompute_fused_mmnx_params(sess, w0, x, curr_n + 1, &kparams);
+            if (!is_supported_mul_mat_nx_kernel(w0, &kparams)) {
+                return false;
+            }
             if ((size_t) kparams.vtcm_size > sess->vtcm_size) {
                 HEX_VERBOSE("ggml-hex: %s skip NX fusion: VTCM needed (%d) > budget (%zu)\n",
                             sess->c_name(), kparams.vtcm_size, sess->vtcm_size);
@@ -2274,6 +2279,9 @@ struct ggml_hexagon_opbatch {
 
             struct htp_mm_kernel_params kparams;
             ggml_hexagon_precompute_fused_mmnx_params(sess, w0, x, 2, &kparams);
+            if (!is_supported_mul_mat_nx_kernel(w0, &kparams)) {
+                return false;
+            }
             if ((size_t) kparams.vtcm_size > sess->vtcm_size) {
                 HEX_VERBOSE("ggml-hex: %s skip NX fusion: VTCM needed (%d) > budget (%zu)\n",
                             sess->c_name(), kparams.vtcm_size, sess->vtcm_size);
@@ -2368,6 +2376,9 @@ struct ggml_hexagon_opbatch {
 
             struct htp_mm_kernel_params kparams;
             ggml_hexagon_precompute_fused_mmidnx_params(sess, w0, x, d_in, curr_n + 1, &kparams);
+            if (!is_supported_mul_mat_id_nx_kernel(w0, &kparams)) {
+                return false;
+            }
             if ((size_t) kparams.vtcm_size > sess->vtcm_size) {
                 HEX_VERBOSE("ggml-hex: %s skip ID NX fusion: VTCM needed (%d) > budget (%zu)\n",
                             sess->c_name(), kparams.vtcm_size, sess->vtcm_size);
@@ -2433,6 +2444,9 @@ struct ggml_hexagon_opbatch {
 
             struct htp_mm_kernel_params kparams;
             ggml_hexagon_precompute_fused_mmidnx_params(sess, w0, x, node.dst(), 2, &kparams);
+            if (!is_supported_mul_mat_id_nx_kernel(w0, &kparams)) {
+                return false;
+            }
             if ((size_t) kparams.vtcm_size > sess->vtcm_size) {
                 HEX_VERBOSE("ggml-hex: %s skip ID NX fusion: VTCM needed (%d) > budget (%zu)\n",
                             sess->c_name(), kparams.vtcm_size, sess->vtcm_size);
@@ -3596,6 +3610,10 @@ static bool ggml_hexagon_matmul_is_hmx_eligible(
     bool is_matmul_id,
     bool is_batched
 ) {
+    if (src1->type != GGML_TYPE_F32) {
+        return false;
+    }
+
     const int ne00  = src0->ne[0];
     const int ne11  = src1->ne[1];
     const int ne12  = src1->ne[2];
@@ -4154,13 +4172,19 @@ static void ggml_hexagon_precompute_fused_mmnx_params(
     const int ne11_padded = hex_round_up(ne11, 32);
 
     const size_t vtcm_budget = sess->vtcm_size;
+    const bool is_batched = (ne02 * ne03 > 1 || ne12 * ne13 > 1);
 
     bool hmx_enabled = (sess->n_hmx > 0) && (opt_mm_select >= 3);
-    if (hmx_enabled && ggml_hexagon_matmul_is_hmx_eligible(src0, src1, nullptr, ne01_padded, false, false)) {
-        if (ggml_hexagon_precompute_hmx_mm_params(sess, src0, src1, nullptr, wtype, ne00_padded, ne01_padded, ne02, ne11, ne12, ne11_padded, false, false, vtcm_budget, kparams)) {
+    if (hmx_enabled && ggml_hexagon_matmul_is_hmx_eligible(src0, src1, nullptr, ne01_padded, false, is_batched)) {
+        if (ggml_hexagon_precompute_hmx_mm_params(sess, src0, src1, nullptr, wtype, ne00_padded, ne01_padded, ne02, ne11, ne12, ne11_padded, false, is_batched, vtcm_budget, kparams)) {
             kparams->n_weights = n_weights;
             goto finalize;
         }
+    }
+
+    if (!is_repack) {
+        kparams->kernel_type = HTP_MM_KERNEL_UNSUPPORTED;
+        return;
     }
 
     {
@@ -4998,10 +5022,43 @@ static bool mm_is_hmx_eligible(const ggml_tensor * t) {
     return ggml_hexagon_matmul_is_hmx_eligible(src0, src1, t, ne01_padded, is_matmul_id, is_batched);
 }
 
+static bool is_supported_mul_mat_nx_kernel(const ggml_tensor * src0, const struct htp_mm_kernel_params * kparams) {
+    if (kparams->n_hmx) {
+        return kparams->kernel_type == HTP_MM_KERNEL_HMX_2D;
+    }
+
+    if (!ggml_hexagon_is_repack_type(src0->type)) {
+        return false;
+    }
+
+    return kparams->kernel_type == HTP_MM_KERNEL_HVX_QUANT_ROW || kparams->kernel_type == HTP_MM_KERNEL_HVX_QUANT_ROW_FLAT;
+}
+
+static bool is_supported_mul_mat_id_nx_kernel(const ggml_tensor * src0, const struct htp_mm_kernel_params * kparams) {
+    if (kparams->n_hmx) {
+        return kparams->kernel_type == HTP_MM_KERNEL_HMX_2D;
+    }
+
+    if (!ggml_hexagon_is_repack_type(src0->type)) {
+        return false;
+    }
+
+    return kparams->kernel_type == HTP_MM_KERNEL_HVX_QUANT_ROW || kparams->kernel_type == HTP_MM_KERNEL_HVX_QUANT_BLOCK;
+}
+
 static bool is_mergeable_mul_mat(const ggml_tensor * t) {
-    if (!t || t->op != GGML_OP_MUL_MAT)   return false;
-    if (t->src[1]->type != GGML_TYPE_F32 && t->src[1]->type != GGML_TYPE_F16) return false;
-    return ggml_is_quantized(t->src[0]->type) || t->src[0]->type == GGML_TYPE_F16;
+    if (!t || t->op != GGML_OP_MUL_MAT) return false;
+
+    const ggml_tensor * src0 = t->src[0];
+    const ggml_tensor * src1 = t->src[1];
+    if (src1->type != GGML_TYPE_F32) return false;
+    if (src0->ne[2] != 1 || src0->ne[3] != 1) return false;
+
+    if (mm_is_hmx_eligible(t)) {
+        return ggml_hexagon_is_hmx_weight_type(src0->type);
+    }
+
+    return ggml_hexagon_is_repack_type(src0->type);
 }
 
 static bool is_mergeable_mul_mat_pair(const ggml_tensor * n1, const ggml_tensor * n2) {
@@ -5025,8 +5082,9 @@ static bool is_mergeable_mul_mat_pair(const ggml_tensor * n1, const ggml_tensor 
 
 static bool is_mergeable_mul_mat_id(const ggml_tensor * t) {
     if (!t || t->op != GGML_OP_MUL_MAT_ID) return false;
-    if (t->src[1]->type != GGML_TYPE_F32 && t->src[1]->type != GGML_TYPE_F16) return false;
-    return ggml_is_quantized(t->src[0]->type) || t->src[0]->type == GGML_TYPE_F16;
+
+    const ggml_tensor * src0 = t->src[0];
+    return ggml_hexagon_is_repack_type(src0->type);
 }
 
 static bool is_mergeable_mul_mat_id_pair(const ggml_tensor * n1, const ggml_tensor * n2) {
