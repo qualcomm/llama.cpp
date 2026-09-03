@@ -38667,18 +38667,46 @@ static void ggml_cl_cpy_slots(ggml_backend_t backend, const ggml_cgraph * cgraph
     CL_CHECK(clSetKernelArg(kernel, 20, sizeof(cl_long),  &step0));
     CL_CHECK(clSetKernelArg(kernel, 21, sizeof(cl_long),  &step1));
 
+    // One row per work item for short rows. The row-per-thread-group rule below maps ne00
+    // work items to a row, so with the delta-net conv window (ne00 = 3) the row indexing
+    // runs three times per row and the workgroup is 63 wide -- not a whole wave. A work
+    // item per row touches the same cache lines with a third of the index arithmetic and
+    // a 64-wide workgroup. GGML_OPENCL_CPY_SLOTS_FAST=0 restores the original geometry
+    // and addressing, for A/B.
+    static const bool cpy_slots_fast = []{
+        const char * e = getenv("GGML_OPENCL_CPY_SLOTS_FAST");
+        return !(e && atoi(e) == 0);
+    }();
+
     // same row mapping as the single-slot pack kernel, slots on the second dimension
     const int maxwg = (int) backend_ctx->get_kernel_workgroup_size(kernel);
     const int base  = MIN(64, maxwg);
-    const int tpr   = MIN(ne00, base);
+    const int tpr   = (cpy_slots_fast && ne00 <= 4) ? 1 : MIN(ne00, base);
     const int rpw   = MAX(1, base / tpr);
     const int lsz   = tpr * rpw;
     const int nrows = ne01*ne02*ne03;
     const int nwg   = (nrows + rpw - 1) / rpw;
 
+    // The destination of these snapshots is a flat tensor: nrows*ne00 fits in its first
+    // dimension with a one-float stride, so the row unflatten in the kernel collapses to
+    // i0 = row*ne00. Say so and the kernel skips two emulated 64-bit divides per row.
+    const cl_int dst_flat = (cpy_slots_fast && nb10 == sizeof(float) &&
+                             (cl_long) nrows * ne00 <= (cl_long) ne10) ? 1 : 0;
+
+    CL_CHECK(clSetKernelArg(kernel, 22, sizeof(int),      &tpr));
+    CL_CHECK(clSetKernelArg(kernel, 23, sizeof(int),      &dst_flat));
+
     size_t global_work_size[] = {(size_t) nwg*lsz, (size_t) n_slots, 1};
     size_t local_work_size[]  = {(size_t) lsz, 1, 1};
 
+    if (getenv("GGML_OPENCL_CPY_PROBE")) {
+        fprintf(stderr, "[CPY-PROBE] slots n=%d ne00=%d rows=%d tpr=%d lsz=%d nwg=%d flat=%d "
+                        "src nb00=%llu nb01=%llu  dst ne0=%d nb0=%llu nb1=%llu\n",
+                n_slots, ne00, nrows, tpr, lsz, nwg, dst_flat,
+                (unsigned long long) nb00, (unsigned long long) nb01,
+                ne10, (unsigned long long) nb10, (unsigned long long) nb11);
+        fflush(stderr);
+    }
     backend_ctx->enqueue_ndrange_kernel(kernel, 2, global_work_size, local_work_size, src1);
 }
 

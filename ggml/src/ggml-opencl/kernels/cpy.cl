@@ -269,15 +269,18 @@ kernel void kernel_cpy_f32_f32_pack_slots(
         ulong nb2,
         ulong nb3,
         long src_step,
-        long dst_step
+        long dst_step,
+        int tpr_in,
+        int dst_flat
 ) {
     const long slot = get_group_id(1);
     src0 = (global float*)((global char*)src0 + offset0 + slot*src_step);
     dst = (global float*)((global char*)dst + offsetd + slot*dst_step);
 
     int lsz = get_local_size(0);
-    int tpr = min(ne00, lsz);          // threads per row
-    int rpw = lsz / tpr;               // rows per workgroup
+    // The host decides the split so the two cannot disagree; tpr_in <= 0 keeps the old rule.
+    int tpr = tpr_in > 0 ? tpr_in : min(ne00, lsz);   // threads per row
+    int rpw = lsz / tpr;                              // rows per workgroup
     int lid = get_local_id(0);
     int row = get_group_id(0)*rpw + lid / tpr;
     int lane = lid - (lid / tpr) * tpr;
@@ -292,19 +295,28 @@ kernel void kernel_cpy_f32_f32_pack_slots(
     int i02 = t % ne02;
     int i03 = t / ne02;
 
-    long n  = (long)row * ne00;
-    int i3  = (int)(n / ((long)ne2*ne1*ne0));
-    long rm = n - (long)i3*ne2*ne1*ne0;
-    int i2  = (int)(rm / ((long)ne1*ne0));
-    rm     -= (long)i2*ne1*ne0;
-    int i1  = (int)(rm / ne0);
-    int i0  = (int)(rm - (long)i1*ne0);
+    global float * dst_data;
+    if (dst_flat) {
+        // The whole copy lands in the destination's first dimension (nrows*ne00 <= ne0)
+        // and nb0 is one float, so the unflatten below collapses to i0 = row*ne00 with
+        // i1 = i2 = i3 = 0. Taking it directly drops two 64-bit divides per work item,
+        // which Adreno emulates. The host sets the flag; see ggml_cl_cpy_slots.
+        dst_data = dst + (long)row*ne00;
+    } else {
+        long n  = (long)row * ne00;
+        int i3  = (int)(n / ((long)ne2*ne1*ne0));
+        long rm = n - (long)i3*ne2*ne1*ne0;
+        int i2  = (int)(rm / ((long)ne1*ne0));
+        rm     -= (long)i2*ne1*ne0;
+        int i1  = (int)(rm / ne0);
+        int i0  = (int)(rm - (long)i1*ne0);
+        dst_data = (global float *) ((global char *) dst + i3*nb3 + i2*nb2 + i1*nb1 + i0*nb0);
+    }
 
-    global float * dst_data = (global float *) ((global char *) dst + i3*nb3 + i2*nb2 + i1*nb1 + i0*nb0);
+    global const char * src_row = (global const char *) src0 + i03*nb03 + i02*nb02 + i01*nb01;
 
     for (int i00 = lane; i00 < ne00; i00 += tpr) {
-        global const float * src = (global float *)((global char *) src0 + i03*nb03 + i02*nb02 + i01*nb01 + i00*nb00);
-        dst_data[i00] = src[0];
+        dst_data[i00] = *(global const float *)(src_row + i00*nb00);
     }
 }
 
