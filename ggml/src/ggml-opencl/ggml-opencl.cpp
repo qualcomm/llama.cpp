@@ -1496,6 +1496,15 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mm_f16_f32_l4_lm;
     cl_kernel kernel_mul_mm_f16_f32_l4_lm_n8 = nullptr;  // narrow-N variant, ne11 <= 8
     cl_kernel kernel_mul_mm_f16_f32_l4_lm_splitk_reduce = nullptr;
+    // Skinny-N variant for the GQA-folded KQ / KQV of a verify batch
+    // (8 < ne11 <= mm_skinny_bn_max); the tile is a build-time constant.
+    cl_program program_mul_mm_f16_f32_skinny = nullptr;
+    cl_kernel  kernel_mul_mm_f16_f32_skinny = nullptr;
+    int mm_skinny_tr = 2;   // rows per cluster
+    int mm_skinny_tc = 16;  // columns per lane
+    int mm_skinny_kl = 4;   // lanes per cluster (K phases); K step = 8 * kl
+    int mm_skinny_cr = 16;  // clusters per column group
+    int mm_skinny_bn_max = 64;
     cl_kernel kernel_mul_mm_q1_0_f32_l4_lm;
     cl_kernel kernel_mul_mm_q4_0_f32_l4_lm;
     cl_kernel kernel_mul_mm_q4_1_f32_l4_lm;
@@ -4245,6 +4254,53 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             if (err_n8 != CL_SUCCESS) {
                 backend_ctx->kernel_mul_mm_f16_f32_l4_lm_n8 = nullptr;
             }
+        }
+        GGML_LOG_CONT(".");
+    }
+
+    // mul_mm_f16_f32_skinny
+    {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src {
+            #include "mul_mm_f16_f32_skinny.cl.h"
+        };
+#else
+        const std::string kernel_src = read_file("mul_mm_f16_f32_skinny.cl");
+#endif
+        // GGML_OPENCL_MM_SKINNY_TILE=TR,TC,KL,CR overrides the thread tile
+        // for tuning; the defaults are the measured optimum on Adreno X2.
+        const char * tile_env = getenv("GGML_OPENCL_MM_SKINNY_TILE");
+        if (tile_env) {
+            int tr = 0, tc = 0, kl = 0, cr = 0;
+            if (sscanf(tile_env, "%d,%d,%d,%d", &tr, &tc, &kl, &cr) == 4 &&
+                tr > 0 && tc > 0 && kl > 0 && (kl & (kl - 1)) == 0 && cr > 0) {
+                backend_ctx->mm_skinny_tr = tr;
+                backend_ctx->mm_skinny_tc = tc;
+                backend_ctx->mm_skinny_kl = kl;
+                backend_ctx->mm_skinny_cr = cr;
+            }
+        }
+        std::string skinny_opts = compile_opts +
+            " -DTR=" + std::to_string(backend_ctx->mm_skinny_tr) +
+            " -DTC=" + std::to_string(backend_ctx->mm_skinny_tc) +
+            " -DKL=" + std::to_string(backend_ctx->mm_skinny_kl) +
+            " -DCR=" + std::to_string(backend_ctx->mm_skinny_cr) +
+            " -DBN_MAX=" + std::to_string(backend_ctx->mm_skinny_bn_max);
+        // The cluster reduce uses subgroup shuffles where the device has them
+        // (the compiler does not predefine the extension macro).
+        if (backend_ctx->has_subgroup_shuffle) {
+            skinny_opts += backend_ctx->has_qcom_subgroup_shuffle
+                ? " -D cl_qcom_subgroup_shuffle=1"
+                : " -D cl_khr_subgroup_shuffle=1";
+        }
+        backend_ctx->program_mul_mm_f16_f32_skinny =
+            build_program_from_source(backend_ctx, kernel_src.c_str(), skinny_opts);
+
+        cl_int err_sk = CL_SUCCESS;
+        backend_ctx->kernel_mul_mm_f16_f32_skinny =
+            clCreateKernel(backend_ctx->program_mul_mm_f16_f32_skinny, "kernel_mul_mm_f16_f32_skinny", &err_sk);
+        if (err_sk != CL_SUCCESS) {
+            backend_ctx->kernel_mul_mm_f16_f32_skinny = nullptr;
         }
         GGML_LOG_CONT(".");
     }
@@ -33213,12 +33269,33 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     offset1_cont = 0;
                 }
 
+                // Skinny-N kernel for the folded verify shapes (8 < ne11 <= 64):
+                // src0 rows streamed from global memory by clusters of KL lanes
+                // splitting K, src1 staged in local memory, one column tile of
+                // ceil(ne11 / TC) groups. It reads src1 as float4 and steps K by
+                // 8 * KL. GGML_OPENCL_MM_SKINNY=0 keeps the 64x64 tile.
+                static const char * mm_skinny_env = getenv("GGML_OPENCL_MM_SKINNY");
+                const bool mm_skinny_off = (mm_skinny_env != nullptr && mm_skinny_env[0] == '0');
+                const bool use_skinny = !mm_skinny_off && !use_narrow_n &&
+                    ne11_mm > 8 && ne11_mm <= backend_ctx->mm_skinny_bn_max &&
+                    backend_ctx->kernel_mul_mm_f16_f32_skinny != nullptr &&
+                    ne00 % 8 == 0 && ne10 % 4 == 0 && offset1_cont % 16 == 0;
+                const int skinny_bm = backend_ctx->mm_skinny_cr * backend_ctx->mm_skinny_tr;
+                const int skinny_kc = 8 * backend_ctx->mm_skinny_kl;
+                if (use_skinny) {
+                    kernel = backend_ctx->kernel_mul_mm_f16_f32_skinny;
+                    nth0   = backend_ctx->mm_skinny_kl * backend_ctx->mm_skinny_cr *
+                             CEIL_DIV(ne11_mm, backend_ctx->mm_skinny_tc);
+                }
+
                 // 64 is block tile size BM and BN - change here when BM and BN in the kernel are changed.
                 // The narrow-N instance is compiled with BN=8, so its N grid must be
                 // tiled by 8 to match -- tiling by 64 would compute only the first 8
                 // columns and silently drop the rest.
                 const int bn_f16 = use_narrow_n ? 8 : 64;
-                const size_t n_wg_mm = (size_t)CEIL_DIV(ne01, 64) * (size_t)CEIL_DIV(ne11_mm, bn_f16) * (size_t)ne12_mm*ne13;
+                const int bm_f16 = use_skinny ? skinny_bm : 64;
+                const int n_col_tiles = use_skinny ? 1 : CEIL_DIV(ne11_mm, bn_f16);
+                const size_t n_wg_mm = (size_t)CEIL_DIV(ne01, bm_f16) * (size_t)n_col_tiles * (size_t)ne12_mm*ne13;
 
                 // Split-K. The folded KQV of a verify batch is M = head dim (256),
                 // N = width * gqa, K = context: 4 row tiles per KV head, 16 workgroups
@@ -33233,13 +33310,18 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 const int mm_splitk_wgs = mm_splitk_env ? atoi(mm_splitk_env) : 64;
                 int nsplit = 1;
                 int kslice = ne00;
-                if (mm_splitk_wgs > 0 && n_wg_mm < (size_t)mm_splitk_wgs && ne00 >= 512 &&
+                // The skinny kernel's K step is its staging depth KC, and its
+                // per-slice cost is low enough that a 128-deep slice pays.
+                const int k_step   = use_skinny ? skinny_kc : 16;
+                const int k_min    = use_skinny ? 256 : 512;
+                const int k_slice_min = use_skinny ? 128 : 256;
+                if (mm_splitk_wgs > 0 && n_wg_mm < (size_t)mm_splitk_wgs && ne00 >= k_min &&
                     ggml_is_contiguous(dst) && ggml_nelements(dst) % 4 == 0 && offsetd % 16 == 0 &&
                     backend_ctx->kernel_mul_mm_f16_f32_l4_lm_splitk_reduce != nullptr) {
                     int want = (int)CEIL_DIV((size_t)mm_splitk_wgs, n_wg_mm);
-                    if (want > ne00 / 256) { want = ne00 / 256; }
+                    if (want > ne00 / k_slice_min) { want = ne00 / k_slice_min; }
                     if (want > 1) {
-                        kslice = CEIL_DIV(CEIL_DIV(ne00, want), 16) * 16;
+                        kslice = CEIL_DIV(CEIL_DIV(ne00, want), k_step) * k_step;
                         nsplit = CEIL_DIV(ne00, kslice);
                     }
                 }
@@ -33276,7 +33358,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 CL_CHECK(clSetKernelArg(kernel, 19, sizeof(int),      &nsplit));
                 CL_CHECK(clSetKernelArg(kernel, 20, sizeof(int),      &kslice));
 
-                size_t global_work_size[] = {(size_t)(CEIL_DIV(ne01, 64)*nth0), (size_t)(CEIL_DIV(ne11_mm, bn_f16)), (size_t)ne12_mm*ne13*nsplit};
+                size_t global_work_size[] = {(size_t)(CEIL_DIV(ne01, bm_f16)*nth0), (size_t)n_col_tiles, (size_t)ne12_mm*ne13*nsplit};
                 size_t local_work_size[] = {(size_t)nth0, 1, 1};
 
                 backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
