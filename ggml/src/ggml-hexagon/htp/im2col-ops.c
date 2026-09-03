@@ -3,10 +3,11 @@
 #pragma clang diagnostic ignored "-Wunused-but-set-variable"
 
 #include <HAP_farf.h>
-#include <HAP_perf.h>
 #include <hexagon_protos.h>
 #include <hexagon_types.h>
 #include <string.h>
+
+#include "hex-common.h"
 
 #define GGML_COMMON_DECL_C
 #include "ggml-common.h"
@@ -276,26 +277,50 @@ int op_im2col(struct htp_ops_context * octx) {
 
     uint32_t patch_base, dev_npatches;
     if (octx->mdev_count > 1) {
-        const uint32_t patches_per_line = MAX(1, (uint32_t) HEX_L2_LINE_SIZE / dst->nb[1]);
-        uint32_t patches_per_mdev = fastdiv(npatches + octx->mdev_count - 1, &octx->mdev_count_div);
-        patches_per_mdev = ((patches_per_mdev + patches_per_line - 1) / patches_per_line) * patches_per_line;
-        patch_base    = MIN(octx->mdev_idx * patches_per_mdev, npatches);
-        dev_npatches  = MIN(patches_per_mdev, npatches - patch_base);
+        const uint32_t patch_size = dst->nb[1];
+        const uint32_t patches_per_chunk = (patch_size > 0) ? (HEX_L2_LINE_SIZE / hex_gcd_u32(patch_size, HEX_L2_LINE_SIZE)) : 1;
+        const uint32_t total_patch_chunks = npatches / patches_per_chunk;
+        const bool can_split_patches = total_patch_chunks >= octx->mdev_count;
+
+        if (!can_split_patches) {
+            patch_base   = (octx->mdev_idx == 0) ? 0 : npatches;
+            dev_npatches = (octx->mdev_idx == 0) ? npatches : 0;
+        } else {
+            const uint32_t chunks_per_mdev = fastdiv(total_patch_chunks + octx->mdev_count - 1, &octx->mdev_count_div);
+            patch_base = MIN(octx->mdev_idx * chunks_per_mdev * patches_per_chunk, npatches);
+            if (octx->mdev_idx == octx->mdev_count - 1) {
+                dev_npatches = npatches - patch_base;
+            } else {
+                dev_npatches = MIN(chunks_per_mdev * patches_per_chunk, npatches - patch_base);
+            }
+        }
     } else {
-        patch_base    = 0;
-        dev_npatches  = npatches;
+        patch_base   = 0;
+        dev_npatches = npatches;
     }
 
     uint32_t row_base, mdev_nrows;
     if (octx->mdev_count > 1) {
-        const uint32_t rows_per_line = MAX(1, (uint32_t) HEX_L2_LINE_SIZE / dst->nb[2]);
-        uint32_t rows_per_mdev = fastdiv(nrows + octx->mdev_count - 1, &octx->mdev_count_div);
-        rows_per_mdev = ((rows_per_mdev + rows_per_line - 1) / rows_per_line) * rows_per_line;
-        row_base   = MIN(octx->mdev_idx * rows_per_mdev, nrows);
-        mdev_nrows  = MIN(rows_per_mdev, nrows - row_base);
+        const uint32_t row_size = dst->nb[2];
+        const uint32_t rows_per_chunk = (row_size > 0) ? (HEX_L2_LINE_SIZE / hex_gcd_u32(row_size, HEX_L2_LINE_SIZE)) : 1;
+        const uint32_t total_row_chunks = nrows / rows_per_chunk;
+        const bool can_split_rows = total_row_chunks >= octx->mdev_count;
+
+        if (!can_split_rows) {
+            row_base   = (octx->mdev_idx == 0) ? 0 : nrows;
+            mdev_nrows = (octx->mdev_idx == 0) ? nrows : 0;
+        } else {
+            const uint32_t chunks_per_mdev = fastdiv(total_row_chunks + octx->mdev_count - 1, &octx->mdev_count_div);
+            row_base = MIN(octx->mdev_idx * chunks_per_mdev * rows_per_chunk, nrows);
+            if (octx->mdev_idx == octx->mdev_count - 1) {
+                mdev_nrows = nrows - row_base;
+            } else {
+                mdev_nrows = MIN(chunks_per_mdev * rows_per_chunk, nrows - row_base);
+            }
+        }
     } else {
         row_base   = 0;
-        mdev_nrows  = nrows;
+        mdev_nrows = nrows;
     }
 
     if (dev_npatches == 0 && mdev_nrows == 0) {

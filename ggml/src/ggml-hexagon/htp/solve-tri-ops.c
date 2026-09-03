@@ -1,8 +1,10 @@
 #pragma clang diagnostic ignored "-Wunused-but-set-variable"
 
 #include <HAP_farf.h>
-#include <HAP_perf.h>
 #include <string.h>
+
+#include "hex-common.h"
+#include "hex-profile.h"
 
 #define GGML_COMMON_DECL_C
 #include "ggml-common.h"
@@ -93,8 +95,8 @@ static void solve_tri_batch_thread_f32(unsigned int nth, unsigned int ith, void 
     const uint32_t start_batch = sctx->mdev_job_start + sctx->jobs_per_thread * ith;
     const uint32_t end_batch   = MIN(start_batch + sctx->jobs_per_thread, sctx->mdev_job_start + sctx->total_jobs);
 
-    uint64_t t1, t2;
-    t1 = HAP_perf_get_qtimer_count();
+    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) start_batch);
 
     for (uint32_t batch = start_batch; batch < end_batch; ++batch) {
         const uint32_t i03 = batch / ne02;
@@ -128,11 +130,10 @@ static void solve_tri_batch_thread_f32(unsigned int nth, unsigned int ith, void 
         }
     }
 
-    t2 = HAP_perf_get_qtimer_count();
+    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) end_batch);
 
-    FARF(HIGH, "solve-tri-batch %d/%d: A=(%ux%u) B=(%ux%u) batch %u:%u usec %u\n",
-         ith, nth, n, n, k, n, start_batch, end_batch,
-         (unsigned) HAP_perf_qtimer_count_to_us(t2 - t1));
+    FARF(HIGH, "solve-tri-batch %d/%d: A=(%ux%u) B=(%ux%u) batch %u:%u\n",
+         ith, nth, n, n, k, n, start_batch, end_batch);
 }
 
 // Chunk-level thread: each job is one (batch, col_chunk) pair.
@@ -152,8 +153,8 @@ static void solve_tri_chunk_thread_f32(unsigned int nth, unsigned int ith, void 
     const uint32_t start_job = sctx->mdev_job_start + sctx->jobs_per_thread * ith;
     const uint32_t end_job   = MIN(start_job + sctx->jobs_per_thread, sctx->mdev_job_start + sctx->total_jobs);
 
-    uint64_t t1, t2;
-    t1 = HAP_perf_get_qtimer_count();
+    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) start_job);
 
     for (uint32_t job = start_job; job < end_job; ++job) {
         const uint32_t batch = job / sctx->k_chunks;
@@ -186,11 +187,10 @@ static void solve_tri_chunk_thread_f32(unsigned int nth, unsigned int ith, void 
         }
     }
 
-    t2 = HAP_perf_get_qtimer_count();
+    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) end_job);
 
-    FARF(HIGH, "solve-tri-chunk %d/%d: A=(%ux%u) B=(%ux%u) jobs %u:%u usec %u\n",
-         ith, nth, n, n, k, n, start_job, end_job,
-         (unsigned) HAP_perf_qtimer_count_to_us(t2 - t1));
+    FARF(HIGH, "solve-tri-chunk %d/%d: A=(%ux%u) B=(%ux%u) jobs %u:%u\n",
+         ith, nth, n, n, k, n, start_job, end_job);
 }
 
 int op_solve_tri(struct htp_ops_context * octx) {
@@ -236,9 +236,23 @@ int op_solve_tri(struct htp_ops_context * octx) {
     if (batched) {
         uint32_t mdev_job_start, mdev_njobs;
         if (octx->mdev_count > 1) {
-            const uint32_t jobs_per_mdev = fastdiv(total_batches + octx->mdev_count - 1, &octx->mdev_count_div);
-            mdev_job_start = MIN(octx->mdev_idx * jobs_per_mdev, total_batches);
-            mdev_njobs     = MIN(jobs_per_mdev, total_batches - mdev_job_start);
+            const uint32_t batch_size = dst->nb[2];
+            const uint32_t batches_per_chunk = (batch_size > 0) ? (HEX_L2_LINE_SIZE / hex_gcd_u32(batch_size, HEX_L2_LINE_SIZE)) : 1;
+            const uint32_t total_chunks = total_batches / batches_per_chunk;
+            const bool can_split = total_chunks >= octx->mdev_count;
+
+            if (!can_split) {
+                mdev_job_start = (octx->mdev_idx == 0) ? 0 : total_batches;
+                mdev_njobs     = (octx->mdev_idx == 0) ? total_batches : 0;
+            } else {
+                const uint32_t chunks_per_mdev = fastdiv(total_chunks + octx->mdev_count - 1, &octx->mdev_count_div);
+                mdev_job_start = MIN(octx->mdev_idx * chunks_per_mdev * batches_per_chunk, total_batches);
+                if (octx->mdev_idx == octx->mdev_count - 1) {
+                    mdev_njobs = total_batches - mdev_job_start;
+                } else {
+                    mdev_njobs = MIN(chunks_per_mdev * batches_per_chunk, total_batches - mdev_job_start);
+                }
+            }
         } else {
             mdev_job_start = 0;
             mdev_njobs     = total_batches;
@@ -260,16 +274,26 @@ int op_solve_tri(struct htp_ops_context * octx) {
             .col_block       = col_block,
         };
 
-        worker_pool_run_func(octx->ctx->worker_pool, solve_tri_batch_thread_f32, &sctx, n_threads);
+        work_queue_run(octx->ctx->work_queue, solve_tri_batch_thread_f32, &sctx, n_threads);
     } else {
         // Chunk-level parallelism
         const uint32_t total_jobs = total_batches * k_chunks;
 
         uint32_t mdev_job_start, mdev_njobs;
         if (octx->mdev_count > 1) {
-            const uint32_t jobs_per_mdev = fastdiv(total_jobs + octx->mdev_count - 1, &octx->mdev_count_div);
-            mdev_job_start = MIN(octx->mdev_idx * jobs_per_mdev, total_jobs);
-            mdev_njobs     = MIN(jobs_per_mdev, total_jobs - mdev_job_start);
+            const bool can_split = ((dst->nb[1] & 127) == 0) && (total_jobs >= octx->mdev_count);
+            if (!can_split) {
+                mdev_job_start = (octx->mdev_idx == 0) ? 0 : total_jobs;
+                mdev_njobs     = (octx->mdev_idx == 0) ? total_jobs : 0;
+            } else {
+                const uint32_t jobs_per_mdev = fastdiv(total_jobs + octx->mdev_count - 1, &octx->mdev_count_div);
+                mdev_job_start = MIN(octx->mdev_idx * jobs_per_mdev, total_jobs);
+                if (octx->mdev_idx == octx->mdev_count - 1) {
+                    mdev_njobs = total_jobs - mdev_job_start;
+                } else {
+                    mdev_njobs = MIN(jobs_per_mdev, total_jobs - mdev_job_start);
+                }
+            }
         } else {
             mdev_job_start = 0;
             mdev_njobs     = total_jobs;
@@ -290,7 +314,7 @@ int op_solve_tri(struct htp_ops_context * octx) {
             .col_block       = col_block,
         };
 
-        worker_pool_run_func(octx->ctx->worker_pool, solve_tri_chunk_thread_f32, &sctx, n_threads);
+        work_queue_run(octx->ctx->work_queue, solve_tri_chunk_thread_f32, &sctx, n_threads);
     }
 
     return HTP_STATUS_OK;
