@@ -166,8 +166,17 @@ static inline bool ggml_cl_env_flag_zero(const char * name) {
 // Widening also divides ROWS_PER_LANE -- hence the s_shard/k_reg/q_reg/g_exp
 // register footprint -- and multiplies the work-group count by the same factor.
 // GGML_OPENCL_GDN_LANES_PER_COLUMN sweeps it without a rebuild; 0/unset keeps
-// the inherited default.
-static int ggml_opencl_gdn_lanes_per_column(int S_V, int sg_size, int cpl) {
+// the default.
+//
+// Default for the multi-token kernel (tgpp=1) at S_V=128: 16, paired with
+// COLS_PER_LANE_GROUP=2. Measured on Adreno X2-90 over lpc {8,16,32} x cpl
+// {1,2,4}, 48 heads, K=8 snapshots: the per-lane state shard
+// (cpl*ROWS_PER_LANE floats) is the lever -- every 16-float geometry is fast and
+// every 32/64-float one is ~4x slower at n_tokens=2..8, so the inherited 8x4
+// (64 floats) paid for its register footprint on both axes. 16x2 vs 8x4: a
+// width-8 spec-decode verify 626 -> 202 us, n_tokens=1024 prefill 9894 -> 7828 us.
+// The single-token kernel keeps 8 (16 costs it 2.5%).
+static int ggml_opencl_gdn_lanes_per_column(int S_V, int sg_size, int cpl, int tgpp) {
     static const int env = []{
         const char * e = getenv("GGML_OPENCL_GDN_LANES_PER_COLUMN");
         return (e && e[0]) ? atoi(e) : 0;
@@ -192,7 +201,7 @@ static int ggml_opencl_gdn_lanes_per_column(int S_V, int sg_size, int cpl) {
         return lpc;
     };
 
-    const int inherited = normalize(S_V >= 128 ? 8 : (S_V < sg_size ? S_V : sg_size));
+    const int inherited = normalize(S_V >= 128 ? (tgpp ? 16 : 8) : (S_V < sg_size ? S_V : sg_size));
 
     if (env <= 0) {
         return inherited;
@@ -210,10 +219,10 @@ static int ggml_opencl_gdn_lanes_per_column(int S_V, int sg_size, int cpl) {
     return geometry_ok(lpc) ? lpc : inherited;
 }
 
-// COLS_PER_LANE_GROUP: columns each lane group carries. 1 at decode; the prompt
-// value of 4 is recorded as an Adreno 750 register-budget choice (128 registers
-// per work-item), so it is worth re-checking on other parts.
-// GGML_OPENCL_GDN_CPL_PP overrides the prompt value.
+// COLS_PER_LANE_GROUP: columns each lane group carries. 1 at decode; 2 for the
+// multi-token kernel (see ggml_opencl_gdn_lanes_per_column for the sweep -- the
+// inherited 4 was an Adreno 750 register-budget choice that the X2-90 numbers do
+// not support at any n_tokens). GGML_OPENCL_GDN_CPL_PP overrides the prompt value.
 static int ggml_opencl_gdn_cols_per_lane_group(int tgpp) {
     static const int env = []{
         const char * e = getenv("GGML_OPENCL_GDN_CPL_PP");
@@ -222,7 +231,7 @@ static int ggml_opencl_gdn_cols_per_lane_group(int tgpp) {
     if (tgpp == 0) {
         return 1;
     }
-    return env > 0 ? env : 4;
+    return env > 0 ? env : 2;
 }
 
 static bool ggml_cl_is_q4_0_soa(const ggml_tensor * tensor);
@@ -969,6 +978,7 @@ struct ggml_backend_opencl_context {
     bool disable_fusion;
     bool fuse_rope_set_rows = true;  // opt-out GGML_OPENCL_FUSE_ROPE_SET_ROWS=0
     bool fuse_rms_rope = true;       // opt-out GGML_OPENCL_FUSE_RMS_ROPE=0
+    bool fuse_gdn_cache = true;      // opt-out GGML_OPENCL_FUSE_GDN_CACHE=0
     bool fuse_mm_gelu = false;       // opt-IN GGML_OPENCL_FUSE_MM_GELU=1 (not byte-identical: scalar vs vector tanh)
     bool fuse_mm_glu = true;         // opt-out GGML_OPENCL_FUSE_MM_GLU=0 (byte-identical gate+up GEMV + GLU, q4_K FFN)
     bool fuse_rms_rope_set_rows = false; // opt-IN GGML_OPENCL_FUSE_RMS_ROPE_SET_ROWS=1 (cross-gap K-cache scatter fold)
@@ -5173,7 +5183,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                     // comment. It depends on cpl (COLS_PER_WG has to divide S_V), so it
                     // belongs inside the tgpp loop, not outside it.
                     const int lanes_per_column =
-                        ggml_opencl_gdn_lanes_per_column(S_V, sg_size, cpl);
+                        ggml_opencl_gdn_lanes_per_column(S_V, sg_size, cpl, tgpp);
 
                     GGML_ASSERT(lanes_per_column >= 1);
                     GGML_ASSERT(((lanes_per_column & (lanes_per_column - 1)) == 0));
@@ -9919,6 +9929,9 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
     if (const char * env = getenv("GGML_OPENCL_FUSE_RMS_ROPE")) {
         backend_ctx->fuse_rms_rope = atoi(env) != 0;
     }
+    if (const char * env = getenv("GGML_OPENCL_FUSE_GDN_CACHE")) {
+        backend_ctx->fuse_gdn_cache = atoi(env) != 0;
+    }
     if (const char * env = getenv("GGML_OPENCL_FUSE_MM_GELU")) {
         backend_ctx->fuse_mm_gelu = atoi(env) != 0;
     }
@@ -12528,6 +12541,18 @@ static void ggml_opencl_op_gemma4_perlayer_block(ggml_backend_t backend, const s
 }
 #endif // GGML_OPENCL_USE_ADRENO_KERNELS
 
+// gated_delta_net + cpy(snapshots -> recurrent cache): the kernel writes its
+// state snapshots straight into the cache view the cpy would have filled.
+// Matcher and dispatch are defined with the op.
+struct ggml_opencl_gdn_fused_cache {
+    const ggml_tensor * view        = nullptr; // [D, n_seqs, n_written] view of the cache
+    cl_ulong            slot_stride = 0;       // floats between rollback groups
+};
+static int  ggml_opencl_try_gdn_cache_fusion(const ggml_cgraph * cgraph, int node_idx,
+                                             ggml_opencl_gdn_fused_cache & cache);
+static void ggml_cl_gated_delta_net_impl(ggml_backend_t backend, ggml_tensor * dst,
+                                         const ggml_opencl_gdn_fused_cache * cache);
+
 // Walk the cgraph and dispatch each node's kernels. When backend_ctx->rec_active
 // is set, the per-op enqueue helper records into the recordable queue instead of
 // the live queue (so this same path both executes normally and captures a
@@ -12581,6 +12606,19 @@ static void ggml_backend_opencl_exec_graph_nodes(ggml_backend_t backend, ggml_cg
             ggml_cl_rope_set_rows(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
             i += 2;
             continue;
+        }
+        // gated_delta_net -> cpy(snapshot tail -> recurrent cache). Byte-identical
+        // to the unfused pair; saves the cpy dispatch and its S_v*S_v*H_v*w floats
+        // of traffic per layer (24 MB at verify width 8 on Qwen3.8-27B).
+        if (!backend_ctx->disable_fusion && backend_ctx->fuse_gdn_cache &&
+            node->op == GGML_OP_GATED_DELTA_NET) {
+            ggml_opencl_gdn_fused_cache cache;
+            const int skip = ggml_opencl_try_gdn_cache_fusion(cgraph, i, cache);
+            if (skip > 0) {
+                ggml_cl_gated_delta_net_impl(backend, node, &cache);
+                i += skip;
+                continue;
+            }
         }
 
         // Gemma-4 per-layer-embedding block megakernel (software grid barrier):
@@ -38724,7 +38762,10 @@ static void ggml_cl_glu(ggml_backend_t backend, const ggml_tensor * src0, const 
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
 }
 
-static void ggml_cl_gated_delta_net(ggml_backend_t backend, ggml_tensor * dst) {
+// cache != nullptr: the follow-on cpy into the recurrent cache was fused (see
+// ggml_opencl_try_gdn_cache_fusion) and the snapshots go there instead of the dst tail.
+static void ggml_cl_gated_delta_net_impl(ggml_backend_t backend, ggml_tensor * dst,
+                                         const ggml_opencl_gdn_fused_cache * cache) {
     GGML_ASSERT(dst);
     GGML_ASSERT(dst->extra);
 
@@ -38764,16 +38805,11 @@ static void ggml_cl_gated_delta_net(ggml_backend_t backend, ggml_tensor * dst) {
 
     // TODO: Optimize when S_v!=128. Not necessary for now as Qwen3.5/6 are all S_v=128
     // token generation mode (tgpp=0):
-    // process 1 token at a time, so columns per lane (cpl) == 1
-    // prompt processing mode (tgpp=1):
-    // cpl=4 to process 4 tokens for single-token. 4 is chosen for Adreno 750 as per
-    // work-item/thread has at most 128 registers.
-    // All Qwen3.5/6 models are S_v == 128, so LANES_PER_COLUMN == 8
-    // such that ROWS_PER_LANE = 128/8 = 16
-    // Variables in the kernel:
-    // k_reg, q_reg, g_exp are all 16 floats
-    // s_shard has cpl*ROWS_PER_LANE = 4*16 = 64 floats
-    // Total 112 registers used.
+    // process 1 token at a time, so columns per lane (cpl) == 1, LANES_PER_COLUMN 8,
+    // ROWS_PER_LANE 16; k_reg, q_reg, g_exp, s_shard are 16 floats each.
+    // multi-token mode (tgpp=1):
+    // cpl=2 with LANES_PER_COLUMN 16 (ROWS_PER_LANE 8): k_reg/q_reg/g_exp 8 floats,
+    // s_shard 16. The geometry helpers above hold the measurements.
     // subgroups_per_workgroup (spw) can be set to 1,2,4,8,16 for tg and 1,2,4 for pp
     // for S_v=128.
     // Empirically found that when spw=1, we get the best performance for both tg and pp
@@ -38818,6 +38854,20 @@ static void ggml_cl_gated_delta_net(ggml_backend_t backend, ggml_tensor * dst) {
     const cl_ulong off_state = extra_state->offset + src_state->view_offs;
     const cl_ulong off_dst   = extra_dst->offset   + dst->view_offs;
 
+    // Snapshot destination: the dst tail (slot stride = one full state set), or
+    // the recurrent cache when the cpy was fused. The kernel indexes slots in
+    // floats with a uint; the matcher already rejected anything that overflows.
+    cl_mem   snap_mem         = extra_dst->data_device;
+    cl_ulong off_snap         = off_dst + (cl_ulong) s_off * sizeof(float);
+    cl_uint  snap_slot_stride = S_v * S_v * H_v * n_seqs;
+    if (cache != nullptr) {
+        ggml_tensor_extra_cl * extra_cache = (ggml_tensor_extra_cl *) cache->view->extra;
+        GGML_ASSERT(extra_cache);
+        snap_mem         = extra_cache->data_device;
+        off_snap         = extra_cache->offset + cache->view->view_offs;
+        snap_slot_stride = (cl_uint) cache->slot_stride;
+    }
+
     int idx = 0;
     CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem),   &extra_q->data_device));
     CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off_q));
@@ -38850,6 +38900,9 @@ static void ggml_cl_gated_delta_net(ggml_backend_t backend, ggml_tensor * dst) {
     CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &rq3));
     CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(float),    &scale));
     CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),    &K));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem),   &snap_mem));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off_snap));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &snap_slot_stride));
 
     // Subgroup size is 64 for Adreno and 32 for Intel
     const int sg_size = backend_ctx->gpu_family == GPU_FAMILY::ADRENO ? 64 : backend_ctx->gpu_family == GPU_FAMILY::INTEL ? 32 : -1;
@@ -38861,7 +38914,7 @@ static void ggml_cl_gated_delta_net(ggml_backend_t backend, ggml_tensor * dst) {
     // Same helper the programs were compiled with -- these two were previously
     // hand-kept copies of one heuristic, and a mismatch silently launches a kernel
     // at the wrong geometry.
-    const int lanes_per_column = ggml_opencl_gdn_lanes_per_column((int) S_v, sg_size, cpl);
+    const int lanes_per_column = ggml_opencl_gdn_lanes_per_column((int) S_v, sg_size, cpl, tgpp);
 
     // Max workgroup size for Adreno 750 is 1024
     const int wg_size = sg_size * spw;
@@ -38887,6 +38940,83 @@ static void ggml_cl_gated_delta_net(ggml_backend_t backend, ggml_tensor * dst) {
     local_work_size[2]  = 1;
 
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+}
+
+static void ggml_cl_gated_delta_net(ggml_backend_t backend, ggml_tensor * dst) {
+    ggml_cl_gated_delta_net_impl(backend, dst, nullptr);
+}
+
+// gated_delta_net -> cpy(snapshot tail -> recurrent cache): have the kernel write
+// its K state snapshots straight into the cache (slot s -> rollback group s, slot
+// 0 newest) and skip the cpy. Mirrors ggml_cuda_try_gdn_cache_fusion. On a
+// width-w verify batch the cpy moves w*S_v*S_v*H_v floats per layer (24 MB at
+// w=8 on Qwen3.8-27B) that the kernel has just written; this is pure traffic.
+// Returns the number of nodes to skip after the gdn (0 = no fusion).
+static int ggml_opencl_try_gdn_cache_fusion(const ggml_cgraph * cgraph, int node_idx,
+                                            ggml_opencl_gdn_fused_cache & cache) {
+    const ggml_tensor * gdn = cgraph->nodes[node_idx];
+    // the kernel leaves the snapshot tail unwritten, so gdn must not be a graph output
+    if (gdn->op != GGML_OP_GATED_DELTA_NET || gdn->type != GGML_TYPE_F32 ||
+        (gdn->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return 0;
+    }
+
+    const ggml_tensor * src_v     = gdn->src[2];
+    const int64_t       S_v       = src_v->ne[0];
+    const int64_t       H         = src_v->ne[1];
+    const int64_t       n_tokens  = src_v->ne[2];
+    const int64_t       n_seqs    = src_v->ne[3];
+    const int64_t       D         = S_v * S_v * H;
+    const int64_t       K         = ggml_get_op_params_i32(gdn, 0);
+    const int64_t       n_written = std::min<int64_t>(n_tokens, K);
+
+    // the snapshot tail starts right after the attention scores
+    const size_t tail_off = ggml_row_size(GGML_TYPE_F32, S_v * H * n_tokens * n_seqs);
+
+    // the snapshot cpy is the first real node after the gdn (skip views/no-ops)
+    const ggml_tensor * cpy  = nullptr;
+    int                 skip = 0;
+    for (int j = node_idx + 1; j < cgraph->n_nodes && cpy == nullptr; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (ggml_is_empty(n) || n->op == GGML_OP_RESHAPE || n->op == GGML_OP_TRANSPOSE ||
+            n->op == GGML_OP_VIEW || n->op == GGML_OP_PERMUTE || n->op == GGML_OP_NONE) {
+            continue;
+        }
+        if (n->op != GGML_OP_CPY || (n->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            return 0;
+        }
+        cpy  = n;
+        skip = j - node_idx;
+    }
+    if (cpy == nullptr) {
+        return 0;
+    }
+
+    const ggml_tensor * src = cpy->src[0]; // view of the gdn snapshot tail
+    const ggml_tensor * dst = cpy->src[1]; // cache view the kernel writes to
+
+    if (src->op != GGML_OP_VIEW || src->view_src != gdn || src->view_offs != tail_off ||
+        !ggml_is_contiguous(src)) {
+        return 0;
+    }
+
+    // dst is the [D, n_seqs, n_written] cache view with the per-seq stride the kernel assumes
+    const std::array<int64_t, GGML_MAX_DIMS> expected_ne = { D, n_seqs, n_written, 1 };
+    if (dst->op != GGML_OP_VIEW || dst->type != GGML_TYPE_F32 || dst->extra == nullptr ||
+        !std::equal(expected_ne.begin(), expected_ne.end(), dst->ne) ||
+        dst->nb[0] != ggml_type_size(GGML_TYPE_F32) || dst->nb[1] != (size_t) ggml_row_size(GGML_TYPE_F32, D)) {
+        return 0;
+    }
+
+    const cl_ulong slot_stride = K > 1 ? (cl_ulong) (dst->nb[2] / sizeof(float)) : 0;
+    // the kernel forms slot*stride + D*n_seqs as a uint
+    if (slot_stride * (cl_ulong) K + (cl_ulong) D * n_seqs > (cl_ulong) UINT32_MAX) {
+        return 0;
+    }
+
+    cache.view        = dst;
+    cache.slot_stride = slot_stride;
+    return skip;
 }
 
 //------------------------------------------------------------------------------
