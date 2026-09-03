@@ -18755,11 +18755,22 @@ static void ggml_cl_add(ggml_backend_t backend, const ggml_tensor * src0, const 
         GGML_ASSERT(ne11 == 1);
     }
 
+    // Same-shape contiguous add (the per-layer residual adds): the row kernel
+    // indexes src1 by gid % ne, which is the identity when ne is the whole
+    // tensor, so it computes a plain elementwise add with one float4 per
+    // work item across the whole tensor. The general kernel runs one
+    // workgroup of up to 64 scalar work items per row, far too few for a
+    // 5120 x 8 tensor.
+    const bool flat = !bcast_row && ggml_are_same_shape(src0, src1) &&
+        ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst) &&
+        ggml_nelements(dst) % 4 == 0 &&
+        offset0 % 16 == 0 && offset1 % 16 == 0 && offsetd % 16 == 0;
+
     if (dst->type == GGML_TYPE_F32) {
         GGML_ASSERT(src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32);
-        if (bcast_row) {
+        if (bcast_row || flat) {
             kernel = backend_ctx->kernel_add_row;
-            const int ne = ne00 / 4;
+            const int ne = flat ? ggml_nelements(dst) / 4 : ne00 / 4;
             CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),   &extra0->data_device));
             CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_ulong), &offset0));
             CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem),   &extra1->data_device));
@@ -18805,9 +18816,9 @@ static void ggml_cl_add(ggml_backend_t backend, const ggml_tensor * src0, const 
         GGML_ASSERT(src1->type == GGML_TYPE_F16 || src1->type == GGML_TYPE_F32);
         const int type_src0 = (src0->type == GGML_TYPE_F32);
         const int type_src1 = (src1->type == GGML_TYPE_F32);
-        if (bcast_row) {
+        if (bcast_row || flat) {
             kernel = backend_ctx->kernel_add_row_f16;
-            const int ne = ne00 / 4;
+            const int ne = flat ? ggml_nelements(dst) / 4 : ne00 / 4;
             CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),   &extra0->data_device));
             CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_ulong), &offset0));
             CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem),   &extra1->data_device));
@@ -18856,7 +18867,7 @@ static void ggml_cl_add(ggml_backend_t backend, const ggml_tensor * src0, const 
         GGML_ASSERT(false && "unsupported data types for add");
     }
 
-    if (bcast_row) {
+    if (bcast_row || flat) {
         int n = ggml_nelements(dst)/4;
         size_t global_work_size[] = {(size_t)n, 1, 1};
         size_t local_work_size[] = {64, 1, 1};
