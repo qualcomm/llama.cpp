@@ -56,6 +56,7 @@ typedef const void * (*get_adreno_bin_kernel_func_t)(
 #include <regex>
 #include <set>
 #include <unordered_set>
+#include <unordered_map>
 
 #ifdef __linux__
 #include <dirent.h>
@@ -995,6 +996,8 @@ struct ggml_backend_opencl_context {
     bool fuse_rope_set_rows = true;  // opt-out GGML_OPENCL_FUSE_ROPE_SET_ROWS=0
     bool fuse_rms_rope = true;       // opt-out GGML_OPENCL_FUSE_RMS_ROPE=0
     bool fuse_gdn_cache = true;      // opt-out GGML_OPENCL_FUSE_GDN_CACHE=0
+    bool fuse_gdn_state = true;      // opt-out GGML_OPENCL_FUSE_GDN_STATE=0 (read the input state from the cache)
+    bool fuse_cpy_slots = true;      // opt-out GGML_OPENCL_FUSE_CPY_SLOTS=0 (offset-stepped cpy run in one launch)
     bool fuse_mm_gelu = false;       // opt-IN GGML_OPENCL_FUSE_MM_GELU=1 (not byte-identical: scalar vs vector tanh)
     bool fuse_mm_glu = true;         // opt-out GGML_OPENCL_FUSE_MM_GLU=0 (byte-identical gate+up GEMV + GLU, q4_K FFN)
     bool fuse_rms_rope_set_rows = false; // opt-IN GGML_OPENCL_FUSE_RMS_ROPE_SET_ROWS=1 (cross-gap K-cache scatter fold)
@@ -1260,6 +1263,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_rope_neox_f32_rms_set_rows_f16;
     cl_kernel kernel_rope_multi_f32, kernel_rope_multi_f16, kernel_rope_vision_f32, kernel_rope_vision_f16;
     cl_kernel kernel_cpy_f16_f16, kernel_cpy_f16_f32, kernel_cpy_f32_f16, kernel_cpy_f32_f32, kernel_cpy_f32_f32_pack, kernel_cpy_i32_i32;
+    cl_kernel kernel_cpy_f32_f32_pack_slots = nullptr;  // a run of offset-stepped cpy nodes in one launch
     cl_kernel kernel_cpy_f32_f32_flat = nullptr;  // contiguous fast path, see ggml_cl_cpy
     cl_kernel kernel_mul_mat_f32_f32;
     cl_kernel kernel_mul_mat_f32_f32_gelu;
@@ -3136,6 +3140,13 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         CL_CHECK((backend_ctx->kernel_cpy_f32_f16 = clCreateKernel(prog, "kernel_cpy_f32_f16", &err), err));
         CL_CHECK((backend_ctx->kernel_cpy_f32_f32 = clCreateKernel(prog, "kernel_cpy_f32_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_cpy_f32_f32_pack = clCreateKernel(prog, "kernel_cpy_f32_f32_pack", &err), err));
+        {   // Non-fatal: without it the cpy run stays one launch per node.
+            cl_int err_slots = CL_SUCCESS;
+            cl_kernel k = clCreateKernel(prog, "kernel_cpy_f32_f32_pack_slots", &err_slots);
+            if (err_slots == CL_SUCCESS) {
+                backend_ctx->kernel_cpy_f32_f32_pack_slots = k;
+            }
+        }
         {   // Non-fatal on purpose: without it ggml_cl_cpy keeps the row-mapped kernel.
             cl_int err_flat = CL_SUCCESS;
             cl_kernel k = clCreateKernel(prog, "kernel_cpy_f32_f32_flat", &err_flat);
@@ -10249,6 +10260,12 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
     if (const char * env = getenv("GGML_OPENCL_FUSE_GDN_CACHE")) {
         backend_ctx->fuse_gdn_cache = atoi(env) != 0;
     }
+    if (const char * env = getenv("GGML_OPENCL_FUSE_GDN_STATE")) {
+        backend_ctx->fuse_gdn_state = atoi(env) != 0;
+    }
+    if (const char * env = getenv("GGML_OPENCL_FUSE_CPY_SLOTS")) {
+        backend_ctx->fuse_cpy_slots = atoi(env) != 0;
+    }
     if (const char * env = getenv("GGML_OPENCL_FUSE_MM_GELU")) {
         backend_ctx->fuse_mm_gelu = atoi(env) != 0;
     }
@@ -12864,11 +12881,26 @@ static void ggml_opencl_op_gemma4_perlayer_block(ggml_backend_t backend, const s
 struct ggml_opencl_gdn_fused_cache {
     const ggml_tensor * view        = nullptr; // [D, n_seqs, n_written] view of the cache
     cl_ulong            slot_stride = 0;       // floats between rollback groups
+    // input side: the kernel gathers the state itself from cache rows ids[seq]
+    // and the get_rows node that did it is skipped
+    const ggml_tensor * state_rows  = nullptr; // [D, mem_size] view of the cache
+    const ggml_tensor * state_ids   = nullptr; // I32 [n_seqs]
+    cl_ulong            state_row_stride = 0;  // floats between cache rows
 };
 static int  ggml_opencl_try_gdn_cache_fusion(const ggml_cgraph * cgraph, int node_idx,
                                              ggml_opencl_gdn_fused_cache & cache);
+static int  ggml_opencl_try_gdn_state_fusion(const ggml_cgraph * cgraph, int node_idx,
+                                             ggml_opencl_gdn_fused_cache & cache);
+static void ggml_opencl_mark_gdn_state_fusions(const ggml_cgraph * cgraph, std::vector<char> & skip_node);
 static void ggml_cl_gated_delta_net_impl(ggml_backend_t backend, ggml_tensor * dst,
                                          const ggml_opencl_gdn_fused_cache * cache);
+
+// A run of consecutive f32 cpy nodes that move one shape between fixed byte
+// steps of the same two buffers, dispatched as a single launch. Defined with
+// the cpy op.
+static int  ggml_opencl_try_cpy_slots(ggml_backend_opencl_context * backend_ctx,
+                                      const ggml_cgraph * cgraph, int node_idx, int * last_idx);
+static void ggml_cl_cpy_slots(ggml_backend_t backend, const ggml_cgraph * cgraph, int node_idx, int last_idx, int n_slots);
 
 // Walk the cgraph and dispatch each node's kernels. When backend_ctx->rec_active
 // is set, the per-op enqueue helper records into the recordable queue instead of
@@ -12883,6 +12915,11 @@ static void ggml_backend_opencl_exec_graph_nodes(ggml_backend_t backend, ggml_cg
     // whose K-cache scatter was folded into an earlier rms+rope dispatch). Skipped
     // when the loop reaches them.
     std::vector<char> skip_node(cgraph->n_nodes, 0);
+    // gated_delta_net reading its input state straight from the recurrent cache:
+    // the get_rows that gathered it runs before the gdn, so it is marked up front.
+    if (!backend_ctx->disable_fusion && backend_ctx->fuse_gdn_state) {
+        ggml_opencl_mark_gdn_state_fusions(cgraph, skip_node);
+    }
     // Feed the queue from a fast core; the driver's own threads were pinned at init.
     ggml_cl_pin_self pin;
 
@@ -12927,13 +12964,39 @@ static void ggml_backend_opencl_exec_graph_nodes(ggml_backend_t backend, ggml_cg
         // gated_delta_net -> cpy(snapshot tail -> recurrent cache). Byte-identical
         // to the unfused pair; saves the cpy dispatch and its S_v*S_v*H_v*w floats
         // of traffic per layer (24 MB at verify width 8 on Qwen3.8-27B).
-        if (!backend_ctx->disable_fusion && backend_ctx->fuse_gdn_cache &&
-            node->op == GGML_OP_GATED_DELTA_NET) {
+        // The input side is the mirror image: the get_rows(cache, ids) that
+        // gathered the state is skipped (marked above) and the kernel reads the
+        // cache rows in place, saving another D*n_seqs floats per layer.
+        if (!backend_ctx->disable_fusion && node->op == GGML_OP_GATED_DELTA_NET &&
+            (backend_ctx->fuse_gdn_cache || backend_ctx->fuse_gdn_state)) {
             ggml_opencl_gdn_fused_cache cache;
-            const int skip = ggml_opencl_try_gdn_cache_fusion(cgraph, i, cache);
-            if (skip > 0) {
+            const int skip = backend_ctx->fuse_gdn_cache ? ggml_opencl_try_gdn_cache_fusion(cgraph, i, cache) : 0;
+            bool state_fused = false;
+            if (backend_ctx->fuse_gdn_state) {
+                const int gr_idx = ggml_opencl_try_gdn_state_fusion(cgraph, i, cache);
+                state_fused = gr_idx >= 0 && skip_node[gr_idx];
+            }
+            if (!state_fused) {
+                cache.state_rows = nullptr;
+                cache.state_ids  = nullptr;
+                cache.state_row_stride = 0;
+            }
+            if (skip > 0 || state_fused) {
                 ggml_cl_gated_delta_net_impl(backend, node, &cache);
                 i += skip;
+                continue;
+            }
+        }
+        // cpy x K at fixed offset steps -> one launch. The conv-state snapshots of a
+        // delta-net layer are K such copies (8 launches of 30720 floats at verify
+        // width 8 on Qwen3.8-27B); byte-identical, saves the launches.
+        if (!backend_ctx->disable_fusion && backend_ctx->fuse_cpy_slots &&
+            node->op == GGML_OP_CPY) {
+            int last_idx = i;
+            const int n_slots = ggml_opencl_try_cpy_slots(backend_ctx, cgraph, i, &last_idx);
+            if (n_slots > 1) {
+                ggml_cl_cpy_slots(backend, cgraph, i, last_idx, n_slots);
+                i = last_idx;
                 continue;
             }
         }
@@ -38473,6 +38536,152 @@ static void ggml_cl_cpy(ggml_backend_t backend, const ggml_tensor * src0, const 
     }
 }
 
+// Count the run of f32 -> f32 cpy nodes starting at node_idx that copy the same
+// shape with the same strides, from the same source buffer to the same destination
+// buffer, with both byte offsets advancing by a constant step per node. Such a run
+// is one kernel_cpy_f32_f32_pack_slots launch. Destination regions must be disjoint
+// and must not overlap any source region of the run, so that the order the slots
+// execute in cannot change the result. Returns the run length (1 = no fusion).
+static int ggml_opencl_try_cpy_slots(ggml_backend_opencl_context * backend_ctx,
+                                     const ggml_cgraph * cgraph, int node_idx, int * last_idx) {
+    *last_idx = node_idx;
+    if (backend_ctx->kernel_cpy_f32_f32_pack_slots == nullptr) {
+        return 1;
+    }
+    const ggml_tensor * first = cgraph->nodes[node_idx];
+    const ggml_tensor * s0    = first->src[0];
+    const ggml_tensor * d0    = first->src[1];
+    if (first->op != GGML_OP_CPY || s0 == nullptr || d0 == nullptr ||
+        s0->type != GGML_TYPE_F32 || d0->type != GGML_TYPE_F32 ||
+        s0->extra == nullptr || d0->extra == nullptr ||
+        s0->ne[0] >= 32 || ggml_nelements(s0) != ggml_nelements(d0)) {
+        return 1;
+    }
+    const ggml_tensor_extra_cl * es0 = (const ggml_tensor_extra_cl *) s0->extra;
+    const ggml_tensor_extra_cl * ed0 = (const ggml_tensor_extra_cl *) d0->extra;
+    const cl_long off_s0 = (cl_long) (es0->offset + s0->view_offs);
+    const cl_long off_d0 = (cl_long) (ed0->offset + d0->view_offs);
+    const cl_long bytes  = (cl_long) ggml_nbytes(d0);
+
+    cl_long step_s = 0, step_d = 0;
+    int n = 1;
+    int last = node_idx;
+    for (int j = node_idx + 1; j < cgraph->n_nodes; ++j) {
+        const ggml_tensor * node = cgraph->nodes[j];
+        if (node->op == GGML_OP_VIEW || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_PERMUTE ||
+            node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_NONE) {
+            continue;  // the views each cpy reads and writes sit between them; no work
+        }
+        if (node->op != GGML_OP_CPY || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            break;
+        }
+        const ggml_tensor * s = node->src[0];
+        const ggml_tensor * d = node->src[1];
+        if (s == nullptr || d == nullptr || s->type != GGML_TYPE_F32 || d->type != GGML_TYPE_F32 ||
+            s->extra == nullptr || d->extra == nullptr ||
+            !ggml_are_same_shape(s, s0) || !ggml_are_same_shape(d, d0) ||
+            !ggml_are_same_stride(s, s0) || !ggml_are_same_stride(d, d0)) {
+            break;
+        }
+        const ggml_tensor_extra_cl * es = (const ggml_tensor_extra_cl *) s->extra;
+        const ggml_tensor_extra_cl * ed = (const ggml_tensor_extra_cl *) d->extra;
+        if (es->data_device != es0->data_device || ed->data_device != ed0->data_device) {
+            break;
+        }
+        const cl_long ds = (cl_long) (es->offset + s->view_offs) - off_s0;
+        const cl_long dd = (cl_long) (ed->offset + d->view_offs) - off_d0;
+        if (n == 1) {
+            step_s = ds;
+            step_d = dd;
+            if (step_d == 0 || (step_d < 0 ? -step_d : step_d) < bytes) {
+                break;  // destination slots overlap
+            }
+        } else if (ds != (cl_long) n * step_s || dd != (cl_long) n * step_d) {
+            break;
+        }
+        n++;
+        last = j;
+    }
+    if (n < 2) {
+        return 1;
+    }
+    if (es0->data_device == ed0->data_device) {
+        // same buffer: the union of the source spans must not touch the union of
+        // the destination spans
+        const cl_long s_lo = off_s0 + (step_s < 0 ? (n - 1) * step_s : 0);
+        const cl_long s_hi = off_s0 + (step_s > 0 ? (n - 1) * step_s : 0) + (cl_long) ggml_nbytes(s0);
+        const cl_long d_lo = off_d0 + (step_d < 0 ? (n - 1) * step_d : 0);
+        const cl_long d_hi = off_d0 + (step_d > 0 ? (n - 1) * step_d : 0) + bytes;
+        if (s_lo < d_hi && d_lo < s_hi) {
+            return 1;
+        }
+    }
+    *last_idx = last;
+    return n;
+}
+
+static void ggml_cl_cpy_slots(ggml_backend_t backend, const ggml_cgraph * cgraph, int node_idx, int last_idx, int n_slots) {
+    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *) backend->context;
+
+    const ggml_tensor * first = cgraph->nodes[node_idx];
+    const ggml_tensor * last  = cgraph->nodes[last_idx];
+    const ggml_tensor * src0  = first->src[0];
+    const ggml_tensor * src1  = first->src[1];
+
+    GGML_TENSOR_LOCALS(int,      ne0, src0, ne);
+    GGML_TENSOR_LOCALS(cl_ulong, nb0, src0, nb);
+    GGML_TENSOR_LOCALS(int,      ne1, src1, ne);
+    GGML_TENSOR_LOCALS(cl_ulong, nb1, src1, nb);
+
+    const ggml_tensor_extra_cl * extra0 = (const ggml_tensor_extra_cl *) src0->extra;
+    const ggml_tensor_extra_cl * extra1 = (const ggml_tensor_extra_cl *) src1->extra;
+    const ggml_tensor_extra_cl * extra0l = (const ggml_tensor_extra_cl *) last->src[0]->extra;
+    const ggml_tensor_extra_cl * extra1l = (const ggml_tensor_extra_cl *) last->src[1]->extra;
+
+    const cl_ulong offset0 = extra0->offset + src0->view_offs;
+    const cl_ulong offset1 = extra1->offset + src1->view_offs;
+    const cl_long  step0   = ((cl_long) (extra0l->offset + last->src[0]->view_offs) - (cl_long) offset0) / (n_slots - 1);
+    const cl_long  step1   = ((cl_long) (extra1l->offset + last->src[1]->view_offs) - (cl_long) offset1) / (n_slots - 1);
+
+    cl_kernel kernel = backend_ctx->kernel_cpy_f32_f32_pack_slots;
+    CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0->data_device));
+    CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_ulong), &offset0));
+    CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),   &extra1->data_device));
+    CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_ulong), &offset1));
+    CL_CHECK(clSetKernelArg(kernel,  4, sizeof(int),      &ne00));
+    CL_CHECK(clSetKernelArg(kernel,  5, sizeof(int),      &ne01));
+    CL_CHECK(clSetKernelArg(kernel,  6, sizeof(int),      &ne02));
+    CL_CHECK(clSetKernelArg(kernel,  7, sizeof(int),      &ne03));
+    CL_CHECK(clSetKernelArg(kernel,  8, sizeof(cl_ulong), &nb00));
+    CL_CHECK(clSetKernelArg(kernel,  9, sizeof(cl_ulong), &nb01));
+    CL_CHECK(clSetKernelArg(kernel, 10, sizeof(cl_ulong), &nb02));
+    CL_CHECK(clSetKernelArg(kernel, 11, sizeof(cl_ulong), &nb03));
+    CL_CHECK(clSetKernelArg(kernel, 12, sizeof(int),      &ne10));
+    CL_CHECK(clSetKernelArg(kernel, 13, sizeof(int),      &ne11));
+    CL_CHECK(clSetKernelArg(kernel, 14, sizeof(int),      &ne12));
+    CL_CHECK(clSetKernelArg(kernel, 15, sizeof(int),      &ne13));
+    CL_CHECK(clSetKernelArg(kernel, 16, sizeof(cl_ulong), &nb10));
+    CL_CHECK(clSetKernelArg(kernel, 17, sizeof(cl_ulong), &nb11));
+    CL_CHECK(clSetKernelArg(kernel, 18, sizeof(cl_ulong), &nb12));
+    CL_CHECK(clSetKernelArg(kernel, 19, sizeof(cl_ulong), &nb13));
+    CL_CHECK(clSetKernelArg(kernel, 20, sizeof(cl_long),  &step0));
+    CL_CHECK(clSetKernelArg(kernel, 21, sizeof(cl_long),  &step1));
+
+    // same row mapping as the single-slot pack kernel, slots on the second dimension
+    const int maxwg = (int) backend_ctx->get_kernel_workgroup_size(kernel);
+    const int base  = MIN(64, maxwg);
+    const int tpr   = MIN(ne00, base);
+    const int rpw   = MAX(1, base / tpr);
+    const int lsz   = tpr * rpw;
+    const int nrows = ne01*ne02*ne03;
+    const int nwg   = (nrows + rpw - 1) / rpw;
+
+    size_t global_work_size[] = {(size_t) nwg*lsz, (size_t) n_slots, 1};
+    size_t local_work_size[]  = {(size_t) lsz, 1, 1};
+
+    backend_ctx->enqueue_ndrange_kernel(kernel, 2, global_work_size, local_work_size, src1);
+}
+
 static void ggml_cl_dup(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     ggml_cl_cpy(backend, src0, dst, nullptr);
     UNUSED(src1);
@@ -39796,12 +40005,30 @@ static void ggml_cl_gated_delta_net_impl(ggml_backend_t backend, ggml_tensor * d
     cl_mem   snap_mem         = extra_dst->data_device;
     cl_ulong off_snap         = off_dst + (cl_ulong) s_off * sizeof(float);
     cl_uint  snap_slot_stride = S_v * S_v * H_v * n_seqs;
-    if (cache != nullptr) {
+    if (cache != nullptr && cache->view != nullptr) {
         ggml_tensor_extra_cl * extra_cache = (ggml_tensor_extra_cl *) cache->view->extra;
         GGML_ASSERT(extra_cache);
         snap_mem         = extra_cache->data_device;
         off_snap         = extra_cache->offset + cache->view->view_offs;
         snap_slot_stride = (cl_uint) cache->slot_stride;
+    }
+
+    // Input state: the [S_v, S_v, H_v, n_seqs] tensor, or the cache rows ids[seq]
+    // when the get_rows was fused (row stride 0 tells the kernel which).
+    cl_mem   state_mem        = extra_state->data_device;
+    cl_ulong off_state_in     = off_state;
+    cl_mem   rows_mem         = extra_state->data_device;
+    cl_ulong off_rows         = 0;
+    cl_ulong state_row_stride = 0;
+    if (cache != nullptr && cache->state_ids != nullptr) {
+        ggml_tensor_extra_cl * extra_rows = (ggml_tensor_extra_cl *) cache->state_rows->extra;
+        ggml_tensor_extra_cl * extra_ids  = (ggml_tensor_extra_cl *) cache->state_ids->extra;
+        GGML_ASSERT(extra_rows && extra_ids);
+        state_mem        = extra_rows->data_device;
+        off_state_in     = extra_rows->offset + cache->state_rows->view_offs;
+        rows_mem         = extra_ids->data_device;
+        off_rows         = extra_ids->offset + cache->state_ids->view_offs;
+        state_row_stride = cache->state_row_stride;
     }
 
     int idx = 0;
@@ -39815,8 +40042,8 @@ static void ggml_cl_gated_delta_net_impl(ggml_backend_t backend, ggml_tensor * d
     CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off_g));
     CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem),   &extra_beta->data_device));
     CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off_beta));
-    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem),   &extra_state->data_device));
-    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off_state));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem),   &state_mem));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off_state_in));
     CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem),   &extra_dst->data_device));
     CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off_dst));
     CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &H_v));
@@ -39839,6 +40066,9 @@ static void ggml_cl_gated_delta_net_impl(ggml_backend_t backend, ggml_tensor * d
     CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem),   &snap_mem));
     CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off_snap));
     CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &snap_slot_stride));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem),   &rows_mem));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off_rows));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &state_row_stride));
 
     // Subgroup size is 64 for Adreno and 32 for Intel
     const int sg_size = backend_ctx->gpu_family == GPU_FAMILY::ADRENO ? 64 : backend_ctx->gpu_family == GPU_FAMILY::INTEL ? 32 : -1;
@@ -39953,6 +40183,141 @@ static int ggml_opencl_try_gdn_cache_fusion(const ggml_cgraph * cgraph, int node
     cache.view        = dst;
     cache.slot_stride = slot_stride;
     return skip;
+}
+
+// gated_delta_net whose input state is get_rows(cache, ids) (reshaped): the
+// kernel can read cache row ids[0] in place. Single sequence only: every row
+// the kernel writes (the new state and its rollback snapshots) then belongs to
+// that one sequence, and each lane reads exactly the elements it may later
+// write, so no read can observe another workgroup's write. With several
+// sequences in the batch, ids[a] may name the row sequence b is about to
+// write (llama's recurrent memory swaps cells through exactly this
+// indirection), and the unfused gather-before-write order is what makes that
+// correct. Returns the get_rows node's index (it sits a few nodes before the
+// gdn) with cache.state_* filled in, or -1. The caller still has to make sure
+// nothing else consumes the gathered state and nothing writes the cache in
+// between; see ggml_opencl_mark_gdn_state_fusions.
+static int ggml_opencl_try_gdn_state_fusion(const ggml_cgraph * cgraph, int node_idx,
+                                            ggml_opencl_gdn_fused_cache & cache) {
+    const ggml_tensor * gdn = cgraph->nodes[node_idx];
+    if (gdn->op != GGML_OP_GATED_DELTA_NET) {
+        return -1;
+    }
+    const ggml_tensor * src_v = gdn->src[2];
+    const ggml_tensor * st    = gdn->src[5];
+    const int64_t       D     = src_v->ne[0] * src_v->ne[0] * src_v->ne[1];
+    const int64_t n_seqs      = src_v->ne[3];
+    if (n_seqs != 1) {
+        return -1;
+    }
+
+    // st is a reshape of the get_rows result (no offset)
+    if (st == nullptr || st->op != GGML_OP_RESHAPE || st->view_src == nullptr || st->view_offs != 0 ||
+        (st->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return -1;
+    }
+    const ggml_tensor * gr = st->view_src;
+    if (gr->op != GGML_OP_GET_ROWS || gr->type != GGML_TYPE_F32 || (gr->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+        gr->ne[0] != D || gr->ne[1] != n_seqs || gr->ne[2] != 1 || gr->ne[3] != 1) {
+        return -1;
+    }
+    const ggml_tensor * rows = gr->src[0];
+    const ggml_tensor * ids  = gr->src[1];
+    if (rows == nullptr || ids == nullptr || rows->extra == nullptr || ids->extra == nullptr ||
+        rows->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32 ||
+        rows->ne[0] != D || rows->ne[2] != 1 || rows->ne[3] != 1 ||
+        rows->nb[0] != sizeof(float) || rows->nb[1] % sizeof(float) != 0 ||
+        ids->ne[0] != n_seqs || ids->ne[1] != 1 || ids->ne[2] != 1 || ids->ne[3] != 1 ||
+        ids->nb[0] != sizeof(int32_t)) {
+        return -1;
+    }
+    // the get_rows node precedes the gdn by a handful of nodes
+    int gr_idx = -1;
+    for (int j = node_idx - 1; j >= 0 && j >= node_idx - 64; --j) {
+        if (cgraph->nodes[j] == gr) {
+            gr_idx = j;
+            break;
+        }
+    }
+    if (gr_idx < 0) {
+        return -1;
+    }
+    cache.state_rows       = rows;
+    cache.state_ids        = ids;
+    cache.state_row_stride = (cl_ulong) (rows->nb[1] / sizeof(float));
+    return gr_idx;
+}
+
+// Mark the get_rows nodes that ggml_opencl_try_gdn_state_fusion folds into a
+// gdn, provided (a) the gathered state has no other consumer in the graph (the
+// gdn and the reshape between them are the only allowed users; any other node
+// or view that touches either tensor keeps the get_rows), and (b) nothing writes
+// the cache between the get_rows and the gdn: llama's build_rs copies the
+// "extra" recurrent states (cells beyond the batch's own) right after the
+// gather, and a fused gdn would read those rows after that copy instead of
+// before it.
+static void ggml_opencl_mark_gdn_state_fusions(const ggml_cgraph * cgraph, std::vector<char> & skip_node) {
+    struct cand { int gr_idx; const ggml_tensor * gdn; const ggml_tensor * st; bool ok; };
+    std::vector<cand> cands;
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (node->op != GGML_OP_GATED_DELTA_NET) {
+            continue;
+        }
+        ggml_opencl_gdn_fused_cache cache;
+        const int gr_idx = ggml_opencl_try_gdn_state_fusion(cgraph, i, cache);
+        if (gr_idx < 0) {
+            continue;
+        }
+        // (b): a non-empty node between the two that is a view into the cache
+        // (cpy, set_rows and in-place ops all are) writes it
+        const ggml_tensor * rows       = cache.state_rows;
+        const ggml_tensor * cache_base = rows->view_src ? rows->view_src : rows;
+        bool cache_written = false;
+        for (int j = gr_idx + 1; j < i && !cache_written; ++j) {
+            const ggml_tensor * n = cgraph->nodes[j];
+            if (n->op == GGML_OP_VIEW || n->op == GGML_OP_RESHAPE || n->op == GGML_OP_PERMUTE ||
+                n->op == GGML_OP_TRANSPOSE || n->op == GGML_OP_NONE || ggml_is_empty(n)) {
+                continue;
+            }
+            cache_written = n->view_src == cache_base;
+        }
+        if (!cache_written) {
+            cands.push_back({ gr_idx, node, node->src[5], true });
+        }
+    }
+    if (cands.empty()) {
+        return;
+    }
+    std::unordered_map<const ggml_tensor *, size_t> owner; // get_rows result or its reshape -> cand
+    for (size_t c = 0; c < cands.size(); ++c) {
+        owner[cgraph->nodes[cands[c].gr_idx]] = c;
+        owner[cands[c].st] = c;
+    }
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (node->view_src != nullptr) {
+            auto it = owner.find(node->view_src);
+            if (it != owner.end() && node != cands[it->second].st) {
+                cands[it->second].ok = false;
+            }
+        }
+        for (int k = 0; k < GGML_MAX_SRC && node->src[k] != nullptr; ++k) {
+            auto it = owner.find(node->src[k]);
+            if (it == owner.end()) {
+                continue;
+            }
+            const cand & cd = cands[it->second];
+            if (!(node == cd.gdn && k == 5) && !(node == cd.st)) {
+                cands[it->second].ok = false;
+            }
+        }
+    }
+    for (const cand & cd : cands) {
+        if (cd.ok) {
+            skip_node[cd.gr_idx] = 1;
+        }
+    }
 }
 
 //------------------------------------------------------------------------------

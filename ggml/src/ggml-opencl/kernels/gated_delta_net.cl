@@ -128,7 +128,16 @@ kernel void kernel_gated_delta_net(
         // host fused the follow-on cpy it is the recurrent cache itself, slot s
         // landing on rollback group s, and the dst tail is left unwritten.
         global       char * snap_buf,  ulong off_snap,
-        uint  snap_slot_stride) {
+        uint  snap_slot_stride,
+        // Where the input state comes from. state_row_stride == 0: state_buf is
+        // the [S_v, S_v, H_v, n_seqs] tensor. Otherwise the host fused the
+        // get_rows that gathered it and state_buf is the recurrent cache: seq s
+        // reads row state_rows[s], rows state_row_stride floats apart. The host
+        // only does this for a single-sequence batch, where each lane reads
+        // exactly the elements it may later write, so reading the cache in
+        // place is safe even when a snapshot lands on the row being read.
+        global const char * rows_buf,  ulong off_rows,
+        ulong state_row_stride) {
 
     global const float * data_q     = (global const float *)(q_buf     + off_q);
     global const float * data_k     = (global const float *)(k_buf     + off_k);
@@ -160,6 +169,13 @@ kernel void kernel_gated_delta_net(
     // read the wrong sequence's initial state for n_seqs>1 && K>1 (single-seq/K=1 hid it since
     // seq_id=0 or K=1 cancels the factor). Matches the CPU reference (iv3*H + iv1)*S_v*S_v.
     const uint state_base = (seq_id * H_v + head_id) * state_size;
+    // Fused get_rows: the input state of this seq is cache row state_rows[seq_id].
+    uint state_in_base = state_base;
+    if (state_row_stride != 0) {
+        global const int * state_rows = (global const int *)(rows_buf + off_rows);
+        data_state   += (ulong)state_rows[seq_id] * state_row_stride;
+        state_in_base = head_id * state_size;
+    }
     const uint q_off_base  = iq3 * sq3 + iq1 * sq1;
     const uint v_off_base  = seq_id * sv3 + head_id * sv1;
     const uint gb_off_base = seq_id * sb3 + head_id * sb1;
@@ -175,7 +191,7 @@ kernel void kernel_gated_delta_net(
         const uint col = sg_col_base + cg * LANE_GROUPS_PER_SG + lane_group;
         #pragma unroll
         for (uint r = 0; r < ROWS_PER_LANE; r++) {
-            s_shard[cg][r] = data_state[state_base + col * S_V + GDN_ROW(r)];
+            s_shard[cg][r] = data_state[state_in_base + col * S_V + GDN_ROW(r)];
         }
     }
 
