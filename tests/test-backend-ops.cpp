@@ -9413,10 +9413,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // Batched (ne1>1) at the same lm_head shape. Placement is decided by a
     // ne1=512 probe, so if the weight is to live on the GPU these must be
     // correct there too -- a decode-only fix is not enough.
-    for (int n : {2, 3, 4, 8}) {
+    for (int n : {2, 3, 4, 5, 6, 7, 8}) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 32768, n, 2816, {1, 1}, {1, 1}));
     }
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32,  32768, 512, 2816, {1, 1}, {1, 1}));
+    // Qwen3.8-27B lm_head K (5120 = 20 superblocks) at the verify width.
+    for (int n : {5, 8}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 32768, n, 5120, {1, 1}, {1, 1}));
+    }
 
     // Small-batch (ne1 2..8) at REAL FFN shapes. The OpenCL backend routes this band
     // to its own cooperative-K GEMMs, and nothing in the eval list reached them: the
@@ -10887,6 +10891,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // affordable while preserving nb and the dispatch shape.
     for (int bs : {1, 2, 3, 4, 8}) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 32768, bs, 2816, {1, 1}, {1, 1}));
+    }
+    // Qwen3.8-27B lm_head (q6_K, 151936 x 5120) at the DFlash2 verify widths: the
+    // full vocab, so the row count and the per-pass bytes match the model.
+    for (int bs : {1, 2, 4, 8}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 151936, bs, 5120, {1, 1}, {1, 1}));
+    }
+    // same K at smaller row counts, to separate the row-count and the K-length effects
+    for (int m : {32768, 65536}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, m, 8, 5120, {1, 1}, {1, 1}));
     }
 
     // Qwen3-4B decode (n=1) GEMV shapes — the real per-token matmuls (Intel/SYCL study).
