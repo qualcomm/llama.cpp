@@ -9424,12 +9424,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // different path, so those kernels were exercised only by the perf sweep, which
     // checks no results. m=4096 k=14336 is the perf-list shape; m=6656 k=19968 and
     // m=19968 k=6656 are muse-glimmer-30B ffn_down / ffn_gate.
+    // q5_K joins for the same reason; 5120 x 6144 is Qwen3.8-27B ssm_out verbatim.
     for (int n : {2, 3, 4, 5, 8}) {
-        for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_Q4_0}) {
+        for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_Q4_0, GGML_TYPE_Q5_K}) {
             test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32,  4096, n, 14336, {1, 1}, {1, 1}));
             test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32,  6656, n, 19968, {1, 1}, {1, 1}));
             test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 19968, n,  6656, {1, 1}, {1, 1}));
         }
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32, 5120, n, 6144, {1, 1}, {1, 1}));
     }
 
     // MoE-router shape: f32 x f32, m = n_expert, n = 2..8 tokens, k = n_embd.
