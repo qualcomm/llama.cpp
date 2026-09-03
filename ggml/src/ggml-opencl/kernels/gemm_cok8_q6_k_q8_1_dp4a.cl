@@ -1,7 +1,7 @@
 // cok-shaped q6_K GEMM with a dp4a inner product at EIGHT columns, for ne1 = 5..8.
 //
 // Third of the eight-column cok kernels (q4_0, q5_K, now q6_K). The shape it is for is the
-// q6_K lm_head of Qwen3.8-27B (151936 x 5120, 994 MiB) at the DFlash2 verify width: the
+// q6_K lm_head of Qwen3.8-27B (151936 x 5120, 638 MB) at the DFlash2 verify width: the
 // f16 GEMM the batch would otherwise take reads that weight at ~31 GB/s, slower than the
 // CPU, which is why the head is pinned to the CPU today (two passes per round, ~18 ms each).
 // The per-layer q6_K tensors of the drafter (ffn_out 5120 x 17408, f16 cok_r4 at 70 GB/s)
