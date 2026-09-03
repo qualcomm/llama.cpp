@@ -12,8 +12,11 @@
 
 #define GGML_COMMON_DECL_C
 #include "ggml-common.h"
+#include "hex-common.h"
+#include "hex-profile.h"
 #include "htp-ctx.h"
 #include "htp-ops.h"
+#include "htp-tensor.h"
 
 /* Circular wrap: maps any integer x into [0, n) */
 static inline uint32_t wrap_around(int32_t x, uint32_t n) {
@@ -126,8 +129,8 @@ static void pad_job_per_thread_hvx(unsigned int nth, unsigned int ith, void * da
     struct htp_ops_context * octx = pctx->octx;
     htp_pad_preamble;
 
-    uint64_t t1, t2;
-    t1 = HAP_perf_get_qtimer_count();
+    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, row_start);
 
     for (uint32_t dst_row = row_start; dst_row < row_end; dst_row++) {
         uint32_t i1, i2, i3;
@@ -166,14 +169,13 @@ static void pad_job_per_thread_hvx(unsigned int nth, unsigned int ith, void * da
         }
     }
 
-    t2 = HAP_perf_get_qtimer_count();
+    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, row_start);
 
-    FARF(HIGH, "pad-hvx %d/%d: (%ux%ux%ux%u) -> (%ux%ux%ux%u) rows %u:%u usec %u\n",
+    FARF(HIGH, "pad-hvx %d/%d: (%ux%ux%ux%u) -> (%ux%ux%ux%u) rows %u:%u\n",
          ith, nth,
          src->ne[0], src->ne[1], src->ne[2], src->ne[3],
          dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],
-         row_start, row_end,
-         (unsigned) HAP_perf_qtimer_count_to_us(t2 - t1));
+         row_start, row_end);
 }
 
 // ---------------------------------------------------------------------------
@@ -185,9 +187,6 @@ static void pad_job_per_thread_hvx_dma(unsigned int nth, unsigned int ith, void 
     struct htp_ops_context * octx = pctx->octx;
     htp_pad_preamble;
     htp_pad_dma_preamble;
-
-    uint64_t t1, t2;
-    t1 = HAP_perf_get_qtimer_count();
 
     // -----------------------------------------------------------------------
     // Priming phase: push 2 pairs of (dummy_dst_DMA, src_DMA) to seed the
@@ -223,6 +222,9 @@ static void pad_job_per_thread_hvx_dma(unsigned int nth, unsigned int ith, void 
     // Main loop: pop completed DMAs, compute in VTCM with aligned HVX ops,
     // push dst DMA and prefetch src for the next+1 row.
     // -----------------------------------------------------------------------
+    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, row_start);
+
     for (uint32_t ir = row_start; ir < row_end; ir++) {
         uint8_t * dst_spad_cur = (uint8_t *) dma_queue_pop(dma).src;
         uint8_t * src_spad_cur = (uint8_t *) dma_queue_pop(dma).dst;
@@ -273,16 +275,15 @@ static void pad_job_per_thread_hvx_dma(unsigned int nth, unsigned int ith, void 
         }
     }
 
+    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, row_start);
+
     dma_queue_flush(dma);
 
-    t2 = HAP_perf_get_qtimer_count();
-
-    FARF(HIGH, "pad-hvx-dma %d/%d: (%ux%ux%ux%u) -> (%ux%ux%ux%u) rows %u:%u usec %u\n",
+    FARF(HIGH, "pad-hvx-dma %d/%d: (%ux%ux%ux%u) -> (%ux%ux%ux%u) rows %u:%u\n",
          ith, nth,
          src->ne[0], src->ne[1], src->ne[2], src->ne[3],
          dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],
-         row_start, row_end,
-         (unsigned) HAP_perf_qtimer_count_to_us(t2 - t1));
+         row_start, row_end);
 }
 
 // ---------------------------------------------------------------------------
@@ -294,8 +295,8 @@ static void pad_job_per_thread_hvx_circular(unsigned int nth, unsigned int ith, 
     struct htp_ops_context * octx = pctx->octx;
     htp_pad_preamble;
 
-    uint64_t t1, t2;
-    t1 = HAP_perf_get_qtimer_count();
+    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, row_start);
 
     for (uint32_t dst_row = row_start; dst_row < row_end; dst_row++) {
         uint32_t i1, i2, i3;
@@ -345,14 +346,13 @@ static void pad_job_per_thread_hvx_circular(unsigned int nth, unsigned int ith, 
         }
     }
 
-    t2 = HAP_perf_get_qtimer_count();
+    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, row_start);
 
-    FARF(HIGH, "pad-hvx-circ %d/%d: (%ux%ux%ux%u) -> (%ux%ux%ux%u) rows %u:%u usec %u\n",
+    FARF(HIGH, "pad-hvx-circ %d/%d: (%ux%ux%ux%u) -> (%ux%ux%ux%u) rows %u:%u\n",
          ith, nth,
          src->ne[0], src->ne[1], src->ne[2], src->ne[3],
          dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],
-         row_start, row_end,
-         (unsigned) HAP_perf_qtimer_count_to_us(t2 - t1));
+         row_start, row_end);
 }
 
 // ---------------------------------------------------------------------------
@@ -364,9 +364,6 @@ static void pad_job_per_thread_hvx_circular_dma(unsigned int nth, unsigned int i
     struct htp_ops_context * octx = pctx->octx;
     htp_pad_preamble;
     htp_pad_dma_preamble;
-
-    uint64_t t1, t2;
-    t1 = HAP_perf_get_qtimer_count();
 
     // -----------------------------------------------------------------------
     // Priming phase: push 2 pairs of (dummy_dst_DMA, src_DMA) to seed the
@@ -391,6 +388,9 @@ static void pad_job_per_thread_hvx_circular_dma(unsigned int nth, unsigned int i
     // Main loop: pop completed DMAs, assemble circular row in VTCM with
     // aligned HVX ops, push dst DMA and prefetch src for the next+1 row.
     // -----------------------------------------------------------------------
+    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, row_start);
+
     for (uint32_t ir = row_start; ir < row_end; ir++) {
         uint8_t * dst_spad_cur = (uint8_t *) dma_queue_pop(dma).src;
         uint8_t * src_spad_cur = (uint8_t *) dma_queue_pop(dma).dst;
@@ -447,16 +447,15 @@ static void pad_job_per_thread_hvx_circular_dma(unsigned int nth, unsigned int i
         }
     }
 
+    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, row_start);
+
     dma_queue_flush(dma);
 
-    t2 = HAP_perf_get_qtimer_count();
-
-    FARF(HIGH, "pad-hvx-circ-dma %d/%d: (%ux%ux%ux%u) -> (%ux%ux%ux%u) rows %u:%u usec %u\n",
+    FARF(HIGH, "pad-hvx-circ-dma %d/%d: (%ux%ux%ux%u) -> (%ux%ux%ux%u) rows %u:%u\n",
          ith, nth,
          src->ne[0], src->ne[1], src->ne[2], src->ne[3],
          dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],
-         row_start, row_end,
-         (unsigned) HAP_perf_qtimer_count_to_us(t2 - t1));
+         row_start, row_end);
 }
 
 int op_pad(struct htp_ops_context * octx) {
@@ -490,12 +489,37 @@ int op_pad(struct htp_ops_context * octx) {
     const uint32_t ne00 = src0->ne[0];
 
     const uint32_t total_dst_rows = dst->ne[1] * dst->ne[2] * dst->ne[3];
+    const size_t dst_row_size     = (size_t)ne0 * type_size;
 
     uint32_t mdev_row_start, mdev_nrows;
     if (octx->mdev_count > 1) {
-        const uint32_t rows_per_mdev = fastdiv(total_dst_rows + octx->mdev_count - 1, &octx->mdev_count_div);
-        mdev_row_start = MIN(octx->mdev_idx * rows_per_mdev, total_dst_rows);
-        mdev_nrows     = MIN(rows_per_mdev, total_dst_rows - mdev_row_start);
+        bool can_split = (dst->ne[0] == 1 || dst->nb[0] == type_size) && !htp_tensor_is_permuted(dst);
+        uint32_t rows_per_chunk = 1;
+        if (can_split) {
+            if (dst->ne[1] > 1 && (dst->nb[1] & 127) == 0) {
+                rows_per_chunk = 1;
+            } else if (dst->nb[1] == dst_row_size &&
+                       (dst->ne[2] <= 1 || dst->nb[2] == dst->nb[1] * dst->ne[1]) &&
+                       (dst->ne[3] <= 1 || dst->nb[3] == dst->nb[2] * dst->ne[2])) {
+                rows_per_chunk = (dst_row_size > 0) ? (HEX_L2_LINE_SIZE / hex_gcd_u32(dst_row_size, HEX_L2_LINE_SIZE)) : 1;
+            } else {
+                can_split = false;
+            }
+        }
+
+        const uint32_t total_chunks = can_split ? (total_dst_rows / rows_per_chunk) : 0;
+        if (total_chunks < octx->mdev_count) {
+            mdev_row_start = (octx->mdev_idx == 0) ? 0 : total_dst_rows;
+            mdev_nrows     = (octx->mdev_idx == 0) ? total_dst_rows : 0;
+        } else {
+            const uint32_t chunks_per_mdev = fastdiv(total_chunks + octx->mdev_count - 1, &octx->mdev_count_div);
+            mdev_row_start = MIN(octx->mdev_idx * chunks_per_mdev * rows_per_chunk, total_dst_rows);
+            if (octx->mdev_idx == octx->mdev_count - 1) {
+                mdev_nrows = total_dst_rows - mdev_row_start;
+            } else {
+                mdev_nrows = MIN(chunks_per_mdev * rows_per_chunk, total_dst_rows - mdev_row_start);
+            }
+        }
     } else {
         mdev_row_start = 0;
         mdev_nrows     = total_dst_rows;
@@ -508,7 +532,6 @@ int op_pad(struct htp_ops_context * octx) {
     const uint32_t n_threads = octx->n_threads;
 
     const size_t src_row_size         = (size_t)ne00 * type_size;
-    const size_t dst_row_size         = (size_t)ne0  * type_size;
     const size_t src_row_size_aligned = hex_round_up(src_row_size, VLEN);
     const size_t dst_row_size_aligned = hex_round_up(dst_row_size, VLEN);
 
@@ -554,10 +577,10 @@ int op_pad(struct htp_ops_context * octx) {
          dst->ne[0],  dst->ne[1],  dst->ne[2],  dst->ne[3],
          lp0, rp0, lp1, rp1, lp2, rp2, lp3, rp3);
 
-    if      (circular && use_dma) { worker_pool_run_func(octx->ctx->worker_pool, pad_job_per_thread_hvx_circular_dma, &pctx, n_threads); }
-    else if (circular)            { worker_pool_run_func(octx->ctx->worker_pool, pad_job_per_thread_hvx_circular,     &pctx, n_threads); }
-    else if (use_dma)             { worker_pool_run_func(octx->ctx->worker_pool, pad_job_per_thread_hvx_dma,          &pctx, n_threads); }
-    else                          { worker_pool_run_func(octx->ctx->worker_pool, pad_job_per_thread_hvx,              &pctx, n_threads); }
+    if      (circular && use_dma) { work_queue_run(octx->ctx->work_queue, pad_job_per_thread_hvx_circular_dma, &pctx, n_threads); }
+    else if (circular)            { work_queue_run(octx->ctx->work_queue, pad_job_per_thread_hvx_circular,     &pctx, n_threads); }
+    else if (use_dma)             { work_queue_run(octx->ctx->work_queue, pad_job_per_thread_hvx_dma,          &pctx, n_threads); }
+    else                          { work_queue_run(octx->ctx->work_queue, pad_job_per_thread_hvx,              &pctx, n_threads); }
 
     return HTP_STATUS_OK;
 }

@@ -14,9 +14,11 @@
 
 #define GGML_COMMON_DECL_C
 #include "ggml-common.h"
+#include "hex-common.h"
+#include "hex-profile.h"
 #include "htp-ctx.h"
 #include "htp-ops.h"
-#include "htp-ops.h"
+#include "htp-tensor.h"
 
 #define htp_softmax_preamble3                     \
     const uint32_t ne00 = src0->ne[0];            \
@@ -236,8 +238,6 @@ static void softmax_job_f32(unsigned int nth, unsigned int ith, void * data) {
         return;
     }
 
-    uint64_t qt = HAP_perf_get_qtimer_count();
-
     int is_aligned = 1;
     int opt_path   = 0;
 
@@ -263,6 +263,9 @@ static void softmax_job_f32(unsigned int nth, unsigned int ith, void * data) {
 
     uint32_t prev_i2 = (uint32_t)-1;
     float slope = 1.0f;
+
+    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, src0_start_row);
 
     for (uint32_t r = src0_start_row; r < src0_end_row; ++r) {
         uint32_t i1 = fastmodulo(r, ne01, &smctx->fastdiv_ne01);
@@ -325,10 +328,11 @@ static void softmax_job_f32(unsigned int nth, unsigned int ith, void * data) {
         }
     }
 
-    qt = HAP_perf_qtimer_count_to_us(HAP_perf_get_qtimer_count() - qt);
-    FARF(HIGH, "softmax-f32 %d/%d: %ux%ux%ux%u (%u:%u) x %ux%ux%ux%u -> %ux%ux%ux%u : opt %u f16 %u usec %u\n", ith, nth,
+    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, src0_start_row);
+
+    FARF(HIGH, "softmax-f32 %d/%d: %ux%ux%ux%u (%u:%u) x %ux%ux%ux%u -> %ux%ux%ux%u : opt %u f16 %u\n", ith, nth,
          ne00, ne01, ne02, ne03, src0_start_row, src0_end_row, ne10, ne11, ne12, ne13,
-         ne0, ne1, ne2, ne3, opt_path, smctx->use_f16, (unsigned) qt);
+         ne0, ne1, ne2, ne3, opt_path, smctx->use_f16);
 }
 
 static int execute_op_softmax_f32(struct htp_ops_context * octx) {
@@ -344,12 +348,37 @@ static int execute_op_softmax_f32(struct htp_ops_context * octx) {
     init_softmax_ctx(&smctx, octx);
 
     const uint32_t src0_nrows = src0->ne[1] * src0->ne[2] * src0->ne[3];
+    const size_t dst_data_row_size = dst->ne[0] * sizeof(float);
 
     uint32_t mdev_row_start, mdev_nrows;
     if (octx->mdev_count > 1) {
-        const uint32_t rows_per_mdev = fastdiv(src0_nrows + octx->mdev_count - 1, &octx->mdev_count_div);
-        mdev_row_start = MIN(octx->mdev_idx * rows_per_mdev, src0_nrows);
-        mdev_nrows     = MIN(rows_per_mdev, src0_nrows - mdev_row_start);
+        bool can_split = (dst->ne[0] == 1 || dst->nb[0] == sizeof(float)) && !htp_tensor_is_permuted(dst);
+        uint32_t rows_per_chunk = 1;
+        if (can_split) {
+            if (dst->ne[1] > 1 && (dst->nb[1] & 127) == 0) {
+                rows_per_chunk = 1;
+            } else if (dst->nb[1] == dst_data_row_size &&
+                       (dst->ne[2] <= 1 || dst->nb[2] == dst->nb[1] * dst->ne[1]) &&
+                       (dst->ne[3] <= 1 || dst->nb[3] == dst->nb[2] * dst->ne[2])) {
+                rows_per_chunk = (dst_data_row_size > 0) ? (HEX_L2_LINE_SIZE / hex_gcd_u32(dst_data_row_size, HEX_L2_LINE_SIZE)) : 1;
+            } else {
+                can_split = false;
+            }
+        }
+
+        const uint32_t total_chunks = can_split ? (src0_nrows / rows_per_chunk) : 0;
+        if (total_chunks < octx->mdev_count) {
+            mdev_row_start = (octx->mdev_idx == 0) ? 0 : src0_nrows;
+            mdev_nrows     = (octx->mdev_idx == 0) ? src0_nrows : 0;
+        } else {
+            const uint32_t chunks_per_mdev = fastdiv(total_chunks + octx->mdev_count - 1, &octx->mdev_count_div);
+            mdev_row_start = MIN(octx->mdev_idx * chunks_per_mdev * rows_per_chunk, src0_nrows);
+            if (octx->mdev_idx == octx->mdev_count - 1) {
+                mdev_nrows = src0_nrows - mdev_row_start;
+            } else {
+                mdev_nrows = MIN(chunks_per_mdev * rows_per_chunk, src0_nrows - mdev_row_start);
+            }
+        }
     } else {
         mdev_row_start = 0;
         mdev_nrows     = src0_nrows;
@@ -402,9 +431,7 @@ static int execute_op_softmax_f32(struct htp_ops_context * octx) {
     octx->src1_spad.data = octx->src0_spad.data + octx->src0_spad.size; octx->src1_spad.src = NULL;
     octx->dst_spad.data  = octx->src1_spad.data + octx->src1_spad.size; octx->dst_spad.src  = NULL;
 
-    if (octx->flags & HTP_OPFLAGS_SKIP_COMPUTE) return err;
-
-    worker_pool_run_func(octx->ctx->worker_pool, softmax_job_f32, &smctx, n_threads);
+    work_queue_run(octx->ctx->work_queue, softmax_job_f32, &smctx, n_threads);
 
     return err;
 }

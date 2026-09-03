@@ -7,6 +7,8 @@
 
 #define GGML_COMMON_DECL_C
 #include "ggml-common.h"
+#include "hex-common.h"
+#include "hex-profile.h"
 #include "htp-ctx.h"
 #include "htp-ops.h"
 #include "htp-tensor.h"
@@ -117,9 +119,6 @@ static inline void hvx_cumsum_row_f32(const float * restrict src, float * restri
 static void cumsum_thread_f32_dma(unsigned int nth, unsigned int ith, void * data) {
     htp_cumsum_preamble;
 
-    uint64_t t1, t2;
-    t1 = HAP_perf_get_qtimer_count();
-
     const uint32_t ir0 = cctx->mdev_row_start + cctx->rows_per_thread * ith;
     const uint32_t ir1 = MIN(ir0 + cctx->rows_per_thread, cctx->mdev_row_start + cctx->total_rows);
 
@@ -150,6 +149,9 @@ static void cumsum_thread_f32_dma(unsigned int nth, unsigned int ith, void * dat
                                    src_row_size_aligned, src_row_size, 1);
     }
 
+    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) ir0);
+
     for (uint32_t ir = ir0; ir < ir1; ir++) {
         float * dst_spad_row = (float *) dma_queue_pop(dma_queue).src;
         float * src_spad_row = (float *) dma_queue_pop(dma_queue).dst;
@@ -168,13 +170,13 @@ static void cumsum_thread_f32_dma(unsigned int nth, unsigned int ith, void * dat
         }
     }
 
-    dma_queue_flush(dma_queue);
-    t2 = HAP_perf_get_qtimer_count();
+    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) ir0);
 
-    FARF(HIGH, "cumsum-f32-dma %d/%d: %ux%ux%ux%u (%u:%u) -> %ux%ux%ux%u usec %u\n",
+    dma_queue_flush(dma_queue);
+
+    FARF(HIGH, "cumsum-f32-dma %d/%d: %ux%ux%ux%u (%u:%u) -> %ux%ux%ux%u\n",
          ith, nth, src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3], ir0, ir1,
-         dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],
-         (unsigned) HAP_perf_qtimer_count_to_us(t2 - t1));
+         dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3]);
 }
 
 // ---------------------------------------------------------------------------
@@ -184,14 +186,14 @@ static void cumsum_thread_f32_dma(unsigned int nth, unsigned int ith, void * dat
 static void cumsum_thread_f32(unsigned int nth, unsigned int ith, void * data) {
     htp_cumsum_preamble;
 
-    uint64_t t1, t2;
-    t1 = HAP_perf_get_qtimer_count();
-
     const uint8_t * src_data = (const uint8_t *) src0->data;
     uint8_t *       dst_data = (uint8_t *) dst->data;
 
     const uint32_t ir0 = cctx->mdev_row_start + cctx->rows_per_thread * ith;
     const uint32_t ir1 = MIN(ir0 + cctx->rows_per_thread, cctx->mdev_row_start + cctx->total_rows);
+
+    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) ir0);
 
     for (uint32_t ir = ir0; ir < ir1; ir++) {
         const float * restrict src_row = (const float *) (src_data + ir * cctx->src_row_size);
@@ -199,12 +201,11 @@ static void cumsum_thread_f32(unsigned int nth, unsigned int ith, void * data) {
         hvx_cumsum_row_f32(src_row, dst_row, ne00);
     }
 
-    t2 = HAP_perf_get_qtimer_count();
+    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) ir0);
 
-    FARF(HIGH, "cumsum-f32 %d/%d: %ux%ux%ux%u (%u:%u) -> %ux%ux%ux%u usec %u\n",
+    FARF(HIGH, "cumsum-f32 %d/%d: %ux%ux%ux%u (%u:%u) -> %ux%ux%ux%u\n",
          ith, nth, src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3], ir0, ir1,
-         dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],
-         (unsigned) HAP_perf_qtimer_count_to_us(t2 - t1));
+         dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3]);
 }
 
 int op_cumsum_f32(struct htp_ops_context * octx) {
@@ -215,13 +216,38 @@ int op_cumsum_f32(struct htp_ops_context * octx) {
         return HTP_STATUS_OK;
     }
 
-    const uint32_t total_rows = src0->ne[1] * src0->ne[2] * src0->ne[3];
+    const uint32_t total_rows      = src0->ne[1] * src0->ne[2] * src0->ne[3];
+    const size_t dst_data_row_size = dst->ne[0] * sizeof(float);
 
     uint32_t mdev_row_start, mdev_nrows;
     if (octx->mdev_count > 1) {
-        const uint32_t rows_per_mdev = fastdiv(total_rows + octx->mdev_count - 1, &octx->mdev_count_div);
-        mdev_row_start = MIN(octx->mdev_idx * rows_per_mdev, total_rows);
-        mdev_nrows     = MIN(rows_per_mdev, total_rows - mdev_row_start);
+        bool can_split = (dst->ne[0] == 1 || dst->nb[0] == sizeof(float)) && !htp_tensor_is_permuted(dst);
+        uint32_t rows_per_chunk = 1;
+        if (can_split) {
+            if (dst->ne[1] > 1 && (dst->nb[1] & 127) == 0) {
+                rows_per_chunk = 1;
+            } else if (dst->nb[1] == dst_data_row_size &&
+                       (dst->ne[2] <= 1 || dst->nb[2] == dst->nb[1] * dst->ne[1]) &&
+                       (dst->ne[3] <= 1 || dst->nb[3] == dst->nb[2] * dst->ne[2])) {
+                rows_per_chunk = (dst_data_row_size > 0) ? (HEX_L2_LINE_SIZE / hex_gcd_u32(dst_data_row_size, HEX_L2_LINE_SIZE)) : 1;
+            } else {
+                can_split = false;
+            }
+        }
+
+        const uint32_t total_chunks = can_split ? (total_rows / rows_per_chunk) : 0;
+        if (total_chunks < octx->mdev_count) {
+            mdev_row_start = (octx->mdev_idx == 0) ? 0 : total_rows;
+            mdev_nrows     = (octx->mdev_idx == 0) ? total_rows : 0;
+        } else {
+            const uint32_t chunks_per_mdev = fastdiv(total_chunks + octx->mdev_count - 1, &octx->mdev_count_div);
+            mdev_row_start = MIN(octx->mdev_idx * chunks_per_mdev * rows_per_chunk, total_rows);
+            if (octx->mdev_idx == octx->mdev_count - 1) {
+                mdev_nrows = total_rows - mdev_row_start;
+            } else {
+                mdev_nrows = MIN(chunks_per_mdev * rows_per_chunk, total_rows - mdev_row_start);
+            }
+        }
     } else {
         mdev_row_start = 0;
         mdev_nrows     = total_rows;
@@ -262,9 +288,9 @@ int op_cumsum_f32(struct htp_ops_context * octx) {
     };
 
     if (octx->ctx->vtcm_size < spad_per_thread * n_threads) {
-        worker_pool_run_func(octx->ctx->worker_pool, cumsum_thread_f32, &cctx, n_threads);
+        work_queue_run(octx->ctx->work_queue, cumsum_thread_f32, &cctx, n_threads);
     } else {
-        worker_pool_run_func(octx->ctx->worker_pool, cumsum_thread_f32_dma, &cctx, n_threads);
+        work_queue_run(octx->ctx->work_queue, cumsum_thread_f32_dma, &cctx, n_threads);
     }
 
     return HTP_STATUS_OK;

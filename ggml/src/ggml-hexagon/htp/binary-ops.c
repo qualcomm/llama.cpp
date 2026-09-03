@@ -13,8 +13,9 @@
 
 #define GGML_COMMON_DECL_C
 #include "ggml-common.h"
-#include "htp-ctx.h"
 #include "hex-common.h"
+#include "hex-profile.h"
+#include "htp-ctx.h"
 #include "htp-ops.h"
 #include "htp-tensor.h"
 
@@ -223,6 +224,9 @@ static void binary_job_scalar(unsigned int nth, unsigned int ith, void * data) {
     }
 
     // Main loop
+    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) start_row);
+
     for (uint32_t ir = start_row; ir < end_row; ) {
         uint32_t current_block_size = calc_block_size(bctx, ir, end_row, ne01, ne02);
 
@@ -267,6 +271,8 @@ static void binary_job_scalar(unsigned int nth, unsigned int ith, void * data) {
         }
         ir += current_block_size;
     }
+
+    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) start_row);
     dma_queue_flush(q);
 }
 
@@ -323,6 +329,9 @@ static void binary_job_vector_same_shape(unsigned int nth, unsigned int ith, voi
         spad_idx ^= 1;
     }
 
+    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) start_row);
+
     for (uint32_t ir = start_row; ir < end_row; ) {
         uint32_t current_block_size = calc_block_size(bctx, ir, end_row, ne01, ne02);
         uint8_t * d_spad  = (uint8_t *) dma_queue_pop(q).src;
@@ -366,6 +375,8 @@ static void binary_job_vector_same_shape(unsigned int nth, unsigned int ith, voi
         }
         ir += current_block_size;
     }
+
+    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) start_row);
     dma_queue_flush(q);
 }
 
@@ -415,6 +426,9 @@ static void binary_job_vector_row_broadcast(unsigned int nth, unsigned int ith, 
         spad_idx ^= 1;
     }
 
+    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) start_row);
+
     for (uint32_t ir = start_row; ir < end_row; ) {
         uint32_t current_block_size = calc_block_size(bctx, ir, end_row, ne01, ne02);
         uint8_t * d_spad  = (uint8_t *) dma_queue_pop(q).src;
@@ -446,6 +460,8 @@ static void binary_job_vector_row_broadcast(unsigned int nth, unsigned int ith, 
         }
         ir += current_block_size;
     }
+
+    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) start_row);
     dma_queue_flush(q);
 }
 
@@ -491,6 +507,9 @@ static void binary_job_vector_complex(unsigned int nth, unsigned int ith, void *
         spad_idx ^= 1;
     }
 
+    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) start_row);
+
     for (uint32_t ir = start_row; ir < end_row; ) {
         uint32_t current_block_size = calc_block_size(bctx, ir, end_row, ne01, ne02);
         uint8_t * d_spad = (uint8_t *) dma_queue_pop(q).src;
@@ -530,6 +549,8 @@ static void binary_job_vector_complex(unsigned int nth, unsigned int ith, void *
         }
         ir += current_block_size;
     }
+
+    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) start_row);
     dma_queue_flush(q);
 }
 
@@ -576,6 +597,9 @@ static void binary_job_element_repeat(unsigned int nth, unsigned int ith, void *
         spad_idx ^= 1;
     }
 
+    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) start_row);
+
     for (uint32_t ir = start_row; ir < end_row; ) {
         uint32_t current_block_size = calc_block_size(bctx, ir, end_row, ne01, ne02);
         uint8_t * d_spad = (uint8_t *) dma_queue_pop(q).src;
@@ -619,6 +643,8 @@ static void binary_job_element_repeat(unsigned int nth, unsigned int ith, void *
         }
         ir += current_block_size;
     }
+
+    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) start_row);
     dma_queue_flush(q);
 }
 
@@ -679,6 +705,9 @@ static void binary_job_add_id(unsigned int nth, unsigned int ith, void * data) {
         spad_idx ^= 1;
     }
 
+    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) start_row);
+
     for (uint32_t ir = start_row; ir < end_row; ) {
         uint32_t current_block_size = calc_block_size(bctx, ir, end_row, ne01, ne02);
         uint8_t * d_spad = (uint8_t *) dma_queue_pop(q).src;
@@ -716,6 +745,8 @@ static void binary_job_add_id(unsigned int nth, unsigned int ith, void * data) {
         }
         ir += current_block_size;
     }
+
+    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) start_row);
     dma_queue_flush(q);
 }
 
@@ -887,7 +918,7 @@ static int execute_op_binary(struct htp_ops_context * octx) {
         dma_queue_pop(q);
     }
 
-    worker_pool_run_func(octx->ctx->worker_pool, worker_func, &bctx, n_threads);
+    work_queue_run(octx->ctx->work_queue, worker_func, &bctx, n_threads);
 
     return HTP_STATUS_OK;
 }

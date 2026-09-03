@@ -18,6 +18,7 @@
 #define GGML_COMMON_DECL_C
 #include "ggml-common.h"
 
+#include "hex-common.h"
 #include "htp-ctx.h"
 #include "htp-ops.h"
 #include "htp-tensor.h"
@@ -199,14 +200,25 @@ int op_set_rows(struct htp_ops_context * octx) {
         return HTP_STATUS_OK;
     }
 
-    const uint32_t total_tasks = kparams->total_tasks;
+    const struct htp_tensor * dst = octx->dst;
+    const uint32_t total_tasks    = kparams->total_tasks;
+
     uint32_t mdev_task_start, mdev_tasks;
     if (octx->mdev_count > 1) {
-        const uint32_t rows_per_line = MAX(1, (uint32_t) 128 / octx->dst->nb[1]);
-        uint32_t tasks_per_mdev = fastdiv(total_tasks + octx->mdev_count - 1, &octx->mdev_count_div);
-        tasks_per_mdev = ((tasks_per_mdev + rows_per_line - 1) / rows_per_line) * rows_per_line;
-        mdev_task_start = MIN(octx->mdev_idx * tasks_per_mdev, total_tasks);
-        mdev_tasks      = MIN(tasks_per_mdev, total_tasks - mdev_task_start);
+        bool can_split = (dst->nb[1] & 127) == 0 && !htp_tensor_is_permuted(dst);
+        const uint32_t total_chunks = can_split ? total_tasks : 0;
+        if (total_chunks < octx->mdev_count) {
+            mdev_task_start = (octx->mdev_idx == 0) ? 0 : total_tasks;
+            mdev_tasks      = (octx->mdev_idx == 0) ? total_tasks : 0;
+        } else {
+            const uint32_t tasks_per_mdev = fastdiv(total_tasks + octx->mdev_count - 1, &octx->mdev_count_div);
+            mdev_task_start = MIN(octx->mdev_idx * tasks_per_mdev, total_tasks);
+            if (octx->mdev_idx == octx->mdev_count - 1) {
+                mdev_tasks = total_tasks - mdev_task_start;
+            } else {
+                mdev_tasks = MIN(tasks_per_mdev, total_tasks - mdev_task_start);
+            }
+        }
     } else {
         mdev_task_start = 0;
         mdev_tasks      = total_tasks;

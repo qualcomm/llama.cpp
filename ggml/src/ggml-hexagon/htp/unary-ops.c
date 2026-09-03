@@ -1150,12 +1150,39 @@ static int execute_op_unary(struct htp_ops_context * octx) {
     const struct htp_unary_kernel_params * kparams = (const struct htp_unary_kernel_params *) octx->kernel_params;
 
     const uint32_t src0_nrows = src0->ne[1] * src0->ne[2] * src0->ne[3];
+    const size_t elem_size = is_f16 ? sizeof(_Float16) : sizeof(float);
+    const size_t src0_data_row_size = src0->ne[0] * elem_size;
+    const size_t dst_data_row_size  = dst->ne[0]  * elem_size;
 
     uint32_t mdev_row_start, mdev_nrows;
     if (octx->mdev_count > 1) {
-        const uint32_t rows_per_mdev = fastdiv(src0_nrows + octx->mdev_count - 1, &octx->mdev_count_div);
-        mdev_row_start = MIN(octx->mdev_idx * rows_per_mdev, src0_nrows);
-        mdev_nrows     = MIN(rows_per_mdev, src0_nrows - mdev_row_start);
+        bool can_split = (dst->ne[0] == 1 || dst->nb[0] == elem_size) && !htp_tensor_is_permuted(dst);
+        uint32_t rows_per_chunk = 1;
+        if (can_split) {
+            if (dst->ne[1] > 1 && (dst->nb[1] & 127) == 0) {
+                rows_per_chunk = 1;
+            } else if (dst->nb[1] == dst_data_row_size &&
+                       (dst->ne[2] <= 1 || dst->nb[2] == dst->nb[1] * dst->ne[1]) &&
+                       (dst->ne[3] <= 1 || dst->nb[3] == dst->nb[2] * dst->ne[2])) {
+                rows_per_chunk = (dst_data_row_size > 0) ? (HEX_L2_LINE_SIZE / hex_gcd_u32(dst_data_row_size, HEX_L2_LINE_SIZE)) : 1;
+            } else {
+                can_split = false;
+            }
+        }
+
+        const uint32_t total_chunks = can_split ? (src0_nrows / rows_per_chunk) : 0;
+        if (total_chunks < octx->mdev_count) {
+            mdev_row_start = (octx->mdev_idx == 0) ? 0 : src0_nrows;
+            mdev_nrows     = (octx->mdev_idx == 0) ? src0_nrows : 0;
+        } else {
+            const uint32_t chunks_per_mdev = fastdiv(total_chunks + octx->mdev_count - 1, &octx->mdev_count_div);
+            mdev_row_start = MIN(octx->mdev_idx * chunks_per_mdev * rows_per_chunk, src0_nrows);
+            if (octx->mdev_idx == octx->mdev_count - 1) {
+                mdev_nrows = src0_nrows - mdev_row_start;
+            } else {
+                mdev_nrows = MIN(chunks_per_mdev * rows_per_chunk, src0_nrows - mdev_row_start);
+            }
+        }
     } else {
         mdev_row_start = 0;
         mdev_nrows     = src0_nrows;
@@ -1166,11 +1193,6 @@ static int execute_op_unary(struct htp_ops_context * octx) {
     }
 
     const uint32_t n_threads = octx->n_threads;
-
-    const size_t elem_size = is_f16 ? sizeof(_Float16) : sizeof(float);
-
-    const size_t src0_data_row_size = src0->ne[0] * elem_size;
-    const size_t dst_data_row_size  = dst->ne[0]  * elem_size;
 
     const size_t src0_row_size_aligned = kparams->src0_row_size_aligned;
     const size_t dst_row_size_aligned  = kparams->dst_row_size_aligned;
@@ -1306,7 +1328,7 @@ static int execute_op_unary(struct htp_ops_context * octx) {
         }
 
         if (task_func) {
-            worker_pool_run_func(octx->ctx->worker_pool, task_func, &uctx, n_threads);
+            work_queue_run(octx->ctx->work_queue, task_func, &uctx, n_threads);
         } else {
             FARF(ERROR, "execute_op_unary: task function is NULL for op %d\n", octx->op);
             err = HTP_STATUS_NO_SUPPORT;

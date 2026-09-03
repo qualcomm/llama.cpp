@@ -1,5 +1,8 @@
+#include "hex-common.h"
+#include "hex-profile.h"
 #include "htp-ctx.h"
 #include "htp-ops.h"
+#include "htp-tensor.h"
 #include "hexagon_types.h"
 #include "hexagon_protos.h"
 #include "hvx_hexagon_protos.h"
@@ -55,6 +58,9 @@ static void concat_2d_f32_transposed(unsigned int nth, unsigned int ith, void * 
     const uint32_t spad0_row_bytes = hex_round_up((src0_ne0 + src1_ne0_padded) * sizeof(float), VLEN);
     uint32_t mu = src1_ne0_padded * spad1_stride;
 
+    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) start_i);
+
     for (uint32_t i = start_i; i < end_i; i += block_i) {
         uint32_t current_block_i = (end_i - i < block_i) ? (end_i - i) : block_i;
 
@@ -87,6 +93,8 @@ static void concat_2d_f32_transposed(unsigned int nth, unsigned int ith, void * 
 
         dma_queue_pop(q);
     }
+
+    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) start_i);
 }
 
 static void concat_2d_f16_transposed(unsigned int nth, unsigned int ith, void * data) {
@@ -122,6 +130,9 @@ static void concat_2d_f16_transposed(unsigned int nth, unsigned int ith, void * 
     const uint32_t spad0_row_bytes = hex_round_up((src0_ne0 + src1_ne0_padded) * sizeof(__fp16), VLEN);
     uint32_t mu = src1_ne0_padded * spad1_stride;
 
+    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) start_i);
+
     for (uint32_t i = start_i; i < end_i; i += block_i) {
         uint32_t current_block_i = (end_i - i < block_i) ? (end_i - i) : block_i;
 
@@ -154,6 +165,8 @@ static void concat_2d_f16_transposed(unsigned int nth, unsigned int ith, void * 
 
         dma_queue_pop(q);
     }
+
+    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) start_i);
 }
 
 static void concat_generic(unsigned int nth, unsigned int ith, void * data) {
@@ -244,11 +257,36 @@ int op_concat(struct htp_ops_context * octx) {
 
     if (dim == 0 && is_2d && is_src1_transposed && !is_src0_transposed) {
         const uint32_t total_rows = dst->ne[1];
+        const size_t dst_data_row_size = dst->ne[0] * type_size;
         uint32_t mdev_row_start, mdev_nrows;
         if (octx->mdev_count > 1) {
-            const uint32_t rows_per_mdev = fastdiv(total_rows + octx->mdev_count - 1, &octx->mdev_count_div);
-            mdev_row_start = MIN(octx->mdev_idx * rows_per_mdev, total_rows);
-            mdev_nrows     = MIN(rows_per_mdev, total_rows - mdev_row_start);
+            bool can_split = (dst->ne[0] == 1 || dst->nb[0] == type_size) && !htp_tensor_is_permuted(dst);
+            uint32_t rows_per_chunk = 1;
+            if (can_split) {
+                if (dst->ne[1] > 1 && (dst->nb[1] & 127) == 0) {
+                    rows_per_chunk = 1;
+                } else if (dst->nb[1] == dst_data_row_size &&
+                           (dst->ne[2] <= 1 || dst->nb[2] == dst->nb[1] * dst->ne[1]) &&
+                           (dst->ne[3] <= 1 || dst->nb[3] == dst->nb[2] * dst->ne[2])) {
+                    rows_per_chunk = (dst_data_row_size > 0) ? (HEX_L2_LINE_SIZE / hex_gcd_u32(dst_data_row_size, HEX_L2_LINE_SIZE)) : 1;
+                } else {
+                    can_split = false;
+                }
+            }
+
+            const uint32_t total_chunks = can_split ? (total_rows / rows_per_chunk) : 0;
+            if (total_chunks < octx->mdev_count) {
+                mdev_row_start = (octx->mdev_idx == 0) ? 0 : total_rows;
+                mdev_nrows     = (octx->mdev_idx == 0) ? total_rows : 0;
+            } else {
+                const uint32_t chunks_per_mdev = fastdiv(total_chunks + octx->mdev_count - 1, &octx->mdev_count_div);
+                mdev_row_start = MIN(octx->mdev_idx * chunks_per_mdev * rows_per_chunk, total_rows);
+                if (octx->mdev_idx == octx->mdev_count - 1) {
+                    mdev_nrows = total_rows - mdev_row_start;
+                } else {
+                    mdev_nrows = MIN(chunks_per_mdev * rows_per_chunk, total_rows - mdev_row_start);
+                }
+            }
         } else {
             mdev_row_start = 0;
             mdev_nrows     = total_rows;
@@ -295,11 +333,21 @@ int op_concat(struct htp_ops_context * octx) {
         const uint32_t total_elements = dst->ne[0] * dst->ne[1] * dst->ne[2] * dst->ne[3];
         uint32_t mdev_elem_start, mdev_nelems;
         if (octx->mdev_count > 1) {
-            const uint32_t elems_per_line = MAX(1u, (uint32_t) HEX_L2_LINE_SIZE / type_size);
-            uint32_t elems_per_mdev = fastdiv(total_elements + octx->mdev_count - 1, &octx->mdev_count_div);
-            elems_per_mdev = ((elems_per_mdev + elems_per_line - 1) / elems_per_line) * elems_per_line;
-            mdev_elem_start = MIN(octx->mdev_idx * elems_per_mdev, total_elements);
-            mdev_nelems     = MIN(elems_per_mdev, total_elements - mdev_elem_start);
+            const uint32_t elems_per_chunk = HEX_L2_LINE_SIZE / type_size;
+            bool can_split = htp_tensor_is_contiguous(dst, type_size) && !htp_tensor_is_permuted(dst);
+            const uint32_t total_chunks = can_split ? (total_elements / elems_per_chunk) : 0;
+            if (total_chunks < octx->mdev_count) {
+                mdev_elem_start = (octx->mdev_idx == 0) ? 0 : total_elements;
+                mdev_nelems     = (octx->mdev_idx == 0) ? total_elements : 0;
+            } else {
+                const uint32_t chunks_per_mdev = fastdiv(total_chunks + octx->mdev_count - 1, &octx->mdev_count_div);
+                mdev_elem_start = MIN(octx->mdev_idx * chunks_per_mdev * elems_per_chunk, total_elements);
+                if (octx->mdev_idx == octx->mdev_count - 1) {
+                    mdev_nelems = total_elements - mdev_elem_start;
+                } else {
+                    mdev_nelems = MIN(chunks_per_mdev * elems_per_chunk, total_elements - mdev_elem_start);
+                }
+            }
         } else {
             mdev_elem_start = 0;
             mdev_nelems     = total_elements;
@@ -313,6 +361,6 @@ int op_concat(struct htp_ops_context * octx) {
         cctx.mdev_nelems     = mdev_nelems;
     }
 
-    worker_pool_run_func(octx->ctx->worker_pool, worker_func, &cctx, n_threads);
+    work_queue_run(octx->ctx->work_queue, worker_func, &cctx, n_threads);
     return HTP_STATUS_OK;
 }

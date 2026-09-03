@@ -5,8 +5,11 @@
 
 #define GGML_COMMON_DECL_C
 #include "ggml-common.h"
+#include "hex-common.h"
+#include "hex-profile.h"
 #include "htp-ctx.h"
 #include "htp-ops.h"
+#include "htp-tensor.h"
 #include "hvx-types.h"
 #include "hex-utils.h"
 #include "hvx-copy.h"
@@ -58,9 +61,6 @@ static void diag_thread_f32_dma(unsigned int nth, unsigned int ith, void * data)
     htp_diag_preamble;
     dma_queue * dma_queue = octx->ctx->dma[ith];
 
-    uint64_t t1, t2;
-    t1 = HAP_perf_get_qtimer_count();
-
     const uint32_t ib0 = dctx->mdev_batch_start + dctx->batches_per_thread * ith;
     const uint32_t ib1 = MIN(ib0 + dctx->batches_per_thread, dctx->mdev_batch_start + dctx->total_batches);
 
@@ -79,6 +79,9 @@ static void diag_thread_f32_dma(unsigned int nth, unsigned int ith, void * data)
     // 1 src buffer + 1 dst row buffer per thread in VTCM
     uint8_t * src_spad = octx->src0_spad.data + (ith * src_batch_size_aligned);
     uint8_t * dst_spad = octx->dst_spad.data  + (ith * dst_row_size_aligned);
+
+    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) ib0);
 
     for (uint32_t ib = ib0; ib < ib1; ib++) {
         const uint32_t i3 = ib / ne02;
@@ -108,12 +111,11 @@ static void diag_thread_f32_dma(unsigned int nth, unsigned int ith, void * data)
         }
     }
 
-    t2 = HAP_perf_get_qtimer_count();
+    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) ib0);
 
-    FARF(HIGH, "diag-f32-dma %d/%d: %ux%ux%ux%u (%u:%u) -> %ux%ux%ux%u usec %u\n",
+    FARF(HIGH, "diag-f32-dma %d/%d: %ux%ux%ux%u (%u:%u) -> %ux%ux%ux%u\n",
          ith, nth, src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3], ib0, ib1,
-         dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],
-         (unsigned) HAP_perf_qtimer_count_to_us(t2 - t1));
+         dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3]);
 }
 
 // ---------------------------------------------------------------------------
@@ -123,14 +125,14 @@ static void diag_thread_f32_dma(unsigned int nth, unsigned int ith, void * data)
 static void diag_thread_f32(unsigned int nth, unsigned int ith, void * data) {
     htp_diag_preamble;
 
-    uint64_t t1, t2;
-    t1 = HAP_perf_get_qtimer_count();
-
     const uint8_t * src_data = (const uint8_t *) src0->data;
     uint8_t *       dst_data = (uint8_t *) dst->data;
 
     const uint32_t ib0 = dctx->mdev_batch_start + dctx->batches_per_thread * ith;
     const uint32_t ib1 = MIN(ib0 + dctx->batches_per_thread, dctx->mdev_batch_start + dctx->total_batches);
+
+    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) ib0);
 
     for (uint32_t ib = ib0; ib < ib1; ib++) {
         const uint32_t i3 = ib / ne02;
@@ -144,12 +146,11 @@ static void diag_thread_f32(unsigned int nth, unsigned int ith, void * data) {
         }
     }
 
-    t2 = HAP_perf_get_qtimer_count();
+    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) ib0);
 
-    FARF(HIGH, "diag-f32 %d/%d: %ux%ux%ux%u (%u:%u) -> %ux%ux%ux%u usec %u\n",
+    FARF(HIGH, "diag-f32 %d/%d: %ux%ux%ux%u (%u:%u) -> %ux%ux%ux%u\n",
          ith, nth, src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3], ib0, ib1,
-         dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],
-         (unsigned) HAP_perf_qtimer_count_to_us(t2 - t1));
+         dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3]);
 }
 
 int op_diag_f32(struct htp_ops_context * octx) {
@@ -161,12 +162,36 @@ int op_diag_f32(struct htp_ops_context * octx) {
     }
 
     const uint32_t total_batches = src0->ne[2] * src0->ne[3];
+    const size_t dst_batch_size  = dst->ne[1] * dst->nb[1];
 
     uint32_t mdev_batch_start, mdev_nbatches;
     if (octx->mdev_count > 1) {
-        const uint32_t batches_per_mdev = fastdiv(total_batches + octx->mdev_count - 1, &octx->mdev_count_div);
-        mdev_batch_start = MIN(octx->mdev_idx * batches_per_mdev, total_batches);
-        mdev_nbatches    = MIN(batches_per_mdev, total_batches - mdev_batch_start);
+        bool can_split = (dst->ne[0] == 1 || dst->nb[0] == sizeof(float)) && !htp_tensor_is_permuted(dst);
+        uint32_t batches_per_chunk = 1;
+        if (can_split) {
+            if (dst->ne[2] > 1 && (dst->nb[2] & 127) == 0) {
+                batches_per_chunk = 1;
+            } else if (dst->nb[2] == dst_batch_size &&
+                       (dst->ne[3] <= 1 || dst->nb[3] == dst->nb[2] * dst->ne[2])) {
+                batches_per_chunk = (dst_batch_size > 0) ? (HEX_L2_LINE_SIZE / hex_gcd_u32(dst_batch_size, HEX_L2_LINE_SIZE)) : 1;
+            } else {
+                can_split = false;
+            }
+        }
+
+        const uint32_t total_chunks = can_split ? (total_batches / batches_per_chunk) : 0;
+        if (total_chunks < octx->mdev_count) {
+            mdev_batch_start = (octx->mdev_idx == 0) ? 0 : total_batches;
+            mdev_nbatches    = (octx->mdev_idx == 0) ? total_batches : 0;
+        } else {
+            const uint32_t chunks_per_mdev = fastdiv(total_chunks + octx->mdev_count - 1, &octx->mdev_count_div);
+            mdev_batch_start = MIN(octx->mdev_idx * chunks_per_mdev * batches_per_chunk, total_batches);
+            if (octx->mdev_idx == octx->mdev_count - 1) {
+                mdev_nbatches = total_batches - mdev_batch_start;
+            } else {
+                mdev_nbatches = MIN(chunks_per_mdev * batches_per_chunk, total_batches - mdev_batch_start);
+            }
+        }
     } else {
         mdev_batch_start = 0;
         mdev_nbatches    = total_batches;
@@ -207,9 +232,9 @@ int op_diag_f32(struct htp_ops_context * octx) {
     };
 
     if (octx->ctx->vtcm_size < spad_per_thread * n_threads) {
-        worker_pool_run_func(octx->ctx->worker_pool, diag_thread_f32, &dctx, n_threads);
+        work_queue_run(octx->ctx->work_queue, diag_thread_f32, &dctx, n_threads);
     } else {
-        worker_pool_run_func(octx->ctx->worker_pool, diag_thread_f32_dma, &dctx, n_threads);
+        work_queue_run(octx->ctx->work_queue, diag_thread_f32_dma, &dctx, n_threads);
     }
 
     return HTP_STATUS_OK;

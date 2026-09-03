@@ -13,9 +13,11 @@
 
 #define GGML_COMMON_DECL_C
 #include "ggml-common.h"
+#include "hex-common.h"
+#include "hex-profile.h"
 #include "htp-ctx.h"
 #include "htp-ops.h"
-#include "htp-ops.h"
+#include "htp-tensor.h"
 
 #define sum_rows_preamble                         \
     const struct htp_tensor *src0 = octx->src[0]; \
@@ -42,6 +44,7 @@
     const uint32_t  nb3 = dst->nb[3];      \
 
 struct sum_rows_context {
+    struct htp_ops_context * octx;
     const uint8_t * src_data;
     uint8_t       * dst_data;
     uint32_t        ne00;
@@ -76,6 +79,9 @@ static void sum_rows_thread_f32(unsigned int nth, unsigned int ith, void *data) 
     // Calculate actual number of rows for this thread
     const uint32_t n_rows = end_row - start_row;
 
+    struct htp_thread_trace * tr = &smctx->octx->ctx->trace[ith];
+    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) start_row);
+
     for (uint32_t ir = 0; ir < n_rows; ir++) {
         const float * restrict src_local = src_th + (ir * (src_stride / sizeof(float)));
 
@@ -89,6 +95,8 @@ static void sum_rows_thread_f32(unsigned int nth, unsigned int ith, void *data) 
             dst_th[ir] = hvx_reduce_sum_f32((const uint8_t *) src_local, ne00);
         }
     }
+
+    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) start_row);
 }
 
 int op_sum_rows(struct htp_ops_context * octx) {
@@ -102,21 +110,38 @@ int op_sum_rows(struct htp_ops_context * octx) {
         return HTP_STATUS_OK;
     }
 
-    const uint32_t src0_nrows = ne01 * ne02 * ne03;
+    const uint32_t src0_nrows      = ne01 * ne02 * ne03;
+    const size_t dst_data_row_size = dst->ne[0] * sizeof(float);
 
     uint32_t mdev_row_start, mdev_nrows;
     if (octx->mdev_count > 1) {
-        /*
-            This op may write to a very small number of rows. If multiple devices split
-            up the rows, they may race to write to the same cache line, leading to
-            incorrect output. So, this op needs a minimum check before it gets split for
-            multi-device uses.
-        */
-        const uint32_t rows_per_line = MAX(1, (uint32_t) HEX_L2_LINE_SIZE / nb1);
-        uint32_t rows_per_mdev = fastdiv(src0_nrows + octx->mdev_count - 1, &octx->mdev_count_div);
-        rows_per_mdev = ((rows_per_mdev + rows_per_line - 1) / rows_per_line) * rows_per_line;
-        mdev_row_start = MIN(octx->mdev_idx * rows_per_mdev, src0_nrows);
-        mdev_nrows     = MIN(rows_per_mdev, src0_nrows - mdev_row_start);
+        bool can_split = (dst->ne[0] == 1 || dst->nb[0] == sizeof(float)) && !htp_tensor_is_permuted(dst);
+        uint32_t rows_per_chunk = 1;
+        if (can_split) {
+            if (dst->ne[1] > 1 && (dst->nb[1] & 127) == 0) {
+                rows_per_chunk = 1;
+            } else if (dst->nb[1] == dst_data_row_size &&
+                       (dst->ne[2] <= 1 || dst->nb[2] == dst->nb[1] * dst->ne[1]) &&
+                       (dst->ne[3] <= 1 || dst->nb[3] == dst->nb[2] * dst->ne[2])) {
+                rows_per_chunk = (dst_data_row_size > 0) ? (HEX_L2_LINE_SIZE / hex_gcd_u32(dst_data_row_size, HEX_L2_LINE_SIZE)) : 1;
+            } else {
+                can_split = false;
+            }
+        }
+
+        const uint32_t total_chunks = can_split ? (src0_nrows / rows_per_chunk) : 0;
+        if (total_chunks < octx->mdev_count) {
+            mdev_row_start = (octx->mdev_idx == 0) ? 0 : src0_nrows;
+            mdev_nrows     = (octx->mdev_idx == 0) ? src0_nrows : 0;
+        } else {
+            const uint32_t chunks_per_mdev = fastdiv(total_chunks + octx->mdev_count - 1, &octx->mdev_count_div);
+            mdev_row_start = MIN(octx->mdev_idx * chunks_per_mdev * rows_per_chunk, src0_nrows);
+            if (octx->mdev_idx == octx->mdev_count - 1) {
+                mdev_nrows = src0_nrows - mdev_row_start;
+            } else {
+                mdev_nrows = MIN(chunks_per_mdev * rows_per_chunk, src0_nrows - mdev_row_start);
+            }
+        }
     } else {
         mdev_row_start = 0;
         mdev_nrows     = src0_nrows;
@@ -135,6 +160,7 @@ int op_sum_rows(struct htp_ops_context * octx) {
     }
 
     struct sum_rows_context smctx = {
+        .octx            = octx,
         .src_data        = (const uint8_t *) src0->data + mdev_row_start * nb01,
         .dst_data        = (uint8_t *) dst->data + mdev_row_start * nb1,
         .ne00            = ne00,
@@ -145,7 +171,7 @@ int op_sum_rows(struct htp_ops_context * octx) {
         .opt_path        = opt_path,
     };
 
-    worker_pool_run_func(octx->ctx->worker_pool, sum_rows_thread_f32, &smctx, n_threads);
+    work_queue_run(octx->ctx->work_queue, sum_rows_thread_f32, &smctx, n_threads);
 
     return HTP_STATUS_OK;
 }

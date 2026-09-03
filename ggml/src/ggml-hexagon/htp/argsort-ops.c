@@ -554,7 +554,7 @@ int op_argsort(struct htp_ops_context * octx) {
     }
 
     // Run jobs
-    worker_pool_run_func(octx->ctx->worker_pool, job_func, &actx, n_threads);
+    work_queue_run(octx->ctx->work_queue, job_func, &actx, n_threads);
 
     return HTP_STATUS_OK;
 }
