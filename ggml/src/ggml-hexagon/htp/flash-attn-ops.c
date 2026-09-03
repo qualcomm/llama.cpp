@@ -5,7 +5,6 @@
 #include <assert.h>
 #include <HAP_compute_res.h>
 #include <HAP_farf.h>
-#include <HAP_perf.h>
 #include <math.h>
 #include <stdbool.h>
 #include <stdatomic.h>
@@ -90,8 +89,6 @@ struct htp_fa_context {
 
     const struct htp_tensor * k;
     const struct htp_tensor * v;
-
-    uint64_t t_start;
 };
 
 struct hmx_fa_context {
@@ -2426,8 +2423,6 @@ int op_flash_attn_ext(struct htp_ops_context * octx) {
     factx.k = k;
     factx.v = v;
 
-    factx.t_start = HAP_perf_get_qtimer_count();
-
     factx.src0_div21 = kparams->u.hvx.src0_div21;
     factx.src0_div1  = kparams->u.hvx.src0_div1;
 
@@ -2477,9 +2472,19 @@ int op_flash_attn_ext(struct htp_ops_context * octx) {
 
     uint32_t mdev_qrow_start, mdev_qrows;
     if (octx->mdev_count > 1) {
-        const uint32_t rows_per_mdev = fastdiv(total_qrows + octx->mdev_count - 1, &octx->mdev_count_div);
-        mdev_qrow_start = MIN(octx->mdev_idx * rows_per_mdev, total_qrows);
-        mdev_qrows      = MIN(rows_per_mdev, total_qrows - mdev_qrow_start);
+        const bool can_split = ((dst->nb[1] & 127) == 0) && (total_qrows >= octx->mdev_count);
+        if (!can_split) {
+            mdev_qrow_start = (octx->mdev_idx == 0) ? 0 : total_qrows;
+            mdev_qrows      = (octx->mdev_idx == 0) ? total_qrows : 0;
+        } else {
+            const uint32_t rows_per_mdev = fastdiv(total_qrows + octx->mdev_count - 1, &octx->mdev_count_div);
+            mdev_qrow_start = MIN(octx->mdev_idx * rows_per_mdev, total_qrows);
+            if (octx->mdev_idx == octx->mdev_count - 1) {
+                mdev_qrows = total_qrows - mdev_qrow_start;
+            } else {
+                mdev_qrows = MIN(rows_per_mdev, total_qrows - mdev_qrow_start);
+            }
+        }
     } else {
         mdev_qrow_start = 0;
         mdev_qrows      = total_qrows;
