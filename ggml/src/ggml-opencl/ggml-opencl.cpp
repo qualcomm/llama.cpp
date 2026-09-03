@@ -1495,6 +1495,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemv_f32_f32_mc;  // multi-column (small-N) f32 GEMV for spec/MTP verify
     cl_kernel kernel_mul_mm_f16_f32_l4_lm;
     cl_kernel kernel_mul_mm_f16_f32_l4_lm_n8 = nullptr;  // narrow-N variant, ne11 <= 8
+    cl_kernel kernel_mul_mm_f16_f32_l4_lm_splitk_reduce = nullptr;
     cl_kernel kernel_mul_mm_q1_0_f32_l4_lm;
     cl_kernel kernel_mul_mm_q4_0_f32_l4_lm;
     cl_kernel kernel_mul_mm_q4_1_f32_l4_lm;
@@ -4223,6 +4224,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
 
         CL_CHECK((backend_ctx->kernel_mul_mm_f16_f32_l4_lm = clCreateKernel(backend_ctx->program_mul_mm_f16_f32_l4_lm, "kernel_mul_mm_f16_f32_l4_lm", &err), err));
+        CL_CHECK((backend_ctx->kernel_mul_mm_f16_f32_l4_lm_splitk_reduce = clCreateKernel(backend_ctx->program_mul_mm_f16_f32_l4_lm, "kernel_mul_mm_f16_f32_l4_lm_splitk_reduce", &err), err));
 
         // Second instance of the SAME source with a narrow N tile, for skinny-N
         // matmuls -- specifically the KQ/KQV of a speculative / MTP verify batch,
@@ -33211,12 +33213,53 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     offset1_cont = 0;
                 }
 
+                // 64 is block tile size BM and BN - change here when BM and BN in the kernel are changed.
+                // The narrow-N instance is compiled with BN=8, so its N grid must be
+                // tiled by 8 to match -- tiling by 64 would compute only the first 8
+                // columns and silently drop the rest.
+                const int bn_f16 = use_narrow_n ? 8 : 64;
+                const size_t n_wg_mm = (size_t)CEIL_DIV(ne01, 64) * (size_t)CEIL_DIV(ne11_mm, bn_f16) * (size_t)ne12_mm*ne13;
+
+                // Split-K. The folded KQV of a verify batch is M = head dim (256),
+                // N = width * gqa, K = context: 4 row tiles per KV head, 16 workgroups
+                // on the whole GPU, each walking the full context 16 K at a time. Cut
+                // K into slices dispatched as extra batches, each writing a partial
+                // sum, and fold the partials in a second pass; the slice count is
+                // chosen to reach a target workgroup count and the slice length is
+                // kept a multiple of the kernel's K step. Only worth it when the grid
+                // is small and K is long. GGML_OPENCL_MM_SPLITK_WGS sets the target
+                // (0 disables).
+                static const char * mm_splitk_env = getenv("GGML_OPENCL_MM_SPLITK_WGS");
+                const int mm_splitk_wgs = mm_splitk_env ? atoi(mm_splitk_env) : 64;
+                int nsplit = 1;
+                int kslice = ne00;
+                if (mm_splitk_wgs > 0 && n_wg_mm < (size_t)mm_splitk_wgs && ne00 >= 512 &&
+                    ggml_is_contiguous(dst) && ggml_nelements(dst) % 4 == 0 && offsetd % 16 == 0 &&
+                    backend_ctx->kernel_mul_mm_f16_f32_l4_lm_splitk_reduce != nullptr) {
+                    int want = (int)CEIL_DIV((size_t)mm_splitk_wgs, n_wg_mm);
+                    if (want > ne00 / 256) { want = ne00 / 256; }
+                    if (want > 1) {
+                        kslice = CEIL_DIV(CEIL_DIV(ne00, want), 16) * 16;
+                        nsplit = CEIL_DIV(ne00, kslice);
+                    }
+                }
+                const bool use_splitk = nsplit > 1;
+
+                cl_mem   mem_dst    = extrad->data_device;
+                cl_ulong offsetd_mm = offsetd;
+                if (use_splitk) {
+                    backend_ctx->prealloc_splitk_partial.allocate(backend_ctx->context,
+                        (size_t)nsplit * ggml_nbytes(dst));
+                    mem_dst    = backend_ctx->prealloc_splitk_partial.buffer;
+                    offsetd_mm = 0;
+                }
+
                 CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &mem_src0));
                 CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_ulong), &offset0_cont));
                 CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),   &mem_src1));
                 CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_ulong), &offset1_cont));
-                CL_CHECK(clSetKernelArg(kernel,  4, sizeof(cl_mem),   &extrad->data_device));
-                CL_CHECK(clSetKernelArg(kernel,  5, sizeof(cl_ulong), &offsetd));
+                CL_CHECK(clSetKernelArg(kernel,  4, sizeof(cl_mem),   &mem_dst));
+                CL_CHECK(clSetKernelArg(kernel,  5, sizeof(cl_ulong), &offsetd_mm));
                 CL_CHECK(clSetKernelArg(kernel,  6, sizeof(int),      &ne00));
                 CL_CHECK(clSetKernelArg(kernel,  7, sizeof(int),      &ne01));
                 CL_CHECK(clSetKernelArg(kernel,  8, sizeof(int),      &ne02));
@@ -33230,16 +33273,26 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 CL_CHECK(clSetKernelArg(kernel, 16, sizeof(int),      &batch_stride_d));
                 CL_CHECK(clSetKernelArg(kernel, 17, sizeof(int),      &r2_mm));
                 CL_CHECK(clSetKernelArg(kernel, 18, sizeof(int),      &r3));
+                CL_CHECK(clSetKernelArg(kernel, 19, sizeof(int),      &nsplit));
+                CL_CHECK(clSetKernelArg(kernel, 20, sizeof(int),      &kslice));
 
-                // 64 is block tile size BM and BN - change here when BM and BN in the kernel are changed.
-                // The narrow-N instance is compiled with BN=8, so its N grid must be
-                // tiled by 8 to match -- tiling by 64 would compute only the first 8
-                // columns and silently drop the rest.
-                const int bn_f16 = use_narrow_n ? 8 : 64;
-                size_t global_work_size[] = {(size_t)(CEIL_DIV(ne01, 64)*nth0), (size_t)(CEIL_DIV(ne11_mm, bn_f16)), (size_t)ne12_mm*ne13};
+                size_t global_work_size[] = {(size_t)(CEIL_DIV(ne01, 64)*nth0), (size_t)(CEIL_DIV(ne11_mm, bn_f16)), (size_t)ne12_mm*ne13*nsplit};
                 size_t local_work_size[] = {(size_t)nth0, 1, 1};
 
                 backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+
+                if (use_splitk) {
+                    cl_kernel rk = backend_ctx->kernel_mul_mm_f16_f32_l4_lm_splitk_reduce;
+                    const int tot4 = (int)(ggml_nelements(dst) / 4);
+                    CL_CHECK(clSetKernelArg(rk, 0, sizeof(cl_mem),   &backend_ctx->prealloc_splitk_partial.buffer));
+                    CL_CHECK(clSetKernelArg(rk, 1, sizeof(cl_mem),   &extrad->data_device));
+                    CL_CHECK(clSetKernelArg(rk, 2, sizeof(cl_ulong), &offsetd));
+                    CL_CHECK(clSetKernelArg(rk, 3, sizeof(int),      &tot4));
+                    CL_CHECK(clSetKernelArg(rk, 4, sizeof(int),      &nsplit));
+                    size_t r_global[] = {(size_t)CEIL_DIV(tot4, 64) * 64};
+                    size_t r_local[]  = {64};
+                    backend_ctx->enqueue_ndrange_kernel(rk, 1, r_global, r_local, dst);
+                }
                 return;
             }
             case GGML_TYPE_Q1_0: {

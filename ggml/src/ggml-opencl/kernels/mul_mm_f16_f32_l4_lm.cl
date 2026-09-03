@@ -62,7 +62,15 @@ kernel void KERNEL_NAME_LM(
     int batch_stride_d,
 
     int r2,
-    int r3
+    int r3,
+
+    // Split-K: the grid's third dimension is nsplit copies of the batch
+    // range, copy ks owning the K range [ks*kslice, min((ks+1)*kslice, ne00)),
+    // and dst is then a partial-sum scratch laid out [nsplit][batches][...]
+    // that kernel_mul_mm_f16_f32_l4_lm_splitk_reduce folds. nsplit = 1 with
+    // kslice = ne00 is the plain matmul. kslice must be a multiple of BK.
+    int nsplit,
+    int kslice
 ) {
     src0 = (global half4*)((global char*)src0 + offset0);
     src1 = (global float4*)((global char*)src1 + offset1);
@@ -71,7 +79,12 @@ kernel void KERNEL_NAME_LM(
     local half  buf_a[BM * BK];
     local float buf_b[BN * BK];
 
-    const int batch_idx = get_global_id(2);
+    const int nbatch    = get_global_size(2) / nsplit;
+    const int ks        = get_global_id(2) / nbatch;
+    const int batch_idx = get_global_id(2) - ks * nbatch;
+
+    const int k_begin = ks * kslice;
+    const int k_end   = min(k_begin + kslice, ne00);
 
     const int i13 = batch_idx / ne12;
     const int i12 = batch_idx % ne12;
@@ -96,8 +109,8 @@ kernel void KERNEL_NAME_LM(
     const int loadstride_a = get_local_size(0) * LOAD_VEC_A / BK;
     const int loadstride_b = get_local_size(0) * LOAD_VEC_B / BK;
 
-    int pos_a = (batch_idx_a * batch_stride_a + ir * BM * stride_a) / LOAD_VEC_A;
-    int pos_b = (batch_idx   * batch_stride_b + ic * BN * stride_b) / LOAD_VEC_B;
+    int pos_a = (batch_idx_a * batch_stride_a + ir * BM * stride_a) / LOAD_VEC_A + k_begin / LOAD_VEC_A;
+    int pos_b = (batch_idx   * batch_stride_b + ic * BN * stride_b) / LOAD_VEC_B + k_begin / LOAD_VEC_B;
 
     float sums[TM * TN];
     half  cache_a[TM];
@@ -107,7 +120,7 @@ kernel void KERNEL_NAME_LM(
         sums[i] = 0.0f;
     }
 
-    for (int block = 0; block < ne00; block += BK) {
+    for (int block = k_begin; block < k_end; block += BK) {
         for (int l = 0; l < BM; l += loadstride_a) {
             if (ir*BM + loadc_a + l < ne01) {
                 const int idx = pos_a + (loadc_a + l) * stride_a / LOAD_VEC_A + loadr_a;
@@ -170,7 +183,7 @@ kernel void KERNEL_NAME_LM(
     const int dr = ir * BM + th_r * TM;
     const int dc = ic * BN + th_c * TN;
 
-    const int offsets = batch_idx * batch_stride_d;
+    const int offsets = (ks * nbatch + batch_idx) * batch_stride_d;
 
     for (int cc = 0; cc < TN; cc++) {
         for (int cr = 0; cr < TM; cr++) {
@@ -179,4 +192,27 @@ kernel void KERNEL_NAME_LM(
             }
         }
     }
+}
+
+// Folds the [nsplit][tot] partial sums of a split-K dispatch into dst.
+// tot4 = tot / 4; the host guarantees tot % 4 == 0 and a float4-aligned dst.
+kernel void kernel_mul_mm_f16_f32_l4_lm_splitk_reduce(
+    global const float4 * partial,
+    global float4 * dst,
+    ulong offsetd,
+    int tot4,
+    int nsplit
+) {
+    dst = (global float4*)((global char*)dst + offsetd);
+
+    const int idx = get_global_id(0);
+    if (idx >= tot4) {
+        return;
+    }
+
+    float4 sum = partial[idx];
+    for (int s = 1; s < nsplit; s++) {
+        sum += partial[s * tot4 + idx];
+    }
+    dst[idx] = sum;
 }
