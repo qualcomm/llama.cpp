@@ -3,7 +3,6 @@
 #pragma clang diagnostic ignored "-Wunused-but-set-variable"
 
 #include <HAP_farf.h>
-#include <HAP_perf.h>
 
 #include <math.h>
 #include <string.h>
@@ -587,7 +586,7 @@ static int execute_op_activations_f32(struct htp_ops_context * octx) {
     actx.data_src1 = data_src1;
     actx.data_dst  = (uint8_t *) dst->data;
 
-    worker_pool_run_func(octx->ctx->worker_pool, act_op_func, &actx, n_threads);
+    work_queue_run(octx->ctx->work_queue, act_op_func, &actx, n_threads);
     return HTP_STATUS_OK;
 }
 

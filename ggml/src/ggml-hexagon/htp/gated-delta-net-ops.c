@@ -4,6 +4,8 @@
 
 #include "hvx-utils.h"
 #include "hex-fastdiv.h"
+#include "hex-common.h"
+#include "hex-profile.h"
 
 #define GGML_COMMON_DECL_C
 #include "ggml-common.h"
@@ -649,6 +651,9 @@ static void gated_delta_net_f32_pp_thread(unsigned int nth, unsigned int ith, vo
         spad_idx ^= 1;
     }
 
+    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) (gctx->mdev_row_start + ith));
+
     int curr_spad_idx = 0;
     for (uint32_t ir = gctx->mdev_row_start + ith; ir < row_end; ir += nth) {
         dma_queue_pop(dma);
@@ -831,6 +836,7 @@ static void gated_delta_net_f32_pp_thread(unsigned int nth, unsigned int ith, vo
         curr_spad_idx ^= 1;
     }
     dma_queue_flush(dma);
+    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) row_end);
 }
 
 
@@ -909,6 +915,9 @@ static void gated_delta_net_f32_tg_thread(unsigned int nth, unsigned int ith, vo
         ir_prefetch += nth;
         spad_idx ^= 1;
     }
+
+    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) (gctx->mdev_row_start + ith));
 
     int curr_spad_idx = 0;
     for (uint32_t ir = gctx->mdev_row_start + ith; ir < row_end; ir += nth) {
@@ -1077,6 +1086,7 @@ static void gated_delta_net_f32_tg_thread(unsigned int nth, unsigned int ith, vo
         curr_spad_idx ^= 1;
     }
     dma_queue_flush(dma);
+    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) row_end);
 }
 
 
@@ -1132,9 +1142,23 @@ int op_gated_delta_net(struct htp_ops_context * octx) {
 
     uint32_t mdev_row_start, mdev_nrows;
     if (octx->mdev_count > 1) {
-        const uint32_t rows_per_mdev = fastdiv(total_rows + octx->mdev_count - 1, &octx->mdev_count_div);
-        mdev_row_start = MIN(octx->mdev_idx * rows_per_mdev, total_rows);
-        mdev_nrows     = MIN(rows_per_mdev, total_rows - mdev_row_start);
+        const uint32_t head_bytes = S_v * sizeof(float);
+        const uint32_t rows_per_chunk = (head_bytes > 0) ? (HEX_L2_LINE_SIZE / hex_gcd_u32(head_bytes, HEX_L2_LINE_SIZE)) : 1;
+        const uint32_t total_chunks = total_rows / rows_per_chunk;
+        const bool can_split = total_chunks >= octx->mdev_count;
+
+        if (!can_split) {
+            mdev_row_start = (octx->mdev_idx == 0) ? 0 : total_rows;
+            mdev_nrows     = (octx->mdev_idx == 0) ? total_rows : 0;
+        } else {
+            const uint32_t chunks_per_mdev = fastdiv(total_chunks + octx->mdev_count - 1, &octx->mdev_count_div);
+            mdev_row_start = MIN(octx->mdev_idx * chunks_per_mdev * rows_per_chunk, total_rows);
+            if (octx->mdev_idx == octx->mdev_count - 1) {
+                mdev_nrows = total_rows - mdev_row_start;
+            } else {
+                mdev_nrows = MIN(chunks_per_mdev * rows_per_chunk, total_rows - mdev_row_start);
+            }
+        }
     } else {
         mdev_row_start = 0;
         mdev_nrows     = total_rows;
@@ -1172,9 +1196,9 @@ int op_gated_delta_net(struct htp_ops_context * octx) {
          gctx.vtcm_per_thread * octx->n_threads, octx->n_threads);
 
     if (n_tokens == 1) {
-        worker_pool_run_func(octx->ctx->worker_pool, gated_delta_net_f32_tg_thread, &gctx, n_threads);
+        work_queue_run(octx->ctx->work_queue, gated_delta_net_f32_tg_thread, &gctx, n_threads);
     } else {
-        worker_pool_run_func(octx->ctx->worker_pool, gated_delta_net_f32_pp_thread, &gctx, n_threads);
+        work_queue_run(octx->ctx->work_queue, gated_delta_net_f32_pp_thread, &gctx, n_threads);
     }
 
     return HTP_STATUS_OK;

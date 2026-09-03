@@ -3,9 +3,10 @@
 #pragma clang diagnostic ignored "-Wunused-but-set-variable"
 
 #include <HAP_farf.h>
-#include <HAP_perf.h>
-
 #include <string.h>
+
+#include "hex-common.h"
+#include "hex-profile.h"
 
 #include "hvx-copy.h"
 #include "hvx-utils.h"
@@ -55,7 +56,8 @@ static void fill_thread(unsigned int nth, unsigned int ith, void * data) {
         return;
     }
 
-    uint64_t t1 = HAP_perf_get_qtimer_count();
+    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) ir0);
 
     if (fctx->opt_path) {
         // Opt path: tensor is fully contiguous, treat as flat array
@@ -74,9 +76,8 @@ static void fill_thread(unsigned int nth, unsigned int ith, void * data) {
         }
     }
 
-    uint64_t t2 = HAP_perf_get_qtimer_count();
-    FARF(HIGH, "fill %u/%u: rows %u:%u usec %u\n",
-         ith, nth, ir0, ir1, (unsigned) HAP_perf_qtimer_count_to_us(t2 - t1));
+    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) ir1);
+    FARF(HIGH, "fill %u/%u: rows %u:%u\n", ith, nth, ir0, ir1);
 }
 
 int op_fill(struct htp_ops_context * octx) {
@@ -92,9 +93,23 @@ int op_fill(struct htp_ops_context * octx) {
 
     uint32_t mdev_row_start, mdev_nrows;
     if (octx->mdev_count > 1) {
-        const uint32_t rows_per_mdev = fastdiv(nr + octx->mdev_count - 1, &octx->mdev_count_div);
-        mdev_row_start = MIN(octx->mdev_idx * rows_per_mdev, nr);
-        mdev_nrows     = MIN(rows_per_mdev, nr - mdev_row_start);
+        const uint32_t row_size = nb1;
+        const uint32_t rows_per_chunk = (row_size > 0) ? (HEX_L2_LINE_SIZE / hex_gcd_u32(row_size, HEX_L2_LINE_SIZE)) : 1;
+        const uint32_t total_chunks = nr / rows_per_chunk;
+        const bool can_split = total_chunks >= octx->mdev_count;
+
+        if (!can_split) {
+            mdev_row_start = (octx->mdev_idx == 0) ? 0 : nr;
+            mdev_nrows     = (octx->mdev_idx == 0) ? nr : 0;
+        } else {
+            const uint32_t chunks_per_mdev = fastdiv(total_chunks + octx->mdev_count - 1, &octx->mdev_count_div);
+            mdev_row_start = MIN(octx->mdev_idx * chunks_per_mdev * rows_per_chunk, nr);
+            if (octx->mdev_idx == octx->mdev_count - 1) {
+                mdev_nrows = nr - mdev_row_start;
+            } else {
+                mdev_nrows = MIN(chunks_per_mdev * rows_per_chunk, nr - mdev_row_start);
+            }
+        }
     } else {
         mdev_row_start = 0;
         mdev_nrows     = nr;
@@ -137,7 +152,7 @@ int op_fill(struct htp_ops_context * octx) {
         return HTP_STATUS_NO_SUPPORT;
     }
 
-    worker_pool_run_func(octx->ctx->worker_pool, fill_thread, &fctx, n_threads);
+    work_queue_run(octx->ctx->work_queue, fill_thread, &fctx, n_threads);
 
     return HTP_STATUS_OK;
 }

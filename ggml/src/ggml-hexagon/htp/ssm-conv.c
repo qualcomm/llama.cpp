@@ -4,7 +4,6 @@
 
 #include <HAP_farf.h>
 #include <HAP_mem.h>
-#include <HAP_perf.h>
 #include <HAP_ps.h>
 #include <hexagon_protos.h>
 #include <hexagon_types.h>
@@ -16,7 +15,7 @@
 #include "ggml-common.h"
 #include "htp-ctx.h"
 #include "hex-dma.h"
-#include "htp-ops.h"
+#include "hex-profile.h"
 #include "htp-ops.h"
 #include "hvx-utils.h"
 
@@ -77,9 +76,6 @@ struct htp_ssm_conv_context {
 static void ssm_conv_thread_f32_f32(unsigned int nth, unsigned int ith, void *data) {
     htp_ssm_conv_preamble;
 
-    uint64_t t1, t2;
-    t1 = HAP_perf_get_qtimer_count();
-
     const uint32_t d_conv  = src1->ne[0];
     const uint32_t d_inner = src0->ne[1];
     const uint32_t n_t     = dst->ne[1];
@@ -105,6 +101,9 @@ static void ssm_conv_thread_f32_f32(unsigned int nth, unsigned int ith, void *da
         return;
     }
 
+    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) d_inner_start);
+
     for (uint32_t i3 = 0; i3 < n_s; ++i3) {
         for (uint32_t i2 = 0; i2 < n_t; ++i2) {
             for (uint32_t i1 = d_inner_start; i1 < d_inner_end; ++i1) {
@@ -123,12 +122,12 @@ static void ssm_conv_thread_f32_f32(unsigned int nth, unsigned int ith, void *da
         }
     }
 
-    t2 = HAP_perf_get_qtimer_count();
+    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) d_inner_end);
 
-    FARF(HIGH, "ssm-conv-f32 %d/%d: %ux%ux%ux%u (%u:%u) * %ux%ux%ux%u -> %ux%ux%ux%u usec %u\n",
+    FARF(HIGH, "ssm-conv-f32 %d/%d: %ux%ux%ux%u (%u:%u) * %ux%ux%ux%u -> %ux%ux%ux%u\n",
          ith, nth, src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3], d_inner_start, d_inner_end,
          src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3], dst->ne[0], dst->ne[1],
-         dst->ne[2], dst->ne[3], (unsigned) HAP_perf_qtimer_count_to_us(t2 - t1));
+         dst->ne[2], dst->ne[3]);
 }
 
 
@@ -259,9 +258,6 @@ static inline void transpose_src0_block(const float * src0_block,
 static void ssm_conv_thread_f32_f32_hvx(unsigned int nth, unsigned int ith, void *data) {
     htp_ssm_conv_preamble;
 
-    uint64_t t1, t2;
-    t1 = HAP_perf_get_qtimer_count();
-
     const uint32_t d_conv  = src1->ne[0];
     const uint32_t d_inner = src0->ne[1];
     const uint32_t n_t     = dst->ne[1];
@@ -281,6 +277,9 @@ static void ssm_conv_thread_f32_f32_hvx(unsigned int nth, unsigned int ith, void
     if (ir0 >= ir1) {
         return;
     }
+
+    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) ir0);
 
     const uint32_t d_inner_per_thread = ir1 - ir0;
     const uint32_t d_inner_stride     = scctx->nrows_per_thread;
@@ -335,12 +334,12 @@ static void ssm_conv_thread_f32_f32_hvx(unsigned int nth, unsigned int ith, void
         }
     }
 
-    t2 = HAP_perf_get_qtimer_count();
+    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) ir1);
 
-    FARF(HIGH, "ssm-conv-f32-hvx %d/%d: %ux%ux%ux%u (%u:%u) * %ux%ux%ux%u -> %ux%ux%ux%u usec %u\n",
+    FARF(HIGH, "ssm-conv-f32-hvx %d/%d: %ux%ux%ux%u (%u:%u) * %ux%ux%ux%u -> %ux%ux%ux%u\n",
          ith, nth, src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3], ir0, ir1,
          src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3], dst->ne[0], dst->ne[1],
-         dst->ne[2], dst->ne[3], (unsigned) HAP_perf_qtimer_count_to_us(t2 - t1));
+         dst->ne[2], dst->ne[3]);
 }
 
 int op_ssm_conv_f32(struct htp_ops_context * octx) {
@@ -363,9 +362,22 @@ int op_ssm_conv_f32(struct htp_ops_context * octx) {
 
     uint32_t mdev_row_start, mdev_nrows;
     if (octx->mdev_count > 1) {
-        const uint32_t rows_per_mdev = fastdiv(d_inner + octx->mdev_count - 1, &octx->mdev_count_div);
-        mdev_row_start = MIN(octx->mdev_idx * rows_per_mdev, d_inner);
-        mdev_nrows     = MIN(rows_per_mdev, d_inner - mdev_row_start);
+        const uint32_t elems_per_chunk = VLEN_FP32;
+        const uint32_t total_chunks = d_inner / elems_per_chunk;
+        const bool can_split = total_chunks >= octx->mdev_count;
+
+        if (!can_split) {
+            mdev_row_start = (octx->mdev_idx == 0) ? 0 : d_inner;
+            mdev_nrows     = (octx->mdev_idx == 0) ? d_inner : 0;
+        } else {
+            const uint32_t chunks_per_mdev = fastdiv(total_chunks + octx->mdev_count - 1, &octx->mdev_count_div);
+            mdev_row_start = MIN(octx->mdev_idx * chunks_per_mdev * elems_per_chunk, d_inner);
+            if (octx->mdev_idx == octx->mdev_count - 1) {
+                mdev_nrows = d_inner - mdev_row_start;
+            } else {
+                mdev_nrows = MIN(chunks_per_mdev * elems_per_chunk, d_inner - mdev_row_start);
+            }
+        }
     } else {
         mdev_row_start = 0;
         mdev_nrows     = d_inner;
@@ -430,9 +442,9 @@ int op_ssm_conv_f32(struct htp_ops_context * octx) {
          dst->ne[1], dst->ne[2], dst->ne[3], use_hvx);
 
     if (use_hvx) {
-        worker_pool_run_func(octx->ctx->worker_pool, ssm_conv_thread_f32_f32_hvx, &scctx, n_threads);
+        work_queue_run(octx->ctx->work_queue, ssm_conv_thread_f32_f32_hvx, &scctx, n_threads);
     } else {
-        worker_pool_run_func(octx->ctx->worker_pool, ssm_conv_thread_f32_f32, &scctx, n_threads);
+        work_queue_run(octx->ctx->work_queue, ssm_conv_thread_f32_f32, &scctx, n_threads);
     }
 
     return HTP_STATUS_OK;
