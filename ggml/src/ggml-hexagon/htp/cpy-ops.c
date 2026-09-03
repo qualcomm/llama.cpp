@@ -312,7 +312,9 @@ int op_cpy(struct htp_ops_context * octx) {
     }
 
     const bool sametype   = (src0->type == dst->type);
-    const bool transposed = (nb00 > nb01) || (nb0 > nb1);
+    const bool transposed = (nb00 > nb01) || (nb0 > nb1) ||
+                            (nb00 != ct.src0_type_size) || (nb0 != ct.dst_type_size) ||
+                            (nb01 < ne00 * ct.src0_type_size) || (nb1 < ne0 * ct.dst_type_size);
     const bool sameshape  = !transposed && (ne00 == ne0 && ne01 == ne1 && ne02 == ne2 && ne03 == ne3);
 
     ct.src0_nrows_per_thread = fastdiv(mdev_nrows + n_threads - 1, &octx->n_threads_div);
