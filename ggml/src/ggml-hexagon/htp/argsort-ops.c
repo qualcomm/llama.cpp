@@ -11,9 +11,10 @@
 #include "hvx-utils.h"
 #include "hex-dma.h"
 
+#include "hex-common.h"
 #include "htp-ctx.h"
 #include "htp-ops.h"
-#include "htp-ops.h"
+#include "htp-tensor.h"
 
 #ifndef MIN
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
@@ -449,13 +450,41 @@ int op_argsort(struct htp_ops_context * octx) {
         return HTP_STATUS_NO_SUPPORT;
     }
 
-    const uint32_t total_rows = octx->src[0]->ne[1] * octx->src[0]->ne[2] * octx->src[0]->ne[3];
+    const struct htp_tensor * src0 = octx->src[0];
+    const struct htp_tensor * dst  = octx->dst;
+
+    const uint32_t total_rows  = src0->ne[1] * src0->ne[2] * src0->ne[3];
+    const size_t dst_row_size  = dst->ne[0]  * sizeof(int32_t);
 
     uint32_t mdev_row_start, mdev_row_end;
     if (octx->mdev_count > 1) {
-        const uint32_t rows_per_mdev = fastdiv(total_rows + octx->mdev_count - 1, &octx->mdev_count_div);
-        mdev_row_start = MIN(octx->mdev_idx * rows_per_mdev, total_rows);
-        mdev_row_end   = MIN(mdev_row_start + rows_per_mdev, total_rows);
+        bool can_split = (dst->ne[0] == 1 || dst->nb[0] == sizeof(int32_t)) && !htp_tensor_is_permuted(dst);
+        uint32_t rows_per_chunk = 1;
+        if (can_split) {
+            if (dst->ne[1] > 1 && (dst->nb[1] & 127) == 0) {
+                rows_per_chunk = 1;
+            } else if (dst->nb[1] == dst_row_size &&
+                       (dst->ne[2] <= 1 || dst->nb[2] == dst->nb[1] * dst->ne[1]) &&
+                       (dst->ne[3] <= 1 || dst->nb[3] == dst->nb[2] * dst->ne[2])) {
+                rows_per_chunk = (dst_row_size > 0) ? (HEX_L2_LINE_SIZE / hex_gcd_u32(dst_row_size, HEX_L2_LINE_SIZE)) : 1;
+            } else {
+                can_split = false;
+            }
+        }
+
+        const uint32_t total_chunks = can_split ? (total_rows / rows_per_chunk) : 0;
+        if (total_chunks < octx->mdev_count) {
+            mdev_row_start = (octx->mdev_idx == 0) ? 0 : total_rows;
+            mdev_row_end   = total_rows;
+        } else {
+            const uint32_t chunks_per_mdev = fastdiv(total_chunks + octx->mdev_count - 1, &octx->mdev_count_div);
+            mdev_row_start = MIN(octx->mdev_idx * chunks_per_mdev * rows_per_chunk, total_rows);
+            if (octx->mdev_idx == octx->mdev_count - 1) {
+                mdev_row_end = total_rows;
+            } else {
+                mdev_row_end = MIN(mdev_row_start + chunks_per_mdev * rows_per_chunk, total_rows);
+            }
+        }
     } else {
         mdev_row_start = 0;
         mdev_row_end   = total_rows;
