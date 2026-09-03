@@ -9,7 +9,7 @@
 //
 // What is specific to q5_K:
 //  - the weight word for four K is built from the ushort nibble group and the qh nibble
-//    without a per-element loop: (u | u << 12) & 0x0F0F0F0F spreads the nibbles to bytes
+//    without a per-element loop: (u | (u >> 4) << 16) & 0x0F0F0F0F spreads the nibbles to bytes
 //    (n0, n2, n1, n3), and (h * 0x02080410) & 0x10101010 lands the four high bits on
 //    bit 4 of the same bytes. Codes stay 0..31, unsigned, so the min term is applied at
 //    the flush like the dense q5_K dp4a kernel: acc += sc*da*dot - mn*sa.
@@ -98,7 +98,9 @@ kernel void kernel_quant_a_q8_1_k4(
 // h: the four qh bits of the same K, bit i = K i. Bytes come out as (K0, K2, K1, K3).
 // The multiply places h<<4, h<<10, h<<19, h<<25, which do not overlap, so the four
 // masked bits are exactly h.s0..3 with no carries between them.
-#define COK_LO(u) ((((uint)(u)) | (((uint)(u)) << 12)) & 0x0F0F0F0Fu)
+// The nibble spread is the 16-bit pack of u and u >> 4, not u | u << 12: the Adreno 840
+// compiler evaluates that shift of a ushort at 16 bits and zeroes the two odd K.
+#define COK_LO(u) (((uint)(u) | ((uint)(ushort)((u) >> 4) << 16)) & 0x0F0F0F0Fu)
 #define COK_HI(h) ((((uint)(h)) * 0x02080410u) & 0x10101010u)
 
 // Row r: K-groups 0..3 of the half block (bl0..bl3), qh bytes hq0 (groups 0, 1) and

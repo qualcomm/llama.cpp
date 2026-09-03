@@ -103,7 +103,9 @@ kernel void kernel_quant_a_q8_1_k4h(
 
 // Four K of one row as one dp4a word, bytes (K0, K2, K1, K3), codes 0..63.
 // u: the ushort nibble group, nibble i = K i. h: the uchar of high bits, bits 2i..2i+1 = K i.
-#define COK_LO(u) ((((uint)(u)) | (((uint)(u)) << 12)) & 0x0F0F0F0Fu)
+// The nibble spread is the 16-bit pack of u and u >> 4, not u | u << 12: the Adreno 840
+// compiler evaluates that shift of a ushort at 16 bits and zeroes the two odd K.
+#define COK_LO(u) (((uint)(u) | ((uint)(ushort)((u) >> 4) << 16)) & 0x0F0F0F0Fu)
 #define COK_HI(h) ((((((uint)(h)) & 0x33u) * 0x110u) & 0x3030u) | (((((uint)(h)) & 0xCCu) * 0x440000u) & 0x30300000u))
 
 // Row r: K-groups 0..3 of the half block (bl0..bl3 nibbles, bh0..bh3 high bits).
