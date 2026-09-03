@@ -29,6 +29,23 @@ static inline bool htp_tensor_is_contiguous(const struct htp_tensor * t, uint32_
     return true;
 }
 
+static inline bool htp_tensor_is_permuted(const struct htp_tensor * t) {
+    return t->nb[0] > t->nb[1] || t->nb[1] > t->nb[2] || t->nb[2] > t->nb[3];
+}
+
+static inline bool htp_tensor_can_row_partition(const struct htp_tensor * t, uint32_t elem_size) {
+    if (t->ne[0] != 1 && t->nb[0] != elem_size) {
+        return false;
+    }
+    if (htp_tensor_is_permuted(t)) {
+        return false;
+    }
+    if (t->ne[1] > 1 && (t->nb[1] & 127) != 0) return false;
+    if (t->ne[2] > 1 && (t->nb[2] & 127) != 0) return false;
+    if (t->ne[3] > 1 && (t->nb[3] & 127) != 0) return false;
+    return true;
+}
+
 static inline uint32_t htp_tensor_get_row_size(int type, uint32_t ne00) {
     switch (type) {
         case HTP_TYPE_F32:  return ne00 * 4;

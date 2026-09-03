@@ -434,6 +434,7 @@ struct ggml_hexagon_session {
     void     wait_event(uint64_t seq);
 
     bool clone_buffer(const ggml_hexagon_shared_buffer*);
+    void unclone_buffer(int fd);
 
     void add_sync_peer(ggml_hexagon_session * peer) {
         sync_peers.insert(peer);
@@ -619,6 +620,9 @@ struct ggml_hexagon_shared_buffer {
     }
 
     ~ggml_hexagon_shared_buffer() {
+        if (sess && mem) {
+            sess->unclone_buffer(fd());
+        }
         free();
         for (auto * extra : tensor_extra) {
             delete extra;
@@ -3088,6 +3092,19 @@ bool ggml_hexagon_session::clone_buffer(const ggml_hexagon_shared_buffer *sbuf)
 
     this->cloned_buffers[sbuf->fd()] = std::move(clone);
     return true;
+}
+
+void ggml_hexagon_session::unclone_buffer(int fd) {
+    if (fd < 0) return;
+
+    auto it = this->cloned_buffers.find(fd);
+    if (it != this->cloned_buffers.end()) {
+        it->second->unmap();
+        this->cloned_buffers.erase(it);
+    }
+    for (auto & sub : mdev_sessions) {
+        sub->unclone_buffer(fd);
+    }
 }
 
 static size_t ggml_hexagon_measure_max_vmem(ggml_hexagon_session *sess) {
