@@ -227,7 +227,7 @@ def main():
                 logger.error("ADB push failed.")
                 sys.exit(res.returncode)
 
-            chmod_cmd = adb_cmd + ["shell", f"chmod -R 755 {target_dir}/bin {target_dir}/lib 2>/dev/null || true"]
+            chmod_cmd = adb_cmd + ["shell", f"chmod -R 755 {target_dir}/bin 2>/dev/null || true"]
             logger.info(f"+ {' '.join(chmod_cmd)}")
             subprocess.run(chmod_cmd)
             logger.info("ADB push completed successfully!")
@@ -254,7 +254,7 @@ def main():
                 logger.error("SSH/SCP deploy failed.")
                 sys.exit(res.returncode)
 
-            chmod_cmd = ["ssh", ssh_host, f"chmod -R 755 {target_dir}/bin {target_dir}/lib 2>/dev/null || true"]
+            chmod_cmd = ["ssh", ssh_host, f"chmod -R 755 {target_dir}/bin 2>/dev/null || true"]
             logger.info(f"+ {' '.join(chmod_cmd)}")
             subprocess.run(chmod_cmd)
             logger.info("SSH/SCP deploy completed successfully!")
