@@ -121,8 +121,8 @@ kernel void kernel_quant_a_q8_1_eo(
 // Column-outer: one activation texel at a time against the unpacked rows. Both wave-
 // uniform operands (activation texel, block scales) come through the texture path: the
 // same bytes as a buffer load cost one L1 transaction per lane and ran 40% slower.
-#define COK_DOT_COL(c)                                                       \
-    { const uint4 A = read_imageui(src1_qa, (c) * k_t + at);                 \
+#define COK_DOT_COL(c, t)                                                    \
+    { const uint4 A = read_imageui(src1_qa, (c) * k_t + (t));                \
       COK_ROWS_DO_C(c) }
 
 #if COK_ROWS == 4
@@ -157,6 +157,7 @@ kernel void kernel_gemm_cok8_q4_0_q8_1_dp4a(
     const int row0 = gx * COK_ROWS;
     const int num_32blk = k / 32;
     const int k_t = k >> 4;                       // activation texels (16 K) per column
+    const int fence = n_no_padding >> 4;          // 0 (n <= 8), unknown to the compiler
 
     // This workgroup's K slice, in 32-K blocks; the COK_NSG subgroups interleave inside it.
     const int chunk   = (num_32blk + ksplit - 1) / ksplit;
@@ -182,9 +183,13 @@ kernel void kernel_gemm_cok8_q4_0_q8_1_dp4a(
 
             // Wave-uniform texture reads, like the f16 cok's read_imageh: the same 16 B
             // through a buffer load costs a full L1 transaction per lane and outweighs
-            // the weight traffic 4:1 at eight columns.
-            COK_DOT_COL(0) COK_DOT_COL(1) COK_DOT_COL(2) COK_DOT_COL(3)
-            COK_DOT_COL(4) COK_DOT_COL(5) COK_DOT_COL(6) COK_DOT_COL(7)
+            // the weight traffic 4:1 at eight columns. Two column groups of four: the
+            // second group's texel index carries a dependency on the first group's dot
+            // (fence is 0, so the value is at), which keeps the compiler from issuing
+            // all eight texel reads up front; on the q5_K twin that alone was -31%.
+            COK_DOT_COL(0, at) COK_DOT_COL(1, at) COK_DOT_COL(2, at) COK_DOT_COL(3, at)
+            const int at4 = at + (d0.s0 & fence);
+            COK_DOT_COL(4, at4) COK_DOT_COL(5, at4) COK_DOT_COL(6, at4) COK_DOT_COL(7, at4)
         }
 
         // One flush per 32-K block: single scale per block, no min term.
