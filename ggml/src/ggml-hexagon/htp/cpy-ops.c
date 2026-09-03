@@ -326,6 +326,8 @@ int op_cpy(struct htp_ops_context * octx) {
     const uint32_t n_threads = octx->n_threads;
     bool use_dma = false;
 
+    const bool dst_is_contiguous = htp_tensor_is_contiguous(dst, ct.dst_type_size);
+
     if (sameshape) {
         const uint32_t total_rows = ne01 * ne02 * ne03;
         const uint32_t row_size   = ne00 * ct.dst_type_size;
@@ -337,7 +339,7 @@ int op_cpy(struct htp_ops_context * octx) {
         if (octx->mdev_count > 1) {
             const uint32_t rows_per_chunk = (row_size > 0) ? (HEX_L2_LINE_SIZE / hex_gcd_u32(row_size, HEX_L2_LINE_SIZE)) : 1;
             struct fastdiv_values div_chunk = init_fastdiv_values(rows_per_chunk);
-            const uint32_t total_chunks   = fastdiv(total_rows, &div_chunk);
+            const uint32_t total_chunks   = dst_is_contiguous ? fastdiv(total_rows, &div_chunk) : 0;
             if (total_chunks < octx->mdev_count) {
                 mdev_row_start = (octx->mdev_idx == 0) ? 0 : total_rows;
                 mdev_nrows     = (octx->mdev_idx == 0) ? total_rows : 0;
@@ -394,11 +396,12 @@ int op_cpy(struct htp_ops_context * octx) {
 
         uint32_t mdev_elem_start, mdev_nelem;
         if (octx->mdev_count > 1) {
-            if (n_lines < octx->mdev_count) {
+            const uint32_t aligned_lines = dst_is_contiguous ? n_lines : 0;
+            if (aligned_lines < octx->mdev_count) {
                 mdev_elem_start = (octx->mdev_idx == 0) ? 0 : total_elems;
                 mdev_nelem      = (octx->mdev_idx == 0) ? total_elems : 0;
             } else {
-                uint32_t lines_per_mdev = fastdiv(n_lines + octx->mdev_count - 1, &octx->mdev_count_div);
+                uint32_t lines_per_mdev = fastdiv(aligned_lines + octx->mdev_count - 1, &octx->mdev_count_div);
                 mdev_elem_start = MIN(octx->mdev_idx * lines_per_mdev * elems_per_line, total_elems);
                 if (octx->mdev_idx == octx->mdev_count - 1) {
                     mdev_nelem = total_elems - mdev_elem_start;
