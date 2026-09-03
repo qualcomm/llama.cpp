@@ -338,8 +338,7 @@ int op_cpy(struct htp_ops_context * octx) {
         uint32_t mdev_row_start, mdev_nrows;
         if (octx->mdev_count > 1) {
             const uint32_t rows_per_chunk = (row_size > 0) ? (HEX_L2_LINE_SIZE / hex_gcd_u32(row_size, HEX_L2_LINE_SIZE)) : 1;
-            struct fastdiv_values div_chunk = init_fastdiv_values(rows_per_chunk);
-            const uint32_t total_chunks   = dst_is_contiguous ? fastdiv(total_rows, &div_chunk) : 0;
+            const uint32_t total_chunks   = dst_is_contiguous ? (total_rows / rows_per_chunk) : 0;
             if (total_chunks < octx->mdev_count) {
                 mdev_row_start = (octx->mdev_idx == 0) ? 0 : total_rows;
                 mdev_nrows     = (octx->mdev_idx == 0) ? total_rows : 0;
