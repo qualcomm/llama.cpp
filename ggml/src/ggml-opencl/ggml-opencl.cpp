@@ -33129,16 +33129,55 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 // threads. Opt out with GGML_OPENCL_MM_NARROW_N=0.
                 static const char * mm_narrow_n_env = getenv("GGML_OPENCL_MM_NARROW_N");
                 const bool mm_narrow_n_off = (mm_narrow_n_env != nullptr && mm_narrow_n_env[0] == '0');
-                const bool use_narrow_n = !mm_narrow_n_off && ne11 >= 2 && ne11 <= 8 &&
+
+                // GQA fold. A KQ / KQV matmul broadcasts one K (or V) head over
+                // r2 query heads, and the batch loop above dispatches those r2
+                // heads as separate batches that each stream the same src0 tile.
+                // The src1 columns of the r2 heads sharing a src0 head are
+                // adjacent in memory (batch i12 starts at column i12*ne11, and
+                // the heads of one group are consecutive i12), and so are the
+                // dst columns, so the same matmul can be dispatched as ne02
+                // batches of ne11*r2 columns with r2 = 1: src0 is read once per
+                // group instead of r2 times. At the verify width of a Qwen3.8
+                // DFlash batch (ne11 = 8, r2 = 6) that is 48 columns in one
+                // 64-wide tile in place of six 8-wide tiles each re-reading K.
+                // Needs both operands contiguous in ne order (true after the
+                // copies below) and a contiguous dst. GGML_OPENCL_MM_GQA_FOLD=0
+                // restores the per-head dispatch.
+                static const char * mm_gqa_fold_env = getenv("GGML_OPENCL_MM_GQA_FOLD");
+                const bool mm_gqa_fold_off = (mm_gqa_fold_env != nullptr && mm_gqa_fold_env[0] == '0');
+                const bool gqa_fold = !mm_gqa_fold_off && r2 > 1 && r3 == 1 && ne11 >= 2 &&
+                                      ggml_is_contiguous(dst);
+                const int ne11_mm = gqa_fold ? ne11 * r2 : ne11;
+                const int ne12_mm = gqa_fold ? ne02       : ne12;
+                const int r2_mm   = gqa_fold ? 1          : r2;
+
+                const bool use_narrow_n = !mm_narrow_n_off && ne11_mm >= 2 && ne11_mm <= 8 &&
                                           backend_ctx->kernel_mul_mm_f16_f32_l4_lm_n8 != nullptr;
 
                 kernel = use_narrow_n ? backend_ctx->kernel_mul_mm_f16_f32_l4_lm_n8
                                       : backend_ctx->kernel_mul_mm_f16_f32_l4_lm;
                 nth0 = 128; // calculated as (BM*BN)/(TM*TN) -- 64*64/(4*8) == 64*8/(4*1)
 
-                int batch_stride_a = ne00*ne01;
-                int batch_stride_b = ne10*ne11;
-                int batch_stride_d = ne0*ne1;
+                // The kernel walks src0 rows as half4 along ne00 and takes the row
+                // and head strides as arguments, so a K cache view (permuted, rows
+                // strided by the GQA width) or a transposed V cache view (rows
+                // strided by the context length) can be read in place: unit element
+                // stride, half4-aligned row and head strides, and a ne02-multiple
+                // (or absent) ne03 stride are all it needs. That drops the
+                // copy-to-contiguous of K and V that ran before every KQ / KQV of
+                // the verify batch. GGML_OPENCL_MM_STRIDED_A=0 restores the copy.
+                static const char * mm_strided_a_env = getenv("GGML_OPENCL_MM_STRIDED_A");
+                const bool mm_strided_a_off = (mm_strided_a_env != nullptr && mm_strided_a_env[0] == '0');
+                const bool src0_in_place = ggml_is_contiguous(src0) ||
+                    (!mm_strided_a_off && nb00 == sizeof(ggml_fp16_t) && nb01 % 8 == 0 && nb02 % 8 == 0 &&
+                     (ne03 == 1 || nb03 == nb02*(cl_ulong)ne02) &&
+                     nb02/2*(cl_ulong)ne02*(cl_ulong)ne03 + nb01/2*(cl_ulong)ne01 < (cl_ulong)INT_MAX);
+
+                int stride_a       = src0_in_place ? (int)(nb01/2) : ne00;
+                int batch_stride_a = src0_in_place ? (int)(nb02/2) : ne00*ne01;
+                int batch_stride_b = ne10*ne11_mm;
+                int batch_stride_d = ne0*ne11_mm;
 
                 cl_mem mem_src0 = extra0->data_device;
                 cl_mem mem_src1 = extra1->data_device;
@@ -33156,7 +33195,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 cl_ulong offset0_cont = offset0;
                 cl_ulong offset1_cont = offset1;
 
-                if (!ggml_is_contiguous(src0)) {
+                if (!src0_in_place) {
                     backend_ctx->prealloc_src0.allocate(backend_ctx->context, ggml_nbytes(src0));
                     ggml_cl_copy_to_contiguous(backend, src0, backend_ctx->prealloc_src0.buffer,
                         nb00_cont, nb01_cont, nb02_cont, nb03_cont);
@@ -33181,15 +33220,15 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 CL_CHECK(clSetKernelArg(kernel,  6, sizeof(int),      &ne00));
                 CL_CHECK(clSetKernelArg(kernel,  7, sizeof(int),      &ne01));
                 CL_CHECK(clSetKernelArg(kernel,  8, sizeof(int),      &ne02));
-                CL_CHECK(clSetKernelArg(kernel,  9, sizeof(int),      &ne11));
-                CL_CHECK(clSetKernelArg(kernel, 10, sizeof(int),      &ne12));
-                CL_CHECK(clSetKernelArg(kernel, 11, sizeof(int),      &ne10)); // stride_a
+                CL_CHECK(clSetKernelArg(kernel,  9, sizeof(int),      &ne11_mm));
+                CL_CHECK(clSetKernelArg(kernel, 10, sizeof(int),      &ne12_mm));
+                CL_CHECK(clSetKernelArg(kernel, 11, sizeof(int),      &stride_a));
                 CL_CHECK(clSetKernelArg(kernel, 12, sizeof(int),      &ne10)); // stride_b
                 CL_CHECK(clSetKernelArg(kernel, 13, sizeof(int),      &ne01)); // stride_d
                 CL_CHECK(clSetKernelArg(kernel, 14, sizeof(int),      &batch_stride_a));
                 CL_CHECK(clSetKernelArg(kernel, 15, sizeof(int),      &batch_stride_b));
                 CL_CHECK(clSetKernelArg(kernel, 16, sizeof(int),      &batch_stride_d));
-                CL_CHECK(clSetKernelArg(kernel, 17, sizeof(int),      &r2));
+                CL_CHECK(clSetKernelArg(kernel, 17, sizeof(int),      &r2_mm));
                 CL_CHECK(clSetKernelArg(kernel, 18, sizeof(int),      &r3));
 
                 // 64 is block tile size BM and BN - change here when BM and BN in the kernel are changed.
@@ -33197,7 +33236,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 // tiled by 8 to match -- tiling by 64 would compute only the first 8
                 // columns and silently drop the rest.
                 const int bn_f16 = use_narrow_n ? 8 : 64;
-                size_t global_work_size[] = {(size_t)(CEIL_DIV(ne01, 64)*nth0), (size_t)(CEIL_DIV(ne11, bn_f16)), (size_t)ne12*ne13};
+                size_t global_work_size[] = {(size_t)(CEIL_DIV(ne01, 64)*nth0), (size_t)(CEIL_DIV(ne11_mm, bn_f16)), (size_t)ne12_mm*ne13};
                 size_t local_work_size[] = {(size_t)nth0, 1, 1};
 
                 backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
