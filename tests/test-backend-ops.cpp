@@ -9693,6 +9693,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 128, 45,  64, { 8,  1}, {4, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 1056, 1, 193, {1,  1}, {4, 1}, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 1056, 1, 67,  {1,  1}, {4, 1}, {0, 2, 1, 3}));
+    // GQA-broadcast KQ / KQV at speculative verify widths (dk 256, 4 kv heads x 6)
+    for (int n : {2, 5, 8, 11}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 1280, n, 256, {4, 1}, {6, 1}, {0, 2, 1, 3}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 256, n, 1280, {4, 1}, {6, 1}, {0, 1, 2, 3}, 2048));
+    }
     // PROBE: contiguous, odd k >= 128. Row stride = k*2 bytes = 2 (mod 8), so a kernel that
     // casts the row pointer to half4/float4 reads it misaligned -- with no permute and no view
     // in sight. Predicts FAIL on the unfixed OpenCL backend.
@@ -10857,6 +10862,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 16416, 1, 128, {8,  1}, {4, 1}, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 128, 1, 16416, {8,  1}, {4, 1}, {0, 1, 2, 3}, 2*16416));
+
+    // Qwen3.8-27B (dk 256, 4 kv heads x gqa 6) attention with -fa 0 at a
+    // speculative verify width: KQ against the permuted K cache view and KQV
+    // against the transposed V cache view (k_v = ctx), at depth 1024 and 4096.
+    // The n = 8 rows are the DFlash verify batch; n = 4 the MTP one.
+    for (int n : {4, 8}) {
+        for (int n_kv : {1280, 4352}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, n_kv, n, 256, {4, 1}, {6, 1}, {0, 2, 1, 3}));
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 256, n, n_kv, {4, 1}, {6, 1}, {0, 1, 2, 3}, 8192));
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 256, n, n_kv, {4, 1}, {6, 1}));
+        }
+    }
 
     // q6_K long-vocab lm_head GEMV (decode, dot-bound): m=vocab, n=1, k=hidden.
     // Exercises the tiled q6_K dp4a decode path (use_q6k_tiled; image-qa candidate).
