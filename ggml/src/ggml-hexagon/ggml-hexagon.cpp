@@ -576,6 +576,9 @@ struct ggml_hexagon_shared_buffer {
         if (this->mem) return;
 
         this->mem = std::make_shared<ggml_hexagon_rpcmem_block>(size);
+        if (fences_size > 0 && this->size() >= fences_size) {
+            memset(base() + (this->size() - fences_size), 0, fences_size);
+        }
 
         HEX_VERBOSE("ggml-hex: %s allocated buffer: base %p size %zu fd %d pinned %d\n", sess->c_name(),
                     (void *) base(), this->size(), fd(), (int) pinned);
