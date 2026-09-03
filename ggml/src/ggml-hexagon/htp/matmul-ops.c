@@ -1160,9 +1160,19 @@ static void hvx_mv_id_nx(unsigned int nth, unsigned int ith, void * data) {
             const uint32_t ne01 = src_w->ne[1];
             uint32_t mdev_start_row, mdev_end_row;
             if (octx->mdev_count > 1) {
-                const uint32_t rows_per_mdev = fastdiv(ne01 + octx->mdev_count - 1, &octx->mdev_count_div);
-                mdev_start_row = MIN(octx->mdev_idx * rows_per_mdev, ne01);
-                mdev_end_row   = MIN(mdev_start_row + rows_per_mdev, ne01);
+                const uint32_t total_chunks = ne01 / 32;
+                if (total_chunks < octx->mdev_count) {
+                    mdev_start_row = (octx->mdev_idx == 0) ? 0 : ne01;
+                    mdev_end_row   = (octx->mdev_idx == 0) ? ne01 : ne01;
+                } else {
+                    const uint32_t chunks_per_mdev = fastdiv(total_chunks + octx->mdev_count - 1, &octx->mdev_count_div);
+                    mdev_start_row = MIN(octx->mdev_idx * chunks_per_mdev * 32, ne01);
+                    if (octx->mdev_idx == octx->mdev_count - 1) {
+                        mdev_end_row = ne01;
+                    } else {
+                        mdev_end_row = MIN(mdev_start_row + chunks_per_mdev * 32, ne01);
+                    }
+                }
             } else {
                 mdev_start_row = 0;
                 mdev_end_row   = ne01;
@@ -1255,9 +1265,19 @@ static void hvx_mm_id_nx(unsigned int nth, unsigned int ith, void * data) {
             const uint32_t ne01 = src_w->ne[1];
             uint32_t mdev_start_row, mdev_end_row;
             if (octx->mdev_count > 1) {
-                const uint32_t rows_per_mdev = fastdiv(ne01 + octx->mdev_count - 1, &octx->mdev_count_div);
-                mdev_start_row = MIN(octx->mdev_idx * rows_per_mdev, ne01);
-                mdev_end_row   = MIN(mdev_start_row + rows_per_mdev, ne01);
+                const uint32_t total_chunks = ne01 / 32;
+                if (total_chunks < octx->mdev_count) {
+                    mdev_start_row = (octx->mdev_idx == 0) ? 0 : ne01;
+                    mdev_end_row   = (octx->mdev_idx == 0) ? ne01 : ne01;
+                } else {
+                    const uint32_t chunks_per_mdev = fastdiv(total_chunks + octx->mdev_count - 1, &octx->mdev_count_div);
+                    mdev_start_row = MIN(octx->mdev_idx * chunks_per_mdev * 32, ne01);
+                    if (octx->mdev_idx == octx->mdev_count - 1) {
+                        mdev_end_row = ne01;
+                    } else {
+                        mdev_end_row = MIN(mdev_start_row + chunks_per_mdev * 32, ne01);
+                    }
+                }
             } else {
                 mdev_start_row = 0;
                 mdev_end_row   = ne01;
@@ -3563,9 +3583,13 @@ static int hmx_mm_op_matmul_id(
         const int m_padded = hex_align_up(cne1, 32);
         int m_start = 0, m_end = m_padded;
         if (octx->mdev_count > 1) {
-            const int rows_per_mdev = (int) fastdiv(m_padded + octx->mdev_count - 1, &octx->mdev_count_div);
-            m_start = MIN((int)(octx->mdev_idx * rows_per_mdev), m_padded);
-            m_end   = MIN(m_start + rows_per_mdev, m_padded);
+            if ((uint32_t) cne1 < octx->mdev_count) {
+                if (octx->mdev_idx > 0) continue;
+            } else {
+                const int rows_per_mdev = (int) fastdiv(m_padded + octx->mdev_count - 1, &octx->mdev_count_div);
+                m_start = MIN((int)(octx->mdev_idx * rows_per_mdev), m_padded);
+                m_end   = MIN(m_start + rows_per_mdev, m_padded);
+            }
         }
         if (m_start >= m_end) continue;
 
@@ -3697,9 +3721,13 @@ static int hmx_mm_op_matmul_id_nx(
         const int m_padded = hex_align_up(cne1, 32);
         int m_start = 0, m_end = m_padded;
         if (octx->mdev_count > 1) {
-            const int rows_per_mdev = (int) fastdiv(m_padded + octx->mdev_count - 1, &octx->mdev_count_div);
-            m_start = MIN((int)(octx->mdev_idx * rows_per_mdev), m_padded);
-            m_end   = MIN(m_start + rows_per_mdev, m_padded);
+            if ((uint32_t) cne1 < octx->mdev_count) {
+                if (octx->mdev_idx > 0) continue;
+            } else {
+                const int rows_per_mdev = (int) fastdiv(m_padded + octx->mdev_count - 1, &octx->mdev_count_div);
+                m_start = MIN((int)(octx->mdev_idx * rows_per_mdev), m_padded);
+                m_end   = MIN(m_start + rows_per_mdev, m_padded);
+            }
         }
         if (m_start >= m_end) continue;
 
@@ -3906,27 +3934,6 @@ int op_matmul_id(struct htp_ops_context * octx) {
     const uint32_t src0_nrows = ne01;  // per expert
     const uint32_t src1_nrows = ne11 * ne12 * ne13;
 
-    uint32_t mdev_row_start, mdev_row_end;
-    if (octx->mdev_count > 1) {
-        const uint32_t rows_per_mdev = fastdiv(src0_nrows + octx->mdev_count - 1, &octx->mdev_count_div);
-        mdev_row_start = MIN(octx->mdev_idx * rows_per_mdev, src0_nrows);
-        mdev_row_end   = MIN(mdev_row_start + rows_per_mdev, src0_nrows);
-    } else {
-        mdev_row_start = 0;
-        mdev_row_end   = src0_nrows;
-    }
-
-    if (mdev_row_start >= mdev_row_end) {
-        return HTP_STATUS_OK;
-    }
-
-    const uint32_t mdev_nrows = mdev_row_end - mdev_row_start;
-    mmctx->mdev_row_start = mdev_row_start;
-    mmctx->mdev_row_end   = mdev_row_end;
-
-    mmctx->src0_nrows_per_thread = fastdiv(mdev_nrows + octx->n_threads - 1, &octx->n_threads_div);
-    mmctx->src0_nrows_per_thread = hex_round_up(mmctx->src0_nrows_per_thread, 32);
-
     // row groups
     const int n_ids = ids->ne[0];  // n_expert_used
     const int n_as  = ne02;        // n_expert
@@ -3978,6 +3985,40 @@ int op_matmul_id(struct htp_ops_context * octx) {
     if (kparams->n_hmx) {
         s = hmx_mm_op_matmul_id(octx, mmctx);
     } else {
+        uint32_t mdev_row_start, mdev_row_end;
+        if (octx->mdev_count > 1) {
+            const uint32_t total_chunks = src0_nrows / 32;
+            if (total_chunks < octx->mdev_count) {
+                mdev_row_start = (octx->mdev_idx == 0) ? 0 : src0_nrows;
+                mdev_row_end   = (octx->mdev_idx == 0) ? src0_nrows : src0_nrows;
+            } else {
+                const uint32_t chunks_per_mdev = fastdiv(total_chunks + octx->mdev_count - 1, &octx->mdev_count_div);
+                mdev_row_start = MIN(octx->mdev_idx * chunks_per_mdev * 32, src0_nrows);
+                if (octx->mdev_idx == octx->mdev_count - 1) {
+                    mdev_row_end = src0_nrows;
+                } else {
+                    mdev_row_end = MIN(mdev_row_start + chunks_per_mdev * 32, src0_nrows);
+                }
+            }
+        } else {
+            mdev_row_start = 0;
+            mdev_row_end   = src0_nrows;
+        }
+
+        if (mdev_row_start >= mdev_row_end) {
+            if (mapping_buf != octx->ctx->ddr_spad_base) {
+                free(mapping_buf);
+            }
+            return HTP_STATUS_OK;
+        }
+
+        const uint32_t mdev_nrows = mdev_row_end - mdev_row_start;
+        mmctx->mdev_row_start = mdev_row_start;
+        mmctx->mdev_row_end   = mdev_row_end;
+
+        mmctx->src0_nrows_per_thread = fastdiv(mdev_nrows + octx->n_threads - 1, &octx->n_threads_div);
+        mmctx->src0_nrows_per_thread = hex_round_up(mmctx->src0_nrows_per_thread, 32);
+
         if (hvx_mm_init_vec_dot(mmctx, src0->type) == 0) {
             s = hvx_mm_matmul_id(octx, mmctx, src1_nrows > 1 ? hvx_mm_id : hvx_mv_id);
         } else {
