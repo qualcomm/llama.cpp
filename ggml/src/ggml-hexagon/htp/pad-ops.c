@@ -105,7 +105,7 @@ struct htp_pad_context {
                                                                                      \
     const size_t type_size = pctx->type_size;                                        \
                                                                                      \
-    const uint32_t row_start = pctx->row_start + pctx->nrows_per_thread * ith;  \
+    const uint32_t row_start = pctx->row_start + pctx->nrows_per_thread * ith;       \
     const uint32_t row_end   = MIN(row_start + pctx->nrows_per_thread, pctx->row_start + pctx->total_dst_rows);
 
 

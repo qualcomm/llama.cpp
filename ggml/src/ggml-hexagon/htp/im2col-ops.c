@@ -78,12 +78,12 @@ static inline void htp_im2col_vtcm_layout_build(struct htp_im2col_vtcm_layout * 
         DST_CTYPE * restrict dst_data           = (DST_CTYPE *) dst->data;                                \
         const uint32_t patch_end                = ictx->patch_base + ictx->npatches;                      \
         const uint32_t patch_start              = ictx->patch_base + ictx->npatches_per_thread * ith;     \
-        const uint32_t patch_stop               = MIN(patch_start + ictx->npatches_per_thread, patch_end); \
-        if (patch_start >= patch_stop) {                                                                   \
+        const uint32_t patch_stop               = MIN(patch_start + ictx->npatches_per_thread, patch_end);\
+        if (patch_start >= patch_stop) {                                                                  \
             return;                                                                                       \
         }                                                                                                 \
         htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, patch_start);                                   \
-        for (uint32_t p = patch_start; p < patch_stop; p++) {                                              \
+        for (uint32_t p = patch_start; p < patch_stop; p++) {                                             \
             const uint32_t iow             = p % OW;                                                      \
             const uint32_t ioh             = (p / OW) % OH;                                               \
             const uint32_t in              = p / (OW * OH);                                               \
@@ -153,7 +153,7 @@ IM2COL_PATCHEMBED_BODY(im2col_patchembed_f32_thread, float, hvx_copy_f32_uu, hvx
         uint8_t *      dst_base         = ictx->pe_vtcm_dst + ith * ictx->pe_dst_size_per_thread;                    \
         float *        srcb             = (float *) src_base;                                                        \
         DST_CTYPE *    dstb             = (DST_CTYPE *) dst_base;                                                    \
-        const uint32_t row_end_max      = ictx->pe_row_base + ictx->pe_nrows;                                       \
+        const uint32_t row_end_max      = ictx->pe_row_base + ictx->pe_nrows;                                        \
         const uint32_t per_thread       = ictx->pe_rows_per_thread;                                                  \
         const uint32_t row_start        = ictx->pe_row_base + per_thread * ith;                                      \
         const uint32_t row_end          = MIN(row_start + per_thread, row_end_max);                                  \
@@ -269,76 +269,76 @@ int op_im2col(struct htp_ops_context * octx) {
         return HTP_STATUS_OK;
     }
 
-    const uint32_t N        = src1->ne[3];
-    const uint32_t OH       = dst->ne[2];
-    const uint32_t OW       = dst->ne[1];
-    const uint32_t npatches = N * OH * OW;
-    const uint32_t nrows    = N * OH;
+    const uint32_t N             = src1->ne[3];
+    const uint32_t OH            = dst->ne[2];
+    const uint32_t OW            = dst->ne[1];
+    const uint32_t total_patches = N * OH * OW;
+    const uint32_t total_rows    = N * OH;
 
-    uint32_t patch_base   = 0;
-    uint32_t dev_npatches = npatches;
+    uint32_t patch_base = 0;
+    uint32_t npatches   = total_patches;
     if (octx->mdev_count > 1) {
         const uint32_t patch_size = dst->nb[1];
         const uint32_t patches_per_chunk = (patch_size > 0) ? (HEX_L2_LINE_SIZE / hex_gcd_u32(patch_size, HEX_L2_LINE_SIZE)) : 1;
-        const uint32_t total_patch_chunks = npatches / patches_per_chunk;
+        const uint32_t total_patch_chunks = total_patches / patches_per_chunk;
         const bool can_split_patches = total_patch_chunks >= octx->mdev_count;
 
         if (!can_split_patches) {
-            patch_base   = (octx->mdev_idx == 0) ? 0 : npatches;
-            dev_npatches = (octx->mdev_idx == 0) ? npatches : 0;
+            patch_base = (octx->mdev_idx == 0) ? 0 : total_patches;
+            npatches   = (octx->mdev_idx == 0) ? total_patches : 0;
         } else {
             const uint32_t chunks_per_mdev = fastdiv(total_patch_chunks + octx->mdev_count - 1, &octx->mdev_count_div);
-            patch_base = MIN(octx->mdev_idx * chunks_per_mdev * patches_per_chunk, npatches);
+            patch_base = MIN(octx->mdev_idx * chunks_per_mdev * patches_per_chunk, total_patches);
             if (octx->mdev_idx == octx->mdev_count - 1) {
-                dev_npatches = npatches - patch_base;
+                npatches = total_patches - patch_base;
             } else {
-                dev_npatches = MIN(chunks_per_mdev * patches_per_chunk, npatches - patch_base);
+                npatches = MIN(chunks_per_mdev * patches_per_chunk, total_patches - patch_base);
             }
         }
     }
 
-    uint32_t row_base  = 0;
-    uint32_t dev_nrows = nrows;
+    uint32_t row_base = 0;
+    uint32_t nrows    = total_rows;
     if (octx->mdev_count > 1) {
         const uint32_t row_size = dst->nb[2];
         const uint32_t rows_per_chunk = (row_size > 0) ? (HEX_L2_LINE_SIZE / hex_gcd_u32(row_size, HEX_L2_LINE_SIZE)) : 1;
-        const uint32_t total_row_chunks = nrows / rows_per_chunk;
+        const uint32_t total_row_chunks = total_rows / rows_per_chunk;
         const bool can_split_rows = total_row_chunks >= octx->mdev_count;
 
         if (!can_split_rows) {
-            row_base  = (octx->mdev_idx == 0) ? 0 : nrows;
-            dev_nrows = (octx->mdev_idx == 0) ? nrows : 0;
+            row_base = (octx->mdev_idx == 0) ? 0 : total_rows;
+            nrows    = (octx->mdev_idx == 0) ? total_rows : 0;
         } else {
             const uint32_t chunks_per_mdev = fastdiv(total_row_chunks + octx->mdev_count - 1, &octx->mdev_count_div);
-            row_base = MIN(octx->mdev_idx * chunks_per_mdev * rows_per_chunk, nrows);
+            row_base = MIN(octx->mdev_idx * chunks_per_mdev * rows_per_chunk, total_rows);
             if (octx->mdev_idx == octx->mdev_count - 1) {
-                dev_nrows = nrows - row_base;
+                nrows = total_rows - row_base;
             } else {
-                dev_nrows = MIN(chunks_per_mdev * rows_per_chunk, nrows - row_base);
+                nrows = MIN(chunks_per_mdev * rows_per_chunk, total_rows - row_base);
             }
         }
     }
 
-    if (dev_npatches == 0 && dev_nrows == 0) {
+    if (npatches == 0 && nrows == 0) {
         return HTP_STATUS_OK;
     }
 
-    const uint32_t n_threads = MIN(octx->n_threads, MAX(dev_npatches, 1));
+    const uint32_t n_threads = MIN(octx->n_threads, MAX(npatches, 1));
 
     struct htp_im2col_context ictx = { 0 };
     ictx.octx                = octx;
     ictx.patch_base          = patch_base;
-    ictx.npatches            = dev_npatches;
-    ictx.npatches_per_thread = (dev_npatches + n_threads - 1) / n_threads;
+    ictx.npatches            = npatches;
+    ictx.npatches_per_thread = (npatches + n_threads - 1) / n_threads;
 
     // Clean non-overlapping patch-embed -> DMA kernel (if it fits VTCM);
     // everything else (padding/dilation/stride edges) -> pure-DDR kernel.
-    if (im2col_use_patchembed_dma(octx) && dev_nrows > 0) {
-        const uint32_t pth = MIN(octx->n_threads, dev_nrows);
+    if (im2col_use_patchembed_dma(octx) && nrows > 0) {
+        const uint32_t pth = MIN(octx->n_threads, nrows);
         if (pth > 0 && im2col_patchembed_dma_fits(octx, &ictx, pth)) {
             ictx.pe_row_base        = row_base;
-            ictx.pe_nrows           = dev_nrows;
-            ictx.pe_rows_per_thread = (dev_nrows + pth - 1) / pth;
+            ictx.pe_nrows           = nrows;
+            ictx.pe_rows_per_thread = (nrows + pth - 1) / pth;
             if (dst->type == HTP_TYPE_F16) {
                 work_queue_run(octx->ctx->work_queue, im2col_patchembed_dma_thread, &ictx, pth);
             } else {
@@ -349,7 +349,7 @@ int op_im2col(struct htp_ops_context * octx) {
         // else: doesn't fit -> fall through to the pure-DDR kernel below.
     }
 
-    if (dev_npatches == 0) {
+    if (npatches == 0) {
         return HTP_STATUS_OK;
     }
 

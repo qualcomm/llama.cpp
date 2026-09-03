@@ -72,11 +72,11 @@ static void set_rows_thread_dma_##TYPE_NAME##_##IDX_TYPE(unsigned int nth, unsig
     set_rows_preamble;                                                                                           \
     struct htp_thread_trace * tr = &octx->ctx->trace[ith];                                                       \
     const uint32_t dr  = srctx->tasks_per_thread;                                                                \
-    const uint32_t ir0 = srctx->task_start + dr * ith;                                                          \
-    if (ir0 >= srctx->task_start + srctx->tasks) {                                                             \
+    const uint32_t ir0 = srctx->task_start + dr * ith;                                                           \
+    if (ir0 >= srctx->task_start + srctx->tasks) {                                                               \
         return;                                                                                                  \
     }                                                                                                            \
-    const uint32_t ir1 = MIN(ir0 + dr, srctx->task_start + srctx->tasks);                              \
+    const uint32_t ir1 = MIN(ir0 + dr, srctx->task_start + srctx->tasks);                                        \
     dma_queue * dma_queue = octx->ctx->dma[ith];                                                                 \
     const struct htp_set_rows_vtcm_layout * vtcm_layout = &srctx->vtcm_layout;                                   \
     uint8_t * vtcm_src0 = srctx->vtcm_base + vtcm_layout->off_src0 + ith * vtcm_layout->src0_bytes_per_thread;   \

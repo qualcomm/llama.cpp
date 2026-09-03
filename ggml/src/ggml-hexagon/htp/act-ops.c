@@ -346,8 +346,8 @@ static void geglu_f32(const float * restrict src0,
         const uint32_t src0_nrows            = actx->src0_nrows;                                                         \
         const uint32_t src0_nrows_per_thread = actx->src0_nrows_per_thread;                                              \
                                                                                                                          \
-        const uint32_t src0_start_row = actx->row_start + src0_nrows_per_thread * ith;                              \
-        const uint32_t src0_end_row   = MIN(src0_start_row + src0_nrows_per_thread, actx->row_start + src0_nrows);  \
+        const uint32_t src0_start_row = actx->row_start + src0_nrows_per_thread * ith;                                   \
+        const uint32_t src0_end_row   = MIN(src0_start_row + src0_nrows_per_thread, actx->row_start + src0_nrows);       \
                                                                                                                          \
         /* no work for this thread */                                                                                    \
         if (src0_start_row >= src0_end_row) {                                                                            \

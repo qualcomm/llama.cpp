@@ -79,7 +79,7 @@ static void cpy_thread_##NAME##_sameshape(unsigned int nth, unsigned int ith, vo
     cpy_preamble;                                                                              \
     const uint32_t dr  = ct->src0_nrows_per_thread;                                            \
     const uint32_t ir0 = ct->row_start + dr * ith;                                             \
-    const uint32_t ir1 = MIN(ir0 + dr, ct->row_start + ct->nrows);                            \
+    const uint32_t ir1 = MIN(ir0 + dr, ct->row_start + ct->nrows);                             \
     if (ir0 >= ir1) return;                                                                    \
     const bool contiguous = (nb01 == ne00 * ELEM_SIZE) && (nb1 == nb01) &&                     \
                             (nb02 == ne01 * nb01)      && (nb2 == nb02) &&                     \
@@ -121,8 +121,8 @@ static void cpy_thread_##NAME##_reshape(unsigned int nth, unsigned int ith, void
     struct htp_ops_context * octx = ct->octx;                                                        \
     cpy_preamble;                                                                                    \
     const uint32_t th_nelem = ct->elem_per_thread;                                                   \
-    const uint32_t th_start = ct->elem_start + ith * th_nelem;                                        \
-    const uint32_t th_end   = MIN(th_start + th_nelem, ct->elem_start + ct->nelem);                   \
+    const uint32_t th_start = ct->elem_start + ith * th_nelem;                                       \
+    const uint32_t th_end   = MIN(th_start + th_nelem, ct->elem_start + ct->nelem);                  \
     if (th_start >= th_end) return;                                                                  \
                                                                                                      \
     const uint32_t ne01_ne00      = ne01 * ne00;                                                     \

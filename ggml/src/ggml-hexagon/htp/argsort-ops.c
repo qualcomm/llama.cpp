@@ -341,8 +341,8 @@ static void htp_argsort_f32_##ne00##_##order_name(unsigned int n, unsigned int i
     const struct htp_tensor * dst = octx->dst;                                                                 \
     uint8_t * spad = actx->vtcm_base + actx->vtcm_per_thread * i;                                              \
     uint32_t rows_per_thread = actx->nrows_per_thread;                                                         \
-    uint32_t start_row = actx->row_start + rows_per_thread * i;                                           \
-    uint32_t end_row = MIN(start_row + rows_per_thread, actx->row_end);                                   \
+    uint32_t start_row = actx->row_start + rows_per_thread * i;                                                \
+    uint32_t end_row = MIN(start_row + rows_per_thread, actx->row_end);                                        \
     size_t values_size = hex_round_up(ne00 * sizeof(float), 128);                                              \
     float * values_buf = (float *) spad;                                                                       \
     int32_t * indices_buf = (int32_t *) (spad + values_size);                                                  \

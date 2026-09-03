@@ -66,11 +66,11 @@ static void get_rows_thread_st_##IDX_TYPE(unsigned int nth, unsigned int ith, vo
     const struct htp_get_rows_kernel_params * kparams = grctx->kparams;                                                \
     get_rows_preamble;                                                                                                 \
     const uint32_t dr  = grctx->tasks_per_thread;                                                                      \
-    const uint32_t ir0 = grctx->task_start + dr * ith;                                                            \
-    if (ir0 >= grctx->task_start + grctx->tasks) {                                                           \
+    const uint32_t ir0 = grctx->task_start + dr * ith;                                                                 \
+    if (ir0 >= grctx->task_start + grctx->tasks) {                                                                     \
         return;                                                                                                        \
     }                                                                                                                  \
-    const uint32_t ir1 = MIN(ir0 + dr, grctx->task_start + grctx->tasks);                                    \
+    const uint32_t ir1 = MIN(ir0 + dr, grctx->task_start + grctx->tasks);                                              \
     const uint32_t row_size_bytes = htp_tensor_get_row_size(octx->src[0]->type, ne00);                                 \
     dma_queue * dma_queue = octx->ctx->dma[ith];                                                                       \
     for (uint32_t i = ir0; i < ir1; ++i) {                                                                             \
@@ -106,11 +106,11 @@ static void get_rows_thread_##TYPE_NAME##_##IDX_TYPE(unsigned int nth, unsigned 
     get_rows_preamble;                                                                                                 \
     struct htp_thread_trace * tr = &octx->ctx->trace[ith];                                                             \
     const uint32_t dr  = grctx->tasks_per_thread;                                                                      \
-    const uint32_t ir0 = grctx->task_start + dr * ith;                                                            \
-    if (ir0 >= grctx->task_start + grctx->tasks) {                                                           \
+    const uint32_t ir0 = grctx->task_start + dr * ith;                                                                 \
+    if (ir0 >= grctx->task_start + grctx->tasks) {                                                                     \
         return;                                                                                                        \
     }                                                                                                                  \
-    const uint32_t ir1 = MIN(ir0 + dr, grctx->task_start + grctx->tasks);                                    \
+    const uint32_t ir1 = MIN(ir0 + dr, grctx->task_start + grctx->tasks);                                              \
     const uint32_t chunks_per_row = kparams->chunks_per_row;                                                           \
     const uint32_t chunk_size     = kparams->chunk_size;                                                               \
     dma_queue * dma_queue = octx->ctx->dma[ith];                                                                       \
