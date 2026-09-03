@@ -39,7 +39,7 @@ struct htp_diag_context {
     size_t          dst_row_size_aligned;
     uint32_t        batches_per_thread;
     uint32_t        total_batches;
-    uint32_t        mdev_batch_start;
+    uint32_t        batch_start;
 };
 
 #define htp_diag_preamble                                              \
@@ -61,8 +61,8 @@ static void diag_thread_f32_dma(unsigned int nth, unsigned int ith, void * data)
     htp_diag_preamble;
     dma_queue * dma_queue = octx->ctx->dma[ith];
 
-    const uint32_t ib0 = dctx->mdev_batch_start + dctx->batches_per_thread * ith;
-    const uint32_t ib1 = MIN(ib0 + dctx->batches_per_thread, dctx->mdev_batch_start + dctx->total_batches);
+    const uint32_t ib0 = dctx->batch_start + dctx->batches_per_thread * ith;
+    const uint32_t ib1 = MIN(ib0 + dctx->batches_per_thread, dctx->batch_start + dctx->total_batches);
 
     if (ib0 >= ib1) {
         return;
@@ -128,8 +128,8 @@ static void diag_thread_f32(unsigned int nth, unsigned int ith, void * data) {
     const uint8_t * src_data = (const uint8_t *) src0->data;
     uint8_t *       dst_data = (uint8_t *) dst->data;
 
-    const uint32_t ib0 = dctx->mdev_batch_start + dctx->batches_per_thread * ith;
-    const uint32_t ib1 = MIN(ib0 + dctx->batches_per_thread, dctx->mdev_batch_start + dctx->total_batches);
+    const uint32_t ib0 = dctx->batch_start + dctx->batches_per_thread * ith;
+    const uint32_t ib1 = MIN(ib0 + dctx->batches_per_thread, dctx->batch_start + dctx->total_batches);
 
     struct htp_thread_trace * tr = &octx->ctx->trace[ith];
     htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) ib0);
@@ -164,7 +164,9 @@ int op_diag_f32(struct htp_ops_context * octx) {
     const uint32_t total_batches = src0->ne[2] * src0->ne[3];
     const size_t dst_batch_size  = dst->ne[1] * dst->nb[1];
 
-    uint32_t mdev_batch_start, mdev_nbatches;
+    uint32_t batch_start = 0;
+    uint32_t nbatches    = total_batches;
+
     if (octx->mdev_count > 1) {
         bool can_split = (dst->ne[0] == 1 || dst->nb[0] == sizeof(float)) && !htp_tensor_is_permuted(dst);
         uint32_t batches_per_chunk = 1;
@@ -181,23 +183,20 @@ int op_diag_f32(struct htp_ops_context * octx) {
 
         const uint32_t total_chunks = can_split ? (total_batches / batches_per_chunk) : 0;
         if (total_chunks < octx->mdev_count) {
-            mdev_batch_start = (octx->mdev_idx == 0) ? 0 : total_batches;
-            mdev_nbatches    = (octx->mdev_idx == 0) ? total_batches : 0;
+            batch_start = (octx->mdev_idx == 0) ? 0 : total_batches;
+            nbatches    = (octx->mdev_idx == 0) ? total_batches : 0;
         } else {
             const uint32_t chunks_per_mdev = fastdiv(total_chunks + octx->mdev_count - 1, &octx->mdev_count_div);
-            mdev_batch_start = MIN(octx->mdev_idx * chunks_per_mdev * batches_per_chunk, total_batches);
+            batch_start = MIN(octx->mdev_idx * chunks_per_mdev * batches_per_chunk, total_batches);
             if (octx->mdev_idx == octx->mdev_count - 1) {
-                mdev_nbatches = total_batches - mdev_batch_start;
+                nbatches = total_batches - batch_start;
             } else {
-                mdev_nbatches = MIN(chunks_per_mdev * batches_per_chunk, total_batches - mdev_batch_start);
+                nbatches = MIN(chunks_per_mdev * batches_per_chunk, total_batches - batch_start);
             }
         }
-    } else {
-        mdev_batch_start = 0;
-        mdev_nbatches    = total_batches;
     }
 
-    if (mdev_nbatches == 0) {
+    if (nbatches == 0) {
         return HTP_STATUS_OK;
     }
 
@@ -226,9 +225,9 @@ int op_diag_f32(struct htp_ops_context * octx) {
         .dst_row_size           = dst_row_size,
         .src_batch_size_aligned = src_batch_size_aligned,
         .dst_row_size_aligned   = dst_row_size_aligned,
-        .batches_per_thread     = fastdiv(mdev_nbatches + n_threads - 1, &octx->n_threads_div),
-        .total_batches          = mdev_nbatches,
-        .mdev_batch_start       = mdev_batch_start,
+        .batches_per_thread     = fastdiv(nbatches + n_threads - 1, &octx->n_threads_div),
+        .total_batches          = nbatches,
+        .batch_start            = batch_start,
     };
 
     if (octx->ctx->vtcm_size < spad_per_thread * n_threads) {

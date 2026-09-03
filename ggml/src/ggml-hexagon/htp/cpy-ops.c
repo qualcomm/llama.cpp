@@ -29,13 +29,13 @@ struct htp_copy_context {
     uint32_t          src0_blocks_per_row;
     uint32_t          dst_blocks_per_row;
 
-    uint32_t          mdev_elem_start;
-    uint32_t          mdev_nelem;
+    uint32_t          elem_start;
+    uint32_t          nelem;
     uint32_t          elem_per_thread;
 
     uint32_t          src0_nrows_per_thread;
-    uint32_t          mdev_row_start;
-    uint32_t          mdev_nrows;
+    uint32_t          row_start;
+    uint32_t          nrows;
 
     struct fastdiv_values div_ne01;
     struct fastdiv_values div_ne02_ne01;
@@ -78,8 +78,8 @@ static void cpy_thread_##NAME##_sameshape(unsigned int nth, unsigned int ith, vo
     struct htp_ops_context * octx = ct->octx;                                                  \
     cpy_preamble;                                                                              \
     const uint32_t dr  = ct->src0_nrows_per_thread;                                            \
-    const uint32_t ir0 = ct->mdev_row_start + dr * ith;                                        \
-    const uint32_t ir1 = MIN(ir0 + dr, ct->mdev_row_start + ct->mdev_nrows);                   \
+    const uint32_t ir0 = ct->row_start + dr * ith;                                             \
+    const uint32_t ir1 = MIN(ir0 + dr, ct->row_start + ct->nrows);                            \
     if (ir0 >= ir1) return;                                                                    \
     const bool contiguous = (nb01 == ne00 * ELEM_SIZE) && (nb1 == nb01) &&                     \
                             (nb02 == ne01 * nb01)      && (nb2 == nb02) &&                     \
@@ -121,8 +121,8 @@ static void cpy_thread_##NAME##_reshape(unsigned int nth, unsigned int ith, void
     struct htp_ops_context * octx = ct->octx;                                                        \
     cpy_preamble;                                                                                    \
     const uint32_t th_nelem = ct->elem_per_thread;                                                   \
-    const uint32_t th_start = ct->mdev_elem_start + ith * th_nelem;                                  \
-    const uint32_t th_end   = MIN(th_start + th_nelem, ct->mdev_elem_start + ct->mdev_nelem);        \
+    const uint32_t th_start = ct->elem_start + ith * th_nelem;                                        \
+    const uint32_t th_end   = MIN(th_start + th_nelem, ct->elem_start + ct->nelem);                   \
     if (th_start >= th_end) return;                                                                  \
                                                                                                      \
     const uint32_t ne01_ne00      = ne01 * ne00;                                                     \
@@ -188,8 +188,8 @@ static void cpy_thread_f16_f32_sameshape(unsigned int nth, unsigned int ith, voi
     cpy_preamble;
 
     const uint32_t dr  = ct->src0_nrows_per_thread;
-    const uint32_t ir0 = ct->mdev_row_start + dr * ith;
-    const uint32_t ir1 = MIN(ir0 + dr, ct->mdev_row_start + ct->mdev_nrows);
+    const uint32_t ir0 = ct->row_start + dr * ith;
+    const uint32_t ir1 = MIN(ir0 + dr, ct->row_start + ct->nrows);
     if (ir0 >= ir1) return;
 
     const uint32_t ne02_ne01 = ne02 * ne01;
@@ -224,8 +224,8 @@ static void cpy_thread_f32_f16_sameshape(unsigned int nth, unsigned int ith, voi
     cpy_preamble;
 
     const uint32_t dr  = ct->src0_nrows_per_thread;
-    const uint32_t ir0 = ct->mdev_row_start + dr * ith;
-    const uint32_t ir1 = MIN(ir0 + dr, ct->mdev_row_start + ct->mdev_nrows);
+    const uint32_t ir0 = ct->row_start + dr * ith;
+    const uint32_t ir1 = MIN(ir0 + dr, ct->row_start + ct->nrows);
     if (ir0 >= ir1) return;
 
     const uint32_t ne02_ne01 = ne02 * ne01;
@@ -335,34 +335,33 @@ int op_cpy(struct htp_ops_context * octx) {
         ct.div_ne01      = init_fastdiv_values(ne01);
         ct.div_ne02_ne01 = init_fastdiv_values(ne02 * ne01);
 
-        uint32_t mdev_row_start, mdev_nrows;
+        uint32_t row_start = 0;
+        uint32_t nrows     = total_rows;
+
         if (octx->mdev_count > 1) {
             const uint32_t rows_per_chunk = (row_size > 0) ? (HEX_L2_LINE_SIZE / hex_gcd_u32(row_size, HEX_L2_LINE_SIZE)) : 1;
             const uint32_t total_chunks   = dst_is_contiguous ? (total_rows / rows_per_chunk) : 0;
             if (total_chunks < octx->mdev_count) {
-                mdev_row_start = (octx->mdev_idx == 0) ? 0 : total_rows;
-                mdev_nrows     = (octx->mdev_idx == 0) ? total_rows : 0;
+                row_start = (octx->mdev_idx == 0) ? 0 : total_rows;
+                nrows     = (octx->mdev_idx == 0) ? total_rows : 0;
             } else {
                 uint32_t chunks_per_mdev = fastdiv(total_chunks + octx->mdev_count - 1, &octx->mdev_count_div);
-                mdev_row_start = MIN(octx->mdev_idx * chunks_per_mdev * rows_per_chunk, total_rows);
+                row_start = MIN(octx->mdev_idx * chunks_per_mdev * rows_per_chunk, total_rows);
                 if (octx->mdev_idx == octx->mdev_count - 1) {
-                    mdev_nrows = total_rows - mdev_row_start;
+                    nrows = total_rows - row_start;
                 } else {
-                    mdev_nrows = MIN(chunks_per_mdev * rows_per_chunk, total_rows - mdev_row_start);
+                    nrows = MIN(chunks_per_mdev * rows_per_chunk, total_rows - row_start);
                 }
             }
-        } else {
-            mdev_row_start = 0;
-            mdev_nrows     = total_rows;
         }
 
-        if (mdev_nrows == 0) {
+        if (nrows == 0) {
             return HTP_STATUS_OK;
         }
 
-        ct.mdev_row_start = mdev_row_start;
-        ct.mdev_nrows     = mdev_nrows;
-        ct.src0_nrows_per_thread = fastdiv(mdev_nrows + n_threads - 1, &octx->n_threads_div);
+        ct.row_start = row_start;
+        ct.nrows     = nrows;
+        ct.src0_nrows_per_thread = fastdiv(nrows + n_threads - 1, &octx->n_threads_div);
 
         if (sametype && octx->mdev_count <= 1) {
             use_dma = true;
@@ -393,33 +392,32 @@ int op_cpy(struct htp_ops_context * octx) {
         ct.div_ne01_ne00      = init_fastdiv_values(ne01 * ne00);
         ct.div_ne02_ne01_ne00 = init_fastdiv_values(ne02 * ne01 * ne00);
 
-        uint32_t mdev_elem_start, mdev_nelem;
+        uint32_t elem_start = 0;
+        uint32_t nelem      = total_elems;
+
         if (octx->mdev_count > 1) {
             const uint32_t aligned_lines = dst_is_contiguous ? n_lines : 0;
             if (aligned_lines < octx->mdev_count) {
-                mdev_elem_start = (octx->mdev_idx == 0) ? 0 : total_elems;
-                mdev_nelem      = (octx->mdev_idx == 0) ? total_elems : 0;
+                elem_start = (octx->mdev_idx == 0) ? 0 : total_elems;
+                nelem      = (octx->mdev_idx == 0) ? total_elems : 0;
             } else {
                 uint32_t lines_per_mdev = fastdiv(aligned_lines + octx->mdev_count - 1, &octx->mdev_count_div);
-                mdev_elem_start = MIN(octx->mdev_idx * lines_per_mdev * elems_per_line, total_elems);
+                elem_start = MIN(octx->mdev_idx * lines_per_mdev * elems_per_line, total_elems);
                 if (octx->mdev_idx == octx->mdev_count - 1) {
-                    mdev_nelem = total_elems - mdev_elem_start;
+                    nelem = total_elems - elem_start;
                 } else {
-                    mdev_nelem = MIN(lines_per_mdev * elems_per_line, total_elems - mdev_elem_start);
+                    nelem = MIN(lines_per_mdev * elems_per_line, total_elems - elem_start);
                 }
             }
-        } else {
-            mdev_elem_start = 0;
-            mdev_nelem      = total_elems;
         }
 
-        if (mdev_nelem == 0) {
+        if (nelem == 0) {
             return HTP_STATUS_OK;
         }
 
-        ct.mdev_elem_start = mdev_elem_start;
-        ct.mdev_nelem      = mdev_nelem;
-        ct.elem_per_thread = fastdiv(mdev_nelem + n_threads - 1, &octx->n_threads_div);
+        ct.elem_start      = elem_start;
+        ct.nelem           = nelem;
+        ct.elem_per_thread = fastdiv(nelem + n_threads - 1, &octx->n_threads_div);
 
         work_queue_func_t copy_fun = (src0->type == HTP_TYPE_F32) ? cpy_thread_f32_reshape : cpy_thread_f16_reshape;
         work_queue_run(octx->ctx->work_queue, copy_fun, &ct, n_threads);

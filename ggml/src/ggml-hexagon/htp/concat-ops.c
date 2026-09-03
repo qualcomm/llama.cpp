@@ -16,10 +16,10 @@ struct htp_concat_context {
     struct htp_ops_context * octx;
     uint32_t dim;
     uint32_t nrows_per_thread;
-    uint32_t mdev_row_start;
-    uint32_t mdev_nrows;
-    uint32_t mdev_elem_start;
-    uint32_t mdev_nelems;
+    uint32_t row_start;
+    uint32_t nrows;
+    uint32_t elem_start;
+    uint32_t nelems;
     struct fastdiv_values div_ne0;
     struct fastdiv_values div_ne1;
     struct fastdiv_values div_ne2;
@@ -36,9 +36,9 @@ static void concat_2d_f32_transposed(unsigned int nth, unsigned int ith, void * 
     const uint32_t src0_ne0 = src0->ne[0];
     const uint32_t src1_ne0 = src1->ne[0];
 
-    const uint32_t mdev_row_end = cctx->mdev_row_start + cctx->mdev_nrows;
-    const uint32_t start_i = cctx->mdev_row_start + ith * cctx->nrows_per_thread;
-    const uint32_t end_i   = (start_i + cctx->nrows_per_thread < mdev_row_end) ? (start_i + cctx->nrows_per_thread) : mdev_row_end;
+    const uint32_t row_end = cctx->row_start + cctx->nrows;
+    const uint32_t start_i = cctx->row_start + ith * cctx->nrows_per_thread;
+    const uint32_t end_i   = (start_i + cctx->nrows_per_thread < row_end) ? (start_i + cctx->nrows_per_thread) : row_end;
     if (start_i >= end_i) return;
 
     dma_queue * q = octx->ctx->dma[ith];
@@ -108,9 +108,9 @@ static void concat_2d_f16_transposed(unsigned int nth, unsigned int ith, void * 
     const uint32_t src0_ne0 = src0->ne[0];
     const uint32_t src1_ne0 = src1->ne[0];
 
-    const uint32_t mdev_row_end = cctx->mdev_row_start + cctx->mdev_nrows;
-    const uint32_t start_i = cctx->mdev_row_start + ith * cctx->nrows_per_thread;
-    const uint32_t end_i   = (start_i + cctx->nrows_per_thread < mdev_row_end) ? (start_i + cctx->nrows_per_thread) : mdev_row_end;
+    const uint32_t row_end = cctx->row_start + cctx->nrows;
+    const uint32_t start_i = cctx->row_start + ith * cctx->nrows_per_thread;
+    const uint32_t end_i   = (start_i + cctx->nrows_per_thread < row_end) ? (start_i + cctx->nrows_per_thread) : row_end;
     if (start_i >= end_i) return;
 
     dma_queue * q = octx->ctx->dma[ith];
@@ -183,12 +183,12 @@ static void concat_generic(unsigned int nth, unsigned int ith, void * data) {
     const uint32_t ne[4] = {dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3]};
 
     // Per-device element range aligned to prevent false sharing
-    const uint32_t mdev_elem_start = cctx->mdev_elem_start;
-    const uint32_t mdev_nelems     = cctx->mdev_nelems;
-    const uint32_t chunk_size = (mdev_nelems + nth - 1) / nth;
+    const uint32_t elem_start = cctx->elem_start;
+    const uint32_t nelems     = cctx->nelems;
+    const uint32_t chunk_size = (nelems + nth - 1) / nth;
 
-    const uint32_t start_idx = MIN(mdev_elem_start + ith * chunk_size, mdev_elem_start + mdev_nelems);
-    const uint32_t end_idx   = MIN(start_idx + chunk_size, mdev_elem_start + mdev_nelems);
+    const uint32_t start_idx = MIN(elem_start + ith * chunk_size, elem_start + nelems);
+    const uint32_t end_idx   = MIN(start_idx + chunk_size, elem_start + nelems);
 
     // Naive scalar element-wise copy
     for (uint32_t idx = start_idx; idx < end_idx; idx++) {
@@ -258,7 +258,8 @@ int op_concat(struct htp_ops_context * octx) {
     if (dim == 0 && is_2d && is_src1_transposed && !is_src0_transposed) {
         const uint32_t total_rows = dst->ne[1];
         const size_t dst_data_row_size = dst->ne[0] * type_size;
-        uint32_t mdev_row_start, mdev_nrows;
+        uint32_t row_start = 0;
+        uint32_t nrows     = total_rows;
         if (octx->mdev_count > 1) {
             bool can_split = (dst->ne[0] == 1 || dst->nb[0] == type_size) && !htp_tensor_is_permuted(dst);
             uint32_t rows_per_chunk = 1;
@@ -276,32 +277,29 @@ int op_concat(struct htp_ops_context * octx) {
 
             const uint32_t total_chunks = can_split ? (total_rows / rows_per_chunk) : 0;
             if (total_chunks < octx->mdev_count) {
-                mdev_row_start = (octx->mdev_idx == 0) ? 0 : total_rows;
-                mdev_nrows     = (octx->mdev_idx == 0) ? total_rows : 0;
+                row_start = (octx->mdev_idx == 0) ? 0 : total_rows;
+                nrows     = (octx->mdev_idx == 0) ? total_rows : 0;
             } else {
                 const uint32_t chunks_per_mdev = fastdiv(total_chunks + octx->mdev_count - 1, &octx->mdev_count_div);
-                mdev_row_start = MIN(octx->mdev_idx * chunks_per_mdev * rows_per_chunk, total_rows);
+                row_start = MIN(octx->mdev_idx * chunks_per_mdev * rows_per_chunk, total_rows);
                 if (octx->mdev_idx == octx->mdev_count - 1) {
-                    mdev_nrows = total_rows - mdev_row_start;
+                    nrows = total_rows - row_start;
                 } else {
-                    mdev_nrows = MIN(chunks_per_mdev * rows_per_chunk, total_rows - mdev_row_start);
+                    nrows = MIN(chunks_per_mdev * rows_per_chunk, total_rows - row_start);
                 }
             }
-        } else {
-            mdev_row_start = 0;
-            mdev_nrows     = total_rows;
         }
 
-        if (mdev_nrows == 0) {
+        if (nrows == 0) {
             return HTP_STATUS_OK;
         }
 
-        cctx.mdev_row_start = mdev_row_start;
-        cctx.mdev_nrows     = mdev_nrows;
+        cctx.row_start = row_start;
+        cctx.nrows     = nrows;
 
         uint32_t block_i = (type_size == 4) ? 32 : 64;
 
-        cctx.nrows_per_thread = fastdiv(mdev_nrows + n_threads - 1, &octx->n_threads_div);
+        cctx.nrows_per_thread = fastdiv(nrows + n_threads - 1, &octx->n_threads_div);
 
         // Allocate VTCM
         uint32_t spad1_stride = block_i * type_size;
@@ -331,34 +329,32 @@ int op_concat(struct htp_ops_context * octx) {
         }
     } else {
         const uint32_t total_elements = dst->ne[0] * dst->ne[1] * dst->ne[2] * dst->ne[3];
-        uint32_t mdev_elem_start, mdev_nelems;
+        uint32_t elem_start = 0;
+        uint32_t nelems     = total_elements;
         if (octx->mdev_count > 1) {
             const uint32_t elems_per_chunk = HEX_L2_LINE_SIZE / type_size;
             bool can_split = htp_tensor_is_contiguous(dst, type_size) && !htp_tensor_is_permuted(dst);
             const uint32_t total_chunks = can_split ? (total_elements / elems_per_chunk) : 0;
             if (total_chunks < octx->mdev_count) {
-                mdev_elem_start = (octx->mdev_idx == 0) ? 0 : total_elements;
-                mdev_nelems     = (octx->mdev_idx == 0) ? total_elements : 0;
+                elem_start = (octx->mdev_idx == 0) ? 0 : total_elements;
+                nelems     = (octx->mdev_idx == 0) ? total_elements : 0;
             } else {
                 const uint32_t chunks_per_mdev = fastdiv(total_chunks + octx->mdev_count - 1, &octx->mdev_count_div);
-                mdev_elem_start = MIN(octx->mdev_idx * chunks_per_mdev * elems_per_chunk, total_elements);
+                elem_start = MIN(octx->mdev_idx * chunks_per_mdev * elems_per_chunk, total_elements);
                 if (octx->mdev_idx == octx->mdev_count - 1) {
-                    mdev_nelems = total_elements - mdev_elem_start;
+                    nelems = total_elements - elem_start;
                 } else {
-                    mdev_nelems = MIN(chunks_per_mdev * elems_per_chunk, total_elements - mdev_elem_start);
+                    nelems = MIN(chunks_per_mdev * elems_per_chunk, total_elements - elem_start);
                 }
             }
-        } else {
-            mdev_elem_start = 0;
-            mdev_nelems     = total_elements;
         }
 
-        if (mdev_nelems == 0) {
+        if (nelems == 0) {
             return HTP_STATUS_OK;
         }
 
-        cctx.mdev_elem_start = mdev_elem_start;
-        cctx.mdev_nelems     = mdev_nelems;
+        cctx.elem_start = elem_start;
+        cctx.nelems     = nelems;
     }
 
     work_queue_run(octx->ctx->work_queue, worker_func, &cctx, n_threads);

@@ -46,7 +46,7 @@ struct htp_unary_context {
     uint32_t                  block;
     uint32_t                  src0_nrows;
     uint32_t                  src0_nrows_per_thread;
-    uint32_t                  mdev_row_start;
+    uint32_t                  row_start;
     uint32_t                  nc;
     uint32_t                  col_tile;             // tiled mode
     bool                      broadcast_weight;
@@ -662,8 +662,8 @@ static void unary_task_##SUFFIX##_##NAME(unsigned int nth, unsigned int ith, voi
     const size_t dst_row_size_aligned  = uctx->dst_row_size_aligned;                                                \
                                                                                                                     \
     const uint32_t src0_nrows = uctx->src0_nrows;                                                                   \
-    const uint32_t src0_start_row = uctx->mdev_row_start + src0_nrows_per_thread * ith;                               \
-    const uint32_t src0_end_row   = MIN(src0_start_row + src0_nrows_per_thread, uctx->mdev_row_start + src0_nrows);   \
+    const uint32_t src0_start_row = uctx->row_start + src0_nrows_per_thread * ith;                                     \
+    const uint32_t src0_end_row   = MIN(src0_start_row + src0_nrows_per_thread, uctx->row_start + src0_nrows);         \
                                                                                                                     \
     if (src0_start_row >= src0_end_row) {                                                                           \
         return;                                                                                                     \
@@ -850,8 +850,8 @@ static void unary_task_f32_tiled_##NAME(unsigned int nth, unsigned int ith, void
     const uint32_t col_tile  = uctx->col_tile;                                                                        \
                                                                                                                       \
     const uint32_t src0_nrows = uctx->src0_nrows;                                                                     \
-    const uint32_t src0_start_row = uctx->mdev_row_start + src0_nrows_per_thread * ith;                               \
-    const uint32_t src0_end_row   = MIN(src0_start_row + src0_nrows_per_thread, uctx->mdev_row_start + src0_nrows);   \
+    const uint32_t src0_start_row = uctx->row_start + src0_nrows_per_thread * ith;                                     \
+    const uint32_t src0_end_row   = MIN(src0_start_row + src0_nrows_per_thread, uctx->row_start + src0_nrows);         \
                                                                                                                       \
     if (src0_start_row >= src0_end_row) {                                                                             \
         return;                                                                                                       \
@@ -1154,7 +1154,9 @@ static int execute_op_unary(struct htp_ops_context * octx) {
     const size_t src0_data_row_size = src0->ne[0] * elem_size;
     const size_t dst_data_row_size  = dst->ne[0]  * elem_size;
 
-    uint32_t mdev_row_start, mdev_nrows;
+    uint32_t row_start = 0;
+    uint32_t nrows     = src0_nrows;
+
     if (octx->mdev_count > 1) {
         bool can_split = (dst->ne[0] == 1 || dst->nb[0] == elem_size) && !htp_tensor_is_permuted(dst);
         uint32_t rows_per_chunk = 1;
@@ -1172,23 +1174,20 @@ static int execute_op_unary(struct htp_ops_context * octx) {
 
         const uint32_t total_chunks = can_split ? (src0_nrows / rows_per_chunk) : 0;
         if (total_chunks < octx->mdev_count) {
-            mdev_row_start = (octx->mdev_idx == 0) ? 0 : src0_nrows;
-            mdev_nrows     = (octx->mdev_idx == 0) ? src0_nrows : 0;
+            row_start = (octx->mdev_idx == 0) ? 0 : src0_nrows;
+            nrows     = (octx->mdev_idx == 0) ? src0_nrows : 0;
         } else {
             const uint32_t chunks_per_mdev = fastdiv(total_chunks + octx->mdev_count - 1, &octx->mdev_count_div);
-            mdev_row_start = MIN(octx->mdev_idx * chunks_per_mdev * rows_per_chunk, src0_nrows);
+            row_start = MIN(octx->mdev_idx * chunks_per_mdev * rows_per_chunk, src0_nrows);
             if (octx->mdev_idx == octx->mdev_count - 1) {
-                mdev_nrows = src0_nrows - mdev_row_start;
+                nrows = src0_nrows - row_start;
             } else {
-                mdev_nrows = MIN(chunks_per_mdev * rows_per_chunk, src0_nrows - mdev_row_start);
+                nrows = MIN(chunks_per_mdev * rows_per_chunk, src0_nrows - row_start);
             }
         }
-    } else {
-        mdev_row_start = 0;
-        mdev_nrows     = src0_nrows;
     }
 
-    if (mdev_nrows == 0) {
+    if (nrows == 0) {
         return HTP_STATUS_OK;
     }
 
@@ -1231,9 +1230,9 @@ static int execute_op_unary(struct htp_ops_context * octx) {
         struct htp_unary_context uctx = {
             .octx                  = octx,
             .kparams               = kparams,
-            .src0_nrows_per_thread = fastdiv(mdev_nrows + n_threads - 1, &octx->n_threads_div),
-            .src0_nrows            = mdev_nrows,
-            .mdev_row_start         = mdev_row_start,
+            .src0_nrows_per_thread = fastdiv(nrows + n_threads - 1, &octx->n_threads_div),
+            .src0_nrows            = nrows,
+            .row_start             = row_start,
 
             .data_src0             = (const uint8_t *)src0->data,
             .data_src1             = (octx->op == HTP_OP_RMS_NORM_MUL) ? (const uint8_t *)src1->data : NULL,

@@ -79,7 +79,7 @@ struct htp_act_context {
     uint32_t                 block;
     uint32_t                 src0_nrows;
     uint32_t                 src0_nrows_per_thread;
-    uint32_t                 mdev_row_start;
+    uint32_t                 row_start;
     int                      nc;
 
     uint8_t *                vtcm_src0;
@@ -346,8 +346,8 @@ static void geglu_f32(const float * restrict src0,
         const uint32_t src0_nrows            = actx->src0_nrows;                                                         \
         const uint32_t src0_nrows_per_thread = actx->src0_nrows_per_thread;                                              \
                                                                                                                          \
-        const uint32_t src0_start_row = actx->mdev_row_start + src0_nrows_per_thread * ith;                              \
-        const uint32_t src0_end_row   = MIN(src0_start_row + src0_nrows_per_thread, actx->mdev_row_start + src0_nrows);  \
+        const uint32_t src0_start_row = actx->row_start + src0_nrows_per_thread * ith;                              \
+        const uint32_t src0_end_row   = MIN(src0_start_row + src0_nrows_per_thread, actx->row_start + src0_nrows);  \
                                                                                                                          \
         /* no work for this thread */                                                                                    \
         if (src0_start_row >= src0_end_row) {                                                                            \
@@ -474,17 +474,16 @@ static int execute_op_activations_f32(struct htp_ops_context * octx) {
 
     const uint32_t src0_nrows = src0->ne[1] * src0->ne[2] * src0->ne[3];
 
-    uint32_t mdev_row_start, mdev_nrows;
+    uint32_t row_start = 0;
+    uint32_t nrows     = src0_nrows;
+
     if (octx->mdev_count > 1) {
         const uint32_t rows_per_mdev = fastdiv(src0_nrows + octx->mdev_count - 1, &octx->mdev_count_div);
-        mdev_row_start = MIN(octx->mdev_idx * rows_per_mdev, src0_nrows);
-        mdev_nrows     = MIN(rows_per_mdev, src0_nrows - mdev_row_start);
-    } else {
-        mdev_row_start = 0;
-        mdev_nrows     = src0_nrows;
+        row_start = MIN(octx->mdev_idx * rows_per_mdev, src0_nrows);
+        nrows     = MIN(rows_per_mdev, src0_nrows - row_start);
     }
 
-    if (mdev_nrows == 0) {
+    if (nrows == 0) {
         return HTP_STATUS_OK;
     }
 
@@ -533,7 +532,7 @@ static int execute_op_activations_f32(struct htp_ops_context * octx) {
     struct htp_act_context actx;
     actx.octx = octx;
 
-    actx.src0_nrows_per_thread = fastdiv(mdev_nrows + n_threads - 1, &octx->n_threads_div);
+    actx.src0_nrows_per_thread = fastdiv(nrows + n_threads - 1, &octx->n_threads_div);
 
     actx.src0_row_size = src0_row_size;
     actx.src1_row_size = src1_row_size;
@@ -560,8 +559,8 @@ static int execute_op_activations_f32(struct htp_ops_context * octx) {
     actx.dst_spad_half_size  = L.dst_bytes_per_thread / 2;
 
     actx.block = actx.src0_spad_half_size / actx.src0_row_size_aligned;
-    actx.src0_nrows = mdev_nrows;
-    actx.mdev_row_start = mdev_row_start;
+    actx.src0_nrows = nrows;
+    actx.row_start  = row_start;
 
     actx.nc = dst->ne[0];
 

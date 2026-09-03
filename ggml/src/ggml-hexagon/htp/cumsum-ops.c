@@ -48,7 +48,7 @@ struct htp_cumsum_context {
     size_t          dst_row_size_aligned;
     uint32_t        rows_per_thread;
     uint32_t        total_rows;
-    uint32_t        mdev_row_start;
+    uint32_t        row_start;
 };
 
 #define htp_cumsum_preamble                                                \
@@ -119,8 +119,8 @@ static inline void hvx_cumsum_row_f32(const float * restrict src, float * restri
 static void cumsum_thread_f32_dma(unsigned int nth, unsigned int ith, void * data) {
     htp_cumsum_preamble;
 
-    const uint32_t ir0 = cctx->mdev_row_start + cctx->rows_per_thread * ith;
-    const uint32_t ir1 = MIN(ir0 + cctx->rows_per_thread, cctx->mdev_row_start + cctx->total_rows);
+    const uint32_t ir0 = cctx->row_start + cctx->rows_per_thread * ith;
+    const uint32_t ir1 = MIN(ir0 + cctx->rows_per_thread, cctx->row_start + cctx->total_rows);
 
     if (ir0 >= ir1) {
         return;
@@ -189,8 +189,8 @@ static void cumsum_thread_f32(unsigned int nth, unsigned int ith, void * data) {
     const uint8_t * src_data = (const uint8_t *) src0->data;
     uint8_t *       dst_data = (uint8_t *) dst->data;
 
-    const uint32_t ir0 = cctx->mdev_row_start + cctx->rows_per_thread * ith;
-    const uint32_t ir1 = MIN(ir0 + cctx->rows_per_thread, cctx->mdev_row_start + cctx->total_rows);
+    const uint32_t ir0 = cctx->row_start + cctx->rows_per_thread * ith;
+    const uint32_t ir1 = MIN(ir0 + cctx->rows_per_thread, cctx->row_start + cctx->total_rows);
 
     struct htp_thread_trace * tr = &octx->ctx->trace[ith];
     htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) ir0);
@@ -219,7 +219,9 @@ int op_cumsum_f32(struct htp_ops_context * octx) {
     const uint32_t total_rows      = src0->ne[1] * src0->ne[2] * src0->ne[3];
     const size_t dst_data_row_size = dst->ne[0] * sizeof(float);
 
-    uint32_t mdev_row_start, mdev_nrows;
+    uint32_t row_start = 0;
+    uint32_t nrows     = total_rows;
+
     if (octx->mdev_count > 1) {
         bool can_split = (dst->ne[0] == 1 || dst->nb[0] == sizeof(float)) && !htp_tensor_is_permuted(dst);
         uint32_t rows_per_chunk = 1;
@@ -237,23 +239,20 @@ int op_cumsum_f32(struct htp_ops_context * octx) {
 
         const uint32_t total_chunks = can_split ? (total_rows / rows_per_chunk) : 0;
         if (total_chunks < octx->mdev_count) {
-            mdev_row_start = (octx->mdev_idx == 0) ? 0 : total_rows;
-            mdev_nrows     = (octx->mdev_idx == 0) ? total_rows : 0;
+            row_start = (octx->mdev_idx == 0) ? 0 : total_rows;
+            nrows     = (octx->mdev_idx == 0) ? total_rows : 0;
         } else {
             const uint32_t chunks_per_mdev = fastdiv(total_chunks + octx->mdev_count - 1, &octx->mdev_count_div);
-            mdev_row_start = MIN(octx->mdev_idx * chunks_per_mdev * rows_per_chunk, total_rows);
+            row_start = MIN(octx->mdev_idx * chunks_per_mdev * rows_per_chunk, total_rows);
             if (octx->mdev_idx == octx->mdev_count - 1) {
-                mdev_nrows = total_rows - mdev_row_start;
+                nrows = total_rows - row_start;
             } else {
-                mdev_nrows = MIN(chunks_per_mdev * rows_per_chunk, total_rows - mdev_row_start);
+                nrows = MIN(chunks_per_mdev * rows_per_chunk, total_rows - row_start);
             }
         }
-    } else {
-        mdev_row_start = 0;
-        mdev_nrows     = total_rows;
     }
 
-    if (mdev_nrows == 0) {
+    if (nrows == 0) {
         return HTP_STATUS_OK;
     }
 
@@ -282,9 +281,9 @@ int op_cumsum_f32(struct htp_ops_context * octx) {
         .dst_row_size         = dst_row_size,
         .src_row_size_aligned = src_row_size_aligned,
         .dst_row_size_aligned = dst_row_size_aligned,
-        .rows_per_thread      = fastdiv(mdev_nrows + n_threads - 1, &octx->n_threads_div),
-        .total_rows           = mdev_nrows,
-        .mdev_row_start       = mdev_row_start,
+        .rows_per_thread      = fastdiv(nrows + n_threads - 1, &octx->n_threads_div),
+        .total_rows           = nrows,
+        .row_start            = row_start,
     };
 
     if (octx->ctx->vtcm_size < spad_per_thread * n_threads) {

@@ -24,8 +24,8 @@ struct htp_gdn_context {
     size_t   state_bytes;
     uint8_t * vtcm_base;
     size_t   vtcm_per_thread;
-    uint32_t mdev_row_start;
-    uint32_t mdev_nrows;
+    uint32_t row_start;
+    uint32_t nrows;
 };
 
 static inline HVX_Vector gdn_mul_dot_f32(float * restrict dst, const float * restrict mul, const float * restrict dot, uint32_t n) {
@@ -590,9 +590,9 @@ static void gated_delta_net_f32_pp_thread(unsigned int nth, unsigned int ith, vo
     const uint32_t n_seqs   = v->ne[3];
     const uint32_t K        = octx->op_params[0];
 
-    const uint32_t row_end = gctx->mdev_row_start + gctx->mdev_nrows;
+    const uint32_t row_end = gctx->row_start + gctx->nrows;
 
-    if (ith >= gctx->mdev_nrows) {
+    if (ith >= gctx->nrows) {
         return;
     }
 
@@ -626,7 +626,7 @@ static void gated_delta_net_f32_pp_thread(unsigned int nth, unsigned int ith, vo
     const uint64_t state_seq_stride = state->nb[3] / sizeof(float);
     const uint64_t state_size_per_snap = (uint64_t) S_v * S_v * H * n_seqs;
 
-    uint32_t ir_prefetch = gctx->mdev_row_start + ith;
+    uint32_t ir_prefetch = gctx->row_start + ith;
     int spad_idx = 0;
 
     // Prefetch preamble (up to 2 steps)
@@ -652,10 +652,10 @@ static void gated_delta_net_f32_pp_thread(unsigned int nth, unsigned int ith, vo
     }
 
     struct htp_thread_trace * tr = &octx->ctx->trace[ith];
-    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) (gctx->mdev_row_start + ith));
+    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) (gctx->row_start + ith));
 
     int curr_spad_idx = 0;
-    for (uint32_t ir = gctx->mdev_row_start + ith; ir < row_end; ir += nth) {
+    for (uint32_t ir = gctx->row_start + ith; ir < row_end; ir += nth) {
         dma_queue_pop(dma);
         dma_queue_pop(dma);
 
@@ -856,9 +856,9 @@ static void gated_delta_net_f32_tg_thread(unsigned int nth, unsigned int ith, vo
     const uint32_t H        = v->ne[1];
     const uint32_t n_seqs   = v->ne[3];
 
-    const uint32_t row_end = gctx->mdev_row_start + gctx->mdev_nrows;
+    const uint32_t row_end = gctx->row_start + gctx->nrows;
 
-    if (ith >= gctx->mdev_nrows) {
+    if (ith >= gctx->nrows) {
         return;
     }
 
@@ -891,7 +891,7 @@ static void gated_delta_net_f32_tg_thread(unsigned int nth, unsigned int ith, vo
 
     const uint64_t state_seq_stride = state->nb[3] / sizeof(float);
 
-    uint32_t ir_prefetch = gctx->mdev_row_start + ith;
+    uint32_t ir_prefetch = gctx->row_start + ith;
     int spad_idx = 0;
 
     // Prefetch preamble (up to 2 steps)
@@ -917,10 +917,10 @@ static void gated_delta_net_f32_tg_thread(unsigned int nth, unsigned int ith, vo
     }
 
     struct htp_thread_trace * tr = &octx->ctx->trace[ith];
-    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) (gctx->mdev_row_start + ith));
+    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) (gctx->row_start + ith));
 
     int curr_spad_idx = 0;
-    for (uint32_t ir = gctx->mdev_row_start + ith; ir < row_end; ir += nth) {
+    for (uint32_t ir = gctx->row_start + ith; ir < row_end; ir += nth) {
         dma_queue_pop(dma);
         dma_queue_pop(dma);
 
@@ -1140,7 +1140,9 @@ int op_gated_delta_net(struct htp_ops_context * octx) {
 
     const uint32_t total_rows = H * n_seqs;
 
-    uint32_t mdev_row_start, mdev_nrows;
+    uint32_t row_start = 0;
+    uint32_t nrows     = total_rows;
+
     if (octx->mdev_count > 1) {
         const uint32_t head_bytes = S_v * sizeof(float);
         const uint32_t rows_per_chunk = (head_bytes > 0) ? (HEX_L2_LINE_SIZE / hex_gcd_u32(head_bytes, HEX_L2_LINE_SIZE)) : 1;
@@ -1148,23 +1150,20 @@ int op_gated_delta_net(struct htp_ops_context * octx) {
         const bool can_split = total_chunks >= octx->mdev_count;
 
         if (!can_split) {
-            mdev_row_start = (octx->mdev_idx == 0) ? 0 : total_rows;
-            mdev_nrows     = (octx->mdev_idx == 0) ? total_rows : 0;
+            row_start = (octx->mdev_idx == 0) ? 0 : total_rows;
+            nrows     = (octx->mdev_idx == 0) ? total_rows : 0;
         } else {
             const uint32_t chunks_per_mdev = fastdiv(total_chunks + octx->mdev_count - 1, &octx->mdev_count_div);
-            mdev_row_start = MIN(octx->mdev_idx * chunks_per_mdev * rows_per_chunk, total_rows);
+            row_start = MIN(octx->mdev_idx * chunks_per_mdev * rows_per_chunk, total_rows);
             if (octx->mdev_idx == octx->mdev_count - 1) {
-                mdev_nrows = total_rows - mdev_row_start;
+                nrows = total_rows - row_start;
             } else {
-                mdev_nrows = MIN(chunks_per_mdev * rows_per_chunk, total_rows - mdev_row_start);
+                nrows = MIN(chunks_per_mdev * rows_per_chunk, total_rows - row_start);
             }
         }
-    } else {
-        mdev_row_start = 0;
-        mdev_nrows     = total_rows;
     }
 
-    if (mdev_nrows == 0) {
+    if (nrows == 0) {
         return HTP_STATUS_OK;
     }
 
@@ -1172,9 +1171,9 @@ int op_gated_delta_net(struct htp_ops_context * octx) {
 
     struct htp_gdn_context gctx;
     gctx.octx = octx;
-    gctx.mdev_row_start  = mdev_row_start;
-    gctx.mdev_nrows      = mdev_nrows;
-    gctx.rows_per_thread = fastdiv(mdev_nrows + n_threads - 1, &octx->n_threads_div);
+    gctx.row_start       = row_start;
+    gctx.nrows           = nrows;
+    gctx.rows_per_thread = fastdiv(nrows + n_threads - 1, &octx->n_threads_div);
     gctx.state_bytes = (size_t) S_v * S_v * sizeof(float);
 
     size_t state_aligned = (size_t) S_v * S_v * sizeof(float);

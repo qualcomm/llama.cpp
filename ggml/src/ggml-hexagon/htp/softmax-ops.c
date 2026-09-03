@@ -71,8 +71,8 @@ struct htp_softmax_context {
     struct fastdiv_values fastdiv_ne13; // For mask broadcasting
 
     uint32_t src0_nrows_per_thread;
-    uint32_t mdev_row_start;
-    uint32_t mdev_nrows;
+    uint32_t row_start;
+    uint32_t nrows;
 };
 
 static void apply_mask(float * restrict wp0,
@@ -227,11 +227,11 @@ static void softmax_job_f32(unsigned int nth, unsigned int ith, void * data) {
 
     htp_softmax_preamble3;
 
-    const uint32_t src0_nrows            = smctx->mdev_nrows;
+    const uint32_t src0_nrows            = smctx->nrows;
     const uint32_t src0_nrows_per_thread = smctx->src0_nrows_per_thread;
 
-    const uint32_t src0_start_row = smctx->mdev_row_start + src0_nrows_per_thread * ith;
-    const uint32_t src0_end_row   = MIN(src0_start_row + src0_nrows_per_thread, smctx->mdev_row_start + src0_nrows);
+    const uint32_t src0_start_row = smctx->row_start + src0_nrows_per_thread * ith;
+    const uint32_t src0_end_row   = MIN(src0_start_row + src0_nrows_per_thread, smctx->row_start + src0_nrows);
 
     // no work for this thread
     if (src0_start_row >= src0_end_row) {
@@ -349,18 +349,22 @@ static int execute_op_softmax_f32(struct htp_ops_context * octx) {
 
     const uint32_t src0_nrows = src0->ne[1] * src0->ne[2] * src0->ne[3];
     const size_t dst_data_row_size = dst->ne[0] * sizeof(float);
+    const size_t elem_size = sizeof(float);
+    const size_t dst_row_size = dst->nb[1];
 
-    uint32_t mdev_row_start, mdev_nrows;
+    uint32_t row_start = 0;
+    uint32_t nrows     = src0_nrows;
+
     if (octx->mdev_count > 1) {
-        bool can_split = (dst->ne[0] == 1 || dst->nb[0] == sizeof(float)) && !htp_tensor_is_permuted(dst);
+        bool can_split = (dst->ne[0] == 1 || dst->nb[0] == elem_size) && !htp_tensor_is_permuted(dst);
         uint32_t rows_per_chunk = 1;
         if (can_split) {
             if (dst->ne[1] > 1 && (dst->nb[1] & 127) == 0) {
                 rows_per_chunk = 1;
-            } else if (dst->nb[1] == dst_data_row_size &&
+            } else if (dst->nb[1] == dst_row_size &&
                        (dst->ne[2] <= 1 || dst->nb[2] == dst->nb[1] * dst->ne[1]) &&
                        (dst->ne[3] <= 1 || dst->nb[3] == dst->nb[2] * dst->ne[2])) {
-                rows_per_chunk = (dst_data_row_size > 0) ? (HEX_L2_LINE_SIZE / hex_gcd_u32(dst_data_row_size, HEX_L2_LINE_SIZE)) : 1;
+                rows_per_chunk = (dst_row_size > 0) ? (HEX_L2_LINE_SIZE / hex_gcd_u32(dst_row_size, HEX_L2_LINE_SIZE)) : 1;
             } else {
                 can_split = false;
             }
@@ -368,35 +372,31 @@ static int execute_op_softmax_f32(struct htp_ops_context * octx) {
 
         const uint32_t total_chunks = can_split ? (src0_nrows / rows_per_chunk) : 0;
         if (total_chunks < octx->mdev_count) {
-            mdev_row_start = (octx->mdev_idx == 0) ? 0 : src0_nrows;
-            mdev_nrows     = (octx->mdev_idx == 0) ? src0_nrows : 0;
+            row_start = (octx->mdev_idx == 0) ? 0 : src0_nrows;
+            nrows     = (octx->mdev_idx == 0) ? src0_nrows : 0;
         } else {
             const uint32_t chunks_per_mdev = fastdiv(total_chunks + octx->mdev_count - 1, &octx->mdev_count_div);
-            mdev_row_start = MIN(octx->mdev_idx * chunks_per_mdev * rows_per_chunk, src0_nrows);
+            row_start = MIN(octx->mdev_idx * chunks_per_mdev * rows_per_chunk, src0_nrows);
             if (octx->mdev_idx == octx->mdev_count - 1) {
-                mdev_nrows = src0_nrows - mdev_row_start;
+                nrows = src0_nrows - row_start;
             } else {
-                mdev_nrows = MIN(chunks_per_mdev * rows_per_chunk, src0_nrows - mdev_row_start);
+                nrows = MIN(chunks_per_mdev * rows_per_chunk, src0_nrows - row_start);
             }
         }
-    } else {
-        mdev_row_start = 0;
-        mdev_nrows     = src0_nrows;
     }
 
-    if (mdev_nrows == 0) {
+    if (nrows == 0) {
         return HTP_STATUS_OK;
     }
 
     const uint32_t n_threads = octx->n_threads;
 
-    smctx.src0_nrows_per_thread = fastdiv(mdev_nrows + n_threads - 1, &octx->n_threads_div);
-    smctx.mdev_row_start        = mdev_row_start;
-    smctx.mdev_nrows            = mdev_nrows;
+    smctx.src0_nrows_per_thread = fastdiv(nrows + n_threads - 1, &octx->n_threads_div);
+    smctx.row_start             = row_start;
+    smctx.nrows                 = nrows;
 
     const size_t src0_row_size = src0->nb[1];
     const size_t src1_row_size = src0_row_size;
-    const size_t dst_row_size  = dst->nb[1];
 
     // VTCM scratchpads for all tensors
     // 4 rows per thread, padded to HVX vector size

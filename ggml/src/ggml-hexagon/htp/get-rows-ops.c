@@ -24,8 +24,8 @@ struct get_rows_context {
     const struct htp_get_rows_kernel_params * kparams;
     struct htp_get_rows_vtcm_layout vtcm_layout;
     uint8_t * vtcm_base;
-    uint32_t mdev_task_start;
-    uint32_t mdev_tasks;
+    uint32_t task_start;
+    uint32_t tasks;
     uint32_t tasks_per_thread;
 };
 
@@ -66,11 +66,11 @@ static void get_rows_thread_st_##IDX_TYPE(unsigned int nth, unsigned int ith, vo
     const struct htp_get_rows_kernel_params * kparams = grctx->kparams;                                                \
     get_rows_preamble;                                                                                                 \
     const uint32_t dr  = grctx->tasks_per_thread;                                                                      \
-    const uint32_t ir0 = grctx->mdev_task_start + dr * ith;                                                            \
-    if (ir0 >= grctx->mdev_task_start + grctx->mdev_tasks) {                                                           \
+    const uint32_t ir0 = grctx->task_start + dr * ith;                                                            \
+    if (ir0 >= grctx->task_start + grctx->tasks) {                                                           \
         return;                                                                                                        \
     }                                                                                                                  \
-    const uint32_t ir1 = MIN(ir0 + dr, grctx->mdev_task_start + grctx->mdev_tasks);                                    \
+    const uint32_t ir1 = MIN(ir0 + dr, grctx->task_start + grctx->tasks);                                    \
     const uint32_t row_size_bytes = htp_tensor_get_row_size(octx->src[0]->type, ne00);                                 \
     dma_queue * dma_queue = octx->ctx->dma[ith];                                                                       \
     for (uint32_t i = ir0; i < ir1; ++i) {                                                                             \
@@ -106,11 +106,11 @@ static void get_rows_thread_##TYPE_NAME##_##IDX_TYPE(unsigned int nth, unsigned 
     get_rows_preamble;                                                                                                 \
     struct htp_thread_trace * tr = &octx->ctx->trace[ith];                                                             \
     const uint32_t dr  = grctx->tasks_per_thread;                                                                      \
-    const uint32_t ir0 = grctx->mdev_task_start + dr * ith;                                                            \
-    if (ir0 >= grctx->mdev_task_start + grctx->mdev_tasks) {                                                           \
+    const uint32_t ir0 = grctx->task_start + dr * ith;                                                            \
+    if (ir0 >= grctx->task_start + grctx->tasks) {                                                           \
         return;                                                                                                        \
     }                                                                                                                  \
-    const uint32_t ir1 = MIN(ir0 + dr, grctx->mdev_task_start + grctx->mdev_tasks);                                    \
+    const uint32_t ir1 = MIN(ir0 + dr, grctx->task_start + grctx->tasks);                                    \
     const uint32_t chunks_per_row = kparams->chunks_per_row;                                                           \
     const uint32_t chunk_size     = kparams->chunk_size;                                                               \
     dma_queue * dma_queue = octx->ctx->dma[ith];                                                                       \
@@ -233,7 +233,9 @@ int op_get_rows(struct htp_ops_context * octx) {
     const uint32_t total_tasks    = kparams->total_tasks;
     const size_t dst_row_size     = htp_tensor_get_row_size(dst->type, dst->ne[0]);
 
-    uint32_t mdev_task_start, mdev_tasks;
+    uint32_t task_start = 0;
+    uint32_t tasks      = total_tasks;
+
     if (octx->mdev_count > 1) {
         bool can_split = (dst->ne[0] == 1 || dst->nb[0] == (dst_row_size / dst->ne[0])) && !htp_tensor_is_permuted(dst);
         uint32_t tasks_per_chunk = 1;
@@ -251,23 +253,20 @@ int op_get_rows(struct htp_ops_context * octx) {
 
         const uint32_t total_chunks = can_split ? (total_tasks / tasks_per_chunk) : 0;
         if (total_chunks < octx->mdev_count) {
-            mdev_task_start = (octx->mdev_idx == 0) ? 0 : total_tasks;
-            mdev_tasks      = (octx->mdev_idx == 0) ? total_tasks : 0;
+            task_start = (octx->mdev_idx == 0) ? 0 : total_tasks;
+            tasks      = (octx->mdev_idx == 0) ? total_tasks : 0;
         } else {
             const uint32_t chunks_per_mdev = fastdiv(total_chunks + octx->mdev_count - 1, &octx->mdev_count_div);
-            mdev_task_start = MIN(octx->mdev_idx * chunks_per_mdev * tasks_per_chunk, total_tasks);
+            task_start = MIN(octx->mdev_idx * chunks_per_mdev * tasks_per_chunk, total_tasks);
             if (octx->mdev_idx == octx->mdev_count - 1) {
-                mdev_tasks = total_tasks - mdev_task_start;
+                tasks = total_tasks - task_start;
             } else {
-                mdev_tasks = MIN(chunks_per_mdev * tasks_per_chunk, total_tasks - mdev_task_start);
+                tasks = MIN(chunks_per_mdev * tasks_per_chunk, total_tasks - task_start);
             }
         }
-    } else {
-        mdev_task_start = 0;
-        mdev_tasks      = total_tasks;
     }
 
-    if (mdev_tasks == 0) {
+    if (tasks == 0) {
         return HTP_STATUS_OK;
     }
 
@@ -277,9 +276,9 @@ int op_get_rows(struct htp_ops_context * octx) {
     grctx.octx = octx;
     grctx.kparams = kparams;
     grctx.vtcm_base = (uint8_t *)octx->ctx->vtcm_base;
-    grctx.mdev_task_start = mdev_task_start;
-    grctx.mdev_tasks = mdev_tasks;
-    grctx.tasks_per_thread = fastdiv(mdev_tasks + n_threads - 1, &octx->n_threads_div);
+    grctx.task_start = task_start;
+    grctx.tasks = tasks;
+    grctx.tasks_per_thread = fastdiv(tasks + n_threads - 1, &octx->n_threads_div);
 
     const uint32_t ne00 = octx->src[0]->ne[0];
     htp_get_rows_vtcm_layout_build(&grctx.vtcm_layout, octx->src[0]->type, ne00, n_threads);

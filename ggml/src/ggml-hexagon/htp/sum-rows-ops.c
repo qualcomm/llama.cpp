@@ -113,7 +113,9 @@ int op_sum_rows(struct htp_ops_context * octx) {
     const uint32_t src0_nrows      = ne01 * ne02 * ne03;
     const size_t dst_data_row_size = dst->ne[0] * sizeof(float);
 
-    uint32_t mdev_row_start, mdev_nrows;
+    uint32_t row_start = 0;
+    uint32_t nrows     = src0_nrows;
+
     if (octx->mdev_count > 1) {
         bool can_split = (dst->ne[0] == 1 || dst->nb[0] == sizeof(float)) && !htp_tensor_is_permuted(dst);
         uint32_t rows_per_chunk = 1;
@@ -131,28 +133,25 @@ int op_sum_rows(struct htp_ops_context * octx) {
 
         const uint32_t total_chunks = can_split ? (src0_nrows / rows_per_chunk) : 0;
         if (total_chunks < octx->mdev_count) {
-            mdev_row_start = (octx->mdev_idx == 0) ? 0 : src0_nrows;
-            mdev_nrows     = (octx->mdev_idx == 0) ? src0_nrows : 0;
+            row_start = (octx->mdev_idx == 0) ? 0 : src0_nrows;
+            nrows     = (octx->mdev_idx == 0) ? src0_nrows : 0;
         } else {
             const uint32_t chunks_per_mdev = fastdiv(total_chunks + octx->mdev_count - 1, &octx->mdev_count_div);
-            mdev_row_start = MIN(octx->mdev_idx * chunks_per_mdev * rows_per_chunk, src0_nrows);
+            row_start = MIN(octx->mdev_idx * chunks_per_mdev * rows_per_chunk, src0_nrows);
             if (octx->mdev_idx == octx->mdev_count - 1) {
-                mdev_nrows = src0_nrows - mdev_row_start;
+                nrows = src0_nrows - row_start;
             } else {
-                mdev_nrows = MIN(chunks_per_mdev * rows_per_chunk, src0_nrows - mdev_row_start);
+                nrows = MIN(chunks_per_mdev * rows_per_chunk, src0_nrows - row_start);
             }
         }
-    } else {
-        mdev_row_start = 0;
-        mdev_nrows     = src0_nrows;
     }
 
-    if (mdev_nrows == 0) {
+    if (nrows == 0) {
         return HTP_STATUS_OK;
     }
 
     const uint32_t n_threads = octx->n_threads;
-    const uint32_t rows_per_thread = fastdiv(mdev_nrows + n_threads - 1, &octx->n_threads_div);
+    const uint32_t rows_per_thread = fastdiv(nrows + n_threads - 1, &octx->n_threads_div);
 
     bool opt_path = false;
     if ((0 == hex_is_aligned((void *) src0->data, VLEN)) && !(nb01 & (VLEN - 1))) {
@@ -161,13 +160,13 @@ int op_sum_rows(struct htp_ops_context * octx) {
 
     struct sum_rows_context smctx = {
         .octx            = octx,
-        .src_data        = (const uint8_t *) src0->data + mdev_row_start * nb01,
-        .dst_data        = (uint8_t *) dst->data + mdev_row_start * nb1,
+        .src_data        = (const uint8_t *) src0->data + row_start * nb01,
+        .dst_data        = (uint8_t *) dst->data + row_start * nb1,
         .ne00            = ne00,
         .src_stride      = nb01,
         .dst_stride      = nb1,
         .rows_per_thread = rows_per_thread,
-        .total_rows      = mdev_nrows,
+        .total_rows      = nrows,
         .opt_path        = opt_path,
     };
 

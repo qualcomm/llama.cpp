@@ -17,7 +17,7 @@ struct htp_solve_tri_context {
     struct htp_ops_context * octx;
     uint32_t                 jobs_per_thread;
     uint32_t                 total_jobs;
-    uint32_t                 mdev_job_start;
+    uint32_t                 job_start;
     uint32_t                 k_chunks;
     uint32_t                 col_block;
 };
@@ -92,8 +92,8 @@ static void solve_tri_batch_thread_f32(unsigned int nth, unsigned int ith, void 
     const uint32_t col_block = VLEN_FP32;
     const uint32_t k_full    = (k / col_block) * col_block;
 
-    const uint32_t start_batch = sctx->mdev_job_start + sctx->jobs_per_thread * ith;
-    const uint32_t end_batch   = MIN(start_batch + sctx->jobs_per_thread, sctx->mdev_job_start + sctx->total_jobs);
+    const uint32_t start_batch = sctx->job_start + sctx->jobs_per_thread * ith;
+    const uint32_t end_batch   = MIN(start_batch + sctx->jobs_per_thread, sctx->job_start + sctx->total_jobs);
 
     struct htp_thread_trace * tr = &octx->ctx->trace[ith];
     htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) start_batch);
@@ -150,8 +150,8 @@ static void solve_tri_chunk_thread_f32(unsigned int nth, unsigned int ith, void 
 
     const uint32_t ne02 = src0->ne[2];
 
-    const uint32_t start_job = sctx->mdev_job_start + sctx->jobs_per_thread * ith;
-    const uint32_t end_job   = MIN(start_job + sctx->jobs_per_thread, sctx->mdev_job_start + sctx->total_jobs);
+    const uint32_t start_job = sctx->job_start + sctx->jobs_per_thread * ith;
+    const uint32_t end_job   = MIN(start_job + sctx->jobs_per_thread, sctx->job_start + sctx->total_jobs);
 
     struct htp_thread_trace * tr = &octx->ctx->trace[ith];
     htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) start_job);
@@ -234,7 +234,9 @@ int op_solve_tri(struct htp_ops_context * octx) {
          dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3], batched);
 
     if (batched) {
-        uint32_t mdev_job_start, mdev_njobs;
+        uint32_t job_start = 0;
+        uint32_t njobs     = total_batches;
+
         if (octx->mdev_count > 1) {
             const uint32_t batch_size = dst->nb[2];
             const uint32_t batches_per_chunk = (batch_size > 0) ? (HEX_L2_LINE_SIZE / hex_gcd_u32(batch_size, HEX_L2_LINE_SIZE)) : 1;
@@ -242,23 +244,20 @@ int op_solve_tri(struct htp_ops_context * octx) {
             const bool can_split = total_chunks >= octx->mdev_count;
 
             if (!can_split) {
-                mdev_job_start = (octx->mdev_idx == 0) ? 0 : total_batches;
-                mdev_njobs     = (octx->mdev_idx == 0) ? total_batches : 0;
+                job_start = (octx->mdev_idx == 0) ? 0 : total_batches;
+                njobs     = (octx->mdev_idx == 0) ? total_batches : 0;
             } else {
                 const uint32_t chunks_per_mdev = fastdiv(total_chunks + octx->mdev_count - 1, &octx->mdev_count_div);
-                mdev_job_start = MIN(octx->mdev_idx * chunks_per_mdev * batches_per_chunk, total_batches);
+                job_start = MIN(octx->mdev_idx * chunks_per_mdev * batches_per_chunk, total_batches);
                 if (octx->mdev_idx == octx->mdev_count - 1) {
-                    mdev_njobs = total_batches - mdev_job_start;
+                    njobs = total_batches - job_start;
                 } else {
-                    mdev_njobs = MIN(chunks_per_mdev * batches_per_chunk, total_batches - mdev_job_start);
+                    njobs = MIN(chunks_per_mdev * batches_per_chunk, total_batches - job_start);
                 }
             }
-        } else {
-            mdev_job_start = 0;
-            mdev_njobs     = total_batches;
         }
 
-        if (mdev_njobs == 0) {
+        if (njobs == 0) {
             return HTP_STATUS_OK;
         }
 
@@ -267,9 +266,9 @@ int op_solve_tri(struct htp_ops_context * octx) {
 
         struct htp_solve_tri_context sctx = {
             .octx            = octx,
-            .jobs_per_thread = fastdiv(mdev_njobs + n_threads - 1, &octx->n_threads_div),
-            .total_jobs      = mdev_njobs,
-            .mdev_job_start  = mdev_job_start,
+            .jobs_per_thread = fastdiv(njobs + n_threads - 1, &octx->n_threads_div),
+            .total_jobs      = njobs,
+            .job_start       = job_start,
             .k_chunks        = k_chunks,
             .col_block       = col_block,
         };
@@ -279,27 +278,26 @@ int op_solve_tri(struct htp_ops_context * octx) {
         // Chunk-level parallelism
         const uint32_t total_jobs = total_batches * k_chunks;
 
-        uint32_t mdev_job_start, mdev_njobs;
+        uint32_t job_start = 0;
+        uint32_t njobs     = total_jobs;
+
         if (octx->mdev_count > 1) {
             const bool can_split = ((dst->nb[1] & 127) == 0) && (total_jobs >= octx->mdev_count);
             if (!can_split) {
-                mdev_job_start = (octx->mdev_idx == 0) ? 0 : total_jobs;
-                mdev_njobs     = (octx->mdev_idx == 0) ? total_jobs : 0;
+                job_start = (octx->mdev_idx == 0) ? 0 : total_jobs;
+                njobs     = (octx->mdev_idx == 0) ? total_jobs : 0;
             } else {
                 const uint32_t jobs_per_mdev = fastdiv(total_jobs + octx->mdev_count - 1, &octx->mdev_count_div);
-                mdev_job_start = MIN(octx->mdev_idx * jobs_per_mdev, total_jobs);
+                job_start = MIN(octx->mdev_idx * jobs_per_mdev, total_jobs);
                 if (octx->mdev_idx == octx->mdev_count - 1) {
-                    mdev_njobs = total_jobs - mdev_job_start;
+                    njobs = total_jobs - job_start;
                 } else {
-                    mdev_njobs = MIN(jobs_per_mdev, total_jobs - mdev_job_start);
+                    njobs = MIN(jobs_per_mdev, total_jobs - job_start);
                 }
             }
-        } else {
-            mdev_job_start = 0;
-            mdev_njobs     = total_jobs;
         }
 
-        if (mdev_njobs == 0) {
+        if (njobs == 0) {
             return HTP_STATUS_OK;
         }
 
@@ -307,9 +305,9 @@ int op_solve_tri(struct htp_ops_context * octx) {
 
         struct htp_solve_tri_context sctx = {
             .octx            = octx,
-            .jobs_per_thread = fastdiv(mdev_njobs + n_threads - 1, &octx->n_threads_div),
-            .total_jobs      = mdev_njobs,
-            .mdev_job_start  = mdev_job_start,
+            .jobs_per_thread = fastdiv(njobs + n_threads - 1, &octx->n_threads_div),
+            .total_jobs      = njobs,
+            .job_start       = job_start,
             .k_chunks        = k_chunks,
             .col_block       = col_block,
         };

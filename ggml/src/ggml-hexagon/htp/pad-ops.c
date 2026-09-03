@@ -71,7 +71,7 @@ struct htp_pad_context {
 
     uint32_t nrows_per_thread;
     uint32_t total_dst_rows;
-    uint32_t mdev_row_start;
+    uint32_t row_start;
 
     size_t   type_size;
 
@@ -105,8 +105,8 @@ struct htp_pad_context {
                                                                                      \
     const size_t type_size = pctx->type_size;                                        \
                                                                                      \
-    const uint32_t row_start = pctx->mdev_row_start + pctx->nrows_per_thread * ith;  \
-    const uint32_t row_end   = MIN(row_start + pctx->nrows_per_thread, pctx->mdev_row_start + pctx->total_dst_rows);
+    const uint32_t row_start = pctx->row_start + pctx->nrows_per_thread * ith;  \
+    const uint32_t row_end   = MIN(row_start + pctx->nrows_per_thread, pctx->row_start + pctx->total_dst_rows);
 
 
 #define htp_pad_dma_preamble                                        \
@@ -491,7 +491,9 @@ int op_pad(struct htp_ops_context * octx) {
     const uint32_t total_dst_rows = dst->ne[1] * dst->ne[2] * dst->ne[3];
     const size_t dst_row_size     = (size_t)ne0 * type_size;
 
-    uint32_t mdev_row_start, mdev_nrows;
+    uint32_t row_start = 0;
+    uint32_t nrows     = total_dst_rows;
+
     if (octx->mdev_count > 1) {
         bool can_split = (dst->ne[0] == 1 || dst->nb[0] == type_size) && !htp_tensor_is_permuted(dst);
         uint32_t rows_per_chunk = 1;
@@ -509,23 +511,20 @@ int op_pad(struct htp_ops_context * octx) {
 
         const uint32_t total_chunks = can_split ? (total_dst_rows / rows_per_chunk) : 0;
         if (total_chunks < octx->mdev_count) {
-            mdev_row_start = (octx->mdev_idx == 0) ? 0 : total_dst_rows;
-            mdev_nrows     = (octx->mdev_idx == 0) ? total_dst_rows : 0;
+            row_start = (octx->mdev_idx == 0) ? 0 : total_dst_rows;
+            nrows     = (octx->mdev_idx == 0) ? total_dst_rows : 0;
         } else {
             const uint32_t chunks_per_mdev = fastdiv(total_chunks + octx->mdev_count - 1, &octx->mdev_count_div);
-            mdev_row_start = MIN(octx->mdev_idx * chunks_per_mdev * rows_per_chunk, total_dst_rows);
+            row_start = MIN(octx->mdev_idx * chunks_per_mdev * rows_per_chunk, total_dst_rows);
             if (octx->mdev_idx == octx->mdev_count - 1) {
-                mdev_nrows = total_dst_rows - mdev_row_start;
+                nrows = total_dst_rows - row_start;
             } else {
-                mdev_nrows = MIN(chunks_per_mdev * rows_per_chunk, total_dst_rows - mdev_row_start);
+                nrows = MIN(chunks_per_mdev * rows_per_chunk, total_dst_rows - row_start);
             }
         }
-    } else {
-        mdev_row_start = 0;
-        mdev_nrows     = total_dst_rows;
     }
 
-    if (mdev_nrows == 0) {
+    if (nrows == 0) {
         return HTP_STATUS_OK;
     }
 
@@ -560,9 +559,9 @@ int op_pad(struct htp_ops_context * octx) {
         .lp1 = lp1, .rp1 = rp1,
         .lp2 = lp2, .rp2 = rp2,
         .lp3 = lp3, .rp3 = rp3,
-        .nrows_per_thread = fastdiv(mdev_nrows + n_threads - 1, &octx->n_threads_div),
-        .total_dst_rows   = mdev_nrows,
-        .mdev_row_start    = mdev_row_start,
+        .nrows_per_thread = fastdiv(nrows + n_threads - 1, &octx->n_threads_div),
+        .total_dst_rows   = nrows,
+        .row_start        = row_start,
         .type_size        = type_size,
         .src_row_size         = src_row_size,
         .src_row_size_aligned = src_row_size_aligned,

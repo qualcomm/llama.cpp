@@ -74,7 +74,7 @@ struct htp_fa_context {
 
     uint32_t qrows;
     uint32_t qrows_per_thread;
-    uint32_t mdev_qrow_start;
+    uint32_t qrow_start;
 
     bool is_q_fp32;
 
@@ -205,8 +205,8 @@ static void flash_attn_ext_f16_thread(unsigned int nth, unsigned int ith, void *
 
     // total rows in q
     const uint32_t dr  = factx->qrows_per_thread;
-    const uint32_t ir0 = factx->mdev_qrow_start + dr * ith;
-    const uint32_t ir1 = MIN(ir0 + dr, factx->mdev_qrow_start + factx->qrows);
+    const uint32_t ir0 = factx->qrow_start + dr * ith;
+    const uint32_t ir1 = MIN(ir0 + dr, factx->qrow_start + factx->qrows);
 
     if (ir0 >= ir1) return;
 
@@ -1887,20 +1887,20 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
 
     // Multi-device: split Q blocks across devices
     const uint32_t n_q_blocks = (neq1 + Br - 1) / Br;
-    uint32_t dev_q_start = 0;
-    uint32_t dev_q_end   = neq1;
+    uint32_t q_start_min = 0;
+    uint32_t q_start_max = neq1;
 
     if (octx->mdev_count > 1) {
-        const uint32_t blocks_per_mdev  = fastdiv(n_q_blocks + octx->mdev_count - 1, &octx->mdev_count_div);
-        const uint32_t mdev_block_start = MIN(octx->mdev_idx * blocks_per_mdev, n_q_blocks);
-        const uint32_t mdev_block_end   = MIN(mdev_block_start + blocks_per_mdev, n_q_blocks);
+        const uint32_t blocks_per_mdev = fastdiv(n_q_blocks + octx->mdev_count - 1, &octx->mdev_count_div);
+        const uint32_t block_start     = MIN(octx->mdev_idx * blocks_per_mdev, n_q_blocks);
+        const uint32_t block_end       = MIN(block_start + blocks_per_mdev, n_q_blocks);
 
-        if (mdev_block_start >= mdev_block_end) {
+        if (block_start >= block_end) {
             return HTP_STATUS_OK;
         }
 
-        dev_q_start = mdev_block_start * Br;
-        dev_q_end   = MIN(mdev_block_end * Br, neq1);
+        q_start_min = block_start * Br;
+        q_start_max = MIN(block_end * Br, neq1);
     }
 
     // ======== VTCM allocation (GQA-aware) ========
@@ -1992,7 +1992,7 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
     // ======== Main loop ========
     for (uint32_t ib3 = 0; ib3 < neq3; ++ib3) {
         const uint32_t im3 = mask ? fastmodulo(ib3, mask->ne[3], &factx.src3_div3) : 0;
-        for (uint32_t q_start = dev_q_start; q_start < dev_q_end; q_start += Br) {
+        for (uint32_t q_start = q_start_min; q_start < q_start_max; q_start += Br) {
             const uint32_t n_rows_q    = hex_smin(Br, neq1 - q_start);
             const size_t   n_rows_g    = n_rows_q * G;
             const size_t   g_br_actual = hex_align_up(n_rows_g, HMX_FP16_TILE_N_ROWS);
@@ -2006,7 +2006,7 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
 
                 // 1. Push Q and KV DMAs for the very first iteration.
                 // Subsequent iterations are enqueued early at the end of the previous iteration.
-                if (ib3 == 0 && q_start == dev_q_start && kv_head == 0) {
+                if (ib3 == 0 && q_start == q_start_min && kv_head == 0) {
                     const uint8_t * q_ptr = (const uint8_t *) q->data + q_start * q->nb[1] +
                                             (kv_head * factx.G) * q->nb[2] + ib3 * q->nb[3];
                     const size_t q_row_bytes = q_transposed ? n_rows_q * q_row_bytes_trans_factor : q_row_bytes_untransposed;
@@ -2327,8 +2327,8 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                 if (next_kv_head >= n_kv_heads) {
                     next_kv_head = 0;
                     next_q_start = q_start + Br;
-                    if (next_q_start >= dev_q_end) {
-                        next_q_start = dev_q_start;
+                    if (next_q_start >= q_start_max) {
+                        next_q_start = q_start_min;
                         next_ib3     = ib3 + 1;
                     }
                 }
@@ -2470,35 +2470,34 @@ int op_flash_attn_ext(struct htp_ops_context * octx) {
     const uint32_t neq3 = q->ne[3];
     const uint32_t total_qrows = neq1 * neq2 * neq3;
 
-    uint32_t mdev_qrow_start, mdev_qrows;
+    uint32_t qrow_start = 0;
+    uint32_t qrows      = total_qrows;
+
     if (octx->mdev_count > 1) {
         const bool can_split = ((dst->nb[1] & 127) == 0) && (total_qrows >= octx->mdev_count);
         if (!can_split) {
-            mdev_qrow_start = (octx->mdev_idx == 0) ? 0 : total_qrows;
-            mdev_qrows      = (octx->mdev_idx == 0) ? total_qrows : 0;
+            qrow_start = (octx->mdev_idx == 0) ? 0 : total_qrows;
+            qrows      = (octx->mdev_idx == 0) ? total_qrows : 0;
         } else {
             const uint32_t rows_per_mdev = fastdiv(total_qrows + octx->mdev_count - 1, &octx->mdev_count_div);
-            mdev_qrow_start = MIN(octx->mdev_idx * rows_per_mdev, total_qrows);
+            qrow_start = MIN(octx->mdev_idx * rows_per_mdev, total_qrows);
             if (octx->mdev_idx == octx->mdev_count - 1) {
-                mdev_qrows = total_qrows - mdev_qrow_start;
+                qrows = total_qrows - qrow_start;
             } else {
-                mdev_qrows = MIN(rows_per_mdev, total_qrows - mdev_qrow_start);
+                qrows = MIN(rows_per_mdev, total_qrows - qrow_start);
             }
         }
-    } else {
-        mdev_qrow_start = 0;
-        mdev_qrows      = total_qrows;
     }
 
-    if (mdev_qrows == 0) {
+    if (qrows == 0) {
         return HTP_STATUS_OK;
     }
 
     const uint32_t n_threads = octx->n_threads;
 
-    factx.qrows            = mdev_qrows;
-    factx.mdev_qrow_start   = mdev_qrow_start;
-    factx.qrows_per_thread = fastdiv(mdev_qrows + n_threads - 1, &octx->n_threads_div);
+    factx.qrows            = qrows;
+    factx.qrow_start       = qrow_start;
+    factx.qrows_per_thread = fastdiv(qrows + n_threads - 1, &octx->n_threads_div);
 
     size_t size_vkq_acc = hex_round_up(v->ne[0] * sizeof(float), 128); // VKQ32
 
