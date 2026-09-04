@@ -87,6 +87,7 @@ set(GGML_OPENCL_KERNELS
     mul_mv_f16_f32_mrow
     mul_mv_f16_f32_l4
     mul_mv_f16_f32
+    mul_mv_f16_f32_mrow
     mul_mv_f32_f32
     mul_mv_q1_0_f32
     mul_mv_q1_0_f32_flat
@@ -253,7 +254,7 @@ set(GGML_OPENCL_KERNELS
 )
 
 if (GGML_OPENCL_USE_ADRENO_KERNELS)
-    list(APPEND GGML_OPENCL_KERNELS gemm_xmem_f16_f32_os8)
+    list(APPEND GGML_OPENCL_KERNELS gemm_xmem_f16_f32_os8 sdpa_xmem_f32_f16_os8)
 endif ()
 
 foreach (K ${GGML_OPENCL_KERNELS})
