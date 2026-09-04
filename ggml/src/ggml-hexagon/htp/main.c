@@ -984,22 +984,26 @@ static void prep_tensors(struct htp_context *ctx, struct htp_buf_desc *bufs, str
     }
 }
 
-static int mdev_sync_fence(struct htp_ops_context * octx, struct htp_buf_desc * bufs, uint32_t n_bufs, uint32_t gen) {
-    if (octx->mdev_count <= 1 || n_bufs == 0 || bufs[0].base == 0) {
+static int mdev_sync_fence(struct htp_ops_context * octx) {
+    if (octx->mdev_count <= 1) {
         return HTP_STATUS_OK;
     }
 
     struct htp_context * ctx = octx->ctx;
+    assert(ctx->fence_base != NULL);
+
+    const uint32_t seq = ++ctx->fence_seq;
+
     struct htp_thread_trace * tr = &ctx->trace[0];
-    htp_trace_event_start(tr, HTP_TRACE_EVT_FENCE, (uint16_t) gen);
+    htp_trace_event_start(tr, HTP_TRACE_EVT_FENCE, (uint16_t) seq);
 
     const uint32_t my_mdev_idx = octx->mdev_idx;
     const uint32_t mdev_count  = octx->mdev_count;
 
-    uint8_t * fence_base   = (uint8_t *) bufs[0].base + bufs[0].size - (mdev_count * HTP_FENCE_SLOT_SIZE);
+    uint8_t * fence_base   = ctx->fence_base;
     atomic_uint * my_fence = (atomic_uint *) (fence_base + my_mdev_idx * HTP_FENCE_SLOT_SIZE);
 
-    atomic_store(my_fence, gen);
+    atomic_store(my_fence, seq);
     asm volatile ("syncht" : : : "memory");
     Q6_dccleaninva_A((void *) my_fence);
 
@@ -1009,14 +1013,19 @@ static int mdev_sync_fence(struct htp_ops_context * octx, struct htp_buf_desc * 
         uint64_t spins = 0;
         while (1) {
             Q6_dccleaninva_A((void *) peer_fence);
+            asm volatile ("syncht" : : : "memory");
             uint32_t val = atomic_load(peer_fence);
-            if ((int32_t)(val - gen) >= 0) {
+            if ((int32_t)(val - seq) >= 0) {
                 break;
             }
-            if (++spins > HTP_FENCE_TIMEOUT) {
-                FARF(ERROR, "ggml-hex: mdev %u timeout waiting for mdev %u (gen %u)\n",
-                     my_mdev_idx, d, gen);
-                htp_trace_event_stop(tr, HTP_TRACE_EVT_FENCE, (uint16_t) gen);
+            if (++spins == 10000) {
+                FARF(ALWAYS, "ggml-hex: mdev %u waiting for mdev %u : seq 0x%08x (b %u, op %u) my_fence %p (0x%08x) peer_fence %p val 0x%08x (diff %d)\n",
+                     my_mdev_idx, d, seq, seq >> 12, seq & 0xfff, my_fence, atomic_load(my_fence), peer_fence, val, (int32_t)(val - seq));
+            }
+            if (spins > HTP_FENCE_TIMEOUT) {
+                FARF(ERROR, "ggml-hex: mdev %u timeout waiting for mdev %u (seq 0x%08x [b %u, op %u], peer_fence %p val 0x%08x)\n",
+                     my_mdev_idx, d, seq, seq >> 12, seq & 0xfff, peer_fence, val);
+                htp_trace_event_stop(tr, HTP_TRACE_EVT_FENCE, (uint16_t) seq);
                 return HTP_STATUS_INTERNAL_ERR;
             }
             hex_pause();
@@ -1024,12 +1033,12 @@ static int mdev_sync_fence(struct htp_ops_context * octx, struct htp_buf_desc * 
     }
     asm volatile ("syncht" : : : "memory");
 
-    htp_trace_event_stop(tr, HTP_TRACE_EVT_FENCE, (uint16_t) gen);
+    htp_trace_event_stop(tr, HTP_TRACE_EVT_FENCE, (uint16_t) seq);
     return HTP_STATUS_OK;
 }
 
 static int proc_op_req(struct htp_ops_context * octx, struct htp_buf_desc * bufs, uint32_t n_bufs,
-                       struct htp_tensor * tens, uint32_t idx, uint32_t gen, struct htp_op_desc * op) {
+                       struct htp_tensor * tens, uint32_t idx, struct htp_op_desc * op) {
     memcpy(octx->op_params, op->params, sizeof(octx->op_params));
     memcpy(octx->kernel_params, op->kernel_params, sizeof(octx->kernel_params));
     octx->flags = op->flags;
@@ -1074,7 +1083,7 @@ static int proc_op_req(struct htp_ops_context * octx, struct htp_buf_desc * bufs
             dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3]);
     }
 
-    int fence_status = mdev_sync_fence(octx, bufs, n_bufs, gen);
+    int fence_status = mdev_sync_fence(octx);
     if (fence_status != HTP_STATUS_OK) {
         return fence_status;
     }
@@ -1155,6 +1164,12 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
     octx->mdev_count    = req->mdev_count;
     if (octx->mdev_count > 1) {
         octx->mdev_count_div = init_fastdiv_values(octx->mdev_count);
+        assert(n_bufs > 0 && bufs[0].base != 0);
+        ctx->fence_base = (uint8_t *) bufs[0].base + bufs[0].size - (octx->mdev_count * HTP_FENCE_SLOT_SIZE);
+        ctx->fence_seq  = (uint32_t)((req->seq & 0xfffff) << 12);
+    } else {
+        ctx->fence_base = NULL;
+        ctx->fence_seq  = 0;
     }
 
     work_queue_wakeup(ctx->work_queue);
@@ -1168,8 +1183,7 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
 
         profile_start(ctx->profiler, &prof);
 
-        const uint32_t gen = (uint32_t)(req->seq * (n_ops + 2) + i + 1);
-        op_status = proc_op_req(octx, bufs, n_bufs, tens, i, gen, &ops[i]);
+        op_status = proc_op_req(octx, bufs, n_bufs, tens, i, &ops[i]);
 
         profile_stop(ctx->profiler, &prof);
 
@@ -1195,8 +1209,7 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
     qurt_mem_cache_clean((qurt_addr_t) 0, 0, QURT_MEM_CACHE_FLUSH_INVALIDATE_ALL, QURT_MEM_DCACHE);
     htp_trace_event_stop(&ctx->trace[0], HTP_TRACE_EVT_L2FLUSH, 0);
 
-    const uint32_t final_gen = (uint32_t)(req->seq * (n_ops + 2) + n_ops + 1);
-    int final_sync_status = mdev_sync_fence(octx, bufs, n_bufs, final_gen);
+    int final_sync_status = mdev_sync_fence(octx);
     if (final_sync_status != HTP_STATUS_OK && op_status == HTP_STATUS_OK) {
         op_status = final_sync_status;
     }

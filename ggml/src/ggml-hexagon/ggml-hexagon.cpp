@@ -394,7 +394,8 @@ struct ggml_hexagon_session {
     ggml_hexagon_opqueue* op_queue;
 
     std::unordered_map<int, std::unique_ptr<ggml_hexagon_shared_buffer>> cloned_buffers;
-    std::unordered_set<ggml_hexagon_session *>                           sync_peers;
+    std::unordered_set<ggml_hexagon_session *>                           virt_peers;
+    std::unordered_set<ggml_hexagon_session *>                           phys_peers;
 
     uint32_t n_threads   = 0;
     uint32_t n_hvx       = 0;
@@ -426,9 +427,10 @@ struct ggml_hexagon_session {
     void enqueue_fence(const ggml_tensor * sync_tensor, uint32_t fence_seq = 0);
     void enqueue_allreduce(const ggml_tensor * dst, const std::vector<const ggml_tensor *> & src_tensors, const std::vector<const ggml_tensor *> & sync_tensors, uint32_t rank, uint32_t n_ranks, uint32_t fence_seq_entry = 0, uint32_t fence_seq_exit = 0);
 
-    void flush(bool all = true);
-    void flush_pending(bool all = false);
+    void flush_sync(bool all = true);
+    void flush_async();
     void flush_batch(size_t min_ops = 1);
+    void flush_peers();
 
     uint64_t record_event();
     void     wait_event(uint64_t seq);
@@ -436,19 +438,11 @@ struct ggml_hexagon_session {
     bool clone_buffer(const ggml_hexagon_shared_buffer*);
     void unclone_buffer(int fd);
 
-    void add_sync_peer(ggml_hexagon_session * peer) {
-        sync_peers.insert(peer);
-    }
-
-    void flush_sync_peers() {
-        if (!sync_peers.empty()) {
-            for (auto * peer : sync_peers) {
-                peer->flush_batch();
-            }
-            sync_peers.clear();
-        }
-        for (auto & sub : mdev_sessions) {
-            sub->flush_sync_peers();
+    void add_peer(ggml_hexagon_session * peer) {
+        if (this->phys_idx == peer->phys_idx) {
+            virt_peers.insert(peer);
+        } else {
+            phys_peers.insert(peer);
         }
     }
 };
@@ -2731,10 +2725,34 @@ struct ggml_hexagon_opqueue {
     }
 };
 
-// Flush HTP response queue i.e wait for all outstanding requests to complete
-void ggml_hexagon_session::flush_pending(bool all) {
+void ggml_hexagon_session::flush_peers() {
+    auto vpeers = std::move(virt_peers);
+    virt_peers.clear();
+    for (auto * peer : vpeers) {
+        peer->flush_sync();
+    }
+
+    auto ppeers = std::move(phys_peers);
+    phys_peers.clear();
+    for (auto * peer : ppeers) {
+        peer->flush_async();
+    }
+
     for (auto & sub : mdev_sessions) {
-        sub->flush_pending(all);
+        sub->flush_peers();
+    }
+}
+
+void ggml_hexagon_session::flush_async() {
+    flush_peers();
+    flush_batch();
+}
+
+void ggml_hexagon_session::flush_sync(bool all) {
+    flush_async();
+
+    for (auto & sub : mdev_sessions) {
+        sub->flush_sync(all);
     }
 
     while (this->op_pending) {
@@ -2780,15 +2798,27 @@ void ggml_hexagon_session::flush_batch(size_t min_ops) {
 
     op_batch->sort_buffers();
 
+    htp_opbatch_req req {};
+    dspqueue_buffer dbuf{};
+
+    if (!op_queue->push(req, dbuf, op_batch)) {
+        flush_sync(false);
+        op_queue->push(req, dbuf, op_batch);
+    }
+
+    req.mdev_idx   = (uint16_t) this->mdev_idx;
+    req.mdev_count = (uint16_t) this->mdev_count;
+
     for (auto & sub : mdev_sessions) {
         htp_opbatch_req sub_req {};
         dspqueue_buffer sub_dbuf{};
 
         if (!sub->op_queue->push(sub_req, sub_dbuf, op_batch)) {
-            sub->flush_pending(false);
+            sub->flush_sync(false);
             sub->op_queue->push(sub_req, sub_dbuf, op_batch);
         }
 
+        sub_req.seq        = req.seq;
         sub_req.mdev_idx   = (uint16_t) sub->mdev_idx;
         sub_req.mdev_count = (uint16_t) sub->mdev_count;
 
@@ -2803,17 +2833,6 @@ void ggml_hexagon_session::flush_batch(size_t min_ops) {
         }
     }
 
-    htp_opbatch_req req {};
-    dspqueue_buffer dbuf{};
-
-    if (!op_queue->push(req, dbuf, op_batch)) {
-        flush_pending(false);
-        op_queue->push(req, dbuf, op_batch);
-    }
-
-    req.mdev_idx   = (uint16_t) this->mdev_idx;
-    req.mdev_count = (uint16_t) this->mdev_count;
-
     // Bump pending flag (cleared in the session::flush once we get the response)
     this->op_pending++;  // atomic inc
 
@@ -2825,12 +2844,6 @@ void ggml_hexagon_session::flush_batch(size_t min_ops) {
     }
 
     op_batch->reset();
-}
-
-void ggml_hexagon_session::flush(bool all) {
-    flush_sync_peers();
-    flush_batch();
-    flush_pending(all);
 }
 
 void ggml_hexagon_session::enqueue_op(const htp_opnode & node) {
@@ -2858,7 +2871,7 @@ void ggml_hexagon_session::enqueue_op(const htp_opnode & node) {
     }
 
     if (!op_batch->fit_op(node)) {
-        flush_batch();
+        flush_async();
     }
     op_batch->add_op(node);
 }
@@ -3060,18 +3073,17 @@ void ggml_hexagon_session::enqueue_allreduce(
 }
 
 void ggml_hexagon_session::wait_event(uint64_t seq) {
-    flush_sync_peers();
     HEX_VERBOSE("ggml-hex: %s opqueue-wait start: seq %llu, current rsp-seq %llu, pending %d\n",
                 this->name.c_str(), (unsigned long long)seq, (unsigned long long)op_queue->rsp_seq, (int)this->op_pending);
     while (op_queue->rsp_seq < seq && this->op_pending > 0) {
-        this->flush_pending(false);
+        flush_sync(false);
     }
     HEX_VERBOSE("ggml-hex: %s opqueue-wait end: seq %llu, current rsp-seq %llu, pending %d\n",
                 this->name.c_str(), (unsigned long long)seq, (unsigned long long)op_queue->rsp_seq, (int)this->op_pending);
 }
 
 uint64_t ggml_hexagon_session::record_event() {
-    flush_batch();
+    flush_async();
     return op_queue->req_seq;
 }
 
@@ -5381,7 +5393,7 @@ static void ggml_backend_hexagon_synchronize(ggml_backend_t backend) {
     HEX_VERBOSE("ggml-hex: %s synchronize\n", sess->c_name());
 
     // Wait until all pending ops complete
-    sess->flush();
+    sess->flush_sync();
 }
 
 enum ggml_hexagon_mem_range_type {
@@ -5621,16 +5633,18 @@ static bool ggml_hexagon_cpy_tensor_async_phys(ggml_backend_t backend_src, ggml_
     auto sess_dst = static_cast<ggml_hexagon_session *>(backend_dst->context);
     auto sbuf_dst = (ggml_hexagon_shared_buffer *) dst->buffer->context;
 
-    if (sess_dst->fence_seq == 0) sess_dst->fence_seq = 1;
-    uint32_t fence_seq = sess_dst->fence_seq++;
-    if (sess_dst->fence_seq == 0) sess_dst->fence_seq = 1;
+    if (!sess_src->clone_buffer(sbuf_dst)) { return false; }
 
     volatile uint32_t * fence = (volatile uint32_t *) sbuf_dst->alloc_fence();
+    if (!fence) { return false; }
+
+    if (++sess_dst->fence_seq == 0) sess_dst->fence_seq = 1;
+    uint32_t fence_seq = sess_dst->fence_seq;
 
     HEX_VERBOSE("ggml-hex: %s cpy-tensor-async %s -> %s size %zu : seq %u\n",
                 sess_dst->name.c_str(), src->name, dst->name, ggml_nbytes(src), fence_seq);
 
-    // dummy extra (must be static)
+    // dummy fence extra (must be static)
     static ggml_hexagon_tensor_extra fence_extra { {}, 0, GGML_HEXAGON_TENSOR_FENCE };
 
     ggml_tensor fence_tensor {};
@@ -5651,7 +5665,7 @@ static bool ggml_hexagon_cpy_tensor_async_phys(ggml_backend_t backend_src, ggml_
     sess_src->enqueue_cpy(src, dst, &fence_tensor, fence_seq);
     sess_dst->enqueue_fence(&fence_tensor, fence_seq);
 
-    sess_dst->add_sync_peer(sess_src);
+    sess_dst->add_peer(sess_src);
 
     return true;
 }
@@ -5659,15 +5673,15 @@ static bool ggml_hexagon_cpy_tensor_async_phys(ggml_backend_t backend_src, ggml_
 static bool ggml_hexagon_cpy_tensor_async_virt(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
     auto sess_src = static_cast<ggml_hexagon_session *>(backend_src->context);
     auto sess_dst = static_cast<ggml_hexagon_session *>(backend_dst->context);
-    auto sbuf_dst = (ggml_hexagon_shared_buffer *) dst->buffer->context;
+    auto sbuf_src = (ggml_hexagon_shared_buffer *) src->buffer->context;
 
-    if (!sess_src->clone_buffer(sbuf_dst)) { return false; }
+    if (!sess_dst->clone_buffer(sbuf_src)) { return false; }
 
     HEX_VERBOSE("ggml-hex: %s cpy-tensor-async %s -> %s size %zu\n",
                 sess_dst->name.c_str(), src->name, dst->name, ggml_nbytes(src));
 
-    sess_src->enqueue_cpy(src, dst);
-    sess_src->flush(true);
+    sess_dst->enqueue_cpy(src, dst);
+    sess_dst->add_peer(sess_src);
 
     return true;
 }
@@ -5685,7 +5699,6 @@ static bool ggml_backend_hexagon_cpy_tensor_async(ggml_backend_t backend_src, gg
     if (sess_src == sess_dst) {
         HEX_VERBOSE("ggml-hex: %s cpy-tensor-async %s -> %s size %zu\n", sess_dst->name.c_str(), src->name, dst->name, ggml_nbytes(src));
         sess_src->enqueue_cpy(src, dst);
-        sess_src->flush_batch();
         return true;
     }
 
@@ -5761,7 +5774,7 @@ static void ggml_backend_hexagon_get_tensor_async(ggml_backend_t backend, const 
     auto sess = static_cast<ggml_hexagon_session *>(backend->context);
     HEX_VERBOSE("ggml-hex: %s get-tensor-async %s : data %p offset %zu size %zu usage %d\n",
                 sess->c_name(), tensor->name, data, offset, size, tensor->buffer ? (int) tensor->buffer->usage : -1);
-    sess->flush(true);
+    sess->flush_sync();
     ggml_backend_tensor_get(tensor, data, offset, size);
 }
 
@@ -5790,7 +5803,7 @@ static void ggml_backend_hexagon_get_tensor_2d_async(ggml_backend_t backend,
     auto sess = static_cast<ggml_hexagon_session *>(backend->context);
     HEX_VERBOSE("ggml-hex: %s get-tensor-2d-async %s : data %p offset %zu size %zu n_copies %zu stride_tensor %zu stride_data %zu usage %d\n",
                 sess->c_name(), tensor->name, data, offset, size, n_copies, stride_tensor, stride_data, tensor->buffer ? (int) tensor->buffer->usage : -1);
-    sess->flush(true);
+    sess->flush_sync();
     ggml_backend_tensor_get_2d(tensor, data, offset, size, n_copies, stride_tensor, stride_data);
 }
 
@@ -6252,6 +6265,16 @@ static void * ggml_backend_hexagon_comm_init(ggml_backend_t * backends, size_t n
         }
     }
 
+    for (size_t i = 0; i < n_backends; i++) {
+        auto sess_i = static_cast<ggml_hexagon_session *>(backends[i]->context);
+        for (size_t j = i + 1; j < n_backends; j++) {
+            auto sess_j = static_cast<ggml_hexagon_session *>(backends[j]->context);
+            if (sess_i->phys_idx == sess_j->phys_idx) {
+                return nullptr;
+            }
+        }
+    }
+
     auto * ctx = new ggml_backend_hexagon_comm_context();
     ctx->backends.assign(backends, backends + n_backends);
     ctx->n_backends = n_backends;
@@ -6271,6 +6294,16 @@ static bool ggml_backend_hexagon_comm_allreduce_tensor(void * comm_ctx_v, struct
     const size_t n_backends = comm_ctx->n_backends;
 
     if (n_backends < 2 || n_backends > 4) return false;
+
+    for (size_t i = 0; i < n_backends; i++) {
+        auto sess_i = static_cast<ggml_hexagon_session *>(comm_ctx->backends[i]->context);
+        for (size_t j = i + 1; j < n_backends; j++) {
+            auto sess_j = static_cast<ggml_hexagon_session *>(comm_ctx->backends[j]->context);
+            if (sess_i->phys_idx == sess_j->phys_idx) {
+                return false;
+            }
+        }
+    }
 
     for (size_t i = 0; i < n_backends; i++) {
         if (!tensors[i] || !tensors[i]->buffer || !ggml_backend_buffer_is_hexagon(tensors[i]->buffer)) {
@@ -6342,7 +6375,7 @@ static bool ggml_backend_hexagon_comm_allreduce_tensor(void * comm_ctx_v, struct
         sess->enqueue_allreduce(tensors[r], data_tensors, sync_tensors, (uint32_t) r, (uint32_t) n_backends, fence_seq_entry, fence_seq_exit);
         for (size_t j = 0; j < n_backends; j++) {
             if (r != j) {
-                sess->add_sync_peer(static_cast<ggml_hexagon_session *>(comm_ctx->backends[j]->context));
+                sess->add_peer(static_cast<ggml_hexagon_session *>(comm_ctx->backends[j]->context));
             }
         }
     }

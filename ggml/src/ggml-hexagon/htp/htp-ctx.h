@@ -111,6 +111,9 @@ struct htp_context {
     void *                 ddr_spad_base;
     size_t                 ddr_spad_size;
 
+    uint8_t *              fence_base;
+    uint32_t               fence_seq;
+
     struct htp_ops_context octx;
 
     qurt_thread_t          main_thread;

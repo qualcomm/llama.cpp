@@ -279,12 +279,13 @@ int op_allreduce(struct htp_ops_context * octx) {
         uint64_t spins = 0;
         while (1) {
             Q6_dccleaninva_A((void *) peer_fence);
+            asm volatile ("syncht" : : : "memory");
             uint32_t val = atomic_load(&peer_fence[0]);
-            if (val == fence_seq_entry || val == fence_seq_exit) {
+            if ((int32_t)(val - fence_seq_entry) >= 0) {
                 break;
             }
             if (++spins > HTP_FENCE_TIMEOUT) {
-                FARF(ERROR, "ggml-hex: allreduce entry fence-wait TIMEOUT: rank %u waiting on %u (fence %p seq %u)\n", rank, j, peer_fence, fence_seq_entry);
+                FARF(ERROR, "ggml-hex: allreduce entry fence-wait TIMEOUT: rank %u waiting on %u (fence %p seq %u, val %u)\n", rank, j, peer_fence, fence_seq_entry, val);
                 return HTP_STATUS_INTERNAL_ERR;
             }
             hex_pause();
@@ -379,12 +380,13 @@ int op_allreduce(struct htp_ops_context * octx) {
         uint64_t spins = 0;
         while (1) {
             Q6_dccleaninva_A((void *) peer_fence);
+            asm volatile ("syncht" : : : "memory");
             uint32_t val = atomic_load(&peer_fence[0]);
-            if (val == fence_seq_exit) {
+            if ((int32_t)(val - fence_seq_exit) >= 0) {
                 break;
             }
             if (++spins > HTP_FENCE_TIMEOUT) {
-                FARF(ERROR, "ggml-hex: allreduce exit fence-wait TIMEOUT: rank %u waiting on %u (fence %p seq %u)\n", rank, j, peer_fence, fence_seq_exit);
+                FARF(ERROR, "ggml-hex: allreduce exit fence-wait TIMEOUT: rank %u waiting on %u (fence %p seq %u, val %u)\n", rank, j, peer_fence, fence_seq_exit, val);
                 return HTP_STATUS_INTERNAL_ERR;
             }
             hex_pause();
