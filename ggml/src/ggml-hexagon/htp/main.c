@@ -737,8 +737,23 @@ static int op_fence(struct htp_ops_context * octx) {
     return HTP_STATUS_OK;
 }
 
+static int op_mdev_setup(struct htp_ops_context * octx) {
+    octx->mdev_idx   = (uint32_t) octx->op_params[0];
+    octx->mdev_count = (uint32_t) octx->op_params[1];
+    if (octx->mdev_count > 1) {
+        octx->mdev_count_div = init_fastdiv_values(octx->mdev_count);
+        const struct htp_tensor * sync = octx->src[0];
+        assert(sync && sync->data);
+        octx->fence_base = (uint8_t *) sync->data;
+    }
+    return HTP_STATUS_OK;
+}
+
 static int execute_op(struct htp_ops_context * octx) {
     switch (octx->op) {
+        case HTP_OP_MDEV_SETUP:
+            return op_mdev_setup(octx);
+
         case HTP_OP_FENCE:
             return op_fence(octx);
 
@@ -990,9 +1005,9 @@ static int mdev_sync_fence(struct htp_ops_context * octx) {
     }
 
     struct htp_context * ctx = octx->ctx;
-    assert(ctx->fence_base != NULL);
+    assert(octx->fence_base != NULL);
 
-    const uint32_t seq = ++ctx->fence_seq;
+    const uint32_t seq = ++octx->fence_seq;
 
     struct htp_thread_trace * tr = &ctx->trace[0];
     htp_trace_event_start(tr, HTP_TRACE_EVT_FENCE, (uint16_t) seq);
@@ -1000,7 +1015,7 @@ static int mdev_sync_fence(struct htp_ops_context * octx) {
     const uint32_t my_mdev_idx = octx->mdev_idx;
     const uint32_t mdev_count  = octx->mdev_count;
 
-    uint8_t * fence_base   = ctx->fence_base;
+    uint8_t * fence_base   = octx->fence_base;
     atomic_uint * my_fence = (atomic_uint *) (fence_base + my_mdev_idx * HTP_FENCE_SLOT_SIZE);
 
     atomic_store(my_fence, seq);
@@ -1160,17 +1175,7 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
     octx->n_threads     = ctx->n_threads;
     octx->n_threads_div = ctx->n_threads_div;
     octx->ctx           = ctx;
-    octx->mdev_idx      = req->mdev_idx;
-    octx->mdev_count    = req->mdev_count;
-    if (octx->mdev_count > 1) {
-        octx->mdev_count_div = init_fastdiv_values(octx->mdev_count);
-        assert(n_bufs > 0 && bufs[0].base != 0);
-        ctx->fence_base = (uint8_t *) bufs[0].base + bufs[0].size - (octx->mdev_count * HTP_FENCE_SLOT_SIZE);
-        ctx->fence_seq  = (uint32_t)((req->seq & 0xfffff) << 12);
-    } else {
-        ctx->fence_base = NULL;
-        ctx->fence_seq  = 0;
-    }
+    octx->fence_seq = (uint32_t)((req->seq & 0xfffff) << 12);
 
     work_queue_wakeup(ctx->work_queue);
     if (ctx->hmx_queue) {

@@ -71,6 +71,8 @@ struct htp_ops_context {
     uint16_t mdev_idx;
     uint16_t mdev_count;
     struct fastdiv_values mdev_count_div;
+    uint8_t * fence_base;
+    uint32_t  fence_seq;
 };
 
 // Main context for htp DSP backend
@@ -110,9 +112,6 @@ struct htp_context {
     // Persistent DDR scratchpad for MUL_MAT_ID mappings
     void *                 ddr_spad_base;
     size_t                 ddr_spad_size;
-
-    uint8_t *              fence_base;
-    uint32_t               fence_seq;
 
     struct htp_ops_context octx;
 
