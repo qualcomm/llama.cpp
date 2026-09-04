@@ -411,6 +411,8 @@ struct ggml_hexagon_session {
     size_t   max_vmem    = 0;
     size_t   max_bufsize = 0;
     uint32_t fence_seq   = 0;
+    uint64_t req_seq     = 0;
+    uint64_t rsp_seq     = 0;
 
     uint64_t                cached_uid = 0;
     std::vector<htp_opnode> cached_nodes;
@@ -1942,6 +1944,12 @@ struct ggml_hexagon_opbatch {
         }
     }
 
+    void update_mdev_group(uint32_t mdev_idx) {
+        if (n_ops > 0 && h_ops[0].opcode == HTP_OP_MDEV_GROUP) {
+            h_ops[0].params[0] = (int32_t) mdev_idx;
+        }
+    }
+
     bool try_fuse_allreduce_add(const htp_opnode & node) {
         if (n_ops == 0 || opt_ar_select != 2) return false;
         if (node.opcode != HTP_OP_ADD) return false;
@@ -2581,9 +2589,6 @@ struct ggml_hexagon_opqueue {
     ggml_hexagon_shared_buffer *shm_buf;
     size_t                      shm_blk_size;
 
-    uint64_t req_seq = 0;
-    uint64_t rsp_seq = 0;
-
     using opvec = std::vector<htp_opnode>;
 
     std::queue<unsigned int>    done;           // completed batch ids
@@ -2627,7 +2632,7 @@ struct ggml_hexagon_opqueue {
     size_t shm_size() const { return shm_buf ? shm_buf->size() : 0; }
 
     // push new batch
-    bool push(htp_opbatch_req& req, dspqueue_buffer& dbuf, const ggml_hexagon_opbatch* op_batch) {
+    bool push(htp_opbatch_req& req, dspqueue_buffer& dbuf, const ggml_hexagon_opbatch* op_batch, uint64_t seq) {
         static_assert(sizeof(htp_opbatch_req) % 8 == 0, "sizeof(htp_opbatch_req) must be multiple of 8");
         static_assert(sizeof(htp_opbatch_rsp) % 8 == 0, "sizeof(htp_opbatch_rsp) must be multiple of 8");
         static_assert(sizeof(htp_buf_desc)    % 8 == 0, "sizeof(htp_buf_desc) must be multiple of 8");
@@ -2641,7 +2646,7 @@ struct ggml_hexagon_opqueue {
         req.n_bufs    = op_batch->n_bufs;
         req.n_tensors = op_batch->n_tens;
         req.n_ops     = op_batch->n_ops;
-        req.seq       = ++req_seq;
+        req.seq       = seq;
 
         op_cache[req.id]   = op_batch->ops;
         start_usec[req.id] = ggml_time_us();
@@ -2748,10 +2753,6 @@ struct ggml_hexagon_opqueue {
                 ggml_hexagon_dump_trace_events(shm_buf->sess->name, rsp, trace_events, n_traces);
             }
         }
-
-        if (rsp.seq > rsp_seq) {
-            rsp_seq = rsp.seq;
-        }
     }
 };
 
@@ -2815,6 +2816,10 @@ void ggml_hexagon_session::flush_pending(bool all) {
 
         op_queue->pop(rsp, dbuf);
 
+        if (rsp.seq > this->rsp_seq) {
+            this->rsp_seq = rsp.seq;
+        }
+
         this->op_pending--;  // atomic dec
 
         if (!all) break;
@@ -2826,15 +2831,6 @@ void ggml_hexagon_session::flush_sync(bool all) {
     flush_pending(all);
 }
 
-static void update_mdev_idx(dspqueue_buffer & dbuf, const htp_opbatch_req & req, const ggml_hexagon_opbatch * op_batch, uint32_t mdev_idx) {
-    if (op_batch->n_ops > 0 && op_batch->h_ops[0].opcode == HTP_OP_MDEV_GROUP) {
-        const size_t b_size = sizeof(htp_buf_desc) * req.n_bufs;
-        const size_t t_size = sizeof(htp_tensor)   * req.n_tensors;
-        htp_op_desc * o_ptr = (htp_op_desc *) ((uint8_t *) dbuf.ptr + b_size + t_size);
-        o_ptr[0].params[0] = (int32_t) mdev_idx;
-    }
-}
-
 void ggml_hexagon_session::flush_batch(size_t min_ops) {
     if (op_batch->n_ops < min_ops) { return; }
 
@@ -2843,25 +2839,26 @@ void ggml_hexagon_session::flush_batch(size_t min_ops) {
     htp_opbatch_req req {};
     dspqueue_buffer dbuf{};
 
-    if (!op_queue->push(req, dbuf, op_batch)) {
-        flush_pending(false);
-        op_queue->push(req, dbuf, op_batch);
-    }
+    const uint64_t seq = ++this->req_seq;
 
-    update_mdev_idx(dbuf, req, op_batch, this->mdev.idx);
+    op_batch->update_mdev_group(this->mdev.idx);
+
+    if (!op_queue->push(req, dbuf, op_batch, seq)) {
+        flush_pending(false);
+        op_queue->push(req, dbuf, op_batch, seq);
+    }
 
     for (auto & sub : this->mdev.sessions) {
         htp_opbatch_req sub_req {};
         dspqueue_buffer sub_dbuf{};
 
-        if (!sub->op_queue->push(sub_req, sub_dbuf, op_batch)) {
+        sub->req_seq = seq;
+        op_batch->update_mdev_group(sub->mdev.idx);
+
+        if (!sub->op_queue->push(sub_req, sub_dbuf, op_batch, seq)) {
             sub->flush_pending(false);
-            sub->op_queue->push(sub_req, sub_dbuf, op_batch);
+            sub->op_queue->push(sub_req, sub_dbuf, op_batch, seq);
         }
-
-        sub_req.seq = req.seq;
-
-        update_mdev_idx(sub_dbuf, sub_req, op_batch, sub->mdev.idx);
 
         sub->op_pending++;
 
@@ -3158,17 +3155,17 @@ void ggml_hexagon_session::enqueue_allreduce(
 
 void ggml_hexagon_session::wait_event(uint64_t seq) {
     HEX_VERBOSE("ggml-hex: %s opqueue-wait start: seq %llu, current rsp-seq %llu, pending %d\n",
-                this->name.c_str(), (unsigned long long)seq, (unsigned long long)op_queue->rsp_seq, (int)this->op_pending);
-    while (op_queue->rsp_seq < seq && this->op_pending > 0) {
+                this->name.c_str(), (unsigned long long)seq, (unsigned long long)this->rsp_seq, (int)this->op_pending);
+    while (this->rsp_seq < seq && this->op_pending > 0) {
         flush_sync(false);
     }
     HEX_VERBOSE("ggml-hex: %s opqueue-wait end: seq %llu, current rsp-seq %llu, pending %d\n",
-                this->name.c_str(), (unsigned long long)seq, (unsigned long long)op_queue->rsp_seq, (int)this->op_pending);
+                this->name.c_str(), (unsigned long long)seq, (unsigned long long)this->rsp_seq, (int)this->op_pending);
 }
 
 uint64_t ggml_hexagon_session::record_event() {
     flush_async();
-    return op_queue->req_seq;
+    return this->req_seq;
 }
 
 bool ggml_hexagon_session::clone_buffer(const ggml_hexagon_shared_buffer *sbuf)
