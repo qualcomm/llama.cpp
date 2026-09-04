@@ -614,25 +614,27 @@ struct ggml_hexagon_shared_buffer {
 };
 
 struct ggml_hexagon_fence_buffer : public ggml_hexagon_shared_buffer {
-    size_t              fence_size = 0;
+    uint32_t            slot_count = 0;
+    uint32_t            slot_start = 0;
     uint32_t            slot_head  = 0;
     ggml_backend_buffer backend_buffer{};
 
-    ggml_hexagon_fence_buffer(ggml_hexagon_session * sess, ggml_backend_buffer_type_t buft, size_t size)
-        : ggml_hexagon_shared_buffer(sess, size, false /* pinned */), fence_size(size) {
+    ggml_hexagon_fence_buffer(ggml_hexagon_session * sess, ggml_backend_buffer_type_t buft, size_t size, uint32_t reserved_slots = 0)
+        : ggml_hexagon_shared_buffer(sess, size, false /* pinned */),
+          slot_count(size / GGML_HEXAGON_FENCE_SLOT_SIZE),
+          slot_start(reserved_slots),
+          slot_head(reserved_slots) {
         backend_buffer.buft    = buft;
         backend_buffer.context = static_cast<ggml_hexagon_shared_buffer *>(this);
         backend_buffer.size    = size;
-        if (base()) {
-            memset(base(), 0, size);
-        }
+        memset(base(), 0, size);
     }
 
     uint8_t * alloc_slot(uint32_t n_slots = 1) {
-        int max_slots = fence_size / GGML_HEXAGON_FENCE_SLOT_SIZE;
-        uint32_t slot = slot_head % max_slots;
-        if (slot + n_slots > (uint32_t) max_slots) {
-            slot = 0;
+        if (slot_start + n_slots > slot_count) return nullptr;
+        uint32_t slot = slot_head;
+        if (slot + n_slots > slot_count) {
+            slot = slot_start;
         }
         slot_head = slot + n_slots;
         return base() + (size_t) slot * GGML_HEXAGON_FENCE_SLOT_SIZE;
@@ -640,7 +642,7 @@ struct ggml_hexagon_fence_buffer : public ggml_hexagon_shared_buffer {
 };
 
 inline uint8_t * ggml_hexagon_session::alloc_fence(uint32_t n_slots) {
-    return fence_buf ? fence_buf->alloc_slot(n_slots) : nullptr;
+    return fence_buf->alloc_slot(n_slots);
 }
 
 static ggml_hexagon_session * ggml_backend_hexagon_buffer_get_sess(ggml_backend_buffer_t buffer) {
@@ -2927,7 +2929,7 @@ void ggml_hexagon_session::enqueue_op(const htp_opnode & node) {
 void ggml_hexagon_session::enqueue_mdev_setup() {
     htp_opnode setup_node(HTP_OP_MDEV_SETUP);
 
-    uint8_t * fence_ptr = this->alloc_fence(this->mdev_count);
+    uint8_t * fence_ptr = this->fence_buf->base();
 
     static ggml_hexagon_tensor_extra fence_extra { {}, 0, GGML_HEXAGON_TENSOR_FENCE };
     ggml_tensor dummy_t {};
@@ -3413,8 +3415,9 @@ void ggml_hexagon_session::allocate(const ggml_hexagon_device_config & config) n
 
     // Allocate buffers and state for op batching
     this->op_queue = new ggml_hexagon_opqueue(this, opt_opbatch, opt_opqueue);
-    ggml_backend_buffer_type_t fence_buft = dev_ctx ? &dev_ctx->fence_buffer_type : nullptr;
-    this->fence_buf = new ggml_hexagon_fence_buffer(this, fence_buft, 64 * 1024);
+
+    const uint32_t reserved_slots = this->mdev_count > 1 ? this->mdev_count : 0;
+    this->fence_buf = new ggml_hexagon_fence_buffer(this, &dev_ctx->fence_buffer_type, 64 * 1024, reserved_slots);
 
     if (!opt_vmem) {
         opt_vmem = ggml_hexagon_measure_max_vmem(this);
@@ -3495,7 +3498,7 @@ void ggml_hexagon_session::release() noexcept(true) {
 
 ggml_hexagon_session::ggml_hexagon_session(const ggml_hexagon_device_config & config, ggml_backend_dev_t dev, uint32_t mdev_idx, uint32_t mdev_count) noexcept(false) {
     this->dev        = dev;
-    this->dev_ctx    = dev ? static_cast<ggml_backend_hexagon_device_context *>(dev->context) : nullptr;
+    this->dev_ctx    = static_cast<ggml_backend_hexagon_device_context *>(dev->context);
     this->mdev_idx   = mdev_idx;
     this->mdev_count = mdev_count > 0 ? mdev_count : (uint32_t) (1 + config.mdev_group.size());
     op_batch         = nullptr;
@@ -3509,7 +3512,6 @@ ggml_hexagon_session::ggml_hexagon_session(const ggml_hexagon_device_config & co
             for (size_t i = 0; i < config.mdev_group.size(); i++) {
                 mdev_sessions.push_back(std::make_unique<ggml_hexagon_session>(
                     config.mdev_group[i], this->dev, (uint32_t) (i + 1), this->mdev_count));
-                mdev_sessions.back()->clone_buffer(this->fence_buf);
             }
         }
     } catch (const std::exception & exc) {
