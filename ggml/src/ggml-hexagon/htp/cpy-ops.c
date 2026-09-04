@@ -16,6 +16,7 @@
 #include "htp-ops.h"
 #include "hvx-utils.h"
 #include "htp-tensor.h"
+#include "htp-fence.h"
 
 struct htp_copy_context {
     struct htp_ops_context * octx;
@@ -433,12 +434,9 @@ int op_cpy(struct htp_ops_context * octx) {
             qurt_mem_cache_clean((qurt_addr_t) 0, 0, QURT_MEM_CACHE_FLUSH_INVALIDATE_ALL, QURT_MEM_DCACHE);
         }
 
-        atomic_uint * sync_fence = (atomic_uint *) sync->data;
         const uint32_t seq = (uint32_t) octx->op_params[0];
-
-        atomic_store(&sync_fence[0], seq);
-        asm volatile ("syncht" : : : "memory");
-        Q6_dccleaninva_A((void *) sync_fence);
+        atomic_uint * sync_fence = (atomic_uint *) (uintptr_t) sync->data;
+        htp_fence_write(sync_fence, seq, HTP_STATUS_OK);
 
         FARF(HIGH, "ggml-hex: sync-release : fence %p seq %u\n", sync_fence, seq);
     }

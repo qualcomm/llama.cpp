@@ -413,6 +413,7 @@ struct ggml_hexagon_session {
 
     std::atomic<uint64_t> batch_req_seq{0};
     std::atomic<uint64_t> batch_rsp_seq{0};
+    std::atomic<uint32_t> last_error{HTP_STATUS_OK};
 
     uint64_t                cached_uid = 0;
     std::vector<htp_opnode> cached_nodes;
@@ -2782,6 +2783,9 @@ void ggml_hexagon_session::flush_async() {
 void ggml_hexagon_session::flush_pending(bool all) {
     for (auto & sub : this->mdev.sessions) {
         sub->flush_pending(all);
+        if (sub->last_error > HTP_STATUS_OK) {
+            this->last_error = sub->last_error.load();
+        }
     }
 
     while (this->batch_rsp_seq < this->batch_req_seq) {
@@ -2809,9 +2813,12 @@ void ggml_hexagon_session::flush_pending(bool all) {
             GGML_ABORT("ggml-hex: %s dspcall : bad response : size %u dspbufs %u\n", this->c_name(), rsp_size, n_dbufs);
         }
 
-        if (rsp.status != HTP_STATUS_OK) {
-            GGML_LOG_ERROR("ggml-hex: %s dspcall : dsp-rsp: %s\n", this->c_name(), status_to_str(rsp.status));
-            // TODO: handle errors
+        if (rsp.status > HTP_STATUS_OK) {
+            GGML_LOG_ERROR("ggml-hex: %s dspcall : dsp-rsp %s\n", this->c_name(), status_to_str(rsp.status));
+            this->last_error = rsp.status;
+            for (auto & sub : this->mdev.sessions) {
+                sub->last_error = rsp.status;
+            }
         }
 
         op_queue->pop(rsp, dbuf);
@@ -3151,6 +3158,9 @@ void ggml_hexagon_session::wait_event(uint64_t seq) {
     while (this->batch_rsp_seq < seq) {
         flush_sync(false);
     }
+    if (this->last_error > HTP_STATUS_OK) {
+        GGML_ABORT("ggml-hex: %s wait-event failed : dsp-error %s\n", this->c_name(), status_to_str(this->last_error));
+    }
     HEX_VERBOSE("ggml-hex: %s wait-event end: seq %llu, batch-req %llu, batch-rsp %llu\n",
                 this->name.c_str(), (unsigned long long)seq, (unsigned long long)this->batch_req_seq, (unsigned long long)this->batch_rsp_seq);
 }
@@ -3237,6 +3247,7 @@ void ggml_hexagon_session::allocate(const ggml_hexagon_device_config & config) n
     this->name          = config.name;
     this->batch_req_seq = 0;
     this->batch_rsp_seq = 0;
+    this->last_error    = HTP_STATUS_OK;
 
     GGML_LOG_DEBUG("ggml-hex: %s allocating new session\n", this->name.c_str());
 
@@ -5378,6 +5389,10 @@ static bool is_mergeable_mul_mat_id_pair(const ggml_tensor * n1, const ggml_tens
 static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, ggml_cgraph * graph) {
     auto sess = static_cast<ggml_hexagon_session *>(backend->context);
 
+    if (sess->last_error > HTP_STATUS_OK) {
+        return GGML_STATUS_FAILED;
+    }
+
     HEX_VERBOSE("ggml-hex: %s graph-compute n_nodes %d\n", sess->c_name(), graph->n_nodes);
 
     const std::vector<htp_opnode> * nodes_ptr = nullptr;
@@ -5464,6 +5479,10 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
         sess->enqueue_op(node);
     }
 
+    if (sess->last_error > HTP_STATUS_OK) {
+        return GGML_STATUS_FAILED;
+    }
+
     return GGML_STATUS_SUCCESS;
 }
 
@@ -5474,6 +5493,9 @@ static void ggml_backend_hexagon_synchronize(ggml_backend_t backend) {
 
     // Wait until all pending ops complete
     sess->flush_sync();
+    if (sess->last_error > HTP_STATUS_OK) {
+        GGML_ABORT("ggml-hex: %s synchronize failed : dsp-error %s\n", sess->c_name(), status_to_str(sess->last_error));
+    }
 }
 
 enum ggml_hexagon_mem_range_type {
@@ -5862,6 +5884,9 @@ static void ggml_backend_hexagon_get_tensor_async(ggml_backend_t backend, const 
     HEX_VERBOSE("ggml-hex: %s get-tensor-async %s : data %p offset %zu size %zu usage %d\n",
                 sess->c_name(), tensor->name, data, offset, size, tensor->buffer ? (int) tensor->buffer->usage : -1);
     sess->flush_sync();
+    if (sess->last_error > HTP_STATUS_OK) {
+        GGML_ABORT("ggml-hex: %s get-tensor-async failed : dsp-error %s\n", sess->c_name(), status_to_str(sess->last_error));
+    }
     ggml_backend_tensor_get(tensor, data, offset, size);
 }
 
@@ -5891,6 +5916,9 @@ static void ggml_backend_hexagon_get_tensor_2d_async(ggml_backend_t backend,
     HEX_VERBOSE("ggml-hex: %s get-tensor-2d-async %s : data %p offset %zu size %zu n_copies %zu stride_tensor %zu stride_data %zu usage %d\n",
                 sess->c_name(), tensor->name, data, offset, size, n_copies, stride_tensor, stride_data, tensor->buffer ? (int) tensor->buffer->usage : -1);
     sess->flush_sync();
+    if (sess->last_error > HTP_STATUS_OK) {
+        GGML_ABORT("ggml-hex: %s get-tensor-2d-async failed : dsp-error %s\n", sess->c_name(), status_to_str(sess->last_error));
+    }
     ggml_backend_tensor_get_2d(tensor, data, offset, size, n_copies, stride_tensor, stride_data);
 }
 

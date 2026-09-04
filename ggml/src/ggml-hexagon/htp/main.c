@@ -34,6 +34,7 @@
 #include "work-queue.h"
 #include "hex-profile.h"
 #include "allreduce-ops.h"
+#include "htp-fence.h"
 
 #define HMX_QUEUE_CAPACITY     16
 #define HMX_QUEUE_STACK_SIZE   16384
@@ -715,18 +716,24 @@ static int op_fence(struct htp_ops_context * octx) {
     htp_trace_event_start(tr, HTP_TRACE_EVT_FENCE, (uint16_t) seq);
 
     const struct htp_tensor * sync = octx->src[0];
-    atomic_uint * sync_fence = (atomic_uint *) sync->data;
+    atomic_uint * sync_fence = (atomic_uint *) (uintptr_t) sync->data;
     uint64_t spins = 0;
     while (1) {
-        Q6_dccleaninva_A((void *) sync_fence);
-        asm volatile ("syncht" : : : "memory");
-        uint32_t val = atomic_load(&sync_fence[0]);
-        if ((int32_t)(val - seq) >= 0) {
+        uint32_t sync_seq;
+        uint32_t sync_status;
+        htp_fence_read(sync_fence, &sync_seq, &sync_status);
+        if (sync_status > HTP_STATUS_OK) {
+            FARF(ERROR, "ggml-hex: sync-wait peer failed with status %u : fence %p seq %u\n", sync_status, sync_fence, seq);
+            htp_trace_event_stop(tr, HTP_TRACE_EVT_FENCE, (uint16_t) seq);
+            return sync_status;
+        }
+        if ((int32_t)(sync_seq - seq) >= 0) {
             break;
         }
         if (++spins > HTP_FENCE_TIMEOUT) {
             FARF(ERROR, "ggml-hex: sync-wait TIMEOUT : fence %p spins %llu seq %u\n", sync_fence, spins, seq);
-            break;
+            htp_trace_event_stop(tr, HTP_TRACE_EVT_FENCE, (uint16_t) seq);
+            return HTP_STATUS_INTERNAL_ERR;
         }
         hex_pause();
     }
@@ -1006,10 +1013,10 @@ static void mdev_group_init(struct htp_context * ctx, const struct htp_opbatch_r
     ctx->mdev.fence_seq = (uint32_t)((req->seq & 0xfffff) << 12);
 }
 
-static int mdev_group_fence(struct htp_ops_context * octx) {
+static int mdev_group_fence(struct htp_ops_context * octx, int op_status) {
     struct htp_context * ctx = octx->ctx;
     if (ctx->mdev.count <= 1) {
-        return HTP_STATUS_OK;
+        return op_status;
     }
 
     assert(ctx->mdev.fence_base != NULL);
@@ -1023,30 +1030,40 @@ static int mdev_group_fence(struct htp_ops_context * octx) {
     const uint32_t mdev_count = ctx->mdev.count;
 
     uint8_t * fence_base   = ctx->mdev.fence_base;
-    atomic_uint * my_fence = (atomic_uint *) (fence_base + mdev_idx * HTP_FENCE_SLOT_SIZE);
+    atomic_uint * my_fence = htp_mdev_fence(fence_base, mdev_idx);
+    htp_fence_write(my_fence, seq, op_status);
 
-    atomic_store(my_fence, seq);
-    asm volatile ("syncht" : : : "memory");
-    Q6_dccleaninva_A((void *) my_fence);
+    if (op_status > HTP_STATUS_OK) {
+        htp_trace_event_stop(tr, HTP_TRACE_EVT_FENCE, (uint16_t) seq);
+        return op_status;
+    }
 
     for (uint32_t d = 0; d < mdev_count; d++) {
         if (d == mdev_idx) continue;
-        atomic_uint * peer_fence = (atomic_uint *) (fence_base + d * HTP_FENCE_SLOT_SIZE);
+        atomic_uint * peer_fence = htp_mdev_fence(fence_base, d);
         uint64_t spins = 0;
         while (1) {
-            Q6_dccleaninva_A((void *) peer_fence);
-            asm volatile ("syncht" : : : "memory");
-            uint32_t val = atomic_load(peer_fence);
-            if ((int32_t)(val - seq) >= 0) {
+            uint32_t peer_seq;
+            uint32_t peer_status;
+            htp_fence_read(peer_fence, &peer_seq, &peer_status);
+            if (peer_status > HTP_STATUS_OK) {
+                FARF(ERROR, "ggml-hex: mdev %u peer %u failed with status %u : seq 0x%08x\n",
+                     mdev_idx, d, peer_status, seq);
+                htp_fence_write(my_fence, seq, peer_status);
+                htp_trace_event_stop(tr, HTP_TRACE_EVT_FENCE, (uint16_t) seq);
+                return peer_status;
+            }
+            if ((int32_t)(peer_seq - seq) >= 0) {
                 break;
             }
             if (++spins == 10000) {
-                FARF(ALWAYS, "ggml-hex: mdev %u waiting for mdev %u : seq 0x%08x (b %u, op %u) my_fence %p (0x%08x) peer_fence %p val 0x%08x (diff %d)\n",
-                     mdev_idx, d, seq, seq >> 12, seq & 0xfff, my_fence, atomic_load(my_fence), peer_fence, val, (int32_t)(val - seq));
+                FARF(ALWAYS, "ggml-hex: mdev %u waiting for mdev %u : seq 0x%08x (b %u op %u) my-fence %p peer-fence %p peer-seq 0x%08x (diff %d)\n",
+                     mdev_idx, d, seq, seq >> 12, seq & 0xfff, my_fence, peer_fence, peer_seq, (int32_t)(peer_seq - seq));
             }
             if (spins > HTP_FENCE_TIMEOUT) {
-                FARF(ERROR, "ggml-hex: mdev %u timeout waiting for mdev %u (seq 0x%08x [b %u, op %u], peer_fence %p val 0x%08x)\n",
-                     mdev_idx, d, seq, seq >> 12, seq & 0xfff, peer_fence, val);
+                FARF(ERROR, "ggml-hex: mdev %u timeout waiting for mdev %u : seq 0x%08x (b %u op %u) peer-fence %p peer-seq 0x%08x\n",
+                     mdev_idx, d, seq, seq >> 12, seq & 0xfff, peer_fence, peer_seq);
+                htp_fence_write(my_fence, seq, HTP_STATUS_INTERNAL_ERR);
                 htp_trace_event_stop(tr, HTP_TRACE_EVT_FENCE, (uint16_t) seq);
                 return HTP_STATUS_INTERNAL_ERR;
             }
@@ -1105,12 +1122,16 @@ static int proc_op_req(struct htp_ops_context * octx, struct htp_buf_desc * bufs
             dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3]);
     }
 
-    int fence_status = mdev_group_fence(octx);
-    if (fence_status != HTP_STATUS_OK) {
+    int fence_status = mdev_group_fence(octx, HTP_STATUS_OK);
+    if (fence_status > HTP_STATUS_OK) {
         return fence_status;
     }
 
     int status = execute_op(octx);
+    if (status > HTP_STATUS_OK && octx->ctx->mdev.count > 1) {
+        atomic_uint * my_fence = htp_mdev_fence(octx->ctx->mdev.fence_base, octx->ctx->mdev.idx);
+        htp_fence_write(my_fence, octx->ctx->mdev.fence_seq, status);
+    }
 
     htp_tensor_dirty_all(octx->ctx, octx->dsts, HTP_OP_MAX_OUTPUTS);
 
@@ -1222,10 +1243,7 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
     qurt_mem_cache_clean((qurt_addr_t) 0, 0, QURT_MEM_CACHE_FLUSH_INVALIDATE_ALL, QURT_MEM_DCACHE);
     htp_trace_event_stop(&ctx->trace[0], HTP_TRACE_EVT_L2FLUSH, 0);
 
-    int final_sync_status = mdev_group_fence(octx);
-    if (final_sync_status != HTP_STATUS_OK && op_status == HTP_STATUS_OK) {
-        op_status = final_sync_status;
-    }
+    op_status = mdev_group_fence(octx, op_status);
 
     profile_stop(HTP_PROF_BASIC, &batch_prof);
 
