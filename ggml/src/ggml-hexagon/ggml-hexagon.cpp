@@ -396,7 +396,6 @@ struct ggml_hexagon_session {
     bool             valid_queue;
     bool             valid_iface;
 
-    std::atomic<int>      op_pending;
     ggml_hexagon_opbatch* op_batch;
     ggml_hexagon_opqueue* op_queue;
 
@@ -411,8 +410,9 @@ struct ggml_hexagon_session {
     size_t   max_vmem    = 0;
     size_t   max_bufsize = 0;
     uint32_t fence_seq   = 0;
-    uint64_t req_seq     = 0;
-    uint64_t rsp_seq     = 0;
+
+    std::atomic<uint64_t> batch_req_seq{0};
+    std::atomic<uint64_t> batch_rsp_seq{0};
 
     uint64_t                cached_uid = 0;
     std::vector<htp_opnode> cached_nodes;
@@ -2784,7 +2784,7 @@ void ggml_hexagon_session::flush_pending(bool all) {
         sub->flush_pending(all);
     }
 
-    while (this->op_pending) {
+    while (this->batch_rsp_seq < this->batch_req_seq) {
         struct htp_opbatch_rsp rsp;
         uint32_t               rsp_size;
         uint32_t               flags;
@@ -2816,11 +2816,8 @@ void ggml_hexagon_session::flush_pending(bool all) {
 
         op_queue->pop(rsp, dbuf);
 
-        if (rsp.seq > this->rsp_seq) {
-            this->rsp_seq = rsp.seq;
-        }
-
-        this->op_pending--;  // atomic dec
+        GGML_ASSERT(rsp.seq == this->batch_rsp_seq + 1);
+        this->batch_rsp_seq = rsp.seq;
 
         if (!all) break;
     }
@@ -2839,7 +2836,7 @@ void ggml_hexagon_session::flush_batch(size_t min_ops) {
     htp_opbatch_req req {};
     dspqueue_buffer dbuf{};
 
-    const uint64_t seq = ++this->req_seq;
+    const uint64_t seq = ++this->batch_req_seq;
 
     op_batch->update_mdev_group(this->mdev.idx);
 
@@ -2852,15 +2849,13 @@ void ggml_hexagon_session::flush_batch(size_t min_ops) {
         htp_opbatch_req sub_req {};
         dspqueue_buffer sub_dbuf{};
 
-        sub->req_seq = seq;
+        sub->batch_req_seq = seq;
         op_batch->update_mdev_group(sub->mdev.idx);
 
         if (!sub->op_queue->push(sub_req, sub_dbuf, op_batch, seq)) {
             sub->flush_pending(false);
             sub->op_queue->push(sub_req, sub_dbuf, op_batch, seq);
         }
-
-        sub->op_pending++;
 
         HEX_VERBOSE("ggml-hex: %s queue-opbatch: %p size %u\n", sub->c_name(), sub_dbuf.ptr, sub_dbuf.size);
 
@@ -2869,9 +2864,6 @@ void ggml_hexagon_session::flush_batch(size_t min_ops) {
             GGML_ABORT("ggml-hex: %s dspqueue_write failed: 0x%08x\n", sub->c_name(), (unsigned) err);
         }
     }
-
-    // Bump pending flag (cleared in the session::flush once we get the response)
-    this->op_pending++;  // atomic inc
 
     HEX_VERBOSE("ggml-hex: %s queue-opbatch: %p size %u\n", this->c_name(), dbuf.ptr, dbuf.size);
 
@@ -3154,18 +3146,18 @@ void ggml_hexagon_session::enqueue_allreduce(
 }
 
 void ggml_hexagon_session::wait_event(uint64_t seq) {
-    HEX_VERBOSE("ggml-hex: %s opqueue-wait start: seq %llu, current rsp-seq %llu, pending %d\n",
-                this->name.c_str(), (unsigned long long)seq, (unsigned long long)this->rsp_seq, (int)this->op_pending);
-    while (this->rsp_seq < seq && this->op_pending > 0) {
+    HEX_VERBOSE("ggml-hex: %s wait-event start: seq %llu, batch-req %llu, batch-rsp %llu\n",
+                this->name.c_str(), (unsigned long long)seq, (unsigned long long)this->batch_req_seq, (unsigned long long)this->batch_rsp_seq);
+    while (this->batch_rsp_seq < seq) {
         flush_sync(false);
     }
-    HEX_VERBOSE("ggml-hex: %s opqueue-wait end: seq %llu, current rsp-seq %llu, pending %d\n",
-                this->name.c_str(), (unsigned long long)seq, (unsigned long long)this->rsp_seq, (int)this->op_pending);
+    HEX_VERBOSE("ggml-hex: %s wait-event end: seq %llu, batch-req %llu, batch-rsp %llu\n",
+                this->name.c_str(), (unsigned long long)seq, (unsigned long long)this->batch_req_seq, (unsigned long long)this->batch_rsp_seq);
 }
 
 uint64_t ggml_hexagon_session::record_event() {
     flush_async();
-    return this->req_seq;
+    return this->batch_req_seq;
 }
 
 bool ggml_hexagon_session::clone_buffer(const ggml_hexagon_shared_buffer *sbuf)
@@ -3242,8 +3234,9 @@ void ggml_hexagon_session::allocate(const ggml_hexagon_device_config & config) n
     this->virt_idx   = virt_idx;
     this->domain_id  = config.domain_id;
     this->session_id = 0;
-    this->name       = config.name;
-    this->op_pending = 0;
+    this->name          = config.name;
+    this->batch_req_seq = 0;
+    this->batch_rsp_seq = 0;
 
     GGML_LOG_DEBUG("ggml-hex: %s allocating new session\n", this->name.c_str());
 
