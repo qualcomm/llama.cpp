@@ -431,6 +431,7 @@ struct ggml_hexagon_session {
     void flush_async();
     void flush_batch(size_t min_ops = 1);
     void flush_peers();
+    void flush_pending(bool all = true);
 
     uint64_t record_event();
     void     wait_event(uint64_t seq);
@@ -2748,11 +2749,9 @@ void ggml_hexagon_session::flush_async() {
     flush_batch();
 }
 
-void ggml_hexagon_session::flush_sync(bool all) {
-    flush_async();
-
+void ggml_hexagon_session::flush_pending(bool all) {
     for (auto & sub : mdev_sessions) {
-        sub->flush_sync(all);
+        sub->flush_pending(all);
     }
 
     while (this->op_pending) {
@@ -2793,6 +2792,11 @@ void ggml_hexagon_session::flush_sync(bool all) {
     }
 }
 
+void ggml_hexagon_session::flush_sync(bool all) {
+    flush_async();
+    flush_pending(all);
+}
+
 void ggml_hexagon_session::flush_batch(size_t min_ops) {
     if (op_batch->n_ops < min_ops) { return; }
 
@@ -2802,7 +2806,7 @@ void ggml_hexagon_session::flush_batch(size_t min_ops) {
     dspqueue_buffer dbuf{};
 
     if (!op_queue->push(req, dbuf, op_batch)) {
-        flush_sync(false);
+        flush_pending(false);
         op_queue->push(req, dbuf, op_batch);
     }
 
@@ -2814,7 +2818,7 @@ void ggml_hexagon_session::flush_batch(size_t min_ops) {
         dspqueue_buffer sub_dbuf{};
 
         if (!sub->op_queue->push(sub_req, sub_dbuf, op_batch)) {
-            sub->flush_sync(false);
+            sub->flush_pending(false);
             sub->op_queue->push(sub_req, sub_dbuf, op_batch);
         }
 
