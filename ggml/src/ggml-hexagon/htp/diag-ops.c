@@ -167,7 +167,7 @@ int op_diag_f32(struct htp_ops_context * octx) {
     uint32_t batch_start = 0;
     uint32_t nbatches    = total_batches;
 
-    if (octx->mdev_count > 1) {
+    if (octx->ctx->mdev.count > 1) {
         bool can_split = (dst->ne[0] == 1 || dst->nb[0] == sizeof(float)) && !htp_tensor_is_permuted(dst);
         uint32_t batches_per_chunk = 1;
         if (can_split) {
@@ -182,13 +182,13 @@ int op_diag_f32(struct htp_ops_context * octx) {
         }
 
         const uint32_t total_chunks = can_split ? (total_batches / batches_per_chunk) : 0;
-        if (total_chunks < octx->mdev_count) {
-            batch_start = (octx->mdev_idx == 0) ? 0 : total_batches;
-            nbatches    = (octx->mdev_idx == 0) ? total_batches : 0;
+        if (total_chunks < octx->ctx->mdev.count) {
+            batch_start = (octx->ctx->mdev.idx == 0) ? 0 : total_batches;
+            nbatches    = (octx->ctx->mdev.idx == 0) ? total_batches : 0;
         } else {
-            const uint32_t chunks_per_mdev = fastdiv(total_chunks + octx->mdev_count - 1, &octx->mdev_count_div);
-            batch_start = MIN(octx->mdev_idx * chunks_per_mdev * batches_per_chunk, total_batches);
-            if (octx->mdev_idx == octx->mdev_count - 1) {
+            const uint32_t chunks_per_mdev = fastdiv(total_chunks + octx->ctx->mdev.count - 1, &octx->ctx->mdev.count_div);
+            batch_start = MIN(octx->ctx->mdev.idx * chunks_per_mdev * batches_per_chunk, total_batches);
+            if (octx->ctx->mdev.idx == octx->ctx->mdev.count - 1) {
                 nbatches = total_batches - batch_start;
             } else {
                 nbatches = MIN(chunks_per_mdev * batches_per_chunk, total_batches - batch_start);

@@ -738,13 +738,14 @@ static int op_fence(struct htp_ops_context * octx) {
 }
 
 static int op_mdev_setup(struct htp_ops_context * octx) {
-    octx->mdev_idx   = (uint32_t) octx->op_params[0];
-    octx->mdev_count = (uint32_t) octx->op_params[1];
-    if (octx->mdev_count > 1) {
-        octx->mdev_count_div = init_fastdiv_values(octx->mdev_count);
+    struct htp_context * ctx = octx->ctx;
+    ctx->mdev.idx   = (uint16_t) octx->op_params[0];
+    ctx->mdev.count = (uint16_t) octx->op_params[1];
+    if (ctx->mdev.count > 1) {
+        ctx->mdev.count_div = init_fastdiv_values(ctx->mdev.count);
         const struct htp_tensor * sync = octx->src[0];
         assert(sync && sync->data);
-        octx->fence_base = (uint8_t *) sync->data;
+        ctx->mdev.fence_base = (uint8_t *) sync->data;
     }
     return HTP_STATUS_OK;
 }
@@ -999,31 +1000,36 @@ static void prep_tensors(struct htp_context *ctx, struct htp_buf_desc *bufs, str
     }
 }
 
-static int mdev_sync_fence(struct htp_ops_context * octx) {
-    if (octx->mdev_count <= 1) {
+static void mdev_group_init(struct htp_context * ctx, const struct htp_opbatch_req * req) {
+    memset(&ctx->mdev, 0, sizeof(ctx->mdev));
+    ctx->mdev.fence_seq = (uint32_t)((req->seq & 0xfffff) << 12);
+}
+
+static int mdev_group_fence(struct htp_ops_context * octx) {
+    struct htp_context * ctx = octx->ctx;
+    if (ctx->mdev.count <= 1) {
         return HTP_STATUS_OK;
     }
 
-    struct htp_context * ctx = octx->ctx;
-    assert(octx->fence_base != NULL);
+    assert(ctx->mdev.fence_base != NULL);
 
-    const uint32_t seq = ++octx->fence_seq;
+    const uint32_t seq = ++ctx->mdev.fence_seq;
 
     struct htp_thread_trace * tr = &ctx->trace[0];
     htp_trace_event_start(tr, HTP_TRACE_EVT_FENCE, (uint16_t) seq);
 
-    const uint32_t my_mdev_idx = octx->mdev_idx;
-    const uint32_t mdev_count  = octx->mdev_count;
+    const uint32_t mdev_idx   = ctx->mdev.idx;
+    const uint32_t mdev_count = ctx->mdev.count;
 
-    uint8_t * fence_base   = octx->fence_base;
-    atomic_uint * my_fence = (atomic_uint *) (fence_base + my_mdev_idx * HTP_FENCE_SLOT_SIZE);
+    uint8_t * fence_base   = ctx->mdev.fence_base;
+    atomic_uint * my_fence = (atomic_uint *) (fence_base + mdev_idx * HTP_FENCE_SLOT_SIZE);
 
     atomic_store(my_fence, seq);
     asm volatile ("syncht" : : : "memory");
     Q6_dccleaninva_A((void *) my_fence);
 
     for (uint32_t d = 0; d < mdev_count; d++) {
-        if (d == my_mdev_idx) continue;
+        if (d == mdev_idx) continue;
         atomic_uint * peer_fence = (atomic_uint *) (fence_base + d * HTP_FENCE_SLOT_SIZE);
         uint64_t spins = 0;
         while (1) {
@@ -1035,11 +1041,11 @@ static int mdev_sync_fence(struct htp_ops_context * octx) {
             }
             if (++spins == 10000) {
                 FARF(ALWAYS, "ggml-hex: mdev %u waiting for mdev %u : seq 0x%08x (b %u, op %u) my_fence %p (0x%08x) peer_fence %p val 0x%08x (diff %d)\n",
-                     my_mdev_idx, d, seq, seq >> 12, seq & 0xfff, my_fence, atomic_load(my_fence), peer_fence, val, (int32_t)(val - seq));
+                     mdev_idx, d, seq, seq >> 12, seq & 0xfff, my_fence, atomic_load(my_fence), peer_fence, val, (int32_t)(val - seq));
             }
             if (spins > HTP_FENCE_TIMEOUT) {
                 FARF(ERROR, "ggml-hex: mdev %u timeout waiting for mdev %u (seq 0x%08x [b %u, op %u], peer_fence %p val 0x%08x)\n",
-                     my_mdev_idx, d, seq, seq >> 12, seq & 0xfff, peer_fence, val);
+                     mdev_idx, d, seq, seq >> 12, seq & 0xfff, peer_fence, val);
                 htp_trace_event_stop(tr, HTP_TRACE_EVT_FENCE, (uint16_t) seq);
                 return HTP_STATUS_INTERNAL_ERR;
             }
@@ -1098,7 +1104,7 @@ static int proc_op_req(struct htp_ops_context * octx, struct htp_buf_desc * bufs
             dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3]);
     }
 
-    int fence_status = mdev_sync_fence(octx);
+    int fence_status = mdev_group_fence(octx);
     if (fence_status != HTP_STATUS_OK) {
         return fence_status;
     }
@@ -1175,7 +1181,8 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
     octx->n_threads     = ctx->n_threads;
     octx->n_threads_div = ctx->n_threads_div;
     octx->ctx           = ctx;
-    octx->fence_seq = (uint32_t)((req->seq & 0xfffff) << 12);
+
+    mdev_group_init(ctx, req);
 
     work_queue_wakeup(ctx->work_queue);
     if (ctx->hmx_queue) {
@@ -1214,7 +1221,7 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
     qurt_mem_cache_clean((qurt_addr_t) 0, 0, QURT_MEM_CACHE_FLUSH_INVALIDATE_ALL, QURT_MEM_DCACHE);
     htp_trace_event_stop(&ctx->trace[0], HTP_TRACE_EVT_L2FLUSH, 0);
 
-    int final_sync_status = mdev_sync_fence(octx);
+    int final_sync_status = mdev_group_fence(octx);
     if (final_sync_status != HTP_STATUS_OK && op_status == HTP_STATUS_OK) {
         op_status = final_sync_status;
     }

@@ -237,19 +237,19 @@ int op_solve_tri(struct htp_ops_context * octx) {
         uint32_t job_start = 0;
         uint32_t njobs     = total_batches;
 
-        if (octx->mdev_count > 1) {
+        if (octx->ctx->mdev.count > 1) {
             const uint32_t batch_size = dst->nb[2];
             const uint32_t batches_per_chunk = (batch_size > 0) ? (HEX_L2_LINE_SIZE / hex_gcd_u32(batch_size, HEX_L2_LINE_SIZE)) : 1;
             const uint32_t total_chunks = total_batches / batches_per_chunk;
-            const bool can_split = total_chunks >= octx->mdev_count;
+            const bool can_split = total_chunks >= octx->ctx->mdev.count;
 
             if (!can_split) {
-                job_start = (octx->mdev_idx == 0) ? 0 : total_batches;
-                njobs     = (octx->mdev_idx == 0) ? total_batches : 0;
+                job_start = (octx->ctx->mdev.idx == 0) ? 0 : total_batches;
+                njobs     = (octx->ctx->mdev.idx == 0) ? total_batches : 0;
             } else {
-                const uint32_t chunks_per_mdev = fastdiv(total_chunks + octx->mdev_count - 1, &octx->mdev_count_div);
-                job_start = MIN(octx->mdev_idx * chunks_per_mdev * batches_per_chunk, total_batches);
-                if (octx->mdev_idx == octx->mdev_count - 1) {
+                const uint32_t chunks_per_mdev = fastdiv(total_chunks + octx->ctx->mdev.count - 1, &octx->ctx->mdev.count_div);
+                job_start = MIN(octx->ctx->mdev.idx * chunks_per_mdev * batches_per_chunk, total_batches);
+                if (octx->ctx->mdev.idx == octx->ctx->mdev.count - 1) {
                     njobs = total_batches - job_start;
                 } else {
                     njobs = MIN(chunks_per_mdev * batches_per_chunk, total_batches - job_start);
@@ -281,15 +281,15 @@ int op_solve_tri(struct htp_ops_context * octx) {
         uint32_t job_start = 0;
         uint32_t njobs     = total_jobs;
 
-        if (octx->mdev_count > 1) {
-            const bool can_split = ((dst->nb[1] & 127) == 0) && (total_jobs >= octx->mdev_count);
+        if (octx->ctx->mdev.count > 1) {
+            const bool can_split = ((dst->nb[1] & 127) == 0) && (total_jobs >= octx->ctx->mdev.count);
             if (!can_split) {
-                job_start = (octx->mdev_idx == 0) ? 0 : total_jobs;
-                njobs     = (octx->mdev_idx == 0) ? total_jobs : 0;
+                job_start = (octx->ctx->mdev.idx == 0) ? 0 : total_jobs;
+                njobs     = (octx->ctx->mdev.idx == 0) ? total_jobs : 0;
             } else {
-                const uint32_t jobs_per_mdev = fastdiv(total_jobs + octx->mdev_count - 1, &octx->mdev_count_div);
-                job_start = MIN(octx->mdev_idx * jobs_per_mdev, total_jobs);
-                if (octx->mdev_idx == octx->mdev_count - 1) {
+                const uint32_t jobs_per_mdev = fastdiv(total_jobs + octx->ctx->mdev.count - 1, &octx->ctx->mdev.count_div);
+                job_start = MIN(octx->ctx->mdev.idx * jobs_per_mdev, total_jobs);
+                if (octx->ctx->mdev.idx == octx->ctx->mdev.count - 1) {
                     njobs = total_jobs - job_start;
                 } else {
                     njobs = MIN(jobs_per_mdev, total_jobs - job_start);

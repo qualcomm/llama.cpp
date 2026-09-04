@@ -38,6 +38,14 @@ struct htp_spad {
     uint32_t                  size_per_thread; // size per thread
 };
 
+struct htp_mdev_group {
+    uint16_t              idx;
+    uint16_t              count;
+    struct fastdiv_values count_div;
+    uint8_t *             fence_base;
+    uint32_t              fence_seq;
+};
+
 struct htp_context;
 
 // Context while processing an Op
@@ -65,14 +73,9 @@ struct htp_ops_context {
     struct htp_spad src3_spad;
     struct htp_spad dst_spad;
 
-    uint32_t n_threads;
+    uint32_t              flags;
+    uint32_t              n_threads;
     struct fastdiv_values n_threads_div;
-    uint32_t flags;
-    uint16_t mdev_idx;
-    uint16_t mdev_count;
-    struct fastdiv_values mdev_count_div;
-    uint8_t * fence_base;
-    uint32_t  fence_seq;
 };
 
 // Main context for htp DSP backend
@@ -82,6 +85,7 @@ struct htp_context {
     struct htp_mmap        mmap[HTP_MAX_MMAPS];
     dma_queue_t            dma[HTP_MAX_NTHREADS];
     dma_queue_t            dma_cached[HTP_MAX_NTHREADS];
+    struct htp_thread_trace trace[HTP_MAX_NTHREADS + 1];
     work_queue_t           work_queue;
     hmx_queue_t            hmx_queue;
 
@@ -94,7 +98,6 @@ struct htp_context {
     bool                   hmx_enabled;
     bool                   etm;
     uint32_t               profiler;
-    struct htp_thread_trace trace[HTP_MAX_NTHREADS + 1];
 
     uint8_t *              vtcm_base;
     size_t                 vtcm_size;
@@ -113,6 +116,7 @@ struct htp_context {
     void *                 ddr_spad_base;
     size_t                 ddr_spad_size;
 
+    struct htp_mdev_group  mdev;
     struct htp_ops_context octx;
 
     qurt_thread_t          main_thread;

@@ -206,16 +206,16 @@ int op_set_rows(struct htp_ops_context * octx) {
     uint32_t task_start = 0;
     uint32_t tasks      = total_tasks;
 
-    if (octx->mdev_count > 1) {
+    if (octx->ctx->mdev.count > 1) {
         bool can_split = (dst->nb[1] & 127) == 0 && !htp_tensor_is_permuted(dst);
         const uint32_t total_chunks = can_split ? total_tasks : 0;
-        if (total_chunks < octx->mdev_count) {
-            task_start = (octx->mdev_idx == 0) ? 0 : total_tasks;
-            tasks      = (octx->mdev_idx == 0) ? total_tasks : 0;
+        if (total_chunks < octx->ctx->mdev.count) {
+            task_start = (octx->ctx->mdev.idx == 0) ? 0 : total_tasks;
+            tasks      = (octx->ctx->mdev.idx == 0) ? total_tasks : 0;
         } else {
-            const uint32_t tasks_per_mdev = fastdiv(total_chunks + octx->mdev_count - 1, &octx->mdev_count_div);
-            task_start = MIN(octx->mdev_idx * tasks_per_mdev, total_tasks);
-            if (octx->mdev_idx == octx->mdev_count - 1) {
+            const uint32_t tasks_per_mdev = fastdiv(total_chunks + octx->ctx->mdev.count - 1, &octx->ctx->mdev.count_div);
+            task_start = MIN(octx->ctx->mdev.idx * tasks_per_mdev, total_tasks);
+            if (octx->ctx->mdev.idx == octx->ctx->mdev.count - 1) {
                 tasks = total_tasks - task_start;
             } else {
                 tasks = MIN(tasks_per_mdev, total_tasks - task_start);

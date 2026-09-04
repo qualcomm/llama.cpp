@@ -1143,19 +1143,19 @@ int op_gated_delta_net(struct htp_ops_context * octx) {
     uint32_t row_start = 0;
     uint32_t nrows     = total_rows;
 
-    if (octx->mdev_count > 1) {
+    if (octx->ctx->mdev.count > 1) {
         const uint32_t head_bytes = S_v * sizeof(float);
         const uint32_t rows_per_chunk = (head_bytes > 0) ? (HEX_L2_LINE_SIZE / hex_gcd_u32(head_bytes, HEX_L2_LINE_SIZE)) : 1;
         const uint32_t total_chunks = total_rows / rows_per_chunk;
-        const bool can_split = total_chunks >= octx->mdev_count;
+        const bool can_split = total_chunks >= octx->ctx->mdev.count;
 
         if (!can_split) {
-            row_start = (octx->mdev_idx == 0) ? 0 : total_rows;
-            nrows     = (octx->mdev_idx == 0) ? total_rows : 0;
+            row_start = (octx->ctx->mdev.idx == 0) ? 0 : total_rows;
+            nrows     = (octx->ctx->mdev.idx == 0) ? total_rows : 0;
         } else {
-            const uint32_t chunks_per_mdev = fastdiv(total_chunks + octx->mdev_count - 1, &octx->mdev_count_div);
-            row_start = MIN(octx->mdev_idx * chunks_per_mdev * rows_per_chunk, total_rows);
-            if (octx->mdev_idx == octx->mdev_count - 1) {
+            const uint32_t chunks_per_mdev = fastdiv(total_chunks + octx->ctx->mdev.count - 1, &octx->ctx->mdev.count_div);
+            row_start = MIN(octx->ctx->mdev.idx * chunks_per_mdev * rows_per_chunk, total_rows);
+            if (octx->ctx->mdev.idx == octx->ctx->mdev.count - 1) {
                 nrows = total_rows - row_start;
             } else {
                 nrows = MIN(chunks_per_mdev * rows_per_chunk, total_rows - row_start);

@@ -1890,9 +1890,9 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
     uint32_t q_start_min = 0;
     uint32_t q_start_max = neq1;
 
-    if (octx->mdev_count > 1) {
-        const uint32_t blocks_per_mdev = fastdiv(n_q_blocks + octx->mdev_count - 1, &octx->mdev_count_div);
-        const uint32_t block_start     = MIN(octx->mdev_idx * blocks_per_mdev, n_q_blocks);
+    if (octx->ctx->mdev.count > 1) {
+        const uint32_t blocks_per_mdev = fastdiv(n_q_blocks + octx->ctx->mdev.count - 1, &octx->ctx->mdev.count_div);
+        const uint32_t block_start     = MIN(octx->ctx->mdev.idx * blocks_per_mdev, n_q_blocks);
         const uint32_t block_end       = MIN(block_start + blocks_per_mdev, n_q_blocks);
 
         if (block_start >= block_end) {
@@ -2473,15 +2473,15 @@ int op_flash_attn_ext(struct htp_ops_context * octx) {
     uint32_t qrow_start = 0;
     uint32_t qrows      = total_qrows;
 
-    if (octx->mdev_count > 1) {
-        const bool can_split = ((dst->nb[1] & 127) == 0) && (total_qrows >= octx->mdev_count);
+    if (octx->ctx->mdev.count > 1) {
+        const bool can_split = ((dst->nb[1] & 127) == 0) && (total_qrows >= octx->ctx->mdev.count);
         if (!can_split) {
-            qrow_start = (octx->mdev_idx == 0) ? 0 : total_qrows;
-            qrows      = (octx->mdev_idx == 0) ? total_qrows : 0;
+            qrow_start = (octx->ctx->mdev.idx == 0) ? 0 : total_qrows;
+            qrows      = (octx->ctx->mdev.idx == 0) ? total_qrows : 0;
         } else {
-            const uint32_t rows_per_mdev = fastdiv(total_qrows + octx->mdev_count - 1, &octx->mdev_count_div);
-            qrow_start = MIN(octx->mdev_idx * rows_per_mdev, total_qrows);
-            if (octx->mdev_idx == octx->mdev_count - 1) {
+            const uint32_t rows_per_mdev = fastdiv(total_qrows + octx->ctx->mdev.count - 1, &octx->ctx->mdev.count_div);
+            qrow_start = MIN(octx->ctx->mdev.idx * rows_per_mdev, total_qrows);
+            if (octx->ctx->mdev.idx == octx->ctx->mdev.count - 1) {
                 qrows = total_qrows - qrow_start;
             } else {
                 qrows = MIN(rows_per_mdev, total_qrows - qrow_start);

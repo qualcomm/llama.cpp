@@ -260,7 +260,7 @@ int op_concat(struct htp_ops_context * octx) {
         const size_t dst_data_row_size = dst->ne[0] * type_size;
         uint32_t row_start = 0;
         uint32_t nrows     = total_rows;
-        if (octx->mdev_count > 1) {
+        if (octx->ctx->mdev.count > 1) {
             bool can_split = (dst->ne[0] == 1 || dst->nb[0] == type_size) && !htp_tensor_is_permuted(dst);
             uint32_t rows_per_chunk = 1;
             if (can_split) {
@@ -276,13 +276,13 @@ int op_concat(struct htp_ops_context * octx) {
             }
 
             const uint32_t total_chunks = can_split ? (total_rows / rows_per_chunk) : 0;
-            if (total_chunks < octx->mdev_count) {
-                row_start = (octx->mdev_idx == 0) ? 0 : total_rows;
-                nrows     = (octx->mdev_idx == 0) ? total_rows : 0;
+            if (total_chunks < octx->ctx->mdev.count) {
+                row_start = (octx->ctx->mdev.idx == 0) ? 0 : total_rows;
+                nrows     = (octx->ctx->mdev.idx == 0) ? total_rows : 0;
             } else {
-                const uint32_t chunks_per_mdev = fastdiv(total_chunks + octx->mdev_count - 1, &octx->mdev_count_div);
-                row_start = MIN(octx->mdev_idx * chunks_per_mdev * rows_per_chunk, total_rows);
-                if (octx->mdev_idx == octx->mdev_count - 1) {
+                const uint32_t chunks_per_mdev = fastdiv(total_chunks + octx->ctx->mdev.count - 1, &octx->ctx->mdev.count_div);
+                row_start = MIN(octx->ctx->mdev.idx * chunks_per_mdev * rows_per_chunk, total_rows);
+                if (octx->ctx->mdev.idx == octx->ctx->mdev.count - 1) {
                     nrows = total_rows - row_start;
                 } else {
                     nrows = MIN(chunks_per_mdev * rows_per_chunk, total_rows - row_start);
@@ -331,17 +331,17 @@ int op_concat(struct htp_ops_context * octx) {
         const uint32_t total_elements = dst->ne[0] * dst->ne[1] * dst->ne[2] * dst->ne[3];
         uint32_t elem_start = 0;
         uint32_t nelems     = total_elements;
-        if (octx->mdev_count > 1) {
+        if (octx->ctx->mdev.count > 1) {
             const uint32_t elems_per_chunk = HEX_L2_LINE_SIZE / type_size;
             bool can_split = htp_tensor_is_contiguous(dst, type_size) && !htp_tensor_is_permuted(dst);
             const uint32_t total_chunks = can_split ? (total_elements / elems_per_chunk) : 0;
-            if (total_chunks < octx->mdev_count) {
-                elem_start = (octx->mdev_idx == 0) ? 0 : total_elements;
-                nelems     = (octx->mdev_idx == 0) ? total_elements : 0;
+            if (total_chunks < octx->ctx->mdev.count) {
+                elem_start = (octx->ctx->mdev.idx == 0) ? 0 : total_elements;
+                nelems     = (octx->ctx->mdev.idx == 0) ? total_elements : 0;
             } else {
-                const uint32_t chunks_per_mdev = fastdiv(total_chunks + octx->mdev_count - 1, &octx->mdev_count_div);
-                elem_start = MIN(octx->mdev_idx * chunks_per_mdev * elems_per_chunk, total_elements);
-                if (octx->mdev_idx == octx->mdev_count - 1) {
+                const uint32_t chunks_per_mdev = fastdiv(total_chunks + octx->ctx->mdev.count - 1, &octx->ctx->mdev.count_div);
+                elem_start = MIN(octx->ctx->mdev.idx * chunks_per_mdev * elems_per_chunk, total_elements);
+                if (octx->ctx->mdev.idx == octx->ctx->mdev.count - 1) {
                     nelems = total_elements - elem_start;
                 } else {
                     nelems = MIN(chunks_per_mdev * elems_per_chunk, total_elements - elem_start);

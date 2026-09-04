@@ -477,9 +477,9 @@ static int execute_op_activations_f32(struct htp_ops_context * octx) {
     uint32_t row_start = 0;
     uint32_t nrows     = src0_nrows;
 
-    if (octx->mdev_count > 1) {
-        const uint32_t rows_per_mdev = fastdiv(src0_nrows + octx->mdev_count - 1, &octx->mdev_count_div);
-        row_start = MIN(octx->mdev_idx * rows_per_mdev, src0_nrows);
+    if (octx->ctx->mdev.count > 1) {
+        const uint32_t rows_per_mdev = fastdiv(src0_nrows + octx->ctx->mdev.count - 1, &octx->ctx->mdev.count_div);
+        row_start = MIN(octx->ctx->mdev.idx * rows_per_mdev, src0_nrows);
         nrows     = MIN(rows_per_mdev, src0_nrows - row_start);
     }
 

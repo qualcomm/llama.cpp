@@ -338,16 +338,16 @@ int op_cpy(struct htp_ops_context * octx) {
         uint32_t row_start = 0;
         uint32_t nrows     = total_rows;
 
-        if (octx->mdev_count > 1) {
+        if (octx->ctx->mdev.count > 1) {
             const uint32_t rows_per_chunk = (row_size > 0) ? (HEX_L2_LINE_SIZE / hex_gcd_u32(row_size, HEX_L2_LINE_SIZE)) : 1;
             const uint32_t total_chunks   = dst_is_contiguous ? (total_rows / rows_per_chunk) : 0;
-            if (total_chunks < octx->mdev_count) {
-                row_start = (octx->mdev_idx == 0) ? 0 : total_rows;
-                nrows     = (octx->mdev_idx == 0) ? total_rows : 0;
+            if (total_chunks < octx->ctx->mdev.count) {
+                row_start = (octx->ctx->mdev.idx == 0) ? 0 : total_rows;
+                nrows     = (octx->ctx->mdev.idx == 0) ? total_rows : 0;
             } else {
-                uint32_t chunks_per_mdev = fastdiv(total_chunks + octx->mdev_count - 1, &octx->mdev_count_div);
-                row_start = MIN(octx->mdev_idx * chunks_per_mdev * rows_per_chunk, total_rows);
-                if (octx->mdev_idx == octx->mdev_count - 1) {
+                uint32_t chunks_per_mdev = fastdiv(total_chunks + octx->ctx->mdev.count - 1, &octx->ctx->mdev.count_div);
+                row_start = MIN(octx->ctx->mdev.idx * chunks_per_mdev * rows_per_chunk, total_rows);
+                if (octx->ctx->mdev.idx == octx->ctx->mdev.count - 1) {
                     nrows = total_rows - row_start;
                 } else {
                     nrows = MIN(chunks_per_mdev * rows_per_chunk, total_rows - row_start);
@@ -363,7 +363,7 @@ int op_cpy(struct htp_ops_context * octx) {
         ct.nrows     = nrows;
         ct.src0_nrows_per_thread = fastdiv(nrows + n_threads - 1, &octx->n_threads_div);
 
-        if (sametype && octx->mdev_count <= 1) {
+        if (sametype && octx->ctx->mdev.count <= 1) {
             use_dma = true;
             cpy_dma_sametype_sameshape(octx, dst, src0, ct.src0_type_size, ne00, ne01, ne02, ne03, nb01, nb02, nb03, nb1, nb2, nb3);
         } else {
@@ -395,15 +395,15 @@ int op_cpy(struct htp_ops_context * octx) {
         uint32_t elem_start = 0;
         uint32_t nelem      = total_elems;
 
-        if (octx->mdev_count > 1) {
+        if (octx->ctx->mdev.count > 1) {
             const uint32_t aligned_lines = dst_is_contiguous ? n_lines : 0;
-            if (aligned_lines < octx->mdev_count) {
-                elem_start = (octx->mdev_idx == 0) ? 0 : total_elems;
-                nelem      = (octx->mdev_idx == 0) ? total_elems : 0;
+            if (aligned_lines < octx->ctx->mdev.count) {
+                elem_start = (octx->ctx->mdev.idx == 0) ? 0 : total_elems;
+                nelem      = (octx->ctx->mdev.idx == 0) ? total_elems : 0;
             } else {
-                uint32_t lines_per_mdev = fastdiv(aligned_lines + octx->mdev_count - 1, &octx->mdev_count_div);
-                elem_start = MIN(octx->mdev_idx * lines_per_mdev * elems_per_line, total_elems);
-                if (octx->mdev_idx == octx->mdev_count - 1) {
+                uint32_t lines_per_mdev = fastdiv(aligned_lines + octx->ctx->mdev.count - 1, &octx->ctx->mdev.count_div);
+                elem_start = MIN(octx->ctx->mdev.idx * lines_per_mdev * elems_per_line, total_elems);
+                if (octx->ctx->mdev.idx == octx->ctx->mdev.count - 1) {
                     nelem = total_elems - elem_start;
                 } else {
                     nelem = MIN(lines_per_mdev * elems_per_line, total_elems - elem_start);
