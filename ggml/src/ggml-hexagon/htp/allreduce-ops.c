@@ -244,6 +244,10 @@ DEFINE_ALLREDUCE_THREAD_DMA_2D(add_bcast_f16, __fp16, hvx_add_f16_aaa, 1, 1)
 DEFINE_ALLREDUCE_THREAD_DMA_2D(add_bcast_f32, float,  hvx_add_f32_aaa, 1, 1)
 
 int op_allreduce(struct htp_ops_context * octx) {
+    if (octx->ctx->mdev.count > 1 && octx->ctx->mdev.idx > 0) {
+        return HTP_STATUS_OK;
+    }
+
     const struct htp_allreduce_kernel_params * kparams = (const struct htp_allreduce_kernel_params *) octx->kernel_params;
     const struct htp_tensor * dst = octx->dst;
 
@@ -254,20 +258,24 @@ int op_allreduce(struct htp_ops_context * octx) {
         return HTP_STATUS_INVAL_PARAMS;
     }
 
+    const uint32_t fence_seq_entry = (uint32_t) octx->op_params[0];
+    const uint32_t fence_seq_exit  = (uint32_t) octx->op_params[1];
+
+    const struct htp_tensor * my_sync = octx->src[n_ranks + rank];
+    atomic_uint * my_fence = (atomic_uint *) (uintptr_t) my_sync->data;
+
     if (dst->type != HTP_TYPE_F16 && dst->type != HTP_TYPE_F32) {
+        FARF(ERROR, "ggml-hex: allreduce unsupported type %d : rank %u\n", dst->type, rank);
+        htp_fence_write(my_fence, fence_seq_entry, HTP_STATUS_NO_SUPPORT);
         return HTP_STATUS_NO_SUPPORT;
     }
 
     const uint32_t nelem = dst->ne[0] * dst->ne[1] * dst->ne[2] * dst->ne[3];
-    const uint32_t fence_seq_entry = (uint32_t) octx->op_params[0];
-    const uint32_t fence_seq_exit  = (uint32_t) octx->op_params[1];
 
     // 1. Entry Barrier: Synchronize all ranks before reading
     struct htp_thread_trace * tr0 = &octx->ctx->trace[0];
     htp_trace_event_start(tr0, HTP_TRACE_EVT_FENCE, (uint16_t) fence_seq_entry);
 
-    const struct htp_tensor * my_sync = octx->src[n_ranks + rank];
-    atomic_uint * my_fence = (atomic_uint *) (uintptr_t) my_sync->data;
     htp_fence_write(my_fence, fence_seq_entry, HTP_STATUS_OK);
 
     for (uint32_t j = 0; j < n_ranks; j++) {
@@ -347,6 +355,8 @@ int op_allreduce(struct htp_ops_context * octx) {
                 }
                 break;
             default:
+                FARF(ERROR, "ggml-hex: allreduce unsupported kernel %d : rank %u\n", kparams->kernel_type, rank);
+                htp_fence_write(my_fence, fence_seq_exit, HTP_STATUS_NO_SUPPORT);
                 return HTP_STATUS_NO_SUPPORT;
         }
 
