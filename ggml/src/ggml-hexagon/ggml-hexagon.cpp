@@ -5771,7 +5771,14 @@ static bool ggml_backend_hexagon_cpy_tensor_async(ggml_backend_t backend_src, gg
         return false;
     }
 
-    *(ggml_hexagon_tensor_extra *) dst->extra = *(const ggml_hexagon_tensor_extra *) src->extra;
+    // FIXME: ggml-meta needs to call init_tensor on auxiliary tensors
+    if (!dst->extra) {
+        ggml_backend_buffer_init_tensor(dst->buffer, dst);
+    }
+
+    auto * dst_extra = static_cast<ggml_hexagon_tensor_extra *>(dst->extra);
+    const auto * src_extra = static_cast<const ggml_hexagon_tensor_extra *>(src->extra);
+    dst_extra->flags = src_extra->flags;
 
     auto sess_src = static_cast<ggml_hexagon_session *>(backend_src->context);
     auto sess_dst = static_cast<ggml_hexagon_session *>(backend_dst->context);
