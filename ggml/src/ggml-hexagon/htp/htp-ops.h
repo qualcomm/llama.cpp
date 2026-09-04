@@ -77,6 +77,7 @@ enum htp_op_code {
     HTP_OP_GET_ROWS,
     HTP_OP_SCALE,
     HTP_OP_CPY,
+    HTP_OP_CPY_FENCE,
     HTP_OP_ARGSORT,
     HTP_OP_SQR,
     HTP_OP_SQRT,
@@ -100,7 +101,7 @@ enum htp_op_code {
     HTP_OP_ALLREDUCE,
     HTP_OP_ALLREDUCE_ADD,
     HTP_OP_GLU_SWIGLU_CLAMP,
-    HTP_OP_MDEV_SETUP,
+    HTP_OP_MDEV_GROUP,
 
     HTP_OP_INVALID
 };
@@ -221,8 +222,6 @@ struct htp_opbatch_req {
     uint32_t n_tensors;   // Number of tensors
     uint32_t n_ops;       // Number of ops
     uint32_t n_traces;    // Number of trace descriptors per thread
-    uint16_t mdev_idx;    // Device index (0..mdev_count-1)
-    uint16_t mdev_count;  // Number of devices
     uint64_t seq;         // Sequence number
     // struct htp_buf_desc  bufs[];    -- dspqueue buf 0
     // struct htp_tensor    tensors[]; -- dspqueue buf 0

@@ -737,14 +737,14 @@ static int op_fence(struct htp_ops_context * octx) {
     return HTP_STATUS_OK;
 }
 
-static int op_mdev_setup(struct htp_ops_context * octx) {
+static int op_mdev_group(struct htp_ops_context * octx) {
     struct htp_context * ctx = octx->ctx;
+    const struct htp_tensor * sync = octx->src[0];
+    assert(sync && sync->data);
     ctx->mdev.idx   = (uint16_t) octx->op_params[0];
-    ctx->mdev.count = (uint16_t) octx->op_params[1];
+    ctx->mdev.count = (uint16_t) sync->ne[1];
     if (ctx->mdev.count > 1) {
         ctx->mdev.count_div = init_fastdiv_values(ctx->mdev.count);
-        const struct htp_tensor * sync = octx->src[0];
-        assert(sync && sync->data);
         ctx->mdev.fence_base = (uint8_t *) sync->data;
     }
     return HTP_STATUS_OK;
@@ -752,8 +752,8 @@ static int op_mdev_setup(struct htp_ops_context * octx) {
 
 static int execute_op(struct htp_ops_context * octx) {
     switch (octx->op) {
-        case HTP_OP_MDEV_SETUP:
-            return op_mdev_setup(octx);
+        case HTP_OP_MDEV_GROUP:
+            return op_mdev_group(octx);
 
         case HTP_OP_FENCE:
             return op_fence(octx);
@@ -828,6 +828,7 @@ static int execute_op(struct htp_ops_context * octx) {
             return op_sum_rows(octx);
 
         case HTP_OP_CPY:
+        case HTP_OP_CPY_FENCE:
             return op_cpy(octx);
 
         case HTP_OP_REPEAT:
