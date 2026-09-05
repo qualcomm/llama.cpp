@@ -125,6 +125,21 @@ struct htp_context {
     size_t                 footprint;
 };
 
+static inline bool htp_ops_context_set_n_threads(struct htp_ops_context * octx, uint32_t n_threads) {
+    if (n_threads == 0 || n_threads > octx->ctx->n_threads) {
+        return false;
+    }
+
+    if (n_threads != octx->n_threads) {
+        octx->n_threads = n_threads;
+        octx->n_threads_div = n_threads == octx->ctx->n_threads
+            ? octx->ctx->n_threads_div
+            : init_fastdiv_values(n_threads);
+    }
+
+    return true;
+}
+
 int op_matmul(struct htp_ops_context * octx);
 int op_matmul_id(struct htp_ops_context * octx);
 int op_matmul_nx(struct htp_ops_context * octx);

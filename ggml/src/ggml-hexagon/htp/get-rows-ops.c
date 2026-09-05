@@ -248,6 +248,10 @@ int op_get_rows(struct htp_ops_context * octx) {
         return HTP_STATUS_OK;
     }
 
+    if (!htp_ops_context_set_n_threads(octx, (uint32_t) kparams->n_threads)) {
+        return HTP_STATUS_INVAL_PARAMS;
+    }
+
     const uint32_t n_threads = octx->n_threads;
 
     struct get_rows_context grctx;

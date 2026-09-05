@@ -1149,6 +1149,10 @@ static int execute_op_unary(struct htp_ops_context * octx) {
 
     const struct htp_unary_kernel_params * kparams = (const struct htp_unary_kernel_params *) octx->kernel_params;
 
+    if (!htp_ops_context_set_n_threads(octx, kparams->n_threads)) {
+        return HTP_STATUS_INVAL_PARAMS;
+    }
+
     const uint32_t src0_nrows = src0->ne[1] * src0->ne[2] * src0->ne[3];
     const size_t elem_size = is_f16 ? sizeof(_Float16) : sizeof(float);
     const size_t src0_data_row_size = src0->ne[0] * elem_size;

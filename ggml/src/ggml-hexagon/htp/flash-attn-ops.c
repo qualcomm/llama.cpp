@@ -2414,6 +2414,10 @@ int op_flash_attn_ext(struct htp_ops_context * octx) {
         return HTP_STATUS_NO_SUPPORT;
     }
 
+    if (!htp_ops_context_set_n_threads(octx, kparams->n_threads)) {
+        return HTP_STATUS_INVAL_PARAMS;
+    }
+
     if (kparams->kernel_type == HTP_FA_KERNEL_HMX) {
         return hmx_flash_attn_ext(octx);
     }

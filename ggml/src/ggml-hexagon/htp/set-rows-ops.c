@@ -217,6 +217,10 @@ int op_set_rows(struct htp_ops_context * octx) {
         return HTP_STATUS_OK;
     }
 
+    if (!htp_ops_context_set_n_threads(octx, (uint32_t) kparams->n_threads)) {
+        return HTP_STATUS_INVAL_PARAMS;
+    }
+
     const uint32_t n_threads = octx->n_threads;
 
     // l2fetch the src1 (indices) tensor in the main thread

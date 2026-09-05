@@ -243,6 +243,36 @@ DEFINE_ALLREDUCE_THREAD_DMA_2D(add_f32,       float,  hvx_add_f32_aaa, 1, 0)
 DEFINE_ALLREDUCE_THREAD_DMA_2D(add_bcast_f16, __fp16, hvx_add_f16_aaa, 1, 1)
 DEFINE_ALLREDUCE_THREAD_DMA_2D(add_bcast_f32, float,  hvx_add_f32_aaa, 1, 1)
 
+static int validate_allreduce(
+    struct htp_ops_context * octx,
+    const struct htp_allreduce_kernel_params * kparams,
+    uint32_t n_ranks
+) {
+    if (!htp_ops_context_set_n_threads(octx, (uint32_t) kparams->n_threads)) {
+        return HTP_STATUS_INVAL_PARAMS;
+    }
+
+    if (kparams->vtcm_size_per_thread <= 0 || kparams->vtcm_size <= 0) {
+        return HTP_STATUS_INVAL_PARAMS;
+    }
+
+    const bool has_add = (octx->op == HTP_OP_ALLREDUCE_ADD);
+    const size_t n_vtcm_buffers = (size_t) (n_ranks + 1) * octx->n_threads + (has_add ? (kparams->is_row_bcast ? 1 : octx->n_threads) : 0);
+    const size_t vtcm_size = n_vtcm_buffers * (size_t) kparams->vtcm_size_per_thread;
+    if (vtcm_size != (size_t) kparams->vtcm_size) {
+        return HTP_STATUS_INVAL_PARAMS;
+    }
+    if (vtcm_size > octx->ctx->vtcm_size) {
+        return HTP_STATUS_VTCM_TOO_SMALL;
+    }
+
+    if (octx->dst->type != HTP_TYPE_F16 && octx->dst->type != HTP_TYPE_F32) {
+        return HTP_STATUS_NO_SUPPORT;
+    }
+
+    return HTP_STATUS_OK;
+}
+
 int op_allreduce(struct htp_ops_context * octx) {
     if (octx->ctx->mdev.count > 1 && octx->ctx->mdev.idx > 0) {
         return HTP_STATUS_OK;
@@ -264,12 +294,16 @@ int op_allreduce(struct htp_ops_context * octx) {
     const struct htp_tensor * my_sync = octx->src[n_ranks + rank];
     atomic_uint * my_fence = (atomic_uint *) (uintptr_t) my_sync->data;
 
-    if (dst->type != HTP_TYPE_F16 && dst->type != HTP_TYPE_F32) {
-        FARF(ERROR, "ggml-hex: allreduce unsupported type %d : rank %u\n", dst->type, rank);
-        htp_fence_write(my_fence, fence_seq_entry, HTP_STATUS_NO_SUPPORT);
-        return HTP_STATUS_NO_SUPPORT;
+    const int status = validate_allreduce(octx, kparams, n_ranks);
+    if (status != HTP_STATUS_OK) {
+        if (status == HTP_STATUS_NO_SUPPORT) {
+            FARF(ERROR, "ggml-hex: allreduce unsupported type %d : rank %u\n", dst->type, rank);
+        }
+        htp_fence_write(my_fence, fence_seq_entry, status);
+        return status;
     }
 
+    const bool has_add = (octx->op == HTP_OP_ALLREDUCE_ADD);
     const uint32_t nelem = dst->ne[0] * dst->ne[1] * dst->ne[2] * dst->ne[3];
 
     // 1. Entry Barrier: Synchronize all ranks before reading
@@ -316,8 +350,6 @@ int op_allreduce(struct htp_ops_context * octx) {
         const uint32_t block_elems          = (uint32_t) kparams->block_elems;
         const uint32_t elems_per_thread     = (uint32_t) kparams->elems_per_thread;
         const uint32_t vtcm_size_per_thread = (uint32_t) kparams->vtcm_size_per_thread;
-
-        const bool has_add = (octx->op == HTP_OP_ALLREDUCE_ADD);
 
         struct htp_allreduce_context actx;
         actx.octx                 = octx;

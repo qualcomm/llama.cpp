@@ -138,6 +138,23 @@ struct htp_mm_context {
     uint32_t vtcm_dst_size_per_thread;
 };
 
+static int htp_mm_init_context(
+    struct htp_ops_context * octx,
+    const struct htp_mm_kernel_params * kparams
+) {
+    if (!htp_ops_context_set_n_threads(octx, (uint32_t) kparams->n_threads)) {
+        return HTP_STATUS_INVAL_PARAMS;
+    }
+
+    if (kparams->n_hmx) {
+        if (kparams->n_act_threads <= 0 || kparams->n_act_threads > (int32_t) octx->n_threads) {
+            return HTP_STATUS_INVAL_PARAMS;
+        }
+    }
+
+    return HTP_STATUS_OK;
+}
+
 // vdelta control to expand first 32 e8m0 values into 32 uint32 elements
 static const uint8_t __attribute__((aligned(128))) expand_x32_e8m0[128] = {
     0x00, 0x00, 0x00, 0x00, 0x01, 0x04, 0x00, 0x00, 0x02, 0x00, 0x08, 0x08, 0x01, 0x02, 0x00, 0x04, 0x04, 0x00, 0x00,
@@ -1559,7 +1576,7 @@ static int hvx_mm_matmul(struct htp_ops_context * octx) {
     mmctx->vtcm_src0_size_per_thread = fastdiv(L.src0_bytes, &octx->n_threads_div);
     mmctx->vtcm_dst_size_per_thread  = fastdiv(L.dst_bytes, &octx->n_threads_div);
 
-    size_t vtcm_size = kparams->vtcm_size > 0 ? (size_t)kparams->vtcm_size : L.total_bytes;
+    const size_t vtcm_size = L.total_bytes;
 
     FARF(HIGH, "matmul-%s : src0-vtcm-size %zu src1-vtcm-size %zu dst-vtcm-size %zu (%zu)\n", mmctx->type,
          L.src0_bytes, L.src1_bytes, L.dst_bytes, vtcm_size);
@@ -3168,7 +3185,7 @@ static int hmx_mm_f16_f32_batched(struct htp_context *ctx, const hmx_mm_f16_f32_
                             int chunk_dst_cols = params->n - (int)nc;
                             if (chunk_dst_cols > 0) {
                                 transfer_output_chunk_threaded(ctx, output, src2_chunk, vtcm_output, (int) n_rows, (int) n_cols,
-                                                               params->dst_stride, params->src2_stride, chunk_dst_cols, ctx->n_threads);
+                                                               params->dst_stride, params->src2_stride, chunk_dst_cols, n_threads);
                             }
                         }
                     }
@@ -3291,7 +3308,8 @@ static int hmx_mm_id_2d_f32(struct htp_context *ctx,
                                          int cur_a,
                                          int mapping_stride,
                                          int m_start,
-                                         int m_end) {
+                                         int m_end,
+                                         int n_threads) {
     struct htp_thread_trace * tr = &ctx->trace[0];
     htp_trace_event_start(tr, HTP_TRACE_EVT_INIT, 0);
 
@@ -3322,7 +3340,6 @@ static int hmx_mm_id_2d_f32(struct htp_context *ctx,
     const int n_k_tiles = k / HTP_MM_HMX_TILE_N_COLS;
     const struct fastdiv_values n_k_tiles_div = init_fastdiv_values(n_k_tiles);
 
-    const int n_threads = ctx->n_threads;
     const bool is_quant   = (weight_type != HTP_TYPE_F16 && weight_type != HTP_TYPE_F32);
 
     const size_t vec_dot_size = k * sizeof(__fp16);
@@ -3472,7 +3489,7 @@ static int hmx_mm_op_matmul(struct htp_ops_context * octx, const struct htp_mm_k
     const float * act_ptr = (const float *) src1->data + m_start * act_stride;
 
     int ret = -1;
-    const int n_threads = MIN(kparams->n_threads, (int) octx->n_threads);
+    const int n_threads = kparams->n_threads;
     if (kparams->kernel_type == HTP_MM_KERNEL_HMX_F16_BATCHED) {
         hmx_mm_f16_f32_batched_params_t batch_params = {
             .dst             = dst_ptr,
@@ -3533,6 +3550,11 @@ static int hmx_mm_op_matmul(struct htp_ops_context * octx, const struct htp_mm_k
 int op_matmul(struct htp_ops_context * octx) {
     const struct htp_mm_kernel_params * kparams = (const struct htp_mm_kernel_params *) octx->kernel_params;
 
+    const int status = htp_mm_init_context(octx, kparams);
+    if (status != HTP_STATUS_OK) {
+        return status;
+    }
+
     if (kparams->n_hmx) {
         return hmx_mm_op_matmul(octx, kparams);
     }
@@ -3574,7 +3596,7 @@ static int hmx_mm_op_matmul_id(
                                    nb1, nb2,
                                    (int) src0->nb[1], (int) src0->type,
                                    matrix_rows, cur_a, mmctx->mapping_stride,
-                                   m_start, m_end);
+                                   m_start, m_end, (int) octx->n_threads);
         if (ret != 0) {
             FARF(ERROR, "HMX matmul failed for expert %u, error %d\n", cur_a, ret);
             return HTP_STATUS_NO_SUPPORT;
@@ -3627,7 +3649,7 @@ static int hvx_mm_matmul_id(
     htp_mm_hvx_vtcm_layout_build(&L, kparams->kernel_type, src0->type, ne10, src1_nrows, octx->n_threads,
                                  0, src0_row_size, src1_row_size, 0, kparams->n_prefetch, true, false);
 
-    size_t vtcm_size = kparams->vtcm_size > 0 ? (size_t)kparams->vtcm_size : L.total_bytes;
+    const size_t vtcm_size = L.total_bytes;
 
     FARF(HIGH, "matmul-id-%s : src0-spad-size %zu src1-spad-size %zu src2-spad-size 0 dst-spad-size %zu (%zu)\n", mmctx->type,
          L.src0_bytes, L.src1_bytes, L.dst_bytes, vtcm_size);
@@ -3718,7 +3740,7 @@ static int hmx_mm_op_matmul_id_nx(
                                        dst->nb[1], dst->nb[2],
                                        (int) src_w->nb[1], (int) src_w->type,
                                        matrix_rows, cur_a, mmctx->mapping_stride,
-                                       m_start, m_end);
+                                       m_start, m_end, (int) octx->n_threads);
             if (ret != 0) {
                 FARF(ERROR, "HMX matmul ID NX failed for expert %u weight %u, error %d\n", cur_a, p, ret);
                 return HTP_STATUS_NO_SUPPORT;
@@ -3774,7 +3796,7 @@ static int hvx_mm_matmul_id_nx(
     htp_mm_hvx_vtcm_layout_build(&L, kparams->kernel_type, src0->type, act->ne[0], src1_nrows, octx->n_threads,
                                  0, src0_row_size, src1_row_size, 0, kparams->n_prefetch, true, false);
 
-    size_t vtcm_size = kparams->vtcm_size > 0 ? (size_t)kparams->vtcm_size : L.total_bytes;
+    const size_t vtcm_size = L.total_bytes;
 
     if (octx->ctx->vtcm_size < vtcm_size) {
         FARF(ERROR, "matmul-id-nx: current VTCM reservation %zu is too small, needed %zu\n",
@@ -3887,15 +3909,20 @@ static inline void scan_expert_ids(
 int op_matmul_id(struct htp_ops_context * octx) {
     htp_matmul_tensors_preamble;
 
+    const struct htp_mm_kernel_params * kparams = (const struct htp_mm_kernel_params *) octx->kernel_params;
+    struct htp_mm_context mmctx_struct = {0};
+    struct htp_mm_context * mmctx = &mmctx_struct;
+
+    const int status = htp_mm_init_context(octx, kparams);
+    if (status != HTP_STATUS_OK) {
+        return status;
+    }
+
     struct htp_thread_trace * tr = &octx->ctx->trace[0];
     htp_trace_event_start(tr, HTP_TRACE_EVT_INIT, 0);
 
-    struct htp_mm_context mmctx_struct = {0};
-    struct htp_mm_context * mmctx = &mmctx_struct;
     mmctx->octx = octx;
     mmctx->act = src1;
-
-    const struct htp_mm_kernel_params * kparams = (const struct htp_mm_kernel_params *) octx->kernel_params;
 
     const struct htp_tensor * restrict ids = octx->src[2];
 
@@ -3996,18 +4023,24 @@ int op_matmul_id(struct htp_ops_context * octx) {
 }
 
 int op_matmul_id_nx(struct htp_ops_context * octx) {
+    const struct htp_mm_kernel_params * kparams = (const struct htp_mm_kernel_params *) octx->kernel_params;
+    struct htp_mm_context mmctx_struct = {0};
+    struct htp_mm_context * mmctx = &mmctx_struct;
+
+    const int status = htp_mm_init_context(octx, kparams);
+    if (status != HTP_STATUS_OK) {
+        return status;
+    }
+
     struct htp_thread_trace * tr = &octx->ctx->trace[0];
     htp_trace_event_start(tr, HTP_TRACE_EVT_INIT, 0);
 
-    const struct htp_mm_kernel_params * kparams = (const struct htp_mm_kernel_params *) octx->kernel_params;
+    mmctx->octx = octx;
     const uint32_t n_weights = kparams->n_weights;
     const struct htp_tensor * restrict src0 = octx->src[0];
     const struct htp_tensor * restrict act  = octx->src[n_weights];
     const struct htp_tensor * restrict ids  = octx->src[n_weights + 1];
 
-    struct htp_mm_context mmctx_struct = {0};
-    struct htp_mm_context * mmctx = &mmctx_struct;
-    mmctx->octx = octx;
     mmctx->act = act;
 
     const size_t src0_row_size = src0->nb[1];
@@ -4080,6 +4113,12 @@ int op_matmul_id_nx(struct htp_ops_context * octx) {
 }
 int op_matmul_nx(struct htp_ops_context * octx) {
     const struct htp_mm_kernel_params * kparams = (const struct htp_mm_kernel_params *) octx->kernel_params;
+
+    const int status = htp_mm_init_context(octx, kparams);
+    if (status != HTP_STATUS_OK) {
+        return status;
+    }
+
     if (kparams->n_hmx) {
         return hmx_mm_nx_2d_f32(octx, kparams);
     }
@@ -4146,7 +4185,7 @@ int op_matmul_nx(struct htp_ops_context * octx) {
     htp_mm_hvx_vtcm_layout_build(&L, kparams->kernel_type, src0->type, act->ne[0], src1_nrows, octx->n_threads,
                                  0, src0_row_size, src1_row_size, 0, kparams->n_prefetch, false, true);
 
-    size_t vtcm_size = kparams->vtcm_size > 0 ? (size_t)kparams->vtcm_size : L.total_bytes;
+    const size_t vtcm_size = L.total_bytes;
 
     if (octx->ctx->vtcm_size < vtcm_size) {
         FARF(ERROR, "matmul-nx: current VTCM reservation %zu is too small, needed %zu\n",
