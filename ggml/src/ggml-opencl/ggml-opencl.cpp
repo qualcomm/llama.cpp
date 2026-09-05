@@ -1978,8 +1978,14 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemm_noshuffle_q5_k_q8_1_dp4a_narrow = nullptr;
     int q5k_dp4a_ts_narrow  = 32;  // == 32 disables the split
     int q5k_dp4a_narrow_max = 16;
-    cl_kernel kernel_gemm_noshuffle_q2_k_q8_1_dp4a = nullptr;  // dp4a (int8) dense q2_K prefill GEMM
-    cl_kernel kernel_gemm_noshuffle_q3_k_q8_1_dp4a = nullptr;  // dp4a (int8) dense q3_K prefill GEMM
+    // TILESIZE_N each GEMM program was BUILT with; the dispatch launches
+    // CEIL_DIV(N, tile) workgroups and must read these, never a literal
+    int       kquant_plane_gemm_ts_narrow = 8;
+    int       kquant_plane_gemm_ts_wide   = 32;
+    cl_kernel kernel_gemm_noshuffle_q2_k_q8_1_dp4a = nullptr;         // wide tile
+    cl_kernel kernel_gemm_noshuffle_q3_k_q8_1_dp4a = nullptr;
+    cl_kernel kernel_gemm_noshuffle_q2_k_q8_1_dp4a_narrow = nullptr;  // verify band
+    cl_kernel kernel_gemm_noshuffle_q3_k_q8_1_dp4a_narrow = nullptr;
     cl_kernel kernel_gemm_noshuffle_q6_k_q8_1_dp4a = nullptr;  // dp4a (int8) dense q6_K prefill GEMM
     // Narrow-tile twin for the verify band; see the q4_K pair above for the rationale.
     cl_kernel kernel_gemm_noshuffle_q6_k_q8_1_dp4a_narrow = nullptr;
@@ -2422,6 +2428,37 @@ static bool ggml_cl_plane_split_gen_on(const ggml_backend_opencl_context * backe
 // K = 5632. Declining only the GEMM still leaves those parts the plane GEMV,
 // which is the half that carries the decode win.
 //
+// The dp4a plane GEMM costs a STEP PER PADDED COLUMN TILE and is flat within
+// one, so a batch narrower than the tile pays for the whole tile. One tile
+// therefore cannot serve both ends: measured on an X2-90, narrowing the tile to
+// 8 is worth +78% at ne11 = 8 but costs 44% of pp512.
+//
+// So the program is built twice and the dispatch picks. Thresholds and tiles are
+// overridable because they are a per-device tuning, not a contract.
+//
+//   ne11 <= 3        the plane GEMV; the GEMM cannot beat it this narrow
+//   4 <= ne11 <= 16  the NARROW tile
+//   ne11 > 16        the WIDE tile
+static int ggml_cl_kquant_plane_gemm_ts_narrow() {
+    const int v = ggml_cl_env_int("GGML_OPENCL_KQUANT_PLANE_GEMM_TS_NARROW", 8);
+    return (v == 8 || v == 16 || v == 32) ? v : 8;
+}
+
+static int ggml_cl_kquant_plane_gemm_ts_wide() {
+    const int v = ggml_cl_env_int("GGML_OPENCL_KQUANT_PLANE_GEMM_TS_WIDE", 32);
+    return (v == 8 || v == 16 || v == 32) ? v : 32;
+}
+
+// smallest ne11 the GEMM is used for at all
+static int ggml_cl_kquant_plane_gemm_min_n() {
+    return ggml_cl_env_int("GGML_OPENCL_KQUANT_PLANE_GEMM_MIN_N", 3);
+}
+
+// largest ne11 served by the narrow tile
+static int ggml_cl_kquant_plane_gemm_narrow_max_n() {
+    return ggml_cl_env_int("GGML_OPENCL_KQUANT_PLANE_GEMM_NARROW_MAX_N", 16);
+}
+
 // Gated on the generation and not on a chip name, following the other A7X
 // compiler carve-outs here: the bug belongs to that compiler generation and
 // older, so a part reporting an older generation should decline too.
@@ -7132,9 +7169,23 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #else
         const std::string kernel_src = read_file("gemm_noshuffle_q2_k_q8_1_dp4a.cl");
 #endif
-        cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        backend_ctx->kquant_plane_gemm_ts_wide   = ggml_cl_kquant_plane_gemm_ts_wide();
+        backend_ctx->kquant_plane_gemm_ts_narrow = ggml_cl_kquant_plane_gemm_ts_narrow();
+
+        cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(),
+            compile_opts + " -DTILESIZE_N=" + std::to_string(backend_ctx->kquant_plane_gemm_ts_wide));
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q2_k_q8_1_dp4a = clCreateKernel(prog, "kernel_gemm_noshuffle_q2_k_q8_1_dp4a", &err), err));
         CL_CHECK(clReleaseProgram(prog));
+
+        if (backend_ctx->kquant_plane_gemm_ts_narrow != backend_ctx->kquant_plane_gemm_ts_wide) {
+            cl_program prog_n = build_program_from_source(backend_ctx, kernel_src.c_str(),
+                compile_opts + " -DTILESIZE_N=" + std::to_string(backend_ctx->kquant_plane_gemm_ts_narrow));
+            CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q2_k_q8_1_dp4a_narrow = clCreateKernel(prog_n, "kernel_gemm_noshuffle_q2_k_q8_1_dp4a", &err), err));
+            CL_CHECK(clReleaseProgram(prog_n));
+        } else {
+            backend_ctx->kernel_gemm_noshuffle_q2_k_q8_1_dp4a_narrow =
+                backend_ctx->kernel_gemm_noshuffle_q2_k_q8_1_dp4a;
+        }
         GGML_LOG_CONT(".");
     }
 
@@ -7146,9 +7197,23 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #else
         const std::string kernel_src = read_file("gemm_noshuffle_q3_k_q8_1_dp4a.cl");
 #endif
-        cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        backend_ctx->kquant_plane_gemm_ts_wide   = ggml_cl_kquant_plane_gemm_ts_wide();
+        backend_ctx->kquant_plane_gemm_ts_narrow = ggml_cl_kquant_plane_gemm_ts_narrow();
+
+        cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(),
+            compile_opts + " -DTILESIZE_N=" + std::to_string(backend_ctx->kquant_plane_gemm_ts_wide));
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q3_k_q8_1_dp4a = clCreateKernel(prog, "kernel_gemm_noshuffle_q3_k_q8_1_dp4a", &err), err));
         CL_CHECK(clReleaseProgram(prog));
+
+        if (backend_ctx->kquant_plane_gemm_ts_narrow != backend_ctx->kquant_plane_gemm_ts_wide) {
+            cl_program prog_n = build_program_from_source(backend_ctx, kernel_src.c_str(),
+                compile_opts + " -DTILESIZE_N=" + std::to_string(backend_ctx->kquant_plane_gemm_ts_narrow));
+            CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q3_k_q8_1_dp4a_narrow = clCreateKernel(prog_n, "kernel_gemm_noshuffle_q3_k_q8_1_dp4a", &err), err));
+            CL_CHECK(clReleaseProgram(prog_n));
+        } else {
+            backend_ctx->kernel_gemm_noshuffle_q3_k_q8_1_dp4a_narrow =
+                backend_ctx->kernel_gemm_noshuffle_q3_k_q8_1_dp4a;
+        }
         GGML_LOG_CONT(".");
     }
 
@@ -33796,15 +33861,24 @@ static bool ggml_cl_mul_mat_kquant_plane(
     GGML_ASSERT(ne00 % 256 == 0 && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
                 "q2_K/q3_K plane split reached a shape supports_op should have declined");
 
-    cl_kernel gemm = is_q2k ? backend_ctx->kernel_gemm_noshuffle_q2_k_q8_1_dp4a
-                            : backend_ctx->kernel_gemm_noshuffle_q3_k_q8_1_dp4a;
+    // Narrow tile for the verify band, wide for prefill. A batch narrower than
+    // the tile pays the whole tile, so this boundary is worth a lot: on an X2-90
+    // ne11 = 8 through the narrow tile is +78% against the GEMV it replaces.
+    const bool use_narrow_tile = ne11 <= ggml_cl_kquant_plane_gemm_narrow_max_n();
+    const int  gemm_ts = use_narrow_tile ? backend_ctx->kquant_plane_gemm_ts_narrow
+                                         : backend_ctx->kquant_plane_gemm_ts_wide;
+    cl_kernel gemm = is_q2k
+        ? (use_narrow_tile ? backend_ctx->kernel_gemm_noshuffle_q2_k_q8_1_dp4a_narrow
+                           : backend_ctx->kernel_gemm_noshuffle_q2_k_q8_1_dp4a)
+        : (use_narrow_tile ? backend_ctx->kernel_gemm_noshuffle_q3_k_q8_1_dp4a_narrow
+                           : backend_ctx->kernel_gemm_noshuffle_q3_k_q8_1_dp4a);
 
     // dp4a prefill GEMM: needs the integer dot product, a compiler that does not
     // miscompile it, a full row tile, and enough columns to be worth the q8_1
     // pre-pass. When it is declined the GEMV below serves prefill too.
     if (gemm && backend_ctx->has_integer_dot
             && ggml_cl_kquant_plane_dp4a_gemm_on(backend_ctx)
-            && ne11 > 8 && ne01 % 64 == 0) {
+            && ne11 > ggml_cl_kquant_plane_gemm_min_n() && ne01 % 64 == 0) {
         const int M = ne01, N = ne11, K = ne00;
         cl_context context = backend_ctx->context;
         cl_int err = CL_SUCCESS;
@@ -33854,7 +33928,9 @@ static bool ggml_cl_mul_mat_kquant_plane(
         CL_CHECK(clSetKernelArg(gemm, ai++, sizeof(cl_int),   &K));
 
         size_t d_local[3]  = { 64, 1, 1 };
-        size_t d_global[3] = { 64, (size_t)CEIL_DIV(M, 64), (size_t)CEIL_DIV(N, 32) };
+        // columns per workgroup == the tile the program was COMPILED with; a
+        // literal here silently under-launches when that tile is narrowed
+        size_t d_global[3] = { 64, (size_t)CEIL_DIV(M, 64), (size_t)CEIL_DIV(N, gemm_ts) };
         backend_ctx->enqueue_ndrange_kernel(gemm, 3, d_global, d_local, dst);
 
         CL_CHECK(clReleaseMemObject(a_sub));
