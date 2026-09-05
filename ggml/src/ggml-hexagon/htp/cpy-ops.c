@@ -294,8 +294,9 @@ static inline void cpy_dma_sametype_sameshape(
     dma_queue_flush(q);
 }
 
-int op_cpy(struct htp_ops_context * octx) {
+static int exec_cpy(struct htp_ops_context * octx, bool * use_dma) {
     cpy_preamble;
+    *use_dma = false;
 
     struct htp_copy_context ct;
     ct.octx = octx;
@@ -325,7 +326,6 @@ int op_cpy(struct htp_ops_context * octx) {
     const bool sameshape  = !transposed && (ne00 == ne0 && ne01 == ne1 && ne02 == ne2 && ne03 == ne3);
 
     const uint32_t n_threads = octx->n_threads;
-    bool use_dma = false;
 
     const bool dst_is_contiguous = htp_tensor_is_contiguous(dst, ct.dst_type_size);
 
@@ -365,7 +365,7 @@ int op_cpy(struct htp_ops_context * octx) {
         ct.src0_nrows_per_thread = fastdiv(nrows + n_threads - 1, &octx->n_threads_div);
 
         if (sametype && octx->ctx->mdev.count <= 1) {
-            use_dma = true;
+            *use_dma = true;
             cpy_dma_sametype_sameshape(octx, dst, src0, ct.src0_type_size, ne00, ne01, ne02, ne03, nb01, nb02, nb03, nb1, nb2, nb3);
         } else {
             work_queue_func_t copy_fun = NULL;
@@ -426,20 +426,27 @@ int op_cpy(struct htp_ops_context * octx) {
         return HTP_STATUS_NO_SUPPORT;
     }
 
+    return HTP_STATUS_OK;
+}
+
+int op_cpy(struct htp_ops_context * octx) {
+    bool use_dma = false;
+    int status = exec_cpy(octx, &use_dma);
+
     if (octx->op == HTP_OP_CPY_FENCE) {
-        const struct htp_tensor *sync = octx->src[1];
+        const struct htp_tensor * sync = octx->src[1];
         assert(sync && (sync->flags & HTP_TENSOR_FENCE));
-        if (!use_dma) {
+        if (status == HTP_STATUS_OK && !use_dma) {
             // htp_tensor_flush_all(octx->ctx, octx->dsts, 1);
             qurt_mem_cache_clean((qurt_addr_t) 0, 0, QURT_MEM_CACHE_FLUSH_INVALIDATE_ALL, QURT_MEM_DCACHE);
         }
 
         const uint32_t seq = (uint32_t) octx->op_params[0];
         atomic_uint * sync_fence = (atomic_uint *) (uintptr_t) sync->data;
-        htp_fence_write(sync_fence, seq, HTP_STATUS_OK);
+        htp_fence_write(sync_fence, seq, status);
 
-        FARF(HIGH, "ggml-hex: sync-release : fence %p seq %u\n", sync_fence, seq);
+        FARF(HIGH, "ggml-hex: sync-release : fence %p seq %u status %d\n", sync_fence, seq, status);
     }
 
-    return HTP_STATUS_OK;
+    return status;
 }
