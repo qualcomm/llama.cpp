@@ -374,7 +374,6 @@ struct ggml_hexagon_mdev_group {
 struct ggml_backend_hexagon_comm_context {
     std::vector<ggml_backend_t> backends;
     size_t                      n_backends = 0;
-    uint32_t                    fence_seq  = 0;
 };
 
 struct ggml_hexagon_event {
@@ -6393,7 +6392,6 @@ static void * ggml_backend_hexagon_comm_init(ggml_backend_t * backends, size_t n
     auto * ctx = new ggml_backend_hexagon_comm_context();
     ctx->backends.assign(backends, backends + n_backends);
     ctx->n_backends = n_backends;
-    ctx->fence_seq  = (((uintptr_t) ctx) & 0xFFFF) | 1;
 
     return ctx;
 }
@@ -6447,11 +6445,16 @@ static bool ggml_backend_hexagon_comm_allreduce_tensor(void * comm_ctx_v, struct
         }
     }
 
-    if (comm_ctx->fence_seq == 0) comm_ctx->fence_seq = 1;
-    uint32_t fence_seq_entry = comm_ctx->fence_seq++;
-    if (comm_ctx->fence_seq == 0) comm_ctx->fence_seq = 1;
-    uint32_t fence_seq_exit  = comm_ctx->fence_seq++;
-    if (comm_ctx->fence_seq == 0) comm_ctx->fence_seq = 1;
+    auto sess_0 = static_cast<ggml_hexagon_session *>(comm_ctx->backends[0]->context);
+    if (++sess_0->fence_seq == 0) sess_0->fence_seq = 1;
+    uint32_t fence_seq_entry = sess_0->fence_seq;
+    if (++sess_0->fence_seq == 0) sess_0->fence_seq = 1;
+    uint32_t fence_seq_exit  = sess_0->fence_seq;
+
+    for (size_t i = 1; i < n_backends; i++) {
+        auto sess_i = static_cast<ggml_hexagon_session *>(comm_ctx->backends[i]->context);
+        sess_i->fence_seq = sess_0->fence_seq;
+    }
 
     volatile uint32_t * fences[GGML_HEXAGON_MAX_SESSIONS];
     for (size_t i = 0; i < n_backends; i++) {
