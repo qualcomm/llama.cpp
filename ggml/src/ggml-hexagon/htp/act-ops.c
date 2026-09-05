@@ -479,7 +479,8 @@ static int execute_op_activations_f32(struct htp_ops_context * octx) {
     uint32_t nrows     = src0_nrows;
 
     if (octx->ctx->mdev.count > 1) {
-        bool can_split = (dst->ne[0] == 1 || dst->nb[0] == sizeof(float)) && !htp_tensor_is_permuted(dst);
+        bool can_split = (((uintptr_t) dst->data & (HEX_L2_LINE_SIZE - 1)) == 0) &&
+                         (dst->ne[0] == 1 || dst->nb[0] == sizeof(float)) && !htp_tensor_is_permuted(dst);
         uint32_t rows_per_chunk = 1;
         if (can_split) {
             if (dst->ne[1] > 1 && (dst->nb[1] & 127) == 0) {
