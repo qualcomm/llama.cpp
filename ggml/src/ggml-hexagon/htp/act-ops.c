@@ -14,7 +14,7 @@
 #include "ggml-common.h"
 #include "htp-ctx.h"
 #include "htp-ops.h"
-#include "htp-ops.h"
+#include "hex-common.h"
 #include "htp-tensor.h"
 #include "htp-vtcm.h"
 
@@ -473,14 +473,39 @@ static int execute_op_activations_f32(struct htp_ops_context * octx) {
     }
 
     const uint32_t src0_nrows = src0->ne[1] * src0->ne[2] * src0->ne[3];
+    const size_t dst_row_size = dst->ne[0] * SIZEOF_FP32;
 
     uint32_t row_start = 0;
     uint32_t nrows     = src0_nrows;
 
     if (octx->ctx->mdev.count > 1) {
-        const uint32_t rows_per_mdev = fastdiv(src0_nrows + octx->ctx->mdev.count - 1, &octx->ctx->mdev.count_div);
-        row_start = MIN(octx->ctx->mdev.idx * rows_per_mdev, src0_nrows);
-        nrows     = MIN(rows_per_mdev, src0_nrows - row_start);
+        bool can_split = (dst->ne[0] == 1 || dst->nb[0] == sizeof(float)) && !htp_tensor_is_permuted(dst);
+        uint32_t rows_per_chunk = 1;
+        if (can_split) {
+            if (dst->ne[1] > 1 && (dst->nb[1] & 127) == 0) {
+                rows_per_chunk = 1;
+            } else if (dst->nb[1] == dst_row_size &&
+                       (dst->ne[2] <= 1 || dst->nb[2] == dst->nb[1] * dst->ne[1]) &&
+                       (dst->ne[3] <= 1 || dst->nb[3] == dst->nb[2] * dst->ne[2])) {
+                rows_per_chunk = (dst_row_size > 0) ? (HEX_L2_LINE_SIZE / hex_gcd_u32(dst_row_size, HEX_L2_LINE_SIZE)) : 1;
+            } else {
+                can_split = false;
+            }
+        }
+
+        const uint32_t total_chunks = can_split ? (src0_nrows / rows_per_chunk) : 0;
+        if (total_chunks < octx->ctx->mdev.count) {
+            row_start = (octx->ctx->mdev.idx == 0) ? 0 : src0_nrows;
+            nrows     = (octx->ctx->mdev.idx == 0) ? src0_nrows : 0;
+        } else {
+            const uint32_t chunks_per_mdev = fastdiv(total_chunks + octx->ctx->mdev.count - 1, &octx->ctx->mdev.count_div);
+            row_start = MIN(octx->ctx->mdev.idx * chunks_per_mdev * rows_per_chunk, src0_nrows);
+            if (octx->ctx->mdev.idx == octx->ctx->mdev.count - 1) {
+                nrows = src0_nrows - row_start;
+            } else {
+                nrows = MIN(chunks_per_mdev * rows_per_chunk, src0_nrows - row_start);
+            }
+        }
     }
 
     if (nrows == 0) {
@@ -491,10 +516,9 @@ static int execute_op_activations_f32(struct htp_ops_context * octx) {
 
     // row_size   = bytes of useful data per row (what the kernel touches / what DMA copies).
     // row_stride = bytes between successive rows in DDR (may exceed row_size for non-contig src).
-    const size_t nc_bytes    = dst->ne[0] * SIZEOF_FP32;
-    const size_t src0_row_size = nc_bytes;
-    const size_t src1_row_size = nc_bytes;
-    const size_t dst_row_size  = nc_bytes;
+    const size_t nc_bytes        = dst_row_size;
+    const size_t src0_row_size   = nc_bytes;
+    const size_t src1_row_size   = nc_bytes;
     const size_t src0_row_stride = src0->nb[1];
     const size_t src1_row_stride = src1 ? src1->nb[1] : src0->nb[1];
 
