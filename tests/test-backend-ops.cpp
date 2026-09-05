@@ -9715,6 +9715,31 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 4096, 1, 2560, {1, 1}, {1, 1})); // Qcur
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 2560, 1, 4096, {1, 1}, {1, 1})); // attn out
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 1024, 1, 2560, {1, 1}, {1, 1})); // K/V cur
+    // Control shapes for the Adreno 619 base-GEMV defect: it fails every m above that
+    // is a multiple of 512 and passes every m tested that is not (16 / 1023 / 6680).
+    // Those passing shapes were picked for other reasons, so the correlation is
+    // undersampled. Pair 512n against 512n +/- 1 at the same k to make it testable.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 2048, 1, 2560, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 2049, 1, 2560, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 2047, 1, 2560, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 4095, 1, 2560, {1, 1}, {1, 1}));
+    // Separate "multiple of 512" from "multiple of 128": 1152 = 9*128 and 2176 = 17*128
+    // are both 128-aligned but NOT 512-aligned. The 619 admission for the Adreno
+    // noshuffle GEMV is 128-shaped, so without these the two hypotheses are
+    // indistinguishable -- every failing m so far is a multiple of both.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 1152, 1, 2560, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 2176, 1, 2560, {1, 1}, {1, 1}));
+    // 64-aligned but NOT 128-aligned. use_adreno_kernels admits on ne01 %% 64 == 0 and
+    // ne01 >= 512, so these are admitted to the same Adreno noshuffle GEMV while every
+    // ..47/..49/..95 control above is DECLINED by the %% 64 rule and silently served by
+    // the generic path -- which is why those pass and prove less than they appear to.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32,  576, 1, 2560, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 1088, 1, 2560, {1, 1}, {1, 1}));
+    // Same admitted alignment on the other quants, to establish whether the defect is
+    // q4_K-specific or a property of the shared noshuffle layout on this device.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 2048, 1, 2560, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 2048, 1, 2560, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32, 2048, 1, 2560, {1, 1}, {1, 1}));
     // q8_0 GDN ssm_out broadcast (Qwen3.5-9B-UD / Qwen3.6-35B): the q8_0 Adreno GEMM/GEMV
     // must honor src1/dst view_offs so the per-slice broadcast iteration is correct.
     // N=1 exercises the GEMV offsetd path; N>1 the GEMM path.

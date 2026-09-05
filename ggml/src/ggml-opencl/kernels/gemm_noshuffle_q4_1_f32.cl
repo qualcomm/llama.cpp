@@ -151,7 +151,14 @@ kernel void kernel_gemm_noshuffle_q4_1_f32(
 // q4_1 vs q4_0: the block carries a min alongside the scale and the nibble has no -8 bias, so
 // the dequant is (nibble * scale + min) and there is one extra half4 load per 32-element block.
 // The layout of src0_m matches src0_d exactly.
+// COK_NSG is overridable so the host can narrow it when a device refuses the
+// 64 x COK_NSG workgroup; see ggml_cl_build_cok_program. Leaving this define
+// unguarded silently wins over the host's -DCOK_NSG: the kernel then strides K
+// by 8 while only nsg_eff subgroups are launched, skipping K blocks and reading
+// uninitialised reduceLM slots -> NaN on every device that narrows (Adreno X1-85).
+#ifndef COK_NSG
 #define COK_NSG 8
+#endif
 #define COK_SG  64
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
