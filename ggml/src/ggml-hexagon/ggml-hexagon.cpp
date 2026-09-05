@@ -450,6 +450,7 @@ struct ggml_hexagon_session {
     void     wait_event(uint64_t seq);
 
     bool clone_buffer(const ggml_hexagon_shared_buffer*);
+    void release_buffer(const ggml_hexagon_shared_buffer*);
     void unclone_buffer(const ggml_hexagon_shared_buffer*);
 
     void add_peer(ggml_hexagon_session * peer) {
@@ -502,6 +503,8 @@ struct ggml_hexagon_rpcmem_block {
     uint8_t * base = nullptr;
     int       fd   = -1;
     size_t    size = 0;
+
+    std::unordered_set<ggml_hexagon_session *> mapped_clones;
 
     ggml_hexagon_rpcmem_block(size_t size) {
         base = (uint8_t *) rpcmem_alloc2(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_DEFAULT_FLAGS, size);
@@ -3169,10 +3172,18 @@ uint64_t ggml_hexagon_session::record_event() {
 
 bool ggml_hexagon_session::clone_buffer(const ggml_hexagon_shared_buffer *sbuf)
 {
-    if (this->cloned_buffers.find(sbuf->fd()) != this->cloned_buffers.end()) return true;
+    GGML_ASSERT(sbuf && sbuf->mem);
+    if (sbuf->sess == this) return true;
+
+    auto mem = sbuf->mem;
+    int   fd = mem->fd;
+
+    GGML_ASSERT(fd >= 0);
+
+    if (this->cloned_buffers.find(fd) != this->cloned_buffers.end()) return true;
 
     HEX_VERBOSE("ggml-hex: %s clone-buffer: %s base %p size %zu fd %d\n", this->name.c_str(),
-                sbuf->c_name(), sbuf->base(), sbuf->size(), sbuf->fd());
+                sbuf->c_name(), sbuf->base(), sbuf->size(), fd);
 
     auto clone = std::make_unique<ggml_hexagon_shared_buffer>(this, *sbuf);
     try {
@@ -3182,22 +3193,35 @@ bool ggml_hexagon_session::clone_buffer(const ggml_hexagon_shared_buffer *sbuf)
         return false;
     }
 
-    this->cloned_buffers[sbuf->fd()] = std::move(clone);
+    this->cloned_buffers[fd] = std::move(clone);
+    mem->mapped_clones.insert(this);
     return true;
 }
 
-void ggml_hexagon_session::unclone_buffer(const ggml_hexagon_shared_buffer * sbuf) {
-    if (!sbuf) return;
-    int fd = sbuf->fd();
-    if (fd < 0) return;
+void ggml_hexagon_session::release_buffer(const ggml_hexagon_shared_buffer * sbuf) {
+    GGML_ASSERT(sbuf && sbuf->mem);
+
+    auto mem = sbuf->mem;
+    int   fd = mem->fd;
+
+    GGML_ASSERT(fd >= 0);
 
     auto it = this->cloned_buffers.find(fd);
     if (it != this->cloned_buffers.end()) {
         auto clone = std::move(it->second);
         this->cloned_buffers.erase(it);
     }
-    for (auto & sub : this->mdev.sessions) {
-        sub->unclone_buffer(sbuf);
+    mem->mapped_clones.erase(this);
+}
+
+void ggml_hexagon_session::unclone_buffer(const ggml_hexagon_shared_buffer * sbuf) {
+    GGML_ASSERT(sbuf && sbuf->mem);
+
+    auto mem = sbuf->mem;
+    std::vector<ggml_hexagon_session *> sessions(mem->mapped_clones.begin(), mem->mapped_clones.end());
+
+    for (auto * sess : sessions) {
+        sess->release_buffer(sbuf);
     }
 }
 
@@ -3464,6 +3488,9 @@ void ggml_hexagon_session::release() noexcept(true) {
         delete this->fence_buf;
         this->fence_buf = nullptr;
     }
+    while (!this->cloned_buffers.empty()) {
+        release_buffer(this->cloned_buffers.begin()->second.get());
+    }
 
     if (opt_etm) {
         err = htp_iface_etm(this->handle, 0);
@@ -3490,8 +3517,6 @@ void ggml_hexagon_session::release() noexcept(true) {
     if (this->valid_handle) {
         htp_iface_close(this->handle);
     }
-
-    this->cloned_buffers.clear();
 }
 
 ggml_hexagon_session::ggml_hexagon_session(const ggml_hexagon_device_config & config, ggml_backend_dev_t dev, uint32_t mdev_idx, uint32_t mdev_count) noexcept(false) {
