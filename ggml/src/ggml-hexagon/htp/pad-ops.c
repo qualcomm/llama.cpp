@@ -179,7 +179,7 @@ static void pad_job_per_thread_hvx(unsigned int nth, unsigned int ith, void * da
 }
 
 // ---------------------------------------------------------------------------
-// HVX + DMA PAD kernel — aligned, double-buffered
+// HVX + DMA PAD kernel - aligned, double-buffered
 // ---------------------------------------------------------------------------
 
 static void pad_job_per_thread_hvx_dma(unsigned int nth, unsigned int ith, void * data) {
@@ -355,7 +355,7 @@ static void pad_job_per_thread_hvx_circular(unsigned int nth, unsigned int ith, 
 }
 
 // ---------------------------------------------------------------------------
-// HVX + DMA circular PAD kernel — aligned, double-buffered
+// HVX + DMA circular PAD kernel - aligned, double-buffered
 // ---------------------------------------------------------------------------
 
 static void pad_job_per_thread_hvx_circular_dma(unsigned int nth, unsigned int ith, void * data) {

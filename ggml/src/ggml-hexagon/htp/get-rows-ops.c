@@ -29,7 +29,7 @@ struct get_rows_context {
     uint32_t tasks_per_thread;
 };
 
-#define get_rows_preamble \
+#define get_rows_preamble                      \
     const uint32_t ne00 = octx->src[0]->ne[0]; \
     const uint32_t ne01 = octx->src[0]->ne[1]; \
     const uint32_t ne02 = octx->src[0]->ne[2]; \

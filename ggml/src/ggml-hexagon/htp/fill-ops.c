@@ -19,18 +19,18 @@
 // ggml op_params layout for FILL:
 //   op_params[0] (as float) - the scalar fill value
 
-#define fill_preamble \
+#define fill_preamble                          \
     const struct htp_tensor * dst = octx->dst; \
-    \
-    const uint32_t ne0 = dst->ne[0]; \
-    const uint32_t ne1 = dst->ne[1]; \
-    const uint32_t ne2 = dst->ne[2]; \
-    const uint32_t ne3 = dst->ne[3]; \
-    \
-    const uint32_t nb1 = dst->nb[1]; \
-    const uint32_t nb2 = dst->nb[2]; \
-    const uint32_t nb3 = dst->nb[3]; \
-    \
+                                               \
+    const uint32_t ne0 = dst->ne[0];           \
+    const uint32_t ne1 = dst->ne[1];           \
+    const uint32_t ne2 = dst->ne[2];           \
+    const uint32_t ne3 = dst->ne[3];           \
+                                               \
+    const uint32_t nb1 = dst->nb[1];           \
+    const uint32_t nb2 = dst->nb[2];           \
+    const uint32_t nb3 = dst->nb[3];           \
+                                               \
     const uint32_t nr = ne1 * ne2 * ne3;
 
 struct htp_fill_context {

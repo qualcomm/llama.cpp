@@ -51,27 +51,27 @@ struct htp_binary_context {
     const struct htp_tensor * src0 = octx->src[0]; \
     const struct htp_tensor * src1 = octx->src[1]; \
     const struct htp_tensor * dst  = octx->dst;    \
-                                       \
-    const uint32_t ne00 = src0->ne[0]; \
-    const uint32_t ne01 = src0->ne[1]; \
-    const uint32_t ne02 = src0->ne[2]; \
-    const uint32_t ne03 = src0->ne[3]; \
-                                       \
-    const uint32_t ne10 = src1->ne[0]; \
-    const uint32_t ne11 = src1->ne[1]; \
-    const uint32_t ne12 = src1->ne[2]; \
-    const uint32_t ne13 = src1->ne[3]; \
-                                       \
-    const uint32_t nb01 = src0->nb[1]; \
-    const uint32_t nb02 = src0->nb[2]; \
-    const uint32_t nb03 = src0->nb[3]; \
-                                       \
-    const uint32_t nb11 = src1->nb[1]; \
-    const uint32_t nb12 = src1->nb[2]; \
-    const uint32_t nb13 = src1->nb[3]; \
-                                       \
-    const uint32_t nb1 = dst->nb[1];   \
-    const uint32_t nb2 = dst->nb[2];   \
+                                                   \
+    const uint32_t ne00 = src0->ne[0];             \
+    const uint32_t ne01 = src0->ne[1];             \
+    const uint32_t ne02 = src0->ne[2];             \
+    const uint32_t ne03 = src0->ne[3];             \
+                                                   \
+    const uint32_t ne10 = src1->ne[0];             \
+    const uint32_t ne11 = src1->ne[1];             \
+    const uint32_t ne12 = src1->ne[2];             \
+    const uint32_t ne13 = src1->ne[3];             \
+                                                   \
+    const uint32_t nb01 = src0->nb[1];             \
+    const uint32_t nb02 = src0->nb[2];             \
+    const uint32_t nb03 = src0->nb[3];             \
+                                                   \
+    const uint32_t nb11 = src1->nb[1];             \
+    const uint32_t nb12 = src1->nb[2];             \
+    const uint32_t nb13 = src1->nb[3];             \
+                                                   \
+    const uint32_t nb1 = dst->nb[1];               \
+    const uint32_t nb2 = dst->nb[2];               \
     const uint32_t nb3 = dst->nb[3];
 
 static inline uint32_t calc_block_size(struct htp_binary_context * bctx, uint32_t ir, uint32_t end_row, uint32_t ne01, uint32_t ne02) {
@@ -96,87 +96,87 @@ static inline uint32_t calc_block_size(struct htp_binary_context * bctx, uint32_
 }
 
 // Macro for scalar op switch
-#define COMPUTE_SCALAR_OP(DST, SRC, VAL, TYPE, N) \
-    if(TYPE == HTP_TYPE_F32) { \
-        switch (octx->op) { \
-            case HTP_OP_ADD: hvx_add_scalar_f32_aa(DST, SRC, *(float *)VAL, N); break; \
-            case HTP_OP_SUB: hvx_sub_scalar_f32_aa(DST, SRC, *(float *)VAL, N); break; \
-            case HTP_OP_MUL: hvx_mul_scalar_f32_aa(DST, SRC, *(float *)VAL, N); break; \
+#define COMPUTE_SCALAR_OP(DST, SRC, VAL, TYPE, N)                                               \
+    if(TYPE == HTP_TYPE_F32) {                                                                  \
+        switch (octx->op) {                                                                     \
+            case HTP_OP_ADD: hvx_add_scalar_f32_aa(DST, SRC, *(float *)VAL, N); break;          \
+            case HTP_OP_SUB: hvx_sub_scalar_f32_aa(DST, SRC, *(float *)VAL, N); break;          \
+            case HTP_OP_MUL: hvx_mul_scalar_f32_aa(DST, SRC, *(float *)VAL, N); break;          \
             case HTP_OP_DIV: hvx_mul_scalar_f32_aa(DST, SRC, 1.0f / (*(float *)VAL), N); break; \
-            default: break; \
-        } \
-    } \
-    else { \
-        switch (octx->op) { \
-            case HTP_OP_ADD: hvx_add_scalar_f16_aa(DST, SRC, *(_Float16 *)VAL, N); break; \
-            case HTP_OP_SUB: hvx_sub_scalar_f16_aa(DST, SRC, *(_Float16 *)VAL, N); break; \
-            case HTP_OP_MUL: hvx_mul_scalar_f16_aa(DST, SRC, *(_Float16 *)VAL, N); break; \
-            case HTP_OP_DIV: hvx_div_scalar_f16_aa(DST, SRC, *(_Float16 *)VAL, N); break; \
-            default: break; \
-        } \
+            default: break;                                                                     \
+        }                                                                                       \
+    }                                                                                           \
+    else {                                                                                      \
+        switch (octx->op) {                                                                     \
+            case HTP_OP_ADD: hvx_add_scalar_f16_aa(DST, SRC, *(_Float16 *)VAL, N); break;       \
+            case HTP_OP_SUB: hvx_sub_scalar_f16_aa(DST, SRC, *(_Float16 *)VAL, N); break;       \
+            case HTP_OP_MUL: hvx_mul_scalar_f16_aa(DST, SRC, *(_Float16 *)VAL, N); break;       \
+            case HTP_OP_DIV: hvx_div_scalar_f16_aa(DST, SRC, *(_Float16 *)VAL, N); break;       \
+            default: break;                                                                     \
+        }                                                                                       \
     }
 
 // Macro for vector op switch (All Aligned)
-#define COMPUTE_VECTOR_OP_AAA(DST, SRC0, SRC1, TYPE, N) \
-    if(TYPE == HTP_TYPE_F32) { \
-        switch (octx->op) { \
+#define COMPUTE_VECTOR_OP_AAA(DST, SRC0, SRC1, TYPE, N)                  \
+    if(TYPE == HTP_TYPE_F32) {                                           \
+        switch (octx->op) {                                              \
             case HTP_OP_ADD: hvx_add_f32_aaa(DST, SRC0, SRC1, N); break; \
             case HTP_OP_SUB: hvx_sub_f32_aaa(DST, SRC0, SRC1, N); break; \
             case HTP_OP_MUL: hvx_mul_f32_aaa(DST, SRC0, SRC1, N); break; \
             case HTP_OP_DIV: hvx_div_f32_aaa(DST, SRC0, SRC1, N); break; \
-            default: break; \
-        } \
-    } \
-    else { \
-        switch (octx->op) { \
+            default: break;                                              \
+        }                                                                \
+    }                                                                    \
+    else {                                                               \
+        switch (octx->op) {                                              \
             case HTP_OP_ADD: hvx_add_f16_aaa(DST, SRC0, SRC1, N); break; \
             case HTP_OP_SUB: hvx_sub_f16_aaa(DST, SRC0, SRC1, N); break; \
             case HTP_OP_MUL: hvx_mul_f16_aaa(DST, SRC0, SRC1, N); break; \
             case HTP_OP_DIV: hvx_div_f16_aaa(DST, SRC0, SRC1, N); break; \
-            default: break; \
-        } \
+            default: break;                                              \
+        }                                                                \
     }
 
 // Macro for vector op switch (Dst Aligned, Src0 Aligned, Src1 Unaligned)
-#define COMPUTE_VECTOR_OP_AAU(DST, SRC0, SRC1, TYPE, N) \
-    if(TYPE == HTP_TYPE_F32) { \
-        switch (octx->op) { \
+#define COMPUTE_VECTOR_OP_AAU(DST, SRC0, SRC1, TYPE, N)                  \
+    if(TYPE == HTP_TYPE_F32) {                                           \
+        switch (octx->op) {                                              \
             case HTP_OP_ADD: hvx_add_f32_aau(DST, SRC0, SRC1, N); break; \
             case HTP_OP_SUB: hvx_sub_f32_aau(DST, SRC0, SRC1, N); break; \
             case HTP_OP_MUL: hvx_mul_f32_aau(DST, SRC0, SRC1, N); break; \
             case HTP_OP_DIV: hvx_div_f32_aau(DST, SRC0, SRC1, N); break; \
-            default: break; \
-        } \
-    } \
-    else { \
-        switch (octx->op) { \
+            default: break;                                              \
+        }                                                                \
+    }                                                                    \
+    else {                                                               \
+        switch (octx->op) {                                              \
             case HTP_OP_ADD: hvx_add_f16_aau(DST, SRC0, SRC1, N); break; \
             case HTP_OP_SUB: hvx_sub_f16_aau(DST, SRC0, SRC1, N); break; \
             case HTP_OP_MUL: hvx_mul_f16_aau(DST, SRC0, SRC1, N); break; \
             case HTP_OP_DIV: hvx_div_f16_aau(DST, SRC0, SRC1, N); break; \
-            default: break; \
-        } \
+            default: break;                                              \
+        }                                                                \
     }
 
 // Macro for vector op switch (All Unaligned - generic loop used in element repeat)
-#define COMPUTE_VECTOR_OP_UUU(DST, SRC0, SRC1, TYPE, N) \
-    if(TYPE == HTP_TYPE_F32) { \
-        switch (octx->op) { \
+#define COMPUTE_VECTOR_OP_UUU(DST, SRC0, SRC1, TYPE, N)                  \
+    if(TYPE == HTP_TYPE_F32) {                                           \
+        switch (octx->op) {                                              \
             case HTP_OP_ADD: hvx_add_f32_uuu(DST, SRC0, SRC1, N); break; \
             case HTP_OP_SUB: hvx_sub_f32_uuu(DST, SRC0, SRC1, N); break; \
             case HTP_OP_MUL: hvx_mul_f32_uuu(DST, SRC0, SRC1, N); break; \
             case HTP_OP_DIV: hvx_div_f32_uuu(DST, SRC0, SRC1, N); break; \
-            default: break; \
-        } \
-    } \
-    else { \
-        switch (octx->op) { \
+            default: break;                                              \
+        }                                                                \
+    }                                                                    \
+    else {                                                               \
+        switch (octx->op) {                                              \
             case HTP_OP_ADD: hvx_add_f16_uuu(DST, SRC0, SRC1, N); break; \
             case HTP_OP_SUB: hvx_sub_f16_uuu(DST, SRC0, SRC1, N); break; \
             case HTP_OP_MUL: hvx_mul_f16_uuu(DST, SRC0, SRC1, N); break; \
             case HTP_OP_DIV: hvx_div_f16_uuu(DST, SRC0, SRC1, N); break; \
-            default: break; \
-        } \
+            default: break;                                              \
+        }                                                                \
     }
 
 // 1. Scalar src1 (ne10 == 1)

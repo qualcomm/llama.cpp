@@ -805,7 +805,7 @@ static void hvx_mm_2d(unsigned int nth, unsigned int ith, void * data) {
         const uint8_t * ss0 = dma_queue_pop(dma_queue).dst;
 
         htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, ir0);
-        // Process src1 columns in pairs (2×2 tiling)
+        // Process src1 columns in pairs (2x2 tiling)
         uint32_t ir1 = 0;
         for (; ir1 + 1 < src1_nrows; ir1 += 2) {
             const uint8_t * restrict src1_col0 = (const uint8_t *) (src1_data + (ir1+0) * src1_stride);
@@ -815,7 +815,7 @@ static void hvx_mm_2d(unsigned int nth, unsigned int ith, void * data) {
             mmctx->vec_dot_2x2(ne00, &dst_row0[ir0], &dst_row1[ir0], ss0, ss0 + src0_stride, src1_col0, src1_col1);
         }
 
-        // Handle remaining src1 rows (fallback to 2×1)
+        // Handle remaining src1 rows (fallback to 2x1)
         for (; ir1 < src1_nrows; ++ir1) {
             const uint8_t * restrict src1_col = (const uint8_t *) (src1_data + ir1 * src1_stride);
             float * restrict dst_row          = (float *) (dst->data + (ir1 * dst_row_size));

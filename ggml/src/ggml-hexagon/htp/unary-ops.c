@@ -497,7 +497,7 @@ static void tri_f32(const float * restrict src,
         }
         if (boundary > ne0) boundary = ne0;
 
-        // Full HVX vectors — each starts at a 128-byte aligned offset
+        // Full HVX vectors - each starts at a 128-byte aligned offset
         for (uint32_t i = 0; i < nvec; i++) {
             const uint32_t vec_start = i * VLEN_FP32;
             const uint32_t vec_end   = vec_start + VLEN_FP32;
@@ -564,7 +564,7 @@ static void softplus_f32(const float * restrict src,
 
         for (uint32_t i = 0; i < ne0; i++) {
             float x = src_f[i];
-            // For x > 20: softplus(x) ≈ x (avoids exp overflow)
+            // For x > 20: softplus(x) ~ x (avoids exp overflow)
             dst_f[i] = (x > 20.0f) ? x : logf(1.0f + expf(x));
         }
     }
