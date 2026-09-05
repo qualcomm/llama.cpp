@@ -10,6 +10,7 @@
 #include "ggml-common.h"
 #include "htp-ctx.h"
 #include "htp-ops.h"
+#include "htp-tensor.h"
 #include "hvx-types.h"
 #include "hvx-utils.h"
 
@@ -240,21 +241,9 @@ int op_solve_tri(struct htp_ops_context * octx) {
         if (octx->ctx->mdev.count > 1) {
             const uint32_t batch_size = dst->nb[2];
             const uint32_t batches_per_chunk = (batch_size > 0) ? (HEX_L2_LINE_SIZE / hex_gcd_u32(batch_size, HEX_L2_LINE_SIZE)) : 1;
-            const uint32_t total_chunks = total_batches / batches_per_chunk;
-            const bool can_split = total_chunks >= octx->ctx->mdev.count;
-
-            if (!can_split) {
-                job_start = (octx->ctx->mdev.idx == 0) ? 0 : total_batches;
-                njobs     = (octx->ctx->mdev.idx == 0) ? total_batches : 0;
-            } else {
-                const uint32_t chunks_per_mdev = fastdiv(total_chunks + octx->ctx->mdev.count - 1, &octx->ctx->mdev.count_div);
-                job_start = MIN(octx->ctx->mdev.idx * chunks_per_mdev * batches_per_chunk, total_batches);
-                if (octx->ctx->mdev.idx == octx->ctx->mdev.count - 1) {
-                    njobs = total_batches - job_start;
-                } else {
-                    njobs = MIN(chunks_per_mdev * batches_per_chunk, total_batches - job_start);
-                }
-            }
+            const struct htp_tensor_mdev_range range = htp_tensor_mdev_partition(total_batches, htp_tensor_mdev_data_aligned(dst) ? batches_per_chunk : 0, octx->ctx->mdev.idx, octx->ctx->mdev.count, &octx->ctx->mdev.count_div);
+            job_start = range.start;
+            njobs     = range.count;
         }
 
         if (njobs == 0) {
@@ -282,19 +271,10 @@ int op_solve_tri(struct htp_ops_context * octx) {
         uint32_t njobs     = total_jobs;
 
         if (octx->ctx->mdev.count > 1) {
-            const bool can_split = ((dst->nb[1] & 127) == 0) && (total_jobs >= octx->ctx->mdev.count);
-            if (!can_split) {
-                job_start = (octx->ctx->mdev.idx == 0) ? 0 : total_jobs;
-                njobs     = (octx->ctx->mdev.idx == 0) ? total_jobs : 0;
-            } else {
-                const uint32_t jobs_per_mdev = fastdiv(total_jobs + octx->ctx->mdev.count - 1, &octx->ctx->mdev.count_div);
-                job_start = MIN(octx->ctx->mdev.idx * jobs_per_mdev, total_jobs);
-                if (octx->ctx->mdev.idx == octx->ctx->mdev.count - 1) {
-                    njobs = total_jobs - job_start;
-                } else {
-                    njobs = MIN(jobs_per_mdev, total_jobs - job_start);
-                }
-            }
+            const bool can_split = htp_tensor_mdev_data_aligned(dst) && ((dst->nb[1] & (HTP_TENSOR_MDEV_LINE_SIZE - 1)) == 0);
+            const struct htp_tensor_mdev_range range = htp_tensor_mdev_partition(total_jobs, can_split ? 1 : 0, octx->ctx->mdev.idx, octx->ctx->mdev.count, &octx->ctx->mdev.count_div);
+            job_start = range.start;
+            njobs     = range.count;
         }
 
         if (njobs == 0) {

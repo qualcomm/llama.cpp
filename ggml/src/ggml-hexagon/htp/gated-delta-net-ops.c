@@ -10,6 +10,7 @@
 #define GGML_COMMON_DECL_C
 #include "ggml-common.h"
 #include "htp-ctx.h"
+#include "htp-tensor.h"
 
 #ifndef MIN
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
@@ -1146,21 +1147,9 @@ int op_gated_delta_net(struct htp_ops_context * octx) {
     if (octx->ctx->mdev.count > 1) {
         const uint32_t head_bytes = S_v * sizeof(float);
         const uint32_t rows_per_chunk = (head_bytes > 0) ? (HEX_L2_LINE_SIZE / hex_gcd_u32(head_bytes, HEX_L2_LINE_SIZE)) : 1;
-        const uint32_t total_chunks = total_rows / rows_per_chunk;
-        const bool can_split = total_chunks >= octx->ctx->mdev.count;
-
-        if (!can_split) {
-            row_start = (octx->ctx->mdev.idx == 0) ? 0 : total_rows;
-            nrows     = (octx->ctx->mdev.idx == 0) ? total_rows : 0;
-        } else {
-            const uint32_t chunks_per_mdev = fastdiv(total_chunks + octx->ctx->mdev.count - 1, &octx->ctx->mdev.count_div);
-            row_start = MIN(octx->ctx->mdev.idx * chunks_per_mdev * rows_per_chunk, total_rows);
-            if (octx->ctx->mdev.idx == octx->ctx->mdev.count - 1) {
-                nrows = total_rows - row_start;
-            } else {
-                nrows = MIN(chunks_per_mdev * rows_per_chunk, total_rows - row_start);
-            }
-        }
+        const struct htp_tensor_mdev_range range = htp_tensor_mdev_partition(total_rows, htp_tensor_mdev_data_aligned(dst) ? rows_per_chunk : 0, octx->ctx->mdev.idx, octx->ctx->mdev.count, &octx->ctx->mdev.count_div);
+        row_start = range.start;
+        nrows     = range.count;
     }
 
     if (nrows == 0) {

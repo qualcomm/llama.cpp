@@ -167,10 +167,11 @@ int op_diag_f32(struct htp_ops_context * octx) {
     uint32_t nbatches    = total_batches;
 
     if (octx->ctx->mdev.count > 1) {
-        bool can_split = (dst->ne[0] == 1 || dst->nb[0] == sizeof(float)) && !htp_tensor_is_permuted(dst);
+        bool can_split = htp_tensor_mdev_data_aligned(dst) && (dst->ne[0] == 1 || dst->nb[0] == sizeof(float)) && !htp_tensor_is_permuted(dst);
         uint32_t batches_per_chunk = 1;
         if (can_split) {
-            if (dst->ne[2] > 1 && (dst->nb[2] & 127) == 0) {
+            if (dst->ne[2] > 1 && (dst->nb[2] & (HTP_TENSOR_MDEV_LINE_SIZE - 1)) == 0 &&
+                (dst->ne[3] <= 1 || (dst->nb[3] & (HTP_TENSOR_MDEV_LINE_SIZE - 1)) == 0)) {
                 batches_per_chunk = 1;
             } else if (dst->nb[2] == dst_batch_size &&
                        (dst->ne[3] <= 1 || dst->nb[3] == dst->nb[2] * dst->ne[2])) {
@@ -180,19 +181,9 @@ int op_diag_f32(struct htp_ops_context * octx) {
             }
         }
 
-        const uint32_t total_chunks = can_split ? (total_batches / batches_per_chunk) : 0;
-        if (total_chunks < octx->ctx->mdev.count) {
-            batch_start = (octx->ctx->mdev.idx == 0) ? 0 : total_batches;
-            nbatches    = (octx->ctx->mdev.idx == 0) ? total_batches : 0;
-        } else {
-            const uint32_t chunks_per_mdev = fastdiv(total_chunks + octx->ctx->mdev.count - 1, &octx->ctx->mdev.count_div);
-            batch_start = MIN(octx->ctx->mdev.idx * chunks_per_mdev * batches_per_chunk, total_batches);
-            if (octx->ctx->mdev.idx == octx->ctx->mdev.count - 1) {
-                nbatches = total_batches - batch_start;
-            } else {
-                nbatches = MIN(chunks_per_mdev * batches_per_chunk, total_batches - batch_start);
-            }
-        }
+        const struct htp_tensor_mdev_range range = htp_tensor_mdev_partition(total_batches, can_split ? batches_per_chunk : 0, octx->ctx->mdev.idx, octx->ctx->mdev.count, &octx->ctx->mdev.count_div);
+        batch_start = range.start;
+        nbatches    = range.count;
     }
 
     if (nbatches == 0) {

@@ -1158,33 +1158,11 @@ static int execute_op_unary(struct htp_ops_context * octx) {
     uint32_t nrows     = src0_nrows;
 
     if (octx->ctx->mdev.count > 1) {
-        bool can_split = (dst->ne[0] == 1 || dst->nb[0] == elem_size) && !htp_tensor_is_permuted(dst);
-        uint32_t rows_per_chunk = 1;
-        if (can_split) {
-            if (dst->ne[1] > 1 && (dst->nb[1] & 127) == 0) {
-                rows_per_chunk = 1;
-            } else if (dst->nb[1] == dst_data_row_size &&
-                       (dst->ne[2] <= 1 || dst->nb[2] == dst->nb[1] * dst->ne[1]) &&
-                       (dst->ne[3] <= 1 || dst->nb[3] == dst->nb[2] * dst->ne[2])) {
-                rows_per_chunk = (dst_data_row_size > 0) ? (HEX_L2_LINE_SIZE / hex_gcd_u32(dst_data_row_size, HEX_L2_LINE_SIZE)) : 1;
-            } else {
-                can_split = false;
-            }
-        }
-
-        const uint32_t total_chunks = can_split ? (src0_nrows / rows_per_chunk) : 0;
-        if (total_chunks < octx->ctx->mdev.count) {
-            row_start = (octx->ctx->mdev.idx == 0) ? 0 : src0_nrows;
-            nrows     = (octx->ctx->mdev.idx == 0) ? src0_nrows : 0;
-        } else {
-            const uint32_t chunks_per_mdev = fastdiv(total_chunks + octx->ctx->mdev.count - 1, &octx->ctx->mdev.count_div);
-            row_start = MIN(octx->ctx->mdev.idx * chunks_per_mdev * rows_per_chunk, src0_nrows);
-            if (octx->ctx->mdev.idx == octx->ctx->mdev.count - 1) {
-                nrows = src0_nrows - row_start;
-            } else {
-                nrows = MIN(chunks_per_mdev * rows_per_chunk, src0_nrows - row_start);
-            }
-        }
+        uint32_t rows_per_chunk = 0;
+        htp_tensor_mdev_rows_per_chunk(dst, (uint32_t) elem_size, (uint32_t) dst_data_row_size, &rows_per_chunk);
+        const struct htp_tensor_mdev_range range = htp_tensor_mdev_partition(src0_nrows, rows_per_chunk, octx->ctx->mdev.idx, octx->ctx->mdev.count, &octx->ctx->mdev.count_div);
+        row_start = range.start;
+        nrows     = range.count;
     }
 
     if (nrows == 0) {

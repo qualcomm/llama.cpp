@@ -15,6 +15,7 @@
 #include "ggml-common.h"
 #include "htp-ctx.h"
 #include "htp-ops.h"
+#include "htp-tensor.h"
 
 // ggml op_params layout for FILL:
 //   op_params[0] (as float) - the scalar fill value
@@ -97,21 +98,9 @@ int op_fill(struct htp_ops_context * octx) {
     if (octx->ctx->mdev.count > 1) {
         const uint32_t row_size = nb1;
         const uint32_t rows_per_chunk = (row_size > 0) ? (HEX_L2_LINE_SIZE / hex_gcd_u32(row_size, HEX_L2_LINE_SIZE)) : 1;
-        const uint32_t total_chunks = nr / rows_per_chunk;
-        const bool can_split = total_chunks >= octx->ctx->mdev.count;
-
-        if (!can_split) {
-            row_start = (octx->ctx->mdev.idx == 0) ? 0 : nr;
-            nrows     = (octx->ctx->mdev.idx == 0) ? nr : 0;
-        } else {
-            const uint32_t chunks_per_mdev = fastdiv(total_chunks + octx->ctx->mdev.count - 1, &octx->ctx->mdev.count_div);
-            row_start = MIN(octx->ctx->mdev.idx * chunks_per_mdev * rows_per_chunk, nr);
-            if (octx->ctx->mdev.idx == octx->ctx->mdev.count - 1) {
-                nrows = nr - row_start;
-            } else {
-                nrows = MIN(chunks_per_mdev * rows_per_chunk, nr - row_start);
-            }
-        }
+        const struct htp_tensor_mdev_range range = htp_tensor_mdev_partition(nr, htp_tensor_mdev_data_aligned(dst) ? rows_per_chunk : 0, octx->ctx->mdev.idx, octx->ctx->mdev.count, &octx->ctx->mdev.count_div);
+        row_start = range.start;
+        nrows     = range.count;
     }
 
     if (nrows == 0) {

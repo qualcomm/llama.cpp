@@ -17,6 +17,7 @@
 #include "hex-dma.h"
 #include "hex-profile.h"
 #include "htp-vtcm.h"
+#include "htp-tensor.h"
 
 struct htp_im2col_context {
     struct htp_ops_context * octx;
@@ -280,21 +281,9 @@ int op_im2col(struct htp_ops_context * octx) {
     if (octx->ctx->mdev.count > 1) {
         const uint32_t patch_size = dst->nb[1];
         const uint32_t patches_per_chunk = (patch_size > 0) ? (HEX_L2_LINE_SIZE / hex_gcd_u32(patch_size, HEX_L2_LINE_SIZE)) : 1;
-        const uint32_t total_patch_chunks = total_patches / patches_per_chunk;
-        const bool can_split_patches = total_patch_chunks >= octx->ctx->mdev.count;
-
-        if (!can_split_patches) {
-            patch_base = (octx->ctx->mdev.idx == 0) ? 0 : total_patches;
-            npatches   = (octx->ctx->mdev.idx == 0) ? total_patches : 0;
-        } else {
-            const uint32_t chunks_per_mdev = fastdiv(total_patch_chunks + octx->ctx->mdev.count - 1, &octx->ctx->mdev.count_div);
-            patch_base = MIN(octx->ctx->mdev.idx * chunks_per_mdev * patches_per_chunk, total_patches);
-            if (octx->ctx->mdev.idx == octx->ctx->mdev.count - 1) {
-                npatches = total_patches - patch_base;
-            } else {
-                npatches = MIN(chunks_per_mdev * patches_per_chunk, total_patches - patch_base);
-            }
-        }
+        const struct htp_tensor_mdev_range range = htp_tensor_mdev_partition(total_patches, htp_tensor_mdev_data_aligned(dst) ? patches_per_chunk : 0, octx->ctx->mdev.idx, octx->ctx->mdev.count, &octx->ctx->mdev.count_div);
+        patch_base = range.start;
+        npatches   = range.count;
     }
 
     uint32_t row_base = 0;
@@ -302,21 +291,9 @@ int op_im2col(struct htp_ops_context * octx) {
     if (octx->ctx->mdev.count > 1) {
         const uint32_t row_size = dst->nb[2];
         const uint32_t rows_per_chunk = (row_size > 0) ? (HEX_L2_LINE_SIZE / hex_gcd_u32(row_size, HEX_L2_LINE_SIZE)) : 1;
-        const uint32_t total_row_chunks = total_rows / rows_per_chunk;
-        const bool can_split_rows = total_row_chunks >= octx->ctx->mdev.count;
-
-        if (!can_split_rows) {
-            row_base = (octx->ctx->mdev.idx == 0) ? 0 : total_rows;
-            nrows    = (octx->ctx->mdev.idx == 0) ? total_rows : 0;
-        } else {
-            const uint32_t chunks_per_mdev = fastdiv(total_row_chunks + octx->ctx->mdev.count - 1, &octx->ctx->mdev.count_div);
-            row_base = MIN(octx->ctx->mdev.idx * chunks_per_mdev * rows_per_chunk, total_rows);
-            if (octx->ctx->mdev.idx == octx->ctx->mdev.count - 1) {
-                nrows = total_rows - row_base;
-            } else {
-                nrows = MIN(chunks_per_mdev * rows_per_chunk, total_rows - row_base);
-            }
-        }
+        const struct htp_tensor_mdev_range range = htp_tensor_mdev_partition(total_rows, htp_tensor_mdev_data_aligned(dst) ? rows_per_chunk : 0, octx->ctx->mdev.idx, octx->ctx->mdev.count, &octx->ctx->mdev.count_div);
+        row_base = range.start;
+        nrows    = range.count;
     }
 
     if (npatches == 0 && nrows == 0) {

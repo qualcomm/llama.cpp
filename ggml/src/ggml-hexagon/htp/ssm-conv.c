@@ -17,6 +17,7 @@
 #include "hex-dma.h"
 #include "hex-profile.h"
 #include "htp-ops.h"
+#include "htp-tensor.h"
 #include "hvx-utils.h"
 
 #define htp_ssm_conv_tensors_preamble                           \
@@ -365,21 +366,9 @@ int op_ssm_conv_f32(struct htp_ops_context * octx) {
 
     if (octx->ctx->mdev.count > 1) {
         const uint32_t elems_per_chunk = VLEN_FP32;
-        const uint32_t total_chunks = d_inner / elems_per_chunk;
-        const bool can_split = total_chunks >= octx->ctx->mdev.count;
-
-        if (!can_split) {
-            row_start = (octx->ctx->mdev.idx == 0) ? 0 : d_inner;
-            nrows     = (octx->ctx->mdev.idx == 0) ? d_inner : 0;
-        } else {
-            const uint32_t chunks_per_mdev = fastdiv(total_chunks + octx->ctx->mdev.count - 1, &octx->ctx->mdev.count_div);
-            row_start = MIN(octx->ctx->mdev.idx * chunks_per_mdev * elems_per_chunk, d_inner);
-            if (octx->ctx->mdev.idx == octx->ctx->mdev.count - 1) {
-                nrows = d_inner - row_start;
-            } else {
-                nrows = MIN(chunks_per_mdev * elems_per_chunk, d_inner - row_start);
-            }
-        }
+        const struct htp_tensor_mdev_range range = htp_tensor_mdev_partition(d_inner, htp_tensor_mdev_data_aligned(dst) ? elems_per_chunk : 0, octx->ctx->mdev.idx, octx->ctx->mdev.count, &octx->ctx->mdev.count_div);
+        row_start = range.start;
+        nrows     = range.count;
     }
 
     if (nrows == 0) {

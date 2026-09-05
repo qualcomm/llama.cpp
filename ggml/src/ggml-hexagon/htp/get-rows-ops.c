@@ -237,33 +237,11 @@ int op_get_rows(struct htp_ops_context * octx) {
     uint32_t tasks      = total_tasks;
 
     if (octx->ctx->mdev.count > 1) {
-        bool can_split = (dst->ne[0] == 1 || dst->nb[0] == (dst_row_size / dst->ne[0])) && !htp_tensor_is_permuted(dst);
         uint32_t tasks_per_chunk = 1;
-        if (can_split) {
-            if (dst->ne[1] > 1 && (dst->nb[1] & 127) == 0) {
-                tasks_per_chunk = 1;
-            } else if (dst->nb[1] == dst_row_size &&
-                       (dst->ne[2] <= 1 || dst->nb[2] == dst->nb[1] * dst->ne[1]) &&
-                       (dst->ne[3] <= 1 || dst->nb[3] == dst->nb[2] * dst->ne[2])) {
-                tasks_per_chunk = (dst_row_size > 0) ? (HEX_L2_LINE_SIZE / hex_gcd_u32(dst_row_size, HEX_L2_LINE_SIZE)) : 1;
-            } else {
-                can_split = false;
-            }
-        }
-
-        const uint32_t total_chunks = can_split ? (total_tasks / tasks_per_chunk) : 0;
-        if (total_chunks < octx->ctx->mdev.count) {
-            task_start = (octx->ctx->mdev.idx == 0) ? 0 : total_tasks;
-            tasks      = (octx->ctx->mdev.idx == 0) ? total_tasks : 0;
-        } else {
-            const uint32_t chunks_per_mdev = fastdiv(total_chunks + octx->ctx->mdev.count - 1, &octx->ctx->mdev.count_div);
-            task_start = MIN(octx->ctx->mdev.idx * chunks_per_mdev * tasks_per_chunk, total_tasks);
-            if (octx->ctx->mdev.idx == octx->ctx->mdev.count - 1) {
-                tasks = total_tasks - task_start;
-            } else {
-                tasks = MIN(chunks_per_mdev * tasks_per_chunk, total_tasks - task_start);
-            }
-        }
+        htp_tensor_mdev_rows_per_chunk(dst, dst_row_size / dst->ne[0], (uint32_t) dst_row_size, &tasks_per_chunk);
+        const struct htp_tensor_mdev_range range = htp_tensor_mdev_partition(total_tasks, tasks_per_chunk, octx->ctx->mdev.idx, octx->ctx->mdev.count, &octx->ctx->mdev.count_div);
+        task_start = range.start;
+        tasks      = range.count;
     }
 
     if (tasks == 0) {

@@ -341,19 +341,10 @@ static int exec_cpy(struct htp_ops_context * octx, bool * use_dma) {
 
         if (octx->ctx->mdev.count > 1) {
             const uint32_t rows_per_chunk = (row_size > 0) ? (HEX_L2_LINE_SIZE / hex_gcd_u32(row_size, HEX_L2_LINE_SIZE)) : 1;
-            const uint32_t total_chunks   = dst_is_contiguous ? (total_rows / rows_per_chunk) : 0;
-            if (total_chunks < octx->ctx->mdev.count) {
-                row_start = (octx->ctx->mdev.idx == 0) ? 0 : total_rows;
-                nrows     = (octx->ctx->mdev.idx == 0) ? total_rows : 0;
-            } else {
-                uint32_t chunks_per_mdev = fastdiv(total_chunks + octx->ctx->mdev.count - 1, &octx->ctx->mdev.count_div);
-                row_start = MIN(octx->ctx->mdev.idx * chunks_per_mdev * rows_per_chunk, total_rows);
-                if (octx->ctx->mdev.idx == octx->ctx->mdev.count - 1) {
-                    nrows = total_rows - row_start;
-                } else {
-                    nrows = MIN(chunks_per_mdev * rows_per_chunk, total_rows - row_start);
-                }
-            }
+            const bool can_split = htp_tensor_mdev_data_aligned(dst) && dst_is_contiguous;
+            const struct htp_tensor_mdev_range range = htp_tensor_mdev_partition(total_rows, can_split ? rows_per_chunk : 0, octx->ctx->mdev.idx, octx->ctx->mdev.count, &octx->ctx->mdev.count_div);
+            row_start = range.start;
+            nrows     = range.count;
         }
 
         if (nrows == 0) {
@@ -382,8 +373,6 @@ static int exec_cpy(struct htp_ops_context * octx, bool * use_dma) {
         }
     } else if (sametype) {
         const uint32_t total_elems = ne0 * ne1 * ne2 * ne3;
-        const uint32_t total_bytes = total_elems * ct.dst_type_size;
-        const uint32_t n_lines     = total_bytes >> 7;
         const uint32_t elems_per_line = (ct.dst_type_size == 4) ? 32 : 64;
 
         ct.div_ne0            = init_fastdiv_values(ne0);
@@ -397,19 +386,10 @@ static int exec_cpy(struct htp_ops_context * octx, bool * use_dma) {
         uint32_t nelem      = total_elems;
 
         if (octx->ctx->mdev.count > 1) {
-            const uint32_t aligned_lines = dst_is_contiguous ? n_lines : 0;
-            if (aligned_lines < octx->ctx->mdev.count) {
-                elem_start = (octx->ctx->mdev.idx == 0) ? 0 : total_elems;
-                nelem      = (octx->ctx->mdev.idx == 0) ? total_elems : 0;
-            } else {
-                uint32_t lines_per_mdev = fastdiv(aligned_lines + octx->ctx->mdev.count - 1, &octx->ctx->mdev.count_div);
-                elem_start = MIN(octx->ctx->mdev.idx * lines_per_mdev * elems_per_line, total_elems);
-                if (octx->ctx->mdev.idx == octx->ctx->mdev.count - 1) {
-                    nelem = total_elems - elem_start;
-                } else {
-                    nelem = MIN(lines_per_mdev * elems_per_line, total_elems - elem_start);
-                }
-            }
+            const bool can_split = htp_tensor_mdev_data_aligned(dst) && dst_is_contiguous;
+            const struct htp_tensor_mdev_range range = htp_tensor_mdev_partition(total_elems, can_split ? elems_per_line : 0, octx->ctx->mdev.idx, octx->ctx->mdev.count, &octx->ctx->mdev.count_div);
+            elem_start = range.start;
+            nelem      = range.count;
         }
 
         if (nelem == 0) {

@@ -1891,9 +1891,9 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
     uint32_t q_start_max = neq1;
 
     if (octx->ctx->mdev.count > 1) {
-        const uint32_t blocks_per_mdev = fastdiv(n_q_blocks + octx->ctx->mdev.count - 1, &octx->ctx->mdev.count_div);
-        const uint32_t block_start     = MIN(octx->ctx->mdev.idx * blocks_per_mdev, n_q_blocks);
-        const uint32_t block_end       = MIN(block_start + blocks_per_mdev, n_q_blocks);
+        const struct htp_tensor_mdev_range range = htp_tensor_mdev_partition(n_q_blocks, htp_tensor_mdev_data_aligned(dst) ? 1 : 0, octx->ctx->mdev.idx, octx->ctx->mdev.count, &octx->ctx->mdev.count_div);
+        const uint32_t block_start = range.start;
+        const uint32_t block_end   = range.start + range.count;
 
         if (block_start >= block_end) {
             return HTP_STATUS_OK;
@@ -2474,19 +2474,10 @@ int op_flash_attn_ext(struct htp_ops_context * octx) {
     uint32_t qrows      = total_qrows;
 
     if (octx->ctx->mdev.count > 1) {
-        const bool can_split = ((dst->nb[1] & 127) == 0) && (total_qrows >= octx->ctx->mdev.count);
-        if (!can_split) {
-            qrow_start = (octx->ctx->mdev.idx == 0) ? 0 : total_qrows;
-            qrows      = (octx->ctx->mdev.idx == 0) ? total_qrows : 0;
-        } else {
-            const uint32_t rows_per_mdev = fastdiv(total_qrows + octx->ctx->mdev.count - 1, &octx->ctx->mdev.count_div);
-            qrow_start = MIN(octx->ctx->mdev.idx * rows_per_mdev, total_qrows);
-            if (octx->ctx->mdev.idx == octx->ctx->mdev.count - 1) {
-                qrows = total_qrows - qrow_start;
-            } else {
-                qrows = MIN(rows_per_mdev, total_qrows - qrow_start);
-            }
-        }
+        const bool can_split = htp_tensor_mdev_data_aligned(dst) && ((dst->nb[1] & (HTP_TENSOR_MDEV_LINE_SIZE - 1)) == 0);
+        const struct htp_tensor_mdev_range range = htp_tensor_mdev_partition(total_qrows, can_split ? 1 : 0, octx->ctx->mdev.idx, octx->ctx->mdev.count, &octx->ctx->mdev.count_div);
+        qrow_start = range.start;
+        qrows      = range.count;
     }
 
     if (qrows == 0) {

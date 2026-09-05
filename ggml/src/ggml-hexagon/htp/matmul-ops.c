@@ -558,19 +558,9 @@ static void hvx_mm_nx_2d_repacked_##SUFFIX(unsigned int nth, unsigned int ith, v
         uint32_t src0_end_row   = ne01;                                                                                           \
         if (octx->ctx->mdev.count > 1) {                                                                                          \
             const bool can_split = htp_tensor_can_row_partition(dst, sizeof(float));                                              \
-            const uint32_t total_chunks = ne01 / 32;                                                                              \
-            if (!can_split || total_chunks < octx->ctx->mdev.count) {                                                             \
-                src0_start_row = (octx->ctx->mdev.idx == 0) ? 0 : ne01;                                                           \
-                src0_end_row   = (octx->ctx->mdev.idx == 0) ? ne01 : ne01;                                                        \
-            } else {                                                                                                              \
-                const uint32_t chunks_per_mdev = fastdiv(total_chunks + octx->ctx->mdev.count - 1, &octx->ctx->mdev.count_div);   \
-                src0_start_row = MIN(octx->ctx->mdev.idx * chunks_per_mdev * 32, ne01);                                           \
-                if (octx->ctx->mdev.idx == octx->ctx->mdev.count - 1) {                                                           \
-                    src0_end_row = ne01;                                                                                          \
-                } else {                                                                                                          \
-                    src0_end_row = MIN(src0_start_row + chunks_per_mdev * 32, ne01);                                              \
-                }                                                                                                                 \
-            }                                                                                                                     \
+            const struct htp_tensor_mdev_range range = htp_tensor_mdev_partition(ne01, can_split ? 32 : 0, octx->ctx->mdev.idx, octx->ctx->mdev.count, &octx->ctx->mdev.count_div); \
+            src0_start_row = range.start;                                                                                         \
+            src0_end_row   = range.start + range.count;                                                                            \
         }                                                                                                                         \
                                                                                                                                   \
         const uint32_t nrows = src0_end_row - src0_start_row;                                                                     \
@@ -1168,19 +1158,10 @@ static void hvx_mv_id_nx(unsigned int nth, unsigned int ith, void * data) {
             uint32_t start_row = 0;
             uint32_t end_row   = ne01;
             if (octx->ctx->mdev.count > 1) {
-                const uint32_t total_chunks = ne01 / 32;
-                if (total_chunks < octx->ctx->mdev.count) {
-                    start_row = (octx->ctx->mdev.idx == 0) ? 0 : ne01;
-                    end_row   = (octx->ctx->mdev.idx == 0) ? ne01 : ne01;
-                } else {
-                    const uint32_t chunks_per_mdev = fastdiv(total_chunks + octx->ctx->mdev.count - 1, &octx->ctx->mdev.count_div);
-                    start_row = MIN(octx->ctx->mdev.idx * chunks_per_mdev * 32, ne01);
-                    if (octx->ctx->mdev.idx == octx->ctx->mdev.count - 1) {
-                        end_row = ne01;
-                    } else {
-                        end_row = MIN(start_row + chunks_per_mdev * 32, ne01);
-                    }
-                }
+                const bool can_split = htp_tensor_can_row_partition(dst, sizeof(float));
+                const struct htp_tensor_mdev_range range = htp_tensor_mdev_partition(ne01, can_split ? 32 : 0, octx->ctx->mdev.idx, octx->ctx->mdev.count, &octx->ctx->mdev.count_div);
+                start_row = range.start;
+                end_row   = range.start + range.count;
             }
 
             const uint32_t nrows = end_row - start_row;
@@ -1271,19 +1252,10 @@ static void hvx_mm_id_nx(unsigned int nth, unsigned int ith, void * data) {
             uint32_t start_row = 0;
             uint32_t end_row   = ne01;
             if (octx->ctx->mdev.count > 1) {
-                const uint32_t total_chunks = ne01 / 32;
-                if (total_chunks < octx->ctx->mdev.count) {
-                    start_row = (octx->ctx->mdev.idx == 0) ? 0 : ne01;
-                    end_row   = (octx->ctx->mdev.idx == 0) ? ne01 : ne01;
-                } else {
-                    const uint32_t chunks_per_mdev = fastdiv(total_chunks + octx->ctx->mdev.count - 1, &octx->ctx->mdev.count_div);
-                    start_row = MIN(octx->ctx->mdev.idx * chunks_per_mdev * 32, ne01);
-                    if (octx->ctx->mdev.idx == octx->ctx->mdev.count - 1) {
-                        end_row = ne01;
-                    } else {
-                        end_row = MIN(start_row + chunks_per_mdev * 32, ne01);
-                    }
-                }
+                const bool can_split = htp_tensor_can_row_partition(dst, sizeof(float));
+                const struct htp_tensor_mdev_range range = htp_tensor_mdev_partition(ne01, can_split ? 32 : 0, octx->ctx->mdev.idx, octx->ctx->mdev.count, &octx->ctx->mdev.count_div);
+                start_row = range.start;
+                end_row   = range.start + range.count;
             }
 
             const uint32_t nrows = end_row - start_row;
@@ -1390,19 +1362,9 @@ static int hvx_mm_matmul(struct htp_ops_context * octx) {
 
     if (octx->ctx->mdev.count > 1) {
         const bool can_split = htp_tensor_can_row_partition(dst, sizeof(float));
-        const uint32_t total_chunks = src0_nrows / 32;
-        if (!can_split || total_chunks < octx->ctx->mdev.count) {
-            src0_row_start = (octx->ctx->mdev.idx == 0) ? 0 : src0_nrows;
-            src0_row_end   = (octx->ctx->mdev.idx == 0) ? src0_nrows : src0_nrows;
-        } else {
-            const uint32_t chunks_per_mdev = fastdiv(total_chunks + octx->ctx->mdev.count - 1, &octx->ctx->mdev.count_div);
-            src0_row_start = MIN(octx->ctx->mdev.idx * chunks_per_mdev * 32, src0_nrows);
-            if (octx->ctx->mdev.idx == octx->ctx->mdev.count - 1) {
-                src0_row_end = src0_nrows;
-            } else {
-                src0_row_end = MIN(src0_row_start + chunks_per_mdev * 32, src0_nrows);
-            }
-        }
+        const struct htp_tensor_mdev_range range = htp_tensor_mdev_partition(src0_nrows, can_split ? 32 : 0, octx->ctx->mdev.idx, octx->ctx->mdev.count, &octx->ctx->mdev.count_div);
+        src0_row_start = range.start;
+        src0_row_end   = range.start + range.count;
     }
 
     if (src0_row_start >= src0_row_end) {
@@ -1674,19 +1636,9 @@ static void hvx_mm_nx_2d(unsigned int nth, unsigned int ith, void * data) {
         uint32_t end_row   = ne01;
         if (octx->ctx->mdev.count > 1) {
             const bool can_split = htp_tensor_can_row_partition(dst, sizeof(float));
-            const uint32_t total_chunks = ne01 / 32;
-            if (!can_split || total_chunks < octx->ctx->mdev.count) {
-                start_row = (octx->ctx->mdev.idx == 0) ? 0 : ne01;
-                end_row   = (octx->ctx->mdev.idx == 0) ? ne01 : ne01;
-            } else {
-                const uint32_t chunks_per_mdev = fastdiv(total_chunks + octx->ctx->mdev.count - 1, &octx->ctx->mdev.count_div);
-                start_row = MIN(octx->ctx->mdev.idx * chunks_per_mdev * 32, ne01);
-                if (octx->ctx->mdev.idx == octx->ctx->mdev.count - 1) {
-                    end_row = ne01;
-                } else {
-                    end_row = MIN(start_row + chunks_per_mdev * 32, ne01);
-                }
-            }
+            const struct htp_tensor_mdev_range range = htp_tensor_mdev_partition(ne01, can_split ? 32 : 0, octx->ctx->mdev.idx, octx->ctx->mdev.count, &octx->ctx->mdev.count_div);
+            start_row = range.start;
+            end_row   = range.start + range.count;
         }
 
         const uint32_t nrows = end_row - start_row;
@@ -2822,14 +2774,10 @@ static int hmx_mm_nx_2d_f32(struct htp_ops_context * octx, const struct htp_mm_k
     int m_start = 0;
     int m_rows  = m;
     if (octx->ctx->mdev.count > 1) {
-        if (!htp_tensor_can_row_partition(octx->dsts[0], sizeof(float)) || (uint32_t) m < octx->ctx->mdev.count) {
-            m_start = (octx->ctx->mdev.idx == 0) ? 0 : m;
-            m_rows  = (octx->ctx->mdev.idx == 0) ? m : 0;
-        } else {
-            const int rows_per_mdev = (int) fastdiv(m + octx->ctx->mdev.count - 1, &octx->ctx->mdev.count_div);
-            m_start = MIN((int)(octx->ctx->mdev.idx * rows_per_mdev), m);
-            m_rows  = MIN(rows_per_mdev, m - m_start);
-        }
+        const bool can_split = htp_tensor_can_row_partition(octx->dsts[0], sizeof(float));
+        const struct htp_tensor_mdev_range range = htp_tensor_mdev_partition((uint32_t) m, can_split ? 1 : 0, octx->ctx->mdev.idx, octx->ctx->mdev.count, &octx->ctx->mdev.count_div);
+        m_start = (int) range.start;
+        m_rows  = (int) range.count;
     }
 
     if (m_rows == 0) {
@@ -3497,14 +3445,10 @@ static int hmx_mm_op_matmul(struct htp_ops_context * octx, const struct htp_mm_k
     int m_start = 0;
     int m_rows  = m_total;
     if (octx->ctx->mdev.count > 1) {
-        if (!htp_tensor_can_row_partition(dst, sizeof(float)) || (uint32_t) m_total < octx->ctx->mdev.count) {
-            m_start = (octx->ctx->mdev.idx == 0) ? 0 : m_total;
-            m_rows  = (octx->ctx->mdev.idx == 0) ? m_total : 0;
-        } else {
-            const int rows_per_mdev = (int) fastdiv(m_total + octx->ctx->mdev.count - 1, &octx->ctx->mdev.count_div);
-            m_start = MIN((int)(octx->ctx->mdev.idx * rows_per_mdev), m_total);
-            m_rows  = MIN(rows_per_mdev, m_total - m_start);
-        }
+        const bool can_split = htp_tensor_can_row_partition(dst, sizeof(float));
+        const struct htp_tensor_mdev_range range = htp_tensor_mdev_partition((uint32_t) m_total, can_split ? 1 : 0, octx->ctx->mdev.idx, octx->ctx->mdev.count, &octx->ctx->mdev.count_div);
+        m_start = (int) range.start;
+        m_rows  = (int) range.count;
     }
 
     if (m_rows == 0) {
@@ -3613,13 +3557,10 @@ static int hmx_mm_op_matmul_id(
         const int m_padded = hex_align_up(cne1, 32);
         int m_start = 0, m_end = m_padded;
         if (octx->ctx->mdev.count > 1) {
-            if ((uint32_t) cne1 < octx->ctx->mdev.count) {
-                if (octx->ctx->mdev.idx > 0) continue;
-            } else {
-                const int rows_per_mdev = (int) fastdiv(m_padded + octx->ctx->mdev.count - 1, &octx->ctx->mdev.count_div);
-                m_start = MIN((int)(octx->ctx->mdev.idx * rows_per_mdev), m_padded);
-                m_end   = MIN(m_start + rows_per_mdev, m_padded);
-            }
+            const bool can_split = htp_tensor_mdev_data_aligned(dst) && (uint32_t) cne1 >= octx->ctx->mdev.count;
+            const struct htp_tensor_mdev_range range = htp_tensor_mdev_partition((uint32_t) m_padded, can_split ? 1 : 0, octx->ctx->mdev.idx, octx->ctx->mdev.count, &octx->ctx->mdev.count_div);
+            m_start = (int) range.start;
+            m_end   = (int) (range.start + range.count);
         }
         if (m_start >= m_end) continue;
 
@@ -3751,13 +3692,14 @@ static int hmx_mm_op_matmul_id_nx(
         const int m_padded = hex_align_up(cne1, 32);
         int m_start = 0, m_end = m_padded;
         if (octx->ctx->mdev.count > 1) {
-            if ((uint32_t) cne1 < octx->ctx->mdev.count) {
-                if (octx->ctx->mdev.idx > 0) continue;
-            } else {
-                const int rows_per_mdev = (int) fastdiv(m_padded + octx->ctx->mdev.count - 1, &octx->ctx->mdev.count_div);
-                m_start = MIN((int)(octx->ctx->mdev.idx * rows_per_mdev), m_padded);
-                m_end   = MIN(m_start + rows_per_mdev, m_padded);
+            bool can_split = (uint32_t) cne1 >= octx->ctx->mdev.count;
+            for (uint32_t p = 0; p < n_weights && can_split; ++p) {
+                const struct htp_tensor * restrict dst = octx->dsts[p];
+                can_split = !dst || htp_tensor_mdev_data_aligned(dst);
             }
+            const struct htp_tensor_mdev_range range = htp_tensor_mdev_partition((uint32_t) m_padded, can_split ? 1 : 0, octx->ctx->mdev.idx, octx->ctx->mdev.count, &octx->ctx->mdev.count_div);
+            m_start = (int) range.start;
+            m_end   = (int) (range.start + range.count);
         }
         if (m_start >= m_end) continue;
 
@@ -4018,19 +3960,10 @@ int op_matmul_id(struct htp_ops_context * octx) {
         uint32_t src0_row_start = 0;
         uint32_t src0_row_end   = src0_nrows;
         if (octx->ctx->mdev.count > 1) {
-            const uint32_t total_chunks = src0_nrows / 32;
-            if (total_chunks < octx->ctx->mdev.count) {
-                src0_row_start = (octx->ctx->mdev.idx == 0) ? 0 : src0_nrows;
-                src0_row_end   = (octx->ctx->mdev.idx == 0) ? src0_nrows : src0_nrows;
-            } else {
-                const uint32_t chunks_per_mdev = fastdiv(total_chunks + octx->ctx->mdev.count - 1, &octx->ctx->mdev.count_div);
-                src0_row_start = MIN(octx->ctx->mdev.idx * chunks_per_mdev * 32, src0_nrows);
-                if (octx->ctx->mdev.idx == octx->ctx->mdev.count - 1) {
-                    src0_row_end = src0_nrows;
-                } else {
-                    src0_row_end = MIN(src0_row_start + chunks_per_mdev * 32, src0_nrows);
-                }
-            }
+            const bool can_split = htp_tensor_can_row_partition(dst, sizeof(float));
+            const struct htp_tensor_mdev_range range = htp_tensor_mdev_partition(src0_nrows, can_split ? 32 : 0, octx->ctx->mdev.idx, octx->ctx->mdev.count, &octx->ctx->mdev.count_div);
+            src0_row_start = range.start;
+            src0_row_end   = range.start + range.count;
         }
 
         if (src0_row_start >= src0_row_end) {

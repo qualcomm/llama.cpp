@@ -207,20 +207,10 @@ int op_set_rows(struct htp_ops_context * octx) {
     uint32_t tasks      = total_tasks;
 
     if (octx->ctx->mdev.count > 1) {
-        bool can_split = (dst->nb[1] & 127) == 0 && !htp_tensor_is_permuted(dst);
-        const uint32_t total_chunks = can_split ? total_tasks : 0;
-        if (total_chunks < octx->ctx->mdev.count) {
-            task_start = (octx->ctx->mdev.idx == 0) ? 0 : total_tasks;
-            tasks      = (octx->ctx->mdev.idx == 0) ? total_tasks : 0;
-        } else {
-            const uint32_t tasks_per_mdev = fastdiv(total_chunks + octx->ctx->mdev.count - 1, &octx->ctx->mdev.count_div);
-            task_start = MIN(octx->ctx->mdev.idx * tasks_per_mdev, total_tasks);
-            if (octx->ctx->mdev.idx == octx->ctx->mdev.count - 1) {
-                tasks = total_tasks - task_start;
-            } else {
-                tasks = MIN(tasks_per_mdev, total_tasks - task_start);
-            }
-        }
+        const bool can_split = htp_tensor_mdev_data_aligned(dst) && (dst->nb[1] & (HTP_TENSOR_MDEV_LINE_SIZE - 1)) == 0 && !htp_tensor_is_permuted(dst);
+        const struct htp_tensor_mdev_range range = htp_tensor_mdev_partition(total_tasks, can_split ? 1 : 0, octx->ctx->mdev.idx, octx->ctx->mdev.count, &octx->ctx->mdev.count_div);
+        task_start = range.start;
+        tasks      = range.count;
     }
 
     if (tasks == 0) {
