@@ -9703,6 +9703,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // Wide-weight MUL_MAT shapes, n = 1 and the small-batch band.
+    //
+    // The quantized mul_mat cases above all use m = 16. The OpenCL Adreno backend
+    // routes a weight to its specialised (transposed "noshuffle") kernels only when
+    // ne00 >= 512 && ne01 >= 512 && ne01 % 64 == 0, and its cooperative-K GEMM --
+    // which is ON by default -- serves ne1 in 2..8 on exactly those weights. No case
+    // above satisfies that, so on Adreno those paths currently have no correctness
+    // coverage at all, while every real model runs them on every token.
+    //
+    // m = 1088 is 64- but not 128-aligned, and m = 1020 is not 64-aligned so it must
+    // fall back to the generic kernel: the pair keeps both sides of the admission
+    // rule honest, which a single aligned size cannot.
+    for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K}) {
+        for (int n : {1, 2, 4, 8}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1024, n, 1024, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1088, n, 1024, {1, 1}, {1, 1}));
+        }
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1020, 1, 1024, {1, 1}, {1, 1}));
+    }
+
     // Test IQP panel path for all grid IQ types
     for (ggml_type type_a : {GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS,
                              GGML_TYPE_IQ3_S, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M, GGML_TYPE_IQ4_XS}) {
