@@ -450,7 +450,7 @@ struct ggml_hexagon_session {
     void     wait_event(uint64_t seq);
 
     bool clone_buffer(const ggml_hexagon_shared_buffer*);
-    void unclone_buffer(int fd);
+    void unclone_buffer(const ggml_hexagon_shared_buffer*);
 
     void add_peer(ggml_hexagon_session * peer) {
         if (this->phys_idx == peer->phys_idx) {
@@ -609,9 +609,6 @@ struct ggml_hexagon_shared_buffer {
     }
 
     ~ggml_hexagon_shared_buffer() {
-        if (sess && mem) {
-            sess->unclone_buffer(fd());
-        }
         free();
         for (auto * extra : tensor_extra) {
             delete extra;
@@ -658,6 +655,7 @@ static ggml_hexagon_session * ggml_backend_hexagon_buffer_get_sess(ggml_backend_
 
 static void ggml_backend_hexagon_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     auto sbuf = static_cast<ggml_hexagon_shared_buffer *>(buffer->context);
+    sbuf->sess->unclone_buffer(sbuf);
     delete sbuf;
 }
 
@@ -3188,16 +3186,18 @@ bool ggml_hexagon_session::clone_buffer(const ggml_hexagon_shared_buffer *sbuf)
     return true;
 }
 
-void ggml_hexagon_session::unclone_buffer(int fd) {
+void ggml_hexagon_session::unclone_buffer(const ggml_hexagon_shared_buffer * sbuf) {
+    if (!sbuf) return;
+    int fd = sbuf->fd();
     if (fd < 0) return;
 
     auto it = this->cloned_buffers.find(fd);
     if (it != this->cloned_buffers.end()) {
-        it->second->unmap();
+        auto clone = std::move(it->second);
         this->cloned_buffers.erase(it);
     }
     for (auto & sub : this->mdev.sessions) {
-        sub->unclone_buffer(fd);
+        sub->unclone_buffer(sbuf);
     }
 }
 
@@ -3459,8 +3459,11 @@ void ggml_hexagon_session::release() noexcept(true) {
 
     delete this->op_batch;
     delete this->op_queue;
-    delete this->fence_buf;
-    this->fence_buf = nullptr;
+    if (this->fence_buf) {
+        unclone_buffer(this->fence_buf);
+        delete this->fence_buf;
+        this->fence_buf = nullptr;
+    }
 
     if (opt_etm) {
         err = htp_iface_etm(this->handle, 0);
