@@ -6007,7 +6007,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         std::string CL_gemv_compile_opts = std::string("-cl-std=") + opencl_c_std +
                                        " -cl-mad-enable ";
         if (backend_ctx->has_vector_subgroup_broadcast) {
-            CL_gemv_compile_opts += " -DVECTOR_SUB_GROUP_BROADCAT ";
+            CL_gemv_compile_opts += " -DVECTOR_SUB_GROUP_BROADCAST ";
         }
 
 #ifdef GGML_OPENCL_EMBED_KERNELS
@@ -6269,7 +6269,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                                        " -DSIMDGROUP_WIDTH=" +
                                        std::to_string(backend_ctx->adreno_wave_size);
         if (backend_ctx->has_vector_subgroup_broadcast) {
-            CL_gemv_compile_opts += " -DVECTOR_SUB_GROUP_BROADCAT ";
+            CL_gemv_compile_opts += " -DVECTOR_SUB_GROUP_BROADCAST ";
         }
 
 #ifdef GGML_OPENCL_EMBED_KERNELS
@@ -7546,7 +7546,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         std::string CL_gemv_compile_opts = std::string("-cl-std=") + opencl_c_std +
                                        " -cl-mad-enable ";
         if (backend_ctx->has_vector_subgroup_broadcast) {
-            CL_gemv_compile_opts += " -DVECTOR_SUB_GROUP_BROADCAT ";
+            CL_gemv_compile_opts += " -DVECTOR_SUB_GROUP_BROADCAST ";
         }
 
         cl_program prog =
@@ -7589,7 +7589,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         std::string CL_gemv_compile_opts = std::string("-cl-std=") + opencl_c_std +
                                        " -cl-mad-enable ";
         if (backend_ctx->has_vector_subgroup_broadcast) {
-            CL_gemv_compile_opts += " -DVECTOR_SUB_GROUP_BROADCAT ";
+            CL_gemv_compile_opts += " -DVECTOR_SUB_GROUP_BROADCAST ";
         }
 
         cl_program prog =
@@ -13527,7 +13527,35 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
 
 // The optimized gemm and gemv kernels are used for large matrices without batch.
 // tensor is the quantized weights matrix.
+// The Adreno 619 MISCOMPILES kernel_gemv_noshuffle_q4_k_f32: it returns wrong values for
+// EVERY shape the Adreno path admits (ne01 % 64 == 0 && ne01 >= 512 && ne00 >= 512), i.e.
+// essentially every real q4_K decode shape, while the same file's _splitk sibling -- same
+// loads, same reduction, differing only in the K-loop stride -- is correct on the same
+// device and shapes, and q4_0 / q5_K / q6_K are correct at an identical m=2048,k=2560.
+//
+// Not a logic bug. Five hypotheses were measured and refuted before landing here: the wide
+// intra-WG K-split (fails at nsg 4 and 8 alike), an m % 512 rule (m=576 and 1088 fail and
+// are not 512-aligned), a differing subgroup width (clGetKernelSubGroupInfo reports wave=64
+// on BOTH the 619 and the 840), an nsg dependence (the 840 forced to nsg=4 is 1200/1200),
+// and weight-image overflow (619 limit 134,217,728 px vs 3,112,960 needed; the 740 shares
+// that limit and passes).
+//
+// Declining the Adreno path here puts the weight in the standard layout and serves it with
+// the generic kernels -- exactly the configuration the % 64-declined shapes (m = 1023,
+// 6680) already use on this device, and which passes. Correct and slower beats fast and
+// wrong. Scoped to the 619 by evidence; the 642L is the other A6X part and is NOT yet
+// tested for this defect.
+static bool q4k_noshuffle_gemv_miscompiles(const ggml_backend_opencl_context *backend_ctx) {
+    return strstr(backend_ctx->device_name.c_str(), "619") != nullptr;
+}
+
 inline bool use_adreno_kernels(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor) {
+    // See q4k_noshuffle_gemv_miscompiles: the 619 returns wrong values from the noshuffle
+    // q4_K GEMV for every shape this predicate would admit. Decline q4_K there so the
+    // weight is never converted and the generic path serves it.
+    if (tensor->type == GGML_TYPE_Q4_K && q4k_noshuffle_gemv_miscompiles(backend_ctx)) {
+        return false;
+    }
     int64_t threshold_ne0 = 512;
     int64_t threshold_ne1 = 512;
     if (!backend_ctx->adreno_cl_compiler_version.newer_than_or_same(E031, 38, 11, 0) &&
