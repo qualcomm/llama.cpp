@@ -5124,6 +5124,14 @@ static bool ggml_hexagon_supported_pad(const struct ggml_hexagon_session * sess,
         return false;
     }
 
+    const int32_t lp0 = ((const int32_t *) op->op_params)[0];
+    const int32_t rp0 = ((const int32_t *) op->op_params)[1];
+    const int32_t circular = ((const int32_t *) op->op_params)[8];
+
+    if (circular && (lp0 > src0->ne[0] || rp0 > src0->ne[0])) {
+        return false;
+    }
+
     return true;
 
     GGML_UNUSED(sess);
