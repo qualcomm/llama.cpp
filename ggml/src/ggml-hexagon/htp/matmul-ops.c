@@ -558,9 +558,10 @@ static void hvx_mm_nx_2d_repacked_##SUFFIX(unsigned int nth, unsigned int ith, v
         uint32_t src0_end_row   = ne01;                                                                                           \
         if (octx->ctx->mdev.count > 1) {                                                                                          \
             const bool can_split = htp_tensor_can_row_partition(dst, sizeof(float));                                              \
-            const struct htp_tensor_mdev_range range = htp_tensor_mdev_partition(ne01, can_split ? 32 : 0, octx->ctx->mdev.idx, octx->ctx->mdev.count, &octx->ctx->mdev.count_div); \
+            const struct htp_tensor_mdev_range range = htp_tensor_mdev_partition(ne01, can_split ? 32 : 0,                        \
+                                                         octx->ctx->mdev.idx, octx->ctx->mdev.count, &octx->ctx->mdev.count_div); \
             src0_start_row = range.start;                                                                                         \
-            src0_end_row   = range.start + range.count;                                                                            \
+            src0_end_row   = range.start + range.count;                                                                           \
         }                                                                                                                         \
                                                                                                                                   \
         const uint32_t nrows = src0_end_row - src0_start_row;                                                                     \
