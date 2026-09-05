@@ -556,16 +556,16 @@ static void hvx_mm_nx_2d_repacked_##SUFFIX(unsigned int nth, unsigned int ith, v
                                                                                                                                   \
         uint32_t src0_start_row = 0;                                                                                              \
         uint32_t src0_end_row   = ne01;                                                                                           \
-        if (octx->ctx->mdev.count > 1) {                                                                                               \
+        if (octx->ctx->mdev.count > 1) {                                                                                          \
             const bool can_split = htp_tensor_can_row_partition(dst, sizeof(float));                                              \
             const uint32_t total_chunks = ne01 / 32;                                                                              \
-            if (!can_split || total_chunks < octx->ctx->mdev.count) {                                                                  \
-                src0_start_row = (octx->ctx->mdev.idx == 0) ? 0 : ne01;                                                                \
-                src0_end_row   = (octx->ctx->mdev.idx == 0) ? ne01 : ne01;                                                             \
+            if (!can_split || total_chunks < octx->ctx->mdev.count) {                                                             \
+                src0_start_row = (octx->ctx->mdev.idx == 0) ? 0 : ne01;                                                           \
+                src0_end_row   = (octx->ctx->mdev.idx == 0) ? ne01 : ne01;                                                        \
             } else {                                                                                                              \
-                const uint32_t chunks_per_mdev = fastdiv(total_chunks + octx->ctx->mdev.count - 1, &octx->ctx->mdev.count_div);             \
-                src0_start_row = MIN(octx->ctx->mdev.idx * chunks_per_mdev * 32, ne01);                                                \
-                if (octx->ctx->mdev.idx == octx->ctx->mdev.count - 1) {                                                                     \
+                const uint32_t chunks_per_mdev = fastdiv(total_chunks + octx->ctx->mdev.count - 1, &octx->ctx->mdev.count_div);   \
+                src0_start_row = MIN(octx->ctx->mdev.idx * chunks_per_mdev * 32, ne01);                                           \
+                if (octx->ctx->mdev.idx == octx->ctx->mdev.count - 1) {                                                           \
                     src0_end_row = ne01;                                                                                          \
                 } else {                                                                                                          \
                     src0_end_row = MIN(src0_start_row + chunks_per_mdev * 32, ne01);                                              \

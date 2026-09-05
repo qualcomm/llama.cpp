@@ -109,12 +109,12 @@ struct htp_pad_context {
     const uint32_t row_end   = MIN(row_start + pctx->nrows_per_thread, pctx->row_start + pctx->total_dst_rows);
 
 
-#define htp_pad_dma_preamble                                        \
-    const size_t src_row_size         = pctx->src_row_size;         \
-    const size_t src_row_size_aligned = pctx->src_row_size_aligned; \
-    const size_t dst_row_size         = pctx->dst_row_size;         \
-    const size_t dst_row_size_aligned = pctx->dst_row_size_aligned; \
-                                                                    \
+#define htp_pad_dma_preamble                                                                \
+    const size_t src_row_size         = pctx->src_row_size;                                 \
+    const size_t src_row_size_aligned = pctx->src_row_size_aligned;                         \
+    const size_t dst_row_size         = pctx->dst_row_size;                                 \
+    const size_t dst_row_size_aligned = pctx->dst_row_size_aligned;                         \
+                                                                                            \
     uint8_t * src_spad_base = octx->src0_spad.data + ith * octx->src0_spad.size_per_thread; \
     uint8_t * dst_spad_base = octx->dst_spad.data  + ith * octx->dst_spad.size_per_thread;  \
                                                                                             \
@@ -223,7 +223,6 @@ static void pad_job_per_thread_hvx_dma(unsigned int nth, unsigned int ith, void 
     // push dst DMA and prefetch src for the next+1 row.
     // -----------------------------------------------------------------------
     struct htp_thread_trace * tr = &octx->ctx->trace[ith];
-    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, row_start);
 
     for (uint32_t ir = row_start; ir < row_end; ir++) {
         uint8_t * dst_spad_cur = (uint8_t *) dma_queue_pop(dma).src;
@@ -239,6 +238,7 @@ static void pad_job_per_thread_hvx_dma(unsigned int nth, unsigned int ith, void 
                                              lp2, rp2, ne2,
                                              lp3, rp3, ne3);
 
+        htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) ir);
         if (!interior) {
             hvx_splat_f32_a(dst_spad_cur, 0.0f, ne0);
         } else {
@@ -252,6 +252,7 @@ static void pad_job_per_thread_hvx_dma(unsigned int nth, unsigned int ith, void 
                 hvx_copy_f32_ua(dst_interior, src_spad_cur, ne00);
             }
         }
+        htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) ir);
 
         dma_queue_push_vtcm_to_ddr(dma,
             dma_make_ptr(dst_ptr, dst_spad_cur),
@@ -274,8 +275,6 @@ static void pad_job_per_thread_hvx_dma(unsigned int nth, unsigned int ith, void 
                 src_row_size_aligned, src_row_size, next_src_ptr ? 1 : 0);
         }
     }
-
-    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, row_start);
 
     dma_queue_flush(dma);
 
@@ -389,7 +388,6 @@ static void pad_job_per_thread_hvx_circular_dma(unsigned int nth, unsigned int i
     // aligned HVX ops, push dst DMA and prefetch src for the next+1 row.
     // -----------------------------------------------------------------------
     struct htp_thread_trace * tr = &octx->ctx->trace[ith];
-    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, row_start);
 
     for (uint32_t ir = row_start; ir < row_end; ir++) {
         uint8_t * dst_spad_cur = (uint8_t *) dma_queue_pop(dma).src;
@@ -399,7 +397,7 @@ static void pad_job_per_thread_hvx_circular_dma(unsigned int nth, unsigned int i
         pad_decompose_row(ir, ne1, ne2, &i1, &i2, &i3);
         uint8_t * dst_ptr = (uint8_t *) dst->data + i1 * nb1 + i2 * nb2 + i3 * nb3;
 
-
+        htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) ir);
         if (lp0 > 0) {
             uint8_t * dst_left       = dst_spad_cur;
             const uint8_t * src_left = src_spad_cur + (size_t)(ne00 - (uint32_t)lp0) * type_size;
@@ -431,6 +429,7 @@ static void pad_job_per_thread_hvx_circular_dma(unsigned int nth, unsigned int i
                 }
             }
         }
+        htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) ir);
 
         dma_queue_push_vtcm_to_ddr(dma,
             dma_make_ptr(dst_ptr, dst_spad_cur),
@@ -446,8 +445,6 @@ static void pad_job_per_thread_hvx_circular_dma(unsigned int nth, unsigned int i
                 src_row_size_aligned, src_row_size, 1);
         }
     }
-
-    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, row_start);
 
     dma_queue_flush(dma);
 

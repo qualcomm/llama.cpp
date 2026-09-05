@@ -662,8 +662,8 @@ static void unary_task_##SUFFIX##_##NAME(unsigned int nth, unsigned int ith, voi
     const size_t dst_row_size_aligned  = uctx->dst_row_size_aligned;                                                \
                                                                                                                     \
     const uint32_t src0_nrows = uctx->src0_nrows;                                                                   \
-    const uint32_t src0_start_row = uctx->row_start + src0_nrows_per_thread * ith;                                    \
-    const uint32_t src0_end_row   = MIN(src0_start_row + src0_nrows_per_thread, uctx->row_start + src0_nrows);        \
+    const uint32_t src0_start_row = uctx->row_start + src0_nrows_per_thread * ith;                                  \
+    const uint32_t src0_end_row   = MIN(src0_start_row + src0_nrows_per_thread, uctx->row_start + src0_nrows);      \
                                                                                                                     \
     if (src0_start_row >= src0_end_row) {                                                                           \
         return;                                                                                                     \
@@ -770,7 +770,7 @@ static void unary_task_##SUFFIX##_##NAME(unsigned int nth, unsigned int ith, voi
         if (next_ir < src0_end_row) {                                                                               \
             const uint32_t next_block_size = unary_block_size(next_ir, src0_end_row, BLOCK, block_src0_contig,      \
                                                               block_dst_contig, ne01, div_ne01);                    \
-            const uint32_t pref_ir = next_ir + next_block_size;                                                       \
+            const uint32_t pref_ir = next_ir + next_block_size;                                                     \
             if (pref_ir < src0_end_row) {                                                                           \
                 const uint32_t pref_block_size = unary_block_size(pref_ir, src0_end_row, BLOCK, block_src0_contig,  \
                                                                   block_dst_contig, ne01, div_ne01);                \

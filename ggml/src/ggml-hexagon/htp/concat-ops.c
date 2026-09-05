@@ -59,7 +59,6 @@ static void concat_2d_f32_transposed(unsigned int nth, unsigned int ith, void * 
     uint32_t mu = src1_ne0_padded * spad1_stride;
 
     struct htp_thread_trace * tr = &octx->ctx->trace[ith];
-    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) start_i);
 
     for (uint32_t i = start_i; i < end_i; i += block_i) {
         uint32_t current_block_i = (end_i - i < block_i) ? (end_i - i) : block_i;
@@ -76,6 +75,7 @@ static void concat_2d_f32_transposed(unsigned int nth, unsigned int ith, void * 
 
         HVX_Vector * vtcm_tmp = (HVX_Vector *)(spad1_base + src1_ne0_padded * spad1_stride);
 
+        htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) i);
         for (uint32_t j = 0; j < src1_ne0_padded; j += 32) {
             #pragma unroll(4)
             for (uint32_t ii = 0; ii < current_block_i; ii++) {
@@ -85,6 +85,7 @@ static void concat_2d_f32_transposed(unsigned int nth, unsigned int ith, void * 
                 hvx_vmemu(dst_ptr) = vtcm_tmp[ii];
             }
         }
+        htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) i);
 
         dma_queue_pop(q); // src0
 
@@ -93,8 +94,6 @@ static void concat_2d_f32_transposed(unsigned int nth, unsigned int ith, void * 
 
         dma_queue_pop(q);
     }
-
-    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) start_i);
 }
 
 static void concat_2d_f16_transposed(unsigned int nth, unsigned int ith, void * data) {
@@ -131,7 +130,6 @@ static void concat_2d_f16_transposed(unsigned int nth, unsigned int ith, void * 
     uint32_t mu = src1_ne0_padded * spad1_stride;
 
     struct htp_thread_trace * tr = &octx->ctx->trace[ith];
-    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) start_i);
 
     for (uint32_t i = start_i; i < end_i; i += block_i) {
         uint32_t current_block_i = (end_i - i < block_i) ? (end_i - i) : block_i;
@@ -148,6 +146,7 @@ static void concat_2d_f16_transposed(unsigned int nth, unsigned int ith, void * 
 
         HVX_Vector * vtcm_tmp = (HVX_Vector *)(spad1_base + src1_ne0_padded * spad1_stride);
 
+        htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) i);
         for (uint32_t j = 0; j < src1_ne0_padded; j += 64) {
             #pragma unroll(4)
             for (uint32_t ii = 0; ii < current_block_i; ii++) {
@@ -157,6 +156,7 @@ static void concat_2d_f16_transposed(unsigned int nth, unsigned int ith, void * 
                 hvx_vmemu(dst_ptr) = vtcm_tmp[ii];
             }
         }
+        htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) i);
 
         dma_queue_pop(q); // src0
 
@@ -165,8 +165,6 @@ static void concat_2d_f16_transposed(unsigned int nth, unsigned int ith, void * 
 
         dma_queue_pop(q);
     }
-
-    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) start_i);
 }
 
 static void concat_generic(unsigned int nth, unsigned int ith, void * data) {

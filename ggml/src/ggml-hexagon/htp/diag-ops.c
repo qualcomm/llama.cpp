@@ -18,17 +18,17 @@
 #define htp_diag_tensors_preamble                           \
     const struct htp_tensor * restrict src0 = octx->src[0]; \
     const struct htp_tensor * restrict dst  = octx->dst;    \
-                                                     \
-    const uint32_t ne02 = src0->ne[2];               \
-                                                     \
-    const uint32_t ne0 = dst->ne[0];                 \
-    const uint32_t ne1 = dst->ne[1];                 \
-                                                     \
-    const uint32_t nb02 = src0->nb[2];               \
-    const uint32_t nb03 = src0->nb[3];               \
-                                                     \
-    const uint32_t nb1 = dst->nb[1];                 \
-    const uint32_t nb2 = dst->nb[2];                 \
+                                                            \
+    const uint32_t ne02 = src0->ne[2];                      \
+                                                            \
+    const uint32_t ne0 = dst->ne[0];                        \
+    const uint32_t ne1 = dst->ne[1];                        \
+                                                            \
+    const uint32_t nb02 = src0->nb[2];                      \
+    const uint32_t nb03 = src0->nb[3];                      \
+                                                            \
+    const uint32_t nb1 = dst->nb[1];                        \
+    const uint32_t nb2 = dst->nb[2];                        \
     const uint32_t nb3 = dst->nb[3];
 
 struct htp_diag_context {
@@ -81,7 +81,6 @@ static void diag_thread_f32_dma(unsigned int nth, unsigned int ith, void * data)
     uint8_t * dst_spad = octx->dst_spad.data  + (ith * dst_row_size_aligned);
 
     struct htp_thread_trace * tr = &octx->ctx->trace[ith];
-    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) ib0);
 
     for (uint32_t ib = ib0; ib < ib1; ib++) {
         const uint32_t i3 = ib / ne02;
@@ -100,7 +99,9 @@ static void diag_thread_f32_dma(unsigned int nth, unsigned int ith, void * data)
 
         for (uint32_t i1 = 0; i1 < ne1; i1++) {
             // Compute row in VTCM
+            htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) (ib * ne1 + i1));
             hvx_diag_row_f32(src_spad_f32, dst_spad_f32, i1, ne0);
+            htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) (ib * ne1 + i1));
 
             // Write completed row back to DDR
             uint8_t * dst_row = dst_data + i3 * nb3 + i2 * nb2 + i1 * nb1;
@@ -110,8 +111,6 @@ static void diag_thread_f32_dma(unsigned int nth, unsigned int ith, void * data)
             dma_queue_flush(dma_queue);
         }
     }
-
-    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) ib0);
 
     FARF(HIGH, "diag-f32-dma %d/%d: %ux%ux%ux%u (%u:%u) -> %ux%ux%ux%u\n",
          ith, nth, src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3], ib0, ib1,

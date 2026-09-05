@@ -19,25 +19,25 @@
 #define htp_cumsum_tensors_preamble                         \
     const struct htp_tensor * restrict src0 = octx->src[0]; \
     const struct htp_tensor * restrict dst  = octx->dst;    \
-                                                     \
-    const uint32_t ne00 = src0->ne[0];               \
-    const uint32_t ne01 = src0->ne[1];               \
-    const uint32_t ne02 = src0->ne[2];               \
-    const uint32_t ne03 = src0->ne[3];               \
-                                                     \
-    const uint32_t ne0 = dst->ne[0];                 \
-    const uint32_t ne1 = dst->ne[1];                 \
-    const uint32_t ne2 = dst->ne[2];                 \
-    const uint32_t ne3 = dst->ne[3];                 \
-                                                     \
-    const uint32_t nb00 = src0->nb[0];               \
-    const uint32_t nb01 = src0->nb[1];               \
-    const uint32_t nb02 = src0->nb[2];               \
-    const uint32_t nb03 = src0->nb[3];               \
-                                                     \
-    const uint32_t nb0 = dst->nb[0];                 \
-    const uint32_t nb1 = dst->nb[1];                 \
-    const uint32_t nb2 = dst->nb[2];                 \
+                                                            \
+    const uint32_t ne00 = src0->ne[0];                      \
+    const uint32_t ne01 = src0->ne[1];                      \
+    const uint32_t ne02 = src0->ne[2];                      \
+    const uint32_t ne03 = src0->ne[3];                      \
+                                                            \
+    const uint32_t ne0 = dst->ne[0];                        \
+    const uint32_t ne1 = dst->ne[1];                        \
+    const uint32_t ne2 = dst->ne[2];                        \
+    const uint32_t ne3 = dst->ne[3];                        \
+                                                            \
+    const uint32_t nb00 = src0->nb[0];                      \
+    const uint32_t nb01 = src0->nb[1];                      \
+    const uint32_t nb02 = src0->nb[2];                      \
+    const uint32_t nb03 = src0->nb[3];                      \
+                                                            \
+    const uint32_t nb0 = dst->nb[0];                        \
+    const uint32_t nb1 = dst->nb[1];                        \
+    const uint32_t nb2 = dst->nb[2];                        \
     const uint32_t nb3 = dst->nb[3];
 
 struct htp_cumsum_context {
@@ -150,13 +150,14 @@ static void cumsum_thread_f32_dma(unsigned int nth, unsigned int ith, void * dat
     }
 
     struct htp_thread_trace * tr = &octx->ctx->trace[ith];
-    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) ir0);
 
     for (uint32_t ir = ir0; ir < ir1; ir++) {
         float * dst_spad_row = (float *) dma_queue_pop(dma_queue).src;
         float * src_spad_row = (float *) dma_queue_pop(dma_queue).dst;
 
+        htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) ir);
         hvx_cumsum_row_f32(src_spad_row, dst_spad_row, ne00);
+        htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) ir);
 
         dma_queue_push_vtcm_to_ddr(dma_queue,
                                    dma_make_ptr(dst_data + (ir * dst_row_size), (uint8_t *) dst_spad_row),
@@ -169,8 +170,6 @@ static void cumsum_thread_f32_dma(unsigned int nth, unsigned int ith, void * dat
                                        src_row_size_aligned, src_row_size, 1);
         }
     }
-
-    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) ir0);
 
     dma_queue_flush(dma_queue);
 

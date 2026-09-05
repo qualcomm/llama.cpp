@@ -23,25 +23,25 @@
     const struct htp_tensor *src0 = octx->src[0]; \
     const struct htp_tensor *dst  = octx->dst;    \
                                                   \
-    const uint32_t ne00 = src0->ne[0];     \
-    const uint32_t ne01 = src0->ne[1];     \
-    const uint32_t ne02 = src0->ne[2];     \
-    const uint32_t ne03 = src0->ne[3];     \
-                                           \
-    const uint32_t nb00 = src0->nb[0];     \
-    const uint32_t nb01 = src0->nb[1];     \
-    const uint32_t nb02 = src0->nb[2];     \
-    const uint32_t nb03 = src0->nb[3];     \
-                                           \
-    const uint32_t  ne0 = dst->ne[0];      \
-    const uint32_t  ne1 = dst->ne[1];      \
-    const uint32_t  ne2 = dst->ne[2];      \
-    const uint32_t  ne3 = dst->ne[3];      \
-                                           \
-    const uint32_t  nb0 = dst->nb[0];      \
-    const uint32_t  nb1 = dst->nb[1];      \
-    const uint32_t  nb2 = dst->nb[2];      \
-    const uint32_t  nb3 = dst->nb[3];      \
+    const uint32_t ne00 = src0->ne[0];            \
+    const uint32_t ne01 = src0->ne[1];            \
+    const uint32_t ne02 = src0->ne[2];            \
+    const uint32_t ne03 = src0->ne[3];            \
+                                                  \
+    const uint32_t nb00 = src0->nb[0];            \
+    const uint32_t nb01 = src0->nb[1];            \
+    const uint32_t nb02 = src0->nb[2];            \
+    const uint32_t nb03 = src0->nb[3];            \
+                                                  \
+    const uint32_t  ne0 = dst->ne[0];             \
+    const uint32_t  ne1 = dst->ne[1];             \
+    const uint32_t  ne2 = dst->ne[2];             \
+    const uint32_t  ne3 = dst->ne[3];             \
+                                                  \
+    const uint32_t  nb0 = dst->nb[0];             \
+    const uint32_t  nb1 = dst->nb[1];             \
+    const uint32_t  nb2 = dst->nb[2];             \
+    const uint32_t  nb3 = dst->nb[3];             \
 
 struct sum_rows_context {
     struct htp_ops_context * octx;

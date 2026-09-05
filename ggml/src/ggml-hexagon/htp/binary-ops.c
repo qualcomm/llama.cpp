@@ -225,7 +225,6 @@ static void binary_job_scalar(unsigned int nth, unsigned int ith, void * data) {
 
     // Main loop
     struct htp_thread_trace * tr = &octx->ctx->trace[ith];
-    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) start_row);
 
     for (uint32_t ir = start_row; ir < end_row; ) {
         uint32_t current_block_size = calc_block_size(bctx, ir, end_row, ne01, ne02);
@@ -247,12 +246,14 @@ static void binary_job_scalar(unsigned int nth, unsigned int ith, void * data) {
         uint8_t * src1_ptr = (uint8_t *)src1->data + i13 * nb13 + i12 * nb12 + i11 * nb11;
         uint32_t s1_stride = (ne11 == 1) ? 0 : nb11;
 
+        htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) ir);
         for (uint32_t r = 0; r < current_block_size; r++) {
             uint8_t * r_src0 = s0_spad + r * bctx->src0_row_size_aligned;
             uint8_t * r_dst  = d_spad + r * bctx->dst_row_size_aligned;
             COMPUTE_SCALAR_OP(r_dst, r_src0, src1_ptr, src0_type, ne00);
             src1_ptr += s1_stride;
         }
+        htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) ir);
 
         uint8_t * dst_curr = (uint8_t *)dst->data + i03 * nb3 + i02 * nb2 + i01 * nb1;
         dma_queue_push(q, dma_make_ptr(dst_curr, d_spad), nb1, bctx->dst_row_size_aligned, row_size_bytes, current_block_size);
@@ -272,7 +273,6 @@ static void binary_job_scalar(unsigned int nth, unsigned int ith, void * data) {
         ir += current_block_size;
     }
 
-    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) start_row);
     dma_queue_flush(q);
 }
 
@@ -330,7 +330,6 @@ static void binary_job_vector_same_shape(unsigned int nth, unsigned int ith, voi
     }
 
     struct htp_thread_trace * tr = &octx->ctx->trace[ith];
-    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) start_row);
 
     for (uint32_t ir = start_row; ir < end_row; ) {
         uint32_t current_block_size = calc_block_size(bctx, ir, end_row, ne01, ne02);
@@ -338,12 +337,14 @@ static void binary_job_vector_same_shape(unsigned int nth, unsigned int ith, voi
         uint8_t * s0_spad = (uint8_t *) dma_queue_pop(q).dst;
         uint8_t * s1_spad = (uint8_t *) dma_queue_pop(q).dst;
 
+        htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) ir);
         for (uint32_t r = 0; r < current_block_size; r++) {
             uint8_t * r_src0 = s0_spad + r * bctx->src0_row_size_aligned;
             uint8_t * r_src1 = s1_spad + r * bctx->src1_row_size_aligned;
             uint8_t * r_dst  = d_spad  + r * bctx->dst_row_size_aligned;
             COMPUTE_VECTOR_OP_AAA(r_dst, r_src0, r_src1, src0_type, ne00);
         }
+        htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) ir);
 
         uint32_t i03, i02, i01, rem;
         i03 = fastdiv(ir, &bctx->src0_dim12_div);
@@ -376,7 +377,6 @@ static void binary_job_vector_same_shape(unsigned int nth, unsigned int ith, voi
         ir += current_block_size;
     }
 
-    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) start_row);
     dma_queue_flush(q);
 }
 
@@ -427,19 +427,20 @@ static void binary_job_vector_row_broadcast(unsigned int nth, unsigned int ith, 
     }
 
     struct htp_thread_trace * tr = &octx->ctx->trace[ith];
-    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) start_row);
 
     for (uint32_t ir = start_row; ir < end_row; ) {
         uint32_t current_block_size = calc_block_size(bctx, ir, end_row, ne01, ne02);
         uint8_t * d_spad  = (uint8_t *) dma_queue_pop(q).src;
         uint8_t * s0_spad = (uint8_t *) dma_queue_pop(q).dst;
 
+        htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) ir);
         for (uint32_t r = 0; r < current_block_size; r++) {
             uint8_t * r_src0 = s0_spad + r * bctx->src0_row_size_aligned;
             uint8_t * r_src1 = (uint8_t *)s1_ptr; // Constant
             uint8_t * r_dst  = d_spad + r * bctx->dst_row_size_aligned;
             COMPUTE_VECTOR_OP_AAA(r_dst, r_src0, r_src1, src0_type, ne00);
         }
+        htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) ir);
 
         uint32_t i03 = fastdiv(ir, &bctx->src0_dim12_div);
         uint32_t rem = ir - i03 * (ne02 * ne01);
@@ -461,7 +462,6 @@ static void binary_job_vector_row_broadcast(unsigned int nth, unsigned int ith, 
         ir += current_block_size;
     }
 
-    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) start_row);
     dma_queue_flush(q);
 }
 
@@ -508,7 +508,6 @@ static void binary_job_vector_complex(unsigned int nth, unsigned int ith, void *
     }
 
     struct htp_thread_trace * tr = &octx->ctx->trace[ith];
-    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) start_row);
 
     for (uint32_t ir = start_row; ir < end_row; ) {
         uint32_t current_block_size = calc_block_size(bctx, ir, end_row, ne01, ne02);
@@ -520,6 +519,7 @@ static void binary_job_vector_complex(unsigned int nth, unsigned int ith, void *
         uint32_t i02 = fastdiv(rem, &bctx->src0_dim1_div);
         uint32_t i01 = rem - i02 * ne01;
 
+        htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) ir);
         for (uint32_t r = 0; r < current_block_size; r++) {
             uint32_t r_i01 = i01 + r;
             uint32_t i13 = fastmodulo(i03, ne13, &bctx->src1_dim3_div);
@@ -533,6 +533,7 @@ static void binary_job_vector_complex(unsigned int nth, unsigned int ith, void *
             // Read src1 from DDR (unaligned)
             COMPUTE_VECTOR_OP_AAU(r_dst, r_src0, r_src1, src0_type, ne00);
         }
+        htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) ir);
 
         uint8_t * dst_curr = (uint8_t *)dst->data + i03 * nb3 + i02 * nb2 + i01 * nb1;
         dma_queue_push(q, dma_make_ptr(dst_curr, d_spad), nb1, bctx->dst_row_size_aligned, row_size_bytes, current_block_size);
@@ -550,7 +551,6 @@ static void binary_job_vector_complex(unsigned int nth, unsigned int ith, void *
         ir += current_block_size;
     }
 
-    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) start_row);
     dma_queue_flush(q);
 }
 
@@ -598,7 +598,6 @@ static void binary_job_element_repeat(unsigned int nth, unsigned int ith, void *
     }
 
     struct htp_thread_trace * tr = &octx->ctx->trace[ith];
-    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) start_row);
 
     for (uint32_t ir = start_row; ir < end_row; ) {
         uint32_t current_block_size = calc_block_size(bctx, ir, end_row, ne01, ne02);
@@ -610,6 +609,7 @@ static void binary_job_element_repeat(unsigned int nth, unsigned int ith, void *
         uint32_t i02 = fastdiv(rem, &bctx->src0_dim1_div);
         uint32_t i01 = rem - i02 * ne01;
 
+        htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) ir);
         for (uint32_t r = 0; r < current_block_size; r++) {
             uint32_t r_i01 = i01 + r;
             uint32_t i13 = fastmodulo(i03, ne13, &bctx->src1_dim3_div);
@@ -627,6 +627,7 @@ static void binary_job_element_repeat(unsigned int nth, unsigned int ith, void *
                 COMPUTE_VECTOR_OP_UUU(r_dst + c * elem_size_bytes, r_src0 + c * elem_size_bytes, r_src1_row, src0_type, len);
             }
         }
+        htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) ir);
 
         uint8_t * dst_curr = (uint8_t *)dst->data + i03 * nb3 + i02 * nb2 + i01 * nb1;
         dma_queue_push(q, dma_make_ptr(dst_curr, d_spad), nb1, bctx->dst_row_size_aligned, row_size_bytes, current_block_size);
@@ -644,7 +645,6 @@ static void binary_job_element_repeat(unsigned int nth, unsigned int ith, void *
         ir += current_block_size;
     }
 
-    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) start_row);
     dma_queue_flush(q);
 }
 
@@ -706,7 +706,6 @@ static void binary_job_add_id(unsigned int nth, unsigned int ith, void * data) {
     }
 
     struct htp_thread_trace * tr = &octx->ctx->trace[ith];
-    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) start_row);
 
     for (uint32_t ir = start_row; ir < end_row; ) {
         uint32_t current_block_size = calc_block_size(bctx, ir, end_row, ne01, ne02);
@@ -718,6 +717,7 @@ static void binary_job_add_id(unsigned int nth, unsigned int ith, void * data) {
         uint32_t i02 = fastdiv(rem, &bctx->src0_dim1_div);
         uint32_t i01 = rem - i02 * ne01;
 
+        htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) ir);
         for (uint32_t r = 0; r < current_block_size; r++) {
             uint32_t r_i01 = i01 + r; // linear within block since we split at ne01
 
@@ -729,6 +729,7 @@ static void binary_job_add_id(unsigned int nth, unsigned int ith, void * data) {
 
             hvx_add_f32_aau(r_dst, r_src0, r_src1, ne00);
         }
+        htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) ir);
 
         uint8_t * dst_curr = (uint8_t *)dst->data + i03 * nb3 + i02 * nb2 + i01 * nb1;
         dma_queue_push(q, dma_make_ptr(dst_curr, d_spad), nb1, bctx->dst_row_size_aligned, ne00 * sizeof(float), current_block_size);
@@ -746,7 +747,6 @@ static void binary_job_add_id(unsigned int nth, unsigned int ith, void * data) {
         ir += current_block_size;
     }
 
-    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) start_row);
     dma_queue_flush(q);
 }
 
