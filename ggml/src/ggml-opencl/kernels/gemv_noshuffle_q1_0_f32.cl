@@ -83,6 +83,14 @@ __kernel void kernel_gemv_noshuffle_q1_0_f32(
     uint LINE_STRIDE_A  = M;
     uint BLOCK_STRIDE_A = 4 * M;
 
+    // The x-grid is padded to CEIL_DIV(M, wavesize)*wavesize, so the tail lanes
+    // hold gid >= M. src0_d is a raw global pointer and read_imageui out of range
+    // is undefined for a non-sampler read, so clamp the row used for every fetch.
+    // The lanes stay active, which the sub_group_broadcast in the dequant macros
+    // requires, and the store below is already guarded. No-op when M is a multiple
+    // of the wave size.
+    uint gid_s = min(gid, M - 1);
+
     uint4  regA;
     half   regS;
     float8 regB;
@@ -91,7 +99,7 @@ __kernel void kernel_gemv_noshuffle_q1_0_f32(
 
     #pragma unroll 1
     for (uint kb = groupId; kb < (K / QK1_0); kb += N_SIMDGROUP) {
-        regS = src0_d[gid + kb * LINE_STRIDE_A]; // each fiber loads its row's scale
+        regS = src0_d[gid_s + kb * LINE_STRIDE_A]; // each fiber loads its row's scale
 
         // first 16 fibers load 8 B values each -> 128 activations for this block
         if (slid < 16) {
@@ -100,10 +108,10 @@ __kernel void kernel_gemv_noshuffle_q1_0_f32(
         }
 
         // load this row's 4 uint32 (128 sign bits)
-        regA.s0 = read_imageui(src0_q, (gid + kb * BLOCK_STRIDE_A + LINE_STRIDE_A * 0)).x;
-        regA.s1 = read_imageui(src0_q, (gid + kb * BLOCK_STRIDE_A + LINE_STRIDE_A * 1)).x;
-        regA.s2 = read_imageui(src0_q, (gid + kb * BLOCK_STRIDE_A + LINE_STRIDE_A * 2)).x;
-        regA.s3 = read_imageui(src0_q, (gid + kb * BLOCK_STRIDE_A + LINE_STRIDE_A * 3)).x;
+        regA.s0 = read_imageui(src0_q, (gid_s + kb * BLOCK_STRIDE_A + LINE_STRIDE_A * 0)).x;
+        regA.s1 = read_imageui(src0_q, (gid_s + kb * BLOCK_STRIDE_A + LINE_STRIDE_A * 1)).x;
+        regA.s2 = read_imageui(src0_q, (gid_s + kb * BLOCK_STRIDE_A + LINE_STRIDE_A * 2)).x;
+        regA.s3 = read_imageui(src0_q, (gid_s + kb * BLOCK_STRIDE_A + LINE_STRIDE_A * 3)).x;
 
         float scale = (float)regS;
         dequantizeBlockAccum_q1(totalSum, regA.s0, scale, regB, 0);
