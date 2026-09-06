@@ -2519,30 +2519,10 @@ static int ggml_cl_q3k_mv_r(const ggml_backend_opencl_context * backend_ctx) {
     return ggml_cl_adreno_x2_class(backend_ctx) ? 4 : 2;
 }
 
-// Ask the device what workgroup a kernel will actually accept and narrow NSG
-// until 64*NSG fits. CL_KERNEL_WORK_GROUP_SIZE is PER-KERNEL and shrinks as
-// register pressure grows, so it cannot be predicted from the shape or from
-// another device: the same binary that launches on one Adreno is refused on
-// another with -54 CL_INVALID_WORK_GROUP_SIZE, which the assert below turns into
-// a hard abort rather than a slow path.
+// Defined below (x2ue keeps a single implementation); declared here for the
+// plane-split program builder that follows.
 static int ggml_cl_nsg_fit(ggml_backend_opencl_context * backend_ctx, cl_kernel k,
-                           int nsg, const char * what) {
-    size_t cap = 0;
-    if (k == nullptr ||
-        clGetKernelWorkGroupInfo(k, backend_ctx->device, CL_KERNEL_WORK_GROUP_SIZE,
-                                 sizeof(cap), &cap, NULL) != CL_SUCCESS || cap == 0) {
-        return nsg;   // cannot tell: leave the preference alone
-    }
-    int w = nsg;
-    while (w > 1 && (size_t) 64 * w > cap) {
-        w >>= 1;
-    }
-    if (w != nsg) {
-        GGML_LOG_WARN("ggml_opencl: %s workgroup %d refused (kernel max %zu), using %d\n",
-                      what, 64 * nsg, cap, 64 * w);
-    }
-    return w;
-}
+                           int nsg, const char * what);
 
 // Build a plane-GEMV program, narrowing NSG until every GEMV it exports accepts
 // the workgroup. NSG is compile-time, so a refusal means rebuilding, not
