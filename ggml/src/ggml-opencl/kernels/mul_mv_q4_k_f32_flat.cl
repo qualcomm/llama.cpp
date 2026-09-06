@@ -104,6 +104,10 @@ kernel void kernel_mul_mv_q4_K_f32_flat(
     int r1 = get_group_id(1);
     int im = get_group_id(2);
     int first_row = (r0 * N_SIMDGROUP + get_sub_group_id()) * N_DST;
+    // The x-grid is padded to whole subgroup row-groups, so the tail subgroups hold
+    // first_row >= ne01 and the unguarded fetches below would read past src0. Slide the
+    // window back; the rows it repeats are stored identically by the subgroup that owns them.
+    first_row = min(first_row, max(ne01 - N_DST, 0));
 
     int i12 = im%ne12;
     int i13 = im/ne12;
@@ -160,13 +164,6 @@ kernel void kernel_mul_mv_q4_K_f32_flat(
         global half   * dm = blk_dm + ib;
 
         for (int row = 0; row < N_DST; row++) {
-          // Skip rows past the end of the weight. The x-grid is padded to whole
-          // N_SIMDGROUP*N_DST groups, so the tail subgroups hold first_row >= ne01
-          // and these fetches would run past src0_q / src0_s / src0_d / src0_dm.
-          // The lanes stay active for the sub_group_reduce_add below, and the store
-          // guard already discards their results. No-op when ne01 is a multiple of
-          // N_SIMDGROUP*N_DST.
-          if (first_row + row < ne01) {
             uint3  sv = vload3(0, scu);
             ushort s0 = (ushort)((sv.x >> shsel) & 0xFFFFu);   // was sc[0]
             ushort s2 = (ushort)((sv.y >> shsel) & 0xFFFFu);   // was sc[2]
@@ -208,7 +205,6 @@ kernel void kernel_mul_mv_q4_K_f32_flat(
                                  (acc2.s0 + 1.f/256.f * acc2.s1) * sc8[4] +
                                  (acc2.s2 + 1.f/256.f * acc2.s3) * sc8[5] * 1.f/16.f) -
                          dmin * (sumy.s0 * sc8[2] + sumy.s1 * sc8[3] + sumy.s2 * sc8[6] + sumy.s3 * sc8[7]);
-          }
 
             q1  += blk*64;
             scu += blk*3;   // blk*6 ushorts == blk*3 uints
