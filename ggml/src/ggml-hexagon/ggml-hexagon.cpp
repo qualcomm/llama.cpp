@@ -1984,8 +1984,8 @@ struct ggml_hexagon_opbatch {
 
         const bool is_same_shape = (ar_local->ne[0] == res_tensor->ne[0] && ar_local->ne[1] == res_tensor->ne[1] &&
                                     ar_local->ne[2] == res_tensor->ne[2] && ar_local->ne[3] == res_tensor->ne[3]);
-        const bool is_row_bcast  = (ar_local->ne[0] == res_tensor->ne[0] &&
-                                    res_tensor->ne[1] == 1 && res_tensor->ne[2] == 1 && res_tensor->ne[3] == 1);
+        const bool is_row_bcast  = !is_same_shape && (ar_local->ne[0] == res_tensor->ne[0] && res_tensor->ne[1] == 1 &&
+                                                      res_tensor->ne[2] == 1 && res_tensor->ne[3] == 1);
 
         if (!is_same_shape && !is_row_bcast) return false;
 
@@ -3003,7 +3003,6 @@ static bool ggml_hexagon_precompute_allreduce_params(
     kparams->n_ranks      = (int32_t) n_ranks;
     kparams->is_row_bcast = (has_add && is_row_bcast) ? 1 : 0;
 
-    const uint32_t n_bufs    = n_ranks + 1 + (has_add ? 1 : 0);
     const uint32_t nelem     = (uint32_t) ggml_nelements(dst);
     const uint32_t elem_size = (dst->type == GGML_TYPE_F16) ? sizeof(ggml_fp16_t) : sizeof(float);
     const bool is_contiguous = ggml_is_contiguous(dst);
@@ -3047,6 +3046,7 @@ static bool ggml_hexagon_precompute_allreduce_params(
         const uint32_t rank_nelem = (uint32_t) kparams->rank_nelem;
         const uint32_t n_threads  = (std::min)((uint32_t) sess->n_threads, (std::max)(1u, rank_nelem / 128));
         kparams->n_threads = n_threads;
+        const size_t n_vtcm_buffers = htp_allreduce_vtcm_buffer_count(n_ranks, n_threads, has_add, is_row_bcast);
 
         uint32_t block_elems = 65536;
         if (block_elems > rank_nelem / n_threads && rank_nelem / n_threads > 128) {
@@ -3056,15 +3056,15 @@ static bool ggml_hexagon_precompute_allreduce_params(
 
         kparams->block_elems          = block_elems;
         kparams->vtcm_size_per_thread = 2 * block_elems * elem_size;
-        kparams->vtcm_size            = n_threads * n_bufs * kparams->vtcm_size_per_thread;
+        kparams->vtcm_size            = n_vtcm_buffers * kparams->vtcm_size_per_thread;
 
         while ((size_t) kparams->vtcm_size > sess->vtcm_size && block_elems > 128) {
-            const size_t max_bytes_per_buf = sess->vtcm_size / (n_threads * n_bufs * 2);
+            const size_t max_bytes_per_buf = sess->vtcm_size / (n_vtcm_buffers * 2);
             block_elems = (uint32_t) hex_align_down((size_t) (max_bytes_per_buf / elem_size), 128);
             if (block_elems < 128) break;
             kparams->block_elems          = block_elems;
             kparams->vtcm_size_per_thread = 2 * block_elems * elem_size;
-            kparams->vtcm_size            = n_threads * n_bufs * kparams->vtcm_size_per_thread;
+            kparams->vtcm_size            = n_vtcm_buffers * kparams->vtcm_size_per_thread;
         }
 
         if (sess->vtcm_size < (size_t) kparams->vtcm_size || block_elems < 128) {
@@ -3080,6 +3080,7 @@ static bool ggml_hexagon_precompute_allreduce_params(
         const uint32_t rank_nrows = (uint32_t) kparams->rank_nelem;
         const uint32_t n_threads  = (std::min)((uint32_t) sess->n_threads, (std::max)(1u, rank_nrows));
         kparams->n_threads = n_threads;
+        const size_t n_vtcm_buffers = htp_allreduce_vtcm_buffer_count(n_ranks, n_threads, has_add, is_row_bcast);
 
         const uint32_t row_bytes = ne0 * elem_size;
         const uint32_t row_size_aligned = (uint32_t) hex_align_up(row_bytes, 128);
@@ -3091,14 +3092,14 @@ static bool ggml_hexagon_precompute_allreduce_params(
         kparams->block_elems = block_rows;
 
         kparams->vtcm_size_per_thread = 2 * (block_rows * row_size_aligned);
-        kparams->vtcm_size            = n_threads * n_bufs * kparams->vtcm_size_per_thread;
+        kparams->vtcm_size            = n_vtcm_buffers * kparams->vtcm_size_per_thread;
 
         while ((size_t) kparams->vtcm_size > sess->vtcm_size && block_rows > 1) {
-            const size_t max_rows_per_buf = sess->vtcm_size / (n_threads * n_bufs * 2 * row_size_aligned);
+            const size_t max_rows_per_buf = sess->vtcm_size / (n_vtcm_buffers * 2 * row_size_aligned);
             block_rows = (std::max)(1u, (uint32_t) max_rows_per_buf);
             kparams->block_elems          = block_rows;
             kparams->vtcm_size_per_thread = 2 * (block_rows * row_size_aligned);
-            kparams->vtcm_size            = n_threads * n_bufs * kparams->vtcm_size_per_thread;
+            kparams->vtcm_size            = n_vtcm_buffers * kparams->vtcm_size_per_thread;
             if (max_rows_per_buf == 0) break;
         }
 

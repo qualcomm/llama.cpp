@@ -257,7 +257,8 @@ static int validate_allreduce(
     }
 
     const bool has_add = (octx->op == HTP_OP_ALLREDUCE_ADD);
-    const size_t n_vtcm_buffers = (size_t) (n_ranks + 1) * octx->n_threads + (has_add ? (kparams->is_row_bcast ? 1 : octx->n_threads) : 0);
+    const size_t n_vtcm_buffers = htp_allreduce_vtcm_buffer_count(
+        n_ranks, octx->n_threads, has_add, kparams->is_row_bcast != 0);
     const size_t vtcm_size = n_vtcm_buffers * (size_t) kparams->vtcm_size_per_thread;
     if (vtcm_size != (size_t) kparams->vtcm_size) {
         return HTP_STATUS_INVAL_PARAMS;
