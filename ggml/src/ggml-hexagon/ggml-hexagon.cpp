@@ -3265,16 +3265,16 @@ void ggml_hexagon_session::allocate(const ggml_hexagon_device_config & config) n
     this->valid_queue   = false;
     this->valid_iface   = false;
 
-    this->phys_idx   = phys_idx;
-    this->virt_idx   = virt_idx;
-    this->domain_id  = config.domain_id;
-    this->session_id = 0;
     this->name          = config.name;
+    this->phys_idx      = phys_idx;
+    this->virt_idx      = virt_idx;
+    this->domain_id     = config.domain_id;
+    this->session_id    = 0;
     this->batch_req_seq = 0;
     this->batch_rsp_seq = 0;
     this->last_error    = HTP_STATUS_OK;
 
-    GGML_LOG_DEBUG("ggml-hex: %s allocating new session\n", this->name.c_str());
+    GGML_LOG_DEBUG("ggml-hex: %s allocating new session : domain %u phys-idx %u virt-idx %u\n", this->name.c_str(), this->domain_id, phys_idx, virt_idx);
 
     if (config.domain_id < 0 || config.domain_name.empty()) {
         GGML_LOG_ERROR("ggml-hex: %s: invalid physical CDSP core %d\n", config.name.c_str(), config.physical_idx);
@@ -3283,25 +3283,14 @@ void ggml_hexagon_session::allocate(const ggml_hexagon_device_config & config) n
 
     const std::string & dom_name = config.domain_name;
 
-    // Enable Unsigned PD for all domains
-    {
-        struct remote_rpc_control_unsigned_module u;
-        u.domain = -1;
-        u.enable = 1;
-        int err  = remote_session_control(DSPRPC_CONTROL_UNSIGNED_MODULE, (void *) &u, sizeof(u));
-        if (err != AEE_SUCCESS) {
-            GGML_LOG_ERROR("ggml-hex: %s failed to enable unsigned PD : error 0x%x\n", this->c_name(), err);
-            throw std::runtime_error("ggml-hex: remote_session_control(unsign) failed (see log for details)");
-        }
-    }
-
     // Create new session if virtual_idx > 0
     if (virt_idx > 0) {
-        struct remote_rpc_reserve_new_session n;
+        struct remote_rpc_reserve_new_session n {};
         n.domain_name_len  = dom_name.size();
         n.domain_name      = const_cast<char *>(dom_name.c_str());
         n.session_name     = const_cast<char *>(this->name.c_str());
         n.session_name_len = this->name.size();
+        n.session_id       = virt_idx;
 
         int err = remote_session_control(FASTRPC_RESERVE_NEW_SESSION, (void *) &n, sizeof(n));
         if (err != AEE_SUCCESS) {
@@ -3315,7 +3304,7 @@ void ggml_hexagon_session::allocate(const ggml_hexagon_device_config & config) n
         this->domain_id     = n.effective_domain_id;
         this->valid_session = true;
     } else {
-        struct remote_rpc_effective_domain_id eff = {};
+        struct remote_rpc_effective_domain_id eff {};
         eff.domain_name     = const_cast<char *>(dom_name.c_str());
         eff.domain_name_len = dom_name.size();
         eff.session_id      = 0;
@@ -3326,6 +3315,18 @@ void ggml_hexagon_session::allocate(const ggml_hexagon_device_config & config) n
         } else {
             GGML_LOG_DEBUG("ggml-hex: %s FASTRPC_GET_EFFECTIVE_DOMAIN_ID returned 0x%x, using domain_id %d\n",
                            this->name.c_str(), err, this->domain_id);
+        }
+    }
+
+    // Enable unsigned modules
+    {
+        struct remote_rpc_control_unsigned_module u;
+        u.domain = this->domain_id;
+        u.enable = 1;
+        int err  = remote_session_control(DSPRPC_CONTROL_UNSIGNED_MODULE, (void *) &u, sizeof(u));
+        if (err != AEE_SUCCESS) {
+            GGML_LOG_ERROR("ggml-hex: %s failed to enable unsigned PD : error 0x%x\n", this->c_name(), err);
+            throw std::runtime_error("ggml-hex: remote_session_control(unsign) failed (see log for details)");
         }
     }
 
@@ -3356,7 +3357,7 @@ void ggml_hexagon_session::allocate(const ggml_hexagon_device_config & config) n
     // Open session
     int err = htp_iface_open(session_uri, &this->handle);
     if (err != AEE_SUCCESS) {
-        GGML_LOG_ERROR("ggml-hex: %s failed to open session : error 0x%x\n", this->c_name(), err);
+        GGML_LOG_ERROR("ggml-hex: %s failed to open session : uri %s error 0x%x\n", this->c_name(), session_uri, err);
         throw std::runtime_error("ggml-hex: failed to open session (see log for details)");
     }
 
