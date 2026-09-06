@@ -297,12 +297,12 @@ Unlike host-level tensor-splitting, row-splitting is executed entirely inside th
 
 ```bash
 ./scripts/snapdragon/run.py --target adb \
-    --devices HTP0[0-1] -- \
+    --devices 'HTP0[0-1]' -- \
     llama-cli -m models/Llama-3.2-3B-Instruct-Q4_0.gguf -ngl 99 -p "Hello"
 ```
 
-You can also combine row-splitting with layer-splitting across multiple grouped devices (e.g. `--devices HTP0[0-1],HTP1[2-3]`
-on 4 physical NPUs, or `--devices HTP0[0-1:0],HTP1[0-1:1]` on 2 physical NPUs using virtual sessions 0 and 1).
+You can also combine row-splitting with layer-splitting across multiple grouped devices (e.g. `--devices 'HTP0[0-1],HTP1[2-3]'`
+on 4 physical NPUs, or `--devices 'HTP0[0-1:0],HTP1[0-1:1]'` on 2 physical NPUs using virtual sessions 0 and 1).
 
 ## Environment variables
 
@@ -363,4 +363,3 @@ on 4 physical NPUs, or `--devices HTP0[0-1:0],HTP1[0-1:1]` on 2 physical NPUs us
   # Disable ADD and SUB on Hexagon (fall back to CPU or GPU)
   ./scripts/snapdragon/run.py --target adb --hex-opfilter "ADD|SUB" -- llama-cli ...
   ```
-
