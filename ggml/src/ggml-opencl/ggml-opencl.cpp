@@ -8180,6 +8180,17 @@ inline bool use_adreno_kernels(const ggml_backend_opencl_context *backend_ctx, c
     bool threashold_ok = tensor->ne[0] >= threshold_ne0 && tensor->ne[1] >= threshold_ne1 &&
             tensor->ne[2] == 1 && tensor->ne[3] == 1;
 
+    // The transposed layout is built by transpose_2d_as_16b over M rows and K/4 (q) /
+    // K/32 (d) columns, so it needs K % 32 == 0 and M % 4 == 0; set_tensor and get_tensor
+    // both assert on them. A legal weight that misses them -- a 2D weight with ne1 % 4 != 0
+    // -- has to be declined here so it takes the flat path, rather than admitted and then
+    // aborted over a shape the backend is not obliged to accelerate. The rule below is
+    // stricter for the types that carry it, so in practice this covers q4_0, q4_1, q5_0,
+    // q5_1 and iq4_nl.
+    if (tensor->ne[0] % 32 != 0 || tensor->ne[1] % 4 != 0) {
+        return false;
+    }
+
     // The noshuffle layout packs 2 rows per 32-bit texel and the GEMV reads it at an
     // ne1/2 texel stride with an exact-cover dispatch, so it is only addressable when
     // ne1 is a multiple of 64; an unaligned ne1 truncates the stride and the weight is
