@@ -1119,6 +1119,7 @@ struct ggml_backend_opencl_context {
 
     // On-disk compiled-program cache (opt-in via GGML_OPENCL_KERNEL_CACHE_DIR).
     cl_program_cache_state program_cache;
+    bool program_cache_initialised = false;   // init once, not per allocation
 
     // prealloc buffers for transposing weights and activations
     ggml_cl_buffer prealloc_quant_trans;
@@ -19241,7 +19242,13 @@ static ggml_backend_buffer_t ggml_backend_opencl_buffer_type_alloc_buffer(ggml_b
     // On-disk cl_program binary cache — opt-in via GGML_OPENCL_KERNEL_CACHE_DIR.
     // Must be initialised before load_cl_kernels() so it can intercept the
     // build_program_from_source path that load_cl_kernels triggers.
-    backend_ctx->program_cache = cl_program_cache_init(backend_ctx->device);
+    //
+    // ONCE, not per allocation: this queries the device and touches the filesystem,
+    // and this function runs on every buffer allocation.
+    if (!backend_ctx->program_cache_initialised) {
+        backend_ctx->program_cache = cl_program_cache_init(backend_ctx->device);
+        backend_ctx->program_cache_initialised = true;
+    }
 
     // Must precede load_cl_kernels(): the large-buffer compile option cannot be retrofitted.
     ggml_opencl_maybe_enable_large_buffer(backend_ctx, size);
