@@ -1470,8 +1470,6 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mv_iq2_xxs_f32_flat_splitk = nullptr;  // K split across workgroups
     cl_kernel kernel_mul_mv_iq2_xxs_f32_flat_glu = nullptr;  // fused ffn_gate+ffn_up+GLU
     cl_kernel kernel_mul_mv_iq2_xs_f32_flat  = nullptr;
-    cl_kernel kernel_mul_mv_q3_k_f32_flat_splitk = nullptr;   // workgroup-level K split
-    cl_kernel kernel_mul_mv_q2_k_f32_flat_splitk = nullptr;   // workgroup-level K split
     cl_kernel kernel_mul_mv_iq2_s_f32_flat;
     cl_kernel kernel_mul_mv_iq2_s_f32_flat_mc  = nullptr;  // 2 columns per workgroup, ne11 2..31
     cl_kernel kernel_mul_mv_iq2_s_f32_flat_mc4 = nullptr;  // 4 columns, used when 4 divides ne11
