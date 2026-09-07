@@ -15436,6 +15436,57 @@ static bool ggml_opencl_can_fuse(const ggml_backend_opencl_context * backend_ctx
         if (wg_q4_k && (use_q4k_tiled(backend_ctx, gate->src[0]) || use_q4k_tiled(backend_ctx, up->src[0]))) {
             return false;
         }
+        // 🔴 Decline the class the dispatcher would run at nsg=8 (see the nsg_y
+        // heuristic in ggml_cl_mul_mat_q4_k_glu_fused: K >= 4096 -> 1, else
+        // M % 128 != 0 -> 4, else 8). That class is the ONLY one in which the fused
+        // kernel has been observed to compute wrong values, and it is not worth
+        // anything to keep.
+        //
+        // Falcon-H1-7B-Q4_K_M (K=3072, M=12288) lands there and is WRONG -- not
+        // merely non-deterministic. Decode step 0, ffn_swiglu-0 float sum vs the
+        // unfused per-op path (llama-nodehash, fused kernel confirmed firing):
+        //
+        //     unfused      71.670833      nsg=1   71.670841   <- agrees
+        //     nsg=2       -23.209502      nsg=4   -9.837156   nsg=8   75.938068
+        //
+        // The whole-model symptom is multilingual garbage from the first token.
+        // No shape rule predicts which members of this class break: Llama-3.2-3B
+        // (K=3072, M=8192) and gemma-4-E4B (K=2560, M=10240) are CORRECT at nsg=8 at
+        // the same K / the same M % 128 == 0, so this is the same uncharacterised
+        // defect as the q4_0 twin, not something a tighter bound can express.
+        //
+        // Declining costs ~nothing because the fusion does not pay in this class
+        // anyway (X2-90 tg128, fused vs GGML_OPENCL_FUSE_MM_GLU=0):
+        //
+        //     gemma-4-E4B      25.18 vs 25.86   fusion already a 2.6% LOSS
+        //     Llama-3.2-3B     46.86 vs 45.88   fusion +2.1%
+        //     Falcon-H1        10.96 vs 15.06   fusion a 27% LOSS (and wrong)
+        //
+        // The two classes that DO pay are kept, and both are verified correct here:
+        // nsg=4 (M % 128 != 0; gemma-4-26B-A4B +26.6%) and nsg=1 (K >= 4096; muse
+        // +0.7%, correct by construction -- no cross-subgroup reduce at all).
+        //
+        // 🔴 X2E-SCOPED ON PURPOSE. Falcon-H1 was run on the rest of the Adreno fleet with
+        // the fusion FIRING at the identical K=3072 M=12288 nsg=8 (confirmed via
+        // GGML_OPENCL_FUSE_DEBUG, not assumed) and every one of them is COHERENT:
+        //
+        //     840 (A8X)  ok     740 (A7X)  ok     850 (E17)  ok     X2-90  GARBAGE
+        //
+        // and the decline is NOT free off X2 (Qwen3-1.7B-Q4_K_M tg64, fusion on vs off):
+        // 850 0.750 -> 0.634 (-15%), 740 14.18 -> 12.96 (-8.6%). So a fleet-wide decline
+        // would pay a real cost everywhere to guard a defect only this generation has.
+        //
+        // The structural explanations are excluded on X2E: the reduce barrier is outside
+        // the divergent store, every weight/scale/activation fetch is exactly in range at
+        // this shape, and clGetKernelSubGroupInfo reports sg_size=64 / sg_count=8 for the
+        // 64x8 NDRange, so subgroups map one-per-row and the slid<4 activation broadcast
+        // stays convergent. That leaves X2E code generation -- the same place the q4_0
+        // twin's defect was never explained either. Widen this gate only on a NEW
+        // measurement, and narrow it only with a mechanism.
+        if (wg_q4_k && backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E &&
+            gate->src[0]->ne[0] < 4096 && (gate->src[0]->ne[1] % 128) == 0) {
+            return false;
+        }
         // that noshuffle layout is only produced at set_tensor time when
         // use_adreno_kernels() accepts the weight (ne0 >= 512 && ne1 >= 512).
         // Smaller weights stay in the plain q4_K layout, which this kernel would
