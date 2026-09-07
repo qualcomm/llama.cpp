@@ -2426,6 +2426,16 @@ static bool ggml_cl_adreno_x2_class(const ggml_backend_opencl_context * backend_
 
 static bool adreno_art_compiler_quirks(const ggml_backend_opencl_context * backend_ctx);   // defined below
 
+// The grid dequant in the IQ l4_lm prefill GEMMs is only correct on an X2-class part
+// with the E031 compiler. Adreno 740 and 619 return +-inf from it, and so does the
+// Adreno 850, whose E17 compiler produces inf against a finite CPU result at
+// m = 1, n = 64. Everything else falls back to the decode GEMV, which is correct on
+// every part.
+static bool ggml_cl_iq_grid_gemm_ok(const ggml_backend_opencl_context * backend_ctx) {
+    return ggml_cl_adreno_x2_class(backend_ctx) && !adreno_art_compiler_quirks(backend_ctx);
+}
+
+
 // Which generations run the plane split at all. A7X and newer; A6X is excluded
 // because it has never been measured there, and an unknown part is excluded
 // because the split has no AoS fallback once a weight is converted.
@@ -36606,7 +36616,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             case GGML_TYPE_IQ3_XXS: {
                 // The grid dequant in this GEMM is only correct from A8X on:
                 // Adreno 740 and 619 return +-inf for it. Older parts use the GEMV.
-                if (adreno_gen_level(backend_ctx->adreno_gen) < GEN_LEVEL_X2) {
+                if (!ggml_cl_iq_grid_gemm_ok(backend_ctx)) {
                     break;
                 }
                 if (ne11 < 32) {
@@ -36653,7 +36663,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             case GGML_TYPE_IQ3_S: {
                 // The grid dequant in this GEMM is only correct from A8X on:
                 // Adreno 740 and 619 return +-inf for it. Older parts use the GEMV.
-                if (adreno_gen_level(backend_ctx->adreno_gen) < GEN_LEVEL_X2) {
+                if (!ggml_cl_iq_grid_gemm_ok(backend_ctx)) {
                     break;
                 }
                 if (ne11 < 32) {
@@ -36700,7 +36710,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             case GGML_TYPE_IQ2_XXS: {
                 // The grid dequant in this GEMM is only correct from A8X on:
                 // Adreno 740 and 619 return +-inf for it. Older parts use the GEMV.
-                if (adreno_gen_level(backend_ctx->adreno_gen) < GEN_LEVEL_X2) {
+                if (!ggml_cl_iq_grid_gemm_ok(backend_ctx)) {
                     break;
                 }
                 if (ne11 < 32) {
@@ -36747,7 +36757,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             case GGML_TYPE_IQ2_XS: {
                 // The grid dequant in this GEMM is only correct from A8X on:
                 // Adreno 740 and 619 return +-inf for it. Older parts use the GEMV.
-                if (adreno_gen_level(backend_ctx->adreno_gen) < GEN_LEVEL_X2) {
+                if (!ggml_cl_iq_grid_gemm_ok(backend_ctx)) {
                     break;
                 }
                 if (ne11 < 32) {
@@ -36794,7 +36804,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             case GGML_TYPE_IQ2_S: {
                 // The grid dequant in this GEMM is only correct from A8X on:
                 // Adreno 740 and 619 return +-inf for it. Older parts use the GEMV.
-                if (adreno_gen_level(backend_ctx->adreno_gen) < GEN_LEVEL_X2) {
+                if (!ggml_cl_iq_grid_gemm_ok(backend_ctx)) {
                     break;
                 }
                 if (ne11 < 32) {
@@ -36843,6 +36853,9 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     break;
                 }
                 if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1)) {
+                    break;
+                }
+                if (!ggml_cl_iq_grid_gemm_ok(backend_ctx)) {
                     break;
                 }
 
