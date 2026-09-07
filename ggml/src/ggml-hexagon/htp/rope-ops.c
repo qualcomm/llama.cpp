@@ -17,8 +17,8 @@
 #include "ggml-common.h"
 #include "htp-ctx.h"
 #include "htp-ops.h"
-#include "htp-ops.h"
 #include "htp-tensor.h"
+#include "rope-ops.h"
 
 // Redefined the rope type constants as we can't include ggml.h
 #define HTP_ROPE_TYPE_NORMAL 0
@@ -26,14 +26,6 @@
 #define HTP_ROPE_TYPE_MROPE  8
 #define HTP_ROPE_TYPE_VISION 24
 #define HTP_ROPE_TYPE_IMROPE 40
-
-#define HTP_ROPE_SPAD_BLOCK  8
-#define HTP_ROPE_SPAD_NSLOTS 4
-#define HTP_ROPE_SPAD_NROWS  (HTP_ROPE_SPAD_BLOCK * HTP_ROPE_SPAD_NSLOTS)
-
-static inline uint8_t * rope_spad_slot(uint8_t * base, uint32_t slot, size_t row_size_aligned) {
-    return base + (slot * HTP_ROPE_SPAD_BLOCK) * row_size_aligned;
-}
 
 #define htp_rope_preamble              \
     const uint32_t ne00 = src0->ne[0]; \
@@ -705,8 +697,6 @@ static int execute_op_rope_f32(struct htp_ops_context * octx) {
     const struct htp_tensor * src2 = octx->src[2];
     const struct htp_tensor * dst  = octx->dst;
 
-    const char * op_type = "rope-f32";
-
     switch (octx->op) {
         case HTP_OP_ROPE:
             break;
@@ -716,38 +706,23 @@ static int execute_op_rope_f32(struct htp_ops_context * octx) {
             return HTP_STATUS_NO_SUPPORT;
     }
 
-    const uint32_t ne0 = dst->ne[0];
-    const uint32_t src0_nrows = src0->ne[1] * src0->ne[2] * src0->ne[3];
-    const uint32_t n_threads = MIN(octx->n_threads, src0_nrows);
+    const struct htp_rope_kernel_params * kparams = (const struct htp_rope_kernel_params *) octx->kernel_params;
+    assert(kparams->n_threads > 0);
+    assert(octx->ctx->vtcm_size >= kparams->vtcm_size);
 
+    const uint32_t ne0 = dst->ne[0];
     const size_t src0_row_size   = src0->ne[0] * sizeof(float);
     const size_t src0_row_stride = src0->nb[1];
     const size_t dst_row_size    = dst->ne[0] * sizeof(float);
     const size_t dst_row_stride  = dst->nb[1];
-
-    // Aligned row sizes for VTCM
-    const size_t src0_row_size_aligned    = hex_round_up(src0_row_size, VLEN);
-    const size_t dst_row_size_aligned     = hex_round_up(dst_row_stride, VLEN);
-    const size_t theta_cache_size_aligned = hex_round_up(src0->ne[0] * sizeof(float), 256);
-
-    // Calculate spad sizes per thread
-    size_t src0_spad_per_thread = theta_cache_size_aligned + HTP_ROPE_SPAD_NROWS * src0_row_size_aligned;
-    size_t spad_per_thread = src0_spad_per_thread;
-
-    // Check if we fit in VTCM
-    size_t total_vtcm_needed = spad_per_thread * n_threads;
-    if (octx->ctx->vtcm_size < total_vtcm_needed) {
-        FARF(ERROR, "%s : current VTCM reservation %zu is too small, needed %zu\n", op_type, octx->ctx->vtcm_size, total_vtcm_needed);
-        return HTP_STATUS_VTCM_TOO_SMALL;
-    }
 
     struct htp_rope_context rctx;
     memset(&rctx, 0, sizeof(struct htp_rope_context));
 
     rctx.octx                  = octx;
     rctx.vtcm_base             = (uint8_t *) octx->ctx->vtcm_base;
-    rctx.spad_per_thread       = spad_per_thread;
-    rctx.theta_cache_offset    = theta_cache_size_aligned;
+    rctx.spad_per_thread       = kparams->spad_per_thread;
+    rctx.theta_cache_offset    = kparams->theta_cache_offset;
 
     const int32_t * op_params = &octx->op_params[0];
     rctx.n_dims     = ((const int32_t *) op_params)[1];
@@ -772,25 +747,22 @@ static int execute_op_rope_f32(struct htp_ops_context * octx) {
 
     rope_corr_dims(rctx.n_dims, rctx.n_ctx_orig, rctx.freq_base, rctx.beta_fast, rctx.beta_slow, rctx.corr_dims);
 
-    rctx.src0_row_size   = src0_row_size;
-    rctx.src0_row_stride = src0_row_stride;
-    rctx.dst_row_size    = dst_row_size;
-    rctx.dst_row_stride  = dst_row_stride;
-    rctx.src0_row_size_aligned = src0_row_size_aligned;
-    rctx.dst_row_size_aligned  = dst_row_size_aligned;
+    rctx.src0_row_size         = src0_row_size;
+    rctx.src0_row_stride       = src0_row_stride;
+    rctx.dst_row_size          = dst_row_size;
+    rctx.dst_row_stride        = dst_row_stride;
+    rctx.src0_row_size_aligned = kparams->src0_row_size_aligned;
+    rctx.dst_row_size_aligned  = kparams->dst_row_size_aligned;
 
-    rctx.src0_nrows = src0_nrows;
-    rctx.src0_nrows_per_thread = (src0_nrows + n_threads - 1) / n_threads;
-
-    if (src0_nrows > 0) {
-        rctx.div_ne2_ne1 = init_fastdiv_values(dst->ne[2] * dst->ne[1]);
-        rctx.div_ne1     = init_fastdiv_values(dst->ne[1]);
-    }
+    rctx.src0_nrows            = kparams->src0_nrows;
+    rctx.src0_nrows_per_thread = kparams->src0_nrows_per_thread;
+    rctx.div_ne2_ne1           = kparams->div_ne2_ne1;
+    rctx.div_ne1               = kparams->div_ne1;
 
     FARF(HIGH, "rope-f32 n-rows %u n-dims %d ne0 %u ext-factor %.6f theta-scale %.6f attn-factor %.6f\n", rctx.src0_nrows, rctx.n_dims, ne0,
          rctx.ext_factor, rctx.theta_scale, rctx.attn_factor);
 
-    work_queue_run(octx->ctx->work_queue, rope_job_f32, &rctx, n_threads);
+    work_queue_run(octx->ctx->work_queue, rope_job_f32, &rctx, kparams->n_threads);
 
     return err;
 }

@@ -56,6 +56,7 @@
 #include "htp/unary-ops.h"
 #include "htp/get-rows-ops.h"
 #include "htp/set-rows-ops.h"
+#include "htp/rope-ops.h"
 #include "htp_iface.h"
 #include "htp-drv.h"
 
@@ -297,6 +298,12 @@ static void ggml_hexagon_precompute_set_rows_params(
     const struct ggml_tensor * src1,
     const struct ggml_tensor * dst,
     struct htp_set_rows_kernel_params * kparams
+);
+
+static void ggml_hexagon_precompute_rope_params(
+    const struct ggml_hexagon_session * sess,
+    const struct ggml_tensor * op,
+    struct htp_rope_kernel_params * kparams
 );
 
 static void ggml_hexagon_precompute_fused_mmnx_params(
@@ -4148,6 +4155,37 @@ static void ggml_hexagon_precompute_set_rows_params(
     kparams->vtcm_size = vtcm_layout.total_bytes;
 }
 
+static void ggml_hexagon_precompute_rope_params(
+    const struct ggml_hexagon_session * sess,
+    const struct ggml_tensor * op,
+    struct htp_rope_kernel_params * kparams
+) {
+    memset(kparams, 0, sizeof(*kparams));
+
+    const struct ggml_tensor * src0 = op->src[0];
+    const struct ggml_tensor * dst  = op;
+
+    const uint32_t src0_nrows = src0->ne[1] * src0->ne[2] * src0->ne[3];
+    const uint32_t n_threads  = (std::min)((uint32_t) sess->n_threads, src0_nrows);
+
+    struct htp_rope_vtcm_layout layout;
+    htp_rope_vtcm_layout_build(&layout, src0->ne[0], dst->nb[1], n_threads);
+
+    kparams->n_threads              = n_threads;
+    kparams->src0_nrows             = src0_nrows;
+    kparams->src0_nrows_per_thread  = (src0_nrows + n_threads - 1) / n_threads;
+    kparams->vtcm_size              = (uint32_t) layout.total_bytes;
+    kparams->spad_per_thread        = (uint32_t) layout.bytes_per_thread;
+    kparams->theta_cache_offset     = (uint32_t) layout.theta_cache_size_aligned;
+    kparams->src0_row_size_aligned  = (uint32_t) layout.src0_row_size_aligned;
+    kparams->dst_row_size_aligned   = (uint32_t) layout.dst_row_size_aligned;
+
+    if (src0_nrows > 0) {
+        kparams->div_ne2_ne1 = init_fastdiv_values(dst->ne[2] * dst->ne[1]);
+        kparams->div_ne1     = init_fastdiv_values(dst->ne[1]);
+    }
+}
+
 static void ggml_hexagon_precompute_fused_mmnx_params(
     const struct ggml_hexagon_session * sess,
     const struct ggml_tensor * src0, // W0
@@ -4768,9 +4806,16 @@ static bool ggml_hexagon_supported_rope(const struct ggml_hexagon_session * sess
     if (src0->nb[1] < src0->ne[0] * sizeof(float) || dst->nb[1] < dst->ne[0] * sizeof(float)) {
         return false;
     }
-    return true;
+    const uint32_t src0_nrows = src0->ne[1] * src0->ne[2] * src0->ne[3];
+    const uint32_t n_threads  = (std::min)((uint32_t) sess->n_threads, src0_nrows);
 
-    GGML_UNUSED(sess);
+    struct htp_rope_vtcm_layout layout;
+    htp_rope_vtcm_layout_build(&layout, src0->ne[0], dst->nb[1], n_threads);
+    if (layout.total_bytes > sess->vtcm_size) {
+        return false;
+    }
+
+    return true;
 }
 
 static bool ggml_hexagon_supported_ssm_conv(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op) {
@@ -5203,6 +5248,11 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
                 ggml_hexagon_precompute_set_rows_params(sess,
                     node.node->src[0], node.node->src[1], node.dst(),
                     (struct htp_set_rows_kernel_params *)node.kernel_params
+                );
+            } else if (node.opcode == HTP_OP_ROPE) {
+                ggml_hexagon_precompute_rope_params(sess,
+                    node.node,
+                    (struct htp_rope_kernel_params *)node.kernel_params
                 );
             }
             computed_nodes.push_back(std::move(node));
