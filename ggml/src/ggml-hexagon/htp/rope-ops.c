@@ -75,9 +75,12 @@ struct htp_rope_context {
     float corr_dims[2];
 
     uint32_t src0_nrows_per_thread;
-    size_t spad_stride;
 
     struct htp_ops_context * octx;
+
+    uint8_t * vtcm_base;
+    size_t    spad_per_thread;
+    size_t    theta_cache_offset;
 
     size_t src0_row_size;
     size_t src0_row_stride;
@@ -85,13 +88,10 @@ struct htp_rope_context {
     size_t dst_row_stride;
     size_t src0_row_size_aligned;
     size_t dst_row_size_aligned;
-    size_t theta_cache_offset;
     uint32_t src0_nrows;
 
     struct fastdiv_values div_ne2_ne1;
     struct fastdiv_values div_ne1;
-
-    uint64_t t_start;
 };
 
 static float rope_yarn_ramp(const float low, const float high, const int i0) {
@@ -559,15 +559,13 @@ static void rope_job_f32(unsigned int nth, unsigned int ith, void * data) {
         return;
     }
 
-    uint64_t tt = HAP_perf_get_qtimer_count();
-
     const int32_t mode    = rctx->mode;
     // MROPE, IMROPE and VISION use NEOX-style pairing for the rotation
     const bool    is_neox = (mode & HTP_ROPE_TYPE_NEOX) || (mode & HTP_ROPE_TYPE_MROPE);
     const bool    is_vision = (mode == HTP_ROPE_TYPE_VISION);
 
     // VTCM setup
-    uint8_t * src0_spad_base = octx->src0_spad.data + (ith * octx->src0_spad.size_per_thread);
+    uint8_t * src0_spad_base = rctx->vtcm_base + (ith * rctx->spad_per_thread);
     float *   theta_cache    = (float *) (src0_spad_base);
               src0_spad_base = src0_spad_base + rctx->theta_cache_offset;
 
@@ -695,9 +693,8 @@ static void rope_job_f32(unsigned int nth, unsigned int ith, void * data) {
 
 done:
     dma_queue_flush(dma_queue);
-    tt = HAP_perf_get_qtimer_count() - tt;
 
-    FARF(HIGH, "rope-f32: %d/%d: (%u:%u) usec %u\n", ith, nth, src0_start_row, src0_end_row, (unsigned) HAP_perf_qtimer_count_to_us(tt));
+    FARF(HIGH, "rope-f32: %d/%d: (%u:%u)\n", ith, nth, src0_start_row, src0_end_row);
 }
 
 static int execute_op_rope_f32(struct htp_ops_context * octx) {
@@ -744,22 +741,13 @@ static int execute_op_rope_f32(struct htp_ops_context * octx) {
         return HTP_STATUS_VTCM_TOO_SMALL;
     }
 
-    octx->src0_spad.size_per_thread = src0_spad_per_thread;
-    octx->dst_spad.size_per_thread  = 0;
-    octx->src0_spad.size = n_threads * src0_spad_per_thread;
-    octx->dst_spad.size  = 0;
-    octx->src1_spad.size = 0;
-
-    octx->src0_spad.data = octx->ctx->vtcm_base;                        octx->src0_spad.src = NULL;
-    octx->src1_spad.data = NULL;                                        octx->src1_spad.src = NULL;
-    octx->dst_spad.data  = NULL;                                        octx->dst_spad.src  = NULL;
-
     struct htp_rope_context rctx;
     memset(&rctx, 0, sizeof(struct htp_rope_context));
 
-    rctx.t_start = HAP_perf_get_qtimer_count();
-
-    rctx.octx = octx;
+    rctx.octx                  = octx;
+    rctx.vtcm_base             = (uint8_t *) octx->ctx->vtcm_base;
+    rctx.spad_per_thread       = spad_per_thread;
+    rctx.theta_cache_offset    = theta_cache_size_aligned;
 
     const int32_t * op_params = &octx->op_params[0];
     rctx.n_dims     = ((const int32_t *) op_params)[1];
@@ -790,7 +778,6 @@ static int execute_op_rope_f32(struct htp_ops_context * octx) {
     rctx.dst_row_stride  = dst_row_stride;
     rctx.src0_row_size_aligned = src0_row_size_aligned;
     rctx.dst_row_size_aligned  = dst_row_size_aligned;
-    rctx.theta_cache_offset    = theta_cache_size_aligned;
 
     rctx.src0_nrows = src0_nrows;
     rctx.src0_nrows_per_thread = (src0_nrows + n_threads - 1) / n_threads;
@@ -803,9 +790,7 @@ static int execute_op_rope_f32(struct htp_ops_context * octx) {
     FARF(HIGH, "rope-f32 n-rows %u n-dims %d ne0 %u ext-factor %.6f theta-scale %.6f attn-factor %.6f\n", rctx.src0_nrows, rctx.n_dims, ne0,
          rctx.ext_factor, rctx.theta_scale, rctx.attn_factor);
 
-    if (!(octx->flags & HTP_OPFLAGS_SKIP_COMPUTE)) {
-        worker_pool_run_func(octx->ctx->worker_pool, rope_job_f32, &rctx, n_threads);
-    }
+    work_queue_run(octx->ctx->work_queue, rope_job_f32, &rctx, n_threads);
 
     return err;
 }
