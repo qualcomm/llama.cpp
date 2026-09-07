@@ -18125,22 +18125,17 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                     op->src[0]->ne[1] >= 32768) {   // vocab-scale weight; no FFN/attn weight is this tall
                     return false;
                 }
-                // The generic mul_mv (GEMV) kernels are wrong for large-batch prefill on
-                // Adreno. A quant mul_mat only avoids the GEMV when it reaches the Adreno
-                // trans-weight GEMM, which needs both a GEMM kernel for the type and
-                // use_adreno_kernels(). Decline the large-N shapes that would otherwise
-                // fall through to the GEMV.
-                {
-                    const ggml_type t = op->src[0]->type;
-                    const bool type_has_gemm = (t == GGML_TYPE_Q4_0 || t == GGML_TYPE_Q4_1 ||
-                                                t == GGML_TYPE_IQ4_NL || t == GGML_TYPE_Q8_0 ||
-                                                t == GGML_TYPE_Q4_K  || t == GGML_TYPE_Q5_K  ||
-                                                t == GGML_TYPE_Q6_K);
-                    const bool uses_gemm = type_has_gemm && use_adreno_kernels(backend_ctx, op->src[0]);
-                    if (!uses_gemm && op->src[1]->ne[1] >= 512) {
-                        return false;
-                    }
-                }
+                // NOTE: the large-N GEMV guard for this type set is applied ONCE, at the
+                // top of this branch, in the form that lets small-output projections
+                // through (see the GGML_OPENCL_GEMV_LARGE_N_GUARD_ALL block above). A
+                // second, blanket copy of it used to sit here; it re-rejected weights with
+                // ne1 < 512 and so undid that escape. Because supports_op is what
+                // llama.cpp's weight_buft_supported() probes at LOAD time -- with a dummy
+                // activation of exactly ne1 = 512 -- the blanket form does not merely
+                // decline a prefill dispatch: it pins the weight to the CPU buffer for the
+                // whole process, so DECODE runs it on CPU too. On muse-glimmer-30B (GQA
+                // K/V = 2 x 128 = 256 rows) that cost 106 MiB of weights off the GPU and
+                // -9.5% tg. Keep the guard in one place.
                 return op->src[1]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]);
             } else if (op->src[0]->type == GGML_TYPE_Q8_0) {
                 // ggml_cl_mul_mat_q8_0_f32_adreno now honors src1/dst view_offs (the
