@@ -6702,8 +6702,17 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif // GGML_OPENCL_USE_ADRENO_KERNELS
 
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
-    // Adreno xmem SDPA
-    if (backend_ctx->gpu_family == GPU_FAMILY::ADRENO) {
+    // Adreno xmem SDPA.
+    //
+    // The path itself is opt-in (GGML_OPENCL_XMEM_SDPA, checked in ggml_cl_flash_attn),
+    // but the program was built and its twelve kernels created on every Adreno context
+    // regardless. Those kernel objects keep the program resident for the life of the
+    // context, so a default-off path charged every model its device-side footprint and
+    // its compile time. Build it only when the path can actually run; the runtime gate
+    // already declines when .compiled is false.
+    const char * xmem_sdpa_preload = getenv("GGML_OPENCL_XMEM_SDPA");
+    const bool xmem_sdpa_wanted = xmem_sdpa_preload != nullptr && xmem_sdpa_preload[0] != '0';
+    if (xmem_sdpa_wanted && backend_ctx->gpu_family == GPU_FAMILY::ADRENO) {
 #ifdef GGML_OPENCL_EMBED_KERNELS
         const std::string kernel_src {
             #include "sdpa_xmem_f32_f16_os8.cl.h"
