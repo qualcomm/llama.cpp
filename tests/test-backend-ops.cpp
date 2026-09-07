@@ -9627,6 +9627,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // Large-N for the types that reach the generic tiled mul_mm but have NO Adreno
+    // trans-weight GEMM (q5_0 / q5_1). The OpenCL backend decides at load time, with a
+    // dummy activation of exactly n=512, whether a weight may live on the GPU at all, so
+    // a wrong answer here does not merely pick a slow kernel -- it CPU-pins the weight.
+    // m=2816,k=2112 is gemma-4-26B-A4B's shared-expert ffn_down verbatim (q5_0 on 16 of
+    // its 30 layers under the Q4_K_M mixed-quant rule); the band had no coverage at all.
+    for (int n : {1, 8, 512}) {
+        for (ggml_type type_a : {GGML_TYPE_Q5_0, GGML_TYPE_Q5_1}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 2816, n, 2112, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4096, n, 4096, {1, 1}, {1, 1}));
+        }
+    }
+
     // MoE-router shape: f32 x f32, m = n_expert, n = 2..8 tokens, k = n_embd.
     // This is ffn_moe_logits (mul_mat of the F32 ffn_gate_inp), which every MoE
     // emits once per layer. It is the small-N regime where a tiled 64x64 GEMM
