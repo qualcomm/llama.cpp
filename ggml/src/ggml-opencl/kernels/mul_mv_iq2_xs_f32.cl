@@ -187,6 +187,30 @@ REQD_SUBGROUP_SIZE_16
 #elif defined (ADRENO_GPU)
 REQD_SUBGROUP_SIZE_64
 #endif
+// IQ2XS_MV_GRIDIMG=1: read the grid through an image1d_buffer.
+//
+// The image tier beat local memory on IQ1_S (+2.5%) and IQ2_S (+4.4%), and beat
+// __constant on IQ3_S (+10.4%) and IQ3_XXS (+18.8%). This AoS kernel still reads its grid from __constant, the case where it won by more.
+//
+// Filled by kernel_iq2xs_grid_export from the table this kernel compiles in, so the
+// host never duplicates it and the two cannot drift.
+#ifndef IQ2XS_MV_GRIDIMG
+#define IQ2XS_MV_GRIDIMG 0
+#endif
+
+kernel void kernel_iq2xs_grid_export(global uint * out) {
+    const uint i = get_global_id(0);
+    if (i < 1024u) {
+        out[i] = iq2xs_grid[i];
+    }
+}
+
+#if IQ2XS_MV_GRIDIMG
+#define IQ2XS_GRID(i) (read_imageui(grid_img, (int)(i)).x)
+#else
+#define IQ2XS_GRID(i) iq2xs_grid[(i)]
+#endif
+
 kernel void kernel_mul_mv_iq2_xs_f32(
         global char * src0,
         int offset0,
@@ -206,7 +230,8 @@ kernel void kernel_mul_mv_iq2_xs_f32(
         int ne0,
         int ne1,
         int r2,
-        int r3
+        int r3,
+        __read_only image1d_buffer_t grid_img
 ) {
     src0 = src0 + offset0;
     src1 = src1 + offset1;
@@ -260,8 +285,8 @@ kernel void kernel_mul_mv_iq2_xs_f32(
             for (int l = 0; l < 4; ++l) {
                 ushort q  = q16[l];
                 uchar  sg = ksigns_iq2xs[q >> 9];
-                uint   lo = iq2xs_grid[2*(q & 511)+0];
-                uint   hi = iq2xs_grid[2*(q & 511)+1];
+                uint   lo = IQ2XS_GRID(2*(q & 511)+0);
+                uint   hi = IQ2XS_GRID(2*(q & 511)+1);
                 float  a  = 0.f;
                 for (int j = 0; j < 4; ++j) {
                     a += yl[8*l+j+0] * (float)((lo >> (8*j)) & 0xFF) * ((sg & (1 << j))     ? -1.f : 1.f);

@@ -281,13 +281,80 @@ constant uint iq1s_grid_gpu[2048] = {
 
 #define BM 64
 #define BN 64
-#define BK 32
+// K tile of 16 rather than 32: buf_a+buf_b are 2*BM*BK*4 bytes, so this halves
+// local memory per workgroup (16 KB -> 8 KB) and doubles resident workgroups.
+// Measured +24.4% (IQ4_XS) / +27.3% (IQ1_S) prefill on Adreno X2-90; the kernel
+// is occupancy bound on local memory, not bandwidth. BK=8 halves it again but
+// doubles the barrier count a second time and measures worse.
+#ifndef BK
+#define BK 16
+#endif
+#ifndef TM
 #ifdef INTEL_GPU
 #define TM 8
-#define TN 8
 #else
 #define TM 4
+#endif
+#endif
+#ifndef TN
 #define TN 8
+#endif
+
+// LM_HALF=1 keeps the two LDS tiles in half instead of float. buf_a+buf_b are
+// 2*BM*BK*sizeof(elem), so this halves local memory per workgroup again --
+// and unlike shrinking BK it does NOT double the barrier count, which is what
+// made BK=8 lose. Accumulation stays in float; only the staged operands narrow.
+#ifndef LM_HALF
+#define LM_HALF 0
+#endif
+#if LM_HALF
+typedef half lm_st;
+#define LM_LD4(p, i) convert_float4(vload4((i), (p)))
+#else
+typedef float lm_st;
+#define LM_LD4(p, i) vload4((i), (p))
+#endif
+
+// IQ1M_LM_GRIDIMG=1: read the codebook through an image1d_buffer instead of
+// from __constant.
+//
+// This kernel is the fallback prefill GEMM, and on every generation where the
+// feature-major plane split is off it is the ONLY prefill path for this type.
+// The index comes from the thread's own block, so the read is a DIVERGENT gather
+// -- the pattern under which byte and word indexed __constant loads serialize on
+// Adreno. The dp4a twin of this kernel had the identical defect and the image was
+// worth up to +42.3% of prefill there, with perplexity bit-identical because only
+// the memory tier changes and never a value read from it.
+//
+// The image is the singleton the decode GEMV already builds at init on every
+// device, so this costs no memory. Default follows the per-generation texture
+// gate; it is UNMEASURED outside X2-class, and X2-class barely uses this kernel
+// because the split claims those tensors first, so the gate is where the value is.
+// MEASURED, and it is NOT the win the dp4a twin was. With the plane split forced
+// off so this kernel carries the prefill, X2-90:
+//   Llama-3.2-3B-IQ3_M     272.98 -> 274.75  (+0.6%)
+//   Llama-3.2-3B-UD-IQ2_M  236.22 -> 243.17  (+2.9%)
+//   Llama-3.2-3B-UD-IQ1_S  246.86 -> 255.99  (+3.7%)
+// PPL 11.6371 either way.
+//
+// So the same defect is worth 42%% in the dp4a GEMM and ~2%% here. The refinement:
+// a divergent __constant gather costs in proportion to how TIGHT the loop around
+// it is. The dp4a kernel builds eight operands per 32-K step in a very short
+// inner loop; this one computes a TM x TN output tile per thread, so each
+// dequantized weight feeds many multiply-accumulates and the gather amortizes.
+// This kernel is also 2.3x slower than the dp4a GEMM before either change
+// (273 against 618 on IQ3_M), so the codebook was never its limit.
+//
+// Small, consistent and never negative, so it stays on where the gate says so,
+// but do not expect the GEMM number from it.
+#ifndef IQ1M_LM_GRIDIMG
+#define IQ1M_LM_GRIDIMG 0
+#endif
+
+#if IQ1M_LM_GRIDIMG
+#define IQ1M_LM_GRID(i) (read_imageui(grid_img, (int)(i)).x)
+#else
+#define IQ1M_LM_GRID(i) iq1s_grid_gpu[(i)]
 #endif
 
 kernel void kernel_mul_mm_iq1_m_f32_l4_lm(
@@ -313,14 +380,15 @@ kernel void kernel_mul_mm_iq1_m_f32_l4_lm(
     int batch_stride_d,
 
     int r2,
-    int r3
+    int r3,
+    __read_only image1d_buffer_t grid_img   // see IQ1M_LM_GRIDIMG
 ) {
     global block_iq1_m * src0_b = (global block_iq1_m *)(src0 + offset0);
     src1 = (global float4*)((global char*)src1 + offset1);
     dst  = (global float *)((global char*)dst  + offsetd);
 
-    local float buf_a[BM * BK];
-    local float buf_b[BN * BK];
+    local lm_st buf_a[BM * BK];
+    local lm_st buf_b[BN * BK];
 
     const int batch_idx = get_global_id(2);
 
@@ -351,12 +419,15 @@ kernel void kernel_mul_mm_iq1_m_f32_l4_lm(
     int pos_a = batch_idx_a * batch_stride_a + ir * BM * stride_a;
     int pos_b = (batch_idx   * batch_stride_b + ic * BN * stride_b) / LOAD_VEC_B;
 
-    float sums[TM * TN];
-    float cache_a[TM];
-    float cache_b[TN];
+    // Accumulate four rows at a time. buf_a is contiguous in the row index, so a
+    // whole TM slice arrives as float4 loads instead of TM scalar ones, and each
+    // vector mad replaces four scalar ones. Same operands in the same order, so
+    // the result is unchanged.
+    float4 sums4[(TM/4) * TN];
+    float4 cache_a4[TM/4];
 
-    for (int i = 0; i < TM * TN; i++) {
-        sums[i] = 0.0f;
+    for (int i = 0; i < (TM/4) * TN; i++) {
+        sums4[i] = (float4)(0.0f);
     }
 
     for (int block = 0; block < ne00; block += BK) {
@@ -386,7 +457,7 @@ kernel void kernel_mul_mm_iq1_m_f32_l4_lm(
                 float dlt = (qhb & (0x08 << (4*(il%2)))) ? (-1.f - IQ1M_DELTA) : (-1.f + IQ1M_DELTA);
 
                 uint gi = (uint)xb->qs[4*sb+il] | ((((uint)qhb >> (4*(il%2))) & 7) << 8);
-                uint g  = iq1s_grid_gpu[gi];
+                uint g  = IQ1M_LM_GRID(gi);
 
                 float4 v1;
                 v1.s0 = dl * ((float)((g >> ( 0 + sh)) & 0xF) + dlt);
@@ -427,18 +498,15 @@ kernel void kernel_mul_mm_iq1_m_f32_l4_lm(
         pos_b += BK / LOAD_VEC_B;
 
         for (int i = 0; i < BK; i++) {
-            for (int j = 0; j < TM; j++) {
-                cache_a[j] = buf_a[(i) * BM + th_r * TM + j];
-            }
-
-            for (int j = 0; j < TN; j++) {
-                cache_b[j] = buf_b[(i) * BN + th_c * TN + j];
+            for (int a = 0; a < TM/4; a++) {
+                cache_a4[a] = LM_LD4(buf_a + (i) * BM + th_r * TM, a);
             }
 
             for (int cc = 0; cc < TN; cc++) {
-                for (int cr = 0; cr < TM; cr++) {
-                    const int sums_idx = cc*TM + cr;
-                    sums[sums_idx] = mad(cache_a[cr], cache_b[cc], sums[sums_idx]);
+                const float cache_b = buf_b[(i) * BN + th_c * TN + cc];
+                for (int a = 0; a < TM/4; a++) {
+                    const int sums_idx = cc*(TM/4) + a;
+                    sums4[sums_idx] = mad(cache_a4[a], (float4)cache_b, sums4[sums_idx]);
                 }
             }
         }
@@ -451,9 +519,13 @@ kernel void kernel_mul_mm_iq1_m_f32_l4_lm(
     const int offsets = batch_idx * batch_stride_d;
 
     for (int cc = 0; cc < TN; cc++) {
-        for (int cr = 0; cr < TM; cr++) {
-            if (dr + cr < ne01 && dc + cc < ne11) {
-                dst[offsets + (dc + cc) * stride_d + dr + cr] = sums[cc * TM + cr];
+        for (int a = 0; a < TM/4; a++) {
+            const float4 v = sums4[cc * (TM/4) + a];
+            const float  vs[4] = { v.s0, v.s1, v.s2, v.s3 };
+            for (int k = 0; k < 4; k++) {
+                if (dr + 4*a + k < ne01 && dc + cc < ne11) {
+                    dst[offsets + (dc + cc) * stride_d + dr + 4*a + k] = vs[k];
+                }
             }
         }
     }

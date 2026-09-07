@@ -14,6 +14,12 @@
 
 #define QK_K 256
 
+// The quant bytes are read through vloadn rather than one uchar at a time.
+// GGML_OPENCL_IQ_MV_VEC=0 puts the scalar loads back for an A/B.
+#ifndef IQ_MV_VEC
+#define IQ_MV_VEC 1
+#endif
+
 constant float kvalues_iq4nl[16] = {
     -127.f, -104.f, -83.f, -65.f, -49.f, -35.f, -22.f, -10.f,
       1.f,   13.f,  25.f,  38.f,  53.f,  69.f,  89.f, 113.f
@@ -47,6 +53,21 @@ typedef struct {
 #undef  BLOCK_STRIDE
 // 8 threads cover one super block, one sub block each
 #define BLOCK_STRIDE (N_SIMDWIDTH/8)
+
+// One packed uint holds 4 quant bytes = 8 weights. yl points at the activation
+// for the first low nibble; the matching high nibbles are 16 slots further on.
+inline float iq4xs_word(uint w, private float * yl) {
+    float acc = 0.f;
+    acc += yl[ 0] * kvalues_iq4nl[(w      ) & 0xf];
+    acc += yl[16] * kvalues_iq4nl[(w >>  4) & 0xf];
+    acc += yl[ 1] * kvalues_iq4nl[(w >>  8) & 0xf];
+    acc += yl[17] * kvalues_iq4nl[(w >> 12) & 0xf];
+    acc += yl[ 2] * kvalues_iq4nl[(w >> 16) & 0xf];
+    acc += yl[18] * kvalues_iq4nl[(w >> 20) & 0xf];
+    acc += yl[ 3] * kvalues_iq4nl[(w >> 24) & 0xf];
+    acc += yl[19] * kvalues_iq4nl[(w >> 28) & 0xf];
+    return acc;
+}
 
 #ifdef INTEL_GPU
 REQD_SUBGROUP_SIZE_16
@@ -117,13 +138,24 @@ kernel void kernel_mul_mv_iq4_xs_f32(
             int ls = ((xb->scales_l[it/2] >> (4*(it%2))) & 0xf) | (((xb->scales_h >> (2*it)) & 3) << 4);
             float dl = (float)xb->d * (float)(ls - 32);
 
-            global uchar * q = xb->qs + 16*it;
-
             float acc = 0.f;
+#if IQ_MV_VEC
+            // qs sits 8 bytes into a 136 byte block, so uint2 alignment holds
+            // but uint4 does not.
+            global uint2 * q2 = (global uint2 *)(xb->qs + 16*it);
+            uint2 wa = q2[0];
+            uint2 wb = q2[1];
+            acc += iq4xs_word(wa.s0, yl +  0);
+            acc += iq4xs_word(wa.s1, yl +  4);
+            acc += iq4xs_word(wb.s0, yl +  8);
+            acc += iq4xs_word(wb.s1, yl + 12);
+#else
+            global uchar * q = xb->qs + 16*it;
             for (int j = 0; j < 16; ++j) {
                 acc += yl[j]    * kvalues_iq4nl[q[j] & 0xf];
                 acc += yl[j+16] * kvalues_iq4nl[q[j] >>  4];
             }
+#endif
 
             sumf[row] += dl * acc;
         }

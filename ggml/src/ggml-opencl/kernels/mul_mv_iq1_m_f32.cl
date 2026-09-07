@@ -13,6 +13,10 @@
 #endif
 
 #define QK_K 256
+
+#ifndef IQ_MV_VEC
+#define IQ_MV_VEC 1
+#endif
 #define IQ1M_DELTA 0.125f
 
 // no d field: the super block scale is 4 nibbles spread over scales[]
@@ -374,14 +378,28 @@ kernel void kernel_mul_mv_iq1_m_f32(
             float dsuper = (float)as_half(u16);
 
             float acc = 0.f;
+#if IQ_MV_VEC
+            // block is 56 bytes of uchar: qs at +0 so qs + 4*it is uint aligned,
+            // qh at +32 so qh + 2*it is ushort aligned
+            uint   qw = *(global uint   *)(xb->qs + 4*it);
+            ushort hw = *(global ushort *)(xb->qh + 2*it);
+#endif
             for (int il = 0; il < 4; ++il) {
                 int   ib16 = 2*it + il/2;
                 float dl   = dsuper * (float)(2*(((uint)sc[ib16/4] >> (3*(ib16%4))) & 7) + 1);
 
+#if IQ_MV_VEC
+                uchar qhb = (il < 2) ? (uchar)(hw & 0xff) : (uchar)(hw >> 8);
+#else
                 uchar qhb = xb->qh[2*it + il/2];
+#endif
                 float dlt = (qhb & (0x08 << (4*(il%2)))) ? (-1.f - IQ1M_DELTA) : (-1.f + IQ1M_DELTA);
 
+#if IQ_MV_VEC
+                uint gi = ((qw >> (8*il)) & 0xff) | ((((uint)qhb >> (4*(il%2))) & 7) << 8);
+#else
                 uint gi = (uint)xb->qs[4*it+il] | ((((uint)qhb >> (4*(il%2))) & 7) << 8);
+#endif
                 uint g  = iq1s_grid_gpu[gi];
 
                 float a = 0.f;

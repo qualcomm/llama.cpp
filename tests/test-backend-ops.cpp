@@ -9885,6 +9885,48 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                              GGML_TYPE_IQ3_S, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M, GGML_TYPE_IQ4_XS}) {
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 16, 10, 256, {1, 1}, {1, 1}));
     }
+
+    // Narrow-batch band, n = 2..8, at WEIGHT-SIZED m and k.
+    //
+    // Backends commonly route this band to a different kernel from both n == 1 and
+    // a full prefill GEMM: CUDA compiles mat-vec for ncols_dst 1..8, Vulkan for
+    // NUM_COLS 1..4, and ggml-opencl has a multi-column GEMV for it. Everything in
+    // other_types above is only exercised at n == 1, so that whole band was
+    // reachable in a model and by no test.
+    //
+    // 🔴 m and k are 512, not the 16 and 256 used above, and that is the point.
+    // ggml-opencl declines its tuned paths for any weight with ne0 or ne1 below
+    // 512, so a case at m = 16 silently measures the generic fallback no matter
+    // which type it names -- it cannot reach the kernel it appears to be testing.
+    // A small case here is not a weaker test, it is a different one.
+    //
+    // n = 5 and 7 are deliberate: a kernel that folds two or four columns per
+    // workgroup has a tail when the fold does not divide n, and the tail is where
+    // an off-by-one lands. Batch dims stay {1,1} because the narrow-batch kernels
+    // commonly decline anything broadcast.
+    // Both lists, so a type is not skipped merely for living in base_types --
+    // q4_K does, and it shares a narrow-batch route with q6_K, which this band
+    // caught returning garbage on one device.
+    {
+        std::vector<ggml_type> narrow_batch_types;
+        for (ggml_type t : base_types)  { narrow_batch_types.push_back(t); }
+        for (ggml_type t : other_types) { narrow_batch_types.push_back(t); }
+        std::sort(narrow_batch_types.begin(), narrow_batch_types.end());
+        narrow_batch_types.erase(std::unique(narrow_batch_types.begin(), narrow_batch_types.end()),
+                                 narrow_batch_types.end());
+        for (ggml_type type_a : narrow_batch_types) {
+            if (ggml_blck_size(type_a) != 256) {
+                continue;   // the routes this targets are all super-block types
+            }
+            for (int n : {2, 4, 5, 7, 8}) {
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 512, n, 512, {1, 1}, {1, 1}));
+            }
+            // and once at a row count that is not a multiple of 64, so a
+            // row-blocked layout cannot hide a truncated stride behind a tidy
+            // shape
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 514, 2, 512, {1, 1}, {1, 1}));
+        }
+    }
 #else
     // m = a rows
     // n = b rows
@@ -9993,10 +10035,35 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // guard overrun dst into the next tensor; the dst sentinel catches it.
     // m = 6680 is Falcon-H1-7B's ssm_in (its only weight whose ne1 is not 64-aligned):
     // 6680 % 128 = 24, and 6680 % 64 = 24, so it pads under both 2-row and 1-row tilings.
+    //
+    // The IQ types are here for a second reason. Backends may route a matmul by
+    // SIZE -- the OpenCL one only uses its tuned kernels above 512x512 -- and the
+    // only other MUL_MAT cases carrying these types are m=16, k=256. So without a
+    // large case they exercise the generic path on every backend and the tuned
+    // one on none, which reads as coverage and is not.
     for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1,
                              GGML_TYPE_Q8_0, GGML_TYPE_Q1_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K,
-                             GGML_TYPE_Q6_K, GGML_TYPE_IQ4_NL}) {
+                             GGML_TYPE_Q6_K, GGML_TYPE_IQ4_NL,
+                             GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS,
+                             GGML_TYPE_IQ2_S, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_XXS,
+                             GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M,
+                             GGML_TYPE_Q2_K, GGML_TYPE_Q3_K}) {
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 6680, 1, 3072, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 6656, 1, 3072, {1, 1}, {1, 1}));
+    }
+
+    // Prefill GEMM at an ffn_down shape, which is the one that separates backends
+    // routing K-quants through a plane-split int8 GEMM from those that do not.
+    // n = 512 clears the ne11 >= 32 those GEMMs require, and k = 5632 is the shape
+    // a real ffn_down has -- 22 super-blocks per row, so it is neither a power of
+    // two nor a multiple of the tiling. Every other large case here is k = 3072,
+    // and a k = 2048 or 3072 tensor of the same type can be correct while this one
+    // is not: an Adreno 740 miscompiles the q2_K and q3_K plane GEMMs at k = 5632
+    // and returns right answers at k = 2048, so a suite without this shape reports
+    // the type as covered.
+    for (ggml_type type_a : {GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K,
+                             GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS}) {
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 2048, 512, 5632, {1, 1}, {1, 1}));
     }
 
     // sycl backend will limit task global_range < MAX_INT

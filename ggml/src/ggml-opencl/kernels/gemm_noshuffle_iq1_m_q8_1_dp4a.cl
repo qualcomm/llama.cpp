@@ -1,33 +1,135 @@
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
-
-#ifdef cl_intel_required_subgroup_size
-#pragma OPENCL EXTENSION cl_intel_required_subgroup_size : enable
-#define INTEL_GPU 1
-#define REQD_SUBGROUP_SIZE_16 __attribute__((intel_reqd_sub_group_size(16)))
-#define REQD_SUBGROUP_SIZE_32 __attribute__((intel_reqd_sub_group_size(32)))
-#elif defined(cl_qcom_reqd_sub_group_size)
-#pragma OPENCL EXTENSION cl_qcom_reqd_sub_group_size : enable
-#define ADRENO_GPU 1
-#define REQD_SUBGROUP_SIZE_64  __attribute__((qcom_reqd_sub_group_size("half")))
-#define REQD_SUBGROUP_SIZE_128 __attribute__((qcom_reqd_sub_group_size("full")))
+#pragma OPENCL EXTENSION cl_khr_subgroups : enable
+#ifdef cl_khr_integer_dot_product
+#pragma OPENCL EXTENSION cl_khr_integer_dot_product : enable
 #endif
+
+// Dense IQ1_M prefill GEMM, dp4a (int8) inner loop, over the feature-major plane
+// split produced by kernel_convert_block_iq1_m_ns:
+//
+//   src0_qs[row + (k/8)*m]    uchar   grid index low 8 bits
+//   src0_qh[row + (k/16)*m]   uchar   two 3-bit index highs, two delta signs
+//   src0_sc[row + (k/64)*m]   ushort  four 3-bit sub-scales + a super-scale nibble
+//
+// IQ1_M is the awkward member of the family and needs two things the others do
+// not:
+//
+//  1. It has NO d field. The super-block scale is a half assembled from the top
+//     nibble of each of the four scale ushorts, so it costs four plane reads --
+//     taken once per super-block behind a wave-uniform branch, not per 32-block.
+//
+//  2. Its delta is per EIGHT weights (four per 32-block), where IQ1_S's is per
+//     32. So q8_1's own sums plane, which is per 32, cannot supply the
+//     sum(a) term the way it can for IQ1_S. The sums are row-independent though,
+//     so they are built during LDS staging exactly as q2_K's per-16 sums are:
+//     each of the 64 lanes owns two (column, 8-weight group) slots of two uints
+//     and sums them as it stores them. Same load volume as before, no barrier.
+//
+// The GPU grid stores 8 values as nibbles, low nibbles first, so masking a uint
+// with 0x0F0F0F0F gives weights 0..3 packed as four int8 and shifting down 4
+// first gives weights 4..7.
 
 #define QK_K 256
 
-#ifndef IQ_MV_VEC
-#define IQ_MV_VEC 1
+// TILESIZE_N is the token tile: compile-time, and the right value is PER
+// DEVICE. This kernel used to be locked at 32 by a one-slot-per-lane staging
+// map; that is now strided, so any tile is correct. The dispatch must pass the
+// SAME value -- see ggml_cl_lowbit_dp4a_ts.
+#ifndef TILESIZE_N
+#define TILESIZE_N 32
 #endif
-#define IQ1S_DELTA 0.125f
 
-typedef struct {
-    half   d;
-    uchar  qs[QK_K/8];
-    ushort qh[QK_K/32];
-} block_iq1_s;
+#define IQ1M_DELTA 0.125f
 
-// iq1s_grid_gpu: 2048 x uint32 = 8 KB. Each uint holds 8 values as nibbles,
-// low nibbles first then high; the stored value is the real one plus 1, and
-// the -1 is folded into delta below (same packing CUDA uses).
+// See gemm_noshuffle_iq2_s_q8_1_dp4a: LDS-staging the 8 KB grid is a win in the
+// 512-thread decode GEMV and a small loss in this 64-thread GEMM.
+// IQ1M_GEMM_GRIDIMG=1: read the codebook through an image1d_buffer.
+//
+// In a GEMM every one of the 64 lanes owns a different row, so the grid reads in
+// a 32-K step are a DIVERGENT gather, and byte/word indexed __constant loads
+// serialize on Adreno under exactly that pattern. Local memory was measured on
+// the IQ2_S twin and lost, because the staged table costs occupancy in a
+// 64-thread workgroup; an image costs no occupancy and no memory, since it is
+// the singleton the decode GEMV already builds at init.
+//
+// The IQ3_S twin of this change is +43.0% prefill on a model made of the type
+// and +8.0% on a hybrid, with perplexity identical to four decimals. Same
+// defect, same fix, here. Default follows the per-generation texture gate.
+// MEASURED: Llama-3.2-3B-UD-IQ1_M pp512 617.2 -> 675.1 (+9.4%), wikitext PPL
+// 56.7210 both ways. The smallest gain of the six, and IQ1_M is 57.9% of that
+// file, so this kernel keeps a cost the image does not address -- it has no d
+// field and assembles its super-block scale from four nibbles. Left as the
+// obvious next thing to look at in this family.
+#ifndef IQ1M_GEMM_GRIDIMG
+#define IQ1M_GEMM_GRIDIMG 0
+#endif
+
+#ifndef IQ1M_GEMM_LDSGRID
+#define IQ1M_GEMM_LDSGRID 0
+#endif
+
+// IQ1M_GEMM_FOLD=1: fold the four per-8-weight terms of a 32-block onto the two
+// distinct scales it actually has.
+//
+// This kernel carries an arithmetic cost none of its siblings do, and that cost
+// is what the codebook image did NOT address (+9.4% here against +42.3% on
+// IQ3_S). Counting the inner loop per column per 32-K step:
+//
+//     IQ1_S   8 dp4a  +  ~3 float ops   (one delta correction, per 32 weights)
+//     IQ1_M   8 dp4a  + ~15 float ops   (four of them, per 8 weights)
+//
+// so on IQ1_M nearly two thirds of the issue slots in the hottest loop in the
+// file are not the dot product. Two of those fifteen are pure waste: the scale
+// is per SIXTEEN weights, so dl1 == dl0 and dl3 == dl2 always, and writing the
+// four terms out separately made the compiler multiply by each of them.
+//
+// Folding pairs the two 8-weight groups that share a scale into ONE dp4a
+// accumulator chain -- the four uints they consume are exactly the four
+// components of the uint4 already staged for them -- and applies the scale once:
+//
+//     8 dp4a + 2 int->float + 4 fma + 2 mul + 1 add  =  9 float ops
+//
+// The delta terms stay. They are genuinely per-8 and their signs are row data,
+// so nothing collapses them; removing them needs a codebook holding the biased
+// operand (8g-8+-1 as int8), which is a second table and a separate question.
+//
+// NOT bit-identical, and strictly MORE accurate: the two group dots are now
+// summed exactly in int32 before the single conversion, where before each was
+// rounded to float on its own.
+#ifndef IQ1M_GEMM_FOLD
+#define IQ1M_GEMM_FOLD 1
+#endif
+
+// IQ1M_GEMM_BIAS=1: read a PRE-BIASED dp4a operand and drop the delta correction
+// entirely.
+//
+// After the fold this kernel is 8 dp4a + 9 float ops per column per 32-K step,
+// and four of those nine are the delta term -- dt_j * s8[c][j], the per-8-weight
+// activation sum times a row-dependent sign. It exists because the weight value
+// is dl*(g - 1 +- 0.125), which is not an integer, so the dp4a can only carry the
+// g part and the rest has to be added back.
+//
+// Multiply through by eight and it IS an integer: 8g - 8 +- 1, with g in {0,1,2},
+// so the operand is one of {-9,-7,-1,1,7,9} and fits int8 with room to spare
+// (|acc| <= 9*127*32 = 36576 across a whole 32-block, and dot_acc_sat saturates
+// anyway). Fold the 1/8 into dl and the dot is EXACT: no correction, no per-8
+// activation sums, no sh_s8 staging and no LDS for it.
+//
+// It cannot be computed from the packed grid in registers -- subtracting a
+// constant from each byte borrows across byte lanes -- so it is a TABLE, built
+// once at init by kernel_iq1m_bias_export and indexed by (grid entry, sign bit).
+//
+// 🔑 The table is CL_RG, not CL_R. One texel carries BOTH operand halves, so a
+// group still costs ONE image fetch. That matters more than the arithmetic: this
+// family's kernels are gather-bound, and doubling the codebook gather is exactly
+// what sank the IQ3_S GLU fusion (-4.9%). A CL_R table would have needed two
+// fetches per group and would probably have lost for the same reason.
+//
+// Costs 32 KB of device memory for the table, built once, shared by every IQ1_M
+// tensor.
+#ifndef IQ1M_GEMM_BIAS
+#define IQ1M_GEMM_BIAS 0
+#endif
 constant uint iq1s_grid_gpu[2048] = {
     0x00000000, 0x00000002, 0x00000101, 0x00000200, 0x00000202, 0x00010001, 0x00010101, 0x00020000,
     0x00020002, 0x00020200, 0x00020202, 0x01000101, 0x01010001, 0x01010100, 0x01010102, 0x01020101,
@@ -287,133 +389,270 @@ constant uint iq1s_grid_gpu[2048] = {
     0x22202022, 0x22202220, 0x22202222, 0x22212121, 0x22222020, 0x22222022, 0x22222220, 0x22222222
 };
 
-#undef N_DST
-#undef N_SIMDGROUP
-#undef N_SIMDWIDTH
+// The activation tile is staged as uint4, not uint: the eight uints a token needs
+// for one 32-K step are contiguous, so they are two uint4s. That cuts the inner
+// loop's __local load count 4x and widens the cooperative staging load from 4 to
+// 16 bytes per lane. Measured on the IQ4_XS twin of this kernel: 3B pp512
+// 675 -> 780 (+15.6%), 27B 72.2 -> 78.2.
+//
+// The uint4s are copied into private temps at the call site -- dp4a with a
+// __local operand inside an unrolled loop is a documented miscompile on X2.
+//
+// IQ1_M consumes the tile in 8-weight groups, so each group is HALF a uint4:
+// group 2v is .xy of sh_qa4[t][v] and group 2v+1 is .zw.
+inline int dot2_q8a_v(uint a0, uint a1, uint2 y) {
+    int r = 0;
+    r = dot_acc_sat_4x8packed_ss_int(a0, y.x, r);
+    r = dot_acc_sat_4x8packed_ss_int(a1, y.y, r);
+    return r;
+}
 
-#ifdef INTEL_GPU
-#define N_DST 4
-#define N_SIMDGROUP 1
-#define N_SIMDWIDTH 16
-#elif defined (ADRENO_GPU)
-#define N_DST 4
-#define N_SIMDGROUP 1
-#define N_SIMDWIDTH 64
-#endif
+// The two 8-weight groups that share a scale, in one accumulator chain. Four
+// products of a nibble (0..2) by an int8 saturate nothing: |acc| <= 4064.
+inline int dot4_q8a_v(uint a0, uint a1, uint a2, uint a3, uint4 y) {
+    int r = 0;
+    r = dot_acc_sat_4x8packed_ss_int(a0, y.x, r);
+    r = dot_acc_sat_4x8packed_ss_int(a1, y.y, r);
+    r = dot_acc_sat_4x8packed_ss_int(a2, y.z, r);
+    r = dot_acc_sat_4x8packed_ss_int(a3, y.w, r);
+    return r;
+}
 
-#undef  BLOCK_STRIDE
-// 8 threads cover one super block, one 32 element sub block each
-#define BLOCK_STRIDE (N_SIMDWIDTH/8)
+// Builds the pre-biased dp4a operand table described above. One work item per
+// texel: t = 2*grid_index + sign_bit, out[2t] = weights 0..3, out[2t+1] = 4..7,
+// each byte 8*g - 8 -+ 1. The grid uint packs weight n in the low nibble of byte n
+// and weight n+4 in the high nibble, which is how the kernel below unpacks it.
+kernel void kernel_iq1m_bias_export(global uint * out) {
+    const uint t = get_global_id(0);
+    if (t >= 4096u) {
+        return;
+    }
+    const uint g = iq1s_grid_gpu[t >> 1];
+    // sign bit set -> dt = -1 - 0.125 -> 8g - 9;  clear -> 8g - 7
+    const int  b = (t & 1u) ? -9 : -7;
+    uint lo = 0u, hi = 0u;
+    for (uint n = 0; n < 4u; ++n) {
+        const int v0 = 8 * (int)((g >> (8u*n     )) & 0xFu) + b;
+        const int v1 = 8 * (int)((g >> (8u*n + 4u)) & 0xFu) + b;
+        lo |= ((uint)(v0 & 0xFF)) << (8u*n);
+        hi |= ((uint)(v1 & 0xFF)) << (8u*n);
+    }
+    out[2u*t + 0u] = lo;
+    out[2u*t + 1u] = hi;
+}
 
-#ifdef INTEL_GPU
-REQD_SUBGROUP_SIZE_16
-#elif defined (ADRENO_GPU)
-REQD_SUBGROUP_SIZE_64
-#endif
-kernel void kernel_mul_mv_iq1_s_f32(
-        global char * src0,
-        int offset0,
-        global char * src1,
-        int offset1,
-        global char * dst,
-        int offsetd,
-        int ne00,
-        int ne01,
-        ulong nb01,
-        ulong nb02,
-        ulong nb03,
-        int ne12,
-        ulong nb11,
-        ulong nb12,
-        ulong nb13,
-        int ne0,
-        int ne1,
-        int r2,
-        int r3
+__attribute__((qcom_wave_pair_mode(1)))
+kernel void kernel_gemm_noshuffle_iq1_m_q8_1_dp4a(
+        __read_only image1d_buffer_t grid_img,   // see IQ1M_GEMM_GRIDIMG
+        __read_only image1d_buffer_t bias_img,   // see IQ1M_GEMM_BIAS (CL_RG)
+        __global const uchar  * src0_qs,
+        __global const uchar  * src0_qh,
+        __global const ushort * src0_sc,
+        __global const uint   * src1_qa,
+        __global const half   * src1_da,
+        __global       float  * dst,
+        ulong  offsetd,
+        int    m,
+        int    n_no_padding,
+        int    k
 ) {
-    src0 = src0 + offset0;
-    src1 = src1 + offset1;
-    dst  = dst  + offsetd;
+    dst = (global float *)((global char *)dst + offsetd);
 
-    int ix = get_sub_group_local_id()/8;  // super block index
-    int it = get_sub_group_local_id()%8;  // sub block inside the super block
+    const uint lid = get_local_id(0);
+    const uint block_id_m = get_global_id(1);
+    const uint block_id_n = get_global_id(2);
 
-    int nb = ne00/QK_K;
+    const uint row      = block_id_m * 64 + lid;
+    const uint col_base = block_id_n * TILESIZE_N;
+    const bool row_valid = row < (uint)m;
+    const uint rrow     = row_valid ? row : 0;
 
-    int r0 = get_group_id(0);
-    int r1 = get_group_id(1);
-    int im = get_group_id(2);
-    int first_row = (r0 * N_SIMDGROUP + get_sub_group_id()) * N_DST;
+    const uint k_u = (uint)k >> 2;
+    const uint k_b = (uint)k >> 5;
 
-    int i12 = im%ne12;
-    int i13 = im/ne12;
-
-    int offset_src0 = first_row*nb01 + (i12/r2)*nb02 + (i13/r3)*nb03;
-    int offset_src1 =        r1*nb11 + (i12   )*nb12 + (i13   )*nb13;
-
-    global block_iq1_s * x = (global block_iq1_s *) (src0 + offset_src0);
-    global float         * y = (global float         *) (src1 + offset_src1);
-
-    float yl[32];
-    float sumf[N_DST] = {0.f};
-    float all_sum;
-
-    global float * y4 = y + ix * QK_K + 32 * it;
-
-    for (int ib = ix; ib < nb; ib += BLOCK_STRIDE) {
-        for (int i = 0; i < 32; ++i) {
-            yl[i] = y4[i];
-        }
-
-        global char * xrow = (global char *)(x + ib);
-
-        // keep the trip count fixed and clamp instead of skipping: rows past
-        // ne01 re-read row 0, and their sums are dropped at the store
-        for (int row = 0; row < N_DST; row++) {
-            int rsafe = (first_row + row < ne01) ? row : 0;
-            global block_iq1_s * xb = (global block_iq1_s *)(xrow + rsafe*nb01);
-
-            ushort qhb = xb->qh[it];
-            float  dl  = (float)xb->d * (float)(2*((qhb >> 12) & 7) + 1);
-            float  dlt = (qhb & 0x8000) ? (-1.f - IQ1S_DELTA) : (-1.f + IQ1S_DELTA);
-
-            global uchar * qsb = xb->qs + 4*it;
-
-            float acc = 0.f;
-#if IQ_MV_VEC
-            // block is 50 bytes with qs at +2, so the four quant bytes are
-            // ushort aligned but not uint aligned
-            ushort2 qv = vload2(0, (global ushort *)qsb);
-            ushort  qp[2] = { qv.s0, qv.s1 };
+    __local uint4 sh_qa4[TILESIZE_N][2];
+#if !IQ1M_GEMM_BIAS
+    __local float sh_s8[TILESIZE_N][4];   // per-8-weight activation sums, in qa units
 #endif
-            for (int l = 0; l < 4; ++l) {
-#if IQ_MV_VEC
-                uchar qb = (l & 1) ? (uchar)(qp[l>>1] >> 8) : (uchar)(qp[l>>1] & 0xff);
-                uint gi = (uint)qb | ((((uint)qhb >> (3*l)) & 7) << 8);
+    __local half  sh_da[TILESIZE_N];
+
+#if IQ1M_GEMM_GRIDIMG
+#define IQ1M_GRID(i) (read_imageui(grid_img, (int)(i)).x)
+#elif IQ1M_GEMM_LDSGRID
+    __local uint sh_grid[2048];
+    for (uint i = lid; i < 2048u; i += 64u) {
+        sh_grid[i] = iq1s_grid_gpu[i];
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+#define IQ1M_GRID(i) sh_grid[(i)]
 #else
-                uint gi = (uint)qsb[l] | ((((uint)qhb >> (3*l)) & 7) << 8);
+#define IQ1M_GRID(i) iq1s_grid_gpu[(i)]
 #endif
-                uint g  = iq1s_grid_gpu[gi];
-                for (int j = 0; j < 4; ++j) {
-                    acc += yl[8*l+j+0] * ((float)((g >> (8*j+0)) & 0xF) + dlt);
-                    acc += yl[8*l+j+4] * ((float)((g >> (8*j+4)) & 0xF) + dlt);
-                }
-            }
 
-            sumf[row] += dl * acc;
+#define NGROUPS (TILESIZE_N / 4)
+    float4 acc[NGROUPS];
+    #pragma unroll
+    for (int g = 0; g < NGROUPS; ++g) acc[g] = (float4)(0.0f);
+
+    float dsuper = 0.f;
+
+    for (uint step = 0; step < (uint)k; step += 32) {
+        const uint sub   = step >> 5;
+        const uint ib    = sub >> 3;
+        const uint sub_l = sub & 7u;
+
+        // wave-uniform: every lane is on the same step, so this costs nothing on
+        // the seven steps that skip it
+        if (sub_l == 0u) {
+            const uint sb = rrow + (ib * 4u) * (uint)m;
+            const uint w0 = (uint)src0_sc[sb + 0u * (uint)m];
+            const uint w1 = (uint)src0_sc[sb + 1u * (uint)m];
+            const uint w2 = (uint)src0_sc[sb + 2u * (uint)m];
+            const uint w3 = (uint)src0_sc[sb + 3u * (uint)m];
+            const ushort u16 = (ushort)(((w0 >> 12)) | ((w1 >> 8) & 0x00f0u)
+                                      | ((w2 >> 4) & 0x0f00u) | (w3 & 0xf000u));
+            dsuper = (float)as_half(u16);
         }
 
-        y4 += BLOCK_STRIDE * QK_K;
-    }
+        // one scale word per 32-block: index (sub_l >> 1) inside the super-block
+        const uint scw = (uint)src0_sc[rrow + (ib * 4u + (sub_l >> 1)) * (uint)m];
+        const uint qh0 = (uint)src0_qh[rrow + (sub * 2u + 0u) * (uint)m];
+        const uint qh1 = (uint)src0_qh[rrow + (sub * 2u + 1u) * (uint)m];
+        const uint qsb = rrow + (sub * 4u) * (uint)m;
 
-    global float * dst_f32 = (global float *) dst + im*ne0*ne1 + r1*ne0;
-
-    for (int row = 0; row < N_DST; ++row) {
-        all_sum = sub_group_reduce_add(sumf[row]);
-        if (first_row + row < ne01) {
-            if (get_sub_group_local_id() == 0) {
-                dst_f32[first_row + row] = all_sum;
-            }
+        // written out per entry rather than as an indexed array: indexing a
+        // private uint8 through a pointer forces it out of registers into scratch
+        const uint shb = 3u * (2u * (sub_l & 1u));
+        uint  qa0, qb0, qa1, qb1, qa2, qb2, qa3, qb3;
+        // dl is per SIXTEEN weights: groups 0,1 share one and groups 2,3 the other
+        float dl0, dl2;
+#if IQ1M_GEMM_BIAS
+        // one CL_RG fetch per group: .x = weights 0..3, .y = 4..7, pre-biased.
+        // The 1/8 that makes 8g-8+-1 an integer is folded into the scale.
+        {
+            const uint i0 = 2u * ((uint)src0_qs[qsb + 0u * (uint)m] | ((qh0 & 7u) << 8))
+                          + ((qh0 >> 3) & 1u);
+            const uint2 v = read_imageui(bias_img, (int)i0).xy;
+            qa0 = v.x; qb0 = v.y;
+            dl0 = dsuper * (float)(2u * ((scw >> shb) & 7u) + 1u) * 0.125f;
         }
+        {
+            const uint i1 = 2u * ((uint)src0_qs[qsb + 1u * (uint)m] | (((qh0 >> 4) & 7u) << 8))
+                          + ((qh0 >> 7) & 1u);
+            const uint2 v = read_imageui(bias_img, (int)i1).xy;
+            qa1 = v.x; qb1 = v.y;
+        }
+        {
+            const uint i2 = 2u * ((uint)src0_qs[qsb + 2u * (uint)m] | ((qh1 & 7u) << 8))
+                          + ((qh1 >> 3) & 1u);
+            const uint2 v = read_imageui(bias_img, (int)i2).xy;
+            qa2 = v.x; qb2 = v.y;
+            dl2 = dsuper * (float)(2u * ((scw >> (shb + 3u)) & 7u) + 1u) * 0.125f;
+        }
+        {
+            const uint i3 = 2u * ((uint)src0_qs[qsb + 3u * (uint)m] | (((qh1 >> 4) & 7u) << 8))
+                          + ((qh1 >> 7) & 1u);
+            const uint2 v = read_imageui(bias_img, (int)i3).xy;
+            qa3 = v.x; qb3 = v.y;
+        }
+#else
+        float dt0, dt1, dt2, dt3;
+        {
+            const uint g = IQ1M_GRID((uint)src0_qs[qsb + 0u * (uint)m] | (((qh0 & 7u) << 8)));
+            qa0 = g & 0x0F0F0F0Fu;  qb0 = (g >> 4) & 0x0F0F0F0Fu;
+            dl0 = dsuper * (float)(2u * ((scw >> shb) & 7u) + 1u);
+            dt0 = (qh0 & 0x08u) ? (-1.f - IQ1M_DELTA) : (-1.f + IQ1M_DELTA);
+        }
+        {
+            const uint g = IQ1M_GRID((uint)src0_qs[qsb + 1u * (uint)m] | ((((qh0 >> 4) & 7u) << 8)));
+            qa1 = g & 0x0F0F0F0Fu;  qb1 = (g >> 4) & 0x0F0F0F0Fu;
+            dt1 = (qh0 & 0x80u) ? (-1.f - IQ1M_DELTA) : (-1.f + IQ1M_DELTA);
+        }
+        {
+            const uint g = IQ1M_GRID((uint)src0_qs[qsb + 2u * (uint)m] | (((qh1 & 7u) << 8)));
+            qa2 = g & 0x0F0F0F0Fu;  qb2 = (g >> 4) & 0x0F0F0F0Fu;
+            dl2 = dsuper * (float)(2u * ((scw >> (shb + 3u)) & 7u) + 1u);
+            dt2 = (qh1 & 0x08u) ? (-1.f - IQ1M_DELTA) : (-1.f + IQ1M_DELTA);
+        }
+        {
+            const uint g = IQ1M_GRID((uint)src0_qs[qsb + 3u * (uint)m] | ((((qh1 >> 4) & 7u) << 8)));
+            qa3 = g & 0x0F0F0F0Fu;  qb3 = (g >> 4) & 0x0F0F0F0Fu;
+            dt3 = (qh1 & 0x80u) ? (-1.f - IQ1M_DELTA) : (-1.f + IQ1M_DELTA);
+        }
+#endif
+
+        // one (column, uint4) slot per lane -- 32 columns x 2 uint4s is exactly the
+        // 64 lanes -- and each uint4 covers TWO 8-weight groups, so both of their
+        // activation sums fall out of the same 16-byte load
+        // Strided over (column, half); at TILESIZE_N=32 that is idx==lid once, so
+        // byte-identical to the direct lane map it replaces, and correct at any
+        // tile so this kernel can take the per-device TILESIZE_N.
+        for (uint idx = lid; idx < TILESIZE_N * 2u; idx += 64u) {
+            const uint t  = idx >> 1;
+            const uint v  = idx & 1u;
+            const uint c  = col_base + t;
+            const bool ok = c < (uint)n_no_padding;
+            const uint4 w = ok ? vload4(0, src1_qa + c * k_u + (step >> 2) + (v << 2))
+                               : (uint4)(0u);
+            sh_qa4[t][v] = w;
+#if !IQ1M_GEMM_BIAS
+            int s0 = 0, s1 = 0;
+            s0 = dot_acc_sat_4x8packed_ss_int(w.x, 0x01010101u, s0);
+            s0 = dot_acc_sat_4x8packed_ss_int(w.y, 0x01010101u, s0);
+            s1 = dot_acc_sat_4x8packed_ss_int(w.z, 0x01010101u, s1);
+            s1 = dot_acc_sat_4x8packed_ss_int(w.w, 0x01010101u, s1);
+            sh_s8[t][2u*v + 0u] = (float)s0;
+            sh_s8[t][2u*v + 1u] = (float)s1;
+#endif
+        }
+        for (uint cc = lid; cc < TILESIZE_N; cc += 64u) {
+            const uint c = col_base + cc;
+            sh_da[cc] = (c < (uint)n_no_padding) ? src1_da[c * k_b + sub] : (half)0;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+#define LD4(arr, b) ((float4)((float)arr[(b)+0], (float)arr[(b)+1], (float)arr[(b)+2], (float)arr[(b)+3]))
+#if IQ1M_GEMM_BIAS
+#define IQ1M_COL(b) ( dl0 * (float)dot4_q8a_v(qa0, qb0, qa1, qb1, (uint4)(sh_qa4[b][0])) \
+                    + dl2 * (float)dot4_q8a_v(qa2, qb2, qa3, qb3, (uint4)(sh_qa4[b][1])) )
+#elif IQ1M_GEMM_FOLD
+#define IQ1M_COL(b) ( dl0 * ((float)dot4_q8a_v(qa0, qb0, qa1, qb1, (uint4)(sh_qa4[b][0])) \
+                             + dt0 * sh_s8[b][0] + dt1 * sh_s8[b][1]) \
+                    + dl2 * ((float)dot4_q8a_v(qa2, qb2, qa3, qb3, (uint4)(sh_qa4[b][1])) \
+                             + dt2 * sh_s8[b][2] + dt3 * sh_s8[b][3]) )
+#else
+#define IQ1M_COL(b) ( dl0 * ((float)dot2_q8a_v(qa0, qb0, (uint2)(sh_qa4[b][0].xy)) + dt0 * sh_s8[b][0]) \
+                    + dl0 * ((float)dot2_q8a_v(qa1, qb1, (uint2)(sh_qa4[b][0].zw)) + dt1 * sh_s8[b][1]) \
+                    + dl2 * ((float)dot2_q8a_v(qa2, qb2, (uint2)(sh_qa4[b][1].xy)) + dt2 * sh_s8[b][2]) \
+                    + dl2 * ((float)dot2_q8a_v(qa3, qb3, (uint2)(sh_qa4[b][1].zw)) + dt3 * sh_s8[b][3]) )
+#endif
+        #pragma unroll
+        for (int g = 0; g < NGROUPS; ++g) {
+            const int b = g * 4;
+            float4 rf;
+            rf.s0 = IQ1M_COL(b+0);  rf.s1 = IQ1M_COL(b+1);
+            rf.s2 = IQ1M_COL(b+2);  rf.s3 = IQ1M_COL(b+3);
+            acc[g] += LD4(sh_da, b) * rf;
+        }
+#undef IQ1M_COL
+#undef LD4
+        barrier(CLK_LOCAL_MEM_FENCE);
     }
+
+    if (!row_valid) {
+        return;
+    }
+
+    #pragma unroll
+    for (int g = 0; g < NGROUPS; ++g) {
+        const uint b = (uint)(g * 4);
+        const float4 a = acc[g];
+        const uint c0 = col_base + b;
+        if (c0 + 0 < (uint)n_no_padding) dst[(c0 + 0) * (uint)m + row] = a.s0;
+        if (c0 + 1 < (uint)n_no_padding) dst[(c0 + 1) * (uint)m + row] = a.s1;
+        if (c0 + 2 < (uint)n_no_padding) dst[(c0 + 2) * (uint)m + row] = a.s2;
+        if (c0 + 3 < (uint)n_no_padding) dst[(c0 + 3) * (uint)m + row] = a.s3;
+    }
+#undef NGROUPS
+#undef IQ1M_GRID
 }

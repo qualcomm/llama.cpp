@@ -117,6 +117,52 @@ struct block_q6_K {
 };
 
 //------------------------------------------------------------------------------
+// block_iq1_m -- note there is NO d field; the super-block scale is assembled
+// from the top nibbles of the four scale ushorts.
+//------------------------------------------------------------------------------
+struct block_iq1_m {
+    uint8_t qs[QK_K/8];      // grid index low 8 bits, one per 8 weights
+    uint8_t qh[QK_K/16];     // two 3-bit index highs and two delta signs
+    uint8_t scales[QK_K/32]; // four ushorts: 4x 3-bit scale each + a super nibble
+};
+
+//------------------------------------------------------------------------------
+// block_iq1_s
+//------------------------------------------------------------------------------
+struct block_iq1_s {
+    half     d;
+    uint8_t  qs[QK_K/8];   // grid index low 8 bits, one per 8 weights
+    ushort   qh[QK_K/32];  // 3 index highs each x4, then a 3-bit scale and a sign
+};
+
+//------------------------------------------------------------------------------
+// block_iq2_xxs
+//------------------------------------------------------------------------------
+struct block_iq2_xxs {
+    half     d;
+    ushort   qs[QK_K/8];      // per 32 weights: 4 grid indices then a scale+signs word
+};
+
+//------------------------------------------------------------------------------
+// block_iq2_xs
+//------------------------------------------------------------------------------
+struct block_iq2_xs {
+    half     d;
+    ushort   qs[QK_K/8];      // 9-bit grid index, 7-bit sign code above it
+    uint8_t  scales[QK_K/32]; // two 4-bit sub-scales
+};
+
+//------------------------------------------------------------------------------
+// block_iq2_s
+//------------------------------------------------------------------------------
+struct block_iq2_s {
+    half     d;
+    uint8_t  qs[QK_K/4];      // first QK_K/8 are grid low bytes, then QK_K/8 of signs
+    uint8_t  qh[QK_K/32];     // two high index bits per grid entry
+    uint8_t  scales[QK_K/32]; // two 4-bit sub-scales
+};
+
+//------------------------------------------------------------------------------
 // block_q2_K
 //------------------------------------------------------------------------------
 struct block_q2_K {
@@ -136,7 +182,6 @@ struct block_q3_K {
     half d;                  // super-block scale
 };
 
-
 //------------------------------------------------------------------------------
 // block_iq4_nl
 //------------------------------------------------------------------------------
@@ -146,6 +191,38 @@ struct block_iq4_nl
 {
     half d;
     uint8_t qs[QK4_NL / 2];
+};
+
+//------------------------------------------------------------------------------
+// block_iq4_xs
+//------------------------------------------------------------------------------
+struct block_iq4_xs
+{
+    half     d;
+    ushort   scales_h;
+    uint8_t  scales_l[QK_K/64];
+    uint8_t  qs[QK_K/2];
+};
+
+//------------------------------------------------------------------------------
+// block_iq3_s
+//------------------------------------------------------------------------------
+struct block_iq3_s
+{
+    half     d;
+    uint8_t  qs[QK_K/4];
+    uint8_t  qh[QK_K/32];
+    uint8_t  signs[QK_K/8];
+    uint8_t  scales[QK_K/64];
+};
+
+//------------------------------------------------------------------------------
+// block_iq3_xxs
+//------------------------------------------------------------------------------
+struct block_iq3_xxs
+{
+    half     d;
+    uint8_t  qs[3*QK_K/8];
 };
 
 //------------------------------------------------------------------------------
@@ -2540,153 +2617,505 @@ kernel void kernel_convert_block_iq4_nl_noshuffle(
     }
 }
 
-kernel void kernel_restore_block_iq4_nl_noshuffle(
-    global uchar * src_q,
-    global half  * src_d,
-    global struct block_iq4_nl * dst,
-    uchar mask_0F,
-    uchar mask_F0,
-    ulong n_blk
+//------------------------------------------------------------------------------
+// IQ4_XS -> planes, in the layout the dp4a GEMM wants.
+//
+// IQ4_XS is IQ4_NL's codebook plus a 256 super-block with eight 6-bit sub-scales,
+// and its 32-element sub-blocks are nibble-ordered exactly like IQ4_NL: elements
+// 0..15 are the low nibbles of qs[0..15], 16..31 the high ones. So the quant
+// plane is the IQ4_NL repack applied once per sub-block, and comes out with the
+// same meaning: ushort j holds the four codebook indices for K = 4j..4j+3.
+//
+// The split is size preserving -- 128 + 2 + 2 + 4 == sizeof(block_iq4_xs) -- so
+// the planes fit as subbuffers of the tensor's own allocation, the way q4_K does.
+// That is why the scales stay packed as scales_h/scales_l instead of being
+// flattened to one half per 32: flattening would need 144 bytes per 256 and no
+// longer fit.
+kernel void kernel_convert_block_iq4_xs_ns(
+    global struct block_iq4_xs * src0,
+    global uchar  * dst_q,     // QK_K/2 bytes per block
+    global half   * dst_d,     // 1 per block
+    global ushort * dst_sh,    // 1 per block
+    global uint   * dst_sl,    // 1 per block, the four scales_l bytes
+    uchar           mask_0F,
+    uchar           mask_F0,
+    ulong           n_blk
 ) {
-    if (get_global_id(0) >= n_blk) {
+    const ulong i = get_global_id(0);
+    if (i >= n_blk) {
         return;
     }
-    global struct block_iq4_nl * b = (global struct block_iq4_nl *) dst + get_global_id(0);
-    global uchar * q = (global uchar *) src_q + QK4_NL/2*get_global_id(0);
-    global half  * d = (global half *) src_d + get_global_id(0);
+    global struct block_iq4_xs * b = (global struct block_iq4_xs *) src0 + i;
+    global uchar * q = (global uchar *) dst_q + (QK_K/2) * i;
 
-    b->d = *d;
-    for (int i = 0; i < QK4_NL/4; ++i) {
-        uchar x0 = q[i + 0       ];
-        uchar x1 = q[i + QK4_NL/4];
+    dst_d[i]  = b->d;
+    dst_sh[i] = b->scales_h;
+    dst_sl[i] = ((uint)b->scales_l[0])
+              | ((uint)b->scales_l[1] <<  8)
+              | ((uint)b->scales_l[2] << 16)
+              | ((uint)b->scales_l[3] << 24);
 
-        b->qs[2*i + 0] = convert_uchar((x0 & mask_0F) | ((x1 & mask_0F) << 4));
-        b->qs[2*i + 1] = convert_uchar(((x0 & mask_F0) >> 4) | (x1 & mask_F0));
-    }
-}
-
-// ---------------------------------------------------------------------------
-// kernel_moe_expand_scale_q8_0
-//
-// Expand the q8_0 per-32-block scale d (one half/block, [expert][row][block]) into
-// the UNIFORM scale[16] format the generic dp4a MoE GEMM (kernel_gemm_moe_q8_1_dp4a,
-// MOE_QT=80) consumes: 16 f16 per 256-superblock (per-16-element segment), where the
-// two segments of each 32-block share the block's d. q8_0 is symmetric -> no min
-// buffer (the GEMM runs with has_min=0). The int8 weight codes are reused verbatim
-// from the existing flat q8_0 weight buffer (extra0_q8_0->q), so only the scale is
-// rebuilt here. One work-item per (row, superblock, expert).
-// ---------------------------------------------------------------------------
-__kernel void kernel_moe_expand_scale_q8_0(
-    __global const half * src_d,      // [expert][row][block], one scale per 32-block
-    __global       half * dst_scale,  // [expert][row][block][2] (FLAT per-32-block)
-    int ne00,
-    int ne01
-) {
-    int row = get_global_id(0);
-    int blk = get_global_id(1);   // 32-block index along K
-    int e   = get_global_id(2);
-    if (row >= ne01) return;
-
-    long nb = ne00 / 32;          // 32-blocks per row (K only needs % 32 == 0)
-    half d  = src_d[((long)e*ne01 + row)*nb + blk];
-    long b  = (((long)e*ne01 + row)*nb + blk) * 2;
-    dst_scale[b + 0] = d;
-    dst_scale[b + 1] = d;
-}
-
-// ---------------------------------------------------------------------------
-// kernel_moe_expand_scale_q5_0
-//
-// q5_0 = symmetric, value = d*(code-16), code = nibble | (hi<<4) in 0..31. The
-// generic dp4a MoE GEMM keeps the unsigned code and centers via the min term:
-//   scale*dp4a(code,a) - min*sum(a),  scale = d,  min = d*16.
-// Reads the existing q5_0 d ([expert][block][row], one half/32-block, from the
-// trans4 convert) and writes the FLAT per-32-block uniform scale[2]/min[1] in
-// [expert][row][block] order (a transpose). One work-item per (row, block, expert).
-// ---------------------------------------------------------------------------
-__kernel void kernel_moe_expand_scale_q5_0(
-    __global const half * src_d,      // [expert][block][row]
-    __global       half * dst_scale,  // [expert][row][block][2]
-    __global       half * dst_min,    // [expert][row][block]
-    int ne00,
-    int ne01
-) {
-    int row = get_global_id(0);
-    int blk = get_global_id(1);
-    int e   = get_global_id(2);
-    if (row >= ne01) return;
-
-    long nb = ne00 / 32;
-    half d  = src_d[(long)e*nb*ne01 + (long)blk*ne01 + row];   // [expert][block][row]
-    long sb = (((long)e*ne01 + row)*nb + blk) * 2;
-    long mb = ((long)e*ne01 + row)*nb + blk;
-    dst_scale[sb + 0] = d;
-    dst_scale[sb + 1] = d;
-    dst_min[mb] = (half)((float)d * 16.0f);
-}
-
-// ---------------------------------------------------------------------------
-// kernel_moe_expand_scale_q5_K
-//
-// q5_K value = d*sv*code + (-dm*mn), with the 6-bit packed per-sub-block scale sv
-// and min mn (8 sub-blocks of 32 per 256-superblock, decoded by get_scale_min_k4
-// from the 12-byte s[]). The generic dp4a MoE GEMM (kernel_gemm_moe_q8_1_dp4a,
-// MOE_QT=5) keeps the unsigned 5-bit code and applies scale/min via the uniform
-// per-32-block buffers:
-//   acc += sc0*a_d*raw1 + sc1*a_d*raw2 - mn_u*a_s,
-//   sc0 = sc1 = d*sv (both per-16 segments of a 32-block share the sub-block scale),
-//   mn_u = dm*mn (positive; the GEMM subtracts it -> the -dm*mn min term).
-// q5_K's q_img (low nibbles) + qh (hi-bit plane) are already in the layout the GEMM
-// reads (same trans4_ns convert that feeds gemm_moe_q5_k_f32_ns), so only the scale
-// is rebuilt here.
-//
-// Inputs are the trans4_ns convert outputs:
-//   src_s  : uchar [expert][row][superblock][12]   (6-bit packed scales/mins)
-//   src_d  : half  [expert][superblock][row]        (superblock scale d)
-//   src_dm : half  [expert][superblock][row]        (superblock min dm)
-// Outputs (FLAT per-32-block, [expert][row][32block]):
-//   dst_scale : half 2/32-block      dst_min : half 1/32-block
-// One work-item per (row, superblock, expert); each emits 8 sub-blocks.
-// ---------------------------------------------------------------------------
-__kernel void kernel_moe_expand_scale_q5_K(
-    __global const uchar * src_s,     // [expert][row][superblock][12]
-    __global const half  * src_d,     // [expert][superblock][row]
-    __global const half  * src_dm,    // [expert][superblock][row]
-    __global       half  * dst_scale, // [expert][row][32block][2]
-    __global       half  * dst_min,   // [expert][row][32block]
-    int ne00,
-    int ne01
-) {
-    int row = get_global_id(0);
-    int sb  = get_global_id(1);   // superblock index along K
-    int e   = get_global_id(2);
-    if (row >= ne01) return;
-
-    long nsb    = ne00 / 256;     // superblocks per row
-    long nblk32 = ne00 / 32;      // 32-blocks per row
-
-    float d  = (float)src_d [((long)e*nsb + sb)*ne01 + row];
-    float dm = (float)src_dm[((long)e*nsb + sb)*ne01 + row];
-
-    __global const uchar * sc = src_s + ((long)e*ne01 + row)*nsb*12 + (long)sb*12;
-
-    for (int j = 0; j < 8; ++j) {
-        uchar sv, mn;
-        // get_scale_min_k4 (6-bit packed scale/min for sub-block j of 8)
-        if (j < 4) {
-            sv = sc[j]   & 63;
-            mn = sc[j+4] & 63;
-        } else {
-            sv = (sc[j+4] & 0x0F) | ((sc[j-4] & 0xC0) >> 2);
-            mn = ((sc[j+4] >> 4) & 0x0F) | ((sc[j]   & 0xC0) >> 2);
+    for (int sb = 0; sb < QK_K/32; ++sb) {
+        global uchar * src = b->qs + 16*sb;
+        global uchar * qo  = q     + 16*sb;
+        for (int i2 = 0; i2 < 8; ++i2) {
+            uchar x0 = src[2*i2 + 0];
+            uchar x1 = src[2*i2 + 1];
+            qo[i2 + 0] = convert_uchar(x0 & mask_0F) | convert_uchar((x1 & mask_0F) << 4);
+            qo[i2 + 8] = convert_uchar((x0 & mask_F0) >> 4) | convert_uchar(x1 & mask_F0);
         }
-        long sub   = (long)sb*8 + j;
-        long sbase = (((long)e*ne01 + row)*nblk32 + sub) * 2;
-        half s_val = (half)(d  * (float)sv);
-        dst_scale[sbase + 0] = s_val;
-        dst_scale[sbase + 1] = s_val;
-        dst_min[((long)e*ne01 + row)*nblk32 + sub] = (half)(dm * (float)mn);
     }
+}
+
+//------------------------------------------------------------------------------
+// block_iq4_xs plane split -> AoS blocks. Exact inverse of
+// kernel_convert_block_iq4_xs_ns above; the caller must un-transpose the four
+// planes back to block-major first.
+//------------------------------------------------------------------------------
+kernel void kernel_restore_block_iq4_xs_ns(
+    global uchar  * src_q,     // QK_K/2 bytes per block
+    global half   * src_d,     // 1 per block
+    global ushort * src_sh,    // 1 per block
+    global uint   * src_sl,    // 1 per block, the four scales_l bytes
+    global struct block_iq4_xs * dst,
+    uchar           mask_0F,
+    uchar           mask_F0,
+    ulong           n_blk
+) {
+    const ulong i = get_global_id(0);
+    if (i >= n_blk) {
+        return;
+    }
+    global struct block_iq4_xs * b = (global struct block_iq4_xs *) dst + i;
+    global uchar * q = (global uchar *) src_q + (QK_K/2) * i;
+
+    b->d        = src_d[i];
+    b->scales_h = src_sh[i];
+    const uint sl = src_sl[i];
+    b->scales_l[0] = (uchar)( sl        & 0xFF);
+    b->scales_l[1] = (uchar)((sl >>  8) & 0xFF);
+    b->scales_l[2] = (uchar)((sl >> 16) & 0xFF);
+    b->scales_l[3] = (uchar)((sl >> 24) & 0xFF);
+
+    for (int sb = 0; sb < QK_K/32; ++sb) {
+        global uchar * qi  = q     + 16*sb;
+        global uchar * out = b->qs + 16*sb;
+        for (int i2 = 0; i2 < 8; ++i2) {
+            // convert wrote:
+            //   qi[i2]   = (x0 & 0x0F) | ((x1 & 0x0F) << 4)
+            //   qi[i2+8] = ((x0 & 0xF0) >> 4) | (x1 & 0xF0)
+            uchar a = qi[i2 + 0];
+            uchar b8 = qi[i2 + 8];
+            out[2*i2 + 0] = convert_uchar(a & mask_0F) | convert_uchar((b8 & mask_0F) << 4);
+            out[2*i2 + 1] = convert_uchar((a & mask_F0) >> 4) | convert_uchar(b8 & mask_F0);
+        }
+    }
+}
+
+//------------------------------------------------------------------------------
+// IQ3_S -> planes. A straight field split, no reordering: for a 32-sub-block sb,
+// `qs[8*sb + u]` is already the grid index for dp4a operand u, because one
+// iq3s_grid entry is a uint holding 4 values, i.e. exactly the 4 weights of
+// K = 4u..4u+3. The 9th index bit is bit u of qh[sb].
+//
+// Size preserving by construction (same five fields), 110 bytes per 256 weights,
+// so the planes are subbuffers of the tensor's own allocation.
+kernel void kernel_convert_block_iq3_s_ns(
+    global struct block_iq3_s * src0,
+    global uchar * dst_qs,      // QK_K/4 per block
+    global uchar * dst_qh,      // QK_K/32
+    global uchar * dst_sg,      // QK_K/8
+    global uchar * dst_sc,      // QK_K/64
+    global half  * dst_d,       // 1
+    ulong          n_blk
+) {
+    const ulong i = get_global_id(0);
+    if (i >= n_blk) {
+        return;
+    }
+    global struct block_iq3_s * b = (global struct block_iq3_s *) src0 + i;
+
+    dst_d[i] = b->d;
+    for (int j = 0; j < QK_K/4;  ++j) { dst_qs[(QK_K/4)  * i + j] = b->qs[j];     }
+    for (int j = 0; j < QK_K/32; ++j) { dst_qh[(QK_K/32) * i + j] = b->qh[j];     }
+    for (int j = 0; j < QK_K/8;  ++j) { dst_sg[(QK_K/8)  * i + j] = b->signs[j];  }
+    for (int j = 0; j < QK_K/64; ++j) { dst_sc[(QK_K/64) * i + j] = b->scales[j]; }
+}
+
+//------------------------------------------------------------------------------
+// IQ3_S planes -> AoS blocks. Exact inverse of kernel_convert_block_iq3_s_ns
+// above (a straight field split, so the restore is the same copy reversed); the
+// caller must un-transpose the five planes back to block-major first.
+//------------------------------------------------------------------------------
+kernel void kernel_restore_block_iq3_s_ns(
+    global uchar * src_qs,
+    global uchar * src_qh,
+    global uchar * src_sg,
+    global uchar * src_sc,
+    global half  * src_d,
+    global struct block_iq3_s * dst,
+    ulong          n_blk
+) {
+    const ulong i = get_global_id(0);
+    if (i >= n_blk) {
+        return;
+    }
+    global struct block_iq3_s * b = (global struct block_iq3_s *) dst + i;
+
+    b->d = src_d[i];
+    for (int j = 0; j < QK_K/4;  ++j) { b->qs[j]     = src_qs[(QK_K/4)  * i + j]; }
+    for (int j = 0; j < QK_K/32; ++j) { b->qh[j]     = src_qh[(QK_K/32) * i + j]; }
+    for (int j = 0; j < QK_K/8;  ++j) { b->signs[j]  = src_sg[(QK_K/8)  * i + j]; }
+    for (int j = 0; j < QK_K/64; ++j) { b->scales[j] = src_sc[(QK_K/64) * i + j]; }
+}
+
+//------------------------------------------------------------------------------
+// IQ2_XXS -> planes. The AoS block packs two different things into one ushort
+// array: for each 32 weights, the first two ushorts are four grid indices (one
+// per 8 weights) and the last two are a uint32 carrying the 4-bit scale in bits
+// 28..31 with four 7-bit sign codes below it.
+//
+// That uint32 sits at a 2-aligned offset inside the block, so it is assembled a
+// ushort at a time here; the plane itself is a properly aligned uint array.
+//
+// Size preserving: QK_K/8 + 4*(QK_K/32) + 2 == 32 + 32 + 2 == 66 ==
+// sizeof(block_iq2_xxs), so the planes are subbuffers of the tensor's own
+// allocation.
+//------------------------------------------------------------------------------
+kernel void kernel_convert_block_iq2_xxs_ns(
+    global struct block_iq2_xxs * src0,
+    global uchar * dst_qs,      // QK_K/8 per block, one grid index per 8 weights
+    global uint  * dst_sas,     // QK_K/32 per block: scale nibble + 4 sign codes
+    global half  * dst_d,       // 1
+    ulong          n_blk
+) {
+    const ulong i = get_global_id(0);
+    if (i >= n_blk) {
+        return;
+    }
+    global struct block_iq2_xxs * b = (global struct block_iq2_xxs *) src0 + i;
+
+    dst_d[i] = b->d;
+    for (int j = 0; j < QK_K/32; ++j) {
+        global const ushort * q2 = b->qs + 4*j;
+        const uint a0 = (uint)q2[0] | ((uint)q2[1] << 16);
+        dst_qs[(QK_K/8) * i + 4*j + 0] = (uchar)( a0        & 0xFF);
+        dst_qs[(QK_K/8) * i + 4*j + 1] = (uchar)((a0 >>  8) & 0xFF);
+        dst_qs[(QK_K/8) * i + 4*j + 2] = (uchar)((a0 >> 16) & 0xFF);
+        dst_qs[(QK_K/8) * i + 4*j + 3] = (uchar)((a0 >> 24) & 0xFF);
+        dst_sas[(QK_K/32) * i + j] = (uint)q2[2] | ((uint)q2[3] << 16);
+    }
+}
+
+//------------------------------------------------------------------------------
+// IQ2_XXS planes -> AoS blocks. Exact inverse of the convert above; the caller
+// must un-transpose the three planes back to block-major first.
+//------------------------------------------------------------------------------
+kernel void kernel_restore_block_iq2_xxs_ns(
+    global uchar * src_qs,
+    global uint  * src_sas,
+    global half  * src_d,
+    global struct block_iq2_xxs * dst,
+    ulong          n_blk
+) {
+    const ulong i = get_global_id(0);
+    if (i >= n_blk) {
+        return;
+    }
+    global struct block_iq2_xxs * b = (global struct block_iq2_xxs *) dst + i;
+
+    b->d = src_d[i];
+    for (int j = 0; j < QK_K/32; ++j) {
+        global ushort * q2 = b->qs + 4*j;
+        const uint a0 = (uint)src_qs[(QK_K/8) * i + 4*j + 0]
+                      | ((uint)src_qs[(QK_K/8) * i + 4*j + 1] <<  8)
+                      | ((uint)src_qs[(QK_K/8) * i + 4*j + 2] << 16)
+                      | ((uint)src_qs[(QK_K/8) * i + 4*j + 3] << 24);
+        const uint a1 = src_sas[(QK_K/32) * i + j];
+        q2[0] = (ushort)( a0        & 0xFFFF);
+        q2[1] = (ushort)((a0 >> 16) & 0xFFFF);
+        q2[2] = (ushort)( a1        & 0xFFFF);
+        q2[3] = (ushort)((a1 >> 16) & 0xFFFF);
+    }
+}
+
+//------------------------------------------------------------------------------
+// IQ2_XS -> planes. A straight field split: the grid index and its sign code
+// already travel together in one ushort, so qs moves across unchanged.
+//
+// Size preserving: 2*(QK_K/8) + QK_K/32 + 2 == 64 + 8 + 2 == 74 ==
+// sizeof(block_iq2_xs).
+//------------------------------------------------------------------------------
+kernel void kernel_convert_block_iq2_xs_ns(
+    global struct block_iq2_xs * src0,
+    global ushort * dst_qs,     // QK_K/8 per block
+    global uchar  * dst_sc,     // QK_K/32 per block
+    global half   * dst_d,      // 1
+    ulong           n_blk
+) {
+    const ulong i = get_global_id(0);
+    if (i >= n_blk) {
+        return;
+    }
+    global struct block_iq2_xs * b = (global struct block_iq2_xs *) src0 + i;
+
+    dst_d[i] = b->d;
+    for (int j = 0; j < QK_K/8;  ++j) { dst_qs[(QK_K/8)  * i + j] = b->qs[j];     }
+    for (int j = 0; j < QK_K/32; ++j) { dst_sc[(QK_K/32) * i + j] = b->scales[j]; }
+}
+
+//------------------------------------------------------------------------------
+// IQ2_XS planes -> AoS blocks.
+//------------------------------------------------------------------------------
+kernel void kernel_restore_block_iq2_xs_ns(
+    global ushort * src_qs,
+    global uchar  * src_sc,
+    global half   * src_d,
+    global struct block_iq2_xs * dst,
+    ulong           n_blk
+) {
+    const ulong i = get_global_id(0);
+    if (i >= n_blk) {
+        return;
+    }
+    global struct block_iq2_xs * b = (global struct block_iq2_xs *) dst + i;
+
+    b->d = src_d[i];
+    for (int j = 0; j < QK_K/8;  ++j) { b->qs[j]     = src_qs[(QK_K/8)  * i + j]; }
+    for (int j = 0; j < QK_K/32; ++j) { b->scales[j] = src_sc[(QK_K/32) * i + j]; }
+}
+
+//------------------------------------------------------------------------------
+// IQ3_XXS -> planes. The AoS block packs two different things into one qs array:
+// the first QK_K/4 bytes are grid indices (one per 4 weights, so one index IS one
+// dp4a operand), and the last QK_K/8 bytes are one uint32 per 32-block carrying
+// the 4-bit scale in bits 28..31 and four 7-bit sign codes below it.
+//
+// Those uint32s sit at a 2-aligned offset inside the block, so they are assembled
+// a byte at a time here; the plane itself is a properly aligned uint array.
+//
+// Size preserving: QK_K/4 + 4*(QK_K/32) + 2 == 64 + 32 + 2 == 98 ==
+// sizeof(block_iq3_xxs), so the planes are subbuffers of the tensor's own
+// allocation.
+//------------------------------------------------------------------------------
+kernel void kernel_convert_block_iq3_xxs_ns(
+    global struct block_iq3_xxs * src0,
+    global uchar * dst_qs,      // QK_K/4 per block
+    global uint  * dst_sas,     // QK_K/32 per block: scale nibble + 4 sign codes
+    global half  * dst_d,       // 1
+    ulong          n_blk
+) {
+    const ulong i = get_global_id(0);
+    if (i >= n_blk) {
+        return;
+    }
+    global struct block_iq3_xxs * b = (global struct block_iq3_xxs *) src0 + i;
+
+    dst_d[i] = b->d;
+    for (int j = 0; j < QK_K/4; ++j) { dst_qs[(QK_K/4) * i + j] = b->qs[j]; }
+    for (int j = 0; j < QK_K/32; ++j) {
+        global const uchar * p = b->qs + QK_K/4 + 4*j;
+        dst_sas[(QK_K/32) * i + j] = (uint)p[0] | ((uint)p[1] << 8)
+                                   | ((uint)p[2] << 16) | ((uint)p[3] << 24);
+    }
+}
+
+//------------------------------------------------------------------------------
+// IQ3_XXS planes -> AoS blocks. Exact inverse of the convert above; the caller
+// must un-transpose the three planes back to block-major first.
+//------------------------------------------------------------------------------
+kernel void kernel_restore_block_iq3_xxs_ns(
+    global uchar * src_qs,
+    global uint  * src_sas,
+    global half  * src_d,
+    global struct block_iq3_xxs * dst,
+    ulong          n_blk
+) {
+    const ulong i = get_global_id(0);
+    if (i >= n_blk) {
+        return;
+    }
+    global struct block_iq3_xxs * b = (global struct block_iq3_xxs *) dst + i;
+
+    b->d = src_d[i];
+    for (int j = 0; j < QK_K/4; ++j) { b->qs[j] = src_qs[(QK_K/4) * i + j]; }
+    for (int j = 0; j < QK_K/32; ++j) {
+        const uint w = src_sas[(QK_K/32) * i + j];
+        global uchar * p = b->qs + QK_K/4 + 4*j;
+        p[0] = (uchar)( w        & 0xFF);
+        p[1] = (uchar)((w >>  8) & 0xFF);
+        p[2] = (uchar)((w >> 16) & 0xFF);
+        p[3] = (uchar)((w >> 24) & 0xFF);
+    }
+}
+
+//------------------------------------------------------------------------------
+// IQ1_M -> planes. A straight field split, three planes and no scale plane of
+// its own -- IQ1_M has no d field, the super-block scale is assembled from the
+// top nibbles of the four scale ushorts.
+//
+//   dst_qs[k/8]   uchar   grid index low 8 bits
+//   dst_qh[k/16]  uchar   two 3-bit index highs and two delta signs
+//   dst_sc[k/64]  ushort  four 3-bit sub-scales plus one nibble of the super scale
+//
+// Size preserving: 32 + 16 + 8 == 56 == sizeof(block_iq1_m).
+//------------------------------------------------------------------------------
+kernel void kernel_convert_block_iq1_m_ns(
+    global struct block_iq1_m * src0,
+    global uchar  * dst_qs,     // QK_K/8 per block
+    global uchar  * dst_qh,     // QK_K/16
+    global ushort * dst_sc,     // QK_K/64
+    ulong           n_blk
+) {
+    const ulong i = get_global_id(0);
+    if (i >= n_blk) {
+        return;
+    }
+    global struct block_iq1_m * b = (global struct block_iq1_m *) src0 + i;
+
+    for (int j = 0; j < QK_K/8;  ++j) { dst_qs[(QK_K/8)  * i + j] = b->qs[j]; }
+    for (int j = 0; j < QK_K/16; ++j) { dst_qh[(QK_K/16) * i + j] = b->qh[j]; }
+    // the scale bytes are only byte-aligned inside the block, so pair them here
+    for (int j = 0; j < QK_K/64; ++j) {
+        dst_sc[(QK_K/64) * i + j] = (ushort)((uint)b->scales[2*j] | ((uint)b->scales[2*j+1] << 8));
+    }
+}
+
+//------------------------------------------------------------------------------
+// IQ1_M planes -> AoS blocks. Exact inverse; the caller must un-transpose first.
+//------------------------------------------------------------------------------
+kernel void kernel_restore_block_iq1_m_ns(
+    global uchar  * src_qs,
+    global uchar  * src_qh,
+    global ushort * src_sc,
+    global struct block_iq1_m * dst,
+    ulong           n_blk
+) {
+    const ulong i = get_global_id(0);
+    if (i >= n_blk) {
+        return;
+    }
+    global struct block_iq1_m * b = (global struct block_iq1_m *) dst + i;
+
+    for (int j = 0; j < QK_K/8;  ++j) { b->qs[j] = src_qs[(QK_K/8)  * i + j]; }
+    for (int j = 0; j < QK_K/16; ++j) { b->qh[j] = src_qh[(QK_K/16) * i + j]; }
+    for (int j = 0; j < QK_K/64; ++j) {
+        const uint w = (uint)src_sc[(QK_K/64) * i + j];
+        b->scales[2*j + 0] = (uchar)( w       & 0xFF);
+        b->scales[2*j + 1] = (uchar)((w >> 8) & 0xFF);
+    }
+}
+
+//------------------------------------------------------------------------------
+// IQ1_S -> planes. A straight field split, three planes:
+//
+//   dst_qs[k/8]   uchar   grid index low 8 bits
+//   dst_qh[k/32]  ushort  four 3-bit index highs, a 3-bit scale, a delta sign
+//   dst_d [k/256] half
+//
+// Size preserving: 32 + 16 + 2 == 50 == sizeof(block_iq1_s).
+//------------------------------------------------------------------------------
+kernel void kernel_convert_block_iq1_s_ns(
+    global struct block_iq1_s * src0,
+    global uchar  * dst_qs,     // QK_K/8 per block
+    global ushort * dst_qh,     // QK_K/32
+    global half   * dst_d,      // 1
+    ulong           n_blk
+) {
+    const ulong i = get_global_id(0);
+    if (i >= n_blk) {
+        return;
+    }
+    global struct block_iq1_s * b = (global struct block_iq1_s *) src0 + i;
+
+    dst_d[i] = b->d;
+    for (int j = 0; j < QK_K/8;  ++j) { dst_qs[(QK_K/8)  * i + j] = b->qs[j]; }
+    for (int j = 0; j < QK_K/32; ++j) { dst_qh[(QK_K/32) * i + j] = b->qh[j]; }
+}
+
+//------------------------------------------------------------------------------
+// IQ1_S planes -> AoS blocks. Exact inverse; the caller must un-transpose first.
+//------------------------------------------------------------------------------
+kernel void kernel_restore_block_iq1_s_ns(
+    global uchar  * src_qs,
+    global ushort * src_qh,
+    global half   * src_d,
+    global struct block_iq1_s * dst,
+    ulong           n_blk
+) {
+    const ulong i = get_global_id(0);
+    if (i >= n_blk) {
+        return;
+    }
+    global struct block_iq1_s * b = (global struct block_iq1_s *) dst + i;
+
+    b->d = src_d[i];
+    for (int j = 0; j < QK_K/8;  ++j) { b->qs[j] = src_qs[(QK_K/8)  * i + j]; }
+    for (int j = 0; j < QK_K/32; ++j) { b->qh[j] = src_qh[(QK_K/32) * i + j]; }
+}
+
+//------------------------------------------------------------------------------
+// IQ2_S -> planes. A straight field split, no reordering. The AoS block packs two
+// different payloads into one qs array -- QK_K/8 grid low bytes then QK_K/8 sign
+// bytes -- exactly like IQ3_XXS, so splitting them apart is free:
+//
+//   dst_qs[k/8]   uchar  grid index low 8 bits, one per EIGHT weights
+//   dst_sg[k/8]   uchar  8 sign bits, one per grid entry
+//   dst_qh[k/32]  uchar  four 2-bit index highs
+//   dst_sc[k/32]  uchar  two 4-bit sub-scales
+//   dst_d [k/256] half
+//
+// Size preserving: 32 + 32 + 8 + 8 + 2 == 82 == sizeof(block_iq2_s).
+//
+// One iq2s_grid entry is EIGHT values, i.e. two dp4a operands, so a 32-block needs
+// only four lookups. Grid values top out at 43, well inside int8.
+//------------------------------------------------------------------------------
+kernel void kernel_convert_block_iq2_s_ns(
+    global struct block_iq2_s * src0,
+    global uchar * dst_qs,      // QK_K/8 per block
+    global uchar * dst_sg,      // QK_K/8
+    global uchar * dst_qh,      // QK_K/32
+    global uchar * dst_sc,      // QK_K/32
+    global half  * dst_d,       // 1
+    ulong          n_blk
+) {
+    const ulong i = get_global_id(0);
+    if (i >= n_blk) {
+        return;
+    }
+    global struct block_iq2_s * b = (global struct block_iq2_s *) src0 + i;
+
+    dst_d[i] = b->d;
+    for (int j = 0; j < QK_K/8;  ++j) { dst_qs[(QK_K/8)  * i + j] = b->qs[j];            }
+    for (int j = 0; j < QK_K/8;  ++j) { dst_sg[(QK_K/8)  * i + j] = b->qs[QK_K/8 + j];   }
+    for (int j = 0; j < QK_K/32; ++j) { dst_qh[(QK_K/32) * i + j] = b->qh[j];            }
+    for (int j = 0; j < QK_K/32; ++j) { dst_sc[(QK_K/32) * i + j] = b->scales[j];        }
+}
+
+//------------------------------------------------------------------------------
+// IQ2_S planes -> AoS blocks. Exact inverse of the split above; the caller must
+// un-transpose the five planes back to block-major first.
+//------------------------------------------------------------------------------
+kernel void kernel_restore_block_iq2_s_ns(
+    global uchar * src_qs,
+    global uchar * src_sg,
+    global uchar * src_qh,
+    global uchar * src_sc,
+    global half  * src_d,
+    global struct block_iq2_s * dst,
+    ulong          n_blk
+) {
+    const ulong i = get_global_id(0);
+    if (i >= n_blk) {
+        return;
+    }
+    global struct block_iq2_s * b = (global struct block_iq2_s *) dst + i;
+
+    b->d = src_d[i];
+    for (int j = 0; j < QK_K/8;  ++j) { b->qs[j]          = src_qs[(QK_K/8)  * i + j]; }
+    for (int j = 0; j < QK_K/8;  ++j) { b->qs[QK_K/8 + j] = src_sg[(QK_K/8)  * i + j]; }
+    for (int j = 0; j < QK_K/32; ++j) { b->qh[j]          = src_qh[(QK_K/32) * i + j]; }
+    for (int j = 0; j < QK_K/32; ++j) { b->scales[j]      = src_sc[(QK_K/32) * i + j]; }
 }
 
 //------------------------------------------------------------------------------
@@ -2888,5 +3317,154 @@ kernel void kernel_restore_block_q3_k_ns(
             v |= ((uint)(src_hm[(QK_K/8) * i + (g >> 1)] >> (4*(g & 1) + (e & 3))) & 1u) << sb;
         }
         b->hmask[ee] = (uchar)v;
+    }
+}
+
+kernel void kernel_restore_block_iq4_nl_noshuffle(
+    global uchar * src_q,
+    global half  * src_d,
+    global struct block_iq4_nl * dst,
+    uchar mask_0F,
+    uchar mask_F0,
+    ulong n_blk
+) {
+    if (get_global_id(0) >= n_blk) {
+        return;
+    }
+    global struct block_iq4_nl * b = (global struct block_iq4_nl *) dst + get_global_id(0);
+    global uchar * q = (global uchar *) src_q + QK4_NL/2*get_global_id(0);
+    global half  * d = (global half *) src_d + get_global_id(0);
+
+    b->d = *d;
+    for (int i = 0; i < QK4_NL/4; ++i) {
+        uchar x0 = q[i + 0       ];
+        uchar x1 = q[i + QK4_NL/4];
+
+        b->qs[2*i + 0] = convert_uchar((x0 & mask_0F) | ((x1 & mask_0F) << 4));
+        b->qs[2*i + 1] = convert_uchar(((x0 & mask_F0) >> 4) | (x1 & mask_F0));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// kernel_moe_expand_scale_q8_0
+//
+// Expand the q8_0 per-32-block scale d (one half/block, [expert][row][block]) into
+// the UNIFORM scale[16] format the generic dp4a MoE GEMM (kernel_gemm_moe_q8_1_dp4a,
+// MOE_QT=80) consumes: 16 f16 per 256-superblock (per-16-element segment), where the
+// two segments of each 32-block share the block's d. q8_0 is symmetric -> no min
+// buffer (the GEMM runs with has_min=0). The int8 weight codes are reused verbatim
+// from the existing flat q8_0 weight buffer (extra0_q8_0->q), so only the scale is
+// rebuilt here. One work-item per (row, superblock, expert).
+// ---------------------------------------------------------------------------
+__kernel void kernel_moe_expand_scale_q8_0(
+    __global const half * src_d,      // [expert][row][block], one scale per 32-block
+    __global       half * dst_scale,  // [expert][row][block][2] (FLAT per-32-block)
+    int ne00,
+    int ne01
+) {
+    int row = get_global_id(0);
+    int blk = get_global_id(1);   // 32-block index along K
+    int e   = get_global_id(2);
+    if (row >= ne01) return;
+
+    long nb = ne00 / 32;          // 32-blocks per row (K only needs % 32 == 0)
+    half d  = src_d[((long)e*ne01 + row)*nb + blk];
+    long b  = (((long)e*ne01 + row)*nb + blk) * 2;
+    dst_scale[b + 0] = d;
+    dst_scale[b + 1] = d;
+}
+
+// ---------------------------------------------------------------------------
+// kernel_moe_expand_scale_q5_0
+//
+// q5_0 = symmetric, value = d*(code-16), code = nibble | (hi<<4) in 0..31. The
+// generic dp4a MoE GEMM keeps the unsigned code and centers via the min term:
+//   scale*dp4a(code,a) - min*sum(a),  scale = d,  min = d*16.
+// Reads the existing q5_0 d ([expert][block][row], one half/32-block, from the
+// trans4 convert) and writes the FLAT per-32-block uniform scale[2]/min[1] in
+// [expert][row][block] order (a transpose). One work-item per (row, block, expert).
+// ---------------------------------------------------------------------------
+__kernel void kernel_moe_expand_scale_q5_0(
+    __global const half * src_d,      // [expert][block][row]
+    __global       half * dst_scale,  // [expert][row][block][2]
+    __global       half * dst_min,    // [expert][row][block]
+    int ne00,
+    int ne01
+) {
+    int row = get_global_id(0);
+    int blk = get_global_id(1);
+    int e   = get_global_id(2);
+    if (row >= ne01) return;
+
+    long nb = ne00 / 32;
+    half d  = src_d[(long)e*nb*ne01 + (long)blk*ne01 + row];   // [expert][block][row]
+    long sb = (((long)e*ne01 + row)*nb + blk) * 2;
+    long mb = ((long)e*ne01 + row)*nb + blk;
+    dst_scale[sb + 0] = d;
+    dst_scale[sb + 1] = d;
+    dst_min[mb] = (half)((float)d * 16.0f);
+}
+
+// ---------------------------------------------------------------------------
+// kernel_moe_expand_scale_q5_K
+//
+// q5_K value = d*sv*code + (-dm*mn), with the 6-bit packed per-sub-block scale sv
+// and min mn (8 sub-blocks of 32 per 256-superblock, decoded by get_scale_min_k4
+// from the 12-byte s[]). The generic dp4a MoE GEMM (kernel_gemm_moe_q8_1_dp4a,
+// MOE_QT=5) keeps the unsigned 5-bit code and applies scale/min via the uniform
+// per-32-block buffers:
+//   acc += sc0*a_d*raw1 + sc1*a_d*raw2 - mn_u*a_s,
+//   sc0 = sc1 = d*sv (both per-16 segments of a 32-block share the sub-block scale),
+//   mn_u = dm*mn (positive; the GEMM subtracts it -> the -dm*mn min term).
+// q5_K's q_img (low nibbles) + qh (hi-bit plane) are already in the layout the GEMM
+// reads (same trans4_ns convert that feeds gemm_moe_q5_k_f32_ns), so only the scale
+// is rebuilt here.
+//
+// Inputs are the trans4_ns convert outputs:
+//   src_s  : uchar [expert][row][superblock][12]   (6-bit packed scales/mins)
+//   src_d  : half  [expert][superblock][row]        (superblock scale d)
+//   src_dm : half  [expert][superblock][row]        (superblock min dm)
+// Outputs (FLAT per-32-block, [expert][row][32block]):
+//   dst_scale : half 2/32-block      dst_min : half 1/32-block
+// One work-item per (row, superblock, expert); each emits 8 sub-blocks.
+// ---------------------------------------------------------------------------
+__kernel void kernel_moe_expand_scale_q5_K(
+    __global const uchar * src_s,     // [expert][row][superblock][12]
+    __global const half  * src_d,     // [expert][superblock][row]
+    __global const half  * src_dm,    // [expert][superblock][row]
+    __global       half  * dst_scale, // [expert][row][32block][2]
+    __global       half  * dst_min,   // [expert][row][32block]
+    int ne00,
+    int ne01
+) {
+    int row = get_global_id(0);
+    int sb  = get_global_id(1);   // superblock index along K
+    int e   = get_global_id(2);
+    if (row >= ne01) return;
+
+    long nsb    = ne00 / 256;     // superblocks per row
+    long nblk32 = ne00 / 32;      // 32-blocks per row
+
+    float d  = (float)src_d [((long)e*nsb + sb)*ne01 + row];
+    float dm = (float)src_dm[((long)e*nsb + sb)*ne01 + row];
+
+    __global const uchar * sc = src_s + ((long)e*ne01 + row)*nsb*12 + (long)sb*12;
+
+    for (int j = 0; j < 8; ++j) {
+        uchar sv, mn;
+        // get_scale_min_k4 (6-bit packed scale/min for sub-block j of 8)
+        if (j < 4) {
+            sv = sc[j]   & 63;
+            mn = sc[j+4] & 63;
+        } else {
+            sv = (sc[j+4] & 0x0F) | ((sc[j-4] & 0xC0) >> 2);
+            mn = ((sc[j+4] >> 4) & 0x0F) | ((sc[j]   & 0xC0) >> 2);
+        }
+        long sub   = (long)sb*8 + j;
+        long sbase = (((long)e*ne01 + row)*nblk32 + sub) * 2;
+        half s_val = (half)(d  * (float)sv);
+        dst_scale[sbase + 0] = s_val;
+        dst_scale[sbase + 1] = s_val;
+        dst_min[((long)e*ne01 + row)*nblk32 + sub] = (half)(dm * (float)mn);
     }
 }

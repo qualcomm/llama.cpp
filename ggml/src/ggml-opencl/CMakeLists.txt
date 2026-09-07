@@ -110,10 +110,18 @@ set(GGML_OPENCL_KERNELS
     mul_mv_iq1_m_f32
     mul_mv_tq1_0_f32
     mul_mv_iq4_xs_f32
-    mul_mv_q2_k_f32
-    mul_mv_q2_k_f32_flat
-    mul_mv_q3_k_f32
+    mul_mv_iq4_xs_f32_flat
+    mul_mv_iq3_s_f32_flat
+    mul_mv_iq3_xxs_f32_flat
+    mul_mv_iq2_xxs_f32_flat
+    mul_mv_iq2_xs_f32_flat
     mul_mv_q3_k_f32_flat
+    mul_mv_q2_k_f32_flat
+    mul_mv_iq2_s_f32_flat
+    mul_mv_iq1_s_f32_flat
+    mul_mv_iq1_m_f32_flat
+    mul_mv_q2_k_f32
+    mul_mv_q3_k_f32
     mul_mv_q4_k_f32
     mul_mv_q4_k_f32_flat
     mul_mv_q4_k_q8_1
@@ -139,13 +147,6 @@ set(GGML_OPENCL_KERNELS
     mul_mv_id_mxfp4_f32_flat
     gemm_moe_q4_0_f32_ns
     gemm_moe_q4_0_q8_1_dp4a
-    gemm_cok_q4_k_q8_1_dp4a
-    gemm_cok_q6_k_q8_1_dp4a
-    gemm_cok_q4_0_q8_1_dp4a
-    gemm_cok8_q4_0_q8_1_dp4a
-    gemm_cok8_q5_k_q8_1_dp4a
-    gemm_cok8_q6_k_q8_1_dp4a
-    gemm_cok8_q6_k_flat_q8_1_dp4a
     gemv_moe_q4_0_f32_ns
     gemm_moe_q8_0_f32_ns
     gemm_moe_q4_1_f32_ns
@@ -159,14 +160,30 @@ set(GGML_OPENCL_KERNELS
     gemm_moe_q6_k_q8_1_dp4a
     gemm_moe_q8_1_dp4a
     moe_reorder_quant_a_q8_1
-    gemm_noshuffle_q2_k_q8_1_dp4a
-    gemm_noshuffle_q3_k_q8_1_dp4a
     gemm_noshuffle_q4_k_q8_1_dp4a
+    gemm_cok_q4_k_q8_1_dp4a
+    gemm_cok_q6_k_q8_1_dp4a
+    gemm_cok_q4_0_q8_1_dp4a
+    gemm_cok8_q4_0_q8_1_dp4a
+    gemm_cok8_q5_k_q8_1_dp4a
+    gemm_cok8_q6_k_q8_1_dp4a
+    gemm_cok8_q6_k_flat_q8_1_dp4a
     gemm_noshuffle_q5_k_q8_1_dp4a
     gemm_noshuffle_q6_k_q8_1_dp4a
     gemm_noshuffle_q8_0_q8_1_dp4a
     gemm_noshuffle_q5_0_q8_1_dp4a
     gemm_noshuffle_iq4_nl_q8_1_dp4a
+    mul_mm_iq4_xs_q8_1_dp4a
+    gemm_noshuffle_iq4_xs_q8_1_dp4a
+    gemm_noshuffle_iq3_s_q8_1_dp4a
+    gemm_noshuffle_iq3_xxs_q8_1_dp4a
+    gemm_noshuffle_iq2_xxs_q8_1_dp4a
+    gemm_noshuffle_iq2_xs_q8_1_dp4a
+    gemm_noshuffle_q3_k_q8_1_dp4a
+    gemm_noshuffle_q2_k_q8_1_dp4a
+    gemm_noshuffle_iq2_s_q8_1_dp4a
+    gemm_noshuffle_iq1_s_q8_1_dp4a
+    gemm_noshuffle_iq1_m_q8_1_dp4a
     gemm_noshuffle_q4_0_q8_1_dp4a
     quant_a_q8_1
     gemv_moe_q4_k_f32_ns

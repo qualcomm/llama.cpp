@@ -1,18 +1,53 @@
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
 
-#ifdef cl_intel_required_subgroup_size
-#define INTEL_GPU 1
-#endif
+// IQ2_XS decode GEMV over the feature-major plane split.
+//
+//   src0_qs [row + (k/8)*m]    ushort  9-bit grid index, 7-bit sign code above it
+//   src0_sc [row + (k/32)*m]   uchar   two 4-bit sub-scales
+//   src0_d  [row + (k/256)*m]  half    super-block scale
+//
+// Size preserving: 2*32 + 8 + 2 == 74 == sizeof(block_iq2_xs), so the three
+// planes are subbuffers of the tensor's own allocation.
+//
+// Same structure as mul_mv_iq2_xxs_f32_flat, and it differs from that kernel in
+// exactly two places: the grid index and its sign travel together in one ushort
+// instead of being split across a byte plane and a packed word, and the scale is
+// a nibble pair per 32 weights rather than the top four bits of the sign word.
+// The grid is twice as long (512 entries) and is indexed the same way, as uint
+// pairs, because one entry is eight bytes.
+
+// MEASURED on X2-90: Llama-3.2-3B-UD-IQ2_M pp512 679.5 -> 685.1 (+0.8%),
+// tg64 25.55 -> 25.69 (+0.6%). Small because that file holds only five IQ2_XS
+// tensors -- the rest is IQ2_S, which was already split. No model on hand is
+// IQ2_XS-dominant, so the large-gain case for this kernel is still unmeasured;
+// its twin one step down, IQ2_XXS, is 1.92x prefill and 1.71x decode on a model
+// made of it.
+//
+// Correctness: the plane round trip is byte exact on all five tensors, and
+// wikitext PPL agrees within its error bar (17.078 -> 17.099 +/- 0.88).
 
 #define QK_K 256
 
-typedef struct {
-    half   d;
-    ushort qs[QK_K/8];
-    uchar  scales[QK_K/32];
-} block_iq2_xs;
+#ifndef IQ2XS_MV_NSG
+#define IQ2XS_MV_NSG 8
+#endif
 
-// iq2xs_grid: 512 entries x 8 bytes = 4 KB, stored as uint pairs (lo, hi)
+// IQ2XS_MV_R2=1: a lane takes two adjacent rows so the ushort quant plane is
+// read a uint at a time and the uchar scale plane a ushort at a time.
+#ifndef IQ2XS_MV_R2
+#define IQ2XS_MV_R2 1
+#endif
+
+// IQ2XS_MV_GRIDIMG=1: read the grid through an image1d_buffer rather than from
+// __constant. Default on for the same reason as every other split grid type; see
+// the IQ2_XXS GEMV header for the five measurements behind it. This grid is the
+// largest of the set at 4 KB, which is the one size where local memory has ever
+// won on this part, so LDS is worth asking about here even though it lost on the
+// smaller tables -- it is not offered yet.
+#ifndef IQ2XS_MV_GRIDIMG
+#define IQ2XS_MV_GRIDIMG 1
+#endif
+
 constant uint iq2xs_grid[1024] = {
     0x08080808, 0x08080808, 0x0808082b, 0x08080808, 0x08081919, 0x08080808, 0x08082b08, 0x08080808,
     0x08082b2b, 0x08080808, 0x08190819, 0x08080808, 0x08191908, 0x08080808, 0x0819192b, 0x08080808,
@@ -144,261 +179,230 @@ constant uint iq2xs_grid[1024] = {
     0x082b2b08, 0x2b2b2b2b, 0x082b2b2b, 0x2b2b2b2b, 0x2b190819, 0x2b2b2b2b, 0x2b2b2b2b, 0x2b2b2b2b
 };
 
-// 7 bit index -> 8 sign bits
-constant uchar ksigns_iq2xs[128] = {
-      0, 129, 130,   3, 132,   5,   6, 135, 136,   9,  10, 139,  12, 141, 142,  15,
-    144,  17,  18, 147,  20, 149, 150,  23,  24, 153, 154,  27, 156,  29,  30, 159,
-    160,  33,  34, 163,  36, 165, 166,  39,  40, 169, 170,  43, 172,  45,  46, 175,
-     48, 177, 178,  51, 180,  53,  54, 183, 184,  57,  58, 187,  60, 189, 190,  63,
-    192,  65,  66, 195,  68, 197, 198,  71,  72, 201, 202,  75, 204,  77,  78, 207,
-     80, 209, 210,  83, 212,  85,  86, 215, 216,  89,  90, 219,  92, 221, 222,  95,
-     96, 225, 226,  99, 228, 101, 102, 231, 232, 105, 106, 235, 108, 237, 238, 111,
-    240, 113, 114, 243, 116, 245, 246, 119, 120, 249, 250, 123, 252, 125, 126, 255
-};
+// ksigns_iq2xs[v] == v | ((popcount(v) & 1) << 7), computed rather than read;
+// byte-indexed __constant loads serialize on Adreno.
+inline uint iq2xs_signs(uint code7) {
+    return code7 | ((uint)(popcount(code7) & 1u) << 7);
+}
 
-#define LOAD_VEC_A 4
-#define LOAD_VEC_B 4
-
-#define BM 64
-#define BN 64
-// K tile of 16 rather than 32: buf_a+buf_b are 2*BM*BK*4 bytes, so this halves
-// local memory per workgroup (16 KB -> 8 KB) and doubles resident workgroups.
-// Measured +24.4% (IQ4_XS) / +27.3% (IQ1_S) prefill on Adreno X2-90; the kernel
-// is occupancy bound on local memory, not bandwidth. BK=8 halves it again but
-// doubles the barrier count a second time and measures worse.
-#ifndef BK
-#define BK 16
+#ifndef IQ2XS_MV_SIGNXOR
+#define IQ2XS_MV_SIGNXOR 1
 #endif
-#ifndef TM
-#ifdef INTEL_GPU
-#define TM 8
+
+// Four grid bytes with their signs applied, as floats. base picks which nibble
+// of the sign byte this half of the entry uses: 0 for the low uint, 4 for the
+// high one.
+inline float4 iq2xs_vals(uint gv, uint sgv, uint base) {
+#if IQ2XS_MV_SIGNXOR
+    const uint  s   = sgv >> base;
+    const uint4 sgn = (uint4)(s << 31, s << 30, s << 29, s << 28) & 0x80000000u;
+    return as_float4(as_uint4(convert_float4(as_uchar4(gv))) ^ sgn);
 #else
-#define TM 4
+    const uint s = sgv >> base;
+    float4 v;
+    v.s0 = (float)((gv      ) & 0xFFu); if (s & 1u) { v.s0 = -v.s0; }
+    v.s1 = (float)((gv >>  8) & 0xFFu); if (s & 2u) { v.s1 = -v.s1; }
+    v.s2 = (float)((gv >> 16) & 0xFFu); if (s & 4u) { v.s2 = -v.s2; }
+    v.s3 = (float)((gv >> 24) & 0xFFu); if (s & 8u) { v.s3 = -v.s3; }
+    return v;
 #endif
-#endif
-#ifndef TN
-#define TN 8
+}
+
+// IQ2XS_MV_AIMG=1: read the ACTIVATION through an image1d_buffer.
+//
+// Measured on the siblings: IQ2_S +20.0%, IQ3_S +10.5%, and IQ4_XS -3.7%. The
+// boundary is how heavy the kernel is per weight, not how redundant the read is:
+// the redundancy is identical everywhere (`grp` carries no row index, so every
+// lane of a subgroup reads the SAME address, 64x over), but it only pays where
+// that load is a large share of a large total. This type has a codebook gather
+// and a delta term per 8 weights, which puts it on the winning side -- measured,
+// not assumed.
+//
+// One CL_RGBA/CL_FLOAT texel IS the float4 the scalar path loads, over src1's own
+// buffer, so there is no copy and no pre-pass. Applied to every kernel in the
+// file, because whichever ones this type's fusion and split-K defaults route
+// through are the ones carrying the frame.
+#ifndef IQ2XS_MV_AIMG
+#define IQ2XS_MV_AIMG 0
 #endif
 
-// LM_HALF=1 keeps the two LDS tiles in half instead of float. buf_a+buf_b are
-// 2*BM*BK*sizeof(elem), so this halves local memory per workgroup again --
-// and unlike shrinking BK it does NOT double the barrier count, which is what
-// made BK=8 lose. Accumulation stays in float; only the staged operands narrow.
-#ifndef LM_HALF
-#define LM_HALF 0
-#endif
-#if LM_HALF
-typedef half lm_st;
-#define LM_LD4(p, i) convert_float4(vload4((i), (p)))
+#if IQ2XS_MV_AIMG
+#define IQ2XS_YV(g) read_imagef(y_img, (int)(y_tex + (g)))
 #else
-typedef float lm_st;
-#define LM_LD4(p, i) vload4((i), (p))
+#define IQ2XS_YV(g) vload4((g), y)
 #endif
 
-// IQ2XS_LM_GRIDIMG=1: read the codebook through an image1d_buffer instead of
-// from __constant.
-//
-// This kernel is the fallback prefill GEMM, and on every generation where the
-// feature-major plane split is off it is the ONLY prefill path for this type.
-// The index comes from the thread's own block, so the read is a DIVERGENT gather
-// -- the pattern under which byte and word indexed __constant loads serialize on
-// Adreno. The dp4a twin of this kernel had the identical defect and the image was
-// worth up to +42.3% of prefill there, with perplexity bit-identical because only
-// the memory tier changes and never a value read from it.
-//
-// The image is the singleton the decode GEMV already builds at init on every
-// device, so this costs no memory. Default follows the per-generation texture
-// gate; it is UNMEASURED outside X2-class, and X2-class barely uses this kernel
-// because the split claims those tensors first, so the gate is where the value is.
-// MEASURED, and it is NOT the win the dp4a twin was. With the plane split forced
-// off so this kernel carries the prefill, X2-90:
-//   Llama-3.2-3B-IQ3_M     272.98 -> 274.75  (+0.6%)
-//   Llama-3.2-3B-UD-IQ2_M  236.22 -> 243.17  (+2.9%)
-//   Llama-3.2-3B-UD-IQ1_S  246.86 -> 255.99  (+3.7%)
-// PPL 11.6371 either way.
-//
-// So the same defect is worth 42%% in the dp4a GEMM and ~2%% here. The refinement:
-// a divergent __constant gather costs in proportion to how TIGHT the loop around
-// it is. The dp4a kernel builds eight operands per 32-K step in a very short
-// inner loop; this one computes a TM x TN output tile per thread, so each
-// dequantized weight feeds many multiply-accumulates and the gather amortizes.
-// This kernel is also 2.3x slower than the dp4a GEMM before either change
-// (273 against 618 on IQ3_M), so the codebook was never its limit.
-//
-// Small, consistent and never negative, so it stays on where the gate says so,
-// but do not expect the GEMM number from it.
-#ifndef IQ2XS_LM_GRIDIMG
-#define IQ2XS_LM_GRIDIMG 0
-#endif
-
-#if IQ2XS_LM_GRIDIMG
-#define IQ2XS_LM_GRID(i) (read_imageui(grid_img, (int)(i)).x)
-#else
-#define IQ2XS_LM_GRID(i) iq2xs_grid[(i)]
-#endif
-
-kernel void kernel_mul_mm_iq2_xs_f32_l4_lm(
-    global char   * src0,
-    ulong offset0,
-    global float4 * src1,
-    ulong offset1,
-    global float  * dst,
-    ulong offsetd,
-
-    int ne00,
-    int ne01,
-    int ne02,
-    int ne11,
-    int ne12,
-
-    int stride_a,
-    int stride_b,
-    int stride_d,
-
-    int batch_stride_a,
-    int batch_stride_b,
-    int batch_stride_d,
-
-    int r2,
-    int r3,
-    __read_only image1d_buffer_t grid_img   // see IQ2XS_LM_GRIDIMG
+kernel void kernel_mul_mv_iq2_xs_f32_flat(
+        __read_only image1d_buffer_t grid_img,
+        __read_only image1d_buffer_t y_img,   // see IQ2XS_MV_AIMG
+        uint y_off,                           // offset1/16, in float4 texels
+        global const ushort * src0_qs,
+        global const uchar  * src0_sc,
+        global const half   * src0_d,
+        global const float  * src1,
+        ulong offset1,
+        global float * dst,
+        ulong offsetd,
+        int ne00,      // K
+        int ne01,      // M, the number of output rows
+        int ne10,      // activation row stride, == K
+        int ne0        // dst row stride
 ) {
-    global block_iq2_xs * src0_b = (global block_iq2_xs *)(src0 + offset0);
-    src1 = (global float4*)((global char*)src1 + offset1);
-    dst  = (global float *)((global char*)dst  + offsetd);
+    src1 = (global const float *)((global const char *)src1 + offset1);
+    dst  = (global float       *)((global char       *)dst  + offsetd);
 
-    local lm_st buf_a[BM * BK];
-    local lm_st buf_b[BN * BK];
+    const uint m   = (uint)ne01;
+    const uint K   = (uint)ne00;
+    const uint nsb = K / QK_K;                  // super blocks along K
 
-    const int batch_idx = get_global_id(2);
+    const uint lid = get_local_id(0);           // lane
+    const uint sgi = get_local_id(1);           // K-split slice
+    const uint col = get_group_id(1);           // token
 
-    const int i13 = batch_idx / ne12;
-    const int i12 = batch_idx % ne12;
+    global const float * y = src1 + (ulong)col * (uint)ne10;
+#if IQ2XS_MV_AIMG
+    const uint y_tex = y_off + col * ((uint)ne10 >> 2);
+#endif
 
-    const int i03 = i13 / r3;
-    const int i02 = i12 / r2;
+#if IQ2XS_MV_GRIDIMG
+#define IQ2XS_GRID(i) (read_imageui(grid_img, (int)(i)).x)
+#else
+#define IQ2XS_GRID(i) iq2xs_grid[(i)]
+#endif
 
-    const int batch_idx_a = i03 * ne02 + i02;
+#if IQ2XS_MV_R2
+    const uint mh  = m >> 1;                        // rows per plane row, as pairs
+    const uint j   = get_group_id(0) * 64u + lid;   // row pair index
+    const uint row = j << 1;
 
-    const int ir = get_group_id(0);
-    const int ic = get_group_id(1);
+    float sumf  = 0.f;
+    float sumf1 = 0.f;
 
-    const int tid = get_local_id(0);
-    const int th_r  = tid % (BM / TM);
-    const int th_c  = tid / (BM / TM);
+    if (j < mh) {
+        global const uint   * qsu = (global const uint   *)src0_qs;
+        global const ushort * scu = (global const ushort *)src0_sc;
 
-    const int loadr_a = get_local_id(0) % (BK / LOAD_VEC_A);
-    const int loadc_a = get_local_id(0) / (BK / LOAD_VEC_A);
-    const int loadr_b = get_local_id(0) % (BK / LOAD_VEC_B);
-    const int loadc_b = get_local_id(0) / (BK / LOAD_VEC_B);
+        for (uint ib = sgi; ib < nsb; ib += IQ2XS_MV_NSG) {
+            const half2 dh = vload2(j + ib * mh, src0_d);
+            const float d0 = (float)dh.s0;
+            const float d1 = (float)dh.s1;
 
-    const int loadstride_a = get_local_size(0) * LOAD_VEC_A / BK;
-    const int loadstride_b = get_local_size(0) * LOAD_VEC_B / BK;
+            float acc0 = 0.f, acc1 = 0.f;
+            for (uint sb = 0; sb < 8u; ++sb) {
+                const uint sub = ib * 8u + sb;
+                const uint scv = (uint)scu[j + sub * mh];       // row pair, one load
 
-    // pos_a counts elements, not blocks
-    int pos_a = batch_idx_a * batch_stride_a + ir * BM * stride_a;
-    int pos_b = (batch_idx   * batch_stride_b + ic * BN * stride_b) / LOAD_VEC_B;
+                const float lo0 = 0.5f + (float)( scv        & 0xFu);
+                const float hi0 = 0.5f + (float)((scv >>  4) & 0xFu);
+                const float lo1 = 0.5f + (float)((scv >>  8) & 0xFu);
+                const float hi1 = 0.5f + (float)((scv >> 12) & 0xFu);
 
-    // Accumulate four rows at a time. buf_a is contiguous in the row index, so a
-    // whole TM slice arrives as float4 loads instead of TM scalar ones, and each
-    // vector mad replaces four scalar ones. Same operands in the same order, so
-    // the result is unchanged.
-    float4 sums4[(TM/4) * TN];
-    float4 cache_a4[TM/4];
+                const uint grp = sub * 4u;      // quant plane units of 8 weights
+                const uint qsb = j + grp * mh;
 
-    for (int i = 0; i < (TM/4) * TN; i++) {
-        sums4[i] = (float4)(0.0f);
-    }
+                float alo0 = 0.f, ahi0 = 0.f, alo1 = 0.f, ahi1 = 0.f;
+                for (uint u = 0; u < 4u; ++u) {
+                    const uint qsv = qsu[qsb + u * mh];         // row pair, one load
+                    const uint q0  = qsv & 0xFFFFu;
+                    const uint q1  = qsv >> 16;
 
-    for (int block = 0; block < ne00; block += BK) {
-        for (int l = 0; l < BM; l += loadstride_a) {
-            if (ir*BM + loadc_a + l < ne01) {
-                int idx = pos_a + (loadc_a + l) * stride_a + loadr_a * LOAD_VEC_A;
-                int ib  = idx / QK_K;
-                int e   = idx % QK_K;
+                    const uint g0  = (q0 & 511u) << 1;          // uint pair index
+                    const uint g1  = (q1 & 511u) << 1;
+                    const uint sg0 = iq2xs_signs(q0 >> 9);
+                    const uint sg1 = iq2xs_signs(q1 >> 9);
 
-                global block_iq2_xs * xb = src0_b + ib;
+                    const float4 yl = IQ2XS_YV(sub * 8u + u * 2u + 0u);
+                    const float4 yh = IQ2XS_YV(sub * 8u + u * 2u + 1u);
 
-                int ib32 = e >> 5;
-                int rem  = e & 31;
-                int lg    = rem >> 3;
-                int j0   = rem & 7;
+                    const float a0 = dot(yl, iq2xs_vals(IQ2XS_GRID(g0    ), sg0, 0u))
+                                   + dot(yh, iq2xs_vals(IQ2XS_GRID(g0 + 1), sg0, 4u));
+                    const float a1 = dot(yl, iq2xs_vals(IQ2XS_GRID(g1    ), sg1, 0u))
+                                   + dot(yh, iq2xs_vals(IQ2XS_GRID(g1 + 1), sg1, 4u));
 
-                ushort q  = xb->qs[4*ib32 + lg];
-                uchar  scb = xb->scales[ib32];
-                float  db  = (float)xb->d * (0.5f + (float)((lg < 2) ? (scb & 0xf) : (scb >> 4))) * 0.25f;
-
-                uchar sg = ksigns_iq2xs[q >> 9];
-                uint  g  = IQ2XS_LM_GRID(2*(q & 511) + (j0 >> 2));
-
-                float4 v1;
-                v1.s0 = db * (float)((g >>  0) & 0xFF) * ((sg & (1 << (j0+0))) ? -1.f : 1.f);
-                v1.s1 = db * (float)((g >>  8) & 0xFF) * ((sg & (1 << (j0+1))) ? -1.f : 1.f);
-                v1.s2 = db * (float)((g >> 16) & 0xFF) * ((sg & (1 << (j0+2))) ? -1.f : 1.f);
-                v1.s3 = db * (float)((g >> 24) & 0xFF) * ((sg & (1 << (j0+3))) ? -1.f : 1.f);
-
-                buf_a[(loadr_a * LOAD_VEC_A + 0) * BM + loadc_a + l] = v1.s0;
-                buf_a[(loadr_a * LOAD_VEC_A + 1) * BM + loadc_a + l] = v1.s1;
-                buf_a[(loadr_a * LOAD_VEC_A + 2) * BM + loadc_a + l] = v1.s2;
-                buf_a[(loadr_a * LOAD_VEC_A + 3) * BM + loadc_a + l] = v1.s3;
-            } else {
-                buf_a[(loadr_a * LOAD_VEC_A + 0) * BM + loadc_a + l] = 0.0f;
-                buf_a[(loadr_a * LOAD_VEC_A + 1) * BM + loadc_a + l] = 0.0f;
-                buf_a[(loadr_a * LOAD_VEC_A + 2) * BM + loadc_a + l] = 0.0f;
-                buf_a[(loadr_a * LOAD_VEC_A + 3) * BM + loadc_a + l] = 0.0f;
-            }
-        }
-
-        for (int l = 0; l < BN; l += loadstride_b) {
-            if (ic*BN + loadc_b + l < ne11) {
-                int idx = pos_b + (loadc_b + l) * stride_b / LOAD_VEC_B + loadr_b;
-                buf_b[(loadr_b * LOAD_VEC_B + 0) * BN + loadc_b + l] = src1[idx].s0;
-                buf_b[(loadr_b * LOAD_VEC_B + 1) * BN + loadc_b + l] = src1[idx].s1;
-                buf_b[(loadr_b * LOAD_VEC_B + 2) * BN + loadc_b + l] = src1[idx].s2;
-                buf_b[(loadr_b * LOAD_VEC_B + 3) * BN + loadc_b + l] = src1[idx].s3;
-            } else {
-                buf_b[(loadr_b * LOAD_VEC_B + 0) * BN + loadc_b + l] = 0.0f;
-                buf_b[(loadr_b * LOAD_VEC_B + 1) * BN + loadc_b + l] = 0.0f;
-                buf_b[(loadr_b * LOAD_VEC_B + 2) * BN + loadc_b + l] = 0.0f;
-                buf_b[(loadr_b * LOAD_VEC_B + 3) * BN + loadc_b + l] = 0.0f;
-            }
-        }
-
-        barrier(CLK_LOCAL_MEM_FENCE);
-
-        pos_a += BK;
-        pos_b += BK / LOAD_VEC_B;
-
-        for (int i = 0; i < BK; i++) {
-            for (int a = 0; a < TM/4; a++) {
-                cache_a4[a] = LM_LD4(buf_a + (i) * BM + th_r * TM, a);
-            }
-
-            for (int cc = 0; cc < TN; cc++) {
-                const float cache_b = buf_b[(i) * BN + th_c * TN + cc];
-                for (int a = 0; a < TM/4; a++) {
-                    const int sums_idx = cc*(TM/4) + a;
-                    sums4[sums_idx] = mad(cache_a4[a], (float4)cache_b, sums4[sums_idx]);
+                    if (u < 2u) { alo0 += a0; alo1 += a1; }
+                    else        { ahi0 += a0; ahi1 += a1; }
                 }
+                acc0 += lo0 * alo0 + hi0 * ahi0;
+                acc1 += lo1 * alo1 + hi1 * ahi1;
             }
+            sumf  += d0 * 0.25f * acc0;
+            sumf1 += d1 * 0.25f * acc1;
         }
-        barrier(CLK_LOCAL_MEM_FENCE);
     }
+#else
+    const uint row = get_group_id(0) * 64u + lid;
 
-    const int dr = ir * BM + th_r * TM;
-    const int dc = ic * BN + th_c * TN;
+    float sumf = 0.f;
 
-    const int offsets = batch_idx * batch_stride_d;
+    if (row < m) {
+        for (uint ib = sgi; ib < nsb; ib += IQ2XS_MV_NSG) {
+            const float d = (float)src0_d[row + ib * m];
 
-    for (int cc = 0; cc < TN; cc++) {
-        for (int a = 0; a < TM/4; a++) {
-            const float4 v = sums4[cc * (TM/4) + a];
-            const float  vs[4] = { v.s0, v.s1, v.s2, v.s3 };
-            for (int k = 0; k < 4; k++) {
-                if (dr + 4*a + k < ne01 && dc + cc < ne11) {
-                    dst[offsets + (dc + cc) * stride_d + dr + 4*a + k] = vs[k];
+            float acc = 0.f;
+            for (uint sb = 0; sb < 8u; ++sb) {
+                const uint sub = ib * 8u + sb;
+                const uint scv = (uint)src0_sc[row + sub * m];
+
+                const float lo = 0.5f + (float)( scv       & 0xFu);
+                const float hi = 0.5f + (float)((scv >> 4) & 0xFu);
+
+                const uint grp = sub * 4u;
+                const uint qsb = row + grp * m;
+
+                float alo = 0.f, ahi = 0.f;
+                for (uint u = 0; u < 4u; ++u) {
+                    const uint q  = (uint)src0_qs[qsb + u * m];
+                    const uint g  = (q & 511u) << 1;
+                    const uint sg = iq2xs_signs(q >> 9);
+
+                    const float4 yl = IQ2XS_YV(sub * 8u + u * 2u + 0u);
+                    const float4 yh = IQ2XS_YV(sub * 8u + u * 2u + 1u);
+
+                    const float a = dot(yl, iq2xs_vals(IQ2XS_GRID(g    ), sg, 0u))
+                                  + dot(yh, iq2xs_vals(IQ2XS_GRID(g + 1), sg, 4u));
+
+                    if (u < 2u) { alo += a; } else { ahi += a; }
                 }
+                acc += lo * alo + hi * ahi;
             }
+            sumf += d * 0.25f * acc;
         }
     }
+#endif
+
+#if IQ2XS_MV_NSG > 1
+#if IQ2XS_MV_R2
+    __local float2 part[IQ2XS_MV_NSG][64];
+    part[sgi][lid] = (float2)(sumf, sumf1);
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (sgi != 0) {
+        return;
+    }
+    for (uint s = 1; s < IQ2XS_MV_NSG; ++s) {
+        const float2 p = part[s][lid];
+        sumf  += p.s0;
+        sumf1 += p.s1;
+    }
+#else
+    __local float part[IQ2XS_MV_NSG][64];
+    part[sgi][lid] = sumf;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (sgi != 0) {
+        return;
+    }
+    for (uint s = 1; s < IQ2XS_MV_NSG; ++s) {
+        sumf += part[s][lid];
+    }
+#endif
+#endif
+
+#if IQ2XS_MV_R2
+    if (j < mh) {
+        vstore2((float2)(sumf, sumf1), 0, dst + (ulong)col * (uint)ne0 + row);
+    }
+#else
+    if (row < m) {
+        dst[(ulong)col * (uint)ne0 + row] = sumf;
+    }
+#endif
 }

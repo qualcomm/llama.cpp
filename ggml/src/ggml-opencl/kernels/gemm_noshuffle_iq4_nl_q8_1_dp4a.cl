@@ -23,7 +23,20 @@
 //   src0_q[row + (k/4)*m]  ushort = 4 nibbles (K = 4*grp .. +3)
 //   src0_d[row + (k/32)*m] half   = per-32-block scale
 
+// TILESIZE_N is the token tile: it fixes the accumulator count (float4
+// acc[TILESIZE_N/4]) and the LDS staging width, so it is compile-time. Left
+// overridable because the right value is PER DEVICE -- the X2-tuned 32
+// over-occupies LDS on an X1-85 and starves it of resident workgroups, where a
+// narrow tile is worth +36% pp512 on the IQ4_XS twin of this kernel.
+//
+// Safe to vary here: the activation tile is staged with a strided
+// `for (idx = lid; idx < TILESIZE_N*N; idx += 64)` loop, correct at any tile.
+// Do NOT copy this to the q2_K or IQ1_M twins -- those map a lane straight onto
+// (column, half) with `lid >> 1`, so they are only correct when
+// TILESIZE_N*2 == 64 and a -D there would silently compute wrong answers.
+#ifndef TILESIZE_N
 #define TILESIZE_N 32
+#endif
 
 // IQ4_NL non-linear codebook as signed int8 (== the f16 kvalues_iq4nl, integral),
 // packed 4 codes per uint. Mirrors the f16 kernel's iq4nl_packed trick: divergent

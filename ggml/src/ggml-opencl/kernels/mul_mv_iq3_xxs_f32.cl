@@ -14,6 +14,10 @@
 
 #define QK_K 256
 
+#ifndef IQ_MV_VEC
+#define IQ_MV_VEC 1
+#endif
+
 // d, then 64 grid index bytes, then 8 uint32 of packed scale+signs
 typedef struct {
     half  d;
@@ -165,10 +169,21 @@ kernel void kernel_mul_mv_iq3_xxs_f32(
             float db = (float)xb->d * (0.5f + (float)(aux32 >> 28)) * 0.5f;
 
             float acc = 0.f;
+#if IQ_MV_VEC
+            // the block is 98 bytes and qs starts at +2, so the 8 quant bytes are
+            // only ushort aligned - four ushort reads instead of eight uchar ones
+            ushort4 qv = vload4(0, (global ushort *)qs);
+            ushort  qp[4] = { qv.s0, qv.s1, qv.s2, qv.s3 };
+#endif
             for (int l = 0; l < 4; ++l) {
                 uchar signs = ksigns_iq2xs[(aux32 >> (7*l)) & 127];
+#if IQ_MV_VEC
+                uint  g1 = iq3xxs_grid[qp[l] & 0xff];
+                uint  g2 = iq3xxs_grid[qp[l] >>    8];
+#else
                 uint  g1 = iq3xxs_grid[qs[2*l+0]];
                 uint  g2 = iq3xxs_grid[qs[2*l+1]];
+#endif
 
                 for (int j = 0; j < 4; ++j) {
                     float s1 = (signs & (1 << j))       ? -1.f : 1.f;

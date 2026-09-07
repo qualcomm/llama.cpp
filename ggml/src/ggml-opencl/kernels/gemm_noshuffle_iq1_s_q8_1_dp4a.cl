@@ -1,33 +1,70 @@
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
-
-#ifdef cl_intel_required_subgroup_size
-#pragma OPENCL EXTENSION cl_intel_required_subgroup_size : enable
-#define INTEL_GPU 1
-#define REQD_SUBGROUP_SIZE_16 __attribute__((intel_reqd_sub_group_size(16)))
-#define REQD_SUBGROUP_SIZE_32 __attribute__((intel_reqd_sub_group_size(32)))
-#elif defined(cl_qcom_reqd_sub_group_size)
-#pragma OPENCL EXTENSION cl_qcom_reqd_sub_group_size : enable
-#define ADRENO_GPU 1
-#define REQD_SUBGROUP_SIZE_64  __attribute__((qcom_reqd_sub_group_size("half")))
-#define REQD_SUBGROUP_SIZE_128 __attribute__((qcom_reqd_sub_group_size("full")))
+#pragma OPENCL EXTENSION cl_khr_subgroups : enable
+#ifdef cl_khr_integer_dot_product
+#pragma OPENCL EXTENSION cl_khr_integer_dot_product : enable
 #endif
+
+// Dense IQ1_S prefill GEMM, dp4a (int8) inner loop, over the feature-major plane
+// split produced by kernel_convert_block_iq1_s_ns:
+//
+//   src0_qs[row + (k/8)*m]    uchar   grid index low 8 bits
+//   src0_qh[row + (k/32)*m]   ushort  4x 3-bit index high, 3-bit scale, sign
+//   src0_d [row + (k/256)*m]  half
+//
+// IQ1_S dequantises to dl * (grid + delta) with delta = +-0.125, which is not an
+// integer -- but it factorises exactly the way q2_K's min does:
+//
+//   sum_k a_k * dl*(g_k + dlt) = dl * ( da*<g,qa> + dlt*sa )
+//
+// where dlt folds the grid's stored +1 offset in (dlt = delta - 1) and `sa` is
+// q8_1's own per-32-block sum of dequantised activations. IQ1_S is the one type
+// where that plane is exactly the right granularity -- delta is per 32-block --
+// so unlike q2_K nothing has to be re-derived per 16.
+//
+// The GPU grid stores 8 values as nibbles, low nibbles first: masking the uint
+// with 0x0F0F0F0F yields weights 0..3 already packed as four int8 (values 0..2),
+// and shifting down 4 first yields weights 4..7. Two dp4a operands, no shuffling.
 
 #define QK_K 256
 
-#ifndef IQ_MV_VEC
-#define IQ_MV_VEC 1
+// TILESIZE_N is the token tile: it fixes the accumulator count (float4
+// acc[TILESIZE_N/4]) and the LDS staging width, so it is compile-time. Left
+// overridable because the right value is PER DEVICE -- the X2-tuned 32
+// over-occupies LDS on an X1-85 and starves it of resident workgroups, where a
+// narrow tile is worth +36% pp512 on the IQ4_XS twin of this kernel.
+//
+// Safe to vary here: the activation tile is staged with a strided
+// `for (idx = lid; idx < TILESIZE_N*N; idx += 64)` loop, correct at any tile.
+// Do NOT copy this to the q2_K or IQ1_M twins -- those map a lane straight onto
+// (column, half) with `lid >> 1`, so they are only correct when
+// TILESIZE_N*2 == 64 and a -D there would silently compute wrong answers.
+#ifndef TILESIZE_N
+#define TILESIZE_N 32
 #endif
-#define IQ1S_DELTA 0.125f
 
-typedef struct {
-    half   d;
-    uchar  qs[QK_K/8];
-    ushort qh[QK_K/32];
-} block_iq1_s;
+// See gemm_noshuffle_iq2_s_q8_1_dp4a: staging the 8 KB grid in LDS is a win in
+// the 512-thread decode GEMV and a small LOSS in this 64-thread GEMM.
+// IQ1S_GEMM_GRIDIMG=1: read the codebook through an image1d_buffer.
+//
+// In a GEMM every one of the 64 lanes owns a different row, so the grid reads in
+// a 32-K step are a DIVERGENT gather, and byte/word indexed __constant loads
+// serialize on Adreno under exactly that pattern. Local memory was measured on
+// the IQ2_S twin and lost, because the staged table costs occupancy in a
+// 64-thread workgroup; an image costs no occupancy and no memory, since it is
+// the singleton the decode GEMV already builds at init.
+//
+// The IQ3_S twin of this change is +43.0% prefill on a model made of the type
+// and +8.0% on a hybrid, with perplexity identical to four decimals. Same
+// defect, same fix, here. Default follows the per-generation texture gate.
+// MEASURED: Llama-3.2-3B-UD-IQ1_S pp512 788.7 -> 945.8 (+19.9%), wikitext PPL
+// 96.9777 both ways. IQ1_S is 51% of that file's prefill GPU time.
+#ifndef IQ1S_GEMM_GRIDIMG
+#define IQ1S_GEMM_GRIDIMG 0
+#endif
 
-// iq1s_grid_gpu: 2048 x uint32 = 8 KB. Each uint holds 8 values as nibbles,
-// low nibbles first then high; the stored value is the real one plus 1, and
-// the -1 is folded into delta below (same packing CUDA uses).
+#ifndef IQ1S_GEMM_LDSGRID
+#define IQ1S_GEMM_LDSGRID 0
+#endif
 constant uint iq1s_grid_gpu[2048] = {
     0x00000000, 0x00000002, 0x00000101, 0x00000200, 0x00000202, 0x00010001, 0x00010101, 0x00020000,
     0x00020002, 0x00020200, 0x00020202, 0x01000101, 0x01010001, 0x01010100, 0x01010102, 0x01020101,
@@ -287,133 +324,149 @@ constant uint iq1s_grid_gpu[2048] = {
     0x22202022, 0x22202220, 0x22202222, 0x22212121, 0x22222020, 0x22222022, 0x22222220, 0x22222222
 };
 
-#undef N_DST
-#undef N_SIMDGROUP
-#undef N_SIMDWIDTH
+// The activation tile is staged as uint4, not uint: the eight uints a token needs
+// for one 32-K step are contiguous, so they are two uint4s. That cuts the inner
+// loop's __local load count 4x and widens the cooperative staging load from 4 to
+// 16 bytes per lane. Measured on the IQ4_XS twin of this kernel: 3B pp512
+// 675 -> 780 (+15.6%), 27B 72.2 -> 78.2.
+//
+// The uint4s are copied into private temps at the call site -- dp4a with a
+// __local operand inside an unrolled loop is a documented miscompile on X2.
+inline int dot8_q8a_v(uint8 qw, uint4 a0, uint4 a1) {
+    int r = 0;
+    r = dot_acc_sat_4x8packed_ss_int(qw.s0, a0.x, r);
+    r = dot_acc_sat_4x8packed_ss_int(qw.s1, a0.y, r);
+    r = dot_acc_sat_4x8packed_ss_int(qw.s2, a0.z, r);
+    r = dot_acc_sat_4x8packed_ss_int(qw.s3, a0.w, r);
+    r = dot_acc_sat_4x8packed_ss_int(qw.s4, a1.x, r);
+    r = dot_acc_sat_4x8packed_ss_int(qw.s5, a1.y, r);
+    r = dot_acc_sat_4x8packed_ss_int(qw.s6, a1.z, r);
+    r = dot_acc_sat_4x8packed_ss_int(qw.s7, a1.w, r);
+    return r;
+}
 
-#ifdef INTEL_GPU
-#define N_DST 4
-#define N_SIMDGROUP 1
-#define N_SIMDWIDTH 16
-#elif defined (ADRENO_GPU)
-#define N_DST 4
-#define N_SIMDGROUP 1
-#define N_SIMDWIDTH 64
-#endif
-
-#undef  BLOCK_STRIDE
-// 8 threads cover one super block, one 32 element sub block each
-#define BLOCK_STRIDE (N_SIMDWIDTH/8)
-
-#ifdef INTEL_GPU
-REQD_SUBGROUP_SIZE_16
-#elif defined (ADRENO_GPU)
-REQD_SUBGROUP_SIZE_64
-#endif
-kernel void kernel_mul_mv_iq1_s_f32(
-        global char * src0,
-        int offset0,
-        global char * src1,
-        int offset1,
-        global char * dst,
-        int offsetd,
-        int ne00,
-        int ne01,
-        ulong nb01,
-        ulong nb02,
-        ulong nb03,
-        int ne12,
-        ulong nb11,
-        ulong nb12,
-        ulong nb13,
-        int ne0,
-        int ne1,
-        int r2,
-        int r3
+__attribute__((qcom_wave_pair_mode(1)))
+kernel void kernel_gemm_noshuffle_iq1_s_q8_1_dp4a(
+        __read_only image1d_buffer_t grid_img,   // see IQ1S_GEMM_GRIDIMG
+        __global const uchar  * src0_qs,
+        __global const ushort * src0_qh,
+        __global const half   * src0_d,
+        __global const uint   * src1_qa,
+        __global const half   * src1_da,
+        __global const half   * src1_sa,   // per-32 sum of dequantised activations
+        __global       float  * dst,
+        ulong  offsetd,
+        int    m,
+        int    n_no_padding,
+        int    k
 ) {
-    src0 = src0 + offset0;
-    src1 = src1 + offset1;
-    dst  = dst  + offsetd;
+    dst = (global float *)((global char *)dst + offsetd);
 
-    int ix = get_sub_group_local_id()/8;  // super block index
-    int it = get_sub_group_local_id()%8;  // sub block inside the super block
+    const uint lid = get_local_id(0);
+    const uint block_id_m = get_global_id(1);
+    const uint block_id_n = get_global_id(2);
 
-    int nb = ne00/QK_K;
+    const uint row      = block_id_m * 64 + lid;
+    const uint col_base = block_id_n * TILESIZE_N;
+    const bool row_valid = row < (uint)m;
+    const uint rrow     = row_valid ? row : 0;
 
-    int r0 = get_group_id(0);
-    int r1 = get_group_id(1);
-    int im = get_group_id(2);
-    int first_row = (r0 * N_SIMDGROUP + get_sub_group_id()) * N_DST;
+    const uint k_u = (uint)k >> 2;
+    const uint k_b = (uint)k >> 5;
 
-    int i12 = im%ne12;
-    int i13 = im/ne12;
+    __local uint4 sh_qa4[TILESIZE_N][2];
+    __local half sh_da[TILESIZE_N];
+    __local half sh_sa[TILESIZE_N];
 
-    int offset_src0 = first_row*nb01 + (i12/r2)*nb02 + (i13/r3)*nb03;
-    int offset_src1 =        r1*nb11 + (i12   )*nb12 + (i13   )*nb13;
-
-    global block_iq1_s * x = (global block_iq1_s *) (src0 + offset_src0);
-    global float         * y = (global float         *) (src1 + offset_src1);
-
-    float yl[32];
-    float sumf[N_DST] = {0.f};
-    float all_sum;
-
-    global float * y4 = y + ix * QK_K + 32 * it;
-
-    for (int ib = ix; ib < nb; ib += BLOCK_STRIDE) {
-        for (int i = 0; i < 32; ++i) {
-            yl[i] = y4[i];
-        }
-
-        global char * xrow = (global char *)(x + ib);
-
-        // keep the trip count fixed and clamp instead of skipping: rows past
-        // ne01 re-read row 0, and their sums are dropped at the store
-        for (int row = 0; row < N_DST; row++) {
-            int rsafe = (first_row + row < ne01) ? row : 0;
-            global block_iq1_s * xb = (global block_iq1_s *)(xrow + rsafe*nb01);
-
-            ushort qhb = xb->qh[it];
-            float  dl  = (float)xb->d * (float)(2*((qhb >> 12) & 7) + 1);
-            float  dlt = (qhb & 0x8000) ? (-1.f - IQ1S_DELTA) : (-1.f + IQ1S_DELTA);
-
-            global uchar * qsb = xb->qs + 4*it;
-
-            float acc = 0.f;
-#if IQ_MV_VEC
-            // block is 50 bytes with qs at +2, so the four quant bytes are
-            // ushort aligned but not uint aligned
-            ushort2 qv = vload2(0, (global ushort *)qsb);
-            ushort  qp[2] = { qv.s0, qv.s1 };
-#endif
-            for (int l = 0; l < 4; ++l) {
-#if IQ_MV_VEC
-                uchar qb = (l & 1) ? (uchar)(qp[l>>1] >> 8) : (uchar)(qp[l>>1] & 0xff);
-                uint gi = (uint)qb | ((((uint)qhb >> (3*l)) & 7) << 8);
+#if IQ1S_GEMM_GRIDIMG
+#define IQ1S_GRID(i) (read_imageui(grid_img, (int)(i)).x)
+#elif IQ1S_GEMM_LDSGRID
+    __local uint sh_grid[2048];
+    for (uint i = lid; i < 2048u; i += 64u) {
+        sh_grid[i] = iq1s_grid_gpu[i];
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+#define IQ1S_GRID(i) sh_grid[(i)]
 #else
-                uint gi = (uint)qsb[l] | ((((uint)qhb >> (3*l)) & 7) << 8);
+#define IQ1S_GRID(i) iq1s_grid_gpu[(i)]
 #endif
-                uint g  = iq1s_grid_gpu[gi];
-                for (int j = 0; j < 4; ++j) {
-                    acc += yl[8*l+j+0] * ((float)((g >> (8*j+0)) & 0xF) + dlt);
-                    acc += yl[8*l+j+4] * ((float)((g >> (8*j+4)) & 0xF) + dlt);
-                }
-            }
 
-            sumf[row] += dl * acc;
+#define NGROUPS (TILESIZE_N / 4)
+    float4 acc[NGROUPS];
+    #pragma unroll
+    for (int g = 0; g < NGROUPS; ++g) acc[g] = (float4)(0.0f);
+
+    for (uint step = 0; step < (uint)k; step += 32) {
+        const uint sub = step >> 5;
+        const uint ib  = sub >> 3;
+
+        const uint  qhv = (uint)src0_qh[rrow + sub * (uint)m];
+        const float dl  = (float)src0_d[rrow + ib * (uint)m]
+                        * (float)(2u * ((qhv >> 12) & 7u) + 1u);
+        // delta - 1: the grid stores the real value plus one
+        const float dlt = ((qhv & 0x8000u) ? -0.125f : 0.125f) - 1.0f;
+
+        const uint gb = rrow + (step >> 3) * (uint)m;
+
+        uint8 qw;
+        {
+            const uint g0 = IQ1S_GRID((uint)src0_qs[gb + 0u * (uint)m] | ((( qhv       & 7u) << 8)));
+            const uint g1 = IQ1S_GRID((uint)src0_qs[gb + 1u * (uint)m] | ((((qhv >> 3) & 7u) << 8)));
+            const uint g2 = IQ1S_GRID((uint)src0_qs[gb + 2u * (uint)m] | ((((qhv >> 6) & 7u) << 8)));
+            const uint g3 = IQ1S_GRID((uint)src0_qs[gb + 3u * (uint)m] | ((((qhv >> 9) & 7u) << 8)));
+            qw.s0 =  g0        & 0x0F0F0F0Fu;   qw.s1 = (g0 >> 4) & 0x0F0F0F0Fu;
+            qw.s2 =  g1        & 0x0F0F0F0Fu;   qw.s3 = (g1 >> 4) & 0x0F0F0F0Fu;
+            qw.s4 =  g2        & 0x0F0F0F0Fu;   qw.s5 = (g2 >> 4) & 0x0F0F0F0Fu;
+            qw.s6 =  g3        & 0x0F0F0F0Fu;   qw.s7 = (g3 >> 4) & 0x0F0F0F0Fu;
         }
 
-        y4 += BLOCK_STRIDE * QK_K;
-    }
-
-    global float * dst_f32 = (global float *) dst + im*ne0*ne1 + r1*ne0;
-
-    for (int row = 0; row < N_DST; ++row) {
-        all_sum = sub_group_reduce_add(sumf[row]);
-        if (first_row + row < ne01) {
-            if (get_sub_group_local_id() == 0) {
-                dst_f32[first_row + row] = all_sum;
-            }
+        // 16-byte cooperative staging: TILESIZE_N*2 uint4s instead of TILESIZE_N*8
+        // uints. (c*k_u + step/4) is a multiple of 8, so vload4 is aligned.
+        for (uint idx = lid; idx < TILESIZE_N * 2; idx += 64) {
+            const uint t = idx >> 1;
+            const uint v = idx & 1;
+            const uint c = col_base + t;
+            sh_qa4[t][v] = (c < (uint)n_no_padding)
+                         ? vload4(0, src1_qa + c * k_u + (step >> 2) + (v << 2))
+                         : (uint4)(0u);
         }
+        if (lid < TILESIZE_N) {
+            const uint c = col_base + lid;
+            const bool ok = c < (uint)n_no_padding;
+            sh_da[lid] = ok ? src1_da[c * k_b + sub] : (half)0;
+            sh_sa[lid] = ok ? src1_sa[c * k_b + sub] : (half)0;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+#define LD4(arr, b) ((float4)((float)arr[(b)+0], (float)arr[(b)+1], (float)arr[(b)+2], (float)arr[(b)+3]))
+        #pragma unroll
+        for (int g = 0; g < NGROUPS; ++g) {
+            const int b = g * 4;
+            float4 rf;
+#define TDOT4(T) dot8_q8a_v(qw, (uint4)(sh_qa4[T][0]), (uint4)(sh_qa4[T][1]))
+            rf.s0 = (float)TDOT4(b+0);  rf.s1 = (float)TDOT4(b+1);
+            rf.s2 = (float)TDOT4(b+2);  rf.s3 = (float)TDOT4(b+3);
+            acc[g] += dl * (LD4(sh_da, b) * rf) + (dl * dlt) * LD4(sh_sa, b);
+        }
+#undef TDOT4
+#undef LD4
+        barrier(CLK_LOCAL_MEM_FENCE);
     }
+
+    if (!row_valid) {
+        return;
+    }
+
+    #pragma unroll
+    for (int g = 0; g < NGROUPS; ++g) {
+        const uint b = (uint)(g * 4);
+        const float4 a = acc[g];
+        const uint c0 = col_base + b;
+        if (c0 + 0 < (uint)n_no_padding) dst[(c0 + 0) * (uint)m + row] = a.s0;
+        if (c0 + 1 < (uint)n_no_padding) dst[(c0 + 1) * (uint)m + row] = a.s1;
+        if (c0 + 2 < (uint)n_no_padding) dst[(c0 + 2) * (uint)m + row] = a.s2;
+        if (c0 + 3 < (uint)n_no_padding) dst[(c0 + 3) * (uint)m + row] = a.s3;
+    }
+#undef NGROUPS
+#undef IQ1S_GRID
 }
