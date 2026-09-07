@@ -9609,6 +9609,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32, 5120, n, 6144, {1, 1}, {1, 1}));
     }
 
+    // GQA K/V projections: m = n_embd_k_gqa (SMALL, < 512), k = n_embd. This band had
+    // no coverage at all, which is how a corruption in it went unnoticed: of the whole
+    // MUL_MAT list only two cases pair a weight m < 512 with an activation n >= 512, and
+    // both are f32/q4_0, so the OpenCL backend's large-N guard for the
+    // q4_1/q5_0/q5_1/mxfp4/iq4_nl/q4_K/q5_K/q6_K branch was never toggled by a test.
+    //
+    // m=256 is n_embd_k_gqa for any 2-KV-head model at head_dim 128. k=3072 is
+    // Falcon-H1-7B (hybrid Mamba2+attention), which produces GARBAGE when these weights
+    // are GPU-resident; k=6656 is muse-glimmer-30B, which is correct at the identical
+    // weight shape. Both must pass. n covers decode (1), short prefill (8 -- where
+    // Falcon-H1 already emits a wrong first token) and the guard's ne1>=512 boundary.
+    for (int n : {1, 8, 512}) {
+        for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 256, n, 3072, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 256, n, 6656, {1, 1}, {1, 1}));
+        }
+    }
+
     // MoE-router shape: f32 x f32, m = n_expert, n = 2..8 tokens, k = n_embd.
     // This is ffn_moe_logits (mul_mat of the F32 ffn_gate_inp), which every MoE
     // emits once per layer. It is the small-N regime where a tiled 64x64 GEMM
