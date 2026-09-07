@@ -9483,6 +9483,31 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 512, 5120, {128, 1}, {1, 1}));
 #endif
 
+    // Weight shapes whose SUPPORT answer decides where the weight LIVES, not just which
+    // kernel runs. A backend is asked about each weight once at load time with a dummy
+    // activation of n = 512 (llama.cpp's weight_buft_supported), so declining one of these
+    // does not merely pick a slower path -- it pins the weight to a CPU buffer for the whole
+    // process and every DECODE matmul on it runs on the CPU too.
+    //
+    // Two bands had no coverage at all, and both are real model shapes:
+    //   m = 256, k = 3072 / 6656 : a GQA K/V projection (n_embd_k_gqa = 256 for any 2-KV-head
+    //                              model at head_dim 128) -- weight m < 512 with activation
+    //                              n >= 512, a combination the list otherwise only has for
+    //                              f32 and q4_0.
+    //   m = 2816, k = 2112       : gemma-4-26B-A4B's shared-expert ffn_down, which its
+    //                              Q4_K_M mixed-quant rule emits as q5_0 on over half the
+    //                              layers -- a type with no coverage above n = 1 at all.
+    for (int n : {1, 8, 512}) {
+        for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 256, n, 3072, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 256, n, 6656, {1, 1}, {1, 1}));
+        }
+        for (ggml_type type_a : {GGML_TYPE_Q5_0, GGML_TYPE_Q5_1}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 2816, n, 2112, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4096, n, 4096, {1, 1}, {1, 1}));
+        }
+    }
+
     for (ggml_type type_a : all_types) {
         for (int i = 1; i < 10; ++i) {
             test_cases.emplace_back(new test_mul_mat(type_a,    GGML_TYPE_F32, 16,  i, 1*256, { 1,  1}, {1, 1}));
