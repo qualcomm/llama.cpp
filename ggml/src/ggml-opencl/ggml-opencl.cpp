@@ -17988,6 +17988,30 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                                                 t == GGML_TYPE_Q4_K  || t == GGML_TYPE_Q5_K  ||
                                                 t == GGML_TYPE_Q6_K);
                     const bool uses_gemm = type_has_gemm && use_adreno_kernels(backend_ctx, op->src[0]);
+                    // The Adreno trans-weight GEMM is not the ONLY way to avoid the buggy
+                    // GEMV at large N: the generic tiled mul_mm handles these types too,
+                    // and unlike the Adreno path it needs no use_adreno_kernels() -- only
+                    // an f32 activation and ne00 % 16 == 0 (see ggml_cl_mul_mat's
+                    // "GEMM using local memory" switch, which covers f32/f16/q1_0/q4_0/
+                    // q4_1/q5_0/q5_1/q8_0/iq4_nl/q4_K/q5_K/q6_K). Treating "has an Adreno
+                    // GEMM" as "has a correct large-N path" CPU-pinned every type in this
+                    // branch that the mul_mm covers but the Adreno GEMM does not.
+                    //
+                    // 🔴 q5_0 was the victim: gemma-4-26B-A4B-Q4_K_M gives its shared-expert
+                    // ffn_down [2112,2816] q8_0 on 14 layers and **q5_0 on the other 16**
+                    // (the Q4_K_M mixed-quant rule). The q8_0 ones ran on GPU in 54 us; the
+                    // q5_0 ones were declined here, pinned to the CPU buffer, and cost a
+                    // 214 us GPU BUBBLE each -- 106 ms of 216 ms total GPU idle, i.e. half
+                    // of all idle and ~10% of decode. MXFP4 stays declined: it is in this
+                    // branch but NOT in the mul_mm switch.
+                    const bool type_has_mm = (t == GGML_TYPE_Q4_0 || t == GGML_TYPE_Q4_1 ||
+                                              t == GGML_TYPE_Q5_0 || t == GGML_TYPE_Q5_1 ||
+                                              t == GGML_TYPE_IQ4_NL || t == GGML_TYPE_Q8_0 ||
+                                              t == GGML_TYPE_Q4_K  || t == GGML_TYPE_Q5_K  ||
+                                              t == GGML_TYPE_Q6_K);
+                    const bool uses_mm = type_has_mm &&
+                                         op->src[1]->type == GGML_TYPE_F32 &&
+                                         (op->src[0]->ne[0] % 16) == 0;
                     // Small-output projections (weight ne1 < 512, e.g. GQA K/V
                     // [n_embd, n_kv_head*head_dim] = [3072,256] on Falcon-H1) fail
                     // use_adreno_kernels (needs ne0,ne1 >= 512) so they have no
@@ -18002,7 +18026,7 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                     // GGML_OPENCL_GEMV_LARGE_N_GUARD_ALL=1 restores the blanket reject.
                     static const bool guard_all = getenv("GGML_OPENCL_GEMV_LARGE_N_GUARD_ALL") != nullptr;
                     const bool small_out = op->src[0]->ne[1] < 512;
-                    if (!uses_gemm && op->src[1]->ne[1] >= 512 && (guard_all || !small_out)) {
+                    if (!uses_gemm && !uses_mm && op->src[1]->ne[1] >= 512 && (guard_all || !small_out)) {
                         return false;
                     }
 
