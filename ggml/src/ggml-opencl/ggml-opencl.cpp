@@ -8688,10 +8688,15 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                     return false;
                 }
                 // The generic mul_mv (GEMV) kernels are wrong for large-batch prefill on
-                // Adreno. A quant mul_mat only avoids the GEMV when it reaches the Adreno
-                // trans-weight GEMM, which needs both a GEMM kernel for the type and
-                // use_adreno_kernels(). Decline the large-N shapes that would otherwise
-                // fall through to the GEMV.
+                // Adreno, so decline the large-N shapes that would fall through to them.
+                //
+                // This decline is not only a dispatch filter: llama.cpp asks the backend
+                // about every weight ONCE at load time, with a dummy activation of exactly
+                // n = 512 (weight_buft_supported), to decide which buffer the weight lives
+                // in. Declining here therefore pins the weight to a CPU buffer for the life
+                // of the process, and every DECODE matmul on it runs on the CPU too. The
+                // two escapes below exist because of that, and both were measured on an
+                // Adreno X2-90 as whole-model decode regressions, not as slow kernels.
                 {
                     const ggml_type t = op->src[0]->type;
                     const bool type_has_gemm = (t == GGML_TYPE_Q4_0 || t == GGML_TYPE_Q4_1 ||
@@ -8699,7 +8704,39 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                                                 t == GGML_TYPE_Q4_K  || t == GGML_TYPE_Q5_K  ||
                                                 t == GGML_TYPE_Q6_K);
                     const bool uses_gemm = type_has_gemm && use_adreno_kernels(backend_ctx, op->src[0]);
-                    if (!uses_gemm && op->src[1]->ne[1] >= 512) {
+
+                    // The Adreno trans-weight GEMM is not the only route that avoids the
+                    // GEMV: the generic tiled mul_mm covers these types too and needs no
+                    // use_adreno_kernels() -- only an f32 activation and ne00 % 16 == 0
+                    // (see the "GEMM using local memory" switch in ggml_cl_mul_mat).
+                    // q5_0/q5_1 have that route but no Adreno GEMM, so treating "has an
+                    // Adreno GEMM" as "has a correct large-N path" CPU-pinned them:
+                    // gemma-4-26B-A4B-Q4_K_M emits its shared-expert ffn_down [2112,2816]
+                    // as q5_0 on 16 of 30 layers, and those layers ran on the CPU, leaving
+                    // a 214 us GPU bubble each -- half of all GPU idle in decode.
+                    const bool type_has_mm = (t == GGML_TYPE_Q4_0 || t == GGML_TYPE_Q4_1 ||
+                                              t == GGML_TYPE_Q5_0 || t == GGML_TYPE_Q5_1 ||
+                                              t == GGML_TYPE_IQ4_NL || t == GGML_TYPE_Q8_0 ||
+                                              t == GGML_TYPE_Q4_K  || t == GGML_TYPE_Q5_K  ||
+                                              t == GGML_TYPE_Q6_K);
+                    const bool uses_mm = type_has_mm &&
+                                         op->src[1]->type == GGML_TYPE_F32 &&
+                                         (op->src[0]->ne[0] % 16) == 0;
+
+                    // Small-output projections (weight ne1 < 512) fail use_adreno_kernels(),
+                    // which requires ne0 and ne1 >= 512, so they have no trans-weight GEMM.
+                    // On a GQA model that is exactly the K and V projections
+                    // ([n_embd, n_kv_head*head_dim], e.g. [3072,256]), and rejecting them
+                    // here CPU-pinned every one: Falcon-H1-7B fell to ~4 t/s with 88 CPU
+                    // matmuls and ~46 CPU<->GPU syncs per token. The documented GEMV
+                    // corruption is the LARGE-ne1 (lm_head / long-vocab) regime, so let the
+                    // small-ne1 weights through and let decode run them on the GPU.
+                    // GGML_OPENCL_GEMV_LARGE_N_GUARD_ALL=1 restores the blanket reject.
+                    static const bool guard_all = getenv("GGML_OPENCL_GEMV_LARGE_N_GUARD_ALL") != nullptr;
+                    const bool small_out = op->src[0]->ne[1] < 512;
+
+                    if (!uses_gemm && !uses_mm && op->src[1]->ne[1] >= 512 &&
+                        (guard_all || !small_out)) {
                         return false;
                     }
                 }
