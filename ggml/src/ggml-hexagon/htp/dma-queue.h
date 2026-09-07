@@ -185,7 +185,7 @@ static inline bool dma_queue_push_single_1d(dma_queue * q, dma_ptr dptr, size_t 
     return true;
 }
 
-static inline bool dma_queue_push_single_2d_order(dma_queue * q, dma_ptr dptr, size_t dst_stride, size_t src_stride, size_t row_size, size_t nrows, unsigned order) {
+static inline bool dma_queue_push_single_2d(dma_queue * q, dma_ptr dptr, size_t dst_stride, size_t src_stride, size_t row_size, size_t nrows) {
     dma_ring * r = q->ring;
     if (((r->push_idx + 1) & r->idx_mask) == r->pop_idx) {
         return false;
@@ -201,7 +201,7 @@ static inline bool dma_queue_push_single_2d_order(dma_queue * q, dma_ptr dptr, s
     desc->dst_bypass     = dma_is_vtcm(q, dptr.dst) ? 1 : q->nocache;
     desc->src_comp       = 0;
     desc->dst_comp       = 0;
-    desc->order          = order ? 1 : 0;
+    desc->order          = 0;
     desc->done           = 0;
     desc->src_stride     = src_stride;
     desc->dst_stride     = dst_stride;
@@ -234,14 +234,6 @@ static inline bool dma_queue_push_single_2d_order(dma_queue * q, dma_ptr dptr, s
 
     r->push_idx = (r->push_idx + 1) & r->idx_mask;
     return true;
-}
-
-static inline bool dma_queue_push_single_2d(dma_queue * q, dma_ptr dptr, size_t dst_stride, size_t src_stride, size_t row_size, size_t nrows) {
-    return dma_queue_push_single_2d_order(q, dptr, dst_stride, src_stride, row_size, nrows, 0);
-}
-
-static inline bool dma_queue_push_single_2d_ordered(dma_queue * q, dma_ptr dptr, size_t dst_stride, size_t src_stride, size_t row_size, size_t nrows) {
-    return dma_queue_push_single_2d_order(q, dptr, dst_stride, src_stride, row_size, nrows, 1);
 }
 
 static inline dma_ptr dma_queue_pop(dma_queue * q) {
