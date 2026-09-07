@@ -8327,18 +8327,37 @@ static inline bool flat_large_m_enabled() {
     return en;
 }
 
+// The noshuffle q4_K GEMV binds the whole weight as one image1d_buffer of
+// ne00*ne01/8 uint texels (two 4-bit weights per byte, four bytes per texel).
+// A vocab-scale weight can exceed CL_DEVICE_IMAGE_MAX_BUFFER_SIZE, and that
+// clCreateImage sits under CL_CHECK, so it aborts the process rather than
+// falling back.
+static inline bool q4_K_weight_image_fits(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor) {
+    const size_t texels = (size_t) ggml_nelements(tensor) / 8;
+    return texels != 0 && texels <= backend_ctx->image_max_buffer_size;
+}
+
 static inline bool use_flat_gemv_for_large_m_q4_K(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor) {
-    if (!flat_large_m_enabled()) {
-        return false;
-    }
     // gemv_noshuffle variant perf drops for large M, use flat variant for large M.
     // threshold is well above typical hidden/FFN dims, but below typical vocab sizes.
     // note that this forces large M weights to use LM GEMM.
     // EXCEPT when this branch's tiled-canonical lm_head/embed layout is active: the
     // weight is converted to the 64-row tiled layout, which the flat gemv would
     // misread as garbage. use_q4k_tiled owns these large-M weights, so defer to it.
-    return tensor->ne[1] >= 32768 && tensor->ne[2] == 1 && tensor->ne[3] == 1
-           && !use_q4k_tiled(backend_ctx, tensor);
+    const bool large_m = tensor->ne[1] >= 32768 && tensor->ne[2] == 1 && tensor->ne[3] == 1
+                         && !use_q4k_tiled(backend_ctx, tensor);
+    if (!large_m) {
+        return false;
+    }
+    // NOTE on ordering, as in use_flat_gemv_for_large_m_q6_K: the image-fit escape is a
+    // CORRECTNESS guard, not a performance one, so it must be reachable regardless of
+    // flat_large_m_enabled(). The opt-in gate therefore sits after it. A weight whose
+    // image does not fit has no working noshuffle route at all -- the GEMV's
+    // clCreateImage fails and CL_CHECK aborts -- so the flat path is the only option.
+    if (!q4_K_weight_image_fits(backend_ctx, tensor)) {
+        return true;
+    }
+    return flat_large_m_enabled();
 }
 
 static inline bool use_flat_gemv_for_large_m_q6_K(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor) {
