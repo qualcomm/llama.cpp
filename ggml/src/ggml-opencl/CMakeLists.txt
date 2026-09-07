@@ -96,6 +96,18 @@ set(GGML_OPENCL_KERNELS
     mul_mv_q4_0_f32_1d_16x_flat
     mul_mv_q4_1_f32
     mul_mv_q4_1_f32_flat
+    mul_mv_q2_0_f32
+    mul_mv_tq2_0_f32
+    mul_mv_nvfp4_f32
+    mul_mv_iq3_xxs_f32
+    mul_mv_iq3_s_f32
+    mul_mv_iq2_xxs_f32
+    mul_mv_iq2_xs_f32
+    mul_mv_iq2_s_f32
+    mul_mv_iq1_s_f32
+    mul_mv_iq1_m_f32
+    mul_mv_tq1_0_f32
+    mul_mv_iq4_xs_f32
     mul_mv_q2_k_f32
     mul_mv_q2_k_f32_flat
     mul_mv_q3_k_f32
@@ -168,6 +180,18 @@ set(GGML_OPENCL_KERNELS
     mul_mm_q5_1_f32_l4_lm
     mul_mm_q8_0_f32_l4_lm
     mul_mm_iq4_nl_f32_l4_lm
+    mul_mm_q2_0_f32_l4_lm
+    mul_mm_tq2_0_f32_l4_lm
+    mul_mm_nvfp4_f32_l4_lm
+    mul_mm_iq3_xxs_f32_l4_lm
+    mul_mm_iq3_s_f32_l4_lm
+    mul_mm_iq2_xxs_f32_l4_lm
+    mul_mm_iq2_xs_f32_l4_lm
+    mul_mm_iq2_s_f32_l4_lm
+    mul_mm_iq1_s_f32_l4_lm
+    mul_mm_iq1_m_f32_l4_lm
+    mul_mm_tq1_0_f32_l4_lm
+    mul_mm_iq4_xs_f32_l4_lm
     mul_mm_q2_k_f32_l4_lm
     mul_mm_q3_k_f32_l4_lm
     mul_mm_q4_k_f32_l4_lm
