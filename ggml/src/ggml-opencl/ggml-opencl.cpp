@@ -8327,6 +8327,30 @@ static inline bool flat_large_m_enabled() {
     return en;
 }
 
+// 🔴 BRANCH-LOCAL DIVERGENCE, q4_K ONLY (2026-09-07). The opt-in above is justified by a
+// measurement on a **q6_K** head (Qwen3-4B-Q4_K_M, q6_K lm_head 151936x2560), but it also
+// gates the **q4_K** predicate, and that shape behaves the opposite way.
+//
+// gemma-4-E4B-it-Q4_K_M ties its head to token_embd, which is q4_K [2560, 262144] -- a
+// different type AND a different vocab from what upstream measured. Flat vs o4 there,
+// tg32, 5 separate processes each (no overlap):
+//
+//     X2-90   o4 25.26-26.55 (med 25.45)  ->  flat 29.29-29.61 (med 29.54)   +16.1%
+//     840     o4 13.19-15.62              ->  flat 15.58-15.61               neutral, tighter
+//     X1-85   o4 med 18.79                ->  flat med 18.79                 neutral
+//
+// So keeping the q4_K path off cost 16% of decode on this model for a conclusion drawn from
+// a q6_K head. q6_K KEEPS the opt-in (flat_large_m_enabled above) -- upstream's numbers do
+// describe that type, and every q6_K-head model we have is unaffected by this.
+// GGML_OPENCL_FLAT_LARGE_M forces either way for BOTH types (=0 off, any other value on).
+static inline bool flat_large_m_q4k_enabled() {
+    static const char * e = getenv("GGML_OPENCL_FLAT_LARGE_M");
+    if (e && e[0] != '\0') {
+        return e[0] != '0';
+    }
+    return true;
+}
+
 // The noshuffle q4_K GEMV binds the whole weight as one image1d_buffer of
 // ne00*ne01/8 uint texels (two 4-bit weights per byte, four bytes per texel).
 // A vocab-scale weight can exceed CL_DEVICE_IMAGE_MAX_BUFFER_SIZE, and that
@@ -8351,13 +8375,15 @@ static inline bool use_flat_gemv_for_large_m_q4_K(const ggml_backend_opencl_cont
     }
     // NOTE on ordering, as in use_flat_gemv_for_large_m_q6_K: the image-fit escape is a
     // CORRECTNESS guard, not a performance one, so it must be reachable regardless of
-    // flat_large_m_enabled(). The opt-in gate therefore sits after it. A weight whose
-    // image does not fit has no working noshuffle route at all -- the GEMV's
-    // clCreateImage fails and CL_CHECK aborts -- so the flat path is the only option.
+    // the perf gate. It therefore sits before it. A weight whose image does not fit has
+    // no working noshuffle route at all -- the GEMV's clCreateImage fails and CL_CHECK
+    // aborts -- so the flat path is the only option.
     if (!q4_K_weight_image_fits(backend_ctx, tensor)) {
         return true;
     }
-    return flat_large_m_enabled();
+    // q4_K uses its OWN default (ON); q6_K keeps upstream's opt-in. See
+    // flat_large_m_q4k_enabled() for the measurement that separates them.
+    return flat_large_m_q4k_enabled();
 }
 
 static inline bool use_flat_gemv_for_large_m_q6_K(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor) {
