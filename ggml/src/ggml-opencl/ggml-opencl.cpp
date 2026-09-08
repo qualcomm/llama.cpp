@@ -19810,11 +19810,19 @@ static void ggml_cl_mul_mat_q4_0_f32_adreno(ggml_backend_t backend, const ggml_t
         CL_CHECK(clReleaseMemObject(b_sub_buf));
         CL_CHECK(clReleaseMemObject(b_img));
     } else {
-        // dp4a (int8) dense prefill GEMM, default off
+        // uint4 activation staging tile for the dp4a GEMM below: same arithmetic,
+        // 4x fewer __local loads in the inner loop. Opt out with
+        // GGML_OPENCL_Q4_0_DP4A_ALDS4=0.
+        static const char * q40_alds4_env = getenv("GGML_OPENCL_Q4_0_DP4A_ALDS4");
+        const bool q40_alds4_on = backend_ctx->kernel_gemm_noshuffle_q4_0_q8_1_dp4a_alds4 != nullptr &&
+            ((q40_alds4_env == nullptr) || (atoi(q40_alds4_env) != 0));
+        // dp4a (int8) dense prefill GEMM. With the scalar staging tile it is slower
+        // than the GEMM it replaces, so it is on by default only on X2E (where the
+        // uint4 tile was measured) and only when that tile is in use.
         static const char * q4_0_dense_dp4a_env = getenv("GGML_OPENCL_Q4_0_DENSE_DP4A");
         bool q4_0_dense_dp4a_on = q4_0_dense_dp4a_env
             ? (atoi(q4_0_dense_dp4a_env) != 0)
-            : false;
+            : (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E && q40_alds4_on);
         // dot prod has to be available
         q4_0_dense_dp4a_on = backend_ctx->has_integer_dot && q4_0_dense_dp4a_on;
 
@@ -19841,12 +19849,7 @@ static void ggml_cl_mul_mat_q4_0_f32_adreno(ggml_backend_t backend, const ggml_t
             size_t q_global[1] = { (size_t)(((n_blocks + 63) / 64) * 64) };
             backend_ctx->enqueue_ndrange_kernel(qk, 1, q_global, q_local, dst);
 
-            // uint4 activation staging tile (see the kernel header): same arithmetic,
-            // 4x fewer __local loads in the inner loop. Default on; opt out with
-            // GGML_OPENCL_Q4_0_DP4A_ALDS4=0.
-            static const char * q40_alds4_env = getenv("GGML_OPENCL_Q4_0_DP4A_ALDS4");
-            const bool q40_alds4_on = (q40_alds4_env == nullptr) || (atoi(q40_alds4_env) != 0);
-            cl_kernel dk = (q40_alds4_on && backend_ctx->kernel_gemm_noshuffle_q4_0_q8_1_dp4a_alds4)
+            cl_kernel dk = q40_alds4_on
                          ? backend_ctx->kernel_gemm_noshuffle_q4_0_q8_1_dp4a_alds4
                          : backend_ctx->kernel_gemm_noshuffle_q4_0_q8_1_dp4a;
             int ai = 0;
