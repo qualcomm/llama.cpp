@@ -18469,11 +18469,19 @@ static void ggml_cl_mul_mat_q4_0_f32_adreno(ggml_backend_t backend, const ggml_t
         CL_CHECK(clReleaseMemObject(b_sub_buf));
         CL_CHECK(clReleaseMemObject(b_img));
     } else {
-        // dp4a (int8) dense prefill GEMM, default off
+        // dp4a (int8) dense prefill GEMM. Default ON where the uint4 staging tile
+        // below is available and measured, off elsewhere.
+        //
+        // The two belong together. On an Adreno X2-90, Llama-3-8B-Q4_0 pp512:
+        // this path with the scalar staging tile is 358 against 370 for the GEMM
+        // it replaces -- a LOSS -- while the uint4 tile takes it to 423 (+14.4%
+        // over the default path, +18.2% over the scalar tile). Enabling this
+        // without the tile would be a regression, so the default is tied to the
+        // generation the tile was measured on rather than to has_integer_dot.
         static const char * q4_0_dense_dp4a_env = getenv("GGML_OPENCL_Q4_0_DENSE_DP4A");
         bool q4_0_dense_dp4a_on = q4_0_dense_dp4a_env
             ? (atoi(q4_0_dense_dp4a_env) != 0)
-            : false;
+            : (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E);
         // dot prod has to be available
         q4_0_dense_dp4a_on = backend_ctx->has_integer_dot && q4_0_dense_dp4a_on;
 
