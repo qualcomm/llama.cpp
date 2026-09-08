@@ -89,8 +89,20 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
 // Widening also divides ROWS_PER_LANE -- hence the s_shard/k_reg/q_reg/g_exp
 // register footprint -- and multiplies the work-group count by the same factor.
 // GGML_OPENCL_GDN_LANES_PER_COLUMN sweeps it without a rebuild; 0/unset keeps
-// the inherited default.
-static int ggml_opencl_gdn_lanes_per_column(int S_V, int sg_size, int cpl) {
+// the default.
+//
+// Default for the multi-token kernel (tgpp=1) at S_V=128 when narrow_shard is
+// set: 16, paired with COLS_PER_LANE_GROUP=2. Measured on Adreno X2-90 over lpc
+// {8,16,32} x cpl {1,2,4}, 48 heads, K=8 snapshots: the per-lane state shard
+// (cpl*ROWS_PER_LANE floats) is the lever -- every 16-float geometry is fast and
+// every 32/64-float one is ~4x slower at n_tokens=2..8, so the inherited 8x4
+// (64 floats) paid for its register footprint on both axes. 16x2 vs 8x4: a
+// width-8 spec-decode verify 626 -> 202 us, n_tokens=1024 prefill 9894 -> 7828 us
+// on X2-90; 2713 -> 566 us and 32-head prefill 199 -> 35 ms on Adreno 740. The
+// single-token kernel keeps 8 (16 costs it 2.5%). narrow_shard is false where the
+// 8x4 geometry still wins prefill (A6X) or is unmeasured (Intel); see
+// ggml_backend_opencl_context::gdn_narrow_shard.
+static int ggml_opencl_gdn_lanes_per_column(int S_V, int sg_size, int cpl, int tgpp, bool narrow_shard) {
     static const int env = []{
         const char * e = getenv("GGML_OPENCL_GDN_LANES_PER_COLUMN");
         return (e && e[0]) ? atoi(e) : 0;
@@ -115,7 +127,8 @@ static int ggml_opencl_gdn_lanes_per_column(int S_V, int sg_size, int cpl) {
         return lpc;
     };
 
-    const int inherited = normalize(S_V >= 128 ? 8 : (S_V < sg_size ? S_V : sg_size));
+    const int inherited = normalize(S_V >= 128 ? ((tgpp && narrow_shard) ? 16 : 8)
+                                              : (S_V < sg_size ? S_V : sg_size));
 
     if (env <= 0) {
         return inherited;
@@ -133,11 +146,12 @@ static int ggml_opencl_gdn_lanes_per_column(int S_V, int sg_size, int cpl) {
     return geometry_ok(lpc) ? lpc : inherited;
 }
 
-// COLS_PER_LANE_GROUP: columns each lane group carries. 1 at decode; the prompt
-// value of 4 is recorded as an Adreno 750 register-budget choice (128 registers
-// per work-item), so it is worth re-checking on other parts.
+// COLS_PER_LANE_GROUP: columns each lane group carries. 1 at decode; 2 for the
+// multi-token kernel where narrow_shard holds (see ggml_opencl_gdn_lanes_per_column
+// for the sweep -- the inherited 4 was an Adreno 750 register-budget choice that
+// the X2-90 and 740 numbers do not support at any n_tokens), else the inherited 4.
 // GGML_OPENCL_GDN_CPL_PP overrides the prompt value.
-static int ggml_opencl_gdn_cols_per_lane_group(int tgpp) {
+static int ggml_opencl_gdn_cols_per_lane_group(int tgpp, bool narrow_shard) {
     static const int env = []{
         const char * e = getenv("GGML_OPENCL_GDN_CPL_PP");
         return (e && e[0]) ? atoi(e) : 0;
@@ -145,7 +159,10 @@ static int ggml_opencl_gdn_cols_per_lane_group(int tgpp) {
     if (tgpp == 0) {
         return 1;
     }
-    return env > 0 ? env : 4;
+    if (env > 0) {
+        return env;
+    }
+    return narrow_shard ? 2 : 4;
 }
 
 static bool ggml_cl_is_q4_0_soa(const ggml_tensor * tensor);
@@ -631,6 +648,13 @@ struct ggml_backend_opencl_context {
 
     GPU_FAMILY gpu_family;
     ADRENO_GPU_GEN adreno_gen;
+
+    // The 16-float state shard wins on every Adreno from A7X up, but costs an A6X
+    // 11-28% of prefill while winning only a token band it never runs a delta-net
+    // model at. Below A7X, and on non-Adreno, keep the inherited 8x4 geometry.
+    bool gdn_narrow_shard() const {
+        return gpu_family == GPU_FAMILY::ADRENO && adreno_gen >= ADRENO_GPU_GEN::A7X;
+    }
 
     cl_int alignment;
     size_t global_mem_size;
@@ -3250,7 +3274,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 
             for (int kda = 0; kda < 2; kda++) {
                 for (int tgpp = 0; tgpp < 2; tgpp++) {
-                    const int cpl = ggml_opencl_gdn_cols_per_lane_group(tgpp);
+                    const bool narrow_shard = backend_ctx->gdn_narrow_shard();
+                    const int cpl = ggml_opencl_gdn_cols_per_lane_group(tgpp, narrow_shard);
                     const int spw  = (tgpp == 0) ? 1 : 1;
 
                     // Shared with the dispatcher in ggml_cl_gated_delta_net -- the two
@@ -3258,7 +3283,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                     // comment. It depends on cpl (COLS_PER_WG has to divide S_V), so it
                     // belongs inside the tgpp loop, not outside it.
                     const int lanes_per_column =
-                        ggml_opencl_gdn_lanes_per_column(S_V, sg_size, cpl);
+                        ggml_opencl_gdn_lanes_per_column(S_V, sg_size, cpl, tgpp, narrow_shard);
 
                     GGML_ASSERT(lanes_per_column >= 1);
                     GGML_ASSERT(((lanes_per_column & (lanes_per_column - 1)) == 0));
@@ -24405,7 +24430,8 @@ static void ggml_cl_gated_delta_net(ggml_backend_t backend, ggml_tensor * dst) {
     // for S_v=128.
     // Empirically found that when spw=1, we get the best performance for both tg and pp
     const int tgpp = (n_tokens == 1) ? 0 : 1;
-    const int cpl  = ggml_opencl_gdn_cols_per_lane_group(tgpp);
+    const bool narrow_shard = backend_ctx->gdn_narrow_shard();
+    const int cpl  = ggml_opencl_gdn_cols_per_lane_group(tgpp, narrow_shard);
     // spw needs adjustment when S_v != 128
     const int spw  = (tgpp == 0) ? 1 : 1;
 
@@ -24477,6 +24503,19 @@ static void ggml_cl_gated_delta_net(ggml_backend_t backend, ggml_tensor * dst) {
     CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &rq3));
     CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(float),    &scale));
     CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),    &K));
+    // Snapshot destination. Unfused, this is the dst tail at s_off with one full
+    // state set between rollback slots -- byte-identical to the previous kernel.
+    const cl_ulong off_snap          = off_dst + (cl_ulong) s_off * sizeof(float);
+    const cl_uint  snap_slot_stride  = S_v * S_v * H_v * n_seqs;
+    // state_row_stride == 0: read the input state from src_state as a plain tensor.
+    const cl_ulong off_rows          = 0;
+    const cl_ulong state_row_stride  = 0;
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem),   &extra_dst->data_device));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off_snap));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &snap_slot_stride));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem),   &extra_dst->data_device));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off_rows));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &state_row_stride));
 
     // Subgroup size is 64 for Adreno and 32 for Intel
     const int sg_size = backend_ctx->gpu_family == GPU_FAMILY::ADRENO ? 64 : backend_ctx->gpu_family == GPU_FAMILY::INTEL ? 32 : -1;
@@ -24488,7 +24527,7 @@ static void ggml_cl_gated_delta_net(ggml_backend_t backend, ggml_tensor * dst) {
     // Same helper the programs were compiled with -- these two were previously
     // hand-kept copies of one heuristic, and a mismatch silently launches a kernel
     // at the wrong geometry.
-    const int lanes_per_column = ggml_opencl_gdn_lanes_per_column((int) S_v, sg_size, cpl);
+    const int lanes_per_column = ggml_opencl_gdn_lanes_per_column((int) S_v, sg_size, cpl, tgpp, narrow_shard);
 
     // Max workgroup size for Adreno 750 is 1024
     const int wg_size = sg_size * spw;
