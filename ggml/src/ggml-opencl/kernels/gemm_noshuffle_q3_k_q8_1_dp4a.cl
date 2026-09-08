@@ -31,9 +31,9 @@
 //
 // Safe to vary here: this kernel stages its activation tile with a strided
 // `for (idx = lid; idx < TILESIZE_N*N; idx += 64)` loop, which is correct for
-// any tile. Do NOT copy this guard to the q2_K twin -- that one maps a lane
-// straight onto (column, half) with `lid >> 1`, so it is only correct when
-// TILESIZE_N*2 == 64, and a -D there would silently compute wrong answers.
+// any tile. The q2_K twin was once the exception -- it mapped one (column, half)
+// straight onto a lane, so only TILESIZE_N*2 == 64 was correct there -- but its
+// staging is strided now too, so every plane GEMM in this family takes a -D.
 #ifndef TILESIZE_N
 #define TILESIZE_N 32
 #endif

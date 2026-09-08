@@ -32,7 +32,7 @@
 // staging width, so it is compile-time, and the right value is PER DEVICE.
 // This kernel used to be locked at 32 because it mapped one (column, half) per
 // lane; that staging is now a strided loop, so any tile is correct. The
-// dispatch must pass the SAME value -- see ggml_cl_lowbit_dp4a_ts.
+// dispatch must pass the SAME value -- see ggml_cl_kquant_plane_gemm_ts_wide/_narrow.
 #ifndef TILESIZE_N
 #define TILESIZE_N 32
 #endif
