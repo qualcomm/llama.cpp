@@ -305,30 +305,15 @@ inline float4 iq1s_vals2(uint b) {
 // Wraps whichever grid tier a kernel selected; see IQ1S_MV_ABL above.
 #define IQ1S_ABL(read, idx) (read)
 
-// Packs iq1s_grid_gpu into the 2-bit form IQ1S_MV_G2 reads: two entries per uint,
-// and within an entry weights 0..3 in the low byte, 4..7 in the high byte. The
-// nibble is biased by +1, so `nib - 1` masked to two bits is the value in two's
-// complement: 0 -> 3 (-1), 1 -> 0, 2 -> 1.
-kernel void kernel_iq1s_grid2_export(global uint * out) {
+kernel void kernel_iq1s_grid_export(global uint * out) {
     const uint i = get_global_id(0);
-    if (i < 1024u) {
-        uint packed = 0u;
-        for (uint h = 0; h < 2u; ++h) {
-            const uint g = iq1s_grid_gpu[2u * i + h];
-            uint e = 0u;
-            for (uint b = 0; b < 4u; ++b) {
-                const uint lo = ((g >> (8u * b))        & 0xFu) - 1u;  // weight b
-                const uint hi = ((g >> (8u * b + 4u))   & 0xFu) - 1u;  // weight b+4
-                e |= (lo & 3u) << (2u * b);
-                e |= (hi & 3u) << (8u + 2u * b);
-            }
-            packed |= e << (16u * h);
-        }
-        out[i] = packed;
+    if (i < 2048u) {
+        out[i] = iq1s_grid_gpu[i];
     }
 }
 
 kernel void kernel_mul_mv_iq1_s_f32_flat(
+        __read_only image1d_buffer_t grid_img,
         global const uchar  * src0_qs,
         global const ushort * src0_qh,
         global const half   * src0_d,
@@ -354,16 +339,7 @@ kernel void kernel_mul_mv_iq1_s_f32_flat(
 
     global const float * y = src1 + (ulong)col * (uint)ne10;
 
-    __local uint sh_grid[2048];
-    {
-        const uint tid  = sgi * 64u + lid;
-        const uint nthr = (uint)(get_local_size(0) * get_local_size(1));
-        for (uint i = tid; i < 2048u; i += nthr) {
-            sh_grid[i] = iq1s_grid_gpu[i];
-        }
-    }
-    barrier(CLK_LOCAL_MEM_FENCE);
-#define IQ1S_GRID(i) IQ1S_ABL(sh_grid[(i)], (i))
+#define IQ1S_GRID(i) IQ1S_ABL((read_imageui(grid_img, (int)(i)).x), (i))
 
     const uint mh  = m >> 1;
     const uint j   = get_group_id(0) * 64u + lid;

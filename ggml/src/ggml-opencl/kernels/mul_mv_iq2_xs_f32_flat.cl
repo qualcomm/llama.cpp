@@ -181,6 +181,7 @@ inline float4 iq2xs_vals(uint gv, uint sgv, uint base) {
 #define IQ2XS_YV(g) vload4((g), y)
 
 kernel void kernel_mul_mv_iq2_xs_f32_flat(
+        __read_only image1d_buffer_t grid_img,
         global const ushort * src0_qs,
         global const uchar  * src0_sc,
         global const half   * src0_d,
@@ -206,7 +207,7 @@ kernel void kernel_mul_mv_iq2_xs_f32_flat(
 
     global const float * y = src1 + (ulong)col * (uint)ne10;
 
-#define IQ2XS_GRID(i) iq2xs_grid[(i)]
+#define IQ2XS_GRID(i) (read_imageui(grid_img, (int)(i)).x)
 
     const uint mh  = m >> 1;                        // rows per plane row, as pairs
     const uint j   = get_group_id(0) * 64u + lid;   // row pair index
@@ -283,5 +284,12 @@ kernel void kernel_mul_mv_iq2_xs_f32_flat(
 
     if (j < mh) {
         vstore2((float2)(sumf, sumf1), 0, dst + (ulong)col * (uint)ne0 + row);
+    }
+}
+
+kernel void kernel_iq2xs_grid_export(global uint * out) {
+    const uint i = get_global_id(0);
+    if (i < 1024u) {
+        out[i] = iq2xs_grid[i];
     }
 }

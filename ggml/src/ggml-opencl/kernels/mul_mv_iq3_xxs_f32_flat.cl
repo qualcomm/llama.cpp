@@ -89,7 +89,15 @@ inline float4 iq3xxs_vals(uint gv, uint sgv, uint base) {
 
 #define IQ3XXS_YV(g) vload4((g), y)
 
+kernel void kernel_iq3xxs_grid_export(global uint * out) {
+    const uint i = get_global_id(0);
+    if (i < 256u) {
+        out[i] = iq3xxs_grid[i];
+    }
+}
+
 kernel void kernel_mul_mv_iq3_xxs_f32_flat(
+        __read_only image1d_buffer_t grid_img,
         global const uchar * src0_qs,
         global const uint  * src0_sas,
         global const half  * src0_d,
@@ -115,7 +123,7 @@ kernel void kernel_mul_mv_iq3_xxs_f32_flat(
 
     global const float * y = src1 + (ulong)col * (uint)ne10;
 
-#define IQ3XXS_GRID(i) iq3xxs_grid[(i)]
+#define IQ3XXS_GRID(i) (read_imageui(grid_img, (int)(i)).x)
 
     const uint mh  = m >> 1;                        // rows per plane row, as pairs
     const uint j   = get_group_id(0) * 64u + lid;   // row pair index

@@ -282,7 +282,15 @@ inline float4 iq2s_vals(uint gv, uint sg, uint base) {
 
 #define IQ2S_YV(g) vload4((g), y)
 
+kernel void kernel_iq2s_grid_export(global uint * out) {
+    const uint i = get_global_id(0);
+    if (i < 2048u) {
+        out[i] = iq2s_grid[i];
+    }
+}
+
 kernel void kernel_mul_mv_iq2_s_f32_flat(
+        __read_only image1d_buffer_t grid_img,
         global const uchar * src0_qs,
         global const uchar * src0_sg,
         global const uchar * src0_qh,
@@ -310,16 +318,7 @@ kernel void kernel_mul_mv_iq2_s_f32_flat(
 
     global const float * y = src1 + (ulong)col * (uint)ne10;
 
-    __local uint sh_grid[2048];
-    {
-        const uint tid  = sgi * 64u + lid;
-        const uint nthr = (uint)(get_local_size(0) * get_local_size(1));
-        for (uint i = tid; i < 2048u; i += nthr) {
-            sh_grid[i] = iq2s_grid[i];
-        }
-    }
-    barrier(CLK_LOCAL_MEM_FENCE);
-#define IQ2S_GRID(i) sh_grid[(i)]
+#define IQ2S_GRID(i) (read_imageui(grid_img, (int)(i)).x)
 
     const uint mh  = m >> 1;
     const uint j   = get_group_id(0) * 64u + lid;
