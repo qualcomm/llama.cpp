@@ -982,7 +982,6 @@ struct ggml_backend_opencl_context {
     // trivially satisfies the rule.
     bool split_kernel_programs = false;
     bool has_subgroup_shuffle = false;       // cl_khr_subgroup_shuffle or cl_qcom_subgroup_shuffle
-    bool has_integer_dot      = false;       // cl_khr_integer_dot_product or cl_qcom_dot_product8
     bool has_qcom_subgroup_shuffle = false;  // specifically cl_qcom_subgroup_shuffle
     bool has_integer_dot_product = false;    // cl_khr_integer_dot_product (dp4a); kernels #ifdef on the same name
     int  qcom_int_dot = -1;                  // -1 unknown, 0 no, 1 yes; BUILD-probed, see ggml_cl_qcom_int_dot_ok
@@ -38810,7 +38809,7 @@ static bool ggml_cl_mul_mat_kquant_plane(
     // dp4a prefill GEMM: needs the integer dot product, a compiler that does not
     // miscompile it, a full row tile, and enough columns to be worth the q8_1
     // pre-pass. When it is declined the GEMV below serves prefill too.
-    if (gemm && backend_ctx->has_integer_dot
+    if (gemm && backend_ctx->has_integer_dot_product
             && ggml_cl_kquant_plane_dp4a_gemm_on(backend_ctx)
             && ne11 > ggml_cl_kquant_plane_gemm_min_n() && ne01 % 64 == 0) {
         const int M = ne01, N = ne11, K = ne00;
