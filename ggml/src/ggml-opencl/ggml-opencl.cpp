@@ -1533,6 +1533,21 @@ static int ggml_cl_q3k_mv_r(const ggml_backend_opencl_context * backend_ctx) {
     return ggml_cl_adreno_x2_class(backend_ctx) ? 4 : 2;
 }
 
+// The quantized l4_lm GEMM stages both tiles in local memory as float. It is
+// occupancy bound on local-memory CAPACITY -- that is what taking BK from 32 to
+// 16 bought -- so staging them as half halves the footprint again.
+//
+// X2-class only. Measured on Llama-3.2-3B, an X2-90 gains 13-15% of prefill
+// (Q2_K 217 -> 250, Q3_K_M 294 -> 334) while an X1 loses 11%: occupancy headroom
+// is not a portable property. Perplexity is unmoved on X2 (10.4207 -> 10.4149).
+static bool ggml_cl_lm_half(const ggml_backend_opencl_context * backend_ctx) {
+    const int v = ggml_cl_env_int("GGML_OPENCL_LM_HALF", -1);
+    if (v >= 0) {
+        return v != 0;
+    }
+    return ggml_cl_adreno_x2_class(backend_ctx);
+}
+
 // Ask the device what workgroup a kernel will actually accept and narrow NSG
 // until 64*NSG fits. CL_KERNEL_WORK_GROUP_SIZE is PER-KERNEL and shrinks as
 // register pressure grows, so it cannot be predicted from the shape or from
@@ -2899,8 +2914,10 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #else
         const std::string kernel_src = read_file("mul_mm_q2_k_f32_l4_lm.cl");
 #endif
+        const std::string lm_opts = compile_opts +
+            " -DLM_HALF=" + std::to_string(ggml_cl_lm_half(backend_ctx) ? 1 : 0);
         cl_program prog =
-            build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+            build_program_from_source(backend_ctx, kernel_src.c_str(), lm_opts);
 
         CL_CHECK((backend_ctx->kernel_mul_mm_q2_k_f32_l4_lm = clCreateKernel(prog, "kernel_mul_mm_q2_k_f32_l4_lm", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -2916,8 +2933,10 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #else
         const std::string kernel_src = read_file("mul_mm_q3_k_f32_l4_lm.cl");
 #endif
+        const std::string lm_opts = compile_opts +
+            " -DLM_HALF=" + std::to_string(ggml_cl_lm_half(backend_ctx) ? 1 : 0);
         cl_program prog =
-            build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+            build_program_from_source(backend_ctx, kernel_src.c_str(), lm_opts);
 
         CL_CHECK((backend_ctx->kernel_mul_mm_q3_k_f32_l4_lm = clCreateKernel(prog, "kernel_mul_mm_q3_k_f32_l4_lm", &err), err));
         CL_CHECK(clReleaseProgram(prog));
