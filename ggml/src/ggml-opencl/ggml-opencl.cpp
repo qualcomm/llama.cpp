@@ -1566,9 +1566,14 @@ static int ggml_cl_kquant_plane_gemm_ts_narrow() {
     return (v == 8 || v == 16 || v == 32) ? v : 8;
 }
 
-static int ggml_cl_kquant_plane_gemm_ts_wide() {
-    const int v = ggml_cl_env_int("GGML_OPENCL_KQUANT_PLANE_GEMM_TS_WIDE", 32);
-    return (v == 8 || v == 16 || v == 32) ? v : 32;
+//
+// The WIDE tile is per device, as for the dense q4_K dp4a GEMM: 32 over-occupies
+// LDS on an X1-85 and starves it of resident workgroups, where 8 is 30-40% faster
+// for both plane families (they share this tile pair).
+static int ggml_cl_kquant_plane_gemm_ts_wide(const ggml_backend_opencl_context * backend_ctx) {
+    const int dflt = (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X1E) ? 8 : 32;
+    const int v = ggml_cl_env_int("GGML_OPENCL_KQUANT_PLANE_GEMM_TS_WIDE", dflt);
+    return (v == 8 || v == 16 || v == 32) ? v : dflt;
 }
 
 // smallest ne11 the GEMM is used for at all
@@ -5333,7 +5338,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #endif
         // the q2_K block below assigns these too; both plane families share the
         // one tile pair, and this block is built first
-        backend_ctx->kquant_plane_gemm_ts_wide   = ggml_cl_kquant_plane_gemm_ts_wide();
+        backend_ctx->kquant_plane_gemm_ts_wide   = ggml_cl_kquant_plane_gemm_ts_wide(backend_ctx);
         backend_ctx->kquant_plane_gemm_ts_narrow = ggml_cl_kquant_plane_gemm_ts_narrow();
 
         cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(),
@@ -5691,7 +5696,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #else
         const std::string kernel_src = read_file("gemm_noshuffle_q2_k_q8_1_dp4a.cl");
 #endif
-        backend_ctx->kquant_plane_gemm_ts_wide   = ggml_cl_kquant_plane_gemm_ts_wide();
+        backend_ctx->kquant_plane_gemm_ts_wide   = ggml_cl_kquant_plane_gemm_ts_wide(backend_ctx);
         backend_ctx->kquant_plane_gemm_ts_narrow = ggml_cl_kquant_plane_gemm_ts_narrow();
 
         cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(),
@@ -5719,7 +5724,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #else
         const std::string kernel_src = read_file("gemm_noshuffle_q3_k_q8_1_dp4a.cl");
 #endif
-        backend_ctx->kquant_plane_gemm_ts_wide   = ggml_cl_kquant_plane_gemm_ts_wide();
+        backend_ctx->kquant_plane_gemm_ts_wide   = ggml_cl_kquant_plane_gemm_ts_wide(backend_ctx);
         backend_ctx->kquant_plane_gemm_ts_narrow = ggml_cl_kquant_plane_gemm_ts_narrow();
 
         cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(),

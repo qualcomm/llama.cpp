@@ -34,7 +34,7 @@
 // TILESIZE_N is the token tile: compile-time, and the right value is PER
 // DEVICE. This kernel used to be locked at 32 by a one-slot-per-lane staging
 // map; that is now strided, so any tile is correct. The dispatch must pass the
-// SAME value -- see ggml_cl_lowbit_dp4a_ts.
+// SAME value -- see ggml_cl_kquant_plane_gemm_ts_wide/_narrow.
 #ifndef TILESIZE_N
 #define TILESIZE_N 32
 #endif
