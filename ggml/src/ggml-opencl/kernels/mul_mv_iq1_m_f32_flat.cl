@@ -296,7 +296,15 @@ inline float iq1m_super(uint w0, uint w1, uint w2, uint w3) {
 
 #define IQ1M_YV(g) vload4((g), y)
 
+kernel void kernel_iq1m_grid_export(global uint * out) {
+    const uint i = get_global_id(0);
+    if (i < 2048u) {
+        out[i] = iq1s_grid_gpu[i];
+    }
+}
+
 kernel void kernel_mul_mv_iq1_m_f32_flat(
+        __read_only image1d_buffer_t grid_img,
         global const uchar  * src0_qs,
         global const uchar  * src0_qh,
         global const ushort * src0_sc,
@@ -322,16 +330,7 @@ kernel void kernel_mul_mv_iq1_m_f32_flat(
 
     global const float * y = src1 + (ulong)col * (uint)ne10;
 
-    __local uint sh_grid[2048];
-    {
-        const uint tid  = sgi * 64u + lid;
-        const uint nthr = (uint)(get_local_size(0) * get_local_size(1));
-        for (uint i = tid; i < 2048u; i += nthr) {
-            sh_grid[i] = iq1s_grid_gpu[i];
-        }
-    }
-    barrier(CLK_LOCAL_MEM_FENCE);
-#define IQ1M_GRID(i) sh_grid[(i)]
+#define IQ1M_GRID(i) (read_imageui(grid_img, (int)(i)).x)
 
     const uint mh  = m >> 1;
     const uint j   = get_group_id(0) * 64u + lid;

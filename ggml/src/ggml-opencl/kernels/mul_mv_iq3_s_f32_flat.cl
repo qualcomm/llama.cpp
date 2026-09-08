@@ -119,12 +119,20 @@ inline float4 iq3s_vals(uint gv, uint sgv, uint base) {
     return v;
 }
 
+kernel void kernel_iq3s_grid_export(global uint * out) {
+    const uint i = get_global_id(0);
+    if (i < 512u) {
+        out[i] = iq3s_grid[i];
+    }
+}
+
 // One weight quad: the fetched grid word `gw` with its signs applied. The grid
 // index `g` is unused.
 #define IQ3S_W(g, gw, sgv, base) iq3s_vals(gw, sgv, base)
 #define IQ3S_GW(g, expr)         (expr)
 
 kernel void kernel_mul_mv_iq3_s_f32_flat(
+        __read_only image1d_buffer_t grid_img,
         global const uchar * src0_qs,
         global const uchar * src0_qh,
         global const uchar * src0_sg,
@@ -152,7 +160,7 @@ kernel void kernel_mul_mv_iq3_s_f32_flat(
 
     global const float * y = src1 + (ulong)col * (uint)ne10;
 
-#define IQ3S_GRID(i) iq3s_grid[(i)]
+#define IQ3S_GRID(i) (read_imageui(grid_img, (int)(i)).x)
 
     const uint mh  = m >> 1;                        // rows per plane row, as ushorts
     const uint j   = get_group_id(0) * 64u + lid;   // row pair index
