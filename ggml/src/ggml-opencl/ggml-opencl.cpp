@@ -6890,7 +6890,24 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         // hardcoded default here would silently drop the override.
         if (e_tm) { lm_opts += " -DTM=" + std::to_string(lm_tm); }
         if (e_tn) { lm_opts += " -DTN=" + std::to_string(lm_tn); }
-        if (e_bk) { lm_opts += " -DBK=" + std::to_string(lm_bk); }
+        // BK=16 is not portable. It halves local memory per workgroup and doubles
+        // the resident workgroup count, which an X2-90 gains ~29% of prefill from
+        // and the E17 compiler LOSES about a third to, measured against its own
+        // BK=32 baseline: an Adreno 850 runs llama3-8b-Q2_K pp512 at 48.8 t/s with
+        // 16 against 74.5 with 32. The generation does not separate the two parts
+        // -- the 850 is A8X, so adreno_x2_class() admits it -- the compiler does,
+        // which is why this names E17 the way the plane-split decline above does.
+        //
+        // Only 32 is ever emitted here, and only on E17. The five kernels that
+        // split a 32-element block across a 32-wide tile define BK 32 unguarded,
+        // so this matches what they already compile with and changes nothing for
+        // them; every other device keeps the kernels' own defaults exactly as
+        // before.
+        if (e_bk) {
+            lm_opts += " -DBK=" + std::to_string(lm_bk);
+        } else if (adreno_art_compiler_quirks(backend_ctx)) {
+            lm_opts += " -DBK=32";
+        }
         backend_ctx->quant_lm_nth0 = (64 * 64) / (lm_tm * lm_tn);
         if (e_tm || e_tn || e_bk) {
             GGML_LOG_INFO("ggml_opencl: l4_lm tile TM=%d TN=%d BK=%d -> local size %d\n",
