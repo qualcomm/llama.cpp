@@ -1548,6 +1548,27 @@ static bool ggml_cl_lm_half(const ggml_backend_opencl_context * backend_ctx) {
     return ggml_cl_adreno_x2_class(backend_ctx);
 }
 
+// K tile for the quantized l4_lm GEMM. Halving it to 16 halves local memory per
+// workgroup and doubles the resident workgroup count, which pays only where the
+// kernel is occupancy bound on local-memory capacity.
+//
+// X2-class and NOT the E17 compiler. The spread is far too wide for a
+// fleet-wide constant: an X2-90 gains ~29% of prefill over BK=32, while an
+// Adreno 850 LOSES ~35% against its own BK=32 baseline. The 850 is A8X, so it
+// is X2-class too -- the generation does not separate these two, the compiler
+// does, which is the same reason the plane split names E17 rather than the
+// GEMM gate. The kernels default to the portable 32.
+static int ggml_cl_lm_bk(const ggml_backend_opencl_context * backend_ctx) {
+    const int v = ggml_cl_env_int("GGML_OPENCL_LM_BK", 0);
+    if (v == 16 || v == 32) {
+        return v;
+    }
+    if (adreno_e17_compiler_quirks(backend_ctx)) {
+        return 32;
+    }
+    return ggml_cl_adreno_x2_class(backend_ctx) ? 16 : 32;
+}
+
 // Ask the device what workgroup a kernel will actually accept and narrow NSG
 // until 64*NSG fits. CL_KERNEL_WORK_GROUP_SIZE is PER-KERNEL and shrinks as
 // register pressure grows, so it cannot be predicted from the shape or from
@@ -2915,7 +2936,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         const std::string kernel_src = read_file("mul_mm_q2_k_f32_l4_lm.cl");
 #endif
         const std::string lm_opts = compile_opts +
-            " -DLM_HALF=" + std::to_string(ggml_cl_lm_half(backend_ctx) ? 1 : 0);
+            " -DLM_HALF=" + std::to_string(ggml_cl_lm_half(backend_ctx) ? 1 : 0) +
+            " -DBK="      + std::to_string(ggml_cl_lm_bk(backend_ctx));
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), lm_opts);
 
@@ -2934,7 +2956,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         const std::string kernel_src = read_file("mul_mm_q3_k_f32_l4_lm.cl");
 #endif
         const std::string lm_opts = compile_opts +
-            " -DLM_HALF=" + std::to_string(ggml_cl_lm_half(backend_ctx) ? 1 : 0);
+            " -DLM_HALF=" + std::to_string(ggml_cl_lm_half(backend_ctx) ? 1 : 0) +
+            " -DBK="      + std::to_string(ggml_cl_lm_bk(backend_ctx));
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), lm_opts);
 
