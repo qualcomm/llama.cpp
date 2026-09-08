@@ -18,7 +18,17 @@ typedef struct {
 
 #define BM 64
 #define BN 64
+// K tile. buf_a and buf_b are 2*BM*BK*4 bytes, so BK=16 halves local memory per
+// workgroup (16 KB -> 8 KB) and doubles the number of resident workgroups.
+//
+// That is worth a lot where the kernel is occupancy bound on local-memory
+// capacity and nothing where it is not, so the host picks it per device rather
+// than the kernel hardcoding it. On an Adreno X2-90 BK=16 is worth about 29%
+// of prefill over BK=32; on the E17 compiler it COSTS about 35%. The default
+// here is the portable one, and only a device measured to gain takes 16.
+#ifndef BK
 #define BK 32
+#endif
 #ifdef INTEL_GPU
 #define TM 8
 #else
