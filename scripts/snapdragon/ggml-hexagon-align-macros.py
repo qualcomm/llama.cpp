@@ -16,11 +16,14 @@ Safety rules:
 
 import argparse
 import difflib
+import logging
 import os
 import re
 import sys
 from collections import Counter
 from typing import List, Optional, Tuple, NamedTuple
+
+logger = logging.getLogger("ggml-hexagon-align-macros")
 
 
 class MacroLine(NamedTuple):
@@ -45,7 +48,7 @@ def parse_macros(filepath: str) -> List[MacroDef]:
         with open(filepath, "r", encoding="utf-8", errors="replace") as f:
             lines = f.readlines()
     except Exception as e:
-        print(f"Error reading {filepath}: {e}", file=sys.stderr)
+        logger.error(f"Error reading {filepath}: {e}")
         return []
 
     macros: List[MacroDef] = []
@@ -190,16 +193,16 @@ def process_file(filepath: str, args: argparse.Namespace) -> Tuple[int, int, Opt
             col_counts = Counter(bs_cols)
 
             if not args.quiet:
-                print(f"{filepath}:{macro.start_line}-{macro.end_line} [{macro.name}]")
-                print(f"  Max content width: {max_content}, Min needed column (+{args.pad}): {max_content + args.pad}")
-                print(f"  Current backslash columns: {dict(sorted(col_counts.items()))}")
+                logger.info(f"{filepath}:{macro.start_line}-{macro.end_line} [{macro.name}]")
+                logger.info(f"  Max content width: {max_content}, Min needed column (+{args.pad}): {max_content + args.pad}")
+                logger.info(f"  Current backslash columns: {dict(sorted(col_counts.items()))}")
                 trailing_ws_lines = [ml.line_num for ml in macro.lines if ml.trailing_ws]
                 if trailing_ws_lines:
-                    print(f"  Warning: Trailing whitespace after backslash on line(s): {trailing_ws_lines}")
+                    logger.warning(f"  Warning: Trailing whitespace after backslash on line(s): {trailing_ws_lines}")
 
             target_col = compute_target_column(macro, args.mode, args.pad, args.target_col)
             if not args.quiet:
-                print(f"  -> Target alignment column: {target_col}")
+                logger.info(f"  -> Target alignment column: {target_col}")
 
             realigned = realign_macro_lines(macro, target_col)
 
@@ -224,7 +227,7 @@ def process_file(filepath: str, args: argparse.Namespace) -> Tuple[int, int, Opt
             with open(filepath, "w", encoding="utf-8") as f:
                 f.writelines(new_file_lines)
             if not args.quiet:
-                print(f"  [FIXED] Updated {filepath}")
+                logger.info(f"  [FIXED] Updated {filepath}")
 
     return len(macros), misaligned_count, diff_text
 
@@ -245,6 +248,7 @@ def find_source_files(paths: List[str]) -> List[str]:
 
 
 def main():
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     parser = argparse.ArgumentParser(
         description="Inspect and align backslashes in multiline C/C++ macros."
     )
@@ -263,7 +267,7 @@ def main():
 
     files = find_source_files(args.paths)
     if not files:
-        print("No C/C++ source files found.", file=sys.stderr)
+        logger.error("No C/C++ source files found.")
         sys.exit(0)
 
     total_macros = 0
@@ -278,11 +282,11 @@ def main():
             diffs.append(diff_text)
 
     if args.diff and diffs:
-        print("\n--- Proposed Changes ---\n")
+        logger.info("\n--- Proposed Changes ---\n")
         for d in diffs:
-            print(d)
+            logger.info(d)
 
-    print(f"\nSummary: scanned {len(files)} files, {total_macros} multiline macros, {total_misaligned} misaligned.")
+    logger.info(f"\nSummary: scanned {len(files)} files, {total_macros} multiline macros, {total_misaligned} misaligned.")
 
     if args.check and total_misaligned > 0:
         sys.exit(1)
