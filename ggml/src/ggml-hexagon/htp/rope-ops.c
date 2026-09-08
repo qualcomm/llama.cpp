@@ -79,7 +79,6 @@ struct htp_rope_context {
     size_t dst_row_size;
     size_t dst_row_stride;
     size_t src0_row_size_aligned;
-    size_t dst_row_size_aligned;
     uint32_t src0_nrows;
 
     struct fastdiv_values div_ne2_ne1;
@@ -752,7 +751,6 @@ static int execute_op_rope_f32(struct htp_ops_context * octx) {
     rctx.dst_row_size          = dst_row_size;
     rctx.dst_row_stride        = dst_row_stride;
     rctx.src0_row_size_aligned = kparams->src0_row_size_aligned;
-    rctx.dst_row_size_aligned  = kparams->dst_row_size_aligned;
 
     rctx.src0_nrows            = kparams->src0_nrows;
     rctx.src0_nrows_per_thread = kparams->src0_nrows_per_thread;
