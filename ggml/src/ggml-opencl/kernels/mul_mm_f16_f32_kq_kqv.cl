@@ -200,17 +200,44 @@ __kernel void mul_mm_f16_f32_kq(
         int nb01
 ) {
 
-    // The n-tiles run on the fast-varying axis and the m-blocks on the slow one. With the
-    // axes the other way round, a whole plane of A (the K/V cache, ne01 * nb01 bytes) is
-    // streamed for one n-tile and then re-streamed for the next, so once A stops fitting
-    // in cache the op cost jumps ~3.5x (measured X2-90: 5.9 ms vs 2.4 ms at ne01=1536).
-    // This way the 16 KB A panel of an m-block is reused across every n-tile while it is
-    // still hot, and B (one head of Q) is the operand that stays resident instead.
+#ifndef KQV
+    // KQ ONLY. The n-tiles run on the fast-varying axis and the m-blocks on the slow one.
+    // With the axes the other way round, a whole plane of A (the K cache, ne01 * nb01
+    // bytes) is streamed for one n-tile and then re-streamed for the next, so once A stops
+    // fitting in cache the op cost jumps ~3.5x (measured X2-90: 5.9 ms vs 2.4 ms at
+    // ne01=1536). This way the 16 KB A panel of an m-block is reused across every n-tile
+    // while it is still hot, and B (one head of Q) is the operand that stays resident.
+    //
+    // 🔴 This holds for KQ because its A panel is 64 x K with K = head_dim: 64*256*2 =
+    // 32 KB, cache-resident by construction. It does NOT hold for KQV, where K IS n_kv --
+    // see the KQV branch below. The two kernels share this file, which is how the KQ
+    // measurement came to govern KQV as well.
     uint m_blocks = (M+TILESIZE_M-1)/TILESIZE_M;
 
     uint block_id_n = get_global_id(1);
     uint block_id_m = get_global_id(2) % m_blocks;
     uint block_id_d = get_global_id(2) / m_blocks;
+#else
+    // KQV: m-blocks on the fast axis (upstream's ordering). For KQV, A is the V cache and
+    // K is n_kv, so an m-block's A panel is 64 * n_kv * 2 B -- 6.3 MB at n_kv 49152, not
+    // 16 KB. It cannot be cache-resident, the reuse the KQ ordering buys never happens,
+    // and the swap costs instead.
+    //
+    // Profiled on X2-90, Qwen3.5-35B-A3B-Q4_0 (gqa8, dk=dv=256), pp16384 -d 32768 -fa 0,
+    // GGML_OPENCL_PROFILING builds of both orderings, mul_mm_f16_f32_kqv, matched call
+    // counts 1280 vs 1270:
+    //     n-tile-fast (this file, before)  629,477 ms total   491.78 ms/call
+    //     m-block-fast (upstream, now)     281,498 ms total   221.65 ms/call   => 2.22x
+    // KQV alone differed by 348 s where TOTAL GPU busy differed by 318 s, and device idle
+    // was 0.2% -- it was the whole build-to-build gap, and it was this kernel, not
+    // scheduling. Position-matched per-dispatch cost showed the deficit growing with the
+    // cache: ~1.1-1.3x shallow, 2.1-2.5x deep.
+    uint n_tiles = (N+TILESIZE_N-1)/TILESIZE_N;
+
+    uint block_id_m = get_global_id(1);
+    uint block_id_n = get_global_id(2) % n_tiles;
+    uint block_id_d = get_global_id(2) / n_tiles;
+#endif
 
     __private float16  regA;
     __private float8   regB;

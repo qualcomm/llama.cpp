@@ -32917,14 +32917,26 @@ static void ggml_cl_mul_mat_kq_kqv_adreno(ggml_backend_t backend, const ggml_ten
     const int n_tiles  = (N + 31) / 32;
     const int m_blocks = (M + 63) / 64;
 
-    // The n-tiles go on the fast-varying axis so that the A panel of an m-block is reused
-    // across every n-tile while it is still cache-hot (see the kernel). A workgroup takes
-    // two adjacent n-tiles, one per subgroup, so both share that A panel while keeping
+    // KQ ONLY: the n-tiles go on the fast-varying axis so that the A panel of an m-block is
+    // reused across every n-tile while it is still cache-hot (see the kernel). A workgroup
+    // takes two adjacent n-tiles, one per subgroup, so both share that A panel while keeping
     // their own local-memory B partition; an odd tile count falls back to one subgroup.
     const int n_tiles_per_wg = (n_tiles % 2) == 0 ? 2 : 1;
 
-    size_t global_work_size[3] = {64, static_cast<size_t>(n_tiles), static_cast<size_t>(m_blocks*ne12)};
-    size_t local_work_size[3]  = {64, static_cast<size_t>(n_tiles_per_wg), 1};
+    // 🔴 KQV takes the m-block-fast ordering instead. Its A panel is 64 x K with K = n_kv
+    // (6.3 MB at n_kv 49152), not 64 x head_dim, so it is never cache-resident and the KQ
+    // ordering costs 2.22x per dispatch at depth -- more than the entire x2ue-vs-upstream
+    // gap on Qwen3.5-35B-A3B pp16384 @ d32768. Measurement in the kernel's own comment.
+    //
+    // 🔑 GEOMETRY AND KERNEL ARE A MATCHED PAIR. mul_mm_f16_f32_kq_kqv.cl derives its
+    // block_id_m/n from these axes under #ifdef KQV; changing one side alone does not run
+    // slower, it computes the WRONG ELEMENTS. Change both or neither.
+    size_t global_work_size[3] = {64,
+        static_cast<size_t>(is_kq ? n_tiles : m_blocks),
+        static_cast<size_t>(is_kq ? m_blocks*ne12 : n_tiles*ne12)};
+    size_t local_work_size[3]  = {64,
+        static_cast<size_t>(is_kq ? n_tiles_per_wg : 1),
+        static_cast<size_t>(is_kq ? 1 : 2)};
 
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
 
