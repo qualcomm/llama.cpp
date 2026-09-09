@@ -300,7 +300,7 @@ int op_allreduce(struct htp_ops_context * octx) {
         if (status == HTP_STATUS_NO_SUPPORT) {
             FARF(ERROR, "ggml-hex: allreduce unsupported type %d : rank %u\n", dst->type, rank);
         }
-        htp_fence_write(my_fence, fence_seq_entry, status);
+        htp_fence_write(my_fence, fence_seq_exit, status);
         return status;
     }
 
@@ -311,7 +311,7 @@ int op_allreduce(struct htp_ops_context * octx) {
     struct htp_thread_trace * tr0 = &octx->ctx->trace[0];
     htp_trace_event_start(tr0, HTP_TRACE_EVT_FENCE, (uint16_t) fence_seq_entry);
 
-    htp_fence_write(my_fence, fence_seq_entry, HTP_STATUS_OK);
+    htp_fence_write(my_fence, fence_seq_entry, octx->status);
 
     for (uint32_t j = 0; j < n_ranks; j++) {
         if (j == rank) continue;
@@ -322,19 +322,19 @@ int op_allreduce(struct htp_ops_context * octx) {
             uint32_t peer_seq;
             uint32_t peer_status;
             htp_fence_read(peer_fence, &peer_seq, &peer_status);
-            if (peer_status > HTP_STATUS_OK) {
-                FARF(ERROR, "ggml-hex: allreduce entry peer %u failed with status %u\n", j, peer_status);
-                htp_fence_write(my_fence, fence_seq_entry, peer_status);
-                htp_trace_event_stop(tr0, HTP_TRACE_EVT_FENCE, (uint16_t) fence_seq_entry);
-                return peer_status;
-            }
             if ((int32_t)(peer_seq - fence_seq_entry) >= 0) {
+                if (peer_status > HTP_STATUS_OK) {
+                    FARF(ERROR, "ggml-hex: allreduce entry peer %u failed with status %u\n", j, peer_status);
+                    htp_fence_write(my_fence, fence_seq_exit, peer_status);
+                    htp_trace_event_stop(tr0, HTP_TRACE_EVT_FENCE, (uint16_t) fence_seq_entry);
+                    return peer_status;
+                }
                 break;
             }
             if (++spins > HTP_FENCE_TIMEOUT) {
                 FARF(ERROR, "ggml-hex: allreduce entry fence-wait TIMEOUT : rank %u waiting on %u fence %p seq %u peer-seq %u\n",
                      rank, j, peer_fence, fence_seq_entry, peer_seq);
-                htp_fence_write(my_fence, fence_seq_entry, HTP_STATUS_INTERNAL_ERR);
+                htp_fence_write(my_fence, fence_seq_exit, HTP_STATUS_INTERNAL_ERR);
                 htp_trace_event_stop(tr0, HTP_TRACE_EVT_FENCE, (uint16_t) fence_seq_entry);
                 return HTP_STATUS_INTERNAL_ERR;
             }
@@ -419,7 +419,7 @@ int op_allreduce(struct htp_ops_context * octx) {
     // 4. Exit Barrier: Synchronize all ranks after writing
     htp_trace_event_start(tr0, HTP_TRACE_EVT_FENCE, (uint16_t) fence_seq_exit);
 
-    htp_fence_write(my_fence, fence_seq_exit, HTP_STATUS_OK);
+    htp_fence_write(my_fence, fence_seq_exit, octx->status);
 
     for (uint32_t j = 0; j < n_ranks; j++) {
         if (j == rank) continue;
@@ -430,13 +430,13 @@ int op_allreduce(struct htp_ops_context * octx) {
             uint32_t peer_seq;
             uint32_t peer_status;
             htp_fence_read(peer_fence, &peer_seq, &peer_status);
-            if (peer_status > HTP_STATUS_OK) {
-                FARF(ERROR, "ggml-hex: allreduce exit peer %u failed with status %u\n", j, peer_status);
-                htp_fence_write(my_fence, fence_seq_exit, peer_status);
-                htp_trace_event_stop(tr0, HTP_TRACE_EVT_FENCE, (uint16_t) fence_seq_exit);
-                return peer_status;
-            }
             if ((int32_t)(peer_seq - fence_seq_exit) >= 0) {
+                if (peer_status > HTP_STATUS_OK) {
+                    FARF(ERROR, "ggml-hex: allreduce exit peer %u failed with status %u\n", j, peer_status);
+                    htp_fence_write(my_fence, fence_seq_exit, peer_status);
+                    htp_trace_event_stop(tr0, HTP_TRACE_EVT_FENCE, (uint16_t) fence_seq_exit);
+                    return peer_status;
+                }
                 break;
             }
             if (++spins > HTP_FENCE_TIMEOUT) {
@@ -453,5 +453,5 @@ int op_allreduce(struct htp_ops_context * octx) {
 
     htp_trace_event_stop(tr0, HTP_TRACE_EVT_FENCE, (uint16_t) fence_seq_exit);
 
-    return HTP_STATUS_OK;
+    return octx->status;
 }

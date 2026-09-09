@@ -720,10 +720,10 @@ static int op_fence(struct htp_ops_context * octx) {
     atomic_uint * sync_fence = (atomic_uint *) (uintptr_t) sync->data;
 
     if (mode == 1) {
-        htp_fence_write(sync_fence, seq, HTP_STATUS_OK);
+        htp_fence_write(sync_fence, seq, octx->status);
         htp_trace_event_stop(tr, HTP_TRACE_EVT_FENCE, (uint16_t) seq);
-        FARF(HIGH, "ggml-hex: sync-signal : fence %p seq %u\n", sync_fence, seq);
-        return HTP_STATUS_OK;
+        FARF(HIGH, "ggml-hex: sync-signal : fence %p seq %u status %d\n", sync_fence, seq, octx->status);
+        return octx->status;
     }
 
     uint64_t spins = 0;
@@ -731,12 +731,12 @@ static int op_fence(struct htp_ops_context * octx) {
         uint32_t sync_seq;
         uint32_t sync_status;
         htp_fence_read(sync_fence, &sync_seq, &sync_status);
-        if (sync_status > HTP_STATUS_OK) {
-            FARF(ERROR, "ggml-hex: sync-wait peer failed with status %u : fence %p seq %u\n", sync_status, sync_fence, seq);
-            htp_trace_event_stop(tr, HTP_TRACE_EVT_FENCE, (uint16_t) seq);
-            return sync_status;
-        }
         if ((int32_t)(sync_seq - seq) >= 0) {
+            if (sync_status > HTP_STATUS_OK) {
+                FARF(ERROR, "ggml-hex: sync-wait peer failed with status %u : fence %p seq %u\n", sync_status, sync_fence, seq);
+                htp_trace_event_stop(tr, HTP_TRACE_EVT_FENCE, (uint16_t) seq);
+                return sync_status;
+            }
             break;
         }
         if (++spins > HTP_FENCE_TIMEOUT) {
@@ -1068,15 +1068,15 @@ static int proc_op_req(struct htp_ops_context * octx, struct htp_buf_desc * bufs
             dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3]);
     }
 
-    int fence_status = htp_mdev_group_barrier(octx, HTP_STATUS_OK);
-    if (fence_status > HTP_STATUS_OK) {
-        return fence_status;
-    }
+    htp_mdev_group_barrier(octx);
 
     int status = execute_op(octx);
-    if (status > HTP_STATUS_OK && octx->ctx->mdev.count > 1) {
+    if (status > HTP_STATUS_OK && octx->status == HTP_STATUS_OK) {
+        octx->status = status;
+    }
+    if (octx->status > HTP_STATUS_OK && octx->ctx->mdev.count > 1) {
         atomic_uint * my_fence = htp_mdev_fence_slot(octx->ctx->mdev.fence_base, octx->ctx->mdev.idx);
-        htp_fence_write(my_fence, octx->ctx->mdev.fence_seq, status);
+        htp_fence_write(my_fence, octx->ctx->mdev.fence_seq, octx->status);
     }
 
     htp_tensor_dirty_all(octx->ctx, octx->dsts, HTP_OP_MAX_OUTPUTS);
@@ -1087,7 +1087,7 @@ static int proc_op_req(struct htp_ops_context * octx, struct htp_buf_desc * bufs
     octx->src3_spad.src = NULL;
     octx->dst_spad.src  = NULL;
 
-    return status;
+    return octx->status;
 }
 
 static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_req * req, const struct dspqueue_buffer * dbuf) {
@@ -1158,7 +1158,8 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
     }
 
     int op_status = HTP_STATUS_OK;
-    for (uint32_t i = 0; i < n_ops && op_status == HTP_STATUS_OK; i++) {
+    octx->status  = HTP_STATUS_OK;
+    for (uint32_t i = 0; i < n_ops; i++) {
         struct profile_data prof;
 
         profile_start(ctx->profiler, &prof);
@@ -1166,6 +1167,10 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
         op_status = proc_op_req(octx, bufs, n_bufs, tens, i, &ops[i]);
 
         profile_stop(ctx->profiler, &prof);
+
+        if (op_status > HTP_STATUS_OK && octx->status == HTP_STATUS_OK) {
+            octx->status = op_status;
+        }
 
         if (ctx->profiler) {
             pds[i].opcode = ops[i].opcode;
@@ -1189,14 +1194,14 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
     qurt_mem_cache_clean((qurt_addr_t) 0, 0, QURT_MEM_CACHE_FLUSH_INVALIDATE_ALL, QURT_MEM_DCACHE);
     htp_trace_event_stop(&ctx->trace[0], HTP_TRACE_EVT_L2FLUSH, 0);
 
-    op_status = htp_mdev_group_barrier(octx, op_status);
+    htp_mdev_group_barrier(octx);
 
     profile_stop(HTP_PROF_BASIC, &batch_prof);
 
     struct htp_opbatch_rsp rsp;
     memset(&rsp, 0, sizeof(rsp));
     rsp.seq          = req->seq;
-    rsp.status       = op_status;
+    rsp.status       = octx->status;
     rsp.n_bufs       = n_bufs;
     rsp.n_tensors    = n_tens;
     rsp.n_ops        = n_ops;

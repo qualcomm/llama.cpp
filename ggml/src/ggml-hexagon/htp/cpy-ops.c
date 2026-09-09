@@ -419,8 +419,12 @@ int op_cpy(struct htp_ops_context * octx) {
             qurt_mem_cache_clean((qurt_addr_t) 0, 0, QURT_MEM_CACHE_FLUSH_INVALIDATE_ALL, QURT_MEM_DCACHE);
         }
 
+        if (status > HTP_STATUS_OK && octx->status == HTP_STATUS_OK) {
+            octx->status = status;
+        }
+
         if (octx->ctx->mdev.count > 1) {
-            status = htp_mdev_group_barrier(octx, status);
+            htp_mdev_group_barrier(octx);
         }
 
         if (octx->ctx->mdev.idx == 0) {
@@ -428,11 +432,11 @@ int op_cpy(struct htp_ops_context * octx) {
             assert(sync && (sync->flags & HTP_TENSOR_FENCE));
             const uint32_t seq = (uint32_t) octx->op_params[0];
             atomic_uint * sync_fence = (atomic_uint *) (uintptr_t) sync->data;
-            htp_fence_write(sync_fence, seq, status);
+            htp_fence_write(sync_fence, seq, octx->status);
 
-            FARF(HIGH, "ggml-hex: sync-release : fence %p seq %u status %d\n", sync_fence, seq, status);
+            FARF(HIGH, "ggml-hex: sync-release : fence %p seq %u status %d\n", sync_fence, seq, octx->status);
         }
     }
 
-    return status;
+    return octx->status;
 }

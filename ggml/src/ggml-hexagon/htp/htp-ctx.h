@@ -76,6 +76,7 @@ struct htp_ops_context {
     uint32_t              flags;
     uint32_t              n_threads;
     struct fastdiv_values n_threads_div;
+    int                   status;
 };
 
 // Main context for htp DSP backend
