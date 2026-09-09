@@ -5904,7 +5904,7 @@ static ggml_backend_event_t ggml_backend_hexagon_device_event_new(ggml_backend_d
 static void ggml_backend_hexagon_device_event_free(ggml_backend_dev_t dev, ggml_backend_event_t event) {
     GGML_UNUSED(dev);
 
-    ggml_hexagon_event * hex_event = (ggml_hexagon_event *)event->context;
+    auto * hex_event = static_cast<ggml_hexagon_event *>(event->context);
     HEX_VERBOSE("ggml-hex: %s event-free : event %p\n", ggml_backend_dev_name(dev), (void *)hex_event);
     hex_event->sess->free_fence((void *) hex_event->fence_slot, 1);
     delete hex_event;
@@ -5914,7 +5914,7 @@ static void ggml_backend_hexagon_device_event_free(ggml_backend_dev_t dev, ggml_
 static void ggml_backend_hexagon_device_event_synchronize(ggml_backend_dev_t dev, ggml_backend_event_t event) {
     GGML_UNUSED(dev);
 
-    ggml_hexagon_event * hex_event = (ggml_hexagon_event *)event->context;
+    auto * hex_event = static_cast<ggml_hexagon_event *>(event->context);
     if (hex_event->seq == 0) {
         return;
     }
@@ -5922,25 +5922,20 @@ static void ggml_backend_hexagon_device_event_synchronize(ggml_backend_dev_t dev
     HEX_VERBOSE("ggml-hex: %s event-synchronize : event %p seq %u fence %p\n",
                 ggml_backend_dev_name(dev), (void *)hex_event, hex_event->seq, (void *)hex_event->fence_slot);
 
-    if ((int32_t)(*hex_event->fence_slot - hex_event->seq) < 0 && hex_event->sess->op_batch->n_ops > 0) {
+    auto * fence = reinterpret_cast<const volatile std::atomic<uint32_t> *>(hex_event->fence_slot);
+
+    if ((int32_t)(fence->load(std::memory_order_relaxed) - hex_event->seq) < 0) {
         hex_event->sess->flush_async();
     }
 
-    while ((int32_t)(*hex_event->fence_slot - hex_event->seq) < 0) {
-        if (hex_event->sess->batch_rsp_seq < hex_event->sess->batch_req_seq) {
-            hex_event->sess->flush_pending(false);
-        }
-        if (hex_event->sess->last_error > HTP_STATUS_OK) {
-            GGML_ABORT("ggml-hex: %s event-synchronize failed : dsp-error %s\n",
-                       hex_event->sess->c_name(), status_to_str(hex_event->sess->last_error));
-        }
+    while ((int32_t)(fence->load(std::memory_order_relaxed) - hex_event->seq) < 0) {
         std::this_thread::yield();
     }
 }
 
 static void ggml_backend_hexagon_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
     auto sess = static_cast<ggml_hexagon_session *>(backend->context);
-    ggml_hexagon_event * hex_event = (ggml_hexagon_event *)event->context;
+    auto hex_event = static_cast<ggml_hexagon_event *>(event->context);
 
     if (++sess->fence_seq == 0) sess->fence_seq = 1;
     hex_event->sess = sess;
@@ -5954,7 +5949,7 @@ static void ggml_backend_hexagon_event_record(ggml_backend_t backend, ggml_backe
 
 static void ggml_backend_hexagon_event_wait(ggml_backend_t backend, ggml_backend_event_t event) {
     auto sess = static_cast<ggml_hexagon_session *>(backend->context);
-    ggml_hexagon_event * hex_event = (ggml_hexagon_event *)event->context;
+    auto hex_event = static_cast<ggml_hexagon_event *>(event->context);
 
     if (hex_event->seq == 0) {
         return;
