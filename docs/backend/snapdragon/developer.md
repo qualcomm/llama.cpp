@@ -120,6 +120,15 @@ Writing high-performance operators for Hexagon requires following specific guide
 
 - Keep worker functions independent and re-entrant. Worker threads should only operate on their designated chunk of rows or elements.
 
+### Avoid Redundant Defensive NULL Checks
+
+- Do not add defensive NULL checks or assertions for internal framework pointers (`ctx`, `octx`, local context structs
+  like `*ctx`, `kparams`, or `data` in worker callbacks).
+- These pointers are architectural invariants and are guaranteed non-NULL during kernel execution. Checks like
+  `if (!octx || !octx->ctx)` clutter the code and obscure intent.
+- **Distinction**: `octx->src[N]` pointers *can* be NULL by design for optional inputs (such as attention masks, optional
+  bias/weights in fused kernels, or frequency factors) and must be checked when optional.
+
 ### Multiline Macro Formatting
 
 - Keep trailing backslashes in multiline `#define` macros cleanly aligned to a consistent column.
