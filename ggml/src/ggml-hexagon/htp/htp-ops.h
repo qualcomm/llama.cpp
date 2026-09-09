@@ -217,29 +217,26 @@ struct htp_prof_desc {
 };
 
 struct htp_opbatch_req {
-    uint32_t id;          // Batch id
+    uint64_t seq;         // Sequence number
     uint32_t n_bufs;      // Number of buffers
     uint32_t n_tensors;   // Number of tensors
     uint32_t n_ops;       // Number of ops
     uint32_t n_traces;    // Number of trace descriptors per thread
-    uint64_t seq;         // Sequence number
     // struct htp_buf_desc  bufs[];    -- dspqueue buf 0
     // struct htp_tensor    tensors[]; -- dspqueue buf 0
     // struct htp_op_desc   ops[];     -- dspqueue buf 0
 };
 
 struct htp_opbatch_rsp {
-    uint32_t id;         // Batch id
-    uint32_t status;     // HTP_STATUS_...
-    uint32_t n_bufs;     // Number of buffers
-    uint32_t n_tensors;  // Number of tensors
-    uint32_t n_ops;      // Number of op profile descriptors
-    uint32_t n_traces[HTP_MAX_NTHREADS + 1];
-    uint32_t usecs;          // Number of usec
-    uint32_t pad;            // align to 8 bytes
+    uint64_t seq;            // Sequence number
     uint64_t cycles_start;   // Start cycle counter
     uint64_t cycles_stop;    // Stop cycle counter
-    uint64_t seq;            // Sequence number
+    uint32_t status;         // HTP_STATUS_...
+    uint32_t n_bufs;         // Number of buffers
+    uint32_t n_tensors;      // Number of tensors
+    uint32_t n_ops;          // Number of op profile descriptors
+    uint32_t usecs;          // Number of usec
+    uint32_t n_traces[HTP_MAX_NTHREADS + 1];
     // struct htp_prof_desc profs[];  -- dspqueue buf 0
 };
 

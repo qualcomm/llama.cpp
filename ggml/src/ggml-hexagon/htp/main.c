@@ -711,12 +711,21 @@ static inline void profile_stop(uint32_t mode, struct profile_data * d) {
 static int op_fence(struct htp_ops_context * octx) {
     struct htp_context *ctx = octx->ctx;
     struct htp_thread_trace * tr = &ctx->trace[0];
-    const uint32_t seq = (uint32_t) octx->op_params[0];
+    const uint32_t seq  = (uint32_t) octx->op_params[0];
+    const uint32_t mode = (uint32_t) octx->op_params[1];
 
     htp_trace_event_start(tr, HTP_TRACE_EVT_FENCE, (uint16_t) seq);
 
     const struct htp_tensor * sync = octx->src[0];
     atomic_uint * sync_fence = (atomic_uint *) (uintptr_t) sync->data;
+
+    if (mode == 1) {
+        htp_fence_write(sync_fence, seq, HTP_STATUS_OK);
+        htp_trace_event_stop(tr, HTP_TRACE_EVT_FENCE, (uint16_t) seq);
+        FARF(HIGH, "ggml-hex: sync-signal : fence %p seq %u\n", sync_fence, seq);
+        return HTP_STATUS_OK;
+    }
+
     uint64_t spins = 0;
     while (1) {
         uint32_t sync_seq;
@@ -1100,7 +1109,7 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
         return;
     }
 
-    FARF(HIGH, "processing opbatch #%u: n-bufs %u n-tensors %u n-ops %u n-traces %u : m-size %u b-size %u t-size %u o-size %u", req->id,
+    FARF(HIGH, "processing opbatch #%llu: n-bufs %u n-tensors %u n-ops %u n-traces %u : m-size %u b-size %u t-size %u o-size %u", (unsigned long long) req->seq,
             n_bufs, n_tens, n_ops, req->n_traces, dbuf->size, b_size, t_size, o_size);
 
     // Setup descriptor pointers
@@ -1186,7 +1195,7 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
 
     struct htp_opbatch_rsp rsp;
     memset(&rsp, 0, sizeof(rsp));
-    rsp.id           = req->id;
+    rsp.seq          = req->seq;
     rsp.status       = op_status;
     rsp.n_bufs       = n_bufs;
     rsp.n_tensors    = n_tens;
@@ -1194,7 +1203,6 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
     rsp.usecs        = batch_prof.usecs;
     rsp.cycles_start = batch_prof.cycles_start;
     rsp.cycles_stop  = batch_prof.cycles_stop;
-    rsp.seq          = req->seq;
 
     if (ctx->profiler == HTP_PROF_TRACE) {
         for (int t = 0; t <= HTP_MAX_NTHREADS; t++) {
