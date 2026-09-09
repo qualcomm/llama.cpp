@@ -1147,7 +1147,8 @@ int op_gated_delta_net(struct htp_ops_context * octx) {
     if (octx->ctx->mdev.count > 1) {
         const uint32_t head_bytes = S_v * sizeof(float);
         const uint32_t rows_per_chunk = (head_bytes > 0) ? (HEX_L2_LINE_SIZE / hex_gcd_u32(head_bytes, HEX_L2_LINE_SIZE)) : 1;
-        const struct htp_tensor_mdev_range range = htp_tensor_mdev_partition(total_rows, htp_tensor_mdev_data_aligned(dst) ? rows_per_chunk : 0, octx->ctx->mdev.idx, octx->ctx->mdev.count, &octx->ctx->mdev.count_div);
+        const struct htp_tensor_mdev_range range = htp_tensor_mdev_partition(total_rows, htp_tensor_mdev_data_aligned(dst) ? rows_per_chunk : 0,
+                                                                             octx->ctx->mdev.idx, octx->ctx->mdev.count, &octx->ctx->mdev.count_div);
         row_start = range.start;
         nrows     = range.count;
     }
@@ -1168,7 +1169,6 @@ int op_gated_delta_net(struct htp_ops_context * octx) {
     size_t state_aligned = (size_t) S_v * S_v * sizeof(float);
     state_aligned = (state_aligned + 127) & ~(size_t)127;
 
-    assert(octx->ctx->vtcm_base != NULL);
     assert(octx->ctx->vtcm_size >= 2 * state_aligned * n_threads);
 
     gctx.vtcm_base = octx->ctx->vtcm_base;

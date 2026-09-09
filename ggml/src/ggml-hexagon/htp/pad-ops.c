@@ -512,9 +512,7 @@ int op_pad(struct htp_ops_context * octx) {
     // Total VTCM needed: 2 buffers (ping+pong) for src and dst, per thread
     const size_t vtcm_needed = (size_t)n_threads * 2 * (src_row_size_aligned + dst_row_size_aligned);
 
-    const int use_dma = (src0->nb[0] == (uint32_t)type_size) &&
-                        (ne00 >= 512) &&
-                        (octx->ctx->vtcm_base != NULL) &&
+    const int use_dma = (src0->nb[0] == (uint32_t)type_size) && (ne00 >= 512) &&
                         (octx->ctx->vtcm_size >= vtcm_needed);
 
     if (use_dma) {
