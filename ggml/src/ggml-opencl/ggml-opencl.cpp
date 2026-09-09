@@ -256,8 +256,6 @@ static ggml_cl_version get_opencl_c_version(ggml_cl_version platform_version, cl
     GGML_UNUSED(platform_version);
 #endif  // CL_TARGET_OPENCL_VERSION >= 300
 
-    // This function documents "on an error returns ggml_cl_version with all zeroes", so honour
-    // that instead of aborting -- the caller can degrade, a dead process cannot.
     if (clGetDeviceInfo(device, CL_DEVICE_OPENCL_C_VERSION, 0, nullptr, &param_size) != CL_SUCCESS || !param_size) {
         return {};
     }
@@ -1145,12 +1143,13 @@ struct ggml_backend_opencl_context {
     }
 
     void enqueue_ndrange_kernel(cl_kernel kernel, cl_uint work_dim, size_t *global_work_size, size_t *local_work_size, const ggml_tensor * tensor) {
-        // An empty range is a no-op, but the spec says a zero global size is
-        // CL_INVALID_GLOBAL_WORK_SIZE, so enqueuing it is an error rather than nothing. Most
-        // drivers return CL_SUCCESS and do nothing; strict drivers (Adreno 642L, 619) return
-        // -63 and the CL_CHECK below aborts the process. Skip it, which is what every other
-        // driver effectively does. A dimension that is wrongly zero still shows up as a wrong
-        // result. Check first, before the profiling path, so no mode enqueues it.
+        // From the spec on clEnqueueNDRangeKernel:
+        // If the device associated with command_queue is an OpenCL 2.1 or newer device,
+        // and global_work_size is NULL or the value in any passed dimension is zero,
+        // then the kernel command will trivially succeed after its event dependencies
+        // are satisfied and subsequently update its completion event.
+        // So this ensures such cases always return trivially without causing errors in
+        // case of an older device.
         for (cl_uint i = 0; i < work_dim; i++) {
             if (global_work_size[i] == 0) {
                 return;
@@ -8607,15 +8606,9 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                    (mode == GGML_SCALE_MODE_NEAREST || mode == GGML_SCALE_MODE_BILINEAR) && !antialias;
         }
         case GGML_OP_CONV_2D:
-            // The kernel walks both operands as if they were contiguous WHCN, so a
-            // channel-most-contiguous (CWHN) input or kernel -- which reaches us as a permuted,
-            // non-contiguous tensor with the same ne -- is read with the wrong strides and
-            // produces garbage rather than being declined. Decline non-contiguous layouts, as
-            // the CUDA and Vulkan backends already do.
-            return (ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) && ggml_is_contiguous(op)) &&
-                   ((op->src[0]->type == GGML_TYPE_F16 && op->src[1]->type == GGML_TYPE_F16 && op->type == GGML_TYPE_F16) ||
-                    (op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32) ||
-                    (op->src[0]->type == GGML_TYPE_F16 && op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32));
+            return (op->src[0]->type == GGML_TYPE_F16 && op->src[1]->type == GGML_TYPE_F16 && op->type == GGML_TYPE_F16) ||
+                   (op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32) ||
+                   (op->src[0]->type == GGML_TYPE_F16 && op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32);
         case GGML_OP_SSM_CONV:
             return (op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32);
         case GGML_OP_SSM_SCAN: {
