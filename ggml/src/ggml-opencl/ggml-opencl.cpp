@@ -214,7 +214,7 @@ static ggml_cl_version get_opencl_device_version(cl_device_id device) {
         return {};
     }
 
-    auto              param_value    = std::string_view(param_storage.get(), param_size);
+    auto param_value = std::string_view(param_storage.get(), param_size);
     const std::string version_prefix = "OpenCL ";  // "OpenCL <major>.<minor> <device-specific-info>"
     if (param_value.find(version_prefix) != 0) {
         return {};
@@ -12315,8 +12315,7 @@ static ggml_backend_buffer_t ggml_backend_opencl_buffer_type_alloc_buffer(ggml_b
     }
 #endif
     if (err != CL_SUCCESS) {
-        mem = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR,
-                             size, NULL, &err);
+        mem = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR, size, NULL, &err);
         if (err == CL_SUCCESS) {
             GGML_LOG_WARN("%s: %.2f MiB allocated via CL_MEM_ALLOC_HOST_PTR fallback — "
                           "device pool exhausted; runtime perf will be degraded. "
