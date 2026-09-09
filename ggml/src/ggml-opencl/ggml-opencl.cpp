@@ -17510,6 +17510,15 @@ inline bool enable_adreno_trans_weight_q5_K(const ggml_backend_opencl_context *b
         return false;
     }
 
+    // Upstream #28402: the packed q5_K weight layout assumes these shape multiples, and a
+    // weight that does not meet them must not take the transposed route at all. Kept as its
+    // own early return rather than folded into the image-fit test below, because it is a
+    // CORRECTNESS guard and must still hold when q5_K_big_head_gpu_optin() waives that test.
+    if (tensor->ne[0] % 32 != 0 || tensor->ne[1] % 4 != 0 ||
+        tensor->ne[2] != 1 || tensor->ne[3] != 1) {
+        return false;
+    }
+
     // Read once per process (a static env), so the set_tensor layout and the dispatch
     // below can never disagree about which layout the weight is in.
     return q5_K_weight_images_fit(backend_ctx, tensor) || q5_K_big_head_gpu_optin();
@@ -17568,6 +17577,14 @@ static inline bool q4_K_weight_image_fits(const ggml_backend_opencl_context *bac
 }
 
 static inline bool use_flat_gemv_for_large_m_q4_K(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor) {
+    // Upstream #28402: the noshuffle/packed route cannot represent a weight whose ne1 is
+    // not a multiple of 4, so the flat GEMV is the only correct option there. A CORRECTNESS
+    // escape, so it sits above the large-M perf gate -- the same ordering rule the
+    // image-fit check below is documented with.
+    if (tensor->ne[1] % 4 != 0 && tensor->ne[2] == 1 && tensor->ne[3] == 1) {
+        return true;
+    }
+
     // gemv_noshuffle variant perf drops for large M, use flat variant for large M.
     // threshold is well above typical hidden/FFN dims, but below typical vocab sizes.
     // note that this forces large M weights to use LM GEMM.
