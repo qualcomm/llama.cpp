@@ -427,3 +427,186 @@ kernel void kernel_mul_mv_iq2_s_f32_flat(
     }
 #undef IQ2S_GRID
 }
+
+// ---------------------------------------------------------------------------
+// Fused ffn_gate + ffn_up + GLU, for decode.
+//
+// The two projections read the SAME activation and differ only in their weights,
+// so running them as two GEMVs reads that activation twice and launches twice.
+// This kernel walks the activation once, accumulating both dot products, and
+// applies the GLU epilogue in registers -- one dispatch, one activation pass.
+// Together gate and up are about a third of an IQ decode frame.
+//
+// Admission is the host's: it fires only on the MUL_MAT/MUL_MAT/GLU subgraph
+// with one shared f32 activation, matching split weights and no swapped operands.
+// ---------------------------------------------------------------------------
+
+#define IQ2S_GLU_GEGLU_COEF_A   0.044715f
+#define IQ2S_GLU_SQRT_2_OVER_PI 0.79788456080286535587989211986876f
+#define IQ2S_GLU_SQRT_2_INV     0.70710678118654752440084436210484f
+#define IQ2S_GLU_QUICK_COEF    -1.702f
+
+// Op numbering and expressions match the q4_K fused path in this backend, so the
+// two cannot drift apart.
+inline float iq2s_glu_apply(int glu_op, float g, float u) {
+    float act;
+    if (glu_op == 1) {        // GEGLU (tanh-approx gelu)
+        act = 0.5f*g*(1.0f + tanh(IQ2S_GLU_SQRT_2_OVER_PI*g*(1.0f + IQ2S_GLU_GEGLU_COEF_A*g*g)));
+    } else if (glu_op == 2) { // SWIGLU (silu)
+        act = g / (1.0f + exp(-g));
+    } else if (glu_op == 0) { // REGLU
+        return g*u*(g > 0.0f);
+    } else if (glu_op == 4) { // GEGLU_ERF
+        act = 0.5f*g*(1.0f + erf(g*IQ2S_GLU_SQRT_2_INV));
+    } else {                  // GEGLU_QUICK
+        act = g*(1.0f/(1.0f + exp(IQ2S_GLU_QUICK_COEF*g)));
+    }
+    return act*u;
+}
+
+kernel void kernel_mul_mv_iq2_s_f32_flat_glu(
+        __read_only image1d_buffer_t grid_img,
+#if IQ2S_MV_AIMG
+        // declared exactly when the host binds them; see the plain GEMV
+        __read_only image1d_buffer_t y_img,
+        uint y_off,
+#endif
+        global const uchar * g_qs,
+        global const uchar * g_sg,
+        global const uchar * g_qh,
+        global const uchar * g_sc,
+        global const half  * g_d,
+        global const uchar * u_qs,
+        global const uchar * u_sg,
+        global const uchar * u_qh,
+        global const uchar * u_sc,
+        global const half  * u_d,
+        global const float * src1,
+        ulong offset1,
+        global float * dst,
+        ulong offsetd,
+        int ne00,
+        int ne01,
+        int ne10,
+        int ne0,
+        int glu_op
+) {
+    src1 = (global const float *)((global const char *)src1 + offset1);
+    dst  = (global float       *)((global char       *)dst  + offsetd);
+
+    const uint m   = (uint)ne01;
+    const uint K   = (uint)ne00;
+    const uint nsb = K / QK_K;
+
+    const uint lid = get_local_id(0);
+    const uint sgi = get_local_id(1);
+    const uint col = get_group_id(1);
+
+    global const float * y = src1 + (ulong)col * (uint)ne10;
+#if IQ2S_MV_AIMG
+#if IQ2S_MV_AIMG
+    const uint y_tex = y_off + col * ((uint)ne10 >> 2);
+#endif
+#endif
+
+#define IQ2S_GGRID(i) (read_imageui(grid_img, (int)(i)).x)
+
+    const uint mh  = m >> 1;
+    const uint j   = get_group_id(0) * 64u + lid;
+    const uint row = j << 1;
+
+    float gs0 = 0.f, gs1 = 0.f, us0 = 0.f, us1 = 0.f;
+
+    if (j < mh) {
+        global const ushort * gqsu = (global const ushort *)g_qs;
+        global const ushort * gsgu = (global const ushort *)g_sg;
+        global const ushort * gqhu = (global const ushort *)g_qh;
+        global const ushort * gscu = (global const ushort *)g_sc;
+        global const ushort * uqsu = (global const ushort *)u_qs;
+        global const ushort * usgu = (global const ushort *)u_sg;
+        global const ushort * uqhu = (global const ushort *)u_qh;
+        global const ushort * uscu = (global const ushort *)u_sc;
+
+        for (uint ib = sgi; ib < nsb; ib += IQ2S_MV_NSG) {
+            const half2 gdh = vload2(j + ib * mh, g_d);
+            const half2 udh = vload2(j + ib * mh, u_d);
+
+            float gacc0 = 0.f, gacc1 = 0.f, uacc0 = 0.f, uacc1 = 0.f;
+            for (uint sb = 0; sb < 8u; ++sb) {
+                const uint sub  = ib * 8u + sb;
+                const uint gqhv = (uint)gqhu[j + sub * mh];
+                const uint gscv = (uint)gscu[j + sub * mh];
+                const uint uqhv = (uint)uqhu[j + sub * mh];
+                const uint uscv = (uint)uscu[j + sub * mh];
+                const uint gb   = j + (sub * 4u) * mh;
+
+                for (uint h = 0; h < 2u; ++h) {
+                    const uint gn0 = (h == 0u) ? ( gscv        & 0xFu) : (( gscv        >> 4) & 0xFu);
+                    const uint gn1 = (h == 0u) ? ((gscv >> 8)  & 0xFu) : (((gscv >> 8)  >> 4) & 0xFu);
+                    const uint un0 = (h == 0u) ? ( uscv        & 0xFu) : (( uscv        >> 4) & 0xFu);
+                    const uint un1 = (h == 0u) ? ((uscv >> 8)  & 0xFu) : (((uscv >> 8)  >> 4) & 0xFu);
+
+                    float ga0 = 0.f, ga1 = 0.f, ua0 = 0.f, ua1 = 0.f;
+                    for (uint t = 0; t < 2u; ++t) {
+                        const uint l = 2u*h + t;
+
+                        // the activation is read ONCE and used by both streams
+                        const uint grp = (ib * 64u + sb * 8u) + l * 2u;
+                        const float4 y0 = IQ2S_YV(grp + 0u);
+                        const float4 y1 = IQ2S_YV(grp + 1u);
+
+                        const uint gqsv = (uint)gqsu[gb + l * mh];
+                        const uint gsgv = (uint)gsgu[gb + l * mh];
+                        const uint ggi0 = ( gqsv       & 0xFFu) | ((((gqhv      ) >> (2u*l)) & 3u) << 8);
+                        const uint ggi1 = ((gqsv >> 8) & 0xFFu) | ((((gqhv >> 8) >> (2u*l)) & 3u) << 8);
+                        const uint gsv0 =  gsgv       & 0xFFu;
+                        const uint gsv1 = (gsgv >> 8) & 0xFFu;
+                        ga0 += dot(y0, iq2s_vals(IQ2S_GGRID(2u*ggi0 + 0u), gsv0, 0u));
+                        ga0 += dot(y1, iq2s_vals(IQ2S_GGRID(2u*ggi0 + 1u), gsv0, 4u));
+                        ga1 += dot(y0, iq2s_vals(IQ2S_GGRID(2u*ggi1 + 0u), gsv1, 0u));
+                        ga1 += dot(y1, iq2s_vals(IQ2S_GGRID(2u*ggi1 + 1u), gsv1, 4u));
+
+                        const uint uqsv = (uint)uqsu[gb + l * mh];
+                        const uint usgv = (uint)usgu[gb + l * mh];
+                        const uint ugi0 = ( uqsv       & 0xFFu) | ((((uqhv      ) >> (2u*l)) & 3u) << 8);
+                        const uint ugi1 = ((uqsv >> 8) & 0xFFu) | ((((uqhv >> 8) >> (2u*l)) & 3u) << 8);
+                        const uint usv0 =  usgv       & 0xFFu;
+                        const uint usv1 = (usgv >> 8) & 0xFFu;
+                        ua0 += dot(y0, iq2s_vals(IQ2S_GGRID(2u*ugi0 + 0u), usv0, 0u));
+                        ua0 += dot(y1, iq2s_vals(IQ2S_GGRID(2u*ugi0 + 1u), usv0, 4u));
+                        ua1 += dot(y0, iq2s_vals(IQ2S_GGRID(2u*ugi1 + 0u), usv1, 0u));
+                        ua1 += dot(y1, iq2s_vals(IQ2S_GGRID(2u*ugi1 + 1u), usv1, 4u));
+                    }
+                    gacc0 += (0.5f + (float)gn0) * ga0;
+                    gacc1 += (0.5f + (float)gn1) * ga1;
+                    uacc0 += (0.5f + (float)un0) * ua0;
+                    uacc1 += (0.5f + (float)un1) * ua1;
+                }
+            }
+            gs0 += (float)gdh.s0 * 0.25f * gacc0;
+            gs1 += (float)gdh.s1 * 0.25f * gacc1;
+            us0 += (float)udh.s0 * 0.25f * uacc0;
+            us1 += (float)udh.s1 * 0.25f * uacc1;
+        }
+    }
+
+#if IQ2S_MV_NSG > 1
+    __local float4 gpart[IQ2S_MV_NSG][64];
+    gpart[sgi][lid] = (float4)(gs0, gs1, us0, us1);
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (sgi != 0) {
+        return;
+    }
+    for (uint s = 1; s < IQ2S_MV_NSG; ++s) {
+        const float4 p = gpart[s][lid];
+        gs0 += p.s0; gs1 += p.s1; us0 += p.s2; us1 += p.s3;
+    }
+#endif
+
+    if (j < mh) {
+        global float * o = dst + (ulong)col * (uint)ne0 + row;
+        o[0] = iq2s_glu_apply(glu_op, gs0, us0);
+        o[1] = iq2s_glu_apply(glu_op, gs1, us1);
+    }
+#undef IQ2S_GGRID
+}

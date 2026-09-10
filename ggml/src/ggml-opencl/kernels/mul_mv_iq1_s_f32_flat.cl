@@ -446,3 +446,172 @@ kernel void kernel_mul_mv_iq1_s_f32_flat(
 }
 
 inline float iq1s_hsum(float4 v) { return (v.s0 + v.s1) + (v.s2 + v.s3); }
+
+// ---------------------------------------------------------------------------
+// Fused ffn_gate + ffn_up + GLU, for decode.
+//
+// The two projections read the SAME activation and differ only in their weights,
+// so running them as two GEMVs reads that activation twice and launches twice.
+// This kernel walks the activation once, accumulating both dot products, and
+// applies the GLU epilogue in registers -- one dispatch, one activation pass.
+// Together gate and up are about a third of an IQ decode frame.
+//
+// Admission is the host's: it fires only on the MUL_MAT/MUL_MAT/GLU subgraph
+// with one shared f32 activation, matching split weights and no swapped operands.
+// ---------------------------------------------------------------------------
+
+#define IQ1S_GLU_GEGLU_COEF_A   0.044715f
+#define IQ1S_GLU_SQRT_2_OVER_PI 0.79788456080286535587989211986876f
+#define IQ1S_GLU_SQRT_2_INV     0.70710678118654752440084436210484f
+#define IQ1S_GLU_QUICK_COEF    -1.702f
+
+// Op numbering and expressions match the q4_K fused path in this backend, so the
+// two cannot drift apart.
+inline float iq1s_glu_apply(int glu_op, float g, float u) {
+    float act;
+    if (glu_op == 1) {        // GEGLU (tanh-approx gelu)
+        act = 0.5f*g*(1.0f + tanh(IQ1S_GLU_SQRT_2_OVER_PI*g*(1.0f + IQ1S_GLU_GEGLU_COEF_A*g*g)));
+    } else if (glu_op == 2) { // SWIGLU (silu)
+        act = g / (1.0f + exp(-g));
+    } else if (glu_op == 0) { // REGLU
+        return g*u*(g > 0.0f);
+    } else if (glu_op == 4) { // GEGLU_ERF
+        act = 0.5f*g*(1.0f + erf(g*IQ1S_GLU_SQRT_2_INV));
+    } else {                  // GEGLU_QUICK
+        act = g*(1.0f/(1.0f + exp(IQ1S_GLU_QUICK_COEF*g)));
+    }
+    return act*u;
+}
+
+kernel void kernel_mul_mv_iq1_s_f32_flat_glu(
+        __read_only image1d_buffer_t grid_img,
+#if IQ1S_MV_AIMG
+        // declared exactly when the host binds them; see the plain GEMV
+        __read_only image1d_buffer_t y_img,
+        uint y_off,
+#endif
+        global const uchar  * g_qs,
+        global const ushort * g_qh,
+        global const half   * g_d,
+        global const uchar  * u_qs,
+        global const ushort * u_qh,
+        global const half   * u_d,
+        global const float  * src1,
+        ulong offset1,
+        global float * dst,
+        ulong offsetd,
+        int ne00,
+        int ne01,
+        int ne10,
+        int ne0,
+        int glu_op
+) {
+    src1 = (global const float *)((global const char *)src1 + offset1);
+    dst  = (global float       *)((global char       *)dst  + offsetd);
+
+    const uint m   = (uint)ne01;
+    const uint K   = (uint)ne00;
+    const uint nsb = K / QK_K;
+
+    const uint lid = get_local_id(0);
+    const uint sgi = get_local_id(1);
+    const uint col = get_group_id(1);
+
+    global const float * y = src1 + (ulong)col * (uint)ne10;
+#if IQ1S_MV_AIMG
+#if IQ1S_MV_AIMG
+    const uint y_tex = y_off + col * ((uint)ne10 >> 2);
+#endif
+#endif
+
+#define IQ1S_GGRID(i) IQ1S_ABL((read_imageui(grid_img, (int)(i)).x), (i))
+
+    const uint mh  = m >> 1;
+    const uint j   = get_group_id(0) * 64u + lid;
+    const uint row = j << 1;
+
+    float gs0 = 0.f, gs1 = 0.f, us0 = 0.f, us1 = 0.f;
+
+    if (j < mh) {
+        global const ushort * gqsu = (global const ushort *)g_qs;
+        global const ushort * uqsu = (global const ushort *)u_qs;
+
+        for (uint ib = sgi; ib < nsb; ib += IQ1S_MV_NSG) {
+            const half2 gdh = vload2(j + ib * mh, g_d);
+            const half2 udh = vload2(j + ib * mh, u_d);
+
+            float gacc0 = 0.f, gacc1 = 0.f, uacc0 = 0.f, uacc1 = 0.f;
+            for (uint sb = 0; sb < 8u; ++sb) {
+                const uint sub = ib * 8u + sb;
+
+                const ushort2 gqhv = vload2(j + sub * mh, g_qh);
+                const ushort2 uqhv = vload2(j + sub * mh, u_qh);
+                const uint gh0 = (uint)gqhv.s0, gh1 = (uint)gqhv.s1;
+                const uint uh0 = (uint)uqhv.s0, uh1 = (uint)uqhv.s1;
+
+                const float gsc0 = (float)(2u * ((gh0 >> 12) & 7u) + 1u);
+                const float gsc1 = (float)(2u * ((gh1 >> 12) & 7u) + 1u);
+                const float usc0 = (float)(2u * ((uh0 >> 12) & 7u) + 1u);
+                const float usc1 = (float)(2u * ((uh1 >> 12) & 7u) + 1u);
+                const float gt0  = ((gh0 & 0x8000u) ? -0.125f : 0.125f) - IQ1S_DBIAS;
+                const float gt1  = ((gh1 & 0x8000u) ? -0.125f : 0.125f) - IQ1S_DBIAS;
+                const float ut0  = ((uh0 & 0x8000u) ? -0.125f : 0.125f) - IQ1S_DBIAS;
+                const float ut1  = ((uh1 & 0x8000u) ? -0.125f : 0.125f) - IQ1S_DBIAS;
+
+                const uint gb  = j + (sub * 4u) * mh;
+                const uint grp = sub * 8u;
+
+                float ga0 = 0.f, ga1 = 0.f, ua0 = 0.f, ua1 = 0.f;
+                float4 as = (float4)(0.f);
+                for (uint l = 0; l < 4u; ++l) {
+                    // activation read ONCE, and its running sum accumulated ONCE,
+                    // for both weight streams and both rows
+                    const float4 y0 = IQ1S_YV(grp + 2u*l + 0u);
+                    const float4 y1 = IQ1S_YV(grp + 2u*l + 1u);
+                    as += y0 + y1;
+
+                    const uint gqsv = (uint)gqsu[gb + l * mh];
+                    const uint gg0  = IQ1S_GGRID(( gqsv       & 0xFFu) | ((((gh0 >> (3u*l)) & 7u) << 8)));
+                    const uint gg1  = IQ1S_GGRID(((gqsv >> 8) & 0xFFu) | ((((gh1 >> (3u*l)) & 7u) << 8)));
+                    ga0 += dot(y0, IQ1S_GVEC(gg0)) + dot(y1, IQ1S_GVEC_HI(gg0));
+                    ga1 += dot(y0, IQ1S_GVEC(gg1)) + dot(y1, IQ1S_GVEC_HI(gg1));
+
+                    const uint uqsv = (uint)uqsu[gb + l * mh];
+                    const uint ug0  = IQ1S_GGRID(( uqsv       & 0xFFu) | ((((uh0 >> (3u*l)) & 7u) << 8)));
+                    const uint ug1  = IQ1S_GGRID(((uqsv >> 8) & 0xFFu) | ((((uh1 >> (3u*l)) & 7u) << 8)));
+                    ua0 += dot(y0, IQ1S_GVEC(ug0)) + dot(y1, IQ1S_GVEC_HI(ug0));
+                    ua1 += dot(y0, IQ1S_GVEC(ug1)) + dot(y1, IQ1S_GVEC_HI(ug1));
+                }
+                const float asum = as.s0 + as.s1 + as.s2 + as.s3;
+                gacc0 += gsc0 * (ga0 + gt0 * asum);
+                gacc1 += gsc1 * (ga1 + gt1 * asum);
+                uacc0 += usc0 * (ua0 + ut0 * asum);
+                uacc1 += usc1 * (ua1 + ut1 * asum);
+            }
+            gs0 += (float)gdh.s0 * gacc0;
+            gs1 += (float)gdh.s1 * gacc1;
+            us0 += (float)udh.s0 * uacc0;
+            us1 += (float)udh.s1 * uacc1;
+        }
+    }
+
+#if IQ1S_MV_NSG > 1
+    __local float4 gpart[IQ1S_MV_NSG][64];
+    gpart[sgi][lid] = (float4)(gs0, gs1, us0, us1);
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (sgi != 0) {
+        return;
+    }
+    for (uint s = 1; s < IQ1S_MV_NSG; ++s) {
+        const float4 p = gpart[s][lid];
+        gs0 += p.s0; gs1 += p.s1; us0 += p.s2; us1 += p.s3;
+    }
+#endif
+
+    if (j < mh) {
+        global float * o = dst + (ulong)col * (uint)ne0 + row;
+        o[0] = iq1s_glu_apply(glu_op, gs0, us0);
+        o[1] = iq1s_glu_apply(glu_op, gs1, us1);
+    }
+#undef IQ1S_GGRID
+}
