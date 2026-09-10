@@ -1100,10 +1100,6 @@ int op_gated_delta_net(struct htp_ops_context * octx) {
     const struct htp_tensor * state = octx->src[5];
     const struct htp_tensor * dst   = octx->dst;
 
-    if (!q || !k || !v || !g || !beta || !state || !dst) {
-        return HTP_STATUS_INVAL_PARAMS;
-    }
-
     if (q->type != HTP_TYPE_F32 || k->type != HTP_TYPE_F32 || v->type != HTP_TYPE_F32 ||
         g->type != HTP_TYPE_F32 || beta->type != HTP_TYPE_F32 || state->type != HTP_TYPE_F32 ||
         dst->type != HTP_TYPE_F32) {

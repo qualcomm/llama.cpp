@@ -1,7 +1,6 @@
 #ifndef HTP_FENCE_H
 #define HTP_FENCE_H
 
-#include <assert.h>
 #include <stdatomic.h>
 #include <stdint.h>
 
@@ -36,8 +35,6 @@ static inline void htp_mdev_group_barrier(struct htp_ops_context * octx) {
     if (ctx->mdev.count <= 1) {
         return;
     }
-
-    assert(ctx->mdev.fence_base != NULL);
 
     const uint32_t seq = ++ctx->mdev.fence_seq;
 

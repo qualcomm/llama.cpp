@@ -762,7 +762,6 @@ static int op_fence(struct htp_ops_context * octx) {
 static int op_mdev_group(struct htp_ops_context * octx) {
     struct htp_context * ctx = octx->ctx;
     const struct htp_tensor * sync = octx->src[0];
-    assert(sync && sync->data);
     ctx->mdev.idx   = (uint16_t) octx->op_params[0];
     ctx->mdev.count = (uint16_t) sync->ne[1];
     if (ctx->mdev.count > 1) {

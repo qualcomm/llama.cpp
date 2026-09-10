@@ -2713,10 +2713,6 @@ static int hmx_mm_nx_2d_f32(struct htp_ops_context * octx, const struct htp_mm_k
     const struct htp_tensor * restrict src0 = octx->src[0];
     const struct htp_tensor * restrict act  = octx->src[n_weights];
 
-    if (!src0 || !act) {
-        return HTP_STATUS_INVAL_PARAMS;
-    }
-
     const int weight_type = (int) src0->type;
     const int k           = (int) act->ne[0];
     const int k_valid     = (int) act->ne[0];

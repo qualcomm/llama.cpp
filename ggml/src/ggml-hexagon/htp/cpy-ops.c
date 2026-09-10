@@ -424,7 +424,6 @@ int op_cpy(struct htp_ops_context * octx) {
 
         if (octx->ctx->mdev.idx == 0) {
             const struct htp_tensor * sync = octx->src[1];
-            assert(sync && (sync->flags & HTP_TENSOR_FENCE));
             const uint32_t seq = (uint32_t) octx->op_params[0];
             atomic_uint * sync_fence = (atomic_uint *) (uintptr_t) sync->data;
             htp_fence_write(sync_fence, seq, octx->status);

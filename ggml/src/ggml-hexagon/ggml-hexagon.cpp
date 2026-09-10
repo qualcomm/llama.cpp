@@ -351,7 +351,7 @@ struct ggml_hexagon_tensor_extra {
 };
 
 static inline bool ggml_hexagon_tensor_is_fuseable(const struct ggml_tensor * t) {
-    if (!t || !t->extra) return false;
+    if (!t->extra) return false;
     auto extra = (const struct ggml_hexagon_tensor_extra *) t->extra;
     return (extra->flags & GGML_HEXAGON_TENSOR_FUSEABLE) != 0;
 }
@@ -2055,7 +2055,6 @@ struct ggml_hexagon_opbatch {
 
         size_t extra_bufs = 0, extra_vmem = 0, extra_tens = 0;
         auto fit_t = [&](const ggml_tensor * t) {
-            if (!t) return;
             if (!t_map.count(t)) {
                 extra_tens++;
                 auto sbuf = static_cast<ggml_hexagon_shared_buffer *>(t->buffer->context);
@@ -2104,10 +2103,9 @@ struct ggml_hexagon_opbatch {
         const ggml_tensor * mul_src1 = node.src1();
         const ggml_tensor * rms_out  = last_node.dst();
 
-        if (!mul_src0 || !mul_src1 || !rms_out) return false;
         if (!ggml_hexagon_tensor_is_fuseable(rms_out)) return false;
 
-        const ggml_tensor * weight = nullptr;
+        const ggml_tensor * weight;
         if (mul_src0 == rms_out || mul_src0->data == rms_out->data) {
             weight = mul_src1;
         } else if (mul_src1 == rms_out || mul_src1->data == rms_out->data) {
@@ -2116,10 +2114,7 @@ struct ggml_hexagon_opbatch {
             return false;
         }
 
-        if (!weight || !weight->data) return false;
-
         const ggml_tensor * src0 = last_node.src0();
-        if (!src0 || !src0->data) return false;
 
         if (src0->ne[0] != weight->ne[0] || src0->ne[0] != node.dst()->ne[0]) {
             return false;
@@ -2150,7 +2145,6 @@ struct ggml_hexagon_opbatch {
 
         size_t extra_bufs = 0, extra_vmem = 0, extra_tens = 0;
         auto fit_t = [&](const ggml_tensor * t) {
-            if (!t) return;
             if (!t_map.count(t)) {
                 extra_tens++;
                 auto sbuf = static_cast<ggml_hexagon_shared_buffer *>(t->buffer->context);
@@ -2205,10 +2199,9 @@ struct ggml_hexagon_opbatch {
         const ggml_tensor * add_src1 = node.src1();
         const ggml_tensor * mm_out   = last_node.dst();
 
-        if (!add_src0 || !add_src1 || !mm_out) return false;
         if (!ggml_hexagon_tensor_is_fuseable(mm_out)) return false;
 
-        const ggml_tensor * src2 = nullptr;
+        const ggml_tensor * src2;
         if (add_src0 == mm_out || add_src0->data == mm_out->data) {
             src2 = add_src1;
         } else if (add_src1 == mm_out || add_src1->data == mm_out->data) {
@@ -2217,11 +2210,8 @@ struct ggml_hexagon_opbatch {
             return false;
         }
 
-        if (!src2 || !src2->data) return false;
-
         const ggml_tensor * src0 = last_node.src0();
         const ggml_tensor * src1 = last_node.src1();
-        if (!src0 || !src1) return false;
 
         struct htp_mm_kernel_params kparams;
         ggml_hexagon_precompute_fused_matmul_add_params(sess, src0, src1, src2, node.dst(), &kparams);
@@ -2237,7 +2227,6 @@ struct ggml_hexagon_opbatch {
 
         size_t extra_bufs = 0, extra_vmem = 0, extra_tens = 0;
         auto fit_t = [&](const ggml_tensor * t) {
-            if (!t) return;
             if (!t_map.count(t)) {
                 extra_tens++;
                 auto sbuf = static_cast<ggml_hexagon_shared_buffer *>(t->buffer->context);
@@ -2290,7 +2279,6 @@ struct ggml_hexagon_opbatch {
         const ggml_tensor * w_in = node.src0();
         const ggml_tensor * x_in = node.src1();
         const ggml_tensor * d_in = node.dst();
-        if (!w_in || !x_in || !d_in) return false;
 
         htp_opnode & last_node = ops[n_ops - 1];
 
@@ -2324,7 +2312,6 @@ struct ggml_hexagon_opbatch {
 
             size_t extra_bufs = 0, extra_vmem = 0, extra_tens = 0;
             auto fit_t = [&](const ggml_tensor * t) {
-                if (!t) return;
                 if (!t_map.count(t)) {
                     extra_tens++;
                     auto sbuf = static_cast<ggml_hexagon_shared_buffer *>(t->buffer->context);
@@ -2375,7 +2362,6 @@ struct ggml_hexagon_opbatch {
             const ggml_tensor * w0 = last_node.src0();
             const ggml_tensor * x  = last_node.src1();
             const ggml_tensor * w1 = node.src0();
-            if (!w0 || !x || !w1) return false;
 
             struct htp_mm_kernel_params kparams;
             ggml_hexagon_precompute_fused_mmnx_params(sess, w0, x, 2, &kparams);
@@ -2390,7 +2376,6 @@ struct ggml_hexagon_opbatch {
 
             size_t extra_bufs = 0, extra_vmem = 0, extra_tens = 0;
             auto fit_t = [&](const ggml_tensor * t) {
-                if (!t) return;
                 if (!t_map.count(t)) {
                     extra_tens++;
                     auto sbuf = static_cast<ggml_hexagon_shared_buffer *>(t->buffer->context);
@@ -2452,7 +2437,6 @@ struct ggml_hexagon_opbatch {
         const ggml_tensor * x_in   = node.src1();
         const ggml_tensor * ids_in = node.node->src[2];
         const ggml_tensor * d_in   = node.dst();
-        if (!w_in || !x_in || !ids_in || !d_in) return false;
 
         htp_opnode & last_node = ops[n_ops - 1];
 
@@ -2487,7 +2471,6 @@ struct ggml_hexagon_opbatch {
 
             size_t extra_bufs = 0, extra_vmem = 0, extra_tens = 0;
             auto fit_t = [&](const ggml_tensor * t) {
-                if (!t) return;
                 if (!t_map.count(t)) {
                     extra_tens++;
                     auto sbuf = static_cast<ggml_hexagon_shared_buffer *>(t->buffer->context);
@@ -2540,7 +2523,6 @@ struct ggml_hexagon_opbatch {
             const ggml_tensor * x   = last_node.src1();
             const ggml_tensor * ids = last_node.node->src[2];
             const ggml_tensor * w1  = node.src0();
-            if (!w0 || !x || !ids || !w1) return false;
 
             struct htp_mm_kernel_params kparams;
             ggml_hexagon_precompute_fused_mmidnx_params(sess, w0, x, node.dst(), 2, &kparams);
@@ -2555,7 +2537,6 @@ struct ggml_hexagon_opbatch {
 
             size_t extra_bufs = 0, extra_vmem = 0, extra_tens = 0;
             auto fit_t = [&](const ggml_tensor * t) {
-                if (!t) return;
                 if (!t_map.count(t)) {
                     extra_tens++;
                     auto sbuf = static_cast<ggml_hexagon_shared_buffer *>(t->buffer->context);
@@ -3799,10 +3780,6 @@ static bool ggml_hexagon_supported_gated_delta_net(const struct ggml_hexagon_ses
     const struct ggml_tensor * beta  = op->src[4];
     const struct ggml_tensor * state = op->src[5];
     const struct ggml_tensor * dst   = op;
-
-    if (!q || !k || !v || !g || !beta || !state) {
-        return false;
-    }
 
     if (q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F32 || v->type != GGML_TYPE_F32 ||
         g->type != GGML_TYPE_F32 || beta->type != GGML_TYPE_F32 || state->type != GGML_TYPE_F32 ||
@@ -5219,10 +5196,6 @@ static bool ggml_hexagon_supported_solve_tri(const struct ggml_hexagon_session *
     const struct ggml_tensor * src1 = op->src[1]; // B
     const struct ggml_tensor * dst  = op;         // X
 
-    if (!src0 || !src1) {
-        return false;
-    }
-
     if (src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
         return false;
     }
@@ -5392,7 +5365,7 @@ static bool is_supported_mul_mat_id_nx_kernel(const ggml_tensor * src0, const st
 }
 
 static bool is_mergeable_mul_mat(const ggml_tensor * t) {
-    if (!t || t->op != GGML_OP_MUL_MAT) return false;
+    if (t->op != GGML_OP_MUL_MAT) return false;
 
     const ggml_tensor * src0 = t->src[0];
     const ggml_tensor * src1 = t->src[1];
@@ -5426,7 +5399,7 @@ static bool is_mergeable_mul_mat_pair(const ggml_tensor * n1, const ggml_tensor 
 }
 
 static bool is_mergeable_mul_mat_id(const ggml_tensor * t) {
-    if (!t || t->op != GGML_OP_MUL_MAT_ID) return false;
+    if (t->op != GGML_OP_MUL_MAT_ID) return false;
 
     const ggml_tensor * src0 = t->src[0];
     return ggml_hexagon_is_repack_type(src0->type);
