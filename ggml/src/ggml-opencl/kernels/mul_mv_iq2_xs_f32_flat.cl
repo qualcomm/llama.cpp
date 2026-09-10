@@ -178,10 +178,41 @@ inline float4 iq2xs_vals(uint gv, uint sgv, uint base) {
     return as_float4(as_uint4(convert_float4(as_uchar4(gv))) ^ sgn);
 }
 
+#if IQ2XS_MV_AIMG
+#define IQ2XS_YV(g) read_imagef(y_img, (int)(y_tex + (g)))
+#else
 #define IQ2XS_YV(g) vload4((g), y)
+#endif
+
+// IQ2XS_MV_AIMG=1: read the activation through an image1d_buffer (a CL_RGBA/CL_FLOAT
+// view over src1's own buffer, so there is no copy) instead of vload4 from global.
+//
+// Every lane in the workgroup reads the SAME activation float4 for a given k, so
+// the read is wave-uniform and redundant across the 64 rows a workgroup owns --
+// exactly the access the texture unit's cache serves better than the vector path.
+//
+// Why it pays here and not everywhere: the boundary is the weight of the kernel
+// per weight, not the redundancy of the read, which is identical in all of them.
+// These types spend a codebook gather, a sign table and several float ops per 8
+// weights, so the activation load is a large share of a large total and hiding it
+// behind the texture unit wins. IQ4_XS is a LINEAR quant with none of that and
+// MEASURED NEGATIVE at -3.7%, which is why it is not on this list.
+//
+// Gated per device rather than assumed: the host defaults it ON for X2-class parts
+// and OFF elsewhere, and GGML_OPENCL_IQ2XS_MV_AIMG overrides it either way.
+#ifndef IQ2XS_MV_AIMG
+#define IQ2XS_MV_AIMG 0
+#endif
 
 kernel void kernel_mul_mv_iq2_xs_f32_flat(
         __read_only image1d_buffer_t grid_img,
+#if IQ2XS_MV_AIMG
+        // Declared only when the option is on, so the argument list the host
+        // binds and the one the kernel expects cannot disagree: a mismatch here
+        // shifts every weight plane down two positions rather than failing.
+        __read_only image1d_buffer_t y_img,
+        uint y_off,
+#endif
         global const ushort * src0_qs,
         global const uchar  * src0_sc,
         global const half   * src0_d,
@@ -206,6 +237,10 @@ kernel void kernel_mul_mv_iq2_xs_f32_flat(
     const uint col = get_group_id(1);           // token
 
     global const float * y = src1 + (ulong)col * (uint)ne10;
+#if IQ2XS_MV_AIMG
+    // src1 is f32 and the image is RGBA/f32, so one texel is four floats.
+    const uint y_tex = y_off + col * ((uint)ne10 >> 2);
+#endif
 
 #define IQ2XS_GRID(i) (read_imageui(grid_img, (int)(i)).x)
 

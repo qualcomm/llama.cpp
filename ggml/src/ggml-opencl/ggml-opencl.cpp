@@ -1650,6 +1650,57 @@ static int ggml_cl_iq3s_mv_nsg(const ggml_backend_opencl_context * backend_ctx) 
     return ggml_cl_env_int("GGML_OPENCL_IQ3S_MV_NSG", 8);
 }
 
+// Read the activation through an image1d_buffer in the IQ decode GEMVs. Every
+// lane of a workgroup reads the same activation float4 for a given k, so the
+// read is wave-uniform and 64-way redundant, which is the access the texture
+// unit's cache serves better than the vector path.
+//
+// Default ON for X2-class parts and OFF elsewhere: which memory tier wins is a
+// per-generation question, and the fleet has generations whose compilers differ
+// on the texture path. GGML_OPENCL_<TYPE>_MV_AIMG overrides it either way.
+//
+// IQ4_XS is deliberately absent. It is a LINEAR quant with no codebook gather
+// and no sign table, the fastest IQ decode in the roster, and the activation
+// texture MEASURES NEGATIVE on it (-3.7%). The boundary is the weight of the
+// kernel per weight, not the redundancy of the read.
+static int ggml_cl_iq_mv_aimg(const ggml_backend_opencl_context * backend_ctx,
+                              const char * env) {
+    if (const char * e = getenv(env)) {
+        if (e[0]) {
+            return atoi(e) != 0 ? 1 : 0;
+        }
+    }
+    return ggml_cl_adreno_x2_class(backend_ctx) ? 1 : 0;
+}
+
+static int ggml_cl_iq1s_mv_aimg(const ggml_backend_opencl_context * backend_ctx) {
+    return ggml_cl_iq_mv_aimg(backend_ctx, "GGML_OPENCL_IQ1S_MV_AIMG");
+}
+
+static int ggml_cl_iq1m_mv_aimg(const ggml_backend_opencl_context * backend_ctx) {
+    return ggml_cl_iq_mv_aimg(backend_ctx, "GGML_OPENCL_IQ1M_MV_AIMG");
+}
+
+static int ggml_cl_iq2xxs_mv_aimg(const ggml_backend_opencl_context * backend_ctx) {
+    return ggml_cl_iq_mv_aimg(backend_ctx, "GGML_OPENCL_IQ2XXS_MV_AIMG");
+}
+
+static int ggml_cl_iq2xs_mv_aimg(const ggml_backend_opencl_context * backend_ctx) {
+    return ggml_cl_iq_mv_aimg(backend_ctx, "GGML_OPENCL_IQ2XS_MV_AIMG");
+}
+
+static int ggml_cl_iq2s_mv_aimg(const ggml_backend_opencl_context * backend_ctx) {
+    return ggml_cl_iq_mv_aimg(backend_ctx, "GGML_OPENCL_IQ2S_MV_AIMG");
+}
+
+static int ggml_cl_iq3xxs_mv_aimg(const ggml_backend_opencl_context * backend_ctx) {
+    return ggml_cl_iq_mv_aimg(backend_ctx, "GGML_OPENCL_IQ3XXS_MV_AIMG");
+}
+
+static int ggml_cl_iq3s_mv_aimg(const ggml_backend_opencl_context * backend_ctx) {
+    return ggml_cl_iq_mv_aimg(backend_ctx, "GGML_OPENCL_IQ3S_MV_AIMG");
+}
+
 static int ggml_cl_q3k_mv_nsg(const ggml_backend_opencl_context * backend_ctx) {
     const int v = ggml_cl_env_int("GGML_OPENCL_Q3K_MV_NSG", 0);
     if (v > 0) {
@@ -1771,6 +1822,45 @@ static void ggml_cl_make_grid_image(ggml_backend_opencl_context * backend_ctx,
     desc.buffer      = *out_buf;
     CL_CHECK((*out_img = clCreateImage(backend_ctx->context, CL_MEM_READ_ONLY,
                                        &fmt, &desc, NULL, &err), err));
+}
+
+// A CL_RGBA/CL_FLOAT image1d_buffer view over the ACTIVATION, for the IQ decode
+// GEMVs whose every lane reads the same float4 for a given k. src1's own buffer
+// backs it, so there is no copy and nothing to keep in sync.
+//
+// Returns nullptr when the view is not expressible -- an offset that is not a
+// whole texel, a row length that is not a multiple of four floats, or a tensor
+// past the device's image1d_buffer limit. The caller then binds the codebook
+// image in its place and the kernel, compiled with AIMG=0, reads global memory:
+// declining is a fallback here, unlike the codebook image, which is a contract.
+//
+// The image is created per dispatch and released after the enqueue. That is
+// affordable only because these GEMVs are launched once per projection; the
+// weight-plane textures are cached for exactly the opposite reason.
+static cl_mem ggml_cl_activation_image(ggml_backend_opencl_context * backend_ctx,
+                                       cl_mem buf, cl_ulong offset1,
+                                       int ne10, int ne11, cl_uint * tex_off) {
+    *tex_off = 0;
+    if ((offset1 % 16) != 0 || (ne10 % 4) != 0) {
+        return nullptr;
+    }
+    const size_t texels = (size_t)(offset1 / 16) + (size_t)ne11 * (size_t)(ne10 / 4);
+    if (texels == 0 || texels > backend_ctx->image_max_buffer_size) {
+        return nullptr;
+    }
+    cl_image_format fmt = { CL_RGBA, CL_FLOAT };
+    cl_image_desc   desc;
+    memset(&desc, 0, sizeof(desc));
+    desc.image_type  = CL_MEM_OBJECT_IMAGE1D_BUFFER;
+    desc.image_width = texels;
+    desc.buffer      = buf;
+    cl_int err = CL_SUCCESS;
+    cl_mem img = clCreateImage(backend_ctx->context, CL_MEM_READ_ONLY, &fmt, &desc, NULL, &err);
+    if (err != CL_SUCCESS) {
+        return nullptr;
+    }
+    *tex_off = (cl_uint)(offset1 / 16);
+    return img;
 }
 
 static cl_program ggml_cl_build_mv_program_nsg(ggml_backend_opencl_context * backend_ctx,
@@ -5201,8 +5291,10 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #else
         const std::string kernel_src = read_file("mul_mv_iq1_s_f32_flat.cl");
 #endif
+        std::string opts = compile_opts;
+        opts += " -DIQ1S_MV_AIMG=" + std::to_string(ggml_cl_iq1s_mv_aimg(backend_ctx));
         cl_program prog = ggml_cl_build_mv_program_nsg(
-            backend_ctx, kernel_src.c_str(), compile_opts, "IQ1S_MV_NSG",
+            backend_ctx, kernel_src.c_str(), opts, "IQ1S_MV_NSG",
             ggml_cl_iq1s_mv_nsg(backend_ctx), &backend_ctx->iq1s_mv_nsg_eff);
         CL_CHECK((backend_ctx->kernel_mul_mv_iq1_s_f32_flat = clCreateKernel(prog, "kernel_mul_mv_iq1_s_f32_flat", &err), err));
         ggml_cl_make_grid_image(backend_ctx, prog, "kernel_iq1s_grid_export", 2048,
@@ -5244,8 +5336,10 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #else
         const std::string kernel_src = read_file("mul_mv_iq1_m_f32_flat.cl");
 #endif
+        std::string opts = compile_opts;
+        opts += " -DIQ1M_MV_AIMG=" + std::to_string(ggml_cl_iq1m_mv_aimg(backend_ctx));
         cl_program prog = ggml_cl_build_mv_program_nsg(
-            backend_ctx, kernel_src.c_str(), compile_opts, "IQ1M_MV_NSG",
+            backend_ctx, kernel_src.c_str(), opts, "IQ1M_MV_NSG",
             ggml_cl_iq1m_mv_nsg(backend_ctx), &backend_ctx->iq1m_mv_nsg_eff);
         CL_CHECK((backend_ctx->kernel_mul_mv_iq1_m_f32_flat = clCreateKernel(prog, "kernel_mul_mv_iq1_m_f32_flat", &err), err));
         ggml_cl_make_grid_image(backend_ctx, prog, "kernel_iq1m_grid_export", 2048,
@@ -5287,8 +5381,10 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #else
         const std::string kernel_src = read_file("mul_mv_iq2_xxs_f32_flat.cl");
 #endif
+        std::string opts = compile_opts;
+        opts += " -DIQ2XXS_MV_AIMG=" + std::to_string(ggml_cl_iq2xxs_mv_aimg(backend_ctx));
         cl_program prog = ggml_cl_build_mv_program_nsg(
-            backend_ctx, kernel_src.c_str(), compile_opts, "IQ2XXS_MV_NSG",
+            backend_ctx, kernel_src.c_str(), opts, "IQ2XXS_MV_NSG",
             ggml_cl_iq2xxs_mv_nsg(backend_ctx), &backend_ctx->iq2xxs_mv_nsg_eff);
         CL_CHECK((backend_ctx->kernel_mul_mv_iq2_xxs_f32_flat = clCreateKernel(prog, "kernel_mul_mv_iq2_xxs_f32_flat", &err), err));
         ggml_cl_make_grid_image(backend_ctx, prog, "kernel_iq2xxs_grid_export", 512,
@@ -5330,8 +5426,10 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #else
         const std::string kernel_src = read_file("mul_mv_iq2_xs_f32_flat.cl");
 #endif
+        std::string opts = compile_opts;
+        opts += " -DIQ2XS_MV_AIMG=" + std::to_string(ggml_cl_iq2xs_mv_aimg(backend_ctx));
         cl_program prog = ggml_cl_build_mv_program_nsg(
-            backend_ctx, kernel_src.c_str(), compile_opts, "IQ2XS_MV_NSG",
+            backend_ctx, kernel_src.c_str(), opts, "IQ2XS_MV_NSG",
             ggml_cl_iq2xs_mv_nsg(backend_ctx), &backend_ctx->iq2xs_mv_nsg_eff);
         CL_CHECK((backend_ctx->kernel_mul_mv_iq2_xs_f32_flat = clCreateKernel(prog, "kernel_mul_mv_iq2_xs_f32_flat", &err), err));
         ggml_cl_make_grid_image(backend_ctx, prog, "kernel_iq2xs_grid_export", 1024,
@@ -5373,8 +5471,10 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #else
         const std::string kernel_src = read_file("mul_mv_iq2_s_f32_flat.cl");
 #endif
+        std::string opts = compile_opts;
+        opts += " -DIQ2S_MV_AIMG=" + std::to_string(ggml_cl_iq2s_mv_aimg(backend_ctx));
         cl_program prog = ggml_cl_build_mv_program_nsg(
-            backend_ctx, kernel_src.c_str(), compile_opts, "IQ2S_MV_NSG",
+            backend_ctx, kernel_src.c_str(), opts, "IQ2S_MV_NSG",
             ggml_cl_iq2s_mv_nsg(backend_ctx), &backend_ctx->iq2s_mv_nsg_eff);
         CL_CHECK((backend_ctx->kernel_mul_mv_iq2_s_f32_flat = clCreateKernel(prog, "kernel_mul_mv_iq2_s_f32_flat", &err), err));
         ggml_cl_make_grid_image(backend_ctx, prog, "kernel_iq2s_grid_export", 2048,
@@ -5416,8 +5516,10 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #else
         const std::string kernel_src = read_file("mul_mv_iq3_xxs_f32_flat.cl");
 #endif
+        std::string opts = compile_opts;
+        opts += " -DIQ3XXS_MV_AIMG=" + std::to_string(ggml_cl_iq3xxs_mv_aimg(backend_ctx));
         cl_program prog = ggml_cl_build_mv_program_nsg(
-            backend_ctx, kernel_src.c_str(), compile_opts, "IQ3XXS_MV_NSG",
+            backend_ctx, kernel_src.c_str(), opts, "IQ3XXS_MV_NSG",
             ggml_cl_iq3xxs_mv_nsg(backend_ctx), &backend_ctx->iq3xxs_mv_nsg_eff);
         CL_CHECK((backend_ctx->kernel_mul_mv_iq3_xxs_f32_flat = clCreateKernel(prog, "kernel_mul_mv_iq3_xxs_f32_flat", &err), err));
         ggml_cl_make_grid_image(backend_ctx, prog, "kernel_iq3xxs_grid_export", 256,
@@ -5459,8 +5561,10 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #else
         const std::string kernel_src = read_file("mul_mv_iq3_s_f32_flat.cl");
 #endif
+        std::string opts = compile_opts;
+        opts += " -DIQ3S_MV_AIMG=" + std::to_string(ggml_cl_iq3s_mv_aimg(backend_ctx));
         cl_program prog = ggml_cl_build_mv_program_nsg(
-            backend_ctx, kernel_src.c_str(), compile_opts, "IQ3S_MV_NSG",
+            backend_ctx, kernel_src.c_str(), opts, "IQ3S_MV_NSG",
             ggml_cl_iq3s_mv_nsg(backend_ctx), &backend_ctx->iq3s_mv_nsg_eff);
         CL_CHECK((backend_ctx->kernel_mul_mv_iq3_s_f32_flat = clCreateKernel(prog, "kernel_mul_mv_iq3_s_f32_flat", &err), err));
         ggml_cl_make_grid_image(backend_ctx, prog, "kernel_iq3s_grid_export", 512,
@@ -10085,6 +10189,11 @@ struct ggml_cl_plane_binding {
     // image and does not have one is a bug, not a fallback.
     bool      gemv_wants_grid_img = false;
     cl_mem    gemv_grid_img = nullptr;
+    // The GEMV was compiled to read the activation through an image (see
+    // GGML_OPENCL_<TYPE>_MV_AIMG). Unlike the codebook this one degrades: when
+    // the view is not expressible the dispatch binds the codebook image in its
+    // place, which is harmless because the kernel then never samples it.
+    bool      gemv_wants_act_img = false;
 };
 
 static bool ggml_cl_plane_binding_for(const ggml_backend_opencl_context * backend_ctx,
@@ -10143,6 +10252,7 @@ static bool ggml_cl_plane_binding_for(const ggml_backend_opencl_context * backen
         b->gemv        = backend_ctx->kernel_mul_mv_iq1_s_f32_flat;
         b->gemv_wants_grid_img = true;
         b->gemv_grid_img = backend_ctx->iq1s_grid_img;
+        b->gemv_wants_act_img  = ggml_cl_iq1s_mv_aimg(backend_ctx) != 0;
         b->nsg         = backend_ctx->iq1s_mv_nsg_eff;
         b->rows_wg     = 64u * (size_t)(2);
         return true;
@@ -10158,6 +10268,7 @@ static bool ggml_cl_plane_binding_for(const ggml_backend_opencl_context * backen
         b->gemv        = backend_ctx->kernel_mul_mv_iq1_m_f32_flat;
         b->gemv_wants_grid_img = true;
         b->gemv_grid_img = backend_ctx->iq1m_grid_img;
+        b->gemv_wants_act_img  = ggml_cl_iq1m_mv_aimg(backend_ctx) != 0;
         b->nsg         = backend_ctx->iq1m_mv_nsg_eff;
         b->rows_wg     = 64u * (size_t)(2);
         return true;
@@ -10173,6 +10284,7 @@ static bool ggml_cl_plane_binding_for(const ggml_backend_opencl_context * backen
         b->gemv        = backend_ctx->kernel_mul_mv_iq2_xxs_f32_flat;
         b->gemv_wants_grid_img = true;
         b->gemv_grid_img = backend_ctx->iq2xxs_grid_img;
+        b->gemv_wants_act_img  = ggml_cl_iq2xxs_mv_aimg(backend_ctx) != 0;
         b->nsg         = backend_ctx->iq2xxs_mv_nsg_eff;
         b->rows_wg     = 64u * (size_t)(2);
         return true;
@@ -10188,6 +10300,7 @@ static bool ggml_cl_plane_binding_for(const ggml_backend_opencl_context * backen
         b->gemv        = backend_ctx->kernel_mul_mv_iq2_xs_f32_flat;
         b->gemv_wants_grid_img = true;
         b->gemv_grid_img = backend_ctx->iq2xs_grid_img;
+        b->gemv_wants_act_img  = ggml_cl_iq2xs_mv_aimg(backend_ctx) != 0;
         b->nsg         = backend_ctx->iq2xs_mv_nsg_eff;
         b->rows_wg     = 64u * (size_t)(2);
         return true;
@@ -10205,6 +10318,7 @@ static bool ggml_cl_plane_binding_for(const ggml_backend_opencl_context * backen
         b->gemv        = backend_ctx->kernel_mul_mv_iq2_s_f32_flat;
         b->gemv_wants_grid_img = true;
         b->gemv_grid_img = backend_ctx->iq2s_grid_img;
+        b->gemv_wants_act_img  = ggml_cl_iq2s_mv_aimg(backend_ctx) != 0;
         b->nsg         = backend_ctx->iq2s_mv_nsg_eff;
         b->rows_wg     = 64u * (size_t)(2);
         return true;
@@ -10220,6 +10334,7 @@ static bool ggml_cl_plane_binding_for(const ggml_backend_opencl_context * backen
         b->gemv        = backend_ctx->kernel_mul_mv_iq3_xxs_f32_flat;
         b->gemv_wants_grid_img = true;
         b->gemv_grid_img = backend_ctx->iq3xxs_grid_img;
+        b->gemv_wants_act_img  = ggml_cl_iq3xxs_mv_aimg(backend_ctx) != 0;
         b->nsg         = backend_ctx->iq3xxs_mv_nsg_eff;
         b->rows_wg     = 64u * (size_t)(2);
         return true;
@@ -10237,6 +10352,7 @@ static bool ggml_cl_plane_binding_for(const ggml_backend_opencl_context * backen
         b->gemv        = backend_ctx->kernel_mul_mv_iq3_s_f32_flat;
         b->gemv_wants_grid_img = true;
         b->gemv_grid_img = backend_ctx->iq3s_grid_img;
+        b->gemv_wants_act_img  = ggml_cl_iq3s_mv_aimg(backend_ctx) != 0;
         b->nsg         = backend_ctx->iq3s_mv_nsg_eff;
         b->rows_wg     = 64u * (size_t)(2);
         return true;
@@ -25030,6 +25146,23 @@ static bool ggml_cl_mul_mat_kquant_plane(
         GGML_ASSERT(pb.gemv_grid_img != nullptr && "IQ codebook image missing");
         CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem), &pb.gemv_grid_img));
     }
+    // The activation image, argument 1 of the IQ GEMVs that were compiled with
+    // AIMG. It is a view over src1's buffer, so it is created here and released
+    // after the enqueue rather than cached: one per projection, not one per row.
+    cl_mem  act_img = nullptr;
+    cl_uint act_off = 0;
+    if (pb.gemv_wants_act_img) {
+        act_img = ggml_cl_activation_image(backend_ctx, extra1->data_device,
+                                           offset1, ne10, ne11, &act_off);
+        // A kernel compiled with AIMG always declares the image argument, so
+        // something valid has to be bound even when the view was declined. The
+        // codebook serves: with no expressible view the offset is 0 and the
+        // kernel reads global memory, so the bound image is never sampled.
+        cl_mem arg = act_img ? act_img : pb.gemv_grid_img;
+        GGML_ASSERT(arg != nullptr && "activation image fallback missing");
+        CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),  &arg));
+        CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_uint), &act_off));
+    }
     for (int pi = 0; pi < pb.n_planes; ++pi) {
         CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem), &pb.planes[pi]));
     }
@@ -25046,6 +25179,9 @@ static bool ggml_cl_mul_mat_kquant_plane(
                            (size_t)ne11 * (size_t)nsg, 1 };
     size_t f_local[3]  = { 64, (size_t)nsg, 1 };
     backend_ctx->enqueue_ndrange_kernel(fk, 3, f_global, f_local, dst);
+    if (act_img) {
+        CL_CHECK(clReleaseMemObject(act_img));
+    }
 
     GGML_UNUSED(src1);
     GGML_UNUSED(ne1);
