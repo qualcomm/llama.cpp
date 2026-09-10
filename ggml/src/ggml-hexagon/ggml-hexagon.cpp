@@ -380,9 +380,10 @@ struct ggml_backend_hexagon_comm_context {
 
 struct ggml_hexagon_event {
     ggml_hexagon_session * sess         = nullptr;
-    uint32_t               seq          = 0;
+    ggml_hexagon_session * fence_sess   = nullptr;
     volatile uint32_t *    fence_slot   = nullptr;
     ggml_tensor            fence_tensor = {};
+    uint32_t               seq          = 0;
 };
 
 struct ggml_hexagon_session {
@@ -5886,6 +5887,7 @@ static ggml_backend_event_t ggml_backend_hexagon_device_event_new(ggml_backend_d
     auto sess    = dev_ctx->session();
 
     ggml_hexagon_event * hex_event = new ggml_hexagon_event();
+    hex_event->fence_sess = sess;
     hex_event->sess       = sess;
     hex_event->fence_slot = (volatile uint32_t *) sess->alloc_fence(1);
 
@@ -5943,7 +5945,7 @@ static void ggml_backend_hexagon_device_event_free(ggml_backend_dev_t dev, ggml_
     auto * hex_event = static_cast<ggml_hexagon_event *>(event->context);
     ggml_hexagon_event_synchronize(dev, hex_event);
     HEX_VERBOSE("ggml-hex: %s event-free : event %p\n", ggml_backend_dev_name(dev), (void *)hex_event);
-    hex_event->sess->free_fence((void *) hex_event->fence_slot, 1);
+    hex_event->fence_sess->free_fence((void *) hex_event->fence_slot, 1);
     delete hex_event;
     delete event;
 }
@@ -5986,7 +5988,7 @@ static void ggml_backend_hexagon_event_wait(ggml_backend_t backend, ggml_backend
         return;
     }
 
-    sess->clone_buffer(hex_event->sess->fence_buf);
+    sess->clone_buffer(hex_event->fence_sess->fence_buf);
     sess->add_peer(hex_event->sess);
     sess->enqueue_fence(&hex_event->fence_tensor, hex_event->seq, /* wait = */ true);
 }
