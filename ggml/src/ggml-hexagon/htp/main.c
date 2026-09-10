@@ -722,7 +722,7 @@ static int op_fence(struct htp_ops_context * octx) {
     if (mode == 1) {
         htp_fence_write(sync_fence, seq, octx->status);
         htp_trace_event_stop(tr, HTP_TRACE_EVT_FENCE, (uint16_t) seq);
-        FARF(HIGH, "ggml-hex: sync-signal : fence %p seq %u status %d\n", sync_fence, seq, octx->status);
+        FARF(HIGH, "ggml-hex: sync-signal : fence %p seq 0x%x status %d\n", sync_fence, seq, octx->status);
         return octx->status;
     }
 
@@ -733,14 +733,14 @@ static int op_fence(struct htp_ops_context * octx) {
         htp_fence_read(sync_fence, &sync_seq, &sync_status);
         if ((int32_t)(sync_seq - seq) >= 0) {
             if (sync_status > HTP_STATUS_OK) {
-                FARF(ERROR, "ggml-hex: sync-wait peer failed with status %u : fence %p seq %u\n", sync_status, sync_fence, seq);
+                FARF(ERROR, "ggml-hex: sync-wait peer failed with status %u : fence %p seq 0x%x\n", sync_status, sync_fence, seq);
                 htp_trace_event_stop(tr, HTP_TRACE_EVT_FENCE, (uint16_t) seq);
                 return sync_status;
             }
             break;
         }
         if (++spins > HTP_FENCE_TIMEOUT) {
-            FARF(ERROR, "ggml-hex: sync-wait TIMEOUT : fence %p spins %llu seq %u\n", sync_fence, spins, seq);
+            FARF(ERROR, "ggml-hex: sync-wait TIMEOUT : fence %p spins %llu seq 0x%x\n", sync_fence, spins, seq);
             htp_trace_event_stop(tr, HTP_TRACE_EVT_FENCE, (uint16_t) seq);
             return HTP_STATUS_INTERNAL_ERR;
         }
@@ -749,7 +749,7 @@ static int op_fence(struct htp_ops_context * octx) {
 
     htp_trace_event_stop(tr, HTP_TRACE_EVT_FENCE, (uint16_t) seq);
 
-    FARF(HIGH, "ggml-hex: sync-done : fence %p spins %llu seq %u\n", sync_fence, spins, seq);
+    FARF(HIGH, "ggml-hex: sync-done : fence %p spins %llu seq 0x%x\n", sync_fence, spins, seq);
     return HTP_STATUS_OK;
 }
 

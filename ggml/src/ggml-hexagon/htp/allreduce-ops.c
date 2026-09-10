@@ -332,7 +332,7 @@ int op_allreduce(struct htp_ops_context * octx) {
                 break;
             }
             if (++spins > HTP_FENCE_TIMEOUT) {
-                FARF(ERROR, "ggml-hex: allreduce entry fence-wait TIMEOUT : rank %u waiting on %u fence %p seq %u peer-seq %u\n",
+                FARF(ERROR, "ggml-hex: allreduce entry fence-wait TIMEOUT : rank %u waiting on %u fence %p seq 0x%x peer-seq 0x%x\n",
                      rank, j, peer_fence, fence_seq_entry, peer_seq);
                 htp_fence_write(my_fence, fence_seq_exit, HTP_STATUS_INTERNAL_ERR);
                 htp_trace_event_stop(tr0, HTP_TRACE_EVT_FENCE, (uint16_t) fence_seq_entry);
@@ -440,7 +440,7 @@ int op_allreduce(struct htp_ops_context * octx) {
                 break;
             }
             if (++spins > HTP_FENCE_TIMEOUT) {
-                FARF(ERROR, "ggml-hex: allreduce exit fence-wait TIMEOUT : rank %u waiting on %u fence %p seq %u peer-seq %u\n",
+                FARF(ERROR, "ggml-hex: allreduce exit fence-wait TIMEOUT : rank %u waiting on %u fence %p seq 0x%x peer-seq 0x%x\n",
                      rank, j, peer_fence, fence_seq_exit, peer_seq);
                 htp_fence_write(my_fence, fence_seq_exit, HTP_STATUS_INTERNAL_ERR);
                 htp_trace_event_stop(tr0, HTP_TRACE_EVT_FENCE, (uint16_t) fence_seq_exit);

@@ -432,7 +432,7 @@ int op_cpy(struct htp_ops_context * octx) {
             atomic_uint * sync_fence = (atomic_uint *) (uintptr_t) sync->data;
             htp_fence_write(sync_fence, seq, octx->status);
 
-            FARF(HIGH, "ggml-hex: sync-release : fence %p seq %u status %d\n", sync_fence, seq, octx->status);
+            FARF(HIGH, "ggml-hex: sync-release : fence %p seq 0x%x status %d\n", sync_fence, seq, octx->status);
         }
     }
 

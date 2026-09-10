@@ -5805,7 +5805,7 @@ static bool ggml_hexagon_cpy_tensor_async_phys(ggml_backend_t backend_src, ggml_
     if (++sess_dst->fence_seq == 0) sess_dst->fence_seq = 1;
     uint32_t fence_seq = sess_dst->fence_seq;
 
-    HEX_VERBOSE("ggml-hex: %s cpy-tensor-async %s -> %s size %zu : seq %u\n",
+    HEX_VERBOSE("ggml-hex: %s cpy-tensor-async %s -> %s size %zu : seq 0x%x\n",
                 sess_dst->name.c_str(), src->name, dst->name, ggml_nbytes(src), fence_seq);
 
     // dummy fence extra (must be static)
@@ -5928,7 +5928,7 @@ static void ggml_backend_hexagon_device_event_synchronize(ggml_backend_dev_t dev
         return;
     }
 
-    HEX_VERBOSE("ggml-hex: %s event-synchronize : event %p seq %u fence %p\n",
+    HEX_VERBOSE("ggml-hex: %s event-synchronize : event %p seq 0x%x fence %p\n",
                 ggml_backend_dev_name(dev), (void *)hex_event, hex_event->seq, (void *)hex_event->fence_slot);
 
     auto * fence = reinterpret_cast<const volatile std::atomic<uint32_t> *>(hex_event->fence_slot);
@@ -5960,7 +5960,7 @@ static void ggml_backend_hexagon_event_record(ggml_backend_t backend, ggml_backe
 
     sess->enqueue_fence(&hex_event->fence_tensor, hex_event->seq, /* wait = */ false);
 
-    HEX_VERBOSE("ggml-hex: %s event-record : event %p seq %u fence %p\n",
+    HEX_VERBOSE("ggml-hex: %s event-record : event %p seq 0x%x fence %p\n",
                 sess->c_name(), (void *)hex_event, hex_event->seq, (void *)hex_event->fence_slot);
 }
 
@@ -5972,7 +5972,7 @@ static void ggml_backend_hexagon_event_wait(ggml_backend_t backend, ggml_backend
         return;
     }
 
-    HEX_VERBOSE("ggml-hex: %s event-wait : event %p seq %u fence %p\n",
+    HEX_VERBOSE("ggml-hex: %s event-wait : event %p seq 0x%x fence %p\n",
                 sess->c_name(), (void *)hex_event, hex_event->seq, (void *)hex_event->fence_slot);
 
     // same physical NPU runs sequentially in FIFO order
