@@ -416,14 +416,11 @@ int op_cpy(struct htp_ops_context * octx) {
     htp_ops_context_set_status(octx, status);
 
     if (octx->op == HTP_OP_CPY_FENCE) {
-        if (status == HTP_STATUS_OK && !use_dma) {
-            // htp_tensor_flush_all(octx->ctx, octx->dsts, 1);
-            qurt_mem_cache_clean((qurt_addr_t) 0, 0, QURT_MEM_CACHE_FLUSH_INVALIDATE_ALL, QURT_MEM_DCACHE);
+        if (!use_dma) {
+            htp_flush_dirty_ranges(octx->ctx);
         }
 
-        if (octx->ctx->mdev.count > 1) {
-            htp_mdev_group_barrier(octx);
-        }
+        htp_mdev_group_barrier(octx);
 
         if (octx->ctx->mdev.idx == 0) {
             const struct htp_tensor * sync = octx->src[1];

@@ -720,12 +720,19 @@ static int op_fence(struct htp_ops_context * octx) {
     atomic_uint * sync_fence = (atomic_uint *) (uintptr_t) sync->data;
 
     if (mode == 1) {
-        htp_fence_write(sync_fence, seq, octx->status);
+        htp_flush_dirty_ranges(ctx);
+
+        htp_mdev_group_barrier(octx);
+
+        if (ctx->mdev.idx == 0) {
+            htp_fence_write(sync_fence, seq, octx->status);
+        }
         htp_trace_event_stop(tr, HTP_TRACE_EVT_FENCE, (uint16_t) seq);
         FARF(HIGH, "ggml-hex: sync-signal : fence %p seq 0x%x status %d\n", sync_fence, seq, octx->status);
         return octx->status;
     }
 
+    int status = HTP_STATUS_OK;
     uint64_t spins = 0;
     while (1) {
         uint32_t sync_seq;
@@ -734,15 +741,14 @@ static int op_fence(struct htp_ops_context * octx) {
         if ((int32_t)(sync_seq - seq) >= 0) {
             if (sync_status > HTP_STATUS_OK) {
                 FARF(ERROR, "ggml-hex: sync-wait peer failed with status %u : fence %p seq 0x%x\n", sync_status, sync_fence, seq);
-                htp_trace_event_stop(tr, HTP_TRACE_EVT_FENCE, (uint16_t) seq);
-                return sync_status;
+                status = sync_status;
             }
             break;
         }
         if (++spins > HTP_FENCE_TIMEOUT) {
             FARF(ERROR, "ggml-hex: sync-wait TIMEOUT : fence %p spins %llu seq 0x%x\n", sync_fence, spins, seq);
-            htp_trace_event_stop(tr, HTP_TRACE_EVT_FENCE, (uint16_t) seq);
-            return HTP_STATUS_INTERNAL_ERR;
+            status = HTP_STATUS_INTERNAL_ERR;
+            break;
         }
         hex_pause();
     }
@@ -750,7 +756,7 @@ static int op_fence(struct htp_ops_context * octx) {
     htp_trace_event_stop(tr, HTP_TRACE_EVT_FENCE, (uint16_t) seq);
 
     FARF(HIGH, "ggml-hex: sync-done : fence %p spins %llu seq 0x%x\n", sync_fence, spins, seq);
-    return HTP_STATUS_OK;
+    return status;
 }
 
 static int op_mdev_group(struct htp_ops_context * octx) {
@@ -1068,13 +1074,13 @@ static int proc_op_req(struct htp_ops_context * octx, struct htp_buf_desc * bufs
             dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3]);
     }
 
+    htp_tensor_dirty_all(octx->ctx, octx->dsts, HTP_OP_MAX_OUTPUTS);
+
     htp_mdev_group_barrier(octx);
 
     int status = execute_op(octx);
 
     htp_ops_context_set_status(octx, status);
-
-    htp_tensor_dirty_all(octx->ctx, octx->dsts, HTP_OP_MAX_OUTPUTS);
 
     octx->src0_spad.src = NULL;
     octx->src1_spad.src = NULL;

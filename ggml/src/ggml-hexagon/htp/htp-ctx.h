@@ -19,7 +19,7 @@
 #endif
 #define HTP_MAX_MMAPS    16
 
-#define HTP_MAX_DIRTY_RANGES 16
+#define HTP_MAX_DIRTY_RANGES 32
 
 // Memory mapping
 struct htp_mmap {
@@ -27,6 +27,11 @@ struct htp_mmap {
     uint64_t base;
     uint32_t fd;
     uint32_t reserved;
+};
+
+struct htp_dirty_range {
+    uint32_t start;
+    uint32_t end;
 };
 
 // Scratchpad state
@@ -107,11 +112,7 @@ struct htp_context {
     atomic_bool            vtcm_needs_release;
 
     uint64_t               max_vmem;
-    struct htp_dirty_range {
-        uint32_t start;
-        uint32_t end;
-        uint32_t bi;
-    } dirty_ranges[HTP_MAX_DIRTY_RANGES];
+    struct htp_dirty_range dirty_ranges[HTP_MAX_DIRTY_RANGES];
 
     // Persistent DDR scratchpad for MUL_MAT_ID mappings
     void *                 ddr_spad_base;
