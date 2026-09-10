@@ -141,6 +141,12 @@ static inline bool htp_ops_context_set_n_threads(struct htp_ops_context * octx, 
     return true;
 }
 
+static inline void htp_ops_context_set_status(struct htp_ops_context * octx, int status) {
+    if (status > HTP_STATUS_OK && octx->status == HTP_STATUS_OK) {
+        octx->status = status;
+    }
+}
+
 int op_matmul(struct htp_ops_context * octx);
 int op_matmul_id(struct htp_ops_context * octx);
 int op_matmul_nx(struct htp_ops_context * octx);

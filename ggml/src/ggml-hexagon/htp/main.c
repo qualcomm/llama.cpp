@@ -1024,10 +1024,10 @@ static void mdev_group_init(struct htp_context * ctx, const struct htp_opbatch_r
 
 static int proc_op_req(struct htp_ops_context * octx, struct htp_buf_desc * bufs, uint32_t n_bufs,
                        struct htp_tensor * tens, uint32_t idx, struct htp_op_desc * op) {
-    memcpy(octx->op_params, op->params, sizeof(octx->op_params));
+    memcpy(octx->op_params,     op->params, sizeof(octx->op_params));
     memcpy(octx->kernel_params, op->kernel_params, sizeof(octx->kernel_params));
-    octx->flags = op->flags;
-    octx->op    = op->opcode;
+    octx->flags         = op->flags;
+    octx->op            = op->opcode;
     octx->n_threads     = octx->ctx->n_threads;
     octx->n_threads_div = octx->ctx->n_threads_div;
 
@@ -1071,13 +1071,8 @@ static int proc_op_req(struct htp_ops_context * octx, struct htp_buf_desc * bufs
     htp_mdev_group_barrier(octx);
 
     int status = execute_op(octx);
-    if (status > HTP_STATUS_OK && octx->status == HTP_STATUS_OK) {
-        octx->status = status;
-    }
-    if (octx->status > HTP_STATUS_OK && octx->ctx->mdev.count > 1) {
-        atomic_uint * my_fence = htp_mdev_fence_slot(octx->ctx->mdev.fence_base, octx->ctx->mdev.idx);
-        htp_fence_write(my_fence, octx->ctx->mdev.fence_seq, octx->status);
-    }
+
+    htp_ops_context_set_status(octx, status);
 
     htp_tensor_dirty_all(octx->ctx, octx->dsts, HTP_OP_MAX_OUTPUTS);
 
@@ -1168,9 +1163,7 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
 
         profile_stop(ctx->profiler, &prof);
 
-        if (op_status > HTP_STATUS_OK && octx->status == HTP_STATUS_OK) {
-            octx->status = op_status;
-        }
+        htp_ops_context_set_status(octx, op_status);
 
         if (ctx->profiler) {
             pds[i].opcode = ops[i].opcode;

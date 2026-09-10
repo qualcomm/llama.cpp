@@ -51,11 +51,6 @@ static inline void htp_mdev_group_barrier(struct htp_ops_context * octx) {
     atomic_uint * my_fence = htp_mdev_fence_slot(fence_base, mdev_idx);
     htp_fence_write(my_fence, seq, octx->status);
 
-    if (octx->status > HTP_STATUS_OK) {
-        htp_trace_event_stop(tr, HTP_TRACE_EVT_FENCE, (uint16_t) seq);
-        return;
-    }
-
     for (uint32_t d = 0; d < mdev_count; d++) {
         if (d == mdev_idx) continue;
         atomic_uint * peer_fence = htp_mdev_fence_slot(fence_base, d);
@@ -68,12 +63,7 @@ static inline void htp_mdev_group_barrier(struct htp_ops_context * octx) {
                 if (peer_status > HTP_STATUS_OK) {
                     FARF(ERROR, "ggml-hex: mdev %u peer %u failed with status %u : seq 0x%08x\n",
                          mdev_idx, d, peer_status, seq);
-                    htp_fence_write(my_fence, seq, peer_status);
-                    htp_trace_event_stop(tr, HTP_TRACE_EVT_FENCE, (uint16_t) seq);
-                    if (octx->status == HTP_STATUS_OK) {
-                        octx->status = peer_status;
-                    }
-                    return;
+                    htp_ops_context_set_status(octx, peer_status);
                 }
                 break;
             }
@@ -84,17 +74,17 @@ static inline void htp_mdev_group_barrier(struct htp_ops_context * octx) {
             if (spins > HTP_FENCE_TIMEOUT) {
                 FARF(ERROR, "ggml-hex: mdev %u timeout waiting for mdev %u : seq 0x%08x (b %u op %u) peer-fence %p peer-seq 0x%08x\n",
                      mdev_idx, d, seq, seq >> 12, seq & 0xfff, peer_fence, peer_seq);
-                htp_fence_write(my_fence, seq, HTP_STATUS_INTERNAL_ERR);
-                htp_trace_event_stop(tr, HTP_TRACE_EVT_FENCE, (uint16_t) seq);
-                if (octx->status == HTP_STATUS_OK) {
-                    octx->status = HTP_STATUS_INTERNAL_ERR;
-                }
-                return;
+                htp_ops_context_set_status(octx, HTP_STATUS_INTERNAL_ERR);
+                break;
             }
             hex_pause();
         }
     }
     asm volatile ("syncht" : : : "memory");
+
+    if (octx->status > HTP_STATUS_OK) {
+        htp_fence_write(my_fence, seq, octx->status);
+    }
 
     htp_trace_event_stop(tr, HTP_TRACE_EVT_FENCE, (uint16_t) seq);
 }

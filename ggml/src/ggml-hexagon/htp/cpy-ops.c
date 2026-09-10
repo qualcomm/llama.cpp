@@ -413,14 +413,12 @@ int op_cpy(struct htp_ops_context * octx) {
     bool use_dma = false;
     int status = exec_cpy(octx, &use_dma);
 
+    htp_ops_context_set_status(octx, status);
+
     if (octx->op == HTP_OP_CPY_FENCE) {
         if (status == HTP_STATUS_OK && !use_dma) {
             // htp_tensor_flush_all(octx->ctx, octx->dsts, 1);
             qurt_mem_cache_clean((qurt_addr_t) 0, 0, QURT_MEM_CACHE_FLUSH_INVALIDATE_ALL, QURT_MEM_DCACHE);
-        }
-
-        if (status > HTP_STATUS_OK && octx->status == HTP_STATUS_OK) {
-            octx->status = status;
         }
 
         if (octx->ctx->mdev.count > 1) {
