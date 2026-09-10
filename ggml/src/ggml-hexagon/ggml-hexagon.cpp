@@ -356,6 +356,15 @@ static inline bool ggml_hexagon_tensor_is_fuseable(const struct ggml_tensor * t)
     return (extra->flags & GGML_HEXAGON_TENSOR_FUSEABLE) != 0;
 }
 
+static inline bool ggml_hexagon_tensors_overlap(const struct ggml_tensor * a, const struct ggml_tensor * b) {
+    const uintptr_t a0 = (uintptr_t) a->data;
+    const uintptr_t b0 = (uintptr_t) b->data;
+    const uintptr_t a1 = a0 + ggml_nbytes(a);
+    const uintptr_t b1 = b0 + ggml_nbytes(b);
+
+    return a0 < b1 && b0 < a1;
+}
+
 struct htp_opnode;
 
 struct ggml_hexagon_opbatch;
@@ -1988,15 +1997,16 @@ struct ggml_hexagon_opbatch {
         if (last_node.opcode != HTP_OP_ALLREDUCE) return false;
 
         auto * ar_kparams = (struct htp_allreduce_kernel_params *) last_node.kernel_params;
-        const uint32_t rank = (uint32_t) ar_kparams->rank;
-        const ggml_tensor * ar_local = (rank < last_node.inputs.size()) ? last_node.inputs[rank] : nullptr;
+        const uint32_t rank    = (uint32_t) ar_kparams->rank;
+        const uint32_t n_ranks = (uint32_t) ar_kparams->n_ranks;
+        const ggml_tensor * ar_local = last_node.inputs[rank];
         const ggml_tensor * add_src0 = node.src0();
         const ggml_tensor * add_src1 = node.src1();
+        const ggml_tensor * add_dst  = node.dst();
 
-        if (!add_src0 || !add_src1 || !ar_local) return false;
         if (!ggml_hexagon_tensor_is_fuseable(ar_local)) return false;
 
-        const ggml_tensor * res_tensor = nullptr;
+        const ggml_tensor * res_tensor;
         if (add_src0 == ar_local || add_src0->data == ar_local->data) {
             res_tensor = add_src1;
         } else if (add_src1 == ar_local || add_src1->data == ar_local->data) {
@@ -2004,8 +2014,6 @@ struct ggml_hexagon_opbatch {
         } else {
             return false;
         }
-
-        if (!res_tensor || !res_tensor->data) return false;
 
         if (ar_local->type != res_tensor->type) return false;
 
@@ -2025,13 +2033,21 @@ struct ggml_hexagon_opbatch {
                 return false;
             }
         }
-        if (ggml_is_contiguous(ar_local) != ggml_is_contiguous(node.dst())) {
+        if (ggml_is_contiguous(ar_local) != ggml_is_contiguous(add_dst)) {
             return false;
+        }
+
+        for (uint32_t r = 0; r < n_ranks; r++) {
+            const ggml_tensor * ar_src = last_node.inputs[r];
+            if (ggml_hexagon_tensors_overlap(add_dst, ar_src)) {
+                HEX_VERBOSE("ggml-hex: %s skip ALLREDUCE_ADD fusion: dst overlaps allreduce src %u\n", sess->c_name(), r);
+                return false;
+            }
         }
 
         struct htp_allreduce_kernel_params new_kparams;
         if (!ggml_hexagon_precompute_allreduce_params(
-            sess, node.dst(), (uint32_t) ar_kparams->rank, (uint32_t) ar_kparams->n_ranks, true, is_row_bcast, &new_kparams
+            sess, add_dst, (uint32_t) ar_kparams->rank, (uint32_t) ar_kparams->n_ranks, true, is_row_bcast, &new_kparams
         )) {
             HEX_VERBOSE("ggml-hex: %s skip ALLREDUCE_ADD fusion: solver failed\n", sess->c_name());
             return false;
@@ -2050,7 +2066,7 @@ struct ggml_hexagon_opbatch {
             }
         };
         fit_t(res_tensor);
-        fit_t(node.dst());
+        fit_t(add_dst);
         if ((extra_bufs + n_bufs) > n_bufs_max || (extra_tens + n_tens) > n_tens_max || (extra_vmem + b_vmem) > b_vmem_max) {
             return false;
         }
@@ -2059,7 +2075,7 @@ struct ggml_hexagon_opbatch {
         last_node.name   = "ALLREDUCE+ADD";
         last_node.inputs.push_back(res_tensor);
         last_node.outputs.clear();
-        last_node.outputs.push_back(node.dst());
+        last_node.outputs.push_back(add_dst);
         last_node.fused.push_back(node.node);
         memcpy(last_node.kernel_params, &new_kparams, sizeof(new_kparams));
 
@@ -2067,9 +2083,8 @@ struct ggml_hexagon_opbatch {
         o.opcode = HTP_OP_ALLREDUCE_ADD;
         memcpy(o.kernel_params, &new_kparams, sizeof(new_kparams));
 
-        const uint32_t n_ranks = (uint32_t) ar_kparams->n_ranks;
         o.src[2 * n_ranks] = add_tensor(res_tensor);
-        o.dst[0]           = add_tensor(node.dst());
+        o.dst[0]           = add_tensor(add_dst);
         for (uint32_t d = 1; d < HTP_OP_MAX_OUTPUTS; d++) {
             o.dst[d] = 0xffff;
         }
@@ -5464,6 +5479,8 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
             auto * extra = (ggml_hexagon_tensor_extra *) graph->nodes[i]->extra;
             if (!extra) continue;
 
+            extra->flags &= ~GGML_HEXAGON_TENSOR_FUSEABLE;
+
             if (graph->nodes[i]->op == GGML_OP_RMS_NORM && ggml_can_fuse(graph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL })) {
                 extra->flags |= GGML_HEXAGON_TENSOR_FUSEABLE;
             } else if (graph->nodes[i]->op == GGML_OP_MUL_MAT || graph->nodes[i]->op == GGML_OP_MUL_MAT_ID) {
@@ -5865,7 +5882,7 @@ static bool ggml_backend_hexagon_cpy_tensor_async(ggml_backend_t backend_src, gg
 
     auto * dst_extra = static_cast<ggml_hexagon_tensor_extra *>(dst->extra);
     const auto * src_extra = static_cast<const ggml_hexagon_tensor_extra *>(src->extra);
-    dst_extra->flags = src_extra->flags;
+    dst_extra->flags = src_extra->flags & ~GGML_HEXAGON_TENSOR_FUSEABLE;
 
     auto sess_src = static_cast<ggml_hexagon_session *>(backend_src->context);
     auto sess_dst = static_cast<ggml_hexagon_session *>(backend_dst->context);

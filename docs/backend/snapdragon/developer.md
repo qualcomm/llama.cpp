@@ -122,12 +122,14 @@ Writing high-performance operators for Hexagon requires following specific guide
 
 ### Avoid Redundant Defensive NULL Checks
 
-- Do not add defensive NULL checks or assertions for internal framework pointers (`ctx`, `octx`, local context structs
-  like `*ctx`, `kparams`, or `data` in worker callbacks).
-- These pointers are architectural invariants and are guaranteed non-NULL during kernel execution. Checks like
-  `if (!octx || !octx->ctx)` clutter the code and obscure intent.
-- **Distinction**: `octx->src[N]` pointers *can* be NULL by design for optional inputs (such as attention masks, optional
-  bias/weights in fused kernels, or frequency factors) and must be checked when optional.
+- Do not add defensive NULL checks or assertions for internal framework pointers or required graph operands and outputs.
+  Internal pointers include `ctx`, `octx`, local context structs like `*ctx`, `kparams`, and worker callback `data`.
+- These pointers are architectural invariants during kernel execution and host-side graph preparation.
+  Graph compute receives allocated nodes with valid required `node->src[N]` and `node->data` pointers.
+- Do not turn an invariant violation into an unsupported operation or missed fusion.
+  Checks such as `if (!octx || !octx->ctx)` clutter the code, obscure intent, and hide upstream errors.
+- **Distinction**: `octx->src[N]` pointers *can* be NULL by design and must be checked when optional.
+  Examples include attention masks, optional bias or weights in fused kernels, and frequency factors.
 
 ### Multiline Macro Formatting
 
