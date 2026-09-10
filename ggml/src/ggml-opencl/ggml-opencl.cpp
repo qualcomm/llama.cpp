@@ -10196,9 +10196,21 @@ struct ggml_cl_plane_binding {
     bool      gemv_wants_act_img = false;
 };
 
+// Answers "is this weight plane-split, and where are its planes" -- so it needs
+// the tensor's extra, which only exists once THIS backend has uploaded it.
+//
+// A tensor scheduled onto another backend has no OpenCL extra, and
+// ggml_backend_opencl_supports_op is asked about exactly those. Reading the
+// planes out of a null extra took the process down at graph-reserve time on any
+// model that mixes plane-split weights with weights this backend declines, so
+// answer "no binding" instead. Callers that need only the TYPE question must use
+// ggml_cl_is_plane_split below, which does not touch the extra.
 static bool ggml_cl_plane_binding_for(const ggml_backend_opencl_context * backend_ctx,
                                       const ggml_tensor * src0,
                                       ggml_cl_plane_binding * b) {
+    if (src0->extra == nullptr) {
+        return false;
+    }
     if (ggml_cl_q2k_is_split(backend_ctx, src0)) {
         const ggml_tensor_extra_cl_q2_K_ns * ex = (const ggml_tensor_extra_cl_q2_K_ns *)src0->extra;
         b->planes[0] = ex->qs;
@@ -10358,6 +10370,24 @@ static bool ggml_cl_plane_binding_for(const ggml_backend_opencl_context * backen
         return true;
     }
     return false;
+}
+
+// The TYPE half of the question above: is this weight one the plane path owns?
+// Deliberately free of any reference to ->extra, so supports_op can ask it about
+// a tensor that lives on another backend. Keep the list in step with
+// ggml_cl_plane_binding_for.
+static bool ggml_cl_is_plane_split(const ggml_backend_opencl_context * backend_ctx,
+                                   const ggml_tensor * t) {
+    return ggml_cl_q2k_is_split(backend_ctx, t)
+        || ggml_cl_q3k_is_split(backend_ctx, t)
+        || ggml_cl_iq4xs_is_split(backend_ctx, t)
+        || ggml_cl_iq1s_is_split(backend_ctx, t)
+        || ggml_cl_iq1m_is_split(backend_ctx, t)
+        || ggml_cl_iq2xxs_is_split(backend_ctx, t)
+        || ggml_cl_iq2xs_is_split(backend_ctx, t)
+        || ggml_cl_iq2s_is_split(backend_ctx, t)
+        || ggml_cl_iq3xxs_is_split(backend_ctx, t)
+        || ggml_cl_iq3s_is_split(backend_ctx, t);
 }
 
 
@@ -10816,8 +10846,7 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                 // A plane-split weight has no AoS fallback -- the block kernels
                 // would read the planes as blocks -- so a shape the plane path
                 // cannot express has to go to the CPU rather than to one of them.
-                ggml_cl_plane_binding pb_probe;
-                if (ggml_cl_plane_binding_for(backend_ctx, op->src[0], &pb_probe)) {
+                if (ggml_cl_is_plane_split(backend_ctx, op->src[0])) {
                     return op->src[0]->ne[0] % 256 == 0 &&
                            op->src[0]->ne[2] == 1 && op->src[0]->ne[3] == 1 &&
                            op->src[1]->ne[2] == 1 && op->src[1]->ne[3] == 1 &&
