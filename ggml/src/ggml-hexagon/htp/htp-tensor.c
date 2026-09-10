@@ -73,6 +73,26 @@ static void l2flush_multi_worker(unsigned int n, unsigned int i, void * data) {
     htp_trace_event_stop(tr, HTP_TRACE_EVT_L2FLUSH, gb_first);
 }
 
+static void merge_dirty_ranges(struct htp_context * ctx) {
+    for (uint32_t i = 0; i < HTP_MAX_DIRTY_RANGES; i++) {
+        struct htp_dirty_range * r = &ctx->dirty_ranges[i];
+        if (!r->start) continue;
+
+        for (uint32_t j = 0; j < HTP_MAX_DIRTY_RANGES;) {
+            struct htp_dirty_range * s = &ctx->dirty_ranges[j];
+            if (i == j || !s->start || r->end < s->start || s->end < r->start) {
+                j++;
+                continue;
+            }
+
+            r->start = MIN(r->start, s->start);
+            r->end   = MAX(r->end, s->end);
+            s->start = 0;
+            j = 0;
+        }
+    }
+}
+
 void htp_tensor_dirty_all(struct htp_context * ctx, const struct htp_tensor * const * tensors, uint32_t n) {
     const struct htp_tensor * pending[HTP_OP_MAX_OUTPUTS];
     uint32_t n_pending = 0;
@@ -105,6 +125,8 @@ void htp_tensor_dirty_all(struct htp_context * ctx, const struct htp_tensor * co
         }
     }
 
+    merge_dirty_ranges(ctx);
+
     if (n_pending == 0) {
         return;
     }
@@ -128,6 +150,7 @@ void htp_tensor_dirty_all(struct htp_context * ctx, const struct htp_tensor * co
             r->start = pending[i]->data;
             r->end   = pending[i]->data + pending[i]->size;
         }
+        merge_dirty_ranges(ctx);
         return;
     }
 
@@ -146,6 +169,7 @@ void htp_tensor_dirty_all(struct htp_context * ctx, const struct htp_tensor * co
             r->start = pending[i]->data;
             r->end   = pending[i]->data + pending[i]->size;
         }
+        merge_dirty_ranges(ctx);
         return;
     }
 
@@ -196,6 +220,8 @@ void htp_tensor_dirty_all(struct htp_context * ctx, const struct htp_tensor * co
         r->start = pending[n_evict + i]->data;
         r->end   = pending[n_evict + i]->data + pending[n_evict + i]->size;
     }
+
+    merge_dirty_ranges(ctx);
 }
 
 static void make_tensor_clean(struct htp_context * ctx, const struct htp_tensor * t) {
