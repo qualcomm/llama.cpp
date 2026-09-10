@@ -919,14 +919,17 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mv_q3_k_f32_flat  = nullptr;   // Q3_K decode GEMV over the planes
     cl_kernel kernel_mul_mv_iq4_xs_f32_flat = nullptr;  // IQ4_XS decode GEMV over the planes
     cl_kernel kernel_mul_mv_iq1_s_f32_flat = nullptr;
+    cl_kernel kernel_mul_mv_iq1_s_f32_flat_glu = nullptr;  // fused ffn_gate+ffn_up+GLU
     cl_kernel kernel_gemm_noshuffle_iq1_s_q8_1_dp4a = nullptr;
     cl_kernel kernel_gemm_noshuffle_iq1_s_q8_1_dp4a_narrow = nullptr;
     int iq1s_mv_nsg_eff = 0;
     cl_kernel kernel_mul_mv_iq1_m_f32_flat = nullptr;
+    cl_kernel kernel_mul_mv_iq1_m_f32_flat_glu = nullptr;  // fused ffn_gate+ffn_up+GLU
     cl_kernel kernel_gemm_noshuffle_iq1_m_q8_1_dp4a = nullptr;
     cl_kernel kernel_gemm_noshuffle_iq1_m_q8_1_dp4a_narrow = nullptr;
     int iq1m_mv_nsg_eff = 0;
     cl_kernel kernel_mul_mv_iq2_xxs_f32_flat = nullptr;
+    cl_kernel kernel_mul_mv_iq2_xxs_f32_flat_glu = nullptr;  // fused ffn_gate+ffn_up+GLU
     cl_kernel kernel_gemm_noshuffle_iq2_xxs_q8_1_dp4a = nullptr;
     cl_kernel kernel_gemm_noshuffle_iq2_xxs_q8_1_dp4a_narrow = nullptr;
     int iq2xxs_mv_nsg_eff = 0;
@@ -935,6 +938,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemm_noshuffle_iq2_xs_q8_1_dp4a_narrow = nullptr;
     int iq2xs_mv_nsg_eff = 0;
     cl_kernel kernel_mul_mv_iq2_s_f32_flat = nullptr;
+    cl_kernel kernel_mul_mv_iq2_s_f32_flat_glu = nullptr;  // fused ffn_gate+ffn_up+GLU
     cl_kernel kernel_gemm_noshuffle_iq2_s_q8_1_dp4a = nullptr;
     cl_kernel kernel_gemm_noshuffle_iq2_s_q8_1_dp4a_narrow = nullptr;
     int iq2s_mv_nsg_eff = 0;
@@ -1699,6 +1703,46 @@ static int ggml_cl_iq3xxs_mv_aimg(const ggml_backend_opencl_context * backend_ct
 
 static int ggml_cl_iq3s_mv_aimg(const ggml_backend_opencl_context * backend_ctx) {
     return ggml_cl_iq_mv_aimg(backend_ctx, "GGML_OPENCL_IQ3S_MV_AIMG");
+}
+
+// Fuse ffn_gate + ffn_up + GLU into one decode dispatch for the split IQ types.
+//
+// Both projections read the same activation and differ only in their weights, so
+// the unfused pair walks that activation twice and launches twice. Gate and up
+// together are roughly a third of an IQ decode frame.
+//
+// Default ON for X2-class parts, matching where the rest of this family's decode
+// tuning is measured; GGML_OPENCL_<TYPE>_FUSE_GLU overrides it.
+//
+// IQ3_S and IQ4_XS are deliberately absent. The fusion doubles the codebook
+// gather a kernel does per activation pass, and on IQ3_S that gather is already
+// the dominant cost, so folding the two projections together loses. IQ4_XS has
+// no gather to double but is the cheapest IQ decode there is, and the fusion
+// does not clear its own overhead either.
+static int ggml_cl_iq_fuse_glu(const ggml_backend_opencl_context * backend_ctx,
+                               const char * env) {
+    if (const char * e = getenv(env)) {
+        if (e[0]) {
+            return atoi(e) != 0 ? 1 : 0;
+        }
+    }
+    return ggml_cl_adreno_x2_class(backend_ctx) ? 1 : 0;
+}
+
+static int ggml_cl_iq1s_fuse_glu(const ggml_backend_opencl_context * backend_ctx) {
+    return ggml_cl_iq_fuse_glu(backend_ctx, "GGML_OPENCL_IQ1S_FUSE_GLU");
+}
+
+static int ggml_cl_iq1m_fuse_glu(const ggml_backend_opencl_context * backend_ctx) {
+    return ggml_cl_iq_fuse_glu(backend_ctx, "GGML_OPENCL_IQ1M_FUSE_GLU");
+}
+
+static int ggml_cl_iq2xxs_fuse_glu(const ggml_backend_opencl_context * backend_ctx) {
+    return ggml_cl_iq_fuse_glu(backend_ctx, "GGML_OPENCL_IQ2XXS_FUSE_GLU");
+}
+
+static int ggml_cl_iq2s_fuse_glu(const ggml_backend_opencl_context * backend_ctx) {
+    return ggml_cl_iq_fuse_glu(backend_ctx, "GGML_OPENCL_IQ2S_FUSE_GLU");
 }
 
 static int ggml_cl_q3k_mv_nsg(const ggml_backend_opencl_context * backend_ctx) {
@@ -5297,6 +5341,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             backend_ctx, kernel_src.c_str(), opts, "IQ1S_MV_NSG",
             ggml_cl_iq1s_mv_nsg(backend_ctx), &backend_ctx->iq1s_mv_nsg_eff);
         CL_CHECK((backend_ctx->kernel_mul_mv_iq1_s_f32_flat = clCreateKernel(prog, "kernel_mul_mv_iq1_s_f32_flat", &err), err));
+        backend_ctx->kernel_mul_mv_iq1_s_f32_flat_glu =
+            clCreateKernel(prog, "kernel_mul_mv_iq1_s_f32_flat_glu", &err);
+        if (err != CL_SUCCESS) { backend_ctx->kernel_mul_mv_iq1_s_f32_flat_glu = nullptr; }
         ggml_cl_make_grid_image(backend_ctx, prog, "kernel_iq1s_grid_export", 2048,
                                 &backend_ctx->iq1s_grid_buf, &backend_ctx->iq1s_grid_img);
         CL_CHECK(clReleaseProgram(prog));
@@ -5342,6 +5389,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             backend_ctx, kernel_src.c_str(), opts, "IQ1M_MV_NSG",
             ggml_cl_iq1m_mv_nsg(backend_ctx), &backend_ctx->iq1m_mv_nsg_eff);
         CL_CHECK((backend_ctx->kernel_mul_mv_iq1_m_f32_flat = clCreateKernel(prog, "kernel_mul_mv_iq1_m_f32_flat", &err), err));
+        backend_ctx->kernel_mul_mv_iq1_m_f32_flat_glu =
+            clCreateKernel(prog, "kernel_mul_mv_iq1_m_f32_flat_glu", &err);
+        if (err != CL_SUCCESS) { backend_ctx->kernel_mul_mv_iq1_m_f32_flat_glu = nullptr; }
         ggml_cl_make_grid_image(backend_ctx, prog, "kernel_iq1m_grid_export", 2048,
                                 &backend_ctx->iq1m_grid_buf, &backend_ctx->iq1m_grid_img);
         CL_CHECK(clReleaseProgram(prog));
@@ -5387,6 +5437,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             backend_ctx, kernel_src.c_str(), opts, "IQ2XXS_MV_NSG",
             ggml_cl_iq2xxs_mv_nsg(backend_ctx), &backend_ctx->iq2xxs_mv_nsg_eff);
         CL_CHECK((backend_ctx->kernel_mul_mv_iq2_xxs_f32_flat = clCreateKernel(prog, "kernel_mul_mv_iq2_xxs_f32_flat", &err), err));
+        backend_ctx->kernel_mul_mv_iq2_xxs_f32_flat_glu =
+            clCreateKernel(prog, "kernel_mul_mv_iq2_xxs_f32_flat_glu", &err);
+        if (err != CL_SUCCESS) { backend_ctx->kernel_mul_mv_iq2_xxs_f32_flat_glu = nullptr; }
         ggml_cl_make_grid_image(backend_ctx, prog, "kernel_iq2xxs_grid_export", 512,
                                 &backend_ctx->iq2xxs_grid_buf, &backend_ctx->iq2xxs_grid_img);
         CL_CHECK(clReleaseProgram(prog));
@@ -5477,6 +5530,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             backend_ctx, kernel_src.c_str(), opts, "IQ2S_MV_NSG",
             ggml_cl_iq2s_mv_nsg(backend_ctx), &backend_ctx->iq2s_mv_nsg_eff);
         CL_CHECK((backend_ctx->kernel_mul_mv_iq2_s_f32_flat = clCreateKernel(prog, "kernel_mul_mv_iq2_s_f32_flat", &err), err));
+        backend_ctx->kernel_mul_mv_iq2_s_f32_flat_glu =
+            clCreateKernel(prog, "kernel_mul_mv_iq2_s_f32_flat_glu", &err);
+        if (err != CL_SUCCESS) { backend_ctx->kernel_mul_mv_iq2_s_f32_flat_glu = nullptr; }
         ggml_cl_make_grid_image(backend_ctx, prog, "kernel_iq2s_grid_export", 2048,
                                 &backend_ctx->iq2s_grid_buf, &backend_ctx->iq2s_grid_img);
         CL_CHECK(clReleaseProgram(prog));
@@ -9009,6 +9065,38 @@ static bool ggml_cl_tensors_overlap(const ggml_tensor * x, const ggml_tensor * y
 // by k VIEWs of it and a (k-1)-long ADD reduction chain producing [n_embd, nt]. When it
 // matches (and the output does not alias the inputs), the whole subgraph collapses to one
 // weighted-sum-across-experts kernel.
+struct ggml_cl_plane_binding {
+    cl_mem    planes[5]   = { nullptr };
+    int       n_planes    = 0;
+    cl_kernel gemm        = nullptr;
+    cl_kernel gemm_narrow = nullptr;
+    cl_kernel gemv        = nullptr;
+    int       nsg         = 0;
+    size_t    rows_wg     = 0;
+    // IQ1_S's codebook carries a per-block delta, so its GEMM needs the per-32
+    // sum of the dequantised activations as well as their q8_1 form.
+    bool      gemm_wants_sa = false;
+    // The IQ GEMVs read their codebook through this image; it is argument 0.
+    // The flag is the contract and the handle is the value: a type that wants the
+    // image and does not have one is a bug, not a fallback.
+    bool      gemv_wants_grid_img = false;
+    cl_mem    gemv_grid_img = nullptr;
+    // The GEMV was compiled to read the activation through an image (see
+    // GGML_OPENCL_<TYPE>_MV_AIMG). Unlike the codebook this one degrades: when
+    // the view is not expressible the dispatch binds the codebook image in its
+    // place, which is harmless because the kernel then never samples it.
+    bool      gemv_wants_act_img = false;
+    // Fused ffn_gate+ffn_up+GLU decode kernel, when this type has one and the
+    // device opted in. nullptr means the pair path serves the FFN as before.
+    cl_kernel gemv_glu = nullptr;
+};
+
+// Defined below; the FFN GLU fusion gate needs it here to ask whether a weight
+// is a split type carrying a fused kernel.
+static bool ggml_cl_plane_binding_for(const ggml_backend_opencl_context * backend_ctx,
+                                      const ggml_tensor * src0,
+                                      ggml_cl_plane_binding * b);
+
 static bool ggml_opencl_can_fuse_moe_combine(const struct ggml_cgraph * cgraph, int node_idx,
                                              const ggml_tensor ** out_final_add) {
     const ggml_tensor * mul = cgraph->nodes[node_idx];
@@ -9411,8 +9499,9 @@ static bool ggml_opencl_can_fuse(const ggml_backend_opencl_context * backend_ctx
     // glu(mul_mat(Wg,x), mul_mat(Wu,x)) — the FFN gate/up GEMVs + GLU. This is a
     // non-linear subgraph (up does NOT consume gate), so the contiguous
     // ggml_can_fuse below rejects it; use ggml_can_fuse_subgraph with the glu as
-    // the sole output and validate the edges explicitly. q4_K decode only;
-    // byte-identical to the per-op path.
+    // the sole output and validate the edges explicitly. Decode only. q4_K is
+    // byte-identical to the per-op path; the split IQ types use the same
+    // accumulation order and the same scalar GLU formula as their pair path.
     if (ops.size() == 3 && ops.begin()[0] == GGML_OP_MUL_MAT &&
         ops.begin()[1] == GGML_OP_MUL_MAT && ops.begin()[2] == GGML_OP_GLU) {
         const enum ggml_op glu_ops[] = { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU };
@@ -9429,11 +9518,26 @@ static bool ggml_opencl_can_fuse(const ggml_backend_opencl_context * backend_ctx
         if (gate->ne[1] != 1 || up->ne[1] != 1) {
             return false;
         }
-        // both projections must be q4_K weights, f32 activation/output
-        if (gate->src[0]->type != GGML_TYPE_Q4_K || up->src[0]->type != GGML_TYPE_Q4_K ||
+        // f32 activation and output either way, and the two projections must be
+        // the same weight type -- the fused kernels read one plane layout.
+        if (up->src[0]->type != gate->src[0]->type ||
             gate->src[1]->type != GGML_TYPE_F32  || up->src[1]->type != GGML_TYPE_F32  ||
             gate->type != GGML_TYPE_F32 || up->type != GGML_TYPE_F32 || glu->type != GGML_TYPE_F32) {
             return false;
+        }
+        const bool wg_q4_k = gate->src[0]->type == GGML_TYPE_Q4_K;
+        if (!wg_q4_k) {
+            // A split IQ type: it needs its own opt-in, a fused kernel the driver
+            // accepted, the plane split on BOTH weights (the kernel reads planes),
+            // and a whole number of super-blocks along K.
+            ggml_cl_plane_binding bg, bu;
+            if (!ggml_cl_plane_binding_for(backend_ctx, gate->src[0], &bg) ||
+                !ggml_cl_plane_binding_for(backend_ctx, up->src[0], &bu) ||
+                bg.gemv_glu == nullptr || bu.gemv_glu == nullptr ||
+                bg.n_planes != bu.n_planes ||
+                gate->src[0]->ne[0] % 256 != 0) {
+                return false;
+            }
         }
         // gate and up must share the same activation and have matching shape/stride
         if (gate->src[1] != up->src[1] ||
@@ -9452,6 +9556,11 @@ static bool ggml_opencl_can_fuse(const ggml_backend_opencl_context * backend_ctx
         // SWIGLU_OAI carries extra alpha/limit params -> not handled by the fused kernel
         if (ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU_OAI) {
             return false;
+        }
+        // the rest of these guard the q4_K image layout only; the IQ types were
+        // already fully validated above and read planes, not the noshuffle image.
+        if (!wg_q4_k) {
+            return true;
         }
         // the fused kernel reads the standard noshuffle image layout; the tiled
         // layout packs weights differently -> defer those to the per-op path
@@ -9571,6 +9680,85 @@ static bool ggml_opencl_can_fuse(const ggml_backend_opencl_context * backend_ctx
 static void ggml_opencl_op_rms_norm_fused(ggml_backend_t backend, ggml_tensor * rms_norm_tensor, ggml_tensor * mul_tensor);
 static void ggml_opencl_op_norm_fused(ggml_backend_t backend, ggml_tensor * norm_tensor, ggml_tensor * mul_tensor, ggml_tensor * add_tensor);
 static void ggml_opencl_op_group_norm_fused(ggml_backend_t backend, ggml_tensor * gn_tensor, ggml_tensor * mul_tensor, ggml_tensor * add_tensor);
+
+// Fused ffn_gate + ffn_up + GLU for the split IQ types, over the plane binding.
+//
+// One function serves every type that has a fused kernel: the binding already
+// enumerates each weight's planes, so this binds the gate's planes then the up's
+// and lets the kernel's own signature decide how many there are. The two weights
+// are the same ggml type -- the fusion gate rejects a mismatch -- so their plane
+// counts agree by construction.
+static void ggml_cl_mul_mat_plane_glu_fused(ggml_backend_t backend, ggml_tensor * gate_tensor,
+                                            ggml_tensor * up_tensor, ggml_tensor * glu_tensor) {
+    GGML_ASSERT(gate_tensor && up_tensor && glu_tensor);
+    const ggml_tensor * Wg   = gate_tensor->src[0];
+    const ggml_tensor * Wu   = up_tensor->src[0];
+    const ggml_tensor * src1 = gate_tensor->src[1];   // == up_tensor->src[1]
+    const ggml_tensor * dst  = glu_tensor;
+    GGML_ASSERT(Wg && Wg->extra && Wu && Wu->extra);
+    GGML_ASSERT(src1 && src1->extra && dst && dst->extra);
+
+    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *)backend->context;
+    ggml_tensor_extra_cl        * extra1 = (ggml_tensor_extra_cl *)src1->extra;
+    ggml_tensor_extra_cl        * extrad = (ggml_tensor_extra_cl *)dst->extra;
+
+    ggml_cl_plane_binding bg, bu;
+    if (!ggml_cl_plane_binding_for(backend_ctx, Wg, &bg) ||
+        !ggml_cl_plane_binding_for(backend_ctx, Wu, &bu)) {
+        GGML_ABORT("fused GLU reached a weight with no plane binding");
+    }
+    GGML_ASSERT(bg.n_planes == bu.n_planes && "gate and up disagree on plane count");
+    GGML_ASSERT(bg.gemv_glu != nullptr && "fused GLU kernel missing");
+
+    const cl_ulong offset1 = extra1->offset + src1->view_offs;
+    const cl_ulong offsetd = extrad->offset + dst->view_offs;
+
+    const int ne00   = Wg->ne[0];        // K
+    const int ne01   = Wg->ne[1];        // M
+    const int ne10   = src1->ne[0];      // activation row stride
+    const int ne0    = dst->ne[0];
+    const int ne11   = src1->ne[1];      // tokens
+    const int glu_op = (int)ggml_get_glu_op(dst);
+
+    cl_kernel fk  = bg.gemv_glu;
+    const int nsg = bg.nsg;
+
+    cl_int  ai = 0;
+    cl_mem  act_img = nullptr;
+    cl_uint act_off = 0;
+
+    GGML_ASSERT(bg.gemv_wants_grid_img && bg.gemv_grid_img != nullptr);
+    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem), &bg.gemv_grid_img));
+    if (bg.gemv_wants_act_img) {
+        act_img = ggml_cl_activation_image(backend_ctx, extra1->data_device,
+                                           offset1, ne10, ne11, &act_off);
+        cl_mem arg = act_img ? act_img : bg.gemv_grid_img;
+        CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),  &arg));
+        CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_uint), &act_off));
+    }
+    for (int pi = 0; pi < bg.n_planes; ++pi) {
+        CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem), &bg.planes[pi]));
+    }
+    for (int pi = 0; pi < bu.n_planes; ++pi) {
+        CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem), &bu.planes[pi]));
+    }
+    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &extra1->data_device));
+    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_ulong), &offset1));
+    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_mem),   &extrad->data_device));
+    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(cl_ulong), &offsetd));
+    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne00));
+    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne01));
+    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne10));
+    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne0));
+    CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &glu_op));
+
+    // the fused kernel is row-pair only, so 128 rows per workgroup as in the GEMV
+    size_t f_global[3] = { CEIL_DIV((size_t)ne01, (size_t)128) * 64,
+                           (size_t)ne11 * (size_t)nsg, 1 };
+    size_t f_local[3]  = { 64, (size_t)nsg, 1 };
+    backend_ctx->enqueue_ndrange_kernel(fk, 3, f_global, f_local, (ggml_tensor *)dst);
+    if (act_img) { CL_CHECK(clReleaseMemObject(act_img)); }
+}
 
 static void ggml_cl_mul_mat_q4_k_glu_fused(ggml_backend_t backend, ggml_tensor * gate_tensor, ggml_tensor * up_tensor, ggml_tensor * glu_tensor) {
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
@@ -9862,7 +10050,8 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
             continue;
         }
         // Fuse mul_mat(Wg,x) + mul_mat(Wu,x) + glu — fold the FFN's two decode
-        // GEMVs and the GLU into one dispatch. q4_K only (guarded below); the
+        // GEMVs and the GLU into one dispatch. q4_K and the split IQ types that
+        // opted in (guarded below); the
         // fused kernel uses the same accumulation/reduction order and the same
         // scalar GLU formula -> coherent. Default on, opt-out GGML_OPENCL_FUSE_MM_GLU=0.
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
@@ -9871,7 +10060,11 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
         // match so the FFN GLU subgraph stays dormant on Intel/other drivers.
         if (backend_ctx->fuse_mm_glu && !backend_ctx->disable_fusion &&
             ggml_opencl_can_fuse(backend_ctx, cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU })) {
-            ggml_cl_mul_mat_q4_k_glu_fused(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
+            if (node->src[0]->type == GGML_TYPE_Q4_K) {
+                ggml_cl_mul_mat_q4_k_glu_fused(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
+            } else {
+                ggml_cl_mul_mat_plane_glu_fused(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
+            }
             i += 2;
             continue;
         }
@@ -10173,38 +10366,6 @@ static bool ggml_cl_q3k_is_split(const ggml_backend_opencl_context * backend_ctx
 // Everything the plane path needs for one weight, so the dispatcher below does
 // not have to know which quantization it is holding. A split weight has no AoS
 // fallback, so a type appears here exactly when its is_split() can return true.
-struct ggml_cl_plane_binding {
-    cl_mem    planes[5]   = { nullptr };
-    int       n_planes    = 0;
-    cl_kernel gemm        = nullptr;
-    cl_kernel gemm_narrow = nullptr;
-    cl_kernel gemv        = nullptr;
-    int       nsg         = 0;
-    size_t    rows_wg     = 0;
-    // IQ1_S's codebook carries a per-block delta, so its GEMM needs the per-32
-    // sum of the dequantised activations as well as their q8_1 form.
-    bool      gemm_wants_sa = false;
-    // The IQ GEMVs read their codebook through this image; it is argument 0.
-    // The flag is the contract and the handle is the value: a type that wants the
-    // image and does not have one is a bug, not a fallback.
-    bool      gemv_wants_grid_img = false;
-    cl_mem    gemv_grid_img = nullptr;
-    // The GEMV was compiled to read the activation through an image (see
-    // GGML_OPENCL_<TYPE>_MV_AIMG). Unlike the codebook this one degrades: when
-    // the view is not expressible the dispatch binds the codebook image in its
-    // place, which is harmless because the kernel then never samples it.
-    bool      gemv_wants_act_img = false;
-};
-
-// Answers "is this weight plane-split, and where are its planes" -- so it needs
-// the tensor's extra, which only exists once THIS backend has uploaded it.
-//
-// A tensor scheduled onto another backend has no OpenCL extra, and
-// ggml_backend_opencl_supports_op is asked about exactly those. Reading the
-// planes out of a null extra took the process down at graph-reserve time on any
-// model that mixes plane-split weights with weights this backend declines, so
-// answer "no binding" instead. Callers that need only the TYPE question must use
-// ggml_cl_is_plane_split below, which does not touch the extra.
 static bool ggml_cl_plane_binding_for(const ggml_backend_opencl_context * backend_ctx,
                                       const ggml_tensor * src0,
                                       ggml_cl_plane_binding * b) {
@@ -10265,6 +10426,8 @@ static bool ggml_cl_plane_binding_for(const ggml_backend_opencl_context * backen
         b->gemv_wants_grid_img = true;
         b->gemv_grid_img = backend_ctx->iq1s_grid_img;
         b->gemv_wants_act_img  = ggml_cl_iq1s_mv_aimg(backend_ctx) != 0;
+        b->gemv_glu    = ggml_cl_iq1s_fuse_glu(backend_ctx)
+                       ? backend_ctx->kernel_mul_mv_iq1_s_f32_flat_glu : nullptr;
         b->nsg         = backend_ctx->iq1s_mv_nsg_eff;
         b->rows_wg     = 64u * (size_t)(2);
         return true;
@@ -10281,6 +10444,8 @@ static bool ggml_cl_plane_binding_for(const ggml_backend_opencl_context * backen
         b->gemv_wants_grid_img = true;
         b->gemv_grid_img = backend_ctx->iq1m_grid_img;
         b->gemv_wants_act_img  = ggml_cl_iq1m_mv_aimg(backend_ctx) != 0;
+        b->gemv_glu    = ggml_cl_iq1m_fuse_glu(backend_ctx)
+                       ? backend_ctx->kernel_mul_mv_iq1_m_f32_flat_glu : nullptr;
         b->nsg         = backend_ctx->iq1m_mv_nsg_eff;
         b->rows_wg     = 64u * (size_t)(2);
         return true;
@@ -10297,6 +10462,8 @@ static bool ggml_cl_plane_binding_for(const ggml_backend_opencl_context * backen
         b->gemv_wants_grid_img = true;
         b->gemv_grid_img = backend_ctx->iq2xxs_grid_img;
         b->gemv_wants_act_img  = ggml_cl_iq2xxs_mv_aimg(backend_ctx) != 0;
+        b->gemv_glu    = ggml_cl_iq2xxs_fuse_glu(backend_ctx)
+                       ? backend_ctx->kernel_mul_mv_iq2_xxs_f32_flat_glu : nullptr;
         b->nsg         = backend_ctx->iq2xxs_mv_nsg_eff;
         b->rows_wg     = 64u * (size_t)(2);
         return true;
@@ -10331,6 +10498,8 @@ static bool ggml_cl_plane_binding_for(const ggml_backend_opencl_context * backen
         b->gemv_wants_grid_img = true;
         b->gemv_grid_img = backend_ctx->iq2s_grid_img;
         b->gemv_wants_act_img  = ggml_cl_iq2s_mv_aimg(backend_ctx) != 0;
+        b->gemv_glu    = ggml_cl_iq2s_fuse_glu(backend_ctx)
+                       ? backend_ctx->kernel_mul_mv_iq2_s_f32_flat_glu : nullptr;
         b->nsg         = backend_ctx->iq2s_mv_nsg_eff;
         b->rows_wg     = 64u * (size_t)(2);
         return true;
