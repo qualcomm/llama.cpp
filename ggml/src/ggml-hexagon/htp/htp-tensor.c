@@ -88,6 +88,7 @@ static void merge_dirty_ranges(struct htp_context * ctx) {
             r->start = MIN(r->start, s->start);
             r->end   = MAX(r->end, s->end);
             s->start = 0;
+            s->end   = 0;
             j = 0;
         }
     }
@@ -173,7 +174,7 @@ void htp_tensor_dirty_all(struct htp_context * ctx, const struct htp_tensor * co
         return;
     }
 
-    if (total_evict_size > HEX_L2_FLUSH_WQ_THRESHOLD && ctx->n_threads > 1 && n_evict <= HTP_OP_MAX_INPUTS) {
+    if (total_evict_size > HEX_L2_FLUSH_WQ_THRESHOLD && ctx->n_threads > 1 && n_evict <= HTP_MAX_DIRTY_RANGES) {
         struct l2flush_multi_task task;
         task.trace    = ctx->trace;
         task.n_ranges = n_evict;

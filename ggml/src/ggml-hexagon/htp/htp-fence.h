@@ -17,8 +17,8 @@ static inline atomic_uint * htp_mdev_fence_slot(const void * fence_base, uint32_
 
 static inline void htp_fence_write(void * fence_ptr, uint32_t seq, uint32_t status) {
     atomic_uint * fence = (atomic_uint *) fence_ptr;
-    atomic_store(&fence[0], seq);
     atomic_store(&fence[1], status);
+    atomic_store(&fence[0], seq);
     asm volatile ("syncht" : : : "memory");
     Q6_dccleaninva_A((void *) fence);
 }
