@@ -888,7 +888,7 @@ static int execute_op(struct htp_ops_context * octx) {
     }
 
     FARF(ERROR, "Unknown Op %u", octx->op);
-    return -1;
+    return HTP_STATUS_NO_SUPPORT;
 }
 
 static inline bool reuse_buf(struct htp_context *ctx, uint32_t *m_reuse, struct htp_buf_desc *b) {
