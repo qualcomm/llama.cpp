@@ -668,7 +668,9 @@ struct ggml_hexagon_fence_buffer : public ggml_hexagon_shared_buffer {
 };
 
 inline uint8_t * ggml_hexagon_session::alloc_fence(uint32_t n_slots) {
-    return fence_buf->alloc_slot(n_slots);
+    uint8_t * ptr = fence_buf->alloc_slot(n_slots);
+    GGML_ASSERT(ptr);
+    return ptr;
 }
 
 inline void ggml_hexagon_session::free_fence(void * ptr, uint32_t n_slots) {
@@ -5910,20 +5912,7 @@ static ggml_backend_event_t ggml_backend_hexagon_device_event_new(ggml_backend_d
     };
 }
 
-static void ggml_backend_hexagon_device_event_free(ggml_backend_dev_t dev, ggml_backend_event_t event) {
-    GGML_UNUSED(dev);
-
-    auto * hex_event = static_cast<ggml_hexagon_event *>(event->context);
-    HEX_VERBOSE("ggml-hex: %s event-free : event %p\n", ggml_backend_dev_name(dev), (void *)hex_event);
-    hex_event->sess->free_fence((void *) hex_event->fence_slot, 1);
-    delete hex_event;
-    delete event;
-}
-
-static void ggml_backend_hexagon_device_event_synchronize(ggml_backend_dev_t dev, ggml_backend_event_t event) {
-    GGML_UNUSED(dev);
-
-    auto * hex_event = static_cast<ggml_hexagon_event *>(event->context);
+static void ggml_hexagon_event_synchronize(ggml_backend_dev_t dev, ggml_hexagon_event * hex_event) {
     if (hex_event->seq == 0) {
         return;
     }
@@ -5948,6 +5937,20 @@ static void ggml_backend_hexagon_device_event_synchronize(ggml_backend_dev_t dev
         }
         std::this_thread::yield();
     }
+}
+
+static void ggml_backend_hexagon_device_event_free(ggml_backend_dev_t dev, ggml_backend_event_t event) {
+    auto * hex_event = static_cast<ggml_hexagon_event *>(event->context);
+    ggml_hexagon_event_synchronize(dev, hex_event);
+    HEX_VERBOSE("ggml-hex: %s event-free : event %p\n", ggml_backend_dev_name(dev), (void *)hex_event);
+    hex_event->sess->free_fence((void *) hex_event->fence_slot, 1);
+    delete hex_event;
+    delete event;
+}
+
+static void ggml_backend_hexagon_device_event_synchronize(ggml_backend_dev_t dev, ggml_backend_event_t event) {
+    auto * hex_event = static_cast<ggml_hexagon_event *>(event->context);
+    ggml_hexagon_event_synchronize(dev, hex_event);
 }
 
 static void ggml_backend_hexagon_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
