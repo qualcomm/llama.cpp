@@ -639,12 +639,12 @@ static void gated_delta_net_f32_pp_thread(unsigned int nth, unsigned int ith, vo
         float * ps_out = state_out_base + ((uint64_t) piv3 * H + piv1) * S_v * S_v;
 
         // Push dummy write-back
-        dma_queue_push(dma, dma_make_ptr(ps_out, s_work[spad_idx]),
+        dma_queue_push(dma, dma_make_data(ps_out, s_work[spad_idx]),
                        S_v * sizeof(float), S_v * sizeof(float),
                        S_v * sizeof(float), 0);
 
         // Push fetch
-        dma_queue_push(dma, dma_make_ptr(s_work[spad_idx], ps_in),
+        dma_queue_push(dma, dma_make_data(s_work[spad_idx], ps_in),
                        S_v * sizeof(float), S_v * sizeof(float),
                        S_v * sizeof(float), S_v);
 
@@ -816,7 +816,7 @@ static void gated_delta_net_f32_pp_thread(unsigned int nth, unsigned int ith, vo
         }
 
         // Push real write-back
-        dma_queue_push(dma, dma_make_ptr(s_out, s_work_curr),
+        dma_queue_push(dma, dma_make_data(s_out, s_work_curr),
                        S_v * sizeof(float), S_v * sizeof(float),
                        S_v * sizeof(float), S_v);
 
@@ -826,7 +826,7 @@ static void gated_delta_net_f32_pp_thread(unsigned int nth, unsigned int ith, vo
             const uint32_t piv3 = fastdiv(ir_prefetch, &fd_H);
             const float * ps_in = state_in_base + (uint64_t) piv3 * state_seq_stride + (uint64_t) piv1 * S_v * S_v;
 
-            dma_queue_push(dma, dma_make_ptr(s_work[spad_idx], ps_in),
+            dma_queue_push(dma, dma_make_data(s_work[spad_idx], ps_in),
                            S_v * sizeof(float), S_v * sizeof(float),
                            S_v * sizeof(float), S_v);
 
@@ -904,12 +904,12 @@ static void gated_delta_net_f32_tg_thread(unsigned int nth, unsigned int ith, vo
         float * ps_out = state_out_base + ((uint64_t) piv3 * H + piv1) * S_v * S_v;
 
         // Push dummy write-back
-        dma_queue_push(dma, dma_make_ptr(ps_out, s_work[spad_idx]),
+        dma_queue_push(dma, dma_make_data(ps_out, s_work[spad_idx]),
                        S_v * sizeof(float), S_v * sizeof(float),
                        S_v * sizeof(float), 0);
 
         // Push fetch
-        dma_queue_push(dma, dma_make_ptr(s_work[spad_idx], ps_in),
+        dma_queue_push(dma, dma_make_data(s_work[spad_idx], ps_in),
                        S_v * sizeof(float), S_v * sizeof(float),
                        S_v * sizeof(float), S_v);
 
@@ -1066,7 +1066,7 @@ static void gated_delta_net_f32_tg_thread(unsigned int nth, unsigned int ith, vo
         }
 
         // Push real write-back
-        dma_queue_push(dma, dma_make_ptr(s_out, s_work_curr),
+        dma_queue_push(dma, dma_make_data(s_out, s_work_curr),
                        S_v * sizeof(float), S_v * sizeof(float),
                        S_v * sizeof(float), S_v);
 
@@ -1076,7 +1076,7 @@ static void gated_delta_net_f32_tg_thread(unsigned int nth, unsigned int ith, vo
             const uint32_t piv3 = fastdiv(ir_prefetch, &fd_H);
             const float * ps_in = state_in_base + (uint64_t) piv3 * state_seq_stride + (uint64_t) piv1 * S_v * S_v;
 
-            dma_queue_push(dma, dma_make_ptr(s_work[spad_idx], ps_in),
+            dma_queue_push(dma, dma_make_data(s_work[spad_idx], ps_in),
                            S_v * sizeof(float), S_v * sizeof(float),
                            S_v * sizeof(float), S_v);
 

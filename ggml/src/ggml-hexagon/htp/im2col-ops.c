@@ -14,7 +14,7 @@
 #include "htp-ctx.h"
 #include "htp-ops.h"
 #include "hvx-utils.h"
-#include "hex-dma.h"
+#include "dma-queue.h"
 #include "hex-profile.h"
 #include "htp-vtcm.h"
 #include "htp-tensor.h"
@@ -86,8 +86,8 @@ static inline void htp_im2col_vtcm_layout_build(struct htp_im2col_vtcm_layout * 
         const uint32_t OH                       = is_2D ? dst->ne[2] : 1;                                  \
         const uint32_t OW                       = dst->ne[1];                                              \
         const uint32_t patch_stride             = IC * KH * KW;                                            \
-        const float * restrict src_data         = (const float *) src1->data;                              \
-        DST_CTYPE * restrict dst_data           = (DST_CTYPE *) dst->data;                                 \
+        const float * restrict src_data         = (const float *) (uintptr_t) src1->data;                  \
+        DST_CTYPE * restrict dst_data           = (DST_CTYPE *) (uintptr_t) dst->data;                     \
         const uint32_t patch_end                = ictx->patch_base + ictx->npatches;                       \
         const uint32_t patch_start              = ictx->patch_base + ictx->npatches_per_thread * ith;      \
         const uint32_t patch_stop               = MIN(patch_start + ictx->npatches_per_thread, patch_end); \
@@ -174,8 +174,8 @@ IM2COL_PATCHEMBED_BODY(im2col_patchembed_f32_thread, float, hvx_copy_f32_uu, hvx
         const uint32_t OW    = dst->ne[1];                                                                           \
         const uint32_t owb = ictx->pe_owb, Wb = ictx->pe_wb;                                                         \
         const uint32_t patch_stride     = IC * KH * KW;                                                              \
-        const float * restrict src_data = (const float *) src1->data;                                                \
-        DST_CTYPE * restrict dst_data   = (DST_CTYPE *) dst->data;                                                   \
+        const dma_addr_t src_data       = src1->data;                                                                \
+        const dma_addr_t dst_data       = dst->data;                                                                 \
         dma_queue *    dmaq             = octx->ctx->dma[ith];                                                       \
         uint8_t *      srcb_base        = ictx->pe_vtcm_src + ith * ictx->pe_src_size_per_thread;                    \
         uint8_t *      dstb_base        = ictx->pe_vtcm_dst + ith * ictx->pe_dst_size_per_thread;                    \
@@ -213,9 +213,9 @@ IM2COL_PATCHEMBED_BODY(im2col_patchembed_f32_thread, float, hvx_copy_f32_uu, hvx
                     if (hi <= lo)                                                                                    \
                         continue;                                                                                    \
                     const uint32_t cpw  = (uint32_t) (hi - lo);                                                      \
-                    float *        vdst = srcb + (uint64_t) ikh * Wb + (uint32_t) lo;                                \
-                    const float *  vsrc = src_data + ((uint64_t) (in * IC) * IH + iih) * IW + (win0 + lo);           \
-                    while (!dma_queue_push(dmaq, dma_make_ptr((uint8_t *) vdst, (const uint8_t *) vsrc),             \
+                    float *        vdst = srcb + (size_t) ikh * Wb + lo;                                             \
+                    const dma_addr_t vsrc = src_data + (size_t) (((in * IC) * IH + iih) * IW + (win0 + lo)) * sizeof(float); \
+                    while (!dma_queue_push(dmaq, dma_make_data(vdst, vsrc),                                          \
                                            (size_t) KH * Wb * sizeof(float), (size_t) IH * IW * sizeof(float),       \
                                            cpw * sizeof(float), IC)) {                                               \
                         dma_queue_pop(dmaq);                                                                         \
@@ -243,9 +243,9 @@ IM2COL_PATCHEMBED_BODY(im2col_patchembed_f32_thread, float, hvx_copy_f32_uu, hvx
                     if (hi <= lo)                                                                                    \
                         continue;                                                                                    \
                     const uint32_t cpw  = (uint32_t) (hi - lo);                                                      \
-                    float *        vdst = nsrcb + (uint64_t) ikh * Wb + (uint32_t) lo;                               \
-                    const float *  vsrc = src_data + ((uint64_t) (nin * IC) * IH + iih) * IW + (nwin0 + lo);         \
-                    while (!dma_queue_push(dmaq, dma_make_ptr((uint8_t *) vdst, (const uint8_t *) vsrc),             \
+                    float *        vdst = nsrcb + (size_t) ikh * Wb + lo;                                            \
+                    const dma_addr_t vsrc = src_data + (size_t) (((nin * IC) * IH + iih) * IW + (nwin0 + lo)) * sizeof(float); \
+                    while (!dma_queue_push(dmaq, dma_make_data(vdst, vsrc),                                          \
                                            (size_t) KH * Wb * sizeof(float), (size_t) IH * IW * sizeof(float),       \
                                            cpw * sizeof(float), IC)) {                                               \
                         dma_queue_pop(dmaq);                                                                         \
@@ -297,9 +297,10 @@ IM2COL_PATCHEMBED_BODY(im2col_patchembed_f32_thread, float, hvx_copy_f32_uu, hvx
                 }                                                                                                    \
             }                                                                                                        \
             htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, r);                                                     \
-            DST_CTYPE * ddr = dst_data + ((uint64_t) (in * OH + ioh) * OW + c0) * patch_stride;                      \
-            dma_queue_push_vtcm_to_ddr(dmaq, dma_make_ptr((uint8_t *) ddr, (uint8_t *) dstb),                        \
-                                       nb * patch_stride * (DST_ELEM), nb * patch_stride * (DST_ELEM), 1);           \
+            const dma_addr_t ddr = dst_data + (size_t) ((in * OH + ioh) * OW + c0) * patch_stride * (DST_ELEM);       \
+            dma_queue_push(dmaq, dma_make_data(ddr, dstb),                                                           \
+                           nb * patch_stride * (DST_ELEM), nb * patch_stride * (DST_ELEM),                           \
+                           nb * patch_stride * (DST_ELEM), 1);                                                       \
             dma_queue_flush(dmaq);                                                                                   \
         }                                                                                                            \
     }
@@ -326,13 +327,13 @@ IM2COL_BLOCKED_DMA_BODY(im2col_blocked_dma_f32_thread, float,  hvx_copy_f32_uu, 
         const uint32_t OH                       = is_2D ? dst->ne[2] : 1;                                            \
         const uint32_t OW                       = dst->ne[1];                                                        \
         const uint32_t patch_stride             = IC * KH * KW;                                                      \
-        const float * restrict src_data         = (const float *) src1->data;                                        \
-        DST_CTYPE * restrict dst_data           = (DST_CTYPE *) dst->data;                                           \
-        dma_queue *    dmaq                     = octx->ctx->dma[ith];                                               \
-        uint8_t *      src_base                 = ictx->pe_vtcm_src + ith * ictx->pe_src_size_per_thread;            \
-        uint8_t *      dst_base                 = ictx->pe_vtcm_dst + ith * ictx->pe_dst_size_per_thread;            \
-        float *        srcb                     = (float *) src_base;                                                \
-        DST_CTYPE *    dstb                     = (DST_CTYPE *) dst_base;                                            \
+        const dma_addr_t src_data       = src1->data;                                                                \
+        const dma_addr_t dst_data       = dst->data;                                                                 \
+        dma_queue *    dmaq             = octx->ctx->dma[ith];                                                       \
+        uint8_t *      src_base         = ictx->pe_vtcm_src + ith * ictx->pe_src_size_per_thread;                    \
+        uint8_t *      dst_base         = ictx->pe_vtcm_dst + ith * ictx->pe_dst_size_per_thread;                    \
+        float *        srcb             = (float *) src_base;                                                        \
+        DST_CTYPE *    dstb             = (DST_CTYPE *) dst_base;                                                    \
         const uint32_t row_end_max              = ictx->pe_row_base + ictx->pe_nrows;                                \
         const uint32_t per_thread               = ictx->pe_rows_per_thread;                                          \
         const uint32_t row_start                = ictx->pe_row_base + per_thread * ith;                              \
@@ -346,12 +347,12 @@ IM2COL_BLOCKED_DMA_BODY(im2col_blocked_dma_f32_thread, float,  hvx_copy_f32_uu, 
                 int32_t iih = (int32_t) ioh * (int32_t) KH + (int32_t) ikh;                                          \
                 int     ok  = (iih >= 0 && iih < (int32_t) IH);                                                      \
                 for (uint32_t iic = 0; iic < IC; iic++) {                                                            \
-                    float *       vdst = srcb + ((uint64_t) (iic * KH + ikh)) * IW;                                  \
-                    const float * _vsrc =                                                                            \
-                        ok ? (src_data + ((uint64_t) (in * IC + iic) * IH + iih) * IW) : (const float *) vdst;       \
-                    dma_queue_push_ddr_to_vtcm(                                                                      \
-                        dmaq, dma_make_ptr((uint8_t *) vdst, ok ? (const uint8_t *) _vsrc : (const uint8_t *) vdst), \
-                        IW * sizeof(float), IW * sizeof(float), ok ? 1 : 0);                                         \
+                    float *       vdst = srcb + (size_t) (iic * KH + ikh) * IW;                                      \
+                    const dma_addr_t vsrc = ok                                                                        \
+                        ? (src_data + (size_t) ((in * IC + iic) * IH + iih) * IW * sizeof(float))                     \
+                        : src_data;                                                                                  \
+                    dma_queue_push(dmaq, dma_make_data(vdst, vsrc),                                                  \
+                                   IW * sizeof(float), IW * sizeof(float), IW * sizeof(float), ok ? 1 : 0);          \
                 }                                                                                                    \
             }                                                                                                        \
             for (uint32_t i = 0; i < IC * KH; i++)                                                                   \
@@ -373,9 +374,10 @@ IM2COL_BLOCKED_DMA_BODY(im2col_blocked_dma_f32_thread, float,  hvx_copy_f32_uu, 
                 }                                                                                                    \
             }                                                                                                        \
             htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, r);                                                     \
-            DST_CTYPE * ddr_row = dst_data + ((uint64_t) (in * OH + ioh) * OW) * patch_stride;                       \
-            dma_queue_push_vtcm_to_ddr(dmaq, dma_make_ptr((uint8_t *) ddr_row, (uint8_t *) dstb),                    \
-                                       OW * patch_stride * (DST_ELEM), OW * patch_stride * (DST_ELEM), 1);           \
+            const dma_addr_t ddr_row = dst_data + (size_t) (in * OH + ioh) * OW * patch_stride * (DST_ELEM);        \
+            dma_queue_push(dmaq, dma_make_data(ddr_row, dstb),                                                       \
+                           OW * patch_stride * (DST_ELEM), OW * patch_stride * (DST_ELEM),                           \
+                           OW * patch_stride * (DST_ELEM), 1);                                                       \
             dma_queue_flush(dmaq);                                                                                   \
         }                                                                                                            \
     }
@@ -571,6 +573,9 @@ int op_im2col(struct htp_ops_context * octx) {
         }
     }
     // Fall through to pure-DDR.
+    if (htp_tensor_is_extended(src1) || htp_tensor_is_extended(dst)) {
+        return HTP_STATUS_NO_SUPPORT;
+    }
 
 
     if (npatches == 0) {

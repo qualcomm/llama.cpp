@@ -289,9 +289,9 @@ static inline void cpy_dma_sametype_sameshape(
     dma_queue * q = octx->ctx->dma[0];
 
     if (contiguous_outer) {
-        if (!dma_queue_push(q, dma_make_ptr((void *) dst->data, (const void *) src0->data), nb1, nb01, ne00 * elem_size, ne01 * ne02 * ne03)) {
+        if (!dma_queue_push(q, dma_make_data(dst->data, src0->data), nb1, nb01, ne00 * elem_size, ne01 * ne02 * ne03)) {
             dma_queue_flush(q);
-            dma_queue_push(q, dma_make_ptr((void *) dst->data, (const void *) src0->data), nb1, nb01, ne00 * elem_size, ne01 * ne02 * ne03);
+            dma_queue_push(q, dma_make_data(dst->data, src0->data), nb1, nb01, ne00 * elem_size, ne01 * ne02 * ne03);
         }
         dma_queue_flush(q);
         return;
@@ -299,12 +299,12 @@ static inline void cpy_dma_sametype_sameshape(
 
     for (uint32_t i03 = 0; i03 < ne03; i03++) {
         for (uint32_t i02 = 0; i02 < ne02; i02++) {
-            uint8_t * dst_ptr  = (uint8_t *) dst->data  + i02 * nb2  + i03 * nb3;
-            uint8_t * src0_ptr = (uint8_t *) src0->data + i02 * nb02 + i03 * nb03;
+            dma_addr_t dst_data  = dst->data  + (dma_addr_t) i02 * nb2  + (dma_addr_t) i03 * nb3;
+            dma_addr_t src0_data = src0->data + (dma_addr_t) i02 * nb02 + (dma_addr_t) i03 * nb03;
 
-            if (!dma_queue_push(q, dma_make_ptr(dst_ptr, src0_ptr), nb1, nb01, ne00 * elem_size, ne01)) {
+            if (!dma_queue_push(q, dma_make_data(dst_data, src0_data), nb1, nb01, ne00 * elem_size, ne01)) {
                 dma_queue_flush(q);
-                dma_queue_push(q, dma_make_ptr(dst_ptr, src0_ptr), nb1, nb01, ne00 * elem_size, ne01);
+                dma_queue_push(q, dma_make_data(dst_data, src0_data), nb1, nb01, ne00 * elem_size, ne01);
             }
         }
     }

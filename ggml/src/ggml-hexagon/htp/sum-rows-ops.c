@@ -8,7 +8,7 @@
 #include <string.h>
 #include <math.h>
 
-#include "hex-dma.h"
+#include "dma-queue.h"
 #include "hvx-utils.h"
 
 #define GGML_COMMON_DECL_C

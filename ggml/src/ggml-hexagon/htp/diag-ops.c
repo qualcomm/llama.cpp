@@ -13,7 +13,7 @@
 #include "hvx-types.h"
 #include "hex-utils.h"
 #include "hvx-copy.h"
-#include "hex-dma.h"
+#include "dma-queue.h"
 
 #define htp_diag_tensors_preamble                           \
     const struct htp_tensor * restrict src0 = octx->src[0]; \
@@ -73,8 +73,8 @@ static void diag_thread_f32_dma(unsigned int nth, unsigned int ith, void * data)
     const size_t src_batch_size_aligned = dctx->src_batch_size_aligned;
     const size_t dst_row_size_aligned   = dctx->dst_row_size_aligned;
 
-    const uint8_t * src_data = (const uint8_t *) src0->data;
-    uint8_t *       dst_data = (uint8_t *) dst->data;
+    const dma_addr_t src_data = src0->data;
+    const dma_addr_t dst_data = dst->data;
 
     // 1 src buffer + 1 dst row buffer per thread in VTCM
     uint8_t * src_spad = octx->src0_spad.data + (ith * src_batch_size_aligned);
@@ -86,12 +86,12 @@ static void diag_thread_f32_dma(unsigned int nth, unsigned int ith, void * data)
         const uint32_t i3 = ib / ne02;
         const uint32_t i2 = ib % ne02;
 
-        const uint8_t * src_batch = src_data + i3 * nb03 + i2 * nb02;
+        const dma_addr_t src_batch = src_data + i3 * nb03 + i2 * nb02;
 
         // Fetch source vector into VTCM
-        dma_queue_push_ddr_to_vtcm(dma_queue,
-                                   dma_make_ptr(src_spad, src_batch),
-                                   src_batch_size_aligned, src_batch_size, 1);
+        dma_queue_push(dma_queue,
+                       dma_make_data(src_spad, src_batch),
+                       src_batch_size_aligned, src_batch_size, src_batch_size, 1);
         dma_queue_flush(dma_queue);
 
         const float * src_spad_f32 = (const float *) src_spad;
@@ -104,10 +104,10 @@ static void diag_thread_f32_dma(unsigned int nth, unsigned int ith, void * data)
             htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) (ib * ne1 + i1));
 
             // Write completed row back to DDR
-            uint8_t * dst_row = dst_data + i3 * nb3 + i2 * nb2 + i1 * nb1;
-            dma_queue_push_vtcm_to_ddr(dma_queue,
-                                       dma_make_ptr(dst_row, dst_spad),
-                                       dst_row_size, dst_row_size_aligned, 1);
+            const dma_addr_t dst_row = dst_data + i3 * nb3 + i2 * nb2 + i1 * nb1;
+            dma_queue_push(dma_queue,
+                           dma_make_data(dst_row, dst_spad),
+                           dst_row_size, dst_row_size_aligned, dst_row_size, 1);
             dma_queue_flush(dma_queue);
         }
     }

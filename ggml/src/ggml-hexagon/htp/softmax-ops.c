@@ -8,7 +8,7 @@
 #include <math.h>
 #include <string.h>
 
-#include "hex-dma.h"
+#include "dma-queue.h"
 #include "hvx-utils.h"
 #include "hex-fastdiv.h"
 

@@ -7,7 +7,7 @@
 #include <math.h>
 #include <string.h>
 
-#include "hex-dma.h"
+#include "dma-queue.h"
 #include "hvx-utils.h"
 
 #define GGML_COMMON_DECL_C
@@ -57,9 +57,9 @@ struct htp_act_context {
     struct htp_ops_context * octx;
 
     // Precomputed values
-    const uint8_t *          data_src0;
-    const uint8_t *          data_src1;
-    uint8_t *                data_dst;
+    dma_addr_t               data_src0;
+    dma_addr_t               data_src1;
+    dma_addr_t               data_dst;
 
     size_t                   src0_row_size;
     size_t                   src1_row_size;
@@ -410,9 +410,9 @@ static void geglu_quick_f32(const float * restrict src0,
             return;                                                                                                      \
         }                                                                                                                \
                                                                                                                          \
-        const uint8_t * restrict data_src0 = actx->data_src0;                                                            \
-        const uint8_t * restrict data_src1 = actx->data_src1;                                                            \
-        uint8_t * restrict data_dst        = actx->data_dst;                                                             \
+        const dma_addr_t data_src0 = actx->data_src0;                                                                    \
+        const dma_addr_t data_src1 = actx->data_src1;                                                                    \
+        const dma_addr_t data_dst  = actx->data_dst;                                                                     \
                                                                                                                          \
         const size_t src0_row_size_aligned = actx->src0_row_size_aligned;                                                \
         const size_t src1_row_size_aligned = actx->src1_row_size_aligned;                                                \
@@ -442,17 +442,17 @@ static void geglu_quick_f32(const float * restrict src0,
             const uint32_t block_size = MIN(BLOCK, src0_end_row - ir);                                                   \
                                                                                                                          \
             /* Dummy DMA transation for sequencing (interleaving dst,src,dst,...) */                                     \
-            dma_queue_push_vtcm_to_ddr(dma_queue,                                                                        \
-                                       dma_make_ptr(data_dst, dst_spad_data + (spad_idx * dst_spad_half_size)),          \
-                                       dst_row_size, dst_row_size_aligned, 0);                                           \
+            dma_queue_push(dma_queue,                                                                                    \
+                           dma_make_data(data_dst, dst_spad_data + (spad_idx * dst_spad_half_size)),                     \
+                           dst_row_size, dst_row_size_aligned, dst_row_size, 0);                                         \
                                                                                                                          \
             dma_queue_push(                                                                                              \
                 dma_queue,                                                                                               \
-                dma_make_ptr(src0_spad_data + (spad_idx * src0_spad_half_size), data_src0 + (ir * src0_row_stride)),     \
+                dma_make_data(src0_spad_data + (spad_idx * src0_spad_half_size), data_src0 + (ir * src0_row_stride)),    \
                 src0_row_size_aligned, src0_row_stride, src0_row_size, block_size);                                      \
             dma_queue_push(                                                                                              \
                 dma_queue,                                                                                               \
-                dma_make_ptr(src1_spad_data + (spad_idx * src1_spad_half_size), data_src1 + (ir * src1_row_stride)),     \
+                dma_make_data(src1_spad_data + (spad_idx * src1_spad_half_size), data_src1 + (ir * src1_row_stride)),    \
                 src1_row_size_aligned, src1_row_stride, src1_row_size, block_size);                                      \
         }                                                                                                                \
                                                                                                                          \
@@ -467,16 +467,16 @@ static void geglu_quick_f32(const float * restrict src0,
             CORE_EXPR;                                                                                                   \
             htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, ir);                                                        \
                                                                                                                          \
-            dma_queue_push_vtcm_to_ddr(dma_queue, dma_make_ptr(data_dst + (ir * dst_row_size), dst_spad),                \
-                                       dst_row_size, dst_row_size_aligned, block_size);                                  \
+            dma_queue_push(dma_queue, dma_make_data(data_dst + (ir * dst_row_size), dst_spad),                           \
+                           dst_row_size, dst_row_size_aligned, dst_row_size, block_size);                                \
                                                                                                                          \
             /* prefetch N+2 loop iteration if any */                                                                     \
             const uint32_t pref_block = (ir + BLOCK * 2);                                                                \
             if (pref_block < src0_end_row) {                                                                             \
                 const uint32_t pref_block_size = MIN(BLOCK, src0_end_row - pref_block);                                  \
-                dma_queue_push(dma_queue, dma_make_ptr(src0_spad, data_src0 + (pref_block * src0_row_stride)),           \
+                dma_queue_push(dma_queue, dma_make_data(src0_spad, data_src0 + (pref_block * src0_row_stride)),          \
                                src0_row_size_aligned, src0_row_stride, src0_row_size, pref_block_size);                  \
-                dma_queue_push(dma_queue, dma_make_ptr(src1_spad, data_src1 + (pref_block * src1_row_stride)),           \
+                dma_queue_push(dma_queue, dma_make_data(src1_spad, data_src1 + (pref_block * src1_row_stride)),          \
                                src1_row_size_aligned, src1_row_stride, src1_row_size, pref_block_size);                  \
             }                                                                                                            \
         }                                                                                                                \
@@ -628,9 +628,9 @@ static int execute_op_activations_f32(struct htp_ops_context * octx) {
 
     actx.nc = dst->ne[0];
 
-    // Pointers and GLU logic
-    const uint8_t * data_src0 = (const uint8_t *) src0->data;
-    const uint8_t * data_src1 = src1 ? (const uint8_t *) src1->data : NULL;
+    // Addresses and GLU logic
+    dma_addr_t data_src0 = src0->data;
+    dma_addr_t data_src1 = src1 ? src1->data : 0;
 
     if (!src1 && (octx->op == HTP_OP_GLU_SWIGLU ||
                   octx->op == HTP_OP_GLU_SWIGLU_OAI ||
@@ -651,7 +651,7 @@ static int execute_op_activations_f32(struct htp_ops_context * octx) {
 
     actx.data_src0 = data_src0;
     actx.data_src1 = data_src1;
-    actx.data_dst  = (uint8_t *) dst->data;
+    actx.data_dst  = dst->data;
 
     work_queue_run(octx->ctx->work_queue, act_op_func, &actx, n_threads);
     return HTP_STATUS_OK;

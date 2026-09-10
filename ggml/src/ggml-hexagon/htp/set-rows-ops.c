@@ -90,14 +90,14 @@ static void set_rows_thread_dma_##TYPE_NAME##_##IDX_TYPE(unsigned int nth, unsig
     uint32_t pi03 = 0;                                                                                           \
     for (uint32_t step = 0, spad_idx = 0; step < total_steps && spad_idx < 2; ++step, spad_idx++) {              \
         uint32_t i = ir0 + pi_step;                                                                              \
-        const uintptr_t src0_ptr = octx->src[0]->data + i*nb01 + pi02*nb02 + pi03*nb03;                          \
+        const dma_addr_t src0_data = octx->src[0]->data + i*nb01 + pi02*nb02 + pi03*nb03;                        \
         dma_queue_push(dma_queue,                                                                                \
-                       dma_make_ptr((void *)octx->dst->data,                                                     \
-                                    vtcm_dst + spad_idx * vtcm_layout->dst_spad_half_size),                      \
+                       dma_make_data(octx->dst->data,                                                            \
+                                     vtcm_dst + spad_idx * vtcm_layout->dst_spad_half_size),                     \
                        dst_row_size, vtcm_layout->dst_spad_half_size, dst_row_size, 0);                          \
         dma_queue_push(dma_queue,                                                                                \
-                       dma_make_ptr((void *)(vtcm_src0 + spad_idx * vtcm_layout->src0_spad_half_size),           \
-                                    (const void *)src0_ptr),                                                     \
+                       dma_make_data(vtcm_src0 + spad_idx * vtcm_layout->src0_spad_half_size,                    \
+                                     src0_data),                                                                 \
                        vtcm_layout->src0_spad_half_size, src0_row_size, src0_row_size, 1);                       \
         pi_step++;                                                                                               \
         if (pi_step == nrows_per_thread) {                                                                       \
@@ -128,21 +128,21 @@ static void set_rows_thread_dma_##TYPE_NAME##_##IDX_TYPE(unsigned int nth, unsig
         }                                                                                                        \
         htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, step);                                                  \
         if (valid_i1) {                                                                                          \
-            const uintptr_t dst_ptr = octx->dst->data + target_i1*nb1 + ci02*nb2 + ci03*nb3;                     \
+            const dma_addr_t dst_data = octx->dst->data + target_i1*nb1 + ci02*nb2 + ci03*nb3;                   \
             dma_queue_push(dma_queue,                                                                            \
-                           dma_make_ptr((void *)dst_ptr, (const void *)dst_spad),                                \
+                           dma_make_data(dst_data, dst_spad),                                                    \
                            dst_row_size, vtcm_layout->dst_spad_half_size, dst_row_size, 1);                      \
         } else {                                                                                                 \
             dma_queue_push(dma_queue,                                                                            \
-                           dma_make_ptr((void *)octx->dst->data, (const void *)dst_spad),                        \
+                           dma_make_data(octx->dst->data, dst_spad),                                             \
                            dst_row_size, vtcm_layout->dst_spad_half_size, dst_row_size, 0);                      \
         }                                                                                                        \
         const uint32_t next_step = step + 2;                                                                     \
         if (next_step < total_steps) {                                                                           \
             uint32_t ni = ir0 + pi_step;                                                                         \
-            const uintptr_t psrc0_ptr = octx->src[0]->data + ni*nb01 + pi02*nb02 + pi03*nb03;                    \
+            const dma_addr_t psrc0_data = octx->src[0]->data + ni*nb01 + pi02*nb02 + pi03*nb03;                  \
             dma_queue_push(dma_queue,                                                                            \
-                           dma_make_ptr((void *)src_spad, (const void *)psrc0_ptr),                              \
+                           dma_make_data(src_spad, psrc0_data),                                                  \
                            vtcm_layout->src0_spad_half_size, src0_row_size, src0_row_size, 1);                   \
             pi_step++;                                                                                           \
             if (pi_step == nrows_per_thread) {                                                                   \

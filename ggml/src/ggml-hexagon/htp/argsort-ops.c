@@ -9,7 +9,7 @@
 #include "ggml.h"
 
 #include "hvx-utils.h"
-#include "hex-dma.h"
+#include "dma-queue.h"
 
 #include "hex-common.h"
 #include "htp-ctx.h"

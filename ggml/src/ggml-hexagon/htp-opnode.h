@@ -15,6 +15,7 @@
 #include "htp/flash-attn-ops.h"
 #include "htp/unary-ops.h"
 #include "htp/allreduce-ops.h"
+#include "htp/ssm-conv.h"
 
 struct htp_opnode {
     ggml_tensor * node   { nullptr };
@@ -350,6 +351,9 @@ struct htp_opformat {
             snprintf(str, max_size, "seq 0x%x", (uint32_t) node.node->op_params[0]);
         } else if (node.opcode == HTP_OP_ALLREDUCE && node.node) {
             snprintf(str, max_size, "seq 0x%x -> 0x%x", (uint32_t) node.node->op_params[0], (uint32_t) node.node->op_params[1]);
+        } else if (node.opcode == HTP_OP_SSM_CONV) {
+            const auto * kparams = (const struct htp_ssm_conv_kernel_params *) node.kernel_params;
+            snprintf(str, max_size, "%s vtcm %d", kparams->n_t == 1 ? "decode" : "prefill", (int) kparams->vtcm_size);
         } else {
             snprintf(str, max_size, "----");
         }
