@@ -621,6 +621,8 @@ int op_argsort(struct htp_ops_context * octx) {
 struct htp_top_k_context {
     struct htp_ops_context * octx;
     uint32_t                 nrows_per_thread;
+    uint32_t                 row_start;
+    uint32_t                 row_end;
     uint8_t *                vtcm_base;
     size_t                   vtcm_per_thread;
     uint32_t                 k;
@@ -633,10 +635,11 @@ static void htp_top_k_f32_##ne00(unsigned int n, unsigned int i, void * data) { 
     const struct htp_tensor * src0 = octx->src[0];                                                             \
     const struct htp_tensor * dst = octx->dst;                                                                 \
     uint8_t * spad = actx->vtcm_base + actx->vtcm_per_thread * i;                                              \
-    uint32_t total_rows = src0->ne[1] * src0->ne[2] * src0->ne[3];                                             \
+    uint32_t row_start = actx->row_start;                                                                      \
+    uint32_t row_end = actx->row_end;                                                                          \
     uint32_t rows_per_thread = actx->nrows_per_thread;                                                         \
-    uint32_t start_row = rows_per_thread * i;                                                                  \
-    uint32_t end_row = MIN(start_row + rows_per_thread, total_rows);                                           \
+    uint32_t start_row = row_start + rows_per_thread * i;                                                      \
+    uint32_t end_row = MIN(start_row + rows_per_thread, row_end);                                              \
     size_t values_size = hex_round_up(ne00 * sizeof(float), 128);                                              \
     float * values_buf = (float *) spad;                                                                       \
     int32_t * indices_buf = (int32_t *) (spad + values_size);                                                  \
@@ -671,17 +674,13 @@ static void htp_top_k_f32_fallback(unsigned int n, unsigned int i, void * data) 
 
     // Unpack context
     const struct htp_tensor * src0 = octx->src[0];
-    const struct htp_tensor * dst = octx->dst;
+    const struct htp_tensor * dst  = octx->dst;
 
     // Scratchpad memory
     uint8_t * spad = actx->vtcm_base + actx->vtcm_per_thread * i;
 
     // Dimensions
     uint32_t ne00 = src0->ne[0];
-    uint32_t ne01 = src0->ne[1];
-    uint32_t ne02 = src0->ne[2];
-    uint32_t ne03 = src0->ne[3];
-
     uint32_t nb01 = src0->nb[1];
 
     uint32_t nb1 = dst->nb[1];
@@ -689,10 +688,11 @@ static void htp_top_k_f32_fallback(unsigned int n, unsigned int i, void * data) 
     uint32_t k = actx->k;
 
     // Rows to process
-    uint32_t total_rows = ne01 * ne02 * ne03;
+    uint32_t row_start = actx->row_start;
+    uint32_t row_end = actx->row_end;
     uint32_t rows_per_thread = actx->nrows_per_thread;
-    uint32_t start_row = rows_per_thread * i;
-    uint32_t end_row = MIN(start_row + rows_per_thread, total_rows);
+    uint32_t start_row = row_start + rows_per_thread * i;
+    uint32_t end_row = MIN(start_row + rows_per_thread, row_end);
 
     // Pad ne00 to n_vec*32 (n_vec a power of 2) for the bitonic network;
     // pad with -INFINITY so it never lands in the top-k.
@@ -869,7 +869,7 @@ static int op_top_k_single_row_threaded(struct htp_ops_context * octx, uint32_t 
     cctx.merge_values_off  = merge_values_off;
     cctx.merge_indices_off = merge_indices_off;
 
-    worker_pool_run_func(octx->ctx->worker_pool, htp_top_k_chunk_job, &cctx, n_chunks);
+    work_queue_run(octx->ctx->work_queue, htp_top_k_chunk_job, &cctx, n_chunks);
 
     struct htp_top_k_merge_ctx mctx;
     mctx.octx              = octx;
@@ -880,7 +880,7 @@ static int op_top_k_single_row_threaded(struct htp_ops_context * octx, uint32_t 
     mctx.total_candidates  = total_candidates;
     mctx.k                 = k;
 
-    worker_pool_run_func(octx->ctx->worker_pool, htp_top_k_merge_job, &mctx, 1);
+    work_queue_run(octx->ctx->work_queue, htp_top_k_merge_job, &mctx, 1);
 
     return HTP_STATUS_OK;
 }
@@ -891,9 +891,30 @@ int op_top_k(struct htp_ops_context * octx) {
         return HTP_STATUS_NO_SUPPORT;
     }
 
-    const uint32_t total_rows = octx->src[0]->ne[1] * octx->src[0]->ne[2] * octx->src[0]->ne[3];
-    uint32_t ne00 = octx->src[0]->ne[0];
-    uint32_t k = octx->dst->ne[0];
+    const struct htp_tensor * src0 = octx->src[0];
+    const struct htp_tensor * dst  = octx->dst;
+
+    const uint32_t total_rows = src0->ne[1] * src0->ne[2] * src0->ne[3];
+    const size_t dst_row_size = dst->ne[0] * sizeof(int32_t);
+
+    uint32_t row_start = 0;
+    uint32_t row_end   = total_rows;
+    if (octx->ctx->mdev.count > 1) {
+        uint32_t rows_per_chunk = 0;
+        htp_tensor_mdev_rows_per_chunk(dst, sizeof(int32_t), (uint32_t) dst_row_size, &rows_per_chunk);
+        const struct htp_tensor_mdev_range range = htp_tensor_mdev_partition(total_rows, rows_per_chunk,
+            octx->ctx->mdev.idx, octx->ctx->mdev.count, &octx->ctx->mdev.count_div);
+        row_start = range.start;
+        row_end   = range.start + range.count;
+    }
+
+    const uint32_t nrows = row_end - row_start;
+    if (nrows == 0) {
+        return HTP_STATUS_OK;
+    }
+
+    uint32_t ne00 = src0->ne[0];
+    uint32_t k    = dst->ne[0];
 
     // Single row + large ne00: the per-row dispatch below would run on one
     // HVX thread while the rest sit idle. Split the row across threads.
@@ -905,7 +926,7 @@ int op_top_k(struct htp_ops_context * octx) {
         // else: fall through to the single-thread path below.
     }
 
-    const uint32_t n_threads = MIN(total_rows, octx->n_threads);
+    const uint32_t n_threads = MIN(nrows, octx->n_threads);
 
     // Scratchpad layout: values + indices
     // For bitonic: need padding to power-of-2 size
@@ -935,11 +956,14 @@ int op_top_k(struct htp_ops_context * octx) {
          octx->src[0]->data, octx->dst->data);
 
     struct htp_top_k_context actx;
-    actx.octx = octx;
-    actx.nrows_per_thread = (total_rows + n_threads - 1) / n_threads;
-    actx.vtcm_base = (uint8_t *) octx->ctx->vtcm_base;
-    actx.vtcm_per_thread = spad_per_thread;
-    actx.k = k;
+    const struct fastdiv_values n_threads_div = init_fastdiv_values(n_threads);
+    actx.octx             = octx;
+    actx.nrows_per_thread = fastdiv(nrows + n_threads - 1, &n_threads_div);
+    actx.row_start        = row_start;
+    actx.row_end          = row_end;
+    actx.vtcm_base        = (uint8_t *) octx->ctx->vtcm_base;
+    actx.vtcm_per_thread  = spad_per_thread;
+    actx.k                = k;
 
     worker_callback_t job_func = htp_top_k_f32_fallback;
     switch (ne00) {
@@ -953,7 +977,7 @@ int op_top_k(struct htp_ops_context * octx) {
     }
 
     // Run jobs
-    worker_pool_run_func(octx->ctx->worker_pool, job_func, &actx, n_threads);
+    work_queue_run(octx->ctx->work_queue, job_func, &actx, n_threads);
 
     return HTP_STATUS_OK;
 }
