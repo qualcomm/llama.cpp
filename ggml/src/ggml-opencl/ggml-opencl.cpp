@@ -7761,7 +7761,7 @@ static void ggml_cl_moe_combine_fused(ggml_backend_t backend, const ggml_tensor 
 }
 
 inline bool use_q4k_tiled(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor);   // defined below (used by the GLU-subgraph fuse check)
-inline bool use_q4_k_ila_kernels(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor);
+inline bool use_q4_k_bin_kernels(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor);
 inline bool use_adreno_kernels(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor);   // defined below
 
 static bool ggml_opencl_can_fuse(const ggml_backend_opencl_context * backend_ctx, const struct ggml_cgraph * cgraph, int node_idx, std::initializer_list<enum ggml_op> ops) {
@@ -7817,7 +7817,7 @@ static bool ggml_opencl_can_fuse(const ggml_backend_opencl_context * backend_ctx
             return false;
         }
         // q4_K bin kernel requires 32b transposed layout, not compatible with the fused gemv
-        if (use_q4_k_ila_kernels(backend_ctx, gate->src[0]) || use_q4_k_ila_kernels(backend_ctx, up->src[0])) {
+        if (use_q4_k_bin_kernels(backend_ctx, gate->src[0]) || use_q4_k_bin_kernels(backend_ctx, up->src[0])) {
             return false;
         }
         // that noshuffle layout is only produced at set_tensor time when
@@ -8393,7 +8393,7 @@ inline bool enable_adreno_trans_weight_q5_K(const ggml_backend_opencl_context *b
            qh_img_width <= backend_ctx->image_max_buffer_size;
 }
 
-inline bool use_q4_0_ila_kernels(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor) {
+inline bool use_q4_0_bin_kernels(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor) {
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
     if (!backend_ctx->kernel_gemv_noshuffle_q4_0_f32_32b_trans ||
         !backend_ctx->kernel_gemm_noshuffle_q4_0_f32_32b_trans_ila_a8_bin) {
@@ -8486,7 +8486,7 @@ static inline bool use_flat_gemv_for_large_m_q6_K(const ggml_backend_opencl_cont
         && tensor->ne[2] == 1 && tensor->ne[3] == 1;
 }
 
-inline bool use_q4_k_ila_kernels(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor) {
+inline bool use_q4_k_bin_kernels(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor) {
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
     if (!backend_ctx->kernel_gemv_noshuffle_q4_k_f32_32b_trans ||
         !backend_ctx->kernel_gemm_noshuffle_q4_k_f32_32b_trans_ila_a8_bin) {
@@ -9684,7 +9684,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
 
             GGML_ASSERT(K % 32 == 0);
 
-            if (use_q4_0_ila_kernels(backend_ctx, tensor)) {
+            if (use_q4_0_bin_kernels(backend_ctx, tensor)) {
                 cl_int err;
                 cl_image_format wimg_fmt;
                 cl_image_desc   wimg_desc;
@@ -10635,7 +10635,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
 
             GGML_ASSERT(K % 32 == 0);
 
-            if (use_q4_k_ila_kernels(backend_ctx, tensor)) {
+            if (use_q4_k_bin_kernels(backend_ctx, tensor)) {
                 cl_int err;
                 cl_image_format wimg_fmt;
                 cl_image_desc   wimg_desc;
@@ -11256,7 +11256,7 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
             buf_trans_d.allocate(backend_ctx->context, size_d);
             buf_unpacked.allocate(backend_ctx->context, ggml_nbytes(tensor));
 
-            if (use_q4_0_ila_kernels(backend_ctx, tensor)) {
+            if (use_q4_0_bin_kernels(backend_ctx, tensor)) {
                 transpose_2d_as_32b(backend_ctx, extra->q, buf_trans_q.buffer, size_q, M, K / 8);
             } else {
                 transpose_2d_as_16b(backend_ctx, extra->q, buf_trans_q.buffer, size_q, M, K / 4);
@@ -11931,7 +11931,7 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
             buf_trans_s.allocate(backend_ctx->context, size_s);
 
             // Transpose q, d, dm, s back
-            if (use_q4_k_ila_kernels(backend_ctx, tensor)) {
+            if (use_q4_k_bin_kernels(backend_ctx, tensor)) {
                 transpose_2d_as_32b(backend_ctx, extra->q, buf_trans_q.buffer, size_q, M, K/8);
             } else {
                 transpose_2d_as_16b(backend_ctx, extra->q,  buf_trans_q.buffer,  size_q,  M, K/4);
@@ -18719,9 +18719,9 @@ static void ggml_cl_mul_mat_q4_0_f32_adreno(ggml_backend_t backend, const ggml_t
     static const bool q40_mc3 = (getenv("GGML_OPENCL_Q40_MC3") != nullptr);
     const bool use_q40_mc3 = q40_mc3 && (ne1 >= 2 && ne1 <= 4) && (ne01 < 32768);
 
-    const bool use_ila = use_q4_0_ila_kernels(backend_ctx, src0);
+    const bool use_bin = use_q4_0_bin_kernels(backend_ctx, src0);
 
-    if (use_ila) {
+    if (use_bin) {
         if (use_q40_mc3) {
             static bool warned = false;
             if (!warned) {
@@ -20467,9 +20467,9 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
     // unified routes batched Q6_K lm_head to CPU). Per-layer mc3 is byte-identical.
     const bool use_mc3 = q4k_mc3 && (ne1 == 3) && (ne01 < 32768);
 
-    const bool use_ila = use_q4_k_ila_kernels(backend_ctx, src0);
+    const bool use_bin = use_q4_k_bin_kernels(backend_ctx, src0);
 
-    if (use_ila) {
+    if (use_bin) {
         if (use_mc3) {
             static bool warned = false;
             if (!warned) {
