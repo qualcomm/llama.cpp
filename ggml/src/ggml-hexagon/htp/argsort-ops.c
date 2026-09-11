@@ -170,6 +170,21 @@ static void quicksort_values_indices_desc(float * values, int32_t * indices, int
     if (i < right) quicksort_values_indices_desc(values, indices, i, right);
 }
 
+static uint32_t top_k_max_value_index(const float * values, uint32_t n, float * value) {
+    uint32_t index = 0;
+    float max_value = values[0];
+
+    for (uint32_t i = 1; i < n; i++) {
+        if (values[i] > max_value) {
+            max_value = values[i];
+            index = i;
+        }
+    }
+
+    *value = max_value;
+    return index;
+}
+
 // LUT for ramp initialization of argsort output (first 32 members)
 int32_t argosrt_ramp_lut[32] __attribute__((aligned(VLEN))) = {
     0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
@@ -378,6 +393,51 @@ static void bitonic_sort_vtcm_desc(uint8_t * values, uint8_t * indices, uint32_t
                 }
             }
         }
+    }
+}
+
+static void top_k_select_tiled(const uint8_t * src, uint32_t n, uint32_t k,
+                               float * values_buf, int32_t * indices_buf,
+                               float * top_values, int32_t * top_indices) {
+    const uint32_t tile_elems = 1024;
+    uint32_t n_tiles            = (n + tile_elems - 1) / tile_elems;
+    uint32_t candidate_count    = n_tiles * k;
+    uint32_t merge_n_vec        = hmx_ceil_div(candidate_count, 32);
+    uint32_t merge_n_vec_pow2   = 1;
+    while (merge_n_vec_pow2 < merge_n_vec) merge_n_vec_pow2 <<= 1;
+    uint32_t merge_elems        = merge_n_vec_pow2 * 32;
+    float * candidate_values    = values_buf + tile_elems;
+    int32_t * candidate_indices = indices_buf + tile_elems;
+    uint32_t candidate_pos      = 0;
+
+    for (uint32_t offset = 0; offset < n; offset += tile_elems) {
+        uint32_t tile_count = MIN(tile_elems, n - offset);
+        hvx_copy_f32_au((uint8_t *) values_buf, src + offset * sizeof(float), tile_count);
+        if (tile_count < tile_elems) {
+            hvx_splat_f32_u((uint8_t *) (values_buf + tile_count), -INFINITY, tile_elems - tile_count);
+        }
+
+        bitonic_sort_vtcm_desc((uint8_t *) values_buf, (uint8_t *) indices_buf, tile_elems / 32, true);
+        uint32_t tile_k = MIN(k, tile_count);
+        for (uint32_t j = 0; j < tile_k; j++) {
+            candidate_values[candidate_pos] = values_buf[j];
+            candidate_indices[candidate_pos] = indices_buf[j] + (int32_t) offset;
+            candidate_pos++;
+        }
+    }
+
+    if (merge_elems > candidate_pos) {
+        hvx_splat_f32_u((uint8_t *) (candidate_values + candidate_pos), -INFINITY, merge_elems - candidate_pos);
+        for (uint32_t j = candidate_pos; j < merge_elems; j++) {
+            candidate_indices[j] = 0;
+        }
+    }
+
+    bitonic_sort_vtcm_desc((uint8_t *) candidate_values, (uint8_t *) candidate_indices, merge_n_vec_pow2, false);
+
+    for (uint32_t j = 0; j < k; j++) {
+        top_values[j] = candidate_values[j];
+        top_indices[j] = candidate_indices[j];
     }
 }
 
@@ -716,6 +776,15 @@ static void htp_top_k_f32_fallback(unsigned int n, unsigned int i, void * data) 
         uint8_t * dst_ptr = (uint8_t *) dst->data  + dst_offset;
 
         hex_l2fetch(src_ptr, ne00 * sizeof(float), ne00 * sizeof(float), 1);
+
+        if (k <= 64 && ne00 > 1024) {
+            float top_values[64];
+            int32_t top_indices[64];
+            top_k_select_tiled(src_ptr, ne00, k, values_buf, indices_buf, top_values, top_indices);
+            memcpy(dst_ptr, top_indices, k * sizeof(int32_t));
+            continue;
+        }
+
         hvx_copy_f32_au((uint8_t*)values_buf, src_ptr, ne00);
 
         // Fills the indices ramp itself, so no init needed here.
@@ -764,6 +833,35 @@ static void htp_top_k_chunk_job(unsigned int n, unsigned int i, void * data) {
 
     uint32_t real_count = (chunk_base < ne00) ? MIN(chunk_elems, ne00 - chunk_base) : 0;
 
+    if (real_count == 0) {
+        float *   merge_values  = (float *) (cctx->vtcm_base + cctx->merge_values_off);
+        int32_t * merge_indices = (int32_t *) (cctx->vtcm_base + cctx->merge_indices_off);
+        for (uint32_t j = 0; j < local_k; j++) {
+            merge_values[i * local_k + j] = -INFINITY;
+            merge_indices[i * local_k + j] = 0;
+        }
+        return;
+    }
+
+    if (local_k > 1 && local_k <= 64 && chunk_elems > 1024) {
+        uint8_t * src_ptr = (uint8_t *) src0->data + (size_t) chunk_base * sizeof(float);
+        float top_values[64];
+        int32_t top_indices[64];
+        float *   merge_values  = (float *) (cctx->vtcm_base + cctx->merge_values_off);
+        int32_t * merge_indices = (int32_t *) (cctx->vtcm_base + cctx->merge_indices_off);
+        for (uint32_t j = 0; j < local_k; j++) {
+            top_values[j] = -INFINITY;
+            top_indices[j] = 0;
+        }
+        top_k_select_tiled(src_ptr, real_count, local_k, values_buf, indices_buf, top_values, top_indices);
+
+        for (uint32_t j = 0; j < local_k; j++) {
+            merge_values[i * local_k + j] = top_values[j];
+            merge_indices[i * local_k + j] = top_indices[j] + (int32_t) chunk_base;
+        }
+        return;
+    }
+
     if (real_count > 0) {
         uint8_t * src_ptr = (uint8_t *) src0->data + (size_t) chunk_base * sizeof(float);
         hex_l2fetch(src_ptr, real_count * sizeof(float), real_count * sizeof(float), 1);
@@ -771,6 +869,16 @@ static void htp_top_k_chunk_job(unsigned int n, unsigned int i, void * data) {
     }
     if (chunk_elems > real_count) {
         hvx_splat_f32_u((uint8_t *) (values_buf + real_count), -INFINITY, chunk_elems - real_count);
+    }
+
+    if (local_k == 1 && cctx->ne00 >= 128*1024) {
+        float max_value;
+        uint32_t max_index = top_k_max_value_index(values_buf, real_count, &max_value);
+        float *   merge_values  = (float *) (cctx->vtcm_base + cctx->merge_values_off);
+        int32_t * merge_indices = (int32_t *) (cctx->vtcm_base + cctx->merge_indices_off);
+        merge_values[i] = max_value;
+        merge_indices[i] = (int32_t) (max_index + chunk_base);
+        return;
     }
 
     // chunk_elems is always a power-of-two multiple of 32
