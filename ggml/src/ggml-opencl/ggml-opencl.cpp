@@ -7761,6 +7761,7 @@ static void ggml_cl_moe_combine_fused(ggml_backend_t backend, const ggml_tensor 
 }
 
 inline bool use_q4k_tiled(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor);   // defined below (used by the GLU-subgraph fuse check)
+inline bool use_q4_k_ila_kernels(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor);
 inline bool use_adreno_kernels(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor);   // defined below
 
 static bool ggml_opencl_can_fuse(const ggml_backend_opencl_context * backend_ctx, const struct ggml_cgraph * cgraph, int node_idx, std::initializer_list<enum ggml_op> ops) {
@@ -7813,6 +7814,10 @@ static bool ggml_opencl_can_fuse(const ggml_backend_opencl_context * backend_ctx
         // the fused kernel reads the standard noshuffle image layout; the tiled
         // layout packs weights differently -> defer those to the per-op path
         if (use_q4k_tiled(backend_ctx, gate->src[0]) || use_q4k_tiled(backend_ctx, up->src[0])) {
+            return false;
+        }
+        // q4_K bin kernel requires 32b transposed layout, not compatible with the fused gemv
+        if (use_q4_k_ila_kernels(backend_ctx, gate->src[0]) || use_q4_k_ila_kernels(backend_ctx, up->src[0])) {
             return false;
         }
         // that noshuffle layout is only produced at set_tensor time when
@@ -8420,20 +8425,6 @@ static inline bool flat_large_m_enabled() {
     return en;
 }
 
-inline bool use_q4_k_ila_kernels(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor) {
-#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
-    if (!backend_ctx->kernel_gemv_noshuffle_q4_k_f32_32b_trans ||
-        !backend_ctx->kernel_gemm_noshuffle_q4_k_f32_32b_trans_ila_a8_bin) {
-        return false;
-    }
-    return (tensor->ne[0] % 256 == 0) && (tensor->ne[1] % 64 == 0);
-#else
-    GGML_UNUSED(backend_ctx);
-    GGML_UNUSED(tensor);
-    return false;
-#endif
-}
-
 static inline bool use_flat_gemv_for_large_m_q4_K(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor) {
     if (tensor->ne[1] % 4 != 0 && tensor->ne[2] == 1 && tensor->ne[3] == 1) {
         return true;
@@ -8493,6 +8484,21 @@ static inline bool use_flat_gemv_for_large_m_q6_K(const ggml_backend_opencl_cont
     return tensor->ne[1] >= 32768
         && (tensor->ne[0] >= 2048 || (backend_ctx->adreno_gen != ADRENO_GPU_GEN::A7X && ggml_nbytes(tensor) >= (256ull << 20)))
         && tensor->ne[2] == 1 && tensor->ne[3] == 1;
+}
+
+inline bool use_q4_k_ila_kernels(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor) {
+#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+    if (!backend_ctx->kernel_gemv_noshuffle_q4_k_f32_32b_trans ||
+        !backend_ctx->kernel_gemm_noshuffle_q4_k_f32_32b_trans_ila_a8_bin) {
+        return false;
+    }
+    return (tensor->ne[0] % 256 == 0) && (tensor->ne[1] % 64 == 0) &&
+           !use_q4k_tiled(backend_ctx, tensor) && !use_flat_gemv_for_large_m_q4_K(backend_ctx, tensor);
+#else
+    GGML_UNUSED(backend_ctx);
+    GGML_UNUSED(tensor);
+    return false;
+#endif
 }
 
 static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
