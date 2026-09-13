@@ -197,7 +197,8 @@ __kernel void mul_mm_f16_f32_kq(
         int M, int K, int N,
         int D_A,
         int D_B,
-        int nb01
+        int nb01,
+        int kqv_mblock_fast
 ) {
 
 #ifndef KQV
@@ -232,11 +233,28 @@ __kernel void mul_mm_f16_f32_kq(
     // was 0.2% -- it was the whole build-to-build gap, and it was this kernel, not
     // scheduling. Position-matched per-dispatch cost showed the deficit growing with the
     // cache: ~1.1-1.3x shallow, 2.1-2.5x deep.
-    uint n_tiles = (N+TILESIZE_N-1)/TILESIZE_N;
+    // RUNTIME choice, not compile-time. m-block-fast is right where the A panel cannot be
+    // cache-resident (depth) and where the n-axis is short, and WRONG for wide-n prefill: at
+    // a GQA fold of r2=16 and ubatch 512 the n-axis is 256 tiles against 2 m-blocks, and
+    // putting the 2-long axis fast-varying costs 5-10% of pp16384 at d0 (muse, Nemotron).
+    // The host picks; see ggml_cl_mul_mat_kq_kqv_adreno.
+    //
+    // STILL A MATCHED PAIR. These derivations must agree with the host grid, so the flag set
+    // here and the axes chosen there move together or the kernel computes WRONG ELEMENTS.
+    // The branch is workgroup-uniform, so it costs no divergence.
+    uint n_tiles  = (N+TILESIZE_N-1)/TILESIZE_N;
+    uint m_blocks = (M+TILESIZE_M-1)/TILESIZE_M;
 
-    uint block_id_m = get_global_id(1);
-    uint block_id_n = get_global_id(2) % n_tiles;
-    uint block_id_d = get_global_id(2) / n_tiles;
+    uint block_id_m, block_id_n, block_id_d;
+    if (kqv_mblock_fast) {
+        block_id_m = get_global_id(1);
+        block_id_n = get_global_id(2) % n_tiles;
+        block_id_d = get_global_id(2) / n_tiles;
+    } else {
+        block_id_n = get_global_id(1);
+        block_id_m = get_global_id(2) % m_blocks;
+        block_id_d = get_global_id(2) / m_blocks;
+    }
 #endif
 
     __private float16  regA;

@@ -32931,12 +32931,53 @@ static void ggml_cl_mul_mat_kq_kqv_adreno(ggml_backend_t backend, const ggml_ten
     // 🔑 GEOMETRY AND KERNEL ARE A MATCHED PAIR. mul_mm_f16_f32_kq_kqv.cl derives its
     // block_id_m/n from these axes under #ifdef KQV; changing one side alone does not run
     // slower, it computes the WRONG ELEMENTS. Change both or neither.
+    // KQV block ordering, chosen at runtime. 890350037 made m-block-fast unconditional for
+    // KQV on the strength of a d32768 profile. Measured 2026-09-12, that is right at depth
+    // (+36.8% Qwen3.5-35B pp16384 @ d32k) and on low GQA ratios (+2.4% gemma-4-26B at d0) but
+    // WRONG for wide-n prefill: -5.0% muse, -8.8% Nemotron at pp16384 d0, both restored
+    // exactly by reverting it. Those are the r2=16 models, where the GQA fold makes
+    // N = ne11*16 and the n-axis 256 tiles against 2 m-blocks.
+    // Default is the shipped behaviour; GGML_OPENCL_MM_KQV_MBLOCK_FAST=0/1 selects an arm so
+    // the gate threshold can be fitted from measurement instead of guessed.
+    // The A panel of an m-block is 64 * K * 2 bytes, and K here IS n_kv. With m_blocks >= 4
+    // there is enough reuse along the m-axis to hide it however large it gets -- gemma-4-26B
+    // (M=256) prefers m-block-fast at every K measured, by a margin that GROWS with K. With
+    // only 2 m-blocks there is not, and once the panel passes ~1 MiB the n-axis has to carry
+    // the reuse instead: muse and Nemotron (M=128) lose 5.2% and 10.2% at K=16384.
+    //
+    // Measured X2-90, both arms from one binary, -ub 512 (n_tiles 16), 2026-09-12:
+    //   M=128  K 2048/4096  wash        K 8192  +1.5..1.8%   K 16384  +5.2/+10.2%  n-tile-fast
+    //   M=256  K 2048 +1.6% .. K 16384 +3.5%                               m-block-fast
+    // Threshold set where the effect is ESTABLISHED (K 8192), not at K 4096 where the arms are
+    // indistinguishable -- flipping the default where it makes no difference is not a fix.
+    //
+    // 🔴 The K term is a CACHE constant measured on X2-90; the m_blocks term is structural.
+    // GGML_OPENCL_MM_KQV_NTILE_MIN_K retunes the former per device (0 disables the exception).
+    static const int kqv_ntile_min_k = []{
+        const char * e = getenv("GGML_OPENCL_MM_KQV_NTILE_MIN_K");
+        return e ? atoi(e) : 8192;
+    }();
+    static const char * kqv_mbf_env = getenv("GGML_OPENCL_MM_KQV_MBLOCK_FAST");
+    const bool kqv_small_m_deep = m_blocks <= 2 && kqv_ntile_min_k > 0 && K >= kqv_ntile_min_k;
+    const int kqv_mblock_fast = is_kq ? 0
+        : (kqv_mbf_env ? (atoi(kqv_mbf_env) != 0) : (kqv_small_m_deep ? 0 : 1));
+    CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(int), &kqv_mblock_fast));
+
+    if (getenv("GGML_OPENCL_KQKV_TRACE")) {
+        fprintf(stderr, "[KQKV] %s M=%d N=%d K=%d ne12=%d n_tiles=%d m_blocks=%d -> %s\n",
+                is_kq ? "KQ" : "KQV", M, N, K, ne12, n_tiles, m_blocks,
+                is_kq ? "n-tile-fast" : (kqv_mblock_fast ? "m-block-fast" : "n-tile-fast"));
+        fflush(stderr);
+    }
+
+    // The grid MUST agree with the flag above -- see the kernel's matching warning.
+    const bool ntile_fast = is_kq || !kqv_mblock_fast;
     size_t global_work_size[3] = {64,
-        static_cast<size_t>(is_kq ? n_tiles : m_blocks),
-        static_cast<size_t>(is_kq ? m_blocks*ne12 : n_tiles*ne12)};
+        static_cast<size_t>(ntile_fast ? n_tiles : m_blocks),
+        static_cast<size_t>(ntile_fast ? m_blocks*ne12 : n_tiles*ne12)};
     size_t local_work_size[3]  = {64,
-        static_cast<size_t>(is_kq ? n_tiles_per_wg : 1),
-        static_cast<size_t>(is_kq ? 1 : 2)};
+        static_cast<size_t>(ntile_fast ? n_tiles_per_wg : 1),
+        static_cast<size_t>(ntile_fast ? 1 : 2)};
 
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
 
