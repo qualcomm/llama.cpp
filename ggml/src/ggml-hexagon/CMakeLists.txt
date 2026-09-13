@@ -64,6 +64,8 @@ function(build_htp_skel V)
     ExternalProject_Add(htp-${V}
         SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/htp BUILD_ALWAYS ON
         BUILD_BYPRODUCTS ${CMAKE_CURRENT_BINARY_DIR}/libggml-htp-${V}.so
+        BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --target install
+        INSTALL_COMMAND ""
         CMAKE_ARGS
             -DCMAKE_BUILD_TYPE=${GGML_HEXAGON_HTP_BUILD_TYPE}
             -DCMAKE_TOOLCHAIN_FILE=${CMAKE_CURRENT_SOURCE_DIR}/htp/cmake-toolchain.cmake
