@@ -5387,9 +5387,8 @@ static bool ggml_hexagon_supported_top_k(const struct ggml_hexagon_session * ses
         return false;
     }
 
-// Single row uses the threaded chunk+merge path, which splits rather than
-// multiplies the scratch buffer -- 256K needs only ~2MB. Multi-row still
-// uses one full buffer per thread, so it keeps the tighter 64K cap
+    // Single row uses the threaded chunk+merge path. Multi-row uses one full
+    // buffer per thread, so it keeps the tighter 64K cap.
     const bool single_row = (src0->ne[1] == 1 && src0->ne[2] == 1 && src0->ne[3] == 1);
     const int64_t max_ne00 = single_row ? (256*1024) : (64*1024);
 
