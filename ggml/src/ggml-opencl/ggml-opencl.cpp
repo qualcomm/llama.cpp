@@ -3474,7 +3474,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         CL_CHECK((backend_ctx->kernel_ssm_scan_f32_mamba2_d128 = clCreateKernel(prog, "kernel_ssm_scan_f32_mamba2_d128", &err), err));
         CL_CHECK((backend_ctx->kernel_ssm_scan_f32_mamba2_d256 = clCreateKernel(prog, "kernel_ssm_scan_f32_mamba2_d256", &err), err));
 
-        cl_kernel * kernels[] = { 
+        cl_kernel * kernels[] = {
             &backend_ctx->kernel_ssm_scan_f32_mamba2_d128,
             &backend_ctx->kernel_ssm_scan_f32_mamba2_d256
         };
