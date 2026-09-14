@@ -21421,7 +21421,26 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         // Attention shapes in the graph satisfy both -- head sizes are multiples
         // of 64 and n_kv is padded -- which is why this has stayed latent.
         // Declining leaves the odd shapes on the generic GEMM, which handles them.
+        // These kernels are correct on every Adreno, but they are not faster on every
+        // Adreno. On the X1E they lose to the generic mul_mm path, and the margin grows
+        // with the prompt, measured on an Adreno X1-85 with Qwen3.5-4B-Q4_K_M, -fa 0,
+        // -b 2048 -ub 512, arms alternated so drift cancels rather than accumulates:
+        //
+        //   pp4096   158.50 -> 166.22 t/s   +4.9%   declining
+        //   pp8192   138.93 -> 151.53 t/s   +9.1%   declining
+        //
+        // (three alternating pairs per point; the admitted arm's own spread was 0.2% and
+        // 1.0%, so the effect is well clear of the noise.)
+        //
+        // The A panel an m-block walks is 64 * K * 2 bytes and K here is n_kv, so it grows
+        // with the prompt; the X1E does not have the cache to keep it resident, and the
+        // deficit compounds as the context lengthens.
+        //
+        // Only the X1E is carved out. It sits between two generations that both gain from
+        // these kernels, so this is a per-part quirk and not a capability level that could
+        // be expressed as an ordering.
         if (ne01 >= 64 && ne1 >= 32 && ne00 >= 16 &&
+            backend_ctx->adreno_gen != ADRENO_GPU_GEN::X1E &&
             (ne00 % 16) == 0 && (ne01 % 64) == 0 && (ne12 % ne02) == 0  &&
             // the KQ/KQV image kernels do not handle dim 3 (multi-stream batches)
             ne03 == 1 && ne13 == 1 &&
