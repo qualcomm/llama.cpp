@@ -8548,20 +8548,6 @@ static inline bool flat_large_m_enabled() {
     return en;
 }
 
-inline bool use_q6_k_bin_kernels(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor) {
-#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
-    if (!backend_ctx->kernel_gemv_noshuffle_q6_k_f32_32b_trans ||
-        !backend_ctx->kernel_gemm_noshuffle_q6_k_f32_32b_trans_ila_a8_bin) {
-        return false;
-    }
-    return (tensor->ne[0] % 256 == 0) && (tensor->ne[1] % 64 == 0);
-#else
-    GGML_UNUSED(backend_ctx);
-    GGML_UNUSED(tensor);
-    return false;
-#endif
-}
-
 static inline bool use_flat_gemv_for_large_m_q4_K(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor) {
     if (tensor->ne[1] % 4 != 0 && tensor->ne[2] == 1 && tensor->ne[3] == 1) {
         return true;
@@ -8621,6 +8607,21 @@ static inline bool use_flat_gemv_for_large_m_q6_K(const ggml_backend_opencl_cont
     return tensor->ne[1] >= 32768
         && (tensor->ne[0] >= 2048 || (backend_ctx->adreno_gen != ADRENO_GPU_GEN::A7X && ggml_nbytes(tensor) >= (256ull << 20)))
         && tensor->ne[2] == 1 && tensor->ne[3] == 1;
+}
+
+inline bool use_q6_k_bin_kernels(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor) {
+#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+    if (!backend_ctx->kernel_gemv_noshuffle_q6_k_f32_32b_trans ||
+        !backend_ctx->kernel_gemm_noshuffle_q6_k_f32_32b_trans_ila_a8_bin) {
+        return false;
+    }
+    return (tensor->ne[0] % 256 == 0) && (tensor->ne[1] % 64 == 0) &&
+           !use_q6k_tiled(backend_ctx, tensor) && !use_flat_gemv_for_large_m_q6_K(backend_ctx, tensor);
+#else
+    GGML_UNUSED(backend_ctx);
+    GGML_UNUSED(tensor);
+    return false;
+#endif
 }
 
 inline bool use_q4_k_bin_kernels(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor) {
