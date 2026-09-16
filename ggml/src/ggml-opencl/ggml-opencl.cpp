@@ -8117,7 +8117,6 @@ static void ggml_cl_mul_mat_q4_k_glu_fused(ggml_backend_t backend, ggml_tensor *
     GGML_UNUSED(gate_tensor);
     GGML_UNUSED(up_tensor);
     GGML_UNUSED(glu_tensor);
-    GGML_ABORT("q4_K GLU fusion requires GGML_OPENCL_USE_ADRENO_KERNELS");
 #endif
 }
 
