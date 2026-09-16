@@ -1287,12 +1287,13 @@ extern "C" {
         // [EXPERIMENTAL]
         // backend sampling interface:
 
-        // return true if the backend supports all ops needed by the sampler and can handle up to n_outputs_max_per_seq outputs per sequence
+        // return true if the backend supports all ops needed by the sampler for n_candidates candidates and can handle up to n_outputs_max_per_seq outputs per sequence
         // note: call once per sampler
         bool (*backend_init)(
                 struct llama_sampler       * smpl,
                 ggml_backend_buffer_type_t   buft,
-                uint32_t                     n_outputs_max_per_seq);
+                uint32_t                     n_outputs_max_per_seq,
+                uint32_t                     n_candidates);
 
         // call after .backend_apply()
         void (*backend_accept)(

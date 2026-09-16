@@ -1246,7 +1246,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     if (sampler && can_offload) {
         auto * buft = ggml_backend_dev_buffer_type(model.dev_output());
 
-        sampler->iface->backend_init(sampler, buft, cparams.n_outputs_max_per_seq);
+        sampler->iface->backend_init(sampler, buft, cparams.n_outputs_max_per_seq, model.vocab.n_tokens());
 
         sampling.samplers[seq_id] = sampler;
 
