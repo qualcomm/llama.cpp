@@ -342,6 +342,10 @@ static int execute_op_softmax_f32(struct htp_ops_context * octx) {
     const struct htp_tensor * src1 = octx->src[1];
     const struct htp_tensor * dst  = octx->dst;
 
+    if (htp_tensor_is_extended(src0) || (src1 && htp_tensor_is_extended(src1)) || htp_tensor_is_extended(dst)) {
+        return HTP_STATUS_NO_SUPPORT;
+    }
+
     struct htp_softmax_context smctx;
     const char * op_type = "softmax-f32";
 

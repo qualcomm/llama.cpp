@@ -213,7 +213,7 @@ static void flash_attn_ext_f16_thread(unsigned int nth, unsigned int ith, void *
 
     struct htp_thread_trace * tr = &octx->ctx->trace[ith];
 
-    dma_queue * dma = octx->ctx->dma[ith];
+    dma_queue * dma_q = octx->ctx->dma[ith];
 
     const uint32_t DK = nek0;
     const uint32_t DV = nev0;
@@ -278,7 +278,7 @@ static void flash_attn_ext_f16_thread(unsigned int nth, unsigned int ith, void *
             next_iv3 = fastdiv(next_iq3, &factx->broadcast_rv3);
             next_iv2 = fastdiv(next_iq2, &factx->broadcast_rv2);
 
-            next_q_row_ptr = q->data + (next_iq1*nbq1 + next_iq2*nbq2 + next_iq3*nbq3);
+            next_q_row_ptr = q->data + next_iq1*nbq1 + next_iq2*nbq2 + next_iq3*nbq3;
 
             if (mask) {
                 const uint32_t next_im2 = fastmodulo(next_iq2, mask->ne[2], &factx->src3_div2);
@@ -290,8 +290,8 @@ static void flash_attn_ext_f16_thread(unsigned int nth, unsigned int ith, void *
             {
                 const uint32_t ic_start = 0;
                 next_block_size0 = MIN(FLASH_ATTN_BLOCK_SIZE, nek1 - ic_start);
-                next_k_src0 = k->data + (ic_start*nbk1 + next_ik2*nbk2 + next_ik3*nbk3);
-                next_v_src0 = v->data + (ic_start*nbv1 + next_iv2*nbv2 + next_iv3*nbv3);
+                next_k_src0 = k->data + ic_start*nbk1 + next_ik2*nbk2 + next_ik3*nbk3;
+                next_v_src0 = v->data + ic_start*nbv1 + next_iv2*nbv2 + next_iv3*nbv3;
                 if (mask) {
                     next_m_src0 = next_mp_base + ic_start * sizeof(__fp16);
                 }
@@ -301,8 +301,8 @@ static void flash_attn_ext_f16_thread(unsigned int nth, unsigned int ith, void *
             if (factx->n_blocks > 1) {
                 const uint32_t ic_start = 1 * FLASH_ATTN_BLOCK_SIZE;
                 next_block_size1 = MIN(FLASH_ATTN_BLOCK_SIZE, nek1 - ic_start);
-                next_k_src1 = k->data + (ic_start*nbk1 + next_ik2*nbk2 + next_ik3*nbk3);
-                next_v_src1 = v->data + (ic_start*nbv1 + next_iv2*nbv2 + next_iv3*nbv3);
+                next_k_src1 = k->data + ic_start*nbk1 + next_ik2*nbk2 + next_ik3*nbk3;
+                next_v_src1 = v->data + ic_start*nbv1 + next_iv2*nbv2 + next_iv3*nbv3;
                 if (mask) {
                     next_m_src1 = next_mp_base + ic_start * sizeof(__fp16);
                 }
@@ -311,8 +311,8 @@ static void flash_attn_ext_f16_thread(unsigned int nth, unsigned int ith, void *
 
         if (ir == ir0) {
             // Fetch Q row
-            const dma_addr_t q_row_ptr = q->data + (iq1*nbq1 + iq2*nbq2 + iq3*nbq3);
-            dma_queue_push(dma, dma_make_data(spad_q, q_row_ptr), factx->size_q_row_padded, nbq1, size_q_row, 1);
+            const dma_addr_t q_row_ptr = q->data + iq1*nbq1 + iq2*nbq2 + iq3*nbq3;
+            dma_queue_push(dma_q, dma_make_data(spad_q, q_row_ptr), factx->size_q_row_padded, nbq1, size_q_row, 1);
 
             // Prefetch first two blocks
             for (uint32_t ib = 0; ib < MIN(factx->n_blocks, 2); ++ib) {
@@ -320,20 +320,20 @@ static void flash_attn_ext_f16_thread(unsigned int nth, unsigned int ith, void *
                 const uint32_t current_block_size = MIN(FLASH_ATTN_BLOCK_SIZE, nek1 - ic_start);
 
                 // K
-                const dma_addr_t k_src = k->data + (ic_start*nbk1 + ik2*nbk2 + ik3*nbk3);
+                const dma_addr_t k_src = k->data + ic_start*nbk1 + ik2*nbk2 + ik3*nbk3;
                 uint8_t * k_dst = spad_k + (ib % 2) * factx->size_k_block;
-                dma_queue_push(dma, dma_make_data(k_dst, k_src), factx->size_k_row_padded, nbk1, size_k_row, current_block_size);
+                dma_queue_push(dma_q, dma_make_data(k_dst, k_src), factx->size_k_row_padded, nbk1, size_k_row, current_block_size);
 
                 // V
-                const dma_addr_t v_src = v->data + (ic_start*nbv1 + iv2*nbv2 + iv3*nbv3);
+                const dma_addr_t v_src = v->data + ic_start*nbv1 + iv2*nbv2 + iv3*nbv3;
                 uint8_t * v_dst = spad_v + (ib % 2) * factx->size_v_block;
-                dma_queue_push(dma, dma_make_data(v_dst, v_src), factx->size_v_row_padded, nbv1, size_v_row, current_block_size);
+                dma_queue_push(dma_q, dma_make_data(v_dst, v_src), factx->size_v_row_padded, nbv1, size_v_row, current_block_size);
 
                 // Mask
                 if (mask) {
                     const dma_addr_t m_src = mp_base + ic_start * sizeof(__fp16);
                     // Mask is 1D contiguous for this row
-                    dma_cache_push(dma, &m_cache, m_src, current_block_size * 2, current_block_size * 2, current_block_size * 2, 1);
+                    dma_cache_push(dma_q, &m_cache, m_src, current_block_size * 2, current_block_size * 2, current_block_size * 2, 1);
                 }
             }
         }
@@ -348,7 +348,7 @@ static void flash_attn_ext_f16_thread(unsigned int nth, unsigned int ith, void *
         hvx_splat_f32_a(spad_a, 0, DV);
         float * VKQ32 = (float *) (spad_a + 0);
 
-        uint8_t * q_ptr_vtcm = (void *) dma_queue_pop(dma).dst;
+        uint8_t * q_ptr_vtcm = (void *) dma_queue_pop(dma_q).dst;
         if (factx->is_q_fp32) {
             hvx_copy_f16_f32_aa(q_ptr_vtcm, q_ptr_vtcm, DK);  // inplace convert f32 to f16
         }
@@ -365,9 +365,9 @@ static void flash_attn_ext_f16_thread(unsigned int nth, unsigned int ith, void *
             const uint32_t current_block_size = MIN(FLASH_ATTN_BLOCK_SIZE, nek1 - ic_start);
 
             // Wait for DMA
-            uint8_t * k_base = (void *) dma_queue_pop(dma).dst; // K
-            uint8_t * v_base = (void *) dma_queue_pop(dma).dst; // V
-            __fp16  * m_base = mask ? (__fp16 *) dma_queue_pop(dma).dst : NULL; // M
+            uint8_t * k_base = (void *) dma_queue_pop(dma_q).dst; // K
+            uint8_t * v_base = (void *) dma_queue_pop(dma_q).dst; // V
+            __fp16  * m_base = mask ? (__fp16 *) dma_queue_pop(dma_q).dst : NULL; // M
 
             if (factx->k->type == HTP_TYPE_Q8_0) {
                 htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_FA_K_PREP, ir);
@@ -424,7 +424,7 @@ static void flash_attn_ext_f16_thread(unsigned int nth, unsigned int ith, void *
 
             if (ib + 1 == factx->n_blocks && has_next_ir) {
                 // Queue next row's Q row!
-                dma_queue_push(dma, dma_make_data(spad_q, next_q_row_ptr), factx->size_q_row_padded, nbq1, size_q_row, 1);
+                dma_queue_push(dma_q, dma_make_data(spad_q, next_q_row_ptr), factx->size_q_row_padded, nbq1, size_q_row, 1);
 
                 if (factx->n_blocks % 2 == 0) {
                     // Queue next row's block 0 (into buffer slot 0)
@@ -432,14 +432,14 @@ static void flash_attn_ext_f16_thread(unsigned int nth, unsigned int ith, void *
                     uint8_t * v_dst = spad_v + 0 * factx->size_v_block;
 
                     // K (block 0 of next row)
-                    dma_queue_push(dma, dma_make_data(k_dst, next_k_src0), factx->size_k_row_padded, nbk1, size_k_row, next_block_size0);
+                    dma_queue_push(dma_q, dma_make_data(k_dst, next_k_src0), factx->size_k_row_padded, nbk1, size_k_row, next_block_size0);
 
                     // V (block 0 of next row)
-                    dma_queue_push(dma, dma_make_data(v_dst, next_v_src0), factx->size_v_row_padded, nbv1, size_v_row, next_block_size0);
+                    dma_queue_push(dma_q, dma_make_data(v_dst, next_v_src0), factx->size_v_row_padded, nbv1, size_v_row, next_block_size0);
 
                     // Mask (block 0 of next row)
                     if (mask) {
-                        dma_cache_push(dma, &m_cache, next_m_src0, next_block_size0 * 2, next_block_size0 * 2, next_block_size0 * 2, 1);
+                        dma_cache_push(dma_q, &m_cache, next_m_src0, next_block_size0 * 2, next_block_size0 * 2, next_block_size0 * 2, 1);
                     }
                 }
             }
@@ -502,17 +502,17 @@ static void flash_attn_ext_f16_thread(unsigned int nth, unsigned int ith, void *
                 const uint32_t next_block_size = MIN(FLASH_ATTN_BLOCK_SIZE, nek1 - next_ic_start);
 
                 // K
-                const dma_addr_t k_src = k->data + (next_ic_start*nbk1 + ik2*nbk2 + ik3*nbk3);
-                dma_queue_push(dma, dma_make_data(k_base, k_src), factx->size_k_row_padded, nbk1, size_k_row, next_block_size);
+                const dma_addr_t k_src = k->data + next_ic_start*nbk1 + ik2*nbk2 + ik3*nbk3;
+                dma_queue_push(dma_q, dma_make_data(k_base, k_src), factx->size_k_row_padded, nbk1, size_k_row, next_block_size);
 
                 // V
-                const dma_addr_t v_src = v->data + (next_ic_start*nbv1 + iv2*nbv2 + iv3*nbv3);
-                dma_queue_push(dma, dma_make_data(v_base, v_src), factx->size_v_row_padded, nbv1, size_v_row, next_block_size);
+                const dma_addr_t v_src = v->data + next_ic_start*nbv1 + iv2*nbv2 + iv3*nbv3;
+                dma_queue_push(dma_q, dma_make_data(v_base, v_src), factx->size_v_row_padded, nbv1, size_v_row, next_block_size);
 
                 // Mask
                 if (mask) {
                     const dma_addr_t m_src = mp_base + next_ic_start * sizeof(__fp16);
-                    dma_cache_push(dma, &m_cache, m_src, next_block_size * 2, next_block_size * 2, next_block_size * 2, 1);
+                    dma_cache_push(dma_q, &m_cache, m_src, next_block_size * 2, next_block_size * 2, next_block_size * 2, 1);
                 }
             }
         }
@@ -525,14 +525,14 @@ static void flash_attn_ext_f16_thread(unsigned int nth, unsigned int ith, void *
                     uint8_t * v_dst = spad_v + 1 * factx->size_v_block;
 
                     // K (block 1 of next row)
-                    dma_queue_push(dma, dma_make_data(k_dst, next_k_src1), factx->size_k_row_padded, nbk1, size_k_row, next_block_size1);
+                    dma_queue_push(dma_q, dma_make_data(k_dst, next_k_src1), factx->size_k_row_padded, nbk1, size_k_row, next_block_size1);
 
                     // V (block 1 of next row)
-                    dma_queue_push(dma, dma_make_data(v_dst, next_v_src1), factx->size_v_row_padded, nbv1, size_v_row, next_block_size1);
+                    dma_queue_push(dma_q, dma_make_data(v_dst, next_v_src1), factx->size_v_row_padded, nbv1, size_v_row, next_block_size1);
 
                     // Mask (block 1 of next row)
                     if (mask) {
-                        dma_cache_push(dma, &m_cache, next_m_src1, next_block_size1 * 2, next_block_size1 * 2, next_block_size1 * 2, 1);
+                        dma_cache_push(dma_q, &m_cache, next_m_src1, next_block_size1 * 2, next_block_size1 * 2, next_block_size1 * 2, 1);
                     }
                 }
             } else {
@@ -542,14 +542,14 @@ static void flash_attn_ext_f16_thread(unsigned int nth, unsigned int ith, void *
                     uint8_t * v_dst = spad_v + 0 * factx->size_v_block;
 
                     // K (block 0 of next row)
-                    dma_queue_push(dma, dma_make_data(k_dst, next_k_src0), factx->size_k_row_padded, nbk1, size_k_row, next_block_size0);
+                    dma_queue_push(dma_q, dma_make_data(k_dst, next_k_src0), factx->size_k_row_padded, nbk1, size_k_row, next_block_size0);
 
                     // V (block 0 of next row)
-                    dma_queue_push(dma, dma_make_data(v_dst, next_v_src0), factx->size_v_row_padded, nbv1, size_v_row, next_block_size0);
+                    dma_queue_push(dma_q, dma_make_data(v_dst, next_v_src0), factx->size_v_row_padded, nbv1, size_v_row, next_block_size0);
 
                     // Mask (block 0 of next row)
                     if (mask) {
-                        dma_cache_push(dma, &m_cache, next_m_src0, next_block_size0 * 2, next_block_size0 * 2, next_block_size0 * 2, 1);
+                        dma_cache_push(dma_q, &m_cache, next_m_src0, next_block_size0 * 2, next_block_size0 * 2, next_block_size0 * 2, 1);
                     }
                 }
 
@@ -559,14 +559,14 @@ static void flash_attn_ext_f16_thread(unsigned int nth, unsigned int ith, void *
                     uint8_t * v_dst = spad_v + 1 * factx->size_v_block;
 
                     // K (block 1 of next row)
-                    dma_queue_push(dma, dma_make_data(k_dst, next_k_src1), factx->size_k_row_padded, nbk1, size_k_row, next_block_size1);
+                    dma_queue_push(dma_q, dma_make_data(k_dst, next_k_src1), factx->size_k_row_padded, nbk1, size_k_row, next_block_size1);
 
                     // V (block 1 of next row)
-                    dma_queue_push(dma, dma_make_data(v_dst, next_v_src1), factx->size_v_row_padded, nbv1, size_v_row, next_block_size1);
+                    dma_queue_push(dma_q, dma_make_data(v_dst, next_v_src1), factx->size_v_row_padded, nbv1, size_v_row, next_block_size1);
 
                     // Mask (block 1 of next row)
                     if (mask) {
-                        dma_cache_push(dma, &m_cache, next_m_src1, next_block_size1 * 2, next_block_size1 * 2, next_block_size1 * 2, 1);
+                        dma_cache_push(dma_q, &m_cache, next_m_src1, next_block_size1 * 2, next_block_size1 * 2, next_block_size1 * 2, 1);
                     }
                 }
             }
@@ -1779,7 +1779,7 @@ static __attribute__((noinline)) void fa_compute_slopes(
 }
 
 static void fa_push_mask_dma_gqa(
-    dma_queue *               dma,
+    dma_queue *               dma_q,
     const struct htp_tensor * mask,
     uint32_t                  q_start,
     uint32_t                  im3,
@@ -1795,35 +1795,35 @@ static void fa_push_mask_dma_gqa(
         const uint32_t h_idx = kv_head * G + g;
         const uint32_t im2 = fastmodulo(h_idx, mask->ne[2], &factx->src3_div2);
         const dma_addr_t ms_src = mask->data + q_start * mask->nb[1] +
-                                 im2 * mask->nb[2] + im3 * mask->nb[3] + kv_start * sizeof(__fp16);
+                                  im2 * mask->nb[2] + im3 * mask->nb[3] + kv_start * sizeof(__fp16);
         uint8_t * ms_dst = (uint8_t *) factx->vtcm_mask_buf + g * m_line_bytes;
-        dma_queue_push(dma, dma_make_data(ms_dst, ms_src), G * m_line_bytes, mask->nb[1], kv_rows * sizeof(__fp16), n_rows_q);
+        dma_queue_push(dma_q, dma_make_data(ms_dst, ms_src), G * m_line_bytes, mask->nb[1], kv_rows * sizeof(__fp16), n_rows_q);
     }
 }
 
-static void fa_pop_mask_dma_gqa(dma_queue * dma, uint32_t G) {
+static void fa_pop_mask_dma_gqa(dma_queue * dma_q, uint32_t G) {
     for (uint32_t g = 0; g < G; ++g) {
-        dma_queue_pop(dma);
+        dma_queue_pop(dma_q);
     }
 }
 
-static inline void fa_prefetch_block(dma_queue * dma, const struct htp_tensor * k, const struct htp_tensor * v, const struct htp_tensor * mask,
+static inline void fa_prefetch_block(dma_queue * dma_q, const struct htp_tensor * k, const struct htp_tensor * v, const struct htp_tensor * mask,
                                      uint32_t b, size_t Bc, size_t size_k_row_padded, size_t size_k_row, size_t size_v_row_padded, size_t size_v_row,
                                      uint32_t ik2, uint32_t ik3, uint32_t iv2, uint32_t iv3, uint32_t q_start, uint32_t im3, uint32_t kv_head, uint32_t G,
                                      size_t m_line_bytes, size_t n_rows_q, size_t nek1, size_t prefetch_buf, struct hmx_fa_context * factx) {
     const uint32_t  prefetch_start = b * Bc;
     const uint32_t  prefetch_rows  = hex_smin(Bc, nek1 - prefetch_start);
     const dma_addr_t k_prefetch_src = k->data + prefetch_start * k->nb[1] + ik2 * k->nb[2] + ik3 * k->nb[3];
-    dma_queue_push(dma, dma_make_data(factx->vtcm_k_fp16[prefetch_buf], k_prefetch_src), size_k_row_padded, k->nb[1], size_k_row, prefetch_rows);
+    dma_queue_push(dma_q, dma_make_data(factx->vtcm_k_fp16[prefetch_buf], k_prefetch_src), size_k_row_padded, k->nb[1], size_k_row, prefetch_rows);
     const dma_addr_t v_prefetch_src = v->data + prefetch_start * v->nb[1] + iv2 * v->nb[2] + iv3 * v->nb[3];
-    dma_queue_push(dma, dma_make_data(factx->vtcm_v_fp16[prefetch_buf], v_prefetch_src), size_v_row_padded, v->nb[1], size_v_row, prefetch_rows);
+    dma_queue_push(dma_q, dma_make_data(factx->vtcm_v_fp16[prefetch_buf], v_prefetch_src), size_v_row_padded, v->nb[1], size_v_row, prefetch_rows);
 
     if (mask) {
         if (__builtin_expect(factx->mask_broadcast, true)) {
             const dma_addr_t ms_src = mask->data + q_start * mask->nb[1] + im3 * mask->nb[3] + prefetch_start * sizeof(__fp16);
-            dma_cache_push(dma, &factx->m_cache, ms_src, m_line_bytes, mask->nb[1], prefetch_rows * sizeof(__fp16), n_rows_q);
+            dma_cache_push(dma_q, &factx->m_cache, ms_src, m_line_bytes, mask->nb[1], prefetch_rows * sizeof(__fp16), n_rows_q);
         } else {
-            fa_push_mask_dma_gqa(dma, mask, q_start, im3, prefetch_start, kv_head, G, m_line_bytes, prefetch_rows, n_rows_q, factx);
+            fa_push_mask_dma_gqa(dma_q, mask, q_start, im3, prefetch_start, kv_head, G, m_line_bytes, prefetch_rows, n_rows_q, factx);
         }
     }
 }
@@ -2022,13 +2022,8 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
     hmx_init_column_scales(factx.vtcm_hmx_scales_id, Q6_V_vsplat_R(0x3c00)); // 1.0
     hmx_init_column_scales(factx.vtcm_hmx_scales_qk, hvx_vec_splat_f16(factx.scale));
 
-    // ======== Skip compute if profiling ========
-    if (octx->flags & HTP_OPFLAGS_SKIP_COMPUTE) {
-        return HTP_STATUS_OK;
-    }
-
     // ======== DMA setup ========
-    dma_queue * const dma = ctx->dma[0];
+    dma_queue * const dma_q = ctx->dma[0];
 
     const size_t n_row_tiles_g_br = g_br / HMX_FP16_TILE_N_ROWS;
     const size_t n_tiles_per_bc   = Bc / HMX_FP16_TILE_N_COLS;
@@ -2068,28 +2063,28 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                                             (kv_head * factx.G) * q->nb[2] + ib3 * q->nb[3];
                     const size_t q_row_bytes = q_transposed ? n_rows_q * q_row_bytes_trans_factor : q_row_bytes_untransposed;
                     const size_t n_rows      = q_transposed ? factx.G : n_rows_q;
-                    dma_queue_push(dma, dma_make_data(factx.vtcm_q_dma, q_ptr), q_row_bytes, hex_smax(q_src_stride, q_row_bytes), q_row_bytes, n_rows);
+                    dma_queue_push(dma_q, dma_make_data(factx.vtcm_q_dma, q_ptr), q_row_bytes, hex_smax(q_src_stride, q_row_bytes), q_row_bytes, n_rows);
 
                     if (factx.n_kv_blocks > 0) {
                         const dma_addr_t k_src = k->data + ik2 * k->nb[2] + ik3 * k->nb[3];
-                        dma_queue_push(dma, dma_make_data(factx.vtcm_k_fp16[0], k_src), size_k_row_padded, k->nb[1], size_k_row, kv_rows0);
+                        dma_queue_push(dma_q, dma_make_data(factx.vtcm_k_fp16[0], k_src), size_k_row_padded, k->nb[1], size_k_row, kv_rows0);
 
                         const dma_addr_t v_src = v->data + iv2 * v->nb[2] + iv3 * v->nb[3];
-                        dma_queue_push(dma, dma_make_data(factx.vtcm_v_fp16[0], v_src), size_v_row_padded, v->nb[1], size_v_row, kv_rows0);
+                        dma_queue_push(dma_q, dma_make_data(factx.vtcm_v_fp16[0], v_src), size_v_row_padded, v->nb[1], size_v_row, kv_rows0);
 
                         if (factx.pipeline && mask) {
                             if (__builtin_expect(factx.mask_broadcast, true)) {
                                 const dma_addr_t ms_src = mask->data + q_start * mask->nb[1] + im3 * mask->nb[3] + 0;
-                                dma_cache_push(dma, &factx.m_cache, ms_src, m_line_bytes, mask->nb[1], kv_rows0 * sizeof(__fp16), n_rows_q);
+                                dma_cache_push(dma_q, &factx.m_cache, ms_src, m_line_bytes, mask->nb[1], kv_rows0 * sizeof(__fp16), n_rows_q);
                             } else {
-                                fa_push_mask_dma_gqa(dma, mask, q_start, im3, 0, kv_head, G, m_line_bytes, kv_rows0, n_rows_q, &factx);
+                                fa_push_mask_dma_gqa(dma_q, mask, q_start, im3, 0, kv_head, G, m_line_bytes, kv_rows0, n_rows_q, &factx);
                             }
                         }
                     }
                 }
 
                 // 2. Pop Q DMA (blocks until Q is loaded)
-                dma_queue_pop(dma);
+                dma_queue_pop(dma_q);
 
                 // ---- Load Q block & Initialize per-block state ----
                 fa_phase_q_load(&factx, q, q_start, kv_head, ib3, n_rows_g);
@@ -2116,12 +2111,12 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
 
                     // Prefetch block 1 early if there are multiple blocks
                     if (factx.n_kv_blocks > 1) {
-                        fa_prefetch_block(dma, k, v, mask, 1, Bc, size_k_row_padded, size_k_row, size_v_row_padded, size_v_row,
+                        fa_prefetch_block(dma_q, k, v, mask, 1, Bc, size_k_row_padded, size_k_row, size_v_row_padded, size_v_row,
                                           ik2, ik3, iv2, iv3, q_start, im3, kv_head, G, m_line_bytes, n_rows_q, nek1, 1, &factx);
                     }
 
                     // Prep and start QK-dot(0)
-                    void * curr_k0 = (void *) dma_queue_pop(dma).dst;
+                    void * curr_k0 = (void *) dma_queue_pop(dma_q).dst;
                     fa_phase_k_interleave(&factx, kv_rows0, k_src_stride, curr_k0, 0, 0);
 
                     qk_job[0].q_tiles        = factx.vtcm_q_tiles;
@@ -2140,16 +2135,16 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                         const size_t   n_col_tiles = hmx_ceil_div(kv_rows, HMX_FP16_TILE_N_COLS);
 
                         // ---- 1. Pop and run V-prep for current block ----
-                        void * curr_v = (void *) dma_queue_pop(dma).dst;
+                        void * curr_v = (void *) dma_queue_pop(dma_q).dst;
                         fa_phase_v_interleave(&factx, kv_rows, v_src_stride, curr_v, factx.vtcm_v_tiles[buf_idx], n_tiles_per_bc, kv_start);
 
                         // ---- 2. Pop and run mask-prep for current block ----
                         __fp16 * current_mask_vtcm = NULL;
                         if (mask) {
                             if (__builtin_expect(factx.mask_broadcast, true)) {
-                                current_mask_vtcm = (__fp16 *) dma_queue_pop(dma).dst;
+                                current_mask_vtcm = (__fp16 *) dma_queue_pop(dma_q).dst;
                             } else {
-                                fa_pop_mask_dma_gqa(dma, G);
+                                fa_pop_mask_dma_gqa(dma_q, G);
                                 current_mask_vtcm = factx.vtcm_mask_buf;
                             }
                         }
@@ -2183,7 +2178,7 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                             const uint32_t next_rows  = hex_smin(Bc, nek1 - next_start);
                             const size_t   next_buf   = 1 - buf_idx;
 
-                            void * next_k = (void *) dma_queue_pop(dma).dst;
+                            void * next_k = (void *) dma_queue_pop(dma_q).dst;
                             fa_phase_k_interleave(&factx, next_rows, k_src_stride, next_k, next_start, next_buf);
 
                             qk_job[next_buf].q_tiles        = factx.vtcm_q_tiles;
@@ -2234,7 +2229,7 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
 
                         // Prefetch block kv_blk + 2
                         if (kv_blk + 2 < factx.n_kv_blocks) {
-                            fa_prefetch_block(dma, k, v, mask, kv_blk + 2, Bc, size_k_row_padded, size_k_row, size_v_row_padded, size_v_row,
+                            fa_prefetch_block(dma_q, k, v, mask, kv_blk + 2, Bc, size_k_row_padded, size_k_row, size_v_row_padded, size_v_row,
                                               ik2, ik3, iv2, iv3, q_start, im3, kv_head, G, m_line_bytes, n_rows_q, nek1, buf_idx, &factx);
                         }
 
@@ -2277,9 +2272,9 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                         if (mask) {
                             if (__builtin_expect(factx.mask_broadcast, true)) {
                                 const dma_addr_t ms_src = mask->data + q_start * mask->nb[1] + im3 * mask->nb[3] + kv_start * sizeof(__fp16);
-                                dma_cache_push(dma, &factx.m_cache, ms_src, m_line_bytes, mask->nb[1], kv_rows * sizeof(__fp16), n_rows_q);
+                                dma_cache_push(dma_q, &factx.m_cache, ms_src, m_line_bytes, mask->nb[1], kv_rows * sizeof(__fp16), n_rows_q);
                             } else {
-                                fa_push_mask_dma_gqa(dma, mask, q_start, im3, kv_start, kv_head, G, m_line_bytes, kv_rows, n_rows_q, &factx);
+                                fa_push_mask_dma_gqa(dma_q, mask, q_start, im3, kv_start, kv_head, G, m_line_bytes, kv_rows, n_rows_q, &factx);
                             }
                         }
 
@@ -2288,13 +2283,13 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                             const uint32_t  prefetch_rows  = hex_smin(Bc, nek1 - prefetch_start);
                             const size_t    prefetch_buf   = 1 - buf_idx;
                             const dma_addr_t k_prefetch_src = k->data + prefetch_start * k->nb[1] + ik2 * k->nb[2] + ik3 * k->nb[3];
-                            dma_queue_push(dma, dma_make_data(factx.vtcm_k_fp16[prefetch_buf], k_prefetch_src), size_k_row_padded, k->nb[1], size_k_row, prefetch_rows);
+                            dma_queue_push(dma_q, dma_make_data(factx.vtcm_k_fp16[prefetch_buf], k_prefetch_src), size_k_row_padded, k->nb[1], size_k_row, prefetch_rows);
                             const dma_addr_t v_prefetch_src = v->data + prefetch_start * v->nb[1] + iv2 * v->nb[2] + iv3 * v->nb[3];
-                            dma_queue_push(dma, dma_make_data(factx.vtcm_v_fp16[prefetch_buf], v_prefetch_src), size_v_row_padded, v->nb[1], size_v_row, prefetch_rows);
+                            dma_queue_push(dma_q, dma_make_data(factx.vtcm_v_fp16[prefetch_buf], v_prefetch_src), size_v_row_padded, v->nb[1], size_v_row, prefetch_rows);
                         }
 
                         // Wait for current K DMA and interleave
-                        void * curr_k = (void *) dma_queue_pop(dma).dst;
+                        void * curr_k = (void *) dma_queue_pop(dma_q).dst;
                         fa_phase_k_interleave(&factx, kv_rows, k_src_stride, curr_k, kv_start, 0);
 
                         {
@@ -2312,16 +2307,16 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                         }
 
                         // Wait for current V DMA and interleave
-                        void * curr_v = (void *) dma_queue_pop(dma).dst;
+                        void * curr_v = (void *) dma_queue_pop(dma_q).dst;
                         fa_phase_v_interleave(&factx, kv_rows, v_src_stride, curr_v, factx.vtcm_v_tiles[0], n_tiles_per_bc, kv_start);
 
                         // ---- Phase 3: softmax + build_D ----
                         __fp16 * current_mask_vtcm = NULL;
                         if (mask) {
                             if (__builtin_expect(factx.mask_broadcast, true)) {
-                                current_mask_vtcm = (__fp16 *) dma_queue_pop(dma).dst;
+                                current_mask_vtcm = (__fp16 *) dma_queue_pop(dma_q).dst;
                             } else {
-                                fa_pop_mask_dma_gqa(dma, G);
+                                fa_pop_mask_dma_gqa(dma_q, G);
                                 current_mask_vtcm = factx.vtcm_mask_buf;
                             }
                         }
@@ -2396,7 +2391,7 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                     const dma_addr_t next_q_ptr = q->data + next_q_start * q->nb[1] + (next_kv_head * factx.G) * q->nb[2] + next_ib3 * q->nb[3];
                     const size_t next_q_row_bytes = q_transposed ? next_n_rows_q * q_row_bytes_trans_factor : q_row_bytes_untransposed;
                     const size_t next_n_rows      = q_transposed ? factx.G : next_n_rows_q;
-                    dma_queue_push(dma, dma_make_data(factx.vtcm_q_dma, next_q_ptr), next_q_row_bytes, hex_smax(q_src_stride, next_q_row_bytes), next_q_row_bytes, next_n_rows);
+                    dma_queue_push(dma_q, dma_make_data(factx.vtcm_q_dma, next_q_ptr), next_q_row_bytes, hex_smax(q_src_stride, next_q_row_bytes), next_q_row_bytes, next_n_rows);
 
                     if (factx.n_kv_blocks > 0) {
                         const uint32_t next_ik2 = next_kv_head;
@@ -2409,10 +2404,10 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                         }
 
                         const dma_addr_t next_k_src = k->data + next_ik2 * k->nb[2] + next_ik3 * k->nb[3];
-                        dma_queue_push(dma, dma_make_data(factx.vtcm_k_fp16[0], next_k_src), size_k_row_padded, k->nb[1], size_k_row, kv_rows0);
+                        dma_queue_push(dma_q, dma_make_data(factx.vtcm_k_fp16[0], next_k_src), size_k_row_padded, k->nb[1], size_k_row, kv_rows0);
 
                         const dma_addr_t next_v_src = v->data + next_iv2 * v->nb[2] + next_iv3 * v->nb[3];
-                        dma_queue_push(dma, dma_make_data(factx.vtcm_v_fp16[0], next_v_src), size_v_row_padded, v->nb[1], size_v_row, kv_rows0);
+                        dma_queue_push(dma_q, dma_make_data(factx.vtcm_v_fp16[0], next_v_src), size_v_row_padded, v->nb[1], size_v_row, kv_rows0);
 
                         if (factx.pipeline && mask) {
                             uint32_t next_im3 = im3;
@@ -2421,9 +2416,9 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                             }
                             if (__builtin_expect(factx.mask_broadcast, true)) {
                                 const dma_addr_t ms_src = mask->data + next_q_start * mask->nb[1] + next_im3 * mask->nb[3] + 0;
-                                dma_cache_push(dma, &factx.m_cache, ms_src, m_line_bytes, mask->nb[1], kv_rows0 * sizeof(__fp16), next_n_rows_q);
+                                dma_cache_push(dma_q, &factx.m_cache, ms_src, m_line_bytes, mask->nb[1], kv_rows0 * sizeof(__fp16), next_n_rows_q);
                             } else {
-                                fa_push_mask_dma_gqa(dma, mask, next_q_start, next_im3, 0, next_kv_head, G, m_line_bytes, kv_rows0, next_n_rows_q, &factx);
+                                fa_push_mask_dma_gqa(dma_q, mask, next_q_start, next_im3, 0, next_kv_head, G, m_line_bytes, kv_rows0, next_n_rows_q, &factx);
                             }
                         }
                     }
@@ -2462,6 +2457,10 @@ int op_flash_attn_ext(struct htp_ops_context * octx) {
     if ((q->type != HTP_TYPE_F16 && q->type != HTP_TYPE_F32) ||
         (k->type != HTP_TYPE_F16 && k->type != HTP_TYPE_Q8_0) ||
         (v->type != HTP_TYPE_F16 && v->type != HTP_TYPE_Q8_0)) {
+        return HTP_STATUS_NO_SUPPORT;
+    }
+
+    if (htp_tensor_is_extended(dst) || (octx->src[4] && htp_tensor_is_extended(octx->src[4]))) {
         return HTP_STATUS_NO_SUPPORT;
     }
 
@@ -2568,9 +2567,7 @@ int op_flash_attn_ext(struct htp_ops_context * octx) {
         return HTP_STATUS_VTCM_TOO_SMALL;
     }
 
-    if (!(octx->flags & HTP_OPFLAGS_SKIP_COMPUTE)) {
-        work_queue_run(octx->ctx->work_queue, flash_attn_ext_f16_thread, &factx, n_threads);
-    }
+    work_queue_run(octx->ctx->work_queue, flash_attn_ext_f16_thread, &factx, n_threads);
 
     return HTP_STATUS_OK;
 }

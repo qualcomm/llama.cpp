@@ -611,7 +611,7 @@ static void gated_delta_net_f32_pp_thread(unsigned int nth, unsigned int ith, vo
     float local_k[HTP_GDN_MAX_SV] __attribute__((aligned(128)));
     float local_sums[32] __attribute__((aligned(128)));
 
-    dma_queue * dma = octx->ctx->dma[ith];
+    dma_queue * dma_q = octx->ctx->dma[ith];
     size_t state_aligned = (size_t) S_v * S_v * sizeof(float);
     state_aligned = (state_aligned + 127) & ~(size_t)127;
     float * s_work[2];
@@ -639,12 +639,12 @@ static void gated_delta_net_f32_pp_thread(unsigned int nth, unsigned int ith, vo
         float * ps_out = state_out_base + ((uint64_t) piv3 * H + piv1) * S_v * S_v;
 
         // Push dummy write-back
-        dma_queue_push(dma, dma_make_data(ps_out, s_work[spad_idx]),
+        dma_queue_push(dma_q, dma_make_data(ps_out, s_work[spad_idx]),
                        S_v * sizeof(float), S_v * sizeof(float),
                        S_v * sizeof(float), 0);
 
         // Push fetch
-        dma_queue_push(dma, dma_make_data(s_work[spad_idx], ps_in),
+        dma_queue_push(dma_q, dma_make_data(s_work[spad_idx], ps_in),
                        S_v * sizeof(float), S_v * sizeof(float),
                        S_v * sizeof(float), S_v);
 
@@ -657,8 +657,8 @@ static void gated_delta_net_f32_pp_thread(unsigned int nth, unsigned int ith, vo
 
     int curr_spad_idx = 0;
     for (uint32_t ir = gctx->row_start + ith; ir < row_end; ir += nth) {
-        dma_queue_pop(dma);
-        dma_queue_pop(dma);
+        dma_queue_pop(dma_q);
+        dma_queue_pop(dma_q);
 
         float * s_work_curr = s_work[curr_spad_idx];
 
@@ -816,7 +816,7 @@ static void gated_delta_net_f32_pp_thread(unsigned int nth, unsigned int ith, vo
         }
 
         // Push real write-back
-        dma_queue_push(dma, dma_make_data(s_out, s_work_curr),
+        dma_queue_push(dma_q, dma_make_data(s_out, s_work_curr),
                        S_v * sizeof(float), S_v * sizeof(float),
                        S_v * sizeof(float), S_v);
 
@@ -826,7 +826,7 @@ static void gated_delta_net_f32_pp_thread(unsigned int nth, unsigned int ith, vo
             const uint32_t piv3 = fastdiv(ir_prefetch, &fd_H);
             const float * ps_in = state_in_base + (uint64_t) piv3 * state_seq_stride + (uint64_t) piv1 * S_v * S_v;
 
-            dma_queue_push(dma, dma_make_data(s_work[spad_idx], ps_in),
+            dma_queue_push(dma_q, dma_make_data(s_work[spad_idx], ps_in),
                            S_v * sizeof(float), S_v * sizeof(float),
                            S_v * sizeof(float), S_v);
 
@@ -836,7 +836,7 @@ static void gated_delta_net_f32_pp_thread(unsigned int nth, unsigned int ith, vo
 
         curr_spad_idx ^= 1;
     }
-    dma_queue_flush(dma);
+    dma_queue_flush(dma_q);
     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) row_end);
 }
 
@@ -877,7 +877,7 @@ static void gated_delta_net_f32_tg_thread(unsigned int nth, unsigned int ith, vo
     float local_k[HTP_GDN_MAX_SV] __attribute__((aligned(128)));
     float local_sums[32] __attribute__((aligned(128)));
 
-    dma_queue * dma = octx->ctx->dma[ith];
+    dma_queue * dma_q = octx->ctx->dma[ith];
     size_t state_aligned = (size_t) S_v * S_v * sizeof(float);
     state_aligned = (state_aligned + 127) & ~(size_t)127;
     float * s_work[2];
@@ -904,12 +904,12 @@ static void gated_delta_net_f32_tg_thread(unsigned int nth, unsigned int ith, vo
         float * ps_out = state_out_base + ((uint64_t) piv3 * H + piv1) * S_v * S_v;
 
         // Push dummy write-back
-        dma_queue_push(dma, dma_make_data(ps_out, s_work[spad_idx]),
+        dma_queue_push(dma_q, dma_make_data(ps_out, s_work[spad_idx]),
                        S_v * sizeof(float), S_v * sizeof(float),
                        S_v * sizeof(float), 0);
 
         // Push fetch
-        dma_queue_push(dma, dma_make_data(s_work[spad_idx], ps_in),
+        dma_queue_push(dma_q, dma_make_data(s_work[spad_idx], ps_in),
                        S_v * sizeof(float), S_v * sizeof(float),
                        S_v * sizeof(float), S_v);
 
@@ -922,8 +922,8 @@ static void gated_delta_net_f32_tg_thread(unsigned int nth, unsigned int ith, vo
 
     int curr_spad_idx = 0;
     for (uint32_t ir = gctx->row_start + ith; ir < row_end; ir += nth) {
-        dma_queue_pop(dma);
-        dma_queue_pop(dma);
+        dma_queue_pop(dma_q);
+        dma_queue_pop(dma_q);
 
         float * s_work_curr = s_work[curr_spad_idx];
 
@@ -1066,7 +1066,7 @@ static void gated_delta_net_f32_tg_thread(unsigned int nth, unsigned int ith, vo
         }
 
         // Push real write-back
-        dma_queue_push(dma, dma_make_data(s_out, s_work_curr),
+        dma_queue_push(dma_q, dma_make_data(s_out, s_work_curr),
                        S_v * sizeof(float), S_v * sizeof(float),
                        S_v * sizeof(float), S_v);
 
@@ -1076,7 +1076,7 @@ static void gated_delta_net_f32_tg_thread(unsigned int nth, unsigned int ith, vo
             const uint32_t piv3 = fastdiv(ir_prefetch, &fd_H);
             const float * ps_in = state_in_base + (uint64_t) piv3 * state_seq_stride + (uint64_t) piv1 * S_v * S_v;
 
-            dma_queue_push(dma, dma_make_data(s_work[spad_idx], ps_in),
+            dma_queue_push(dma_q, dma_make_data(s_work[spad_idx], ps_in),
                            S_v * sizeof(float), S_v * sizeof(float),
                            S_v * sizeof(float), S_v);
 
@@ -1086,7 +1086,7 @@ static void gated_delta_net_f32_tg_thread(unsigned int nth, unsigned int ith, vo
 
         curr_spad_idx ^= 1;
     }
-    dma_queue_flush(dma);
+    dma_queue_flush(dma_q);
     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) row_end);
 }
 
@@ -1131,8 +1131,13 @@ int op_gated_delta_net(struct htp_ops_context * octx) {
         return HTP_STATUS_NO_SUPPORT;
     }
 
-    if (octx->flags & HTP_OPFLAGS_SKIP_COMPUTE) {
-        return HTP_STATUS_OK;
+    for (int i = 0; i < 6; i++) {
+        if (htp_tensor_is_extended(octx->src[i])) {
+            return HTP_STATUS_NO_SUPPORT;
+        }
+    }
+    if (htp_tensor_is_extended(dst)) {
+        return HTP_STATUS_NO_SUPPORT;
     }
 
     const uint32_t total_rows = H * n_seqs;

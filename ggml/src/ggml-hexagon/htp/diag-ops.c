@@ -59,7 +59,7 @@ static inline void hvx_diag_row_f32(const float * restrict src, float * restrict
 
 static void diag_thread_f32_dma(unsigned int nth, unsigned int ith, void * data) {
     htp_diag_preamble;
-    dma_queue * dma_queue = octx->ctx->dma[ith];
+    dma_queue * dma_q = octx->ctx->dma[ith];
 
     const uint32_t ib0 = dctx->batch_start + dctx->batches_per_thread * ith;
     const uint32_t ib1 = MIN(ib0 + dctx->batches_per_thread, dctx->batch_start + dctx->total_batches);
@@ -89,10 +89,10 @@ static void diag_thread_f32_dma(unsigned int nth, unsigned int ith, void * data)
         const dma_addr_t src_batch = src_data + i3 * nb03 + i2 * nb02;
 
         // Fetch source vector into VTCM
-        dma_queue_push(dma_queue,
+        dma_queue_push(dma_q,
                        dma_make_data(src_spad, src_batch),
                        src_batch_size_aligned, src_batch_size, src_batch_size, 1);
-        dma_queue_flush(dma_queue);
+        dma_queue_flush(dma_q);
 
         const float * src_spad_f32 = (const float *) src_spad;
         float       * dst_spad_f32 = (float *) dst_spad;
@@ -105,10 +105,10 @@ static void diag_thread_f32_dma(unsigned int nth, unsigned int ith, void * data)
 
             // Write completed row back to DDR
             const dma_addr_t dst_row = dst_data + i3 * nb3 + i2 * nb2 + i1 * nb1;
-            dma_queue_push(dma_queue,
+            dma_queue_push(dma_q,
                            dma_make_data(dst_row, dst_spad),
                            dst_row_size, dst_row_size_aligned, dst_row_size, 1);
-            dma_queue_flush(dma_queue);
+            dma_queue_flush(dma_q);
         }
     }
 
@@ -155,10 +155,6 @@ static void diag_thread_f32(unsigned int nth, unsigned int ith, void * data) {
 int op_diag_f32(struct htp_ops_context * octx) {
     const struct htp_tensor * src0 = octx->src[0];
     const struct htp_tensor * dst  = octx->dst;
-
-    if (octx->flags & HTP_OPFLAGS_SKIP_COMPUTE) {
-        return HTP_STATUS_OK;
-    }
 
     const uint32_t total_batches = src0->ne[2] * src0->ne[3];
     const size_t dst_batch_size  = dst->ne[1] * dst->nb[1];
@@ -221,6 +217,9 @@ int op_diag_f32(struct htp_ops_context * octx) {
     };
 
     if (octx->ctx->vtcm_size < spad_per_thread * n_threads) {
+        if (htp_tensor_is_extended(src0) || htp_tensor_is_extended(dst)) {
+            return HTP_STATUS_NO_SUPPORT;
+        }
         work_queue_run(octx->ctx->work_queue, diag_thread_f32, &dctx, n_threads);
     } else {
         work_queue_run(octx->ctx->work_queue, diag_thread_f32_dma, &dctx, n_threads);

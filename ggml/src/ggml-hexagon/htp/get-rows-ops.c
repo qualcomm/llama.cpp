@@ -227,8 +227,8 @@ int op_get_rows(struct htp_ops_context * octx) {
         return HTP_STATUS_NO_SUPPORT;
     }
 
-    if (octx->flags & HTP_OPFLAGS_SKIP_COMPUTE) {
-        return HTP_STATUS_OK;
+    if (htp_tensor_is_extended(octx->src[1])) {
+        return HTP_STATUS_NO_SUPPORT;
     }
 
     const struct htp_tensor * dst = octx->dst;

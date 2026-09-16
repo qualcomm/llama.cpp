@@ -385,104 +385,100 @@ static void geglu_quick_f32(const float * restrict src0,
     }
 }
 
-#define DEFINE_GLU_PER_THREAD(NAME, OP_STR, CORE_EXPR)                                                                   \
-    static void glu_##NAME##_f32_per_thread(unsigned int nth, unsigned int ith, void * data) {                           \
-        struct htp_act_context * actx = (struct htp_act_context *) data;                                                 \
-        htp_act_preamble;                                                                                                \
-                                                                                                                         \
-        struct htp_thread_trace * tr = actx->octx->ctx ? &actx->octx->ctx->trace[ith] : NULL;                            \
-                                                                                                                         \
-        size_t src0_row_size = actx->src0_row_size;                                                                      \
-        size_t src1_row_size = actx->src1_row_size;                                                                      \
-        size_t dst_row_size  = actx->dst_row_size;                                                                       \
-                                                                                                                         \
-        size_t src0_row_stride = actx->src0_row_stride;                                                                  \
-        size_t src1_row_stride = actx->src1_row_stride;                                                                  \
-                                                                                                                         \
-        const uint32_t src0_nrows            = actx->src0_nrows;                                                         \
-        const uint32_t src0_nrows_per_thread = actx->src0_nrows_per_thread;                                              \
-                                                                                                                         \
-        const uint32_t src0_start_row = actx->row_start + src0_nrows_per_thread * ith;                                   \
-        const uint32_t src0_end_row   = MIN(src0_start_row + src0_nrows_per_thread, actx->row_start + src0_nrows);       \
-                                                                                                                         \
-        /* no work for this thread */                                                                                    \
-        if (src0_start_row >= src0_end_row) {                                                                            \
-            return;                                                                                                      \
-        }                                                                                                                \
-                                                                                                                         \
-        const dma_addr_t data_src0 = actx->data_src0;                                                                    \
-        const dma_addr_t data_src1 = actx->data_src1;                                                                    \
-        const dma_addr_t data_dst  = actx->data_dst;                                                                     \
-                                                                                                                         \
-        const size_t src0_row_size_aligned = actx->src0_row_size_aligned;                                                \
-        const size_t src1_row_size_aligned = actx->src1_row_size_aligned;                                                \
-        const size_t dst_row_size_aligned  = actx->dst_row_size_aligned;                                                 \
-                                                                                                                         \
-        uint8_t * restrict src0_spad_data = actx->vtcm_src0 + (ith * actx->vtcm_src0_size_per_thread);                   \
-        uint8_t * restrict src1_spad_data = actx->vtcm_src1 + (ith * actx->vtcm_src1_size_per_thread);                   \
-        uint8_t * restrict dst_spad_data  = actx->vtcm_dst  + (ith * actx->vtcm_dst_size_per_thread);                    \
-                                                                                                                         \
-        size_t src0_spad_half_size = actx->src0_spad_half_size;                                                          \
-        size_t src1_spad_half_size = actx->src1_spad_half_size;                                                          \
-        size_t dst_spad_half_size  = actx->dst_spad_half_size;                                                           \
-                                                                                                                         \
-        const int BLOCK = actx->block;                                                                                   \
-        if (BLOCK == 0) {                                                                                                \
-            FARF(ERROR,                                                                                                  \
-                 OP_STR                                                                                                  \
-                 " : current VTCM reservation %zu is too small for even 1 row per thread, needed at least %zu\n",        \
-                 actx->vtcm_src0_size_per_thread, src0_row_size_aligned);                                                \
-            return;                                                                                                      \
-        }                                                                                                                \
-                                                                                                                         \
-        dma_queue * dma_queue = actx->octx->ctx->dma[ith];                                                               \
-                                                                                                                         \
-        /* See discussion: https://github.com/ggml-org/llama.cpp/pull/18151#issuecomment-3678235379 */                   \
-        for (uint32_t ir = src0_start_row, spad_idx = 0; ir < src0_end_row && spad_idx < 2; ir += BLOCK, spad_idx++) {   \
-            const uint32_t block_size = MIN(BLOCK, src0_end_row - ir);                                                   \
-                                                                                                                         \
-            /* Dummy DMA transation for sequencing (interleaving dst,src,dst,...) */                                     \
-            dma_queue_push(dma_queue,                                                                                    \
-                           dma_make_data(data_dst, dst_spad_data + (spad_idx * dst_spad_half_size)),                     \
-                           dst_row_size, dst_row_size_aligned, dst_row_size, 0);                                         \
-                                                                                                                         \
-            dma_queue_push(                                                                                              \
-                dma_queue,                                                                                               \
-                dma_make_data(src0_spad_data + (spad_idx * src0_spad_half_size), data_src0 + (ir * src0_row_stride)),    \
-                src0_row_size_aligned, src0_row_stride, src0_row_size, block_size);                                      \
-            dma_queue_push(                                                                                              \
-                dma_queue,                                                                                               \
-                dma_make_data(src1_spad_data + (spad_idx * src1_spad_half_size), data_src1 + (ir * src1_row_stride)),    \
-                src1_row_size_aligned, src1_row_stride, src1_row_size, block_size);                                      \
-        }                                                                                                                \
-                                                                                                                         \
-        for (uint32_t ir = src0_start_row; ir < src0_end_row; ir += BLOCK) {                                             \
-            const uint32_t block_size = MIN(BLOCK, src0_end_row - ir);                                                   \
-                                                                                                                         \
-            float * dst_spad  = (float *) dma_queue_pop(dma_queue).src;                                                  \
-            float * src0_spad = (float *) dma_queue_pop(dma_queue).dst;                                                  \
-            float * src1_spad = (float *) dma_queue_pop(dma_queue).dst;                                                  \
-                                                                                                                         \
-            htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, ir);                                                       \
-            CORE_EXPR;                                                                                                   \
-            htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, ir);                                                        \
-                                                                                                                         \
-            dma_queue_push(dma_queue, dma_make_data(data_dst + (ir * dst_row_size), dst_spad),                           \
-                           dst_row_size, dst_row_size_aligned, dst_row_size, block_size);                                \
-                                                                                                                         \
-            /* prefetch N+2 loop iteration if any */                                                                     \
-            const uint32_t pref_block = (ir + BLOCK * 2);                                                                \
-            if (pref_block < src0_end_row) {                                                                             \
-                const uint32_t pref_block_size = MIN(BLOCK, src0_end_row - pref_block);                                  \
-                dma_queue_push(dma_queue, dma_make_data(src0_spad, data_src0 + (pref_block * src0_row_stride)),          \
-                               src0_row_size_aligned, src0_row_stride, src0_row_size, pref_block_size);                  \
-                dma_queue_push(dma_queue, dma_make_data(src1_spad, data_src1 + (pref_block * src1_row_stride)),          \
-                               src1_row_size_aligned, src1_row_stride, src1_row_size, pref_block_size);                  \
-            }                                                                                                            \
-        }                                                                                                                \
-                                                                                                                         \
-        dma_queue_flush(dma_queue);                                                                                      \
-                                                                                                                         \
+#define DEFINE_GLU_PER_THREAD(NAME, OP_STR, CORE_EXPR)                                                                 \
+    static void glu_##NAME##_f32_per_thread(unsigned int nth, unsigned int ith, void * data) {                         \
+        struct htp_act_context * actx = (struct htp_act_context *) data;                                               \
+        htp_act_preamble;                                                                                              \
+                                                                                                                       \
+        struct htp_thread_trace * tr = actx->octx->ctx ? &actx->octx->ctx->trace[ith] : NULL;                          \
+                                                                                                                       \
+        size_t src0_row_size = actx->src0_row_size;                                                                    \
+        size_t src1_row_size = actx->src1_row_size;                                                                    \
+        size_t dst_row_size  = actx->dst_row_size;                                                                     \
+                                                                                                                       \
+        size_t src0_row_stride = actx->src0_row_stride;                                                                \
+        size_t src1_row_stride = actx->src1_row_stride;                                                                \
+                                                                                                                       \
+        const uint32_t src0_nrows            = actx->src0_nrows;                                                       \
+        const uint32_t src0_nrows_per_thread = actx->src0_nrows_per_thread;                                            \
+                                                                                                                       \
+        const uint32_t src0_start_row = actx->row_start + src0_nrows_per_thread * ith;                                 \
+        const uint32_t src0_end_row   = MIN(src0_start_row + src0_nrows_per_thread, actx->row_start + src0_nrows);     \
+                                                                                                                       \
+        /* no work for this thread */                                                                                  \
+        if (src0_start_row >= src0_end_row) {                                                                          \
+            return;                                                                                                    \
+        }                                                                                                              \
+                                                                                                                       \
+        const dma_addr_t data_src0 = actx->data_src0;                                                                  \
+        const dma_addr_t data_src1 = actx->data_src1;                                                                  \
+        const dma_addr_t data_dst  = actx->data_dst;                                                                   \
+                                                                                                                       \
+        const size_t src0_row_size_aligned = actx->src0_row_size_aligned;                                              \
+        const size_t src1_row_size_aligned = actx->src1_row_size_aligned;                                              \
+        const size_t dst_row_size_aligned  = actx->dst_row_size_aligned;                                               \
+                                                                                                                       \
+        uint8_t * restrict src0_spad_data = actx->vtcm_src0 + (ith * actx->vtcm_src0_size_per_thread);                 \
+        uint8_t * restrict src1_spad_data = actx->vtcm_src1 + (ith * actx->vtcm_src1_size_per_thread);                 \
+        uint8_t * restrict dst_spad_data  = actx->vtcm_dst  + (ith * actx->vtcm_dst_size_per_thread);                  \
+                                                                                                                       \
+        size_t src0_spad_half_size = actx->src0_spad_half_size;                                                        \
+        size_t src1_spad_half_size = actx->src1_spad_half_size;                                                        \
+        size_t dst_spad_half_size  = actx->dst_spad_half_size;                                                         \
+                                                                                                                       \
+        const int BLOCK = actx->block;                                                                                 \
+        if (BLOCK == 0) {                                                                                              \
+            FARF(ERROR, OP_STR " : VTCM reservation %zu is too small, needed %zu\n",                                   \
+                 actx->vtcm_src0_size_per_thread, src0_row_size_aligned);                                              \
+            return;                                                                                                    \
+        }                                                                                                              \
+                                                                                                                       \
+        dma_queue * dma_q = actx->octx->ctx->dma[ith];                                                                 \
+                                                                                                                       \
+        for (uint32_t ir = src0_start_row, spad_idx = 0; ir < src0_end_row && spad_idx < 2; ir += BLOCK, spad_idx++) { \
+            const uint32_t block_size = MIN(BLOCK, src0_end_row - ir);                                                 \
+                                                                                                                       \
+            /* Dummy DMA transation for sequencing (interleaving dst,src,dst,...) */                                   \
+            dma_queue_push(dma_q,                                                                                      \
+                           dma_make_data(data_dst, dst_spad_data + (spad_idx * dst_spad_half_size)),                   \
+                           dst_row_size, dst_row_size_aligned, dst_row_size, 0);                                       \
+                                                                                                                       \
+            dma_queue_push(                                                                                            \
+                dma_q,                                                                                                 \
+                dma_make_data(src0_spad_data + (spad_idx * src0_spad_half_size), data_src0 + (ir * src0_row_stride)),  \
+                src0_row_size_aligned, src0_row_stride, src0_row_size, block_size);                                    \
+            dma_queue_push(                                                                                            \
+                dma_q,                                                                                                 \
+                dma_make_data(src1_spad_data + (spad_idx * src1_spad_half_size), data_src1 + (ir * src1_row_stride)),  \
+                src1_row_size_aligned, src1_row_stride, src1_row_size, block_size);                                    \
+        }                                                                                                              \
+                                                                                                                       \
+        for (uint32_t ir = src0_start_row; ir < src0_end_row; ir += BLOCK) {                                           \
+            const uint32_t block_size = MIN(BLOCK, src0_end_row - ir);                                                 \
+                                                                                                                       \
+            float * dst_spad  = (float *) dma_queue_pop(dma_q).src;                                                    \
+            float * src0_spad = (float *) dma_queue_pop(dma_q).dst;                                                    \
+            float * src1_spad = (float *) dma_queue_pop(dma_q).dst;                                                    \
+                                                                                                                       \
+            htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, ir);                                                     \
+            CORE_EXPR;                                                                                                 \
+            htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, ir);                                                      \
+                                                                                                                       \
+            dma_queue_push(dma_q, dma_make_data(data_dst + (ir * dst_row_size), dst_spad),                             \
+                           dst_row_size, dst_row_size_aligned, dst_row_size, block_size);                              \
+                                                                                                                       \
+            /* prefetch N+2 loop iteration if any */                                                                   \
+            const uint32_t pref_block = (ir + BLOCK * 2);                                                              \
+            if (pref_block < src0_end_row) {                                                                           \
+                const uint32_t pref_block_size = MIN(BLOCK, src0_end_row - pref_block);                                \
+                dma_queue_push(dma_q, dma_make_data(src0_spad, data_src0 + (pref_block * src0_row_stride)),            \
+                               src0_row_size_aligned, src0_row_stride, src0_row_size, pref_block_size);                \
+                dma_queue_push(dma_q, dma_make_data(src1_spad, data_src1 + (pref_block * src1_row_stride)),            \
+                               src1_row_size_aligned, src1_row_stride, src1_row_size, pref_block_size);                \
+            }                                                                                                          \
+        }                                                                                                              \
+                                                                                                                       \
+        dma_queue_flush(dma_q);                                                                                        \
     }
 
 DEFINE_GLU_PER_THREAD(swiglu, "swiglu-f32", swiglu_f32(src0_spad, src1_spad, dst_spad, block_size, actx))
@@ -586,10 +582,6 @@ static int execute_op_activations_f32(struct htp_ops_context * octx) {
         FARF(HIGH, "%s: %ux%ux%ux%u -> %ux%ux%ux%u : src0-vtcm-size %zu src1-vtcm-size %zu dst-vtcm-size %zu\n", op_type,
              src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3], dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],
              L.src0_bytes_per_thread * n_threads, L.src1_bytes_per_thread * n_threads, L.dst_bytes_per_thread * n_threads);
-    }
-
-    if ((octx->flags & HTP_OPFLAGS_SKIP_COMPUTE)) {
-        return HTP_STATUS_OK;
     }
 
     // Prepare context

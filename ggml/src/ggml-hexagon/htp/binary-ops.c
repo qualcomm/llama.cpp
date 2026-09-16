@@ -885,16 +885,16 @@ static int execute_op_binary(struct htp_ops_context * octx) {
         }
     }
 
+    if (octx->op == HTP_OP_ADD_ID && htp_tensor_is_extended(octx->src[2])) {
+        return HTP_STATUS_NO_SUPPORT;
+    }
+
     struct htp_binary_context bctx;
     bctx.vtcm_base = (uint8_t *) octx->ctx->vtcm_base;
     htp_binary_vtcm_layout_build(&bctx.vtcm_layout, kparams, octx->ctx->vtcm_size);
 
     if (bctx.vtcm_layout.rows_per_buffer == 0 || bctx.vtcm_layout.total_bytes > octx->ctx->vtcm_size) {
         return HTP_STATUS_VTCM_TOO_SMALL;
-    }
-
-    if ((octx->flags & HTP_OPFLAGS_SKIP_COMPUTE)) {
-        return HTP_STATUS_OK;
     }
 
     dma_queue * dma_q = octx->ctx->dma[0];

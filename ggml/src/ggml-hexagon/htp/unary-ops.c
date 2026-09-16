@@ -1207,113 +1207,111 @@ static int execute_op_unary(struct htp_ops_context * octx) {
          src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3], dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],
          kparams->vtcm_src0_size, kparams->vtcm_src1_size, kparams->vtcm_dst_size);
 
-    if (!(octx->flags & HTP_OPFLAGS_SKIP_COMPUTE)) {
-        uint8_t * const base = (uint8_t *) octx->ctx->vtcm_base;
-        struct htp_unary_context uctx = {
-            .octx                  = octx,
-            .kparams               = kparams,
-            .src0_nrows_per_thread = fastdiv(nrows + n_threads - 1, &octx->n_threads_div),
-            .src0_nrows            = nrows,
-            .row_start             = row_start,
+    uint8_t * const base = (uint8_t *) octx->ctx->vtcm_base;
+    struct htp_unary_context uctx = {
+        .octx                  = octx,
+        .kparams               = kparams,
+        .src0_nrows_per_thread = fastdiv(nrows + n_threads - 1, &octx->n_threads_div),
+        .src0_nrows            = nrows,
+        .row_start             = row_start,
 
-            .data_src0             = src0->data,
-            .data_src1             = (octx->op == HTP_OP_RMS_NORM_MUL) ? src1->data : 0,
-            .data_dst              = dst->data,
+        .data_src0             = src0->data,
+        .data_src1             = (octx->op == HTP_OP_RMS_NORM_MUL) ? src1->data : 0,
+        .data_dst              = dst->data,
 
-            .src0_data_row_size    = src0_data_row_size,
-            .src1_data_row_size    = src1_data_row_size,
-            .dst_data_row_size     = dst_data_row_size,
+        .src0_data_row_size    = src0_data_row_size,
+        .src1_data_row_size    = src1_data_row_size,
+        .dst_data_row_size     = dst_data_row_size,
 
-            .src0_row_size_aligned = src0_row_size_aligned,
-            .src1_row_size_aligned = src1_row_size_aligned,
-            .dst_row_size_aligned  = dst_row_size_aligned,
+        .src0_row_size_aligned = src0_row_size_aligned,
+        .src1_row_size_aligned = src1_row_size_aligned,
+        .dst_row_size_aligned  = dst_row_size_aligned,
 
-            .src0_vtcm_half_size   = kparams->vtcm_src0_size_per_thread / 2,
-            .src1_vtcm_half_size   = (octx->op == HTP_OP_RMS_NORM_MUL) ? (kparams->vtcm_src1_size_per_thread / (broadcast_weight ? 1 : 2)) : 0,
-            .dst_vtcm_half_size    = kparams->vtcm_dst_size_per_thread / 2,
+        .src0_vtcm_half_size   = kparams->vtcm_src0_size_per_thread / 2,
+        .src1_vtcm_half_size   = (octx->op == HTP_OP_RMS_NORM_MUL) ? (kparams->vtcm_src1_size_per_thread / (broadcast_weight ? 1 : 2)) : 0,
+        .dst_vtcm_half_size    = kparams->vtcm_dst_size_per_thread / 2,
 
-            .block                 = kparams->block,
-            .nc                    = src0->ne[0],
-            .col_tile              = col_tile,
-            .broadcast_weight      = broadcast_weight,
+        .block                 = kparams->block,
+        .nc                    = src0->ne[0],
+        .col_tile              = col_tile,
+        .broadcast_weight      = broadcast_weight,
 
-            .vtcm_src0             = VTCM_LAYOUT_PTR(uint8_t, base, 0),
-            .vtcm_src1             = VTCM_LAYOUT_PTR_OPTIONAL(uint8_t, base, kparams->vtcm_src0_size, kparams->vtcm_src1_size > 0),
-            .vtcm_dst              = VTCM_LAYOUT_PTR(uint8_t, base, kparams->vtcm_src0_size + kparams->vtcm_src1_size),
+        .vtcm_src0             = VTCM_LAYOUT_PTR(uint8_t, base, 0),
+        .vtcm_src1             = VTCM_LAYOUT_PTR_OPTIONAL(uint8_t, base, kparams->vtcm_src0_size, kparams->vtcm_src1_size > 0),
+        .vtcm_dst              = VTCM_LAYOUT_PTR(uint8_t, base, kparams->vtcm_src0_size + kparams->vtcm_src1_size),
 
-            .vtcm_src0_size_per_thread = kparams->vtcm_src0_size_per_thread,
-            .vtcm_src1_size_per_thread = kparams->vtcm_src1_size_per_thread,
-            .vtcm_dst_size_per_thread  = kparams->vtcm_dst_size_per_thread,
-        };
+        .vtcm_src0_size_per_thread = kparams->vtcm_src0_size_per_thread,
+        .vtcm_src1_size_per_thread = kparams->vtcm_src1_size_per_thread,
+        .vtcm_dst_size_per_thread  = kparams->vtcm_dst_size_per_thread,
+    };
 
-        FARF(HIGH, "%s: %s mode (col_tile %u)\n", op_type, col_tile ? "tiled" : "row-block", col_tile);
+    FARF(HIGH, "%s: %s mode (col_tile %u)\n", op_type, col_tile ? "tiled" : "row-block", col_tile);
 
-        worker_callback_t task_func = NULL;
-        if (col_tile) {
-            switch (octx->op) {
-                case HTP_OP_SCALE:           task_func = unary_task_f32_tiled_scale;          break;
-                case HTP_OP_CLAMP:           task_func = unary_task_f32_tiled_clamp;          break;
-                case HTP_OP_LEAKY_RELU:      task_func = unary_task_f32_tiled_leaky_relu;     break;
-                case HTP_OP_SQR:             task_func = unary_task_f32_tiled_sqr;            break;
-                case HTP_OP_SQRT:            task_func = unary_task_f32_tiled_sqrt;           break;
-                case HTP_OP_UNARY_NEG:       task_func = unary_task_f32_tiled_unary_neg;      break;
-                case HTP_OP_UNARY_EXP:       task_func = unary_task_f32_tiled_unary_exp;      break;
-                case HTP_OP_UNARY_SIGMOID:   task_func = unary_task_f32_tiled_unary_sigmoid;  break;
-                case HTP_OP_UNARY_SILU:      task_func = unary_task_f32_tiled_unary_silu;     break;
-                case HTP_OP_UNARY_GELU:      task_func = unary_task_f32_tiled_unary_gelu;     break;
-                case HTP_OP_UNARY_SOFTPLUS:  task_func = unary_task_f32_tiled_unary_softplus; break;
-                case HTP_OP_UNARY_TANH:      task_func = unary_task_f32_tiled_unary_tanh;     break;
-                case HTP_OP_UNARY_ABS:       task_func = unary_task_f32_tiled_unary_abs;      break;
-                case HTP_OP_UNARY_LOG:       task_func = unary_task_f32_tiled_unary_log;      break;
-                case HTP_OP_UNARY_RELU:      task_func = unary_task_f32_tiled_unary_relu;     break;
-                case HTP_OP_TRI:             task_func = unary_task_f32_tiled_tri;            break;
-                default:                     break;
-            }
-        } else if (is_f16) {
-            switch (octx->op) {
-                case HTP_OP_NORM:            task_func = unary_task_f16_norm;                 break;
-                case HTP_OP_RMS_NORM:        task_func = unary_task_f16_rms_norm;             break;
-                case HTP_OP_SCALE:           task_func = unary_task_f16_scale;                break;
-                case HTP_OP_CLAMP:           task_func = unary_task_f16_clamp;                break;
-                case HTP_OP_SQR:             task_func = unary_task_f16_sqr;                  break;
-                case HTP_OP_SQRT:            task_func = unary_task_f16_sqrt;                 break;
-                case HTP_OP_L2_NORM:         task_func = unary_task_f16_l2_norm;              break;
-                case HTP_OP_UNARY_ABS:       task_func = unary_task_f16_unary_abs;            break;
-                case HTP_OP_UNARY_LOG:       task_func = unary_task_f16_unary_log;            break;
-                default:                     break;
-            }
-        } else {
-            switch (octx->op) {
-                case HTP_OP_NORM:            task_func = unary_task_f32_norm;                 break;
-                case HTP_OP_RMS_NORM:        task_func = unary_task_f32_rms_norm;             break;
-                case HTP_OP_RMS_NORM_MUL:    task_func = unary_task_f32_rms_norm_mul;         break;
-                case HTP_OP_SCALE:           task_func = unary_task_f32_scale;                break;
-                case HTP_OP_CLAMP:           task_func = unary_task_f32_clamp;                break;
-                case HTP_OP_LEAKY_RELU:      task_func = unary_task_f32_leaky_relu;           break;
-                case HTP_OP_SQR:             task_func = unary_task_f32_sqr;                  break;
-                case HTP_OP_SQRT:            task_func = unary_task_f32_sqrt;                 break;
-                case HTP_OP_UNARY_NEG:       task_func = unary_task_f32_unary_neg;            break;
-                case HTP_OP_UNARY_EXP:       task_func = unary_task_f32_unary_exp;            break;
-                case HTP_OP_UNARY_SIGMOID:   task_func = unary_task_f32_unary_sigmoid;        break;
-                case HTP_OP_UNARY_SILU:      task_func = unary_task_f32_unary_silu;           break;
-                case HTP_OP_UNARY_GELU:      task_func = unary_task_f32_unary_gelu;           break;
-                case HTP_OP_UNARY_SOFTPLUS:  task_func = unary_task_f32_unary_softplus;       break;
-                case HTP_OP_UNARY_TANH:      task_func = unary_task_f32_unary_tanh;           break;
-                case HTP_OP_UNARY_ABS:       task_func = unary_task_f32_unary_abs;            break;
-                case HTP_OP_UNARY_LOG:       task_func = unary_task_f32_unary_log;            break;
-                case HTP_OP_UNARY_RELU:      task_func = unary_task_f32_unary_relu;           break;
-                case HTP_OP_L2_NORM:         task_func = unary_task_f32_l2_norm;              break;
-                case HTP_OP_TRI:             task_func = unary_task_f32_tri;                  break;
-                default:                     break;
-            }
+    worker_callback_t task_func = NULL;
+    if (col_tile) {
+        switch (octx->op) {
+            case HTP_OP_SCALE:           task_func = unary_task_f32_tiled_scale;          break;
+            case HTP_OP_CLAMP:           task_func = unary_task_f32_tiled_clamp;          break;
+            case HTP_OP_LEAKY_RELU:      task_func = unary_task_f32_tiled_leaky_relu;     break;
+            case HTP_OP_SQR:             task_func = unary_task_f32_tiled_sqr;            break;
+            case HTP_OP_SQRT:            task_func = unary_task_f32_tiled_sqrt;           break;
+            case HTP_OP_UNARY_NEG:       task_func = unary_task_f32_tiled_unary_neg;      break;
+            case HTP_OP_UNARY_EXP:       task_func = unary_task_f32_tiled_unary_exp;      break;
+            case HTP_OP_UNARY_SIGMOID:   task_func = unary_task_f32_tiled_unary_sigmoid;  break;
+            case HTP_OP_UNARY_SILU:      task_func = unary_task_f32_tiled_unary_silu;     break;
+            case HTP_OP_UNARY_GELU:      task_func = unary_task_f32_tiled_unary_gelu;     break;
+            case HTP_OP_UNARY_SOFTPLUS:  task_func = unary_task_f32_tiled_unary_softplus; break;
+            case HTP_OP_UNARY_TANH:      task_func = unary_task_f32_tiled_unary_tanh;     break;
+            case HTP_OP_UNARY_ABS:       task_func = unary_task_f32_tiled_unary_abs;      break;
+            case HTP_OP_UNARY_LOG:       task_func = unary_task_f32_tiled_unary_log;      break;
+            case HTP_OP_UNARY_RELU:      task_func = unary_task_f32_tiled_unary_relu;     break;
+            case HTP_OP_TRI:             task_func = unary_task_f32_tiled_tri;            break;
+            default:                     break;
         }
-
-        if (task_func) {
-            work_queue_run(octx->ctx->work_queue, task_func, &uctx, n_threads);
-        } else {
-            FARF(ERROR, "execute_op_unary: task function is NULL for op %d\n", octx->op);
-            err = HTP_STATUS_NO_SUPPORT;
+    } else if (is_f16) {
+        switch (octx->op) {
+            case HTP_OP_NORM:            task_func = unary_task_f16_norm;                 break;
+            case HTP_OP_RMS_NORM:        task_func = unary_task_f16_rms_norm;             break;
+            case HTP_OP_SCALE:           task_func = unary_task_f16_scale;                break;
+            case HTP_OP_CLAMP:           task_func = unary_task_f16_clamp;                break;
+            case HTP_OP_SQR:             task_func = unary_task_f16_sqr;                  break;
+            case HTP_OP_SQRT:            task_func = unary_task_f16_sqrt;                 break;
+            case HTP_OP_L2_NORM:         task_func = unary_task_f16_l2_norm;              break;
+            case HTP_OP_UNARY_ABS:       task_func = unary_task_f16_unary_abs;            break;
+            case HTP_OP_UNARY_LOG:       task_func = unary_task_f16_unary_log;            break;
+            default:                     break;
         }
+    } else {
+        switch (octx->op) {
+            case HTP_OP_NORM:            task_func = unary_task_f32_norm;                 break;
+            case HTP_OP_RMS_NORM:        task_func = unary_task_f32_rms_norm;             break;
+            case HTP_OP_RMS_NORM_MUL:    task_func = unary_task_f32_rms_norm_mul;         break;
+            case HTP_OP_SCALE:           task_func = unary_task_f32_scale;                break;
+            case HTP_OP_CLAMP:           task_func = unary_task_f32_clamp;                break;
+            case HTP_OP_LEAKY_RELU:      task_func = unary_task_f32_leaky_relu;           break;
+            case HTP_OP_SQR:             task_func = unary_task_f32_sqr;                  break;
+            case HTP_OP_SQRT:            task_func = unary_task_f32_sqrt;                 break;
+            case HTP_OP_UNARY_NEG:       task_func = unary_task_f32_unary_neg;            break;
+            case HTP_OP_UNARY_EXP:       task_func = unary_task_f32_unary_exp;            break;
+            case HTP_OP_UNARY_SIGMOID:   task_func = unary_task_f32_unary_sigmoid;        break;
+            case HTP_OP_UNARY_SILU:      task_func = unary_task_f32_unary_silu;           break;
+            case HTP_OP_UNARY_GELU:      task_func = unary_task_f32_unary_gelu;           break;
+            case HTP_OP_UNARY_SOFTPLUS:  task_func = unary_task_f32_unary_softplus;       break;
+            case HTP_OP_UNARY_TANH:      task_func = unary_task_f32_unary_tanh;           break;
+            case HTP_OP_UNARY_ABS:       task_func = unary_task_f32_unary_abs;            break;
+            case HTP_OP_UNARY_LOG:       task_func = unary_task_f32_unary_log;            break;
+            case HTP_OP_UNARY_RELU:      task_func = unary_task_f32_unary_relu;           break;
+            case HTP_OP_L2_NORM:         task_func = unary_task_f32_l2_norm;              break;
+            case HTP_OP_TRI:             task_func = unary_task_f32_tri;                  break;
+            default:                     break;
+        }
+    }
+
+    if (task_func) {
+        work_queue_run(octx->ctx->work_queue, task_func, &uctx, n_threads);
+    } else {
+        FARF(ERROR, "execute_op_unary: task function is NULL for op %d\n", octx->op);
+        err = HTP_STATUS_NO_SUPPORT;
     }
 
     return err;

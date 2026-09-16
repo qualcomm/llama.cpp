@@ -329,7 +329,7 @@ IM2COL_BLOCKED_DMA_BODY(im2col_blocked_dma_f32_thread, float,  hvx_copy_f32_uu, 
         const uint32_t patch_stride             = IC * KH * KW;                                                      \
         const dma_addr_t src_data       = src1->data;                                                                \
         const dma_addr_t dst_data       = dst->data;                                                                 \
-        dma_queue *    dmaq             = octx->ctx->dma[ith];                                                       \
+        dma_queue *    dma_q            = octx->ctx->dma[ith];                                                       \
         uint8_t *      src_base         = ictx->pe_vtcm_src + ith * ictx->pe_src_size_per_thread;                    \
         uint8_t *      dst_base         = ictx->pe_vtcm_dst + ith * ictx->pe_dst_size_per_thread;                    \
         float *        srcb             = (float *) src_base;                                                        \
@@ -351,12 +351,12 @@ IM2COL_BLOCKED_DMA_BODY(im2col_blocked_dma_f32_thread, float,  hvx_copy_f32_uu, 
                     const dma_addr_t vsrc = ok                                                                        \
                         ? (src_data + (size_t) ((in * IC + iic) * IH + iih) * IW * sizeof(float))                     \
                         : src_data;                                                                                  \
-                    dma_queue_push(dmaq, dma_make_data(vdst, vsrc),                                                  \
+                    dma_queue_push(dma_q, dma_make_data(vdst, vsrc),                                                 \
                                    IW * sizeof(float), IW * sizeof(float), IW * sizeof(float), ok ? 1 : 0);          \
                 }                                                                                                    \
             }                                                                                                        \
             for (uint32_t i = 0; i < IC * KH; i++)                                                                   \
-                dma_queue_pop(dmaq);                                                                                 \
+                dma_queue_pop(dma_q);                                                                                \
             htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, r);                                                    \
             for (uint32_t iow = 0; iow < OW; iow++) {                                                                \
                 DST_CTYPE * dst_patch = dstb + (uint64_t) iow * patch_stride;                                        \
@@ -375,10 +375,10 @@ IM2COL_BLOCKED_DMA_BODY(im2col_blocked_dma_f32_thread, float,  hvx_copy_f32_uu, 
             }                                                                                                        \
             htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, r);                                                     \
             const dma_addr_t ddr_row = dst_data + (size_t) (in * OH + ioh) * OW * patch_stride * (DST_ELEM);        \
-            dma_queue_push(dmaq, dma_make_data(ddr_row, dstb),                                                       \
+            dma_queue_push(dma_q, dma_make_data(ddr_row, dstb),                                                      \
                            OW * patch_stride * (DST_ELEM), OW * patch_stride * (DST_ELEM),                           \
                            OW * patch_stride * (DST_ELEM), 1);                                                       \
-            dma_queue_flush(dmaq);                                                                                   \
+            dma_queue_flush(dma_q);                                                                                  \
         }                                                                                                            \
     }
 
@@ -498,10 +498,6 @@ int op_im2col(struct htp_ops_context * octx) {
         return HTP_STATUS_NO_SUPPORT;
     }
 
-    if (octx->flags & HTP_OPFLAGS_SKIP_COMPUTE) {
-        return HTP_STATUS_OK;
-    }
-
     const int32_t  is_2D         = octx->op_params[6] == 1;
     const uint32_t N             = is_2D ? src1->ne[3] : src1->ne[2];
     const uint32_t OH            = is_2D ? dst->ne[2] : 1;
@@ -573,13 +569,12 @@ int op_im2col(struct htp_ops_context * octx) {
         }
     }
     // Fall through to pure-DDR.
-    if (htp_tensor_is_extended(src1) || htp_tensor_is_extended(dst)) {
-        return HTP_STATUS_NO_SUPPORT;
-    }
-
-
     if (npatches == 0) {
         return HTP_STATUS_OK;
+    }
+
+    if (htp_tensor_is_extended(src1) || htp_tensor_is_extended(dst)) {
+        return HTP_STATUS_NO_SUPPORT;
     }
 
     if (dst->type == HTP_TYPE_F16) {

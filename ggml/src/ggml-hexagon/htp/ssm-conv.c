@@ -411,9 +411,6 @@ int op_ssm_conv_f32(struct htp_ops_context * octx) {
 
     const struct htp_ssm_conv_kernel_params * kparams = (const struct htp_ssm_conv_kernel_params *) octx->kernel_params;
 
-    if (octx->flags & HTP_OPFLAGS_SKIP_COMPUTE) {
-        return HTP_STATUS_OK;
-    }
 
     if (!htp_ops_context_set_n_threads(octx, kparams->n_threads)) {
         return HTP_STATUS_INVAL_PARAMS;

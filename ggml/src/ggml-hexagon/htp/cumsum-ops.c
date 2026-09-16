@@ -55,7 +55,7 @@ struct htp_cumsum_context {
     struct htp_cumsum_context * cctx = (struct htp_cumsum_context *) data; \
     struct htp_ops_context *    octx = cctx->octx;                         \
     htp_cumsum_tensors_preamble;                                           \
-    dma_queue * dma_queue = octx->ctx->dma[ith];
+    dma_queue * dma_q = octx->ctx->dma[ith];
 
 // ---------------------------------------------------------------------------
 // HVX prefix scan helpers
@@ -139,11 +139,11 @@ static void cumsum_thread_f32_dma(unsigned int nth, unsigned int ith, void * dat
 
     for (uint32_t ir = ir0, spad_idx = 0; ir < ir1 && spad_idx < 2; ir++, spad_idx++) {
         // Dummy dst writeback to establish queue ordering
-        dma_queue_push(dma_queue,
+        dma_queue_push(dma_q,
                        dma_make_data(dst_data, dst_spad + (spad_idx * dst_row_size_aligned)),
                        dst_row_size, dst_row_size_aligned, dst_row_size, 0);
 
-        dma_queue_push(dma_queue,
+        dma_queue_push(dma_q,
                        dma_make_data(src_spad + (spad_idx * src_row_size_aligned),
                                      src_data + (ir * src_row_size)),
                        src_row_size_aligned, src_row_size, src_row_size, 1);
@@ -152,26 +152,26 @@ static void cumsum_thread_f32_dma(unsigned int nth, unsigned int ith, void * dat
     struct htp_thread_trace * tr = &octx->ctx->trace[ith];
 
     for (uint32_t ir = ir0; ir < ir1; ir++) {
-        float * dst_spad_row = (float *) dma_queue_pop(dma_queue).src;
-        float * src_spad_row = (float *) dma_queue_pop(dma_queue).dst;
+        float * dst_spad_row = (float *) dma_queue_pop(dma_q).src;
+        float * src_spad_row = (float *) dma_queue_pop(dma_q).dst;
 
         htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) ir);
         hvx_cumsum_row_f32(src_spad_row, dst_spad_row, ne00);
         htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) ir);
 
-        dma_queue_push(dma_queue,
+        dma_queue_push(dma_q,
                        dma_make_data(dst_data + (ir * dst_row_size), dst_spad_row),
                        dst_row_size, dst_row_size_aligned, dst_row_size, 1);
 
         const uint32_t next_row = ir + 2;
         if (next_row < ir1) {
-            dma_queue_push(dma_queue,
+            dma_queue_push(dma_q,
                            dma_make_data(src_spad_row, src_data + (next_row * src_row_size)),
                            src_row_size_aligned, src_row_size, src_row_size, 1);
         }
     }
 
-    dma_queue_flush(dma_queue);
+    dma_queue_flush(dma_q);
 
     FARF(HIGH, "cumsum-f32-dma %d/%d: %ux%ux%ux%u (%u:%u) -> %ux%ux%ux%u\n",
          ith, nth, src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3], ir0, ir1,
@@ -210,10 +210,6 @@ static void cumsum_thread_f32(unsigned int nth, unsigned int ith, void * data) {
 int op_cumsum_f32(struct htp_ops_context * octx) {
     const struct htp_tensor * src0 = octx->src[0];
     const struct htp_tensor * dst  = octx->dst;
-
-    if (octx->flags & HTP_OPFLAGS_SKIP_COMPUTE) {
-        return HTP_STATUS_OK;
-    }
 
     const uint32_t total_rows      = src0->ne[1] * src0->ne[2] * src0->ne[3];
     const size_t dst_data_row_size = dst->ne[0] * sizeof(float);
@@ -264,6 +260,9 @@ int op_cumsum_f32(struct htp_ops_context * octx) {
     };
 
     if (octx->ctx->vtcm_size < spad_per_thread * n_threads) {
+        if (htp_tensor_is_extended(src0) || htp_tensor_is_extended(dst)) {
+            return HTP_STATUS_NO_SUPPORT;
+        }
         work_queue_run(octx->ctx->work_queue, cumsum_thread_f32, &cctx, n_threads);
     } else {
         work_queue_run(octx->ctx->work_queue, cumsum_thread_f32_dma, &cctx, n_threads);

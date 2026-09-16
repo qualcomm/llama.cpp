@@ -109,8 +109,8 @@ static void cpy_thread_##NAME##_sameshape(unsigned int nth, unsigned int ith, vo
     const bool contiguous = htp_tensor_is_contiguous(src0, ELEM_SIZE) && htp_tensor_is_contiguous(dst, ELEM_SIZE); \
     if (contiguous) {                                                                                              \
         dma_queue * dma_q = octx->ctx->dma[ith];                                                                   \
-        dma_addr_t dst_addr  = dst->data  + (dma_addr_t) ir0 * ne00 * ELEM_SIZE;                                   \
-        dma_addr_t src0_addr = src0->data + (dma_addr_t) ir0 * ne00 * ELEM_SIZE;                                   \
+        dma_addr_t dst_addr  = dst->data  + ir0 * ne00 * ELEM_SIZE;                                                \
+        dma_addr_t src0_addr = src0->data + ir0 * ne00 * ELEM_SIZE;                                                \
         cpy_dma_sametype_reshape_contig(dma_q, dst_addr, src0_addr, (ir1 - ir0) * ne00 * ELEM_SIZE);               \
         return;                                                                                                    \
     }                                                                                                              \
@@ -153,8 +153,8 @@ static void cpy_thread_##NAME##_reshape(unsigned int nth, unsigned int ith, void
                                                                                                       \
     if (htp_tensor_is_contiguous(src0, ELEM_SIZE) && htp_tensor_is_contiguous(dst, ELEM_SIZE)) {      \
         dma_queue * dma_q = octx->ctx->dma[ith];                                                      \
-        dma_addr_t dst_addr  = dst->data  + (dma_addr_t) th_start * ELEM_SIZE;                        \
-        dma_addr_t src0_addr = src0->data + (dma_addr_t) th_start * ELEM_SIZE;                        \
+        dma_addr_t dst_addr  = dst->data  + th_start * ELEM_SIZE;                                     \
+        dma_addr_t src0_addr = src0->data + th_start * ELEM_SIZE;                                     \
         cpy_dma_sametype_reshape_contig(dma_q, dst_addr, src0_addr, (th_end - th_start) * ELEM_SIZE); \
         return;                                                                                       \
     }                                                                                                 \
@@ -314,8 +314,8 @@ static inline void cpy_dma_push_2d_chunked(
             dma_queue_flush(dma_q);
             dma_queue_push(dma_q, dma_make_data(dst, src), dst_stride, src_stride, row_size, cur_rows);
         }
-        dst   += (dma_addr_t) cur_rows * dst_stride;
-        src   += (dma_addr_t) cur_rows * src_stride;
+        dst   += cur_rows * dst_stride;
+        src   += cur_rows * src_stride;
         nrows -= cur_rows;
     }
 }
@@ -351,8 +351,8 @@ static inline void cpy_dma_sametype_sameshape(
 
     for (uint32_t i03 = 0; i03 < ne03; i03++) {
         for (uint32_t i02 = 0; i02 < ne02; i02++) {
-            dma_addr_t dst_data  = dst->data  + (dma_addr_t) i02 * nb2  + (dma_addr_t) i03 * nb3;
-            dma_addr_t src0_data = src0->data + (dma_addr_t) i02 * nb02 + (dma_addr_t) i03 * nb03;
+            dma_addr_t dst_data  = dst->data  + i02 * nb2  + i03 * nb3;
+            dma_addr_t src0_data = src0->data + i02 * nb02 + i03 * nb03;
             cpy_dma_push_2d_chunked(dma_q, dst_data, src0_data, nb1, nb01, ne00 * elem_size, ne01);
         }
     }
@@ -381,10 +381,6 @@ static int exec_cpy(struct htp_ops_context * octx, bool * use_dma) {
         return HTP_STATUS_NO_SUPPORT;
     }
 
-    if (octx->flags & HTP_OPFLAGS_SKIP_COMPUTE) {
-        return HTP_STATUS_OK;
-    }
-
     const bool sametype   = (src0->type == dst->type);
     const bool transposed = (nb00 > nb01) || (nb0 > nb1) ||
                             (nb00 != ct.src0_type_size) || (nb0 != ct.dst_type_size) ||
@@ -400,7 +396,7 @@ static int exec_cpy(struct htp_ops_context * octx, bool * use_dma) {
         if (!sametype) {
             return HTP_STATUS_NO_SUPPORT;
         }
-        if (!sameshape && !(src_is_contiguous && dst_is_contiguous)) {
+        if (!sameshape && !(src_is_contiguous && dst_is_contiguous && octx->ctx->mdev.count <= 1)) {
             return HTP_STATUS_NO_SUPPORT;
         }
     }
@@ -510,6 +506,9 @@ int op_cpy(struct htp_ops_context * octx) {
 
         if (octx->ctx->mdev.idx == 0) {
             const struct htp_tensor * sync = octx->src[1];
+            if (htp_tensor_is_extended(sync)) {
+                return HTP_STATUS_NO_SUPPORT;
+            }
             const uint32_t seq = (uint32_t) octx->op_params[0];
             atomic_uint * sync_fence = (atomic_uint *) (uintptr_t) sync->data;
             htp_fence_write(sync_fence, seq, octx->status);
