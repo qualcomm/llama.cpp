@@ -98,6 +98,13 @@ typedef struct {
     dma_addr_t src;
 } dma_data;
 
+// Hardware descriptor field limits
+#define DMA_MAX_NROWS          0xFFFFu        // 16-bit HW descriptor limit (65535)
+#define DMA_MAX_SIZE_24B       0x00FFFFFFu    // 24-bit HW descriptor limit for row_size / 1D size (16MB - 1)
+#define DMA_MAX_STRIDE_24B     0x00FFFFFFu    // 24-bit HW descriptor limit for strides (16MB - 1)
+#define DMA_SAFE_CHUNK_SIZE    0x00F00000u    // ~15MB safe contiguous chunk size
+
+
 typedef struct dma_ring_s dma_ring;
 struct dma_ring_s {
     dma_descriptor_2d * desc;      // descriptor pointers
@@ -331,7 +338,7 @@ static inline uint32_t dma_queue_capacity(dma_queue * q) {
 // Overflow-safe DMA push: all 2d descriptor fields (row_size, nrows, src_stride, dst_stride) are 16-bit, max 65535.
 // This version transparently handles values that exceed the 16-bit limit and submits chained DMA transtions.
 
-#define DMA_MAX_FIELD_VAL 65535u
+#define DMA_MAX_FIELD_VAL DMA_MAX_NROWS
 
 static inline bool dma_queue_push(dma_queue *q, dma_data ddata, size_t dst_stride, size_t src_stride, size_t row_size, size_t nrows) {
     // Fast path: everything fits in 16 bits

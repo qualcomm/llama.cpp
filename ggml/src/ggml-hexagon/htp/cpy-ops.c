@@ -59,7 +59,7 @@ static inline void cpy_dma_sametype_reshape_contig(
         return;
     }
 
-    const uint32_t max_chunk = 0x00f00000;
+    const uint32_t max_chunk = DMA_SAFE_CHUNK_SIZE;
     while (total_bytes > 0) {
         const uint32_t chunk = MIN(total_bytes, max_chunk);
         if (!dma_queue_push(dma_q, dma_make_data(dst, src0), chunk, chunk, chunk, /*nrows=*/ 1)) {
@@ -299,6 +299,27 @@ static void cpy_thread_f32_f16_sameshape(unsigned int nth, unsigned int ith, voi
     }
 }
 
+static inline void cpy_dma_push_2d_chunked(
+    dma_queue * dma_q,
+    dma_addr_t  dst,
+    dma_addr_t  src,
+    size_t      dst_stride,
+    size_t      src_stride,
+    size_t      row_size,
+    uint32_t    nrows
+) {
+    while (nrows > 0) {
+        const uint32_t cur_rows = MIN(nrows, DMA_MAX_NROWS);
+        if (!dma_queue_push(dma_q, dma_make_data(dst, src), dst_stride, src_stride, row_size, cur_rows)) {
+            dma_queue_flush(dma_q);
+            dma_queue_push(dma_q, dma_make_data(dst, src), dst_stride, src_stride, row_size, cur_rows);
+        }
+        dst   += (dma_addr_t) cur_rows * dst_stride;
+        src   += (dma_addr_t) cur_rows * src_stride;
+        nrows -= cur_rows;
+    }
+}
+
 static inline void cpy_dma_sametype_sameshape(
     struct htp_ops_context * octx,
     const struct htp_tensor * dst,
@@ -322,10 +343,8 @@ static inline void cpy_dma_sametype_sameshape(
         (ne03 == 1 || (nb03 == ne02 * nb02 && nb3 == ne02 * nb2));
 
     if (contiguous_outer) {
-        if (!dma_queue_push(dma_q, dma_make_data(dst->data, src0->data), nb1, nb01, ne00 * elem_size, ne01 * ne02 * ne03)) {
-            dma_queue_flush(dma_q);
-            dma_queue_push(dma_q, dma_make_data(dst->data, src0->data), nb1, nb01, ne00 * elem_size, ne01 * ne02 * ne03);
-        }
+        uint32_t total_rows = ne01 * ne02 * ne03;
+        cpy_dma_push_2d_chunked(dma_q, dst->data, src0->data, nb1, nb01, ne00 * elem_size, total_rows);
         dma_queue_flush(dma_q);
         return;
     }
@@ -334,11 +353,7 @@ static inline void cpy_dma_sametype_sameshape(
         for (uint32_t i02 = 0; i02 < ne02; i02++) {
             dma_addr_t dst_data  = dst->data  + (dma_addr_t) i02 * nb2  + (dma_addr_t) i03 * nb3;
             dma_addr_t src0_data = src0->data + (dma_addr_t) i02 * nb02 + (dma_addr_t) i03 * nb03;
-
-            if (!dma_queue_push(dma_q, dma_make_data(dst_data, src0_data), nb1, nb01, ne00 * elem_size, ne01)) {
-                dma_queue_flush(dma_q);
-                dma_queue_push(dma_q, dma_make_data(dst_data, src0_data), nb1, nb01, ne00 * elem_size, ne01);
-            }
+            cpy_dma_push_2d_chunked(dma_q, dst_data, src0_data, nb1, nb01, ne00 * elem_size, ne01);
         }
     }
 
