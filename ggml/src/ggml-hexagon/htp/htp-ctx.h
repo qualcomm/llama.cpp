@@ -17,9 +17,9 @@
 #ifndef HTP_MAX_NTHREADS
 #define HTP_MAX_NTHREADS 10
 #endif
-#define HTP_MAX_MMAPS    16
 
-#define HTP_MAX_DIRTY_RANGES 32
+#define HTP_MAX_MMAPS        64
+#define HTP_MAX_DIRTY_RANGES 64
 
 // Memory mapping
 struct htp_mmap {
