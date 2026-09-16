@@ -4863,13 +4863,15 @@ static void ggml_hexagon_precompute_rope_params(
     memset(kparams, 0, sizeof(*kparams));
 
     const struct ggml_tensor * src0 = op->src[0];
+    const struct ggml_tensor * src2 = op->src[2];
     const struct ggml_tensor * dst  = op;
 
     const uint32_t src0_nrows = src0->ne[1] * src0->ne[2] * src0->ne[3];
     const uint32_t n_threads  = (std::min)((uint32_t) sess->n_threads, src0_nrows);
+    const uint32_t n_freq_factors = src2 ? (uint32_t) src2->ne[0] : 0;
 
     struct htp_rope_vtcm_layout layout;
-    htp_rope_vtcm_layout_build(&layout, src0->ne[0], n_threads);
+    htp_rope_vtcm_layout_build(&layout, src0->ne[0], n_threads, n_freq_factors);
 
     kparams->n_threads              = n_threads;
     kparams->src0_nrows             = src0_nrows;
@@ -4878,6 +4880,8 @@ static void ggml_hexagon_precompute_rope_params(
     kparams->spad_per_thread        = (uint32_t) layout.bytes_per_thread;
     kparams->theta_cache_offset     = (uint32_t) layout.theta_cache_size_aligned;
     kparams->src0_row_size_aligned  = (uint32_t) layout.src0_row_size_aligned;
+    kparams->freq_factors_offset    = (uint32_t) (layout.bytes_per_thread * n_threads);
+    kparams->freq_factors_size      = (uint32_t) layout.freq_factors_size_aligned;
 
     if (src0_nrows > 0) {
         kparams->div_ne2_ne1 = init_fastdiv_values(dst->ne[2] * dst->ne[1]);
@@ -5657,9 +5661,10 @@ static bool ggml_hexagon_supported_rope(const struct ggml_hexagon_session * sess
     }
 
     const uint32_t n_threads = (std::min)((uint32_t) sess->n_threads, src0_nrows);
+    const uint32_t n_freq_factors = src2 ? (uint32_t) src2->ne[0] : 0;
 
     struct htp_rope_vtcm_layout layout;
-    htp_rope_vtcm_layout_build(&layout, src0->ne[0], n_threads);
+    htp_rope_vtcm_layout_build(&layout, src0->ne[0], n_threads, n_freq_factors);
     if (layout.total_bytes > sess->vtcm_size) {
         return false;
     }
