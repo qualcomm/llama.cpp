@@ -296,7 +296,8 @@ static void test_single_output_backend_sampler_free(llama_sampler * smpl) {
 }
 
 static bool test_single_output_backend_sampler_backend_init(
-        llama_sampler * smpl, ggml_backend_buffer_type_t /*buft*/, uint32_t n_outputs_max_per_seq) {
+        llama_sampler * smpl, ggml_backend_buffer_type_t /*buft*/, uint32_t n_outputs_max_per_seq,
+        uint32_t /*n_candidates*/) {
     auto * ctx = (test_single_output_backend_sampler *) smpl->ctx;
     ctx->backend_outputs_max_per_seq = n_outputs_max_per_seq;
     if (n_outputs_max_per_seq > 1) {
