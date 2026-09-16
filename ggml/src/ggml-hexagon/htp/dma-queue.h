@@ -6,6 +6,7 @@
 #include <assert.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <string.h>
 #include "hex-utils.h"
 
 #include "hex-profile.h"
@@ -25,8 +26,8 @@ typedef struct dma_descriptor_1d_s {
     uint32_t src_bypass:1;
     uint32_t order:1;
     uint32_t done:1;
-    void *   src;
-    void *   dst;
+    uint32_t src;
+    uint32_t dst;
 } dma_descriptor_1d;
 
 #if __HVX_ARCH__ < 75
@@ -41,8 +42,8 @@ typedef struct dma_descriptor_2d_s {
     uint32_t src_bypass:1;
     uint32_t order:1;
     uint32_t done:1;
-    void *   src;
-    void *   dst;
+    uint32_t src;
+    uint32_t dst;
     uint32_t desc_type:8;
     uint32_t reserved1:24;
     uint32_t row_size:16;
@@ -65,8 +66,8 @@ typedef struct dma_descriptor_2d_s {
     uint32_t src_bypass:1;
     uint32_t order:1;
     uint32_t done:1;
-    void *   src;
-    void *   dst;
+    uint32_t src;
+    uint32_t dst;
     uint32_t desc_type:8;
 #if __HVX_ARCH__ > 79
     uint32_t src_upper:8;
@@ -100,10 +101,13 @@ typedef struct {
 
 // Hardware descriptor field limits
 #define DMA_MAX_NROWS          0xFFFFu        // 16-bit HW descriptor limit (65535)
+#define DMA_MAX_SIZE_16B       0xFFFFu        // 16-bit HW descriptor limit for row_size (65535)
+#define DMA_MAX_STRIDE_16B     0xFFFFu        // 16-bit HW descriptor limit for strides (65535)
 #define DMA_MAX_SIZE_24B       0x00FFFFFFu    // 24-bit HW descriptor limit for row_size / 1D size (16MB - 1)
 #define DMA_MAX_STRIDE_24B     0x00FFFFFFu    // 24-bit HW descriptor limit for strides (16MB - 1)
 #define DMA_SAFE_CHUNK_SIZE    0x00F00000u    // ~15MB safe contiguous chunk size
 
+#define DMA_FALLBACK_CAPACITY  16u            // descriptors in secondary fallback ring
 
 typedef struct dma_ring_s dma_ring;
 struct dma_ring_s {
@@ -121,7 +125,8 @@ typedef struct dma_queue_s dma_queue;
 typedef dma_queue * dma_queue_t;
 
 struct dma_queue_s {
-    dma_ring *          ring;      // Points to the descriptor ring state
+    dma_ring *          ring0;     // Main descriptor ring state
+    dma_ring *          ring1;     // Secondary fallback descriptor ring state
     bool                alias;     // When set, dma_queue_delete will not free the ring
 };
 
@@ -133,6 +138,11 @@ void        dma_queue_free(dma_queue_t q);
 size_t      dma_queue_alias_sizeof(void);
 dma_queue_t dma_queue_alias_init(void * ptr, dma_queue_t main_q);
 void        dma_queue_alias_free(dma_queue_t q);
+
+bool        dma_queue_push_fallback_2d(dma_queue * q, dma_data ddata, size_t dst_stride, size_t src_stride, size_t row_size, size_t nrows);
+#if __HVX_ARCH__ < 75
+bool        dma_queue_push_fallback_1d(dma_queue * q, dma_data ddata, size_t dst_stride, size_t src_stride, size_t row_size, size_t nrows);
+#endif
 
 // TODO: technically we don't need these and could use Q6_dmstart/wait/etc instead
 // but those do not seem to always compiler properly.
@@ -166,19 +176,18 @@ static inline dma_data dma_make_data_impl(dma_addr_t dst, dma_addr_t src)
 
 #define dma_make_data(dst, src) dma_make_data_impl((dma_addr_t) (dst), (dma_addr_t) (src))
 
-static inline bool dma_queue_push_single_1d(dma_queue * q, dma_data ddata, size_t size) {
+static inline bool dma_ring_push_single_1d(dma_ring * r, dma_data ddata, size_t size) {
 #if __HVX_ARCH__ > 79
     assert(!((ddata.src | ddata.dst) >> 32) || size == 0);
 #endif
 
-    dma_ring * r = q->ring;
     if (((r->push_idx + 1) & r->idx_mask) == r->pop_idx) {
         return false;
     }
 
     dma_descriptor_1d * desc = (dma_descriptor_1d *) &r->desc[r->push_idx];
-    desc->src  = (void *) (uintptr_t) ddata.src;
-    desc->dst  = (void *) (uintptr_t) ddata.dst;
+    desc->src  = (uint32_t) ddata.src;
+    desc->dst  = (uint32_t) ddata.dst;
     desc->size = size;
 
     r->data[r->push_idx] = ddata;
@@ -204,7 +213,7 @@ static inline bool dma_queue_push_single_1d(dma_queue * q, dma_data ddata, size_
     return true;
 }
 
-static inline bool dma_queue_push_single_2d(dma_queue * q, dma_data ddata, size_t dst_stride, size_t src_stride, size_t row_size, size_t nrows) {
+static inline bool dma_ring_push_single_2d(dma_ring * r, dma_data ddata, size_t dst_stride, size_t src_stride, size_t row_size, size_t nrows) {
 #if __HVX_ARCH__ > 79
     const uint32_t src_hi = (uint32_t) (ddata.src >> 32);
     const uint32_t dst_hi = (uint32_t) (ddata.dst >> 32);
@@ -215,7 +224,6 @@ static inline bool dma_queue_push_single_2d(dma_queue * q, dma_data ddata, size_
     }
 #endif
 
-    dma_ring * r = q->ring;
     if (((r->push_idx + 1) & r->idx_mask) == r->pop_idx) {
         return false;
     }
@@ -233,8 +241,8 @@ static inline bool dma_queue_push_single_2d(dma_queue * q, dma_data ddata, size_
     desc->done           = 0;
     desc->src_stride     = src_stride;
     desc->dst_stride     = dst_stride;
-    desc->src            = (void *) (uintptr_t) ddata.src;
-    desc->dst            = (void *) (uintptr_t) ddata.dst;
+    desc->src            = (uint32_t) ddata.src;
+    desc->dst            = (uint32_t) ddata.dst;
     desc->row_size       = row_size;
 
 #if __HVX_ARCH__ < 75
@@ -275,8 +283,7 @@ static inline bool dma_queue_push_single_2d(dma_queue * q, dma_data ddata, size_
     return true;
 }
 
-static inline dma_data dma_queue_pop(dma_queue * q) {
-    dma_ring * r = q->ring;
+static inline dma_data dma_ring_pop(dma_ring * r) {
     dma_data ddata = { 0 };
 
     if (r->push_idx == r->pop_idx) {
@@ -301,8 +308,7 @@ static inline dma_data dma_queue_pop(dma_queue * q) {
     return ddata;
 }
 
-static inline dma_data dma_queue_pop_nowait(dma_queue * q) {
-    dma_ring * r = q->ring;
+static inline dma_data dma_ring_pop_nowait(dma_ring * r) {
     dma_data ddata = { 0 };
 
     if (r->push_idx == r->pop_idx) {
@@ -317,68 +323,95 @@ static inline dma_data dma_queue_pop_nowait(dma_queue * q) {
     return ddata;
 }
 
+static inline bool dma_ring_empty(dma_ring * r) {
+    return r->push_idx == r->pop_idx;
+}
+
+static inline void dma_ring_flush(dma_ring * r) {
+    while (dma_ring_pop(r).dst != 0) ;
+}
+
+static inline uint32_t dma_ring_depth(dma_ring * r) {
+    return (r->push_idx - r->pop_idx) & r->idx_mask;
+}
+
+static inline uint32_t dma_ring_capacity(dma_ring * r) {
+    return r->capacity;
+}
+
+static inline bool dma_queue_push_single_1d(dma_queue * q, dma_data ddata, size_t size) {
+    return dma_ring_push_single_1d(q->ring0, ddata, size);
+}
+
+static inline bool dma_queue_push_single_2d(dma_queue * q, dma_data ddata, size_t dst_stride, size_t src_stride, size_t row_size, size_t nrows) {
+    return dma_ring_push_single_2d(q->ring0, ddata, dst_stride, src_stride, row_size, nrows);
+}
+
+static inline dma_data dma_queue_pop(dma_queue * q) {
+    return dma_ring_pop(q->ring0);
+}
+
+static inline dma_data dma_queue_pop_nowait(dma_queue * q) {
+    return dma_ring_pop_nowait(q->ring0);
+}
+
 static inline bool dma_queue_empty(dma_queue * q) {
-    return q->ring->push_idx == q->ring->pop_idx;
+    return dma_ring_empty(q->ring0);
 }
 
 static inline void dma_queue_flush(dma_queue * q) {
-    while (dma_queue_pop(q).dst != 0) ;
+    dma_ring_flush(q->ring0);
 }
 
 static inline uint32_t dma_queue_depth(dma_queue * q) {
-    return (q->ring->push_idx - q->ring->pop_idx) & q->ring->idx_mask;
+    return dma_ring_depth(q->ring0);
 }
 
 static inline uint32_t dma_queue_capacity(dma_queue * q) {
-    return q->ring->capacity;
+    return dma_ring_capacity(q->ring0);
 }
 
 #if __HVX_ARCH__ < 75
 
-// Overflow-safe DMA push: all 2d descriptor fields (row_size, nrows, src_stride, dst_stride) are 16-bit, max 65535.
-// This version transparently handles values that exceed the 16-bit limit and submits chained DMA transtions.
-
-#define DMA_MAX_FIELD_VAL DMA_MAX_NROWS
-
 static inline bool dma_queue_push(dma_queue *q, dma_data ddata, size_t dst_stride, size_t src_stride, size_t row_size, size_t nrows) {
     // Fast path: everything fits in 16 bits
     if (nrows == 0 || __builtin_expect(
-            row_size   <= DMA_MAX_FIELD_VAL &&
-            nrows      <= DMA_MAX_FIELD_VAL &&
-            src_stride <= DMA_MAX_FIELD_VAL &&
-            dst_stride <= DMA_MAX_FIELD_VAL, 1)) {
-        return dma_queue_push_single_2d(q, ddata, dst_stride, src_stride, row_size, nrows);
+            nrows      <= DMA_MAX_NROWS &&
+            row_size   <= DMA_MAX_SIZE_16B &&
+            src_stride <= DMA_MAX_STRIDE_16B &&
+            dst_stride <= DMA_MAX_STRIDE_16B, 1)) {
+        return dma_ring_push_single_2d(q->ring0, ddata, dst_stride, src_stride, row_size, nrows);
     }
 
-    // Contiguous block
-    // Use 1d DMA mode which supports sizes up to 24-bits (16MB)
+    // Contiguous block: 1D DMA mode supports up to 24-bit size (16MB)
     if (nrows == 1 || (row_size == src_stride && row_size == dst_stride)) {
         size_t total = row_size * nrows;
-        return dma_queue_push_single_1d(q, ddata, total);
+        if (total <= DMA_MAX_SIZE_24B) {
+            return dma_ring_push_single_1d(q->ring0, ddata, total);
+        }
     }
 
-    // Stride overflow - fall back to row-by-row.
-    {
-        size_t r = 0;
-        while (r + 1 < nrows) {
-            dma_data d = dma_make_data(ddata.dst + r * dst_stride, ddata.src + r * src_stride);
-            if (!dma_queue_push_single_1d(q, d, row_size)) {
-                dma_queue_flush(q);
-            } else {
-                r++;
-            }
-        }
-        dma_queue_flush(q);
-        dma_data d = dma_make_data(ddata.dst + r * dst_stride, ddata.src + r * src_stride);
-        return dma_queue_push_single_1d(q, d, row_size);
+    // Row count overflow with 16-bit strides: chunk 2D descriptors via fallback ring
+    if (row_size <= DMA_MAX_SIZE_16B && src_stride <= DMA_MAX_STRIDE_16B && dst_stride <= DMA_MAX_STRIDE_16B) {
+        return dma_queue_push_fallback_2d(q, ddata, dst_stride, src_stride, row_size, nrows);
     }
+
+    // Stride or row_size overflow: row-by-row 1D via fallback ring
+    return dma_queue_push_fallback_1d(q, ddata, dst_stride, src_stride, row_size, nrows);
 }
 
 #else // HVX_ARCH >= 75
 
 static inline bool dma_queue_push(dma_queue *q, dma_data ddata, size_t dst_stride, size_t src_stride, size_t row_size, size_t nrows) {
-    // On v75 and up we always use 2d 24-bit mode
-    return dma_queue_push_single_2d(q, ddata, dst_stride, src_stride, row_size, nrows);
+    if (nrows == 0 || __builtin_expect(
+            nrows      <= DMA_MAX_NROWS &&
+            row_size   <= DMA_MAX_SIZE_24B &&
+            src_stride <= DMA_MAX_STRIDE_24B &&
+            dst_stride <= DMA_MAX_STRIDE_24B, 1)) {
+        return dma_ring_push_single_2d(q->ring0, ddata, dst_stride, src_stride, row_size, nrows);
+    }
+
+    return dma_queue_push_fallback_2d(q, ddata, dst_stride, src_stride, row_size, nrows);
 }
 
 #endif
