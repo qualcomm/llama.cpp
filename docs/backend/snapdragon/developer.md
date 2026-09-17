@@ -146,6 +146,21 @@ Writing high-performance operators for Hexagon requires following specific guide
   python3 scripts/snapdragon/ggml-hexagon-align-macros.py --fix ggml/src/ggml-hexagon/htp/
   ```
 
+### Binary Inspection and Spill Analysis
+
+Use [`scripts/snapdragon/ggml-hexagon-inspect.py`](../../../scripts/snapdragon/ggml-hexagon-inspect.py) to audit Hexagon binaries for register spills, inspect function disassembly, or resolve crash addresses:
+
+```bash
+# Check for vector and scalar register spills
+python3 scripts/snapdragon/ggml-hexagon-inspect.py --spills --func "^compute_"
+
+# Disassemble with annotated loops and spill markers
+python3 scripts/snapdragon/ggml-hexagon-inspect.py --disasm compute_same_shape_div_f32
+
+# Resolve crash addresses to function symbols and lines
+python3 scripts/snapdragon/ggml-hexagon-inspect.py --addr2line 0x51a30 0x5ba54
+```
+
 ## Multi-Device Partitioning (mdev)
 
 Multi-device (mdev) mode enables row-level tensor parallel execution across multiple physical NPU cores or virtual NPU
