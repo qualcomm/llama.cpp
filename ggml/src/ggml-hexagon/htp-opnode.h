@@ -16,6 +16,7 @@
 #include "htp/unary-ops.h"
 #include "htp/allreduce-ops.h"
 #include "htp/ssm-conv.h"
+#include "htp/gated-delta-net-ops.h"
 
 struct htp_opnode {
     ggml_tensor * node   { nullptr };
@@ -354,6 +355,11 @@ struct htp_opformat {
         } else if (node.opcode == HTP_OP_SSM_CONV) {
             const auto * kparams = (const struct htp_ssm_conv_kernel_params *) node.kernel_params;
             snprintf(str, max_size, "%s vtcm %d", kparams->n_t == 1 ? "decode" : "prefill", (int) kparams->vtcm_size);
+        } else if (node.opcode == HTP_OP_GATED_DELTA_NET) {
+            const auto * kparams = (const struct htp_gdn_kernel_params *) node.kernel_params;
+            snprintf(str, max_size, "%s vtcm %u",
+                     kparams->kda ? "kda" : "scalar",
+                     (unsigned int) (kparams->vtcm_size ? kparams->vtcm_size : kparams->vtcm_per_thread * kparams->n_threads));
         } else {
             snprintf(str, max_size, "----");
         }
