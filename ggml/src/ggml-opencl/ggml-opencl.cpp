@@ -1256,6 +1256,7 @@ struct ggml_backend_opencl_context {
     cl_program program_softmax_f16;
     cl_program program_softmax_4_f32;
     cl_program program_softmax_4_f16;
+    cl_program program_mul_mm_q8_kqv;
     cl_program program_argsort_f32_i32;
     cl_program program_top_k = nullptr;
     cl_program program_sum_rows_f32;
@@ -1306,6 +1307,8 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_diag_f32;
     cl_kernel kernel_soft_max, kernel_soft_max_4;
     cl_kernel kernel_soft_max_f16, kernel_soft_max_4_f16, kernel_soft_max_4_f16_nonorm, kernel_fa_scale_rows_f32;
+    cl_kernel kernel_soft_max_4_f16_q8;
+    cl_kernel kernel_mul_mm_q8_kqv;
     ggml_opencl_fa_kernels fa;
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
     ggml_cl_adreno_xmem_attn_state adreno_xmem_attn;
@@ -7621,6 +7624,23 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         CL_CHECK((backend_ctx->kernel_soft_max_4_f16 = clCreateKernel(backend_ctx->program_softmax_4_f16, "kernel_soft_max_4_f16", &err), err));
         CL_CHECK((backend_ctx->kernel_soft_max_4_f16_nonorm = clCreateKernel(backend_ctx->program_softmax_4_f16, "kernel_soft_max_4_f16_nonorm", &err), err));
         CL_CHECK((backend_ctx->kernel_fa_scale_rows_f32 = clCreateKernel(backend_ctx->program_softmax_4_f16, "kernel_fa_scale_rows_f32", &err), err));
+        CL_CHECK((backend_ctx->kernel_soft_max_4_f16_q8 = clCreateKernel(backend_ctx->program_softmax_4_f16, "kernel_soft_max_4_f16_q8", &err), err));
+        GGML_LOG_CONT(".");
+    }
+
+    // mul_mm_q8_kqv
+    {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src {
+            #include "mul_mm_q8_kqv.cl.h"
+        };
+#else
+        const std::string kernel_src = read_file("mul_mm_q8_kqv.cl");
+#endif
+        backend_ctx->program_mul_mm_q8_kqv =
+            build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+
+        CL_CHECK((backend_ctx->kernel_mul_mm_q8_kqv = clCreateKernel(backend_ctx->program_mul_mm_q8_kqv, "kernel_mul_mm_q8_kqv", &err), err));
         GGML_LOG_CONT(".");
     }
 
