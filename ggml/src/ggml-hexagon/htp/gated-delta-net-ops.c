@@ -774,9 +774,10 @@ static void gated_delta_net_f32_pp_thread(unsigned int nth, unsigned int ith, vo
         return;
     }
 
+    const struct htp_tensor * dst_cache = octx->dsts[1];
     const float scale = kparams->scale;
     float * dst_base       = (float *) (uintptr_t) dst->data;
-    float * state_out_base = dst_base + (uint64_t) S_v * H * n_tokens * n_seqs;
+    float * state_out_base = dst_cache ? (float *) (uintptr_t) dst_cache->data : (dst_base + S_v * H * n_tokens * n_seqs);
 
     dma_queue * dma_q = octx->ctx->dma[ith];
     const struct htp_gdn_vtcm_layout * layout = &gctx->layout;
@@ -792,7 +793,7 @@ static void gated_delta_net_f32_pp_thread(unsigned int nth, unsigned int ith, vo
 
     const uint32_t state_seq_stride = kparams->state_seq_stride;
     const uint64_t state_size_per_snap = (uint64_t) kparams->state_size_per_snap;
-    const dma_addr_t state_out_dma_base = dst->data + (uint64_t) S_v * H * n_tokens * n_seqs * sizeof(float);
+    const dma_addr_t state_out_dma_base = dst_cache ? dst_cache->data : (dst->data + S_v * H * n_tokens * n_seqs * sizeof(float));
 
     uint32_t ir_prefetch = gctx->row_start + ith;
     int spad_idx = 0;
@@ -915,6 +916,7 @@ static void gated_delta_net_f32_tg_thread(unsigned int nth, unsigned int ith, vo
         return;
     }
 
+    const struct htp_tensor * dst_cache = octx->dsts[1];
     const float scale = kparams->scale;
     float * dst_base  = (float *) (uintptr_t) dst->data;
 
@@ -931,7 +933,7 @@ static void gated_delta_net_f32_tg_thread(unsigned int nth, unsigned int ith, vo
     const struct fastdiv_values * fd_rk3 = &kparams->div_rk3;
 
     const uint32_t state_seq_stride = kparams->state_seq_stride;
-    const dma_addr_t state_out_dma_base = dst->data + (uint64_t) S_v * H * n_seqs * sizeof(float);
+    const dma_addr_t state_out_dma_base = dst_cache ? dst_cache->data : (dst->data + S_v * H * n_seqs * sizeof(float));
 
     uint32_t ir_prefetch = gctx->row_start + ith;
     int spad_idx = 0;
@@ -1067,6 +1069,12 @@ int op_gated_delta_net(struct htp_ops_context * octx) {
     }
     if (htp_tensor_is_extended(octx->dst)) {
         return HTP_STATUS_NO_SUPPORT;
+    }
+    if (octx->dsts[1]) {
+        const struct htp_tensor * dst_cache = octx->dsts[1];
+        if (dst_cache->type != HTP_TYPE_F32 || htp_tensor_is_extended(dst_cache)) {
+            return HTP_STATUS_NO_SUPPORT;
+        }
     }
 
     const struct htp_gdn_kernel_params * kparams = (const struct htp_gdn_kernel_params *) octx->kernel_params;
