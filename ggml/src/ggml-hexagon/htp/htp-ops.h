@@ -158,7 +158,7 @@ struct htp_buf_desc {
 };
 
 enum htp_op_flags {
-    HTP_OPFLAGS_SKIP_COMPUTE  = (1U << 0), // Skip actual computation (used for profiling)
+    HTP_OPFLAGS_STUB  = (1U << 0),
 };
 
 // Op descriptor
