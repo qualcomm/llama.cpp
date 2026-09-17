@@ -1295,6 +1295,40 @@ static inline void gdn_pack_d_t_row_tiles(
     }
 }
 
+static __attribute__((noinline)) void gdn_build_inv_l_and_a(
+    HVX_Vector * restrict rows_inv,
+    HVX_Vector * restrict rows_a,
+    const HVX_Vector * restrict rows_kk,
+    const HVX_Vector * restrict rows_qk,
+    const __fp16 * restrict decay_m,
+    const __fp16 * restrict decay_a,
+    const float * restrict beta
+) {
+    const HVX_Vector v_one_f16 = hvx_vec_splat_f16(1.0f);
+    HVX_VectorAlias local_row_m;
+
+    for (uint32_t t = 0; t < 64; ++t) {
+        HVX_Vector v_decay_m = hvx_vmemu(decay_m + t * 64);
+        HVX_Vector v_scale_t = hvx_vec_splat_f16(beta[t]);
+        HVX_Vector row_m     = hvx_vec_mul_f16_f16(hvx_vec_mul_f16_f16(rows_kk[t], v_decay_m), v_scale_t);
+
+        HVX_Vector v_decay_a = hvx_vmemu(decay_a + t * 64);
+        rows_a[t]            = hvx_vec_mul_f16_f16(rows_qk[t], v_decay_a);
+
+        HVX_Vector v_inv_t = Q6_V_vzero();
+        local_row_m.v = row_m;
+
+        for (uint32_t k_idx = 0; k_idx < t; ++k_idx) {
+            if (local_row_m.fp16[k_idx] != 0.0f) {
+                HVX_Vector v_lk = hvx_vec_splat_f16(local_row_m.fp16[k_idx]);
+                v_inv_t = hvx_vec_sub_f16_f16(v_inv_t, hvx_vec_mul_f16_f16(v_lk, rows_inv[k_idx]));
+            }
+        }
+        HVX_VectorPred q_diag = (t == 0) ? Q6_Q_vsetq2_R(2) : Q6_Q_and_QQn(Q6_Q_vsetq2_R(2 * (t + 1)), Q6_Q_vsetq2_R(2 * t));
+        rows_inv[t] = Q6_V_vmux_QVV(q_diag, v_one_f16, v_inv_t);
+    }
+}
+
 static int gated_delta_net_f32_hmx_chunked(
     struct htp_ops_context * octx,
     const struct htp_gdn_kernel_params * kparams,
@@ -1363,7 +1397,8 @@ static int gated_delta_net_f32_hmx_chunked(
 
     float * gamma         = (float *) vtcm_seq_alloc(&vtcm_cur, hex_round_up(chunk_size * sizeof(float), 128));
     float * lambda_init   = (float *) vtcm_seq_alloc(&vtcm_cur, hex_round_up(chunk_size * sizeof(float), 128));
-    float * exp_neg_gamma = (float *) vtcm_seq_alloc(&vtcm_cur, hex_round_up(chunk_size * sizeof(float), 128));
+    __fp16 * decay_m      = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, 64 * 64 * sizeof(__fp16));
+    __fp16 * decay_a      = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, 64 * 64 * sizeof(__fp16));
 
     HVX_Vector * rows_kk  = (HVX_Vector *) vtcm_seq_alloc(&vtcm_cur, 64 * sizeof(HVX_Vector));
     HVX_Vector * rows_qk  = (HVX_Vector *) vtcm_seq_alloc(&vtcm_cur, 64 * sizeof(HVX_Vector));
@@ -1372,8 +1407,6 @@ static int gated_delta_net_f32_hmx_chunked(
     HVX_Vector * vtcm_m   = (HVX_Vector *) vtcm_seq_alloc(&vtcm_cur, 32 * sizeof(HVX_Vector));
     HVX_Vector * vtcm_tmp = (HVX_Vector *) vtcm_seq_alloc(&vtcm_cur, 32 * sizeof(HVX_Vector));
 
-    __fp16 * vtcm_l_row    = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, 128);
-    __fp16 * vtcm_inv_buf  = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, 128);
     float  * vtcm_attn_rem = (float *)  vtcm_seq_alloc(&vtcm_cur, 128 * sizeof(float));
 
     if ((size_t) (vtcm_cur - octx->ctx->vtcm_base) > octx->ctx->vtcm_size) {
@@ -1435,11 +1468,30 @@ static int gated_delta_net_f32_hmx_chunked(
                 gamma[t] = gamma[t - 1] + vtcm_g_f32[t];
             }
             for (uint32_t t = 0; t < 64; ++t) {
-                lambda_init[t] = expf(gamma[t]);
-                exp_neg_gamma[t] = expf(-gamma[t]);
+                float val = gamma[t];
+                if (val < -20.0f) val = -20.0f;
+                if (val > 0.0f) val = 0.0f;
+                lambda_init[t] = expf(val);
             }
 
-            HVX_Vector v_exp_neg = hvx_vec_f32_to_f16(hvx_vmemu(exp_neg_gamma + 0), hvx_vmemu(exp_neg_gamma + 32));
+            for (uint32_t t = 0; t < 64; ++t) {
+                const float gamma_t = gamma[t];
+                for (uint32_t s = 0; s < 64; ++s) {
+                    if (s < t) {
+                        float diff = gamma_t - gamma[s];
+                        if (diff < -20.0f) diff = -20.0f;
+                        if (diff > 0.0f) diff = 0.0f;
+                        decay_m[t * 64 + s] = (__fp16) expf(diff);
+                        decay_a[t * 64 + s] = (__fp16) expf(diff);
+                    } else if (s == t) {
+                        decay_m[t * 64 + s] = 0.0f;
+                        decay_a[t * 64 + s] = 1.0f;
+                    } else {
+                        decay_m[t * 64 + s] = 0.0f;
+                        decay_a[t * 64 + s] = 0.0f;
+                    }
+                }
+            }
 
             gdn_f32_to_hmx_row_tiles(vtcm_k_row_tiles, vtcm_k_f32, NULL, 64, S_v);
 
@@ -1479,31 +1531,7 @@ static int gated_delta_net_f32_hmx_chunked(
             gdn_unpack_64x64_tiles_to_vectors(rows_kk, vtcm_kk_tiles);
             gdn_unpack_64x64_tiles_to_vectors(rows_qk, vtcm_qk_tiles);
 
-            for (uint32_t t = 0; t < 64; ++t) {
-                HVX_VectorPred q_strict_lower = Q6_Q_vsetq2_R(t * sizeof(__fp16));
-                HVX_Vector kk_lower = Q6_V_vmux_QVV(q_strict_lower, rows_kk[t], Q6_V_vzero());
-                float scale_t = vtcm_b_f32[t] * lambda_init[t];
-                HVX_Vector v_scale_t = hvx_vec_splat_f16(scale_t);
-                HVX_Vector row_m = hvx_vec_mul_f16_f16(hvx_vec_mul_f16_f16(kk_lower, v_exp_neg), v_scale_t);
-
-                HVX_VectorPred q_causal = Q6_Q_vsetq2_R((t + 1) * sizeof(__fp16));
-                HVX_Vector qk_causal = Q6_V_vmux_QVV(q_causal, rows_qk[t], Q6_V_vzero());
-                HVX_Vector v_lambda_t = hvx_vec_splat_f16(lambda_init[t]);
-                rows_a[t] = hvx_vec_mul_f16_f16(hvx_vec_mul_f16_f16(qk_causal, v_exp_neg), v_lambda_t);
-
-                HVX_Vector v_inv_t = Q6_V_vzero();
-                hvx_vec_store_u(vtcm_l_row, 64 * sizeof(__fp16), row_m);
-
-                for (uint32_t k_idx = 0; k_idx < t; ++k_idx) {
-                    if (vtcm_l_row[k_idx] != 0.0f) {
-                        HVX_Vector v_lk = hvx_vec_splat_f16(vtcm_l_row[k_idx]);
-                        v_inv_t = hvx_vec_sub_f16_f16(v_inv_t, hvx_vec_mul_f16_f16(v_lk, rows_inv[k_idx]));
-                    }
-                }
-                hvx_vec_store_u(vtcm_inv_buf, 64 * sizeof(__fp16), v_inv_t);
-                vtcm_inv_buf[t] = 1.0f;
-                rows_inv[t] = hvx_vmemu(vtcm_inv_buf);
-            }
+            gdn_build_inv_l_and_a(rows_inv, rows_a, rows_kk, rows_qk, decay_m, decay_a, vtcm_b_f32);
 
             gdn_pack_64x64_vectors_to_tiles(vtcm_inv_row_tiles, rows_inv);
             gdn_pack_64x64_vectors_to_tiles(vtcm_a_row_tiles, rows_a);
@@ -1534,6 +1562,7 @@ static int gated_delta_net_f32_hmx_chunked(
             htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) c);
 
             gdn_unpack_64xS_tiles_to_f16(vtcm_delta_f16, vtcm_delta_tiles, S_v);
+
             hmx_interleave_cols_to_tiles(vtcm_delta_col_tiles, vtcm_delta_f16, 64, S_v, S_v, 2, 0, 64);
 
             htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) c);
@@ -1553,7 +1582,7 @@ static int gated_delta_net_f32_hmx_chunked(
             }
 
             for (uint32_t s = 0; s < 64; ++s) {
-                float decay_s = expf(gamma[63] - gamma[s]);
+                float decay_s = (float) decay_a[63 * 64 + s];
                 HVX_Vector vs = hvx_vec_splat_f16(decay_s);
                 for (uint32_t i = 0; i < S_v; i += 64) {
                     HVX_Vector vd = hvx_vmemu(vtcm_delta_f16 + s * S_v + i);
