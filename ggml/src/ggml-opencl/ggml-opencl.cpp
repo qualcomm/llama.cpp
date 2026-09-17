@@ -1588,7 +1588,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_conv_2d_f16;
     cl_kernel kernel_conv_2d_f32;
     cl_kernel kernel_conv_2d_f16_f32;
-    cl_kernel kernel_ssm_conv_f32_f32, kernel_ssm_conv_f32_f32_4;
+    cl_kernel kernel_ssm_conv_f32_f32, kernel_ssm_conv_f32_f32_4, kernel_ssm_conv_f32_f32_tpi;
     // [size_idx][kda][tgpp] where size_idx: 0=S_V=16, 1=32, 2=64, 3=128; kda: 0 or 1.
     // tgpp 0 = TG variant (COLS_PER_LANE_GROUP=1), tgpp 1 = prefill variant (COLS_PER_LANE_GROUP=4).
     cl_kernel kernel_gated_delta_net_f32[4][2][2] = {};
@@ -8171,6 +8171,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 
         CL_CHECK((backend_ctx->kernel_ssm_conv_f32_f32   = clCreateKernel(prog, "kernel_ssm_conv_f32_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_ssm_conv_f32_f32_4 = clCreateKernel(prog, "kernel_ssm_conv_f32_f32_4", &err), err));
+        CL_CHECK((backend_ctx->kernel_ssm_conv_f32_f32_tpi = clCreateKernel(prog, "kernel_ssm_conv_f32_f32_tpi", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
@@ -25751,10 +25752,23 @@ static void ggml_cl_ssm_conv(ggml_backend_t backend, const ggml_tensor * src0, c
     cl_ulong nb1 = dst->nb[1];
     cl_ulong nb2 = dst->nb[2];
 
+    // Tokens per work item. The conv window slides by one element per token, so making several
+    // tokens in one work item keeps the window in registers and drops the reload. Gated until
+    // measured; the value is the tile length.
+    static const int tpi = []{
+        const char * e = getenv("GGML_OPENCL_SSM_CONV_TPI");
+        return e ? atoi(e) : 0;
+    }();
+    const bool tile = tpi > 0;
+
     cl_kernel kernel = backend_ctx->kernel_ssm_conv_f32_f32;
 
     if (ne10 % 4 == 0) {
         kernel = backend_ctx->kernel_ssm_conv_f32_f32_4;
+    }
+
+    if (tile) {
+        kernel = backend_ctx->kernel_ssm_conv_f32_f32_tpi;
     }
 
     CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0->data_device));
@@ -25771,8 +25785,12 @@ static void ggml_cl_ssm_conv(ggml_backend_t backend, const ggml_tensor * src0, c
     CL_CHECK(clSetKernelArg(kernel, 11, sizeof(cl_ulong), &nb0));
     CL_CHECK(clSetKernelArg(kernel, 12, sizeof(cl_ulong), &nb1));
     CL_CHECK(clSetKernelArg(kernel, 13, sizeof(cl_ulong), &nb2));
+    if (tile) {
+        CL_CHECK(clSetKernelArg(kernel, 14, sizeof(int), &ne1));
+        CL_CHECK(clSetKernelArg(kernel, 15, sizeof(int), &tpi));
+    }
 
-    size_t global_work_size[] = {(size_t)ne01, (size_t)ne1, (size_t)ne2};
+    size_t global_work_size[] = {(size_t)ne01, (size_t)(tile ? (ne1 + tpi - 1)/tpi : ne1), (size_t)ne2};
     size_t local_work_size[]  = {64, 1, 1};
 
     size_t * local_work_size_ptr = local_work_size;
