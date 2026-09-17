@@ -242,6 +242,9 @@ kernel void kernel_fa_scale_rows_f32(
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
 #endif
+// The parameter list after the three output pairs matches kernel_soft_max_4_f16_nonorm exactly,
+// so the host sets the arguments with the same loop and only the leading count changes. dst and
+// nb1..nb3 are unused here - P goes to qp/dp instead of the f32 score matrix.
 kernel void kernel_soft_max_4_f16_q8(
         global uchar * qp,
         ulong offset_qp,
@@ -255,6 +258,8 @@ kernel void kernel_soft_max_4_f16_q8(
         ulong offset1,
         global char * src2,
         ulong offset2,
+        global char * dst,
+        ulong offsetd,
         int ne00,
         ulong nb01,
         ulong nb02,
@@ -264,6 +269,9 @@ kernel void kernel_soft_max_4_f16_q8(
         ulong nb11,
         ulong nb12,
         ulong nb13,
+        ulong nb1,
+        ulong nb2,
+        ulong nb3,
         float scale,
         float max_bias,
         float m0,
@@ -273,6 +281,8 @@ kernel void kernel_soft_max_4_f16_q8(
     src0 = src0 + offset0;
     src1 = src1 + offset1;
     src2 = src2 + offset2;
+
+    (void) dst; (void) offsetd; (void) nb1; (void) nb2; (void) nb3;
 
     int i03 = get_group_id(2);
     int i02 = get_group_id(1);
