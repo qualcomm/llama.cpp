@@ -16,7 +16,7 @@ void ggml_cl_load_kernels_clamp(ggml_backend_opencl_context * backend_ctx) {
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
 
-        CL_CHECK((backend_ctx->kernel_clamp = clCreateKernel(prog, "kernel_clamp", &err), err));
+        CL_CHECK((backend_ctx->clamp.kernel_clamp = clCreateKernel(prog, "kernel_clamp", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
@@ -43,7 +43,7 @@ void ggml_cl_clamp(ggml_backend_t backend, const ggml_tensor * src0, const ggml_
     memcpy(&min, ((int32_t *) dst->op_params) + 0, sizeof(float));
     memcpy(&max, ((int32_t *) dst->op_params) + 1, sizeof(float));
 
-    cl_kernel kernel = backend_ctx->kernel_clamp;
+    cl_kernel kernel = backend_ctx->clamp.kernel_clamp;
 
     CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),   &extra0->data_device));
     CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_ulong), &offset0));
