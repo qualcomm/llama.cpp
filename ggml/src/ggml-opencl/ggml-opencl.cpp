@@ -248,6 +248,7 @@ static bool ggml_cl_is_q8_0_soa(const ggml_tensor * tensor);
 
 static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
 static void ggml_cl_soft_max(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
+static void ggml_cl_soft_max_ex(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, cl_mem sums);
 static void ggml_cl_cpy(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
 
 // See https://gmplib.org/~tege/divcnst-pldi94.pdf figure 4.1.
@@ -1189,6 +1190,8 @@ struct ggml_backend_opencl_context {
     ggml_cl_buffer prealloc_fa_vt;
     ggml_cl_buffer prealloc_fa_kq;
     ggml_cl_buffer prealloc_fa_kqv;
+    // Row sums published by the deferred-normalisation softmax.
+    ggml_cl_buffer prealloc_fa_sums;
     // Diagnostic: force the decomposition's GEMMs onto the generic mul_mat path,
     // to tell a bug in this plumbing apart from one in the tuned image kernels.
     bool fa_decompose_generic_gemm = false;
@@ -1302,7 +1305,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_diag_mask_inf, kernel_diag_mask_inf_8;
     cl_kernel kernel_diag_f32;
     cl_kernel kernel_soft_max, kernel_soft_max_4;
-    cl_kernel kernel_soft_max_f16, kernel_soft_max_4_f16;
+    cl_kernel kernel_soft_max_f16, kernel_soft_max_4_f16, kernel_soft_max_4_f16_nonorm, kernel_fa_scale_rows_f32;
     ggml_opencl_fa_kernels fa;
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
     ggml_cl_adreno_xmem_attn_state adreno_xmem_attn;
@@ -7616,6 +7619,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
 
         CL_CHECK((backend_ctx->kernel_soft_max_4_f16 = clCreateKernel(backend_ctx->program_softmax_4_f16, "kernel_soft_max_4_f16", &err), err));
+        CL_CHECK((backend_ctx->kernel_soft_max_4_f16_nonorm = clCreateKernel(backend_ctx->program_softmax_4_f16, "kernel_soft_max_4_f16_nonorm", &err), err));
+        CL_CHECK((backend_ctx->kernel_fa_scale_rows_f32 = clCreateKernel(backend_ctx->program_softmax_4_f16, "kernel_fa_scale_rows_f32", &err), err));
         GGML_LOG_CONT(".");
     }
 
@@ -30037,6 +30042,9 @@ static bool ggml_cl_flash_attn_decompose(
     backend_ctx->prealloc_fa_vt.allocate(backend_ctx->context, vt_bytes);
     backend_ctx->prealloc_fa_kq.allocate(backend_ctx->context, kq_bytes);
     backend_ctx->prealloc_fa_kqv.allocate(backend_ctx->context, kqv_bytes);
+    // One float per (query row, head) for the deferred softmax normalisation.
+    backend_ctx->prealloc_fa_sums.allocate(backend_ctx->context,
+        (size_t)n_q_chunk*n_head*sizeof(float));
 
     static const bool generic_gemm = ggml_cl_env_flag("GGML_OPENCL_FA_DECOMPOSE_GENERIC");
     backend_ctx->fa_decompose_generic_gemm = generic_gemm;
@@ -30084,6 +30092,14 @@ static bool ggml_cl_flash_attn_decompose(
     ggml_cl_fa_scratch_tensor(vt, extra_vt, backend_ctx->prealloc_fa_vt.buffer,
                               GGML_TYPE_F16, GGML_OP_NONE, n_kv, dv, n_head_kv, "fa_vt");
 
+    // Defer the softmax normalisation into the KQV result. Off by default; the arithmetic is
+    // equivalent but not bit-identical (1/sum is applied once per output row instead of to every
+    // probability), so it is gated until it has a correctness run behind it.
+    static const bool defer_norm = []{
+        const char * e = getenv("GGML_OPENCL_FA_SOFTMAX_DEFER_NORM");
+        return e && atoi(e) != 0;
+    }();
+
     for (int64_t q0 = 0; q0 < n_q; q0 += n_q_chunk) {
         const int64_t nqc = MIN(n_q_chunk, (int64_t)n_q - q0);
 
@@ -30115,13 +30131,36 @@ static bool ggml_cl_flash_attn_decompose(
                 mask_chunk.view_offs = mask->view_offs + (size_t)q0 * mask->nb[1];
                 mask_arg = &mask_chunk;
             }
-            ggml_cl_soft_max(backend, &kq, mask_arg, &kq_sm);
+            ggml_cl_soft_max_ex(backend, &kq, mask_arg, &kq_sm,
+                                defer_norm ? backend_ctx->prealloc_fa_sums.buffer : nullptr);
         }
 
         // ---- KQV: [n_kv,dv,n_head_kv]^T x [n_kv,nqc,n_head] -> [dv,nqc,n_head]
         ggml_cl_fa_scratch_tensor(kqv, extra_kqv, backend_ctx->prealloc_fa_kqv.buffer,
                                   GGML_TYPE_F32, GGML_OP_MUL_MAT, dv, nqc, n_head, "fa_kqv");
         ggml_cl_mul_mat(backend, &vt, &kq, &kqv);
+
+        // ---- deferred normalisation: out[:, n, h] /= sum[n, h] -----------------
+        // The softmax above left exp(x - max) in the scores and published the row sums, which
+        // saves a whole read+write of the n_kv x nqc score matrix. Applying 1/sum here instead
+        // costs one pass over the dv x nqc x n_head result - orders of magnitude smaller.
+        if (defer_norm) {
+            ggml_tensor_extra_cl * extra_kqv_s = (ggml_tensor_extra_cl *)kqv.extra;
+            cl_kernel ks = backend_ctx->kernel_fa_scale_rows_f32;
+            cl_ulong  off_kqv = extra_kqv_s->offset + kqv.view_offs;
+            cl_ulong  off_sums = 0;
+            const int dv_i  = (int)dv;
+            const int ne1_i = (int)nqc;
+            CL_CHECK(clSetKernelArg(ks, 0, sizeof(cl_mem),   &extra_kqv_s->data_device));
+            CL_CHECK(clSetKernelArg(ks, 1, sizeof(cl_ulong), &off_kqv));
+            CL_CHECK(clSetKernelArg(ks, 2, sizeof(cl_mem),   &backend_ctx->prealloc_fa_sums.buffer));
+            CL_CHECK(clSetKernelArg(ks, 3, sizeof(cl_ulong), &off_sums));
+            CL_CHECK(clSetKernelArg(ks, 4, sizeof(int),      &dv_i));
+            CL_CHECK(clSetKernelArg(ks, 5, sizeof(int),      &ne1_i));
+            size_t gws[3] = {(size_t)64*nqc, (size_t)n_head, 1};
+            size_t lws[3] = {64, 1, 1};
+            backend_ctx->enqueue_ndrange_kernel(ks, 3, gws, lws, &kqv);
+        }
 
         // ---- permute into dst: [dv,nqc,n_head] -> dst[dv,n_head,q0+nqc) ------
         {
@@ -49601,6 +49640,10 @@ static void ggml_cl_diag(ggml_backend_t backend, const ggml_tensor * src0, const
 }
 
 static void ggml_cl_soft_max(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    ggml_cl_soft_max_ex(backend, src0, src1, dst, nullptr);
+}
+
+static void ggml_cl_soft_max_ex(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, cl_mem sums) {
     GGML_ASSERT(src0);
     GGML_ASSERT(src0->extra);
     GGML_ASSERT(dst);
@@ -49684,7 +49727,10 @@ static void ggml_cl_soft_max(ggml_backend_t backend, const ggml_tensor * src0, c
 
     if (ne00%4 == 0) {
         if (use_f16) {
-            kernel = backend_ctx->kernel_soft_max_4_f16;
+            // With a sums buffer the caller wants the normalisation deferred: this variant leaves
+            // exp(x - max) in dst and publishes the row sums for the consumer to fold in.
+            kernel = sums ? backend_ctx->kernel_soft_max_4_f16_nonorm
+                          : backend_ctx->kernel_soft_max_4_f16;
         } else {
             kernel = backend_ctx->kernel_soft_max_4;
         }
@@ -49696,31 +49742,37 @@ static void ggml_cl_soft_max(ggml_backend_t backend, const ggml_tensor * src0, c
         }
     }
 
-    CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0->data_device));
-    CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_ulong), &offset0));
-    CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),   extra1 ? &extra1->data_device : &extra0->data_device));
-    CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_ulong), &offset1));
-    CL_CHECK(clSetKernelArg(kernel,  4, sizeof(cl_mem),   extra2 ? &extra2->data_device : &extra0->data_device));
-    CL_CHECK(clSetKernelArg(kernel,  5, sizeof(cl_ulong), &offset2));
-    CL_CHECK(clSetKernelArg(kernel,  6, sizeof(cl_mem),   &extrad->data_device));
-    CL_CHECK(clSetKernelArg(kernel,  7, sizeof(cl_ulong), &offsetd));
-    CL_CHECK(clSetKernelArg(kernel,  8, sizeof(int),      &ne00));
-    CL_CHECK(clSetKernelArg(kernel,  9, sizeof(cl_ulong), &nb01));
-    CL_CHECK(clSetKernelArg(kernel, 10, sizeof(cl_ulong), &nb02));
-    CL_CHECK(clSetKernelArg(kernel, 11, sizeof(cl_ulong), &nb03));
-    CL_CHECK(clSetKernelArg(kernel, 12, sizeof(int),      &ne12));
-    CL_CHECK(clSetKernelArg(kernel, 13, sizeof(int),      &ne13));
-    CL_CHECK(clSetKernelArg(kernel, 14, sizeof(cl_ulong), &nb11));
-    CL_CHECK(clSetKernelArg(kernel, 15, sizeof(cl_ulong), &nb12));
-    CL_CHECK(clSetKernelArg(kernel, 16, sizeof(cl_ulong), &nb13));
-    CL_CHECK(clSetKernelArg(kernel, 17, sizeof(cl_ulong), &nb1));
-    CL_CHECK(clSetKernelArg(kernel, 18, sizeof(cl_ulong), &nb2));
-    CL_CHECK(clSetKernelArg(kernel, 19, sizeof(cl_ulong), &nb3));
-    CL_CHECK(clSetKernelArg(kernel, 20, sizeof(float),    &scale));
-    CL_CHECK(clSetKernelArg(kernel, 21, sizeof(float),    &max_bias));
-    CL_CHECK(clSetKernelArg(kernel, 22, sizeof(float),    &m0));
-    CL_CHECK(clSetKernelArg(kernel, 23, sizeof(float),    &m1));
-    CL_CHECK(clSetKernelArg(kernel, 24, sizeof(int),      &n_head_log2));
+    cl_uint a = 0;
+    if (sums) {
+        const cl_ulong offset_sums = 0;
+        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &sums));
+        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &offset_sums));
+    }
+    CL_CHECK(clSetKernelArg(kernel, a+0, sizeof(cl_mem),   &extra0->data_device));
+    CL_CHECK(clSetKernelArg(kernel, a+1, sizeof(cl_ulong), &offset0));
+    CL_CHECK(clSetKernelArg(kernel, a+2, sizeof(cl_mem),   extra1 ? &extra1->data_device : &extra0->data_device));
+    CL_CHECK(clSetKernelArg(kernel, a+3, sizeof(cl_ulong), &offset1));
+    CL_CHECK(clSetKernelArg(kernel, a+4, sizeof(cl_mem),   extra2 ? &extra2->data_device : &extra0->data_device));
+    CL_CHECK(clSetKernelArg(kernel, a+5, sizeof(cl_ulong), &offset2));
+    CL_CHECK(clSetKernelArg(kernel, a+6, sizeof(cl_mem),   &extrad->data_device));
+    CL_CHECK(clSetKernelArg(kernel, a+7, sizeof(cl_ulong), &offsetd));
+    CL_CHECK(clSetKernelArg(kernel, a+8, sizeof(int),      &ne00));
+    CL_CHECK(clSetKernelArg(kernel, a+9, sizeof(cl_ulong), &nb01));
+    CL_CHECK(clSetKernelArg(kernel, a+10, sizeof(cl_ulong), &nb02));
+    CL_CHECK(clSetKernelArg(kernel, a+11, sizeof(cl_ulong), &nb03));
+    CL_CHECK(clSetKernelArg(kernel, a+12, sizeof(int),      &ne12));
+    CL_CHECK(clSetKernelArg(kernel, a+13, sizeof(int),      &ne13));
+    CL_CHECK(clSetKernelArg(kernel, a+14, sizeof(cl_ulong), &nb11));
+    CL_CHECK(clSetKernelArg(kernel, a+15, sizeof(cl_ulong), &nb12));
+    CL_CHECK(clSetKernelArg(kernel, a+16, sizeof(cl_ulong), &nb13));
+    CL_CHECK(clSetKernelArg(kernel, a+17, sizeof(cl_ulong), &nb1));
+    CL_CHECK(clSetKernelArg(kernel, a+18, sizeof(cl_ulong), &nb2));
+    CL_CHECK(clSetKernelArg(kernel, a+19, sizeof(cl_ulong), &nb3));
+    CL_CHECK(clSetKernelArg(kernel, a+20, sizeof(float),    &scale));
+    CL_CHECK(clSetKernelArg(kernel, a+21, sizeof(float),    &max_bias));
+    CL_CHECK(clSetKernelArg(kernel, a+22, sizeof(float),    &m0));
+    CL_CHECK(clSetKernelArg(kernel, a+23, sizeof(float),    &m1));
+    CL_CHECK(clSetKernelArg(kernel, a+24, sizeof(int),      &n_head_log2));
 
     size_t global_work_size[] = {(size_t)ne01*nth, (size_t)ne02, (size_t)ne03};
     size_t local_work_size[] = {(size_t)nth, 1, 1};
