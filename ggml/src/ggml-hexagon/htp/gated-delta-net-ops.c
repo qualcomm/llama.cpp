@@ -1352,66 +1352,70 @@ static int gated_delta_net_f32_hmx_chunked(
     const uint32_t n_chunks   = kparams->n_chunks;
     const uint32_t n_sv_tiles = S_v / 32;
 
-    uint8_t * vtcm_cur = (uint8_t *) octx->ctx->vtcm_base;
+    struct htp_gdn_hmx_vtcm_layout L;
+    htp_gdn_hmx_vtcm_layout_build(&L, S_v, chunk_size, kparams->n_heads_batch, kparams->n_threads, kparams->pipeline != 0);
 
-    float *  vtcm_s_state     = (float *)  vtcm_seq_alloc(&vtcm_cur, hex_round_up(S_v * S_v * sizeof(float), 2048));
-    __fp16 * vtcm_s_f16       = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, hex_round_up(S_v * S_v * sizeof(__fp16), 2048));
-    __fp16 * vtcm_s_col_tiles = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, 16 * HMX_FP16_TILE_SIZE);
-
-    float * vtcm_q_f32 = (float *) vtcm_seq_alloc(&vtcm_cur, hex_round_up(chunk_size * S_v * sizeof(float), 2048));
-    float * vtcm_k_f32 = (float *) vtcm_seq_alloc(&vtcm_cur, hex_round_up(chunk_size * S_v * sizeof(float), 2048));
-    float * vtcm_v_f32 = (float *) vtcm_seq_alloc(&vtcm_cur, hex_round_up(chunk_size * S_v * sizeof(float), 2048));
-    float * vtcm_g_f32 = (float *) vtcm_seq_alloc(&vtcm_cur, hex_round_up(chunk_size * sizeof(float), 2048));
-    float * vtcm_b_f32 = (float *) vtcm_seq_alloc(&vtcm_cur, hex_round_up(chunk_size * sizeof(float), 2048));
-    float * vtcm_o_f32 = (float *) vtcm_seq_alloc(&vtcm_cur, hex_round_up(chunk_size * S_v * sizeof(float), 2048));
-
-    float * vtcm_v_inter_f32 = (float *) vtcm_seq_alloc(&vtcm_cur, hex_round_up(chunk_size * S_v * sizeof(float), 2048));
-    float * vtcm_o_inter_f32 = (float *) vtcm_seq_alloc(&vtcm_cur, hex_round_up(chunk_size * S_v * sizeof(float), 2048));
-    float * vtcm_o_intra_f32 = (float *) vtcm_seq_alloc(&vtcm_cur, hex_round_up(chunk_size * S_v * sizeof(float), 2048));
-    float * vtcm_s_update_f32 = (float *) vtcm_seq_alloc(&vtcm_cur, hex_round_up(S_v * S_v * sizeof(float), 2048));
-
-    __fp16 * vtcm_k_f16       = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, hex_round_up(chunk_size * S_v * sizeof(__fp16), 2048));
-    __fp16 * vtcm_v_prime_f16 = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, hex_round_up(chunk_size * S_v * sizeof(__fp16), 2048));
-    __fp16 * vtcm_delta_f16   = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, hex_round_up(chunk_size * S_v * sizeof(__fp16), 2048));
-    __fp16 * vtcm_d_f16       = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, hex_round_up(chunk_size * S_v * sizeof(__fp16), 2048));
-
-    __fp16 * vtcm_q_row_tiles        = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, 8 * HMX_FP16_TILE_SIZE);
-    __fp16 * vtcm_k_row_tiles        = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, 8 * HMX_FP16_TILE_SIZE);
-    __fp16 * vtcm_k_col_tiles        = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, 8 * HMX_FP16_TILE_SIZE);
-    __fp16 * vtcm_k_prime_row_tiles  = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, 8 * HMX_FP16_TILE_SIZE);
-    __fp16 * vtcm_k_col_tiles_64x128 = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, 8 * HMX_FP16_TILE_SIZE);
-    __fp16 * vtcm_kk_tiles           = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, 4 * HMX_FP16_TILE_SIZE);
-    __fp16 * vtcm_qk_tiles           = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, 4 * HMX_FP16_TILE_SIZE);
-    __fp16 * vtcm_v_inter_tiles      = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, 8 * HMX_FP16_TILE_SIZE);
-    __fp16 * vtcm_o_inter_tiles      = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, 8 * HMX_FP16_TILE_SIZE);
-    __fp16 * vtcm_inv_row_tiles      = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, 4 * HMX_FP16_TILE_SIZE);
-    __fp16 * vtcm_a_row_tiles        = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, 4 * HMX_FP16_TILE_SIZE);
-    __fp16 * vtcm_v_prime_col_tiles  = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, 8 * HMX_FP16_TILE_SIZE);
-    __fp16 * vtcm_delta_tiles        = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, 8 * HMX_FP16_TILE_SIZE);
-    __fp16 * vtcm_delta_col_tiles    = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, 8 * HMX_FP16_TILE_SIZE);
-    __fp16 * vtcm_o_intra_tiles      = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, 8 * HMX_FP16_TILE_SIZE);
-    __fp16 * vtcm_d_row_tiles        = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, 8 * HMX_FP16_TILE_SIZE);
-    __fp16 * vtcm_s_update_tiles     = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, 16 * HMX_FP16_TILE_SIZE);
-
-    uint8_t * vtcm_scales_1 = vtcm_seq_alloc(&vtcm_cur, 256);
-
-    float * gamma         = (float *) vtcm_seq_alloc(&vtcm_cur, hex_round_up(chunk_size * sizeof(float), 128));
-    float * lambda_init   = (float *) vtcm_seq_alloc(&vtcm_cur, hex_round_up(chunk_size * sizeof(float), 128));
-    __fp16 * decay_m      = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, 64 * 64 * sizeof(__fp16));
-    __fp16 * decay_a      = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, 64 * 64 * sizeof(__fp16));
-
-    HVX_Vector * rows_kk  = (HVX_Vector *) vtcm_seq_alloc(&vtcm_cur, 64 * sizeof(HVX_Vector));
-    HVX_Vector * rows_qk  = (HVX_Vector *) vtcm_seq_alloc(&vtcm_cur, 64 * sizeof(HVX_Vector));
-    HVX_Vector * rows_inv = (HVX_Vector *) vtcm_seq_alloc(&vtcm_cur, 64 * sizeof(HVX_Vector));
-    HVX_Vector * rows_a   = (HVX_Vector *) vtcm_seq_alloc(&vtcm_cur, 64 * sizeof(HVX_Vector));
-    HVX_Vector * vtcm_m   = (HVX_Vector *) vtcm_seq_alloc(&vtcm_cur, 32 * sizeof(HVX_Vector));
-    HVX_Vector * vtcm_tmp = (HVX_Vector *) vtcm_seq_alloc(&vtcm_cur, 32 * sizeof(HVX_Vector));
-
-    float  * vtcm_attn_rem = (float *)  vtcm_seq_alloc(&vtcm_cur, 128 * sizeof(float));
-
-    if ((size_t) (vtcm_cur - octx->ctx->vtcm_base) > octx->ctx->vtcm_size) {
+    if (L.total_bytes > octx->ctx->vtcm_size) {
         return HTP_STATUS_VTCM_TOO_SMALL;
     }
+
+    uint8_t * const vtcm_base = (uint8_t *) octx->ctx->vtcm_base;
+
+    float *  vtcm_s_state     = VTCM_LAYOUT_PTR(float, vtcm_base, L.off_s_state);
+    __fp16 * vtcm_s_f16       = VTCM_LAYOUT_PTR(__fp16, vtcm_base, L.off_s_f16);
+    __fp16 * vtcm_s_col_tiles = VTCM_LAYOUT_PTR(__fp16, vtcm_base, L.off_s_col_tiles);
+
+    float * vtcm_q_f32 = VTCM_LAYOUT_PTR(float, vtcm_base, L.off_q_f32[0]);
+    float * vtcm_k_f32 = VTCM_LAYOUT_PTR(float, vtcm_base, L.off_k_f32[0]);
+    float * vtcm_v_f32 = VTCM_LAYOUT_PTR(float, vtcm_base, L.off_v_f32[0]);
+    float * vtcm_g_f32 = VTCM_LAYOUT_PTR(float, vtcm_base, L.off_g_f32[0]);
+    float * vtcm_b_f32 = VTCM_LAYOUT_PTR(float, vtcm_base, L.off_b_f32[0]);
+    float * vtcm_o_f32 = VTCM_LAYOUT_PTR(float, vtcm_base, L.off_o_f32[0]);
+
+    float * vtcm_v_inter_f32  = VTCM_LAYOUT_PTR(float, vtcm_base, L.off_v_inter_f32);
+    float * vtcm_o_inter_f32  = VTCM_LAYOUT_PTR(float, vtcm_base, L.off_o_inter_f32);
+    float * vtcm_o_intra_f32  = VTCM_LAYOUT_PTR(float, vtcm_base, L.off_o_intra_f32);
+    float * vtcm_s_update_f32 = VTCM_LAYOUT_PTR(float, vtcm_base, L.off_s_update_f32);
+
+    __fp16 * vtcm_k_f16       = VTCM_LAYOUT_PTR(__fp16, vtcm_base, L.off_k_f16);
+    __fp16 * vtcm_v_prime_f16 = VTCM_LAYOUT_PTR(__fp16, vtcm_base, L.off_v_prime_f16);
+    __fp16 * vtcm_delta_f16   = VTCM_LAYOUT_PTR(__fp16, vtcm_base, L.off_delta_f16);
+    __fp16 * vtcm_d_f16       = VTCM_LAYOUT_PTR(__fp16, vtcm_base, L.off_d_f16);
+
+    __fp16 * vtcm_q_row_tiles        = VTCM_LAYOUT_PTR(__fp16, vtcm_base, L.off_q_row_tiles);
+    __fp16 * vtcm_k_row_tiles        = VTCM_LAYOUT_PTR(__fp16, vtcm_base, L.off_k_row_tiles);
+    __fp16 * vtcm_k_col_tiles        = VTCM_LAYOUT_PTR(__fp16, vtcm_base, L.off_k_col_tiles);
+    __fp16 * vtcm_k_prime_row_tiles  = VTCM_LAYOUT_PTR(__fp16, vtcm_base, L.off_k_prime_row_tiles);
+    __fp16 * vtcm_k_col_tiles_64x128 = VTCM_LAYOUT_PTR(__fp16, vtcm_base, L.off_k_col_tiles_64x128);
+    __fp16 * vtcm_kk_tiles           = VTCM_LAYOUT_PTR(__fp16, vtcm_base, L.off_kk_tiles);
+    __fp16 * vtcm_qk_tiles           = VTCM_LAYOUT_PTR(__fp16, vtcm_base, L.off_qk_tiles);
+    __fp16 * vtcm_v_inter_tiles      = VTCM_LAYOUT_PTR(__fp16, vtcm_base, L.off_v_inter_tiles);
+    __fp16 * vtcm_o_inter_tiles      = VTCM_LAYOUT_PTR(__fp16, vtcm_base, L.off_o_inter_tiles);
+    __fp16 * vtcm_inv_row_tiles      = VTCM_LAYOUT_PTR(__fp16, vtcm_base, L.off_inv_row_tiles);
+    __fp16 * vtcm_a_row_tiles        = VTCM_LAYOUT_PTR(__fp16, vtcm_base, L.off_a_row_tiles);
+    __fp16 * vtcm_v_prime_col_tiles  = VTCM_LAYOUT_PTR(__fp16, vtcm_base, L.off_v_prime_col_tiles);
+    __fp16 * vtcm_delta_tiles        = VTCM_LAYOUT_PTR(__fp16, vtcm_base, L.off_delta_tiles);
+    __fp16 * vtcm_delta_col_tiles    = VTCM_LAYOUT_PTR(__fp16, vtcm_base, L.off_delta_col_tiles);
+    __fp16 * vtcm_o_intra_tiles      = VTCM_LAYOUT_PTR(__fp16, vtcm_base, L.off_o_intra_tiles);
+    __fp16 * vtcm_d_row_tiles        = VTCM_LAYOUT_PTR(__fp16, vtcm_base, L.off_d_row_tiles);
+    __fp16 * vtcm_s_update_tiles     = VTCM_LAYOUT_PTR(__fp16, vtcm_base, L.off_s_update_tiles);
+
+    uint8_t * vtcm_scales_1 = VTCM_LAYOUT_PTR(uint8_t, vtcm_base, L.off_scales_1);
+
+    float * gamma         = VTCM_LAYOUT_PTR(float, vtcm_base, L.off_gamma);
+    float * lambda_init   = VTCM_LAYOUT_PTR(float, vtcm_base, L.off_lambda_init);
+    __fp16 * decay_m      = VTCM_LAYOUT_PTR(__fp16, vtcm_base, L.off_decay_m);
+    __fp16 * decay_a      = VTCM_LAYOUT_PTR(__fp16, vtcm_base, L.off_decay_a);
+
+    HVX_Vector * rows_kk  = VTCM_LAYOUT_PTR(HVX_Vector, vtcm_base, L.off_rows_kk);
+    HVX_Vector * rows_qk  = VTCM_LAYOUT_PTR(HVX_Vector, vtcm_base, L.off_rows_qk);
+    HVX_Vector * rows_inv = VTCM_LAYOUT_PTR(HVX_Vector, vtcm_base, L.off_rows_inv);
+    HVX_Vector * rows_a   = VTCM_LAYOUT_PTR(HVX_Vector, vtcm_base, L.off_rows_a);
+
+    HVX_Vector * vtcm_m   = VTCM_LAYOUT_PTR(HVX_Vector, vtcm_base, L.off_thread_scratch);
+    HVX_Vector * vtcm_tmp = vtcm_m + 32;
+
+    float  * vtcm_attn_rem = VTCM_LAYOUT_PTR(float, vtcm_base, L.off_attn_rem);
 
     hmx_init_column_scales(vtcm_scales_1, Q6_V_vsplat_R(0x3c00));
 
@@ -1731,22 +1735,28 @@ int op_gated_delta_net(struct htp_ops_context * octx) {
                                  (g->ne[0] == 1) &&
                                  (K == 1);
 
-        struct htp_gdn_vtcm_layout layout_local;
-        if (can_use_hmx) {
-            htp_gdn_hmx_vtcm_layout_build(&layout_local, S_v, HTP_GDN_CHUNK_SIZE, 1);
-            if (layout_local.total_bytes <= octx->ctx->vtcm_size) {
-                kparams_local.kernel_type = HTP_GDN_KERNEL_HMX_CHUNKED;
-                kparams_local.chunk_size  = HTP_GDN_CHUNK_SIZE;
-                kparams_local.n_chunks    = n_tokens / HTP_GDN_CHUNK_SIZE;
-            } else {
-                htp_gdn_vtcm_layout_build(&layout_local, S_v, n_threads);
-            }
+        struct htp_gdn_hmx_vtcm_layout hmx_layout_local;
+        struct htp_gdn_vtcm_layout hvx_layout_local;
+        uint32_t n_heads_batch = 1;
+
+        if (can_use_hmx && htp_gdn_hmx_solve_layout(&hmx_layout_local, S_v, HTP_GDN_CHUNK_SIZE, total_rows, octx->ctx->vtcm_size, n_threads, true, &n_heads_batch)) {
+            kparams_local.kernel_type     = HTP_GDN_KERNEL_HMX_CHUNKED;
+            kparams_local.pipeline        = hmx_layout_local.pipeline ? 1 : 0;
+            kparams_local.chunk_size      = HTP_GDN_CHUNK_SIZE;
+            kparams_local.n_chunks        = n_tokens / HTP_GDN_CHUNK_SIZE;
+            kparams_local.n_heads_batch   = (uint16_t) n_heads_batch;
+            kparams_local.vtcm_size       = (uint32_t) hmx_layout_local.total_bytes;
+            kparams_local.state_aligned   = (uint32_t) hmx_layout_local.state_f32_bytes;
+            kparams_local.vtcm_per_thread = (uint32_t) (hmx_layout_local.total_bytes / (n_threads > 0 ? n_threads : 1));
         } else {
-            htp_gdn_vtcm_layout_build(&layout_local, S_v, n_threads);
+            htp_gdn_vtcm_layout_build(&hvx_layout_local, S_v, n_threads);
+            kparams_local.kernel_type     = HTP_GDN_KERNEL_HVX_RECURRENT;
+            kparams_local.pipeline        = 0;
+            kparams_local.n_heads_batch   = 1;
+            kparams_local.state_aligned   = (uint32_t) hvx_layout_local.state_aligned;
+            kparams_local.vtcm_per_thread = (uint32_t) hvx_layout_local.bytes_per_thread;
+            kparams_local.vtcm_size       = (uint32_t) hvx_layout_local.total_bytes;
         }
-        kparams_local.state_aligned       = (uint32_t) layout_local.state_aligned;
-        kparams_local.vtcm_per_thread     = (uint32_t) layout_local.bytes_per_thread;
-        kparams_local.vtcm_size           = (uint32_t) layout_local.total_bytes;
         kparams_local.kda                 = (g->ne[0] == S_v) ? 1 : 0;
         kparams_local.scale               = 1.0f / sqrtf((float) S_v);
         kparams_local.state_seq_stride    = (uint32_t) (state->nb[3] / sizeof(float));

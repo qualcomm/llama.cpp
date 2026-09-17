@@ -4392,10 +4392,26 @@ static bool ggml_hexagon_supported_gated_delta_net(const struct ggml_hexagon_ses
 
     const uint32_t total_rows = (uint32_t) (H * n_seqs);
     const uint32_t n_threads  = (std::min)((uint32_t) sess->n_threads, total_rows);
-    struct htp_gdn_vtcm_layout layout;
-    htp_gdn_vtcm_layout_build(&layout, (uint32_t) S_v, n_threads);
-    if (layout.total_bytes > sess->vtcm_size) {
-        return false;
+
+    const bool can_use_hmx = (opt_gdn_select >= 2) &&
+                             (sess->n_hmx > 0) &&
+                             (S_v % 64 == 0) &&
+                             (n_tokens >= HTP_GDN_CHUNK_SIZE) &&
+                             (g->ne[0] == 1) &&
+                             (K == 1);
+
+    if (can_use_hmx) {
+        struct htp_gdn_hmx_vtcm_layout layout;
+        uint32_t n_heads_batch = 0;
+        if (!htp_gdn_hmx_solve_layout(&layout, (uint32_t) S_v, HTP_GDN_CHUNK_SIZE, total_rows, sess->vtcm_size, n_threads, true, &n_heads_batch)) {
+            return false;
+        }
+    } else {
+        struct htp_gdn_vtcm_layout layout;
+        htp_gdn_vtcm_layout_build(&layout, (uint32_t) S_v, n_threads);
+        if (layout.total_bytes > sess->vtcm_size) {
+            return false;
+        }
     }
 
     return true;
@@ -5218,18 +5234,27 @@ static void ggml_hexagon_precompute_gated_delta_net_params(
                              (g->ne[0] == 1) &&
                              (K == 1);
 
-    struct htp_gdn_vtcm_layout layout;
-    if (can_use_hmx) {
-        htp_gdn_hmx_vtcm_layout_build(&layout, S_v, HTP_GDN_CHUNK_SIZE, 1);
-        if (layout.total_bytes <= sess->vtcm_size) {
-            kparams->kernel_type = HTP_GDN_KERNEL_HMX_CHUNKED;
-            kparams->chunk_size  = HTP_GDN_CHUNK_SIZE;
-            kparams->n_chunks    = n_tokens / HTP_GDN_CHUNK_SIZE;
-        } else {
-            htp_gdn_vtcm_layout_build(&layout, S_v, n_threads);
-        }
+    struct htp_gdn_hmx_vtcm_layout hmx_layout;
+    struct htp_gdn_vtcm_layout hvx_layout;
+    uint32_t n_heads_batch = 1;
+
+    if (can_use_hmx && htp_gdn_hmx_solve_layout(&hmx_layout, S_v, HTP_GDN_CHUNK_SIZE, total_rows, sess->vtcm_size, n_threads, true, &n_heads_batch)) {
+        kparams->kernel_type     = HTP_GDN_KERNEL_HMX_CHUNKED;
+        kparams->pipeline        = hmx_layout.pipeline ? 1 : 0;
+        kparams->chunk_size      = HTP_GDN_CHUNK_SIZE;
+        kparams->n_chunks        = n_tokens / HTP_GDN_CHUNK_SIZE;
+        kparams->n_heads_batch   = (uint16_t) n_heads_batch;
+        kparams->vtcm_size       = (uint32_t) hmx_layout.total_bytes;
+        kparams->state_aligned   = (uint32_t) hmx_layout.state_f32_bytes;
+        kparams->vtcm_per_thread = (uint32_t) (hmx_layout.total_bytes / (n_threads > 0 ? n_threads : 1));
     } else {
-        htp_gdn_vtcm_layout_build(&layout, S_v, n_threads);
+        htp_gdn_vtcm_layout_build(&hvx_layout, S_v, n_threads);
+        kparams->kernel_type     = HTP_GDN_KERNEL_HVX_RECURRENT;
+        kparams->pipeline        = 0;
+        kparams->n_heads_batch   = 1;
+        kparams->state_aligned   = (uint32_t) hvx_layout.state_aligned;
+        kparams->vtcm_per_thread = (uint32_t) hvx_layout.bytes_per_thread;
+        kparams->vtcm_size       = (uint32_t) hvx_layout.total_bytes;
     }
 
     kparams->n_threads           = n_threads;
@@ -5241,9 +5266,6 @@ static void ggml_hexagon_precompute_gated_delta_net_params(
     kparams->total_rows          = total_rows;
     kparams->rows_per_thread     = (total_rows + kparams->n_threads - 1) / kparams->n_threads;
     kparams->kda                 = (g->ne[0] == S_v) ? 1 : 0;
-    kparams->state_aligned       = (uint32_t) layout.state_aligned;
-    kparams->vtcm_per_thread     = (uint32_t) layout.bytes_per_thread;
-    kparams->vtcm_size           = (uint32_t) layout.total_bytes;
     kparams->state_seq_stride    = (uint32_t) (state->nb[3] / sizeof(float));
     kparams->state_size_per_snap = S_v * S_v * H * n_seqs;
     kparams->scale               = 1.0f / sqrtf((float) S_v);
