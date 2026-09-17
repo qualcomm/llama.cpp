@@ -30110,12 +30110,14 @@ static bool ggml_cl_flash_attn_decompose(
     ggml_cl_fa_scratch_tensor(vt, extra_vt, backend_ctx->prealloc_fa_vt.buffer,
                               GGML_TYPE_F16, GGML_OP_NONE, n_kv, dv, n_head_kv, "fa_vt");
 
-    // Defer the softmax normalisation into the KQV result. Off by default; the arithmetic is
-    // equivalent but not bit-identical (1/sum is applied once per output row instead of to every
-    // probability), so it is gated until it has a correctness run behind it.
+    // Defer the softmax normalisation into the KQV result. The arithmetic is equivalent but not
+    // bit-identical - 1/sum is applied once per output row instead of to every probability - so
+    // it carries a perplexity check on two models: Qwen3.5-35B +0.047%, Qwen3.8-27B -0.047%,
+    // opposite signs and a fourteenth of one standard error, i.e. rounding with no bias.
+    // Set GGML_OPENCL_FA_SOFTMAX_DEFER_NORM=0 to opt out.
     static const bool defer_norm = []{
         const char * e = getenv("GGML_OPENCL_FA_SOFTMAX_DEFER_NORM");
-        return e && atoi(e) != 0;
+        return (e && e[0]) ? atoi(e) != 0 : true;
     }();
 
     for (int64_t q0 = 0; q0 < n_q; q0 += n_q_chunk) {
