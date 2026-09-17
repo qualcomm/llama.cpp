@@ -11,6 +11,10 @@
 #include "ggml-common.h"
 #include "htp-ctx.h"
 #include "htp-tensor.h"
+#include "htp-vtcm.h"
+#include "hmx-utils.h"
+#include "hmx-fa-kernels.h"
+#include "hmx-queue.h"
 #include "gated-delta-net-ops.h"
 
 #ifndef MIN
@@ -1022,6 +1026,601 @@ static void gated_delta_net_f32_tg_thread(unsigned int nth, unsigned int ith, vo
     dma_queue_flush(dma_q);
 }
 
+struct htp_gdn_hmx_gemm_job {
+    const __fp16 * row_tiles;
+    const __fp16 * col_tiles;
+    __fp16 *       out_tiles;
+    uint32_t       n_row_tiles;
+    uint32_t       n_col_tiles;
+    uint32_t       n_dot_tiles;
+    uint32_t       dot_stride;
+    uint8_t *      hmx_scales;
+};
+
+static void htp_gdn_hmx_gemm_worker(void * data) {
+    struct htp_gdn_hmx_gemm_job * job = (struct htp_gdn_hmx_gemm_job *) data;
+    asm volatile(HMX_SET_BIAS("%0") :: "r"((unsigned int)job->hmx_scales));
+
+    const size_t dot_stride = job->dot_stride;
+    for (uint32_t r = 0; r < job->n_row_tiles; ++r) {
+        const __fp16 * r_tiles = job->row_tiles + r * dot_stride;
+        const __fp16 * c_tiles = job->col_tiles;
+        __fp16 *       o_tile  = job->out_tiles + r * job->n_col_tiles * HMX_FP16_TILE_N_ELMS;
+
+        for (uint32_t c = 0; c < job->n_col_tiles; ++c) {
+            hmx_fa_qk_dot_tile(r_tiles, c_tiles, o_tile, job->n_dot_tiles);
+            c_tiles += dot_stride;
+            o_tile  += HMX_FP16_TILE_N_ELMS;
+        }
+    }
+}
+
+static inline void htp_gdn_run_hmx_gemm(
+    hmx_queue_t q,
+    struct htp_gdn_hmx_gemm_job * job,
+    const __fp16 * row_tiles,
+    const __fp16 * col_tiles,
+    __fp16 * out_tiles,
+    uint32_t n_row_tiles,
+    uint32_t n_col_tiles,
+    uint32_t n_dot_tiles,
+    uint8_t * scales
+) {
+    job->row_tiles   = row_tiles;
+    job->col_tiles   = col_tiles;
+    job->out_tiles   = out_tiles;
+    job->n_row_tiles = n_row_tiles;
+    job->n_col_tiles = n_col_tiles;
+    job->n_dot_tiles = n_dot_tiles;
+    job->dot_stride  = n_dot_tiles * HMX_FP16_TILE_N_ELMS;
+    job->hmx_scales  = scales;
+
+    hmx_queue_push(q, hmx_queue_make_desc(htp_gdn_hmx_gemm_worker, job));
+    hmx_queue_pop(q);
+}
+
+static inline void gdn_unpack_64x64_tiles_to_vectors(
+    HVX_Vector * restrict rows,
+    const __fp16 * restrict tiles
+) {
+    const HVX_Vector * t00 = (const HVX_Vector *) (tiles + 0 * HMX_FP16_TILE_N_ELMS);
+    const HVX_Vector * t01 = (const HVX_Vector *) (tiles + 1 * HMX_FP16_TILE_N_ELMS);
+    const HVX_Vector * t10 = (const HVX_Vector *) (tiles + 2 * HMX_FP16_TILE_N_ELMS);
+    const HVX_Vector * t11 = (const HVX_Vector *) (tiles + 3 * HMX_FP16_TILE_N_ELMS);
+
+    for (uint32_t r = 0; r < 16; ++r) {
+        HVX_VectorPair vp0 = Q6_W_vdeal_VVR(t01[r], t00[r], -2);
+        rows[2 * r + 0] = Q6_V_lo_W(vp0);
+        rows[2 * r + 1] = Q6_V_hi_W(vp0);
+
+        HVX_VectorPair vp1 = Q6_W_vdeal_VVR(t11[r], t10[r], -2);
+        rows[32 + 2 * r + 0] = Q6_V_lo_W(vp1);
+        rows[32 + 2 * r + 1] = Q6_V_hi_W(vp1);
+    }
+}
+
+static inline void gdn_pack_64x64_vectors_to_tiles(
+    __fp16 * restrict tiles,
+    const HVX_Vector * restrict rows
+) {
+    HVX_Vector * t00 = (HVX_Vector *) (tiles + 0 * HMX_FP16_TILE_N_ELMS);
+    HVX_Vector * t01 = (HVX_Vector *) (tiles + 1 * HMX_FP16_TILE_N_ELMS);
+    HVX_Vector * t10 = (HVX_Vector *) (tiles + 2 * HMX_FP16_TILE_N_ELMS);
+    HVX_Vector * t11 = (HVX_Vector *) (tiles + 3 * HMX_FP16_TILE_N_ELMS);
+
+    for (uint32_t r = 0; r < 16; ++r) {
+        HVX_VectorPair vp0 = Q6_W_vshuff_VVR(rows[2 * r + 1], rows[2 * r + 0], -2);
+        t00[r] = Q6_V_lo_W(vp0);
+        t01[r] = Q6_V_hi_W(vp0);
+
+        HVX_VectorPair vp1 = Q6_W_vshuff_VVR(rows[32 + 2 * r + 1], rows[32 + 2 * r + 0], -2);
+        t10[r] = Q6_V_lo_W(vp1);
+        t11[r] = Q6_V_hi_W(vp1);
+    }
+}
+
+static inline void gdn_unpack_64xS_tiles_to_f32(
+    float * restrict dst_f32,
+    const __fp16 * restrict tiles,
+    uint32_t S_v
+) {
+    const uint32_t n_col_tiles = S_v / 32;
+    for (uint32_t r0 = 0; r0 < 2; ++r0) {
+        for (uint32_t d = 0; d < S_v / 64; ++d) {
+            const HVX_Vector * t0 = (const HVX_Vector *) (tiles + (r0 * n_col_tiles + 2 * d + 0) * HMX_FP16_TILE_N_ELMS);
+            const HVX_Vector * t1 = (const HVX_Vector *) (tiles + (r0 * n_col_tiles + 2 * d + 1) * HMX_FP16_TILE_N_ELMS);
+
+            for (uint32_t r = 0; r < 16; ++r) {
+                HVX_VectorPair vp01 = Q6_W_vdeal_VVR(t1[r], t0[r], -2);
+                HVX_VectorPair p0 = hvx_vec_f16_to_f32(Q6_V_lo_W(vp01));
+                HVX_VectorPair p1 = hvx_vec_f16_to_f32(Q6_V_hi_W(vp01));
+
+                float * out0 = dst_f32 + (r0 * 32 + 2 * r + 0) * S_v + d * 64;
+                float * out1 = dst_f32 + (r0 * 32 + 2 * r + 1) * S_v + d * 64;
+
+                hvx_vmemu(out0 + 0)  = Q6_V_lo_W(p0);
+                hvx_vmemu(out0 + 32) = Q6_V_hi_W(p0);
+                hvx_vmemu(out1 + 0)  = Q6_V_lo_W(p1);
+                hvx_vmemu(out1 + 32) = Q6_V_hi_W(p1);
+            }
+        }
+    }
+}
+
+static inline void gdn_unpack_64xS_tiles_to_f16(
+    __fp16 * restrict dst_f16,
+    const __fp16 * restrict tiles,
+    uint32_t S_v
+) {
+    const uint32_t n_col_tiles = S_v / 32;
+    for (uint32_t r0 = 0; r0 < 2; ++r0) {
+        for (uint32_t d = 0; d < S_v / 64; ++d) {
+            const HVX_Vector * t0 = (const HVX_Vector *) (tiles + (r0 * n_col_tiles + 2 * d + 0) * HMX_FP16_TILE_N_ELMS);
+            const HVX_Vector * t1 = (const HVX_Vector *) (tiles + (r0 * n_col_tiles + 2 * d + 1) * HMX_FP16_TILE_N_ELMS);
+
+            for (uint32_t r = 0; r < 16; ++r) {
+                HVX_VectorPair vp01 = Q6_W_vdeal_VVR(t1[r], t0[r], -2);
+                __fp16 * out0 = dst_f16 + (r0 * 32 + 2 * r + 0) * S_v + d * 64;
+                __fp16 * out1 = dst_f16 + (r0 * 32 + 2 * r + 1) * S_v + d * 64;
+
+                hvx_vmemu(out0) = Q6_V_lo_W(vp01);
+                hvx_vmemu(out1) = Q6_V_hi_W(vp01);
+            }
+        }
+    }
+}
+
+static inline void gdn_unpack_SxS_tiles_to_f32(
+    float * restrict dst_f32,
+    const __fp16 * restrict tiles,
+    uint32_t S_v
+) {
+    const uint32_t n_tiles = S_v / 32;
+    for (uint32_t r0 = 0; r0 < n_tiles; ++r0) {
+        for (uint32_t d = 0; d < S_v / 64; ++d) {
+            const HVX_Vector * t0 = (const HVX_Vector *) (tiles + (r0 * n_tiles + 2 * d + 0) * HMX_FP16_TILE_N_ELMS);
+            const HVX_Vector * t1 = (const HVX_Vector *) (tiles + (r0 * n_tiles + 2 * d + 1) * HMX_FP16_TILE_N_ELMS);
+
+            for (uint32_t r = 0; r < 16; ++r) {
+                HVX_VectorPair vp01 = Q6_W_vdeal_VVR(t1[r], t0[r], -2);
+                HVX_VectorPair p0 = hvx_vec_f16_to_f32(Q6_V_lo_W(vp01));
+                HVX_VectorPair p1 = hvx_vec_f16_to_f32(Q6_V_hi_W(vp01));
+
+                float * out0 = dst_f32 + (r0 * 32 + 2 * r + 0) * S_v + d * 64;
+                float * out1 = dst_f32 + (r0 * 32 + 2 * r + 1) * S_v + d * 64;
+
+                hvx_vmemu(out0 + 0)  = Q6_V_lo_W(p0);
+                hvx_vmemu(out0 + 32) = Q6_V_hi_W(p0);
+                hvx_vmemu(out1 + 0)  = Q6_V_lo_W(p1);
+                hvx_vmemu(out1 + 32) = Q6_V_hi_W(p1);
+            }
+        }
+    }
+}
+
+static inline void gdn_f32_to_hmx_row_tiles(
+    __fp16 * restrict dst_tiles,
+    const float * restrict src,
+    const float * restrict scale_per_row,
+    uint32_t n_rows,
+    uint32_t n_cols
+) {
+    const uint32_t n_col_tiles = n_cols / 32;
+    for (uint32_t r = 0; r < n_rows; r += 2) {
+        uint32_t r0 = r / 32;
+        uint32_t r1 = (r % 32) / 2;
+        const float * p0 = src + (r + 0) * n_cols;
+        const float * p1 = src + (r + 1) * n_cols;
+        HVX_Vector s0 = scale_per_row ? hvx_vec_splat_f32(scale_per_row[r + 0]) : hvx_vec_splat_f32(1.0f);
+        HVX_Vector s1 = scale_per_row ? hvx_vec_splat_f32(scale_per_row[r + 1]) : hvx_vec_splat_f32(1.0f);
+
+        for (uint32_t c = 0; c < n_col_tiles; ++c) {
+            HVX_Vector v0 = hvx_vec_mul_f32_f32(hvx_vmemu(p0 + c * 32), s0);
+            HVX_Vector v1 = hvx_vec_mul_f32_f32(hvx_vmemu(p1 + c * 32), s1);
+            HVX_Vector vh = hvx_vec_f32_to_f16_shuff(v0, v1);
+            __fp16 * tile = dst_tiles + (r0 * n_col_tiles + c) * HMX_FP16_TILE_N_ELMS;
+            ((HVX_Vector *) tile)[r1] = vh;
+        }
+    }
+}
+
+static inline void hvx_transpose_32x32_words(HVX_Vector * restrict m, HVX_Vector * restrict tmp) {
+    for (int i = 0; i < 16; ++i) {
+        HVX_VectorPair p = Q6_W_vshuff_VVR(m[2*i + 1], m[2*i], -4);
+        tmp[2*i + 0] = Q6_V_lo_W(p);
+        tmp[2*i + 1] = Q6_V_hi_W(p);
+    }
+
+    for (int b = 0; b < 32; b += 4) {
+        HVX_VectorPair p0 = Q6_W_vshuff_VVR(tmp[b + 2], tmp[b + 0], -8);
+        HVX_VectorPair p1 = Q6_W_vshuff_VVR(tmp[b + 3], tmp[b + 1], -8);
+        m[b + 0] = Q6_V_lo_W(p0); m[b + 1] = Q6_V_hi_W(p0);
+        m[b + 2] = Q6_V_lo_W(p1); m[b + 3] = Q6_V_hi_W(p1);
+    }
+
+    for (int b = 0; b < 32; b += 8) {
+        for (int i = 0; i < 4; ++i) {
+            HVX_VectorPair p = Q6_W_vshuff_VVR(m[b + i + 4], m[b + i], -16);
+            tmp[b + 2*i + 0] = Q6_V_lo_W(p);
+            tmp[b + 2*i + 1] = Q6_V_hi_W(p);
+        }
+    }
+
+    for (int b = 0; b < 32; b += 16) {
+        for (int i = 0; i < 8; ++i) {
+            HVX_VectorPair p = Q6_W_vshuff_VVR(tmp[b + i + 8], tmp[b + i], -32);
+            m[b + 2*i + 0] = Q6_V_lo_W(p);
+            m[b + 2*i + 1] = Q6_V_hi_W(p);
+        }
+    }
+
+    for (int i = 0; i < 16; ++i) {
+        HVX_VectorPair p = Q6_W_vshuff_VVR(m[i + 16], m[i], -64);
+        tmp[2 * i + 0]   = Q6_V_lo_W(p);
+        tmp[2 * i + 1]   = Q6_V_hi_W(p);
+    }
+
+    for (int i = 0; i < 32; ++i) {
+        m[i] = tmp[i];
+    }
+}
+
+static inline void gdn_pack_d_t_row_tiles(
+    __fp16 * restrict dst_tiles,
+    const __fp16 * restrict src_d,
+    uint32_t S_v,
+    HVX_Vector * restrict m,
+    HVX_Vector * restrict tmp
+) {
+    for (uint32_t col_half = 0; col_half < S_v / 64; ++col_half) {
+        uint32_t r0_base = col_half * 2;
+        for (uint32_t c0 = 0; c0 < 2; ++c0) {
+            for (uint32_t s_local = 0; s_local < 32; ++s_local) {
+                uint32_t s = c0 * 32 + s_local;
+                m[s_local] = hvx_vmemu(src_d + s * S_v + col_half * 64);
+            }
+
+            hvx_transpose_32x32_words(m, tmp);
+
+            uint32_t tile0_idx = (r0_base + 0) * 2 + c0;
+            uint32_t tile1_idx = (r0_base + 1) * 2 + c0;
+            HVX_Vector * t0 = (HVX_Vector *)(dst_tiles + tile0_idx * HMX_FP16_TILE_N_ELMS);
+            HVX_Vector * t1 = (HVX_Vector *)(dst_tiles + tile1_idx * HMX_FP16_TILE_N_ELMS);
+
+            for (uint32_t r = 0; r < 16; ++r) {
+                t0[r] = m[r];
+                t1[r] = m[16 + r];
+            }
+        }
+    }
+}
+
+static int gated_delta_net_f32_hmx_chunked(
+    struct htp_ops_context * octx,
+    const struct htp_gdn_kernel_params * kparams,
+    uint32_t row_start,
+    uint32_t nrows
+) {
+    const struct htp_tensor * q     = octx->src[0];
+    const struct htp_tensor * k     = octx->src[1];
+    const struct htp_tensor * v     = octx->src[2];
+    const struct htp_tensor * g     = octx->src[3];
+    const struct htp_tensor * beta  = octx->src[4];
+    const struct htp_tensor * state = octx->src[5];
+    const struct htp_tensor * dst   = octx->dst;
+    const struct htp_tensor * dst_cache = octx->dsts[1];
+
+    const uint32_t S_v        = kparams->S_v;
+    const uint32_t H          = kparams->H;
+    const uint32_t n_tokens   = kparams->n_tokens;
+    const float    scale      = kparams->scale;
+    const uint32_t chunk_size = kparams->chunk_size;
+    const uint32_t n_chunks   = kparams->n_chunks;
+    const uint32_t n_sv_tiles = S_v / 32;
+
+    uint8_t * vtcm_cur = (uint8_t *) octx->ctx->vtcm_base;
+
+    float *  vtcm_s_state     = (float *)  vtcm_seq_alloc(&vtcm_cur, hex_round_up(S_v * S_v * sizeof(float), 2048));
+    __fp16 * vtcm_s_f16       = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, hex_round_up(S_v * S_v * sizeof(__fp16), 2048));
+    __fp16 * vtcm_s_col_tiles = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, 16 * HMX_FP16_TILE_SIZE);
+
+    float * vtcm_q_f32 = (float *) vtcm_seq_alloc(&vtcm_cur, hex_round_up(chunk_size * S_v * sizeof(float), 2048));
+    float * vtcm_k_f32 = (float *) vtcm_seq_alloc(&vtcm_cur, hex_round_up(chunk_size * S_v * sizeof(float), 2048));
+    float * vtcm_v_f32 = (float *) vtcm_seq_alloc(&vtcm_cur, hex_round_up(chunk_size * S_v * sizeof(float), 2048));
+    float * vtcm_g_f32 = (float *) vtcm_seq_alloc(&vtcm_cur, hex_round_up(chunk_size * sizeof(float), 2048));
+    float * vtcm_b_f32 = (float *) vtcm_seq_alloc(&vtcm_cur, hex_round_up(chunk_size * sizeof(float), 2048));
+    float * vtcm_o_f32 = (float *) vtcm_seq_alloc(&vtcm_cur, hex_round_up(chunk_size * S_v * sizeof(float), 2048));
+
+    float * vtcm_v_inter_f32 = (float *) vtcm_seq_alloc(&vtcm_cur, hex_round_up(chunk_size * S_v * sizeof(float), 2048));
+    float * vtcm_o_inter_f32 = (float *) vtcm_seq_alloc(&vtcm_cur, hex_round_up(chunk_size * S_v * sizeof(float), 2048));
+    float * vtcm_o_intra_f32 = (float *) vtcm_seq_alloc(&vtcm_cur, hex_round_up(chunk_size * S_v * sizeof(float), 2048));
+    float * vtcm_s_update_f32 = (float *) vtcm_seq_alloc(&vtcm_cur, hex_round_up(S_v * S_v * sizeof(float), 2048));
+
+    __fp16 * vtcm_k_f16       = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, hex_round_up(chunk_size * S_v * sizeof(__fp16), 2048));
+    __fp16 * vtcm_v_prime_f16 = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, hex_round_up(chunk_size * S_v * sizeof(__fp16), 2048));
+    __fp16 * vtcm_delta_f16   = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, hex_round_up(chunk_size * S_v * sizeof(__fp16), 2048));
+    __fp16 * vtcm_d_f16       = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, hex_round_up(chunk_size * S_v * sizeof(__fp16), 2048));
+
+    __fp16 * vtcm_q_row_tiles        = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, 8 * HMX_FP16_TILE_SIZE);
+    __fp16 * vtcm_k_row_tiles        = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, 8 * HMX_FP16_TILE_SIZE);
+    __fp16 * vtcm_k_col_tiles        = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, 8 * HMX_FP16_TILE_SIZE);
+    __fp16 * vtcm_k_prime_row_tiles  = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, 8 * HMX_FP16_TILE_SIZE);
+    __fp16 * vtcm_k_col_tiles_64x128 = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, 8 * HMX_FP16_TILE_SIZE);
+    __fp16 * vtcm_kk_tiles           = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, 4 * HMX_FP16_TILE_SIZE);
+    __fp16 * vtcm_qk_tiles           = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, 4 * HMX_FP16_TILE_SIZE);
+    __fp16 * vtcm_v_inter_tiles      = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, 8 * HMX_FP16_TILE_SIZE);
+    __fp16 * vtcm_o_inter_tiles      = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, 8 * HMX_FP16_TILE_SIZE);
+    __fp16 * vtcm_inv_row_tiles      = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, 4 * HMX_FP16_TILE_SIZE);
+    __fp16 * vtcm_a_row_tiles        = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, 4 * HMX_FP16_TILE_SIZE);
+    __fp16 * vtcm_v_prime_col_tiles  = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, 8 * HMX_FP16_TILE_SIZE);
+    __fp16 * vtcm_delta_tiles        = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, 8 * HMX_FP16_TILE_SIZE);
+    __fp16 * vtcm_delta_col_tiles    = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, 8 * HMX_FP16_TILE_SIZE);
+    __fp16 * vtcm_o_intra_tiles      = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, 8 * HMX_FP16_TILE_SIZE);
+    __fp16 * vtcm_d_row_tiles        = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, 8 * HMX_FP16_TILE_SIZE);
+    __fp16 * vtcm_s_update_tiles     = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, 16 * HMX_FP16_TILE_SIZE);
+
+    uint8_t * vtcm_scales_1 = vtcm_seq_alloc(&vtcm_cur, 256);
+
+    float * gamma         = (float *) vtcm_seq_alloc(&vtcm_cur, hex_round_up(chunk_size * sizeof(float), 128));
+    float * lambda_init   = (float *) vtcm_seq_alloc(&vtcm_cur, hex_round_up(chunk_size * sizeof(float), 128));
+    float * exp_neg_gamma = (float *) vtcm_seq_alloc(&vtcm_cur, hex_round_up(chunk_size * sizeof(float), 128));
+
+    HVX_Vector * rows_kk  = (HVX_Vector *) vtcm_seq_alloc(&vtcm_cur, 64 * sizeof(HVX_Vector));
+    HVX_Vector * rows_qk  = (HVX_Vector *) vtcm_seq_alloc(&vtcm_cur, 64 * sizeof(HVX_Vector));
+    HVX_Vector * rows_inv = (HVX_Vector *) vtcm_seq_alloc(&vtcm_cur, 64 * sizeof(HVX_Vector));
+    HVX_Vector * rows_a   = (HVX_Vector *) vtcm_seq_alloc(&vtcm_cur, 64 * sizeof(HVX_Vector));
+    HVX_Vector * vtcm_m   = (HVX_Vector *) vtcm_seq_alloc(&vtcm_cur, 32 * sizeof(HVX_Vector));
+    HVX_Vector * vtcm_tmp = (HVX_Vector *) vtcm_seq_alloc(&vtcm_cur, 32 * sizeof(HVX_Vector));
+
+    __fp16 * vtcm_l_row    = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, 128);
+    __fp16 * vtcm_inv_buf  = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, 128);
+    float  * vtcm_attn_rem = (float *)  vtcm_seq_alloc(&vtcm_cur, 128 * sizeof(float));
+
+    if ((size_t) (vtcm_cur - octx->ctx->vtcm_base) > octx->ctx->vtcm_size) {
+        return HTP_STATUS_VTCM_TOO_SMALL;
+    }
+
+    hmx_init_column_scales(vtcm_scales_1, Q6_V_vsplat_R(0x3c00));
+
+    hmx_queue_t hmx_q = octx->ctx->hmx_queue;
+    dma_queue * dma_q = octx->ctx->dma[0];
+    struct htp_thread_trace * tr = &octx->ctx->trace[0];
+    struct htp_gdn_hmx_gemm_job gemm_job;
+
+    for (uint32_t r = row_start; r < row_start + nrows; ++r) {
+        const uint32_t iv1 = fastmodulo(r, H, &kparams->div_H);
+        const uint32_t iv3 = fastdiv(r, &kparams->div_H);
+
+        const uint32_t iq1 = fastmodulo(iv1, q->ne[1], &kparams->div_q1);
+        const uint32_t ik1 = fastmodulo(iv1, k->ne[1], &kparams->div_k1);
+        const uint32_t iq3 = fastdiv(iv3, &kparams->div_rq3);
+        const uint32_t ik3 = fastdiv(iv3, &kparams->div_rk3);
+
+        const dma_addr_t state_in_dma = state->data +
+            ((uint64_t) iv3 * kparams->state_seq_stride + (uint64_t) iv1 * S_v * S_v) * sizeof(float);
+
+        const dma_addr_t state_out_dma = dst_cache ?
+            (dst_cache->data + ((uint64_t) iv3 * H + iv1) * S_v * S_v * sizeof(float)) :
+            (dst->data + ((uint64_t) S_v * H * n_tokens * kparams->n_seqs + (uint64_t) (iv3 * H + iv1) * S_v * S_v) * sizeof(float));
+
+        dma_queue_push(dma_q, dma_make_data(vtcm_s_state, state_in_dma),
+                       S_v * sizeof(float), S_v * sizeof(float), S_v * sizeof(float), S_v);
+        dma_queue_pop(dma_q);
+
+        for (uint32_t c = 0; c < n_chunks; ++c) {
+            const uint32_t t_chunk = c * chunk_size;
+
+            const dma_addr_t q_dma = q->data + (uint64_t) iq3 * q->nb[3] + (uint64_t) t_chunk * q->nb[2] + (uint64_t) iq1 * q->nb[1];
+            const dma_addr_t k_dma = k->data + (uint64_t) ik3 * k->nb[3] + (uint64_t) t_chunk * k->nb[2] + (uint64_t) ik1 * k->nb[1];
+            const dma_addr_t v_dma = v->data + (uint64_t) iv3 * v->nb[3] + (uint64_t) t_chunk * v->nb[2] + (uint64_t) iv1 * v->nb[1];
+
+            dma_queue_push(dma_q, dma_make_data(vtcm_q_f32, q_dma), S_v * sizeof(float), q->nb[2], S_v * sizeof(float), chunk_size);
+            dma_queue_push(dma_q, dma_make_data(vtcm_k_f32, k_dma), S_v * sizeof(float), k->nb[2], S_v * sizeof(float), chunk_size);
+            dma_queue_push(dma_q, dma_make_data(vtcm_v_f32, v_dma), S_v * sizeof(float), v->nb[2], S_v * sizeof(float), chunk_size);
+            dma_queue_pop(dma_q);
+            dma_queue_pop(dma_q);
+            dma_queue_pop(dma_q);
+
+            for (uint32_t t = 0; t < chunk_size; ++t) {
+                vtcm_g_f32[t] = *(const float *) ((const uint8_t *) (uintptr_t) g->data +
+                    (uint64_t) iv3 * g->nb[3] + (uint64_t) (t_chunk + t) * g->nb[2] + (uint64_t) iv1 * g->nb[1]);
+                vtcm_b_f32[t] = *(const float *) ((const uint8_t *) (uintptr_t) beta->data +
+                    (uint64_t) iv3 * beta->nb[3] + (uint64_t) (t_chunk + t) * beta->nb[2] + (uint64_t) iv1 * beta->nb[1]);
+            }
+
+            htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) c);
+
+            gamma[0] = vtcm_g_f32[0];
+            for (uint32_t t = 1; t < 64; ++t) {
+                gamma[t] = gamma[t - 1] + vtcm_g_f32[t];
+            }
+            for (uint32_t t = 0; t < 64; ++t) {
+                lambda_init[t] = expf(gamma[t]);
+                exp_neg_gamma[t] = expf(-gamma[t]);
+            }
+
+            HVX_Vector v_exp_neg = hvx_vec_f32_to_f16(hvx_vmemu(exp_neg_gamma + 0), hvx_vmemu(exp_neg_gamma + 32));
+
+            gdn_f32_to_hmx_row_tiles(vtcm_k_row_tiles, vtcm_k_f32, NULL, 64, S_v);
+
+            for (uint32_t t = 0; t < 64; ++t) {
+                for (uint32_t i = 0; i < S_v; i += 64) {
+                    HVX_Vector v0 = hvx_vmemu(vtcm_k_f32 + t * S_v + i + 0);
+                    HVX_Vector v1 = (i + 32 < S_v) ? hvx_vmemu(vtcm_k_f32 + t * S_v + i + 32) : Q6_V_vzero();
+                    hvx_vmemu(vtcm_k_f16 + t * S_v + i) = hvx_vec_f32_to_f16(v0, v1);
+                }
+            }
+            hmx_interleave_rows_to_tiles(vtcm_k_col_tiles, vtcm_k_f16, 64, S_v, S_v, 0, 64);
+
+            gdn_f32_to_hmx_row_tiles(vtcm_q_row_tiles, vtcm_q_f32, NULL, 64, S_v);
+
+            for (uint32_t j = 0; j < S_v; ++j) {
+                for (uint32_t i = 0; i < S_v; i += 64) {
+                    HVX_Vector v0 = hvx_vmemu(vtcm_s_state + j * S_v + i + 0);
+                    HVX_Vector v1 = (i + 32 < S_v) ? hvx_vmemu(vtcm_s_state + j * S_v + i + 32) : Q6_V_vzero();
+                    hvx_vmemu(vtcm_s_f16 + j * S_v + i) = hvx_vec_f32_to_f16(v0, v1);
+                }
+            }
+            hmx_interleave_rows_to_tiles(vtcm_s_col_tiles, vtcm_s_f16, S_v, S_v, S_v, 0, S_v);
+
+            gdn_f32_to_hmx_row_tiles(vtcm_k_prime_row_tiles, vtcm_k_f32, lambda_init, 64, S_v);
+
+            htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) c);
+
+            htp_gdn_run_hmx_gemm(hmx_q, &gemm_job, vtcm_k_row_tiles, vtcm_k_col_tiles, vtcm_kk_tiles, 2, 2, n_sv_tiles, vtcm_scales_1);
+            htp_gdn_run_hmx_gemm(hmx_q, &gemm_job, vtcm_q_row_tiles, vtcm_k_col_tiles, vtcm_qk_tiles, 2, 2, n_sv_tiles, vtcm_scales_1);
+            htp_gdn_run_hmx_gemm(hmx_q, &gemm_job, vtcm_k_prime_row_tiles, vtcm_s_col_tiles, vtcm_v_inter_tiles, 2, n_sv_tiles, n_sv_tiles, vtcm_scales_1);
+
+            gdn_f32_to_hmx_row_tiles(vtcm_q_row_tiles, vtcm_q_f32, lambda_init, 64, S_v);
+            htp_gdn_run_hmx_gemm(hmx_q, &gemm_job, vtcm_q_row_tiles, vtcm_s_col_tiles, vtcm_o_inter_tiles, 2, n_sv_tiles, n_sv_tiles, vtcm_scales_1);
+
+            htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) c);
+
+            gdn_unpack_64x64_tiles_to_vectors(rows_kk, vtcm_kk_tiles);
+            gdn_unpack_64x64_tiles_to_vectors(rows_qk, vtcm_qk_tiles);
+
+            for (uint32_t t = 0; t < 64; ++t) {
+                HVX_VectorPred q_strict_lower = Q6_Q_vsetq2_R(t * sizeof(__fp16));
+                HVX_Vector kk_lower = Q6_V_vmux_QVV(q_strict_lower, rows_kk[t], Q6_V_vzero());
+                float scale_t = vtcm_b_f32[t] * lambda_init[t];
+                HVX_Vector v_scale_t = hvx_vec_splat_f16(scale_t);
+                HVX_Vector row_m = hvx_vec_mul_f16_f16(hvx_vec_mul_f16_f16(kk_lower, v_exp_neg), v_scale_t);
+
+                HVX_VectorPred q_causal = Q6_Q_vsetq2_R((t + 1) * sizeof(__fp16));
+                HVX_Vector qk_causal = Q6_V_vmux_QVV(q_causal, rows_qk[t], Q6_V_vzero());
+                HVX_Vector v_lambda_t = hvx_vec_splat_f16(lambda_init[t]);
+                rows_a[t] = hvx_vec_mul_f16_f16(hvx_vec_mul_f16_f16(qk_causal, v_exp_neg), v_lambda_t);
+
+                HVX_Vector v_inv_t = Q6_V_vzero();
+                hvx_vec_store_u(vtcm_l_row, 64 * sizeof(__fp16), row_m);
+
+                for (uint32_t k_idx = 0; k_idx < t; ++k_idx) {
+                    if (vtcm_l_row[k_idx] != 0.0f) {
+                        HVX_Vector v_lk = hvx_vec_splat_f16(vtcm_l_row[k_idx]);
+                        v_inv_t = hvx_vec_sub_f16_f16(v_inv_t, hvx_vec_mul_f16_f16(v_lk, rows_inv[k_idx]));
+                    }
+                }
+                hvx_vec_store_u(vtcm_inv_buf, 64 * sizeof(__fp16), v_inv_t);
+                vtcm_inv_buf[t] = 1.0f;
+                rows_inv[t] = hvx_vmemu(vtcm_inv_buf);
+            }
+
+            gdn_pack_64x64_vectors_to_tiles(vtcm_inv_row_tiles, rows_inv);
+            gdn_pack_64x64_vectors_to_tiles(vtcm_a_row_tiles, rows_a);
+
+            gdn_unpack_64xS_tiles_to_f32(vtcm_v_inter_f32, vtcm_v_inter_tiles, S_v);
+
+            for (uint32_t t = 0; t < 64; ++t) {
+                HVX_Vector vb = hvx_vec_splat_f32(vtcm_b_f32[t]);
+                for (uint32_t i = 0; i < S_v; i += 64) {
+                    HVX_Vector vv0 = hvx_vmemu(vtcm_v_f32 + t * S_v + i + 0);
+                    HVX_Vector vv1 = (i + 32 < S_v) ? hvx_vmemu(vtcm_v_f32 + t * S_v + i + 32) : Q6_V_vzero();
+                    HVX_Vector vi0 = hvx_vmemu(vtcm_v_inter_f32 + t * S_v + i + 0);
+                    HVX_Vector vi1 = (i + 32 < S_v) ? hvx_vmemu(vtcm_v_inter_f32 + t * S_v + i + 32) : Q6_V_vzero();
+
+                    HVX_Vector vp0 = hvx_vec_mul_f32_f32(hvx_vec_sub_f32_f32(vv0, vi0), vb);
+                    HVX_Vector vp1 = hvx_vec_mul_f32_f32(hvx_vec_sub_f32_f32(vv1, vi1), vb);
+
+                    hvx_vmemu(vtcm_v_prime_f16 + t * S_v + i) = hvx_vec_f32_to_f16(vp0, vp1);
+                }
+            }
+
+            hmx_interleave_cols_to_tiles(vtcm_v_prime_col_tiles, vtcm_v_prime_f16, 64, S_v, S_v, 2, 0, 64);
+
+            htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) c);
+
+            htp_gdn_run_hmx_gemm(hmx_q, &gemm_job, vtcm_inv_row_tiles, vtcm_v_prime_col_tiles, vtcm_delta_tiles, 2, n_sv_tiles, 2, vtcm_scales_1);
+
+            htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) c);
+
+            gdn_unpack_64xS_tiles_to_f16(vtcm_delta_f16, vtcm_delta_tiles, S_v);
+            hmx_interleave_cols_to_tiles(vtcm_delta_col_tiles, vtcm_delta_f16, 64, S_v, S_v, 2, 0, 64);
+
+            htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) c);
+
+            htp_gdn_run_hmx_gemm(hmx_q, &gemm_job, vtcm_a_row_tiles, vtcm_delta_col_tiles, vtcm_o_intra_tiles, 2, n_sv_tiles, 2, vtcm_scales_1);
+
+            htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) c);
+
+            gdn_unpack_64xS_tiles_to_f32(vtcm_o_inter_f32, vtcm_o_inter_tiles, S_v);
+            gdn_unpack_64xS_tiles_to_f32(vtcm_o_intra_f32, vtcm_o_intra_tiles, S_v);
+
+            HVX_Vector vscale = hvx_vec_splat_f32(scale);
+            for (uint32_t i = 0; i < 64 * S_v / 32; ++i) {
+                HVX_Vector vi = hvx_vmemu(vtcm_o_inter_f32 + i * 32);
+                HVX_Vector va = hvx_vmemu(vtcm_o_intra_f32 + i * 32);
+                hvx_vmemu(vtcm_o_f32 + i * 32) = hvx_vec_mul_f32_f32(hvx_vec_add_f32_f32(vi, va), vscale);
+            }
+
+            for (uint32_t s = 0; s < 64; ++s) {
+                float decay_s = expf(gamma[63] - gamma[s]);
+                HVX_Vector vs = hvx_vec_splat_f16(decay_s);
+                for (uint32_t i = 0; i < S_v; i += 64) {
+                    HVX_Vector vd = hvx_vmemu(vtcm_delta_f16 + s * S_v + i);
+                    hvx_vmemu(vtcm_d_f16 + s * S_v + i) = hvx_vec_mul_f16_f16(vd, vs);
+                }
+            }
+
+            gdn_pack_d_t_row_tiles(vtcm_d_row_tiles, vtcm_d_f16, S_v, vtcm_m, vtcm_tmp);
+            hmx_interleave_cols_to_tiles(vtcm_k_col_tiles_64x128, vtcm_k_f16, 64, S_v, S_v, 2, 0, 64);
+
+            htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) c);
+
+            htp_gdn_run_hmx_gemm(hmx_q, &gemm_job, vtcm_d_row_tiles, vtcm_k_col_tiles_64x128, vtcm_s_update_tiles, n_sv_tiles, n_sv_tiles, 2, vtcm_scales_1);
+
+            htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) c);
+
+            gdn_unpack_SxS_tiles_to_f32(vtcm_s_update_f32, vtcm_s_update_tiles, S_v);
+
+            HVX_Vector v_l_final = hvx_vec_splat_f32(lambda_init[63]);
+            for (uint32_t i = 0; i < S_v * S_v / 32; ++i) {
+                HVX_Vector vs_old = hvx_vmemu(vtcm_s_state + i * 32);
+                HVX_Vector vsu    = hvx_vmemu(vtcm_s_update_f32 + i * 32);
+                hvx_vmemu(vtcm_s_state + i * 32) = hvx_vec_add_f32_f32(hvx_vec_mul_f32_f32(vs_old, v_l_final), vsu);
+            }
+
+            htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) c);
+
+            const dma_addr_t attn_chunk_dma = dst->data +
+                ((uint64_t) iv3 * n_tokens * H + (uint64_t) t_chunk * H + iv1) * S_v * sizeof(float);
+
+            dma_queue_push(dma_q, dma_make_data(attn_chunk_dma, vtcm_o_f32),
+                           dst->nb[1], S_v * sizeof(float), S_v * sizeof(float), chunk_size);
+            dma_queue_pop(dma_q);
+        }
+
+        const uint32_t t_rem_start = n_chunks * chunk_size;
+        if (t_rem_start < n_tokens) {
+            htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) n_chunks);
+            for (uint32_t t = t_rem_start; t < n_tokens; ++t) {
+                const float * q_t = (const float *) ((const uint8_t *) (uintptr_t) q->data +
+                    (uint64_t) iq3 * q->nb[3] + (uint64_t) t * q->nb[2] + (uint64_t) iq1 * q->nb[1]);
+                const float * k_t = (const float *) ((const uint8_t *) (uintptr_t) k->data +
+                    (uint64_t) ik3 * k->nb[3] + (uint64_t) t * k->nb[2] + (uint64_t) ik1 * k->nb[1]);
+                const float * v_t = (const float *) ((const uint8_t *) (uintptr_t) v->data +
+                    (uint64_t) iv3 * v->nb[3] + (uint64_t) t * v->nb[2] + (uint64_t) iv1 * v->nb[1]);
+                const float * g_t = (const float *) ((const uint8_t *) (uintptr_t) g->data +
+                    (uint64_t) iv3 * g->nb[3] + (uint64_t) t * g->nb[2] + (uint64_t) iv1 * g->nb[1]);
+                const float   b_t = *(const float *) ((const uint8_t *) (uintptr_t) beta->data +
+                    (uint64_t) iv3 * beta->nb[3] + (uint64_t) t * beta->nb[2] + (uint64_t) iv1 * beta->nb[1]);
+
+                gdn_step_scalar_f32(vtcm_s_state, vtcm_attn_rem, q_t, k_t, v_t, g_t, b_t, scale, S_v);
+
+                float * dst_rem = (float *) (uintptr_t) dst->data +
+                    ((uint64_t) iv3 * n_tokens * H + (uint64_t) t * H + iv1) * S_v;
+                hvx_copy_f32_uu((uint8_t *) dst_rem, (const uint8_t *) vtcm_attn_rem, S_v);
+            }
+            htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) n_chunks);
+        }
+
+        dma_queue_push(dma_q, dma_make_data(state_out_dma, vtcm_s_state),
+                       S_v * sizeof(float), S_v * sizeof(float), S_v * sizeof(float), S_v);
+        dma_queue_pop(dma_q);
+    }
+
+    return HTP_STATUS_OK;
+}
+
 int op_gated_delta_net(struct htp_ops_context * octx) {
     const struct htp_tensor * q     = octx->src[0];
     const struct htp_tensor * k     = octx->src[1];
@@ -1097,8 +1696,25 @@ int op_gated_delta_net(struct htp_ops_context * octx) {
         kparams_local.K                   = K;
         kparams_local.total_rows          = total_rows;
         kparams_local.rows_per_thread     = (total_rows + n_threads - 1) / n_threads;
+        const bool can_use_hmx = (octx->ctx->hmx_enabled) &&
+                                 (S_v % 64 == 0) &&
+                                 (n_tokens >= HTP_GDN_CHUNK_SIZE) &&
+                                 (g->ne[0] == 1) &&
+                                 (K == 1);
+
         struct htp_gdn_vtcm_layout layout_local;
-        htp_gdn_vtcm_layout_build(&layout_local, S_v, n_threads);
+        if (can_use_hmx) {
+            htp_gdn_hmx_vtcm_layout_build(&layout_local, S_v, HTP_GDN_CHUNK_SIZE, 1);
+            if (layout_local.total_bytes <= octx->ctx->vtcm_size) {
+                kparams_local.kernel_type = HTP_GDN_KERNEL_HMX_CHUNKED;
+                kparams_local.chunk_size  = HTP_GDN_CHUNK_SIZE;
+                kparams_local.n_chunks    = n_tokens / HTP_GDN_CHUNK_SIZE;
+            } else {
+                htp_gdn_vtcm_layout_build(&layout_local, S_v, n_threads);
+            }
+        } else {
+            htp_gdn_vtcm_layout_build(&layout_local, S_v, n_threads);
+        }
         kparams_local.state_aligned       = (uint32_t) layout_local.state_aligned;
         kparams_local.vtcm_per_thread     = (uint32_t) layout_local.bytes_per_thread;
         kparams_local.vtcm_size           = (uint32_t) layout_local.total_bytes;
@@ -1128,6 +1744,10 @@ int op_gated_delta_net(struct htp_ops_context * octx) {
 
     if (nrows == 0) {
         return HTP_STATUS_OK;
+    }
+
+    if (kparams->kernel_type == HTP_GDN_KERNEL_HMX_CHUNKED) {
+        return gated_delta_net_f32_hmx_chunked(octx, kparams, row_start, nrows);
     }
 
     const uint32_t n_threads = (nrows < kparams->n_threads) ? nrows : kparams->n_threads;

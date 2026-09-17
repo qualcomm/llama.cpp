@@ -100,6 +100,7 @@ static bool   opt_dma64   = false;
 
 static int    opt_mm_select = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU (unsupported)
 static int    opt_fa_select = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU (unsupported)
+static int    opt_gdn_select = 2; // 2 = HMX -> HVX, 1 = HVX, 0 = CPU (unsupported)
 static int    opt_ar_select = 2; // 2 = fused ALLREDUCE+ADD (DMA, default), 1 = unfused ALLREDUCE (DMA), 0 = fallback to CPY+FENCE
 
 // Default PMU events, if profiling with PMU (mode=2) is enabled
@@ -4340,6 +4341,10 @@ static bool ggml_hexagon_supported_flash_attn_ext(const struct ggml_hexagon_sess
 }
 
 static bool ggml_hexagon_supported_gated_delta_net(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op) {
+    if (opt_gdn_select < 1) {
+        return false;
+    }
+
     const struct ggml_tensor * q     = op->src[0];
     const struct ggml_tensor * k     = op->src[1];
     const struct ggml_tensor * v     = op->src[2];
@@ -4388,7 +4393,7 @@ static bool ggml_hexagon_supported_gated_delta_net(const struct ggml_hexagon_ses
     const uint32_t total_rows = (uint32_t) (H * n_seqs);
     const uint32_t n_threads  = (std::min)((uint32_t) sess->n_threads, total_rows);
     struct htp_gdn_vtcm_layout layout;
-    htp_gdn_vtcm_layout_build(&layout, (uint32_t) S_v, n_threads ? n_threads : 1);
+    htp_gdn_vtcm_layout_build(&layout, (uint32_t) S_v, n_threads);
     if (layout.total_bytes > sess->vtcm_size) {
         return false;
     }
@@ -5206,10 +5211,28 @@ static void ggml_hexagon_precompute_gated_delta_net_params(
     const uint32_t total_rows = H * n_seqs;
     const uint32_t n_threads  = (std::min)((uint32_t) sess->n_threads, total_rows);
 
-    struct htp_gdn_vtcm_layout layout;
-    htp_gdn_vtcm_layout_build(&layout, S_v, n_threads ? n_threads : 1);
+    const bool can_use_hmx = (opt_gdn_select >= 2) &&
+                             (sess->n_hmx > 0) &&
+                             (S_v % 64 == 0) &&
+                             (n_tokens >= HTP_GDN_CHUNK_SIZE) &&
+                             (g->ne[0] == 1) &&
+                             (K == 1);
 
-    kparams->n_threads           = n_threads ? n_threads : 1;
+    struct htp_gdn_vtcm_layout layout;
+    if (can_use_hmx) {
+        htp_gdn_hmx_vtcm_layout_build(&layout, S_v, HTP_GDN_CHUNK_SIZE, 1);
+        if (layout.total_bytes <= sess->vtcm_size) {
+            kparams->kernel_type = HTP_GDN_KERNEL_HMX_CHUNKED;
+            kparams->chunk_size  = HTP_GDN_CHUNK_SIZE;
+            kparams->n_chunks    = n_tokens / HTP_GDN_CHUNK_SIZE;
+        } else {
+            htp_gdn_vtcm_layout_build(&layout, S_v, n_threads);
+        }
+    } else {
+        htp_gdn_vtcm_layout_build(&layout, S_v, n_threads);
+    }
+
+    kparams->n_threads           = n_threads;
     kparams->S_v                 = S_v;
     kparams->H                   = H;
     kparams->n_tokens            = n_tokens;
@@ -7731,6 +7754,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_nhmx     = getenv("GGML_HEXAGON_NHMX");
     const char * str_mm_select = getenv("GGML_HEXAGON_MM_SELECT");
     const char * str_fa_select = getenv("GGML_HEXAGON_FA_SELECT");
+    const char * str_gdn_select = getenv("GGML_HEXAGON_GDN_SELECT");
     const char * str_ar_select = getenv("GGML_HEXAGON_AR_SELECT");
     const char * str_ndev     = getenv("GGML_HEXAGON_NDEV");
     const char * str_arch     = getenv("GGML_HEXAGON_ARCH");
@@ -7783,6 +7807,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     opt_nhmx      = str_nhmx     ? atoi(str_nhmx)                         : opt_nhmx;
     opt_mm_select = str_mm_select ? atoi(str_mm_select)                   : opt_mm_select;
     opt_fa_select = str_fa_select ? atoi(str_fa_select)                   : opt_fa_select;
+    opt_gdn_select = str_gdn_select ? atoi(str_gdn_select)                 : opt_gdn_select;
     opt_ar_select = str_ar_select ? atoi(str_ar_select)                   : opt_ar_select;
     opt_mbuf      = str_mbuf     ? strtoul(str_mbuf, NULL, 0) * MiB       : opt_mbuf;
     opt_vmem      = str_vmem     ? strtoul(str_vmem, NULL, 0) * MiB       : opt_vmem;
