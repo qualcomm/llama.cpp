@@ -30002,10 +30002,34 @@ static bool ggml_cl_flash_attn_decompose(
     // at dk>=128. X1E stays at 256: it runs BOTH GEMMs on the generic mul_mat
     // (it declines the tuned image kernels), and dk=128 has never been measured
     // there -- a different code path, not merely a different constant.
-    const int min_dk = min_dk_env > 0
-                     ? min_dk_env
-                     : ((backend_ctx->adreno_gen == ADRENO_GPU_GEN::A8X ||
-                         backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E) ? 128 : 256);
+    // The int8 KQV GEMM moves the X2E floor down to dk=64, but only when it will actually run.
+    // gpt-oss-20B (dk 64), pp16384 at depth 0 / pp4096 at depth 16384, X2-90:
+    //
+    //   fused tile                  376 / 215
+    //   decomposed, f16 KQV         150 / 106   (-60% / -51%)
+    //   decomposed, int8 KQV        455 / 257   (+21% / +20%)
+    //
+    // A 64-deep contraction gives the f16 GEMM nothing per byte of V^T it streams, so dk=64 is a
+    // 2.5x loss unless the int8 gate below takes. The floor therefore follows that gate's
+    // conditions rather than dk alone. A8X keeps 128: dk=64 is not measured there.
+    //
+    // The int8 tile reuses each V^T slice across the query heads of a KV group, so it needs a
+    // group to reuse it with. SmolLM2-1.7B (dk 64, 32 heads, 32 KV heads) at dk=64:
+    // pp16384 +1.8%, pp4096 at depth 16384 -21%; Llama-3.2-1B (GQA 4) and granite-3B (GQA 3)
+    // on the same ladder: +35% / +34% at those two points. So dk=64 also wants n_head > n_head_kv.
+    static const bool kqv_int8_set = getenv("GGML_OPENCL_FA_KQV_INT8") != nullptr;
+    static const bool kqv_int8_env = []{
+        const char * e = getenv("GGML_OPENCL_FA_KQV_INT8");
+        return !e || !e[0] || atoi(e) != 0;
+    }();
+    const bool kqv_int8_possible = kqv_int8_env && (n_kv % 32 == 0) && (dv % 64 == 0) &&
+                                   n_head_kv > 0 && mask != nullptr &&
+                                   backend_ctx->kernel_fa_v_transpose_q8 != nullptr;
+    const bool gqa_group = n_head_kv > 0 && n_head % n_head_kv == 0 && n_head / n_head_kv >= 2;
+    const int gen_min_dk = backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E ? ((kqv_int8_possible && gqa_group) ? 64 : 128)
+                         : backend_ctx->adreno_gen == ADRENO_GPU_GEN::A8X ? 128
+                         : 256;
+    const int min_dk = min_dk_env > 0 ? min_dk_env : gen_min_dk;
     const bool measured_shape = dk >= min_dk;
 
     if (!(env_override >= 0 ? env_override == 1 : (measured_gen && measured_shape))) {
@@ -30158,11 +30182,6 @@ static bool ggml_cl_flash_attn_decompose(
     // NOT ggml_cl_env_flag: that treats any non-empty value as true, so "=0" would enable
     // the path rather than disable it. An A/B run with the off arm set to "0" silently
     // compared this path against itself.
-    static const bool kqv_int8_set = getenv("GGML_OPENCL_FA_KQV_INT8") != nullptr;
-    static const bool kqv_int8_env = []{
-        const char * e = getenv("GGML_OPENCL_FA_KQV_INT8");
-        return !e || !e[0] || atoi(e) != 0;
-    }();
     const bool kqv_int8 = kqv_int8_env && (n_kv % 32 == 0) && dv == kqv_m && n_head_kv > 0 &&
                           mask != nullptr &&
                           backend_ctx->kernel_fa_v_transpose_q8 != nullptr;
