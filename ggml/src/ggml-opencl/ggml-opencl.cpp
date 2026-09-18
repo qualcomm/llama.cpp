@@ -30154,16 +30154,18 @@ static bool ggml_cl_flash_attn_decompose(
 
     // int8 KQV: P as u8 and V^T as int8, each with one half scale per 32 elements along n_kv.
     // n_kv must divide by 32 for the block layout; the gate below declines otherwise.
+    // On by default; GGML_OPENCL_FA_KQV_INT8=0 opts out.
     // NOT ggml_cl_env_flag: that treats any non-empty value as true, so "=0" would enable
     // the path rather than disable it. An A/B run with the off arm set to "0" silently
     // compared this path against itself.
+    static const bool kqv_int8_set = getenv("GGML_OPENCL_FA_KQV_INT8") != nullptr;
     static const bool kqv_int8_env = []{
         const char * e = getenv("GGML_OPENCL_FA_KQV_INT8");
-        return e && e[0] && atoi(e) != 0;
+        return !e || !e[0] || atoi(e) != 0;
     }();
     const bool kqv_int8 = kqv_int8_env && (n_kv % 32 == 0) && dv == kqv_m && n_head_kv > 0 &&
                           backend_ctx->kernel_fa_v_transpose_q8 != nullptr;
-    if (kqv_int8_env) {
+    if (kqv_int8_set || kqv_int8) {
         // Report once why the path did or did not take: four conditions, and a silent decline
         // is indistinguishable from a kernel that ran and did nothing.
         static bool said = false;
