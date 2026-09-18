@@ -29908,8 +29908,7 @@ static void ggml_cl_fa_dump(ggml_backend_opencl_context * ctx, const char * name
         if (x != 0) ++nz; sum += x; asum += fabs(x); mn = std::min(mn, x); mx = std::max(mx, x);
         if (i < 8) { char b[32]; snprintf(b, sizeof b, "%g ", x); first += b; }
     }
-    fprintf(stderr, "[fa-int8-dump] %-8s n=%zu nz=%zu min=%g max=%g mean=%g absmean=%g first=[%s]
-", name, n, nz, mn, mx, sum/n, asum/n, first.c_str());
+    fprintf(stderr, "[fa-int8-dump] %-8s n=%zu nz=%zu min=%g max=%g mean=%g absmean=%g first=[%s]\n", name, n, nz, mn, mx, sum/n, asum/n, first.c_str());
 }
 
 static bool ggml_cl_flash_attn_decompose(
@@ -30372,8 +30371,7 @@ static bool ggml_cl_flash_attn_decompose(
                     static const bool dump = ggml_cl_env_flag("GGML_OPENCL_FA_INT8_DUMP");
                     static int dumped = 0;
                     if (dump && dumped++ < 1) {
-                        fprintf(stderr, "[fa-int8-dump] KQ call dk=%d n_kv=%d nqc=%d n_head=%d n_head_kv=%d gws=%zu,%zu,%zu q_nb1=%zu q_nb2=%zu k_nb1=%zu k_nb2=%zu
-", (int)dk, (int)n_kv, (int)nqc, (int)n_head, (int)n_head_kv, gws[0], gws[1], gws[2], (size_t)q->nb[1], (size_t)q->nb[2], (size_t)k->nb[1], (size_t)k->nb[2]);
+                        fprintf(stderr, "[fa-int8-dump] KQ call dk=%d n_kv=%d nqc=%d n_head=%d n_head_kv=%d gws=%zu,%zu,%zu q_nb1=%zu q_nb2=%zu k_nb1=%zu k_nb2=%zu\n", (int)dk, (int)n_kv, (int)nqc, (int)n_head, (int)n_head_kv, gws[0], gws[1], gws[2], (size_t)q->nb[1], (size_t)q->nb[2], (size_t)k->nb[1], (size_t)k->nb[2]);
                         ggml_cl_fa_dump(backend_ctx, "kq_q_s8", backend_ctx->prealloc_fa_kq_q.buffer, 0, (size_t)n_kv*dk*n_head_kv, 's');
                         ggml_cl_fa_dump(backend_ctx, "kq_d_h",  backend_ctx->prealloc_fa_kq_d.buffer, 0, (size_t)n_kv*(dk/32)*n_head_kv, 'h');
                         ggml_cl_fa_dump(backend_ctx, "qq_q_s8", backend_ctx->prealloc_fa_qq_q.buffer, 0, (size_t)nqc*dk*n_head, 's');
@@ -30451,8 +30449,7 @@ static bool ggml_cl_flash_attn_decompose(
             static const bool dump = ggml_cl_env_flag("GGML_OPENCL_FA_INT8_DUMP");
             static int dumped = 0;
             if (dump && dumped++ < 1) {
-                fprintf(stderr, "[fa-int8-dump] KQV call dv=%d n_kv=%d nqc=%d n_head=%d n_head_kv=%d gws=%zu,%zu,%zu
-", (int)dv, (int)n_kv, (int)nqc, (int)n_head, (int)n_head_kv, gws[0], gws[1], gws[2]);
+                fprintf(stderr, "[fa-int8-dump] KQV call dv=%d n_kv=%d nqc=%d n_head=%d n_head_kv=%d gws=%zu,%zu,%zu\n", (int)dv, (int)n_kv, (int)nqc, (int)n_head, (int)n_head_kv, gws[0], gws[1], gws[2]);
                 ggml_cl_fa_dump(backend_ctx, "kq_f32", ((ggml_tensor_extra_cl *)kq.extra)->data_device, ((ggml_tensor_extra_cl *)kq.extra)->offset + kq.view_offs, (size_t)n_kv*nqc*n_head, 'f');
                 ggml_cl_fa_dump(backend_ctx, "pq_u8",  backend_ctx->prealloc_fa_pq.buffer, 0, (size_t)n_kv*nqc*n_head, 'u');
                 ggml_cl_fa_dump(backend_ctx, "pd_h",   backend_ctx->prealloc_fa_pd.buffer, 0, (size_t)(n_kv/32)*nqc*n_head, 'h');
