@@ -97,7 +97,7 @@ kernel void kernel_mul_mm_q8_kqv(
             if (qi < n_q && bb < nb_here) {
                 v = vload4(0, &pq[(pbase + qi)*nu + (size_t)(bg + bb)*8 + h]);
             }
-            vstore4(v, 0, &sh_pq[t][bb][0]);
+            vstore4(v, 0, &sh_pq[t][bb][h]);
         }
         for (int i = lid; i < KQV_TN*KQV_NB; i += KQV_WG) {
             const int t  = i / KQV_NB;
