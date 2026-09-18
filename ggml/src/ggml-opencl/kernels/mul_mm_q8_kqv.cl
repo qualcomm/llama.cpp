@@ -24,6 +24,7 @@
 #define KQV_TM 32   // d rows per workgroup
 #define KQV_TN 16   // queries per workgroup
 #define KQV_WG 64
+#define KQV_NB 8   // P blocks staged per barrier
 
 __attribute__((reqd_work_group_size(KQV_WG, 1, 1)))
 kernel void kernel_mul_mm_q8_kqv(
@@ -63,8 +64,12 @@ kernel void kernel_mul_mm_q8_kqv(
     const int qg  = tid / KQV_TM;                   // 0 or 1 -> which half of the queries
     const int d   = dm0 + dl;
 
-    __local uint sh_pq[KQV_TN][8];
-    __local half sh_pd[KQV_TN];
+    // P is staged KQV_NB blocks at a time. One block per barrier put two barriers around only
+    // 64 dp4a instructions, and at n_kv=16384 that is 1024 barriers per workgroup - the first
+    // cut measured exactly at parity with the f16 kernel because it was synchronisation bound,
+    // not math bound. Eight blocks per barrier raises the work between them to 512 instructions.
+    __local uint sh_pq[KQV_TN][KQV_NB][8];
+    __local half sh_pd[KQV_TN][KQV_NB];
 
     float acc[8];
     #pragma unroll
@@ -75,40 +80,47 @@ kernel void kernel_mul_mm_q8_kqv(
     const size_t vbase = ((size_t)head_kv*dv + d)*nu;
     const size_t vdbas = ((size_t)head_kv*dv + d)*nblk;
 
-    for (int blk = 0; blk < nblk; ++blk) {
-        // stage this 32-block of P for all KQV_TN queries: 16 x 8 uints, 2 per lane
-        for (int i = tid; i < KQV_TN*8; i += KQV_WG) {
-            const int qq = i >> 3;
+    for (int bg = 0; bg < nblk; bg += KQV_NB) {
+        const int nb_here = min(KQV_NB, nblk - bg);
+
+        for (int i = tid; i < KQV_TN*KQV_NB*8; i += KQV_WG) {
+            const int qq = i >> 6;            // KQV_NB*8 == 64 per query
+            const int bb = (i >> 3) & (KQV_NB - 1);
             const int uu = i & 7;
             const int qi = qn0 + qq;
-            sh_pq[qq][uu] = qi < n_q ? pq[((size_t)head*n_q + qi)*nu + blk*8 + uu] : 0u;
+            sh_pq[qq][bb][uu] = (qi < n_q && bb < nb_here)
+                ? pq[((size_t)head*n_q + qi)*nu + (size_t)(bg + bb)*8 + uu] : 0u;
         }
-        if (tid < KQV_TN) {
-            const int qi = qn0 + tid;
-            sh_pd[tid] = qi < n_q ? pd[((size_t)head*n_q + qi)*nblk + blk] : (half)0.0f;
+        for (int i = tid; i < KQV_TN*KQV_NB; i += KQV_WG) {
+            const int qq = i / KQV_NB;
+            const int bb = i % KQV_NB;
+            const int qi = qn0 + qq;
+            sh_pd[qq][bb] = (qi < n_q && bb < nb_here)
+                ? pd[((size_t)head*n_q + qi)*nblk + bg + bb] : (half)0.0f;
         }
         barrier(CLK_LOCAL_MEM_FENCE);
 
         if (d < dv) {
-            uint w[8];
-            #pragma unroll
-            for (int u = 0; u < 8; ++u) {
-                w[u] = vq[vbase + blk*8 + u];
-            }
-            const float dvs = (float)vd[vdbas + blk];
-
-            #pragma unroll
-            for (int j = 0; j < 8; ++j) {
-                const int qq = qg*8 + j;
-
-                int raw = 0;
+            for (int bb = 0; bb < nb_here; ++bb) {
+                uint w[8];
                 #pragma unroll
                 for (int u = 0; u < 8; ++u) {
-                    // P is unsigned, V^T is signed
-                    raw = dot_acc_sat_4x8packed_us_int(sh_pq[qq][u], w[u], raw);
+                    w[u] = vq[vbase + (size_t)(bg + bb)*8 + u];
                 }
+                const float dvs = (float)vd[vdbas + bg + bb];
 
-                acc[j] += dvs * (float)sh_pd[qq] * (float)raw;
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const int qq = qg*8 + j;
+
+                    int raw = 0;
+                    #pragma unroll
+                    for (int u = 0; u < 8; ++u) {
+                        raw = dot_acc_sat_4x8packed_us_int(sh_pq[qq][bb][u], w[u], raw);
+                    }
+
+                    acc[j] += dvs * (float)sh_pd[qq][bb] * (float)raw;
+                }
             }
         }
         barrier(CLK_LOCAL_MEM_FENCE);
