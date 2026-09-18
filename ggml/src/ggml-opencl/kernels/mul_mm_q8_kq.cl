@@ -118,6 +118,9 @@ kernel void kernel_fa_q8_rows_f32(
 #ifndef KQ_DBG
 #define KQ_DBG 0
 #endif
+#ifndef KQ_SWAP
+#define KQ_SWAP 0
+#endif
 
 #if KQ_WAVE_PAIR
 __attribute__((qcom_wave_pair_mode(1)))
@@ -212,6 +215,16 @@ kernel void kernel_mul_mm_q8_kq(
             const uint4 a1 = (uint4)(sh_q[t][b*8+4], sh_q[t][b*8+5], sh_q[t][b*8+6], sh_q[t][b*8+7]);
 #endif
             int raw = 0;
+#if KQ_SWAP
+            raw = dot_acc_sat_4x8packed_ss_int(w0.s0, a0.s0, raw);
+            raw = dot_acc_sat_4x8packed_ss_int(w0.s1, a0.s1, raw);
+            raw = dot_acc_sat_4x8packed_ss_int(w0.s2, a0.s2, raw);
+            raw = dot_acc_sat_4x8packed_ss_int(w0.s3, a0.s3, raw);
+            raw = dot_acc_sat_4x8packed_ss_int(w1.s0, a1.s0, raw);
+            raw = dot_acc_sat_4x8packed_ss_int(w1.s1, a1.s1, raw);
+            raw = dot_acc_sat_4x8packed_ss_int(w1.s2, a1.s2, raw);
+            raw = dot_acc_sat_4x8packed_ss_int(w1.s3, a1.s3, raw);
+#else
             raw = dot_acc_sat_4x8packed_ss_int(a0.s0, w0.s0, raw);
             raw = dot_acc_sat_4x8packed_ss_int(a0.s1, w0.s1, raw);
             raw = dot_acc_sat_4x8packed_ss_int(a0.s2, w0.s2, raw);
@@ -220,6 +233,7 @@ kernel void kernel_mul_mm_q8_kq(
             raw = dot_acc_sat_4x8packed_ss_int(a1.s1, w1.s1, raw);
             raw = dot_acc_sat_4x8packed_ss_int(a1.s2, w1.s2, raw);
             raw = dot_acc_sat_4x8packed_ss_int(a1.s3, w1.s3, raw);
+#endif
             acc[t] += dks * (float)sh_qd[t][b] * (float)raw;
         }
     }

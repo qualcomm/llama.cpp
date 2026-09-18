@@ -171,6 +171,9 @@ kernel void kernel_mul_mm_q8_kqv(
 #ifndef KQV_DBG
 #define KQV_DBG 0       // 1: write 1.0 instead of the result (dispatch/store path check)
 #endif
+#ifndef KQV_SWAP
+#define KQV_SWAP 0      // 1: V first, P second (su variant) in the packed dot
+#endif
 
 #if KQV_WAVE_PAIR
 __attribute__((qcom_wave_pair_mode(1)))
@@ -281,6 +284,16 @@ kernel void kernel_mul_mm_q8_kqv(
                 const uint4 a1 = (uint4)(sh_pq[t][bb][4], sh_pq[t][bb][5], sh_pq[t][bb][6], sh_pq[t][bb][7]);
 #endif
                 int raw = 0;
+#if KQV_SWAP
+                raw = dot_acc_sat_4x8packed_su_int(w0.s0, a0.s0, raw);
+                raw = dot_acc_sat_4x8packed_su_int(w0.s1, a0.s1, raw);
+                raw = dot_acc_sat_4x8packed_su_int(w0.s2, a0.s2, raw);
+                raw = dot_acc_sat_4x8packed_su_int(w0.s3, a0.s3, raw);
+                raw = dot_acc_sat_4x8packed_su_int(w1.s0, a1.s0, raw);
+                raw = dot_acc_sat_4x8packed_su_int(w1.s1, a1.s1, raw);
+                raw = dot_acc_sat_4x8packed_su_int(w1.s2, a1.s2, raw);
+                raw = dot_acc_sat_4x8packed_su_int(w1.s3, a1.s3, raw);
+#else
                 raw = dot_acc_sat_4x8packed_us_int(a0.s0, w0.s0, raw);
                 raw = dot_acc_sat_4x8packed_us_int(a0.s1, w0.s1, raw);
                 raw = dot_acc_sat_4x8packed_us_int(a0.s2, w0.s2, raw);
@@ -289,6 +302,7 @@ kernel void kernel_mul_mm_q8_kqv(
                 raw = dot_acc_sat_4x8packed_us_int(a1.s1, w1.s1, raw);
                 raw = dot_acc_sat_4x8packed_us_int(a1.s2, w1.s2, raw);
                 raw = dot_acc_sat_4x8packed_us_int(a1.s3, w1.s3, raw);
+#endif
                 acc[t] += dvs * (float)sh_pd[t][bb] * (float)raw;
             }
         }
