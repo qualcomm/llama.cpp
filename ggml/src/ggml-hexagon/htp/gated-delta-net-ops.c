@@ -1993,13 +1993,9 @@ static int gated_delta_net_f32_hmx_chunked(
                 htp_gdn_push_hmx_gemm_task(hmx_q, &gemm_tasks[h][0], heads[h].k_row_tiles, heads[h].k_col_tiles, heads[h].kk_tiles, 2, 2, n_sv_tiles, vtcm_scales_1);
             }
             for (uint32_t h = 0; h < n_batch; ++h) {
-                hmx_queue_pop(hmx_q);
-            }
-
-            for (uint32_t h = 0; h < n_batch; ++h) {
                 htp_gdn_push_hmx_gemm_task(hmx_q, &gemm_tasks[h][1], heads[h].q_row_tiles, heads[h].k_col_tiles, heads[h].qk_tiles, 2, 2, n_sv_tiles, vtcm_scales_1);
             }
-            for (uint32_t h = 0; h < n_batch; ++h) {
+            for (uint32_t h = 0; h < 2 * n_batch; ++h) {
                 hmx_queue_pop(hmx_q);
             }
 
