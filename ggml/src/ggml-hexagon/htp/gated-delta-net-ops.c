@@ -1191,8 +1191,10 @@ static inline void gdn_unpack_SxS_tiles_to_f32(
     }
 }
 
-static inline void gdn_f32_to_hmx_row_tiles(
+static inline void gdn_f32_to_hmx_row_tiles_and_f16(
     __fp16 * restrict dst_tiles,
+    __fp16 * restrict dst_prime_tiles,
+    __fp16 * restrict dst_f16,
     const float * restrict src,
     const float * restrict scale_per_row,
     uint32_t n_rows,
@@ -1207,12 +1209,32 @@ static inline void gdn_f32_to_hmx_row_tiles(
         HVX_Vector s0 = scale_per_row ? hvx_vec_splat_f32(scale_per_row[r + 0]) : hvx_vec_splat_f32(1.0f);
         HVX_Vector s1 = scale_per_row ? hvx_vec_splat_f32(scale_per_row[r + 1]) : hvx_vec_splat_f32(1.0f);
 
-        for (uint32_t c = 0; c < n_col_tiles; ++c) {
-            HVX_Vector v0 = hvx_vec_mul_f32_f32(hvx_vmem(p0 + c * 32), s0);
-            HVX_Vector v1 = hvx_vec_mul_f32_f32(hvx_vmem(p1 + c * 32), s1);
-            HVX_Vector vh = hvx_vec_f32_to_f16_shuff(v0, v1);
-            __fp16 * tile = dst_tiles + (r0 * n_col_tiles + c) * HMX_FP16_TILE_N_ELMS;
-            ((HVX_Vector *) tile)[r1] = vh;
+        for (uint32_t c = 0; c < n_col_tiles; c += 2) {
+            HVX_Vector v0_0 = hvx_vmem(p0 + (c + 0) * 32);
+            HVX_Vector v1_0 = hvx_vmem(p1 + (c + 0) * 32);
+            HVX_Vector v0_1 = hvx_vmem(p0 + (c + 1) * 32);
+            HVX_Vector v1_1 = hvx_vmem(p1 + (c + 1) * 32);
+
+            HVX_Vector vh0 = hvx_vec_f32_to_f16_shuff(v0_0, v1_0);
+            HVX_Vector vh1 = hvx_vec_f32_to_f16_shuff(v0_1, v1_1);
+            __fp16 * tile0 = dst_tiles + (r0 * n_col_tiles + c + 0) * HMX_FP16_TILE_N_ELMS;
+            __fp16 * tile1 = dst_tiles + (r0 * n_col_tiles + c + 1) * HMX_FP16_TILE_N_ELMS;
+            ((HVX_Vector *) tile0)[r1] = vh0;
+            ((HVX_Vector *) tile1)[r1] = vh1;
+
+            if (dst_prime_tiles) {
+                HVX_Vector vh0_s = hvx_vec_f32_to_f16_shuff(hvx_vec_mul_f32_f32(v0_0, s0), hvx_vec_mul_f32_f32(v1_0, s1));
+                HVX_Vector vh1_s = hvx_vec_f32_to_f16_shuff(hvx_vec_mul_f32_f32(v0_1, s0), hvx_vec_mul_f32_f32(v1_1, s1));
+                __fp16 * tile0_s = dst_prime_tiles + (r0 * n_col_tiles + c + 0) * HMX_FP16_TILE_N_ELMS;
+                __fp16 * tile1_s = dst_prime_tiles + (r0 * n_col_tiles + c + 1) * HMX_FP16_TILE_N_ELMS;
+                ((HVX_Vector *) tile0_s)[r1] = vh0_s;
+                ((HVX_Vector *) tile1_s)[r1] = vh1_s;
+            }
+
+            if (dst_f16) {
+                hvx_vmem(dst_f16 + (r + 0) * n_cols + c * 32) = hvx_vec_f32_to_f16(v0_0, v0_1);
+                hvx_vmem(dst_f16 + (r + 1) * n_cols + c * 32) = hvx_vec_f32_to_f16(v1_0, v1_1);
+            }
         }
     }
 }
@@ -1676,20 +1698,12 @@ static void gdn_hvx_phase1_worker(unsigned int n, unsigned int i, void * data) {
         hvx_vmem(head->decay_a + t * 64) = v_a;
     }
 
-    gdn_f32_to_hmx_row_tiles(head->k_row_tiles, head->k_f32[curr_buf], NULL, 64, S_v);
-
-    for (uint32_t t = 0; t < 64; ++t) {
-        for (uint32_t j = 0; j < S_v; j += 64) {
-            HVX_Vector v0 = hvx_vmem(head->k_f32[curr_buf] + t * S_v + j + 0);
-            HVX_Vector v1 = (j + 32 < S_v) ? hvx_vmem(head->k_f32[curr_buf] + t * S_v + j + 32) : Q6_V_vzero();
-            hvx_vmem(head->k_f16 + t * S_v + j) = hvx_vec_f32_to_f16(v0, v1);
-        }
-    }
+    gdn_f32_to_hmx_row_tiles_and_f16(head->k_row_tiles, head->k_prime_row_tiles, head->k_f16,
+                                     head->k_f32[curr_buf], head->lambda_init, 64, S_v);
     hmx_interleave_rows_to_tiles(head->k_col_tiles, head->k_f16, 64, S_v, S_v, 0, 64);
 
-    gdn_f32_to_hmx_row_tiles(head->q_row_tiles, head->q_f32[curr_buf], NULL, 64, S_v);
-    gdn_f32_to_hmx_row_tiles(head->k_prime_row_tiles, head->k_f32[curr_buf], head->lambda_init, 64, S_v);
-    gdn_f32_to_hmx_row_tiles(head->q_prime_row_tiles, head->q_f32[curr_buf], head->lambda_init, 64, S_v);
+    gdn_f32_to_hmx_row_tiles_and_f16(head->q_row_tiles, head->q_prime_row_tiles, NULL,
+                                     head->q_f32[curr_buf], head->lambda_init, 64, S_v);
 
     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_GDN_PREP, info);
 }
