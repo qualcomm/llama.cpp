@@ -21,6 +21,9 @@
 // Dispatch order (host and kernel are a matched pair): query tile fastest across the heads of a
 // GQA group, then the kv block, then the KV head. A 64-row K block is 16 KB and is reused from
 // L2 by every query tile of its group before the next block is touched.
+//
+// The packed dot takes the K word (from global, in registers) FIRST and the Q word (from local
+// memory) second; see mul_mm_q8_kqv.cl for why the order matters on the Adreno compiler.
 
 #ifndef KQ_TN
 #define KQ_TN 32        // queries per workgroup
@@ -103,30 +106,7 @@ kernel void kernel_fa_q8_rows_f32(
 
 // ---- the GEMM -----------------------------------------------------------------------------
 
-#ifndef KQ_WAVE_PAIR
-#define KQ_WAVE_PAIR 1
-#endif
-#ifndef KQ_LDS_VEC
-#define KQ_LDS_VEC 1
-#endif
-#ifndef KQ_GLB_VEC
-#define KQ_GLB_VEC 1
-#endif
-#ifndef KQ_STG_VEC
-#define KQ_STG_VEC 1
-#endif
-#ifndef KQ_DBG
-#define KQ_DBG 0
-#endif
-#ifndef KQ_SWAP
-#define KQ_SWAP 0
-#endif
-
-#if KQ_WAVE_PAIR
 __attribute__((qcom_wave_pair_mode(1)))
-#else
-__attribute__((reqd_work_group_size(KQ_WG, 1, 1)))
-#endif
 kernel void kernel_mul_mm_q8_kq(
         global const uint  * kq,        // K int8, [head_kv][n_kv][dk]   as packed uints
         global const half  * kd,        // K scales, [head_kv][n_kv][dk/32]
@@ -157,7 +137,6 @@ kernel void kernel_mul_mm_q8_kq(
     __local half sh_qd[KQ_TN][KQ_DK_MAX/32];
 
     const size_t qbase = (size_t)head*n_q;
-#if KQ_STG_VEC
     for (int i = lid; i < KQ_TN*(KQ_DK_MAX/16); i += KQ_WG) {
         const int t = i / (KQ_DK_MAX/16);
         const int u = (i % (KQ_DK_MAX/16)) * 4;
@@ -168,14 +147,6 @@ kernel void kernel_mul_mm_q8_kq(
         }
         vstore4(v, 0, &sh_q[t][u]);
     }
-#else
-    for (int i = lid; i < KQ_TN*(KQ_DK_MAX/4); i += KQ_WG) {
-        const int t = i / (KQ_DK_MAX/4);
-        const int u = i % (KQ_DK_MAX/4);
-        const int qi = qn0 + t;
-        sh_q[t][u] = (qi < n_q && u < nu) ? qq[(qbase + qi)*nu + u] : 0u;
-    }
-#endif
     for (int i = lid; i < KQ_TN*(KQ_DK_MAX/32); i += KQ_WG) {
         const int t = i / (KQ_DK_MAX/32);
         const int b = i % (KQ_DK_MAX/32);
@@ -195,27 +166,15 @@ kernel void kernel_mul_mm_q8_kq(
     const size_t kdbas = ((size_t)head_kv*n_kv + kl)*nblk;
 
     for (int b = 0; b < nblk; ++b) {
-#if KQ_GLB_VEC
         const uint4 w0 = vload4(0, &kq[kbase + b*8]);
         const uint4 w1 = vload4(0, &kq[kbase + b*8 + 4]);
-#else
-        const size_t ko = kbase + b*8;
-        const uint4 w0 = (uint4)(kq[ko+0], kq[ko+1], kq[ko+2], kq[ko+3]);
-        const uint4 w1 = (uint4)(kq[ko+4], kq[ko+5], kq[ko+6], kq[ko+7]);
-#endif
         const float dks = (float)kd[kdbas + b];
 
         #pragma unroll
         for (int t = 0; t < KQ_TN; ++t) {
-#if KQ_LDS_VEC
             const uint4 a0 = vload4(0, &sh_q[t][b*8]);
             const uint4 a1 = vload4(0, &sh_q[t][b*8 + 4]);
-#else
-            const uint4 a0 = (uint4)(sh_q[t][b*8+0], sh_q[t][b*8+1], sh_q[t][b*8+2], sh_q[t][b*8+3]);
-            const uint4 a1 = (uint4)(sh_q[t][b*8+4], sh_q[t][b*8+5], sh_q[t][b*8+6], sh_q[t][b*8+7]);
-#endif
             int raw = 0;
-#if KQ_SWAP
             raw = dot_acc_sat_4x8packed_ss_int(w0.s0, a0.s0, raw);
             raw = dot_acc_sat_4x8packed_ss_int(w0.s1, a0.s1, raw);
             raw = dot_acc_sat_4x8packed_ss_int(w0.s2, a0.s2, raw);
@@ -224,16 +183,6 @@ kernel void kernel_mul_mm_q8_kq(
             raw = dot_acc_sat_4x8packed_ss_int(w1.s1, a1.s1, raw);
             raw = dot_acc_sat_4x8packed_ss_int(w1.s2, a1.s2, raw);
             raw = dot_acc_sat_4x8packed_ss_int(w1.s3, a1.s3, raw);
-#else
-            raw = dot_acc_sat_4x8packed_ss_int(a0.s0, w0.s0, raw);
-            raw = dot_acc_sat_4x8packed_ss_int(a0.s1, w0.s1, raw);
-            raw = dot_acc_sat_4x8packed_ss_int(a0.s2, w0.s2, raw);
-            raw = dot_acc_sat_4x8packed_ss_int(a0.s3, w0.s3, raw);
-            raw = dot_acc_sat_4x8packed_ss_int(a1.s0, w1.s0, raw);
-            raw = dot_acc_sat_4x8packed_ss_int(a1.s1, w1.s1, raw);
-            raw = dot_acc_sat_4x8packed_ss_int(a1.s2, w1.s2, raw);
-            raw = dot_acc_sat_4x8packed_ss_int(a1.s3, w1.s3, raw);
-#endif
             acc[t] += dks * (float)sh_qd[t][b] * (float)raw;
         }
     }
@@ -247,7 +196,7 @@ kernel void kernel_mul_mm_q8_kq(
     for (int t = 0; t < KQ_TN; ++t) {
         const int qi = qn0 + t;
         if (qi < n_q) {
-            dst[(qbase + qi)*n_kv + kv] = KQ_DBG ? 1.0f : acc[t];
+            dst[(qbase + qi)*n_kv + kv] = acc[t];
         }
     }
 }
