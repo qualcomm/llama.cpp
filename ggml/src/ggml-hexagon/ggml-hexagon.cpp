@@ -4403,7 +4403,7 @@ static bool ggml_hexagon_supported_gated_delta_net(const struct ggml_hexagon_ses
     const bool can_use_hmx = (opt_gdn_select >= 2) &&
                              (sess->n_hmx > 0) &&
                              (S_v % 64 == 0) &&
-                             (n_tokens >= HTP_GDN_CHUNK_SIZE) &&
+                             (n_tokens >= HTP_GDN_MIN_TOKENS) &&
                              (g->ne[0] == 1) &&
                              (K == 1);
 
@@ -5237,7 +5237,7 @@ static void ggml_hexagon_precompute_gated_delta_net_params(
     const bool can_use_hmx = (opt_gdn_select >= 2) &&
                              (sess->n_hmx > 0) &&
                              (S_v % 64 == 0) &&
-                             (n_tokens >= HTP_GDN_CHUNK_SIZE) &&
+                             (n_tokens >= HTP_GDN_MIN_TOKENS) &&
                              (g->ne[0] == 1) &&
                              (K == 1);
 
@@ -5249,7 +5249,7 @@ static void ggml_hexagon_precompute_gated_delta_net_params(
         kparams->kernel_type     = HTP_GDN_KERNEL_HMX_CHUNKED;
         kparams->pipeline        = hmx_layout.pipeline ? 1 : 0;
         kparams->chunk_size      = HTP_GDN_CHUNK_SIZE;
-        kparams->n_chunks        = n_tokens / HTP_GDN_CHUNK_SIZE;
+        kparams->n_chunks        = (n_tokens + HTP_GDN_CHUNK_SIZE - 1) / HTP_GDN_CHUNK_SIZE;
         kparams->n_heads_batch   = (uint16_t) n_heads_batch;
         kparams->vtcm_size       = (uint32_t) hmx_layout.total_bytes;
         kparams->state_aligned   = (uint32_t) hmx_layout.state_f32_bytes;
