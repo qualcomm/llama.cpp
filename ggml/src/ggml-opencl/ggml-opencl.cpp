@@ -1314,6 +1314,8 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_soft_max_4_f16_q8;
     cl_kernel kernel_mul_mm_q8_kqv;
     cl_kernel kernel_fa_v_transpose_q8 = nullptr;
+    int fa_kqv_tn = 32;   // queries per int8 KQV workgroup, matches the kernel's KQV_TN
+    int fa_kqv_nb = 4;    // P blocks per barrier in the int8 KQV
     ggml_opencl_fa_kernels fa;
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
     ggml_cl_adreno_xmem_attn_state adreno_xmem_attn;
@@ -7642,8 +7644,20 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #else
         const std::string kernel_src = read_file("mul_mm_q8_kqv.cl");
 #endif
+        // Tile sweep knobs, read once: the kernel's KQV_TN / KQV_NB defaults are the shipped
+        // values, and the dispatch below must agree with KQV_TN.
+        auto env_pow2 = [](const char * name, int def, int lo, int hi) {
+            const char * e = getenv(name);
+            const int v = (e && e[0]) ? atoi(e) : def;
+            return (v >= lo && v <= hi && (v & (v - 1)) == 0) ? v : def;
+        };
+        backend_ctx->fa_kqv_tn = env_pow2("GGML_OPENCL_FA_KQV_TN", 32, 8, 64);
+        backend_ctx->fa_kqv_nb = env_pow2("GGML_OPENCL_FA_KQV_NB", 4, 1, 16);
+        const std::string kqv_opts = compile_opts +
+            " -DKQV_TN=" + std::to_string(backend_ctx->fa_kqv_tn) +
+            " -DKQV_NB=" + std::to_string(backend_ctx->fa_kqv_nb);
         backend_ctx->program_mul_mm_q8_kqv =
-            build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+            build_program_from_source(backend_ctx, kernel_src.c_str(), kqv_opts);
 
         CL_CHECK((backend_ctx->kernel_mul_mm_q8_kqv = clCreateKernel(backend_ctx->program_mul_mm_q8_kqv, "kernel_mul_mm_q8_kqv", &err), err));
         GGML_LOG_CONT(".");
@@ -30255,11 +30269,12 @@ static bool ggml_cl_flash_attn_decompose(
             CL_CHECK(clSetKernelArg(kk, i++, sizeof(int),      &nq_i));
             CL_CHECK(clSetKernelArg(kk, i++, sizeof(int),      &nh_i));
             CL_CHECK(clSetKernelArg(kk, i++, sizeof(int),      &nhkv_i));
-            // Matched to kernel_mul_mm_q8_kqv: 64 d rows x 32 queries per workgroup, d-block
+            // Matched to kernel_mul_mm_q8_kqv: 64 d rows x fa_kqv_tn queries per workgroup, d-block
             // fastest, then the query heads of one GQA group, then the query tile, then the KV
             // head. The kernel decodes the head from get_group_id(1); change both or neither.
             const size_t gsz = (size_t)(n_head / n_head_kv);
-            size_t gws[3] = { (size_t)((dv + 63)/64)*64, gsz*(size_t)((nqc + 31)/32), (size_t)n_head_kv };
+            const size_t tn  = (size_t)backend_ctx->fa_kqv_tn;
+            size_t gws[3] = { (size_t)((dv + 63)/64)*64, gsz*(size_t)((nqc + tn - 1)/tn), (size_t)n_head_kv };
             size_t lws[3] = { 64, 1, 1 };
             backend_ctx->enqueue_ndrange_kernel(kk, 3, gws, lws, dst);
         } else {
