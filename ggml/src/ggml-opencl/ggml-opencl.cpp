@@ -1323,6 +1323,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_fa_q8_rows_f16;
     cl_kernel kernel_fa_q8_rows_f32;
     int fa_kq_tn = 32;    // queries per int8 KQ workgroup, matches the kernel's KQ_TN
+    int fa_kq_mb = 8;     // 64-row kv blocks per int8 KQ workgroup, matches the kernel's KQ_MB
     cl_kernel kernel_fa_v_transpose_q8 = nullptr;
     int fa_kqv_tn = 32;   // queries per int8 KQV workgroup, matches the kernel's KQV_TN
     int fa_kqv_nb = 4;    // P blocks per barrier in the int8 KQV
@@ -7688,7 +7689,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             return (v >= lo && v <= hi && (v & (v - 1)) == 0) ? v : def;
         };
         backend_ctx->fa_kq_tn = env_pow2("GGML_OPENCL_FA_KQ_TN", 32, 8, 64);
-        const std::string kq_opts = compile_opts + " -DKQ_TN=" + std::to_string(backend_ctx->fa_kq_tn);
+        backend_ctx->fa_kq_mb = env_pow2("GGML_OPENCL_FA_KQ_MB", 8, 1, 64);
+        const std::string kq_opts = compile_opts + " -DKQ_TN=" + std::to_string(backend_ctx->fa_kq_tn) +
+            " -DKQ_MB=" + std::to_string(backend_ctx->fa_kq_mb);
         backend_ctx->program_mul_mm_q8_kq =
             build_program_from_source(backend_ctx, kernel_src.c_str(), kq_opts);
 
@@ -30339,7 +30342,8 @@ static bool ggml_cl_flash_attn_decompose(
                     CL_CHECK(clSetKernelArg(kk, i++, sizeof(int),      &nhkv_i));
                     const size_t gsz = (size_t)(n_head / n_head_kv);
                     const size_t tn  = (size_t)backend_ctx->fa_kq_tn;
-                    size_t gws[3] = { 64*gsz*(size_t)((nqc + tn - 1)/tn), (size_t)((n_kv + 63)/64), (size_t)n_head_kv };
+                    const size_t mb  = 64*(size_t)backend_ctx->fa_kq_mb;
+                    size_t gws[3] = { 64*gsz*(size_t)((nqc + tn - 1)/tn), (size_t)((n_kv + mb - 1)/mb), (size_t)n_head_kv };
                     size_t lws[3] = { 64, 1, 1 };
                     backend_ctx->enqueue_ndrange_kernel(kk, 3, gws, lws, dst);
                 }

@@ -16,7 +16,9 @@
 //
 // The contraction is short (dk = 256 is 8 blocks) and the output is the largest tensor in the
 // attention, so the tile is sized for the output: one lane owns one kv row and KQ_TN queries,
-// the whole Q tile is staged in local memory once, and there are no per-block barriers.
+// the whole Q tile is staged in local memory once, and there are no per-block barriers. A
+// workgroup then walks KQ_MB consecutive 64-row kv blocks with that one staged tile: with a
+// single block the staging and the launch cost more than the 8-block contraction they serve.
 //
 // Dispatch order (host and kernel are a matched pair): query tile fastest across the heads of a
 // GQA group, then the kv block, then the KV head. A 64-row K block is 16 KB and is reused from
@@ -28,7 +30,10 @@
 #ifndef KQ_TN
 #define KQ_TN 32        // queries per workgroup
 #endif
-#define KQ_TM 64        // kv rows per workgroup, one per lane
+#ifndef KQ_MB
+#define KQ_MB 8         // 64-row kv blocks per workgroup, sharing one staged Q tile
+#endif
+#define KQ_TM 64        // kv rows per block, one per lane
 #define KQ_WG 64
 #define KQ_DK_MAX 256   // local memory is sized for this; the host declines larger heads
 
@@ -128,7 +133,7 @@ kernel void kernel_mul_mm_q8_kq(
     const int head_kv = get_group_id(2);
     const int head = head_kv*gsz + (g0 % gsz);
     const int qn0  = (g0 / gsz) * KQ_TN;
-    const int kv   = get_group_id(1)*KQ_TM + lid;
+    const int kv0  = get_group_id(1)*KQ_TM*KQ_MB + lid;
 
     const int nblk = dk / 32;
     const int nu   = dk / 4;
@@ -155,48 +160,53 @@ kernel void kernel_mul_mm_q8_kq(
     }
     barrier(CLK_LOCAL_MEM_FENCE);
 
-    float acc[KQ_TN];
-    #pragma unroll
-    for (int t = 0; t < KQ_TN; ++t) {
-        acc[t] = 0.0f;
-    }
+    for (int m = 0; m < KQ_MB; ++m) {
+        const int kv = kv0 + m*KQ_TM;
+        if (kv - lid >= n_kv) {
+            break;                                  // whole block past the end, uniform per workgroup
+        }
 
-    const int    kl    = min(kv, n_kv - 1);         // clamp so a tail lane loads in bounds
-    const size_t kbase = ((size_t)head_kv*n_kv + kl)*nu;
-    const size_t kdbas = ((size_t)head_kv*n_kv + kl)*nblk;
-
-    for (int b = 0; b < nblk; ++b) {
-        const uint4 w0 = vload4(0, &kq[kbase + b*8]);
-        const uint4 w1 = vload4(0, &kq[kbase + b*8 + 4]);
-        const float dks = (float)kd[kdbas + b];
-
+        float acc[KQ_TN];
         #pragma unroll
         for (int t = 0; t < KQ_TN; ++t) {
-            const uint4 a0 = vload4(0, &sh_q[t][b*8]);
-            const uint4 a1 = vload4(0, &sh_q[t][b*8 + 4]);
-            int raw = 0;
-            raw = dot_acc_sat_4x8packed_ss_int(w0.s0, a0.s0, raw);
-            raw = dot_acc_sat_4x8packed_ss_int(w0.s1, a0.s1, raw);
-            raw = dot_acc_sat_4x8packed_ss_int(w0.s2, a0.s2, raw);
-            raw = dot_acc_sat_4x8packed_ss_int(w0.s3, a0.s3, raw);
-            raw = dot_acc_sat_4x8packed_ss_int(w1.s0, a1.s0, raw);
-            raw = dot_acc_sat_4x8packed_ss_int(w1.s1, a1.s1, raw);
-            raw = dot_acc_sat_4x8packed_ss_int(w1.s2, a1.s2, raw);
-            raw = dot_acc_sat_4x8packed_ss_int(w1.s3, a1.s3, raw);
-            acc[t] += dks * (float)sh_qd[t][b] * (float)raw;
+            acc[t] = 0.0f;
         }
-    }
 
-    if (kv >= n_kv) {
-        return;
-    }
+        const int    kl    = min(kv, n_kv - 1);     // clamp so a tail lane loads in bounds
+        const size_t kbase = ((size_t)head_kv*n_kv + kl)*nu;
+        const size_t kdbas = ((size_t)head_kv*n_kv + kl)*nblk;
 
-    // dst is [head][n_q][n_kv] with n_kv contiguous, so the 64 lanes of a kv block write contiguously
-    #pragma unroll
-    for (int t = 0; t < KQ_TN; ++t) {
-        const int qi = qn0 + t;
-        if (qi < n_q) {
-            dst[(qbase + qi)*n_kv + kv] = acc[t];
+        for (int b = 0; b < nblk; ++b) {
+            const uint4 w0 = vload4(0, &kq[kbase + b*8]);
+            const uint4 w1 = vload4(0, &kq[kbase + b*8 + 4]);
+            const float dks = (float)kd[kdbas + b];
+
+            #pragma unroll
+            for (int t = 0; t < KQ_TN; ++t) {
+                const uint4 a0 = vload4(0, &sh_q[t][b*8]);
+                const uint4 a1 = vload4(0, &sh_q[t][b*8 + 4]);
+                int raw = 0;
+                raw = dot_acc_sat_4x8packed_ss_int(w0.s0, a0.s0, raw);
+                raw = dot_acc_sat_4x8packed_ss_int(w0.s1, a0.s1, raw);
+                raw = dot_acc_sat_4x8packed_ss_int(w0.s2, a0.s2, raw);
+                raw = dot_acc_sat_4x8packed_ss_int(w0.s3, a0.s3, raw);
+                raw = dot_acc_sat_4x8packed_ss_int(w1.s0, a1.s0, raw);
+                raw = dot_acc_sat_4x8packed_ss_int(w1.s1, a1.s1, raw);
+                raw = dot_acc_sat_4x8packed_ss_int(w1.s2, a1.s2, raw);
+                raw = dot_acc_sat_4x8packed_ss_int(w1.s3, a1.s3, raw);
+                acc[t] += dks * (float)sh_qd[t][b] * (float)raw;
+            }
+        }
+
+        if (kv < n_kv) {
+            // dst is [head][n_q][n_kv] with n_kv contiguous, so the 64 lanes of a kv block write contiguously
+            #pragma unroll
+            for (int t = 0; t < KQ_TN; ++t) {
+                const int qi = qn0 + t;
+                if (qi < n_q) {
+                    dst[(qbase + qi)*n_kv + kv] = acc[t];
+                }
+            }
         }
     }
 }
