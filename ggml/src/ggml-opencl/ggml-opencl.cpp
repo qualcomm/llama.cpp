@@ -30255,7 +30255,11 @@ static bool ggml_cl_flash_attn_decompose(
             CL_CHECK(clSetKernelArg(kk, i++, sizeof(int),      &nq_i));
             CL_CHECK(clSetKernelArg(kk, i++, sizeof(int),      &nh_i));
             CL_CHECK(clSetKernelArg(kk, i++, sizeof(int),      &nhkv_i));
-            size_t gws[3] = { (size_t)((dv + 31)/32)*64, (size_t)((nqc + 15)/16), (size_t)n_head };
+            // Matched to kernel_mul_mm_q8_kqv: 64 d rows x 32 queries per workgroup, d-block
+            // fastest, then the query heads of one GQA group, then the query tile, then the KV
+            // head. The kernel decodes the head from get_group_id(1); change both or neither.
+            const size_t gsz = (size_t)(n_head / n_head_kv);
+            size_t gws[3] = { (size_t)((dv + 63)/64)*64, gsz*(size_t)((nqc + 31)/32), (size_t)n_head_kv };
             size_t lws[3] = { 64, 1, 1 };
             backend_ctx->enqueue_ndrange_kernel(kk, 3, gws, lws, dst);
         } else {
