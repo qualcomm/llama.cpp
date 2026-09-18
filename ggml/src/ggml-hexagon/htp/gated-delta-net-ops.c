@@ -60,9 +60,8 @@ static inline HVX_Vector gdn_mul_dot_f32(float * restrict dst, const HVX_Vector 
     return hvx_vec_reduce_sum_f32(acc);
 }
 
-static inline HVX_Vector gdn_mul_scalar_dot_f32(float * restrict dst, float mul, const HVX_Vector * restrict dot, uint32_t n) {
+static inline HVX_Vector gdn_mul_scalar_dot_f32(float * restrict dst, HVX_Vector vmul, const HVX_Vector * restrict dot, uint32_t n) {
     HVX_Vector acc = Q6_V_vzero();
-    const HVX_Vector vmul = hvx_vec_splat_f32(mul);
     const uint32_t epv = 128 / sizeof(float);
     const uint32_t nvec = n / epv;
     const uint32_t nloe = n % epv;
@@ -594,20 +593,15 @@ static inline void gdn_step_kda_f32(
     HVX_Vector vk[4];
     HVX_Vector vg[4];
 
-    static const float kInf    = INFINITY;
-    static const float kMaxExp = 88.7228f;
-    const HVX_Vector max_exp = hvx_vec_splat_f32(kMaxExp);
-    const HVX_Vector inf     = hvx_vec_splat_f32(kInf);
-
     for (uint32_t i = 0; i < nvec; ++i) {
         vq[i] = hvx_vmemu(q_t + i * epv);
         vk[i] = hvx_vmemu(k_t + i * epv);
-        vg[i] = hvx_vec_exp_f32_guard(hvx_vmemu(g_t + i * epv), max_exp, inf);
+        vg[i] = hvx_vec_exp_f32(hvx_vmemu(g_t + i * epv));
     }
     if (nloe) {
         vq[nvec] = hvx_vmemu(q_t + nvec * epv);
         vk[nvec] = hvx_vmemu(k_t + nvec * epv);
-        vg[nvec] = hvx_vec_exp_f32_guard(hvx_vmemu(g_t + nvec * epv), max_exp, inf);
+        vg[nvec] = hvx_vec_exp_f32(hvx_vmemu(g_t + nvec * epv));
     }
 
     const HVX_Vector vbeta  = hvx_vec_splat_f32(beta_val);
@@ -695,9 +689,8 @@ static inline void gdn_step_scalar_f32(
         vk[nvec] = hvx_vmemu(k_t + nvec * epv);
     }
 
-    const float gate       = expf(g_t[0]);
-    const HVX_Vector vgate = hvx_vec_splat_f32(gate);
-    const HVX_Vector vbeta = hvx_vec_splat_f32(beta_val);
+    const HVX_Vector vgate  = hvx_vec_exp_f32(hvx_vec_splat_f32(g_t[0]));
+    const HVX_Vector vbeta  = hvx_vec_splat_f32(beta_val);
     const HVX_Vector vscale = hvx_vec_splat_f32(scale);
 
     float delta[8] __attribute__((aligned(128)));
@@ -747,7 +740,7 @@ static inline void gdn_step_scalar_f32(
     }
     for (; j < S_v; ++j) {
         float * row = s_work + (uint64_t) j * S_v;
-        HVX_Vector vsum = gdn_mul_scalar_dot_f32(row, gate, vk, S_v);
+        HVX_Vector vsum = gdn_mul_scalar_dot_f32(row, vgate, vk, S_v);
         HVX_Vector vv_t = hvx_vec_splat_f32(v_t[j]);
         HVX_Vector vdj  = hvx_vec_mul_f32_f32(hvx_vec_sub_f32_f32(vv_t, vsum), vbeta);
         HVX_Vector vres = gdn_add_scaled_dot_f32(row, vk, vdj, vq, S_v);
