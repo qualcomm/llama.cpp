@@ -1310,13 +1310,10 @@ static inline void gdn_pack_d_t_row_tiles(
     }
 }
 
-static __attribute__((noinline)) void gdn_build_inv_l_and_a(
+static __attribute__((noinline)) void gdn_build_inv_l(
     HVX_Vector * restrict rows_inv,
-    HVX_Vector * restrict rows_a,
     const HVX_Vector * restrict rows_kk,
-    const HVX_Vector * restrict rows_qk,
     const __fp16 * restrict decay_m,
-    const __fp16 * restrict decay_a,
     const float * restrict beta
 ) {
     const HVX_Vector v_one_f16 = hvx_vec_splat_f16(1.0f);
@@ -1328,9 +1325,6 @@ static __attribute__((noinline)) void gdn_build_inv_l_and_a(
         HVX_Vector v_decay_m = hvx_vmem(decay_m + t * 64);
         HVX_Vector v_scale_t = hvx_vec_splat_f16(beta_f16.fp16[t]);
         HVX_Vector row_m     = hvx_vec_mul_f16_f16(hvx_vec_mul_f16_f16(rows_kk[t], v_decay_m), v_scale_t);
-
-        HVX_Vector v_decay_a = hvx_vmem(decay_a + t * 64);
-        rows_a[t]            = hvx_vec_mul_f16_f16(rows_qk[t], v_decay_a);
 
         row_m_f16.v = row_m;
 
@@ -1597,7 +1591,7 @@ static inline __attribute__((unused)) HVX_Vector hvx_clamp_neg20_0(HVX_Vector v,
     return Q6_V_vmux_QVV(p_lt, v_neg20, v);
 }
 
-static void gdn_hvx_phase1_worker(unsigned int n, unsigned int i, void * data) {
+static void gdn_hvx_phase1a_worker(unsigned int n, unsigned int i, void * data) {
     (void) n;
     struct htp_gdn_batch_context * bctx = (struct htp_gdn_batch_context *) data;
     struct htp_thread_trace * tr = &bctx->octx->ctx->trace[i];
@@ -1663,11 +1657,36 @@ static void gdn_hvx_phase1_worker(unsigned int n, unsigned int i, void * data) {
     HVX_Vector v_gamma0 = hvx_vmem(local_gamma + 0);
     HVX_Vector v_gamma1 = hvx_vmem(local_gamma + 32);
 
+    hvx_vmem(head->gamma) = hvx_vec_f32_to_f16(v_gamma0, v_gamma1);
+
     hvx_vmem(head->lambda_init + 0)  = hvx_vec_exp_f32(hvx_clamp_neg20_0(v_gamma0, v_zero, v_neg20));
     hvx_vmem(head->lambda_init + 32) = hvx_vec_exp_f32(hvx_clamp_neg20_0(v_gamma1, v_zero, v_neg20));
 
+    gdn_f32_to_hmx_row_tiles_and_f16(head->k_row_tiles, head->k_prime_row_tiles, head->k_f16,
+                                     head->k_f32[curr_buf], head->lambda_init, 64, S_v);
+    hmx_interleave_rows_to_tiles(head->k_col_tiles, head->k_f16, 64, S_v, S_v, 0, 64);
+
+    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_GDN_PREP, info);
+}
+
+static void gdn_hvx_phase1b_worker(unsigned int n, unsigned int i, void * data) {
+    (void) n;
+    struct htp_gdn_batch_context * bctx = (struct htp_gdn_batch_context *) data;
+    struct htp_thread_trace * tr = &bctx->octx->ctx->trace[i];
+    const uint16_t info = (uint16_t) bctx->c;
+    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_GDN_PREP, info);
+
+    struct htp_gdn_head_ptrs * head = &bctx->heads[i];
+    const uint32_t curr_buf = bctx->curr_buf;
+    const uint32_t S_v = bctx->S_v;
+
+    gdn_f32_to_hmx_row_tiles_and_f16(head->q_row_tiles, head->q_prime_row_tiles, NULL,
+                                     head->q_f32[curr_buf], head->lambda_init, 64, S_v);
+
+    hmx_interleave_cols_to_tiles(head->k_col_tiles_64x128, head->k_f16, 64, S_v, S_v, 2, 0, 64);
+
     HVX_VectorAlias gamma_f16;
-    gamma_f16.v = hvx_vec_f32_to_f16(v_gamma0, v_gamma1);
+    gamma_f16.v = hvx_vmem(head->gamma);
 
     const HVX_Vector v_zero_f16  = Q6_V_vzero();
     const HVX_Vector v_neg20_f16 = hvx_vec_splat_f16(-20.0f);
@@ -1698,13 +1717,6 @@ static void gdn_hvx_phase1_worker(unsigned int n, unsigned int i, void * data) {
         hvx_vmem(head->decay_a + t * 64) = v_a;
     }
 
-    gdn_f32_to_hmx_row_tiles_and_f16(head->k_row_tiles, head->k_prime_row_tiles, head->k_f16,
-                                     head->k_f32[curr_buf], head->lambda_init, 64, S_v);
-    hmx_interleave_rows_to_tiles(head->k_col_tiles, head->k_f16, 64, S_v, S_v, 0, 64);
-
-    gdn_f32_to_hmx_row_tiles_and_f16(head->q_row_tiles, head->q_prime_row_tiles, NULL,
-                                     head->q_f32[curr_buf], head->lambda_init, 64, S_v);
-
     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_GDN_PREP, info);
 }
 
@@ -1719,13 +1731,10 @@ static void gdn_hvx_phase2_worker(unsigned int n, unsigned int i, void * data) {
     const uint32_t curr_buf = bctx->curr_buf;
 
     gdn_unpack_64x64_tiles_to_vectors(head->rows_kk, head->kk_tiles);
-    gdn_unpack_64x64_tiles_to_vectors(head->rows_qk, head->qk_tiles);
 
-    gdn_build_inv_l_and_a(head->rows_inv, head->rows_a, head->rows_kk, head->rows_qk,
-                          head->decay_m, head->decay_a, head->b_f32[curr_buf]);
+    gdn_build_inv_l(head->rows_inv, head->rows_kk, head->decay_m, head->b_f32[curr_buf]);
 
     gdn_pack_64x64_vectors_to_tiles(head->inv_row_tiles, head->rows_inv);
-    gdn_pack_64x64_vectors_to_tiles(head->a_row_tiles, head->rows_a);
 
     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_GDN_SOLVE, info);
 }
@@ -1764,6 +1773,13 @@ static void gdn_hvx_phase3_worker(unsigned int n, unsigned int i, void * data) {
 
     hmx_interleave_cols_to_tiles(head->v_prime_col_tiles, head->v_prime_f16, 64, S_v, S_v, 2, 0, 64);
 
+    gdn_unpack_64x64_tiles_to_vectors(head->rows_qk, head->qk_tiles);
+    for (uint32_t t = 0; t < 64; ++t) {
+        HVX_Vector v_decay_a = hvx_vmem(head->decay_a + t * 64);
+        head->rows_a[t]      = hvx_vec_mul_f16_f16(head->rows_qk[t], v_decay_a);
+    }
+    gdn_pack_64x64_vectors_to_tiles(head->a_row_tiles, head->rows_a);
+
     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_GDN_V_PREP, info);
 }
 
@@ -1793,7 +1809,6 @@ static void gdn_hvx_phase4_worker(unsigned int n, unsigned int i, void * data) {
     }
 
     gdn_pack_d_t_row_tiles(head->d_row_tiles, head->d_f16, S_v, head->vtcm_m, head->vtcm_tmp);
-    hmx_interleave_cols_to_tiles(head->k_col_tiles_64x128, head->k_f16, 64, S_v, S_v, 2, 0, 64);
 
     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_GDN_D_PREP, info);
 }
@@ -1987,20 +2002,26 @@ static int gated_delta_net_f32_hmx_chunked(
                 }
             }
 
-            work_queue_run(wp, gdn_hvx_phase1_worker, &bctx, n_batch);
+            work_queue_run(wp, gdn_hvx_phase1a_worker, &bctx, n_batch);
 
             for (uint32_t h = 0; h < n_batch; ++h) {
                 htp_gdn_push_hmx_gemm_task(hmx_q, &gemm_tasks[h][0], heads[h].k_row_tiles, heads[h].k_col_tiles, heads[h].kk_tiles, 2, 2, n_sv_tiles, vtcm_scales_1);
             }
             for (uint32_t h = 0; h < n_batch; ++h) {
-                htp_gdn_push_hmx_gemm_task(hmx_q, &gemm_tasks[h][1], heads[h].q_row_tiles, heads[h].k_col_tiles, heads[h].qk_tiles, 2, 2, n_sv_tiles, vtcm_scales_1);
+                htp_gdn_push_hmx_gemm_task(hmx_q, &gemm_tasks[h][2], heads[h].k_prime_row_tiles, heads[h].s_col_tiles, heads[h].v_inter_tiles, 2, n_sv_tiles, n_sv_tiles, vtcm_scales_1);
             }
-            for (uint32_t h = 0; h < 2 * n_batch; ++h) {
+
+            work_queue_run(wp, gdn_hvx_phase1b_worker, &bctx, n_batch);
+
+            for (uint32_t h = 0; h < n_batch; ++h) {
                 hmx_queue_pop(hmx_q);
             }
 
             for (uint32_t h = 0; h < n_batch; ++h) {
-                htp_gdn_push_hmx_gemm_task(hmx_q, &gemm_tasks[h][2], heads[h].k_prime_row_tiles, heads[h].s_col_tiles, heads[h].v_inter_tiles, 2, n_sv_tiles, n_sv_tiles, vtcm_scales_1);
+                htp_gdn_push_hmx_gemm_task(hmx_q, &gemm_tasks[h][1], heads[h].q_row_tiles, heads[h].k_col_tiles, heads[h].qk_tiles, 2, 2, n_sv_tiles, vtcm_scales_1);
+            }
+            for (uint32_t h = 0; h < n_batch; ++h) {
+                htp_gdn_push_hmx_gemm_task(hmx_q, &gemm_tasks[h][3], heads[h].q_prime_row_tiles, heads[h].s_col_tiles, heads[h].o_inter_tiles, 2, n_sv_tiles, n_sv_tiles, vtcm_scales_1);
             }
 
             work_queue_run(wp, gdn_hvx_phase2_worker, &bctx, n_batch);
@@ -2008,9 +2029,8 @@ static int gated_delta_net_f32_hmx_chunked(
             for (uint32_t h = 0; h < n_batch; ++h) {
                 hmx_queue_pop(hmx_q);
             }
-
             for (uint32_t h = 0; h < n_batch; ++h) {
-                htp_gdn_push_hmx_gemm_task(hmx_q, &gemm_tasks[h][3], heads[h].q_prime_row_tiles, heads[h].s_col_tiles, heads[h].o_inter_tiles, 2, n_sv_tiles, n_sv_tiles, vtcm_scales_1);
+                hmx_queue_pop(hmx_q);
             }
 
             work_queue_run(wp, gdn_hvx_phase3_worker, &bctx, n_batch);
@@ -2031,13 +2051,12 @@ static int gated_delta_net_f32_hmx_chunked(
             for (uint32_t h = 0; h < n_batch; ++h) {
                 htp_gdn_push_hmx_gemm_task(hmx_q, &gemm_tasks[h][5], heads[h].a_row_tiles, heads[h].delta_col_tiles, heads[h].o_intra_tiles, 2, n_sv_tiles, 2, vtcm_scales_1);
             }
-
             for (uint32_t h = 0; h < n_batch; ++h) {
-                hmx_queue_pop(hmx_q);
+                htp_gdn_push_hmx_gemm_task(hmx_q, &gemm_tasks[h][6], heads[h].d_row_tiles, heads[h].k_col_tiles_64x128, heads[h].s_update_tiles, n_sv_tiles, n_sv_tiles, 2, vtcm_scales_1);
             }
 
             for (uint32_t h = 0; h < n_batch; ++h) {
-                htp_gdn_push_hmx_gemm_task(hmx_q, &gemm_tasks[h][6], heads[h].d_row_tiles, heads[h].k_col_tiles_64x128, heads[h].s_update_tiles, n_sv_tiles, n_sv_tiles, 2, vtcm_scales_1);
+                hmx_queue_pop(hmx_q);
             }
 
             work_queue_run(wp, gdn_hvx_phase5_worker, &bctx, n_batch);
