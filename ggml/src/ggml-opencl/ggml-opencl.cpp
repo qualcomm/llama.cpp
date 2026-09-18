@@ -30411,6 +30411,10 @@ static bool ggml_cl_flash_attn_decompose(
             const size_t tn  = (size_t)backend_ctx->fa_kqv_tn;
             size_t gws[3] = { (size_t)((dv + 63)/64)*64, gsz*(size_t)((nqc + tn - 1)/tn), (size_t)n_head_kv };
             size_t lws[3] = { 64, 1, 1 };
+            static const bool kqv_v1 = []{ const char * e = getenv("GGML_OPENCL_FA_KQV_OPTS"); return e && strstr(e, "-DKQV_V1"); }();
+            if (kqv_v1) {
+                gws[0] = (size_t)((dv + 31)/32)*64; gws[1] = (size_t)((nqc + 15)/16); gws[2] = (size_t)n_head;
+            }
             backend_ctx->enqueue_ndrange_kernel(kk, 3, gws, lws, dst);
         } else {
             ggml_cl_mul_mat(backend, &vt, &kq, &kqv);

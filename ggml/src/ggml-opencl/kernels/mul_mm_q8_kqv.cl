@@ -26,6 +26,128 @@
 // query heads that share one KV head, then the query tile, then the KV head. The heads of one
 // GQA group read the same V^T slice, so they hit it in L2 while it is hot.
 
+#if defined(KQV_V1)
+// The 09-17 first cut, kept verbatim for calibration.
+#define V1_TM 32   // d rows per workgroup
+#define V1_TN 16   // queries per workgroup
+#define V1_WG 64
+#define V1_NB 8   // P blocks staged per barrier
+
+__attribute__((reqd_work_group_size(V1_WG, 1, 1)))
+kernel void kernel_mul_mm_q8_kqv(
+        global const uint  * vq,        // V^T int8, [head_kv][dv][n_kv]        as packed uints
+        ulong                off_vq,
+        global const half  * vd,        // V^T scales, [head_kv][dv][n_kv/32]
+        ulong                off_vd,
+        global const uint  * pq,        // P u8,     [head][n_q][n_kv]          as packed uints
+        ulong                off_pq,
+        global const half  * pd,        // P scales, [head][n_q][n_kv/32]
+        ulong                off_pd,
+        global       float * dst,       // [head][n_q][dv]
+        ulong                off_dst,
+        int                  dv,
+        int                  n_kv,
+        int                  n_q,
+        int                  n_head,
+        int                  n_head_kv
+) {
+    vq  = (global const uint  *)((global const char *)vq  + off_vq);
+    vd  = (global const half  *)((global const char *)vd  + off_vd);
+    pq  = (global const uint  *)((global const char *)pq  + off_pq);
+    pd  = (global const half  *)((global const char *)pd  + off_pd);
+    dst = (global       float *)((global const char *)dst + off_dst);
+
+    const int tid  = get_local_id(0);
+    const int dm0  = get_group_id(0) * V1_TM;      // first d row of this tile
+    const int qn0  = get_group_id(1) * V1_TN;      // first query of this tile
+    const int head = get_group_id(2);
+
+    const int head_kv = n_head_kv > 0 ? head % n_head_kv : 0;
+    const int nblk    = n_kv / 32;                  // dispatch guarantees n_kv % 32 == 0
+    const int nu      = n_kv / 4;                   // uints per row
+
+    // lane layout: 32 consecutive d rows x 2 query groups of 8
+    const int dl  = tid & (V1_TM - 1);             // 0..31 -> d row
+    const int qg  = tid / V1_TM;                   // 0 or 1 -> which half of the queries
+    const int d   = dm0 + dl;
+
+    // P is staged V1_NB blocks at a time. One block per barrier put two barriers around only
+    // 64 dp4a instructions, and at n_kv=16384 that is 1024 barriers per workgroup - the first
+    // cut measured exactly at parity with the f16 kernel because it was synchronisation bound,
+    // not math bound. Eight blocks per barrier raises the work between them to 512 instructions.
+    __local uint sh_pq[V1_TN][V1_NB][8];
+    __local half sh_pd[V1_TN][V1_NB];
+
+    float acc[8];
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        acc[j] = 0.0f;
+    }
+
+    const size_t vbase = ((size_t)head_kv*dv + d)*nu;
+    const size_t vdbas = ((size_t)head_kv*dv + d)*nblk;
+
+    for (int bg = 0; bg < nblk; bg += V1_NB) {
+        const int nb_here = min(V1_NB, nblk - bg);
+
+        for (int i = tid; i < V1_TN*V1_NB*8; i += V1_WG) {
+            const int qq = i >> 6;            // V1_NB*8 == 64 per query
+            const int bb = (i >> 3) & (V1_NB - 1);
+            const int uu = i & 7;
+            const int qi = qn0 + qq;
+            sh_pq[qq][bb][uu] = (qi < n_q && bb < nb_here)
+                ? pq[((size_t)head*n_q + qi)*nu + (size_t)(bg + bb)*8 + uu] : 0u;
+        }
+        for (int i = tid; i < V1_TN*V1_NB; i += V1_WG) {
+            const int qq = i / V1_NB;
+            const int bb = i % V1_NB;
+            const int qi = qn0 + qq;
+            sh_pd[qq][bb] = (qi < n_q && bb < nb_here)
+                ? pd[((size_t)head*n_q + qi)*nblk + bg + bb] : (half)0.0f;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        if (d < dv) {
+            for (int bb = 0; bb < nb_here; ++bb) {
+                uint w[8];
+                #pragma unroll
+                for (int u = 0; u < 8; ++u) {
+                    w[u] = vq[vbase + (size_t)(bg + bb)*8 + u];
+                }
+                const float dvs = (float)vd[vdbas + bg + bb];
+
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const int qq = qg*8 + j;
+
+                    int raw = 0;
+                    #pragma unroll
+                    for (int u = 0; u < 8; ++u) {
+                        raw = dot_acc_sat_4x8packed_us_int(sh_pq[qq][bb][u], w[u], raw);
+                    }
+
+                    acc[j] += dvs * (float)sh_pd[qq][bb] * (float)raw;
+                }
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    if (d >= dv) {
+        return;
+    }
+
+    // dst is [head][n_q][dv] with dv contiguous, so the 32 lanes of a d-run write contiguously
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const int qi = qn0 + qg*8 + j;
+        if (qi < n_q) {
+            dst[((size_t)head*n_q + qi)*dv + d] = acc[j];
+        }
+    }
+}
+
+#else
 #define KQV_TM 64   // d rows per workgroup, one per lane
 #ifndef KQV_TN
 #define KQV_TN 32   // queries per workgroup, all owned by every lane
@@ -186,3 +308,5 @@ kernel void kernel_mul_mm_q8_kqv(
         }
     }
 }
+
+#endif // KQV_V1
