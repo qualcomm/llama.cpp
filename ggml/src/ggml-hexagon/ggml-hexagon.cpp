@@ -4573,68 +4573,74 @@ static void ggml_hexagon_precompute_hvx_mm_params(
         const bool is_permuted = ggml_is_permuted(src0) || ggml_is_permuted(src1);
 
         struct htp_mm_hvx_vtcm_layout L;
+        if (!is_batched && !is_permuted) {
+            uint32_t m_chunk = 0;
+            if (htp_mm_hvx_solve_vtcm_params(
+                    HTP_MM_KERNEL_HVX_F16_F16_VTCM, wtype, ne10, src1_nrows, sess->n_threads,
+                    dst->nb[1], src0->nb[1], src1->nb[1], src2_row_size, 16, vtcm_budget,
+                    &L, &m_chunk)) {
+                kparams->kernel_type = HTP_MM_KERNEL_HVX_F16_F16_VTCM;
+                kparams->m_chunk = (m_chunk < (uint32_t) src1_nrows) ? m_chunk : 0;
+                kparams->src1_row_size = hex_round_up(ne10 * 2, 128);
+                kparams->vtcm_size = L.total_bytes;
+                kparams->vtcm_src0_size = L.src0_bytes;
+                kparams->vtcm_src1_size = L.src1_bytes;
+                kparams->vtcm_dst_size = L.dst_bytes;
+                kparams->n_prefetch = 16;
+                return;
+            }
+        }
+
+        if (src1->type == GGML_TYPE_F32) {
+            kparams->kernel_type = HTP_MM_KERNEL_HVX_F16_F32_DDR;
+        } else {
+            kparams->kernel_type = HTP_MM_KERNEL_HVX_F16_F16_DDR;
+        }
+        kparams->src1_row_size = src1->nb[1];
         htp_mm_hvx_vtcm_layout_build(
-            &L, HTP_MM_KERNEL_HVX_F16_F16_VTCM, wtype, ne10, src1_nrows, sess->n_threads,
+            &L, kparams->kernel_type, wtype, ne10, src1_nrows, sess->n_threads,
             dst->nb[1], src0->nb[1], src1->nb[1], src2_row_size, 16, false, false
         );
-
-        if (!is_batched && !is_permuted && L.total_bytes <= vtcm_budget) {
-            kparams->kernel_type = HTP_MM_KERNEL_HVX_F16_F16_VTCM;
-            kparams->src1_row_size = hex_round_up(ne10 * 2, 128);
-            kparams->vtcm_size = L.total_bytes;
-            kparams->vtcm_src0_size = L.src0_bytes;
-            kparams->vtcm_src1_size = L.src1_bytes;
-            kparams->vtcm_dst_size = L.dst_bytes;
-            kparams->n_prefetch = 16;
-        } else {
-            if (src1->type == GGML_TYPE_F32) {
-                kparams->kernel_type = HTP_MM_KERNEL_HVX_F16_F32_DDR;
-            } else {
-                kparams->kernel_type = HTP_MM_KERNEL_HVX_F16_F16_DDR;
-            }
-            kparams->src1_row_size = src1->nb[1];
-            htp_mm_hvx_vtcm_layout_build(
-                &L, kparams->kernel_type, wtype, ne10, src1_nrows, sess->n_threads,
-                dst->nb[1], src0->nb[1], src1->nb[1], src2_row_size, 16, false, false
-            );
-            kparams->vtcm_size = L.total_bytes;
-            kparams->vtcm_src0_size = L.src0_bytes;
-            kparams->vtcm_src1_size = L.src1_bytes;
-            kparams->vtcm_dst_size = L.dst_bytes;
-            kparams->n_prefetch = 16;
-        }
+        kparams->vtcm_size = L.total_bytes;
+        kparams->vtcm_src0_size = L.src0_bytes;
+        kparams->vtcm_src1_size = L.src1_bytes;
+        kparams->vtcm_dst_size = L.dst_bytes;
+        kparams->n_prefetch = 16;
     } else {
         // F32 HVX
         const bool is_batched  = (ne02 > 1) || (ne03 > 1);
         const bool is_permuted = ggml_is_permuted(src0) || ggml_is_permuted(src1);
 
         struct htp_mm_hvx_vtcm_layout L;
+        if (!is_batched && !is_permuted) {
+            uint32_t m_chunk = 0;
+            if (htp_mm_hvx_solve_vtcm_params(
+                    HTP_MM_KERNEL_HVX_F32_F32_VTCM, wtype, ne10, src1_nrows, sess->n_threads,
+                    dst->nb[1], src0->nb[1], src1->nb[1], src2_row_size, 16, vtcm_budget,
+                    &L, &m_chunk)) {
+                kparams->kernel_type = HTP_MM_KERNEL_HVX_F32_F32_VTCM;
+                kparams->m_chunk = (m_chunk < (uint32_t) src1_nrows) ? m_chunk : 0;
+                kparams->src1_row_size = hex_round_up(ne10 * 4, 128);
+                kparams->vtcm_size = L.total_bytes;
+                kparams->vtcm_src0_size = L.src0_bytes;
+                kparams->vtcm_src1_size = L.src1_bytes;
+                kparams->vtcm_dst_size = L.dst_bytes;
+                kparams->n_prefetch = 16;
+                return;
+            }
+        }
+
+        kparams->kernel_type = HTP_MM_KERNEL_HVX_F32_F32_DDR;
+        kparams->src1_row_size = src1->nb[1];
         htp_mm_hvx_vtcm_layout_build(
-            &L, HTP_MM_KERNEL_HVX_F32_F32_VTCM, wtype, ne10, src1_nrows, sess->n_threads,
+            &L, kparams->kernel_type, wtype, ne10, src1_nrows, sess->n_threads,
             dst->nb[1], src0->nb[1], src1->nb[1], src2_row_size, 16, false, false
         );
-
-        if (!is_batched && !is_permuted && L.total_bytes <= vtcm_budget) {
-            kparams->kernel_type = HTP_MM_KERNEL_HVX_F32_F32_VTCM;
-            kparams->src1_row_size = hex_round_up(ne10 * 4, 128);
-            kparams->vtcm_size = L.total_bytes;
-            kparams->vtcm_src0_size = L.src0_bytes;
-            kparams->vtcm_src1_size = L.src1_bytes;
-            kparams->vtcm_dst_size = L.dst_bytes;
-            kparams->n_prefetch = 16;
-        } else {
-            kparams->kernel_type = HTP_MM_KERNEL_HVX_F32_F32_DDR;
-            kparams->src1_row_size = src1->nb[1];
-            htp_mm_hvx_vtcm_layout_build(
-                &L, kparams->kernel_type, wtype, ne10, src1_nrows, sess->n_threads,
-                dst->nb[1], src0->nb[1], src1->nb[1], src2_row_size, 16, false, false
-            );
-            kparams->vtcm_size = L.total_bytes;
-            kparams->vtcm_src0_size = L.src0_bytes;
-            kparams->vtcm_src1_size = L.src1_bytes;
-            kparams->vtcm_dst_size = L.dst_bytes;
-            kparams->n_prefetch = 16;
-        }
+        kparams->vtcm_size = L.total_bytes;
+        kparams->vtcm_src0_size = L.src0_bytes;
+        kparams->vtcm_src1_size = L.src1_bytes;
+        kparams->vtcm_dst_size = L.dst_bytes;
+        kparams->n_prefetch = 16;
     }
 }
 

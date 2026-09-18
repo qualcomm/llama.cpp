@@ -640,6 +640,78 @@ static inline void htp_mm_hvx_vtcm_layout_build(
     L->total_bytes = off;
 }
 
+static inline bool htp_mm_hvx_solve_vtcm_params(
+    int kernel_type,
+    int wtype,
+    uint32_t ne10,
+    uint32_t src1_nrows,
+    uint32_t n_threads,
+    size_t dst_row_size,
+    size_t src0_row_size,
+    size_t src1_row_size,
+    size_t src2_row_size,
+    uint32_t n_prefetch,
+    size_t vtcm_budget,
+    struct htp_mm_hvx_vtcm_layout * L_out,
+    uint32_t * m_chunk_out
+) {
+    struct htp_mm_hvx_vtcm_layout L;
+    htp_mm_hvx_vtcm_layout_build(
+        &L, kernel_type, wtype, ne10, src1_nrows, n_threads,
+        dst_row_size, src0_row_size, src1_row_size, src2_row_size, n_prefetch, false, false
+    );
+
+    if (L.total_bytes <= vtcm_budget) {
+        *L_out = L;
+        *m_chunk_out = src1_nrows;
+        return true;
+    }
+
+    const size_t fixed_bytes = L.src0_bytes + L.src2_bytes + L.dst_bytes;
+    if (vtcm_budget <= fixed_bytes) {
+        return false;
+    }
+
+    const size_t avail_act = vtcm_budget - fixed_bytes;
+    const size_t elem_size = (kernel_type == HTP_MM_KERNEL_HVX_F16_F16_VTCM) ? 2 : 4;
+    const size_t row_size  = hex_round_up(ne10 * elem_size, 128);
+    if (row_size == 0) {
+        return false;
+    }
+
+    uint32_t m_chunk = (uint32_t) (avail_act / row_size);
+    if (m_chunk > 1) {
+        m_chunk &= ~1U;
+    }
+    if (m_chunk > src1_nrows) {
+        m_chunk = src1_nrows;
+    }
+    if (m_chunk < 1) {
+        return false;
+    }
+
+    htp_mm_hvx_vtcm_layout_build(
+        &L, kernel_type, wtype, ne10, m_chunk, n_threads,
+        dst_row_size, src0_row_size, src1_row_size, src2_row_size, n_prefetch, false, false
+    );
+
+    while (m_chunk > 2 && L.total_bytes > vtcm_budget) {
+        m_chunk -= 2;
+        htp_mm_hvx_vtcm_layout_build(
+            &L, kernel_type, wtype, ne10, m_chunk, n_threads,
+            dst_row_size, src0_row_size, src1_row_size, src2_row_size, n_prefetch, false, false
+        );
+    }
+
+    if (L.total_bytes <= vtcm_budget) {
+        *L_out = L;
+        *m_chunk_out = m_chunk;
+        return true;
+    }
+
+    return false;
+}
+
 static inline size_t htp_mm_hmx_get_2d_vtcm_size(
     int wtype, uint32_t k, size_t mc, size_t nc, bool pipeline, uint32_t act_threads, uint32_t aligned_tile_size
 ) {
