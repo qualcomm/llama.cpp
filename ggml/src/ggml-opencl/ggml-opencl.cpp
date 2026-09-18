@@ -30105,6 +30105,15 @@ static bool ggml_cl_flash_attn_decompose(
     static const bool kqv_int8_env = ggml_cl_env_flag("GGML_OPENCL_FA_KQV_INT8");
     const bool kqv_int8 = kqv_int8_env && (n_kv % 32 == 0) && dv == kqv_m && n_head_kv > 0 &&
                           backend_ctx->kernel_fa_v_transpose_q8 != nullptr;
+    if (kqv_int8_env) {
+        // Report once why the path did or did not take: four conditions, and a silent decline
+        // is indistinguishable from a kernel that ran and did nothing.
+        static bool said = false;
+        if (!said) {
+            said = true;
+            GGML_LOG_INFO("ggml_opencl: FA_KQV_INT8 %s n_kv=%d rem32=%d dv=%d kqv_m=%d n_head_kv=%d vt_q8=%s\n", kqv_int8 ? "ON" : "DECLINED", (int)n_kv, (int)(n_kv % 32), (int)dv, (int)kqv_m, (int)n_head_kv, backend_ctx->kernel_fa_v_transpose_q8 ? "yes" : "NULL");
+        }
+    }
     if (kqv_int8) {
         const size_t nblk = (size_t)n_kv / 32;
         backend_ctx->prealloc_fa_vtq.allocate(backend_ctx->context, (size_t)n_kv*dv*n_head_kv);
