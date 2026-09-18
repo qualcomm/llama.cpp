@@ -7692,7 +7692,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             return (v >= lo && v <= hi && (v & (v - 1)) == 0) ? v : def;
         };
         backend_ctx->fa_kq_tn = env_pow2("GGML_OPENCL_FA_KQ_TN", 32, 8, 64);
-        const std::string kq_opts = compile_opts + " -DKQ_TN=" + std::to_string(backend_ctx->fa_kq_tn);
+        const char * kq_extra = getenv("GGML_OPENCL_FA_KQ_OPTS");
+        const std::string kq_opts = compile_opts + " -DKQ_TN=" + std::to_string(backend_ctx->fa_kq_tn) +
+            (kq_extra && kq_extra[0] ? std::string(" ") + kq_extra : std::string());
         backend_ctx->program_mul_mm_q8_kq =
             build_program_from_source(backend_ctx, kernel_src.c_str(), kq_opts);
 

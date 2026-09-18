@@ -103,7 +103,21 @@ kernel void kernel_fa_q8_rows_f32(
 
 // ---- the GEMM -----------------------------------------------------------------------------
 
+#ifndef KQ_WAVE_PAIR
+#define KQ_WAVE_PAIR 1
+#endif
+#ifndef KQ_LDS_VEC
+#define KQ_LDS_VEC 1
+#endif
+#ifndef KQ_GLB_VEC
+#define KQ_GLB_VEC 1
+#endif
+
+#if KQ_WAVE_PAIR
 __attribute__((qcom_wave_pair_mode(1)))
+#else
+__attribute__((reqd_work_group_size(KQ_WG, 1, 1)))
+#endif
 kernel void kernel_mul_mm_q8_kq(
         global const uint  * kq,        // K int8, [head_kv][n_kv][dk]   as packed uints
         global const half  * kd,        // K scales, [head_kv][n_kv][dk/32]
@@ -163,14 +177,25 @@ kernel void kernel_mul_mm_q8_kq(
     const size_t kdbas = ((size_t)head_kv*n_kv + kl)*nblk;
 
     for (int b = 0; b < nblk; ++b) {
+#if KQ_GLB_VEC
         const uint4 w0 = vload4(0, &kq[kbase + b*8]);
         const uint4 w1 = vload4(0, &kq[kbase + b*8 + 4]);
+#else
+        const size_t ko = kbase + b*8;
+        const uint4 w0 = (uint4)(kq[ko+0], kq[ko+1], kq[ko+2], kq[ko+3]);
+        const uint4 w1 = (uint4)(kq[ko+4], kq[ko+5], kq[ko+6], kq[ko+7]);
+#endif
         const float dks = (float)kd[kdbas + b];
 
         #pragma unroll
         for (int t = 0; t < KQ_TN; ++t) {
+#if KQ_LDS_VEC
             const uint4 a0 = vload4(0, &sh_q[t][b*8]);
             const uint4 a1 = vload4(0, &sh_q[t][b*8 + 4]);
+#else
+            const uint4 a0 = (uint4)(sh_q[t][b*8+0], sh_q[t][b*8+1], sh_q[t][b*8+2], sh_q[t][b*8+3]);
+            const uint4 a1 = (uint4)(sh_q[t][b*8+4], sh_q[t][b*8+5], sh_q[t][b*8+6], sh_q[t][b*8+7]);
+#endif
             int raw = 0;
             raw = dot_acc_sat_4x8packed_ss_int(a0.s0, w0.s0, raw);
             raw = dot_acc_sat_4x8packed_ss_int(a0.s1, w0.s1, raw);
