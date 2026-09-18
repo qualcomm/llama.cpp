@@ -34,8 +34,21 @@
 #define KQV_NB 4    // 32-blocks of P staged per barrier
 #endif
 #define KQV_WG 64
+#ifndef KQV_WAVE_PAIR
+#define KQV_WAVE_PAIR 1
+#endif
+#ifndef KQV_LDS_VEC
+#define KQV_LDS_VEC 1   // 1: 16-byte loads from local memory, 0: scalar
+#endif
+#ifndef KQV_GLB_VEC
+#define KQV_GLB_VEC 1   // 1: 16-byte loads of V from global, 0: scalar
+#endif
 
+#if KQV_WAVE_PAIR
 __attribute__((qcom_wave_pair_mode(1)))
+#else
+__attribute__((reqd_work_group_size(KQV_WG, 1, 1)))
+#endif
 kernel void kernel_mul_mm_q8_kqv(
         global const uint  * vq,        // V^T int8, [head_kv][dv][n_kv]        as packed uints
         ulong                off_vq,
@@ -109,14 +122,25 @@ kernel void kernel_mul_mm_q8_kqv(
         barrier(CLK_LOCAL_MEM_FENCE);
 
         for (int bb = 0; bb < nb_here; ++bb) {
+#if KQV_GLB_VEC
             const uint4 w0 = vload4(0, &vq[vbase + (size_t)(bg + bb)*8]);
             const uint4 w1 = vload4(0, &vq[vbase + (size_t)(bg + bb)*8 + 4]);
+#else
+            const size_t vo = vbase + (size_t)(bg + bb)*8;
+            const uint4 w0 = (uint4)(vq[vo+0], vq[vo+1], vq[vo+2], vq[vo+3]);
+            const uint4 w1 = (uint4)(vq[vo+4], vq[vo+5], vq[vo+6], vq[vo+7]);
+#endif
             const float dvs = (float)vd[vdbas + bg + bb];
 
             #pragma unroll
             for (int t = 0; t < KQV_TN; ++t) {
+#if KQV_LDS_VEC
                 const uint4 a0 = vload4(0, &sh_pq[t][bb][0]);
                 const uint4 a1 = vload4(0, &sh_pq[t][bb][4]);
+#else
+                const uint4 a0 = (uint4)(sh_pq[t][bb][0], sh_pq[t][bb][1], sh_pq[t][bb][2], sh_pq[t][bb][3]);
+                const uint4 a1 = (uint4)(sh_pq[t][bb][4], sh_pq[t][bb][5], sh_pq[t][bb][6], sh_pq[t][bb][7]);
+#endif
                 int raw = 0;
                 raw = dot_acc_sat_4x8packed_us_int(a0.s0, w0.s0, raw);
                 raw = dot_acc_sat_4x8packed_us_int(a0.s1, w0.s1, raw);

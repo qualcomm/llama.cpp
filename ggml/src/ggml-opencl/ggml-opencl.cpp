@@ -7663,9 +7663,13 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         };
         backend_ctx->fa_kqv_tn = env_pow2("GGML_OPENCL_FA_KQV_TN", 32, 8, 64);
         backend_ctx->fa_kqv_nb = env_pow2("GGML_OPENCL_FA_KQV_NB", 4, 1, 16);
+        // GGML_OPENCL_FA_KQV_OPTS: extra -D options appended verbatim, for bisecting a variant
+        // without a rebuild (e.g. "-DKQV_WAVE_PAIR=0 -DKQV_LDS_VEC=0").
+        const char * kqv_extra = getenv("GGML_OPENCL_FA_KQV_OPTS");
         const std::string kqv_opts = compile_opts +
             " -DKQV_TN=" + std::to_string(backend_ctx->fa_kqv_tn) +
-            " -DKQV_NB=" + std::to_string(backend_ctx->fa_kqv_nb);
+            " -DKQV_NB=" + std::to_string(backend_ctx->fa_kqv_nb) +
+            (kqv_extra && kqv_extra[0] ? std::string(" ") + kqv_extra : std::string());
         backend_ctx->program_mul_mm_q8_kqv =
             build_program_from_source(backend_ctx, kernel_src.c_str(), kqv_opts);
 
