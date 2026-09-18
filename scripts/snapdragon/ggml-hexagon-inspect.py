@@ -69,6 +69,11 @@ class FuncStats:
         self.vspills_total = 0
         self.sspills_in_loop = 0
         self.sspills_total = 0
+        self.promotions_in_loop = 0
+        self.promotions_total = 0
+        self.promotion_targets: Dict[str, int] = {}
+        self.calls_in_loop = 0
+        self.calls_total = 0
         self.insns: List[InsnInfo] = []
 
 
@@ -89,6 +94,10 @@ RE_VSPILL = re.compile(r"\bvmemu?\s*\(\s*r(?:29|30)\b")
 RE_SSPILL = re.compile(r"\bmem[bwhd]\s*\(\s*r(?:29|30)\b")
 RE_VEC_OP = re.compile(r"\b(v[0-9]+|w[0-9]+|q[0-3]|vmemu?)\b")
 RE_STORE = re.compile(r"=\s*(?:v[0-9]|r[0-9]|w[0-9]|#)")
+RE_PROMOTION_CALL = re.compile(
+    r"\b(?:call|jump)\s+(?:0x[0-9a-fA-F]+\s+)?<(__(?:trunc|extend)[a-zA-Z0-9_]+)(?:@plt)?>"
+)
+RE_ANY_CALL = re.compile(r"\bcallr?\b")
 
 
 def get_repo_root() -> Path:
@@ -406,6 +415,19 @@ def parse_disassembly(
                     if in_loop:
                         stats.sspills_in_loop += 1
 
+                is_call = bool(RE_ANY_CALL.search(insn))
+                prom_m = RE_PROMOTION_CALL.search(insn)
+                if is_call:
+                    stats.calls_total += 1
+                    if in_loop:
+                        stats.calls_in_loop += 1
+                if prom_m:
+                    stats.promotions_total += 1
+                    ptarget = prom_m.group(1)
+                    stats.promotion_targets[ptarget] = stats.promotion_targets.get(ptarget, 0) + 1
+                    if in_loop:
+                        stats.promotions_in_loop += 1
+
                 stats.insns.append(
                     InsnInfo(
                         address=cur_addr,
@@ -480,6 +502,19 @@ def annotate_disasm_line(
     elif RE_SSPILL.search(asm_chunk):
         if in_loop:
             tags.append("[S-SPILL:IN-LOOP]" if not use_color else "\033[1;35m[S-SPILL:IN-LOOP]\033[0m")
+
+    prom_m = RE_PROMOTION_CALL.search(asm_chunk)
+    if prom_m:
+        ptarget = prom_m.group(1)
+        if in_loop:
+            tags.append(f"[PROMOTION:{ptarget}:IN-LOOP]" if not use_color else f"\033[1;31m[PROMOTION:{ptarget}:IN-LOOP]\033[0m")
+        else:
+            tags.append(f"[PROMOTION:{ptarget}]" if not use_color else f"\033[1;35m[PROMOTION:{ptarget}]\033[0m")
+    elif RE_ANY_CALL.search(asm_chunk):
+        if in_loop:
+            tags.append("[CALL:IN-LOOP]" if not use_color else "\033[1;31m[CALL:IN-LOOP]\033[0m")
+        else:
+            tags.append("[CALL]" if not use_color else "\033[1;36m[CALL]\033[0m")
 
     if ":endloop0" in asm_chunk:
         tags.append("[LOOP0-END]")
@@ -610,6 +645,100 @@ def run_spills(
     return 0
 
 
+def run_promotions(
+    toolchain: HexagonToolchain,
+    lib_path: Path,
+    args: argparse.Namespace,
+) -> int:
+    # Scan and report soft-float promotion calls across binary functions
+    print(f"Inspecting library: {lib_path}")
+    disasm_text = toolchain.run_tool("hexagon-llvm-objdump", ["-d", str(lib_path)])
+
+    func_re = re.compile(args.func) if args.func else None
+    funcs = parse_disassembly(disasm_text, func_re)
+
+    reported = []
+    for f in funcs:
+        if args.all or f.promotions_total > 0:
+            reported.append(f)
+
+    # Sort: in-loop promotions desc, then total promotions desc
+    reported.sort(
+        key=lambda x: (x.promotions_in_loop, x.promotions_total),
+        reverse=True,
+    )
+
+    use_color = not args.no_color and sys.stdout.isatty()
+
+    col_addr = "Address"
+    col_name = "Function"
+    col_loop = "Loops"
+    col_inloop = "In-Loop"
+    col_tot = "Total"
+    col_targets = "Promotion Targets"
+
+    hdr = f"{col_addr:<10} | {col_name:<44} | {col_loop:>5} | {col_inloop:>7} | {col_tot:>5} | {col_targets}"
+    sep = "-" * max(len(hdr), 110)
+
+    print("\n" + sep)
+    print(hdr)
+    print(sep)
+
+    tot_inloop = 0
+    tot_prom = 0
+    tot_funcs_with_prom = 0
+    strict_violations = []
+
+    for f in reported:
+        tot_inloop += f.promotions_in_loop
+        tot_prom += f.promotions_total
+        if f.promotions_total > 0:
+            tot_funcs_with_prom += 1
+
+        if args.strict:
+            max_p = args.max_promotions if args.max_promotions is not None else 0
+            if f.promotions_total > max_p:
+                strict_violations.append(
+                    f"{f.name}: {f.promotions_total} float promotion calls (max allowed: {max_p})"
+                )
+
+        inloop_str = f"{f.promotions_in_loop:>7}"
+        if f.promotions_in_loop > 0 and use_color:
+            inloop_str = f"\033[1;31m{inloop_str}\033[0m"
+
+        targets_str = ", ".join(f"{t}: {c}" for t, c in sorted(f.promotion_targets.items()))
+        print(
+            f"0x{f.address:08x} | {f.name:<44} | {f.loop_count:>5} | {inloop_str} | {f.promotions_total:>5} | {targets_str}"
+        )
+
+    print(sep)
+    print(
+        f"Total functions analyzed: {len(funcs)} | Reported: {len(reported)} | "
+        f"Functions with float promotions: {tot_funcs_with_prom} | "
+        f"Total promotion calls: {tot_prom} | In-loop: {tot_inloop}"
+    )
+
+    if args.strict:
+        print("\n" + "=" * 50)
+        if strict_violations:
+            if use_color:
+                print("\033[1;31mSTRICT CHECK FAILED\033[0m")
+            else:
+                print("STRICT CHECK FAILED")
+            for v in strict_violations:
+                print(f"  - {v}")
+            print("=" * 50)
+            return 1
+        else:
+            if use_color:
+                print("\033[1;32mSTRICT CHECK PASSED: 0 violations\033[0m")
+            else:
+                print("STRICT CHECK PASSED: 0 violations")
+            print("=" * 50)
+
+    return 0
+
+
 def run_disasm(
     toolchain: HexagonToolchain,
     lib_path: Path,
@@ -636,8 +765,9 @@ def run_disasm(
         if not matched_symbols:
             print(f"Error: No symbols found matching '{func_pattern}'.")
             return 1
-        # Re-run with exact symbol list
-        sym_arg = ",".join(matched_symbols[:20])
+        # Re-run with symbol list bounded by limit
+        sym_limit = args.limit if hasattr(args, "limit") and args.limit and args.limit > 0 else len(matched_symbols)
+        sym_arg = ",".join(matched_symbols[:sym_limit])
         disasm_text = toolchain.run_tool(
             "hexagon-llvm-objdump",
             ["-d", f"--disassemble-symbols={sym_arg}", str(lib_path)],
@@ -668,6 +798,10 @@ def run_disasm(
         print(
             f"Spills:   Vector in-loop: {func_stats.vspills_in_loop} | Vector total: {func_stats.vspills_total} | "
             f"Scalar in-loop: {func_stats.sspills_in_loop} | Scalar total: {func_stats.sspills_total}"
+        )
+        print(
+            f"Calls:    Total: {func_stats.calls_total} (in-loop: {func_stats.calls_in_loop}) | "
+            f"Float promotions: {func_stats.promotions_total} (in-loop: {func_stats.promotions_in_loop})"
         )
         print(hdr_border)
 
@@ -825,9 +959,20 @@ def main():
         help="Scan binary and report scalar/vector stack spills table.",
     )
     parser.add_argument(
+        "--promotions",
+        action="store_true",
+        help="Scan binary and report functions with soft-float promotion calls (__trunc*, __extend*).",
+    )
+    parser.add_argument(
         "--disasm",
         metavar="FUNC",
         help="Disassemble function symbol or regex pattern with annotated loop and spill markers.",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=20,
+        help="Maximum symbols to disassemble when using pattern in --disasm (default: 20, 0 for unlimited).",
     )
     parser.add_argument(
         "--addr2line",
@@ -840,13 +985,13 @@ def main():
     parser.add_argument(
         "--func",
         "-f",
-        help="Regex filter for function names in --spills.",
+        help="Regex filter for function names in --spills or --promotions.",
     )
     parser.add_argument(
         "--all",
         "-a",
         action="store_true",
-        help="Show all functions in --spills table, even those with 0 spills.",
+        help="Show all functions in table, even those with 0 spills/promotions.",
     )
     parser.add_argument(
         "--no-color",
@@ -871,6 +1016,12 @@ def main():
         type=int,
         default=0,
         help="Maximum allowed vector instructions in DMA workers in --strict mode (default: 0).",
+    )
+    parser.add_argument(
+        "--max-promotions",
+        type=int,
+        default=None,
+        help="Maximum allowed float promotion calls in --strict mode (default: 0).",
     )
     parser.add_argument(
         "--dma-pattern",
@@ -942,6 +1093,8 @@ def main():
         sys.exit(run_addr2line(toolchain, lib_path, args))
     elif args.disasm:
         sys.exit(run_disasm(toolchain, lib_path, args))
+    elif args.promotions:
+        sys.exit(run_promotions(toolchain, lib_path, args))
     else:
         # Default action is --spills
         sys.exit(run_spills(toolchain, lib_path, args))
