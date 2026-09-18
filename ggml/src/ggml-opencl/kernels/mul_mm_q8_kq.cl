@@ -112,6 +112,12 @@ kernel void kernel_fa_q8_rows_f32(
 #ifndef KQ_GLB_VEC
 #define KQ_GLB_VEC 1
 #endif
+#ifndef KQ_STG_VEC
+#define KQ_STG_VEC 1
+#endif
+#ifndef KQ_DBG
+#define KQ_DBG 0
+#endif
 
 #if KQ_WAVE_PAIR
 __attribute__((qcom_wave_pair_mode(1)))
@@ -148,6 +154,7 @@ kernel void kernel_mul_mm_q8_kq(
     __local half sh_qd[KQ_TN][KQ_DK_MAX/32];
 
     const size_t qbase = (size_t)head*n_q;
+#if KQ_STG_VEC
     for (int i = lid; i < KQ_TN*(KQ_DK_MAX/16); i += KQ_WG) {
         const int t = i / (KQ_DK_MAX/16);
         const int u = (i % (KQ_DK_MAX/16)) * 4;
@@ -158,6 +165,14 @@ kernel void kernel_mul_mm_q8_kq(
         }
         vstore4(v, 0, &sh_q[t][u]);
     }
+#else
+    for (int i = lid; i < KQ_TN*(KQ_DK_MAX/4); i += KQ_WG) {
+        const int t = i / (KQ_DK_MAX/4);
+        const int u = i % (KQ_DK_MAX/4);
+        const int qi = qn0 + t;
+        sh_q[t][u] = (qi < n_q && u < nu) ? qq[(qbase + qi)*nu + u] : 0u;
+    }
+#endif
     for (int i = lid; i < KQ_TN*(KQ_DK_MAX/32); i += KQ_WG) {
         const int t = i / (KQ_DK_MAX/32);
         const int b = i % (KQ_DK_MAX/32);
@@ -218,7 +233,7 @@ kernel void kernel_mul_mm_q8_kq(
     for (int t = 0; t < KQ_TN; ++t) {
         const int qi = qn0 + t;
         if (qi < n_q) {
-            dst[(qbase + qi)*n_kv + kv] = acc[t];
+            dst[(qbase + qi)*n_kv + kv] = KQ_DBG ? 1.0f : acc[t];
         }
     }
 }

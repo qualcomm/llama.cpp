@@ -43,6 +43,12 @@
 #ifndef KQV_GLB_VEC
 #define KQV_GLB_VEC 1   // 1: 16-byte loads of V from global, 0: scalar
 #endif
+#ifndef KQV_STG_VEC
+#define KQV_STG_VEC 1   // 1: stage P with 16-byte load/store, 0: scalar
+#endif
+#ifndef KQV_DBG
+#define KQV_DBG 0       // 1: write 1.0 instead of the result (dispatch/store path check)
+#endif
 
 #if KQV_WAVE_PAIR
 __attribute__((qcom_wave_pair_mode(1)))
@@ -100,6 +106,7 @@ kernel void kernel_mul_mm_q8_kqv(
     for (int bg = 0; bg < nblk; bg += KQV_NB) {
         const int nb_here = min(KQV_NB, nblk - bg);
 
+#if KQV_STG_VEC
         // stage P: each (query, block) is 8 uints = two 16-byte loads
         for (int i = lid; i < KQV_TN*KQV_NB*2; i += KQV_WG) {
             const int t  = i / (KQV_NB*2);
@@ -112,6 +119,16 @@ kernel void kernel_mul_mm_q8_kqv(
             }
             vstore4(v, 0, &sh_pq[t][bb][h]);
         }
+#else
+        for (int i = lid; i < KQV_TN*KQV_NB*8; i += KQV_WG) {
+            const int t  = i / (KQV_NB*8);
+            const int bb = (i / 8) % KQV_NB;
+            const int u  = i & 7;
+            const int qi = qn0 + t;
+            sh_pq[t][bb][u] = (qi < n_q && bb < nb_here)
+                ? pq[(pbase + qi)*nu + (size_t)(bg + bb)*8 + u] : 0u;
+        }
+#endif
         for (int i = lid; i < KQV_TN*KQV_NB; i += KQV_WG) {
             const int t  = i / KQV_NB;
             const int bb = i % KQV_NB;
@@ -165,7 +182,7 @@ kernel void kernel_mul_mm_q8_kqv(
     for (int t = 0; t < KQV_TN; ++t) {
         const int qi = qn0 + t;
         if (qi < n_q) {
-            dst[(pbase + qi)*dv + d] = acc[t];
+            dst[(pbase + qi)*dv + d] = KQV_DBG ? 1.0f : acc[t];
         }
     }
 }
