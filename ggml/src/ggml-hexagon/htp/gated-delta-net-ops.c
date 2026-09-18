@@ -1196,18 +1196,24 @@ static inline void gdn_f32_to_hmx_row_tiles_and_f16(
     __fp16 * restrict dst_prime_tiles,
     __fp16 * restrict dst_f16,
     const float * restrict src,
-    const float * restrict scale_per_row,
+    const __fp16 * restrict scale_per_row,
     uint32_t n_rows,
     uint32_t n_cols
 ) {
     const uint32_t n_col_tiles = n_cols / 32;
+    const uint32_t * scale_pairs = (const uint32_t *) scale_per_row;
+
     for (uint32_t r = 0; r < n_rows; r += 2) {
         uint32_t r0 = r / 32;
         uint32_t r1 = (r % 32) / 2;
         const float * p0 = src + (r + 0) * n_cols;
         const float * p1 = src + (r + 1) * n_cols;
-        HVX_Vector s0 = scale_per_row ? hvx_vec_splat_f32(scale_per_row[r + 0]) : hvx_vec_splat_f32(1.0f);
-        HVX_Vector s1 = scale_per_row ? hvx_vec_splat_f32(scale_per_row[r + 1]) : hvx_vec_splat_f32(1.0f);
+
+        HVX_Vector v_scale;
+        if (dst_prime_tiles) {
+            uint32_t scale_pair = scale_pairs ? scale_pairs[r / 2] : 0x3c003c00;
+            v_scale = Q6_V_vsplat_R(scale_pair);
+        }
 
         for (uint32_t c = 0; c < n_col_tiles; c += 2) {
             HVX_Vector v0_0 = hvx_vmem(p0 + (c + 0) * 32);
@@ -1223,8 +1229,8 @@ static inline void gdn_f32_to_hmx_row_tiles_and_f16(
             ((HVX_Vector *) tile1)[r1] = vh1;
 
             if (dst_prime_tiles) {
-                HVX_Vector vh0_s = hvx_vec_f32_to_f16_shuff(hvx_vec_mul_f32_f32(v0_0, s0), hvx_vec_mul_f32_f32(v1_0, s1));
-                HVX_Vector vh1_s = hvx_vec_f32_to_f16_shuff(hvx_vec_mul_f32_f32(v0_1, s0), hvx_vec_mul_f32_f32(v1_1, s1));
+                HVX_Vector vh0_s = hvx_vec_mul_f16_f16(vh0, v_scale);
+                HVX_Vector vh1_s = hvx_vec_mul_f16_f16(vh1, v_scale);
                 __fp16 * tile0_s = dst_prime_tiles + (r0 * n_col_tiles + c + 0) * HMX_FP16_TILE_N_ELMS;
                 __fp16 * tile1_s = dst_prime_tiles + (r0 * n_col_tiles + c + 1) * HMX_FP16_TILE_N_ELMS;
                 ((HVX_Vector *) tile0_s)[r1] = vh0_s;
@@ -1232,8 +1238,9 @@ static inline void gdn_f32_to_hmx_row_tiles_and_f16(
             }
 
             if (dst_f16) {
-                hvx_vmem(dst_f16 + (r + 0) * n_cols + c * 32) = hvx_vec_f32_to_f16(v0_0, v0_1);
-                hvx_vmem(dst_f16 + (r + 1) * n_cols + c * 32) = hvx_vec_f32_to_f16(v1_0, v1_1);
+                HVX_VectorPair vp01 = Q6_W_vdeal_VVR(vh1, vh0, -2);
+                hvx_vmem(dst_f16 + (r + 0) * n_cols + c * 32) = Q6_V_lo_W(vp01);
+                hvx_vmem(dst_f16 + (r + 1) * n_cols + c * 32) = Q6_V_hi_W(vp01);
             }
         }
     }
@@ -1439,8 +1446,9 @@ struct htp_gdn_head_ptrs {
     __fp16 * o_intra_tiles;
     __fp16 * d_row_tiles;
 
-    float *  gamma;
+    __fp16 * gamma;
     float *  lambda_init;
+    __fp16 * lambda_init_f16;
     __fp16 * decay_m;
     __fp16 * decay_a;
 
@@ -1531,8 +1539,9 @@ static inline void gdn_init_head_ptrs(
     head->o_intra_tiles      = VTCM_LAYOUT_PTR(__fp16, vtcm_base, L->off_o_intra_tiles + h * L->tile_64xSv_bytes);
     head->d_row_tiles        = VTCM_LAYOUT_PTR(__fp16, vtcm_base, L->off_d_row_tiles + h * L->tile_64xSv_bytes);
 
-    head->gamma       = VTCM_LAYOUT_PTR(float, vtcm_base, L->off_gamma + h * dma_scalar_sz);
-    head->lambda_init = VTCM_LAYOUT_PTR(float, vtcm_base, L->off_lambda_init + h * dma_scalar_sz);
+    head->gamma           = VTCM_LAYOUT_PTR(__fp16, vtcm_base, L->off_gamma + h * dma_scalar_sz);
+    head->lambda_init_f16 = VTCM_LAYOUT_PTR(__fp16, vtcm_base, L->off_gamma + h * dma_scalar_sz + 128);
+    head->lambda_init     = VTCM_LAYOUT_PTR(float, vtcm_base, L->off_lambda_init + h * dma_scalar_sz);
     head->decay_m     = VTCM_LAYOUT_PTR(__fp16, vtcm_base, L->off_decay_m + h * decay_sz);
     head->decay_a     = VTCM_LAYOUT_PTR(__fp16, vtcm_base, L->off_decay_a + h * decay_sz);
 
@@ -1591,6 +1600,23 @@ static inline __attribute__((unused)) HVX_Vector hvx_clamp_neg20_0(HVX_Vector v,
     return Q6_V_vmux_QVV(p_lt, v_neg20, v);
 }
 
+static inline HVX_Vector hvx_prefix_scan_f32(HVX_Vector v, HVX_Vector carry_in) {
+    const HVX_Vector zero = Q6_V_vzero();
+
+    v = hvx_vec_add_f32_f32(v, Q6_V_vlalign_VVR(v, zero,  4));
+    v = hvx_vec_add_f32_f32(v, Q6_V_vlalign_VVR(v, zero,  8));
+    v = hvx_vec_add_f32_f32(v, Q6_V_vlalign_VVR(v, zero, 16));
+    v = hvx_vec_add_f32_f32(v, Q6_V_vlalign_VVR(v, zero, 32));
+    v = hvx_vec_add_f32_f32(v, Q6_V_vlalign_VVR(v, zero, 64));
+    v = hvx_vec_add_f32_f32(v, carry_in);
+
+    return v;
+}
+
+static inline HVX_Vector hvx_splat_last_f32(HVX_Vector v) {
+    return hvx_vec_repl4(Q6_V_vror_VR(v, 124));
+}
+
 static void gdn_hvx_phase1a_worker(unsigned int n, unsigned int i, void * data) {
     (void) n;
     struct htp_gdn_batch_context * bctx = (struct htp_gdn_batch_context *) data;
@@ -1641,29 +1667,27 @@ static void gdn_hvx_phase1a_worker(unsigned int n, unsigned int i, void * data) 
         }
     }
 
-    HVX_VectorAlias local_g[2];
-    local_g[0].v = hvx_vmem(head->g_f32[curr_buf] + 0);
-    local_g[1].v = hvx_vmem(head->g_f32[curr_buf] + 32);
+    const HVX_Vector v_g0 = hvx_vmem(head->g_f32[curr_buf] + 0);
+    const HVX_Vector v_g1 = hvx_vmem(head->g_f32[curr_buf] + 32);
 
-    float local_gamma[64] __attribute__((aligned(128)));
+    HVX_Vector v_gamma0 = hvx_prefix_scan_f32(v_g0, Q6_V_vzero());
+    HVX_Vector v_carry  = hvx_splat_last_f32(v_gamma0);
+    HVX_Vector v_gamma1 = hvx_prefix_scan_f32(v_g1, v_carry);
 
-    local_gamma[0] = local_g[0].fp32[0];
-    for (uint32_t t = 1; t < 64; ++t) {
-        local_gamma[t] = local_gamma[t - 1] + local_g[t / 32].fp32[t % 32];
-    }
     const HVX_Vector v_zero  = Q6_V_vzero();
     const HVX_Vector v_neg20 = hvx_vec_splat_f32(-20.0f);
 
-    HVX_Vector v_gamma0 = hvx_vmem(local_gamma + 0);
-    HVX_Vector v_gamma1 = hvx_vmem(local_gamma + 32);
-
     hvx_vmem(head->gamma) = hvx_vec_f32_to_f16(v_gamma0, v_gamma1);
 
-    hvx_vmem(head->lambda_init + 0)  = hvx_vec_exp_f32(hvx_clamp_neg20_0(v_gamma0, v_zero, v_neg20));
-    hvx_vmem(head->lambda_init + 32) = hvx_vec_exp_f32(hvx_clamp_neg20_0(v_gamma1, v_zero, v_neg20));
+    HVX_Vector v_l0 = hvx_vec_exp_f32(hvx_clamp_neg20_0(v_gamma0, v_zero, v_neg20));
+    HVX_Vector v_l1 = hvx_vec_exp_f32(hvx_clamp_neg20_0(v_gamma1, v_zero, v_neg20));
+
+    hvx_vmem(head->lambda_init + 0)  = v_l0;
+    hvx_vmem(head->lambda_init + 32) = v_l1;
+    hvx_vmem(head->lambda_init_f16)  = hvx_vec_f32_to_f16(v_l0, v_l1);
 
     gdn_f32_to_hmx_row_tiles_and_f16(head->k_row_tiles, head->k_prime_row_tiles, head->k_f16,
-                                     head->k_f32[curr_buf], head->lambda_init, 64, S_v);
+                                     head->k_f32[curr_buf], head->lambda_init_f16, 64, S_v);
     hmx_interleave_rows_to_tiles(head->k_col_tiles, head->k_f16, 64, S_v, S_v, 0, 64);
 
     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_GDN_PREP, info);
@@ -1681,12 +1705,12 @@ static void gdn_hvx_phase1b_worker(unsigned int n, unsigned int i, void * data) 
     const uint32_t S_v = bctx->S_v;
 
     gdn_f32_to_hmx_row_tiles_and_f16(head->q_row_tiles, head->q_prime_row_tiles, NULL,
-                                     head->q_f32[curr_buf], head->lambda_init, 64, S_v);
+                                     head->q_f32[curr_buf], head->lambda_init_f16, 64, S_v);
 
     hmx_interleave_cols_to_tiles(head->k_col_tiles_64x128, head->k_f16, 64, S_v, S_v, 2, 0, 64);
 
-    HVX_VectorAlias gamma_f16;
-    gamma_f16.v = hvx_vmem(head->gamma);
+    const uint16_t * gamma_u16 = (const uint16_t *) head->gamma;
+    const HVX_Vector v_gamma   = hvx_vmem(head->gamma);
 
     const HVX_Vector v_zero_f16  = Q6_V_vzero();
     const HVX_Vector v_neg20_f16 = hvx_vec_splat_f16(-20.0f);
@@ -1697,8 +1721,8 @@ static void gdn_hvx_phase1b_worker(unsigned int n, unsigned int i, void * data) 
     hvx_vmem(head->decay_a + 0) = Q6_V_vand_QV(Q6_Q_vsetq2_R(2), v_one_f16);
 
     for (uint32_t t = 1; t < 64; ++t) {
-        HVX_Vector v_gamma_t  = hvx_vec_splat_f16(gamma_f16.fp16[t]);
-        HVX_Vector diff       = hvx_vec_sub_f16_f16(v_gamma_t, gamma_f16.v);
+        HVX_Vector v_gamma_t  = Q6_Vh_vsplat_R(gamma_u16[t]);
+        HVX_Vector diff       = hvx_vec_sub_f16_f16(v_gamma_t, v_gamma);
         HVX_VectorPred p_gt   = Q6_Q_vcmp_gt_VhfVhf(diff, v_zero_f16);
         diff                  = Q6_V_vmux_QVV(p_gt, v_zero_f16, diff);
         diff                  = Q6_Vhf_vmax_VhfVhf(v_neg20_f16, diff);
