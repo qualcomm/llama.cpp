@@ -1644,33 +1644,33 @@ static void gdn_hvx_phase1_worker(unsigned int n, unsigned int i, void * data) {
     hvx_vmem(head->lambda_init + 0)  = hvx_vec_exp_f32(hvx_clamp_neg20_0(v_gamma0, v_zero, v_neg20));
     hvx_vmem(head->lambda_init + 32) = hvx_vec_exp_f32(hvx_clamp_neg20_0(v_gamma1, v_zero, v_neg20));
 
-    const HVX_Vector v_one_f16 = hvx_vec_splat_f16(1.0f);
+    HVX_VectorAlias gamma_f16;
+    gamma_f16.v = hvx_vec_f32_to_f16(v_gamma0, v_gamma1);
 
-    for (uint32_t t = 0; t < 64; ++t) {
-        HVX_Vector v_gamma_t = hvx_vec_splat_f32(local_gamma[t]);
-        HVX_Vector diff0 = hvx_vec_sub_f32_f32(v_gamma_t, v_gamma0);
-        HVX_Vector diff1 = hvx_vec_sub_f32_f32(v_gamma_t, v_gamma1);
+    const HVX_Vector v_zero_f16  = Q6_V_vzero();
+    const HVX_Vector v_neg20_f16 = hvx_vec_splat_f16(-20.0f);
+    const HVX_Vector v_log2e_f16 = hvx_vec_splat_f16(1.4426950408889634f);
+    const HVX_Vector v_one_f16   = hvx_vec_splat_f16(1.0f);
 
-        diff0 = hvx_clamp_neg20_0(diff0, v_zero, v_neg20);
-        diff1 = hvx_clamp_neg20_0(diff1, v_zero, v_neg20);
+    hvx_vmem(head->decay_m + 0) = Q6_V_vzero();
+    hvx_vmem(head->decay_a + 0) = Q6_V_vand_QV(Q6_Q_vsetq2_R(2), v_one_f16);
 
-        HVX_Vector exp0 = hvx_vec_exp_f32(diff0);
-        HVX_Vector exp1 = hvx_vec_exp_f32(diff1);
+    for (uint32_t t = 1; t < 64; ++t) {
+        HVX_Vector v_gamma_t  = hvx_vec_splat_f16(gamma_f16.fp16[t]);
+        HVX_Vector diff       = hvx_vec_sub_f16_f16(v_gamma_t, gamma_f16.v);
+        HVX_VectorPred p_gt   = Q6_Q_vcmp_gt_VhfVhf(diff, v_zero_f16);
+        diff                  = Q6_V_vmux_QVV(p_gt, v_zero_f16, diff);
+        diff                  = Q6_Vhf_vmax_VhfVhf(v_neg20_f16, diff);
 
-        HVX_Vector v_exp = hvx_vec_f32_to_f16(exp0, exp1);
+        HVX_Vector diff_log2e = hvx_vec_mul_f16_f16(diff, v_log2e_f16);
+        HVX_Vector v_exp      = hvx_vec_exp2_f16(diff_log2e);
 
-        HVX_Vector v_m, v_a;
-        if (t == 0) {
-            v_m = Q6_V_vzero();
-            v_a = Q6_V_vand_QV(Q6_Q_vsetq2_R(2), v_one_f16);
-        } else {
-            HVX_VectorPred mask_lt_t = Q6_Q_vsetq2_R(2 * t);
-            v_m = Q6_V_vand_QV(mask_lt_t, v_exp);
+        HVX_VectorPred mask_lt_t = Q6_Q_vsetq2_R(2 * t);
+        HVX_Vector v_m           = Q6_V_vand_QV(mask_lt_t, v_exp);
 
-            HVX_VectorPred mask_le_t = (t == 63) ? Q6_Q_vcmp_eq_VhVh(v_zero, v_zero) : Q6_Q_vsetq2_R(2 * (t + 1));
-            HVX_VectorPred mask_diag = Q6_Q_and_QQn(mask_le_t, mask_lt_t);
-            v_a = Q6_V_vmux_QVV(mask_diag, v_one_f16, v_m);
-        }
+        HVX_VectorPred mask_le_t = (t == 63) ? Q6_Q_vcmp_eq_VhVh(v_zero_f16, v_zero_f16) : Q6_Q_vsetq2_R(2 * (t + 1));
+        HVX_VectorPred mask_diag = Q6_Q_and_QQn(mask_le_t, mask_lt_t);
+        HVX_Vector v_a           = Q6_V_vmux_QVV(mask_diag, v_one_f16, v_m);
 
         hvx_vmem(head->decay_m + t * 64) = v_m;
         hvx_vmem(head->decay_a + t * 64) = v_a;
