@@ -8532,6 +8532,7 @@ inline bool use_q4_0_bin_kernels(const ggml_backend_opencl_context *backend_ctx,
 #endif
 }
 
+#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
 static bool use_fa_bin_kernels_prefill(const ggml_backend_opencl_context * backend_ctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v) {
     if (backend_ctx->fa.kernel_flash_attn_f32_f16_bin == nullptr) {
         return false;
@@ -8551,6 +8552,7 @@ static bool use_fa_bin_kernels_prefill(const ggml_backend_opencl_context * backe
             && (dk == 64 || dk == 128 || dk == 256 || dk == 512)
             && (!prefill_only || n_q != 1));
 }
+#endif
 
 // The flat-GEMV large-m escape is OPT-IN (GGML_OPENCL_FLAT_LARGE_M=1) because it
 // is SLOWER than the route it replaces, not because it is unsafe. It was first
