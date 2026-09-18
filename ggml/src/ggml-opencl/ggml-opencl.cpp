@@ -30164,6 +30164,7 @@ static bool ggml_cl_flash_attn_decompose(
         return !e || !e[0] || atoi(e) != 0;
     }();
     const bool kqv_int8 = kqv_int8_env && (n_kv % 32 == 0) && dv == kqv_m && n_head_kv > 0 &&
+                          mask != nullptr &&
                           backend_ctx->kernel_fa_v_transpose_q8 != nullptr;
     if (kqv_int8_set || kqv_int8) {
         // Report once why the path did or did not take: four conditions, and a silent decline
@@ -30286,10 +30287,17 @@ static bool ggml_cl_flash_attn_decompose(
     // it carries a perplexity check on two models: Qwen3.5-35B +0.047%, Qwen3.8-27B -0.047%,
     // opposite signs and a fourteenth of one standard error, i.e. rounding with no bias.
     // Set GGML_OPENCL_FA_SOFTMAX_DEFER_NORM=0 to opt out.
-    static const bool defer_norm = []{
+    static const bool defer_norm_env = []{
         const char * e = getenv("GGML_OPENCL_FA_SOFTMAX_DEFER_NORM");
         return (e && e[0]) ? atoi(e) != 0 : true;
     }();
+    // ggml_cl_soft_max_ex only has deferred-norm kernels for an f16 mask and a row length that
+    // divides by 4. It still passes the sums argument for any other shape, which shifts the arg
+    // indices against a kernel that has no such argument. Rows here are n_kv long, and a null
+    // mask selects the f32 kernel. Real prefill always has an f16 mask and pads n_kv to 256, so
+    // this only guards synthetic shapes.
+    const bool softmax_can_defer = mask != nullptr && (n_kv % 4 == 0);
+    const bool defer_norm = defer_norm_env && softmax_can_defer;
 
     for (int64_t q0 = 0; q0 < n_q; q0 += n_q_chunk) {
         const int64_t nqc = MIN(n_q_chunk, (int64_t)n_q - q0);
