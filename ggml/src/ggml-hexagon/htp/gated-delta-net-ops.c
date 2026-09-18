@@ -1298,27 +1298,24 @@ static __attribute__((noinline)) void gdn_build_inv_l_and_a(
     const float * restrict beta
 ) {
     const HVX_Vector v_one_f16 = hvx_vec_splat_f16(1.0f);
-    HVX_VectorAlias local_row_m;
-    HVX_VectorAlias local_b[2];
-    local_b[0].v = hvx_vmem(beta + 0);
-    local_b[1].v = hvx_vmem(beta + 32);
+    HVX_VectorAlias beta_f16;
+    HVX_VectorAlias row_m_f16;
+    beta_f16.v = hvx_vec_f32_to_f16(hvx_vmem(beta + 0), hvx_vmem(beta + 32));
 
     for (uint32_t t = 0; t < 64; ++t) {
         HVX_Vector v_decay_m = hvx_vmem(decay_m + t * 64);
-        HVX_Vector v_scale_t = hvx_vec_splat_f16(local_b[t / 32].fp32[t % 32]);
+        HVX_Vector v_scale_t = hvx_vec_splat_f16(beta_f16.fp16[t]);
         HVX_Vector row_m     = hvx_vec_mul_f16_f16(hvx_vec_mul_f16_f16(rows_kk[t], v_decay_m), v_scale_t);
 
         HVX_Vector v_decay_a = hvx_vmem(decay_a + t * 64);
         rows_a[t]            = hvx_vec_mul_f16_f16(rows_qk[t], v_decay_a);
 
-        HVX_Vector v_inv_t = Q6_V_vzero();
-        local_row_m.v = row_m;
+        row_m_f16.v = row_m;
 
+        HVX_Vector v_inv_t = Q6_V_vzero();
         for (uint32_t k_idx = 0; k_idx < t; ++k_idx) {
-            if (local_row_m.fp16[k_idx] != 0.0f) {
-                HVX_Vector v_lk = hvx_vec_splat_f16(local_row_m.fp16[k_idx]);
-                v_inv_t = hvx_vec_sub_f16_f16(v_inv_t, hvx_vec_mul_f16_f16(v_lk, rows_inv[k_idx]));
-            }
+            HVX_Vector v_lk = hvx_vec_splat_f16(row_m_f16.fp16[k_idx]);
+            v_inv_t = hvx_vec_sub_f16_f16(v_inv_t, hvx_vec_mul_f16_f16(v_lk, rows_inv[k_idx]));
         }
         HVX_VectorPred q_diag = (t == 0) ? Q6_Q_vsetq2_R(2) : Q6_Q_and_QQn(Q6_Q_vsetq2_R(2 * (t + 1)), Q6_Q_vsetq2_R(2 * t));
         rows_inv[t] = Q6_V_vmux_QVV(q_diag, v_one_f16, v_inv_t);
