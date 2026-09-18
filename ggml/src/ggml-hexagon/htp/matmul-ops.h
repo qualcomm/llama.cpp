@@ -72,7 +72,6 @@ enum htp_mm_kernel_type {
     // HVX quantized paths
     HTP_MM_KERNEL_HVX_QUANT_ROW,      // standard row-wise parallel quantization
     HTP_MM_KERNEL_HVX_QUANT_BLOCK,    // parallel block-wise quantization
-    HTP_MM_KERNEL_HVX_QUANT_ROW_FLAT, // row-wise fallback flat quantization
 };
 
 // Op-specific struct for precomputed matmul params
@@ -244,20 +243,6 @@ static inline size_t htp_mm_q8_1_tiled_row_size(uint32_t ne) {
     const uint32_t ne_padded = ((ne + 127) / 128) * 128;
     const uint32_t nb_32 = ne_padded / 32;
     return nb_32 * HTP_MM_ACT_TILE_SIZE_Q8_1;
-}
-
-static inline size_t htp_mm_q8_0_flat_row_size(uint32_t ne) {
-    const uint32_t quants_size = hex_align_up(ne, 128);
-    const uint32_t num_scales = (ne + 31) / 32;
-    const uint32_t scales_size = hex_align_up(num_scales * 2, 128);
-    return quants_size + scales_size;
-}
-
-static inline size_t htp_mm_q8_1_flat_row_size(uint32_t ne) {
-    const uint32_t quants_size = hex_align_up(ne, 128);
-    const uint32_t num_scales = (ne + 31) / 32;
-    const uint32_t scales_size = hex_align_up(num_scales * 4, 128);
-    return quants_size + scales_size;
 }
 
 static inline size_t htp_mm_get_tiled_row_stride(int weight_type, uint32_t k) {
@@ -517,12 +502,8 @@ static inline void htp_mm_hvx_vtcm_layout_build(
             weight_sz_per_thread = hex_round_up(n_prefetch * src0_row_size_padded, 128);
         }
 
-        size_t flat_act_row_size  = (wtype == HTP_TYPE_Q4_1 || wtype == HTP_TYPE_Q4_K) ? htp_mm_q8_1_flat_row_size(ne10)  : htp_mm_q8_0_flat_row_size(ne10);
         size_t tiled_act_row_size = (wtype == HTP_TYPE_Q4_1 || wtype == HTP_TYPE_Q4_K) ? htp_mm_q8_1_tiled_row_size(ne10) : htp_mm_q8_0_tiled_row_size(ne10);
-
-        size_t act_sz = (kernel_type == HTP_MM_KERNEL_HVX_QUANT_ROW_FLAT)
-            ? hex_round_up(flat_act_row_size  * src1_nrows, 128)
-            : hex_round_up(tiled_act_row_size * src1_nrows, 128);
+        size_t act_sz = hex_round_up(tiled_act_row_size * src1_nrows, 128);
 
         src0_sz = weight_sz_per_thread * n_threads; // shared single-weight prefetch buffer
         src1_sz = act_sz;                           // quantized activation buffer
@@ -547,6 +528,8 @@ static inline void htp_mm_hvx_vtcm_layout_build(
 
         src0_sz = src0_sz_per_thread * n_threads;
         dst_sz  = htp_mm_round_up(ne10 * sizeof(float), QK_Q8_0_TILED * sizeof(float)) * n_threads;
+        src2_sz = 0;
+        src3_sz = 0;
     } else {
         const size_t src0_row_size_padded = htp_mm_round_up(src0_row_size, 128);
         const size_t dst_nrows = (src1_nrows > 1) ? 0 : 1;
@@ -594,28 +577,6 @@ static inline void htp_mm_hvx_vtcm_layout_build(
 
                 size_t quant_scratch_size_per_thread = htp_mm_round_up(ne10 * sizeof(float), QK_Q8_0_TILED * sizeof(float));
                 size_t dst_slice_per_thread = (dst_nrows > 0 && src1_nrows == 1) ? htp_mm_round_up((dst_row_size + n_threads - 1) / n_threads, 128) : 0;
-                size_t dst_size_per_thread = (dst_slice_per_thread > quant_scratch_size_per_thread) ? dst_slice_per_thread : quant_scratch_size_per_thread;
-                dst_sz = dst_size_per_thread * n_threads;
-                break;
-            }
-            case HTP_MM_KERNEL_HVX_QUANT_ROW_FLAT: {
-                size_t q_src1_row_size = (wtype == HTP_TYPE_Q4_1 || wtype == HTP_TYPE_Q4_K) ? htp_mm_q8_1_flat_row_size(ne10) : htp_mm_q8_0_flat_row_size(ne10);
-
-                src0_sz = htp_mm_round_up(n_prefetch * src0_row_size_padded, 256);
-                src1_sz = htp_mm_round_up(q_src1_row_size * src1_nrows, 256);
-
-                src0_sz = src0_sz * n_threads;
-
-                if (is_repack) {
-                    uint32_t aligned_tile_size = htp_mm_get_weight_aligned_tile_size(wtype);
-                    uint32_t n_k_tiles = ne10 / 32;
-                    uint32_t tile_row_size = n_k_tiles * aligned_tile_size;
-                    size_t repacked_vtcm_size = htp_mm_round_up(n_prefetch * tile_row_size, 256);
-                    src0_sz = repacked_vtcm_size * n_threads;
-                }
-
-                size_t quant_scratch_size_per_thread = htp_mm_round_up(ne10 * sizeof(float), QK_Q8_0_TILED * sizeof(float));
-                size_t dst_slice_per_thread = dst_nrows > 0 ? htp_mm_round_up((dst_row_size + n_threads - 1) / n_threads, 128) : 0;
                 size_t dst_size_per_thread = (dst_slice_per_thread > quant_scratch_size_per_thread) ? dst_slice_per_thread : quant_scratch_size_per_thread;
                 dst_sz = dst_size_per_thread * n_threads;
                 break;
@@ -673,8 +634,16 @@ static inline bool htp_mm_hvx_solve_vtcm_params(
     }
 
     const size_t avail_act = vtcm_budget - fixed_bytes;
-    const size_t elem_size = (kernel_type == HTP_MM_KERNEL_HVX_F16_F16_VTCM) ? 2 : 4;
-    const size_t row_size  = hex_round_up(ne10 * elem_size, 128);
+    size_t row_size = 0;
+    if (kernel_type == HTP_MM_KERNEL_HVX_QUANT_ROW || kernel_type == HTP_MM_KERNEL_HVX_QUANT_BLOCK) {
+        row_size = (wtype == HTP_TYPE_Q4_1 || wtype == HTP_TYPE_Q4_K)
+                 ? htp_mm_q8_1_tiled_row_size(ne10)
+                 : htp_mm_q8_0_tiled_row_size(ne10);
+    } else if (kernel_type == HTP_MM_KERNEL_HVX_F16_F16_VTCM) {
+        row_size = hex_round_up(ne10 * 2, 128);
+    } else {
+        row_size = hex_round_up(ne10 * 4, 128);
+    }
     if (row_size == 0) {
         return false;
     }
