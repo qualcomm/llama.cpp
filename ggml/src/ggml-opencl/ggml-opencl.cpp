@@ -29891,6 +29891,27 @@ static void ggml_cl_fa_scratch_tensor(
 //
 // Returns false when the shape or layout falls outside what the reused kernels
 // accept; the caller then runs the fused tile exactly as before.
+// Debug: read a device buffer back and print value statistics. GGML_OPENCL_FA_INT8_DUMP=1.
+static void ggml_cl_fa_dump(ggml_backend_opencl_context * ctx, const char * name, cl_mem buf, size_t off, size_t n, char kind) {
+    if (!buf || n == 0) return;
+    const size_t esz = kind == 'f' ? 4 : kind == 'h' ? 2 : 1;
+    std::vector<unsigned char> raw(n*esz);
+    CL_CHECK(clFinish(ctx->queue));
+    CL_CHECK(clEnqueueReadBuffer(ctx->queue, buf, CL_TRUE, off, n*esz, raw.data(), 0, NULL, NULL));
+    double sum = 0, asum = 0; size_t nz = 0; double mn = 1e30, mx = -1e30; std::string first;
+    for (size_t i = 0; i < n; ++i) {
+        double x;
+        if (kind == 'f') x = ((const float *)raw.data())[i];
+        else if (kind == 'h') x = ggml_fp16_to_fp32(((const ggml_fp16_t *)raw.data())[i]);
+        else if (kind == 'u') x = raw[i];
+        else x = ((const signed char *)raw.data())[i];
+        if (x != 0) ++nz; sum += x; asum += fabs(x); mn = std::min(mn, x); mx = std::max(mx, x);
+        if (i < 8) { char b[32]; snprintf(b, sizeof b, "%g ", x); first += b; }
+    }
+    fprintf(stderr, "[fa-int8-dump] %-8s n=%zu nz=%zu min=%g max=%g mean=%g absmean=%g first=[%s]
+", name, n, nz, mn, mx, sum/n, asum/n, first.c_str());
+}
+
 static bool ggml_cl_flash_attn_decompose(
     ggml_backend_t backend, const ggml_tensor * q, const ggml_tensor * k,
     const ggml_tensor * v, const ggml_tensor * mask, const ggml_tensor * sinks,
@@ -30348,6 +30369,17 @@ static bool ggml_cl_flash_attn_decompose(
                     size_t gws[3] = { 64*gsz*(size_t)((nqc + tn - 1)/tn), (size_t)((n_kv + 63)/64), (size_t)n_head_kv };
                     size_t lws[3] = { 64, 1, 1 };
                     backend_ctx->enqueue_ndrange_kernel(kk, 3, gws, lws, dst);
+                    static const bool dump = ggml_cl_env_flag("GGML_OPENCL_FA_INT8_DUMP");
+                    static int dumped = 0;
+                    if (dump && dumped++ < 1) {
+                        fprintf(stderr, "[fa-int8-dump] KQ call dk=%d n_kv=%d nqc=%d n_head=%d n_head_kv=%d gws=%zu,%zu,%zu q_nb1=%zu q_nb2=%zu k_nb1=%zu k_nb2=%zu
+", (int)dk, (int)n_kv, (int)nqc, (int)n_head, (int)n_head_kv, gws[0], gws[1], gws[2], (size_t)q->nb[1], (size_t)q->nb[2], (size_t)k->nb[1], (size_t)k->nb[2]);
+                        ggml_cl_fa_dump(backend_ctx, "kq_q_s8", backend_ctx->prealloc_fa_kq_q.buffer, 0, (size_t)n_kv*dk*n_head_kv, 's');
+                        ggml_cl_fa_dump(backend_ctx, "kq_d_h",  backend_ctx->prealloc_fa_kq_d.buffer, 0, (size_t)n_kv*(dk/32)*n_head_kv, 'h');
+                        ggml_cl_fa_dump(backend_ctx, "qq_q_s8", backend_ctx->prealloc_fa_qq_q.buffer, 0, (size_t)nqc*dk*n_head, 's');
+                        ggml_cl_fa_dump(backend_ctx, "qq_d_h",  backend_ctx->prealloc_fa_qq_d.buffer, 0, (size_t)nqc*(dk/32)*n_head, 'h');
+                        ggml_cl_fa_dump(backend_ctx, "kq_out",  ex->data_device, off_kq_i, (size_t)n_kv*nqc*n_head, 'f');
+                    }
                 }
             } else {
                 ggml_cl_mul_mat(backend, k, &q_chunk, &kq);
@@ -30416,6 +30448,20 @@ static bool ggml_cl_flash_attn_decompose(
                 gws[0] = (size_t)((dv + 31)/32)*64; gws[1] = (size_t)((nqc + 15)/16); gws[2] = (size_t)n_head;
             }
             backend_ctx->enqueue_ndrange_kernel(kk, 3, gws, lws, dst);
+            static const bool dump = ggml_cl_env_flag("GGML_OPENCL_FA_INT8_DUMP");
+            static int dumped = 0;
+            if (dump && dumped++ < 1) {
+                fprintf(stderr, "[fa-int8-dump] KQV call dv=%d n_kv=%d nqc=%d n_head=%d n_head_kv=%d gws=%zu,%zu,%zu
+", (int)dv, (int)n_kv, (int)nqc, (int)n_head, (int)n_head_kv, gws[0], gws[1], gws[2]);
+                ggml_cl_fa_dump(backend_ctx, "kq_f32", ((ggml_tensor_extra_cl *)kq.extra)->data_device, ((ggml_tensor_extra_cl *)kq.extra)->offset + kq.view_offs, (size_t)n_kv*nqc*n_head, 'f');
+                ggml_cl_fa_dump(backend_ctx, "pq_u8",  backend_ctx->prealloc_fa_pq.buffer, 0, (size_t)n_kv*nqc*n_head, 'u');
+                ggml_cl_fa_dump(backend_ctx, "pd_h",   backend_ctx->prealloc_fa_pd.buffer, 0, (size_t)(n_kv/32)*nqc*n_head, 'h');
+                ggml_cl_fa_dump(backend_ctx, "sums",   backend_ctx->prealloc_fa_sums.buffer, 0, (size_t)nqc*n_head, 'f');
+                ggml_cl_fa_dump(backend_ctx, "vtq_s8", backend_ctx->prealloc_fa_vtq.buffer, 0, (size_t)n_kv*dv*n_head_kv, 's');
+                ggml_cl_fa_dump(backend_ctx, "vtd_h",  backend_ctx->prealloc_fa_vtd.buffer, 0, (size_t)(n_kv/32)*dv*n_head_kv, 'h');
+                ggml_cl_fa_dump(backend_ctx, "vt_f16", backend_ctx->prealloc_fa_vt.buffer, 0, (size_t)n_kv*dv*n_head_kv, 'h');
+                ggml_cl_fa_dump(backend_ctx, "kqv_out", ex->data_device, off_kqv_i, (size_t)dv*nqc*n_head, 'f');
+            }
         } else {
             ggml_cl_mul_mat(backend, &vt, &kq, &kqv);
         }
