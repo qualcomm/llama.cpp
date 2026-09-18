@@ -55,6 +55,7 @@ struct htp_fa_context {
 
     float scale;
     float max_bias;
+    bool  has_softcap;
     __fp16 logit_softcap;
 
     uint32_t n_head_log2;
@@ -103,6 +104,7 @@ struct hmx_fa_context {
     // Op parameters
     __fp16       scale;
     float        max_bias;
+    bool         has_softcap;
     __fp16       logit_softcap;
     uint32_t     n_head_log2;
     float        m0, m1;
@@ -357,7 +359,8 @@ static void flash_attn_ext_f16_thread(unsigned int nth, unsigned int ith, void *
 
         const HVX_Vector slope_vec = hvx_vec_splat_f16(slope);
         const HVX_Vector v_neg_inf = Q6_Vh_vsplat_R(0xfbff);
-        const HVX_Vector v_cap     = (factx->logit_softcap != 0.0f) ? hvx_vec_splat_f16(factx->logit_softcap) : Q6_V_vzero();
+        const bool has_softcap     = factx->has_softcap;
+        const HVX_Vector v_cap     = has_softcap ? hvx_vec_splat_f16(factx->logit_softcap) : Q6_V_vzero();
         const HVX_Vector vinf      = Q6_Vh_vsplat_R(0xFC00);
         const HVX_Vector vmin      = Q6_Vh_vsplat_R(0xFBFF);
         const HVX_Vector v_log2e   = hvx_vec_splat_f16(EXP_LOG2E_F);
@@ -400,7 +403,7 @@ static void flash_attn_ext_f16_thread(unsigned int nth, unsigned int ith, void *
             }
 
             // 2. Softcap (in FP16)
-            if (factx->logit_softcap != 0.0f) {
+            if (has_softcap) {
                 scores_f16 = hvx_vec_tanh_f16(scores_f16);
                 scores_f16 = hvx_vec_mul_f16_f16(scores_f16, v_cap);
             }
@@ -1554,7 +1557,7 @@ static void fa_softmax_thread(unsigned int n, unsigned int i, void * data) {
     const bool mask_broadcast = factx->mask_broadcast;
     const bool is_g1          = (args->G == 1);
     const bool has_alibi      = args->has_alibi;
-    const bool has_softcap    = (factx->logit_softcap != 0.0f);
+    const bool has_softcap    = factx->has_softcap;
 
     fa_softmax_impl(n, i, data, has_mask, mask_broadcast, is_g1, has_alibi, has_softcap);
 }
@@ -1589,9 +1592,9 @@ static void fa_phase_softmax_and_build_d(struct hmx_fa_context * factx,
     const size_t n_row_vec_cnt = hmx_ceil_div(sargs->n_rows_g, 64);
 
     worker_callback_t softmax_fn = fa_softmax_thread;
-    if (sargs->mask == NULL && factx->logit_softcap == 0.0f && !sargs->has_alibi) {
+    if (sargs->mask == NULL && !factx->has_softcap && !sargs->has_alibi) {
         softmax_fn = fa_softmax_thread_nomask;
-    } else if (sargs->mask != NULL && factx->mask_broadcast && factx->logit_softcap == 0.0f && !sargs->has_alibi) {
+    } else if (sargs->mask != NULL && factx->mask_broadcast && !factx->has_softcap && !sargs->has_alibi) {
         if (sargs->G == 1) {
             softmax_fn = fa_softmax_thread_mask_broadcast_g1;
         } else {
@@ -1905,13 +1908,14 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
         factx.src3_div3  = kparams->src3_div3;
     }
 
-    if (kparams->logit_softcap == 0.0f) {
+    factx.has_softcap   = (kparams->logit_softcap != 0.0f);
+    if (!factx.has_softcap) {
         factx.scale = (__fp16) (kparams->scale * EXP_LOG2E_F);  // log2(e)
     } else {
         factx.scale = (__fp16) kparams->scale;
     }
     factx.max_bias      = kparams->max_bias;
-    factx.logit_softcap = (__fp16) (kparams->logit_softcap * EXP_LOG2E_F);
+    factx.logit_softcap = factx.has_softcap ? (__fp16) (kparams->logit_softcap * EXP_LOG2E_F) : 0;
 
     factx.n_head_log2 = kparams->n_head_log2;
     factx.m0          = kparams->m0;
@@ -2513,7 +2517,8 @@ int op_flash_attn_ext(struct htp_ops_context * octx) {
 
     factx.scale = kparams->scale;
     factx.max_bias = kparams->max_bias;
-    factx.logit_softcap = (__fp16) kparams->logit_softcap;
+    factx.has_softcap = (kparams->logit_softcap != 0.0f);
+    factx.logit_softcap = factx.has_softcap ? (__fp16) kparams->logit_softcap : 0;
 
     factx.n_head_log2 = kparams->n_head_log2;
     factx.m0          = kparams->m0;
