@@ -268,6 +268,7 @@ set(GGML_OPENCL_KERNELS
     unary_mul
     softmax_4_f32
     mul_mm_q8_kqv
+    mul_mm_q8_kq
     softmax_4_f16
     softmax_f32
     softmax_f16

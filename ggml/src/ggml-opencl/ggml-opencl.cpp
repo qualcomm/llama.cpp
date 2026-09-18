@@ -1196,6 +1196,11 @@ struct ggml_backend_opencl_context {
     ggml_cl_buffer prealloc_fa_vtd;
     ggml_cl_buffer prealloc_fa_pq;
     ggml_cl_buffer prealloc_fa_pd;
+    // int8 KQ: K and the Q chunk as int8 with per-32 half scales along dk.
+    ggml_cl_buffer prealloc_fa_kq_q;
+    ggml_cl_buffer prealloc_fa_kq_d;
+    ggml_cl_buffer prealloc_fa_qq_q;
+    ggml_cl_buffer prealloc_fa_qq_d;
     // Diagnostic: force the decomposition's GEMMs onto the generic mul_mat path,
     // to tell a bug in this plumbing apart from one in the tuned image kernels.
     bool fa_decompose_generic_gemm = false;
@@ -1261,6 +1266,7 @@ struct ggml_backend_opencl_context {
     cl_program program_softmax_4_f32;
     cl_program program_softmax_4_f16;
     cl_program program_mul_mm_q8_kqv;
+    cl_program program_mul_mm_q8_kq;
     cl_program program_argsort_f32_i32;
     cl_program program_top_k = nullptr;
     cl_program program_sum_rows_f32;
@@ -1313,6 +1319,10 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_soft_max_f16, kernel_soft_max_4_f16, kernel_soft_max_4_f16_nonorm, kernel_fa_scale_rows_f32;
     cl_kernel kernel_soft_max_4_f16_q8;
     cl_kernel kernel_mul_mm_q8_kqv;
+    cl_kernel kernel_mul_mm_q8_kq;
+    cl_kernel kernel_fa_q8_rows_f16;
+    cl_kernel kernel_fa_q8_rows_f32;
+    int fa_kq_tn = 32;    // queries per int8 KQ workgroup, matches the kernel's KQ_TN
     cl_kernel kernel_fa_v_transpose_q8 = nullptr;
     int fa_kqv_tn = 32;   // queries per int8 KQV workgroup, matches the kernel's KQV_TN
     int fa_kqv_nb = 4;    // P blocks per barrier in the int8 KQV
@@ -7660,6 +7670,31 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             build_program_from_source(backend_ctx, kernel_src.c_str(), kqv_opts);
 
         CL_CHECK((backend_ctx->kernel_mul_mm_q8_kqv = clCreateKernel(backend_ctx->program_mul_mm_q8_kqv, "kernel_mul_mm_q8_kqv", &err), err));
+        GGML_LOG_CONT(".");
+    }
+
+    // mul_mm_q8_kq
+    {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src {
+            #include "mul_mm_q8_kq.cl.h"
+        };
+#else
+        const std::string kernel_src = read_file("mul_mm_q8_kq.cl");
+#endif
+        auto env_pow2 = [](const char * name, int def, int lo, int hi) {
+            const char * e = getenv(name);
+            const int v = (e && e[0]) ? atoi(e) : def;
+            return (v >= lo && v <= hi && (v & (v - 1)) == 0) ? v : def;
+        };
+        backend_ctx->fa_kq_tn = env_pow2("GGML_OPENCL_FA_KQ_TN", 32, 8, 64);
+        const std::string kq_opts = compile_opts + " -DKQ_TN=" + std::to_string(backend_ctx->fa_kq_tn);
+        backend_ctx->program_mul_mm_q8_kq =
+            build_program_from_source(backend_ctx, kernel_src.c_str(), kq_opts);
+
+        CL_CHECK((backend_ctx->kernel_mul_mm_q8_kq    = clCreateKernel(backend_ctx->program_mul_mm_q8_kq, "kernel_mul_mm_q8_kq", &err), err));
+        CL_CHECK((backend_ctx->kernel_fa_q8_rows_f16  = clCreateKernel(backend_ctx->program_mul_mm_q8_kq, "kernel_fa_q8_rows_f16", &err), err));
+        CL_CHECK((backend_ctx->kernel_fa_q8_rows_f32  = clCreateKernel(backend_ctx->program_mul_mm_q8_kq, "kernel_fa_q8_rows_f32", &err), err));
         GGML_LOG_CONT(".");
     }
 
@@ -30142,6 +30177,28 @@ static bool ggml_cl_flash_attn_decompose(
         backend_ctx->prealloc_fa_pd.allocate(backend_ctx->context, nblk*n_q_chunk*n_head*sizeof(cl_half));
     }
 
+    // int8 KQ: K quantised once per call, the Q chunk once per chunk, both along dk. The kernel
+    // sizes its local memory for dk <= 256; larger heads keep the f16 GEMM.
+    static const bool kq_int8_env = []{
+        const char * e = getenv("GGML_OPENCL_FA_KQ_INT8");
+        return e && e[0] && atoi(e) != 0;
+    }();
+    const bool kq_int8 = kq_int8_env && (dk % 32 == 0) && dk <= 256 && n_head_kv > 0;
+    if (kq_int8_env) {
+        static bool said = false;
+        if (!said) {
+            said = true;
+            GGML_LOG_INFO("ggml_opencl: FA_KQ_INT8 %s dk=%d n_kv=%d n_head_kv=%d\n", kq_int8 ? "ON" : "DECLINED", (int)dk, (int)n_kv, (int)n_head_kv);
+        }
+    }
+    if (kq_int8) {
+        const size_t nblk = (size_t)dk / 32;
+        backend_ctx->prealloc_fa_kq_q.allocate(backend_ctx->context, (size_t)n_kv*dk*n_head_kv);
+        backend_ctx->prealloc_fa_kq_d.allocate(backend_ctx->context, (size_t)n_kv*nblk*n_head_kv*sizeof(cl_half));
+        backend_ctx->prealloc_fa_qq_q.allocate(backend_ctx->context, (size_t)n_q_chunk*dk*n_head);
+        backend_ctx->prealloc_fa_qq_d.allocate(backend_ctx->context, (size_t)n_q_chunk*nblk*n_head*sizeof(cl_half));
+    }
+
     static const bool generic_gemm = ggml_cl_env_flag("GGML_OPENCL_FA_DECOMPOSE_GENERIC");
     backend_ctx->fa_decompose_generic_gemm = generic_gemm;
 
@@ -30191,6 +30248,29 @@ static bool ggml_cl_flash_attn_decompose(
         backend_ctx->enqueue_ndrange_kernel(kernel_vt_use, 3, gws, lws, dst);
     }
 
+    // ---- K as int8, once for the whole call --------------------------------
+    if (kq_int8) {
+        ggml_tensor_extra_cl * extra_k = (ggml_tensor_extra_cl *)k->extra;
+        cl_ulong offset_k = extra_k->offset + k->view_offs;
+        const cl_ulong k_nb1 = k->nb[1], k_nb2 = k->nb[2];
+        const int dk_i = (int)dk, nkv_i = (int)n_kv, nhkv_i = (int)n_head_kv;
+        cl_kernel kq8 = backend_ctx->kernel_fa_q8_rows_f16;
+        cl_uint i = 0;
+        CL_CHECK(clSetKernelArg(kq8, i++, sizeof(cl_mem),   &extra_k->data_device));
+        CL_CHECK(clSetKernelArg(kq8, i++, sizeof(cl_ulong), &offset_k));
+        CL_CHECK(clSetKernelArg(kq8, i++, sizeof(cl_ulong), &k_nb1));
+        CL_CHECK(clSetKernelArg(kq8, i++, sizeof(cl_ulong), &k_nb2));
+        CL_CHECK(clSetKernelArg(kq8, i++, sizeof(cl_mem),   &backend_ctx->prealloc_fa_kq_q.buffer));
+        CL_CHECK(clSetKernelArg(kq8, i++, sizeof(cl_mem),   &backend_ctx->prealloc_fa_kq_d.buffer));
+        CL_CHECK(clSetKernelArg(kq8, i++, sizeof(int),      &dk_i));
+        CL_CHECK(clSetKernelArg(kq8, i++, sizeof(int),      &nkv_i));
+        CL_CHECK(clSetKernelArg(kq8, i++, sizeof(int),      &nhkv_i));
+        const size_t total = (size_t)(dk/32)*n_kv*n_head_kv;
+        size_t gws[3] = { (total + 63)/64*64, 1, 1 };
+        size_t lws[3] = { 64, 1, 1 };
+        backend_ctx->enqueue_ndrange_kernel(kq8, 3, gws, lws, dst);
+    }
+
     ggml_tensor_extra_cl extra_vt, extra_kq, extra_kqv;
     ggml_tensor vt, kq, kqv;
     ggml_cl_fa_scratch_tensor(vt, extra_vt, backend_ctx->prealloc_fa_vt.buffer,
@@ -30216,7 +30296,56 @@ static bool ggml_cl_flash_attn_decompose(
             ggml_tensor q_chunk = *q;
             q_chunk.ne[1]     = nqc;
             q_chunk.view_offs = q->view_offs + (size_t)q0 * q->nb[1];
-            ggml_cl_mul_mat(backend, k, &q_chunk, &kq);
+            if (kq_int8) {
+                ggml_tensor_extra_cl * extra_q = (ggml_tensor_extra_cl *)q->extra;
+                cl_ulong offset_q = extra_q->offset + q_chunk.view_offs;
+                const cl_ulong q_nb1 = q->nb[1], q_nb2 = q->nb[2];
+                const int dk_i = (int)dk, nkv_i = (int)n_kv, nq_i = (int)nqc;
+                const int nh_i = (int)n_head, nhkv_i = (int)n_head_kv;
+                {
+                    cl_kernel qq8 = backend_ctx->kernel_fa_q8_rows_f32;
+                    cl_uint i = 0;
+                    CL_CHECK(clSetKernelArg(qq8, i++, sizeof(cl_mem),   &extra_q->data_device));
+                    CL_CHECK(clSetKernelArg(qq8, i++, sizeof(cl_ulong), &offset_q));
+                    CL_CHECK(clSetKernelArg(qq8, i++, sizeof(cl_ulong), &q_nb1));
+                    CL_CHECK(clSetKernelArg(qq8, i++, sizeof(cl_ulong), &q_nb2));
+                    CL_CHECK(clSetKernelArg(qq8, i++, sizeof(cl_mem),   &backend_ctx->prealloc_fa_qq_q.buffer));
+                    CL_CHECK(clSetKernelArg(qq8, i++, sizeof(cl_mem),   &backend_ctx->prealloc_fa_qq_d.buffer));
+                    CL_CHECK(clSetKernelArg(qq8, i++, sizeof(int),      &dk_i));
+                    CL_CHECK(clSetKernelArg(qq8, i++, sizeof(int),      &nq_i));
+                    CL_CHECK(clSetKernelArg(qq8, i++, sizeof(int),      &nh_i));
+                    const size_t total = (size_t)(dk/32)*nqc*n_head;
+                    size_t gws[3] = { (total + 63)/64*64, 1, 1 };
+                    size_t lws[3] = { 64, 1, 1 };
+                    backend_ctx->enqueue_ndrange_kernel(qq8, 3, gws, lws, dst);
+                }
+                {
+                    // Matched to kernel_mul_mm_q8_kq: query tile fastest across the heads of a
+                    // GQA group, then the 64-row kv block, then the KV head.
+                    cl_kernel kk = backend_ctx->kernel_mul_mm_q8_kq;
+                    ggml_tensor_extra_cl * ex = (ggml_tensor_extra_cl *)kq.extra;
+                    const cl_ulong off_kq_i = ex->offset + kq.view_offs;
+                    cl_uint i = 0;
+                    CL_CHECK(clSetKernelArg(kk, i++, sizeof(cl_mem),   &backend_ctx->prealloc_fa_kq_q.buffer));
+                    CL_CHECK(clSetKernelArg(kk, i++, sizeof(cl_mem),   &backend_ctx->prealloc_fa_kq_d.buffer));
+                    CL_CHECK(clSetKernelArg(kk, i++, sizeof(cl_mem),   &backend_ctx->prealloc_fa_qq_q.buffer));
+                    CL_CHECK(clSetKernelArg(kk, i++, sizeof(cl_mem),   &backend_ctx->prealloc_fa_qq_d.buffer));
+                    CL_CHECK(clSetKernelArg(kk, i++, sizeof(cl_mem),   &ex->data_device));
+                    CL_CHECK(clSetKernelArg(kk, i++, sizeof(cl_ulong), &off_kq_i));
+                    CL_CHECK(clSetKernelArg(kk, i++, sizeof(int),      &dk_i));
+                    CL_CHECK(clSetKernelArg(kk, i++, sizeof(int),      &nkv_i));
+                    CL_CHECK(clSetKernelArg(kk, i++, sizeof(int),      &nq_i));
+                    CL_CHECK(clSetKernelArg(kk, i++, sizeof(int),      &nh_i));
+                    CL_CHECK(clSetKernelArg(kk, i++, sizeof(int),      &nhkv_i));
+                    const size_t gsz = (size_t)(n_head / n_head_kv);
+                    const size_t tn  = (size_t)backend_ctx->fa_kq_tn;
+                    size_t gws[3] = { 64*gsz*(size_t)((nqc + tn - 1)/tn), (size_t)((n_kv + 63)/64), (size_t)n_head_kv };
+                    size_t lws[3] = { 64, 1, 1 };
+                    backend_ctx->enqueue_ndrange_kernel(kk, 3, gws, lws, dst);
+                }
+            } else {
+                ggml_cl_mul_mat(backend, k, &q_chunk, &kq);
+            }
         }
 
         // ---- soft_max in place: scale, mask, ALiBi, sinks --------------------
