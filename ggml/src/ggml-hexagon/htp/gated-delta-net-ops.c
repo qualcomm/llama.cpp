@@ -2,6 +2,7 @@
 #include <stdbool.h>
 #include <string.h>
 #include <math.h>
+#include <HAP_farf.h>
 
 #include "hvx-base.h"
 #include "hvx-copy.h"
@@ -1137,10 +1138,10 @@ static inline void gdn_unpack_64xS_tiles_to_f32(
                 float * out0 = dst_f32 + (r0 * 32 + 2 * r + 0) * S_v + d * 64;
                 float * out1 = dst_f32 + (r0 * 32 + 2 * r + 1) * S_v + d * 64;
 
-                hvx_vmemu(out0 + 0)  = Q6_V_lo_W(p0);
-                hvx_vmemu(out0 + 32) = Q6_V_hi_W(p0);
-                hvx_vmemu(out1 + 0)  = Q6_V_lo_W(p1);
-                hvx_vmemu(out1 + 32) = Q6_V_hi_W(p1);
+                hvx_vmem(out0 + 0)  = Q6_V_lo_W(p0);
+                hvx_vmem(out0 + 32) = Q6_V_hi_W(p0);
+                hvx_vmem(out1 + 0)  = Q6_V_lo_W(p1);
+                hvx_vmem(out1 + 32) = Q6_V_hi_W(p1);
             }
         }
     }
@@ -1162,8 +1163,8 @@ static inline void gdn_unpack_64xS_tiles_to_f16(
                 __fp16 * out0 = dst_f16 + (r0 * 32 + 2 * r + 0) * S_v + d * 64;
                 __fp16 * out1 = dst_f16 + (r0 * 32 + 2 * r + 1) * S_v + d * 64;
 
-                hvx_vmemu(out0) = Q6_V_lo_W(vp01);
-                hvx_vmemu(out1) = Q6_V_hi_W(vp01);
+                hvx_vmem(out0) = Q6_V_lo_W(vp01);
+                hvx_vmem(out1) = Q6_V_hi_W(vp01);
             }
         }
     }
@@ -1188,10 +1189,10 @@ static inline void gdn_unpack_SxS_tiles_to_f32(
                 float * out0 = dst_f32 + (r0 * 32 + 2 * r + 0) * S_v + d * 64;
                 float * out1 = dst_f32 + (r0 * 32 + 2 * r + 1) * S_v + d * 64;
 
-                hvx_vmemu(out0 + 0)  = Q6_V_lo_W(p0);
-                hvx_vmemu(out0 + 32) = Q6_V_hi_W(p0);
-                hvx_vmemu(out1 + 0)  = Q6_V_lo_W(p1);
-                hvx_vmemu(out1 + 32) = Q6_V_hi_W(p1);
+                hvx_vmem(out0 + 0)  = Q6_V_lo_W(p0);
+                hvx_vmem(out0 + 32) = Q6_V_hi_W(p0);
+                hvx_vmem(out1 + 0)  = Q6_V_lo_W(p1);
+                hvx_vmem(out1 + 32) = Q6_V_hi_W(p1);
             }
         }
     }
@@ -1214,8 +1215,8 @@ static inline void gdn_f32_to_hmx_row_tiles(
         HVX_Vector s1 = scale_per_row ? hvx_vec_splat_f32(scale_per_row[r + 1]) : hvx_vec_splat_f32(1.0f);
 
         for (uint32_t c = 0; c < n_col_tiles; ++c) {
-            HVX_Vector v0 = hvx_vec_mul_f32_f32(hvx_vmemu(p0 + c * 32), s0);
-            HVX_Vector v1 = hvx_vec_mul_f32_f32(hvx_vmemu(p1 + c * 32), s1);
+            HVX_Vector v0 = hvx_vec_mul_f32_f32(hvx_vmem(p0 + c * 32), s0);
+            HVX_Vector v1 = hvx_vec_mul_f32_f32(hvx_vmem(p1 + c * 32), s1);
             HVX_Vector vh = hvx_vec_f32_to_f16_shuff(v0, v1);
             __fp16 * tile = dst_tiles + (r0 * n_col_tiles + c) * HMX_FP16_TILE_N_ELMS;
             ((HVX_Vector *) tile)[r1] = vh;
@@ -1276,7 +1277,7 @@ static inline void gdn_pack_d_t_row_tiles(
         for (uint32_t c0 = 0; c0 < 2; ++c0) {
             for (uint32_t s_local = 0; s_local < 32; ++s_local) {
                 uint32_t s = c0 * 32 + s_local;
-                m[s_local] = hvx_vmemu(src_d + s * S_v + col_half * 64);
+                m[s_local] = hvx_vmem(src_d + s * S_v + col_half * 64);
             }
 
             hvx_transpose_32x32_words(m, tmp);
@@ -1306,15 +1307,15 @@ static __attribute__((noinline)) void gdn_build_inv_l_and_a(
     const HVX_Vector v_one_f16 = hvx_vec_splat_f16(1.0f);
     HVX_VectorAlias local_row_m;
     HVX_VectorAlias local_b[2];
-    local_b[0].v = hvx_vmemu(beta + 0);
-    local_b[1].v = hvx_vmemu(beta + 32);
+    local_b[0].v = hvx_vmem(beta + 0);
+    local_b[1].v = hvx_vmem(beta + 32);
 
     for (uint32_t t = 0; t < 64; ++t) {
-        HVX_Vector v_decay_m = hvx_vmemu(decay_m + t * 64);
+        HVX_Vector v_decay_m = hvx_vmem(decay_m + t * 64);
         HVX_Vector v_scale_t = hvx_vec_splat_f16(local_b[t / 32].fp32[t % 32]);
         HVX_Vector row_m     = hvx_vec_mul_f16_f16(hvx_vec_mul_f16_f16(rows_kk[t], v_decay_m), v_scale_t);
 
-        HVX_Vector v_decay_a = hvx_vmemu(decay_a + t * 64);
+        HVX_Vector v_decay_a = hvx_vmem(decay_a + t * 64);
         rows_a[t]            = hvx_vec_mul_f16_f16(rows_qk[t], v_decay_a);
 
         HVX_Vector v_inv_t = Q6_V_vzero();
@@ -1383,9 +1384,9 @@ static inline void gdn_pack_s_col_tiles(
 ) {
     for (uint32_t j = 0; j < S_v; ++j) {
         for (uint32_t i = 0; i < S_v; i += 64) {
-            HVX_Vector v0 = hvx_vmemu(vtcm_s_state + j * S_v + i + 0);
-            HVX_Vector v1 = (i + 32 < S_v) ? hvx_vmemu(vtcm_s_state + j * S_v + i + 32) : Q6_V_vzero();
-            hvx_vmemu(vtcm_s_f16 + j * S_v + i) = hvx_vec_f32_to_f16(v0, v1);
+            HVX_Vector v0 = hvx_vmem(vtcm_s_state + j * S_v + i + 0);
+            HVX_Vector v1 = (i + 32 < S_v) ? hvx_vmem(vtcm_s_state + j * S_v + i + 32) : Q6_V_vzero();
+            hvx_vmem(vtcm_s_f16 + j * S_v + i) = hvx_vec_f32_to_f16(v0, v1);
         }
     }
     hmx_interleave_rows_to_tiles(vtcm_s_col_tiles, vtcm_s_f16, S_v, S_v, S_v, 0, S_v);
@@ -1579,6 +1580,13 @@ static void gdn_hvx_init_state_worker(unsigned int n, unsigned int i, void * dat
     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, 0);
 }
 
+static inline __attribute__((unused)) HVX_Vector hvx_clamp_neg20_0(HVX_Vector v, HVX_Vector v_zero, HVX_Vector v_neg20) {
+    HVX_VectorPred p_gt = Q6_Q_vcmp_gt_VsfVsf(v, v_zero);
+    v = Q6_V_vmux_QVV(p_gt, v_zero, v);
+    HVX_VectorPred p_lt = Q6_Q_vcmp_gt_VsfVsf(v_neg20, v);
+    return Q6_V_vmux_QVV(p_lt, v_neg20, v);
+}
+
 static void gdn_hvx_phase1_worker(unsigned int n, unsigned int i, void * data) {
     (void) n;
     struct htp_gdn_batch_context * bctx = (struct htp_gdn_batch_context *) data;
@@ -1592,10 +1600,10 @@ static void gdn_hvx_phase1_worker(unsigned int n, unsigned int i, void * data) {
     const uint32_t n_batch = bctx->n_batch;
 
     if (n_batch == 1) {
-        hvx_vmemu(head->g_f32[curr_buf] + 0)  = hvx_vmemu(bctx->vtcm_g_raw + 0);
-        hvx_vmemu(head->g_f32[curr_buf] + 32) = hvx_vmemu(bctx->vtcm_g_raw + 32);
-        hvx_vmemu(head->b_f32[curr_buf] + 0)  = hvx_vmemu(bctx->vtcm_b_raw + 0);
-        hvx_vmemu(head->b_f32[curr_buf] + 32) = hvx_vmemu(bctx->vtcm_b_raw + 32);
+        hvx_vmem(head->g_f32[curr_buf] + 0)  = hvx_vmem(bctx->vtcm_g_raw + 0);
+        hvx_vmem(head->g_f32[curr_buf] + 32) = hvx_vmem(bctx->vtcm_g_raw + 32);
+        hvx_vmem(head->b_f32[curr_buf] + 0)  = hvx_vmem(bctx->vtcm_b_raw + 0);
+        hvx_vmem(head->b_f32[curr_buf] + 32) = hvx_vmem(bctx->vtcm_b_raw + 32);
     } else {
         int32_t offsets[32] __attribute__((aligned(128)));
         for (int k = 0; k < 32; ++k) {
@@ -1613,55 +1621,63 @@ static void gdn_hvx_phase1_worker(unsigned int n, unsigned int i, void * data) {
     }
 
     HVX_VectorAlias local_g[2];
-    local_g[0].v = hvx_vmemu(head->g_f32[curr_buf] + 0);
-    local_g[1].v = hvx_vmemu(head->g_f32[curr_buf] + 32);
+    local_g[0].v = hvx_vmem(head->g_f32[curr_buf] + 0);
+    local_g[1].v = hvx_vmem(head->g_f32[curr_buf] + 32);
 
-    float local_gamma[64];
-    HVX_VectorAlias local_lambda[2];
+    float local_gamma[64] __attribute__((aligned(128)));
 
     local_gamma[0] = local_g[0].fp32[0];
     for (uint32_t t = 1; t < 64; ++t) {
         local_gamma[t] = local_gamma[t - 1] + local_g[t / 32].fp32[t % 32];
     }
-    for (uint32_t t = 0; t < 64; ++t) {
-        float val = local_gamma[t];
-        if (val < -20.0f) val = -20.0f;
-        if (val > 0.0f) val = 0.0f;
-        local_lambda[t / 32].fp32[t % 32] = expf(val);
-    }
+    const HVX_Vector v_zero  = Q6_V_vzero();
+    const HVX_Vector v_neg20 = hvx_vec_splat_f32(-20.0f);
 
-    hvx_vmemu(head->lambda_init + 0)  = local_lambda[0].v;
-    hvx_vmemu(head->lambda_init + 32) = local_lambda[1].v;
+    HVX_Vector v_gamma0 = hvx_vmem(local_gamma + 0);
+    HVX_Vector v_gamma1 = hvx_vmem(local_gamma + 32);
+
+    hvx_vmem(head->lambda_init + 0)  = hvx_vec_exp_f32(hvx_clamp_neg20_0(v_gamma0, v_zero, v_neg20));
+    hvx_vmem(head->lambda_init + 32) = hvx_vec_exp_f32(hvx_clamp_neg20_0(v_gamma1, v_zero, v_neg20));
+
+    const HVX_Vector v_one_f16 = hvx_vec_splat_f16(1.0f);
 
     for (uint32_t t = 0; t < 64; ++t) {
-        const float gamma_t = local_gamma[t];
-        HVX_VectorAlias row_m, row_a;
-        for (uint32_t s = 0; s < 64; ++s) {
-            if (s < t) {
-                float diff = gamma_t - local_gamma[s];
-                if (diff < -20.0f) diff = -20.0f;
-                if (diff > 0.0f) diff = 0.0f;
-                row_m.fp16[s] = (__fp16) expf(diff);
-                row_a.fp16[s] = (__fp16) expf(diff);
-            } else if (s == t) {
-                row_m.fp16[s] = 0.0f;
-                row_a.fp16[s] = 1.0f;
-            } else {
-                row_m.fp16[s] = 0.0f;
-                row_a.fp16[s] = 0.0f;
-            }
+        HVX_Vector v_gamma_t = hvx_vec_splat_f32(local_gamma[t]);
+        HVX_Vector diff0 = hvx_vec_sub_f32_f32(v_gamma_t, v_gamma0);
+        HVX_Vector diff1 = hvx_vec_sub_f32_f32(v_gamma_t, v_gamma1);
+
+        diff0 = hvx_clamp_neg20_0(diff0, v_zero, v_neg20);
+        diff1 = hvx_clamp_neg20_0(diff1, v_zero, v_neg20);
+
+        HVX_Vector exp0 = hvx_vec_exp_f32(diff0);
+        HVX_Vector exp1 = hvx_vec_exp_f32(diff1);
+
+        HVX_Vector v_exp = hvx_vec_f32_to_f16(exp0, exp1);
+
+        HVX_Vector v_m, v_a;
+        if (t == 0) {
+            v_m = Q6_V_vzero();
+            v_a = Q6_V_vand_QV(Q6_Q_vsetq2_R(2), v_one_f16);
+        } else {
+            HVX_VectorPred mask_lt_t = Q6_Q_vsetq2_R(2 * t);
+            v_m = Q6_V_vand_QV(mask_lt_t, v_exp);
+
+            HVX_VectorPred mask_le_t = (t == 63) ? Q6_Q_vcmp_eq_VhVh(v_zero, v_zero) : Q6_Q_vsetq2_R(2 * (t + 1));
+            HVX_VectorPred mask_diag = Q6_Q_and_QQn(mask_le_t, mask_lt_t);
+            v_a = Q6_V_vmux_QVV(mask_diag, v_one_f16, v_m);
         }
-        hvx_vmemu(head->decay_m + t * 64) = row_m.v;
-        hvx_vmemu(head->decay_a + t * 64) = row_a.v;
+
+        hvx_vmem(head->decay_m + t * 64) = v_m;
+        hvx_vmem(head->decay_a + t * 64) = v_a;
     }
 
     gdn_f32_to_hmx_row_tiles(head->k_row_tiles, head->k_f32[curr_buf], NULL, 64, S_v);
 
     for (uint32_t t = 0; t < 64; ++t) {
         for (uint32_t j = 0; j < S_v; j += 64) {
-            HVX_Vector v0 = hvx_vmemu(head->k_f32[curr_buf] + t * S_v + j + 0);
-            HVX_Vector v1 = (j + 32 < S_v) ? hvx_vmemu(head->k_f32[curr_buf] + t * S_v + j + 32) : Q6_V_vzero();
-            hvx_vmemu(head->k_f16 + t * S_v + j) = hvx_vec_f32_to_f16(v0, v1);
+            HVX_Vector v0 = hvx_vmem(head->k_f32[curr_buf] + t * S_v + j + 0);
+            HVX_Vector v1 = (j + 32 < S_v) ? hvx_vmem(head->k_f32[curr_buf] + t * S_v + j + 32) : Q6_V_vzero();
+            hvx_vmem(head->k_f16 + t * S_v + j) = hvx_vec_f32_to_f16(v0, v1);
         }
     }
     hmx_interleave_rows_to_tiles(head->k_col_tiles, head->k_f16, 64, S_v, S_v, 0, 64);
@@ -1709,21 +1725,21 @@ static void gdn_hvx_phase3_worker(unsigned int n, unsigned int i, void * data) {
     gdn_unpack_64xS_tiles_to_f32(head->v_inter_f32, head->v_inter_tiles, S_v);
 
     HVX_VectorAlias local_b[2];
-    local_b[0].v = hvx_vmemu(head->b_f32[curr_buf] + 0);
-    local_b[1].v = hvx_vmemu(head->b_f32[curr_buf] + 32);
+    local_b[0].v = hvx_vmem(head->b_f32[curr_buf] + 0);
+    local_b[1].v = hvx_vmem(head->b_f32[curr_buf] + 32);
 
     for (uint32_t t = 0; t < 64; ++t) {
         HVX_Vector vb = hvx_vec_splat_f32(local_b[t / 32].fp32[t % 32]);
         for (uint32_t j = 0; j < S_v; j += 64) {
-            HVX_Vector vv0 = hvx_vmemu(head->v_f32[curr_buf] + t * S_v + j + 0);
-            HVX_Vector vv1 = (j + 32 < S_v) ? hvx_vmemu(head->v_f32[curr_buf] + t * S_v + j + 32) : Q6_V_vzero();
-            HVX_Vector vi0 = hvx_vmemu(head->v_inter_f32 + t * S_v + j + 0);
-            HVX_Vector vi1 = (j + 32 < S_v) ? hvx_vmemu(head->v_inter_f32 + t * S_v + j + 32) : Q6_V_vzero();
+            HVX_Vector vv0 = hvx_vmem(head->v_f32[curr_buf] + t * S_v + j + 0);
+            HVX_Vector vv1 = (j + 32 < S_v) ? hvx_vmem(head->v_f32[curr_buf] + t * S_v + j + 32) : Q6_V_vzero();
+            HVX_Vector vi0 = hvx_vmem(head->v_inter_f32 + t * S_v + j + 0);
+            HVX_Vector vi1 = (j + 32 < S_v) ? hvx_vmem(head->v_inter_f32 + t * S_v + j + 32) : Q6_V_vzero();
 
             HVX_Vector vp0 = hvx_vec_mul_f32_f32(hvx_vec_sub_f32_f32(vv0, vi0), vb);
             HVX_Vector vp1 = hvx_vec_mul_f32_f32(hvx_vec_sub_f32_f32(vv1, vi1), vb);
 
-            hvx_vmemu(head->v_prime_f16 + t * S_v + j) = hvx_vec_f32_to_f16(vp0, vp1);
+            hvx_vmem(head->v_prime_f16 + t * S_v + j) = hvx_vec_f32_to_f16(vp0, vp1);
         }
     }
 
@@ -1746,14 +1762,14 @@ static void gdn_hvx_phase4_worker(unsigned int n, unsigned int i, void * data) {
     hmx_interleave_cols_to_tiles(head->delta_col_tiles, head->delta_f16, 64, S_v, S_v, 2, 0, 64);
 
     HVX_VectorAlias last_decay_row;
-    last_decay_row.v = hvx_vmemu(head->decay_a + 63 * 64);
+    last_decay_row.v = hvx_vmem(head->decay_a + 63 * 64);
 
     for (uint32_t s = 0; s < 64; ++s) {
         float decay_s = (float) last_decay_row.fp16[s];
         HVX_Vector vs = hvx_vec_splat_f16(decay_s);
         for (uint32_t j = 0; j < S_v; j += 64) {
-            HVX_Vector vd = hvx_vmemu(head->delta_f16 + s * S_v + j);
-            hvx_vmemu(head->d_f16 + s * S_v + j) = hvx_vec_mul_f16_f16(vd, vs);
+            HVX_Vector vd = hvx_vmem(head->delta_f16 + s * S_v + j);
+            hvx_vmem(head->d_f16 + s * S_v + j) = hvx_vec_mul_f16_f16(vd, vs);
         }
     }
 
@@ -1780,9 +1796,9 @@ static void gdn_hvx_phase5_worker(unsigned int n, unsigned int i, void * data) {
 
     HVX_Vector vscale = hvx_vec_splat_f32(scale);
     for (uint32_t j = 0; j < 64 * S_v / 32; ++j) {
-        HVX_Vector vi = hvx_vmemu(head->o_inter_f32 + j * 32);
-        HVX_Vector va = hvx_vmemu(head->o_intra_f32 + j * 32);
-        hvx_vmemu(head->o_f32[curr_buf] + j * 32) = hvx_vec_mul_f32_f32(hvx_vec_add_f32_f32(vi, va), vscale);
+        HVX_Vector vi = hvx_vmem(head->o_inter_f32 + j * 32);
+        HVX_Vector va = hvx_vmem(head->o_intra_f32 + j * 32);
+        hvx_vmem(head->o_f32[curr_buf] + j * 32) = hvx_vec_mul_f32_f32(hvx_vec_add_f32_f32(vi, va), vscale);
     }
 
     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_GDN_OUT, info);
@@ -1803,13 +1819,13 @@ static void gdn_hvx_phase6_worker(unsigned int n, unsigned int i, void * data) {
     gdn_unpack_SxS_tiles_to_f32(head->s_update_f32, head->s_update_tiles, S_v);
 
     HVX_VectorAlias last_lambda;
-    last_lambda.v = hvx_vmemu(head->lambda_init + 32);
+    last_lambda.v = hvx_vmem(head->lambda_init + 32);
     HVX_Vector v_l_final = hvx_vec_splat_f32(last_lambda.fp32[31]);
 
     for (uint32_t j = 0; j < S_v * S_v / 32; ++j) {
-        HVX_Vector vs_old = hvx_vmemu(head->s_state + j * 32);
-        HVX_Vector vsu    = hvx_vmemu(head->s_update_f32 + j * 32);
-        hvx_vmemu(head->s_state + j * 32) = hvx_vec_add_f32_f32(hvx_vec_mul_f32_f32(vs_old, v_l_final), vsu);
+        HVX_Vector vs_old = hvx_vmem(head->s_state + j * 32);
+        HVX_Vector vsu    = hvx_vmem(head->s_update_f32 + j * 32);
+        hvx_vmem(head->s_state + j * 32) = hvx_vec_add_f32_f32(hvx_vec_mul_f32_f32(vs_old, v_l_final), vsu);
     }
 
     if (c + 1 < n_chunks) {
