@@ -29911,6 +29911,14 @@ static void ggml_cl_fa_dump(ggml_backend_opencl_context * ctx, const char * name
     fprintf(stderr, "[fa-int8-dump] %-8s n=%zu nz=%zu min=%g max=%g mean=%g absmean=%g first=[%s]\n", name, n, nz, mn, mx, sum/n, asum/n, first.c_str());
 }
 
+// Debug: read a whole buffer region back as bytes.
+static std::vector<unsigned char> ggml_cl_fa_read(ggml_backend_opencl_context * ctx, cl_mem buf, size_t off, size_t bytes) {
+    std::vector<unsigned char> raw(bytes);
+    CL_CHECK(clFinish(ctx->queue));
+    CL_CHECK(clEnqueueReadBuffer(ctx->queue, buf, CL_TRUE, off, bytes, raw.data(), 0, NULL, NULL));
+    return raw;
+}
+
 static bool ggml_cl_flash_attn_decompose(
     ggml_backend_t backend, const ggml_tensor * q, const ggml_tensor * k,
     const ggml_tensor * v, const ggml_tensor * mask, const ggml_tensor * sinks,
@@ -30377,6 +30385,38 @@ static bool ggml_cl_flash_attn_decompose(
                         ggml_cl_fa_dump(backend_ctx, "qq_q_s8", backend_ctx->prealloc_fa_qq_q.buffer, 0, (size_t)nqc*dk*n_head, 's');
                         ggml_cl_fa_dump(backend_ctx, "qq_d_h",  backend_ctx->prealloc_fa_qq_d.buffer, 0, (size_t)nqc*(dk/32)*n_head, 'h');
                         ggml_cl_fa_dump(backend_ctx, "kq_out",  ex->data_device, off_kq_i, (size_t)n_kv*nqc*n_head, 'f');
+                        const int nblk = (int)dk/32;
+                        auto kqb = ggml_cl_fa_read(backend_ctx, backend_ctx->prealloc_fa_kq_q.buffer, 0, (size_t)n_kv*dk*n_head_kv);
+                        auto kdb = ggml_cl_fa_read(backend_ctx, backend_ctx->prealloc_fa_kq_d.buffer, 0, (size_t)n_kv*nblk*n_head_kv*2);
+                        auto qqb = ggml_cl_fa_read(backend_ctx, backend_ctx->prealloc_fa_qq_q.buffer, 0, (size_t)nqc*dk*n_head);
+                        auto qdb = ggml_cl_fa_read(backend_ctx, backend_ctx->prealloc_fa_qq_d.buffer, 0, (size_t)nqc*nblk*n_head*2);
+                        auto outb = ggml_cl_fa_read(backend_ctx, ex->data_device, off_kq_i, (size_t)n_kv*nqc*n_head*4);
+                        // f32 reference from the original K (f16) and Q (f32) tensors
+                        ggml_tensor_extra_cl * extra_k2 = (ggml_tensor_extra_cl *)k->extra;
+                        auto kraw = ggml_cl_fa_read(backend_ctx, extra_k2->data_device, extra_k2->offset + k->view_offs, (size_t)k->nb[2]*n_head_kv);
+                        auto qraw = ggml_cl_fa_read(backend_ctx, extra_q->data_device, offset_q, (size_t)q->nb[2]*n_head);
+                        const int gszi = (int)(n_head / n_head_kv);
+                        for (int probe = 0; probe < 6; ++probe) {
+                            const int hh = (probe*7) % (int)n_head, qq = (probe*11) % (int)nqc, kv = (probe*37) % (int)n_kv;
+                            const int hk = hh / gszi;
+                            double host = 0, ref = 0;
+                            for (int b = 0; b < nblk; ++b) {
+                                int raw = 0;
+                                for (int i = 0; i < 32; ++i) {
+                                    raw += (int)(signed char)kqb[((size_t)hk*n_kv + kv)*dk + b*32 + i] * (int)(signed char)qqb[((size_t)hh*nqc + qq)*dk + b*32 + i];
+                                }
+                                const float dks = ggml_fp16_to_fp32(((const ggml_fp16_t *)kdb.data())[((size_t)hk*n_kv + kv)*nblk + b]);
+                                const float dqs = ggml_fp16_to_fp32(((const ggml_fp16_t *)qdb.data())[((size_t)hh*nqc + qq)*nblk + b]);
+                                host += (double)dks * dqs * raw;
+                            }
+                            for (int i = 0; i < (int)dk; ++i) {
+                                const float kf = ggml_fp16_to_fp32(((const ggml_fp16_t *)(kraw.data() + (size_t)hk*k->nb[2] + (size_t)kv*k->nb[1]))[i]);
+                                const float qf = ((const float *)(qraw.data() + (size_t)hh*q->nb[2] + (size_t)qq*q->nb[1]))[i];
+                                ref += (double)kf * qf;
+                            }
+                            const float dev = ((const float *)outb.data())[((size_t)hh*nqc + qq)*n_kv + kv];
+                            fprintf(stderr, "[fa-int8-dump] KQ probe h=%d q=%d kv=%d device=%g host=%g ref=%g%s", hh, qq, kv, dev, host, ref, "\n");
+                        }
                     }
                 }
             } else {
@@ -30458,6 +30498,30 @@ static bool ggml_cl_flash_attn_decompose(
                 ggml_cl_fa_dump(backend_ctx, "vtd_h",  backend_ctx->prealloc_fa_vtd.buffer, 0, (size_t)(n_kv/32)*dv*n_head_kv, 'h');
                 ggml_cl_fa_dump(backend_ctx, "vt_f16", backend_ctx->prealloc_fa_vt.buffer, 0, (size_t)n_kv*dv*n_head_kv, 'h');
                 ggml_cl_fa_dump(backend_ctx, "kqv_out", ex->data_device, off_kqv_i, (size_t)dv*nqc*n_head, 'f');
+                // host recompute of a few outputs from the dumped int8 operands
+                const int nblk = (int)n_kv/32;
+                auto vq = ggml_cl_fa_read(backend_ctx, backend_ctx->prealloc_fa_vtq.buffer, 0, (size_t)n_kv*dv*n_head_kv);
+                auto vd = ggml_cl_fa_read(backend_ctx, backend_ctx->prealloc_fa_vtd.buffer, 0, (size_t)nblk*dv*n_head_kv*2);
+                auto pqb = ggml_cl_fa_read(backend_ctx, backend_ctx->prealloc_fa_pq.buffer, 0, (size_t)n_kv*nqc*n_head);
+                auto pdb = ggml_cl_fa_read(backend_ctx, backend_ctx->prealloc_fa_pd.buffer, 0, (size_t)nblk*nqc*n_head*2);
+                auto outb = ggml_cl_fa_read(backend_ctx, ex->data_device, off_kqv_i, (size_t)dv*nqc*n_head*4);
+                const int gszi = (int)(n_head / n_head_kv);
+                for (int probe = 0; probe < 6; ++probe) {
+                    const int hh = (probe*7) % (int)n_head, qq = (probe*11) % (int)nqc, dd = (probe*37) % (int)dv;
+                    const int hk = hh / gszi;
+                    double host = 0;
+                    for (int b = 0; b < nblk; ++b) {
+                        int raw = 0;
+                        for (int i = 0; i < 32; ++i) {
+                            raw += (int)pqb[((size_t)hh*nqc + qq)*n_kv + b*32 + i] * (int)(signed char)vq[((size_t)hk*dv + dd)*n_kv + b*32 + i];
+                        }
+                        const float dvs = ggml_fp16_to_fp32(((const ggml_fp16_t *)vd.data())[((size_t)hk*dv + dd)*nblk + b]);
+                        const float dps = ggml_fp16_to_fp32(((const ggml_fp16_t *)pdb.data())[((size_t)hh*nqc + qq)*nblk + b]);
+                        host += (double)dvs * dps * raw;
+                    }
+                    const float dev = ((const float *)outb.data())[((size_t)hh*nqc + qq)*dv + dd];
+                    fprintf(stderr, "[fa-int8-dump] KQV probe h=%d q=%d d=%d device=%g host=%g%s", hh, qq, dd, dev, host, "\n");
+                }
             }
         } else {
             ggml_cl_mul_mat(backend, &vt, &kq, &kqv);
