@@ -362,3 +362,59 @@ kernel void kernel_soft_max_4_f16_q8(
         psums[row] = sum;
     }
 }
+
+// Second half of the fused KQ+softmax path (mul_mm_f16_f32_kq_p8). One workgroup
+// per (query, head) row: reduce the per-32-block maxima to the row max (sinks join
+// it as an extra column), then emit the per-block half scale
+// exp(bmax - rowmax)/255 that kernel_mul_mm_q8_kqv consumes and the deferred-norm
+// row sum. Touches 8 bytes per 32 scores instead of the 13 bytes per score the
+// two-pass softmax read, so it is ~1/50 of that kernel's traffic.
+#ifdef ADRENO_GPU
+REQD_SUBGROUP_SIZE_64
+#endif
+kernel void kernel_fa_p8_fixup(
+        global float * bmax,
+        global float * bsum,
+        global half  * dp,
+        global float * psums,
+        global char  * sinks,
+        ulong offset_sinks,
+        int has_sinks,
+        int nblk,
+        int N
+) {
+    const int n    = get_group_id(0);
+    const int head = get_group_id(1);
+    const uint row = (uint)head*(uint)N + (uint)n;
+    global float * bm = bmax + (size_t)row*nblk;
+    global float * bs = bsum + (size_t)row*nblk;
+    global half  * dr = dp   + (size_t)row*nblk;
+
+    float lmax = -INFINITY;
+    for (int b = get_local_id(0); b < nblk; b += get_local_size(0)) {
+        lmax = fmax(lmax, bm[b]);
+    }
+    float rowmax = sub_group_reduce_max(lmax);
+    float sink = 0.0f;
+    if (has_sinks) {
+        sink = ((global float *)(sinks + offset_sinks))[head];
+        rowmax = fmax(rowmax, sink);
+    }
+
+    float lsum = 0.0f;
+    for (int b = get_local_id(0); b < nblk; b += get_local_size(0)) {
+        const float m = bm[b];
+        // finite sentinels rather than -INFINITY compares: the program builds with
+        // -cl-finite-math-only, which may fold a test against infinity itself.
+        const float f = (m > -1.0e30f && rowmax > -1.0e30f) ? exp(m - rowmax) : 0.0f;
+        dr[b] = (half)(f / 255.0f);
+        lsum += bs[b]*f;
+    }
+    float sum = sub_group_reduce_add(lsum);
+    if (has_sinks && rowmax > -1.0e30f) {
+        sum += exp(sink - rowmax);
+    }
+    if (get_local_id(0) == 0) {
+        psums[row] = sum;
+    }
+}
