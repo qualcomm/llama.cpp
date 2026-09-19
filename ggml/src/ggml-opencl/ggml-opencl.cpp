@@ -30026,7 +30026,24 @@ static bool ggml_cl_flash_attn_decompose(
                                    n_head_kv > 0 && mask != nullptr &&
                                    backend_ctx->kernel_fa_v_transpose_q8 != nullptr;
     const bool gqa_group = n_head_kv > 0 && n_head % n_head_kv == 0 && n_head / n_head_kv >= 2;
-    const int gen_min_dk = backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E ? ((kqv_int8_possible && gqa_group) ? 64 : 128)
+    // At short context the dk=64 decomposition does not amortise its per-chunk cost against a
+    // fused tile that is already efficient there. Prefill arrives in 512-token ubatches, so n_kv
+    // climbs through one call and the floor only moves the first chunk. gpt-oss-20B, floor 0 vs
+    // 1024 vs 2048, vs the fused tile:
+    //
+    //   pp512    -2.5%   +0.1%   +0.1%
+    //   pp1024   -1.3%   +2.3%   +0.1%
+    //   pp2048   +2.1%   +6.1%   +3.0%
+    //   pp4096   +7.9%  +11.1%  +10.0%
+    //
+    // Llama-3.2-1B and granite-3B give up at most 1.9 points at pp512/1024 under 1024 and lose
+    // more under 2048. GGML_OPENCL_FA_DECOMPOSE_DK64_MIN_NKV retunes it without a rebuild.
+    static const int dk64_min_nkv = []{
+        const char * e = getenv("GGML_OPENCL_FA_DECOMPOSE_DK64_MIN_NKV");
+        return (e && e[0]) ? atoi(e) : 1024;
+    }();
+    const bool dk64_ok = kqv_int8_possible && gqa_group && n_kv >= dk64_min_nkv;
+    const int gen_min_dk = backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E ? (dk64_ok ? 64 : 128)
                          : backend_ctx->adreno_gen == ADRENO_GPU_GEN::A8X ? 128
                          : 256;
     const int min_dk = min_dk_env > 0 ? min_dk_env : gen_min_dk;
