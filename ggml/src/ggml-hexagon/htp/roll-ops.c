@@ -261,10 +261,6 @@ int execute_op_roll_f32(struct htp_ops_context * octx) {
         return HTP_STATUS_INVAL_PARAMS;
     }
 
-    if (octx->flags & HTP_OPFLAGS_SKIP_COMPUTE) {
-        return HTP_STATUS_OK;
-    }
-
     const uint32_t total_rows = ne1 * ne2 * ne3;
     const size_t dst_row_size = ne0 * sizeof(float);
 
