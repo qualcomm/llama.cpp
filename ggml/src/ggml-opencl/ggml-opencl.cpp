@@ -30418,6 +30418,22 @@ static bool ggml_cl_flash_attn_decompose(
         // its f32 dst in a CL_R image and inherits this device limit.
         n_q_chunk = MIN(n_q_chunk, img_limit);
     }
+    // The int8 fused-softmax KQ GEMM wants FEWER query tiles per kv block once the cache is
+    // long: with 8 tiles (256 queries) its cost per score doubles between 33k and 49k rows
+    // of kv (135 -> 294 ps on the X2-90), with 3-4 tiles it stays flat. Measured on
+    // Qwen3.5-35B-A3B, pp16384, against the uncapped sizing: chunk 96 is +19% at 32k and
+    // +19% at 48k tokens of context, 128 is +17% / +14% (-0.5% at depth 0), 64 is below
+    // 128 at depth and -1.8% at depth 0. Blocks per workgroup (KQ_MB 4 / 16) do not move
+    // it, so it is the tile count, not the K footprint. Applied after the floors and
+    // ceilings; GGML_OPENCL_FA_KQ_INT8_MAX_CHUNK overrides (512 restores the old sizing).
+    static const int64_t kq_int8_max_chunk = []{
+        const char * e = getenv("GGML_OPENCL_FA_KQ_INT8_MAX_CHUNK");
+        const int v = (e && e[0]) ? atoi(e) : 96;
+        return (int64_t)(v >= 32 ? (v / 32) * 32 : 96);
+    }();
+    if (kq_p8_possible && kq_int8_env_pre) {
+        n_q_chunk = MIN(n_q_chunk, kq_int8_max_chunk);
+    }
     if (n_q_chunk < 32) {
         FA_DECLINE("chunk<32");
     }
