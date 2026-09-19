@@ -148,11 +148,18 @@ Writing high-performance operators for Hexagon requires following specific guide
 
 ### Binary Inspection and Spill Analysis
 
-Use [`scripts/snapdragon/ggml-hexagon-inspect.py`](../../../scripts/snapdragon/ggml-hexagon-inspect.py) to audit Hexagon binaries for register spills, inspect function disassembly, or resolve crash addresses:
+Use [`scripts/snapdragon/ggml-hexagon-inspect.py`](../../../scripts/snapdragon/ggml-hexagon-inspect.py) to audit Hexagon binaries for register 
+spills, unexpected float promotions, or disassembly:
+
+- Always verify that compute kernels have zero in-loop vector spills (`--spills --strict`) and no float promotions (`--promotions`).
+- Avoid excessive loop unrolling (`#pragma unroll`), which increases register pressure and causes spills.
 
 ```bash
 # Check for vector and scalar register spills
-python3 scripts/snapdragon/ggml-hexagon-inspect.py --spills --func "^compute_"
+python3 scripts/snapdragon/ggml-hexagon-inspect.py --spills --strict --func "^compute_"
+
+# Check for float promotions
+python3 scripts/snapdragon/ggml-hexagon-inspect.py --promotions --func "^compute_"
 
 # Disassemble with annotated loops and spill markers
 python3 scripts/snapdragon/ggml-hexagon-inspect.py --disasm compute_same_shape_div_f32
