@@ -112,30 +112,10 @@ kernel void kernel_mul_mm_q8_kqv(
         }
         barrier(CLK_LOCAL_MEM_FENCE);
 
-        // Issue every V^T load of this staging group before the first dot: a lane streams its
-        // own row and each block is 32 bytes, so with one block loaded per iteration the load
-        // latency is exposed once per 32 rows of kv for the whole contraction (1,600 times at
-        // 50k rows). Loading the KQV_NB blocks up front keeps KQV_NB reads in flight. The
-        // tail group clamps to its last block so no lane reads past the row.
-        uint4 w0v[KQV_NB];
-        uint4 w1v[KQV_NB];
-        float dvsv[KQV_NB];
-        #pragma unroll
-        for (int bb = 0; bb < KQV_NB; ++bb) {
-            const int b = bg + min(bb, nb_here - 1);
-            w0v[bb]  = vload4(0, &vq[vbase + (size_t)b*8]);
-            w1v[bb]  = vload4(0, &vq[vbase + (size_t)b*8 + 4]);
-            dvsv[bb] = (float)vd[vdbas + b];
-        }
-
-        #pragma unroll
-        for (int bb = 0; bb < KQV_NB; ++bb) {
-            if (bb >= nb_here) {
-                break;
-            }
-            const uint4 w0 = w0v[bb];
-            const uint4 w1 = w1v[bb];
-            const float dvs = dvsv[bb];
+        for (int bb = 0; bb < nb_here; ++bb) {
+            const uint4 w0 = vload4(0, &vq[vbase + (size_t)(bg + bb)*8]);
+            const uint4 w1 = vload4(0, &vq[vbase + (size_t)(bg + bb)*8 + 4]);
+            const float dvs = (float)vd[vdbas + bg + bb];
 
             #pragma unroll
             for (int t = 0; t < KQV_TN; ++t) {
