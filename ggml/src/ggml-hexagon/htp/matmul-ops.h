@@ -62,12 +62,7 @@ enum htp_mm_kernel_type {
 
     // HVX floating-point paths
     HTP_MM_KERNEL_HVX_F16_F16_VTCM,
-    HTP_MM_KERNEL_HVX_F16_F16_DDR,
-    HTP_MM_KERNEL_HVX_F16_F32_DDR,
-
     HTP_MM_KERNEL_HVX_F32_F32_VTCM,
-    HTP_MM_KERNEL_HVX_F32_F32_DDR,
-    HTP_MM_KERNEL_HVX_F32_F16_DDR,
 
     // HVX quantized paths
     HTP_MM_KERNEL_HVX_QUANT_ROW,      // standard row-wise parallel quantization
@@ -100,7 +95,7 @@ struct htp_mm_kernel_params {
     struct fastdiv_values div_ne1;
     struct fastdiv_values div_r2;
     struct fastdiv_values div_r3;
-    struct fastdiv_values div_ne11;
+    struct fastdiv_values div_ne12;
     struct fastdiv_values div_n_act_threads;
     struct fastdiv_values div_ne00_padded;
 };
@@ -539,15 +534,6 @@ static inline void htp_mm_hvx_vtcm_layout_build(
                 size_t f16_src1_row_size = htp_mm_round_up(ne10 * 2, 128);
                 src1_sz = htp_mm_round_up(f16_src1_row_size * src1_nrows, 256);
                 src0_sz = htp_mm_round_up(n_prefetch * src0_row_size_padded, 256) * n_threads;
-                dst_sz  = dst_nrows > 0 ? htp_mm_round_up(dst_row_size, 128) * n_threads : 0;
-                break;
-            }
-            case HTP_MM_KERNEL_HVX_F16_F32_DDR:
-            case HTP_MM_KERNEL_HVX_F16_F16_DDR:
-            case HTP_MM_KERNEL_HVX_F32_F32_DDR:
-            case HTP_MM_KERNEL_HVX_F32_F16_DDR: {
-                src0_sz = htp_mm_round_up(n_prefetch * src0_row_size, 256) * n_threads;
-                src1_sz = htp_mm_round_up(n_prefetch * src1_row_size, 256) * n_threads;
                 dst_sz  = dst_nrows > 0 ? htp_mm_round_up(dst_row_size, 128) * n_threads : 0;
                 break;
             }

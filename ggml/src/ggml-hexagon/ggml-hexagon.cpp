@@ -4614,78 +4614,46 @@ static void ggml_hexagon_precompute_hvx_mm_params(
     done_quant:;
     } else if (wtype == GGML_TYPE_F16) {
         // F16 HVX
-        const bool is_batched  = (ne02 > 1) || (ne03 > 1);
-        const bool is_permuted = ggml_is_permuted(src0) || ggml_is_permuted(src1);
-
         struct htp_mm_hvx_vtcm_layout L;
-        if (!is_batched && !is_permuted) {
-            uint32_t m_chunk = 0;
-            if (htp_mm_hvx_solve_vtcm_params(
-                    HTP_MM_KERNEL_HVX_F16_F16_VTCM, wtype, ne10, src1_nrows, sess->n_threads,
-                    dst->nb[1], src0->nb[1], src1->nb[1], src2_row_size, 16, vtcm_budget,
-                    &L, &m_chunk)) {
-                kparams->kernel_type = HTP_MM_KERNEL_HVX_F16_F16_VTCM;
-                kparams->m_chunk = (m_chunk < (uint32_t) src1_nrows) ? m_chunk : 0;
-                kparams->src1_row_size = hex_round_up(ne10 * 2, 128);
-                kparams->vtcm_size = L.total_bytes;
-                kparams->vtcm_src0_size = L.src0_bytes;
-                kparams->vtcm_src1_size = L.src1_bytes;
-                kparams->vtcm_dst_size = L.dst_bytes;
-                kparams->n_prefetch = 16;
-                return;
-            }
+        uint32_t m_chunk = 0;
+        if (htp_mm_hvx_solve_vtcm_params(
+                HTP_MM_KERNEL_HVX_F16_F16_VTCM, wtype, ne10, src1_nrows, sess->n_threads,
+                dst->nb[1], src0->nb[1], src1->nb[1], src2_row_size, 16, vtcm_budget,
+                &L, &m_chunk)) {
+            kparams->kernel_type = HTP_MM_KERNEL_HVX_F16_F16_VTCM;
+            kparams->m_chunk = (m_chunk < (uint32_t) src1_nrows) ? m_chunk : 0;
+            kparams->src1_row_size = hex_round_up(ne10 * 2, 128);
+            kparams->vtcm_size = L.total_bytes;
+            kparams->vtcm_src0_size = L.src0_bytes;
+            kparams->vtcm_src1_size = L.src1_bytes;
+            kparams->vtcm_dst_size = L.dst_bytes;
+            kparams->n_prefetch = 16;
+            return;
         }
 
-        if (src1->type == GGML_TYPE_F32) {
-            kparams->kernel_type = HTP_MM_KERNEL_HVX_F16_F32_DDR;
-        } else {
-            kparams->kernel_type = HTP_MM_KERNEL_HVX_F16_F16_DDR;
-        }
-        kparams->src1_row_size = src1->nb[1];
-        htp_mm_hvx_vtcm_layout_build(
-            &L, kparams->kernel_type, wtype, ne10, src1_nrows, sess->n_threads,
-            dst->nb[1], src0->nb[1], src1->nb[1], src2_row_size, 16, false, false
-        );
-        kparams->vtcm_size = L.total_bytes;
-        kparams->vtcm_src0_size = L.src0_bytes;
-        kparams->vtcm_src1_size = L.src1_bytes;
-        kparams->vtcm_dst_size = L.dst_bytes;
-        kparams->n_prefetch = 16;
+        kparams->kernel_type = HTP_MM_KERNEL_UNSUPPORTED;
+        return;
     } else {
         // F32 HVX
-        const bool is_batched  = (ne02 > 1) || (ne03 > 1);
-        const bool is_permuted = ggml_is_permuted(src0) || ggml_is_permuted(src1);
-
         struct htp_mm_hvx_vtcm_layout L;
-        if (!is_batched && !is_permuted) {
-            uint32_t m_chunk = 0;
-            if (htp_mm_hvx_solve_vtcm_params(
-                    HTP_MM_KERNEL_HVX_F32_F32_VTCM, wtype, ne10, src1_nrows, sess->n_threads,
-                    dst->nb[1], src0->nb[1], src1->nb[1], src2_row_size, 16, vtcm_budget,
-                    &L, &m_chunk)) {
-                kparams->kernel_type = HTP_MM_KERNEL_HVX_F32_F32_VTCM;
-                kparams->m_chunk = (m_chunk < (uint32_t) src1_nrows) ? m_chunk : 0;
-                kparams->src1_row_size = hex_round_up(ne10 * 4, 128);
-                kparams->vtcm_size = L.total_bytes;
-                kparams->vtcm_src0_size = L.src0_bytes;
-                kparams->vtcm_src1_size = L.src1_bytes;
-                kparams->vtcm_dst_size = L.dst_bytes;
-                kparams->n_prefetch = 16;
-                return;
-            }
+        uint32_t m_chunk = 0;
+        if (htp_mm_hvx_solve_vtcm_params(
+                HTP_MM_KERNEL_HVX_F32_F32_VTCM, wtype, ne10, src1_nrows, sess->n_threads,
+                dst->nb[1], src0->nb[1], src1->nb[1], src2_row_size, 16, vtcm_budget,
+                &L, &m_chunk)) {
+            kparams->kernel_type = HTP_MM_KERNEL_HVX_F32_F32_VTCM;
+            kparams->m_chunk = (m_chunk < (uint32_t) src1_nrows) ? m_chunk : 0;
+            kparams->src1_row_size = hex_round_up(ne10 * 4, 128);
+            kparams->vtcm_size = L.total_bytes;
+            kparams->vtcm_src0_size = L.src0_bytes;
+            kparams->vtcm_src1_size = L.src1_bytes;
+            kparams->vtcm_dst_size = L.dst_bytes;
+            kparams->n_prefetch = 16;
+            return;
         }
 
-        kparams->kernel_type = HTP_MM_KERNEL_HVX_F32_F32_DDR;
-        kparams->src1_row_size = src1->nb[1];
-        htp_mm_hvx_vtcm_layout_build(
-            &L, kparams->kernel_type, wtype, ne10, src1_nrows, sess->n_threads,
-            dst->nb[1], src0->nb[1], src1->nb[1], src2_row_size, 16, false, false
-        );
-        kparams->vtcm_size = L.total_bytes;
-        kparams->vtcm_src0_size = L.src0_bytes;
-        kparams->vtcm_src1_size = L.src1_bytes;
-        kparams->vtcm_dst_size = L.dst_bytes;
-        kparams->n_prefetch = 16;
+        kparams->kernel_type = HTP_MM_KERNEL_UNSUPPORTED;
+        return;
     }
 }
 
@@ -4736,7 +4704,7 @@ finalize:
     kparams->div_ne1      = init_fastdiv_values(ne11);
     kparams->div_r2       = init_fastdiv_values(ne02 > 0 ? ne12 / ne02 : 1);
     kparams->div_r3       = init_fastdiv_values(ne03 > 0 ? ne13 / ne03 : 1);
-    kparams->div_ne11     = init_fastdiv_values(ne11);
+    kparams->div_ne12     = init_fastdiv_values(ne12);
 }
 
 static void ggml_hexagon_precompute_matmul_params(
@@ -5326,7 +5294,7 @@ finalize:
     kparams->div_ne1      = init_fastdiv_values(ne11);
     kparams->div_r2       = init_fastdiv_values(ne02 > 0 ? ne12 / ne02 : 1);
     kparams->div_r3       = init_fastdiv_values(ne03 > 0 ? ne13 / ne03 : 1);
-    kparams->div_ne11     = init_fastdiv_values(ne11);
+    kparams->div_ne12     = init_fastdiv_values(ne12);
 }
 
 static void ggml_hexagon_precompute_fused_mmidnx_params(
@@ -5371,12 +5339,19 @@ static bool ggml_hexagon_supported_mul_mat(const struct ggml_hexagon_session * s
         case GGML_TYPE_MXFP4:
         case GGML_TYPE_Q4_K:
         case GGML_TYPE_Q6_K:
+            if (!ggml_is_contiguous(src0) || ggml_is_permuted(src0)) {
+                return false;
+            }
+
             if (src0->ne[0] % ((src0->type == GGML_TYPE_Q6_K || src0->type == GGML_TYPE_Q4_K) ? QK_K : 32)) {
                 return false;
             }
 
-            if (src1->ne[2] != 1 || src1->ne[3] != 1) {
-                return false;  // no broadcasting (for now)
+            if (src1->ne[2] < src0->ne[2] || src1->ne[3] < src0->ne[3]) {
+                return false;
+            }
+            if (src1->ne[2] % src0->ne[2] != 0 || src1->ne[3] % src0->ne[3] != 0) {
+                return false;
             }
 
             if (!src0->buffer) {
@@ -5443,6 +5418,10 @@ static bool ggml_hexagon_supported_mul_mat_id(const struct ggml_hexagon_session 
         case GGML_TYPE_MXFP4:
         case GGML_TYPE_Q4_K:
         case GGML_TYPE_Q6_K:
+            if (!ggml_is_contiguous(src0) || ggml_is_permuted(src0)) {
+                return false;
+            }
+
             if (src0->ne[0] % ((src0->type == GGML_TYPE_Q6_K || src0->type == GGML_TYPE_Q4_K) ? QK_K : 32)) {
                 return false;
             }

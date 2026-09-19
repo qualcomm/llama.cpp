@@ -196,40 +196,6 @@ static inline void vec_dot_f32_f32_aa_2x2(const uint32_t n, float * restrict s0,
     hvx_vec_store_u(s1, 8, r0_r1_c1_sum);
 }
 
-static inline void vec_dot_f32_f32_uu_1x1(const uint32_t n, float * restrict s, const void * restrict x, const void * restrict y) {
-    const HVX_UVector * restrict vx = (const HVX_UVector * restrict) x;
-    const HVX_UVector * restrict vy = (const HVX_UVector * restrict) y;
-
-    uint32_t nvec = n / VLEN_FP32; // num full fp32 hvx vectors
-    uint32_t nloe = n % VLEN_FP32; // leftover elements
-
-    HVX_Vector       rsum = Q6_V_vzero();
-
-    uint32_t i = 0;
-
-    #pragma unroll(2)
-    for (i = 0; i < nvec; i++) {
-        HVX_Vector x_sf = vx[i];
-        HVX_Vector y_sf = vy[i];
-
-        rsum = HVX_OP_ADD_F32(rsum, HVX_OP_MUL_F32(x_sf, y_sf));
-    }
-
-    if (nloe) {
-        HVX_Vector x_sf = vx[i];
-        HVX_Vector y_sf = vy[i];
-
-        HVX_VectorPred bmask = Q6_Q_vsetq_R(nloe * 4);
-        x_sf = Q6_V_vand_QV(bmask, x_sf);
-        y_sf = Q6_V_vand_QV(bmask, y_sf);
-
-        rsum = HVX_OP_ADD_F32(rsum, HVX_OP_MUL_F32(x_sf, y_sf));
-    }
-
-    rsum = hvx_vec_reduce_sum_f32(rsum);
-    hvx_vec_store_u(&s[0], 4, rsum);
-}
-
 #undef HVX_OP_ADD_F32
 #undef HVX_OP_MUL_F32
 
@@ -357,88 +323,7 @@ static inline void vec_dot_f16_f16_aa_2x2(const uint32_t n, float * restrict s0,
     hvx_vec_store_u(&s1[0], 8, r0_r1_c1_sum);  // row0,col1 row1,col1
 }
 
-static inline void vec_dot_f16_f16_uu_1x1(const uint32_t n, float * restrict s, const void * restrict vx, const void * restrict vy) {
-    const HVX_UVector * restrict x = (const HVX_UVector *) vx;
-    const HVX_UVector * restrict y = (const HVX_UVector *) vy;
 
-    uint32_t nvec = n / VLEN_FP16; // num full fp16 hvx vectors
-    uint32_t nloe = n % VLEN_FP16; // leftover elements
-
-    HVX_Vector rsum = Q6_V_vzero();
-
-    uint32_t i = 0;
-
-    #pragma unroll(4)
-    for (i = 0; i < nvec; i++) {
-        HVX_VectorPair xy_qf = Q6_Wqf32_vmpy_VhfVhf(x[i], y[i]);
-        rsum = Q6_Vqf32_vadd_Vqf32Vqf32(rsum, Q6_Vqf32_vadd_Vqf32Vqf32(Q6_V_lo_W(xy_qf),  Q6_V_hi_W(xy_qf)));
-    }
-
-    if (nloe) {
-        HVX_VectorPred bmask = Q6_Q_vsetq_R(nloe * 2);
-        HVX_Vector x_hf = Q6_V_vand_QV(bmask, x[i]);
-        HVX_Vector y_hf = Q6_V_vand_QV(bmask, y[i]);
-
-        HVX_VectorPair xy_qf = Q6_Wqf32_vmpy_VhfVhf(x_hf, y_hf);
-        rsum = Q6_Vqf32_vadd_Vqf32Vqf32(rsum, Q6_Vqf32_vadd_Vqf32Vqf32(Q6_V_lo_W(xy_qf),  Q6_V_hi_W(xy_qf)));
-    }
-
-    rsum = hvx_vec_reduce_sum_f32(Q6_Vsf_equals_Vqf32(rsum));
-    hvx_vec_store_u(&s[0], 4, rsum);
-}
-
-static inline void vec_dot_f16_f32_uu_1x1(const uint32_t n, float * restrict s, const void * restrict x, const void * restrict y) {
-    const HVX_UVector * restrict vx = (const HVX_UVector * restrict) x;
-    const HVX_UVector * restrict vy = (const HVX_UVector * restrict) y;
-
-    uint32_t nvec = n / VLEN_FP16; // num full fp16 hvx vectors
-    uint32_t nloe = n % VLEN_FP16; // leftover elements
-
-    const HVX_Vector zero = Q6_V_vzero();
-
-    HVX_Vector       rsum = Q6_V_vzero();
-
-    uint32_t i = 0;
-
-    #pragma unroll(2)
-    for (i = 0; i < nvec; i++) {
-        // Load y (fp32) and convert into fp16
-        HVX_Vector y0_qf = Q6_Vqf32_vsub_VsfVsf(vy[i*2+0], zero);  // 32 elements
-        HVX_Vector y1_qf = Q6_Vqf32_vsub_VsfVsf(vy[i*2+1], zero);  // 32 elements
-        HVX_Vector y_hf  = Q6_Vh_vdeal_Vh(Q6_Vhf_equals_Wqf32(Q6_W_vcombine_VV(y1_qf, y0_qf)));
-
-        // Load x (fp16)
-        HVX_Vector x_hf  = vx[i];
-
-        HVX_VectorPair xy_qf = Q6_Wqf32_vmpy_VhfVhf(x_hf, y_hf);
-
-        rsum = Q6_Vqf32_vadd_Vqf32Vqf32(rsum, Q6_Vqf32_vadd_Vqf32Vqf32(Q6_V_lo_W(xy_qf),  Q6_V_hi_W(xy_qf)));
-    }
-
-    if (nloe) {
-        // Load y (fp32) and convert into fp16
-        HVX_Vector y0_qf = Q6_Vqf32_vsub_VsfVsf(vy[i*2+0], zero);  // 32 elements
-        HVX_Vector y1_qf = Q6_Vqf32_vsub_VsfVsf(vy[i*2+1], zero);  // 32 elements
-        HVX_Vector y_hf  = Q6_Vh_vdeal_Vh(Q6_Vhf_equals_Wqf32(Q6_W_vcombine_VV(y1_qf, y0_qf)));
-
-        // Load x (fp16)
-        HVX_Vector x_hf  = vx[i];
-
-        // Zero-out unused elements
-        // Note that we need to clear both x and y because they may contain NANs
-        HVX_VectorPred bmask = Q6_Q_vsetq_R(nloe * 2);
-        x_hf = Q6_V_vand_QV(bmask, x_hf);
-        y_hf = Q6_V_vand_QV(bmask, y_hf);
-
-        HVX_VectorPair xy_qf = Q6_Wqf32_vmpy_VhfVhf(x_hf, y_hf);
-
-        rsum = Q6_Vqf32_vadd_Vqf32Vqf32(rsum, Q6_Vqf32_vadd_Vqf32Vqf32(Q6_V_lo_W(xy_qf),  Q6_V_hi_W(xy_qf)));
-    }
-
-    // Convert into fp32 and reduce
-    rsum = hvx_vec_reduce_sum_f32(Q6_Vsf_equals_Vqf32(rsum));
-    hvx_vec_store_u(&s[0], 4, rsum);
-}
 
 static inline void hvx_tensor_add_f32_grid(
     const struct htp_tensor * restrict dst,
@@ -462,7 +347,7 @@ static inline void hvx_tensor_add_f32_grid(
     const bool is_broadcast3 = (src2->ne[3] == 1);
 
     for (uint32_t r = start_row; r < end_row; r++) {
-        float * dst_row = (float *) ((uint8_t *) dst->data + r * nb1);
+        float * dst_row = (float *) ((uint8_t *) dst->data + (size_t) r * nb1);
 
         uint32_t i13 = fastdiv(r, div_ne11_12);
         uint32_t i12 = fastdiv(r - i13 * ne11_12, div_ne11);
@@ -473,7 +358,7 @@ static inline void hvx_tensor_add_f32_grid(
         uint32_t i21 = is_broadcast1 ? 0 : i11;
 
         const float * src2_row = (const float *) ((const uint8_t *) src2->data +
-                                  i21 * src2->nb[1] + i22 * src2->nb[2] + i23 * src2->nb[3]);
+                                  (size_t) i21 * src2->nb[1] + (size_t) i22 * src2->nb[2] + (size_t) i23 * src2->nb[3]);
 
         float * dst_ptr = &dst_row[start_col];
         const float * src2_ptr = &src2_row[start_col];

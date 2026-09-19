@@ -327,9 +327,6 @@ struct htp_opformat {
             } else if (type == HTP_MM_KERNEL_HVX_F16_F16_VTCM || type == HTP_MM_KERNEL_HVX_F32_F32_VTCM ||
                        type == HTP_MM_KERNEL_HVX_QUANT_ROW    || type == HTP_MM_KERNEL_HVX_QUANT_BLOCK) {
                 path = "hvx-tiled";
-            } else if (type == HTP_MM_KERNEL_HVX_F16_F16_DDR  || type == HTP_MM_KERNEL_HVX_F16_F32_DDR ||
-                       type == HTP_MM_KERNEL_HVX_F32_F32_DDR  || type == HTP_MM_KERNEL_HVX_F32_F16_DDR) {
-                path = "hvx-flat";
             }
             snprintf(str, max_size, "%s vtcm %d", path, (int) kparams->vtcm_size);
         } else if (node.opcode == HTP_OP_FLASH_ATTN_EXT) {

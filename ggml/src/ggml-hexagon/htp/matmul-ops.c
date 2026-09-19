@@ -25,17 +25,6 @@
 #include "matmul-ops.h"
 #include "htp-vtcm.h"
 
-static void hvx_tensor_add_f32_grid(
-    const struct htp_tensor * restrict dst,
-    const struct htp_tensor * restrict src2,
-    uint32_t start_row,
-    uint32_t end_row,
-    uint32_t start_col,
-    uint32_t end_col,
-    const struct fastdiv_values * div_ne11_12,
-    const struct fastdiv_values * div_ne11
-);
-
 typedef struct {
     float        *dst;
     const float  *src2;
@@ -256,86 +245,7 @@ static inline void hvx_mm_run_quant_task(struct htp_mm_context * mmctx, unsigned
     }
 }
 
-// *** matmul with support for 4d tensors and full broadcasting
 
-static void hvx_mm_4d(unsigned int nth, unsigned int ith, void * data) {
-    htp_matmul_preamble;
-
-    assert(ne12 % ne02 == 0);
-    assert(ne13 % ne03 == 0);
-
-    // This is the size of the first dimension of the result, so we can iterate that way. (see the ASSERT above, these are the same numbers)
-    const uint32_t nr0 = ne0;
-
-    // This is the size of the rest of the dimensions of the result
-    const uint32_t nr1 = ne1 * ne2 * ne3;
-
-    const uint32_t src0_nrows = mmctx->src0_row_end - mmctx->src0_row_start;
-
-    // distribute the thread work across the inner or outer loop based on which one is larger
-    uint32_t dr0, dr1, ith0, ith1;
-    if (nr0 > nr1) {
-        dr0  = fastdiv(src0_nrows + nth - 1, &octx->n_threads_div);
-        dr1  = nr1;
-        ith0 = ith;
-        ith1 = 0;
-    } else {
-        dr0  = src0_nrows;
-        dr1  = fastdiv(nr1 + nth - 1, &octx->n_threads_div);
-        ith0 = 0;
-        ith1 = ith;
-    }
-
-    const uint32_t ir0_start = mmctx->src0_row_start + dr0 * ith0;
-    const uint32_t ir0_end   = MIN(ir0_start + dr0, mmctx->src0_row_end);
-
-    const uint32_t ir1_start = dr1 * ith1;
-    const uint32_t ir1_end   = MIN(ir1_start + dr1, nr1);
-
-    // no work for this thread
-    if (ir0_start >= ir0_end || ir1_start >= ir1_end) {
-        return;
-    }
-
-    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
-    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, ir0_start);
-
-    const uint32_t blck_0 = 64;
-    const uint32_t blck_1 = 64;
-
-    for (uint32_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
-        for (uint32_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
-            for (uint32_t ir1 = iir1; ir1 < MIN(iir1 + blck_1, ir1_end); ir1++) {
-                const uint32_t i13 = fastdiv(ir1, &mmctx->mm_div_ne12_ne1);
-                const uint32_t i12 = fastdiv(ir1 - i13 * ne12 * ne1, &mmctx->mm_div_ne1);
-                const uint32_t i11 = (ir1 - i13 * ne12 * ne1 - i12 * ne1);
-
-                // broadcast src0 into src1
-                const uint32_t i03 = fastdiv(i13, &mmctx->mm_div_r3);
-                const uint32_t i02 = fastdiv(i12, &mmctx->mm_div_r2);
-
-                const uint32_t i1 = i11;
-                const uint32_t i2 = i12;
-                const uint32_t i3 = i13;
-
-                const uint8_t * restrict src0_base = (const uint8_t *) src0->data + (0 + i02 * nb02 + i03 * nb03);
-                const uint8_t * restrict src1_col  = (const uint8_t *) src1->data + (i11 * nb11 + i12 * nb12 + i13 * nb13);
-                float * dst_col = (float *) ((uint8_t * restrict) dst->data + (i1 * nb1 + i2 * nb2 + i3 * nb3));
-
-                const uint32_t ir0_block_end = MIN(iir0 + blck_0, ir0_end);
-                for (uint32_t ir0 = iir0; ir0 < ir0_block_end; ir0++) {
-                    const uint8_t * restrict src0_row = src0_base + ir0 * nb01;
-                    mmctx->vec_dot_1x1(ne00, &dst_col[ir0], src0_row, src1_col);
-                }
-            }
-        }
-    }
-
-    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, ir0_start);
-    if (src2) {
-        hvx_tensor_add_f32_grid(dst, src2, ir1_start, ir1_end, ir0_start, ir0_end, &mmctx->mm_div_ne12_ne1, &mmctx->mm_div_ne1);
-    }
-}
 
 // hvx kernels first: the HMX Q6_K dequantizer reuses unpack_q6_k_group from there
 #include "hvx-mm-kernels-tiled.h"
@@ -654,33 +564,50 @@ MATMUL_2D_REPACKED_IMPL(q6_k,       896,  tiled_vec_dot_q6_k_32x2,  tiled_vec_do
 MATMUL_2D_REPACKED_IMPL(iq4nl,      576,  tiled_vec_dot_iq4nl_32x2, tiled_vec_dot_iq4nl_32x1)
 MATMUL_2D_REPACKED_IMPL(mxfp4,      544,  tiled_vec_dot_mxfp4_32x2, tiled_vec_dot_mxfp4_32x1)
 
-#define QUANTIZE_IMPL(name, log_name, kernel_fn, dst_row_size_expr)                                                     \
-static void name(unsigned int nth, unsigned int ith, void * data) {                                                     \
-    struct htp_mm_context * mmctx = data;                                                                               \
-    struct htp_ops_context * octx = mmctx->octx;                                                                        \
-    const struct htp_tensor * src = mmctx->act;                                                                         \
-    const uint32_t ne0 = src->ne[0];                                                                                    \
-    const uint32_t nrows = mmctx->cur_m_rows ? mmctx->cur_m_rows : mmctx->src1_nrows;                                   \
-    const uint32_t nrows_per_thread = mmctx->n_quant_rows_per_thread;                                                   \
-                                                                                                                        \
-    const uint32_t ir_first = nrows_per_thread * ith;                                                                   \
-    if (ir_first >= nrows) {                                                                                            \
-        return;                                                                                                         \
-    }                                                                                                                   \
-                                                                                                                        \
-    struct htp_thread_trace * tr = &octx->ctx->trace[ith];                                                              \
-    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_A_QUANT, ir_first);                                                     \
-                                                                                                                        \
-    uint8_t * restrict dst = mmctx->vtcm_src1;                                                                          \
-    const uint32_t ir_last = MIN(ir_first + nrows_per_thread, nrows);                                                   \
-    const size_t src_row_size = src->nb[1];                                                                             \
-    const size_t dst_row_size = (dst_row_size_expr);                                                                    \
-    const uint8_t * restrict src_data = (const uint8_t *) src->data + (src_row_size * (mmctx->cur_m_start + ir_first)); \
-    uint8_t * restrict dst_data = (uint8_t *) dst + (dst_row_size * ir_first);                                          \
-    uint8_t * restrict tmp_data = (uint8_t *) mmctx->vtcm_dst + (mmctx->vtcm_dst_size_per_thread * ith);                \
-    kernel_fn(src_data, dst_data, tmp_data, ne0, ir_last - ir_first, src_row_size, dst_row_size);                       \
-                                                                                                                        \
-    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_A_QUANT, ir_first);                                                      \
+#define QUANTIZE_IMPL(name, log_name, kernel_fn, dst_row_size_expr)                                                                                               \
+static void name(unsigned int nth, unsigned int ith, void * data) {                                                                                               \
+    struct htp_mm_context * mmctx = data;                                                                                                                         \
+    struct htp_ops_context * octx = mmctx->octx;                                                                                                                  \
+    const struct htp_mm_kernel_params * kparams = (const struct htp_mm_kernel_params *) octx->kernel_params;                                                      \
+    const struct htp_tensor * src = mmctx->act;                                                                                                                   \
+    const uint32_t ne0 = src->ne[0];                                                                                                                              \
+    const uint32_t nrows = mmctx->cur_m_rows ? mmctx->cur_m_rows : mmctx->src1_nrows;                                                                             \
+    const uint32_t nrows_per_thread = mmctx->n_quant_rows_per_thread;                                                                                             \
+                                                                                                                                                                  \
+    const uint32_t ir_first = nrows_per_thread * ith;                                                                                                             \
+    if (ir_first >= nrows) {                                                                                                                                      \
+        return;                                                                                                                                                   \
+    }                                                                                                                                                             \
+                                                                                                                                                                  \
+    struct htp_thread_trace * tr = &octx->ctx->trace[ith];                                                                                                        \
+    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_A_QUANT, ir_first);                                                                                               \
+                                                                                                                                                                  \
+    uint8_t * restrict dst = mmctx->vtcm_src1;                                                                                                                    \
+    const uint32_t ir_last = MIN(ir_first + nrows_per_thread, nrows);                                                                                             \
+    const size_t src_row_size = src->nb[1];                                                                                                                       \
+    const size_t dst_row_size = (dst_row_size_expr);                                                                                                              \
+    uint8_t * restrict tmp_data = (uint8_t *) mmctx->vtcm_dst + (mmctx->vtcm_dst_size_per_thread * ith);                                                          \
+                                                                                                                                                                  \
+    const bool is_contiguous = (src->nb[2] == src->ne[1] * src->nb[1]) && (src->nb[3] == src->ne[2] * src->nb[2]);                                                \
+    if (is_contiguous) {                                                                                                                                          \
+        const uint8_t * restrict src_data = (const uint8_t *) src->data + (src_row_size * (mmctx->cur_m_start + ir_first));                                       \
+        uint8_t * restrict dst_data = (uint8_t *) dst + (dst_row_size * ir_first);                                                                                \
+        kernel_fn(src_data, dst_data, tmp_data, ne0, ir_last - ir_first, src_row_size, dst_row_size);                                                             \
+    } else {                                                                                                                                                      \
+        const uint32_t ne12_ne1 = src->ne[2] * src->ne[1];                                                                                                        \
+        for (uint32_t ir = ir_first; ir < ir_last; ++ir) {                                                                                                        \
+            const uint32_t ir1 = mmctx->cur_m_start + ir;                                                                                                         \
+            const uint32_t i13 = fastdiv(ir1, &kparams->div_ne12_ne1);                                                                                            \
+            const uint32_t rem = ir1 - i13 * ne12_ne1;                                                                                                            \
+            const uint32_t i12 = fastdiv(rem, &kparams->div_ne1);                                                                                                 \
+            const uint32_t i11 = rem - i12 * src->ne[1];                                                                                                          \
+            const uint8_t * restrict row_src = (const uint8_t *) src->data + ((size_t) i11 * src->nb[1] + (size_t) i12 * src->nb[2] + (size_t) i13 * src->nb[3]); \
+            uint8_t * restrict row_dst = dst + (dst_row_size * ir);                                                                                               \
+            kernel_fn(row_src, row_dst, tmp_data, ne0, 1, src_row_size, dst_row_size);                                                                            \
+        }                                                                                                                                                         \
+    }                                                                                                                                                             \
+                                                                                                                                                                  \
+    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_A_QUANT, ir_first);                                                                                                \
 }
 
 QUANTIZE_IMPL(quantize_f32_q8_0_tiled, "quantize-f32-q8_0_tiled", quantize_f32_q8_0_tiled_kernel, htp_mm_q8_0_tiled_row_size(ne0))
@@ -749,6 +676,141 @@ MATMUL_NX_2D_REPACKED_IMPL(q4_1,       640,  tiled_vec_dot_q4_1_32x2,  tiled_vec
 MATMUL_NX_2D_REPACKED_IMPL(q8_0,       1088, tiled_vec_dot_q8_0_32x2,  tiled_vec_dot_q8_0_32x1)
 MATMUL_NX_2D_REPACKED_IMPL(iq4nl,      576,  tiled_vec_dot_iq4nl_32x2, tiled_vec_dot_iq4nl_32x1)
 MATMUL_NX_2D_REPACKED_IMPL(mxfp4,      544,  tiled_vec_dot_mxfp4_32x2, tiled_vec_dot_mxfp4_32x1)
+
+#define MATMUL_4D_REPACKED_IMPL(SUFFIX, TILE_SIZE, DOT_2X2, DOT_2X1)                                                                                        \
+static void hvx_mm_4d_repacked_##SUFFIX(unsigned int nth, unsigned int ith, void * data) {                                                                  \
+    htp_matmul_preamble;                                                                                                                                    \
+                                                                                                                                                            \
+    const uint32_t src0_nrows = mmctx->src0_row_end - mmctx->src0_row_start;                                                                                \
+    const uint32_t cur_m_rows = mmctx->cur_m_rows ? mmctx->cur_m_rows : (ne11 * ne12 * ne13);                                                               \
+    const uint32_t cur_m_start = mmctx->cur_m_start;                                                                                                        \
+                                                                                                                                                            \
+    const uint32_t src0_start_row  = mmctx->src0_row_start + src0_nrows_per_thread * ith;                                                                   \
+    const uint32_t src0_end_row    = MIN(src0_start_row + src0_nrows_per_thread, mmctx->src0_row_end);                                                      \
+                                                                                                                                                            \
+    struct htp_thread_trace * tr = &octx->ctx->trace[ith];                                                                                                  \
+                                                                                                                                                            \
+    const struct htp_mm_kernel_params * kparams = (const struct htp_mm_kernel_params *) octx->kernel_params;                                                \
+    const uint32_t n_prefetch = kparams->n_prefetch;                                                                                                        \
+    assert(n_prefetch >= 2 && n_prefetch <= HTP_MM_MAX_PREFETCH && (n_prefetch & (n_prefetch - 1)) == 0);                                                   \
+                                                                                                                                                            \
+    const size_t dst_row_size = nb1;                                                                                                                        \
+    const size_t src1_stride = mmctx->vtcm_src1_stride;                                                                                                     \
+                                                                                                                                                            \
+    uint8_t * restrict vtcm_src0_ptr = mmctx->vtcm_src0 + mmctx->vtcm_src0_size_per_thread * ith;                                                           \
+    uint8_t * restrict src1_data = mmctx->vtcm_src1;                                                                                                        \
+                                                                                                                                                            \
+    const uint32_t tile_size = TILE_SIZE;                                                                                                                   \
+    const uint32_t aligned_tile_size = hex_align_up(tile_size, 128);                                                                                        \
+                                                                                                                                                            \
+    const uint32_t n_k_tiles_w = ne00 / 32;                                                                                                                 \
+    const uint32_t n_k_tiles_a = ne10 / 32;                                                                                                                 \
+    const uint32_t tile_row_stride = n_k_tiles_w * tile_size;                                                                                               \
+    const uint32_t tile_row_transfer_size_aligned = n_k_tiles_a * aligned_tile_size;                                                                        \
+    const uint32_t src0_slice_stride = ((ne01 + 31) / 32) * tile_row_stride;                                                                                \
+                                                                                                                                                            \
+    const uint32_t ct_start = src0_start_row / 32;                                                                                                          \
+    const uint32_t ct_end   = (src0_end_row + 31) / 32;                                                                                                     \
+                                                                                                                                                            \
+    hvx_mm_run_quant_task(mmctx, ith);                                                                                                                      \
+                                                                                                                                                            \
+    if (src0_start_row >= src0_end_row || cur_m_rows == 0) {                                                                                                \
+        return;                                                                                                                                             \
+    }                                                                                                                                                       \
+                                                                                                                                                            \
+    const uint32_t total_batches = ne12 * ne13;                                                                                                             \
+    const uint32_t b_start = fastdiv(cur_m_start, &kparams->div_ne1);                                                                                       \
+    uint32_t b_end = fastdiv(cur_m_start + cur_m_rows + ne11 - 1, &kparams->div_ne1);                                                                       \
+    b_end = MIN(b_end, total_batches);                                                                                                                      \
+                                                                                                                                                            \
+    uint32_t b_grp_start = b_start;                                                                                                                         \
+    while (b_grp_start < b_end) {                                                                                                                           \
+        const uint32_t b3 = fastdiv(b_grp_start, &kparams->div_ne12);                                                                                       \
+        const uint32_t b2 = b_grp_start - b3 * ne12;                                                                                                        \
+        const uint32_t i02 = fastdiv(b2, &kparams->div_r2);                                                                                                 \
+        const uint32_t i03 = fastdiv(b3, &kparams->div_r3);                                                                                                 \
+                                                                                                                                                            \
+        uint32_t b_grp_end = b_grp_start + 1;                                                                                                               \
+        while (b_grp_end < b_end) {                                                                                                                         \
+            const uint32_t cur_b3 = fastdiv(b_grp_end, &kparams->div_ne12);                                                                                 \
+            const uint32_t cur_b2 = b_grp_end - cur_b3 * ne12;                                                                                              \
+            const uint32_t cur_i02 = fastdiv(cur_b2, &kparams->div_r2);                                                                                     \
+            const uint32_t cur_i03 = fastdiv(cur_b3, &kparams->div_r3);                                                                                     \
+            if (cur_i02 != i02 || cur_i03 != i03) {                                                                                                         \
+                break;                                                                                                                                      \
+            }                                                                                                                                               \
+            b_grp_end++;                                                                                                                                    \
+        }                                                                                                                                                   \
+                                                                                                                                                            \
+        const uint32_t slice_idx = i03 * ne02 + i02;                                                                                                        \
+        const dma_addr_t src0_slice = src0->data + (size_t) slice_idx * src0_slice_stride;                                                                  \
+                                                                                                                                                            \
+        uint32_t push_ct = ct_start;                                                                                                                        \
+        for (uint32_t d = 0; d < n_prefetch && push_ct < ct_end; d++, push_ct++) {                                                                          \
+            dma_queue_push(dma_q, dma_make_data(vtcm_src0_ptr + d * tile_row_transfer_size_aligned,                                                         \
+                           src0_slice + (size_t) push_ct * tile_row_stride),                                                                                \
+                           aligned_tile_size, tile_size, tile_size, n_k_tiles_a);                                                                           \
+        }                                                                                                                                                   \
+                                                                                                                                                            \
+        for (uint32_t ct = ct_start; ct < ct_end; ct++) {                                                                                                   \
+            const uint8_t * w_tile = (void *) dma_queue_pop(dma_q).dst;                                                                                     \
+                                                                                                                                                            \
+            int valid_rows = (int)ne0 - (int)(ct * 32);                                                                                                     \
+            valid_rows = MIN(32, MAX(0, valid_rows));                                                                                                       \
+                                                                                                                                                            \
+            htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, ct);                                                                                          \
+            for (uint32_t b = b_grp_start; b < b_grp_end; b++) {                                                                                            \
+                const uint32_t b_m_start = b * ne11;                                                                                                        \
+                const uint32_t m_first = MAX(cur_m_start, b_m_start);                                                                                       \
+                const uint32_t m_last  = MIN(cur_m_start + cur_m_rows, b_m_start + ne11);                                                                   \
+                if (m_first >= m_last) continue;                                                                                                            \
+                                                                                                                                                            \
+                const uint32_t cur_b3 = fastdiv(b, &kparams->div_ne12);                                                                                     \
+                const uint32_t cur_b2 = b - cur_b3 * ne12;                                                                                                  \
+                uint8_t * dst_batch_base = (uint8_t *) dst->data + (size_t) cur_b2 * nb2 + (size_t) cur_b3 * nb3;                                           \
+                                                                                                                                                            \
+                const uint32_t chunk_m_offset = m_first - cur_m_start;                                                                                      \
+                const uint32_t dst_m_offset   = m_first - b_m_start;                                                                                        \
+                const uint32_t batch_nrows    = m_last - m_first;                                                                                           \
+                                                                                                                                                            \
+                uint32_t ir1 = 0;                                                                                                                           \
+                for (; ir1 + 1 < batch_nrows; ir1 += 2) {                                                                                                   \
+                    const uint8_t * restrict src1_col0 = (const uint8_t *) (src1_data + (chunk_m_offset + ir1 + 0) * src1_stride);                          \
+                    const uint8_t * restrict src1_col1 = (const uint8_t *) (src1_data + (chunk_m_offset + ir1 + 1) * src1_stride);                          \
+                    float * restrict dst_row0 = (float *) (dst_batch_base + (dst_m_offset + ir1 + 0) * dst_row_size);                                       \
+                    float * restrict dst_row1 = (float *) (dst_batch_base + (dst_m_offset + ir1 + 1) * dst_row_size);                                       \
+                    float * dst_ptr0 = &dst_row0[ct * 32];                                                                                                  \
+                    float * dst_ptr1 = &dst_row1[ct * 32];                                                                                                  \
+                    DOT_2X2(ne10, dst_ptr0, dst_ptr1, w_tile, src1_col0, src1_col1, valid_rows, NULL, NULL);                                                \
+                }                                                                                                                                           \
+                for (; ir1 < batch_nrows; ++ir1) {                                                                                                          \
+                    const uint8_t * restrict src1_col = (const uint8_t *) (src1_data + (chunk_m_offset + ir1) * src1_stride);                               \
+                    float * restrict dst_row = (float *) (dst_batch_base + (dst_m_offset + ir1) * dst_row_size);                                            \
+                    float * dst_ptr = &dst_row[ct * 32];                                                                                                    \
+                    DOT_2X1(ne10, dst_ptr, w_tile, src1_col, valid_rows, NULL);                                                                             \
+                }                                                                                                                                           \
+            }                                                                                                                                               \
+            htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, ct);                                                                                           \
+                                                                                                                                                            \
+            if (push_ct < ct_end) {                                                                                                                         \
+                dma_queue_push(dma_q, dma_make_data(w_tile, src0_slice + (size_t) push_ct * tile_row_stride),                                               \
+                               aligned_tile_size, tile_size, tile_size, n_k_tiles_a);                                                                       \
+                push_ct++;                                                                                                                                  \
+            }                                                                                                                                               \
+        }                                                                                                                                                   \
+        b_grp_start = b_grp_end;                                                                                                                            \
+    }                                                                                                                                                       \
+    if (src2) {                                                                                                                                             \
+        hvx_tensor_add_f32_grid(dst, src2, cur_m_start, cur_m_start + cur_m_rows, src0_start_row, src0_end_row, &kparams->div_ne12_ne1, &kparams->div_ne1); \
+    }                                                                                                                                                       \
+}
+
+MATMUL_4D_REPACKED_IMPL(q4_0,       576,  tiled_vec_dot_q4_0_32x2,  tiled_vec_dot_q4_0_32x1)
+MATMUL_4D_REPACKED_IMPL(q4_1,       640,  tiled_vec_dot_q4_1_32x2,  tiled_vec_dot_q4_1_32x1)
+MATMUL_4D_REPACKED_IMPL(q8_0,       1088, tiled_vec_dot_q8_0_32x2,  tiled_vec_dot_q8_0_32x1)
+MATMUL_4D_REPACKED_IMPL(q6_k,       896,  tiled_vec_dot_q6_k_32x2,  tiled_vec_dot_q6_k_32x1)
+MATMUL_4D_REPACKED_IMPL(iq4nl,      576,  tiled_vec_dot_iq4nl_32x2, tiled_vec_dot_iq4nl_32x1)
+MATMUL_4D_REPACKED_IMPL(mxfp4,      544,  tiled_vec_dot_mxfp4_32x2, tiled_vec_dot_mxfp4_32x1)
 
 static void hvx_mm_2d(unsigned int nth, unsigned int ith, void * data) {
     htp_matmul_preamble;
@@ -957,6 +1019,154 @@ static void hvx_mv_2d(unsigned int nth, unsigned int ith, void * data) {
             hvx_copy_f32_ua((uint8_t *) &dst_col[src0_start_row], (uint8_t *) tmp, copy_cnt);
         }
         htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, src0_end_row);
+    }
+}
+
+static void hvx_mm_4d(unsigned int nth, unsigned int ith, void * data) {
+    htp_matmul_preamble;
+
+    const struct htp_mm_kernel_params * kparams = (const struct htp_mm_kernel_params *) octx->kernel_params;
+    const uint32_t n_prefetch = kparams->n_prefetch;
+    assert(n_prefetch >= 2 && n_prefetch <= HTP_MM_MAX_PREFETCH && (n_prefetch & (n_prefetch - 1)) == 0);
+    const uint32_t prefetch_mask = n_prefetch - 1;
+
+    const uint32_t src0_nrows = mmctx->src0_row_end - mmctx->src0_row_start;
+    const uint32_t cur_m_rows = mmctx->cur_m_rows ? mmctx->cur_m_rows : (ne11 * ne12 * ne13);
+    const uint32_t cur_m_start = mmctx->cur_m_start;
+
+    const uint32_t src0_start_row  = mmctx->src0_row_start + src0_nrows_per_thread * ith;
+    const uint32_t src0_end_row    = MIN(src0_start_row + src0_nrows_per_thread, mmctx->src0_row_end);
+    const uint32_t src0_end_row_x2 = src0_start_row + ((src0_end_row - src0_start_row) & ~1U);
+
+    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+
+    const size_t dst_row_size  = nb1;
+    const size_t src0_row_size = nb01;
+    const size_t src0_stride = mmctx->vtcm_src0_stride;
+    const size_t src1_stride = mmctx->vtcm_src1_stride;
+
+    uint8_t * restrict vtcm_src0_ptr = mmctx->vtcm_src0 + mmctx->vtcm_src0_size_per_thread * ith;
+    uint8_t * restrict src1_data     = mmctx->vtcm_src1;
+
+    hvx_mm_run_quant_task(mmctx, ith);
+
+    if (src0_start_row >= src0_end_row || cur_m_rows == 0) {
+        return;
+    }
+
+    const uint32_t total_batches = ne12 * ne13;
+    const uint32_t b_start = fastdiv(cur_m_start, &kparams->div_ne1);
+    uint32_t b_end = fastdiv(cur_m_start + cur_m_rows + ne11 - 1, &kparams->div_ne1);
+    b_end = MIN(b_end, total_batches);
+
+    uint32_t b_grp_start = b_start;
+    while (b_grp_start < b_end) {
+        const uint32_t b3 = fastdiv(b_grp_start, &kparams->div_ne12);
+        const uint32_t b2 = b_grp_start - b3 * ne12;
+        const uint32_t i02 = fastdiv(b2, &kparams->div_r2);
+        const uint32_t i03 = fastdiv(b3, &kparams->div_r3);
+
+        uint32_t b_grp_end = b_grp_start + 1;
+        while (b_grp_end < b_end) {
+            const uint32_t cur_b3 = fastdiv(b_grp_end, &kparams->div_ne12);
+            const uint32_t cur_b2 = b_grp_end - cur_b3 * ne12;
+            const uint32_t cur_i02 = fastdiv(cur_b2, &kparams->div_r2);
+            const uint32_t cur_i03 = fastdiv(cur_b3, &kparams->div_r3);
+            if (cur_i02 != i02 || cur_i03 != i03) {
+                break;
+            }
+            b_grp_end++;
+        }
+
+        const dma_addr_t src0_row = src0->data + ((size_t) i02 * nb02 + (size_t) i03 * nb03);
+
+        for (uint32_t ir0 = src0_start_row; ir0 < src0_end_row_x2; ir0 += 2) {
+            const int is0 = (ir0 - src0_start_row);
+            if (is0 >= (int)n_prefetch) {
+                break;
+            }
+            dma_queue_push(dma_q, dma_make_data(vtcm_src0_ptr + is0 * src0_stride, src0_row + (size_t) ir0 * src0_row_size),
+                           src0_stride, src0_row_size, src0_row_size, 2);
+        }
+
+        for (uint32_t ir0 = src0_start_row; ir0 < src0_end_row_x2; ir0 += 2) {
+            const uint8_t * ss0 = (void *) dma_queue_pop(dma_q).dst;
+
+            htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, ir0);
+            for (uint32_t b = b_grp_start; b < b_grp_end; b++) {
+                const uint32_t b_m_start = b * ne11;
+                const uint32_t m_first = MAX(cur_m_start, b_m_start);
+                const uint32_t m_last  = MIN(cur_m_start + cur_m_rows, b_m_start + ne11);
+                if (m_first >= m_last) continue;
+
+                const uint32_t cur_b3 = fastdiv(b, &kparams->div_ne12);
+                const uint32_t cur_b2 = b - cur_b3 * ne12;
+                uint8_t * dst_batch_base = (uint8_t *) dst->data + (size_t) cur_b2 * nb2 + (size_t) cur_b3 * nb3;
+
+                const uint32_t chunk_m_offset = m_first - cur_m_start;
+                const uint32_t dst_m_offset   = m_first - b_m_start;
+                const uint32_t batch_nrows    = m_last - m_first;
+
+                uint32_t ir1 = 0;
+                for (; ir1 + 1 < batch_nrows; ir1 += 2) {
+                    const uint8_t * restrict src1_col0 = (const uint8_t *) (src1_data + (chunk_m_offset + ir1 + 0) * src1_stride);
+                    const uint8_t * restrict src1_col1 = (const uint8_t *) (src1_data + (chunk_m_offset + ir1 + 1) * src1_stride);
+                    float * restrict dst_row0 = (float *) (dst_batch_base + (dst_m_offset + ir1 + 0) * dst_row_size);
+                    float * restrict dst_row1 = (float *) (dst_batch_base + (dst_m_offset + ir1 + 1) * dst_row_size);
+                    mmctx->vec_dot_2x2(ne00, &dst_row0[ir0], &dst_row1[ir0], ss0, ss0 + src0_stride, src1_col0, src1_col1);
+                }
+                for (; ir1 < batch_nrows; ++ir1) {
+                    const uint8_t * restrict src1_col = (const uint8_t *) (src1_data + (chunk_m_offset + ir1) * src1_stride);
+                    float * restrict dst_row          = (float *) (dst_batch_base + (dst_m_offset + ir1) * dst_row_size);
+                    mmctx->vec_dot_2x1(ne00, &dst_row[ir0], ss0, ss0 + src0_stride, src1_col);
+                }
+            }
+            htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, ir0);
+
+            const int pr0 = (ir0 + n_prefetch);
+            const int is0 = (pr0 - src0_start_row) & prefetch_mask;
+            if (pr0 < src0_end_row_x2) {
+                dma_queue_push(dma_q, dma_make_data(vtcm_src0_ptr + is0 * src0_stride, src0_row + (size_t) pr0 * src0_row_size),
+                               src0_stride, src0_row_size, src0_row_size, 2);
+            }
+        }
+
+        if (src0_end_row != src0_end_row_x2) {
+            uint32_t ir0 = src0_end_row_x2;
+            const int is0 = (ir0 - src0_start_row) & prefetch_mask;
+            dma_queue_push(dma_q, dma_make_data(vtcm_src0_ptr + is0 * src0_stride, src0_row + (size_t) ir0 * src0_row_size),
+                           src0_stride, src0_row_size, src0_row_size, 1);
+            const uint8_t * ss0 = (void *) dma_queue_pop(dma_q).dst;
+
+            htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, ir0);
+            for (uint32_t b = b_grp_start; b < b_grp_end; b++) {
+                const uint32_t b_m_start = b * ne11;
+                const uint32_t m_first = MAX(cur_m_start, b_m_start);
+                const uint32_t m_last  = MIN(cur_m_start + cur_m_rows, b_m_start + ne11);
+                if (m_first >= m_last) continue;
+
+                const uint32_t cur_b3 = fastdiv(b, &kparams->div_ne12);
+                const uint32_t cur_b2 = b - cur_b3 * ne12;
+                uint8_t * dst_batch_base = (uint8_t *) dst->data + (size_t) cur_b2 * nb2 + (size_t) cur_b3 * nb3;
+
+                const uint32_t chunk_m_offset = m_first - cur_m_start;
+                const uint32_t dst_m_offset   = m_first - b_m_start;
+                const uint32_t batch_nrows    = m_last - m_first;
+
+                for (uint32_t ir1 = 0; ir1 < batch_nrows; ++ir1) {
+                    const uint8_t * restrict src1_col = (const uint8_t *) (src1_data + (chunk_m_offset + ir1) * src1_stride);
+                    float * restrict dst_row          = (float *) (dst_batch_base + (dst_m_offset + ir1) * dst_row_size);
+                    mmctx->vec_dot_1x1(ne00, &dst_row[ir0], ss0, src1_col);
+                }
+            }
+            htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, ir0);
+        }
+
+        b_grp_start = b_grp_end;
+    }
+
+    if (src2) {
+        hvx_tensor_add_f32_grid(dst, src2, cur_m_start, cur_m_start + cur_m_rows, src0_start_row, src0_end_row, &kparams->div_ne12_ne1, &kparams->div_ne1);
     }
 }
 
@@ -1368,13 +1578,6 @@ static int hvx_mm_matmul(struct htp_ops_context * octx) {
     mmctx->act = src1;
 
     const struct htp_mm_kernel_params * kparams = (const struct htp_mm_kernel_params *) octx->kernel_params;
-    if ((htp_matmul_has_extended_weight(octx, 1) || htp_tensor_is_extended(src1) || htp_tensor_is_extended(dst) || htp_tensor_is_extended(src2)) &&
-        (kparams->kernel_type == HTP_MM_KERNEL_HVX_F16_F16_DDR ||
-         kparams->kernel_type == HTP_MM_KERNEL_HVX_F16_F32_DDR ||
-         kparams->kernel_type == HTP_MM_KERNEL_HVX_F32_F32_DDR ||
-         kparams->kernel_type == HTP_MM_KERNEL_HVX_F32_F16_DDR)) {
-        return HTP_STATUS_NO_SUPPORT;
-    }
 
     const uint32_t src0_nrows = ne01;
     const uint32_t src1_nrows = ne11 * ne12 * ne13;
@@ -1421,7 +1624,23 @@ static int hvx_mm_matmul(struct htp_ops_context * octx) {
     worker_callback_t quant_task_func;
     worker_callback_t matmul_job_func;
     uint32_t n_quant_tasks = 1;
-    if (src1_nrows > 1) {
+    const bool is_batched = (ne12 > 1 || ne13 > 1 || ne02 > 1 || ne03 > 1);
+    if (is_batched) {
+        if (is_repacked) {
+            switch (src0->type) {
+                case HTP_TYPE_Q4_0:   matmul_job_func = hvx_mm_4d_repacked_q4_0;   break;
+                case HTP_TYPE_Q4_1:
+                case HTP_TYPE_Q4_K:   matmul_job_func = hvx_mm_4d_repacked_q4_1;   break;
+                case HTP_TYPE_Q8_0:   matmul_job_func = hvx_mm_4d_repacked_q8_0;   break;
+                case HTP_TYPE_Q6_K:   matmul_job_func = hvx_mm_4d_repacked_q6_k;   break;
+                case HTP_TYPE_IQ4_NL: matmul_job_func = hvx_mm_4d_repacked_iq4nl;  break;
+                case HTP_TYPE_MXFP4:  matmul_job_func = hvx_mm_4d_repacked_mxfp4;  break;
+                default:              return HTP_STATUS_NO_SUPPORT;
+            }
+        } else {
+            matmul_job_func = hvx_mm_4d;
+        }
+    } else if (src1_nrows > 1) {
         if (is_repacked) {
             switch (src0->type) {
                 case HTP_TYPE_Q4_0:   matmul_job_func = hvx_mm_2d_repacked_q4_0;   break;
@@ -1465,32 +1684,6 @@ static int hvx_mm_matmul(struct htp_ops_context * octx) {
             src1_row_size          = hex_round_up(ne10 * 2, 128);
             break;
 
-        case HTP_MM_KERNEL_HVX_F16_F32_DDR:
-            mmctx->type            = "f16-f32";
-            mmctx->vec_dot_1x1     = vec_dot_f16_f32_uu_1x1;
-            matmul_job_func        = hvx_mm_4d;
-            mmctx->mm_div_ne12_ne1 = kparams->div_ne12_ne1;
-            mmctx->mm_div_ne1      = kparams->div_ne1;
-            mmctx->mm_div_r2       = kparams->div_r2;
-            mmctx->mm_div_r3       = kparams->div_r3;
-            need_quant             = false;
-            quant_task_func        = NULL;
-            src1_row_size          = nb11;
-            break;
-
-        case HTP_MM_KERNEL_HVX_F16_F16_DDR:
-            mmctx->type            = "f16-f16";
-            mmctx->vec_dot_1x1     = vec_dot_f16_f16_uu_1x1;
-            matmul_job_func        = hvx_mm_4d;
-            mmctx->mm_div_ne12_ne1 = kparams->div_ne12_ne1;
-            mmctx->mm_div_ne1      = kparams->div_ne1;
-            mmctx->mm_div_r2       = kparams->div_r2;
-            mmctx->mm_div_r3       = kparams->div_r3;
-            src1_row_size          = nb11;
-            need_quant             = false;
-            quant_task_func        = NULL;
-            break;
-
         case HTP_MM_KERNEL_HVX_F32_F32_VTCM:
             quant_task_func        = quantize_f32_f32;
             mmctx->type            = "f32-f32";
@@ -1498,19 +1691,6 @@ static int hvx_mm_matmul(struct htp_ops_context * octx) {
             mmctx->vec_dot_2x1     = vec_dot_f32_f32_aa_2x1;
             mmctx->vec_dot_2x2     = vec_dot_f32_f32_aa_2x2;
             src1_row_size          = hex_round_up(ne10 * 4, 128);
-            break;
-
-        case HTP_MM_KERNEL_HVX_F32_F32_DDR:
-            quant_task_func        = NULL;
-            mmctx->type            = "f32-f32";
-            mmctx->vec_dot_1x1     = vec_dot_f32_f32_uu_1x1;
-            mmctx->mm_div_ne12_ne1 = kparams->div_ne12_ne1;
-            mmctx->mm_div_ne1      = kparams->div_ne1;
-            mmctx->mm_div_r2       = kparams->div_r2;
-            mmctx->mm_div_r3       = kparams->div_r3;
-            src1_row_size          = nb11;
-            need_quant             = false;
-            matmul_job_func        = hvx_mm_4d;
             break;
 
         case HTP_MM_KERNEL_HVX_QUANT_BLOCK:
@@ -1524,7 +1704,7 @@ static int hvx_mm_matmul(struct htp_ops_context * octx) {
             const uint32_t nb = (ne10 + qk - 1) / qk;
             const uint32_t total_nb = src1_nrows * nb;
 
-            if (src1_nrows < octx->n_threads) {
+            if (src1_nrows < octx->n_threads && !is_batched) {
                 n_quant_tasks = MIN(total_nb, octx->n_threads);
                 quant_task_func = (src0->type == HTP_TYPE_Q4_1 || src0->type == HTP_TYPE_Q4_K) ? quantize_f32_q8_1_tiled_block : quantize_f32_q8_0_tiled_block;
                 for (uint32_t ith = 0; ith < n_quant_tasks; ++ith) {
@@ -4005,7 +4185,7 @@ int op_matmul_id(struct htp_ops_context * octx) {
     mmctx->matrix_row_counts    = matrix_row_counts;
     mmctx->matrix_rows          = matrix_rows;
     mmctx->mapping_stride       = mapping_stride;
-    mmctx->mm_div_ne11          = kparams->div_ne11;
+    mmctx->mm_div_ne11          = kparams->div_ne1;
     mmctx->src0_row_size_padded = src0_row_size_padded;
     mmctx->src1_nrows           = src1_nrows;
     mmctx->cur_m_start          = 0;
@@ -4128,7 +4308,7 @@ int op_matmul_id_nx(struct htp_ops_context * octx) {
     mmctx->matrix_row_counts    = matrix_row_counts;
     mmctx->matrix_rows          = matrix_rows;
     mmctx->mapping_stride       = mapping_stride;
-    mmctx->mm_div_ne11          = kparams->div_ne11;
+    mmctx->mm_div_ne11          = kparams->div_ne1;
     mmctx->src0_row_size_padded = src0_row_size_padded;
     mmctx->src1_nrows           = src1_nrows;
     mmctx->cur_m_start          = 0;
