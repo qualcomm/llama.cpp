@@ -1317,33 +1317,105 @@ static inline void gdn_pack_d_t_row_tiles(
     }
 }
 
-static __attribute__((noinline)) void gdn_build_inv_l(
-    HVX_Vector * restrict rows_inv,
+static __attribute__((noinline)) void gdn_build_inv_l_blocks(
+    __fp16 * restrict inv_row_tiles,
     const HVX_Vector * restrict rows_kk,
     const __fp16 * restrict decay_m,
-    const float * restrict beta
+    const float * restrict beta,
+    __fp16 * restrict l10_tile,
+    __fp16 * restrict neg_a11_tile
 ) {
     const HVX_Vector v_one_f16 = hvx_vec_splat_f16(1.0f);
-    HVX_VectorAlias beta_f16;
-    HVX_VectorAlias row_m_f16;
-    beta_f16.v = hvx_vec_f32_to_f16(hvx_vmem(beta + 0), hvx_vmem(beta + 32));
+    const HVX_VectorPred q_mask64 = Q6_Q_vsetq2_R(64);
 
-    for (uint32_t t = 0; t < 64; ++t) {
-        HVX_Vector v_decay_m = hvx_vmem(decay_m + t * 64);
-        HVX_Vector v_scale_t = hvx_vec_splat_f16(beta_f16.fp16[t]);
-        HVX_Vector row_m     = hvx_vec_mul_f16_f16(hvx_vec_mul_f16_f16(rows_kk[t], v_decay_m), v_scale_t);
+    uint16_t beta_u16[64] __attribute__((aligned(128)));
+    uint16_t l00[32][32]  __attribute__((aligned(128)));
+    uint16_t l11[32][32]  __attribute__((aligned(128)));
 
-        row_m_f16.v = row_m;
+    HVX_Vector * restrict p_l00 = (HVX_Vector *) l00;
+    HVX_Vector * restrict p_l11 = (HVX_Vector *) l11;
+    HVX_Vector * restrict p_l10_tile = (HVX_Vector *) l10_tile;
 
-        HVX_Vector v_inv_t = Q6_V_vzero();
-        for (uint32_t k_idx = 0; k_idx < t; ++k_idx) {
-            HVX_Vector v_lk = hvx_vec_splat_f16(row_m_f16.fp16[k_idx]);
-            v_inv_t = hvx_vec_sub_f16_f16(v_inv_t, hvx_vec_mul_f16_f16(v_lk, rows_inv[k_idx]));
+    HVX_Vector * restrict tile00 = (HVX_Vector *) (inv_row_tiles + 0 * HMX_FP16_TILE_N_ELMS);
+    HVX_Vector * restrict tile01 = (HVX_Vector *) (inv_row_tiles + 1 * HMX_FP16_TILE_N_ELMS);
+    HVX_Vector * restrict tile11 = (HVX_Vector *) (inv_row_tiles + 3 * HMX_FP16_TILE_N_ELMS);
+    HVX_Vector * restrict p_neg_a11 = (HVX_Vector *) neg_a11_tile;
+
+    hvx_vmem(beta_u16) = hvx_vec_f32_to_f16(hvx_vmem(beta + 0), hvx_vmem(beta + 32));
+
+    for (uint32_t r = 0; r < 16; ++r) {
+        tile01[r] = Q6_V_vzero();
+    }
+
+    for (uint32_t r = 0; r < 16; ++r) {
+        uint32_t t0 = 2 * r;
+        uint32_t t1 = t0 + 1;
+
+        HVX_Vector v_d0 = hvx_vmem(decay_m + t0 * 64);
+        HVX_Vector v_d1 = hvx_vmem(decay_m + t1 * 64);
+        HVX_Vector v_b0 = Q6_Vh_vsplat_R(beta_u16[t0]);
+        HVX_Vector v_b1 = Q6_Vh_vsplat_R(beta_u16[t1]);
+
+        HVX_Vector r0 = hvx_vec_mul_f16_f16(hvx_vec_mul_f16_f16(rows_kk[t0], v_d0), v_b0);
+        HVX_Vector r1 = hvx_vec_mul_f16_f16(hvx_vec_mul_f16_f16(rows_kk[t1], v_d1), v_b1);
+
+        p_l00[r] = Q6_V_vmux_QVV(q_mask64, r0, Q6_V_vror_VR(r1, 64));
+    }
+
+    for (uint32_t r = 0; r < 16; ++r) {
+        uint32_t t0 = 32 + 2 * r;
+        uint32_t t1 = t0 + 1;
+
+        HVX_Vector v_d0 = hvx_vmem(decay_m + t0 * 64);
+        HVX_Vector v_d1 = hvx_vmem(decay_m + t1 * 64);
+        HVX_Vector v_b0 = Q6_Vh_vsplat_R(beta_u16[t0]);
+        HVX_Vector v_b1 = Q6_Vh_vsplat_R(beta_u16[t1]);
+
+        HVX_Vector r0 = hvx_vec_mul_f16_f16(hvx_vec_mul_f16_f16(rows_kk[t0], v_d0), v_b0);
+        HVX_Vector r1 = hvx_vec_mul_f16_f16(hvx_vec_mul_f16_f16(rows_kk[t1], v_d1), v_b1);
+
+        HVX_VectorPair vp_l10 = Q6_W_vshuff_VVR(r1, r0, -2);
+        p_l10_tile[r] = Q6_V_lo_W(vp_l10);
+        p_l11[r] = Q6_V_vmux_QVV(q_mask64, Q6_V_vror_VR(r0, 64), r1);
+    }
+
+    HVX_Vector a_rows[32];
+    for (uint32_t t = 0; t < 32; ++t) {
+        HVX_Vector v_inv = Q6_V_vzero();
+        for (uint32_t k = 0; k < t; ++k) {
+            HVX_Vector v_lk = Q6_Vh_vsplat_R(l00[t][k]);
+            v_inv = hvx_vec_sub_f16_f16(v_inv, hvx_vec_mul_f16_f16(v_lk, a_rows[k]));
         }
         HVX_VectorPred q_diag = (t == 0) ? Q6_Q_vsetq2_R(2) : Q6_Q_and_QQn(Q6_Q_vsetq2_R(2 * (t + 1)), Q6_Q_vsetq2_R(2 * t));
-        rows_inv[t] = Q6_V_vmux_QVV(q_diag, v_one_f16, v_inv_t);
+        a_rows[t] = Q6_V_vand_QV(q_mask64, Q6_V_vmux_QVV(q_diag, v_one_f16, v_inv));
+    }
+
+    for (uint32_t r = 0; r < 16; ++r) {
+        HVX_VectorPair vp = Q6_W_vshuff_VVR(a_rows[2 * r + 1], a_rows[2 * r + 0], -2);
+        tile00[r] = Q6_V_lo_W(vp);
+    }
+
+    for (uint32_t t = 0; t < 32; ++t) {
+        HVX_Vector v_inv = Q6_V_vzero();
+        for (uint32_t k = 0; k < t; ++k) {
+            HVX_Vector v_lk = Q6_Vh_vsplat_R(l11[t][k]);
+            v_inv = hvx_vec_sub_f16_f16(v_inv, hvx_vec_mul_f16_f16(v_lk, a_rows[k]));
+        }
+        HVX_VectorPred q_diag = (t == 0) ? Q6_Q_vsetq2_R(2) : Q6_Q_and_QQn(Q6_Q_vsetq2_R(2 * (t + 1)), Q6_Q_vsetq2_R(2 * t));
+        a_rows[t] = Q6_V_vand_QV(q_mask64, Q6_V_vmux_QVV(q_diag, v_one_f16, v_inv));
+    }
+
+    for (uint32_t r = 0; r < 16; ++r) {
+        HVX_VectorPair vp = Q6_W_vshuff_VVR(a_rows[2 * r + 1], a_rows[2 * r + 0], -2);
+        tile11[r] = Q6_V_lo_W(vp);
+
+        HVX_Vector n0 = hvx_vec_sub_f16_f16(Q6_V_vzero(), a_rows[2 * r + 0]);
+        HVX_Vector n1 = hvx_vec_sub_f16_f16(Q6_V_vzero(), a_rows[2 * r + 1]);
+        HVX_VectorPair vp_neg = Q6_W_vshuff_VVR(n1, n0, -2);
+        p_neg_a11[r] = Q6_V_lo_W(vp_neg);
     }
 }
+
 
 static inline void gdn_dma_push_chunk_inputs(
     dma_queue * dma_q,
@@ -1756,9 +1828,14 @@ static void gdn_hvx_phase2_worker(unsigned int n, unsigned int i, void * data) {
 
     gdn_unpack_64x64_tiles_to_vectors(head->rows_kk, head->kk_tiles);
 
-    gdn_build_inv_l(head->rows_inv, head->rows_kk, head->decay_m, head->b_f32[curr_buf]);
-
-    gdn_pack_64x64_vectors_to_tiles(head->inv_row_tiles, head->rows_inv);
+    gdn_build_inv_l_blocks(
+        head->inv_row_tiles,
+        head->rows_kk,
+        head->decay_m,
+        head->b_f32[curr_buf],
+        (__fp16 *) head->vtcm_m,
+        (__fp16 *) head->vtcm_m + HMX_FP16_TILE_N_ELMS
+    );
 
     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_GDN_SOLVE, info);
 }
@@ -1943,7 +2020,7 @@ static int gated_delta_net_f32_hmx_chunked(
     work_queue_t wp    = octx->ctx->work_queue;
 
     struct htp_gdn_head_ptrs heads[8];
-    struct htp_gdn_hmx_gemm_task gemm_tasks[8][7];
+    struct htp_gdn_hmx_gemm_task gemm_tasks[8][9];
 
     uint32_t n_batch = 1;
     for (uint32_t r = row_start; r < row_start + nrows; r += n_batch) {
@@ -2057,15 +2134,41 @@ static int gated_delta_net_f32_hmx_chunked(
                 hmx_queue_pop(hmx_q);
             }
 
+            for (uint32_t h = 0; h < n_batch; ++h) {
+                htp_gdn_push_hmx_gemm_task(
+                    hmx_q, &gemm_tasks[h][7],
+                    (__fp16 *) heads[h].vtcm_m,
+                    heads[h].inv_row_tiles + 0 * HMX_FP16_TILE_N_ELMS,
+                    (__fp16 *) heads[h].vtcm_tmp,
+                    1, 1, 1, vtcm_scales_1
+                );
+            }
+            for (uint32_t h = 0; h < n_batch; ++h) {
+                htp_gdn_push_hmx_gemm_task(
+                    hmx_q, &gemm_tasks[h][8],
+                    (__fp16 *) heads[h].vtcm_m + HMX_FP16_TILE_N_ELMS,
+                    (__fp16 *) heads[h].vtcm_tmp,
+                    heads[h].inv_row_tiles + 2 * HMX_FP16_TILE_N_ELMS,
+                    1, 1, 1, vtcm_scales_1
+                );
+            }
+
             work_queue_run(wp, gdn_hvx_phase3_worker, &bctx, n_batch);
+
+            for (uint32_t h = 0; h < n_batch; ++h) {
+                hmx_queue_pop(hmx_q);
+            }
+            for (uint32_t h = 0; h < n_batch; ++h) {
+                hmx_queue_pop(hmx_q);
+            }
+            for (uint32_t h = 0; h < n_batch; ++h) {
+                hmx_queue_pop(hmx_q);
+            }
 
             for (uint32_t h = 0; h < n_batch; ++h) {
                 htp_gdn_push_hmx_gemm_task(hmx_q, &gemm_tasks[h][4], heads[h].inv_row_tiles, heads[h].v_prime_col_tiles, heads[h].delta_tiles, 2, n_sv_tiles, 2, vtcm_scales_1);
             }
 
-            for (uint32_t h = 0; h < n_batch; ++h) {
-                hmx_queue_pop(hmx_q);
-            }
             for (uint32_t h = 0; h < n_batch; ++h) {
                 hmx_queue_pop(hmx_q);
             }
