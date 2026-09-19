@@ -35,7 +35,7 @@
 #define KQV_TN 32   // queries per workgroup, all owned by every lane
 #endif
 #ifndef KQV_NB
-#define KQV_NB 4    // 32-blocks of P staged per barrier
+#define KQV_NB 8    // 32-blocks of P staged per barrier
 #endif
 #define KQV_WG 64
 
