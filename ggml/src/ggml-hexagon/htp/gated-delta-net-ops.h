@@ -11,6 +11,7 @@
 
 #define HTP_GDN_MAX_SV     128
 #define HTP_GDN_CHUNK_SIZE 64
+#define HTP_GDN_MIN_TOKENS 8
 
 #ifndef HMX_FP16_TILE_SIZE
 #define HMX_FP16_TILE_SIZE 2048
@@ -132,7 +133,6 @@ struct htp_gdn_hmx_vtcm_layout {
     size_t off_rows_a;
 
     size_t off_thread_scratch;
-    size_t off_attn_rem;
     size_t off_scales_1;
 
     size_t state_f32_bytes;
@@ -251,7 +251,6 @@ static inline void htp_gdn_hmx_vtcm_layout_build(
 
     const size_t thread_scratch_sz = 64 * 128;
     VTCM_LAYOUT_ALLOC(off, off_thread_scratch, nth * thread_scratch_sz);
-    VTCM_LAYOUT_ALLOC(off, off_attn_rem,       nth * (128 * sizeof(float)));
     VTCM_LAYOUT_ALLOC(off, off_scales_1,       256);
 
     L->total_bytes = off;
