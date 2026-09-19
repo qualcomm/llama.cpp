@@ -30022,7 +30022,11 @@ static bool ggml_cl_flash_attn_decompose(
         const char * e = getenv("GGML_OPENCL_FA_KQV_INT8");
         return !e || !e[0] || atoi(e) != 0;
     }();
-    const bool kqv_int8_possible = kqv_int8_env && (n_kv % 32 == 0) && (dv % 64 == 0) &&
+    static const bool defer_norm_env = []{
+        const char * e = getenv("GGML_OPENCL_FA_SOFTMAX_DEFER_NORM");
+        return (e && e[0]) ? atoi(e) != 0 : true;
+    }();
+    const bool kqv_int8_possible = kqv_int8_env && defer_norm_env && (n_kv % 32 == 0) && (dv % 64 == 0) &&
                                    n_head_kv > 0 && mask != nullptr &&
                                    backend_ctx->kernel_fa_v_transpose_q8 != nullptr;
     const bool gqa_group = n_head_kv > 0 && n_head % n_head_kv == 0 && n_head / n_head_kv >= 2;
@@ -30199,14 +30203,15 @@ static bool ggml_cl_flash_attn_decompose(
     // NOT ggml_cl_env_flag: that treats any non-empty value as true, so "=0" would enable
     // the path rather than disable it. An A/B run with the off arm set to "0" silently
     // compared this path against itself.
-    static const bool defer_norm_env = []{
-        const char * e = getenv("GGML_OPENCL_FA_SOFTMAX_DEFER_NORM");
-        return (e && e[0]) ? atoi(e) != 0 : true;
-    }();
     // The int8 GEMM reads P from the deferred-norm softmax variant, so it needs that variant to
     // have run: with GGML_OPENCL_FA_SOFTMAX_DEFER_NORM=0 the plain kernel runs and P is never
     // written.
-    const bool kqv_int8 = kqv_int8_env && defer_norm_env && (n_kv % 32 == 0) && dv == kqv_m && n_head_kv > 0 &&
+    // Generations the int8 path is verified on: X2-90 (X2E) and Adreno 840 (A8X). On the X1-85
+    // (X1E) the path computes its own cases correctly but later flash-attention cases that use a
+    // sinks tensor fail once it has run, and the cause is not yet localised; it stays off there.
+    const bool kqv_int8_gen = backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E ||
+                              backend_ctx->adreno_gen == ADRENO_GPU_GEN::A8X;
+    const bool kqv_int8 = kqv_int8_env && defer_norm_env && kqv_int8_gen && (n_kv % 32 == 0) && dv == kqv_m && n_head_kv > 0 &&
                           mask != nullptr &&
                           backend_ctx->kernel_fa_v_transpose_q8 != nullptr;
     if (kqv_int8_set || kqv_int8) {
