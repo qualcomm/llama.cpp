@@ -1333,7 +1333,7 @@ struct ggml_backend_opencl_context {
     int fa_kq_mb = 8;     // 64-row kv blocks per int8 KQ workgroup, matches the kernel's KQ_MB
     cl_kernel kernel_fa_v_transpose_q8 = nullptr;
     int fa_kqv_tn = 32;   // queries per int8 KQV workgroup, matches the kernel's KQV_TN
-    int fa_kqv_nb = 4;    // P blocks per barrier in the int8 KQV
+    int fa_kqv_nb = 8;    // P blocks per barrier in the int8 KQV
     ggml_opencl_fa_kernels fa;
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
     ggml_cl_adreno_xmem_attn_state adreno_xmem_attn;
@@ -7676,7 +7676,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             return (v >= lo && v <= hi && (v & (v - 1)) == 0) ? v : def;
         };
         backend_ctx->fa_kqv_tn = env_pow2("GGML_OPENCL_FA_KQV_TN", 32, 8, 64);
-        backend_ctx->fa_kqv_nb = env_pow2("GGML_OPENCL_FA_KQV_NB", 4, 1, 16);
+        backend_ctx->fa_kqv_nb = env_pow2("GGML_OPENCL_FA_KQV_NB", 8, 1, 16);
         const std::string kqv_opts = compile_opts +
             " -DKQV_TN=" + std::to_string(backend_ctx->fa_kqv_tn) +
             " -DKQV_NB=" + std::to_string(backend_ctx->fa_kqv_nb);
