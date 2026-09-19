@@ -30256,12 +30256,21 @@ static bool ggml_cl_flash_attn_decompose(
         const char * e = getenv("GGML_OPENCL_FA_KQ_P8");
         return !e || !e[0] || atoi(e) != 0;
     }();
-    static const bool kq_int8_env_pre = []{
+    // int8 KQ: GGML_OPENCL_FA_KQ_INT8 unset = int8 whenever its fused-softmax kernel can take
+    // the shape (head size <= 256 and a multiple of 32), "0" = f16, non-zero = int8 also on the
+    // separate (non-fused) path, which is slower than the f16 image kernel at depth and exists
+    // for A/B only. The int8 kernel is chosen only together with the fused epilogue by default:
+    // without it the f32 score write is what made it lose.
+    static const int kq_int8_env_val = []{
         const char * e = getenv("GGML_OPENCL_FA_KQ_INT8");
-        return e && e[0] && atoi(e) != 0;
+        if (!e || !e[0]) return -1;
+        return atoi(e) != 0 ? 1 : 0;
     }();
+    const bool kq_p8_int8_shape = backend_ctx->kernel_mul_mm_q8_kq_p8 != nullptr && (dk % 32 == 0) && dk <= 256;
+    const bool kq_int8_env_pre = kq_int8_env_val == 1 ||
+                                 (kq_int8_env_val == -1 && kq_p8_env && kqv_int8_possible && kq_p8_int8_shape);
     const bool kq_p8_possible = kq_p8_env && kqv_int8_possible &&
-        (kq_int8_env_pre ? (backend_ctx->kernel_mul_mm_q8_kq_p8 != nullptr && (dk % 32 == 0) && dk <= 256)
+        (kq_int8_env_pre ? kq_p8_int8_shape
                          : backend_ctx->kernel_mul_mm_f16_f32_kq_p8 != nullptr) &&
         backend_ctx->kernel_fa_p8_fixup != nullptr &&
         (n_kv % 64 == 0) && dk >= 16 && (dk % 16 == 0) && n_head % n_head_kv == 0 &&
@@ -30484,12 +30493,9 @@ static bool ggml_cl_flash_attn_decompose(
 
     // int8 KQ: K quantised once per call, the Q chunk once per chunk, both along dk. The kernel
     // sizes its local memory for dk <= 256; larger heads keep the f16 GEMM.
-    static const bool kq_int8_env = []{
-        const char * e = getenv("GGML_OPENCL_FA_KQ_INT8");
-        return e && e[0] && atoi(e) != 0;
-    }();
+    const bool kq_int8_env = kq_int8_env_pre;
     const bool kq_int8 = kq_int8_env && (dk % 32 == 0) && dk <= 256 && n_head_kv > 0;
-    if (kq_int8_env) {
+    if (kq_int8_env_val != -1 || kq_int8) {
         static bool said = false;
         if (!said) {
             said = true;
