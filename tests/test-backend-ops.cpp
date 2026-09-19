@@ -11012,6 +11012,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // cache-layout prefill cases: K, V and Q permuted the way llama.cpp's KV cache
+    // presents them to the op (head stride inside the row: [dk, n_kv, n_head_kv] with
+    // nb[2] < nb[1], rows packed), n_q >= 64 and a 64-aligned n_kv. The sweep above
+    // builds every operand contiguous per head, and its permuted "view" variant doubles
+    // the head dimension of the backing tensor, so the rows are never packed; the
+    // dedicated prefill KQ/KQV GEMM kernels of the OpenCL Adreno backend accept only
+    // packed rows and no case reached them. Direct tensors (kv_view = false) give the
+    // packed layout. GQA 8 at head size 256 is the Qwen3.5-35B-A3B shape, GQA 4 at 128
+    // the Qwen3-30B-A3B one.
+    for (int kv : { 1024, 2048, }) {
+        for (int nb : { 64, 75, 256, }) {
+            for (bool sinks : { false, true, }) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, kv, nb, true, sinks, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false));
+                test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {4, 1}, kv, nb, true, sinks, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false));
+            }
+        }
+    }
+
     // verify-shaped cases: a handful of queries against a deep cache. This is
     // what speculative/MTP verification and multi-slot serving (-np 2..8) hand
     // the FA op, and it fell between the sweep above (kv <= 1024) and the
