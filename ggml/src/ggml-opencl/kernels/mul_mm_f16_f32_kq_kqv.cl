@@ -189,7 +189,7 @@ inline void mm_store_c_N(
 // scale + mask, quantises each 32-row block of a query column to u8 against the
 // BLOCK maximum, and writes that block's max and sum of exp(s - blockmax) to two
 // side arrays. kernel_fa_p8_fixup (softmax_4_f16.cl) then turns those into the
-// per-block half scale exp(blockmax - rowmax)/255 and the deferred-norm row sum.
+// per-block f32 scale exp(blockmax - rowmax)/255 and the deferred-norm row sum.
 // This is exactly the value kernel_soft_max_4_f16_q8 produces (its per-block scale
 // is amax/255 with amax = exp(blockmax - rowmax)), so the u8 P and the scales are
 // the same numbers, but the f32 score matrix never touches memory: the softmax's
