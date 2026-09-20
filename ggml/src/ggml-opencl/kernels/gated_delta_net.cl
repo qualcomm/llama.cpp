@@ -122,7 +122,11 @@ kernel void kernel_gated_delta_net(
         uint  H_k,
         uint  rq3,
         float scale,
-        uint K) {
+        uint K,
+        // First token to process. The chunked prefill path (gated_delta_net_chunk.cl)
+        // takes the leading whole chunks and hands the state over through state_buf;
+        // this kernel then finishes tokens t0..n_tokens-1 and writes the snapshots.
+        uint t0) {
 
     global const float * data_q     = (global const float *)(q_buf     + off_q);
     global const float * data_k     = (global const float *)(k_buf     + off_k);
@@ -172,9 +176,9 @@ kernel void kernel_gated_delta_net(
         }
     }
 
-    uint attn_off = (seq_id * n_tokens * H_v + head_id) * S_V;
+    uint attn_off = (seq_id * n_tokens * H_v + head_id) * S_V + t0 * S_V * H_v;
 
-    for (uint t = 0; t < n_tokens; t++) {
+    for (uint t = t0; t < n_tokens; t++) {
         const uint  q_off    = q_off_base + t * sq2;
         const uint  k_off    = q_off;
         const uint  v_off    = v_off_base + t * sv2;
