@@ -597,7 +597,7 @@ static void rope_job_f32(unsigned int nth, unsigned int ith, void * data) {
                     const uint32_t pnr = MIN(nrows - pr, HTP_ROPE_SPAD_BLOCK);
                     const uint32_t slot = (cur_slot + pr / HTP_ROPE_SPAD_BLOCK) % HTP_ROPE_SPAD_NSLOTS;
                     uint8_t * spad_slot = rope_spad_slot(src0_spad_base, slot, rctx->src0_row_size_aligned);
-                    const dma_addr_t src0_data = src0->data + (dma_addr_t) i3 * nb03 + (dma_addr_t) i2 * nb02 + (dma_addr_t) (i1 + pr) * nb01;
+                    const dma_addr_t src0_data = src0->data + i3 * nb03 + i2 * nb02 + (i1 + pr) * nb01;
 
                     // Dummy DMA transaction for sequencing (interleaving wr, rd, wr, rd, ...)
                     dma_queue_push(dma_q, dma_make_data(dst->data, spad_slot), 0, 0, 0, 0);
@@ -660,7 +660,7 @@ static void rope_job_f32(unsigned int nth, unsigned int ith, void * data) {
                     }
                     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, cur_ir);
 
-                    const dma_addr_t dst_data = dst->data + (dma_addr_t) i3 * nb3 + (dma_addr_t) i2 * nb2 + (dma_addr_t) cur_i1 * nb1;
+                    const dma_addr_t dst_data = dst->data + i3 * nb3 + i2 * nb2 + cur_i1 * nb1;
                     dma_queue_push(dma_q, dma_make_data(dst_data, cur_spad),
                         rctx->dst_row_stride, rctx->src0_row_size_aligned, rctx->dst_row_size, cnr);
 
@@ -670,7 +670,7 @@ static void rope_job_f32(unsigned int nth, unsigned int ith, void * data) {
                         const uint32_t pnr    = MIN(nrows - p_cr, HTP_ROPE_SPAD_BLOCK);
                         const uint32_t p_slot = (cur_slot + p_cr / HTP_ROPE_SPAD_BLOCK) % HTP_ROPE_SPAD_NSLOTS;
                         uint8_t * p_spad      = rope_spad_slot(src0_spad_base, p_slot, rctx->src0_row_size_aligned);
-                        const dma_addr_t p_src0_data = src0->data + (dma_addr_t) i3 * nb03 + (dma_addr_t) i2 * nb02 + (dma_addr_t) (base_i1 + p_cr) * nb01;
+                        const dma_addr_t p_src0_data = src0->data + i3 * nb03 + i2 * nb02 + (base_i1 + p_cr) * nb01;
 
                         dma_queue_push(dma_q, dma_make_data(p_spad, p_src0_data),
                             rctx->src0_row_size_aligned, rctx->src0_row_stride, rctx->src0_row_size, pnr);

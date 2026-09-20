@@ -133,8 +133,8 @@ bool dma_queue_push_fallback_2d(dma_queue * q, dma_data ddata, size_t dst_stride
             dma_ring_flush(r1);
             dma_ring_push_single_2d(r1, cur_data, dst_stride, src_stride, row_size, cur_rows);
         }
-        cur_dst  += (dma_addr_t) cur_rows * dst_stride;
-        cur_src  += (dma_addr_t) cur_rows * src_stride;
+        cur_dst  += cur_rows * dst_stride;
+        cur_src  += cur_rows * src_stride;
         rem_rows -= cur_rows;
     }
 

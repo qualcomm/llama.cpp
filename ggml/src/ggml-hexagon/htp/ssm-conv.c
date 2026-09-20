@@ -224,7 +224,7 @@ static void ssm_conv_thread_f32_decode(unsigned int nth, unsigned int ith, void 
     struct htp_thread_trace * tr = &octx->ctx->trace[ith];
 
     // 1. Fetch weights src1 from DDR into VTCM via DMA (DMA64-safe)
-    const dma_addr_t src1_ddr = src1->data + (dma_addr_t) ir0 * d_conv * sizeof(float);
+    const dma_addr_t src1_ddr = src1->data + ir0 * d_conv * sizeof(float);
     dma_queue_push(dma_q, dma_make_data((uint8_t *) src1_raw, src1_ddr), weight_bytes, weight_bytes, weight_bytes, 1);
     dma_queue_pop(dma_q);
 
@@ -238,7 +238,7 @@ static void ssm_conv_thread_f32_decode(unsigned int nth, unsigned int ith, void 
 
     // 3. Process each sequence
     for (uint32_t s = 0; s < n_s; ++s) {
-        const dma_addr_t src0_ddr = src0->data + (dma_addr_t) s * src0_stride_seq_bytes + (dma_addr_t) ir0 * d_conv * sizeof(float);
+        const dma_addr_t src0_ddr = src0->data + s * src0_stride_seq_bytes + ir0 * d_conv * sizeof(float);
         dma_queue_push(dma_q, dma_make_data((uint8_t *) src0_raw, src0_ddr), input_bytes, input_bytes, input_bytes, 1);
         dma_queue_pop(dma_q);
 
@@ -262,7 +262,7 @@ static void ssm_conv_thread_f32_decode(unsigned int nth, unsigned int ith, void 
         }
         htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) s);
 
-        const dma_addr_t dst_ddr = dst->data + (dma_addr_t) s * dst_stride_seq_bytes + (dma_addr_t) ir0 * sizeof(float);
+        const dma_addr_t dst_ddr = dst->data + s * dst_stride_seq_bytes + ir0 * sizeof(float);
         dma_queue_push(dma_q, dma_make_data(dst_ddr, (uint8_t *) dst_spad), output_bytes, output_bytes, output_bytes, 1);
         dma_queue_pop(dma_q);
     }
@@ -327,7 +327,7 @@ static void ssm_conv_thread_f32_prefill(unsigned int nth, unsigned int ith, void
     struct htp_thread_trace * tr = &octx->ctx->trace[ith];
 
     // 1. Fetch weights src1 from DDR into VTCM via DMA (DMA64-safe)
-    const dma_addr_t src1_ddr = src1->data + (dma_addr_t) ir0 * d_conv * sizeof(float);
+    const dma_addr_t src1_ddr = src1->data + ir0 * d_conv * sizeof(float);
     dma_queue_push(dma_q, dma_make_data((uint8_t *) src1_raw, src1_ddr), weight_bytes, weight_bytes, weight_bytes, 1);
     dma_queue_pop(dma_q);
 
@@ -344,8 +344,8 @@ static void ssm_conv_thread_f32_prefill(unsigned int nth, unsigned int ith, void
 
             // Fetch src0 chunk from DDR to VTCM via 2D DMA
             const dma_addr_t src0_tile_ddr = src0->data +
-                (dma_addr_t) i3 * src0_stride_seq_bytes +
-                (dma_addr_t) (ir0 + tile_off) * src0_stride_inner_bytes;
+                i3 * src0_stride_seq_bytes +
+                (ir0 + tile_off) * src0_stride_inner_bytes;
             const size_t row_bytes = ncs * sizeof(float);
 
             dma_queue_push(dma_q, dma_make_data((uint8_t *) src0_tile_raw, src0_tile_ddr),
@@ -384,8 +384,8 @@ static void ssm_conv_thread_f32_prefill(unsigned int nth, unsigned int ith, void
 
             // Writeback dst_tile from VTCM to DDR via 2D DMA
             const dma_addr_t dst_tile_ddr = dst->data +
-                (dma_addr_t) i3 * dst_stride_seq_bytes +
-                (dma_addr_t) (ir0 + tile_off) * sizeof(float);
+                i3 * dst_stride_seq_bytes +
+                (ir0 + tile_off) * sizeof(float);
             const size_t dst_row_bytes = tile_n * sizeof(float);
 
             dma_queue_push(dma_q, dma_make_data(dst_tile_ddr, (uint8_t *) dst_tile),

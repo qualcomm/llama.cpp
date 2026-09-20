@@ -342,13 +342,13 @@ static void softmax_thread_dma(unsigned int nth, unsigned int ith, void * data) 
         compute(d_spad, s_spad, NULL, ne00, smctx->scale, 1.0f);
         htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, r);
 
-        dma_addr_t cur_dst = data_dst + (dma_addr_t) r * dst_row_size;
+        dma_addr_t cur_dst = data_dst + r * dst_row_size;
         dma_queue_push(dma_q, dma_make_data(cur_dst, d_spad),
                        dst_row_size, smctx->dst_row_size_aligned, dst_row_size, 1);
 
         const uint32_t next_r = r + 2;
         if (next_r < src0_end_row) {
-            dma_addr_t next_src0 = data_src0 + (dma_addr_t) next_r * src0_row_size;
+            dma_addr_t next_src0 = data_src0 + next_r * src0_row_size;
             dma_queue_push(dma_q, dma_make_data(s_spad, next_src0),
                            smctx->src0_row_size_aligned, src0_row_size, src0_row_size, 1);
         }
@@ -411,8 +411,8 @@ static void softmax_thread_mask_dma(unsigned int nth, unsigned int ith, void * d
     dma_queue * dma_q = octx->ctx->dma[ith];
 
     for (uint32_t r = src0_start_row, idx = 0; r < src0_end_row && idx < 2; r++, idx++) {
-        dma_addr_t cur_dst  = data_dst  + (dma_addr_t) r * dst_row_size;
-        dma_addr_t cur_src0 = data_src0 + (dma_addr_t) r * src0_row_size;
+        dma_addr_t cur_dst  = data_dst  + r * dst_row_size;
+        dma_addr_t cur_src0 = data_src0 + r * src0_row_size;
 
         uint32_t i1 = fastmodulo(r, ne01, div_ne01);
         uint32_t r_div_ne01 = fastdiv(r, div_ne01);
@@ -420,7 +420,7 @@ static void softmax_thread_mask_dma(unsigned int nth, unsigned int ith, void * d
         uint32_t i3 = fastdiv(r_div_ne01, div_ne02);
         uint32_t i12 = (ne12 == ne02) ? i2 : fastmodulo(i2, ne12, div_ne12);
         uint32_t i13 = (ne13 == ne03) ? i3 : fastmodulo(i3, ne13, div_ne13);
-        dma_addr_t cur_src1 = data_src1 + (dma_addr_t) i1 * nb11 + (dma_addr_t) i12 * nb12 + (dma_addr_t) i13 * nb13;
+        dma_addr_t cur_src1 = data_src1 + i1 * nb11 + i12 * nb12 + i13 * nb13;
 
         void * d_spad = dst_vtcm_base  + idx * dst_vtcm_half;
         void * s_spad = src0_vtcm_base + idx * src0_vtcm_half;
@@ -457,13 +457,13 @@ static void softmax_thread_mask_dma(unsigned int nth, unsigned int ith, void * d
         compute(d_spad, s_spad, m_spad, ne00, smctx->scale, slope);
         htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, r);
 
-        dma_addr_t cur_dst = data_dst + (dma_addr_t) r * dst_row_size;
+        dma_addr_t cur_dst = data_dst + r * dst_row_size;
         dma_queue_push(dma_q, dma_make_data(cur_dst, d_spad),
                        dst_row_size, smctx->dst_row_size_aligned, dst_row_size, 1);
 
         const uint32_t next_r = r + 2;
         if (next_r < src0_end_row) {
-            dma_addr_t next_src0 = data_src0 + (dma_addr_t) next_r * src0_row_size;
+            dma_addr_t next_src0 = data_src0 + next_r * src0_row_size;
 
             uint32_t ni1 = fastmodulo(next_r, ne01, div_ne01);
             uint32_t nr_div_ne01 = fastdiv(next_r, div_ne01);
@@ -471,7 +471,7 @@ static void softmax_thread_mask_dma(unsigned int nth, unsigned int ith, void * d
             uint32_t ni3 = fastdiv(nr_div_ne01, div_ne02);
             uint32_t ni12 = (ne12 == ne02) ? ni2 : fastmodulo(ni2, ne12, div_ne12);
             uint32_t ni13 = (ne13 == ne03) ? ni3 : fastmodulo(ni3, ne13, div_ne13);
-            dma_addr_t next_src1 = data_src1 + (dma_addr_t) ni1 * nb11 + (dma_addr_t) ni12 * nb12 + (dma_addr_t) ni13 * nb13;
+            dma_addr_t next_src1 = data_src1 + ni1 * nb11 + ni12 * nb12 + ni13 * nb13;
 
             dma_queue_push(dma_q, dma_make_data(s_spad, next_src0),
                            smctx->src0_row_size_aligned, src0_row_size, src0_row_size, 1);

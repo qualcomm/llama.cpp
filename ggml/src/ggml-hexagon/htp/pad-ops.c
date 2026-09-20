@@ -55,9 +55,9 @@ static inline dma_addr_t pad_src_row_data(const struct htp_tensor * src,
                                           uint32_t i1, uint32_t i2, uint32_t i3,
                                           int32_t lp1, int32_t lp2, int32_t lp3) {
     return src->data
-        + (dma_addr_t)(i1 - (uint32_t)lp1) * src->nb[1]
-        + (dma_addr_t)(i2 - (uint32_t)lp2) * src->nb[2]
-        + (dma_addr_t)(i3 - (uint32_t)lp3) * src->nb[3];
+        + (i1 - (uint32_t)lp1) * src->nb[1]
+        + (i2 - (uint32_t)lp2) * src->nb[2]
+        + (i3 - (uint32_t)lp3) * src->nb[3];
 }
 
 /* Compute the DDR src row pointer for a circular row (wrap-around indexing) */
@@ -74,9 +74,9 @@ static inline dma_addr_t pad_circ_src_row_data(const struct htp_tensor * src,
                                                uint32_t i1, uint32_t i2, uint32_t i3,
                                                int32_t lp1, int32_t lp2, int32_t lp3) {
     return src->data
-        + (dma_addr_t)wrap_around((int32_t)i1 - lp1, src->ne[1]) * src->nb[1]
-        + (dma_addr_t)wrap_around((int32_t)i2 - lp2, src->ne[2]) * src->nb[2]
-        + (dma_addr_t)wrap_around((int32_t)i3 - lp3, src->ne[3]) * src->nb[3];
+        + wrap_around((int32_t)i1 - lp1, src->ne[1]) * src->nb[1]
+        + wrap_around((int32_t)i2 - lp2, src->ne[2]) * src->nb[2]
+        + wrap_around((int32_t)i3 - lp3, src->ne[3]) * src->nb[3];
 }
 
 struct htp_pad_context {
