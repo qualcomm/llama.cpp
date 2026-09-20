@@ -234,7 +234,8 @@ __kernel void flash_attn_v_transpose_q8(
     const int n_head_kv,
     const ulong v_nb1,
     const ulong v_nb2,
-    const ulong v_nb3
+    const ulong v_nb3,
+    const int kv_pitch                  // bytes per V^T row, >= n_kv, multiple of 32
 ) {
     __local half tile[FA_VT_TILE][FA_VT_TILE + 1];
 
@@ -262,14 +263,14 @@ __kernel void flash_attn_v_transpose_q8(
     barrier(CLK_LOCAL_MEM_FENCE);
 
     const int lid  = ly * FA_VT_TILE + lx;
-    const int nblk = n_kv / FA_VT_TILE;
+    const int nblk = kv_pitch / FA_VT_TILE;
 
     if (lid < FA_VT_TILE) {
         const int d = d0 + lid;
         if (d < dv) {
             const ulong hbase = ((ulong) batch_idx * (ulong) n_head_kv + (ulong) head_kv_idx);
 
-            global char * qrow = (global char *) vt_q_void + hbase*(ulong)n_kv*(ulong)dv + (ulong) d * (ulong) n_kv;
+            global char * qrow = (global char *) vt_q_void + hbase*(ulong)kv_pitch*(ulong)dv + (ulong) d * (ulong) kv_pitch;
             global half * drow = (global half *) vt_d_void + hbase*(ulong)nblk*(ulong)dv + (ulong) d * (ulong) nblk;
 
             float v[FA_VT_TILE];

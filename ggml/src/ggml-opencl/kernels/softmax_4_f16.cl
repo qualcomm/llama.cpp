@@ -250,6 +250,7 @@ kernel void kernel_soft_max_4_f16_q8(
         ulong offset_qp,
         global half * dp,
         ulong offset_dp,
+        int qp_pitch,               // bytes per P row, >= ne00, multiple of 32
         global float * psums,
         ulong offset_sums,
         global char * src0,
@@ -322,8 +323,8 @@ kernel void kernel_soft_max_4_f16_q8(
     const int nblk = ne00 / 32;
     const uint row  = (uint)(i03*get_num_groups(1)*get_num_groups(0) + i02*get_num_groups(0) + i01);
 
-    global uchar * qrow = (global uchar *)((global char *)qp + offset_qp) + (size_t)row*ne00;
-    global half  * drow = (global half  *)((global char *)dp + offset_dp) + (size_t)row*nblk;
+    global uchar * qrow = (global uchar *)((global char *)qp + offset_qp) + (size_t)row*qp_pitch;
+    global half  * drow = (global half  *)((global char *)dp + offset_dp) + (size_t)row*(qp_pitch/32);
 
     float lsum = 0.0f;
     for (int b = get_local_id(0); b < nblk; b += get_local_size(0)) {
@@ -381,14 +382,15 @@ kernel void kernel_fa_p8_fixup(
         ulong offset_sinks,
         int has_sinks,
         int nblk,
+        int row_blk,                // blocks per row of bmax/bsum/dp (the padded pitch), >= nblk
         int N
 ) {
     const int n    = get_group_id(0);
     const int head = get_group_id(1);
     const uint row = (uint)head*(uint)N + (uint)n;
-    global float * bm = bmax + (size_t)row*nblk;
-    global float * bs = bsum + (size_t)row*nblk;
-    global half  * dr = dp   + (size_t)row*nblk;
+    global float * bm = bmax + (size_t)row*row_blk;
+    global float * bs = bsum + (size_t)row*row_blk;
+    global half  * dr = dp   + (size_t)row*row_blk;
 
     float lmax = -INFINITY;
     for (int b = get_local_id(0); b < nblk; b += get_local_size(0)) {
