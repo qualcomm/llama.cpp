@@ -30242,7 +30242,14 @@ static bool ggml_cl_flash_attn_decompose(
         const char * e = getenv("GGML_OPENCL_FA_SOFTMAX_DEFER_NORM");
         return (e && e[0]) ? atoi(e) != 0 : true;
     }();
-    const bool kqv_int8_possible = kqv_int8_env && defer_norm_env && (n_kv % 32 == 0) && (dv % 64 == 0) &&
+    // Generations the int8 path is verified on: X2-90 (X2E) and Adreno 840 (A8X). On the X1-85
+    // (X1E) later flash-attention cases with a sinks tensor fail after it has run; not localised.
+    // The allow-list sits in this first decision because the fused-softmax gate, the int8 KQ
+    // default and the dk=64 floor all build on it: a generation admitted here and declined later
+    // trips the gate mismatch below and drops the decomposed prefill to the fused tile.
+    const bool kqv_int8_gen = backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E ||
+                              backend_ctx->adreno_gen == ADRENO_GPU_GEN::A8X;
+    const bool kqv_int8_possible = kqv_int8_env && defer_norm_env && kqv_int8_gen && (n_kv % 32 == 0) && (dv % 64 == 0) &&
                                    n_head_kv > 0 && mask != nullptr &&
                                    backend_ctx->kernel_fa_v_transpose_q8 != nullptr;
     // Fused KQ+softmax (mul_mm_f16_f32_kq_p8): the KQ GEMM writes the u8 P and the
@@ -30477,15 +30484,9 @@ static bool ggml_cl_flash_attn_decompose(
     // compared this path against itself.
     // The int8 GEMM reads P from the deferred-norm softmax variant, so it needs that variant to
     // have run: with GGML_OPENCL_FA_SOFTMAX_DEFER_NORM=0 the plain kernel runs and P is never
-    // written.
-    // Generations the int8 path is verified on: X2-90 (X2E) and Adreno 840 (A8X). On the X1-85
-    // (X1E) the path computes its own cases correctly but later flash-attention cases that use a
-    // sinks tensor fail once it has run, and the cause is not yet localised; it stays off there.
-    const bool kqv_int8_gen = backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E ||
-                              backend_ctx->adreno_gen == ADRENO_GPU_GEN::A8X;
-    const bool kqv_int8 = kqv_int8_env && defer_norm_env && kqv_int8_gen && (n_kv % 32 == 0) && dv == kqv_m && n_head_kv > 0 &&
-                          mask != nullptr &&
-                          backend_ctx->kernel_fa_v_transpose_q8 != nullptr;
+    // written. kqv_int8_possible above carries every condition, including the generation
+    // allow-list; dv == kqv_m restates its dv % 64 test against the padded row count.
+    const bool kqv_int8 = kqv_int8_possible && dv == kqv_m;
     if (kqv_int8_set || kqv_int8) {
         // Report once why the path did or did not take: four conditions, and a silent decline
         // is indistinguishable from a kernel that ran and did nothing.
