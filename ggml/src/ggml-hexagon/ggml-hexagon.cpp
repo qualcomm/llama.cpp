@@ -5016,8 +5016,13 @@ static void ggml_hexagon_precompute_softmax_params(
     kparams->src0_spad_half_size       = (uint32_t) layout.src0_spad_half_size;
     kparams->src1_spad_half_size       = (uint32_t) layout.src1_spad_half_size;
     kparams->dst_spad_half_size        = (uint32_t) layout.dst_spad_half_size;
-
-    kparams->opt_path = (ne00 % 32 == 0) ? 1 : 0;
+    if (!kparams->use_src1) {
+        kparams->kernel_id = HTP_SOFTMAX_KERNEL_NOMASK;
+    } else if (kparams->use_f16) {
+        kparams->kernel_id = HTP_SOFTMAX_KERNEL_MASK_F16;
+    } else {
+        kparams->kernel_id = HTP_SOFTMAX_KERNEL_MASK_F32;
+    }
 
     if (src0->ne[1] > 0) kparams->div_ne01 = init_fastdiv_values(src0->ne[1]);
     if (src0->ne[2] > 0) kparams->div_ne02 = init_fastdiv_values(src0->ne[2]);
@@ -5633,6 +5638,10 @@ static bool ggml_hexagon_supported_softmax(const struct ggml_hexagon_session * s
         return false;
     }
     if (dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    if (src0->ne[2] > 512) {
         return false;
     }
 

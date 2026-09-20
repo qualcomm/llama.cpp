@@ -17,6 +17,7 @@
 #include "htp/allreduce-ops.h"
 #include "htp/ssm-conv.h"
 #include "htp/gated-delta-net-ops.h"
+#include "htp/softmax-ops.h"
 
 struct htp_opnode {
     ggml_tensor * node   { nullptr };
@@ -351,6 +352,9 @@ struct htp_opformat {
         } else if (node.opcode == HTP_OP_SSM_CONV) {
             const auto * kparams = (const struct htp_ssm_conv_kernel_params *) node.kernel_params;
             snprintf(str, max_size, "%s vtcm %d", kparams->n_t == 1 ? "decode" : "prefill", (int) kparams->vtcm_size);
+        } else if (node.opcode == HTP_OP_SOFTMAX) {
+            const auto * kparams = (const struct htp_softmax_kernel_params *) node.kernel_params;
+            snprintf(str, max_size, "k%d nth %d vtcm %d", (int) kparams->kernel_id, (int) kparams->n_threads, (int) kparams->vtcm_size);
         } else if (node.opcode == HTP_OP_GATED_DELTA_NET) {
             const auto * kparams = (const struct htp_gdn_kernel_params *) node.kernel_params;
             snprintf(str, max_size, "%s vtcm %u",

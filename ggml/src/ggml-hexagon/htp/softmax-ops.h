@@ -8,6 +8,13 @@
 #include "hex-fastdiv.h"
 #include "hex-common.h"
 
+enum htp_softmax_kernel_id {
+    HTP_SOFTMAX_KERNEL_NOMASK = 0,
+    HTP_SOFTMAX_KERNEL_MASK_F32,
+    HTP_SOFTMAX_KERNEL_MASK_F16,
+    HTP_SOFTMAX_KERNEL_COUNT,
+};
+
 struct htp_softmax_kernel_params {
     uint32_t n_threads;
     uint32_t src0_nrows;
@@ -30,7 +37,7 @@ struct htp_softmax_kernel_params {
     uint32_t n_head_log2;
     uint32_t use_src1;
     uint32_t use_f16;
-    uint32_t opt_path;
+    uint32_t kernel_id;
 
     float    scale;
     float    max_bias;
