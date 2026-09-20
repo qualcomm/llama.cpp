@@ -149,7 +149,7 @@ kernel void kernel_gdn_chunk_prep(
             *((global float *)(scr_buf + off_gamma) + ((hh == 0) ? ch0 : ch1)) = exp(G_C);
         }
     }
-    sub_group_barrier(CLK_LOCAL_MEM_FENCE);
+    barrier(CLK_LOCAL_MEM_FENCE);
 
     // --- r-blocked copies Kb, Qb (own-row operands of the A/P product), Qg, and Kg -----------
     // lane = token: one strided row read, coalesced blocked writes
@@ -196,7 +196,7 @@ kernel void kernel_gdn_chunk_prep(
             }
         }
     }
-    sub_group_barrier(CLK_GLOBAL_MEM_FENCE | CLK_LOCAL_MEM_FENCE);
+    barrier(CLK_GLOBAL_MEM_FENCE | CLK_LOCAL_MEM_FENCE);
 
     // --- A = strict_lower(beta_i D (K K^T)), P = lower(scale D (Q K^T)), lane = row i --------
     // JB tokens j at a time over RB-wide r blocks: the lane's own k and q blocks sit in
@@ -218,14 +218,14 @@ kernel void kernel_gdn_chunk_prep(
                 oq[r4] = vload4(0, scr_qb + ((rb * (RB / 4) + r4) * CH + lane) * 4);
             }
 
-            sub_group_barrier(CLK_LOCAL_MEM_FENCE);
+            barrier(CLK_LOCAL_MEM_FENCE);
             {
                 // JB tokens x RB floats = 64 lanes x one float4: lane -> (token lane/4, r4 lane%4)
                 const uint j  = lane >> 2;
                 const uint r4 = lane & 3;
                 vstore4(vload4(0, scr_kb + ((rb * (RB / 4) + r4) * CH + jb * JB + j) * 4), 0, tile + j * RB + r4 * 4);
             }
-            sub_group_barrier(CLK_LOCAL_MEM_FENCE);
+            barrier(CLK_LOCAL_MEM_FENCE);
 
             #pragma unroll
             for (uint j = 0; j < JB; j++) {
@@ -269,7 +269,7 @@ kernel void kernel_gdn_chunk_prep(
         }
     }
 #endif
-    sub_group_barrier(CLK_LOCAL_MEM_FENCE);
+    barrier(CLK_LOCAL_MEM_FENCE);
 
     for (uint hh = 0; hh < hpair; hh++) {
     if (hh == 1) {
@@ -277,7 +277,7 @@ kernel void kernel_gdn_chunk_prep(
         for (uint jj = 0; jj < lane; jj++) {
             AT[lane * TSTRIDE + jj] = A1[lane * (lane - 1) / 2 + jj];
         }
-        sub_group_barrier(CLK_LOCAL_MEM_FENCE);
+        barrier(CLK_LOCAL_MEM_FENCE);
     }
     const uint     ch    = (hh == 0) ? ch0 : ch1;
     global float * scr_w = (global float *)(scr_buf + off_w) + (ulong) ch * SCR_W_SIZE;
@@ -289,6 +289,9 @@ kernel void kernel_gdn_chunk_prep(
     // T[j][l] is this lane's own earlier write, kept transposed at AT[l][j] (on and above the
     // diagonal, disjoint from A; the entries below it belong to A and are masked). No barrier.
 #ifndef GDN_SKIP_SOLVE
+    if (lane == 0) {
+        AT[0] = 1.0f;   // T[0][0]; lane 0 reads it in every later step
+    }
     for (uint i = 1; i < CH; i++) {
         float t = (i == lane) ? 1.0f : 0.0f;
         uint j = 0;
@@ -309,11 +312,8 @@ kernel void kernel_gdn_chunk_prep(
             AT[lane * TSTRIDE + i] = t;
         }
     }
-    if (lane == 0) {
-        AT[0] = 1.0f;
-    }
 #endif
-    sub_group_barrier(CLK_LOCAL_MEM_FENCE);
+    barrier(CLK_LOCAL_MEM_FENCE);
 
     // --- W = T (K beta e^G), U = T (V beta), lane = column pair (r, r + 64) --------------------
     // 16-row blocks of i; T[i][j] for the block is four uniform float4 (AT[j][i0..i0+15]), each
@@ -415,7 +415,7 @@ kernel void kernel_gdn_chunk_scan(
         S_l[c * S_V + lane]      = data_state[state_in_base + (col0 + c) * S_V + lane];
         S_l[c * S_V + CH + lane] = data_state[state_in_base + (col0 + c) * S_V + CH + lane];
     }
-    sub_group_barrier(CLK_LOCAL_MEM_FENCE);
+    barrier(CLK_LOCAL_MEM_FENCE);
 
     const uint ch0 = (seq * H_v + head) * n_chunks;
     global float * attn = data_dst + ((ulong) seq * n_tokens * H_v + head) * S_V + col0;
@@ -457,7 +457,7 @@ kernel void kernel_gdn_chunk_scan(
             VN_l[(c4 * 4 + 2) * CH + lane] = u.s2 - accv[c4 * 4 + 2];
             VN_l[(c4 * 4 + 3) * CH + lane] = u.s3 - accv[c4 * 4 + 3];
         }
-        sub_group_barrier(CLK_LOCAL_MEM_FENCE);
+        barrier(CLK_LOCAL_MEM_FENCE);
 
         // O += P V_new (lane = token row); dS = Kg^T V_new (lane = r and r + 64)
         float accs0[NCOL];
@@ -493,7 +493,7 @@ kernel void kernel_gdn_chunk_scan(
             S_l[c * S_V + lane]      = gamma * S_l[c * S_V + lane]      + accs0[c];
             S_l[c * S_V + CH + lane] = gamma * S_l[c * S_V + CH + lane] + accs1[c];
         }
-        sub_group_barrier(CLK_LOCAL_MEM_FENCE);
+        barrier(CLK_LOCAL_MEM_FENCE);
     }
 
     #pragma unroll
