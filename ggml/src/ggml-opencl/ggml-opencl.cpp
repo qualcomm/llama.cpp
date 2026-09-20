@@ -51634,11 +51634,13 @@ static void ggml_cl_gated_delta_net_impl(ggml_backend_t backend, ggml_tensor * d
     const int64_t K        = ggml_get_op_params_i32(dst, 0);
     const bool    kda      = src_g->ne[0] == S_v;
 
+    // At least two chunks: a single chunk does not amortise the prep (Adreno 840, 32 heads: 64
+    // tokens 1.45 -> 1.73 ms, 256 tokens 5.84 -> 5.15 ms).
     const int64_t CH = 64;
     int64_t n_full = 0;
     if (backend_ctx->gdn_chunk && backend_ctx->kernel_gdn_chunk_scan != nullptr && S_v == 128 && !kda) {
         const int64_t reserve = K > 1 ? K : 0;
-        if (n_tokens - reserve >= CH) {
+        if (n_tokens - reserve >= 2 * CH) {
             n_full = ((n_tokens - reserve) / CH) * CH;
         }
     }
