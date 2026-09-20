@@ -313,51 +313,48 @@ kernel void kernel_gdn_chunk_prep(
 
     // --- W = T (K beta e^G), U = T (V beta), lane = column pair (r, r + 64) --------------------
     // 16-row blocks of i; T[i][j] for the block is four uniform float4 (AT[j][i0..i0+15]), each
-    // feeding eight FMAs, and j stops at the block's last row (T is lower triangular).
-    for (uint mtx = 0; mtx < 2; mtx++) {
-        global const float * src = (mtx == 0) ? k_chunk : v_chunk;
-        const ulong sstride = (mtx == 0) ? sk2 : sv2;
-        for (uint ib = 0; ib < CH / 16; ib++) {
-            float acc0[16], acc1[16];
+    // feeding sixteen FMAs (W and U share the read), and j stops at the block's last row (T is
+    // lower triangular).
+    for (uint ib = 0; ib < CH / 16; ib++) {
+        float w0[16], w1[16], u0[16], u1[16];
+        #pragma unroll
+        for (uint e = 0; e < 16; e++) {
+            w0[e] = 0.0f; w1[e] = 0.0f;
+            u0[e] = 0.0f; u1[e] = 0.0f;
+        }
+        // rows i >= j only: inside the block's own 16 x 16 square the slots [j][i], i < j,
+        // hold A, not T, and are masked out
+        for (uint j = 0; j < ib * 16 + 16; j++) {
+            const float b  = Bs[hh][j];
+            const float gk = b * eG[hh][j];
+            const float k0 = k_chunk[(ulong) j * sk2 + lane]      * gk;
+            const float k1 = k_chunk[(ulong) j * sk2 + CH + lane] * gk;
+            const float v0 = v_chunk[(ulong) j * sv2 + lane]      * b;
+            const float v1 = v_chunk[(ulong) j * sv2 + CH + lane] * b;
+            const int   jd = (int) j - (int) (ib * 16);   // > 0 inside the diagonal square
             #pragma unroll
-            for (uint e = 0; e < 16; e++) {
-                acc0[e] = 0.0f;
-                acc1[e] = 0.0f;
-            }
-            // rows i >= j only: inside the block's own 16 x 16 square the slots [j][i], i < j,
-            // hold A, not T, and are masked out
-            for (uint j = 0; j < ib * 16 + 16; j++) {
-                const float g  = (mtx == 0) ? Bs[hh][j] * eG[hh][j] : Bs[hh][j];
-                const float x0 = src[(ulong) j * sstride + lane]      * g;
-                const float x1 = src[(ulong) j * sstride + CH + lane] * g;
-                const int   jd = (int) j - (int) (ib * 16);   // > 0 inside the diagonal square
-                #pragma unroll
-                for (uint e4 = 0; e4 < 4; e4++) {
-                    float4 t4 = vload4(0, AT + j * TSTRIDE + ib * 16 + e4 * 4);
-                    if (jd > 0) {
-                        const int b = (int) (e4 * 4);
-                        t4.s0 = (b + 0 >= jd) ? t4.s0 : 0.0f;
-                        t4.s1 = (b + 1 >= jd) ? t4.s1 : 0.0f;
-                        t4.s2 = (b + 2 >= jd) ? t4.s2 : 0.0f;
-                        t4.s3 = (b + 3 >= jd) ? t4.s3 : 0.0f;
-                    }
-                    acc0[e4 * 4 + 0] += t4.s0 * x0; acc1[e4 * 4 + 0] += t4.s0 * x1;
-                    acc0[e4 * 4 + 1] += t4.s1 * x0; acc1[e4 * 4 + 1] += t4.s1 * x1;
-                    acc0[e4 * 4 + 2] += t4.s2 * x0; acc1[e4 * 4 + 2] += t4.s2 * x1;
-                    acc0[e4 * 4 + 3] += t4.s3 * x0; acc1[e4 * 4 + 3] += t4.s3 * x1;
+            for (uint e4 = 0; e4 < 4; e4++) {
+                float4 t4 = vload4(0, AT + j * TSTRIDE + ib * 16 + e4 * 4);
+                if (jd > 0) {
+                    const int bb = (int) (e4 * 4);
+                    t4.s0 = (bb + 0 >= jd) ? t4.s0 : 0.0f;
+                    t4.s1 = (bb + 1 >= jd) ? t4.s1 : 0.0f;
+                    t4.s2 = (bb + 2 >= jd) ? t4.s2 : 0.0f;
+                    t4.s3 = (bb + 3 >= jd) ? t4.s3 : 0.0f;
                 }
+                w0[e4 * 4 + 0] += t4.s0 * k0; w1[e4 * 4 + 0] += t4.s0 * k1; u0[e4 * 4 + 0] += t4.s0 * v0; u1[e4 * 4 + 0] += t4.s0 * v1;
+                w0[e4 * 4 + 1] += t4.s1 * k0; w1[e4 * 4 + 1] += t4.s1 * k1; u0[e4 * 4 + 1] += t4.s1 * v0; u1[e4 * 4 + 1] += t4.s1 * v1;
+                w0[e4 * 4 + 2] += t4.s2 * k0; w1[e4 * 4 + 2] += t4.s2 * k1; u0[e4 * 4 + 2] += t4.s2 * v0; u1[e4 * 4 + 2] += t4.s2 * v1;
+                w0[e4 * 4 + 3] += t4.s3 * k0; w1[e4 * 4 + 3] += t4.s3 * k1; u0[e4 * 4 + 3] += t4.s3 * v0; u1[e4 * 4 + 3] += t4.s3 * v1;
             }
-            #pragma unroll
-            for (uint e = 0; e < 16; e++) {
-                const uint i = ib * 16 + e;
-                if (mtx == 0) {
-                    scr_w[((lane >> 2) * CH + i) * 4 + (lane & 3)]        = acc0[e];
-                    scr_w[(((lane + CH) >> 2) * CH + i) * 4 + (lane & 3)] = acc1[e];
-                } else {
-                    scr_u[i * S_V + lane]      = acc0[e];
-                    scr_u[i * S_V + CH + lane] = acc1[e];
-                }
-            }
+        }
+        #pragma unroll
+        for (uint e = 0; e < 16; e++) {
+            const uint i = ib * 16 + e;
+            scr_w[((lane >> 2) * CH + i) * 4 + (lane & 3)]        = w0[e];
+            scr_w[(((lane + CH) >> 2) * CH + i) * 4 + (lane & 3)] = w1[e];
+            scr_u[i * S_V + lane]      = u0[e];
+            scr_u[i * S_V + CH + lane] = u1[e];
         }
     }
     }
