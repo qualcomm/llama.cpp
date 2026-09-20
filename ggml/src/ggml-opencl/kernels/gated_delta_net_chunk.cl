@@ -329,13 +329,23 @@ kernel void kernel_gdn_chunk_prep(
                 acc0[e] = 0.0f;
                 acc1[e] = 0.0f;
             }
+            // rows i >= j only: inside the block's own 16 x 16 square the slots [j][i], i < j,
+            // hold A, not T, and are masked out
             for (uint j = 0; j < ib * 16 + 16; j++) {
                 const float g  = (mtx == 0) ? Bs[hh][j] * eG[hh][j] : Bs[hh][j];
                 const float x0 = src[(ulong) j * sstride + lane]      * g;
                 const float x1 = src[(ulong) j * sstride + CH + lane] * g;
+                const int   jd = (int) j - (int) (ib * 16);   // > 0 inside the diagonal square
                 #pragma unroll
                 for (uint e4 = 0; e4 < 4; e4++) {
-                    const float4 t4 = vload4(0, AT + j * TSTRIDE + ib * 16 + e4 * 4);
+                    float4 t4 = vload4(0, AT + j * TSTRIDE + ib * 16 + e4 * 4);
+                    if (jd > 0) {
+                        const int b = (int) (e4 * 4);
+                        t4.s0 = (b + 0 >= jd) ? t4.s0 : 0.0f;
+                        t4.s1 = (b + 1 >= jd) ? t4.s1 : 0.0f;
+                        t4.s2 = (b + 2 >= jd) ? t4.s2 : 0.0f;
+                        t4.s3 = (b + 3 >= jd) ? t4.s3 : 0.0f;
+                    }
                     acc0[e4 * 4 + 0] += t4.s0 * x0; acc1[e4 * 4 + 0] += t4.s0 * x1;
                     acc0[e4 * 4 + 1] += t4.s1 * x0; acc1[e4 * 4 + 1] += t4.s1 * x1;
                     acc0[e4 * 4 + 2] += t4.s2 * x0; acc1[e4 * 4 + 2] += t4.s2 * x1;
