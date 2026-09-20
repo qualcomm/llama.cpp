@@ -30247,13 +30247,16 @@ static bool ggml_cl_flash_attn_decompose(
         const char * e = getenv("GGML_OPENCL_FA_SOFTMAX_DEFER_NORM");
         return (e && e[0]) ? atoi(e) != 0 : true;
     }();
-    // Generations the int8 path is verified on: X2-90 (X2E) and Adreno 840 (A8X). On the X1-85
-    // (X1E) later flash-attention cases with a sinks tensor fail after it has run; not localised.
+    // Generations the int8 path is verified on: X2-90 (X2E), Adreno 840 (A8X) and X1-85 (X1E).
+    // The X1E was excluded while its flash-attention cases with a sinks tensor failed; that was
+    // the half-precision P block scale underflowing (X1E flushes half subnormals), fixed by the
+    // f32 scale, and the X1E now passes the full suite with the path on.
     // The allow-list sits in this first decision because the fused-softmax gate, the int8 KQ
     // default and the dk=64 floor all build on it: a generation admitted here and declined later
     // trips the gate mismatch below and drops the decomposed prefill to the fused tile.
     const bool kqv_int8_gen = backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E ||
-                              backend_ctx->adreno_gen == ADRENO_GPU_GEN::A8X;
+                              backend_ctx->adreno_gen == ADRENO_GPU_GEN::A8X ||
+                              backend_ctx->adreno_gen == ADRENO_GPU_GEN::X1E;
     const bool kqv_int8_possible = kqv_int8_env && defer_norm_env && kqv_int8_gen && (n_kv % 32 == 0) && (dv % 64 == 0) &&
                                    n_head_kv > 0 && mask != nullptr &&
                                    backend_ctx->kernel_fa_v_transpose_q8 != nullptr;
