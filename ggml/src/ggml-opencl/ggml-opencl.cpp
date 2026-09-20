@@ -25857,13 +25857,15 @@ static void ggml_cl_ssm_conv(ggml_backend_t backend, const ggml_tensor * src0, c
     cl_ulong nb2 = dst->nb[2];
 
     // Tokens per work item. The conv window slides by one element per token, so making several
-    // tokens in one work item keeps the window in registers and drops the reload. Gated until
-    // measured; the value is the tile length.
+    // tokens in one work item keeps the window in registers and drops the reload. Prefill only:
+    // a single-token call gains nothing from the tile and pays for its loop (-1.4% decode on the
+    // X2-90), and short tiles win over long ones because the wave count carries the latency
+    // hiding. GGML_OPENCL_SSM_CONV_TPI overrides the tile length; 0 keeps the one-output kernel.
     static const int tpi = []{
         const char * e = getenv("GGML_OPENCL_SSM_CONV_TPI");
-        return e ? atoi(e) : 0;
+        return (e && e[0]) ? atoi(e) : 8;
     }();
-    const bool tile = tpi > 0;
+    const bool tile = tpi > 0 && ne1 >= 64 && ne10 == 4;
 
     cl_kernel kernel = backend_ctx->kernel_ssm_conv_f32_f32;
 
