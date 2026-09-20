@@ -140,6 +140,7 @@ dma_queue_t dma_queue_alias_init(void * ptr, dma_queue_t main_q);
 void        dma_queue_alias_free(dma_queue_t q);
 
 bool        dma_queue_push_fallback_2d(dma_queue * q, dma_data ddata, size_t dst_stride, size_t src_stride, size_t row_size, size_t nrows);
+bool        dma_queue_push_fallback_contig(dma_queue * q, dma_data ddata, size_t total);
 #if __HVX_ARCH__ < 75
 bool        dma_queue_push_fallback_1d(dma_queue * q, dma_data ddata, size_t dst_stride, size_t src_stride, size_t row_size, size_t nrows);
 #endif
@@ -328,7 +329,9 @@ static inline bool dma_ring_empty(dma_ring * r) {
 }
 
 static inline void dma_ring_flush(dma_ring * r) {
-    while (dma_ring_pop(r).dst != 0) ;
+    while (!dma_ring_empty(r)) {
+        dma_ring_pop(r);
+    }
 }
 
 static inline uint32_t dma_ring_depth(dma_ring * r) {
@@ -389,6 +392,7 @@ static inline bool dma_queue_push(dma_queue *q, dma_data ddata, size_t dst_strid
         if (total <= DMA_MAX_SIZE_24B) {
             return dma_ring_push_single_1d(q->ring0, ddata, total);
         }
+        return dma_queue_push_fallback_contig(q, ddata, total);
     }
 
     // Row count overflow with 16-bit strides: chunk 2D descriptors via fallback ring
@@ -409,6 +413,12 @@ static inline bool dma_queue_push(dma_queue *q, dma_data ddata, size_t dst_strid
             src_stride <= DMA_MAX_STRIDE_24B &&
             dst_stride <= DMA_MAX_STRIDE_24B, 1)) {
         return dma_ring_push_single_2d(q->ring0, ddata, dst_stride, src_stride, row_size, nrows);
+    }
+
+    // Contiguous block exceeding 24 bits
+    if (nrows == 1 || (row_size == src_stride && row_size == dst_stride)) {
+        size_t total = row_size * nrows;
+        return dma_queue_push_fallback_contig(q, ddata, total);
     }
 
     return dma_queue_push_fallback_2d(q, ddata, dst_stride, src_stride, row_size, nrows);
