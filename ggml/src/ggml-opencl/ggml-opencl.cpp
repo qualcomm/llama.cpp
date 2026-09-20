@@ -1208,6 +1208,15 @@ struct ggml_backend_opencl_context {
     // tgpp 0 = TG variant (COLS_PER_LANE_GROUP=1), tgpp 1 = prefill variant (COLS_PER_LANE_GROUP=4).
     cl_kernel kernel_gated_delta_net_f32[4][2][2] = {};
     cl_kernel kernel_ssm_scan_f32 = nullptr;
+    // Chunkwise (WY) gated_delta_net prefill, S_V=128 scalar gate only; see
+    // kernels/gated_delta_net_chunk.cl. Default on for X2-class Adreno (GGML_OPENCL_GDN_CHUNK=0
+    // opts out), GGML_OPENCL_GDN_CHUNK=1 opts in elsewhere.
+    cl_kernel kernel_gdn_chunk_prep = nullptr;
+    cl_kernel kernel_gdn_chunk_scan = nullptr;
+    static constexpr int gdn_chunk_ncol = 8; // state columns per scan workgroup (NCOL)
+    bool gdn_chunk = false;
+    ggml_cl_buffer prealloc_gdn_chunk; // W/Qg/Kg/U/Kb/Qb/P/gamma per (chunk, head, seq)
+    ggml_cl_buffer prealloc_gdn_state; // state hand-over from the chunk scan to the recurrent tail
     cl_kernel kernel_ssm_scan_f32_mamba2_d128 = nullptr;
     cl_kernel kernel_ssm_scan_f32_mamba2_d256 = nullptr;
 
@@ -2720,6 +2729,8 @@ static int ggml_cl_q1_0_gemv_ns1_min_m(const ggml_backend_opencl_context * backe
     }
     return backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E ? 8192 : 0;
 }
+
+static bool adreno_e17_compiler_quirks(const ggml_backend_opencl_context *backend_ctx);
 
 static bool adreno_e17_compiler_quirks(const ggml_backend_opencl_context *backend_ctx);
 
@@ -5450,7 +5461,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         for (int si = 0; si < 4; si++) {
             const int S_V = gdn_sizes[si];
 
-            // MUST match the dispatcher heuristic in ggml_cl_gated_delta_net exactly.
+            // MUST match the dispatcher heuristic in ggml_cl_gated_delta_net_recurrent exactly.
             int lanes_per_column;
             if (S_V >= 128) {
                 lanes_per_column = 8;
@@ -5505,6 +5516,45 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                     CL_CHECK(clReleaseProgram(prog));
                 }
             }
+        }
+        GGML_LOG_CONT(".");
+    }
+
+    // gated_delta_net chunkwise prefill (S_V=128, scalar gate). Adreno only: the
+    // kernels are written for the 64-wide wave (lane = token of a 64-token chunk).
+    if (backend_ctx->gpu_family == GPU_FAMILY::ADRENO) {
+    #ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src {
+            #include "gated_delta_net_chunk.cl.h"
+        };
+    #else
+        const std::string kernel_src = read_file("gated_delta_net_chunk.cl");
+    #endif
+        // Default on for the X2 class (X2E, and A8X = Adreno 830/840/850) minus the E17 compiler:
+        // the Adreno 850 builds and passes these kernels but runs them at half the recurrent
+        // kernel's speed (32 heads x 1024 tokens 15.4 ms against 7.6 ms), so it is subtracted as
+        // the dense dp4a GEMMs are. Other gens are unmeasured and opt in.
+        // GGML_OPENCL_GDN_CHUNK: 0 forces it off, any other integer forces it on.
+        const bool x2_class = backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E ||
+                              backend_ctx->adreno_gen == ADRENO_GPU_GEN::A8X;
+        bool gdn_chunk = x2_class && !adreno_e17_compiler_quirks(backend_ctx);
+        if (const char * e = getenv("GGML_OPENCL_GDN_CHUNK")) {
+            if (e[0] != '\0') {
+                gdn_chunk = atoi(e) != 0;
+            }
+        }
+        backend_ctx->gdn_chunk = gdn_chunk;
+        std::string opts = compile_opts;
+        opts += " -DS_V=128 -DNCOL=" + std::to_string(backend_ctx->gdn_chunk_ncol);
+        // Not fatal: a compiler that rejects these kernels only loses the chunked path.
+        cl_program prog = build_program_from_source_ex(backend_ctx->context, backend_ctx->device,
+                                                       kernel_src.c_str(), opts, /*fatal=*/false, "gated_delta_net_chunk");
+        if (prog != nullptr) {
+            CL_CHECK((backend_ctx->kernel_gdn_chunk_prep = clCreateKernel(prog, "kernel_gdn_chunk_prep", &err), err));
+            CL_CHECK((backend_ctx->kernel_gdn_chunk_scan = clCreateKernel(prog, "kernel_gdn_chunk_scan", &err), err));
+            CL_CHECK(clReleaseProgram(prog));
+        } else {
+            GGML_LOG_WARN("ggml_opencl: gated_delta_net_chunk did not build; the chunked prefill path is off\n");
         }
         GGML_LOG_CONT(".");
     }
@@ -39040,7 +39090,10 @@ static void ggml_cl_glu(ggml_backend_t backend, const ggml_tensor * src0, const 
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
 }
 
-static void ggml_cl_gated_delta_net(ggml_backend_t backend, ggml_tensor * dst) {
+// The recurrent kernel over tokens t0..n_tokens-1. tail_state (when set) replaces the
+// op's input state: the chunked path leaves the state after its whole chunks there.
+static void ggml_cl_gated_delta_net_recurrent(ggml_backend_t backend, ggml_tensor * dst,
+                                              cl_uint t0, cl_mem tail_state, cl_ulong off_tail_state) {
     GGML_ASSERT(dst);
     GGML_ASSERT(dst->extra);
 
@@ -39145,8 +39198,10 @@ static void ggml_cl_gated_delta_net(ggml_backend_t backend, ggml_tensor * dst) {
     CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off_g));
     CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem),   &extra_beta->data_device));
     CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off_beta));
-    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem),   &extra_state->data_device));
-    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off_state));
+    const cl_mem   state_mem    = tail_state != nullptr ? tail_state : extra_state->data_device;
+    const cl_ulong off_state_in = tail_state != nullptr ? off_tail_state : off_state;
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem),   &state_mem));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off_state_in));
     CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem),   &extra_dst->data_device));
     CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off_dst));
     CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &H_v));
@@ -39166,6 +39221,7 @@ static void ggml_cl_gated_delta_net(ggml_backend_t backend, ggml_tensor * dst) {
     CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &rq3));
     CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(float),    &scale));
     CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),    &K));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),    &t0));
 
     // Subgroup size is 64 for Adreno and 32 for Intel
     const int sg_size = backend_ctx->gpu_family == GPU_FAMILY::ADRENO ? 64 : backend_ctx->gpu_family == GPU_FAMILY::INTEL ? 32 : -1;
@@ -39218,6 +39274,183 @@ static void ggml_cl_gated_delta_net(ggml_backend_t backend, ggml_tensor * dst) {
 
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
 }
+
+// Chunkwise (WY) prefill: whole 64-token chunks through kernel_gdn_chunk_prep +
+// kernel_gdn_chunk_scan, then the recurrent kernel finishes the tail (the tokens past
+// the last whole chunk, plus the last K tokens when snapshots are wanted, since only
+// the recurrent kernel writes per-token states).
+static void ggml_cl_gated_delta_net(ggml_backend_t backend, ggml_tensor * dst) {
+    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *) backend->context;
+
+    const ggml_tensor * src_q     = dst->src[0];
+    const ggml_tensor * src_k     = dst->src[1];
+    const ggml_tensor * src_v     = dst->src[2];
+    const ggml_tensor * src_g     = dst->src[3];
+    const ggml_tensor * src_beta  = dst->src[4];
+    const ggml_tensor * src_state = dst->src[5];
+
+    const int64_t S_v      = src_v->ne[0];
+    const int64_t H_v      = src_v->ne[1];
+    const int64_t n_tokens = src_v->ne[2];
+    const int64_t n_seqs   = src_v->ne[3];
+    const int64_t K        = ggml_get_op_params_i32(dst, 0);
+    const bool    kda      = src_g->ne[0] == S_v;
+
+    // At least two chunks: a single chunk does not amortise the prep (Adreno 840, 32 heads: 64
+    // tokens 1.45 -> 1.73 ms, 256 tokens 5.84 -> 5.15 ms).
+    const int64_t CH = 64;
+    int64_t n_full = 0;
+    if (backend_ctx->gdn_chunk && backend_ctx->kernel_gdn_chunk_scan != nullptr && S_v == 128 && !kda) {
+        const int64_t reserve = K > 1 ? K : 0;
+        if (n_tokens - reserve >= 2 * CH) {
+            n_full = ((n_tokens - reserve) / CH) * CH;
+        }
+    }
+
+    const int64_t n_chunks = n_full / CH;
+    const int64_t n_tail   = n_tokens - n_full;
+    const int64_t n_ch     = n_chunks * H_v * n_seqs;
+
+    // scratch: W, Qg, Kg, U, Kb, Qb (S_v*64 floats each), P (64*64), gamma (1) per chunk-head
+    const cl_ulong sz_mat = (cl_ulong) n_ch * S_v * CH * sizeof(float);
+    const cl_ulong sz_p   = (cl_ulong) n_ch * CH * CH * sizeof(float);
+    const cl_ulong off_w = 0, off_qg = sz_mat, off_kg = 2 * sz_mat, off_u = 3 * sz_mat, off_kb = 4 * sz_mat, off_qb = 5 * sz_mat;
+    const cl_ulong off_p = 6 * sz_mat;
+    const cl_ulong off_gamma = off_p + sz_p;
+    const cl_ulong scr_bytes = off_gamma + ((cl_ulong) n_ch * sizeof(float) + 255) / 256 * 256;
+    const size_t state_bytes = (size_t) S_v * S_v * H_v * n_seqs * sizeof(float);
+
+    // The scratch grows with the ubatch: when the device cannot allocate it in one buffer,
+    // the whole op stays on the recurrent kernel.
+    if (n_full == 0 || scr_bytes > backend_ctx->max_alloc_size ||
+        (n_tail > 0 && state_bytes > backend_ctx->max_alloc_size)) {
+        ggml_cl_gated_delta_net_recurrent(backend, dst, 0, nullptr, 0);
+        return;
+    }
+
+    backend_ctx->prealloc_gdn_chunk.allocate(backend_ctx->context, scr_bytes);
+    if (n_tail > 0) {
+        backend_ctx->prealloc_gdn_state.allocate(backend_ctx->context, state_bytes);
+    }
+
+    ggml_tensor_extra_cl * extra_q     = (ggml_tensor_extra_cl *) src_q->extra;
+    ggml_tensor_extra_cl * extra_k     = (ggml_tensor_extra_cl *) src_k->extra;
+    ggml_tensor_extra_cl * extra_v     = (ggml_tensor_extra_cl *) src_v->extra;
+    ggml_tensor_extra_cl * extra_g     = (ggml_tensor_extra_cl *) src_g->extra;
+    ggml_tensor_extra_cl * extra_beta  = (ggml_tensor_extra_cl *) src_beta->extra;
+    ggml_tensor_extra_cl * extra_state = (ggml_tensor_extra_cl *) src_state->extra;
+    ggml_tensor_extra_cl * extra_dst   = (ggml_tensor_extra_cl *) dst->extra;
+
+    const cl_ulong off_q     = extra_q->offset     + src_q->view_offs;
+    const cl_ulong off_k     = extra_k->offset     + src_k->view_offs;
+    const cl_ulong off_v     = extra_v->offset     + src_v->view_offs;
+    const cl_ulong off_g     = extra_g->offset     + src_g->view_offs;
+    const cl_ulong off_beta  = extra_beta->offset  + src_beta->view_offs;
+    const cl_ulong off_dst   = extra_dst->offset   + dst->view_offs;
+
+    const cl_uint H_v_u = (cl_uint) H_v;
+    const cl_uint H_k   = (cl_uint) src_q->ne[1];
+    const cl_uint rq3   = (cl_uint)(src_v->ne[3] / src_q->ne[3]);
+    // v-heads h and h + H_k share k-head h: one prep workgroup serves both when H_v == 2 H_k
+    const cl_uint hpair = (H_v_u == 2 * H_k) ? 2 : 1;
+    const cl_uint n_chunks_u = (cl_uint) n_chunks;
+    const cl_uint n_tokens_u = (cl_uint) n_tokens;
+    const cl_uint sq1 = (cl_uint)(src_q->nb[1] / sizeof(float)), sq2 = (cl_uint)(src_q->nb[2] / sizeof(float)), sq3 = (cl_uint)(src_q->nb[3] / sizeof(float));
+    const cl_uint sk1 = (cl_uint)(src_k->nb[1] / sizeof(float)), sk2 = (cl_uint)(src_k->nb[2] / sizeof(float)), sk3 = (cl_uint)(src_k->nb[3] / sizeof(float));
+    const cl_uint sv1 = (cl_uint)(src_v->nb[1] / sizeof(float)), sv2 = (cl_uint)(src_v->nb[2] / sizeof(float)), sv3 = (cl_uint)(src_v->nb[3] / sizeof(float));
+    const cl_uint sb1 = (cl_uint)(src_beta->nb[1] / sizeof(float)), sb2 = (cl_uint)(src_beta->nb[2] / sizeof(float)), sb3 = (cl_uint)(src_beta->nb[3] / sizeof(float));
+    const float scale = 1.0f / sqrtf((float) S_v);
+
+    cl_mem scr = backend_ctx->prealloc_gdn_chunk.buffer;
+
+    {
+        cl_kernel kernel = backend_ctx->kernel_gdn_chunk_prep;
+        int idx = 0;
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem),   &extra_q->data_device));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off_q));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem),   &extra_k->data_device));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off_k));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem),   &extra_v->data_device));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off_v));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem),   &extra_g->data_device));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off_g));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem),   &extra_beta->data_device));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off_beta));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem),   &scr));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off_w));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off_qg));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off_kg));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off_u));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off_p));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off_gamma));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off_kb));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off_qb));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &H_v_u));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &H_k));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &hpair));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &n_chunks_u));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &rq3));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &sq1));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &sq2));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &sq3));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &sk1));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &sk2));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &sk3));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &sv1));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &sv2));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &sv3));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &sb1));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &sb2));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &sb3));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(float),    &scale));
+
+        size_t global_work_size[3] = { (size_t) n_chunks * CH, (size_t) (H_v / hpair), (size_t) n_seqs };
+        size_t local_work_size[3]  = { (size_t) CH, 1, 1 };
+        backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+    }
+
+    // input state: the [S_v, S_v, H_v, n_seqs] tensor
+    cl_mem   state_mem    = extra_state->data_device;
+    cl_ulong off_state_in = extra_state->offset + src_state->view_offs;
+
+    // output state: the tail scratch, or (no tail, so K == 1) the final-state slot of dst
+    cl_mem   sout_mem = backend_ctx->prealloc_gdn_state.buffer;
+    cl_ulong off_sout = 0;
+    if (n_tail == 0) {
+        sout_mem = extra_dst->data_device;
+        off_sout = off_dst + (cl_ulong) S_v * H_v * n_tokens * n_seqs * sizeof(float);
+    }
+
+    {
+        cl_kernel kernel = backend_ctx->kernel_gdn_chunk_scan;
+        int idx = 0;
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem),   &scr));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off_w));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off_qg));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off_kg));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off_u));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off_p));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off_gamma));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem),   &state_mem));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off_state_in));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem),   &extra_dst->data_device));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off_dst));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem),   &sout_mem));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off_sout));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &H_v_u));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &n_tokens_u));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &n_chunks_u));
+
+        size_t global_work_size[3] = { (size_t) (S_v / backend_ctx->gdn_chunk_ncol) * CH, (size_t) H_v, (size_t) n_seqs };
+        size_t local_work_size[3]  = { (size_t) CH, 1, 1 };
+        backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+    }
+
+    if (n_tail > 0) {
+        ggml_cl_gated_delta_net_recurrent(backend, dst, (cl_uint) n_full, backend_ctx->prealloc_gdn_state.buffer, 0);
+    }
+}
+
 
 //------------------------------------------------------------------------------
 // Op offloading
