@@ -1623,12 +1623,10 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gated_delta_net_f32[4][2][2] = {};
     // Chunkwise (WY) gated_delta_net prefill, S_V=128 scalar gate only; see
     // kernels/gated_delta_net_chunk.cl. GGML_OPENCL_GDN_CHUNK=1 opts in,
-    // GGML_OPENCL_GDN_CHUNK_NCOL={4,8,16,32} sets the state columns per scan workgroup,
-    // GGML_OPENCL_GDN_CHUNK_MSPLIT={1,2,4} the reduction-axis split (rows per lane).
+    // GGML_OPENCL_GDN_CHUNK_NCOL={4,8,16} sets the state columns per scan workgroup.
     cl_kernel kernel_gdn_chunk_prep = nullptr;
     cl_kernel kernel_gdn_chunk_scan = nullptr;
     int  gdn_chunk_ncol = 8;
-    int  gdn_chunk_msplit = 1;
     bool gdn_chunk = false;
     ggml_cl_buffer prealloc_gdn_chunk; // W/Qg/Kg/U/P/gamma per (chunk, head, seq)
     ggml_cl_buffer prealloc_gdn_state; // state hand-over from the chunk scan to the recurrent tail
@@ -8419,28 +8417,26 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         backend_ctx->gdn_chunk = ggml_cl_env_flag("GGML_OPENCL_GDN_CHUNK");
         if (const char * e = getenv("GGML_OPENCL_GDN_CHUNK_NCOL")) {
             const int n = atoi(e);
-            if (n == 4 || n == 8 || n == 16 || n == 32) {
+            if (n == 4 || n == 8 || n == 16) {
                 backend_ctx->gdn_chunk_ncol = n;
-            }
-        }
-        if (const char * e = getenv("GGML_OPENCL_GDN_CHUNK_MSPLIT")) {
-            const int n = atoi(e);
-            if (n == 1 || n == 2 || n == 4) {
-                backend_ctx->gdn_chunk_msplit = n;
             }
         }
         std::string opts = compile_opts;
         opts += " -DS_V=128 -DNCOL=" + std::to_string(backend_ctx->gdn_chunk_ncol);
-        opts += " -DMSPLIT=" + std::to_string(backend_ctx->gdn_chunk_msplit);
-        opts += " -DUSE_QCOM_SUBGROUP_SHUFFLE=" + std::to_string(backend_ctx->has_qcom_subgroup_shuffle ? 1 : 0);
         if (const char * e = getenv("GGML_OPENCL_GDN_CHUNK_DBG")) {
             opts += " ";
             opts += e; // raw extra defines for kernel-phase timing; output is wrong with any of them
         }
-        cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), opts);
-        CL_CHECK((backend_ctx->kernel_gdn_chunk_prep = clCreateKernel(prog, "kernel_gdn_chunk_prep", &err), err));
-        CL_CHECK((backend_ctx->kernel_gdn_chunk_scan = clCreateKernel(prog, "kernel_gdn_chunk_scan", &err), err));
-        CL_CHECK(clReleaseProgram(prog));
+        // Not fatal: a compiler that rejects these kernels only loses the chunked path.
+        cl_program prog = build_program_from_source_ex(backend_ctx->context, backend_ctx->device,
+                                                       kernel_src.c_str(), opts, /*fatal=*/false, "gated_delta_net_chunk");
+        if (prog != nullptr) {
+            CL_CHECK((backend_ctx->kernel_gdn_chunk_prep = clCreateKernel(prog, "kernel_gdn_chunk_prep", &err), err));
+            CL_CHECK((backend_ctx->kernel_gdn_chunk_scan = clCreateKernel(prog, "kernel_gdn_chunk_scan", &err), err));
+            CL_CHECK(clReleaseProgram(prog));
+        } else {
+            GGML_LOG_WARN("ggml_opencl: gated_delta_net_chunk did not build; the chunked prefill path is off\n");
+        }
         GGML_LOG_CONT(".");
     }
 
@@ -51653,9 +51649,9 @@ static void ggml_cl_gated_delta_net_impl(ggml_backend_t backend, ggml_tensor * d
     static bool logged = false;
     if (!logged) {
         logged = true;
-        GGML_LOG_INFO("ggml_opencl: GDN_CHUNK ON: n_tokens=%lld n_full=%lld n_tail=%lld H_v=%lld ncol=%d msplit=%d\n",
+        GGML_LOG_INFO("ggml_opencl: GDN_CHUNK ON: n_tokens=%lld n_full=%lld n_tail=%lld H_v=%lld ncol=%d\n",
                       (long long) n_tokens, (long long) n_full, (long long) n_tail, (long long) H_v,
-                      backend_ctx->gdn_chunk_ncol, backend_ctx->gdn_chunk_msplit);
+                      backend_ctx->gdn_chunk_ncol);
     }
 
     // scratch: W, Qg, Kg, U, Kb, Qb (S_v*64 floats each), P (64*64), gamma (1) per chunk-head
@@ -51688,6 +51684,8 @@ static void ggml_cl_gated_delta_net_impl(ggml_backend_t backend, ggml_tensor * d
     const cl_uint H_v_u = (cl_uint) H_v;
     const cl_uint H_k   = (cl_uint) src_q->ne[1];
     const cl_uint rq3   = (cl_uint)(src_v->ne[3] / src_q->ne[3]);
+    // v-heads h and h + H_k share k-head h: one prep workgroup serves both when H_v == 2 H_k
+    const cl_uint hpair = (H_v_u == 2 * H_k) ? 2 : 1;
     const cl_uint n_chunks_u = (cl_uint) n_chunks;
     const cl_uint n_tokens_u = (cl_uint) n_tokens;
     const cl_uint sq1 = (cl_uint)(src_q->nb[1] / sizeof(float)), sq2 = (cl_uint)(src_q->nb[2] / sizeof(float)), sq3 = (cl_uint)(src_q->nb[3] / sizeof(float));
@@ -51722,6 +51720,7 @@ static void ggml_cl_gated_delta_net_impl(ggml_backend_t backend, ggml_tensor * d
         CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off_qb));
         CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &H_v_u));
         CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &H_k));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &hpair));
         CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &n_chunks_u));
         CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &rq3));
         CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &sq1));
@@ -51738,7 +51737,7 @@ static void ggml_cl_gated_delta_net_impl(ggml_backend_t backend, ggml_tensor * d
         CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &sb3));
         CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(float),    &scale));
 
-        size_t global_work_size[3] = { (size_t) n_chunks * CH, (size_t) H_v, (size_t) n_seqs };
+        size_t global_work_size[3] = { (size_t) n_chunks * CH, (size_t) (H_v / hpair), (size_t) n_seqs };
         size_t local_work_size[3]  = { (size_t) CH, 1, 1 };
         backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
     }

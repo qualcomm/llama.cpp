@@ -44,21 +44,11 @@
 #define REQD_SUBGROUP_SIZE_64
 #endif
 
-#ifndef USE_QCOM_SUBGROUP_SHUFFLE
-#define USE_QCOM_SUBGROUP_SHUFFLE 0
-#endif
-#if USE_QCOM_SUBGROUP_SHUFFLE
-#pragma OPENCL EXTENSION cl_qcom_subgroup_shuffle : enable
-#endif
-
 #ifndef S_V
 #define S_V 128
 #endif
 #ifndef NCOL
 #define NCOL 8
-#endif
-#ifndef MSPLIT
-#define MSPLIT 1            // scan: lane groups the reduction axis is split over == rows per lane
 #endif
 
 #define CH      64          // tokens per chunk == lanes per workgroup
@@ -84,24 +74,6 @@
 #define SCR_U_SIZE   (S_V * CH)
 #define SCR_P_SIZE   (CH * CH)
 
-// Sum v over the lanes that differ in the bits >= log2(CH/m) (the reduction-axis split).
-static inline float gdn_split_sum(float v, uint m, __local float * xchg, uint lane) {
-#if USE_QCOM_SUBGROUP_SHUFFLE
-    for (uint s = CH / m; s < CH; s <<= 1) {
-        v += qcom_sub_group_shuffle_xor(v, s, CLK_SUB_GROUP_SHUFFLE_WIDTH_WAVE_SIZE_QCOM, v);
-    }
-    return v;
-#else
-    for (uint s = CH / m; s < CH; s <<= 1) {
-        xchg[lane] = v;
-        sub_group_barrier(CLK_LOCAL_MEM_FENCE);
-        v += xchg[lane ^ s];
-        sub_group_barrier(CLK_LOCAL_MEM_FENCE);
-    }
-    return v;
-#endif
-}
-
 __attribute__((reqd_work_group_size(CH, 1, 1)))
 REQD_SUBGROUP_SIZE_64
 kernel void kernel_gdn_chunk_prep(
@@ -114,6 +86,7 @@ kernel void kernel_gdn_chunk_prep(
         ulong off_kb, ulong off_qb,
         uint  H_v,
         uint  H_k,
+        uint  hpair,     // 2: this workgroup serves v-heads head and head + H_k (one k-head); 1: one v-head
         uint  n_chunks,
         uint  rq3,
         uint  sq1, uint sq2, uint sq3,
@@ -134,46 +107,47 @@ kernel void kernel_gdn_chunk_prep(
     const uint lane  = get_local_id(0);
     const uint tok   = chunk * CH + lane;
 
-    const uint ch = (seq * H_v + head) * n_chunks + chunk;
+    // the v-heads of this workgroup (hh = 0, 1) and their chunk-head scratch indices
+    const uint head1 = head + H_k;
+    const uint ch0 = (seq * H_v + head)  * n_chunks + chunk;
+    const uint ch1 = (seq * H_v + head1) * n_chunks + chunk;
 
-    global float * scr_w     = (global float *)(scr_buf + off_w)     + (ulong) ch * SCR_W_SIZE;
-    global float * scr_qg    = (global float *)(scr_buf + off_qg)    + (ulong) ch * SCR_QG_SIZE;
-    global float * scr_kg    = (global float *)(scr_buf + off_kg)    + (ulong) ch * SCR_KG_SIZE;
-    global float * scr_u     = (global float *)(scr_buf + off_u)     + (ulong) ch * SCR_U_SIZE;
-    global float * scr_p     = (global float *)(scr_buf + off_p)     + (ulong) ch * SCR_P_SIZE;
-    global float * scr_gamma = (global float *)(scr_buf + off_gamma) + ch;
-    global float * scr_kb    = (global float *)(scr_buf + off_kb)    + (ulong) ch * SCR_W_SIZE;
-    global float * scr_qb    = (global float *)(scr_buf + off_qb)    + (ulong) ch * SCR_W_SIZE;
+    global float * scr_kb = (global float *)(scr_buf + off_kb) + (ulong) ch0 * SCR_W_SIZE;
+    global float * scr_qb = (global float *)(scr_buf + off_qb) + (ulong) ch0 * SCR_W_SIZE;
 
     const uint iq1 = head % H_k;
     const uint iq3 = seq / rq3;
 
-    // first row of the chunk in q/k/v; row j is + j * stride
+    // first row of the chunk in q/k; row j is + j * stride
     global const float * q_chunk = data_q + iq3 * sq3 + iq1 * sq1 + (ulong) (chunk * CH) * sq2;
     global const float * k_chunk = data_k + iq3 * sk3 + iq1 * sk1 + (ulong) (chunk * CH) * sk2;
-    global const float * v_chunk = data_v + seq * sv3 + head * sv1 + (ulong) (chunk * CH) * sv2;
-
-    const uint gb_off = seq * sb3 + head * sb1 + tok * sb2;
 
     __local float AT[CH * TSTRIDE];     // A row-major strictly below the diagonal; T^T on and above it
+    __local float A1[CH * (CH - 1) / 2];// head 1's A, packed by row, until its turn
     __local float tile[JB * RB];        // k tile of the A/P product
-    __local float Gs[CH];               // cumulative gate G_j
-    __local float eG[CH];               // exp(G_j)
-    __local float eGd[CH];              // exp(G_C - G_j)
-    __local float Bs[CH];               // beta_j
+    __local float Gs[2][CH];            // cumulative gate G_j
+    __local float eG[2][CH];            // exp(G_j)
+    __local float eGd[2][CH];           // exp(G_C - G_j)
+    __local float Bs[2][CH];            // beta_j
 
-    // --- gate prefix, per-token scalars ----------------------------------------------------
-    const float g_i    = data_g[gb_off];
-    const float beta_i = data_beta[gb_off];
-    const float G_i    = sub_group_scan_inclusive_add(g_i);
-    const float G_C    = sub_group_broadcast(G_i, CH - 1);
-
-    Gs[lane]  = G_i;
-    eG[lane]  = exp(G_i);
-    eGd[lane] = exp(G_C - G_i);
-    Bs[lane]  = beta_i;
-    if (lane == 0) {
-        *scr_gamma = exp(G_C);
+    // --- gate prefix, per-token scalars, per head ---------------------------------------------
+    float G_i[2], beta_i[2];
+    G_i[1] = 0.0f; beta_i[1] = 0.0f;
+    for (uint hh = 0; hh < hpair; hh++) {
+        const uint  hd     = (hh == 0) ? head : head1;
+        const uint  gb_off = seq * sb3 + hd * sb1 + tok * sb2;
+        const float g      = data_g[gb_off];
+        const float G      = sub_group_scan_inclusive_add(g);
+        const float G_C    = sub_group_broadcast(G, CH - 1);
+        G_i[hh]    = G;
+        beta_i[hh] = data_beta[gb_off];
+        Gs[hh][lane]  = G;
+        eG[hh][lane]  = exp(G);
+        eGd[hh][lane] = exp(G_C - G);
+        Bs[hh][lane]  = beta_i[hh];
+        if (lane == 0) {
+            *((global float *)(scr_buf + off_gamma) + ((hh == 0) ? ch0 : ch1)) = exp(G_C);
+        }
     }
     sub_group_barrier(CLK_LOCAL_MEM_FENCE);
 
@@ -182,29 +156,44 @@ kernel void kernel_gdn_chunk_prep(
     {
         global const float * q_row = q_chunk + (ulong) lane * sq2;
         global const float * k_row = k_chunk + (ulong) lane * sk2;
-        const float sg = scale * eG[lane];
+        global float * scr_qg0 = (global float *)(scr_buf + off_qg) + (ulong) ch0 * SCR_QG_SIZE;
+        global float * scr_qg1 = (global float *)(scr_buf + off_qg) + (ulong) ch1 * SCR_QG_SIZE;
+        const float sg0 = scale * eG[0][lane];
+        const float sg1 = scale * eG[1][lane];
         #pragma unroll 8
         for (uint r4 = 0; r4 < S_V / 4; r4++) {
             const float4 kv = vload4(0, k_row + r4 * 4);
             const float4 qv = vload4(0, q_row + r4 * 4);
-            vstore4(kv,      0, scr_kb + (r4 * CH + lane) * 4);
-            vstore4(qv,      0, scr_qb + (r4 * CH + lane) * 4);
-            vstore4(sg * qv, 0, scr_qg + (r4 * CH + lane) * 4);
+            vstore4(kv,       0, scr_kb  + (r4 * CH + lane) * 4);
+            vstore4(qv,       0, scr_qb  + (r4 * CH + lane) * 4);
+            vstore4(sg0 * qv, 0, scr_qg0 + (r4 * CH + lane) * 4);
+            if (hpair > 1) {
+                vstore4(sg1 * qv, 0, scr_qg1 + (r4 * CH + lane) * 4);
+            }
         }
     }
     // Kg = e^{G_C - G_t} k_t, t-blocked with lane = r (two rows per lane)
-    #pragma unroll 2
-    for (uint rh = 0; rh < S_V / CH; rh++) {
-        const uint r = rh * CH + lane;
-        #pragma unroll 4
-        for (uint t4 = 0; t4 < CH / 4; t4++) {
-            float kg[4];
-            #pragma unroll
-            for (uint e = 0; e < 4; e++) {
-                const uint t = t4 * 4 + e;
-                kg[e] = eGd[t] * k_chunk[(ulong) t * sk2 + r];
+    {
+        global float * scr_kg0 = (global float *)(scr_buf + off_kg) + (ulong) ch0 * SCR_KG_SIZE;
+        global float * scr_kg1 = (global float *)(scr_buf + off_kg) + (ulong) ch1 * SCR_KG_SIZE;
+        #pragma unroll 2
+        for (uint rh = 0; rh < S_V / CH; rh++) {
+            const uint r = rh * CH + lane;
+            #pragma unroll 4
+            for (uint t4 = 0; t4 < CH / 4; t4++) {
+                float kg0[4], kg1[4];
+                #pragma unroll
+                for (uint e = 0; e < 4; e++) {
+                    const uint  t = t4 * 4 + e;
+                    const float k = k_chunk[(ulong) t * sk2 + r];
+                    kg0[e] = eGd[0][t] * k;
+                    kg1[e] = eGd[1][t] * k;
+                }
+                vstore4((float4)(kg0[0], kg0[1], kg0[2], kg0[3]), 0, scr_kg0 + (t4 * S_V + r) * 4);
+                if (hpair > 1) {
+                    vstore4((float4)(kg1[0], kg1[1], kg1[2], kg1[3]), 0, scr_kg1 + (t4 * S_V + r) * 4);
+                }
             }
-            vstore4((float4)(kg[0], kg[1], kg[2], kg[3]), 0, scr_kg + (t4 * S_V + r) * 4);
         }
     }
     sub_group_barrier(CLK_GLOBAL_MEM_FENCE | CLK_LOCAL_MEM_FENCE);
@@ -249,28 +238,51 @@ kernel void kernel_gdn_chunk_prep(
             }
         }
 
-        // A[i][j] = beta_i exp(G_i - G_j) k_i.k_j for j < i
-        #pragma unroll
-        for (uint j = 0; j < JB; j++) {
-            const uint jj = jb * JB + j;
-            if (jj < lane) {
-                AT[lane * TSTRIDE + jj] = beta_i * exp(G_i - Gs[jj]) * acc_a[j];
-            }
-        }
+        // per head: A[i][j] = beta_i exp(G_i - G_j) k_i.k_j for j < i (head 1 parked in A1),
         // P[i][j] = scale exp(G_i - G_j) q_i.k_j for j <= i, else 0; t-blocked [j/4][i][4]
-        #pragma unroll
-        for (uint j4 = 0; j4 < JB / 4; j4++) {
-            float pe[4];
+        for (uint hh = 0; hh < hpair; hh++) {
+            global float * scr_p = (global float *)(scr_buf + off_p) + (ulong) ((hh == 0) ? ch0 : ch1) * SCR_P_SIZE;
+            const float Gi = G_i[hh];
+            const float bi = beta_i[hh];
             #pragma unroll
-            for (uint e = 0; e < 4; e++) {
-                const uint jj = jb * JB + j4 * 4 + e;
-                pe[e] = (jj <= lane) ? scale * exp(G_i - Gs[jj]) * acc_p[j4 * 4 + e] : 0.0f;
+            for (uint j = 0; j < JB; j++) {
+                const uint jj = jb * JB + j;
+                if (jj < lane) {
+                    const float a = bi * exp(Gi - Gs[hh][jj]) * acc_a[j];
+                    if (hh == 0) {
+                        AT[lane * TSTRIDE + jj] = a;
+                    } else {
+                        A1[lane * (lane - 1) / 2 + jj] = a;
+                    }
+                }
             }
-            vstore4((float4)(pe[0], pe[1], pe[2], pe[3]), 0, scr_p + ((jb * (JB / 4) + j4) * CH + lane) * 4);
+            #pragma unroll
+            for (uint j4 = 0; j4 < JB / 4; j4++) {
+                float pe[4];
+                #pragma unroll
+                for (uint e = 0; e < 4; e++) {
+                    const uint jj = jb * JB + j4 * 4 + e;
+                    pe[e] = (jj <= lane) ? scale * exp(Gi - Gs[hh][jj]) * acc_p[j4 * 4 + e] : 0.0f;
+                }
+                vstore4((float4)(pe[0], pe[1], pe[2], pe[3]), 0, scr_p + ((jb * (JB / 4) + j4) * CH + lane) * 4);
+            }
         }
     }
 #endif
     sub_group_barrier(CLK_LOCAL_MEM_FENCE);
+
+    for (uint hh = 0; hh < hpair; hh++) {
+    if (hh == 1) {
+        // head 1's turn: its A into the triangle (own row), then everyone may read it
+        for (uint jj = 0; jj < lane; jj++) {
+            AT[lane * TSTRIDE + jj] = A1[lane * (lane - 1) / 2 + jj];
+        }
+        sub_group_barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    const uint     ch    = (hh == 0) ? ch0 : ch1;
+    global float * scr_w = (global float *)(scr_buf + off_w) + (ulong) ch * SCR_W_SIZE;
+    global float * scr_u = (global float *)(scr_buf + off_u) + (ulong) ch * SCR_U_SIZE;
+    global const float * v_chunk = data_v + seq * sv3 + ((hh == 0) ? head : head1) * sv1 + (ulong) (chunk * CH) * sv2;
 
     // --- T = (I + A)^-1 by forward substitution, lane = column l --------------------------------
     // T[i][l] = d_il - sum_{j<i} A[i][j] T[j][l]: A row i is read four at a time wave-uniformly,
@@ -318,7 +330,7 @@ kernel void kernel_gdn_chunk_prep(
                 acc1[e] = 0.0f;
             }
             for (uint j = 0; j < ib * 16 + 16; j++) {
-                const float g  = (mtx == 0) ? Bs[j] * eG[j] : Bs[j];
+                const float g  = (mtx == 0) ? Bs[hh][j] * eG[hh][j] : Bs[hh][j];
                 const float x0 = src[(ulong) j * sstride + lane]      * g;
                 const float x1 = src[(ulong) j * sstride + CH + lane] * g;
                 #pragma unroll
@@ -344,21 +356,14 @@ kernel void kernel_gdn_chunk_prep(
         }
     }
 #endif
+    }
 }
 
 // One workgroup per (column block, head, seq): NCOL state columns resident in local
-// memory across the chunk loop. Lane = (token group lg = lane % (CH/MSPLIT)) x (split
-// ls = lane / (CH/MSPLIT)); a lane owns tokens lg + (CH/MSPLIT) e and state rows
-// lg + (CH/MSPLIT) f, and the r (t) axis of each product is split across ls, so one
-// uniform S (V_new) float4 feeds MSPLIT rows of W and Qg (P, and 2*MSPLIT rows of Kg).
-// Writes the attention rows of the chunked tokens and the state after the last chunk
-// (to the snapshot slot, or the tail scratch when the recurrent kernel finishes the
-// remaining tokens).
-#define TG      (CH / MSPLIT)       // token groups == lanes per split
-#define R4S     (S_V / 4 / MSPLIT)  // r4 steps per lane in GEMM1
-#define T4S     (CH / 4 / MSPLIT)   // t4 steps per lane in GEMM2
-#define NRF     (S_V / TG)          // state rows per lane == 2*MSPLIT
-
+// memory across the chunk loop, lane = token row of the chunk and state rows lane,
+// lane + 64. Writes the attention rows of the chunked tokens and the state after the
+// last chunk (to the snapshot slot, or the tail scratch when the recurrent kernel
+// finishes the remaining tokens).
 __attribute__((reqd_work_group_size(CH, 1, 1)))
 REQD_SUBGROUP_SIZE_64
 kernel void kernel_gdn_chunk_scan(
@@ -376,8 +381,6 @@ kernel void kernel_gdn_chunk_scan(
     const uint head = get_group_id(1);
     const uint seq  = get_group_id(2);
     const uint lane = get_local_id(0);
-    const uint lg   = lane % TG;
-    const uint ls   = lane / TG;
 
     global const float * data_state = (global const float *)(state_buf + off_state);
     global       float * data_dst   = (global       float *)(dst_buf   + off_dst);
@@ -394,7 +397,6 @@ kernel void kernel_gdn_chunk_scan(
 
     __local float S_l [NCOL * S_V];     // [col][r]
     __local float VN_l[NCOL * CH];      // [col][t]
-    __local float xchg[CH];
 
     const uint col0 = cb * NCOL;
 
@@ -417,129 +419,69 @@ kernel void kernel_gdn_chunk_scan(
         global const float * scr_p     = (global const float *)(scr_buf + off_p)     + (ulong) ch * SCR_P_SIZE;
         global const float * scr_gamma = (global const float *)(scr_buf + off_gamma) + ch;
 
-        // (V'; Oi) = (W; Qg) S over this lane's r4 range, MSPLIT token rows
-        float accv[MSPLIT][NCOL];
-        float acco[MSPLIT][NCOL];
+        // (V'; Oi) = (W; Qg) S : lane = token row
+        float accv[NCOL];
+        float acco[NCOL];
         #pragma unroll
-        for (uint e = 0; e < MSPLIT; e++) {
-            #pragma unroll
-            for (uint c = 0; c < NCOL; c++) {
-                accv[e][c] = 0.0f;
-                acco[e][c] = 0.0f;
-            }
+        for (uint c = 0; c < NCOL; c++) {
+            accv[c] = 0.0f;
+            acco[c] = 0.0f;
         }
-        for (uint r4 = ls * R4S; r4 < (ls + 1) * R4S; r4++) {
-            float4 w[MSPLIT], qg[MSPLIT];
-            #pragma unroll
-            for (uint e = 0; e < MSPLIT; e++) {
-                w[e]  = vload4(0, scr_w  + (r4 * CH + lg + e * TG) * 4);
-                qg[e] = vload4(0, scr_qg + (r4 * CH + lg + e * TG) * 4);
-            }
+        for (uint r4 = 0; r4 < S_V / 4; r4++) {
+            const float4 w  = vload4(0, scr_w  + (r4 * CH + lane) * 4);
+            const float4 qg = vload4(0, scr_qg + (r4 * CH + lane) * 4);
             #pragma unroll
             for (uint c = 0; c < NCOL; c++) {
                 const float4 s = vload4(0, S_l + c * S_V + r4 * 4);
-                #pragma unroll
-                for (uint e = 0; e < MSPLIT; e++) {
-                    accv[e][c] += dot(w[e],  s);
-                    acco[e][c] += dot(qg[e], s);
-                }
-            }
-        }
-        #pragma unroll
-        for (uint e = 0; e < MSPLIT; e++) {
-            #pragma unroll
-            for (uint c = 0; c < NCOL; c++) {
-                accv[e][c] = gdn_split_sum(accv[e][c], MSPLIT, xchg, lane);
-                acco[e][c] = gdn_split_sum(acco[e][c], MSPLIT, xchg, lane);
+                accv[c] += dot(w,  s);
+                acco[c] += dot(qg, s);
             }
         }
 
-        // V_new = U - V' into local memory, [col][t]; split 0 writes
-        if (ls == 0) {
-            #pragma unroll
-            for (uint e = 0; e < MSPLIT; e++) {
-                const uint i = lg + e * TG;
-                #pragma unroll
-                for (uint c4 = 0; c4 < NCOL / 4; c4++) {
-                    const float4 u = vload4(0, scr_u + i * S_V + col0 + c4 * 4);
-                    VN_l[(c4 * 4 + 0) * CH + i] = u.s0 - accv[e][c4 * 4 + 0];
-                    VN_l[(c4 * 4 + 1) * CH + i] = u.s1 - accv[e][c4 * 4 + 1];
-                    VN_l[(c4 * 4 + 2) * CH + i] = u.s2 - accv[e][c4 * 4 + 2];
-                    VN_l[(c4 * 4 + 3) * CH + i] = u.s3 - accv[e][c4 * 4 + 3];
-                }
-            }
+        // V_new = U - V' into local memory, [col][t]
+        #pragma unroll
+        for (uint c4 = 0; c4 < NCOL / 4; c4++) {
+            const float4 u = vload4(0, scr_u + lane * S_V + col0 + c4 * 4);
+            VN_l[(c4 * 4 + 0) * CH + lane] = u.s0 - accv[c4 * 4 + 0];
+            VN_l[(c4 * 4 + 1) * CH + lane] = u.s1 - accv[c4 * 4 + 1];
+            VN_l[(c4 * 4 + 2) * CH + lane] = u.s2 - accv[c4 * 4 + 2];
+            VN_l[(c4 * 4 + 3) * CH + lane] = u.s3 - accv[c4 * 4 + 3];
         }
         sub_group_barrier(CLK_LOCAL_MEM_FENCE);
 
-        // O += P V_new (MSPLIT token rows); dS = Kg^T V_new (NRF state rows), t4 range split
-        float accs[NRF][NCOL];
+        // O += P V_new (lane = token row); dS = Kg^T V_new (lane = r and r + 64)
+        float accs0[NCOL];
+        float accs1[NCOL];
         #pragma unroll
-        for (uint f = 0; f < NRF; f++) {
-            #pragma unroll
-            for (uint c = 0; c < NCOL; c++) {
-                accs[f][c] = 0.0f;
-            }
+        for (uint c = 0; c < NCOL; c++) {
+            accs0[c] = 0.0f;
+            accs1[c] = 0.0f;
         }
-        for (uint t4 = ls * T4S; t4 < (ls + 1) * T4S; t4++) {
-            float4 p[MSPLIT], kg[NRF];
-            #pragma unroll
-            for (uint e = 0; e < MSPLIT; e++) {
-                p[e] = vload4(0, scr_p + (t4 * CH + lg + e * TG) * 4);
-            }
-            #pragma unroll
-            for (uint f = 0; f < NRF; f++) {
-                kg[f] = vload4(0, scr_kg + (t4 * S_V + lg + f * TG) * 4);
-            }
+        for (uint t4 = 0; t4 < CH / 4; t4++) {
+            const float4 p   = vload4(0, scr_p  + (t4 * CH  + lane) * 4);
+            const float4 kg0 = vload4(0, scr_kg + (t4 * S_V + lane) * 4);
+            const float4 kg1 = vload4(0, scr_kg + (t4 * S_V + CH + lane) * 4);
             #pragma unroll
             for (uint c = 0; c < NCOL; c++) {
                 const float4 vn = vload4(0, VN_l + c * CH + t4 * 4);
-                #pragma unroll
-                for (uint e = 0; e < MSPLIT; e++) {
-                    acco[e][c] += dot(p[e], vn);
-                }
-                #pragma unroll
-                for (uint f = 0; f < NRF; f++) {
-                    accs[f][c] += dot(kg[f], vn);
-                }
-            }
-        }
-        #pragma unroll
-        for (uint e = 0; e < MSPLIT; e++) {
-            #pragma unroll
-            for (uint c = 0; c < NCOL; c++) {
-                acco[e][c] = gdn_split_sum(acco[e][c], MSPLIT, xchg, lane);
-            }
-        }
-        #pragma unroll
-        for (uint f = 0; f < NRF; f++) {
-            #pragma unroll
-            for (uint c = 0; c < NCOL; c++) {
-                accs[f][c] = gdn_split_sum(accs[f][c], MSPLIT, xchg, lane);
+                acco [c] += dot(p,   vn);
+                accs0[c] += dot(kg0, vn);
+                accs1[c] += dot(kg1, vn);
             }
         }
 
-        if (ls == 0) {
-            #pragma unroll
-            for (uint e = 0; e < MSPLIT; e++) {
-                global float * orow = attn + (ulong) (chunk * CH + lg + e * TG) * (S_V * H_v);
-                #pragma unroll
-                for (uint c4 = 0; c4 < NCOL / 4; c4++) {
-                    vstore4((float4)(acco[e][c4 * 4 + 0], acco[e][c4 * 4 + 1], acco[e][c4 * 4 + 2], acco[e][c4 * 4 + 3]), 0, orow + c4 * 4);
-                }
-            }
+        global float * orow = attn + (ulong) (chunk * CH + lane) * (S_V * H_v);
+        #pragma unroll
+        for (uint c4 = 0; c4 < NCOL / 4; c4++) {
+            vstore4((float4)(acco[c4 * 4 + 0], acco[c4 * 4 + 1], acco[c4 * 4 + 2], acco[c4 * 4 + 3]), 0, orow + c4 * 4);
         }
 
         // S = gamma S + dS; the barrier also orders this chunk's VN reads before the next writes
         const float gamma = *scr_gamma;
-        if (ls == 0) {
-            #pragma unroll
-            for (uint f = 0; f < NRF; f++) {
-                const uint r = lg + f * TG;
-                #pragma unroll
-                for (uint c = 0; c < NCOL; c++) {
-                    S_l[c * S_V + r] = gamma * S_l[c * S_V + r] + accs[f][c];
-                }
-            }
+        #pragma unroll
+        for (uint c = 0; c < NCOL; c++) {
+            S_l[c * S_V + lane]      = gamma * S_l[c * S_V + lane]      + accs0[c];
+            S_l[c * S_V + CH + lane] = gamma * S_l[c * S_V + CH + lane] + accs1[c];
         }
         sub_group_barrier(CLK_LOCAL_MEM_FENCE);
     }
