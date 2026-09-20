@@ -28,7 +28,7 @@ struct htp_binary_kernel_params {
     uint32_t src1_row_size_aligned;
     uint32_t dst_row_size_aligned;
 
-    uint32_t static_src1_size;
+    uint32_t src1_size;
     uint32_t vtcm_size;
 };
 
@@ -52,7 +52,7 @@ struct htp_binary_vtcm_layout {
     size_t src1_spad_half_size;
     size_t dst_spad_half_size;
 
-    size_t static_src1_size;
+    size_t src1_size;
     uint32_t rows_per_buffer;
 };
 
@@ -72,17 +72,17 @@ static inline void htp_binary_vtcm_layout_build(
         ? 2 * (kparams->src0_row_size_aligned + kparams->src1_row_size_aligned + kparams->dst_row_size_aligned)
         : 2 * (kparams->src0_row_size_aligned + kparams->dst_row_size_aligned);
 
-    if (spad_row_total == 0 || vtcm_size < kparams->static_src1_size) {
+    if (spad_row_total == 0 || vtcm_size < kparams->src1_size) {
         return;
     }
 
-    const size_t rows_per_buffer = (vtcm_size - kparams->static_src1_size) / (n_threads * spad_row_total);
+    const size_t rows_per_buffer = (vtcm_size - kparams->src1_size) / (n_threads * spad_row_total);
     if (rows_per_buffer == 0) {
         return;
     }
 
     L->rows_per_buffer = (uint32_t) rows_per_buffer;
-    L->static_src1_size = kparams->static_src1_size;
+    L->src1_size = kparams->src1_size;
 
     L->src0_bytes_per_thread = rows_per_buffer * 2 * kparams->src0_row_size_aligned;
     L->dst_bytes_per_thread  = rows_per_buffer * 2 * kparams->dst_row_size_aligned;
@@ -95,8 +95,8 @@ static inline void htp_binary_vtcm_layout_build(
     L->dst_spad_half_size  = L->dst_bytes_per_thread / 2;
 
     const size_t src0_total = n_threads * L->src0_bytes_per_thread;
-    const size_t src1_total = (kparams->static_src1_size > 0)
-        ? kparams->static_src1_size
+    const size_t src1_total = (kparams->src1_size > 0)
+        ? kparams->src1_size
         : n_threads * L->src1_bytes_per_thread;
     const size_t dst_total  = n_threads * L->dst_bytes_per_thread;
 

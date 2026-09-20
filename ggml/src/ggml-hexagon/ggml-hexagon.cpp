@@ -4785,19 +4785,20 @@ static bool ggml_hexagon_precompute_binary_params(
     const bool is_complex   = !is_add_id && !is_scalar && !is_same_shape && (src1->ne[0] == src0->ne[0]);
 
     enum htp_binary_kernel_type kernel_type;
-    size_t static_src1_size = 0;
+    size_t src1_size = 0;
 
     if (is_add_id) {
         kernel_type = HTP_BINARY_KERNEL_ADD_ID;
+        src1_size = hex_round_up(src1->ne[1] * src1_row_size_aligned, 128);
     } else if (is_row_bcast) {
         kernel_type = HTP_BINARY_KERNEL_ROW_BCAST;
-        static_src1_size = src1_row_size_aligned;
+        src1_size = src1_row_size_aligned;
     } else if (is_scalar) {
         const bool is_scalar_static = (src1->ne[2] == 1 && src1->ne[3] == 1) &&
             (src1->ne[1] == 1 || src1->nb[1] == elem_size);
         if (is_scalar_static) {
             kernel_type = HTP_BINARY_KERNEL_SCALAR_DMA;
-            static_src1_size = hex_round_up(src1->ne[1] * elem_size, 128);
+            src1_size = hex_round_up(src1->ne[1] * elem_size, 128);
         } else {
             kernel_type = HTP_BINARY_KERNEL_SCALAR;
         }
@@ -4814,7 +4815,7 @@ static bool ggml_hexagon_precompute_binary_params(
     kparams->src0_row_size_aligned = src0_row_size_aligned;
     kparams->src1_row_size_aligned = src1_row_size_aligned;
     kparams->dst_row_size_aligned  = dst_row_size_aligned;
-    kparams->static_src1_size      = static_src1_size;
+    kparams->src1_size             = src1_size;
 
     struct htp_binary_vtcm_layout L;
     htp_binary_vtcm_layout_build(&L, kparams, sess->vtcm_size);
@@ -5518,22 +5519,29 @@ static bool ggml_hexagon_supported_binary(const struct ggml_hexagon_session * se
 static bool ggml_hexagon_supported_add_id(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op) {
     const struct ggml_tensor * src0 = op->src[0];
     const struct ggml_tensor * src1 = op->src[1];
+    const struct ggml_tensor * src2 = op->src[2];
     const struct ggml_tensor * dst  = op;
 
-    if (src0->type != GGML_TYPE_F32) {
+    if (!src2) {
         return false;
     }
-    if (src1->type != GGML_TYPE_F32) {
-        return false;
-    }
-    if (dst->type != GGML_TYPE_F32) {
+    if (src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || src2->type != GGML_TYPE_I32) {
         return false;
     }
     if (!ggml_are_same_shape(src0, dst)) {
         return false;
     }
+    if (src1->ne[0] != src0->ne[0] || src1->ne[2] != 1 || src1->ne[3] != 1) {
+        return false;
+    }
+    if (src2->ne[0] != src0->ne[1] || src2->ne[1] != src0->ne[2]) {
+        return false;
+    }
+    if (src0->nb[0] != sizeof(float) || src1->nb[0] != sizeof(float) || dst->nb[0] != sizeof(float) || src2->nb[0] != sizeof(int32_t)) {
+        return false;
+    }
 
-    // REVISIT: add support for non-contigiuos tensors
+    // REVISIT: add support for non-contiguous tensors
     if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) {
         return false;
     }

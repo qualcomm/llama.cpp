@@ -14,6 +14,7 @@
 #include "htp/matmul-ops.h"
 #include "htp/flash-attn-ops.h"
 #include "htp/unary-ops.h"
+#include "htp/binary-ops.h"
 #include "htp/allreduce-ops.h"
 #include "htp/ssm-conv.h"
 #include "htp/gated-delta-net-ops.h"
@@ -360,6 +361,10 @@ struct htp_opformat {
             snprintf(str, max_size, "%s vtcm %u",
                      kparams->kda ? "kda" : "scalar",
                      (unsigned int) (kparams->vtcm_size ? kparams->vtcm_size : kparams->vtcm_per_thread * kparams->n_threads));
+        } else if (node.opcode == HTP_OP_MUL || node.opcode == HTP_OP_ADD || node.opcode == HTP_OP_ADD_ID ||
+                   node.opcode == HTP_OP_SUB || node.opcode == HTP_OP_DIV) {
+            const auto * kparams = (const struct htp_binary_kernel_params *) node.kernel_params;
+            snprintf(str, max_size, "vtcm %u", (unsigned int) kparams->vtcm_size);
         } else {
             snprintf(str, max_size, "----");
         }
