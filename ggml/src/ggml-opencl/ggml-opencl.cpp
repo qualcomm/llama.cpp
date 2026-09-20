@@ -30333,8 +30333,17 @@ static bool ggml_cl_flash_attn_decompose(
         return atoi(e) != 0 ? 1 : 0;
     }();
     const bool kq_p8_int8_shape = backend_ctx->kernel_mul_mm_q8_kq_p8 != nullptr && (dk % 32 == 0) && dk <= 256;
+    // A model with attention sinks at head size 64 declines the int8 KQ. The sink logit is fixed
+    // while the scores move, so the score error of an int8 contraction re-weights sink against
+    // keys instead of only reordering keys, and the softmax carries that into the output. It is
+    // the sinks and not the head size: on a sinks-free model of the same geometry the same
+    // comparison is an order of magnitude smaller, and head size 256 is unaffected either way.
+    // The KQV side is untouched - it costs nothing on either model.
+    // GGML_OPENCL_FA_KQ_INT8=1 still forces the kernel, for A/B.
+    const bool kq_int8_sinks = sinks != nullptr && dk <= 64;
     const bool kq_int8_env_pre = kq_int8_env_val == 1 ||
-                                 (kq_int8_env_val == -1 && kq_p8_env && kqv_int8_possible && kq_p8_int8_shape);
+                                 (kq_int8_env_val == -1 && !kq_int8_sinks &&
+                                  kq_p8_env && kqv_int8_possible && kq_p8_int8_shape);
     const bool kq_p8_possible = kq_p8_env && kqv_int8_possible &&
         (kq_int8_env_pre ? kq_p8_int8_shape
                          : backend_ctx->kernel_mul_mm_f16_f32_kq_p8 != nullptr) &&
@@ -30584,11 +30593,12 @@ static bool ggml_cl_flash_attn_decompose(
     // sizes its local memory for dk <= 256; larger heads keep the f16 GEMM.
     const bool kq_int8_env = kq_int8_env_pre;
     const bool kq_int8 = kq_int8_env && (dk % 32 == 0) && dk <= 256 && n_head_kv > 0;
-    if (kq_int8_env_val != -1 || kq_int8) {
+    if (kq_int8_env_val != -1 || kq_int8 || kq_int8_sinks) {
         static bool said = false;
         if (!said) {
             said = true;
-            GGML_LOG_INFO("ggml_opencl: FA_KQ_INT8 %s dk=%d n_kv=%d n_head_kv=%d\n", kq_int8 ? "ON" : "DECLINED", (int)dk, (int)n_kv, (int)n_head_kv);
+            GGML_LOG_INFO("ggml_opencl: FA_KQ_INT8 %s dk=%d n_kv=%d n_head_kv=%d%s\n", kq_int8 ? "ON" : "DECLINED",
+                          (int)dk, (int)n_kv, (int)n_head_kv, kq_int8_sinks && !kq_int8 ? " (declined: sinks at dk<=64)" : "");
         }
     }
     if (kq_int8) {
