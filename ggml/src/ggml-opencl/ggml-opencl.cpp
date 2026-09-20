@@ -8428,10 +8428,6 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         }
         std::string opts = compile_opts;
         opts += " -DS_V=128 -DNCOL=" + std::to_string(backend_ctx->gdn_chunk_ncol);
-        if (const char * e = getenv("GGML_OPENCL_GDN_CHUNK_DBG")) {
-            opts += " ";
-            opts += e; // raw extra defines for kernel-phase timing; output is wrong with any of them
-        }
         // Not fatal: a compiler that rejects these kernels only loses the chunked path.
         cl_program prog = build_program_from_source_ex(backend_ctx->context, backend_ctx->device,
                                                        kernel_src.c_str(), opts, /*fatal=*/false, "gated_delta_net_chunk");
@@ -51747,27 +51743,6 @@ static void ggml_cl_gated_delta_net_impl(ggml_backend_t backend, ggml_tensor * d
         size_t global_work_size[3] = { (size_t) n_chunks * CH, (size_t) (H_v / hpair), (size_t) n_seqs };
         size_t local_work_size[3]  = { (size_t) CH, 1, 1 };
         backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
-    }
-
-    // Diagnostic: read the prep scratch back and summarise each region (GGML_OPENCL_GDN_CHUNK_DUMP=1)
-    if (ggml_cl_env_flag("GGML_OPENCL_GDN_CHUNK_DUMP")) {
-        CL_CHECK(clFinish(backend_ctx->queue));
-        const size_t total = (size_t) (off_gamma + (cl_ulong) n_ch * sizeof(float));
-        std::vector<float> buf(total / sizeof(float));
-        CL_CHECK(clEnqueueReadBuffer(backend_ctx->queue, scr, CL_TRUE, 0, total, buf.data(), 0, NULL, NULL));
-        struct region { const char * name; cl_ulong off; cl_ulong bytes; };
-        const region regs[] = { {"W", off_w, sz_mat}, {"Qg", off_qg, sz_mat}, {"Kg", off_kg, sz_mat}, {"U", off_u, sz_mat},
-                                {"Kb", off_kb, sz_mat}, {"Qb", off_qb, sz_mat}, {"P", off_p, sz_p}, {"gamma", off_gamma, (cl_ulong) n_ch * sizeof(float)} };
-        for (const region & r : regs) {
-            size_t nz = 0, nn = 0; float mn = 1e30f, mx = -1e30f;
-            const float * f = buf.data() + r.off / sizeof(float);
-            for (size_t i = 0; i < r.bytes / sizeof(float); i++) {
-                if (f[i] == 0.0f) nz++;
-                if (f[i] != f[i]) { nn++; continue; }
-                mn = std::min(mn, f[i]); mx = std::max(mx, f[i]);
-            }
-            GGML_LOG_INFO("gdn dump %-5s n=%zu zeros=%zu nan=%zu min=%g max=%g first=%g\n", r.name, r.bytes / sizeof(float), nz, nn, mn, mx, f[0]);
-        }
     }
 
     // input state: the state tensor, or the cache rows ids[seq] when the get_rows was fused

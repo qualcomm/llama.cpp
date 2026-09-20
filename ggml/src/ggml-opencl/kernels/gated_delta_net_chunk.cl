@@ -201,7 +201,6 @@ kernel void kernel_gdn_chunk_prep(
     // --- A = strict_lower(beta_i D (K K^T)), P = lower(scale D (Q K^T)), lane = row i --------
     // JB tokens j at a time over RB-wide r blocks: the lane's own k and q blocks sit in
     // registers, the [JB][RB] k tile is read wave-uniformly and each float4 feeds both dots.
-#ifndef GDN_SKIP_AP
     for (uint jb = 0; jb < CH / JB; jb++) {
         float acc_a[JB], acc_p[JB];
         #pragma unroll
@@ -268,7 +267,6 @@ kernel void kernel_gdn_chunk_prep(
             }
         }
     }
-#endif
     barrier(CLK_LOCAL_MEM_FENCE);
 
     for (uint hh = 0; hh < hpair; hh++) {
@@ -288,7 +286,6 @@ kernel void kernel_gdn_chunk_prep(
     // T[i][l] = d_il - sum_{j<i} A[i][j] T[j][l]: A row i is read four at a time wave-uniformly,
     // T[j][l] is this lane's own earlier write, kept transposed at AT[l][j] (on and above the
     // diagonal, disjoint from A; the entries below it belong to A and are masked). No barrier.
-#ifndef GDN_SKIP_SOLVE
     if (lane == 0) {
         AT[0] = 1.0f;   // T[0][0]; lane 0 reads it in every later step
     }
@@ -312,13 +309,11 @@ kernel void kernel_gdn_chunk_prep(
             AT[lane * TSTRIDE + i] = t;
         }
     }
-#endif
     barrier(CLK_LOCAL_MEM_FENCE);
 
     // --- W = T (K beta e^G), U = T (V beta), lane = column pair (r, r + 64) --------------------
     // 16-row blocks of i; T[i][j] for the block is four uniform float4 (AT[j][i0..i0+15]), each
     // feeding eight FMAs, and j stops at the block's last row (T is lower triangular).
-#ifndef GDN_SKIP_WU
     for (uint mtx = 0; mtx < 2; mtx++) {
         global const float * src = (mtx == 0) ? k_chunk : v_chunk;
         const ulong sstride = (mtx == 0) ? sk2 : sv2;
@@ -365,7 +360,6 @@ kernel void kernel_gdn_chunk_prep(
             }
         }
     }
-#endif
     }
 }
 
