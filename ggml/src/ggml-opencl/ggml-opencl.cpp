@@ -1622,7 +1622,8 @@ struct ggml_backend_opencl_context {
     // tgpp 0 = TG variant (COLS_PER_LANE_GROUP=1), tgpp 1 = prefill variant (COLS_PER_LANE_GROUP=4).
     cl_kernel kernel_gated_delta_net_f32[4][2][2] = {};
     // Chunkwise (WY) gated_delta_net prefill, S_V=128 scalar gate only; see
-    // kernels/gated_delta_net_chunk.cl. GGML_OPENCL_GDN_CHUNK=1 opts in,
+    // kernels/gated_delta_net_chunk.cl. Default on for X2-class Adreno (GGML_OPENCL_GDN_CHUNK=0
+    // opts out), GGML_OPENCL_GDN_CHUNK=1 opts in elsewhere;
     // GGML_OPENCL_GDN_CHUNK_NCOL={4,8,16} sets the state columns per scan workgroup.
     cl_kernel kernel_gdn_chunk_prep = nullptr;
     cl_kernel kernel_gdn_chunk_scan = nullptr;
@@ -8414,7 +8415,10 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
     #else
         const std::string kernel_src = read_file("gated_delta_net_chunk.cl");
     #endif
-        backend_ctx->gdn_chunk = ggml_cl_env_flag("GGML_OPENCL_GDN_CHUNK");
+        // Default on for the X2 class (X2-90, Adreno 840: Qwen3.5-35B prefill +3.3..4.3%, perplexity
+        // in band, GATED_DELTA_NET suite clean on both); other gens are unmeasured and opt in.
+        backend_ctx->gdn_chunk = backend_ctx->adreno_x2_class() ? !ggml_cl_env_flag_zero("GGML_OPENCL_GDN_CHUNK")
+                                                                 :  ggml_cl_env_flag("GGML_OPENCL_GDN_CHUNK");
         if (const char * e = getenv("GGML_OPENCL_GDN_CHUNK_NCOL")) {
             const int n = atoi(e);
             if (n == 4 || n == 8 || n == 16) {
