@@ -8417,8 +8417,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
     #endif
         // Default on for the X2 class (X2-90, Adreno 840: Qwen3.5-35B prefill +3.3..4.3%, perplexity
         // in band, GATED_DELTA_NET suite clean on both); other gens are unmeasured and opt in.
-        backend_ctx->gdn_chunk = backend_ctx->adreno_x2_class() ? !ggml_cl_env_flag_zero("GGML_OPENCL_GDN_CHUNK")
-                                                                 :  ggml_cl_env_flag("GGML_OPENCL_GDN_CHUNK");
+        backend_ctx->gdn_chunk = backend_ctx->adreno_x2_class()
+            ? !ggml_cl_env_flag_zero("GGML_OPENCL_GDN_CHUNK")
+            :  ggml_cl_env_flag("GGML_OPENCL_GDN_CHUNK") && !ggml_cl_env_flag_zero("GGML_OPENCL_GDN_CHUNK");
         if (const char * e = getenv("GGML_OPENCL_GDN_CHUNK_NCOL")) {
             const int n = atoi(e);
             if (n == 4 || n == 8 || n == 16) {
