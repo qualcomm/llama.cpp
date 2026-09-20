@@ -201,9 +201,9 @@ __kernel void mul_mm_f16_f32_kq_p8(
         int offset0,
         __global float* matrix_B,
         int offset1,
-        __global uchar* qp,      // u8 P, [D_B][N][M]
-        __global float* bmax,    // per 32-row block max,          [D_B][N][M/32]
-        __global float* bsum,    // per block sum of exp(s - bmax), [D_B][N][M/32]
+        __global uchar* qp,      // u8 P, [D_B][N][p_pitch]
+        __global float* bmax,    // per 32-row block max,          [D_B][N][p_pitch/32]
+        __global float* bsum,    // per block sum of exp(s - bmax), [D_B][N][p_pitch/32]
         __global char*  mask,    // f16 [>=M][N] view (chunk rows), row stride mask_nb1 bytes
         ulong offset_mask,
         ulong mask_nb1,
@@ -216,7 +216,8 @@ __kernel void mul_mm_f16_f32_kq_p8(
         int D_A,
         int D_B,
         int nb01,
-        int kqv_mblock_fast
+        int kqv_mblock_fast,
+        int p_pitch              // bytes per P row, >= M, multiple of 32
 ) {
 #elif defined(KQV)
 __kernel void mul_mm_f16_f32_kqv(
@@ -390,7 +391,7 @@ __kernel void mul_mm_f16_f32_kq(
     }
     __global const half * mrow = (__global const half *)(mask + offset_mask);
     const uint mstride = (uint)(mask_nb1 / 2);
-    const int nblk = M / 32;
+    const int nblk = p_pitch / 32;
 
     #pragma unroll
     for (int half_ = 0; half_ < 2; ++half_) {
@@ -441,7 +442,7 @@ __kernel void mul_mm_f16_f32_kq(
                     q0 = convert_uchar16_sat_rte(e0*255.0f);
                     q1 = convert_uchar16_sat_rte(e1*255.0f);
                 }
-                __global uchar * qdst = qp + (size_t)prow*(size_t)M + (size_t)kvb;
+                __global uchar * qdst = qp + (size_t)prow*(size_t)p_pitch + (size_t)kvb;
                 vstore16(q0, 0, qdst);
                 vstore16(q1, 1, qdst);
                 bmax[(size_t)prow*nblk + blk] = amax;

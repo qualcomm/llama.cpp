@@ -249,7 +249,7 @@ static bool ggml_cl_is_q8_0_soa(const ggml_tensor * tensor);
 
 static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
 static void ggml_cl_soft_max(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
-static void ggml_cl_soft_max_ex(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, cl_mem sums, cl_mem qp = nullptr, cl_mem dp = nullptr);
+static void ggml_cl_soft_max_ex(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, cl_mem sums, cl_mem qp = nullptr, cl_mem dp = nullptr, int qp_pitch = 0);
 static void ggml_cl_cpy(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
 
 // See https://gmplib.org/~tege/divcnst-pldi94.pdf figure 4.1.
@@ -29916,8 +29916,10 @@ static void ggml_cl_fa_kq_p8_dispatch(ggml_backend_t backend,
                                       const ggml_tensor * dst,
                                       int64_t q0, int64_t nqc, int64_t n_kv, int64_t dk,
                                       int64_t n_head, int64_t n_head_kv,
-                                      float scale, float max_bias, bool kq_int8) {
+                                      float scale, float max_bias, bool kq_int8, int64_t p_pitch) {
     ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *)backend->context;
+    const int p_pitch_i = (int)p_pitch;
+    const int row_blk   = (int)(p_pitch / 32);
     cl_context context = backend_ctx->context;
     cl_int status;
 
@@ -30012,6 +30014,7 @@ static void ggml_cl_fa_kq_p8_dispatch(ggml_backend_t backend,
         CL_CHECK(clSetKernelArg(kk, i++, sizeof(int),      &nq_i));
         CL_CHECK(clSetKernelArg(kk, i++, sizeof(int),      &nh_i));
         CL_CHECK(clSetKernelArg(kk, i++, sizeof(int),      &nhkv_i));
+        CL_CHECK(clSetKernelArg(kk, i++, sizeof(int),      &p_pitch_i));
         const size_t gsz = (size_t)(D_B / D_A);
         const size_t tn  = 32;
         const size_t mb  = 64*(size_t)backend_ctx->fa_kq_mb;
@@ -30046,6 +30049,7 @@ static void ggml_cl_fa_kq_p8_dispatch(ggml_backend_t backend,
     CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &D_B));
     CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &nb01));
     CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &zero));   // kqv_mblock_fast: KQ is n-tile-fast
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &p_pitch_i));
 
     // Same grid as the separate KQ: n-tiles on the fast axis, m-blocks x heads on the slow one.
     const int n_tiles  = (N + 31) / 32;
@@ -30075,6 +30079,7 @@ static void ggml_cl_fa_kq_p8_dispatch(ggml_backend_t backend,
     CL_CHECK(clSetKernelArg(kf, a++, sizeof(cl_ulong), &off_sinks));
     CL_CHECK(clSetKernelArg(kf, a++, sizeof(int),      &has_sinks));
     CL_CHECK(clSetKernelArg(kf, a++, sizeof(int),      &nblk));
+    CL_CHECK(clSetKernelArg(kf, a++, sizeof(int),      &row_blk));
     CL_CHECK(clSetKernelArg(kf, a++, sizeof(int),      &N));
     size_t gws2[3] = {(size_t)64 * (size_t)N, (size_t)D_B, 1};
     size_t lws2[3] = {64, 1, 1};
@@ -30487,20 +30492,32 @@ static bool ggml_cl_flash_attn_decompose(
     // written. kqv_int8_possible above carries every condition, including the generation
     // allow-list; dv == kqv_m restates its dv % 64 test against the padded row count.
     const bool kqv_int8 = kqv_int8_possible && dv == kqv_m;
+    // Row pitch of the int8 scratch (V^T, P and their scales), in bytes. With the pitch equal to
+    // n_kv, every row of a kv-strided stream lands on the same cache sets whenever n_kv is a
+    // multiple of 4096 - one prefill ubatch in eight - and the int8 KQV then costs up to 2.4x per
+    // score, the V^T quantise 5x (X2-90, kernel alone). One extra 64-byte line per row spreads
+    // the rows and the cost is flat in n_kv. GGML_OPENCL_FA_KV_PITCH_PAD=0 restores the packed
+    // pitch (A/B only).
+    static const int64_t kv_pitch_pad = []{
+        const char * e = getenv("GGML_OPENCL_FA_KV_PITCH_PAD");
+        const int v = (e && e[0]) ? atoi(e) : 64;
+        return (int64_t)(v > 0 ? (v / 32) * 32 : 0);
+    }();
+    const int64_t kv_pitch = n_kv + kv_pitch_pad;
     if (kqv_int8_set || kqv_int8) {
         // Report once why the path did or did not take: four conditions, and a silent decline
         // is indistinguishable from a kernel that ran and did nothing.
         static bool said = false;
         if (!said) {
             said = true;
-            GGML_LOG_INFO("ggml_opencl: FA_KQV_INT8 %s n_kv=%d rem32=%d dv=%d kqv_m=%d n_head_kv=%d vt_q8=%s\n", kqv_int8 ? "ON" : "DECLINED", (int)n_kv, (int)(n_kv % 32), (int)dv, (int)kqv_m, (int)n_head_kv, backend_ctx->kernel_fa_v_transpose_q8 ? "yes" : "NULL");
+            GGML_LOG_INFO("ggml_opencl: FA_KQV_INT8 %s n_kv=%d rem32=%d dv=%d kqv_m=%d n_head_kv=%d vt_q8=%s pitch=%d\n", kqv_int8 ? "ON" : "DECLINED", (int)n_kv, (int)(n_kv % 32), (int)dv, (int)kqv_m, (int)n_head_kv, backend_ctx->kernel_fa_v_transpose_q8 ? "yes" : "NULL", (int)kv_pitch);
         }
     }
     if (kqv_int8) {
-        const size_t nblk = (size_t)n_kv / 32;
-        backend_ctx->prealloc_fa_vtq.allocate(backend_ctx->context, (size_t)n_kv*dv*n_head_kv);
+        const size_t nblk = (size_t)kv_pitch / 32;
+        backend_ctx->prealloc_fa_vtq.allocate(backend_ctx->context, (size_t)kv_pitch*dv*n_head_kv);
         backend_ctx->prealloc_fa_vtd.allocate(backend_ctx->context, nblk*dv*n_head_kv*sizeof(cl_half));
-        backend_ctx->prealloc_fa_pq.allocate(backend_ctx->context, (size_t)n_kv*n_q_chunk*n_head);
+        backend_ctx->prealloc_fa_pq.allocate(backend_ctx->context, (size_t)kv_pitch*n_q_chunk*n_head);
         backend_ctx->prealloc_fa_pd.allocate(backend_ctx->context, nblk*n_q_chunk*n_head*sizeof(cl_half));
         if (kq_p8_possible) {
             backend_ctx->prealloc_fa_bmax.allocate(backend_ctx->context, nblk*n_q_chunk*n_head*sizeof(float));
@@ -30585,6 +30602,10 @@ static bool ggml_cl_flash_attn_decompose(
         CL_CHECK(clSetKernelArg(kernel_vt_use, idx++, sizeof(cl_ulong), &v_nb1));
         CL_CHECK(clSetKernelArg(kernel_vt_use, idx++, sizeof(cl_ulong), &v_nb2));
         CL_CHECK(clSetKernelArg(kernel_vt_use, idx++, sizeof(cl_ulong), &v_nb3));
+        if (kqv_int8) {
+            const int kv_pitch_i = (int)kv_pitch;
+            CL_CHECK(clSetKernelArg(kernel_vt_use, idx++, sizeof(int), &kv_pitch_i));
+        }
 
         const size_t nd  = (size_t)((dv   + 31) / 32);
         const size_t nkb = (size_t)((n_kv + 31) / 32);
@@ -30642,7 +30663,7 @@ static bool ggml_cl_flash_attn_decompose(
         if (kq_p8) {
             GGML_ASSERT(defer_norm);
             ggml_cl_fa_kq_p8_dispatch(backend, k, q, mask, sinks, dst, q0, nqc, n_kv, dk, n_head, n_head_kv,
-                                      scale, max_bias, kq_int8);
+                                      scale, max_bias, kq_int8, kv_pitch);
         } else {
         ggml_cl_fa_scratch_tensor(kq, extra_kq, backend_ctx->prealloc_fa_kq.buffer,
                                   GGML_TYPE_F32, GGML_OP_MUL_MAT, n_kv, nqc, n_head, "fa_kq");
@@ -30724,7 +30745,8 @@ static bool ggml_cl_flash_attn_decompose(
             ggml_cl_soft_max_ex(backend, &kq, mask_arg, &kq_sm,
                                 defer_norm ? backend_ctx->prealloc_fa_sums.buffer : nullptr,
                                 kqv_int8 ? backend_ctx->prealloc_fa_pq.buffer : nullptr,
-                                kqv_int8 ? backend_ctx->prealloc_fa_pd.buffer : nullptr);
+                                kqv_int8 ? backend_ctx->prealloc_fa_pd.buffer : nullptr,
+                                (int)kv_pitch);
         }
         } // !kq_p8
 
@@ -30754,6 +30776,10 @@ static bool ggml_cl_flash_attn_decompose(
             CL_CHECK(clSetKernelArg(kk, i++, sizeof(int),      &nq_i));
             CL_CHECK(clSetKernelArg(kk, i++, sizeof(int),      &nh_i));
             CL_CHECK(clSetKernelArg(kk, i++, sizeof(int),      &nhkv_i));
+            {
+                const int kv_pitch_i = (int)kv_pitch;
+                CL_CHECK(clSetKernelArg(kk, i++, sizeof(int), &kv_pitch_i));
+            }
             // Matched to kernel_mul_mm_q8_kqv: 64 d rows x fa_kqv_tn queries per workgroup, d-block
             // fastest, then the query heads of one GQA group, then the query tile, then the KV
             // head. The kernel decodes the head from get_group_id(1); change both or neither.
@@ -50269,7 +50295,7 @@ static void ggml_cl_soft_max(ggml_backend_t backend, const ggml_tensor * src0, c
     ggml_cl_soft_max_ex(backend, src0, src1, dst, nullptr);
 }
 
-static void ggml_cl_soft_max_ex(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, cl_mem sums, cl_mem qp, cl_mem dp) {
+static void ggml_cl_soft_max_ex(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, cl_mem sums, cl_mem qp, cl_mem dp, int qp_pitch) {
     GGML_ASSERT(src0);
     GGML_ASSERT(src0->extra);
     GGML_ASSERT(dst);
@@ -50373,10 +50399,12 @@ static void ggml_cl_soft_max_ex(ggml_backend_t backend, const ggml_tensor * src0
     cl_uint a = 0;
     const cl_ulong offset_zero = 0;
     if (sums && qp && dp) {
+        const int qp_pitch_i = qp_pitch > 0 ? qp_pitch : ne00;
         CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &qp));
         CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &offset_zero));
         CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &dp));
         CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &offset_zero));
+        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &qp_pitch_i));
     }
     if (sums) {
         CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &sums));

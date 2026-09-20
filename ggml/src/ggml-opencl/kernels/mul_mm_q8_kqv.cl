@@ -41,13 +41,13 @@
 
 __attribute__((qcom_wave_pair_mode(1)))
 kernel void kernel_mul_mm_q8_kqv(
-        global const uint  * vq,        // V^T int8, [head_kv][dv][n_kv]        as packed uints
+        global const uint  * vq,        // V^T int8, [head_kv][dv][kv_pitch]     as packed uints
         ulong                off_vq,
-        global const half  * vd,        // V^T scales, [head_kv][dv][n_kv/32]
+        global const half  * vd,        // V^T scales, [head_kv][dv][kv_pitch/32]
         ulong                off_vd,
-        global const uint  * pq,        // P u8,     [head][n_q][n_kv]          as packed uints
+        global const uint  * pq,        // P u8,     [head][n_q][kv_pitch]       as packed uints
         ulong                off_pq,
-        global const half  * pd,        // P scales, [head][n_q][n_kv/32]
+        global const half  * pd,        // P scales, [head][n_q][kv_pitch/32]
         ulong                off_pd,
         global       float * dst,       // [head][n_q][dv]
         ulong                off_dst,
@@ -55,7 +55,8 @@ kernel void kernel_mul_mm_q8_kqv(
         int                  n_kv,
         int                  n_q,
         int                  n_head,
-        int                  n_head_kv
+        int                  n_head_kv,
+        int                  kv_pitch    // bytes per V^T row and per P row, >= n_kv, multiple of 32
 ) {
     vq  = (global const uint  *)((global const char *)vq  + off_vq);
     vd  = (global const half  *)((global const char *)vd  + off_vd);
@@ -72,7 +73,8 @@ kernel void kernel_mul_mm_q8_kqv(
     const int d    = get_group_id(0)*KQV_TM + lid;  // this lane's d row
 
     const int nblk = n_kv / 32;                     // dispatch guarantees n_kv % 32 == 0
-    const int nu   = n_kv / 4;                      // uints per row
+    const int nu   = kv_pitch / 4;                  // uints per row
+    const int nbp  = kv_pitch / 32;                 // scales per row
 
     __local uint sh_pq[KQV_TN][KQV_NB][8];
     __local half sh_pd[KQV_TN][KQV_NB];
@@ -85,7 +87,7 @@ kernel void kernel_mul_mm_q8_kqv(
 
     const int    dl    = min(d, dv - 1);            // clamp so a tail lane loads in bounds
     const size_t vbase = ((size_t)head_kv*dv + dl)*nu;
-    const size_t vdbas = ((size_t)head_kv*dv + dl)*nblk;
+    const size_t vdbas = ((size_t)head_kv*dv + dl)*nbp;
     const size_t pbase = (size_t)head*n_q;
 
     for (int bg = 0; bg < nblk; bg += KQV_NB) {
@@ -108,7 +110,7 @@ kernel void kernel_mul_mm_q8_kqv(
             const int bb = i % KQV_NB;
             const int qi = qn0 + t;
             sh_pd[t][bb] = (qi < n_q && bb < nb_here)
-                ? pd[(pbase + qi)*nblk + bg + bb] : (half)0.0f;
+                ? pd[(pbase + qi)*nbp + bg + bb] : (half)0.0f;
         }
         barrier(CLK_LOCAL_MEM_FENCE);
 

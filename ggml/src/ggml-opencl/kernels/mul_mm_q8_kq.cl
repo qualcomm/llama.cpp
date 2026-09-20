@@ -223,9 +223,9 @@ kernel void kernel_mul_mm_q8_kq_p8(
         global const half  * kd,        // K scales, [head_kv][n_kv][dk/32]
         global const uint  * qq,        // Q int8, [head][n_q][dk]       as packed uints
         global const half  * qd,        // Q scales, [head][n_q][dk/32]
-        global       uchar * qp,        // u8 P, [head][n_q][n_kv]
-        global       float * bmax,      // per 32-row block max,          [head][n_q][n_kv/32]
-        global       float * bsum,      // per block sum of exp(s - bmax), [head][n_q][n_kv/32]
+        global       uchar * qp,        // u8 P, [head][n_q][p_pitch]
+        global       float * bmax,      // per 32-row block max,          [head][n_q][p_pitch/32]
+        global       float * bsum,      // per block sum of exp(s - bmax), [head][n_q][p_pitch/32]
         global const char  * mask,      // f16 [>=n_kv][n_q] view, row stride mask_nb1 bytes
         ulong                offset_mask,
         ulong                mask_nb1,
@@ -238,7 +238,8 @@ kernel void kernel_mul_mm_q8_kq_p8(
         int                  n_kv,
         int                  n_q,
         int                  n_head,
-        int                  n_head_kv
+        int                  n_head_kv,
+        int                  p_pitch     // bytes per P row, >= n_kv, multiple of 32
 ) {
     const int lid  = get_local_id(0);
     const int gsz  = n_head / n_head_kv;
@@ -282,7 +283,7 @@ kernel void kernel_mul_mm_q8_kq_p8(
     }
     global const half * mrow = (global const half *)(mask + offset_mask);
     const uint mstride = (uint)(mask_nb1 / 2);
-    const int  pblk    = n_kv / 32;
+    const int  pblk    = p_pitch / 32;
 
     for (int m = 0; m < KQ_MB; ++m) {
         const int kv = kv0 + m*KQ_TM;
@@ -368,7 +369,7 @@ kernel void kernel_mul_mm_q8_kq_p8(
                         q0 = convert_uchar16_sat_rte(e0*255.0f);
                         q1 = convert_uchar16_sat_rte(e1*255.0f);
                     }
-                    global uchar * qdst = qp + prow*(size_t)n_kv + (size_t)kvb;
+                    global uchar * qdst = qp + prow*(size_t)p_pitch + (size_t)kvb;
                     vstore16(q0, 0, qdst);
                     vstore16(q1, 1, qdst);
                     bmax[prow*pblk + blk] = amax;
