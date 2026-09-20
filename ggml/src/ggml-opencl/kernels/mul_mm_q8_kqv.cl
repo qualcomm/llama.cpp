@@ -47,7 +47,7 @@ kernel void kernel_mul_mm_q8_kqv(
         ulong                off_vd,
         global const uint  * pq,        // P u8,     [head][n_q][kv_pitch]       as packed uints
         ulong                off_pq,
-        global const half  * pd,        // P scales, [head][n_q][kv_pitch/32]
+        global const float * pd,        // P scales f32, [head][n_q][kv_pitch/32]
         ulong                off_pd,
         global       float * dst,       // [head][n_q][dv]
         ulong                off_dst,
@@ -61,7 +61,7 @@ kernel void kernel_mul_mm_q8_kqv(
     vq  = (global const uint  *)((global const char *)vq  + off_vq);
     vd  = (global const half  *)((global const char *)vd  + off_vd);
     pq  = (global const uint  *)((global const char *)pq  + off_pq);
-    pd  = (global const half  *)((global const char *)pd  + off_pd);
+    pd  = (global const float *)((global const char *)pd  + off_pd);
     dst = (global       float *)((global const char *)dst + off_dst);
 
     const int lid  = get_local_id(0);
@@ -76,8 +76,8 @@ kernel void kernel_mul_mm_q8_kqv(
     const int nu   = kv_pitch / 4;                  // uints per row
     const int nbp  = kv_pitch / 32;                 // scales per row
 
-    __local uint sh_pq[KQV_TN][KQV_NB][8];
-    __local half sh_pd[KQV_TN][KQV_NB];
+    __local uint  sh_pq[KQV_TN][KQV_NB][8];
+    __local float sh_pd[KQV_TN][KQV_NB];
 
     float acc[KQV_TN];
     #pragma unroll
@@ -110,7 +110,7 @@ kernel void kernel_mul_mm_q8_kqv(
             const int bb = i % KQV_NB;
             const int qi = qn0 + t;
             sh_pd[t][bb] = (qi < n_q && bb < nb_here)
-                ? pd[(pbase + qi)*nbp + bg + bb] : (half)0.0f;
+                ? pd[(pbase + qi)*nbp + bg + bb] : 0.0f;
         }
         barrier(CLK_LOCAL_MEM_FENCE);
 
@@ -132,7 +132,7 @@ kernel void kernel_mul_mm_q8_kqv(
                 raw = dot_acc_sat_4x8packed_su_int(w1.s1, a1.s1, raw);
                 raw = dot_acc_sat_4x8packed_su_int(w1.s2, a1.s2, raw);
                 raw = dot_acc_sat_4x8packed_su_int(w1.s3, a1.s3, raw);
-                acc[t] += dvs * (float)sh_pd[t][bb] * (float)raw;
+                acc[t] += dvs * sh_pd[t][bb] * (float)raw;
             }
         }
         barrier(CLK_LOCAL_MEM_FENCE);

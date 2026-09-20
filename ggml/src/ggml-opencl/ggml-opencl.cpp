@@ -29906,7 +29906,7 @@ static void ggml_cl_fa_scratch_tensor(
 // accept; the caller then runs the fused tile exactly as before.
 // Fused KQ + block softmax for the decomposed prefill: one mul_mm_f16_f32_kq_p8 dispatch
 // over the query chunk (writes u8 P into prealloc_fa_pq and the per-32-block max/sum into
-// prealloc_fa_bmax/bsum), then kernel_fa_p8_fixup (per-block half scales into prealloc_fa_pd,
+// prealloc_fa_bmax/bsum), then kernel_fa_p8_fixup (per-block f32 scales into prealloc_fa_pd,
 // deferred-norm row sums into prealloc_fa_sums). A and B are bound exactly as
 // ggml_cl_mul_mat_kq_kqv_adreno binds them for KQ: K as an RGBA-float image over the packed
 // cache rows, the Q chunk as the raw [n][head][dk] buffer of the permuted view.
@@ -30481,7 +30481,8 @@ static bool ggml_cl_flash_attn_decompose(
     backend_ctx->prealloc_fa_sums.allocate(backend_ctx->context,
         (size_t)n_q_chunk*n_head*sizeof(float));
 
-    // int8 KQV: P as u8 and V^T as int8, each with one half scale per 32 elements along n_kv.
+    // int8 KQV: P as u8 and V^T as int8, each with one scale per 32 elements along n_kv (f32 for
+    // P, half for V^T).
     // n_kv must divide by 32 for the block layout; the gate below declines otherwise.
     // On by default; GGML_OPENCL_FA_KQV_INT8=0 opts out.
     // NOT ggml_cl_env_flag: that treats any non-empty value as true, so "=0" would enable
@@ -30518,7 +30519,7 @@ static bool ggml_cl_flash_attn_decompose(
         backend_ctx->prealloc_fa_vtq.allocate(backend_ctx->context, (size_t)kv_pitch*dv*n_head_kv);
         backend_ctx->prealloc_fa_vtd.allocate(backend_ctx->context, nblk*dv*n_head_kv*sizeof(cl_half));
         backend_ctx->prealloc_fa_pq.allocate(backend_ctx->context, (size_t)kv_pitch*n_q_chunk*n_head);
-        backend_ctx->prealloc_fa_pd.allocate(backend_ctx->context, nblk*n_q_chunk*n_head*sizeof(cl_half));
+        backend_ctx->prealloc_fa_pd.allocate(backend_ctx->context, nblk*n_q_chunk*n_head*sizeof(float));
         if (kq_p8_possible) {
             backend_ctx->prealloc_fa_bmax.allocate(backend_ctx->context, nblk*n_q_chunk*n_head*sizeof(float));
             backend_ctx->prealloc_fa_bsum.allocate(backend_ctx->context, nblk*n_q_chunk*n_head*sizeof(float));
