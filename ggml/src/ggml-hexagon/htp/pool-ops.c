@@ -132,7 +132,9 @@ static inline void pool_plane_exact(
     const HVX_Vector scale = hvx_vec_splat_f32(p->inv_kernel_area);
     const HVX_Vector seed  = is_max ? hvx_vec_splat_f32(-FLT_MAX) : Q6_V_vsplat_R(0);
     const uint32_t row_bytes = p->src_x * sizeof(float);
-    const bool use_gather = p->src_x >= VLEN_FP32;
+    // ARMVw gather is not reliable on V73.  The scalar packing fallback below
+    // still feeds the reduction through HVX and is used there instead.
+    const bool use_gather = p->src_x >= VLEN_FP32 && __HVX_ARCH__ >= 75;
     const uint32_t gather_span = row_bytes < VLEN ? VLEN : row_bytes;
     int32_t offsets[VLEN_FP32] __attribute__((aligned(VLEN)));
     for (uint32_t oy = 0; oy < p->dst_y; ++oy) {
@@ -243,7 +245,21 @@ static inline void pool_row_general_scalar(
                 acc = is_max ? MAX(acc, row[ix]) : acc + row[ix];
             }
         }
-        dst_row[ox] = is_max ? acc : acc * p->inv_kernel_area;
+        if (is_max) {
+            dst_row[ox] = acc;
+        } else if (p->avg_divide_count) {
+            const int32_t ix0 = (int32_t) (ox * p->stride_x) - p->pad_x;
+            int count = 0;
+            for (uint32_t kx = 0; kx < p->kernel_x; ++kx) {
+                const int32_t ix = ix0 + (int32_t) kx;
+                if (ix >= 0 && ix < (int32_t) p->src_x) {
+                    ++count;
+                }
+            }
+            dst_row[ox] = count > 0 ? acc / count : 0.0f;
+        } else {
+            dst_row[ox] = acc * p->inv_kernel_area;
+        }
     }
 }
 
@@ -254,12 +270,6 @@ static inline void pool_row_general_vec(
     uint32_t ox_start, uint32_t ox_end, int32_t iy0, uint32_t ky_lo, uint32_t ky_hi, bool is_max) {
     const HVX_Vector scale = hvx_vec_splat_f32(p->inv_kernel_area);
     const HVX_Vector seed  = is_max ? hvx_vec_splat_f32(-FLT_MAX) : Q6_V_vsplat_R(0);
-    int32_t gather_offsets[VLEN_FP32] __attribute__((aligned(VLEN)));
-    for (uint32_t lane = 0; lane < VLEN_FP32; ++lane) {
-        gather_offsets[lane] = (int32_t) (lane * p->stride_x * sizeof(float));
-    }
-    const HVX_Vector gather_offsets_v = *(const HVX_UVector *) gather_offsets;
-    const uint32_t row_bytes = p->src_x * sizeof(float);
 
     uint32_t ox = ox_start;
     for (; ox + VLEN_FP32 <= ox_end; ox += VLEN_FP32) {
@@ -289,10 +299,12 @@ static inline void pool_row_general_vec(
                 }
             } else {
                 for (uint32_t kx = 0; kx < p->kernel_x; ++kx) {
-                    HVX_Vector v;
-                    Q6_vgather_ARMVw(&v, (size_t) (row + ix0 + (int32_t) kx),
-                                     row_bytes, gather_offsets_v);
-                    acc = is_max ? Q6_Vsf_vmax_VsfVsf(acc, v) : hvx_vec_add_f32_f32(acc, v);
+                    HVX_VectorAlias packed __attribute__((aligned(VLEN)));
+                    for (uint32_t lane = 0; lane < VLEN_FP32; ++lane) {
+                        packed.fp32[lane] = row[ix0 + (int32_t) (lane * p->stride_x) + (int32_t) kx];
+                    }
+                    acc = is_max ? Q6_Vsf_vmax_VsfVsf(acc, packed.v)
+                                 : hvx_vec_add_f32_f32(acc, packed.v);
                 }
             }
         }
@@ -334,7 +346,7 @@ static inline void pool_plane(const float * src, float * dst, const struct htp_p
         pool_plane_hvx_narrow(src, dst, p);
     } else if (p->fast_path) {
         pool_plane_hvx(src, dst, p);
-    } else if (p->narrow_general_path) {
+    } else if (p->narrow_general_path && !p->avg_divide_count) {
         pool_plane_general_narrow(src, dst, p);
     } else if (p->exact_path) {
         pool_plane_exact(src, dst, p);
@@ -445,7 +457,9 @@ int op_pool_2d(struct htp_ops_context * octx) {
     }
 
     uint32_t plane_start = 0;
-    uint32_t plane_count = src0->ne[2] * src0->ne[3];
+    uint32_t plane_count = (octx->op == HTP_OP_POOL_1D)
+        ? src0->ne[1] * src0->ne[2] * src0->ne[3]
+        : src0->ne[2] * src0->ne[3];
     if (octx->ctx->mdev.count > 1) {
         const uint32_t planes_per_chunk = (p->dst_plane_bytes > 0) ?
             (HEX_L2_LINE_SIZE / hex_gcd_u32(p->dst_plane_bytes, HEX_L2_LINE_SIZE)) : 1;
@@ -467,4 +481,8 @@ int op_pool_2d(struct htp_ops_context * octx) {
     };
     work_queue_run(octx->ctx->work_queue, pool_2d_thread, &ctx, octx->n_threads);
     return HTP_STATUS_OK;
+}
+
+int op_pool_1d(struct htp_ops_context * octx) {
+    return op_pool_2d(octx);
 }

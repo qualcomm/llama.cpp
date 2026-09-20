@@ -28,6 +28,7 @@ struct htp_pool_2d_kernel_params {
     uint32_t block_path;
     uint32_t exact_path;
     uint32_t narrow_general_path;
+    uint32_t avg_divide_count;
     float    inv_kernel_area;
 };
 
