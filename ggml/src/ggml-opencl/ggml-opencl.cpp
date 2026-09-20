@@ -8416,8 +8416,11 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         const std::string kernel_src = read_file("gated_delta_net_chunk.cl");
     #endif
         // Default on for the X2 class (X2-90, Adreno 840: Qwen3.5-35B prefill +3.3..4.3%, perplexity
-        // in band, GATED_DELTA_NET suite clean on both); other gens are unmeasured and opt in.
-        backend_ctx->gdn_chunk = backend_ctx->adreno_x2_class()
+        // in band, GATED_DELTA_NET suite clean on both) minus the E17 compiler: the Adreno 850 builds
+        // and passes these kernels but runs them at half the recurrent kernel's speed (32 heads x 1024
+        // tokens 15.4 ms against 7.6 ms), so it is subtracted from the level as the dense dp4a GEMMs
+        // are. Other gens are unmeasured and opt in.
+        backend_ctx->gdn_chunk = (backend_ctx->adreno_x2_class() && !adreno_art_compiler_quirks(backend_ctx))
             ? !ggml_cl_env_flag_zero("GGML_OPENCL_GDN_CHUNK")
             :  ggml_cl_env_flag("GGML_OPENCL_GDN_CHUNK") && !ggml_cl_env_flag_zero("GGML_OPENCL_GDN_CHUNK");
         if (const char * e = getenv("GGML_OPENCL_GDN_CHUNK_NCOL")) {
