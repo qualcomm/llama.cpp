@@ -36,7 +36,7 @@ import signal
 import subprocess
 import sys
 from pathlib import Path
-from typing import Dict, List, NamedTuple, Optional, Set, Tuple
+from typing import Dict, List, NamedTuple, Optional, Tuple
 
 # Ignore SIGPIPE to handle pipes (e.g. head, grep) gracefully
 if hasattr(signal, "SIGPIPE"):
@@ -278,8 +278,6 @@ class HexagonToolchain:
         if res.returncode != 0:
             raise RuntimeError(f"Docker command failed: {res.stderr.strip()}")
         return res.stdout
-
-
 
 
 def parse_symbols(toolchain: HexagonToolchain, lib_path: Path) -> List[SymbolEntry]:
@@ -540,7 +538,7 @@ def run_spills(
     args: argparse.Namespace,
 ) -> int:
     # Scan and report register spills across binary functions
-    print(f"Inspecting library: {lib_path}")
+    logger.info(f"Inspecting library: {lib_path}")
     disasm_text = toolchain.run_tool("hexagon-llvm-objdump", ["-d", str(lib_path)])
 
     func_re = re.compile(args.func) if args.func else None
@@ -578,9 +576,9 @@ def run_spills(
     )
     sep = "-" * len(hdr)
 
-    print("\n" + sep)
-    print(hdr)
-    print(sep)
+    logger.info("\n" + sep)
+    logger.info(hdr)
+    logger.info(sep)
 
     tot_vloop = 0
     tot_sloop = 0
@@ -612,35 +610,35 @@ def run_spills(
         if f.vspills_in_loop > 0 and use_color:
             vloop_str = f"\033[1;31m{vloop_str}\033[0m"
 
-        print(
+        logger.info(
             f"0x{f.address:08x} | {f.name:<44} | {f.packet_count:>7} | {f.insn_count:>6} | "
             f"{f.vec_insn_count:>7} | {vloop_str} | {f.vspills_total:>5} | {f.sspills_in_loop:>6} | {f.sspills_total:>5}"
         )
 
-    print(sep)
-    print(
+    logger.info(sep)
+    logger.info(
         f"Total functions analyzed: {len(funcs)} | Reported: {len(reported)} | "
         f"Functions with in-loop vector spills: {tot_funcs_with_vloop} | "
         f"Total in-loop vector spills: {tot_vloop} | Total in-loop scalar spills: {tot_sloop}"
     )
 
     if args.strict:
-        print("\n" + "=" * 50)
+        logger.info("\n" + "=" * 50)
         if strict_violations:
             if use_color:
-                print("\033[1;31mSTRICT CHECK FAILED\033[0m")
+                logger.error("\033[1;31mSTRICT CHECK FAILED\033[0m")
             else:
-                print("STRICT CHECK FAILED")
+                logger.error("STRICT CHECK FAILED")
             for v in strict_violations:
-                print(f"  - {v}")
-            print("=" * 50)
+                logger.error(f"  - {v}")
+            logger.info("=" * 50)
             return 1
         else:
             if use_color:
-                print("\033[1;32mSTRICT CHECK PASSED: 0 violations\033[0m")
+                logger.info("\033[1;32mSTRICT CHECK PASSED: 0 violations\033[0m")
             else:
-                print("STRICT CHECK PASSED: 0 violations")
-            print("=" * 50)
+                logger.info("STRICT CHECK PASSED: 0 violations")
+            logger.info("=" * 50)
 
     return 0
 
@@ -651,7 +649,7 @@ def run_promotions(
     args: argparse.Namespace,
 ) -> int:
     # Scan and report soft-float promotion calls across binary functions
-    print(f"Inspecting library: {lib_path}")
+    logger.info(f"Inspecting library: {lib_path}")
     disasm_text = toolchain.run_tool("hexagon-llvm-objdump", ["-d", str(lib_path)])
 
     func_re = re.compile(args.func) if args.func else None
@@ -680,9 +678,9 @@ def run_promotions(
     hdr = f"{col_addr:<10} | {col_name:<44} | {col_loop:>5} | {col_inloop:>7} | {col_tot:>5} | {col_targets}"
     sep = "-" * max(len(hdr), 110)
 
-    print("\n" + sep)
-    print(hdr)
-    print(sep)
+    logger.info("\n" + sep)
+    logger.info(hdr)
+    logger.info(sep)
 
     tot_inloop = 0
     tot_prom = 0
@@ -707,34 +705,34 @@ def run_promotions(
             inloop_str = f"\033[1;31m{inloop_str}\033[0m"
 
         targets_str = ", ".join(f"{t}: {c}" for t, c in sorted(f.promotion_targets.items()))
-        print(
+        logger.info(
             f"0x{f.address:08x} | {f.name:<44} | {f.loop_count:>5} | {inloop_str} | {f.promotions_total:>5} | {targets_str}"
         )
 
-    print(sep)
-    print(
+    logger.info(sep)
+    logger.info(
         f"Total functions analyzed: {len(funcs)} | Reported: {len(reported)} | "
         f"Functions with float promotions: {tot_funcs_with_prom} | "
         f"Total promotion calls: {tot_prom} | In-loop: {tot_inloop}"
     )
 
     if args.strict:
-        print("\n" + "=" * 50)
+        logger.info("\n" + "=" * 50)
         if strict_violations:
             if use_color:
-                print("\033[1;31mSTRICT CHECK FAILED\033[0m")
+                logger.error("\033[1;31mSTRICT CHECK FAILED\033[0m")
             else:
-                print("STRICT CHECK FAILED")
+                logger.error("STRICT CHECK FAILED")
             for v in strict_violations:
-                print(f"  - {v}")
-            print("=" * 50)
+                logger.error(f"  - {v}")
+            logger.info("=" * 50)
             return 1
         else:
             if use_color:
-                print("\033[1;32mSTRICT CHECK PASSED: 0 violations\033[0m")
+                logger.info("\033[1;32mSTRICT CHECK PASSED: 0 violations\033[0m")
             else:
-                print("STRICT CHECK PASSED: 0 violations")
-            print("=" * 50)
+                logger.info("STRICT CHECK PASSED: 0 violations")
+            logger.info("=" * 50)
 
     return 0
 
@@ -746,8 +744,8 @@ def run_disasm(
 ) -> int:
     # Disassemble matching function(s) with annotated loop and spill markers
     func_pattern = args.disasm
-    print(f"Inspecting library: {lib_path}")
-    print(f"Disassembling functions matching: '{func_pattern}'\n")
+    logger.info(f"Inspecting library: {lib_path}")
+    logger.info(f"Disassembling functions matching: '{func_pattern}'\n")
 
     # Disassemble symbol
     disasm_text = toolchain.run_tool(
@@ -763,7 +761,7 @@ def run_disasm(
         all_matches = list(RE_SYMBOL_HEADER.finditer(all_disasm))
         matched_symbols = [m.group(2) for m in all_matches if pat.search(m.group(2))]
         if not matched_symbols:
-            print(f"Error: No symbols found matching '{func_pattern}'.")
+            logger.error(f"Error: No symbols found matching '{func_pattern}'.")
             return 1
         # Re-run with symbol list bounded by limit
         sym_limit = args.limit if hasattr(args, "limit") and args.limit and args.limit > 0 else len(matched_symbols)
@@ -776,7 +774,7 @@ def run_disasm(
 
     use_color = not args.no_color and sys.stdout.isatty()
 
-    # Parse and print annotated functions
+    # Parse and log annotated functions
     for i, m in enumerate(matches):
         name = m.group(2)
         addr = int(m.group(1), 16)
@@ -787,25 +785,25 @@ def run_disasm(
         # Parse statistics for this function
         func_stats = parse_disassembly(disasm_text[m.start():end_idx])[0]
 
-        # Print header
+        # Log header
         hdr_border = "=" * 80
-        print(hdr_border)
-        print(f"Function: {name}")
-        print(f"Address:  0x{addr:08x} - 0x{addr + func_stats.size:08x} ({func_stats.size} bytes)")
-        print(f"Packets:  {func_stats.packet_count} | Instructions: {func_stats.insn_count} | Loops: {func_stats.loop_count}")
+        logger.info(hdr_border)
+        logger.info(f"Function: {name}")
+        logger.info(f"Address:  0x{addr:08x} - 0x{addr + func_stats.size:08x} ({func_stats.size} bytes)")
+        logger.info(f"Packets:  {func_stats.packet_count} | Instructions: {func_stats.insn_count} | Loops: {func_stats.loop_count}")
         vec_pct = (func_stats.vec_insn_count / func_stats.insn_count * 100.0) if func_stats.insn_count else 0.0
-        print(f"HVX Ops:  {func_stats.vec_insn_count} ({vec_pct:.1f}% of instructions)")
-        print(
+        logger.info(f"HVX Ops:  {func_stats.vec_insn_count} ({vec_pct:.1f}% of instructions)")
+        logger.info(
             f"Spills:   Vector in-loop: {func_stats.vspills_in_loop} | Vector total: {func_stats.vspills_total} | "
             f"Scalar in-loop: {func_stats.sspills_in_loop} | Scalar total: {func_stats.sspills_total}"
         )
-        print(
+        logger.info(
             f"Calls:    Total: {func_stats.calls_total} (in-loop: {func_stats.calls_in_loop}) | "
             f"Float promotions: {func_stats.promotions_total} (in-loop: {func_stats.promotions_in_loop})"
         )
-        print(hdr_border)
+        logger.info(hdr_border)
 
-        # Print annotated disassembly
+        # Log annotated disassembly
         loop0_target: Optional[int] = None
         loop1_target: Optional[int] = None
         loop0_active = False
@@ -815,8 +813,8 @@ def run_disasm(
             ann_line, loop0_target, loop1_target, loop0_active, loop1_active = annotate_disasm_line(
                 line, loop0_target, loop1_target, loop0_active, loop1_active, use_color
             )
-            print(ann_line)
-        print()
+            logger.info(ann_line)
+        logger.info("")
 
     return 0
 
@@ -892,11 +890,11 @@ def run_addr2line(
         input_addrs.extend(extract_addresses_from_input(stdin_lines))
 
     if not input_addrs:
-        print("Error: No addresses found to resolve. Provide hex addresses or pipe crash logs to stdin.")
-        print("Example: ./scripts/snapdragon/ggml-hexagon-inspect.py --addr2line 0x51a30 0x5ba54")
+        logger.error("Error: No addresses found to resolve. Provide hex addresses or pipe crash logs to stdin.")
+        logger.error("Example: ./scripts/snapdragon/ggml-hexagon-inspect.py --addr2line 0x51a30 0x5ba54")
         return 1
 
-    print(f"Resolving {len(input_addrs)} address(es) against: {lib_path}\n")
+    logger.info(f"Resolving {len(input_addrs)} address(es) against: {lib_path}\n")
 
     # Load symbol table for symbol + offset fallback
     symbols = parse_symbols(toolchain, lib_path)
@@ -930,9 +928,9 @@ def run_addr2line(
             else:
                 sym_display = func_name
 
-            print(f"{addr_hex:<12} -> {sym_display:<40} ({src_loc})")
+            logger.info(f"{addr_hex:<12} -> {sym_display:<40} ({src_loc})")
         else:
-            print(line)
+            logger.info(line)
 
     return 0
 
@@ -1058,6 +1056,8 @@ def main():
 
     args = parser.parse_args()
 
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+
     repo_root = get_repo_root()
 
     # Determine target library
@@ -1065,13 +1065,13 @@ def main():
     if args.lib:
         lib_path = Path(args.lib).resolve()
         if not lib_path.is_file():
-            print(f"Error: Specified library '{args.lib}' does not exist.")
+            logger.error(f"Error: Specified library '{args.lib}' does not exist.")
             sys.exit(1)
     else:
         lib_path = find_default_lib(repo_root, args.arch)
         if not lib_path:
-            print("Error: No Hexagon library found in build-* or pkg-* directories.")
-            print("Build the project first via ./scripts/snapdragon/build.py --target adb or specify --lib.")
+            logger.error("Error: No Hexagon library found in build-* or pkg-* directories.")
+            logger.error("Build the project first via ./scripts/snapdragon/build.py --target adb or specify --lib.")
             sys.exit(1)
 
     # Initialize toolchain wrapper
@@ -1085,7 +1085,7 @@ def main():
             image_ver=args.toolchain_version,
         )
     except Exception as e:
-        print(f"Error initializing toolchain: {e}")
+        logger.error(f"Error initializing toolchain: {e}")
         sys.exit(1)
 
     # Dispatch commands
@@ -1101,4 +1101,5 @@ def main():
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     main()
