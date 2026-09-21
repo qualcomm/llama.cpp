@@ -185,20 +185,19 @@ class HexagonToolchain:
         self.docker_bin = shutil.which("docker")
         self.use_docker = use_docker
 
-        # Check native tools first if not explicitly forced to Docker
-        self.native_objdump = None
-        self.native_addr2line = None
-
         if not use_docker:
-            self._discover_native_tools()
+            self.native_objdump, self.native_addr2line = self._discover_native_tools()
+        else:
+            self.native_objdump = None
+            self.native_addr2line = None
 
         if not self.native_objdump and not self.native_addr2line:
             self.use_docker = True
 
-    def _discover_native_tools(self):
+    def _discover_native_tools(self) -> Tuple[Optional[str], Optional[str]]:
         # Check system PATH
-        self.native_objdump = shutil.which("hexagon-llvm-objdump")
-        self.native_addr2line = shutil.which("hexagon-addr2line") or shutil.which("hexagon-llvm-addr2line")
+        objdump = shutil.which("hexagon-llvm-objdump")
+        addr2line = shutil.which("hexagon-addr2line") or shutil.which("hexagon-llvm-addr2line")
 
         # Check HEXAGON_TOOLS_ROOT environment variable
         tools_root = os.environ.get("HEXAGON_TOOLS_ROOT")
@@ -206,10 +205,10 @@ class HexagonToolchain:
             bin_dir = Path(tools_root) / "Tools" / "bin"
             objdump_path = bin_dir / "hexagon-llvm-objdump"
             addr2line_path = bin_dir / "hexagon-addr2line"
-            if objdump_path.is_file() and not self.native_objdump:
-                self.native_objdump = str(objdump_path)
-            if addr2line_path.is_file() and not self.native_addr2line:
-                self.native_addr2line = str(addr2line_path)
+            if objdump_path.is_file() and not objdump:
+                objdump = str(objdump_path)
+            if addr2line_path.is_file() and not addr2line:
+                addr2line = str(addr2line_path)
 
         # Check HEXAGON_SDK_ROOT environment variable
         sdk_root = os.environ.get("HEXAGON_SDK_ROOT")
@@ -220,10 +219,12 @@ class HexagonToolchain:
                     bin_dir = t_dir / "Tools" / "bin"
                     objdump_path = bin_dir / "hexagon-llvm-objdump"
                     addr2line_path = bin_dir / "hexagon-addr2line"
-                    if objdump_path.is_file() and not self.native_objdump:
-                        self.native_objdump = str(objdump_path)
-                    if addr2line_path.is_file() and not self.native_addr2line:
-                        self.native_addr2line = str(addr2line_path)
+                    if objdump_path.is_file() and not objdump:
+                        objdump = str(objdump_path)
+                    if addr2line_path.is_file() and not addr2line:
+                        addr2line = str(addr2line_path)
+
+        return objdump, addr2line
 
     def run_tool(self, tool_name: str, args: List[str], stdin_data: Optional[str] = None) -> str:
         # Execute tool either natively or inside Docker container
@@ -585,7 +586,7 @@ def run_spills(
     tot_funcs_with_vloop = 0
     strict_violations = []
 
-    dma_re = re.compile(args.dma_pattern) if args.dma_pattern else None
+    dma_re: Optional[re.Pattern[str]] = re.compile(args.dma_pattern) if args.dma_pattern else None
 
     for f in reported:
         tot_vloop += f.vspills_in_loop
