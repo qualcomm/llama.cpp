@@ -1044,13 +1044,19 @@ static void prep_op_bufs(struct htp_context *ctx, struct htp_buf_desc *bufs, uin
     }
 
     if (!mmap_ok) {
-        // Attempt clean defragmentation: drop all mappings and remap (pass 2)
-        FARF(HIGH, "prep-bufs : dropping all mappings to defragment address space");
-        for (uint32_t i=0; i < HTP_MAX_MMAPS; i++) { drop_mmap(ctx, ctx->mmap + i); }
+        // Attempt defragmentation: drop 32-bit mappings and remap (pass 2)
+        FARF(HIGH, "prep-bufs : dropping 32-bit mappings to defragment address space");
+        for (uint32_t i=0; i < HTP_MAX_MMAPS; i++) {
+            if (!(ctx->mmap[i].flags & HTP_BUF_EXTENDED)) {
+                drop_mmap(ctx, ctx->mmap + i);
+            }
+        }
 
         for (uint32_t i=0; i < n_bufs; i++) {
             struct htp_buf_desc *b = bufs + i;
-            b->base = 0;
+            if (!(b->flags & HTP_BUF_EXTENDED)) {
+                b->base = 0;
+            }
             if (!mmap_buf(ctx, b)) {
                 FARF(ERROR, "prep-bufs : mmap failed after defragmentation (fd %u size %llu)", b->fd, (unsigned long long) b->size);
                 abort();
