@@ -427,6 +427,16 @@ static void flash_attn_ext_f16_thread(unsigned int nth, unsigned int ith, void *
             HVX_Vector v_max     = Q6_V_lo_W(hvx_vec_f16_to_f32(v_max_f16)); // splat block max in FP32
             htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_FA_QK, ir);
 
+            // prefetch K for block ib + 2 after QK
+            if (ib + 2 < factx->n_blocks) {
+                const uint32_t next_ib = ib + 2;
+                const uint32_t next_ic_start = next_ib * FLASH_ATTN_BLOCK_SIZE;
+                const uint32_t next_block_size = MIN(FLASH_ATTN_BLOCK_SIZE, nek1 - next_ic_start);
+
+                const dma_addr_t k_src = k->data + next_ic_start*nbk1 + ik2*nbk2 + ik3*nbk3;
+                dma_queue_push(dma_q, dma_make_data(k_base, k_src), factx->size_k_row_padded, nbk1, size_k_row, next_block_size);
+            }
+
             if (ib + 1 == factx->n_blocks && has_next_ir) {
                 // Queue next row's Q row!
                 dma_queue_push(dma_q, dma_make_data(spad_q, next_q_row_ptr), factx->size_q_row_padded, nbq1, size_q_row, 1);
@@ -557,15 +567,11 @@ static void flash_attn_ext_f16_thread(unsigned int nth, unsigned int ith, void *
             }
             htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_FA_SFM, ir);
 
-            // Issue DMA for next+1 block (if exists)
+            // prefetch V and mask for block ib + 2 after V accumulation
             if (ib + 2 < factx->n_blocks) {
                 const uint32_t next_ib = ib + 2;
                 const uint32_t next_ic_start = next_ib * FLASH_ATTN_BLOCK_SIZE;
                 const uint32_t next_block_size = MIN(FLASH_ATTN_BLOCK_SIZE, nek1 - next_ic_start);
-
-                // K
-                const dma_addr_t k_src = k->data + next_ic_start*nbk1 + ik2*nbk2 + ik3*nbk3;
-                dma_queue_push(dma_q, dma_make_data(k_base, k_src), factx->size_k_row_padded, nbk1, size_k_row, next_block_size);
 
                 // V
                 const dma_addr_t v_src = v->data + next_ic_start*nbv1 + iv2*nbv2 + iv3*nbv3;
