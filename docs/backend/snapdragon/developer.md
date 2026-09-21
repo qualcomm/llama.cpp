@@ -148,7 +148,7 @@ Writing high-performance operators for Hexagon requires following specific guide
 
 ### Binary Inspection and Spill Analysis
 
-Use [`scripts/snapdragon/ggml-hexagon-inspect.py`](../../../scripts/snapdragon/ggml-hexagon-inspect.py) to audit Hexagon binaries for register 
+Use [`scripts/snapdragon/ggml-hexagon-inspect.py`](../../../scripts/snapdragon/ggml-hexagon-inspect.py) to audit Hexagon binaries for register
 spills, unexpected float promotions, or disassembly:
 
 - Always verify that compute kernels have zero in-loop vector spills (`--spills --strict`) and no float promotions (`--promotions`).
