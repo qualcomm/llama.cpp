@@ -480,7 +480,6 @@ struct ggml_hexagon_session {
     uint32_t n_hmx       = 0;
     uint64_t vtcm_size   = 0;
     size_t   max_vmem    = 0;
-    size_t   max_bufsize = 0;
     uint32_t fence_seq   = 0;
 
     std::atomic<uint64_t> batch_req_seq{0};
@@ -546,7 +545,6 @@ struct ggml_backend_hexagon_device_context {
     int                        dev_id;
     ggml_hexagon_device_config config;
     ggml_backend_dev_t         dev = nullptr;
-    size_t                     max_bufsize = 0;
 
     ggml_backend_buffer_type buffer_type       = {};
     ggml_backend_buffer_type host_buffer_type  = {};
@@ -562,9 +560,6 @@ struct ggml_backend_hexagon_device_context {
     ggml_hexagon_session * session() {
         if (!sess) {
             sess = std::make_unique<ggml_hexagon_session>(config, dev);
-            if (max_bufsize > sess->max_vmem) {
-                max_bufsize = sess->max_vmem;
-            }
         }
         return sess.get();
     }
@@ -2084,11 +2079,6 @@ static const char * ggml_backend_hexagon_buffer_type_name(ggml_backend_buffer_ty
 static ggml_backend_buffer_t ggml_backend_hexagon_buffer_type_alloc_buffer(
             ggml_backend_buffer_type_t buffer_type, size_t size) {
     auto dev_ctx = static_cast<ggml_backend_hexagon_buffer_type_context *>(buffer_type->context)->dev_ctx;
-    if (size > dev_ctx->max_bufsize) {
-        GGML_LOG_ERROR("ggml-hex: %s buffer size %zu exceeds max_bufsize %zu\n",
-                       dev_ctx->c_name(), size, dev_ctx->max_bufsize);
-        return nullptr;
-    }
     auto sess    = dev_ctx->session();
     if (sess && sess->max_vmem && size > sess->max_vmem) {
         GGML_LOG_ERROR("ggml-hex: %s buffer size %zu exceeds max_vmem %zu\n",
@@ -2107,11 +2097,6 @@ static ggml_backend_buffer_t ggml_backend_hexagon_buffer_type_alloc_buffer(
 static ggml_backend_buffer_t ggml_backend_hexagon_host_buffer_type_alloc_buffer(
             ggml_backend_buffer_type_t buffer_type, size_t size) {
     auto dev_ctx = static_cast<ggml_backend_hexagon_buffer_type_context *>(buffer_type->context)->dev_ctx;
-    if (size > dev_ctx->max_bufsize) {
-        GGML_LOG_ERROR("ggml-hex: %s host buffer size %zu exceeds max_bufsize %zu\n",
-                       dev_ctx->c_name(), size, dev_ctx->max_bufsize);
-        return nullptr;
-    }
     auto sess    = dev_ctx->session();
     if (sess && sess->max_vmem && size > sess->max_vmem) {
         GGML_LOG_ERROR("ggml-hex: %s host buffer size %zu exceeds max_vmem %zu\n",
@@ -2146,10 +2131,8 @@ static size_t ggml_backend_hexagon_buffer_type_get_alloc_size(ggml_backend_buffe
 }
 
 static size_t ggml_backend_hexagon_buffer_type_get_max_size(ggml_backend_buffer_type_t buft) {
-    auto * context = static_cast<ggml_backend_hexagon_buffer_type_context *>(buft->context);
-    auto dev_ctx = context->dev_ctx;
-    dev_ctx->session();
-    return dev_ctx->max_bufsize;
+    return opt_mbuf;
+    GGML_UNUSED(buft);
 }
 
 static bool ggml_backend_hexagon_buffer_type_is_host(ggml_backend_buffer_type_t buft) {
@@ -2181,7 +2164,7 @@ static ggml_backend_buffer_type_i ggml_backend_hexagon_host_buffer_type_interfac
 };
 
 ggml_backend_hexagon_device_context::ggml_backend_hexagon_device_context(int dev_id, const ggml_hexagon_device_config & config, ggml_backend_dev_t dev)
-    : dev_id(dev_id), config(config), dev(dev), max_bufsize(opt_mbuf) {
+    : dev_id(dev_id), config(config), dev(dev) {
     buffer_type.device  = dev;
     buffer_type.iface   = ggml_backend_hexagon_buffer_type_interface;
     buffer_type.context = new ggml_backend_hexagon_buffer_type_context(config.name, this);
@@ -3935,7 +3918,6 @@ void ggml_hexagon_session::allocate(const ggml_hexagon_device_config & config) n
     this->valid_handle = true;
 
     // Query HW info and resolve session options
-    this->max_bufsize = opt_mbuf;
     {
         unsigned int hw_n_threads = 0;
         unsigned int hw_n_hvx     = 0;
