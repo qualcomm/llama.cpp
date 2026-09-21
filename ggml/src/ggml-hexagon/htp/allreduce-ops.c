@@ -419,6 +419,11 @@ int op_allreduce(struct htp_ops_context * octx) {
     // 4. Exit Barrier: Synchronize all ranks after writing
     htp_trace_event_start(tr0, HTP_TRACE_EVT_FENCE, (uint16_t) fence_seq_exit);
 
+    // Ensure all fanned-out DMA writes to peer dst buffers are globally committed to DDR
+    // before signalling peers, so the next (non-allreduce) consumer op on any core reads
+    // fresh data. htp_fence_write() only fences *after* the fence store, which is too late.
+    asm volatile ("syncht" : : : "memory");
+
     htp_fence_write(my_fence, fence_seq_exit, octx->status);
 
     for (uint32_t j = 0; j < n_ranks; j++) {
