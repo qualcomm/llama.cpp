@@ -4,7 +4,7 @@
 #include <HAP_farf.h>
 
 #include "hex-common.h"
-#include "hex-dma.h"
+#include "dma-queue.h"
 #include "hex-profile.h"
 #include "htp-ctx.h"
 #include "htp-ops.h"
@@ -413,16 +413,18 @@ static void pool_2d_thread(unsigned int nth, unsigned int ith, void * data) {
         if (i == 0) {
             // prologue: stage plane 'first' and wait - nothing to overlap with yet
             const float * src_plane = (const float *) (src_data + plane * p->src_plane_bytes);
-            dma_queue_push_ddr_to_vtcm(dma_queue, dma_make_ptr(srcb, (void *) src_plane),
-                                       p->src_plane_bytes_aligned, p->src_plane_bytes, 1);
+            dma_queue_push(dma_queue, dma_make_data(srcb, src_plane),
+                           p->src_plane_bytes_aligned, p->src_plane_bytes,
+                           p->src_plane_bytes, 1);
             dma_queue_flush(dma_queue);
         }
         if (i + 1 < total) {
             // prefetch: stage plane i+1 into the other slot; overlaps with this plane's compute below
             const uint32_t nbuf = 1u - buf;
             const float * next_src_plane = (const float *) (src_data + (uint64_t) (plane + 1) * p->src_plane_bytes);
-            dma_queue_push_ddr_to_vtcm(dma_queue, dma_make_ptr(srcb2[nbuf], (void *) next_src_plane),
-                                       p->src_plane_bytes_aligned, p->src_plane_bytes, 1);
+            dma_queue_push(dma_queue, dma_make_data(srcb2[nbuf], next_src_plane),
+                           p->src_plane_bytes_aligned, p->src_plane_bytes,
+                           p->src_plane_bytes, 1);
         }
 
         htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) plane);
@@ -430,8 +432,9 @@ static void pool_2d_thread(unsigned int nth, unsigned int ith, void * data) {
         htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) plane);
 
         float * dst_plane = (float *) (dst_data + plane * p->dst_plane_bytes);
-        dma_queue_push_vtcm_to_ddr(dma_queue, dma_make_ptr((uint8_t *) dst_plane, (uint8_t *) dstb),
-                                   p->dst_plane_bytes, p->dst_plane_bytes_aligned, 1);
+        dma_queue_push(dma_queue, dma_make_data(dst_plane, dstb),
+                       p->dst_plane_bytes, p->dst_plane_bytes_aligned,
+                       p->dst_plane_bytes, 1);
         dma_queue_flush(dma_queue);
     }
 
@@ -452,10 +455,6 @@ int op_pool_2d(struct htp_ops_context * octx) {
         (params[0] != HTP_POOL_AVG && params[0] != HTP_POOL_MAX)) {
         return HTP_STATUS_NO_SUPPORT;
     }
-    if (octx->flags & HTP_OPFLAGS_SKIP_COMPUTE) {
-        return HTP_STATUS_OK;
-    }
-
     uint32_t plane_start = 0;
     uint32_t plane_count = (octx->op == HTP_OP_POOL_1D)
         ? src0->ne[1] * src0->ne[2] * src0->ne[3]
