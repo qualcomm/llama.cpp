@@ -21241,7 +21241,23 @@ static bool ggml_cl_flash_attn_decompose(
         const int v = (e && e[0]) ? atoi(e) : 64;
         return (int64_t)(v > 0 ? (v / 32) * 32 : 0);
     }();
-    const int64_t kv_pitch = n_kv + kv_pitch_pad;
+    // Beyond 16k rows the int8 KQV streams its 64 rows 2-3.5x slower per row unless the pitch is a
+    // multiple of 32 KB plus the pad (the cost resets at n_kv = 32768 and nowhere else). Round the
+    // pitch up to 32 KB before the pad from 16k rows on: gpt-oss-20B pp16384 @ d32768 184.7 -> 246.9
+    // t/s on the X2-90, d0 unchanged. Costs at most 32 KB more per scratch row.
+    // GGML_OPENCL_FA_KV_PITCH_ROUND=0 restores the packed pitch, another power of two changes the
+    // granule; GGML_OPENCL_FA_KV_PITCH_ROUND_MIN moves the row floor (A/B only).
+    static const int64_t kv_pitch_round = []{
+        const char * e = getenv("GGML_OPENCL_FA_KV_PITCH_ROUND");
+        const int64_t v = (e && e[0]) ? atoll(e) : 32768;
+        return (v > 0 && (v & (v - 1)) == 0) ? v : (int64_t)0;
+    }();
+    static const int64_t kv_pitch_round_min = []{
+        const char * e = getenv("GGML_OPENCL_FA_KV_PITCH_ROUND_MIN");
+        return (e && e[0]) ? (int64_t)atoll(e) : (int64_t)16384;
+    }();
+    const bool kv_pitch_do_round = kv_pitch_round > 0 && n_kv > kv_pitch_round_min;
+    const int64_t kv_pitch = (kv_pitch_do_round ? ((n_kv + kv_pitch_round - 1) & ~(kv_pitch_round - 1)) : n_kv) + kv_pitch_pad;
     if (kqv_int8_set || kqv_int8) {
         // Report once why the path did or did not take: four conditions, and a silent decline
         // is indistinguishable from a kernel that ran and did nothing.
