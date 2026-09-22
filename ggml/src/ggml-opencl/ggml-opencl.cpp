@@ -19353,14 +19353,14 @@ static void ggml_cl_mul_mat_q4_0_f32_adreno_ila(ggml_backend_t backend, const gg
         cl_mem s_img = extra0_q4_0->d_img;
         GGML_ASSERT(a_img && s_img && "ILA Q4_0 weight images missing; set_tensor should have built them");
 
-        static const char * q4_0_ila_dp4a_env = getenv("GGML_OPENCL_Q4_0_ILA_DP4A");
-                     bool   q4_0_ila_dp4a_on  = q4_0_ila_dp4a_env
-                                                  ? (atoi(q4_0_ila_dp4a_env) != 0)
+        static const char * q4_0_bin_dp4a_env = getenv("GGML_OPENCL_Q4_0_BIN_DP4A");
+                     bool   q4_0_bin_dp4a_on  = q4_0_bin_dp4a_env
+                                                  ? (atoi(q4_0_bin_dp4a_env) != 0)
                                                   : true;
         // dot prod has to be available
-        q4_0_ila_dp4a_on = backend_ctx->has_integer_dot && q4_0_ila_dp4a_on;
+        q4_0_bin_dp4a_on = backend_ctx->has_integer_dot && q4_0_bin_dp4a_on;
 
-        if (q4_0_ila_dp4a_on && backend_ctx->kernel_gemm_noshuffle_q4_0_q8_1_dp4a_ila_a8_bin) {
+        if (q4_0_bin_dp4a_on && backend_ctx->kernel_gemm_noshuffle_q4_0_q8_1_dp4a_ila_a8_bin) {
             const int    dp4a_N_pad = CEIL_DIV(N, 32) * 32;
             const size_t n_blocks   = (size_t)dp4a_N_pad * (K / 32);
 
@@ -21185,14 +21185,14 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno_ila(ggml_backend_t backend, const gg
         const int gemm_tile_n = 64;
         int N_pad = CEIL_DIV(N, gemm_tile_n) * gemm_tile_n;
 
-        static const char * q4_k_ila_dp4a_env = getenv("GGML_OPENCL_Q4_K_ILA_DP4A");
-                     bool   q4_k_ila_dp4a_on  = q4_k_ila_dp4a_env
-                                                  ? (atoi(q4_k_ila_dp4a_env) != 0)
+        static const char * q4_k_bin_dp4a_env = getenv("GGML_OPENCL_Q4_K_BIN_DP4A");
+                     bool   q4_k_bin_dp4a_on  = q4_k_bin_dp4a_env
+                                                  ? (atoi(q4_k_bin_dp4a_env) != 0)
                                                   : true;
         // dot prod has to be available
-        q4_k_ila_dp4a_on = backend_ctx->has_integer_dot && q4_k_ila_dp4a_on;
+        q4_k_bin_dp4a_on = backend_ctx->has_integer_dot && q4_k_bin_dp4a_on;
 
-        if (q4_k_ila_dp4a_on && backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_ila_a8_bin) {
+        if (q4_k_bin_dp4a_on && backend_ctx->kernel_gemm_noshuffle_q4_k_q8_1_dp4a_ila_a8_bin) {
             const int    dp4a_N_pad = CEIL_DIV(N, 32) * 32;
             const size_t n_blocks   = (size_t)dp4a_N_pad * (K / 32);
 
