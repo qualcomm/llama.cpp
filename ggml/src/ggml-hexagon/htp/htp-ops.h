@@ -192,6 +192,13 @@ enum htp_trace_event_id {
     HTP_TRACE_EVT_BUFF                = 3,
     HTP_TRACE_EVT_FENCE               = 4,
 
+    // Allreduce collective phases (see op_allreduce in allreduce-ops.c). Used to
+    // attribute where multi-core collective time actually goes: entry barrier,
+    // sharded reduction, fan-out DMA wait, exit barrier.
+    HTP_TRACE_EVT_AR_ENTRY_BARRIER    = 5,
+    HTP_TRACE_EVT_AR_REDUCE           = 6,
+    HTP_TRACE_EVT_AR_EXIT_BARRIER     = 7,
+
     HTP_TRACE_EVT_HVX_COMP            = 20,
     HTP_TRACE_EVT_HVX_A_QUANT         = 21,
     HTP_TRACE_EVT_HVX_A_PREP          = 22,

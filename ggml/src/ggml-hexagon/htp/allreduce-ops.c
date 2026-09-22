@@ -306,9 +306,11 @@ int op_allreduce(struct htp_ops_context * octx) {
 
     const bool has_add = (octx->op == HTP_OP_ALLREDUCE_ADD);
     const uint32_t nelem = dst->ne[0] * dst->ne[1] * dst->ne[2] * dst->ne[3];
+    const int32_t  mode  = kparams->mode;
 
     // 1. Entry Barrier: Synchronize all ranks before reading
     struct htp_thread_trace * tr0 = &octx->ctx->trace[0];
+    htp_trace_event_start(tr0, HTP_TRACE_EVT_AR_ENTRY_BARRIER, (uint16_t) fence_seq_entry);
     htp_trace_event_start(tr0, HTP_TRACE_EVT_FENCE, (uint16_t) fence_seq_entry);
 
     htp_fence_write(my_fence, fence_seq_entry, octx->status);
@@ -344,8 +346,10 @@ int op_allreduce(struct htp_ops_context * octx) {
     asm volatile ("syncht" : : : "memory");
 
     htp_trace_event_stop(tr0, HTP_TRACE_EVT_FENCE, (uint16_t) fence_seq_entry);
+    htp_trace_event_stop(tr0, HTP_TRACE_EVT_AR_ENTRY_BARRIER, (uint16_t) fence_seq_entry);
 
     // 2. Multi-threaded Reduction across assigned rank chunk
+    htp_trace_event_start(tr0, HTP_TRACE_EVT_AR_REDUCE, (uint16_t) fence_seq_entry);
     if (nelem > 0) {
         const uint32_t n_threads            = (uint32_t) kparams->n_threads;
         const uint32_t block_elems          = (uint32_t) kparams->block_elems;
@@ -415,14 +419,20 @@ int op_allreduce(struct htp_ops_context * octx) {
 
         work_queue_run(octx->ctx->work_queue, reduce_fun, &actx, n_threads);
     }
+    htp_trace_event_stop(tr0, HTP_TRACE_EVT_AR_REDUCE, (uint16_t) fence_seq_entry);
 
     // 4. Exit Barrier: Synchronize all ranks after writing
+    htp_trace_event_start(tr0, HTP_TRACE_EVT_AR_EXIT_BARRIER, (uint16_t) fence_seq_exit);
     htp_trace_event_start(tr0, HTP_TRACE_EVT_FENCE, (uint16_t) fence_seq_exit);
 
-    // Ensure all fanned-out DMA writes to peer dst buffers are globally committed to DDR
-    // before signalling peers, so the next (non-allreduce) consumer op on any core reads
-    // fresh data. htp_fence_write() only fences *after* the fence store, which is too late.
-    asm volatile ("syncht" : : : "memory");
+    // Sharded fan-out writes each core's shard into peer buffers via DMA. Drain those
+    // writes to DDR before signalling peers, so the next (non-allreduce) consumer op on
+    // any core reads fresh data -- htp_fence_write()'s own syncht fences only after the
+    // fence store, which is too late. The FULL path writes only this core's own buffer and
+    // reads only its own buffer next, so it needs no extra cross-core drain here.
+    if (mode == HTP_ALLREDUCE_SHARDED_FANOUT) {
+        asm volatile ("syncht" : : : "memory");
+    }
 
     htp_fence_write(my_fence, fence_seq_exit, octx->status);
 
@@ -457,6 +467,7 @@ int op_allreduce(struct htp_ops_context * octx) {
     asm volatile ("syncht" : : : "memory");
 
     htp_trace_event_stop(tr0, HTP_TRACE_EVT_FENCE, (uint16_t) fence_seq_exit);
+    htp_trace_event_stop(tr0, HTP_TRACE_EVT_AR_EXIT_BARRIER, (uint16_t) fence_seq_exit);
 
     return octx->status;
 }

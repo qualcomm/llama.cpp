@@ -103,30 +103,6 @@ static int    opt_fa_select = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = C
 static int    opt_ar_select = 2; // 2 = fused ALLREDUCE+ADD (DMA, default), 1 = unfused ALLREDUCE (DMA), 0 = fallback to CPY+FENCE
 static int    opt_ar_scatter = 1; // 1 = reduce-scatter the fused ALLREDUCE+ADD (default), 0 = full redundant reduction
 
-// EXPERIMENT ONLY -- PRODUCES INCORRECT RESULTS. Suppresses the reduce-scatter
-// all-gather fan-out so each core writes its 1/N shard only to its own buffer.
-// Every core therefore ends up with just its own shard and stale data elsewhere.
-// This exists purely to measure the DDR-traffic floor that a shared result
-// buffer would reach: profiling shows ALLREDUCE+ADD is bandwidth-bound and the
-// fan-out is 44% of its traffic, so this bounds the achievable win before
-// paying for the (much larger) meta-backend shared-allocation change.
-// Never enable outside a profiling run.
-static int    opt_ar_nofanout = 0;
-
-// Diagnostic only: verify that no op writes into an allreduce result. This is the
-// safety precondition for collapsing the N per-core result copies into one shared
-// buffer -- if any downstream op wrote a result in place, all N cores would write
-// the same shared memory and race. Logs a WARN per violation; 0 violations over a
-// full run is the evidence we need. No effect on results.
-static int    opt_ar_sharedchk = 0;
-
-// Shared allreduce result buffer. Instead of every core writing its 1/N shard into
-// all N per-core result buffers (an all-gather by write duplication), each core writes
-// its shard once into core 0's buffer and all cores read the result from there.
-// Profiling showed ALLREDUCE+ADD is DDR-bandwidth-bound and the fan-out is 44% of its
-// traffic; removing it measured -27% on the op. Off by default until A/B-validated.
-static int    opt_ar_share = 0;
-
 // Default PMU events, if profiling with PMU (mode=2) is enabled
 // See https://docs.qualcomm.com/doc/80-N2040-60/topic/pmu-events.html
 //     https://docs.qualcomm.com/doc/80-N2040-61/topic/hvx-pmu-events.html
@@ -212,6 +188,9 @@ static const char * htp_event_name(uint16_t id) {
         case HTP_TRACE_EVT_INIT:           return "INIT";
         case HTP_TRACE_EVT_BUFF:           return "BUFF";
         case HTP_TRACE_EVT_FENCE:          return "FENCE";
+        case HTP_TRACE_EVT_AR_ENTRY_BARRIER: return "AR_ENTRY_BARRIER";
+        case HTP_TRACE_EVT_AR_REDUCE:      return "AR_REDUCE";
+        case HTP_TRACE_EVT_AR_EXIT_BARRIER: return "AR_EXIT_BARRIER";
         default:                           return "UNKNOWN";
     }
 }
@@ -406,6 +385,7 @@ static bool ggml_hexagon_precompute_allreduce_params(
     uint32_t n_ranks,
     bool has_add,
     bool is_row_bcast,
+    bool is_shard_ok,
     struct htp_allreduce_kernel_params * kparams
 );
 
@@ -491,23 +471,6 @@ struct ggml_hexagon_session {
     std::unordered_map<int, std::unique_ptr<ggml_hexagon_shared_buffer>> cloned_buffers;
     std::unordered_set<ggml_hexagon_session *>                           virt_peers;
     std::unordered_set<ggml_hexagon_session *>                           phys_peers;
-
-    // Diagnostic (GGML_HEXAGON_AR_SHAREDCHK): memory ranges written by allreduce
-    // outputs in the current graph. Used to prove that no later op writes into an
-    // allreduce result, which is the safety precondition for replacing the
-    // all-gather fan-out with a single shared result buffer.
-    std::vector<std::pair<uintptr_t, size_t>> ar_out_ranges;
-
-    // Shared allreduce result buffer (GGML_HEXAGON_AR_SHARE).
-    //   ar_share_map  : this core's result address -> core 0's equivalent tensor. Any
-    //                   later op in this graph reading the result is redirected there.
-    //   ar_node_safe  : per graph-node, true when no *later* node writes that node's
-    //                   output. Only such results may be shared: an in-place writer
-    //                   would have all N cores writing one buffer and racing.
-    //   cur_node_idx  : index of the node currently being enqueued, to index the above.
-    std::unordered_map<uintptr_t, const ggml_tensor *> ar_share_map;
-    std::vector<uint8_t>                               ar_node_safe;
-    size_t                                             cur_node_idx = 0;
 
     uint32_t n_threads   = 0;
     uint32_t n_hvx       = 0;
@@ -2625,20 +2588,29 @@ struct ggml_hexagon_opbatch {
             return false;
         }
 
+        // Decide scatter eligibility BEFORE precompute so the solver lays out the correct
+        // reduction range. Scatter is safe only when the residual ADD is exactly in-place over
+        // this rank's own allreduce partial and the rank count fits the multi-dst fan-out.
+        // If shard is NOT ok, precompute must produce a FULL-range reduction — not a 1/N
+        // shard — or the FULL path leaves the rest of the buffer stale.
+        const bool is_shard_ok = n_ranks <= HTP_OP_MAX_OUTPUTS &&
+                                 add_dst->data == ar_local->data;
+
         struct htp_allreduce_kernel_params new_kparams;
         if (!ggml_hexagon_precompute_allreduce_params(
-            sess, add_dst, (uint32_t) ar_kparams->rank, (uint32_t) ar_kparams->n_ranks, true, is_row_bcast, &new_kparams
+            sess, add_dst, (uint32_t) ar_kparams->rank, (uint32_t) ar_kparams->n_ranks, true, is_row_bcast, is_shard_ok, &new_kparams
         )) {
             HEX_VERBOSE("ggml-hex: %s skip ALLREDUCE_ADD fusion: solver failed\n", sess->c_name());
             return false;
         }
 
-        // Reduce-scatter fan-out is eligible only when the solver picked the sharded
-        // multi-dst 1D path and the residual ADD is exactly in-place over this rank's own
-        // allreduce partial. Each rank then reduces and writes only its own 1/N shard.
-        const bool scatter_ok = (new_kparams.n_dsts > 1 || opt_ar_nofanout) &&
-                                n_ranks <= HTP_OP_MAX_OUTPUTS &&
-                                add_dst->data == ar_local->data;
+        // scatter_ok reflects what the solver actually produced: sharded multi-dst 1D path.
+        // (is_shard_ok can be true yet n_dsts==1 if the op wasn't 1D-eligible -> FULL.)
+        const bool scatter_ok = new_kparams.n_dsts > 1;
+
+        // Collective mode is carried in the kernel params so the HTP kernel and instrumentation
+        // consume the same decision instead of re-deriving it.
+        new_kparams.mode = scatter_ok ? HTP_ALLREDUCE_SHARDED_FANOUT : HTP_ALLREDUCE_FULL;
 
         for (uint32_t r = 0; r < n_ranks; r++) {
             const ggml_tensor * ar_src = last_node.inputs[r];
@@ -2670,67 +2642,39 @@ struct ggml_hexagon_opbatch {
         last_node.fused.push_back(node.node);
         memcpy(last_node.kernel_params, &new_kparams, sizeof(new_kparams));
 
-        // Shared result buffer: rather than replicating this core's shard into all N
-        // per-core buffers, write it once into core 0's buffer and redirect every later
-        // reader to that copy. Legal only when the result is not written again later in
-        // this graph (ar_node_safe) -- otherwise all N cores would write one buffer.
-        // The per-shard disjointness argument is unchanged: core q writes only shard q of
-        // core 0's buffer and reads only shard q of every partial, so no core can clobber a
-        // region a peer is still reading.
-        const bool share_ok = opt_ar_share && scatter_ok &&
-                              sess->cur_node_idx < sess->ar_node_safe.size() &&
-                              sess->ar_node_safe[sess->cur_node_idx] &&
-                              last_node.inputs[0] && last_node.inputs[0]->data;
-
-        if (share_ok) {
-            new_kparams.n_dsts = 1;
-            memcpy(last_node.kernel_params, &new_kparams, sizeof(new_kparams));
-        }
-
         htp_op_desc & o = h_ops[n_ops - 1];
         o.opcode = HTP_OP_ALLREDUCE_ADD;
         memcpy(o.kernel_params, &new_kparams, sizeof(new_kparams));
 
         o.src[2 * n_ranks] = add_tensor(res_tensor);
-        if (share_ok) {
-            // Single shared destination: core 0's copy of the allreduce result.
-            o.dst[0] = o.src[0];
-            for (uint32_t d = 1; d < HTP_OP_MAX_OUTPUTS; d++) {
-                o.dst[d] = 0xffff;
+        if (new_kparams.mode == HTP_ALLREDUCE_SHARDED_FANOUT) {
+            // Reduce-scatter: each core reduces only its own 1/N shard, then writes that
+            // shard into all n_ranks per-core result buffers. The meta backend gives each
+            // core a separate physical buffer, so the shard must be replicated to every
+            // core's copy to form the complete result; only the (cheap) DMA write is
+            // replicated, the HVX reduction stays 1/N.
+            //
+            // Destinations reuse the first n_ranks source slots: those are exactly the N
+            // per-core allreduce partials, which are the buffers that must receive the final
+            // activation. Assert that contract rather than trust source ordering silently.
+            GGML_ASSERT((uint32_t) new_kparams.n_dsts == n_ranks);
+            for (uint32_t d = 0; d < n_ranks; d++) {
+                GGML_ASSERT(o.src[d] != 0xffff);
+                o.dst[d] = o.src[d];
             }
-            sess->ar_share_map[(uintptr_t) add_dst->data] = last_node.inputs[0];
-            HEX_VERBOSE("ggml-hex: %s fused ALLREDUCE+ADD (#%u) shared-dst -> %p\n",
-                        sess->c_name(), n_ops - 1, last_node.inputs[0]->data);
-        } else if (scatter_ok) {
-            // Fan-out: write this core's reduced 1/N shard into all n_ranks per-core buffers.
-            // The meta backend allocates a separate physical buffer per core, so the shard
-            // must be replicated to every core's copy; only the DMA write fans out, the HVX
-            // reduction stays 1/N.
-            const uint32_t n_out = opt_ar_nofanout ? 1 : n_ranks;
-            if (opt_ar_nofanout) {
-                // Experiment: own buffer only. Incorrect output by construction.
-                o.dst[0] = o.src[rank];
-            } else {
-                for (uint32_t d = 0; d < n_ranks; d++) {
-                    o.dst[d] = o.src[d];
-                }
-            }
-            for (uint32_t d = n_out; d < HTP_OP_MAX_OUTPUTS; d++) {
+            for (uint32_t d = n_ranks; d < HTP_OP_MAX_OUTPUTS; d++) {
                 o.dst[d] = 0xffff;
             }
         } else {
+            // Full redundant reduction: this core reduces the whole tensor into its own buffer.
             o.dst[0] = add_tensor(add_dst);
             for (uint32_t d = 1; d < HTP_OP_MAX_OUTPUTS; d++) {
                 o.dst[d] = 0xffff;
             }
         }
 
-        if (opt_ar_sharedchk && add_dst->data) {
-            sess->ar_out_ranges.emplace_back((uintptr_t) add_dst->data, ggml_nbytes(add_dst));
-        }
-
-        HEX_VERBOSE("ggml-hex: %s fused ALLREDUCE+ADD (#%u) scatter=%d n_dsts=%d\n",
-                    sess->c_name(), n_ops - 1, (int) scatter_ok, (int) new_kparams.n_dsts);
+        HEX_VERBOSE("ggml-hex: %s fused ALLREDUCE+ADD (#%u) mode=%d n_dsts=%d\n",
+                    sess->c_name(), n_ops - 1, (int) new_kparams.mode, (int) new_kparams.n_dsts);
         return true;
     }
 
@@ -3569,78 +3513,18 @@ void ggml_hexagon_session::enqueue_op(const htp_opnode & node) {
         }
     };
 
-    // Redirect reads of a shared allreduce result to core 0's copy. Done before the
-    // clone loop below so core 0's buffer gets mapped into this session as a side effect.
-    htp_opnode        remapped;
-    const htp_opnode * node_p = &node;
-    if (opt_ar_share && !this->ar_share_map.empty()) {
-        bool needs_remap = false;
-        for (auto t : node.get_inputs()) {
-            if (t && t->data && this->ar_share_map.count((uintptr_t) t->data)) {
-                needs_remap = true;
-                break;
-            }
-        }
-        if (needs_remap) {
-            remapped = node;
-            for (auto & t : remapped.inputs) {
-                if (!t || !t->data) continue;
-                auto it = this->ar_share_map.find((uintptr_t) t->data);
-                if (it != this->ar_share_map.end()) {
-                    t = it->second;
-                }
-            }
-            node_p = &remapped;
-        }
-    }
-    const htp_opnode & node_r = *node_p;
-
-    for (auto t : node_r.get_inputs()) {
+    for (auto t : node.get_inputs()) {
         clone_tensor_buffer(t);
     }
-    for (auto t : node_r.get_outputs()) {
+    for (auto t : node.get_outputs()) {
         clone_tensor_buffer(t);
     }
 
-    if (opt_ar_sharedchk) {
-        for (auto t : node_r.get_outputs()) {
-            if (!t || !t->data) continue;
-            const uintptr_t b = (uintptr_t) t->data;
-            const size_t    n = ggml_nbytes(t);
-            for (const auto & r : this->ar_out_ranges) {
-                if (b < r.first + r.second && r.first < b + n) {
-                    GGML_LOG_WARN("ggml-hex: %s AR_SHAREDCHK VIOLATION: op %s writes [%p,+%zu) "
-                                  "overlapping allreduce result [%p,+%zu) -- shared result buffer would race\n",
-                                  this->c_name(), node_r.op_name().c_str(), t->data, n,
-                                  (void *) r.first, r.second);
-                    break;
-                }
-            }
-        }
-        // Reader side: the share remap matches inputs by exact base address, so a reader
-        // that takes a *view* into an allreduce result (non-zero offset) is silently
-        // missed and would read this core's copy, which is never written under sharing.
-        // Inspect the pre-remap node so we can tell covered from missed readers.
-        for (auto t : node.get_inputs()) {
-            if (!t || !t->data) continue;
-            const uintptr_t b = (uintptr_t) t->data;
-            const size_t    n = ggml_nbytes(t);
-            for (const auto & r : this->ar_out_ranges) {
-                if (b < r.first + r.second && r.first < b + n) {
-                    GGML_LOG_WARN("ggml-hex: %s AR_SHAREDCHK READER %s: op %s reads [%p,+%zu) of allreduce result [%p,+%zu)\n",
-                                  this->c_name(), (b == r.first) ? "EXACT" : "VIEW-MISSED",
-                                  node.op_name().c_str(), t->data, n, (void *) r.first, r.second);
-                    break;
-                }
-            }
-        }
-    }
-
-    if (opt_opfusion && op_batch->try_fuse(node_r)) {
+    if (opt_opfusion && op_batch->try_fuse(node)) {
         return;
     }
 
-    if (!op_batch->fit_op(node_r)) {
+    if (!op_batch->fit_op(node)) {
         flush_async();
     }
 
@@ -3653,7 +3537,7 @@ void ggml_hexagon_session::enqueue_op(const htp_opnode & node) {
                    c_name());
     }
 
-    op_batch->add_op(node_r);
+    op_batch->add_op(node);
 }
 
 void ggml_hexagon_session::enqueue_mdev_group() {
@@ -3731,6 +3615,7 @@ static bool ggml_hexagon_precompute_allreduce_params(
     uint32_t n_ranks,
     bool has_add,
     bool is_row_bcast,
+    bool is_shard_ok,
     struct htp_allreduce_kernel_params * kparams
 ) {
     memset(kparams, 0, sizeof(*kparams));
@@ -3751,16 +3636,18 @@ static bool ggml_hexagon_precompute_allreduce_params(
 
     if (has_add) {
         // Reduce-scatter: when the fused residual ADD is in-place over this rank's own
-        // allreduce partial (validated by try_fuse_allreduce_add), each rank reduces only
-        // its own disjoint 1/N shard and fans that shard out to all N per-core buffers.
-        // The HVX reduction work is cut N-fold; only the (cheap) DMA write is replicated.
-        if (opt_ar_scatter && use_1d && !is_row_bcast) {
+        // allreduce partial (validated by try_fuse_allreduce_add) AND the caller says shard
+        // is safe (is_shard_ok), each rank reduces only its own disjoint 1/N shard and fans
+        // that shard out to all N per-core buffers. The HVX reduction work is cut N-fold;
+        // only the (cheap) DMA write is replicated. When shard is NOT ok, fall back to the
+        // full-range reduction into this rank's own buffer -- the shard range MUST cover the
+        // whole tensor here, otherwise the FULL path would reduce only 1/N and leave the rest
+        // of the buffer stale (the Qwen mixed-mode corruption bug).
+        if (opt_ar_scatter && is_shard_ok && use_1d && !is_row_bcast) {
             const uint32_t rank_chunk_elems = hex_round_up((nelem + n_ranks - 1) / n_ranks, 128);
             const uint32_t rank_elem_start  = (std::min)(rank * rank_chunk_elems, nelem);
             const uint32_t rank_elem_end    = (std::min)(rank_elem_start + rank_chunk_elems, nelem);
-            // opt_ar_nofanout: shard the reduce exactly as normal but write only one dst.
-            // Deliberately incorrect -- see the opt_ar_nofanout declaration.
-            kparams->n_dsts          = opt_ar_nofanout ? 1 : (int32_t) n_ranks;
+            kparams->n_dsts          = (int32_t) n_ranks;
             kparams->rank_elem_start = (int32_t) rank_elem_start;
             kparams->rank_nelem      = (int32_t) (rank_elem_end - rank_elem_start);
         } else if (use_1d) {
@@ -3790,6 +3677,12 @@ static bool ggml_hexagon_precompute_allreduce_params(
             kparams->rank_nelem            = (int32_t) rank_nrows;
         }
     }
+
+    // Default collective mode from the destination count: any path writing to all N per-core
+    // buffers fans out across cores (needs the exit-barrier DMA drain), a single-dst path does
+    // not. The fused ALLREDUCE+ADD planner may downgrade SHARDED_FANOUT->FULL after its
+    // in-place aliasing check; the standalone allreduce keeps whatever is set here.
+    kparams->mode = (kparams->n_dsts > 1) ? HTP_ALLREDUCE_SHARDED_FANOUT : HTP_ALLREDUCE_FULL;
 
     if (use_1d) {
         const uint32_t rank_nelem = (uint32_t) kparams->rank_nelem;
@@ -3896,9 +3789,8 @@ void ggml_hexagon_session::enqueue_allreduce(
     }
 
     ggml_hexagon_precompute_allreduce_params(
-        this, dst, rank, n_ranks, false, false,
-        (struct htp_allreduce_kernel_params *) ar_node.kernel_params
-    );
+        this, dst, rank, n_ranks, false, false, /*is_shard_ok=*/ false,
+        (struct htp_allreduce_kernel_params *) ar_node.kernel_params);
 
     ar_node.name = "ALLREDUCE";
     this->enqueue_op(ar_node);
@@ -6511,10 +6403,6 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
         return GGML_STATUS_FAILED;
     }
 
-    if (opt_ar_sharedchk) {
-        sess->ar_out_ranges.clear();
-    }
-
     HEX_VERBOSE("ggml-hex: %s graph-compute n_nodes %d\n", sess->c_name(), graph->n_nodes);
 
     const std::vector<htp_opnode> * nodes_ptr = nullptr;
@@ -6618,35 +6506,8 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
         }
     }
 
-    // Shared-result safety pre-pass. A node's output may be shared across cores only if
-    // no *later* node writes it: an in-place writer (e.g. the final output norm) would
-    // otherwise have all N cores writing the one shared buffer concurrently. Single
-    // reverse scan, so O(n) rather than the naive O(n^2) pairwise overlap test.
-    // Exact-address matching is sufficient here because ggml-alloc never places a live
-    // tensor partially inside another live tensor -- only exact in-place aliases occur.
-    if (opt_ar_share) {
-        sess->ar_share_map.clear();
-        const size_t n_nodes = nodes_ptr->size();
-        sess->ar_node_safe.assign(n_nodes, 1);
-        std::unordered_set<uintptr_t> written_later;
-        for (size_t k = n_nodes; k-- > 0; ) {
-            const auto & nd = (*nodes_ptr)[k];
-            for (auto t : nd.get_outputs()) {
-                if (t && t->data && written_later.count((uintptr_t) t->data)) {
-                    sess->ar_node_safe[k] = 0;
-                    break;
-                }
-            }
-            for (auto t : nd.get_outputs()) {
-                if (t && t->data) written_later.insert((uintptr_t) t->data);
-            }
-        }
-    }
-
     // Queue and execute
-    size_t node_idx = 0;
     for (const auto & node : *nodes_ptr) {
-        sess->cur_node_idx = node_idx++;
         sess->enqueue_op(node);
     }
 
@@ -7740,7 +7601,7 @@ static bool ggml_backend_hexagon_comm_allreduce_tensor(void * comm_ctx_v, struct
     for (size_t r = 0; r < n_backends; r++) {
         auto sess = static_cast<ggml_hexagon_session *>(comm_ctx->backends[r]->context);
         struct htp_allreduce_kernel_params kparams;
-        if (!ggml_hexagon_precompute_allreduce_params(sess, tensors[r], (uint32_t) r, (uint32_t) n_backends, false, false, &kparams)) {
+        if (!ggml_hexagon_precompute_allreduce_params(sess, tensors[r], (uint32_t) r, (uint32_t) n_backends, false, false, /*is_shard_ok=*/ false, &kparams)) {
             return false;
         }
     }
@@ -7760,9 +7621,6 @@ static bool ggml_backend_hexagon_comm_allreduce_tensor(void * comm_ctx_v, struct
     for (size_t i = 0; i < n_backends; i++) {
         auto sess_i = static_cast<ggml_hexagon_session *>(comm_ctx->backends[i]->context);
         sess_i->fence_seq = max_seq;
-        if (opt_ar_sharedchk && tensors[i]->data) {
-            sess_i->ar_out_ranges.emplace_back((uintptr_t) tensors[i]->data, ggml_nbytes(tensors[i]));
-        }
     }
 
     std::vector<const ggml_tensor *> data_tensors(n_backends);
@@ -7950,9 +7808,6 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_fa_select = getenv("GGML_HEXAGON_FA_SELECT");
     const char * str_ar_select = getenv("GGML_HEXAGON_AR_SELECT");
     const char * str_ar_scatter = getenv("GGML_HEXAGON_AR_SCATTER");
-    const char * str_ar_nofanout = getenv("GGML_HEXAGON_AR_NOFANOUT");
-    const char * str_ar_sharedchk = getenv("GGML_HEXAGON_AR_SHAREDCHK");
-    const char * str_ar_share = getenv("GGML_HEXAGON_AR_SHARE");
     const char * str_ndev     = getenv("GGML_HEXAGON_NDEV");
     const char * str_arch     = getenv("GGML_HEXAGON_ARCH");
     const char * str_vmem     = getenv("GGML_HEXAGON_VMEM");
@@ -8006,16 +7861,6 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     opt_fa_select = str_fa_select ? atoi(str_fa_select)                   : opt_fa_select;
     opt_ar_select = str_ar_select ? atoi(str_ar_select)                   : opt_ar_select;
     opt_ar_scatter = str_ar_scatter ? atoi(str_ar_scatter)                : opt_ar_scatter;
-    opt_ar_nofanout = str_ar_nofanout ? atoi(str_ar_nofanout)             : opt_ar_nofanout;
-    opt_ar_sharedchk = str_ar_sharedchk ? atoi(str_ar_sharedchk)          : opt_ar_sharedchk;
-    opt_ar_share  = str_ar_share  ? atoi(str_ar_share)                    : opt_ar_share;
-    if (opt_ar_sharedchk) {
-        GGML_LOG_INFO("ggml-hex: GGML_HEXAGON_AR_SHAREDCHK=1 -- checking for writes into allreduce results\n");
-    }
-    if (opt_ar_nofanout) {
-        GGML_LOG_WARN("ggml-hex: GGML_HEXAGON_AR_NOFANOUT=1 -- allreduce all-gather fan-out "
-                      "DISABLED. Output WILL be numerically wrong. Profiling use only.\n");
-    }
     opt_mbuf      = str_mbuf     ? strtoul(str_mbuf, NULL, 0) * MiB       : opt_mbuf;
     opt_vmem      = str_vmem     ? strtoul(str_vmem, NULL, 0) * MiB       : opt_vmem;
     opt_hostbuf   = str_hostbuf  ? atoi(str_hostbuf) != 0                 : opt_hostbuf;
