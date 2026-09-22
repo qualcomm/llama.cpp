@@ -198,7 +198,7 @@ export GGML_HEXAGON_DEVICES=HTP0,HTP1,HTP2,HTP3
 Baseline run: `20260921-191207` (`dev/ebateni/scatter-on-master`, `cf5b841d6`).  
 Split modes: `single`, `tensor`, `tensor-scatter` (= tensor + `AR_SCATTER=1`), `row`.  
 Quality columns: `IQ score · needle · cookie`.  
-`*` = ubatch reduced 1024→512 due to upstream VTCM regression (#28589).  
+`*` = ubatch reduced 1024→512 due to upstream VTCM regression (#28589) — see note below.  
 **Bold** = best PP or TG in that row across split methods.
 
 ### llama-3.2-3b-instruct-q4_0
@@ -260,9 +260,21 @@ Scatter gain for gemma: ~0% (GQA-capped tensor-split, few eligible allreduce ops
 - **Qwen row-split regression** (upstream #28589): Qwen 4c row drops from 3.31x
   (`hexagon-mdev`) to 1.40x (upstream). Unrelated to this patch — the upstream
   reimplementation of row-split lost Qwen's scaling. Tracked separately.
-- **Upstream VTCM abort** at large ubatch (upstream #28589): `enqueue_allreduce`
-  ignores `precompute_allreduce_params`'s false return, causing a silent abort.
-  Tracked separately.
+- **Upstream VTCM abort at ubatch=1024 (upstream #28589):** Qwen 4c tensor-split
+  at `ub=1024` hits a VTCM/HMX resource limit introduced by commit `eafe15a5`
+  ("hexagon: support for multi-device model split"). The failure mode is a hard
+  abort in `enqueue_op` with a message of the form:
+  ```
+  vmem/tensor/buffer limit exceeded
+  GGML_ASSERT: ggml_hexagon_session::enqueue_op
+  ```
+  Root cause: `enqueue_allreduce` calls `precompute_allreduce_params` but does not
+  check its return value. When the VTCM solver cannot fit the allocation it returns
+  false, but the op is enqueued anyway with zeroed params, which triggers the
+  abort. This is an upstream bug unrelated to this patch — confirmed by reproducing
+  on a pristine upstream `e6cef8152` build with no scatter changes applied.  
+  The test harness automatically retries at `ub=512` when this abort is detected,
+  and marks the result with `*`. Tracked separately for an upstream fix.
 - **Megatron-style column/row weight partitioning**: the 71% barrier-wait cost
   can only be meaningfully reduced by cutting the number of collectives per layer
   (Megatron pairing collapses 2 allreduces per MLP/attention block into 1). This
