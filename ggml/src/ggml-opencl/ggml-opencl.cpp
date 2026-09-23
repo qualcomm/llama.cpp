@@ -30582,7 +30582,16 @@ static bool ggml_cl_flash_attn_decompose(
         const char * e = getenv("GGML_OPENCL_FA_KV_PITCH_ROUND_MIN");
         return (e && e[0]) ? (int64_t)atoll(e) : (int64_t)16384;
     }();
-    const bool kv_pitch_do_round = kv_pitch_round > 0 && n_kv > kv_pitch_round_min;
+    // The rounded pitch helps only where few V^T rows stream per kv head: the KQV GEMM reads dv
+    // rows at the pitch, and at dv 512 a 32 KB multiple puts them back on the same cache sets -
+    // the kernel then costs 32% more per call and gemma-4-26B loses 30% at depth, the same
+    // sensitivity that the rounding removes at dv 64. Every geometry measured to gain is dv <= 256.
+    // GGML_OPENCL_FA_KV_PITCH_ROUND_MAX_DV moves the bound (A/B only).
+    static const int64_t kv_pitch_round_max_dv = []{
+        const char * e = getenv("GGML_OPENCL_FA_KV_PITCH_ROUND_MAX_DV");
+        return (e && e[0]) ? (int64_t)atoll(e) : (int64_t)256;
+    }();
+    const bool kv_pitch_do_round = kv_pitch_round > 0 && n_kv > kv_pitch_round_min && dv <= kv_pitch_round_max_dv;
     const int64_t kv_pitch = (kv_pitch_do_round ? ((n_kv + kv_pitch_round - 1) & ~(kv_pitch_round - 1)) : n_kv) + kv_pitch_pad;
     if (kqv_int8_set || kqv_int8) {
         // Report once why the path did or did not take: four conditions, and a silent decline
