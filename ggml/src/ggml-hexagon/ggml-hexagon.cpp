@@ -5203,10 +5203,10 @@ static bool ggml_hexagon_supported_activations(const struct ggml_hexagon_session
     const struct ggml_tensor * src1 = op->src[1];
     const struct ggml_tensor * dst  = op;
 
-    if (src0->type != GGML_TYPE_F32) {
+    if (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16) {
         return false;
     }
-    if (dst->type != GGML_TYPE_F32) {
+    if (dst->type != src0->type) {
         return false;
     }
 
@@ -5218,7 +5218,7 @@ static bool ggml_hexagon_supported_activations(const struct ggml_hexagon_session
     }
 
     if (src1) {
-        if (src1->type != GGML_TYPE_F32) {
+        if (src1->type != src0->type) {
             return false;
         }
         if (!ggml_are_same_shape(src0, src1)) {
