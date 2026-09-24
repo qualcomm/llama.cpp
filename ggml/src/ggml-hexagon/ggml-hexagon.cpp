@@ -5884,7 +5884,8 @@ static bool ggml_hexagon_supported_unary(const struct ggml_hexagon_session * ses
             case GGML_OP_LOG:
                 break;
             case GGML_OP_UNARY:
-                if (ggml_get_unary_op(op) != GGML_UNARY_OP_ABS) {
+                if (ggml_get_unary_op(op) != GGML_UNARY_OP_ABS &&
+                    ggml_get_unary_op(op) != GGML_UNARY_OP_STEP) {
                     return false;
                 }
                 break;
@@ -6488,6 +6489,7 @@ static htp_op_code op_remap_to_htp(const ggml_tensor * t) {
                 case GGML_UNARY_OP_TANH:       return HTP_OP_UNARY_TANH;
                 case GGML_UNARY_OP_ABS:        return HTP_OP_UNARY_ABS;
                 case GGML_UNARY_OP_RELU:       return HTP_OP_UNARY_RELU;
+                case GGML_UNARY_OP_STEP:       return HTP_OP_UNARY_STEP;
             default:
                 break;
             }
@@ -7540,6 +7542,7 @@ static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, cons
                 case GGML_UNARY_OP_GELU:
                 case GGML_UNARY_OP_GELU_QUICK:
                 case GGML_UNARY_OP_RELU:
+                case GGML_UNARY_OP_STEP:
                     supp = ggml_hexagon_supported_unary(sess, op);
                     break;
                 default:
