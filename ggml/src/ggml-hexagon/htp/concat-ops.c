@@ -281,19 +281,19 @@ static bool concat_dim1_contiguous_dma(struct htp_ops_context * octx, int dim, u
 
     for (uint32_t i3 = 0; i3 < dst->ne[3]; ++i3) {
         for (uint32_t i2 = 0; i2 < dst->ne[2]; ++i2) {
-            uint8_t * dst_ptr  = (uint8_t *) dst->data  + i3 * dst->nb[3]  + i2 * dst->nb[2];
-            uint8_t * src0_ptr = (uint8_t *) src0->data + i3 * src0->nb[3] + i2 * src0->nb[2];
-            uint8_t * src1_ptr = (uint8_t *) src1->data + i3 * src1->nb[3] + i2 * src1->nb[2];
+            dma_addr_t dst_addr  = dst->data  + i3 * dst->nb[3]  + i2 * dst->nb[2];
+            dma_addr_t src0_addr = src0->data + i3 * src0->nb[3] + i2 * src0->nb[2];
+            dma_addr_t src1_addr = src1->data + i3 * src1->nb[3] + i2 * src1->nb[2];
 
-            if (!dma_queue_push(q, dma_make_ptr(dst_ptr, src0_ptr), dst->nb[1], src0->nb[1], src0_row_size, src0->ne[1])) {
+            if (!dma_queue_push(q, dma_make_data(dst_addr, src0_addr), dst->nb[1], src0->nb[1], src0_row_size, src0->ne[1])) {
                 dma_queue_flush(q);
-                dma_queue_push(q, dma_make_ptr(dst_ptr, src0_ptr), dst->nb[1], src0->nb[1], src0_row_size, src0->ne[1]);
+                dma_queue_push(q, dma_make_data(dst_addr, src0_addr), dst->nb[1], src0->nb[1], src0_row_size, src0->ne[1]);
             }
 
-            dst_ptr += src0->ne[1] * dst->nb[1];
-            if (!dma_queue_push(q, dma_make_ptr(dst_ptr, src1_ptr), dst->nb[1], src1->nb[1], src1_row_size, src1->ne[1])) {
+            dst_addr += src0->ne[1] * dst->nb[1];
+            if (!dma_queue_push(q, dma_make_data(dst_addr, src1_addr), dst->nb[1], src1->nb[1], src1_row_size, src1->ne[1])) {
                 dma_queue_flush(q);
-                dma_queue_push(q, dma_make_ptr(dst_ptr, src1_ptr), dst->nb[1], src1->nb[1], src1_row_size, src1->ne[1]);
+                dma_queue_push(q, dma_make_data(dst_addr, src1_addr), dst->nb[1], src1->nb[1], src1_row_size, src1->ne[1]);
             }
         }
     }
