@@ -18188,10 +18188,13 @@ static bool ggml_cl_top_k_plan_for(ggml_backend_opencl_context * backend_ctx,
 
 inline bool use_q6_k_bin_kernels(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor) {
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
-    // GGML_OPENCL_Q6_K_BIN=0 keeps these weights in the regular layout and on this backend's own
-    // kernels. Read once: set_tensor and the dispatch must agree on the layout.
-    static const bool disabled = ggml_cl_env_flag_zero("GGML_OPENCL_Q6_K_BIN");
-    if (disabled) {
+    // OPT-IN (GGML_OPENCL_Q6_K_BIN=1). The bin GEMM wins prefill by 40%+ on gemma-4-E4B Q4_K_M, but
+    // it also takes the speculative verify batch (k+1 = 8 columns, padded to the bin
+    // tile), where this backend's narrow cooperative-K GEMM is much faster: X2-90, MTP
+    // k=7, 51.7 -> 42.7 t/s (-17%) with it on, plain decode unchanged. Read once:
+    // set_tensor and the dispatch must agree on the layout.
+    static const bool enabled = ggml_cl_env_flag("GGML_OPENCL_Q6_K_BIN") && !ggml_cl_env_flag_zero("GGML_OPENCL_Q6_K_BIN");
+    if (!enabled) {
         return false;
     }
     if (!backend_ctx->kernel_gemv_noshuffle_q6_k_f32_32b_trans ||
@@ -18212,10 +18215,13 @@ inline bool use_q6_k_bin_kernels(const ggml_backend_opencl_context *backend_ctx,
 
 inline bool use_q4_k_bin_kernels(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor) {
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
-    // GGML_OPENCL_Q4_K_BIN=0 keeps these weights in the regular layout and on this backend's own
-    // kernels. Read once: set_tensor and the dispatch must agree on the layout.
-    static const bool disabled = ggml_cl_env_flag_zero("GGML_OPENCL_Q4_K_BIN");
-    if (disabled) {
+    // OPT-IN (GGML_OPENCL_Q4_K_BIN=1). The bin GEMM wins prefill by 40%+ on gemma-4-E4B Q4_K_M, but
+    // it also takes the speculative verify batch (k+1 = 8 columns, padded to the bin
+    // tile), where this backend's narrow cooperative-K GEMM is much faster: X2-90, MTP
+    // k=7, 51.7 -> 42.7 t/s (-17%) with it on, plain decode unchanged. Read once:
+    // set_tensor and the dispatch must agree on the layout.
+    static const bool enabled = ggml_cl_env_flag("GGML_OPENCL_Q4_K_BIN") && !ggml_cl_env_flag_zero("GGML_OPENCL_Q4_K_BIN");
+    if (!enabled) {
         return false;
     }
     if (!backend_ctx->kernel_gemv_noshuffle_q4_k_f32_32b_trans ||
