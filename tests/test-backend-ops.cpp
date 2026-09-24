@@ -10205,6 +10205,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32, 2560, 128, 4096, {1, 1}, {4, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32, 2560, 170, 4096, {1, 1}, {3, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 2560, 128, 4096, {1, 1}, {4, 1}));
+    // batched src1 over a 2-D weight: the bin (ILA) GEMM paths see one slice at a time
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 2560,   1, 4096, {1, 1}, {4, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 2560, 170, 4096, {1, 1}, {3, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 2560,   1, 4096, {1, 1}, {4, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 2560, 128, 4096, {1, 1}, {4, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 2560, 170, 4096, {1, 1}, {3, 1}));
     // Qwen3-4B decode (n=1) GEMV shapes — the real per-token matmuls (Intel/SYCL study).
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 9728, 1, 2560, {1, 1}, {1, 1})); // ffn up/gate
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 2560, 1, 9728, {1, 1}, {1, 1})); // ffn down
