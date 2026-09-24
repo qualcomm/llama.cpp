@@ -17941,10 +17941,12 @@ inline bool enable_adreno_trans_weight_q5_K(const ggml_backend_opencl_context *b
 
 inline bool use_q4_0_bin_kernels(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor) {
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
-    // GGML_OPENCL_Q4_0_BIN=0 keeps these weights in the regular layout and on this backend's own
-    // kernels. Read once: set_tensor and the dispatch must agree on the layout.
-    static const bool disabled = ggml_cl_env_flag_zero("GGML_OPENCL_Q4_0_BIN");
-    if (disabled) {
+    // OPT-IN (GGML_OPENCL_Q4_0_BIN=1), for the same reason as q4_K below: the bin GEMM wins
+    // prefill (gemma-4-E4B q4_0 pp512 +46% on the X2-90) but its decode GEMV is slower
+    // (tg128 33.6 -> 30.1) and it pads the speculative verify batch to its tile (MTP k=6
+    // 60.6 -> 47.5 t/s). Read once: set_tensor and the dispatch must agree on the layout.
+    static const bool enabled = ggml_cl_env_flag("GGML_OPENCL_Q4_0_BIN") && !ggml_cl_env_flag_zero("GGML_OPENCL_Q4_0_BIN");
+    if (!enabled) {
         return false;
     }
     if (!backend_ctx->kernel_gemv_noshuffle_q4_0_f32_32b_trans ||
