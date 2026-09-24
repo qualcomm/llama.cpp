@@ -15682,6 +15682,7 @@ static void ggml_cl_moe_combine_fused(ggml_backend_t backend, const ggml_tensor 
     backend_ctx->enqueue_ndrange_kernel(kernel, 2, gws, lws, (ggml_tensor *)dst);
 }
 
+inline bool use_q4_0_bin_kernels(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor);
 inline bool use_q4_k_bin_kernels(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor);
 
 static bool ggml_opencl_can_fuse(const ggml_backend_opencl_context * backend_ctx, const struct ggml_cgraph * cgraph, int node_idx, std::initializer_list<enum ggml_op> ops) {
@@ -15753,6 +15754,12 @@ static bool ggml_opencl_can_fuse(const ggml_backend_opencl_context * backend_ctx
         // Declining is also the FASTER choice here, so there is nothing to trade off:
         // tg128 unfused 37.6 vs 35.8 at the broken nsg=4 and 34.1 at a correct nsg=2.
         if (wg_q4_0 && (gate->src[0]->ne[1] % 128) != 0) {
+            return false;
+        }
+        // Same as for q4_K below: a weight in the bin (32b-transposed) layout cannot be read
+        // by the fused noshuffle GEMV, which would silently compute garbage.
+        if (wg_q4_0 && (use_q4_0_bin_kernels(backend_ctx, gate->src[0]) ||
+                        use_q4_0_bin_kernels(backend_ctx, up->src[0]))) {
             return false;
         }
         const bool wg_iq2_xxs = gate->src[0]->type == GGML_TYPE_IQ2_XXS;
