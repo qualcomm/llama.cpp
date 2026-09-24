@@ -3895,8 +3895,8 @@ static int hvx_mm_matmul_id(
     octx->src2_spad.src  = NULL;
     octx->dst_spad.src   = NULL;
 
-    mmctx->vtcm_src0_stride     = src0_row_size_padded;
-    mmctx->vtcm_src1_stride     = src1_row_size;
+    mmctx->vtcm_src0_stride    = src0_row_size_padded;
+    mmctx->vtcm_src1_stride    = src1_row_size;
     mmctx->vtcm_act_raw_stride = hex_round_up(ne10 * sizeof(float), QK_Q8_0_TILED * sizeof(float));
 
     mmctx->vtcm_src0_size_per_thread = fastdiv(L.src0_bytes, &octx->n_threads_div);
