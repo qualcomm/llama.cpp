@@ -6080,11 +6080,6 @@ static void ggml_hexagon_precompute_ssm_conv_params(
 
     const uint32_t raw_rpt = (d_inner + n_threads - 1) / n_threads;
     const uint32_t d_inner_per_thread = hex_round_up(raw_rpt, 32);
-    kparams->d_inner_per_thread = d_inner_per_thread;
-
-    kparams->src0_row_size_aligned = hex_round_up(ncs * sizeof(float), 128);
-    kparams->src1_row_size_aligned = hex_round_up(d_conv * sizeof(float), 128);
-    kparams->dst_row_size_aligned  = hex_round_up(d_inner * sizeof(float), 128);
 
     if (n_t == 1) {
         kparams->d_inner_tile = d_inner_per_thread;
@@ -6113,9 +6108,14 @@ static void ggml_hexagon_precompute_ssm_conv_params(
         const uint32_t vtcm_src1_per_thread = src1_raw_bytes + src1_T_bytes;
 
         const size_t vtcm_budget = (sess->vtcm_size > 0 ? sess->vtcm_size / n_threads : (1024 * 1024));
-        const size_t avail_for_src0 = vtcm_budget > vtcm_src1_per_thread ? vtcm_budget - vtcm_src1_per_thread : (128 * 1024);
 
-        uint32_t d_inner_tile = (uint32_t)((avail_for_src0 / 2) / (ncs * sizeof(float) + n_t * sizeof(float) + 1));
+        // the kernel double-buffers the raw src0 tile and the dst tile, and transposes
+        // one 32-channel block at a time
+        const uint32_t src0_block_T = hex_round_up(ncs * 32 * sizeof(float), 128);
+        const size_t   fixed_bytes  = vtcm_src1_per_thread + src0_block_T;
+        const size_t   avail_for_tiles = vtcm_budget > fixed_bytes ? vtcm_budget - fixed_bytes : (128 * 1024);
+
+        uint32_t d_inner_tile = (uint32_t)(avail_for_tiles / (2 * (ncs + n_t) * sizeof(float)));
         d_inner_tile = (d_inner_tile / 32) * 32;
         if (d_inner_tile == 0) {
             d_inner_tile = 32;
@@ -6125,11 +6125,10 @@ static void ggml_hexagon_precompute_ssm_conv_params(
         }
         kparams->d_inner_tile = d_inner_tile;
 
-        const uint32_t src0_tile_raw = hex_round_up(d_inner_tile * ncs * sizeof(float), 128) + 128;
-        const uint32_t src0_tile_T   = hex_round_up(ncs * d_inner_tile * sizeof(float), 128);
-        const uint32_t vtcm_src0_per_thread = src0_tile_raw + src0_tile_T;
+        const uint32_t src0_tile_raw = hex_round_up(d_inner_tile * ncs * sizeof(float), 128);
+        const uint32_t vtcm_src0_per_thread = 2 * src0_tile_raw + src0_block_T;
 
-        const uint32_t vtcm_dst_per_thread = hex_round_up(d_inner_tile * n_t * sizeof(float), 128);
+        const uint32_t vtcm_dst_per_thread = 2 * hex_round_up(d_inner_tile * n_t * sizeof(float), 128);
 
         kparams->vtcm_src0_size_per_thread = vtcm_src0_per_thread;
         kparams->vtcm_src1_size_per_thread = vtcm_src1_per_thread;
@@ -6140,8 +6139,6 @@ static void ggml_hexagon_precompute_ssm_conv_params(
         kparams->vtcm_dst_size  = vtcm_dst_per_thread  * n_threads;
         kparams->vtcm_size      = kparams->vtcm_src0_size + kparams->vtcm_src1_size + kparams->vtcm_dst_size;
     }
-
-    kparams->div_n_threads = init_fastdiv_values(n_threads);
 }
 
 static void ggml_hexagon_precompute_gated_delta_net_params(
