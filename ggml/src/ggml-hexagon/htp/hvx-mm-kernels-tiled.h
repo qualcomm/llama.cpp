@@ -966,14 +966,9 @@ static inline void quantize_f32_q8_0_tiled_kernel(
     size_t src_row_size,
     size_t dst_row_size
 ) {
-    const size_t src_row_size_padded = hex_round_up(src_row_size, QK_Q8_0_TILED * sizeof(float));
-    hvx_splat_f32_a(tmp_data, 0.0f, src_row_size_padded / sizeof(float));
-
+    (void) tmp_data;
     for (uint32_t i = 0; i < nrows; ++i) {
-        hex_l2fetch(src_data, src_row_size, src_row_size, 2);
-        hvx_copy_f32_aa(tmp_data, src_data, ne0);
-
-        quantize_row_f32_q8_0_tiled((float *) tmp_data, dst_data, ne0);
+        quantize_row_f32_q8_0_tiled((float *) src_data, dst_data, ne0);
         dst_data += dst_row_size;
         src_data += src_row_size;
     }
@@ -988,14 +983,9 @@ static inline void quantize_f32_q8_1_tiled_kernel(
     size_t src_row_size,
     size_t dst_row_size
 ) {
-    const size_t src_row_size_padded = hex_round_up(src_row_size, QK_Q8_0_TILED * sizeof(float));
-    hvx_splat_f32_a(tmp_data, 0.0f, src_row_size_padded / sizeof(float));
-
+    (void) tmp_data;
     for (uint32_t i = 0; i < nrows; ++i) {
-        hex_l2fetch(src_data, src_row_size, src_row_size, 2);
-        hvx_copy_f32_aa(tmp_data, src_data, ne0);
-
-        quantize_row_f32_q8_1_tiled((float *) tmp_data, dst_data, ne0);
+        quantize_row_f32_q8_1_tiled((float *) src_data, dst_data, ne0);
         dst_data += dst_row_size;
         src_data += src_row_size;
     }
@@ -1013,24 +1003,15 @@ static inline void quantize_f32_q8_0_tiled_block_kernel(
     uint32_t r,
     uint32_t c
 ) {
+    (void) tmp_data;
     const uint32_t qk = QK_Q8_0_TILED;
     const uint32_t nb = (ne0 + qk - 1) / qk;
 
     for (uint32_t ib = ib_first; ib < ib_last; ++ib) {
-        const uint8_t * restrict src_ptr = (const uint8_t *) src + r * src_row_size + c * qk * sizeof(float);
+        const float * restrict src_ptr = (const float *) ((const uint8_t *) src + r * src_row_size + c * qk * sizeof(float));
         uint8_t * restrict dst_ptr = dst + r * dst_row_size + c * 4 * 1152;
 
-        hex_l2fetch(src_ptr, qk * sizeof(float), qk * sizeof(float), 1);
-
-        if (c == nb - 1) {
-            uint32_t active_elements = ne0 - c * qk;
-            hvx_splat_f32_a(tmp_data, 0.0f, qk);
-            hvx_copy_f32_aa(tmp_data, src_ptr, active_elements);
-        } else {
-            hvx_copy_f32_aa(tmp_data, src_ptr, qk);
-        }
-
-        quantize_block_f32_q8_0_tiled((float *) tmp_data, dst_ptr);
+        quantize_block_f32_q8_0_tiled((float *) src_ptr, dst_ptr);
 
         c++;
         if (c == nb) {
@@ -1052,24 +1033,15 @@ static inline void quantize_f32_q8_1_tiled_block_kernel(
     uint32_t r,
     uint32_t c
 ) {
+    (void) tmp_data;
     const uint32_t qk = QK_Q8_0_TILED;
     const uint32_t nb = (ne0 + qk - 1) / qk;
 
     for (uint32_t ib = ib_first; ib < ib_last; ++ib) {
-        const uint8_t * restrict src_ptr = (const uint8_t *) src + r * src_row_size + c * qk * sizeof(float);
+        const float * restrict src_ptr = (const float *) ((const uint8_t *) src + r * src_row_size + c * qk * sizeof(float));
         uint8_t * restrict dst_ptr = dst + r * dst_row_size + c * 4 * 1280;
 
-        hex_l2fetch(src_ptr, qk * sizeof(float), qk * sizeof(float), 1);
-
-        if (c == nb - 1) {
-            uint32_t active_elements = ne0 - c * qk;
-            hvx_splat_f32_a(tmp_data, 0.0f, qk);
-            hvx_copy_f32_aa(tmp_data, src_ptr, active_elements);
-        } else {
-            hvx_copy_f32_aa(tmp_data, src_ptr, qk);
-        }
-
-        quantize_block_f32_q8_1_tiled((float *) tmp_data, dst_ptr);
+        quantize_block_f32_q8_1_tiled((float *) src_ptr, dst_ptr);
 
         c++;
         if (c == nb) {

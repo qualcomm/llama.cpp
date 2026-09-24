@@ -332,6 +332,7 @@ struct htp_mm_hvx_vtcm_layout {
     size_t off_src2;          // vtcm_src2 (Wq / fused only)
     size_t off_src3;          // vtcm_src3 (Wv / fused only)
     size_t off_dst;           // vtcm_dst (output scratch)
+    size_t off_src1_raw;      // vtcm_src1_raw (raw activation DMA staging)
 
     // Cached sizes
     size_t src0_bytes;
@@ -339,6 +340,7 @@ struct htp_mm_hvx_vtcm_layout {
     size_t src2_bytes;
     size_t src3_bytes;
     size_t dst_bytes;
+    size_t src1_raw_bytes;
 
     size_t total_bytes;
 };
@@ -478,11 +480,12 @@ static inline void htp_mm_hvx_vtcm_layout_build(
     bool is_fused_nx
 ) {
     (void)src1_row_size;
-    size_t src0_sz = 0;
-    size_t src1_sz = 0;
-    size_t src2_sz = src2_row_size > 0 ? htp_mm_round_up(src2_row_size, 128) : 0;
-    size_t src3_sz = 0;
-    size_t dst_sz  = 0;
+    size_t src0_sz     = 0;
+    size_t src1_sz     = 0;
+    size_t src2_sz     = src2_row_size > 0 ? htp_mm_round_up(src2_row_size, 128) : 0;
+    size_t src3_sz     = 0;
+    size_t dst_sz      = 0;
+    size_t src1_raw_sz = 0;
 
     const bool is_repack = (wtype == HTP_TYPE_Q4_0 || wtype == HTP_TYPE_Q4_1 ||
                             wtype == HTP_TYPE_Q8_0 || wtype == HTP_TYPE_IQ4_NL ||
@@ -491,7 +494,6 @@ static inline void htp_mm_hvx_vtcm_layout_build(
 
     if (is_fused_nx) {
         const size_t src0_row_size_padded = hex_round_up(src0_row_size, 128);
-        const size_t quant_scratch_size = hex_round_up(ne10 * sizeof(float), QK_Q8_0_TILED * sizeof(float)) * n_threads;
 
         size_t weight_sz_per_thread = 0;
 
@@ -507,12 +509,14 @@ static inline void htp_mm_hvx_vtcm_layout_build(
 
         size_t tiled_act_row_size = (wtype == HTP_TYPE_Q4_1 || wtype == HTP_TYPE_Q4_K) ? htp_mm_q8_1_tiled_row_size(ne10) : htp_mm_q8_0_tiled_row_size(ne10);
         size_t act_sz = hex_round_up(tiled_act_row_size * src1_nrows, 128);
+        size_t raw_row_size = hex_round_up(ne10 * sizeof(float), QK_Q8_0_TILED * sizeof(float));
 
-        src0_sz = weight_sz_per_thread * n_threads; // shared single-weight prefetch buffer
-        src1_sz = act_sz;                           // quantized activation buffer
-        src2_sz = 0;
-        src3_sz = 0;
-        dst_sz  = quant_scratch_size;
+        src0_sz     = weight_sz_per_thread * n_threads; // shared single-weight prefetch buffer
+        src1_sz     = act_sz;                           // quantized activation buffer
+        src2_sz     = 0;
+        src3_sz     = 0;
+        dst_sz      = 0;
+        src1_raw_sz = hex_round_up(raw_row_size * src1_nrows, 128);
     } else if (is_matmul_id) {
         const size_t src0_row_size_padded = htp_mm_round_up(src0_row_size, 128);
         const size_t src1_row_size_tiled = (wtype == HTP_TYPE_Q4_1 || wtype == HTP_TYPE_Q4_K) ? htp_mm_q8_1_tiled_row_size(ne10)
@@ -529,10 +533,13 @@ static inline void htp_mm_hvx_vtcm_layout_build(
             src0_sz_per_thread               = repacked_vtcm_size;
         }
 
-        src0_sz = src0_sz_per_thread * n_threads;
-        dst_sz  = htp_mm_round_up(ne10 * sizeof(float), QK_Q8_0_TILED * sizeof(float)) * n_threads;
-        src2_sz = 0;
-        src3_sz = 0;
+        size_t raw_row_size = hex_round_up(ne10 * sizeof(float), QK_Q8_0_TILED * sizeof(float));
+
+        src0_sz     = src0_sz_per_thread * n_threads;
+        dst_sz      = 0;
+        src2_sz     = 0;
+        src3_sz     = 0;
+        src1_raw_sz = hex_round_up(raw_row_size * src1_nrows, 128);
     } else {
         const size_t src0_row_size_padded = htp_mm_round_up(src0_row_size, 128);
         const size_t dst_nrows = (src1_nrows > 1) ? 0 : 1;
@@ -540,16 +547,18 @@ static inline void htp_mm_hvx_vtcm_layout_build(
         switch (kernel_type) {
             case HTP_MM_KERNEL_HVX_F16_F16_VTCM: {
                 size_t f16_src1_row_size = htp_mm_round_up(ne10 * 2, 128);
-                src1_sz = htp_mm_round_up(f16_src1_row_size * src1_nrows, 256);
-                src0_sz = htp_mm_round_up(n_prefetch * src0_row_size_padded, 256) * n_threads;
-                dst_sz  = dst_nrows > 0 ? htp_mm_round_up(dst_row_size, 128) * n_threads : 0;
+                src1_sz     = htp_mm_round_up(f16_src1_row_size * src1_nrows, 256);
+                src0_sz     = htp_mm_round_up(n_prefetch * src0_row_size_padded, 256) * n_threads;
+                dst_sz      = dst_nrows > 0 ? htp_mm_round_up(dst_row_size, 128) * n_threads : 0;
+                src1_raw_sz = hex_round_up(hex_round_up(ne10 * sizeof(float), 128) * src1_nrows, 128);
                 break;
             }
             case HTP_MM_KERNEL_HVX_F32_F32_VTCM: {
                 size_t f32_src1_row_size = htp_mm_round_up(ne10 * 4, 128);
-                src1_sz = htp_mm_round_up(f32_src1_row_size * src1_nrows, 256);
-                src0_sz = htp_mm_round_up(n_prefetch * src0_row_size_padded, 256) * n_threads;
-                dst_sz  = dst_nrows > 0 ? htp_mm_round_up(dst_row_size, 128) * n_threads : 0;
+                src1_sz     = htp_mm_round_up(f32_src1_row_size * src1_nrows, 256);
+                src0_sz     = htp_mm_round_up(n_prefetch * src0_row_size_padded, 256) * n_threads;
+                dst_sz      = dst_nrows > 0 ? htp_mm_round_up(dst_row_size, 128) * n_threads : 0;
+                src1_raw_sz = 0;
                 break;
             }
             case HTP_MM_KERNEL_HVX_QUANT_BLOCK:
@@ -569,10 +578,10 @@ static inline void htp_mm_hvx_vtcm_layout_build(
                     src0_sz = repacked_vtcm_size * n_threads;
                 }
 
-                size_t quant_scratch_size_per_thread = htp_mm_round_up(ne10 * sizeof(float), QK_Q8_0_TILED * sizeof(float));
                 size_t dst_slice_per_thread = (dst_nrows > 0 && src1_nrows == 1) ? htp_mm_round_up((dst_row_size + n_threads - 1) / n_threads, 128) : 0;
-                size_t dst_size_per_thread = (dst_slice_per_thread > quant_scratch_size_per_thread) ? dst_slice_per_thread : quant_scratch_size_per_thread;
-                dst_sz = dst_size_per_thread * n_threads;
+                dst_sz = dst_slice_per_thread * n_threads;
+                size_t raw_row_size = hex_round_up(ne10 * sizeof(float), QK_Q8_0_TILED * sizeof(float));
+                src1_raw_sz = hex_round_up(raw_row_size * src1_nrows, 128);
                 break;
             }
             default:
@@ -580,19 +589,30 @@ static inline void htp_mm_hvx_vtcm_layout_build(
         }
     }
 
-    size_t off = 0;
-    VTCM_LAYOUT_ALLOC(off, off_src0, src0_sz);
-    VTCM_LAYOUT_ALLOC(off, off_src1, src1_sz);
-    VTCM_LAYOUT_ALLOC(off, off_src2, src2_sz);
-    VTCM_LAYOUT_ALLOC(off, off_src3, src3_sz);
-    VTCM_LAYOUT_ALLOC(off, off_dst,  dst_sz);
+    // Group A: Persistent buffers across chunk compute
+    size_t off_group_a = 0;
+    VTCM_LAYOUT_ALLOC(off_group_a, off_src1, src1_sz);
+    VTCM_LAYOUT_ALLOC_OPTIONAL(off_group_a, off_src2, src2_sz, src2_sz > 0);
+    VTCM_LAYOUT_ALLOC_OPTIONAL(off_group_a, off_src3, src3_sz, src3_sz > 0);
 
-    L->src0_bytes = src0_sz;
-    L->src1_bytes = src1_sz;
-    L->src2_bytes = src2_sz;
-    L->src3_bytes = src3_sz;
-    L->dst_bytes  = dst_sz;
-    L->total_bytes = off;
+    // Group B: Compute-only buffers (starts at off_group_a)
+    size_t off_group_b = off_group_a;
+    VTCM_LAYOUT_ALLOC(off_group_b, off_src0, src0_sz);
+    VTCM_LAYOUT_ALLOC_OPTIONAL(off_group_b, off_dst, dst_sz, dst_sz > 0);
+    const size_t group_b_size = off_group_b - off_group_a;
+
+    // Group C: Raw activation staging buffer (overlaps Group B, starts at off_group_a)
+    size_t off_group_c = off_group_a;
+    VTCM_LAYOUT_ALLOC_OPTIONAL(off_group_c, off_src1_raw, src1_raw_sz, src1_raw_sz > 0);
+    const size_t group_c_size = off_group_c - off_group_a;
+
+    L->src0_bytes     = src0_sz;
+    L->src1_bytes     = src1_sz;
+    L->src2_bytes     = src2_sz;
+    L->src3_bytes     = src3_sz;
+    L->dst_bytes      = dst_sz;
+    L->src1_raw_bytes = src1_raw_sz;
+    L->total_bytes    = off_group_a + hex_smax(group_b_size, group_c_size);
 }
 
 static inline bool htp_mm_hvx_solve_vtcm_params(
@@ -642,7 +662,12 @@ static inline bool htp_mm_hvx_solve_vtcm_params(
         return false;
     }
 
-    uint32_t m_chunk = (uint32_t) (avail_act / row_size);
+    size_t eff_row_size = row_size;
+    if (kernel_type == HTP_MM_KERNEL_HVX_QUANT_ROW || kernel_type == HTP_MM_KERNEL_HVX_QUANT_BLOCK) {
+        eff_row_size += hex_round_up(ne10 * sizeof(float), QK_Q8_0_TILED * sizeof(float));
+    }
+
+    uint32_t m_chunk = (uint32_t) (avail_act / eff_row_size);
     if (m_chunk > 1) {
         m_chunk &= ~1U;
     }
