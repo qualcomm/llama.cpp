@@ -63,6 +63,7 @@
 #include "htp/rope-ops.h"
 #include "htp/ssm-conv.h"
 #include "htp/gated-delta-net-ops.h"
+#include "htp/argsort-ops.h"
 #include "htp_iface.h"
 #include "htp-drv.h"
 
@@ -366,6 +367,13 @@ static void ggml_hexagon_precompute_gated_delta_net_params(
     const struct ggml_hexagon_session * sess,
     const struct ggml_tensor * op,
     struct htp_gdn_kernel_params * kparams
+);
+
+static void ggml_hexagon_precompute_sort_params(
+    const struct ggml_hexagon_session * sess,
+    const struct ggml_tensor * op,
+    bool is_top_k,
+    struct htp_sort_kernel_params * kparams
 );
 
 static void ggml_hexagon_precompute_fused_mmnx_params(
@@ -5479,6 +5487,52 @@ static void ggml_hexagon_precompute_gated_delta_net_params(
     if (kparams->n_threads > 0) kparams->div_n_threads = init_fastdiv_values(kparams->n_threads);
 }
 
+static void ggml_hexagon_precompute_sort_params(
+    const struct ggml_hexagon_session * sess,
+    const struct ggml_tensor * op,
+    bool is_top_k,
+    struct htp_sort_kernel_params * kparams
+) {
+    memset(kparams, 0, sizeof(*kparams));
+
+    const struct ggml_tensor * src0 = op->src[0];
+    const struct ggml_tensor * dst  = op;
+
+    const uint32_t total_rows = src0->ne[1] * src0->ne[2] * src0->ne[3];
+    const uint32_t ne00       = src0->ne[0];
+    const uint32_t k          = dst->ne[0];
+
+    int32_t order = GGML_SORT_ORDER_DESC;
+    if (!is_top_k) {
+        order = ((const int32_t *) op->op_params)[0];
+    }
+
+    const uint32_t n_threads_max = sess->n_threads > 0 ? sess->n_threads : 4;
+    const size_t vtcm_budget = sess->vtcm_size > 0 ? sess->vtcm_size : (8 * 1024 * 1024);
+
+    struct htp_sort_vtcm_layout layout;
+    bool ok = htp_sort_solve_layout(&layout, ne00, total_rows, k, n_threads_max, vtcm_budget, is_top_k);
+    GGML_ASSERT(ok);
+
+    kparams->n_threads         = (int32_t) layout.n_threads;
+    kparams->total_rows        = (int32_t) total_rows;
+    kparams->row_start         = 0;
+    kparams->row_end           = (int32_t) total_rows;
+    kparams->ne00              = (int32_t) ne00;
+    kparams->k                 = (int32_t) k;
+    kparams->order             = order;
+    kparams->is_top_k          = is_top_k ? 1 : 0;
+    kparams->use_dma           = 1;
+    kparams->chunk_elems       = (int32_t) layout.chunk_elems;
+    kparams->n_chunks          = (int32_t) layout.n_chunks;
+    kparams->vtcm_size         = (int32_t) layout.total_bytes;
+    kparams->phase1_slot_size  = (int32_t) layout.phase1_slot_size;
+    kparams->merge_values_off  = (int32_t) layout.merge_values_off;
+    kparams->merge_indices_off = (int32_t) layout.merge_indices_off;
+    kparams->merge_elems       = (int32_t) layout.merge_elems;
+    kparams->n_slots           = (int32_t) layout.n_slots;
+}
+
 static void ggml_hexagon_precompute_fused_mmnx_params(
     const struct ggml_hexagon_session * sess,
     const struct ggml_tensor * src0, // W0
@@ -6058,42 +6112,36 @@ static bool ggml_hexagon_supported_argsort(const struct ggml_hexagon_session * s
     const struct ggml_tensor * src0 = op->src[0]; // values
     const struct ggml_tensor * dst  = op;         // indices
 
-    if (src0->type != GGML_TYPE_F32) {
+    if (src0->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_I32) {
         return false;
     }
 
-    if (dst->type != GGML_TYPE_I32) {
-        return false;
-    }
+    const uint32_t total_rows = src0->ne[1] * src0->ne[2] * src0->ne[3];
+    const uint32_t n_threads_max = sess->n_threads > 0 ? sess->n_threads : 4;
+    const size_t vtcm_budget = sess->vtcm_size > 0 ? sess->vtcm_size : (8 * 1024 * 1024);
 
-    if (src0->ne[0] > (16*1024)) {
-        // reject tensors with huge rows for now
+    struct htp_sort_vtcm_layout layout;
+    if (!htp_sort_solve_layout(&layout, src0->ne[0], total_rows, dst->ne[0], n_threads_max, vtcm_budget, false)) {
         return false;
     }
 
     return true;
-
-    GGML_UNUSED(sess);
 }
 
 static bool ggml_hexagon_supported_top_k(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op) {
     const struct ggml_tensor * src0 = op->src[0]; // values
     const struct ggml_tensor * dst  = op;         // indices
 
-    if (src0->type != GGML_TYPE_F32) {
+    if (src0->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_I32) {
         return false;
     }
 
-    if (dst->type != GGML_TYPE_I32) {
-        return false;
-    }
+    const uint32_t total_rows = src0->ne[1] * src0->ne[2] * src0->ne[3];
+    const uint32_t n_threads_max = sess->n_threads > 0 ? sess->n_threads : 4;
+    const size_t vtcm_budget = sess->vtcm_size > 0 ? sess->vtcm_size : (8 * 1024 * 1024);
 
-    // Single row uses the threaded chunk+merge path. Multi-row uses one full
-    // buffer per thread, so it keeps the tighter 64K cap.
-    const bool single_row = (src0->ne[1] == 1 && src0->ne[2] == 1 && src0->ne[3] == 1);
-    const int64_t max_ne00 = single_row ? (256*1024) : (64*1024);
-
-    if (src0->ne[0] > max_ne00) {
+    struct htp_sort_vtcm_layout layout;
+    if (!htp_sort_solve_layout(&layout, src0->ne[0], total_rows, dst->ne[0], n_threads_max, vtcm_budget, true)) {
         return false;
     }
 
@@ -6669,6 +6717,12 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
                 ggml_hexagon_precompute_gated_delta_net_params(sess,
                     node.node,
                     (struct htp_gdn_kernel_params *)node.kernel_params
+                );
+            } else if (node.opcode == HTP_OP_ARGSORT || node.opcode == HTP_OP_TOP_K) {
+                ggml_hexagon_precompute_sort_params(sess,
+                    node.node,
+                    node.opcode == HTP_OP_TOP_K,
+                    (struct htp_sort_kernel_params *) node.kernel_params
                 );
             }
             computed_nodes.push_back(std::move(node));
