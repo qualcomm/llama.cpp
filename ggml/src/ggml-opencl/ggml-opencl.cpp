@@ -17934,6 +17934,12 @@ inline bool enable_adreno_trans_weight_q5_K(const ggml_backend_opencl_context *b
 
 inline bool use_q4_0_bin_kernels(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor) {
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+    // GGML_OPENCL_Q4_0_BIN=0 keeps these weights in the regular layout and on this backend's own
+    // kernels. Read once: set_tensor and the dispatch must agree on the layout.
+    static const bool disabled = ggml_cl_env_flag_zero("GGML_OPENCL_Q4_0_BIN");
+    if (disabled) {
+        return false;
+    }
     if (!backend_ctx->kernel_gemv_noshuffle_q4_0_f32_32b_trans ||
         !backend_ctx->kernel_gemm_noshuffle_q4_0_f32_32b_trans_ila_a8_bin) {
         return false;
@@ -17952,6 +17958,11 @@ inline bool use_q4_0_bin_kernels(const ggml_backend_opencl_context *backend_ctx,
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
 static bool use_fa_bin_kernels_prefill(const ggml_backend_opencl_context * backend_ctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v) {
     if (backend_ctx->fa.kernel_flash_attn_f32_f16_bin == nullptr) {
+        return false;
+    }
+    // GGML_OPENCL_FA_BIN=0 keeps prefill attention on this backend's own paths.
+    static const bool disabled = ggml_cl_env_flag_zero("GGML_OPENCL_FA_BIN");
+    if (disabled) {
         return false;
     }
 
@@ -18170,6 +18181,12 @@ static bool ggml_cl_top_k_plan_for(ggml_backend_opencl_context * backend_ctx,
 
 inline bool use_q6_k_bin_kernels(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor) {
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+    // GGML_OPENCL_Q6_K_BIN=0 keeps these weights in the regular layout and on this backend's own
+    // kernels. Read once: set_tensor and the dispatch must agree on the layout.
+    static const bool disabled = ggml_cl_env_flag_zero("GGML_OPENCL_Q6_K_BIN");
+    if (disabled) {
+        return false;
+    }
     if (!backend_ctx->kernel_gemv_noshuffle_q6_k_f32_32b_trans ||
         !backend_ctx->kernel_gemm_noshuffle_q6_k_f32_32b_trans_ila_a8_bin) {
         return false;
@@ -18188,6 +18205,12 @@ inline bool use_q6_k_bin_kernels(const ggml_backend_opencl_context *backend_ctx,
 
 inline bool use_q4_k_bin_kernels(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor) {
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+    // GGML_OPENCL_Q4_K_BIN=0 keeps these weights in the regular layout and on this backend's own
+    // kernels. Read once: set_tensor and the dispatch must agree on the layout.
+    static const bool disabled = ggml_cl_env_flag_zero("GGML_OPENCL_Q4_K_BIN");
+    if (disabled) {
+        return false;
+    }
     if (!backend_ctx->kernel_gemv_noshuffle_q4_k_f32_32b_trans ||
         !backend_ctx->kernel_gemm_noshuffle_q4_k_f32_32b_trans_ila_a8_bin) {
         return false;
