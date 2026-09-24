@@ -105,16 +105,13 @@ struct htp_mm_context {
     struct fastdiv_values mm_div_r3;
     struct fastdiv_values mm_div_ne11;
 
-    // Per thread quant tasks
     // Precomputed block-parallel quantization values
-    worker_callback_t quant_task_func;
     uint32_t          quant_ib_first[WORK_QUEUE_MAX_N_THREADS];
     uint32_t          quant_ib_last[WORK_QUEUE_MAX_N_THREADS];
     uint32_t          quant_r[WORK_QUEUE_MAX_N_THREADS];
     uint32_t          quant_c[WORK_QUEUE_MAX_N_THREADS];
     uint32_t          n_quant_tasks;
     uint32_t          n_quant_rows_per_thread;
-    atomic_uint       quant_barrier;
 
     // Fields for scattered mapping & HMX support in MUL_MAT_ID
     const uint32_t * matrix_row_counts;
@@ -238,10 +235,6 @@ static const uint8_t __attribute__((aligned(VLEN))) kvalues_mxfp4_lut[] = {
     uint32_t src0_nrows_per_thread = mmctx->src0_nrows_per_thread;  \
     htp_matmul_tensors_preamble;
 
-static inline void hvx_mm_run_quant_task(struct htp_mm_context * mmctx, unsigned int ith) {
-    (void) mmctx;
-    (void) ith;
-}
 
 
 
@@ -297,8 +290,6 @@ static void hvx_mm_2d_repacked_##SUFFIX(unsigned int nth, unsigned int ith, void
                            src0_row + push_ct * tile_row_stride), aligned_tile_size, tile_size, tile_size, n_k_tiles_a);                   \
         }                                                                                                                                  \
     }                                                                                                                                      \
-                                                                                                                                           \
-    hvx_mm_run_quant_task(mmctx, ith);                                                                                                     \
                                                                                                                                            \
     if (src0_start_row >= src0_end_row) {                                                                                                  \
         return;                                                                                                                            \
@@ -413,8 +404,6 @@ static void hvx_mv_2d_repacked_##SUFFIX(unsigned int nth, unsigned int ith, void
         }                                                                                                                \
     }                                                                                                                    \
                                                                                                                          \
-    hvx_mm_run_quant_task(mmctx, ith);                                                                                   \
-                                                                                                                         \
     if (src0_start_row >= src0_end_row) {                                                                                \
         return;                                                                                                          \
     }                                                                                                                    \
@@ -475,8 +464,6 @@ static void hvx_mm_nx_2d_repacked_##SUFFIX(unsigned int nth, unsigned int ith, v
     const uint32_t aligned_tile_size = hex_align_up(tile_size, 128);                                                              \
     uint32_t n_k_tiles_a = ne10 / 32;                                                                                             \
     uint32_t tile_row_transfer_size_aligned = n_k_tiles_a * aligned_tile_size;                                                    \
-                                                                                                                                  \
-    hvx_mm_run_quant_task(mmctx, ith);                                                                                            \
                                                                                                                                   \
     for (uint32_t widx = 0; widx < n_weights; widx++) {                                                                           \
         const struct htp_tensor * restrict src_w = octx->src[widx];                                                               \
@@ -765,7 +752,6 @@ static void hvx_mm_4d_repacked_##SUFFIX(unsigned int nth, unsigned int ith, void
     const uint32_t ct_start = src0_start_row / 32;                                                                                                          \
     const uint32_t ct_end   = (src0_end_row + 31) / 32;                                                                                                     \
                                                                                                                                                             \
-    hvx_mm_run_quant_task(mmctx, ith);                                                                                                                      \
                                                                                                                                                             \
     if (src0_start_row >= src0_end_row || cur_m_rows == 0) {                                                                                                \
         return;                                                                                                                                             \
@@ -897,7 +883,6 @@ static void hvx_mm_2d(unsigned int nth, unsigned int ith, void * data) {
 
     const dma_addr_t src0_row = src0->data;
 
-    hvx_mm_run_quant_task(mmctx, ith);
 
     // Prefill vtcm with src0 rows
     if (src0_start_row < src0_end_row) {
@@ -1026,7 +1011,6 @@ static void hvx_mv_2d(unsigned int nth, unsigned int ith, void * data) {
         }
     }
 
-    hvx_mm_run_quant_task(mmctx, ith);
 
     if (src0_start_row >= src0_end_row) {
         return;
@@ -1101,7 +1085,6 @@ static void hvx_mm_4d(unsigned int nth, unsigned int ith, void * data) {
     uint8_t * restrict vtcm_src0_ptr = mmctx->vtcm_src0 + mmctx->vtcm_src0_size_per_thread * ith;
     uint8_t * restrict src1_data     = mmctx->vtcm_src1;
 
-    hvx_mm_run_quant_task(mmctx, ith);
 
     if (src0_start_row >= src0_end_row || cur_m_rows == 0) {
         return;
@@ -1235,7 +1218,6 @@ static void hvx_mm_id(unsigned int nth, unsigned int ith, void * data) {
     const uint32_t src0_start_row  = mmctx->src0_row_start + src0_nrows_per_thread * ith;
     const uint32_t src0_end_row    = MIN(src0_start_row + src0_nrows_per_thread, mmctx->src0_row_end);
 
-    hvx_mm_run_quant_task(mmctx, ith);
 
     if (src0_start_row >= src0_end_row) {
         return;
@@ -1324,7 +1306,6 @@ static void hvx_mv_id(unsigned int nth, unsigned int ith, void * data) {
     const uint32_t src0_start_row  = mmctx->src0_row_start + src0_nrows_per_thread * ith;
     const uint32_t src0_end_row    = MIN(src0_start_row + src0_nrows_per_thread, mmctx->src0_row_end);
 
-    hvx_mm_run_quant_task(mmctx, ith);
 
     if (src0_start_row >= src0_end_row) {
         return;
@@ -1403,7 +1384,6 @@ static void hvx_mv_id_nx(unsigned int nth, unsigned int ith, void * data) {
     const struct htp_tensor * restrict act  = octx->src[n_weights];
     const struct htp_tensor * restrict ids  = octx->src[n_weights + 1];
 
-    hvx_mm_run_quant_task(mmctx, ith);
 
     struct htp_thread_trace * tr = &octx->ctx->trace[ith];
 
@@ -1494,7 +1474,6 @@ static void hvx_mm_id_nx(unsigned int nth, unsigned int ith, void * data) {
     const struct htp_tensor * restrict act  = octx->src[n_weights];
     const struct htp_tensor * restrict ids  = octx->src[n_weights + 1];
 
-    hvx_mm_run_quant_task(mmctx, ith);
 
     struct htp_thread_trace * tr = &octx->ctx->trace[ith];
 
@@ -1914,7 +1893,6 @@ static void hvx_mm_nx_2d(unsigned int nth, unsigned int ith, void * data) {
 
     struct htp_thread_trace * tr = &octx->ctx->trace[ith];
 
-    hvx_mm_run_quant_task(mmctx, ith);
 
     for (uint32_t widx = 0; widx < n_weights; widx++) {
         const struct htp_tensor * restrict src_w = octx->src[widx];
