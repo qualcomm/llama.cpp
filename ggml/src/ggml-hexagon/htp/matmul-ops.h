@@ -477,8 +477,8 @@ static inline void htp_mm_hvx_vtcm_layout_build(
     bool is_fused_nx
 ) {
     (void)src1_row_size;
-    size_t src0_sz     = 0;
-    size_t src1_sz     = 0;
+    size_t src0_sz    = 0;
+    size_t src1_sz    = 0;
     size_t src2_sz    = src2_row_size > 0 ? htp_mm_round_up(src2_row_size, 128) : 0;
     size_t src3_sz    = 0;
     size_t dst_sz     = 0;
