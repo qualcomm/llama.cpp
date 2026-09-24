@@ -605,6 +605,8 @@ static void hvx_mm_transfer_src1_dma(
     }
 
     if (dst_row_size > row_bytes) {
+        struct htp_thread_trace * tr = &octx->ctx->trace[0];
+        htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_A_PREP, (uint16_t) m_start);
         const uint32_t pad_elems = (dst_row_size - row_bytes) / elem_size;
         if (elem_size == sizeof(float)) {
             for (uint32_t ir = 0; ir < m_rows; ++ir) {
@@ -615,6 +617,7 @@ static void hvx_mm_transfer_src1_dma(
                 hvx_splat_f16_u(dst_base + ir * dst_row_size + row_bytes, (_Float16) 0.0f, pad_elems);
             }
         }
+        htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_A_PREP, (uint16_t) m_start);
     }
 }
 
@@ -657,6 +660,9 @@ QUANTIZE_IMPL(quantize_f16_f16,        "quantize-f16-f16",        quantize_f16_f
 static void quantize_f32_q8_0_tiled_block(unsigned int nth, unsigned int ith, void * data) {
     (void) nth;
     struct htp_mm_context * mmctx = data;
+    if (mmctx->quant_ib_first[ith] >= mmctx->quant_ib_last[ith]) {
+        return;
+    }
     struct htp_ops_context * octx = mmctx->octx;
     struct htp_thread_trace * tr = &octx->ctx->trace[ith];
     htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_A_QUANT, mmctx->quant_ib_first[ith]);
@@ -682,6 +688,9 @@ static void quantize_f32_q8_0_tiled_block(unsigned int nth, unsigned int ith, vo
 static void quantize_f32_q8_1_tiled_block(unsigned int nth, unsigned int ith, void * data) {
     (void) nth;
     struct htp_mm_context * mmctx = data;
+    if (mmctx->quant_ib_first[ith] >= mmctx->quant_ib_last[ith]) {
+        return;
+    }
     struct htp_ops_context * octx = mmctx->octx;
     struct htp_thread_trace * tr = &octx->ctx->trace[ith];
     htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_A_QUANT, mmctx->quant_ib_first[ith]);
@@ -1813,9 +1822,9 @@ static int hvx_mm_matmul(struct htp_ops_context * octx) {
         mmctx->vtcm_src1_raw_stride = 0;
     }
 
-    if (kparams->m_chunk > 0 && (uint32_t) kparams->m_chunk < src1_nrows) {
-        htp_trace_event_stop(tr, HTP_TRACE_EVT_INIT, 0);
+    htp_trace_event_stop(tr, HTP_TRACE_EVT_INIT, 0);
 
+    if (kparams->m_chunk > 0 && (uint32_t) kparams->m_chunk < src1_nrows) {
         for (uint32_t m_start = 0; m_start < src1_nrows; m_start += m_chunk) {
             const uint32_t cur_m_rows = MIN(src1_nrows - m_start, m_chunk);
             mmctx->cur_m_start = m_start;
@@ -1865,8 +1874,6 @@ static int hvx_mm_matmul(struct htp_ops_context * octx) {
         } else {
             hvx_mm_transfer_src1_dma(octx, kparams, src1, mmctx->vtcm_src1, mmctx->vtcm_src1_stride, 0, src1_nrows);
         }
-
-        htp_trace_event_stop(tr, HTP_TRACE_EVT_INIT, 0);
 
         work_queue_run(octx->ctx->work_queue, matmul_job_func, mmctx, octx->n_threads);
     }
@@ -3985,13 +3992,13 @@ static int hvx_mm_matmul_id(
     mmctx->cur_m_start = 0;
     mmctx->cur_m_rows  = src1_nrows;
 
+    htp_trace_event_stop(tr, HTP_TRACE_EVT_INIT, 0);
+
     hvx_mm_transfer_src1_dma(octx, kparams, src1, mmctx->vtcm_src1_raw, mmctx->vtcm_src1_raw_stride, 0, src1_nrows);
 
     mmctx->n_quant_rows_per_thread = (src1_nrows + n_quant_tasks - 1) / n_quant_tasks;
     mmctx->n_quant_tasks = n_quant_tasks;
     work_queue_run(octx->ctx->work_queue, quant_task_func, mmctx, n_quant_tasks);
-
-    htp_trace_event_stop(tr, HTP_TRACE_EVT_INIT, 0);
 
     work_queue_run(octx->ctx->work_queue, hvx_mmid_task_func, mmctx, octx->n_threads);
 
@@ -4129,18 +4136,18 @@ static int hvx_mm_matmul_id_nx(
     mmctx->cur_m_start = 0;
     mmctx->cur_m_rows  = src1_nrows;
 
-    hvx_mm_transfer_src1_dma(octx, kparams, act, mmctx->vtcm_src1_raw, mmctx->vtcm_src1_raw_stride, 0, src1_nrows);
-
-    mmctx->n_quant_rows_per_thread = (src1_nrows + n_quant_tasks - 1) / n_quant_tasks;
-    mmctx->n_quant_tasks           = n_quant_tasks;
-    work_queue_run(octx->ctx->work_queue, quant_task_func, mmctx, n_quant_tasks);
-
     FARF(HIGH, "matmul-id-nx: src0 %d:%d:%d type %s nrows %u, src1 %d:%d:%d nrows %u, vtcm %zu/%zu, threads %d\n",
          src0->ne[0], src0->ne[1], src0->ne[2], mmctx->type, src0->ne[1],
          act->ne[0], act->ne[1], act->ne[2], src1_nrows,
          L.total_bytes, octx->ctx->vtcm_size, octx->n_threads);
 
     htp_trace_event_stop(tr, HTP_TRACE_EVT_INIT, 0);
+
+    hvx_mm_transfer_src1_dma(octx, kparams, act, mmctx->vtcm_src1_raw, mmctx->vtcm_src1_raw_stride, 0, src1_nrows);
+
+    mmctx->n_quant_rows_per_thread = (src1_nrows + n_quant_tasks - 1) / n_quant_tasks;
+    mmctx->n_quant_tasks           = n_quant_tasks;
+    work_queue_run(octx->ctx->work_queue, quant_task_func, mmctx, n_quant_tasks);
 
     work_queue_run(octx->ctx->work_queue, hvx_mmid_task_func, mmctx, octx->n_threads);
 
@@ -4533,12 +4540,6 @@ int op_matmul_nx(struct htp_ops_context * octx) {
     mmctx->vtcm_src1_size_per_thread = L.src1_bytes;
     mmctx->vtcm_dst_size_per_thread  = fastdiv(L.dst_bytes, &octx->n_threads_div);
 
-    hvx_mm_transfer_src1_dma(octx, kparams, act, mmctx->vtcm_src1_raw, mmctx->vtcm_src1_raw_stride, 0, src1_nrows);
-
-    mmctx->n_quant_rows_per_thread = (src1_nrows + n_quant_tasks - 1) / n_quant_tasks;
-    mmctx->n_quant_tasks = n_quant_tasks;
-    work_queue_run(octx->ctx->work_queue, quant_task_func, mmctx, n_quant_tasks);
-
     // Run fused matmul
     const uint32_t n_matmul_jobs = octx->n_threads;
     worker_callback_t matmul_job_func;
@@ -4550,13 +4551,21 @@ int op_matmul_nx(struct htp_ops_context * octx) {
             case HTP_TYPE_Q8_0:   matmul_job_func = hvx_mm_nx_2d_repacked_q8_0;   break;
             case HTP_TYPE_IQ4_NL: matmul_job_func = hvx_mm_nx_2d_repacked_iq4nl;  break;
             case HTP_TYPE_MXFP4:  matmul_job_func = hvx_mm_nx_2d_repacked_mxfp4;  break;
-            default:              return HTP_STATUS_NO_SUPPORT;
+            default:
+                htp_trace_event_stop(tr, HTP_TRACE_EVT_INIT, 0);
+                return HTP_STATUS_NO_SUPPORT;
         }
     } else {
         matmul_job_func = hvx_mm_nx_2d;
     }
 
     htp_trace_event_stop(tr, HTP_TRACE_EVT_INIT, 0);
+
+    hvx_mm_transfer_src1_dma(octx, kparams, act, mmctx->vtcm_src1_raw, mmctx->vtcm_src1_raw_stride, 0, src1_nrows);
+
+    mmctx->n_quant_rows_per_thread = (src1_nrows + n_quant_tasks - 1) / n_quant_tasks;
+    mmctx->n_quant_tasks = n_quant_tasks;
+    work_queue_run(octx->ctx->work_queue, quant_task_func, mmctx, n_quant_tasks);
 
     work_queue_run(octx->ctx->work_queue, matmul_job_func, mmctx, n_matmul_jobs);
 
