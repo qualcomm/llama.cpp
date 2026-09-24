@@ -883,6 +883,9 @@ static int execute_op(struct htp_ops_context * octx) {
         case HTP_OP_GET_ROWS:
             return op_get_rows(octx);
 
+        case HTP_OP_SUM:
+            return op_sum(octx);
+
         case HTP_OP_SUM_ROWS:
             return op_sum_rows(octx);
 

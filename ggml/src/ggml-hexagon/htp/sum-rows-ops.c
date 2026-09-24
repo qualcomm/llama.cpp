@@ -152,3 +152,78 @@ int op_sum_rows(struct htp_ops_context * octx) {
 
     return HTP_STATUS_OK;
 }
+
+struct sum_context {
+    struct htp_ops_context * octx;
+    const float            * src_data;
+    float                    partial_sums[HTP_MAX_NTHREADS];
+    uint32_t                 total_elems;
+    uint32_t                 elems_per_thread;
+};
+
+static void sum_thread_f32(unsigned int nth, unsigned int ith, void * data) {
+    struct sum_context * sctx = (struct sum_context *) data;
+    const uint32_t start = sctx->elems_per_thread * ith;
+    const uint32_t end   = MIN(start + sctx->elems_per_thread, sctx->total_elems);
+
+    if (start >= end) {
+        sctx->partial_sums[ith] = 0.0f;
+        return;
+    }
+
+    const uint32_t n = end - start;
+    const float * src = sctx->src_data + start;
+
+    struct htp_thread_trace * tr = &sctx->octx->ctx->trace[ith];
+    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) start);
+
+    hex_l2fetch_block((const void *) src, n * sizeof(float));
+
+    sctx->partial_sums[ith] = hvx_reduce_sum_f32((const uint8_t *) src, n);
+
+    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) start);
+}
+
+int op_sum(struct htp_ops_context * octx) {
+    const struct htp_tensor * src0 = octx->src[0];
+    const struct htp_tensor * dst  = octx->dst;
+
+    if (src0->type != HTP_TYPE_F32) {
+        return HTP_STATUS_NO_SUPPORT;
+    }
+
+    if (htp_tensor_is_extended(src0) || htp_tensor_is_extended(dst)) {
+        return HTP_STATUS_NO_SUPPORT;
+    }
+
+    if (octx->ctx->mdev.count > 1 && octx->ctx->mdev.idx > 0) {
+        return HTP_STATUS_OK;
+    }
+
+    const uint32_t total_elems = (uint32_t) (src0->ne[0] * src0->ne[1] * src0->ne[2] * src0->ne[3]);
+    if (total_elems == 0) {
+        ((float *) dst->data)[0] = 0.0f;
+        return HTP_STATUS_OK;
+    }
+
+    const uint32_t n_threads = (total_elems >= 1024) ? MIN(octx->n_threads, HTP_MAX_NTHREADS) : 1;
+    const uint32_t raw_chunk = (total_elems + n_threads - 1) / n_threads;
+    const uint32_t elems_per_thread = hex_round_up(raw_chunk, 32);
+
+    struct sum_context sctx = {
+        .octx             = octx,
+        .src_data         = (const float *) src0->data,
+        .total_elems      = total_elems,
+        .elems_per_thread = elems_per_thread,
+    };
+
+    work_queue_run(octx->ctx->work_queue, sum_thread_f32, &sctx, n_threads);
+
+    float sum = 0.0f;
+    for (uint32_t i = 0; i < n_threads; i++) {
+        sum += sctx.partial_sums[i];
+    }
+    ((float *) dst->data)[0] = sum;
+
+    return HTP_STATUS_OK;
+}
