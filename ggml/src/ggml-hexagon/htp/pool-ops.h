@@ -38,10 +38,8 @@ static_assert(sizeof(struct htp_pool_2d_kernel_params) <= 128, "htp_pool_2d_kern
 _Static_assert(sizeof(struct htp_pool_2d_kernel_params) <= 128, "htp_pool_2d_kernel_params is too large");
 #endif
 
-// Interior column range [ox_lo, ox_hi) where every kernel column kx in [0, kernel_x) is
-// guaranteed in-bounds for every ox. The general path can use either contiguous loads,
-// deinterleaving, or HVX gather depending on stride_x.
-static inline bool htp_pool2d_vec_interior_range(
+// Compute the output-column range whose pooling windows are fully in-bounds.
+static inline bool htp_pool2d_interior_range(
     uint32_t src_x, uint32_t dst_x, uint32_t kernel_x, uint32_t stride_x, int32_t pad_x,
     uint32_t * ox_lo, uint32_t * ox_hi) {
     if (stride_x == 0) {

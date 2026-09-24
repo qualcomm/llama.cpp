@@ -9,12 +9,43 @@
 #include "htp-ctx.h"
 #include "htp-ops.h"
 #include "htp-tensor.h"
+#include "hvx-inverse.h"
 #include "hvx-types.h"
 #include "hvx-utils.h"
 #include "pool-ops.h"
 
 #define HTP_POOL_MAX 0
 #define HTP_POOL_AVG 1
+
+static inline float pool_inv_count(uint32_t count) {
+    HVX_VectorAlias inv;
+    inv.v = hvx_vec_inverse_f32(hvx_vec_splat_f32((float) count));
+    return inv.fp32[0];
+}
+
+#define POOL_INV_CACHE_SIZE 16
+
+struct pool_inv_cache {
+    uint32_t count[POOL_INV_CACHE_SIZE];
+    float reciprocal[POOL_INV_CACHE_SIZE];
+    uint32_t size;
+};
+
+static inline float pool_inv_count_cached(struct pool_inv_cache * cache, uint32_t count) {
+    for (uint32_t i = 0; i < cache->size; ++i) {
+        if (cache->count[i] == count) {
+            return cache->reciprocal[i];
+        }
+    }
+
+    const float reciprocal = pool_inv_count(count);
+    if (cache->size < POOL_INV_CACHE_SIZE) {
+        cache->count[cache->size] = count;
+        cache->reciprocal[cache->size] = reciprocal;
+        ++cache->size;
+    }
+    return reciprocal;
+}
 
 // Fast path: exact non-overlapping tiling (stride == kernel, no padding), kernel_x in {1,2}.
 // Every window is guaranteed fully in-bounds, so this never needs boundary clamping.
@@ -155,7 +186,7 @@ static inline void pool_plane_exact(
                     if (use_gather) {
                         Q6_vgather_ARMVw(&gathered, (size_t) (row + kx), gather_span, gather_offsets);
                     } else {
-                        HVX_VectorAlias packed __attribute__((aligned(VLEN)));
+                        HVX_VectorAlias packed;
                         for (uint32_t lane = 0; lane < lanes; ++lane) {
                             packed.fp32[lane] = row[lane * p->kernel_x + kx];
                         }
@@ -194,7 +225,7 @@ static inline void pool_plane_general_narrow(
             for (uint32_t ky = 0; ky < p->kernel_y; ++ky) {
                 const int32_t iy = iy0 + (int32_t) ky;
                 for (uint32_t kx = 0; kx < p->kernel_x; ++kx) {
-                    HVX_VectorAlias packed __attribute__((aligned(VLEN)));
+                    HVX_VectorAlias packed;
                     for (uint32_t lane = 0; lane < lanes; ++lane) {
                         const int32_t ix = (int32_t) ((ox + lane) * p->stride_x) - p->pad_x + (int32_t) kx;
                         packed.fp32[lane] = (iy >= 0 && iy < (int32_t) p->src_y &&
@@ -231,7 +262,8 @@ static inline void pool_row_bounds_y(
 
 static inline void pool_row_general_scalar(
     const float * src, float * dst_row, const struct htp_pool_2d_kernel_params * p,
-    uint32_t ox_start, uint32_t ox_end, int32_t iy0, uint32_t ky_lo, uint32_t ky_hi, bool is_max) {
+    uint32_t ox_start, uint32_t ox_end, int32_t iy0, uint32_t ky_lo, uint32_t ky_hi, bool is_max,
+    struct pool_inv_cache * inv_cache) {
     for (uint32_t ox = ox_start; ox < ox_end; ++ox) {
         const int32_t ix0 = (int32_t) (ox * p->stride_x) - p->pad_x;
         float acc = is_max ? -FLT_MAX : 0.0f;
@@ -256,7 +288,7 @@ static inline void pool_row_general_scalar(
                     ++count;
                 }
             }
-            dst_row[ox] = count > 0 ? acc / count : 0.0f;
+            dst_row[ox] = count > 0 ? acc * pool_inv_count_cached(inv_cache, (uint32_t) count) : 0.0f;
         } else {
             dst_row[ox] = acc * p->inv_kernel_area;
         }
@@ -267,7 +299,8 @@ static inline void pool_row_general_scalar(
 // for every ox in [ox_start, ox_end), so no per-lane masking is needed.
 static inline void pool_row_general_vec(
     const float * src, float * dst_row, const struct htp_pool_2d_kernel_params * p,
-    uint32_t ox_start, uint32_t ox_end, int32_t iy0, uint32_t ky_lo, uint32_t ky_hi, bool is_max) {
+    uint32_t ox_start, uint32_t ox_end, int32_t iy0, uint32_t ky_lo, uint32_t ky_hi, bool is_max,
+    struct pool_inv_cache * inv_cache) {
     const HVX_Vector scale = hvx_vec_splat_f32(p->inv_kernel_area);
     const HVX_Vector seed  = is_max ? hvx_vec_splat_f32(-FLT_MAX) : Q6_V_vsplat_R(0);
 
@@ -299,7 +332,7 @@ static inline void pool_row_general_vec(
                 }
             } else {
                 for (uint32_t kx = 0; kx < p->kernel_x; ++kx) {
-                    HVX_VectorAlias packed __attribute__((aligned(VLEN)));
+                    HVX_VectorAlias packed;
                     for (uint32_t lane = 0; lane < VLEN_FP32; ++lane) {
                         packed.fp32[lane] = row[ix0 + (int32_t) (lane * p->stride_x) + (int32_t) kx];
                     }
@@ -311,7 +344,7 @@ static inline void pool_row_general_vec(
         hvx_vec_store_u(dst_row + ox, VLEN, is_max ? acc : hvx_vec_mul_f32_f32(acc, scale));
     }
     if (ox < ox_end) {
-        pool_row_general_scalar(src, dst_row, p, ox, ox_end, iy0, ky_lo, ky_hi, is_max);
+        pool_row_general_scalar(src, dst_row, p, ox, ox_end, iy0, ky_lo, ky_hi, is_max, inv_cache);
     }
 }
 
@@ -320,10 +353,11 @@ static inline void pool_plane_general(
     const bool is_max = (p->pool_op == HTP_POOL_MAX);
 
     // Compute the in-bounds x-interior for vectorized pooling.
-    // htp_pool2d_vec_interior_range() is shared with the host support check;
     // x-strides other than 1 and 2 use the scalar path.
     uint32_t ox_lo, ox_hi;
-    htp_pool2d_vec_interior_range(p->src_x, p->dst_x, p->kernel_x, p->stride_x, p->pad_x, &ox_lo, &ox_hi);
+    htp_pool2d_interior_range(p->src_x, p->dst_x, p->kernel_x, p->stride_x, p->pad_x, &ox_lo, &ox_hi);
+
+    struct pool_inv_cache inv_cache = { 0 };
 
     for (uint32_t oy = 0; oy < p->dst_y; ++oy) {
         int32_t iy0;
@@ -331,9 +365,10 @@ static inline void pool_plane_general(
         pool_row_bounds_y(p, oy, &iy0, &ky_lo, &ky_hi);
         float * dst_row = dst + oy * p->dst_x;
 
-        pool_row_general_scalar(src, dst_row, p, 0, ox_lo, iy0, ky_lo, ky_hi, is_max);
-        pool_row_general_vec(src, dst_row, p, ox_lo, ox_hi, iy0, ky_lo, ky_hi, is_max);
-        pool_row_general_scalar(src, dst_row, p, ox_hi, p->dst_x, iy0, ky_lo, ky_hi, is_max);
+        inv_cache.size = 0;
+        pool_row_general_scalar(src, dst_row, p, 0, ox_lo, iy0, ky_lo, ky_hi, is_max, &inv_cache);
+        pool_row_general_vec(src, dst_row, p, ox_lo, ox_hi, iy0, ky_lo, ky_hi, is_max, &inv_cache);
+        pool_row_general_scalar(src, dst_row, p, ox_hi, p->dst_x, iy0, ky_lo, ky_hi, is_max, &inv_cache);
     }
 }
 
@@ -404,22 +439,38 @@ static void pool_2d_thread(unsigned int nth, unsigned int ith, void * data) {
 
     const uint32_t total = last - first;
 
+    if (total == 0) {
+        return;
+    }
+
+    // Stage the first input before entering the overlapped pipeline.
+    {
+        const float * src_plane = (const float *) (src_data + (uint64_t) first * p->src_plane_bytes);
+        dma_queue_push(dma_queue, dma_make_data(srcb2[0], src_plane),
+                       p->src_plane_bytes_aligned, p->src_plane_bytes,
+                       p->src_plane_bytes, 1);
+        dma_queue_pop(dma_queue);
+    }
+
     for (uint32_t i = 0; i < total; ++i) {
         const uint32_t plane = first + i;
         const uint32_t buf   = i & 1u;
         float * srcb = srcb2[buf];
         float * dstb = dstb2[buf];
 
-        if (i == 0) {
-            // prologue: stage plane 'first' and wait - nothing to overlap with yet
-            const float * src_plane = (const float *) (src_data + plane * p->src_plane_bytes);
-            dma_queue_push(dma_queue, dma_make_data(srcb, src_plane),
-                           p->src_plane_bytes_aligned, p->src_plane_bytes,
-                           p->src_plane_bytes, 1);
-            dma_queue_flush(dma_queue);
+        // Transfers are queued in this order for each plane:
+        // next input, current output
+        // Before reusing a slot, wait for the older output and current input
+        // in FIFO order. This keeps DMA and compute overlapped.
+        if (i > 1) {
+            dma_queue_pop(dma_queue); // output from plane i - 2
         }
+
+        if (i > 0) {
+            dma_queue_pop(dma_queue); // input for plane i
+        }
+
         if (i + 1 < total) {
-            // prefetch: stage plane i+1 into the other slot; overlaps with this plane's compute below
             const uint32_t nbuf = 1u - buf;
             const float * next_src_plane = (const float *) (src_data + (uint64_t) (plane + 1) * p->src_plane_bytes);
             dma_queue_push(dma_queue, dma_make_data(srcb2[nbuf], next_src_plane),
@@ -435,7 +486,12 @@ static void pool_2d_thread(unsigned int nth, unsigned int ith, void * data) {
         dma_queue_push(dma_queue, dma_make_data(dst_plane, dstb),
                        p->dst_plane_bytes, p->dst_plane_bytes_aligned,
                        p->dst_plane_bytes, 1);
-        dma_queue_flush(dma_queue);
+    }
+
+    // The last one or two output transfers are still outstanding.
+    dma_queue_pop(dma_queue);
+    if (total > 1) {
+        dma_queue_pop(dma_queue);
     }
 
     FARF(HIGH, "pool2d-f32-dma %d/%d: %ux%ux%ux%u -> %ux%ux%ux%u (%u:%u)\n",

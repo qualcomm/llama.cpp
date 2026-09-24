@@ -6842,7 +6842,7 @@ static bool ggml_hexagon_supported_pool_2d(const struct ggml_hexagon_session * s
 
     // FIXME: Vectorize general pooling when no full x-interior is available.
     uint32_t ox_lo, ox_hi;
-    htp_pool2d_vec_interior_range((uint32_t) src0->ne[0], (uint32_t) op->ne[0],
+    htp_pool2d_interior_range((uint32_t) src0->ne[0], (uint32_t) op->ne[0],
                                   (uint32_t) kernel_x, (uint32_t) stride_x,
                                   pad_x, &ox_lo, &ox_hi);
     return ox_hi - ox_lo >= 32;
