@@ -5011,8 +5011,41 @@ static bool ggml_hexagon_precompute_binary_params(
         (src1->ne[1] == src0->ne[1] || src1->ne[1] == 1) &&
         (src1->ne[2] == src0->ne[2] || src1->ne[2] == 1) &&
         (src1->ne[3] == src0->ne[3] || src1->ne[3] == 1);
-    const bool is_row_bcast = is_same_shape && src1->ne[1] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1;
+    const bool is_row_bcast = is_same_shape &&
+        (src0->ne[1] > 1 || src0->ne[2] > 1 || src0->ne[3] > 1) &&
+        src1->ne[1] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1;
     const bool is_complex   = !is_add_id && !is_scalar && !is_same_shape && (src1->ne[0] == src0->ne[0]);
+    const bool is_contig    = ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst);
+    const bool is_1d        = src0->ne[1] == 1 && src0->ne[2] == 1 && src0->ne[3] == 1;
+
+    if (!is_add_id && is_contig && ggml_are_same_shape(src0, src1) && is_1d) {
+        const uint32_t total_elems = (uint32_t) ggml_nelements(src0);
+        const uint32_t n_threads = sess->n_threads;
+        const uint32_t max_chunk_elems = 32768 / elem_size;
+        const uint32_t min_chunk_elems = 256;
+        const uint32_t target_chunk_elems = hex_round_up((total_elems + (2 * n_threads) - 1) / (2 * n_threads), 32);
+        const uint32_t chunk_size = (std::min)(max_chunk_elems, (std::max)(target_chunk_elems, min_chunk_elems));
+        const uint32_t chunk_bytes = hex_round_up(chunk_size * elem_size, 128);
+
+        kparams->kernel_type           = HTP_BINARY_KERNEL_CHUNKED;
+        kparams->n_threads             = n_threads;
+        kparams->rows_per_buffer       = 1;
+        kparams->src0_row_size_aligned = src0_row_size_aligned;
+        kparams->src1_row_size_aligned = src1_row_size_aligned;
+        kparams->dst_row_size_aligned  = dst_row_size_aligned;
+        kparams->src1_size             = 0;
+        kparams->chunk_size            = chunk_size;
+        kparams->chunk_bytes           = chunk_bytes;
+
+        struct htp_binary_vtcm_layout L;
+        htp_binary_vtcm_layout_build(&L, kparams, sess->vtcm_size);
+        if (L.total_bytes == 0 || L.total_bytes > sess->vtcm_size) {
+            return false;
+        }
+
+        kparams->vtcm_size = L.total_bytes;
+        return true;
+    }
 
     enum htp_binary_kernel_type kernel_type;
     size_t src1_size = 0;
@@ -5050,6 +5083,30 @@ static bool ggml_hexagon_precompute_binary_params(
     struct htp_binary_vtcm_layout L;
     htp_binary_vtcm_layout_build(&L, kparams, sess->vtcm_size);
     if (L.rows_per_buffer == 0 || L.total_bytes > sess->vtcm_size) {
+        if (!is_add_id && is_contig && ggml_are_same_shape(src0, src1)) {
+            const uint32_t total_elems = (uint32_t) ggml_nelements(src0);
+            const uint32_t n_threads = sess->n_threads;
+            const uint32_t max_chunk_elems = 32768 / elem_size;
+            const uint32_t min_chunk_elems = 256;
+            const uint32_t target_chunk_elems = hex_round_up((total_elems + (2 * n_threads) - 1) / (2 * n_threads), 32);
+            const uint32_t chunk_size = (std::min)(max_chunk_elems, (std::max)(target_chunk_elems, min_chunk_elems));
+            const uint32_t chunk_bytes = hex_round_up(chunk_size * elem_size, 128);
+
+            kparams->kernel_type           = HTP_BINARY_KERNEL_CHUNKED;
+            kparams->n_threads             = n_threads;
+            kparams->rows_per_buffer       = 1;
+            kparams->src1_size             = 0;
+            kparams->chunk_size            = chunk_size;
+            kparams->chunk_bytes           = chunk_bytes;
+
+            htp_binary_vtcm_layout_build(&L, kparams, sess->vtcm_size);
+            if (L.total_bytes == 0 || L.total_bytes > sess->vtcm_size) {
+                return false;
+            }
+
+            kparams->vtcm_size = L.total_bytes;
+            return true;
+        }
         return false;
     }
 

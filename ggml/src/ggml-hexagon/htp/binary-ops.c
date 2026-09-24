@@ -917,6 +917,117 @@ static void binary_thread_add_id_f32(unsigned int nth, unsigned int ith, void * 
     dma_queue_flush(dma_q);
 }
 
+typedef void (*compute_binary_chunked_t)(
+    uint8_t * restrict dst,
+    const uint8_t * restrict src0,
+    const uint8_t * restrict src1,
+    const uint32_t num_elems
+);
+
+struct binary_chunked_context {
+    struct htp_ops_context * octx;
+    struct htp_binary_vtcm_layout vtcm_layout;
+    uint8_t *                vtcm_base;
+    uint32_t                 elem_start;
+    uint32_t                 nelem;
+    uint32_t                 chunk_size;
+    uint32_t                 chunks_per_thread;
+    uint32_t                 total_chunks;
+    compute_binary_chunked_t compute;
+};
+
+static void binary_thread_chunked(unsigned int nth, unsigned int ith, void * data) {
+    (void) nth;
+    struct binary_chunked_context * ctx = (struct binary_chunked_context *) data;
+    struct htp_ops_context * octx = ctx->octx;
+    const struct htp_tensor * src0 = octx->src[0];
+    const struct htp_tensor * src1 = octx->src[1];
+    const struct htp_tensor * dst  = octx->dst;
+
+    const uint32_t start_chunk = ctx->chunks_per_thread * ith;
+    const uint32_t end_chunk   = MIN(start_chunk + ctx->chunks_per_thread, ctx->total_chunks);
+    if (start_chunk >= end_chunk) {
+        return;
+    }
+
+    const uint32_t src0_type   = src0->type;
+    const size_t   elem_size   = (src0_type == HTP_TYPE_F32) ? sizeof(float) : sizeof(_Float16);
+    const uint32_t chunk_size  = ctx->chunk_size;
+    const size_t   chunk_bytes = ctx->vtcm_layout.src0_spad_half_size;
+
+    FARF(HIGH, "binary-chunked: %d/%d (%u:%u) chunks %u elems %u",
+         ith, nth, start_chunk, end_chunk, ctx->total_chunks, ctx->nelem);
+
+    const struct htp_binary_vtcm_layout * layout = &ctx->vtcm_layout;
+    uint8_t * src0_spad_base = VTCM_LAYOUT_PTR(uint8_t, ctx->vtcm_base, layout->off_src0) + (ith * layout->src0_bytes_per_thread);
+    uint8_t * src1_spad_base = VTCM_LAYOUT_PTR(uint8_t, ctx->vtcm_base, layout->off_src1) + (ith * layout->src1_bytes_per_thread);
+    uint8_t * dst_spad_base  = VTCM_LAYOUT_PTR(uint8_t, ctx->vtcm_base, layout->off_dst)  + (ith * layout->dst_bytes_per_thread);
+
+    dma_queue * dma_q = octx->ctx->dma[ith];
+    uint32_t prefetch_chunk = start_chunk;
+    int spad_idx = 0;
+
+    for (int k = 0; k < 2 && prefetch_chunk < end_chunk; k++) {
+        const uint32_t c_start   = ctx->elem_start + prefetch_chunk * chunk_size;
+        const uint32_t c_end     = MIN(c_start + chunk_size, ctx->elem_start + ctx->nelem);
+        const uint32_t cur_elems = c_end - c_start;
+        const uint32_t cur_bytes = cur_elems * elem_size;
+
+        dma_addr_t s0_curr = src0->data + (size_t) c_start * elem_size;
+        dma_addr_t s1_curr = src1->data + (size_t) c_start * elem_size;
+        dma_addr_t d_curr  = dst->data  + (size_t) c_start * elem_size;
+
+        uint8_t * s0_spad = src0_spad_base + spad_idx * chunk_bytes;
+        uint8_t * s1_spad = src1_spad_base + spad_idx * chunk_bytes;
+        uint8_t * d_spad  = dst_spad_base  + spad_idx * chunk_bytes;
+
+        dma_queue_push(dma_q, dma_make_data(d_curr, d_spad), chunk_bytes, chunk_bytes, cur_bytes, 0);
+        dma_queue_push(dma_q, dma_make_data(s0_spad, s0_curr), chunk_bytes, chunk_bytes, cur_bytes, 1);
+        dma_queue_push(dma_q, dma_make_data(s1_spad, s1_curr), chunk_bytes, chunk_bytes, cur_bytes, 1);
+
+        prefetch_chunk++;
+        spad_idx ^= 1;
+    }
+
+    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    compute_binary_chunked_t compute = ctx->compute;
+
+    for (uint32_t c = start_chunk; c < end_chunk; c++) {
+        const uint32_t c_start   = ctx->elem_start + c * chunk_size;
+        const uint32_t c_end     = MIN(c_start + chunk_size, ctx->elem_start + ctx->nelem);
+        const uint32_t cur_elems = c_end - c_start;
+        const uint32_t cur_bytes = cur_elems * elem_size;
+
+        uint8_t * d_spad  = (uint8_t *) dma_queue_pop(dma_q).src;
+        uint8_t * s0_spad = (uint8_t *) dma_queue_pop(dma_q).dst;
+        uint8_t * s1_spad = (uint8_t *) dma_queue_pop(dma_q).dst;
+
+        htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) c);
+        compute(d_spad, s0_spad, s1_spad, cur_elems);
+        htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) c);
+
+        dma_addr_t dst_curr = dst->data + (size_t) c_start * elem_size;
+        dma_queue_push(dma_q, dma_make_data(dst_curr, d_spad), chunk_bytes, chunk_bytes, cur_bytes, 1);
+
+        if (prefetch_chunk < end_chunk) {
+            const uint32_t pc_start  = ctx->elem_start + prefetch_chunk * chunk_size;
+            const uint32_t pc_end    = MIN(pc_start + chunk_size, ctx->elem_start + ctx->nelem);
+            const uint32_t p_elems   = pc_end - pc_start;
+            const uint32_t p_bytes   = p_elems * elem_size;
+
+            dma_addr_t s0_next = src0->data + (size_t) pc_start * elem_size;
+            dma_addr_t s1_next = src1->data + (size_t) pc_start * elem_size;
+
+            dma_queue_push(dma_q, dma_make_data(s0_spad, s0_next), chunk_bytes, chunk_bytes, p_bytes, 1);
+            dma_queue_push(dma_q, dma_make_data(s1_spad, s1_next), chunk_bytes, chunk_bytes, p_bytes, 1);
+
+            prefetch_chunk++;
+        }
+    }
+
+    dma_queue_flush(dma_q);
+}
+
 static int execute_op_binary(struct htp_ops_context * octx) {
     const struct htp_tensor * src0 = octx->src[0];
     const struct htp_tensor * src1 = octx->src[1];
@@ -931,6 +1042,125 @@ static int execute_op_binary(struct htp_ops_context * octx) {
     const size_t src0_row_size = src0->ne[0] * elem_size;
     const size_t src1_row_size = src1->ne[0] * elem_size;
     const size_t dst_row_size  = dst->ne[0]  * elem_size;
+
+    if (kparams->kernel_type == HTP_BINARY_KERNEL_CHUNKED) {
+        if (htp_tensor_is_extended(src0) || htp_tensor_is_extended(src1) || htp_tensor_is_extended(dst)) {
+            return HTP_STATUS_NO_SUPPORT;
+        }
+
+        compute_binary_chunked_t compute = NULL;
+        if (src0_type == HTP_TYPE_F32) {
+            switch (octx->op) {
+                case HTP_OP_ADD: compute = hvx_add_f32; break;
+                case HTP_OP_SUB: compute = hvx_sub_f32; break;
+                case HTP_OP_MUL: compute = hvx_mul_f32; break;
+                case HTP_OP_DIV: compute = hvx_div_f32; break;
+                default: break;
+            }
+        } else if (src0_type == HTP_TYPE_F16) {
+            switch (octx->op) {
+                case HTP_OP_ADD: compute = hvx_add_f16; break;
+                case HTP_OP_SUB: compute = hvx_sub_f16; break;
+                case HTP_OP_MUL: compute = hvx_mul_f16; break;
+                case HTP_OP_DIV: compute = hvx_div_f16; break;
+                default: break;
+            }
+        }
+
+        if (!compute) {
+            return HTP_STATUS_NO_SUPPORT;
+        }
+
+        const uint32_t total_elems = (uint32_t) (src0->ne[0] * src0->ne[1] * src0->ne[2] * src0->ne[3]);
+        if (total_elems == 0) {
+            return HTP_STATUS_OK;
+        }
+
+        if (total_elems == 1) {
+            if (octx->ctx->mdev.count > 1 && octx->ctx->mdev.idx > 0) {
+                return HTP_STATUS_OK;
+            }
+            if (src0_type == HTP_TYPE_F32) {
+                const float a = ((const float *) src0->data)[0];
+                const float b = ((const float *) src1->data)[0];
+                float res = 0.0f;
+                switch (octx->op) {
+                    case HTP_OP_ADD: res = a + b; break;
+                    case HTP_OP_SUB: res = a - b; break;
+                    case HTP_OP_MUL: res = a * b; break;
+                    case HTP_OP_DIV: res = a / b; break;
+                    default: return HTP_STATUS_NO_SUPPORT;
+                }
+                ((float *) dst->data)[0] = res;
+                return HTP_STATUS_OK;
+            } else if (src0_type == HTP_TYPE_F16) {
+                const _Float16 a = ((const _Float16 *) src0->data)[0];
+                const _Float16 b = ((const _Float16 *) src1->data)[0];
+                _Float16 res = 0.0f;
+                switch (octx->op) {
+                    case HTP_OP_ADD: res = a + b; break;
+                    case HTP_OP_SUB: res = a - b; break;
+                    case HTP_OP_MUL: res = a * b; break;
+                    case HTP_OP_DIV: res = a / b; break;
+                    default: return HTP_STATUS_NO_SUPPORT;
+                }
+                ((_Float16 *) dst->data)[0] = res;
+                return HTP_STATUS_OK;
+            }
+        }
+
+        uint32_t elem_start = 0;
+        uint32_t nelem      = total_elems;
+        const uint32_t elems_per_line = (src0_type == HTP_TYPE_F32) ? 32 : 64;
+
+        if (octx->ctx->mdev.count > 1) {
+            const bool can_split = htp_tensor_mdev_data_aligned(dst) &&
+                                   htp_tensor_mdev_data_aligned(src0) &&
+                                   htp_tensor_mdev_data_aligned(src1) &&
+                                   htp_tensor_is_contiguous(dst, elem_size) &&
+                                   htp_tensor_is_contiguous(src0, elem_size) &&
+                                   htp_tensor_is_contiguous(src1, elem_size);
+            const struct htp_tensor_mdev_range range = htp_tensor_mdev_partition(
+                total_elems, can_split ? elems_per_line : 0,
+                octx->ctx->mdev.idx, octx->ctx->mdev.count, &octx->ctx->mdev.count_div);
+            elem_start = range.start;
+            nelem      = range.count;
+        }
+
+        if (nelem == 0) {
+            return HTP_STATUS_OK;
+        }
+
+        if (!htp_ops_context_set_n_threads(octx, kparams->n_threads)) {
+            return HTP_STATUS_INVAL_PARAMS;
+        }
+
+        struct htp_binary_vtcm_layout vtcm_layout;
+        htp_binary_vtcm_layout_build(&vtcm_layout, kparams, octx->ctx->vtcm_size);
+        if (vtcm_layout.total_bytes == 0 || vtcm_layout.total_bytes > octx->ctx->vtcm_size) {
+            return HTP_STATUS_VTCM_TOO_SMALL;
+        }
+
+        const uint32_t chunk_size = kparams->chunk_size > 0 ? kparams->chunk_size : (32768 / elem_size);
+        const uint32_t total_chunks = (nelem + chunk_size - 1) / chunk_size;
+        const uint32_t n_threads = (total_chunks >= 2) ? MIN(octx->n_threads, total_chunks) : 1;
+        const uint32_t chunks_per_thread = (total_chunks + n_threads - 1) / n_threads;
+
+        struct binary_chunked_context cctx = {
+            .octx              = octx,
+            .vtcm_layout       = vtcm_layout,
+            .vtcm_base         = (uint8_t *) octx->ctx->vtcm_base,
+            .elem_start        = elem_start,
+            .nelem             = nelem,
+            .chunk_size        = chunk_size,
+            .chunks_per_thread = chunks_per_thread,
+            .total_chunks      = total_chunks,
+            .compute           = compute,
+        };
+
+        work_queue_run(octx->ctx->work_queue, binary_thread_chunked, &cctx, n_threads);
+        return HTP_STATUS_OK;
+    }
 
     uint32_t row_start = 0;
     uint32_t nrows     = src0_nrows;
