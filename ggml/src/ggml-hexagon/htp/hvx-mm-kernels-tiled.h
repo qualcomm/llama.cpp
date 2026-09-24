@@ -156,9 +156,8 @@ static inline void quantize_block_f32_q8_0_tiled(float * restrict x, uint8_t * r
     HVX_Vector vx23_i16 = hvx_vec_i16_from_hf_rnd_sat(vx23_hf);
     HVX_Vector vx_i8    = Q6_Vb_vpack_VhVh_sat(vx23_i16, vx01_i16);
 
-    HVX_VectorPair vp1 = Q6_W_vshuff_VVR(vd23_hf, vd01_hf, -2);
-    HVX_VectorPair vp2 = Q6_W_vshuff_VVR(Q6_V_hi_W(vp1), Q6_V_lo_W(vp1), -2);
-    HVX_Vector v_scales = Q6_V_lo_W(vp2);
+    HVX_VectorPair vp01 = Q6_W_vshuff_VVR(vd01_hf, vd01_hf, -64);
+    HVX_VectorPair vp23 = Q6_W_vshuff_VVR(vd23_hf, vd23_hf, -64);
 
     static const uint8_t __attribute__((aligned(128))) repl[128] = {
         0x00, 0x00, 0x00, 0x00, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
@@ -172,9 +171,19 @@ static inline void quantize_block_f32_q8_0_tiled(float * restrict x, uint8_t * r
     };
     HVX_Vector v_repl_ctrl = * (const HVX_Vector *) repl;
 
+    #pragma unroll
     for (int b = 0; b < 4; b++) {
         HVX_Vector v_act = Q6_V_vror_VR(vx_i8, b * 32);
-        HVX_Vector r_scale = hvx_vec_repl_f16(Q6_V_vror_VR(v_scales, b * sizeof(__fp16)));
+        HVX_Vector r_scale;
+        if (b == 0) {
+            r_scale = Q6_V_lo_W(vp01);
+        } else if (b == 1) {
+            r_scale = Q6_V_hi_W(vp01);
+        } else if (b == 2) {
+            r_scale = Q6_V_lo_W(vp23);
+        } else {
+            r_scale = Q6_V_hi_W(vp23);
+        }
 
         HVX_Vector r0 = Q6_V_vdelta_VV(v_act, v_repl_ctrl);
         HVX_Vector r1 = Q6_V_vdelta_VV(Q6_V_vror_VR(v_act, 4),  v_repl_ctrl);
