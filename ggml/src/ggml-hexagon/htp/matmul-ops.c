@@ -29,9 +29,8 @@ typedef struct {
     float        *dst;
     dma_addr_t    src2_addr;
     size_t        src2_bytes;
-    const float  *activation;
-    dma_addr_t    src1_dma_addr;
-    bool          src1_extended;
+    dma_addr_t    act_dma_addr;
+    bool          act_extended;
     dma_addr_t    weight;
     dma_queue *   weight_dma;
     int           m;
@@ -47,8 +46,8 @@ typedef struct {
     int           ne13;
     size_t        src0_nb2;
     size_t        src0_nb3;
-    size_t        src1_nb2;
-    size_t        src1_nb3;
+    size_t        act_nb2;
+    size_t        act_nb3;
     size_t        src2_nb2;
     size_t        src2_nb3;
     size_t        dst_nb2;
@@ -2054,9 +2053,7 @@ typedef struct {
     struct htp_context            * ctx;
     struct htp_thread_trace       * traces;
     __fp16                        * dst;
-    const float                   * src;
-    dma_addr_t                      src_addr;
-    const struct mmid_row_mapping * matrix_rows;
+    dma_addr_t                      act_dma_addr;
     float                         * vtcm_f32_act;
     uint32_t                        n_tasks;
     uint32_t                        n_tot_chunks;
@@ -2073,8 +2070,7 @@ typedef struct {
     struct htp_context            * ctx;
     struct htp_thread_trace       * traces;
     __fp16                        * dst;
-    const float                   * src;
-    dma_addr_t                      src_addr;
+    dma_addr_t                      act_dma_addr;
     float                         * vtcm_f32_act;
     uint32_t                        n_rows;
     uint32_t                        k_block;
@@ -2090,8 +2086,7 @@ typedef struct {
 static void transfer_activation_chunk_fp32_to_fp16_dma_pipelined_col_chunk(
         dma_queue *dma_q,
         __fp16 *restrict vtcm_dst,
-        const float *restrict src,
-        dma_addr_t src_addr,
+        dma_addr_t act_dma_addr,
         uint32_t n_rows,
         uint32_t k_block,
         uint32_t k_stride,
@@ -2111,7 +2106,7 @@ static void transfer_activation_chunk_fp32_to_fp16_dma_pipelined_col_chunk(
     // Push step 0
     if (n_steps > 0 && n_rows > 0) {
         uint32_t nrows_to_fetch = hex_smin(n_rows, R);
-        dma_queue_push(dma_q, dma_make_data(thread_f32_act, src_addr + (size_t) c_first * sizeof(float)),
+        dma_queue_push(dma_q, dma_make_data(thread_f32_act, act_dma_addr + (size_t) c_first * sizeof(float)),
                        c_len * sizeof(float), k_stride * sizeof(float), k_chunk_valid * sizeof(float), nrows_to_fetch);
     }
     // Push step 1
@@ -2120,7 +2115,7 @@ static void transfer_activation_chunk_fp32_to_fp16_dma_pipelined_col_chunk(
         if (next_r < n_rows) {
             uint32_t nrows_to_fetch = hex_smin(n_rows - next_r, R);
             float *next_buf = thread_f32_act + 1 * R * c_len;
-            dma_queue_push(dma_q, dma_make_data(next_buf, src_addr + ((size_t) next_r * k_stride + c_first) * sizeof(float)),
+            dma_queue_push(dma_q, dma_make_data(next_buf, act_dma_addr + ((size_t) next_r * k_stride + c_first) * sizeof(float)),
                            c_len * sizeof(float), k_stride * sizeof(float), k_chunk_valid * sizeof(float), nrows_to_fetch);
         }
     }
@@ -2150,7 +2145,7 @@ static void transfer_activation_chunk_fp32_to_fp16_dma_pipelined_col_chunk(
         uint32_t next_r = next_s << dma_step_rows_shift;
         if (next_r < n_rows) {
             uint32_t nrows_to_fetch = hex_smin(n_rows - next_r, R);
-            dma_queue_push(dma_q, dma_make_data(curr_buf, src_addr + ((size_t) next_r * k_stride + c_first) * sizeof(float)),
+            dma_queue_push(dma_q, dma_make_data(curr_buf, act_dma_addr + ((size_t) next_r * k_stride + c_first) * sizeof(float)),
                            c_len * sizeof(float), k_stride * sizeof(float), k_chunk_valid * sizeof(float), nrows_to_fetch);
         }
     }
@@ -2214,17 +2209,17 @@ static void transfer_activation_chunk_col_chunk_worker_fn(unsigned int n, unsign
     }
 
     __fp16 *dst = st->dst;
-    const float *src = st->src;
 
     if (st->vtcm_f32_act) {
         size_t thread_scratch_bytes = hex_align_down(fastdiv(st->vtcm_f32_act_bytes, &st->n_threads_div), 128);
         float *thread_f32_act = (float *)((char *)st->vtcm_f32_act + i * thread_scratch_bytes);
 
         transfer_activation_chunk_fp32_to_fp16_dma_pipelined_col_chunk(
-            st->ctx->dma[i], dst, src, st->src_addr, st->n_rows, st->k_block, st->k_stride, k_chunk_valid,
+            st->ctx->dma[i], dst, st->act_dma_addr, st->n_rows, st->k_block, st->k_stride, k_chunk_valid,
             c_first, c_len, thread_f32_act, tr, st->dma_step_rows, st->dma_step_rows_shift
         );
     } else {
+        const float *src = (const float *)(uintptr_t) st->act_dma_addr;
         htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_A_PREP, c_first);
         transfer_activation_chunk_fp32_to_fp16_col_chunk(
             dst, src, st->n_rows, st->k_block, st->k_stride, c_first, c_len, k_chunk_valid
@@ -2236,8 +2231,7 @@ static void transfer_activation_chunk_col_chunk_worker_fn(unsigned int n, unsign
 static void transfer_activation_chunk_fp32_to_fp16_dma_pipelined(
         dma_queue *dma_q,
         __fp16 *restrict vtcm_dst,
-        const float *restrict src,
-        dma_addr_t src_addr,
+        dma_addr_t act_dma_addr,
         uint32_t n_rows,
         uint32_t k_block,
         uint32_t k_stride,
@@ -2255,7 +2249,7 @@ static void transfer_activation_chunk_fp32_to_fp16_dma_pipelined(
     // Push step 0
     if (n_steps > 0 && n_rows > 0) {
         uint32_t nrows_to_fetch = hex_smin(n_rows, R);
-        dma_queue_push(dma_q, dma_make_data(thread_f32_act, src_addr),
+        dma_queue_push(dma_q, dma_make_data(thread_f32_act, act_dma_addr),
                        k_block * sizeof(float), k_stride * sizeof(float), k_valid * sizeof(float), nrows_to_fetch);
     }
     // Push step 1 (if valid)
@@ -2264,7 +2258,7 @@ static void transfer_activation_chunk_fp32_to_fp16_dma_pipelined(
         if (next_r < n_rows) {
             uint32_t nrows_to_fetch = hex_smin(n_rows - next_r, R);
             float *next_buf = thread_f32_act + 1 * R * k_block;
-            dma_queue_push(dma_q, dma_make_data(next_buf, src_addr + (size_t) next_r * k_stride * sizeof(float)),
+            dma_queue_push(dma_q, dma_make_data(next_buf, act_dma_addr + (size_t) next_r * k_stride * sizeof(float)),
                            k_block * sizeof(float), k_stride * sizeof(float), k_valid * sizeof(float), nrows_to_fetch);
         }
     }
@@ -2292,7 +2286,7 @@ static void transfer_activation_chunk_fp32_to_fp16_dma_pipelined(
         uint32_t next_r = next_s << dma_step_rows_shift;
         if (next_r < n_rows) {
             uint32_t nrows_to_fetch = hex_smin(n_rows - next_r, R);
-            dma_queue_push(dma_q, dma_make_data(curr_buf, src_addr + (size_t) next_r * k_stride * sizeof(float)),
+            dma_queue_push(dma_q, dma_make_data(curr_buf, act_dma_addr + (size_t) next_r * k_stride * sizeof(float)),
                            k_block * sizeof(float), k_stride * sizeof(float), k_valid * sizeof(float), nrows_to_fetch);
         }
     }
@@ -2308,15 +2302,15 @@ static void transfer_activation_chunk_worker_fn(unsigned int n, unsigned int i, 
         size_t chunk_size = hex_smin(st->n_tot_chunks - chunk_idx, st->n_chunks_per_task);
 
         __fp16      *dst = st->dst + chunk_idx * st->k_block;
-        const float *src = st->src + chunk_idx * st->k_stride;
-        const dma_addr_t src_addr = st->src_addr + (size_t) chunk_idx * st->k_stride * sizeof(float);
+        const dma_addr_t act_dma_addr = st->act_dma_addr + (size_t) chunk_idx * st->k_stride * sizeof(float);
 
         if (st->vtcm_f32_act) {
             float *thread_f32_act = (float *)((char *)st->vtcm_f32_act + i * st->vtcm_f32_act_bytes_per_thread);
             transfer_activation_chunk_fp32_to_fp16_dma_pipelined(
-                st->ctx->dma[i], dst, src, src_addr, chunk_size, st->k_block, st->k_stride, st->k_valid, thread_f32_act, tr, st->dma_step_rows, st->dma_step_rows_shift
+                st->ctx->dma[i], dst, act_dma_addr, chunk_size, st->k_block, st->k_stride, st->k_valid, thread_f32_act, tr, st->dma_step_rows, st->dma_step_rows_shift
             );
         } else {
+            const float *src = (const float *)(uintptr_t) act_dma_addr;
             htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_A_PREP, chunk_idx);
             transfer_activation_chunk_fp32_to_fp16(dst, src, chunk_size, st->k_block, st->k_stride, st->k_valid);
             htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_A_PREP, chunk_idx);
@@ -2559,8 +2553,7 @@ static void transfer_output_chunk_threaded(struct htp_context *ctx, float *dst, 
 struct activation_transfer_params {
     struct htp_context *          ctx;
     __fp16 *                      dst;
-    const float *                 src;
-    dma_addr_t                    src_addr;
+    dma_addr_t                    act_dma_addr;
     int                           n_rows;
     int                           k_block;
     int                           k_stride;
@@ -2575,8 +2568,7 @@ struct activation_transfer_params {
 static void transfer_activation_chunk_threaded(const struct activation_transfer_params * params) {
     struct htp_context *          ctx                = params->ctx;
     __fp16 *                      dst                = params->dst;
-    const float *                 src                = params->src;
-    const dma_addr_t              src_addr           = params->src_addr ? params->src_addr : (dma_addr_t) src;
+    const dma_addr_t              act_dma_addr       = params->act_dma_addr;
     int                           n_rows             = params->n_rows;
     int                           k_block            = params->k_block;
     int                           k_stride           = params->k_stride;
@@ -2608,8 +2600,7 @@ static void transfer_activation_chunk_threaded(const struct activation_transfer_
 
         activation_transfer_col_chunk_state_t col_state;
         col_state.dst = dst;
-        col_state.src = src;
-        col_state.src_addr = src_addr;
+        col_state.act_dma_addr = act_dma_addr;
         col_state.n_rows = n_rows;
         col_state.k_block = k_block;
         col_state.k_stride = k_stride;
@@ -2637,8 +2628,7 @@ static void transfer_activation_chunk_threaded(const struct activation_transfer_
     state.n_tot_chunks       = n_tot_chunks;
     state.n_chunks_per_task  = n_chunks_per_task;
     state.dst                = dst;
-    state.src                = src;
-    state.src_addr           = src_addr;
+    state.act_dma_addr       = act_dma_addr;
     state.k_block            = k_block;
     state.k_stride           = k_stride;
     state.k_valid            = k_valid;
@@ -2708,8 +2698,7 @@ static int hmx_mm_2d_f32(struct htp_context *ctx,
                                   float *restrict dst,
                                   dma_addr_t src2_addr,
                                   size_t src2_bytes,
-                                  const float *activation,
-                                  dma_addr_t src1_dma_addr,
+                                  dma_addr_t act_dma_addr,
                                   dma_addr_t weight,
                                   int m, int k, int n,
                                   int act_stride,
@@ -2733,7 +2722,7 @@ static int hmx_mm_2d_f32(struct htp_context *ctx,
     htp_trace_event_start(tr, HTP_TRACE_EVT_INIT, 0);
 
     if (k % 32 != 0 || n % 32 != 0) { return -1; }
-    if (!hex_is_aligned(dst, VLEN) || !hex_is_aligned(activation, VLEN)) { return -1; }
+    if (!hex_is_aligned(dst, VLEN) || (act_dma_addr & (VLEN - 1)) != 0) { return -1; }
 
     size_t row_stride = htp_mm_get_tiled_row_stride(weight_type, k);
     if (row_stride == 0) {
@@ -2825,8 +2814,7 @@ static int hmx_mm_2d_f32(struct htp_context *ctx,
             struct activation_transfer_params act_params = {
                 .ctx = ctx,
                 .dst = vtcm_f16_act,
-                .src = activation + mr * act_stride,
-                .src_addr = src1_dma_addr + mr * (size_t) act_stride * sizeof(float),
+                .act_dma_addr = act_dma_addr + mr * (size_t) act_stride * sizeof(float),
                 .n_rows = (int) n_rows,
                 .k_block = k,
                 .k_stride = act_stride,
@@ -2917,8 +2905,7 @@ static int hmx_mm_2d_f32(struct htp_context *ctx,
             struct activation_transfer_params act_params = {
                 .ctx = ctx,
                 .dst = vtcm_f16_act,
-                .src = activation + mr * act_stride,
-                .src_addr = src1_dma_addr + mr * (size_t) act_stride * sizeof(float),
+                .act_dma_addr = act_dma_addr + mr * (size_t) act_stride * sizeof(float),
                 .n_rows = (int) n_rows,
                 .k_block = k,
                 .k_stride = act_stride,
@@ -2997,10 +2984,10 @@ static int hmx_mm_nx_2d_f32(struct htp_ops_context * octx, const struct htp_mm_k
     const int k_valid     = (int) act->ne[0];
     const int m           = (int) (act->ne[1] * act->ne[2] * act->ne[3]);
     const int act_stride  = (int) (act->nb[1] / sizeof(float));
-    const float * activation = (const float *) act->data;
+    const dma_addr_t act_dma_addr = act->data;
 
     if (k % 32 != 0) { return HTP_STATUS_NO_SUPPORT; }
-    if (!hex_is_aligned(activation, VLEN)) { return HTP_STATUS_NO_SUPPORT; }
+    if ((act_dma_addr & (VLEN - 1)) != 0) { return HTP_STATUS_NO_SUPPORT; }
 
     size_t row_stride = htp_mm_get_tiled_row_stride(weight_type, k);
     if (row_stride == 0) {
@@ -3098,7 +3085,7 @@ static int hmx_mm_nx_2d_f32(struct htp_ops_context * octx, const struct htp_mm_k
             struct activation_transfer_params act_params = {
                 .ctx = ctx,
                 .dst = vtcm_f16_act,
-                .src = activation + mr * act_stride,
+                .act_dma_addr = act_dma_addr + (dma_addr_t) mr * act_stride * sizeof(float),
                 .n_rows = (int) n_rows,
                 .k_block = k,
                 .k_stride = act_stride,
@@ -3196,7 +3183,7 @@ static int hmx_mm_nx_2d_f32(struct htp_ops_context * octx, const struct htp_mm_k
             struct activation_transfer_params act_params = {
                 .ctx = ctx,
                 .dst = vtcm_f16_act,
-                .src = activation + mr * act_stride,
+                .act_dma_addr = act_dma_addr + (dma_addr_t) mr * act_stride * sizeof(float),
                 .n_rows = (int) n_rows,
                 .k_block = k,
                 .k_stride = act_stride,
@@ -3274,17 +3261,10 @@ static inline dma_addr_t hmx_mm_weight_batch_data(const hmx_mm_f16_f32_batched_p
     return params->weight + b2_idx * params->src0_nb2 + b3_idx * params->src0_nb3;
 }
 
-static inline const float *hmx_mm_activation_batch_ptr(const hmx_mm_f16_f32_batched_params_t *params,
-                                                           int dst_b2, int dst_b3) {
-    return (const float *) ((const uint8_t *) params->activation +
-                            (size_t) dst_b2 * params->src1_nb2 +
-                            (size_t) dst_b3 * params->src1_nb3);
-}
-
-static inline dma_addr_t hmx_mm_src1_batch_addr(const hmx_mm_f16_f32_batched_params_t *params,
+static inline dma_addr_t hmx_mm_act_batch_addr(const hmx_mm_f16_f32_batched_params_t *params,
                                                 int dst_b2, int dst_b3) {
-    return params->src1_dma_addr + (dma_addr_t) dst_b2 * params->src1_nb2 +
-           (dma_addr_t) dst_b3 * params->src1_nb3;
+    return params->act_dma_addr + (dma_addr_t) dst_b2 * params->act_nb2 +
+           (dma_addr_t) dst_b3 * params->act_nb3;
 }
 
 static inline float *hmx_mm_dst_batch_ptr(const hmx_mm_f16_f32_batched_params_t *params,
@@ -3306,8 +3286,7 @@ static int hmx_mm_f16_f32_batched_simple(struct htp_context *ctx,
                                        (dma_addr_t) b3 * params->src2_nb3) : 0;
             ret = hmx_mm_2d_f32(ctx, params->weight_dma, hmx_mm_dst_batch_ptr(params, b2, b3),
                                 cur_src2_addr, params->src2_bytes,
-                                hmx_mm_activation_batch_ptr(params, b2, b3),
-                                hmx_mm_src1_batch_addr(params, b2, b3),
+                                hmx_mm_act_batch_addr(params, b2, b3),
                                 hmx_mm_weight_batch_data(params, b2, b3),
                                 params->m, params->k, params->n,
                                 params->act_stride, params->weight_stride * (int)sizeof(__fp16),
@@ -3328,7 +3307,7 @@ static int hmx_mm_f16_f32_batched(struct htp_context *ctx, const hmx_mm_f16_f32_
     if (params->ne02 <= 0 || params->ne03 <= 0 || params->ne12 <= 0 || params->ne13 <= 0) { return -1; }
     if (params->ne12 % params->ne02 != 0 || params->ne13 % params->ne03 != 0) { return -1; }
     if (params->k % 32 != 0 || params->n % 32 != 0) { return -1; }
-    if (!hex_is_aligned(params->dst, VLEN) || !hex_is_aligned(params->activation, VLEN)) { return -1; }
+    if (!hex_is_aligned(params->dst, VLEN) || (params->act_dma_addr & (VLEN - 1)) != 0) { return -1; }
 
     const int group_size = params->r2;
     const size_t vtcm_budget  = ctx->vtcm_size;
@@ -3346,7 +3325,7 @@ static int hmx_mm_f16_f32_batched(struct htp_context *ctx, const hmx_mm_f16_f32_
 
     const size_t vec_dot_size = params->k * sizeof(__fp16);
 
-    const bool use_dma_activation = params->src1_extended || (params->act_stride > params->k);
+    const bool use_dma_activation = params->act_extended || (params->act_stride > params->k);
     const size_t f32_scratch_size = use_dma_activation
         ? hex_align_up((size_t)act_threads * HTP_MM_DMA_ACT_MULTIPLIER * (size_t) params->k * sizeof(float), HTP_MM_HMX_TILE_SIZE) : 0;
 
@@ -3408,15 +3387,13 @@ static int hmx_mm_f16_f32_batched(struct htp_context *ctx, const hmx_mm_f16_f32_
                 // converts from the contiguous VTCM buffer.  This avoids L2 cache
                 // thrashing from HVX loads at large strides.
                 for (int g = 0; g < group_size; ++g) {
-                    const float *activation_chunk = hmx_mm_activation_batch_ptr(params, b2_base + g, b3) + mr * params->act_stride;
-                    const dma_addr_t src1_dma_addr = hmx_mm_src1_batch_addr(params, b2_base + g, b3) +
-                                                       mr * (dma_addr_t) params->act_stride * sizeof(float);
+                    const dma_addr_t act_dma_addr = hmx_mm_act_batch_addr(params, b2_base + g, b3) +
+                                                      (dma_addr_t) mr * params->act_stride * sizeof(float);
                     __fp16 *vtcm_act_g = vtcm_f16_act + (size_t) g * L.act_head_stride;
                     struct activation_transfer_params act_params = {
                         .ctx = ctx,
                         .dst = vtcm_act_g,
-                        .src = activation_chunk,
-                        .src_addr = src1_dma_addr,
+                        .act_dma_addr = act_dma_addr,
                         .n_rows = (int) n_rows,
                         .k_block = params->k,
                         .k_stride = params->act_stride,
@@ -3781,10 +3758,8 @@ static int hmx_mm_op_matmul(struct htp_ops_context * octx, const struct htp_mm_k
     }
 
     const int dst_stride = (int)(dst->nb[1] / sizeof(float));
-    float       * dst_ptr = (float *)       dst->data  + m_start * dst_stride;
-    const float * act_ptr = (const float *) src1->data + m_start * act_stride;
-    const dma_addr_t act_addr = (dma_addr_t) src1->data + (dma_addr_t) m_start * act_stride * sizeof(float);
-
+    float       * dst_ptr = (float *) dst->data + m_start * dst_stride;
+    const dma_addr_t act_addr = src1->data + (dma_addr_t) m_start * act_stride * sizeof(float);
 
     int ret = -1;
     const int n_threads = kparams->n_threads;
@@ -3793,9 +3768,8 @@ static int hmx_mm_op_matmul(struct htp_ops_context * octx, const struct htp_mm_k
             .dst             = dst_ptr,
             .src2_addr       = src2_addr,
             .src2_bytes      = src2_bytes,
-            .activation      = act_ptr,
-            .src1_dma_addr   = act_addr,
-            .src1_extended   = htp_tensor_is_extended(src1),
+            .act_dma_addr    = act_addr,
+            .act_extended    = htp_tensor_is_extended(src1),
             .weight          = src0->data,
             .weight_dma      = octx->ctx->dma[0],
             .m               = m_rows,
@@ -3811,8 +3785,8 @@ static int hmx_mm_op_matmul(struct htp_ops_context * octx, const struct htp_mm_k
             .ne13            = ne13,
             .src0_nb2        = src0->nb[2],
             .src0_nb3        = src0->nb[3],
-            .src1_nb2        = src1->nb[2],
-            .src1_nb3        = src1->nb[3],
+            .act_nb2         = src1->nb[2],
+            .act_nb3         = src1->nb[3],
             .dst_nb2         = dst->nb[2],
             .dst_nb3         = dst->nb[3],
             .src2_nb2        = src2_nb2,
@@ -3831,7 +3805,7 @@ static int hmx_mm_op_matmul(struct htp_ops_context * octx, const struct htp_mm_k
                                      kparams->vtcm_size);
     } else {
         ret = hmx_mm_2d_f32(
-            octx->ctx, octx->ctx->dma[0], dst_ptr, src2_addr, src2_bytes, act_ptr,
+            octx->ctx, octx->ctx->dma[0], dst_ptr, src2_addr, src2_bytes,
             act_addr, src0->data,
             m_rows, k, n, act_stride, (int) src0->nb[1], (int) src0->type, (int) src1->ne[0],
             dst_stride, src2_stride, (int)dst->ne[0],
