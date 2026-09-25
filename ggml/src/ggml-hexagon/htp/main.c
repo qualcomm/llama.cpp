@@ -902,6 +902,9 @@ static int execute_op(struct htp_ops_context * octx) {
         case HTP_OP_TOP_K:
             return op_top_k(octx);
 
+        case HTP_OP_ARGMAX:
+            return op_argmax(octx);
+
         case HTP_OP_SSM_CONV:
             return op_ssm_conv(octx);
 

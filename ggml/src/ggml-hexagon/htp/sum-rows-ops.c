@@ -227,3 +227,245 @@ int op_sum(struct htp_ops_context * octx) {
 
     return HTP_STATUS_OK;
 }
+
+static inline void argmax_slice_f32(
+    const float * restrict src,
+    uint32_t n,
+    uint32_t offset,
+    float * out_val,
+    int32_t * out_idx
+) {
+    if (n == 0) {
+        *out_val = -INFINITY;
+        *out_idx = (int32_t) offset;
+        return;
+    }
+
+    if (n < 32 || !hex_is_aligned((void *) src, 128)) {
+        float best_val = src[0];
+        int32_t best_idx = (int32_t) offset;
+        for (uint32_t i = 1; i < n; i++) {
+            if (src[i] > best_val) {
+                best_val = src[i];
+                best_idx = (int32_t) (offset + i);
+            }
+        }
+        *out_val = best_val;
+        *out_idx = best_idx;
+        return;
+    }
+
+    static const int32_t c_lane_idx[32] __attribute__((aligned(128))) = {
+         0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15,
+        16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31
+    };
+
+    const HVX_Vector v_init_idx = *(const HVX_Vector *) c_lane_idx;
+    const HVX_Vector v_step     = Q6_V_vsplat_R(32);
+    HVX_Vector v_cur_idx        = Q6_Vw_vadd_VwVw(v_init_idx, Q6_V_vsplat_R((int32_t) offset));
+    HVX_Vector v_max_val        = hvx_vec_splat_f32(-INFINITY);
+    HVX_Vector v_max_idx        = v_cur_idx;
+
+    const HVX_Vector * vsrc = (const HVX_Vector *) src;
+    const uint32_t nvec = n / 32;
+
+    for (uint32_t vi = 0; vi < nvec; vi++) {
+        HVX_Vector v = vsrc[vi];
+        HVX_VectorPred pred = Q6_Q_vcmp_gt_VsfVsf(v, v_max_val);
+        v_max_val = Q6_V_vmux_QVV(pred, v, v_max_val);
+        v_max_idx = Q6_V_vmux_QVV(pred, v_cur_idx, v_max_idx);
+        v_cur_idx = Q6_Vw_vadd_VwVw(v_cur_idx, v_step);
+    }
+
+    HVX_VectorAlias u_val, u_idx;
+    u_val.v = v_max_val;
+    u_idx.v = v_max_idx;
+
+    float best_val = u_val.fp32[0];
+    int32_t best_idx = (int32_t) u_idx.w[0];
+    for (int i = 1; i < 32; i++) {
+        if (u_val.fp32[i] > best_val) {
+            best_val = u_val.fp32[i];
+            best_idx = (int32_t) u_idx.w[i];
+        }
+    }
+
+    for (uint32_t i = nvec * 32; i < n; i++) {
+        if (src[i] > best_val) {
+            best_val = src[i];
+            best_idx = (int32_t) (offset + i);
+        }
+    }
+
+    *out_val = best_val;
+    *out_idx = best_idx;
+}
+
+struct argmax_context {
+    struct htp_ops_context * octx;
+    const float            * src_data;
+    int32_t                * dst_data;
+    uint32_t                 ne00;
+    uint32_t                 src_stride;
+    uint32_t                 dst_stride;
+    uint32_t                 row_start;
+    uint32_t                 nrows;
+    uint32_t                 rows_per_thread;
+    uint32_t                 elems_per_thread;
+
+    float                    partial_max[HTP_MAX_NTHREADS];
+    int32_t                  partial_idx[HTP_MAX_NTHREADS];
+};
+
+static void argmax_thread_single_row(unsigned int nth, unsigned int ith, void * data) {
+    struct argmax_context * actx = (struct argmax_context *) data;
+    const uint32_t start = actx->elems_per_thread * ith;
+    const uint32_t end   = MIN(start + actx->elems_per_thread, actx->ne00);
+
+    if (start >= end) {
+        actx->partial_max[ith] = -INFINITY;
+        actx->partial_idx[ith] = 0;
+        return;
+    }
+
+    const uint32_t n = end - start;
+    const float * src = actx->src_data + start;
+
+    struct htp_thread_trace * tr = &actx->octx->ctx->trace[ith];
+    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) start);
+
+    hex_l2fetch_block((const void *) src, n * sizeof(float));
+
+    float max_val;
+    int32_t max_idx;
+    argmax_slice_f32(src, n, start, &max_val, &max_idx);
+
+    actx->partial_max[ith] = max_val;
+    actx->partial_idx[ith] = max_idx;
+
+    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) start);
+}
+
+static void argmax_thread_multi_row(unsigned int nth, unsigned int ith, void * data) {
+    struct argmax_context * actx = (struct argmax_context *) data;
+    const uint32_t r0 = actx->row_start + actx->rows_per_thread * ith;
+    const uint32_t r1 = MIN(r0 + actx->rows_per_thread, actx->row_start + actx->nrows);
+
+    if (r0 >= r1) {
+        return;
+    }
+
+    struct htp_thread_trace * tr = &actx->octx->ctx->trace[ith];
+    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) r0);
+
+    for (uint32_t r = r0; r < r1; r++) {
+        const float * src_row = (const float *) ((const uint8_t *) actx->src_data + r * actx->src_stride);
+        int32_t * dst_val     = (int32_t *) ((uint8_t *) actx->dst_data + r * actx->dst_stride);
+
+        hex_l2fetch_block((const void *) src_row, actx->ne00 * sizeof(float));
+
+        float max_val;
+        int32_t max_idx;
+        argmax_slice_f32(src_row, actx->ne00, 0, &max_val, &max_idx);
+
+        *dst_val = max_idx;
+    }
+
+    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) r0);
+}
+
+int op_argmax(struct htp_ops_context * octx) {
+    const struct htp_tensor * src0 = octx->src[0];
+    const struct htp_tensor * dst  = octx->dst;
+
+    if (src0->type != HTP_TYPE_F32 || dst->type != HTP_TYPE_I32) {
+        return HTP_STATUS_NO_SUPPORT;
+    }
+
+    if (htp_tensor_is_extended(src0) || htp_tensor_is_extended(dst)) {
+        return HTP_STATUS_NO_SUPPORT;
+    }
+
+    const uint32_t ne00 = src0->ne[0];
+    const uint32_t src0_nrows = src0->ne[1] * src0->ne[2] * src0->ne[3];
+
+    if (ne00 == 0 || src0_nrows == 0) {
+        return HTP_STATUS_OK;
+    }
+
+    if (src0_nrows == 1) {
+        if (octx->ctx->mdev.count > 1 && octx->ctx->mdev.idx > 0) {
+            return HTP_STATUS_OK;
+        }
+
+        if (ne00 == 1) {
+            ((int32_t *) dst->data)[0] = 0;
+            return HTP_STATUS_OK;
+        }
+
+        const uint32_t n_threads = (ne00 >= 1024) ? MIN(octx->n_threads, HTP_MAX_NTHREADS) : 1;
+        const uint32_t raw_chunk = (ne00 + n_threads - 1) / n_threads;
+        const uint32_t elems_per_thread = hex_round_up(raw_chunk, 32);
+
+        struct argmax_context actx = {
+            .octx             = octx,
+            .src_data         = (const float *) src0->data,
+            .dst_data         = (int32_t *) dst->data,
+            .ne00             = ne00,
+            .src_stride       = src0->nb[1] > 0 ? (uint32_t) src0->nb[1] : (uint32_t) (ne00 * sizeof(float)),
+            .dst_stride       = dst->nb[0] > 0 ? (uint32_t) dst->nb[0] : (uint32_t) sizeof(int32_t),
+            .row_start        = 0,
+            .nrows            = 1,
+            .rows_per_thread  = 1,
+            .elems_per_thread = elems_per_thread,
+        };
+
+        work_queue_run(octx->ctx->work_queue, argmax_thread_single_row, &actx, n_threads);
+
+        float best_val = actx.partial_max[0];
+        int32_t best_idx = actx.partial_idx[0];
+        for (uint32_t i = 1; i < n_threads; i++) {
+            if (actx.partial_max[i] > best_val) {
+                best_val = actx.partial_max[i];
+                best_idx = actx.partial_idx[i];
+            }
+        }
+        ((int32_t *) dst->data)[0] = best_idx;
+        return HTP_STATUS_OK;
+    }
+
+    uint32_t row_start = 0;
+    uint32_t nrows     = src0_nrows;
+
+    if (octx->ctx->mdev.count > 1) {
+        uint32_t rows_per_chunk = 0;
+        htp_tensor_mdev_rows_per_chunk(dst, sizeof(int32_t), sizeof(int32_t), &rows_per_chunk);
+        const struct htp_tensor_mdev_range range = htp_tensor_mdev_partition(
+            src0_nrows, rows_per_chunk, octx->ctx->mdev.idx, octx->ctx->mdev.count, &octx->ctx->mdev.count_div);
+        row_start = range.start;
+        nrows     = range.count;
+    }
+
+    if (nrows == 0) {
+        return HTP_STATUS_OK;
+    }
+
+    const uint32_t n_threads = MIN(octx->n_threads, nrows);
+    const uint32_t rows_per_thread = (nrows + n_threads - 1) / n_threads;
+
+    struct argmax_context actx = {
+        .octx             = octx,
+        .src_data         = (const float *) src0->data,
+        .dst_data         = (int32_t *) dst->data,
+        .ne00             = ne00,
+        .src_stride       = src0->nb[1] > 0 ? (uint32_t) src0->nb[1] : (uint32_t) (ne00 * sizeof(float)),
+        .dst_stride       = dst->nb[0] > 0 ? (uint32_t) dst->nb[0] : (uint32_t) sizeof(int32_t),
+        .row_start        = row_start,
+        .nrows            = nrows,
+        .rows_per_thread  = rows_per_thread,
+        .elems_per_thread = 0,
+    };
+
+    work_queue_run(octx->ctx->work_queue, argmax_thread_multi_row, &actx, n_threads);
+    return HTP_STATUS_OK;
+}
