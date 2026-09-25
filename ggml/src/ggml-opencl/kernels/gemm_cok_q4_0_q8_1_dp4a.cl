@@ -93,10 +93,25 @@ typedef int2   cok_dotv;
 #endif
 
 // One K-group (4 K values): unpack the folded rows' weights, then dot every column.
+#ifdef COK_Q_BIN
+// bin (32b-transposed) plane: one uint per (8 K, row), low half = the noshuffle ushort of
+// the first four K. ku0 is a multiple of 4, so K-group ku0+t is word ku0/2 + t/2, half t&1.
+#define COK_QB8(t) convert_ushort8(((t) & 1) ? (vload8(0, src0_q + row0 + ((ku0 >> 1) + ((t) >> 1)) * m) >> 16) \
+                                          : (vload8(0, src0_q + row0 + ((ku0 >> 1) + ((t) >> 1)) * m) & 0xFFFFu))
+#define COK_QB4(t) convert_ushort4(((t) & 1) ? (vload4(0, src0_q + row0 + ((ku0 >> 1) + ((t) >> 1)) * m) >> 16) \
+                                          : (vload4(0, src0_q + row0 + ((ku0 >> 1) + ((t) >> 1)) * m) & 0xFFFFu))
+#define COK_QB2(t) convert_ushort2(((t) & 1) ? (vload2(0, src0_q + row0 + ((ku0 >> 1) + ((t) >> 1)) * m) >> 16) \
+                                          : (vload2(0, src0_q + row0 + ((ku0 >> 1) + ((t) >> 1)) * m) & 0xFFFFu))
+#else
+#define COK_QB8(t) vload8(0, src0_q + row0 + (ku0 + t) * m)
+#define COK_QB4(t) vload4(0, src0_q + row0 + (ku0 + t) * m)
+#define COK_QB2(t) vload2(0, src0_q + row0 + (ku0 + t) * m)
+#endif
+
 #if COK_ROWS == 8
 #define COK_KSTEP(t)                                                  \
     {                                                                 \
-    ushort8 bl = vload8(0, src0_q + row0 + (ku0 + t) * m);            \
+    ushort8 bl = COK_QB8(t);                                            \
     const uint w0 = EXP40(bl.s0);                                     \
     const uint w1 = EXP40(bl.s1);                                     \
     const uint w2 = EXP40(bl.s2);                                     \
@@ -110,7 +125,7 @@ typedef int2   cok_dotv;
 #elif COK_ROWS == 4
 #define COK_KSTEP(t)                                                   \
     {                                                                  \
-    ushort4 bl = vload4(0, src0_q + row0 + (ku0 + t) * m);             \
+    ushort4 bl = COK_QB4(t);                                             \
     const uint w0 = EXP40(bl.s0);                                      \
     const uint w1 = EXP40(bl.s1);                                      \
     const uint w2 = EXP40(bl.s2);                                      \
@@ -120,7 +135,7 @@ typedef int2   cok_dotv;
 #else
 #define COK_KSTEP(t)                                                   \
     {                                                                  \
-    ushort2 bl = vload2(0, src0_q + row0 + (ku0 + t) * m);             \
+    ushort2 bl = COK_QB2(t);                                             \
     const uint w0 = EXP40(bl.s0);                                      \
     const uint w1 = EXP40(bl.s1);                                      \
     COK_DOTS_AT(t)                                                     \
@@ -128,7 +143,11 @@ typedef int2   cok_dotv;
 #endif
 
 kernel void kernel_gemm_cok_q4_0_q8_1_dp4a(
+#ifdef COK_Q_BIN
+    global const uint   * src0_q,     // q4_0 nibble plane, bin [row + (K/8)*m]
+#else
     global const ushort * src0_q,     // q4_0 nibble plane [row + (K/4)*m]
+#endif
     global const half   * src0_d,     // one scale per 32-K block [row + blk*m]
     global const uint   * src1_qa,    // q8_1 activations  [col*k_u + K/4]
     global const half   * src1_da,    // activation scale  [col*k_b + blk]

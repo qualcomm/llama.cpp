@@ -2092,6 +2092,9 @@ struct ggml_backend_opencl_context {
     int       q6k_cok_dp4a_rows = 4;
     cl_kernel kernel_gemm_cok_q4_0_q8_1_dp4a    = nullptr;  // q4_0 twin, 4-column
     cl_kernel kernel_gemm_cok_q4_0_q8_1_dp4a_c2 = nullptr;  // q4_0 twin, 2-column
+    cl_kernel kernel_gemm_cok_q4_0_q8_1_dp4a_bin    = nullptr;  // same builds over the bin plane
+    cl_kernel kernel_gemm_cok_q4_0_q8_1_dp4a_bin_c2 = nullptr;
+    int q40_cok_dp4a_bin_nsg = 8, q40_cok_dp4a_bin_nsg_c2 = 8;
     int       q40_cok_dp4a_nsg  = 4;
     int       q40_cok_dp4a_nsg_c2 = 4;
     int       q40_cok_dp4a_rows = 4;
@@ -4308,6 +4311,18 @@ static void ggml_cl_cok_build_q40(ggml_backend_opencl_context * backend_ctx) {
         }
         fflush(stderr);
         backend_ctx->q40_cok_dp4a_rows = rows40;
+        for (int cols : {4, 2}) {
+            int nsg_eff = nsg40;
+            cl_program prog = ggml_cl_build_cok_program(
+                backend_ctx, kernel_src.c_str(),
+                base40 + " -DCOK_Q_BIN=1 -DCOK_COLS=" + std::to_string(cols), nsg_eff, &nsg_eff);
+            if (prog == nullptr) { continue; }
+            cl_kernel kk = clCreateKernel(prog, "kernel_gemm_cok_q4_0_q8_1_dp4a", &err);
+            if (err != CL_SUCCESS) { kk = nullptr; }
+            if (cols == 4) { backend_ctx->kernel_gemm_cok_q4_0_q8_1_dp4a_bin    = kk; backend_ctx->q40_cok_dp4a_bin_nsg    = nsg_eff; }
+            else           { backend_ctx->kernel_gemm_cok_q4_0_q8_1_dp4a_bin_c2 = kk; backend_ctx->q40_cok_dp4a_bin_nsg_c2 = nsg_eff; }
+            CL_CHECK(clReleaseProgram(prog));
+        }
         GGML_LOG_INFO("ggml_opencl: q4_0 cok+dp4a narrow GEMM %s (rows=%d COK_NSG=%d)\n",
                       backend_ctx->kernel_gemm_cok_q4_0_q8_1_dp4a ? "loaded" : "UNAVAILABLE",
                       backend_ctx->q40_cok_dp4a_rows, backend_ctx->q40_cok_dp4a_nsg);
@@ -35267,6 +35282,81 @@ static void ggml_cl_mul_mat_q4_0_f32_adreno_ila(ggml_backend_t backend, const gg
     int M = ne01;
     int N = ne1;
     int K = ne00;
+
+    // Verify widths 2..4 on the bin layout: the int8 cooperative-K GEMM this backend runs
+    // there for the noshuffle layout, built over the bin plane. Same gate and host sequence.
+    // GGML_OPENCL_Q4_0_BIN_DP4AN=0 turns it off.
+    static const bool bin_dp4an_off = ggml_cl_env_flag_zero("GGML_OPENCL_Q4_0_BIN_DP4AN");
+    if (!bin_dp4an_off && ne1 >= 2 && ne1 <= 4 &&
+        ggml_cl_cok_have_q40(backend_ctx) &&
+        ggml_cl_cok_dp4a_narrow_on(backend_ctx, ne1, ne01, ne00, backend_ctx->q40_cok_dp4a_rows) &&
+        ((ne1 <= 2) ? backend_ctx->kernel_gemm_cok_q4_0_q8_1_dp4a_bin_c2
+                    : backend_ctx->kernel_gemm_cok_q4_0_q8_1_dp4a_bin) != nullptr) {
+
+            const int N40 = (int)ne1, K40 = (int)ne00;
+            const int w40 = (N40 <= 2) ? 2 : 4;
+
+            cl_mem a_sub40 = nullptr;
+            region.origin = offset1;
+            region.size   = (size_t)K40 * N40 * sizeof(float);
+            CL_CHECK((a_sub40 = clCreateSubBuffer(extra1->data_device, 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &err), err));
+
+            // Allocated at the KERNEL's width so no column index is clamped -- clamping made
+            // several lanes load the same address and cost 20% at one width.
+            const size_t nb40  = (size_t)w40 * (K40 / 32);
+            const size_t qa40  = (size_t)w40 * K40 * sizeof(cl_char);
+            const size_t was40 = backend_ctx->prealloc_moe_qa.size;
+            const size_t wasd40 = backend_ctx->prealloc_moe_da.size;
+            backend_ctx->prealloc_moe_qa.allocate(context, qa40);
+            backend_ctx->prealloc_moe_da.allocate(context, nb40 * sizeof(cl_half));
+            backend_ctx->prealloc_moe_sa.allocate(context, nb40 * sizeof(cl_half));
+            if (backend_ctx->prealloc_moe_qa.size != was40) {
+                const cl_char z8 = 0;
+                CL_CHECK(clEnqueueFillBuffer(backend_ctx->queue, backend_ctx->prealloc_moe_qa.buffer,
+                                             &z8, sizeof(z8), 0, backend_ctx->prealloc_moe_qa.size, 0, NULL, NULL));
+            }
+            if (backend_ctx->prealloc_moe_da.size != wasd40) {
+                const cl_half z16 = 0;
+                CL_CHECK(clEnqueueFillBuffer(backend_ctx->queue, backend_ctx->prealloc_moe_da.buffer,
+                                             &z16, sizeof(z16), 0, backend_ctx->prealloc_moe_da.size, 0, NULL, NULL));
+                CL_CHECK(clEnqueueFillBuffer(backend_ctx->queue, backend_ctx->prealloc_moe_sa.buffer,
+                                             &z16, sizeof(z16), 0, backend_ctx->prealloc_moe_sa.size, 0, NULL, NULL));
+            }
+
+            cl_int tbq40 = (cl_int)((size_t)N40 * (K40 / 32));
+            cl_kernel qk40 = backend_ctx->kernel_quant_a_q8_1;
+            CL_CHECK(clSetKernelArg(qk40, 0, sizeof(cl_mem), &a_sub40));
+            CL_CHECK(clSetKernelArg(qk40, 1, sizeof(cl_mem), &backend_ctx->prealloc_moe_qa.buffer));
+            CL_CHECK(clSetKernelArg(qk40, 2, sizeof(cl_mem), &backend_ctx->prealloc_moe_da.buffer));
+            CL_CHECK(clSetKernelArg(qk40, 3, sizeof(cl_mem), &backend_ctx->prealloc_moe_sa.buffer));
+            CL_CHECK(clSetKernelArg(qk40, 4, sizeof(cl_int), &tbq40));
+            size_t q40_local[1]  = { 64 };
+            size_t q40_global[1] = { (size_t)((((size_t)tbq40 + 63) / 64) * 64) };
+            backend_ctx->enqueue_ndrange_kernel(qk40, 1, q40_global, q40_local, dst);
+
+            cl_kernel ck40 = (N40 <= 2) ? backend_ctx->kernel_gemm_cok_q4_0_q8_1_dp4a_bin_c2
+                                        : backend_ctx->kernel_gemm_cok_q4_0_q8_1_dp4a_bin;
+            const cl_int clamp40 = w40;
+            CL_CHECK(clSetKernelArg(ck40, 0, sizeof(cl_mem),   &extra0_q4_0->q));
+            CL_CHECK(clSetKernelArg(ck40, 1, sizeof(cl_mem),   &extra0_q4_0->d));
+            CL_CHECK(clSetKernelArg(ck40, 2, sizeof(cl_mem),   &backend_ctx->prealloc_moe_qa.buffer));
+            CL_CHECK(clSetKernelArg(ck40, 3, sizeof(cl_mem),   &backend_ctx->prealloc_moe_da.buffer));
+            CL_CHECK(clSetKernelArg(ck40, 4, sizeof(cl_mem),   &extrad->data_device));
+            CL_CHECK(clSetKernelArg(ck40, 5, sizeof(cl_ulong), &offsetd));
+            CL_CHECK(clSetKernelArg(ck40, 6, sizeof(cl_int),   &ne01));
+            CL_CHECK(clSetKernelArg(ck40, 7, sizeof(cl_int),   &clamp40));
+            CL_CHECK(clSetKernelArg(ck40, 8, sizeof(cl_int),   &ne00));
+            CL_CHECK(clSetKernelArg(ck40, 9, sizeof(cl_int),   &ne1));
+
+            const size_t nsg40d = (size_t)((N40 <= 2) ? backend_ctx->q40_cok_dp4a_bin_nsg_c2
+                                                      : backend_ctx->q40_cok_dp4a_bin_nsg);
+            size_t c40_local[3]  = { 64, nsg40d, 1 };
+            size_t c40_global[3] = { (size_t)(ne01 / backend_ctx->q40_cok_dp4a_rows), nsg40d, 1 };
+            backend_ctx->enqueue_ndrange_kernel(ck40, 3, c40_global, c40_local, dst);
+
+            CL_CHECK(clReleaseMemObject(a_sub40));
+            return;
+            }
 
     // Speculative-verify widths on a weight in the bin layout: this backend's eight-column
     // cooperative-K dp4a GEMM over the bin plane, instead of the bin GEMM padded to its tile.
