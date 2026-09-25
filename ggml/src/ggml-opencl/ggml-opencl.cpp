@@ -35317,11 +35317,13 @@ static void ggml_cl_mul_mat_q4_0_f32_adreno_ila(ggml_backend_t backend, const gg
     int N = ne1;
     int K = ne00;
 
-    // Verify widths 2..4 on the bin layout: the int8 cooperative-K GEMM this backend runs
-    // there for the noshuffle layout, built over the bin plane. Same gate and host sequence.
-    // GGML_OPENCL_Q4_0_BIN_DP4AN=0 turns it off.
-    static const bool bin_dp4an_off = ggml_cl_env_flag_zero("GGML_OPENCL_Q4_0_BIN_DP4AN");
-    if (!bin_dp4an_off && ne1 >= 2 && ne1 <= 4 &&
+    // Verify widths 2..4 on the bin layout through the int8 narrow cooperative-K GEMM. OPT-IN
+    // (GGML_OPENCL_Q4_0_BIN_DP4AN=1): on this layout the eight-column kernel below serves
+    // these widths faster (X2-90 test-backend-ops perf, ne1 2..4: 0.43-0.99x the noshuffle
+    // dispatch, against 1.02-1.15x for this kernel).
+    static const bool bin_dp4an_on = ggml_cl_env_flag("GGML_OPENCL_Q4_0_BIN_DP4AN") &&
+                                     !ggml_cl_env_flag_zero("GGML_OPENCL_Q4_0_BIN_DP4AN");
+    if (bin_dp4an_on && ne1 >= 2 && ne1 <= 4 &&
         ggml_cl_cok_have_q40(backend_ctx) &&
         ggml_cl_cok_dp4a_narrow_on(backend_ctx, ne1, ne01, ne00, backend_ctx->q40_cok_dp4a_rows) &&
         ((ne1 <= 2) ? backend_ctx->kernel_gemm_cok_q4_0_q8_1_dp4a_bin_c2
@@ -35395,9 +35397,10 @@ static void ggml_cl_mul_mat_q4_0_f32_adreno_ila(ggml_backend_t backend, const gg
     // Speculative-verify widths on a weight in the bin layout: this backend's eight-column
     // cooperative-K dp4a GEMM over the bin plane, instead of the bin GEMM padded to its tile.
     // Same host sequence as the noshuffle path. GGML_OPENCL_Q4_0_BIN_COK=0 turns it off;
-    // GGML_OPENCL_Q4_0_BIN_COK_MINN sets the narrowest width it takes (default 5).
+    // GGML_OPENCL_Q4_0_BIN_COK_MINN sets the narrowest width it takes (default 2: it computes
+    // eight columns regardless, and still beats the noshuffle dispatch at 2..4).
     static const bool bin_cok_off  = ggml_cl_env_flag_zero("GGML_OPENCL_Q4_0_BIN_COK");
-    static const int  bin_cok_minn = ggml_cl_env_int("GGML_OPENCL_Q4_0_BIN_COK_MINN", 5);
+    static const int  bin_cok_minn = ggml_cl_env_int("GGML_OPENCL_Q4_0_BIN_COK_MINN", 2);
     if (!bin_cok_off && ne1 >= bin_cok_minn && ne1 <= 8 &&
         ggml_cl_cok_have_q40_cok8(backend_ctx) &&
         ggml_cl_cok8_dp4a_on(backend_ctx, 5, ne01, ne00, backend_ctx->q40_cok8_rows) &&
