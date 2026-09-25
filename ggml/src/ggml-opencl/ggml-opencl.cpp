@@ -38400,7 +38400,14 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno_ila(ggml_backend_t backend, const gg
         backend_ctx->enqueue_ndrange_kernel(qk8, 1, q8_global, q8_local, dst);
 
         const int base_wg8 = ne01 / 256;
-        const int ksplit8  = ggml_opencl_cok_ksplit(backend_ctx, base_wg8, kb8);
+        int ksplit8 = ggml_opencl_cok_ksplit(backend_ctx, base_wg8, kb8);
+        // A K-split set for the noshuffle q4_K dp4a GEMM (GGML_OPENCL_Q4K_DP4A_KSPLIT, part of a
+        // speculative-decode config) applies to its bin-layout counterpart too: muse-glimmer's
+        // verify pass at widths 6..8 and depth 3584, X2-90, 192.2 -> 189.6 ms with it.
+        static const int q4k_bin_ksplit_env = []{
+            const char * e = getenv("GGML_OPENCL_Q4K_DP4A_KSPLIT"); return e ? atoi(e) : 0;
+        }();
+        if (q4k_bin_ksplit_env > 0) { ksplit8 = MIN(q4k_bin_ksplit_env, kb8); }
         cl_mem   out8   = extrad->data_device;
         cl_ulong outoff = offsetd;
         if (ksplit8 > 1) {
@@ -40148,6 +40155,12 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno_ila(ggml_backend_t backend, const gg
             if (q6k_cok8_splitk_on && !q6k_cok8_splitk_pinned && ne01 >= 131072 && ksplit8 < 4 && kb8 >= 4) {
                 ksplit8 = 4;
             }
+            // As for the q4_K bin kernel: a K-split set for the noshuffle q6_K dp4a GEMM
+            // (GGML_OPENCL_Q6K_DP4A_KSPLIT) applies here too.
+            static const int q6k_bin_ksplit_env = []{
+                const char * e = getenv("GGML_OPENCL_Q6K_DP4A_KSPLIT"); return e ? atoi(e) : 0;
+            }();
+            if (q6k_bin_ksplit_env > 0) { ksplit8 = MIN(q6k_bin_ksplit_env, kb8); }
 
             if (getenv("GGML_OPENCL_Q40_COK_PROBE")) {
                 static int n_q6k_cok8_probe = 0;
