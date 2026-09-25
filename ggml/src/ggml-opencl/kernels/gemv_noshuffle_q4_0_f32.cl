@@ -11,6 +11,23 @@
 #define QK4_0 32
 #define N_SIMDGROUP 4
 
+// Weight fetch for K-groups J and J+1 of rows 2*gid_s and 2*gid_s+1, as two noshuffle texels
+// (each: two rows x four K, low half the even row). Q40_BIN reads the bin (32b-transposed)
+// plane instead, where texel u*M + row holds one row's eight K, and rebuilds the same two
+// texels from the halves of the two rows' words, so the arithmetic below is unchanged.
+#ifdef Q40_BIN
+#define Q40_LD2(d0, d1, IMG, J) {                                                        \
+    const uint q40_u  = (4 * k + ((J) >> 1)) * M + 2 * gid_s;                            \
+    const uint q40_w0 = read_imageui(IMG, (int)(q40_u    )).x;                            \
+    const uint q40_w1 = read_imageui(IMG, (int)(q40_u + 1)).x;                            \
+    d0 = (q40_w0 & 0xFFFFu) | (q40_w1 << 16);                                            \
+    d1 = (q40_w0 >> 16)     | (q40_w1 & 0xFFFF0000u); }
+#else
+#define Q40_LD2(d0, d1, IMG, J) {                                                        \
+    d0 = read_imageui(IMG, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * (J))).x;        \
+    d1 = read_imageui(IMG, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * ((J) + 1))).x; }
+#endif
+
 #define dequantizeBlockAccum_ns_sgbroadcast_1_hi(total_sums, bits4, scale, y) \
     float shared_y; \
     shared_y = sub_group_broadcast(y.s0, 0); \
@@ -238,20 +255,16 @@ __kernel void kernel_gemv_noshuffle_q4_0_f32(
         }
 
         // load half weights for two blocks in consecutive rows
-        regA.s0 = read_imageui(src0_q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 0)).x;
-        regA.s1 = read_imageui(src0_q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 1)).x;
-        regA.s2 = read_imageui(src0_q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 2)).x;
-        regA.s3 = read_imageui(src0_q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 3)).x;
+        Q40_LD2(regA.s0, regA.s1, src0_q, 0);
+        Q40_LD2(regA.s2, regA.s3, src0_q, 2);
 #ifdef VECTOR_SUB_GROUP_BROADCAST
         dequantizeBlockAccum_ns_sgbroadcast_8_hi(totalSum, as_ushort8(regA), regS, regB);
 #else
         dequantizeBlockAccum_ns_sgbroadcast_1_hi(totalSum, as_ushort8(regA), regS, regB);
 #endif // VECTOR_SUB_GROUP_BROADCAST
 
-        regA.s0 = read_imageui(src0_q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 4)).x;
-        regA.s1 = read_imageui(src0_q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 5)).x;
-        regA.s2 = read_imageui(src0_q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 6)).x;
-        regA.s3 = read_imageui(src0_q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 7)).x;
+        Q40_LD2(regA.s0, regA.s1, src0_q, 4);
+        Q40_LD2(regA.s2, regA.s3, src0_q, 6);
 #ifdef VECTOR_SUB_GROUP_BROADCAST
         dequantizeBlockAccum_ns_sgbroadcast_8_lo(totalSum, as_ushort8(regA), regS, regB);
 #else
@@ -349,14 +362,10 @@ __kernel void kernel_gemv_noshuffle_q4_0_f32_mc3(
         regS = src0_d[gid_s + k * LINE_STRIDE_A];
 
         // weights loaded ONCE, reused across the columns
-        regA_hi.s0 = read_imageui(src0_q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 0)).x;
-        regA_hi.s1 = read_imageui(src0_q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 1)).x;
-        regA_hi.s2 = read_imageui(src0_q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 2)).x;
-        regA_hi.s3 = read_imageui(src0_q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 3)).x;
-        regA_lo.s0 = read_imageui(src0_q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 4)).x;
-        regA_lo.s1 = read_imageui(src0_q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 5)).x;
-        regA_lo.s2 = read_imageui(src0_q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 6)).x;
-        regA_lo.s3 = read_imageui(src0_q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 7)).x;
+        Q40_LD2(regA_hi.s0, regA_hi.s1, src0_q, 0);
+        Q40_LD2(regA_hi.s2, regA_hi.s3, src0_q, 2);
+        Q40_LD2(regA_lo.s0, regA_lo.s1, src0_q, 4);
+        Q40_LD2(regA_lo.s2, regA_lo.s3, src0_q, 6);
 
         MC_COL_Q40(ts0, 0);
         MC_COL_Q40(ts1, 1);
@@ -455,14 +464,10 @@ __kernel void kernel_gemv_noshuffle_q4_0_f32_mc3_splitk(
     for (uint k = kslice * nsg + groupId; k < (K / QK4_0); k += ksplit * nsg) {
         regS = src0_d[gid_s + k * LINE_STRIDE_A];
 
-        regA_hi.s0 = read_imageui(src0_q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 0)).x;
-        regA_hi.s1 = read_imageui(src0_q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 1)).x;
-        regA_hi.s2 = read_imageui(src0_q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 2)).x;
-        regA_hi.s3 = read_imageui(src0_q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 3)).x;
-        regA_lo.s0 = read_imageui(src0_q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 4)).x;
-        regA_lo.s1 = read_imageui(src0_q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 5)).x;
-        regA_lo.s2 = read_imageui(src0_q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 6)).x;
-        regA_lo.s3 = read_imageui(src0_q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 7)).x;
+        Q40_LD2(regA_hi.s0, regA_hi.s1, src0_q, 0);
+        Q40_LD2(regA_hi.s2, regA_hi.s3, src0_q, 2);
+        Q40_LD2(regA_lo.s0, regA_lo.s1, src0_q, 4);
+        Q40_LD2(regA_lo.s2, regA_lo.s3, src0_q, 6);
 
         MC_COL_Q40(ts0, 0);
         MC_COL_Q40(ts1, 1);
@@ -546,19 +551,15 @@ __kernel void kernel_gemv_noshuffle_q4_0_f32_splitk(
             regB.s0123 = read_imagef(src1, (slid * 2 + k * 8));
             regB.s4567 = read_imagef(src1, (1 + slid * 2 + k * 8));
         }
-        regA.s0 = read_imageui(src0_q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 0)).x;
-        regA.s1 = read_imageui(src0_q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 1)).x;
-        regA.s2 = read_imageui(src0_q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 2)).x;
-        regA.s3 = read_imageui(src0_q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 3)).x;
+        Q40_LD2(regA.s0, regA.s1, src0_q, 0);
+        Q40_LD2(regA.s2, regA.s3, src0_q, 2);
 #ifdef VECTOR_SUB_GROUP_BROADCAST
         dequantizeBlockAccum_ns_sgbroadcast_8_hi(totalSum, as_ushort8(regA), regS, regB);
 #else
         dequantizeBlockAccum_ns_sgbroadcast_1_hi(totalSum, as_ushort8(regA), regS, regB);
 #endif
-        regA.s0 = read_imageui(src0_q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 4)).x;
-        regA.s1 = read_imageui(src0_q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 5)).x;
-        regA.s2 = read_imageui(src0_q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 6)).x;
-        regA.s3 = read_imageui(src0_q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 7)).x;
+        Q40_LD2(regA.s0, regA.s1, src0_q, 4);
+        Q40_LD2(regA.s2, regA.s3, src0_q, 6);
 #ifdef VECTOR_SUB_GROUP_BROADCAST
         dequantizeBlockAccum_ns_sgbroadcast_8_lo(totalSum, as_ushort8(regA), regS, regB);
 #else
@@ -668,15 +669,11 @@ __kernel void kernel_gemv_noshuffle_q4_0_f32_glu(
             regB.s0123 = read_imagef(src1, (slid * 2 + k * 8));                    \
             regB.s4567 = read_imagef(src1, (1 + slid * 2 + k * 8));                \
         }                                                                          \
-        regA.s0 = read_imageui(Q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 0)).x;\
-        regA.s1 = read_imageui(Q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 1)).x;\
-        regA.s2 = read_imageui(Q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 2)).x;\
-        regA.s3 = read_imageui(Q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 3)).x;\
+        Q40_LD2(regA.s0, regA.s1, Q, 0); \
+        Q40_LD2(regA.s2, regA.s3, Q, 2); \
         Q40_DEQ_HI(SUM, as_ushort8(regA), regS, regB);                             \
-        regA.s0 = read_imageui(Q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 4)).x;\
-        regA.s1 = read_imageui(Q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 5)).x;\
-        regA.s2 = read_imageui(Q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 6)).x;\
-        regA.s3 = read_imageui(Q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 7)).x;\
+        Q40_LD2(regA.s0, regA.s1, Q, 4); \
+        Q40_LD2(regA.s2, regA.s3, Q, 6); \
         Q40_DEQ_LO(SUM, as_ushort8(regA), regS, regB);                             \
     }
     Q40_GLU_LOOP(gateSum, src0g_q, src0g_d)

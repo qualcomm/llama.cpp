@@ -1995,6 +1995,9 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemv_noshuffle_q4_0_f32_glu;     // fused gate+up GEMV + GLU (q4_0 FFN)
     cl_kernel kernel_gemm_noshuffle_q4_0_f32_32b_trans_ila_a8_bin;
     cl_kernel kernel_gemv_noshuffle_q4_0_f32_32b_trans_splitk = nullptr; // bin GEMV, K split over workgroups
+    cl_kernel kernel_gemv_noshuffle_q4_0_f32_bin        = nullptr;  // noshuffle GEMV family built over the bin plane
+    cl_kernel kernel_gemv_noshuffle_q4_0_f32_splitk_bin = nullptr;
+    cl_kernel kernel_gemv_noshuffle_q4_0_f32_glu_bin    = nullptr;
     cl_kernel kernel_gemm_noshuffle_q4_0_q8_1_dp4a_ila_a8_bin;
     cl_kernel kernel_gemv_noshuffle_q4_0_f32_32b_trans;
     cl_kernel kernel_gemv_noshuffle_q4_0_f32_4096_1_11008;
@@ -8757,6 +8760,22 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q4_0_f32_splitk = clCreateKernel(prog, "kernel_gemv_noshuffle_q4_0_f32_splitk", &err), err));
         CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q4_0_f32_glu = clCreateKernel(prog, "kernel_gemv_noshuffle_q4_0_f32_glu", &err), err));
         CL_CHECK(clReleaseProgram(prog));
+
+        // The same kernels over the bin (32b-transposed) plane that a QPM kernel library's
+        // q4_0 GEMMs use: only the weight fetch differs (Q40_LD2 in the kernel source).
+        if (backend_ctx->gpu_family == GPU_FAMILY::ADRENO) {
+            cl_program prog_bin = build_program_from_source(backend_ctx, kernel_src_CL_gemv_general.c_str(),
+                                                            CL_gemv_compile_opts + " -DQ40_BIN");
+            if (prog_bin) {
+                backend_ctx->kernel_gemv_noshuffle_q4_0_f32_bin        = clCreateKernel(prog_bin, "kernel_gemv_noshuffle_q4_0_f32", &err);
+                if (err != CL_SUCCESS) { backend_ctx->kernel_gemv_noshuffle_q4_0_f32_bin = nullptr; }
+                backend_ctx->kernel_gemv_noshuffle_q4_0_f32_splitk_bin = clCreateKernel(prog_bin, "kernel_gemv_noshuffle_q4_0_f32_splitk", &err);
+                if (err != CL_SUCCESS) { backend_ctx->kernel_gemv_noshuffle_q4_0_f32_splitk_bin = nullptr; }
+                backend_ctx->kernel_gemv_noshuffle_q4_0_f32_glu_bin    = clCreateKernel(prog_bin, "kernel_gemv_noshuffle_q4_0_f32_glu", &err);
+                if (err != CL_SUCCESS) { backend_ctx->kernel_gemv_noshuffle_q4_0_f32_glu_bin = nullptr; }
+                CL_CHECK(clReleaseProgram(prog_bin));
+            }
+        }
         GGML_LOG_CONT(".");
     }
 
@@ -15834,9 +15853,13 @@ static bool ggml_opencl_can_fuse(const ggml_backend_opencl_context * backend_ctx
         }
         // Same as for q4_K below: a weight in the bin (32b-transposed) layout cannot be read
         // by the fused noshuffle GEMV, which would silently compute garbage.
-        if (wg_q4_0 && (use_q4_0_bin_kernels(backend_ctx, gate->src[0]) ||
-                        use_q4_0_bin_kernels(backend_ctx, up->src[0]))) {
-            return false;
+        if (wg_q4_0) {
+            const bool bin_g = use_q4_0_bin_kernels(backend_ctx, gate->src[0]);
+            const bool bin_u = use_q4_0_bin_kernels(backend_ctx, up->src[0]);
+            // both in the bin layout: the bin build of the fused kernel serves them
+            if ((bin_g || bin_u) && !(bin_g && bin_u && backend_ctx->kernel_gemv_noshuffle_q4_0_f32_glu_bin != nullptr)) {
+                return false;
+            }
         }
         const bool wg_iq2_xxs = gate->src[0]->type == GGML_TYPE_IQ2_XXS;
         if (wg_iq2_xxs) {
@@ -28046,7 +28069,10 @@ static void ggml_cl_mul_mat_q4_0_glu_fused(ggml_backend_t backend, ggml_tensor *
     img_desc.buffer      = b_sub_buf;
     CL_CHECK((b_img = clCreateImage(context, CL_MEM_READ_ONLY, &img_fmt, &img_desc, NULL, &err), err));
 
-    cl_kernel kernel = backend_ctx->kernel_gemv_noshuffle_q4_0_f32_glu;
+    // Same R32UI view either way: the bin plane has the same texel count (M*K/8).
+    cl_kernel kernel = use_q4_0_bin_kernels(backend_ctx, Wg)
+                     ? backend_ctx->kernel_gemv_noshuffle_q4_0_f32_glu_bin
+                     : backend_ctx->kernel_gemv_noshuffle_q4_0_f32_glu;
     CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),   &qg_img));
     CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem),   &extra_g->d));
     CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem),   &qu_img));
@@ -35487,32 +35513,33 @@ static void ggml_cl_mul_mat_q4_0_f32_adreno_ila(ggml_backend_t backend, const gg
         img_desc.buffer      = b_sub_buf;
         CL_CHECK((b_img = clCreateImage(context, CL_MEM_READ_ONLY, &img_fmt, &img_desc, NULL, &err), err));
 
-        // Split K across workgroups where the output alone cannot fill the GPU, with the
-        // noshuffle q4_0 GEMV's rule (X2E, m <= 4096, ~24 workgroups). This kernel is one row
-        // per lane, so its base workgroup count is m/64.
-        static const bool bin_splitk_off = ggml_cl_env_flag_zero("GGML_OPENCL_Q4_0_BIN_SPLITK");
-        if (!bin_splitk_off && backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E && ne01 <= 4096 &&
-            backend_ctx->kernel_gemv_noshuffle_q4_0_f32_32b_trans_splitk != nullptr) {
-            const int base_wg = (int)CEIL_DIV(ne01, 64);
+        // This backend's two-rows-per-lane q4_0 GEMV family, built over the bin plane: it
+        // shares each broadcast of B across two rows where the one-row bin GEMV does not,
+        // and splits K across workgroups with the noshuffle rule (X2E, m <= 4096).
+        // GGML_OPENCL_Q4_0_BIN_GEMV2=0 keeps the one-row kernel.
+        static const bool bin_gemv2_off = ggml_cl_env_flag_zero("GGML_OPENCL_Q4_0_BIN_GEMV2");
+        if (!bin_gemv2_off && (M % 2) == 0 &&
+            backend_ctx->kernel_gemv_noshuffle_q4_0_f32_bin && backend_ctx->kernel_gemv_noshuffle_q4_0_f32_splitk_bin) {
+            const int  base_wg = (int)CEIL_DIV(M / 2, 64);
             int ksplit = (24 + base_wg - 1) / base_wg;
             ksplit = ksplit < 1 ? 1 : (ksplit > 8 ? 8 : ksplit);
-            if (ksplit > 1) {
-                const cl_int ks_arg = ksplit;
-                backend_ctx->prealloc_splitk_partial.allocate(context, (size_t)ksplit * ne01 * sizeof(float));
+            const bool split = backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E && M <= 4096 && ksplit > 1;
+            const size_t gx = (size_t)CEIL_DIV(M / 2, 64) * 64;
+            if (split) {
+                backend_ctx->prealloc_splitk_partial.allocate(context, (size_t)ksplit * M * sizeof(float));
                 cl_mem partial = backend_ctx->prealloc_splitk_partial.buffer;
-                cl_kernel ks = backend_ctx->kernel_gemv_noshuffle_q4_0_f32_32b_trans_splitk;
+                cl_kernel ks = backend_ctx->kernel_gemv_noshuffle_q4_0_f32_splitk_bin;
                 CL_CHECK(clSetKernelArg(ks, 0, sizeof(cl_mem), &extra0_q4_0->q_img));
                 CL_CHECK(clSetKernelArg(ks, 1, sizeof(cl_mem), &extra0_q4_0->d));
                 CL_CHECK(clSetKernelArg(ks, 2, sizeof(cl_mem), &b_img));
                 CL_CHECK(clSetKernelArg(ks, 3, sizeof(cl_mem), &partial));
                 CL_CHECK(clSetKernelArg(ks, 4, sizeof(cl_int), &K));
                 CL_CHECK(clSetKernelArg(ks, 5, sizeof(cl_int), &M));
-                CL_CHECK(clSetKernelArg(ks, 6, sizeof(cl_int), &ks_arg));
-                size_t wavesize = backend_ctx->adreno_wave_size;
-                size_t lsk[3] = { wavesize, 4, 1 };
-                size_t gsk[3] = { (size_t)CEIL_DIV(M, 64) * 64, (size_t)(4 * ksplit), 1 };
+                size_t lsk[3] = { 64, 4, 1 };
+                size_t gsk[3] = { gx, (size_t)(4 * ksplit), 1 };
                 backend_ctx->enqueue_ndrange_kernel(ks, 3, gsk, lsk, dst);
 
+                const cl_int ks_arg = ksplit;
                 cl_kernel kr = backend_ctx->kernel_gemv_splitk_reduce_f32;
                 CL_CHECK(clSetKernelArg(kr, 0, sizeof(cl_mem),   &partial));
                 CL_CHECK(clSetKernelArg(kr, 1, sizeof(cl_mem),   &extrad->data_device));
@@ -35522,11 +35549,32 @@ static void ggml_cl_mul_mat_q4_0_f32_adreno_ila(ggml_backend_t backend, const gg
                 size_t lr[3] = { 64, 1, 1 };
                 size_t gr[3] = { (size_t)CEIL_DIV(M, 64) * 64, 1, 1 };
                 backend_ctx->enqueue_ndrange_kernel(kr, 3, gr, lr, dst);
-
-                CL_CHECK(clReleaseMemObject(b_sub_buf));
-                CL_CHECK(clReleaseMemObject(b_img));
-                return;
+            } else {
+                const int      one = 1;
+                const cl_ulong zero = 0;
+                cl_kernel kb = backend_ctx->kernel_gemv_noshuffle_q4_0_f32_bin;
+                CL_CHECK(clSetKernelArg(kb,  0, sizeof(cl_mem),   &extra0_q4_0->q_img));
+                CL_CHECK(clSetKernelArg(kb,  1, sizeof(cl_mem),   &extra0_q4_0->d));
+                CL_CHECK(clSetKernelArg(kb,  2, sizeof(cl_mem),   &b_img));
+                CL_CHECK(clSetKernelArg(kb,  3, sizeof(cl_ulong), &zero));
+                CL_CHECK(clSetKernelArg(kb,  4, sizeof(cl_mem),   &extrad->data_device));
+                CL_CHECK(clSetKernelArg(kb,  5, sizeof(cl_ulong), &offsetd));
+                CL_CHECK(clSetKernelArg(kb,  6, sizeof(int),      &K));
+                CL_CHECK(clSetKernelArg(kb,  7, sizeof(int),      &M));
+                CL_CHECK(clSetKernelArg(kb,  8, sizeof(int),      &one));
+                CL_CHECK(clSetKernelArg(kb,  9, sizeof(int),      &K));
+                CL_CHECK(clSetKernelArg(kb, 10, sizeof(int),      &one));
+                CL_CHECK(clSetKernelArg(kb, 11, sizeof(int),      &M));
+                CL_CHECK(clSetKernelArg(kb, 12, sizeof(int),      &one));
+                CL_CHECK(clSetKernelArg(kb, 13, sizeof(int),      &one));
+                CL_CHECK(clSetKernelArg(kb, 14, sizeof(int),      &one));
+                size_t lb[3] = { 64, 4, 1 };
+                size_t gb[3] = { gx, 4, 1 };
+                backend_ctx->enqueue_ndrange_kernel(kb, 3, gb, lb, dst);
             }
+            CL_CHECK(clReleaseMemObject(b_sub_buf));
+            CL_CHECK(clReleaseMemObject(b_img));
+            return;
         }
 
         kernel = backend_ctx->kernel_gemv_noshuffle_q4_0_f32_32b_trans;
