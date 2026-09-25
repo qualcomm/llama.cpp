@@ -18050,6 +18050,10 @@ inline bool use_q4_0_bin_kernels(const ggml_backend_opencl_context *backend_ctx,
     if (!enabled) {
         return false;
     }
+    // The fusion and megakernel guards ask this of weights of any type.
+    if (tensor->type != GGML_TYPE_Q4_0) {
+        return false;
+    }
     if (!backend_ctx->kernel_gemv_noshuffle_q4_0_f32_32b_trans ||
         !backend_ctx->kernel_gemm_noshuffle_q4_0_f32_32b_trans_ila_a8_bin) {
         return false;
@@ -18300,6 +18304,10 @@ inline bool use_q6_k_bin_kernels(const ggml_backend_opencl_context *backend_ctx,
     if (!enabled) {
         return false;
     }
+    // The fusion and megakernel guards ask this of weights of any type.
+    if (tensor->type != GGML_TYPE_Q6_K) {
+        return false;
+    }
     if (!backend_ctx->kernel_gemv_noshuffle_q6_k_f32_32b_trans ||
         !backend_ctx->kernel_gemm_noshuffle_q6_k_f32_32b_trans_ila_a8_bin) {
         return false;
@@ -18325,6 +18333,10 @@ inline bool use_q4_k_bin_kernels(const ggml_backend_opencl_context *backend_ctx,
     // set_tensor and the dispatch must agree on the layout.
     static const bool enabled = ggml_cl_env_flag("GGML_OPENCL_Q4_K_BIN") && !ggml_cl_env_flag_zero("GGML_OPENCL_Q4_K_BIN");
     if (!enabled) {
+        return false;
+    }
+    // The fusion and megakernel guards ask this of weights of any type.
+    if (tensor->type != GGML_TYPE_Q4_K) {
         return false;
     }
     if (!backend_ctx->kernel_gemv_noshuffle_q4_k_f32_32b_trans ||
