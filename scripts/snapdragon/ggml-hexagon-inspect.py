@@ -5,6 +5,9 @@ ggml-hexagon-inspect.py - Hexagon DSP binary inspection and diagnostic tool.
 Inspects Hexagon ELF binaries (libggml-htp-v*.so) for:
   - Register spills (--spills): counts scalar and HVX vector stack spills,
     separating in-loop spills from frame setup/teardown.
+  - Soft-float promotions (--promotions): calls to __trunc*/__extend* helpers.
+  - Software divides (--swdiv): calls to __hexagon_udivdi3 and related
+    integer/float divide and modulo helpers, with source call sites.
   - Function disassembly (--disasm <func>): annotated disassembly showing
     hardware loop bounds, packet boundaries, and spill instructions.
   - Crash address resolution (--addr2line <addr...>): maps hex crash offsets
@@ -17,6 +20,10 @@ Usage:
   ./scripts/snapdragon/ggml-hexagon-inspect.py --spills
   ./scripts/snapdragon/ggml-hexagon-inspect.py --spills --func "^compute_"
   ./scripts/snapdragon/ggml-hexagon-inspect.py --spills --func "^compute_" --strict
+
+  # Find functions that call software divide helpers
+  ./scripts/snapdragon/ggml-hexagon-inspect.py --swdiv
+  ./scripts/snapdragon/ggml-hexagon-inspect.py --swdiv --inline --func "^op_cpy$"
 
   # Disassemble a function with annotated loop and spill markers
   ./scripts/snapdragon/ggml-hexagon-inspect.py --disasm compute_same_shape_div_f32
@@ -108,6 +115,9 @@ class FuncStats:
         self.promotions_in_loop = 0
         self.promotions_total = 0
         self.promotion_targets: Dict[str, int] = {}
+        self.swdivs_in_loop = 0
+        self.swdivs_total = 0
+        self.swdiv_sites: List[Tuple[int, str, bool]] = []
         self.calls_in_loop = 0
         self.calls_total = 0
         self.loops: List[LoopStats] = []
@@ -135,6 +145,9 @@ RE_ASSIGN_LHS = re.compile(r"^\s*(?:if\s*\([^)]+\)\s*)?(r[0-9]+)(?::(r[0-9]+))?\
 RE_VEC_OP = re.compile(r"\b(v[0-9]+|w[0-9]+|q[0-3]|vmemu?)\b")
 RE_PROMOTION_CALL = re.compile(
     r"\b(?:call|jump)\s+(?:0x[0-9a-fA-F]+\s+)?<(__(?:trunc|extend)[a-zA-Z0-9_]+)(?:@plt)?>"
+)
+RE_SWDIV_CALL = re.compile(
+    r"\b(?:call|jump)\s+(?:0x[0-9a-fA-F]+\s+)?<(__hexagon_(?:u?(?:div|mod)[sd]i3|div[sd]f3))(?:@plt)?>"
 )
 RE_ANY_CALL = re.compile(r"\bcallr?\b")
 
@@ -550,6 +563,12 @@ def parse_disassembly(
                     stats.promotion_targets[ptarget] = stats.promotion_targets.get(ptarget, 0) + 1
                     if in_loop:
                         stats.promotions_in_loop += 1
+                swdiv_m = RE_SWDIV_CALL.search(insn)
+                if swdiv_m:
+                    stats.swdivs_total += 1
+                    stats.swdiv_sites.append((cur_addr, swdiv_m.group(1), in_loop))
+                    if in_loop:
+                        stats.swdivs_in_loop += 1
 
                 stats.insns.append(
                     InsnInfo(
@@ -680,6 +699,7 @@ def annotate_disasm_line(
             is_event = True
 
     prom_m = RE_PROMOTION_CALL.search(asm_chunk)
+    swdiv_m = RE_SWDIV_CALL.search(asm_chunk)
     if prom_m:
         ptarget = prom_m.group(1)
         if in_loop:
@@ -687,6 +707,15 @@ def annotate_disasm_line(
             tags.append(f"\033[1;31m{tag}\033[0m" if use_color else tag)
         else:
             tag = f"[PROMOTION:{ptarget}]"
+            tags.append(f"\033[1;35m{tag}\033[0m" if use_color else tag)
+        is_event = True
+    elif swdiv_m:
+        dtarget = swdiv_m.group(1)
+        if in_loop:
+            tag = f"[SW-DIV:{dtarget}:IN-LOOP]"
+            tags.append(f"\033[1;31m{tag}\033[0m" if use_color else tag)
+        else:
+            tag = f"[SW-DIV:{dtarget}]"
             tags.append(f"\033[1;35m{tag}\033[0m" if use_color else tag)
         is_event = True
     elif RE_ANY_CALL.search(asm_chunk):
@@ -941,6 +970,97 @@ def run_promotions(
     return 0
 
 
+def run_swdiv(
+    toolchain: HexagonToolchain,
+    lib_path: Path,
+    args: argparse.Namespace,
+) -> int:
+    # Scan and report software divide/modulo helper calls across binary functions
+    logger.info(f"Inspecting library: {lib_path}")
+    disasm_text = toolchain.run_tool("hexagon-llvm-objdump", ["-d", str(lib_path)])
+
+    func_re = re.compile(args.func) if args.func else None
+    funcs = parse_disassembly(disasm_text, func_re)
+
+    reported = [f for f in funcs if args.all or f.swdivs_total > 0]
+
+    # Sort: in-loop divides desc, then total divides desc
+    reported.sort(key=lambda x: (x.swdivs_in_loop, x.swdivs_total), reverse=True)
+
+    use_color = not args.no_color and sys.stdout.isatty()
+
+    # Resolve call sites to source lines, falling back to function offsets without debug info
+    site_chains: Dict[int, List[str]] = {}
+    sites = [a for f in reported for a, _, _ in f.swdiv_sites]
+    if sites:
+        # With -i each address prints its inlined frames innermost first, one block per address;
+        # the last frame with a known line is the call site in the reported function itself
+        raw = toolchain.run_tool("hexagon-addr2line", ["-e", str(lib_path), "-a", "-i"] + [f"0x{a:x}" for a in sites])
+        for block in re.split(r"\n\s*\n", raw.strip()):
+            addr_line, *frames = block.strip().splitlines()
+            locs = [m for m in (re.match(r"^(.*?):(\d+)(?::\d+)?$", fr.strip()) for fr in frames) if m]
+            chain = [f"{os.path.basename(m.group(1))}:{m.group(2)}" for m in locs if m.group(1) != "??" and m.group(2) != "0"]
+            if chain:
+                site_chains[int(addr_line, 16)] = chain
+        if not site_chains:
+            logger.info("Note: no source line info in library (build with -g); showing call-site offsets instead.")
+
+    col_addr = "Address"
+    col_name = "Function"
+    col_inloop = "In-Loop"
+    col_tot = "Total"
+    col_sites = "Call Sites"
+
+    name_w = max([40] + [len(f.name) for f in reported])
+    hdr = f"{col_addr:<10} | {col_name:<{name_w}} | {col_inloop:>7} | {col_tot:>5} | {col_sites}"
+    sep = "-" * max(len(hdr), 110)
+
+    logger.info("\n" + sep)
+    logger.info(hdr)
+    logger.info(re.sub(r"[^|]", "-", hdr).ljust(len(sep), "-"))
+
+    tot_inloop = 0
+    tot_divs = 0
+    tot_funcs_with_divs = 0
+
+    for f in reported:
+        tot_inloop += f.swdivs_in_loop
+        tot_divs += f.swdivs_total
+        if f.swdivs_total > 0:
+            tot_funcs_with_divs += 1
+
+        inloop_str = f"{f.swdivs_in_loop:>7}"
+        if f.swdivs_in_loop > 0 and use_color:
+            inloop_str = f"\033[1;31m{inloop_str}\033[0m"
+
+        # Several calls can share a source line; list each location once
+        locs = [site_chains[a][-1] if a in site_chains else f"+0x{a - f.address:x}" for a, _, _ in f.swdiv_sites]
+        sites_str = ", ".join(dict.fromkeys(locs))
+        logger.info(
+            f"0x{f.address:08x} | {f.name:<{name_w}} | {inloop_str} | {f.swdivs_total:>5} | {sites_str}".rstrip()
+        )
+
+        # Per-call detail: helper and full inline chain, innermost (the divide itself) first
+        if args.inline:
+            helper_w = max(len(re.sub(r"^__hexagon_", "", h)) for _, h, _ in f.swdiv_sites)
+            for a, helper, in_loop in f.swdiv_sites:
+                chain = " <- ".join(site_chains.get(a, ["?"]))
+                loop_tag = " [IN-LOOP]" if in_loop else ""
+                if in_loop and use_color:
+                    loop_tag = f"\033[1;31m{loop_tag}\033[0m"
+                off = f"+0x{a - f.address:x}"
+                logger.info(f"    {off:<8} {re.sub(r'^__hexagon_', '', helper):<{helper_w}}  {chain}{loop_tag}")
+
+    logger.info(sep)
+    logger.info(
+        f"Total functions analyzed: {len(funcs)} | Reported: {len(reported)} | "
+        f"Functions with sw divides: {tot_funcs_with_divs} | "
+        f"Total sw divide calls: {tot_divs} | In-loop: {tot_inloop}"
+    )
+
+    return 0
+
+
 def run_disasm(
     toolchain: HexagonToolchain,
     lib_path: Path,
@@ -1005,7 +1125,8 @@ def run_disasm(
         )
         logger.info(
             f"Calls:    Total: {func_stats.calls_total} (in-loop: {func_stats.calls_in_loop}) | "
-            f"Float promotions: {func_stats.promotions_total} (in-loop: {func_stats.promotions_in_loop})"
+            f"Float promotions: {func_stats.promotions_total} (in-loop: {func_stats.promotions_in_loop}) | "
+            f"SW divides: {func_stats.swdivs_total} (in-loop: {func_stats.swdivs_in_loop})"
         )
         logger.info(hdr_border)
 
@@ -1064,7 +1185,7 @@ def run_disasm(
                         to_show[j] = True
 
             if not any(to_show):
-                logger.info("  (No spills, promotions, or in-loop calls detected in this function)\n")
+                logger.info("  (No spills, promotions, sw divides, or in-loop calls detected in this function)\n")
             else:
                 in_gap = False
                 for idx, show in enumerate(to_show):
@@ -1227,6 +1348,16 @@ def main():
         help="Scan binary and report functions with soft-float promotion calls (__trunc*, __extend*).",
     )
     parser.add_argument(
+        "--swdiv",
+        action="store_true",
+        help="Scan binary and report functions with software divide/modulo calls (__hexagon_udivdi3, __hexagon_udivsi3, ...).",
+    )
+    parser.add_argument(
+        "--inline",
+        action="store_true",
+        help="In --swdiv, list every call under its function with the helper and its inlined source chain.",
+    )
+    parser.add_argument(
         "--disasm",
         nargs="?",
         const="",
@@ -1236,7 +1367,7 @@ def main():
     parser.add_argument(
         "--spills-only",
         action="store_true",
-        help="In --disasm, only display packets containing spills, promotions, or in-loop calls, with surrounding context.",
+        help="In --disasm, only display packets containing spills, promotions, sw divides, or in-loop calls, with surrounding context.",
     )
     parser.add_argument(
         "-C",
@@ -1264,13 +1395,13 @@ def main():
         "--func",
         "--fn",
         "-f",
-        help="Regex filter for function names in --spills, --promotions, or --disasm.",
+        help="Regex filter for function names in --spills, --promotions, --swdiv, or --disasm.",
     )
     parser.add_argument(
         "--all",
         "-a",
         action="store_true",
-        help="Show all functions in table, even those with 0 spills/promotions.",
+        help="Show all functions in table, even those with 0 spills/promotions/sw divides.",
     )
     parser.add_argument(
         "--no-color",
@@ -1381,6 +1512,8 @@ def main():
         sys.exit(run_disasm(toolchain, lib_path, args))
     elif args.promotions:
         sys.exit(run_promotions(toolchain, lib_path, args))
+    elif args.swdiv:
+        sys.exit(run_swdiv(toolchain, lib_path, args))
     else:
         # Default action is --spills
         sys.exit(run_spills(toolchain, lib_path, args))
