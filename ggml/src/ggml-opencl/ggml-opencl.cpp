@@ -2181,7 +2181,6 @@ struct ggml_backend_opencl_context {
     int       q4k_cok_nsg_alt = 6;
     bool      q4k_cok_alt_built = false;
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_alt = nullptr;
-    cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_bin_alt = nullptr; // bin twin, alt COK_NSG
     // COK_NSG each cok program was COMPILED with, after narrowing to what the device
     // will actually launch. The dispatch must use these: COK_NSG sets both the
     // workgroup (64 x COK_NSG) and the K-slice axis, so launching 8 against a kernel
@@ -2195,6 +2194,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg = nullptr;
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr = nullptr;
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_bin = nullptr; // same, bin (32b-transposed) weights
+    cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_bin_r32 = nullptr; // R32UI reads, for wide launches
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r2_wimg_nr = nullptr;
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r4_nr = nullptr;
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r4_nrh = nullptr;
@@ -4537,9 +4537,6 @@ static void ggml_cl_cok_build_q4k_nsg_alt(ggml_backend_opencl_context * backend_
     backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_alt =
         clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr", &err);
     if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_alt = nullptr; }
-    backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_bin_alt =
-        clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_bin", &err);
-    if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_bin_alt = nullptr; }
     GGML_LOG_INFO("ggml_opencl: q4_K cok narrow-K-split program %s (COK_NSG=%d)\n",
                   backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_alt ? "loaded" : "UNAVAILABLE",
                   nsg_eff);
@@ -9436,6 +9433,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_bin =
             clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_bin", &err);
         if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_bin = nullptr; }
+        backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_bin_r32 =
+            clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_bin_r32", &err);
+        if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_bin_r32 = nullptr; }
         backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r2_wimg_nr =
             clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_f32_cok_r2_wimg_nr", &err);
         if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r2_wimg_nr = nullptr; }
@@ -38070,25 +38070,27 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno_ila(ggml_backend_t backend, const gg
         backend_ctx->enqueue_ndrange_kernel(tk, 2, t_global, t_local, dst);
 
         const cl_uchar mask_d6 = 0x3F, mask_d4 = 0x0F, mask_hi2 = 0xC0;
-        // The plane as RGBA32UI so a lane's four rows are one texel read.
+        // How the weight is read depends on the launch width (X2-90, test-backend-ops perf,
+        // widths 5..8): one RGBA32UI texel per four rows wins while the ne01/256 workgroups
+        // fit in one wave on the compute units (m=1024: 1.03x the noshuffle kernel against
+        // 1.11x), four R32UI reads win above it (m >= 6144: 1.06-1.09x against 1.24-1.27x).
+        // The narrow-K-split program the noshuffle kernel switches to there loses on this
+        // layout (1.37-1.44x) and is not used.
+        const bool wide = backend_ctx->compute_units > 0 &&
+                          (size_t)ne01 / 256 > (size_t)backend_ctx->compute_units &&
+                          backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_bin_r32 != nullptr;
         cl_mem q_img4 = nullptr;
-        img_fmt = { CL_RGBA, CL_UNSIGNED_INT32 };
-        memset(&img_desc, 0, sizeof(img_desc));
-        img_desc.image_type  = CL_MEM_OBJECT_IMAGE1D_BUFFER;
-        img_desc.image_width = (size_t)M * K / 32;
-        img_desc.buffer      = extra0_q4_k->q;
-        CL_CHECK((q_img4 = clCreateImage(context, CL_MEM_READ_ONLY, &img_fmt, &img_desc, NULL, &err), err));
-
-        // Same K-split rule as the noshuffle path: above one workgroup per compute unit the
-        // narrower split fits more workgroups per CU (ggml_cl_cok_build_q4k_nsg_alt).
-        static const bool nsg_alt_on = !ggml_cl_env_flag_zero("GGML_OPENCL_Q4K_COK_NSG_ALT");
-        const bool use_alt = nsg_alt_on && backend_ctx->compute_units > 0 &&
-                             (size_t)ne01 / 256 > (size_t)backend_ctx->compute_units &&
-                             ggml_cl_cok_have_q4k_nsg_alt(backend_ctx) &&
-                             backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_bin_alt != nullptr;
-        kernel = use_alt ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_bin_alt
-                         : backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_bin;
-        CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &q_img4));
+        if (!wide) {
+            img_fmt = { CL_RGBA, CL_UNSIGNED_INT32 };
+            memset(&img_desc, 0, sizeof(img_desc));
+            img_desc.image_type  = CL_MEM_OBJECT_IMAGE1D_BUFFER;
+            img_desc.image_width = (size_t)M * K / 32;
+            img_desc.buffer      = extra0_q4_k->q;
+            CL_CHECK((q_img4 = clCreateImage(context, CL_MEM_READ_ONLY, &img_fmt, &img_desc, NULL, &err), err));
+        }
+        kernel = wide ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_bin_r32
+                      : backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_bin;
+        CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   wide ? &extra0_q4_k->q_img : &q_img4));
         CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_mem),   &extra0_q4_k->s));
         CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),   &extra0_q4_k->d));
         CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_mem),   &extra0_q4_k->dm));
@@ -38103,12 +38105,14 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno_ila(ggml_backend_t backend, const gg
         CL_CHECK(clSetKernelArg(kernel, 12, sizeof(cl_uchar), &mask_d4));
         CL_CHECK(clSetKernelArg(kernel, 13, sizeof(cl_uchar), &mask_hi2));
 
-        const size_t nsg = use_alt ? (size_t)backend_ctx->q4k_cok_nsg_alt : (size_t)backend_ctx->q4k_cok_nsg;
+        const size_t nsg = (size_t)backend_ctx->q4k_cok_nsg;
         size_t local_work_size[3]  = { 64, nsg, 1 };
         size_t global_work_size[3] = { (size_t)(ne01 / 4), nsg, 1 };
         backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
 
-        CL_CHECK(clReleaseMemObject(q_img4));
+        if (q_img4) {
+            CL_CHECK(clReleaseMemObject(q_img4));
+        }
         CL_CHECK(clReleaseMemObject(b_img_trans));
         CL_CHECK(clReleaseMemObject(b_sub_buf_trans));
         CL_CHECK(clReleaseMemObject(b_img));
