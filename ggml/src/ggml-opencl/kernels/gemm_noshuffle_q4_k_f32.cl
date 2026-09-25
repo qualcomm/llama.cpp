@@ -1944,13 +1944,13 @@ kernel void kernel_gemm_noshuffle_q4_k_f32_cok_r8(
 }
 #endif  // !Q4K_COK_MINIMAL
 
-#ifndef Q4K_COK_MINIMAL
 
 // cok_r4_wimg_nr over the bin (32b-transposed) weight layout that the QPM kernel library's
 // q4_K GEMMs use. There a uint32 texel holds one row's eight consecutive-K nibbles
 // (texel u*m + row for K-group u), where the noshuffle layout holds four per ushort. So a
 // lane's four rows for eight K-values are four texels, read once and used twice: the low
-// halves for the first four K-values, the high halves for the next four. Everything else
+// halves for the first four K-values, the high halves for the next four. The host binds
+// the plane as RGBA32UI, so the four rows arrive in one 16-byte texel. Everything else
 // - the f16 N-major activation image, the scale/min math, the named-register reduction and
 // the store - is cok_r4_wimg_nr unchanged, so this is the same speculative-verify kernel
 // for a weight that stays in the bin layout for the prefill GEMM.
@@ -1984,7 +1984,7 @@ kernel void kernel_gemm_noshuffle_q4_k_f32_cok_r8(
 REQD_SUBGROUP_SIZE_64
 #endif
 kernel void kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_bin(
-    read_only image1d_buffer_t src0_q_img,   // bin layout, R32UI, texel u*m + row
+    read_only image1d_buffer_t src0_q_img,   // bin layout, RGBA32UI, texel (u*m + row)/4
     global const uchar  * src0_s,
     global const half   * src0_d,
     global const half   * src0_dm,
@@ -2038,15 +2038,10 @@ kernel void kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_bin(
 
         for (int l = 0; l < 32; l += 8) {
             int ki = i + l;
-            uint tex = (uint)(ki >> 3) * (uint)m + (uint)row0;
-            uint w0 = read_imageui(src0_q_img, (int)(tex    )).x;
-            uint w1 = read_imageui(src0_q_img, (int)(tex + 1)).x;
-            uint w2 = read_imageui(src0_q_img, (int)(tex + 2)).x;
-            uint w3 = read_imageui(src0_q_img, (int)(tex + 3)).x;
-            ushort4 lo = (ushort4)((ushort)(w0 & 0xFFFFu), (ushort)(w1 & 0xFFFFu),
-                                   (ushort)(w2 & 0xFFFFu), (ushort)(w3 & 0xFFFFu));
-            ushort4 hi = (ushort4)((ushort)(w0 >> 16), (ushort)(w1 >> 16),
-                                   (ushort)(w2 >> 16), (ushort)(w3 >> 16));
+            // row0 and m are multiples of 4, so the four rows are one RGBA32UI texel.
+            uint4 w = read_imageui(src0_q_img, (int)(((uint)(ki >> 3) * (uint)m + (uint)row0) >> 2));
+            ushort4 lo = convert_ushort4(w & 0xFFFFu);
+            ushort4 hi = convert_ushort4(w >> 16);
             COK_BIN_K4(lo, ki)
             COK_BIN_K4(hi, ki + 4)
         }
@@ -2103,4 +2098,3 @@ kernel void kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_bin(
         if (idx < m*n_no_padding) { vstore4((float4)(o0.s7, o1.s7, o2.s7, o3.s7), 0, dst + idx); idx += m; }
     }
 }
-#endif  // !Q4K_COK_MINIMAL
