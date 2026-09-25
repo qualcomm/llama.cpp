@@ -2040,13 +2040,11 @@ kernel void kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_bin(
             int ki = i + l;
             // row0 and m are multiples of 4, so the four rows are one RGBA32UI texel.
             uint4 w = read_imageui(src0_q_img, (int)(((uint)(ki >> 3) * (uint)m + (uint)row0) >> 2));
-            // Component-wise, not convert_ushort4(w & 0xFFFF) / convert_ushort4(w >> 16): the
-            // vector form compiles to much slower code on the X2-90 (1.22-1.27x the noshuffle
-            // kernel at m >= 6144 against 1.05-1.10x for this form, test-backend-ops perf).
-            ushort4 lo = (ushort4)((ushort)(w.s0 & 0xFFFFu), (ushort)(w.s1 & 0xFFFFu),
-                                   (ushort)(w.s2 & 0xFFFFu), (ushort)(w.s3 & 0xFFFFu));
-            ushort4 hi = (ushort4)((ushort)(w.s0 >> 16), (ushort)(w.s1 >> 16),
-                                   (ushort)(w.s2 >> 16), (ushort)(w.s3 >> 16));
+            // The vector conversion is the faster form for this (narrow-launch) variant; the
+            // wide-launch _r32 variant below takes the halves component by component, which is
+            // the faster form there (X2-90 test-backend-ops perf, widths 5..8).
+            ushort4 lo = convert_ushort4(w & 0xFFFFu);
+            ushort4 hi = convert_ushort4(w >> 16);
             COK_BIN_K4(lo, ki)
             COK_BIN_K4(hi, ki + 4)
         }

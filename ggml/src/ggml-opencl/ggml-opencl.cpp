@@ -2204,6 +2204,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr = nullptr;
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_bin = nullptr; // same, bin (32b-transposed) weights
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_bin_r32 = nullptr; // R32UI reads, for wide launches
+    cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_bin_r32_alt = nullptr; // same, narrow-K-split program
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r2_wimg_nr = nullptr;
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r4_nr = nullptr;
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r4_nrh = nullptr;
@@ -4571,6 +4572,9 @@ static void ggml_cl_cok_build_q4k_nsg_alt(ggml_backend_opencl_context * backend_
     backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_alt =
         clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr", &err);
     if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_alt = nullptr; }
+    backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_bin_r32_alt =
+        clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_bin_r32", &err);
+    if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_bin_r32_alt = nullptr; }
     GGML_LOG_INFO("ggml_opencl: q4_K cok narrow-K-split program %s (COK_NSG=%d)\n",
                   backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_alt ? "loaded" : "UNAVAILABLE",
                   nsg_eff);
@@ -38401,6 +38405,15 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno_ila(ggml_backend_t backend, const gg
         }
         kernel = wide ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_bin_r32
                       : backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_bin;
+        // Wide launches can also take the narrow-K-split program, as the noshuffle kernel does
+        // (GGML_OPENCL_Q4_K_BIN_ALT=1, measuring).
+        static const bool bin_alt_on = ggml_cl_env_flag("GGML_OPENCL_Q4_K_BIN_ALT") &&
+                                       !ggml_cl_env_flag_zero("GGML_OPENCL_Q4_K_BIN_ALT");
+        const bool use_alt = wide && bin_alt_on && ggml_cl_cok_have_q4k_nsg_alt(backend_ctx) &&
+                             backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_bin_r32_alt != nullptr;
+        if (use_alt) {
+            kernel = backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_bin_r32_alt;
+        }
         CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   wide ? &extra0_q4_k->q_img : &q_img4));
         CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_mem),   &extra0_q4_k->s));
         CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),   &extra0_q4_k->d));
@@ -38416,7 +38429,7 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno_ila(ggml_backend_t backend, const gg
         CL_CHECK(clSetKernelArg(kernel, 12, sizeof(cl_uchar), &mask_d4));
         CL_CHECK(clSetKernelArg(kernel, 13, sizeof(cl_uchar), &mask_hi2));
 
-        const size_t nsg = (size_t)backend_ctx->q4k_cok_nsg;
+        const size_t nsg = use_alt ? (size_t)backend_ctx->q4k_cok_nsg_alt : (size_t)backend_ctx->q4k_cok_nsg;
         size_t local_work_size[3]  = { 64, nsg, 1 };
         size_t global_work_size[3] = { (size_t)(ne01 / 4), nsg, 1 };
         backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
