@@ -39,7 +39,7 @@
 #define COK_BIN_COMP 1
 #endif
 #ifndef COK_BIN_SG
-#define COK_BIN_SG 4
+#define COK_BIN_SG 8
 #endif
 
 #define COK_PACK4(a, b, c, e)                                         \
@@ -298,7 +298,8 @@ kernel void kernel_gemm_cok8_q6_k_q8_1_dp4a_bin(
     // are: one 8-byte load per row fetches the four blocks' scales (they are row-major), and
     // the stream across the matrix stays as compact as the one-block interleave. X2-90,
     // 6656 x 19968 (muse-glimmer ffn_down) at widths 2..8: 1.17-1.30x the noshuffle kernel
-    // with one scalar load per block, 1.02-1.14x with this.
+    // with one scalar load per block, 1.02-1.14x with this, 0.97-1.09x with eight blocks per
+    // 16-byte load (COK_BIN_SG 8, the default).
     for (int bg = b_beg; bg * 4 < num_32blk; bg += nslice) {
     ushort4 sr0 = vload4(0, src0_s + (row0 + 0) * num_32blk + bg * 4);
     ushort4 sr1 = vload4(0, src0_s + (row0 + 1) * num_32blk + bg * 4);
