@@ -757,15 +757,16 @@ def run_spills(
     col_stot = "S-Tot"
     col_notes = "Notes"
 
+    name_w = max([40] + [len(f.name) for f in reported])
     hdr = (
-        f"{col_addr:<10} | {col_name:<40} | {col_pkts:>7} | {col_insn:>6} | "
+        f"{col_addr:<10} | {col_name:<{name_w}} | {col_pkts:>7} | {col_insn:>6} | "
         f"{col_vec:>7} | {col_vloop:>14} | {col_vtot:>5} | {col_sloop:>14} | {col_stot:>5} | {col_notes}"
     )
     sep = "-" * len(hdr)
 
     logger.info("\n" + sep)
     logger.info(hdr)
-    logger.info(sep)
+    logger.info(re.sub(r"[^|]", "-", hdr))
 
     tot_vloop = 0
     tot_sloop = 0
@@ -813,7 +814,7 @@ def run_spills(
         sloop_str = f"{sloop_detail:>14}"
 
         logger.info(
-            f"0x{f.address:08x} | {f.name:<40} | {f.packet_count:>7} | {f.insn_count:>6} | "
+            f"0x{f.address:08x} | {f.name:<{name_w}} | {f.packet_count:>7} | {f.insn_count:>6} | "
             f"{f.vec_insn_count:>7} | {vloop_str} | {f.vspills_total:>5} | {sloop_str} | {f.sspills_total:>5} | {notes}"
         )
 
@@ -877,12 +878,13 @@ def run_promotions(
     col_tot = "Total"
     col_targets = "Promotion Targets"
 
-    hdr = f"{col_addr:<10} | {col_name:<44} | {col_loop:>5} | {col_inloop:>7} | {col_tot:>5} | {col_targets}"
+    name_w = max([40] + [len(f.name) for f in reported])
+    hdr = f"{col_addr:<10} | {col_name:<{name_w}} | {col_loop:>5} | {col_inloop:>7} | {col_tot:>5} | {col_targets}"
     sep = "-" * max(len(hdr), 110)
 
     logger.info("\n" + sep)
     logger.info(hdr)
-    logger.info(sep)
+    logger.info(re.sub(r"[^|]", "-", hdr).ljust(len(sep), "-"))
 
     tot_inloop = 0
     tot_prom = 0
@@ -908,7 +910,7 @@ def run_promotions(
 
         targets_str = ", ".join(f"{t}: {c}" for t, c in sorted(f.promotion_targets.items()))
         logger.info(
-            f"0x{f.address:08x} | {f.name:<44} | {f.loop_count:>5} | {inloop_str} | {f.promotions_total:>5} | {targets_str}"
+            f"0x{f.address:08x} | {f.name:<{name_w}} | {f.loop_count:>5} | {inloop_str} | {f.promotions_total:>5} | {targets_str}"
         )
 
     logger.info(sep)
@@ -1009,13 +1011,14 @@ def run_disasm(
 
         # Print Loop Breakdown Table if function has loops
         if func_stats.loops:
-            logger.info(f"\n--- Loops ({len(func_stats.loops)}) " + "-" * 67)
             loop_hdr = (
-                f"{'#':<3} | {'Type':<5} | {'Address Range':<25} | {'Packets':>7} | "
+                f"{'#':<3} | {'Type':<5} | {'Address Range':<23} | {'Packets':>7} | "
                 f"{'HVX Ops':>7} | {'Vec/Pkt':>7} | {'V-Spills (st, ld)':>17} | {'S-Spills (st, ld)':>17} | Notes"
             )
-            logger.info(loop_hdr)
+            logger.info(f"\nLoops ({len(func_stats.loops)})")
             logger.info("-" * len(loop_hdr))
+            logger.info(loop_hdr)
+            logger.info(re.sub(r"[^|]", "-", loop_hdr))
             for loop in func_stats.loops:
                 vspill_str = f"{loop.vspills_total} ({loop.vspills_st}s,{loop.vspills_ld}l)"
                 sspill_str = f"{loop.sspills_total} ({loop.sspills_st}s,{loop.sspills_ld}l)"
@@ -1028,7 +1031,7 @@ def run_disasm(
                     notes.append("\033[1;32mdual-hvx\033[0m" if use_color else "dual-hvx")
                 notes_str = ", ".join(notes)
                 logger.info(
-                    f"{loop.loop_id:<3} | {loop.loop_type:<5} | 0x{loop.start_addr:08x} - 0x{loop.end_addr:08x} | "
+                    f"{loop.loop_id:<3} | {loop.loop_type:<5} | {f'0x{loop.start_addr:08x} - 0x{loop.end_addr:08x}':<23} | "
                     f"{loop.packet_count:>7} | {loop.vec_insn_count:>7} | {loop.vec_density:>7.2f} | "
                     f"{vspill_str:>17} | {sspill_str:>17} | {notes_str}"
                 )
