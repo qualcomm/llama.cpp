@@ -2187,6 +2187,7 @@ struct ggml_backend_opencl_context {
     int       q80_cok_nsg_eff = 8;
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg = nullptr;
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr = nullptr;
+    cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_bin = nullptr; // same, bin (32b-transposed) weights
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r2_wimg_nr = nullptr;
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r4_nr = nullptr;
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r4_nrh = nullptr;
@@ -9405,6 +9406,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr =
             clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr", &err);
         if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr = nullptr; }
+        backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_bin =
+            clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_bin", &err);
+        if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_bin = nullptr; }
         backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r2_wimg_nr =
             clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_f32_cok_r2_wimg_nr", &err);
         if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r2_wimg_nr = nullptr; }
@@ -37901,6 +37905,87 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno_ila(ggml_backend_t backend, const gg
     int M = ne01;
     int N = ne1;
     int K = ne00;
+
+    // Speculative-verify widths (2..8) on a weight in the bin layout. The bin GEMM pads such
+    // a batch to its 32/64-column tile; this backend's cooperative-K kernel takes it as is,
+    // and its bin-layout twin reads the same texture the bin GEMV uses. X2-90, gemma-4-E4B
+    // Q4_K_M with MTP k=7: see the commit. GGML_OPENCL_Q4_K_BIN_COK=0 sends these widths to
+    // the bin GEMM.
+    static const bool bin_cok_off = ggml_cl_env_flag_zero("GGML_OPENCL_Q4_K_BIN_COK");
+    const bool use_bin_cok = !bin_cok_off && ne1 >= 2 && ne1 <= 8 && (M % 4) == 0 &&
+                             backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_bin != nullptr &&
+                             backend_ctx->kernel_transpose_32_16 != nullptr;
+    if (use_bin_cok) {
+        cl_mem b_sub_buf = nullptr, b_img = nullptr, b_sub_buf_trans = nullptr, b_img_trans = nullptr;
+
+        region.origin = offset1;
+        region.size   = (size_t)K * N * sizeof(float);
+        CL_CHECK((b_sub_buf = clCreateSubBuffer(extra1->data_device, 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &err), err));
+
+        img_fmt = { CL_RGBA, CL_FLOAT };
+        memset(&img_desc, 0, sizeof(img_desc));
+        img_desc.image_type  = CL_MEM_OBJECT_IMAGE1D_BUFFER;
+        img_desc.image_width = (size_t)K * N / 4;
+        img_desc.buffer      = b_sub_buf;
+        CL_CHECK((b_img = clCreateImage(context, CL_MEM_READ_ONLY, &img_fmt, &img_desc, NULL, &err), err));
+
+        // f16, N-major, N padded to 8 -- the activation layout the cok kernels read
+        const int padded_N = 8;
+        region.origin = 0;
+        region.size   = (size_t)K * padded_N * sizeof(cl_half);
+        backend_ctx->prealloc_act_trans.allocate(context, region.size);
+        CL_CHECK((b_sub_buf_trans = clCreateSubBuffer(backend_ctx->prealloc_act_trans.buffer, 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &err), err));
+        img_fmt = { CL_RGBA, CL_HALF_FLOAT };
+        memset(&img_desc, 0, sizeof(img_desc));
+        img_desc.image_type  = CL_MEM_OBJECT_IMAGE1D_BUFFER;
+        img_desc.image_width = (size_t)K * padded_N / 4;
+        img_desc.buffer      = b_sub_buf_trans;
+        CL_CHECK((b_img_trans = clCreateImage(context, 0, &img_fmt, &img_desc, NULL, &err), err));
+
+        int height_B = N / 4;
+        if (height_B == 0) {
+            height_B = 1;
+        }
+        int width_B = K / 4;
+        int padded_height_B = padded_N / 4;
+        cl_kernel tk = backend_ctx->kernel_transpose_32_16;
+        CL_CHECK(clSetKernelArg(tk, 0, sizeof(cl_mem), &b_img));
+        CL_CHECK(clSetKernelArg(tk, 1, sizeof(cl_mem), &b_img_trans));
+        CL_CHECK(clSetKernelArg(tk, 2, sizeof(int),    &height_B));
+        CL_CHECK(clSetKernelArg(tk, 3, sizeof(int),    &width_B));
+        CL_CHECK(clSetKernelArg(tk, 4, sizeof(int),    &padded_height_B));
+        size_t t_local[2]  = { 1, 16 };
+        size_t t_global[2] = { (size_t)width_B, (size_t)padded_height_B };
+        backend_ctx->enqueue_ndrange_kernel(tk, 2, t_global, t_local, dst);
+
+        const cl_uchar mask_d6 = 0x3F, mask_d4 = 0x0F, mask_hi2 = 0xC0;
+        kernel = backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_bin;
+        CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0_q4_k->q_img));
+        CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_mem),   &extra0_q4_k->s));
+        CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),   &extra0_q4_k->d));
+        CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_mem),   &extra0_q4_k->dm));
+        CL_CHECK(clSetKernelArg(kernel,  4, sizeof(cl_mem),   &b_img_trans));
+        CL_CHECK(clSetKernelArg(kernel,  5, sizeof(cl_mem),   &extrad->data_device));
+        CL_CHECK(clSetKernelArg(kernel,  6, sizeof(cl_ulong), &offsetd));
+        CL_CHECK(clSetKernelArg(kernel,  7, sizeof(cl_int),   &ne01));
+        CL_CHECK(clSetKernelArg(kernel,  8, sizeof(cl_int),   &padded_N));
+        CL_CHECK(clSetKernelArg(kernel,  9, sizeof(cl_int),   &ne00));
+        CL_CHECK(clSetKernelArg(kernel, 10, sizeof(cl_int),   &ne1));
+        CL_CHECK(clSetKernelArg(kernel, 11, sizeof(cl_uchar), &mask_d6));
+        CL_CHECK(clSetKernelArg(kernel, 12, sizeof(cl_uchar), &mask_d4));
+        CL_CHECK(clSetKernelArg(kernel, 13, sizeof(cl_uchar), &mask_hi2));
+
+        const size_t nsg = (size_t)backend_ctx->q4k_cok_nsg;
+        size_t local_work_size[3]  = { 64, nsg, 1 };
+        size_t global_work_size[3] = { (size_t)(ne01 / 4), nsg, 1 };
+        backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+
+        CL_CHECK(clReleaseMemObject(b_img_trans));
+        CL_CHECK(clReleaseMemObject(b_sub_buf_trans));
+        CL_CHECK(clReleaseMemObject(b_img));
+        CL_CHECK(clReleaseMemObject(b_sub_buf));
+        return;
+    }
 
     if (ne1 == 1) {
         cl_mem b_sub_buf = nullptr;
