@@ -65,7 +65,7 @@ static void concat_2d_f32_transposed(unsigned int nth, unsigned int ith, void * 
     struct htp_thread_trace * tr = &octx->ctx->trace[ith];
 
     for (uint32_t p = 0; p < cctx->nplanes; p++) {
-        const uint32_t i3 = p / dst->ne[2];
+        const uint32_t i3 = fastdiv(p, &cctx->div_ne2);
         const uint32_t i2 = p - i3 * dst->ne[2];
         const dma_addr_t src0_plane = src0->data + i2 * src0->nb[2] + i3 * src0->nb[3];
         const dma_addr_t src1_plane = src1->data + i2 * src1->nb[2] + i3 * src1->nb[3];
@@ -144,7 +144,7 @@ static void concat_2d_f16_transposed(unsigned int nth, unsigned int ith, void * 
     struct htp_thread_trace * tr = &octx->ctx->trace[ith];
 
     for (uint32_t p = 0; p < cctx->nplanes; p++) {
-        const uint32_t i3 = p / dst->ne[2];
+        const uint32_t i3 = fastdiv(p, &cctx->div_ne2);
         const uint32_t i2 = p - i3 * dst->ne[2];
         const dma_addr_t src0_plane = src0->data + i2 * src0->nb[2] + i3 * src0->nb[3];
         const dma_addr_t src1_plane = src1->data + i2 * src1->nb[2] + i3 * src1->nb[3];
@@ -200,7 +200,7 @@ static void concat_generic(unsigned int nth, unsigned int ith, void * data) {
     // Per-device element range aligned to prevent false sharing
     const uint32_t elem_start = cctx->elem_start;
     const uint32_t nelems     = cctx->nelems;
-    const uint32_t chunk_size = (nelems + nth - 1) / nth;
+    const uint32_t chunk_size = fastdiv(nelems + nth - 1, &octx->n_threads_div);
 
     const uint32_t start_idx = MIN(elem_start + ith * chunk_size, elem_start + nelems);
     const uint32_t end_idx   = MIN(start_idx + chunk_size, elem_start + nelems);
