@@ -108,6 +108,9 @@ enum htp_op_code {
     HTP_OP_GLU_SWIGLU_CLAMP,
     HTP_OP_MDEV_GROUP,
     HTP_OP_ROLL,
+    HTP_OP_ARGMAX,
+    HTP_OP_UNARY_GELU_ERF,
+    HTP_OP_GLU_GEGLU_ERF,
 
     HTP_OP_INVALID
 };
