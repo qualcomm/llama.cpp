@@ -127,10 +127,23 @@ typedef int2   cok_dotv;
 #endif
 
 // One K-group: unpack the weight nibbles for the folded rows, then dot every column.
+// COK_Q_BIN: the plane is the bin (32b-transposed) layout, one uint per (8 K, row) whose
+// low half is the noshuffle ushort of the first four K and high half of the next four.
+// ku0 is a multiple of 4, so K-group ku0+t is word ku0/2 + t/2, half t&1.
+#ifdef COK_Q_BIN
+#define COK_QBITS4(t) convert_ushort4(((t) & 1) ? (vload4(0, src0_q + row0 + ((ku0 >> 1) + ((t) >> 1)) * m) >> 16) \
+                                                : (vload4(0, src0_q + row0 + ((ku0 >> 1) + ((t) >> 1)) * m) & 0xFFFFu))
+#define COK_QBITS2(t) convert_ushort2(((t) & 1) ? (vload2(0, src0_q + row0 + ((ku0 >> 1) + ((t) >> 1)) * m) >> 16) \
+                                                : (vload2(0, src0_q + row0 + ((ku0 >> 1) + ((t) >> 1)) * m) & 0xFFFFu))
+#else
+#define COK_QBITS4(t) vload4(0, src0_q + row0 + (ku0 + t) * m)
+#define COK_QBITS2(t) vload2(0, src0_q + row0 + (ku0 + t) * m)
+#endif
+
 #if COK_ROWS == 4
 #define COK_KSTEP(t)                                                   \
     {                                                                     \
-    ushort4 bits = vload4(0, src0_q + row0 + (ku0 + t) * m);              \
+    ushort4 bits = COK_QBITS4(t);                                      \
     const uint w0 = EXP4(bits.s0);                                        \
     const uint w1 = EXP4(bits.s1);                                        \
     const uint w2 = EXP4(bits.s2);                                        \
@@ -140,7 +153,7 @@ typedef int2   cok_dotv;
 #else
 #define COK_KSTEP(t)                                                   \
     {                                                                     \
-    ushort2 bits = vload2(0, src0_q + row0 + (ku0 + t) * m);              \
+    ushort2 bits = COK_QBITS2(t);                                      \
     const uint w0 = EXP4(bits.s0);                                        \
     const uint w1 = EXP4(bits.s1);                                        \
     COK_DOTS_AT(t)                                                        \
@@ -160,7 +173,11 @@ inline void get_scale_min_k4_c(int j, global const uchar * q, int stride,
 }
 
 kernel void kernel_gemm_cok_q4_k_q8_1_dp4a(
+#ifdef COK_Q_BIN
+    global const uint   * src0_q,     // q4_K nibble plane, bin [row + (K/8)*m]
+#else
     global const ushort * src0_q,     // q4_K nibble plane   [row + (K/4)*m]
+#endif
     global const uchar  * src0_s,     // packed scales/mins
     global const half   * src0_d,     // super-block scale
     global const half   * src0_dm,    // super-block min
