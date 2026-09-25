@@ -5006,15 +5006,16 @@ static bool ggml_hexagon_precompute_binary_params(
     const bool is_add_id = op == HTP_OP_ADD_ID;
     const bool is_scalar = !is_add_id && src1->ne[0] == 1;
     const bool is_transposed = src0->nb[1] < src0_row_size || src1->nb[1] < src1_row_size || dst->nb[1] < dst_row_size;
-    const bool is_same_shape = !is_add_id && !is_scalar && !is_transposed &&
+    const bool is_row_bcast = !is_add_id && !is_scalar && !is_transposed &&
         src1->ne[0] == src0->ne[0] &&
-        (src1->ne[1] == src0->ne[1] || src1->ne[1] == 1) &&
-        (src1->ne[2] == src0->ne[2] || src1->ne[2] == 1) &&
-        (src1->ne[3] == src0->ne[3] || src1->ne[3] == 1);
-    const bool is_row_bcast = is_same_shape &&
         (src0->ne[1] > 1 || src0->ne[2] > 1 || src0->ne[3] > 1) &&
         src1->ne[1] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1;
-    const bool is_complex   = !is_add_id && !is_scalar && !is_same_shape && (src1->ne[0] == src0->ne[0]);
+    const bool is_same_shape = !is_add_id && !is_scalar && !is_transposed &&
+        src1->ne[0] == src0->ne[0] &&
+        src1->ne[1] == src0->ne[1] &&
+        (src1->ne[2] == src0->ne[2] || src1->ne[2] == 1) &&
+        (src1->ne[3] == src0->ne[3] || src1->ne[3] == 1);
+    const bool is_complex   = !is_add_id && !is_scalar && !is_same_shape && !is_row_bcast && (src1->ne[0] == src0->ne[0]);
     const bool is_contig    = ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst);
     const bool is_1d        = src0->ne[1] == 1 && src0->ne[2] == 1 && src0->ne[3] == 1;
     const bool is_scalar_broadcast = !is_add_id && (ggml_nelements(src1) == 1);
