@@ -126,17 +126,33 @@ kernel void kernel_quant_a_q8_1_eo(
       COK_ROWS_DO_C(c) }
 
 #if COK_ROWS == 4
+#ifdef COK_Q_BIN
+// bin (32b-transposed) plane: one uint per (8 K, row), low half = the noshuffle ushort of
+// the first four K. g0 is a multiple of 4, so K-group g0+t is word g0/2 + t/2, half t&1.
+#define COK_WLOAD(t) ushort4 bl##t = convert_ushort4(((t) & 1) ? (vload4(0, src0_q + row0 + ((g0 >> 1) + ((t) >> 1)) * m) >> 16) \
+                                                            : (vload4(0, src0_q + row0 + ((g0 >> 1) + ((t) >> 1)) * m) & 0xFFFFu));
+#else
 #define COK_WLOAD(t) ushort4 bl##t = vload4(0, src0_q + row0 + (g0 + t) * m);
+#endif
 #define COK_ROWS_DO(F) F(0) F(1) F(2) F(3)
 #define COK_ROWS_DO_C(c) COK_DOT_RC(0, c) COK_DOT_RC(1, c) COK_DOT_RC(2, c) COK_DOT_RC(3, c)
 #else
+#ifdef COK_Q_BIN
+#define COK_WLOAD(t) ushort2 bl##t = convert_ushort2(((t) & 1) ? (vload2(0, src0_q + row0 + ((g0 >> 1) + ((t) >> 1)) * m) >> 16) \
+                                                            : (vload2(0, src0_q + row0 + ((g0 >> 1) + ((t) >> 1)) * m) & 0xFFFFu));
+#else
 #define COK_WLOAD(t) ushort2 bl##t = vload2(0, src0_q + row0 + (g0 + t) * m);
+#endif
 #define COK_ROWS_DO(F) F(0) F(1)
 #define COK_ROWS_DO_C(c) COK_DOT_RC(0, c) COK_DOT_RC(1, c)
 #endif
 
 kernel void kernel_gemm_cok8_q4_0_q8_1_dp4a(
+#ifdef COK_Q_BIN
+    global const uint   * src0_q,     // q4_0 nibble plane, bin [row + (K/8)*m]
+#else
     global const ushort * src0_q,     // q4_0 nibble plane [row + (K/4)*m]
+#endif
     global const half   * src0_d,     // one scale per 32-K block [row + blk*m]
     read_only image1d_buffer_t src1_qa,  // q8_1 activations, eo order, RGBA32UI texels [col*K/16 + K/16]
     read_only image1d_buffer_t src1_da,  // activation scales, one half8 texel per block [blk*8 + col]
