@@ -36,10 +36,10 @@
 #define COK_SG   64
 #define COK_ROWS 4
 #ifndef COK_BIN_COMP
-#define COK_BIN_COMP 0
+#define COK_BIN_COMP 1
 #endif
 #ifndef COK_BIN_SG
-#define COK_BIN_SG 1
+#define COK_BIN_SG 4
 #endif
 
 #define COK_PACK4(a, b, c, e)                                         \
@@ -296,7 +296,9 @@ kernel void kernel_gemm_cok8_q6_k_q8_1_dp4a_bin(
 #if COK_BIN_SG == 4
     // Groups of four consecutive 32-K blocks, interleaved across slices like single blocks
     // are: one 8-byte load per row fetches the four blocks' scales (they are row-major), and
-    // the stream across the matrix stays as compact as the one-block interleave.
+    // the stream across the matrix stays as compact as the one-block interleave. X2-90,
+    // 6656 x 19968 (muse-glimmer ffn_down) at widths 2..8: 1.17-1.30x the noshuffle kernel
+    // with one scalar load per block, 1.02-1.14x with this.
     for (int bg = b_beg; bg * 4 < num_32blk; bg += nslice) {
     ushort4 sr0 = vload4(0, src0_s + (row0 + 0) * num_32blk + bg * 4);
     ushort4 sr1 = vload4(0, src0_s + (row0 + 1) * num_32blk + bg * 4);
@@ -306,6 +308,16 @@ kernel void kernel_gemm_cok8_q6_k_q8_1_dp4a_bin(
         const int blk = bg * 4 + jb;
         const ushort4 spk = (ushort4)(sr0.s0, sr1.s0, sr2.s0, sr3.s0);
         sr0 = sr0.s1230; sr1 = sr1.s1230; sr2 = sr2.s1230; sr3 = sr3.s1230;
+#elif COK_BIN_SG == 8
+    for (int bg = b_beg; bg * 8 < num_32blk; bg += nslice) {
+    ushort8 sr0 = vload8(0, src0_s + (row0 + 0) * num_32blk + bg * 8);
+    ushort8 sr1 = vload8(0, src0_s + (row0 + 1) * num_32blk + bg * 8);
+    ushort8 sr2 = vload8(0, src0_s + (row0 + 2) * num_32blk + bg * 8);
+    ushort8 sr3 = vload8(0, src0_s + (row0 + 3) * num_32blk + bg * 8);
+    for (int jb = 0; jb < 8; ++jb) {
+        const int blk = bg * 8 + jb;
+        const ushort4 spk = (ushort4)(sr0.s0, sr1.s0, sr2.s0, sr3.s0);
+        sr0 = sr0.s12345670; sr1 = sr1.s12345670; sr2 = sr2.s12345670; sr3 = sr3.s12345670;
 #else
     for (int blk = b_beg; blk < num_32blk; blk += nslice) {
         const ushort4 spk = (ushort4)(src0_s[(row0 + 0) * num_32blk + blk],
@@ -364,7 +376,7 @@ kernel void kernel_gemm_cok8_q6_k_q8_1_dp4a_bin(
             acc3 = mad(mad(da, convert_float8(d3), sm), s3f, acc3);
         }
     }
-#if COK_BIN_SG == 4
+#if COK_BIN_SG == 4 || COK_BIN_SG == 8
     }
 #endif
 
