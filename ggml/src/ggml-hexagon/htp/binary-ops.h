@@ -34,6 +34,7 @@ struct htp_binary_kernel_params {
 
     uint32_t chunk_size;
     uint32_t chunk_bytes;
+    uint32_t is_scalar;
 };
 
 #if defined(__cplusplus)
@@ -79,18 +80,18 @@ static inline void htp_binary_vtcm_layout_build(
         }
 
         L->src0_bytes_per_thread = 2 * chunk_bytes;
-        L->src1_bytes_per_thread = 2 * chunk_bytes;
+        L->src1_bytes_per_thread = kparams->is_scalar ? 0 : (2 * chunk_bytes);
         L->dst_bytes_per_thread  = 2 * chunk_bytes;
 
         L->src0_spad_half_size = chunk_bytes;
-        L->src1_spad_half_size = chunk_bytes;
+        L->src1_spad_half_size = kparams->is_scalar ? 0 : chunk_bytes;
         L->dst_spad_half_size  = chunk_bytes;
 
         L->rows_per_buffer = 1;
         L->src1_size = 0;
 
         const size_t src0_total = n_threads * L->src0_bytes_per_thread;
-        const size_t src1_total = n_threads * L->src1_bytes_per_thread;
+        const size_t src1_total = kparams->is_scalar ? 128 : (n_threads * L->src1_bytes_per_thread);
         const size_t dst_total  = n_threads * L->dst_bytes_per_thread;
 
         size_t off = 0;
