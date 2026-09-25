@@ -1994,6 +1994,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemv_noshuffle_q4_0_f32_splitk;  // split-K across WGs (small-M decode)
     cl_kernel kernel_gemv_noshuffle_q4_0_f32_glu;     // fused gate+up GEMV + GLU (q4_0 FFN)
     cl_kernel kernel_gemm_noshuffle_q4_0_f32_32b_trans_ila_a8_bin;
+    cl_kernel kernel_gemv_noshuffle_q4_0_f32_32b_trans_splitk = nullptr; // bin GEMV, K split over workgroups
     cl_kernel kernel_gemm_noshuffle_q4_0_q8_1_dp4a_ila_a8_bin;
     cl_kernel kernel_gemv_noshuffle_q4_0_f32_32b_trans;
     cl_kernel kernel_gemv_noshuffle_q4_0_f32_4096_1_11008;
@@ -8889,6 +8890,11 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), opts);
             CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q4_0_f32_32b_trans =
                 clCreateKernel(prog, "kernel_gemv_noshuffle_q4_0_f32_32b_trans", &err), err));
+            backend_ctx->kernel_gemv_noshuffle_q4_0_f32_32b_trans_splitk =
+                clCreateKernel(prog, "kernel_gemv_noshuffle_q4_0_f32_32b_trans_splitk", &err);
+            if (err != CL_SUCCESS) {
+                backend_ctx->kernel_gemv_noshuffle_q4_0_f32_32b_trans_splitk = nullptr;
+            }
             CL_CHECK(clReleaseProgram(prog));
             GGML_LOG_CONT(".");
         }
@@ -35474,6 +35480,48 @@ static void ggml_cl_mul_mat_q4_0_f32_adreno_ila(ggml_backend_t backend, const gg
         img_desc.image_width = (size_t)K * N / 4;
         img_desc.buffer      = b_sub_buf;
         CL_CHECK((b_img = clCreateImage(context, CL_MEM_READ_ONLY, &img_fmt, &img_desc, NULL, &err), err));
+
+        // Split K across workgroups where the output alone cannot fill the GPU, with the
+        // noshuffle q4_0 GEMV's rule (X2E, m <= 4096, ~24 workgroups). This kernel is one row
+        // per lane, so its base workgroup count is m/64.
+        static const bool bin_splitk_off = ggml_cl_env_flag_zero("GGML_OPENCL_Q4_0_BIN_SPLITK");
+        if (!bin_splitk_off && backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E && ne01 <= 4096 &&
+            backend_ctx->kernel_gemv_noshuffle_q4_0_f32_32b_trans_splitk != nullptr) {
+            const int base_wg = (int)CEIL_DIV(ne01, 64);
+            int ksplit = (24 + base_wg - 1) / base_wg;
+            ksplit = ksplit < 1 ? 1 : (ksplit > 8 ? 8 : ksplit);
+            if (ksplit > 1) {
+                const cl_int ks_arg = ksplit;
+                backend_ctx->prealloc_splitk_partial.allocate(context, (size_t)ksplit * ne01 * sizeof(float));
+                cl_mem partial = backend_ctx->prealloc_splitk_partial.buffer;
+                cl_kernel ks = backend_ctx->kernel_gemv_noshuffle_q4_0_f32_32b_trans_splitk;
+                CL_CHECK(clSetKernelArg(ks, 0, sizeof(cl_mem), &extra0_q4_0->q_img));
+                CL_CHECK(clSetKernelArg(ks, 1, sizeof(cl_mem), &extra0_q4_0->d));
+                CL_CHECK(clSetKernelArg(ks, 2, sizeof(cl_mem), &b_img));
+                CL_CHECK(clSetKernelArg(ks, 3, sizeof(cl_mem), &partial));
+                CL_CHECK(clSetKernelArg(ks, 4, sizeof(cl_int), &K));
+                CL_CHECK(clSetKernelArg(ks, 5, sizeof(cl_int), &M));
+                CL_CHECK(clSetKernelArg(ks, 6, sizeof(cl_int), &ks_arg));
+                size_t wavesize = backend_ctx->adreno_wave_size;
+                size_t lsk[3] = { wavesize, 4, 1 };
+                size_t gsk[3] = { (size_t)CEIL_DIV(M, 64) * 64, (size_t)(4 * ksplit), 1 };
+                backend_ctx->enqueue_ndrange_kernel(ks, 3, gsk, lsk, dst);
+
+                cl_kernel kr = backend_ctx->kernel_gemv_splitk_reduce_f32;
+                CL_CHECK(clSetKernelArg(kr, 0, sizeof(cl_mem),   &partial));
+                CL_CHECK(clSetKernelArg(kr, 1, sizeof(cl_mem),   &extrad->data_device));
+                CL_CHECK(clSetKernelArg(kr, 2, sizeof(cl_ulong), &offsetd));
+                CL_CHECK(clSetKernelArg(kr, 3, sizeof(cl_int),   &M));
+                CL_CHECK(clSetKernelArg(kr, 4, sizeof(cl_int),   &ks_arg));
+                size_t lr[3] = { 64, 1, 1 };
+                size_t gr[3] = { (size_t)CEIL_DIV(M, 64) * 64, 1, 1 };
+                backend_ctx->enqueue_ndrange_kernel(kr, 3, gr, lr, dst);
+
+                CL_CHECK(clReleaseMemObject(b_sub_buf));
+                CL_CHECK(clReleaseMemObject(b_img));
+                return;
+            }
+        }
 
         kernel = backend_ctx->kernel_gemv_noshuffle_q4_0_f32_32b_trans;
         CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),   &extra0_q4_0->q_img));

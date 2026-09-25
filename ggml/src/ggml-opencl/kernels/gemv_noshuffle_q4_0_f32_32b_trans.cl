@@ -135,3 +135,62 @@ __kernel void kernel_gemv_noshuffle_q4_0_f32_32b_trans(
         }
     }
 }
+
+// Split-K form of kernel_gemv_noshuffle_q4_0_f32_32b_trans for outputs too narrow to fill the
+// GPU (m/64 workgroups; m = 1024 is 16 of them). Workgroup ks along the second grid axis takes
+// every ksplit-th group of blocks and writes partial[ks*ne01 + row];
+// kernel_gemv_splitk_reduce_f32 adds the slices.
+#ifdef ADRENO_GPU
+REQD_SUBGROUP_SIZE_64
+#endif
+__kernel void kernel_gemv_noshuffle_q4_0_f32_32b_trans_splitk(
+        __read_only  image1d_buffer_t src0_q,
+        global half  * src0_d,
+        __read_only  image1d_buffer_t src1,
+        global float * partial,
+        int ne00,
+        int ne01,
+        int ksplit)
+{
+    uint groupId = get_local_id(1);
+    uint gid     = get_global_id(0);
+    uint ks      = get_group_id(1);
+    ushort slid  = get_sub_group_local_id();
+
+    uint K = ne00;
+    uint M = ne01;
+
+    __private uint4  regA;
+    __private half   regS;
+    __private float8 regB;
+    __private float  totalSum = 0.0f;
+
+    for (uint k = ks * N_SIMDGROUP + groupId; k < (K / QK4_0); k += N_SIMDGROUP * ksplit) {
+        regS = src0_d[k * M + gid];
+        if (slid < 4) {
+            regB.s0123 = read_imagef(src1, (slid * 2 + k * 8));
+            regB.s4567 = read_imagef(src1, (1 + slid * 2 + k * 8));
+        }
+        regA.s0 = read_imageui(src0_q, ((k * 4 + 0) * M + gid)).x;
+        regA.s1 = read_imageui(src0_q, ((k * 4 + 1) * M + gid)).x;
+        regA.s2 = read_imageui(src0_q, ((k * 4 + 2) * M + gid)).x;
+        regA.s3 = read_imageui(src0_q, ((k * 4 + 3) * M + gid)).x;
+
+        dequantizeBlockAccum_ila_1row_hi(totalSum, as_ushort8(regA), regS, regB);
+        dequantizeBlockAccum_ila_1row_lo(totalSum, as_ushort8(regA), regS, regB);
+    }
+
+    __local float reduceLM[SIMDGROUP_WIDTH * 3];
+    if (groupId == 1) reduceLM[SIMDGROUP_WIDTH * 0 + slid] = totalSum;
+    if (groupId == 2) reduceLM[SIMDGROUP_WIDTH * 1 + slid] = totalSum;
+    if (groupId == 3) reduceLM[SIMDGROUP_WIDTH * 2 + slid] = totalSum;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (groupId == 0) {
+        totalSum += reduceLM[SIMDGROUP_WIDTH * 0 + slid];
+        totalSum += reduceLM[SIMDGROUP_WIDTH * 1 + slid];
+        totalSum += reduceLM[SIMDGROUP_WIDTH * 2 + slid];
+        if (gid < M) {
+            partial[ks * M + gid] = totalSum;
+        }
+    }
+}
