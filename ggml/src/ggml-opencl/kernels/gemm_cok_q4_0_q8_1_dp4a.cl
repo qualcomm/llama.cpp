@@ -96,12 +96,25 @@ typedef int2   cok_dotv;
 #ifdef COK_Q_BIN
 // bin (32b-transposed) plane: one uint per (8 K, row), low half = the noshuffle ushort of
 // the first four K. ku0 is a multiple of 4, so K-group ku0+t is word ku0/2 + t/2, half t&1.
-#define COK_QB8(t) convert_ushort8(((t) & 1) ? (vload8(0, src0_q + row0 + ((ku0 >> 1) + ((t) >> 1)) * m) >> 16) \
-                                          : (vload8(0, src0_q + row0 + ((ku0 >> 1) + ((t) >> 1)) * m) & 0xFFFFu))
-#define COK_QB4(t) convert_ushort4(((t) & 1) ? (vload4(0, src0_q + row0 + ((ku0 >> 1) + ((t) >> 1)) * m) >> 16) \
-                                          : (vload4(0, src0_q + row0 + ((ku0 >> 1) + ((t) >> 1)) * m) & 0xFFFFu))
-#define COK_QB2(t) convert_ushort2(((t) & 1) ? (vload2(0, src0_q + row0 + ((ku0 >> 1) + ((t) >> 1)) * m) >> 16) \
-                                          : (vload2(0, src0_q + row0 + ((ku0 >> 1) + ((t) >> 1)) * m) & 0xFFFFu))
+// The halves are taken component by component: convert_ushortN(w >> 16) compiles to much
+// slower code on the X2-90.
+inline ushort8 cok_half8(uint8 w, int hi) {
+    return hi ? (ushort8)((ushort)(w.s0 >> 16), (ushort)(w.s1 >> 16), (ushort)(w.s2 >> 16), (ushort)(w.s3 >> 16),
+                          (ushort)(w.s4 >> 16), (ushort)(w.s5 >> 16), (ushort)(w.s6 >> 16), (ushort)(w.s7 >> 16))
+              : (ushort8)((ushort)(w.s0 & 0xFFFFu), (ushort)(w.s1 & 0xFFFFu), (ushort)(w.s2 & 0xFFFFu), (ushort)(w.s3 & 0xFFFFu),
+                          (ushort)(w.s4 & 0xFFFFu), (ushort)(w.s5 & 0xFFFFu), (ushort)(w.s6 & 0xFFFFu), (ushort)(w.s7 & 0xFFFFu));
+}
+inline ushort4 cok_half4(uint4 w, int hi) {
+    return hi ? (ushort4)((ushort)(w.s0 >> 16), (ushort)(w.s1 >> 16), (ushort)(w.s2 >> 16), (ushort)(w.s3 >> 16))
+              : (ushort4)((ushort)(w.s0 & 0xFFFFu), (ushort)(w.s1 & 0xFFFFu), (ushort)(w.s2 & 0xFFFFu), (ushort)(w.s3 & 0xFFFFu));
+}
+inline ushort2 cok_half2(uint2 w, int hi) {
+    return hi ? (ushort2)((ushort)(w.s0 >> 16), (ushort)(w.s1 >> 16))
+              : (ushort2)((ushort)(w.s0 & 0xFFFFu), (ushort)(w.s1 & 0xFFFFu));
+}
+#define COK_QB8(t) cok_half8(vload8(0, src0_q + row0 + ((ku0 >> 1) + ((t) >> 1)) * m), (t) & 1)
+#define COK_QB4(t) cok_half4(vload4(0, src0_q + row0 + ((ku0 >> 1) + ((t) >> 1)) * m), (t) & 1)
+#define COK_QB2(t) cok_half2(vload2(0, src0_q + row0 + ((ku0 >> 1) + ((t) >> 1)) * m), (t) & 1)
 #else
 #define COK_QB8(t) vload8(0, src0_q + row0 + (ku0 + t) * m)
 #define COK_QB4(t) vload4(0, src0_q + row0 + (ku0 + t) * m)

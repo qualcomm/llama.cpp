@@ -2204,7 +2204,6 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr = nullptr;
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_bin = nullptr; // same, bin (32b-transposed) weights
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_bin_r32 = nullptr; // R32UI reads, for wide launches
-    cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_bin_v0 = nullptr;  // A/B only
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r2_wimg_nr = nullptr;
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r4_nr = nullptr;
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_cok_r4_nrh = nullptr;
@@ -9492,9 +9491,6 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_bin_r32 =
             clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_bin_r32", &err);
         if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_bin_r32 = nullptr; }
-        backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_bin_v0 =
-            clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_bin_v0", &err);
-        if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_bin_v0 = nullptr; }
         backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r2_wimg_nr =
             clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_f32_cok_r2_wimg_nr", &err);
         if (err != CL_SUCCESS) { backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r2_wimg_nr = nullptr; }
@@ -38388,7 +38384,7 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno_ila(ggml_backend_t backend, const gg
         // GGML_OPENCL_Q4_K_BIN_COK_READ = 1 (RGBA) / 2 (R32) forces the read, for A/B.
         static const int bin_cok_read = ggml_cl_env_int("GGML_OPENCL_Q4_K_BIN_COK_READ", 0);
         const bool wide = backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_bin_r32 != nullptr &&
-                          (bin_cok_read == 2 || bin_cok_read == 3 ||
+                          (bin_cok_read == 2 ||
                            (bin_cok_read == 0 && backend_ctx->compute_units > 0 &&
                             (size_t)ne01 / 256 > (size_t)backend_ctx->compute_units));
         cl_mem q_img4 = nullptr;
@@ -38402,9 +38398,6 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno_ila(ggml_backend_t backend, const gg
         }
         kernel = wide ? backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_bin_r32
                       : backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_bin;
-        if (bin_cok_read == 3 && backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_bin_v0 && wide) {
-            kernel = backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_bin_v0;
-        }
         CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   wide ? &extra0_q4_k->q_img : &q_img4));
         CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_mem),   &extra0_q4_k->s));
         CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),   &extra0_q4_k->d));
