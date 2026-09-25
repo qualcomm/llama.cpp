@@ -39497,7 +39497,11 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno_ila(ggml_backend_t backend, const gg
     // padded to its tile. Same host sequence as the noshuffle path.
     // GGML_OPENCL_Q6_K_BIN_COK=0 sends these widths to the bin GEMM.
     static const bool bin_cok_off = ggml_cl_env_flag_zero("GGML_OPENCL_Q6_K_BIN_COK");
-    if (!bin_cok_off && ggml_cl_q6k_cok8_dp4a_on(backend_ctx, ne1, ne01, ne00)
+    // The kernel computes eight columns whatever ne1 is; below 5 that is surplus work, but on
+    // this layout the alternative is the bin GEMM padded to 32/64. GGML_OPENCL_Q6_K_BIN_COK_MINN
+    // sets the narrowest width it takes (default 5, the noshuffle path's bound).
+    static const int bin_cok_minn = ggml_cl_env_int("GGML_OPENCL_Q6_K_BIN_COK_MINN", 5);
+    if (!bin_cok_off && ne1 >= bin_cok_minn && ne1 <= 8 && ggml_cl_q6k_cok8_dp4a_on(backend_ctx, 5, ne01, ne00)
         && ggml_cl_cok_have_q6k_cok8(backend_ctx)
         && backend_ctx->kernel_gemm_cok8_q6_k_q8_1_dp4a_bin != nullptr) {
         cl_mem b_sub_buf;
