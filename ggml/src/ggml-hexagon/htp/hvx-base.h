@@ -303,4 +303,10 @@ static inline HVX_Vector hvx_vec_load_act_tile(const uint8_t * y_q, uint32_t kt,
     }
 }
 
+// Specialized store that will follow outstanding scatters or gathers to make sure they complete
+static inline void hvx_gather_sync(void * vtcm_addr) {
+    asm volatile("vmem(%0+#0):scatter_release\n"
+                 "v0 = vmem(%0+#0)\n" :: "r"(vtcm_addr) : "v0", "memory");
+}
+
 #endif /* HVX_BASE_H */
