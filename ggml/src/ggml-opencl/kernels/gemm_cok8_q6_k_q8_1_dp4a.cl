@@ -244,3 +244,122 @@ kernel void kernel_gemm_cok8_q6_k_q8_1_dp4a(
     }
 #undef COK_STORE_COL
 }
+
+// The same kernel over the bin (32b-transposed) weight layout that the QPM kernel library's
+// q6_K GEMMs use. Only the weight fetches differ:
+//  - ql is one uint per (8 K, row): its low half is the noshuffle ushort of the first four
+//    K, its high half the next four.
+//  - qh is one uint per (16 K, row): byte i holds the high bits of the i-th four K.
+//  - s is left row-major there: one ushort (two int8 scales) per (row, 32-K block), rows
+//    k/32 ushorts apart, so the four rows are four scalar loads instead of one vload4.
+//  - d is transposed as in the noshuffle layout.
+kernel void kernel_gemm_cok8_q6_k_q8_1_dp4a_bin(
+    global const uint   * src0_ql,    // [(K/8)*m + row]
+    global const uint   * src0_qh,    // [(K/16)*m + row]
+    global const ushort * src0_s,     // [row*(K/32) + blk]
+    global const half   * src0_d,     // [row + sb*m]
+    read_only image1d_buffer_t src1_qa,
+    read_only image1d_buffer_t src1_ds,
+    global float * dst,
+    ulong offsetd,
+    int m,
+    int k,
+    int n_no_padding,
+    uchar  mask_c0,
+    int ksplit
+) {
+    dst = (global float *)((global char *)dst + offsetd);
+
+    const int gx   = get_global_id(0);
+    const int sg   = get_local_id(1);
+    const int lane = get_local_id(0);
+    const int ks   = get_group_id(1);
+
+    const bool live = gx * COK_ROWS < m;
+    const int  row0 = live ? gx * COK_ROWS : m - COK_ROWS;
+    const int num_32blk = k / 32;
+    const int k_t = k >> 4;
+    const int fence = (int)(mask_c0 >> 6) - 3;
+
+    const int nslice = ksplit * COK_NSG;
+    const int b_beg  = ks * COK_NSG + sg;
+
+    float8 acc0 = (float8)(0.0f), acc1 = (float8)(0.0f);
+    float8 acc2 = (float8)(0.0f), acc3 = (float8)(0.0f);
+
+    for (int blk = b_beg; blk < num_32blk; blk += nslice) {
+        const ushort4 spk = (ushort4)(src0_s[(row0 + 0) * num_32blk + blk],
+                                      src0_s[(row0 + 1) * num_32blk + blk],
+                                      src0_s[(row0 + 2) * num_32blk + blk],
+                                      src0_s[(row0 + 3) * num_32blk + blk]);
+        const half4   scd = vload4(0, src0_d + row0 + (blk >> 3) * m);
+        const float8  da  = convert_float8(as_half8(read_imageui(src1_ds, 3 * blk)));
+
+        for (int h = 0; h < 2; ++h) {
+            const int g0 = (blk << 3) + (h << 2);
+            const int at = (blk << 1) + h;
+
+            const uint4 l01 = vload4(0, src0_ql + row0 + ((g0 >> 1)    ) * m);
+            const uint4 l23 = vload4(0, src0_ql + row0 + ((g0 >> 1) + 1) * m);
+            const uint4 hq  = vload4(0, src0_qh + row0 + (g0 >> 2) * m);
+            const ushort4 bl0 = convert_ushort4(l01 & 0xFFFFu);
+            const ushort4 bl1 = convert_ushort4(l01 >> 16);
+            const ushort4 bl2 = convert_ushort4(l23 & 0xFFFFu);
+            const ushort4 bl3 = convert_ushort4(l23 >> 16);
+            const uchar4  bh0 = convert_uchar4( hq        & 0xFFu);
+            const uchar4  bh1 = convert_uchar4((hq >>  8) & 0xFFu);
+            const uchar4  bh2 = convert_uchar4((hq >> 16) & 0xFFu);
+            const uchar4  bh3 = convert_uchar4( hq >> 24);
+
+            COK_UNPACK(0) COK_UNPACK(1) COK_UNPACK(2) COK_UNPACK(3)
+
+            int8 d0 = (int8)(0), d1 = (int8)(0), d2 = (int8)(0), d3 = (int8)(0);
+            COK_DOT_COL(0, at) COK_DOT_COL(1, at) COK_DOT_COL(2, at) COK_DOT_COL(3, at)
+            const int at4 = at + (d0.s0 & fence);
+            COK_DOT_COL(4, at4) COK_DOT_COL(5, at4) COK_DOT_COL(6, at4) COK_DOT_COL(7, at4)
+
+            const float8 sa = convert_float8(as_half8(read_imageui(src1_ds, 3 * blk + 1 + h)));
+            const float8 sm = sa * -32.0f;
+            const float s0f = (float)(h ? as_char2(spk.s0).s1 : as_char2(spk.s0).s0) * (float)scd.s0;
+            const float s1f = (float)(h ? as_char2(spk.s1).s1 : as_char2(spk.s1).s0) * (float)scd.s1;
+            const float s2f = (float)(h ? as_char2(spk.s2).s1 : as_char2(spk.s2).s0) * (float)scd.s2;
+            const float s3f = (float)(h ? as_char2(spk.s3).s1 : as_char2(spk.s3).s0) * (float)scd.s3;
+            acc0 = mad(mad(da, convert_float8(d0), sm), s0f, acc0);
+            acc1 = mad(mad(da, convert_float8(d1), sm), s1f, acc1);
+            acc2 = mad(mad(da, convert_float8(d2), sm), s2f, acc2);
+            acc3 = mad(mad(da, convert_float8(d3), sm), s3f, acc3);
+        }
+    }
+
+    local float8 reduceLM[COK_SG * (COK_NSG - 1)];
+    float8 out0 = (float8)(0.0f), out1 = (float8)(0.0f);
+    float8 out2 = (float8)(0.0f), out3 = (float8)(0.0f);
+#define COK_REDUCE(accv, outv)                                       \
+    barrier(CLK_LOCAL_MEM_FENCE);                                    \
+    if (sg > 0) { reduceLM[(sg - 1) * COK_SG + lane] = (accv); }     \
+    barrier(CLK_LOCAL_MEM_FENCE);                                    \
+    if (sg == 0) {                                                   \
+        float8 sum = (accv);                                         \
+        for (int s = 0; s < COK_NSG - 1; s++) {                      \
+            sum += reduceLM[s * COK_SG + lane];                      \
+        }                                                            \
+        (outv) = sum;                                                \
+    }
+    COK_REDUCE(acc0, out0)
+    COK_REDUCE(acc1, out1)
+    COK_REDUCE(acc2, out2)
+    COK_REDUCE(acc3, out3)
+#undef COK_REDUCE
+
+#define COK_STORE_COL(c)                                                                  \
+    if ((c) < n_no_padding) {                                                             \
+        vstore4((float4)(out0.s##c, out1.s##c, out2.s##c, out3.s##c), 0,                  \
+                dst + (c) * m + row0);                                                    \
+    }
+    if (sg == 0 && live) {
+        dst += (size_t)ks * (size_t)m * (size_t)n_no_padding;
+        COK_STORE_COL(0) COK_STORE_COL(1) COK_STORE_COL(2) COK_STORE_COL(3)
+        COK_STORE_COL(4) COK_STORE_COL(5) COK_STORE_COL(6) COK_STORE_COL(7)
+    }
+#undef COK_STORE_COL
+}
