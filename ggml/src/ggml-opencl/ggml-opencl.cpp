@@ -28124,9 +28124,10 @@ static void ggml_cl_mul_mat_q4_0_glu_fused(ggml_backend_t backend, ggml_tensor *
     // 4 matches the base decode GEMV (N_SIMDGROUP 4), which has always been
     // bit-reproducible. GGML_OPENCL_GLU_NSG overrides for A/B.
     size_t maxwg = backend_ctx->get_kernel_workgroup_size(kernel);
-    // The bin build runs at 2: X2-90 gemma-4-E4B q4_0 tg128 33.8 at 2 vs 32.2 at 4 (the
-    // noshuffle build 33.5 at 4); 2 is one of the bit-exact reduction orders measured above.
-    size_t nsg_y = use_q4_0_bin_kernels(backend_ctx, Wg) ? 2 : 4;
+    // The bin build runs at 2 on short K: X2-90 gemma-4-E4B q4_0 (K 2560) tg128 33.8 at 2 vs
+    // 32.2 at 4 (the noshuffle build 33.5 at 4). Longer K keeps 4: Qwen3.8-27B q4_0 (K 5120)
+    // tg64 7.09 at 4 vs 6.69 at 2 (noshuffle 6.75). Both are bit-exact orders measured above.
+    size_t nsg_y = (use_q4_0_bin_kernels(backend_ctx, Wg) && K < 4096) ? 2 : 4;
     while (nsg_y > 1 && 64 * nsg_y > maxwg) { nsg_y >>= 1; }
     static const int glu_nsg_force = []{
         const char * e = std::getenv("GGML_OPENCL_GLU_NSG");
