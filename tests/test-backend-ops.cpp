@@ -10098,6 +10098,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, m, 2, 1024, { 1, 1 }, { 1, 1 }));
     }
 
+    // Q4_K decode (n = 1) at narrow outputs, where a backend may split K across workgroups
+    // because the rows alone cannot fill the GPU: 512 rows, and 2560 x 10240 (gemma-4-E4B
+    // ffn_down).
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32,  512, 1,  2560, { 1, 1 }, { 1, 1 }));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 2560, 1, 10240, { 1, 1 }, { 1, 1 }));
+
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP4, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
