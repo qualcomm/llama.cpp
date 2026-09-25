@@ -18046,13 +18046,25 @@ inline bool enable_adreno_trans_weight_q5_K(const ggml_backend_opencl_context *b
     return q5_K_weight_images_fit(backend_ctx, tensor) || q5_K_big_head_gpu_optin();
 }
 
+// Whether a bin weight layout is on: GGML_OPENCL_<type>_BIN=0 / =1 decides where set,
+// otherwise it is on for the X2E, the generation its speculative-verify and decode paths
+// were measured on, and off elsewhere.
+static bool ggml_cl_bin_layout_on(const ggml_backend_opencl_context * backend_ctx, const char * env) {
+    const char * v = getenv(env);
+    if (v != nullptr && v[0] != '\0') {
+        return v[0] != '0';
+    }
+    return backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E;
+}
+
 inline bool use_q4_0_bin_kernels(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor) {
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
-    // OPT-IN (GGML_OPENCL_Q4_0_BIN=1), for the same reason as q4_K below: the bin GEMM wins
-    // prefill (gemma-4-E4B q4_0 pp512 +46% on the X2-90) but its decode GEMV is slower
-    // (tg128 33.6 -> 30.1) and it pads the speculative verify batch to its tile (MTP k=6
-    // 60.6 -> 47.5 t/s). Read once: set_tensor and the dispatch must agree on the layout.
-    static const bool enabled = ggml_cl_env_flag("GGML_OPENCL_Q4_0_BIN") && !ggml_cl_env_flag_zero("GGML_OPENCL_Q4_0_BIN");
+    // Default ON on the X2E where the bin kernels load (see ggml_cl_bin_layout_on); =0 keeps the
+    // noshuffle layout.
+    // The bin GEMM wins prefill (gemma-4-E4B q4_0 pp512 +48% on the X2-90), and decode and the
+    // speculative verify widths run this backend's own kernels over the bin plane, at or above
+    // the noshuffle layout's speed. Read once: set_tensor and the dispatch must agree.
+    static const bool enabled = ggml_cl_bin_layout_on(backend_ctx, "GGML_OPENCL_Q4_0_BIN");
     if (!enabled) {
         return false;
     }
@@ -18301,12 +18313,11 @@ static bool ggml_cl_top_k_plan_for(ggml_backend_opencl_context * backend_ctx,
 
 inline bool use_q6_k_bin_kernels(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor) {
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
-    // OPT-IN (GGML_OPENCL_Q6_K_BIN=1). The bin GEMM wins prefill by 40%+ on gemma-4-E4B Q4_K_M, but
-    // it also takes the speculative verify batch (k+1 = 8 columns, padded to the bin
-    // tile), where this backend's narrow cooperative-K GEMM is much faster: X2-90, MTP
-    // k=7, 51.7 -> 42.7 t/s (-17%) with it on, plain decode unchanged. Read once:
-    // set_tensor and the dispatch must agree on the layout.
-    static const bool enabled = ggml_cl_env_flag("GGML_OPENCL_Q6_K_BIN") && !ggml_cl_env_flag_zero("GGML_OPENCL_Q6_K_BIN");
+    // Default ON on the X2E where the bin kernels load (see ggml_cl_bin_layout_on); =0 keeps the
+    // noshuffle layout.
+    // As for q4_K above: the bin GEMM for prefill, this backend's eight-column dp4a GEMM over
+    // the bin plane for the verify widths. Read once: set_tensor and the dispatch must agree.
+    static const bool enabled = ggml_cl_bin_layout_on(backend_ctx, "GGML_OPENCL_Q6_K_BIN");
     if (!enabled) {
         return false;
     }
@@ -18332,12 +18343,13 @@ inline bool use_q6_k_bin_kernels(const ggml_backend_opencl_context *backend_ctx,
 
 inline bool use_q4_k_bin_kernels(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor) {
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
-    // OPT-IN (GGML_OPENCL_Q4_K_BIN=1). The bin GEMM wins prefill by 40%+ on gemma-4-E4B Q4_K_M, but
-    // it also takes the speculative verify batch (k+1 = 8 columns, padded to the bin
-    // tile), where this backend's narrow cooperative-K GEMM is much faster: X2-90, MTP
-    // k=7, 51.7 -> 42.7 t/s (-17%) with it on, plain decode unchanged. Read once:
-    // set_tensor and the dispatch must agree on the layout.
-    static const bool enabled = ggml_cl_env_flag("GGML_OPENCL_Q4_K_BIN") && !ggml_cl_env_flag_zero("GGML_OPENCL_Q4_K_BIN");
+    // Default ON on the X2E where the bin kernels load (see ggml_cl_bin_layout_on); =0 keeps the
+    // noshuffle layout.
+    // The bin GEMM wins prefill by 40%+ on gemma-4-E4B Q4_K_M (X2-90), and the speculative
+    // verify widths run this backend's cooperative-K GEMMs over the bin plane rather than the
+    // bin GEMM padded to its tile (MTP k=7 52.6 -> 53.9 t/s). Read once: set_tensor and the
+    // dispatch must agree on the layout.
+    static const bool enabled = ggml_cl_bin_layout_on(backend_ctx, "GGML_OPENCL_Q4_K_BIN");
     if (!enabled) {
         return false;
     }
