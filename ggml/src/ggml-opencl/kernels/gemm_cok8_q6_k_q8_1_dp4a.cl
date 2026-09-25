@@ -35,6 +35,12 @@
 #endif
 #define COK_SG   64
 #define COK_ROWS 4
+#ifndef COK_BIN_COMP
+#define COK_BIN_COMP 0
+#endif
+#ifndef COK_BIN_SG
+#define COK_BIN_SG 1
+#endif
 
 #define COK_PACK4(a, b, c, e)                                         \
     ( ((uint)(a) & 0xFFu) | (((uint)(b) & 0xFFu) << 8)               \
@@ -287,11 +293,26 @@ kernel void kernel_gemm_cok8_q6_k_q8_1_dp4a_bin(
     float8 acc0 = (float8)(0.0f), acc1 = (float8)(0.0f);
     float8 acc2 = (float8)(0.0f), acc3 = (float8)(0.0f);
 
+#if COK_BIN_SG == 4
+    // Groups of four consecutive 32-K blocks, interleaved across slices like single blocks
+    // are: one 8-byte load per row fetches the four blocks' scales (they are row-major), and
+    // the stream across the matrix stays as compact as the one-block interleave.
+    for (int bg = b_beg; bg * 4 < num_32blk; bg += nslice) {
+    ushort4 sr0 = vload4(0, src0_s + (row0 + 0) * num_32blk + bg * 4);
+    ushort4 sr1 = vload4(0, src0_s + (row0 + 1) * num_32blk + bg * 4);
+    ushort4 sr2 = vload4(0, src0_s + (row0 + 2) * num_32blk + bg * 4);
+    ushort4 sr3 = vload4(0, src0_s + (row0 + 3) * num_32blk + bg * 4);
+    for (int jb = 0; jb < 4; ++jb) {
+        const int blk = bg * 4 + jb;
+        const ushort4 spk = (ushort4)(sr0.s0, sr1.s0, sr2.s0, sr3.s0);
+        sr0 = sr0.s1230; sr1 = sr1.s1230; sr2 = sr2.s1230; sr3 = sr3.s1230;
+#else
     for (int blk = b_beg; blk < num_32blk; blk += nslice) {
         const ushort4 spk = (ushort4)(src0_s[(row0 + 0) * num_32blk + blk],
                                       src0_s[(row0 + 1) * num_32blk + blk],
                                       src0_s[(row0 + 2) * num_32blk + blk],
                                       src0_s[(row0 + 3) * num_32blk + blk]);
+#endif
         const half4   scd = vload4(0, src0_d + row0 + (blk >> 3) * m);
         const float8  da  = convert_float8(as_half8(read_imageui(src1_ds, 3 * blk)));
 
@@ -302,6 +323,18 @@ kernel void kernel_gemm_cok8_q6_k_q8_1_dp4a_bin(
             const uint4 l01 = vload4(0, src0_ql + row0 + ((g0 >> 1)    ) * m);
             const uint4 l23 = vload4(0, src0_ql + row0 + ((g0 >> 1) + 1) * m);
             const uint4 hq  = vload4(0, src0_qh + row0 + (g0 >> 2) * m);
+#if COK_BIN_COMP
+            // Component by component: the vector conversion of a shifted uint4 compiles to
+            // much slower code on the X2-90 (the q4_K cooperative-K kernel measured it).
+            const ushort4 bl0 = (ushort4)((ushort)l01.s0, (ushort)l01.s1, (ushort)l01.s2, (ushort)l01.s3);
+            const ushort4 bl1 = (ushort4)((ushort)(l01.s0 >> 16), (ushort)(l01.s1 >> 16), (ushort)(l01.s2 >> 16), (ushort)(l01.s3 >> 16));
+            const ushort4 bl2 = (ushort4)((ushort)l23.s0, (ushort)l23.s1, (ushort)l23.s2, (ushort)l23.s3);
+            const ushort4 bl3 = (ushort4)((ushort)(l23.s0 >> 16), (ushort)(l23.s1 >> 16), (ushort)(l23.s2 >> 16), (ushort)(l23.s3 >> 16));
+            const uchar4  bh0 = (uchar4)((uchar)hq.s0, (uchar)hq.s1, (uchar)hq.s2, (uchar)hq.s3);
+            const uchar4  bh1 = (uchar4)((uchar)(hq.s0 >> 8), (uchar)(hq.s1 >> 8), (uchar)(hq.s2 >> 8), (uchar)(hq.s3 >> 8));
+            const uchar4  bh2 = (uchar4)((uchar)(hq.s0 >> 16), (uchar)(hq.s1 >> 16), (uchar)(hq.s2 >> 16), (uchar)(hq.s3 >> 16));
+            const uchar4  bh3 = (uchar4)((uchar)(hq.s0 >> 24), (uchar)(hq.s1 >> 24), (uchar)(hq.s2 >> 24), (uchar)(hq.s3 >> 24));
+#else
             const ushort4 bl0 = convert_ushort4(l01 & 0xFFFFu);
             const ushort4 bl1 = convert_ushort4(l01 >> 16);
             const ushort4 bl2 = convert_ushort4(l23 & 0xFFFFu);
@@ -310,6 +343,7 @@ kernel void kernel_gemm_cok8_q6_k_q8_1_dp4a_bin(
             const uchar4  bh1 = convert_uchar4((hq >>  8) & 0xFFu);
             const uchar4  bh2 = convert_uchar4((hq >> 16) & 0xFFu);
             const uchar4  bh3 = convert_uchar4( hq >> 24);
+#endif
 
             COK_UNPACK(0) COK_UNPACK(1) COK_UNPACK(2) COK_UNPACK(3)
 
@@ -330,6 +364,9 @@ kernel void kernel_gemm_cok8_q6_k_q8_1_dp4a_bin(
             acc3 = mad(mad(da, convert_float8(d3), sm), s3f, acc3);
         }
     }
+#if COK_BIN_SG == 4
+    }
+#endif
 
     local float8 reduceLM[COK_SG * (COK_NSG - 1)];
     float8 out0 = (float8)(0.0f), out1 = (float8)(0.0f);

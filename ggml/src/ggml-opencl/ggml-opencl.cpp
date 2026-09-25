@@ -4452,7 +4452,9 @@ static void ggml_cl_cok_build_q5k_cok8(ggml_backend_opencl_context * backend_ctx
 // the q5_K twin's build. GGML_OPENCL_Q6K_COK8_NSG sizes the K-split.
 static void ggml_cl_cok_build_q6k_cok8(ggml_backend_opencl_context * backend_ctx) {
     cl_int err;
-    const std::string compile_opts = ggml_opencl_make_compile_opts(backend_ctx);
+    std::string compile_opts = ggml_opencl_make_compile_opts(backend_ctx);
+    // A/B hook for the build-time variants of the bin kernel (COK_BIN_COMP, COK_BIN_SG).
+    if (const char * e = getenv("GGML_OPENCL_Q6K_COK8_OPTS")) { compile_opts += std::string(" ") + e; }
 #ifdef GGML_OPENCL_EMBED_KERNELS
     const std::string kernel_src {
         #include "gemm_cok8_q6_k_q8_1_dp4a.cl.h"
