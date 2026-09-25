@@ -2358,14 +2358,16 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #else
         const std::string kernel_src = read_file("mul_mv_f16_f32_mrow.cl");
 #endif
-        backend_ctx->program_mul_mv_f16_f32_mrow =
-            build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        // Five kernels after one that calls sub_group_reduce_add: the case a compiler that
+        // can hold only one such kernel per program rejects, so give each its own program
+        // there (the index is the kernel's ordinal in the file).
+        backend_ctx->program_mul_mv_f16_f32_mrow = nullptr;
 
-        CL_CHECK((backend_ctx->kernel_mul_mat_f16_f32_mrow = clCreateKernel(backend_ctx->program_mul_mv_f16_f32_mrow, "kernel_mul_mat_f16_f32_mrow", &err), err));
-        CL_CHECK((backend_ctx->kernel_mul_mat_f16_f32_mrow_r2 = clCreateKernel(backend_ctx->program_mul_mv_f16_f32_mrow, "kernel_mul_mat_f16_f32_mrow_r2", &err), err));
-        CL_CHECK((backend_ctx->kernel_mul_mat_f16_f32_mrow_r4 = clCreateKernel(backend_ctx->program_mul_mv_f16_f32_mrow, "kernel_mul_mat_f16_f32_mrow_r4", &err), err));
-        CL_CHECK((backend_ctx->kernel_mul_mat_f16_f32_mrow_h8 = clCreateKernel(backend_ctx->program_mul_mv_f16_f32_mrow, "kernel_mul_mat_f16_f32_mrow_h8", &err), err));
-        CL_CHECK((backend_ctx->kernel_mul_mat_f16_f32_mrow_h8r2 = clCreateKernel(backend_ctx->program_mul_mv_f16_f32_mrow, "kernel_mul_mat_f16_f32_mrow_h8r2", &err), err));
+        CL_CHECK((backend_ctx->kernel_mul_mat_f16_f32_mrow = clCreateKernel(cl_program_for_kernel(backend_ctx, kernel_src, compile_opts, backend_ctx->program_mul_mv_f16_f32_mrow, 1), "kernel_mul_mat_f16_f32_mrow", &err), err));
+        CL_CHECK((backend_ctx->kernel_mul_mat_f16_f32_mrow_r2 = clCreateKernel(cl_program_for_kernel(backend_ctx, kernel_src, compile_opts, backend_ctx->program_mul_mv_f16_f32_mrow, 4), "kernel_mul_mat_f16_f32_mrow_r2", &err), err));
+        CL_CHECK((backend_ctx->kernel_mul_mat_f16_f32_mrow_r4 = clCreateKernel(cl_program_for_kernel(backend_ctx, kernel_src, compile_opts, backend_ctx->program_mul_mv_f16_f32_mrow, 5), "kernel_mul_mat_f16_f32_mrow_r4", &err), err));
+        CL_CHECK((backend_ctx->kernel_mul_mat_f16_f32_mrow_h8 = clCreateKernel(cl_program_for_kernel(backend_ctx, kernel_src, compile_opts, backend_ctx->program_mul_mv_f16_f32_mrow, 2), "kernel_mul_mat_f16_f32_mrow_h8", &err), err));
+        CL_CHECK((backend_ctx->kernel_mul_mat_f16_f32_mrow_h8r2 = clCreateKernel(cl_program_for_kernel(backend_ctx, kernel_src, compile_opts, backend_ctx->program_mul_mv_f16_f32_mrow, 3), "kernel_mul_mat_f16_f32_mrow_h8r2", &err), err));
         GGML_LOG_CONT(".");
     }
 
@@ -3514,12 +3516,13 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #else
         const std::string kernel_src = read_file("ssm_scan.cl");
 #endif
-        cl_program prog =
-            build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        // The two Mamba-2 kernels reduce with sub_group_reduce_add; the A6X compiler cannot
+        // hold such a kernel together with others (it crashes in its subgroup lowering).
+        cl_program shared_ssm_scan = nullptr;
 
-        CL_CHECK((backend_ctx->kernel_ssm_scan_f32 = clCreateKernel(prog, "kernel_ssm_scan_f32", &err), err));
-        CL_CHECK((backend_ctx->kernel_ssm_scan_f32_mamba2_d128 = clCreateKernel(prog, "kernel_ssm_scan_f32_mamba2_d128", &err), err));
-        CL_CHECK((backend_ctx->kernel_ssm_scan_f32_mamba2_d256 = clCreateKernel(prog, "kernel_ssm_scan_f32_mamba2_d256", &err), err));
+        CL_CHECK((backend_ctx->kernel_ssm_scan_f32 = clCreateKernel(cl_program_for_kernel(backend_ctx, kernel_src, compile_opts, shared_ssm_scan, 3), "kernel_ssm_scan_f32", &err), err));
+        CL_CHECK((backend_ctx->kernel_ssm_scan_f32_mamba2_d128 = clCreateKernel(cl_program_for_kernel(backend_ctx, kernel_src, compile_opts, shared_ssm_scan, 1), "kernel_ssm_scan_f32_mamba2_d128", &err), err));
+        CL_CHECK((backend_ctx->kernel_ssm_scan_f32_mamba2_d256 = clCreateKernel(cl_program_for_kernel(backend_ctx, kernel_src, compile_opts, shared_ssm_scan, 2), "kernel_ssm_scan_f32_mamba2_d256", &err), err));
 
         cl_kernel * kernels[] = {
             &backend_ctx->kernel_ssm_scan_f32_mamba2_d128,
@@ -3545,7 +3548,6 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                 *kernels[i] = nullptr;
             }
         }
-        CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
 
