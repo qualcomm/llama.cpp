@@ -38331,9 +38331,12 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno_ila(ggml_backend_t backend, const gg
         // 1.11x), four R32UI reads win above it (m >= 6144: 1.06-1.09x against 1.24-1.27x).
         // The narrow-K-split program the noshuffle kernel switches to there loses on this
         // layout (1.37-1.44x) and is not used.
-        const bool wide = backend_ctx->compute_units > 0 &&
-                          (size_t)ne01 / 256 > (size_t)backend_ctx->compute_units &&
-                          backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_bin_r32 != nullptr;
+        // GGML_OPENCL_Q4_K_BIN_COK_READ = 1 (RGBA) / 2 (R32) forces the read, for A/B.
+        static const int bin_cok_read = ggml_cl_env_int("GGML_OPENCL_Q4_K_BIN_COK_READ", 0);
+        const bool wide = backend_ctx->kernel_gemm_noshuffle_q4_k_f32_cok_r4_wimg_nr_bin_r32 != nullptr &&
+                          (bin_cok_read == 2 ||
+                           (bin_cok_read == 0 && backend_ctx->compute_units > 0 &&
+                            (size_t)ne01 / 256 > (size_t)backend_ctx->compute_units));
         cl_mem q_img4 = nullptr;
         if (!wide) {
             img_fmt = { CL_RGBA, CL_UNSIGNED_INT32 };
