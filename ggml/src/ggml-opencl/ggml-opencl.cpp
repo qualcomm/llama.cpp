@@ -16568,6 +16568,8 @@ static bool ggml_opencl_can_fuse_gemma4_perlayer_block(const ggml_backend_opencl
     if (!is_q4k && !is_f32)                                       { return false; }
     if (is_q4k) {
         if (use_q4k_tiled(backend_ctx, Wg) || use_q4k_tiled(backend_ctx, Wp))               { return false; }
+        // the megakernel reads the noshuffle layout; a weight in the bin layout would be misread
+        if (use_q4_k_bin_kernels(backend_ctx, Wg) || use_q4_k_bin_kernels(backend_ctx, Wp)) { return false; }
         if (((ggml_tensor_extra_cl_q4_K *)Wg->extra)->q == nullptr) { return false; }
         if (((ggml_tensor_extra_cl_q4_K *)Wp->extra)->q == nullptr) { return false; }
         const int blck = ggml_blck_size(GGML_TYPE_Q4_K);           // QK_K = 256
