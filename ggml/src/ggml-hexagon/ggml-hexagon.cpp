@@ -5017,10 +5017,9 @@ static bool ggml_hexagon_precompute_binary_params(
         (src1->ne[3] == src0->ne[3] || src1->ne[3] == 1);
     const bool is_complex   = !is_add_id && !is_scalar && !is_same_shape && !is_row_bcast && (src1->ne[0] == src0->ne[0]);
     const bool is_contig    = ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst);
-    const bool is_1d        = src0->ne[1] == 1 && src0->ne[2] == 1 && src0->ne[3] == 1;
     const bool is_scalar_broadcast = !is_add_id && (ggml_nelements(src1) == 1);
 
-    if (!is_add_id && is_contig && (ggml_are_same_shape(src0, src1) || is_scalar_broadcast) && is_1d) {
+    if (!is_add_id && is_contig && (ggml_are_same_shape(src0, src1) || is_scalar_broadcast)) {
         const uint32_t total_elems = (uint32_t) ggml_nelements(src0);
         const uint32_t n_threads = sess->n_threads;
         const uint32_t max_chunk_elems = 32768 / elem_size;
