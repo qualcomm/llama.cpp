@@ -151,6 +151,12 @@ static inline bool htp_sort_solve_layout(
         return false;
     }
 
+    uint32_t n_slots = 1;
+    if (n_chunks == 1 && phase1_slot_size * 2 <= vtcm_budget) {
+        n_slots = 2;
+        total_bytes = phase1_slot_size * 2;
+    }
+
     layout->total_bytes       = total_bytes;
     layout->phase1_slot_size  = phase1_slot_size;
     layout->merge_values_off  = merge_values_off;
@@ -159,6 +165,7 @@ static inline bool htp_sort_solve_layout(
     layout->n_chunks          = n_chunks;
     layout->merge_elems       = merge_elems;
     layout->n_threads         = n_chunks;
+    layout->n_slots           = n_slots;
     return true;
 }
 

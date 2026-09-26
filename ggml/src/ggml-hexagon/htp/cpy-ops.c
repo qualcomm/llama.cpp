@@ -301,7 +301,7 @@ static void cpy_thread_f32_f16_sameshape(unsigned int nth, unsigned int ith, voi
     }
 }
 
-static void cpy_thread_f32_i32_sameshape(unsigned int nth, unsigned int ith, void * data) {
+static void cpy_thread_i32_f32_sameshape(unsigned int nth, unsigned int ith, void * data) {
     struct htp_copy_context * ct = (struct htp_copy_context *) data;
     struct htp_ops_context * octx = ct->octx;
     cpy_preamble;
@@ -324,6 +324,7 @@ static void cpy_thread_f32_i32_sameshape(unsigned int nth, unsigned int ith, voi
         hex_l2fetch(src0_ptr, ne00 * sizeof(float), nb01, 2);
         const float * restrict src_row = (const float *) src0_ptr;
         int32_t * restrict dst_row = (int32_t *) dst_ptr;
+        #pragma clang loop vectorize(disable)
         for (uint32_t i = 0; i < ne00; i++) {
             dst_row[i] = (int32_t) src_row[i];
         }
@@ -341,7 +342,7 @@ static void cpy_thread_f32_i32_sameshape(unsigned int nth, unsigned int ith, voi
     }
 }
 
-static void cpy_thread_i32_f32_sameshape(unsigned int nth, unsigned int ith, void * data) {
+static void cpy_thread_f32_i32_sameshape(unsigned int nth, unsigned int ith, void * data) {
     struct htp_copy_context * ct = (struct htp_copy_context *) data;
     struct htp_ops_context * octx = ct->octx;
     cpy_preamble;
@@ -364,6 +365,7 @@ static void cpy_thread_i32_f32_sameshape(unsigned int nth, unsigned int ith, voi
         hex_l2fetch(src0_ptr, ne00 * sizeof(int32_t), nb01, 2);
         const int32_t * restrict src_row = (const int32_t *) src0_ptr;
         float * restrict dst_row = (float *) dst_ptr;
+        #pragma clang loop vectorize(disable)
         for (uint32_t i = 0; i < ne00; i++) {
             dst_row[i] = (float) src_row[i];
         }
@@ -567,9 +569,9 @@ static int exec_cpy(struct htp_ops_context * octx, bool * use_dma) {
             } else if (dst->type == HTP_TYPE_F32 && src0->type == HTP_TYPE_F16) {
                 copy_fun = cpy_thread_f32_f16_sameshape;
             } else if (dst->type == HTP_TYPE_I32 && src0->type == HTP_TYPE_F32) {
-                copy_fun = cpy_thread_f32_i32_sameshape;
-            } else if (dst->type == HTP_TYPE_F32 && src0->type == HTP_TYPE_I32) {
                 copy_fun = cpy_thread_i32_f32_sameshape;
+            } else if (dst->type == HTP_TYPE_F32 && src0->type == HTP_TYPE_I32) {
+                copy_fun = cpy_thread_f32_i32_sameshape;
             } else {
                 return HTP_STATUS_NO_SUPPORT;
             }

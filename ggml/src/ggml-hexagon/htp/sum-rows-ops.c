@@ -83,16 +83,17 @@ static void sum_rows_thread_f32(unsigned int nth, unsigned int ith, void *data) 
     htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) start_row);
 
     for (uint32_t ir = 0; ir < n_rows; ir++) {
-        const float * restrict src_local = src_th + (ir * (src_stride / sizeof(float)));
+        const float * restrict src_local = (const float *) ((const uint8_t *) src_th + ir * src_stride);
+        float       * restrict dst_local = (float *)       ((uint8_t *)       dst_th + ir * dst_stride);
 
         if (ir + 1 < n_rows) {
-            hex_l2fetch(src_local + (src_stride / sizeof(float)), src_stride, src_stride, 1);
+            hex_l2fetch((const uint8_t *) src_local + src_stride, src_stride, src_stride, 1);
         }
 
         if (opt_path) {
-            dst_th[ir] = hvx_reduce_sum_f32_a((const uint8_t *) src_local, ne00);
+            *dst_local = hvx_reduce_sum_f32_a((const uint8_t *) src_local, ne00);
         } else {
-            dst_th[ir] = hvx_reduce_sum_f32((const uint8_t *) src_local, ne00);
+            *dst_local = hvx_reduce_sum_f32((const uint8_t *) src_local, ne00);
         }
     }
 
@@ -235,70 +236,7 @@ static inline void argmax_slice_f32(
     float * out_val,
     int32_t * out_idx
 ) {
-    if (n == 0) {
-        *out_val = -INFINITY;
-        *out_idx = (int32_t) offset;
-        return;
-    }
-
-    if (n < 32 || !hex_is_aligned((void *) src, 128)) {
-        float best_val = src[0];
-        int32_t best_idx = (int32_t) offset;
-        for (uint32_t i = 1; i < n; i++) {
-            if (src[i] > best_val) {
-                best_val = src[i];
-                best_idx = (int32_t) (offset + i);
-            }
-        }
-        *out_val = best_val;
-        *out_idx = best_idx;
-        return;
-    }
-
-    static const int32_t c_lane_idx[32] __attribute__((aligned(128))) = {
-         0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15,
-        16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31
-    };
-
-    const HVX_Vector v_init_idx = *(const HVX_Vector *) c_lane_idx;
-    const HVX_Vector v_step     = Q6_V_vsplat_R(32);
-    HVX_Vector v_cur_idx        = Q6_Vw_vadd_VwVw(v_init_idx, Q6_V_vsplat_R((int32_t) offset));
-    HVX_Vector v_max_val        = hvx_vec_splat_f32(-INFINITY);
-    HVX_Vector v_max_idx        = v_cur_idx;
-
-    const HVX_Vector * vsrc = (const HVX_Vector *) src;
-    const uint32_t nvec = n / 32;
-
-    for (uint32_t vi = 0; vi < nvec; vi++) {
-        HVX_Vector v = vsrc[vi];
-        HVX_VectorPred pred = Q6_Q_vcmp_gt_VsfVsf(v, v_max_val);
-        v_max_val = Q6_V_vmux_QVV(pred, v, v_max_val);
-        v_max_idx = Q6_V_vmux_QVV(pred, v_cur_idx, v_max_idx);
-        v_cur_idx = Q6_Vw_vadd_VwVw(v_cur_idx, v_step);
-    }
-
-    HVX_VectorAlias u_val, u_idx;
-    u_val.v = v_max_val;
-    u_idx.v = v_max_idx;
-
-    float best_val = u_val.fp32[0];
-    int32_t best_idx = (int32_t) u_idx.w[0];
-    for (int i = 1; i < 32; i++) {
-        if (u_val.fp32[i] > best_val) {
-            best_val = u_val.fp32[i];
-            best_idx = (int32_t) u_idx.w[i];
-        }
-    }
-
-    for (uint32_t i = nvec * 32; i < n; i++) {
-        if (src[i] > best_val) {
-            best_val = src[i];
-            best_idx = (int32_t) (offset + i);
-        }
-    }
-
-    *out_val = best_val;
-    *out_idx = best_idx;
+    hvx_argmax_f32(src, n, offset, out_val, out_idx);
 }
 
 struct argmax_context {
@@ -438,10 +376,11 @@ int op_argmax(struct htp_ops_context * octx) {
     uint32_t nrows     = src0_nrows;
 
     if (octx->ctx->mdev.count > 1) {
-        uint32_t rows_per_chunk = 0;
-        htp_tensor_mdev_rows_per_chunk(dst, sizeof(int32_t), sizeof(int32_t), &rows_per_chunk);
+        const bool can_split = htp_tensor_mdev_data_aligned(dst) &&
+                               htp_tensor_is_contiguous(dst, sizeof(int32_t));
+        const uint32_t elems_per_chunk = can_split ? 32 : 0;
         const struct htp_tensor_mdev_range range = htp_tensor_mdev_partition(
-            src0_nrows, rows_per_chunk, octx->ctx->mdev.idx, octx->ctx->mdev.count, &octx->ctx->mdev.count_div);
+            src0_nrows, elems_per_chunk, octx->ctx->mdev.idx, octx->ctx->mdev.count, &octx->ctx->mdev.count_div);
         row_start = range.start;
         nrows     = range.count;
     }

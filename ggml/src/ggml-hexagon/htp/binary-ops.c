@@ -1174,7 +1174,7 @@ static int execute_op_binary(struct htp_ops_context * octx) {
         const uint32_t chunks_per_thread = (total_chunks + n_threads - 1) / n_threads;
 
         float scalar_f32 = 0.0f;
-        _Float16 scalar_f16 = 0.0f;
+        _Float16 scalar_f16 = 0;
         if (is_scalar) {
             uint8_t * vtcm_src1 = VTCM_LAYOUT_PTR(uint8_t, octx->ctx->vtcm_base, vtcm_layout.off_src1);
             dma_queue * dma_q = octx->ctx->dma[0];
