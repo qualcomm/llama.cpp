@@ -324,7 +324,6 @@ static void cpy_thread_i32_f32_sameshape(unsigned int nth, unsigned int ith, voi
         hex_l2fetch(src0_ptr, ne00 * sizeof(float), nb01, 2);
         const float * restrict src_row = (const float *) src0_ptr;
         int32_t * restrict dst_row = (int32_t *) dst_ptr;
-        #pragma clang loop vectorize(disable)
         for (uint32_t i = 0; i < ne00; i++) {
             dst_row[i] = (int32_t) src_row[i];
         }
@@ -365,7 +364,6 @@ static void cpy_thread_f32_i32_sameshape(unsigned int nth, unsigned int ith, voi
         hex_l2fetch(src0_ptr, ne00 * sizeof(int32_t), nb01, 2);
         const int32_t * restrict src_row = (const int32_t *) src0_ptr;
         float * restrict dst_row = (float *) dst_ptr;
-        #pragma clang loop vectorize(disable)
         for (uint32_t i = 0; i < ne00; i++) {
             dst_row[i] = (float) src_row[i];
         }
