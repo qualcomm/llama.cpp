@@ -12296,11 +12296,16 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
                     return (v >= 1 && v <= 4) ? v : 2;
                 }();
                 const size_t hs_wg = (size_t) (64 * hs_nsg);
+                // Cluster width: the BASE width, not the f16 GQA4-dense one. The two differ only on A8X
+                // (16 vs 32), where the 32 that wins f16 GQA4-dense costs this program 36%: Qwen3-30B-A3B
+                // on the 840, FA decode GPU time at d4096 28.8 ms/token at 32 vs 18.4 at 16.
+                const std::string opts_cl_c_hs = backend_ctx->fa_c8_cluster
+                    ? " -D FA_CL_C=" + std::to_string(backend_ctx->fa_c8_cluster) : std::string();
                 const std::string opts_hs = opts +
                     " -D FA_MQ_ONLY -D MQ_GQA=" + std::to_string(8 / hs_n) +
                     " -D MQ_NSG=" + std::to_string(hs_nsg) +
                     " -D MQ_NSG_SPLIT=" + std::to_string(hs_nsg) +
-                    " -D FA_HEAD_SUB=" + std::to_string(hs_n) + opts_cl_c_gqa4;
+                    " -D FA_HEAD_SUB=" + std::to_string(hs_n) + opts_cl_c_hs;
                 const std::string tag_hs = "fa f32_f16 MQ_GQA=" + std::to_string(8 / hs_n) +
                     " dk128 g8 headsub" + std::to_string(hs_n) + " wg" + std::to_string(hs_wg);
                 cl_program prog_hs = build_program_from_source_ex_cached(
