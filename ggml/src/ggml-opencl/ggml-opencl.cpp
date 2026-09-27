@@ -815,6 +815,7 @@ struct ggml_opencl_fa_kernels {
     // KV head, to cut the 592 B/WI the GQA8 form reports (f16's head-split
     // kernel is at 368 for the same shape).
     std::map<std::pair<int, int>, cl_kernel> f32_q8_0_q1_vec_mq_split_g8_c8_hs2;
+    std::map<std::pair<int, int>, int>       f32_q8_0_q1_vec_mq_split_g8_c8_hs2_sub;  // FA_HEAD_SUB it was built with
     std::map<std::pair<int, int>, cl_kernel> f32_f16_q1_vec_mq_split_g8_hs2;  // gqa8 via MQ_GQA=4 x 2 WGs
     // Per-shape workgroup size and head-split factor for the above. fa_hs_wg /
     // fa_hs_sub below are single scalars written by the DK=64 build site; once a
@@ -12575,7 +12576,12 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
             // the C=16 f16 cluster kernel onto the spilled scalar q1_split. Same
             // FA_CL_C as the f16 dk=64 program -- at DK_VEC=16 a width of 8 would
             // double the per-lane o_acc for MQ_GQA=8.
-            if (is_q8 && dk == 64 && dv == 64 && backend_ctx->has_subgroup_shuffle) {
+            // These q8_0 GQA8 c16 programs are also built at dk=dv=128 (Qwen3-30B-A3B with a q8_0 KV cache), which
+            // otherwise decodes on the older non-cluster f32_q8_0_q1_vec_mq_split_g8 kernel: X2-90 tg128 9.10 -> 24.16
+            // @d8192 and 3.23 -> 10.68 @d32768. Opt out with GGML_OPENCL_FA_Q8_C8_DK128=0.
+            static const bool q8_c8_dk128 = !ggml_cl_env_flag_zero("GGML_OPENCL_FA_Q8_C8_DK128");
+            if (is_q8 && ((dk == 64 && dv == 64) || (q8_c8_dk128 && dk == 128 && dv == 128)) &&
+                backend_ctx->has_subgroup_shuffle) {
                 // Timing probes for the q8_0-vs-f16 decode gap. Numerically
                 // WRONG -- they delete a load and keep everything else -- so
                 // they measure where the gap lives, they do not ship.
@@ -12659,9 +12665,17 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
                     return !(e && e[0] == '0');
                 }();
                 if (q8_hs_on) {
+                    // dk=64 keeps FA_HEAD_SUB=2; dk=128 starts at 4, the measured optimum of the f16 dk128 GQA8
+                    // head-split program (GGML_OPENCL_FA_Q8_HS_DK128_SUB = 2/4/8 overrides).
+                    static const int q8_hs_dk128_sub = []{
+                        const char * e = std::getenv("GGML_OPENCL_FA_Q8_HS_DK128_SUB");
+                        const int v = (e && e[0]) ? atoi(e) : 4;
+                        return (v == 2 || v == 4 || v == 8) ? v : 4;
+                    }();
+                    const int q8_hs_n = dk == 128 ? q8_hs_dk128_sub : 2;
                     const std::string opts_q8_hs2 = opts +
-                        " -D MQ_GQA=4 -D MQ_NSG=2 -D MQ_NSG_SPLIT=2 -D FA_CL_C=16"
-                        " -D FA_HEAD_SUB=2" +
+                        " -D MQ_GQA=" + std::to_string(8 / q8_hs_n) + " -D MQ_NSG=2 -D MQ_NSG_SPLIT=2 -D FA_CL_C=16"
+                        " -D FA_HEAD_SUB=" + std::to_string(q8_hs_n) +
                         (q8_mhred_on ? " -D FA_CL_MHRED=1" : "") + opts_q8_maskb + opts_q8_masksg +
                         opts_q8_int + opts_q8_probe;
                     cl_program prog_q8_hs2 = build_program_from_source_ex_cached(
@@ -12673,6 +12687,7 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
                             if (ggml_opencl_fa_kernel_fits_wg(backend_ctx, k_hs, 128,
                                                               "flash_attn_f32_q8_0_q1_vec_mq_split_c8 (hs2)", dk, dv)) {
                                 backend_ctx->fa.f32_q8_0_q1_vec_mq_split_g8_c8_hs2[{dk, dv}] = k_hs;
+                                backend_ctx->fa.f32_q8_0_q1_vec_mq_split_g8_c8_hs2_sub[{dk, dv}] = q8_hs_n;
                                 ggml_opencl_log_fa_kernel_spill(backend_ctx, k_hs,
                                     "flash_attn_f32_q8_0_q1_vec_mq_split_g8_c8_hs2", dk, dv);
                             } else {
@@ -33614,7 +33629,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
                 fd_mq_wg   = 192;
             // q8_0 KV — DK=DV=128 GQA=8 (Qwen3-30B-A3B q8 KV path); n_q==1 only for now
             } else if (nq1_only && is_q8_0 && gqa_ratio_dispatch == 8 &&
-                d_head_q == 64 && d_head_v == 64 &&
+                ((d_head_q == 64 && d_head_v == 64) || (d_head_q == 128 && d_head_v == 128)) &&
                 n_head == n_head_kv * 8 &&
                 (backend_ctx->fa.f32_q8_0_q1_vec_mq_split_g8_c8.count(dk_dv) > 0 ||
                  backend_ctx->fa.f32_q8_0_q1_vec_mq_split_g8_c8_hs2.count(dk_dv) > 0)) {
@@ -33628,7 +33643,8 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
                 // left unexplained.
                 if (backend_ctx->fa.f32_q8_0_q1_vec_mq_split_g8_c8_hs2.count(dk_dv) > 0) {
                     fd_k_split   = backend_ctx->fa.f32_q8_0_q1_vec_mq_split_g8_c8_hs2.at(dk_dv);
-                    fd_head_sub  = 2;
+                    fd_head_sub  = backend_ctx->fa.f32_q8_0_q1_vec_mq_split_g8_c8_hs2_sub.count(dk_dv) > 0
+                                 ? backend_ctx->fa.f32_q8_0_q1_vec_mq_split_g8_c8_hs2_sub.at(dk_dv) : 2;
                 } else {
                     fd_k_split   = backend_ctx->fa.f32_q8_0_q1_vec_mq_split_g8_c8.at(dk_dv);
                 }
