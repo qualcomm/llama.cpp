@@ -130,7 +130,7 @@ inline float get_alibi_slope(float max_bias, int head_idx, int n_head_log2, floa
     return pow(base, (float)exph);
 }
 
-#ifndef FA_MQ_SPLIT_ONLY  // the narrow MQ program carries q1_vec_mq_split (+ merge) alone
+#if !defined(FA_MQ_SPLIT_ONLY) && !defined(FA_Q8_VEC_ONLY)  // the narrow MQ / DK=512 vec programs carry one kernel (+ merge)
 // q1 decode: one query row per WG, threads sweep KV positions.
 __kernel void flash_attn_f32_q8_0_q1(
     const global void * q_void, ulong q_offset,
@@ -562,7 +562,7 @@ __kernel void flash_attn_f32_q8_0_q1_vec(
 // Merge kernel from flash_attn_f32_f16.cl is type-agnostic and reused.
 #define FA_PARTIAL_FLOATS (2 + DV)
 
-#ifndef FA_MQ_SPLIT_ONLY  // the narrow MQ program carries q1_vec_mq_split (+ merge) alone
+#if !defined(FA_MQ_SPLIT_ONLY) && !defined(FA_Q8_VEC_ONLY)  // the narrow MQ / DK=512 vec programs carry one kernel (+ merge)
 __kernel void flash_attn_f32_q8_0_q1_split(
     const global void * q_void, ulong q_offset,
     const global void * k_void, ulong k_offset,
@@ -813,6 +813,7 @@ __kernel void flash_attn_f32_q8_0_q1_split(
 #endif
 #define MQ_SPLIT_WG_SIZE_Q8 (Q1_WG_SIZE * MQ_NSG_SPLIT)
 
+#ifndef FA_Q8_VEC_ONLY
 REQD_SUBGROUP_SIZE_64
 __kernel void flash_attn_f32_q8_0_q1_vec_mq_split(
     const global void * q_void, ulong q_offset,
@@ -1117,6 +1118,7 @@ __kernel void flash_attn_f32_q8_0_q1_vec_mq_split(
     }
 }
 #undef FA_Q8MQ_HEAD_IDX
+#endif  // !FA_Q8_VEC_ONLY (q1_vec_mq_split)
 
 // ---------------------------------------------------------------------------
 // flash_attn_f32_q8_0_q1_vec_mq_split_c8 ? cluster-parallel variant of the MQ
@@ -1133,7 +1135,7 @@ __kernel void flash_attn_f32_q8_0_q1_vec_mq_split(
 // pathology, so no g8 program is compiled for it).
 // ---------------------------------------------------------------------------
 
-#if defined(HAS_SUBGROUP_SHUFFLE) && !defined(FA_MQ_SPLIT_ONLY)
+#if defined(HAS_SUBGROUP_SHUFFLE) && !defined(FA_MQ_SPLIT_ONLY) && !defined(FA_Q8_VEC_ONLY)
 
 #ifndef FA_CL_C
 #define FA_CL_C 8
@@ -1719,7 +1721,7 @@ __kernel void flash_attn_f32_q8_0_q1_vec_mq_split_c8(
 #endif  // DK_VEC/DV_VEC divisible by FA_CL_C
 #endif  // HAS_SUBGROUP_SHUFFLE (q1_vec_mq_split_c8)
 
-#ifndef FA_MQ_SPLIT_ONLY  // the narrow MQ program carries q1_vec_mq_split (+ merge) alone
+#if !defined(FA_MQ_SPLIT_ONLY) && !defined(FA_Q8_VEC_ONLY)  // the narrow MQ / DK=512 vec programs carry one kernel (+ merge)
 __kernel void flash_attn_f32_q8_0(
     const global void * q_void, ulong q_offset,
     const global void * k_void, ulong k_offset,

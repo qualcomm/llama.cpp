@@ -11545,6 +11545,52 @@ static bool ggml_opencl_ensure_fa_f32_f16_vec_512(ggml_backend_opencl_context * 
     return true;
 }
 
+// q8_0-KV twin: q1_vec alone from the q8_0 source (FA_Q8_VEC_ONLY), since no shared q8_0 program
+// builds at DK=512 either. It is the q8_0 decode kernel the dispatch stands on at this size (the
+// narrow MQ split takes over where it applies); without one the host would dequantise the whole
+// cache to f32 on every call.
+static bool ggml_opencl_ensure_fa_q8_vec_512(ggml_backend_opencl_context * backend_ctx) {
+    const int dk = 512, dv = 512;
+    const std::pair<int, int> dk_dv = {dk, dv};
+    if (backend_ctx->fa.f32_q8_0_q1_vec.count(dk_dv) > 0) return true;
+
+    static bool failed = false;
+    if (failed) return false;
+    if (backend_ctx->kernel_compile_opts.empty()) return false;   // reachable from supports_op before load
+
+    const ggml_opencl_fa_dim * cfg = nullptr;
+    for (const auto & d : g_opencl_fa_dims) {
+        if (d.dk == dk && d.dv == dv) { cfg = &d; break; }
+    }
+    if (cfg == nullptr) { failed = true; return false; }
+
+    const std::string opts = ggml_opencl_fa_compile_opts(backend_ctx, cfg, FA_VARIANT_Q8_0) + " -D FA_Q8_VEC_ONLY";
+    cl_program prog = build_program_from_source_ex_cached(
+        backend_ctx, ggml_opencl_fa_kernel_src(FA_VARIANT_Q8_0).c_str(), opts,
+        /*fatal=*/false, "fa q8_0 decode512 vec", /*bin_size=*/0, backend_ctx->queue);
+    if (!prog) { failed = true; return false; }
+
+    cl_int err;
+    cl_kernel k = clCreateKernel(prog, "flash_attn_f32_q8_0_q1_vec", &err);
+    if (err != CL_SUCCESS) { clReleaseProgram(prog); failed = true; return false; }
+    if (!ggml_opencl_fa_kernel_fits_wg(backend_ctx, k, 256, "flash_attn_f32_q8_0_q1_vec (decode512)", dk, dv)) {
+        clReleaseKernel(k);
+        clReleaseProgram(prog);
+        failed = true;
+        return false;
+    }
+    if (!backend_ctx->fa.f32_merge.count(dk_dv)) {
+        cl_kernel k_merge = clCreateKernel(prog, "flash_attn_f32_merge", &err);
+        if (err == CL_SUCCESS) {
+            backend_ctx->fa.f32_merge[dk_dv] = k_merge;
+        }
+    }
+    backend_ctx->fa.f32_q8_0_q1_vec[dk_dv] = k;
+    ggml_opencl_log_fa_kernel_spill(backend_ctx, k, "flash_attn_f32_q8_0_q1_vec (decode512)", dk, dv);
+    clReleaseProgram(prog);
+    return true;
+}
+
 // DK=512 decode, KV-head-coalesced + flash-decoding split, in its own program.
 //
 // q1_vec still reads the KV cache once per QUERY head: gemma-4-E4B is
@@ -19333,8 +19379,20 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                     return false;
                 }
                 if (!is_f32_f16) {
-                    // q8_0 KV: prefill on the int8 decomposed path only (see the predicate).
-                    return is_f32_q8_0 && q->ne[1] > 1 && ggml_cl_fa_q8_dk512_prefill_ok(backend_ctx, op);
+                    if (!is_f32_q8_0) {
+                        return false;
+                    }
+                    if (q->ne[1] == 1) {
+                        // q8_0 KV decode: q1_vec in its own program, the narrow MQ split on top
+                        // where it applies. GGML_OPENCL_FA_DK512_DECODE=0 opts out as for f16.
+                        const char * dk512_env = getenv("GGML_OPENCL_FA_DK512_DECODE");
+                        if (dk512_env != NULL && dk512_env[0] == '0') {
+                            return false;
+                        }
+                        return ggml_opencl_ensure_fa_q8_vec_512(backend_ctx);
+                    }
+                    // q8_0 KV prefill: the int8 decomposed path only (see the predicate).
+                    return ggml_cl_fa_q8_dk512_prefill_ok(backend_ctx, op);
                 }
                 if (q->ne[1] == 1) {
                     // Decode (n_q==1): the DK=512 q1 GPU decode path is correct but
@@ -30917,6 +30975,9 @@ static cl_kernel ggml_cl_fa_kq_p8_dk512(ggml_backend_opencl_context * backend_ct
     if (tried || backend_ctx->fa_kq_tn != 32) {
         return backend_ctx->kernel_mul_mm_q8_kq_p8_dk512;
     }
+    if (backend_ctx->kernel_compile_opts.empty()) {
+        return nullptr;   // reachable from supports_op before load; do not latch the refusal
+    }
     tried = true;
 #ifdef GGML_OPENCL_EMBED_KERNELS
     const std::string kernel_src {
@@ -32807,6 +32868,12 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         } else {
             ggml_opencl_ensure_fa_variant(backend_ctx, d_head_q, d_head_v, FA_VARIANT_F32_F16_SPLIT);
         }
+    } else if (is_q8_0 && fa_decode_only_512) {
+        // DK=512: no shared q8_0 program fits the compiler. Decode runs q1_vec (+ the narrow MQ
+        // split below); prefill never gets here (the int8 decomposed or the WMM path takes it).
+        if (n_q == 1) {
+            ggml_opencl_ensure_fa_q8_vec_512(backend_ctx);
+        }
     } else if (is_q8_0) {
         ggml_opencl_ensure_fa_variant(backend_ctx, d_head_q, d_head_v, FA_VARIANT_Q8_0);
         if (d_head_q == 96 && d_head_v == 96) {
@@ -33013,15 +33080,16 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     // q8_0 KV: the same narrow program built from the q8_0 source, for the shapes whose only q8_0
     // decode route was the per-query-head q1 family (re-reading the cache gqa times): DK=256 at
     // any of these fan-outs (Qwen3.5 gqa 8, Qwen3.8 gqa 6, gemma-4 SWA) and DK=128 at gqa 16
-    // (Nemotron-H, muse). Same head_sub / workgroup table as the f16 program. DK=512 is not here:
-    // there is no shared q8_0 program at that size for the rest of the dispatch to stand on.
+    // (Nemotron-H, muse), and DK=512 (gemma-4 global layers, where q1_vec is the only other q8_0
+    // decode kernel). Same head_sub / workgroup table as the f16 program.
     // GGML_OPENCL_FA_MQN_Q8=0 opts out.
     static const bool mqn_q8 = !ggml_cl_env_flag_zero("GGML_OPENCL_FA_MQN_Q8");
     if (mqn_q8 && n_q == 1 && is_q8_0 && d_head_q == d_head_v && n_head_kv > 0 &&
-        (d_head_q == 256 || (d_head_q == 128 && n_head / n_head_kv == 16))) {
+        (d_head_q == 512 || d_head_q == 256 || (d_head_q == 128 && n_head / n_head_kv == 16))) {
         const int gqa = n_head / n_head_kv;
         if (n_head % n_head_kv == 0 && (gqa == 2 || gqa == 4 || gqa == 6 || gqa == 8 || gqa == 16)) {
-            int hs  = (d_head_q == 128 && gqa == 16) ? 16 : ((gqa == 8) ? 2 : 1);
+            int hs  = (d_head_q == 512) ? ((gqa == 8) ? 4 : ((gqa == 16) ? 8 : 1))
+                    : (d_head_q == 128 && gqa == 16) ? 16 : ((gqa == 8) ? 2 : 1);
             int nsg = (d_head_q == 256 && gqa == 8) ? 2 : 4;
             static const int q8_hs_env = []{ const char * e = getenv("GGML_OPENCL_FA_MQN_Q8_HS");
                                              return (e && e[0]) ? atoi(e) : 0; }();
@@ -33033,8 +33101,10 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     }
 
     const std::pair<int, int> dk_dv = {d_head_q, d_head_v};
+    // DK=512 has q1_vec only (ggml_opencl_ensure_fa_q8_vec_512), no q1.
     const bool use_native_q8_0_q1 = is_q8_0 && n_q == 1 &&
-                                    backend_ctx->fa.f32_q8_0_q1.count(dk_dv) > 0;
+                                    (backend_ctx->fa.f32_q8_0_q1.count(dk_dv) > 0 ||
+                                     backend_ctx->fa.f32_q8_0_q1_vec.count(dk_dv) > 0);
     // Native q8_0 prefill — reads q8_0 directly, wg_size = cfg->bm.
     const bool use_native_q8_0 = is_q8_0 && n_q > 1 &&
                                  backend_ctx->fa.f32_q8_0.count(dk_dv) > 0;
@@ -33187,7 +33257,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
             // DDR. Opt-out GGML_OPENCL_FA_Q8_VEC=0 forces legacy q1 (A/B / safety).
             const char * q8vec_env = getenv("GGML_OPENCL_FA_Q8_VEC");
             const bool   q8vec_off = (q8vec_env != NULL) && (q8vec_env[0] == '0');
-            if (!q8vec_off && d_head_v >= 256 &&
+            if ((!q8vec_off || backend_ctx->fa.f32_q8_0_q1.count(dk_dv) == 0) && d_head_v >= 256 &&
                 backend_ctx->fa.f32_q8_0_q1_vec.count(dk_dv) > 0) {
                 kernel = backend_ctx->fa.f32_q8_0_q1_vec.at(dk_dv);
                 use_q1_vec = true;
