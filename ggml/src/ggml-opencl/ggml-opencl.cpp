@@ -30487,6 +30487,10 @@ static constexpr int FD_MAX_N_Q_MULTI_WIDE  = 4;
 // measured +17-25% tg on Qwen3-4B q8_0 KV. The non-MQ split already spreads
 // KV across 64 lanes (short recurrence) so it keeps FD_KV_PER_SPLIT.
 static constexpr int FD_MQ_KV_PER_SPLIT = 256;
+// The dk=128 GQA8 head-split route (Qwen3-30B-A3B class) wants longer slices: X2-90 tg128 +2.5% @d8192 and
+// +5.8% @d32768 at 512 vs 256. As a global value 512 was mixed (Qwen3.5-35B -5%, E4B -2% at depth), so it
+// applies to that route only.
+static constexpr int FD_MQ_KV_PER_SPLIT_G8HS = 512;
 static constexpr int FD_MQ_MAX_SPLITS   = 128;
 // Position-parallel block-softmax (ppb) decode FA runs a WG of ONE 32-wide
 // subgroup, so it needs ~3x more work-groups than the c8 MQ path (WG=96) to
@@ -33198,6 +33202,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     cl_kernel fd_k_split = NULL;
     bool use_fd_mq = false;
     bool use_ppb   = false;  // position-parallel block-softmax kernel (finer split)
+    bool fd_g8hs   = false;  // dk=128 GQA8 head-split route (takes FD_MQ_KV_PER_SPLIT_G8HS)
     size_t fd_mq_wg = 256;  // MQ_GQA=4 kernel: Q1_WG_SIZE(64) * MQ_NSG_SPLIT(4)
     int    fd_head_sub = 1; // workgroups per gqa group (FA_HEAD_SUB in the kernel)
     bool use_fa_k_img = false;  // K bound as image1d_buffer_t instead of (buf, offset)
@@ -33491,6 +33496,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
                 use_fd_mq   = true;
                 fd_mq_wg    = (size_t) backend_ctx->fa.f32_f16_q1_vec_mq_split_g8_hs2_wg.at(dk_dv);
                 fd_head_sub = backend_ctx->fa.f32_f16_q1_vec_mq_split_g8_hs2_sub.at(dk_dv);
+                fd_g8hs     = true;
             // Cluster-parallel decode for the g8
             } else if (is_mixed && gqa_ratio_dispatch == 8 &&
                 d_head_q == 128 && d_head_v == 128 &&
@@ -33946,7 +33952,8 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
             return (e && e[0]) ? atoi(e) : 0;
         }();
         int fd_kv_per_split = use_ppb ? FD_PPB_KV_PER_SPLIT
-                                      : (use_fd_mq ? FD_MQ_KV_PER_SPLIT : FD_KV_PER_SPLIT);
+                                      : (use_fd_mq ? (fd_g8hs ? FD_MQ_KV_PER_SPLIT_G8HS : FD_MQ_KV_PER_SPLIT)
+                                                   : FD_KV_PER_SPLIT);
         int fd_max_splits   = use_fd_mq ? FD_MQ_MAX_SPLITS   : FD_MAX_SPLITS;
         if (fd_env_kv_per_split > 0) fd_kv_per_split = fd_env_kv_per_split;
         if (fd_env_max_splits   > 0) fd_max_splits   = fd_env_max_splits;
