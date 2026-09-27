@@ -32691,13 +32691,6 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     if (n_q > 1 && ggml_cl_flash_attn_decompose(backend, q, k, v, mask, sinks, dst)) {
         return;
     }
-    // supports_op admits q8_0 KV at DK=512 prefill only for shapes the decomposed path takes
-    // (ggml_cl_fa_q8_dk512_prefill_ok); there is no other GPU kernel for it.
-    if (fa_decode_only_512 && n_q > 1 && k->type == GGML_TYPE_Q8_0) {
-        GGML_ABORT("ggml_opencl: q8_0-KV DK=512 prefill was admitted but the decomposed path declined it "
-                   "(GGML_OPENCL_KQKV_TRACE=1 shows why)");
-    }
-
     cl_kernel kernel = NULL;
     bool use_prefill_k_img = false;  // DK=512 prefill tile with K bound as image1d_buffer_t
 
@@ -32713,6 +32706,12 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         return;
     }
 #endif
+    // q8_0 KV at DK=512 prefill has only the decomposed path and the WMM path above; supports_op
+    // admits it for exactly those shapes (ggml_cl_fa_q8_dk512_prefill_ok, use_fa_bin_kernels_prefill).
+    if (fa_decode_only_512 && n_q > 1 && is_q8_0) {
+        GGML_ABORT("ggml_opencl: q8_0-KV DK=512 prefill was admitted but neither the decomposed nor the "
+                   "WMM path took it (GGML_OPENCL_KQKV_TRACE=1 shows why the decomposed path declined)");
+    }
 
     if (is_f16) {
         ggml_opencl_ensure_fa_variant(backend_ctx, d_head_q, d_head_v, FA_VARIANT_F16);
