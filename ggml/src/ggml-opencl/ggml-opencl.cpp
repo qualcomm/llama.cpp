@@ -832,6 +832,9 @@ struct ggml_opencl_fa_kernels {
     std::map<std::tuple<int, int, int>, cl_kernel> mq_narrow_k_img;  // same, K as image1d_buffer_t
     std::map<std::tuple<int, int, int>, int>       mq_narrow_wg;
     std::map<std::tuple<int, int, int>, int>       mq_narrow_hs;
+    std::map<std::tuple<int, int, int>, cl_kernel> mq_narrow_q8;     // q8_0-KV twin of mq_narrow
+    std::map<std::tuple<int, int, int>, int>       mq_narrow_q8_wg;
+    std::map<std::tuple<int, int, int>, int>       mq_narrow_q8_hs;
     int fa_hs_wg  = 128;  // workgroup size of the head-split program
     int fa_hs_sub = 2;    // FA_HEAD_SUB it was built with
     std::map<std::pair<int, int>, cl_kernel> f32_q8_0;               // prefill (baseline)
@@ -11640,6 +11643,76 @@ static bool ggml_opencl_ensure_fa_mq_narrow(ggml_backend_opencl_context * backen
     }
     for (int nsg = nsg_split; nsg >= 1; nsg /= 2) {
         if (ggml_opencl_try_fa_mq_narrow(backend_ctx, dk, dv, gqa, head_sub, nsg, k_img)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// q8_0-KV twin of the narrow MQ split program: flash_attn_f32_q8_0_q1_vec_mq_split alone
+// (FA_MQ_SPLIT_ONLY), with the f16 program's MQ_GQA / MQ_NSG_SPLIT / FA_HEAD_SUB and dp4a QK
+// against the raw q8_0 K bytes. Registers the merge kernel for (dk, dv) when none is there yet.
+static bool ggml_opencl_try_fa_mq_narrow_q8(ggml_backend_opencl_context * backend_ctx,
+                                            int dk, int dv, int gqa, int head_sub, int nsg_split) {
+    const std::tuple<int, int, int> key = {dk, dv, gqa};
+    if (backend_ctx->fa.mq_narrow_q8.count(key) > 0) return true;
+
+    static std::set<std::tuple<int, int, int, int>> failed;
+    const std::tuple<int, int, int, int> fkey = {dk, dv, gqa, nsg_split};
+    if (failed.count(fkey) > 0) return false;
+
+    const ggml_opencl_fa_dim * cfg = nullptr;
+    for (const auto & d : g_opencl_fa_dims) {
+        if (d.dk == dk && d.dv == dv) { cfg = &d; break; }
+    }
+    if (cfg == nullptr) { failed.insert(fkey); return false; }
+
+    const size_t wg = (size_t) 64 * nsg_split;
+    const std::string opts = ggml_opencl_fa_compile_opts(backend_ctx, cfg, FA_VARIANT_Q8_0) +
+                             " -D FA_MQ_SPLIT_ONLY -D MQ_GQA=" + std::to_string(gqa / head_sub) +
+                             " -D MQ_NSG_SPLIT=" + std::to_string(nsg_split) +
+                             " -D FA_HEAD_SUB=" + std::to_string(head_sub);
+    const std::string tag = "fa q8_0 mq_split narrow dk" + std::to_string(dk) + " gqa" + std::to_string(gqa) +
+                            " hs" + std::to_string(head_sub) + " wg" + std::to_string(wg);
+    cl_program prog = build_program_from_source_ex_cached(
+        backend_ctx, ggml_opencl_fa_kernel_src(FA_VARIANT_Q8_0).c_str(), opts,
+        /*fatal=*/false, tag.c_str(), /*bin_size=*/0, backend_ctx->queue);
+    if (!prog) { failed.insert(fkey); return false; }
+
+    cl_int err;
+    cl_kernel k = clCreateKernel(prog, "flash_attn_f32_q8_0_q1_vec_mq_split", &err);
+    if (err != CL_SUCCESS) { clReleaseProgram(prog); failed.insert(fkey); return false; }
+    if (!ggml_opencl_fa_kernel_fits_wg(backend_ctx, k, wg, tag.c_str(), dk, dv)) {
+        clReleaseKernel(k);
+        clReleaseProgram(prog);
+        failed.insert(fkey);
+        return false;
+    }
+    if (!backend_ctx->fa.f32_merge.count({dk, dv})) {
+        cl_kernel k_merge = clCreateKernel(prog, "flash_attn_f32_merge", &err);
+        if (err == CL_SUCCESS) {
+            backend_ctx->fa.f32_merge[{dk, dv}] = k_merge;
+        }
+    }
+    backend_ctx->fa.mq_narrow_q8[key]    = k;
+    backend_ctx->fa.mq_narrow_q8_wg[key] = (int) wg;
+    backend_ctx->fa.mq_narrow_q8_hs[key] = head_sub;
+    ggml_opencl_log_fa_kernel_spill(backend_ctx, k, tag.c_str(), dk, dv);
+    clReleaseProgram(prog);
+    return true;
+}
+
+static bool ggml_opencl_ensure_fa_mq_narrow_q8(ggml_backend_opencl_context * backend_ctx,
+                                               int dk, int dv, int gqa, int head_sub, int nsg_split) {
+    static const int nsg_pin = []{
+        const char * e = getenv("GGML_OPENCL_FA_MQN_NSG");
+        return (e && e[0]) ? atoi(e) : 0;
+    }();
+    if (nsg_pin > 0) {
+        return ggml_opencl_try_fa_mq_narrow_q8(backend_ctx, dk, dv, gqa, head_sub, nsg_pin);
+    }
+    for (int nsg = nsg_split; nsg >= 1; nsg /= 2) {
+        if (ggml_opencl_try_fa_mq_narrow_q8(backend_ctx, dk, dv, gqa, head_sub, nsg)) {
             return true;
         }
     }
@@ -32937,6 +33010,28 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         }
     }
 
+    // q8_0 KV: the same narrow program built from the q8_0 source, for the shapes whose only q8_0
+    // decode route was the per-query-head q1 family (re-reading the cache gqa times): DK=256 at
+    // any of these fan-outs (Qwen3.5 gqa 8, Qwen3.8 gqa 6, gemma-4 SWA) and DK=128 at gqa 16
+    // (Nemotron-H, muse). Same head_sub / workgroup table as the f16 program. DK=512 is not here:
+    // there is no shared q8_0 program at that size for the rest of the dispatch to stand on.
+    // GGML_OPENCL_FA_MQN_Q8=0 opts out.
+    static const bool mqn_q8 = !ggml_cl_env_flag_zero("GGML_OPENCL_FA_MQN_Q8");
+    if (mqn_q8 && n_q == 1 && is_q8_0 && d_head_q == d_head_v && n_head_kv > 0 &&
+        (d_head_q == 256 || (d_head_q == 128 && n_head / n_head_kv == 16))) {
+        const int gqa = n_head / n_head_kv;
+        if (n_head % n_head_kv == 0 && (gqa == 2 || gqa == 4 || gqa == 6 || gqa == 8 || gqa == 16)) {
+            int hs  = (d_head_q == 128 && gqa == 16) ? 16 : ((gqa == 8) ? 2 : 1);
+            int nsg = (d_head_q == 256 && gqa == 8) ? 2 : 4;
+            static const int q8_hs_env = []{ const char * e = getenv("GGML_OPENCL_FA_MQN_Q8_HS");
+                                             return (e && e[0]) ? atoi(e) : 0; }();
+            if (q8_hs_env > 0) hs = q8_hs_env;
+            if (gqa % hs == 0) {
+                ggml_opencl_ensure_fa_mq_narrow_q8(backend_ctx, d_head_q, d_head_v, gqa, hs, nsg);
+            }
+        }
+    }
+
     const std::pair<int, int> dk_dv = {d_head_q, d_head_v};
     const bool use_native_q8_0_q1 = is_q8_0 && n_q == 1 &&
                                     backend_ctx->fa.f32_q8_0_q1.count(dk_dv) > 0;
@@ -33526,7 +33621,8 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
             return (e && e[0]) ? atoi(e) : 2;
         }();
         const bool have_mq_narrow =
-            backend_ctx->fa.mq_narrow.count({d_head_q, d_head_v, gqa_ratio_dispatch}) > 0;
+            backend_ctx->fa.mq_narrow.count({d_head_q, d_head_v, gqa_ratio_dispatch}) > 0 ||
+            (is_q8_0 && backend_ctx->fa.mq_narrow_q8.count({d_head_q, d_head_v, gqa_ratio_dispatch}) > 0);
         const int mq_n_kv_floor = have_mq_narrow
             ? std::min(fd_min_n_kv_mq, mq_narrow_min_n_kv)
             : fd_min_n_kv_mq;
@@ -33759,6 +33855,14 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
                 fd_k_split = backend_ctx->fa.f32_f16_q1_vec_mq_split_g8.at(dk_dv);
                 use_fd_mq  = true;
                 fd_mq_wg   = 192;
+            // q8_0 KV narrow MQ split (DK=256, DK=128 gqa 16); built above only for those shapes.
+            } else if (nq1_only && is_q8_0 &&
+                backend_ctx->fa.mq_narrow_q8.count({d_head_q, d_head_v, gqa_ratio_dispatch}) > 0) {
+                const std::tuple<int, int, int> nk = {d_head_q, d_head_v, gqa_ratio_dispatch};
+                fd_k_split  = backend_ctx->fa.mq_narrow_q8.at(nk);
+                use_fd_mq   = true;
+                fd_mq_wg    = (size_t) backend_ctx->fa.mq_narrow_q8_wg.at(nk);
+                fd_head_sub = backend_ctx->fa.mq_narrow_q8_hs.at(nk);
             // q8_0 KV — DK=DV=128 GQA=8 (Qwen3-30B-A3B q8 KV path); n_q==1 only for now
             } else if (nq1_only && is_q8_0 && gqa_ratio_dispatch == 8 &&
                 ((d_head_q == 64 && d_head_v == 64) || (d_head_q == 128 && d_head_v == 128)) &&

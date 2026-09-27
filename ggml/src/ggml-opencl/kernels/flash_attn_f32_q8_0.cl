@@ -130,6 +130,7 @@ inline float get_alibi_slope(float max_bias, int head_idx, int n_head_log2, floa
     return pow(base, (float)exph);
 }
 
+#ifndef FA_MQ_SPLIT_ONLY  // the narrow MQ program carries q1_vec_mq_split (+ merge) alone
 // q1 decode: one query row per WG, threads sweep KV positions.
 __kernel void flash_attn_f32_q8_0_q1(
     const global void * q_void, ulong q_offset,
@@ -318,6 +319,7 @@ __kernel void flash_attn_f32_q8_0_q1(
         for (int i = 0; i < DV_VEC; ++i) o_row[i] = (O_DATA_TYPE4)(0.0f);
     }
 }
+#endif  // !FA_MQ_SPLIT_ONLY
 
 #ifdef cl_intel_subgroups
 #pragma OPENCL EXTENSION cl_intel_subgroups : enable
@@ -382,6 +384,7 @@ inline float4 dequant_q8_0_lane_probe(const global char * block_ptr, int lane) {
 #define FA_Q8_INT_QK 1
 #endif
 
+#ifndef FA_MQ_SPLIT_ONLY  // the narrow MQ program carries q1_vec_mq_split (+ merge) alone
 REQD_SUBGROUP_SIZE_64
 __kernel void flash_attn_f32_q8_0_q1_vec(
     const global void * q_void, ulong q_offset,
@@ -553,11 +556,13 @@ __kernel void flash_attn_f32_q8_0_q1_vec(
         }
     }
 }
+#endif  // !FA_MQ_SPLIT_ONLY
 
 // Flash-decoding split pass for q8_0 KV. Partial record: [m, l, O[DV]].
 // Merge kernel from flash_attn_f32_f16.cl is type-agnostic and reused.
 #define FA_PARTIAL_FLOATS (2 + DV)
 
+#ifndef FA_MQ_SPLIT_ONLY  // the narrow MQ program carries q1_vec_mq_split (+ merge) alone
 __kernel void flash_attn_f32_q8_0_q1_split(
     const global void * q_void, ulong q_offset,
     const global void * k_void, ulong k_offset,
@@ -743,6 +748,7 @@ __kernel void flash_attn_f32_q8_0_q1_split(
         }
     }
 }
+#endif  // !FA_MQ_SPLIT_ONLY
 
 // Prefill: q8_0 K/V, n_q > 1. BLOCK_M ? BLOCK_N tiling.
 // K path keeps packed int8 in local for dp4a QK dot; V path dequant -> half in local.
@@ -802,6 +808,9 @@ __kernel void flash_attn_f32_q8_0_q1_split(
 #ifndef MQ_NSG_SPLIT
 #define MQ_NSG_SPLIT 4
 #endif
+#ifndef FA_HEAD_SUB
+#define FA_HEAD_SUB 1
+#endif
 #define MQ_SPLIT_WG_SIZE_Q8 (Q1_WG_SIZE * MQ_NSG_SPLIT)
 
 REQD_SUBGROUP_SIZE_64
@@ -841,8 +850,14 @@ __kernel void flash_attn_f32_q8_0_q1_vec_mq_split(
     const int split_idx        = split_q_idx % n_splits;
     const int q_idx            = split_q_idx / n_splits;
 
-    const int batch_idx   = kvhead_batch_idx / n_head_kv;
-    const int head_kv_idx = kvhead_batch_idx % n_head_kv;
+    // FA_HEAD_SUB > 1 splits the gqa group across that many workgroups (same scheme as the f16
+    // narrow kernel and the q8_0 cluster kernel below); at 1 this is the original indexing.
+    const int hgroups     = n_head_kv * FA_HEAD_SUB;
+    const int batch_idx   = kvhead_batch_idx / hgroups;
+    const int hg          = kvhead_batch_idx % hgroups;
+    const int head_kv_idx = hg / FA_HEAD_SUB;
+    const int head_sub    = hg % FA_HEAD_SUB;
+#define FA_Q8MQ_HEAD_IDX(h) (head_kv_idx * (MQ_GQA * FA_HEAD_SUB) + head_sub * MQ_GQA + (h))
 
     const int kv_start = split_idx * kv_per_split;
     const int kv_end   = min(kv_start + kv_per_split, n_kv);
@@ -854,7 +869,7 @@ __kernel void flash_attn_f32_q8_0_q1_vec_mq_split(
         if (tid == 0) {
             #pragma unroll
             for (int h = 0; h < MQ_GQA; ++h) {
-                const int head_idx = head_kv_idx * MQ_GQA + h;
+                const int head_idx = FA_Q8MQ_HEAD_IDX(h);
                 const ulong rec_idx = ((((ulong) batch_idx * n_head + head_idx) * n_q + q_idx)
                                        * n_splits + split_idx);
                 global float * rec = partial_void + rec_idx * record_stride;
@@ -874,7 +889,7 @@ __kernel void flash_attn_f32_q8_0_q1_vec_mq_split(
     for (int i = tid; i < MQ_GQA * DK_VEC; i += MQ_SPLIT_WG_SIZE_Q8) {
         const int h        = i / DK_VEC;
         const int k        = i % DK_VEC;
-        const int head_idx = head_kv_idx * MQ_GQA + h;
+        const int head_idx = FA_Q8MQ_HEAD_IDX(h);
         const ulong q_row_offset = batch_idx * q_nb3 + head_idx * q_nb2 + (ulong) q_idx * q_nb1;
         const global Q_DATA_TYPE4 * q_ptr = (const global Q_DATA_TYPE4 *) (q_base + q_row_offset);
         q_shared[h * DK_VEC + k] = CONVERT_Q_ACC4(q_ptr[k]);
@@ -907,7 +922,7 @@ __kernel void flash_attn_f32_q8_0_q1_vec_mq_split(
     float slope[MQ_GQA];
     #pragma unroll
     for (int h = 0; h < MQ_GQA; ++h) {
-        slope[h] = get_alibi_slope(max_bias, head_kv_idx * MQ_GQA + h, n_head_log2, m0, m1);
+        slope[h] = get_alibi_slope(max_bias, FA_Q8MQ_HEAD_IDX(h), n_head_log2, m0, m1);
     }
 
     const global char * mask_base[MQ_GQA];
@@ -918,7 +933,7 @@ __kernel void flash_attn_f32_q8_0_q1_vec_mq_split(
                                           (ulong) q_idx * mask_nb1;
         #pragma unroll
         for (int h = 0; h < MQ_GQA; ++h) {
-            const int head_idx      = head_kv_idx * MQ_GQA + h;
+            const int head_idx      = FA_Q8MQ_HEAD_IDX(h);
             const int mask_head_idx = head_idx % mask_ne2;
             mask_base[h] = mask_base_b + mask_head_idx * mask_nb2;
         }
@@ -1066,7 +1081,7 @@ __kernel void flash_attn_f32_q8_0_q1_vec_mq_split(
         barrier(CLK_LOCAL_MEM_FENCE);
 
         if (sgid == 0) {
-            const int head_idx = head_kv_idx * MQ_GQA + h;
+            const int head_idx = FA_Q8MQ_HEAD_IDX(h);
 
             ACC_TYPE m_c = sg_m[h][0];
             #pragma unroll
@@ -1101,6 +1116,7 @@ __kernel void flash_attn_f32_q8_0_q1_vec_mq_split(
         barrier(CLK_LOCAL_MEM_FENCE);
     }
 }
+#undef FA_Q8MQ_HEAD_IDX
 
 // ---------------------------------------------------------------------------
 // flash_attn_f32_q8_0_q1_vec_mq_split_c8 ? cluster-parallel variant of the MQ
@@ -1117,7 +1133,7 @@ __kernel void flash_attn_f32_q8_0_q1_vec_mq_split(
 // pathology, so no g8 program is compiled for it).
 // ---------------------------------------------------------------------------
 
-#ifdef HAS_SUBGROUP_SHUFFLE
+#if defined(HAS_SUBGROUP_SHUFFLE) && !defined(FA_MQ_SPLIT_ONLY)
 
 #ifndef FA_CL_C
 #define FA_CL_C 8
@@ -1703,6 +1719,7 @@ __kernel void flash_attn_f32_q8_0_q1_vec_mq_split_c8(
 #endif  // DK_VEC/DV_VEC divisible by FA_CL_C
 #endif  // HAS_SUBGROUP_SHUFFLE (q1_vec_mq_split_c8)
 
+#ifndef FA_MQ_SPLIT_ONLY  // the narrow MQ program carries q1_vec_mq_split (+ merge) alone
 __kernel void flash_attn_f32_q8_0(
     const global void * q_void, ulong q_offset,
     const global void * k_void, ulong k_offset,
@@ -2208,6 +2225,7 @@ __kernel void flash_attn_f32_q8_0(
         }
     }
 }
+#endif  // !FA_MQ_SPLIT_ONLY
 
 // FD Pass 2: merge split partials. Identical across q4_0/q8_0/f16; each FA
 // source owns a copy since kernels compile per-source-program.
