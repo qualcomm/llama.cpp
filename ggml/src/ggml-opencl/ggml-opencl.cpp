@@ -12301,7 +12301,11 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
                 // on the 840, FA decode GPU time at d4096 28.8 ms/token at 32 vs 18.4 at 16.
                 const std::string opts_cl_c_hs = backend_ctx->fa_c8_cluster
                     ? " -D FA_CL_C=" + std::to_string(backend_ctx->fa_c8_cluster) : std::string();
-                const std::string opts_hs = opts +
+                // V loads hoisted to the top of the c8 loop (FA_CL_VPRE): same arithmetic, the loads no longer wait
+                // behind the dot/reduce/exp chain. Qwen3-30B-A3B on X2-90: FA decode -12% per call at kv 8192 and
+                // -9% at 32768; tg128 +5.0% @d8192, +8.9% @d32768. Opt out with GGML_OPENCL_FA_VPRE=0.
+                static const bool hs_vpre = !ggml_cl_env_flag_zero("GGML_OPENCL_FA_VPRE");
+                const std::string opts_hs = opts + (hs_vpre ? " -D FA_CL_VPRE" : "") +
                     " -D FA_MQ_ONLY -D MQ_GQA=" + std::to_string(8 / hs_n) +
                     " -D MQ_NSG=" + std::to_string(hs_nsg) +
                     " -D MQ_NSG_SPLIT=" + std::to_string(hs_nsg) +

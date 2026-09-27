@@ -2592,6 +2592,14 @@ __kernel void flash_attn_f32_f16_q1_vec_mq_split_c8(
             o_acc[h][0] = mad(p, v_vec_1, o_acc[h][0] * sp);
         }
 #else
+#ifdef FA_CL_VPRE
+        // Issue this row's V loads now, beside K: they do not depend on the score, and left at the
+        // bottom of the iteration their latency sits behind the whole dot/reduce/exp chain.
+        // Held as raw half4 until use; the arithmetic is unchanged.
+        KV_DATA_TYPE4 v_pre[FA_CL_DV];
+        #pragma unroll
+        for (int i = 0; i < FA_CL_DV; ++i) v_pre[i] = v_ptr[lic + FA_CL_C * i];
+#endif
         // Dot: this lane covers DK elements {lic + FA_CL_C*i} of the cluster's row.
         ACC_TYPE4 dot4[MQ_GQA];
         #pragma unroll
@@ -2701,7 +2709,11 @@ __kernel void flash_attn_f32_f16_q1_vec_mq_split_c8(
         // V accumulate on this lane's DV slice (p = 0 on tail -> inert).
         #pragma unroll
         for (int i = 0; i < FA_CL_DV; ++i) {
+#ifdef FA_CL_VPRE
+            const ACC_TYPE4 v_vec = CONVERT_KV_ACC4(v_pre[i]);
+#else
             const ACC_TYPE4 v_vec = CONVERT_KV_ACC4(v_ptr[lic + FA_CL_C * i]);
+#endif
             #pragma unroll
             for (int h = 0; h < MQ_GQA; ++h) {
                 o_acc[h][i] = mad(p_h[h], v_vec, o_acc[h][i] * sp_h[h]);
