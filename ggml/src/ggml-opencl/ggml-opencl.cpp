@@ -1341,6 +1341,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mm_q8_kqv;
     cl_kernel kernel_mul_mm_q8_kq;
     cl_kernel kernel_mul_mm_q8_kq_p8 = nullptr;   // fused-softmax variant, only when KQ_TN == 32
+    cl_kernel kernel_mul_mm_q8_kq_p8_dk512 = nullptr;  // same, KQ_DK_MAX=512, built on first q8_0-KV use
     cl_kernel kernel_fa_q8_rows_f16;
     cl_kernel kernel_fa_q8_rows_f32;
     cl_kernel kernel_fa_q8_rows_q8_0 = nullptr;          // q8_0 KV cache -> the int8 K planes, bit-exact
@@ -18430,6 +18431,62 @@ inline bool use_q4_k_bin_kernels(const ggml_backend_opencl_context *backend_ctx,
 #endif
 }
 
+static cl_kernel ggml_cl_fa_kq_p8_dk512(ggml_backend_opencl_context * backend_ctx);
+
+// q8_0-KV prefill at DK=DV=512 exists on the GPU only as the int8 decomposed path: there is no
+// q8_0 fused tile at DK=512 (a full program there OOMs the compiler) and nothing to fall back to.
+// So admit exactly the shapes that path takes and leave the rest on the CPU. Every condition
+// here restates a gate of ggml_cl_flash_attn_decompose for kv_q8, DK=512 and its default
+// environment; ggml_cl_flash_attn aborts if the two ever disagree.
+static bool ggml_cl_fa_q8_dk512_prefill_ok(ggml_backend_opencl_context * backend_ctx, const ggml_tensor * op) {
+    const ggml_tensor * q    = op->src[0];
+    const ggml_tensor * k    = op->src[1];
+    const ggml_tensor * v    = op->src[2];
+    const ggml_tensor * mask = op->src[3];
+
+    if (backend_ctx->gpu_family != ADRENO ||
+        !(backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E || backend_ctx->adreno_gen == ADRENO_GPU_GEN::A8X ||
+          backend_ctx->adreno_gen == ADRENO_GPU_GEN::X1E)) {
+        return false;
+    }
+    auto env_is = [](const char * name, char c) { const char * e = getenv(name); return e && e[0] == c; };
+    if (env_is("GGML_OPENCL_FA_PREFILL_DECOMPOSE", '0') || env_is("GGML_OPENCL_FA_DECOMPOSE_Q8", '0') ||
+        env_is("GGML_OPENCL_FA_KQV_INT8", '0') || env_is("GGML_OPENCL_FA_SOFTMAX_DEFER_NORM", '0') ||
+        env_is("GGML_OPENCL_FA_KQ_P8", '0') || env_is("GGML_OPENCL_FA_KQ_INT8", '0') ||
+        ggml_cl_env_flag("GGML_OPENCL_FA_DECOMPOSE_GENERIC")) {
+        return false;
+    }
+    const char * min_dk_e = getenv("GGML_OPENCL_FA_DECOMPOSE_MIN_DK");
+    if (min_dk_e && min_dk_e[0] && atoi(min_dk_e) > 512) {
+        return false;
+    }
+    const char * min_nq_e = getenv("GGML_OPENCL_FA_DECOMPOSE_MIN_NQ");
+    const int min_n_q = (min_nq_e && min_nq_e[0]) ? atoi(min_nq_e) : 64;
+
+    const int64_t dk = q->ne[0], dv = v->ne[0], n_q = q->ne[1], n_kv = k->ne[1];
+    const int64_t n_head = q->ne[2], n_head_kv = k->ne[2];
+    const float logit_softcap = ((const float *)op->op_params)[2];
+    if (dk != 512 || dv != 512 || n_q < MAX(min_n_q, 32) || n_kv % 64 != 0 ||
+        q->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32 ||
+        k->type != GGML_TYPE_Q8_0 || v->type != GGML_TYPE_Q8_0 ||
+        ggml_cl_is_q8_0_soa(k) || ggml_cl_is_q8_0_soa(v) ||
+        q->ne[3] != 1 || k->ne[3] != 1 || v->ne[3] != 1 || op->ne[3] != 1 ||
+        n_head_kv <= 0 || n_head % n_head_kv != 0 || logit_softcap != 0.0f ||
+        k->nb[0] != ggml_type_size(GGML_TYPE_Q8_0) || v->nb[0] != ggml_type_size(GGML_TYPE_Q8_0) ||
+        q->nb[0] != sizeof(float) || q->nb[2] != (size_t)dk*sizeof(float) ||
+        q->nb[1] != (size_t)dk*n_head*sizeof(float) ||
+        mask == nullptr || mask->type != GGML_TYPE_F16 || mask->ne[0] < n_kv || (mask->nb[1] % 2) != 0) {
+        return false;
+    }
+    if (backend_ctx->fa_kq_tn != 32 || backend_ctx->kernel_mul_mm_q8_kq_p8 == nullptr ||
+        backend_ctx->kernel_fa_p8_fixup == nullptr || ggml_cl_fa_kq_p8_dk512(backend_ctx) == nullptr) {
+        return false;
+    }
+    ggml_opencl_ensure_fa_pre_kernels(backend_ctx, 512, 512);
+    return backend_ctx->kernel_fa_v_transpose_q8_q8_0 != nullptr &&
+           backend_ctx->fa.v_transpose_f16.count({512, 512}) > 0;
+}
+
 static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     ggml_backend_opencl_device_context * dev_ctx     = (ggml_backend_opencl_device_context *)dev->context;
     ggml_backend_opencl_context *        backend_ctx = dev_ctx->backend_ctx;
@@ -19203,7 +19260,8 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                     return false;
                 }
                 if (!is_f32_f16) {
-                    return false;
+                    // q8_0 KV: prefill on the int8 decomposed path only (see the predicate).
+                    return is_f32_q8_0 && q->ne[1] > 1 && ggml_cl_fa_q8_dk512_prefill_ok(backend_ctx, op);
                 }
                 if (q->ne[1] == 1) {
                     // Decode (n_q==1): the DK=512 q1 GPU decode path is correct but
@@ -30666,7 +30724,8 @@ static void ggml_cl_fa_kq_p8_dispatch(ggml_backend_t backend,
             size_t lws[3] = { 64, 1, 1 };
             backend_ctx->enqueue_ndrange_kernel(qq8, 3, gws, lws, dst);
         }
-        cl_kernel kk = backend_ctx->kernel_mul_mm_q8_kq_p8;
+        cl_kernel kk = K > 256 ? backend_ctx->kernel_mul_mm_q8_kq_p8_dk512 : backend_ctx->kernel_mul_mm_q8_kq_p8;
+        GGML_ASSERT(kk != nullptr);
         cl_uint i = 0;
         CL_CHECK(clSetKernelArg(kk, i++, sizeof(cl_mem),   &backend_ctx->prealloc_fa_kq_q.buffer));
         CL_CHECK(clSetKernelArg(kk, i++, sizeof(cl_mem),   &backend_ctx->prealloc_fa_kq_d.buffer));
@@ -30777,6 +30836,39 @@ static void ggml_cl_fa_trace_once(const char * fmt, ...) {
         GGML_LOG_INFO("ggml_opencl: fa-trace %s\n", line);
     }
 }
+// The fused int8 KQ sized for heads up to 512. Only a q8_0 KV cache takes it: f16 KV at DK=512
+// keeps the f16 KQ it was measured with, and the q8_0 cache has no f16 KQ to fall back to. Built
+// on first use so no other model pays the compile; a refused build leaves the shape declined.
+static cl_kernel ggml_cl_fa_kq_p8_dk512(ggml_backend_opencl_context * backend_ctx) {
+    static bool tried = false;
+    if (tried || backend_ctx->fa_kq_tn != 32) {
+        return backend_ctx->kernel_mul_mm_q8_kq_p8_dk512;
+    }
+    tried = true;
+#ifdef GGML_OPENCL_EMBED_KERNELS
+    const std::string kernel_src {
+        #include "mul_mm_q8_kq.cl.h"
+    };
+#else
+    const std::string kernel_src = read_file("mul_mm_q8_kq.cl");
+#endif
+    const std::string opts = ggml_opencl_make_compile_opts(backend_ctx) + " -DKQ_TN=32" +
+        " -DKQ_MB=" + std::to_string(backend_ctx->fa_kq_mb) + " -DKQ_DK_MAX=512";
+    cl_program prog = build_program_from_source_ex_cached(backend_ctx, kernel_src.c_str(), opts,
+        /*fatal=*/false, "fa int8 kq_p8 dk512", /*bin_size=*/0, backend_ctx->queue);
+    if (!prog) {
+        return nullptr;
+    }
+    cl_int err;
+    cl_kernel k = clCreateKernel(prog, "kernel_mul_mm_q8_kq_p8", &err);
+    clReleaseProgram(prog);
+    if (err != CL_SUCCESS) {
+        return nullptr;
+    }
+    backend_ctx->kernel_mul_mm_q8_kq_p8_dk512 = k;
+    return k;
+}
+
 #define FA_DECLINE(reason) do { ggml_cl_fa_trace_once("decompose declined [%s] dk=%d dv=%d n_q=%d n_kv=%d heads=%d/%d", reason, (int)q->ne[0], (int)v->ne[0], (int)q->ne[1], (int)k->ne[1], (int)q->ne[2], (int)k->ne[2]); return false; } while (0)
 
 static bool ggml_cl_flash_attn_decompose(
@@ -30963,7 +31055,10 @@ static bool ggml_cl_flash_attn_decompose(
         if (!e || !e[0]) return -1;
         return atoi(e) != 0 ? 1 : 0;
     }();
-    const bool kq_p8_int8_shape = backend_ctx->kernel_mul_mm_q8_kq_p8 != nullptr && (dk % 32 == 0) && dk <= 256;
+    const bool kq_dk512 = kv_q8 && dk > 256 && dk <= 512 && (dk % 32 == 0) &&
+                          ggml_cl_fa_kq_p8_dk512(backend_ctx) != nullptr;
+    const bool kq_p8_int8_shape = backend_ctx->kernel_mul_mm_q8_kq_p8 != nullptr && (dk % 32 == 0) &&
+                                  (dk <= 256 || kq_dk512);
     // A model with attention sinks at head size 64 declines the int8 KQ. The sink logit is fixed
     // while the scores move, so the score error of an int8 contraction re-weights sink against
     // keys instead of only reordering keys, and the softmax carries that into the output. It is
@@ -31257,7 +31352,7 @@ static bool ggml_cl_flash_attn_decompose(
     // int8 KQ: K quantised once per call, the Q chunk once per chunk, both along dk. The kernel
     // sizes its local memory for dk <= 256; larger heads keep the f16 GEMM.
     const bool kq_int8_env = kq_int8_env_pre;
-    const bool kq_int8 = kq_int8_env && (dk % 32 == 0) && dk <= 256 && n_head_kv > 0;
+    const bool kq_int8 = kq_int8_env && (dk % 32 == 0) && (dk <= 256 || kq_dk512) && n_head_kv > 0;
     if (kq_int8_env_val != -1 || kq_int8 || kq_int8_sinks) {
         static bool said = false;
         if (!said) {
@@ -32595,6 +32690,12 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     // that program.
     if (n_q > 1 && ggml_cl_flash_attn_decompose(backend, q, k, v, mask, sinks, dst)) {
         return;
+    }
+    // supports_op admits q8_0 KV at DK=512 prefill only for shapes the decomposed path takes
+    // (ggml_cl_fa_q8_dk512_prefill_ok); there is no other GPU kernel for it.
+    if (fa_decode_only_512 && n_q > 1 && k->type == GGML_TYPE_Q8_0) {
+        GGML_ABORT("ggml_opencl: q8_0-KV DK=512 prefill was admitted but the decomposed path declined it "
+                   "(GGML_OPENCL_KQKV_TRACE=1 shows why)");
     }
 
     cl_kernel kernel = NULL;

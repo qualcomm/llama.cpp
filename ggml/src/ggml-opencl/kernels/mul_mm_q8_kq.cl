@@ -35,7 +35,9 @@
 #endif
 #define KQ_TM 64        // kv rows per block, one per lane
 #define KQ_WG 64
+#ifndef KQ_DK_MAX
 #define KQ_DK_MAX 256   // local memory is sized for this; the host declines larger heads
+#endif                  // (a second build at 512 serves the q8_0-KV DK=512 prefill)
 
 // ---- row quantisation: [nhead][nrow][ne0] -> int8 + per-32 half scale --------------------
 // One lane per 32-block. src rows are strided (nb1 bytes per row, nb2 per head) so a KV-cache
