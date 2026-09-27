@@ -1357,6 +1357,22 @@ __kernel void flash_attn_f32_q8_0_q1_vec_mq_split_c8(
 
         const global char * k_row = k_base + k_row_base + (ulong) k_safe * k_nb1;
         const global char * v_row = v_base + v_row_base + (ulong) k_safe * v_nb1;
+#if defined(FA_CL_VPRE) && !defined(FA_Q8_PROBE_NODEQ) && !defined(FA_Q8_PROBE_NOSCALE)
+        // Issue this row's V loads (scale + 4 int8) now, beside K: they do not depend on the score, and at the
+        // bottom of the iteration their latency sits behind the dot/reduce/exp chain. Dequantized at use, in
+        // the same order as dequant_q8_0_lane, so the result is unchanged.
+        float vpre_d[FA_CL_DVQ];
+        char4 vpre_q[FA_CL_DVQ];
+        #pragma unroll
+        for (int i = 0; i < FA_CL_DVQ; ++i) {
+            const int dv = lic + FA_CL_C * i;
+            const global char * vb = v_row + (dv / 8) * Q8_0_BLOCK_SIZE;
+            const global char * qs = vb + 2 + (dv % 8) * 4;
+            vpre_d[i] = vload_half(0, (const global half *) vb);
+            vpre_q[i] = (char4)(qs[0], qs[1], qs[2], qs[3]);
+        }
+#define FA_Q8_VPRE_ON 1
+#endif
 
 #if defined(FA_CL_MASK_BCAST) && defined(FA_CL_MASK_SG)
         // Restage every FA_CL_C iterations, then shuffle out this cluster's
@@ -1579,13 +1595,18 @@ __kernel void flash_attn_f32_q8_0_q1_vec_mq_split_c8(
         // V accumulate on this lane's quartets (p = 0 on tail -> inert).
         #pragma unroll
         for (int i = 0; i < FA_CL_DVQ; ++i) {
+#ifdef FA_Q8_VPRE_ON
+            const float4 v_v = vpre_d[i] * (float4)((float)vpre_q[i].s0, (float)vpre_q[i].s1, (float)vpre_q[i].s2, (float)vpre_q[i].s3);
+#else
             const int dv = lic + FA_CL_C * i;
             const float4 v_v = dequant_q8_0_lane_probe(v_row + (dv / 8) * Q8_0_BLOCK_SIZE, dv % 8);
+#endif
             #pragma unroll
             for (int h = 0; h < MQ_GQA; ++h) {
                 o_acc[h][i] = mad(p_h[h], v_v, o_acc[h][i] * sp_h[h]);
             }
         }
+#undef FA_Q8_VPRE_ON
     }
 
     // Merge stage 1: fold cluster partials inside the subgroup via shuffles.

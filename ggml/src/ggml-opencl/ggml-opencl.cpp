@@ -12673,7 +12673,11 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
                         return (v == 2 || v == 4 || v == 8) ? v : 4;
                     }();
                     const int q8_hs_n = dk == 128 ? q8_hs_dk128_sub : 2;
-                    const std::string opts_q8_hs2 = opts +
+                    // V loads hoisted to the top of the loop in the dk=128 head-split program (FA_CL_VPRE): same
+                    // arithmetic, no longer behind the dot/reduce/exp chain. Qwen3-30B-A3B q8_0 KV on X2-90: tg128
+                    // +6.9% @d8192, +10.1% @d32768. Opt out with GGML_OPENCL_FA_Q8_VPRE=0.
+                    static const bool q8_vpre = !ggml_cl_env_flag_zero("GGML_OPENCL_FA_Q8_VPRE");
+                    const std::string opts_q8_hs2 = opts + ((q8_vpre && dk == 128) ? " -D FA_CL_VPRE" : "") +
                         " -D MQ_GQA=" + std::to_string(8 / q8_hs_n) + " -D MQ_NSG=2 -D MQ_NSG_SPLIT=2 -D FA_CL_C=16"
                         " -D FA_HEAD_SUB=" + std::to_string(q8_hs_n) +
                         (q8_mhred_on ? " -D FA_CL_MHRED=1" : "") + opts_q8_maskb + opts_q8_masksg +
