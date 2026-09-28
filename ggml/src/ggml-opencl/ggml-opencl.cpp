@@ -54486,7 +54486,7 @@ static int ggml_opencl_try_gdn_state_fusion(const ggml_cgraph * cgraph, int node
 // gather, and a fused gdn would read those rows after that copy instead of
 // before it.
 static void ggml_opencl_mark_gdn_state_fusions(const ggml_cgraph * cgraph, std::vector<char> & skip_node) {
-    struct cand { int gr_idx; const ggml_tensor * gdn; const ggml_tensor * st; bool ok; };
+    struct cand { int gr_idx; int gdn_idx; const ggml_tensor * gdn; const ggml_tensor * st; const ggml_tensor * ids; bool ok; };
     std::vector<cand> cands;
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * node = cgraph->nodes[i];
@@ -54512,11 +54512,37 @@ static void ggml_opencl_mark_gdn_state_fusions(const ggml_cgraph * cgraph, std::
             cache_written = n->view_src == cache_base;
         }
         if (!cache_written) {
-            cands.push_back({ gr_idx, node, node->src[5], true });
+            cands.push_back({ gr_idx, i, node, node->src[5], cache.state_ids, true });
         }
     }
     if (cands.empty()) {
         return;
+    }
+    // (c) the ids stay allocated until the gdn reads them. The allocator frees a
+    // tensor after its last consumer in the graph, and with the get_rows skipped
+    // that consumer can be the get_rows itself: on the last delta-net layer the
+    // ids are then reused for the tensors computed between the two, and the gdn
+    // reads a stale row index (an out-of-bounds read that hung the GPU on
+    // Qwen3.5-35B-A3B at -ub 1). Keep the fusion only when a later node reads the
+    // ids too.
+    std::unordered_map<const ggml_tensor *, int> ids_last_use;
+    for (const cand & cd : cands) {
+        ids_last_use[cd.ids] = -1;
+    }
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        for (int k = 0; k < GGML_MAX_SRC && node->src[k] != nullptr; ++k) {
+            const ggml_tensor * s = node->src[k];
+            auto it = ids_last_use.find(s->view_src ? s->view_src : s);
+            if (it != ids_last_use.end()) {
+                it->second = i;
+            }
+        }
+    }
+    for (cand & cd : cands) {
+        if (ids_last_use[cd.ids] <= cd.gdn_idx) {
+            cd.ok = false;
+        }
     }
     std::unordered_map<const ggml_tensor *, size_t> owner; // get_rows result or its reshape -> cand
     for (size_t c = 0; c < cands.size(); ++c) {
