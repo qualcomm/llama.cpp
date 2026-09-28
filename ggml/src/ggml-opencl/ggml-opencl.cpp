@@ -33098,15 +33098,21 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     // decode route was the per-query-head q1 family (re-reading the cache gqa times): DK=256 at
     // any of these fan-outs (Qwen3.5 gqa 8, Qwen3.8 gqa 6, gemma-4 SWA) and DK=128 at gqa 16
     // (Nemotron-H, muse), and DK=512 (gemma-4 global layers, where q1_vec is the only other q8_0
-    // decode kernel). Same head_sub / workgroup table as the f16 program.
-    // GGML_OPENCL_FA_MQN_Q8=0 opts out.
+    // decode kernel). Same head_sub / workgroup table as the f16 program except two head_subs,
+    // measured on the X2-90 (q8_0 KV, tg128, bookended):
+    //   DK=128 gqa 16: 16 -> 8. Nemotron-3.5 @ d16384 22.44 / 22.49 -> 24.86 (head_sub 4: 22.17);
+    //                  the subgroup count moves nothing (nsg 2 / 4 / 8 = 22.53 / 22.44 / 22.01).
+    //   DK=512 gqa 8:   4 -> 2. gemma-4-26B @ d16384 / d32768 22.60 / 17.25 -> 24.72 / 19.74 (again
+    //                  24.87 / 19.66); head_sub 1 21.75 / 16.74; head_sub 2 on its DK=256 SWA
+    //                  layers too 24.28 / 19.47, nsg 2 23.38 / 19.30.
+    // GGML_OPENCL_FA_MQN_Q8=0 opts out; GGML_OPENCL_FA_MQN_Q8_HS overrides head_sub.
     static const bool mqn_q8 = !ggml_cl_env_flag_zero("GGML_OPENCL_FA_MQN_Q8");
     if (mqn_q8 && n_q == 1 && is_q8_0 && d_head_q == d_head_v && n_head_kv > 0 &&
         (d_head_q == 512 || d_head_q == 256 || (d_head_q == 128 && n_head / n_head_kv == 16))) {
         const int gqa = n_head / n_head_kv;
         if (n_head % n_head_kv == 0 && (gqa == 2 || gqa == 4 || gqa == 6 || gqa == 8 || gqa == 16)) {
-            int hs  = (d_head_q == 512) ? ((gqa == 8) ? 4 : ((gqa == 16) ? 8 : 1))
-                    : (d_head_q == 128 && gqa == 16) ? 16 : ((gqa == 8) ? 2 : 1);
+            int hs  = (d_head_q == 512) ? ((gqa == 8) ? 2 : ((gqa == 16) ? 8 : 1))
+                    : (d_head_q == 128 && gqa == 16) ? 8 : ((gqa == 8) ? 2 : 1);
             int nsg = (d_head_q == 256 && gqa == 8) ? 2 : 4;
             static const int q8_hs_env = []{ const char * e = getenv("GGML_OPENCL_FA_MQN_Q8_HS");
                                              return (e && e[0]) ? atoi(e) : 0; }();
