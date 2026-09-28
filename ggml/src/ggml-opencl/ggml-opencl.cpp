@@ -1629,6 +1629,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_trunc_f32, kernel_trunc_f32_4, kernel_trunc_f32_nc, kernel_trunc_f16, kernel_trunc_f16_4, kernel_trunc_f16_nc;
     cl_kernel kernel_softplus_f32, kernel_softplus_f32_4, kernel_softplus_f32_nc;
     cl_kernel kernel_softplus_f16, kernel_softplus_f16_4, kernel_softplus_f16_nc;
+    cl_kernel kernel_fwht_f32 = nullptr;   // MUL_MAT tagged GGML_HINT_SRC0_IS_HADAMARD
     cl_kernel kernel_upscale;
     cl_kernel kernel_upscale_bilinear;
     cl_kernel kernel_upscale_bilinear_aa;
@@ -8195,6 +8196,22 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         CL_CHECK((backend_ctx->kernel_softplus_f16    = clCreateKernel(prog, "kernel_softplus_f16", &err), err));
         CL_CHECK((backend_ctx->kernel_softplus_f16_4  = clCreateKernel(prog, "kernel_softplus_f16_4", &err), err));
         CL_CHECK((backend_ctx->kernel_softplus_f16_nc = clCreateKernel(prog, "kernel_softplus_f16_nc", &err), err));
+        CL_CHECK(clReleaseProgram(prog));
+        GGML_LOG_CONT(".");
+    }
+
+    // fwht
+    {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src {
+            #include "fwht.cl.h"
+        };
+#else
+        const std::string kernel_src = read_file("fwht.cl");
+#endif
+        cl_program prog =
+            build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        CL_CHECK((backend_ctx->kernel_fwht_f32 = clCreateKernel(prog, "kernel_fwht_f32", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
@@ -42655,6 +42672,48 @@ static bool ggml_cl_mul_mat_kquant_plane(
     return true;
 }
 
+// MUL_MAT tagged GGML_HINT_SRC0_IS_HADAMARD: src0 is the orthonormal n x n Walsh-Hadamard matrix
+// llama.cpp rotates Q/K/V (and the attention output) by when the KV cache is quantized, so the
+// product is a fast Walsh-Hadamard transform of each src1 row and src0 need not be read. As a
+// dense f32 GEMM it was 4 matmuls per layer: 3.0 ms of every gemma-4-26B q8_0-KV decode token at
+// depth 16384 on the X2-90 (6% of the step). Returns false (-> the ordinary matmul) for shapes
+// the kernel does not take. GGML_OPENCL_FWHT=0 opts out.
+static bool ggml_cl_fwht(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst) {
+    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *)backend->context;
+    static const bool off = ggml_cl_env_flag_zero("GGML_OPENCL_FWHT");
+    cl_kernel kernel = backend_ctx->kernel_fwht_f32;
+    if (off || kernel == nullptr) {
+        return false;
+    }
+    if (src->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || !ggml_are_same_shape(src, dst) ||
+        !ggml_is_contiguous(src) || !ggml_is_contiguous(dst)) {
+        return false;
+    }
+    const int n = (int) src->ne[0];
+    if (n != 64 && n != 128 && n != 256 && n != 512) {
+        return false;
+    }
+    const int64_t rows = ggml_nrows(src);
+
+    ggml_tensor_extra_cl * extra_s = (ggml_tensor_extra_cl *)src->extra;
+    ggml_tensor_extra_cl * extra_d = (ggml_tensor_extra_cl *)dst->extra;
+    const cl_ulong off_s = extra_s->offset + src->view_offs;
+    const cl_ulong off_d = extra_d->offset + dst->view_offs;
+    const float scale = 1.0f / sqrtf((float) n);
+
+    CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),   &extra_s->data_device));
+    CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_ulong), &off_s));
+    CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem),   &extra_d->data_device));
+    CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_ulong), &off_d));
+    CL_CHECK(clSetKernelArg(kernel, 4, sizeof(int),      &n));
+    CL_CHECK(clSetKernelArg(kernel, 5, sizeof(float),    &scale));
+
+    size_t gws[3] = { (size_t) rows * 64, 1, 1 };
+    size_t lws[3] = { 64, 1, 1 };
+    backend_ctx->enqueue_ndrange_kernel(kernel, 1, gws, lws, dst);
+    return true;
+}
+
 static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_ASSERT(src0);
     GGML_ASSERT(src0->extra);
@@ -42668,6 +42727,10 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
     const enum ggml_type src1t = src1->type;
 
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
+
+    if (ggml_get_op_params_i32(dst, 1) == GGML_HINT_SRC0_IS_HADAMARD && ggml_cl_fwht(backend, src1, dst)) {
+        return;
+    }
 
     // Which batch widths does the real workload actually run at?
     //

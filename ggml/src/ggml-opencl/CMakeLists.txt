@@ -292,6 +292,7 @@ set(GGML_OPENCL_KERNELS
     abs
     unary_ext
     softplus
+    fwht
     pad
     repeat
     mul_mat_f16_f32
