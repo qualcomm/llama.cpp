@@ -11244,6 +11244,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int nb : { 2, 8, }) {
         test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {4, 1}, 2048, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     }
+    // the same verify batch in the cache layout (packed rows, as in the prefill block
+    // above): the cases before it build every operand per head, so a backend that treats
+    // the KV cache's own layout specially for a short batch was never reached. GQA 4 at
+    // head size 512 / 256 is gemma-4's global / sliding attention, GQA 8 at 128 the
+    // Qwen3-30B-A3B shape. Sinks and ALiBi check the per-head mapping of the query rows.
+    for (int kv : { 1024, 4096, }) {
+        for (int nb : { 2, 4, 8, }) {
+            test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, {4, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false));
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {4, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false));
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {8, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false));
+        }
+    }
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, {4, 1}, 1024, 4, true, true,  0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false));
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, {4, 1}, 1024, 4, true, false, 8, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {4, 1}, 1024, 4, true, true,  0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false));
 
     for (int hsk : { 40, 64, 72, 80, 96, 128, 192, 256, 320, 512, 576 }) {
         for (int hsv : { 40, 64, 72, 80, 96, 128, 192, 256, 512 }) {
