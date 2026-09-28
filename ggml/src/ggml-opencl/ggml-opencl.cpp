@@ -1341,6 +1341,8 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_soft_max_f16, kernel_soft_max_4_f16, kernel_soft_max_4_f16_nonorm, kernel_fa_scale_rows_f32;
     cl_kernel kernel_soft_max_4_f16_q8;
     cl_kernel kernel_fa_p8_fixup = nullptr;
+    cl_kernel kernel_fa_kqv_direct_f16 = nullptr;
+    cl_kernel kernel_fa_kqv_direct_reduce = nullptr;
     cl_kernel kernel_mul_mm_q8_kqv;
     cl_kernel kernel_mul_mm_q8_kq;
     cl_kernel kernel_mul_mm_q8_kq_p8 = nullptr;   // fused-softmax variant, only when KQ_TN == 32
@@ -7763,6 +7765,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         CL_CHECK((backend_ctx->kernel_fa_scale_rows_f32 = clCreateKernel(backend_ctx->program_softmax_4_f16, "kernel_fa_scale_rows_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_soft_max_4_f16_q8 = clCreateKernel(backend_ctx->program_softmax_4_f16, "kernel_soft_max_4_f16_q8", &err), err));
         CL_CHECK((backend_ctx->kernel_fa_p8_fixup = clCreateKernel(backend_ctx->program_softmax_4_f16, "kernel_fa_p8_fixup", &err), err));
+        CL_CHECK((backend_ctx->kernel_fa_kqv_direct_f16 = clCreateKernel(backend_ctx->program_softmax_4_f16, "kernel_fa_kqv_direct_f16", &err), err));
+        CL_CHECK((backend_ctx->kernel_fa_kqv_direct_reduce = clCreateKernel(backend_ctx->program_softmax_4_f16, "kernel_fa_kqv_direct_reduce", &err), err));
         GGML_LOG_CONT(".");
     }
 
@@ -30947,12 +30951,22 @@ static void ggml_cl_fa_kq_p8_dispatch(ggml_backend_t backend,
     CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &nb01));
     CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &zero));   // kqv_mblock_fast: KQ is n-tile-fast
     CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &p_pitch_i));
+    // A batch narrower than one 32-query n-tile (a speculative verify) folds the query heads of a
+    // KV group into the tile columns: the tile fills instead of running mostly padding, and each
+    // K row streams once per KV head instead of once per query head. gemma-4-E4B (8 queries,
+    // GQA 4, DK 512) at depth 15360 on the X2-90: 2.5 -> 0.78 ms per global layer.
+    // GGML_OPENCL_FA_KQ_P8_FOLD=0 opts out.
+    static const bool fold_env = !ggml_cl_env_flag_zero("GGML_OPENCL_FA_KQ_P8_FOLD");
+    const int gqa  = D_B / D_A;
+    const int fold = (fold_env && gqa > 1 && N < 32) ? gqa : 1;
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &fold));
 
-    // Same grid as the separate KQ: n-tiles on the fast axis, m-blocks x heads on the slow one.
-    const int n_tiles  = (N + 31) / 32;
+    // Same grid as the separate KQ: n-tiles on the fast axis, m-blocks x heads on the slow one
+    // (KV heads when folded).
+    const int n_tiles  = (N*fold + 31) / 32;
     const int m_blocks = (M + 63) / 64;
     const int n_tiles_per_wg = (n_tiles % 2) == 0 ? 2 : 1;
-    size_t gws[3] = {64, (size_t)n_tiles, (size_t)m_blocks * (size_t)D_B};
+    size_t gws[3] = {64, (size_t)n_tiles, (size_t)m_blocks * (size_t)(fold > 1 ? D_A : D_B)};
     size_t lws[3] = {64, (size_t)n_tiles_per_wg, 1};
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, gws, lws, dst);
 
@@ -31582,6 +31596,17 @@ static bool ggml_cl_flash_attn_decompose(
         }
     }
 
+    // A batch whose (query, query head) pairs of one KV group fit one 32-column tile (a
+    // speculative verify) reads V in the cache's row layout instead: the V^T rebuild streams the
+    // whole V cache on every call, which such a batch cannot amortise. f16 V only.
+    // GGML_OPENCL_FA_KQV_DIRECT=0 opts out.
+    static const bool kqv_direct_env = !ggml_cl_env_flag_zero("GGML_OPENCL_FA_KQV_DIRECT");
+    const bool kqv_direct = kqv_direct_env && kq_p8 && v->type == GGML_TYPE_F16 &&
+                            backend_ctx->kernel_fa_kqv_direct_f16 != nullptr &&
+                            n_q_chunk >= n_q && (int64_t)n_q*(n_head/n_head_kv) <= 32 &&
+                            dv % 128 == 0 && (v->nb[1] % 4) == 0 && (v->nb[2] % 4) == 0;
+    ggml_cl_fa_trace_once("decompose kqv_direct=%d n_q=%d gqa=%d dv=%d", (int)kqv_direct, (int)n_q, (int)(n_head/n_head_kv), (int)dv);
+
     static const bool debug = ggml_cl_env_flag("GGML_OPENCL_FA_DECOMPOSE_DEBUG");
     if (debug) {
         // Once per (dk, dv): a model with more than one attention geometry
@@ -31597,7 +31622,7 @@ static bool ggml_cl_flash_attn_decompose(
     }
 
     // ---- V^T, once for the whole call ------------------------------------
-    {
+    if (!kqv_direct) {
         ggml_tensor_extra_cl * extra_v = (ggml_tensor_extra_cl *)v->extra;
         cl_ulong offset_v = extra_v->offset + v->view_offs;
         const cl_ulong v_nb1 = v->nb[1], v_nb2 = v->nb[2], v_nb3 = v->nb[3];
@@ -31773,7 +31798,54 @@ static bool ggml_cl_flash_attn_decompose(
         // ---- KQV: [n_kv,dv,n_head_kv]^T x [n_kv,nqc,n_head] -> [dv,nqc,n_head]
         ggml_cl_fa_scratch_tensor(kqv, extra_kqv, backend_ctx->prealloc_fa_kqv.buffer,
                                   GGML_TYPE_F32, GGML_OP_MUL_MAT, dv, nqc, n_head, "fa_kqv");
-        if (kqv_int8) {
+        if (kqv_direct) {
+            // KV split sized for ~256 work-groups in all; each split takes whole 32-row blocks.
+            const int nblk_i   = (int)(n_kv / 32);
+            const int d_blocks = (int)(dv / 128);
+            const int want     = MAX(1, 256 / (d_blocks*(int)n_head_kv));
+            const int bps      = MAX(1, (nblk_i + want - 1) / want);
+            const int n_split  = (nblk_i + bps - 1) / bps;
+            const int n_elem   = (int)(n_head*nqc*dv);
+            backend_ctx->prealloc_fa_kq.allocate(backend_ctx->context, (size_t)n_split*n_elem*sizeof(float));
+
+            ggml_tensor_extra_cl * extra_v = (ggml_tensor_extra_cl *)v->extra;
+            const cl_ulong off_v = extra_v->offset + v->view_offs;
+            const cl_ulong v_nb1 = v->nb[1], v_nb2 = v->nb[2];
+            const int dv_i = (int)dv, nq_i = (int)nqc, gqa_i = (int)(n_head/n_head_kv), nh_i = (int)n_head;
+            const int p_pitch_i = (int)kv_pitch;
+            cl_kernel kd = backend_ctx->kernel_fa_kqv_direct_f16;
+            cl_uint i = 0;
+            CL_CHECK(clSetKernelArg(kd, i++, sizeof(cl_mem),   &extra_v->data_device));
+            CL_CHECK(clSetKernelArg(kd, i++, sizeof(cl_ulong), &off_v));
+            CL_CHECK(clSetKernelArg(kd, i++, sizeof(cl_ulong), &v_nb1));
+            CL_CHECK(clSetKernelArg(kd, i++, sizeof(cl_ulong), &v_nb2));
+            CL_CHECK(clSetKernelArg(kd, i++, sizeof(cl_mem),   &backend_ctx->prealloc_fa_pq.buffer));
+            CL_CHECK(clSetKernelArg(kd, i++, sizeof(cl_mem),   &backend_ctx->prealloc_fa_pd.buffer));
+            CL_CHECK(clSetKernelArg(kd, i++, sizeof(cl_mem),   &backend_ctx->prealloc_fa_kq.buffer));
+            CL_CHECK(clSetKernelArg(kd, i++, sizeof(int),      &dv_i));
+            CL_CHECK(clSetKernelArg(kd, i++, sizeof(int),      &nq_i));
+            CL_CHECK(clSetKernelArg(kd, i++, sizeof(int),      &gqa_i));
+            CL_CHECK(clSetKernelArg(kd, i++, sizeof(int),      &nh_i));
+            CL_CHECK(clSetKernelArg(kd, i++, sizeof(int),      &nblk_i));
+            CL_CHECK(clSetKernelArg(kd, i++, sizeof(int),      &bps));
+            CL_CHECK(clSetKernelArg(kd, i++, sizeof(int),      &p_pitch_i));
+            size_t gws[3] = { (size_t)d_blocks*64, (size_t)n_head_kv, (size_t)n_split };
+            size_t lws[3] = { 64, 1, 1 };
+            backend_ctx->enqueue_ndrange_kernel(kd, 3, gws, lws, dst);
+
+            ggml_tensor_extra_cl * ex = (ggml_tensor_extra_cl *)kqv.extra;
+            const cl_ulong off_kqv_i = ex->offset + kqv.view_offs;
+            cl_kernel kr = backend_ctx->kernel_fa_kqv_direct_reduce;
+            i = 0;
+            CL_CHECK(clSetKernelArg(kr, i++, sizeof(cl_mem),   &backend_ctx->prealloc_fa_kq.buffer));
+            CL_CHECK(clSetKernelArg(kr, i++, sizeof(cl_mem),   &ex->data_device));
+            CL_CHECK(clSetKernelArg(kr, i++, sizeof(cl_ulong), &off_kqv_i));
+            CL_CHECK(clSetKernelArg(kr, i++, sizeof(int),      &n_elem));
+            CL_CHECK(clSetKernelArg(kr, i++, sizeof(int),      &n_split));
+            size_t gws2[3] = { (size_t)((n_elem + 63)/64)*64, 1, 1 };
+            size_t lws2[3] = { 64, 1, 1 };
+            backend_ctx->enqueue_ndrange_kernel(kr, 3, gws2, lws2, dst);
+        } else if (kqv_int8) {
             cl_kernel kk = backend_ctx->kernel_mul_mm_q8_kqv;
             ggml_tensor_extra_cl * ex = (ggml_tensor_extra_cl *)kqv.extra;
             const cl_ulong z = 0;
