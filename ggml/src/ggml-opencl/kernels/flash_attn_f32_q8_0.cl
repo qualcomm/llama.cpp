@@ -997,6 +997,21 @@ __kernel void flash_attn_f32_q8_0_q1_vec_mq_split(
         const global char * k_row = k_base + batch_idx * k_nb3 + head_kv_idx * k_nb2 + k_idx * k_nb1;
         const global char * v_row = v_base + batch_idx * v_nb3 + head_kv_idx * v_nb2 + k_idx * v_nb1;
 
+#ifdef FA_Q8MQ_VPRE
+        // Issue this row's V loads before the K dot, the score reduction and the softmax update, so
+        // their latency hides behind that chain instead of heading the accumulate (the same move as
+        // FA_CL_VPRE in the cluster kernels).
+        float4 v_pre[Q1V_DV_PER_THREAD];
+        #pragma unroll
+        for (int i = 0; i < Q1V_DV_PER_THREAD; ++i) {
+            const int dv = tid_sg + i * Q1_WG_SIZE;
+            v_pre[i] = (float4)(0.0f);
+            if (dv < DV_VEC) {
+                v_pre[i] = dequant_q8_0_lane(v_row + (dv / 8) * Q8_0_BLOCK_SIZE, dv % 8);
+            }
+        }
+#endif
+
 #ifdef FA_Q8MQ_IQK
         ACC_TYPE dot_s[MQ_GQA];
         #pragma unroll
@@ -1061,6 +1076,17 @@ __kernel void flash_attn_f32_q8_0_q1_vec_mq_split(
             m_i[h]  = m_new;
         }
 
+#ifdef FA_Q8MQ_VPRE
+        #pragma unroll
+        for (int i = 0; i < Q1V_DV_PER_THREAD; ++i) {
+            if (tid_sg + i * Q1_WG_SIZE < DV_VEC) {
+                #pragma unroll
+                for (int h = 0; h < MQ_GQA; ++h) {
+                    o_acc[h][i] = mad(p_h[h], v_pre[i], o_acc[h][i] * sp_h[h]);
+                }
+            }
+        }
+#else
         int idx = 0;
         for (int dv = tid_sg; dv < DV_VEC; dv += Q1_WG_SIZE, ++idx) {
             const int block_idx = dv / 8;
@@ -1071,6 +1097,7 @@ __kernel void flash_attn_f32_q8_0_q1_vec_mq_split(
                 o_acc[h][idx] = mad(p_h[h], v_v, o_acc[h][idx] * sp_h[h]);
             }
         }
+#endif
     }
 
     // Per-h cross-subgroup merge: subgroup 0 folds NSG partials into a single
