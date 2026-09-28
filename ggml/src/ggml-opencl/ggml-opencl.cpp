@@ -11731,10 +11731,14 @@ static bool ggml_opencl_try_fa_mq_narrow_q8(ggml_backend_opencl_context * backen
     if (cfg == nullptr) { failed.insert(fkey); return false; }
 
     const size_t wg = (size_t) 64 * nsg_split;
+    // The kernel takes the dp4a QK with two quartets per lane at DK=512 (FA_Q8MQ_NQ 2);
+    // GGML_OPENCL_FA_MQN_Q8_IQK2=0 keeps that size on the float dequant + mad sweep.
+    static const bool iqk2_off = ggml_cl_env_flag_zero("GGML_OPENCL_FA_MQN_Q8_IQK2");
     const std::string opts = ggml_opencl_fa_compile_opts(backend_ctx, cfg, FA_VARIANT_Q8_0) +
                              " -D FA_MQ_SPLIT_ONLY -D MQ_GQA=" + std::to_string(gqa / head_sub) +
                              " -D MQ_NSG_SPLIT=" + std::to_string(nsg_split) +
-                             " -D FA_HEAD_SUB=" + std::to_string(head_sub);
+                             " -D FA_HEAD_SUB=" + std::to_string(head_sub) +
+                             (iqk2_off ? " -D FA_Q8MQ_IQK2_OFF" : "");
     const std::string tag = "fa q8_0 mq_split narrow dk" + std::to_string(dk) + " gqa" + std::to_string(gqa) +
                             " hs" + std::to_string(head_sub) + " wg" + std::to_string(wg);
     cl_program prog = build_program_from_source_ex_cached(
