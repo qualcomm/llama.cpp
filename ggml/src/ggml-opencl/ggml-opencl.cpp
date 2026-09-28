@@ -18613,12 +18613,12 @@ static bool ggml_cl_fa_q8_dk512_prefill_ok(ggml_backend_opencl_context * backend
         return false;
     }
     const char * min_nq_e = getenv("GGML_OPENCL_FA_DECOMPOSE_MIN_NQ");
-    const int min_n_q = (min_nq_e && min_nq_e[0]) ? atoi(min_nq_e) : 64;
+    const int min_n_q = (min_nq_e && min_nq_e[0]) ? atoi(min_nq_e) : 2;
 
     const int64_t dk = q->ne[0], dv = v->ne[0], n_q = q->ne[1], n_kv = k->ne[1];
     const int64_t n_head = q->ne[2], n_head_kv = k->ne[2];
     const float logit_softcap = ((const float *)op->op_params)[2];
-    if (dk != 512 || dv != 512 || n_q < MAX(min_n_q, 32) || n_kv % 64 != 0 ||
+    if (dk != 512 || dv != 512 || n_q < MAX(min_n_q, 2) || n_kv % 64 != 0 ||
         q->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32 ||
         k->type != GGML_TYPE_Q8_0 || v->type != GGML_TYPE_Q8_0 ||
         ggml_cl_is_q8_0_soa(k) || ggml_cl_is_q8_0_soa(v) ||
@@ -31288,14 +31288,26 @@ static bool ggml_cl_flash_attn_decompose(
         FA_DECLINE("gen/dk");
     }
 
-    // Below this the fused tile is competitive and the per-chunk dispatch
-    // overhead is not amortised; decode must never come here.
+    // Decode (n_q == 1) never comes here. Everything wider does, including a speculative verify
+    // batch (2-16 queries), which the per-query-row MQ routes serve by re-reading the whole KV range
+    // once per query row, and which q8_0 KV otherwise sends to the fused q8_0 tile. The floor was 64;
+    // at 2 speculative decoding with -fa 1 recovers most of what it lost against -fa 0 (X2-90,
+    // spec speedup over plain decode, depth 1k / 4k / 8k / 15k):
+    //   E4B Q4_K_M + MTP  f16  1.05 / 0.92 / 0.77 / 0.63x -> 1.27 / 1.27 / 1.25 / 1.04x
+    //                     q8_0 1.07 / 0.88 / 0.66 / 0.49x -> 1.35 / 1.23 / 1.16 / 1.05x
+    //   Qwen3.8 + DFlash2 q8_0 @ 8k / 15k 1.51 / 1.44x -> 2.23 / 2.69x (-fa 0 2.38 / 2.71x)
+    // GGML_OPENCL_FA_DECOMPOSE_MIN_NQ restores any floor.
     static const int min_n_q = []{
         const char * e = getenv("GGML_OPENCL_FA_DECOMPOSE_MIN_NQ");
-        return (e && e[0]) ? atoi(e) : 64;
+        return (e && e[0]) ? atoi(e) : 2;
     }();
     if (n_q < min_n_q) {
         FA_DECLINE("n_q");
+    }
+    // Except where the sinks gate keeps the KQ in f16 at head size <= 64 (gpt-oss, f16 KV): there
+    // the MQ route wins below a 64-query batch (pp16 @ d4096 134.4 against 130.1 decomposed).
+    if (n_q < 64 && kq_int8_sinks) {
+        FA_DECLINE("n_q (sinks, f16 KQ)");
     }
 
     if (q->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
@@ -31422,7 +31434,10 @@ static bool ggml_cl_flash_attn_decompose(
     if (kq_p8_possible && kq_int8_env_pre) {
         n_q_chunk = MIN(n_q_chunk, kq_int8_max_chunk);
     }
-    if (n_q_chunk < 32) {
+    // A batch narrower than one 32-query tile runs as a single short chunk (a speculative verify
+    // batch is 2-16 queries): the kq/kqv kernels guard every query index against n_q. Only a
+    // chunk forced below 32 while the batch is wider than it is declined.
+    if (n_q_chunk < 32 && n_q_chunk < n_q) {
         FA_DECLINE("chunk<32");
     }
     // Even out the chunks so the tail is not a stub, then align to the 32-wide
