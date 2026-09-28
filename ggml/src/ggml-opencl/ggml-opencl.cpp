@@ -31224,7 +31224,18 @@ static bool ggml_cl_flash_attn_decompose(
     // comparison is an order of magnitude smaller, and head size 256 is unaffected either way.
     // The KQV side is untouched - it costs nothing on either model.
     // GGML_OPENCL_FA_KQ_INT8=1 still forces the kernel, for A/B.
-    const bool kq_int8_sinks = sinks != nullptr && dk <= 64;
+    // A q8_0 KV cache is exempt wherever the WMM path cannot take the shape (past its image limits,
+    // ~16k tokens of context on the X2-90): the q8_0 alternative there is the fused q8_0 tile, which
+    // quantises Q to int8 and runs dp4a against the q8_0 K itself -- the same int8 Q.K error -- so
+    // the decomposed int8 KQ adds nothing it was not already paying. Within the WMM path's limits
+    // (fp16 Q.K) the decline stands. GGML_OPENCL_FA_Q8_SINKS_INT8=0 restores it everywhere.
+#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+    const bool wmm_takes = use_fa_bin_kernels_prefill(backend_ctx, q, k, v);
+#else
+    const bool wmm_takes = false;
+#endif
+    static const bool q8_sinks_int8 = !ggml_cl_env_flag_zero("GGML_OPENCL_FA_Q8_SINKS_INT8");
+    const bool kq_int8_sinks = sinks != nullptr && dk <= 64 && !(kv_q8 && q8_sinks_int8 && !wmm_takes);
     const bool kq_int8_env_pre = kq_int8_env_val == 1 ||
                                  (kq_int8_env_val == -1 && !kq_int8_sinks &&
                                   kq_p8_env && kqv_int8_possible && kq_p8_int8_shape);
