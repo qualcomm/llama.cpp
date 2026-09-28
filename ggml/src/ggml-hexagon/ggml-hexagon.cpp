@@ -2797,11 +2797,7 @@ struct ggml_hexagon_opbatch {
             return false;
         }
 
-        // Decide scatter eligibility before precompute so the solver lays out the correct
-        // reduction range. Scatter is safe only when the residual ADD is exactly in-place over
-        // this rank's own allreduce partial and the rank count fits the multi-dst fan-out.
-        // If shard is not ok, precompute must produce a full-range reduction — not a 1/N
-        // shard — or the full path leaves the rest of the buffer stale.
+        // scatter is only valid for in-place add within max outputs
         const bool is_shard_ok = n_ranks <= HTP_OP_MAX_OUTPUTS && add_dst->data == ar_local->data;
 
         struct htp_allreduce_kernel_params new_kparams;
@@ -2812,12 +2808,7 @@ struct ggml_hexagon_opbatch {
             return false;
         }
 
-        // scatter_ok reflects what the solver actually produced: sharded multi-dst 1D path.
-        // (is_shard_ok can be true yet n_dsts==1 if the op wasn't 1D-eligible -> FULL.)
         const bool scatter_ok = new_kparams.n_dsts > 1;
-
-        // Collective mode is carried in the kernel params so the HTP kernel and instrumentation
-        // consume the same decision instead of re-deriving it.
         new_kparams.mode = scatter_ok ? HTP_ALLREDUCE_SHARDED_FANOUT : HTP_ALLREDUCE_FULL;
 
         for (uint32_t r = 0; r < n_ranks; r++) {
@@ -2825,12 +2816,7 @@ struct ggml_hexagon_opbatch {
             if (!ggml_hexagon_tensors_overlap(add_dst, ar_src)) {
                 continue;
             }
-            // Aliasing our own partial is safe under reduce-scatter: rank r writes only
-            // shard r while rank q reads only shard q, and the shards are disjoint element
-            // ranges, so no rank can clobber a region a peer is still reading. This is the
-            // same aliasing the unfused ALLREDUCE already relies on. The alias must be
-            // exact -- a partial overlap shifts the shard mapping and reintroduces the
-            // race, so it stays rejected, as does any overlap with a peer's partial.
+            // in-place aliasing is safe under reduce-scatter since each rank writes disjoint shards
             if (scatter_ok && r == rank) {
                 continue;
             }
@@ -2856,15 +2842,7 @@ struct ggml_hexagon_opbatch {
 
         o.src[2 * n_ranks] = add_tensor(res_tensor);
         if (new_kparams.mode == HTP_ALLREDUCE_SHARDED_FANOUT) {
-            // Reduce-scatter: each core reduces only its own 1/N shard, then writes that
-            // shard into all n_ranks per-core result buffers. The meta backend gives each
-            // core a separate physical buffer, so the shard must be replicated to every
-            // core's copy to form the complete result; only the (cheap) DMA write is
-            // replicated, the HVX reduction stays 1/N.
-            //
-            // Destinations reuse the first n_ranks source slots: those are exactly the N
-            // per-core allreduce partials, which are the buffers that must receive the final
-            // activation. Assert that contract rather than trust source ordering silently.
+            // fan out shard to all per-rank partial buffers
             GGML_ASSERT((uint32_t) new_kparams.n_dsts == n_ranks);
             for (uint32_t d = 0; d < n_ranks; d++) {
                 GGML_ASSERT(o.src[d] != 0xffff);
@@ -2874,7 +2852,6 @@ struct ggml_hexagon_opbatch {
                 o.dst[d] = 0xffff;
             }
         } else {
-            // Full redundant reduction: this core reduces the whole tensor into its own buffer.
             o.dst[0] = add_tensor(add_dst);
             for (uint32_t d = 1; d < HTP_OP_MAX_OUTPUTS; d++) {
                 o.dst[d] = 0xffff;
@@ -3843,14 +3820,7 @@ static bool ggml_hexagon_precompute_allreduce_params(
     const bool use_1d = is_contiguous && !(has_add && is_row_bcast && ne1 > 1);
 
     if (has_add) {
-        // Reduce-scatter: when the fused residual ADD is in-place over this rank's own
-        // allreduce partial (validated by try_fuse_allreduce_add) AND the caller says shard
-        // is safe (is_shard_ok), each rank reduces only its own disjoint 1/N shard and fans
-        // that shard out to all N per-core buffers. The HVX reduction work is cut N-fold;
-        // only the (cheap) DMA write is replicated. When shard is NOT ok, fall back to the
-        // full-range reduction into this rank's own buffer -- the shard range MUST cover the
-        // whole tensor here, otherwise the FULL path would reduce only 1/N and leave the rest
-        // of the buffer stale (the Qwen mixed-mode corruption bug).
+        // sharded reduce-scatter for contiguous in-place add
         if (opt_ar_scatter && is_shard_ok && use_1d && !is_row_bcast) {
             const uint32_t rank_chunk_elems = hex_round_up((nelem + n_ranks - 1) / n_ranks, 128);
             const uint32_t rank_elem_start  = (std::min)(rank * rank_chunk_elems, nelem);
@@ -3886,10 +3856,6 @@ static bool ggml_hexagon_precompute_allreduce_params(
         }
     }
 
-    // Default collective mode from the destination count: any path writing to all N per-core
-    // buffers fans out across cores (needs the exit-barrier DMA drain), a single-dst path does
-    // not. The fused ALLREDUCE+ADD planner may downgrade SHARDED_FANOUT->FULL after its
-    // in-place aliasing check; the standalone allreduce keeps whatever is set here.
     kparams->mode = (kparams->n_dsts > 1) ? HTP_ALLREDUCE_SHARDED_FANOUT : HTP_ALLREDUCE_FULL;
 
     if (use_1d) {
