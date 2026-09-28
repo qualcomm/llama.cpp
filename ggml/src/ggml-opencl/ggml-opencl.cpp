@@ -11657,11 +11657,20 @@ static bool ggml_opencl_try_fa_mq_narrow(ggml_backend_opencl_context * backend_c
     if (cfg == nullptr) { failed.insert(fkey); return false; }
 
     const size_t wg = (size_t) 64 * nsg_split;
+    // V loads issued at the top of each KV row (FA_MQS_VPRE), except at MQ_GQA 2. Every shape measured
+    // on the X2-90 (f16 KV tg128, bookended) gains at MQ_GQA 1 or 4 -- Qwen3.5 (DK=256 gqa 8 hs 2)
+    // +7% / +9% @ d16384 / d32768, Nemotron-3.5 (DK=128 gqa 16 hs 16) +3%, E4B (DK=256/512 gqa 4
+    // hs 1) and muse +1% -- and loses at MQ_GQA 2, both gemma-4-26B shapes: DK=512 gqa 8 hs 4
+    // 27.15 -> 23.34 / 22.29 -> 18.01, and with that one excluded its DK=256 gqa 2 hs 1 SWA layers
+    // still 27.16 -> 26.42 / 22.27 -> 21.84. GGML_OPENCL_FA_MQN_VPRE=0 opts out everywhere.
+    static const bool vpre_off = ggml_cl_env_flag_zero("GGML_OPENCL_FA_MQN_VPRE");
+    const bool vpre = !vpre_off && mq_gqa != 2;
     const std::string opts = ggml_opencl_fa_compile_opts(backend_ctx, cfg, FA_VARIANT_F32_F16) +
                              " -D FA_MQ_ONLY -D FA_MQ_SPLIT_ONLY -D MQ_GQA=" + std::to_string(mq_gqa) +
                              " -D MQ_NSG_SPLIT=" + std::to_string(nsg_split) +
                              " -D FA_HEAD_SUB=" + std::to_string(head_sub) +
-                             (k_img ? " -D FA_MQ_KIMG" : "");
+                             (k_img ? " -D FA_MQ_KIMG" : "") +
+                             (vpre ? " -D FA_MQS_VPRE" : "");
     const std::string tag = std::string("fa f32_f16 mq_split narrow") + (k_img ? " k_img" : "") +
                             " dk" + std::to_string(dk) +
                             " gqa" + std::to_string(gqa) + " mq" + std::to_string(mq_gqa) +
