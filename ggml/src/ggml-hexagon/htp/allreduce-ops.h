@@ -17,6 +17,21 @@ enum htp_allreduce_kernel_type {
     HTP_ALLREDUCE_KERNEL_DMA_2D,
 };
 
+// Collective mode for the fused ALLREDUCE(+ADD). Chosen once by the host planner
+// (ggml_hexagon_precompute_allreduce_params) and consumed by every later stage --
+// fusion emit, the HTP kernel, and per-phase instrumentation -- instead of being
+// re-derived from n_dsts at each site.
+//
+//   FULL           : every rank reduces the whole tensor into its own buffer.
+//                    Redundant compute (N x reduction), but no cross-rank writes.
+//   SHARDED_FANOUT : each rank reduces only its own disjoint 1/N shard, then writes
+//                    that shard into all N per-rank buffers (all-gather by fan-out).
+//                    Cuts reduction compute N-fold; fan-out DMA is N x B traffic.
+enum htp_allreduce_mode {
+    HTP_ALLREDUCE_FULL           = 0,
+    HTP_ALLREDUCE_SHARDED_FANOUT = 1,
+};
+
 static inline size_t htp_allreduce_vtcm_buffer_count(
     uint32_t n_ranks,
     uint32_t n_threads,
@@ -42,6 +57,7 @@ struct htp_allreduce_kernel_params {
     int32_t rank_nelem;
     int32_t n_dsts;
     int32_t is_row_bcast;
+    int32_t mode;                 // enum htp_allreduce_mode: FULL or SHARDED_FANOUT
 };
 
 #ifdef __cplusplus

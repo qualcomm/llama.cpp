@@ -306,6 +306,7 @@ int op_allreduce(struct htp_ops_context * octx) {
 
     const bool has_add = (octx->op == HTP_OP_ALLREDUCE_ADD);
     const uint32_t nelem = dst->ne[0] * dst->ne[1] * dst->ne[2] * dst->ne[3];
+    const int32_t  mode  = kparams->mode;
 
     // 1. Entry Barrier: Synchronize all ranks before reading
     struct htp_thread_trace * tr0 = &octx->ctx->trace[0];
@@ -418,6 +419,15 @@ int op_allreduce(struct htp_ops_context * octx) {
 
     // 4. Exit Barrier: Synchronize all ranks after writing
     htp_trace_event_start(tr0, HTP_TRACE_EVT_FENCE, (uint16_t) fence_seq_exit);
+
+    // Sharded fan-out writes each core's shard into peer buffers via DMA. Drain those
+    // writes to DDR before signalling peers, so the next (non-allreduce) consumer op on
+    // any core reads fresh data -- htp_fence_write()'s own syncht fences only after the
+    // fence store, which is too late. The FULL path writes only this core's own buffer and
+    // reads only its own buffer next, so it needs no extra cross-core drain here.
+    if (mode == HTP_ALLREDUCE_SHARDED_FANOUT) {
+        asm volatile ("syncht" : : : "memory");
+    }
 
     htp_fence_write(my_fence, fence_seq_exit, octx->status);
 

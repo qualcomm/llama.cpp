@@ -99,10 +99,11 @@ static int    opt_profile = 0; // profiling mode (0-disabled, 1-basic, 2-pmu)
 static bool   opt_hostbuf = false;
 static bool   opt_dma64   = false;
 
-static int    opt_mm_select = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU (unsupported)
-static int    opt_fa_select = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU (unsupported)
+static int    opt_mm_select  = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU (unsupported)
+static int    opt_fa_select  = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU (unsupported)
 static int    opt_gdn_select = 2; // 2 = HMX -> HVX, 1 = HVX, 0 = CPU (unsupported)
-static int    opt_ar_select = 2; // 2 = fused ALLREDUCE+ADD (DMA, default), 1 = unfused ALLREDUCE (DMA), 0 = fallback to CPY+FENCE
+static int    opt_ar_select  = 2; // 2 = fused ALLREDUCE+ADD (default), 1 = unfused ALLREDUCE, 0 = fallback to CPY+FENCE
+static int    opt_ar_scatter = 1; // 1 = reduce-scatter the fused ALLREDUCE+ADD (default), 0 = full reduction
 
 // Default PMU events, if profiling with PMU (mode=2) is enabled
 // See https://docs.qualcomm.com/doc/80-N2040-60/topic/pmu-events.html
@@ -400,6 +401,7 @@ static bool ggml_hexagon_precompute_allreduce_params(
     uint32_t n_ranks,
     bool has_add,
     bool is_row_bcast,
+    bool is_shard_ok,
     struct htp_allreduce_kernel_params * kparams
 );
 
@@ -2795,19 +2797,44 @@ struct ggml_hexagon_opbatch {
             return false;
         }
 
-        for (uint32_t r = 0; r < n_ranks; r++) {
-            const ggml_tensor * ar_src = last_node.inputs[r];
-            if (ggml_hexagon_tensors_overlap(add_dst, ar_src)) {
-                HEX_VERBOSE("ggml-hex: %s skip ALLREDUCE_ADD fusion: dst overlaps allreduce src %u\n", sess->c_name(), r);
-                return false;
-            }
-        }
+        // Decide scatter eligibility before precompute so the solver lays out the correct
+        // reduction range. Scatter is safe only when the residual ADD is exactly in-place over
+        // this rank's own allreduce partial and the rank count fits the multi-dst fan-out.
+        // If shard is not ok, precompute must produce a full-range reduction — not a 1/N
+        // shard — or the full path leaves the rest of the buffer stale.
+        const bool is_shard_ok = n_ranks <= HTP_OP_MAX_OUTPUTS && add_dst->data == ar_local->data;
 
         struct htp_allreduce_kernel_params new_kparams;
         if (!ggml_hexagon_precompute_allreduce_params(
-            sess, add_dst, (uint32_t) ar_kparams->rank, (uint32_t) ar_kparams->n_ranks, true, is_row_bcast, &new_kparams
+            sess, add_dst, (uint32_t) ar_kparams->rank, (uint32_t) ar_kparams->n_ranks, true, is_row_bcast, is_shard_ok, &new_kparams
         )) {
             HEX_VERBOSE("ggml-hex: %s skip ALLREDUCE_ADD fusion: solver failed\n", sess->c_name());
+            return false;
+        }
+
+        // scatter_ok reflects what the solver actually produced: sharded multi-dst 1D path.
+        // (is_shard_ok can be true yet n_dsts==1 if the op wasn't 1D-eligible -> FULL.)
+        const bool scatter_ok = new_kparams.n_dsts > 1;
+
+        // Collective mode is carried in the kernel params so the HTP kernel and instrumentation
+        // consume the same decision instead of re-deriving it.
+        new_kparams.mode = scatter_ok ? HTP_ALLREDUCE_SHARDED_FANOUT : HTP_ALLREDUCE_FULL;
+
+        for (uint32_t r = 0; r < n_ranks; r++) {
+            const ggml_tensor * ar_src = last_node.inputs[r];
+            if (!ggml_hexagon_tensors_overlap(add_dst, ar_src)) {
+                continue;
+            }
+            // Aliasing our own partial is safe under reduce-scatter: rank r writes only
+            // shard r while rank q reads only shard q, and the shards are disjoint element
+            // ranges, so no rank can clobber a region a peer is still reading. This is the
+            // same aliasing the unfused ALLREDUCE already relies on. The alias must be
+            // exact -- a partial overlap shifts the shard mapping and reintroduces the
+            // race, so it stays rejected, as does any overlap with a peer's partial.
+            if (scatter_ok && r == rank) {
+                continue;
+            }
+            HEX_VERBOSE("ggml-hex: %s skip ALLREDUCE_ADD fusion: dst overlaps allreduce src %u\n", sess->c_name(), r);
             return false;
         }
 
@@ -2828,12 +2855,34 @@ struct ggml_hexagon_opbatch {
         memcpy(o.kernel_params, &new_kparams, sizeof(new_kparams));
 
         o.src[2 * n_ranks] = add_tensor(res_tensor);
-        o.dst[0]           = add_tensor(add_dst);
-        for (uint32_t d = 1; d < HTP_OP_MAX_OUTPUTS; d++) {
-            o.dst[d] = 0xffff;
+        if (new_kparams.mode == HTP_ALLREDUCE_SHARDED_FANOUT) {
+            // Reduce-scatter: each core reduces only its own 1/N shard, then writes that
+            // shard into all n_ranks per-core result buffers. The meta backend gives each
+            // core a separate physical buffer, so the shard must be replicated to every
+            // core's copy to form the complete result; only the (cheap) DMA write is
+            // replicated, the HVX reduction stays 1/N.
+            //
+            // Destinations reuse the first n_ranks source slots: those are exactly the N
+            // per-core allreduce partials, which are the buffers that must receive the final
+            // activation. Assert that contract rather than trust source ordering silently.
+            GGML_ASSERT((uint32_t) new_kparams.n_dsts == n_ranks);
+            for (uint32_t d = 0; d < n_ranks; d++) {
+                GGML_ASSERT(o.src[d] != 0xffff);
+                o.dst[d] = o.src[d];
+            }
+            for (uint32_t d = n_ranks; d < HTP_OP_MAX_OUTPUTS; d++) {
+                o.dst[d] = 0xffff;
+            }
+        } else {
+            // Full redundant reduction: this core reduces the whole tensor into its own buffer.
+            o.dst[0] = add_tensor(add_dst);
+            for (uint32_t d = 1; d < HTP_OP_MAX_OUTPUTS; d++) {
+                o.dst[d] = 0xffff;
+            }
         }
 
-        HEX_VERBOSE("ggml-hex: %s fused ALLREDUCE+ADD (#%u)\n", sess->c_name(), n_ops - 1);
+        HEX_VERBOSE("ggml-hex: %s fused ALLREDUCE+ADD (#%u) mode=%d n_dsts=%d\n",
+                    sess->c_name(), n_ops - 1, (int) new_kparams.mode, (int) new_kparams.n_dsts);
         return true;
     }
 
@@ -3774,6 +3823,7 @@ static bool ggml_hexagon_precompute_allreduce_params(
     uint32_t n_ranks,
     bool has_add,
     bool is_row_bcast,
+    bool is_shard_ok,
     struct htp_allreduce_kernel_params * kparams
 ) {
     memset(kparams, 0, sizeof(*kparams));
@@ -3793,11 +3843,27 @@ static bool ggml_hexagon_precompute_allreduce_params(
     const bool use_1d = is_contiguous && !(has_add && is_row_bcast && ne1 > 1);
 
     if (has_add) {
-        kparams->n_dsts = 1;
-        if (use_1d) {
+        // Reduce-scatter: when the fused residual ADD is in-place over this rank's own
+        // allreduce partial (validated by try_fuse_allreduce_add) AND the caller says shard
+        // is safe (is_shard_ok), each rank reduces only its own disjoint 1/N shard and fans
+        // that shard out to all N per-core buffers. The HVX reduction work is cut N-fold;
+        // only the (cheap) DMA write is replicated. When shard is NOT ok, fall back to the
+        // full-range reduction into this rank's own buffer -- the shard range MUST cover the
+        // whole tensor here, otherwise the FULL path would reduce only 1/N and leave the rest
+        // of the buffer stale (the Qwen mixed-mode corruption bug).
+        if (opt_ar_scatter && is_shard_ok && use_1d && !is_row_bcast) {
+            const uint32_t rank_chunk_elems = hex_round_up((nelem + n_ranks - 1) / n_ranks, 128);
+            const uint32_t rank_elem_start  = (std::min)(rank * rank_chunk_elems, nelem);
+            const uint32_t rank_elem_end    = (std::min)(rank_elem_start + rank_chunk_elems, nelem);
+            kparams->n_dsts          = (int32_t) n_ranks;
+            kparams->rank_elem_start = (int32_t) rank_elem_start;
+            kparams->rank_nelem      = (int32_t) (rank_elem_end - rank_elem_start);
+        } else if (use_1d) {
+            kparams->n_dsts          = 1;
             kparams->rank_elem_start = 0;
             kparams->rank_nelem      = (int32_t) nelem;
         } else {
+            kparams->n_dsts          = 1;
             kparams->rank_elem_start = 0;
             kparams->rank_nelem      = (int32_t) ne1;
         }
@@ -3819,6 +3885,12 @@ static bool ggml_hexagon_precompute_allreduce_params(
             kparams->rank_nelem            = (int32_t) rank_nrows;
         }
     }
+
+    // Default collective mode from the destination count: any path writing to all N per-core
+    // buffers fans out across cores (needs the exit-barrier DMA drain), a single-dst path does
+    // not. The fused ALLREDUCE+ADD planner may downgrade SHARDED_FANOUT->FULL after its
+    // in-place aliasing check; the standalone allreduce keeps whatever is set here.
+    kparams->mode = (kparams->n_dsts > 1) ? HTP_ALLREDUCE_SHARDED_FANOUT : HTP_ALLREDUCE_FULL;
 
     if (use_1d) {
         const uint32_t rank_nelem = (uint32_t) kparams->rank_nelem;
@@ -3925,9 +3997,8 @@ void ggml_hexagon_session::enqueue_allreduce(
     }
 
     ggml_hexagon_precompute_allreduce_params(
-        this, dst, rank, n_ranks, false, false,
-        (struct htp_allreduce_kernel_params *) ar_node.kernel_params
-    );
+        this, dst, rank, n_ranks, false, false, /*is_shard_ok=*/ false,
+        (struct htp_allreduce_kernel_params *) ar_node.kernel_params);
 
     ar_node.name = "ALLREDUCE";
     this->enqueue_op(ar_node);
@@ -7995,7 +8066,7 @@ static bool ggml_backend_hexagon_comm_allreduce_tensor(void * comm_ctx_v, struct
     for (size_t r = 0; r < n_backends; r++) {
         auto sess = static_cast<ggml_hexagon_session *>(comm_ctx->backends[r]->context);
         struct htp_allreduce_kernel_params kparams;
-        if (!ggml_hexagon_precompute_allreduce_params(sess, tensors[r], (uint32_t) r, (uint32_t) n_backends, false, false, &kparams)) {
+        if (!ggml_hexagon_precompute_allreduce_params(sess, tensors[r], (uint32_t) r, (uint32_t) n_backends, false, false, /*is_shard_ok=*/ false, &kparams)) {
             return false;
         }
     }
@@ -8204,6 +8275,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_fa_select = getenv("GGML_HEXAGON_FA_SELECT");
     const char * str_gdn_select = getenv("GGML_HEXAGON_GDN_SELECT");
     const char * str_ar_select = getenv("GGML_HEXAGON_AR_SELECT");
+    const char * str_ar_scatter = getenv("GGML_HEXAGON_AR_SCATTER");
     const char * str_ndev     = getenv("GGML_HEXAGON_NDEV");
     const char * str_arch     = getenv("GGML_HEXAGON_ARCH");
     const char * str_vmem     = getenv("GGML_HEXAGON_VMEM");
@@ -8257,6 +8329,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     opt_fa_select = str_fa_select ? atoi(str_fa_select)                   : opt_fa_select;
     opt_gdn_select = str_gdn_select ? atoi(str_gdn_select)                 : opt_gdn_select;
     opt_ar_select = str_ar_select ? atoi(str_ar_select)                   : opt_ar_select;
+    opt_ar_scatter = str_ar_scatter ? atoi(str_ar_scatter)                : opt_ar_scatter;
     opt_mbuf      = str_mbuf     ? strtoul(str_mbuf, NULL, 0) * MiB       : opt_mbuf;
     opt_vmem      = str_vmem     ? strtoul(str_vmem, NULL, 0) * MiB       : opt_vmem;
     opt_hostbuf   = str_hostbuf  ? atoi(str_hostbuf) != 0                 : opt_hostbuf;
