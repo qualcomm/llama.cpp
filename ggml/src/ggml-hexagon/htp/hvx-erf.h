@@ -6,27 +6,21 @@
 #include "hvx-inverse.h"
 
 // Maximum error is about 1.5e-7 for the Abramowitz-Stegun approximation.
-static inline HVX_Vector hvx_vec_erf_f32(HVX_Vector x) {
+static __attribute__((noinline)) HVX_Vector hvx_vec_erf_f32(HVX_Vector x) {
     const HVX_Vector zero = hvx_vec_splat_f32(0.0f);
-    const HVX_Vector one  = hvx_vec_splat_f32(1.0f);
-    const HVX_Vector p    = hvx_vec_splat_f32(0.3275911f);
-    const HVX_Vector a1   = hvx_vec_splat_f32(0.254829592f);
-    const HVX_Vector a2   = hvx_vec_splat_f32(-0.284496736f);
-    const HVX_Vector a3   = hvx_vec_splat_f32(1.421413741f);
-    const HVX_Vector a4   = hvx_vec_splat_f32(-1.453152027f);
-    const HVX_Vector a5   = hvx_vec_splat_f32(1.061405429f);
-
     const HVX_Vector ax = hvx_vec_abs_f32(x);
-    const HVX_Vector t = hvx_vec_inverse_f32(hvx_vec_add_f32_f32(one, hvx_vec_mul_f32_f32(p, ax)));
+    HVX_Vector t = hvx_vec_inverse_f32(hvx_vec_add_f32_f32(
+        hvx_vec_splat_f32(1.0f), hvx_vec_mul_f32_f32(hvx_vec_splat_f32(0.3275911f), ax)));
 
-    HVX_Vector poly = hvx_vec_mul_f32_f32(a5, t);
-    poly = hvx_vec_add_f32_f32(a4, hvx_vec_mul_f32_f32(poly, t));
-    poly = hvx_vec_add_f32_f32(a3, hvx_vec_mul_f32_f32(poly, t));
-    poly = hvx_vec_add_f32_f32(a2, hvx_vec_mul_f32_f32(poly, t));
-    poly = hvx_vec_add_f32_f32(a1, hvx_vec_mul_f32_f32(poly, t));
+    HVX_Vector poly = hvx_vec_mul_f32_f32(hvx_vec_splat_f32(1.061405429f), t);
+    poly = hvx_vec_add_f32_f32(hvx_vec_splat_f32(-1.453152027f), hvx_vec_mul_f32_f32(poly, t));
+    poly = hvx_vec_add_f32_f32(hvx_vec_splat_f32(1.421413741f), hvx_vec_mul_f32_f32(poly, t));
+    poly = hvx_vec_add_f32_f32(hvx_vec_splat_f32(-0.284496736f), hvx_vec_mul_f32_f32(poly, t));
+    poly = hvx_vec_add_f32_f32(hvx_vec_splat_f32(0.254829592f), hvx_vec_mul_f32_f32(poly, t));
 
     const HVX_Vector exp_term = hvx_vec_exp_f32(hvx_vec_neg_f32(hvx_vec_mul_f32_f32(ax, ax)));
-    HVX_Vector result = hvx_vec_sub_f32_f32(one, hvx_vec_mul_f32_f32(hvx_vec_mul_f32_f32(poly, t), exp_term));
+    HVX_Vector result = hvx_vec_sub_f32_f32(hvx_vec_splat_f32(1.0f),
+        hvx_vec_mul_f32_f32(hvx_vec_mul_f32_f32(poly, t), exp_term));
 
     const HVX_VectorPred neg = Q6_Q_vcmp_gt_VsfVsf(zero, x);
     result = Q6_V_vmux_QVV(neg, hvx_vec_neg_f32(result), result);
