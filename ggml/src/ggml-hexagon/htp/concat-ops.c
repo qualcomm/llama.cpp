@@ -26,6 +26,12 @@ struct htp_concat_context {
     struct fastdiv_values div_ne2;
 };
 
+static inline dma_addr_t concat_plane_addr(const struct htp_tensor * t, uint32_t p, const struct fastdiv_values * div_ne2, uint32_t ne2) {
+    const uint32_t i3 = fastdiv(p, div_ne2);
+    const uint32_t i2 = p - i3 * ne2;
+    return t->data + i2 * t->nb[2] + i3 * t->nb[3];
+}
+
 static void concat_2d_f32_transposed(unsigned int nth, unsigned int ith, void * data) {
     struct htp_concat_context * cctx = (struct htp_concat_context *) data;
     struct htp_ops_context * octx = cctx->octx;
@@ -50,58 +56,74 @@ static void concat_2d_f32_transposed(unsigned int nth, unsigned int ith, void * 
     const uint32_t block_i = 32;
     const uint32_t spad1_stride = block_i * sizeof(float);
 
-    int32_t offsets[32] __attribute__((aligned(128)));
-    for(int k=0; k<32; k++) {
-        offsets[k] = k * spad1_stride;
-    }
-    HVX_Vector vv = *(HVX_Vector*)offsets;
+    const HVX_Vector offsets = hvx_vec_gather_offsets_w(spad1_stride);
     const uint32_t src1_ne0_padded = hex_round_up(src1_ne0, 32);
     const uint32_t src0_row_bytes  = src0_ne0 * sizeof(float);
     const uint32_t src0_row_padded = hex_round_up(src0_row_bytes, VLEN);
     const uint32_t src0_pre        = src0_row_padded - src0_row_bytes;
     const uint32_t spad0_row_bytes = src0_row_padded + src1_ne0_padded * sizeof(float);
-    uint32_t mu = src1_ne0_padded * spad1_stride;
 
     struct htp_thread_trace * tr = &octx->ctx->trace[ith];
 
-    for (uint32_t p = 0; p < cctx->nplanes; p++) {
-        const uint32_t i3 = fastdiv(p, &cctx->div_ne2);
-        const uint32_t i2 = p - i3 * dst->ne[2];
-        const dma_addr_t src0_plane = src0->data + i2 * src0->nb[2] + i3 * src0->nb[3];
-        const dma_addr_t src1_plane = src1->data + i2 * src1->nb[2] + i3 * src1->nb[3];
-        const dma_addr_t dst_plane  = dst->data  + i2 * dst->nb[2]  + i3 * dst->nb[3];
+    const struct fastdiv_values * div_ne2 = &cctx->div_ne2;
+    const uint32_t ne2 = dst->ne[2];
 
-        for (uint32_t i = start_i; i < end_i; i += block_i) {
-            uint32_t current_block_i = (end_i - i < block_i) ? (end_i - i) : block_i;
+    uint32_t p = 0;
+    uint32_t i = start_i;
 
-            uint32_t src1_width_bytes = current_block_i * sizeof(float);
-            const dma_addr_t src1_addr = src1_plane + i * src1->nb[1];
-            dma_queue_push(dma_q, dma_make_data(spad1_base, src1_addr), spad1_stride, src1->nb[0], src1_width_bytes, src1_ne0);
+    const dma_addr_t src1_addr = concat_plane_addr(src1, p, div_ne2, ne2) + i * src1->nb[1];
+    dma_queue_push(dma_q, dma_make_data(spad1_base, src1_addr), spad1_stride, src1->nb[0], MIN(end_i - i, block_i) * sizeof(float), src1_ne0);
 
-            const dma_addr_t src0_addr = src0_plane + i * src0->nb[1];
-            dma_queue_push(dma_q, dma_make_data(spad0_base + src0_pre, src0_addr), spad0_row_bytes, src0->nb[1], src0_row_bytes, current_block_i);
+    const dma_addr_t src0_addr = concat_plane_addr(src0, p, div_ne2, ne2) + i * src0->nb[1];
+    dma_queue_push(dma_q, dma_make_data(spad0_base + src0_pre, src0_addr), spad0_row_bytes, src0->nb[1], src0_row_bytes, MIN(end_i - i, block_i));
 
-            dma_queue_pop(dma_q); // src1
+    dma_queue_pop(dma_q); // src1
 
-            htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) i);
-            for (uint32_t j = 0; j < src1_ne0_padded; j += 32) {
-                #pragma unroll(4)
-                for (uint32_t ii = 0; ii < current_block_i; ii++) {
-                    size_t rt = (size_t)(spad1_base + j * spad1_stride + ii * sizeof(float));
-                    HVX_Vector * dst_ptr = (HVX_Vector *) (spad0_base + ii * spad0_row_bytes + src0_row_padded + j * sizeof(float));
-                    Q6_vgather_ARMVw(dst_ptr, rt, mu, vv);
-                }
-            }
-            hvx_gather_sync(spad0_base + src0_row_padded);
-            htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) i);
+    while (p < cctx->nplanes) {
+        const uint32_t current_block_i = MIN(end_i - i, block_i);
 
-            dma_queue_pop(dma_q); // src0
-
-            const dma_addr_t dst_addr = dst_plane + i * dst->nb[1];
-            dma_queue_push(dma_q, dma_make_data(dst_addr, spad0_base + src0_pre), dst->nb[1], spad0_row_bytes, (src0_ne0 + src1_ne0) * sizeof(float), current_block_i);
-
-            dma_queue_pop(dma_q);
+        htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) i);
+        for (uint32_t j = 0; j < src1_ne0; j += 32) {
+            const uint8_t * src_ptr = spad1_base + j * spad1_stride;
+            uint8_t * dst_ptr = spad0_base + src0_row_padded + j * sizeof(float);
+            hvx_transpose_32x32_w_gather(dst_ptr, spad0_row_bytes, src_ptr, spad1_stride, offsets, current_block_i, MIN(src1_ne0 - j, 32));
         }
+        hvx_gather_sync(spad0_base + src0_row_padded);
+        htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) i);
+
+        uint32_t np = p;
+        uint32_t ni = i + block_i;
+        if (ni >= end_i) {
+            ni = start_i;
+            np++;
+        }
+        const bool has_next = np < cctx->nplanes;
+        const uint32_t next_block_i = MIN(end_i - ni, block_i);
+
+        // spad1 is free after the gather sync, prefetch next src1 ahead of the dst write
+        if (has_next) {
+            const dma_addr_t nsrc1_addr = concat_plane_addr(src1, np, div_ne2, ne2) + ni * src1->nb[1];
+            dma_queue_push(dma_q, dma_make_data(spad1_base, nsrc1_addr), spad1_stride, src1->nb[0], next_block_i * sizeof(float), src1_ne0);
+        }
+
+        dma_queue_pop(dma_q); // src0
+
+        const dma_addr_t dst_addr = concat_plane_addr(dst, p, div_ne2, ne2) + i * dst->nb[1];
+        dma_queue_push(dma_q, dma_make_data(dst_addr, spad0_base + src0_pre), dst->nb[1], spad0_row_bytes, (src0_ne0 + src1_ne0) * sizeof(float), current_block_i);
+
+        if (has_next) {
+            dma_queue_pop(dma_q); // next src1
+        }
+        dma_queue_pop(dma_q); // dst
+
+        // spad0 is free after the dst write
+        if (has_next) {
+            const dma_addr_t nsrc0_addr = concat_plane_addr(src0, np, div_ne2, ne2) + ni * src0->nb[1];
+            dma_queue_push(dma_q, dma_make_data(spad0_base + src0_pre, nsrc0_addr), spad0_row_bytes, src0->nb[1], src0_row_bytes, next_block_i);
+        }
+
+        p = np;
+        i = ni;
     }
 }
 
@@ -129,58 +151,74 @@ static void concat_2d_f16_transposed(unsigned int nth, unsigned int ith, void * 
     const uint32_t block_i = 64;
     const uint32_t spad1_stride = block_i * sizeof(__fp16);
 
-    int16_t offsets[64] __attribute__((aligned(128)));
-    for(int k=0; k<64; k++) {
-        offsets[k] = k * spad1_stride;
-    }
-    HVX_Vector vv = *(HVX_Vector*)offsets;
+    const HVX_Vector offsets = hvx_vec_gather_offsets_h(spad1_stride);
     const uint32_t src1_ne0_padded = hex_round_up(src1_ne0, 64);
     const uint32_t src0_row_bytes  = src0_ne0 * sizeof(__fp16);
     const uint32_t src0_row_padded = hex_round_up(src0_row_bytes, VLEN);
     const uint32_t src0_pre        = src0_row_padded - src0_row_bytes;
     const uint32_t spad0_row_bytes = src0_row_padded + src1_ne0_padded * sizeof(__fp16);
-    uint32_t mu = src1_ne0_padded * spad1_stride;
 
     struct htp_thread_trace * tr = &octx->ctx->trace[ith];
 
-    for (uint32_t p = 0; p < cctx->nplanes; p++) {
-        const uint32_t i3 = fastdiv(p, &cctx->div_ne2);
-        const uint32_t i2 = p - i3 * dst->ne[2];
-        const dma_addr_t src0_plane = src0->data + i2 * src0->nb[2] + i3 * src0->nb[3];
-        const dma_addr_t src1_plane = src1->data + i2 * src1->nb[2] + i3 * src1->nb[3];
-        const dma_addr_t dst_plane  = dst->data  + i2 * dst->nb[2]  + i3 * dst->nb[3];
+    const struct fastdiv_values * div_ne2 = &cctx->div_ne2;
+    const uint32_t ne2 = dst->ne[2];
 
-        for (uint32_t i = start_i; i < end_i; i += block_i) {
-            uint32_t current_block_i = (end_i - i < block_i) ? (end_i - i) : block_i;
+    uint32_t p = 0;
+    uint32_t i = start_i;
 
-            uint32_t src1_width_bytes = current_block_i * sizeof(__fp16);
-            const dma_addr_t src1_addr = src1_plane + i * src1->nb[1];
-            dma_queue_push(dma_q, dma_make_data(spad1_base, src1_addr), spad1_stride, src1->nb[0], src1_width_bytes, src1_ne0);
+    const dma_addr_t src1_addr = concat_plane_addr(src1, p, div_ne2, ne2) + i * src1->nb[1];
+    dma_queue_push(dma_q, dma_make_data(spad1_base, src1_addr), spad1_stride, src1->nb[0], MIN(end_i - i, block_i) * sizeof(__fp16), src1_ne0);
 
-            const dma_addr_t src0_addr = src0_plane + i * src0->nb[1];
-            dma_queue_push(dma_q, dma_make_data(spad0_base + src0_pre, src0_addr), spad0_row_bytes, src0->nb[1], src0_row_bytes, current_block_i);
+    const dma_addr_t src0_addr = concat_plane_addr(src0, p, div_ne2, ne2) + i * src0->nb[1];
+    dma_queue_push(dma_q, dma_make_data(spad0_base + src0_pre, src0_addr), spad0_row_bytes, src0->nb[1], src0_row_bytes, MIN(end_i - i, block_i));
 
-            dma_queue_pop(dma_q); // src1
+    dma_queue_pop(dma_q); // src1
 
-            htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) i);
-            for (uint32_t j = 0; j < src1_ne0_padded; j += 64) {
-                #pragma unroll(4)
-                for (uint32_t ii = 0; ii < current_block_i; ii++) {
-                    size_t rt = (size_t)(spad1_base + j * spad1_stride + ii * sizeof(__fp16));
-                    HVX_Vector * dst_ptr = (HVX_Vector *) (spad0_base + ii * spad0_row_bytes + src0_row_padded + j * sizeof(__fp16));
-                    Q6_vgather_ARMVh(dst_ptr, rt, mu, vv);
-                }
-            }
-            hvx_gather_sync(spad0_base + src0_row_padded);
-            htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) i);
+    while (p < cctx->nplanes) {
+        const uint32_t current_block_i = MIN(end_i - i, block_i);
 
-            dma_queue_pop(dma_q); // src0
-
-            const dma_addr_t dst_addr = dst_plane + i * dst->nb[1];
-            dma_queue_push(dma_q, dma_make_data(dst_addr, spad0_base + src0_pre), dst->nb[1], spad0_row_bytes, (src0_ne0 + src1_ne0) * sizeof(__fp16), current_block_i);
-
-            dma_queue_pop(dma_q);
+        htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) i);
+        for (uint32_t j = 0; j < src1_ne0; j += 64) {
+            const uint8_t * src_ptr = spad1_base + j * spad1_stride;
+            uint8_t * dst_ptr = spad0_base + src0_row_padded + j * sizeof(__fp16);
+            hvx_transpose_64x64_h_gather(dst_ptr, spad0_row_bytes, src_ptr, spad1_stride, offsets, current_block_i, MIN(src1_ne0 - j, 64));
         }
+        hvx_gather_sync(spad0_base + src0_row_padded);
+        htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) i);
+
+        uint32_t np = p;
+        uint32_t ni = i + block_i;
+        if (ni >= end_i) {
+            ni = start_i;
+            np++;
+        }
+        const bool has_next = np < cctx->nplanes;
+        const uint32_t next_block_i = MIN(end_i - ni, block_i);
+
+        // spad1 is free after the gather sync, prefetch next src1 ahead of the dst write
+        if (has_next) {
+            const dma_addr_t nsrc1_addr = concat_plane_addr(src1, np, div_ne2, ne2) + ni * src1->nb[1];
+            dma_queue_push(dma_q, dma_make_data(spad1_base, nsrc1_addr), spad1_stride, src1->nb[0], next_block_i * sizeof(__fp16), src1_ne0);
+        }
+
+        dma_queue_pop(dma_q); // src0
+
+        const dma_addr_t dst_addr = concat_plane_addr(dst, p, div_ne2, ne2) + i * dst->nb[1];
+        dma_queue_push(dma_q, dma_make_data(dst_addr, spad0_base + src0_pre), dst->nb[1], spad0_row_bytes, (src0_ne0 + src1_ne0) * sizeof(__fp16), current_block_i);
+
+        if (has_next) {
+            dma_queue_pop(dma_q); // next src1
+        }
+        dma_queue_pop(dma_q); // dst
+
+        // spad0 is free after the dst write
+        if (has_next) {
+            const dma_addr_t nsrc0_addr = concat_plane_addr(src0, np, div_ne2, ne2) + ni * src0->nb[1];
+            dma_queue_push(dma_q, dma_make_data(spad0_base + src0_pre, nsrc0_addr), spad0_row_bytes, src0->nb[1], src0_row_bytes, next_block_i);
+        }
+
+        p = np;
+        i = ni;
     }
 }
 
