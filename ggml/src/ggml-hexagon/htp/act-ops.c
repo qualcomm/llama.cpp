@@ -634,7 +634,7 @@ static void geglu_f16(const _Float16 * restrict src0,
             return;                                                                                                    \
         }                                                                                                              \
                                                                                                                        \
-        dma_queue * dma_q = actx->octx->ctx->dma[ith];                                                                \
+        dma_queue * dma_q = actx->octx->ctx->dma[ith];                                                                 \
         glu_compute_##SUFFIX##_fn_t compute = (glu_compute_##SUFFIX##_fn_t) actx->compute;                             \
                                                                                                                        \
         for (uint32_t ir = src0_start_row, spad_idx = 0; ir < src0_end_row && spad_idx < 2; ir += BLOCK, spad_idx++) { \
@@ -646,11 +646,11 @@ static void geglu_f16(const _Float16 * restrict src0,
                            dst_row_size, dst_row_size_aligned, dst_row_size, 0);                                       \
                                                                                                                        \
             dma_queue_push(dma_q,                                                                                      \
-                dma_make_data(src0_spad_data + (spad_idx * src0_spad_half_size), data_src0 + (ir * src0_row_stride)),   \
+                dma_make_data(src0_spad_data + (spad_idx * src0_spad_half_size), data_src0 + (ir * src0_row_stride)),  \
                 src0_row_size_aligned, src0_row_stride, src0_row_size, block_size);                                    \
                                                                                                                        \
             dma_queue_push(dma_q,                                                                                      \
-                dma_make_data(src1_spad_data + (spad_idx * src1_spad_half_size), data_src1 + (ir * src1_row_stride)),   \
+                dma_make_data(src1_spad_data + (spad_idx * src1_spad_half_size), data_src1 + (ir * src1_row_stride)),  \
                 src1_row_size_aligned, src1_row_stride, src1_row_size, block_size);                                    \
         }                                                                                                              \
                                                                                                                        \
