@@ -5179,7 +5179,7 @@ static bool ggml_hexagon_matmul_is_hmx_eligible(
     bool is_matmul_id,
     bool is_batched
 ) {
-    if (src1->type != GGML_TYPE_F32) {
+    if (src1->type != GGML_TYPE_F32 && (src1->type != GGML_TYPE_F16 || is_matmul_id)) {
         return false;
     }
 
@@ -5188,8 +5188,8 @@ static bool ggml_hexagon_matmul_is_hmx_eligible(
     const int ne12  = src1->ne[2];
     const int wtype = src0->type;
 
-    // HMX weight tile requires N to be 32-aligned.
-    if (ne01_padded % 32 != 0) {
+    // HMX weight tiles accept non-32-aligned N for non-matmul_id.
+    if (ne01_padded % 32 != 0 && is_matmul_id) {
         return false;
     }
 
@@ -5508,6 +5508,9 @@ static void ggml_hexagon_precompute_matmul_params_impl(
     const int ne00_padded = is_repack ? hex_round_up(ne00, 32) : ne00;
     const int ne01_padded = is_repack ? hex_round_up(ne01, 32) : ne01;
     const int ne11_padded = hex_round_up(ne11, 32);
+    // VTCM has to hold whole 32-row weight tiles, so size for the rounded-up N
+    // even when the tensor itself is ragged.
+    const int  ne01_tiled  = hex_round_up(ne01_padded, 32);
 
     const bool is_matmul_id = (dst->op == GGML_OP_MUL_MAT_ID);
     const bool is_batched   = (ne02 * ne03 > 1 || ne12 * ne13 > 1);
@@ -5517,7 +5520,7 @@ static void ggml_hexagon_precompute_matmul_params_impl(
     // Check HMX eligibility and try precomputing HMX parameters
     bool hmx_enabled = (sess->n_hmx > 0) && (opt_mm_select >= 2);
     if (hmx_enabled && ggml_hexagon_matmul_is_hmx_eligible(src0, src1, dst, ne01_padded, is_matmul_id, is_batched)) {
-        if (ggml_hexagon_precompute_hmx_mm_params(sess, src0, src1, dst, wtype, ne00_padded, ne01_padded, ne02, ne11, ne12, ne11_padded, is_matmul_id, is_batched, src2_size, vtcm_budget, kparams)) {
+        if (ggml_hexagon_precompute_hmx_mm_params(sess, src0, src1, dst, wtype, ne00_padded, ne01_tiled, ne02, ne11, ne12, ne11_padded, is_matmul_id, is_batched, src2_size, vtcm_budget, kparams)) {
             goto finalize;
         }
     }
