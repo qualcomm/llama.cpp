@@ -18289,7 +18289,8 @@ inline bool use_q4_0_bin_kernels(const ggml_backend_opencl_context *backend_ctx,
 }
 
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
-static bool use_fa_bin_kernels_prefill(const ggml_backend_opencl_context * backend_ctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v) {
+static bool use_fa_bin_kernels_prefill(const ggml_backend_opencl_context * backend_ctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v,
+                                       const ggml_tensor * sinks) {
     if (backend_ctx->fa.kernel_flash_attn_f32_f16_bin == nullptr) {
         return false;
     }
@@ -18305,6 +18306,16 @@ static bool use_fa_bin_kernels_prefill(const ggml_backend_opencl_context * backe
     const int n_q = q->ne[1];
     const int dk = q->ne[0];
     const int dv = v->ne[0];
+
+    // q8_0 KV with attention sinks at head size <= 64 (gpt-oss) goes to the decomposed int8 path
+    // instead: KL against CPU logits on in-distribution chat text, X2-90, 24.5k tokens, this
+    // path 93.39% top-1 / mean KLD 0.067 / 99% KLD 1.42 against 93.16% / 0.054 / 1.07 decomposed
+    // (f16 KV 94.60% / 0.042 / 0.86), and pp4096 779 -> 836 t/s.
+    // GGML_OPENCL_FA_BIN_Q8_SINKS=1 keeps it here.
+    static const bool q8_sinks_keep = ggml_cl_env_flag("GGML_OPENCL_FA_BIN_Q8_SINKS");
+    if (is_q8_0 && sinks != nullptr && dk <= 64 && !q8_sinks_keep) {
+        return false;
+    }
 
     constexpr bool prefill_only = true;
 
@@ -19306,7 +19317,7 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
             return op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_FLASH_ATTN_EXT: {
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
-            if (use_fa_bin_kernels_prefill(backend_ctx, op->src[0], op->src[1], op->src[2])) {
+            if (use_fa_bin_kernels_prefill(backend_ctx, op->src[0], op->src[1], op->src[2], op->src[4])) {
                 return true;
             }
 #endif
@@ -31251,10 +31262,11 @@ static bool ggml_cl_flash_attn_decompose(
     // A q8_0 KV cache is exempt wherever the WMM path cannot take the shape (past its image limits,
     // ~16k tokens of context on the X2-90): the q8_0 alternative there is the fused q8_0 tile, which
     // quantises Q to int8 and runs dp4a against the q8_0 K itself -- the same int8 Q.K error -- so
-    // the decomposed int8 KQ adds nothing it was not already paying. Within the WMM path's limits
-    // (fp16 Q.K) the decline stands. GGML_OPENCL_FA_Q8_SINKS_INT8=0 restores it everywhere.
+    // the decomposed int8 KQ adds nothing it was not already paying. The WMM path declines this
+    // shape itself (use_fa_bin_kernels_prefill: it measured the heavier KL tail), so a q8_0 cache
+    // with sinks lands here at every context. GGML_OPENCL_FA_Q8_SINKS_INT8=0 restores the decline.
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
-    const bool wmm_takes = use_fa_bin_kernels_prefill(backend_ctx, q, k, v);
+    const bool wmm_takes = use_fa_bin_kernels_prefill(backend_ctx, q, k, v, sinks);
 #else
     const bool wmm_takes = false;
 #endif
@@ -32966,7 +32978,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     const bool is_q4_0 = q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_Q4_0 && v->type == GGML_TYPE_Q4_0;
 
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
-    if (use_fa_bin_kernels_prefill(backend_ctx, q, k, v)) {
+    if (use_fa_bin_kernels_prefill(backend_ctx, q, k, v, sinks)) {
         // We support the prefill path of flash attn with a specialized d_head = 64/128/256
         ggml_cl_flash_attn_prefill_bin(backend, q, k, dst);
         return;
