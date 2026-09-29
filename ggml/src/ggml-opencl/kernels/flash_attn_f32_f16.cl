@@ -1897,6 +1897,10 @@ __kernel void flash_attn_f32_f16_q1_vec_mq(
 #define FA_PARTIAL_FLOATS (2 + DV)
 #endif
 
+// FA_MQS_LEAN reworks the shared-Q (LDS) score path; the register-Q form keeps its own.
+#if defined(FA_MQS_LEAN) && defined(FA_Q1_Q_REG)
+#undef FA_MQS_LEAN
+#endif
 #ifndef FA_MQ_KIMG   // the k_img-only program carries the image form instead
 REQD_SUBGROUP_SIZE_64
 __kernel void flash_attn_f32_f16_q1_vec_mq_split(
@@ -2036,7 +2040,18 @@ __kernel void flash_attn_f32_f16_q1_vec_mq_split(
     const int kv_lo    = kv_start + sgid * kv_per_sg;
     const int kv_hi    = min(kv_end, kv_lo + kv_per_sg);
 
+#ifdef FA_MQS_LEAN
+    // FA_MQS_LEAN: this kernel sits at a register-residency step (16 vec4 GPRs at DK=512 MQ_GQA 2),
+    // so one extra live value costs ~40% (measured). Two changes that fit under it together: the
+    // score is accumulated as a scalar per head with dot() instead of a float4 per head, and the
+    // mask - one value per KV position when mask_ne2 == 1 - is read once per row at the top of the
+    // row instead of once per head behind the reduce, where it was 19% of the kernel.
+    const global MASK_DATA_TYPE * mask_one = (mask_void != NULL && mask_ne2 == 1) ? (const global MASK_DATA_TYPE *) mask_base[0] : NULL;
+#endif
     for (int k_idx = kv_lo; k_idx < kv_hi; ++k_idx) {
+#ifdef FA_MQS_LEAN
+        const ACC_TYPE mask_v = mask_one != NULL ? (ACC_TYPE) mask_one[k_idx] : 0.0f;
+#endif
         const ulong k_row_off = batch_idx * k_nb3 + head_kv_idx * k_nb2 + k_idx * k_nb1;
         const ulong v_row_off = batch_idx * v_nb3 + head_kv_idx * v_nb2 + k_idx * v_nb1;
         const global KV_DATA_TYPE4 * k_ptr = (const global KV_DATA_TYPE4 *) (k_base + k_row_off);
@@ -2052,6 +2067,18 @@ __kernel void flash_attn_f32_f16_q1_vec_mq_split(
         }
 #endif
 
+#ifdef FA_MQS_LEAN
+        ACC_TYPE dotp[MQ_GQA];
+        #pragma unroll
+        for (int h = 0; h < MQ_GQA; ++h) dotp[h] = 0.0f;
+        for (int k = tid_sg; k < DK_VEC; k += Q1_WG_SIZE) {
+            const ACC_TYPE4 k_vec = CONVERT_KV_ACC4(k_ptr[k]);
+            #pragma unroll
+            for (int h = 0; h < MQ_GQA; ++h) {
+                dotp[h] += dot(q_shared[h * DK_VEC + k], k_vec);
+            }
+        }
+#else
         ACC_TYPE4 dot4[MQ_GQA];
         #pragma unroll
         for (int h = 0; h < MQ_GQA; ++h) dot4[h] = (ACC_TYPE4)(0.0f);
@@ -2072,12 +2099,22 @@ __kernel void flash_attn_f32_f16_q1_vec_mq_split(
             }
         }
 #endif
+#endif // FA_MQS_LEAN
 
         ACC_TYPE score[MQ_GQA];
         #pragma unroll
         for (int h = 0; h < MQ_GQA; ++h) {
+#ifdef FA_MQS_LEAN
+            const ACC_TYPE dot_partial = dotp[h];
+#else
             const ACC_TYPE dot_partial = dot4[h].s0 + dot4[h].s1 + dot4[h].s2 + dot4[h].s3;
+#endif
             ACC_TYPE s = sub_group_reduce_add(dot_partial) * scale;
+#ifdef FA_MQS_LEAN
+            if (mask_one != NULL) {
+                s += slope[h] * mask_v;
+            } else
+#endif
             if (mask_base[h] != NULL) {
                 const global MASK_DATA_TYPE * mask_ptr = (const global MASK_DATA_TYPE *) mask_base[h];
                 s += slope[h] * (ACC_TYPE) mask_ptr[k_idx];

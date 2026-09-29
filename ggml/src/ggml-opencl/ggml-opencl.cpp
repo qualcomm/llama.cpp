@@ -11669,7 +11669,14 @@ static bool ggml_opencl_try_fa_mq_narrow(ggml_backend_opencl_context * backend_c
     // still 27.16 -> 26.42 / 22.27 -> 21.84. GGML_OPENCL_FA_MQN_VPRE=0 opts out everywhere.
     static const bool vpre_off = ggml_cl_env_flag_zero("GGML_OPENCL_FA_MQN_VPRE");
     const bool vpre = !vpre_off && mq_gqa != 2;
+    // Scalar score accumulation + the mask read once per row at the top of the row (FA_MQS_LEAN, the
+    // shared-Q form only, i.e. DK > 256): the DK=512 MQ_GQA 2 program sits at 16 vec4 GPRs, where the
+    // hoist alone crosses a residency step (+40%); together they stay at 16. gemma-4-26B global layers
+    // on the X2-90: 3.06 -> 2.81 ms per call at depth 32768, tg64 +2% / +3.5% at 16384 / 32768; E4B
+    // unchanged. GGML_OPENCL_FA_MQS_LEAN=0 opts out.
+    static const bool mqs_lean = !ggml_cl_env_flag_zero("GGML_OPENCL_FA_MQS_LEAN");
     const std::string opts = ggml_opencl_fa_compile_opts(backend_ctx, cfg, FA_VARIANT_F32_F16) +
+                             (mqs_lean && !k_img ? " -D FA_MQS_LEAN" : "") +
                              " -D FA_MQ_ONLY -D FA_MQ_SPLIT_ONLY -D MQ_GQA=" + std::to_string(mq_gqa) +
                              " -D MQ_NSG_SPLIT=" + std::to_string(nsg_split) +
                              " -D FA_HEAD_SUB=" + std::to_string(head_sub) +
