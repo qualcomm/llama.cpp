@@ -149,6 +149,9 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
 bool common_speculative_process(common_speculative * spec, const llama_batch & batch,
                                 const std::vector<int32_t> * rows = nullptr);
 
+// common_batch input (llama_batch_ext callers), converted to a llama_batch for the above
+bool common_speculative_process(common_speculative * spec, const common_batch & batch);
+
 // generate drafts for the sequences specified with `common_speculative_get_draft_params`
 void common_speculative_draft(common_speculative * spec);
 

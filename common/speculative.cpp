@@ -3462,6 +3462,41 @@ bool common_speculative_process(common_speculative * spec, const llama_batch & b
     return result;
 }
 
+bool common_speculative_process(common_speculative * spec, const common_batch & batch) {
+    if (spec == nullptr || batch.size() <= 0) {
+        return true;
+    }
+
+    // The implementations above take a llama_batch (tree drafting passes row subsets of one),
+    // so mirror the entries into one. An embedding batch carries n_pos positions per entry,
+    // stored section-major as llama_batch expects for M-RoPE.
+    const int32_t n      = batch.size();
+    const bool    embd   = batch.has_embd();
+    const int32_t n_embd = embd ? (int32_t) batch.tokens[0].embd.n_embd : 0;
+    const int32_t n_pos  = embd ? std::max(1, batch.n_pos) : 1;
+
+    llama_batch lb = llama_batch_init(n * n_pos, n_embd, 1);
+    lb.n_tokens = n;
+    for (int32_t i = 0; i < n; ++i) {
+        const auto & t = batch.tokens[i];
+        if (embd) {
+            std::memcpy(lb.embd + (size_t) i * n_embd, t.embd.data, (size_t) n_embd * sizeof(float));
+        } else {
+            lb.token[i] = t.id;
+        }
+        for (int32_t p = 0; p < n_pos; ++p) {
+            lb.pos[(size_t) p * n + i] = t.pos[p];
+        }
+        lb.n_seq_id[i]  = 1;
+        lb.seq_id[i][0] = t.seq_id;
+        lb.logits[i]    = t.output;
+    }
+
+    const bool ok = common_speculative_process(spec, lb, nullptr);
+    llama_batch_free(lb);
+    return ok;
+}
+
 void common_speculative_draft(common_speculative * spec) {
     if (spec == nullptr) {
         return;
