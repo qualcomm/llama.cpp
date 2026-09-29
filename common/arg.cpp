@@ -351,7 +351,7 @@ static bool parse_bool_value(const std::string & value) {
 static std::string get_default_local_path(const std::string & url) {
     auto f = string_split<std::string>(url, '#').front();
     f = string_split<std::string>(f, '?').front();
-    return fs_get_cache_file(string_split<std::string>(f, '/').back());
+    return fs_path_to_utf8(fs_get_cache_file(string_split<std::string>(f, '/').back()));
 }
 
 static bool spec_types_is_default(const common_params & params) {
@@ -2673,16 +2673,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.video_ffmpeg_bin_dir = value;
         }
     ).set_examples(mmproj_examples).set_env("LLAMA_ARG_VIDEO_FFMPEG_DIR"));
-    if (params.is_gen_docs || llama_supports_rpc()) {
-        add_opt(common_arg(
-            {"--rpc"}, "SERVERS",
-            "comma-separated list of RPC servers (host:port)",
-            [](common_params & params, const std::string & value) {
-                add_rpc_devices(value);
-                GGML_UNUSED(params);
+    add_opt(common_arg(
+        {"--rpc"}, "SERVERS",
+        "comma-separated list of RPC servers (host:port)",
+        [](common_params & params, const std::string & value) {
+            if (!llama_supports_rpc()) {
+                throw std::invalid_argument("RPC not supported in this build");
             }
-        ).set_env("LLAMA_ARG_RPC"));
-    }
+            add_rpc_devices(value);
+            GGML_UNUSED(params);
+        }
+    ).set_env("LLAMA_ARG_RPC"));
     add_opt(common_arg(
         {"-lm", "--load-mode"}, "MODE",
         "model loading mode (default: auto)\n"
