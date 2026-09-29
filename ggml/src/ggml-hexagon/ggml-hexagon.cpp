@@ -6637,12 +6637,12 @@ static htp_op_code op_remap_to_htp(const ggml_tensor * t) {
 
         case GGML_OP_GLU:
             switch (ggml_get_glu_op(t)) {
-                case GGML_GLU_OP_SWIGLU:     return HTP_OP_GLU_SWIGLU;
-                case GGML_GLU_OP_SWIGLU_OAI: return HTP_OP_GLU_SWIGLU_OAI;
+                case GGML_GLU_OP_SWIGLU:       return HTP_OP_GLU_SWIGLU;
+                case GGML_GLU_OP_SWIGLU_OAI:   return HTP_OP_GLU_SWIGLU_OAI;
                 case GGML_GLU_OP_SWIGLU_CLAMP: return HTP_OP_GLU_SWIGLU_CLAMP;
-                case GGML_GLU_OP_GEGLU:      return HTP_OP_GLU_GEGLU;
-                case GGML_GLU_OP_GEGLU_QUICK: return HTP_OP_GLU_GEGLU_QUICK;
-                case GGML_GLU_OP_GEGLU_ERF:  return HTP_OP_GLU_GEGLU_ERF;
+                case GGML_GLU_OP_GEGLU:        return HTP_OP_GLU_GEGLU;
+                case GGML_GLU_OP_GEGLU_QUICK:  return HTP_OP_GLU_GEGLU_QUICK;
+                case GGML_GLU_OP_GEGLU_ERF:    return HTP_OP_GLU_GEGLU_ERF;
                 default: break;
             }
             break;
