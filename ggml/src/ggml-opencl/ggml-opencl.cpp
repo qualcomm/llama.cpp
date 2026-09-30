@@ -1672,6 +1672,13 @@ static void ggml_cl_cok_build_narrow(ggml_backend_opencl_context * backend_ctx,
                 return;
             }
         } else {
+            // Both widths launch with the subgroup count the 4-column build settled
+            // on, so a 2-column build that had to narrow further would run with more
+            // subgroups than it was compiled for: drop it instead.
+            if (kk != nullptr && nsg_eff != nsg) {
+                CL_CHECK(clReleaseKernel(kk));
+                kk = nullptr;
+            }
             k_c2 = kk;
         }
     }
