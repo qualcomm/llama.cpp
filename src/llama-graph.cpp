@@ -14,6 +14,21 @@
 #include <cstring>
 #include <unordered_set>
 
+static ggml_tensor * ggml_mul_mat_aux(
+        ggml_context * ctx,
+        ggml_tensor * cur,
+        ggml_tensor * rot) {
+    const auto n = rot->ne[0];
+
+    ggml_tensor * res;
+
+    res = ggml_reshape_2d(ctx, cur, n, ggml_nelements(cur)/n);
+    res = ggml_mul_mat   (ctx, rot, res);
+    res = ggml_reshape_4d(ctx, res, cur->ne[0], cur->ne[1], cur->ne[2], cur->ne[3]);
+
+    return res;
+}
+
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
     if (ubatch->token) {
         const int64_t n_tokens = ubatch->n_tokens;
@@ -387,6 +402,14 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     mctx->set_input_v_idxs(self_v_idxs, ubatch);
 
     mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+
+    if (self_k_rot) {
+        mctx->set_input_k_rot(self_k_rot);
+    }
+
+    if (self_v_rot) {
+        mctx->set_input_v_rot(self_v_rot);
+    }
 }
 
 bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
@@ -415,6 +438,22 @@ void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
     mctx->get_swa()->set_input_v_idxs(self_v_idxs_swa, ubatch);
 
     mctx->get_swa()->set_input_kq_mask(self_kq_mask_swa, ubatch, cparams.causal_attn);
+
+    if (self_k_rot) {
+        mctx->get_base()->set_input_k_rot(self_k_rot);
+    }
+
+    if (self_v_rot) {
+        mctx->get_base()->set_input_v_rot(self_v_rot);
+    }
+
+    if (self_k_rot_swa) {
+        mctx->get_swa()->set_input_k_rot(self_k_rot_swa);
+    }
+
+    if (self_v_rot_swa) {
+        mctx->get_swa()->set_input_v_rot(self_v_rot_swa);
+    }
 }
 
 bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
@@ -472,6 +511,14 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
     mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
 
     mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+
+    if (inp_attn->self_k_rot) {
+        mctx->get_attn()->set_input_k_rot(inp_attn->self_k_rot);
+    }
+
+    if (inp_attn->self_v_rot) {
+        mctx->get_attn()->set_input_v_rot(inp_attn->self_v_rot);
+    }
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
@@ -1696,6 +1743,9 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
         inp->self_kq_mask_cnv = cparams.flash_attn ? ggml_cast(ctx0, inp->self_kq_mask, GGML_TYPE_F16) : inp->self_kq_mask;
     }
 
+    inp->self_k_rot = mctx_cur->build_input_k_rot(ctx0);
+    inp->self_v_rot = mctx_cur->build_input_v_rot(ctx0);
+
     return inp;
 }
 
@@ -1719,6 +1769,15 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_tensor * v_mla,
             float     kq_scale,
             int       il) const {
+    if (inp->self_k_rot) {
+        q_cur = ggml_mul_mat_aux(ctx0, q_cur, inp->self_k_rot);
+        k_cur = ggml_mul_mat_aux(ctx0, k_cur, inp->self_k_rot);
+    }
+
+    if (inp->self_v_rot) {
+        v_cur = ggml_mul_mat_aux(ctx0, v_cur, inp->self_v_rot);
+    }
+
     // these nodes are added to the graph together so that they are not reordered
     // by doing so, the number of splits in the graph is reduced
     // expand k later to enable rope fusion which directly writes into k-v cache
@@ -1745,6 +1804,10 @@ ggml_tensor * llm_graph_context::build_attn(
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
+
+    if (inp->self_v_rot) {
+        cur = ggml_mul_mat_aux(ctx0, cur, inp->self_v_rot);
+    }
 
     if (wo) {
         cur = build_lora_mm(wo, cur);
@@ -1773,6 +1836,23 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_tensor * v_mla,
             float     kq_scale,
             int       il) const {
+    const bool is_swa = hparams.is_swa(il);
+
+    auto * k_rot = is_swa ? inp->self_k_rot_swa : inp->self_k_rot;
+    auto * v_rot = is_swa ? inp->self_v_rot_swa : inp->self_v_rot;
+
+    if (k_rot) {
+        q_cur = ggml_mul_mat_aux(ctx0, q_cur, k_rot);
+        if (k_cur) {
+            k_cur = ggml_mul_mat_aux(ctx0, k_cur, k_rot);
+        }
+    }
+    if (v_rot) {
+        if (v_cur) {
+            v_cur = ggml_mul_mat_aux(ctx0, v_cur, v_rot);
+        }
+    }
+
     // these nodes are added to the graph together so that they are not reordered
     // by doing so, the number of splits in the graph is reduced
     ggml_build_forward_expand(gf, q_cur);
@@ -1786,8 +1866,6 @@ ggml_tensor * llm_graph_context::build_attn(
     }
 
     const auto * mctx_iswa = inp->mctx;
-
-    const bool is_swa = hparams.is_swa(il);
 
     const auto * mctx_cur = is_swa ? mctx_iswa->get_swa() : mctx_iswa->get_base();
 
@@ -1812,6 +1890,10 @@ ggml_tensor * llm_graph_context::build_attn(
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
+
+    if (v_rot) {
+        cur = ggml_mul_mat_aux(ctx0, cur, v_rot);
+    }
 
     if (wo) {
         cur = build_lora_mm(wo, cur);
@@ -1922,6 +2004,12 @@ llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const
         inp->self_kq_mask_swa_cnv = cparams.flash_attn ? ggml_cast(ctx0, inp->self_kq_mask_swa, GGML_TYPE_F16) : inp->self_kq_mask_swa;
         ggml_set_name(inp->self_kq_mask_swa_cnv, "self_kq_mask_swa_cnv");
     }
+
+    inp->self_k_rot = mctx_cur->get_base()->build_input_k_rot(ctx0);
+    inp->self_v_rot = mctx_cur->get_base()->build_input_v_rot(ctx0);
+
+    inp->self_k_rot_swa = mctx_cur->get_swa()->build_input_k_rot(ctx0);
+    inp->self_v_rot_swa = mctx_cur->get_swa()->build_input_v_rot(ctx0);
 
     return (llm_graph_input_attn_kv_iswa *) res->add_input(std::move(inp));
 }

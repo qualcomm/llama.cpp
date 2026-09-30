@@ -2955,7 +2955,7 @@ llama_context * llama_init_from_model(
         params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
     }
 
-    if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO && ggml_is_quantized(params.type_k)) {
+    if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && ggml_is_quantized(params.type_k)) {
         const uint32_t blck_size = ggml_blck_size(params.type_k);
         if (model->hparams.n_embd_head_k % blck_size != 0) {
             LLAMA_LOG_ERROR("%s: K cache type %s with block size %u does not divide n_embd_head_k=%u\n",
@@ -2964,7 +2964,7 @@ llama_context * llama_init_from_model(
         }
     }
 
-    if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO && ggml_is_quantized(params.type_v)) {
+    if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && ggml_is_quantized(params.type_v)) {
         const uint32_t blck_size = ggml_blck_size(params.type_v);
         if (model->hparams.n_embd_head_v % blck_size != 0) {
             LLAMA_LOG_ERROR("%s: V cache type %s with block size %u does not divide n_embd_head_k=%u\n",
