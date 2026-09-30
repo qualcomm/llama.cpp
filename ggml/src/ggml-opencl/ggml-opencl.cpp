@@ -209,9 +209,22 @@ static inline bool ggml_cl_env_flag_zero(const char * name) {
 // them and their paths compile as dead code at their real upstream values.
 #define GGML_TYPE_NVFP4 ((ggml_type) 40)
 #define GGML_TYPE_Q2_0  ((ggml_type) 42)
-// ggml_mul_mat hints (op_params[1]) postdate this base, which never writes that slot, so the
-// Walsh-Hadamard MUL_MAT fast path is unreachable. Same value as upstream.
+// ggml_mul_mat hints (op_params[1]) postdate this base, which never writes that slot. Same value
+// as upstream.
 #define GGML_HINT_SRC0_IS_HADAMARD 1
+// With a quantized KV cache, a core that rotates Q/K/V by a Walsh-Hadamard matrix (upstream #21038)
+// but predates the hint issues the rotation as a dense MUL_MAT whose src0 is the graph input the KV
+// cache names attn_inp_k_rot / attn_inp_v_rot. Recognise it by name so it takes the FWHT path;
+// ggml_cl_fwht still checks the shape and falls back to the plain GEMM otherwise.
+static inline bool ggml_cl_mul_mat_src0_is_hadamard(const struct ggml_tensor * dst) {
+    if (ggml_get_op_params_i32(dst, 1) == GGML_HINT_SRC0_IS_HADAMARD) {
+        return true;
+    }
+    const char * name = dst->src[0] ? dst->src[0]->name : "";
+    // substring, not prefix: the scheduler hands the backend a copy of the CPU-side input named
+    // "<backend>#attn_inp_k_rot#<n>"
+    return strstr(name, "attn_inp_k_rot") != nullptr || strstr(name, "attn_inp_v_rot") != nullptr;
+}
 
 // The q1_0 device kernels are not built: they are ~5 extra OpenCL programs whose
 // dispatch sites above can never be reached, and program builds dominate Adreno
@@ -43520,7 +43533,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
 
-    if (ggml_get_op_params_i32(dst, 1) == GGML_HINT_SRC0_IS_HADAMARD && ggml_cl_fwht(backend, src1, dst)) {
+    if (ggml_cl_mul_mat_src0_is_hadamard(dst) && ggml_cl_fwht(backend, src1, dst)) {
         return;
     }
 
