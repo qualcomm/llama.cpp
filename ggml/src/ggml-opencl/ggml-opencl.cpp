@@ -1052,6 +1052,17 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_quant_a_q8_1_k4h             = nullptr;  // its activation quant, half-block sums
     int       q6k_cok8_nsg   = 4;
     bool      q6k_cok8_built = false;
+    // q4_K: the narrow cok+dp4a builds over the bin plane for ne1 = 2..4, and an eight-column
+    // kernel for 5..8. Each width narrows its K-split independently, so each keeps its own.
+    cl_kernel kernel_gemm_cok_q4_k_q8_1_dp4a_bin_c4 = nullptr;  // 4-column, ne1 3..4
+    cl_kernel kernel_gemm_cok_q4_k_q8_1_dp4a_bin_c2 = nullptr;  // 2-column, ne1 == 2
+    int       q4k_cok_dp4a_bin_nsg_c4 = 8;
+    int       q4k_cok_dp4a_bin_nsg_c2 = 8;
+    bool      q4k_cok_bin_built = false;
+    cl_kernel kernel_gemm_cok8_q4_k_q8_1_dp4a_bin = nullptr;
+    cl_kernel kernel_quant_a_q8_1_k4              = nullptr;  // its (0 2 1 3) activation quant
+    int       q4k_cok8_nsg   = 4;
+    bool      q4k_cok8_built = false;
     // RGBA32UI views of prealloc_moe_qa / prealloc_moe_da for the cok8 kernels' texture
     // reads, rebuilt when allocate() replaces the buffer underneath
     cl_mem    cok8_qa_img     = nullptr;
@@ -1887,6 +1898,79 @@ static bool ggml_cl_cok_have_q6k_cok8(ggml_backend_opencl_context * backend_ctx)
         }
     }
     return backend_ctx->kernel_gemm_cok8_q6_k_q8_1_dp4a_bin != nullptr;
+}
+
+// gemm_cok_q4_k_q8_1_dp4a over the bin plane (-DCOK_Q_BIN=1), the same two column widths
+// as the narrow noshuffle builds; only the nibble fetch differs. Each width keeps the
+// subgroup count it was built at.
+static void ggml_cl_cok_build_q4k_bin(ggml_backend_opencl_context * backend_ctx) {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+    const std::string kernel_src {
+        #include "gemm_cok_q4_k_q8_1_dp4a.cl.h"
+    };
+#else
+    const std::string kernel_src = read_file("gemm_cok_q4_k_q8_1_dp4a.cl");
+#endif
+    const std::string base_opts = ggml_cl_cok_compile_opts(backend_ctx)
+        + " -DCOK_Q_BIN=1 -DCOK_ROWS=" + std::to_string(backend_ctx->q4k_cok_dp4a_rows);
+    for (int cols : {4, 2}) {
+        int & nsg = (cols == 4) ? backend_ctx->q4k_cok_dp4a_bin_nsg_c4
+                                : backend_ctx->q4k_cok_dp4a_bin_nsg_c2;
+        int nsg_eff = nsg;
+        cl_program prog = ggml_cl_build_cok_program(
+            backend_ctx, kernel_src.c_str(),
+            base_opts + " -DCOK_COLS=" + std::to_string(cols), nsg_eff, &nsg_eff);
+        if (prog == nullptr) {
+            continue;
+        }
+        cl_int err;
+        cl_kernel kk = clCreateKernel(prog, "kernel_gemm_cok_q4_k_q8_1_dp4a", &err);
+        if (err != CL_SUCCESS) { kk = nullptr; }
+        CL_CHECK(clReleaseProgram(prog));
+        if (cols == 4) {
+            backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a_bin_c4 = kk;
+        } else {
+            backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a_bin_c2 = kk;
+        }
+        nsg = nsg_eff;
+    }
+}
+
+// gemm_cok8_q4_k_q8_1_dp4a (the eight-column q4_K kernel over the bin plane) and its
+// activation quant.
+static void ggml_cl_cok_build_q4k_cok8(ggml_backend_opencl_context * backend_ctx) {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+    const std::string kernel_src {
+        #include "gemm_cok8_q4_k_q8_1_dp4a.cl.h"
+    };
+#else
+    const std::string kernel_src = read_file("gemm_cok8_q4_k_q8_1_dp4a.cl");
+#endif
+    ggml_cl_cok8_build(backend_ctx, kernel_src, ggml_cl_cok_compile_opts(backend_ctx),
+                       "kernel_gemm_cok8_q4_k_q8_1_dp4a_bin", "kernel_quant_a_q8_1_k4",
+                       backend_ctx->q4k_cok8_nsg,
+                       backend_ctx->kernel_gemm_cok8_q4_k_q8_1_dp4a_bin,
+                       backend_ctx->kernel_quant_a_q8_1_k4);
+}
+
+static bool ggml_cl_cok_have_q4k_bin(ggml_backend_opencl_context * backend_ctx) {
+    if (!backend_ctx->q4k_cok_bin_built) {
+        backend_ctx->q4k_cok_bin_built = true;
+        if (backend_ctx->has_integer_dot && ggml_cl_cok_dp4a_build_on()) {
+            ggml_cl_cok_build_q4k_bin(backend_ctx);
+        }
+    }
+    return backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a_bin_c4 != nullptr;
+}
+
+static bool ggml_cl_cok_have_q4k_cok8(ggml_backend_opencl_context * backend_ctx) {
+    if (!backend_ctx->q4k_cok8_built) {
+        backend_ctx->q4k_cok8_built = true;
+        if (backend_ctx->has_integer_dot && ggml_cl_cok_dp4a_build_on()) {
+            ggml_cl_cok_build_q4k_cok8(backend_ctx);
+        }
+    }
+    return backend_ctx->kernel_gemm_cok8_q4_k_q8_1_dp4a_bin != nullptr;
 }
 #endif // GGML_OPENCL_USE_ADRENO_KERNELS
 
@@ -22045,6 +22129,170 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno_ila(ggml_backend_t backend, const gg
     int M = ne01;
     int N = ne1;
     int K = ne00;
+
+    // Speculative-verify widths (2..8): the library GEMM below pads the batch to its
+    // 32- or 64-column tile. Widths 2..4 take the narrow int8 cooperative-K GEMM this
+    // backend runs there for the noshuffle layout, built over the bin plane; 5..8 take an
+    // eight-column one. GGML_OPENCL_Q4_K_BIN_COK=0 sends these widths back to the library
+    // GEMM.
+    static const bool bin_cok_on = ggml_cl_bin_cok_env_on("GGML_OPENCL_Q4_K_BIN_COK");
+    if (bin_cok_on && ne1 >= 2 && ne1 <= 4 &&
+        ggml_cl_cok_dp4a_narrow_on(backend_ctx, ne1, ne01, ne00, backend_ctx->q4k_cok_dp4a_rows) &&
+        ggml_cl_cok_have_q4k_bin(backend_ctx) &&
+        ((ne1 <= 2) ? backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a_bin_c2
+                    : backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a_bin_c4) != nullptr) {
+        cl_mem b_sub_buf = nullptr;
+        region.origin = offset1;
+        region.size   = (size_t)K * N * sizeof(float);
+        CL_CHECK((b_sub_buf = clCreateSubBuffer(extra1->data_device, 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &err), err));
+
+        // Allocated at the kernel's width so no column index is clamped; the pad is
+        // zeroed on growth only, as on the noshuffle path.
+        const int    cok_w    = (ne1 <= 2) ? 2 : 4;
+        const size_t qa_bytes = (size_t)cok_w * K * sizeof(cl_char);
+        const size_t nb       = (size_t)cok_w * (K / 32);
+        const size_t qa_was = backend_ctx->prealloc_moe_qa.size;
+        const size_t da_was = backend_ctx->prealloc_moe_da.size;
+        backend_ctx->prealloc_moe_qa.allocate(context, qa_bytes);
+        backend_ctx->prealloc_moe_da.allocate(context, nb * sizeof(cl_half));
+        backend_ctx->prealloc_moe_sa.allocate(context, nb * sizeof(cl_half));
+        if (backend_ctx->prealloc_moe_qa.size != qa_was) {
+            const cl_char z8 = 0;
+            CL_CHECK(clEnqueueFillBuffer(backend_ctx->queue, backend_ctx->prealloc_moe_qa.buffer,
+                                         &z8, sizeof(z8), 0, backend_ctx->prealloc_moe_qa.size, 0, NULL, NULL));
+        }
+        if (backend_ctx->prealloc_moe_da.size != da_was) {
+            const cl_half z16 = 0;
+            CL_CHECK(clEnqueueFillBuffer(backend_ctx->queue, backend_ctx->prealloc_moe_da.buffer,
+                                         &z16, sizeof(z16), 0, backend_ctx->prealloc_moe_da.size, 0, NULL, NULL));
+            CL_CHECK(clEnqueueFillBuffer(backend_ctx->queue, backend_ctx->prealloc_moe_sa.buffer,
+                                         &z16, sizeof(z16), 0, backend_ctx->prealloc_moe_sa.size, 0, NULL, NULL));
+        }
+
+        cl_int tbq = (cl_int)((size_t)N * (K / 32));
+        cl_kernel qk = backend_ctx->kernel_quant_a_q8_1;
+        CL_CHECK(clSetKernelArg(qk, 0, sizeof(cl_mem), &b_sub_buf));
+        CL_CHECK(clSetKernelArg(qk, 1, sizeof(cl_mem), &backend_ctx->prealloc_moe_qa.buffer));
+        CL_CHECK(clSetKernelArg(qk, 2, sizeof(cl_mem), &backend_ctx->prealloc_moe_da.buffer));
+        CL_CHECK(clSetKernelArg(qk, 3, sizeof(cl_mem), &backend_ctx->prealloc_moe_sa.buffer));
+        CL_CHECK(clSetKernelArg(qk, 4, sizeof(cl_int), &tbq));
+        size_t q_local[1]  = { 64 };
+        size_t q_global[1] = { (size_t)((((size_t)tbq + 63) / 64) * 64) };
+        backend_ctx->enqueue_ndrange_kernel(qk, 1, q_global, q_local, dst);
+
+        cl_kernel ck = (ne1 <= 2) ? backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a_bin_c2
+                                  : backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a_bin_c4;
+        const int cok_nsg_sel = (ne1 <= 2) ? backend_ctx->q4k_cok_dp4a_bin_nsg_c2
+                                           : backend_ctx->q4k_cok_dp4a_bin_nsg_c4;
+        const cl_uchar mask_d6 = 0x3F, mask_d4 = 0x0F, mask_hi2 = 0xC0;
+        const cl_int   clamp_n = cok_w;
+        CL_CHECK(clSetKernelArg(ck,  0, sizeof(cl_mem),   &extra0_q4_k->q));
+        CL_CHECK(clSetKernelArg(ck,  1, sizeof(cl_mem),   &extra0_q4_k->s));
+        CL_CHECK(clSetKernelArg(ck,  2, sizeof(cl_mem),   &extra0_q4_k->d));
+        CL_CHECK(clSetKernelArg(ck,  3, sizeof(cl_mem),   &extra0_q4_k->dm));
+        CL_CHECK(clSetKernelArg(ck,  4, sizeof(cl_mem),   &backend_ctx->prealloc_moe_qa.buffer));
+        CL_CHECK(clSetKernelArg(ck,  5, sizeof(cl_mem),   &backend_ctx->prealloc_moe_da.buffer));
+        CL_CHECK(clSetKernelArg(ck,  6, sizeof(cl_mem),   &backend_ctx->prealloc_moe_sa.buffer));
+        CL_CHECK(clSetKernelArg(ck,  7, sizeof(cl_mem),   &extrad->data_device));
+        CL_CHECK(clSetKernelArg(ck,  8, sizeof(cl_ulong), &offsetd));
+        CL_CHECK(clSetKernelArg(ck,  9, sizeof(cl_int),   &ne01));
+        CL_CHECK(clSetKernelArg(ck, 10, sizeof(cl_int),   &clamp_n));
+        CL_CHECK(clSetKernelArg(ck, 11, sizeof(cl_int),   &ne00));
+        CL_CHECK(clSetKernelArg(ck, 12, sizeof(cl_int),   &ne1));
+        CL_CHECK(clSetKernelArg(ck, 13, sizeof(cl_uchar), &mask_d6));
+        CL_CHECK(clSetKernelArg(ck, 14, sizeof(cl_uchar), &mask_d4));
+        CL_CHECK(clSetKernelArg(ck, 15, sizeof(cl_uchar), &mask_hi2));
+
+        // COK_NSG is compile-time, so the launch uses the value this width was built at.
+        const size_t cok_nsg = (size_t)cok_nsg_sel;
+        size_t c_local[3]  = { 64, cok_nsg, 1 };
+        size_t c_global[3] = { (size_t)(ne01 / backend_ctx->q4k_cok_dp4a_rows), cok_nsg, 1 };
+        backend_ctx->enqueue_ndrange_kernel(ck, 3, c_global, c_local, dst);
+
+        CL_CHECK(clReleaseMemObject(b_sub_buf));
+        return;
+    }
+
+    if (bin_cok_on && ne1 >= 5 && ne1 <= 8 &&
+        ggml_cl_cok_dp4a_device_ok(backend_ctx) &&
+        (ne01 % 256) == 0 && (ne00 % 256) == 0 &&
+        ggml_cl_cok_have_q4k_cok8(backend_ctx) &&
+        // Allocated at the kernel's width of 8 columns; the surplus columns compute on
+        // whatever the buffer holds and are dropped at the store. Two half8 texels per
+        // block (scale, sum).
+        ggml_cl_cok8_prepare(backend_ctx, (size_t)8 * ne00 * sizeof(cl_char),
+                             (size_t)16 * (ne00 / 32) * sizeof(cl_half))) {
+        cl_mem b_sub_buf = nullptr;
+        region.origin = offset1;
+        region.size   = (size_t)K * N * sizeof(float);
+        CL_CHECK((b_sub_buf = clCreateSubBuffer(extra1->data_device, 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &err), err));
+
+        const int kb8  = K / 32;
+        const int nsg8 = backend_ctx->q4k_cok8_nsg;
+
+        const cl_int tbq8    = (cl_int)(ne1 * kb8);
+        const cl_int kb8_arg = (cl_int)kb8;
+        cl_kernel qk8 = backend_ctx->kernel_quant_a_q8_1_k4;
+        CL_CHECK(clSetKernelArg(qk8, 0, sizeof(cl_mem), &b_sub_buf));
+        CL_CHECK(clSetKernelArg(qk8, 1, sizeof(cl_mem), &backend_ctx->prealloc_moe_qa.buffer));
+        CL_CHECK(clSetKernelArg(qk8, 2, sizeof(cl_mem), &backend_ctx->prealloc_moe_da.buffer));
+        CL_CHECK(clSetKernelArg(qk8, 3, sizeof(cl_int), &tbq8));
+        CL_CHECK(clSetKernelArg(qk8, 4, sizeof(cl_int), &kb8_arg));
+        size_t q8_local[1]  = { 64 };
+        size_t q8_global[1] = { (size_t)((((size_t)tbq8 + 63) / 64) * 64) };
+        backend_ctx->enqueue_ndrange_kernel(qk8, 1, q8_global, q8_local, dst);
+
+        const int base_wg8 = ne01 / 256;
+        const int ksplit8  = ggml_cl_cok_ksplit(backend_ctx, base_wg8, kb8);
+        cl_mem   out8   = extrad->data_device;
+        cl_ulong outoff = offsetd;
+        if (ksplit8 > 1) {
+            backend_ctx->prealloc_splitk_partial.allocate(
+                context, (size_t)ksplit8 * (size_t)ne01 * (size_t)ne1 * sizeof(float));
+            out8   = backend_ctx->prealloc_splitk_partial.buffer;
+            outoff = 0;
+        }
+
+        const cl_uchar mask_d6 = 0x3F, mask_d4 = 0x0F, mask_hi2 = 0xC0;
+        const cl_int ksplit8_arg = ksplit8;
+        cl_kernel ck8 = backend_ctx->kernel_gemm_cok8_q4_k_q8_1_dp4a_bin;
+        int ai = 0;
+        CL_CHECK(clSetKernelArg(ck8, ai++, sizeof(cl_mem),   &extra0_q4_k->q));
+        CL_CHECK(clSetKernelArg(ck8, ai++, sizeof(cl_mem),   &extra0_q4_k->s));
+        CL_CHECK(clSetKernelArg(ck8, ai++, sizeof(cl_mem),   &extra0_q4_k->d));
+        CL_CHECK(clSetKernelArg(ck8, ai++, sizeof(cl_mem),   &extra0_q4_k->dm));
+        CL_CHECK(clSetKernelArg(ck8, ai++, sizeof(cl_mem),   &backend_ctx->cok8_qa_img));
+        CL_CHECK(clSetKernelArg(ck8, ai++, sizeof(cl_mem),   &backend_ctx->cok8_da_img));
+        CL_CHECK(clSetKernelArg(ck8, ai++, sizeof(cl_mem),   &out8));
+        CL_CHECK(clSetKernelArg(ck8, ai++, sizeof(cl_ulong), &outoff));
+        CL_CHECK(clSetKernelArg(ck8, ai++, sizeof(cl_int),   &ne01));
+        CL_CHECK(clSetKernelArg(ck8, ai++, sizeof(cl_int),   &ne00));
+        CL_CHECK(clSetKernelArg(ck8, ai++, sizeof(cl_int),   &ne1));
+        CL_CHECK(clSetKernelArg(ck8, ai++, sizeof(cl_uchar), &mask_d6));
+        CL_CHECK(clSetKernelArg(ck8, ai++, sizeof(cl_uchar), &mask_d4));
+        CL_CHECK(clSetKernelArg(ck8, ai++, sizeof(cl_uchar), &mask_hi2));
+        CL_CHECK(clSetKernelArg(ck8, ai++, sizeof(cl_int),   &ksplit8_arg));
+
+        size_t c8_local[3]  = { 64, (size_t)nsg8, 1 };
+        size_t c8_global[3] = { (size_t)(ne01 / 4), (size_t)(nsg8 * ksplit8), 1 };
+        backend_ctx->enqueue_ndrange_kernel(ck8, 3, c8_global, c8_local, dst);
+
+        if (ksplit8 > 1) {
+            const cl_int rows_r = (cl_int)(ne01 * ne1);
+            cl_kernel kr = backend_ctx->kernel_gemv_splitk_reduce_f32;
+            CL_CHECK(clSetKernelArg(kr, 0, sizeof(cl_mem),   &out8));
+            CL_CHECK(clSetKernelArg(kr, 1, sizeof(cl_mem),   &extrad->data_device));
+            CL_CHECK(clSetKernelArg(kr, 2, sizeof(cl_ulong), &offsetd));
+            CL_CHECK(clSetKernelArg(kr, 3, sizeof(cl_int),   &rows_r));
+            CL_CHECK(clSetKernelArg(kr, 4, sizeof(cl_int),   &ksplit8_arg));
+            size_t lr[3] = {64, 1, 1};
+            size_t gr[3] = {(size_t)CEIL_DIV(rows_r, 64) * 64, 1, 1};
+            backend_ctx->enqueue_ndrange_kernel(kr, 3, gr, lr, dst);
+        }
+
+        CL_CHECK(clReleaseMemObject(b_sub_buf));
+        return;
+    }
 
     if (ne1 == 1) {
         cl_mem b_sub_buf = nullptr;
