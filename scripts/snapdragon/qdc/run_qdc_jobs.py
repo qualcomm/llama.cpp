@@ -28,18 +28,22 @@ from __future__ import annotations
 
 import argparse
 import enum
+import json
 import logging
 import os
 import re
 import shutil
+import socket
 import sys
 import tempfile
 import time
 import xml.etree.ElementTree as ET
+import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterator, TypeVar
 
+import httpx
 from qualcomm_device_cloud_sdk.api import qdc_api
 from qualcomm_device_cloud_sdk.logging import configure_logging
 from qualcomm_device_cloud_sdk.models import (
@@ -73,6 +77,16 @@ CAPACITY_POLL        = 60
 MAX_CONCURRENT_JOBS  = 5
 DEFAULT_RETRIES      = 0
 RETRY_DELAY          = 300
+# Retry policy for individual QDC SDK calls that touch the network and are safe
+# to repeat. The schedule (5, 10, 20, 40, 80, 160, 300, 300, 300, 300) sums to
+# ~30 min, enough to ride out a short QDC API outage.
+CALL_MAX_RETRIES     = 10
+CALL_BACKOFF_BASE    = 5
+CALL_BACKOFF_MAX     = 300
+# The SDK raises a bare Exception with the code in the message (e.g. "failed
+# with status code 500 and message: ..."), so we match on the message.
+_RETRYABLE_STATUS_CODES = (403, 429, 500, 502, 503, 504)
+_CallRetT = TypeVar("_CallRetT")
 TERMINAL_STATES     = {JobState.COMPLETED, JobState.CANCELED}
 NON_TERMINAL_STATES = {JobState.DISPATCHED, JobState.RUNNING, JobState.SETUP, JobState.SUBMITTED}
 
@@ -252,6 +266,94 @@ DEVICE_PLATFORM: dict[str, Platform] = {
 # =============================================================================
 
 
+def _matched_retryable_status_code(err: Exception) -> int | None:
+    """Return the retryable HTTP status code embedded in err, else None.
+
+    Returns only the code so callers never echo the rest of the message, which
+    may carry server-reflected credential fragments.
+    """
+    message = str(err)
+    for code in _RETRYABLE_STATUS_CODES:
+        if f"status code {code}" in message:
+            return code
+    return None
+
+
+def _unwrap_causes(err: BaseException) -> Iterator[BaseException]:
+    """Yield err and every exception in its __cause__/__context__ chain.
+
+    The SDK re-throws failures as ``raise Exception(msg) from e``, so the real
+    error is only visible by walking the chain.
+    """
+    seen: set[int] = set()
+    cur: BaseException | None = err
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        yield cur
+        cur = cur.__cause__ or cur.__context__
+
+
+def _transient_network_error_name(err: Exception) -> str | None:
+    """Return the type name of an underlying transient network error, else None.
+
+    Bare OSError is deliberately not matched: a local FileNotFoundError or ENOSPC
+    is permanent and must fail fast.
+    """
+    for cause in _unwrap_causes(err):
+        if isinstance(cause, (ConnectionError, TimeoutError, socket.gaierror)):
+            return type(cause).__name__
+        if isinstance(cause, httpx.TransportError):
+            return type(cause).__name__
+    return None
+
+
+def _is_malformed_response(err: Exception) -> bool:
+    """True if err (or a chained cause) is a JSONDecodeError or BadZipFile.
+
+    QDC can mark a job's log upload "completed" before the log files are
+    durable, so the next read can return an empty JSON body or a truncated zip.
+    """
+    return any(
+        isinstance(cause, (json.JSONDecodeError, zipfile.BadZipFile))
+        for cause in _unwrap_causes(err)
+    )
+
+
+def _describe_error(err: Exception) -> str:
+    """Safe one-line description of a QDC error for logging (never the raw message)."""
+    code = _matched_retryable_status_code(err)
+    if code is not None:
+        return f"status code {code}"
+    net_err = _transient_network_error_name(err)
+    if net_err is not None:
+        return f"network error ({net_err})"
+    if _is_malformed_response(err):
+        return "malformed response body"
+    return type(err).__name__
+
+
+def _call_with_retry(func: Callable[[], _CallRetT], description: str) -> _CallRetT:
+    """Call func(), retrying through transient network / HTTP / malformed-response errors."""
+    for attempt in range(CALL_MAX_RETRIES):
+        try:
+            return func()
+        except Exception as err:
+            transient = (
+                _transient_network_error_name(err) is not None
+                or _matched_retryable_status_code(err) is not None
+                or _is_malformed_response(err)
+            )
+            if not transient or attempt == CALL_MAX_RETRIES - 1:
+                raise
+            delay = min(CALL_BACKOFF_BASE * (2**attempt), CALL_BACKOFF_MAX)
+            log.warning(
+                "[QDC retry] %s failed with %s; attempt %d/%d, retrying in %ds",
+                description, _describe_error(err), attempt + 1, CALL_MAX_RETRIES, delay,
+            )
+            time.sleep(delay)
+    raise AssertionError("unreachable")  # loop either returns or raises
+
+
 def wait_for_job(client, job_id: str, timeout: int) -> str:
     elapsed = 0
     last_state = None
@@ -268,7 +370,7 @@ def wait_for_job(client, job_id: str, timeout: int) -> str:
                 job_id,
                 consecutive_errors,
                 max_consecutive_errors,
-                e,
+                _describe_error(e),
             )
             if consecutive_errors >= max_consecutive_errors:
                 raise
@@ -291,7 +393,7 @@ def wait_for_job(client, job_id: str, timeout: int) -> str:
         qdc_api.abort_job(client, job_id)
         log.warning("Aborted job %s after timeout to free concurrency slot", job_id)
     except Exception as e:
-        log.warning("Failed to abort job %s: %s", job_id, e)
+        log.warning("Failed to abort job %s: %s", job_id, _describe_error(e))
     raise TimeoutError(f"Job {job_id} did not finish within {timeout}s")
 
 
@@ -301,7 +403,7 @@ def wait_for_log_upload(client, job_id: str) -> None:
         try:
             status = (qdc_api.get_job_log_upload_status(client, job_id) or "").lower()
         except Exception as e:
-            log.warning("get_job_log_upload_status failed: %s — will retry", e)
+            log.warning("get_job_log_upload_status failed: %s — will retry", _describe_error(e))
             status = ""
         if status in {"completed", "failed"}:
             return
@@ -315,7 +417,10 @@ def wait_for_capacity(client, max_jobs: int = MAX_CONCURRENT_JOBS) -> None:
     """Block until the user's active (non-terminal) QDC job count is below max_jobs."""
     elapsed = 0
     while elapsed < CAPACITY_TIMEOUT:
-        jobs_page = qdc_api.get_jobs_list(client, page_number=0, page_size=50)
+        jobs_page = _call_with_retry(
+            lambda: qdc_api.get_jobs_list(client, page_number=0, page_size=50),
+            "get_jobs_list",
+        )
         if jobs_page is None:
             log.warning(
                 "Could not retrieve job list; proceeding without capacity check"
@@ -374,27 +479,36 @@ def _parse_pytest_output(content: str) -> dict[str, bool]:
     return results
 
 
+def _dump_raw_logs(src_dir: Path, dump_dir: Path) -> None:
+    """Copy every unpacked QDC log file under src_dir into dump_dir.
+
+    Keeps files the parser ignores (appium/pytest stdout, install logs, device
+    host logs) so failures can be diagnosed from the CI artifact.
+    """
+    dump_dir.mkdir(parents=True, exist_ok=True)
+    for root_dir, _, files in os.walk(src_dir):
+        for fname in files:
+            src = Path(root_dir) / fname
+            dst = dump_dir / src.relative_to(src_dir)
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                shutil.copy(src, dst)
+            except Exception as e:
+                log.warning("Could not dump log %s: %s", fname, e)
+
+
 def fetch_logs_and_parse_tests(
-    client, job_id: str, max_retries: int = 5, retry_delay: int = 30
+    client, job_id: str, dump_dir: Path | None = None
 ) -> tuple[dict[str, bool], dict[str, str], dict[str, str]]:
     """Returns (test_results, raw_logs, failure_details)."""
-    log_files = None
-    for attempt in range(1, max_retries + 1):
-        try:
-            log_files = qdc_api.get_job_log_files(client, job_id)
-            break
-        except Exception as e:
-            if attempt < max_retries:
-                log.warning(
-                    "get_job_log_files failed (attempt %d/%d): %s — retrying in %ds",
-                    attempt, max_retries, e, retry_delay,
-                )
-                time.sleep(retry_delay)
-            else:
-                log.error(
-                    "get_job_log_files failed after %d attempts: %s", max_retries, e
-                )
-                return {}, {}, {}
+    try:
+        log_files = _call_with_retry(
+            lambda: qdc_api.get_job_log_files(client, job_id),
+            f"get_job_log_files({job_id})",
+        )
+    except Exception as e:
+        log.error("get_job_log_files failed: %s", _describe_error(e))
+        return {}, {}, {}
     if not log_files:
         log.warning("No log files returned for job %s", job_id)
         return {}, {}, {}
@@ -408,7 +522,18 @@ def fetch_logs_and_parse_tests(
         for lf in log_files:
             zip_path = os.path.join(tmpdir, "log.zip")
             log.info("Downloading log file: %s", lf.filename)
-            qdc_api.download_job_log_files(client, lf.filename, zip_path)
+
+            def _download_and_verify() -> None:
+                qdc_api.download_job_log_files(client, lf.filename, zip_path)
+                if not zipfile.is_zipfile(zip_path):
+                    raise zipfile.BadZipFile(f"downloaded {lf.filename} is not a valid zip")
+
+            try:
+                _call_with_retry(_download_and_verify, f"download_job_log_files({lf.filename})")
+            except Exception as e:
+                # One bad log file must not discard the results already recovered.
+                log.warning("Skipping %s: %s", lf.filename, _describe_error(e))
+                continue
             try:
                 shutil.unpack_archive(zip_path, tmpdir, "zip")
             except Exception as e:
@@ -417,6 +542,8 @@ def fetch_logs_and_parse_tests(
         for root_dir, _, files in os.walk(tmpdir):
             for fname in sorted(files):
                 fpath = os.path.join(root_dir, fname)
+                if fname == "log.zip":
+                    continue
                 content = Path(fpath).read_text(errors="replace")
                 if fname.endswith(".xml"):
                     results, failures = _parse_junit_xml(content)
@@ -428,6 +555,9 @@ def fetch_logs_and_parse_tests(
                     log.info("--- %s ---\n%s", fname, content)
                     raw_logs[fname] = content
                     pytest_fallback.update(_parse_pytest_output(content))
+
+        if dump_dir is not None:
+            _dump_raw_logs(Path(tmpdir), dump_dir)
 
     return (
         (test_results if test_results else pytest_fallback),
@@ -514,6 +644,8 @@ def parse_args() -> argparse.Namespace:
                    help="Number of retries when device is unavailable (default: 0)")
     p.add_argument("--retry-delay", type=int, default=RETRY_DELAY, metavar="SECONDS",
                    help=f"Seconds to wait between retries (default: {RETRY_DELAY})")
+    p.add_argument("--log-dump-dir", type=Path, default=None, metavar="DIR",
+                   help="Dump all raw QDC device logs under DIR/<device>/ for CI artifact upload")
     args = p.parse_args()
     if args.test in ("bench", "all") and not args.model_url:
         p.error("--model-url is required when --test bench or --test all")
@@ -534,20 +666,23 @@ def _submit_and_run_job(client, args, spec, target_id, artifact_id) -> JobResult
 
     job_name = spec.job_name_fmt.format(base="llama.cpp Hexagon tests")
 
-    job_id = qdc_api.submit_job(
-        public_api_client=client,
-        target_id=target_id,
-        job_name=job_name,
-        external_job_id=None,
-        job_type=JobType.AUTOMATED,
-        job_mode=JobMode.APPLICATION,
-        timeout=max(1, args.job_timeout // 60),
-        test_framework=spec.test_framework,
-        entry_script=spec.entry_script,
-        job_artifacts=[artifact_id],
-        monkey_events=None,
-        monkey_session_timeout=None,
-        job_parameters=[JobSubmissionParameter.WIFIENABLED],
+    job_id = _call_with_retry(
+        lambda: qdc_api.submit_job(
+            public_api_client=client,
+            target_id=target_id,
+            job_name=job_name,
+            external_job_id=None,
+            job_type=JobType.AUTOMATED,
+            job_mode=JobMode.APPLICATION,
+            timeout=max(1, args.job_timeout // 60),
+            test_framework=spec.test_framework,
+            entry_script=spec.entry_script,
+            job_artifacts=[artifact_id],
+            monkey_events=None,
+            monkey_session_timeout=None,
+            job_parameters=[JobSubmissionParameter.WIFIENABLED],
+        ),
+        f"submit_job({args.device})",
     )
     if job_id is None:
         raise DeviceUnavailableError("Job submission failed — device may be unavailable")
@@ -560,7 +695,10 @@ def _submit_and_run_job(client, args, spec, target_id, artifact_id) -> JobResult
     log.info("Job %s finished: %s", job_id, job_status)
 
     wait_for_log_upload(client, job_id)
-    tests, raw_logs, failure_details = fetch_logs_and_parse_tests(client, job_id)
+    dump_dir = args.log_dump_dir / args.device if args.log_dump_dir else None
+    tests, raw_logs, failure_details = fetch_logs_and_parse_tests(
+        client, job_id, dump_dir=dump_dir
+    )
 
     job_ok = job_status == JobState.COMPLETED.value.lower()
 
@@ -575,6 +713,10 @@ def _submit_and_run_job(client, args, spec, target_id, artifact_id) -> JobResult
         passed = False
     if not passed:
         log.error("Job did not complete successfully or tests failed (status=%s)", job_status)
+        # Failing test names would otherwise only be visible in the step summary.
+        for name, ok in tests.items():
+            if not ok:
+                log.error("FAILED %s\n%s", name, failure_details.get(name, "(no detail)"))
 
     return JobResult(passed=passed, tests=tests, raw_logs=raw_logs, failure_details=failure_details)
 
@@ -606,7 +748,10 @@ def main() -> int:
         client_type_header="Python",
     )
 
-    target_id = qdc_api.get_target_id(client, args.device)
+    target_id = _call_with_retry(
+        lambda: qdc_api.get_target_id(client, args.device),
+        f"get_target_id({args.device})",
+    )
     if target_id is None:
         log.error("Could not find QDC target for device %r", args.device)
         return 1
@@ -617,7 +762,10 @@ def main() -> int:
             args.pkg_dir, Path(tmpdir), args.test, args.model_url
         )
         log.info("Uploading artifact (%d MB) ...", zip_path.stat().st_size // 1_000_000)
-        artifact_id = qdc_api.upload_file(client, str(zip_path), ArtifactType.TESTSCRIPT)
+        artifact_id = _call_with_retry(
+            lambda: qdc_api.upload_file(client, str(zip_path), ArtifactType.TESTSCRIPT),
+            "upload_file",
+        )
 
     if artifact_id is None:
         log.error("Artifact upload failed")
