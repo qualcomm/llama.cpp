@@ -183,11 +183,45 @@ inline void mm_store_c_N(
 #define TILESIZE_K 16
 #define TILESIZE_M 64
 #define TILESIZE_N 32
-#ifdef KQV
+#if defined(KQ_P8)
+// KQ with the softmax folded into the epilogue (-DKQ_P8). The same GEMM as
+// mul_mm_f16_f32_kq, but instead of writing the f32 score tile it applies
+// scale + mask, quantises each 32-row block of a query column to u8 against the
+// BLOCK maximum, and writes that block's max and sum of exp(s - blockmax) to two
+// side arrays. kernel_fa_p8_fixup (softmax_4_f16.cl) then turns those into the
+// per-block f32 scale exp(blockmax - rowmax)/255 and the deferred-norm row sum.
+// This is exactly the value kernel_soft_max_4_f16_q8 produces (its per-block scale
+// is amax/255 with amax = exp(blockmax - rowmax)), so the u8 P and the scales are
+// the same numbers, but the f32 score matrix never touches memory: the softmax's
+// two full passes over it (13 B per score with the f16 mask re-read per head)
+// and this kernel's 4 B/score image write are gone, and with no CL_R dst image
+// the image_max_buffer_size cap on the query chunk no longer applies.
+__kernel void mul_mm_f16_f32_kq_p8(
+        __read_only  image1d_buffer_t matrix_A,
+        int offset0,
+        __global float* matrix_B,
+        int offset1,
+        __global uchar* qp,      // u8 P, [D_B][N][p_pitch]
+        __global float* bmax,    // per 32-row block max,          [D_B][N][p_pitch/32]
+        __global float* bsum,    // per block sum of exp(s - bmax), [D_B][N][p_pitch/32]
+        __global char*  mask,    // f16 [>=M][N] view (chunk rows), row stride mask_nb1 bytes
+        ulong offset_mask,
+        ulong mask_nb1,
+        float scale,
+        float max_bias,
+        float m0,
+        float m1,
+        int n_head_log2,
+        int M, int K, int N,
+        int D_A,
+        int D_B,
+        int nb01,
+        int kqv_mblock_fast,
+        int p_pitch,             // bytes per P row, >= M, multiple of 32
+        int gqa_fold             // > 1: the query heads of one KV group share the n-tiles
+) {
+#elif defined(KQV)
 __kernel void mul_mm_f16_f32_kqv(
-#else
-__kernel void mul_mm_f16_f32_kq(
-#endif
         __read_only  image1d_buffer_t matrix_A,
         int offset0,
         __global float* matrix_B,
@@ -197,20 +231,80 @@ __kernel void mul_mm_f16_f32_kq(
         int M, int K, int N,
         int D_A,
         int D_B,
-        int nb01
+        int nb01,
+        int kqv_mblock_fast
 ) {
+#else
+__kernel void mul_mm_f16_f32_kq(
+        __read_only  image1d_buffer_t matrix_A,
+        int offset0,
+        __global float* matrix_B,
+        int offset1,
+        __write_only image1d_buffer_t matrix_C,
+        int offsetd,
+        int M, int K, int N,
+        int D_A,
+        int D_B,
+        int nb01,
+        int kqv_mblock_fast
+) {
+#endif
 
-    // The n-tiles run on the fast-varying axis and the m-blocks on the slow one. With the
-    // axes the other way round, a whole plane of A (the K/V cache, ne01 * nb01 bytes) is
-    // streamed for one n-tile and then re-streamed for the next, so once A stops fitting
-    // in cache the op cost jumps ~3.5x (measured X2-90: 5.9 ms vs 2.4 ms at ne01=1536).
-    // This way the 16 KB A panel of an m-block is reused across every n-tile while it is
-    // still hot, and B (one head of Q) is the operand that stays resident instead.
+#ifndef KQV
+    // KQ ONLY. The n-tiles run on the fast-varying axis and the m-blocks on the slow one.
+    // With the axes the other way round, a whole plane of A (the K cache, ne01 * nb01
+    // bytes) is streamed for one n-tile and then re-streamed for the next, so once A stops
+    // fitting in cache the op cost jumps ~3.5x (measured X2-90: 5.9 ms vs 2.4 ms at
+    // ne01=1536). This way the 16 KB A panel of an m-block is reused across every n-tile
+    // while it is still hot, and B (one head of Q) is the operand that stays resident.
+    //
+    // 🔴 This holds for KQ because its A panel is 64 x K with K = head_dim: 64*256*2 =
+    // 32 KB, cache-resident by construction. It does NOT hold for KQV, where K IS n_kv --
+    // see the KQV branch below. The two kernels share this file, which is how the KQ
+    // measurement came to govern KQV as well.
     uint m_blocks = (M+TILESIZE_M-1)/TILESIZE_M;
 
     uint block_id_n = get_global_id(1);
     uint block_id_m = get_global_id(2) % m_blocks;
     uint block_id_d = get_global_id(2) / m_blocks;
+#else
+    // KQV: m-blocks on the fast axis (upstream's ordering). For KQV, A is the V cache and
+    // K is n_kv, so an m-block's A panel is 64 * n_kv * 2 B -- 6.3 MB at n_kv 49152, not
+    // 16 KB. It cannot be cache-resident, the reuse the KQ ordering buys never happens,
+    // and the swap costs instead.
+    //
+    // Profiled on X2-90, Qwen3.5-35B-A3B-Q4_0 (gqa8, dk=dv=256), pp16384 -d 32768 -fa 0,
+    // GGML_OPENCL_PROFILING builds of both orderings, mul_mm_f16_f32_kqv, matched call
+    // counts 1280 vs 1270:
+    //     n-tile-fast (this file, before)  629,477 ms total   491.78 ms/call
+    //     m-block-fast (upstream, now)     281,498 ms total   221.65 ms/call   => 2.22x
+    // KQV alone differed by 348 s where TOTAL GPU busy differed by 318 s, and device idle
+    // was 0.2% -- it was the whole build-to-build gap, and it was this kernel, not
+    // scheduling. Position-matched per-dispatch cost showed the deficit growing with the
+    // cache: ~1.1-1.3x shallow, 2.1-2.5x deep.
+    // RUNTIME choice, not compile-time. m-block-fast is right where the A panel cannot be
+    // cache-resident (depth) and where the n-axis is short, and WRONG for wide-n prefill: at
+    // a GQA fold of r2=16 and ubatch 512 the n-axis is 256 tiles against 2 m-blocks, and
+    // putting the 2-long axis fast-varying costs 5-10% of pp16384 at d0 (muse, Nemotron).
+    // The host picks; see ggml_cl_mul_mat_kq_kqv_adreno.
+    //
+    // STILL A MATCHED PAIR. These derivations must agree with the host grid, so the flag set
+    // here and the axes chosen there move together or the kernel computes WRONG ELEMENTS.
+    // The branch is workgroup-uniform, so it costs no divergence.
+    uint n_tiles  = (N+TILESIZE_N-1)/TILESIZE_N;
+    uint m_blocks = (M+TILESIZE_M-1)/TILESIZE_M;
+
+    uint block_id_m, block_id_n, block_id_d;
+    if (kqv_mblock_fast) {
+        block_id_m = get_global_id(1);
+        block_id_n = get_global_id(2) % n_tiles;
+        block_id_d = get_global_id(2) / n_tiles;
+    } else {
+        block_id_n = get_global_id(1);
+        block_id_m = get_global_id(2) % m_blocks;
+        block_id_d = get_global_id(2) / m_blocks;
+    }
+#endif
 
     __private float16  regA;
     __private float8   regB;
@@ -219,8 +313,18 @@ __kernel void mul_mm_f16_f32_kq(
 
     const uint col   = block_id_m * TILESIZE_M;
     const uint row   = block_id_n * TILESIZE_N;
+#ifdef KQ_P8
+    // gqa_fold > 1: block_id_d is a KV head and the n-tile columns run over (query, head of the
+    // group), column c = query*gqa_fold + head. A short batch (a speculative verify of 2-16
+    // queries) then fills the 32-wide tile and streams each K row once per KV head instead of
+    // once per query head.
+    const uint fold    = gqa_fold > 1 ? (uint)gqa_fold : 1u;
+    const uint depth_A = fold > 1 ? block_id_d : block_id_d / (D_B/D_A);
+    const uint depth_B = block_id_d;
+#else
     const uint depth_A = block_id_d / (D_B/D_A);
     const uint depth_B = block_id_d;
+#endif
 
 #ifdef KQV
     int line_stride_matrix_A_in_bytes = nb01 * M;
@@ -259,6 +363,20 @@ __kernel void mul_mm_f16_f32_kq(
 
     __local float matrix_B_local[1024];
 
+#ifdef KQ_P8
+    if (fold > 1) {
+        // this lane's two B columns, clamped to the last real one past the batch (read, unused)
+        const uint nv = (uint)N * fold;
+        uint c0 = row + b_globalOffsetInWords_xy.y;
+        uint c1 = c0 + 16;
+        c0 = min(c0, nv - 1);
+        c1 = min(c1, nv - 1);
+        b_globalOffsetInWords00 = (c0/fold)*strideBinElements + (depth_B*fold + c0%fold)*K + b_globalOffsetInWords_xy.x;
+        b_globalOffsetInWords16 = (c1/fold)*strideBinElements + (depth_B*fold + c1%fold)*K + b_globalOffsetInWords_xy.x;
+        subMatrixBStartInElements = 0;
+    }
+#endif
+
     for (uint step=0; step < K; step+=TILESIZE_K) {
         size_t sub_block_id_m = get_local_id(0);
         regA = mm_load_a(matrix_A, subMatrixAStartInElements, nb01, line_stride_matrix_A_in_bytes);
@@ -275,7 +393,92 @@ __kernel void mul_mm_f16_f32_kq(
         subMatrixBStartInElements += TILESIZE_K;
     }
 
+#ifdef KQ_P8
+    // ---- fused block softmax epilogue ----
+    // Lane = kv row col+lane of this 64-row tile; regC0/regC1 = query columns
+    // row+0..15 / row+16..31. Each 32-row block of a column is one u8 block of
+    // the P layout kernel_mul_mm_q8_kqv consumes. The raw tile is transposed
+    // through local memory in two 16-column halves; one lane then owns one
+    // (column, block) and does everything on 16-wide vectors: scale + mask (the
+    // mask row is contiguous in kv, so it is two vector loads here instead of 32
+    // strided scalar loads in the row pass), block max, exp, sum, saturating u8
+    // conversion. Keeping the epilogue in vector instructions is what keeps it
+    // small next to the 8192-FMA main loop.
+    __local float p8_lds[2048];
+    __local float * lds = p8_lds + get_sub_group_id() * 1024;
+    const uint lane = get_local_id(0);
+    __global const half * mrow = (__global const half *)(mask + offset_mask);
+    const uint mstride = (uint)(mask_nb1 / 2);
+    const int nblk = p_pitch / 32;
+
+    #pragma unroll
+    for (int half_ = 0; half_ < 2; ++half_) {
+        barrier(CLK_LOCAL_MEM_FENCE);
+        const float16 cc = half_ == 0 ? regC0 : regC1;
+        lds[ 0*64 + lane] = cc.s0; lds[ 1*64 + lane] = cc.s1; lds[ 2*64 + lane] = cc.s2; lds[ 3*64 + lane] = cc.s3;
+        lds[ 4*64 + lane] = cc.s4; lds[ 5*64 + lane] = cc.s5; lds[ 6*64 + lane] = cc.s6; lds[ 7*64 + lane] = cc.s7;
+        lds[ 8*64 + lane] = cc.s8; lds[ 9*64 + lane] = cc.s9; lds[10*64 + lane] = cc.sa; lds[11*64 + lane] = cc.sb;
+        lds[12*64 + lane] = cc.sc; lds[13*64 + lane] = cc.sd; lds[14*64 + lane] = cc.se; lds[15*64 + lane] = cc.sf;
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (lane < 32) {
+            const int  j = lane >> 1;
+            const int  b = lane & 1;
+            const uint c = row + half_*16 + j;          // tile column
+            const uint n = c / fold;                     // query
+            const uint h = depth_B*fold + c % fold;      // query head
+            if (c < (uint)N * fold) {
+                float slope = 1.0f;
+                if (max_bias > 0.0f) {
+                    const float base = (int)h < n_head_log2 ? m0 : m1;
+                    const int   ex   = (int)h < n_head_log2 ? (int)h + 1 : 2*((int)h - n_head_log2) + 1;
+                    slope = pow(base, ex);
+                }
+                const uint kvb = col + b*32;               // first kv row of this block
+                const __local float * src = lds + j*64 + b*32;
+                float16 s0 = vload16(0, src);
+                float16 s1 = vload16(1, src);
+                const __global half * mp = mrow + (size_t)n*mstride + kvb;
+                const float16 m0v = convert_float16(vload16(0, mp));
+                const float16 m1v = convert_float16(vload16(1, mp));
+                s0 = s0*scale + slope*m0v;
+                s1 = s1*scale + slope*m1v;
+                const float16 mx16 = fmax(s0, s1);
+                const float8  mx8  = fmax(mx16.lo, mx16.hi);
+                const float4  mx4  = fmax(mx8.lo, mx8.hi);
+                const float2  mx2  = fmax(mx4.lo, mx4.hi);
+                const float   amax = fmax(mx2.x, mx2.y);
+                const uint prow = h*(uint)N + n;
+                const uint blk  = kvb >> 5;
+                float sum = 0.0f;
+                uchar16 q0 = (uchar16)(0);
+                uchar16 q1 = (uchar16)(0);
+                // Masked scores are -inf; a block that is entirely masked (every kv row
+                // past this query under a causal mask) has amax = -inf and must quantise
+                // to zeros with a zero sum, never exp(-inf - -inf). The program builds
+                // with -cl-finite-math-only, so compare against a finite sentinel: a test
+                // against -INFINITY itself may be folded away.
+                if (amax > -1.0e30f) {
+                    const float16 e0 = exp(s0 - amax);
+                    const float16 e1 = exp(s1 - amax);
+                    const float16 a16 = e0 + e1;
+                    const float8  a8  = a16.lo + a16.hi;
+                    const float4  a4  = a8.lo + a8.hi;
+                    const float2  a2  = a4.lo + a4.hi;
+                    sum = a2.x + a2.y;
+                    q0 = convert_uchar16_sat_rte(e0*255.0f);
+                    q1 = convert_uchar16_sat_rte(e1*255.0f);
+                }
+                __global uchar * qdst = qp + (size_t)prow*(size_t)p_pitch + (size_t)kvb;
+                vstore16(q0, 0, qdst);
+                vstore16(q1, 1, qdst);
+                bmax[(size_t)prow*nblk + blk] = amax;
+                bsum[(size_t)prow*nblk + blk] = sum;
+            }
+        }
+    }
+#else
     uint subMatrixCStartInElements = depth_B * N * M + row * M + col;
     mm_store_c_N(matrix_C, regC0, regC1, subMatrixCStartInElements, line_stride_matrix_C_in_bytes, (N-block_id_n*32));
+#endif
 }
 

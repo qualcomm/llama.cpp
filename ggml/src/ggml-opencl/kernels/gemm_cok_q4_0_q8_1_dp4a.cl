@@ -93,10 +93,38 @@ typedef int2   cok_dotv;
 #endif
 
 // One K-group (4 K values): unpack the folded rows' weights, then dot every column.
+#ifdef COK_Q_BIN
+// bin (32b-transposed) plane: one uint per (8 K, row), low half = the noshuffle ushort of
+// the first four K. ku0 is a multiple of 4, so K-group ku0+t is word ku0/2 + t/2, half t&1.
+// The halves are taken component by component: convert_ushortN(w >> 16) compiles to much
+// slower code on the X2-90.
+inline ushort8 cok_half8(uint8 w, int hi) {
+    return hi ? (ushort8)((ushort)(w.s0 >> 16), (ushort)(w.s1 >> 16), (ushort)(w.s2 >> 16), (ushort)(w.s3 >> 16),
+                          (ushort)(w.s4 >> 16), (ushort)(w.s5 >> 16), (ushort)(w.s6 >> 16), (ushort)(w.s7 >> 16))
+              : (ushort8)((ushort)(w.s0 & 0xFFFFu), (ushort)(w.s1 & 0xFFFFu), (ushort)(w.s2 & 0xFFFFu), (ushort)(w.s3 & 0xFFFFu),
+                          (ushort)(w.s4 & 0xFFFFu), (ushort)(w.s5 & 0xFFFFu), (ushort)(w.s6 & 0xFFFFu), (ushort)(w.s7 & 0xFFFFu));
+}
+inline ushort4 cok_half4(uint4 w, int hi) {
+    return hi ? (ushort4)((ushort)(w.s0 >> 16), (ushort)(w.s1 >> 16), (ushort)(w.s2 >> 16), (ushort)(w.s3 >> 16))
+              : (ushort4)((ushort)(w.s0 & 0xFFFFu), (ushort)(w.s1 & 0xFFFFu), (ushort)(w.s2 & 0xFFFFu), (ushort)(w.s3 & 0xFFFFu));
+}
+inline ushort2 cok_half2(uint2 w, int hi) {
+    return hi ? (ushort2)((ushort)(w.s0 >> 16), (ushort)(w.s1 >> 16))
+              : (ushort2)((ushort)(w.s0 & 0xFFFFu), (ushort)(w.s1 & 0xFFFFu));
+}
+#define COK_QB8(t) cok_half8(vload8(0, src0_q + row0 + ((ku0 >> 1) + ((t) >> 1)) * m), (t) & 1)
+#define COK_QB4(t) cok_half4(vload4(0, src0_q + row0 + ((ku0 >> 1) + ((t) >> 1)) * m), (t) & 1)
+#define COK_QB2(t) cok_half2(vload2(0, src0_q + row0 + ((ku0 >> 1) + ((t) >> 1)) * m), (t) & 1)
+#else
+#define COK_QB8(t) vload8(0, src0_q + row0 + (ku0 + t) * m)
+#define COK_QB4(t) vload4(0, src0_q + row0 + (ku0 + t) * m)
+#define COK_QB2(t) vload2(0, src0_q + row0 + (ku0 + t) * m)
+#endif
+
 #if COK_ROWS == 8
 #define COK_KSTEP(t)                                                  \
     {                                                                 \
-    ushort8 bl = vload8(0, src0_q + row0 + (ku0 + t) * m);            \
+    ushort8 bl = COK_QB8(t);                                            \
     const uint w0 = EXP40(bl.s0);                                     \
     const uint w1 = EXP40(bl.s1);                                     \
     const uint w2 = EXP40(bl.s2);                                     \
@@ -110,7 +138,7 @@ typedef int2   cok_dotv;
 #elif COK_ROWS == 4
 #define COK_KSTEP(t)                                                   \
     {                                                                  \
-    ushort4 bl = vload4(0, src0_q + row0 + (ku0 + t) * m);             \
+    ushort4 bl = COK_QB4(t);                                             \
     const uint w0 = EXP40(bl.s0);                                      \
     const uint w1 = EXP40(bl.s1);                                      \
     const uint w2 = EXP40(bl.s2);                                      \
@@ -120,7 +148,7 @@ typedef int2   cok_dotv;
 #else
 #define COK_KSTEP(t)                                                   \
     {                                                                  \
-    ushort2 bl = vload2(0, src0_q + row0 + (ku0 + t) * m);             \
+    ushort2 bl = COK_QB2(t);                                             \
     const uint w0 = EXP40(bl.s0);                                      \
     const uint w1 = EXP40(bl.s1);                                      \
     COK_DOTS_AT(t)                                                     \
@@ -128,7 +156,11 @@ typedef int2   cok_dotv;
 #endif
 
 kernel void kernel_gemm_cok_q4_0_q8_1_dp4a(
+#ifdef COK_Q_BIN
+    global const uint   * src0_q,     // q4_0 nibble plane, bin [row + (K/8)*m]
+#else
     global const ushort * src0_q,     // q4_0 nibble plane [row + (K/4)*m]
+#endif
     global const half   * src0_d,     // one scale per 32-K block [row + blk*m]
     global const uint   * src1_qa,    // q8_1 activations  [col*k_u + K/4]
     global const half   * src1_da,    // activation scale  [col*k_b + blk]
