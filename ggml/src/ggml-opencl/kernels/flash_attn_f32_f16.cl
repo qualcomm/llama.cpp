@@ -1897,6 +1897,10 @@ __kernel void flash_attn_f32_f16_q1_vec_mq(
 #define FA_PARTIAL_FLOATS (2 + DV)
 #endif
 
+// FA_MQS_LEAN reworks the shared-Q (LDS) score path; the register-Q form keeps its own.
+#if defined(FA_MQS_LEAN) && defined(FA_Q1_Q_REG)
+#undef FA_MQS_LEAN
+#endif
 #ifndef FA_MQ_KIMG   // the k_img-only program carries the image form instead
 REQD_SUBGROUP_SIZE_64
 __kernel void flash_attn_f32_f16_q1_vec_mq_split(
@@ -2036,12 +2040,45 @@ __kernel void flash_attn_f32_f16_q1_vec_mq_split(
     const int kv_lo    = kv_start + sgid * kv_per_sg;
     const int kv_hi    = min(kv_end, kv_lo + kv_per_sg);
 
+#ifdef FA_MQS_LEAN
+    // FA_MQS_LEAN: this kernel sits at a register-residency step (16 vec4 GPRs at DK=512 MQ_GQA 2),
+    // so one extra live value costs ~40% (measured). Two changes that fit under it together: the
+    // score is accumulated as a scalar per head with dot() instead of a float4 per head, and the
+    // mask - one value per KV position when mask_ne2 == 1 - is read once per row at the top of the
+    // row instead of once per head behind the reduce, where it was 19% of the kernel.
+    const global MASK_DATA_TYPE * mask_one = (mask_void != NULL && mask_ne2 == 1) ? (const global MASK_DATA_TYPE *) mask_base[0] : NULL;
+#endif
     for (int k_idx = kv_lo; k_idx < kv_hi; ++k_idx) {
+#ifdef FA_MQS_LEAN
+        const ACC_TYPE mask_v = mask_one != NULL ? (ACC_TYPE) mask_one[k_idx] : 0.0f;
+#endif
         const ulong k_row_off = batch_idx * k_nb3 + head_kv_idx * k_nb2 + k_idx * k_nb1;
         const ulong v_row_off = batch_idx * v_nb3 + head_kv_idx * v_nb2 + k_idx * v_nb1;
         const global KV_DATA_TYPE4 * k_ptr = (const global KV_DATA_TYPE4 *) (k_base + k_row_off);
         const global KV_DATA_TYPE4 * v_ptr = (const global KV_DATA_TYPE4 *) (v_base + v_row_off);
+#ifdef FA_MQS_VPRE
+        // Issue this row's V loads before the K dot, the score reduction and the softmax update,
+        // so their latency hides behind that chain (FA_CL_VPRE / FA_Q8MQ_VPRE, same move).
+        ACC_TYPE4 v_pre[Q1V_DV_PER_THREAD];
+        #pragma unroll
+        for (int i = 0; i < Q1V_DV_PER_THREAD; ++i) {
+            const int dv = tid_sg + i * Q1_WG_SIZE;
+            v_pre[i] = (dv < DV_VEC) ? CONVERT_KV_ACC4(v_ptr[dv]) : (ACC_TYPE4)(0.0f);
+        }
+#endif
 
+#ifdef FA_MQS_LEAN
+        ACC_TYPE dotp[MQ_GQA];
+        #pragma unroll
+        for (int h = 0; h < MQ_GQA; ++h) dotp[h] = 0.0f;
+        for (int k = tid_sg; k < DK_VEC; k += Q1_WG_SIZE) {
+            const ACC_TYPE4 k_vec = CONVERT_KV_ACC4(k_ptr[k]);
+            #pragma unroll
+            for (int h = 0; h < MQ_GQA; ++h) {
+                dotp[h] += dot(q_shared[h * DK_VEC + k], k_vec);
+            }
+        }
+#else
         ACC_TYPE4 dot4[MQ_GQA];
         #pragma unroll
         for (int h = 0; h < MQ_GQA; ++h) dot4[h] = (ACC_TYPE4)(0.0f);
@@ -2062,12 +2099,22 @@ __kernel void flash_attn_f32_f16_q1_vec_mq_split(
             }
         }
 #endif
+#endif // FA_MQS_LEAN
 
         ACC_TYPE score[MQ_GQA];
         #pragma unroll
         for (int h = 0; h < MQ_GQA; ++h) {
+#ifdef FA_MQS_LEAN
+            const ACC_TYPE dot_partial = dotp[h];
+#else
             const ACC_TYPE dot_partial = dot4[h].s0 + dot4[h].s1 + dot4[h].s2 + dot4[h].s3;
+#endif
             ACC_TYPE s = sub_group_reduce_add(dot_partial) * scale;
+#ifdef FA_MQS_LEAN
+            if (mask_one != NULL) {
+                s += slope[h] * mask_v;
+            } else
+#endif
             if (mask_base[h] != NULL) {
                 const global MASK_DATA_TYPE * mask_ptr = (const global MASK_DATA_TYPE *) mask_base[h];
                 s += slope[h] * (ACC_TYPE) mask_ptr[k_idx];
@@ -2089,6 +2136,17 @@ __kernel void flash_attn_f32_f16_q1_vec_mq_split(
             m_i[h]  = m_new;
         }
 
+#ifdef FA_MQS_VPRE
+        #pragma unroll
+        for (int i = 0; i < Q1V_DV_PER_THREAD; ++i) {
+            if (tid_sg + i * Q1_WG_SIZE < DV_VEC) {
+                #pragma unroll
+                for (int h = 0; h < MQ_GQA; ++h) {
+                    o_acc[h][i] = mad(p_h[h], v_pre[i], o_acc[h][i] * sp_h[h]);
+                }
+            }
+        }
+#else
         int idx = 0;
         for (int dv_idx = tid_sg; dv_idx < DV_VEC; dv_idx += Q1_WG_SIZE, ++idx) {
             const ACC_TYPE4 v_vec = CONVERT_KV_ACC4(v_ptr[dv_idx]);
@@ -2097,6 +2155,7 @@ __kernel void flash_attn_f32_f16_q1_vec_mq_split(
                 o_acc[h][idx] = mad(p_h[h], v_vec, o_acc[h][idx] * sp_h[h]);
             }
         }
+#endif
     }
 
     // per-h cross-subgroup merge
@@ -2592,6 +2651,14 @@ __kernel void flash_attn_f32_f16_q1_vec_mq_split_c8(
             o_acc[h][0] = mad(p, v_vec_1, o_acc[h][0] * sp);
         }
 #else
+#ifdef FA_CL_VPRE
+        // Issue this row's V loads now, beside K: they do not depend on the score, and left at the
+        // bottom of the iteration their latency sits behind the whole dot/reduce/exp chain.
+        // Held as raw half4 until use; the arithmetic is unchanged.
+        KV_DATA_TYPE4 v_pre[FA_CL_DV];
+        #pragma unroll
+        for (int i = 0; i < FA_CL_DV; ++i) v_pre[i] = v_ptr[lic + FA_CL_C * i];
+#endif
         // Dot: this lane covers DK elements {lic + FA_CL_C*i} of the cluster's row.
         ACC_TYPE4 dot4[MQ_GQA];
         #pragma unroll
@@ -2701,7 +2768,11 @@ __kernel void flash_attn_f32_f16_q1_vec_mq_split_c8(
         // V accumulate on this lane's DV slice (p = 0 on tail -> inert).
         #pragma unroll
         for (int i = 0; i < FA_CL_DV; ++i) {
+#ifdef FA_CL_VPRE
+            const ACC_TYPE4 v_vec = CONVERT_KV_ACC4(v_pre[i]);
+#else
             const ACC_TYPE4 v_vec = CONVERT_KV_ACC4(v_ptr[lic + FA_CL_C * i]);
+#endif
             #pragma unroll
             for (int h = 0; h < MQ_GQA; ++h) {
                 o_acc[h][i] = mad(p_h[h], v_vec, o_acc[h][i] * sp_h[h]);
@@ -3396,6 +3467,16 @@ __kernel void flash_attn_f32_f16_q1_vec_mq_split_k_img(
 
         const ulong v_row_off = batch_idx * v_nb3 + head_kv_idx * v_nb2 + k_idx * v_nb1;
         const global KV_DATA_TYPE4 * v_ptr = (const global KV_DATA_TYPE4 *) (v_base + v_row_off);
+#ifdef FA_MQS_VPRE
+        // Issue this row's V loads before the K dot, the score reduction and the softmax update,
+        // so their latency hides behind that chain (FA_CL_VPRE / FA_Q8MQ_VPRE, same move).
+        ACC_TYPE4 v_pre[Q1V_DV_PER_THREAD];
+        #pragma unroll
+        for (int i = 0; i < Q1V_DV_PER_THREAD; ++i) {
+            const int dv = tid_sg + i * Q1_WG_SIZE;
+            v_pre[i] = (dv < DV_VEC) ? CONVERT_KV_ACC4(v_ptr[dv]) : (ACC_TYPE4)(0.0f);
+        }
+#endif
 
         ACC_TYPE4 dot4[MQ_GQA];
         #pragma unroll
@@ -3435,6 +3516,17 @@ __kernel void flash_attn_f32_f16_q1_vec_mq_split_k_img(
             m_i[h]  = m_new;
         }
 
+#ifdef FA_MQS_VPRE
+        #pragma unroll
+        for (int i = 0; i < Q1V_DV_PER_THREAD; ++i) {
+            if (tid_sg + i * Q1_WG_SIZE < DV_VEC) {
+                #pragma unroll
+                for (int h = 0; h < MQ_GQA; ++h) {
+                    o_acc[h][i] = mad(p_h[h], v_pre[i], o_acc[h][i] * sp_h[h]);
+                }
+            }
+        }
+#else
         int idx = 0;
         for (int dv_idx = tid_sg; dv_idx < DV_VEC; dv_idx += Q1_WG_SIZE, ++idx) {
             const ACC_TYPE4 v_vec = CONVERT_KV_ACC4(v_ptr[dv_idx]);
@@ -3443,6 +3535,7 @@ __kernel void flash_attn_f32_f16_q1_vec_mq_split_k_img(
                 o_acc[h][idx] = mad(p_h[h], v_vec, o_acc[h][idx] * sp_h[h]);
             }
         }
+#endif
     }
 
     __local ACC_TYPE  sg_m[MQ_GQA][MQ_NSG_SPLIT];

@@ -97,6 +97,30 @@ set(GGML_OPENCL_KERNELS
     mul_mv_q4_0_f32_1d_16x_flat
     mul_mv_q4_1_f32
     mul_mv_q4_1_f32_flat
+    mul_mv_q2_0_f32
+    mul_mv_tq2_0_f32
+    mul_mv_nvfp4_f32
+    mul_mv_iq3_xxs_f32
+    mul_mv_iq3_s_f32
+    mul_mv_iq2_xxs_f32
+    mul_mv_iq2_xs_f32
+    mul_mv_iq2_s_f32
+    mul_mv_iq1_s_f32
+    mul_mv_iq1_m_f32
+    mul_mv_tq1_0_f32
+    mul_mv_iq4_xs_f32
+    mul_mv_iq4_xs_f32_flat
+    mul_mv_iq3_s_f32_flat
+    mul_mv_iq3_xxs_f32_flat
+    mul_mv_iq2_xxs_f32_flat
+    mul_mv_iq2_xs_f32_flat
+    mul_mv_q3_k_f32_flat
+    mul_mv_q2_k_f32_flat
+    mul_mv_iq2_s_f32_flat
+    mul_mv_iq1_s_f32_flat
+    mul_mv_iq1_m_f32_flat
+    mul_mv_q2_k_f32
+    mul_mv_q3_k_f32
     mul_mv_q4_k_f32
     mul_mv_q4_k_f32_flat
     mul_mv_q4_k_q8_1
@@ -122,9 +146,6 @@ set(GGML_OPENCL_KERNELS
     mul_mv_id_mxfp4_f32_flat
     gemm_moe_q4_0_f32_ns
     gemm_moe_q4_0_q8_1_dp4a
-    gemm_cok_q4_k_q8_1_dp4a
-    gemm_cok_q6_k_q8_1_dp4a
-    gemm_cok_q4_0_q8_1_dp4a
     gemv_moe_q4_0_f32_ns
     gemm_moe_q8_0_f32_ns
     gemm_moe_q4_1_f32_ns
@@ -139,11 +160,29 @@ set(GGML_OPENCL_KERNELS
     gemm_moe_q8_1_dp4a
     moe_reorder_quant_a_q8_1
     gemm_noshuffle_q4_k_q8_1_dp4a
+    gemm_cok_q4_k_q8_1_dp4a
+    gemm_cok_q6_k_q8_1_dp4a
+    gemm_cok_q4_0_q8_1_dp4a
+    gemm_cok8_q4_0_q8_1_dp4a
+    gemm_cok8_q5_k_q8_1_dp4a
+    gemm_cok8_q6_k_q8_1_dp4a
+    gemm_cok8_q6_k_flat_q8_1_dp4a
     gemm_noshuffle_q5_k_q8_1_dp4a
     gemm_noshuffle_q6_k_q8_1_dp4a
     gemm_noshuffle_q8_0_q8_1_dp4a
     gemm_noshuffle_q5_0_q8_1_dp4a
     gemm_noshuffle_iq4_nl_q8_1_dp4a
+    mul_mm_iq4_xs_q8_1_dp4a
+    gemm_noshuffle_iq4_xs_q8_1_dp4a
+    gemm_noshuffle_iq3_s_q8_1_dp4a
+    gemm_noshuffle_iq3_xxs_q8_1_dp4a
+    gemm_noshuffle_iq2_xxs_q8_1_dp4a
+    gemm_noshuffle_iq2_xs_q8_1_dp4a
+    gemm_noshuffle_q3_k_q8_1_dp4a
+    gemm_noshuffle_q2_k_q8_1_dp4a
+    gemm_noshuffle_iq2_s_q8_1_dp4a
+    gemm_noshuffle_iq1_s_q8_1_dp4a
+    gemm_noshuffle_iq1_m_q8_1_dp4a
     gemm_noshuffle_q4_0_q8_1_dp4a
     quant_a_q8_1
     gemv_moe_q4_k_f32_ns
@@ -162,6 +201,7 @@ set(GGML_OPENCL_KERNELS
     topk_moe
     mul_mm_f32_f32_l4_lm
     mul_mm_f16_f32_l4_lm
+    mul_mm_f16_f32_skinny
     mul_mm_q1_0_f32_l4_lm
     mul_mm_q4_0_f32_l4_lm
     mul_mm_q4_1_f32_l4_lm
@@ -169,6 +209,20 @@ set(GGML_OPENCL_KERNELS
     mul_mm_q5_1_f32_l4_lm
     mul_mm_q8_0_f32_l4_lm
     mul_mm_iq4_nl_f32_l4_lm
+    mul_mm_q2_0_f32_l4_lm
+    mul_mm_tq2_0_f32_l4_lm
+    mul_mm_nvfp4_f32_l4_lm
+    mul_mm_iq3_xxs_f32_l4_lm
+    mul_mm_iq3_s_f32_l4_lm
+    mul_mm_iq2_xxs_f32_l4_lm
+    mul_mm_iq2_xs_f32_l4_lm
+    mul_mm_iq2_s_f32_l4_lm
+    mul_mm_iq1_s_f32_l4_lm
+    mul_mm_iq1_m_f32_l4_lm
+    mul_mm_tq1_0_f32_l4_lm
+    mul_mm_iq4_xs_f32_l4_lm
+    mul_mm_q2_k_f32_l4_lm
+    mul_mm_q3_k_f32_l4_lm
     mul_mm_q4_k_f32_l4_lm
     mul_mm_q5_k_f32_l4_lm
     mul_mm_q6_k_f32_l4_lm
@@ -177,6 +231,7 @@ set(GGML_OPENCL_KERNELS
     gemv_noshuffle_q4_0_f32
     gemv_noshuffle_q4_0_f32_spec
     gemm_noshuffle_q4_0_f32
+    gemv_noshuffle_q4_0_f32_32b_trans
     gemv_noshuffle_q4_1_f32
     gemm_noshuffle_q4_1_f32
     gemv_noshuffle_q5_0_f32
@@ -191,13 +246,16 @@ set(GGML_OPENCL_KERNELS
     gemv_noshuffle_q4_k_f32_o4
     gemv_noshuffle_q4_k_f32_tiled
     gemm_noshuffle_q4_k_f32
+    gemv_noshuffle_q4_k_f32_32b_trans
     gemv_noshuffle_q6_k_f32
     gemv_noshuffle_q6_k_f32_o4
     gemv_noshuffle_q6_k_f32_tiled
     gemm_noshuffle_q6_k_f32
     gemm_noshuffle_q6_k_f32_tiled
+    gemv_noshuffle_q6_k_f32_32b_trans
     gemv_noshuffle_q5_k_f32
     gemm_noshuffle_q5_k_f32
+    gemv_noshuffle_q5_k_f32_32b_trans
     mul
     neg
     norm
@@ -211,6 +269,8 @@ set(GGML_OPENCL_KERNELS
     silu
     unary_mul
     softmax_4_f32
+    mul_mm_q8_kqv
+    mul_mm_q8_kq
     softmax_4_f16
     softmax_f32
     softmax_f16
@@ -218,10 +278,10 @@ set(GGML_OPENCL_KERNELS
     sqrt
     ssm_conv
     ssm_scan
-    # gated_delta_net omitted: GGML_OP_GATED_DELTA_NET postdates the b7725 base this
-    # branch is pinned to, so the host path is guarded off in ggml-opencl.cpp
-    # (GGML_OPENCL_HAS_GATED_DELTA_NET). The kernel source is kept in kernels/ so the
-    # next refresh from the x2-unified line stays a clean file-level copy.
+    # gated_delta_net / gated_delta_net_chunk omitted: GGML_OP_GATED_DELTA_NET postdates
+    # the b7725 base this branch is pinned to, so the host path is guarded off in
+    # ggml-opencl.cpp (GGML_OPENCL_HAS_GATED_DELTA_NET). The kernel sources are kept in
+    # kernels/ so the next refresh from the x2-unified line stays a clean file-level copy.
     sub
     sum_rows
     cumsum
@@ -235,6 +295,7 @@ set(GGML_OPENCL_KERNELS
     abs
     unary_ext
     softplus
+    fwht
     pad
     repeat
     mul_mat_f16_f32
@@ -242,6 +303,7 @@ set(GGML_OPENCL_KERNELS
     mul_mm_q8_0_f32_kq_dp4a
     conv2d
     conv2d_f16_f32
+    flash_attn_repack
     flash_attn_pre_f16
     flash_attn_f32_f16
     flash_attn_f32_q8_0
@@ -252,7 +314,7 @@ set(GGML_OPENCL_KERNELS
 )
 
 if (GGML_OPENCL_USE_ADRENO_KERNELS)
-    list(APPEND GGML_OPENCL_KERNELS gemm_xmem_f16_f32_os8)
+    list(APPEND GGML_OPENCL_KERNELS gemm_xmem_f16_f32_os8 sdpa_xmem_f32_f16_os8)
 endif ()
 
 foreach (K ${GGML_OPENCL_KERNELS})

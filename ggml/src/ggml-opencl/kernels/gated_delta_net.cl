@@ -122,7 +122,26 @@ kernel void kernel_gated_delta_net(
         uint  H_k,
         uint  rq3,
         float scale,
-        uint K) {
+        uint K,
+        // Where the state snapshots go. Standalone this is the tail of dst
+        // (off_dst + s_off floats, slot stride S_V*S_V*H_v*n_seqs); when the
+        // host fused the follow-on cpy it is the recurrent cache itself, slot s
+        // landing on rollback group s, and the dst tail is left unwritten.
+        global       char * snap_buf,  ulong off_snap,
+        uint  snap_slot_stride,
+        // Where the input state comes from. state_row_stride == 0: state_buf is
+        // the [S_v, S_v, H_v, n_seqs] tensor. Otherwise the host fused the
+        // get_rows that gathered it and state_buf is the recurrent cache: seq s
+        // reads row state_rows[s], rows state_row_stride floats apart. The host
+        // only does this for a single-sequence batch, where each lane reads
+        // exactly the elements it may later write, so reading the cache in
+        // place is safe even when a snapshot lands on the row being read.
+        global const char * rows_buf,  ulong off_rows,
+        ulong state_row_stride,
+        // First token to process. The chunked prefill path (gated_delta_net_chunk.cl)
+        // takes the leading whole chunks and hands the state over through state_buf;
+        // this kernel then finishes tokens t0..n_tokens-1 and writes the snapshots.
+        uint  t0) {
 
     global const float * data_q     = (global const float *)(q_buf     + off_q);
     global const float * data_k     = (global const float *)(k_buf     + off_k);
@@ -131,6 +150,7 @@ kernel void kernel_gated_delta_net(
     global const float * data_beta  = (global const float *)(beta_buf  + off_beta);
     global const float * data_state = (global const float *)(state_buf + off_state);
     global       float * data_dst   = (global       float *)(dst_buf   + off_dst);
+    global       float * data_snap  = (global       float *)(snap_buf  + off_snap);
 
     const uint head_id     = get_group_id(0);
     const uint seq_id      = get_group_id(1);
@@ -153,11 +173,18 @@ kernel void kernel_gated_delta_net(
     // read the wrong sequence's initial state for n_seqs>1 && K>1 (single-seq/K=1 hid it since
     // seq_id=0 or K=1 cancels the factor). Matches the CPU reference (iv3*H + iv1)*S_v*S_v.
     const uint state_base = (seq_id * H_v + head_id) * state_size;
+    // Fused get_rows: the input state of this seq is cache row state_rows[seq_id].
+    uint state_in_base = state_base;
+    if (state_row_stride != 0) {
+        global const int * state_rows = (global const int *)(rows_buf + off_rows);
+        data_state   += (ulong)state_rows[seq_id] * state_row_stride;
+        state_in_base = head_id * state_size;
+    }
     const uint q_off_base  = iq3 * sq3 + iq1 * sq1;
     const uint v_off_base  = seq_id * sv3 + head_id * sv1;
     const uint gb_off_base = seq_id * sb3 + head_id * sb1;
     const uint state_out_base      = (seq_id * H_v + head_id) * state_size;
-    const uint state_size_per_snap = state_size * H_v * n_seqs;
+    (void) s_off; // snapshot placement now comes from snap_buf/off_snap/snap_slot_stride
 
     __local float reduce_temp[WG_SIZE];
     __local float * temp_ptr = reduce_temp + sg_id * SUBGROUP_SIZE;
@@ -168,13 +195,13 @@ kernel void kernel_gated_delta_net(
         const uint col = sg_col_base + cg * LANE_GROUPS_PER_SG + lane_group;
         #pragma unroll
         for (uint r = 0; r < ROWS_PER_LANE; r++) {
-            s_shard[cg][r] = data_state[state_base + col * S_V + GDN_ROW(r)];
+            s_shard[cg][r] = data_state[state_in_base + col * S_V + GDN_ROW(r)];
         }
     }
 
-    uint attn_off = (seq_id * n_tokens * H_v + head_id) * S_V;
+    uint attn_off = (seq_id * n_tokens * H_v + head_id) * S_V + t0 * S_V * H_v;
 
-    for (uint t = 0; t < n_tokens; t++) {
+    for (uint t = t0; t < n_tokens; t++) {
         const uint  q_off    = q_off_base + t * sq2;
         const uint  k_off    = q_off;
         const uint  v_off    = v_off_base + t * sv2;
@@ -260,10 +287,10 @@ kernel void kernel_gated_delta_net(
                 #pragma unroll
                 for (uint cg = 0; cg < COLS_PER_LANE_GROUP; cg++) {
                     const uint col = sg_col_base + cg * LANE_GROUPS_PER_SG + lane_group;
-                    const uint slot_base = s_off + (uint)target_slot * state_size_per_snap + state_out_base;
+                    const uint slot_base = (uint)target_slot * snap_slot_stride + state_out_base;
                     #pragma unroll
                     for (uint r = 0; r < ROWS_PER_LANE; r++) {
-                        data_dst[slot_base + col * S_V + GDN_ROW(r)] = s_shard[cg][r];
+                        data_snap[slot_base + col * S_V + GDN_ROW(r)] = s_shard[cg][r];
                     }
                 }
             }
@@ -276,7 +303,7 @@ kernel void kernel_gated_delta_net(
             const uint col = sg_col_base + cg * LANE_GROUPS_PER_SG + lane_group;
             #pragma unroll
             for (uint r = 0; r < ROWS_PER_LANE; r++) {
-                data_dst[s_off + state_base + col * S_V + GDN_ROW(r)] = s_shard[cg][r];
+                data_snap[state_base + col * S_V + GDN_ROW(r)] = s_shard[cg][r];
             }
         }
     }
