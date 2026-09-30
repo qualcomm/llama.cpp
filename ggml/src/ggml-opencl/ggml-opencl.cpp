@@ -80,6 +80,20 @@ typedef const void * (*get_adreno_bin_kernel_func_t)(
 // ggml_mul_mat hints (op_params[1]) postdate this base, which never writes that slot, so the
 // Walsh-Hadamard MUL_MAT fast path is unreachable. Same value as upstream.
 #define GGML_HINT_SRC0_IS_HADAMARD 1
+// This base already rotates Q/K/V by a Walsh-Hadamard matrix for quantized KV caches (same
+// ggml_gen_hadamard, same mul_mat(rot, x) call sites as upstream) but predates the hint, so the
+// rotation runs as a dense MUL_MAT. Its rotation matrices are the graph inputs the KV cache names
+// attn_inp_k_rot / attn_inp_v_rot, so recognise those as well; ggml_cl_fwht still checks the shape
+// and falls back to the plain GEMM for anything it does not cover.
+static inline bool ggml_cl_mul_mat_src0_is_hadamard(const struct ggml_tensor * dst) {
+    if (ggml_get_op_params_i32(dst, 1) == GGML_HINT_SRC0_IS_HADAMARD) {
+        return true;
+    }
+    const char * name = dst->src[0] ? dst->src[0]->name : "";
+    // substring, not prefix: the scheduler hands the backend a copy of the CPU-side input named
+    // "<backend>#attn_inp_k_rot#<n>"
+    return strstr(name, "attn_inp_k_rot") != nullptr || strstr(name, "attn_inp_v_rot") != nullptr;
+}
 // Snapshot count of SSM_SCAN / GATED_DELTA_NET. The x2-unified backend reads it from
 // op_params[0], which newer ggml cores set. At the b8981 base neither op takes a K argument,
 // op_params stay zero and the destination holds exactly the final state -- the K == 1
@@ -43310,7 +43324,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
 
-    if (ggml_get_op_params_i32(dst, 1) == GGML_HINT_SRC0_IS_HADAMARD && ggml_cl_fwht(backend, src1, dst)) {
+    if (ggml_cl_mul_mat_src0_is_hadamard(dst) && ggml_cl_fwht(backend, src1, dst)) {
         return;
     }
 
