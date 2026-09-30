@@ -876,6 +876,12 @@ bool llm_arch_is_diffusion(const llm_arch & arch) {
     }
 }
 
+bool llm_arch_supports_rs_rollback(const llm_arch & arch) {
+    // recurrent-state partial rollback (Qwen3.5 GDN) is not part of this backport
+    GGML_UNUSED(arch);
+    return false;
+}
+
 bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
     switch (arch) {
         case LLM_ARCH_GROK:
