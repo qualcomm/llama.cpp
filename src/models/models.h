@@ -280,6 +280,10 @@ struct llm_build_gemma4_iswa : public llm_graph_context {
     ggml_tensor * project_per_layer_inputs(ggml_tensor * inp_batch, ggml_tensor * inp_per_layer);
 };
 
+struct llm_build_gemma4_assistant : public llm_graph_context {
+    llm_build_gemma4_assistant(const llama_model & model, const llm_graph_params & params);
+};
+
 struct llm_build_gemma_embedding : public llm_graph_context {
     llm_build_gemma_embedding(const llama_model & model, const llm_graph_params & params);
 };

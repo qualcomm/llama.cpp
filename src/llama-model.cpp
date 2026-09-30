@@ -1654,6 +1654,32 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                     default: type = LLM_TYPE_UNKNOWN;
                 }
             } break;
+        case LLM_ARCH_GEMMA4_ASSISTANT:
+            {
+                // the assistant consumes [target token embedding, target hidden state] rows,
+                // the target hidden size is stored as embedding_length_out
+                hparams.n_embd_inp_impl = hparams.n_embd_out();
+
+                hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
+                ml.get_key_or_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.swa_layers, hparams.n_layer);
+
+                uint32_t n_kv_shared_layers = 0;
+                ml.get_key(LLM_KV_ATTENTION_SHARED_KV_LAYERS, n_kv_shared_layers, false);
+
+                hparams.f_attention_scale = 1.0f;
+
+                // all assistant layers are MTP (nextn) layers
+                ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS, hparams.nextn_predict_layers, false);
+                GGML_ASSERT(hparams.nextn_predict_layers == hparams.n_layer && "nextn_predict_layers must be == n_layer");
+
+                ml.get_key(LLM_KV_ROPE_FREQ_BASE_SWA,          hparams.rope_freq_base_train_swa, false);
+                ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW,    hparams.n_swa);
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+                ml.get_key(LLM_KV_ATTENTION_KEY_LENGTH_SWA,    hparams.n_embd_head_k_swa);
+                ml.get_key(LLM_KV_ATTENTION_VALUE_LENGTH_SWA,  hparams.n_embd_head_v_swa);
+
+                type = LLM_TYPE_UNKNOWN;
+            } break;
         case LLM_ARCH_GEMMA_EMBEDDING:
             {
                 hparams.swa_type = LLAMA_SWA_TYPE_SYMMETRIC;
@@ -4642,6 +4668,60 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                             layer.per_layer_proj       = create_tensor(tn(LLM_TENSOR_PER_LAYER_PROJ,      "weight", i), {n_embd_per_layer, n_embd}, 0);
                             layer.per_layer_post_norm  = create_tensor(tn(LLM_TENSOR_PER_LAYER_POST_NORM, "weight", i), {n_embd}, 0);
                         }
+                    }
+                } break;
+            case LLM_ARCH_GEMMA4_ASSISTANT:
+                {
+                    if (n_embd_head_k != n_embd_head_v) {
+                        throw std::runtime_error("Gemma 4 assistant requires n_embd_head_k == n_embd_head_v");
+                    }
+                    if (hparams.n_embd_head_k_swa != hparams.n_embd_head_v_swa) {
+                        throw std::runtime_error("Gemma 4 assistant requires n_embd_head_k_swa == n_embd_head_v_swa");
+                    }
+                    if (hparams.n_embd_out() == (uint32_t) n_embd) {
+                        throw std::runtime_error("Gemma 4 assistant requires embedding_length_out to carry the target hidden size");
+                    }
+
+                    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
+                    output   = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
+
+                    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), { n_embd }, 0);
+
+                    const int64_t n_embd_backbone = hparams.n_embd_inp();
+                    nextn_proj_post = create_tensor(tn(LLM_TENSOR_NEXTN_PROJ_POST, "weight"), { n_embd, n_embd_backbone }, 0);
+
+                    int rope_freqs_flag = 0;
+
+                    for (int i = 0; i < n_layer; ++i) {
+                        auto & layer = layers[i];
+
+                        const int64_t n_head      = hparams.n_head(i);
+                        const int64_t n_embd_head = hparams.n_embd_head_k(i);
+                        const int64_t n_ff_cur    = hparams.n_ff(i);
+
+                        if (i == 0) {
+                            nextn_proj_pre = create_tensor(tn(LLM_TENSOR_NEXTN_PROJ_PRE, "weight", i), { 2*n_embd_backbone, n_embd }, 0);
+                        }
+
+                        layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), { n_embd }, 0);
+                        layer.wq        = create_tensor(tn(LLM_TENSOR_ATTN_Q,    "weight", i), { n_embd, n_embd_head*n_head }, 0);
+                        layer.wo        = create_tensor(tn(LLM_TENSOR_ATTN_OUT,  "weight", i), { n_embd_head*n_head, n_embd }, 0);
+
+                        layer.attn_q_norm    = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM,    "weight", i), { n_embd_head }, 0);
+                        layer.attn_post_norm = create_tensor(tn(LLM_TENSOR_ATTN_POST_NORM, "weight", i), { n_embd }, 0);
+
+                        layer.out_scale = create_tensor(tn(LLM_TENSOR_LAYER_OUT_SCALE, "weight", i), { 1u }, 0);
+
+                        if (!hparams.is_swa(i)) {
+                            layer.rope_freqs = create_tensor(tn(LLM_TENSOR_ROPE_FREQS, "weight", i), { n_embd_head/2 }, rope_freqs_flag);
+                            rope_freqs_flag = TENSOR_DUPLICATED;
+                        }
+
+                        layer.ffn_norm      = create_tensor(tn(LLM_TENSOR_FFN_NORM,      "weight", i), { n_embd }, 0);
+                        layer.ffn_gate      = create_tensor(tn(LLM_TENSOR_FFN_GATE,      "weight", i), { n_embd, n_ff_cur }, 0);
+                        layer.ffn_up        = create_tensor(tn(LLM_TENSOR_FFN_UP,        "weight", i), { n_embd, n_ff_cur }, 0);
+                        layer.ffn_down      = create_tensor(tn(LLM_TENSOR_FFN_DOWN,      "weight", i), { n_ff_cur, n_embd }, 0);
+                        layer.ffn_post_norm = create_tensor(tn(LLM_TENSOR_FFN_POST_NORM, "weight", i), { n_embd }, 0);
                     }
                 } break;
             case LLM_ARCH_STARCODER2:
@@ -8514,6 +8594,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     }
                 } else {
                     llama_memory_i::layer_reuse_cb reuse = nullptr;
+                    llama_memory_i::layer_share_cb share = nullptr;
 
                     if (arch == LLM_ARCH_GEMMA3N || arch == LLM_ARCH_GEMMA4) {
                         reuse = [&](int32_t il) {
@@ -8522,6 +8603,28 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             }
 
                             return -1;
+                        };
+                    }
+
+                    llama_memory_t mem_other = nullptr;
+
+                    if (arch == LLM_ARCH_GEMMA4_ASSISTANT) {
+                        // the assistant has no KV cache of its own: its SWA layers attend to the KV cache of the
+                        // last SWA layer of the target model and its full-attention layers to the last
+                        // full-attention layer of the target model
+                        GGML_ASSERT(cparams.ctx_other != nullptr);
+
+                        mem_other = params.mem_other;
+                        GGML_ASSERT(mem_other != nullptr);
+
+                        share = [&](int32_t il) {
+                            const llama_model * model_other = llama_get_model(cparams.ctx_other);
+
+                            if (hparams.is_swa(il)) {
+                                return llama_model_n_layer(model_other) - 2;
+                            }
+
+                            return llama_model_n_layer(model_other) - 1;
                         };
                     }
 
@@ -8540,8 +8643,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 cparams.n_seq_max,
                                 cparams.n_ubatch,
                                 1,
+                                mem_other,
                                 nullptr,
-                                reuse);
+                                reuse,
+                                share);
                     } else {
                         GGML_ASSERT(!hparams.is_swa_any());
 
@@ -8557,6 +8662,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 1,
                                 hparams.n_swa,
                                 hparams.swa_type,
+                                nullptr,
+                                nullptr,
                                 nullptr,
                                 nullptr);
                     }
@@ -8767,6 +8874,10 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
         case LLM_ARCH_GEMMA4:
             {
                 llm = std::make_unique<llm_build_gemma4_iswa>(*this, params);
+            } break;
+        case LLM_ARCH_GEMMA4_ASSISTANT:
+            {
+                llm = std::make_unique<llm_build_gemma4_assistant>(*this, params);
             } break;
         case LLM_ARCH_GEMMA_EMBEDDING:
             {
@@ -9289,6 +9400,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_GEMMA3:
         case LLM_ARCH_GEMMA3N:
         case LLM_ARCH_GEMMA4:
+        case LLM_ARCH_GEMMA4_ASSISTANT:
         case LLM_ARCH_GEMMA_EMBEDDING:
         case LLM_ARCH_STARCODER2:
         case LLM_ARCH_OPENELM:
