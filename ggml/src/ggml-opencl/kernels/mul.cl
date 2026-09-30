@@ -39,9 +39,18 @@ kernel void kernel_mul(
     src1 = src1 + offset1;
     dst  = dst + offsetd;
 
+    // The host may split ne0 across extra workgroups when the row count alone
+    // cannot fill the device (a tall-narrow dst, e.g. the MoE weighting whose
+    // shape is [n_embd, n_expert_used]). nchunk is recovered from the launch
+    // geometry rather than passed, so the kernel signature is unchanged and
+    // nchunk == 1 reproduces the original one-workgroup-per-row mapping.
+    int nchunk = ne01 > 0 ? (int)get_num_groups(0) / ne01 : 1;
+    nchunk = nchunk < 1 ? 1 : nchunk;
+
     int i03 = get_group_id(2);
     int i02 = get_group_id(1);
-    int i01 = get_group_id(0);
+    int i01 = (int)get_group_id(0) / nchunk;
+    int ic  = (int)get_group_id(0) % nchunk;
 
     int i13 = i03 % ne13;
     int i12 = i02 % ne12;
@@ -51,7 +60,7 @@ kernel void kernel_mul(
     global char * src1_ptr = src1 + i13*nb13 + i12*nb12 + i11*nb11;
     global char * dst_ptr  = dst  + i03*nb3  + i02*nb2  + i01*nb1;
 
-    for (int i0 = get_local_id(0); i0 < ne0; i0 += get_local_size(0)) {
+    for (int i0 = ic*(int)get_local_size(0) + (int)get_local_id(0); i0 < ne0; i0 += nchunk*(int)get_local_size(0)) {
         const int i10 = i0 % ne10;
         *((global float *)(dst_ptr + i0*nb0)) = *((global float *)(src0_ptr + i0*nb00)) * *((global float *)(src1_ptr + i10*nb10));
     }
@@ -114,9 +123,18 @@ kernel void kernel_mul_f16(
     src1 = src1 + offset1;
     dst  = dst + offsetd;
 
+    // The host may split ne0 across extra workgroups when the row count alone
+    // cannot fill the device (a tall-narrow dst, e.g. the MoE weighting whose
+    // shape is [n_embd, n_expert_used]). nchunk is recovered from the launch
+    // geometry rather than passed, so the kernel signature is unchanged and
+    // nchunk == 1 reproduces the original one-workgroup-per-row mapping.
+    int nchunk = ne01 > 0 ? (int)get_num_groups(0) / ne01 : 1;
+    nchunk = nchunk < 1 ? 1 : nchunk;
+
     int i03 = get_group_id(2);
     int i02 = get_group_id(1);
-    int i01 = get_group_id(0);
+    int i01 = (int)get_group_id(0) / nchunk;
+    int ic  = (int)get_group_id(0) % nchunk;
 
     int i13 = i03 % ne13;
     int i12 = i02 % ne12;
@@ -126,7 +144,7 @@ kernel void kernel_mul_f16(
     global char * src1_ptr = src1 + i13*nb13 + i12*nb12 + i11*nb11;
     global char * dst_ptr  = dst  + i03*nb3  + i02*nb2  + i01*nb1;
 
-    for (int i0 = get_local_id(0); i0 < ne0; i0 += get_local_size(0)) {
+    for (int i0 = ic*(int)get_local_size(0) + (int)get_local_id(0); i0 < ne0; i0 += nchunk*(int)get_local_size(0)) {
         const int i10 = i0 % ne10;
         *((global half *)(dst_ptr + i0*nb0)) = *((global half *)(src0_ptr + i0*nb00)) * *((global half *)(src1_ptr + i10*nb10));
     }
