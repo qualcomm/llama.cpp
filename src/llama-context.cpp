@@ -1721,6 +1721,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // TODO: this clear of the buffer can easily be forgotten - need something better
     embd_seq.clear();
     output_swaps.clear();
+    embd_batch_idxs.clear();
 
     sched_reserve();
 
@@ -1941,6 +1942,16 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
                 GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
                 ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
+
+                // unmasked rows follow the ubatch token order, which a multi-sequence split
+                // permutes; remember each row's original batch index so output_reorder()
+                // can restore token order (upstream #29019)
+                if (!masked) {
+                    GGML_ASSERT(ubatch.data && ubatch.data->batch_idxs.size() == ubatch.n_tokens);
+                    GGML_ASSERT(embd_batch_idxs.size() == (size_t) n_tokens_prev);
+                    const auto & batch_idxs = ubatch.data->batch_idxs;
+                    embd_batch_idxs.insert(embd_batch_idxs.end(), batch_idxs.begin(), batch_idxs.end());
+                }
             }
         }
 
@@ -2221,6 +2232,22 @@ void llama_context::output_reorder() {
     }
 
     output_swaps.clear();
+
+    // unmasked NextN embeddings hold one row per token, independent of logits selection;
+    // restore the original token order (upstream #29019)
+    for (size_t i = 0; i < embd_batch_idxs.size(); ++i) {
+        while (embd_batch_idxs[i] != (int32_t) i) {
+            const int32_t j = embd_batch_idxs[i];
+            GGML_ASSERT(j >= 0 && (size_t) j < embd_batch_idxs.size());
+            if (embd_nextn.size > 0 && !cparams.embeddings_nextn_masked) {
+                for (uint64_t k = 0; k < n_embd_out; ++k) {
+                    std::swap(embd_nextn.data[i*n_embd_out + k], embd_nextn.data[j*n_embd_out + k]);
+                }
+            }
+            std::swap(embd_batch_idxs[i], embd_batch_idxs[j]);
+        }
+    }
+    embd_batch_idxs.clear();
 }
 
 //

@@ -309,6 +309,9 @@ private:
 
     std::vector<swap_info> output_swaps;
 
+    // unmasked NextN rows are extracted in ubatch order; extracted index -> original batch index
+    std::vector<int32_t> embd_batch_idxs;
+
     ggml_backend_sched_ptr sched;
 
     bool sched_need_reserve = true;
