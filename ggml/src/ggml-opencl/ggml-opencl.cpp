@@ -18424,6 +18424,17 @@ static bool use_fa_bin_kernels_prefill(const ggml_backend_opencl_context * backe
     if (is_q8_0 && sinks != nullptr && dk <= 64 && !q8_sinks_keep) {
         return false;
     }
+    // The same shapes with an f16 cache go to this backend's fused tile, which skips KV tiles the
+    // mask hides entirely; this kernel computes every tile. gpt-oss alternates full layers with
+    // 128-token sliding-window layers, and the window layers are almost entirely masked: at
+    // -ub 1024 the window-layer attention falls 384 -> 208 ms per pp2048 off this kernel.
+    // gpt-oss-20B f16 KV, X2-90, -ub 1024: pp2048 +3.1%, pp4096 +4.0%, pp4096 @ d16384 +2.3%;
+    // -ub 2048: pp2048 +21%. GGML_OPENCL_FA_BIN_SINKS=1 keeps it here.
+    static const bool sinks_keep = ggml_cl_env_flag("GGML_OPENCL_FA_BIN_SINKS") &&
+                                   !ggml_cl_env_flag_zero("GGML_OPENCL_FA_BIN_SINKS");
+    if (is_mixed && sinks != nullptr && dk <= 64 && !sinks_keep) {
+        return false;
+    }
 
     constexpr bool prefill_only = true;
 
