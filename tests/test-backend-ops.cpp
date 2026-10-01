@@ -11430,6 +11430,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             false, 16, 8, false, false, true, false, { 1, 1 }));
     }
 
+    // Single-token gate/up + GLU on FFN widths that are a multiple of 64 but not of 128, at a
+    // size where backends switch to their large-weight decode kernels.
+    for (auto [rows, k] : std::vector<std::pair<int64_t, int64_t>>{ {2112, 2048}, {10944, 4096} }) {
+        for (ggml_glu_op glu_op : { GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU }) {
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q4_K, glu_op, 1, rows, k,
+                false, 1, 1, false, false, true, false, { 1, 1 }));
+        }
+    }
+
     for (auto gate : {GATING_FUNC_SOFTMAX, GATING_FUNC_SIGMOID, GATING_FUNC_SOFTMAX_WEIGHT, GATING_FUNC_SQRT_SOFTPLUS}) {
         for (bool with_norm : {false, true}) {
             for (bool bias_probs : {false, true}) {
