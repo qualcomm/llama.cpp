@@ -3901,6 +3901,19 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         CL_CHECK((backend_ctx->kernel_mul_mat_f16_f32_mrow_r4 = clCreateKernel(cl_program_for_kernel(backend_ctx, kernel_src, compile_opts, backend_ctx->program_mul_mv_f16_f32_mrow, 5), "kernel_mul_mat_f16_f32_mrow_r4", &err), err));
         CL_CHECK((backend_ctx->kernel_mul_mat_f16_f32_mrow_h8 = clCreateKernel(cl_program_for_kernel(backend_ctx, kernel_src, compile_opts, backend_ctx->program_mul_mv_f16_f32_mrow, 2), "kernel_mul_mat_f16_f32_mrow_h8", &err), err));
         CL_CHECK((backend_ctx->kernel_mul_mat_f16_f32_mrow_h8r2 = clCreateKernel(cl_program_for_kernel(backend_ctx, kernel_src, compile_opts, backend_ctx->program_mul_mv_f16_f32_mrow, 3), "kernel_mul_mat_f16_f32_mrow_h8r2", &err), err));
+
+        // These launch a fixed 64 x 16 workgroup. E031.38 (Adreno 642L) allows them only
+        // 640-896 work-items, so every launch would fail with CL_INVALID_WORK_GROUP_SIZE;
+        // drop any that cannot take it. Without the base kernel the dispatch uses the 1row
+        // kernel, and without a variant it uses the base kernel.
+        for (cl_kernel * k : { &backend_ctx->kernel_mul_mat_f16_f32_mrow,    &backend_ctx->kernel_mul_mat_f16_f32_mrow_r2,
+                               &backend_ctx->kernel_mul_mat_f16_f32_mrow_r4, &backend_ctx->kernel_mul_mat_f16_f32_mrow_h8,
+                               &backend_ctx->kernel_mul_mat_f16_f32_mrow_h8r2 }) {
+            if (backend_ctx->get_kernel_workgroup_size(*k) < 64 * 16) {
+                CL_CHECK(clReleaseKernel(*k));
+                *k = nullptr;
+            }
+        }
         GGML_LOG_CONT(".");
     }
 
