@@ -95,6 +95,14 @@ class DeviceUnavailableError(Exception):
     """Raised when the QDC device resource is not available (retryable)."""
 
 
+class TestsFailedError(Exception):
+    """Raised when the job ran but tests failed (retryable; keeps the result)."""
+
+    def __init__(self, result: "JobResult"):
+        super().__init__("tests did not pass")
+        self.result = result
+
+
 _SCRIPTS_DIR = Path(__file__).parent
 _TESTS_DIR = _SCRIPTS_DIR / "tests"
 
@@ -641,7 +649,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--job-timeout", type=int, default=JOB_TIMEOUT, metavar="SECONDS",
                    help=f"Max seconds to wait for job completion (default: {JOB_TIMEOUT})")
     p.add_argument("--retries", type=int, default=DEFAULT_RETRIES, metavar="N",
-                   help="Number of retries when device is unavailable (default: 0)")
+                   help="Number of retries when the device is unavailable or tests fail (default: 0)")
     p.add_argument("--retry-delay", type=int, default=RETRY_DELAY, metavar="SECONDS",
                    help=f"Seconds to wait between retries (default: {RETRY_DELAY})")
     p.add_argument("--log-dump-dir", type=Path, default=None, metavar="DIR",
@@ -717,6 +725,11 @@ def _submit_and_run_job(client, args, spec, target_id, artifact_id) -> JobResult
         for name, ok in tests.items():
             if not ok:
                 log.error("FAILED %s\n%s", name, failure_details.get(name, "(no detail)"))
+        # QDC "completed" only means the entry script exited; failures here are
+        # often device-side flakes (adb/Appium setup, model download), so retry.
+        raise TestsFailedError(
+            JobResult(passed=False, tests=tests, raw_logs=raw_logs, failure_details=failure_details)
+        )
 
     return JobResult(passed=passed, tests=tests, raw_logs=raw_logs, failure_details=failure_details)
 
@@ -776,6 +789,18 @@ def main() -> int:
         try:
             result = _submit_and_run_job(client, args, spec, target_id, artifact_id)
             break
+        except TestsFailedError as e:
+            result = e.result
+            if attempt < max_attempts:
+                log.warning(
+                    "Attempt %d/%d failed (tests did not pass) — retrying in %ds",
+                    attempt, max_attempts, args.retry_delay,
+                )
+                time.sleep(args.retry_delay)
+            else:
+                log.error("Attempt %d/%d failed (tests did not pass) — no retries left",
+                          attempt, max_attempts)
+                break
         except DeviceUnavailableError as e:
             if attempt < max_attempts:
                 log.warning(

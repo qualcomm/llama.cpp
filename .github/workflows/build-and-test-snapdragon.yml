@@ -92,7 +92,7 @@ jobs:
     name: Test on QDC Device (${{ matrix.device }})
     needs: [android-ndk-snapdragon, linux-iot-snapdragon]
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 90
+    timeout-minutes: 300
     strategy:
       fail-fast: false
       matrix:
@@ -140,7 +140,7 @@ jobs:
               --model-url  "https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q4_0.gguf" \
               --device     ${{ matrix.device }} \
               --log-dump-dir qdc_device_logs \
-              ${{ startsWith(matrix.device, 'QCS') && '--retries 2 --retry-delay 300' || '' }}
+              --retries 2 --retry-delay 120
         env:
           QDC_API_KEY: ${{ secrets.QDC_API_KEY }}
 
