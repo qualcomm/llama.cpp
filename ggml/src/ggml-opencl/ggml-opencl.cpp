@@ -31462,10 +31462,19 @@ static bool ggml_cl_flash_attn_decompose(
     //
     // Llama-3.2-1B and granite-3B give up at most 1.9 points at pp512/1024 under 1024 and lose
     // more under 2048. GGML_OPENCL_FA_DECOMPOSE_DK64_MIN_NKV retunes it without a rebuild.
-    static const int dk64_min_nkv = []{
+    //
+    // The 1024 floor was tuned for 512-query calls; with a wider ubatch the first call already
+    // starts at n_kv = n_q and the decomposition loses there. Keep the floor at least 2*n_q, which
+    // leaves -ub 512 unchanged. gpt-oss-20B at -ub 1024, floor 1024 -> 2*n_q (X2-90):
+    //   pp1024 871 -> 948, pp2048 859 -> 895, pp4096 813 -> 830, pp16384 577 -> 581,
+    //   pp4096 @ d16384 381 -> 381
+    // which makes -ub 1024 at least as fast as -ub 512 everywhere measured. Setting the env var
+    // replaces the whole rule with its fixed value.
+    static const int dk64_min_nkv_env = []{
         const char * e = getenv("GGML_OPENCL_FA_DECOMPOSE_DK64_MIN_NKV");
-        return (e && e[0]) ? atoi(e) : 1024;
+        return (e && e[0]) ? atoi(e) : -1;
     }();
+    const int dk64_min_nkv = dk64_min_nkv_env >= 0 ? dk64_min_nkv_env : std::max(1024, 2 * n_q);
     const bool dk64_ok = kqv_int8_possible && gqa_group && n_kv >= dk64_min_nkv;
     const int gen_min_dk = backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E ? (dk64_ok ? 64 : 128)
                          : backend_ctx->adreno_gen == ADRENO_GPU_GEN::A8X ? 128
