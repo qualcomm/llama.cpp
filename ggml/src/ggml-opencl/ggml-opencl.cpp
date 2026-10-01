@@ -18563,9 +18563,17 @@ static bool use_fa_bin_kernels_prefill(const ggml_backend_opencl_context * backe
     // -ub 1024 the window-layer attention falls 384 -> 208 ms per pp2048 off this kernel.
     // gpt-oss-20B f16 KV, X2-90, -ub 1024: pp2048 +3.1%, pp4096 +4.0%, pp4096 @ d16384 +2.3%;
     // -ub 2048: pp2048 +21%. GGML_OPENCL_FA_BIN_SINKS=1 keeps it here.
+    // Short calls stay here: a single 512x512 call has its window layers only ~75% masked, too
+    // little for the skip to pay for the fused tile's lower per-tile throughput (pp512 -2% off
+    // this kernel). GGML_OPENCL_FA_BIN_SINKS_MIN_NKV sets the KV length from which the fused
+    // tile takes over.
     static const bool sinks_keep = ggml_cl_env_flag("GGML_OPENCL_FA_BIN_SINKS") &&
                                    !ggml_cl_env_flag_zero("GGML_OPENCL_FA_BIN_SINKS");
-    if (is_mixed && sinks != nullptr && dk <= 64 && !sinks_keep) {
+    static const int sinks_min_nkv = []{
+        const char * e = getenv("GGML_OPENCL_FA_BIN_SINKS_MIN_NKV");
+        return (e && e[0]) ? atoi(e) : 1024;
+    }();
+    if (is_mixed && sinks != nullptr && dk <= 64 && !sinks_keep && k->ne[1] >= sinks_min_nkv) {
         return false;
     }
 
