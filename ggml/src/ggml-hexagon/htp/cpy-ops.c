@@ -88,6 +88,7 @@ static void cpy_thread_##NAME##_sameshape(unsigned int nth, unsigned int ith, vo
         dma_addr_t dst_addr  = dst->data  + ir0 * ne00 * ELEM_SIZE;                                                \
         dma_addr_t src0_addr = src0->data + ir0 * ne00 * ELEM_SIZE;                                                \
         cpy_dma_sametype_reshape_contig(dma_q, dst_addr, src0_addr, (ir1 - ir0) * ne00 * ELEM_SIZE);               \
+        dma_queue_flush(dma_q);                                                                                    \
         return;                                                                                                    \
     }                                                                                                              \
     const uint32_t ne02_ne01 = ne02 * ne01;                                                                        \
@@ -133,6 +134,7 @@ static void cpy_thread_##NAME##_reshape(unsigned int nth, unsigned int ith, void
         dma_addr_t dst_addr  = dst->data  + th_start * ELEM_SIZE;                                     \
         dma_addr_t src0_addr = src0->data + th_start * ELEM_SIZE;                                     \
         cpy_dma_sametype_reshape_contig(dma_q, dst_addr, src0_addr, (th_end - th_start) * ELEM_SIZE); \
+        dma_queue_flush(dma_q);                                                                       \
         return;                                                                                       \
     }                                                                                                 \
                                                                                                       \

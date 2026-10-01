@@ -43,6 +43,10 @@ static inline void cpy_dma_push_2d_chunked(dma_queue * dma_q,
                                            size_t      src_stride,
                                            size_t      row_size,
                                            uint32_t    nrows) {
+    if (row_size == 0 || nrows == 0) {
+        return;
+    }
+
     while (nrows > 0) {
         const uint32_t cur_rows = MIN(nrows, DMA_MAX_NROWS);
         if (!dma_queue_push(dma_q, dma_make_data(dst, src), dst_stride, src_stride, row_size, cur_rows)) {
@@ -65,6 +69,10 @@ static inline void cpy_dma_sametype_sameshape(dma_queue *               dma_q,
     const uint32_t ne01 = src0->ne[1];
     const uint32_t ne02 = src0->ne[2];
     const uint32_t ne03 = src0->ne[3];
+
+    if (ne00 == 0 || ne01 == 0 || ne02 == 0 || ne03 == 0) {
+        return;
+    }
 
     const uint32_t nb01 = src0->nb[1];
     const uint32_t nb02 = src0->nb[2];

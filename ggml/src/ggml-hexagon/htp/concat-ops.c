@@ -287,11 +287,11 @@ static void concat_generic(unsigned int nth, unsigned int ith, void * data) {
     }
 }
 
-// When the tensor rows are smaller than this, DMA is not worth it.
-// Fallback to the generic element-wise copy path.
-#define CONCAT_DMA_MIN_ROW 16u
-
 static bool concat_dma(struct htp_ops_context * octx, int dim, uint32_t type_size) {
+    if (dim < 0 || dim >= HTP_OP_MAX_DIMS) {
+        return false;
+    }
+
     const struct htp_tensor * src0 = octx->src[0];
     const struct htp_tensor * src1 = octx->src[1];
     const struct htp_tensor * dst  = octx->dst;
@@ -300,7 +300,8 @@ static bool concat_dma(struct htp_ops_context * octx, int dim, uint32_t type_siz
     if (octx->ctx->mdev.count > 1 ||
         (dst->type != HTP_TYPE_F32 && dst->type != HTP_TYPE_F16 && dst->type != HTP_TYPE_I32) ||
         src0->type != dst->type || src1->type != dst->type || src0->nb[0] != type_size || src1->nb[0] != type_size ||
-        dst->nb[0] != type_size || (size_t) dst->ne[0] * type_size > DMA_MAX_SIZE_24B) {
+        dst->nb[0] != type_size || (size_t) dst->ne[0] * type_size > DMA_MAX_SIZE_24B ||
+        dst->nb[1] > DMA_MAX_STRIDE_24B || src0->nb[1] > DMA_MAX_STRIDE_24B || src1->nb[1] > DMA_MAX_STRIDE_24B) {
         return false;
     }
 
@@ -320,14 +321,6 @@ static bool concat_dma(struct htp_ops_context * octx, int dim, uint32_t type_siz
     }
     view1.data += (uint64_t) src0->ne[dim] * dst->nb[dim];
 
-    // A contiguous copy is one 1d transfer and does not care about the row width.
-    const bool contig0 = htp_tensor_is_contiguous(src0, type_size) && htp_tensor_is_contiguous(&view0, type_size);
-    const bool contig1 = htp_tensor_is_contiguous(src1, type_size) && htp_tensor_is_contiguous(&view1, type_size);
-    if ((!contig0 && (size_t) src0->ne[0] * type_size < CONCAT_DMA_MIN_ROW) ||
-        (!contig1 && (size_t) src1->ne[0] * type_size < CONCAT_DMA_MIN_ROW)) {
-        return false;
-    }
-
     dma_queue * q = octx->ctx->dma[0];
 
     cpy_dma_sametype_sameshape(q, &view0, src0, type_size);
@@ -337,11 +330,14 @@ static bool concat_dma(struct htp_ops_context * octx, int dim, uint32_t type_siz
 }
 
 int op_concat(struct htp_ops_context * octx) {
+    int dim = octx->op_params[0];
+    if (dim < 0 || dim >= HTP_OP_MAX_DIMS) {
+        return HTP_STATUS_NO_SUPPORT;
+    }
+
     const struct htp_tensor * src0 = octx->src[0];
     const struct htp_tensor * src1 = octx->src[1];
     const struct htp_tensor * dst  = octx->dst;
-
-    int dim = octx->op_params[0];
 
     const uint32_t type_size = (dst->type == HTP_TYPE_F32 || dst->type == HTP_TYPE_I32) ? 4 : 2;
     bool is_src1_transposed  = (src1->nb[0] > src1->nb[1]);
