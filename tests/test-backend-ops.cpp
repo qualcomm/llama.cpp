@@ -5105,7 +5105,7 @@ struct test_mul_mat : public test_case {
     }
 };
 
-// Preserve the Q8_0 N=1 input pattern that exposed the accuracy regression.
+// Preserve the Q8_0 N=1 input pattern.
 // Standard MUL_MAT tests use uniform initialization and do not cover it.
 struct test_mul_mat_q8_0_varying_range : public test_mul_mat {
     test_mul_mat_q8_0_varying_range(int64_t m, int64_t k)
