@@ -4520,8 +4520,10 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         GGML_LOG_CONT(".");
     }
 
-    // gemm_noshuffle_q2_k_q8_1_dp4a / q3_k (dp4a dense prefill GEMMs over the planes)
-    {
+    // gemm_noshuffle_q2_k_q8_1_dp4a / q3_k (dp4a dense prefill GEMMs over the planes). Their
+    // kernels call the integer dot product unconditionally, so build them only where it exists;
+    // the dispatch already requires it.
+    if (backend_ctx->has_integer_dot) {
 #ifdef GGML_OPENCL_EMBED_KERNELS
         const std::string kernel_src {
             #include "gemm_noshuffle_q2_k_q8_1_dp4a.cl.h"
@@ -4549,7 +4551,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         GGML_LOG_CONT(".");
     }
 
-    {
+    if (backend_ctx->has_integer_dot) {
 #ifdef GGML_OPENCL_EMBED_KERNELS
         const std::string kernel_src {
             #include "gemm_noshuffle_q3_k_q8_1_dp4a.cl.h"
