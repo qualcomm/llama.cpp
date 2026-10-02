@@ -870,7 +870,7 @@ __kernel void FA_TILE_NAME(
 }
 
 // Note: REQD_SUBGROUP_SIZE_64 intentionally omitted. Adding it routes the
-// X2 driver (and X1, per hp-hamoa) to its slower $fallback kernel variant
+// X2 driver (and X1) to its slower $fallback kernel variant
 // for sibling kernels in the same program — measured -5% on Llama-3.2-3B
 // _q1_vec at d=8192. At WG=Q1_WG_SIZE=64 the Adreno default sg=64, so
 // sub_group_reduce_max/add and sub_group_barrier produce correct WG-wide
@@ -2268,7 +2268,7 @@ __kernel void flash_attn_f32_f16_q1_vec_mq_split(
 
 // FA_C8_NO_SG_PIN (host passes it on Adreno X1E): the explicit "half"
 // sub-group attribute routes this fp16-heavy kernel to a slow fallback
-// codegen path on the X1 compiler — hp-hamoa measured -20/-23% WITH the pin
+// codegen path on the X1 compiler — measured -20/-23% WITH the pin
 // vs +17/+56% WITHOUT (tg@d8k/16k), correctness clean, because the 64*NSG
 // launch geometry already yields sg=64 there. X2 KEEPS the pin: its driver
 // picks a 128-wide wave without it and miscompiles full-subgroup reduces.
@@ -2278,7 +2278,7 @@ __kernel void flash_attn_f32_f16_q1_vec_mq_split(
 // REQD_FA_SG pins the HW subgroup on Intel (intel_reqd_sub_group_size(FA_SG),
 // host passes -D FA_SG=32); empty on Adreno. REQD_SUBGROUP_SIZE_64 pins 64 on
 // Adreno; empty on Intel. So both vendors get the correct pin for the c8
-// cluster lane-math + full-subgroup reduces. dell-x64-hq Intel c8 enable
+// cluster lane-math + full-subgroup reduces. Intel c8 enable
 // (+119% per-op on Xe-LP post-rebase).
 #define FA_C8_SG_ATTR REQD_FA_SG REQD_SUBGROUP_SIZE_64
 #endif
