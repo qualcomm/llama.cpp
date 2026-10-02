@@ -4,6 +4,21 @@
 #pragma OPENCL EXTENSION cl_khr_integer_dot_product : enable
 #endif
 
+// -DMOE_Q41 builds the q4_1 twin from this source. q4_1 MoE weights share the
+// q4_0 nibble image and scale layout and add a per-32-block min plane at the
+// scale's offset, so only the epilogue differs:
+//   q4_1 weight w_i = d * q_i + m
+//   Sum_i w_i a_i = d * a_d * dp4a(q_i, qa_i) + m * a_s
+// Mirrors vec_dot_q4_1_q8_1.
+
+#ifdef MOE_Q41
+#define MOE_KERNEL_NAME     kernel_gemm_moe_q4_1_q8_1_dp4a
+#define MOE_EPILOGUE(t, r)  (d_val * (float)sh_d[t] * (float)(r) + m_val * (float)sh_s[t])
+#else
+#define MOE_KERNEL_NAME     kernel_gemm_moe_q4_0_q8_1_dp4a
+#define MOE_EPILOGUE(t, r)  (d_val * ((float)sh_d[t] * (float)(r) - 8.0f * (float)sh_s[t]))
+#endif
+
 #define TILESIZE_M 64
 #define TILESIZE_N 32
 
@@ -28,13 +43,16 @@
         raw = dot_acc_sat_4x8packed_ss_int(qw[5], a1.s1, raw);       \
         raw = dot_acc_sat_4x8packed_ss_int(qw[6], a1.s2, raw);       \
         raw = dot_acc_sat_4x8packed_ss_int(qw[7], a1.s3, raw);       \
-        acc[t] += d_val * ((float)sh_d[t] * (float)raw - 8.0f * (float)sh_s[t]); \
+        acc[t] += MOE_EPILOGUE(t, raw);                              \
     } while (0)
 
 __attribute__((qcom_wave_pair_mode(1)))
-kernel void kernel_gemm_moe_q4_0_q8_1_dp4a(
-        __read_only  image1d_buffer_t src0_q,   // q4_0 weights (transposed, packed nibbles)
+kernel void MOE_KERNEL_NAME(
+        __read_only  image1d_buffer_t src0_q,   // q4_0/q4_1 weights (transposed, packed nibbles)
         __global     half *           src0_d,   // per-32-block scale
+#ifdef MOE_Q41
+        __global     half *           src0_m,   // per-32-block min (q4_1 only)
+#endif
         __global     uint *           src1_qa,  // q8_1 activations: int8 quants (as uint, 4/elem)
         __global     half *           src1_da,  // q8_1 per-block scale  [tok_slot * ne00/32]
         __global     half *           src1_sa,  // q8_1 per-block sum*d  [tok_slot * ne00/32]
@@ -99,6 +117,9 @@ kernel void kernel_gemm_moe_q4_0_q8_1_dp4a(
         // per-32-block scale for this WI's row
         const uint d_offset = row_idx + sub * ne01 + expert_id * num_blocks * ne01;
         const float d_val = (float)src0_d[d_offset];
+#ifdef MOE_Q41
+        const float m_val = (float)src0_m[d_offset];
+#endif
 
         // repack this WI's 32 weight nibbles into 8 dp4a uints
         const uint qoff0 = row + ((ne01 * step) >> 3)        + ((expert_id * ne00 * ne01) >> 3);
