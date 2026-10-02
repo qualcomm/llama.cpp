@@ -5209,10 +5209,7 @@ static bool ggml_hexagon_precompute_hmx_mm_params(
         if (dst && is_matmul_id) {
             const int n_experts = ne02 > 0 ? ne02 : 1;
             const size_t total_expert_rows = (size_t) dst->ne[1] * dst->ne[2];
-            int m_per_expert = (int) ((total_expert_rows + n_experts - 1) / n_experts);
-            if (sess->mdev.count > 1 && ((dst->nb[1] & 127) == 0)) {
-                m_per_expert = (m_per_expert + (int) sess->mdev.count - 1) / (int) sess->mdev.count;
-            }
+            const int m_per_expert = (int) ((total_expert_rows + n_experts - 1) / n_experts);
             m_id_rows = hex_round_up(std::max(m_per_expert, 32), 32);
         }
         const uint32_t cost_m = is_matmul_id ? (uint32_t) m_id_rows : (uint32_t) m_for_solver;

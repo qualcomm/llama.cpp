@@ -3882,14 +3882,28 @@ static int hmx_mm_op_matmul_id(
     const int n_ids = octx->src[2]->ne[0];
     const int n_as  = ne02;
 
-    for (uint32_t cur_a = 0; cur_a < n_as; ++cur_a) {
+    const bool mdev_split = (octx->ctx->mdev.count > 1) && htp_tensor_mdev_data_aligned(dst);
+    uint32_t n_active = 0;
+    if (mdev_split) {
+        for (uint32_t a = 0; a < (uint32_t) n_as; ++a) {
+            if (matrix_row_counts[a] > 0) n_active++;
+        }
+    }
+    const bool expert_split = mdev_split && (n_active >= octx->ctx->mdev.count);
+
+    uint32_t active_idx = 0;
+    for (uint32_t cur_a = 0; cur_a < (uint32_t) n_as; ++cur_a) {
         const int32_t cne1 = matrix_row_counts[cur_a];
         if (cne1 == 0) continue;
 
         const int m_padded = hex_align_up(cne1, 32);
         int m_start = 0, m_end = m_padded;
-        if (octx->ctx->mdev.count > 1) {
-            const bool can_split = htp_tensor_mdev_data_aligned(dst) && (uint32_t) cne1 >= octx->ctx->mdev.count;
+        if (expert_split) {
+            const bool my_expert = (active_idx % octx->ctx->mdev.count) == octx->ctx->mdev.idx;
+            active_idx++;
+            if (!my_expert) continue;
+        } else if (mdev_split) {
+            const bool can_split = (uint32_t) cne1 >= octx->ctx->mdev.count;
             const struct htp_tensor_mdev_range range = htp_tensor_mdev_partition((uint32_t) m_padded, can_split ? 1 : 0, octx->ctx->mdev.idx, octx->ctx->mdev.count, &octx->ctx->mdev.count_div);
             m_start = (int) range.start;
             m_end   = (int) (range.start + range.count);
@@ -4023,18 +4037,32 @@ static int hmx_mm_op_matmul_id_nx(
     const struct htp_tensor * restrict act  = octx->src[n_weights];
     const int n_as = src0->ne[2];
 
+    bool mdev_split = (octx->ctx->mdev.count > 1);
+    for (uint32_t p = 0; p < n_weights && mdev_split; ++p) {
+        const struct htp_tensor * restrict dst = octx->dsts[p];
+        mdev_split = !dst || htp_tensor_mdev_data_aligned(dst);
+    }
+    uint32_t n_active = 0;
+    if (mdev_split) {
+        for (uint32_t a = 0; a < (uint32_t) n_as; ++a) {
+            if (matrix_row_counts[a] > 0) n_active++;
+        }
+    }
+    const bool expert_split = mdev_split && (n_active >= octx->ctx->mdev.count);
+
+    uint32_t active_idx = 0;
     for (uint32_t cur_a = 0; cur_a < (uint32_t) n_as; ++cur_a) {
         const int32_t cne1 = matrix_row_counts[cur_a];
         if (cne1 == 0) continue;
 
         const int m_padded = hex_align_up(cne1, 32);
         int m_start = 0, m_end = m_padded;
-        if (octx->ctx->mdev.count > 1) {
-            bool can_split = (uint32_t) cne1 >= octx->ctx->mdev.count;
-            for (uint32_t p = 0; p < n_weights && can_split; ++p) {
-                const struct htp_tensor * restrict dst = octx->dsts[p];
-                can_split = !dst || htp_tensor_mdev_data_aligned(dst);
-            }
+        if (expert_split) {
+            const bool my_expert = (active_idx % octx->ctx->mdev.count) == octx->ctx->mdev.idx;
+            active_idx++;
+            if (!my_expert) continue;
+        } else if (mdev_split) {
+            const bool can_split = (uint32_t) cne1 >= octx->ctx->mdev.count;
             const struct htp_tensor_mdev_range range = htp_tensor_mdev_partition((uint32_t) m_padded, can_split ? 1 : 0, octx->ctx->mdev.idx, octx->ctx->mdev.count, &octx->ctx->mdev.count_div);
             m_start = (int) range.start;
             m_end   = (int) (range.start + range.count);
