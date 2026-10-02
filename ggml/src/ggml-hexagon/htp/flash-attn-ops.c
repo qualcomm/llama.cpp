@@ -1869,8 +1869,8 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
     factx.Bc             = kparams->Bc;
     factx.g_br           = kparams->u.hmx.g_br;
     factx.n_kv_blocks    = kparams->n_kv_blocks;
-    factx.is_q_fp32      = (kparams->is_q_fp32 != 0);
-    factx.is_dst_fp32    = (HTP_FA_DST_F32(kparams) != 0);
+    factx.is_q_fp32      = (q->type == HTP_TYPE_F32);
+    factx.is_dst_fp32    = (dst->type == HTP_TYPE_F32);
     factx.pipeline       = (kparams->u.hmx.pipeline != 0);
     factx.mask_broadcast = (kparams->u.hmx.mask_broadcast != 0);
     if (mask) {
@@ -1910,13 +1910,15 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
     if (octx->ctx->mdev.count > 1) {
         const uint32_t mdev_count = octx->ctx->mdev.count;
         const uint32_t mdev_idx   = octx->ctx->mdev.idx;
-        if (HTP_FA_HEAD_SPLIT(kparams) && n_kv_heads >= mdev_count && n_kv_heads % mdev_count == 0) {
+        const bool can_split      = htp_tensor_mdev_data_aligned(dst) && ((dst->nb[1] & (HTP_TENSOR_MDEV_LINE_SIZE - 1)) == 0);
+
+        if (kparams->head_split && can_split && n_kv_heads >= mdev_count && n_kv_heads % mdev_count == 0) {
             const uint32_t kv_per_core = n_kv_heads / mdev_count;
             kv_head_min = mdev_idx * kv_per_core;
             kv_head_max = kv_head_min + kv_per_core;
             head_split  = true;
         } else {
-            const struct htp_tensor_mdev_range range = htp_tensor_mdev_partition(n_q_blocks, htp_tensor_mdev_data_aligned(dst) ? 1 : 0, mdev_idx, mdev_count, &octx->ctx->mdev.count_div);
+            const struct htp_tensor_mdev_range range = htp_tensor_mdev_partition(n_q_blocks, can_split ? 1 : 0, mdev_idx, mdev_count, &octx->ctx->mdev.count_div);
             const uint32_t block_start = range.start;
             const uint32_t block_end   = range.start + range.count;
 
@@ -2491,7 +2493,7 @@ int op_flash_attn_ext(struct htp_ops_context * octx) {
         factx.src3_div3 = kparams->src3_div3;
     }
 
-    factx.is_q_fp32 = (kparams->is_q_fp32 != 0);
+    factx.is_q_fp32 = (q->type == HTP_TYPE_F32);
     factx.size_q_row_padded = kparams->u.hvx.size_q_row_padded;
     factx.size_k_row_padded = kparams->u.hvx.size_k_row_padded;
     factx.size_v_row_padded = kparams->u.hvx.size_v_row_padded;
@@ -2527,13 +2529,17 @@ int op_flash_attn_ext(struct htp_ops_context * octx) {
     if (octx->ctx->mdev.count > 1) {
         const uint32_t mdev_count = octx->ctx->mdev.count;
         const uint32_t mdev_idx   = octx->ctx->mdev.idx;
-        if (HTP_FA_HEAD_SPLIT(kparams) && neq2 >= mdev_count && neq2 % mdev_count == 0) {
-            const uint32_t heads_per_core = neq2 / mdev_count;
+        const uint32_t n_kv_heads = k->ne[2];
+        const bool can_split      = htp_tensor_mdev_data_aligned(dst) && ((dst->nb[1] & (HTP_TENSOR_MDEV_LINE_SIZE - 1)) == 0);
+
+        if (kparams->head_split && can_split && neq3 == 1 && n_kv_heads >= mdev_count && n_kv_heads % mdev_count == 0) {
+            const uint32_t G              = kparams->G;
+            const uint32_t kv_per_core    = n_kv_heads / mdev_count;
+            const uint32_t heads_per_core = kv_per_core * G;
             const uint32_t head_start     = mdev_idx * heads_per_core;
             qrow_start = head_start * neq1;
             qrows      = heads_per_core * neq1;
         } else {
-            const bool can_split = htp_tensor_mdev_data_aligned(dst) && ((dst->nb[1] & (HTP_TENSOR_MDEV_LINE_SIZE - 1)) == 0);
             const struct htp_tensor_mdev_range range = htp_tensor_mdev_partition(total_qrows, can_split ? 1 : 0, mdev_idx, mdev_count, &octx->ctx->mdev.count_div);
             qrow_start = range.start;
             qrows      = range.count;

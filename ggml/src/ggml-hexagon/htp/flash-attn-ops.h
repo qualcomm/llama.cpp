@@ -34,8 +34,8 @@ enum htp_fa_kernel_type {
 
 struct htp_fa_kernel_params {
     uint8_t  kernel_type;        // enum htp_fa_kernel_type
-    uint8_t  is_q_fp32;          // 1 = Q type is F32, 0 = F16
-    uint8_t  is_dst_fp32;        // bit 0: dst type is F32; bit 1: fa_head_split enabled
+    uint8_t  head_split;         // 1 = partition by KV heads in multicore, 0 = token partition
+    uint8_t  flags;              // reserved
     uint8_t  n_threads;          // Number of threads to run
 
     // Common parameters
@@ -82,12 +82,6 @@ struct htp_fa_kernel_params {
         } hvx;
     } u;
 };
-
-// Accessors for is_dst_fp32 bitfields (bit 0 = dst is F32, bit 1 = fa_head_split)
-#define HTP_FA_DST_F32(p)             ((p)->is_dst_fp32 & 0x01u)
-#define HTP_FA_HEAD_SPLIT(p)          (((p)->is_dst_fp32 >> 1) & 0x01u)
-#define HTP_FA_DST_F32_SET(p, v)      ((p)->is_dst_fp32 = (uint8_t)(((p)->is_dst_fp32 & ~0x01u) | ((v) ? 1u : 0u)))
-#define HTP_FA_HEAD_SPLIT_SET(p, v)   ((p)->is_dst_fp32 = (uint8_t)(((p)->is_dst_fp32 & ~0x02u) | ((v) ? 2u : 0u)))
 
 #if defined(__cplusplus)
 static_assert(sizeof(struct htp_fa_kernel_params) <= 128, "htp_fa_kernel_params is too large for kernel_params blob");
