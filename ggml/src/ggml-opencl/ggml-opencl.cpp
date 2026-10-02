@@ -1343,12 +1343,12 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_fa_p8_fixup = nullptr;
     cl_kernel kernel_fa_kqv_direct_f16 = nullptr;
     cl_kernel kernel_fa_kqv_direct_reduce = nullptr;
-    cl_kernel kernel_mul_mm_q8_kqv;
-    cl_kernel kernel_mul_mm_q8_kq;
+    cl_kernel kernel_mul_mm_q8_kqv = nullptr;
+    cl_kernel kernel_mul_mm_q8_kq = nullptr;
     cl_kernel kernel_mul_mm_q8_kq_p8 = nullptr;   // fused-softmax variant, only when KQ_TN == 32
     cl_kernel kernel_mul_mm_q8_kq_p8_dk512 = nullptr;  // same, KQ_DK_MAX=512, built on first q8_0-KV use
-    cl_kernel kernel_fa_q8_rows_f16;
-    cl_kernel kernel_fa_q8_rows_f32;
+    cl_kernel kernel_fa_q8_rows_f16 = nullptr;
+    cl_kernel kernel_fa_q8_rows_f32 = nullptr;
     cl_kernel kernel_fa_q8_rows_q8_0 = nullptr;          // q8_0 KV cache -> the int8 K planes, bit-exact
     int fa_kq_tn = 32;    // queries per int8 KQ workgroup, matches the kernel's KQ_TN
     int fa_kq_mb = 8;     // 64-row kv blocks per int8 KQ workgroup, matches the kernel's KQ_MB
@@ -7859,10 +7859,16 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         const std::string kqv_opts = compile_opts +
             " -DKQV_TN=" + std::to_string(backend_ctx->fa_kqv_tn) +
             " -DKQV_NB=" + std::to_string(backend_ctx->fa_kqv_nb);
-        backend_ctx->program_mul_mm_q8_kqv =
-            build_program_from_source(backend_ctx, kernel_src.c_str(), kqv_opts);
-
-        CL_CHECK((backend_ctx->kernel_mul_mm_q8_kqv = clCreateKernel(backend_ctx->program_mul_mm_q8_kqv, "kernel_mul_mm_q8_kqv", &err), err));
+        // Non-fatal: the int8 attention GEMMs need dp4a, which compilers without
+        // cl_khr_integer_dot_product reject outright, and they are only dispatched on the
+        // generations kqv_int8_gen admits. A device that cannot build them keeps the handle
+        // null and the decomposed prefill declines to the fused tile.
+        backend_ctx->program_mul_mm_q8_kqv = !backend_ctx->has_integer_dot_product ? nullptr :
+            build_program_from_source_ex_cached(
+                backend_ctx, kernel_src.c_str(), kqv_opts, /*fatal=*/false, "mul_mm_q8_kqv");
+        if (backend_ctx->program_mul_mm_q8_kqv != nullptr) {
+            CL_CHECK((backend_ctx->kernel_mul_mm_q8_kqv = clCreateKernel(backend_ctx->program_mul_mm_q8_kqv, "kernel_mul_mm_q8_kqv", &err), err));
+        }
         GGML_LOG_CONT(".");
     }
 
@@ -7884,16 +7890,19 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         backend_ctx->fa_kq_mb = env_pow2("GGML_OPENCL_FA_KQ_MB", 8, 1, 64);
         const std::string kq_opts = compile_opts + " -DKQ_TN=" + std::to_string(backend_ctx->fa_kq_tn) +
             " -DKQ_MB=" + std::to_string(backend_ctx->fa_kq_mb);
-        backend_ctx->program_mul_mm_q8_kq =
-            build_program_from_source(backend_ctx, kernel_src.c_str(), kq_opts);
-
-        CL_CHECK((backend_ctx->kernel_mul_mm_q8_kq    = clCreateKernel(backend_ctx->program_mul_mm_q8_kq, "kernel_mul_mm_q8_kq", &err), err));
-        if (backend_ctx->fa_kq_tn == 32) {
-            CL_CHECK((backend_ctx->kernel_mul_mm_q8_kq_p8 = clCreateKernel(backend_ctx->program_mul_mm_q8_kq, "kernel_mul_mm_q8_kq_p8", &err), err));
+        // Non-fatal for the same reason as mul_mm_q8_kqv above.
+        backend_ctx->program_mul_mm_q8_kq = !backend_ctx->has_integer_dot_product ? nullptr :
+            build_program_from_source_ex_cached(
+                backend_ctx, kernel_src.c_str(), kq_opts, /*fatal=*/false, "mul_mm_q8_kq");
+        if (backend_ctx->program_mul_mm_q8_kq != nullptr) {
+            CL_CHECK((backend_ctx->kernel_mul_mm_q8_kq    = clCreateKernel(backend_ctx->program_mul_mm_q8_kq, "kernel_mul_mm_q8_kq", &err), err));
+            if (backend_ctx->fa_kq_tn == 32) {
+                CL_CHECK((backend_ctx->kernel_mul_mm_q8_kq_p8 = clCreateKernel(backend_ctx->program_mul_mm_q8_kq, "kernel_mul_mm_q8_kq_p8", &err), err));
+            }
+            CL_CHECK((backend_ctx->kernel_fa_q8_rows_f16  = clCreateKernel(backend_ctx->program_mul_mm_q8_kq, "kernel_fa_q8_rows_f16", &err), err));
+            CL_CHECK((backend_ctx->kernel_fa_q8_rows_f32  = clCreateKernel(backend_ctx->program_mul_mm_q8_kq, "kernel_fa_q8_rows_f32", &err), err));
+            CL_CHECK((backend_ctx->kernel_fa_q8_rows_q8_0 = clCreateKernel(backend_ctx->program_mul_mm_q8_kq, "kernel_fa_q8_rows_q8_0", &err), err));
         }
-        CL_CHECK((backend_ctx->kernel_fa_q8_rows_f16  = clCreateKernel(backend_ctx->program_mul_mm_q8_kq, "kernel_fa_q8_rows_f16", &err), err));
-        CL_CHECK((backend_ctx->kernel_fa_q8_rows_f32  = clCreateKernel(backend_ctx->program_mul_mm_q8_kq, "kernel_fa_q8_rows_f32", &err), err));
-        CL_CHECK((backend_ctx->kernel_fa_q8_rows_q8_0 = clCreateKernel(backend_ctx->program_mul_mm_q8_kq, "kernel_fa_q8_rows_q8_0", &err), err));
         GGML_LOG_CONT(".");
     }
 
@@ -10091,8 +10100,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
     }
 
 
-    // gemm_noshuffle_q2_k_q8_1_dp4a / q3_k (dp4a dense prefill GEMMs over the planes)
-    {
+    // gemm_noshuffle_q2_k_q8_1_dp4a / q3_k (dp4a dense prefill GEMMs over the planes).
+    // Only dispatched with has_integer_dot_product, and a compiler without it rejects dp4a.
+    if (backend_ctx->has_integer_dot_product) {
 #ifdef GGML_OPENCL_EMBED_KERNELS
         const std::string kernel_src {
             #include "gemm_noshuffle_q2_k_q8_1_dp4a.cl.h"
@@ -10120,7 +10130,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         GGML_LOG_CONT(".");
     }
 
-    {
+    if (backend_ctx->has_integer_dot_product) {
 #ifdef GGML_OPENCL_EMBED_KERNELS
         const std::string kernel_src {
             #include "gemm_noshuffle_q3_k_q8_1_dp4a.cl.h"
@@ -31459,6 +31469,8 @@ static bool ggml_cl_flash_attn_decompose(
     const bool kv_q8 = k->type == GGML_TYPE_Q8_0 && v->type == GGML_TYPE_Q8_0;
     const bool kqv_int8_possible = kqv_int8_env && defer_norm_env && kqv_int8_gen && (n_kv % 32 == 0) && (dv % 64 == 0) &&
                                    n_head_kv > 0 && mask != nullptr &&
+                                   backend_ctx->kernel_mul_mm_q8_kqv != nullptr &&
+                                   backend_ctx->kernel_mul_mm_q8_kq != nullptr &&
                                    (kv_q8 ? backend_ctx->kernel_fa_v_transpose_q8_q8_0 != nullptr
                                           : backend_ctx->kernel_fa_v_transpose_q8 != nullptr);
     // Fused KQ+softmax (mul_mm_f16_f32_kq_p8): the KQ GEMM writes the u8 P and the
