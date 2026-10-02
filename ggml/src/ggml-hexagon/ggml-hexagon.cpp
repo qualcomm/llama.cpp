@@ -4858,7 +4858,6 @@ static bool ggml_hexagon_precompute_flash_attn_params(
     const struct ggml_tensor * k    = op->src[1];
     const struct ggml_tensor * v    = op->src[2];
     const struct ggml_tensor * mask = op->src[3];
-    const struct ggml_tensor * dst  = op;
 
     const uint32_t neq0 = q->ne[0];  // head_dim (DK)
     const uint32_t neq1 = q->ne[1];  // n_tokens
@@ -5168,9 +5167,25 @@ static bool ggml_hexagon_precompute_hmx_mm_params(
     struct htp_mm_kernel_params * kparams
 ) {
     const int aligned_tile_size = htp_mm_get_weight_aligned_tile_size(wtype);
-    const bool pipeline = is_matmul_id ? false : htp_mm_hmx_pipeline(ne11);
     const int n_threads = (int)sess->n_threads;
     const int ne10 = src1->ne[0];
+
+    int m_for_solver = ne11;
+    int m_for_solver_padded = ne11_padded;
+    if (!is_matmul_id && sess->mdev.count > 1 && ((uint32_t) ne11 >= sess->mdev.count)) {
+        bool can_row_split = false;
+        if (dst) {
+            can_row_split = ((dst->nb[1] & 127) == 0);
+        } else {
+            const size_t dst_nb1 = (size_t) ne01_padded * sizeof(float);
+            can_row_split = ((dst_nb1 & 127) == 0);
+        }
+        if (can_row_split) {
+            m_for_solver = (ne11 + (int) sess->mdev.count - 1) / (int) sess->mdev.count;
+            m_for_solver_padded = hex_round_up(std::max(m_for_solver, 32), 32);
+        }
+    }
+    const bool pipeline = is_matmul_id ? false : htp_mm_hmx_pipeline(m_for_solver);
 
     const bool is_batched_val = is_matmul_id ? false : is_batched;
     const int group_size = (ne02 > 0 ? ne12 / ne02 : 1);
@@ -5183,15 +5198,25 @@ static bool ggml_hexagon_precompute_hmx_mm_params(
 
     if (is_batched_val && wtype == GGML_TYPE_F16 && group_size > 1) {
         // Try grouped path first
-        if (htp_mm_hmx_solve_batched_params(wtype, ne00_padded, ne01_padded, ne11, group_size, n_threads, pipeline, src2_size, vtcm_budget, &m_chunk, &n_chunk, &act_threads_selected, &vtcm_size)) {
+        if (htp_mm_hmx_solve_batched_params(wtype, ne00_padded, ne01_padded, m_for_solver, group_size, n_threads, pipeline, src2_size, vtcm_budget, &m_chunk, &n_chunk, &act_threads_selected, &vtcm_size)) {
             use_grouped = true;
         }
     }
 
     if (!use_grouped) {
         // Fallback to simple 2D path (group_size = 1)
-        const int m_id_rows = (dst && is_matmul_id) ? (int) ((size_t) dst->ne[1] * dst->ne[2]) : 0;
-        if (!htp_mm_hmx_solve_2d_params(wtype, ne00_padded, m_id_rows, ne01_padded, ne11_padded, ne11, n_threads, pipeline, is_matmul_id, aligned_tile_size, src2_size, vtcm_budget, &m_chunk, &n_chunk, &act_threads_selected, &vtcm_size)) {
+        int m_id_rows = 0;
+        if (dst && is_matmul_id) {
+            const int n_experts = ne02 > 0 ? ne02 : 1;
+            const size_t total_expert_rows = (size_t) dst->ne[1] * dst->ne[2];
+            int m_per_expert = (int) ((total_expert_rows + n_experts - 1) / n_experts);
+            if (sess->mdev.count > 1 && ((dst->nb[1] & 127) == 0)) {
+                m_per_expert = (m_per_expert + (int) sess->mdev.count - 1) / (int) sess->mdev.count;
+            }
+            m_id_rows = hex_round_up(std::max(m_per_expert, 32), 32);
+        }
+        const uint32_t cost_m = is_matmul_id ? (uint32_t) m_id_rows : (uint32_t) m_for_solver;
+        if (!htp_mm_hmx_solve_2d_params(wtype, ne00_padded, m_id_rows, ne01_padded, m_for_solver_padded, cost_m, n_threads, pipeline, is_matmul_id, aligned_tile_size, src2_size, vtcm_budget, &m_chunk, &n_chunk, &act_threads_selected, &vtcm_size)) {
             return false;
         }
     }
