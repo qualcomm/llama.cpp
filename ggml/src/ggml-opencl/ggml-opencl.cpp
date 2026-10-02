@@ -8445,11 +8445,11 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
             // X2E +4.8% (Qwen3-4B) / +3.2% (Llama-3-8B), X1E +18.0%, and
             // A8X +61% / +42% / +33% (Qwen3-4B / Llama-3-8B / Mistral-7B),
             // where it also makes FA-on beat FA-off on this shape.
-            // No device gate is needed because those three families are the
-            // only ones that reach this dispatch: A7X declines every mixed and
-            // quantized FA combination above (compiler SIGSEGV) and E17
-            // declines FLASH_ATTN_EXT outright, so the kernel is unreachable on
-            // the 740 and the 850 -- both confirmed on device.
+            // It is not gated by device. A7X declines every mixed and quantized
+            // FA combination above (compiler SIGSEGV) and E17 declines
+            // FLASH_ATTN_EXT outright, so the kernel is unreachable on the 740
+            // and the 850 -- both confirmed on device. A6X does reach it: it is
+            // correct there (Adreno 619), but its speed has not been measured.
             if (!fa_decode_only && dk == 128 && dv == 128 && backend_ctx->has_subgroup_shuffle &&
                 !(getenv("GGML_OPENCL_FA_HS_GQA4") && getenv("GGML_OPENCL_FA_HS_GQA4")[0] == '0')) {
                 const std::string opts_hs4 = opts +
@@ -23332,7 +23332,8 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         // stops it loading at full offload there, so the shape is unreachable on
         // X1E in practice rather than untested-and-risky. FLASH_ATTN_EXT coverage
         // does run there. A7X and E17 never reach this function at all --
-        // supports_op declines f16-KV flash attention on both.
+        // supports_op declines f16-KV flash attention on both. A6X reaches it
+        // and is correct there (Adreno 619); its speed has not been measured.
         static const bool mqn_gqa2 = []{
             const char * e = getenv("GGML_OPENCL_FA_MQN_GQA2");
             return e == NULL || e[0] != '0';
@@ -23363,7 +23364,8 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         // carry a +-20% spread. The shape is unreachable in practice on X1E
         // rather than untested-and-risky, and the aborts reproduce with this
         // route off. A7X and E17 never reach this function at all -- supports_op
-        // declines f16-KV flash attention on both.
+        // declines f16-KV flash attention on both. A6X reaches it and is correct
+        // there (Adreno 619); its speed has not been measured.
         static const bool mqn_gqa16 = []{
             const char * e = getenv("GGML_OPENCL_FA_MQN_GQA16");
             return e == NULL || e[0] != '0';
@@ -24012,7 +24014,10 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     }
     const bool use_fd = (fd_k_split != NULL);
 
-    static const bool fa_debug = getenv("GGML_OPENCL_FA_DEBUG") != NULL;
+    static const bool fa_debug = []{
+        const char * e = getenv("GGML_OPENCL_FA_DEBUG");
+        return e != NULL && atoi(e) != 0;
+    }();
     if (fa_debug && use_fd) {
         char fd_kname[128] = {0};
         clGetKernelInfo(fd_k_split, CL_KERNEL_FUNCTION_NAME, sizeof(fd_kname) - 1, fd_kname, NULL);
@@ -24190,10 +24195,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         const size_t partial_size_bytes =
             (size_t) n_batch * n_head * n_q * n_splits * fa_partial_floats * sizeof(float);
 
-        // Opt-out for diagnosis. Force-disabled while recordable queues are in
-        // use: a recording bakes the cl_mem handle into the captured dispatch,
-        // and a pool that grows afterwards would leave the replay pointing at a
-        // released buffer.
+        // Opt-out for diagnosis (GGML_OPENCL_FD_PARTIAL_POOL=0).
         static const bool fd_pool_env_on = []{
             const char * e = getenv("GGML_OPENCL_FD_PARTIAL_POOL");
             return !(e && e[0] == '0');
@@ -24261,7 +24263,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
                     k_data_device, offset_k, k_bytes, CL_HALF_FLOAT);
             }
             // if image creation fails, fallback to buffer based kernels
-            if (getenv("GGML_OPENCL_FA_DEBUG")) {
+            if (fa_debug) {
                 GGML_LOG_INFO("ggml_opencl: FA k_img %s (pixels=%zu max=%zu)\n",
                     k_img ? "CREATED -> texture path" : "FAILED -> buffer fallback",
                     k_pixels, (size_t) backend_ctx->image_max_buffer_size);

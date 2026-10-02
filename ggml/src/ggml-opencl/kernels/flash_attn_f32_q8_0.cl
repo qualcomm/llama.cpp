@@ -714,7 +714,7 @@ __kernel void flash_attn_f32_q8_0_q1_split(
     }
 }
 
-// Prefill: q8_0 K/V, n_q > 1. BLOCK_M ? BLOCK_N tiling.
+// Prefill: q8_0 K/V, n_q > 1. BLOCK_M × BLOCK_N tiling.
 // K path keeps packed int8 in local for dp4a QK dot; V path dequant -> half in local.
 // Requires DK % QK8_0 == 0 and DV % QK8_0 == 0 (gated in supports_op).
 #define KV_DATA_TYPE4 half4
@@ -801,7 +801,7 @@ __kernel void flash_attn_f32_q8_0_q1_vec_mq_split(
     const ulong record_stride = (ulong) FA_PARTIAL_FLOATS;
 
     if (kv_start >= kv_end) {
-        // Empty split ? write sentinel for each of the MQ_GQA Q-heads.
+        // Empty split — write sentinel for each of the MQ_GQA Q-heads.
         if (tid == 0) {
             #pragma unroll
             for (int h = 0; h < MQ_GQA; ++h) {
@@ -1820,7 +1820,7 @@ __kernel void flash_attn_f32_q8_0(
             }
 #endif
         }
-        // V tile load ? strategy-dependent.
+        // V tile load — strategy-dependent.
 #if FA_V_STRATEGY == 2
         {
             // Int8 packed V in local memory + per-block scale. Accumulate
