@@ -4,47 +4,69 @@
 #pragma OPENCL EXTENSION cl_khr_integer_dot_product : enable
 #endif
 
+// q4_0 MoE prefill GEMM, dp4a (int8) inner loop.
+//
+// Drop-in alternative to kernel_gemm_moe_q4_0_f32_ns: same tiling / grid /
+// output scatter, but the activation tile is pre-quantized to q8_1 (see
+// kernel_moe_reorder_quant_a_q8_1) and the per-32-block dot uses the qcom int8
+// dp4a. Mirrors kernel_gemm_moe_q4_k_q8_1_dp4a; q4_0 differs only in having a
+// single fp16 scale per 32-block (no per-subblock 6-bit scales) and a constant
+// zero-point of 8 instead of a per-block min:
+//   q4_0 weight w_i = d * (q_i - 8), q_i in [0,15]
+//   Sum_i w_i a_i = d * a_d * dp4a(q_i, qa_i) - 8 * d * a_s
+// where a_s = a_d * Sum(qa) (the q8_1 "s" field). Mirrors vec_dot_q4_0_q8_1.
+//
 // -DMOE_Q41 builds the q4_1 twin from this source. q4_1 MoE weights share the
 // q4_0 nibble image and scale layout and add a per-32-block min plane at the
 // scale's offset, so only the epilogue differs:
 //   q4_1 weight w_i = d * q_i + m
 //   Sum_i w_i a_i = d * a_d * dp4a(q_i, qa_i) + m * a_s
 // Mirrors vec_dot_q4_1_q8_1.
+//
+// The 32 per-token accumulators are kept as 8 float4 groups of 4 tokens with a
+// vector epilogue, the layout of the dense kernel_gemm_noshuffle_q4_0_q8_1_dp4a.
+// A ragged tile runs whole groups up to its real-token count (a uniform guard)
+// instead of a runtime-bounded per-token loop. One float per token with that
+// loop was 18-22% slower per GEMM on the Adreno 840 at Qwen3-30B-A3B shapes.
 
 #ifdef MOE_Q41
-#define MOE_KERNEL_NAME     kernel_gemm_moe_q4_1_q8_1_dp4a
-#define MOE_EPILOGUE(t, r)  (d_val * (float)sh_d[t] * (float)(r) + m_val * (float)sh_s[t])
+#define MOE_KERNEL_NAME kernel_gemm_moe_q4_1_q8_1_dp4a
 #else
-#define MOE_KERNEL_NAME     kernel_gemm_moe_q4_0_q8_1_dp4a
-#define MOE_EPILOGUE(t, r)  (d_val * ((float)sh_d[t] * (float)(r) - 8.0f * (float)sh_s[t]))
+#define MOE_KERNEL_NAME kernel_gemm_moe_q4_0_q8_1_dp4a
 #endif
 
 #define TILESIZE_M 64
 #define TILESIZE_N 32
+#define NGROUPS    (TILESIZE_N / 4)
 
 // Expand the 4 nibbles held in the low 16 bits of `u` into 4 bytes (one nibble
-// per byte, value 0..15), packed for the int8 dp4a. The -8 zero-point is applied
-// in the epilogue via the activation sum term (cheaper than biasing every byte).
+// per byte, value 0..15), packed for the int8 dp4a. The q4_0 -8 zero-point is
+// applied in the epilogue via the activation sum term (cheaper than biasing
+// every byte).
 #define EXP4(u)  ( ((uint)((u) & 0x000Fu))        | \
                   (((uint)((u) & 0x00F0u)) << 4)  | \
                   (((uint)((u) & 0x0F00u)) << 8)  | \
                   (((uint)((u) & 0xF000u)) << 12) )
 
-// One token's dp4a dot (8 uints = 32 K elems) + q4_0 scale/zero-point epilogue.
-#define MOE_Q40_DP4A_T(t) do {                                       \
-        uint4 a0 = vload4(0, &sh_qa[t][0]);                          \
-        uint4 a1 = vload4(0, &sh_qa[t][4]);                          \
-        int raw = 0;                                                 \
-        raw = dot_acc_sat_4x8packed_ss_int(qw[0], a0.s0, raw);       \
-        raw = dot_acc_sat_4x8packed_ss_int(qw[1], a0.s1, raw);       \
-        raw = dot_acc_sat_4x8packed_ss_int(qw[2], a0.s2, raw);       \
-        raw = dot_acc_sat_4x8packed_ss_int(qw[3], a0.s3, raw);       \
-        raw = dot_acc_sat_4x8packed_ss_int(qw[4], a1.s0, raw);       \
-        raw = dot_acc_sat_4x8packed_ss_int(qw[5], a1.s1, raw);       \
-        raw = dot_acc_sat_4x8packed_ss_int(qw[6], a1.s2, raw);       \
-        raw = dot_acc_sat_4x8packed_ss_int(qw[7], a1.s3, raw);       \
-        acc[t] += MOE_EPILOGUE(t, raw);                              \
+// R = 32-K dp4a dot of this WI's 8 weight uints (qw) with token T's 8 activation uints.
+#define MOE_DOT8(T, R) do {                                            \
+        const uint4 a0 = vload4(0, &sh_qa[T][0]);                      \
+        const uint4 a1 = vload4(0, &sh_qa[T][4]);                      \
+        int r_ = 0;                                                    \
+        r_ = dot_acc_sat_4x8packed_ss_int(qw[0], a0.s0, r_);           \
+        r_ = dot_acc_sat_4x8packed_ss_int(qw[1], a0.s1, r_);           \
+        r_ = dot_acc_sat_4x8packed_ss_int(qw[2], a0.s2, r_);           \
+        r_ = dot_acc_sat_4x8packed_ss_int(qw[3], a0.s3, r_);           \
+        r_ = dot_acc_sat_4x8packed_ss_int(qw[4], a1.s0, r_);           \
+        r_ = dot_acc_sat_4x8packed_ss_int(qw[5], a1.s1, r_);           \
+        r_ = dot_acc_sat_4x8packed_ss_int(qw[6], a1.s2, r_);           \
+        r_ = dot_acc_sat_4x8packed_ss_int(qw[7], a1.s3, r_);           \
+        R = r_;                                                        \
     } while (0)
+
+// Token t's accumulator; t is a compile-time constant after unrolling.
+#define ACC(t) ((((t) & 3) == 0) ? acc[(t) >> 2].s0 : (((t) & 3) == 1) ? acc[(t) >> 2].s1 : \
+                (((t) & 3) == 2) ? acc[(t) >> 2].s2 : acc[(t) >> 2].s3)
 
 __attribute__((qcom_wave_pair_mode(1)))
 kernel void MOE_KERNEL_NAME(
@@ -86,7 +108,7 @@ kernel void MOE_KERNEL_NAME(
     __local half sh_d[TILESIZE_N];
     __local half sh_s[TILESIZE_N];
 
-    // Real-token count for this tile
+    // Real-token count for this tile (see kernel_gemm_moe_q4_k_q8_1_dp4a).
     __local uint sh_src2[TILESIZE_N];
     __local int  sh_nreal;
     if (lid < TILESIZE_N) {
@@ -107,21 +129,22 @@ kernel void MOE_KERNEL_NAME(
     barrier(CLK_LOCAL_MEM_FENCE);
     const int n_real = sh_nreal;
 
-    float acc[TILESIZE_N];
+    float4 acc[NGROUPS];
     #pragma unroll
-    for (int t = 0; t < TILESIZE_N; ++t) acc[t] = 0.0f;
+    for (int g = 0; g < NGROUPS; ++g) acc[g] = (float4)(0.0f);
 
     for (uint step = 0; step < ne00; step += 32) {
         const uint sub = step >> 5;        // 32-block index along K
 
-        // per-32-block scale for this WI's row
+        // --- per-32-block scale (and q4_1 min) for this WI's row ---
         const uint d_offset = row_idx + sub * ne01 + expert_id * num_blocks * ne01;
         const float d_val = (float)src0_d[d_offset];
 #ifdef MOE_Q41
         const float m_val = (float)src0_m[d_offset];
 #endif
 
-        // repack this WI's 32 weight nibbles into 8 dp4a uints
+        // --- repack this WI's 32 weight nibbles into 8 dp4a uints (same image
+        //     layout as kernel_gemm_moe_q4_k_q8_1_dp4a) ---
         const uint qoff0 = row + ((ne01 * step) >> 3)        + ((expert_id * ne00 * ne01) >> 3);
         const uint qoff1 = row + ((ne01 * (step + 16)) >> 3) + ((expert_id * ne00 * ne01) >> 3);
         const uint r0 = read_imageui(src0_q, qoff0 + lid).x;
@@ -134,7 +157,7 @@ kernel void MOE_KERNEL_NAME(
         qw[4] = EXP4(r2);        qw[5] = EXP4(r2 >> 16);
         qw[6] = EXP4(r3);        qw[7] = EXP4(r3 >> 16);
 
-        // cooperatively stage the n_real-token x 32-K int8 activations
+        // --- cooperatively stage the n_real-token x 32-K int8 activations to LDS ---
         // Stage each token's 8 activation uints as two 128-bit uint4 loads/stores.
         const uint vlim = (uint)n_real * 2;
         for (uint idx = lid; idx < vlim; idx += 64) {
@@ -149,12 +172,24 @@ kernel void MOE_KERNEL_NAME(
         }
         barrier(CLK_LOCAL_MEM_FENCE);
 
-        if (n_real == TILESIZE_N) {
-            #pragma unroll
-            for (int t = 0; t < TILESIZE_N; ++t) { MOE_Q40_DP4A_T(t); }
-        } else {
-            #pragma unroll 4
-            for (int t = 0; t < n_real; ++t) { MOE_Q40_DP4A_T(t); }
+        // Whole groups up to n_real. Lanes past n_real in the last group read
+        // unstaged LDS, but their results are never stored.
+        #pragma unroll
+        for (int g = 0; g < NGROUPS; ++g) {
+            if (g * 4 < n_real) {
+                const int b = g * 4;
+                int4 raw;
+                MOE_DOT8(b + 0, raw.s0); MOE_DOT8(b + 1, raw.s1);
+                MOE_DOT8(b + 2, raw.s2); MOE_DOT8(b + 3, raw.s3);
+                const float4 rf = convert_float4(raw);
+                const float4 ad = (float4)((float)sh_d[b + 0], (float)sh_d[b + 1], (float)sh_d[b + 2], (float)sh_d[b + 3]);
+                const float4 as = (float4)((float)sh_s[b + 0], (float)sh_s[b + 1], (float)sh_s[b + 2], (float)sh_s[b + 3]);
+#ifdef MOE_Q41
+                acc[g] += d_val * ad * rf + m_val * as;
+#else
+                acc[g] += d_val * (ad * rf - 8.0f * as);
+#endif
+            }
         }
         barrier(CLK_LOCAL_MEM_FENCE);
     }
@@ -163,7 +198,7 @@ kernel void MOE_KERNEL_NAME(
         return;
     }
 
-    // scatter results to original output rows (reuse sh_src2 from the top)
+    // --- scatter results to original output rows (reuse sh_src2 from the top) ---
     __local uint out_idx[TILESIZE_N];
     if (lid < TILESIZE_N) {
         uint idx = sh_src2[lid];
@@ -178,13 +213,16 @@ kernel void MOE_KERNEL_NAME(
     if (n_real == TILESIZE_N) {
         #pragma unroll
         for (int t = 1; t < TILESIZE_N; ++t) {
-            write_imagef(dst, out_idx[t] + m_offset, acc[t]);
+            write_imagef(dst, out_idx[t] + m_offset, ACC(t));
         }
         barrier(CLK_GLOBAL_MEM_FENCE);
-        write_imagef(dst, out_idx[0] + m_offset, acc[0]);
+        write_imagef(dst, out_idx[0] + m_offset, ACC(0));
     } else {
-        for (int t = 0; t < n_real; ++t) {
-            write_imagef(dst, out_idx[t] + m_offset, acc[t]);
+        #pragma unroll
+        for (int t = 0; t < TILESIZE_N; ++t) {
+            if (t < n_real) {
+                write_imagef(dst, out_idx[t] + m_offset, ACC(t));
+            }
         }
     }
 }
