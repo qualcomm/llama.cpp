@@ -2342,6 +2342,19 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         CL_CHECK((backend_ctx->kernel_mul_mat_f16_f32_mrow_r4 = clCreateKernel(backend_ctx->program_mul_mv_f16_f32_mrow, "kernel_mul_mat_f16_f32_mrow_r4", &err), err));
         CL_CHECK((backend_ctx->kernel_mul_mat_f16_f32_mrow_h8 = clCreateKernel(backend_ctx->program_mul_mv_f16_f32_mrow, "kernel_mul_mat_f16_f32_mrow_h8", &err), err));
         CL_CHECK((backend_ctx->kernel_mul_mat_f16_f32_mrow_h8r2 = clCreateKernel(backend_ctx->program_mul_mv_f16_f32_mrow, "kernel_mul_mat_f16_f32_mrow_h8r2", &err), err));
+
+        // The mrow kernels launch a fixed 64 x MROW (=1024) workgroup. Where the compiler
+        // caps a kernel below that the enqueue is refused with -54, so drop the variant
+        // here; the dispatch null-checks each one and a missing base kernel sends decode
+        // to the _1row kernel.
+        for (cl_kernel * k : { &backend_ctx->kernel_mul_mat_f16_f32_mrow, &backend_ctx->kernel_mul_mat_f16_f32_mrow_r2,
+                               &backend_ctx->kernel_mul_mat_f16_f32_mrow_r4, &backend_ctx->kernel_mul_mat_f16_f32_mrow_h8,
+                               &backend_ctx->kernel_mul_mat_f16_f32_mrow_h8r2 }) {
+            if (*k != nullptr && backend_ctx->get_kernel_workgroup_size(*k) < 64 * 16) {
+                CL_CHECK(clReleaseKernel(*k));
+                *k = nullptr;
+            }
+        }
         GGML_LOG_CONT(".");
     }
 
