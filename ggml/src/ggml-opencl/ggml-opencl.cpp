@@ -19405,10 +19405,19 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                     // which is why it measures as a wash and why this default is still right.
                     // Placement cannot be split per width: weight_buft_supported probes once at
                     // a fixed ne1 = 512.
+                    // Also default-on for A8X on its own compiler, i.e. the Adreno 840 and not
+                    // the 850 (E17, see above); the 830 shares the generation but was not measured. There the CPU head is not a wash: the phone's CPU
+                    // streams the vocab weight far slower than the GPU and the CPU threads
+                    // compete with the thread that feeds the GPU. Qwen3-30B-A3B Q4_0 (Q6_K
+                    // head) tg64: 20.9 / 10.5 (bimodal) -> 18.8 / 18.5 at d0, 6.0 -> 14.4 / 15.0
+                    // at d4096.
+                    const bool lmhead_gen_default =
+                        backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E ||
+                        (backend_ctx->adreno_gen == ADRENO_GPU_GEN::A8X &&
+                         backend_ctx->adreno_cl_compiler_version.type != E17);
                     const bool lmhead_gpu = lmhead_env
                         ? (lmhead_env[0] != '\0' && lmhead_env[0] != '0')
-                        : (lmhead_type_validated &&
-                           backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E);
+                        : (lmhead_type_validated && lmhead_gen_default);
                     if (op->ne[0] >= 32768 && op->src[1]->ne[1] > 1) {
                         if (!lmhead_gpu) {
                             return false;
