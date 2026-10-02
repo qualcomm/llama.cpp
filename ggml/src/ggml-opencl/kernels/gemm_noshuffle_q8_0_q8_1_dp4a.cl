@@ -471,4 +471,3 @@ kernel void kernel_gemm_noshuffle_q8_0_q8_1_dp4a_wimg_alds4(
     }
 #undef NGROUPS
 }
-

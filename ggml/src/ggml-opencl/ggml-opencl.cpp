@@ -564,7 +564,7 @@ static ADRENO_GPU_GEN get_adreno_gpu_gen(const char *device_name) {
     // "Adreno (TM) 642L" (or "Adreno642Lv1"), which matched none of the patterns and so was
     // treated as an unrecognised -- and, by the policy below, brand-new -- part. Match the
     // number, not an exact name. This is the union of the two lists we had: the low end
-    // (610-630) from the A6X enablement work, and 662/670 from x2ue's roster.
+    // (610-630) from the A6X enablement work, and 662/670 from the x2-unified roster.
     if (strstr(device_name, "610") || strstr(device_name, "612") ||
         strstr(device_name, "613") || strstr(device_name, "615") ||
         strstr(device_name, "616") || strstr(device_name, "618") ||
@@ -1130,12 +1130,12 @@ struct ggml_backend_opencl_context {
     // the deciding property is per-lane o_acc register pressure: those
     // compilers spill the kernel-default widths (868/916B private, c8 loses
     // e2e) and need 16/32 to keep o_acc at 128B/lane. X1E's compiler holds the
-    // defaults unspilled, yet measured wide-C is STILL a win there (hp-hamoa
+    // defaults unspilled, yet measured wide-C is STILL a win there (measured
     // 2026-07-10: C=16 = +28-30% on DK128-GQA4 decode, neutral on DK64 / GQA1
     // / quant-KV), so every c8-default-on gen (>= X1E) takes base 16.
     // GGML_OPENCL_FA_CL_C={8,16,32} overrides for per-device A/B.
     // fa_c8_cluster is the base/quant-KV width; fa_c8_cluster_f16 is the f16
-    // GQA4-dense width, which wants a WIDER cluster on the 12-CU A8X (hphq
+    // GQA4-dense width, which wants a WIDER cluster on the 12-CU A8X (measured
     // 2026-07-09: f16 C=32 beats C=16 by +25.7%, while quant KV stays best at
     // 16). Three validated f16 points: X1E @6 CU -> 16, A8X @12 CU -> 32,
     // X2E @16 CU -> 16 — NOT monotonic in compute-unit count, so the width is
@@ -1146,7 +1146,7 @@ struct ggml_backend_opencl_context {
     int  fa_c8_cluster_f16 = 0;
     // fa_c8_default_on: cluster-parallel decode FA default. Gated on gen_level
     // >= X1 (X1E, A8X/840, X2E and newer). All device-validated: X2E (wide-C
-    // re-measure 2026-07-07), X1E (hp-hamoa 2026-07-04/05), A8X (hphq 840
+    // re-measure 2026-07-07), X1E (2026-07-04/05), A8X (840
     // 2026-07-09: c8 +296..563% tg at d4096/d8192, coherent). Newer/unknown
     // gens inherit via the optimistic init default.
     bool fa_c8_default_on = false;
@@ -3687,7 +3687,7 @@ static cl_program build_program_from_source_ex(cl_context ctx, cl_device_id dev,
     return NULL;
 }
 
-// Merged: the cache wrapper (hq/cl-program-cache) around x2ue's signature, which also
+// Merged: the cache wrapper (program-cache change) around the x2-unified signature, which also
 // carries bin_size for the QPM ILA blob path. The two are orthogonal by construction --
 // the cache wraps build-from-source; the bin kernels come in via clCreateProgramWithBinary.
 static cl_program build_program_from_source(ggml_backend_opencl_context * backend_ctx, const char* program_buffer, const std::string &compile_opts, size_t bin_size = 0) {
@@ -4068,7 +4068,7 @@ static bool ggml_cl_kquant_plane_dp4a_gemm_on(const ggml_backend_opencl_context 
 
 
 
-// Defined below (x2ue keeps a single implementation); declared here for the
+// Defined below (x2-unified keeps a single implementation); declared here for the
 // plane-split program builder that follows.
 static int ggml_cl_nsg_fit(ggml_backend_opencl_context * backend_ctx, cl_kernel k,
                            int nsg, const char * what);
@@ -11425,7 +11425,7 @@ static std::string ggml_opencl_fa_compile_opts(ggml_backend_opencl_context * bac
     // routes the fp16-heavy kernel to a slow fallback variant WITH the pin
     // (-20/-23% tg) and is correct without it (the 64*NSG launch geometry
     // already yields sg=64 there); removing it flips X1 to +17/+56%
-    // (hp-hamoa, 2026-07-04). X2 KEEPS the pin — its driver picks a 128-wide
+    // (X1E, 2026-07-04). X2 KEEPS the pin — its driver picks a 128-wide
     // wave without it and miscompiles full-subgroup reduces.
     if (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X1E) {
         opts += " -D FA_C8_NO_SG_PIN";
@@ -12132,7 +12132,7 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
     // @d8k), f16 GQA4 +6% -> +50-93% (Mistral/Qwen3-4B, new @16k records
     // 12.38/14.11), quant-KV -16/-19% -> +45/+62%; C=32 GQA4 / C=64 g8
     // overshoot). X1E also compiles GQA4 16 — no spill there, but measured
-    // C=16 wins +28-30% on DK128-GQA4 decode (hp-hamoa 2026-07-10), neutral
+    // C=16 wins +28-30% on DK128-GQA4 decode (X1E 2026-07-10), neutral
     // elsewhere.
     // Appended per-program (not to the shared base opts) to avoid a duplicate
     // -D FA_CL_C with the g8 programs' own define.
@@ -18307,10 +18307,10 @@ inline bool use_adreno_moe_kernels(const ggml_backend_opencl_context *backend_ct
 // order bias. A7X regresses hard on this layout and stays off.
 // GGML_OPENCL_{Q4K,Q6K}_GEMV_TILED forces either way (=0 off, any other value on).
 //
-// BRANCH-LOCAL DIVERGENCE (x2ue, 2026-09-04 upstream sync). Upstream defaults this
+// BRANCH-LOCAL DIVERGENCE (x2-unified, 2026-09-04 upstream sync). Upstream defaults this
 // ON for X2E and A8X on the numbers above. This branch keeps it OFF, pending a
 // measurement, because the comparison upstream made no longer describes this tree:
-// its +6.9%/+11.9% is tiled vs the o4 route, and since then x2ue has landed the
+// its +6.9%/+11.9% is tiled vs the o4 route, and since then x2-unified has landed the
 // flat q6_K eight-column cok+dp4a GEMM lm_head (1c3c6d970 / 3952a146d), which is
 // what serves the long-vocab head here. use_q6k_tiled takes precedence over the
 // flat path (see use_flat_gemv_for_large_m_q6_K below), so switching this on would
@@ -31410,7 +31410,7 @@ static bool ggml_cl_flash_attn_decompose(
     // path), so on X1E this runs BOTH its GEMMs on the generic mul_mat. That is
     // a different code path from the one X2E/A8X exercise, which is why it was
     // held back until measured rather than assumed to follow. Measured on
-    // hp-hamoa (Adreno X1-85), gemma-4, pp512/2048/4096 vs the fused tile:
+    // X1E (Adreno X1-85), gemma-4, pp512/2048/4096 vs the fused tile:
     //
     //   E2B  +11.5%  +33.7%  +54.1%
     //   E4B   +7.4%  +20.2%  +32.6%
@@ -32031,7 +32031,7 @@ static bool ggml_cl_flash_attn_decompose(
     // it carries a perplexity check on two models: Qwen3.5-35B +0.047%, Qwen3.8-27B -0.047%,
     // opposite signs and a fourteenth of one standard error, i.e. rounding with no bias.
     // Set GGML_OPENCL_FA_SOFTMAX_DEFER_NORM=0 to opt out.
-    
+
     // ggml_cl_soft_max_ex only has deferred-norm kernels for an f16 mask and a row length that
     // divides by 4. It still passes the sums argument for any other shape, which shifts the arg
     // indices against a kernel that has no such argument. Rows here are n_kv long, and a null
@@ -33670,7 +33670,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     // shuffle_xor — the 2 lanes are adjacent (split_idx = tid % N_SPLIT) and, with
     // FA_SG=32 pinned, stay within one 32-wide subgroup, so the reduction is correct
     // (test-backend-ops: hsk=128 matches the split-off 2565/2565 fail-set exactly).
-    // e2e (Qwen3-4B-Q4_K_M, dell-x64-hq Xe-LP, 2026-07-05): pp512 46->70 (+52%),
+    // e2e (Qwen3-4B-Q4_K_M, Intel Xe-LP, 2026-07-05): pp512 46->70 (+52%),
     // pp512@d8192 4.4->28.6 (+6.5x, now 1.8x AHEAD of SYCL's 15.9). n_split>2 is a
     // wash (68/68.6/68.9 short). DK=256 EXCLUDED: its N_SPLIT=16 config miscomputes
     // on the 32-wide subgroup (84 hsk=256 FAILs), so it keeps the non-split BM tile.
@@ -34130,7 +34130,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         // Cluster-parallel decode (c8): default derived at init into
         // fa_c8_default_on (gen_level >= X1: X1E/A8X/X2E and newer; see the
         // context-struct comment) for the f16 DK=128 MQ paths. X1E: stock
-        // kernels compile unspilled at C=8/16 (hp-hamoa clean-build
+        // kernels compile unspilled at C=8/16 (X1E clean-build
         // re-validation, +17-56% f16 GQA4, +72/+128% quant-KV, 2026-07-04/05).
         // X2E: requires the WIDE cluster widths (GQA4 16 / g8 32 —
         // fa_c8_cluster, consumed in ensure_fa) that keep per-lane o_acc at
@@ -34139,7 +34139,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         // records), quant-KV +45/+62%, TBO FLASH_ATTN_EXT 0 FAIL. (At the
         // original widths X2's compiler spills 868/916B private and c8 LOSES —
         // that spilled config shipped default-on 07-05..07-07 and caused a
-        // customer-visible fa1-at-depth regression.) A8X (840): hphq 2026-07-09
+        // customer-visible fa1-at-depth regression.) A8X (840): 2026-07-09
         // c8 +296..563% tg @d4096/d8192, coherent; its width preference is
         // KV-type-dependent (f16 wants 32, quant 16 — see fa_c8_cluster in
         // ensure_fa).
@@ -34156,7 +34156,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         const bool c8_f16_on = (c8_env_state >= 0) ? (c8_env_state == 1) : c8_default_on;
         // Quant-KV (q4_0/q8_0) GQA4 c8: default-on X2E + X1E (X2E re-measured
         // at C=16 2026-07-07: q4-KV +45/+62% @d8k/16k Mistral; X1-85 validated
-        // by hp-hamoa 2026-07-05: q8-KV +128% (9.19 @d16k), q4-KV +72%, clean
+        // on 2026-07-05: q8-KV +128% (9.19 @d16k), q4-KV +72%, clean
         // TBO + coherence). NOTE the per-gen quant preference differs: X2 is
         // BW-bound (q4_0 fastest), X1 is dequant-ALU-bound (q8_0 fastest).
         const bool c8_quant_on = (c8_env_state >= 0) ? (c8_env_state == 1) : c8_default_on;
@@ -34573,12 +34573,12 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
             }
         }
     }
-    // dell-x64-hq c8 port: Intel cluster-parallel decode FA (DEFAULT-ON, opt-out GGML_OPENCL_FA_C8=0).
+    // c8 port: Intel cluster-parallel decode FA (DEFAULT-ON, opt-out GGML_OPENCL_FA_C8=0).
     // The MQ block above is gpu_family!=INTEL-gated; reach x2's c8 path here for Intel.
     // Xe-LP q1_vec FA is 1.5-6% of the 74.5 GB/s streaming floor -> MLP-starved; c8's
     // per-lane KV streams fill the pipe (+2x per-op, 16->33 GFLOPS @kv8-16k). f16 KV,
     // DK=DV=128, GQA=4, n_q==1. WG: stock c8 = MQ_NSG(4)xFA_SG(32)=128; ns2 = 64.
-    // e2e (Qwen3-4B-Q4_K_M, dell-x64-hq Xe-LP, 2026-07-05): tg128@d8192 1.47->2.16 (+47%),
+    // e2e (Qwen3-4B-Q4_K_M, Intel Xe-LP, 2026-07-05): tg128@d8192 1.47->2.16 (+47%),
     // closing the long-context decode gap vs SYCL (4.28) from 2.9x to 2.0x. Only fires at
     // n_kv>=FD_MIN_N_KV(2048), so short-context decode is unaffected by construction.
     const char * fa_c8_env = getenv("GGML_OPENCL_FA_C8");
@@ -35786,7 +35786,7 @@ static void ggml_cl_mul_mat_kq_kqv_adreno(ggml_backend_t backend, const ggml_ten
 
     // 🔴 KQV takes the m-block-fast ordering instead. Its A panel is 64 x K with K = n_kv
     // (6.3 MB at n_kv 49152), not 64 x head_dim, so it is never cache-resident and the KQ
-    // ordering costs 2.22x per dispatch at depth -- more than the entire x2ue-vs-upstream
+    // ordering costs 2.22x per dispatch at depth -- more than the entire x2-unified-vs-upstream
     // gap on Qwen3.5-35B-A3B pp16384 @ d32768. Measurement in the kernel's own comment.
     //
     // 🔑 GEOMETRY AND KERNEL ARE A MATCHED PAIR. mul_mm_f16_f32_kq_kqv.cl derives its
@@ -37686,7 +37686,7 @@ static void ggml_cl_mul_mat_q4_1_f32_adreno(ggml_backend_t backend, const ggml_t
     // STAYS OPT-IN (GGML_OPENCL_Q41_MC3=1), unlike the q4_0 sibling -- defaulting it
     // on was tried and MEASURED AS A REGRESSION.
     //
-    // The workgroup-occupancy scan (llama-shared/tools/wg_scan.py) flagged the q4_1
+    // The workgroup-occupancy scan flagged the q4_1
     // tiled GEMM as the largest remaining under-occupied launch once q4_0's mc3 was
     // on: 5 workgroups, 10.1% of GPU on gemma-4-E4B-it-Q4_0. Routing it here anyway
     // costs -4.2% at p=2 and -3.9% at p=4 (X2-90, 2 reps, arms disjoint, reps within
@@ -46243,7 +46243,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne01));
                     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne10));
                     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne0));
-                
+
                     const size_t rows_wg = ggml_cl_iq2xxs_mv_r2() ? 128 : 64;
                     size_t f_global[3] = { CEIL_DIV((size_t)ne01, rows_wg) * 64,
                                            (size_t)ne11 * (size_t)nsg, 1 };
@@ -46390,7 +46390,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne01));
                     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne10));
                     CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne0));
-                
+
                     const size_t rows_wg = ggml_cl_iq2xs_mv_r2() ? 128 : 64;
                     size_t f_global[3] = { CEIL_DIV((size_t)ne01, rows_wg) * 64,
                                            (size_t)ne11 * (size_t)nsg, 1 };
@@ -48805,7 +48805,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne01));
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne10));
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne0));
-            
+
                 const size_t rows_wg = ggml_cl_iq2xxs_mv_r2() ? 128 : 64;
                 size_t f_global[3] = { CEIL_DIV((size_t)ne01, rows_wg) * 64,
                                        (size_t)ne11 * (size_t)nsg, 1 };
@@ -48882,7 +48882,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne01));
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne10));
                 CL_CHECK(clSetKernelArg(fk, ai++, sizeof(int),      &ne0));
-            
+
                 const size_t rows_wg = ggml_cl_iq2xs_mv_r2() ? 128 : 64;
                 size_t f_global[3] = { CEIL_DIV((size_t)ne01, rows_wg) * 64,
                                        (size_t)ne11 * (size_t)nsg, 1 };
@@ -50067,7 +50067,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             // which reads the weight once per N_COLS columns. Same arithmetic per
             // (row, column), so the result is bit-identical.
             //
-            // NOT on the old E031 compilers. The multi-column twins are x2ue-only and
+            // NOT on the old E031 compilers. The multi-column twins are x2-unified-only and
             // upstream never had to consider them: they carry their own copy of the
             // vectorised vload4/convert_float4/dot() dequant, which is exactly the idiom
             // ADRENO_OLD_COMPILER exists to avoid, and they have no -D variant and no

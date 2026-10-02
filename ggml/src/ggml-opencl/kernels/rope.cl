@@ -1313,4 +1313,3 @@ kernel void kernel_rope_neox_f32_rms_set_rows_f16(
     }
 }
 #endif
-
