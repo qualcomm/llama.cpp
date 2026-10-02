@@ -1252,6 +1252,8 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemv_noshuffle_q6_K_f32;
     cl_kernel kernel_gemv_noshuffle_q6_K_f32_o4;
     cl_kernel kernel_gemv_noshuffle_q6_K_f32_o4_global;  // weights via __global (opt-in)
+    bool      q6k_o4_fits = true;         // per-kernel WG ceiling admits the 64x4 the o4 reductions assume
+    bool      q6k_o4_global_fits = true;
     cl_kernel kernel_gemv_noshuffle_q6_K_f32_tiled;      // tiled-wide layout (opt-in)
     cl_kernel kernel_gemv_noshuffle_q6_K_f32_tiled_mc3;  // tiled multi-column (N=3) verify lm_head
     cl_kernel kernel_gemm_noshuffle_q6_K_f32_tiled;      // batched (N>1) over the tiled layout
@@ -5193,6 +5195,14 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q6_K_f32_o4_global =
             clCreateKernel(prog_g, "kernel_gemv_noshuffle_q6_K_f32_o4_global", &err), err));
         CL_CHECK(clReleaseProgram(prog_g));
+
+        // The o4 reductions are written for exactly 4 subgroups (lws 64x4). Some compilers
+        // cap a variant below that, where the enqueue is refused with -54, so record
+        // whether each variant fits and let the dispatch decline to the next kernel.
+        backend_ctx->q6k_o4_fits =
+            backend_ctx->get_kernel_workgroup_size(backend_ctx->kernel_gemv_noshuffle_q6_K_f32_o4) >= 256;
+        backend_ctx->q6k_o4_global_fits =
+            backend_ctx->get_kernel_workgroup_size(backend_ctx->kernel_gemv_noshuffle_q6_K_f32_o4_global) >= 256;
         GGML_LOG_CONT(".");
     }
 
@@ -22345,8 +22355,11 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
             return !e || e[0] == '\0' || e[0] != '0';
         }();
         const bool use_tiled     = !use_q6k_mc3 && use_q6k_tiled(backend_ctx, src0);
-        const bool use_o4        = !use_tiled && !use_q6k_mc3 && gemv_o4_env && (ne01 % 4 == 0) && (ne01 >= 32768);
-        const bool use_o4_global = use_o4 && o4_global_env;
+        // A variant whose per-kernel WG ceiling is below the 64x4 it needs declines (see
+        // q6k_o4_fits); without the global variant o4 falls back to the image reads.
+        const bool use_o4_raw    = !use_tiled && !use_q6k_mc3 && gemv_o4_env && (ne01 % 4 == 0) && (ne01 >= 32768);
+        const bool use_o4_global = use_o4_raw && o4_global_env && backend_ctx->q6k_o4_global_fits;
+        const bool use_o4        = use_o4_raw && (use_o4_global || backend_ctx->q6k_o4_fits);
 
         // ql/qh image views are only needed when NOT reading weights from global.
         if (!use_o4_global && !use_tiled) {
