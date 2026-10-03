@@ -1692,6 +1692,8 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemm_moe_mxfp4_q8_1_dp4a = nullptr;   // dp4a (int8) mxfp4 MoE prefill GEMM
     cl_kernel kernel_gemm_moe_q4_0_q8_1_dp4a = nullptr;    // dp4a (int8) q4_0 MoE prefill GEMM
     cl_kernel kernel_gemm_moe_q4_1_q8_1_dp4a = nullptr;    // dp4a (int8) q4_1 MoE prefill GEMM (same source, -DMOE_Q41)
+    cl_kernel kernel_gemm_moe_q4_0_q8_1_dp4a_rb2 = nullptr; // two rows per lane (-DMOE_RB2), ne01 % 128 == 0
+    cl_kernel kernel_gemm_moe_q4_1_q8_1_dp4a_rb2 = nullptr;
     cl_kernel kernel_gemv_moe_mxfp4_f32_ns_glu;
     cl_kernel kernel_gemv_moe_mxfp4_f32_ns_glu_wimg = nullptr;  // weight-as-texture variant
     cl_kernel kernel_gemm_moe_mxfp4_q8_1_dp4a_bin = nullptr;   // binary dp4a (int8) mxfp4 MoE prefill GEMM
@@ -10792,6 +10794,19 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             build_program_from_source(backend_ctx, kernel_src.c_str(), opts_q41.c_str());
         CL_CHECK((backend_ctx->kernel_gemm_moe_q4_1_q8_1_dp4a = clCreateKernel(prog_q41, "kernel_gemm_moe_q4_1_q8_1_dp4a", &err), err));
         CL_CHECK(clReleaseProgram(prog_q41));
+
+        // Two-rows-per-lane builds of both (-DMOE_RB2), taken where the 128-row tile divides ne01.
+        // GGML_OPENCL_MOE_RB2=0 opts out.
+        if (!ggml_cl_env_flag_zero("GGML_OPENCL_MOE_RB2")) {
+            const std::string o40 = CL_moe_compile_opts + " -DMOE_RB2";
+            const std::string o41 = CL_moe_compile_opts + " -DMOE_RB2 -DMOE_Q41";
+            cl_program p40 = build_program_from_source(backend_ctx, kernel_src.c_str(), o40.c_str());
+            cl_program p41 = build_program_from_source(backend_ctx, kernel_src.c_str(), o41.c_str());
+            CL_CHECK((backend_ctx->kernel_gemm_moe_q4_0_q8_1_dp4a_rb2 = clCreateKernel(p40, "kernel_gemm_moe_q4_0_q8_1_dp4a", &err), err));
+            CL_CHECK((backend_ctx->kernel_gemm_moe_q4_1_q8_1_dp4a_rb2 = clCreateKernel(p41, "kernel_gemm_moe_q4_1_q8_1_dp4a", &err), err));
+            CL_CHECK(clReleaseProgram(p40));
+            CL_CHECK(clReleaseProgram(p41));
+        }
         GGML_LOG_CONT(".");
     }
 
@@ -50749,6 +50764,11 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                         if (backend_ctx->kernel_gemm_moe_q4_0_q8_1_dp4a_bin) {
                             dk = backend_ctx->kernel_gemm_moe_q4_0_q8_1_dp4a_bin;
                         }
+                        const bool rb2 = backend_ctx->kernel_gemm_moe_q4_0_q8_1_dp4a_rb2 != nullptr &&
+                                         !backend_ctx->kernel_gemm_moe_q4_0_q8_1_dp4a_bin && (ne01 % 128) == 0;
+                        if (rb2) {
+                            dk = backend_ctx->kernel_gemm_moe_q4_0_q8_1_dp4a_rb2;
+                        }
 
                         int aidx = 0;
                         CL_CHECK(clSetKernelArg(dk, aidx++, sizeof(cl_mem), &extra0_q4_0->q_img));
@@ -50765,7 +50785,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                         const int moe_ragged = backend_ctx->moe_gemm_ragged ? 1 : 0;
                         CL_CHECK(clSetKernelArg(dk, aidx++, sizeof(int),    &moe_ragged));
 
-                        size_t dp_global[3] = { 64, (size_t)((ne01 + 63) / 64), (size_t)max_post_router_tile };
+                        size_t dp_global[3] = { 64, (size_t)(rb2 ? ne01 / 128 : (ne01 + 63) / 64), (size_t)max_post_router_tile };
                         size_t dp_local[3]  = { 64, 1, 1 };
                         backend_ctx->enqueue_ndrange_kernel(dk, 3, dp_global, dp_local, dst);
 
@@ -51007,7 +51027,8 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                         buf_dst_image = clCreateImage(backend_ctx->context, CL_MEM_WRITE_ONLY, &image_format_buf_dst, &image_desc_buf_dst, NULL, &status);
                         CL_CHECK(status);
 
-                        cl_kernel dk = backend_ctx->kernel_gemm_moe_q4_1_q8_1_dp4a;
+                        const bool rb2 = backend_ctx->kernel_gemm_moe_q4_1_q8_1_dp4a_rb2 != nullptr && (ne01 % 128) == 0;
+                        cl_kernel dk = rb2 ? backend_ctx->kernel_gemm_moe_q4_1_q8_1_dp4a_rb2 : backend_ctx->kernel_gemm_moe_q4_1_q8_1_dp4a;
                         int aidx = 0;
                         CL_CHECK(clSetKernelArg(dk, aidx++, sizeof(cl_mem), &extra0_q4_1->q_img));
                         CL_CHECK(clSetKernelArg(dk, aidx++, sizeof(cl_mem), &extra0_q4_1->d));
@@ -51024,7 +51045,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                         const int moe_ragged = backend_ctx->moe_gemm_ragged ? 1 : 0;
                         CL_CHECK(clSetKernelArg(dk, aidx++, sizeof(int),    &moe_ragged));
 
-                        size_t dp_global[3] = { 64, (size_t)((ne01 + 63) / 64), (size_t)max_post_router_tile };
+                        size_t dp_global[3] = { 64, (size_t)(rb2 ? ne01 / 128 : (ne01 + 63) / 64), (size_t)max_post_router_tile };
                         size_t dp_local[3]  = { 64, 1, 1 };
                         backend_ctx->enqueue_ndrange_kernel(dk, 3, dp_global, dp_local, dst);
 
