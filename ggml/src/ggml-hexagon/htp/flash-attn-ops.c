@@ -1904,7 +1904,6 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
     uint32_t q_start_max  = neq1;
     uint32_t kv_head_min  = 0;
     uint32_t kv_head_max  = n_kv_heads;
-    bool     head_split   = false;
 
     if (octx->ctx->mdev.count > 1) {
         const uint32_t mdev_count = octx->ctx->mdev.count;
@@ -1915,7 +1914,6 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
             const uint32_t kv_per_core = n_kv_heads / mdev_count;
             kv_head_min = mdev_idx * kv_per_core;
             kv_head_max = kv_head_min + kv_per_core;
-            head_split  = true;
         } else {
             const struct htp_tensor_mdev_range range = htp_tensor_mdev_partition(n_q_blocks, can_split ? 1 : 0, mdev_idx, mdev_count, &octx->ctx->mdev.count_div);
             const uint32_t block_start = range.start;
