@@ -1799,7 +1799,7 @@ static int hvx_mm_matmul(struct htp_ops_context * octx) {
             mmctx->vec_dot_1x1     = vec_dot_f16_f16_aa_1x1;
             mmctx->vec_dot_2x1     = vec_dot_f16_f16_aa_2x1;
             mmctx->vec_dot_2x2     = vec_dot_f16_f16_aa_2x2;
-            src1_row_size          = hex_round_up(ne10 * 2, 128);
+            src1_row_size          = kparams->act_row_size;
             break;
 
         case HTP_MM_KERNEL_HVX_F32_F32_VTCM:
@@ -1809,7 +1809,7 @@ static int hvx_mm_matmul(struct htp_ops_context * octx) {
             mmctx->vec_dot_1x1     = vec_dot_f32_f32_aa_1x1;
             mmctx->vec_dot_2x1     = vec_dot_f32_f32_aa_2x1;
             mmctx->vec_dot_2x2     = vec_dot_f32_f32_aa_2x2;
-            src1_row_size          = hex_round_up(ne10 * 4, 128);
+            src1_row_size          = kparams->act_row_size;
             break;
 
         case HTP_MM_KERNEL_HVX_QUANT_BLOCK:
@@ -1838,7 +1838,7 @@ static int hvx_mm_matmul(struct htp_ops_context * octx) {
                 n_quant_tasks = MIN(src1_nrows, octx->n_threads);
                 quant_task_func = htp_mm_act_quant_row_func(src0->type);
             }
-            src1_row_size = htp_mm_weight_has_offset(src0->type) ? htp_mm_q8_1_tiled_row_size(ne10) : htp_mm_q8_0_tiled_row_size(ne10);
+            src1_row_size = kparams->act_row_size;
             break;
     }
 
@@ -3856,27 +3856,14 @@ static int hmx_mm_op_matmul(struct htp_ops_context * octx, const struct htp_mm_k
     return HTP_STATUS_OK;
 }
 
-// The rows of dims 1..3 can be walked with one stride (size-1 dims skipped); returns that stride
-static inline bool htp_mm_rows_stride(const struct htp_tensor * t, uint32_t * stride) {
-    uint32_t s = 0, next = 0;
-    for (int i = 1; i < 4; i++) {
-        if (t->ne[i] == 1) continue;
-        if (s == 0) { s = t->nb[i]; next = s * t->ne[i]; continue; }
-        if (t->nb[i] != next) return false;
-        next *= t->ne[i];
-    }
-    *stride = s ? s : t->nb[1];
-    return true;
-}
-
-static inline void htp_mm_tensor_flatten_rows(struct htp_tensor * f, const struct htp_tensor * t, uint32_t stride) {
-    *f = *t;
-    f->ne[1] = t->ne[1] * t->ne[2] * t->ne[3];
-    f->ne[2] = 1;
-    f->ne[3] = 1;
-    f->nb[1] = stride;
-    f->nb[2] = f->nb[1] * f->ne[1];
-    f->nb[3] = f->nb[2];
+static inline void htp_mm_tensor_collapse_rows(struct htp_tensor * c, const struct htp_tensor * t, uint32_t stride) {
+    *c = *t;
+    c->ne[1] = t->ne[1] * t->ne[2] * t->ne[3];
+    c->ne[2] = 1;
+    c->ne[3] = 1;
+    c->nb[1] = stride;
+    c->nb[2] = c->nb[1] * c->ne[1];
+    c->nb[3] = c->nb[2];
 }
 
 static int op_matmul_impl(struct htp_ops_context * octx) {
@@ -3895,20 +3882,18 @@ static int op_matmul_impl(struct htp_ops_context * octx) {
 }
 
 int op_matmul(struct htp_ops_context * octx) {
-    const struct htp_tensor * src0 = octx->src[0];
-    const struct htp_tensor * src1 = octx->src[1];
-    const struct htp_tensor * dst  = octx->dst;
+    const struct htp_mm_kernel_params * kparams = (const struct htp_mm_kernel_params *) octx->kernel_params;
 
-    // 2D weight with a batched contiguous activation: one 2D matmul over all rows (host computed kparams the same way)
-    const uint32_t src1_type_size = (src1->type == HTP_TYPE_F32 || src1->type == HTP_TYPE_I32) ? 4 : 2;
-    uint32_t s1, sd;
-    if (octx->src[2] == NULL && src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] * src1->ne[3] > 1 &&
-        src1->nb[0] == src1_type_size && htp_mm_rows_stride(src1, &s1) && htp_mm_rows_stride(dst, &sd)) {
-        struct htp_tensor src1_flat, dst_flat;
-        htp_mm_tensor_flatten_rows(&src1_flat, src1, s1);
-        htp_mm_tensor_flatten_rows(&dst_flat, dst, sd);
-        octx->src[1] = &src1_flat;
-        octx->dst    = &dst_flat;
+    if (kparams->collapse) {
+        const struct htp_tensor * src1 = octx->src[1];
+        const struct htp_tensor * dst  = octx->dst;
+        const uint32_t s1 = (src1->ne[1] > 1) ? src1->nb[1] : ((src1->ne[2] > 1) ? src1->nb[2] : src1->nb[1]);
+        const uint32_t sd = (dst->ne[1]  > 1) ? dst->nb[1]  : ((dst->ne[2]  > 1) ? dst->nb[2]  : dst->nb[1]);
+        struct htp_tensor src1_collapsed, dst_collapsed;
+        htp_mm_tensor_collapse_rows(&src1_collapsed, src1, s1);
+        htp_mm_tensor_collapse_rows(&dst_collapsed,  dst,  sd);
+        octx->src[1] = &src1_collapsed;
+        octx->dst    = &dst_collapsed;
         const int status = op_matmul_impl(octx);
         octx->src[1] = src1;
         octx->dst    = dst;

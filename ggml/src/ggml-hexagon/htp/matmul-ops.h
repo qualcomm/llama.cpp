@@ -87,24 +87,27 @@ enum htp_mm_kernel_type {
 
 // Op-specific struct for precomputed matmul params
 struct htp_mm_kernel_params {
-    int32_t  kernel_type;        // enum htp_mm_kernel_type
-    int32_t  pipeline;           // 1 = pipelined execution, 0 = standard
+    uint8_t  kernel_type;        // enum htp_mm_kernel_type
+    uint8_t  pipeline;           // 1 = pipelined execution, 0 = standard
+    uint8_t  collapse;           // 1 = collapse outer dims into 2D, 0 = standard
+    uint8_t  n_hmx;              // 1 = use HMX, 0 = use HVX
+
+    uint8_t  n_threads;          // Number of threads to spawn
+    uint8_t  n_act_threads;      // Number of threads for activation preparation
+    uint8_t  n_prefetch;         // Prefetch lookahead buffers/rows in VTCM
+    uint8_t  n_weights;          // Number of weights for fused NX
+
     int32_t  m_chunk;            // Row chunk size (M chunk)
     int32_t  n_chunk;            // Col chunk size (N chunk)
-    int32_t  n_threads;          // Number of threads to spawn
-    int32_t  n_act_threads;      // Number of threads for activation preparation
-    int32_t  n_hmx;              // 1 = use HMX, 0 = use HVX
-    int32_t  n_prefetch;         // Prefetch lookahead buffers/rows in VTCM
     int32_t  tile_size;          // Weight tile size
     int32_t  aligned_tile_size;  // Aligned weight tile size (padded to 128)
-    int32_t  src1_row_size;      // Row size for quantized activation
+    int32_t  act_row_size;       // Row size for activation scratchpad
     int32_t  vtcm_size;          // Total required scratchpad size in VTCM
     int32_t  vtcm_src0_size;     // src0 scratchpad size in VTCM
     int32_t  vtcm_src1_size;     // src1 scratchpad size in VTCM
     int32_t  vtcm_src2_size;     // src2 scratchpad size in VTCM (fused only)
     int32_t  vtcm_src3_size;     // src3 scratchpad size in VTCM (fused only)
     int32_t  vtcm_dst_size;      // dst scratchpad size in VTCM
-    int32_t  n_weights;          // Number of weights for fused NX
 
     // Precomputed division values
     struct fastdiv_values div_ne12_ne1;
