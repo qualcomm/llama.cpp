@@ -823,6 +823,10 @@ struct ggml_opencl_fa_kernels {
     std::map<std::pair<int, int>, int>       f32_f16_q1_vec_mq_split_g8_hs2_wg;
     std::map<std::pair<int, int>, int>       f32_f16_q1_vec_mq_split_g8_hs2_sub;
     std::map<std::pair<int, int>, cl_kernel> f32_f16_q1_vec_mq_split_gqa4_hs2;  // gqa4 via MQ_GQA=2 x 2 WGs
+    // gqa16 at DK=128 via the same cluster kernel, MQ_GQA=16/sub over sub WGs per KV head
+    std::map<std::pair<int, int>, cl_kernel> f32_f16_q1_vec_mq_split_g16_hs;
+    std::map<std::pair<int, int>, int>       f32_f16_q1_vec_mq_split_g16_hs_wg;
+    std::map<std::pair<int, int>, int>       f32_f16_q1_vec_mq_split_g16_hs_sub;
     // q1_vec_mq_split built alone (FA_MQ_SPLIT_ONLY) for a specific
     // (dk, dv, gqa), with its own MQ_NSG_SPLIT / FA_HEAD_SUB. Used where the
     // shared program either cannot hold the MQ family (DK=512) or produces a
@@ -11922,6 +11926,69 @@ static bool ggml_opencl_ensure_fa_mq_narrow(ggml_backend_opencl_context * backen
         }
     }
     return false;
+}
+
+// gqa=16 at DK=128 (Nemotron-H, muse-glimmer: 2 KV heads) on the cluster kernel that serves gqa=8:
+// MQ_GQA=4 over four workgroups per KV head, with the fused multi-head reduce and V prefetch. The
+// narrow program it replaces runs MQ_GQA=1 over sixteen, so every KV row is read sixteen times and
+// every head pays its own reduce. Per call, dk=128 gqa=16 f16, 2 KV heads, kv 4096/16384 (us):
+//   X2-90  423/1625 -> 132/440    840  1175/4590 -> 281/1033    X1-85  1060/4320 -> 252/964
+// Nemotron-3.5-30B-A3B Q4_0 on the X2-90, tg128: d4096 31.9 -> 34.3, d16384 26.0 -> 31.9.
+// Four is the split to keep: eight (MQ_GQA=2, no fused reduce) is ~20% slower on all three,
+// and two (MQ_GQA=8) spills to 1216 B/WI on the 840 and runs 18x slower there.
+// GGML_OPENCL_FA_G16_HS_DK128=0 opts out (back to the narrow program); _SUB=2/4/8 sets the split.
+static bool ggml_opencl_ensure_fa_g16_hs(ggml_backend_opencl_context * backend_ctx, int dk, int dv) {
+    const std::pair<int, int> key = {dk, dv};
+    if (backend_ctx->fa.f32_f16_q1_vec_mq_split_g16_hs.count(key) > 0) return true;
+    static std::set<std::pair<int, int>> failed;
+    if (failed.count(key) > 0) return false;
+
+    const ggml_opencl_fa_dim * cfg = nullptr;
+    for (const auto & d : g_opencl_fa_dims) {
+        if (d.dk == dk && d.dv == dv) { cfg = &d; break; }
+    }
+    if (cfg == nullptr || backend_ctx->fa_c8_cluster == 0) { failed.insert(key); return false; }
+
+    static const int hs_n = []{
+        const char * e = std::getenv("GGML_OPENCL_FA_G16_HS_DK128_SUB");
+        const int v = (e && e[0]) ? atoi(e) : 4;
+        return (v == 2 || v == 4 || v == 8) ? v : 4;
+    }();
+    static const int hs_nsg = []{
+        const char * e = std::getenv("GGML_OPENCL_FA_G16_HS_DK128_NSG");
+        const int v = (e && e[0]) ? atoi(e) : 2;
+        return (v >= 1 && v <= 4) ? v : 2;
+    }();
+    static const bool vpre  = !ggml_cl_env_flag_zero("GGML_OPENCL_FA_VPRE");
+    static const bool mhred = !ggml_cl_env_flag_zero("GGML_OPENCL_FA_G16_HS_DK128_MHRED");
+    const size_t wg = (size_t) (64 * hs_nsg);
+    const std::string opts = ggml_opencl_fa_compile_opts(backend_ctx, cfg, FA_VARIANT_F32_F16) +
+                             (vpre ? " -D FA_CL_VPRE" : "") + (mhred ? " -D FA_CL_MHRED=1" : "") +
+                             " -D FA_MQ_ONLY -D MQ_GQA=" + std::to_string(16 / hs_n) +
+                             " -D MQ_NSG=" + std::to_string(hs_nsg) +
+                             " -D MQ_NSG_SPLIT=" + std::to_string(hs_nsg) +
+                             " -D FA_HEAD_SUB=" + std::to_string(hs_n) +
+                             " -D FA_CL_C=" + std::to_string(backend_ctx->fa_c8_cluster);
+    const std::string tag = "fa f32_f16 MQ_GQA=" + std::to_string(16 / hs_n) + " dk" + std::to_string(dk) +
+                            " g16 headsub" + std::to_string(hs_n) + " wg" + std::to_string(wg);
+    cl_program prog = build_program_from_source_ex_cached(
+        backend_ctx, ggml_opencl_fa_kernel_src(FA_VARIANT_F32_F16).c_str(), opts,
+        /*fatal=*/false, tag.c_str(), /*bin_size=*/0, backend_ctx->queue);
+    if (!prog) { failed.insert(key); return false; }
+    cl_int err;
+    cl_kernel k = clCreateKernel(prog, "flash_attn_f32_f16_q1_vec_mq_split_c8", &err);
+    clReleaseProgram(prog);
+    if (err != CL_SUCCESS) { failed.insert(key); return false; }
+    if (!ggml_opencl_fa_kernel_fits_wg(backend_ctx, k, wg, tag.c_str(), dk, dv)) {
+        clReleaseKernel(k);
+        failed.insert(key);
+        return false;
+    }
+    backend_ctx->fa.f32_f16_q1_vec_mq_split_g16_hs[key]     = k;
+    backend_ctx->fa.f32_f16_q1_vec_mq_split_g16_hs_wg[key]  = (int) wg;
+    backend_ctx->fa.f32_f16_q1_vec_mq_split_g16_hs_sub[key] = hs_n;
+    ggml_opencl_log_fa_kernel_spill(backend_ctx, k, tag.c_str(), dk, dv);
+    return true;
 }
 
 // q8_0-KV twin of the narrow MQ split program: flash_attn_f32_q8_0_q1_vec_mq_split alone
@@ -33586,6 +33653,10 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
             if (e && e[0]) { return e[0] != '0'; }
             return backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E;
         }();
+        static const bool g16_hs = !ggml_cl_env_flag_zero("GGML_OPENCL_FA_G16_HS_DK128");
+        if (g16_hs && gqa == 16 && d_head_q == 128 && backend_ctx->has_subgroup_shuffle) {
+            ggml_opencl_ensure_fa_g16_hs(backend_ctx, d_head_q, d_head_v);
+        }
         if (gqa == 4 || gqa == 8 || (gqa == 2 && mqn_gqa2) || (gqa == 16 && mqn_gqa16) ||
             (gqa == 6 && mqn_gqa6)) {
             // hs/nsg defaults are per-shape measurements on the X2-90; the env
@@ -34301,6 +34372,17 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
                 use_fd_mq   = true;
                 fd_mq_wg    = 128;
                 fd_head_sub = 2;
+            // gqa=16 at DK=128 on the cluster kernel (see ggml_opencl_ensure_fa_g16_hs). Decode
+            // only: the narrow program below keeps the speculative-verify widths it was tuned for.
+            } else if (nq1_only && is_mixed && gqa_ratio_dispatch == 16 &&
+                d_head_q == 128 && d_head_v == 128 &&
+                n_head == n_head_kv * 16 &&
+                backend_ctx->fa.f32_f16_q1_vec_mq_split_g16_hs.count(dk_dv) > 0) {
+                fd_k_split  = backend_ctx->fa.f32_f16_q1_vec_mq_split_g16_hs.at(dk_dv);
+                use_fd_mq   = true;
+                fd_mq_wg    = (size_t) backend_ctx->fa.f32_f16_q1_vec_mq_split_g16_hs_wg.at(dk_dv);
+                fd_head_sub = backend_ctx->fa.f32_f16_q1_vec_mq_split_g16_hs_sub.at(dk_dv);
+                fd_g8hs     = true;
             // Narrow one-kernel MQ split program (gemma-4 DK=512 global layers
             // and DK=256 gqa=8 SWA layers). Carries its own workgroup size and
             // FA_HEAD_SUB, both chosen when it was built.
