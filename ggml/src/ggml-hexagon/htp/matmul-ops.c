@@ -3080,7 +3080,14 @@ static int hmx_mm_nx_2d_f32(struct htp_ops_context * octx, const struct htp_mm_k
     int m_start = 0;
     int m_rows  = m;
     if (octx->ctx->mdev.count > 1) {
-        const bool can_split = htp_tensor_can_row_partition(octx->dsts[0], sizeof(float));
+        bool can_split = true;
+        for (uint32_t p = 0; p < n_weights; ++p) {
+            const struct htp_tensor * restrict dst = octx->dsts[p];
+            if (dst && !htp_tensor_can_row_partition(dst, sizeof(float))) {
+                can_split = false;
+                break;
+            }
+        }
         const struct htp_tensor_mdev_range range = htp_tensor_mdev_partition((uint32_t) m, can_split ? 1 : 0, octx->ctx->mdev.idx, octx->ctx->mdev.count, &octx->ctx->mdev.count_div);
         m_start = (int) range.start;
         m_rows  = (int) range.count;
