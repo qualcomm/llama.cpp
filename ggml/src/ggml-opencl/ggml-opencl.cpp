@@ -12647,15 +12647,23 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
             if (!fa_decode_only && dk == 128 && dv == 128 &&
                 backend_ctx->has_subgroup_shuffle &&
                 !ggml_cl_env_flag_zero("GGML_OPENCL_FA_G8_HS_DK128")) {
-                // 4 is the measured optimum, not an extrapolation. X2-90 tg128 at
-                // d4096/d8192: 31.1/24.7 at FA_HEAD_SUB=2, 33.0/25.7 at 4, and
-                // 30.5/23.3 at 8 -- MQ_GQA=1 overshoots and lands BELOW 2, so the
-                // grid mechanism saturates here rather than continuing.
+                // Two workgroups per KV head (MQ_GQA=4), with the fused multi-head
+                // cluster reduce (FA_CL_MHRED: 8 shuffles per KV row instead of 16,
+                // same per-head summation order). MQ_GQA=2 has no fused reduce at
+                // DK=128, so the head split to 4 that used to win here paid the full
+                // reduce on every row and read each row 4 times. Per call, dk=128
+                // gqa=8 f16 at kv 4096/8192/16384, FA_HEAD_SUB=4 -> 2 + MHRED:
+                //   X2-90  159/310/596 -> 130/246/482 us
+                //   840    370/714/1394 -> 316/634/1218 us
+                //   X1-85  330/637/1220 -> 282/526/1022 us
+                // 2 without MHRED lands in between on all three. Opt out of the
+                // fused reduce with GGML_OPENCL_FA_G8_HS_DK128_MHRED=0.
                 static const int hs_n = []{
                     const char * e = std::getenv("GGML_OPENCL_FA_G8_HS_DK128_SUB");
-                    const int v = (e && e[0]) ? atoi(e) : 4;
-                    return (v == 2 || v == 4 || v == 8) ? v : 4;
+                    const int v = (e && e[0]) ? atoi(e) : 2;
+                    return (v == 2 || v == 4 || v == 8) ? v : 2;
                 }();
+                static const bool hs_mhred = !ggml_cl_env_flag_zero("GGML_OPENCL_FA_G8_HS_DK128_MHRED");
                 static const int hs_nsg = []{
                     const char * e = std::getenv("GGML_OPENCL_FA_G8_HS_DK128_NSG");
                     const int v = (e && e[0]) ? atoi(e) : 2;
@@ -12672,6 +12680,7 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
                 // -9% at 32768; tg128 +5.0% @d8192, +8.9% @d32768. Opt out with GGML_OPENCL_FA_VPRE=0.
                 static const bool hs_vpre = !ggml_cl_env_flag_zero("GGML_OPENCL_FA_VPRE");
                 const std::string opts_hs = opts + (hs_vpre ? " -D FA_CL_VPRE" : "") +
+                    (hs_mhred ? " -D FA_CL_MHRED=1" : "") +
                     " -D FA_MQ_ONLY -D MQ_GQA=" + std::to_string(8 / hs_n) +
                     " -D MQ_NSG=" + std::to_string(hs_nsg) +
                     " -D MQ_NSG_SPLIT=" + std::to_string(hs_nsg) +
