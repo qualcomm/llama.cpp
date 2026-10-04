@@ -136,9 +136,20 @@ kernel void MOE_KERNEL_NAME(
 
     const uint ne00_u = ne00 >> 2;   // ne00 in uint (int8x4) units
 
+#ifdef MOE_LM_PAD
+    // E17 (Adreno 850) returns wrong values for the start of these tiles, corrupting the first
+    // tokens of every tile; starting each one MOE_LM_PAD x 8 bytes in avoids it.
+    __local uint sh_qa_store[TILESIZE_N * 8 + 2 * MOE_LM_PAD];
+    __local half sh_d_store[TILESIZE_N + 4 * MOE_LM_PAD];
+    __local half sh_s_store[TILESIZE_N + 4 * MOE_LM_PAD];
+    __local uint (*sh_qa)[8] = (__local uint (*)[8])(sh_qa_store + 2 * MOE_LM_PAD);
+    __local half * sh_d = sh_d_store + 4 * MOE_LM_PAD;
+    __local half * sh_s = sh_s_store + 4 * MOE_LM_PAD;
+#else
     __local uint sh_qa[TILESIZE_N][8]; // 32 tokens x 8 uints (32 int8) = 1 KiB
     __local half sh_d[TILESIZE_N];
     __local half sh_s[TILESIZE_N];
+#endif
 
     // Real-token count for this tile (see kernel_gemm_moe_q4_k_q8_1_dp4a).
     __local uint sh_src2[TILESIZE_N];
