@@ -388,7 +388,7 @@ static void ggml_hexagon_precompute_sort_params(
 static void ggml_hexagon_precompute_fused_mmnx_params(
     const struct ggml_hexagon_session * sess,
     const struct ggml_tensor * src0,
-    const struct ggml_tensor * src1,
+    const struct ggml_tensor * act,
     int32_t n_weights,
     struct htp_mm_kernel_params * kparams
 );
@@ -396,7 +396,7 @@ static void ggml_hexagon_precompute_fused_mmnx_params(
 static void ggml_hexagon_precompute_fused_mmidnx_params(
     const struct ggml_hexagon_session * sess,
     const struct ggml_tensor * src0,
-    const struct ggml_tensor * src1,
+    const struct ggml_tensor * act,
     const struct ggml_tensor * dst,
     int32_t n_weights,
     struct htp_mm_kernel_params * kparams
@@ -5271,9 +5271,9 @@ static bool ggml_hexagon_precompute_hmx_mm_params(
     kparams->vtcm_src0_size = 0;
     kparams->div_n_act_threads = init_fastdiv_values(act_threads_selected);
     kparams->div_ne00_padded   = init_fastdiv_values(ne00_padded);
-    kparams->vtcm_src1_size = 0;
-    kparams->vtcm_src2_size = (int32_t) src2_size;
-    kparams->vtcm_dst_size = 0;
+    kparams->vtcm_act_size     = 0;
+    kparams->vtcm_bias_size    = (int32_t) src2_size;
+    kparams->vtcm_dst_size     = 0;
 
     if (is_batched && !is_matmul_id) {
         kparams->kernel_type = HTP_MM_KERNEL_HMX_F16_BATCHED;
@@ -5344,7 +5344,8 @@ static void ggml_hexagon_precompute_hvx_mm_params(
             kparams->n_prefetch     = best_n_prefetch;
             kparams->vtcm_size      = L.total_bytes;
             kparams->vtcm_src0_size = L.src0_bytes;
-            kparams->vtcm_src1_size = L.src1_bytes;
+            kparams->vtcm_act_size  = L.act_bytes;
+            kparams->vtcm_bias_size = 0;
             kparams->vtcm_dst_size  = L.dst_bytes;
             goto done_quant;
         } else {
@@ -5382,8 +5383,8 @@ static void ggml_hexagon_precompute_hvx_mm_params(
                     kparams->m_chunk        = (m_chunk < (uint32_t) src1_nrows) ? m_chunk : 0;
                     kparams->vtcm_size      = L.total_bytes;
                     kparams->vtcm_src0_size = L.src0_bytes;
-                    kparams->vtcm_src1_size = L.src1_bytes;
-                    kparams->vtcm_src2_size = L.src2_bytes;
+                    kparams->vtcm_act_size  = L.act_bytes;
+                    kparams->vtcm_bias_size = L.bias_bytes;
                     kparams->vtcm_dst_size  = L.dst_bytes;
                     goto done_quant;
                 }
@@ -5407,8 +5408,8 @@ static void ggml_hexagon_precompute_hvx_mm_params(
             kparams->act_row_size = hex_round_up(ne10 * 2, 128);
             kparams->vtcm_size = L.total_bytes;
             kparams->vtcm_src0_size = L.src0_bytes;
-            kparams->vtcm_src1_size = L.src1_bytes;
-            kparams->vtcm_src2_size = L.src2_bytes;
+            kparams->vtcm_act_size  = L.act_bytes;
+            kparams->vtcm_bias_size = L.bias_bytes;
             kparams->vtcm_dst_size = L.dst_bytes;
             kparams->n_prefetch = 16;
             return;
@@ -5429,8 +5430,8 @@ static void ggml_hexagon_precompute_hvx_mm_params(
             kparams->act_row_size = hex_round_up(ne10 * 4, 128);
             kparams->vtcm_size = L.total_bytes;
             kparams->vtcm_src0_size = L.src0_bytes;
-            kparams->vtcm_src1_size = L.src1_bytes;
-            kparams->vtcm_src2_size = L.src2_bytes;
+            kparams->vtcm_act_size  = L.act_bytes;
+            kparams->vtcm_bias_size = L.bias_bytes;
             kparams->vtcm_dst_size = L.dst_bytes;
             kparams->n_prefetch = 16;
             return;
@@ -6170,7 +6171,7 @@ static void ggml_hexagon_precompute_sort_params(
 static void ggml_hexagon_precompute_fused_mmnx_params(
     const struct ggml_hexagon_session * sess,
     const struct ggml_tensor * src0, // W0
-    const struct ggml_tensor * src1, // x
+    const struct ggml_tensor * act,  // x
     int32_t n_weights,
     struct htp_mm_kernel_params * kparams
 ) {
@@ -6182,10 +6183,10 @@ static void ggml_hexagon_precompute_fused_mmnx_params(
     const int ne02 = src0->ne[2];
     const int ne03 = src0->ne[3];
 
-    const int ne10 = src1->ne[0];
-    const int ne11 = src1->ne[1];
-    const int ne12 = src1->ne[2];
-    const int ne13 = src1->ne[3];
+    const int ne10 = act->ne[0];
+    const int ne11 = act->ne[1];
+    const int ne12 = act->ne[2];
+    const int ne13 = act->ne[3];
 
     const int wtype = src0->type;
     const bool is_repack = ggml_hexagon_is_repack_type((ggml_type) wtype);
@@ -6197,8 +6198,8 @@ static void ggml_hexagon_precompute_fused_mmnx_params(
     const bool is_batched = (ne02 * ne03 > 1 || ne12 * ne13 > 1);
 
     bool hmx_enabled = (sess->n_hmx > 0) && (opt_mm_select >= 2);
-    if (hmx_enabled && ggml_hexagon_matmul_is_hmx_eligible(src0, src1, nullptr, ne01_padded, false, is_batched)) {
-        if (ggml_hexagon_precompute_hmx_mm_params(sess, src0, src1, nullptr, wtype, ne00_padded, ne01_padded, ne02, ne11, ne12, ne11_padded, false, is_batched, 0, vtcm_budget, kparams)) {
+    if (hmx_enabled && ggml_hexagon_matmul_is_hmx_eligible(src0, act, nullptr, ne01_padded, false, is_batched)) {
+        if (ggml_hexagon_precompute_hmx_mm_params(sess, src0, act, nullptr, wtype, ne00_padded, ne01_padded, ne02, ne11, ne12, ne11_padded, false, is_batched, 0, vtcm_budget, kparams)) {
             kparams->n_weights = n_weights;
             goto finalize;
         }
@@ -6210,20 +6211,20 @@ static void ggml_hexagon_precompute_fused_mmnx_params(
     }
 
     {
-        const int src1_nrows = ne11 * ne12 * ne13;
-        const size_t src1_row_size = htp_mm_weight_has_offset(wtype) ? htp_mm_q8_1_tiled_row_size(ne10) : htp_mm_q8_0_tiled_row_size(ne10);
+        const int act_nrows = ne11 * ne12 * ne13;
+        const size_t act_row_size = htp_mm_weight_has_offset(wtype) ? htp_mm_q8_1_tiled_row_size(ne10) : htp_mm_q8_0_tiled_row_size(ne10);
         const size_t src0_row_size = src0->nb[1];
 
         uint32_t best_n_prefetch = 16;
 
         if (is_repack) {
-            const uint32_t max_prefetch = (src1_nrows > HTP_MM_HMX_MIN_NROWS) ? 2 : 16;
+            const uint32_t max_prefetch = (act_nrows > HTP_MM_HMX_MIN_NROWS) ? 2 : 16;
             best_n_prefetch = 2;
             for (uint32_t d = max_prefetch; d >= 2; d /= 2) {
                 struct htp_mm_hvx_vtcm_layout L;
                 htp_mm_hvx_vtcm_layout_build(
-                    &L, HTP_MM_KERNEL_HVX_QUANT_ROW, wtype, ne10, src1_nrows, sess->n_threads,
-                    0, src0_row_size, src1_row_size, 0, d, false, true
+                    &L, HTP_MM_KERNEL_HVX_QUANT_ROW, wtype, ne10, act_nrows, sess->n_threads,
+                    0, src0_row_size, act_row_size, 0, d, false, true
                 );
                 if (L.total_bytes <= sess->vtcm_size) {
                     best_n_prefetch = d;
@@ -6237,15 +6238,16 @@ static void ggml_hexagon_precompute_fused_mmnx_params(
 
         // Test tiled first
         htp_mm_hvx_vtcm_layout_build(
-            &L, HTP_MM_KERNEL_HVX_QUANT_ROW, wtype, ne10, src1_nrows, sess->n_threads,
-            0, src0_row_size, src1_row_size, 0, best_n_prefetch, false, true
+            &L, HTP_MM_KERNEL_HVX_QUANT_ROW, wtype, ne10, act_nrows, sess->n_threads,
+            0, src0_row_size, act_row_size, 0, best_n_prefetch, false, true
         );
 
         if (try_tiled && L.total_bytes <= sess->vtcm_size) {
-            kparams->kernel_type = HTP_MM_KERNEL_HVX_QUANT_ROW;
-            kparams->act_row_size   = src1_row_size;
+            kparams->kernel_type    = HTP_MM_KERNEL_HVX_QUANT_ROW;
+            kparams->act_row_size   = act_row_size;
             kparams->vtcm_src0_size = L.src0_bytes;
-            kparams->vtcm_src1_size = L.src1_bytes;
+            kparams->vtcm_act_size  = L.act_bytes;
+            kparams->vtcm_bias_size = 0;
             kparams->vtcm_dst_size  = L.dst_bytes;
             kparams->vtcm_size      = L.total_bytes;
             kparams->n_prefetch     = best_n_prefetch;
@@ -6267,12 +6269,12 @@ finalize:
 static void ggml_hexagon_precompute_fused_mmidnx_params(
     const struct ggml_hexagon_session * sess,
     const struct ggml_tensor * src0, // W0
-    const struct ggml_tensor * src1, // x
+    const struct ggml_tensor * act,  // x
     const struct ggml_tensor * dst,  // dst0
     int32_t n_weights,
     struct htp_mm_kernel_params * kparams
 ) {
-    ggml_hexagon_precompute_matmul_params_impl(sess, src0, src1, dst, 0, 0, kparams);
+    ggml_hexagon_precompute_matmul_params_impl(sess, src0, act, dst, 0, 0, kparams);
     kparams->n_weights = n_weights;
 }
 
