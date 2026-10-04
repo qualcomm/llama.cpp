@@ -547,6 +547,7 @@ static ADRENO_GPU_GEN get_adreno_gpu_gen(const char *device_name) {
 // which is how a new compiler gets re-verified without a rebuild.
 struct ggml_backend_opencl_context;
 static bool adreno_art_compiler_quirks(const ggml_backend_opencl_context *backend_ctx);
+static bool ggml_cl_kq_rowsplit_on(const ggml_backend_opencl_context * backend_ctx);
 
 // Should the narrow cok+dp4a programs (q4_K / q6_K / q4_0, ne1 2..4) be BUILT at all?
 // Default yes; GGML_OPENCL_COK_DP4A=0 skips the build as well as the dispatch, so opting
@@ -1397,6 +1398,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mat_f16_f32_l4_x8_pair = nullptr;
     cl_kernel kernel_mul_mat_f16_f32_l4_x8_gqa4 = nullptr;
     cl_kernel kernel_mul_mat_f16_f32_l4_x8_gqa4_img = nullptr;
+    cl_kernel kernel_mul_mat_f16_f32_l4_x8_gqa8_rs_img = nullptr;
     cl_kernel kernel_mul_mat_f16_f32_l4_x8_gqa_r4_img = nullptr;
     cl_kernel kernel_mul_mat_f16_f32_l4_x8_gqa_r2_dk256_img = nullptr;
     cl_kernel kernel_mul_mat_f16_f32_l4_x8_gqa_r8_dk256_img = nullptr;
@@ -6824,6 +6826,12 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         backend_ctx->kernel_mul_mat_f16_f32_l4_x8_gqa4_img =
             clCreateKernel(cl_program_for_kernel(backend_ctx, kernel_src, compile_opts, shared_l4, 10), "kernel_mul_mat_f16_f32_l4_x8_gqa4_img", &err_x8gi);
         if (err_x8gi != CL_SUCCESS) backend_ctx->kernel_mul_mat_f16_f32_l4_x8_gqa4_img = nullptr;
+        if (ggml_cl_kq_rowsplit_on(backend_ctx)) {
+            cl_int err_rs;
+            backend_ctx->kernel_mul_mat_f16_f32_l4_x8_gqa8_rs_img =
+                clCreateKernel(cl_program_for_kernel(backend_ctx, kernel_src, compile_opts, shared_l4, 16), "kernel_mul_mat_f16_f32_l4_x8_gqa8_rs_img", &err_rs);
+            if (err_rs != CL_SUCCESS) backend_ctx->kernel_mul_mat_f16_f32_l4_x8_gqa8_rs_img = nullptr;
+        }
         // r2=4 specialization (Llama-3.x / Qwen3-4B/8B / Qwen3.5-4B / etc.).
         // A compiler that needs split programs also miscompiles this one: permuted
         // n=1 nr=[4,1] f16/bf16 comes out wrong. It is an optional variant and the
@@ -18284,6 +18292,18 @@ static bool adreno_art_compiler_quirks(const ggml_backend_opencl_context *backen
     }
     const char * env = getenv("GGML_OPENCL_ART_QUIRKS");
     return !(env && env[0] == '0');
+}
+
+// Row-split decode KQ (kernel_mul_mat_f16_f32_l4_x8_gqa8_rs_img) in place of _x8_gqa4_img.
+// Measured on the Adreno 850 only: 2.3x at n_kv 4096 and 2.4x at 8192. The 840 loses with
+// it (up to -50% at n_kv 2048), so it stays off elsewhere. GGML_OPENCL_KQ_ROWSPLIT=0/1
+// overrides.
+static bool ggml_cl_kq_rowsplit_on(const ggml_backend_opencl_context * backend_ctx) {
+    static const char * env = getenv("GGML_OPENCL_KQ_ROWSPLIT");
+    if (env && env[0]) {
+        return env[0] != '0';
+    }
+    return adreno_art_compiler_quirks(backend_ctx);
 }
 
 // Default gate for the *dense* dp4a prefill GEMMs (gemm_noshuffle_*_q8_1_dp4a).
@@ -44671,6 +44691,18 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 kq_img_kernel = backend_ctx->kernel_mul_mat_f16_f32_l4_x8_gqa4_img;
             }
         }
+        // The row-split kernel takes n_it 8-row groups per workgroup, sized so the grid
+        // stays near 192 workgroups (16 per CU on the 850) at any KV length.
+        int64_t kq_rows_per_wg = 16;
+        int     kq_rs_n_it     = 0;
+        if (kq_img_kernel != nullptr &&
+            kq_img_kernel == backend_ctx->kernel_mul_mat_f16_f32_l4_x8_gqa4_img &&
+            backend_ctx->kernel_mul_mat_f16_f32_l4_x8_gqa8_rs_img != nullptr) {
+            const int64_t wg_per_head = std::max<int64_t>(1, 192 / (ne02 * ne13));
+            kq_rs_n_it     = (int)CEIL_DIV(CEIL_DIV(ne01, 8), wg_per_head);
+            kq_rows_per_wg = 8 * (int64_t)kq_rs_n_it;
+            kq_img_kernel  = backend_ctx->kernel_mul_mat_f16_f32_l4_x8_gqa8_rs_img;
+        }
         if (kq_img_kernel != nullptr) {
             const size_t nb00_bytes = sizeof(uint16_t);
             const size_t k_bytes_span =
@@ -44710,8 +44742,12 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(int),      &r2));
                     CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(int),      &r3));
 
+                    if (kq_rs_n_it > 0) {
+                        CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(int), &kq_rs_n_it));
+                    }
+
                     const int nth0_d = 64;
-                    const int64_t n_wg_x = ne01 / 16;
+                    const int64_t n_wg_x = CEIL_DIV(ne01, kq_rows_per_wg);
                     size_t global_work_size[] = {(size_t)n_wg_x * nth0_d, (size_t)1, (size_t)ne02 * ne13};
                     size_t local_work_size[]  = {(size_t)nth0_d, (size_t)1, 1};
                     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
