@@ -185,6 +185,7 @@ static const uint8_t __attribute__((aligned(VLEN))) kvalues_mxfp4_lut[] = {
     const struct htp_tensor * restrict src1 = octx->src[1];         \
     const struct htp_tensor * restrict src2 = octx->src[2];         \
     const struct htp_tensor * restrict  dst = octx->dst;            \
+    const struct htp_tensor * restrict  act = src1;                 \
                                                                     \
     const uint32_t ne00 = src0->ne[0];                              \
     const uint32_t ne01 = src0->ne[1];                              \
@@ -1677,7 +1678,7 @@ static int hvx_mm_matmul(struct htp_ops_context * octx) {
     struct htp_mm_context mmctx_struct = {0};
     struct htp_mm_context * mmctx = &mmctx_struct;
     mmctx->octx = octx;
-    mmctx->act = src1;
+    mmctx->act = act;
 
     const struct htp_mm_kernel_params * kparams = (const struct htp_mm_kernel_params *) octx->kernel_params;
 
@@ -1787,9 +1788,9 @@ static int hvx_mm_matmul(struct htp_ops_context * octx) {
 
     switch (kparams->kernel_type) {
         case HTP_MM_KERNEL_HVX_F16_F16_VTCM:
-            quant_task_func        = (src1->type == HTP_TYPE_F32) ? quantize_f32_f16 : quantize_f16_f16;
-            need_quant             = (src1->type == HTP_TYPE_F32);
-            mmctx->type            = (src1->type == HTP_TYPE_F32) ? "f32-f16" : "f16-f16";
+            quant_task_func        = (act->type == HTP_TYPE_F32) ? quantize_f32_f16 : quantize_f16_f16;
+            need_quant             = (act->type == HTP_TYPE_F32);
+            mmctx->type            = (act->type == HTP_TYPE_F32) ? "f32-f16" : "f16-f16";
             mmctx->vec_dot_1x1     = vec_dot_f16_f16_aa_1x1;
             mmctx->vec_dot_2x1     = vec_dot_f16_f16_aa_2x1;
             mmctx->vec_dot_2x2     = vec_dot_f16_f16_aa_2x2;
@@ -1862,8 +1863,8 @@ static int hvx_mm_matmul(struct htp_ops_context * octx) {
          L.src0_bytes, L.act_bytes, L.dst_bytes, vtcm_size);
 
     FARF(HIGH, "matmul-%s : %ux%ux%ux%u * %ux%ux%ux%u-> %ux%ux%ux%u (0x%p, 0x%p, 0x%p)\n", mmctx->type, src0->ne[0],
-         src0->ne[1], src0->ne[2], src0->ne[3], src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3], dst->ne[0],
-         dst->ne[1], dst->ne[2], dst->ne[3], src0->data, src1->data, dst->data);
+         src0->ne[1], src0->ne[2], src0->ne[3], act->ne[0], act->ne[1], act->ne[2], act->ne[3], dst->ne[0],
+         dst->ne[1], dst->ne[2], dst->ne[3], src0->data, act->data, dst->data);
 
     if (octx->ctx->vtcm_size < vtcm_size) {
         FARF(ERROR, "matmul-%s : current VTCM reservation %zu is too small, needed %zu\n", mmctx->type,
@@ -1877,10 +1878,6 @@ static int hvx_mm_matmul(struct htp_ops_context * octx) {
     mmctx->vtcm_bias     = VTCM_LAYOUT_PTR(uint8_t, base, L.off_bias);
     mmctx->vtcm_dst      = VTCM_LAYOUT_PTR(uint8_t, base, L.off_dst);
     mmctx->vtcm_act_raw  = VTCM_LAYOUT_PTR(uint8_t, base, L.off_act_raw);
-
-    octx->src1_spad.src  = NULL;
-    octx->src0_spad.src  = NULL;
-    octx->dst_spad.src   = NULL;
 
     mmctx->vtcm_src0_stride = src0_row_size_padded;
     mmctx->vtcm_act_stride  = act_row_size;
@@ -1901,7 +1898,7 @@ static int hvx_mm_matmul(struct htp_ops_context * octx) {
             mmctx->cur_m_rows  = cur_m_rows;
 
             if (need_quant) {
-                hvx_mm_transfer_act_dma(octx, kparams, src1, mmctx->vtcm_act_raw, mmctx->vtcm_act_raw_stride, m_start, cur_m_rows);
+                hvx_mm_transfer_act_dma(octx, kparams, act, mmctx->vtcm_act_raw, mmctx->vtcm_act_raw_stride, m_start, cur_m_rows);
 
                 const uint32_t qk = QK_Q8_0_TILED;
                 const uint32_t nb = (ne10 + qk - 1) / qk;
@@ -1927,7 +1924,7 @@ static int hvx_mm_matmul(struct htp_ops_context * octx) {
                 mmctx->n_quant_tasks = quant_tasks;
                 work_queue_run(octx->ctx->work_queue, q_func, mmctx, quant_tasks);
             } else {
-                hvx_mm_transfer_act_dma(octx, kparams, src1, mmctx->vtcm_act, mmctx->vtcm_act_stride, m_start, cur_m_rows);
+                hvx_mm_transfer_act_dma(octx, kparams, act, mmctx->vtcm_act, mmctx->vtcm_act_stride, m_start, cur_m_rows);
             }
 
             work_queue_run(octx->ctx->work_queue, matmul_job_func, mmctx, octx->n_threads);
@@ -1937,12 +1934,12 @@ static int hvx_mm_matmul(struct htp_ops_context * octx) {
         mmctx->cur_m_rows  = act_nrows;
 
         if (need_quant) {
-            hvx_mm_transfer_act_dma(octx, kparams, src1, mmctx->vtcm_act_raw, mmctx->vtcm_act_raw_stride, 0, act_nrows);
+            hvx_mm_transfer_act_dma(octx, kparams, act, mmctx->vtcm_act_raw, mmctx->vtcm_act_raw_stride, 0, act_nrows);
             mmctx->n_quant_rows_per_thread = (act_nrows + n_quant_tasks - 1) / n_quant_tasks;
             mmctx->n_quant_tasks = n_quant_tasks;
             work_queue_run(octx->ctx->work_queue, quant_task_func, mmctx, n_quant_tasks);
         } else {
-            hvx_mm_transfer_act_dma(octx, kparams, src1, mmctx->vtcm_act, mmctx->vtcm_act_stride, 0, act_nrows);
+            hvx_mm_transfer_act_dma(octx, kparams, act, mmctx->vtcm_act, mmctx->vtcm_act_stride, 0, act_nrows);
         }
 
         work_queue_run(octx->ctx->work_queue, matmul_job_func, mmctx, octx->n_threads);
@@ -3754,8 +3751,8 @@ static int hmx_mm_op_matmul(struct htp_ops_context * octx, const struct htp_mm_k
 
     int k = (int) src0->ne[0];
     int n = (int) src0->ne[1];
-    const int m_total    = (int) src1->ne[1];
-    const int act_stride = (int)(src1->nb[1] / sizeof(float));
+    const int m_total    = (int) act->ne[1];
+    const int act_stride = (int)(act->nb[1] / sizeof(float));
     const int wgt_stride = (int)(src0->nb[1] / sizeof(__fp16));
 
     int m_start = 0;
@@ -3786,7 +3783,7 @@ static int hmx_mm_op_matmul(struct htp_ops_context * octx, const struct htp_mm_k
 
     const int dst_stride = (int)(dst->nb[1] / sizeof(float));
     float       * dst_ptr = (float *) dst->data + m_start * dst_stride;
-    const dma_addr_t act_addr = src1->data + m_start * act_stride * sizeof(float);
+    const dma_addr_t act_addr = act->data + m_start * act_stride * sizeof(float);
 
     int ret = -1;
     const int n_threads = kparams->n_threads;
@@ -3811,8 +3808,8 @@ static int hmx_mm_op_matmul(struct htp_ops_context * octx, const struct htp_mm_k
             .ne13            = ne13,
             .src0_nb2        = src0->nb[2],
             .src0_nb3        = src0->nb[3],
-            .act_nb2         = src1->nb[2],
-            .act_nb3         = src1->nb[3],
+            .act_nb2         = act->nb[2],
+            .act_nb3         = act->nb[3],
             .dst_nb2         = dst->nb[2],
             .dst_nb3         = dst->nb[3],
             .bias_nb2        = src2_nb2,
@@ -3833,7 +3830,7 @@ static int hmx_mm_op_matmul(struct htp_ops_context * octx, const struct htp_mm_k
         ret = hmx_mm_2d_f32(
             octx->ctx, octx->ctx->dma[0], dst_ptr, src2_addr, src2_bytes,
             act_addr, src0->data,
-            m_rows, k, n, act_stride, (int) src0->nb[1], (int) src0->type, (int) src1->ne[0],
+            m_rows, k, n, act_stride, (int) src0->nb[1], (int) src0->type, (int) act->ne[0],
             dst_stride, src2_stride, (int)dst->ne[0],
             kparams->m_chunk, kparams->n_chunk, kparams->pipeline, n_threads,
             kparams->n_act_threads,
@@ -3879,14 +3876,14 @@ int op_matmul(struct htp_ops_context * octx) {
     const struct htp_mm_kernel_params * kparams = (const struct htp_mm_kernel_params *) octx->kernel_params;
 
     if (kparams->collapse) {
-        const struct htp_tensor * src1 = octx->src[1];
+        const struct htp_tensor * act  = octx->src[1];
         const struct htp_tensor * dst  = octx->dst;
-        const uint32_t s1 = (src1->ne[1] > 1) ? src1->nb[1] : ((src1->ne[2] > 1) ? src1->nb[2] : src1->nb[3]);
-        const uint32_t sd = (dst->ne[1]  > 1) ? dst->nb[1]  : ((dst->ne[2]  > 1) ? dst->nb[2]  : dst->nb[3]);
-        struct htp_tensor src1_collapsed, dst_collapsed;
-        htp_mm_tensor_collapse_rows(&src1_collapsed, src1, s1);
-        htp_mm_tensor_collapse_rows(&dst_collapsed,  dst,  sd);
-        octx->src[1] = &src1_collapsed;
+        const uint32_t s_act = (act->ne[1] > 1) ? act->nb[1] : ((act->ne[2] > 1) ? act->nb[2] : act->nb[3]);
+        const uint32_t sd    = (dst->ne[1] > 1) ? dst->nb[1] : ((dst->ne[2] > 1) ? dst->nb[2] : dst->nb[3]);
+        struct htp_tensor act_collapsed, dst_collapsed;
+        htp_mm_tensor_collapse_rows(&act_collapsed, act, s_act);
+        htp_mm_tensor_collapse_rows(&dst_collapsed, dst, sd);
+        octx->src[1] = &act_collapsed;
         octx->dst    = &dst_collapsed;
 
         struct htp_tensor src2_collapsed;
@@ -3898,7 +3895,7 @@ int op_matmul(struct htp_ops_context * octx) {
         }
 
         const int status = op_matmul_impl(octx);
-        octx->src[1] = src1;
+        octx->src[1] = act;
         octx->dst    = dst;
         if (src2) {
             octx->src[2] = src2;
@@ -3948,7 +3945,7 @@ static int hmx_mm_op_matmul_id(
         }
         if (m_start >= m_end) continue;
 
-        int ret = hmx_mm_id_2d_f32(octx->ctx, octx->ctx->dma[0], (float*) dst->data, (float*) src1->data,
+        int ret = hmx_mm_id_2d_f32(octx->ctx, octx->ctx->dma[0], (float*) dst->data, (float*) act->data,
                                    src0->data + cur_a * nb02,
                                    cne1, ne00, ne01,
                                    ne10,
@@ -4016,9 +4013,9 @@ static int hvx_mm_matmul_id(
          L.src0_bytes, L.act_bytes, L.dst_bytes, vtcm_size);
 
     FARF(HIGH, "matmul-id-%s : %ux%ux%ux%u * %ux%ux%ux%u (%ux%ux%ux%u) -> %ux%ux%ux%u (0x%p, 0x%p, 0x%p)\n", mmctx->type,
-         src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3], src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3],
+         src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3], act->ne[0], act->ne[1], act->ne[2], act->ne[3],
          ids->ne[0], ids->ne[1], ids->ne[2], ids->ne[3], dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3], src0->data,
-         src1->data, dst->data);
+         act->data, dst->data);
 
     // Make sure the reserved vtcm size is sufficient
     if (octx->ctx->vtcm_size < vtcm_size) {
@@ -4033,11 +4030,6 @@ static int hvx_mm_matmul_id(
     mmctx->vtcm_dst      = VTCM_LAYOUT_PTR(uint8_t, base, L.off_dst);
     mmctx->vtcm_act_raw  = VTCM_LAYOUT_PTR(uint8_t, base, L.off_act_raw);
 
-    octx->src1_spad.src  = NULL;
-    octx->src0_spad.src  = NULL;
-    octx->src2_spad.src  = NULL;
-    octx->dst_spad.src   = NULL;
-
     mmctx->vtcm_src0_stride    = src0_row_size_padded;
     mmctx->vtcm_act_stride     = act_row_size;
     mmctx->vtcm_act_raw_stride = hex_round_up(ne10 * sizeof(float), QK_Q8_0_TILED * sizeof(float));
@@ -4051,7 +4043,7 @@ static int hvx_mm_matmul_id(
 
     htp_trace_event_stop(tr, HTP_TRACE_EVT_INIT, 0);
 
-    hvx_mm_transfer_act_dma(octx, kparams, src1, mmctx->vtcm_act_raw, mmctx->vtcm_act_raw_stride, 0, act_nrows);
+    hvx_mm_transfer_act_dma(octx, kparams, act, mmctx->vtcm_act_raw, mmctx->vtcm_act_raw_stride, 0, act_nrows);
 
     mmctx->n_quant_rows_per_thread = (act_nrows + n_quant_tasks - 1) / n_quant_tasks;
     mmctx->n_quant_tasks = n_quant_tasks;
@@ -4190,12 +4182,6 @@ static int hvx_mm_matmul_id_nx(
     mmctx->vtcm_dst      = VTCM_LAYOUT_PTR(uint8_t, base, L.off_dst);
     mmctx->vtcm_act_raw  = VTCM_LAYOUT_PTR(uint8_t, base, L.off_act_raw);
 
-    octx->src0_spad.src = NULL;
-    octx->src1_spad.src = NULL;
-    octx->src2_spad.src = NULL;
-    octx->src3_spad.src = NULL;
-    octx->dst_spad.src  = NULL;
-
     mmctx->vtcm_src0_stride    = 0;
     mmctx->vtcm_act_stride     = act_row_size;
     mmctx->vtcm_act_raw_stride = hex_round_up(act->ne[0] * sizeof(float), QK_Q8_0_TILED * sizeof(float));
@@ -4308,10 +4294,10 @@ int op_matmul_id(struct htp_ops_context * octx) {
     htp_trace_event_start(tr, HTP_TRACE_EVT_INIT, 0);
 
     mmctx->octx = octx;
-    mmctx->act = src1;
+    mmctx->act = act;
 
     const struct htp_tensor * restrict ids = octx->src[2];
-    if (htp_tensor_is_extended(ids) || htp_tensor_is_extended(src1) || htp_tensor_is_extended(dst)) {
+    if (htp_tensor_is_extended(ids) || htp_tensor_is_extended(act) || htp_tensor_is_extended(dst)) {
         return HTP_STATUS_NO_SUPPORT;
     }
 
@@ -4321,7 +4307,7 @@ int op_matmul_id(struct htp_ops_context * octx) {
     const size_t src0_row_size_padded = hex_round_up(src0_row_size, 128);
 
     const uint32_t src0_nrows = ne01;  // per expert
-    const uint32_t src1_nrows = ne11 * ne12 * ne13;
+    const uint32_t act_nrows  = ne11 * ne12 * ne13;
 
     // row groups
     const int n_ids = ids->ne[0];  // n_expert_used
@@ -4332,7 +4318,7 @@ int op_matmul_id(struct htp_ops_context * octx) {
     uint32_t * matrix_row_counts = (uint32_t *) mapping_buf;
     struct mmid_row_mapping * matrix_rows = NULL;
 
-    if (src1_nrows > 1) {
+    if (act_nrows > 1) {
         const size_t matrix_row_counts_size = n_as * sizeof(uint32_t);
         assert(octx->ctx->ddr_spad_size >= matrix_row_counts_size);
 
@@ -4366,9 +4352,9 @@ int op_matmul_id(struct htp_ops_context * octx) {
     mmctx->mapping_stride       = mapping_stride;
     mmctx->mm_div_ne11          = kparams->div_ne1;
     mmctx->src0_row_size_padded = src0_row_size_padded;
-    mmctx->act_nrows            = src1_nrows;
+    mmctx->act_nrows            = act_nrows;
     mmctx->cur_m_start          = 0;
-    mmctx->cur_m_rows           = src1_nrows;
+    mmctx->cur_m_rows           = act_nrows;
 
     htp_trace_event_stop(tr, HTP_TRACE_EVT_INIT, 0);
 
@@ -4400,7 +4386,7 @@ int op_matmul_id(struct htp_ops_context * octx) {
         mmctx->src0_nrows_per_thread = hex_round_up(mmctx->src0_nrows_per_thread, 32);
 
         if (hvx_mm_init_vec_dot(mmctx, src0->type) == 0) {
-            s = hvx_mm_matmul_id(octx, mmctx, src1_nrows > 1 ? hvx_mm_id : hvx_mv_id);
+            s = hvx_mm_matmul_id(octx, mmctx, act_nrows > 1 ? hvx_mm_id : hvx_mv_id);
         } else {
             s = HTP_STATUS_NO_SUPPORT;
         }
@@ -4598,12 +4584,6 @@ static int op_matmul_nx_impl(struct htp_ops_context * octx) {
     mmctx->vtcm_act      = VTCM_LAYOUT_PTR(uint8_t, base, L.off_act);
     mmctx->vtcm_dst      = VTCM_LAYOUT_PTR(uint8_t, base, L.off_dst);
     mmctx->vtcm_act_raw  = VTCM_LAYOUT_PTR(uint8_t, base, L.off_act_raw);
-
-    octx->src0_spad.src  = NULL;
-    octx->src1_spad.src  = NULL;
-    octx->src2_spad.src  = NULL;
-    octx->src3_spad.src  = NULL;
-    octx->dst_spad.src   = NULL;
 
     mmctx->vtcm_src0_stride    = is_repacked ? 0 : src0_row_size_padded;
     mmctx->vtcm_act_stride     = act_row_size;
