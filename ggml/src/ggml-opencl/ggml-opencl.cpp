@@ -10469,8 +10469,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
     std::string CL_moe_compile_opts = std::string("-cl-std=") + opencl_c_std +
             " -cl-mad-enable "
             " -cl-fast-relaxed-math";
-    // The q4_0/q4_1 MoE GEMMs (f32 and dp4a) get wrong values from the start of their local
-    // tiles on the E17 compiler (Adreno 850); see MOE_LM_PAD in those kernels.
+    // The MoE GEMMs (f32 and dp4a) get wrong values from the start of their local tiles on
+    // the E17 compiler (Adreno 850); see MOE_LM_PAD in those kernels.
     if (adreno_art_compiler_quirks(backend_ctx)) {
         CL_moe_compile_opts += " -DMOE_LM_PAD=1";
     }
@@ -18400,17 +18400,18 @@ inline bool use_adreno_moe_kernels(const ggml_backend_opencl_context *backend_ct
     // Keep both rules. The name roster and the compiler-version quirk catch different parts,
     // and an unknown part that neither recognises must still land on the safe side.
     //
-    // E17 (Adreno 850), revisited: the convert is NOT miscompiled there on the current
-    // driver -- the q4_0 and q4_1 trans4_ns converts are bit-exact against a host reference
-    // at Qwen3-30B-A3B shapes. The garbage came from the MoE GEMMs (f32 and dp4a) reading
-    // wrong values from the start of their local tiles, fixed by MOE_LM_PAD. q4_0 and q4_1 take the layout on
-    // E17 (checked: MUL_MAT_ID 82/82 and 75/75, granite-3.0-3B-A800M Q4_0 PPL 13.4235 vs
-    // CPU 13.4279); every other type stays declined there until it is checked the same way.
+    // E17 (Adreno 850), revisited: the converts are NOT miscompiled there on the current
+    // driver -- the q4_0 and q4_1 trans4_ns converts are bit-exact against a host reference,
+    // and every type below survives a set_tensor/get_tensor round trip byte for byte. The
+    // garbage came from the MoE GEMMs reading wrong values from the start of their local
+    // tiles, fixed by MOE_LM_PAD. Checked on the 850: MUL_MAT_ID and the fused GLU / weighted
+    // cases for each type; granite-3.0-3B-A800M PPL against the CPU for Q4_0, Q4_K_M (q4_K +
+    // q6_K experts) and MXFP4. q5_K is still declined there: its round trip differs on E17
+    // (but not on the Adreno 840).
     if ((backend_ctx && (backend_ctx->adreno_gen == ADRENO_GPU_GEN::A6X ||
                          backend_ctx->adreno_gen == ADRENO_GPU_GEN::A7X ||
                          backend_ctx->adreno_gen == ADRENO_GPU_GEN::ADRENO_UNKNOWN)) ||
-        (adreno_art_compiler_quirks(backend_ctx) &&
-         tensor->type != GGML_TYPE_Q4_0 && tensor->type != GGML_TYPE_Q4_1)) {
+        (adreno_art_compiler_quirks(backend_ctx) && tensor->type == GGML_TYPE_Q5_K)) {
         return false;
     }
     int ne01 = tensor->ne[1];
