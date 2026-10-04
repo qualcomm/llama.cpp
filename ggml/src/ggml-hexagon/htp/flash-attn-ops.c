@@ -2534,6 +2534,7 @@ int op_flash_attn_ext(struct htp_ops_context * octx) {
         const uint32_t n_kv_heads = k->ne[2];
         const bool can_split      = htp_tensor_mdev_data_aligned(dst) && ((dst->nb[1] & (HTP_TENSOR_MDEV_LINE_SIZE - 1)) == 0);
 
+        // head range is contiguous in flat row space only when neq3 == 1
         if (kparams->head_split && can_split && neq3 == 1 && n_kv_heads >= mdev_count && n_kv_heads % mdev_count == 0) {
             const uint32_t G              = kparams->G;
             const uint32_t kv_per_core    = n_kv_heads / mdev_count;
