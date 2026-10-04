@@ -47795,10 +47795,12 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     const bool mm_kqv_gqa_off = (mm_kqv_gqa_env != nullptr && mm_kqv_gqa_env[0] == '0');
                     // Minimum n_kv for the coalesced KQV to pay off (see the gate below).
                     // GGML_OPENCL_MM_KQV_GQA_MIN_KV retunes it per device.
-                    static const int mm_kqv_gqa_min_kv = []{
+                    // The Adreno 850 crosses over much earlier than the X2-90: per call,
+                    // n_kv 1024 42 -> 36 us, 4096 170 -> 80 us (512 is 28 -> 30).
+                    static const int mm_kqv_gqa_min_kv = [backend_ctx]{
                         static const char * const e = getenv("GGML_OPENCL_MM_KQV_GQA_MIN_KV");
                         const int v = (e && e[0]) ? atoi(e) : 0;
-                        return v > 0 ? v : 8192;
+                        return v > 0 ? v : (adreno_art_compiler_quirks(backend_ctx) ? 1024 : 8192);
                     }();
                     if (can_multi_out && (ne01 % 16) == 0 && ne00 == 128 && r2 == 8 && r3 == 1 && mm_kq_gqa_on &&
                         backend_ctx->kernel_mul_mat_f16_f32_l4_x8_gqa4 != nullptr) {
