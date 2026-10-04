@@ -3915,6 +3915,45 @@ struct test_add_add : public test_case {
 };
 
 // GGML_OP_ADD + GGML_OP_RMS_NORM (fused operation)
+// GGML_OP_ADD -> GGML_OP_RMS_NORM -> GGML_OP_MUL with the add reused afterwards: the residual add in
+// front of every pre-norm, whose sum is both normalised and carried on as the residual stream.
+struct test_add_rms_norm_mul : public test_case {
+    const std::array<int64_t, 4> ne;
+    const float eps;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "ADD_RMS_NORM_MUL";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR2(ne, eps);
+    }
+
+    test_add_rms_norm_mul(std::array<int64_t, 4> ne = {2048, 1, 1, 1}, float eps = 1e-6f)
+        : ne(ne), eps(eps) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_name(a, "a");
+        ggml_tensor * b = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_name(b, "b");
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0]);
+        ggml_set_name(w, "w");
+
+        ggml_tensor * sum = ggml_add(ctx, a, b);
+        ggml_set_name(sum, "sum");
+        ggml_tensor * normed = ggml_mul(ctx, ggml_rms_norm(ctx, sum, eps), w);
+        ggml_set_name(normed, "normed");
+
+        ggml_tensor * out = ggml_add(ctx, normed, sum);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_add_rms_norm : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne;
@@ -10030,6 +10069,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 1536, 1, 1, 1 }, 1e-6f, false, false, true));
+    for (auto ne : std::vector<std::array<int64_t, 4>>{ {2048, 1, 1, 1}, {2048, 7, 1, 1}, {2048, 512, 1, 1}, {4096, 3, 2, 1}, {64, 5, 4, 3} }) {
+        test_cases.emplace_back(new test_add_rms_norm_mul(ne));
+    }
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 256, 4, 1, 1 }, 1e-6f, false, false, true));
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 256, 4, 3, 2 }, 1e-6f, false, false, true));
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 256, 4, 3, 2 }, 1e-6f, false, false, true, false, true));
