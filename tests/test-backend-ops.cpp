@@ -10546,6 +10546,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 16, 16, 256, {2, 3}, {1, 1}, {0, 1, 3, 2}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 16, 16, 256, {2, 3}, {1, 1}, {0, 3, 2, 1}));
 
+    // decode attention without flash attention, head dim 128, gqa 8 (Qwen3-30B-A3B): KQ and KQV
+    // for one query row over the n_kv range where backends switch decode kernels. 4112 leaves a
+    // partial last workgroup on kernels that tile the KV rows.
+    for (int n_kv : {256, 1024, 2048, 4096, 4112, 8192}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, n_kv, 1, 128, {4, 1}, {8, 1}, {0, 2, 1, 3}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 128, 1, n_kv, {4, 1}, {8, 1}, {0, 2, 1, 3}));
+    }
+
     // token-tile boundary coverage. With n_used == n_mats every token routes to every expert, so
     // each expert receives exactly n rows, with no dependence on the random draw. mul_mm_id is used
     // from 32 tokens up: n = 32, 33, 47, 48, 49 reach it, leaving a last tile of 32, 1, 15, 16 and
