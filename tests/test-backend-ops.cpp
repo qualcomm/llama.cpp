@@ -11321,6 +11321,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},  1025,  64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 16384,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
 
+    // f16 KV decode at DK=128 with wide gqa groups, past the n_kv where backends switch to a
+    // split-KV decode: gqa 8 (Qwen3-30B-A3B, 4 KV heads) and gqa 16 (Nemotron-H, 2 KV heads),
+    // with a ragged KV length, ALiBi slopes (indexed by query head), a broadcast batch, and
+    // sinks with softcap.
+    for (int64_t nr2 : {8, 16}) {
+        const int64_t nh = nr2 == 8 ? 4 : 2;
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, nh, {nr2, 1}, 4096, 1, true, false, 0,    0,     GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, nh, {nr2, 1}, 4099, 1, true, false, 0,    0,     GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, nh, {nr2, 1}, 4096, 1, true, false, 8.0f, 0,     GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, nh, {nr2, 2}, 4096, 1, true, false, 0,    0,     GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, nh, {nr2, 1}, 4096, 1, true, true,  0,    10.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    }
+
     // MLA shape: the V cache is a sub-view of the K cache, with quantized KV
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {8, 1},  113,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true));
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {8, 1}, 1024,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true));
