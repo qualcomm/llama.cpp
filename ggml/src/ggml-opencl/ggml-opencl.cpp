@@ -17487,13 +17487,6 @@ static void ggml_backend_opencl_exec_graph_nodes(ggml_backend_t backend, ggml_cg
             }
         }
 
-        // Fuse rms_norm + mul(weight) + add(residual). Default on; opt out with
-        // GGML_OPENCL_FUSE_RMS_ADD=0 (kept separate from the rms_norm+mul fuse so
-        // the residual fold can be A/B'd in isolation).
-        // Fuse rms_norm + mul(weight) + add(residual) + mul(scalar) — Gemma-4's
-        // per-layer l_out = (post_norm residual) * layer_output_scale. Checked
-        // before the 3-op rms+mul+add so the longer pattern wins. Opt out with
-        // GGML_OPENCL_FUSE_RMS_ADD_SCALE=0.
         // add + rms_norm + mul(weight): the residual add before every pre-norm. Opt out with
         // GGML_OPENCL_FUSE_ADD_RMS=0.
         static const bool fuse_add_rms = []{
@@ -17506,6 +17499,13 @@ static void ggml_backend_opencl_exec_graph_nodes(ggml_backend_t backend, ggml_cg
             continue;
         }
 
+        // Fuse rms_norm + mul(weight) + add(residual). Default on; opt out with
+        // GGML_OPENCL_FUSE_RMS_ADD=0 (kept separate from the rms_norm+mul fuse so
+        // the residual fold can be A/B'd in isolation).
+        // Fuse rms_norm + mul(weight) + add(residual) + mul(scalar) — Gemma-4's
+        // per-layer l_out = (post_norm residual) * layer_output_scale. Checked
+        // before the 3-op rms+mul+add so the longer pattern wins. Opt out with
+        // GGML_OPENCL_FUSE_RMS_ADD_SCALE=0.
         static const bool fuse_rms_add_scale = []{
             const char * e = std::getenv("GGML_OPENCL_FUSE_RMS_ADD_SCALE");
             return !e || e[0] == '\0' || e[0] != '0';
