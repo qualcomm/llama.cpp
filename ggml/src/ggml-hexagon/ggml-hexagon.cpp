@@ -7369,12 +7369,14 @@ static bool is_mergeable_mul_mat(const ggml_tensor * t) {
 
     const ggml_tensor * src0 = t->src[0];
     const ggml_tensor * src1 = t->src[1];
-    if (src1->type != GGML_TYPE_F32) return false;
     if (src0->ne[2] != 1 || src0->ne[3] != 1) return false;
 
     if (mm_is_hmx_eligible(t)) {
         return ggml_hexagon_is_hmx_weight_type(src0->type);
     }
+
+    // HVX path requires F32 activations and repacked weights (except Q6_K)
+    if (src1->type != GGML_TYPE_F32) return false;
 
     return ggml_hexagon_is_repack_type(src0->type) && src0->type != GGML_TYPE_Q6_K;
 }
