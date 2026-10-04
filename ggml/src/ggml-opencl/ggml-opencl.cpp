@@ -10468,6 +10468,11 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
     std::string CL_moe_compile_opts = std::string("-cl-std=") + opencl_c_std +
             " -cl-mad-enable "
             " -cl-fast-relaxed-math";
+    // The q4_0/q4_1 f32 MoE GEMMs lose the first element of their local B tile on the
+    // E17 compiler (Adreno 850); see MOE_LM_PAD in those kernels.
+    if (adreno_art_compiler_quirks(backend_ctx)) {
+        CL_moe_compile_opts += " -DMOE_LM_PAD=1";
+    }
 
     // Diagnostic: build the ragged MoE GEMM partial-tile loop with the same
     // fully-unrolled compile-time-constant token index the full-tile loop uses,
