@@ -5228,7 +5228,7 @@ static bool ggml_hexagon_matmul_is_hmx_eligible(
 static bool ggml_hexagon_precompute_hmx_mm_params(
     const struct ggml_hexagon_session * sess,
     const struct ggml_tensor * src0,
-    const struct ggml_tensor * src1,
+    const struct ggml_tensor * act,
     const struct ggml_tensor * dst,
     int wtype,
     int ne00_padded,
@@ -5245,19 +5245,16 @@ static bool ggml_hexagon_precompute_hmx_mm_params(
 ) {
     const int aligned_tile_size = htp_mm_get_weight_aligned_tile_size(wtype);
     const int n_threads = (int)sess->n_threads;
-    const int ne10 = src1->ne[0];
+    const int ne10 = act->ne[0];
 
     int m_for_solver = ne11;
     int m_for_solver_padded = ne11_padded;
+    // matmul_id partitions by expert; regular matmul partitions M rows (ne11) across devices
     if (!is_matmul_id && sess->mdev.count > 1 && ((uint32_t) ne11 >= sess->mdev.count)) {
-        bool can_row_split = false;
-        if (dst) {
-            can_row_split = ((dst->nb[1] & 127) == 0);
-        } else {
-            const size_t dst_nb1 = (size_t) ne01_padded * sizeof(float);
-            can_row_split = ((dst_nb1 & 127) == 0);
-        }
-        if (can_row_split) {
+        const bool dst_row_split = dst ? ((dst->nb[1] & 127) == 0)
+                                       : ((((size_t) ne01_padded * sizeof(float)) & 127) == 0);
+        const bool act_row_split = ((act->nb[1] & 127) == 0);
+        if (dst_row_split && act_row_split) {
             m_for_solver = (ne11 + (int) sess->mdev.count - 1) / (int) sess->mdev.count;
             m_for_solver_padded = hex_round_up(std::max(m_for_solver, 32), 32);
         }
