@@ -18384,10 +18384,18 @@ inline bool use_adreno_moe_kernels(const ggml_backend_opencl_context *backend_ct
     //
     // Keep both rules. The name roster and the compiler-version quirk catch different parts,
     // and an unknown part that neither recognises must still land on the safe side.
+    //
+    // E17 (Adreno 850), revisited: the convert is NOT miscompiled there on the current
+    // driver -- the q4_0 and q4_1 trans4_ns converts are bit-exact against a host reference
+    // at Qwen3-30B-A3B shapes. The garbage came from the f32 MoE GEMMs dropping the first
+    // element of their local B tile, fixed by MOE_LM_PAD. q4_0 and q4_1 take the layout on
+    // E17 (checked: MUL_MAT_ID 82/82 and 75/75, granite-3.0-3B-A800M Q4_0 PPL 13.4235 vs
+    // CPU 13.4279); every other type stays declined there until it is checked the same way.
     if ((backend_ctx && (backend_ctx->adreno_gen == ADRENO_GPU_GEN::A6X ||
                          backend_ctx->adreno_gen == ADRENO_GPU_GEN::A7X ||
                          backend_ctx->adreno_gen == ADRENO_GPU_GEN::ADRENO_UNKNOWN)) ||
-        adreno_art_compiler_quirks(backend_ctx)) {
+        (adreno_art_compiler_quirks(backend_ctx) &&
+         tensor->type != GGML_TYPE_Q4_0 && tensor->type != GGML_TYPE_Q4_1)) {
         return false;
     }
     int ne01 = tensor->ne[1];
@@ -50883,9 +50891,11 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     // #27768); the routing threshold above only arbitrates between the SOURCE
                     // dp4a GEMM and the ILA bin kernel, which is what it was measured against.
                     const bool dp4a_bin_available = backend_ctx->kernel_gemm_moe_q4_0_q8_1_dp4a_bin != nullptr;
+                    // Off on E17 (Adreno 850): the dp4a MoE GEMM still returns wrong results there
+                    // (MUL_MAT_ID q4_0 14/82 even with MOE_LM_PAD); the f32 GEMM is correct.
                     const bool use_moe_dp4a = q4_0_moe_dp4a_env
                         ? (atoi(q4_0_moe_dp4a_env) != 0)
-                        : (backend_ctx->adreno_dp4a_moe()
+                        : (backend_ctx->adreno_dp4a_moe() && !adreno_art_compiler_quirks(backend_ctx)
                            && (dp4a_bin_available || !bin_available || moe_routings < moe_bin_min));
                     const bool use_bin_kernel = bin_available && !use_moe_dp4a;
 
@@ -51245,7 +51255,8 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     const bool use_q41_dp4a = backend_ctx->kernel_gemm_moe_q4_1_q8_1_dp4a != nullptr &&
                         (q4_1_moe_dp4a_env
                             ? (atoi(q4_1_moe_dp4a_env) != 0)
-                            : (backend_ctx->adreno_dp4a_moe() && !backend_ctx->kernel_gemm_moe_q4_1_f32_ns_bin));
+                            : (backend_ctx->adreno_dp4a_moe() && !adreno_art_compiler_quirks(backend_ctx) &&
+                               !backend_ctx->kernel_gemm_moe_q4_1_f32_ns_bin));
                     static const char * q41_dispatch_log_env = getenv("GGML_OPENCL_MOE_DISPATCH_LOG");
                     if (q41_dispatch_log_env && atoi(q41_dispatch_log_env) != 0) {
                         static int last_logged = -1;
