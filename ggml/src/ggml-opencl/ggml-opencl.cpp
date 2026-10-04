@@ -1710,6 +1710,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_moe_scatter_det = nullptr;      // diagnostic: deterministic slot assignment
     cl_kernel kernel_moe_scatter_stable = nullptr;   // deterministic slot assignment, one workgroup per expert
     cl_kernel kernel_mul_mv_id_q4_0_f32_8x_flat;
+    int       moe_flat_ndst = 8;   // rows per subgroup the flat q4_0 MoE GEMV was built with
     cl_kernel kernel_mul_mv_id_q8_0_f32, kernel_mul_mv_id_q8_0_f32_flat;
     cl_kernel kernel_mul_mv_id_mxfp4_f32;
     cl_kernel kernel_mul_mv_id_mxfp4_f32_flat;
@@ -8752,8 +8753,19 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #else
         const std::string kernel_src = read_file("mul_mv_id_q4_0_f32_8x_flat.cl");
 #endif
+        // Rows per subgroup: 4 on the E17 compiler (Adreno 850), where it is measured faster,
+        // 8 elsewhere. GGML_OPENCL_MOE_FLAT_NDST overrides (2, 4, 8 or 16).
+        backend_ctx->moe_flat_ndst = adreno_art_compiler_quirks(backend_ctx) ? 4 : 8;
+        if (const char * e = getenv("GGML_OPENCL_MOE_FLAT_NDST")) {
+            const int v = atoi(e);
+            if (v == 2 || v == 4 || v == 8 || v == 16) {
+                backend_ctx->moe_flat_ndst = v;
+            }
+        }
+        const std::string flat_opts = backend_ctx->moe_flat_ndst == 8 ? compile_opts
+            : compile_opts + " -DMOE_NDST=" + std::to_string(backend_ctx->moe_flat_ndst);
         backend_ctx->program_mul_mv_id_q4_0_f32_8x_flat =
-            build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+            build_program_from_source(backend_ctx, kernel_src.c_str(), flat_opts);
 
         CL_CHECK((backend_ctx->kernel_mul_mv_id_q4_0_f32_8x_flat = clCreateKernel(backend_ctx->program_mul_mv_id_q4_0_f32_8x_flat, "kernel_mul_mv_id_q4_0_f32_8x_flat", &err), err));
         GGML_LOG_CONT(".");
@@ -51094,7 +51106,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
             } else if (backend_ctx->gpu_family == ADRENO) {
                 sgs  = 64;
                 nsg  = 1;
-                ndst = 8;
+                ndst = backend_ctx->moe_flat_ndst;
             } else {
                 GGML_ASSERT(false && "TODO: Unknown GPU");
             }
