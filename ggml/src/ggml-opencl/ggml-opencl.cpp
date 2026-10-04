@@ -5101,8 +5101,16 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #else
         const std::string kernel_src = read_file("cvt.cl");
 #endif
+        // The E17 compiler (Adreno 850) carries a printf in any program into every program
+        // it compiles afterwards in the same process, and the driver then allocates and
+        // zeroes a 1 MB printf buffer on each dispatch of those kernels: ~300 us per enqueue
+        // against ~50 us. cvt.cl is built early and holds the only printfs that compile on
+        // E17 (the q4_0/q4_1/q5_0/q5_1 noshuffle workaround for older compilers), so drop
+        // them there.
+        const std::string cvt_opts = adreno_art_compiler_quirks(backend_ctx)
+            ? compile_opts + " -DGGML_CL_NO_PRINTF_WA" : compile_opts;
         backend_ctx->program_cvt =
-            build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+            build_program_from_source(backend_ctx, kernel_src.c_str(), cvt_opts);
 
         CL_CHECK((backend_ctx->kernel_convert_block_q1_0  = clCreateKernel(backend_ctx->program_cvt, "kernel_convert_block_q1_0", &err), err));
         CL_CHECK((backend_ctx->kernel_restore_block_q1_0  = clCreateKernel(backend_ctx->program_cvt, "kernel_restore_block_q1_0", &err), err));
