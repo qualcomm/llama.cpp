@@ -1,3 +1,5 @@
+#define _USE_MATH_DEFINES
+
 #include <assert.h>
 #include <inttypes.h>
 #include <stdio.h>
@@ -23,6 +25,10 @@
 #include <algorithm>
 #include <cmath>
 #include <initializer_list>
+
+#ifndef M_LOG2E
+#    define M_LOG2E 1.44269504088896340736
+#endif
 
 #ifdef _WIN32
 #    define WIN32_LEAN_AND_MEAN
@@ -5340,6 +5346,9 @@ static void ggml_hexagon_precompute_hvx_mm_params(
 
     kparams->n_hmx = 0;
     kparams->n_threads = sess->n_threads;
+
+    GGML_UNUSED(ne02);
+    GGML_UNUSED(ne03);
 
     const bool is_quant = (wtype != GGML_TYPE_F16 && wtype != GGML_TYPE_F32);
     const int src1_nrows = ne11 * ne12 * ne13;
