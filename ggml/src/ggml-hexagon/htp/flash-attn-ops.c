@@ -1879,13 +1879,12 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
     }
 
     factx.has_softcap   = (kparams->logit_softcap != 0.0f);
-    if (!factx.has_softcap) {
-        factx.scale = (__fp16) (kparams->scale * EXP_LOG2E_F);  // log2(e)
-    } else {
-        factx.scale = (__fp16) kparams->scale;
-    }
+    factx.scale         = (__fp16) kparams->scale;
     factx.max_bias      = kparams->max_bias;
-    factx.logit_softcap = factx.has_softcap ? (__fp16) (kparams->logit_softcap * EXP_LOG2E_F) : 0;
+    factx.logit_softcap = 0;
+    if (factx.has_softcap) {
+        factx.logit_softcap = (__fp16) kparams->logit_softcap;
+    }
 
     factx.n_head_log2 = kparams->n_head_log2;
     factx.m0          = kparams->m0;
@@ -2503,7 +2502,10 @@ int op_flash_attn_ext(struct htp_ops_context * octx) {
     factx.scale = kparams->scale;
     factx.max_bias = kparams->max_bias;
     factx.has_softcap = (kparams->logit_softcap != 0.0f);
-    factx.logit_softcap = factx.has_softcap ? (__fp16) kparams->logit_softcap : 0;
+    factx.logit_softcap = 0;
+    if (factx.has_softcap) {
+        factx.logit_softcap = (__fp16) kparams->logit_softcap;
+    }
 
     factx.n_head_log2 = kparams->n_head_log2;
     factx.m0          = kparams->m0;

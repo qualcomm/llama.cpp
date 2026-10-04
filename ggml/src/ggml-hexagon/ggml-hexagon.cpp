@@ -4942,6 +4942,13 @@ static bool ggml_hexagon_precompute_flash_attn_params(
         int ret = hmx_fa_find_chunk_size(&Br, &Bc, G, DK_pad, DV_pad, neq1, nek1, sess->vtcm_size, sess->n_threads, (q->type == GGML_TYPE_F32), sinks != nullptr, n_head);
         if (ret == 0) {
             kparams->kernel_type = HTP_FA_KERNEL_HMX;
+            if (logit_softcap == 0.0f) {
+                kparams->scale = scale * (float) M_LOG2E;
+                kparams->logit_softcap = 0.0f;
+            } else {
+                kparams->scale = scale;
+                kparams->logit_softcap = logit_softcap * (float) M_LOG2E;
+            }
             kparams->Br = Br;
             kparams->Bc = Bc;
             kparams->n_kv_blocks = (nek1 + Bc - 1) / Bc;
