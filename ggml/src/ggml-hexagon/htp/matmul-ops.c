@@ -3887,8 +3887,8 @@ int op_matmul(struct htp_ops_context * octx) {
     if (kparams->collapse) {
         const struct htp_tensor * src1 = octx->src[1];
         const struct htp_tensor * dst  = octx->dst;
-        const uint32_t s1 = (src1->ne[1] > 1) ? src1->nb[1] : ((src1->ne[2] > 1) ? src1->nb[2] : src1->nb[1]);
-        const uint32_t sd = (dst->ne[1]  > 1) ? dst->nb[1]  : ((dst->ne[2]  > 1) ? dst->nb[2]  : dst->nb[1]);
+        const uint32_t s1 = (src1->ne[1] > 1) ? src1->nb[1] : ((src1->ne[2] > 1) ? src1->nb[2] : src1->nb[3]);
+        const uint32_t sd = (dst->ne[1]  > 1) ? dst->nb[1]  : ((dst->ne[2]  > 1) ? dst->nb[2]  : dst->nb[3]);
         struct htp_tensor src1_collapsed, dst_collapsed;
         htp_mm_tensor_collapse_rows(&src1_collapsed, src1, s1);
         htp_mm_tensor_collapse_rows(&dst_collapsed,  dst,  sd);
