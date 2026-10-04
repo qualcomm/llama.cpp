@@ -4002,7 +4002,7 @@ static int hmx_mm_op_matmul_id(
     }
     const bool expert_split = mdev_split && (n_active >= octx->ctx->mdev.count);
 
-    uint32_t active_idx = 0;
+    uint32_t target_dev = 0;
     for (uint32_t cur_a = 0; cur_a < (uint32_t) n_as; ++cur_a) {
         const int32_t cne1 = matrix_row_counts[cur_a];
         if (cne1 == 0) continue;
@@ -4010,8 +4010,10 @@ static int hmx_mm_op_matmul_id(
         const int m_padded = hex_align_up(cne1, 32);
         int m_start = 0, m_end = m_padded;
         if (expert_split) {
-            const bool my_expert = (active_idx % octx->ctx->mdev.count) == octx->ctx->mdev.idx;
-            active_idx++;
+            const bool my_expert = (target_dev == octx->ctx->mdev.idx);
+            if (++target_dev == octx->ctx->mdev.count) {
+                target_dev = 0;
+            }
             if (!my_expert) continue;
         } else if (mdev_split) {
             const bool can_split = (uint32_t) cne1 >= octx->ctx->mdev.count;
@@ -4155,7 +4157,7 @@ static int hmx_mm_op_matmul_id_nx(
     }
     const bool expert_split = mdev_split && (n_active >= octx->ctx->mdev.count);
 
-    uint32_t active_idx = 0;
+    uint32_t target_dev = 0;
     for (uint32_t cur_a = 0; cur_a < (uint32_t) n_as; ++cur_a) {
         const int32_t cne1 = matrix_row_counts[cur_a];
         if (cne1 == 0) continue;
@@ -4163,8 +4165,10 @@ static int hmx_mm_op_matmul_id_nx(
         const int m_padded = hex_align_up(cne1, 32);
         int m_start = 0, m_end = m_padded;
         if (expert_split) {
-            const bool my_expert = (active_idx % octx->ctx->mdev.count) == octx->ctx->mdev.idx;
-            active_idx++;
+            const bool my_expert = (target_dev == octx->ctx->mdev.idx);
+            if (++target_dev == octx->ctx->mdev.count) {
+                target_dev = 0;
+            }
             if (!my_expert) continue;
         } else if (mdev_split) {
             const bool can_split = (uint32_t) cne1 >= octx->ctx->mdev.count;
