@@ -5552,7 +5552,7 @@ static bool ggml_hexagon_matmul_can_collapse(const struct ggml_tensor * src0, co
     return (dst->op == GGML_OP_MUL_MAT || dst->op == GGML_OP_ADD) &&
            src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] * src1->ne[3] > 1 &&
            src1->nb[0] == ggml_type_size(src1->type) && ggml_hexagon_rows_stride(src1->ne, src1->nb, &s1) &&
-           ggml_hexagon_rows_stride(dst->ne, dst->nb, &sd);
+           dst->nb[0] == ggml_type_size(dst->type) && ggml_hexagon_rows_stride(dst->ne, dst->nb, &sd);
 }
 
 static bool ggml_hexagon_matmul_add_can_collapse(
