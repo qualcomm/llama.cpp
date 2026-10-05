@@ -3993,7 +3993,10 @@ static int hmx_mm_op_matmul_id(
     const int n_ids = octx->src[2]->ne[0];
     const int n_as  = ne02;
 
-    const bool mdev_split = (octx->ctx->mdev.count > 1) && htp_tensor_mdev_data_aligned(dst);
+    const bool mdev_split = (octx->ctx->mdev.count > 1) && htp_tensor_can_row_partition(dst, sizeof(float));
+    if (octx->ctx->mdev.count > 1 && !mdev_split && octx->ctx->mdev.idx > 0) {
+        return HTP_STATUS_OK;
+    }
     uint32_t n_active = 0;
     if (mdev_split) {
         for (uint32_t a = 0; a < (uint32_t) n_as; ++a) {
@@ -4147,7 +4150,10 @@ static int hmx_mm_op_matmul_id_nx(
     bool mdev_split = (octx->ctx->mdev.count > 1);
     for (uint32_t p = 0; p < n_weights && mdev_split; ++p) {
         const struct htp_tensor * restrict dst = octx->dsts[p];
-        mdev_split = !dst || htp_tensor_mdev_data_aligned(dst);
+        mdev_split = !dst || htp_tensor_can_row_partition(dst, sizeof(float));
+    }
+    if (octx->ctx->mdev.count > 1 && !mdev_split && octx->ctx->mdev.idx > 0) {
+        return HTP_STATUS_OK;
     }
     uint32_t n_active = 0;
     if (mdev_split) {
