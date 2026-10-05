@@ -2146,6 +2146,14 @@ __kernel void flash_attn_f32_f16_q1_vec_mq_split_c8(
 #endif
         const global KV_DATA_TYPE4 * v_ptr = (const global KV_DATA_TYPE4 *) (v_base + v_row_base  + (ulong) k_safe * v_nb1);
 
+#if defined(FA_CL_VPRE) && !(FA_CL_DK == 1 && FA_CL_DV == 1)
+        // Issue this row's V loads beside K: they do not depend on the score, and left at the
+        // bottom of the iteration their latency sits behind the dot/reduce/exp chain.
+        KV_DATA_TYPE4 v_pre[FA_CL_DV];
+        #pragma unroll
+        for (int i = 0; i < FA_CL_DV; ++i) v_pre[i] = v_ptr[lic + FA_CL_C * i];
+#endif
+
 #ifdef FA_CL_MASK_BCAST
         // Issue the broadcast mask load with the K row so both are in flight.
         ACC_TYPE mask_val = (ACC_TYPE) 0.0f;
@@ -2452,7 +2460,11 @@ __kernel void flash_attn_f32_f16_q1_vec_mq_split_c8(
         // V accumulate on this lane's DV slice (p = 0 on tail -> inert).
         #pragma unroll
         for (int i = 0; i < FA_CL_DV; ++i) {
+#ifdef FA_CL_VPRE
+            const ACC_TYPE4 v_vec = CONVERT_KV_ACC4(v_pre[i]);
+#else
             const ACC_TYPE4 v_vec = CONVERT_KV_ACC4(v_ptr[lic + FA_CL_C * i]);
+#endif
             #pragma unroll
             for (int h = 0; h < MQ_GQA; ++h) {
                 o_acc[h][i] = mad(p_h[h], v_vec, o_acc[h][i] * sp_h[h]);

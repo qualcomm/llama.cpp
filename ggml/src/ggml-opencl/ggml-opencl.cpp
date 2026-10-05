@@ -555,6 +555,10 @@ struct ggml_opencl_fa_kernels {
     // second head dimension builds the same family they stop being unambiguous.
     std::map<std::pair<int, int>, int>       f32_f16_q1_vec_mq_split_g8_hs2_wg;
     std::map<std::pair<int, int>, int>       f32_f16_q1_vec_mq_split_g8_hs2_sub;
+    // gqa=16 sibling at DK=128 (Nemotron-H class: 2 KV heads x 16): the same MQ_GQA=4
+    // program built at FA_HEAD_SUB=4.
+    std::map<std::pair<int, int>, cl_kernel> f32_f16_q1_vec_mq_split_g16_hs4;
+    std::map<std::pair<int, int>, int>       f32_f16_q1_vec_mq_split_g16_hs4_wg;
     std::map<std::pair<int, int>, cl_kernel> f32_f16_q1_vec_mq_split_gqa4_hs2;
     // q1_vec_mq_split built alone (FA_MQ_SPLIT_ONLY) for a specific
     // (dk, dv, gqa), with its own MQ_NSG_SPLIT / FA_HEAD_SUB. Used where the
@@ -8641,14 +8645,19 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
             }();
             if (!fa_decode_only && dk == 128 && dv == 128 &&
                 backend_ctx->has_subgroup_shuffle && g8_hs_dk128_on) {
-                // 4 is the measured optimum, not an extrapolation. X2-90 tg128 at
-                // d4096/d8192: 31.1/24.7 at FA_HEAD_SUB=2, 33.0/25.7 at 4, and
-                // 30.5/23.3 at 8 -- MQ_GQA=1 overshoots and lands BELOW 2, so the
-                // grid mechanism saturates here rather than continuing.
+                // Default FA_HEAD_SUB=2, i.e. MQ_GQA=4, with the four heads' cluster
+                // reduce fused (FA_CL_MHRED: 8 shuffles per KV row instead of 16, same
+                // per-head summation order), the V loads issued beside K (FA_CL_VPRE) and
+                // FA_CL_C=16. Per call at kv 8192 on the 840 (A8X): 800 us at the previous
+                // default (FA_HEAD_SUB=4, MQ_GQA=2) -> 650 us; without MHRED and VPRE,
+                // FA_HEAD_SUB=2 only ties FA_HEAD_SUB=4. GGML_OPENCL_FA_G8_HS_DK128_SUB=4 or
+                // 8 builds the plain MQ_GQA=2 / 1 forms instead (X2-90 tg128 at d4096/d8192
+                // for the plain forms: 31.1/24.7 at FA_HEAD_SUB=2, 33.0/25.7 at 4, 30.5/23.3
+                // at 8).
                 static const int hs_n = []{
                     const char * e = std::getenv("GGML_OPENCL_FA_G8_HS_DK128_SUB");
-                    const int v = (e && e[0]) ? atoi(e) : 4;
-                    return (v == 2 || v == 4 || v == 8) ? v : 4;
+                    const int v = (e && e[0]) ? atoi(e) : 2;
+                    return (v == 2 || v == 4 || v == 8) ? v : 2;
                 }();
                 static const int hs_nsg = []{
                     const char * e = std::getenv("GGML_OPENCL_FA_G8_HS_DK128_NSG");
@@ -8656,11 +8665,18 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
                     return (v >= 1 && v <= 4) ? v : 2;
                 }();
                 const size_t hs_wg = (size_t) (64 * hs_nsg);
-                const std::string opts_hs = opts +
-                    " -D FA_MQ_ONLY -D MQ_GQA=" + std::to_string(8 / hs_n) +
-                    " -D MQ_NSG=" + std::to_string(hs_nsg) +
+                // MQ_GQA=4 options, shared with the gqa=16 sibling below.
+                const std::string opts_hs_g4 = opts +
+                    " -D FA_MQ_ONLY -D MQ_GQA=4 -D MQ_NSG=" + std::to_string(hs_nsg) +
                     " -D MQ_NSG_SPLIT=" + std::to_string(hs_nsg) +
-                    " -D FA_HEAD_SUB=" + std::to_string(hs_n) + opts_cl_c_gqa4;
+                    " -D FA_CL_C=16 -D FA_CL_MHRED -D FA_CL_VPRE";
+                const std::string opts_hs = hs_n == 2
+                    ? opts_hs_g4 + " -D FA_HEAD_SUB=2"
+                    : opts +
+                      " -D FA_MQ_ONLY -D MQ_GQA=" + std::to_string(8 / hs_n) +
+                      " -D MQ_NSG=" + std::to_string(hs_nsg) +
+                      " -D MQ_NSG_SPLIT=" + std::to_string(hs_nsg) +
+                      " -D FA_HEAD_SUB=" + std::to_string(hs_n) + opts_cl_c_gqa4;
                 const std::string tag_hs = "fa f32_f16 MQ_GQA=" + std::to_string(8 / hs_n) +
                     " dk128 g8 headsub" + std::to_string(hs_n) + " wg" + std::to_string(hs_wg);
                 cl_program prog_hs = build_program_from_source_ex(
@@ -8679,6 +8695,37 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
                         }
                     }
                     clReleaseProgram(prog_hs);
+                }
+
+                // gqa=16 at DK=128 (Nemotron-H 30B-A3B: 2 KV heads x 16) matches no MQ
+                // route and falls to the per-head q1_split, which reads the KV cache once
+                // per query head. Serve it with the same MQ_GQA=4 program at
+                // FA_HEAD_SUB=4. Per call on the 840 (A8X), kv 4096 / 8192 / 16384:
+                // 3434 / 6702 / 12850 us -> 290 / 555 / 1068 us.
+                // GGML_OPENCL_FA_G16_HS_DK128=0 opts out.
+                static const bool g16_hs_dk128_on = []{
+                    const char * e = std::getenv("GGML_OPENCL_FA_G16_HS_DK128");
+                    return !(e != nullptr && e[0] == '0');
+                }();
+                if (g16_hs_dk128_on) {
+                    const std::string opts_g16 = opts_hs_g4 + " -D FA_HEAD_SUB=4";
+                    const std::string tag_g16  = "fa f32_f16 MQ_GQA=4 dk128 g16 headsub4 wg" + std::to_string(hs_wg);
+                    cl_program prog_g16 = build_program_from_source_ex(
+                        backend_ctx->context, backend_ctx->device, src.c_str(), opts_g16,
+                        /*fatal=*/false, tag_g16.c_str(), backend_ctx->queue);
+                    if (prog_g16) {
+                        cl_kernel k_g16 = clCreateKernel(prog_g16, "flash_attn_f32_f16_q1_vec_mq_split_c8", &err);
+                        if (err == CL_SUCCESS) {
+                            if (ggml_opencl_fa_kernel_fits_wg(backend_ctx, k_g16, hs_wg, tag_g16.c_str(), dk, dv)) {
+                                backend_ctx->fa.f32_f16_q1_vec_mq_split_g16_hs4[{dk, dv}]    = k_g16;
+                                backend_ctx->fa.f32_f16_q1_vec_mq_split_g16_hs4_wg[{dk, dv}] = (int) hs_wg;
+                                ggml_opencl_log_fa_kernel_spill(backend_ctx, k_g16, tag_g16.c_str(), dk, dv);
+                            } else {
+                                clReleaseKernel(k_g16);
+                            }
+                        }
+                        clReleaseProgram(prog_g16);
+                    }
                 }
             }
             // NSG_SPLIT=2 programs for the cluster-parallel kernel: its register
@@ -22209,6 +22256,12 @@ static constexpr int FD_MAX_N_Q_MULTI = 8;
 // MQ FD split-groups have few subgroups (MQ_NSG_SPLIT), so use a smaller
 // kv_per_split to keep the softmax recurrence short; non-MQ keeps FD_KV_PER_SPLIT.
 static constexpr int FD_MQ_KV_PER_SPLIT = 256;
+// The DK=128 head-split routes already multiply the grid by FA_HEAD_SUB workgroups per KV
+// head, so they take wider KV slices: 512 measured 3-15% faster than 256 on X2E and X1E at
+// kv 4096-16384, and 6-9% faster on A8X from kv 8192 up -- but 10-17% slower on A8X at kv
+// 4096, which keeps 256 there.
+static constexpr int FD_MQ_KV_PER_SPLIT_HS = 512;
+static constexpr int FD_MQ_KV_PER_SPLIT_HS_A8X_MIN_N_KV = 8192;
 static constexpr int FD_MQ_MAX_SPLITS   = 128;
 
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
@@ -23668,6 +23721,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     bool use_fd_mq = false;
     size_t fd_mq_wg = 256;  // MQ_GQA=4 kernel: Q1_WG_SIZE(64) * MQ_NSG_SPLIT(4)
     int    fd_head_sub = 1; // workgroups per gqa group (FA_HEAD_SUB in the kernel)
+    bool   fd_hs_wide  = false; // DK=128 head-split route: wider KV splits (FD_MQ_KV_PER_SPLIT_HS)
     bool use_fa_k_img = false;  // K bound as image1d_buffer_t instead of (buf, offset)
 
     {
@@ -23838,6 +23892,17 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
                 use_fd_mq   = true;
                 fd_mq_wg    = (size_t) backend_ctx->fa.f32_f16_q1_vec_mq_split_g8_hs2_wg.at(dk_dv);
                 fd_head_sub = backend_ctx->fa.f32_f16_q1_vec_mq_split_g8_hs2_sub.at(dk_dv);
+                fd_hs_wide  = d_head_q == 128;
+            // gqa=16 at DK=128: the MQ_GQA=4 head-split program at FA_HEAD_SUB=4.
+            } else if (nq1_only && is_mixed && gqa_ratio_dispatch == 16 &&
+                d_head_q == 128 && d_head_v == 128 &&
+                n_head == n_head_kv * 16 &&
+                backend_ctx->fa.f32_f16_q1_vec_mq_split_g16_hs4.count(dk_dv) > 0) {
+                fd_k_split  = backend_ctx->fa.f32_f16_q1_vec_mq_split_g16_hs4.at(dk_dv);
+                use_fd_mq   = true;
+                fd_mq_wg    = (size_t) backend_ctx->fa.f32_f16_q1_vec_mq_split_g16_hs4_wg.at(dk_dv);
+                fd_head_sub = 4;
+                fd_hs_wide  = true;
             // Cluster-parallel decode for the g8
             } else if (is_mixed && gqa_ratio_dispatch == 8 &&
                 d_head_q == 128 && d_head_v == 128 &&
@@ -24149,7 +24214,9 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
             return (e && e[0]) ? atoi(e) : 0;
         }();
 
-        int fd_kv_per_split = use_fd_mq ? FD_MQ_KV_PER_SPLIT
+        const bool fd_wide_split = fd_hs_wide &&
+            (backend_ctx->adreno_gen != ADRENO_GPU_GEN::A8X || n_kv >= FD_MQ_KV_PER_SPLIT_HS_A8X_MIN_N_KV);
+        int fd_kv_per_split = use_fd_mq ? (fd_wide_split ? FD_MQ_KV_PER_SPLIT_HS : FD_MQ_KV_PER_SPLIT)
                                         : (is_mixed ? FD_KV_PER_SPLIT_F16 : FD_KV_PER_SPLIT);
         int fd_max_splits   = use_fd_mq ? FD_MQ_MAX_SPLITS   : FD_MAX_SPLITS;
         if (fd_env_kv_per_split > 0) { fd_kv_per_split = fd_env_kv_per_split; }
