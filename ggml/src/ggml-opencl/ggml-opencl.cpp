@@ -8620,13 +8620,9 @@ inline bool use_adreno_moe_kernels(const ggml_backend_opencl_context *backend_ct
     }
 
     // The E17 compiler (Adreno 850) builds these repack kernels correctly: every type survives
-    // a set_tensor/get_tensor round trip byte for byte there. What went wrong on E17 is the MoE
-    // GEMMs reading wrong values from the start of their local tiles, fixed by MOE_LM_PAD. q5_K
-    // stays excluded on E17: its round trip does differ there (not on the Adreno 840).
-    if (adreno_e17_compiler_quirks(backend_ctx) && tensor->type == GGML_TYPE_Q5_K) {
-        return false;
-    }
-
+    // a set_tensor/get_tensor round trip byte for byte there (q5_K since its qh pack builds
+    // each word as a uint). What went wrong on E17 is the MoE GEMMs reading wrong values from
+    // the start of their local tiles, fixed by MOE_LM_PAD.
     int ne01 = tensor->ne[1];
     return (((strstr(tensor->name, "ffn") != NULL) && (strstr(tensor->name, "exps") != NULL)) || (strstr(tensor->name, "as") != NULL)) && (ne01 % 32 == 0);
 }
