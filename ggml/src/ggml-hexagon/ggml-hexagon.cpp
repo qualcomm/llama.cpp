@@ -6878,11 +6878,11 @@ static bool ggml_hexagon_supported_pool_2d(const struct ggml_hexagon_session * s
                                   (uint32_t) kernel_x, (uint32_t) stride_x,
                                   pad_x, &ox_lo, &ox_hi);
     return ox_hi - ox_lo >= 32;
-
-    GGML_UNUSED(sess);
 }
 
 static bool ggml_hexagon_supported_pool_1d(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op) {
+    GGML_UNUSED(sess);
+
     const struct ggml_tensor * src0 = op->src[0];
     const int32_t * params = op->op_params;
 
@@ -6909,8 +6909,6 @@ static bool ggml_hexagon_supported_pool_1d(const struct ggml_hexagon_session * s
     // The pool kernel has a scalar general path for overlapping windows,
     // arbitrary strides, and padding.
     return true;
-
-    GGML_UNUSED(sess);
 }
 
 static bool ggml_hexagon_supported_activations(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op) {

@@ -207,14 +207,9 @@ static inline void pool_row_general_scalar(
         if (is_max) {
             dst_row[ox] = acc;
         } else if (p->avg_divide_count) {
-            const int32_t ix0 = (int32_t) (ox * p->stride_x) - p->pad_x;
-            int count = 0;
-            for (uint32_t kx = 0; kx < p->kernel_x; ++kx) {
-                const int32_t ix = ix0 + (int32_t) kx;
-                if (ix >= 0 && ix < (int32_t) p->src_x) {
-                    ++count;
-                }
-            }
+            const int32_t valid_start = MAX(0, ix0);
+            const int32_t valid_end   = MIN((int32_t) p->src_x, ix0 + (int32_t) p->kernel_x);
+            const int32_t count       = MAX(0, valid_end - valid_start);
             dst_row[ox] = count > 0 ? acc * pool_inv_count_cached(inv_cache, (uint32_t) count) : 0.0f;
         } else {
             dst_row[ox] = acc * p->inv_kernel_area;
@@ -299,7 +294,6 @@ static inline void pool_plane_general(
         pool_row_bounds_y(p, oy, &iy0, &ky_lo, &ky_hi);
         float * dst_row = dst + oy * p->dst_x;
 
-        inv_cache.size = 0;
         pool_row_general_scalar(src, dst_row, p, 0, p->ox_lo, iy0, ky_lo, ky_hi, is_max, &inv_cache);
         pool_row_general_vec(src, dst_row, p, p->ox_lo, p->ox_hi, iy0, ky_lo, ky_hi, is_max, &inv_cache);
         pool_row_general_scalar(src, dst_row, p, p->ox_hi, p->dst_x, iy0, ky_lo, ky_hi, is_max, &inv_cache);
@@ -372,13 +366,18 @@ static void pool_2d_thread(unsigned int nth, unsigned int ith, void * data) {
 
     const uint32_t total = last - first;
 
-    // Stage the first input before entering the overlapped pipeline.
-    {
-        const dma_addr_t src_addr = src0->data + (dma_addr_t) first * p->src_plane_bytes;
-        dma_queue_push(dma_queue, dma_make_data(srcb2[0], src_addr),
+    // Warm up the pipeline: push up to 2 initial (dummy dst, src) transfer pairs.
+    for (uint32_t i = 0; i < total && i < 2; ++i) {
+        dma_queue_push(dma_queue,
+                       dma_make_data(dst->data, dstb2[i]),
+                       p->dst_plane_bytes, p->dst_plane_bytes_aligned,
+                       p->dst_plane_bytes, 0);
+
+        const dma_addr_t src_addr = src0->data + (first + i) * p->src_plane_bytes;
+        dma_queue_push(dma_queue,
+                       dma_make_data(srcb2[i], src_addr),
                        p->src_plane_bytes_aligned, p->src_plane_bytes,
                        p->src_plane_bytes, 1);
-        dma_queue_pop(dma_queue);
     }
 
     for (uint32_t i = 0; i < total; ++i) {
@@ -387,41 +386,29 @@ static void pool_2d_thread(unsigned int nth, unsigned int ith, void * data) {
         float * srcb = srcb2[buf];
         float * dstb = dstb2[buf];
 
-        // Transfers are queued in this order for each plane:
-        // next input, current output
-        // Before reusing a slot, wait for the older output and current input
-        // in FIFO order. This keeps DMA and compute overlapped.
-        if (i > 1) {
-            dma_queue_pop(dma_queue); // output from plane i - 2
-        }
-
-        if (i > 0) {
-            dma_queue_pop(dma_queue); // input for plane i
-        }
-
-        if (i + 1 < total) {
-            const uint32_t nbuf = 1u - buf;
-            const dma_addr_t next_src_addr = src0->data + (dma_addr_t) (plane + 1) * p->src_plane_bytes;
-            dma_queue_push(dma_queue, dma_make_data(srcb2[nbuf], next_src_addr),
-                           p->src_plane_bytes_aligned, p->src_plane_bytes,
-                           p->src_plane_bytes, 1);
-        }
+        dma_queue_pop(dma_queue); // dst writeback from plane i - 2 (or dummy on iter 0, 1)
+        dma_queue_pop(dma_queue); // input for plane i
 
         htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) plane);
         pool_plane(srcb, dstb, p);
         htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) plane);
 
-        const dma_addr_t dst_addr = dst->data + (dma_addr_t) plane * p->dst_plane_bytes;
-        dma_queue_push(dma_queue, dma_make_data(dst_addr, dstb),
+        const dma_addr_t dst_addr = dst->data + plane * p->dst_plane_bytes;
+        dma_queue_push(dma_queue,
+                       dma_make_data(dst_addr, dstb),
                        p->dst_plane_bytes, p->dst_plane_bytes_aligned,
                        p->dst_plane_bytes, 1);
+
+        if (i + 2 < total) {
+            const dma_addr_t next_src_addr = src0->data + (plane + 2) * p->src_plane_bytes;
+            dma_queue_push(dma_queue,
+                           dma_make_data(srcb, next_src_addr),
+                           p->src_plane_bytes_aligned, p->src_plane_bytes,
+                           p->src_plane_bytes, 1);
+        }
     }
 
-    // The last one or two output transfers are still outstanding.
-    dma_queue_pop(dma_queue);
-    if (total > 1) {
-        dma_queue_pop(dma_queue);
-    }
+    dma_queue_flush(dma_queue);
 
     FARF(HIGH, "pool2d-f32-dma %d/%d: %ux%ux%ux%u -> %ux%ux%ux%u (%u:%u)\n",
          ith, nth, src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
