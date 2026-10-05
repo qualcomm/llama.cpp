@@ -455,6 +455,14 @@ static inline bool ggml_hexagon_tensors_overlap(const struct ggml_tensor * a, co
     return a0 < b1 && b0 < a1;
 }
 
+static inline bool ggml_hexagon_can_row_partition(const struct ggml_tensor * t) {
+    if (!t) return false;
+    if (t->ne[1] > 1 && (t->nb[1] & 127) != 0) return false;
+    if (t->ne[2] > 1 && (t->nb[2] & 127) != 0) return false;
+    if (t->ne[3] > 1 && (t->nb[3] & 127) != 0) return false;
+    return true;
+}
+
 struct htp_opnode;
 
 struct ggml_hexagon_opbatch;
@@ -5251,9 +5259,9 @@ static bool ggml_hexagon_precompute_hmx_mm_params(
     int m_for_solver_padded = ne11_padded;
     // matmul_id partitions by expert; regular matmul partitions M rows (ne11) across devices
     if (!is_matmul_id && sess->mdev.count > 1 && ((uint32_t) ne11 >= sess->mdev.count)) {
-        const bool dst_row_split = dst ? ((dst->nb[1] & 127) == 0)
-                                       : ((((size_t) ne01_padded * sizeof(float)) & 127) == 0);
-        const bool act_row_split = ((act->nb[1] & 127) == 0);
+        // when dst is null, padded dims are used for estimate which are 128-byte aligned
+        const bool dst_row_split = dst ? ggml_hexagon_can_row_partition(dst) : true;
+        const bool act_row_split = ggml_hexagon_can_row_partition(act);
         if (dst_row_split && act_row_split) {
             m_for_solver = (ne11 + (int) sess->mdev.count - 1) / (int) sess->mdev.count;
             m_for_solver_padded = hex_round_up(std::max(m_for_solver, 32), 32);
@@ -5283,7 +5291,10 @@ static bool ggml_hexagon_precompute_hmx_mm_params(
         if (dst && is_matmul_id) {
             const int n_experts = ne02 > 0 ? ne02 : 1;
             const size_t total_expert_rows = (size_t) dst->ne[1] * dst->ne[2];
-            const int m_per_expert = (int) ((total_expert_rows + n_experts - 1) / n_experts);
+            int m_per_expert = (int) ((total_expert_rows + n_experts - 1) / n_experts);
+            if (sess->mdev.count > 1 && ggml_hexagon_can_row_partition(dst)) {
+                m_per_expert = (m_per_expert + (int) sess->mdev.count - 1) / (int) sess->mdev.count;
+            }
             m_id_rows = hex_round_up(std::max(m_per_expert, 32), 32);
         }
         const uint32_t cost_m = is_matmul_id ? (uint32_t) m_id_rows : (uint32_t) m_for_solver;

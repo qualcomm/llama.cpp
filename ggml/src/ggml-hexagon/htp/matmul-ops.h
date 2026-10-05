@@ -149,6 +149,7 @@ static inline int htp_mm_hmx_compute_chunks(size_t   vtcm_total,
     const size_t usable = vtcm_total - overhead;
 
     size_t best_cost = SIZE_MAX;
+    size_t best_tail_waste = SIZE_MAX;
     size_t best_mn   = 0;
     size_t best_m = 0, best_n = 0;
 
@@ -175,12 +176,17 @@ static inline int htp_mm_hmx_compute_chunks(size_t   vtcm_total,
             size_t mblocks = ((size_t) m + mc - 1) / mc;
             size_t nblocks = ((size_t) n + nc - 1) / nc;
             size_t cost    = mblocks * m_block_cost + nblocks * n_block_cost;
+            size_t rem     = n % nc;
+            size_t tail_waste = (rem == 0) ? 0 : (nc - rem);
             size_t mn      = mc * nc;
-            if (cost < best_cost || (cost == best_cost && mn > best_mn)) {
-                best_cost = cost;
-                best_mn   = mn;
-                best_m    = mc;
-                best_n    = nc;
+            if (cost < best_cost ||
+                (cost == best_cost && tail_waste < best_tail_waste) ||
+                (cost == best_cost && tail_waste == best_tail_waste && mn > best_mn)) {
+                best_cost       = cost;
+                best_tail_waste = tail_waste;
+                best_mn         = mn;
+                best_m          = mc;
+                best_n          = nc;
             }
         }
 
