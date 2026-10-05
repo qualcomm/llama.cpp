@@ -1309,6 +1309,16 @@ kernel void kernel_convert_block_q5_k_trans4_ns(
     dst_d [dst_blk_offset] = b->d;
     dst_dm[dst_blk_offset] = b->dm;
 
+#ifdef GGML_CL_Q5K_QH_WA
+    // E17 (Adreno 850) packs the uchar bit-gather below wrong; gather each word as a uint.
+    for (int k = 0; k < 8; k++) {
+        uint packed = 0;
+        for (int jq = 0; jq < 32; jq++) {
+            packed |= (((uint)b->qh[jq] >> k) & 1u) << jq;
+        }
+        dst_qh[i01 + (i00 * 8 + k) * ne01 + i02 * ne00_blk * 8 * ne01] = packed;
+    }
+#else
     for (int k = 0; k < 8; k++) {
         uchar b0 = 0, b1 = 0, b2 = 0, b3 = 0;
         for (int bit = 0; bit < 8; bit++) {
@@ -1320,6 +1330,7 @@ kernel void kernel_convert_block_q5_k_trans4_ns(
         uint packed = (uint)b0 | ((uint)b1 << 8) | ((uint)b2 << 16) | ((uint)b3 << 24);
         dst_qh[i01 + (i00 * 8 + k) * ne01 + i02 * ne00_blk * 8 * ne01] = packed;
     }
+#endif
 
     uint4 qv[8];
     uchar * qv_bytes = (uchar *)qv;
@@ -1380,6 +1391,20 @@ kernel void kernel_restore_block_q5_k_trans4_ns(
     b->d  = src_d[src_blk_offset];
     b->dm = src_dm[src_blk_offset];
 
+#ifdef GGML_CL_Q5K_QH_WA
+    // build each qh byte in registers and store it once
+    uint pk[8];
+    for (int k = 0; k < 8; k++) {
+        pk[k] = src_qh[i01 + (i00 * 8 + k) * ne01 + i02 * ne00_blk * 8 * ne01];
+    }
+    for (int jq = 0; jq < 32; jq++) {
+        uint v = 0;
+        for (int k = 0; k < 8; k++) {
+            v |= ((pk[k] >> jq) & 1u) << k;
+        }
+        b->qh[jq] = (uchar)v;
+    }
+#else
     for (int j = 0; j < 32; j++) b->qh[j] = 0;
     for (int k = 0; k < 8; k++) {
         uint packed = src_qh[i01 + (i00 * 8 + k) * ne01 + i02 * ne00_blk * 8 * ne01];
@@ -1394,6 +1419,7 @@ kernel void kernel_restore_block_q5_k_trans4_ns(
             b->qh[24 + bit] |= (uchar)(((b3 >> bit) & 1) << k);
         }
     }
+#endif
 
     __global uchar * s_src = src_s + (i02 * ne01 + i01) * ne00_blk * K_SCALE_SIZE + i00 * K_SCALE_SIZE;
     for (int i = 0; i < K_SCALE_SIZE; ++i) {

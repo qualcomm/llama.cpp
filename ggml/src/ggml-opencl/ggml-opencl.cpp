@@ -5110,9 +5110,10 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         // zeroes a 1 MB printf buffer on each dispatch of those kernels: ~300 us per enqueue
         // against ~50 us. cvt.cl is built early and holds the only printfs that compile on
         // E17 (the q4_0/q4_1/q5_0/q5_1 noshuffle workaround for older compilers), so drop
-        // them there.
+        // them there. E17 also packs the q5_K qh bits of the Adreno MoE layout wrong
+        // (GGML_CL_Q5K_QH_WA builds each word directly).
         const std::string cvt_opts = adreno_art_compiler_quirks(backend_ctx)
-            ? compile_opts + " -DGGML_CL_NO_PRINTF_WA" : compile_opts;
+            ? compile_opts + " -DGGML_CL_NO_PRINTF_WA -DGGML_CL_Q5K_QH_WA" : compile_opts;
         backend_ctx->program_cvt =
             build_program_from_source(backend_ctx, kernel_src.c_str(), cvt_opts);
 
@@ -18406,12 +18407,11 @@ inline bool use_adreno_moe_kernels(const ggml_backend_opencl_context *backend_ct
     // garbage came from the MoE GEMMs reading wrong values from the start of their local
     // tiles, fixed by MOE_LM_PAD. Checked on the 850: MUL_MAT_ID and the fused GLU / weighted
     // cases for each type; granite-3.0-3B-A800M PPL against the CPU for Q4_0, Q4_K_M (q4_K +
-    // q6_K experts) and MXFP4. q5_K is still declined there: its round trip differs on E17
-    // (but not on the Adreno 840).
-    if ((backend_ctx && (backend_ctx->adreno_gen == ADRENO_GPU_GEN::A6X ||
-                         backend_ctx->adreno_gen == ADRENO_GPU_GEN::A7X ||
-                         backend_ctx->adreno_gen == ADRENO_GPU_GEN::ADRENO_UNKNOWN)) ||
-        (adreno_art_compiler_quirks(backend_ctx) && tensor->type == GGML_TYPE_Q5_K)) {
+    // q6_K experts) and MXFP4. q5_K too, once its qh pack was rewritten for E17
+    // (GGML_CL_Q5K_QH_WA in cvt.cl; the original pack gave PPL ~11000).
+    if (backend_ctx && (backend_ctx->adreno_gen == ADRENO_GPU_GEN::A6X ||
+                        backend_ctx->adreno_gen == ADRENO_GPU_GEN::A7X ||
+                        backend_ctx->adreno_gen == ADRENO_GPU_GEN::ADRENO_UNKNOWN)) {
         return false;
     }
     int ne01 = tensor->ne[1];
