@@ -3133,7 +3133,7 @@ static int hmx_mm_nx_2d_f32(struct htp_ops_context * octx, const struct htp_mm_k
         if (can_split) {
             for (uint32_t p = 0; p < n_weights; ++p) {
                 const struct htp_tensor * restrict dst = octx->dsts[p];
-                if (dst && !htp_tensor_can_row_partition(dst, sizeof(float))) {
+                if (!htp_tensor_can_row_partition(dst, sizeof(float))) {
                     can_split = false;
                     break;
                 }
@@ -4150,7 +4150,7 @@ static int hmx_mm_op_matmul_id_nx(
     bool mdev_split = (octx->ctx->mdev.count > 1);
     for (uint32_t p = 0; p < n_weights && mdev_split; ++p) {
         const struct htp_tensor * restrict dst = octx->dsts[p];
-        mdev_split = !dst || htp_tensor_can_row_partition(dst, sizeof(float));
+        mdev_split = htp_tensor_can_row_partition(dst, sizeof(float));
     }
     if (octx->ctx->mdev.count > 1 && !mdev_split && octx->ctx->mdev.idx > 0) {
         return HTP_STATUS_OK;
@@ -4507,7 +4507,7 @@ int op_matmul_id_nx(struct htp_ops_context * octx) {
         return HTP_STATUS_NO_SUPPORT;
     }
     for (uint32_t p = 0; p < n_weights; p++) {
-        if (octx->dsts[p] && htp_tensor_is_extended(octx->dsts[p])) {
+        if (htp_tensor_is_extended(octx->dsts[p])) {
             return HTP_STATUS_NO_SUPPORT;
         }
     }
@@ -4730,12 +4730,10 @@ int op_matmul_nx(struct htp_ops_context * octx) {
 
         for (uint32_t p = 0; p < n_weights; p++) {
             orig_dsts[p] = octx->dsts[p];
-            if (octx->dsts[p]) {
-                const struct htp_tensor * d = octx->dsts[p];
-                const uint32_t sd = (d->ne[1] > 1) ? d->nb[1] : ((d->ne[2] > 1) ? d->nb[2] : d->nb[3]);
-                htp_mm_tensor_collapse_rows(&dsts_collapsed[p], d, sd);
-                octx->dsts[p] = &dsts_collapsed[p];
-            }
+            const struct htp_tensor * d = octx->dsts[p];
+            const uint32_t sd = (d->ne[1] > 1) ? d->nb[1] : ((d->ne[2] > 1) ? d->nb[2] : d->nb[3]);
+            htp_mm_tensor_collapse_rows(&dsts_collapsed[p], d, sd);
+            octx->dsts[p] = &dsts_collapsed[p];
         }
 
         const int status = op_matmul_nx_impl(octx);

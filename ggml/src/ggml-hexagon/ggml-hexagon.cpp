@@ -456,7 +456,6 @@ static inline bool ggml_hexagon_tensors_overlap(const struct ggml_tensor * a, co
 }
 
 static inline bool ggml_hexagon_can_row_partition(const struct ggml_tensor * t) {
-    if (!t) return false;
     if (t->ne[1] > 1 && (t->nb[1] & 127) != 0) return false;
     if (t->ne[2] > 1 && (t->nb[2] & 127) != 0) return false;
     if (t->ne[3] > 1 && (t->nb[3] & 127) != 0) return false;
