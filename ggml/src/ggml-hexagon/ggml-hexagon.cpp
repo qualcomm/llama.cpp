@@ -6344,9 +6344,6 @@ static void ggml_hexagon_precompute_pool_2d_params(
                            kparams->kernel_y == 1 && kparams->stride_y == 1 &&
                            kparams->stride_x == kparams->kernel_x &&
                            kparams->kernel_x >= 32) ? 1 : 0;
-    kparams->exact_path = (kparams->pad_x == 0 && kparams->pad_y == 0 &&
-                           kparams->stride_x == kparams->kernel_x &&
-                           kparams->stride_y == kparams->kernel_y) ? 1 : 0;
     kparams->avg_divide_count = (is_pool_1d && kparams->pool_op == GGML_OP_POOL_AVG) ? 1 : 0;
     ggml_hexagon_pool_interior_range(kparams->src_x, kparams->dst_x, kparams->kernel_x,
                                      kparams->stride_x, kparams->pad_x,

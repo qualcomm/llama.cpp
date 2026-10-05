@@ -17,36 +17,6 @@
 #define HTP_POOL_MAX 0
 #define HTP_POOL_AVG 1
 
-static inline float pool_inv_count(uint32_t count) {
-    HVX_VectorAlias inv;
-    inv.v = hvx_vec_inverse_f32(hvx_vec_splat_f32((float) count));
-    return inv.fp32[0];
-}
-
-#define POOL_INV_CACHE_SIZE 16
-
-struct pool_inv_cache {
-    uint32_t count[POOL_INV_CACHE_SIZE];
-    float reciprocal[POOL_INV_CACHE_SIZE];
-    uint32_t size;
-};
-
-static inline float pool_inv_count_cached(struct pool_inv_cache * cache, uint32_t count) {
-    for (uint32_t i = 0; i < cache->size; ++i) {
-        if (cache->count[i] == count) {
-            return cache->reciprocal[i];
-        }
-    }
-
-    const float reciprocal = pool_inv_count(count);
-    if (cache->size < POOL_INV_CACHE_SIZE) {
-        cache->count[cache->size] = count;
-        cache->reciprocal[cache->size] = reciprocal;
-        ++cache->size;
-    }
-    return reciprocal;
-}
-
 // Fast path: exact non-overlapping tiling (stride == kernel, no padding), kernel_x in {1,2}.
 // Every window is guaranteed fully in-bounds, so this never needs boundary clamping.
 static void pool_plane_hvx(
@@ -118,11 +88,13 @@ static void pool_plane_hvx_narrow(
 static void pool_plane_global(
     const float * src, float * dst, const struct htp_pool_2d_kernel_params * p) {
     const uint32_t n = p->src_x * p->src_y;
+    float val;
     if (p->pool_op == HTP_POOL_MAX) {
-        dst[0] = hvx_reduce_max_f32((const uint8_t *) src, n);
+        val = hvx_reduce_max_f32((const uint8_t *) src, n);
     } else {
-        dst[0] = hvx_reduce_sum_f32((const uint8_t *) src, n) * p->inv_kernel_area;
+        val = hvx_reduce_sum_f32((const uint8_t *) src, n) * p->inv_kernel_area;
     }
+    hvx_vec_store_u(dst, sizeof(float), hvx_vec_splat_f32(val));
 }
 
 static void pool_plane_block(
@@ -132,32 +104,13 @@ static void pool_plane_block(
         float * dst_row = dst + oy * p->dst_x;
         for (uint32_t ox = 0; ox < p->dst_x; ++ox) {
             const uint8_t * block = (const uint8_t *) (row + ox * p->kernel_x);
+            float val;
             if (p->pool_op == HTP_POOL_MAX) {
-                dst_row[ox] = hvx_reduce_max_f32(block, p->kernel_x);
+                val = hvx_reduce_max_f32(block, p->kernel_x);
             } else {
-                dst_row[ox] = hvx_reduce_sum_f32(block, p->kernel_x) * p->inv_kernel_area;
+                val = hvx_reduce_sum_f32(block, p->kernel_x) * p->inv_kernel_area;
             }
-        }
-    }
-}
-
-// Generic exact-tiling path for kernels without a lane-shuffle fast path. Strided
-// lanes cannot be vector-loaded, so accumulate in scalar registers (DDR input only).
-static void pool_plane_exact(
-    const float * src, float * dst, const struct htp_pool_2d_kernel_params * p) {
-    const bool is_max = (p->pool_op == HTP_POOL_MAX);
-    for (uint32_t oy = 0; oy < p->dst_y; ++oy) {
-        const float * src_rows = src + oy * p->kernel_y * p->src_x;
-        float * dst_row = dst + oy * p->dst_x;
-        for (uint32_t ox = 0; ox < p->dst_x; ++ox) {
-            float acc = is_max ? -FLT_MAX : 0.0f;
-            for (uint32_t ky = 0; ky < p->kernel_y; ++ky) {
-                const float * row = src_rows + ky * p->src_x + ox * p->kernel_x;
-                for (uint32_t kx = 0; kx < p->kernel_x; ++kx) {
-                    acc = is_max ? MAX(acc, row[kx]) : acc + row[kx];
-                }
-            }
-            dst_row[ox] = is_max ? acc : acc * p->inv_kernel_area;
+            hvx_vec_store_u(dst_row + ox, sizeof(float), hvx_vec_splat_f32(val));
         }
     }
 }
@@ -175,71 +128,87 @@ static inline void pool_row_bounds_y(
     *ky_hi = (uint32_t) MAX(0, MIN((int32_t) p->kernel_y, hi));
 }
 
-static inline void pool_row_general_scalar(
+static inline void pool_pixel_boundary_vec(
     const float * src, float * dst_row, const struct htp_pool_2d_kernel_params * p,
-    uint32_t ox_start, uint32_t ox_end, int32_t iy0, uint32_t ky_lo, uint32_t ky_hi, bool is_max,
-    struct pool_inv_cache * inv_cache) {
-    for (uint32_t ox = ox_start; ox < ox_end; ++ox) {
-        const int32_t ix0 = (int32_t) (ox * p->stride_x) - p->pad_x;
-        float acc = is_max ? -FLT_MAX : 0.0f;
-        for (uint32_t ky = ky_lo; ky < ky_hi; ++ky) {
-            const float * row = src + (uint32_t) (iy0 + (int32_t) ky) * p->src_x;
-            for (uint32_t kx = 0; kx < p->kernel_x; ++kx) {
-                const int32_t ix = ix0 + (int32_t) kx;
-                if (ix < 0 || ix >= (int32_t) p->src_x) {
-                    continue;
-                }
-                acc = is_max ? MAX(acc, row[ix]) : acc + row[ix];
-            }
+    uint32_t ox, int32_t iy0, uint32_t ky_lo, uint32_t ky_hi, bool is_max) {
+    const int32_t ix0 = (int32_t) (ox * p->stride_x) - p->pad_x;
+    const int32_t kx_lo = MAX(0, -ix0);
+    const int32_t kx_hi = MIN((int32_t) p->kernel_x, (int32_t) p->src_x - ix0);
+
+    if (kx_lo >= kx_hi || ky_lo >= ky_hi) {
+        HVX_Vector empty_val = is_max ? hvx_vec_splat_f32(-FLT_MAX) : Q6_V_vsplat_R(0);
+        hvx_vec_store_u(dst_row + ox, sizeof(float), empty_val);
+        return;
+    }
+
+    const uint32_t valid_kx = (uint32_t) (kx_hi - kx_lo);
+    const HVX_Vector mask_identity = is_max ? hvx_vec_splat_f32(-FLT_MAX) : Q6_V_vsplat_R(0);
+
+    HVX_Vector acc = mask_identity;
+    for (uint32_t ky = ky_lo; ky < ky_hi; ++ky) {
+        const float * row = src + (uint32_t) (iy0 + (int32_t) ky) * p->src_x;
+        for (uint32_t k = 0; k < valid_kx; k += VLEN_FP32) {
+            const uint32_t k_rem = valid_kx - k;
+            const uint32_t n = (k_rem < VLEN_FP32) ? k_rem : VLEN_FP32;
+            const HVX_VectorPred q = Q6_Q_vsetq_R(n * sizeof(float));
+            const HVX_Vector raw = *(const HVX_UVector *) (row + ix0 + kx_lo + k);
+            const HVX_Vector v = Q6_V_vmux_QVV(q, raw, mask_identity);
+            acc = is_max ? Q6_Vsf_vmax_VsfVsf(acc, v) : hvx_vec_add_f32_f32(acc, v);
         }
-        if (is_max) {
-            dst_row[ox] = acc;
-        } else if (p->avg_divide_count) {
-            const int32_t valid_start = MAX(0, ix0);
-            const int32_t valid_end   = MIN((int32_t) p->src_x, ix0 + (int32_t) p->kernel_x);
-            const int32_t count       = MAX(0, valid_end - valid_start);
-            dst_row[ox] = count > 0 ? acc * pool_inv_count_cached(inv_cache, (uint32_t) count) : 0.0f;
+    }
+
+    HVX_Vector reduced = is_max ? hvx_vec_reduce_max_f32(acc) : hvx_vec_reduce_sum_f32(acc);
+    if (!is_max) {
+        HVX_Vector scale_vec;
+        if (p->avg_divide_count) {
+            const uint32_t count = (ky_hi - ky_lo) * valid_kx;
+            scale_vec = hvx_vec_inverse_f32(hvx_vec_splat_f32((float) count));
         } else {
-            dst_row[ox] = acc * p->inv_kernel_area;
+            scale_vec = hvx_vec_splat_f32(p->inv_kernel_area);
         }
+        reduced = hvx_vec_mul_f32_f32(reduced, scale_vec);
+    }
+    hvx_vec_store_u(dst_row + ox, sizeof(float), reduced);
+}
+
+static inline void pool_row_general_boundary_vec(
+    const float * src, float * dst_row, const struct htp_pool_2d_kernel_params * p,
+    uint32_t ox_start, uint32_t ox_end, int32_t iy0, uint32_t ky_lo, uint32_t ky_hi, bool is_max) {
+    for (uint32_t ox = ox_start; ox < ox_end; ++ox) {
+        pool_pixel_boundary_vec(src, dst_row, p, ox, iy0, ky_lo, ky_hi, is_max);
     }
 }
 
-// Vectorized interior loop. Callers guarantee every kx in [0, kernel_x) is in-bounds
-// for every ox in [ox_start, ox_end), so no per-lane masking is needed.
+// Vectorized interior loop.
 static inline void pool_row_general_vec(
     const float * src, float * dst_row, const struct htp_pool_2d_kernel_params * p,
-    uint32_t ox_start, uint32_t ox_end, int32_t iy0, uint32_t ky_lo, uint32_t ky_hi, bool is_max,
-    struct pool_inv_cache * inv_cache) {
+    uint32_t ox_start, uint32_t ox_end, int32_t iy0, uint32_t ky_lo, uint32_t ky_hi, bool is_max) {
+    if (ox_start >= ox_end) {
+        return;
+    }
+
+    if (p->stride_x != 1 && p->stride_x != 2) {
+        pool_row_general_boundary_vec(src, dst_row, p, ox_start, ox_end, iy0, ky_lo, ky_hi, is_max);
+        return;
+    }
+
     const HVX_Vector scale = hvx_vec_splat_f32(p->inv_kernel_area);
     const HVX_Vector seed  = is_max ? hvx_vec_splat_f32(-FLT_MAX) : Q6_V_vsplat_R(0);
 
-    uint32_t ox = ox_start;
-    for (; ox + VLEN_FP32 <= ox_end; ox += VLEN_FP32) {
+    for (uint32_t ox = ox_start; ox < ox_end; ox += VLEN_FP32) {
+        const uint32_t rem = ox_end - ox;
+        const uint32_t nbytes = (rem < VLEN_FP32) ? (rem * sizeof(float)) : VLEN;
         const int32_t ix0 = (int32_t) (ox * p->stride_x) - p->pad_x;
         HVX_Vector acc = seed;
-
-        if (p->stride_x == 2) {
-            const uint32_t last_kx = ((p->kernel_x - 1) / 2) * 2;
-            const uint32_t load_end = (uint32_t) ix0 + last_kx + 2 * VLEN_FP32;
-            if (load_end > p->src_x) {
-                pool_row_general_scalar(src, dst_row, p, ox, ox + VLEN_FP32,
-                                        iy0, ky_lo, ky_hi, is_max, inv_cache);
-                continue;
-            }
-        }
 
         for (uint32_t ky = ky_lo; ky < ky_hi; ++ky) {
             const float * row = src + (uint32_t) (iy0 + (int32_t) ky) * p->src_x;
             if (p->stride_x == 1) {
-                // Consecutive ox map to consecutive columns: one unaligned load per kx.
                 for (uint32_t kx = 0; kx < p->kernel_x; ++kx) {
                     const HVX_Vector v = *(const HVX_UVector *) (row + ix0 + (int32_t) kx);
                     acc = is_max ? Q6_Vsf_vmax_VsfVsf(acc, v) : hvx_vec_add_f32_f32(acc, v);
                 }
-            } else if (p->stride_x == 2) {
-                // Consecutive ox are 2 columns apart: deinterleave gives both kx and kx+1
-                // in one shot, same trick as the fast path's kernel_x==2 case, generalized.
+            } else {
                 for (uint32_t kx = 0; kx < p->kernel_x; kx += 2) {
                     const HVX_Vector v0 = *(const HVX_UVector *) (row + ix0 + (int32_t) kx);
                     const HVX_Vector v1 = *(const HVX_UVector *) (row + ix0 + (int32_t) kx + VLEN_FP32);
@@ -251,21 +220,9 @@ static inline void pool_row_general_vec(
                         acc = is_max ? Q6_Vsf_vmax_VsfVsf(acc, hi) : hvx_vec_add_f32_f32(acc, hi);
                     }
                 }
-            } else {
-                for (uint32_t kx = 0; kx < p->kernel_x; ++kx) {
-                    HVX_VectorAlias packed;
-                    for (uint32_t lane = 0; lane < VLEN_FP32; ++lane) {
-                        packed.fp32[lane] = row[ix0 + (int32_t) (lane * p->stride_x) + (int32_t) kx];
-                    }
-                    acc = is_max ? Q6_Vsf_vmax_VsfVsf(acc, packed.v)
-                                 : hvx_vec_add_f32_f32(acc, packed.v);
-                }
             }
         }
-        hvx_vec_store_u(dst_row + ox, VLEN, is_max ? acc : hvx_vec_mul_f32_f32(acc, scale));
-    }
-    if (ox < ox_end) {
-        pool_row_general_scalar(src, dst_row, p, ox, ox_end, iy0, ky_lo, ky_hi, is_max, inv_cache);
+        hvx_vec_store_u(dst_row + ox, nbytes, is_max ? acc : hvx_vec_mul_f32_f32(acc, scale));
     }
 }
 
@@ -273,18 +230,15 @@ static void pool_plane_general(
     const float * src, float * dst, const struct htp_pool_2d_kernel_params * p) {
     const bool is_max = (p->pool_op == HTP_POOL_MAX);
 
-    // Use the host-computed x-interior for vectorization.
-    struct pool_inv_cache inv_cache = { 0 };
-
     for (uint32_t oy = 0; oy < p->dst_y; ++oy) {
         int32_t iy0;
         uint32_t ky_lo, ky_hi;
         pool_row_bounds_y(p, oy, &iy0, &ky_lo, &ky_hi);
         float * dst_row = dst + oy * p->dst_x;
 
-        pool_row_general_scalar(src, dst_row, p, 0, p->ox_lo, iy0, ky_lo, ky_hi, is_max, &inv_cache);
-        pool_row_general_vec(src, dst_row, p, p->ox_lo, p->ox_hi, iy0, ky_lo, ky_hi, is_max, &inv_cache);
-        pool_row_general_scalar(src, dst_row, p, p->ox_hi, p->dst_x, iy0, ky_lo, ky_hi, is_max, &inv_cache);
+        pool_row_general_boundary_vec(src, dst_row, p, 0, p->ox_lo, iy0, ky_lo, ky_hi, is_max);
+        pool_row_general_vec(src, dst_row, p, p->ox_lo, p->ox_hi, iy0, ky_lo, ky_hi, is_max);
+        pool_row_general_boundary_vec(src, dst_row, p, p->ox_hi, p->dst_x, iy0, ky_lo, ky_hi, is_max);
     }
 }
 
@@ -424,8 +378,6 @@ int op_pool_2d(struct htp_ops_context * octx) {
         pool_plane = pool_plane_hvx_narrow;
     } else if (p->fast_path) {
         pool_plane = pool_plane_hvx;
-    } else if (p->exact_path) {
-        pool_plane = pool_plane_exact;
     } else {
         pool_plane = pool_plane_general;
     }
