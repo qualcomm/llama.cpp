@@ -61,13 +61,6 @@ static inline bool htp_pool_solve_layout(
     uint32_t n_threads,
     size_t   vtcm_budget
 ) {
-    if (layout) {
-        memset(layout, 0, sizeof(*layout));
-    }
-    if (n_threads == 0 || vtcm_budget == 0) {
-        return false;
-    }
-
     // Full-plane double buffering (256 bytes guard space for vector loads)
     const size_t src_plane_bytes   = (size_t) src_x * src_y * sizeof(float);
     const size_t dst_plane_bytes   = (size_t) dst_x * dst_y * sizeof(float);
@@ -79,15 +72,13 @@ static inline bool htp_pool_solve_layout(
         return false;
     }
 
-    if (layout) {
-        layout->src_spad_half_size   = src_plane_aligned;
-        layout->dst_spad_half_size   = dst_plane_aligned;
-        layout->src_bytes_per_thread = 2 * src_plane_aligned;
-        layout->dst_bytes_per_thread = 2 * dst_plane_aligned;
-        layout->off_src              = 0;
-        layout->off_dst              = layout->src_bytes_per_thread * n_threads;
-        layout->total_bytes          = layout->off_dst + layout->dst_bytes_per_thread * n_threads;
-    }
+    layout->src_spad_half_size   = src_plane_aligned;
+    layout->dst_spad_half_size   = dst_plane_aligned;
+    layout->src_bytes_per_thread = 2 * src_plane_aligned;
+    layout->dst_bytes_per_thread = 2 * dst_plane_aligned;
+    layout->off_src              = 0;
+    layout->off_dst              = layout->src_bytes_per_thread * n_threads;
+    layout->total_bytes          = layout->off_dst + layout->dst_bytes_per_thread * n_threads;
     return true;
 }
 

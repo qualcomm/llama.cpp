@@ -6311,9 +6311,7 @@ static void ggml_hexagon_precompute_pool_2d_params(
     const uint32_t n_threads = (std::min)((uint32_t) sess->n_threads, planes > 0 ? planes : 1);
 
     struct htp_pool_vtcm_layout layout;
-    const bool ok = htp_pool_solve_layout(
-        &layout, src_x, src_y, dst_x, dst_y,
-        n_threads, sess->vtcm_size);
+    const bool ok = htp_pool_solve_layout(&layout, src_x, src_y, dst_x, dst_y, n_threads, sess->vtcm_size);
     GGML_ASSERT(ok);
 
     kparams->src_x = src_x;
@@ -6869,9 +6867,7 @@ static bool ggml_hexagon_supported_pool_1d(const struct ggml_hexagon_session * s
     const uint32_t n_threads = (std::min)((uint32_t) sess->n_threads, planes > 0 ? planes : 1);
 
     struct htp_pool_vtcm_layout layout;
-    return htp_pool_solve_layout(&layout, (uint32_t) src0->ne[0], 1,
-                                 (uint32_t) op->ne[0], 1,
-                                 n_threads, sess->vtcm_size);
+    return htp_pool_solve_layout(&layout, (uint32_t) src0->ne[0], 1, (uint32_t) op->ne[0], 1, n_threads, sess->vtcm_size);
 }
 
 static bool ggml_hexagon_supported_activations(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op) {
