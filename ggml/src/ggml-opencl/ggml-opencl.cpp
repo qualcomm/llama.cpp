@@ -8594,6 +8594,19 @@ static bool adreno_e17_compiler_quirks(const ggml_backend_opencl_context *backen
     return !(env && env[0] == '0');
 }
 
+// Largest token count the q4_0/q4_1 MoE GEMV takes before the tiled GEMM. Each token costs
+// one weight pass in the GEMV, while the GEMM pads every expert to a 32-token tile, so small
+// batches (speculative-decode verify) are faster in the GEMV. Measured on the Adreno 850
+// against the dp4a GEMM: GEMV ahead up to 16 tokens, GEMM from 32. Elsewhere unmeasured,
+// so 1 (decode only). GGML_OPENCL_MOE_GEMV_MAX_TOK overrides.
+static int ggml_cl_moe_gemv_max_tokens(const ggml_backend_opencl_context * backend_ctx) {
+    static const char * env = getenv("GGML_OPENCL_MOE_GEMV_MAX_TOK");
+    if (env && env[0]) {
+        return std::max(1, atoi(env));
+    }
+    return adreno_e17_compiler_quirks(backend_ctx) ? 16 : 1;
+}
+
 inline bool use_adreno_moe_kernels(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor) {
     // The moe weight repack kernels *_trans4_ns alias a private ushort8 through a uchar*.
     // Certain compilers (found with some A7x and A6x) miscompiles this, corrupting the weights.
@@ -25941,7 +25954,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                 size_t local_size[3] = {64, 2, 1};
                 size_t global_size[3] = {64, 2, 1};
 
-                if (ne12 == 1) { // for gemv
+                if (ne12 <= ggml_cl_moe_gemv_max_tokens(backend_ctx)) { // for gemv
                     kernel = backend_ctx->kernel_gemv_moe_q4_0_f32_ns;
 
                     cl_mem src1_sub_buffer, buf_src1_image, buf_src2;
@@ -25949,14 +25962,14 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     // create a sub_buffer for src2
                     cl_buffer_region region;
                     region.origin = offset2;
-                    region.size = ne20 * ne21 * sizeof(int);
+                    region.size = (size_t)nb21 * (ne21 - 1) + ne20 * sizeof(int);
                     buf_src2 = clCreateSubBuffer(extra2->data_device, 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &status);
                     CL_CHECK(status);
 
                     // set thread grid
                     global_size[0] = static_cast<size_t>(((ne01 + 63) / 64) * 64);
                     global_size[1] = 4;
-                    global_size[2] = static_cast<size_t>(ne20);
+                    global_size[2] = static_cast<size_t>(ne20 * ne12);
                     local_size[1] = 4;
 
                     // create a sub_buffer for src1
@@ -25982,6 +25995,9 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ne00));
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ne01));
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ne11));
+                    const int ids_stride = (int)(nb21 / sizeof(int));
+                    CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ne20));
+                    CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ids_stride));
 
                     // launch kernel
                     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_size, local_size, dst);
@@ -26255,7 +26271,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                 size_t local_size[3] = {64, 2, 1};
                 size_t global_size[3] = {64, 2, 1};
 
-                if (ne12 == 1) { // for gemv
+                if (ne12 <= ggml_cl_moe_gemv_max_tokens(backend_ctx)) { // for gemv
                     kernel = backend_ctx->kernel_gemv_moe_q4_1_f32_ns;
 
                     cl_mem src1_sub_buffer, buf_src1_image, buf_src2;
@@ -26263,14 +26279,14 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     // create a sub_buffer for src2
                     cl_buffer_region region;
                     region.origin = offset2;
-                    region.size = ne20 * ne21 * sizeof(int);
+                    region.size = (size_t)nb21 * (ne21 - 1) + ne20 * sizeof(int);
                     buf_src2 = clCreateSubBuffer(extra2->data_device, 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &status);
                     CL_CHECK(status);
 
                     // set thread grid
                     global_size[0] = static_cast<size_t>(((ne01 + 63) / 64) * 64);
                     global_size[1] = 4;
-                    global_size[2] = static_cast<size_t>(ne20);
+                    global_size[2] = static_cast<size_t>(ne20 * ne12);
                     local_size[1] = 4;
 
                     // create a sub_buffer for src1
@@ -26297,6 +26313,9 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ne00));
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ne01));
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ne11));
+                    const int ids_stride = (int)(nb21 / sizeof(int));
+                    CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ne20));
+                    CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ids_stride));
 
                     // launch kernel
                     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_size, local_size, dst);
