@@ -2735,17 +2735,6 @@ static inline void hmx_matmul_job_init(hmx_matmul_job_t * job,
     job->n_dot_tiles = n_dot_tiles;
 }
 
-// Pad the last weight tile to 32 columns. This only happens for F32/F16 weights which are not repacked.
-static inline void hmx_mm_zero_weight_tail(void * raw0, void * raw1, size_t n, size_t n_chunk, size_t row_stride) {
-    const size_t n_last = n - ((n - 1) / n_chunk) * n_chunk;
-    const size_t n_padded = hex_align_up(n_last, HTP_MM_HMX_TILE_N_COLS);
-    const size_t bytes = (n_padded - n_last) * row_stride;
-    memset((uint8_t *) raw0 + n_last * row_stride, 0, bytes);
-    if (raw1) {
-        memset((uint8_t *) raw1 + n_last * row_stride, 0, bytes);
-    }
-}
-
 static int hmx_mm_2d_f32(struct htp_context *ctx,
                                   dma_queue *weight_dma,
                                   float *restrict dst,
@@ -2838,11 +2827,6 @@ static int hmx_mm_2d_f32(struct htp_context *ctx,
         VTCM_LAYOUT_PTR(__fp16, base, L.off_weight[0]),
         VTCM_LAYOUT_PTR_OPTIONAL(__fp16, base, L.off_weight[1], pipeline)
     };
-
-    // A ragged N: the last chunk's DMA leaves the tail of its last tile unfilled in the raw staging buffers;
-    if (!is_quant) {
-        hmx_mm_zero_weight_tail(vtcm_weight_raw[0], vtcm_weight_raw[1], (size_t) n, n_chunk_n_cols, row_stride);
-    }
 
     __fp16  *vtcm_f16_act    = VTCM_LAYOUT_PTR(__fp16, base, L.off_act);
     float   *vtcm_f32_act    = VTCM_LAYOUT_PTR(float, base, L.off_act_f32);
@@ -3449,10 +3433,6 @@ static int hmx_mm_f16_f32_batched(struct htp_context *ctx, const hmx_mm_f16_f32_
     const size_t fp16_row_bytes   = (size_t) params->k * sizeof(__fp16);
     const size_t weight_row_bytes = (size_t) params->weight_stride * sizeof(__fp16);
 
-    // A ragged N: the last chunk's DMA leaves the tail of its last tile unfilled in the
-    // staging buffers; zero it once here (see the helper for why once is enough).
-    hmx_mm_zero_weight_tail(vtcm_scratch0, vtcm_scratch1, (size_t) params->n, n_chunk_n_cols, fp16_row_bytes);
-
     htp_trace_event_stop(tr, HTP_TRACE_EVT_INIT, 0);
 
     hmx_matmul_job_t job;
@@ -3515,7 +3495,7 @@ static int hmx_mm_f16_f32_batched(struct htp_context *ctx, const hmx_mm_f16_f32_
 
                         const size_t n_cols_tiled = hex_align_up(n_cols, HTP_MM_HMX_TILE_N_COLS);
 
-                        hmx_interleave_rows_to_tiles(vtcm_weight, (const __fp16 *) curr_raw, n_cols_tiled, params->k, params->k, 0, n_cols_tiled);
+                        hmx_interleave_rows_to_tiles(vtcm_weight, (const __fp16 *) curr_raw, (uint32_t) n_cols, params->k, params->k, 0, (uint32_t) n_cols_tiled);
 
                         const size_t nc_next = nc + n_chunk_n_cols * 2;
                         if (nc_next < (size_t) params->n) {
