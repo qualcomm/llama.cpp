@@ -883,6 +883,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mat_f16_f32_l4_x8_pair = nullptr;
     cl_kernel kernel_mul_mat_f16_f32_l4_x8_gqa4 = nullptr;
     cl_kernel kernel_mul_mat_f16_f32_l4_x8_gqa4_img = nullptr;
+    cl_kernel kernel_mul_mat_f16_f32_l4_x8_gqa8_rs_img = nullptr;
     cl_kernel kernel_mul_mat_f16_f32_l4_x8_gqa_r4_img = nullptr;
     cl_kernel kernel_mul_mat_f16_f32_l4_x8_gqa_r2_dk256_img = nullptr;
     cl_kernel kernel_mul_mat_f16_f32_l4_y8 = nullptr;
@@ -1430,6 +1431,9 @@ static cl_program build_program_from_binary(cl_context ctx, cl_device_id dev, co
 
     return p;
 }
+
+static bool adreno_e17_compiler_quirks(const ggml_backend_opencl_context *backend_ctx);
+static bool ggml_cl_kq_rowsplit_on(const ggml_backend_opencl_context * backend_ctx);
 
 static void load_cl_kernels_argsort(ggml_backend_opencl_context *backend_ctx) {
     // compiler options for general kernels
@@ -2381,6 +2385,12 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         backend_ctx->kernel_mul_mat_f16_f32_l4_x8_gqa4_img =
             clCreateKernel(backend_ctx->program_mul_mv_f16_f32_l4, "kernel_mul_mat_f16_f32_l4_x8_gqa4_img", &err_x8gi);
         if (err_x8gi != CL_SUCCESS) { backend_ctx->kernel_mul_mat_f16_f32_l4_x8_gqa4_img = nullptr; }
+        if (ggml_cl_kq_rowsplit_on(backend_ctx)) {
+            cl_int err_rs;
+            backend_ctx->kernel_mul_mat_f16_f32_l4_x8_gqa8_rs_img =
+                clCreateKernel(backend_ctx->program_mul_mv_f16_f32_l4, "kernel_mul_mat_f16_f32_l4_x8_gqa8_rs_img", &err_rs);
+            if (err_rs != CL_SUCCESS) { backend_ctx->kernel_mul_mat_f16_f32_l4_x8_gqa8_rs_img = nullptr; }
+        }
 
         cl_int err_x8gi_r4 = CL_SUCCESS;
         backend_ctx->kernel_mul_mat_f16_f32_l4_x8_gqa_r4_img =
@@ -8558,6 +8568,18 @@ static bool adreno_e17_compiler_quirks(const ggml_backend_opencl_context *backen
     }
     const char * env = getenv("GGML_OPENCL_ADRENO_E17_QUIRKS");
     return !(env && env[0] == '0');
+}
+
+// Row-split decode KQ (kernel_mul_mat_f16_f32_l4_x8_gqa8_rs_img) in place of _x8_gqa4_img.
+// Measured on the Adreno 850 only: 2.3x at n_kv 4096 and 2.4x at 8192. The Adreno 840 loses
+// with it (up to -50% at n_kv 2048), so it stays off elsewhere. GGML_OPENCL_KQ_ROWSPLIT=0/1
+// overrides.
+static bool ggml_cl_kq_rowsplit_on(const ggml_backend_opencl_context * backend_ctx) {
+    static const char * env = getenv("GGML_OPENCL_KQ_ROWSPLIT");
+    if (env && env[0]) {
+        return env[0] != '0';
+    }
+    return adreno_e17_compiler_quirks(backend_ctx);
 }
 
 inline bool use_adreno_moe_kernels(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor) {
@@ -23588,6 +23610,16 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             const size_t k_pixels = k_bytes >> 4;
             if (k_pixels > 0 && k_pixels <= backend_ctx->image_max_buffer_size) {
                 cl_kernel kernel = backend_ctx->kernel_mul_mat_f16_f32_l4_x8_gqa4_img;
+                // The row-split kernel takes n_it 8-row groups per workgroup, sized so the
+                // grid stays near 192 workgroups (16 per CU on the 850) at any KV length.
+                int64_t rows_per_wg = 16;
+                int     rs_n_it     = 0;
+                if (backend_ctx->kernel_mul_mat_f16_f32_l4_x8_gqa8_rs_img != nullptr) {
+                    const int64_t wg_per_head = std::max<int64_t>(1, 192 / (ne02 * ne13));
+                    rs_n_it     = (int)CEIL_DIV(CEIL_DIV(ne01, 8), wg_per_head);
+                    rows_per_wg = 8 * (int64_t)rs_n_it;
+                    kernel      = backend_ctx->kernel_mul_mat_f16_f32_l4_x8_gqa8_rs_img;
+                }
                 cl_mem K_img = ggml_cl_img_pool_get_or_create(
                     backend_ctx, backend_ctx->kq_img_pool,
                     extra0->data_device, offset0, k_bytes, CL_FLOAT);
@@ -23616,8 +23648,12 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(int),      &r2));
                     CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(int),      &r3));
 
+                    if (rs_n_it > 0) {
+                        CL_CHECK(clSetKernelArg(kernel, k_arg++, sizeof(int), &rs_n_it));
+                    }
+
                     const int nth0_d = 64;
-                    const int64_t n_wg_x = ne01 / 16;
+                    const int64_t n_wg_x = CEIL_DIV(ne01, rows_per_wg);
                     size_t global_work_size[] = {(size_t)n_wg_x * nth0_d, (size_t)1, (size_t)ne02 * ne13};
                     size_t local_work_size[]  = {(size_t)nth0_d, (size_t)1, 1};
                     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
@@ -24685,7 +24721,12 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     // GQA-coalesced KQV variant (DK=128/r2=8/r3=1) that reads
                     // each V slab once per K-head and emits all r2 Q-heads
                     static const char * mm_kqv_gqa_env = getenv("GGML_OPENCL_MM_KQV_GQA");
-                    static const bool mm_kqv_gqa_on = (mm_kqv_gqa_env != nullptr && mm_kqv_gqa_env[0] != '0');
+                    // Opt-in, except on the E17 compiler (Adreno 850) from n_kv 1024, where it
+                    // is measured faster than the per-head kernel: KQV per call at n_kv 1024
+                    // 42 -> 36 us, 4096 170 -> 80 us (512 is 28 -> 30).
+                    const bool mm_kqv_gqa_on = mm_kqv_gqa_env != nullptr
+                        ? mm_kqv_gqa_env[0] != '0'
+                        : (adreno_e17_compiler_quirks(backend_ctx) && ne00 >= 1024);
                     if (can_multi_out && (ne01 % 16) == 0 && ne00 == 128 && r2 == 8 && r3 == 1 && mm_kq_gqa_on &&
                         backend_ctx->kernel_mul_mat_f16_f32_l4_x8_gqa4 != nullptr) {
                         kernel = backend_ctx->kernel_mul_mat_f16_f32_l4_x8_gqa4;
