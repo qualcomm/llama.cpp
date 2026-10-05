@@ -352,9 +352,9 @@ static void ssm_conv_thread_f32_prefill(unsigned int nth, unsigned int ith, void
     dma_queue_pop(dma_q);
 
     // 2. Unpack/transpose src1_raw into src1_T {d_conv, d_inner_stride}
-    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) ir0);
+    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_W_PREP, (uint16_t) ir0);
     hvx_ssm_conv_unpack_to_T(src1_raw, src1_T, d_inner_per_thread, d_inner_stride, d_conv);
-    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) ir0);
+    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_W_PREP, (uint16_t) ir0);
 
     const uint32_t C_TILE = VLEN_FP32;
 
@@ -365,23 +365,28 @@ static void ssm_conv_thread_f32_prefill(unsigned int nth, unsigned int ith, void
     }
     const HVX_Vector vv = *(const HVX_Vector *) gather_off;
 
-    const uint32_t n_tiles  = (d_inner_per_thread + d_inner_tile - 1) / d_inner_tile;
-    const uint32_t n_chunks = n_s * n_tiles;
+    const uint32_t n_tiles   = (d_inner_per_thread + d_inner_tile - 1) / d_inner_tile;
+    const uint32_t n_chunks  = n_s * n_tiles;
     const size_t   row_bytes = ncs * sizeof(float);
+
+    uint32_t s_fetch        = 0;
+    uint32_t tile_off_fetch = 0;
 
     // Chunk c fetches into src0_tile_raw[c & 1] and writes back from dst_tile[c & 1].
     // Two fetches run ahead, so the queue order is F0 F1 W0 F2 W1 ... and pops follow it.
     #define SSM_CONV_PUSH_FETCH(c)                                                                  \
         do {                                                                                        \
-            const uint32_t c_ = (c);                                                                \
-            const uint32_t s_ = c_ / n_tiles;                                                       \
-            const uint32_t o_ = (c_ - s_ * n_tiles) * d_inner_tile;                                 \
             dma_queue_push(dma_q,                                                                   \
-                           dma_make_data((uint8_t *) src0_tile_raw[c_ & 1],                         \
-                                         src0->data + s_ * src0_stride_seq_bytes +                  \
-                                             (ir0 + o_) * src0_stride_inner_bytes),                 \
+                           dma_make_data((uint8_t *) src0_tile_raw[(c) & 1],                        \
+                                         src0->data + s_fetch * src0_stride_seq_bytes +             \
+                                             (ir0 + tile_off_fetch) * src0_stride_inner_bytes),     \
                            row_bytes, src0_stride_inner_bytes, row_bytes,                           \
-                           MIN(d_inner_tile, d_inner_per_thread - o_));                             \
+                           MIN(d_inner_tile, d_inner_per_thread - tile_off_fetch));                 \
+            tile_off_fetch += d_inner_tile;                                                         \
+            if (tile_off_fetch >= d_inner_per_thread) {                                             \
+                tile_off_fetch = 0;                                                                 \
+                s_fetch++;                                                                          \
+            }                                                                                       \
         } while (0)
 
     SSM_CONV_PUSH_FETCH(0);
@@ -389,10 +394,11 @@ static void ssm_conv_thread_f32_prefill(unsigned int nth, unsigned int ith, void
         SSM_CONV_PUSH_FETCH(1);
     }
 
+    uint32_t i3       = 0;
+    uint32_t tile_off = 0;
+
     for (uint32_t c = 0; c < n_chunks; ++c) {
-        const uint32_t i3       = c / n_tiles;
-        const uint32_t tile_off = (c - i3 * n_tiles) * d_inner_tile;
-        const uint32_t tile_n   = MIN(d_inner_tile, d_inner_per_thread - tile_off);
+        const uint32_t tile_n = MIN(d_inner_tile, d_inner_per_thread - tile_off);
 
         const float * restrict raw = src0_tile_raw[c & 1];
         float * restrict       out = dst_tile[c & 1];
@@ -409,9 +415,9 @@ static void ssm_conv_thread_f32_prefill(unsigned int nth, unsigned int ith, void
         for (uint32_t cb = 0; cb < tile_n; cb += C_TILE) {
             const uint32_t cb_n = MIN(C_TILE, tile_n - cb);
 
-            htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_W_PREP, (uint16_t) tile_off);
+            htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_A_PREP, (uint16_t) tile_off);
             hvx_ssm_conv_transpose_block(raw + (size_t) cb * ncs, src0_T, ncs, cb_n, vv);
-            htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_W_PREP, (uint16_t) tile_off);
+            htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_A_PREP, (uint16_t) tile_off);
 
             const float * restrict wp = src1_T + tile_off + cb;
             float * restrict       op = out + cb;
@@ -463,6 +469,12 @@ static void ssm_conv_thread_f32_prefill(unsigned int nth, unsigned int ith, void
 
         if (c + 2 < n_chunks) {
             SSM_CONV_PUSH_FETCH(c + 2);
+        }
+
+        tile_off += d_inner_tile;
+        if (tile_off >= d_inner_per_thread) {
+            tile_off = 0;
+            i3++;
         }
     }
 
