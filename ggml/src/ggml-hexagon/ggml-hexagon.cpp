@@ -6265,6 +6265,31 @@ static void ggml_hexagon_precompute_sort_params(
     kparams->n_slots           = (int32_t) layout.n_slots;
 }
 
+static void ggml_hexagon_pool_interior_range(
+    uint32_t src_x, uint32_t dst_x, uint32_t kernel_x, uint32_t stride_x, int32_t pad_x,
+    uint32_t * ox_lo, uint32_t * ox_hi) {
+    const uint32_t lo_raw = ((uint32_t) pad_x + stride_x - 1) / stride_x;
+    *ox_lo = (lo_raw < dst_x) ? lo_raw : dst_x;
+
+    const int32_t numer_hi = (int32_t) src_x - (int32_t) kernel_x + pad_x;
+    if (numer_hi < 0) {
+        *ox_hi = 0;
+    } else {
+        const uint32_t hi_raw = (uint32_t) numer_hi / stride_x + 1;
+        *ox_hi = (hi_raw < dst_x) ? hi_raw : dst_x;
+    }
+    if (*ox_hi < *ox_lo) {
+        *ox_hi = *ox_lo;
+    }
+}
+
+static bool ggml_hexagon_pool_shape_fits(
+    const struct ggml_tensor * src0,
+    const struct ggml_tensor * dst
+) {
+    return ggml_nbytes(src0) <= UINT32_MAX - 256 && ggml_nbytes(dst) <= UINT32_MAX - 256;
+}
+
 static void ggml_hexagon_precompute_pool_2d_params(
     const struct ggml_hexagon_session * sess,
     const struct ggml_tensor * src0,
@@ -6280,20 +6305,17 @@ static void ggml_hexagon_precompute_pool_2d_params(
     const uint32_t dst_y = is_pool_1d ? 1 : (uint32_t) dst->ne[1];
     const uint32_t src_plane_bytes = src_x * src_y * sizeof(float);
     const uint32_t dst_plane_bytes = dst_x * dst_y * sizeof(float);
-    // Leave one 128-byte HVX vector of guard space for the narrow-width path,
-    // which uses partial stores and full-width loads from VTCM.
+    // Reserve one 128-byte HVX vector for narrow-path loads.
     const uint32_t src_plane_aligned = (uint32_t) ((src_plane_bytes + 255) & ~127u);
     const uint32_t dst_plane_aligned = (uint32_t) ((dst_plane_bytes + 127) & ~127u);
     const uint32_t planes = (uint32_t) (is_pool_1d
-        ? src0->ne[1] * src0->ne[2] * src0->ne[3]
-        : src0->ne[2] * src0->ne[3]);
+        ? (uint64_t) src0->ne[1] * (uint64_t) src0->ne[2] * (uint64_t) src0->ne[3]
+        : (uint64_t) src0->ne[2] * (uint64_t) src0->ne[3]);
     const uint32_t n_threads = (std::min)((uint32_t) sess->n_threads, planes);
-    const uint32_t planes_per_thread = (planes + n_threads - 1) / n_threads;
     const uint64_t per_thread_vtcm = 2 * ((uint64_t) src_plane_aligned + dst_plane_aligned);
     const uint64_t total_bytes = (uint64_t) planes * (src_plane_bytes + dst_plane_bytes);
-    // DMA/VTCM setup dominates very small pool operations.  Keep those
-    // operations on HTP, but access DDR directly instead of paying the
-    // staging overhead.  Larger workloads retain the overlapped DMA path.
+    // DMA/VTCM setup dominates very small pool operations.  Use staging only
+    // for paths that keep all compute accesses vector-based.
     constexpr uint64_t pool_dma_min_bytes = 64 * 1024;
 
     kparams->src_x = src_x;
@@ -6310,17 +6332,13 @@ static void ggml_hexagon_precompute_pool_2d_params(
     kparams->dst_plane_bytes = dst_plane_bytes;
     kparams->src_plane_bytes_aligned = src_plane_aligned;
     kparams->dst_plane_bytes_aligned = dst_plane_aligned;
-    kparams->planes_per_thread = planes_per_thread;
-    kparams->use_dma = total_bytes >= pool_dma_min_bytes &&
-                       per_thread_vtcm * n_threads <= sess->vtcm_size;
+    kparams->n_threads = n_threads;
+    kparams->planes = planes;
     kparams->pool_op = (uint32_t) ggml_get_op_params_i32(dst, 0);
-    // Fast HVX path requires exact non-overlapping tiling (stride == kernel, no padding)
-    // and a kernel width the deinterleave trick supports
+    // Fast HVX path requires exact tiling and a supported kernel width.
     kparams->fast_path = (kparams->pad_x == 0 && kparams->pad_y == 0 &&
                            kparams->stride_x == kparams->kernel_x && kparams->stride_y == kparams->kernel_y &&
                            (kparams->kernel_x == 1 || kparams->kernel_x == 2)) ? 1 : 0;
-    kparams->narrow_path = (kparams->use_dma && kparams->fast_path &&
-                            kparams->dst_x < 32) ? 1 : 0;
     kparams->global_path = (kparams->pad_x == 0 && kparams->pad_y == 0 &&
                             kparams->stride_x == kparams->kernel_x &&
                             kparams->stride_y == kparams->kernel_y &&
@@ -6330,12 +6348,24 @@ static void ggml_hexagon_precompute_pool_2d_params(
     kparams->block_path = (kparams->pad_x == 0 && kparams->pad_y == 0 &&
                            kparams->kernel_y == 1 && kparams->stride_y == 1 &&
                            kparams->stride_x == kparams->kernel_x &&
-                           kparams->kernel_x > 2) ? 1 : 0;
+                           kparams->kernel_x >= 32) ? 1 : 0;
     kparams->exact_path = (kparams->pad_x == 0 && kparams->pad_y == 0 &&
                            kparams->stride_x == kparams->kernel_x &&
                            kparams->stride_y == kparams->kernel_y) ? 1 : 0;
-    kparams->narrow_general_path = 0;
     kparams->avg_divide_count = (is_pool_1d && kparams->pool_op == GGML_OP_POOL_AVG) ? 1 : 0;
+    ggml_hexagon_pool_interior_range(kparams->src_x, kparams->dst_x, kparams->kernel_x,
+                                     kparams->stride_x, kparams->pad_x,
+                                     &kparams->ox_lo, &kparams->ox_hi);
+
+    const bool narrow_ok = (uint64_t) kparams->dst_x * kparams->kernel_x <= 32;
+    const bool fast_dma_safe = kparams->fast_path &&
+                               (narrow_ok || kparams->dst_x % 32 == 0);
+    const bool dma_safe_path = kparams->global_path || kparams->block_path || fast_dma_safe;
+    kparams->use_dma = dma_safe_path &&
+                       total_bytes >= pool_dma_min_bytes &&
+                       per_thread_vtcm * n_threads <= sess->vtcm_size;
+    kparams->narrow_path = (kparams->use_dma && kparams->fast_path &&
+                            narrow_ok) ? 1 : 0;
     kparams->inv_kernel_area = 1.0f / (float) (kparams->kernel_x * kparams->kernel_y);
 }
 
@@ -6788,8 +6818,6 @@ static bool ggml_hexagon_supported_pool_2d(const struct ggml_hexagon_session * s
     const struct ggml_tensor * src0 = op->src[0];
     const int32_t * params = op->op_params;
 
-    GGML_UNUSED(sess);
-
     if (params[0] != GGML_OP_POOL_AVG && params[0] != GGML_OP_POOL_MAX) {
         return false;
     }
@@ -6797,6 +6825,9 @@ static bool ggml_hexagon_supported_pool_2d(const struct ggml_hexagon_session * s
         return false;
     }
     if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(op)) {
+        return false;
+    }
+    if (!ggml_hexagon_pool_shape_fits(src0, op)) {
         return false;
     }
 
@@ -6822,9 +6853,11 @@ static bool ggml_hexagon_supported_pool_2d(const struct ggml_hexagon_session * s
 
     const bool block_pool =
         pad_x == 0 && pad_y == 0 && kernel_y == 1 && stride_y == 1 &&
-        stride_x == kernel_x && kernel_x > 2;
+        stride_x == kernel_x && kernel_x >= 32;
     if (block_pool) {
-        return true;
+        // FIXME: Work is split per plane, so few planes leave threads idle with no DMA overlap.
+        // Split rows within a plane and reduce 32 outputs per vector, then drop this gate.
+        return src0->ne[2] * src0->ne[3] >= (int64_t) sess->n_threads;
     }
 
     const bool exact_tiling =
@@ -6834,25 +6867,24 @@ static bool ggml_hexagon_supported_pool_2d(const struct ggml_hexagon_session * s
         return true;
     }
 
-    // Small source rows use the packed HVX fallback, including padded and
-    // overlapping windows whose output is too narrow for the general vector path.
+    // Small source rows use the scalar general path, including padded and overlapping windows.
     if (src0->ne[0] < 32) {
         return true;
     }
 
     // FIXME: Vectorize general pooling when no full x-interior is available.
     uint32_t ox_lo, ox_hi;
-    htp_pool2d_interior_range((uint32_t) src0->ne[0], (uint32_t) op->ne[0],
+    ggml_hexagon_pool_interior_range((uint32_t) src0->ne[0], (uint32_t) op->ne[0],
                                   (uint32_t) kernel_x, (uint32_t) stride_x,
                                   pad_x, &ox_lo, &ox_hi);
     return ox_hi - ox_lo >= 32;
+
+    GGML_UNUSED(sess);
 }
 
 static bool ggml_hexagon_supported_pool_1d(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op) {
     const struct ggml_tensor * src0 = op->src[0];
     const int32_t * params = op->op_params;
-
-    GGML_UNUSED(sess);
 
     if (params[0] != GGML_OP_POOL_AVG && params[0] != GGML_OP_POOL_MAX) {
         return false;
@@ -6861,6 +6893,9 @@ static bool ggml_hexagon_supported_pool_1d(const struct ggml_hexagon_session * s
         return false;
     }
     if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(op)) {
+        return false;
+    }
+    if (!ggml_hexagon_pool_shape_fits(src0, op)) {
         return false;
     }
 
@@ -6874,6 +6909,8 @@ static bool ggml_hexagon_supported_pool_1d(const struct ggml_hexagon_session * s
     // The pool kernel has a scalar general path for overlapping windows,
     // arbitrary strides, and padding.
     return true;
+
+    GGML_UNUSED(sess);
 }
 
 static bool ggml_hexagon_supported_activations(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op) {
