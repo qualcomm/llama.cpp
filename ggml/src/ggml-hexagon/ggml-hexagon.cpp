@@ -6305,13 +6305,16 @@ static void ggml_hexagon_precompute_pool_2d_params(
     const uint32_t dst_y = is_pool_1d ? 1 : (uint32_t) dst->ne[1];
     const uint32_t src_plane_bytes = src_x * src_y * sizeof(float);
     const uint32_t dst_plane_bytes = dst_x * dst_y * sizeof(float);
-    // Reserve one 128-byte HVX vector for narrow-path loads.
-    const uint32_t src_plane_aligned = (uint32_t) ((src_plane_bytes + 255) & ~127u);
-    const uint32_t dst_plane_aligned = (uint32_t) ((dst_plane_bytes + 127) & ~127u);
     const uint32_t planes = (uint32_t) (is_pool_1d
         ? (uint64_t) src0->ne[1] * (uint64_t) src0->ne[2] * (uint64_t) src0->ne[3]
         : (uint64_t) src0->ne[2] * (uint64_t) src0->ne[3]);
     const uint32_t n_threads = (std::min)((uint32_t) sess->n_threads, planes > 0 ? planes : 1);
+
+    struct htp_pool_vtcm_layout layout;
+    const bool ok = htp_pool_solve_layout(
+        &layout, src_x, src_y, dst_x, dst_y,
+        n_threads, sess->vtcm_size);
+    GGML_ASSERT(ok);
 
     kparams->src_x = src_x;
     kparams->src_y = src_y;
@@ -6325,8 +6328,8 @@ static void ggml_hexagon_precompute_pool_2d_params(
     kparams->pad_y = is_pool_1d ? 0 : ggml_get_op_params_i32(dst, 6);
     kparams->src_plane_bytes = src_plane_bytes;
     kparams->dst_plane_bytes = dst_plane_bytes;
-    kparams->src_plane_bytes_aligned = src_plane_aligned;
-    kparams->dst_plane_bytes_aligned = dst_plane_aligned;
+    kparams->src_plane_bytes_aligned = (uint32_t) layout.src_spad_half_size;
+    kparams->dst_plane_bytes_aligned = (uint32_t) layout.dst_spad_half_size;
     kparams->n_threads = n_threads;
     kparams->planes = planes;
     kparams->pool_op = (uint32_t) ggml_get_op_params_i32(dst, 0);
@@ -6352,15 +6355,6 @@ static void ggml_hexagon_precompute_pool_2d_params(
     const bool narrow_ok = (uint64_t) kparams->dst_x * kparams->kernel_x <= 32;
     kparams->narrow_path = (kparams->fast_path && narrow_ok) ? 1 : 0;
     kparams->inv_kernel_area = 1.0f / (float) (kparams->kernel_x * kparams->kernel_y);
-
-    struct htp_pool_vtcm_layout layout;
-    const bool ok = htp_pool_solve_layout(
-        &layout, src_x, src_y, dst_x, dst_y,
-        kparams->kernel_y, kparams->stride_y, kparams->pad_y,
-        n_threads, sess->vtcm_size);
-    GGML_ASSERT(ok);
-
-    kparams->chunk_rows = layout.chunk_rows;
 }
 
 static void ggml_hexagon_precompute_fused_mmnx_params(
@@ -6844,7 +6838,6 @@ static bool ggml_hexagon_supported_pool_2d(const struct ggml_hexagon_session * s
     struct htp_pool_vtcm_layout layout;
     return htp_pool_solve_layout(&layout, (uint32_t) src0->ne[0], (uint32_t) src0->ne[1],
                                  (uint32_t) op->ne[0], (uint32_t) op->ne[1],
-                                 (uint32_t) kernel_y, (uint32_t) stride_y, pad_y,
                                  n_threads, sess->vtcm_size);
 }
 
@@ -6878,7 +6871,6 @@ static bool ggml_hexagon_supported_pool_1d(const struct ggml_hexagon_session * s
     struct htp_pool_vtcm_layout layout;
     return htp_pool_solve_layout(&layout, (uint32_t) src0->ne[0], 1,
                                  (uint32_t) op->ne[0], 1,
-                                 1, 1, 0,
                                  n_threads, sess->vtcm_size);
 }
 

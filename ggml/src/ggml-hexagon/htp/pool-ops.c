@@ -248,7 +248,7 @@ struct pool_2d_context {
     struct htp_ops_context * octx;
     const struct htp_pool_2d_kernel_params * kparams;
     pool_plane_fn_t pool_plane;
-    struct htp_pool_vtcm_layout layout;
+    uint32_t n_threads;
     uint32_t plane_start;
     uint32_t plane_count;
     uint32_t planes_per_thread;
@@ -271,13 +271,18 @@ static void pool_2d_thread(unsigned int nth, unsigned int ith, void * data) {
     struct htp_thread_trace * tr = &ctx->octx->ctx->trace[ith];
     dma_queue * dma_queue = ctx->octx->ctx->dma[ith];
 
-    const struct htp_pool_vtcm_layout * layout = &ctx->layout;
-    uint8_t * vtcm_base = (uint8_t *) ctx->octx->ctx->vtcm_base;
-    uint8_t * src_spad  = vtcm_base + layout->off_src + ith * layout->src_bytes_per_thread;
-    uint8_t * dst_spad  = vtcm_base + layout->off_dst + ith * layout->dst_bytes_per_thread;
+    const uint32_t src_spad_half = p->src_plane_bytes_aligned;
+    const uint32_t dst_spad_half = p->dst_plane_bytes_aligned;
+    const uint32_t src_bytes_per_thread = 2 * src_spad_half;
+    const uint32_t dst_bytes_per_thread = 2 * dst_spad_half;
+    const size_t off_dst = (size_t) ctx->n_threads * src_bytes_per_thread;
 
-    float * srcb2[2] = { (float *) src_spad, (float *) (src_spad + layout->src_spad_half_size) };
-    float * dstb2[2] = { (float *) dst_spad, (float *) (dst_spad + layout->dst_spad_half_size) };
+    uint8_t * vtcm_base = (uint8_t *) ctx->octx->ctx->vtcm_base;
+    uint8_t * src_spad  = vtcm_base + ith * src_bytes_per_thread;
+    uint8_t * dst_spad  = vtcm_base + off_dst + ith * dst_bytes_per_thread;
+
+    float * srcb2[2] = { (float *) src_spad, (float *) (src_spad + src_spad_half) };
+    float * dstb2[2] = { (float *) dst_spad, (float *) (dst_spad + dst_spad_half) };
 
     const uint32_t total = last - first;
 
@@ -285,13 +290,13 @@ static void pool_2d_thread(unsigned int nth, unsigned int ith, void * data) {
     for (uint32_t i = 0; i < total && i < 2; ++i) {
         dma_queue_push(dma_queue,
                        dma_make_data(dst->data, dstb2[i]),
-                       p->dst_plane_bytes, layout->dst_spad_half_size,
+                       p->dst_plane_bytes, dst_spad_half,
                        p->dst_plane_bytes, 0);
 
         const dma_addr_t src_addr = src0->data + (first + i) * p->src_plane_bytes;
         dma_queue_push(dma_queue,
                        dma_make_data(srcb2[i], src_addr),
-                       layout->src_spad_half_size, p->src_plane_bytes,
+                       src_spad_half, p->src_plane_bytes,
                        p->src_plane_bytes, 1);
     }
 
@@ -311,14 +316,14 @@ static void pool_2d_thread(unsigned int nth, unsigned int ith, void * data) {
         const dma_addr_t dst_addr = dst->data + plane * p->dst_plane_bytes;
         dma_queue_push(dma_queue,
                        dma_make_data(dst_addr, dstb),
-                       p->dst_plane_bytes, layout->dst_spad_half_size,
+                       p->dst_plane_bytes, dst_spad_half,
                        p->dst_plane_bytes, 1);
 
         if (i + 2 < total) {
             const dma_addr_t next_src_addr = src0->data + (plane + 2) * p->src_plane_bytes;
             dma_queue_push(dma_queue,
                            dma_make_data(srcb, next_src_addr),
-                           layout->src_spad_half_size, p->src_plane_bytes,
+                           src_spad_half, p->src_plane_bytes,
                            p->src_plane_bytes, 1);
         }
     }
@@ -340,12 +345,6 @@ int op_pool_2d(struct htp_ops_context * octx) {
     if (src0->type != HTP_TYPE_F32 || dst->type != HTP_TYPE_F32 ||
         (p->pool_op != HTP_POOL_AVG && p->pool_op != HTP_POOL_MAX)) {
         return HTP_STATUS_NO_SUPPORT;
-    }
-    struct htp_pool_vtcm_layout layout;
-    if (!htp_pool_solve_layout(&layout, p->src_x, p->src_y, p->dst_x, p->dst_y,
-                               p->kernel_y, p->stride_y, p->pad_y,
-                               p->n_threads, octx->ctx->vtcm_size)) {
-        return HTP_STATUS_VTCM_TOO_SMALL;
     }
 
     uint32_t plane_start = 0;
@@ -386,7 +385,7 @@ int op_pool_2d(struct htp_ops_context * octx) {
         .octx = octx,
         .kparams = p,
         .pool_plane = pool_plane,
-        .layout = layout,
+        .n_threads = n_threads,
         .plane_start = plane_start,
         .plane_count = plane_count,
         .planes_per_thread = planes_per_thread,
