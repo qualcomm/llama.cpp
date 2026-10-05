@@ -1439,6 +1439,8 @@ static cl_program build_program_from_binary(cl_context ctx, cl_device_id dev, co
     return p;
 }
 
+static bool adreno_e17_compiler_quirks(const ggml_backend_opencl_context *backend_ctx);
+
 static void load_cl_kernels_argsort(ggml_backend_opencl_context *backend_ctx) {
     // compiler options for general kernels
     auto opencl_c_std =
@@ -4536,6 +4538,11 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
     std::string CL_moe_compile_opts = std::string("-cl-std=") + opencl_c_std +
             " -cl-mad-enable "
             " -cl-fast-relaxed-math";
+    // The MoE GEMMs (f32 and dp4a) get wrong values from the start of their local tiles on
+    // the E17 compiler (Adreno 850); see MOE_LM_PAD in those kernels.
+    if (adreno_e17_compiler_quirks(backend_ctx)) {
+        CL_moe_compile_opts += " -DMOE_LM_PAD=1";
+    }
 
     // gemv_moe_q4_1_f32_ns
     {
@@ -8599,7 +8606,11 @@ inline bool use_adreno_moe_kernels(const ggml_backend_opencl_context *backend_ct
         return false;
     }
 
-    if (adreno_e17_compiler_quirks(backend_ctx)) {
+    // The E17 compiler (Adreno 850) builds these repack kernels correctly: every type survives
+    // a set_tensor/get_tensor round trip byte for byte there. What went wrong on E17 is the MoE
+    // GEMMs reading wrong values from the start of their local tiles, fixed by MOE_LM_PAD. q5_K
+    // stays excluded on E17: its round trip does differ there (not on the Adreno 840).
+    if (adreno_e17_compiler_quirks(backend_ctx) && tensor->type == GGML_TYPE_Q5_K) {
         return false;
     }
 
