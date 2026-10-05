@@ -49,17 +49,17 @@ static inline float pool_inv_count_cached(struct pool_inv_cache * cache, uint32_
 
 // Fast path: exact non-overlapping tiling (stride == kernel, no padding), kernel_x in {1,2}.
 // Every window is guaranteed fully in-bounds, so this never needs boundary clamping.
-static inline void pool_plane_hvx(
+static void pool_plane_hvx(
     const float * src, float * dst, const struct htp_pool_2d_kernel_params * p) {
     const bool is_max = (p->pool_op == HTP_POOL_MAX);
     const HVX_Vector scale = hvx_vec_splat_f32(p->inv_kernel_area);
     const HVX_Vector seed  = is_max ? hvx_vec_splat_f32(-FLT_MAX) : Q6_V_vsplat_R(0);
 
-    const uint32_t nvec = p->dst_x / VLEN_FP32;
     for (uint32_t oy = 0; oy < p->dst_y; ++oy) {
         const uint32_t sy = oy * p->kernel_y;
-        for (uint32_t vx = 0; vx < nvec; ++vx) {
-            const uint32_t ox = vx * VLEN_FP32;
+        for (uint32_t ox = 0; ox < p->dst_x; ox += VLEN_FP32) {
+            const uint32_t rem = p->dst_x - ox;
+            const uint32_t nbytes = (rem < VLEN_FP32) ? (rem * sizeof(float)) : VLEN;
             HVX_Vector acc = seed;
             for (uint32_t ky = 0; ky < p->kernel_y; ++ky) {
                 const float * row = src + (sy + ky) * p->src_x;
@@ -76,26 +76,14 @@ static inline void pool_plane_hvx(
                     acc = is_max ? Q6_Vsf_vmax_VsfVsf(acc, v) : hvx_vec_add_f32_f32(acc, v);
                 }
             }
-            hvx_vec_store_u(dst + oy * p->dst_x + ox, VLEN, is_max ? acc : hvx_vec_mul_f32_f32(acc, scale));
-        }
-
-        for (uint32_t ox = nvec * VLEN_FP32; ox < p->dst_x; ++ox) {
-            const uint32_t sx = ox * p->kernel_x;
-            float acc = is_max ? -FLT_MAX : 0.0f;
-            for (uint32_t ky = 0; ky < p->kernel_y; ++ky) {
-                const float * row = src + (sy + ky) * p->src_x + sx;
-                for (uint32_t kx = 0; kx < p->kernel_x; ++kx) {
-                    acc = is_max ? MAX(acc, row[kx]) : acc + row[kx];
-                }
-            }
-            dst[oy * p->dst_x + ox] = is_max ? acc : acc * p->inv_kernel_area;
+            hvx_vec_store_u(dst + oy * p->dst_x + ox, nbytes, is_max ? acc : hvx_vec_mul_f32_f32(acc, scale));
         }
     }
 }
 
 // Narrow exact-tiling path. The input is staged in VTCM with one vector of
 // guard space, so full-width loads are safe even when src_x is below 32.
-static inline void pool_plane_hvx_narrow(
+static void pool_plane_hvx_narrow(
     const float * src, float * dst, const struct htp_pool_2d_kernel_params * p) {
     const bool is_max = (p->pool_op == HTP_POOL_MAX);
     const HVX_Vector scale = hvx_vec_splat_f32(p->inv_kernel_area);
@@ -127,7 +115,7 @@ static inline void pool_plane_hvx_narrow(
     }
 }
 
-static inline void pool_plane_global(
+static void pool_plane_global(
     const float * src, float * dst, const struct htp_pool_2d_kernel_params * p) {
     const uint32_t n = p->src_x * p->src_y;
     if (p->pool_op == HTP_POOL_MAX) {
@@ -137,7 +125,7 @@ static inline void pool_plane_global(
     }
 }
 
-static inline void pool_plane_block(
+static void pool_plane_block(
     const float * src, float * dst, const struct htp_pool_2d_kernel_params * p) {
     for (uint32_t oy = 0; oy < p->dst_y; ++oy) {
         const float * row = src + oy * p->src_x;
@@ -155,7 +143,7 @@ static inline void pool_plane_block(
 
 // Generic exact-tiling path for kernels without a lane-shuffle fast path. Strided
 // lanes cannot be vector-loaded, so accumulate in scalar registers (DDR input only).
-static inline void pool_plane_exact(
+static void pool_plane_exact(
     const float * src, float * dst, const struct htp_pool_2d_kernel_params * p) {
     const bool is_max = (p->pool_op == HTP_POOL_MAX);
     for (uint32_t oy = 0; oy < p->dst_y; ++oy) {
@@ -281,7 +269,7 @@ static inline void pool_row_general_vec(
     }
 }
 
-static inline void pool_plane_general(
+static void pool_plane_general(
     const float * src, float * dst, const struct htp_pool_2d_kernel_params * p) {
     const bool is_max = (p->pool_op == HTP_POOL_MAX);
 
@@ -300,27 +288,16 @@ static inline void pool_plane_general(
     }
 }
 
-static inline void pool_plane(const float * src, float * dst, const struct htp_pool_2d_kernel_params * p) {
-    if (p->global_path) {
-        pool_plane_global(src, dst, p);
-    } else if (p->block_path) {
-        pool_plane_block(src, dst, p);
-    } else if (p->narrow_path) {
-        pool_plane_hvx_narrow(src, dst, p);
-    } else if (p->fast_path) {
-        pool_plane_hvx(src, dst, p);
-    } else if (p->exact_path) {
-        pool_plane_exact(src, dst, p);
-    } else {
-        pool_plane_general(src, dst, p);
-    }
-}
+typedef void (*pool_plane_fn_t)(const float * src, float * dst, const struct htp_pool_2d_kernel_params * p);
 
 struct pool_2d_context {
     struct htp_ops_context * octx;
     const struct htp_pool_2d_kernel_params * kparams;
+    pool_plane_fn_t pool_plane;
+    struct htp_pool_vtcm_layout layout;
     uint32_t plane_start;
     uint32_t plane_count;
+    uint32_t planes_per_thread;
 };
 
 static void pool_2d_thread(unsigned int nth, unsigned int ith, void * data) {
@@ -328,7 +305,8 @@ static void pool_2d_thread(unsigned int nth, unsigned int ith, void * data) {
     const struct htp_pool_2d_kernel_params * p = ctx->kparams;
     const struct htp_tensor * src0 = ctx->octx->src[0];
     const struct htp_tensor * dst = ctx->octx->dst;
-    const uint32_t planes_per_thread = fastdiv(ctx->plane_count + p->n_threads - 1, &ctx->octx->n_threads_div);
+    pool_plane_fn_t pool_plane = ctx->pool_plane;
+    const uint32_t planes_per_thread = ctx->planes_per_thread;
     const uint32_t first = ctx->plane_start + ith * planes_per_thread;
     const uint32_t last = MIN(first + planes_per_thread, ctx->plane_start + ctx->plane_count);
 
@@ -337,32 +315,15 @@ static void pool_2d_thread(unsigned int nth, unsigned int ith, void * data) {
     }
 
     struct htp_thread_trace * tr = &ctx->octx->ctx->trace[ith];
-
-    if (!p->use_dma) {
-        const uint8_t * src_data = (const uint8_t *) htp_tensor_data(src0);
-        uint8_t * dst_data = (uint8_t *) htp_tensor_data(dst);
-        for (uint32_t plane = first; plane < last; ++plane) {
-            const float * src_plane = (const float *) (src_data + (size_t) plane * p->src_plane_bytes);
-            float * dst_plane = (float *) (dst_data + (size_t) plane * p->dst_plane_bytes);
-
-            htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) plane);
-            pool_plane(src_plane, dst_plane, p);
-            htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) plane);
-        }
-
-        FARF(HIGH, "pool2d-f32 %d/%d: %ux%ux%ux%u -> %ux%ux%ux%u (%u:%u)\n",
-             ith, nth, src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
-             dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3], first, last);
-        (void) nth;
-        return;
-    }
-
     dma_queue * dma_queue = ctx->octx->ctx->dma[ith];
-    const size_t spad_per_thread = 2 * (p->src_plane_bytes_aligned + p->dst_plane_bytes_aligned);
-    uint8_t * src_spad = ctx->octx->ctx->vtcm_base + ith * spad_per_thread;
-    uint8_t * dst_spad = src_spad + 2 * p->src_plane_bytes_aligned;
-    float * srcb2[2] = { (float *) src_spad, (float *) (src_spad + p->src_plane_bytes_aligned) };
-    float * dstb2[2] = { (float *) dst_spad, (float *) (dst_spad + p->dst_plane_bytes_aligned) };
+
+    const struct htp_pool_vtcm_layout * layout = &ctx->layout;
+    uint8_t * vtcm_base = (uint8_t *) ctx->octx->ctx->vtcm_base;
+    uint8_t * src_spad  = vtcm_base + layout->off_src + ith * layout->src_bytes_per_thread;
+    uint8_t * dst_spad  = vtcm_base + layout->off_dst + ith * layout->dst_bytes_per_thread;
+
+    float * srcb2[2] = { (float *) src_spad, (float *) (src_spad + layout->src_spad_half_size) };
+    float * dstb2[2] = { (float *) dst_spad, (float *) (dst_spad + layout->dst_spad_half_size) };
 
     const uint32_t total = last - first;
 
@@ -370,13 +331,13 @@ static void pool_2d_thread(unsigned int nth, unsigned int ith, void * data) {
     for (uint32_t i = 0; i < total && i < 2; ++i) {
         dma_queue_push(dma_queue,
                        dma_make_data(dst->data, dstb2[i]),
-                       p->dst_plane_bytes, p->dst_plane_bytes_aligned,
+                       p->dst_plane_bytes, layout->dst_spad_half_size,
                        p->dst_plane_bytes, 0);
 
         const dma_addr_t src_addr = src0->data + (first + i) * p->src_plane_bytes;
         dma_queue_push(dma_queue,
                        dma_make_data(srcb2[i], src_addr),
-                       p->src_plane_bytes_aligned, p->src_plane_bytes,
+                       layout->src_spad_half_size, p->src_plane_bytes,
                        p->src_plane_bytes, 1);
     }
 
@@ -396,14 +357,14 @@ static void pool_2d_thread(unsigned int nth, unsigned int ith, void * data) {
         const dma_addr_t dst_addr = dst->data + plane * p->dst_plane_bytes;
         dma_queue_push(dma_queue,
                        dma_make_data(dst_addr, dstb),
-                       p->dst_plane_bytes, p->dst_plane_bytes_aligned,
+                       p->dst_plane_bytes, layout->dst_spad_half_size,
                        p->dst_plane_bytes, 1);
 
         if (i + 2 < total) {
             const dma_addr_t next_src_addr = src0->data + (plane + 2) * p->src_plane_bytes;
             dma_queue_push(dma_queue,
                            dma_make_data(srcb, next_src_addr),
-                           p->src_plane_bytes_aligned, p->src_plane_bytes,
+                           layout->src_spad_half_size, p->src_plane_bytes,
                            p->src_plane_bytes, 1);
         }
     }
@@ -426,23 +387,17 @@ int op_pool_2d(struct htp_ops_context * octx) {
         (p->pool_op != HTP_POOL_AVG && p->pool_op != HTP_POOL_MAX)) {
         return HTP_STATUS_NO_SUPPORT;
     }
-    if (!htp_ops_context_set_n_threads(octx, p->n_threads)) {
-        return HTP_STATUS_INVAL_PARAMS;
-    }
-
-    if (p->use_dma) {
-        const size_t spad_per_thread = 2 * ((size_t) p->src_plane_bytes_aligned + p->dst_plane_bytes_aligned);
-        if (spad_per_thread * p->n_threads > octx->ctx->vtcm_size) {
-            return HTP_STATUS_VTCM_TOO_SMALL;
-        }
-    } else if (htp_tensor_is_extended(src0) || htp_tensor_is_extended(dst)) {
-        return HTP_STATUS_NO_SUPPORT;
+    struct htp_pool_vtcm_layout layout;
+    if (!htp_pool_solve_layout(&layout, p->src_x, p->src_y, p->dst_x, p->dst_y,
+                               p->kernel_y, p->stride_y, p->pad_y,
+                               p->n_threads, octx->ctx->vtcm_size)) {
+        return HTP_STATUS_VTCM_TOO_SMALL;
     }
 
     uint32_t plane_start = 0;
     uint32_t plane_count = p->planes;
     if (octx->ctx->mdev.count > 1) {
-        const uint32_t planes_per_chunk = HEX_L2_LINE_SIZE / hex_gcd_u32(p->dst_plane_bytes, HEX_L2_LINE_SIZE);
+        const uint32_t planes_per_chunk = (p->dst_plane_bytes > 0) ? (HEX_L2_LINE_SIZE / hex_gcd_u32(p->dst_plane_bytes, HEX_L2_LINE_SIZE)) : 1;
         const struct htp_tensor_mdev_range range = htp_tensor_mdev_partition(
             plane_count, htp_tensor_mdev_data_aligned(dst) ? planes_per_chunk : 0,
             octx->ctx->mdev.idx, octx->ctx->mdev.count, &octx->ctx->mdev.count_div);
@@ -453,13 +408,38 @@ int op_pool_2d(struct htp_ops_context * octx) {
         return HTP_STATUS_OK;
     }
 
+    const uint32_t n_threads = MIN(p->n_threads, plane_count);
+    if (!htp_ops_context_set_n_threads(octx, n_threads)) {
+        return HTP_STATUS_INVAL_PARAMS;
+    }
+
+    const uint32_t planes_per_thread = fastdiv(plane_count + n_threads - 1, &octx->n_threads_div);
+
+    pool_plane_fn_t pool_plane;
+    if (p->global_path) {
+        pool_plane = pool_plane_global;
+    } else if (p->block_path) {
+        pool_plane = pool_plane_block;
+    } else if (p->narrow_path) {
+        pool_plane = pool_plane_hvx_narrow;
+    } else if (p->fast_path) {
+        pool_plane = pool_plane_hvx;
+    } else if (p->exact_path) {
+        pool_plane = pool_plane_exact;
+    } else {
+        pool_plane = pool_plane_general;
+    }
+
     struct pool_2d_context ctx = {
         .octx = octx,
         .kparams = p,
+        .pool_plane = pool_plane,
+        .layout = layout,
         .plane_start = plane_start,
         .plane_count = plane_count,
+        .planes_per_thread = planes_per_thread,
     };
-    work_queue_run(octx->ctx->work_queue, pool_2d_thread, &ctx, p->n_threads);
+    work_queue_run(octx->ctx->work_queue, pool_2d_thread, &ctx, n_threads);
     return HTP_STATUS_OK;
 }
 

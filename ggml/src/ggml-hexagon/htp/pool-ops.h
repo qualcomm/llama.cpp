@@ -2,7 +2,11 @@
 #define HTP_POOL_OPS_H
 
 #include <stdint.h>
+#include <stddef.h>
 #include <stdbool.h>
+#include <string.h>
+
+#include "hex-common.h"
 
 struct htp_pool_2d_kernel_params {
     uint32_t src_x;
@@ -21,7 +25,7 @@ struct htp_pool_2d_kernel_params {
     uint32_t dst_plane_bytes_aligned;
     uint32_t n_threads;
     uint32_t planes;
-    uint32_t use_dma;
+    uint32_t chunk_rows;
     uint32_t pool_op;
     uint32_t fast_path;
     uint32_t narrow_path;
@@ -39,5 +43,81 @@ static_assert(sizeof(struct htp_pool_2d_kernel_params) <= 128, "htp_pool_2d_kern
 #else
 _Static_assert(sizeof(struct htp_pool_2d_kernel_params) <= 128, "htp_pool_2d_kernel_params is too large");
 #endif
+
+struct htp_pool_vtcm_layout {
+    size_t   total_bytes;
+    size_t   off_src;
+    size_t   off_dst;
+    size_t   src_bytes_per_thread;
+    size_t   dst_bytes_per_thread;
+    size_t   src_spad_half_size;
+    size_t   dst_spad_half_size;
+    uint32_t chunk_rows;
+};
+
+static inline bool htp_pool_solve_layout(
+    struct htp_pool_vtcm_layout * layout,
+    uint32_t src_x,
+    uint32_t src_y,
+    uint32_t dst_x,
+    uint32_t dst_y,
+    uint32_t kernel_y,
+    uint32_t stride_y,
+    int32_t  pad_y,
+    uint32_t n_threads,
+    size_t   vtcm_budget
+) {
+    memset(layout, 0, sizeof(*layout));
+    if (n_threads == 0 || vtcm_budget == 0) {
+        return false;
+    }
+
+    // Try full-plane double buffering first (256 bytes guard space for vector loads)
+    const size_t src_plane_bytes   = (size_t) src_x * src_y * sizeof(float);
+    const size_t dst_plane_bytes   = (size_t) dst_x * dst_y * sizeof(float);
+    const size_t src_plane_aligned = hex_round_up((uint32_t) src_plane_bytes + 256, 128);
+    const size_t dst_plane_aligned = hex_round_up((uint32_t) dst_plane_bytes, 128);
+
+    const size_t spad_per_thread = 2 * (src_plane_aligned + dst_plane_aligned);
+    if (spad_per_thread * n_threads <= vtcm_budget) {
+        layout->src_spad_half_size   = src_plane_aligned;
+        layout->dst_spad_half_size   = dst_plane_aligned;
+        layout->src_bytes_per_thread = 2 * src_plane_aligned;
+        layout->dst_bytes_per_thread = 2 * dst_plane_aligned;
+        layout->chunk_rows           = dst_y;
+
+        layout->off_src     = 0;
+        layout->off_dst     = layout->off_src + layout->src_bytes_per_thread * n_threads;
+        layout->total_bytes = layout->off_dst + layout->dst_bytes_per_thread * n_threads;
+        return true;
+    }
+
+    // Row chunking when full plane exceeds VTCM budget
+    const size_t src_row_bytes = (size_t) src_x * sizeof(float);
+    const size_t dst_row_bytes = (size_t) dst_x * sizeof(float);
+
+    for (uint32_t chunk_rows = dst_y; chunk_rows >= 1; --chunk_rows) {
+        const uint32_t chunk_iy = (chunk_rows - 1) * stride_y + kernel_y;
+        const size_t chunk_src_bytes = hex_round_up((uint32_t) (chunk_iy * src_row_bytes) + 256, 128);
+        const size_t chunk_dst_bytes = hex_round_up((uint32_t) (chunk_rows * dst_row_bytes), 128);
+
+        const size_t chunk_spad_per_thread = 2 * (chunk_src_bytes + chunk_dst_bytes);
+        if (chunk_spad_per_thread * n_threads <= vtcm_budget) {
+            layout->src_spad_half_size   = chunk_src_bytes;
+            layout->dst_spad_half_size   = chunk_dst_bytes;
+            layout->src_bytes_per_thread = 2 * chunk_src_bytes;
+            layout->dst_bytes_per_thread = 2 * chunk_dst_bytes;
+            layout->chunk_rows           = chunk_rows;
+
+            layout->off_src     = 0;
+            layout->off_dst     = layout->off_src + layout->src_bytes_per_thread * n_threads;
+            layout->total_bytes = layout->off_dst + layout->dst_bytes_per_thread * n_threads;
+            return true;
+        }
+    }
+
+    (void) pad_y;
+    return false;
+}
 
 #endif // HTP_POOL_OPS_H
