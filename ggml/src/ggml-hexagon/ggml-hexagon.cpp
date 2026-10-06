@@ -71,6 +71,7 @@
 #include "htp/ssm-conv.h"
 #include "htp/gated-delta-net-ops.h"
 #include "htp/argsort-ops.h"
+#include "htp/concat-ops.h"
 #include "htp_iface.h"
 #include "htp-drv.h"
 
@@ -398,6 +399,12 @@ static void ggml_hexagon_precompute_pool_2d_params(
     const struct ggml_tensor * dst,
     struct htp_pool_2d_kernel_params * kparams,
     bool is_pool_1d
+);
+
+static bool ggml_hexagon_precompute_concat_params(
+    const struct ggml_hexagon_session * sess,
+    const struct ggml_tensor * op,
+    struct htp_concat_kernel_params * kparams
 );
 
 static void ggml_hexagon_precompute_fused_mmnx_params(
@@ -6260,6 +6267,7 @@ static void ggml_hexagon_precompute_sort_params(
     kparams->n_slots           = (int32_t) layout.n_slots;
 }
 
+<<<<<<< HEAD
 static void ggml_hexagon_pool_interior_range(
     uint32_t src_x, uint32_t dst_x, uint32_t kernel_x, uint32_t stride_x, int32_t pad_x,
     uint32_t * ox_lo, uint32_t * ox_hi) {
@@ -6348,6 +6356,78 @@ static void ggml_hexagon_precompute_pool_2d_params(
     const bool narrow_ok = (uint64_t) kparams->dst_x * kparams->kernel_x <= 32;
     kparams->narrow_path = (kparams->fast_path && narrow_ok) ? 1 : 0;
     kparams->inv_kernel_area = 1.0f / (float) (kparams->kernel_x * kparams->kernel_y);
+
+    return true;
+}
+
+static bool ggml_hexagon_precompute_concat_params(
+    const struct ggml_hexagon_session * sess,
+    const struct ggml_tensor * op,
+    struct htp_concat_kernel_params * kparams
+) {
+    memset(kparams, 0, sizeof(*kparams));
+    kparams->kernel_type = HTP_CONCAT_KERNEL_UNSUPPORTED;
+
+    const struct ggml_tensor * src0 = op->src[0];
+    const struct ggml_tensor * src1 = op->src[1];
+    const struct ggml_tensor * dst  = op;
+
+    if (!src0 || !src1 || !dst) {
+        return false;
+    }
+
+    int dim = ((const int32_t *) op->op_params)[0];
+    if (dim < 0 || dim >= GGML_MAX_DIMS) {
+        return false;
+    }
+    kparams->dim = dim;
+
+    if (dst->type != GGML_TYPE_F32 && dst->type != GGML_TYPE_F16 && dst->type != GGML_TYPE_I32) {
+        return false;
+    }
+    if (src0->type != dst->type || src1->type != dst->type) {
+        return false;
+    }
+
+    const uint32_t type_size = ggml_type_size(dst->type);
+
+    for (int d = 0; d < GGML_MAX_DIMS; d++) {
+        const int64_t ne_d = (d == dim) ? src0->ne[d] + src1->ne[d] : src0->ne[d];
+        if (dst->ne[d] != ne_d || (d != dim && src1->ne[d] != dst->ne[d])) {
+            return false;
+        }
+    }
+
+    const bool dma_strides_ok = (src0->nb[0] == type_size && src1->nb[0] == type_size && dst->nb[0] == type_size);
+
+    if (dma_strides_ok) {
+        kparams->kernel_type = HTP_CONCAT_KERNEL_REGULAR;
+        kparams->n_threads   = 1;
+        return true;
+    }
+
+    const bool is_src1_transposed = (src1->nb[0] > src1->nb[1]);
+    const bool is_src0_transposed = (src0->nb[0] > src0->nb[1]);
+    const bool transposed_rows_ok = (src0->nb[0] == type_size && src1->nb[1] == type_size && dst->nb[0] == type_size);
+
+    if (dim == 0 && is_src1_transposed && !is_src0_transposed && transposed_rows_ok &&
+        (dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16)) {
+
+        const uint32_t n_threads = sess->n_threads > 0 ? (uint32_t) sess->n_threads : 8;
+        struct htp_concat_transposed_vtcm_layout layout;
+        htp_concat_transposed_vtcm_layout_build(&layout, (uint32_t) src0->ne[0], (uint32_t) src1->ne[0], type_size, n_threads);
+
+        if (sess->vtcm_size > 0 && layout.total_bytes > sess->vtcm_size) {
+            return false;
+        }
+
+        kparams->kernel_type = HTP_CONCAT_KERNEL_TRANSPOSED;
+        kparams->n_threads   = n_threads;
+        kparams->vtcm_size   = layout.total_bytes;
+        return true;
+    }
+
+    return false;
 }
 
 static void ggml_hexagon_precompute_fused_mmnx_params(
@@ -6368,7 +6448,6 @@ static void ggml_hexagon_precompute_fused_mmnx_params(
     const int ne10 = act->ne[0];
     const int ne11 = act->ne[1];
     const int ne12 = act->ne[2];
-    const int ne13 = act->ne[3];
 
     const int wtype = src0->type;
     const bool is_repack = ggml_hexagon_is_repack_type((ggml_type) wtype);
@@ -7717,6 +7796,10 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
                     sess, node.node->src[0], node.dst(),
                     (struct htp_pool_2d_kernel_params *)node.kernel_params,
                     node.opcode == HTP_OP_POOL_1D
+            } else if (node.opcode == HTP_OP_CONCAT) {
+                ggml_hexagon_precompute_concat_params(sess,
+                    node.node,
+                    (struct htp_concat_kernel_params *) node.kernel_params
                 );
             }
             computed_nodes.push_back(std::move(node));
@@ -8415,23 +8498,8 @@ static bool ggml_hexagon_supported_repeat(const struct ggml_hexagon_session * se
 }
 
 static bool ggml_hexagon_supported_concat(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op) {
-    int dim = ((const int32_t *) op->op_params)[0];
-    if (dim < 0 || dim >= GGML_MAX_DIMS) {
-        return false;
-    }
-
-    for (int i = 0; i < GGML_MAX_SRC; ++i) {
-        const struct ggml_tensor * src = op->src[i];
-        if (!src) {
-            continue;
-        }
-        if (src->type != GGML_TYPE_F32 && src->type != GGML_TYPE_I32 && src->type != GGML_TYPE_F16) {
-            return false;
-        }
-    }
-
-    return true;
-    GGML_UNUSED(sess);
+    struct htp_concat_kernel_params kparams;
+    return ggml_hexagon_precompute_concat_params(sess, op, &kparams);
 }
 
 static bool ggml_hexagon_supported_fill(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op) {
