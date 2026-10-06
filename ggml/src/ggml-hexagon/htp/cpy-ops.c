@@ -11,7 +11,7 @@
 
 #define GGML_COMMON_DECL_C
 #include "ggml-common.h"
-#include "hex-cpy-dma.h"
+#include "dma-copy.h"
 #include "htp-ctx.h"
 #include "htp-fence.h"
 #include "htp-ops.h"
@@ -92,7 +92,7 @@ static void cpy_thread_##NAME##_sameshape(unsigned int nth, unsigned int ith, vo
     if (contiguous) {                                                                                              \
         dma_addr_t dst_addr  = dst->data  + ir0 * ne00 * ELEM_SIZE;                                                \
         dma_addr_t src0_addr = src0->data + ir0 * ne00 * ELEM_SIZE;                                                \
-        cpy_dma_sametype_reshape_contig(dma_q, dst_addr, src0_addr, (ir1 - ir0) * ne00 * ELEM_SIZE);               \
+        dma_cpy_sametype_reshape_contig(dma_q, dst_addr, src0_addr, (ir1 - ir0) * ne00 * ELEM_SIZE);               \
         dma_queue_flush(dma_q);                                                                                    \
         return;                                                                                                    \
     }                                                                                                              \
@@ -106,7 +106,7 @@ static void cpy_thread_##NAME##_sameshape(unsigned int nth, unsigned int ith, vo
     uint32_t r = ir0;                                                                                              \
     while (r < ir1) {                                                                                              \
         uint32_t rows = MIN(ir1 - r, ne01 - i01);                                                                  \
-        cpy_dma_push_2d_chunked(dma_q, dst_addr, src0_addr,                                                        \
+        dma_cpy_push_2d_chunked(dma_q, dst_addr, src0_addr,                                                        \
                                 nb1, nb01, ne00 * ELEM_SIZE, rows);                                                \
         r   += rows;                                                                                               \
         i01 += rows;                                                                                               \
@@ -144,7 +144,7 @@ static void cpy_thread_##NAME##_reshape(unsigned int nth, unsigned int ith, void
     if (htp_tensor_is_contiguous(src0, ELEM_SIZE) && htp_tensor_is_contiguous(dst, ELEM_SIZE)) {      \
         dma_addr_t dst_addr  = dst->data  + th_start * ELEM_SIZE;                                     \
         dma_addr_t src0_addr = src0->data + th_start * ELEM_SIZE;                                     \
-        cpy_dma_sametype_reshape_contig(dma_q, dst_addr, src0_addr, (th_end - th_start) * ELEM_SIZE); \
+        dma_cpy_sametype_reshape_contig(dma_q, dst_addr, src0_addr, (th_end - th_start) * ELEM_SIZE); \
         dma_queue_flush(dma_q);                                                                       \
         return;                                                                                       \
     }                                                                                                 \
@@ -177,9 +177,9 @@ static void cpy_thread_##NAME##_reshape(unsigned int nth, unsigned int ith, void
     while (e < th_end) {                                                                              \
         const uint32_t run = MIN(MIN(ne00 - i00, ne0 - i10), th_end - e);                             \
         if (rows_contig) {                                                                            \
-            cpy_dma_sametype_reshape_contig(dma_q, dst_addr, src0_addr, run * ELEM_SIZE);             \
+            dma_cpy_sametype_reshape_contig(dma_q, dst_addr, src0_addr, run * ELEM_SIZE);             \
         } else {                                                                                      \
-            cpy_dma_push_2d_chunked(dma_q, dst_addr, src0_addr, nb0, nb00, ELEM_SIZE, run);           \
+            dma_cpy_push_2d_chunked(dma_q, dst_addr, src0_addr, nb0, nb00, ELEM_SIZE, run);           \
         }                                                                                             \
         e += run;                                                                                     \
                                                                                                       \
@@ -323,7 +323,7 @@ static int exec_cpy(struct htp_ops_context * octx) {
         }
         if (src0->type == dst->type) {
             const uint32_t elem_size = (src0->type == HTP_TYPE_F16) ? 2 : 4;
-            cpy_dma_sametype_reshape_contig(octx->ctx->dma[0], dst->data, src0->data, elem_size);
+            dma_cpy_sametype_reshape_contig(octx->ctx->dma[0], dst->data, src0->data, elem_size);
             dma_queue_flush(octx->ctx->dma[0]);
             return HTP_STATUS_OK;
         }
@@ -421,7 +421,7 @@ static int exec_cpy(struct htp_ops_context * octx) {
         if (sametype) {
             if (octx->ctx->mdev.count <= 1 || htp_tensor_is_extended(src0) || htp_tensor_is_extended(dst)) {
                 if (octx->ctx->mdev.idx == 0) {
-                    cpy_dma_sametype_sameshape(octx->ctx->dma[0], dst, src0, ct.src0_type_size);
+                    dma_cpy_sametype_sameshape(octx->ctx->dma[0], dst, src0, ct.src0_type_size);
                     dma_queue_flush(octx->ctx->dma[0]);
                 }
             } else {
@@ -469,7 +469,7 @@ static int exec_cpy(struct htp_ops_context * octx) {
         const uint32_t total_elems = ne0 * ne1 * ne2 * ne3;
 
         if (octx->ctx->mdev.count <= 1 && dst_is_contiguous && src_is_contiguous) {
-            cpy_dma_sametype_reshape_contig(octx->ctx->dma[0], dst->data, src0->data, total_elems * ct.dst_type_size);
+            dma_cpy_sametype_reshape_contig(octx->ctx->dma[0], dst->data, src0->data, total_elems * ct.dst_type_size);
             dma_queue_flush(octx->ctx->dma[0]);
             return HTP_STATUS_OK;
         }

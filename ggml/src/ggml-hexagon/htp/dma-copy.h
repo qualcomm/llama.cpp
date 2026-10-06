@@ -1,9 +1,9 @@
-#ifndef HEX_CPY_DMA_H
-#define HEX_CPY_DMA_H
+#ifndef HTP_DMA_COPY_H
+#define HTP_DMA_COPY_H
 
 // DDR<->DDR DMA copies of same-type, same-shape tensors with arbitrary strides.
 // Used by CPY for the copy itself and by CONCAT, which is two such copies into
-// two views of its destination.  Every helper only pushes descriptors; the
+// two views of its destination. Every helper only pushes descriptors; the
 // caller flushes the queue when it needs the data.
 
 #include "dma-queue.h"
@@ -14,7 +14,7 @@
 #include <stdint.h>
 
 // Contiguous byte run, as 1d transfers of at most DMA_SAFE_CHUNK_SIZE each.
-static inline void cpy_dma_sametype_reshape_contig(dma_queue * dma_q,
+static inline void dma_cpy_sametype_reshape_contig(dma_queue * dma_q,
                                                    dma_addr_t  dst,
                                                    dma_addr_t  src0,
                                                    uint32_t    total_bytes) {
@@ -36,7 +36,7 @@ static inline void cpy_dma_sametype_reshape_contig(dma_queue * dma_q,
 }
 
 // One 2d transfer, split at the 16-bit nrows field.
-static inline void cpy_dma_push_2d_chunked(dma_queue * dma_q,
+static inline void dma_cpy_push_2d_chunked(dma_queue * dma_q,
                                            dma_addr_t  dst,
                                            dma_addr_t  src,
                                            size_t      dst_stride,
@@ -61,7 +61,7 @@ static inline void cpy_dma_push_2d_chunked(dma_queue * dma_q,
 
 // Copy a range of rows [row_start, row_start + nrows) from src0 into dst:
 // same type, same ne[], any nb[] above dim 0, dim 0 dense on both sides (nb[0] == elem_size).
-static inline void cpy_dma_sametype_sameshape_range(dma_queue *               dma_q,
+static inline void dma_cpy_sametype_sameshape_range(dma_queue *               dma_q,
                                                     const struct htp_tensor * dst,
                                                     const struct htp_tensor * src0,
                                                     uint32_t                  elem_size,
@@ -91,7 +91,7 @@ static inline void cpy_dma_sametype_sameshape_range(dma_queue *               dm
     const bool contiguous = htp_tensor_is_contiguous(src0, elem_size) && htp_tensor_is_contiguous(dst, elem_size);
 
     if (contiguous) {
-        cpy_dma_sametype_reshape_contig(dma_q,
+        dma_cpy_sametype_reshape_contig(dma_q,
                                         dst->data  + (dma_addr_t) row_start * ne00 * elem_size,
                                         src0->data + (dma_addr_t) row_start * ne00 * elem_size,
                                         nrows * ne00 * elem_size);
@@ -118,7 +118,7 @@ static inline void cpy_dma_sametype_sameshape_range(dma_queue *               dm
     }
 
     if (contiguous_outer) {
-        cpy_dma_push_2d_chunked(dma_q,
+        dma_cpy_push_2d_chunked(dma_q,
                                 dst->data  + (dma_addr_t) row_start * nb1,
                                 src0->data + (dma_addr_t) row_start * nb01,
                                 nb1, nb01, ne00 * elem_size, nrows);
@@ -138,7 +138,7 @@ static inline void cpy_dma_sametype_sameshape_range(dma_queue *               dm
     const uint32_t row_end = row_start + nrows;
     while (r < row_end) {
         uint32_t cur_rows = MIN(row_end - r, ne01 - i01);
-        cpy_dma_push_2d_chunked(dma_q, cur_dst, cur_src0, nb1, nb01, ne00 * elem_size, cur_rows);
+        dma_cpy_push_2d_chunked(dma_q, cur_dst, cur_src0, nb1, nb01, ne00 * elem_size, cur_rows);
         r   += cur_rows;
         i01 += cur_rows;
         if (i01 == ne01) {
@@ -158,12 +158,12 @@ static inline void cpy_dma_sametype_sameshape_range(dma_queue *               dm
 
 // Copy src0 into dst: same type, same ne[], any nb[] above dim 0, dim 0 dense on
 // both sides (nb[0] == elem_size).
-static inline void cpy_dma_sametype_sameshape(dma_queue *               dma_q,
+static inline void dma_cpy_sametype_sameshape(dma_queue *               dma_q,
                                               const struct htp_tensor * dst,
                                               const struct htp_tensor * src0,
                                               uint32_t                  elem_size) {
     const uint32_t total_rows = src0->ne[1] * src0->ne[2] * src0->ne[3];
-    cpy_dma_sametype_sameshape_range(dma_q, dst, src0, elem_size, 0, total_rows);
+    dma_cpy_sametype_sameshape_range(dma_q, dst, src0, elem_size, 0, total_rows);
 }
 
-#endif /* HEX_CPY_DMA_H */
+#endif /* HTP_DMA_COPY_H */

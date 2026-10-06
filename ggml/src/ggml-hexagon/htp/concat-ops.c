@@ -1,7 +1,7 @@
 #include "concat-ops.h"
 #include "dma-queue.h"
 #include "hex-common.h"
-#include "hex-cpy-dma.h"
+#include "dma-copy.h"
 #include "hex-fastdiv.h"
 #include "hex-profile.h"
 #include "hexagon_protos.h"
@@ -258,8 +258,8 @@ static int concat_regular(struct htp_ops_context * octx, int dim, uint32_t type_
 
     dma_queue * q = octx->ctx->dma[0];
 
-    cpy_dma_sametype_sameshape_range(q, &view0, src0, type_size, rstart0, nrows0);
-    cpy_dma_sametype_sameshape_range(q, &view1, src1, type_size, rstart1, nrows1);
+    dma_cpy_sametype_sameshape_range(q, &view0, src0, type_size, rstart0, nrows0);
+    dma_cpy_sametype_sameshape_range(q, &view1, src1, type_size, rstart1, nrows1);
     dma_queue_flush(q);
 
     htp_mdev_group_barrier(octx);
