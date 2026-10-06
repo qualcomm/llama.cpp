@@ -9495,7 +9495,10 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #else
         const std::string kernel_src = read_file("gemm_noshuffle_q4_0_q8_1_dp4a.cl");
 #endif
-        cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        // E17 (Adreno 850) reads wrong values from the start of the local tiles: pad them.
+        const std::string q40_dp4a_opts = adreno_art_compiler_quirks(backend_ctx)
+            ? compile_opts + " -DGEMM_LM_PAD=1" : compile_opts;
+        cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), q40_dp4a_opts);
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_0_q8_1_dp4a = clCreateKernel(prog, "kernel_gemm_noshuffle_q4_0_q8_1_dp4a", &err), err));
         // Weights-as-texture. q4_K has had one since c06213299; q4_0 never did, which is
         // why a smaller q4_0 drafter measured slower than the q4_K_M one. Non-fatal.
@@ -9525,7 +9528,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         }
         backend_ctx->q40_dp4a_ts_narrow = ts_narrow;
         if (ts_narrow != 32) {
-            std::string narrow_opts = compile_opts + " -DTILESIZE_N=" + std::to_string(ts_narrow);
+            std::string narrow_opts = q40_dp4a_opts + " -DTILESIZE_N=" + std::to_string(ts_narrow);
             cl_program nprog = build_program_from_source(backend_ctx, kernel_src.c_str(), narrow_opts);
             CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_0_q8_1_dp4a_narrow = clCreateKernel(nprog, "kernel_gemm_noshuffle_q4_0_q8_1_dp4a", &err), err));
             backend_ctx->kernel_gemm_noshuffle_q4_0_q8_1_dp4a_narrow_wimg =
@@ -37522,10 +37525,14 @@ static void ggml_cl_mul_mat_q4_0_f32_adreno(ggml_backend_t backend, const ggml_t
             return;
         }
 
+        // On E17 (Adreno 850), with its local tiles padded (GEMM_LM_PAD), the dp4a GEMM wins only
+        // on wide outputs: Qwen3-30B-A3B shapes at N=512, M=4096 -22% and M=2048 -17%, but
+        // M=512 +25%. Take it from M >= 2048 there.
         static const char * q4_0_dense_dp4a_env = getenv("GGML_OPENCL_Q4_0_DENSE_DP4A");
         bool q4_0_dense_dp4a_on = q4_0_dense_dp4a_env
             ? (atoi(q4_0_dense_dp4a_env) != 0)
-            : adreno_dense_dp4a_default_on(backend_ctx);
+            : (adreno_dense_dp4a_default_on(backend_ctx) ||
+               (adreno_art_compiler_quirks(backend_ctx) && M >= 2048));
         // dot prod has to be available
         q4_0_dense_dp4a_on = backend_ctx->has_integer_dot_product && q4_0_dense_dp4a_on;
 
