@@ -177,8 +177,10 @@ sessions.
 
 - Shared tensor buffers reside in DDR (RPCMEM) with a 128-byte cache line granularity
   (`HEX_L2_LINE_SIZE` = 128 bytes, `HTP_TENSOR_MDEV_LINE_SIZE`).
-- **Rule**: Multi-device work partitions must align destination write regions to 128-byte cache line boundaries so distinct
-  devices never share or overwrite the same cache line.
+- **Rule**: Multi-device work partitions that write directly to DDR through HVX/L2 must align destination write regions to
+  128-byte cache line boundaries so distinct devices never share or overwrite the same cache line.
+- DMA writes to DDR are not subject to this cache-line ownership rule. They may use smaller non-overlapping destination
+  ranges when the operator only writes through DMA.
 
 ### Partitioning Helpers in `htp-tensor.h`
 
@@ -204,11 +206,10 @@ Common partitioning logic is factored into reusable inline helpers in
 
 ### Row-Partitioned Operators
 
-For row-wise operators
+For row-wise operators that write directly to DDR
 (such as activations in [`act-ops.c`](../../../ggml/src/ggml-hexagon/htp/act-ops.c),
 binary ops in [`binary-ops.c`](../../../ggml/src/ggml-hexagon/htp/binary-ops.c),
-unary ops in [`unary-ops.c`](../../../ggml/src/ggml-hexagon/htp/unary-ops.c), and
-sameshape copies in [`cpy-ops.c`](../../../ggml/src/ggml-hexagon/htp/cpy-ops.c)):
+and unary ops in [`unary-ops.c`](../../../ggml/src/ggml-hexagon/htp/unary-ops.c)):
 
 ```c
 const uint32_t total_rows   = ne01 * ne02 * ne03;
@@ -233,8 +234,7 @@ if (nrows == 0) {
 
 ### Element-Partitioned Operators
 
-For flat element-wise operations (such as reshape copies in
-[`cpy-ops.c`](../../../ggml/src/ggml-hexagon/htp/cpy-ops.c)):
+For flat element-wise operations that write directly to DDR:
 - Partition total linear elements N = ne0 * ne1 * ne2 * ne3 in 128-byte cache line chunks (`elems_per_line = (elem_size == 4) ? 32 : 64`).
 - Requires strict 1D contiguity:
   [`htp_tensor_is_contiguous(dst, elem_size)`](../../../ggml/src/ggml-hexagon/htp/htp-tensor.h#L28)
@@ -351,4 +351,3 @@ Multi-device execution synchronizes worker sessions through atomic fence slots a
   - [`htp_tensor_flush_all()`](../../../ggml/src/ggml-hexagon/htp/htp-tensor.h) flushes only modified tensor address ranges,
     ensuring peer devices and the host CPU observe consistent data in DDR.
 - Never signal completion before all DMA transfers are drained and dirty tensor flushes have completed.
-
