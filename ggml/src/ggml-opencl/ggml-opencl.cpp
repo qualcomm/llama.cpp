@@ -954,6 +954,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_soft_max_4_f16_q8;
     cl_kernel kernel_fa_p8_fixup = nullptr;
     cl_kernel kernel_fa_kqv_direct_f16 = nullptr;
+    cl_kernel kernel_fa_kqv_direct_f16_c8 = nullptr;   // at most 8 columns (decode), E17 only
     cl_kernel kernel_fa_kqv_direct_reduce = nullptr;
     cl_kernel kernel_mul_mm_q8_kqv = nullptr;
     cl_kernel kernel_mul_mm_q8_kq = nullptr;
@@ -2712,6 +2713,8 @@ static int ggml_cl_q1_0_gemv_ns1_min_m(const ggml_backend_opencl_context * backe
     }
     return backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E ? 8192 : 0;
 }
+
+static bool adreno_e17_compiler_quirks(const ggml_backend_opencl_context *backend_ctx);
 
 static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
     if (backend_ctx->kernels_loaded) {
@@ -4764,6 +4767,15 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         CL_CHECK((backend_ctx->kernel_fa_p8_fixup = clCreateKernel(backend_ctx->program_softmax_4_f16, "kernel_fa_p8_fixup", &err), err));
         CL_CHECK((backend_ctx->kernel_fa_kqv_direct_f16 = clCreateKernel(backend_ctx->program_softmax_4_f16, "kernel_fa_kqv_direct_f16", &err), err));
         CL_CHECK((backend_ctx->kernel_fa_kqv_direct_reduce = clCreateKernel(backend_ctx->program_softmax_4_f16, "kernel_fa_kqv_direct_reduce", &err), err));
+        // The E17 compiler (Adreno 850) runs decode attention through the direct KQV (see
+        // ggml_cl_flash_attn_decompose). Sized for 32 columns, its accumulators spill there;
+        // a decode batch has at most 8 (n_q x GQA), so build a narrow copy as well.
+        if (adreno_e17_compiler_quirks(backend_ctx)) {
+            cl_program prog_c8 = build_program_from_source(backend_ctx, kernel_src.c_str(),
+                                                           compile_opts + " -DFA_KQVD_MAXC=8");
+            CL_CHECK((backend_ctx->kernel_fa_kqv_direct_f16_c8 = clCreateKernel(prog_c8, "kernel_fa_kqv_direct_f16", &err), err));
+            CL_CHECK(clReleaseProgram(prog_c8));
+        }
         GGML_LOG_CONT(".");
     }
 
@@ -8346,9 +8358,20 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
     if (src.empty()) { return false; }
     std::string opts = ggml_opencl_fa_compile_opts(backend_ctx, cfg, variant);
 
+    // The E17 compiler (Adreno 850) segfaults building the whole f32_f16 program, but
+    // builds its decode half (-D FA_DECODE_ONLY: q1, q1_split, q1_vec, merge) and its
+    // BM-tile half (-D FA_PREFILL_ONLY) as two programs. The vec/MQ/local-tile decode
+    // variants and the extra MQ programs are skipped there, as for DK=512.
+    const bool fa_e17_split = variant == FA_VARIANT_F32_F16 && dk != 512 &&
+                              adreno_e17_compiler_quirks(backend_ctx);
     // bypass kernels for DK=512
-    const bool fa_decode_only = (variant == FA_VARIANT_F32_F16 && dk == 512);
-    if (fa_decode_only) {
+    const bool fa_decode_only = (variant == FA_VARIANT_F32_F16 && dk == 512) || fa_e17_split;
+    if (fa_e17_split) {
+        opts += " -D FA_DECODE_ONLY";
+    } else if (variant == FA_VARIANT_F32_F16_SPLIT && adreno_e17_compiler_quirks(backend_ctx)) {
+        // The split variant only registers the BM tile.
+        opts += " -D FA_PREFILL_ONLY";
+    } else if (fa_decode_only) {
         opts += " -D FA_DECODE_ONLY -D FA_DECODE_MINIMAL";
     }
 
@@ -8438,6 +8461,20 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
                 CL_CHECK((k = clCreateKernel(prog, "flash_attn_f32_f16", &err), err));
                 backend_ctx->fa.f32_f16[{dk, dv}] = k;
                 ggml_opencl_log_fa_kernel_spill(backend_ctx, k, "flash_attn_f32_f16", dk, dv);
+            } else if (fa_e17_split) {
+                std::string opts_tile = opts;
+                opts_tile.replace(opts_tile.find(" -D FA_DECODE_ONLY"), strlen(" -D FA_DECODE_ONLY"), " -D FA_PREFILL_ONLY");
+                cl_program prog_tile = build_program_from_source_ex(
+                    backend_ctx->context, backend_ctx->device, src.c_str(), opts_tile + opts_cl_c_gqa4,
+                    /*fatal=*/false, "fa f32_f16 prefill", backend_ctx->queue);
+                if (prog_tile) {
+                    cl_kernel k = clCreateKernel(prog_tile, "flash_attn_f32_f16", &err);
+                    if (err == CL_SUCCESS) {
+                        backend_ctx->fa.f32_f16[{dk, dv}] = k;
+                        ggml_opencl_log_fa_kernel_spill(backend_ctx, k, "flash_attn_f32_f16", dk, dv);
+                    }
+                    clReleaseProgram(prog_tile);
+                }
             }
             CL_CHECK((kq1 = clCreateKernel(prog, "flash_attn_f32_f16_q1", &err), err));
             backend_ctx->fa.f32_f16_q1[{dk, dv}] = kq1;
@@ -13187,16 +13224,23 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                 return true;
             }
 #endif
-            // The E17 compilers segfault while building FA kernels, skip E17 for now
-            if (adreno_e17_compiler_quirks(backend_ctx)) {
-                return false;
-            }
             const ggml_tensor * q = op->src[0];
             const ggml_tensor * k = op->src[1];
             const ggml_tensor * v = op->src[2];
 
             const int dk = q->ne[0];
             const int dv = v->ne[0];
+
+            // The E17 compiler (Adreno 850) segfaults building the whole flash_attn_f32_f16
+            // program, but builds it as separate prefill and decode programs
+            // (ggml_opencl_ensure_fa_variant), and decode runs through the decomposed path
+            // there. That is verified for f16 KV at head size 128 only: other head sizes fail
+            // on E17 (40-96) or crash its compiler (192).
+            if (adreno_e17_compiler_quirks(backend_ctx) &&
+                !(dk == 128 && dv == 128 && q->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                  k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16)) {
+                return false;
+            }
 
             const struct { int dk; int dv; } supported_dims[] = {
                 { 40,  40}, { 64,  64}, { 80,  80}, { 96,  96},
@@ -23821,6 +23865,14 @@ static bool ggml_cl_flash_attn_decompose(
     // cached blocks, and the V^T pass rebuilds the scales along n_kv from the q8_0 values in
     // registers. Nothing goes through f16. Taken only when both int8 GEMMs run (declined below
     // otherwise, back to the fused q8_0 tile); GGML_OPENCL_FA_DECOMPOSE_Q8=0 opts out.
+    // Decode on the E17 compiler (Adreno 850): its flash-attention decode kernels spill and
+    // run 2-7x slower than the unfused path, so a decode or small verify batch runs here as
+    // the f16 KQ GEMM (the tuned decode kernels) + softmax + the KQV that reads V in the
+    // cache's row layout. GGML_OPENCL_FA_E17_DECODE=0 opts out.
+    static const bool e17_dec_env = !ggml_cl_env_flag_zero("GGML_OPENCL_FA_E17_DECODE");
+    const bool e17_dec = e17_dec_env && n_q <= 8 && adreno_e17_compiler_quirks(backend_ctx) &&
+                         k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16;
+
     static const bool kv_q8_env = !ggml_cl_env_flag_zero("GGML_OPENCL_FA_DECOMPOSE_Q8");
     const bool kv_q8 = k->type == GGML_TYPE_Q8_0 && v->type == GGML_TYPE_Q8_0;
     const bool kqv_int8_possible = kqv_int8_env && defer_norm_env && kqv_int8_gen && (n_kv % 32 == 0) && (dv % 64 == 0) &&
@@ -23863,7 +23915,7 @@ static bool ggml_cl_flash_attn_decompose(
     const bool kq_int8_env_pre = kq_int8_env_val == 1 ||
                                  (kq_int8_env_val == -1 && kv_q8 && !kq_int8_sinks &&
                                   kq_p8_env && kqv_int8_possible && kq_p8_int8_shape);
-    const bool kq_p8_possible = kq_p8_env && kqv_int8_possible &&
+    const bool kq_p8_possible = !e17_dec && kq_p8_env && kqv_int8_possible &&
         (kq_int8_env_pre ? kq_p8_int8_shape
                          : backend_ctx->kernel_mul_mm_f16_f32_kq_p8 != nullptr) &&
         backend_ctx->kernel_fa_p8_fixup != nullptr &&
@@ -23908,7 +23960,7 @@ static bool ggml_cl_flash_attn_decompose(
     const int min_dk = min_dk_env > 0 ? min_dk_env : gen_min_dk;
     const bool measured_shape = dk >= min_dk;
 
-    if (!(env_override >= 0 ? env_override == 1 : (measured_gen && measured_shape))) {
+    if (!e17_dec && !(env_override >= 0 ? env_override == 1 : (measured_gen && measured_shape))) {
         FA_DECLINE("gen/dk");
     }
 
@@ -23925,7 +23977,7 @@ static bool ggml_cl_flash_attn_decompose(
         const char * e = getenv("GGML_OPENCL_FA_DECOMPOSE_MIN_NQ");
         return (e && e[0]) ? atoi(e) : 2;
     }();
-    if (n_q < min_n_q) {
+    if (n_q < min_n_q && !e17_dec) {
         FA_DECLINE("n_q");
     }
     // Except where the sinks gate keeps the KQ in f16 at head size <= 64 (gpt-oss, f16 KV): there
@@ -24169,7 +24221,7 @@ static bool ggml_cl_flash_attn_decompose(
     // int8 KQ: K quantised once per call, the Q chunk once per chunk, both along dk. The kernel
     // sizes its local memory for dk <= 256; larger heads keep the f16 GEMM.
     const bool kq_int8_env = kq_int8_env_pre;
-    const bool kq_int8 = kq_int8_env && (dk % 32 == 0) && dk <= 256 && n_head_kv > 0;
+    const bool kq_int8 = !e17_dec && kq_int8_env && (dk % 32 == 0) && dk <= 256 && n_head_kv > 0;
     if (kq_int8_env_val != -1 || kq_int8 || kq_int8_sinks) {
         static bool said = false;
         if (!said) {
@@ -24189,7 +24241,7 @@ static bool ggml_cl_flash_attn_decompose(
     static const bool generic_gemm = ggml_cl_env_flag("GGML_OPENCL_FA_DECOMPOSE_GENERIC");
     backend_ctx->fa_decompose_generic_gemm = generic_gemm;
 
-    const bool kq_p8 = kq_p8_possible && kqv_int8 && (kq_int8 == kq_int8_env_pre) && !generic_gemm;
+    const bool kq_p8 = !e17_dec && kq_p8_possible && kqv_int8 && (kq_int8 == kq_int8_env_pre) && !generic_gemm;
     ggml_cl_fa_trace_once("decompose run dk=%d n_q=%d n_kv=%d heads=%d/%d chunk=%d kqv_int8=%d kq_int8=%d kq_p8_possible=%d kq_p8=%d",
         (int)dk, (int)n_q, (int)n_kv, (int)n_head, (int)n_head_kv, (int)n_q_chunk, (int)kqv_int8, (int)kq_int8, (int)kq_p8_possible, (int)kq_p8);
     if (kq_p8_possible != kq_p8) {
@@ -24211,11 +24263,14 @@ static bool ggml_cl_flash_attn_decompose(
     // whole V cache on every call, which such a batch cannot amortise. f16 V only.
     // GGML_OPENCL_FA_KQV_DIRECT=0 opts out.
     static const bool kqv_direct_env = !ggml_cl_env_flag_zero("GGML_OPENCL_FA_KQV_DIRECT");
-    const bool kqv_direct = kqv_direct_env && kq_p8 && v->type == GGML_TYPE_F16 &&
+    const bool kqv_direct = kqv_direct_env && (kq_p8 || (e17_dec && kqv_int8)) && v->type == GGML_TYPE_F16 &&
                             backend_ctx->kernel_fa_kqv_direct_f16 != nullptr &&
                             n_q_chunk >= n_q && (int64_t)n_q*(n_head/n_head_kv) <= 32 &&
                             dv % 128 == 0 && (v->nb[1] % 4) == 0 && (v->nb[2] % 4) == 0;
     ggml_cl_fa_trace_once("decompose kqv_direct=%d n_q=%d gqa=%d dv=%d", (int)kqv_direct, (int)n_q, (int)(n_head/n_head_kv), (int)dv);
+    if (e17_dec && !kqv_direct) {
+        FA_DECLINE("e17 decode without the direct KQV");
+    }
 
     static const bool debug = ggml_cl_env_flag("GGML_OPENCL_FA_DECOMPOSE_DEBUG");
     if (debug) {
@@ -24423,7 +24478,8 @@ static bool ggml_cl_flash_attn_decompose(
             const cl_ulong v_nb1 = v->nb[1], v_nb2 = v->nb[2];
             const int dv_i = (int)dv, nq_i = (int)nqc, gqa_i = (int)(n_head/n_head_kv), nh_i = (int)n_head;
             const int p_pitch_i = (int)kv_pitch;
-            cl_kernel kd = backend_ctx->kernel_fa_kqv_direct_f16;
+            cl_kernel kd = (n_q*(n_head/n_head_kv) <= 8 && backend_ctx->kernel_fa_kqv_direct_f16_c8 != nullptr)
+                         ? backend_ctx->kernel_fa_kqv_direct_f16_c8 : backend_ctx->kernel_fa_kqv_direct_f16;
             cl_uint i = 0;
             CL_CHECK(clSetKernelArg(kd, i++, sizeof(cl_mem),   &extra_v->data_device));
             CL_CHECK(clSetKernelArg(kd, i++, sizeof(cl_ulong), &off_v));
@@ -24587,7 +24643,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     // it declines and falls through here whenever the shape does not fit.
     // Placed after the prepass compile because the V transpose it needs ships in
     // that program.
-    if (n_q > 1 && ggml_cl_flash_attn_decompose(backend, q, k, v, mask, sinks, dst)) {
+    if ((n_q > 1 || adreno_e17_compiler_quirks(backend_ctx)) && ggml_cl_flash_attn_decompose(backend, q, k, v, mask, sinks, dst)) {
         return;
     }
 
