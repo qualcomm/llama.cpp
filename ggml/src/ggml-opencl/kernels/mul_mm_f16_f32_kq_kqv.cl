@@ -217,7 +217,8 @@ __kernel void mul_mm_f16_f32_kq_p8(
         int D_B,
         int nb01,
         int kqv_mblock_fast,
-        int p_pitch              // bytes per P row, >= M, multiple of 32
+        int p_pitch,             // bytes per P row, >= M, multiple of 32
+        int gqa_fold             // > 1: the query heads of one KV group share the n-tiles
 ) {
 #elif defined(KQV)
 __kernel void mul_mm_f16_f32_kqv(
@@ -268,8 +269,18 @@ __kernel void mul_mm_f16_f32_kq(
 
     const uint col   = block_id_m * TILESIZE_M;
     const uint row   = block_id_n * TILESIZE_N;
+#ifdef KQ_P8
+    // gqa_fold > 1: block_id_d is a KV head and the n-tile columns run over (query, head of the
+    // group), column c = query*gqa_fold + head. A short batch (a speculative verify of 2-16
+    // queries) then fills the 32-wide tile and streams each K row once per KV head instead of
+    // once per query head.
+    const uint fold    = gqa_fold > 1 ? (uint)gqa_fold : 1u;
+    const uint depth_A = fold > 1 ? block_id_d : block_id_d / (D_B/D_A);
+    const uint depth_B = block_id_d;
+#else
     const uint depth_A = block_id_d / (D_B/D_A);
     const uint depth_B = block_id_d;
+#endif
 
 #ifdef KQV
     int line_stride_matrix_A_in_bytes = nb01 * M;
@@ -308,6 +319,20 @@ __kernel void mul_mm_f16_f32_kq(
 
     __local float matrix_B_local[1024];
 
+#ifdef KQ_P8
+    if (fold > 1) {
+        // this lane's two B columns, clamped to the last real one past the batch (read, unused)
+        const uint nv = (uint)N * fold;
+        uint c0 = row + b_globalOffsetInWords_xy.y;
+        uint c1 = c0 + 16;
+        c0 = min(c0, nv - 1);
+        c1 = min(c1, nv - 1);
+        b_globalOffsetInWords00 = (c0/fold)*strideBinElements + (depth_B*fold + c0%fold)*K + b_globalOffsetInWords_xy.x;
+        b_globalOffsetInWords16 = (c1/fold)*strideBinElements + (depth_B*fold + c1%fold)*K + b_globalOffsetInWords_xy.x;
+        subMatrixBStartInElements = 0;
+    }
+#endif
+
     for (uint step=0; step < K; step+=TILESIZE_K) {
         size_t sub_block_id_m = get_local_id(0);
         regA = mm_load_a(matrix_A, subMatrixAStartInElements, nb01, line_stride_matrix_A_in_bytes);
@@ -338,13 +363,6 @@ __kernel void mul_mm_f16_f32_kq(
     __local float p8_lds[2048];
     __local float * lds = p8_lds + get_sub_group_id() * 1024;
     const uint lane = get_local_id(0);
-    float slope = 1.0f;
-    if (max_bias > 0.0f) {
-        const int h = (int)depth_B;
-        const float base = h < n_head_log2 ? m0 : m1;
-        const int   ex   = h < n_head_log2 ? h + 1 : 2*(h - n_head_log2) + 1;
-        slope = pow(base, ex);
-    }
     __global const half * mrow = (__global const half *)(mask + offset_mask);
     const uint mstride = (uint)(mask_nb1 / 2);
     const int nblk = p_pitch / 32;
@@ -361,8 +379,16 @@ __kernel void mul_mm_f16_f32_kq(
         if (lane < 32) {
             const int  j = lane >> 1;
             const int  b = lane & 1;
-            const uint n = row + half_*16 + j;
-            if (n < (uint)N) {
+            const uint c = row + half_*16 + j;          // tile column
+            const uint n = c / fold;                     // query
+            const uint h = depth_B*fold + c % fold;      // query head
+            if (c < (uint)N * fold) {
+                float slope = 1.0f;
+                if (max_bias > 0.0f) {
+                    const float base = (int)h < n_head_log2 ? m0 : m1;
+                    const int   ex   = (int)h < n_head_log2 ? (int)h + 1 : 2*((int)h - n_head_log2) + 1;
+                    slope = pow(base, ex);
+                }
                 const uint kvb = col + b*32;               // first kv row of this block
                 const __local float * src = lds + j*64 + b*32;
                 float16 s0 = vload16(0, src);
@@ -377,7 +403,7 @@ __kernel void mul_mm_f16_f32_kq(
                 const float4  mx4  = fmax(mx8.lo, mx8.hi);
                 const float2  mx2  = fmax(mx4.lo, mx4.hi);
                 const float   amax = fmax(mx2.x, mx2.y);
-                const uint prow = depth_B*(uint)N + n;
+                const uint prow = h*(uint)N + n;
                 const uint blk  = kvb >> 5;
                 float sum = 0.0f;
                 uchar16 q0 = (uchar16)(0);
