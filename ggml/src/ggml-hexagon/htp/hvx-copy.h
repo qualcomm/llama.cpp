@@ -259,4 +259,74 @@ static inline void hvx_copy_f32_f16_uu(uint8_t * restrict dst, const uint8_t * r
     hvx_copy_f32_f16_loop_body(HVX_UVector, HVX_UVector, hvx_vec_store_u);
 }
 
+//// fp32 -> int32
+
+#define hvx_copy_i32_f32_loop_body(dst_type, src_type, vec_store) \
+    do {                                                          \
+        dst_type * restrict vdst = (dst_type *) dst;              \
+        src_type * restrict vsrc = (src_type *) src;              \
+                                                                  \
+        const uint32_t elem_size = sizeof(int32_t);               \
+        const uint32_t epv  = 128 / elem_size;                    \
+        const uint32_t nvec = n / epv;                            \
+        const uint32_t nloe = n % epv;                            \
+                                                                  \
+        uint32_t i = 0;                                           \
+        _Pragma("unroll(4)")                                      \
+        for (; i < nvec; i++) {                                   \
+            vdst[i] = Q6_Vw_equals_Vsf(vsrc[i]);                  \
+        }                                                         \
+        if (nloe) {                                               \
+            HVX_Vector v = Q6_Vw_equals_Vsf(vsrc[i]);             \
+            vec_store((void *) &vdst[i], nloe * elem_size, v);    \
+        }                                                         \
+    } while(0)
+
+// copy/convert n fp32 elements into n int32 elements : source is aligned, destination is aligned
+static inline void hvx_copy_i32_f32_aa(uint8_t * restrict dst, const uint8_t * restrict src, uint32_t n) {
+    assert((unsigned long) dst % 128 == 0);
+    assert((unsigned long) src % 128 == 0);
+    hvx_copy_i32_f32_loop_body(HVX_Vector, HVX_Vector, hvx_vec_store_a);
+}
+
+// copy/convert n fp32 elements into n int32 elements : source is unaligned, destination is unaligned
+static inline void hvx_copy_i32_f32_uu(uint8_t * restrict dst, const uint8_t * restrict src, uint32_t n) {
+    hvx_copy_i32_f32_loop_body(HVX_UVector, HVX_UVector, hvx_vec_store_u);
+}
+
+//// int32 -> fp32
+
+#define hvx_copy_f32_i32_loop_body(dst_type, src_type, vec_store) \
+    do {                                                          \
+        dst_type * restrict vdst = (dst_type *) dst;              \
+        src_type * restrict vsrc = (src_type *) src;              \
+                                                                  \
+        const uint32_t elem_size = sizeof(float);                 \
+        const uint32_t epv  = 128 / elem_size;                    \
+        const uint32_t nvec = n / epv;                            \
+        const uint32_t nloe = n % epv;                            \
+                                                                  \
+        uint32_t i = 0;                                           \
+        _Pragma("unroll(4)")                                      \
+        for (; i < nvec; i++) {                                   \
+            vdst[i] = Q6_Vsf_equals_Vw(vsrc[i]);                  \
+        }                                                         \
+        if (nloe) {                                               \
+            HVX_Vector v = Q6_Vsf_equals_Vw(vsrc[i]);             \
+            vec_store((void *) &vdst[i], nloe * elem_size, v);    \
+        }                                                         \
+    } while(0)
+
+// copy/convert n int32 elements into n fp32 elements : source is aligned, destination is aligned
+static inline void hvx_copy_f32_i32_aa(uint8_t * restrict dst, const uint8_t * restrict src, uint32_t n) {
+    assert((unsigned long) dst % 128 == 0);
+    assert((unsigned long) src % 128 == 0);
+    hvx_copy_f32_i32_loop_body(HVX_Vector, HVX_Vector, hvx_vec_store_a);
+}
+
+// copy/convert n int32 elements into n fp32 elements : source is unaligned, destination is unaligned
+static inline void hvx_copy_f32_i32_uu(uint8_t * restrict dst, const uint8_t * restrict src, uint32_t n) {
+    hvx_copy_f32_i32_loop_body(HVX_UVector, HVX_UVector, hvx_vec_store_u);
+}
+
 #endif // HVX_COPY_H

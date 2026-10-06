@@ -38,6 +38,11 @@ struct htp_copy_context {
     uint32_t          row_start;
     uint32_t          nrows;
 
+    uint8_t *         vtcm_src0;
+    uint8_t *         vtcm_dst;
+    uint32_t          src0_buf_size;
+    uint32_t          dst_buf_size;
+
     struct fastdiv_values div_ne01;
     struct fastdiv_values div_ne02_ne01;
 
@@ -96,12 +101,12 @@ static void cpy_thread_##NAME##_sameshape(unsigned int nth, unsigned int ith, vo
     uint32_t rem = ir0 - i03 * ne02_ne01;                                                                          \
     uint32_t i02 = fastdiv(rem, &ct->div_ne01);                                                                    \
     uint32_t i01 = rem - i02 * ne01;                                                                               \
-    uint8_t * dst_ptr  = (uint8_t *) dst->data  + i01*nb1  + i02*nb2  + i03*nb3;                                   \
-    uint8_t * src0_ptr = (uint8_t *) src0->data + i01*nb01 + i02*nb02 + i03*nb03;                                  \
+    dma_addr_t dst_addr  = dst->data  + i01*nb1  + i02*nb2  + i03*nb3;                                             \
+    dma_addr_t src0_addr = src0->data + i01*nb01 + i02*nb02 + i03*nb03;                                            \
     uint32_t r = ir0;                                                                                              \
     while (r < ir1) {                                                                                              \
         uint32_t rows = MIN(ir1 - r, ne01 - i01);                                                                  \
-        cpy_dma_push_2d_chunked(dma_q, (dma_addr_t)(uintptr_t) dst_ptr, (dma_addr_t)(uintptr_t) src0_ptr,          \
+        cpy_dma_push_2d_chunked(dma_q, dst_addr, src0_addr,                                                        \
                                 nb1, nb01, ne00 * ELEM_SIZE, rows);                                                \
         r   += rows;                                                                                               \
         i01 += rows;                                                                                               \
@@ -111,11 +116,11 @@ static void cpy_thread_##NAME##_sameshape(unsigned int nth, unsigned int ith, vo
                 i02 = 0;                                                                                           \
                 i03++;                                                                                             \
             }                                                                                                      \
-            dst_ptr  = (uint8_t *) dst->data  + i02*nb2  + i03*nb3;                                                \
-            src0_ptr = (uint8_t *) src0->data + i02*nb02 + i03*nb03;                                               \
+            dst_addr  = dst->data  + i02*nb2  + i03*nb3;                                                           \
+            src0_addr = src0->data + i02*nb02 + i03*nb03;                                                          \
         } else {                                                                                                   \
-            dst_ptr  += rows * nb1;                                                                                \
-            src0_ptr += rows * nb01;                                                                               \
+            dst_addr  += rows * nb1;                                                                               \
+            src0_addr += rows * nb01;                                                                              \
         }                                                                                                          \
     }                                                                                                              \
     dma_queue_flush(dma_q);                                                                                        \
@@ -164,215 +169,148 @@ static void cpy_thread_##NAME##_reshape(unsigned int nth, unsigned int ith, void
     uint32_t i01 = fastdiv(rem2_s, &ct->div_ne00);                                                    \
     uint32_t i00 = rem2_s - i01 * ne00;                                                               \
                                                                                                       \
-    char * dst_ptr        = (char *)       dst->data  + i10*nb0  + i11*nb1  + i12*nb2  + i13*nb3;     \
-    const char * src0_ptr = (const char *) src0->data + i00*nb00 + i01*nb01 + i02*nb02 + i03*nb03;    \
-                                                                                                       \
+    dma_addr_t dst_addr  = dst->data  + i10*nb0  + i11*nb1  + i12*nb2  + i13*nb3;                     \
+    dma_addr_t src0_addr = src0->data + i00*nb00 + i01*nb01 + i02*nb02 + i03*nb03;                    \
+                                                                                                      \
     const bool rows_contig = (nb00 == ELEM_SIZE) && (nb0 == ELEM_SIZE);                               \
-    const bool can_2d_dma  = (nb00 >= ELEM_SIZE) && (nb0 >= ELEM_SIZE);                               \
-                                                                                                       \
-    while (e < th_end) {                                                                               \
-        uint32_t run = 1;                                                                              \
-        if (rows_contig) {                                                                             \
-            run = MIN(MIN(ne00 - i00, ne0 - i10), th_end - e);                                         \
-            cpy_dma_sametype_reshape_contig(dma_q, (dma_addr_t)(uintptr_t) dst_ptr,                    \
-                                            (dma_addr_t)(uintptr_t) src0_ptr, run * ELEM_SIZE);        \
-        } else if (can_2d_dma) {                                                                       \
-            run = MIN(MIN(ne00 - i00, ne0 - i10), th_end - e);                                         \
-            cpy_dma_push_2d_chunked(dma_q, (dma_addr_t)(uintptr_t) dst_ptr,                            \
-                                    (dma_addr_t)(uintptr_t) src0_ptr, nb0, nb00, ELEM_SIZE, run);      \
-        } else {                                                                                       \
-            *((ELEM_TYPE *) dst_ptr) = *((const ELEM_TYPE *) src0_ptr);                                \
-        }                                                                                              \
-        e += run;                                                                                      \
-                                                                                                       \
-        dst_ptr += run * nb0;                                                                          \
-        i10     += run;                                                                                \
-        if (i10 == ne0) {                                                                              \
-            i10 = 0;                                                                                   \
-            if (++i11 == ne1) {                                                                        \
-                i11 = 0;                                                                               \
-                if (++i12 == ne2) {                                                                    \
-                    i12 = 0;                                                                           \
-                    i13++;                                                                             \
-                }                                                                                      \
-            }                                                                                          \
-            dst_ptr = (char *) dst->data + i11*nb1 + i12*nb2 + i13*nb3;                                \
-        }                                                                                              \
-                                                                                                       \
-        src0_ptr += run * nb00;                                                                        \
-        i00      += run;                                                                               \
-        if (i00 == ne00) {                                                                             \
-            i00 = 0;                                                                                   \
-            if (++i01 == ne01) {                                                                       \
-                i01 = 0;                                                                               \
-                if (++i02 == ne02) {                                                                   \
-                    i02 = 0;                                                                           \
-                    i03++;                                                                             \
-                }                                                                                      \
-            }                                                                                          \
-            src0_ptr = (const char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03;                     \
-        }                                                                                              \
-    }                                                                                                  \
-    if (rows_contig || can_2d_dma) {                                                                   \
-        dma_queue_flush(dma_q);                                                                        \
-    }                                                                                                  \
+                                                                                                      \
+    while (e < th_end) {                                                                              \
+        const uint32_t run = MIN(MIN(ne00 - i00, ne0 - i10), th_end - e);                             \
+        if (rows_contig) {                                                                            \
+            cpy_dma_sametype_reshape_contig(dma_q, dst_addr, src0_addr, run * ELEM_SIZE);             \
+        } else {                                                                                      \
+            cpy_dma_push_2d_chunked(dma_q, dst_addr, src0_addr, nb0, nb00, ELEM_SIZE, run);           \
+        }                                                                                             \
+        e += run;                                                                                     \
+                                                                                                      \
+        dst_addr += run * nb0;                                                                        \
+        i10      += run;                                                                              \
+        if (i10 == ne0) {                                                                             \
+            i10 = 0;                                                                                  \
+            if (++i11 == ne1) {                                                                       \
+                i11 = 0;                                                                              \
+                if (++i12 == ne2) {                                                                   \
+                    i12 = 0;                                                                          \
+                    i13++;                                                                            \
+                }                                                                                     \
+            }                                                                                         \
+            dst_addr = dst->data + i11*nb1 + i12*nb2 + i13*nb3;                                       \
+        }                                                                                             \
+                                                                                                      \
+        src0_addr += run * nb00;                                                                      \
+        i00       += run;                                                                             \
+        if (i00 == ne00) {                                                                            \
+            i00 = 0;                                                                                  \
+            if (++i01 == ne01) {                                                                      \
+                i01 = 0;                                                                              \
+                if (++i02 == ne02) {                                                                  \
+                    i02 = 0;                                                                          \
+                    i03++;                                                                            \
+                }                                                                                     \
+            }                                                                                         \
+            src0_addr = src0->data + i01*nb01 + i02*nb02 + i03*nb03;                                  \
+        }                                                                                             \
+    }                                                                                                 \
+    dma_queue_flush(dma_q);                                                                           \
 }
 
 DEFINE_CPY_RESHAPE(f32,  float, 4)
 DEFINE_CPY_RESHAPE(f16, __fp16, 2)
 DEFINE_CPY_RESHAPE(i32, int32_t, 4)
 
-static void cpy_thread_f16_f32_sameshape(unsigned int nth, unsigned int ith, void * data) {
-    struct htp_copy_context * ct = (struct htp_copy_context *) data;
-    struct htp_ops_context * octx = ct->octx;
-    cpy_preamble;
+#define DEFINE_CPY_CONVERT_SAMESHAPE(NAME, CONV_FUNC)                                        \
+static void cpy_thread_##NAME##_sameshape(unsigned int nth, unsigned int ith, void * data) { \
+    struct htp_copy_context * ct = (struct htp_copy_context *) data;                         \
+    struct htp_ops_context * octx = ct->octx;                                                \
+    cpy_preamble;                                                                            \
+                                                                                             \
+    const uint32_t dr  = ct->src0_nrows_per_thread;                                          \
+    const uint32_t ir0 = ct->row_start + dr * ith;                                           \
+    const uint32_t ir1 = MIN(ir0 + dr, ct->row_start + ct->nrows);                           \
+    if (ir0 >= ir1) return;                                                                  \
+    const uint32_t nrows_thread = ir1 - ir0;                                                 \
+                                                                                             \
+    dma_queue * dma_q = octx->ctx->dma[ith];                                                 \
+    struct htp_thread_trace * tr = &octx->ctx->trace[ith];                                   \
+                                                                                             \
+    uint8_t * vtcm_src0_base = ct->vtcm_src0 + ith * 2 * ct->src0_buf_size;                  \
+    uint8_t * vtcm_dst_base  = ct->vtcm_dst  + ith * 2 * ct->dst_buf_size;                   \
+    const uint32_t src0_row_size = ne00 * ct->src0_type_size;                                \
+    const uint32_t dst_row_size  = ne00 * ct->dst_type_size;                                 \
+    const uint32_t src0_buf_size = ct->src0_buf_size;                                        \
+    const uint32_t dst_buf_size  = ct->dst_buf_size;                                         \
+                                                                                             \
+    const uint32_t ne02_ne01 = ne02 * ne01;                                                  \
+    uint32_t i03 = fastdiv(ir0, &ct->div_ne02_ne01);                                         \
+    uint32_t rem = ir0 - i03 * ne02_ne01;                                                    \
+    uint32_t i02 = fastdiv(rem, &ct->div_ne01);                                              \
+    uint32_t i01 = rem - i02 * ne01;                                                         \
+                                                                                             \
+    uint32_t f_i01 = i01, f_i02 = i02, f_i03 = i03;                                          \
+    dma_addr_t f_src0_addr = src0->data + f_i01*nb01 + f_i02*nb02 + f_i03*nb03;              \
+                                                                                             \
+    uint32_t c_i01 = i01, c_i02 = i02, c_i03 = i03;                                          \
+    dma_addr_t c_dst_addr = dst->data + c_i01*nb1 + c_i02*nb2 + c_i03*nb3;                   \
+                                                                                             \
+    for (uint32_t r = 0; r < nrows_thread && r < 2; ++r) {                                   \
+        uint8_t * src_spad = vtcm_src0_base + r * src0_buf_size;                             \
+        uint8_t * dst_spad = vtcm_dst_base  + r * dst_buf_size;                              \
+        dma_queue_push(dma_q, dma_make_data(dst->data, dst_spad),                            \
+                       dst_row_size, dst_buf_size, dst_row_size, 0);                         \
+        dma_queue_push(dma_q, dma_make_data(src_spad, f_src0_addr),                          \
+                       src0_buf_size, src0_row_size, src0_row_size, 1);                      \
+        f_src0_addr += nb01;                                                                 \
+        if (++f_i01 == ne01) {                                                               \
+            f_i01 = 0;                                                                       \
+            if (++f_i02 == ne02) {                                                           \
+                f_i02 = 0;                                                                   \
+                f_i03++;                                                                     \
+            }                                                                                \
+            f_src0_addr = src0->data + f_i02*nb02 + f_i03*nb03;                              \
+        }                                                                                    \
+    }                                                                                        \
+                                                                                             \
+    for (uint32_t r = 0; r < nrows_thread; ++r) {                                            \
+        uint8_t * dst_spad = (uint8_t *) (uintptr_t) dma_queue_pop(dma_q).src;               \
+        uint8_t * src_spad = (uint8_t *) (uintptr_t) dma_queue_pop(dma_q).dst;               \
+                                                                                             \
+        htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) r);                     \
+        CONV_FUNC(dst_spad, src_spad, ne00);                                                 \
+        htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) r);                      \
+                                                                                             \
+        dma_queue_push(dma_q, dma_make_data(c_dst_addr, dst_spad),                           \
+                       dst_row_size, dst_buf_size, dst_row_size, 1);                         \
+        c_dst_addr += nb1;                                                                   \
+        if (++c_i01 == ne01) {                                                               \
+            c_i01 = 0;                                                                       \
+            if (++c_i02 == ne02) {                                                           \
+                c_i02 = 0;                                                                   \
+                c_i03++;                                                                     \
+            }                                                                                \
+            c_dst_addr = dst->data + c_i02*nb2 + c_i03*nb3;                                  \
+        }                                                                                    \
+                                                                                             \
+        if (r + 2 < nrows_thread) {                                                          \
+            dma_queue_push(dma_q, dma_make_data(src_spad, f_src0_addr),                      \
+                           src0_buf_size, src0_row_size, src0_row_size, 1);                  \
+            f_src0_addr += nb01;                                                             \
+            if (++f_i01 == ne01) {                                                           \
+                f_i01 = 0;                                                                   \
+                if (++f_i02 == ne02) {                                                       \
+                    f_i02 = 0;                                                               \
+                    f_i03++;                                                                 \
+                }                                                                            \
+                f_src0_addr = src0->data + f_i02*nb02 + f_i03*nb03;                          \
+            }                                                                                \
+        }                                                                                    \
+    }                                                                                        \
+    dma_queue_flush(dma_q);                                                                  \
+}                                                                                            \
 
-    const uint32_t dr  = ct->src0_nrows_per_thread;
-    const uint32_t ir0 = ct->row_start + dr * ith;
-    const uint32_t ir1 = MIN(ir0 + dr, ct->row_start + ct->nrows);
-    if (ir0 >= ir1) return;
-
-    const uint32_t ne02_ne01 = ne02 * ne01;
-    uint32_t i03 = fastdiv(ir0, &ct->div_ne02_ne01);
-    uint32_t rem = ir0 - i03 * ne02_ne01;
-    uint32_t i02 = fastdiv(rem, &ct->div_ne01);
-    uint32_t i01 = rem - i02 * ne01;
-
-    uint8_t* dst_ptr  = (uint8_t*) dst->data  + i01*nb1  + i02*nb2  + i03*nb3;
-    uint8_t* src0_ptr = (uint8_t*) src0->data + i01*nb01 + i02*nb02 + i03*nb03;
-
-    for (uint32_t r = ir0; r < ir1; r++) {
-        hex_l2fetch(src0_ptr, ne00 * sizeof(float), nb01, 2);
-        hvx_copy_f16_f32_uu(dst_ptr, src0_ptr, ne00);
-        dst_ptr  += nb1;
-        src0_ptr += nb01;
-        if (++i01 == ne01) {
-            i01 = 0;
-            if (++i02 == ne02) {
-                i02 = 0;
-                i03++;
-            }
-            dst_ptr  = (uint8_t*) dst->data  + i02*nb2  + i03*nb3;
-            src0_ptr = (uint8_t*) src0->data + i02*nb02 + i03*nb03;
-        }
-    }
-}
-
-static void cpy_thread_f32_f16_sameshape(unsigned int nth, unsigned int ith, void * data) {
-    struct htp_copy_context * ct = (struct htp_copy_context *) data;
-    struct htp_ops_context * octx = ct->octx;
-    cpy_preamble;
-
-    const uint32_t dr  = ct->src0_nrows_per_thread;
-    const uint32_t ir0 = ct->row_start + dr * ith;
-    const uint32_t ir1 = MIN(ir0 + dr, ct->row_start + ct->nrows);
-    if (ir0 >= ir1) return;
-
-    const uint32_t ne02_ne01 = ne02 * ne01;
-    uint32_t i03 = fastdiv(ir0, &ct->div_ne02_ne01);
-    uint32_t rem = ir0 - i03 * ne02_ne01;
-    uint32_t i02 = fastdiv(rem, &ct->div_ne01);
-    uint32_t i01 = rem - i02 * ne01;
-
-    uint8_t* dst_ptr  = (uint8_t*) dst->data  + i01*nb1  + i02*nb2  + i03*nb3;
-    uint8_t* src0_ptr = (uint8_t*) src0->data + i01*nb01 + i02*nb02 + i03*nb03;
-
-    for (uint32_t r = ir0; r < ir1; r++) {
-        hex_l2fetch(src0_ptr, ne00 * sizeof(__fp16), nb01, 2);
-        hvx_copy_f32_f16_uu(dst_ptr, src0_ptr, ne00);
-        dst_ptr  += nb1;
-        src0_ptr += nb01;
-        if (++i01 == ne01) {
-            i01 = 0;
-            if (++i02 == ne02) {
-                i02 = 0;
-                i03++;
-            }
-            dst_ptr  = (uint8_t*) dst->data  + i02*nb2  + i03*nb3;
-            src0_ptr = (uint8_t*) src0->data + i02*nb02 + i03*nb03;
-        }
-    }
-}
-
-static void cpy_thread_i32_f32_sameshape(unsigned int nth, unsigned int ith, void * data) {
-    struct htp_copy_context * ct = (struct htp_copy_context *) data;
-    struct htp_ops_context * octx = ct->octx;
-    cpy_preamble;
-
-    const uint32_t dr  = ct->src0_nrows_per_thread;
-    const uint32_t ir0 = ct->row_start + dr * ith;
-    const uint32_t ir1 = MIN(ir0 + dr, ct->row_start + ct->nrows);
-    if (ir0 >= ir1) return;
-
-    const uint32_t ne02_ne01 = ne02 * ne01;
-    uint32_t i03 = fastdiv(ir0, &ct->div_ne02_ne01);
-    uint32_t rem = ir0 - i03 * ne02_ne01;
-    uint32_t i02 = fastdiv(rem, &ct->div_ne01);
-    uint32_t i01 = rem - i02 * ne01;
-
-    uint8_t* dst_ptr  = (uint8_t*) dst->data  + i01*nb1  + i02*nb2  + i03*nb3;
-    uint8_t* src0_ptr = (uint8_t*) src0->data + i01*nb01 + i02*nb02 + i03*nb03;
-
-    for (uint32_t r = ir0; r < ir1; r++) {
-        hex_l2fetch(src0_ptr, ne00 * sizeof(float), nb01, 2);
-        const float * restrict src_row = (const float *) src0_ptr;
-        int32_t * restrict dst_row = (int32_t *) dst_ptr;
-        for (uint32_t i = 0; i < ne00; i++) {
-            dst_row[i] = (int32_t) src_row[i];
-        }
-        dst_ptr  += nb1;
-        src0_ptr += nb01;
-        if (++i01 == ne01) {
-            i01 = 0;
-            if (++i02 == ne02) {
-                i02 = 0;
-                i03++;
-            }
-            dst_ptr  = (uint8_t*) dst->data  + i02*nb2  + i03*nb3;
-            src0_ptr = (uint8_t*) src0->data + i02*nb02 + i03*nb03;
-        }
-    }
-}
-
-static void cpy_thread_f32_i32_sameshape(unsigned int nth, unsigned int ith, void * data) {
-    struct htp_copy_context * ct = (struct htp_copy_context *) data;
-    struct htp_ops_context * octx = ct->octx;
-    cpy_preamble;
-
-    const uint32_t dr  = ct->src0_nrows_per_thread;
-    const uint32_t ir0 = ct->row_start + dr * ith;
-    const uint32_t ir1 = MIN(ir0 + dr, ct->row_start + ct->nrows);
-    if (ir0 >= ir1) return;
-
-    const uint32_t ne02_ne01 = ne02 * ne01;
-    uint32_t i03 = fastdiv(ir0, &ct->div_ne02_ne01);
-    uint32_t rem = ir0 - i03 * ne02_ne01;
-    uint32_t i02 = fastdiv(rem, &ct->div_ne01);
-    uint32_t i01 = rem - i02 * ne01;
-
-    uint8_t* dst_ptr  = (uint8_t*) dst->data  + i01*nb1  + i02*nb2  + i03*nb3;
-    uint8_t* src0_ptr = (uint8_t*) src0->data + i01*nb01 + i02*nb02 + i03*nb03;
-
-    for (uint32_t r = ir0; r < ir1; r++) {
-        hex_l2fetch(src0_ptr, ne00 * sizeof(int32_t), nb01, 2);
-        const int32_t * restrict src_row = (const int32_t *) src0_ptr;
-        float * restrict dst_row = (float *) dst_ptr;
-        for (uint32_t i = 0; i < ne00; i++) {
-            dst_row[i] = (float) src_row[i];
-        }
-        dst_ptr  += nb1;
-        src0_ptr += nb01;
-        if (++i01 == ne01) {
-            i01 = 0;
-            if (++i02 == ne02) {
-                i02 = 0;
-                i03++;
-            }
-            dst_ptr  = (uint8_t*) dst->data  + i02*nb2  + i03*nb3;
-            src0_ptr = (uint8_t*) src0->data + i02*nb02 + i03*nb03;
-        }
-    }
-}
+DEFINE_CPY_CONVERT_SAMESHAPE(f16_f32, hvx_copy_f16_f32_aa)
+DEFINE_CPY_CONVERT_SAMESHAPE(f32_f16, hvx_copy_f32_f16_aa)
+DEFINE_CPY_CONVERT_SAMESHAPE(i32_f32, hvx_copy_i32_f32_aa)
+DEFINE_CPY_CONVERT_SAMESHAPE(f32_i32, hvx_copy_f32_i32_aa)
 
 static int exec_cpy(struct htp_ops_context * octx, bool * use_dma) {
     cpy_preamble;
@@ -391,20 +329,31 @@ static int exec_cpy(struct htp_ops_context * octx, bool * use_dma) {
             dma_queue_flush(octx->ctx->dma[0]);
             return HTP_STATUS_OK;
         }
-        if (src0->type == HTP_TYPE_F32 && dst->type == HTP_TYPE_I32) {
-            ((int32_t *) dst->data)[0] = (int32_t) (((const float *) src0->data)[0]);
-            return HTP_STATUS_OK;
-        }
-        if (src0->type == HTP_TYPE_I32 && dst->type == HTP_TYPE_F32) {
-            ((float *) dst->data)[0] = (float) (((const int32_t *) src0->data)[0]);
-            return HTP_STATUS_OK;
-        }
-        if (src0->type == HTP_TYPE_F32 && dst->type == HTP_TYPE_F16) {
-            ((__fp16 *) dst->data)[0] = (__fp16) (((const float *) src0->data)[0]);
-            return HTP_STATUS_OK;
-        }
-        if (src0->type == HTP_TYPE_F16 && dst->type == HTP_TYPE_F32) {
-            ((float *) dst->data)[0] = (float) (((const __fp16 *) src0->data)[0]);
+        if ((src0->type == HTP_TYPE_F32 && dst->type == HTP_TYPE_I32) ||
+            (src0->type == HTP_TYPE_I32 && dst->type == HTP_TYPE_F32) ||
+            (src0->type == HTP_TYPE_F32 && dst->type == HTP_TYPE_F16) ||
+            (src0->type == HTP_TYPE_F16 && dst->type == HTP_TYPE_F32)) {
+            dma_queue * dma_q = octx->ctx->dma[0];
+            dma_addr_t s_vtcm = (dma_addr_t)(uintptr_t) octx->ctx->vtcm_base;
+            dma_addr_t d_vtcm = s_vtcm + 256;
+            const uint32_t s_size = (src0->type == HTP_TYPE_F16) ? 2 : 4;
+            const uint32_t d_size = (dst->type == HTP_TYPE_F16) ? 2 : 4;
+            dma_queue_push(dma_q, dma_make_data(s_vtcm, src0->data), s_size, s_size, s_size, 1);
+            dma_queue_pop(dma_q);
+            uint8_t * s_ptr = (uint8_t *) octx->ctx->vtcm_base;
+            uint8_t * d_ptr = s_ptr + 256;
+            if (src0->type == HTP_TYPE_F32 && dst->type == HTP_TYPE_I32) {
+                *((int32_t *) d_ptr) = (int32_t) (*((const float *) s_ptr));
+            } else if (src0->type == HTP_TYPE_I32 && dst->type == HTP_TYPE_F32) {
+                *((float *) d_ptr) = (float) (*((const int32_t *) s_ptr));
+            } else if (src0->type == HTP_TYPE_F32 && dst->type == HTP_TYPE_F16) {
+                *((__fp16 *) d_ptr) = (__fp16) (*((const float *) s_ptr));
+            } else {
+                *((float *) d_ptr) = (float) (*((const __fp16 *) s_ptr));
+            }
+            dma_queue_push(dma_q, dma_make_data(dst->data, d_vtcm), d_size, d_size, d_size, 1);
+            dma_queue_flush(dma_q);
+            *use_dma = true;
             return HTP_STATUS_OK;
         }
     }
@@ -493,6 +442,33 @@ static int exec_cpy(struct htp_ops_context * octx, bool * use_dma) {
                 work_queue_run(octx->ctx->work_queue, copy_fun, &ct, n_threads);
             }
         } else {
+            const uint32_t src0_row_size         = ne00 * ct.src0_type_size;
+            const uint32_t dst_row_size          = ne00 * ct.dst_type_size;
+            const uint32_t src0_row_size_aligned = hex_round_up(src0_row_size, 256);
+            const uint32_t dst_row_size_aligned  = hex_round_up(dst_row_size, 256);
+
+            const size_t vtcm_needed = (size_t) n_threads * 2 * (src0_row_size_aligned + dst_row_size_aligned);
+            if (vtcm_needed > octx->ctx->vtcm_size) {
+                return HTP_STATUS_VTCM_TOO_SMALL;
+            }
+
+            uint8_t * vtcm_base = (uint8_t *) octx->ctx->vtcm_base;
+            ct.vtcm_src0     = vtcm_base;
+            ct.vtcm_dst      = vtcm_base + (size_t) n_threads * 2 * src0_row_size_aligned;
+            ct.src0_buf_size = src0_row_size_aligned;
+            ct.dst_buf_size  = dst_row_size_aligned;
+
+            octx->src0_spad.size_per_thread = 2 * src0_row_size_aligned;
+            octx->dst_spad.size_per_thread  = 2 * dst_row_size_aligned;
+            octx->src0_spad.size = n_threads * octx->src0_spad.size_per_thread;
+            octx->dst_spad.size  = n_threads * octx->dst_spad.size_per_thread;
+            octx->src0_spad.data = ct.vtcm_src0;
+            octx->dst_spad.data  = ct.vtcm_dst;
+            octx->src0_spad.src  = NULL;
+            octx->dst_spad.src   = NULL;
+
+            *use_dma = true;
+
             work_queue_func_t copy_fun = NULL;
             if (dst->type == HTP_TYPE_F16 && src0->type == HTP_TYPE_F32) {
                 copy_fun = cpy_thread_f16_f32_sameshape;
@@ -510,12 +486,8 @@ static int exec_cpy(struct htp_ops_context * octx, bool * use_dma) {
     } else if (sametype) {
         const uint32_t total_elems = ne0 * ne1 * ne2 * ne3;
         const uint32_t elems_per_line = (ct.dst_type_size == 4) ? 32 : 64;
-        const bool rows_contig = (nb00 == ct.src0_type_size) && (nb0 == ct.dst_type_size);
-        const bool can_2d_dma  = (nb00 >= ct.src0_type_size) && (nb0 >= ct.dst_type_size);
+        *use_dma = true;
 
-        if (rows_contig || can_2d_dma) {
-            *use_dma = true;
-        }
 
         if (octx->ctx->mdev.count <= 1 && dst_is_contiguous && src_is_contiguous) {
             cpy_dma_sametype_reshape_contig(octx->ctx->dma[0], dst->data, src0->data, total_elems * ct.dst_type_size);
