@@ -83,19 +83,20 @@ static void cpy_thread_##NAME##_reshape(unsigned int nth, unsigned int ith, void
     const uint32_t ne1_ne0        = ne1 * ne0;                                                        \
     const uint32_t ne2_ne1_ne0    = ne2 * ne1_ne0;                                                    \
                                                                                                       \
+    const struct htp_copy_reshape_params * rsh = &ct->kparams->u.reshape;                             \
     uint32_t e = th_start;                                                                            \
-    uint32_t i13 = fastdiv(e, &ct->kparams->u.reshape.div_ne2_ne1_ne0);                               \
+    uint32_t i13 = fastdiv(e, &rsh->div_ne2_ne1_ne0);                                                 \
     uint32_t rem = e - i13 * ne2_ne1_ne0;                                                             \
-    uint32_t i12 = fastdiv(rem, &ct->kparams->u.reshape.div_ne1_ne0);                                 \
+    uint32_t i12 = fastdiv(rem, &rsh->div_ne1_ne0);                                                   \
     uint32_t rem2 = rem - i12 * ne1_ne0;                                                              \
-    uint32_t i11 = fastdiv(rem2, &ct->kparams->u.reshape.div_ne0);                                    \
+    uint32_t i11 = fastdiv(rem2, &rsh->div_ne0);                                                      \
     uint32_t i10 = rem2 - i11 * ne0;                                                                  \
                                                                                                       \
-    uint32_t i03 = fastdiv(e, &ct->kparams->u.reshape.div_ne02_ne01_ne00);                            \
+    uint32_t i03 = fastdiv(e, &rsh->div_ne02_ne01_ne00);                                              \
     uint32_t rem_s = e - i03 * ne02_ne01_ne00;                                                        \
-    uint32_t i02 = fastdiv(rem_s, &ct->kparams->u.reshape.div_ne01_ne00);                             \
+    uint32_t i02 = fastdiv(rem_s, &rsh->div_ne01_ne00);                                               \
     uint32_t rem2_s = rem_s - i02 * ne01_ne00;                                                        \
-    uint32_t i01 = fastdiv(rem2_s, &ct->kparams->u.reshape.div_ne00);                                 \
+    uint32_t i01 = fastdiv(rem2_s, &rsh->div_ne00);                                                   \
     uint32_t i00 = rem2_s - i01 * ne00;                                                               \
                                                                                                       \
     dma_addr_t dst_addr  = dst->data  + i10*nb0  + i11*nb1  + i12*nb2  + i13*nb3;                     \
@@ -162,17 +163,18 @@ static void cpy_thread_##NAME##_sameshape(unsigned int nth, unsigned int ith, vo
     dma_queue * dma_q = octx->ctx->dma[ith];                                                 \
     struct htp_thread_trace * tr = &octx->ctx->trace[ith];                                   \
                                                                                              \
-    const uint32_t src0_buf_size = ct->kparams->u.convert.src0_buf_size;                     \
-    const uint32_t dst_buf_size  = ct->kparams->u.convert.dst_buf_size;                      \
-    uint8_t * vtcm_src0_base = ct->vtcm_src0 + ith * 2 * src0_buf_size;                      \
-    uint8_t * vtcm_dst_base  = ct->vtcm_dst  + ith * 2 * dst_buf_size;                       \
+    const struct htp_copy_convert_params * cvt = &ct->kparams->u.convert;                    \
+    const uint32_t src0_buf_size = cvt->src0_buf_size;                                       \
+    const uint32_t dst_buf_size  = cvt->dst_buf_size;                                        \
+    uint8_t * vtcm_src0_base = ct->vtcm_src0 + ith * cvt->spad0_size_per_thread;             \
+    uint8_t * vtcm_dst_base  = ct->vtcm_dst  + ith * cvt->spad1_size_per_thread;             \
     const uint32_t src0_row_size = ne00 * ct->kparams->src0_type_size;                       \
     const uint32_t dst_row_size  = ne00 * ct->kparams->dst_type_size;                        \
                                                                                              \
     const uint32_t ne02_ne01 = ne02 * ne01;                                                  \
-    uint32_t i03 = fastdiv(ir0, &ct->kparams->u.convert.div_ne02_ne01);                      \
+    uint32_t i03 = fastdiv(ir0, &cvt->div_ne02_ne01);                                        \
     uint32_t rem = ir0 - i03 * ne02_ne01;                                                    \
-    uint32_t i02 = fastdiv(rem, &ct->kparams->u.convert.div_ne01);                           \
+    uint32_t i02 = fastdiv(rem, &cvt->div_ne01);                                             \
     uint32_t i01 = rem - i02 * ne01;                                                         \
                                                                                              \
     uint32_t f_i01 = i01, f_i02 = i02, f_i03 = i03;                                          \
@@ -346,6 +348,10 @@ static int cpy_sameshape_convert(struct htp_ops_context * octx, const struct htp
         return HTP_STATUS_NO_SUPPORT;
     }
 
+    if (!htp_ops_context_set_n_threads(octx, kparams->n_threads)) {
+        return HTP_STATUS_INVAL_PARAMS;
+    }
+
     uint32_t row_start = 0;
     uint32_t nrows     = kparams->total_rows;
 
@@ -365,7 +371,7 @@ static int cpy_sameshape_convert(struct htp_ops_context * octx, const struct htp
     }
 
     const uint32_t n_threads = octx->n_threads;
-    const uint32_t src0_row_size_aligned = kparams->u.convert.src0_buf_size;
+    const struct htp_copy_convert_params * cvt = &kparams->u.convert;
 
     struct htp_copy_context ct;
     ct.octx                  = octx;
@@ -376,7 +382,7 @@ static int cpy_sameshape_convert(struct htp_ops_context * octx, const struct htp
 
     uint8_t * vtcm_base = (uint8_t *) octx->ctx->vtcm_base;
     ct.vtcm_src0 = vtcm_base;
-    ct.vtcm_dst  = vtcm_base + (size_t) n_threads * 2 * src0_row_size_aligned;
+    ct.vtcm_dst  = vtcm_base + (size_t) n_threads * cvt->spad0_size_per_thread;
 
     work_queue_func_t copy_fun = NULL;
     if (dst->type == HTP_TYPE_F16 && src0->type == HTP_TYPE_F32) {
@@ -401,6 +407,10 @@ static int cpy_reshape(struct htp_ops_context * octx, const struct htp_copy_kern
 
     if (htp_tensor_is_extended(src0) || htp_tensor_is_extended(dst)) {
         return HTP_STATUS_NO_SUPPORT;
+    }
+
+    if (!htp_ops_context_set_n_threads(octx, kparams->n_threads)) {
+        return HTP_STATUS_INVAL_PARAMS;
     }
 
     uint32_t elem_start = 0;

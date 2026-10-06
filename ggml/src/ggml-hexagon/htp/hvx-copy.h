@@ -44,7 +44,7 @@ static inline void hvx_splat_f32_u(void * restrict dst, float v, uint32_t n) {
 }
 
 static inline void hvx_splat_f16_a(void * restrict dst, _Float16 v, uint32_t n) {
-    hvx_splat_u(dst,  hvx_vec_splat_f16(v), n, sizeof(__fp16));
+    hvx_splat_a(dst,  hvx_vec_splat_f16(v), n, sizeof(__fp16));
 }
 
 static inline void hvx_splat_f16_u(void * restrict dst, _Float16 v, uint32_t n) {

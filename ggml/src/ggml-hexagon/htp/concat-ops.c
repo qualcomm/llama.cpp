@@ -49,7 +49,7 @@ static void concat_2d_f32_transposed(unsigned int nth, unsigned int ith, void * 
     const uint32_t row_end = cctx->row_start + cctx->nrows;
     const uint32_t start_i = cctx->row_start + ith * cctx->nrows_per_thread;
     const uint32_t end_i   = (start_i + cctx->nrows_per_thread < row_end) ? (start_i + cctx->nrows_per_thread) : row_end;
-    if (start_i >= end_i || cctx->nplanes == 0) return;
+    if (start_i >= end_i) return;
 
     dma_queue * dma_q = octx->ctx->dma[ith];
 
@@ -145,7 +145,7 @@ static void concat_2d_f16_transposed(unsigned int nth, unsigned int ith, void * 
     const uint32_t row_end = cctx->row_start + cctx->nrows;
     const uint32_t start_i = cctx->row_start + ith * cctx->nrows_per_thread;
     const uint32_t end_i   = (start_i + cctx->nrows_per_thread < row_end) ? (start_i + cctx->nrows_per_thread) : row_end;
-    if (start_i >= end_i || cctx->nplanes == 0) return;
+    if (start_i >= end_i) return;
 
     dma_queue * dma_q = octx->ctx->dma[ith];
 
@@ -267,10 +267,12 @@ static int concat_regular(struct htp_ops_context * octx, int dim, uint32_t type_
     return HTP_STATUS_OK;
 }
 
-static int concat_transposed(struct htp_ops_context * octx, uint32_t type_size) {
-    const struct htp_tensor * src0 = octx->src[0];
-    const struct htp_tensor * src1 = octx->src[1];
-    const struct htp_tensor * dst  = octx->dst;
+static int concat_transposed(struct htp_ops_context * octx, const struct htp_concat_kernel_params * kparams, uint32_t type_size) {
+    if (!htp_ops_context_set_n_threads(octx, kparams->n_threads)) {
+        return HTP_STATUS_INVAL_PARAMS;
+    }
+
+    const struct htp_tensor * dst = octx->dst;
 
     const uint32_t total_rows = dst->ne[1];
     uint32_t row_start = 0;
@@ -285,22 +287,24 @@ static int concat_transposed(struct htp_ops_context * octx, uint32_t type_size) 
         return HTP_STATUS_OK;
     }
 
-    const uint32_t n_threads = octx->n_threads;
-    struct htp_concat_transposed_vtcm_layout layout;
-    htp_concat_transposed_vtcm_layout_build(&layout, src0->ne[0], src1->ne[0], type_size, n_threads);
-
-    if (layout.total_bytes > octx->ctx->vtcm_size) {
+    if (kparams->vtcm_size > octx->ctx->vtcm_size) {
         return HTP_STATUS_VTCM_TOO_SMALL;
     }
+
+    const uint32_t n_threads = octx->n_threads;
+
+    // layout precomputed on host; kept for reference:
+    // struct htp_concat_transposed_vtcm_layout layout;
+    // htp_concat_transposed_vtcm_layout_build(&layout, octx->src[0]->ne[0], octx->src[1]->ne[0], type_size, n_threads);
 
     uint8_t * vtcm_base = (uint8_t *) octx->ctx->vtcm_base;
 
     struct htp_concat_context cctx;
     cctx.octx                  = octx;
     cctx.spad0_base            = vtcm_base;
-    cctx.spad1_base            = vtcm_base + n_threads * layout.src0_spad_size_per_thread;
-    cctx.spad0_size_per_thread = layout.src0_spad_size_per_thread;
-    cctx.spad1_size_per_thread = layout.src1_spad_size_per_thread;
+    cctx.spad1_base            = vtcm_base + n_threads * kparams->spad0_size_per_thread;
+    cctx.spad0_size_per_thread = kparams->spad0_size_per_thread;
+    cctx.spad1_size_per_thread = kparams->spad1_size_per_thread;
     cctx.row_start             = row_start;
     cctx.nrows                 = nrows;
     cctx.nplanes               = dst->ne[2] * dst->ne[3];
@@ -324,7 +328,7 @@ int op_concat(struct htp_ops_context * octx) {
             break;
 
         case HTP_CONCAT_KERNEL_TRANSPOSED:
-            status = concat_transposed(octx, type_size);
+            status = concat_transposed(octx, kparams, type_size);
             break;
 
         default:

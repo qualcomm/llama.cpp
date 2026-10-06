@@ -6429,9 +6429,11 @@ static bool ggml_hexagon_precompute_concat_params(
             return false;
         }
 
-        kparams->kernel_type = HTP_CONCAT_KERNEL_TRANSPOSED;
-        kparams->n_threads   = n_threads;
-        kparams->vtcm_size   = layout.total_bytes;
+        kparams->kernel_type           = HTP_CONCAT_KERNEL_TRANSPOSED;
+        kparams->n_threads             = n_threads;
+        kparams->vtcm_size             = layout.total_bytes;
+        kparams->spad0_size_per_thread = layout.src0_spad_size_per_thread;
+        kparams->spad1_size_per_thread = layout.src1_spad_size_per_thread;
         return true;
     }
 
@@ -6547,22 +6549,21 @@ static bool ggml_hexagon_precompute_cpy_params(
     }
 
     const uint32_t n_threads = sess->n_threads > 0 ? (uint32_t) sess->n_threads : 4;
-    const uint32_t src0_row_size = (uint32_t) (src0->ne[0] * src_type_size);
-    const uint32_t dst_row_size  = (uint32_t) (dst->ne[0] * dst_type_size);
-    const uint32_t src0_row_size_aligned = hex_round_up(src0_row_size, 256);
-    const uint32_t dst_row_size_aligned  = hex_round_up(dst_row_size, 256);
+    struct htp_copy_convert_vtcm_layout layout;
+    htp_copy_convert_vtcm_layout_build(&layout, (uint32_t) src0->ne[0], src_type_size, dst_type_size, n_threads);
 
-    const size_t vtcm_needed = (size_t) n_threads * 2 * (src0_row_size_aligned + dst_row_size_aligned);
-    if (sess->vtcm_size > 0 && vtcm_needed > sess->vtcm_size) {
+    if (sess->vtcm_size > 0 && layout.total_bytes > sess->vtcm_size) {
         return false;
     }
 
     kparams->kernel_type             = HTP_COPY_KERNEL_SAMESHAPE_CONVERT;
     kparams->total_rows              = (uint32_t) (src0->ne[1] * src0->ne[2] * src0->ne[3]);
     kparams->n_threads               = (uint8_t) n_threads;
-    kparams->vtcm_size               = (uint32_t) vtcm_needed;
-    kparams->u.convert.src0_buf_size = src0_row_size_aligned;
-    kparams->u.convert.dst_buf_size  = dst_row_size_aligned;
+    kparams->vtcm_size               = layout.total_bytes;
+    kparams->u.convert.src0_buf_size = layout.src0_buf_size;
+    kparams->u.convert.dst_buf_size  = layout.dst_buf_size;
+    kparams->u.convert.spad0_size_per_thread = layout.spad0_size_per_thread;
+    kparams->u.convert.spad1_size_per_thread = layout.spad1_size_per_thread;
     kparams->u.convert.div_ne01      = init_fastdiv_values((uint32_t) src0->ne[1]);
     kparams->u.convert.div_ne02_ne01 = init_fastdiv_values((uint32_t) (src0->ne[2] * src0->ne[1]));
 

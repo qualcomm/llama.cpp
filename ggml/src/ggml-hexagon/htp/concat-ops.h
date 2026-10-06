@@ -17,6 +17,8 @@ struct htp_concat_kernel_params {
     uint8_t  pad;
 
     uint32_t vtcm_size;
+    uint32_t spad0_size_per_thread;
+    uint32_t spad1_size_per_thread;
 };
 
 #if defined(__cplusplus)

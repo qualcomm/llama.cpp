@@ -14,6 +14,24 @@ enum htp_copy_kernel_type {
     HTP_COPY_KERNEL_SCALAR             = 5,
 };
 
+struct htp_copy_convert_params {
+    uint32_t              src0_buf_size;
+    uint32_t              dst_buf_size;
+    uint32_t              spad0_size_per_thread;
+    uint32_t              spad1_size_per_thread;
+    struct fastdiv_values div_ne01;
+    struct fastdiv_values div_ne02_ne01;
+};
+
+struct htp_copy_reshape_params {
+    struct fastdiv_values div_ne0;
+    struct fastdiv_values div_ne1_ne0;
+    struct fastdiv_values div_ne2_ne1_ne0;
+    struct fastdiv_values div_ne00;
+    struct fastdiv_values div_ne01_ne00;
+    struct fastdiv_values div_ne02_ne01_ne00;
+};
+
 struct htp_copy_kernel_params {
     uint8_t  kernel_type;
     uint8_t  src0_type_size;
@@ -25,23 +43,32 @@ struct htp_copy_kernel_params {
     uint32_t vtcm_size;
 
     union {
-        struct {
-            uint32_t              src0_buf_size;
-            uint32_t              dst_buf_size;
-            struct fastdiv_values div_ne01;
-            struct fastdiv_values div_ne02_ne01;
-        } convert;
-
-        struct {
-            struct fastdiv_values div_ne0;
-            struct fastdiv_values div_ne1_ne0;
-            struct fastdiv_values div_ne2_ne1_ne0;
-            struct fastdiv_values div_ne00;
-            struct fastdiv_values div_ne01_ne00;
-            struct fastdiv_values div_ne02_ne01_ne00;
-        } reshape;
+        struct htp_copy_convert_params convert;
+        struct htp_copy_reshape_params reshape;
     } u;
 };
+
+struct htp_copy_convert_vtcm_layout {
+    uint32_t src0_buf_size;
+    uint32_t dst_buf_size;
+    uint32_t spad0_size_per_thread;
+    uint32_t spad1_size_per_thread;
+    uint32_t total_bytes;
+};
+
+static inline void htp_copy_convert_vtcm_layout_build(
+    struct htp_copy_convert_vtcm_layout * layout,
+    uint32_t ne00,
+    uint32_t src_type_size,
+    uint32_t dst_type_size,
+    uint32_t n_threads) {
+
+    layout->src0_buf_size = hex_round_up(ne00 * src_type_size, 256);
+    layout->dst_buf_size  = hex_round_up(ne00 * dst_type_size, 256);
+    layout->spad0_size_per_thread = 2 * layout->src0_buf_size;
+    layout->spad1_size_per_thread = 2 * layout->dst_buf_size;
+    layout->total_bytes = n_threads * (layout->spad0_size_per_thread + layout->spad1_size_per_thread);
+}
 
 #if defined(__cplusplus)
 static_assert(sizeof(struct htp_copy_kernel_params) <= 128, "htp_copy_kernel_params is too large for kernel_params blob");
