@@ -6278,7 +6278,6 @@ static void ggml_hexagon_precompute_sort_params(
     kparams->n_slots           = (int32_t) layout.n_slots;
 }
 
-<<<<<<< HEAD
 static void ggml_hexagon_pool_interior_range(
     uint32_t src_x, uint32_t dst_x, uint32_t kernel_x, uint32_t stride_x, int32_t pad_x,
     uint32_t * ox_lo, uint32_t * ox_hi) {
@@ -6367,8 +6366,6 @@ static void ggml_hexagon_precompute_pool_2d_params(
     const bool narrow_ok = (uint64_t) kparams->dst_x * kparams->kernel_x <= 32;
     kparams->narrow_path = (kparams->fast_path && narrow_ok) ? 1 : 0;
     kparams->inv_kernel_area = 1.0f / (float) (kparams->kernel_x * kparams->kernel_y);
-
-    return true;
 }
 
 static bool ggml_hexagon_precompute_concat_params(
@@ -6506,9 +6503,9 @@ static bool ggml_hexagon_precompute_cpy_params(
         }
     }
 
-    const bool transposed = (src0->nb[0] > src0->nb[1]) || (dst->nb[0] > dst->nb[1]) ||
+    const bool transposed = (src0->nb[0] > src0->nb[1])    || (dst->nb[0] > dst->nb[1]) ||
                             (src0->nb[0] != src_type_size) || (dst->nb[0] != dst_type_size) ||
-                            (src0->nb[1] < src0->ne[0] * src_type_size) || (dst->nb[1] < dst->ne[0] * dst_type_size);
+                            (src0->nb[1] < (size_t) src0->ne[0] * src_type_size) || (dst->nb[1] < (size_t) dst->ne[0] * dst_type_size);
     const bool sameshape  = same_extents && !transposed;
 
     const bool src_is_contiguous = ggml_is_contiguous(src0);
@@ -6590,6 +6587,7 @@ static void ggml_hexagon_precompute_fused_mmnx_params(
     const int ne10 = act->ne[0];
     const int ne11 = act->ne[1];
     const int ne12 = act->ne[2];
+    const int ne13 = act->ne[3];
 
     const int wtype = src0->type;
     const bool is_repack = ggml_hexagon_is_repack_type((ggml_type) wtype);
@@ -7937,7 +7935,7 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
                 ggml_hexagon_precompute_pool_2d_params(
                     sess, node.node->src[0], node.dst(),
                     (struct htp_pool_2d_kernel_params *)node.kernel_params,
-                    node.opcode == HTP_OP_POOL_1D
+                    node.opcode == HTP_OP_POOL_1D);
             } else if (node.opcode == HTP_OP_CONCAT) {
                 ggml_hexagon_precompute_concat_params(sess,
                     node.node,
