@@ -248,8 +248,9 @@ REQD_SUBGROUP_SIZE_64
 kernel void kernel_soft_max_4_f16_q8(
         global uchar * qp,
         ulong offset_qp,
-        global half * dp,
+        global float * dp,
         ulong offset_dp,
+        int qp_pitch,               // bytes per P row, >= ne00, multiple of 32
         global float * psums,
         ulong offset_sums,
         global char * src0,
@@ -322,8 +323,8 @@ kernel void kernel_soft_max_4_f16_q8(
     const int nblk = ne00 / 32;
     const uint row  = (uint)(i03*get_num_groups(1)*get_num_groups(0) + i02*get_num_groups(0) + i01);
 
-    global uchar * qrow = (global uchar *)((global char *)qp + offset_qp) + (size_t)row*ne00;
-    global half  * drow = (global half  *)((global char *)dp + offset_dp) + (size_t)row*nblk;
+    global uchar * qrow = (global uchar *)((global char *)qp + offset_qp) + (size_t)row*qp_pitch;
+    global float * drow = (global float *)((global char *)dp + offset_dp) + (size_t)row*(qp_pitch/32);
 
     float lsum = 0.0f;
     for (int b = get_local_id(0); b < nblk; b += get_local_size(0)) {
@@ -337,11 +338,14 @@ kernel void kernel_soft_max_4_f16_q8(
             amax = fmax(amax, fmax(fmax(e.s0, e.s1), fmax(e.s2, e.s3)));
         }
 
-        // P >= 0, so quantise unsigned: 255 levels instead of 127
+        // P >= 0, so quantise unsigned: 255 levels instead of 127. The scale stays f32: it is
+        // exp(blockmax - rowmax)/255, and a row whose max sits far above its scores (a large
+        // attention sink) puts it below the half normal range, where a device that flushes
+        // subnormals drops the whole block.
         const float d  = amax / 255.0f;
         const float id = amax > 0.0f ? 255.0f / amax : 0.0f;
 
-        drow[b] = (half)d;
+        drow[b] = d;
 
         #pragma unroll
         for (int i = 0; i < 32; ++i) {
@@ -359,6 +363,63 @@ kernel void kernel_soft_max_4_f16_q8(
 
     if (get_local_id(0) == 0) {
         psums = (global float *)((global char *)psums + offset_sums);
+        psums[row] = sum;
+    }
+}
+
+// Second half of the fused KQ+softmax path (mul_mm_f16_f32_kq_p8). One workgroup
+// per (query, head) row: reduce the per-32-block maxima to the row max (sinks join
+// it as an extra column), then emit the per-block f32 scale
+// exp(bmax - rowmax)/255 that kernel_mul_mm_q8_kqv consumes and the deferred-norm
+// row sum. Touches 8 bytes per 32 scores instead of the 13 bytes per score the
+// two-pass softmax read, so it is ~1/50 of that kernel's traffic.
+#ifdef ADRENO_GPU
+REQD_SUBGROUP_SIZE_64
+#endif
+kernel void kernel_fa_p8_fixup(
+        global float * bmax,
+        global float * bsum,
+        global float * dp,
+        global float * psums,
+        global char  * sinks,
+        ulong offset_sinks,
+        int has_sinks,
+        int nblk,
+        int row_blk,                // blocks per row of bmax/bsum/dp (the padded pitch), >= nblk
+        int N
+) {
+    const int n    = get_group_id(0);
+    const int head = get_group_id(1);
+    const uint row = (uint)head*(uint)N + (uint)n;
+    global float * bm = bmax + (size_t)row*row_blk;
+    global float * bs = bsum + (size_t)row*row_blk;
+    global float * dr = dp   + (size_t)row*row_blk;
+
+    float lmax = -INFINITY;
+    for (int b = get_local_id(0); b < nblk; b += get_local_size(0)) {
+        lmax = fmax(lmax, bm[b]);
+    }
+    float rowmax = sub_group_reduce_max(lmax);
+    float sink = 0.0f;
+    if (has_sinks) {
+        sink = ((global float *)(sinks + offset_sinks))[head];
+        rowmax = fmax(rowmax, sink);
+    }
+
+    float lsum = 0.0f;
+    for (int b = get_local_id(0); b < nblk; b += get_local_size(0)) {
+        const float m = bm[b];
+        // finite sentinels rather than -INFINITY compares: the program builds with
+        // -cl-finite-math-only, which may fold a test against infinity itself.
+        const float f = (m > -1.0e30f && rowmax > -1.0e30f) ? exp(m - rowmax) : 0.0f;
+        dr[b] = f / 255.0f;   // f32: see kernel_soft_max_4_f16_q8
+        lsum += bs[b]*f;
+    }
+    float sum = sub_group_reduce_add(lsum);
+    if (has_sinks && rowmax > -1.0e30f) {
+        sum += exp(sink - rowmax);
+    }
+    if (get_local_id(0) == 0) {
         psums[row] = sum;
     }
 }
