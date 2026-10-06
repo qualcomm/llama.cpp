@@ -8614,10 +8614,14 @@ inline bool use_adreno_moe_kernels(const ggml_backend_opencl_context *backend_ct
 // LOSS and inverts the ranking. The same box, after a reboot and a gate that
 // waits for policy6 to return to 4396800, reports the +11.9% above with no
 // order bias. A7X regresses hard on this layout and stays off.
+// The Adreno 850 (E17 compiler) stays off too: decode is ~3% slower with it, and the
+// batched tiled GEMM is so slow (~9 s for a 512-token Qwen3-4B lm_head) that its
+// results come back wrong.
 // GGML_OPENCL_{Q4K,Q6K}_GEMV_TILED forces either way (=0 off, any other value on).
 inline bool tiled_gemv_default_on(const ggml_backend_opencl_context *backend_ctx) {
-    return backend_ctx && (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E ||
-                           backend_ctx->adreno_gen == ADRENO_GPU_GEN::A8X);
+    return backend_ctx && !adreno_e17_compiler_quirks(backend_ctx) &&
+           (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E ||
+            backend_ctx->adreno_gen == ADRENO_GPU_GEN::A8X);
 }
 
 // Tiled-wide q6_K GEMV (default OFF; GGML_OPENCL_Q6K_GEMV_TILED forces either
