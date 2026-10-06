@@ -49,7 +49,7 @@ static void concat_2d_f32_transposed(unsigned int nth, unsigned int ith, void * 
     const uint32_t row_end = cctx->row_start + cctx->nrows;
     const uint32_t start_i = cctx->row_start + ith * cctx->nrows_per_thread;
     const uint32_t end_i   = (start_i + cctx->nrows_per_thread < row_end) ? (start_i + cctx->nrows_per_thread) : row_end;
-    if (start_i >= end_i) return;
+    if (start_i >= end_i || cctx->nplanes == 0) return;
 
     dma_queue * dma_q = octx->ctx->dma[ith];
 
@@ -128,6 +128,7 @@ static void concat_2d_f32_transposed(unsigned int nth, unsigned int ith, void * 
         p = np;
         i = ni;
     }
+    dma_queue_flush(dma_q);
 }
 
 static void concat_2d_f16_transposed(unsigned int nth, unsigned int ith, void * data) {
@@ -144,7 +145,7 @@ static void concat_2d_f16_transposed(unsigned int nth, unsigned int ith, void * 
     const uint32_t row_end = cctx->row_start + cctx->nrows;
     const uint32_t start_i = cctx->row_start + ith * cctx->nrows_per_thread;
     const uint32_t end_i   = (start_i + cctx->nrows_per_thread < row_end) ? (start_i + cctx->nrows_per_thread) : row_end;
-    if (start_i >= end_i) return;
+    if (start_i >= end_i || cctx->nplanes == 0) return;
 
     dma_queue * dma_q = octx->ctx->dma[ith];
 
@@ -223,6 +224,7 @@ static void concat_2d_f16_transposed(unsigned int nth, unsigned int ith, void * 
         p = np;
         i = ni;
     }
+    dma_queue_flush(dma_q);
 }
 
 static int concat_regular(struct htp_ops_context * octx, int dim, uint32_t type_size) {
@@ -279,7 +281,7 @@ static int concat_transposed(struct htp_ops_context * octx, uint32_t type_size) 
         nrows     = range.count;
     }
 
-    if (nrows == 0) {
+    if (nrows == 0 || dst->ne[2] == 0 || dst->ne[3] == 0) {
         return HTP_STATUS_OK;
     }
 
