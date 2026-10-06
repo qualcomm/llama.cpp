@@ -24930,8 +24930,9 @@ static void ggml_cl_mul_mat_kq_kqv_adreno(ggml_backend_t backend, const ggml_ten
         // KQ
         region.size = nb01 * ne01;
     } else {
-        // KQV
-        region.size = nb02 * ne02;
+        // KQV: the span the kernel walks (nb01 * ne01 per head). nb02 * ne02 is not that
+        // span for a single head with a degenerate view stride.
+        region.size = nb01 * ne01 * ne02;
     }
 
     A_sub_buffer = clCreateSubBuffer((extra0->data_device), 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &status);
@@ -24954,7 +24955,7 @@ static void ggml_cl_mul_mat_kq_kqv_adreno(ggml_backend_t backend, const ggml_ten
         img_desc_1d.image_width = (nb01 * ne01 / 4)/4;
     }
     else {
-        img_desc_1d.image_width = (nb02 * ne02 / 4)/4;
+        img_desc_1d.image_width = (nb01 * ne01 * ne02 / 4)/4;
     }
     img_desc_1d.buffer = A_sub_buffer;
     A_image1d = clCreateImage(context, CL_MEM_READ_ONLY, &img_fmt_1d, &img_desc_1d, NULL, &status);
@@ -30216,8 +30217,15 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             // For KQV. Reaching this arm is what makes the op a KQV; the callee
             // is told so explicitly rather than re-deriving it from the strides
             // the arm above has already ruled on.
+            //
+            // Layout admission: the KQV kernel receives only nb01 and walks A with a
+            // per-head stride of nb01*ne01, so only layouts where that walk is correct
+            // may route: packed heads (nb02 == nb01*ne01, every transposed-V cache
+            // view) or a single head (ne02 == 1). Anything else (for example a K with
+            // its heads further apart than one head of rows) goes to the generic GEMM.
             if (!ggml_is_contiguous(src0) && ggml_is_contiguous(src1) &&
-                ((nb02 * ne02 / 4)/4 <= backend_ctx->image_max_buffer_size)) {
+                (ne02 == 1 || nb02 == nb01 * ne01) &&
+                ((nb01 * ne01 * ne02 / 4)/4 <= backend_ctx->image_max_buffer_size)) {
                 ggml_cl_mul_mat_kq_kqv_adreno(backend, src0, src1, dst, /*is_kq =*/ false);
                 return;
             }
