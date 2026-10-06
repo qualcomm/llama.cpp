@@ -70,13 +70,6 @@ static void cpy_thread_##NAME##_reshape(unsigned int nth, unsigned int ith, void
     if (th_start >= th_end) return;                                                                   \
                                                                                                       \
     dma_queue * dma_q = octx->ctx->dma[ith];                                                          \
-    if (htp_tensor_is_contiguous(src0, ELEM_SIZE) && htp_tensor_is_contiguous(dst, ELEM_SIZE)) {      \
-        dma_addr_t dst_addr  = dst->data  + (dma_addr_t) th_start * ELEM_SIZE;                        \
-        dma_addr_t src0_addr = src0->data + (dma_addr_t) th_start * ELEM_SIZE;                        \
-        dma_cpy_sametype_reshape_contig(dma_q, dst_addr, src0_addr, (th_end - th_start) * ELEM_SIZE); \
-        dma_queue_flush(dma_q);                                                                       \
-        return;                                                                                       \
-    }                                                                                                 \
                                                                                                       \
     const uint32_t ne01_ne00      = ne01 * ne00;                                                      \
     const uint32_t ne02_ne01_ne00 = ne02 * ne01_ne00;                                                 \
@@ -308,8 +301,8 @@ static int cpy_1d_contig(struct htp_ops_context * octx, const struct htp_copy_ke
     if (nelem > 0) {
         dma_queue * q = octx->ctx->dma[0];
         const uint32_t type_size = kparams->src0_type_size;
-        dma_addr_t dst_addr  = dst->data  + (dma_addr_t) elem_start * type_size;
-        dma_addr_t src0_addr = src0->data + (dma_addr_t) elem_start * type_size;
+        dma_addr_t dst_addr  = dst->data  + elem_start * type_size;
+        dma_addr_t src0_addr = src0->data + elem_start * type_size;
         dma_cpy_sametype_reshape_contig(q, dst_addr, src0_addr, nelem * type_size);
         dma_queue_flush(q);
     }
