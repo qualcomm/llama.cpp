@@ -166,51 +166,56 @@ static void cpy_thread_##NAME##_reshape(unsigned int nth, unsigned int ith, void
                                                                                                       \
     char * dst_ptr        = (char *)       dst->data  + i10*nb0  + i11*nb1  + i12*nb2  + i13*nb3;     \
     const char * src0_ptr = (const char *) src0->data + i00*nb00 + i01*nb01 + i02*nb02 + i03*nb03;    \
-                                                                                                      \
+                                                                                                       \
     const bool rows_contig = (nb00 == ELEM_SIZE) && (nb0 == ELEM_SIZE);                               \
-                                                                                                      \
-    while (e < th_end) {                                                                              \
-        uint32_t run = 1;                                                                             \
-        if (rows_contig) {                                                                            \
-            run = MIN(MIN(ne00 - i00, ne0 - i10), th_end - e);                                        \
-            cpy_dma_sametype_reshape_contig(dma_q, (dma_addr_t)(uintptr_t) dst_ptr,                   \
-                                            (dma_addr_t)(uintptr_t) src0_ptr, run * ELEM_SIZE);       \
-        } else {                                                                                      \
-            *((ELEM_TYPE *) dst_ptr) = *((const ELEM_TYPE *) src0_ptr);                               \
-        }                                                                                             \
-        e += run;                                                                                     \
-                                                                                                      \
-        dst_ptr += run * nb0;                                                                         \
-        i10     += run;                                                                               \
-        if (i10 == ne0) {                                                                             \
-            i10 = 0;                                                                                  \
-            if (++i11 == ne1) {                                                                       \
-                i11 = 0;                                                                              \
-                if (++i12 == ne2) {                                                                   \
-                    i12 = 0;                                                                          \
-                    i13++;                                                                            \
-                }                                                                                     \
-            }                                                                                         \
-            dst_ptr = (char *) dst->data + i11*nb1 + i12*nb2 + i13*nb3;                               \
-        }                                                                                             \
-                                                                                                      \
-        src0_ptr += run * nb00;                                                                       \
-        i00      += run;                                                                              \
-        if (i00 == ne00) {                                                                            \
-            i00 = 0;                                                                                  \
-            if (++i01 == ne01) {                                                                      \
-                i01 = 0;                                                                              \
-                if (++i02 == ne02) {                                                                  \
-                    i02 = 0;                                                                          \
-                    i03++;                                                                            \
-                }                                                                                     \
-            }                                                                                         \
-            src0_ptr = (const char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03;                    \
-        }                                                                                             \
-    }                                                                                                 \
-    if (rows_contig) {                                                                                \
-        dma_queue_flush(dma_q);                                                                       \
-    }                                                                                                 \
+    const bool can_2d_dma  = (nb00 >= ELEM_SIZE) && (nb0 >= ELEM_SIZE);                               \
+                                                                                                       \
+    while (e < th_end) {                                                                               \
+        uint32_t run = 1;                                                                              \
+        if (rows_contig) {                                                                             \
+            run = MIN(MIN(ne00 - i00, ne0 - i10), th_end - e);                                         \
+            cpy_dma_sametype_reshape_contig(dma_q, (dma_addr_t)(uintptr_t) dst_ptr,                    \
+                                            (dma_addr_t)(uintptr_t) src0_ptr, run * ELEM_SIZE);        \
+        } else if (can_2d_dma) {                                                                       \
+            run = MIN(MIN(ne00 - i00, ne0 - i10), th_end - e);                                         \
+            cpy_dma_push_2d_chunked(dma_q, (dma_addr_t)(uintptr_t) dst_ptr,                            \
+                                    (dma_addr_t)(uintptr_t) src0_ptr, nb0, nb00, ELEM_SIZE, run);      \
+        } else {                                                                                       \
+            *((ELEM_TYPE *) dst_ptr) = *((const ELEM_TYPE *) src0_ptr);                                \
+        }                                                                                              \
+        e += run;                                                                                      \
+                                                                                                       \
+        dst_ptr += run * nb0;                                                                          \
+        i10     += run;                                                                                \
+        if (i10 == ne0) {                                                                              \
+            i10 = 0;                                                                                   \
+            if (++i11 == ne1) {                                                                        \
+                i11 = 0;                                                                               \
+                if (++i12 == ne2) {                                                                    \
+                    i12 = 0;                                                                           \
+                    i13++;                                                                             \
+                }                                                                                      \
+            }                                                                                          \
+            dst_ptr = (char *) dst->data + i11*nb1 + i12*nb2 + i13*nb3;                                \
+        }                                                                                              \
+                                                                                                       \
+        src0_ptr += run * nb00;                                                                        \
+        i00      += run;                                                                               \
+        if (i00 == ne00) {                                                                             \
+            i00 = 0;                                                                                   \
+            if (++i01 == ne01) {                                                                       \
+                i01 = 0;                                                                               \
+                if (++i02 == ne02) {                                                                   \
+                    i02 = 0;                                                                           \
+                    i03++;                                                                             \
+                }                                                                                      \
+            }                                                                                          \
+            src0_ptr = (const char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03;                     \
+        }                                                                                              \
+    }                                                                                                  \
+    if (rows_contig || can_2d_dma) {                                                                   \
+        dma_queue_flush(dma_q);                                                                        \
+    }                                                                                                  \
 }
 
 DEFINE_CPY_RESHAPE(f32,  float, 4)
@@ -379,24 +384,19 @@ static int exec_cpy(struct htp_ops_context * octx, bool * use_dma) {
         if (octx->ctx->mdev.count > 1 && octx->ctx->mdev.idx > 0) {
             return HTP_STATUS_OK;
         }
+        if (src0->type == dst->type) {
+            const uint32_t elem_size = (src0->type == HTP_TYPE_F16) ? 2 : 4;
+            *use_dma = true;
+            cpy_dma_sametype_reshape_contig(octx->ctx->dma[0], dst->data, src0->data, elem_size);
+            dma_queue_flush(octx->ctx->dma[0]);
+            return HTP_STATUS_OK;
+        }
         if (src0->type == HTP_TYPE_F32 && dst->type == HTP_TYPE_I32) {
             ((int32_t *) dst->data)[0] = (int32_t) (((const float *) src0->data)[0]);
             return HTP_STATUS_OK;
         }
         if (src0->type == HTP_TYPE_I32 && dst->type == HTP_TYPE_F32) {
             ((float *) dst->data)[0] = (float) (((const int32_t *) src0->data)[0]);
-            return HTP_STATUS_OK;
-        }
-        if (src0->type == HTP_TYPE_I32 && dst->type == HTP_TYPE_I32) {
-            ((int32_t *) dst->data)[0] = ((const int32_t *) src0->data)[0];
-            return HTP_STATUS_OK;
-        }
-        if (src0->type == HTP_TYPE_F32 && dst->type == HTP_TYPE_F32) {
-            ((float *) dst->data)[0] = ((const float *) src0->data)[0];
-            return HTP_STATUS_OK;
-        }
-        if (src0->type == HTP_TYPE_F16 && dst->type == HTP_TYPE_F16) {
-            ((__fp16 *) dst->data)[0] = ((const __fp16 *) src0->data)[0];
             return HTP_STATUS_OK;
         }
         if (src0->type == HTP_TYPE_F32 && dst->type == HTP_TYPE_F16) {
@@ -511,8 +511,9 @@ static int exec_cpy(struct htp_ops_context * octx, bool * use_dma) {
         const uint32_t total_elems = ne0 * ne1 * ne2 * ne3;
         const uint32_t elems_per_line = (ct.dst_type_size == 4) ? 32 : 64;
         const bool rows_contig = (nb00 == ct.src0_type_size) && (nb0 == ct.dst_type_size);
+        const bool can_2d_dma  = (nb00 >= ct.src0_type_size) && (nb0 >= ct.dst_type_size);
 
-        if (rows_contig) {
+        if (rows_contig || can_2d_dma) {
             *use_dma = true;
         }
 
