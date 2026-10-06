@@ -138,8 +138,8 @@ static inline void hvx_ssm_conv_unpack_to_T(const float * raw, float * T, uint32
 // Decode dot product specialization for d_conv == 4: multiply in the raw channel-major layout,
 // then deinterleave the products so each vector holds one tap of 32 channels, and sum.
 // Keeps both operands in DMA layout - no transpose, no scratch.
-static inline void hvx_ssm_conv_decode_4(const float * x, const float * w, float * out, uint32_t d_inner_per_thread) {
-    for (uint32_t cb = 0; cb < d_inner_per_thread; cb += VLEN_FP32) {
+static inline void hvx_ssm_conv_decode_4(const float * x, const float * w, float * out, uint32_t n_ch) {
+    for (uint32_t cb = 0; cb < n_ch; cb += VLEN_FP32) {
         const float * xp = x + cb * 4;
         const float * wp = w + cb * 4;
 
@@ -203,9 +203,11 @@ static void ssm_conv_thread_f32_decode(unsigned int nth, unsigned int ith, void 
 
     const uint32_t d_inner_per_thread = ir1 - ir0;
     const uint32_t d_inner_stride     = hex_round_up(d_inner_per_thread, VLEN_FP32);
+    const uint32_t d_inner_tile       = scctx->d_inner_tile;
 
-    const size_t src0_stride_seq_bytes = src0->nb[2];
-    const size_t dst_stride_seq_bytes  = dst->nb[2];
+    const size_t src0_stride_inner_bytes = src0->nb[1];
+    const size_t src0_stride_seq_bytes   = src0->nb[2];
+    const size_t dst_stride_seq_bytes    = dst->nb[2];
 
     uint8_t * src1_spad_base = octx->src1_spad.data + ith * octx->src1_spad.size_per_thread;
     uint8_t * src0_spad_base = octx->src0_spad.data + ith * octx->src0_spad.size_per_thread;
@@ -217,25 +219,49 @@ static void ssm_conv_thread_f32_decode(unsigned int nth, unsigned int ith, void 
     float * src1_raw = (float *) src1_spad_base;
     float * src1_T   = (float *) (src1_spad_base + weight_raw_size);
 
-    float * src0_raw = (float *) src0_spad_base;
-    float * src0_T   = (float *) (src0_spad_base + weight_raw_size);
+    const size_t src0_tile_raw_bytes = hex_round_up(d_inner_tile * d_conv * sizeof(float), 128);
+    const size_t dst_tile_bytes      = hex_round_up(d_inner_tile * sizeof(float), 128);
 
-    float * dst_spad = (float *) dst_spad_base;
+    float * src0_tile_raw[2] = { (float *) src0_spad_base, (float *) (src0_spad_base + src0_tile_raw_bytes) };
+    float * src0_T           = (float *) (src0_spad_base + 2 * src0_tile_raw_bytes);
+
+    float * dst_tile[2] = { (float *) dst_spad_base, (float *) (dst_spad_base + dst_tile_bytes) };
 
     struct htp_thread_trace * tr = &octx->ctx->trace[ith];
-
-    const size_t input_bytes  = (size_t) d_inner_per_thread * d_conv * sizeof(float);
-    const size_t output_bytes = (size_t) d_inner_per_thread * sizeof(float);
 
     // raw_dot keeps both operands in the DMA layout, so src1 needs no prep pass
     const bool raw_dot = (d_conv == 4) && (d_inner_per_thread % VLEN_FP32 == 0);
 
-    // Queue the weights and the first input together so the two DDR reads overlap
+    const uint32_t n_tiles   = (d_inner_per_thread + d_inner_tile - 1) / d_inner_tile;
+    const uint32_t n_chunks  = n_s * n_tiles;
+    const size_t   row_bytes = d_conv * sizeof(float);
+
+    uint32_t s_fetch        = 0;
+    uint32_t tile_off_fetch = 0;
+
+    #define SSM_CONV_DECODE_PUSH_FETCH(c)                                                         \
+        do {                                                                                      \
+            const uint32_t   cur_tile_n = MIN(d_inner_tile, d_inner_per_thread - tile_off_fetch); \
+            const dma_addr_t fetch_ddr  = src0->data + s_fetch * src0_stride_seq_bytes +          \
+                                          (ir0 + tile_off_fetch) * src0_stride_inner_bytes;       \
+            dma_queue_push(dma_q,                                                                 \
+                           dma_make_data((uint8_t *) src0_tile_raw[(c) & 1], fetch_ddr),          \
+                           row_bytes, src0_stride_inner_bytes, row_bytes, cur_tile_n);            \
+            tile_off_fetch += d_inner_tile;                                                       \
+            if (tile_off_fetch >= d_inner_per_thread) {                                           \
+                tile_off_fetch = 0;                                                               \
+                s_fetch++;                                                                        \
+            }                                                                                     \
+        } while (0)
+
+    // Queue weights and initial input tiles together so DDR reads overlap
     const dma_addr_t src1_ddr = src1->data + ir0 * d_conv * sizeof(float);
     dma_queue_push(dma_q, dma_make_data((uint8_t *) src1_raw, src1_ddr), weight_bytes, weight_bytes, weight_bytes, 1);
 
-    const dma_addr_t src0_ddr0 = src0->data + ir0 * d_conv * sizeof(float);
-    dma_queue_push(dma_q, dma_make_data((uint8_t *) src0_raw, src0_ddr0), input_bytes, input_bytes, input_bytes, 1);
+    SSM_CONV_DECODE_PUSH_FETCH(0);
+    if (n_chunks > 1) {
+        SSM_CONV_DECODE_PUSH_FETCH(1);
+    }
 
     dma_queue_pop(dma_q);  // weights
 
@@ -246,42 +272,67 @@ static void ssm_conv_thread_f32_decode(unsigned int nth, unsigned int ith, void 
         htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_W_PREP, (uint16_t) ir0);
     }
 
-    // Process each sequence
-    for (uint32_t s = 0; s < n_s; ++s) {
-        if (s > 0) {
-            const dma_addr_t src0_ddr = src0->data + s * src0_stride_seq_bytes + ir0 * d_conv * sizeof(float);
-            dma_queue_push(dma_q, dma_make_data((uint8_t *) src0_raw, src0_ddr), input_bytes, input_bytes, input_bytes, 1);
+    uint32_t i3       = 0;
+    uint32_t tile_off = 0;
+
+    for (uint32_t c = 0; c < n_chunks; ++c) {
+        const uint32_t tile_n = MIN(d_inner_tile, d_inner_per_thread - tile_off);
+
+        if (c >= 2) {
+            dma_queue_pop(dma_q);  // writeback of chunk c-2, frees dst_tile[c & 1]
         }
-        dma_queue_pop(dma_q);  // input
+        dma_queue_pop(dma_q);      // fetch chunk c
 
-        htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) s);
+        float * restrict out = dst_tile[c & 1];
+
+        htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) i3);
         if (raw_dot) {
-            hvx_ssm_conv_decode_4(src0_raw, src1_raw, dst_spad, d_inner_per_thread);
+            const float * xp = src0_tile_raw[c & 1];
+            const float * wp = src1_raw + tile_off * 4;
+            hvx_ssm_conv_decode_4(xp, wp, out, tile_n);
         } else {
-            hvx_ssm_conv_unpack_to_T(src0_raw, src0_T, d_inner_per_thread, d_inner_stride, d_conv);
+            const uint32_t tile_stride = hex_round_up(tile_n, VLEN_FP32);
+            hvx_ssm_conv_unpack_to_T(src0_tile_raw[c & 1], src0_T, tile_n, tile_stride, d_conv);
 
-            for (uint32_t cb = 0; cb < d_inner_per_thread; cb += VLEN_FP32) {
-                const uint32_t cb_n = MIN(VLEN_FP32, d_inner_per_thread - cb);
+            for (uint32_t cb = 0; cb < tile_n; cb += VLEN_FP32) {
+                const uint32_t cb_n = MIN(VLEN_FP32, tile_n - cb);
                 HVX_Vector acc = hvx_vec_splat_f32(0.0f);
                 for (uint32_t j = 0; j < d_conv; ++j) {
-                    HVX_Vector x = *(const HVX_Vector *)(src0_T + j * d_inner_stride + cb);
-                    HVX_Vector w = *(const HVX_Vector *)(src1_T + j * d_inner_stride + cb);
+                    HVX_Vector x = *(const HVX_Vector *)(src0_T + j * tile_stride + cb);
+                    HVX_Vector w = *(const HVX_Vector *)(src1_T + j * d_inner_stride + tile_off + cb);
                     acc          = Q6_Vqf32_vadd_Vqf32Vqf32(acc, Q6_Vqf32_vmpy_VsfVsf(x, w));
                 }
                 HVX_Vector y = Q6_Vsf_equals_Vqf32(acc);
                 if (cb_n == VLEN_FP32) {
-                    *(HVX_Vector *)(dst_spad + cb) = y;
+                    *(HVX_Vector *)(out + cb) = y;
                 } else {
-                    hvx_vec_store_u(dst_spad + cb, cb_n * sizeof(float), y);
+                    hvx_vec_store_u(out + cb, cb_n * sizeof(float), y);
                 }
             }
         }
-        htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) s);
+        htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) i3);
 
-        const dma_addr_t dst_ddr = dst->data + s * dst_stride_seq_bytes + ir0 * sizeof(float);
-        dma_queue_push(dma_q, dma_make_data(dst_ddr, (uint8_t *) dst_spad), output_bytes, output_bytes, output_bytes, 1);
-        dma_queue_pop(dma_q);
+        const dma_addr_t dst_ddr        = dst->data + i3 * dst_stride_seq_bytes + (ir0 + tile_off) * sizeof(float);
+        const size_t     tile_out_bytes = (size_t) tile_n * sizeof(float);
+        dma_queue_push(dma_q, dma_make_data(dst_ddr, (uint8_t *) out),
+                       tile_out_bytes, tile_out_bytes, tile_out_bytes, 1);
+
+        if (c + 2 < n_chunks) {
+            SSM_CONV_DECODE_PUSH_FETCH(c + 2);
+        }
+
+        tile_off += d_inner_tile;
+        if (tile_off >= d_inner_per_thread) {
+            tile_off = 0;
+            i3++;
+        }
     }
+
+    for (uint32_t k = MIN(n_chunks, 2); k > 0; --k) {
+        dma_queue_pop(dma_q);  // drain the last writebacks
+    }
+
+    #undef SSM_CONV_DECODE_PUSH_FETCH
 
     FARF(HIGH, "ssm-conv-f32-decode %d/%d: %ux%ux%ux%u (%u:%u) * %ux%ux%ux%u -> %ux%ux%ux%u\n",
          ith, nth, src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3], ir0, ir1,
@@ -346,12 +397,42 @@ static void ssm_conv_thread_f32_prefill(unsigned int nth, unsigned int ith, void
 
     struct htp_thread_trace * tr = &octx->ctx->trace[ith];
 
-    // 1. Fetch weights src1 from DDR into VTCM via DMA (DMA64-safe)
+    const uint32_t n_tiles   = (d_inner_per_thread + d_inner_tile - 1) / d_inner_tile;
+    const uint32_t n_chunks  = n_s * n_tiles;
+    const size_t   row_bytes = ncs * sizeof(float);
+
+    uint32_t s_fetch        = 0;
+    uint32_t tile_off_fetch = 0;
+
+    // Chunk c fetches into src0_tile_raw[c & 1] and writes back from dst_tile[c & 1].
+    // Two fetches run ahead, so the queue order is F0 F1 W0 F2 W1 ... and pops follow it.
+    #define SSM_CONV_PUSH_FETCH(c)                                                                \
+        do {                                                                                      \
+            const uint32_t   cur_tile_n = MIN(d_inner_tile, d_inner_per_thread - tile_off_fetch); \
+            const dma_addr_t fetch_ddr  = src0->data + s_fetch * src0_stride_seq_bytes +          \
+                                          (ir0 + tile_off_fetch) * src0_stride_inner_bytes;       \
+            dma_queue_push(dma_q,                                                                 \
+                           dma_make_data((uint8_t *) src0_tile_raw[(c) & 1], fetch_ddr),          \
+                           row_bytes, src0_stride_inner_bytes, row_bytes, cur_tile_n);            \
+            tile_off_fetch += d_inner_tile;                                                       \
+            if (tile_off_fetch >= d_inner_per_thread) {                                           \
+                tile_off_fetch = 0;                                                               \
+                s_fetch++;                                                                        \
+            }                                                                                     \
+        } while (0)
+
+    // Queue weights and initial input tiles together so DDR reads overlap
     const dma_addr_t src1_ddr = src1->data + ir0 * d_conv * sizeof(float);
     dma_queue_push(dma_q, dma_make_data((uint8_t *) src1_raw, src1_ddr), weight_bytes, weight_bytes, weight_bytes, 1);
-    dma_queue_pop(dma_q);
 
-    // 2. Unpack/transpose src1_raw into src1_T {d_conv, d_inner_stride}
+    SSM_CONV_PUSH_FETCH(0);
+    if (n_chunks > 1) {
+        SSM_CONV_PUSH_FETCH(1);
+    }
+
+    dma_queue_pop(dma_q);  // weights
+
+    // Unpack/transpose src1_raw into src1_T {d_conv, d_inner_stride}
     htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_W_PREP, (uint16_t) ir0);
     hvx_ssm_conv_unpack_to_T(src1_raw, src1_T, d_inner_per_thread, d_inner_stride, d_conv);
     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_W_PREP, (uint16_t) ir0);
@@ -364,35 +445,6 @@ static void ssm_conv_thread_f32_prefill(unsigned int nth, unsigned int ith, void
         gather_off[r] = r * ncs * sizeof(float);
     }
     const HVX_Vector vv = *(const HVX_Vector *) gather_off;
-
-    const uint32_t n_tiles   = (d_inner_per_thread + d_inner_tile - 1) / d_inner_tile;
-    const uint32_t n_chunks  = n_s * n_tiles;
-    const size_t   row_bytes = ncs * sizeof(float);
-
-    uint32_t s_fetch        = 0;
-    uint32_t tile_off_fetch = 0;
-
-    // Chunk c fetches into src0_tile_raw[c & 1] and writes back from dst_tile[c & 1].
-    // Two fetches run ahead, so the queue order is F0 F1 W0 F2 W1 ... and pops follow it.
-    #define SSM_CONV_PUSH_FETCH(c)                                                                  \
-        do {                                                                                        \
-            dma_queue_push(dma_q,                                                                   \
-                           dma_make_data((uint8_t *) src0_tile_raw[(c) & 1],                        \
-                                         src0->data + s_fetch * src0_stride_seq_bytes +             \
-                                             (ir0 + tile_off_fetch) * src0_stride_inner_bytes),     \
-                           row_bytes, src0_stride_inner_bytes, row_bytes,                           \
-                           MIN(d_inner_tile, d_inner_per_thread - tile_off_fetch));                 \
-            tile_off_fetch += d_inner_tile;                                                         \
-            if (tile_off_fetch >= d_inner_per_thread) {                                             \
-                tile_off_fetch = 0;                                                                 \
-                s_fetch++;                                                                          \
-            }                                                                                       \
-        } while (0)
-
-    SSM_CONV_PUSH_FETCH(0);
-    if (n_chunks > 1) {
-        SSM_CONV_PUSH_FETCH(1);
-    }
 
     uint32_t i3       = 0;
     uint32_t tile_off = 0;
