@@ -214,3 +214,83 @@ __kernel void flash_attn_v_transpose_f16(
         }
     }
 }
+
+// V transpose that emits int8 + a per-32-block scale instead of f16, for the dp4a KQV path.
+//
+// The transpose tile is already FA_VT_TILE = 32 wide along kv, and kv is the contiguous axis of
+// the output (vt[d*n_kv + kv]), so one tile row IS exactly one quantisation block - the scales
+// fall out of the existing staging with no extra pass over V.
+//
+// Blocks are owned one-per-lane rather than one-per-element: lane t takes d = d0+t and reads
+// tile[0..31][t], a column walk of the +1-padded LDS tile, so it is bank-conflict free. That
+// leaves most of the workgroup idle in this phase, which is affordable - the f16 transpose this
+// replaces is 0.10% of prefill.
+__kernel void flash_attn_v_transpose_q8(
+    const global void * v_void, ulong v_offset,
+    global void * vt_q_void,            // char, [n_head_kv][dv][n_kv]
+    global void * vt_d_void,            // half, [n_head_kv][dv][n_kv/32]
+    const int n_kv,
+    const int dv,
+    const int n_head_kv,
+    const ulong v_nb1,
+    const ulong v_nb2,
+    const ulong v_nb3
+) {
+    __local half tile[FA_VT_TILE][FA_VT_TILE + 1];
+
+    const int d0 = get_group_id(0) * FA_VT_TILE;
+    const int k0 = get_group_id(1) * FA_VT_TILE;
+    const int head_kv_idx = get_group_id(2) % n_head_kv;
+    const int batch_idx   = get_group_id(2) / n_head_kv;
+
+    const int lx = get_local_id(0);
+    const int ly = get_local_id(1);
+
+    const global char * v_head = (const global char *) v_void + v_offset +
+        (ulong) batch_idx * v_nb3 + (ulong) head_kv_idx * v_nb2;
+
+    for (int r = 0; r < FA_VT_TILE; r += FA_VT_ROWS) {
+        const int d  = d0 + lx;
+        const int kv = k0 + ly + r;
+        half val = (half) 0.0f;
+        if (d < dv && kv < n_kv) {
+            val = ((const global half *) (v_head + (ulong) kv * v_nb1))[d];
+        }
+        tile[ly + r][lx] = val;
+    }
+
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    const int lid  = ly * FA_VT_TILE + lx;
+    const int nblk = n_kv / FA_VT_TILE;
+
+    if (lid < FA_VT_TILE) {
+        const int d = d0 + lid;
+        if (d < dv) {
+            const ulong hbase = ((ulong) batch_idx * (ulong) n_head_kv + (ulong) head_kv_idx);
+
+            global char * qrow = (global char *) vt_q_void + hbase*(ulong)n_kv*(ulong)dv + (ulong) d * (ulong) n_kv;
+            global half * drow = (global half *) vt_d_void + hbase*(ulong)nblk*(ulong)dv + (ulong) d * (ulong) nblk;
+
+            float v[FA_VT_TILE];
+            float amax = 0.0f;
+
+            for (int i = 0; i < FA_VT_TILE; ++i) {
+                v[i] = (float) tile[i][lid];
+                amax = fmax(amax, fabs(v[i]));
+            }
+
+            const float dq = amax / 127.0f;
+            const float id = amax > 0.0f ? 127.0f / amax : 0.0f;
+
+            drow[k0 / FA_VT_TILE] = (half) dq;
+
+            for (int i = 0; i < FA_VT_TILE; ++i) {
+                const int kv = k0 + i;
+                if (kv < n_kv) {
+                    qrow[kv] = (char) clamp((int) rint(v[i] * id), -127, 127);
+                }
+            }
+        }
+    }
+}
