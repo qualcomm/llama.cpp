@@ -7637,6 +7637,7 @@ static htp_op_code op_remap_to_htp(const ggml_tensor * t) {
         case GGML_OP_ADD_ID:          return HTP_OP_ADD_ID;
         case GGML_OP_SUB:             return HTP_OP_SUB;
         case GGML_OP_DIV:             return HTP_OP_DIV;
+        case GGML_OP_DUP:
         case GGML_OP_CPY:             return HTP_OP_CPY;
         case GGML_OP_CONT:            return HTP_OP_CPY;
         case GGML_OP_GET_ROWS:        return HTP_OP_GET_ROWS;
@@ -8784,6 +8785,7 @@ static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, cons
             supp = ggml_hexagon_supported_get_rows(sess, op);
             break;
 
+        case GGML_OP_DUP:
         case GGML_OP_CPY:
             supp = ggml_hexagon_supported_cpy(sess, op);
             break;
