@@ -262,7 +262,6 @@ static int concat_regular(struct htp_ops_context * octx, int dim, uint32_t type_
     dma_cpy_sametype_sameshape_range(q, &view1, src1, type_size, rstart1, nrows1);
     dma_queue_flush(q);
 
-    htp_mdev_group_barrier(octx);
     return HTP_STATUS_OK;
 }
 
@@ -316,14 +315,26 @@ int op_concat(struct htp_ops_context * octx) {
     const struct htp_tensor * dst = octx->dst;
     const uint32_t type_size = (dst->type == HTP_TYPE_F32 || dst->type == HTP_TYPE_I32) ? 4 : 2;
 
+    int status = HTP_STATUS_OK;
     switch (kparams->kernel_type) {
         case HTP_CONCAT_KERNEL_REGULAR:
-            return concat_regular(octx, kparams->dim, type_size);
+            status = concat_regular(octx, kparams->dim, type_size);
+            break;
 
         case HTP_CONCAT_KERNEL_TRANSPOSED:
-            return concat_transposed(octx, type_size);
+            status = concat_transposed(octx, type_size);
+            break;
 
         default:
-            return HTP_STATUS_NO_SUPPORT;
+            status = HTP_STATUS_NO_SUPPORT;
+            break;
     }
+
+    htp_ops_context_set_status(octx, status);
+
+    if (octx->ctx->mdev.count > 1) {
+        htp_mdev_group_barrier(octx);
+    }
+
+    return octx->status;
 }
