@@ -6,6 +6,7 @@
 #include "hexagon_protos.h"
 #include "hexagon_types.h"
 #include "htp-ctx.h"
+#include "htp-fence.h"
 #include "htp-ops.h"
 #include "htp-tensor.h"
 #include "htp-vtcm.h"
@@ -296,9 +297,7 @@ static bool concat_dma(struct htp_ops_context * octx, int dim, uint32_t type_siz
     const struct htp_tensor * src1 = octx->src[1];
     const struct htp_tensor * dst  = octx->dst;
 
-    // Not partitioned across devices: the row/element-split paths handle that.
-    if (octx->ctx->mdev.count > 1 ||
-        (dst->type != HTP_TYPE_F32 && dst->type != HTP_TYPE_F16 && dst->type != HTP_TYPE_I32) ||
+    if ((dst->type != HTP_TYPE_F32 && dst->type != HTP_TYPE_F16 && dst->type != HTP_TYPE_I32) ||
         src0->type != dst->type || src1->type != dst->type || src0->nb[0] != type_size || src1->nb[0] != type_size ||
         dst->nb[0] != type_size || (size_t) dst->ne[0] * type_size > DMA_MAX_SIZE_24B ||
         dst->nb[1] > DMA_MAX_STRIDE_24B || src0->nb[1] > DMA_MAX_STRIDE_24B || src1->nb[1] > DMA_MAX_STRIDE_24B) {
@@ -312,20 +311,24 @@ static bool concat_dma(struct htp_ops_context * octx, int dim, uint32_t type_siz
         }
     }
 
-    // The two views of dst, shaped like the sources.
-    struct htp_tensor view0 = *dst;
-    struct htp_tensor view1 = *dst;
-    for (int d = 0; d < HTP_OP_MAX_DIMS; d++) {
-        view0.ne[d] = src0->ne[d];
-        view1.ne[d] = src1->ne[d];
+    if (octx->ctx->mdev.count <= 1 || octx->ctx->mdev.idx == 0) {
+        // The two views of dst, shaped like the sources.
+        struct htp_tensor view0 = *dst;
+        struct htp_tensor view1 = *dst;
+        for (int d = 0; d < HTP_OP_MAX_DIMS; d++) {
+            view0.ne[d] = src0->ne[d];
+            view1.ne[d] = src1->ne[d];
+        }
+        view1.data += src0->ne[dim] * dst->nb[dim];
+
+        dma_queue * q = octx->ctx->dma[0];
+
+        cpy_dma_sametype_sameshape(q, &view0, src0, type_size);
+        cpy_dma_sametype_sameshape(q, &view1, src1, type_size);
+        dma_queue_flush(q);
     }
-    view1.data += (uint64_t) src0->ne[dim] * dst->nb[dim];
 
-    dma_queue * q = octx->ctx->dma[0];
-
-    cpy_dma_sametype_sameshape(q, &view0, src0, type_size);
-    cpy_dma_sametype_sameshape(q, &view1, src1, type_size);
-    dma_queue_flush(q);
+    htp_mdev_group_barrier(octx);
     return true;
 }
 
@@ -361,13 +364,10 @@ int op_concat(struct htp_ops_context * octx) {
 
     if (dim == 0 && is_src1_transposed && !is_src0_transposed && rows_ok) {
         const uint32_t total_rows = dst->ne[1];
-        const size_t dst_data_row_size = dst->ne[0] * type_size;
         uint32_t row_start = 0;
         uint32_t nrows     = total_rows;
         if (octx->ctx->mdev.count > 1) {
-            uint32_t rows_per_chunk = 0;
-            htp_tensor_mdev_rows_per_chunk(dst, type_size, (uint32_t) dst_data_row_size, &rows_per_chunk);
-            const struct htp_tensor_mdev_range range = htp_tensor_mdev_partition(total_rows, rows_per_chunk, octx->ctx->mdev.idx, octx->ctx->mdev.count, &octx->ctx->mdev.count_div);
+            const struct htp_tensor_mdev_range range = htp_tensor_mdev_partition(total_rows, 1, octx->ctx->mdev.idx, octx->ctx->mdev.count, &octx->ctx->mdev.count_div);
             row_start = range.start;
             nrows     = range.count;
         }
