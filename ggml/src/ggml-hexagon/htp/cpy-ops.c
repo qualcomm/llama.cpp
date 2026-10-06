@@ -312,9 +312,8 @@ DEFINE_CPY_CONVERT_SAMESHAPE(f32_f16, hvx_copy_f32_f16_aa)
 DEFINE_CPY_CONVERT_SAMESHAPE(i32_f32, hvx_copy_i32_f32_aa)
 DEFINE_CPY_CONVERT_SAMESHAPE(f32_i32, hvx_copy_f32_i32_aa)
 
-static int exec_cpy(struct htp_ops_context * octx, bool * use_dma) {
+static int exec_cpy(struct htp_ops_context * octx) {
     cpy_preamble;
-    *use_dma = false;
 
     const uint32_t total_elems_src = ne00 * ne01 * ne02 * ne03;
     const uint32_t total_elems_dst = ne0 * ne1 * ne2 * ne3;
@@ -324,7 +323,6 @@ static int exec_cpy(struct htp_ops_context * octx, bool * use_dma) {
         }
         if (src0->type == dst->type) {
             const uint32_t elem_size = (src0->type == HTP_TYPE_F16) ? 2 : 4;
-            *use_dma = true;
             cpy_dma_sametype_reshape_contig(octx->ctx->dma[0], dst->data, src0->data, elem_size);
             dma_queue_flush(octx->ctx->dma[0]);
             return HTP_STATUS_OK;
@@ -353,7 +351,6 @@ static int exec_cpy(struct htp_ops_context * octx, bool * use_dma) {
             }
             dma_queue_push(dma_q, dma_make_data(dst->data, d_vtcm), d_size, d_size, d_size, 1);
             dma_queue_flush(dma_q);
-            *use_dma = true;
             return HTP_STATUS_OK;
         }
     }
@@ -422,7 +419,6 @@ static int exec_cpy(struct htp_ops_context * octx, bool * use_dma) {
         ct.src0_nrows_per_thread = fastdiv(nrows + n_threads - 1, &octx->n_threads_div);
 
         if (sametype) {
-            *use_dma = true;
             if (octx->ctx->mdev.count <= 1 || htp_tensor_is_extended(src0) || htp_tensor_is_extended(dst)) {
                 if (octx->ctx->mdev.idx == 0) {
                     cpy_dma_sametype_sameshape(octx->ctx->dma[0], dst, src0, ct.src0_type_size);
@@ -455,17 +451,6 @@ static int exec_cpy(struct htp_ops_context * octx, bool * use_dma) {
             ct.src0_buf_size = src0_row_size_aligned;
             ct.dst_buf_size  = dst_row_size_aligned;
 
-            octx->src0_spad.size_per_thread = 2 * src0_row_size_aligned;
-            octx->dst_spad.size_per_thread  = 2 * dst_row_size_aligned;
-            octx->src0_spad.size = n_threads * octx->src0_spad.size_per_thread;
-            octx->dst_spad.size  = n_threads * octx->dst_spad.size_per_thread;
-            octx->src0_spad.data = ct.vtcm_src0;
-            octx->dst_spad.data  = ct.vtcm_dst;
-            octx->src0_spad.src  = NULL;
-            octx->dst_spad.src   = NULL;
-
-            *use_dma = true;
-
             work_queue_func_t copy_fun = NULL;
             if (dst->type == HTP_TYPE_F16 && src0->type == HTP_TYPE_F32) {
                 copy_fun = cpy_thread_f16_f32_sameshape;
@@ -482,7 +467,6 @@ static int exec_cpy(struct htp_ops_context * octx, bool * use_dma) {
         }
     } else if (sametype) {
         const uint32_t total_elems = ne0 * ne1 * ne2 * ne3;
-        *use_dma = true;
 
         if (octx->ctx->mdev.count <= 1 && dst_is_contiguous && src_is_contiguous) {
             cpy_dma_sametype_reshape_contig(octx->ctx->dma[0], dst->data, src0->data, total_elems * ct.dst_type_size);
@@ -531,16 +515,11 @@ static int exec_cpy(struct htp_ops_context * octx, bool * use_dma) {
 }
 
 int op_cpy(struct htp_ops_context * octx) {
-    bool use_dma = false;
-    int status = exec_cpy(octx, &use_dma);
+    int status = exec_cpy(octx);
 
     htp_ops_context_set_status(octx, status);
 
     if (octx->op == HTP_OP_CPY_FENCE) {
-        if (!use_dma) {
-            htp_flush_dirty_ranges(octx->ctx);
-        }
-
         htp_mdev_group_barrier(octx);
 
         if (octx->ctx->mdev.idx == 0) {
