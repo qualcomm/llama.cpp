@@ -52529,17 +52529,32 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     // DEFAULT ON for any dp4a-capable Adreno (the old "-14% on X1" predated
                     // the fa604e60e vec-acc rewrite; X1-85 re-measured +22-25% pp512/2048 on
                     // Granite-a800m). Dense dp4a stays X2-class-only. Env override forces either way.
-                    // EXCEPTION: when the q4_k MoE bin (ILA) kernel is loaded
-                    // (GGML_OPENCL_USE_ADRENO_BIN_KERNELS build + kernel lib present),
-                    // it beats the dp4a GEMM on X2E (+13-19% prefill on Qwen3-30B-A3B,
-                    // byte-identical greedy), so default dp4a off to let the bin kernel
-                    // (dispatched in the !use_moe_dp4a path below) win. The explicit env
-                    // GGML_OPENCL_Q4K_MOE_DP4A=1 still forces dp4a for A/B / fallback.
+                    // When the q4_k MoE bin (ILA) kernel is loaded (GGML_OPENCL_USE_ADRENO_BIN_KERNELS
+                    // build + kernel lib present), the two-rows-per-lane dp4a build beats it on
+                    // X2-90: Qwen3.5-35B-A3B Q4_K_M -ub 1024 pp512 +18.7%, pp2048 +14.3%. Where
+                    // that build cannot run (ne01 % 128 != 0, or GGML_OPENCL_MOE_RB2=0) the bin
+                    // kernel keeps the shape. GGML_OPENCL_Q4K_MOE_DP4A=0/1 forces either way.
                     static const char * q4k_moe_dp4a_env = getenv("GGML_OPENCL_Q4K_MOE_DP4A");
+                    const bool          q4k_rb2_ok = backend_ctx->kernel_gemm_moe_q4_k_q8_1_dp4a_rb2 != nullptr && (ne01 % 128) == 0;
                     const bool          use_moe_dp4a = q4k_moe_dp4a_env
                         ? (atoi(q4k_moe_dp4a_env) != 0)
                         : (backend_ctx->adreno_dp4a_moe()
-                           && backend_ctx->kernel_gemm_moe_q4_k_f32_ns_bin == nullptr);
+                           && (backend_ctx->kernel_gemm_moe_q4_k_f32_ns_bin == nullptr || q4k_rb2_ok));
+
+                    // GGML_OPENCL_MOE_DISPATCH_LOG=1 names the kernel that fired, once per
+                    // distinct (rows, routings).
+                    static const char * q4k_dispatch_log_env = getenv("GGML_OPENCL_MOE_DISPATCH_LOG");
+                    if (q4k_dispatch_log_env && atoi(q4k_dispatch_log_env) != 0) {
+                        static long long last_logged = -1;
+                        const long long key = (long long)ne01 * 1000000 + (long long)(ne20 * ne21);
+                        if (key != last_logged) {
+                            last_logged = key;
+                            GGML_LOG_INFO("ggml_opencl: mul_mat_id q4_K gemm ne01=%d routings=%d -> %s\n",
+                                          (int)ne01, (int)(ne20 * ne21),
+                                          use_moe_dp4a ? (q4k_rb2_ok ? "dp4a-rb2" : "dp4a")
+                                                       : (backend_ctx->kernel_gemm_moe_q4_k_f32_ns_bin ? "ila-bin" : "source-ns"));
+                        }
+                    }
 
                     cl_buffer_region region;
                     region.origin = 0;
@@ -52640,7 +52655,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                         backend_ctx->enqueue_ndrange_kernel(rq, 2, rq_global, rq_local, dst);
 
                         // dp4a GEMM
-                        const bool rb2 = backend_ctx->kernel_gemm_moe_q4_k_q8_1_dp4a_rb2 != nullptr && (ne01 % 128) == 0;
+                        const bool rb2 = q4k_rb2_ok;
                         cl_kernel dk = rb2 ? backend_ctx->kernel_gemm_moe_q4_k_q8_1_dp4a_rb2 : backend_ctx->kernel_gemm_moe_q4_k_q8_1_dp4a;
                         int aidx = 0;
                         CL_CHECK(clSetKernelArg(dk, aidx++, sizeof(cl_mem), &extra0_q4_K->q_img));
