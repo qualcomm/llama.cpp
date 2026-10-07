@@ -1010,6 +1010,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemv_moe_q4_k_f32_ns, kernel_gemm_moe_q4_k_f32_ns, kernel_gemm_moe_q4_k_f32_ns_bin;
     cl_kernel kernel_gemv_moe_q4_k_f32_ns_wimg = nullptr;  // weight-as-texture MoE decode GEMV (opt-in)
     cl_kernel kernel_gemm_moe_q4_k_q8_1_dp4a = nullptr;    // dp4a (int8) prefill GEMM variant
+    cl_kernel kernel_gemm_moe_q4_k_q8_1_dp4a_rb2 = nullptr; // two rows per lane (-DMOE_RB2), ne01 % 128 == 0
     cl_kernel kernel_moe_reorder_quant_a_q8_1;   // fused reorder + q8_1 quant for the dp4a GEMM
     cl_kernel kernel_gemm_moe_q8_1_dp4a_q80 = nullptr;   // generic dp4a MoE GEMM (MOE_QT=80), opt-in
     cl_kernel kernel_moe_expand_scale_q8_0 = nullptr;    // q8_0 per-block d -> uniform scale[16]
@@ -4830,6 +4831,15 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 
         CL_CHECK((backend_ctx->kernel_gemm_moe_q4_k_q8_1_dp4a = clCreateKernel(prog, "kernel_gemm_moe_q4_k_q8_1_dp4a", &err), err));
         CL_CHECK(clReleaseProgram(prog));
+
+        // Two-rows-per-lane build (-DMOE_RB2), taken where the 128-row tile divides ne01.
+        // GGML_OPENCL_MOE_RB2=0 opts out.
+        if (!(getenv("GGML_OPENCL_MOE_RB2") && getenv("GGML_OPENCL_MOE_RB2")[0] == '0')) {
+            const std::string o_rb2 = CL_moe_compile_opts + " -DMOE_RB2";
+            cl_program p_rb2 = build_program_from_source(backend_ctx, kernel_src.c_str(), o_rb2.c_str());
+            CL_CHECK((backend_ctx->kernel_gemm_moe_q4_k_q8_1_dp4a_rb2 = clCreateKernel(p_rb2, "kernel_gemm_moe_q4_k_q8_1_dp4a", &err), err));
+            CL_CHECK(clReleaseProgram(p_rb2));
+        }
         GGML_LOG_CONT(".");
     }
 
@@ -27331,8 +27341,26 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                                          : (backend_ctx->adreno_dp4a_moe());
                     // dot prod has to be available
                     use_moe_dp4a = backend_ctx->has_integer_dot && use_moe_dp4a;
-                    // bin kernel takes precedence
-                    use_moe_dp4a = use_moe_dp4a && backend_ctx->kernel_gemm_moe_q4_k_f32_ns_bin == nullptr;
+                    // The bin kernel takes precedence, except where the two-rows-per-lane dp4a
+                    // build applies: it is faster than the bin kernel there (X2-90, Qwen3.5-35B-A3B
+                    // Q4_K_M pp512 +19%, Qwen3-30B-A3B Q4_K_M +28%).
+                    const bool q4k_rb2_ok = backend_ctx->kernel_gemm_moe_q4_k_q8_1_dp4a_rb2 != nullptr && (ne01 % 128) == 0;
+                    if (q4k_moe_dp4a_env == nullptr) {
+                        use_moe_dp4a = use_moe_dp4a && (backend_ctx->kernel_gemm_moe_q4_k_f32_ns_bin == nullptr || q4k_rb2_ok);
+                    }
+
+                    static const char * q4k_dispatch_log_env = getenv("GGML_OPENCL_MOE_DISPATCH_LOG");
+                    if (q4k_dispatch_log_env && atoi(q4k_dispatch_log_env) != 0) {
+                        static long long last_logged = -1;
+                        const long long key = (long long)ne01 * 1000000 + (long long)(ne20 * ne21);
+                        if (key != last_logged) {
+                            last_logged = key;
+                            GGML_LOG_INFO("ggml_opencl: mul_mat_id q4_K gemm ne01=%d routings=%d -> %s\n",
+                                          (int)ne01, (int)(ne20 * ne21),
+                                          use_moe_dp4a ? (q4k_rb2_ok ? "dp4a-rb2" : "dp4a")
+                                                       : (backend_ctx->kernel_gemm_moe_q4_k_f32_ns_bin ? "ila-bin" : "source-ns"));
+                        }
+                    }
 
                     cl_buffer_region region;
                     region.origin = 0;
@@ -27433,7 +27461,8 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                         backend_ctx->enqueue_ndrange_kernel(rq, 2, rq_global, rq_local, dst);
 
                         // dp4a GEMM
-                        cl_kernel dk = backend_ctx->kernel_gemm_moe_q4_k_q8_1_dp4a;
+                        const bool rb2 = q4k_rb2_ok;
+                        cl_kernel dk = rb2 ? backend_ctx->kernel_gemm_moe_q4_k_q8_1_dp4a_rb2 : backend_ctx->kernel_gemm_moe_q4_k_q8_1_dp4a;
                         int aidx = 0;
                         CL_CHECK(clSetKernelArg(dk, aidx++, sizeof(cl_mem), &extra0_q4_K->q_img));
                         CL_CHECK(clSetKernelArg(dk, aidx++, sizeof(cl_mem), &extra0_q4_K->d));
@@ -27450,7 +27479,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                         CL_CHECK(clSetKernelArg(dk, aidx++, sizeof(int),    &ne01));
                         CL_CHECK(clSetKernelArg(dk, aidx++, sizeof(int),    &backend_ctx->adreno_use_moe_ragged_dp4));
 
-                        size_t dp_global[3] = { 64, (size_t)((ne01 + 63) / 64), (size_t)max_post_router_tile };
+                        size_t dp_global[3] = { 64, (size_t)(rb2 ? ne01 / 128 : (ne01 + 63) / 64), (size_t)max_post_router_tile };
                         size_t dp_local[3]  = { 64, 1, 1 };
                         backend_ctx->enqueue_ndrange_kernel(dk, 3, dp_global, dp_local, dst);
 
