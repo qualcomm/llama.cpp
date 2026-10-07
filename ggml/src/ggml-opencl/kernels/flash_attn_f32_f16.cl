@@ -665,7 +665,7 @@ __kernel void FA_TILE_NAME(
 
 // allow bypassing decode kernels to avoid compiler crash for DK=512 on Adreno GPUs
 #ifndef FA_PREFILL_ONLY
-#ifndef FA_MQ_ONLY  // q1 excluded from the MQ-only (g8) program
+#if !defined(FA_MQ_ONLY) && !defined(FA_VEC_ONLY)
 REQD_FA_SG
 __kernel void flash_attn_f32_f16_q1(
     const global void * q_void, ulong q_offset,
@@ -932,13 +932,13 @@ __kernel void flash_attn_f32_f16_q1_vec(
         }
         ACC_TYPE dot_partial = dot4.s0 + dot4.s1 + dot4.s2 + dot4.s3;
         ACC_TYPE score = sub_group_reduce_add(dot_partial) * scale;
+        if (logit_softcap > 0.0f) {
+            score = logit_softcap * tanh(score / logit_softcap);
+        }
 
         if (mask_base != NULL) {
             const global MASK_DATA_TYPE * mask_ptr = (const global MASK_DATA_TYPE *) mask_base;
             score += slope * (ACC_TYPE) mask_ptr[k_idx];
-        }
-        if (logit_softcap > 0.0f) {
-            score = logit_softcap * tanh(score / logit_softcap);
         }
 
         // FA-2 online update. All threads in the subgroup see the same score,
@@ -1385,6 +1385,7 @@ __kernel void flash_attn_f32_f16_q1_local_mq_split(
 #endif
 #define MQ_WG_SIZE (Q1_WG_SIZE * MQ_NSG)
 
+#ifndef FA_MQ_SPLIT_ONLY
 REQD_SUBGROUP_SIZE_64
 __kernel void flash_attn_f32_f16_q1_vec_mq(
     const global void * q_void, ulong q_offset,
@@ -1606,6 +1607,8 @@ __kernel void flash_attn_f32_f16_q1_vec_mq(
     }
 }
 
+#endif  // !FA_MQ_SPLIT_ONLY
+
 #ifndef MQ_NSG_SPLIT
 #define MQ_NSG_SPLIT 4
 #endif
@@ -1755,12 +1758,12 @@ __kernel void flash_attn_f32_f16_q1_vec_mq_split(
         for (int h = 0; h < MQ_GQA; ++h) {
             const ACC_TYPE dot_partial = dot4[h].s0 + dot4[h].s1 + dot4[h].s2 + dot4[h].s3;
             ACC_TYPE s = sub_group_reduce_add(dot_partial) * scale;
+            if (logit_softcap > 0.0f) {
+                s = logit_softcap * tanh(s / logit_softcap);
+            }
             if (mask_base[h] != NULL) {
                 const global MASK_DATA_TYPE * mask_ptr = (const global MASK_DATA_TYPE *) mask_base[h];
                 s += slope[h] * (ACC_TYPE) mask_ptr[k_idx];
-            }
-            if (logit_softcap > 0.0f) {
-                s = logit_softcap * tanh(s / logit_softcap);
             }
             score[h] = s;
         }
@@ -1848,6 +1851,7 @@ __kernel void flash_attn_f32_f16_q1_vec_mq_split(
     }
 }
 
+#ifndef FA_MQ_SPLIT_ONLY
 // Cluster-parallel variant of _q1_vec_mq_split
 //
 // Tthe baseline keeps one 256B K row in flight per subgroup (32 lanes cooperate
@@ -2419,9 +2423,11 @@ __kernel void flash_attn_f32_f16_q1_vec_mq_split_k_img(
         barrier(CLK_LOCAL_MEM_FENCE);
     }
 }
+#endif  // !FA_MQ_SPLIT_ONLY
 #endif  // !FA_DECODE_ONLY
 
 #ifndef FA_MQ_ONLY  // q1_split + merge excluded from the MQ-only (g8) program
+#ifndef FA_VEC_ONLY
 __kernel void flash_attn_f32_f16_q1_split(
     const global void * q_void, ulong q_offset,
     const global void * k_void, ulong k_offset,
@@ -2577,6 +2583,8 @@ __kernel void flash_attn_f32_f16_q1_split(
         }
     }
 }
+
+#endif  // !FA_VEC_ONLY
 
 // FD Pass 2: merge per-split partials into final O
 // empty splits drop via exp(-INF)=0.
