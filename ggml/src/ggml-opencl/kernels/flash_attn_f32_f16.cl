@@ -1618,6 +1618,10 @@ __kernel void flash_attn_f32_f16_q1_vec_mq(
 #define FA_PARTIAL_FLOATS (2 + DV)
 #endif
 
+#ifndef FA_HEAD_SUB
+#define FA_HEAD_SUB 1
+#endif
+
 REQD_SUBGROUP_SIZE_64
 __kernel void flash_attn_f32_f16_q1_vec_mq_split(
     const global void * q_void, ulong q_offset,
@@ -1655,8 +1659,12 @@ __kernel void flash_attn_f32_f16_q1_vec_mq_split(
     const int split_idx        = split_q_idx % n_splits;
     const int q_idx            = split_q_idx / n_splits;
 
-    const int batch_idx   = kvhead_batch_idx / n_head_kv;
-    const int head_kv_idx = kvhead_batch_idx % n_head_kv;
+    const int hgroups     = n_head_kv * FA_HEAD_SUB;
+    const int batch_idx   = kvhead_batch_idx / hgroups;
+    const int hg          = kvhead_batch_idx % hgroups;
+    const int head_kv_idx = hg / FA_HEAD_SUB;
+    const int head_sub    = hg % FA_HEAD_SUB;
+#define FA_MQS_HEAD_IDX(h) (head_kv_idx * (MQ_GQA * FA_HEAD_SUB) + head_sub * MQ_GQA + (h))
 
     const int kv_start = split_idx * kv_per_split;
     const int kv_end   = min(kv_start + kv_per_split, n_kv);
@@ -1669,7 +1677,7 @@ __kernel void flash_attn_f32_f16_q1_vec_mq_split(
         if (tid == 0) {
             #pragma unroll
             for (int h = 0; h < MQ_GQA; ++h) {
-                const int head_idx = head_kv_idx * MQ_GQA + h;
+                const int head_idx = FA_MQS_HEAD_IDX(h);
                 const ulong rec_idx = ((((ulong) batch_idx * n_head + head_idx) * n_q + q_idx)
                                        * n_splits + split_idx);
                 global float * rec = partial_void + rec_idx * record_stride;
@@ -1684,22 +1692,33 @@ __kernel void flash_attn_f32_f16_q1_vec_mq_split(
     const global char * k_base = (const global char *) k_void + k_offset;
     const global char * v_base = (const global char *) v_void + v_offset;
 
+#ifdef FA_Q1_Q_REG
+    ACC_TYPE4 q_reg[MQ_GQA];
+    #pragma unroll
+    for (int h = 0; h < MQ_GQA; ++h) {
+        const int head_idx = FA_MQS_HEAD_IDX(h);
+        const ulong q_row_offset = batch_idx * q_nb3 + head_idx * q_nb2 + (ulong) q_idx * q_nb1;
+        const global Q_DATA_TYPE4 * q_ptr = (const global Q_DATA_TYPE4 *) (q_base + q_row_offset);
+        q_reg[h] = (tid_sg < DK_VEC) ? CONVERT_Q_ACC4(q_ptr[tid_sg]) : (ACC_TYPE4)(0.0f);
+    }
+#else
     // stage MQ_GQA Q rows in __local once (uniform across WG)
     __local ACC_TYPE4 q_shared[MQ_GQA * DK_VEC];
     for (int i = tid; i < MQ_GQA * DK_VEC; i += MQ_SPLIT_WG_SIZE) {
         const int h        = i / DK_VEC;
         const int k        = i % DK_VEC;
-        const int head_idx = head_kv_idx * MQ_GQA + h;
+        const int head_idx = FA_MQS_HEAD_IDX(h);
         const ulong q_row_offset = batch_idx * q_nb3 + head_idx * q_nb2 + (ulong) q_idx * q_nb1;
         const global Q_DATA_TYPE4 * q_ptr = (const global Q_DATA_TYPE4 *) (q_base + q_row_offset);
         q_shared[h * DK_VEC + k] = CONVERT_Q_ACC4(q_ptr[k]);
     }
     barrier(CLK_LOCAL_MEM_FENCE);
+#endif
 
     float slope[MQ_GQA];
     #pragma unroll
     for (int h = 0; h < MQ_GQA; ++h) {
-        slope[h] = get_alibi_slope(max_bias, head_kv_idx * MQ_GQA + h, n_head_log2, m0, m1);
+        slope[h] = get_alibi_slope(max_bias, FA_MQS_HEAD_IDX(h), n_head_log2, m0, m1);
     }
 
     const global char * mask_base[MQ_GQA];
@@ -1710,7 +1729,7 @@ __kernel void flash_attn_f32_f16_q1_vec_mq_split(
                                           (ulong) q_idx * mask_nb1;
         #pragma unroll
         for (int h = 0; h < MQ_GQA; ++h) {
-            const int head_idx      = head_kv_idx * MQ_GQA + h;
+            const int head_idx      = FA_MQS_HEAD_IDX(h);
             const int mask_head_idx = head_idx % mask_ne2;
             mask_base[h] = mask_base_b + mask_head_idx * mask_nb2;
         }
@@ -1745,6 +1764,15 @@ __kernel void flash_attn_f32_f16_q1_vec_mq_split(
         ACC_TYPE4 dot4[MQ_GQA];
         #pragma unroll
         for (int h = 0; h < MQ_GQA; ++h) dot4[h] = (ACC_TYPE4)(0.0f);
+#ifdef FA_Q1_Q_REG
+        if (tid_sg < DK_VEC) {
+            const ACC_TYPE4 k_vec = CONVERT_KV_ACC4(k_ptr[tid_sg]);
+            #pragma unroll
+            for (int h = 0; h < MQ_GQA; ++h) {
+                dot4[h] = mad(q_reg[h], k_vec, dot4[h]);
+            }
+        }
+#else
         for (int k = tid_sg; k < DK_VEC; k += Q1_WG_SIZE) {
             const ACC_TYPE4 k_vec = CONVERT_KV_ACC4(k_ptr[k]);
             #pragma unroll
@@ -1752,6 +1780,7 @@ __kernel void flash_attn_f32_f16_q1_vec_mq_split(
                 dot4[h] = mad(q_shared[h * DK_VEC + k], k_vec, dot4[h]);
             }
         }
+#endif
 
         ACC_TYPE score[MQ_GQA];
         #pragma unroll
@@ -1813,7 +1842,7 @@ __kernel void flash_attn_f32_f16_q1_vec_mq_split(
         barrier(CLK_LOCAL_MEM_FENCE);
 
         if (sgid == 0) {
-            const int head_idx = head_kv_idx * MQ_GQA + h;
+            const int head_idx = FA_MQS_HEAD_IDX(h);
 
             // fold per-subgroup (m, l) into split-level (m_c, l_c)
             ACC_TYPE m_c = sg_m[h][0];
@@ -1850,6 +1879,8 @@ __kernel void flash_attn_f32_f16_q1_vec_mq_split(
         barrier(CLK_LOCAL_MEM_FENCE);
     }
 }
+
+#undef FA_MQS_HEAD_IDX
 
 #ifndef FA_MQ_SPLIT_ONLY
 // Cluster-parallel variant of _q1_vec_mq_split

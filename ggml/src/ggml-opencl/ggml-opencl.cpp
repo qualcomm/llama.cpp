@@ -48,6 +48,7 @@ typedef const void * (*get_adreno_bin_kernel_func_t)(
 #include <mutex>
 #include <regex>
 #include <set>
+#include <tuple>
 #include <unordered_set>
 
 #undef MIN
@@ -494,9 +495,10 @@ struct ggml_opencl_fa_kernels {
     // vec decode
     std::map<std::pair<int, int>, cl_kernel> f32_f16_q1_vec;
     bool f32_f16_vec_512_attempted = false;
-    std::map<std::pair<int, int>, cl_kernel> f32_f16_mq_decode;
-    std::map<std::pair<int, int>, size_t>    f32_f16_mq_decode_wg;
-    std::set<std::pair<int, int>>           f32_f16_mq_decode_attempted;
+    std::map<std::tuple<int, int, int>, cl_kernel> f32_f16_mq_decode;
+    std::map<std::tuple<int, int, int>, size_t>    f32_f16_mq_decode_wg;
+    std::map<std::tuple<int, int, int>, int>       f32_f16_mq_decode_hs;
+    std::set<std::tuple<int, int, int>>           f32_f16_mq_decode_attempted;
     ggml_cl_buffer fd_partial;
     cl_uint compute_units = 0;
     // kv-head-coalesced vec decode
@@ -5630,16 +5632,17 @@ static bool ggml_opencl_ensure_fa_f32_f16_vec_512(ggml_backend_opencl_context * 
     return true;
 }
 
-static void ggml_opencl_ensure_fa_f32_f16_mq_decode(ggml_backend_opencl_context * backend_ctx, int dk, int dv) {
-    const std::pair<int, int> key = {dk, dv};
+static void ggml_opencl_ensure_fa_f32_f16_mq_decode(ggml_backend_opencl_context * backend_ctx, int dk, int dv, int gqa) {
+    const std::tuple<int, int, int> key = {dk, dv, gqa};
     auto & fa = backend_ctx->fa;
     if (fa.f32_f16_mq_decode.count(key) > 0 || fa.f32_f16_mq_decode_attempted.count(key) > 0 ||
         backend_ctx->kernel_compile_opts.empty()) {
         return;
     }
-    if (fa.f32_f16_q1_vec_mq_split.count(key) > 0) {
-        fa.f32_f16_mq_decode[key] = fa.f32_f16_q1_vec_mq_split.at(key);
+    if (gqa == 4 && fa.f32_f16_q1_vec_mq_split.count({dk, dv}) > 0) {
+        fa.f32_f16_mq_decode[key] = fa.f32_f16_q1_vec_mq_split.at({dk, dv});
         fa.f32_f16_mq_decode_wg[key] = 256;
+        fa.f32_f16_mq_decode_hs[key] = 1;
         return;
     }
     fa.f32_f16_mq_decode_attempted.insert(key);
@@ -5654,10 +5657,14 @@ static void ggml_opencl_ensure_fa_f32_f16_mq_decode(ggml_backend_opencl_context 
         return;
     }
 
+    const int head_sub = gqa == 8 ? (dk == 512 ? 4 : 2) : 1;
+    const int nsg_max = gqa == 8 && dk == 256 ? 2 : 4;
     const std::string src = ggml_opencl_fa_kernel_src(FA_VARIANT_F32_F16);
     const std::string opts = ggml_opencl_fa_compile_opts(backend_ctx, cfg, FA_VARIANT_F32_F16) +
-                             " -D FA_MQ_ONLY -D FA_MQ_SPLIT_ONLY -D MQ_GQA=4";
-    for (int nsg = 4; nsg >= 1; nsg /= 2) {
+                             " -D FA_MQ_ONLY -D FA_MQ_SPLIT_ONLY -D MQ_GQA=" + std::to_string(gqa / head_sub) +
+                             " -D FA_HEAD_SUB=" + std::to_string(head_sub) +
+                             (gqa == 8 && dk == 256 ? " -D FA_Q1_Q_REG" : "");
+    for (int nsg = nsg_max; nsg >= 1; nsg /= 2) {
         const size_t wg = 64 * nsg;
         cl_program prog = build_program_from_source_ex(
             backend_ctx->context, backend_ctx->device, src.c_str(),
@@ -5678,6 +5685,7 @@ static void ggml_opencl_ensure_fa_f32_f16_mq_decode(ggml_backend_opencl_context 
         }
         fa.f32_f16_mq_decode[key] = kernel;
         fa.f32_f16_mq_decode_wg[key] = wg;
+        fa.f32_f16_mq_decode_hs[key] = head_sub;
         return;
     }
 }
@@ -9410,7 +9418,7 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                     const char * decode_env = getenv("GGML_OPENCL_FA_DK512_DECODE");
                     if ((decode_env && decode_env[0] == '0') ||
                         backend_ctx->gpu_family != ADRENO || k->ne[2] <= 0 ||
-                        q->ne[2] / k->ne[2] != 4 || q->ne[2] % k->ne[2] != 0 ||
+                        (q->ne[2] / k->ne[2] != 4 && q->ne[2] / k->ne[2] != 8) || q->ne[2] % k->ne[2] != 0 ||
                         !ggml_opencl_ensure_fa_f32_f16_vec_512(backend_ctx)) {
                         return false;
                     }
@@ -18068,11 +18076,13 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     }
 
     const std::pair<int, int> dk_dv = {d_head_q, d_head_v};
+    const int mq_gqa = n_head_kv > 0 ? n_head / n_head_kv : 0;
+    const std::tuple<int, int, int> mq_decode_key = {d_head_q, d_head_v, mq_gqa};
     const bool mq_decode_shape = backend_ctx->gpu_family == ADRENO && is_mixed && n_q == 1 &&
                                  (d_head_q == 256 || d_head_q == 512) && d_head_q == d_head_v &&
-                                 n_head_kv > 0 && n_head / n_head_kv == 4 && n_head % n_head_kv == 0;
+                                 n_head_kv > 0 && (mq_gqa == 4 || mq_gqa == 8) && n_head % n_head_kv == 0;
     if (mq_decode_shape && n_kv >= 32) {
-        ggml_opencl_ensure_fa_f32_f16_mq_decode(backend_ctx, d_head_q, d_head_v);
+        ggml_opencl_ensure_fa_f32_f16_mq_decode(backend_ctx, d_head_q, d_head_v, mq_gqa);
     }
     const bool use_native_q8_0_q1 = is_q8_0 && n_q == 1 &&
                                     backend_ctx->fa.f32_q8_0_q1.count(dk_dv) > 0;
@@ -18333,6 +18343,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     cl_kernel fd_k_split = NULL;
     bool use_fd_mq = false;
     bool use_fd_mq_decode = false;
+    int fd_head_sub = 1;
     size_t fd_mq_wg = 256;  // MQ_GQA=4 kernel: Q1_WG_SIZE(64) * MQ_NSG_SPLIT(4)
     bool use_fa_k_img = false;  // K bound as image1d_buffer_t instead of (buf, offset)
 
@@ -18367,9 +18378,10 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
             !use_local_tile &&
             n_kv >= (mq_decode_shape ? 32 : FD_MIN_N_KV) &&
             backend_ctx->fa.f32_merge.count(dk_dv) > 0) {
-            if (mq_decode_shape && backend_ctx->fa.f32_f16_mq_decode.count(dk_dv) > 0) {
-                fd_k_split = backend_ctx->fa.f32_f16_mq_decode.at(dk_dv);
-                fd_mq_wg = backend_ctx->fa.f32_f16_mq_decode_wg.at(dk_dv);
+            if (mq_decode_shape && backend_ctx->fa.f32_f16_mq_decode.count(mq_decode_key) > 0) {
+                fd_k_split = backend_ctx->fa.f32_f16_mq_decode.at(mq_decode_key);
+                fd_mq_wg = backend_ctx->fa.f32_f16_mq_decode_wg.at(mq_decode_key);
+                fd_head_sub = backend_ctx->fa.f32_f16_mq_decode_hs.at(mq_decode_key);
                 use_fd_mq = true;
                 use_fd_mq_decode = true;
             } else if (nq1_only && lmq_on && is_mixed && d_head_q == 128 && d_head_v == 128 &&
@@ -18761,7 +18773,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         // matches Q1_WG_SIZE * NSG (MQ_GQA=4 -> 256; MQ_GQA=8 -> 192)
         const size_t fd_wg = use_fd_mq ? fd_mq_wg : 64;
         const size_t fd_head_dim = use_fd_mq
-            ? (size_t)(n_head_kv * n_batch)
+            ? (size_t)(n_head_kv * fd_head_sub * n_batch)
             : (size_t)(n_head     * n_batch);
         size_t fd_lws[3] = { fd_wg, 1, 1 };
         // gid(2) packs q_idx * n_splits + split_idx.
