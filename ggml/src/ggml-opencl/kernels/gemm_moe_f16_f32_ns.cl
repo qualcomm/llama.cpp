@@ -1,3 +1,9 @@
+// Batched MoE GEMM for f16 expert weights (bf16 weights are stored as f16). Same tiling as
+// kernel_gemm_moe_q8_0_f32_ns: 64 output rows per workgroup, one per lane, and a 32-token tile
+// of one expert, so each weight is read once per tile. Each lane loads 16 halves of its row.
+//
+// src0: [n_expert][ne01][ne00] halves, as stored.
+
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
 #pragma OPENCL EXTENSION cl_khr_subgroups : enable
 #pragma OPENCL EXTENSION cl_qcom_subgroup_uniform_load: enable
@@ -7,25 +13,6 @@
 #define TILESIZE_K 16
 #define TILESIZE_M 64
 #define TILESIZE_N 32
-
-
-#define dequantize_q4_0(q4, a_f16, scale) \
-    a_f16.s0 = (half)((q4.s0 & 0x000F) - 8) * scale; \
-    a_f16.s1 = (half)(((q4.s0 & 0x00F0) >> 4) - 8) * scale; \
-    a_f16.s2 = (half)(((q4.s0 & 0x0F00) >> 8) - 8) * scale; \
-    a_f16.s3 = (half)(((q4.s0 & 0xF000) >> 12) - 8) * scale; \
-    a_f16.s4 = (half)((q4.s1 & 0x000F) - 8) * scale; \
-    a_f16.s5 = (half)(((q4.s1 & 0x00F0) >> 4) - 8) * scale; \
-    a_f16.s6 = (half)(((q4.s1 & 0x0F00) >> 8) - 8) * scale; \
-    a_f16.s7 = (half)(((q4.s1 & 0xF000) >> 12) - 8) * scale; \
-    a_f16.s8 = (half)((q4.s2 & 0x000F) - 8) * scale; \
-    a_f16.s9 = (half)(((q4.s2 & 0x00F0) >> 4) - 8) * scale; \
-    a_f16.sa = (half)(((q4.s2 & 0x0F00) >> 8) - 8) * scale; \
-    a_f16.sb = (half)(((q4.s2 & 0xF000) >> 12) - 8) * scale; \
-    a_f16.sc = (half)((q4.s3 & 0x000F) - 8) * scale; \
-    a_f16.sd = (half)(((q4.s3 & 0x00F0) >> 4) - 8) * scale; \
-    a_f16.se = (half)(((q4.s3 & 0x0F00) >> 8) - 8) * scale; \
-    a_f16.sf = (half)(((q4.s3 & 0xF000) >> 12) - 8) * scale; \
 
 
 #define dotx16_reduce8(a_reg, b_lm, c_reg, lm_offset) \
@@ -98,97 +85,29 @@
     c_reg.lo += convert_float8(acc.lo); \
     c_reg.hi += convert_float8(acc.hi); \
 
-// Quarter-tile variant: computes 8 output columns (one skip-group) into a float8
-// accumulator. Same reduction order / flush cadence as dotx16_reduce8, so the
-// non-skipped path is byte-identical; it just lets the caller skip empty
-// 8-column groups at finer granularity. Uses a private half8 `acc8`.
-#define dotx8_reduce4(a_reg, b_lm, c_reg, lm_offset) \
-    acc8.s0 = dot(a_reg.s0123, b_lm[lm_offset + 0]); \
-    acc8.s1 = dot(a_reg.s0123, b_lm[lm_offset + 1]); \
-    acc8.s2 = dot(a_reg.s0123, b_lm[lm_offset + 2]); \
-    acc8.s3 = dot(a_reg.s0123, b_lm[lm_offset + 3]); \
-    acc8.s4 = dot(a_reg.s0123, b_lm[lm_offset + 4]); \
-    acc8.s5 = dot(a_reg.s0123, b_lm[lm_offset + 5]); \
-    acc8.s6 = dot(a_reg.s0123, b_lm[lm_offset + 6]); \
-    acc8.s7 = dot(a_reg.s0123, b_lm[lm_offset + 7]); \
-    acc8.s0 += dot(a_reg.s4567, b_lm[lm_offset + 32]); \
-    acc8.s1 += dot(a_reg.s4567, b_lm[lm_offset + 33]); \
-    acc8.s2 += dot(a_reg.s4567, b_lm[lm_offset + 34]); \
-    acc8.s3 += dot(a_reg.s4567, b_lm[lm_offset + 35]); \
-    acc8.s4 += dot(a_reg.s4567, b_lm[lm_offset + 36]); \
-    acc8.s5 += dot(a_reg.s4567, b_lm[lm_offset + 37]); \
-    acc8.s6 += dot(a_reg.s4567, b_lm[lm_offset + 38]); \
-    acc8.s7 += dot(a_reg.s4567, b_lm[lm_offset + 39]); \
-    c_reg += convert_float8(acc8); \
-    acc8.s0 = dot(a_reg.s89ab, b_lm[lm_offset + 64]); \
-    acc8.s1 = dot(a_reg.s89ab, b_lm[lm_offset + 65]); \
-    acc8.s2 = dot(a_reg.s89ab, b_lm[lm_offset + 66]); \
-    acc8.s3 = dot(a_reg.s89ab, b_lm[lm_offset + 67]); \
-    acc8.s4 = dot(a_reg.s89ab, b_lm[lm_offset + 68]); \
-    acc8.s5 = dot(a_reg.s89ab, b_lm[lm_offset + 69]); \
-    acc8.s6 = dot(a_reg.s89ab, b_lm[lm_offset + 70]); \
-    acc8.s7 = dot(a_reg.s89ab, b_lm[lm_offset + 71]); \
-    acc8.s0 += dot(a_reg.scdef, b_lm[lm_offset + 96]); \
-    acc8.s1 += dot(a_reg.scdef, b_lm[lm_offset + 97]); \
-    acc8.s2 += dot(a_reg.scdef, b_lm[lm_offset + 98]); \
-    acc8.s3 += dot(a_reg.scdef, b_lm[lm_offset + 99]); \
-    acc8.s4 += dot(a_reg.scdef, b_lm[lm_offset + 100]); \
-    acc8.s5 += dot(a_reg.scdef, b_lm[lm_offset + 101]); \
-    acc8.s6 += dot(a_reg.scdef, b_lm[lm_offset + 102]); \
-    acc8.s7 += dot(a_reg.scdef, b_lm[lm_offset + 103]); \
-    c_reg += convert_float8(acc8); \
 
-
-__attribute__((qcom_wave_pair_mode(1))) // 1=force single 2=force pair
-kernel void kernel_gemm_moe_q4_0_f32_ns(
-        __read_only  image1d_buffer_t src0_q,
-        __global     half *           src0_d,
-        __read_only  image1d_buffer_t src1,
-        __global     uint *           src2,
-        __global     ushort *         src2_emap,
+__attribute__((qcom_wave_pair_mode(1)))
+kernel void kernel_gemm_moe_f16_f32_ns(
+        __global     char *           src0,     // f16 expert weights [n_expert][ne01][ne00]
+        ulong                         offset0,  // byte offset of the weights in src0
+        __read_only  image1d_buffer_t src1,     // reordered activations (f32)
+        __global     uint *           src2,     // post-router out indices
+        __global     ushort *         src2_emap,// expert per tile
         __write_only image1d_buffer_t dst,
         __global     int *            total_tiles,
         uint ne00,
-        uint ne01,
-        uint is_ragged,
-        uint skip_gran
+        uint ne01
 ) {
     uint block_id_m = get_global_id(1); // m_tile
     uint block_id_n = get_global_id(2); // n_tile
 
-    // Boundary check
     if (block_id_n >= total_tiles[0]) {
         return;
     }
 
-    // Ragged tile-skip: when is_ragged and the upper 16 token-slots of this tile are all
-    // padding (router 0xFFFFFFFF), skip the second (reg_c.hi) dotx16_reduce8 half -> ~half
-    // the GEMM dot for sparse tiles. Numerically identical (the skipped lanes are padding).
-    // Ragged tile-skip: tokens are packed contiguously per expert (moe_scatter fills
-    // lanes 0..V-1, moe_fill pre-pads the rest), so router padding (0xFFFFFFFF) is always
-    // trailing. Find the valid-token count V and round it UP to the skip granularity
-    // skip_gran (columns per skip-group: 8 = quarter, 16 = half/legacy, 32 = disabled).
-    // A 8-column group g is all-padding iff its first column (8*g) >= n_active, so its
-    // dotx8_reduce4 is skipped. Numerically identical (skipped lanes are padding).
-    uint n_active = TILESIZE_N;
-    if (is_ragged && skip_gran < TILESIZE_N) {
-        uint n_valid = TILESIZE_N;
-        for (uint _t = 0; _t < TILESIZE_N; ++_t) {
-            if (src2[block_id_n * TILESIZE_N + _t] == 0xFFFFFFFFu) { n_valid = _t; break; }
-        }
-        n_active = min((uint)TILESIZE_N, ((n_valid + skip_gran - 1) / skip_gran) * skip_gran);
-    }
-    // Group 0 (cols 0-7) always runs; groups 1-3 skip when fully padding.
-    bool skip_g1 = (8u  >= n_active);
-    bool skip_g2 = (16u >= n_active);
-    bool skip_g3 = (24u >= n_active);
-
     __private half16 reg_a;
     __private float32 reg_c = (float32)(0);
 #ifdef MOE_LM_PAD
-    // E17 (Adreno 850) returns wrong values for the first element of this tile, which
-    // corrupts output column 0 of every tile; starting the tile MOE_LM_PAD elements in
-    // avoids it.
     __local half4 shared_b_store[128 + MOE_LM_PAD];
     __local half4 * shared_b = shared_b_store + MOE_LM_PAD;
 #else
@@ -200,6 +119,11 @@ kernel void kernel_gemm_moe_q4_0_f32_ns(
     const uint row = block_id_m * TILESIZE_M;
     const uint col = block_id_n * TILESIZE_N;
 
+    // this lane's output row; the tail lanes of a partial 64-row tile re-read the last row
+    // (their results are never stored) so no read leaves the expert's weights
+    const uint w_row = expert_id * ne01 + min((uint)(row + get_local_id(0)), ne01 - 1u);
+    __global half * w = (__global half *)(src0 + offset0) + (ulong)w_row * ne00;
+
     uint sub_block_id_m = get_local_id(0);
     uint2 b_global_offset;
     b_global_offset.x = ((sub_block_id_m & 3) << 2) + (sub_block_id_m >> 2) * ne00;
@@ -208,77 +132,46 @@ kernel void kernel_gemm_moe_q4_0_f32_ns(
     b_local_offset.x = (sub_block_id_m & 3) * 32 + (sub_block_id_m >> 2);
     b_local_offset.y = b_local_offset.x + 16;
 
-    // Loop along K axis, 32 elements (one block) for each iteration, divided into 2 sub-blocks
+    // Loop along K axis, 32 elements (one block) per iteration, split into 2 sub-blocks.
     for (uint step = 0; step < ne00; step += TILESIZE_K * 2) {
-        // First sub-block
-        uint q_sub_offset = row + ((ne01 * step) >> 3) + ((expert_id * ne00 * ne01) >> 3);
-        uint s_sub_offset = row + ((ne01 * step) >> 5) + ((expert_id * ne00 * ne01) >> 5);
+        // First sub-block: 16 weights at K=step
+        reg_a = vload16(0, w + step);
+
         uint b_sub_offset = col * ne00 + step;
-
-        // Load scale for current Q4_0 block
-        uint s_offset = s_sub_offset + get_global_id(0);
-        half s = src0_d[s_offset];
-
-        // Load 16 q (64-bits) in transposed layout
-        uint2 q4x16;
-        q4x16.x = read_imageui(src0_q, q_sub_offset + sub_block_id_m).x;
-        q4x16.y = read_imageui(src0_q, q_sub_offset + sub_block_id_m + ne01).x;
-
-        // Load 16x32 floats from matrix B, each fiber out of 64 in a sub-group loads 8 elements
         float8 bx8_f32;
         bx8_f32.lo = read_imagef(src1, (b_sub_offset + b_global_offset.x) / 4);
         bx8_f32.hi = read_imagef(src1, (b_sub_offset + b_global_offset.y) / 4);
-        // Convert to half and store to LM to share within the subgroup
         half8 bx8_f16 = convert_half8(bx8_f32);
         shared_b[b_local_offset.x] = bx8_f16.lo;
         shared_b[b_local_offset.y] = bx8_f16.hi;
 
-        // Dequantization
-        dequantize_q4_0(as_ushort4(q4x16), reg_a, s);
-
         sub_group_barrier(CLK_LOCAL_MEM_FENCE);
 
-        // 32 16x16 fp16 dot product with 8 elements reduction for better precision
-        half8 acc8;
-        dotx8_reduce4(reg_a, shared_b, reg_c.lo.lo, 0);
-        if (!skip_g1) { dotx8_reduce4(reg_a, shared_b, reg_c.lo.hi, 8); }
-        if (!skip_g2) { dotx8_reduce4(reg_a, shared_b, reg_c.hi.lo, 16); }
-        if (!skip_g3) { dotx8_reduce4(reg_a, shared_b, reg_c.hi.hi, 24); }
+        half16 acc;
+        dotx16_reduce8(reg_a, shared_b, reg_c.lo, 0);
+        dotx16_reduce8(reg_a, shared_b, reg_c.hi, 16);
 
-        // Repeat for second sub-block
+        // Second sub-block: next 16 weights at K=step+16
         uint half_step = step + TILESIZE_K;
-        q_sub_offset = row + ((ne01 * half_step) >> 3) + ((expert_id * ne00 * ne01) >> 3);
+        reg_a = vload16(0, w + half_step);
         b_sub_offset = col * ne00 + half_step;
 
-        // Load next 16 q (64-bits) in transposed layout
-        q4x16.x = read_imageui(src0_q, q_sub_offset + sub_block_id_m).x;
-        q4x16.y = read_imageui(src0_q, q_sub_offset + sub_block_id_m + ne01).x;
-
-        // Load 16x32 floats from matrix B, each fiber out of 64 in a sub-group loads 8 elements
         bx8_f32.lo = read_imagef(src1, (b_sub_offset + b_global_offset.x) / 4);
         bx8_f32.hi = read_imagef(src1, (b_sub_offset + b_global_offset.y) / 4);
-        // Convert to half and store to LM to share within the subgroup
         bx8_f16 = convert_half8(bx8_f32);
         shared_b[b_local_offset.x] = bx8_f16.lo;
         shared_b[b_local_offset.y] = bx8_f16.hi;
 
-        // Dequantization
-        dequantize_q4_0(as_ushort4(q4x16), reg_a, s);
-
         sub_group_barrier(CLK_LOCAL_MEM_FENCE);
 
-        // 32 16x16 fp16 dot product with 3-levels reduction for better precision
-        dotx8_reduce4(reg_a, shared_b, reg_c.lo.lo, 0);
-        if (!skip_g1) { dotx8_reduce4(reg_a, shared_b, reg_c.lo.hi, 8); }
-        if (!skip_g2) { dotx8_reduce4(reg_a, shared_b, reg_c.hi.lo, 16); }
-        if (!skip_g3) { dotx8_reduce4(reg_a, shared_b, reg_c.hi.hi, 24); }
+        dotx16_reduce8(reg_a, shared_b, reg_c.lo, 0);
+        dotx16_reduce8(reg_a, shared_b, reg_c.hi, 16);
     }
 
     if ((get_global_id(0) + block_id_m * TILESIZE_M) >= ne01) {
         return;
     }
 
-    // Load poster router and share in LM
     __local uint out_idx[TILESIZE_N];
 
     if (get_local_id(0) < TILESIZE_N) {
@@ -291,7 +184,6 @@ kernel void kernel_gemm_moe_q4_0_f32_ns(
 
     barrier(CLK_LOCAL_MEM_FENCE);
 
-    // Scatter results back to original position in output grid
     uint m_offset = row + get_local_id(0);
 
     write_imagef(dst, out_idx[1] + m_offset, (reg_c.s1));
@@ -326,7 +218,6 @@ kernel void kernel_gemm_moe_q4_0_f32_ns(
     write_imagef(dst, out_idx[30] + m_offset, (reg_c.su));
     write_imagef(dst, out_idx[31] + m_offset, (reg_c.sv));
 
-    // Store zero padding parts to the index of first output in tile, override correct result in the end
     barrier(CLK_GLOBAL_MEM_FENCE);
     write_imagef(dst, out_idx[0] + m_offset, (reg_c.s0));
 }
