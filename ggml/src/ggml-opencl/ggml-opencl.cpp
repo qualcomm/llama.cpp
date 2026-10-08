@@ -280,7 +280,8 @@ static ADRENO_GPU_GEN get_adreno_gpu_gen(const char *device_name) {
         strstr(device_name, "613") || strstr(device_name, "615") ||
         strstr(device_name, "616") || strstr(device_name, "618") ||
         strstr(device_name, "619") || strstr(device_name, "620") ||
-        strstr(device_name, "630") || strstr(device_name, "640") ||
+        strstr(device_name, "623") || strstr(device_name, "630") ||
+        strstr(device_name, "640") ||
         strstr(device_name, "642") || strstr(device_name, "643") ||
         strstr(device_name, "644") || strstr(device_name, "650") ||
         strstr(device_name, "660") || strstr(device_name, "663") ||
