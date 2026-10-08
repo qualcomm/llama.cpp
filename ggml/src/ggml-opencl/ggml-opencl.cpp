@@ -16410,6 +16410,31 @@ static void ggml_cl_moe_combine_fused(ggml_backend_t backend, const ggml_tensor 
 inline bool use_q4_0_bin_kernels(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor);
 inline bool use_q4_k_bin_kernels(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor);
 
+// A fused group reads its inputs while it writes its output, all in one dispatch, but the
+// allocator placed that output as if the group's earlier nodes had already run: an input
+// whose last reader is an earlier node of the group is free by the time the last node runs,
+// so the output may be put on top of it (Qwen3.8-27B's last-layer ffn_swiglu landed exactly
+// on ffn_gate/ffn_up's activation). The fused kernel then overwrites input that other
+// work-groups have not read yet. Decline the fusion when the output overlaps an input.
+static bool ggml_cl_fused_out_overlaps(const ggml_tensor * out, std::initializer_list<const ggml_tensor *> ins) {
+    if (out == nullptr || out->data == nullptr || out->buffer == nullptr) {
+        return false;
+    }
+    const char * o0 = (const char *) out->data;
+    const char * o1 = o0 + ggml_nbytes(out);
+    for (const ggml_tensor * t : ins) {
+        if (t == nullptr || t->data == nullptr || t->buffer != out->buffer) {
+            continue;
+        }
+        const char * i0 = (const char *) t->data;
+        const char * i1 = i0 + ggml_nbytes(t);
+        if (i0 < o1 && o0 < i1) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool ggml_opencl_can_fuse(const ggml_backend_opencl_context * backend_ctx, const struct ggml_cgraph * cgraph, int node_idx, std::initializer_list<enum ggml_op> ops) {
     // ROPE + VIEW + SET_ROWS uses ggml_can_fuse_subgraph (the VIEW is a no-op
     // node) instead of the contiguous ggml_can_fuse below.
@@ -16447,6 +16472,9 @@ static bool ggml_opencl_can_fuse(const ggml_backend_opencl_context * backend_ctx
         const ggml_tensor *gate = cgraph->nodes[node_idx];
         const ggml_tensor *up   = cgraph->nodes[node_idx+1];
         const ggml_tensor *glu  = cgraph->nodes[node_idx+2];
+        if (ggml_cl_fused_out_overlaps(glu, { gate->src[1], up->src[1] })) {
+            return false;
+        }
 
         // decode GEMV path only (single token); prefill GEMM is separate
         if (gate->ne[1] != 1 || up->ne[1] != 1) {
@@ -16677,6 +16705,9 @@ static bool ggml_opencl_can_fuse(const ggml_backend_opencl_context * backend_ctx
         const ggml_tensor *vg   = cgraph->nodes[node_idx+1];
         const ggml_tensor *vu   = cgraph->nodes[node_idx+2];
         const ggml_tensor *glu  = cgraph->nodes[node_idx+3];
+        if (ggml_cl_fused_out_overlaps(glu, { mmid->src[1], mmid->src[2] })) {
+            return false;
+        }
 
         // combined gate_up weight must be q4_K, f32 activation/output
         if (mmid->src[0]->type != GGML_TYPE_Q4_K ||
@@ -16727,6 +16758,9 @@ static bool ggml_opencl_can_fuse(const ggml_backend_opencl_context * backend_ctx
         const ggml_tensor *gate = cgraph->nodes[node_idx];
         const ggml_tensor *up   = cgraph->nodes[node_idx+1];
         const ggml_tensor *glu  = cgraph->nodes[node_idx+2];
+        if (ggml_cl_fused_out_overlaps(glu, { gate->src[1], gate->src[2], up->src[1], up->src[2] })) {
+            return false;
+        }
 
         // both expert weights q4_K, f32 activation/output
         if (gate->src[0]->type != GGML_TYPE_Q4_K || up->src[0]->type != GGML_TYPE_Q4_K ||
@@ -16786,6 +16820,9 @@ static bool ggml_opencl_can_fuse(const ggml_backend_opencl_context * backend_ctx
         const ggml_tensor *umm = cgraph->nodes[node_idx+2];
         const ggml_tensor *uad = cgraph->nodes[node_idx+3];
         const ggml_tensor *glu = cgraph->nodes[node_idx+4];
+        if (ggml_cl_fused_out_overlaps(glu, { gmm->src[1], gmm->src[2], umm->src[1], umm->src[2], gad->src[2], uad->src[2] })) {
+            return false;
+        }
 
         if (ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU_OAI) {
             return false;
