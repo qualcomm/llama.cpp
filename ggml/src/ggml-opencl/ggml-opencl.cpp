@@ -5657,12 +5657,15 @@ static void ggml_opencl_ensure_fa_f32_f16_mq_decode(ggml_backend_opencl_context 
         return;
     }
 
+    const bool cluster = dk == 64;
     const int head_sub = gqa == 8 ? (dk == 512 ? 4 : 2) : 1;
-    const int nsg_max = gqa == 8 && dk == 256 ? 2 : 4;
+    const int nsg_max = cluster ? 1 : (gqa == 8 && dk == 256 ? 2 : 4);
+    const char * kernel_name = cluster ? "flash_attn_f32_f16_q1_vec_mq_split_c8" : "flash_attn_f32_f16_q1_vec_mq_split";
     const std::string src = ggml_opencl_fa_kernel_src(FA_VARIANT_F32_F16);
     const std::string opts = ggml_opencl_fa_compile_opts(backend_ctx, cfg, FA_VARIANT_F32_F16) +
-                             " -D FA_MQ_ONLY -D FA_MQ_SPLIT_ONLY -D MQ_GQA=" + std::to_string(gqa / head_sub) +
+                             " -D FA_MQ_ONLY -D MQ_GQA=" + std::to_string(gqa / head_sub) +
                              " -D FA_HEAD_SUB=" + std::to_string(head_sub) +
+                             (cluster ? " -D MQ_NSG=1 -D FA_CL_C=16 -D FA_CL_MHRED -D FA_CL_MASK_BCAST" : " -D FA_MQ_SPLIT_ONLY") +
                              (gqa == 8 && dk == 256 ? " -D FA_Q1_Q_REG" : "");
     for (int nsg = nsg_max; nsg >= 1; nsg /= 2) {
         const size_t wg = 64 * nsg;
@@ -5674,12 +5677,12 @@ static void ggml_opencl_ensure_fa_f32_f16_mq_decode(ggml_backend_opencl_context 
             continue;
         }
         cl_int err;
-        cl_kernel kernel = clCreateKernel(prog, "flash_attn_f32_f16_q1_vec_mq_split", &err);
+        cl_kernel kernel = clCreateKernel(prog, kernel_name, &err);
         clReleaseProgram(prog);
         if (err != CL_SUCCESS) {
             continue;
         }
-        if (!ggml_opencl_fa_kernel_fits_wg(backend_ctx, kernel, wg, "flash_attn_f32_f16_q1_vec_mq_split", dk, dv)) {
+        if (!ggml_opencl_fa_kernel_fits_wg(backend_ctx, kernel, wg, kernel_name, dk, dv)) {
             clReleaseKernel(kernel);
             continue;
         }
@@ -18079,8 +18082,9 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     const int mq_gqa = n_head_kv > 0 ? n_head / n_head_kv : 0;
     const std::tuple<int, int, int> mq_decode_key = {d_head_q, d_head_v, mq_gqa};
     const bool mq_decode_shape = backend_ctx->gpu_family == ADRENO && is_mixed && n_q == 1 &&
-                                 (d_head_q == 256 || d_head_q == 512) && d_head_q == d_head_v &&
-                                 n_head_kv > 0 && (mq_gqa == 4 || mq_gqa == 8) && n_head % n_head_kv == 0;
+                                 d_head_q == d_head_v && n_head_kv > 0 && n_head % n_head_kv == 0 &&
+                                 ((d_head_q == 64 && mq_gqa == 8 && backend_ctx->has_subgroup_shuffle) ||
+                                  ((d_head_q == 256 || d_head_q == 512) && (mq_gqa == 4 || mq_gqa == 8)));
     if (mq_decode_shape && n_kv >= 32) {
         ggml_opencl_ensure_fa_f32_f16_mq_decode(backend_ctx, d_head_q, d_head_v, mq_gqa);
     }
