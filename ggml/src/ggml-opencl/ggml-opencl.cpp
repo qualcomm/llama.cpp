@@ -18828,6 +18828,13 @@ static bool use_fa_bin_kernels_prefill(const ggml_backend_opencl_context * backe
         return false;
     }
 
+    // q8_0 K/V at DK=512 comes out wrong here whenever V holds different values from K
+    // (FLASH_ATTN_EXT hsk=512 q8_0, every n_q > 1 tested; f16 K/V at DK=512 is correct), so
+    // leave that shape to the decomposed path (ggml_cl_fa_q8_dk512_prefill_ok).
+    if (is_q8_0 && dk == 512) {
+        return false;
+    }
+
     return (backend_ctx->gpu_family == GPU_FAMILY::ADRENO &&
             (is_mixed || is_q8_0) && (dk == dv)
             && (dk == 64 || dk == 128 || dk == 256 || dk == 512)
