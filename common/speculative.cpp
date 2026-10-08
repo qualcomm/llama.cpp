@@ -2027,6 +2027,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     [&](int32_t i) { return batch_in.token[rows[i]]; },
                     [&](int32_t i) { return batch_in.pos  [rows[i]]; },
                     [&](int32_t i) {
+                        if (i == 0 && batch_in.pos[rows[0]] == 0) {
+                            std::fill(pending_h[seq_id].begin(), pending_h[seq_id].end(), 0.0f);
+                        }
                         return i == 0 ? pending_h[seq_id].data()
                                       : llama_get_embeddings_nextn_ith(ctx_tgt, rows[i - 1]);
                     })) {
@@ -2112,6 +2115,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 if (i_batch_beg[seq_id] < 0) {
                     continue;
+                }
+
+                // a token at position 0 has no predecessor: pair it with a zero row, not the
+                // h left over from the previous request, or identical requests draft differently
+                if (batch_in.pos[i_batch_beg[seq_id]] == 0) {
+                    std::fill(pending_h[seq_id].begin(), pending_h[seq_id].end(), 0.0f);
                 }
 
                 set_h(i_batch_beg[seq_id], pending_h[seq_id].data());
