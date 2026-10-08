@@ -487,26 +487,8 @@ def _parse_pytest_output(content: str) -> dict[str, bool]:
     return results
 
 
-def _dump_raw_logs(src_dir: Path, dump_dir: Path) -> None:
-    """Copy every unpacked QDC log file under src_dir into dump_dir.
-
-    Keeps files the parser ignores (appium/pytest stdout, install logs, device
-    host logs) so failures can be diagnosed from the CI artifact.
-    """
-    dump_dir.mkdir(parents=True, exist_ok=True)
-    for root_dir, _, files in os.walk(src_dir):
-        for fname in files:
-            src = Path(root_dir) / fname
-            dst = dump_dir / src.relative_to(src_dir)
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            try:
-                shutil.copy(src, dst)
-            except Exception as e:
-                log.warning("Could not dump log %s: %s", fname, e)
-
-
 def fetch_logs_and_parse_tests(
-    client, job_id: str, dump_dir: Path | None = None
+    client, job_id: str
 ) -> tuple[dict[str, bool], dict[str, str], dict[str, str]]:
     """Returns (test_results, raw_logs, failure_details)."""
     try:
@@ -563,9 +545,6 @@ def fetch_logs_and_parse_tests(
                     log.info("--- %s ---\n%s", fname, content)
                     raw_logs[fname] = content
                     pytest_fallback.update(_parse_pytest_output(content))
-
-        if dump_dir is not None:
-            _dump_raw_logs(Path(tmpdir), dump_dir)
 
     return (
         (test_results if test_results else pytest_fallback),
@@ -652,8 +631,6 @@ def parse_args() -> argparse.Namespace:
                    help="Number of retries when the device is unavailable or tests fail (default: 0)")
     p.add_argument("--retry-delay", type=int, default=RETRY_DELAY, metavar="SECONDS",
                    help=f"Seconds to wait between retries (default: {RETRY_DELAY})")
-    p.add_argument("--log-dump-dir", type=Path, default=None, metavar="DIR",
-                   help="Dump all raw QDC device logs under DIR/<device>/ for CI artifact upload")
     args = p.parse_args()
     if args.test in ("bench", "all") and not args.model_url:
         p.error("--model-url is required when --test bench or --test all")
@@ -703,10 +680,7 @@ def _submit_and_run_job(client, args, spec, target_id, artifact_id) -> JobResult
     log.info("Job %s finished: %s", job_id, job_status)
 
     wait_for_log_upload(client, job_id)
-    dump_dir = args.log_dump_dir / args.device if args.log_dump_dir else None
-    tests, raw_logs, failure_details = fetch_logs_and_parse_tests(
-        client, job_id, dump_dir=dump_dir
-    )
+    tests, raw_logs, failure_details = fetch_logs_and_parse_tests(client, job_id)
 
     job_ok = job_status == JobState.COMPLETED.value.lower()
 
