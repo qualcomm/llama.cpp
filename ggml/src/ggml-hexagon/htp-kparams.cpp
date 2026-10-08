@@ -1065,7 +1065,11 @@ static bool htp_matmul_check_types(
             case GGML_TYPE_Q6_K:
             case GGML_TYPE_Q3_K:
             case GGML_TYPE_Q2_K:
-                if (!ggml_is_contiguous(src0) || ggml_is_permuted(src0) || ggml_is_view(src0)) {
+                if (!ggml_is_contiguous(src0) &&
+                    (!ggml_hexagon_tensor_is_expert_cache(src0) || !ggml_hexagon_valid_cache_slot_layout(src0))) {
+                    return false;
+                }
+                if (ggml_is_permuted(src0) || ggml_is_view(src0)) {
                     return false;
                 }
                 if (src0->ne[0] % ggml_blck_size(src0->type) != 0) {

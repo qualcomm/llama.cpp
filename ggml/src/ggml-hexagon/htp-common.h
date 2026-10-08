@@ -58,6 +58,21 @@ static inline bool ggml_hexagon_tensor_is_fuseable(const struct ggml_tensor * t)
     return (ggml_hexagon_tensor_get_flags(t) & HTP_TENSOR_FUSEABLE) != 0;
 }
 
+static inline bool ggml_hexagon_tensor_is_expert_cache(const struct ggml_tensor * t) {
+    return (ggml_hexagon_tensor_get_flags(t) & HTP_TENSOR_EXPERT_CACHE) != 0;
+}
+
+static inline bool ggml_hexagon_valid_cache_slot_layout(const struct ggml_tensor * tensor) {
+    const size_t row_stride = ggml_row_size(tensor->type, tensor->ne[0]);
+    const size_t natural_slot_stride = row_stride * (size_t) tensor->ne[1];
+
+    return tensor->nb[0] == ggml_type_size(tensor->type) &&
+           tensor->nb[1] == row_stride &&
+           tensor->nb[2] >= natural_slot_stride &&
+           tensor->nb[2] % 32 == 0 &&
+           tensor->nb[3] == tensor->nb[2] * (size_t) tensor->ne[2];
+}
+
 static inline bool ggml_hexagon_tensor_is_tiled(const struct ggml_tensor * t) {
     return (ggml_hexagon_tensor_get_flags(t) & HTP_TENSOR_TILED) != 0;
 }
