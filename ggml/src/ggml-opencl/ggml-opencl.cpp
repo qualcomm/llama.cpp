@@ -900,7 +900,6 @@ struct ggml_backend_opencl_context {
     cl_program program_sub;
     cl_program program_norm;
     cl_program program_relu;
-    cl_program program_rms_norm;
     cl_program program_group_norm;
     cl_program program_rope;
     cl_program program_silu;
@@ -4700,7 +4699,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         CL_CHECK((backend_ctx->kernel_rms_norm     = clCreateKernel(cl_program_for_kernel(backend_ctx, kernel_src, compile_opts, shared_rms_norm, 1), "kernel_rms_norm", &err), err));
         CL_CHECK((backend_ctx->kernel_rms_norm_mul = clCreateKernel(cl_program_for_kernel(backend_ctx, kernel_src, compile_opts, shared_rms_norm, 2), "kernel_rms_norm_mul", &err), err));
         CL_CHECK((backend_ctx->kernel_rms_norm_mul_add = clCreateKernel(cl_program_for_kernel(backend_ctx, kernel_src, compile_opts, shared_rms_norm, 3), "kernel_rms_norm_mul_add", &err), err));
-        CL_CHECK((backend_ctx->kernel_add_rms_norm_mul = clCreateKernel(backend_ctx->program_rms_norm, "kernel_add_rms_norm_mul", &err), err));
+        CL_CHECK((backend_ctx->kernel_add_rms_norm_mul = clCreateKernel(cl_program_for_kernel(backend_ctx, kernel_src, compile_opts, shared_rms_norm, 3), "kernel_add_rms_norm_mul", &err), err));
         GGML_LOG_CONT(".");
     }
 
