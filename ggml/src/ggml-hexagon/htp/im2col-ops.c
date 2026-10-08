@@ -351,7 +351,7 @@ IM2COL_BLOCKED_DMA_BODY(im2col_blocked_dma_f32_thread, float,  hvx_copy_f32_uu, 
                     const dma_addr_t vsrc = ok                                                                   \
                         ? (src_data + (size_t) ((in * IC + iic) * IH + iih) * IW * sizeof(float))                \
                         : src_data;                                                                              \
-                    /* IC*KH descriptors per row can exceed the ring capacity: retire the oldest when full */   \
+                    /* IC*KH descriptors per row can exceed the ring capacity: retire the oldest when full */    \
                     while (!dma_queue_push(dma_q, dma_make_data(vdst, vsrc),                                     \
                                            IW * sizeof(float), IW * sizeof(float), IW * sizeof(float),           \
                                            ok ? 1 : 0)) {                                                        \
