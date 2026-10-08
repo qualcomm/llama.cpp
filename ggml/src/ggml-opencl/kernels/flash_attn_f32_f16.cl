@@ -2170,12 +2170,12 @@ __kernel void flash_attn_f32_f16_q1_vec_mq_split_c8(
                 s += sub_group_shuffle_xor(s, step);
             }
             s *= scale;
+            if (logit_softcap > 0.0f) {
+                s = logit_softcap * tanh(s / logit_softcap);
+            }
             if (mask_base[h] != NULL) {
                 const global MASK_DATA_TYPE * mask_ptr = (const global MASK_DATA_TYPE *) mask_base[h];
                 s += slope[h] * (ACC_TYPE) mask_ptr[k_safe];
-            }
-            if (logit_softcap > 0.0f) {
-                s = logit_softcap * tanh(s / logit_softcap);
             }
             score[h] = valid ? s : FA_M_INIT;
         }
