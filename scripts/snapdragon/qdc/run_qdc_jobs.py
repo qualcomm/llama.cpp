@@ -41,7 +41,7 @@ import xml.etree.ElementTree as ET
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterator, TypeVar
+from typing import Callable, TypeVar
 
 import httpx
 from qualcomm_device_cloud_sdk.api import qdc_api
@@ -287,57 +287,22 @@ def _matched_retryable_status_code(err: Exception) -> int | None:
     return None
 
 
-def _unwrap_causes(err: BaseException) -> Iterator[BaseException]:
-    """Yield err and every exception in its __cause__/__context__ chain.
-
-    The SDK re-throws failures as ``raise Exception(msg) from e``, so the real
-    error is only visible by walking the chain.
-    """
-    seen: set[int] = set()
-    cur: BaseException | None = err
-    while cur is not None and id(cur) not in seen:
-        seen.add(id(cur))
-        yield cur
-        cur = cur.__cause__ or cur.__context__
-
-
-def _transient_network_error_name(err: Exception) -> str | None:
-    """Return the type name of an underlying transient network error, else None.
-
-    Bare OSError is deliberately not matched: a local FileNotFoundError or ENOSPC
-    is permanent and must fail fast.
-    """
-    for cause in _unwrap_causes(err):
-        if isinstance(cause, (ConnectionError, TimeoutError, socket.gaierror)):
-            return type(cause).__name__
-        if isinstance(cause, httpx.TransportError):
-            return type(cause).__name__
-    return None
-
-
-def _is_malformed_response(err: Exception) -> bool:
-    """True if err (or a chained cause) is a JSONDecodeError or BadZipFile.
-
-    QDC can mark a job's log upload "completed" before the log files are
-    durable, so the next read can return an empty JSON body or a truncated zip.
-    """
-    return any(
-        isinstance(cause, (json.JSONDecodeError, zipfile.BadZipFile))
-        for cause in _unwrap_causes(err)
-    )
-
-
 def _describe_error(err: Exception) -> str:
     """Safe one-line description of a QDC error for logging (never the raw message)."""
     code = _matched_retryable_status_code(err)
     if code is not None:
         return f"status code {code}"
-    net_err = _transient_network_error_name(err)
-    if net_err is not None:
-        return f"network error ({net_err})"
-    if _is_malformed_response(err):
-        return "malformed response body"
     return type(err).__name__
+
+
+_TRANSIENT_ERROR_TYPES = (
+    ConnectionError,
+    TimeoutError,
+    socket.gaierror,
+    httpx.TransportError,
+    json.JSONDecodeError,
+    zipfile.BadZipFile,
+)
 
 
 def _call_with_retry(func: Callable[[], _CallRetT], description: str) -> _CallRetT:
@@ -347,9 +312,8 @@ def _call_with_retry(func: Callable[[], _CallRetT], description: str) -> _CallRe
             return func()
         except Exception as err:
             transient = (
-                _transient_network_error_name(err) is not None
+                isinstance(err, _TRANSIENT_ERROR_TYPES)
                 or _matched_retryable_status_code(err) is not None
-                or _is_malformed_response(err)
             )
             if not transient or attempt == CALL_MAX_RETRIES - 1:
                 raise
