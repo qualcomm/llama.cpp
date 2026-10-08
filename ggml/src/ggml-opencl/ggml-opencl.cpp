@@ -889,7 +889,6 @@ struct ggml_backend_opencl_context {
     cl_program program_mul_mv_mxfp4_f32_flat;
     cl_program program_mul_mv_f16_f16;
     cl_program program_mul_mv_f16_f32_1row;
-    cl_program program_mul_mv_f16_f32_l4;
     cl_program program_mul_mv_f16_f32;
     cl_program program_mul_mv_f32_f32;
     cl_program program_mul;
@@ -3957,7 +3956,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         if (ggml_cl_kq_rowsplit_on(backend_ctx)) {
             cl_int err_rs;
             backend_ctx->kernel_mul_mat_f16_f32_l4_x8_gqa8_rs_img =
-                clCreateKernel(backend_ctx->program_mul_mv_f16_f32_l4, "kernel_mul_mat_f16_f32_l4_x8_gqa8_rs_img", &err_rs);
+                clCreateKernel(cl_program_for_kernel(backend_ctx, kernel_src, compile_opts, shared_l4, 14), "kernel_mul_mat_f16_f32_l4_x8_gqa8_rs_img", &err_rs);
             if (err_rs != CL_SUCCESS) { backend_ctx->kernel_mul_mat_f16_f32_l4_x8_gqa8_rs_img = nullptr; }
         }
 

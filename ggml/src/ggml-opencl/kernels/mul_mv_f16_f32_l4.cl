@@ -1261,6 +1261,9 @@ kernel void kernel_mul_mat_f16_f32_l4_x8_gqa_r2_dk256_img(
     }
 }
 
+#endif // GGML_CL_ONLY == 13
+
+#if !defined(GGML_CL_ONLY) || GGML_CL_ONLY == 14
 // Row-split variant of _x8_gqa4_img for decode KQ at DK=128, r2=8.
 //
 // _x8_gqa4_img splits the subgroup into 8 Q-head groups that each load the whole K row,
