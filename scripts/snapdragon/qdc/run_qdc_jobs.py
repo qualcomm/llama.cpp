@@ -496,8 +496,6 @@ def fetch_logs_and_parse_tests(
         for root_dir, _, files in os.walk(tmpdir):
             for fname in sorted(files):
                 fpath = os.path.join(root_dir, fname)
-                if fname == "log.zip":
-                    continue
                 content = Path(fpath).read_text(errors="replace")
                 if fname.endswith(".xml"):
                     results, failures = _parse_junit_xml(content)
