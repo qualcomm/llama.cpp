@@ -1583,6 +1583,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             for (int k = 0; k < n_tokens; ++k) {
                 const llama_seq_id seq_id = batch_in.tokens[k].seq_id;
 
+                // a token at position 0 has no predecessor: pair it with a zero row, not the
+                // h left over from the previous request, or identical requests draft differently
+                if (k == i_batch_beg[seq_id] && batch_in.tokens[k].pos[0] == 0) {
+                    std::fill(pending_h[seq_id].begin(), pending_h[seq_id].end(), 0.0f);
+                }
+
                 const int32_t idx = batch.add(batch_in.tokens[k].id, batch_in.tokens[k].pos[0], seq_id, false);
 
                 const float * h_row = k == i_batch_beg[seq_id]
