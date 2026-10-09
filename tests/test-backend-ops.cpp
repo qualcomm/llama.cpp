@@ -12135,6 +12135,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int kv : { 4096, 4099 }) {
         test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {16, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     }
+    // The same global layers with Q in the model's [0, 2, 1, 3] layout: decode, a full 64-query
+    // prefill batch and one that leaves a partial 32-query tile, so a backend that tiles queries
+    // per KV group sees ratio 16 at head size 512.
+    for (int nb : { 1, 64, 45 }) {
+        for (bool kv_view : { true, false }) {
+            test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {16, 1}, 4096, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, kv_view));
+        }
+    }
 
     // Same idea for gemma-4-26B's two decode shapes, neither of which any case
     // in this suite reached: head size 256 at GQA ratio 2 (25 of its 30 layers)
