@@ -32316,7 +32316,7 @@ static bool ggml_cl_flash_attn_decompose(
     }
 
     // int8 KQ: K quantised once per call, the Q chunk once per chunk, both along dk. The separate
-    // kernel sizes its local memory for dk <= 256; the fused one stages dk in slices.
+    // kernel sizes its local memory for dk <= 256; the fused one's 512 build stages dk in slices.
     const bool kq_int8_env = kq_int8_env_pre;
     // Past 256 only the fused kernel has a build sized for the head (the separate int8 KQ is
     // compiled for 256), so a head that cannot take the fused path stays on the f16 GEMM.
