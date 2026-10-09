@@ -11511,6 +11511,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, {4, 1}, 1024, 4, true, false, 8, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {4, 1}, 1024, 4, true, true,  0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false));
 
+    // GQA 16 at head size 512 in the cache layout: decode, a full 64-query batch and one that leaves a
+    // partial 32-query tile, each with and without a KV view.
+    for (int nb : { 1, 64, 45, }) {
+        for (bool kv_view : { true, false, }) {
+            test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {16, 1}, 4096, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, kv_view));
+        }
+    }
+
     for (int hsk : { 40, 64, 72, 80, 96, 128, 192, 256, 320, 512, 576 }) {
         for (int hsv : { 40, 64, 72, 80, 96, 128, 192, 256, 512 }) {
             if (hsk != 96 && hsk != 192 && hsk != 320 && hsk != 576 && hsk != hsv) continue;
