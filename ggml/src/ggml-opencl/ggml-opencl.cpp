@@ -31739,8 +31739,7 @@ static void ggml_cl_fa_trace_once(const char * fmt, ...) {
         GGML_LOG_INFO("ggml_opencl: fa-trace %s\n", line);
     }
 }
-// The fused int8 KQ sized for heads up to 512. Only a q8_0 KV cache takes it: f16 KV at DK=512
-// keeps the f16 KQ it was measured with, and the q8_0 cache has no f16 KQ to fall back to. Built
+// The fused int8 KQ built for heads up to 512 (q8_0 KV, and f16 KV on the default path). Built
 // on first use so no other model pays the compile; a refused build leaves the shape declined.
 static cl_kernel ggml_cl_fa_kq_p8_dk512(ggml_backend_opencl_context * backend_ctx) {
     static bool tried = false;
@@ -31971,7 +31970,20 @@ static bool ggml_cl_flash_attn_decompose(
         if (!e || !e[0]) return -1;
         return atoi(e) != 0 ? 1 : 0;
     }();
-    const bool kq_dk512 = kv_q8 && dk > 256 && dk <= 512 && (dk % 32 == 0) &&
+    // f16 KV at DK=512 takes the same kernel: the K pre-pass quantises f16 rows of any head size.
+    // Only for a batch of at least one 32-query tile - a narrower verify batch keeps the f16 KQ,
+    // whose GQA fold streams each K row once per KV head. On by default on X2E;
+    // GGML_OPENCL_FA_KQ_DK512_F16=0 opts out, any other value opts in elsewhere.
+    static const int kq_dk512_f16_env = []{
+        const char * e = getenv("GGML_OPENCL_FA_KQ_DK512_F16");
+        if (!e || !e[0]) return -1;
+        return atoi(e) != 0 ? 1 : 0;
+    }();
+    const bool kq_dk512_f16 = kq_dk512_f16_env == 1 ||
+                              (kq_dk512_f16_env == -1 && backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E);
+    const bool kv_f16 = k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16;
+    const bool kq_dk512 = (kv_q8 || (kv_f16 && kq_dk512_f16 && n_q >= 32)) &&
+                          dk > 256 && dk <= 512 && (dk % 32 == 0) &&
                           ggml_cl_fa_kq_p8_dk512(backend_ctx) != nullptr;
     const bool kq_p8_int8_shape = backend_ctx->kernel_mul_mm_q8_kq_p8 != nullptr && (dk % 32 == 0) &&
                                   (dk <= 256 || kq_dk512);
@@ -32004,7 +32016,9 @@ static bool ggml_cl_flash_attn_decompose(
         backend_ctx->kernel_fa_p8_fixup != nullptr &&
         (n_kv % 64 == 0) && dk >= 16 && (dk % 16 == 0) && n_head % n_head_kv == 0 &&
         // The packed-row K layout is for the f16 image GEMM; the int8 K pass reads strided rows.
+        // f16 KV past head size 256 only reaches the fused path through the int8 KQ.
         (kv_q8 ? kq_int8_env_pre && k->nb[0] == ggml_type_size(GGML_TYPE_Q8_0)
+         : (kq_dk512 && kq_int8_env_pre) ? k->nb[0] == sizeof(ggml_fp16_t)
                : k->nb[0] == sizeof(ggml_fp16_t) && k->nb[2] == (size_t)dk*sizeof(ggml_fp16_t) &&
                  k->nb[1] == (size_t)dk*n_head_kv*sizeof(ggml_fp16_t)) &&
         q->nb[0] == sizeof(float) && q->nb[2] == (size_t)dk*sizeof(float) &&
@@ -32301,10 +32315,13 @@ static bool ggml_cl_flash_attn_decompose(
         }
     }
 
-    // int8 KQ: K quantised once per call, the Q chunk once per chunk, both along dk. The kernel
-    // sizes its local memory for dk <= 256; larger heads keep the f16 GEMM.
+    // int8 KQ: K quantised once per call, the Q chunk once per chunk, both along dk. The separate
+    // kernel sizes its local memory for dk <= 256; the fused one stages dk in slices.
     const bool kq_int8_env = kq_int8_env_pre;
-    const bool kq_int8 = !e17_dec && kq_int8_env && (dk % 32 == 0) && (dk <= 256 || kq_dk512) && n_head_kv > 0;
+    // Past 256 only the fused kernel has a build sized for the head (the separate int8 KQ is
+    // compiled for 256), so a head that cannot take the fused path stays on the f16 GEMM.
+    const bool kq_int8 = !e17_dec && kq_int8_env && (dk % 32 == 0) && (dk <= 256 || (kq_dk512 && kq_p8_possible)) &&
+                         n_head_kv > 0;
     if (kq_int8_env_val != -1 || kq_int8 || kq_int8_sinks) {
         static bool said = false;
         if (!said) {
