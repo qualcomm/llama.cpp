@@ -55912,6 +55912,14 @@ static int ggml_opencl_try_gdn_state_fusion(const ggml_cgraph * cgraph, int node
         return -1;
     }
     const ggml_tensor * gr = st->view_src;
+    // llama's build_rs gathers all n_rs states with one get_rows and hands the
+    // gdn a view of its first n_seqs rows: reshape(view(get_rows)). Accept that
+    // single offset-0 view, or the reshape straight on the get_rows.
+    const ggml_tensor * mid = st->src[0];
+    if (mid != gr && (mid == nullptr || mid->op != GGML_OP_VIEW || mid->src[0] != gr || mid->view_offs != 0 ||
+                      (mid->flags & GGML_TENSOR_FLAG_OUTPUT))) {
+        return -1;
+    }
     if (gr->op != GGML_OP_GET_ROWS || gr->type != GGML_TYPE_F32 || (gr->flags & GGML_TENSOR_FLAG_OUTPUT) ||
         gr->ne[0] != D || gr->ne[1] != n_seqs || gr->ne[2] != 1 || gr->ne[3] != 1) {
         return -1;
@@ -56010,16 +56018,23 @@ static void ggml_opencl_mark_gdn_state_fusions(const ggml_cgraph * cgraph, std::
             cd.ok = false;
         }
     }
-    std::unordered_map<const ggml_tensor *, size_t> owner; // get_rows result or its reshape -> cand
+    // get_rows result, the optional view between it and the reshape, and the reshape -> cand
+    std::unordered_map<const ggml_tensor *, size_t> owner;
     for (size_t c = 0; c < cands.size(); ++c) {
         owner[cgraph->nodes[cands[c].gr_idx]] = c;
         owner[cands[c].st] = c;
+        owner[cands[c].st->src[0]] = c;
     }
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * node = cgraph->nodes[i];
+        // a zero-element node reads and writes nothing: build_rs's view of the
+        // extra states and its cpy are empty whenever n_rs == n_seqs
+        if (ggml_is_empty(node)) {
+            continue;
+        }
         if (node->view_src != nullptr) {
             auto it = owner.find(node->view_src);
-            if (it != owner.end() && node != cands[it->second].st) {
+            if (it != owner.end() && node != cands[it->second].st && node != cands[it->second].st->src[0]) {
                 cands[it->second].ok = false;
             }
         }
@@ -56029,7 +56044,7 @@ static void ggml_opencl_mark_gdn_state_fusions(const ggml_cgraph * cgraph, std::
                 continue;
             }
             const cand & cd = cands[it->second];
-            if (!(node == cd.gdn && k == 5) && !(node == cd.st)) {
+            if (!(node == cd.gdn && k == 5) && !(node == cd.st) && !(node == cd.st->src[0])) {
                 cands[it->second].ok = false;
             }
         }
