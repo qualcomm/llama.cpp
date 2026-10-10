@@ -306,8 +306,7 @@ static inline size_t ggml_hexagon_tiled_row_size(enum ggml_type type, int64_t ne
 }
 
 static inline bool ggml_hexagon_is_hmx_weight_type(enum ggml_type type) {
-    return type == GGML_TYPE_F16 || type == GGML_TYPE_F32 ||
-           (ggml_hexagon_is_repack_type(type) && type != GGML_TYPE_Q1_0);
+    return type == GGML_TYPE_F16 || type == GGML_TYPE_F32 || ggml_hexagon_is_repack_type(type);
 }
 
 struct ggml_hexagon_session;
@@ -5377,7 +5376,8 @@ static bool ggml_hexagon_matmul_is_hmx_eligible(
     const struct ggml_tensor * dst,
     int ne01_padded,
     bool is_matmul_id,
-    bool is_batched
+    bool is_batched,
+    bool is_collapsed
 ) {
     if (src1->type != GGML_TYPE_F32 && (src1->type != GGML_TYPE_F16 || is_matmul_id)) {
         return false;
@@ -5387,6 +5387,15 @@ static bool ggml_hexagon_matmul_is_hmx_eligible(
     const int ne11  = src1->ne[1];
     const int ne12  = src1->ne[2];
     const int wtype = src0->type;
+
+    if (wtype == GGML_TYPE_Q1_0) {
+        if (!dst || dst->op != GGML_OP_MUL_MAT || dst->type != GGML_TYPE_F32 ||
+            src1->type != GGML_TYPE_F32 || !ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) ||
+            !ggml_is_contiguous(dst) || is_matmul_id || is_batched || is_collapsed ||
+            ne00 % HTP_MM_WEIGHT_TILE_K_Q1_0 != 0 || ne01_padded % HTP_MM_HMX_TILE_N_COLS != 0) {
+            return false;
+        }
+    }
 
     // HMX weight tiles accept non-32-aligned N for non-matmul_id.
     if (ne01_padded % 32 != 0 && is_matmul_id) {
@@ -5416,13 +5425,12 @@ static bool ggml_hexagon_matmul_is_hmx_eligible(
     // M alignment: Use HMX when M > HTP_MM_HMX_MIN_NROWS.
     // For MUL_MAT_ID, src1 shape is [K, n_expert_used, n_tokens, 1], so n_tokens is ne12.
     const int m = is_matmul_id ? ne12 : ne11;
-    if (m <= HTP_MM_HMX_MIN_NROWS) {
+    const int min_nrows = wtype == GGML_TYPE_Q1_0 ? HTP_MM_HMX_Q1_0_MIN_NROWS : HTP_MM_HMX_MIN_NROWS;
+    if (m <= min_nrows) {
         return false;
     }
 
     return true;
-
-    GGML_UNUSED(dst);
 }
 
 static bool ggml_hexagon_precompute_hmx_mm_params(
@@ -5690,6 +5698,7 @@ static void ggml_hexagon_precompute_matmul_params_impl(
     const struct ggml_tensor * dst,
     const size_t src2_row_size,
     const size_t src2_size,
+    bool is_collapsed,
     struct htp_mm_kernel_params * kparams
 ) {
     memset(kparams, 0, sizeof(*kparams));
@@ -5721,7 +5730,7 @@ static void ggml_hexagon_precompute_matmul_params_impl(
 
     // Check HMX eligibility and try precomputing HMX parameters
     bool hmx_enabled = (sess->n_hmx > 0) && (opt_mm_select >= 2);
-    if (hmx_enabled && ggml_hexagon_matmul_is_hmx_eligible(src0, src1, dst, ne01_padded, is_matmul_id, is_batched)) {
+    if (hmx_enabled && ggml_hexagon_matmul_is_hmx_eligible(src0, src1, dst, ne01_padded, is_matmul_id, is_batched, is_collapsed)) {
         if (ggml_hexagon_precompute_hmx_mm_params(sess, src0, src1, dst, wtype, ne00_padded, ne01_tiled, ne02, ne11, ne12, ne11_padded, is_matmul_id, is_batched, src2_size, vtcm_budget, kparams)) {
             goto finalize;
         }
@@ -5808,11 +5817,11 @@ static void ggml_hexagon_precompute_matmul_params(
     if (ggml_hexagon_matmul_can_collapse(src0, src1, dst)) {
         const ggml_tensor src1_collapsed = ggml_hexagon_tensor_collapse_rows(src1);
         const ggml_tensor dst_collapsed  = ggml_hexagon_tensor_collapse_rows(dst);
-        ggml_hexagon_precompute_matmul_params_impl(sess, src0, &src1_collapsed, &dst_collapsed, 0, 0, kparams);
+        ggml_hexagon_precompute_matmul_params_impl(sess, src0, &src1_collapsed, &dst_collapsed, 0, 0, true, kparams);
         kparams->collapse = 1;
         return;
     }
-    ggml_hexagon_precompute_matmul_params_impl(sess, src0, src1, dst, 0, 0, kparams);
+    ggml_hexagon_precompute_matmul_params_impl(sess, src0, src1, dst, 0, 0, false, kparams);
 }
 
 static void ggml_hexagon_precompute_fused_matmul_add_params(
@@ -5831,12 +5840,12 @@ static void ggml_hexagon_precompute_fused_matmul_add_params(
                                            : (src2 ? *src2 : ggml_tensor{});
         const struct ggml_tensor * p_src2 = src2 ? &src2_collapsed : nullptr;
         const size_t src2_size = p_src2 ? hex_round_up(ggml_nbytes(p_src2), 128) : 0;
-        ggml_hexagon_precompute_matmul_params_impl(sess, src0, &src1_collapsed, &dst_collapsed, p_src2 ? p_src2->nb[1] : 0, src2_size, kparams);
+        ggml_hexagon_precompute_matmul_params_impl(sess, src0, &src1_collapsed, &dst_collapsed, p_src2 ? p_src2->nb[1] : 0, src2_size, true, kparams);
         kparams->collapse = 1;
         return;
     }
     const size_t src2_size = src2 ? hex_round_up(ggml_nbytes(src2), 128) : 0;
-    ggml_hexagon_precompute_matmul_params_impl(sess, src0, src1, dst, src2 ? src2->nb[1] : 0, src2_size, kparams);
+    ggml_hexagon_precompute_matmul_params_impl(sess, src0, src1, dst, src2 ? src2->nb[1] : 0, src2_size, false, kparams);
 }
 
 static bool ggml_hexagon_precompute_binary_params(
@@ -6769,7 +6778,7 @@ static void ggml_hexagon_precompute_fused_mmnx_params(
     const bool is_batched = (ne02 * ne03 > 1 || ne12 * ne13 > 1);
 
     bool hmx_enabled = (sess->n_hmx > 0) && (opt_mm_select >= 2);
-    if (hmx_enabled && ggml_hexagon_matmul_is_hmx_eligible(src0, act, nullptr, ne01_padded, false, is_batched)) {
+    if (hmx_enabled && ggml_hexagon_matmul_is_hmx_eligible(src0, act, nullptr, ne01_padded, false, is_batched, false)) {
         if (ggml_hexagon_precompute_hmx_mm_params(sess, src0, act, nullptr, wtype, ne00_padded, ne01_tiled, ne02, ne11, ne12, ne11_padded, false, is_batched, 0, vtcm_budget, kparams)) {
             kparams->n_weights = n_weights;
             goto finalize;
@@ -6845,7 +6854,7 @@ static void ggml_hexagon_precompute_fused_mmidnx_params(
     int32_t n_weights,
     struct htp_mm_kernel_params * kparams
 ) {
-    ggml_hexagon_precompute_matmul_params_impl(sess, src0, act, dst, 0, 0, kparams);
+    ggml_hexagon_precompute_matmul_params_impl(sess, src0, act, dst, 0, 0, false, kparams);
     kparams->n_weights = n_weights;
 }
 
@@ -7897,7 +7906,7 @@ static bool mm_is_hmx_eligible(const ggml_tensor * t) {
         const int wtype = src0->type;
         const bool is_repack = ggml_hexagon_is_repack_type((ggml_type) wtype);
         const int ne01_padded = is_repack ? hex_round_up(src0->ne[1], 32) : src0->ne[1];
-        return ggml_hexagon_matmul_is_hmx_eligible(src0, &src1_c, t, ne01_padded, false, false);
+        return ggml_hexagon_matmul_is_hmx_eligible(src0, &src1_c, t, ne01_padded, false, false, true);
     }
 
     const int wtype = src0->type;
@@ -7907,7 +7916,7 @@ static bool mm_is_hmx_eligible(const ggml_tensor * t) {
 
     const int ne01_padded = is_repack ? hex_round_up(src0->ne[1], 32) : src0->ne[1];
 
-    return ggml_hexagon_matmul_is_hmx_eligible(src0, src1, t, ne01_padded, is_matmul_id, is_batched);
+    return ggml_hexagon_matmul_is_hmx_eligible(src0, src1, t, ne01_padded, is_matmul_id, is_batched, false);
 }
 
 static bool is_supported_mul_mat_nx_kernel(const ggml_tensor * src0, const struct htp_mm_kernel_params * kparams) {

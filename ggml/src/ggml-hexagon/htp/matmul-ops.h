@@ -17,7 +17,8 @@ extern "C" {
 #define HTP_MM_HMX_TILE_N_ROWS 32
 #define HTP_MM_HMX_TILE_SIZE   (32 * 32 * sizeof(__fp16)) // 2048 bytes
 #define HTP_MM_HMX_TILE_N_ELMS 1024
-#define HTP_MM_HMX_MIN_NROWS   4
+#define HTP_MM_HMX_MIN_NROWS      4
+#define HTP_MM_HMX_Q1_0_MIN_NROWS 8
 
 // --- Weight Repacked Tile Sizes ---
 #define HTP_MM_WEIGHT_TILE_K_Q1_0            128
@@ -296,7 +297,6 @@ static inline size_t htp_mm_q8_1_tiled_row_size(uint32_t ne) {
 }
 
 static inline size_t htp_mm_get_tiled_row_stride(int weight_type, uint32_t k) {
-    uint32_t nb = (k + QK_Q4_0_TILED - 1) / QK_Q4_0_TILED;
     switch (weight_type) {
         case HTP_TYPE_Q4_0:
         case HTP_TYPE_IQ4_NL:
@@ -308,7 +308,10 @@ static inline size_t htp_mm_get_tiled_row_stride(int weight_type, uint32_t k) {
         case HTP_TYPE_Q3_K:
         case HTP_TYPE_Q2_K:
         case HTP_TYPE_MXFP4:
-            return (size_t) nb * htp_mm_get_weight_tile_size(weight_type);
+            return (size_t) ((k + QK_Q4_0_TILED - 1) / QK_Q4_0_TILED) * htp_mm_get_weight_tile_size(weight_type);
+        case HTP_TYPE_Q1_0:
+            return (size_t) ((k + HTP_MM_WEIGHT_TILE_K_Q1_0 - 1) / HTP_MM_WEIGHT_TILE_K_Q1_0) *
+                HTP_MM_WEIGHT_TILE_SIZE_Q1_0;
         case HTP_TYPE_F16:
             return (size_t) k * sizeof(__fp16);
         case HTP_TYPE_F32:
@@ -333,8 +336,8 @@ static inline void htp_mm_hmx_get_2d_chunk_costs(
     const bool is_quant = (wtype != HTP_TYPE_F16 && wtype != HTP_TYPE_F32);
     const size_t row_stride = htp_mm_get_tiled_row_stride(wtype, k);
     const size_t vec_dot_size = k * sizeof(uint16_t);
-    const uint32_t n_k_tiles = k / HTP_MM_HMX_TILE_N_COLS;
-    const size_t qweight_row_stride = is_quant ? (size_t)(n_k_tiles * aligned_tile_size) / 32 : 0;
+    const uint32_t n_weight_tiles = k / htp_mm_get_weight_tile_k(wtype);
+    const size_t qweight_row_stride = is_quant ? (size_t)(n_weight_tiles * aligned_tile_size) / 32 : 0;
 
     *size_per_n_out = (pipeline ? 2 : 1) * (is_quant ? qweight_row_stride : row_stride) +
                       (pipeline ? 2 * vec_dot_size : vec_dot_size);
@@ -465,11 +468,11 @@ static inline void htp_mm_hmx_vtcm_layout_build(
         const bool is_quant = (wtype != HTP_TYPE_F16 && wtype != HTP_TYPE_F32);
         const size_t row_stride = htp_mm_get_tiled_row_stride(wtype, k);
         const size_t vec_dot_size = k * sizeof(uint16_t);
-        const uint32_t n_k_tiles = k / HTP_MM_HMX_TILE_N_COLS;
+        const uint32_t n_weight_tiles = k / htp_mm_get_weight_tile_k(wtype);
 
         const size_t min_f32_size = hex_align_up(act_threads * HTP_MM_DMA_ACT_MULTIPLIER * k * sizeof(float), 128);
         const size_t weight_area_size = is_quant
-            ? hex_align_up((nc / 32) * n_k_tiles * aligned_tile_size, HTP_MM_HMX_TILE_SIZE)
+            ? hex_align_up((nc / 32) * n_weight_tiles * aligned_tile_size, HTP_MM_HMX_TILE_SIZE)
             : hex_align_up(nc * row_stride, HTP_MM_HMX_TILE_SIZE);
         const size_t act_area_size    = hex_align_up(mc * vec_dot_size, HTP_MM_HMX_TILE_SIZE);
         const size_t output_area_size = hex_align_up(mc * nc * sizeof(__fp16), HTP_MM_HMX_TILE_SIZE);
