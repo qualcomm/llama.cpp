@@ -39178,9 +39178,10 @@ static void ggml_cl_mul_mat_q8_0_f32_adreno(ggml_backend_t backend, const ggml_t
         CL_CHECK(clReleaseMemObject(b_sub_buf));
     } else {
         static const char * q8_bin_dp4a_env = getenv("GGML_OPENCL_Q8_0_BIN_DP4A");
-        // Opt-in on this branch: it would take the widths the narrow q8_0 kernels serve.
+        // Default on, as upstream; GGML_OPENCL_Q8_0_BIN_DP4A=0 opts out. N > 16 below keeps
+        // the speculative-verify widths on the narrow q8_0 kernels.
         const bool q8_bin_dp4a_on = backend_ctx->has_integer_dot_product &&
-            (q8_bin_dp4a_env ? (atoi(q8_bin_dp4a_env) != 0) : false);
+            (q8_bin_dp4a_env ? (atoi(q8_bin_dp4a_env) != 0) : true);
 
         if (q8_bin_dp4a_on && backend_ctx->kernel_gemm_noshuffle_q8_0_q8_1_dp4a_ila_a8_bin
                 && M % 64 == 0 && N > 16) {
