@@ -39182,9 +39182,13 @@ static void ggml_cl_mul_mat_q8_0_f32_adreno(ggml_backend_t backend, const ggml_t
         // the speculative-verify widths on the narrow q8_0 kernels.
         const bool q8_bin_dp4a_on = backend_ctx->has_integer_dot_product &&
             (q8_bin_dp4a_env ? (atoi(q8_bin_dp4a_env) != 0) : true);
+        // Smallest width the library GEMM takes; GGML_OPENCL_Q8_0_BIN_DP4A_MIN_N lowers it to A/B
+        // the verify band against the narrow kernels.
+        static const char * q8_bin_dp4a_min_n_env = getenv("GGML_OPENCL_Q8_0_BIN_DP4A_MIN_N");
+        static const int q8_bin_dp4a_min_n = q8_bin_dp4a_min_n_env ? atoi(q8_bin_dp4a_min_n_env) : 17;
 
         if (q8_bin_dp4a_on && backend_ctx->kernel_gemm_noshuffle_q8_0_q8_1_dp4a_ila_a8_bin
-                && M % 64 == 0 && N > 16) {
+                && M % 64 == 0 && N >= q8_bin_dp4a_min_n) {
             cl_mem a_sub = nullptr;
             region.origin = offset1;
             region.size   = (size_t)K * N * sizeof(float);
