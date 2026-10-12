@@ -2426,6 +2426,26 @@ static int ggml_cl_env_int(const char * name, int fallback) {
     return atoi(v);
 }
 
+// Lanes per row (as a log2) for kernel_gemv_{f32,f16}_f32_mcr: the widest power of two that
+// still gives each lane at least four float4 of K (64 at K=2560, 16 at K=256), never under 4.
+static int ggml_cl_mcr_lpr_log2(int ne00) {
+    int lpr_log2 = 6;
+    while (lpr_log2 > 2 && ((ne00 / 4) >> lpr_log2) < 4) {
+        lpr_log2--;
+    }
+    return lpr_log2;
+}
+
+// The row-shared GEMV launches one work-group per (64 >> lpr_log2) rows, so a skinny weight
+// gets too few to fill the part: Qwen3.8's 48-row ssm_alpha/ssm_beta run 52.7 us there against
+// 29.5 us on the per-(row, column) kernel at width 8 on the X2-90, while gemma-4's 256-row
+// inp_gate runs 40.8 against 130.7. Take it from 256 work-groups, or past the 512 rows the
+// per-(row, column) kernel stops at.
+static bool ggml_cl_mcr_wide_enough(int ne00, int ne01) {
+    const int rows_per_wg = 64 >> ggml_cl_mcr_lpr_log2(ne00);
+    return ne01 > 512 || (ne01 + rows_per_wg - 1) / rows_per_wg >= 256;
+}
+
 // The AoS decode GEMVs read their quant bytes one uchar at a time, which costs
 // more than the arithmetic around them. IQ_MV_VEC=1 reads them through vloadn.
 // GGML_OPENCL_IQ_MV_VEC=0 restores the scalar loads for an A/B from one binary.
@@ -45504,16 +45524,11 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 static const bool f32_mcr = ggml_cl_env_int("GGML_OPENCL_F32_MCR",
                     backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E ? 1 : 0) != 0;
                 if (f32_mc && f32_mcr && backend_ctx->kernel_gemv_f32_f32_mcr != nullptr &&
-                    ne11 >= 2 && ne11 <= 8 && (ne00 % 4 == 0) &&
+                    ne11 >= 2 && ne11 <= 8 && (ne00 % 4 == 0) && ggml_cl_mcr_wide_enough(ne00, ne01) &&
                     ne02 == 1 && ne12 == 1 && ne13 == 1 &&
                     ggml_is_contiguous(src0) && ggml_is_contiguous(src1)) {
                     cl_kernel kr = backend_ctx->kernel_gemv_f32_f32_mcr;
-                    // Lanes per row: the widest power of two that still gives each lane at
-                    // least four float4 of K (64 at K=2560, 16 at K=256), never under 4.
-                    int lpr_log2 = 6;
-                    while (lpr_log2 > 2 && ((ne00 / 4) >> lpr_log2) < 4) {
-                        lpr_log2--;
-                    }
+                    int lpr_log2 = ggml_cl_mcr_lpr_log2(ne00);
                     const int rows_per_wg = 64 >> lpr_log2;
                     int stride_a = ne00, stride_b = ne00, stride_d = ne01;
                     CL_CHECK(clSetKernelArg(kr,  0, sizeof(cl_mem),   &extra0->data_device));
@@ -45636,14 +45651,11 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 static const bool f16_mcr = ggml_cl_env_int("GGML_OPENCL_F16_MCR",
                     backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E ? 1 : 0) != 0;
                 if (f16_mcr && backend_ctx->kernel_gemv_f16_f32_mcr != nullptr &&
-                    src1t == GGML_TYPE_F32 && ne11 >= 2 && ne11 <= 8 && (ne00 % 4 == 0) &&
+                    src1t == GGML_TYPE_F32 && ne11 >= 2 && ne11 <= 8 && (ne00 % 4 == 0) && ggml_cl_mcr_wide_enough(ne00, ne01) &&
                     ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
                     ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)) {
                     cl_kernel kr = backend_ctx->kernel_gemv_f16_f32_mcr;
-                    int lpr_log2 = 6;
-                    while (lpr_log2 > 2 && ((ne00 / 4) >> lpr_log2) < 4) {
-                        lpr_log2--;
-                    }
+                    int lpr_log2 = ggml_cl_mcr_lpr_log2(ne00);
                     const int rows_per_wg = 64 >> lpr_log2;
                     int stride_a = ne00, stride_b = ne10, stride_d = ne01;
                     CL_CHECK(clSetKernelArg(kr,  0, sizeof(cl_mem),   &extra0->data_device));
