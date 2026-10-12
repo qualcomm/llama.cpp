@@ -39678,7 +39678,10 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno_ila(ggml_backend_t backend, const gg
     // backend runs there for the noshuffle layout, built over the bin plane. Same gate, same
     // host sequence. GGML_OPENCL_Q4_K_BIN_DP4AN=0 leaves these widths to the f16 kernel below.
     static const bool bin_dp4an_off = ggml_cl_env_flag_zero("GGML_OPENCL_Q4_K_BIN_DP4AN");
-    if (!bin_dp4an_off && ne1 >= 2 && ne1 <= 4 &&
+    // Narrowest width the eight-column kernel below takes (GGML_OPENCL_Q4_K_BIN_COK8_MINN);
+    // widths under it stay here.
+    static const int bin_cok8_minn = ggml_cl_env_int("GGML_OPENCL_Q4_K_BIN_COK8_MINN", 5);
+    if (!bin_dp4an_off && ne1 >= 2 && ne1 <= 4 && ne1 < bin_cok8_minn &&
         ggml_cl_cok_have_q4k(backend_ctx) &&   // builds on first use; sets q4k_cok_dp4a_rows
         ggml_cl_cok_dp4a_narrow_on(backend_ctx, ne1, ne01, ne00, backend_ctx->q4k_cok_dp4a_rows) &&
         ((ne1 <= 2) ? backend_ctx->kernel_gemm_cok_q4_k_q8_1_dp4a_bin_c2
@@ -39757,8 +39760,8 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno_ila(ggml_backend_t backend, const gg
     // than the noshuffle kernel reads its own layout). GGML_OPENCL_Q4_K_BIN_COK8=0 keeps
     // the f16 kernel.
     static const bool bin_cok8_off = ggml_cl_env_flag_zero("GGML_OPENCL_Q4_K_BIN_COK8");
-    if (!bin_cok8_off && ne1 >= 5 && ne1 <= 8 &&
-        ggml_cl_q5k_cok8_dp4a_on(backend_ctx, ne1, ne01, ne00) &&
+    if (!bin_cok8_off && ne1 >= MIN(bin_cok8_minn, 5) && ne1 >= 2 && ne1 <= 8 &&
+        ggml_cl_q5k_cok8_dp4a_on(backend_ctx, 5, ne01, ne00) &&
         ggml_cl_cok_have_q5k_cok8(backend_ctx) &&
         backend_ctx->kernel_gemm_cok8_q4_k_q8_1_dp4a_bin != nullptr) {
         cl_mem b_sub_buf = nullptr;
