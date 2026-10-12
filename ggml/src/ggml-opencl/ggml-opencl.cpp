@@ -39679,8 +39679,11 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno_ila(ggml_backend_t backend, const gg
     // host sequence. GGML_OPENCL_Q4_K_BIN_DP4AN=0 leaves these widths to the f16 kernel below.
     static const bool bin_dp4an_off = ggml_cl_env_flag_zero("GGML_OPENCL_Q4_K_BIN_DP4AN");
     // Narrowest width the eight-column kernel below takes (GGML_OPENCL_Q4_K_BIN_COK8_MINN);
-    // widths under it stay here.
-    static const int bin_cok8_minn = ggml_cl_env_int("GGML_OPENCL_Q4_K_BIN_COK8_MINN", 5);
+    // widths under it stay here. 2 on the X2-90: the eight-column kernel at widths 2..4 beats
+    // these kernels by 9-27% on gemma-4-E4B Q4_K_M although it computes all eight columns.
+    // Other parts keep 5 until measured.
+    static const int bin_cok8_minn = ggml_cl_env_int("GGML_OPENCL_Q4_K_BIN_COK8_MINN",
+        backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E ? 2 : 5);
     if (!bin_dp4an_off && ne1 >= 2 && ne1 <= 4 && ne1 < bin_cok8_minn &&
         ggml_cl_cok_have_q4k(backend_ctx) &&   // builds on first use; sets q4k_cok_dp4a_rows
         ggml_cl_cok_dp4a_narrow_on(backend_ctx, ne1, ne01, ne00, backend_ctx->q4k_cok_dp4a_rows) &&
