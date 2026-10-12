@@ -2441,6 +2441,14 @@ static int ggml_cl_mcr_lpr_log2(int ne00) {
 // 29.5 us on the per-(row, column) kernel at width 8 on the X2-90, while gemma-4's 256-row
 // inp_gate runs 40.8 against 130.7. Take it from 256 work-groups, or past the 512 rows the
 // per-(row, column) kernel stops at.
+// Default for the row-shared small-N GEMV: measured on the X2-90 and the Adreno 840 (gemma-4-E4B MTP
+// verify GPU time -7% and -11..-14%). Off on the E17 compiler (850), as the per-(row, column) one is.
+static bool adreno_art_compiler_quirks(const ggml_backend_opencl_context * backend_ctx);
+static bool ggml_cl_mcr_default_on(const ggml_backend_opencl_context * backend_ctx) {
+    return (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E || backend_ctx->adreno_gen == ADRENO_GPU_GEN::A8X) &&
+           !adreno_art_compiler_quirks(backend_ctx);
+}
+
 static bool ggml_cl_mcr_wide_enough(int ne00, int ne01) {
     const int rows_per_wg = 64 >> ggml_cl_mcr_lpr_log2(ne00);
     return ne01 > 512 || (ne01 + rows_per_wg - 1) / rows_per_wg >= 256;
@@ -45519,10 +45527,10 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     : !adreno_art_compiler_quirks(backend_ctx);
                 // Row-shared variant (kernel_gemv_f32_f32_mcr): reads each weight row once for
                 // all N columns and takes any M, so gemma-4's per-layer proj (2560 x 256) leaves
-                // the tiled GEMM too. On by default on the X2-90 (gemma-4-E4B MTP verify -3.4 ms of
-                // GPU time per round with F16_MCR); GGML_OPENCL_F32_MCR=0/1 forces it.
+                // the tiled GEMM too. On by default on the X2-90 and the A8X (see ggml_cl_mcr_default_on);
+                // GGML_OPENCL_F32_MCR=0/1 forces it.
                 static const bool f32_mcr = ggml_cl_env_int("GGML_OPENCL_F32_MCR",
-                    backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E ? 1 : 0) != 0;
+                    ggml_cl_mcr_default_on(backend_ctx) ? 1 : 0) != 0;
                 if (f32_mc && f32_mcr && backend_ctx->kernel_gemv_f32_f32_mcr != nullptr &&
                     ne11 >= 2 && ne11 <= 8 && (ne00 % 4 == 0) && ggml_cl_mcr_wide_enough(ne00, ne01) &&
                     ne02 == 1 && ne12 == 1 && ne13 == 1 &&
@@ -45647,9 +45655,9 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 // A plain 2D f16 weight at verify widths (gemma-4's per_layer_model_proj): the
                 // row-shared GEMV reads it once for all columns, where the narrow-N tile below
                 // runs it at a fraction of the bandwidth. KQ/KQV (ne02 > 1, strided views) keep
-                // the tile. On by default on the X2-90; GGML_OPENCL_F16_MCR=0/1 forces it.
+                // the tile. On by default as F32_MCR is; GGML_OPENCL_F16_MCR=0/1 forces it.
                 static const bool f16_mcr = ggml_cl_env_int("GGML_OPENCL_F16_MCR",
-                    backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E ? 1 : 0) != 0;
+                    ggml_cl_mcr_default_on(backend_ctx) ? 1 : 0) != 0;
                 if (f16_mcr && backend_ctx->kernel_gemv_f16_f32_mcr != nullptr &&
                     src1t == GGML_TYPE_F32 && ne11 >= 2 && ne11 <= 8 && (ne00 % 4 == 0) && ggml_cl_mcr_wide_enough(ne00, ne01) &&
                     ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
