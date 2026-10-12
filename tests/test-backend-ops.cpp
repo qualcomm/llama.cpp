@@ -10465,6 +10465,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int n : {5, 8}) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 32768, n, 5120, {1, 1}, {1, 1}));
     }
+    // An MTP drafter's q8_0 head: K = 256 against a vocab-scale M (gemma-4-E4B: 262144 x 256).
+    for (int n : {1, 4}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 32768, n, 256, {1, 1}, {1, 1}));
+    }
 
     // Small-batch (ne1 2..8) at REAL FFN shapes. The OpenCL backend routes this band
     // to its own cooperative-K GEMMs, and nothing in the eval list reached them: the
