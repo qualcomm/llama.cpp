@@ -73,9 +73,20 @@ kernel void kernel_gemm_noshuffle_q4_0_q8_1_dp4a(
     const uint k_u = (uint)k >> 2;   // K in uint (int8x4) units
     const uint k_b = (uint)k >> 5;   // blocks-of-32 along K
 
+#ifdef GEMM_LM_PAD
+    // E17 (Adreno 850) reads wrong values from the start of these local tiles (as in the MoE
+    // dp4a GEMM, see MOE_LM_PAD); start each one GEMM_LM_PAD x 8 bytes in.
+    __local uint sh_qa_store[TILESIZE_N * 8 + 2 * GEMM_LM_PAD];
+    __local half sh_d_store[TILESIZE_N + 4 * GEMM_LM_PAD];
+    __local half sh_s_store[TILESIZE_N + 4 * GEMM_LM_PAD];
+    __local uint (*sh_qa)[8] = (__local uint (*)[8])(sh_qa_store + 2 * GEMM_LM_PAD);
+    __local half * sh_d = sh_d_store + 4 * GEMM_LM_PAD;
+    __local half * sh_s = sh_s_store + 4 * GEMM_LM_PAD;
+#else
     __local uint sh_qa[TILESIZE_N][8];
     __local half sh_d[TILESIZE_N];
     __local half sh_s[TILESIZE_N];
+#endif
 
 #define NGROUPS (TILESIZE_N / 4)
     float4 acc[NGROUPS];
@@ -193,9 +204,20 @@ kernel void kernel_gemm_noshuffle_q4_0_q8_1_dp4a_wimg(
     // m is even (host-gated), so the half-select is loop-invariant.
     const uint sel = (rrow & 1u) * 16u;
 
+#ifdef GEMM_LM_PAD
+    // E17 (Adreno 850) reads wrong values from the start of these local tiles (as in the MoE
+    // dp4a GEMM, see MOE_LM_PAD); start each one GEMM_LM_PAD x 8 bytes in.
+    __local uint sh_qa_store[TILESIZE_N * 8 + 2 * GEMM_LM_PAD];
+    __local half sh_d_store[TILESIZE_N + 4 * GEMM_LM_PAD];
+    __local half sh_s_store[TILESIZE_N + 4 * GEMM_LM_PAD];
+    __local uint (*sh_qa)[8] = (__local uint (*)[8])(sh_qa_store + 2 * GEMM_LM_PAD);
+    __local half * sh_d = sh_d_store + 4 * GEMM_LM_PAD;
+    __local half * sh_s = sh_s_store + 4 * GEMM_LM_PAD;
+#else
     __local uint sh_qa[TILESIZE_N][8];
     __local half sh_d[TILESIZE_N];
     __local half sh_s[TILESIZE_N];
+#endif
 
 #define NGROUPS (TILESIZE_N / 4)
     float4 acc[NGROUPS];
@@ -322,9 +344,19 @@ kernel void kernel_gemm_noshuffle_q4_0_q8_1_dp4a_alds4(
     const uint k_u = (uint)k >> 2;   // K in uint (int8x4) units
     const uint k_b = (uint)k >> 5;   // blocks-of-32 along K
 
+#ifdef GEMM_LM_PAD
+    // E17: start each local tile in (see the scalar-tile kernel above); one uint4 keeps sh_qa4 aligned.
+    __local uint4 sh_qa4_store[TILESIZE_N * 2 + GEMM_LM_PAD];
+    __local half sh_d_store[TILESIZE_N + 4 * GEMM_LM_PAD];
+    __local half sh_s_store[TILESIZE_N + 4 * GEMM_LM_PAD];
+    __local uint4 (*sh_qa4)[2] = (__local uint4 (*)[2])(sh_qa4_store + GEMM_LM_PAD);
+    __local half * sh_d = sh_d_store + 4 * GEMM_LM_PAD;
+    __local half * sh_s = sh_s_store + 4 * GEMM_LM_PAD;
+#else
     __local uint4 sh_qa4[TILESIZE_N][2];
     __local half sh_d[TILESIZE_N];
     __local half sh_s[TILESIZE_N];
+#endif
 
 #define NGROUPS (TILESIZE_N / 4)
     float4 acc[NGROUPS];
@@ -429,9 +461,19 @@ kernel void kernel_gemm_noshuffle_q4_0_q8_1_dp4a_wimg_alds4(
     // m is even (host-gated), so the half-select is loop-invariant.
     const uint sel = (rrow & 1u) * 16u;
 
+#ifdef GEMM_LM_PAD
+    // E17: start each local tile in (see the scalar-tile kernel above); one uint4 keeps sh_qa4 aligned.
+    __local uint4 sh_qa4_store[TILESIZE_N * 2 + GEMM_LM_PAD];
+    __local half sh_d_store[TILESIZE_N + 4 * GEMM_LM_PAD];
+    __local half sh_s_store[TILESIZE_N + 4 * GEMM_LM_PAD];
+    __local uint4 (*sh_qa4)[2] = (__local uint4 (*)[2])(sh_qa4_store + GEMM_LM_PAD);
+    __local half * sh_d = sh_d_store + 4 * GEMM_LM_PAD;
+    __local half * sh_s = sh_s_store + 4 * GEMM_LM_PAD;
+#else
     __local uint4 sh_qa4[TILESIZE_N][2];
     __local half sh_d[TILESIZE_N];
     __local half sh_s[TILESIZE_N];
+#endif
 
 #define NGROUPS (TILESIZE_N / 4)
     float4 acc[NGROUPS];

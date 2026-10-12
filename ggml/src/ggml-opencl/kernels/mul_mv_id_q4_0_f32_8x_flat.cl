@@ -85,11 +85,98 @@ inline float block_q_4_0_dot_y_flat(
 #define N_SIMDGROUP 1 // number of SIMD groups in a thread group
 #define N_SIMDWIDTH 16 // subgroup size
 #elif defined (ADRENO_GPU)
+#ifdef MOE_NDST
+#define N_DST MOE_NDST
+#else
 #define N_DST 8
+#endif
 #define N_SIMDGROUP 1
 #define N_SIMDWIDTH 64
 #endif
 
+#ifdef MOE_NDST
+// Rows per subgroup set at build time (MOE_NDST). The Adreno 850 runs this kernel faster
+// with 4 rows per subgroup than with 8: more subgroups in flight hide more of the load
+// latency (Qwen3-30B-A3B decode: gate -3%, down -5%). 2 and 16 are slower there.
+inline void mul_vec_q_n_f32_nrow_flat(
+        global char  * src0_q,
+        global half  * src0_d,
+        global float * src1,
+        global float * dst,
+        int ne00,
+        int ne01,
+        int ne02,
+        int ne10,
+        int ne12,
+        int ne0,
+        int ne1,
+        int r2,
+        int r3
+) {
+    const ulong nb = ne00/QK4_0;
+
+    int r0 = get_group_id(0);
+    int r1 = get_group_id(1);
+    int im = 0;
+
+    int first_row = (r0 * N_SIMDGROUP + get_sub_group_id()) * N_DST;
+    first_row = min(first_row, max(ne01 - N_DST, 0));
+
+    int i12 = im%ne12;
+    int i13 = im/ne12;
+
+    ulong offset0_d = first_row * nb + (i12/r2)*(nb*ne01) + (i13/r3)*(nb*ne01*ne02);
+    ulong offset0_q = offset0_d * QK4_0/2;
+
+    global uchar * x = (global uchar *) src0_q + offset0_q;
+    global half  * d = (global half  *) src0_d + offset0_d;
+    global float * y = (global float *) src1   + r1*ne10 + im*ne00*ne1;
+
+    float16 yl;
+    float sumf[N_DST];
+    #pragma unroll
+    for (int r = 0; r < N_DST; ++r) {
+        sumf[r] = 0.f;
+    }
+
+    int ix = get_sub_group_local_id()/2;
+    int il = 8*(get_sub_group_local_id()%2);
+
+    global float * yb = y + ix*QK4_0 + il;
+
+    for (int ib = ix; ib < nb; ib += N_SIMDWIDTH/2) {
+        float sumy = 0.f;
+        sumy += yb[0]  + yb[1]  + yb[2]  + yb[3]  + yb[4]  + yb[5]  + yb[6]  + yb[7];
+        sumy += yb[16] + yb[17] + yb[18] + yb[19] + yb[20] + yb[21] + yb[22] + yb[23];
+
+        yl.s0 = yb[0];        yl.s1 = yb[1]/256.f;
+        yl.s2 = yb[2];        yl.s3 = yb[3]/256.f;
+        yl.s4 = yb[4];        yl.s5 = yb[5]/256.f;
+        yl.s6 = yb[6];        yl.s7 = yb[7]/256.f;
+        yl.s8 = yb[16]/16.f;  yl.s9 = yb[17]/4096.f;
+        yl.sa = yb[18]/16.f;  yl.sb = yb[19]/4096.f;
+        yl.sc = yb[20]/16.f;  yl.sd = yb[21]/4096.f;
+        yl.se = yb[22]/16.f;  yl.sf = yb[23]/4096.f;
+
+        #pragma unroll
+        for (int r = 0; r < N_DST; ++r) {
+            sumf[r] += block_q_4_0_dot_y_flat(x + ib*QK4_0/2 + r*nb*QK4_0/2, d + ib + r*nb, sumy, yl, il);
+        }
+
+        yb += QK4_0 * (N_SIMDWIDTH/2);
+    }
+
+    #pragma unroll
+    for (int r = 0; r < N_DST; ++r) {
+        float tot = sub_group_reduce_add(sumf[r]);
+        if (get_sub_group_local_id() == 0 && first_row + r < ne01) {
+            dst[r1*ne0 + im*ne0*ne1 + first_row + r] = tot;
+        }
+    }
+}
+#endif
+
+#ifndef MOE_NDST
 inline void mul_vec_q_n_f32_8x_flat(
         global char  * src0_q,
         global half  * src0_d,
@@ -231,6 +318,8 @@ inline void mul_vec_q_n_f32_8x_flat(
     }
 }
 
+#endif // !MOE_NDST
+
 #ifdef INTEL_GPU
 REQD_SUBGROUP_SIZE_16
 #elif defined (ADRENO_GPU)
@@ -283,5 +372,9 @@ kernel void kernel_mul_mv_id_q4_0_f32_8x_flat(
     global float * src1_cur   = (global float *)((global char *) src1  + i11*nb11 + i12*nb12);
     global float * dst_cur    = dst + i1*ne0 + i2*ne1*ne0;
 
+#ifdef MOE_NDST
+    mul_vec_q_n_f32_nrow_flat(src0_q_cur, src0_d_cur, src1_cur, dst_cur, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3);
+#else
     mul_vec_q_n_f32_8x_flat(src0_q_cur, src0_d_cur, src1_cur, dst_cur, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3);
+#endif
 }

@@ -55,14 +55,18 @@
 // only the lane-to-element assignment differs -- but the reduction then sums in
 // a different order, so this is not bit-identical and needs its own
 // test-backend-ops pass rather than inheriting the default's.
+// GDN_ROW is deliberately NOT wrapped in outer parentheses: every use is the tail of a sum
+// (base + col * S_V + GDN_ROW(r)), and grouping the row term as one value made the Adreno 840
+// compiler (E031.50) keep a separate offset per row live -- 1084 B of private memory against
+// 804 at 8x4, 544 against 448 at 16x2, 608 against 496 for decode.
 #ifndef GDN_LANE_CONTIG
 #define GDN_LANE_CONTIG 0
 #endif
 
 #if GDN_LANE_CONTIG
-#define GDN_ROW(r)  ((lane) * ROWS_PER_LANE + (r))
+#define GDN_ROW(r)  (lane) * ROWS_PER_LANE + (r)
 #else
-#define GDN_ROW(r)  ((r) * LANES_PER_COLUMN + (lane))
+#define GDN_ROW(r)  (r) * LANES_PER_COLUMN + (lane)
 #endif
 
 #if USE_QCOM_SUBGROUP_SHUFFLE
