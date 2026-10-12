@@ -39178,14 +39178,15 @@ static void ggml_cl_mul_mat_q8_0_f32_adreno(ggml_backend_t backend, const ggml_t
         CL_CHECK(clReleaseMemObject(b_sub_buf));
     } else {
         static const char * q8_bin_dp4a_env = getenv("GGML_OPENCL_Q8_0_BIN_DP4A");
-        // Default on, as upstream; GGML_OPENCL_Q8_0_BIN_DP4A=0 opts out. N > 16 below keeps
-        // the speculative-verify widths on the narrow q8_0 kernels.
+        // Default on, as upstream; GGML_OPENCL_Q8_0_BIN_DP4A=0 opts out.
         const bool q8_bin_dp4a_on = backend_ctx->has_integer_dot_product &&
             (q8_bin_dp4a_env ? (atoi(q8_bin_dp4a_env) != 0) : true);
-        // Smallest width the library GEMM takes; GGML_OPENCL_Q8_0_BIN_DP4A_MIN_N lowers it to A/B
-        // the verify band against the narrow kernels.
+        // Smallest width the library GEMM takes (GGML_OPENCL_Q8_0_BIN_DP4A_MIN_N overrides). Widths
+        // up to 8 stay on cooperative-K below, which is faster there and keeps MTP verify logits
+        // equal to the N=1 GEMV's; 9..16 would otherwise fall to the ILA f16 bin kernel, which the
+        // library GEMM beats by about a third.
         static const char * q8_bin_dp4a_min_n_env = getenv("GGML_OPENCL_Q8_0_BIN_DP4A_MIN_N");
-        static const int q8_bin_dp4a_min_n = q8_bin_dp4a_min_n_env ? atoi(q8_bin_dp4a_min_n_env) : 17;
+        static const int q8_bin_dp4a_min_n = q8_bin_dp4a_min_n_env ? atoi(q8_bin_dp4a_min_n_env) : 9;
 
         if (q8_bin_dp4a_on && backend_ctx->kernel_gemm_noshuffle_q8_0_q8_1_dp4a_ila_a8_bin
                 && M % 64 == 0 && N >= q8_bin_dp4a_min_n) {
