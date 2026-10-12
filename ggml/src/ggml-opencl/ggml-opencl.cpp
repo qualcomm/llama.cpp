@@ -45499,8 +45499,10 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     : !adreno_art_compiler_quirks(backend_ctx);
                 // Row-shared variant (kernel_gemv_f32_f32_mcr): reads each weight row once for
                 // all N columns and takes any M, so gemma-4's per-layer proj (2560 x 256) leaves
-                // the tiled GEMM too. GGML_OPENCL_F32_MCR=1 turns it on.
-                static const bool f32_mcr = ggml_cl_env_int("GGML_OPENCL_F32_MCR", 0) != 0;
+                // the tiled GEMM too. On by default on the X2-90 (gemma-4-E4B MTP verify -3.4 ms of
+                // GPU time per round with F16_MCR); GGML_OPENCL_F32_MCR=0/1 forces it.
+                static const bool f32_mcr = ggml_cl_env_int("GGML_OPENCL_F32_MCR",
+                    backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E ? 1 : 0) != 0;
                 if (f32_mc && f32_mcr && backend_ctx->kernel_gemv_f32_f32_mcr != nullptr &&
                     ne11 >= 2 && ne11 <= 8 && (ne00 % 4 == 0) &&
                     ne02 == 1 && ne12 == 1 && ne13 == 1 &&
@@ -45630,8 +45632,9 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 // A plain 2D f16 weight at verify widths (gemma-4's per_layer_model_proj): the
                 // row-shared GEMV reads it once for all columns, where the narrow-N tile below
                 // runs it at a fraction of the bandwidth. KQ/KQV (ne02 > 1, strided views) keep
-                // the tile. GGML_OPENCL_F16_MCR=1 turns it on.
-                static const bool f16_mcr = ggml_cl_env_int("GGML_OPENCL_F16_MCR", 0) != 0;
+                // the tile. On by default on the X2-90; GGML_OPENCL_F16_MCR=0/1 forces it.
+                static const bool f16_mcr = ggml_cl_env_int("GGML_OPENCL_F16_MCR",
+                    backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E ? 1 : 0) != 0;
                 if (f16_mcr && backend_ctx->kernel_gemv_f16_f32_mcr != nullptr &&
                     src1t == GGML_TYPE_F32 && ne11 >= 2 && ne11 <= 8 && (ne00 % 4 == 0) &&
                     ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
