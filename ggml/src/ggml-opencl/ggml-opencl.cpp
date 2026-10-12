@@ -18073,6 +18073,12 @@ inline bool use_adreno_kernels(const ggml_backend_opencl_context *backend_ctx, c
         threshold_ne0 = 128;
         threshold_ne1 = 128;
     }
+    // The K floor on the X2 class is 256: an MTP drafter's weights are all K = 256 (gemma-4-E4B's
+    // 262144 x 256 q8_0 head ran the flat GEMV at 965 us per draft step against 567 us on the
+    // Adreno GEMV, X2-90). Other parts keep 512 until measured.
+    if (backend_ctx->adreno_x2_class() && threshold_ne0 > 256) {
+        threshold_ne0 = 256;
+    }
     // The ne1 (output-row) threshold declines any weight narrower than 512 rows, which on a
     // GQA model is exactly the K and V projections: muse-glimmer-30B has 2 KV heads x 128 =
     // 256 rows, so attn_k/attn_v fall out of the Adreno path onto the generic flat GEMV.
