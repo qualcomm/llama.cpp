@@ -160,6 +160,7 @@ int op_repeat(struct htp_ops_context * octx);
 int op_argsort(struct htp_ops_context * octx);
 int op_top_k(struct htp_ops_context * octx);
 int op_ssm_conv(struct htp_ops_context * octx);
+int op_ssm_scan(struct htp_ops_context * octx);
 int op_cumsum(struct htp_ops_context * octx);
 int op_fill(struct htp_ops_context * octx);
 int op_concat(struct htp_ops_context * octx);
