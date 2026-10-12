@@ -433,7 +433,9 @@ kernel void kernel_fa_p8_fixup(
 // work-groups (get_group_id(2) = split) into partial sums; kernel_fa_kqv_direct_reduce adds them.
 //   P u8        [head][n_q][p_pitch],  P scales f32 [head][n_q][p_pitch/32]
 //   part f32    [split][head][n_q][dv]
+#ifndef FA_KQVD_MAXC
 #define FA_KQVD_MAXC 32
+#endif
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
 #endif

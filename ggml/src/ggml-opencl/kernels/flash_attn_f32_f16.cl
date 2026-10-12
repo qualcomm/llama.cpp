@@ -484,6 +484,10 @@ __kernel void FA_TILE_NAME(
 
                 ACC_TYPE score0 = partial0 * scale;
                 ACC_TYPE score1 = partial1 * scale;
+                if (logit_softcap > 0.0f) {
+                    score0 = logit_softcap * tanh(score0 / logit_softcap);
+                    score1 = logit_softcap * tanh(score1 / logit_softcap);
+                }
 
                 if (!query_valid) { score0 = FA_M_INIT; score1 = FA_M_INIT; }
                 if (is_causal) {
@@ -507,10 +511,6 @@ __kernel void FA_TILE_NAME(
                     }
                 }
 
-                if (logit_softcap > 0.0f) {
-                    score0 = logit_softcap * tanh(score0 / logit_softcap);
-                    score1 = logit_softcap * tanh(score1 / logit_softcap);
-                }
 
                 const ACC_TYPE m_new = max(m_i, max(score0, score1));
                 // Whole tile masked (m_new == FA_M_INIT): force the exp() args
@@ -573,6 +573,9 @@ __kernel void FA_TILE_NAME(
                         score += local_partial[j][q_lane * N_SPLIT + s];
                     }
                     score *= scale;
+                    if (logit_softcap > 0.0f) {
+                        score = logit_softcap * tanh(score / logit_softcap);
+                    }
 
                     if (is_causal && k_row > (n_kv - n_q + my_query_row)) score = FA_M_INIT;
                     if (k_row >= n_kv) score = FA_M_INIT;
@@ -589,9 +592,6 @@ __kernel void FA_TILE_NAME(
                         }
                     }
 
-                    if (logit_softcap > 0.0f) {
-                        score = logit_softcap * tanh(score / logit_softcap);
-                    }
 
                     m_new = max(m_new, score);
                     local_p[q_lane][j] = score;
@@ -675,6 +675,12 @@ __kernel void FA_TILE_NAME(
                 ACC_TYPE s1 = (dot_acc1.s0 + dot_acc1.s1 + dot_acc1.s2 + dot_acc1.s3) * scale;
                 ACC_TYPE s2 = (dot_acc2.s0 + dot_acc2.s1 + dot_acc2.s2 + dot_acc2.s3) * scale;
                 ACC_TYPE s3 = (dot_acc3.s0 + dot_acc3.s1 + dot_acc3.s2 + dot_acc3.s3) * scale;
+                if (logit_softcap > 0.0f) {
+                    s0 = logit_softcap * tanh(s0 / logit_softcap);
+                    s1 = logit_softcap * tanh(s1 / logit_softcap);
+                    s2 = logit_softcap * tanh(s2 / logit_softcap);
+                    s3 = logit_softcap * tanh(s3 / logit_softcap);
+                }
 
                 if (is_causal) {
                     const int causal_limit = n_kv - n_q + my_query_row;
@@ -704,12 +710,6 @@ __kernel void FA_TILE_NAME(
                     }
                 }
 
-                if (logit_softcap > 0.0f) {
-                    s0 = logit_softcap * tanh(s0 / logit_softcap);
-                    s1 = logit_softcap * tanh(s1 / logit_softcap);
-                    s2 = logit_softcap * tanh(s2 / logit_softcap);
-                    s3 = logit_softcap * tanh(s3 / logit_softcap);
-                }
 
                 const ACC_TYPE m_new      = max(m_i, max(max(s0, s1), max(s2, s3)));
                 // Whole tile masked (m_new == FA_M_INIT): force the exp() args
@@ -970,12 +970,12 @@ __kernel void flash_attn_f32_f16_q1(
             dot_acc = mad(q_shared[k], CONVERT_KV_ACC4(k_ptr[k]), dot_acc);
         }
         ACC_TYPE score = (dot_acc.s0 + dot_acc.s1 + dot_acc.s2 + dot_acc.s3) * scale;
+        if (logit_softcap > 0.0f) {
+            score = logit_softcap * tanh(score / logit_softcap);
+        }
         if (mask_base != NULL) {
             const global MASK_DATA_TYPE* mask_ptr = (const global MASK_DATA_TYPE*)(mask_base);
             score += slope * (ACC_TYPE)mask_ptr[k_idx];
-        }
-        if (logit_softcap > 0.0f) {
-            score = logit_softcap * tanh(score / logit_softcap);
         }
         m_i = max(m_i, score);
     }
@@ -998,12 +998,12 @@ __kernel void flash_attn_f32_f16_q1(
             dot_acc = mad(q_shared[k], CONVERT_KV_ACC4(k_ptr[k]), dot_acc);
         }
         ACC_TYPE score = (dot_acc.s0 + dot_acc.s1 + dot_acc.s2 + dot_acc.s3) * scale;
+        if (logit_softcap > 0.0f) {
+            score = logit_softcap * tanh(score / logit_softcap);
+        }
         if (mask_base != NULL) {
             const global MASK_DATA_TYPE* mask_ptr = (const global MASK_DATA_TYPE*)(mask_base);
             score += slope * (ACC_TYPE)mask_ptr[k_idx];
-        }
-        if (logit_softcap > 0.0f) {
-            score = logit_softcap * tanh(score / logit_softcap);
         }
         const ACC_TYPE p = exp(score - m_final);
         l_i += p;
@@ -1174,13 +1174,13 @@ __kernel void flash_attn_f32_f16_q1_vec(
         }
         ACC_TYPE dot_partial = dot4.s0 + dot4.s1 + dot4.s2 + dot4.s3;
         ACC_TYPE score = sub_group_reduce_add(dot_partial) * scale;
+        if (logit_softcap > 0.0f) {
+            score = logit_softcap * tanh(score / logit_softcap);
+        }
 
         if (mask_base != NULL) {
             const global MASK_DATA_TYPE * mask_ptr = (const global MASK_DATA_TYPE *) mask_base;
             score += slope * (ACC_TYPE) mask_ptr[k_idx];
-        }
-        if (logit_softcap > 0.0f) {
-            score = logit_softcap * tanh(score / logit_softcap);
         }
 
         // FA-2 online update. All threads in the subgroup see the same score,
@@ -1364,12 +1364,12 @@ __kernel void flash_attn_f32_f16_q1_local_tile(
 
             if (tid == 0) {
                 float s = red[0] * scale;
+                if (logit_softcap > 0.0f) {
+                    s = logit_softcap * tanh(s / logit_softcap);
+                }
                 if (mask_base != NULL) {
                     const global MASK_DATA_TYPE * mask_ptr = (const global MASK_DATA_TYPE *) mask_base;
                     s += slope * (float) mask_ptr[kv_idx];
-                }
-                if (logit_softcap > 0.0f) {
-                    s = logit_softcap * tanh(s / logit_softcap);
                 }
                 score_shared = s;
             }
@@ -1565,12 +1565,12 @@ __kernel void flash_attn_f32_f16_q1_local_mq_split(
                     contrib += q_shared[h * DK + d] * (float) k_tile[j * DK + d];
                 }
                 float s = sub_group_reduce_add(contrib) * scale;
+                if (logit_softcap > 0.0f) {
+                    s = logit_softcap * tanh(s / logit_softcap);
+                }
                 if (mask_base[h] != NULL) {
                     const global MASK_DATA_TYPE * mask_ptr = (const global MASK_DATA_TYPE *) mask_base[h];
                     s += slope[h] * (float) mask_ptr[kv_idx];
-                }
-                if (logit_softcap > 0.0f) {
-                    s = logit_softcap * tanh(s / logit_softcap);
                 }
                 score[h] = s;
             }
@@ -1785,12 +1785,12 @@ __kernel void flash_attn_f32_f16_q1_vec_mq(
         for (int h = 0; h < MQ_GQA; ++h) {
             const ACC_TYPE dot_partial = dot4[h].s0 + dot4[h].s1 + dot4[h].s2 + dot4[h].s3;
             ACC_TYPE s = sub_group_reduce_add(dot_partial) * scale;
+            if (logit_softcap > 0.0f) {
+                s = logit_softcap * tanh(s / logit_softcap);
+            }
             if (mask_base[h] != NULL) {
                 const global MASK_DATA_TYPE * mask_ptr = (const global MASK_DATA_TYPE *) mask_base[h];
                 s += slope[h] * (ACC_TYPE) mask_ptr[k_idx];
-            }
-            if (logit_softcap > 0.0f) {
-                s = logit_softcap * tanh(s / logit_softcap);
             }
             score[h] = s;
         }
@@ -2110,6 +2110,9 @@ __kernel void flash_attn_f32_f16_q1_vec_mq_split(
             const ACC_TYPE dot_partial = dot4[h].s0 + dot4[h].s1 + dot4[h].s2 + dot4[h].s3;
 #endif
             ACC_TYPE s = sub_group_reduce_add(dot_partial) * scale;
+            if (logit_softcap > 0.0f) {
+                s = logit_softcap * tanh(s / logit_softcap);
+            }
 #ifdef FA_MQS_LEAN
             if (mask_one != NULL) {
                 s += slope[h] * mask_v;
@@ -2118,9 +2121,6 @@ __kernel void flash_attn_f32_f16_q1_vec_mq_split(
             if (mask_base[h] != NULL) {
                 const global MASK_DATA_TYPE * mask_ptr = (const global MASK_DATA_TYPE *) mask_base[h];
                 s += slope[h] * (ACC_TYPE) mask_ptr[k_idx];
-            }
-            if (logit_softcap > 0.0f) {
-                s = logit_softcap * tanh(s / logit_softcap);
             }
             score[h] = s;
         }
@@ -2624,6 +2624,9 @@ __kernel void flash_attn_f32_f16_q1_vec_mq_split_c8(
             }
 #endif
             s *= scale;
+            if (logit_softcap > 0.0f) {
+                s = logit_softcap * tanh(s / logit_softcap);
+            }
 #ifdef FA_CL_MASK_BCAST
             if (mask_bcast) {
                 s += slope[h] * mask_val;
@@ -2639,9 +2642,6 @@ __kernel void flash_attn_f32_f16_q1_vec_mq_split_c8(
                 s += slope[h] * (ACC_TYPE) mask_ptr[k_safe];
             }
 #endif
-            if (logit_softcap > 0.0f) {
-                s = logit_softcap * tanh(s / logit_softcap);
-            }
             const ACC_TYPE sc    = valid ? s : FA_M_INIT;
             const ACC_TYPE m_new = max(m_i[h], sc);
             const ACC_TYPE sp    = native_exp(m_i[h] - m_new);
@@ -2731,6 +2731,9 @@ __kernel void flash_attn_f32_f16_q1_vec_mq_split_c8(
             }
 #endif
             s *= scale;
+            if (logit_softcap > 0.0f) {
+                s = logit_softcap * tanh(s / logit_softcap);
+            }
 #ifdef FA_CL_MASK_BCAST
             if (mask_bcast) {
                 s += slope[h] * mask_val;
@@ -2746,9 +2749,6 @@ __kernel void flash_attn_f32_f16_q1_vec_mq_split_c8(
                 s += slope[h] * (ACC_TYPE) mask_ptr[k_safe];
             }
 #endif
-            if (logit_softcap > 0.0f) {
-                s = logit_softcap * tanh(s / logit_softcap);
-            }
             score[h] = valid ? s : FA_M_INIT;
         }
 
@@ -3035,12 +3035,12 @@ __kernel void flash_attn_f32_f16_q1_ppb(
                 acc4 = mad(q_shared[h * DK_VEC + k], CONVERT_KV_ACC4(k_ptr[k]), acc4);
             }
             ACC_TYPE s = (acc4.s0 + acc4.s1 + acc4.s2 + acc4.s3) * scale;
+            if (logit_softcap > 0.0f) {
+                s = logit_softcap * tanh(s / logit_softcap);
+            }
             if (mask_base[h] != NULL) {
                 const global MASK_DATA_TYPE * mask_ptr = (const global MASK_DATA_TYPE *) mask_base[h];
                 s += slope[h] * (ACC_TYPE) mask_ptr[p_safe];
-            }
-            if (logit_softcap > 0.0f) {
-                s = logit_softcap * tanh(s / logit_softcap);
             }
             score[h] = valid ? s : FA_M_INIT;
         }
@@ -3246,12 +3246,12 @@ __kernel void flash_attn_f32_f16_q1_ppb4(
                 acc4 = mad(q_shared[h * DK_VEC + k], CONVERT_KV_ACC4(k_ptr[k]), acc4);
             }
             ACC_TYPE s = (acc4.s0 + acc4.s1 + acc4.s2 + acc4.s3) * scale;
+            if (logit_softcap > 0.0f) {
+                s = logit_softcap * tanh(s / logit_softcap);
+            }
             if (mask_base[hh] != NULL) {
                 const global MASK_DATA_TYPE * mask_ptr = (const global MASK_DATA_TYPE *) mask_base[hh];
                 s += slope[hh] * (ACC_TYPE) mask_ptr[p_safe];
-            }
-            if (logit_softcap > 0.0f) {
-                s = logit_softcap * tanh(s / logit_softcap);
             }
             score[hh] = valid ? s : FA_M_INIT;
         }
@@ -3495,12 +3495,12 @@ __kernel void flash_attn_f32_f16_q1_vec_mq_split_k_img(
         for (int h = 0; h < MQ_GQA; ++h) {
             const ACC_TYPE dot_partial = dot4[h].s0 + dot4[h].s1 + dot4[h].s2 + dot4[h].s3;
             ACC_TYPE s = sub_group_reduce_add(dot_partial) * scale;
+            if (logit_softcap > 0.0f) {
+                s = logit_softcap * tanh(s / logit_softcap);
+            }
             if (mask_base[h] != NULL) {
                 const global MASK_DATA_TYPE * mask_ptr = (const global MASK_DATA_TYPE *) mask_base[h];
                 s += slope[h] * (ACC_TYPE) mask_ptr[k_idx];
-            }
-            if (logit_softcap > 0.0f) {
-                s = logit_softcap * tanh(s / logit_softcap);
             }
             score[h] = s;
         }
@@ -3693,12 +3693,12 @@ __kernel void flash_attn_f32_f16_q1_split(
             dot_acc = mad(q_shared[k], CONVERT_KV_ACC4(k_ptr[k]), dot_acc);
         }
         ACC_TYPE score = (dot_acc.s0 + dot_acc.s1 + dot_acc.s2 + dot_acc.s3) * scale;
+        if (logit_softcap > 0.0f) {
+            score = logit_softcap * tanh(score / logit_softcap);
+        }
         if (mask_base != NULL) {
             const global MASK_DATA_TYPE * mask_ptr = (const global MASK_DATA_TYPE *) (mask_base);
             score += slope * (ACC_TYPE) mask_ptr[k_idx];
-        }
-        if (logit_softcap > 0.0f) {
-            score = logit_softcap * tanh(score / logit_softcap);
         }
         m_i = max(m_i, score);
     }
@@ -3722,12 +3722,12 @@ __kernel void flash_attn_f32_f16_q1_split(
             dot_acc = mad(q_shared[k], CONVERT_KV_ACC4(k_ptr[k]), dot_acc);
         }
         ACC_TYPE score = (dot_acc.s0 + dot_acc.s1 + dot_acc.s2 + dot_acc.s3) * scale;
+        if (logit_softcap > 0.0f) {
+            score = logit_softcap * tanh(score / logit_softcap);
+        }
         if (mask_base != NULL) {
             const global MASK_DATA_TYPE * mask_ptr = (const global MASK_DATA_TYPE *) (mask_base);
             score += slope * (ACC_TYPE) mask_ptr[k_idx];
-        }
-        if (logit_softcap > 0.0f) {
-            score = logit_softcap * tanh(score / logit_softcap);
         }
         const ACC_TYPE p = exp(score - m_c);
         l_i += p;
