@@ -1470,6 +1470,31 @@ void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adap
     llama_set_adapters_lora(ctx, loras.data(), loras.size(), scales.data());
 }
 
+// true if the model would be offloaded to an OpenCL GPU
+static bool common_offloads_to_opencl(const common_params & params) {
+    if (params.n_gpu_layers == 0) {
+        return false;
+    }
+    auto is_opencl = [](ggml_backend_dev_t dev) {
+        return ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU &&
+               strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "OpenCL") == 0;
+    };
+    if (!params.devices.empty()) {
+        for (ggml_backend_dev_t dev : params.devices) {
+            if (dev != nullptr && is_opencl(dev)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        if (is_opencl(ggml_backend_dev_get(i))) {
+            return true;
+        }
+    }
+    return false;
+}
+
 struct llama_model_params common_model_params_to_llama(common_params & params) {
     auto mparams = llama_model_default_params();
 
@@ -1483,6 +1508,14 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.tensor_split    = params.tensor_split;
     mparams.use_mmap        = params.use_mmap;
     mparams.use_direct_io   = params.use_direct_io;
+
+    // the OpenCL backend copies weights into its own buffers; keeping the file mapped as well
+    // made gpt-oss several times slower on Adreno X2, so load without mmap unless asked for
+    // (upstream does the same from #26081 on)
+    if (mparams.use_mmap && !params.use_mmap_set && !mparams.use_direct_io && common_offloads_to_opencl(params)) {
+        LOG_INF("%s: OpenCL GPU in use, loading the model without mmap (--mmap to override)\n", __func__);
+        mparams.use_mmap = false;
+    }
     mparams.use_mlock       = params.use_mlock;
     mparams.check_tensors   = params.check_tensors;
     mparams.use_extra_bufts = !params.no_extra_bufts;

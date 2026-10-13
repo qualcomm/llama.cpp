@@ -1085,6 +1085,15 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     }
     if (params.use_mmap.empty()) {
         params.use_mmap = cmd_params_defaults.use_mmap;
+        // as in common: with an OpenCL GPU, load without mmap unless -mmp is given
+        for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU &&
+                strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "OpenCL") == 0) {
+                params.use_mmap = { false };
+                break;
+            }
+        }
     }
     if (params.use_direct_io.empty()) {
         params.use_direct_io = cmd_params_defaults.use_direct_io;
