@@ -912,6 +912,7 @@ struct console_printer : public printer {
         } else {
             printf("  %zu/%zu tests passed\n", info.tests_passed, info.tests_total);
         }
+        fflush(stdout);
     }
 
     void print_backend_status(const backend_status_info & info) override {
@@ -921,6 +922,7 @@ struct console_printer : public printer {
         } else {
             printf("\033[1;31mFAIL\033[0m\n");
         }
+        fflush(stdout);
     }
 
     void print_testing_start(const testing_start_info & info) override {
@@ -953,6 +955,7 @@ struct console_printer : public printer {
         } else {
             printf("\033[1;31mFAIL\033[0m\n");
         }
+        fflush(stdout);
     }
 
     void print_failed_tests(const std::vector<std::string> & failed_tests) override {
@@ -964,6 +967,7 @@ struct console_printer : public printer {
         for (const auto & test_name : failed_tests) {
             printf("  %s\n", test_name.c_str());
         }
+        fflush(stdout);
     }
 
   private:

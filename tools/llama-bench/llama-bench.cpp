@@ -2534,10 +2534,12 @@ int llama_bench(int argc, char ** argv) {
 
     if (p) {
         p->print_footer();
+        fflush(p->fout);
     }
 
     if (p_err) {
         p_err->print_footer();
+        fflush(p_err->fout);
     }
 
     llama_backend_free();
