@@ -45783,13 +45783,17 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 // the verify batch. GGML_OPENCL_MM_STRIDED_A=0 restores the copy.
                 static const char * mm_strided_a_env = getenv("GGML_OPENCL_MM_STRIDED_A");
                 const bool mm_strided_a_off = (mm_strided_a_env != nullptr && mm_strided_a_env[0] == '0');
+                // The kernel steps src0 batches by (i03*ne02 + i02)*batch_stride_a. The stride of
+                // a size-1 dim is arbitrary (ggml_is_contiguous ignores it), so with ne02 == 1 --
+                // the per-stream K/V views of a multi-stream KV cache -- take it from ne03.
+                const cl_ulong nb02_a = (ne02 == 1 && ne03 > 1) ? nb03 : nb02;
                 const bool src0_in_place = ggml_is_contiguous(src0) ||
-                    (!mm_strided_a_off && nb00 == sizeof(ggml_fp16_t) && nb01 % 8 == 0 && nb02 % 8 == 0 &&
-                     (ne03 == 1 || nb03 == nb02*(cl_ulong)ne02) &&
-                     nb02/2*(cl_ulong)ne02*(cl_ulong)ne03 + nb01/2*(cl_ulong)ne01 < (cl_ulong)INT_MAX);
+                    (!mm_strided_a_off && nb00 == sizeof(ggml_fp16_t) && nb01 % 8 == 0 && nb02_a % 8 == 0 &&
+                     (ne03 == 1 || nb03 == nb02_a*(cl_ulong)ne02) &&
+                     nb02_a/2*(cl_ulong)ne02*(cl_ulong)ne03 + nb01/2*(cl_ulong)ne01 < (cl_ulong)INT_MAX);
 
                 int stride_a       = src0_in_place ? (int)(nb01/2) : ne00;
-                int batch_stride_a = src0_in_place ? (int)(nb02/2) : ne00*ne01;
+                int batch_stride_a = src0_in_place ? (int)(nb02_a/2) : ne00*ne01;
                 int batch_stride_b = ne10*ne11_mm;
                 int batch_stride_d = ne0*ne11_mm;
 
