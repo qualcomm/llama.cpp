@@ -19276,6 +19276,21 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
         }
     }
 
+    // A tensor larger than CL_DEVICE_MAX_MEM_ALLOC_SIZE cannot be put in an OpenCL buffer
+    // unless large-buffer mode is on, or can still be turned on by the first allocation
+    // (ggml_opencl_maybe_enable_large_buffer), so its op cannot run here.
+    if (backend_ctx && !backend_ctx->adreno_use_large_buffer &&
+        (!backend_ctx->adreno_has_large_buffer || g_cl_programs_built != 0)) {
+        if (ggml_nbytes(op) > backend_ctx->max_alloc_size) {
+            return false;
+        }
+        for (int i = 0; i < GGML_MAX_SRC; i++) {
+            if (op->src[i] && ggml_nbytes(op->src[i]) > backend_ctx->max_alloc_size) {
+                return false;
+            }
+        }
+    }
+
     switch (op->op) {
         case GGML_OP_NONE:
             return true;
