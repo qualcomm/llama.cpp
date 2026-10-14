@@ -2254,7 +2254,7 @@ static void test_read_percentage_disabled_reads_all_misses() {
     printf("test_read_percentage_disabled_reads_all_misses: PASS\n");
 }
 
-// With a 50% read limit, four eligible misses need two reads and two substitutions.
+// With a 60% read limit, four eligible misses need three reads and one substitution.
 static void test_read_percentage_ranks_and_substitutes() {
     std::string tmpfile = (std::filesystem::temp_directory_path() / "test-read-percentage-enabled-XXXXXX").string();
     int         fd      = mkstemp(tmpfile.data());
@@ -2271,7 +2271,8 @@ static void test_read_percentage_ranks_and_substitutes() {
     }
 
     llama_expert_cache cache;
-    cache.read_percentage_ = 50;  // ceil(4 * 50 / 100) = 2 reads
+    cache.stats_           = true;
+    cache.read_percentage_ = 60;  // ceil(4 * 60 / 100) = 3 reads
     EC_CHECK(cache.add_file(fd));
 
     // Leave space for three cached experts and four possible misses.
@@ -2299,7 +2300,7 @@ static void test_read_percentage_ranks_and_substitutes() {
     dst.ne[1]               = 1;  // n_tokens (decode)
     dst.data                = ids_data;
 
-    // Experts 0 and 1 have the two closest cached matches.
+    // Expert 0 has the closest cached match, so only it is substituted at a 60% read limit.
     float       probs_data[8] = { /*0*/ 0.40f, /*1*/ 0.10f, /*2*/ 0.60f, /*3*/ 0.15f,
                             /*4*/ 0.0f,  /*5*/ 0.90f, /*6*/ 0.42f, /*7*/ 0.05f };
     ggml_tensor probs_tensor  = {};
@@ -2310,12 +2311,15 @@ static void test_read_percentage_ranks_and_substitutes() {
     llama_expert_cache::op_params_t params = { &cache, 0 };
     llama_expert_cache::reroute_fn(&dst, nullptr, &probs_tensor, /*ith=*/0, /*nth=*/1, &params);
 
-    // The two larger gaps remain real reads.
+    // The three larger gaps remain real reads.
+    assert(ids_data[1] == 1);
     assert(ids_data[2] == 2);
     assert(ids_data[3] == 3);
 
     assert(ids_data[0] == 6);  // miss 0 (p=0.40) substituted by expert 6 (p=0.42)
-    assert(ids_data[1] == 7);  // miss 1 (p=0.10) substituted by expert 7 (p=0.05)
+    EC_CHECK(cache.stat_read_pct_subs.load() == 1);
+    EC_CHECK(cache.stat_hits.load() == 1 && cache.stat_misses.load() == 3);
+    EC_CHECK(cache.stat_flash_bytes.load() == 192 && cache.stat_flash_reads.load() == 1);
 
     close(fd);
     unlink(tmpfile.c_str());
