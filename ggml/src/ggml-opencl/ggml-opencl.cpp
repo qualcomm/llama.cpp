@@ -37755,14 +37755,15 @@ static void ggml_cl_mul_mat_q4_0_f32_adreno(ggml_backend_t backend, const ggml_t
             return;
         }
 
-        // On E17 (Adreno 850), with its local tiles padded (GEMM_LM_PAD), the dp4a GEMM wins only
-        // on wide outputs: Qwen3-30B-A3B shapes at N=512, M=4096 -22% and M=2048 -17%, but
-        // M=512 +25%. Take it from M >= 2048 there.
+        // On E17 (Adreno 850), with its local tiles padded (GEMM_LM_PAD), take the dp4a GEMM at
+        // every width. It used to start at M >= 2048, which left narrower outputs on the f16 GEMM
+        // below; its half-precision activations cost gemma-4-E2B-Q4_0 ~2% perplexity (ffn_down,
+        // M = 1536: 125.0 vs 122.8 here, CPU 122.6), and dp4a now measures equal or faster there
+        // (pp512 gemma-4-E2B 722 -> 771, Llama-3.2-1B 1438 -> 1452, Qwen3-4B 479 -> 481).
         static const char * q4_0_dense_dp4a_env = getenv("GGML_OPENCL_Q4_0_DENSE_DP4A");
         bool q4_0_dense_dp4a_on = q4_0_dense_dp4a_env
             ? (atoi(q4_0_dense_dp4a_env) != 0)
-            : (adreno_dense_dp4a_default_on(backend_ctx) ||
-               (adreno_art_compiler_quirks(backend_ctx) && M >= 2048));
+            : (adreno_dense_dp4a_default_on(backend_ctx) || adreno_art_compiler_quirks(backend_ctx));
         // dot prod has to be available
         q4_0_dense_dp4a_on = backend_ctx->has_integer_dot_product && q4_0_dense_dp4a_on;
 
