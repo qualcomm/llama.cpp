@@ -16204,8 +16204,13 @@ static bool ggml_opencl_can_fuse_moe_combine(const struct ggml_cgraph * cgraph, 
 
 // The prebuilt q4_K / q6_K MoE dp4a GEMMs of kernel library 0.0.14 replace the source
 // dp4a GEMMs when selected. Off by default: on the X2-90 the source path is faster
-// (see the A/B in the commit). GGML_OPENCL_MOE_QK_DP4A_BIN=1 selects them.
-static bool ggml_cl_moe_qk_dp4a_bin_on() {
+// (see the A/B in the commit). GGML_OPENCL_MOE_QK_DP4A_BIN=1 selects both;
+// GGML_OPENCL_MOE_Q4K_DP4A_BIN / _Q6K_DP4A_BIN=0/1 override it per type.
+static bool ggml_cl_moe_qk_dp4a_bin_on(const char * type_env) {
+    const char * t = getenv(type_env);
+    if (t && *t) {
+        return atoi(t) != 0;
+    }
     static const char * e = getenv("GGML_OPENCL_MOE_QK_DP4A_BIN");
     return e && *e && atoi(e) != 0;
 }
@@ -52842,7 +52847,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     // kernel keeps the shape. GGML_OPENCL_Q4K_MOE_DP4A=0/1 forces either way.
                     static const char * q4k_moe_dp4a_env = getenv("GGML_OPENCL_Q4K_MOE_DP4A");
                     // prebuilt q4_K dp4a GEMM (kernel library 0.0.14+), GGML_OPENCL_MOE_QK_DP4A_BIN=1
-                    const bool          q4k_dp4a_bin = backend_ctx->kernel_gemm_moe_q4_k_q8_1_dp4a_bin != nullptr && ggml_cl_moe_qk_dp4a_bin_on();
+                    const bool          q4k_dp4a_bin = backend_ctx->kernel_gemm_moe_q4_k_q8_1_dp4a_bin != nullptr && ggml_cl_moe_qk_dp4a_bin_on("GGML_OPENCL_MOE_Q4K_DP4A_BIN");
                     const bool          q4k_rb2_ok = !q4k_dp4a_bin && backend_ctx->kernel_gemm_moe_q4_k_q8_1_dp4a_rb2 != nullptr && (ne01 % 128) == 0;
                     const bool          use_moe_dp4a = q4k_moe_dp4a_env
                         ? (atoi(q4k_moe_dp4a_env) != 0)
@@ -53390,7 +53395,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     // vec-acc, with q4_K MoE; dense dp4a stays X2-only). Env forces either way.
                     static const char * q6k_moe_dp4a_env = getenv("GGML_OPENCL_Q6K_MOE_DP4A");
                     // prebuilt q6_K dp4a GEMM (kernel library 0.0.14+), GGML_OPENCL_MOE_QK_DP4A_BIN=1
-                    const bool          q6k_dp4a_bin = backend_ctx->kernel_gemm_moe_q6_k_q8_1_dp4a_bin != nullptr && ggml_cl_moe_qk_dp4a_bin_on();
+                    const bool          q6k_dp4a_bin = backend_ctx->kernel_gemm_moe_q6_k_q8_1_dp4a_bin != nullptr && ggml_cl_moe_qk_dp4a_bin_on("GGML_OPENCL_MOE_Q6K_DP4A_BIN");
                     // adreno_dp4a_moe() already folds in dp4a availability
                     // (ADRENO && has_integer_dot_product), so upstream's separate
                     // "dot prod has to be available" guard is redundant here. Its
@@ -53401,6 +53406,18 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                         // bin kernel takes precedence (from upstream), unless the prebuilt
                         // q6_K dp4a GEMM is selected
                         && (backend_ctx->kernel_gemm_moe_q6_k_f32_ns_bin == nullptr || q6k_dp4a_bin);
+                    static const char * q6k_dispatch_log_env = getenv("GGML_OPENCL_MOE_DISPATCH_LOG");
+                    if (q6k_dispatch_log_env && atoi(q6k_dispatch_log_env) != 0) {
+                        static long long last_logged = -1;
+                        const long long key = (long long)ne01 * 1000000 + (long long)(ne20 * ne21);
+                        if (key != last_logged) {
+                            last_logged = key;
+                            GGML_LOG_INFO("ggml_opencl: mul_mat_id q6_K gemm ne01=%d routings=%d -> %s\n",
+                                          (int)ne01, (int)(ne20 * ne21),
+                                          use_q6k_dp4a ? (q6k_dp4a_bin ? "dp4a-bin" : "dp4a")
+                                                       : (backend_ctx->kernel_gemm_moe_q6_k_f32_ns_bin ? "ila-bin" : "source-ns"));
+                        }
+                    }
 
                     cl_buffer_region region;
                     region.origin = 0;
