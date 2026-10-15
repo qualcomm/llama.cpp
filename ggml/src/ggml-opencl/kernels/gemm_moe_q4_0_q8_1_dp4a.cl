@@ -40,13 +40,27 @@
 #define NGROUPS    (TILESIZE_N / 4)
 
 // Expand the 4 nibbles held in the low 16 bits of `u` into 4 bytes (one nibble
-// per byte, value 0..15), packed for the int8 dp4a. The q4_0 -8 zero-point is
-// applied in the epilogue via the activation sum term (cheaper than biasing
-// every byte).
+// per byte, value 0..15), packed for the int8 dp4a. q4_1 applies its min in the
+// epilogue via the activation sum term; q4_0 folds its -8 into the weights (WEXP4).
 #define EXP4(u)  ( ((uint)((u) & 0x000Fu))        | \
                   (((uint)((u) & 0x00F0u)) << 4)  | \
                   (((uint)((u) & 0x0F00u)) << 8)  | \
                   (((uint)((u) & 0xF000u)) << 12) )
+
+// The same 4 weights as signed int8 q - 8 (-8..7), so the zero-point is folded into
+// the dot product instead of a separate d * sum(a) term. That term is stored as half
+// and overflows once the activations of a 32-block average above ~2000.
+// Per byte: x = q ^ 8 holds q - 8 in its low 4 bits; sign-extend bit 3 into bits 4..7.
+inline uint exp4s(uint u) {
+    const uint x = EXP4(u) ^ 0x08080808u;
+    return x | ((x & 0x08080808u) * 0x1Fu);
+}
+
+#ifdef MOE_Q41
+#define WEXP4(u) EXP4(u)
+#else
+#define WEXP4(u) exp4s(u)
+#endif
 
 // R = 32-K dp4a dot of this WI's 8 weight uints (qw) with token T's 8 activation uints.
 #define MOE_DOT8(T, R) do {                                            \
@@ -200,10 +214,10 @@ kernel void MOE_KERNEL_NAME(
         const uint r2 = read_imageui(src0_q, qoff1 + lid).x;
         const uint r3 = read_imageui(src0_q, qoff1 + lid + ne01).x;
         uint qw[8];
-        qw[0] = EXP4(r0);        qw[1] = EXP4(r0 >> 16);
-        qw[2] = EXP4(r1);        qw[3] = EXP4(r1 >> 16);
-        qw[4] = EXP4(r2);        qw[5] = EXP4(r2 >> 16);
-        qw[6] = EXP4(r3);        qw[7] = EXP4(r3 >> 16);
+        qw[0] = WEXP4(r0);        qw[1] = WEXP4(r0 >> 16);
+        qw[2] = WEXP4(r1);        qw[3] = WEXP4(r1 >> 16);
+        qw[4] = WEXP4(r2);        qw[5] = WEXP4(r2 >> 16);
+        qw[6] = WEXP4(r3);        qw[7] = WEXP4(r3 >> 16);
 #ifdef MOE_RB2
         const float d_val2 = (float)src0_d[d_offset + 64];
 #ifdef MOE_Q41
@@ -215,10 +229,10 @@ kernel void MOE_KERNEL_NAME(
             const uint t1 = read_imageui(src0_q, qoff0 + lid + 64 + ne01).x;
             const uint t2 = read_imageui(src0_q, qoff1 + lid + 64).x;
             const uint t3 = read_imageui(src0_q, qoff1 + lid + 64 + ne01).x;
-            qv[0] = EXP4(t0);    qv[1] = EXP4(t0 >> 16);
-            qv[2] = EXP4(t1);    qv[3] = EXP4(t1 >> 16);
-            qv[4] = EXP4(t2);    qv[5] = EXP4(t2 >> 16);
-            qv[6] = EXP4(t3);    qv[7] = EXP4(t3 >> 16);
+            qv[0] = WEXP4(t0);    qv[1] = WEXP4(t0 >> 16);
+            qv[2] = WEXP4(t1);    qv[3] = WEXP4(t1 >> 16);
+            qv[4] = WEXP4(t2);    qv[5] = WEXP4(t2 >> 16);
+            qv[6] = WEXP4(t3);    qv[7] = WEXP4(t3 >> 16);
         }
 #endif
 
@@ -233,7 +247,9 @@ kernel void MOE_KERNEL_NAME(
         }
         if (lid < (uint)n_real) {
             sh_d[lid] = src1_da[(col + lid) * num_blocks + sub];
+#ifdef MOE_Q41
             sh_s[lid] = src1_sa[(col + lid) * num_blocks + sub];
+#endif
         }
         barrier(CLK_LOCAL_MEM_FENCE);
 
@@ -255,16 +271,18 @@ kernel void MOE_KERNEL_NAME(
 #endif
                 const float4 rf = convert_float4(raw);
                 const float4 ad = (float4)((float)sh_d[b + 0], (float)sh_d[b + 1], (float)sh_d[b + 2], (float)sh_d[b + 3]);
+#ifdef MOE_Q41
                 const float4 as = (float4)((float)sh_s[b + 0], (float)sh_s[b + 1], (float)sh_s[b + 2], (float)sh_s[b + 3]);
+#endif
 #ifdef MOE_Q41
                 acc[g] += d_val * ad * rf + m_val * as;
 #ifdef MOE_RB2
                 acc2[g] += d_val2 * ad * rf2 + m_val2 * as;
 #endif
 #else
-                acc[g] += d_val * (ad * rf - 8.0f * as);
+                acc[g] += d_val * ad * rf;
 #ifdef MOE_RB2
-                acc2[g] += d_val2 * (ad * rf2 - 8.0f * as);
+                acc2[g] += d_val2 * ad * rf2;
 #endif
 #endif
             }

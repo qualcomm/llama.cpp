@@ -1330,6 +1330,7 @@ struct ggml_backend_opencl_context {
 
     // prealloc buffers for MoE router table preprocess
     bool toggle_reorder = false;
+    ggml_cl_buffer prealloc_router_ids;   // aligned copy of a router table at an unaligned offset
     ggml_cl_buffer prealloc_post_router;
     ggml_cl_buffer prealloc_emap;
     ggml_cl_buffer prealloc_hist;
@@ -19427,6 +19428,21 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
     // reject ops that match the opfilter regex
     if (dev_ctx->opfilter && std::regex_match(std::string(ggml_op_desc(op)), *dev_ctx->opfilter)) {
         return false;
+    }
+
+    // A tensor larger than CL_DEVICE_MAX_MEM_ALLOC_SIZE cannot be put in an OpenCL buffer
+    // unless large-buffer mode is on, or can still be turned on by the first allocation
+    // (ggml_opencl_maybe_enable_large_buffer), so its op cannot run here.
+    if (backend_ctx && !backend_ctx->adreno_use_large_buffer &&
+        (!backend_ctx->adreno_has_large_buffer || g_cl_programs_built != 0)) {
+        if (ggml_nbytes(op) > backend_ctx->max_alloc_size) {
+            return false;
+        }
+        for (int i = 0; i < GGML_MAX_SRC; i++) {
+            if (op->src[i] && ggml_nbytes(op->src[i]) > backend_ctx->max_alloc_size) {
+                return false;
+            }
+        }
     }
 
     switch (op->op) {
@@ -37980,14 +37996,15 @@ static void ggml_cl_mul_mat_q4_0_f32_adreno(ggml_backend_t backend, const ggml_t
             return;
         }
 
-        // On E17 (Adreno 850), with its local tiles padded (GEMM_LM_PAD), the dp4a GEMM wins only
-        // on wide outputs: Qwen3-30B-A3B shapes at N=512, M=4096 -22% and M=2048 -17%, but
-        // M=512 +25%. Take it from M >= 2048 there.
+        // On E17 (Adreno 850), with its local tiles padded (GEMM_LM_PAD), take the dp4a GEMM at
+        // every width. It used to start at M >= 2048, which left narrower outputs on the f16 GEMM
+        // below; its half-precision activations cost gemma-4-E2B-Q4_0 ~2% perplexity (ffn_down,
+        // M = 1536: 125.0 vs 122.8 here, CPU 122.6), and dp4a now measures equal or faster there
+        // (pp512 gemma-4-E2B 722 -> 771, Llama-3.2-1B 1438 -> 1452, Qwen3-4B 479 -> 481).
         static const char * q4_0_dense_dp4a_env = getenv("GGML_OPENCL_Q4_0_DENSE_DP4A");
         bool q4_0_dense_dp4a_on = q4_0_dense_dp4a_env
             ? (atoi(q4_0_dense_dp4a_env) != 0)
-            : (adreno_dense_dp4a_default_on(backend_ctx) ||
-               (adreno_art_compiler_quirks(backend_ctx) && M >= 2048));
+            : (adreno_dense_dp4a_default_on(backend_ctx) || adreno_art_compiler_quirks(backend_ctx));
         // dot prod has to be available
         q4_0_dense_dp4a_on = backend_ctx->has_integer_dot_product && q4_0_dense_dp4a_on;
 
@@ -45992,13 +46009,17 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 // the verify batch. GGML_OPENCL_MM_STRIDED_A=0 restores the copy.
                 static const char * mm_strided_a_env = getenv("GGML_OPENCL_MM_STRIDED_A");
                 const bool mm_strided_a_off = (mm_strided_a_env != nullptr && mm_strided_a_env[0] == '0');
+                // The kernel steps src0 batches by (i03*ne02 + i02)*batch_stride_a. The stride of
+                // a size-1 dim is arbitrary (ggml_is_contiguous ignores it), so with ne02 == 1 --
+                // the per-stream K/V views of a multi-stream KV cache -- take it from ne03.
+                const cl_ulong nb02_a = (ne02 == 1 && ne03 > 1) ? nb03 : nb02;
                 const bool src0_in_place = ggml_is_contiguous(src0) ||
-                    (!mm_strided_a_off && nb00 == sizeof(ggml_fp16_t) && nb01 % 8 == 0 && nb02 % 8 == 0 &&
-                     (ne03 == 1 || nb03 == nb02*(cl_ulong)ne02) &&
-                     nb02/2*(cl_ulong)ne02*(cl_ulong)ne03 + nb01/2*(cl_ulong)ne01 < (cl_ulong)INT_MAX);
+                    (!mm_strided_a_off && nb00 == sizeof(ggml_fp16_t) && nb01 % 8 == 0 && nb02_a % 8 == 0 &&
+                     (ne03 == 1 || nb03 == nb02_a*(cl_ulong)ne02) &&
+                     nb02_a/2*(cl_ulong)ne02*(cl_ulong)ne03 + nb01/2*(cl_ulong)ne01 < (cl_ulong)INT_MAX);
 
                 int stride_a       = src0_in_place ? (int)(nb01/2) : ne00;
-                int batch_stride_a = src0_in_place ? (int)(nb02/2) : ne00*ne01;
+                int batch_stride_a = src0_in_place ? (int)(nb02_a/2) : ne00*ne01;
                 int batch_stride_b = ne10*ne11_mm;
                 int batch_stride_d = ne0*ne11_mm;
 
@@ -51131,7 +51152,17 @@ static void moe_router_reoerder(ggml_backend_t backend, const ggml_tensor * src,
     cl_buffer_region region;
     region.origin = offset;
     region.size = nb21 * ne21;
-    cl_mem original_router_buf = clCreateSubBuffer(extra->data_device, 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &err);
+    cl_mem src_buf = extra->data_device;
+    if (offset % backend_ctx->alignment != 0) {
+        // A sub-buffer origin must be aligned to CL_DEVICE_MEM_BASE_ADDR_ALIGN; a router
+        // table viewed at another offset is copied to an aligned buffer first.
+        backend_ctx->prealloc_router_ids.allocate(backend_ctx->context, region.size);
+        CL_CHECK(clEnqueueCopyBuffer(backend_ctx->queue, extra->data_device, backend_ctx->prealloc_router_ids.buffer,
+                                     offset, 0, region.size, 0, NULL, NULL));
+        src_buf = backend_ctx->prealloc_router_ids.buffer;
+        region.origin = 0;
+    }
+    cl_mem original_router_buf = clCreateSubBuffer(src_buf, 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &err);
     CL_CHECK(err);
 
     backend_ctx->prealloc_post_router.allocate(backend_ctx->context, sizeof(int) * max_post_router_tile * n_tile_size);
