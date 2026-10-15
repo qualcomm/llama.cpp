@@ -16202,17 +16202,20 @@ static bool ggml_opencl_can_fuse_moe_combine(const struct ggml_cgraph * cgraph, 
     return true;
 }
 
-// The prebuilt q4_K / q6_K MoE dp4a GEMMs of kernel library 0.0.14 replace the source
-// dp4a GEMMs when selected. Off by default: on the X2-90 the source path is faster
-// (see the A/B in the commit). GGML_OPENCL_MOE_QK_DP4A_BIN=1 selects both;
-// GGML_OPENCL_MOE_Q4K_DP4A_BIN / _Q6K_DP4A_BIN=0/1 override it per type.
-static bool ggml_cl_moe_qk_dp4a_bin_on(const char * type_env) {
+// The prebuilt q4_K / q6_K MoE dp4a GEMMs of kernel library 0.0.14+. On the X2-90 the
+// q6_K one is faster than the f32 prebuilt GEMM q6_K MoE otherwise takes, so it is on by
+// default; the q4_K one loses to the two-rows-per-lane source GEMM, so it is off.
+// GGML_OPENCL_MOE_QK_DP4A_BIN=0/1 sets both; _Q4K_DP4A_BIN / _Q6K_DP4A_BIN override per type.
+static bool ggml_cl_moe_qk_dp4a_bin_on(const char * type_env, bool def) {
     const char * t = getenv(type_env);
     if (t && *t) {
         return atoi(t) != 0;
     }
     static const char * e = getenv("GGML_OPENCL_MOE_QK_DP4A_BIN");
-    return e && *e && atoi(e) != 0;
+    if (e && *e) {
+        return atoi(e) != 0;
+    }
+    return def;
 }
 
 static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
@@ -52847,7 +52850,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     // kernel keeps the shape. GGML_OPENCL_Q4K_MOE_DP4A=0/1 forces either way.
                     static const char * q4k_moe_dp4a_env = getenv("GGML_OPENCL_Q4K_MOE_DP4A");
                     // prebuilt q4_K dp4a GEMM (kernel library 0.0.14+), GGML_OPENCL_MOE_QK_DP4A_BIN=1
-                    const bool          q4k_dp4a_bin = backend_ctx->kernel_gemm_moe_q4_k_q8_1_dp4a_bin != nullptr && ggml_cl_moe_qk_dp4a_bin_on("GGML_OPENCL_MOE_Q4K_DP4A_BIN");
+                    const bool          q4k_dp4a_bin = backend_ctx->kernel_gemm_moe_q4_k_q8_1_dp4a_bin != nullptr && ggml_cl_moe_qk_dp4a_bin_on("GGML_OPENCL_MOE_Q4K_DP4A_BIN", false);
                     const bool          q4k_rb2_ok = !q4k_dp4a_bin && backend_ctx->kernel_gemm_moe_q4_k_q8_1_dp4a_rb2 != nullptr && (ne01 % 128) == 0;
                     const bool          use_moe_dp4a = q4k_moe_dp4a_env
                         ? (atoi(q4k_moe_dp4a_env) != 0)
@@ -53394,8 +53397,8 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     // DEFAULT ON for X1E + X2E (X1 MoE dp4a win confirmed post-fa604e60e
                     // vec-acc, with q4_K MoE; dense dp4a stays X2-only). Env forces either way.
                     static const char * q6k_moe_dp4a_env = getenv("GGML_OPENCL_Q6K_MOE_DP4A");
-                    // prebuilt q6_K dp4a GEMM (kernel library 0.0.14+), GGML_OPENCL_MOE_QK_DP4A_BIN=1
-                    const bool          q6k_dp4a_bin = backend_ctx->kernel_gemm_moe_q6_k_q8_1_dp4a_bin != nullptr && ggml_cl_moe_qk_dp4a_bin_on("GGML_OPENCL_MOE_Q6K_DP4A_BIN");
+                    // prebuilt q6_K dp4a GEMM (kernel library 0.0.14+), on by default
+                    const bool          q6k_dp4a_bin = backend_ctx->kernel_gemm_moe_q6_k_q8_1_dp4a_bin != nullptr && ggml_cl_moe_qk_dp4a_bin_on("GGML_OPENCL_MOE_Q6K_DP4A_BIN", true);
                     // adreno_dp4a_moe() already folds in dp4a availability
                     // (ADRENO && has_integer_dot_product), so upstream's separate
                     // "dot prod has to be available" guard is redundant here. Its
