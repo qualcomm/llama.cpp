@@ -1710,6 +1710,8 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemv_moe_mxfp4_f32_ns_glu_wimg = nullptr;  // weight-as-texture variant
     cl_kernel kernel_gemm_moe_mxfp4_q8_1_dp4a_bin = nullptr;   // binary dp4a (int8) mxfp4 MoE prefill GEMM
     cl_kernel kernel_gemm_moe_q4_0_q8_1_dp4a_bin = nullptr;    // binary dp4a (int8) q4_0 MoE prefill GEMM
+    cl_kernel kernel_gemm_moe_q4_k_q8_1_dp4a_bin = nullptr;   // binary dp4a (int8) q4_k MoE prefill GEMM
+    cl_kernel kernel_gemm_moe_q6_k_q8_1_dp4a_bin = nullptr;    // binary dp4a (int8) q6_k MoE prefill GEMM
     cl_kernel kernel_moe_reorder_b;
     cl_kernel kernel_moe_histogram, kernel_moe_scan, kernel_moe_fill, kernel_moe_scatter;
     cl_kernel kernel_moe_scatter_det = nullptr;      // diagnostic: deterministic slot assignment
@@ -10869,6 +10871,24 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         GGML_LOG_CONT(".");
     }
 
+    // gemm_moe_q4_k_q8_1_dp4a_bin (dp4a prefill GEMM)
+    if (backend_ctx->has_integer_dot_product) {
+        size_t bin_size = 0;
+        backend_ctx->kernel_gemm_moe_q4_k_q8_1_dp4a_bin = nullptr;
+
+        if (use_adreno_bin_kernels(backend_ctx)) {
+            const char * kernel_bin = (const char *)backend_ctx->get_adreno_bin_kernel("gemm_moe_q4_k_q8_1_dp4a_ila", &bin_size);
+            if (kernel_bin && bin_size > 0) {
+                cl_program prog =
+                    build_program_from_binary(backend_ctx->context, backend_ctx->device, kernel_bin, CL_moe_compile_opts, bin_size);
+
+                CL_CHECK((backend_ctx->kernel_gemm_moe_q4_k_q8_1_dp4a_bin = clCreateKernel(prog, "kernel_gemm_moe_q4_k_q8_1_dp4a_ila", &err), err));
+                CL_CHECK(clReleaseProgram(prog));
+                GGML_LOG_CONT(".");
+            }
+        }
+    }
+
     // gemm_moe_mxfp4_q8_1_dp4a (dp4a prefill GEMM)
     if (backend_ctx->has_integer_dot_product) {
 #ifdef GGML_OPENCL_EMBED_KERNELS
@@ -11106,6 +11126,24 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         CL_CHECK((backend_ctx->kernel_gemm_moe_q6_k_q8_1_dp4a = clCreateKernel(prog, "kernel_gemm_moe_q6_k_q8_1_dp4a", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
+    }
+
+    // gemm_moe_q6_k_q8_1_dp4a_bin (dp4a prefill GEMM)
+    if (backend_ctx->has_integer_dot_product) {
+        size_t bin_size = 0;
+        backend_ctx->kernel_gemm_moe_q6_k_q8_1_dp4a_bin = nullptr;
+
+        if (use_adreno_bin_kernels(backend_ctx)) {
+            const char * kernel_bin = (const char *)backend_ctx->get_adreno_bin_kernel("gemm_moe_q6_k_q8_1_dp4a_ila", &bin_size);
+            if (kernel_bin && bin_size > 0) {
+                cl_program prog =
+                    build_program_from_binary(backend_ctx->context, backend_ctx->device, kernel_bin, CL_moe_compile_opts, bin_size);
+
+                CL_CHECK((backend_ctx->kernel_gemm_moe_q6_k_q8_1_dp4a_bin = clCreateKernel(prog, "kernel_gemm_moe_q6_k_q8_1_dp4a_ila", &err), err));
+                CL_CHECK(clReleaseProgram(prog));
+                GGML_LOG_CONT(".");
+            }
+        }
     }
 
     // gemv_moe_mxfp4_f32_ns
@@ -16162,6 +16200,14 @@ static bool ggml_opencl_can_fuse_moe_combine(const struct ggml_cgraph * cgraph, 
 
     *out_final_add = final_add;
     return true;
+}
+
+// The prebuilt q4_K / q6_K MoE dp4a GEMMs of kernel library 0.0.14 replace the source
+// dp4a GEMMs when selected. Off by default: on the X2-90 the source path is faster
+// (see the A/B in the commit). GGML_OPENCL_MOE_QK_DP4A_BIN=1 selects them.
+static bool ggml_cl_moe_qk_dp4a_bin_on() {
+    static const char * e = getenv("GGML_OPENCL_MOE_QK_DP4A_BIN");
+    return e && *e && atoi(e) != 0;
 }
 
 static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
@@ -52795,11 +52841,13 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     // that build cannot run (ne01 % 128 != 0, or GGML_OPENCL_MOE_RB2=0) the bin
                     // kernel keeps the shape. GGML_OPENCL_Q4K_MOE_DP4A=0/1 forces either way.
                     static const char * q4k_moe_dp4a_env = getenv("GGML_OPENCL_Q4K_MOE_DP4A");
-                    const bool          q4k_rb2_ok = backend_ctx->kernel_gemm_moe_q4_k_q8_1_dp4a_rb2 != nullptr && (ne01 % 128) == 0;
+                    // prebuilt q4_K dp4a GEMM (kernel library 0.0.14+), GGML_OPENCL_MOE_QK_DP4A_BIN=1
+                    const bool          q4k_dp4a_bin = backend_ctx->kernel_gemm_moe_q4_k_q8_1_dp4a_bin != nullptr && ggml_cl_moe_qk_dp4a_bin_on();
+                    const bool          q4k_rb2_ok = !q4k_dp4a_bin && backend_ctx->kernel_gemm_moe_q4_k_q8_1_dp4a_rb2 != nullptr && (ne01 % 128) == 0;
                     const bool          use_moe_dp4a = q4k_moe_dp4a_env
                         ? (atoi(q4k_moe_dp4a_env) != 0)
                         : (backend_ctx->adreno_dp4a_moe()
-                           && (backend_ctx->kernel_gemm_moe_q4_k_f32_ns_bin == nullptr || q4k_rb2_ok));
+                           && (backend_ctx->kernel_gemm_moe_q4_k_f32_ns_bin == nullptr || q4k_rb2_ok || q4k_dp4a_bin));
 
                     // GGML_OPENCL_MOE_DISPATCH_LOG=1 names the kernel that fired, once per
                     // distinct (rows, routings).
@@ -52811,7 +52859,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                             last_logged = key;
                             GGML_LOG_INFO("ggml_opencl: mul_mat_id q4_K gemm ne01=%d routings=%d -> %s\n",
                                           (int)ne01, (int)(ne20 * ne21),
-                                          use_moe_dp4a ? (q4k_rb2_ok ? "dp4a-rb2" : "dp4a")
+                                          use_moe_dp4a ? (q4k_dp4a_bin ? "dp4a-bin" : q4k_rb2_ok ? "dp4a-rb2" : "dp4a")
                                                        : (backend_ctx->kernel_gemm_moe_q4_k_f32_ns_bin ? "ila-bin" : "source-ns"));
                         }
                     }
@@ -52916,7 +52964,9 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
 
                         // dp4a GEMM
                         const bool rb2 = q4k_rb2_ok;
-                        cl_kernel dk = rb2 ? backend_ctx->kernel_gemm_moe_q4_k_q8_1_dp4a_rb2 : backend_ctx->kernel_gemm_moe_q4_k_q8_1_dp4a;
+                        cl_kernel dk = q4k_dp4a_bin ? backend_ctx->kernel_gemm_moe_q4_k_q8_1_dp4a_bin
+                                     : rb2          ? backend_ctx->kernel_gemm_moe_q4_k_q8_1_dp4a_rb2
+                                                    : backend_ctx->kernel_gemm_moe_q4_k_q8_1_dp4a;
                         int aidx = 0;
                         CL_CHECK(clSetKernelArg(dk, aidx++, sizeof(cl_mem), &extra0_q4_K->q_img));
                         CL_CHECK(clSetKernelArg(dk, aidx++, sizeof(cl_mem), &extra0_q4_K->d));
@@ -53339,6 +53389,8 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     // DEFAULT ON for X1E + X2E (X1 MoE dp4a win confirmed post-fa604e60e
                     // vec-acc, with q4_K MoE; dense dp4a stays X2-only). Env forces either way.
                     static const char * q6k_moe_dp4a_env = getenv("GGML_OPENCL_Q6K_MOE_DP4A");
+                    // prebuilt q6_K dp4a GEMM (kernel library 0.0.14+), GGML_OPENCL_MOE_QK_DP4A_BIN=1
+                    const bool          q6k_dp4a_bin = backend_ctx->kernel_gemm_moe_q6_k_q8_1_dp4a_bin != nullptr && ggml_cl_moe_qk_dp4a_bin_on();
                     // adreno_dp4a_moe() already folds in dp4a availability
                     // (ADRENO && has_integer_dot_product), so upstream's separate
                     // "dot prod has to be available" guard is redundant here. Its
@@ -53346,8 +53398,9 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     const bool          use_q6k_dp4a = (q6k_moe_dp4a_env
                         ? (atoi(q6k_moe_dp4a_env) != 0)
                         : backend_ctx->adreno_dp4a_moe())
-                        // bin kernel takes precedence (from upstream)
-                        && backend_ctx->kernel_gemm_moe_q6_k_f32_ns_bin == nullptr;
+                        // bin kernel takes precedence (from upstream), unless the prebuilt
+                        // q6_K dp4a GEMM is selected
+                        && (backend_ctx->kernel_gemm_moe_q6_k_f32_ns_bin == nullptr || q6k_dp4a_bin);
 
                     cl_buffer_region region;
                     region.origin = 0;
@@ -53449,6 +53502,10 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                         backend_ctx->enqueue_ndrange_kernel(rq, 2, rq_global, rq_local, dst);
 
                         cl_kernel dk = backend_ctx->kernel_gemm_moe_q6_k_q8_1_dp4a;
+                        if (q6k_dp4a_bin) {
+                            dk = backend_ctx->kernel_gemm_moe_q6_k_q8_1_dp4a_bin;
+                        }
+
                         int qi = 0;
                         CL_CHECK(clSetKernelArg(dk, qi++, sizeof(cl_mem), &extra0_q6_K->ql_img));
                         CL_CHECK(clSetKernelArg(dk, qi++, sizeof(cl_mem), &extra0_q6_K->qh));
