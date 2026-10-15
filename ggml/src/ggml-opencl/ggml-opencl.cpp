@@ -14263,6 +14263,15 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
     backend_ctx->driver_version = driver_version.data();
 
     backend_ctx->adreno_cl_compiler_version = get_adreno_cl_compiler_version(driver_version.data());
+    // Later Adreno 850 (art) drivers report the compiler as a changelist ("build: 900.0
+    // Compiler 7327125/3") rather than "E17.51.xx", which leaves the version unparsed and
+    // every E17 workaround off: the head-size-256 flash-attention programs then fail to
+    // build and decode aborts on the missing kernel. It is the same compiler family, so
+    // treat an unparsed 850 as E17.
+    if (backend_ctx->gpu_family == GPU_FAMILY::ADRENO && backend_ctx->adreno_cl_compiler_version.major < 0 &&
+        strstr(backend_ctx->device_name.c_str(), "850")) {
+        backend_ctx->adreno_cl_compiler_version = { ADRENO_CL_COMPILER_TYPE::E17, -1, -1, -1 };
+    }
 
     ggml_cl_quiesce_omp_threads(backend_ctx.get());
 
