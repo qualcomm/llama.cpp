@@ -631,3 +631,132 @@ __kernel void kernel_gemv_moe_q4_k_f32_ns_glu_wimg(
         dst[i01 + i20 * n_ff] = moe_glu_apply(glu_op, gate_sum, up_sum);
     }
 }
+
+// Merged gate_up GLU GEMV, contiguous-chunk variant. Same layout and math as
+// kernel_gemv_moe_q4_k_f32_ns_glu, but each subgroup takes a contiguous run of the row's
+// 32-element sub-blocks instead of every 4th one, so it walks whole super-blocks: the
+// row's 12 scale bytes are fetched once per super-block (one vload3) and decoded for all
+// 8 sub-blocks, instead of being re-read per sub-block from addresses a row (120 B at
+// K=2560) apart across the lanes. Summation order differs from the per-op path.
+static inline float moe_q4k_row_dot_cs(
+        global const uint  * q,
+        global const half  * d,
+        global const half  * dm,
+        global const uchar * s,
+        __read_only image1d_buffer_t src1,
+        uint row, uint ne00, uint ne01, uint expert_id,
+        uint expert_q_offset, uint expert_d_offset, uint scales_per_row,
+        uint i11, uint ib_lo, uint ib_hi) {
+    float sum = 0.0f;
+    for (uint sb = ib_lo / 8; sb * 8 < ib_hi; ++sb) {
+        const float dv  = (float) d [expert_d_offset + sb * ne01 + row];
+        const float dmv = (float) dm[expert_d_offset + sb * ne01 + row];
+        const uint3 sv  = vload3(0, (global const uint *)(s + (expert_id * ne01 + row) * scales_per_row + sb * K_SCALE_SIZE));
+        uchar b[12];
+        vstore4(as_uchar4(sv.x), 0, b);
+        vstore4(as_uchar4(sv.y), 1, b);
+        vstore4(as_uchar4(sv.z), 2, b);
+
+        #pragma unroll
+        for (uint j = 0; j < 8; ++j) {
+            const uint ib = sb * 8 + j;
+            if (ib < ib_lo || ib >= ib_hi) {
+                continue;
+            }
+            uchar sc, mn;
+            if (j < 4) {
+                sc = b[j] & 63;
+                mn = b[j + 4] & 63;
+            } else {
+                sc = (b[j + 4] & 0x0F) | ((b[j - 4] & 0xC0) >> 2);
+                mn = ((b[j + 4] >> 4) & 0x0F) | ((b[j] & 0xC0) >> 2);
+            }
+            const float scale = dv  * (float) sc;
+            const float minv  = dmv * (float) mn;
+
+            const uint q_base = expert_q_offset + ib * ne01 * 4 + row;
+            uint4 regQ;
+            regQ.s0 = q[q_base];
+            regQ.s1 = q[q_base + ne01];
+            regQ.s2 = q[q_base + ne01 * 2];
+            regQ.s3 = q[q_base + ne01 * 3];
+            const uint y_offset = i11 * ne00 / 4 + ib * 8;
+
+            float8 fp32x8 = q4_k_to_fp32_packed8(as_ushort2(regQ.s0), scale, minv);
+            float4 acc = read_imagef(src1, (int)(y_offset + 0)) * fp32x8.lo;
+            acc       += read_imagef(src1, (int)(y_offset + 1)) * fp32x8.hi;
+            fp32x8 = q4_k_to_fp32_packed8(as_ushort2(regQ.s1), scale, minv);
+            acc       += read_imagef(src1, (int)(y_offset + 2)) * fp32x8.lo;
+            acc       += read_imagef(src1, (int)(y_offset + 3)) * fp32x8.hi;
+            fp32x8 = q4_k_to_fp32_packed8(as_ushort2(regQ.s2), scale, minv);
+            acc       += read_imagef(src1, (int)(y_offset + 4)) * fp32x8.lo;
+            acc       += read_imagef(src1, (int)(y_offset + 5)) * fp32x8.hi;
+            fp32x8 = q4_k_to_fp32_packed8(as_ushort2(regQ.s3), scale, minv);
+            acc       += read_imagef(src1, (int)(y_offset + 6)) * fp32x8.lo;
+            acc       += read_imagef(src1, (int)(y_offset + 7)) * fp32x8.hi;
+            sum += (acc.s0 + acc.s1) + (acc.s2 + acc.s3);
+        }
+    }
+    return sum;
+}
+
+__attribute__((qcom_reqd_sub_group_size("half")))
+__kernel void kernel_gemv_moe_q4_k_f32_ns_glu_cs(
+    __global uint *         src0_q,
+    __global half *         src0_d,
+    __global half *         src0_dm,
+    __global uchar *        src0_s,
+    __read_only image1d_buffer_t src1,
+    __global uint *         src2,
+    __global float *        dst,
+    ulong                   offsetd,
+    int                     ne00,    // K
+    int                     ne01,    // combined output rows = 2*n_ff
+    int                     ne11,
+    int                     n_ff,    // GLU output rows (= ne01/2)
+    int                     glu_op
+) {
+    uint i01  = get_global_id(0);
+    uint i20  = get_global_id(2);
+    uint sgid = get_local_id(1);
+    uint slid = get_sub_group_local_id();
+
+    // every lane reaches the barrier: clamp the tail rows and drop them at the store
+    const bool row_active = (i01 < (uint)n_ff);
+    if (!row_active) {
+        i01 = 0;
+    }
+
+    const uint i11       = i20 % ne11;
+    const uint expert_id = src2[i20];
+
+    const uint num_superblocks = ne00 / QK_K;
+    const uint num_subblocks   = ne00 / 32;
+    const uint scales_per_row  = num_superblocks * K_SCALE_SIZE;
+
+    const uint expert_q_offset = expert_id * (ne00 / 8) * ne01;
+    const uint expert_d_offset = expert_id * num_superblocks * ne01;
+
+    const uint per   = (num_subblocks + N_SIMDGROUP - 1) / N_SIMDGROUP;
+    const uint ib_lo = min(sgid * per, num_subblocks);
+    const uint ib_hi = min(ib_lo + per, num_subblocks);
+
+    float gate_sum = moe_q4k_row_dot_cs(src0_q, src0_d, src0_dm, src0_s, src1, i01,
+            ne00, ne01, expert_id, expert_q_offset, expert_d_offset, scales_per_row, i11, ib_lo, ib_hi);
+    float up_sum   = moe_q4k_row_dot_cs(src0_q, src0_d, src0_dm, src0_s, src1, i01 + (uint)n_ff,
+            ne00, ne01, expert_id, expert_q_offset, expert_d_offset, scales_per_row, i11, ib_lo, ib_hi);
+
+    __local float2 reduceLM[SIMDGROUP_WIDTH * (N_SIMDGROUP - 1)];
+    if (sgid != 0) reduceLM[SIMDGROUP_WIDTH * (sgid - 1) + slid] = (float2)(gate_sum, up_sum);
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (sgid == 0) {
+        for (int g = 0; g < N_SIMDGROUP - 1; ++g) {
+            gate_sum += reduceLM[SIMDGROUP_WIDTH * g + slid].s0;
+            up_sum   += reduceLM[SIMDGROUP_WIDTH * g + slid].s1;
+        }
+        dst = dst + (offsetd >> 2);
+        if (row_active) {
+            dst[i01 + i20 * n_ff] = moe_glu_apply(glu_op, gate_sum, up_sum);
+        }
+    }
+}

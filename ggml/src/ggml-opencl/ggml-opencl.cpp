@@ -1718,6 +1718,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemv_moe_q4_k_f32_ns_glu;   // fused combined-gate_up GEMV + GLU (MoE FFN)
     cl_kernel kernel_gemv_moe_q4_k_f32_ns_glu_wimg = nullptr;  // weight-as-texture variant
     cl_kernel kernel_gemv_moe_q4_k_f32_ns_glu2 = nullptr;      // fused separate gate/up GEMV + GLU (MoE FFN)
+    cl_kernel kernel_gemv_moe_q4_k_f32_ns_glu_cs = nullptr;    // merged gate_up GLU, contiguous K chunks per subgroup
     cl_kernel kernel_gemv_moe_q5_k_f32_ns, kernel_gemm_moe_q5_k_f32_ns;
     cl_kernel kernel_gemv_moe_q6_k_f32_ns, kernel_gemm_moe_q6_k_f32_ns, kernel_gemm_moe_q6_k_f32_ns_bin;
     cl_kernel kernel_gemm_moe_q6_k_q8_1_dp4a = nullptr;    // dp4a (int8) q6_K MoE prefill GEMM
@@ -10968,6 +10969,10 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         CL_CHECK((backend_ctx->kernel_gemv_moe_q4_k_f32_ns_wimg = clCreateKernel(prog, "kernel_gemv_moe_q4_k_f32_ns_wimg", &err), err));
         CL_CHECK((backend_ctx->kernel_gemv_moe_q4_k_f32_ns_glu_wimg = clCreateKernel(prog, "kernel_gemv_moe_q4_k_f32_ns_glu_wimg", &err), err));
         CL_CHECK((backend_ctx->kernel_gemv_moe_q4_k_f32_ns_glu2 = clCreateKernel(prog, "kernel_gemv_moe_q4_k_f32_ns_glu2", &err), err));
+        backend_ctx->kernel_gemv_moe_q4_k_f32_ns_glu_cs = clCreateKernel(prog, "kernel_gemv_moe_q4_k_f32_ns_glu_cs", &err);
+        if (err != CL_SUCCESS) {
+            backend_ctx->kernel_gemv_moe_q4_k_f32_ns_glu_cs = nullptr;
+        }
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
@@ -29605,6 +29610,14 @@ static void ggml_cl_mul_mat_id_q4_k_glu_fused(ggml_backend_t backend, ggml_tenso
         && extra0->q_img != nullptr;
     if (use_moe_decode_wimg) {
         kernel = backend_ctx->kernel_gemv_moe_q4_k_f32_ns_glu_wimg;
+    }
+    // GGML_OPENCL_MOE_GLU_CS=1: contiguous K chunks per subgroup, one scale fetch per super-block
+    static const bool moe_glu_cs = []{
+        const char * e = getenv("GGML_OPENCL_MOE_GLU_CS");
+        return e && e[0] == '1';
+    }();
+    if (!use_moe_decode_wimg && moe_glu_cs && backend_ctx->kernel_gemv_moe_q4_k_f32_ns_glu_cs != nullptr) {
+        kernel = backend_ctx->kernel_gemv_moe_q4_k_f32_ns_glu_cs;
     }
     int arg_idx = 0;
     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),    use_moe_decode_wimg ? &extra0->q_img : &extra0->q));
