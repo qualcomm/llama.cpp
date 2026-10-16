@@ -358,6 +358,7 @@ set(GGML_OPENCL_KERNELS
     sub
     sum_rows
     cumsum
+    fa_sparse
     transpose
     concat
     tsembd
