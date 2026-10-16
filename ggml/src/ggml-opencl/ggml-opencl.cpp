@@ -20213,8 +20213,17 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
             // That is verified for f16 KV at head size 128 only: other head sizes fail on E17
             // (40-96) or crash its compiler (192).
             if (adreno_art_compiler_quirks(backend_ctx)) {
-                if (!(dk == 128 && dv == 128 && q->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
-                      k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16)) {
+                const bool f16_kv = q->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                                    k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16;
+                // probe: head size 256 with the n_kv_max hint (qwen4exp QSA), which gathers the
+                // visible cells and runs the decomposed path over them
+                static const bool sparse256 = []{
+                    const char * e = getenv("GGML_OPENCL_E17_FA_SPARSE_256");
+                    return e && e[0] == '1';
+                }();
+                const bool sparse_ok = sparse256 && f16_kv && dk == 256 && dv == 256 &&
+                                       ggml_get_op_params_i32(op, 4) > 0;
+                if (!((dk == 128 && dv == 128 && f16_kv) || sparse_ok)) {
                     return false;
                 }
             } else if (backend_ctx->split_kernel_programs) {
