@@ -1579,7 +1579,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mv_q4_K_f32;
     cl_kernel kernel_mul_mv_q4_K_f32_flat;
     cl_kernel kernel_mul_mv_q4_K_f32_flat_ndst8 = nullptr; // small-m variant (Intel): N_DST=8 raises subgroup count/occupancy
-    cl_kernel kernel_mul_mv_q4_K_f32_flat_ndst4 = nullptr; // few-row variant (Adreno): N_DST=4 for weights of <= 256 rows
+    cl_kernel kernel_mul_mv_q4_K_f32_flat_ndst4 = nullptr; // few-row variant (Adreno): N_DST=4 for weights of <= 512 rows
     cl_kernel kernel_mul_mv_q4_k_q8_1 = nullptr;           // int8 q8_1 decode GEMV (Intel small-m, noshuffle weight)
     cl_kernel kernel_quant_a_q8_1_i = nullptr;             // activation f32->q8_1 (Intel; Adreno's is behind USE_ADRENO_KERNELS)
     // Persistent q8_1 activation scratch for the int8 decode GEMV — grown on demand
@@ -50963,7 +50963,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 ndst = 16;
                 static const int ndst4_max_rows = []{
                     const char * e = getenv("GGML_OPENCL_Q4K_NDST4_MAX_ROWS");
-                    return (e && e[0]) ? atoi(e) : 256;
+                    return (e && e[0]) ? atoi(e) : 512;
                 }();
                 if (ne01 <= ndst4_max_rows && backend_ctx->kernel_mul_mv_q4_K_f32_flat_ndst4 != nullptr) {
                     kernel = backend_ctx->kernel_mul_mv_q4_K_f32_flat_ndst4;
