@@ -7,16 +7,16 @@
 #include "htp-ops.h"
 
 struct htp_ssm_conv_kernel_params {
-    uint32_t n_threads;
+    uint32_t n_hvx;
     uint32_t d_conv;
     uint32_t d_inner;
     uint32_t n_t;
     uint32_t n_s;
     uint32_t d_inner_tile;
 
-    uint32_t vtcm_src0_size_per_thread;
-    uint32_t vtcm_src1_size_per_thread;
-    uint32_t vtcm_dst_size_per_thread;
+    uint32_t vtcm_src0_size_per_hvx;
+    uint32_t vtcm_src1_size_per_hvx;
+    uint32_t vtcm_dst_size_per_hvx;
 
     uint32_t vtcm_src0_size;
     uint32_t vtcm_src1_size;

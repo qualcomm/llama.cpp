@@ -13,8 +13,8 @@ enum htp_im2col_kernel_type {
 struct htp_im2col_vtcm_layout {
     uint32_t off_src;
     uint32_t off_dst;
-    uint32_t src_bytes_per_thread;
-    uint32_t dst_bytes_per_thread;
+    uint32_t src_bytes_per_hvx;
+    uint32_t dst_bytes_per_hvx;
     uint32_t total_bytes;
 };
 
@@ -22,27 +22,27 @@ static inline void htp_im2col_vtcm_layout_build(
     struct htp_im2col_vtcm_layout * layout,
     uint32_t src_row_bytes,
     uint32_t dst_row_bytes,
-    uint32_t n_threads) {
+    uint32_t n_hvx) {
 
-    layout->src_bytes_per_thread = 2 * src_row_bytes + 256;
-    layout->dst_bytes_per_thread = 2 * dst_row_bytes;
+    layout->src_bytes_per_hvx = 2 * src_row_bytes + 256;
+    layout->dst_bytes_per_hvx = 2 * dst_row_bytes;
 
     layout->off_src     = 0;
-    layout->off_dst     = layout->off_src + layout->src_bytes_per_thread * n_threads;
-    layout->total_bytes = layout->off_dst + layout->dst_bytes_per_thread * n_threads;
+    layout->off_dst     = layout->off_src + layout->src_bytes_per_hvx * n_hvx;
+    layout->total_bytes = layout->off_dst + layout->dst_bytes_per_hvx * n_hvx;
 }
 
 struct htp_im2col_kernel_params {
     uint8_t  kernel_type;
     uint8_t  is_2d;
     uint8_t  is_3d;
-    uint8_t  n_threads;
+    uint8_t  n_hvx;
 
     uint32_t vtcm_size;
     uint32_t off_src;
     uint32_t off_dst;
-    uint32_t src_bytes_per_thread;
-    uint32_t dst_bytes_per_thread;
+    uint32_t src_bytes_per_hvx;
+    uint32_t dst_bytes_per_hvx;
     uint32_t src_row_bytes;
     uint32_t dst_row_bytes;
 

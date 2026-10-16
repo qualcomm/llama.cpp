@@ -66,12 +66,12 @@ struct htp_rope_context {
     float theta_powers[32];
     float corr_dims[2];
 
-    uint32_t src0_nrows_per_thread;
+    uint32_t src0_nrows_per_hvx;
 
     struct htp_ops_context * octx;
 
     uint8_t * vtcm_base;
-    size_t    spad_per_thread;
+    size_t    spad_per_hvx;
     size_t    theta_cache_offset;
 
     size_t src0_row_size;
@@ -544,10 +544,10 @@ static void rope_job_f32(unsigned int nth, unsigned int ith, void * data) {
     htp_rope_preamble;
 
     const uint32_t src0_nrows = rctx->nrows;
-    const uint32_t src0_nrows_per_thread = rctx->src0_nrows_per_thread;
+    const uint32_t src0_nrows_per_hvx = rctx->src0_nrows_per_hvx;
 
-    const uint32_t src0_start_row = rctx->row_start + src0_nrows_per_thread * ith;
-    const uint32_t src0_end_row   = MIN(src0_start_row + src0_nrows_per_thread, rctx->row_start + src0_nrows);
+    const uint32_t src0_start_row = rctx->row_start + src0_nrows_per_hvx * ith;
+    const uint32_t src0_end_row   = MIN(src0_start_row + src0_nrows_per_hvx, rctx->row_start + src0_nrows);
 
     // no work for this thread
     if (src0_start_row >= src0_end_row) {
@@ -560,7 +560,7 @@ static void rope_job_f32(unsigned int nth, unsigned int ith, void * data) {
     const bool    is_vision = (mode == HTP_ROPE_TYPE_VISION);
 
     // VTCM setup
-    uint8_t * src0_spad_base = rctx->vtcm_base + (ith * rctx->spad_per_thread);
+    uint8_t * src0_spad_base = rctx->vtcm_base + (ith * rctx->spad_per_hvx);
     float *   theta_cache    = (float *) (src0_spad_base);
               src0_spad_base = src0_spad_base + rctx->theta_cache_offset;
 
@@ -710,7 +710,7 @@ static int execute_op_rope_f32(struct htp_ops_context * octx) {
     }
 
     const struct htp_rope_kernel_params * kparams = (const struct htp_rope_kernel_params *) octx->kernel_params;
-    if (!htp_ops_context_set_n_threads(octx, kparams->n_threads)) {
+    if (!htp_ops_context_set_n_hvx(octx, kparams->n_hvx)) {
         return HTP_STATUS_INVAL_PARAMS;
     }
     assert(octx->ctx->vtcm_size >= kparams->vtcm_size);
@@ -738,7 +738,7 @@ static int execute_op_rope_f32(struct htp_ops_context * octx) {
         return HTP_STATUS_OK;
     }
 
-    const uint32_t n_threads = octx->n_threads;
+    const uint32_t n_hvx = octx->n_hvx;
 
     const uint32_t ne0 = dst->ne[0];
     const size_t src0_row_size   = src0->ne[0] * sizeof(float);
@@ -751,7 +751,7 @@ static int execute_op_rope_f32(struct htp_ops_context * octx) {
 
     rctx.octx                  = octx;
     rctx.vtcm_base             = (uint8_t *) octx->ctx->vtcm_base;
-    rctx.spad_per_thread       = kparams->spad_per_thread;
+    rctx.spad_per_hvx          = kparams->spad_per_hvx;
     rctx.theta_cache_offset    = kparams->theta_cache_offset;
 
     if (src2) {
@@ -796,14 +796,14 @@ static int execute_op_rope_f32(struct htp_ops_context * octx) {
     rctx.src0_nrows            = nrows;
     rctx.nrows                 = nrows;
     rctx.row_start             = row_start;
-    rctx.src0_nrows_per_thread = fastdiv(nrows + n_threads - 1, &octx->n_threads_div);
+    rctx.src0_nrows_per_hvx    = fastdiv(nrows + n_hvx - 1, &octx->n_hvx_div);
     rctx.div_ne2_ne1           = kparams->div_ne2_ne1;
     rctx.div_ne1               = kparams->div_ne1;
 
     FARF(HIGH, "rope-f32 n-rows %u n-dims %d ne0 %u ext-factor %.6f theta-scale %.6f attn-factor %.6f\n", rctx.src0_nrows, rctx.n_dims, ne0,
          rctx.ext_factor, rctx.theta_scale, rctx.attn_factor);
 
-    work_queue_run(octx->ctx->work_queue, rope_job_f32, &rctx, n_threads);
+    work_queue_run(octx->ctx->hvx_queue, rope_job_f32, &rctx, n_hvx);
 
     return err;
 }

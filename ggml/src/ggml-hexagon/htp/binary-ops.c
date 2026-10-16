@@ -39,7 +39,7 @@ struct htp_binary_context {
     struct fastdiv_values src1_dim3_div; // ne13
 
     uint32_t block_max;
-    uint32_t nrows_per_thread;
+    uint32_t nrows_per_hvx;
     uint32_t total_rows;
     uint32_t row_start;
     size_t   src0_row_size_aligned;
@@ -269,16 +269,16 @@ static void binary_thread_scalar(unsigned int nth, unsigned int ith, void * data
     const size_t row_stride   = (size_t) ne11 * elem_size;
 
     const uint32_t row_size_bytes = bctx->row_size_bytes;
-    const uint32_t start_row = bctx->row_start + bctx->nrows_per_thread * ith;
-    const uint32_t end_row   = MIN(start_row + bctx->nrows_per_thread, bctx->row_start + bctx->total_rows);
+    const uint32_t start_row      = bctx->row_start + bctx->nrows_per_hvx * ith;
+    const uint32_t end_row        = MIN(start_row + bctx->nrows_per_hvx, bctx->row_start + bctx->total_rows);
     if (start_row >= end_row) return;
 
     FARF(HIGH, "binary-scalar: %d/%d (%u:%u) row-size %u (%u)",
          ith, nth, start_row, end_row, nb01, bctx->dst_row_size_aligned);
 
     const struct htp_binary_vtcm_layout * layout = &bctx->vtcm_layout;
-    uint8_t * src0_spad_base = VTCM_LAYOUT_PTR(uint8_t, bctx->vtcm_base, layout->off_src0) + (ith * layout->src0_bytes_per_thread);
-    uint8_t * dst_spad_base  = VTCM_LAYOUT_PTR(uint8_t, bctx->vtcm_base, layout->off_dst)  + (ith * layout->dst_bytes_per_thread);
+    uint8_t * src0_spad_base = VTCM_LAYOUT_PTR(uint8_t, bctx->vtcm_base, layout->off_src0) + (ith * layout->src0_bytes_per_hvx);
+    uint8_t * dst_spad_base  = VTCM_LAYOUT_PTR(uint8_t, bctx->vtcm_base, layout->off_dst)  + (ith * layout->dst_bytes_per_hvx);
     size_t src0_spad_half    = layout->src0_spad_half_size;
     size_t dst_spad_half     = layout->dst_spad_half_size;
     const void * s1_table    = VTCM_LAYOUT_PTR(const void, bctx->vtcm_base, layout->off_src1);
@@ -363,17 +363,17 @@ static void binary_thread_vector_same_shape(unsigned int nth, unsigned int ith, 
     htp_binary_preamble;
 
     const uint32_t row_size_bytes = bctx->row_size_bytes;
-    const uint32_t start_row = bctx->row_start + bctx->nrows_per_thread * ith;
-    const uint32_t end_row   = MIN(start_row + bctx->nrows_per_thread, bctx->row_start + bctx->total_rows);
+    const uint32_t start_row      = bctx->row_start + bctx->nrows_per_hvx * ith;
+    const uint32_t end_row        = MIN(start_row + bctx->nrows_per_hvx, bctx->row_start + bctx->total_rows);
     if (start_row >= end_row) return;
 
     FARF(HIGH, "binary-same-shape: %d/%d (%u:%u) row-size %u (%u)",
          ith, nth, start_row, end_row, nb01, bctx->dst_row_size_aligned);
 
     const struct htp_binary_vtcm_layout * layout = &bctx->vtcm_layout;
-    uint8_t * src0_spad_base = VTCM_LAYOUT_PTR(uint8_t, bctx->vtcm_base, layout->off_src0) + (ith * layout->src0_bytes_per_thread);
-    uint8_t * src1_spad_base = VTCM_LAYOUT_PTR(uint8_t, bctx->vtcm_base, layout->off_src1) + (ith * layout->src1_bytes_per_thread);
-    uint8_t * dst_spad_base  = VTCM_LAYOUT_PTR(uint8_t, bctx->vtcm_base, layout->off_dst)  + (ith * layout->dst_bytes_per_thread);
+    uint8_t * src0_spad_base = VTCM_LAYOUT_PTR(uint8_t, bctx->vtcm_base, layout->off_src0) + (ith * layout->src0_bytes_per_hvx);
+    uint8_t * src1_spad_base = VTCM_LAYOUT_PTR(uint8_t, bctx->vtcm_base, layout->off_src1) + (ith * layout->src1_bytes_per_hvx);
+    uint8_t * dst_spad_base  = VTCM_LAYOUT_PTR(uint8_t, bctx->vtcm_base, layout->off_dst)  + (ith * layout->dst_bytes_per_hvx);
 
     size_t src0_spad_half = layout->src0_spad_half_size;
     size_t src1_spad_half = layout->src1_spad_half_size;
@@ -465,16 +465,16 @@ static void binary_thread_vector_row_broadcast(unsigned int nth, unsigned int it
     htp_binary_preamble;
 
     const uint32_t row_size_bytes = bctx->row_size_bytes;
-    const uint32_t start_row  = bctx->row_start + bctx->nrows_per_thread * ith;
-    const uint32_t end_row    = MIN(start_row + bctx->nrows_per_thread, bctx->row_start + bctx->total_rows);
+    const uint32_t start_row      = bctx->row_start + bctx->nrows_per_hvx * ith;
+    const uint32_t end_row        = MIN(start_row + bctx->nrows_per_hvx, bctx->row_start + bctx->total_rows);
     if (start_row >= end_row) return;
 
     FARF(HIGH, "binary-row-bcast: %d/%d (%u:%u) row-size %u (%u)",
          ith, nth, start_row, end_row, nb01, bctx->dst_row_size_aligned);
 
     const struct htp_binary_vtcm_layout * layout = &bctx->vtcm_layout;
-    uint8_t * src0_spad_base = VTCM_LAYOUT_PTR(uint8_t, bctx->vtcm_base, layout->off_src0) + (ith * layout->src0_bytes_per_thread);
-    uint8_t * dst_spad_base  = VTCM_LAYOUT_PTR(uint8_t, bctx->vtcm_base, layout->off_dst)  + (ith * layout->dst_bytes_per_thread);
+    uint8_t * src0_spad_base = VTCM_LAYOUT_PTR(uint8_t, bctx->vtcm_base, layout->off_src0) + (ith * layout->src0_bytes_per_hvx);
+    uint8_t * dst_spad_base  = VTCM_LAYOUT_PTR(uint8_t, bctx->vtcm_base, layout->off_dst)  + (ith * layout->dst_bytes_per_hvx);
 
     size_t src0_spad_half = layout->src0_spad_half_size;
     size_t dst_spad_half  = layout->dst_spad_half_size;
@@ -548,16 +548,16 @@ static void binary_thread_vector_complex(unsigned int nth, unsigned int ith, voi
     htp_binary_preamble;
 
     const uint32_t row_size_bytes = bctx->row_size_bytes;
-    const uint32_t start_row  = bctx->row_start + bctx->nrows_per_thread * ith;
-    const uint32_t end_row    = MIN(start_row + bctx->nrows_per_thread, bctx->row_start + bctx->total_rows);
+    const uint32_t start_row      = bctx->row_start + bctx->nrows_per_hvx * ith;
+    const uint32_t end_row        = MIN(start_row + bctx->nrows_per_hvx, bctx->row_start + bctx->total_rows);
     if (start_row >= end_row) return;
 
     FARF(HIGH, "binary-complex: %d/%d (%u:%u) row-size %u (%u)",
          ith, nth, start_row, end_row, nb01, bctx->dst_row_size_aligned);
 
     const struct htp_binary_vtcm_layout * layout = &bctx->vtcm_layout;
-    uint8_t * src0_spad_base = VTCM_LAYOUT_PTR(uint8_t, bctx->vtcm_base, layout->off_src0) + (ith * layout->src0_bytes_per_thread);
-    uint8_t * dst_spad_base  = VTCM_LAYOUT_PTR(uint8_t, bctx->vtcm_base, layout->off_dst)  + (ith * layout->dst_bytes_per_thread);
+    uint8_t * src0_spad_base = VTCM_LAYOUT_PTR(uint8_t, bctx->vtcm_base, layout->off_src0) + (ith * layout->src0_bytes_per_hvx);
+    uint8_t * dst_spad_base  = VTCM_LAYOUT_PTR(uint8_t, bctx->vtcm_base, layout->off_dst)  + (ith * layout->dst_bytes_per_hvx);
     size_t src0_spad_half    = layout->src0_spad_half_size;
     size_t dst_spad_half     = layout->dst_spad_half_size;
     const uint8_t * vtcm_src1 = VTCM_LAYOUT_PTR(const uint8_t, bctx->vtcm_base, layout->off_src1);
@@ -639,13 +639,13 @@ static void binary_thread_element_repeat(unsigned int nth, unsigned int ith, voi
     htp_binary_preamble;
 
     const uint32_t row_size_bytes = bctx->row_size_bytes;
-    const uint32_t start_row  = bctx->row_start + bctx->nrows_per_thread * ith;
-    const uint32_t end_row    = MIN(start_row + bctx->nrows_per_thread, bctx->row_start + bctx->total_rows);
+    const uint32_t start_row      = bctx->row_start + bctx->nrows_per_hvx * ith;
+    const uint32_t end_row        = MIN(start_row + bctx->nrows_per_hvx, bctx->row_start + bctx->total_rows);
     if (start_row >= end_row) return;
 
     const struct htp_binary_vtcm_layout * layout = &bctx->vtcm_layout;
-    uint8_t * src0_spad_base = VTCM_LAYOUT_PTR(uint8_t, bctx->vtcm_base, layout->off_src0) + (ith * layout->src0_bytes_per_thread);
-    uint8_t * dst_spad_base  = VTCM_LAYOUT_PTR(uint8_t, bctx->vtcm_base, layout->off_dst)  + (ith * layout->dst_bytes_per_thread);
+    uint8_t * src0_spad_base = VTCM_LAYOUT_PTR(uint8_t, bctx->vtcm_base, layout->off_src0) + (ith * layout->src0_bytes_per_hvx);
+    uint8_t * dst_spad_base  = VTCM_LAYOUT_PTR(uint8_t, bctx->vtcm_base, layout->off_dst)  + (ith * layout->dst_bytes_per_hvx);
     size_t src0_spad_half    = layout->src0_spad_half_size;
     size_t dst_spad_half     = layout->dst_spad_half_size;
     const uint8_t * vtcm_src1 = VTCM_LAYOUT_PTR(const uint8_t, bctx->vtcm_base, layout->off_src1);
@@ -747,13 +747,13 @@ static void binary_thread_add_id_f32(unsigned int nth, unsigned int ith, void * 
     const uint32_t nb3 = dst->nb[3];
 
     const uint32_t row_size_bytes = bctx->row_size_bytes;
-    const uint32_t start_row = bctx->row_start + bctx->nrows_per_thread * ith;
-    const uint32_t end_row   = MIN(start_row + bctx->nrows_per_thread, bctx->row_start + bctx->total_rows);
+    const uint32_t start_row      = bctx->row_start + bctx->nrows_per_hvx * ith;
+    const uint32_t end_row        = MIN(start_row + bctx->nrows_per_hvx, bctx->row_start + bctx->total_rows);
     if (start_row >= end_row) return;
 
     const struct htp_binary_vtcm_layout * layout = &bctx->vtcm_layout;
-    uint8_t * src0_spad_base = VTCM_LAYOUT_PTR(uint8_t, bctx->vtcm_base, layout->off_src0) + (ith * layout->src0_bytes_per_thread);
-    uint8_t * dst_spad_base  = VTCM_LAYOUT_PTR(uint8_t, bctx->vtcm_base, layout->off_dst)  + (ith * layout->dst_bytes_per_thread);
+    uint8_t * src0_spad_base = VTCM_LAYOUT_PTR(uint8_t, bctx->vtcm_base, layout->off_src0) + (ith * layout->src0_bytes_per_hvx);
+    uint8_t * dst_spad_base  = VTCM_LAYOUT_PTR(uint8_t, bctx->vtcm_base, layout->off_dst)  + (ith * layout->dst_bytes_per_hvx);
     const uint8_t * vtcm_src1 = VTCM_LAYOUT_PTR(const uint8_t, bctx->vtcm_base, layout->off_src1);
     const int32_t * vtcm_src2 = VTCM_LAYOUT_PTR(const int32_t, bctx->vtcm_base, layout->off_src2);
     size_t src0_spad_half    = layout->src0_spad_half_size;
@@ -857,7 +857,7 @@ struct binary_chunked_context {
     uint32_t                 elem_start;
     uint32_t                 nelem;
     uint32_t                 chunk_size;
-    uint32_t                 chunks_per_thread;
+    uint32_t                 chunks_per_hvx;
     uint32_t                 total_chunks;
     bool                     is_scalar;
     float                    scalar_f32;
@@ -875,8 +875,8 @@ static void binary_thread_chunked(unsigned int nth, unsigned int ith, void * dat
     const struct htp_tensor * src1 = octx->src[1];
     const struct htp_tensor * dst  = octx->dst;
 
-    const uint32_t start_chunk = ctx->chunks_per_thread * ith;
-    const uint32_t end_chunk   = MIN(start_chunk + ctx->chunks_per_thread, ctx->total_chunks);
+    const uint32_t start_chunk = ctx->chunks_per_hvx * ith;
+    const uint32_t end_chunk   = MIN(start_chunk + ctx->chunks_per_hvx, ctx->total_chunks);
     if (start_chunk >= end_chunk) {
         return;
     }
@@ -890,9 +890,9 @@ static void binary_thread_chunked(unsigned int nth, unsigned int ith, void * dat
          ith, nth, start_chunk, end_chunk, ctx->total_chunks, ctx->nelem);
 
     const struct htp_binary_vtcm_layout * layout = &ctx->vtcm_layout;
-    uint8_t * src0_spad_base = VTCM_LAYOUT_PTR(uint8_t, ctx->vtcm_base, layout->off_src0) + (ith * layout->src0_bytes_per_thread);
-    uint8_t * src1_spad_base = ctx->is_scalar ? NULL : (VTCM_LAYOUT_PTR(uint8_t, ctx->vtcm_base, layout->off_src1) + (ith * layout->src1_bytes_per_thread));
-    uint8_t * dst_spad_base  = VTCM_LAYOUT_PTR(uint8_t, ctx->vtcm_base, layout->off_dst)  + (ith * layout->dst_bytes_per_thread);
+    uint8_t * src0_spad_base = VTCM_LAYOUT_PTR(uint8_t, ctx->vtcm_base, layout->off_src0) + (ith * layout->src0_bytes_per_hvx);
+    uint8_t * src1_spad_base = ctx->is_scalar ? NULL : (VTCM_LAYOUT_PTR(uint8_t, ctx->vtcm_base, layout->off_src1) + (ith * layout->src1_bytes_per_hvx));
+    uint8_t * dst_spad_base  = VTCM_LAYOUT_PTR(uint8_t, ctx->vtcm_base, layout->off_dst)  + (ith * layout->dst_bytes_per_hvx);
 
     dma_queue * dma_q = octx->ctx->dma[ith];
     uint32_t prefetch_chunk = start_chunk;
@@ -1062,7 +1062,7 @@ static int execute_op_binary(struct htp_ops_context * octx) {
             return HTP_STATUS_OK;
         }
 
-        if (!htp_ops_context_set_n_threads(octx, kparams->n_threads)) {
+        if (!htp_ops_context_set_n_hvx(octx, kparams->n_hvx)) {
             return HTP_STATUS_INVAL_PARAMS;
         }
 
@@ -1074,8 +1074,8 @@ static int execute_op_binary(struct htp_ops_context * octx) {
 
         const uint32_t chunk_size = kparams->chunk_size > 0 ? kparams->chunk_size : (32768 / elem_size);
         const uint32_t total_chunks = (nelem + chunk_size - 1) / chunk_size;
-        const uint32_t n_threads = (total_chunks >= 2) ? MIN(octx->n_threads, total_chunks) : 1;
-        const uint32_t chunks_per_thread = (total_chunks + n_threads - 1) / n_threads;
+        const uint32_t n_hvx = (total_chunks >= 2) ? MIN(octx->n_hvx, total_chunks) : 1;
+        const uint32_t chunks_per_hvx = (total_chunks + n_hvx - 1) / n_hvx;
 
         float scalar_f32 = 0.0f;
         _Float16 scalar_f16 = 0;
@@ -1093,23 +1093,23 @@ static int execute_op_binary(struct htp_ops_context * octx) {
         }
 
         struct binary_chunked_context cctx = {
-            .octx                = octx,
-            .vtcm_layout         = vtcm_layout,
-            .vtcm_base           = (uint8_t *) octx->ctx->vtcm_base,
-            .elem_start          = elem_start,
-            .nelem               = nelem,
-            .chunk_size          = chunk_size,
-            .chunks_per_thread   = chunks_per_thread,
-            .total_chunks        = total_chunks,
-            .is_scalar           = is_scalar,
-            .scalar_f32          = scalar_f32,
-            .scalar_f16          = scalar_f16,
-            .compute             = compute,
-            .compute_scalar_f32  = compute_scalar_f32,
-            .compute_scalar_f16  = compute_scalar_f16,
+            .octx                          = octx,
+            .vtcm_layout                   = vtcm_layout,
+            .vtcm_base                     = (uint8_t *) octx->ctx->vtcm_base,
+            .elem_start                    = elem_start,
+            .nelem                         = nelem,
+            .chunk_size                    = chunk_size,
+            .chunks_per_hvx                = chunks_per_hvx,
+            .total_chunks                  = total_chunks,
+            .is_scalar                     = is_scalar,
+            .scalar_f32                    = scalar_f32,
+            .scalar_f16                    = scalar_f16,
+            .compute                       = compute,
+            .compute_scalar_f32            = compute_scalar_f32,
+            .compute_scalar_f16            = compute_scalar_f16,
         };
 
-        work_queue_run(octx->ctx->work_queue, binary_thread_chunked, &cctx, n_threads);
+        work_queue_run(octx->ctx->hvx_queue, binary_thread_chunked, &cctx, n_hvx);
         return HTP_STATUS_OK;
     }
 
@@ -1129,11 +1129,11 @@ static int execute_op_binary(struct htp_ops_context * octx) {
         return HTP_STATUS_OK;
     }
 
-    if (!htp_ops_context_set_n_threads(octx, kparams->n_threads)) {
+    if (!htp_ops_context_set_n_hvx(octx, kparams->n_hvx)) {
         return HTP_STATUS_INVAL_PARAMS;
     }
 
-    const uint32_t n_threads = octx->n_threads;
+    const uint32_t n_hvx               = octx->n_hvx;
     const size_t src0_row_size_aligned = kparams->src0_row_size_aligned;
     const size_t src1_row_size_aligned = kparams->src1_row_size_aligned;
     const size_t dst_row_size_aligned  = kparams->dst_row_size_aligned;
@@ -1185,7 +1185,7 @@ static int execute_op_binary(struct htp_ops_context * octx) {
     }
 
     bctx.octx                  = octx;
-    bctx.nrows_per_thread      = fastdiv(nrows + n_threads - 1, &octx->n_threads_div);
+    bctx.nrows_per_hvx         = fastdiv(nrows + n_hvx - 1, &octx->n_hvx_div);
     bctx.total_rows            = nrows;
     bctx.row_start             = row_start;
     bctx.block_max             = bctx.vtcm_layout.rows_per_buffer;
@@ -1205,7 +1205,7 @@ static int execute_op_binary(struct htp_ops_context * octx) {
     bctx.split_at_ne01  = kparams->split_at_ne01;
     bctx.split_at_ne02  = kparams->split_at_ne02;
 
-    worker_callback_t worker_func = NULL;
+    work_queue_func_t worker_func = NULL;
     void * compute_func = NULL;
 
     switch (kparams->kernel_type) {
@@ -1332,7 +1332,7 @@ static int execute_op_binary(struct htp_ops_context * octx) {
         dma_queue_flush(dma_q);
     }
 
-    work_queue_run(octx->ctx->work_queue, worker_func, &bctx, n_threads);
+    work_queue_run(octx->ctx->hvx_queue, worker_func, &bctx, n_hvx);
 
     return HTP_STATUS_OK;
 }

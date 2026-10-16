@@ -36,7 +36,7 @@
 
 struct htp_fill_context {
     struct htp_ops_context * octx;
-    uint32_t nrows_per_thread;
+    uint32_t nrows_per_hvx;
     uint32_t total_rows;  // ne1 * ne2 * ne3
     uint32_t row_start;
     bool     opt_path;
@@ -50,8 +50,8 @@ static void fill_thread(unsigned int nth, unsigned int ith, void * data) {
     fill_preamble;
 
     // Parallelise over the flat row index spanning ne1*ne2*ne3
-    const uint32_t ir0 = fctx->row_start + fctx->nrows_per_thread * ith;
-    const uint32_t ir1 = MIN(ir0 + fctx->nrows_per_thread, fctx->row_start + fctx->total_rows);
+    const uint32_t ir0 = fctx->row_start + fctx->nrows_per_hvx * ith;
+    const uint32_t ir1 = MIN(ir0 + fctx->nrows_per_hvx, fctx->row_start + fctx->total_rows);
 
     if (ir0 >= ir1) {
         return;
@@ -108,7 +108,7 @@ int op_fill(struct htp_ops_context * octx) {
     }
 
     // nr = ne1*ne2*ne3 (flat row count across all outer dims); parallelise over it.
-    const uint32_t n_threads = octx->n_threads;
+    const uint32_t n_hvx = octx->n_hvx;
 
     // Optimize if fully contiguous: skip stride arithmetic, treat as flat array
     const bool opt_path = (nb2 == nb1 * ne1) && (nb3 == nb2 * ne2);
@@ -120,11 +120,11 @@ int op_fill(struct htp_ops_context * octx) {
     memcpy(&val_f32, &octx->op_params[0], sizeof(float));
 
     struct htp_fill_context fctx = {
-        .octx             = octx,
-        .nrows_per_thread = fastdiv(nrows + n_threads - 1, &octx->n_threads_div),
-        .total_rows       = nrows,
-        .row_start        = row_start,
-        .opt_path         = opt_path,
+        .octx                    = octx,
+        .nrows_per_hvx           = fastdiv(nrows + n_hvx - 1, &octx->n_hvx_div),
+        .total_rows              = nrows,
+        .row_start               = row_start,
+        .opt_path                = opt_path,
     };
 
     switch (dst->type) {
@@ -140,7 +140,7 @@ int op_fill(struct htp_ops_context * octx) {
         return HTP_STATUS_NO_SUPPORT;
     }
 
-    work_queue_run(octx->ctx->work_queue, fill_thread, &fctx, n_threads);
+    work_queue_run(octx->ctx->hvx_queue, fill_thread, &fctx, n_hvx);
 
     return HTP_STATUS_OK;
 }

@@ -87,7 +87,7 @@ struct htp_pad_context {
     int32_t  lp2, rp2;
     int32_t  lp3, rp3;
 
-    uint32_t nrows_per_thread;
+    uint32_t nrows_per_hvx;
     uint32_t total_dst_rows;
     uint32_t row_start;
 
@@ -100,42 +100,42 @@ struct htp_pad_context {
     size_t   dst_row_size_aligned;
 };
 
-#define htp_pad_preamble                                                             \
-    const struct htp_tensor * src = octx->src[0];                                    \
-    const struct htp_tensor * dst = octx->dst;                                       \
-                                                                                     \
-    const uint32_t ne00 = src->ne[0];                                                \
-    const uint32_t nb00 = src->nb[0];                                                \
-                                                                                     \
-    const uint32_t ne0 = dst->ne[0];                                                 \
-    const uint32_t ne1 = dst->ne[1];                                                 \
-    const uint32_t ne2 = dst->ne[2];                                                 \
-    const uint32_t ne3 = dst->ne[3];                                                 \
-                                                                                     \
-    const uint32_t nb1 = dst->nb[1];                                                 \
-    const uint32_t nb2 = dst->nb[2];                                                 \
-    const uint32_t nb3 = dst->nb[3];                                                 \
-                                                                                     \
-    const int32_t lp0 = pctx->lp0, rp0 = pctx->rp0;                                  \
-    const int32_t lp1 = pctx->lp1, rp1 = pctx->rp1;                                  \
-    const int32_t lp2 = pctx->lp2, rp2 = pctx->rp2;                                  \
-    const int32_t lp3 = pctx->lp3, rp3 = pctx->rp3;                                  \
-                                                                                     \
-    const size_t type_size = pctx->type_size;                                        \
-                                                                                     \
-    const uint32_t row_start = pctx->row_start + pctx->nrows_per_thread * ith;       \
-    const uint32_t row_end   = MIN(row_start + pctx->nrows_per_thread, pctx->row_start + pctx->total_dst_rows);
+#define htp_pad_preamble                                                                                     \
+    const struct htp_tensor * src = octx->src[0];                                                            \
+    const struct htp_tensor * dst = octx->dst;                                                               \
+                                                                                                             \
+    const uint32_t ne00 = src->ne[0];                                                                        \
+    const uint32_t nb00 = src->nb[0];                                                                        \
+                                                                                                             \
+    const uint32_t ne0 = dst->ne[0];                                                                         \
+    const uint32_t ne1 = dst->ne[1];                                                                         \
+    const uint32_t ne2 = dst->ne[2];                                                                         \
+    const uint32_t ne3 = dst->ne[3];                                                                         \
+                                                                                                             \
+    const uint32_t nb1 = dst->nb[1];                                                                         \
+    const uint32_t nb2 = dst->nb[2];                                                                         \
+    const uint32_t nb3 = dst->nb[3];                                                                         \
+                                                                                                             \
+    const int32_t lp0 = pctx->lp0, rp0 = pctx->rp0;                                                          \
+    const int32_t lp1 = pctx->lp1, rp1 = pctx->rp1;                                                          \
+    const int32_t lp2 = pctx->lp2, rp2 = pctx->rp2;                                                          \
+    const int32_t lp3 = pctx->lp3, rp3 = pctx->rp3;                                                          \
+                                                                                                             \
+    const size_t type_size = pctx->type_size;                                                                \
+                                                                                                             \
+    const uint32_t row_start = pctx->row_start + pctx->nrows_per_hvx * ith;                                  \
+    const uint32_t row_end   = MIN(row_start + pctx->nrows_per_hvx, pctx->row_start + pctx->total_dst_rows);
 
 
-#define htp_pad_dma_preamble                                                                \
-    const size_t src_row_size         = pctx->src_row_size;                                 \
-    const size_t src_row_size_aligned = pctx->src_row_size_aligned;                         \
-    const size_t dst_row_size         = pctx->dst_row_size;                                 \
-    const size_t dst_row_size_aligned = pctx->dst_row_size_aligned;                         \
-                                                                                            \
-    uint8_t * src_spad_base = octx->src0_spad.data + ith * octx->src0_spad.size_per_thread; \
-    uint8_t * dst_spad_base = octx->dst_spad.data  + ith * octx->dst_spad.size_per_thread;  \
-                                                                                            \
+#define htp_pad_dma_preamble                                                             \
+    const size_t src_row_size         = pctx->src_row_size;                              \
+    const size_t src_row_size_aligned = pctx->src_row_size_aligned;                      \
+    const size_t dst_row_size         = pctx->dst_row_size;                              \
+    const size_t dst_row_size_aligned = pctx->dst_row_size_aligned;                      \
+                                                                                         \
+    uint8_t * src_spad_base = octx->src0_spad.data + ith * octx->src0_spad.size_per_hvx; \
+    uint8_t * dst_spad_base = octx->dst_spad.data  + ith * octx->dst_spad.size_per_hvx;  \
+                                                                                         \
     dma_queue * dma_q = octx->ctx->dma[ith];
 
 // ---------------------------------------------------------------------------
@@ -516,14 +516,14 @@ int op_pad(struct htp_ops_context * octx) {
         return HTP_STATUS_OK;
     }
 
-    const uint32_t n_threads = octx->n_threads;
+    const uint32_t n_hvx = octx->n_hvx;
 
     const size_t src_row_size         = (size_t)ne00 * type_size;
     const size_t src_row_size_aligned = hex_round_up(src_row_size, VLEN);
     const size_t dst_row_size_aligned = hex_round_up(dst_row_size, VLEN);
 
     // Total VTCM needed: 2 buffers (ping+pong) for src and dst, per thread
-    const size_t vtcm_needed = (size_t)n_threads * 2 * (src_row_size_aligned + dst_row_size_aligned);
+    const size_t vtcm_needed = (size_t)n_hvx * 2 * (src_row_size_aligned + dst_row_size_aligned);
 
     const int use_dma = (src0->nb[0] == (uint32_t)type_size) && (ne00 >= 512) &&
                         (octx->ctx->vtcm_size >= vtcm_needed);
@@ -533,30 +533,30 @@ int op_pad(struct htp_ops_context * octx) {
     }
 
     if (use_dma) {
-        octx->src0_spad.size_per_thread = 2 * src_row_size_aligned;
-        octx->dst_spad.size_per_thread  = 2 * dst_row_size_aligned;
-        octx->src0_spad.size = n_threads * octx->src0_spad.size_per_thread;
-        octx->dst_spad.size  = n_threads * octx->dst_spad.size_per_thread;
-        octx->src0_spad.data = octx->ctx->vtcm_base;
-        octx->dst_spad.data  = octx->src0_spad.data + octx->src0_spad.size;
-        octx->src0_spad.src  = NULL;
-        octx->dst_spad.src   = NULL;
+        octx->src0_spad.size_per_hvx = 2 * src_row_size_aligned;
+        octx->dst_spad.size_per_hvx  = 2 * dst_row_size_aligned;
+        octx->src0_spad.size         = n_hvx * octx->src0_spad.size_per_hvx;
+        octx->dst_spad.size          = n_hvx * octx->dst_spad.size_per_hvx;
+        octx->src0_spad.data         = octx->ctx->vtcm_base;
+        octx->dst_spad.data          = octx->src0_spad.data + octx->src0_spad.size;
+        octx->src0_spad.src          = NULL;
+        octx->dst_spad.src           = NULL;
     }
 
     struct htp_pad_context pctx = {
-        .octx             = octx,
-        .lp0 = lp0, .rp0 = rp0,
-        .lp1 = lp1, .rp1 = rp1,
-        .lp2 = lp2, .rp2 = rp2,
-        .lp3 = lp3, .rp3 = rp3,
-        .nrows_per_thread = fastdiv(nrows + n_threads - 1, &octx->n_threads_div),
-        .total_dst_rows   = nrows,
-        .row_start        = row_start,
-        .type_size        = type_size,
-        .src_row_size         = src_row_size,
-        .src_row_size_aligned = src_row_size_aligned,
-        .dst_row_size         = dst_row_size,
-        .dst_row_size_aligned = dst_row_size_aligned,
+        .octx                   = octx,
+        .lp0                    = lp0, .rp0 = rp0,
+        .lp1                    = lp1, .rp1 = rp1,
+        .lp2                    = lp2, .rp2 = rp2,
+        .lp3                    = lp3, .rp3 = rp3,
+        .nrows_per_hvx          = fastdiv(nrows + n_hvx - 1, &octx->n_hvx_div),
+        .total_dst_rows         = nrows,
+        .row_start              = row_start,
+        .type_size              = type_size,
+        .src_row_size           = src_row_size,
+        .src_row_size_aligned   = src_row_size_aligned,
+        .dst_row_size           = dst_row_size,
+        .dst_row_size_aligned   = dst_row_size_aligned,
     };
 
     FARF(HIGH, "pad-hvx%s%s: (%ux%ux%ux%u) -> (%ux%ux%ux%u) pads=(%d,%d,%d,%d,%d,%d,%d,%d)\n",
@@ -566,10 +566,10 @@ int op_pad(struct htp_ops_context * octx) {
          dst->ne[0],  dst->ne[1],  dst->ne[2],  dst->ne[3],
          lp0, rp0, lp1, rp1, lp2, rp2, lp3, rp3);
 
-    if      (circular && use_dma) { work_queue_run(octx->ctx->work_queue, pad_job_per_thread_hvx_circular_dma, &pctx, n_threads); }
-    else if (circular)            { work_queue_run(octx->ctx->work_queue, pad_job_per_thread_hvx_circular,     &pctx, n_threads); }
-    else if (use_dma)             { work_queue_run(octx->ctx->work_queue, pad_job_per_thread_hvx_dma,          &pctx, n_threads); }
-    else                          { work_queue_run(octx->ctx->work_queue, pad_job_per_thread_hvx,              &pctx, n_threads); }
+    if      (circular && use_dma) { work_queue_run(octx->ctx->hvx_queue, pad_job_per_thread_hvx_circular_dma, &pctx, n_hvx); }
+    else if (circular)            { work_queue_run(octx->ctx->hvx_queue, pad_job_per_thread_hvx_circular,     &pctx, n_hvx); }
+    else if (use_dma)             { work_queue_run(octx->ctx->hvx_queue, pad_job_per_thread_hvx_dma,          &pctx, n_hvx); }
+    else                          { work_queue_run(octx->ctx->hvx_queue, pad_job_per_thread_hvx,              &pctx, n_hvx); }
 
     return HTP_STATUS_OK;
 }

@@ -9,7 +9,7 @@
 #include "hex-fastdiv.h"
 
 struct htp_sort_kernel_params {
-    int32_t  n_threads;
+    int32_t  n_hvx;
     int32_t  total_rows;
     int32_t  row_start;
     int32_t  row_end;
@@ -37,7 +37,7 @@ struct htp_sort_vtcm_layout {
     uint32_t chunk_elems;
     uint32_t n_chunks;
     uint32_t merge_elems;
-    uint32_t n_threads;
+    uint32_t n_hvx;
     uint32_t n_slots;
 };
 
@@ -46,14 +46,14 @@ static inline bool htp_sort_solve_layout(
     uint32_t ne00,
     uint32_t total_rows,
     uint32_t k,
-    uint32_t n_threads_max,
+    uint32_t n_hvx_max,
     size_t vtcm_budget,
     bool is_top_k) {
 
     memset(layout, 0, sizeof(*layout));
 
     if (total_rows > 1) {
-        uint32_t n_threads = total_rows < n_threads_max ? total_rows : n_threads_max;
+        uint32_t n_hvx = total_rows < n_hvx_max ? total_rows : n_hvx_max;
 
         uint32_t n_vec = (ne00 + 31) / 32;
         uint32_t n_vec_pow2 = 1;
@@ -69,13 +69,13 @@ static inline bool htp_sort_solve_layout(
             n_slots = 1;
         }
 
-        size_t spad_per_thread = spad_per_slot * n_slots;
+        size_t spad_per_hvx = spad_per_slot * n_slots;
 
-        while (n_threads > 1 && (spad_per_thread * n_threads) > vtcm_budget) {
-            n_threads--;
+        while (n_hvx > 1 && (spad_per_hvx * n_hvx) > vtcm_budget) {
+            n_hvx--;
         }
 
-        size_t total_bytes = spad_per_thread * n_threads;
+        size_t total_bytes = spad_per_hvx * n_hvx;
         if (total_bytes > vtcm_budget) {
             return false;
         }
@@ -84,7 +84,7 @@ static inline bool htp_sort_solve_layout(
         layout->phase1_slot_size = spad_per_slot;
         layout->chunk_elems      = ne00_padded;
         layout->n_chunks         = 1;
-        layout->n_threads        = n_threads;
+        layout->n_hvx            = n_hvx;
         layout->n_slots          = n_slots;
         return true;
     }
@@ -95,7 +95,7 @@ static inline bool htp_sort_solve_layout(
 
     uint32_t n_chunks = 1;
     if (ne00 > 1024) {
-        while (n_chunks * 2 <= n_threads_max && n_chunks * 2 <= n_vec_pow2) {
+        while (n_chunks * 2 <= n_hvx_max && n_chunks * 2 <= n_vec_pow2) {
             n_chunks *= 2;
         }
     }
@@ -164,7 +164,7 @@ static inline bool htp_sort_solve_layout(
     layout->chunk_elems       = chunk_elems;
     layout->n_chunks          = n_chunks;
     layout->merge_elems       = merge_elems;
-    layout->n_threads         = n_chunks;
+    layout->n_hvx             = n_chunks;
     layout->n_slots           = n_slots;
     return true;
 }

@@ -95,7 +95,7 @@ struct htp_act_context {
 
     uint32_t                 block;
     uint32_t                 src0_nrows;
-    uint32_t                 src0_nrows_per_thread;
+    uint32_t                 src0_nrows_per_hvx;
     uint32_t                 row_start;
     int                      nc;
 
@@ -103,9 +103,9 @@ struct htp_act_context {
     uint8_t *                vtcm_src1;
     uint8_t *                vtcm_dst;
 
-    size_t                   vtcm_src0_size_per_thread;
-    size_t                   vtcm_src1_size_per_thread;
-    size_t                   vtcm_dst_size_per_thread;
+    size_t                   vtcm_src0_size_per_hvx;
+    size_t                   vtcm_src1_size_per_hvx;
+    size_t                   vtcm_dst_size_per_hvx;
 };
 
 struct htp_act_vtcm_layout {
@@ -114,33 +114,33 @@ struct htp_act_vtcm_layout {
     size_t off_src1;
     size_t off_dst;
 
-    size_t src0_bytes_per_thread;
-    size_t src1_bytes_per_thread;
-    size_t dst_bytes_per_thread;
+    size_t src0_bytes_per_hvx;
+    size_t src1_bytes_per_hvx;
+    size_t dst_bytes_per_hvx;
 
-    uint32_t vtcm_row_per_thread;
+    uint32_t vtcm_row_per_hvx;
 };
 
 static inline void htp_act_vtcm_layout_build(struct htp_act_vtcm_layout * L,
                                              size_t                       src0_row_size_aligned,
                                              size_t                       src1_row_size_aligned,
                                              size_t                       dst_row_size_aligned,
-                                             uint32_t                     n_threads,
+                                             uint32_t                     n_hvx,
                                              size_t                       vtcm_size) {
     const size_t   spad_size_per_row   = src0_row_size_aligned + src1_row_size_aligned + dst_row_size_aligned;
-    const uint32_t vtcm_row_per_thread = (uint32_t) (vtcm_size / (n_threads * spad_size_per_row));
+    const uint32_t vtcm_row_per_hvx    = (uint32_t) (vtcm_size / (n_hvx * spad_size_per_row));
 
-    L->vtcm_row_per_thread = vtcm_row_per_thread;
+    L->vtcm_row_per_hvx = vtcm_row_per_hvx;
 
-    L->src0_bytes_per_thread = src0_row_size_aligned * vtcm_row_per_thread;
-    L->src1_bytes_per_thread = src1_row_size_aligned * vtcm_row_per_thread;
-    L->dst_bytes_per_thread  = dst_row_size_aligned * vtcm_row_per_thread;
+    L->src0_bytes_per_hvx = src0_row_size_aligned * vtcm_row_per_hvx;
+    L->src1_bytes_per_hvx = src1_row_size_aligned * vtcm_row_per_hvx;
+    L->dst_bytes_per_hvx  = dst_row_size_aligned * vtcm_row_per_hvx;
 
     L->off_src0 = 0;
-    L->off_src1 = L->off_src0 + L->src0_bytes_per_thread * n_threads;
-    L->off_dst  = L->off_src1 + L->src1_bytes_per_thread * n_threads;
+    L->off_src1 = L->off_src0 + L->src0_bytes_per_hvx * n_hvx;
+    L->off_dst  = L->off_src1 + L->src1_bytes_per_hvx * n_hvx;
 
-    L->total_bytes = L->off_dst + L->dst_bytes_per_thread * n_threads;
+    L->total_bytes = L->off_dst + L->dst_bytes_per_hvx * n_hvx;
 }
 
 #define htp_glu_op_preamble                                            \
@@ -587,7 +587,7 @@ static void geglu_f16(const _Float16 * restrict src0,
 }
 
 #define DEFINE_GLU_PER_THREAD(TYPE, SUFFIX)                                                                            \
-    static void glu_##SUFFIX##_per_thread(unsigned int nth, unsigned int ith, void * data) {                           \
+    static void glu_##SUFFIX##_per_hvx(unsigned int nth, unsigned int ith, void * data) {                              \
         struct htp_act_context * actx = (struct htp_act_context *) data;                                               \
         htp_act_preamble;                                                                                              \
                                                                                                                        \
@@ -601,10 +601,10 @@ static void geglu_f16(const _Float16 * restrict src0,
         size_t src1_row_stride = actx->src1_row_stride;                                                                \
                                                                                                                        \
         const uint32_t src0_nrows            = actx->src0_nrows;                                                       \
-        const uint32_t src0_nrows_per_thread = actx->src0_nrows_per_thread;                                            \
+        const uint32_t src0_nrows_per_hvx    = actx->src0_nrows_per_hvx;                                               \
                                                                                                                        \
-        const uint32_t src0_start_row = actx->row_start + src0_nrows_per_thread * ith;                                 \
-        const uint32_t src0_end_row   = MIN(src0_start_row + src0_nrows_per_thread, actx->row_start + src0_nrows);     \
+        const uint32_t src0_start_row = actx->row_start + src0_nrows_per_hvx * ith;                                    \
+        const uint32_t src0_end_row   = MIN(src0_start_row + src0_nrows_per_hvx, actx->row_start + src0_nrows);        \
                                                                                                                        \
         /* no work for this thread */                                                                                  \
         if (src0_start_row >= src0_end_row) {                                                                          \
@@ -619,9 +619,9 @@ static void geglu_f16(const _Float16 * restrict src0,
         const size_t src1_row_size_aligned = actx->src1_row_size_aligned;                                              \
         const size_t dst_row_size_aligned  = actx->dst_row_size_aligned;                                               \
                                                                                                                        \
-        uint8_t * restrict src0_spad_data = actx->vtcm_src0 + (ith * actx->vtcm_src0_size_per_thread);                 \
-        uint8_t * restrict src1_spad_data = actx->vtcm_src1 + (ith * actx->vtcm_src1_size_per_thread);                 \
-        uint8_t * restrict dst_spad_data  = actx->vtcm_dst  + (ith * actx->vtcm_dst_size_per_thread);                  \
+        uint8_t * restrict src0_spad_data = actx->vtcm_src0 + (ith * actx->vtcm_src0_size_per_hvx);                    \
+        uint8_t * restrict src1_spad_data = actx->vtcm_src1 + (ith * actx->vtcm_src1_size_per_hvx);                    \
+        uint8_t * restrict dst_spad_data  = actx->vtcm_dst  + (ith * actx->vtcm_dst_size_per_hvx);                     \
                                                                                                                        \
         size_t src0_spad_half_size = actx->src0_spad_half_size;                                                        \
         size_t src1_spad_half_size = actx->src1_spad_half_size;                                                        \
@@ -630,7 +630,7 @@ static void geglu_f16(const _Float16 * restrict src0,
         const int BLOCK = actx->block;                                                                                 \
         if (BLOCK == 0) {                                                                                              \
             FARF(ERROR, "%s : VTCM reservation %zu is too small, needed %zu\n",                                        \
-                 actx->op_str, actx->vtcm_src0_size_per_thread, src0_row_size_aligned);                                \
+                 actx->op_str, actx->vtcm_src0_size_per_hvx, src0_row_size_aligned);                                   \
             return;                                                                                                    \
         }                                                                                                              \
                                                                                                                        \
@@ -752,7 +752,7 @@ static int execute_op_activations_f32(struct htp_ops_context * octx) {
         return HTP_STATUS_OK;
     }
 
-    const uint32_t n_threads = octx->n_threads;
+    const uint32_t n_hvx = octx->n_hvx;
 
     // row_size   = bytes of useful data per row (what the kernel touches / what DMA copies).
     // row_stride = bytes between successive rows in DDR (may exceed row_size for non-contig src).
@@ -767,25 +767,25 @@ static int execute_op_activations_f32(struct htp_ops_context * octx) {
     const size_t dst_row_size_aligned  = hex_round_up(dst_row_size, VLEN);
 
     struct htp_act_vtcm_layout L;
-    htp_act_vtcm_layout_build(&L, src0_row_size_aligned, src1_row_size_aligned, dst_row_size_aligned, n_threads,
+    htp_act_vtcm_layout_build(&L, src0_row_size_aligned, src1_row_size_aligned, dst_row_size_aligned, n_hvx,
                               octx->ctx->vtcm_size);
 
     // Make sure the reserved vtcm size is sufficient
-    if (L.vtcm_row_per_thread == 0) {
-        FARF(ERROR, "act-%s : current VTCM reservation %zu is too small for even 1 row per thread, needed at least %zu\n", op_type, octx->ctx->vtcm_size,
-             (src0_row_size_aligned + src1_row_size_aligned + dst_row_size_aligned) * n_threads);
+    if (L.vtcm_row_per_hvx == 0) {
+        FARF(ERROR, "act-%s : current VTCM reservation %zu is too small for even 1 row per HVX, needed at least %zu\n", op_type, octx->ctx->vtcm_size,
+             (src0_row_size_aligned + src1_row_size_aligned + dst_row_size_aligned) * n_hvx);
         return HTP_STATUS_VTCM_TOO_SMALL;
     }
 
     if (src1) {
         FARF(HIGH, "%s: %ux%ux%ux%u x %ux%ux%ux%u -> %ux%ux%ux%u : src0-vtcm-size %zu src1-vtcm-size %zu dst-vtcm-size %zu\n",
              op_type, src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3], src1->ne[0], src1->ne[1], src1->ne[2],
-             src1->ne[3], dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3], L.src0_bytes_per_thread * n_threads,
-             L.src1_bytes_per_thread * n_threads, L.dst_bytes_per_thread * n_threads);
+             src1->ne[3], dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3], L.src0_bytes_per_hvx * n_hvx,
+             L.src1_bytes_per_hvx * n_hvx, L.dst_bytes_per_hvx * n_hvx);
     } else {
         FARF(HIGH, "%s: %ux%ux%ux%u -> %ux%ux%ux%u : src0-vtcm-size %zu src1-vtcm-size %zu dst-vtcm-size %zu\n", op_type,
              src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3], dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],
-             L.src0_bytes_per_thread * n_threads, L.src1_bytes_per_thread * n_threads, L.dst_bytes_per_thread * n_threads);
+             L.src0_bytes_per_hvx * n_hvx, L.src1_bytes_per_hvx * n_hvx, L.dst_bytes_per_hvx * n_hvx);
     }
 
     // Prepare context
@@ -794,7 +794,7 @@ static int execute_op_activations_f32(struct htp_ops_context * octx) {
     actx.compute = (void *) compute_fn;
     actx.op_str  = op_type;
 
-    actx.src0_nrows_per_thread = fastdiv(nrows + n_threads - 1, &octx->n_threads_div);
+    actx.src0_nrows_per_hvx = fastdiv(nrows + n_hvx - 1, &octx->n_hvx_div);
 
     actx.src0_row_size = src0_row_size;
     actx.src1_row_size = src1_row_size;
@@ -812,13 +812,13 @@ static int execute_op_activations_f32(struct htp_ops_context * octx) {
     actx.vtcm_src1 = VTCM_LAYOUT_PTR(uint8_t, base, L.off_src1);
     actx.vtcm_dst  = VTCM_LAYOUT_PTR(uint8_t, base, L.off_dst);
 
-    actx.vtcm_src0_size_per_thread = L.src0_bytes_per_thread;
-    actx.vtcm_src1_size_per_thread = L.src1_bytes_per_thread;
-    actx.vtcm_dst_size_per_thread  = L.dst_bytes_per_thread;
+    actx.vtcm_src0_size_per_hvx = L.src0_bytes_per_hvx;
+    actx.vtcm_src1_size_per_hvx = L.src1_bytes_per_hvx;
+    actx.vtcm_dst_size_per_hvx  = L.dst_bytes_per_hvx;
 
-    actx.src0_spad_half_size = L.src0_bytes_per_thread / 2;
-    actx.src1_spad_half_size = L.src1_bytes_per_thread / 2;
-    actx.dst_spad_half_size  = L.dst_bytes_per_thread / 2;
+    actx.src0_spad_half_size = L.src0_bytes_per_hvx / 2;
+    actx.src1_spad_half_size = L.src1_bytes_per_hvx / 2;
+    actx.dst_spad_half_size  = L.dst_bytes_per_hvx / 2;
 
     actx.block = actx.src0_spad_half_size / actx.src0_row_size_aligned;
     actx.src0_nrows = nrows;
@@ -852,7 +852,7 @@ static int execute_op_activations_f32(struct htp_ops_context * octx) {
     actx.data_src1 = data_src1;
     actx.data_dst  = dst->data;
 
-    work_queue_run(octx->ctx->work_queue, (worker_callback_t)glu_f32_per_thread, &actx, n_threads);
+    work_queue_run(octx->ctx->hvx_queue, (work_queue_func_t)glu_f32_per_hvx, &actx, n_hvx);
     return HTP_STATUS_OK;
 }
 
@@ -913,7 +913,7 @@ static int execute_op_activations_f16(struct htp_ops_context * octx) {
         return HTP_STATUS_OK;
     }
 
-    const uint32_t n_threads = octx->n_threads;
+    const uint32_t n_hvx = octx->n_hvx;
 
     // row_size   = bytes of useful data per row (what the kernel touches / what DMA copies).
     // row_stride = bytes between successive rows in DDR (may exceed row_size for non-contig src).
@@ -928,25 +928,25 @@ static int execute_op_activations_f16(struct htp_ops_context * octx) {
     const size_t dst_row_size_aligned  = hex_round_up(dst_row_size, VLEN);
 
     struct htp_act_vtcm_layout L;
-    htp_act_vtcm_layout_build(&L, src0_row_size_aligned, src1_row_size_aligned, dst_row_size_aligned, n_threads,
+    htp_act_vtcm_layout_build(&L, src0_row_size_aligned, src1_row_size_aligned, dst_row_size_aligned, n_hvx,
                               octx->ctx->vtcm_size);
 
     // Make sure the reserved vtcm size is sufficient
-    if (L.vtcm_row_per_thread == 0) {
-        FARF(ERROR, "act-%s : current VTCM reservation %zu is too small for even 1 row per thread, needed at least %zu\n", op_type, octx->ctx->vtcm_size,
-             (src0_row_size_aligned + src1_row_size_aligned + dst_row_size_aligned) * n_threads);
+    if (L.vtcm_row_per_hvx == 0) {
+        FARF(ERROR, "act-%s : current VTCM reservation %zu is too small for even 1 row per HVX, needed at least %zu\n", op_type, octx->ctx->vtcm_size,
+             (src0_row_size_aligned + src1_row_size_aligned + dst_row_size_aligned) * n_hvx);
         return HTP_STATUS_VTCM_TOO_SMALL;
     }
 
     if (src1) {
         FARF(HIGH, "%s: %ux%ux%ux%u x %ux%ux%ux%u -> %ux%ux%ux%u : src0-vtcm-size %zu src1-vtcm-size %zu dst-vtcm-size %zu\n",
              op_type, src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3], src1->ne[0], src1->ne[1], src1->ne[2],
-             src1->ne[3], dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3], L.src0_bytes_per_thread * n_threads,
-             L.src1_bytes_per_thread * n_threads, L.dst_bytes_per_thread * n_threads);
+             src1->ne[3], dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3], L.src0_bytes_per_hvx * n_hvx,
+             L.src1_bytes_per_hvx * n_hvx, L.dst_bytes_per_hvx * n_hvx);
     } else {
         FARF(HIGH, "%s: %ux%ux%ux%u -> %ux%ux%ux%u : src0-vtcm-size %zu src1-vtcm-size %zu dst-vtcm-size %zu\n", op_type,
              src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3], dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],
-             L.src0_bytes_per_thread * n_threads, L.src1_bytes_per_thread * n_threads, L.dst_bytes_per_thread * n_threads);
+             L.src0_bytes_per_hvx * n_hvx, L.src1_bytes_per_hvx * n_hvx, L.dst_bytes_per_hvx * n_hvx);
     }
 
     // Prepare context
@@ -955,7 +955,7 @@ static int execute_op_activations_f16(struct htp_ops_context * octx) {
     actx.compute = (void *) compute_fn;
     actx.op_str  = op_type;
 
-    actx.src0_nrows_per_thread = fastdiv(nrows + n_threads - 1, &octx->n_threads_div);
+    actx.src0_nrows_per_hvx = fastdiv(nrows + n_hvx - 1, &octx->n_hvx_div);
 
     actx.src0_row_size = src0_row_size;
     actx.src1_row_size = src1_row_size;
@@ -973,13 +973,13 @@ static int execute_op_activations_f16(struct htp_ops_context * octx) {
     actx.vtcm_src1 = VTCM_LAYOUT_PTR(uint8_t, base, L.off_src1);
     actx.vtcm_dst  = VTCM_LAYOUT_PTR(uint8_t, base, L.off_dst);
 
-    actx.vtcm_src0_size_per_thread = L.src0_bytes_per_thread;
-    actx.vtcm_src1_size_per_thread = L.src1_bytes_per_thread;
-    actx.vtcm_dst_size_per_thread  = L.dst_bytes_per_thread;
+    actx.vtcm_src0_size_per_hvx = L.src0_bytes_per_hvx;
+    actx.vtcm_src1_size_per_hvx = L.src1_bytes_per_hvx;
+    actx.vtcm_dst_size_per_hvx  = L.dst_bytes_per_hvx;
 
-    actx.src0_spad_half_size = L.src0_bytes_per_thread / 2;
-    actx.src1_spad_half_size = L.src1_bytes_per_thread / 2;
-    actx.dst_spad_half_size  = L.dst_bytes_per_thread / 2;
+    actx.src0_spad_half_size = L.src0_bytes_per_hvx / 2;
+    actx.src1_spad_half_size = L.src1_bytes_per_hvx / 2;
+    actx.dst_spad_half_size  = L.dst_bytes_per_hvx / 2;
 
     actx.block = actx.src0_spad_half_size / actx.src0_row_size_aligned;
     actx.src0_nrows = nrows;
@@ -1011,7 +1011,7 @@ static int execute_op_activations_f16(struct htp_ops_context * octx) {
     actx.data_src1 = data_src1;
     actx.data_dst  = dst->data;
 
-    work_queue_run(octx->ctx->work_queue, (worker_callback_t)glu_f16_per_thread, &actx, n_threads);
+    work_queue_run(octx->ctx->hvx_queue, (work_queue_func_t)glu_f16_per_hvx, &actx, n_hvx);
     return HTP_STATUS_OK;
 }
 

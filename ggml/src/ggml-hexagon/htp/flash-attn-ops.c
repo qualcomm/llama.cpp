@@ -76,7 +76,7 @@ struct htp_fa_context {
     size_t size_m_block;
 
     uint32_t qrows;
-    uint32_t qrows_per_thread;
+    uint32_t qrows_per_hvx;
     uint32_t qrow_start;
 
     bool is_q_fp32;
@@ -101,8 +101,8 @@ struct hmx_fa_context {
     const struct htp_tensor *      sinks;  // attention sinks (src[4]), NULL if absent
     const struct htp_tensor *      k;
     const struct htp_tensor *      v;
-    bool         pipeline;  // true when n_kv_blocks >= FA_MIN_KV_BLOCKS && n_threads >= 2
-    uint32_t     n_threads;
+    bool         pipeline;  // true when n_kv_blocks >= FA_MIN_KV_BLOCKS && n_hvx >= 2
+    uint32_t     n_hvx;
 
     // Op parameters
     __fp16       scale;
@@ -150,7 +150,7 @@ struct hmx_fa_context {
     HVX_Vector * vtcm_l_vec;           // Row sum [g_br]
     HVX_Vector * vtcm_s_rowmax;        // Softmax intermediate [g_br]
     HVX_Vector * vtcm_p_rowsum;        // Softmax intermediate [g_br]
-    HVX_Vector * vtcm_row_bufs;        // Per-thread softmax row scratch [n_threads][2][Bc/64]
+    HVX_Vector * vtcm_row_bufs;        // Per-HVX softmax row scratch [n_hvx][2][Bc/64]
     uint8_t *    vtcm_hmx_scales_id;   // HMX output scales (identity)
     uint8_t *    vtcm_hmx_scales_qk;   // HMX output scales (qk_scale)
     __fp16 *     vtcm_mask_buf;        // VTCM mask buffer [Br * m_line], DMA'd per KV block
@@ -284,7 +284,7 @@ static void flash_attn_ext_f16_thread(unsigned int nth, unsigned int ith, void *
     const uint32_t nb3 = dst->nb[3];
 
     // total rows in q
-    const uint32_t dr  = factx->qrows_per_thread;
+    const uint32_t dr  = factx->qrows_per_hvx;
     const uint32_t ir0 = factx->qrow_start + dr * ith;
     const uint32_t ir1 = MIN(ir0 + dr, factx->qrow_start + factx->qrows);
 
@@ -779,10 +779,10 @@ static void fa_k_interleave_thread(unsigned int n, unsigned int i, void * data) 
 }
 
 static void fa_phase_k_interleave(struct hmx_fa_context * factx, uint32_t kv_rows, size_t src_stride, void * curr_k, uint32_t kv_start, size_t buf_idx) {
-    work_queue_t wp = factx->octx->ctx->work_queue;
+    work_queue_t wp = factx->octx->ctx->hvx_queue;
     uint32_t n = 1;
-    if (factx->n_threads > 1 && kv_rows >= factx->n_threads * 2) {
-        n = factx->n_threads;
+    if (factx->n_hvx > 1 && kv_rows >= factx->n_hvx * 2) {
+        n = factx->n_hvx;
     }
     uint32_t rows_per_t = hex_align_up(hmx_ceil_div(kv_rows, n), 2);
     fa_k_int_args_t args = { factx, kv_rows, src_stride, curr_k, kv_start, rows_per_t, buf_idx };
@@ -839,10 +839,10 @@ static void fa_phase_v_interleave(struct hmx_fa_context * factx,
                                   void *                  v_tiles_dst,
                                   size_t                  n_col_tiles,
                                   uint32_t                kv_start) {
-    work_queue_t wp = factx->octx->ctx->work_queue;
+    work_queue_t wp = factx->octx->ctx->hvx_queue;
     uint32_t n = 1;
-    if (factx->n_threads > 1 && kv_rows >= factx->n_threads * 2) {
-        n = factx->n_threads;
+    if (factx->n_hvx > 1 && kv_rows >= factx->n_hvx * 2) {
+        n = factx->n_hvx;
     }
     uint32_t rows_per_t = hex_align_up(hmx_ceil_div(kv_rows, n), 2);
     fa_v_int_args_t args = { factx, kv_rows, src_stride, v_src, v_tiles_dst, n_col_tiles, kv_start, rows_per_t };
@@ -988,10 +988,10 @@ static void fa_phase_q_load(struct hmx_fa_context *   factx,
                             uint32_t                  kv_head,
                             uint32_t                  ib3,
                             size_t                    n_rows_g) {
-    work_queue_t wp = factx->octx->ctx->work_queue;
+    work_queue_t wp = factx->octx->ctx->hvx_queue;
     uint32_t n = 1;
-    if (factx->n_threads > 1 && n_rows_g >= (size_t) (factx->n_threads * 2)) {
-        n = factx->n_threads;
+    if (factx->n_hvx > 1 && n_rows_g >= (size_t) (factx->n_hvx * 2)) {
+        n = factx->n_hvx;
     }
     size_t rows_per_t = hex_align_up(hmx_ceil_div(factx->g_br, n), 2);
     const uint32_t n_rows_q = hex_smin(factx->Br, factx->neq1 - q_start);
@@ -1168,14 +1168,14 @@ static void fa_phase_o_store(struct hmx_fa_context *   factx,
                              uint32_t                  kv_head,
                              uint32_t                  ib3,
                              size_t                    n_rows_g) {
-    work_queue_t wp = factx->octx->ctx->work_queue;
+    work_queue_t wp = factx->octx->ctx->hvx_queue;
     uint32_t n = 1;
-    if (factx->n_threads > 1 && n_rows_g >= (size_t) (factx->n_threads * 2)) {
-        n = factx->n_threads;
+    if (factx->n_hvx > 1 && n_rows_g >= (size_t) (factx->n_hvx * 2)) {
+        n = factx->n_hvx;
     }
     size_t rows_per_t = hmx_ceil_div(n_rows_g, n);
     fa_o_store_args_t args = { factx, dst, o_tile_src, q_start, kv_head, ib3, n_rows_g, rows_per_t };
-    worker_callback_t store_fn = factx->is_dst_fp32 ? fa_o_store_thread_f32 : fa_o_store_thread_f16;
+    work_queue_func_t store_fn = factx->is_dst_fp32 ? fa_o_store_thread_f32 : fa_o_store_thread_f16;
     if (n > 1) {
         work_queue_run(wp, store_fn, &args, n);
     } else {
@@ -1720,10 +1720,10 @@ static void fa_phase_softmax_and_build_d(struct hmx_fa_context * factx,
                                          fa_softmax_args_t *     sargs,
                                          size_t                  n_row_tiles,
                                          size_t                  n_row_tiles_g_br) {
-    work_queue_t wp = factx->octx->ctx->work_queue;
+    work_queue_t wp = factx->octx->ctx->hvx_queue;
     const size_t n_row_vec_cnt = hmx_ceil_div(sargs->n_rows_g, 64);
 
-    worker_callback_t softmax_fn = fa_softmax_thread;
+    work_queue_func_t softmax_fn = fa_softmax_thread;
     if (sargs->mask == NULL && !factx->has_softcap && !sargs->has_alibi) {
         softmax_fn = fa_softmax_thread_nomask;
     } else if (sargs->mask != NULL && factx->mask_broadcast && !factx->has_softcap && !sargs->has_alibi) {
@@ -1734,8 +1734,8 @@ static void fa_phase_softmax_and_build_d(struct hmx_fa_context * factx,
         }
     }
 
-    if (factx->n_threads > 1 && n_row_vec_cnt >= 2) {
-        uint32_t n_use = (uint32_t) hex_smin((size_t) factx->n_threads, n_row_vec_cnt);
+    if (factx->n_hvx > 1 && n_row_vec_cnt >= 2) {
+        uint32_t n_use = (uint32_t) hex_smin((size_t) factx->n_hvx, n_row_vec_cnt);
         sargs->thread_div = init_fastdiv_values(n_use);
         work_queue_run(wp, softmax_fn, sargs, n_use);
     } else {
@@ -2016,7 +2016,7 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
     factx.sinks          = octx->src[4];  // NULL if this op has no attention sinks
     factx.k              = k;
     factx.v              = v;
-    factx.n_threads      = kparams->n_threads;
+    factx.n_hvx          = kparams->n_hvx;
     factx.DK             = DK;
     factx.DV             = DV;
     factx.DK_pad         = DK_pad;
@@ -2056,7 +2056,7 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
     const uint32_t Bc = factx.Bc;
     const uint32_t g_br = factx.g_br;
     const bool pipeline = factx.pipeline;
-    const uint32_t n_threads = factx.n_threads;
+    const uint32_t n_hvx = factx.n_hvx;
     const uint32_t G = factx.G;
 
     // Multi-device: prefer head-parallel partitioning (each core owns a disjoint head
@@ -2104,7 +2104,7 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
     // Build the VTCM layout once (shared with the host estimator) and place every
     // scratch buffer at its computed offset. Padded head dims size the HMX tiles.
     struct hmx_fa_vtcm_layout L;
-    hmx_fa_vtcm_layout_build(&L, G, DK_pad, DV_pad, Br, Bc, n_threads, pipeline, factx.is_q_fp32, factx.sinks != NULL, factx.n_heads);
+    hmx_fa_vtcm_layout_build(&L, G, DK_pad, DV_pad, Br, Bc, n_hvx, pipeline, factx.is_q_fp32, factx.sinks != NULL, factx.n_heads);
 
     if (L.total_bytes > ctx->vtcm_size) {
         return HTP_STATUS_VTCM_TOO_SMALL;
@@ -2631,7 +2631,7 @@ int op_flash_attn_ext(struct htp_ops_context * octx) {
         return HTP_STATUS_NO_SUPPORT;
     }
 
-    if (!htp_ops_context_set_n_threads(octx, kparams->n_threads)) {
+    if (!htp_ops_context_set_n_hvx(octx, kparams->n_hvx)) {
         return HTP_STATUS_INVAL_PARAMS;
     }
 
@@ -2719,16 +2719,16 @@ int op_flash_attn_ext(struct htp_ops_context * octx) {
         return HTP_STATUS_OK;
     }
 
-    const uint32_t n_threads = octx->n_threads;
+    const uint32_t n_hvx = octx->n_hvx;
 
     factx.qrows            = qrows;
     factx.qrow_start       = qrow_start;
-    factx.qrows_per_thread = fastdiv(qrows + n_threads - 1, &octx->n_threads_div);
+    factx.qrows_per_hvx    = fastdiv(qrows + n_hvx - 1, &octx->n_hvx_div);
 
     const bool has_mask  = (mask != NULL);
     const bool has_sinks = (octx->src[4] != NULL);
     struct hvx_fa_vtcm_layout L;
-    hvx_fa_vtcm_layout_build(&L, k->ne[0], v->ne[0], factx.is_q_fp32, has_mask, has_sinks, n_head, n_threads);
+    hvx_fa_vtcm_layout_build(&L, k->ne[0], v->ne[0], factx.is_q_fp32, has_mask, has_sinks, n_head, n_hvx);
 
     if (L.total_bytes > octx->ctx->vtcm_size) {
         return HTP_STATUS_VTCM_TOO_SMALL;
@@ -2765,7 +2765,7 @@ int op_flash_attn_ext(struct htp_ops_context * octx) {
         dma_queue_pop(dma_q);
     }
 
-    work_queue_run(octx->ctx->work_queue, flash_attn_ext_f16_thread, &factx, n_threads);
+    work_queue_run(octx->ctx->hvx_queue, flash_attn_ext_f16_thread, &factx, n_hvx);
 
     return HTP_STATUS_OK;
 }

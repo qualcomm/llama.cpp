@@ -25,7 +25,7 @@ struct htp_repeat_context {
     uint32_t nr2;
     uint32_t nr3;
 
-    uint32_t nrows_per_thread;
+    uint32_t nrows_per_hvx;
     uint32_t total_dst_rows;  // ne1 * ne2 * ne3
     uint32_t row_start;
 
@@ -65,8 +65,8 @@ static void repeat_job_per_thread(unsigned int nth, unsigned int ith, void * dat
 
     const size_t row_bytes = ne00 * rctx->type_size;
 
-    const uint32_t row_start = rctx->row_start + rctx->nrows_per_thread * ith;
-    const uint32_t row_end   = MIN(row_start + rctx->nrows_per_thread, rctx->row_start + rctx->total_dst_rows);
+    const uint32_t row_start = rctx->row_start + rctx->nrows_per_hvx * ith;
+    const uint32_t row_end   = MIN(row_start + rctx->nrows_per_hvx, rctx->row_start + rctx->total_dst_rows);
 
     struct htp_thread_trace * tr = &octx->ctx->trace[ith];
     htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, row_start);
@@ -144,18 +144,18 @@ int op_repeat(struct htp_ops_context * octx) {
         return HTP_STATUS_OK;
     }
 
-    const uint32_t n_threads = octx->n_threads;
+    const uint32_t n_hvx = octx->n_hvx;
 
     struct htp_repeat_context rctx = {
-        .octx             = octx,
-        .nr0              = dst->ne[0] / src0->ne[0],
-        .nr1              = dst->ne[1] / src0->ne[1],
-        .nr2              = dst->ne[2] / src0->ne[2],
-        .nr3              = dst->ne[3] / src0->ne[3],
-        .nrows_per_thread = fastdiv(nrows + n_threads - 1, &octx->n_threads_div),
-        .total_dst_rows   = nrows,
-        .row_start        = row_start,
-        .type_size        = type_size,
+        .octx                      = octx,
+        .nr0                       = dst->ne[0] / src0->ne[0],
+        .nr1                       = dst->ne[1] / src0->ne[1],
+        .nr2                       = dst->ne[2] / src0->ne[2],
+        .nr3                       = dst->ne[3] / src0->ne[3],
+        .nrows_per_hvx             = fastdiv(nrows + n_hvx - 1, &octx->n_hvx_div),
+        .total_dst_rows            = nrows,
+        .row_start                 = row_start,
+        .type_size                 = type_size,
     };
 
     FARF(HIGH, "repeat: (%ux%ux%ux%u) -> (%ux%ux%ux%u) nr=(%u,%u,%u,%u)\n",
@@ -163,7 +163,7 @@ int op_repeat(struct htp_ops_context * octx) {
          dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],
          rctx.nr0, rctx.nr1, rctx.nr2, rctx.nr3);
 
-    work_queue_run(octx->ctx->work_queue, repeat_job_per_thread, &rctx, n_threads);
+    work_queue_run(octx->ctx->hvx_queue, repeat_job_per_thread, &rctx, n_hvx);
 
     return HTP_STATUS_OK;
 }

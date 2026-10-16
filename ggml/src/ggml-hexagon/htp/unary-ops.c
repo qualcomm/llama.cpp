@@ -79,7 +79,7 @@ struct htp_unary_context {
 
     uint32_t                  block;
     uint32_t                  src0_nrows;
-    uint32_t                  src0_nrows_per_thread;
+    uint32_t                  src0_nrows_per_hvx;
     uint32_t                  row_start;
     uint32_t                  nc;
     uint32_t                  col_tile;             // tiled mode
@@ -89,9 +89,9 @@ struct htp_unary_context {
     uint8_t *                 vtcm_src1;
     uint8_t *                 vtcm_dst;
 
-    size_t                    vtcm_src0_size_per_thread;
-    size_t                    vtcm_src1_size_per_thread;
-    size_t                    vtcm_dst_size_per_thread;
+    size_t                    vtcm_src0_size_per_hvx;
+    size_t                    vtcm_src1_size_per_hvx;
+    size_t                    vtcm_dst_size_per_hvx;
 };
 
 // Convert flat row index to DDR byte offset using the tensor's actual strides.
@@ -1140,15 +1140,15 @@ static void unary_thread_row_block(unsigned int nth, unsigned int ith, void * da
 
     htp_unary_preamble;
 
-    const uint32_t src0_nrows_per_thread = uctx->src0_nrows_per_thread;
-    const size_t src0_data_row_size = uctx->src0_data_row_size;
-    const size_t dst_data_row_size  = uctx->dst_data_row_size;
+    const uint32_t src0_nrows_per_hvx  = uctx->src0_nrows_per_hvx;
+    const size_t src0_data_row_size    = uctx->src0_data_row_size;
+    const size_t dst_data_row_size     = uctx->dst_data_row_size;
     const size_t src0_row_size_aligned = uctx->src0_row_size_aligned;
     const size_t dst_row_size_aligned  = uctx->dst_row_size_aligned;
 
-    const uint32_t src0_nrows = uctx->src0_nrows;
-    const uint32_t src0_start_row = uctx->row_start + src0_nrows_per_thread * ith;
-    const uint32_t src0_end_row   = MIN(src0_start_row + src0_nrows_per_thread, uctx->row_start + src0_nrows);
+    const uint32_t src0_nrows     = uctx->src0_nrows;
+    const uint32_t src0_start_row = uctx->row_start + src0_nrows_per_hvx * ith;
+    const uint32_t src0_end_row   = MIN(src0_start_row + src0_nrows_per_hvx, uctx->row_start + src0_nrows);
 
     if (src0_start_row >= src0_end_row) {
         return;
@@ -1157,8 +1157,8 @@ static void unary_thread_row_block(unsigned int nth, unsigned int ith, void * da
     const dma_addr_t data_src = uctx->data_src0;
     const dma_addr_t data_dst = uctx->data_dst;
 
-    uint8_t * src0_vtcm_data = uctx->vtcm_src0 + (ith * uctx->vtcm_src0_size_per_thread);
-    uint8_t * dst_vtcm_data  = uctx->vtcm_dst + (ith * uctx->vtcm_dst_size_per_thread);
+    uint8_t * src0_vtcm_data = uctx->vtcm_src0 + (ith * uctx->vtcm_src0_size_per_hvx);
+    uint8_t * dst_vtcm_data  = uctx->vtcm_dst + (ith * uctx->vtcm_dst_size_per_hvx);
 
     const size_t src0_vtcm_half_size = uctx->src0_vtcm_half_size;
     const size_t dst_vtcm_half_size  = uctx->dst_vtcm_half_size;
@@ -1177,7 +1177,7 @@ static void unary_thread_row_block(unsigned int nth, unsigned int ith, void * da
     const uint32_t BLOCK = MIN(src0_max_block, dst_max_block);
     if (BLOCK == 0) {
         FARF(ERROR, "unary-row-block : current VTCM reservation %zu is too small, needed at least %zu\n",
-             uctx->vtcm_src0_size_per_thread, src0_row_size_aligned);
+             uctx->vtcm_src0_size_per_hvx, src0_row_size_aligned);
         return;
     }
 
@@ -1251,15 +1251,15 @@ static void unary_thread_rms_norm_mul_f32(unsigned int nth, unsigned int ith, vo
 
     htp_unary_preamble;
 
-    const uint32_t src0_nrows_per_thread = uctx->src0_nrows_per_thread;
-    const size_t src0_data_row_size = uctx->src0_data_row_size;
-    const size_t dst_data_row_size  = uctx->dst_data_row_size;
+    const uint32_t src0_nrows_per_hvx  = uctx->src0_nrows_per_hvx;
+    const size_t src0_data_row_size    = uctx->src0_data_row_size;
+    const size_t dst_data_row_size     = uctx->dst_data_row_size;
     const size_t src0_row_size_aligned = uctx->src0_row_size_aligned;
     const size_t dst_row_size_aligned  = uctx->dst_row_size_aligned;
 
-    const uint32_t src0_nrows = uctx->src0_nrows;
-    const uint32_t src0_start_row = uctx->row_start + src0_nrows_per_thread * ith;
-    const uint32_t src0_end_row   = MIN(src0_start_row + src0_nrows_per_thread, uctx->row_start + src0_nrows);
+    const uint32_t src0_nrows     = uctx->src0_nrows;
+    const uint32_t src0_start_row = uctx->row_start + src0_nrows_per_hvx * ith;
+    const uint32_t src0_end_row   = MIN(src0_start_row + src0_nrows_per_hvx, uctx->row_start + src0_nrows);
 
     if (src0_start_row >= src0_end_row) {
         return;
@@ -1278,9 +1278,9 @@ static void unary_thread_rms_norm_mul_f32(unsigned int nth, unsigned int ith, vo
     const uint32_t nb13_bc = (src1->ne[3] > 1) ? nb13 : 0;
     const bool src1_contig = ((nb12 == (size_t)ne01 * nb11) && (nb13 == (size_t)ne02 * nb12));
 
-    uint8_t * src0_vtcm_data = uctx->vtcm_src0 + (ith * uctx->vtcm_src0_size_per_thread);
-    uint8_t * src1_vtcm_data = uctx->vtcm_src1 ? (uctx->vtcm_src1 + (ith * uctx->vtcm_src1_size_per_thread)) : NULL;
-    uint8_t * dst_vtcm_data  = uctx->vtcm_dst + (ith * uctx->vtcm_dst_size_per_thread);
+    uint8_t * src0_vtcm_data = uctx->vtcm_src0 + (ith * uctx->vtcm_src0_size_per_hvx);
+    uint8_t * src1_vtcm_data = uctx->vtcm_src1 ? (uctx->vtcm_src1 + (ith * uctx->vtcm_src1_size_per_hvx)) : NULL;
+    uint8_t * dst_vtcm_data  = uctx->vtcm_dst + (ith * uctx->vtcm_dst_size_per_hvx);
 
     const size_t src0_vtcm_half_size = uctx->src0_vtcm_half_size;
     const size_t src1_vtcm_half_size = uctx->src1_vtcm_half_size;
@@ -1304,7 +1304,7 @@ static void unary_thread_rms_norm_mul_f32(unsigned int nth, unsigned int ith, vo
     const uint32_t BLOCK = MIN(src0_max_block, dst_max_block);
     if (BLOCK == 0) {
         FARF(ERROR, "unary-rms-norm-mul : current VTCM reservation %zu is too small, needed at least %zu\n",
-             uctx->vtcm_src0_size_per_thread, src0_row_size_aligned);
+             uctx->vtcm_src0_size_per_hvx, src0_row_size_aligned);
         return;
     }
 
@@ -1406,15 +1406,15 @@ static void unary_thread_tri_f32(unsigned int nth, unsigned int ith, void * data
 
     htp_unary_preamble;
 
-    const uint32_t src0_nrows_per_thread = uctx->src0_nrows_per_thread;
-    const size_t src0_data_row_size = uctx->src0_data_row_size;
-    const size_t dst_data_row_size  = uctx->dst_data_row_size;
+    const uint32_t src0_nrows_per_hvx  = uctx->src0_nrows_per_hvx;
+    const size_t src0_data_row_size    = uctx->src0_data_row_size;
+    const size_t dst_data_row_size     = uctx->dst_data_row_size;
     const size_t src0_row_size_aligned = uctx->src0_row_size_aligned;
     const size_t dst_row_size_aligned  = uctx->dst_row_size_aligned;
 
-    const uint32_t src0_nrows = uctx->src0_nrows;
-    const uint32_t src0_start_row = uctx->row_start + src0_nrows_per_thread * ith;
-    const uint32_t src0_end_row   = MIN(src0_start_row + src0_nrows_per_thread, uctx->row_start + src0_nrows);
+    const uint32_t src0_nrows     = uctx->src0_nrows;
+    const uint32_t src0_start_row = uctx->row_start + src0_nrows_per_hvx * ith;
+    const uint32_t src0_end_row   = MIN(src0_start_row + src0_nrows_per_hvx, uctx->row_start + src0_nrows);
 
     if (src0_start_row >= src0_end_row) {
         return;
@@ -1423,8 +1423,8 @@ static void unary_thread_tri_f32(unsigned int nth, unsigned int ith, void * data
     const dma_addr_t data_src = uctx->data_src0;
     const dma_addr_t data_dst = uctx->data_dst;
 
-    uint8_t * src0_vtcm_data = uctx->vtcm_src0 + (ith * uctx->vtcm_src0_size_per_thread);
-    uint8_t * dst_vtcm_data  = uctx->vtcm_dst + (ith * uctx->vtcm_dst_size_per_thread);
+    uint8_t * src0_vtcm_data = uctx->vtcm_src0 + (ith * uctx->vtcm_src0_size_per_hvx);
+    uint8_t * dst_vtcm_data  = uctx->vtcm_dst + (ith * uctx->vtcm_dst_size_per_hvx);
 
     const size_t src0_vtcm_half_size = uctx->src0_vtcm_half_size;
     const size_t dst_vtcm_half_size  = uctx->dst_vtcm_half_size;
@@ -1443,7 +1443,7 @@ static void unary_thread_tri_f32(unsigned int nth, unsigned int ith, void * data
     const uint32_t BLOCK = MIN(src0_max_block, dst_max_block);
     if (BLOCK == 0) {
         FARF(ERROR, "unary-tri : current VTCM reservation %zu is too small, needed at least %zu\n",
-             uctx->vtcm_src0_size_per_thread, src0_row_size_aligned);
+             uctx->vtcm_src0_size_per_hvx, src0_row_size_aligned);
         return;
     }
 
@@ -1517,12 +1517,12 @@ static void unary_thread_tiled(unsigned int nth, unsigned int ith, void * data) 
 
     htp_unary_preamble;
 
-    const uint32_t src0_nrows_per_thread = uctx->src0_nrows_per_thread;
+    const uint32_t src0_nrows_per_hvx    = uctx->src0_nrows_per_hvx;
     const uint32_t col_tile              = uctx->col_tile;
 
     const uint32_t src0_nrows     = uctx->src0_nrows;
-    const uint32_t src0_start_row = uctx->row_start + src0_nrows_per_thread * ith;
-    const uint32_t src0_end_row   = MIN(src0_start_row + src0_nrows_per_thread, uctx->row_start + src0_nrows);
+    const uint32_t src0_start_row = uctx->row_start + src0_nrows_per_hvx * ith;
+    const uint32_t src0_end_row   = MIN(src0_start_row + src0_nrows_per_hvx, uctx->row_start + src0_nrows);
 
     if (src0_start_row >= src0_end_row) {
         return;
@@ -1531,8 +1531,8 @@ static void unary_thread_tiled(unsigned int nth, unsigned int ith, void * data) 
     const dma_addr_t data_src = uctx->data_src0;
     const dma_addr_t data_dst = uctx->data_dst;
 
-    uint8_t * src0_vtcm_data = uctx->vtcm_src0 + (ith * uctx->vtcm_src0_size_per_thread);
-    uint8_t * dst_vtcm_data  = uctx->vtcm_dst + (ith * uctx->vtcm_dst_size_per_thread);
+    uint8_t * src0_vtcm_data = uctx->vtcm_src0 + (ith * uctx->vtcm_src0_size_per_hvx);
+    uint8_t * dst_vtcm_data  = uctx->vtcm_dst + (ith * uctx->vtcm_dst_size_per_hvx);
 
     const size_t src0_half = uctx->src0_vtcm_half_size;
     const size_t dst_half  = uctx->dst_vtcm_half_size;
@@ -1634,13 +1634,13 @@ static void unary_thread_tiled_tri_f32(unsigned int nth, unsigned int ith, void 
 
     htp_unary_preamble;
 
-    const uint32_t src0_nrows_per_thread = uctx->src0_nrows_per_thread;
+    const uint32_t src0_nrows_per_hvx = uctx->src0_nrows_per_hvx;
     const int32_t * op_params            = octx->op_params;
     const uint32_t col_tile              = uctx->col_tile;
 
     const uint32_t src0_nrows     = uctx->src0_nrows;
-    const uint32_t src0_start_row = uctx->row_start + src0_nrows_per_thread * ith;
-    const uint32_t src0_end_row   = MIN(src0_start_row + src0_nrows_per_thread, uctx->row_start + src0_nrows);
+    const uint32_t src0_start_row = uctx->row_start + src0_nrows_per_hvx * ith;
+    const uint32_t src0_end_row   = MIN(src0_start_row + src0_nrows_per_hvx, uctx->row_start + src0_nrows);
 
     if (src0_start_row >= src0_end_row) {
         return;
@@ -1649,8 +1649,8 @@ static void unary_thread_tiled_tri_f32(unsigned int nth, unsigned int ith, void 
     const dma_addr_t data_src = uctx->data_src0;
     const dma_addr_t data_dst = uctx->data_dst;
 
-    uint8_t * src0_vtcm_data = uctx->vtcm_src0 + (ith * uctx->vtcm_src0_size_per_thread);
-    uint8_t * dst_vtcm_data  = uctx->vtcm_dst + (ith * uctx->vtcm_dst_size_per_thread);
+    uint8_t * src0_vtcm_data = uctx->vtcm_src0 + (ith * uctx->vtcm_src0_size_per_hvx);
+    uint8_t * dst_vtcm_data  = uctx->vtcm_dst + (ith * uctx->vtcm_dst_size_per_hvx);
 
     const size_t src0_half = uctx->src0_vtcm_half_size;
     const size_t dst_half  = uctx->dst_vtcm_half_size;
@@ -1811,7 +1811,7 @@ static int execute_op_unary(struct htp_ops_context * octx) {
 
     const struct htp_unary_kernel_params * kparams = (const struct htp_unary_kernel_params *) octx->kernel_params;
 
-    if (!htp_ops_context_set_n_threads(octx, kparams->n_threads)) {
+    if (!htp_ops_context_set_n_hvx(octx, kparams->n_hvx)) {
         return HTP_STATUS_INVAL_PARAMS;
     }
 
@@ -1836,7 +1836,7 @@ static int execute_op_unary(struct htp_ops_context * octx) {
         return HTP_STATUS_OK;
     }
 
-    const uint32_t n_threads = octx->n_threads;
+    const uint32_t n_hvx = octx->n_hvx;
 
     const size_t src0_row_size_aligned = kparams->src0_row_size_aligned;
     const size_t dst_row_size_aligned  = kparams->dst_row_size_aligned;
@@ -1872,11 +1872,11 @@ static int execute_op_unary(struct htp_ops_context * octx) {
 
     uint8_t * const base = (uint8_t *) octx->ctx->vtcm_base;
     struct htp_unary_context uctx = {
-        .octx                  = octx,
-        .kparams               = kparams,
-        .src0_nrows_per_thread = fastdiv(nrows + n_threads - 1, &octx->n_threads_div),
-        .src0_nrows            = nrows,
-        .row_start             = row_start,
+        .octx                     = octx,
+        .kparams                  = kparams,
+        .src0_nrows_per_hvx       = fastdiv(nrows + n_hvx - 1, &octx->n_hvx_div),
+        .src0_nrows               = nrows,
+        .row_start                = row_start,
 
         .data_src0             = src0->data,
         .data_src1             = (octx->op == HTP_OP_RMS_NORM_MUL) ? src1->data : 0,
@@ -1890,9 +1890,9 @@ static int execute_op_unary(struct htp_ops_context * octx) {
         .src1_row_size_aligned = src1_row_size_aligned,
         .dst_row_size_aligned  = dst_row_size_aligned,
 
-        .src0_vtcm_half_size   = kparams->vtcm_src0_size_per_thread / 2,
-        .src1_vtcm_half_size   = (octx->op == HTP_OP_RMS_NORM_MUL) ? (kparams->vtcm_src1_size_per_thread / (broadcast_weight ? 1 : 2)) : 0,
-        .dst_vtcm_half_size    = kparams->vtcm_dst_size_per_thread / 2,
+        .src0_vtcm_half_size   = kparams->vtcm_src0_size_per_hvx / 2,
+        .src1_vtcm_half_size   = (octx->op == HTP_OP_RMS_NORM_MUL) ? (kparams->vtcm_src1_size_per_hvx / (broadcast_weight ? 1 : 2)) : 0,
+        .dst_vtcm_half_size    = kparams->vtcm_dst_size_per_hvx / 2,
 
         .block                 = kparams->block,
         .nc                    = src0->ne[0],
@@ -1903,14 +1903,14 @@ static int execute_op_unary(struct htp_ops_context * octx) {
         .vtcm_src1             = VTCM_LAYOUT_PTR_OPTIONAL(uint8_t, base, kparams->vtcm_src0_size, kparams->vtcm_src1_size > 0),
         .vtcm_dst              = VTCM_LAYOUT_PTR(uint8_t, base, kparams->vtcm_src0_size + kparams->vtcm_src1_size),
 
-        .vtcm_src0_size_per_thread = kparams->vtcm_src0_size_per_thread,
-        .vtcm_src1_size_per_thread = kparams->vtcm_src1_size_per_thread,
-        .vtcm_dst_size_per_thread  = kparams->vtcm_dst_size_per_thread,
+        .vtcm_src0_size_per_hvx = kparams->vtcm_src0_size_per_hvx,
+        .vtcm_src1_size_per_hvx = kparams->vtcm_src1_size_per_hvx,
+        .vtcm_dst_size_per_hvx  = kparams->vtcm_dst_size_per_hvx,
     };
 
     FARF(HIGH, "%s: %s mode (col_tile %u)\n", op_type, col_tile ? "tiled" : "row-block", col_tile);
 
-    worker_callback_t task_func = NULL;
+    work_queue_func_t task_func = NULL;
     void * compute_func = NULL;
 
     if (col_tile) {
@@ -1999,7 +1999,7 @@ static int execute_op_unary(struct htp_ops_context * octx) {
     }
 
     uctx.compute = compute_func;
-    work_queue_run(octx->ctx->work_queue, task_func, &uctx, n_threads);
+    work_queue_run(octx->ctx->hvx_queue, task_func, &uctx, n_hvx);
 
     return err;
 }

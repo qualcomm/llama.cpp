@@ -46,7 +46,7 @@ struct htp_cumsum_context {
     size_t          dst_row_size;
     size_t          src_row_size_aligned;
     size_t          dst_row_size_aligned;
-    uint32_t        rows_per_thread;
+    uint32_t        rows_per_hvx;
     uint32_t        total_rows;
     uint32_t        row_start;
 };
@@ -119,8 +119,8 @@ static inline void hvx_cumsum_row_f32(const float * restrict src, float * restri
 static void cumsum_thread_f32_dma(unsigned int nth, unsigned int ith, void * data) {
     htp_cumsum_preamble;
 
-    const uint32_t ir0 = cctx->row_start + cctx->rows_per_thread * ith;
-    const uint32_t ir1 = MIN(ir0 + cctx->rows_per_thread, cctx->row_start + cctx->total_rows);
+    const uint32_t ir0 = cctx->row_start + cctx->rows_per_hvx * ith;
+    const uint32_t ir1 = MIN(ir0 + cctx->rows_per_hvx, cctx->row_start + cctx->total_rows);
 
     if (ir0 >= ir1) {
         return;
@@ -188,8 +188,8 @@ static void cumsum_thread_f32(unsigned int nth, unsigned int ith, void * data) {
     const uint8_t * src_data = (const uint8_t *) src0->data;
     uint8_t *       dst_data = (uint8_t *) dst->data;
 
-    const uint32_t ir0 = cctx->row_start + cctx->rows_per_thread * ith;
-    const uint32_t ir1 = MIN(ir0 + cctx->rows_per_thread, cctx->row_start + cctx->total_rows);
+    const uint32_t ir0 = cctx->row_start + cctx->rows_per_hvx * ith;
+    const uint32_t ir1 = MIN(ir0 + cctx->rows_per_hvx, cctx->row_start + cctx->total_rows);
 
     struct htp_thread_trace * tr = &octx->ctx->trace[ith];
     htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) ir0);
@@ -229,7 +229,7 @@ int op_cumsum_f32(struct htp_ops_context * octx) {
         return HTP_STATUS_OK;
     }
 
-    const uint32_t n_threads = octx->n_threads;
+    const uint32_t n_hvx = octx->n_hvx;
 
     const size_t src_row_size         = src0->nb[1];
     const size_t dst_row_size         = dst->nb[1];
@@ -237,35 +237,35 @@ int op_cumsum_f32(struct htp_ops_context * octx) {
     const size_t dst_row_size_aligned = hex_round_up(dst_row_size, VLEN);
 
     // 2 ping-pong buffers per thread for src and dst
-    const size_t spad_per_thread = 2 * (src_row_size_aligned + dst_row_size_aligned);
+    const size_t spad_per_hvx = 2 * (src_row_size_aligned + dst_row_size_aligned);
 
-    octx->src0_spad.size_per_thread = src_row_size_aligned * 2;
-    octx->dst_spad.size_per_thread  = dst_row_size_aligned * 2;
+    octx->src0_spad.size_per_hvx = src_row_size_aligned * 2;
+    octx->dst_spad.size_per_hvx  = dst_row_size_aligned * 2;
 
-    octx->src0_spad.size  = n_threads * octx->src0_spad.size_per_thread;
-    octx->dst_spad.size   = n_threads * octx->dst_spad.size_per_thread;
+    octx->src0_spad.size  = n_hvx * octx->src0_spad.size_per_hvx;
+    octx->dst_spad.size   = n_hvx * octx->dst_spad.size_per_hvx;
 
     octx->src0_spad.data  = octx->ctx->vtcm_base;                        octx->src0_spad.src = NULL;
     octx->dst_spad.data   = octx->src0_spad.data + octx->src0_spad.size; octx->dst_spad.src  = NULL;
 
     struct htp_cumsum_context cctx = {
-        .octx                 = octx,
-        .src_row_size         = src_row_size,
-        .dst_row_size         = dst_row_size,
-        .src_row_size_aligned = src_row_size_aligned,
-        .dst_row_size_aligned = dst_row_size_aligned,
-        .rows_per_thread      = fastdiv(nrows + n_threads - 1, &octx->n_threads_div),
-        .total_rows           = nrows,
-        .row_start            = row_start,
+        .octx                      = octx,
+        .src_row_size              = src_row_size,
+        .dst_row_size              = dst_row_size,
+        .src_row_size_aligned      = src_row_size_aligned,
+        .dst_row_size_aligned      = dst_row_size_aligned,
+        .rows_per_hvx              = fastdiv(nrows + n_hvx - 1, &octx->n_hvx_div),
+        .total_rows                = nrows,
+        .row_start                 = row_start,
     };
 
-    if (octx->ctx->vtcm_size < spad_per_thread * n_threads) {
+    if (octx->ctx->vtcm_size < spad_per_hvx * n_hvx) {
         if (htp_tensor_is_extended(src0) || htp_tensor_is_extended(dst)) {
             return HTP_STATUS_NO_SUPPORT;
         }
-        work_queue_run(octx->ctx->work_queue, cumsum_thread_f32, &cctx, n_threads);
+        work_queue_run(octx->ctx->hvx_queue, cumsum_thread_f32, &cctx, n_hvx);
     } else {
-        work_queue_run(octx->ctx->work_queue, cumsum_thread_f32_dma, &cctx, n_threads);
+        work_queue_run(octx->ctx->hvx_queue, cumsum_thread_f32_dma, &cctx, n_hvx);
     }
 
     return HTP_STATUS_OK;

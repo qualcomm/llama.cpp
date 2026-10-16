@@ -9,11 +9,11 @@
 #define HTP_ROPE_SPAD_NROWS  (HTP_ROPE_SPAD_BLOCK * HTP_ROPE_SPAD_NSLOTS)
 
 struct htp_rope_kernel_params {
-    uint32_t n_threads;
+    uint32_t n_hvx;
     uint32_t src0_nrows;
-    uint32_t src0_nrows_per_thread;
+    uint32_t src0_nrows_per_hvx;
     uint32_t vtcm_size;
-    uint32_t spad_per_thread;
+    uint32_t spad_per_hvx;
     uint32_t theta_cache_offset;
     uint32_t src0_row_size_aligned;
     uint32_t freq_factors_offset;
@@ -31,7 +31,7 @@ _Static_assert(sizeof(struct htp_rope_kernel_params) <= 128, "htp_rope_kernel_pa
 
 struct htp_rope_vtcm_layout {
     size_t total_bytes;
-    size_t bytes_per_thread;
+    size_t bytes_per_hvx;
     size_t theta_cache_size_aligned;
     size_t src0_row_size_aligned;
     size_t freq_factors_size_aligned;
@@ -40,7 +40,7 @@ struct htp_rope_vtcm_layout {
 static inline void htp_rope_vtcm_layout_build(
     struct htp_rope_vtcm_layout * layout,
     uint32_t ne00,
-    uint32_t n_threads,
+    uint32_t n_hvx,
     uint32_t n_freq_factors
 ) {
     const size_t src0_row_size             = ne00 * sizeof(float);
@@ -51,8 +51,8 @@ static inline void htp_rope_vtcm_layout_build(
     layout->src0_row_size_aligned     = src0_row_size_aligned;
     layout->theta_cache_size_aligned  = theta_cache_size_aligned;
     layout->freq_factors_size_aligned = freq_factors_size_aligned;
-    layout->bytes_per_thread          = theta_cache_size_aligned + HTP_ROPE_SPAD_NROWS * src0_row_size_aligned;
-    layout->total_bytes               = layout->bytes_per_thread * n_threads + freq_factors_size_aligned;
+    layout->bytes_per_hvx             = theta_cache_size_aligned + HTP_ROPE_SPAD_NROWS * src0_row_size_aligned;
+    layout->total_bytes               = layout->bytes_per_hvx * n_hvx + freq_factors_size_aligned;
 }
 
 static inline uint8_t * rope_spad_slot(uint8_t * base, uint32_t slot, size_t row_size_aligned) {

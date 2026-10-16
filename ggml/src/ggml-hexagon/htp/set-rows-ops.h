@@ -4,15 +4,15 @@
 #include "hex-fastdiv.h"
 
 struct htp_set_rows_kernel_params {
-    int32_t  n_threads;
+    int32_t  n_hvx;
     int32_t  total_tasks;
-    int32_t  tasks_per_thread;
+    int32_t  tasks_per_hvx;
     int32_t  vtcm_size;
 
     // Fastdiv helpers
     struct fastdiv_values div_ne11;
     struct fastdiv_values div_ne12;
-    struct fastdiv_values div_tasks_per_thread;
+    struct fastdiv_values div_tasks_per_hvx;
     struct fastdiv_values div_ne02;
 };
 
@@ -21,8 +21,8 @@ struct htp_set_rows_vtcm_layout {
     size_t off_src0;
     size_t off_dst;
 
-    size_t src0_bytes_per_thread;
-    size_t dst_bytes_per_thread;
+    size_t src0_bytes_per_hvx;
+    size_t dst_bytes_per_hvx;
 
     size_t src0_spad_half_size;
     size_t dst_spad_half_size;
@@ -32,7 +32,7 @@ static inline void htp_set_rows_vtcm_layout_build(
     struct htp_set_rows_vtcm_layout * vtcm_layout,
     int dst_type,
     uint32_t ne00,
-    uint32_t n_threads) {
+    uint32_t n_hvx) {
 
     size_t src0_row_size = ne00 * 4;
     size_t dst_row_size = 0;
@@ -57,12 +57,12 @@ static inline void htp_set_rows_vtcm_layout_build(
     vtcm_layout->src0_spad_half_size = src0_row_size_aligned;
     vtcm_layout->dst_spad_half_size  = dst_row_size_aligned;
 
-    vtcm_layout->src0_bytes_per_thread = src0_row_size_aligned * 2;
-    vtcm_layout->dst_bytes_per_thread  = dst_row_size_aligned * 2;
+    vtcm_layout->src0_bytes_per_hvx = src0_row_size_aligned * 2;
+    vtcm_layout->dst_bytes_per_hvx  = dst_row_size_aligned * 2;
 
-    vtcm_layout->off_src0 = 0;
-    vtcm_layout->off_dst  = vtcm_layout->off_src0 + vtcm_layout->src0_bytes_per_thread * n_threads;
-    vtcm_layout->total_bytes = vtcm_layout->off_dst + vtcm_layout->dst_bytes_per_thread * n_threads;
+    vtcm_layout->off_src0    = 0;
+    vtcm_layout->off_dst     = vtcm_layout->off_src0 + vtcm_layout->src0_bytes_per_hvx * n_hvx;
+    vtcm_layout->total_bytes = vtcm_layout->off_dst + vtcm_layout->dst_bytes_per_hvx * n_hvx;
 }
 
 #if defined(__cplusplus)

@@ -16,7 +16,7 @@
 
 struct htp_solve_tri_context {
     struct htp_ops_context * octx;
-    uint32_t                 jobs_per_thread;
+    uint32_t                 jobs_per_hvx;
     uint32_t                 total_jobs;
     uint32_t                 job_start;
     uint32_t                 k_chunks;
@@ -93,8 +93,8 @@ static void solve_tri_batch_thread_f32(unsigned int nth, unsigned int ith, void 
     const uint32_t col_block = VLEN_FP32;
     const uint32_t k_full    = (k / col_block) * col_block;
 
-    const uint32_t start_batch = sctx->job_start + sctx->jobs_per_thread * ith;
-    const uint32_t end_batch   = MIN(start_batch + sctx->jobs_per_thread, sctx->job_start + sctx->total_jobs);
+    const uint32_t start_batch = sctx->job_start + sctx->jobs_per_hvx * ith;
+    const uint32_t end_batch   = MIN(start_batch + sctx->jobs_per_hvx, sctx->job_start + sctx->total_jobs);
 
     struct htp_thread_trace * tr = &octx->ctx->trace[ith];
     htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) start_batch);
@@ -151,8 +151,8 @@ static void solve_tri_chunk_thread_f32(unsigned int nth, unsigned int ith, void 
 
     const uint32_t ne02 = src0->ne[2];
 
-    const uint32_t start_job = sctx->job_start + sctx->jobs_per_thread * ith;
-    const uint32_t end_job   = MIN(start_job + sctx->jobs_per_thread, sctx->job_start + sctx->total_jobs);
+    const uint32_t start_job = sctx->job_start + sctx->jobs_per_hvx * ith;
+    const uint32_t end_job   = MIN(start_job + sctx->jobs_per_hvx, sctx->job_start + sctx->total_jobs);
 
     struct htp_thread_trace * tr = &octx->ctx->trace[ith];
     htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) start_job);
@@ -227,7 +227,7 @@ int op_solve_tri(struct htp_ops_context * octx) {
     const uint32_t col_block     = VLEN_FP32;
     const uint32_t k_chunks      = (k + col_block - 1) / col_block;
     const uint32_t total_batches = src0->ne[2] * src0->ne[3];
-    const bool     batched       = total_batches >= (uint32_t) octx->n_threads;
+    const bool     batched       = total_batches >= (uint32_t) octx->n_hvx;
 
     FARF(HIGH, "solve-tri: (%ux%ux%ux%u) x (%ux%ux%ux%u) -> (%ux%ux%ux%u) : batched %d\n",
          src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
@@ -251,18 +251,18 @@ int op_solve_tri(struct htp_ops_context * octx) {
         }
 
         // Batch-level parallelism
-        const uint32_t n_threads = octx->n_threads;
+        const uint32_t n_hvx = octx->n_hvx;
 
         struct htp_solve_tri_context sctx = {
-            .octx            = octx,
-            .jobs_per_thread = fastdiv(njobs + n_threads - 1, &octx->n_threads_div),
-            .total_jobs      = njobs,
-            .job_start       = job_start,
-            .k_chunks        = k_chunks,
-            .col_block       = col_block,
+            .octx                         = octx,
+            .jobs_per_hvx                 = fastdiv(njobs + n_hvx - 1, &octx->n_hvx_div),
+            .total_jobs                   = njobs,
+            .job_start                    = job_start,
+            .k_chunks                     = k_chunks,
+            .col_block                    = col_block,
         };
 
-        work_queue_run(octx->ctx->work_queue, solve_tri_batch_thread_f32, &sctx, n_threads);
+        work_queue_run(octx->ctx->hvx_queue, solve_tri_batch_thread_f32, &sctx, n_hvx);
     } else {
         // Chunk-level parallelism
         const uint32_t total_jobs = total_batches * k_chunks;
@@ -281,18 +281,18 @@ int op_solve_tri(struct htp_ops_context * octx) {
             return HTP_STATUS_OK;
         }
 
-        const uint32_t n_threads = octx->n_threads;
+        const uint32_t n_hvx = octx->n_hvx;
 
         struct htp_solve_tri_context sctx = {
-            .octx            = octx,
-            .jobs_per_thread = fastdiv(njobs + n_threads - 1, &octx->n_threads_div),
-            .total_jobs      = njobs,
-            .job_start       = job_start,
-            .k_chunks        = k_chunks,
-            .col_block       = col_block,
+            .octx                         = octx,
+            .jobs_per_hvx                 = fastdiv(njobs + n_hvx - 1, &octx->n_hvx_div),
+            .total_jobs                   = njobs,
+            .job_start                    = job_start,
+            .k_chunks                     = k_chunks,
+            .col_block                    = col_block,
         };
 
-        work_queue_run(octx->ctx->work_queue, solve_tri_chunk_thread_f32, &sctx, n_threads);
+        work_queue_run(octx->ctx->hvx_queue, solve_tri_chunk_thread_f32, &sctx, n_hvx);
     }
 
     return HTP_STATUS_OK;

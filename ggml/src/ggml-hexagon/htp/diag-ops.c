@@ -37,7 +37,7 @@ struct htp_diag_context {
     size_t          dst_row_size;
     size_t          src_batch_size_aligned;
     size_t          dst_row_size_aligned;
-    uint32_t        batches_per_thread;
+    uint32_t        batches_per_hvx;
     uint32_t        total_batches;
     uint32_t        batch_start;
 };
@@ -61,8 +61,8 @@ static void diag_thread_f32_dma(unsigned int nth, unsigned int ith, void * data)
     htp_diag_preamble;
     dma_queue * dma_q = octx->ctx->dma[ith];
 
-    const uint32_t ib0 = dctx->batch_start + dctx->batches_per_thread * ith;
-    const uint32_t ib1 = MIN(ib0 + dctx->batches_per_thread, dctx->batch_start + dctx->total_batches);
+    const uint32_t ib0 = dctx->batch_start + dctx->batches_per_hvx * ith;
+    const uint32_t ib1 = MIN(ib0 + dctx->batches_per_hvx, dctx->batch_start + dctx->total_batches);
 
     if (ib0 >= ib1) {
         return;
@@ -127,8 +127,8 @@ static void diag_thread_f32(unsigned int nth, unsigned int ith, void * data) {
     const uint8_t * src_data = (const uint8_t *) src0->data;
     uint8_t *       dst_data = (uint8_t *) dst->data;
 
-    const uint32_t ib0 = dctx->batch_start + dctx->batches_per_thread * ith;
-    const uint32_t ib1 = MIN(ib0 + dctx->batches_per_thread, dctx->batch_start + dctx->total_batches);
+    const uint32_t ib0 = dctx->batch_start + dctx->batches_per_hvx * ith;
+    const uint32_t ib1 = MIN(ib0 + dctx->batches_per_hvx, dctx->batch_start + dctx->total_batches);
 
     struct htp_thread_trace * tr = &octx->ctx->trace[ith];
     htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) ib0);
@@ -186,7 +186,7 @@ int op_diag_f32(struct htp_ops_context * octx) {
         return HTP_STATUS_OK;
     }
 
-    const uint32_t n_threads     = octx->n_threads;
+    const uint32_t n_hvx         = octx->n_hvx;
 
     const size_t src_batch_size         = src0->ne[0] * sizeof(float);
     const size_t dst_row_size           = dst->ne[0] * sizeof(float);
@@ -194,35 +194,35 @@ int op_diag_f32(struct htp_ops_context * octx) {
     const size_t dst_row_size_aligned   = hex_round_up(dst_row_size, VLEN);
 
     // 1 src buffer + 1 dst row buffer per thread
-    const size_t spad_per_thread = src_batch_size_aligned + dst_row_size_aligned;
+    const size_t spad_per_hvx = src_batch_size_aligned + dst_row_size_aligned;
 
-    octx->src0_spad.size_per_thread = src_batch_size_aligned;
-    octx->dst_spad.size_per_thread  = dst_row_size_aligned;
+    octx->src0_spad.size_per_hvx = src_batch_size_aligned;
+    octx->dst_spad.size_per_hvx  = dst_row_size_aligned;
 
-    octx->src0_spad.size = n_threads * octx->src0_spad.size_per_thread;
-    octx->dst_spad.size  = n_threads * octx->dst_spad.size_per_thread;
+    octx->src0_spad.size = n_hvx * octx->src0_spad.size_per_hvx;
+    octx->dst_spad.size  = n_hvx * octx->dst_spad.size_per_hvx;
 
     octx->src0_spad.data = octx->ctx->vtcm_base;                        octx->src0_spad.src = NULL;
     octx->dst_spad.data  = octx->src0_spad.data + octx->src0_spad.size; octx->dst_spad.src  = NULL;
 
     struct htp_diag_context dctx = {
-        .octx                   = octx,
-        .src_batch_size         = src_batch_size,
-        .dst_row_size           = dst_row_size,
-        .src_batch_size_aligned = src_batch_size_aligned,
-        .dst_row_size_aligned   = dst_row_size_aligned,
-        .batches_per_thread     = fastdiv(nbatches + n_threads - 1, &octx->n_threads_div),
-        .total_batches          = nbatches,
-        .batch_start            = batch_start,
+        .octx                    = octx,
+        .src_batch_size          = src_batch_size,
+        .dst_row_size            = dst_row_size,
+        .src_batch_size_aligned  = src_batch_size_aligned,
+        .dst_row_size_aligned    = dst_row_size_aligned,
+        .batches_per_hvx         = fastdiv(nbatches + n_hvx - 1, &octx->n_hvx_div),
+        .total_batches           = nbatches,
+        .batch_start             = batch_start,
     };
 
-    if (octx->ctx->vtcm_size < spad_per_thread * n_threads) {
+    if (octx->ctx->vtcm_size < spad_per_hvx * n_hvx) {
         if (htp_tensor_is_extended(src0) || htp_tensor_is_extended(dst)) {
             return HTP_STATUS_NO_SUPPORT;
         }
-        work_queue_run(octx->ctx->work_queue, diag_thread_f32, &dctx, n_threads);
+        work_queue_run(octx->ctx->hvx_queue, diag_thread_f32, &dctx, n_hvx);
     } else {
-        work_queue_run(octx->ctx->work_queue, diag_thread_f32_dma, &dctx, n_threads);
+        work_queue_run(octx->ctx->hvx_queue, diag_thread_f32_dma, &dctx, n_hvx);
     }
 
     return HTP_STATUS_OK;

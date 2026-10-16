@@ -780,7 +780,7 @@ static void gated_delta_net_f32_pp_thread(unsigned int nth, unsigned int ith, vo
     dma_queue * dma_q = octx->ctx->dma[ith];
     const struct htp_gdn_vtcm_layout * layout = &gctx->layout;
     float * s_work[2];
-    s_work[0] = (float *) (gctx->vtcm_base + layout->bytes_per_thread * ith);
+    s_work[0] = (float *) (gctx->vtcm_base + layout->bytes_per_hvx * ith);
     s_work[1] = s_work[0] + layout->state_aligned / sizeof(float);
 
     const struct fastdiv_values * fd_H   = &kparams->div_H;
@@ -921,7 +921,7 @@ static void gated_delta_net_f32_tg_thread(unsigned int nth, unsigned int ith, vo
     dma_queue * dma_q = octx->ctx->dma[ith];
     const struct htp_gdn_vtcm_layout * layout = &gctx->layout;
     float * s_work[2];
-    s_work[0] = (float *) (gctx->vtcm_base + layout->bytes_per_thread * ith);
+    s_work[0] = (float *) (gctx->vtcm_base + layout->bytes_per_hvx * ith);
     s_work[1] = s_work[0] + layout->state_aligned / sizeof(float);
 
     const struct fastdiv_values * fd_H   = &kparams->div_H;
@@ -1622,7 +1622,7 @@ static inline void gdn_init_head_ptrs(
     head->rows_inv = VTCM_LAYOUT_PTR(HVX_Vector, vtcm_base, L->off_rows_inv + h * row_vecs_sz);
     head->rows_a   = VTCM_LAYOUT_PTR(HVX_Vector, vtcm_base, L->off_rows_a + h * row_vecs_sz);
 
-    head->vtcm_m   = VTCM_LAYOUT_PTR(HVX_Vector, vtcm_base, L->off_thread_scratch + h * (64 * 128));
+    head->vtcm_m   = VTCM_LAYOUT_PTR(HVX_Vector, vtcm_base, L->off_hvx_scratch + h * (64 * 128));
     head->vtcm_tmp = head->vtcm_m + 32;
 
     head->iv1 = base_iv1 + h;
@@ -2042,7 +2042,7 @@ static int gated_delta_net_f32_hmx_chunked(
     const uint32_t n_sv_tiles = S_v / 32;
 
     struct htp_gdn_hmx_vtcm_layout L;
-    htp_gdn_hmx_vtcm_layout_build(&L, S_v, chunk_size, kparams->n_heads_batch, kparams->n_threads, kparams->pipeline != 0);
+    htp_gdn_hmx_vtcm_layout_build(&L, S_v, chunk_size, kparams->n_heads_batch, kparams->n_hvx, kparams->pipeline != 0);
 
     if (L.total_bytes > octx->ctx->vtcm_size) {
         return HTP_STATUS_VTCM_TOO_SMALL;
@@ -2064,7 +2064,7 @@ static int gated_delta_net_f32_hmx_chunked(
 
     hmx_queue_t  hmx_q = octx->ctx->hmx_queue;
     dma_queue *  dma_q = octx->ctx->dma[0];
-    work_queue_t wp    = octx->ctx->work_queue;
+    work_queue_t wp    = octx->ctx->hvx_queue;
 
     struct htp_gdn_head_ptrs heads[8];
     struct htp_gdn_hmx_gemm_task gemm_tasks[8][9];
@@ -2330,21 +2330,21 @@ int op_gated_delta_net(struct htp_ops_context * octx) {
         const uint32_t rq3 = n_seqs / q->ne[3];
         const uint32_t rk3 = n_seqs / k->ne[3];
         const uint32_t total_rows = H * n_seqs;
-        uint32_t n_threads = (total_rows < octx->n_threads) ? total_rows : octx->n_threads;
-        if (n_threads == 0) {
-            n_threads = 1;
+        uint32_t n_hvx = (total_rows < octx->n_hvx) ? total_rows : octx->n_hvx;
+        if (n_hvx == 0) {
+            n_hvx = 1;
         }
 
         memset(&kparams_local, 0, sizeof(kparams_local));
-        kparams_local.n_threads           = n_threads;
+        kparams_local.n_hvx               = n_hvx;
         kparams_local.S_v                 = S_v;
         kparams_local.H                   = H;
         kparams_local.n_tokens            = n_tokens;
         kparams_local.n_seqs              = n_seqs;
         kparams_local.K                   = K;
         kparams_local.total_rows          = total_rows;
-        kparams_local.rows_per_thread     = (total_rows + n_threads - 1) / n_threads;
-        const bool can_use_hmx = (octx->ctx->hmx_enabled) &&
+        kparams_local.rows_per_hvx        = (total_rows + n_hvx - 1) / n_hvx;
+        const bool can_use_hmx            = (octx->ctx->hmx_enabled) &&
                                  (S_v % 64 == 0) &&
                                  (n_tokens >= HTP_GDN_MIN_TOKENS) &&
                                  (g->ne[0] == 1) &&
@@ -2354,7 +2354,7 @@ int op_gated_delta_net(struct htp_ops_context * octx) {
         struct htp_gdn_vtcm_layout hvx_layout_local;
         uint32_t n_heads_batch = 1;
 
-        if (can_use_hmx && htp_gdn_hmx_solve_layout(&hmx_layout_local, S_v, HTP_GDN_CHUNK_SIZE, total_rows, octx->ctx->vtcm_size, n_threads, true, &n_heads_batch)) {
+        if (can_use_hmx && htp_gdn_hmx_solve_layout(&hmx_layout_local, S_v, HTP_GDN_CHUNK_SIZE, total_rows, octx->ctx->vtcm_size, n_hvx, true, &n_heads_batch)) {
             kparams_local.kernel_type     = HTP_GDN_KERNEL_HMX_CHUNKED;
             kparams_local.pipeline        = hmx_layout_local.pipeline ? 1 : 0;
             kparams_local.chunk_size      = HTP_GDN_CHUNK_SIZE;
@@ -2362,14 +2362,14 @@ int op_gated_delta_net(struct htp_ops_context * octx) {
             kparams_local.n_heads_batch   = (uint16_t) n_heads_batch;
             kparams_local.vtcm_size       = (uint32_t) hmx_layout_local.total_bytes;
             kparams_local.state_aligned   = (uint32_t) hmx_layout_local.state_f32_bytes;
-            kparams_local.vtcm_per_thread = (uint32_t) (hmx_layout_local.total_bytes / (n_threads > 0 ? n_threads : 1));
+            kparams_local.vtcm_per_hvx    = (uint32_t) (hmx_layout_local.total_bytes / (n_hvx > 0 ? n_hvx : 1));
         } else {
-            htp_gdn_vtcm_layout_build(&hvx_layout_local, S_v, n_threads);
+            htp_gdn_vtcm_layout_build(&hvx_layout_local, S_v, n_hvx);
             kparams_local.kernel_type     = HTP_GDN_KERNEL_HVX_RECURRENT;
             kparams_local.pipeline        = 0;
             kparams_local.n_heads_batch   = 1;
             kparams_local.state_aligned   = (uint32_t) hvx_layout_local.state_aligned;
-            kparams_local.vtcm_per_thread = (uint32_t) hvx_layout_local.bytes_per_thread;
+            kparams_local.vtcm_per_hvx    = (uint32_t) hvx_layout_local.bytes_per_hvx;
             kparams_local.vtcm_size       = (uint32_t) hvx_layout_local.total_bytes;
         }
         kparams_local.kda                 = (g->ne[0] == S_v) ? 1 : 0;
@@ -2382,7 +2382,7 @@ int op_gated_delta_net(struct htp_ops_context * octx) {
         kparams_local.div_k1        = init_fastdiv_values(k->ne[1]);
         kparams_local.div_rq3       = init_fastdiv_values(rq3);
         kparams_local.div_rk3       = init_fastdiv_values(rk3);
-        kparams_local.div_n_threads = init_fastdiv_values(n_threads);
+        kparams_local.div_n_hvx     = init_fastdiv_values(n_hvx);
 
         kparams = &kparams_local;
     }
@@ -2416,7 +2416,7 @@ int op_gated_delta_net(struct htp_ops_context * octx) {
         return gated_delta_net_f32_hmx_chunked(octx, kparams, row_start, nrows);
     }
 
-    const uint32_t n_threads = (nrows < kparams->n_threads) ? nrows : kparams->n_threads;
+    const uint32_t n_hvx = (nrows < kparams->n_hvx) ? nrows : kparams->n_hvx;
 
     struct htp_gdn_context gctx;
     gctx.octx      = octx;
@@ -2425,25 +2425,25 @@ int op_gated_delta_net(struct htp_ops_context * octx) {
     gctx.nrows     = nrows;
     gctx.vtcm_base = octx->ctx->vtcm_base;
 
-    htp_gdn_vtcm_layout_build(&gctx.layout, S_v, n_threads);
+    htp_gdn_vtcm_layout_build(&gctx.layout, S_v, n_hvx);
 
     if (gctx.layout.total_bytes > octx->ctx->vtcm_size) {
         return HTP_STATUS_VTCM_TOO_SMALL;
     }
 
     FARF(HIGH, "gated-delta-net-f32: q(%ux%ux%ux%u) k(%ux%ux%ux%u) v(%ux%ux%ux%u) state(%ux%ux%ux%u) -> (%ux%ux%ux%u) : "
-         "vtcm-size %zu n_threads %u\n",
+         "vtcm-size %zu n_hvx %u\n",
          q->ne[0], q->ne[1], q->ne[2], q->ne[3],
          k->ne[0], k->ne[1], k->ne[2], k->ne[3],
          v->ne[0], v->ne[1], v->ne[2], v->ne[3],
          state->ne[0], state->ne[1], state->ne[2], state->ne[3],
          dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],
-         gctx.layout.total_bytes, n_threads);
+         gctx.layout.total_bytes, n_hvx);
 
     if (n_tokens == 1) {
-        work_queue_run(octx->ctx->work_queue, gated_delta_net_f32_tg_thread, &gctx, n_threads);
+        work_queue_run(octx->ctx->hvx_queue, gated_delta_net_f32_tg_thread, &gctx, n_hvx);
     } else {
-        work_queue_run(octx->ctx->work_queue, gated_delta_net_f32_pp_thread, &gctx, n_threads);
+        work_queue_run(octx->ctx->hvx_queue, gated_delta_net_f32_pp_thread, &gctx, n_hvx);
     }
 
     return HTP_STATUS_OK;

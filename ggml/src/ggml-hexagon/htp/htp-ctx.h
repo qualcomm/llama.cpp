@@ -35,7 +35,7 @@ struct htp_spad {
     uint8_t *                 data;            // pointer to an area in vtcm
     uint32_t                  stride;          // stride used inside this spad
     uint32_t                  size;            // total size
-    uint32_t                  size_per_thread; // size per thread
+    uint32_t                  size_per_hvx;    // size per hvx
 };
 
 struct htp_mdev_group {
@@ -71,8 +71,8 @@ struct htp_ops_context {
     struct htp_spad dst_spad;
 
     uint32_t              flags;
-    uint32_t              n_threads;
-    struct fastdiv_values n_threads_div;
+    uint32_t              n_hvx;
+    struct fastdiv_values n_hvx_div;
     int                   status;
 };
 
@@ -83,11 +83,12 @@ struct htp_context {
     struct htp_mmap        mmap[HTP_MAX_MMAPS];
     dma_queue_t            dma[HTP_MAX_NTHREADS];
     struct htp_thread_trace trace[HTP_MAX_NTHREADS + 1];
-    work_queue_t           work_queue;
+    work_queue_t           hvx_queue;
     hmx_queue_t            hmx_queue;
 
     uint32_t               n_threads;
-    struct fastdiv_values  n_threads_div;
+    uint32_t               n_hvx;
+    struct fastdiv_values  n_hvx_div;
 
     int                    thread_id;
     int                    thread_prio;
@@ -118,16 +119,16 @@ struct htp_context {
     size_t                 footprint;
 };
 
-static inline bool htp_ops_context_set_n_threads(struct htp_ops_context * octx, uint32_t n_threads) {
-    if (n_threads == 0 || n_threads > octx->ctx->n_threads) {
+static inline bool htp_ops_context_set_n_hvx(struct htp_ops_context * octx, uint32_t n_hvx) {
+    if (n_hvx == 0 || n_hvx > octx->ctx->n_hvx) {
         return false;
     }
 
-    if (n_threads != octx->n_threads) {
-        octx->n_threads = n_threads;
-        octx->n_threads_div = n_threads == octx->ctx->n_threads
-            ? octx->ctx->n_threads_div
-            : init_fastdiv_values(n_threads);
+    if (n_hvx != octx->n_hvx) {
+        octx->n_hvx = n_hvx;
+        octx->n_hvx_div = n_hvx == octx->ctx->n_hvx
+            ? octx->ctx->n_hvx_div
+            : init_fastdiv_values(n_hvx);
     }
 
     return true;

@@ -23,7 +23,7 @@ struct htp_roll_context {
 
     uint32_t row_start;
     uint32_t nrows;
-    uint32_t nrows_per_thread;
+    uint32_t nrows_per_hvx;
 
     struct fastdiv_values div_ne1;
     struct fastdiv_values div_ne2_ne1;
@@ -204,8 +204,8 @@ static void roll_thread_f32(unsigned int nth, unsigned int ith, void * data) {
 
     htp_roll_preamble;
 
-    const uint32_t row_start = rctx->row_start + rctx->nrows_per_thread * ith;
-    const uint32_t row_end   = MIN(row_start + rctx->nrows_per_thread, rctx->row_start + rctx->nrows);
+    const uint32_t row_start = rctx->row_start + rctx->nrows_per_hvx * ith;
+    const uint32_t row_end   = MIN(row_start + rctx->nrows_per_hvx, rctx->row_start + rctx->nrows);
     if (row_start >= row_end) {
         return;
     }
@@ -290,17 +290,17 @@ int execute_op_roll_f32(struct htp_ops_context * octx) {
         return HTP_STATUS_NO_SUPPORT;
     }
 
-    const uint32_t n_threads = octx->n_threads;
+    const uint32_t n_hvx         = octx->n_hvx;
     struct htp_roll_context rctx = {
-        .octx             = octx,
-        .row_start        = row_start,
-        .nrows            = nrows,
-        .nrows_per_thread = fastdiv(nrows + n_threads - 1, &octx->n_threads_div),
-        .div_ne1          = init_fastdiv_values(dst->ne[1]),
-        .div_ne2_ne1      = init_fastdiv_values(dst->ne[2] * dst->ne[1]),
+        .octx                    = octx,
+        .row_start               = row_start,
+        .nrows                   = nrows,
+        .nrows_per_hvx           = fastdiv(nrows + n_hvx - 1, &octx->n_hvx_div),
+        .div_ne1                 = init_fastdiv_values(dst->ne[1]),
+        .div_ne2_ne1             = init_fastdiv_values(dst->ne[2] * dst->ne[1]),
     };
 
-    work_queue_run(octx->ctx->work_queue, roll_thread_f32, &rctx, n_threads);
+    work_queue_run(octx->ctx->hvx_queue, roll_thread_f32, &rctx, n_hvx);
 
     return HTP_STATUS_OK;
 }

@@ -30,9 +30,4 @@ static inline bool work_queue_run(work_queue_t q, work_queue_func_t func, void *
     return work_queue_run_async(q, func, data, n);
 }
 
-// Legacy compatibility
-typedef work_queue_func_t     worker_callback_t;
-#define worker_pool_run_func  work_queue_run
-#define worker_pool           work_queue
-
 #endif  // #ifndef HTP_WORK_QUEUE_H

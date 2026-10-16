@@ -19,8 +19,8 @@ enum htp_copy_kernel_type {
 struct htp_copy_convert_params {
     uint32_t              src0_buf_size;
     uint32_t              dst_buf_size;
-    uint32_t              spad0_size_per_thread;
-    uint32_t              spad1_size_per_thread;
+    uint32_t              spad0_size_per_hvx;
+    uint32_t              spad1_size_per_hvx;
     uint32_t              src0_row_stride;  // row pitch in the VTCM buffers
     uint32_t              dst_row_stride;
     uint32_t              blk_rows;         // rows moved per DMA descriptor
@@ -41,7 +41,7 @@ struct htp_copy_kernel_params {
     uint8_t  kernel_type;
     uint8_t  src0_type_size;
     uint8_t  dst_type_size;
-    uint8_t  n_threads;
+    uint8_t  n_hvx;
 
     uint32_t total_elems;
     uint32_t total_rows;
@@ -55,8 +55,8 @@ struct htp_copy_kernel_params {
 };
 
 // Size of one VTCM staging buffer: big enough that a DMA descriptor moves many short
-// rows at once. The copy kernels keep four per thread (two in flight each way), about
-// 1 MB of VTCM with 8 threads.
+// rows at once. The copy kernels keep four per hvx unit (two in flight each way), about
+// 1 MB of VTCM with 8 hvx units.
 #define HTP_COPY_VTCM_BLK_BYTES (32 * 1024)
 
 struct htp_copy_convert_vtcm_layout {
@@ -65,8 +65,8 @@ struct htp_copy_convert_vtcm_layout {
     uint32_t blk_rows;
     uint32_t src0_buf_size;
     uint32_t dst_buf_size;
-    uint32_t spad0_size_per_thread;
-    uint32_t spad1_size_per_thread;
+    uint32_t spad0_size_per_hvx;
+    uint32_t spad1_size_per_hvx;
     uint32_t total_bytes;
 };
 
@@ -77,7 +77,7 @@ static inline void htp_copy_convert_vtcm_layout_build(
     uint32_t ne01,
     uint32_t src_type_size,
     uint32_t dst_type_size,
-    uint32_t n_threads) {
+    uint32_t n_hvx) {
 
     layout->src0_row_stride = hex_round_up(ne00 * src_type_size, 256);
     layout->dst_row_stride  = hex_round_up(ne00 * dst_type_size, 256);
@@ -92,11 +92,11 @@ static inline void htp_copy_convert_vtcm_layout_build(
     }
     layout->blk_rows = blk_rows;
 
-    layout->src0_buf_size = blk_rows * layout->src0_row_stride;
-    layout->dst_buf_size  = blk_rows * layout->dst_row_stride;
-    layout->spad0_size_per_thread = 2 * layout->src0_buf_size;
-    layout->spad1_size_per_thread = 2 * layout->dst_buf_size;
-    layout->total_bytes = n_threads * (layout->spad0_size_per_thread + layout->spad1_size_per_thread);
+    layout->src0_buf_size      = blk_rows * layout->src0_row_stride;
+    layout->dst_buf_size       = blk_rows * layout->dst_row_stride;
+    layout->spad0_size_per_hvx = 2 * layout->src0_buf_size;
+    layout->spad1_size_per_hvx = 2 * layout->dst_buf_size;
+    layout->total_bytes        = n_hvx * (layout->spad0_size_per_hvx + layout->spad1_size_per_hvx);
 }
 
 #if defined(__cplusplus)

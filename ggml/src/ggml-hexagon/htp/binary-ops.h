@@ -21,7 +21,7 @@ enum htp_binary_kernel_type {
 
 struct htp_binary_kernel_params {
     uint32_t kernel_type;
-    uint32_t n_threads;
+    uint32_t n_hvx;
     uint32_t rows_per_buffer;
 
     uint32_t src0_row_size_aligned;
@@ -75,9 +75,9 @@ struct htp_binary_vtcm_layout {
     size_t off_src2;
     size_t off_dst;
 
-    size_t src0_bytes_per_thread;
-    size_t src1_bytes_per_thread;
-    size_t dst_bytes_per_thread;
+    size_t src0_bytes_per_hvx;
+    size_t src1_bytes_per_hvx;
+    size_t dst_bytes_per_hvx;
 
     size_t src0_spad_half_size;
     size_t src1_spad_half_size;
@@ -95,8 +95,8 @@ static inline void htp_binary_vtcm_layout_build(
 ) {
     memset(L, 0, sizeof(*L));
 
-    const uint32_t n_threads = kparams->n_threads;
-    if (n_threads == 0) {
+    const uint32_t n_hvx = kparams->n_hvx;
+    if (n_hvx == 0) {
         return;
     }
 
@@ -106,9 +106,9 @@ static inline void htp_binary_vtcm_layout_build(
             return;
         }
 
-        L->src0_bytes_per_thread = 2 * chunk_bytes;
-        L->src1_bytes_per_thread = kparams->is_scalar ? 0 : (2 * chunk_bytes);
-        L->dst_bytes_per_thread  = 2 * chunk_bytes;
+        L->src0_bytes_per_hvx = 2 * chunk_bytes;
+        L->src1_bytes_per_hvx = kparams->is_scalar ? 0 : (2 * chunk_bytes);
+        L->dst_bytes_per_hvx  = 2 * chunk_bytes;
 
         L->src0_spad_half_size = chunk_bytes;
         L->src1_spad_half_size = kparams->is_scalar ? 0 : chunk_bytes;
@@ -117,9 +117,9 @@ static inline void htp_binary_vtcm_layout_build(
         L->rows_per_buffer = 1;
         L->src1_size = 0;
 
-        const size_t src0_total = n_threads * L->src0_bytes_per_thread;
-        const size_t src1_total = kparams->is_scalar ? 128 : (n_threads * L->src1_bytes_per_thread);
-        const size_t dst_total  = n_threads * L->dst_bytes_per_thread;
+        const size_t src0_total = n_hvx * L->src0_bytes_per_hvx;
+        const size_t src1_total = kparams->is_scalar ? 128 : (n_hvx * L->src1_bytes_per_hvx);
+        const size_t dst_total  = n_hvx * L->dst_bytes_per_hvx;
 
         size_t off = 0;
         VTCM_LAYOUT_ALLOC(off, off_src0, src0_total);
@@ -143,7 +143,7 @@ static inline void htp_binary_vtcm_layout_build(
         return;
     }
 
-    const size_t rows_per_buffer = (vtcm_size - static_vtcm_size) / (n_threads * spad_row_total);
+    const size_t rows_per_buffer = (vtcm_size - static_vtcm_size) / (n_hvx * spad_row_total);
     if (rows_per_buffer == 0) {
         return;
     }
@@ -152,22 +152,22 @@ static inline void htp_binary_vtcm_layout_build(
     L->src1_size = kparams->src1_size;
     L->src2_size = kparams->src2_size;
 
-    L->src0_bytes_per_thread = rows_per_buffer * 2 * kparams->src0_row_size_aligned;
-    L->dst_bytes_per_thread  = rows_per_buffer * 2 * kparams->dst_row_size_aligned;
-    L->src1_bytes_per_thread = (kparams->kernel_type == HTP_BINARY_KERNEL_SAME_SHAPE)
+    L->src0_bytes_per_hvx = rows_per_buffer * 2 * kparams->src0_row_size_aligned;
+    L->dst_bytes_per_hvx  = rows_per_buffer * 2 * kparams->dst_row_size_aligned;
+    L->src1_bytes_per_hvx = (kparams->kernel_type == HTP_BINARY_KERNEL_SAME_SHAPE)
         ? rows_per_buffer * 2 * kparams->src1_row_size_aligned
         : 0;
 
-    L->src0_spad_half_size = L->src0_bytes_per_thread / 2;
-    L->src1_spad_half_size = L->src1_bytes_per_thread / 2;
-    L->dst_spad_half_size  = L->dst_bytes_per_thread / 2;
+    L->src0_spad_half_size = L->src0_bytes_per_hvx / 2;
+    L->src1_spad_half_size = L->src1_bytes_per_hvx / 2;
+    L->dst_spad_half_size  = L->dst_bytes_per_hvx / 2;
 
-    const size_t src0_total = n_threads * L->src0_bytes_per_thread;
+    const size_t src0_total = n_hvx * L->src0_bytes_per_hvx;
     const size_t src1_total = (kparams->src1_size > 0)
         ? kparams->src1_size
-        : n_threads * L->src1_bytes_per_thread;
+        : n_hvx * L->src1_bytes_per_hvx;
     const size_t src2_total = kparams->src2_size;
-    const size_t dst_total  = n_threads * L->dst_bytes_per_thread;
+    const size_t dst_total  = n_hvx * L->dst_bytes_per_hvx;
 
     size_t off = 0;
     VTCM_LAYOUT_ALLOC(off, off_src0, src0_total);
