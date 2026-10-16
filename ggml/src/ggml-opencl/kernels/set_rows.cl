@@ -707,7 +707,7 @@ kernel void kernel_set_rows_q4_0_soa_i32(
     }
 }
 
-// f16 -> f16 (qwen4exp scatters f16 zeros into its QSA mask), moved as raw bits
+// f16 -> f16, moved as raw bits
 
 kernel void kernel_set_rows_f16_f16_i64(
         global char * src0,

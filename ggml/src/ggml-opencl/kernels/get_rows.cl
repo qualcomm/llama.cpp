@@ -192,7 +192,7 @@ kernel void kernel_get_rows_q4_0(
     }
 }
 
-// i32 rows (qwen4exp gathers its QSA pool cell indices), copied as integers
+// i32 rows, copied as integers
 kernel void kernel_get_rows_i32(
         global void * src0,
         ulong offset0,

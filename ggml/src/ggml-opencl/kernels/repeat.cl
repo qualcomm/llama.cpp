@@ -23,8 +23,8 @@ kernel void kernel_repeat_f32(
 
     const int i3 = get_group_id(2);
     const int i2 = get_group_id(1);
-    // a row may be split into nchunks workgroups: a long row with few rows of its kind
-    // (e.g. one mask row broadcast per token) would otherwise run on one compute unit
+    // a row may be split into nchunks workgroups, so a long row repeated only a
+    // few times does not run on a single compute unit
     const int i1    = get_group_id(0) / nchunks;
     const int chunk = get_group_id(0) % nchunks;
     const int span  = (ne0 + nchunks - 1) / nchunks;
@@ -70,8 +70,8 @@ kernel void kernel_repeat_f16(
 
     const int i3 = get_group_id(2);
     const int i2 = get_group_id(1);
-    // a row may be split into nchunks workgroups: a long row with few rows of its kind
-    // (e.g. one mask row broadcast per token) would otherwise run on one compute unit
+    // a row may be split into nchunks workgroups, so a long row repeated only a
+    // few times does not run on a single compute unit
     const int i1    = get_group_id(0) / nchunks;
     const int chunk = get_group_id(0) % nchunks;
     const int span  = (ne0 + nchunks - 1) / nchunks;

@@ -634,10 +634,9 @@ __kernel void kernel_gemv_moe_q4_k_f32_ns_glu_wimg(
 
 // Merged gate_up GLU GEMV, contiguous-chunk variant. Same layout and math as
 // kernel_gemv_moe_q4_k_f32_ns_glu, but each subgroup takes a contiguous run of the row's
-// 32-element sub-blocks instead of every 4th one, so it walks whole super-blocks: the
-// row's 12 scale bytes are fetched once per super-block (one vload3) and decoded for all
-// 8 sub-blocks, instead of being re-read per sub-block from addresses a row (120 B at
-// K=2560) apart across the lanes. Summation order differs from the per-op path.
+// 32-element sub-blocks instead of every 4th one, so it walks whole super-blocks and
+// fetches the row's 12 scale bytes once per super-block (one vload3) instead of once per
+// sub-block. Summation order differs from the per-op path.
 static inline float moe_q4k_row_dot_cs(
         global const uint  * q,
         global const half  * d,
@@ -761,9 +760,8 @@ __kernel void kernel_gemv_moe_q4_k_f32_ns_glu_cs(
     }
 }
 
-// Separate gate/up GLU GEMV, contiguous-chunk variant of kernel_gemv_moe_q4_k_f32_ns_glu2 (the
-// layout the published Qwen3.8-Flash-Next / qwen4exp GGUFs use): one scale fetch per super-block
-// per row, as in kernel_gemv_moe_q4_k_f32_ns_glu_cs.
+// Separate gate/up GLU GEMV, contiguous-chunk variant of kernel_gemv_moe_q4_k_f32_ns_glu2:
+// one scale fetch per super-block per row, as in kernel_gemv_moe_q4_k_f32_ns_glu_cs.
 __attribute__((qcom_reqd_sub_group_size("half")))
 __kernel void kernel_gemv_moe_q4_k_f32_ns_glu2_cs(
     __global uint *         gate_q,

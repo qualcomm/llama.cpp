@@ -1631,7 +1631,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_fa_sparse_gather  = nullptr;       // ... gathered into dense K/V/mask
     int       lightning_indexer_rk = 1;                 // LI_RK: K rows per lane
     int       lightning_indexer_tq = 8;                 // LI_TQ of the multi-token tile
-    // the qwen4exp QSA mask is built from i32 indices and f16 rows
+    // i32 / f16 variants of GET_ROWS, CPY, FILL, REPEAT and SET_ROWS
     cl_kernel kernel_get_rows_i32         = nullptr;
     cl_kernel kernel_cpy_i32_f32          = nullptr;
     cl_kernel kernel_cpy_f32_i32          = nullptr;
@@ -6416,9 +6416,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             if (err != CL_SUCCESS) backend_ctx->kernel_mul_mv_q4_K_f32_flat_ndst8 = nullptr;
             CL_CHECK(clReleaseProgram(prog8));
         }
-        // Few-row variant (Adreno): with N_DST=16 a weight of a handful of rows is one
-        // subgroup computing 16 rows serially over K; the qwen4exp hyper-connection
-        // inject (10240 x 4) took 74 us that way.
+        // Few-row variant (Adreno): with N_DST=16 a weight of a handful of rows runs as
+        // one subgroup computing 16 rows serially over K, leaving the GPU mostly idle.
         if (backend_ctx->gpu_family == ADRENO) {
             const std::string q4k_ndst4_opts = compile_opts + " -D Q4K_N_DST_OVERRIDE=4";
             cl_program prog4 =
@@ -20220,11 +20219,9 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
             if (adreno_art_compiler_quirks(backend_ctx)) {
                 const bool f16_kv = q->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
                                     k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16;
-                // Head size 256 with the n_kv_max hint (qwen4exp QSA): the op gathers the visible
-                // cells and runs the decomposed path over them. On the 850 the 6 f16 head-256 sparse
-                // cases pass, the QSA decode op is 0.45 ms flat from 4K to 32K, and qwen4exp
-                // real-dims pp512 goes 487 -> 812 t/s at d32768 (895 -> 1067 at d8192) with tg
-                // unchanged. GGML_OPENCL_E17_FA_SPARSE_256=0 keeps it on the unfused path.
+                // Head size 256 is admitted only with the n_kv_max hint (e.g. qwen4exp QSA): the op
+                // then gathers the visible cells and runs the decomposed path over them.
+                // GGML_OPENCL_E17_FA_SPARSE_256=0 keeps such layers on the unfused path.
                 static const bool sparse256 = []{
                     const char * e = getenv("GGML_OPENCL_E17_FA_SPARSE_256");
                     return !(e && e[0] == '0');
@@ -29628,11 +29625,8 @@ static void ggml_cl_mul_mat_id_q4_k_glu_fused(ggml_backend_t backend, ggml_tenso
     if (use_moe_decode_wimg) {
         kernel = backend_ctx->kernel_gemv_moe_q4_k_f32_ns_glu_wimg;
     }
-    // Contiguous K chunks per subgroup, one scale fetch per super-block. The kernel is 1.48x
-    // on the X2-90 (qwen4exp 2560 -> 2x640, 0.249 -> 0.168 ms) and 1.3-1.6x on the 840;
-    // gemma-4-26B-A4B tg64 31.6 -> 34.4 on the X2-90. GGML_OPENCL_MOE_GLU_CS=0 keeps the
-    // interleaved kernel (summation order differs; KLD vs it is at the level of a split-K
-    // reorder on the same model).
+    // Contiguous K chunks per subgroup, so the q4_K scales are fetched once per super-block.
+    // The summation order differs from the interleaved kernel; GGML_OPENCL_MOE_GLU_CS=0 keeps it.
     static const bool moe_glu_cs = []{
         const char * e = getenv("GGML_OPENCL_MOE_GLU_CS");
         return !(e && e[0] == '0');
@@ -34348,15 +34342,10 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
             if (e && e[0]) { return e[0] != '0'; }
             return backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E;
         }();
-        // gqa == 12 is qwen4exp (n_head 24, n_head_kv 2, dk=dv=256), whose QSA layers decode over
-        // the gathered cells of the sparse path; without this it runs the per-query-head q1
-        // kernel. QSA decode op (2048 visible cells), us/run, matched A/B/A/B:
-        //   X2-90  587 -> 297 (hs 6; hs 3 318, hs 4 327, hs 2 429; hs 1 aborts the build)
-        //   840    951-1030 -> 676-693
-        // Both pass the 119 gqa-12 FLASH_ATTN_EXT cases. Default on for those two generations
-        // only; the 850 (E17) takes the decomposed path and is not measured here.
-        // GGML_OPENCL_FA_MQN_GQA12=0/1 forces it.
-        // NOT static: the value depends on the DEVICE.
+        // gqa == 12 (e.g. qwen4exp: 24 query heads over 2 KV heads, dk=dv=256) otherwise matches
+        // no MQ route and decodes with the per-query-head q1 kernel. Enabled on X2E and A8X, the
+        // two generations it is measured on; GGML_OPENCL_FA_MQN_GQA12=0/1 forces it.
+        // Not static: the value depends on the device.
         const bool mqn_gqa12 = [&]{
             const char * e = getenv("GGML_OPENCL_FA_MQN_GQA12");
             if (e && e[0]) { return e[0] != '0'; }
@@ -34399,7 +34388,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
             // allocation actually exceeds the device cap.
             int hs  = (d_head_q == 512) ? ((gqa == 8) ? 4 : ((gqa == 16) ? 8 : 1))
                     : (d_head_q == 128 && gqa == 16) ? 16
-                    : (gqa == 12) ? 6   // MQ_GQA 2; a 12-wide fold (hs 1) aborts the build on the X2-90
+                    : (gqa == 12) ? 6   // MQ_GQA 2; a 12-wide fold (hs 1) does not build on the X2-90
                     : ((gqa == 8) ? 2 : 1);
             int nsg = (d_head_q == 256 && gqa == 8) ? 2 : 4;
             static const int hs_env  = []{ const char * e = getenv("GGML_OPENCL_FA_MQN_HS");
