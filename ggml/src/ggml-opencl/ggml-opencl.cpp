@@ -1579,6 +1579,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mv_q4_K_f32;
     cl_kernel kernel_mul_mv_q4_K_f32_flat;
     cl_kernel kernel_mul_mv_q4_K_f32_flat_ndst8 = nullptr; // small-m variant (Intel): N_DST=8 raises subgroup count/occupancy
+    cl_kernel kernel_mul_mv_q4_K_f32_flat_ndst4 = nullptr; // few-row variant (Adreno): N_DST=4 for weights of <= 256 rows
     cl_kernel kernel_mul_mv_q4_k_q8_1 = nullptr;           // int8 q8_1 decode GEMV (Intel small-m, noshuffle weight)
     cl_kernel kernel_quant_a_q8_1_i = nullptr;             // activation f32->q8_1 (Intel; Adreno's is behind USE_ADRENO_KERNELS)
     // Persistent q8_1 activation scratch for the int8 decode GEMV — grown on demand
@@ -6412,6 +6413,17 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             backend_ctx->kernel_mul_mv_q4_K_f32_flat_ndst8 = clCreateKernel(prog8, "kernel_mul_mv_q4_K_f32_flat", &err);
             if (err != CL_SUCCESS) backend_ctx->kernel_mul_mv_q4_K_f32_flat_ndst8 = nullptr;
             CL_CHECK(clReleaseProgram(prog8));
+        }
+        // Few-row variant (Adreno): with N_DST=16 a weight of a handful of rows is one
+        // subgroup computing 16 rows serially over K; the qwen4exp hyper-connection
+        // inject (10240 x 4) took 74 us that way.
+        if (backend_ctx->gpu_family == ADRENO) {
+            const std::string q4k_ndst4_opts = compile_opts + " -D Q4K_N_DST_OVERRIDE=4";
+            cl_program prog4 =
+                build_program_from_source(backend_ctx, kernel_src.c_str(), q4k_ndst4_opts);
+            backend_ctx->kernel_mul_mv_q4_K_f32_flat_ndst4 = clCreateKernel(prog4, "kernel_mul_mv_q4_K_f32_flat", &err);
+            if (err != CL_SUCCESS) backend_ctx->kernel_mul_mv_q4_K_f32_flat_ndst4 = nullptr;
+            CL_CHECK(clReleaseProgram(prog4));
         }
     }
 
@@ -50949,6 +50961,14 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 nth0 = 64;
                 nth1 = 2;
                 ndst = 16;
+                static const int ndst4_max_rows = []{
+                    const char * e = getenv("GGML_OPENCL_Q4K_NDST4_MAX_ROWS");
+                    return (e && e[0]) ? atoi(e) : 256;
+                }();
+                if (ne01 <= ndst4_max_rows && backend_ctx->kernel_mul_mv_q4_K_f32_flat_ndst4 != nullptr) {
+                    kernel = backend_ctx->kernel_mul_mv_q4_K_f32_flat_ndst4;
+                    ndst = 4;
+                }
             } else {
                 GGML_ASSERT(false && "TODO: Unknown GPU");
             }
