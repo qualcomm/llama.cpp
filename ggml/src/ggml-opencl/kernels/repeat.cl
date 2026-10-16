@@ -15,14 +15,21 @@ kernel void kernel_repeat_f32(
         ulong   nb0,
         ulong   nb1,
         ulong   nb2,
-        ulong   nb3
+        ulong   nb3,
+        int     nchunks
 ) {
     src0 = src0 + offset0;
     dst  = dst  + offsetd;
 
     const int i3 = get_group_id(2);
     const int i2 = get_group_id(1);
-    const int i1 = get_group_id(0);
+    // a row may be split into nchunks workgroups, so a long row repeated only a
+    // few times does not run on a single compute unit
+    const int i1    = get_group_id(0) / nchunks;
+    const int chunk = get_group_id(0) % nchunks;
+    const int span  = (ne0 + nchunks - 1) / nchunks;
+    const int i0_lo = chunk*span;
+    const int i0_hi = min(ne0, i0_lo + span);
 
     const int i03 = i3%ne03;
     const int i02 = i2%ne02;
@@ -31,8 +38,55 @@ kernel void kernel_repeat_f32(
     global const char * src0_ptr = src0 + i03*nb03 + i02*nb02 + i01*nb01;
     global       char * dst_ptr  = dst  +  i3*nb3  +  i2*nb2  +  i1*nb1;
 
-    for (int i0 = get_local_id(0); i0 < ne0; i0 += get_local_size(0)) {
+    for (int i0 = i0_lo + get_local_id(0); i0 < i0_hi; i0 += get_local_size(0)) {
         const int i00 = i0%ne00;
         *((global float *)(dst_ptr + i0*nb0)) = *((global float *)(src0_ptr + i00*nb00));
+    }
+}
+
+// 16-bit elements (f16), moved as raw bits
+kernel void kernel_repeat_f16(
+        global const char * src0,
+        ulong               offset0,
+        global       char * dst,
+        ulong               offsetd,
+        int     ne00,
+        int     ne01,
+        int     ne02,
+        int     ne03,
+        ulong   nb00,
+        ulong   nb01,
+        ulong   nb02,
+        ulong   nb03,
+        int     ne0,
+        ulong   nb0,
+        ulong   nb1,
+        ulong   nb2,
+        ulong   nb3,
+        int     nchunks
+) {
+    src0 = src0 + offset0;
+    dst  = dst  + offsetd;
+
+    const int i3 = get_group_id(2);
+    const int i2 = get_group_id(1);
+    // a row may be split into nchunks workgroups, so a long row repeated only a
+    // few times does not run on a single compute unit
+    const int i1    = get_group_id(0) / nchunks;
+    const int chunk = get_group_id(0) % nchunks;
+    const int span  = (ne0 + nchunks - 1) / nchunks;
+    const int i0_lo = chunk*span;
+    const int i0_hi = min(ne0, i0_lo + span);
+
+    const int i03 = i3%ne03;
+    const int i02 = i2%ne02;
+    const int i01 = i1%ne01;
+
+    global const char * src0_ptr = src0 + i03*nb03 + i02*nb02 + i01*nb01;
+    global       char * dst_ptr  = dst  +  i3*nb3  +  i2*nb2  +  i1*nb1;
+
+    for (int i0 = i0_lo + get_local_id(0); i0 < i0_hi; i0 += get_local_size(0)) {
+        const int i00 = i0%ne00;
+        *((global ushort *)(dst_ptr + i0*nb0)) = *((global ushort *)(src0_ptr + i00*nb00));
     }
 }

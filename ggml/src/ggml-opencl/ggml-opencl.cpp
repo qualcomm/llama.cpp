@@ -991,6 +991,14 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_dsv4_hc_comb = nullptr;
     cl_kernel kernel_dsv4_hc_pre  = nullptr;
     cl_kernel kernel_dsv4_hc_post = nullptr;
+    // i32 / f16 variants of GET_ROWS, CPY, FILL, REPEAT and SET_ROWS
+    cl_kernel kernel_get_rows_i32         = nullptr;
+    cl_kernel kernel_cpy_i32_f32          = nullptr;
+    cl_kernel kernel_cpy_f32_i32          = nullptr;
+    cl_kernel kernel_fill_f16             = nullptr;
+    cl_kernel kernel_repeat_f16           = nullptr;
+    cl_kernel kernel_set_rows_f16_f16_i64 = nullptr;
+    cl_kernel kernel_set_rows_f16_f16_i32 = nullptr;
     cl_kernel kernel_repeat_f32;
     cl_kernel kernel_pad;
     cl_kernel kernel_tanh_f32, kernel_tanh_f32_4, kernel_tanh_f32_nc;
@@ -1667,6 +1675,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
 
         CL_CHECK((backend_ctx->kernel_fill = clCreateKernel(prog, "kernel_fill_f32", &err), err));
+        CL_CHECK((backend_ctx->kernel_fill_f16 = clCreateKernel(prog, "kernel_fill_f16", &err), err));
         GGML_LOG_CONT(".");
 
         CL_CHECK(clReleaseProgram(prog));
@@ -1718,6 +1727,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             }
         }
         CL_CHECK((backend_ctx->kernel_cpy_i32_i32 = clCreateKernel(prog, "kernel_cpy_i32_i32", &err), err));
+        CL_CHECK((backend_ctx->kernel_cpy_i32_f32 = clCreateKernel(prog, "kernel_cpy_i32_f32", &err), err));
+        CL_CHECK((backend_ctx->kernel_cpy_f32_i32 = clCreateKernel(prog, "kernel_cpy_f32_i32", &err), err));
         GGML_LOG_CONT(".");
     }
 
@@ -1908,6 +1919,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         CL_CHECK((backend_ctx->kernel_get_rows_f32  = clCreateKernel(backend_ctx->program_get_rows, "kernel_get_rows_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_get_rows_f16  = clCreateKernel(backend_ctx->program_get_rows, "kernel_get_rows_f16", &err), err));
         CL_CHECK((backend_ctx->kernel_get_rows_q4_0 = clCreateKernel(backend_ctx->program_get_rows, "kernel_get_rows_q4_0", &err), err));
+        CL_CHECK((backend_ctx->kernel_get_rows_i32  = clCreateKernel(backend_ctx->program_get_rows, "kernel_get_rows_i32", &err), err));
         GGML_LOG_CONT(".");
     }
 
@@ -3233,6 +3245,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
         CL_CHECK((backend_ctx->kernel_repeat_f32 = clCreateKernel(prog, "kernel_repeat_f32", &err), err));
+        CL_CHECK((backend_ctx->kernel_repeat_f16 = clCreateKernel(prog, "kernel_repeat_f16", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
@@ -3506,6 +3519,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         CL_CHECK((backend_ctx->kernel_set_rows_f32_i32 = clCreateKernel(backend_ctx->program_set_rows, "kernel_set_rows_f32_i32", &err), err));
         CL_CHECK((backend_ctx->kernel_set_rows_f16_i64 = clCreateKernel(backend_ctx->program_set_rows, "kernel_set_rows_f16_i64", &err), err));
         CL_CHECK((backend_ctx->kernel_set_rows_f16_i32 = clCreateKernel(backend_ctx->program_set_rows, "kernel_set_rows_f16_i32", &err), err));
+        CL_CHECK((backend_ctx->kernel_set_rows_f16_f16_i64 = clCreateKernel(backend_ctx->program_set_rows, "kernel_set_rows_f16_f16_i64", &err), err));
+        CL_CHECK((backend_ctx->kernel_set_rows_f16_f16_i32 = clCreateKernel(backend_ctx->program_set_rows, "kernel_set_rows_f16_f16_i32", &err), err));
         CL_CHECK((backend_ctx->kernel_set_rows_q8_0_i64 = clCreateKernel(backend_ctx->program_set_rows, "kernel_set_rows_q8_0_i64", &err), err));
         CL_CHECK((backend_ctx->kernel_set_rows_q8_0_i32 = clCreateKernel(backend_ctx->program_set_rows, "kernel_set_rows_q8_0_i32", &err), err));
         CL_CHECK((backend_ctx->kernel_set_rows_q8_0_soa_i64 = clCreateKernel(backend_ctx->program_set_rows, "kernel_set_rows_q8_0_soa_i64", &err), err));
@@ -9298,6 +9313,8 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                 case GGML_TYPE_F32:
                 case GGML_TYPE_F16:
                     return true;
+                case GGML_TYPE_I32:
+                    return op->type == GGML_TYPE_I32;
                 case GGML_TYPE_Q4_0:
 #ifdef GGML_OPENCL_SOA_Q
                     // We do not support flattened Q4_0 (and possibly other Q's)
@@ -9313,6 +9330,9 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                 // TODO: add support
                 // ref: https://github.com/ggml-org/llama.cpp/pull/14274
 #pragma message("TODO: implement BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, IQ4_NL support (https://github.com/ggml-org/llama.cpp/pull/14661)")
+                if (op->src[0]->type == GGML_TYPE_F16 && op->type == GGML_TYPE_F16) {
+                    return op->src[1]->type == GGML_TYPE_I64 || op->src[1]->type == GGML_TYPE_I32;
+                }
                 if (op->src[0]->type != GGML_TYPE_F32) {
                     return false;
                 }
@@ -9335,6 +9355,8 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                         case GGML_TYPE_F16:
                         case GGML_TYPE_F32:
                             return true;
+                        case GGML_TYPE_I32:
+                            return op->op == GGML_OP_CPY;
                         default:
                             return false;
                     }
@@ -9350,6 +9372,8 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                     switch (op->type) {
                         case GGML_TYPE_I32:
                             return true;
+                        case GGML_TYPE_F32:
+                            return op->op == GGML_OP_CPY;
                         default:
                             return false;
                     }
@@ -9432,7 +9456,7 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
         case GGML_OP_TRI:
             return op->type == GGML_TYPE_F32 && ggml_is_contiguous(op);
         case GGML_OP_FILL:
-            return op->type == GGML_TYPE_F32 && ggml_is_contiguous(op);
+            return (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16) && ggml_is_contiguous(op);
         case GGML_OP_CLAMP:
             return op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_SOFT_MAX:
@@ -9443,7 +9467,7 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
         case GGML_OP_L2_NORM:
             return ggml_is_contiguous_rows(op->src[0]);
         case GGML_OP_REPEAT:
-            return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32; // Assuming F32 for now, can be expanded
+            return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) && op->type == op->src[0]->type;
         case GGML_OP_PAD:
             // TODO: add circular padding support for opencl, see https://github.com/ggml-org/llama.cpp/pull/16985
             if (ggml_get_op_params_i32(op, 8) != 0) {
@@ -13880,6 +13904,9 @@ static void ggml_cl_get_rows(ggml_backend_t backend, const ggml_tensor * src0, c
         case GGML_TYPE_Q4_0:
             kernel = backend_ctx->kernel_get_rows_q4_0;
             break;
+        case GGML_TYPE_I32:
+            kernel = backend_ctx->kernel_get_rows_i32;
+            break;
         default:
             GGML_ASSERT(false && "not implemented");
     }
@@ -13995,6 +14022,11 @@ static void ggml_cl_set_rows(ggml_backend_t backend, const ggml_tensor * src0, c
         kernel = (src1->type == GGML_TYPE_I64)
                     ? backend_ctx->kernel_set_rows_q4_0_soa_i64
                     : backend_ctx->kernel_set_rows_q4_0_soa_i32;
+    } else if (src0->type == GGML_TYPE_F16) {
+        GGML_ASSERT(dst->type == GGML_TYPE_F16);
+        kernel = (src1->type == GGML_TYPE_I64)
+                    ? backend_ctx->kernel_set_rows_f16_f16_i64
+                    : backend_ctx->kernel_set_rows_f16_f16_i32;
     } else {
         switch (dst->type) {
             case GGML_TYPE_F32:
@@ -15400,7 +15432,7 @@ static void ggml_cl_fill(ggml_backend_t backend, const ggml_tensor * src0, const
 
     const int64_t n = ggml_nelements(dst);
 
-    cl_kernel kernel = backend_ctx->kernel_fill;
+    cl_kernel kernel = dst->type == GGML_TYPE_F16 ? backend_ctx->kernel_fill_f16 : backend_ctx->kernel_fill;
 
     CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),   &extrad->data_device));
     CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_ulong), &offsetd));
@@ -16650,7 +16682,7 @@ static void ggml_cl_repeat(ggml_backend_t backend, const ggml_tensor * src0, con
     const cl_ulong nb2 = dst->nb[2];
     const cl_ulong nb3 = dst->nb[3];
 
-    cl_kernel kernel = backend_ctx->kernel_repeat_f32;
+    cl_kernel kernel = dst->type == GGML_TYPE_F16 ? backend_ctx->kernel_repeat_f16 : backend_ctx->kernel_repeat_f32;
 
     CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0->data_device));
     CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_ulong), &offset0));
@@ -16672,7 +16704,12 @@ static void ggml_cl_repeat(ggml_backend_t backend, const ggml_tensor * src0, con
 
     int nth = 64;
 
-    size_t global_work_size[] = {(size_t)ne1*nth, (size_t)ne2, (size_t)ne3};
+    // split long rows when there are too few rows to fill the GPU
+    const int64_t nrows   = (int64_t)ne1*ne2*ne3;
+    const int     nchunks = nrows >= 64 ? 1 : (int)std::max<int64_t>(1, std::min<int64_t>(ne0/(nth*16), 64));
+    CL_CHECK(clSetKernelArg(kernel, 17, sizeof(int), &nchunks));
+
+    size_t global_work_size[] = {(size_t)ne1*nchunks*nth, (size_t)ne2, (size_t)ne3};
     size_t local_work_size[] = {(size_t)nth, 1, 1};
 
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
@@ -28989,6 +29026,9 @@ static void ggml_cl_cpy(ggml_backend_t backend, const ggml_tensor * src0, const 
                                        ? backend_ctx->kernel_cpy_f32_f32_pack
                                        : backend_ctx->kernel_cpy_f32_f32;
                     break;
+                case GGML_TYPE_I32:
+                    kernel = backend_ctx->kernel_cpy_f32_i32;
+                    break;
                 default:
                     GGML_ASSERT(false && "not implemented");
             }
@@ -29009,6 +29049,9 @@ static void ggml_cl_cpy(ggml_backend_t backend, const ggml_tensor * src0, const 
             switch (src1t) {
                 case GGML_TYPE_I32:
                     kernel = backend_ctx->kernel_cpy_i32_i32;
+                    break;
+                case GGML_TYPE_F32:
+                    kernel = backend_ctx->kernel_cpy_i32_f32;
                     break;
                 default:
                     GGML_ASSERT(false && "not implemented");
