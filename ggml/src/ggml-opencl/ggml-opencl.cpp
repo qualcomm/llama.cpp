@@ -652,6 +652,8 @@ struct ggml_backend_opencl_context {
     // TOP_K is loaded from supports_op for the same reason as argsort: whether a
     // row is servable depends on the workgroup the compiled kernel can launch.
     bool kernels_loaded_top_k = false;
+    // lightning indexer (DeepSeek-V3.2 DSA, glm5-next, qwen4exp QSA), compiled on first use
+    bool kernels_loaded_lightning_indexer = false;
     // rest of the kernels are currently always loaded in alloc_buffer.
     bool kernels_loaded = false;
 
@@ -983,6 +985,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_top_k_unmap    = nullptr;   // TOP_K stage 3
     cl_kernel kernel_sum_rows_f32, kernel_sum_rows_f32_4;
     cl_kernel kernel_cumsum_blk, kernel_cumsum_add;
+    cl_kernel kernel_lightning_indexer[2][2] = {};      // [K is f16][multi-token tile]
     cl_kernel kernel_repeat_f32;
     cl_kernel kernel_pad;
     cl_kernel kernel_tanh_f32, kernel_tanh_f32_4, kernel_tanh_f32_nc;
@@ -9206,6 +9209,42 @@ static bool ggml_cl_top_k_plan_for(ggml_backend_opencl_context * backend_ctx,
     return false;
 }
 
+static void load_cl_kernels_lightning_indexer(ggml_backend_opencl_context * backend_ctx) {
+    if (backend_ctx->kernels_loaded_lightning_indexer) {
+        return;
+    }
+    backend_ctx->kernels_loaded_lightning_indexer = true;
+
+#ifdef GGML_OPENCL_EMBED_KERNELS
+    const std::string kernel_src {
+        #include "lightning_indexer.cl.h"
+    };
+#else
+    const std::string kernel_src = read_file("lightning_indexer.cl");
+#endif
+
+    // no fast math: the mask carries -inf
+    const std::string opts = std::string("-cl-std=CL") + std::to_string(backend_ctx->opencl_c_version.major) + "." + std::to_string(backend_ctx->opencl_c_version.minor) + " -cl-mad-enable";
+    // a 1-token tile for decode, an 8-token tile for everything else
+    for (int k_f16 = 0; k_f16 < 2; ++k_f16) {
+        for (int tq8 = 0; tq8 < 2; ++tq8) {
+            const std::string o = opts + (k_f16 ? " -DLI_K_F16" : "") + (tq8 ? " -DLI_TQ=8" : " -DLI_TQ=1");
+            cl_program prog = build_program_from_source_ex(
+                backend_ctx->context, backend_ctx->device, kernel_src.c_str(), o, /*fatal=*/false, "lightning_indexer");
+            if (!prog) {
+                GGML_LOG_WARN("ggml_opencl: LIGHTNING_INDEXER program (K %s, TQ %d) failed to build; op stays on CPU\n",
+                              k_f16 ? "f16" : "f32", tq8 ? 8 : 1);
+                continue;
+            }
+            cl_int err;
+            cl_kernel kernel = clCreateKernel(prog, "kernel_lightning_indexer", &err);
+            if (err == CL_SUCCESS) {
+                backend_ctx->kernel_lightning_indexer[k_f16][tq8] = kernel;
+            }
+        }
+    }
+}
+
 static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     ggml_backend_opencl_device_context * dev_ctx     = (ggml_backend_opencl_device_context *)dev->context;
     ggml_backend_opencl_context *        backend_ctx = dev_ctx->backend_ctx;
@@ -9693,6 +9732,24 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                 }
             }
             return true;
+        }
+        case GGML_OP_LIGHTNING_INDEXER: {
+            const ggml_tensor * q = op->src[0];
+            const ggml_tensor * k = op->src[1];
+            const ggml_tensor * w = op->src[2];
+            const ggml_tensor * m = op->src[3];
+            if (k->type != GGML_TYPE_F32 && k->type != GGML_TYPE_F16) {
+                return false;
+            }
+            // rows of whole 32-element slices with unit element stride
+            if (q->ne[0] % 32 != 0 || q->nb[0] != sizeof(float) || k->nb[0] != ggml_type_size(k->type) ||
+                w->nb[0] != sizeof(float) || m->nb[0] != sizeof(ggml_fp16_t) || op->nb[0] != sizeof(float)) {
+                return false;
+            }
+            load_cl_kernels_lightning_indexer(backend_ctx);
+            const int k_f16 = k->type == GGML_TYPE_F16;
+            return backend_ctx->kernel_lightning_indexer[k_f16][0] != nullptr &&
+                   backend_ctx->kernel_lightning_indexer[k_f16][1] != nullptr;
         }
         default:
             return false;
@@ -29819,6 +29876,76 @@ static void ggml_cl_sum_rows(ggml_backend_t backend, const ggml_tensor * src0, c
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
 }
 
+static void ggml_cl_lightning_indexer(ggml_backend_t backend, ggml_tensor * dst) {
+    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *) backend->context;
+
+    const ggml_tensor * q = dst->src[0];
+    const ggml_tensor * k = dst->src[1];
+    const ggml_tensor * w = dst->src[2];
+    const ggml_tensor * m = dst->src[3];
+
+    ggml_tensor_extra_cl * extraq = (ggml_tensor_extra_cl *) q->extra;
+    ggml_tensor_extra_cl * extrak = (ggml_tensor_extra_cl *) k->extra;
+    ggml_tensor_extra_cl * extraw = (ggml_tensor_extra_cl *) w->extra;
+    ggml_tensor_extra_cl * extram = (ggml_tensor_extra_cl *) m->extra;
+    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *) dst->extra;
+
+    cl_ulong offq = extraq->offset + q->view_offs;
+    cl_ulong offk = extrak->offset + k->view_offs;
+    cl_ulong offw = extraw->offset + w->view_offs;
+    cl_ulong offm = extram->offset + m->view_offs;
+    cl_ulong offd = extrad->offset + dst->view_offs;
+
+    const int n_embd   = (int) q->ne[0];
+    const int n_head   = (int) q->ne[1];
+    const int n_tokens = (int) q->ne[2];
+    const int n_stream = (int) q->ne[3];
+    const int n_kv     = (int) k->ne[2];
+    const int nem3     = (int) m->ne[3];
+    const cl_ulong nbq1 = q->nb[1], nbq2 = q->nb[2], nbq3 = q->nb[3];
+    const cl_ulong nbk2 = k->nb[2], nbk3 = k->nb[3];
+    const cl_ulong nbw1 = w->nb[1], nbw3 = w->nb[3];
+    const cl_ulong nbm1 = m->nb[1], nbm3 = m->nb[3];
+    const cl_ulong nb1  = dst->nb[1], nb3 = dst->nb[3];
+
+    const bool tq8 = n_tokens > 1;
+    cl_kernel kernel = backend_ctx->kernel_lightning_indexer[k->type == GGML_TYPE_F16][tq8];
+    int i = 0;
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_mem),   &extraq->data_device));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &offq));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_mem),   &extrak->data_device));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &offk));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_mem),   &extraw->data_device));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &offw));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_mem),   &extram->data_device));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &offm));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_mem),   &extrad->data_device));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &offd));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(int),      &n_embd));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(int),      &n_head));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(int),      &n_tokens));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(int),      &n_kv));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(int),      &nem3));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbq1));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbq2));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbq3));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbk2));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbk3));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbw1));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbw3));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbm1));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbm3));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nb1));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nb3));
+
+    const size_t tq  = tq8 ? 8 : 1; // LI_TQ
+    const size_t lws = 64;          // LI_WG
+    const size_t tk  = lws;         // LI_TK = LI_WG * LI_RK: K rows per workgroup
+    size_t global_work_size[] = { (n_kv + tk - 1) / tk * lws, (n_tokens + tq - 1) / tq, (size_t) n_stream };
+    size_t local_work_size[]  = { lws, 1, 1 };
+    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+}
+
 static void ggml_cl_cumsum(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_ASSERT(src0);
     GGML_ASSERT(src0->extra);
@@ -30631,6 +30758,12 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
             }
             func = ggml_cl_cumsum;
             break;
+        case GGML_OP_LIGHTNING_INDEXER:
+            if (!any_on_device) {
+                return false;
+            }
+            ggml_cl_lightning_indexer(backend, tensor);
+            return true;
         case GGML_OP_FLASH_ATTN_EXT:
             if (!any_on_device) {
                 return false;
