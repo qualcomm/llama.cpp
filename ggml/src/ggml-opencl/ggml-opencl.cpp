@@ -31095,7 +31095,12 @@ static void ggml_cl_repeat(ggml_backend_t backend, const ggml_tensor * src0, con
 
     int nth = 64;
 
-    size_t global_work_size[] = {(size_t)ne1*nth, (size_t)ne2, (size_t)ne3};
+    // split long rows when there are too few rows to fill the GPU
+    const int64_t nrows   = (int64_t)ne1*ne2*ne3;
+    const int     nchunks = nrows >= 64 ? 1 : (int)std::max<int64_t>(1, std::min<int64_t>(ne0/(nth*16), 64));
+    CL_CHECK(clSetKernelArg(kernel, 17, sizeof(int), &nchunks));
+
+    size_t global_work_size[] = {(size_t)ne1*nchunks*nth, (size_t)ne2, (size_t)ne3};
     size_t local_work_size[] = {(size_t)nth, 1, 1};
 
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
