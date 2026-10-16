@@ -34335,12 +34335,19 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
             if (e && e[0]) { return e[0] != '0'; }
             return backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E;
         }();
+        // gqa == 12 is qwen4exp (n_head 24, n_head_kv 2, dk=dv=256), whose QSA layers decode over
+        // the gathered cells of the sparse path. GGML_OPENCL_FA_MQN_GQA12=0/1 forces it.
+        const bool mqn_gqa12 = [&]{
+            const char * e = getenv("GGML_OPENCL_FA_MQN_GQA12");
+            if (e && e[0]) { return e[0] != '0'; }
+            return false;
+        }();
         static const bool g16_hs = !ggml_cl_env_flag_zero("GGML_OPENCL_FA_G16_HS_DK128");
         if (g16_hs && gqa == 16 && d_head_q == 128 && backend_ctx->has_subgroup_shuffle) {
             ggml_opencl_ensure_fa_g16_hs(backend_ctx, d_head_q, d_head_v);
         }
         if (gqa == 4 || gqa == 8 || (gqa == 2 && mqn_gqa2) || (gqa == 16 && mqn_gqa16) ||
-            (gqa == 6 && mqn_gqa6)) {
+            (gqa == 6 && mqn_gqa6) || (gqa == 12 && mqn_gqa12)) {
             // hs/nsg defaults are per-shape measurements on the X2-90; the env
             // knobs exist to re-tune them elsewhere. DK=256 gqa=8 must stay at
             // a 128-thread workgroup - the stock 192-thread g8 kernel is what
