@@ -218,6 +218,7 @@ set(GGML_OPENCL_KERNELS
     sub
     sum_rows
     cumsum
+    dsv4_hc
     transpose
     concat
     tsembd
