@@ -760,3 +760,70 @@ __kernel void kernel_gemv_moe_q4_k_f32_ns_glu_cs(
         }
     }
 }
+
+// Separate gate/up GLU GEMV, contiguous-chunk variant of kernel_gemv_moe_q4_k_f32_ns_glu2 (the
+// layout the published Qwen3.8-Flash-Next / qwen4exp GGUFs use): one scale fetch per super-block
+// per row, as in kernel_gemv_moe_q4_k_f32_ns_glu_cs.
+__attribute__((qcom_reqd_sub_group_size("half")))
+__kernel void kernel_gemv_moe_q4_k_f32_ns_glu2_cs(
+    __global uint *         gate_q,
+    __global half *         gate_d,
+    __global half *         gate_dm,
+    __global uchar *        gate_s,
+    __global uint *         up_q,
+    __global half *         up_d,
+    __global half *         up_dm,
+    __global uchar *        up_s,
+    __read_only image1d_buffer_t src1,
+    __global uint *         src2,
+    __global float *        dst,
+    ulong                   offsetd,
+    int                     ne00,    // K
+    int                     ne01,    // rows per weight = n_ff
+    int                     ne11,
+    int                     glu_op
+) {
+    uint i01  = get_global_id(0);
+    uint i20  = get_global_id(2);
+    uint sgid = get_local_id(1);
+    uint slid = get_sub_group_local_id();
+
+    // every lane reaches the barrier: clamp the tail rows and drop them at the store
+    const bool row_active = (i01 < (uint)ne01);
+    if (!row_active) {
+        i01 = 0;
+    }
+
+    const uint i11       = i20 % ne11;
+    const uint expert_id = src2[i20];
+
+    const uint num_superblocks = ne00 / QK_K;
+    const uint num_subblocks   = ne00 / 32;
+    const uint scales_per_row  = num_superblocks * K_SCALE_SIZE;
+
+    const uint expert_q_offset = expert_id * (ne00 / 8) * ne01;
+    const uint expert_d_offset = expert_id * num_superblocks * ne01;
+
+    const uint per   = (num_subblocks + N_SIMDGROUP - 1) / N_SIMDGROUP;
+    const uint ib_lo = min(sgid * per, num_subblocks);
+    const uint ib_hi = min(ib_lo + per, num_subblocks);
+
+    float gate_sum = moe_q4k_row_dot_cs(gate_q, gate_d, gate_dm, gate_s, src1, i01,
+            ne00, ne01, expert_id, expert_q_offset, expert_d_offset, scales_per_row, i11, ib_lo, ib_hi);
+    float up_sum   = moe_q4k_row_dot_cs(up_q, up_d, up_dm, up_s, src1, i01,
+            ne00, ne01, expert_id, expert_q_offset, expert_d_offset, scales_per_row, i11, ib_lo, ib_hi);
+
+    __local float2 reduceLM[SIMDGROUP_WIDTH * (N_SIMDGROUP - 1)];
+    if (sgid != 0) reduceLM[SIMDGROUP_WIDTH * (sgid - 1) + slid] = (float2)(gate_sum, up_sum);
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (sgid == 0) {
+        for (int g = 0; g < N_SIMDGROUP - 1; ++g) {
+            gate_sum += reduceLM[SIMDGROUP_WIDTH * g + slid].s0;
+            up_sum   += reduceLM[SIMDGROUP_WIDTH * g + slid].s1;
+        }
+        dst = dst + (offsetd >> 2);
+        if (row_active) {
+            dst[i01 + i20 * ne01] = moe_glu_apply(glu_op, gate_sum, up_sum);
+        }
+    }
+}

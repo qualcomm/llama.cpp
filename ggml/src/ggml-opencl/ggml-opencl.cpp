@@ -1719,6 +1719,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemv_moe_q4_k_f32_ns_glu_wimg = nullptr;  // weight-as-texture variant
     cl_kernel kernel_gemv_moe_q4_k_f32_ns_glu2 = nullptr;      // fused separate gate/up GEMV + GLU (MoE FFN)
     cl_kernel kernel_gemv_moe_q4_k_f32_ns_glu_cs = nullptr;    // merged gate_up GLU, contiguous K chunks per subgroup
+    cl_kernel kernel_gemv_moe_q4_k_f32_ns_glu2_cs = nullptr;   // separate gate/up GLU, contiguous K chunks per subgroup
     cl_kernel kernel_gemv_moe_q5_k_f32_ns, kernel_gemm_moe_q5_k_f32_ns;
     cl_kernel kernel_gemv_moe_q6_k_f32_ns, kernel_gemm_moe_q6_k_f32_ns, kernel_gemm_moe_q6_k_f32_ns_bin;
     cl_kernel kernel_gemm_moe_q6_k_q8_1_dp4a = nullptr;    // dp4a (int8) q6_K MoE prefill GEMM
@@ -10972,6 +10973,10 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         backend_ctx->kernel_gemv_moe_q4_k_f32_ns_glu_cs = clCreateKernel(prog, "kernel_gemv_moe_q4_k_f32_ns_glu_cs", &err);
         if (err != CL_SUCCESS) {
             backend_ctx->kernel_gemv_moe_q4_k_f32_ns_glu_cs = nullptr;
+        }
+        backend_ctx->kernel_gemv_moe_q4_k_f32_ns_glu2_cs = clCreateKernel(prog, "kernel_gemv_moe_q4_k_f32_ns_glu2_cs", &err);
+        if (err != CL_SUCCESS) {
+            backend_ctx->kernel_gemv_moe_q4_k_f32_ns_glu2_cs = nullptr;
         }
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
@@ -29728,6 +29733,14 @@ static void ggml_cl_mul_mat_id_q4_k_glu2_fused(ggml_backend_t backend, ggml_tens
     CL_CHECK(status);
 
     cl_kernel kernel = backend_ctx->kernel_gemv_moe_q4_k_f32_ns_glu2;
+    // contiguous K chunks per subgroup, as for the merged gate_up GLU; GGML_OPENCL_MOE_GLU_CS=0 off
+    static const bool moe_glu2_cs = []{
+        const char * e = getenv("GGML_OPENCL_MOE_GLU_CS");
+        return !(e && e[0] == '0');
+    }();
+    if (moe_glu2_cs && backend_ctx->kernel_gemv_moe_q4_k_f32_ns_glu2_cs != nullptr) {
+        kernel = backend_ctx->kernel_gemv_moe_q4_k_f32_ns_glu2_cs;
+    }
     int arg_idx = 0;
     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),    &eg->q));
     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),    &eg->d));
