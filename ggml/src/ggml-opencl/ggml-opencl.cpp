@@ -29611,10 +29611,14 @@ static void ggml_cl_mul_mat_id_q4_k_glu_fused(ggml_backend_t backend, ggml_tenso
     if (use_moe_decode_wimg) {
         kernel = backend_ctx->kernel_gemv_moe_q4_k_f32_ns_glu_wimg;
     }
-    // GGML_OPENCL_MOE_GLU_CS=1: contiguous K chunks per subgroup, one scale fetch per super-block
+    // Contiguous K chunks per subgroup, one scale fetch per super-block. The kernel is 1.48x
+    // on the X2-90 (qwen4exp 2560 -> 2x640, 0.249 -> 0.168 ms) and 1.3-1.6x on the 840;
+    // gemma-4-26B-A4B tg64 31.6 -> 34.4 on the X2-90. GGML_OPENCL_MOE_GLU_CS=0 keeps the
+    // interleaved kernel (summation order differs; KLD vs it is at the level of a split-K
+    // reorder on the same model).
     static const bool moe_glu_cs = []{
         const char * e = getenv("GGML_OPENCL_MOE_GLU_CS");
-        return e && e[0] == '1';
+        return !(e && e[0] == '0');
     }();
     if (!use_moe_decode_wimg && moe_glu_cs && backend_ctx->kernel_gemv_moe_q4_k_f32_ns_glu_cs != nullptr) {
         kernel = backend_ctx->kernel_gemv_moe_q4_k_f32_ns_glu_cs;
