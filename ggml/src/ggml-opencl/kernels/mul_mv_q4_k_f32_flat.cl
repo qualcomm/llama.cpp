@@ -48,7 +48,11 @@ typedef struct {
 #define N_SIMDGROUP 1 // number of SIMD groups in a thread group
 #define N_SIMDWIDTH 16 // SIMD group size
 #elif defined (ADRENO_GPU)
+#ifdef Q4K_N_DST_OVERRIDE
+#define N_DST Q4K_N_DST_OVERRIDE // host lowers N_DST for weights with few rows
+#else
 #define N_DST 16
+#endif
 #define N_SIMDGROUP 2
 #define N_SIMDWIDTH 64
 #endif
