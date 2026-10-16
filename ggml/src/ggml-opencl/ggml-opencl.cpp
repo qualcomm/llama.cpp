@@ -34336,11 +34336,18 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
             return backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E;
         }();
         // gqa == 12 is qwen4exp (n_head 24, n_head_kv 2, dk=dv=256), whose QSA layers decode over
-        // the gathered cells of the sparse path. GGML_OPENCL_FA_MQN_GQA12=0/1 forces it.
+        // the gathered cells of the sparse path; without this it runs the per-query-head q1
+        // kernel. QSA decode op (2048 visible cells), us/run, matched A/B/A/B:
+        //   X2-90  587 -> 297 (hs 6; hs 3 318, hs 4 327, hs 2 429; hs 1 aborts the build)
+        //   840    951-1030 -> 676-693
+        // Both pass the 119 gqa-12 FLASH_ATTN_EXT cases. Default on for those two generations
+        // only; the 850 (E17) takes the decomposed path and is not measured here.
+        // GGML_OPENCL_FA_MQN_GQA12=0/1 forces it.
+        // NOT static: the value depends on the DEVICE.
         const bool mqn_gqa12 = [&]{
             const char * e = getenv("GGML_OPENCL_FA_MQN_GQA12");
             if (e && e[0]) { return e[0] != '0'; }
-            return false;
+            return backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E || backend_ctx->adreno_gen == ADRENO_GPU_GEN::A8X;
         }();
         static const bool g16_hs = !ggml_cl_env_flag_zero("GGML_OPENCL_FA_G16_HS_DK128");
         if (g16_hs && gqa == 16 && d_head_q == 128 && backend_ctx->has_subgroup_shuffle) {
@@ -34379,6 +34386,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
             // allocation actually exceeds the device cap.
             int hs  = (d_head_q == 512) ? ((gqa == 8) ? 4 : ((gqa == 16) ? 8 : 1))
                     : (d_head_q == 128 && gqa == 16) ? 16
+                    : (gqa == 12) ? 6   // MQ_GQA 2; a 12-wide fold (hs 1) aborts the build on the X2-90
                     : ((gqa == 8) ? 2 : 1);
             int nsg = (d_head_q == 256 && gqa == 8) ? 2 : 4;
             static const int hs_env  = []{ const char * e = getenv("GGML_OPENCL_FA_MQN_HS");
