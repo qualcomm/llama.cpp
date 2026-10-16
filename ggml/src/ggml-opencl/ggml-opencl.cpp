@@ -956,6 +956,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mv_q5_1_f32_flat;
     cl_kernel kernel_mul_mv_q4_K_f32;
     cl_kernel kernel_mul_mv_q4_K_f32_flat;
+    cl_kernel kernel_mul_mv_q4_K_f32_flat_ndst4 = nullptr; // few-row variant (Adreno): N_DST=4
     cl_kernel kernel_mul_mv_q5_K_f32;
     cl_kernel kernel_mul_mv_q5_K_f32_flat;
     cl_kernel kernel_mul_mv_q6_K_f32;
@@ -2043,6 +2044,17 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         CL_CHECK((backend_ctx->kernel_mul_mv_q4_K_f32_flat = clCreateKernel(prog, "kernel_mul_mv_q4_K_f32_flat", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
+
+        // Few-row variant (Adreno): with N_DST=16 a weight of a handful of rows runs as
+        // one subgroup computing 16 rows serially over K, leaving the GPU mostly idle.
+        if (backend_ctx->gpu_family == ADRENO) {
+            const std::string q4k_ndst4_opts = compile_opts + " -D Q4K_N_DST_OVERRIDE=4";
+            cl_program prog4 =
+                build_program_from_source(backend_ctx, kernel_src.c_str(), q4k_ndst4_opts);
+            backend_ctx->kernel_mul_mv_q4_K_f32_flat_ndst4 = clCreateKernel(prog4, "kernel_mul_mv_q4_K_f32_flat", &err);
+            if (err != CL_SUCCESS) backend_ctx->kernel_mul_mv_q4_K_f32_flat_ndst4 = nullptr;
+            CL_CHECK(clReleaseProgram(prog4));
+        }
     }
 
     // mul_mv_q5_0_f32
@@ -25581,6 +25593,15 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 nth0 = 64;
                 nth1 = 2;
                 ndst = 16;
+                // weights of up to GGML_OPENCL_Q4K_NDST4_MAX_ROWS rows (default 512) take the N_DST=4 build
+                static const int ndst4_max_rows = []{
+                    const char * e = getenv("GGML_OPENCL_Q4K_NDST4_MAX_ROWS");
+                    return (e && e[0]) ? atoi(e) : 512;
+                }();
+                if (ne01 <= ndst4_max_rows && backend_ctx->kernel_mul_mv_q4_K_f32_flat_ndst4 != nullptr) {
+                    kernel = backend_ctx->kernel_mul_mv_q4_K_f32_flat_ndst4;
+                    ndst = 4;
+                }
             } else {
                 GGML_ASSERT(false && "TODO: Unknown GPU");
             }
