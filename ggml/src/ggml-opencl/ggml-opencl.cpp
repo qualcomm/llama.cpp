@@ -1624,8 +1624,8 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_dsv4_hc_pre    = nullptr;
     cl_kernel kernel_dsv4_hc_post   = nullptr;
     cl_kernel kernel_lightning_indexer[2][2] = {};      // [K is f16][multi-token tile]
-    int       lightning_indexer_rk = 2;                 // LI_RK: K rows per lane
-    int       lightning_indexer_tq = 4;                 // LI_TQ of the multi-token tile
+    int       lightning_indexer_rk = 1;                 // LI_RK: K rows per lane
+    int       lightning_indexer_tq = 8;                 // LI_TQ of the multi-token tile
     // the qwen4exp QSA mask is built from i32 indices and f16 rows
     cl_kernel kernel_get_rows_i32         = nullptr;
     cl_kernel kernel_cpy_i32_f32          = nullptr;
@@ -4266,9 +4266,11 @@ static void load_cl_kernels_lightning_indexer(ggml_backend_opencl_context * back
                 backend_ctx->kernel_lightning_indexer[k_f16][tq4] = kernel;
                 cl_ulong pm = 0;
                 clGetKernelWorkGroupInfo(kernel, backend_ctx->device, CL_KERNEL_PRIVATE_MEM_SIZE, sizeof(pm), &pm, NULL);
-                if (env_rk || env_tq) GGML_LOG_INFO("ggml_opencl: lightning_indexer K %s TQ %d RK %d: private %llu B\n", k_f16 ? "f16" : "f32",
-                               tq4 ? backend_ctx->lightning_indexer_tq : 1, backend_ctx->lightning_indexer_rk,
-                               (unsigned long long) pm);
+                if (env_rk || env_tq) {
+                    GGML_LOG_INFO("ggml_opencl: lightning_indexer K %s TQ %d RK %d: private %llu B\n",
+                                  k_f16 ? "f16" : "f32", tq4 ? backend_ctx->lightning_indexer_tq : 1,
+                                  backend_ctx->lightning_indexer_rk, (unsigned long long) pm);
+                }
             }
         }
     }

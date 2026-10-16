@@ -11,12 +11,12 @@
 // Built without fast math: the mask carries -inf.
 
 #ifndef LI_TQ
-#define LI_TQ 4
+#define LI_TQ 8
 #endif
 
 #define LI_WG 64
 #ifndef LI_RK
-#define LI_RK 2
+#define LI_RK 1
 #endif
 #define LI_TK (LI_WG*LI_RK)
 #define LI_DC 32            // K elements per slice; n_embd must be a multiple
