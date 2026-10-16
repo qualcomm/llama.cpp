@@ -20215,11 +20215,14 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
             if (adreno_art_compiler_quirks(backend_ctx)) {
                 const bool f16_kv = q->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
                                     k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16;
-                // probe: head size 256 with the n_kv_max hint (qwen4exp QSA), which gathers the
-                // visible cells and runs the decomposed path over them
+                // Head size 256 with the n_kv_max hint (qwen4exp QSA): the op gathers the visible
+                // cells and runs the decomposed path over them. On the 850 the 6 f16 head-256 sparse
+                // cases pass, the QSA decode op is 0.45 ms flat from 4K to 32K, and qwen4exp
+                // real-dims pp512 goes 487 -> 812 t/s at d32768 (895 -> 1067 at d8192) with tg
+                // unchanged. GGML_OPENCL_E17_FA_SPARSE_256=0 keeps it on the unfused path.
                 static const bool sparse256 = []{
                     const char * e = getenv("GGML_OPENCL_E17_FA_SPARSE_256");
-                    return e && e[0] == '1';
+                    return !(e && e[0] == '0');
                 }();
                 const bool sparse_ok = sparse256 && f16_kv && dk == 256 && dv == 256 &&
                                        ggml_get_op_params_i32(op, 4) > 0;
