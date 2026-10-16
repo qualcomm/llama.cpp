@@ -287,6 +287,7 @@ set(GGML_OPENCL_KERNELS
     cumsum
     dsv4_hc
     lightning_indexer
+    fa_sparse
     transpose
     concat
     tsembd
