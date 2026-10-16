@@ -1623,7 +1623,9 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_dsv4_hc_comb   = nullptr;
     cl_kernel kernel_dsv4_hc_pre    = nullptr;
     cl_kernel kernel_dsv4_hc_post   = nullptr;
-    cl_kernel kernel_lightning_indexer[2][2] = {};      // [K is f16][4-token tile]
+    cl_kernel kernel_lightning_indexer[2][2] = {};      // [K is f16][multi-token tile]
+    int       lightning_indexer_rk = 2;                 // LI_RK: K rows per lane
+    int       lightning_indexer_tq = 4;                 // LI_TQ of the multi-token tile
     // the qwen4exp QSA mask is built from i32 indices and f16 rows
     cl_kernel kernel_get_rows_i32         = nullptr;
     cl_kernel kernel_cpy_i32_f32          = nullptr;
@@ -4239,10 +4241,18 @@ static void load_cl_kernels_lightning_indexer(ggml_backend_opencl_context * back
 
     // no fast math: the mask carries -inf
     const std::string opts = ggml_cl_std_opts(backend_ctx) + " -cl-mad-enable";
-    // a 1-token tile for decode, a 4-token tile for everything else
+    // tile overrides for tuning: GGML_OPENCL_LI_RK (K rows per lane), GGML_OPENCL_LI_TQ (tokens per tile)
+    const char * env_rk = getenv("GGML_OPENCL_LI_RK");
+    const char * env_tq = getenv("GGML_OPENCL_LI_TQ");
+    if (env_rk) { backend_ctx->lightning_indexer_rk = std::max(1, atoi(env_rk)); }
+    if (env_tq) { backend_ctx->lightning_indexer_tq = std::max(1, atoi(env_tq)); }
+
+    // a 1-token tile for decode, a multi-token tile for everything else
     for (int k_f16 = 0; k_f16 < 2; ++k_f16) {
         for (int tq4 = 0; tq4 < 2; ++tq4) {
-            const std::string o = opts + (k_f16 ? " -DLI_K_F16" : "") + (tq4 ? " -DLI_TQ=4" : " -DLI_TQ=1");
+            const std::string o = opts + (k_f16 ? " -DLI_K_F16" : "") +
+                " -DLI_TQ=" + std::to_string(tq4 ? backend_ctx->lightning_indexer_tq : 1) +
+                " -DLI_RK=" + std::to_string(backend_ctx->lightning_indexer_rk);
             cl_program prog = build_program_from_source_ex(
                 backend_ctx->context, backend_ctx->device, kernel_src.c_str(), o, /*fatal=*/false, "lightning_indexer");
             if (!prog) {
@@ -4254,6 +4264,11 @@ static void load_cl_kernels_lightning_indexer(ggml_backend_opencl_context * back
             cl_kernel kernel = clCreateKernel(prog, "kernel_lightning_indexer", &err);
             if (err == CL_SUCCESS) {
                 backend_ctx->kernel_lightning_indexer[k_f16][tq4] = kernel;
+                cl_ulong pm = 0;
+                clGetKernelWorkGroupInfo(kernel, backend_ctx->device, CL_KERNEL_PRIVATE_MEM_SIZE, sizeof(pm), &pm, NULL);
+                if (env_rk || env_tq) GGML_LOG_INFO("ggml_opencl: lightning_indexer K %s TQ %d RK %d: private %llu B\n", k_f16 ? "f16" : "f32",
+                               tq4 ? backend_ctx->lightning_indexer_tq : 1, backend_ctx->lightning_indexer_rk,
+                               (unsigned long long) pm);
             }
         }
     }
@@ -55805,9 +55820,9 @@ static void ggml_cl_lightning_indexer(ggml_backend_t backend, ggml_tensor * dst)
     CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nb1));
     CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nb3));
 
-    const size_t tq  = tq4 ? 4 : 1; // LI_TQ
-    const size_t lws = 64;          // LI_WG
-    const size_t tk  = 2*lws;       // LI_TK: K rows per workgroup
+    const size_t tq  = tq4 ? backend_ctx->lightning_indexer_tq : 1;  // LI_TQ
+    const size_t lws = 64;                                           // LI_WG
+    const size_t tk  = backend_ctx->lightning_indexer_rk*lws;        // LI_TK: K rows per workgroup
     size_t global_work_size[] = { (n_kv + tk - 1) / tk * lws, (n_tokens + tq - 1) / tq, (size_t) n_stream };
     size_t local_work_size[]  = { lws, 1, 1 };
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);

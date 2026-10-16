@@ -15,7 +15,9 @@
 #endif
 
 #define LI_WG 64
+#ifndef LI_RK
 #define LI_RK 2
+#endif
 #define LI_TK (LI_WG*LI_RK)
 #define LI_DC 32            // K elements per slice; n_embd must be a multiple
 #define LI_DC4 (LI_DC/4)
