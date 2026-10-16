@@ -654,6 +654,8 @@ struct ggml_backend_opencl_context {
     bool kernels_loaded_top_k = false;
     // lightning indexer (DeepSeek-V3.2 DSA, glm5-next, qwen4exp QSA), compiled on first use
     bool kernels_loaded_lightning_indexer = false;
+    // hyper-connection ops (DeepSeek-V4, qwen4exp, glm5-next), compiled on first use
+    bool kernels_loaded_dsv4_hc = false;
     // rest of the kernels are currently always loaded in alloc_buffer.
     bool kernels_loaded = false;
 
@@ -986,6 +988,9 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_sum_rows_f32, kernel_sum_rows_f32_4;
     cl_kernel kernel_cumsum_blk, kernel_cumsum_add;
     cl_kernel kernel_lightning_indexer[2][2] = {};      // [K is f16][multi-token tile]
+    cl_kernel kernel_dsv4_hc_comb = nullptr;
+    cl_kernel kernel_dsv4_hc_pre  = nullptr;
+    cl_kernel kernel_dsv4_hc_post = nullptr;
     cl_kernel kernel_repeat_f32;
     cl_kernel kernel_pad;
     cl_kernel kernel_tanh_f32, kernel_tanh_f32_4, kernel_tanh_f32_nc;
@@ -9245,6 +9250,37 @@ static void load_cl_kernels_lightning_indexer(ggml_backend_opencl_context * back
     }
 }
 
+static void load_cl_kernels_dsv4_hc(ggml_backend_opencl_context * backend_ctx) {
+    if (backend_ctx->kernels_loaded_dsv4_hc) {
+        return;
+    }
+    backend_ctx->kernels_loaded_dsv4_hc = true;
+
+#ifdef GGML_OPENCL_EMBED_KERNELS
+    const std::string kernel_src {
+        #include "dsv4_hc.cl.h"
+    };
+#else
+    const std::string kernel_src = read_file("dsv4_hc.cl");
+#endif
+
+    const std::string opts = std::string("-cl-std=CL") + std::to_string(backend_ctx->opencl_c_version.major) + "." + std::to_string(backend_ctx->opencl_c_version.minor) + " -cl-mad-enable";
+    cl_program prog = build_program_from_source_ex(
+        backend_ctx->context, backend_ctx->device, kernel_src.c_str(), opts, /*fatal=*/false, "dsv4_hc");
+    if (!prog) {
+        GGML_LOG_WARN("ggml_opencl: DSV4_HC program failed to build; the ops stay on CPU\n");
+        return;
+    }
+
+    cl_int err;
+    cl_kernel comb = clCreateKernel(prog, "kernel_dsv4_hc_comb", &err);
+    backend_ctx->kernel_dsv4_hc_comb = err == CL_SUCCESS ? comb : nullptr;
+    cl_kernel pre  = clCreateKernel(prog, "kernel_dsv4_hc_pre",  &err);
+    backend_ctx->kernel_dsv4_hc_pre  = err == CL_SUCCESS ? pre  : nullptr;
+    cl_kernel post = clCreateKernel(prog, "kernel_dsv4_hc_post", &err);
+    backend_ctx->kernel_dsv4_hc_post = err == CL_SUCCESS ? post : nullptr;
+}
+
 static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     ggml_backend_opencl_device_context * dev_ctx     = (ggml_backend_opencl_device_context *)dev->context;
     ggml_backend_opencl_context *        backend_ctx = dev_ctx->backend_ctx;
@@ -9751,6 +9787,27 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
             return backend_ctx->kernel_lightning_indexer[k_f16][0] != nullptr &&
                    backend_ctx->kernel_lightning_indexer[k_f16][1] != nullptr;
         }
+        case GGML_OP_DSV4_HC_COMB:
+            if (op->type != GGML_TYPE_F32 || op->src[0]->type != GGML_TYPE_F32 ||
+                op->src[1]->type != GGML_TYPE_F32 || op->src[2]->type != GGML_TYPE_F32) {
+                return false;
+            }
+            load_cl_kernels_dsv4_hc(backend_ctx);
+            return backend_ctx->kernel_dsv4_hc_comb != nullptr;
+        case GGML_OP_DSV4_HC_PRE:
+            if (op->type != GGML_TYPE_F32 || op->src[0]->type != GGML_TYPE_F32 || op->src[1]->type != GGML_TYPE_F32) {
+                return false;
+            }
+            load_cl_kernels_dsv4_hc(backend_ctx);
+            return backend_ctx->kernel_dsv4_hc_pre != nullptr;
+        case GGML_OP_DSV4_HC_POST:
+            if (op->type != GGML_TYPE_F32 || op->src[0]->type != GGML_TYPE_F32 ||
+                op->src[1]->type != GGML_TYPE_F32 || op->src[2]->type != GGML_TYPE_F32 ||
+                (op->src[3] && op->src[3]->type != GGML_TYPE_F32)) {
+                return false;
+            }
+            load_cl_kernels_dsv4_hc(backend_ctx);
+            return backend_ctx->kernel_dsv4_hc_post != nullptr;
         default:
             return false;
     }
@@ -29946,6 +30003,173 @@ static void ggml_cl_lightning_indexer(ggml_backend_t backend, ggml_tensor * dst)
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
 }
 
+static void ggml_cl_dsv4_hc_comb(ggml_backend_t backend, ggml_tensor * dst) {
+    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *) backend->context;
+
+    const ggml_tensor * mixes = dst->src[0];
+    const ggml_tensor * scale = dst->src[1];
+    const ggml_tensor * base  = dst->src[2];
+
+    ggml_tensor_extra_cl * extram = (ggml_tensor_extra_cl *) mixes->extra;
+    ggml_tensor_extra_cl * extras = (ggml_tensor_extra_cl *) scale->extra;
+    ggml_tensor_extra_cl * extrab = (ggml_tensor_extra_cl *) base->extra;
+    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *) dst->extra;
+
+    cl_ulong offm = extram->offset + mixes->view_offs;
+    cl_ulong offs = extras->offset + scale->view_offs;
+    cl_ulong offb = extrab->offset + base->view_offs;
+    cl_ulong offd = extrad->offset + dst->view_offs;
+
+    const int      n_tokens = (int) mixes->ne[1];
+    const cl_ulong nbm0 = mixes->nb[0], nbm1 = mixes->nb[1];
+    const cl_ulong nbs0 = scale->nb[0];
+    const cl_ulong nbb0 = base->nb[0];
+    const cl_ulong nbd0 = dst->nb[0], nbd1 = dst->nb[1], nbd2 = dst->nb[2];
+    const float    eps    = ggml_get_op_params_f32(dst, 0);
+    const int      n_iter = ggml_get_op_params_i32(dst, 1);
+
+    cl_kernel kernel = backend_ctx->kernel_dsv4_hc_comb;
+    int i = 0;
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_mem),   &extram->data_device));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &offm));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_mem),   &extras->data_device));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &offs));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_mem),   &extrab->data_device));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &offb));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_mem),   &extrad->data_device));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &offd));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(int),      &n_tokens));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbm0));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbm1));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbs0));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbb0));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbd0));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbd1));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbd2));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(float),    &eps));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(int),      &n_iter));
+
+    const size_t lws = 64;
+    size_t global_work_size[] = { (size_t) ((n_tokens + lws - 1) / lws) * lws, 1, 1 };
+    size_t local_work_size[]  = { lws, 1, 1 };
+    backend_ctx->enqueue_ndrange_kernel(kernel, 1, global_work_size, local_work_size, dst);
+}
+
+static void ggml_cl_dsv4_hc_pre(ggml_backend_t backend, ggml_tensor * dst) {
+    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *) backend->context;
+
+    const ggml_tensor * x = dst->src[0];
+    const ggml_tensor * w = dst->src[1];
+
+    ggml_tensor_extra_cl * extrax = (ggml_tensor_extra_cl *) x->extra;
+    ggml_tensor_extra_cl * extraw = (ggml_tensor_extra_cl *) w->extra;
+    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *) dst->extra;
+
+    cl_ulong offx = extrax->offset + x->view_offs;
+    cl_ulong offw = extraw->offset + w->view_offs;
+    cl_ulong offd = extrad->offset + dst->view_offs;
+
+    const int      n_embd   = (int) x->ne[0];
+    const int      hc       = (int) x->ne[1];
+    const int      n_tokens = (int) x->ne[2];
+    const cl_ulong nbx0 = x->nb[0], nbx1 = x->nb[1], nbx2 = x->nb[2];
+    const cl_ulong nbw0 = w->nb[0], nbw1 = w->nb[1], nbw2 = w->nb[2];
+    const cl_ulong nbd0 = dst->nb[0], nbd1 = dst->nb[1];
+    const float    scale = ggml_get_op_params_f32(dst, 0);
+    const int      gated = ggml_get_op_params_i32(dst, 1) != 0;
+
+    cl_kernel kernel = backend_ctx->kernel_dsv4_hc_pre;
+    int i = 0;
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_mem),   &extrax->data_device));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &offx));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_mem),   &extraw->data_device));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &offw));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_mem),   &extrad->data_device));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &offd));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(int),      &n_embd));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(int),      &hc));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbx0));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbx1));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbx2));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbw0));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbw1));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbw2));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbd0));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbd1));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(float),    &scale));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(int),      &gated));
+
+    const size_t lws = 64;
+    size_t global_work_size[] = { (size_t) ((n_embd + lws - 1) / lws) * lws, (size_t) n_tokens, 1 };
+    size_t local_work_size[]  = { lws, 1, 1 };
+    backend_ctx->enqueue_ndrange_kernel(kernel, 2, global_work_size, local_work_size, dst);
+}
+
+static void ggml_cl_dsv4_hc_post(ggml_backend_t backend, ggml_tensor * dst) {
+    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *) backend->context;
+
+    const ggml_tensor * x    = dst->src[0];
+    const ggml_tensor * res  = dst->src[1];
+    const ggml_tensor * post = dst->src[2];
+    const ggml_tensor * comb = dst->src[3]; // nullptr: identity mixing
+
+    ggml_tensor_extra_cl * extrax = (ggml_tensor_extra_cl *) x->extra;
+    ggml_tensor_extra_cl * extrar = (ggml_tensor_extra_cl *) res->extra;
+    ggml_tensor_extra_cl * extrap = (ggml_tensor_extra_cl *) post->extra;
+    ggml_tensor_extra_cl * extrac = comb ? (ggml_tensor_extra_cl *) comb->extra : extrap;
+    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *) dst->extra;
+
+    cl_ulong offx = extrax->offset + x->view_offs;
+    cl_ulong offr = extrar->offset + res->view_offs;
+    cl_ulong offp = extrap->offset + post->view_offs;
+    cl_ulong offc = comb ? extrac->offset + comb->view_offs : offp;
+    cl_ulong offd = extrad->offset + dst->view_offs;
+
+    const int      n_embd   = (int) x->ne[0];
+    const int      n_tokens = (int) x->ne[1];
+    const int      hc       = (int) res->ne[1];
+    const int      has_comb = comb != nullptr;
+    const cl_ulong nbx0 = x->nb[0],    nbx1 = x->nb[1];
+    const cl_ulong nbr0 = res->nb[0],  nbr1 = res->nb[1],  nbr2 = res->nb[2];
+    const cl_ulong nbp0 = post->nb[0], nbp1 = post->nb[1];
+    const cl_ulong nbc0 = comb ? comb->nb[0] : 0, nbc1 = comb ? comb->nb[1] : 0, nbc2 = comb ? comb->nb[2] : 0;
+    const cl_ulong nbd0 = dst->nb[0],  nbd1 = dst->nb[1],  nbd2 = dst->nb[2];
+
+    cl_kernel kernel = backend_ctx->kernel_dsv4_hc_post;
+    int i = 0;
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_mem),   &extrax->data_device));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &offx));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_mem),   &extrar->data_device));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &offr));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_mem),   &extrap->data_device));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &offp));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_mem),   &extrac->data_device));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &offc));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_mem),   &extrad->data_device));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &offd));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(int),      &n_embd));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(int),      &hc));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(int),      &has_comb));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbx0));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbx1));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbr0));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbr1));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbr2));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbp0));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbp1));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbc0));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbc1));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbc2));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbd0));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbd1));
+    CL_CHECK(clSetKernelArg(kernel, i++, sizeof(cl_ulong), &nbd2));
+
+    const size_t lws = 64;
+    size_t global_work_size[] = { (size_t) ((n_embd + lws - 1) / lws) * lws, (size_t) n_tokens, 1 };
+    size_t local_work_size[]  = { lws, 1, 1 };
+    backend_ctx->enqueue_ndrange_kernel(kernel, 2, global_work_size, local_work_size, dst);
+}
+
 static void ggml_cl_cumsum(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_ASSERT(src0);
     GGML_ASSERT(src0->extra);
@@ -30763,6 +30987,24 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
                 return false;
             }
             ggml_cl_lightning_indexer(backend, tensor);
+            return true;
+        case GGML_OP_DSV4_HC_COMB:
+            if (!any_on_device) {
+                return false;
+            }
+            ggml_cl_dsv4_hc_comb(backend, tensor);
+            return true;
+        case GGML_OP_DSV4_HC_PRE:
+            if (!any_on_device) {
+                return false;
+            }
+            ggml_cl_dsv4_hc_pre(backend, tensor);
+            return true;
+        case GGML_OP_DSV4_HC_POST:
+            if (!any_on_device) {
+                return false;
+            }
+            ggml_cl_dsv4_hc_post(backend, tensor);
             return true;
         case GGML_OP_FLASH_ATTN_EXT:
             if (!any_on_device) {

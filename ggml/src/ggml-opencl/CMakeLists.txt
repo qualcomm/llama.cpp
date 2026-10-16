@@ -221,6 +221,7 @@ set(GGML_OPENCL_KERNELS
     sum_rows
     cumsum
     lightning_indexer
+    dsv4_hc
     transpose
     concat
     tsembd
