@@ -1158,6 +1158,10 @@ struct ggml_backend_opencl_context {
     ggml_cl_buffer prealloc_topk_ord;  // TOP_K stage-2 argsort output    [nrows * ncand]
     ggml_cl_buffer prealloc_moe_da;   // per-block d  [tok_slots * ne00/32] (half)
     ggml_cl_buffer prealloc_moe_sa;   // per-block s  [tok_slots * ne00/32] (half)
+    // per-tile transposed qa/da and on-chip scratch for the ldck dp4a MoE GEMM
+    ggml_cl_buffer prealloc_moe_qa_trans;    // int8 quants  [tok_slots * ne00]
+    ggml_cl_buffer prealloc_moe_da_trans;    // per-block d  [tok_slots * ne00/32] (float)
+    ggml_cl_buffer prealloc_moe_qda_on_chip;
 
     // Gemma-4 per-layer-block megakernel (software-grid-barrier) scratch.
     ggml_cl_buffer prealloc_mega_pl_scratch;  // y1[n_pl] + y2[n_pl] + y3[D] f32
@@ -1686,6 +1690,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemm_moe_q4_k_q8_1_dp4a = nullptr;    // dp4a (int8) prefill GEMM variant
     cl_kernel kernel_gemm_moe_q4_k_q8_1_dp4a_rb2 = nullptr; // two rows per lane (-DMOE_RB2), ne01 % 128 == 0
     cl_kernel kernel_moe_reorder_quant_a_q8_1;   // fused reorder + q8_1 quant for the dp4a GEMM
+    cl_kernel kernel_transpose_activation_q8 = nullptr;    // per-tile transpose of q8_1 activations for the ldck dp4a GEMM
     cl_kernel kernel_gemm_moe_q8_1_dp4a_q80 = nullptr;   // generic dp4a MoE GEMM (MOE_QT=80), opt-in
     cl_kernel kernel_moe_expand_scale_q8_0 = nullptr;    // q8_0 per-block d -> uniform scale[16]
     cl_kernel kernel_gemm_moe_q8_1_dp4a_q50 = nullptr;   // generic dp4a MoE GEMM (MOE_QT=50, q5_0), opt-in
@@ -1709,6 +1714,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemv_moe_mxfp4_f32_ns_glu;
     cl_kernel kernel_gemv_moe_mxfp4_f32_ns_glu_wimg = nullptr;  // weight-as-texture variant
     cl_kernel kernel_gemm_moe_mxfp4_q8_1_dp4a_bin = nullptr;   // binary dp4a (int8) mxfp4 MoE prefill GEMM
+    cl_kernel kernel_gemm_moe_mxfp4_q8_1_dp4a_ldck_bin = nullptr;   // binary dp4a (int8) mxfp4 MoE prefill GEMM using ldck (X1)
     cl_kernel kernel_gemm_moe_q4_0_q8_1_dp4a_bin = nullptr;    // binary dp4a (int8) q4_0 MoE prefill GEMM
     cl_kernel kernel_gemm_moe_q4_k_q8_1_dp4a_bin = nullptr;   // binary dp4a (int8) q4_k MoE prefill GEMM
     cl_kernel kernel_gemm_moe_q6_k_q8_1_dp4a_bin = nullptr;    // binary dp4a (int8) q6_k MoE prefill GEMM
@@ -10924,6 +10930,25 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         }
     }
 
+    // gemm_moe_mxfp4_q8_1_dp4a_ldck_bin (dp4a prefill GEMM, X1; the kernel library
+    // serves it only where the plain mxfp4 dp4a bin kernel is absent)
+    if (backend_ctx->has_integer_dot_product) {
+        size_t bin_size = 0;
+        backend_ctx->kernel_gemm_moe_mxfp4_q8_1_dp4a_ldck_bin = nullptr;
+
+        if (use_adreno_bin_kernels(backend_ctx)) {
+            const char * kernel_bin = (const char *)backend_ctx->get_adreno_bin_kernel("gemm_moe_mxfp4_q8_1_dp4a_ila_ldck", &bin_size);
+            if (kernel_bin && bin_size > 0) {
+                cl_program prog =
+                    build_program_from_binary(backend_ctx->context, backend_ctx->device, kernel_bin, CL_moe_compile_opts, bin_size);
+
+                CL_CHECK((backend_ctx->kernel_gemm_moe_mxfp4_q8_1_dp4a_ldck_bin = clCreateKernel(prog, "kernel_gemm_moe_mxfp4_q8_1_dp4a_ila_ldck", &err), err));
+                CL_CHECK(clReleaseProgram(prog));
+                GGML_LOG_CONT(".");
+            }
+        }
+    }
+
     // gemm_moe_q4_0_q8_1_dp4a (dp4a prefill GEMM)
     if (backend_ctx->has_integer_dot_product) {
 #ifdef GGML_OPENCL_EMBED_KERNELS
@@ -11021,6 +11046,24 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             build_program_from_source(backend_ctx, kernel_src.c_str(), CL_moe_compile_opts);
 
         CL_CHECK((backend_ctx->kernel_moe_reorder_quant_a_q8_1 = clCreateKernel(prog, "kernel_moe_reorder_quant_a_q8_1", &err), err));
+        CL_CHECK(clReleaseProgram(prog));
+        GGML_LOG_CONT(".");
+    }
+
+    // transpose_activation_q8 (per-tile transpose of q8_1 activations for the ldck
+    // dp4a GEMM); only the ldck bin kernel consumes it
+    if (backend_ctx->kernel_gemm_moe_mxfp4_q8_1_dp4a_ldck_bin) {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src {
+            #include "transpose_activation_q8.cl.h"
+        };
+#else
+        const std::string kernel_src = read_file("transpose_activation_q8.cl");
+#endif
+        cl_program prog =
+            build_program_from_source(backend_ctx, kernel_src.c_str(), CL_moe_compile_opts);
+
+        CL_CHECK((backend_ctx->kernel_transpose_activation_q8 = clCreateKernel(prog, "kernel_transpose_activation_q8", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
@@ -53700,12 +53743,38 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     // prefill regressed -14%; X1 stays opt-in). When the mxfp4 MoE bin
                     // (ILA) kernel is loaded, default dp4a off to let it win; env forces.
                     static const char * mxfp4_moe_dp4a_env = getenv("GGML_OPENCL_MXFP4_MOE_DP4A");
-                    const bool use_moe_dp4a = mxfp4_moe_dp4a_env
+                    // The ldck dp4a bin kernel (X1, kernel library 0.0.15+) ranks with the
+                    // plain bin kernels (X2/A8x); the library never serves both to one
+                    // device. It replaces the source dp4a GEMM, on its own transposed
+                    // activation layout. GGML_OPENCL_MOE_MXFP4_LDCK_BIN=0 keeps the source GEMM.
+                    static const char * mxfp4_ldck_env = getenv("GGML_OPENCL_MOE_MXFP4_LDCK_BIN");
+                    const bool use_moe_dp4a_ldck = backend_ctx->kernel_gemm_moe_mxfp4_q8_1_dp4a_ldck_bin != nullptr &&
+                        backend_ctx->kernel_transpose_activation_q8 != nullptr &&
+                        backend_ctx->kernel_gemm_moe_mxfp4_q8_1_dp4a_bin == nullptr &&
+                        backend_ctx->kernel_gemm_moe_mxfp4_f32_ns_bin == nullptr &&
+                        (!mxfp4_moe_dp4a_env || atoi(mxfp4_moe_dp4a_env) != 0) &&
+                        (!mxfp4_ldck_env || atoi(mxfp4_ldck_env) != 0);
+                    const bool use_moe_dp4a = use_moe_dp4a_ldck || (mxfp4_moe_dp4a_env
                         ? (atoi(mxfp4_moe_dp4a_env) != 0)
                         : (backend_ctx->adreno_dp4a_moe()
                            // the dp4a bin kernel outranks the plain ILA bin kernel
                            && (backend_ctx->kernel_gemm_moe_mxfp4_q8_1_dp4a_bin != nullptr ||
-                               backend_ctx->kernel_gemm_moe_mxfp4_f32_ns_bin == nullptr));
+                               backend_ctx->kernel_gemm_moe_mxfp4_f32_ns_bin == nullptr)));
+
+                    // GGML_OPENCL_MOE_DISPATCH_LOG=1 names the kernel that fired, once per
+                    // distinct (rows, routings).
+                    static const char * mxfp4_dispatch_log_env = getenv("GGML_OPENCL_MOE_DISPATCH_LOG");
+                    if (mxfp4_dispatch_log_env && atoi(mxfp4_dispatch_log_env) != 0) {
+                        static long long last_logged = -1;
+                        const long long key = (long long)ne01 * 1000000 + (long long)(ne20 * ne21);
+                        if (key != last_logged) {
+                            last_logged = key;
+                            GGML_LOG_INFO("ggml_opencl: mul_mat_id mxfp4 gemm ne01=%d routings=%d -> %s\n",
+                                          (int)ne01, (int)(ne20 * ne21),
+                                          use_moe_dp4a ? (backend_ctx->kernel_gemm_moe_mxfp4_q8_1_dp4a_bin ? "dp4a-bin" : use_moe_dp4a_ldck ? "dp4a-ldck-bin" : "dp4a")
+                                                       : (backend_ctx->kernel_gemm_moe_mxfp4_f32_ns_bin ? "ila-bin" : "source-ns"));
+                        }
+                    }
 
                     cl_buffer_region region;
                     region.origin = 0;
@@ -53792,6 +53861,12 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                         backend_ctx->prealloc_moe_qa.allocate(backend_ctx->context, tok_slots * ne00 * sizeof(cl_char));
                         backend_ctx->prealloc_moe_da.allocate(backend_ctx->context, n_blocks * sizeof(cl_half));
                         backend_ctx->prealloc_moe_sa.allocate(backend_ctx->context, n_blocks * sizeof(cl_half));
+                        if (use_moe_dp4a_ldck) {
+                            backend_ctx->prealloc_moe_qa_trans.allocate(backend_ctx->context, tok_slots * ne00 * sizeof(cl_char));
+                            backend_ctx->prealloc_moe_da_trans.allocate(backend_ctx->context, n_blocks * sizeof(cl_float));
+                            // matches max_constant_size of src1_a_cm in the ldck kernel
+                            backend_ctx->prealloc_moe_qda_on_chip.allocate(backend_ctx->context, 2304);
+                        }
 
                         // fused reorder + q8_1 quant straight from the original
                         // activations (no intermediate f32 reorder buffer). mxfp4 has no
@@ -53816,13 +53891,33 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                         cl_kernel dk = backend_ctx->kernel_gemm_moe_mxfp4_q8_1_dp4a;
                         if (backend_ctx->kernel_gemm_moe_mxfp4_q8_1_dp4a_bin) {
                             dk = backend_ctx->kernel_gemm_moe_mxfp4_q8_1_dp4a_bin;
+                        } else if (use_moe_dp4a_ldck) {
+                            dk = backend_ctx->kernel_gemm_moe_mxfp4_q8_1_dp4a_ldck_bin;
+
+                            // per-tile transpose of qa/da for the ldck kernel
+                            cl_kernel tk = backend_ctx->kernel_transpose_activation_q8;
+                            CL_CHECK(clSetKernelArg(tk, 0, sizeof(cl_mem),  &backend_ctx->prealloc_moe_qa.buffer));
+                            CL_CHECK(clSetKernelArg(tk, 1, sizeof(cl_mem),  &backend_ctx->prealloc_moe_qa_trans.buffer));
+                            CL_CHECK(clSetKernelArg(tk, 2, sizeof(cl_mem),  &backend_ctx->prealloc_moe_da.buffer));
+                            CL_CHECK(clSetKernelArg(tk, 3, sizeof(cl_mem),  &backend_ctx->prealloc_moe_da_trans.buffer));
+                            CL_CHECK(clSetKernelArg(tk, 4, sizeof(cl_mem),  &(backend_ctx->prealloc_total_tiles.buffer)));
+                            CL_CHECK(clSetKernelArg(tk, 5, sizeof(cl_uint), &ne00));
+                            size_t tk_local[3]  = { 32, 8, 1 };
+                            size_t tk_global[3] = { 32, (size_t)(ne00 / 4), (size_t)max_post_router_tile };
+                            backend_ctx->enqueue_ndrange_kernel(tk, 3, tk_global, tk_local, dst);
                         }
 
                         int aidx = 0;
                         CL_CHECK(clSetKernelArg(dk, aidx++, sizeof(cl_mem), &extra0_mxfp4->q_img));
                         CL_CHECK(clSetKernelArg(dk, aidx++, sizeof(cl_mem), &extra0_mxfp4->e));
-                        CL_CHECK(clSetKernelArg(dk, aidx++, sizeof(cl_mem), &backend_ctx->prealloc_moe_qa.buffer));
-                        CL_CHECK(clSetKernelArg(dk, aidx++, sizeof(cl_mem), &backend_ctx->prealloc_moe_da.buffer));
+                        if (use_moe_dp4a_ldck) {
+                            CL_CHECK(clSetKernelArg(dk, aidx++, sizeof(cl_mem), &backend_ctx->prealloc_moe_qa_trans.buffer));
+                            CL_CHECK(clSetKernelArg(dk, aidx++, sizeof(cl_mem), &backend_ctx->prealloc_moe_da_trans.buffer));
+                            CL_CHECK(clSetKernelArg(dk, aidx++, sizeof(cl_mem), &backend_ctx->prealloc_moe_qda_on_chip.buffer));
+                        } else {
+                            CL_CHECK(clSetKernelArg(dk, aidx++, sizeof(cl_mem), &backend_ctx->prealloc_moe_qa.buffer));
+                            CL_CHECK(clSetKernelArg(dk, aidx++, sizeof(cl_mem), &backend_ctx->prealloc_moe_da.buffer));
+                        }
                         CL_CHECK(clSetKernelArg(dk, aidx++, sizeof(cl_mem), &buf_src2));
                         CL_CHECK(clSetKernelArg(dk, aidx++, sizeof(cl_mem), &buf_src2_emap));
                         CL_CHECK(clSetKernelArg(dk, aidx++, sizeof(cl_mem), &buf_dst_image));
