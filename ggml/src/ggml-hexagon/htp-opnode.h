@@ -4,13 +4,14 @@
 #define GGML_COMMON_IMPL_CPP
 #include "ggml-backend-impl.h"
 #include "ggml-common.h"
+#include "ggml-impl.h"
 
 #include <algorithm>
 #include <string>
 #include <vector>
 #include <memory>
 #include <stdio.h>
-#include "htp-ops.h"
+#include "htp/htp-ops.h"
 #include "htp/matmul-ops.h"
 #include "htp/flash-attn-ops.h"
 #include "htp/unary-ops.h"
@@ -25,6 +26,7 @@
 struct htp_opnode {
     ggml_tensor * node   { nullptr };
     htp_op_code   opcode { HTP_OP_INVALID };
+    int32_t       params[HTP_OP_MAX_PARAMS] {0};
     int32_t       kernel_params[HTP_OP_MAX_KERN_PARAMS] {0};
 
     std::vector<ggml_tensor *>                fused;
@@ -48,6 +50,8 @@ struct htp_opnode {
         this->node = node;
         if (this->node) {
             this->name = ggml_op_desc(this->node);
+            static_assert(sizeof(this->params) == sizeof(this->node->op_params), "params size mismatch");
+            memcpy(this->params, this->node->op_params, sizeof(this->params));
 
             // Build inputs (preserving optional nullptrs)
             int n_inputs = n_active_src(this->node);

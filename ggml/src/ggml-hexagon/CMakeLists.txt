@@ -50,6 +50,9 @@ endif()
 set(TARGET_NAME ggml-hexagon)
 ggml_add_backend_library(${TARGET_NAME}
     ggml-hexagon.cpp
+    htp-common.h
+    htp-fusion.cpp
+    htp-fusion.h
     htp-repack.cpp
     htp-repack.h
     htp-drv.cpp
