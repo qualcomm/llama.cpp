@@ -44,7 +44,7 @@ struct htp_fill_context {
     uint32_t   elem_size;
 };
 
-static void fill_thread(unsigned int nth, unsigned int ith, void * data) {
+static void fill_thread(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {
     const struct htp_fill_context * fctx = (const struct htp_fill_context *) data;
     struct htp_ops_context        * octx = fctx->octx;
     fill_preamble;
@@ -57,7 +57,7 @@ static void fill_thread(unsigned int nth, unsigned int ith, void * data) {
         return;
     }
 
-    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    struct htp_thread_trace * tr = th->trace;
     htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) ir0);
 
     if (fctx->opt_path) {

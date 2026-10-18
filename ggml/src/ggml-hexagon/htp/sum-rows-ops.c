@@ -55,7 +55,7 @@ struct sum_rows_context {
     bool            opt_path;
 };
 
-static void sum_rows_thread_f32(unsigned int nth, unsigned int ith, void *data) {
+static void sum_rows_thread_f32(const htp_thread_t * th, unsigned int nth, unsigned int ith, void *data) {
     const struct sum_rows_context * smctx = (const struct sum_rows_context *) data;
 
     const uint32_t rows_per_hvx    = smctx->rows_per_hvx;
@@ -79,7 +79,7 @@ static void sum_rows_thread_f32(unsigned int nth, unsigned int ith, void *data) 
     // Calculate actual number of rows for this thread
     const uint32_t n_rows = end_row - start_row;
 
-    struct htp_thread_trace * tr = &smctx->octx->ctx->trace[ith];
+    struct htp_thread_trace * tr = th->trace;
     htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) start_row);
 
     for (uint32_t ir = 0; ir < n_rows; ir++) {
@@ -157,12 +157,12 @@ int op_sum_rows(struct htp_ops_context * octx) {
 struct sum_context {
     struct htp_ops_context * octx;
     const float            * src_data;
-    float                    partial_sums[HTP_MAX_NTHREADS];
+    float                    partial_sums[HTP_MAX_NHVX];
     uint32_t                 total_elems;
     uint32_t                 elems_per_hvx;
 };
 
-static void sum_thread_f32(unsigned int nth, unsigned int ith, void * data) {
+static void sum_thread_f32(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {
     struct sum_context * sctx = (struct sum_context *) data;
     const uint32_t start = sctx->elems_per_hvx * ith;
     const uint32_t end   = MIN(start + sctx->elems_per_hvx, sctx->total_elems);
@@ -175,7 +175,7 @@ static void sum_thread_f32(unsigned int nth, unsigned int ith, void * data) {
     const uint32_t n = end - start;
     const float * src = sctx->src_data + start;
 
-    struct htp_thread_trace * tr = &sctx->octx->ctx->trace[ith];
+    struct htp_thread_trace * tr = th->trace;
     htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) start);
 
     hex_l2fetch_block((const void *) src, n * sizeof(float));
@@ -207,7 +207,7 @@ int op_sum(struct htp_ops_context * octx) {
         return HTP_STATUS_OK;
     }
 
-    const uint32_t n_hvx = (total_elems >= 1024) ? MIN(octx->n_hvx, HTP_MAX_NTHREADS) : 1;
+    const uint32_t n_hvx = (total_elems >= 1024) ? MIN(octx->n_hvx, HTP_MAX_NHVX) : 1;
     const uint32_t raw_chunk = (total_elems + n_hvx - 1) / n_hvx;
     const uint32_t elems_per_hvx = hex_round_up(raw_chunk, 32);
 
@@ -251,11 +251,11 @@ struct argmax_context {
     uint32_t                 rows_per_hvx;
     uint32_t                 elems_per_hvx;
 
-    float                    partial_max[HTP_MAX_NTHREADS];
-    int32_t                  partial_idx[HTP_MAX_NTHREADS];
+    float                    partial_max[HTP_MAX_NHVX];
+    int32_t                  partial_idx[HTP_MAX_NHVX];
 };
 
-static void argmax_thread_single_row(unsigned int nth, unsigned int ith, void * data) {
+static void argmax_thread_single_row(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {
     struct argmax_context * actx = (struct argmax_context *) data;
     const uint32_t start = actx->elems_per_hvx * ith;
     const uint32_t end   = MIN(start + actx->elems_per_hvx, actx->ne00);
@@ -269,7 +269,7 @@ static void argmax_thread_single_row(unsigned int nth, unsigned int ith, void * 
     const uint32_t n = end - start;
     const float * src = actx->src_data + start;
 
-    struct htp_thread_trace * tr = &actx->octx->ctx->trace[ith];
+    struct htp_thread_trace * tr = th->trace;
     htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) start);
 
     hex_l2fetch_block((const void *) src, n * sizeof(float));
@@ -284,7 +284,7 @@ static void argmax_thread_single_row(unsigned int nth, unsigned int ith, void * 
     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) start);
 }
 
-static void argmax_thread_multi_row(unsigned int nth, unsigned int ith, void * data) {
+static void argmax_thread_multi_row(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {
     struct argmax_context * actx = (struct argmax_context *) data;
     const uint32_t r0 = actx->row_start + actx->rows_per_hvx * ith;
     const uint32_t r1 = MIN(r0 + actx->rows_per_hvx, actx->row_start + actx->nrows);
@@ -293,7 +293,7 @@ static void argmax_thread_multi_row(unsigned int nth, unsigned int ith, void * d
         return;
     }
 
-    struct htp_thread_trace * tr = &actx->octx->ctx->trace[ith];
+    struct htp_thread_trace * tr = th->trace;
     htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) r0);
 
     for (uint32_t r = r0; r < r1; r++) {
@@ -341,7 +341,7 @@ int op_argmax(struct htp_ops_context * octx) {
             return HTP_STATUS_OK;
         }
 
-        const uint32_t n_hvx = (ne00 >= 1024) ? MIN(octx->n_hvx, HTP_MAX_NTHREADS) : 1;
+        const uint32_t n_hvx = (ne00 >= 1024) ? MIN(octx->n_hvx, HTP_MAX_NHVX) : 1;
         const uint32_t raw_chunk = (ne00 + n_hvx - 1) / n_hvx;
         const uint32_t elems_per_hvx = hex_round_up(raw_chunk, 32);
 

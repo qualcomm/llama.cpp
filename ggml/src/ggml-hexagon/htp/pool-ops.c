@@ -254,7 +254,7 @@ struct pool_2d_context {
     uint32_t planes_per_hvx;
 };
 
-static void pool_2d_thread(unsigned int nth, unsigned int ith, void * data) {
+static void pool_2d_thread(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {
     struct pool_2d_context * ctx = (struct pool_2d_context *) data;
     const struct htp_pool_2d_kernel_params * p = ctx->kparams;
     const struct htp_tensor * src0 = ctx->octx->src[0];
@@ -268,8 +268,8 @@ static void pool_2d_thread(unsigned int nth, unsigned int ith, void * data) {
         return;
     }
 
-    struct htp_thread_trace * tr = &ctx->octx->ctx->trace[ith];
-    dma_queue * dma_queue = ctx->octx->ctx->dma[ith];
+    struct htp_thread_trace * tr = th->trace;
+    dma_queue * dma_queue = th->dma_q;
 
     const uint32_t src_spad_half = p->src_plane_bytes_aligned;
     const uint32_t dst_spad_half = p->dst_plane_bytes_aligned;

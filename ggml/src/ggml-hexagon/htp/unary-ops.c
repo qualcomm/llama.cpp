@@ -1130,13 +1130,13 @@ static void tri_apply_tile_f32(const void * restrict src, void * restrict dst,
 }
 
 // 1. Standard row-block unary task (F32 and F16).
-static void unary_thread_row_block(unsigned int nth, unsigned int ith, void * data) {
+static void unary_thread_row_block(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {
     (void) nth;
     const struct htp_unary_context * uctx = (const struct htp_unary_context *) data;
     struct htp_ops_context * octx = uctx->octx;
     const struct htp_tensor * src = octx->src[0];
     const struct htp_tensor * dst = octx->dst;
-    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    struct htp_thread_trace * tr = th->trace;
 
     htp_unary_preamble;
 
@@ -1181,7 +1181,7 @@ static void unary_thread_row_block(unsigned int nth, unsigned int ith, void * da
         return;
     }
 
-    dma_queue * dma_q = octx->ctx->dma[ith];
+    dma_queue * dma_q = th->dma_q;
 
     for (uint32_t ir = src0_start_row, vtcm_idx = 0; ir < src0_end_row && vtcm_idx < 2; vtcm_idx++) {
         const uint32_t block_size = unary_block_size(ir, src0_end_row, BLOCK, src0_contig, dst_contig,
@@ -1241,13 +1241,13 @@ static void unary_thread_row_block(unsigned int nth, unsigned int ith, void * da
 }
 
 // 2. RMS_NORM_MUL row-block task with weight buffer.
-static void unary_thread_rms_norm_mul_f32(unsigned int nth, unsigned int ith, void * data) {
+static void unary_thread_rms_norm_mul_f32(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {
     (void) nth;
     const struct htp_unary_context * uctx = (const struct htp_unary_context *) data;
     struct htp_ops_context * octx = uctx->octx;
     const struct htp_tensor * src = octx->src[0];
     const struct htp_tensor * dst = octx->dst;
-    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    struct htp_thread_trace * tr = th->trace;
 
     htp_unary_preamble;
 
@@ -1308,7 +1308,7 @@ static void unary_thread_rms_norm_mul_f32(unsigned int nth, unsigned int ith, vo
         return;
     }
 
-    dma_queue * dma_q = octx->ctx->dma[ith];
+    dma_queue * dma_q = th->dma_q;
 
     if (uctx->broadcast_weight) {
         dma_queue_push(dma_q, dma_make_data(src1_vtcm_data, data_src1),
@@ -1396,13 +1396,13 @@ static void unary_thread_rms_norm_mul_f32(unsigned int nth, unsigned int ith, vo
 }
 
 // 3. TRI row-block task with row index ir.
-static void unary_thread_tri_f32(unsigned int nth, unsigned int ith, void * data) {
+static void unary_thread_tri_f32(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {
     (void) nth;
     const struct htp_unary_context * uctx = (const struct htp_unary_context *) data;
     struct htp_ops_context * octx = uctx->octx;
     const struct htp_tensor * src = octx->src[0];
     const struct htp_tensor * dst = octx->dst;
-    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    struct htp_thread_trace * tr = th->trace;
 
     htp_unary_preamble;
 
@@ -1447,7 +1447,7 @@ static void unary_thread_tri_f32(unsigned int nth, unsigned int ith, void * data
         return;
     }
 
-    dma_queue * dma_q = octx->ctx->dma[ith];
+    dma_queue * dma_q = th->dma_q;
 
     for (uint32_t ir = src0_start_row, vtcm_idx = 0; ir < src0_end_row && vtcm_idx < 2; vtcm_idx++) {
         const uint32_t block_size = unary_block_size(ir, src0_end_row, BLOCK, src0_contig, dst_contig,
@@ -1507,13 +1507,13 @@ static void unary_thread_tri_f32(unsigned int nth, unsigned int ith, void * data
 }
 
 // 4. Pointwise tiled unary task.
-static void unary_thread_tiled(unsigned int nth, unsigned int ith, void * data) {
+static void unary_thread_tiled(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {
     (void) nth;
     const struct htp_unary_context * uctx = (const struct htp_unary_context *) data;
     struct htp_ops_context * octx = uctx->octx;
     const struct htp_tensor * src = octx->src[0];
     const struct htp_tensor * dst = octx->dst;
-    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    struct htp_thread_trace * tr = th->trace;
 
     htp_unary_preamble;
 
@@ -1537,7 +1537,7 @@ static void unary_thread_tiled(unsigned int nth, unsigned int ith, void * data) 
     const size_t src0_half = uctx->src0_vtcm_half_size;
     const size_t dst_half  = uctx->dst_vtcm_half_size;
 
-    dma_queue * dma_q = octx->ctx->dma[ith];
+    dma_queue * dma_q = th->dma_q;
 
     const struct fastdiv_values * div_ne01  = &uctx->kparams->div_ne01;
     const struct fastdiv_values * div_ne02  = &uctx->kparams->div_ne02;
@@ -1624,13 +1624,13 @@ static void unary_thread_tiled(unsigned int nth, unsigned int ith, void * data) 
 }
 
 // 5. TRI tiled task.
-static void unary_thread_tiled_tri_f32(unsigned int nth, unsigned int ith, void * data) {
+static void unary_thread_tiled_tri_f32(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {
     (void) nth;
     const struct htp_unary_context * uctx = (const struct htp_unary_context *) data;
     struct htp_ops_context * octx = uctx->octx;
     const struct htp_tensor * src = octx->src[0];
     const struct htp_tensor * dst = octx->dst;
-    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    struct htp_thread_trace * tr = th->trace;
 
     htp_unary_preamble;
 
@@ -1655,7 +1655,7 @@ static void unary_thread_tiled_tri_f32(unsigned int nth, unsigned int ith, void 
     const size_t src0_half = uctx->src0_vtcm_half_size;
     const size_t dst_half  = uctx->dst_vtcm_half_size;
 
-    dma_queue * dma_q = octx->ctx->dma[ith];
+    dma_queue * dma_q = th->dma_q;
 
     const struct fastdiv_values * div_ne01  = &uctx->kparams->div_ne01;
     const struct fastdiv_values * div_ne02  = &uctx->kparams->div_ne02;

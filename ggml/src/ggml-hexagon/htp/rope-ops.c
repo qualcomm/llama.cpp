@@ -532,7 +532,7 @@ static void inline rope_neox_f32_inplace(struct htp_rope_context * rctx, uint8_t
     }
 }
 
-static void rope_job_f32(unsigned int nth, unsigned int ith, void * data) {
+static void rope_job_f32(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {
     struct htp_rope_context * rctx = (struct htp_rope_context *) data;
     struct htp_ops_context * octx = rctx->octx;
 
@@ -564,8 +564,8 @@ static void rope_job_f32(unsigned int nth, unsigned int ith, void * data) {
     float *   theta_cache    = (float *) (src0_spad_base);
               src0_spad_base = src0_spad_base + rctx->theta_cache_offset;
 
-    dma_queue * dma_q = octx->ctx->dma[ith];
-    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    dma_queue * dma_q = th->dma_q;
+    struct htp_thread_trace * tr = th->trace;
     const int32_t * pos = (const int32_t *) (uintptr_t) src1->data;
     const float * freq_factors = rctx->freq_factors;
 

@@ -587,11 +587,11 @@ static void geglu_f16(const _Float16 * restrict src0,
 }
 
 #define DEFINE_GLU_PER_THREAD(TYPE, SUFFIX)                                                                            \
-    static void glu_##SUFFIX##_per_hvx(unsigned int nth, unsigned int ith, void * data) {                              \
+    static void glu_##SUFFIX##_per_hvx(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {     \
         struct htp_act_context * actx = (struct htp_act_context *) data;                                               \
         htp_act_preamble;                                                                                              \
                                                                                                                        \
-        struct htp_thread_trace * tr = actx->octx->ctx ? &actx->octx->ctx->trace[ith] : NULL;                          \
+        struct htp_thread_trace * tr = actx->octx->ctx ? th->trace : NULL;                                             \
                                                                                                                        \
         size_t src0_row_size = actx->src0_row_size;                                                                    \
         size_t src1_row_size = actx->src1_row_size;                                                                    \
@@ -634,7 +634,7 @@ static void geglu_f16(const _Float16 * restrict src0,
             return;                                                                                                    \
         }                                                                                                              \
                                                                                                                        \
-        dma_queue * dma_q = actx->octx->ctx->dma[ith];                                                                 \
+        dma_queue * dma_q = th->dma_q;                                                                                 \
         glu_compute_##SUFFIX##_fn_t compute = (glu_compute_##SUFFIX##_fn_t) actx->compute;                             \
                                                                                                                        \
         for (uint32_t ir = src0_start_row, spad_idx = 0; ir < src0_end_row && spad_idx < 2; ir += BLOCK, spad_idx++) { \

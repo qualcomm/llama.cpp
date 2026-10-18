@@ -20,6 +20,7 @@
 #include <string.h>
 #include <stdatomic.h>
 
+#include "htp-thread.h"
 #include "hex-utils.h"
 #include "dma-queue.h"
 #include "hmx-queue.h"
@@ -42,8 +43,7 @@
 #define WORK_QUEUE_STACK_SIZE  16384
 #define MAIN_THREAD_STACK_SIZE 32768
 
-_Static_assert(WORK_QUEUE_MAX_N_THREADS >= HTP_MAX_NTHREADS,
-               "work-queue thread cap must be >= HTP_MAX_NTHREADS");
+atomic_uint htp_thread_count = 0;
 
 struct htp_handle {
     struct htp_context * ctx;
@@ -487,11 +487,11 @@ AEEResult htp_iface_start(remote_handle64 handle, uint32_t sess_id, uint64_t dsp
     if (n_hvx == 0) {
         n_hvx = hw_nhvx;
     }
-    if (n_hvx > hw_nth) {
-        n_hvx = hw_nth;
+    if (n_hvx > HTP_MAX_NHVX) {
+        n_hvx = HTP_MAX_NHVX;
     }
-    if (n_hvx > HTP_MAX_NTHREADS) {
-        n_hvx = HTP_MAX_NTHREADS;
+    if (n_hvx > hw_nth - 1) {
+        n_hvx = hw_nth - 1;
     }
 
     uint32_t n_threads = hw_nth;
@@ -651,14 +651,6 @@ AEEResult htp_iface_start(remote_handle64 handle, uint32_t sess_id, uint64_t dsp
     }
 #endif
 
-    ctx->hmx_enabled = n_hmx;
-    ctx->hmx_queue   = NULL;
-    if (n_hmx) {
-        void * hmx_ptr = (void *) ((uintptr_t) block + offset_hmx);
-        ctx->hmx_queue = hmx_queue_init(hmx_ptr, HMX_QUEUE_CAPACITY, HMX_QUEUE_STACK_SIZE, ctx->vtcm_rctx, &ctx->trace[HTP_MAX_NTHREADS]);
-    }
-    FARF(HIGH, "HMX %s (n_hmx=%d)", ctx->hmx_enabled ? "enabled" : "disabled", n_hmx);
-
     ctx->n_threads = n_threads;
     ctx->n_hvx     = n_hvx;
     ctx->n_hvx_div = init_fastdiv_values(ctx->n_hvx);
@@ -676,8 +668,19 @@ AEEResult htp_iface_start(remote_handle64 handle, uint32_t sess_id, uint64_t dsp
     ctx->ddr_spad_size = 512 * 1024; // 512 KB
     ctx->ddr_spad_base = memalign(128, ctx->ddr_spad_size);
 
+    htp_thread_reset();
+    htp_thread_init(&ctx->main_th, ctx->dma, ctx->trace);
+
     void * wq_ptr = (void *) ((uintptr_t) block + offset_wq);
-    ctx->hvx_queue = work_queue_init(wq_ptr, n_hvx, WORK_QUEUE_CAPACITY, WORK_QUEUE_STACK_SIZE);
+    ctx->hvx_queue = work_queue_init(wq_ptr, n_hvx, WORK_QUEUE_CAPACITY, WORK_QUEUE_STACK_SIZE, ctx->dma, ctx->trace);
+
+    ctx->hmx_enabled = n_hmx;
+    ctx->hmx_queue   = NULL;
+    if (n_hmx) {
+        void * hmx_ptr = (void *) ((uintptr_t) block + offset_hmx);
+        ctx->hmx_queue = hmx_queue_init(hmx_ptr, HMX_QUEUE_CAPACITY, HMX_QUEUE_STACK_SIZE, ctx->vtcm_rctx, ctx->dma, ctx->trace);
+    }
+    FARF(HIGH, "HMX %s (n_hmx=%d)", ctx->hmx_enabled ? "enabled" : "disabled", n_hmx);
 
     ctx->main_stack = NULL;
     ctx->main_thread = 0;
@@ -770,11 +773,11 @@ AEEResult htp_iface_hwinfo(remote_handle64 handle, uint32_t * n_threads, uint32_
     }
 
     uint32_t n_hvx_val = hw_nhvx;
-    if (n_hvx_val > hw_threads.max_hthreads) {
-        n_hvx_val = hw_threads.max_hthreads;
+    if (n_hvx_val > HTP_MAX_NHVX) {
+        n_hvx_val = HTP_MAX_NHVX;
     }
-    if (n_hvx_val > HTP_MAX_NTHREADS) {
-        n_hvx_val = HTP_MAX_NTHREADS;
+    if (n_hvx_val > n_threads_val - 1) {
+        n_hvx_val = n_threads_val - 1;
     }
 
     *n_threads = n_threads_val;
@@ -1351,6 +1354,7 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
         hmx_queue_suspend(ctx->hmx_queue);
         hmx_queue_flush(ctx->hmx_queue);
     }
+    work_queue_flush(ctx->hvx_queue);
     work_queue_suspend(ctx->hvx_queue);
 
     // Flush remaining dirty tensors at the end of the batch

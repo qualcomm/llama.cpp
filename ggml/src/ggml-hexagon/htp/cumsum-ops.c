@@ -55,7 +55,7 @@ struct htp_cumsum_context {
     struct htp_cumsum_context * cctx = (struct htp_cumsum_context *) data; \
     struct htp_ops_context *    octx = cctx->octx;                         \
     htp_cumsum_tensors_preamble;                                           \
-    dma_queue * dma_q = octx->ctx->dma[ith];
+    dma_queue * dma_q = th->dma_q;
 
 // ---------------------------------------------------------------------------
 // HVX prefix scan helpers
@@ -116,7 +116,7 @@ static inline void hvx_cumsum_row_f32(const float * restrict src, float * restri
 // Per thread worker: Double-buffered DMA
 // ---------------------------------------------------------------------------
 
-static void cumsum_thread_f32_dma(unsigned int nth, unsigned int ith, void * data) {
+static void cumsum_thread_f32_dma(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {
     htp_cumsum_preamble;
 
     const uint32_t ir0 = cctx->row_start + cctx->rows_per_hvx * ith;
@@ -149,7 +149,7 @@ static void cumsum_thread_f32_dma(unsigned int nth, unsigned int ith, void * dat
                        src_row_size_aligned, src_row_size, src_row_size, 1);
     }
 
-    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    struct htp_thread_trace * tr = th->trace;
 
     for (uint32_t ir = ir0; ir < ir1; ir++) {
         float * dst_spad_row = (float *) dma_queue_pop(dma_q).src;
@@ -182,7 +182,7 @@ static void cumsum_thread_f32_dma(unsigned int nth, unsigned int ith, void * dat
 // Per thread worker: Direct HVX (no DMA)
 // ---------------------------------------------------------------------------
 
-static void cumsum_thread_f32(unsigned int nth, unsigned int ith, void * data) {
+static void cumsum_thread_f32(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {
     htp_cumsum_preamble;
 
     const uint8_t * src_data = (const uint8_t *) src0->data;
@@ -191,7 +191,7 @@ static void cumsum_thread_f32(unsigned int nth, unsigned int ith, void * data) {
     const uint32_t ir0 = cctx->row_start + cctx->rows_per_hvx * ith;
     const uint32_t ir1 = MIN(ir0 + cctx->rows_per_hvx, cctx->row_start + cctx->total_rows);
 
-    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    struct htp_thread_trace * tr = th->trace;
     htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) ir0);
 
     for (uint32_t ir = ir0; ir < ir1; ir++) {

@@ -198,7 +198,7 @@ static int roll_dma_f32_strided(struct htp_ops_context * octx) {
     return HTP_STATUS_OK;
 }
 
-static void roll_thread_f32(unsigned int nth, unsigned int ith, void * data) {
+static void roll_thread_f32(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {
     struct htp_roll_context * rctx = (struct htp_roll_context *) data;
     struct htp_ops_context * octx = rctx->octx;
 
@@ -210,7 +210,7 @@ static void roll_thread_f32(unsigned int nth, unsigned int ith, void * data) {
         return;
     }
 
-    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    struct htp_thread_trace * tr = th->trace;
     htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, row_start);
 
     for (uint32_t row = row_start; row < row_end; row++) {

@@ -57,9 +57,9 @@ static inline void hvx_diag_row_f32(const float * restrict src, float * restrict
 // Per thread worker: DMA src fetch, compute in VTCM, DMA dst writeback
 // ---------------------------------------------------------------------------
 
-static void diag_thread_f32_dma(unsigned int nth, unsigned int ith, void * data) {
+static void diag_thread_f32_dma(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {
     htp_diag_preamble;
-    dma_queue * dma_q = octx->ctx->dma[ith];
+    dma_queue * dma_q = th->dma_q;
 
     const uint32_t ib0 = dctx->batch_start + dctx->batches_per_hvx * ith;
     const uint32_t ib1 = MIN(ib0 + dctx->batches_per_hvx, dctx->batch_start + dctx->total_batches);
@@ -80,7 +80,7 @@ static void diag_thread_f32_dma(unsigned int nth, unsigned int ith, void * data)
     uint8_t * src_spad = octx->src0_spad.data + (ith * src_batch_size_aligned);
     uint8_t * dst_spad = octx->dst_spad.data  + (ith * dst_row_size_aligned);
 
-    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    struct htp_thread_trace * tr = th->trace;
 
     for (uint32_t ib = ib0; ib < ib1; ib++) {
         const uint32_t i3 = ib / ne02;
@@ -121,7 +121,7 @@ static void diag_thread_f32_dma(unsigned int nth, unsigned int ith, void * data)
 // Per thread worker: Direct HVX (no DMA)
 // ---------------------------------------------------------------------------
 
-static void diag_thread_f32(unsigned int nth, unsigned int ith, void * data) {
+static void diag_thread_f32(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {
     htp_diag_preamble;
 
     const uint8_t * src_data = (const uint8_t *) src0->data;
@@ -130,7 +130,7 @@ static void diag_thread_f32(unsigned int nth, unsigned int ith, void * data) {
     const uint32_t ib0 = dctx->batch_start + dctx->batches_per_hvx * ith;
     const uint32_t ib1 = MIN(ib0 + dctx->batches_per_hvx, dctx->batch_start + dctx->total_batches);
 
-    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    struct htp_thread_trace * tr = th->trace;
     htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) ib0);
 
     for (uint32_t ib = ib0; ib < ib1; ib++) {

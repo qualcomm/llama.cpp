@@ -36,7 +36,7 @@ static inline dma_addr_t concat_plane_addr(const struct htp_tensor * t, uint32_t
     return t->data + i2 * t->nb[2] + i3 * t->nb[3];
 }
 
-static void concat_2d_f32_transposed(unsigned int nth, unsigned int ith, void * data) {
+static void concat_2d_f32_transposed(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {
     struct htp_concat_context * cctx = (struct htp_concat_context *) data;
     struct htp_ops_context * octx = cctx->octx;
 
@@ -52,7 +52,7 @@ static void concat_2d_f32_transposed(unsigned int nth, unsigned int ith, void * 
     const uint32_t end_i   = (start_i + cctx->nrows_per_hvx < row_end) ? (start_i + cctx->nrows_per_hvx) : row_end;
     if (start_i >= end_i) return;
 
-    dma_queue * dma_q = octx->ctx->dma[ith];
+    dma_queue * dma_q = th->dma_q;
 
     uint8_t * spad0_base = cctx->spad0_base + ith * cctx->spad0_size_per_hvx;
     uint8_t * spad1_base = cctx->spad1_base + ith * cctx->spad1_size_per_hvx;
@@ -67,7 +67,7 @@ static void concat_2d_f32_transposed(unsigned int nth, unsigned int ith, void * 
     const uint32_t src0_pre        = src0_row_padded - src0_row_bytes;
     const uint32_t spad0_row_bytes = src0_row_padded + src1_ne0_padded * sizeof(float);
 
-    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    struct htp_thread_trace * tr = th->trace;
 
     const struct fastdiv_values * div_ne2 = &cctx->div_ne2;
     const uint32_t ne2 = dst->ne[2];
@@ -132,7 +132,7 @@ static void concat_2d_f32_transposed(unsigned int nth, unsigned int ith, void * 
     dma_queue_flush(dma_q);
 }
 
-static void concat_2d_f16_transposed(unsigned int nth, unsigned int ith, void * data) {
+static void concat_2d_f16_transposed(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {
     struct htp_concat_context * cctx = (struct htp_concat_context *) data;
     struct htp_ops_context * octx = cctx->octx;
 
@@ -148,7 +148,7 @@ static void concat_2d_f16_transposed(unsigned int nth, unsigned int ith, void * 
     const uint32_t end_i   = (start_i + cctx->nrows_per_hvx < row_end) ? (start_i + cctx->nrows_per_hvx) : row_end;
     if (start_i >= end_i) return;
 
-    dma_queue * dma_q = octx->ctx->dma[ith];
+    dma_queue * dma_q = th->dma_q;
 
     uint8_t * spad0_base = cctx->spad0_base + ith * cctx->spad0_size_per_hvx;
     uint8_t * spad1_base = cctx->spad1_base + ith * cctx->spad1_size_per_hvx;
@@ -163,7 +163,7 @@ static void concat_2d_f16_transposed(unsigned int nth, unsigned int ith, void * 
     const uint32_t src0_pre        = src0_row_padded - src0_row_bytes;
     const uint32_t spad0_row_bytes = src0_row_padded + src1_ne0_padded * sizeof(__fp16);
 
-    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    struct htp_thread_trace * tr = th->trace;
 
     const struct fastdiv_values * div_ne2 = &cctx->div_ne2;
     const uint32_t ne2 = dst->ne[2];

@@ -279,10 +279,10 @@ static void ggml_hexagon_dump_batch_prof(const std::string & sess_name, const ht
 
     char evt_str[256] = "----";
     if (opt_profile == 3) {
-        snprintf(evt_str, sizeof(evt_str), "evt-cnt %u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u",
+        snprintf(evt_str, sizeof(evt_str), "evt-cnt %u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u",
                 rsp.n_traces[0], rsp.n_traces[1], rsp.n_traces[2], rsp.n_traces[3],
                 rsp.n_traces[4], rsp.n_traces[5], rsp.n_traces[6], rsp.n_traces[7],
-                rsp.n_traces[8], rsp.n_traces[9], rsp.n_traces[10]);
+                rsp.n_traces[8], rsp.n_traces[9], rsp.n_traces[10], rsp.n_traces[11], rsp.n_traces[12]);
     }
 
     GGML_LOG_DEBUG("ggml-hex: %s profile-op OPBATCH|----|n-ops %u|%s|----|----|usec %u cycles %llu start %llu mhz %.1f\n",
@@ -3240,7 +3240,7 @@ void ggml_hexagon_session::allocate(const ggml_hexagon_device_config & config) n
         int hw_err = htp_iface_hwinfo(this->handle, &hw_n_threads, &hw_n_hvx, &hw_n_hmx, &hw_vtcm_size);
         if (hw_err == 0) {
             this->n_threads          = (std::min)((uint32_t) HTP_MAX_NTHREADS, (uint32_t) hw_n_threads);
-            const uint32_t max_n_hvx = (std::min)(this->n_threads, (uint32_t) hw_n_hvx);
+            const uint32_t max_n_hvx = (std::min)({this->n_threads - 1, (uint32_t) hw_n_hvx, (uint32_t) HTP_MAX_NHVX});
             this->n_hvx              = opt_nhvx > 0 ? (uint32_t) (std::min)(opt_nhvx, (size_t) max_n_hvx) : max_n_hvx;
             this->n_hmx              = (opt_nhmx != 0) ? (uint32_t)hw_n_hmx : 0;
             this->vtcm_size          = (uint64_t)hw_vtcm_size;
@@ -3249,10 +3249,11 @@ void ggml_hexagon_session::allocate(const ggml_hexagon_device_config & config) n
                           (unsigned long long)(this->vtcm_size / (1024 * 1024)));
         } else {
             GGML_LOG_WARN("ggml-hex: %s failed to query hwinfo (0x%x), using defaults\n", this->c_name(), hw_err);
-            this->n_threads = (std::min)(8u, (uint32_t) HTP_MAX_NTHREADS);
-            this->n_hvx     = opt_nhvx > 0 ? (uint32_t) (std::min)(opt_nhvx, (size_t) this->n_threads) : (std::min)(4u, this->n_threads);
-            this->n_hmx     = (opt_nhmx != 0) ? 1 : 0;
-            this->vtcm_size = 8 * 1024 * 1024;
+            this->n_threads          = (std::min)(8u, (uint32_t) HTP_MAX_NTHREADS);
+            const uint32_t max_n_hvx = (std::min)(this->n_threads - 1, (uint32_t) HTP_MAX_NHVX);
+            this->n_hvx              = opt_nhvx > 0 ? (uint32_t) (std::min)(opt_nhvx, (size_t) max_n_hvx) : (std::min)(4u, max_n_hvx);
+            this->n_hmx              = (opt_nhmx != 0) ? 1 : 0;
+            this->vtcm_size          = 8 * 1024 * 1024;
         }
     }
 

@@ -287,13 +287,13 @@ static const softmax_compute_fn_t softmax_kernels[HTP_SOFTMAX_KERNEL_COUNT] = {
     [HTP_SOFTMAX_KERNEL_MASK_F16] = compute_fast_softmax_f32_mask_f16,
 };
 
-static void softmax_thread_dma(unsigned int nth, unsigned int ith, void * data) {
+static void softmax_thread_dma(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {
     (void) nth;
     const struct htp_softmax_context * smctx = (const struct htp_softmax_context *) data;
     struct htp_ops_context * octx = smctx->octx;
     const struct htp_tensor * src0 = octx->src[0];
     const struct htp_tensor * dst  = octx->dst;
-    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    struct htp_thread_trace * tr = th->trace;
 
     const uint32_t src0_nrows            = smctx->nrows;
     const uint32_t src0_nrows_per_hvx    = smctx->src0_nrows_per_hvx;
@@ -317,7 +317,7 @@ static void softmax_thread_dma(unsigned int nth, unsigned int ith, void * data) 
     const size_t src0_vtcm_half = smctx->src0_spad_half_size;
     const size_t dst_vtcm_half  = smctx->dst_spad_half_size;
 
-    dma_queue * dma_q = octx->ctx->dma[ith];
+    dma_queue * dma_q = th->dma_q;
 
     for (uint32_t r = src0_start_row, idx = 0; r < src0_end_row && idx < 2; r++, idx++) {
         dma_addr_t cur_dst  = data_dst  + r * dst_row_size;
@@ -357,14 +357,14 @@ static void softmax_thread_dma(unsigned int nth, unsigned int ith, void * data) 
     dma_queue_flush(dma_q);
 }
 
-static void softmax_thread_mask_dma(unsigned int nth, unsigned int ith, void * data) {
+static void softmax_thread_mask_dma(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {
     (void) nth;
     const struct htp_softmax_context * smctx = (const struct htp_softmax_context *) data;
     struct htp_ops_context * octx = smctx->octx;
     const struct htp_tensor * src0 = octx->src[0];
     const struct htp_tensor * src1 = octx->src[1];
     const struct htp_tensor * dst  = octx->dst;
-    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    struct htp_thread_trace * tr = th->trace;
 
     const uint32_t src0_nrows            = smctx->nrows;
     const uint32_t src0_nrows_per_hvx    = smctx->src0_nrows_per_hvx;
@@ -408,7 +408,7 @@ static void softmax_thread_mask_dma(unsigned int nth, unsigned int ith, void * d
     const struct fastdiv_values * div_ne12 = &smctx->div_ne12;
     const struct fastdiv_values * div_ne13 = &smctx->div_ne13;
 
-    dma_queue * dma_q = octx->ctx->dma[ith];
+    dma_queue * dma_q = th->dma_q;
 
     for (uint32_t r = src0_start_row, idx = 0; r < src0_end_row && idx < 2; r++, idx++) {
         dma_addr_t cur_dst  = data_dst  + r * dst_row_size;

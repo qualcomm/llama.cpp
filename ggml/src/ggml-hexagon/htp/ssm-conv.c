@@ -178,7 +178,7 @@ static inline void hvx_ssm_conv_transpose_block(const float * raw_block,
 }
 
 // Single-token decode worker (n_t == 1)
-static void ssm_conv_thread_f32_decode(unsigned int nth, unsigned int ith, void * data) {
+static void ssm_conv_thread_f32_decode(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {
     struct htp_ssm_conv_context *             scctx   = (struct htp_ssm_conv_context *) data;
     struct htp_ops_context *                  octx    = scctx->octx;
     const struct htp_ssm_conv_kernel_params * kparams = scctx->kparams;
@@ -187,7 +187,7 @@ static void ssm_conv_thread_f32_decode(unsigned int nth, unsigned int ith, void 
     const struct htp_tensor * restrict src1 = octx->src[1];
     const struct htp_tensor * restrict dst  = octx->dst;
 
-    dma_queue * dma_q = octx->ctx->dma[ith];
+    dma_queue * dma_q = th->dma_q;
 
     const uint32_t d_conv  = kparams->d_conv;
     const uint32_t d_inner = kparams->d_inner;
@@ -227,7 +227,7 @@ static void ssm_conv_thread_f32_decode(unsigned int nth, unsigned int ith, void 
 
     float * dst_tile[2] = { (float *) dst_spad_base, (float *) (dst_spad_base + dst_tile_bytes) };
 
-    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    struct htp_thread_trace * tr = th->trace;
 
     // raw_dot keeps both operands in the DMA layout, so src1 needs no prep pass
     const bool raw_dot = (d_conv == 4) && (d_inner_per_hvx % VLEN_FP32 == 0);
@@ -341,7 +341,7 @@ static void ssm_conv_thread_f32_decode(unsigned int nth, unsigned int ith, void 
 }
 
 // Multi-token prefill worker (n_t > 1)
-static void ssm_conv_thread_f32_prefill(unsigned int nth, unsigned int ith, void * data) {
+static void ssm_conv_thread_f32_prefill(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {
     struct htp_ssm_conv_context *             scctx   = (struct htp_ssm_conv_context *) data;
     struct htp_ops_context *                  octx    = scctx->octx;
     const struct htp_ssm_conv_kernel_params * kparams = scctx->kparams;
@@ -350,7 +350,7 @@ static void ssm_conv_thread_f32_prefill(unsigned int nth, unsigned int ith, void
     const struct htp_tensor * restrict src1 = octx->src[1];
     const struct htp_tensor * restrict dst  = octx->dst;
 
-    dma_queue * dma_q = octx->ctx->dma[ith];
+    dma_queue * dma_q = th->dma_q;
 
     const uint32_t d_conv  = kparams->d_conv;
     const uint32_t d_inner = kparams->d_inner;
@@ -395,7 +395,7 @@ static void ssm_conv_thread_f32_prefill(unsigned int nth, unsigned int ith, void
 
     float * dst_tile[2] = { (float *) dst_spad_base, (float *) (dst_spad_base + dst_tile_bytes) };
 
-    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    struct htp_thread_trace * tr = th->trace;
 
     const uint32_t n_tiles   = (d_inner_per_hvx + d_inner_tile - 1) / d_inner_tile;
     const uint32_t n_chunks  = n_s * n_tiles;

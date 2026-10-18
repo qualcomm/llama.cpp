@@ -35,7 +35,7 @@ static void flush_all_dcache(struct htp_context * ctx) {
     memset(ctx->dirty_ranges, 0, sizeof(ctx->dirty_ranges));
 }
 
-static void l2flush_multi_worker(unsigned int n, unsigned int i, void * data) {
+static void l2flush_multi_worker(const htp_thread_t * th, unsigned int n, unsigned int i, void * data) {
     struct l2flush_multi_task * task = (struct l2flush_multi_task *) data;
     (void) n;
 
@@ -48,7 +48,7 @@ static void l2flush_multi_worker(unsigned int n, unsigned int i, void * data) {
         return;
     }
 
-    struct htp_thread_trace * tr = &task->trace[i];
+    struct htp_thread_trace * tr = th->trace;
     htp_trace_event_start(tr, HTP_TRACE_EVT_L2FLUSH, gb_first);
 
     for (uint32_t r = 0; r < task->n_ranges; r++) {

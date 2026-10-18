@@ -190,7 +190,7 @@ static void gather_rows_compute_f16_vgn(
     }
 }
 
-static void gather_rows_thread_f32(unsigned int nth, unsigned int ith, void * data) {
+static void gather_rows_thread_f32(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {
     (void) nth;
     const struct gather_rows_task * task = (const struct gather_rows_task *) data;
     const struct htp_gather_rows_params * kparams = task->kparams;
@@ -204,7 +204,7 @@ static void gather_rows_thread_f32(unsigned int nth, unsigned int ith, void * da
         return;
     }
 
-    struct htp_thread_trace * tr = &task->octx->ctx->trace[ith];
+    struct htp_thread_trace * tr = th->trace;
 
     uint8_t * base   = task->octx->ctx->vtcm_base + ith * kparams->slice;
     HVX_Vector * tab = (HVX_Vector *) base;
@@ -219,7 +219,7 @@ static void gather_rows_thread_f32(unsigned int nth, unsigned int ith, void * da
     gather_rows_init_tables_f32(tab, inc, kparams, a, b);
     htp_trace_event_stop(tr, HTP_TRACE_EVT_INIT, (uint16_t) r_beg);
 
-    dma_queue * q = task->octx->ctx->dma[ith];
+    dma_queue * q = th->dma_q;
     const uint32_t n_in   = 1 + (task->b ? (kparams->b_dense ? 1 : kparams->nb) : 0);
     const uint32_t nr_max = kparams->nr_max;
     const uint32_t nr0    = MIN(nr_max, r_end - r_beg);
@@ -263,7 +263,7 @@ static void gather_rows_thread_f32(unsigned int nth, unsigned int ith, void * da
     dma_queue_flush(q);
 }
 
-static void gather_rows_thread_f16(unsigned int nth, unsigned int ith, void * data) {
+static void gather_rows_thread_f16(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {
     (void) nth;
     const struct gather_rows_task * task = (const struct gather_rows_task *) data;
     const struct htp_gather_rows_params * kparams = task->kparams;
@@ -277,7 +277,7 @@ static void gather_rows_thread_f16(unsigned int nth, unsigned int ith, void * da
         return;
     }
 
-    struct htp_thread_trace * tr = &task->octx->ctx->trace[ith];
+    struct htp_thread_trace * tr = th->trace;
 
     uint8_t * base   = task->octx->ctx->vtcm_base + ith * kparams->slice;
     HVX_Vector * tab = (HVX_Vector *) base;
@@ -292,7 +292,7 @@ static void gather_rows_thread_f16(unsigned int nth, unsigned int ith, void * da
     gather_rows_init_tables_f16(tab, inc, kparams, a, b);
     htp_trace_event_stop(tr, HTP_TRACE_EVT_INIT, (uint16_t) r_beg);
 
-    dma_queue * q = task->octx->ctx->dma[ith];
+    dma_queue * q = th->dma_q;
     const uint32_t n_in = 1 + (task->b ? (kparams->b_dense ? 1 : kparams->nb) : 0);
 
     const uint32_t nr_max = kparams->nr_max;

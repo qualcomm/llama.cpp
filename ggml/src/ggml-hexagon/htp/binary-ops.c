@@ -259,7 +259,7 @@ static void compute_add_id_f32(
 }
 
 // 1. Scalar src1 in VTCM via DMA (ne10 == 1)
-static void binary_thread_scalar(unsigned int nth, unsigned int ith, void * data) {
+static void binary_thread_scalar(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {
     struct htp_binary_context * bctx = (struct htp_binary_context *) data;
     struct htp_ops_context * octx = bctx->octx;
     htp_binary_preamble;
@@ -283,7 +283,7 @@ static void binary_thread_scalar(unsigned int nth, unsigned int ith, void * data
     size_t dst_spad_half     = layout->dst_spad_half_size;
     const void * s1_table    = VTCM_LAYOUT_PTR(const void, bctx->vtcm_base, layout->off_src1);
 
-    dma_queue * dma_q = octx->ctx->dma[ith];
+    dma_queue * dma_q = th->dma_q;
     uint32_t ir_prefetch = start_row;
     int spad_idx = 0;
 
@@ -308,7 +308,7 @@ static void binary_thread_scalar(unsigned int nth, unsigned int ith, void * data
         spad_idx ^= 1;
     }
 
-    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    struct htp_thread_trace * tr = th->trace;
     compute_scalar_t compute = (compute_scalar_t) bctx->compute;
 
     for (uint32_t ir = start_row; ir < end_row; ) {
@@ -357,7 +357,7 @@ static void binary_thread_scalar(unsigned int nth, unsigned int ith, void * data
 }
 
 // 2. Vector Same Shape (ne1x == ne0x) or Simple Broadcast
-static void binary_thread_vector_same_shape(unsigned int nth, unsigned int ith, void * data) {
+static void binary_thread_vector_same_shape(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {
     struct htp_binary_context * bctx = (struct htp_binary_context *) data;
     struct htp_ops_context * octx = bctx->octx;
     htp_binary_preamble;
@@ -379,7 +379,7 @@ static void binary_thread_vector_same_shape(unsigned int nth, unsigned int ith, 
     size_t src1_spad_half = layout->src1_spad_half_size;
     size_t dst_spad_half  = layout->dst_spad_half_size;
 
-    dma_queue * dma_q = octx->ctx->dma[ith];
+    dma_queue * dma_q = th->dma_q;
     uint32_t ir_prefetch = start_row;
     int spad_idx = 0;
 
@@ -410,7 +410,7 @@ static void binary_thread_vector_same_shape(unsigned int nth, unsigned int ith, 
         spad_idx ^= 1;
     }
 
-    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    struct htp_thread_trace * tr = th->trace;
     compute_same_shape_t compute = (compute_same_shape_t) bctx->compute;
 
     for (uint32_t ir = start_row; ir < end_row; ) {
@@ -459,7 +459,7 @@ static void binary_thread_vector_same_shape(unsigned int nth, unsigned int ith, 
 }
 
 // 3. Row Broadcast (ne11 == 1, ne12 == 1, single row src1)
-static void binary_thread_vector_row_broadcast(unsigned int nth, unsigned int ith, void * data) {
+static void binary_thread_vector_row_broadcast(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {
     struct htp_binary_context * bctx = (struct htp_binary_context *) data;
     struct htp_ops_context * octx = bctx->octx;
     htp_binary_preamble;
@@ -479,7 +479,7 @@ static void binary_thread_vector_row_broadcast(unsigned int nth, unsigned int it
     size_t src0_spad_half = layout->src0_spad_half_size;
     size_t dst_spad_half  = layout->dst_spad_half_size;
 
-    dma_queue * dma_q = octx->ctx->dma[ith];
+    dma_queue * dma_q = th->dma_q;
     uint32_t ir_prefetch = start_row;
     int spad_idx = 0;
 
@@ -504,7 +504,7 @@ static void binary_thread_vector_row_broadcast(unsigned int nth, unsigned int it
         spad_idx ^= 1;
     }
 
-    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    struct htp_thread_trace * tr = th->trace;
     compute_row_bcast_t compute = (compute_row_bcast_t) bctx->compute;
 
     for (uint32_t ir = start_row; ir < end_row; ) {
@@ -542,7 +542,7 @@ static void binary_thread_vector_row_broadcast(unsigned int nth, unsigned int it
 }
 
 // 4. Vector Complex (ne10 == ne00, complex broadcast)
-static void binary_thread_vector_complex(unsigned int nth, unsigned int ith, void * data) {
+static void binary_thread_vector_complex(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {
     struct htp_binary_context * bctx = (struct htp_binary_context *) data;
     struct htp_ops_context * octx = bctx->octx;
     htp_binary_preamble;
@@ -567,7 +567,7 @@ static void binary_thread_vector_complex(unsigned int nth, unsigned int ith, voi
     const size_t vtcm_plane_stride = (size_t) ne11 * vtcm_row_stride;
     const size_t vtcm_vol_stride   = (size_t) ne12 * vtcm_plane_stride;
 
-    dma_queue * dma_q = octx->ctx->dma[ith];
+    dma_queue * dma_q = th->dma_q;
     uint32_t ir_prefetch = start_row;
     int spad_idx = 0;
 
@@ -590,7 +590,7 @@ static void binary_thread_vector_complex(unsigned int nth, unsigned int ith, voi
         spad_idx ^= 1;
     }
 
-    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    struct htp_thread_trace * tr = th->trace;
     compute_complex_t compute = (compute_complex_t) bctx->compute;
 
     for (uint32_t ir = start_row; ir < end_row; ) {
@@ -633,7 +633,7 @@ static void binary_thread_vector_complex(unsigned int nth, unsigned int ith, voi
 }
 
 // 5. Element Repeat (ne10 != ne00)
-static void binary_thread_element_repeat(unsigned int nth, unsigned int ith, void * data) {
+static void binary_thread_element_repeat(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {
     struct htp_binary_context * bctx = (struct htp_binary_context *) data;
     struct htp_ops_context * octx = bctx->octx;
     htp_binary_preamble;
@@ -658,7 +658,7 @@ static void binary_thread_element_repeat(unsigned int nth, unsigned int ith, voi
     FARF(HIGH, "binary-repeat: %d/%d (%u:%u) row-size %u (%u)",
          ith, nth, start_row, end_row, nb01, bctx->dst_row_size_aligned);
 
-    dma_queue * dma_q = octx->ctx->dma[ith];
+    dma_queue * dma_q = th->dma_q;
     uint32_t ir_prefetch = start_row;
     int spad_idx = 0;
 
@@ -681,7 +681,7 @@ static void binary_thread_element_repeat(unsigned int nth, unsigned int ith, voi
         spad_idx ^= 1;
     }
 
-    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    struct htp_thread_trace * tr = th->trace;
     compute_repeat_t compute = (compute_repeat_t) bctx->compute;
 
     for (uint32_t ir = start_row; ir < end_row; ) {
@@ -724,7 +724,7 @@ static void binary_thread_element_repeat(unsigned int nth, unsigned int ith, voi
 }
 
 // 6. ADD_ID (src1 gathered via src2 indices)
-static void binary_thread_add_id_f32(unsigned int nth, unsigned int ith, void * data) {
+static void binary_thread_add_id_f32(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {
     struct htp_binary_context * bctx = (struct htp_binary_context *) data;
     struct htp_ops_context * octx = bctx->octx;
 
@@ -759,7 +759,7 @@ static void binary_thread_add_id_f32(unsigned int nth, unsigned int ith, void * 
     size_t src0_spad_half    = layout->src0_spad_half_size;
     size_t dst_spad_half     = layout->dst_spad_half_size;
 
-    dma_queue * dma_q = octx->ctx->dma[ith];
+    dma_queue * dma_q = th->dma_q;
     uint32_t ir_prefetch = start_row;
     int spad_idx = 0;
 
@@ -782,7 +782,7 @@ static void binary_thread_add_id_f32(unsigned int nth, unsigned int ith, void * 
         spad_idx ^= 1;
     }
 
-    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    struct htp_thread_trace * tr = th->trace;
 
     for (uint32_t ir = start_row; ir < end_row; ) {
         uint32_t current_block_size = calc_block_size(bctx, ir, end_row, ne01, ne02);
@@ -867,7 +867,7 @@ struct binary_chunked_context {
     compute_binary_scalar_chunked_f16_t compute_scalar_f16;
 };
 
-static void binary_thread_chunked(unsigned int nth, unsigned int ith, void * data) {
+static void binary_thread_chunked(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {
     (void) nth;
     struct binary_chunked_context * ctx = (struct binary_chunked_context *) data;
     struct htp_ops_context * octx = ctx->octx;
@@ -894,7 +894,7 @@ static void binary_thread_chunked(unsigned int nth, unsigned int ith, void * dat
     uint8_t * src1_spad_base = ctx->is_scalar ? NULL : (VTCM_LAYOUT_PTR(uint8_t, ctx->vtcm_base, layout->off_src1) + (ith * layout->src1_bytes_per_hvx));
     uint8_t * dst_spad_base  = VTCM_LAYOUT_PTR(uint8_t, ctx->vtcm_base, layout->off_dst)  + (ith * layout->dst_bytes_per_hvx);
 
-    dma_queue * dma_q = octx->ctx->dma[ith];
+    dma_queue * dma_q = th->dma_q;
     uint32_t prefetch_chunk = start_chunk;
     int spad_idx = 0;
 
@@ -922,7 +922,7 @@ static void binary_thread_chunked(unsigned int nth, unsigned int ith, void * dat
         spad_idx ^= 1;
     }
 
-    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    struct htp_thread_trace * tr = th->trace;
 
     for (uint32_t c = start_chunk; c < end_chunk; c++) {
         const uint32_t c_start   = ctx->elem_start + c * chunk_size;

@@ -748,7 +748,7 @@ static inline void gdn_step_scalar_f32(
     }
 }
 
-static void gated_delta_net_f32_pp_thread(unsigned int nth, unsigned int ith, void * data) {
+static void gated_delta_net_f32_pp_thread(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {
     struct htp_gdn_context * gctx = (struct htp_gdn_context *) data;
     struct htp_ops_context * octx = gctx->octx;
     const struct htp_gdn_kernel_params * kparams = gctx->kparams;
@@ -777,7 +777,7 @@ static void gated_delta_net_f32_pp_thread(unsigned int nth, unsigned int ith, vo
     float * dst_base       = (float *) (uintptr_t) dst->data;
     float * state_out_base = dst_cache ? (float *) (uintptr_t) dst_cache->data : (dst_base + S_v * H * n_tokens * n_seqs);
 
-    dma_queue * dma_q = octx->ctx->dma[ith];
+    dma_queue * dma_q = th->dma_q;
     const struct htp_gdn_vtcm_layout * layout = &gctx->layout;
     float * s_work[2];
     s_work[0] = (float *) (gctx->vtcm_base + layout->bytes_per_hvx * ith);
@@ -817,7 +817,7 @@ static void gated_delta_net_f32_pp_thread(unsigned int nth, unsigned int ith, vo
         spad_idx ^= 1;
     }
 
-    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    struct htp_thread_trace * tr = th->trace;
 
     int curr_spad_idx = 0;
     for (uint32_t ir = gctx->row_start + ith; ir < row_end; ir += nth) {
@@ -892,7 +892,7 @@ static void gated_delta_net_f32_pp_thread(unsigned int nth, unsigned int ith, vo
     dma_queue_flush(dma_q);
 }
 
-static void gated_delta_net_f32_tg_thread(unsigned int nth, unsigned int ith, void * data) {
+static void gated_delta_net_f32_tg_thread(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {
     struct htp_gdn_context * gctx = (struct htp_gdn_context *) data;
     struct htp_ops_context * octx = gctx->octx;
     const struct htp_gdn_kernel_params * kparams = gctx->kparams;
@@ -918,7 +918,7 @@ static void gated_delta_net_f32_tg_thread(unsigned int nth, unsigned int ith, vo
     const float scale = kparams->scale;
     float * dst_base  = (float *) (uintptr_t) dst->data;
 
-    dma_queue * dma_q = octx->ctx->dma[ith];
+    dma_queue * dma_q = th->dma_q;
     const struct htp_gdn_vtcm_layout * layout = &gctx->layout;
     float * s_work[2];
     s_work[0] = (float *) (gctx->vtcm_base + layout->bytes_per_hvx * ith);
@@ -957,7 +957,7 @@ static void gated_delta_net_f32_tg_thread(unsigned int nth, unsigned int ith, vo
         spad_idx ^= 1;
     }
 
-    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    struct htp_thread_trace * tr = th->trace;
 
     int curr_spad_idx = 0;
     for (uint32_t ir = gctx->row_start + ith; ir < row_end; ir += nth) {
@@ -1031,7 +1031,7 @@ struct htp_gdn_hmx_gemm_task {
     uint8_t *      hmx_scales;
 };
 
-static void htp_gdn_hmx_gemm_worker(void * data) {
+static void htp_gdn_hmx_gemm_worker(const htp_thread_t * th, void * data) {
     struct htp_gdn_hmx_gemm_task * task = (struct htp_gdn_hmx_gemm_task *) data;
     asm volatile(HMX_SET_BIAS("%0") :: "r"((unsigned int)task->hmx_scales));
 
@@ -1653,10 +1653,10 @@ struct htp_gdn_batch_context {
     const struct htp_gdn_kernel_params * kparams;
 };
 
-static void gdn_hvx_init_state_worker(unsigned int n, unsigned int i, void * data) {
+static void gdn_hvx_init_state_worker(const htp_thread_t * th, unsigned int n, unsigned int i, void * data) {
     (void) n;
     struct htp_gdn_batch_context * bctx = (struct htp_gdn_batch_context *) data;
-    struct htp_thread_trace * tr = &bctx->octx->ctx->trace[i];
+    struct htp_thread_trace * tr = th->trace;
     htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, 0);
 
     struct htp_gdn_head_ptrs * head = &bctx->heads[i];
@@ -1689,10 +1689,10 @@ static inline HVX_Vector hvx_splat_last_f32(HVX_Vector v) {
     return hvx_vec_repl4(Q6_V_vror_VR(v, 124));
 }
 
-static void gdn_hvx_phase1a_worker(unsigned int n, unsigned int i, void * data) {
+static void gdn_hvx_phase1a_worker(const htp_thread_t * th, unsigned int n, unsigned int i, void * data) {
     (void) n;
     struct htp_gdn_batch_context * bctx = (struct htp_gdn_batch_context *) data;
-    struct htp_thread_trace * tr = &bctx->octx->ctx->trace[i];
+    struct htp_thread_trace * tr = th->trace;
     const uint16_t info = (uint16_t) bctx->c;
     htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_GDN_PREP, info);
 
@@ -1765,10 +1765,10 @@ static void gdn_hvx_phase1a_worker(unsigned int n, unsigned int i, void * data) 
     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_GDN_PREP, info);
 }
 
-static void gdn_hvx_phase1b_worker(unsigned int n, unsigned int i, void * data) {
+static void gdn_hvx_phase1b_worker(const htp_thread_t * th, unsigned int n, unsigned int i, void * data) {
     (void) n;
     struct htp_gdn_batch_context * bctx = (struct htp_gdn_batch_context *) data;
-    struct htp_thread_trace * tr = &bctx->octx->ctx->trace[i];
+    struct htp_thread_trace * tr = th->trace;
     const uint16_t info = (uint16_t) bctx->c;
     htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_GDN_PREP, info);
 
@@ -1862,10 +1862,10 @@ static void gdn_hvx_phase1b_worker(unsigned int n, unsigned int i, void * data) 
     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_GDN_PREP, info);
 }
 
-static void gdn_hvx_phase2_worker(unsigned int n, unsigned int i, void * data) {
+static void gdn_hvx_phase2_worker(const htp_thread_t * th, unsigned int n, unsigned int i, void * data) {
     (void) n;
     struct htp_gdn_batch_context * bctx = (struct htp_gdn_batch_context *) data;
-    struct htp_thread_trace * tr = &bctx->octx->ctx->trace[i];
+    struct htp_thread_trace * tr = th->trace;
     const uint16_t info = (uint16_t) bctx->c;
     htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_GDN_SOLVE, info);
 
@@ -1886,10 +1886,10 @@ static void gdn_hvx_phase2_worker(unsigned int n, unsigned int i, void * data) {
     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_GDN_SOLVE, info);
 }
 
-static void gdn_hvx_phase3_worker(unsigned int n, unsigned int i, void * data) {
+static void gdn_hvx_phase3_worker(const htp_thread_t * th, unsigned int n, unsigned int i, void * data) {
     (void) n;
     struct htp_gdn_batch_context * bctx = (struct htp_gdn_batch_context *) data;
-    struct htp_thread_trace * tr = &bctx->octx->ctx->trace[i];
+    struct htp_thread_trace * tr = th->trace;
     const uint16_t info = (uint16_t) bctx->c;
     htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_GDN_V_PREP, info);
 
@@ -1930,10 +1930,10 @@ static void gdn_hvx_phase3_worker(unsigned int n, unsigned int i, void * data) {
     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_GDN_V_PREP, info);
 }
 
-static void gdn_hvx_phase4_worker(unsigned int n, unsigned int i, void * data) {
+static void gdn_hvx_phase4_worker(const htp_thread_t * th, unsigned int n, unsigned int i, void * data) {
     (void) n;
     struct htp_gdn_batch_context * bctx = (struct htp_gdn_batch_context *) data;
-    struct htp_thread_trace * tr = &bctx->octx->ctx->trace[i];
+    struct htp_thread_trace * tr = th->trace;
     const uint16_t info = (uint16_t) bctx->c;
     htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_GDN_D_PREP, info);
 
@@ -1961,10 +1961,10 @@ static void gdn_hvx_phase4_worker(unsigned int n, unsigned int i, void * data) {
     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_GDN_D_PREP, info);
 }
 
-static void gdn_hvx_phase5_worker(unsigned int n, unsigned int i, void * data) {
+static void gdn_hvx_phase5_worker(const htp_thread_t * th, unsigned int n, unsigned int i, void * data) {
     (void) n;
     struct htp_gdn_batch_context * bctx = (struct htp_gdn_batch_context *) data;
-    struct htp_thread_trace * tr = &bctx->octx->ctx->trace[i];
+    struct htp_thread_trace * tr = th->trace;
     const uint16_t info = (uint16_t) bctx->c;
     htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_GDN_OUT, info);
 
@@ -1986,10 +1986,10 @@ static void gdn_hvx_phase5_worker(unsigned int n, unsigned int i, void * data) {
     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_GDN_OUT, info);
 }
 
-static void gdn_hvx_phase6_worker(unsigned int n, unsigned int i, void * data) {
+static void gdn_hvx_phase6_worker(const htp_thread_t * th, unsigned int n, unsigned int i, void * data) {
     (void) n;
     struct htp_gdn_batch_context * bctx = (struct htp_gdn_batch_context *) data;
-    struct htp_thread_trace * tr = &bctx->octx->ctx->trace[i];
+    struct htp_thread_trace * tr = th->trace;
     const uint16_t info = (uint16_t) bctx->c;
     htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_GDN_STATE, info);
 

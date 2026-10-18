@@ -16,7 +16,11 @@
 #include <stdbool.h>
 
 #ifndef HTP_MAX_NTHREADS
-#define HTP_MAX_NTHREADS 10
+#define HTP_MAX_NTHREADS 12
+#endif
+
+#ifndef HTP_MAX_NHVX
+#define HTP_MAX_NHVX 8
 #endif
 
 #define HTP_MAX_MMAPS 64
@@ -114,6 +118,7 @@ struct htp_context {
     struct htp_ops_context octx;
 
     qurt_thread_t          main_thread;
+    htp_thread_t           main_th;
     void *                 main_stack;
     atomic_bool            killed;
     size_t                 footprint;

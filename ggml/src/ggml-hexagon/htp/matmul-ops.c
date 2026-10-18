@@ -114,10 +114,10 @@ struct htp_mm_context {
     struct fastdiv_values mm_div_ne11;
 
     // Precomputed block-parallel quantization values
-    uint32_t          quant_ib_first[WORK_QUEUE_MAX_N_THREADS];
-    uint32_t          quant_ib_last[WORK_QUEUE_MAX_N_THREADS];
-    uint32_t          quant_r[WORK_QUEUE_MAX_N_THREADS];
-    uint32_t          quant_c[WORK_QUEUE_MAX_N_THREADS];
+    uint32_t          quant_ib_first[HTP_MAX_NHVX];
+    uint32_t          quant_ib_last[HTP_MAX_NHVX];
+    uint32_t          quant_r[HTP_MAX_NHVX];
+    uint32_t          quant_c[HTP_MAX_NHVX];
     uint32_t          n_quant_tasks;
     uint32_t          n_quant_rows_per_hvx;
 
@@ -235,7 +235,7 @@ static const uint8_t __attribute__((aligned(VLEN))) kvalues_mxfp4_lut[] = {
 #define htp_matmul_preamble                                  \
     struct htp_mm_context * mmctx  = data;                   \
     struct htp_ops_context * octx  = mmctx->octx;            \
-    dma_queue * dma_q              = octx->ctx->dma[ith];    \
+    dma_queue * dma_q              = th->dma_q;              \
     uint32_t src0_nrows_per_hvx = mmctx->src0_nrows_per_hvx; \
     htp_matmul_tensors_preamble;
 
@@ -247,7 +247,7 @@ static const uint8_t __attribute__((aligned(VLEN))) kvalues_mxfp4_lut[] = {
 #include "hvx-mm-kernels-float.h"
 #include "hmx-mm-kernels-tiled.h"
 
-static void hvx_mm_2d_tiled(unsigned int nth, unsigned int ith, void * data) {
+static void hvx_mm_2d_tiled(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {
     htp_matmul_preamble;
 
     const uint32_t src0_nrows = mmctx->src0_row_end - mmctx->src0_row_start;
@@ -257,7 +257,7 @@ static void hvx_mm_2d_tiled(unsigned int nth, unsigned int ith, void * data) {
     const uint32_t src0_start_row  = mmctx->src0_row_start + src0_nrows_per_hvx * ith;
     const uint32_t src0_end_row    = MIN(src0_start_row + src0_nrows_per_hvx, mmctx->src0_row_end);
 
-    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    struct htp_thread_trace * tr = th->trace;
 
     const struct htp_mm_kernel_params * kparams = (const struct htp_mm_kernel_params *) octx->kernel_params;
     const uint32_t n_prefetch = kparams->n_prefetch;
@@ -346,7 +346,7 @@ static void hvx_mm_2d_tiled(unsigned int nth, unsigned int ith, void * data) {
     }
 }
 
-static void hvx_mv_2d_tiled(unsigned int nth, unsigned int ith, void * data) {
+static void hvx_mv_2d_tiled(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {
     htp_matmul_preamble;
 
     const uint32_t src0_nrows = mmctx->src0_row_end - mmctx->src0_row_start;
@@ -354,7 +354,7 @@ static void hvx_mv_2d_tiled(unsigned int nth, unsigned int ith, void * data) {
     const uint32_t src0_start_row  = mmctx->src0_row_start + src0_nrows_per_hvx * ith;
     const uint32_t src0_end_row    = MIN(src0_start_row + src0_nrows_per_hvx, mmctx->src0_row_end);
 
-    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    struct htp_thread_trace * tr = th->trace;
 
     const struct htp_mm_kernel_params * kparams = (const struct htp_mm_kernel_params *) octx->kernel_params;
     const uint32_t n_prefetch = kparams->n_prefetch;
@@ -440,7 +440,7 @@ static void hvx_mv_2d_tiled(unsigned int nth, unsigned int ith, void * data) {
     }
 }
 
-static void hvx_mm_nx_2d_tiled(unsigned int nth, unsigned int ith, void * data) {
+static void hvx_mm_nx_2d_tiled(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {
     struct htp_mm_context * mmctx = data;
     struct htp_ops_context * octx = mmctx->octx;
     const struct htp_mm_kernel_params * kparams = (const struct htp_mm_kernel_params *) octx->kernel_params;
@@ -454,7 +454,7 @@ static void hvx_mm_nx_2d_tiled(unsigned int nth, unsigned int ith, void * data) 
     uint8_t * restrict vtcm_weight_ptr = mmctx->vtcm_src0 + mmctx->vtcm_src0_size_per_hvx * ith;
     uint8_t * restrict act_data        = mmctx->vtcm_act;
 
-    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    struct htp_thread_trace * tr = th->trace;
     const uint32_t n_prefetch = kparams->n_prefetch;
     assert(n_prefetch >= 2 && n_prefetch <= HTP_MM_MAX_PREFETCH && (n_prefetch & (n_prefetch - 1)) == 0);
 
@@ -462,7 +462,7 @@ static void hvx_mm_nx_2d_tiled(unsigned int nth, unsigned int ith, void * data) 
         const struct htp_tensor * restrict src_w = octx->src[widx];
         const struct htp_tensor * restrict dst   = octx->dsts[widx];
         if (!src_w || !dst) continue;
-        dma_queue * dma_q = octx->ctx->dma[ith];
+        dma_queue * dma_q = th->dma_q;
 
         const uint32_t tile_size = htp_tensor_get_tile_size(src_w->type);
         const uint32_t aligned_tile_size = htp_tensor_get_tile_padded_size(src_w->type);
@@ -611,7 +611,7 @@ static void hvx_mm_transfer_act_dma(
 }
 
 #define QUANTIZE_IMPL(name, log_name, kernel_fn, dst_row_size_expr)                                        \
-static void name(unsigned int nth, unsigned int ith, void * data) {                                        \
+static void name(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {               \
     (void) nth;                                                                                            \
     struct htp_mm_context * mmctx = data;                                                                  \
     struct htp_ops_context * octx = mmctx->octx;                                                           \
@@ -625,7 +625,7 @@ static void name(unsigned int nth, unsigned int ith, void * data) {             
         return;                                                                                            \
     }                                                                                                      \
                                                                                                            \
-    struct htp_thread_trace * tr = &octx->ctx->trace[ith];                                                 \
+    struct htp_thread_trace * tr = th->trace;                                                              \
     htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_A_QUANT, ir_first);                                        \
                                                                                                            \
     uint8_t * restrict dst = mmctx->vtcm_act;                                                              \
@@ -649,14 +649,14 @@ QUANTIZE_IMPL(quantize_f32_f32,            "quantize-f32-f32",            quanti
 QUANTIZE_IMPL(quantize_f32_f16,            "quantize-f32-f16",            quantize_f32_f16_kernel,            mmctx->vtcm_act_stride)
 QUANTIZE_IMPL(quantize_f16_f16,            "quantize-f16-f16",            quantize_f16_f16_kernel,            mmctx->vtcm_act_stride)
 
-static void quantize_f32_q8_0_tiled_block(unsigned int nth, unsigned int ith, void * data) {
+static void quantize_f32_q8_0_tiled_block(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {
     (void) nth;
     struct htp_mm_context * mmctx = data;
     if (mmctx->quant_ib_first[ith] >= mmctx->quant_ib_last[ith]) {
         return;
     }
     struct htp_ops_context * octx = mmctx->octx;
-    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    struct htp_thread_trace * tr = th->trace;
     htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_A_QUANT, mmctx->quant_ib_first[ith]);
 
     const struct htp_tensor * src = mmctx->act;
@@ -677,14 +677,14 @@ static void quantize_f32_q8_0_tiled_block(unsigned int nth, unsigned int ith, vo
     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_A_QUANT, mmctx->quant_ib_first[ith]);
 }
 
-static void quantize_f32_q8_1_tiled_block(unsigned int nth, unsigned int ith, void * data) {
+static void quantize_f32_q8_1_tiled_block(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {
     (void) nth;
     struct htp_mm_context * mmctx = data;
     if (mmctx->quant_ib_first[ith] >= mmctx->quant_ib_last[ith]) {
         return;
     }
     struct htp_ops_context * octx = mmctx->octx;
-    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    struct htp_thread_trace * tr = th->trace;
     htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_A_QUANT, mmctx->quant_ib_first[ith]);
 
     const struct htp_tensor * src = mmctx->act;
@@ -705,14 +705,14 @@ static void quantize_f32_q8_1_tiled_block(unsigned int nth, unsigned int ith, vo
     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_A_QUANT, mmctx->quant_ib_first[ith]);
 }
 
-static void quantize_f32_q8_1_s16_tiled_block(unsigned int nth, unsigned int ith, void * data) {
+static void quantize_f32_q8_1_s16_tiled_block(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {
     (void) nth;
     struct htp_mm_context * mmctx = data;
     if (mmctx->quant_ib_first[ith] >= mmctx->quant_ib_last[ith]) {
         return;
     }
     struct htp_ops_context * octx = mmctx->octx;
-    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    struct htp_thread_trace * tr = th->trace;
     htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_A_QUANT, mmctx->quant_ib_first[ith]);
 
     const struct htp_tensor * src = mmctx->act;
@@ -733,14 +733,14 @@ static void quantize_f32_q8_1_s16_tiled_block(unsigned int nth, unsigned int ith
     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_A_QUANT, mmctx->quant_ib_first[ith]);
 }
 
-static void quantize_f32_f16_tiled_block(unsigned int nth, unsigned int ith, void * data) {
+static void quantize_f32_f16_tiled_block(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {
     (void) nth;
     struct htp_mm_context * mmctx = data;
     if (mmctx->quant_ib_first[ith] >= mmctx->quant_ib_last[ith]) {
         return;
     }
     struct htp_ops_context * octx = mmctx->octx;
-    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    struct htp_thread_trace * tr = th->trace;
     htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_A_QUANT, mmctx->quant_ib_first[ith]);
 
     const struct htp_tensor * src = mmctx->act;
@@ -761,14 +761,14 @@ static void quantize_f32_f16_tiled_block(unsigned int nth, unsigned int ith, voi
     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_A_QUANT, mmctx->quant_ib_first[ith]);
 }
 
-static void quantize_f16_f16_tiled_block(unsigned int nth, unsigned int ith, void * data) {
+static void quantize_f16_f16_tiled_block(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {
     (void) nth;
     struct htp_mm_context * mmctx = data;
     if (mmctx->quant_ib_first[ith] >= mmctx->quant_ib_last[ith]) {
         return;
     }
     struct htp_ops_context * octx = mmctx->octx;
-    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    struct htp_thread_trace * tr = th->trace;
     htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_A_QUANT, mmctx->quant_ib_first[ith]);
 
     const struct htp_tensor * src = mmctx->act;
@@ -810,7 +810,7 @@ static inline work_queue_func_t htp_mm_act_quant_block_func(int weight_type, int
     return htp_mm_weight_has_offset(weight_type) ? quantize_f32_q8_1_tiled_block : quantize_f32_q8_0_tiled_block;
 }
 
-static void hvx_mm_4d_tiled(unsigned int nth, unsigned int ith, void * data) {
+static void hvx_mm_4d_tiled(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {
     htp_matmul_preamble;
 
     const uint32_t src0_nrows = mmctx->src0_row_end - mmctx->src0_row_start;
@@ -820,7 +820,7 @@ static void hvx_mm_4d_tiled(unsigned int nth, unsigned int ith, void * data) {
     const uint32_t src0_start_row  = mmctx->src0_row_start + src0_nrows_per_hvx * ith;
     const uint32_t src0_end_row    = MIN(src0_start_row + src0_nrows_per_hvx, mmctx->src0_row_end);
 
-    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    struct htp_thread_trace * tr = th->trace;
 
     const struct htp_mm_kernel_params * kparams = (const struct htp_mm_kernel_params *) octx->kernel_params;
     const uint32_t n_prefetch = kparams->n_prefetch;
@@ -934,7 +934,7 @@ static void hvx_mm_4d_tiled(unsigned int nth, unsigned int ith, void * data) {
     }
 }
 
-static void hvx_mm_2d_flat(unsigned int nth, unsigned int ith, void * data) {
+static void hvx_mm_2d_flat(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {
     htp_matmul_preamble;
 
     const struct htp_mm_kernel_params * kparams = (const struct htp_mm_kernel_params *) octx->kernel_params;
@@ -950,7 +950,7 @@ static void hvx_mm_2d_flat(unsigned int nth, unsigned int ith, void * data) {
     const uint32_t src0_end_row    = MIN(src0_start_row + src0_nrows_per_hvx, mmctx->src0_row_end);
     const uint32_t src0_end_row_x2 = src0_start_row + ((src0_end_row - src0_start_row) & ~1U);
 
-    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    struct htp_thread_trace * tr = th->trace;
 
     const size_t dst_row_size  = nb1;
     const size_t src0_row_size = nb01;
@@ -1037,7 +1037,7 @@ static void hvx_mm_2d_flat(unsigned int nth, unsigned int ith, void * data) {
     }
 }
 
-static void hvx_mv_2d_flat(unsigned int nth, unsigned int ith, void * data) {
+static void hvx_mv_2d_flat(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {
     htp_matmul_preamble;
 
     const uint32_t src0_nrows = mmctx->src0_row_end - mmctx->src0_row_start;
@@ -1045,7 +1045,7 @@ static void hvx_mv_2d_flat(unsigned int nth, unsigned int ith, void * data) {
     const uint32_t src0_start_row  = mmctx->src0_row_start + src0_nrows_per_hvx * ith;
     const uint32_t src0_end_row    = MIN(src0_start_row + src0_nrows_per_hvx, mmctx->src0_row_end);
 
-    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    struct htp_thread_trace * tr = th->trace;
 
     const size_t dst_row_size  = nb1;
     const size_t src0_row_size = nb01;
@@ -1142,7 +1142,7 @@ static void hvx_mv_2d_flat(unsigned int nth, unsigned int ith, void * data) {
     }
 }
 
-static void hvx_mm_4d_flat(unsigned int nth, unsigned int ith, void * data) {
+static void hvx_mm_4d_flat(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {
     htp_matmul_preamble;
 
     const struct htp_mm_kernel_params * kparams = (const struct htp_mm_kernel_params *) octx->kernel_params;
@@ -1158,7 +1158,7 @@ static void hvx_mm_4d_flat(unsigned int nth, unsigned int ith, void * data) {
     const uint32_t src0_end_row    = MIN(src0_start_row + src0_nrows_per_hvx, mmctx->src0_row_end);
     const uint32_t src0_end_row_x2 = src0_start_row + ((src0_end_row - src0_start_row) & ~1U);
 
-    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    struct htp_thread_trace * tr = th->trace;
 
     const size_t dst_row_size  = nb1;
     const size_t src0_row_size = nb01;
@@ -1291,7 +1291,7 @@ static void hvx_mm_4d_flat(unsigned int nth, unsigned int ith, void * data) {
 
 #define MMID_MATRIX_ROW(row_id, i1) matrix_rows[(row_id) * mmctx->mapping_stride + (i1)]
 
-static void hvx_mm_id_tiled(unsigned int nth, unsigned int ith, void * data) {
+static void hvx_mm_id_tiled(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {
     htp_matmul_preamble;
 
     const struct htp_tensor * restrict ids = octx->src[2];
@@ -1306,7 +1306,7 @@ static void hvx_mm_id_tiled(unsigned int nth, unsigned int ith, void * data) {
         return;
     }
 
-    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    struct htp_thread_trace * tr = th->trace;
 
     const struct htp_mm_kernel_params * kparams = (const struct htp_mm_kernel_params *) octx->kernel_params;
     const uint32_t n_prefetch = kparams->n_prefetch;
@@ -1379,7 +1379,7 @@ static void hvx_mm_id_tiled(unsigned int nth, unsigned int ith, void * data) {
     }
 }
 
-static void hvx_mv_id_tiled(unsigned int nth, unsigned int ith, void * data) {
+static void hvx_mv_id_tiled(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {
     htp_matmul_preamble;
 
     const struct htp_tensor * restrict ids = octx->src[2];
@@ -1393,7 +1393,7 @@ static void hvx_mv_id_tiled(unsigned int nth, unsigned int ith, void * data) {
         return;
     }
 
-    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    struct htp_thread_trace * tr = th->trace;
 
     const struct htp_mm_kernel_params * kparams = (const struct htp_mm_kernel_params *) octx->kernel_params;
     const uint32_t n_prefetch = kparams->n_prefetch;
@@ -1456,7 +1456,7 @@ static void hvx_mv_id_tiled(unsigned int nth, unsigned int ith, void * data) {
     }
 }
 
-static void hvx_mv_id_nx_tiled(unsigned int nth, unsigned int ith, void * data) {
+static void hvx_mv_id_nx_tiled(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {
     struct htp_mm_context * mmctx = (struct htp_mm_context *) data;
     struct htp_ops_context * octx = mmctx->octx;
     const struct htp_mm_kernel_params * kparams = (const struct htp_mm_kernel_params *) octx->kernel_params;
@@ -1466,7 +1466,7 @@ static void hvx_mv_id_nx_tiled(unsigned int nth, unsigned int ith, void * data) 
     const struct htp_tensor * restrict ids  = octx->src[n_weights + 1];
 
 
-    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    struct htp_thread_trace * tr = th->trace;
 
     const uint32_t n_prefetch = kparams->n_prefetch;
     assert(n_prefetch >= 2 && n_prefetch <= HTP_MM_MAX_PREFETCH && (n_prefetch & (n_prefetch - 1)) == 0);
@@ -1486,7 +1486,7 @@ static void hvx_mv_id_nx_tiled(unsigned int nth, unsigned int ith, void * data) 
             const struct htp_tensor * restrict src_w = octx->src[p];
             const struct htp_tensor * restrict dst   = octx->dsts[p];
             if (!src_w || !dst) continue;
-            dma_queue * dma_q = octx->ctx->dma[ith];
+            dma_queue * dma_q = th->dma_q;
 
             const uint32_t ne01 = src_w->ne[1];
             uint32_t start_row = 0;
@@ -1545,7 +1545,7 @@ static void hvx_mv_id_nx_tiled(unsigned int nth, unsigned int ith, void * data) 
     }
 }
 
-static void hvx_mm_id_nx_tiled(unsigned int nth, unsigned int ith, void * data) {
+static void hvx_mm_id_nx_tiled(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {
     struct htp_mm_context * mmctx = (struct htp_mm_context *) data;
     struct htp_ops_context * octx = mmctx->octx;
     const struct htp_mm_kernel_params * kparams = (const struct htp_mm_kernel_params *) octx->kernel_params;
@@ -1555,7 +1555,7 @@ static void hvx_mm_id_nx_tiled(unsigned int nth, unsigned int ith, void * data) 
     const struct htp_tensor * restrict ids  = octx->src[n_weights + 1];
 
 
-    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    struct htp_thread_trace * tr = th->trace;
 
     const uint32_t n_prefetch = kparams->n_prefetch;
     assert(n_prefetch >= 2 && n_prefetch <= HTP_MM_MAX_PREFETCH && (n_prefetch & (n_prefetch - 1)) == 0);
@@ -1578,7 +1578,7 @@ static void hvx_mm_id_nx_tiled(unsigned int nth, unsigned int ith, void * data) 
             const struct htp_tensor * restrict src_w = octx->src[p];
             const struct htp_tensor * restrict dst   = octx->dsts[p];
             if (!src_w || !dst) continue;
-            dma_queue * dma_q = octx->ctx->dma[ith];
+            dma_queue * dma_q = th->dma_q;
 
             const uint32_t ne01 = src_w->ne[1];
             uint32_t start_row = 0;
@@ -1952,9 +1952,9 @@ static int hvx_mm_matmul(struct htp_ops_context * octx) {
     return HTP_STATUS_OK;
 }
 
-static void dequantize_tiled_worker_loop(unsigned int n, unsigned int i, void * data) {
+static void dequantize_tiled_worker_loop(const htp_thread_t * th, unsigned int n, unsigned int i, void * data) {
     tiled_dequantize_state_t * state = (tiled_dequantize_state_t *) data;
-    struct htp_thread_trace * tr = &state->traces[i];
+    struct htp_thread_trace * tr = th->trace;
     htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_W_DEQUANT, i);
     for (unsigned int task_id = i; task_id < (unsigned int) state->n_tasks; task_id += n) {
         int start = task_id * state->n_tiles_per_task;
@@ -1964,10 +1964,10 @@ static void dequantize_tiled_worker_loop(unsigned int n, unsigned int i, void * 
     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_W_DEQUANT, i);
 }
 
-static void transfer_output_chunk_worker_fn(unsigned int n, unsigned int i, void *data) {
+static void transfer_output_chunk_worker_fn(const htp_thread_t * th, unsigned int n, unsigned int i, void *data) {
     output_transfer_task_state_t *st = (output_transfer_task_state_t *) data;
 
-    struct htp_thread_trace * tr = &st->traces[i];
+    struct htp_thread_trace * tr = th->trace;
 
     int start_chunk_idx = i * st->n_chunks_per_task;
     htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_O_PROC, start_chunk_idx);
@@ -1985,8 +1985,6 @@ static void transfer_output_chunk_worker_fn(unsigned int n, unsigned int i, void
 }
 
 typedef struct {
-    struct htp_context            * ctx;
-    struct htp_thread_trace       * traces;
     __fp16                        * dst;
     dma_addr_t                      act_dma_addr;
     float                         * vtcm_f32_act;
@@ -2003,8 +2001,6 @@ typedef struct {
 } activation_transfer_task_state_t;
 
 typedef struct {
-    struct htp_context            * ctx;
-    struct htp_thread_trace       * traces;
     __fp16                        * dst;
     dma_addr_t                      act_dma_addr;
     float                         * vtcm_f32_act;
@@ -2087,9 +2083,9 @@ static void transfer_activation_chunk_fp32_to_fp16_dma_pipelined_col_chunk(
     }
 }
 
-static void transfer_activation_chunk_col_chunk_worker_fn(unsigned int n, unsigned int i, void *data) {
+static void transfer_activation_chunk_col_chunk_worker_fn(const htp_thread_t * th, unsigned int n, unsigned int i, void *data) {
     activation_transfer_col_chunk_state_t *st = (activation_transfer_col_chunk_state_t *) data;
-    struct htp_thread_trace * tr = &st->traces[i];
+    struct htp_thread_trace * tr = th->trace;
 
     uint32_t n_blocks = st->k_block / 32;
     uint32_t b_first  = fastdiv(n_blocks * i, &st->n_hvx_div);
@@ -2113,7 +2109,7 @@ static void transfer_activation_chunk_col_chunk_worker_fn(unsigned int n, unsign
     float *thread_f32_act = (float *)((char *)st->vtcm_f32_act + i * thread_scratch_bytes);
 
     transfer_activation_chunk_fp32_to_fp16_dma_pipelined_col_chunk(
-        st->ctx->dma[i], dst, st->act_dma_addr, st->n_rows, st->k_block, st->k_stride, k_chunk_valid,
+        th->dma_q, dst, st->act_dma_addr, st->n_rows, st->k_block, st->k_stride, k_chunk_valid,
         c_first, c_len, thread_f32_act, tr, st->dma_step_rows, st->dma_step_rows_shift
     );
 }
@@ -2201,10 +2197,10 @@ static void transfer_activation_chunk_to_fp16_dma_pipelined(
     }
 }
 
-static void transfer_activation_chunk_worker_fn(unsigned int n, unsigned int i, void *data) {
+static void transfer_activation_chunk_worker_fn(const htp_thread_t * th, unsigned int n, unsigned int i, void *data) {
     activation_transfer_task_state_t *st = (activation_transfer_task_state_t *) data;
 
-    struct htp_thread_trace * tr = &st->traces[i];
+    struct htp_thread_trace * tr = th->trace;
 
     for (unsigned int task_id = i; task_id < (unsigned int)st->n_tasks; task_id += n) {
         int    chunk_idx  = task_id * st->n_chunks_per_task;
@@ -2215,13 +2211,12 @@ static void transfer_activation_chunk_worker_fn(unsigned int n, unsigned int i, 
 
         uint8_t *thread_act = (uint8_t *) st->vtcm_f32_act + i * st->vtcm_f32_act_bytes_per_hvx;
         transfer_activation_chunk_to_fp16_dma_pipelined(
-            st->ctx->dma[i], dst, act_dma_addr, chunk_size, st->k_block, st->k_stride, st->k_valid, thread_act, st->act_elem_size, tr, st->dma_step_rows, st->dma_step_rows_shift
+            th->dma_q, dst, act_dma_addr, chunk_size, st->k_block, st->k_stride, st->k_valid, thread_act, st->act_elem_size, tr, st->dma_step_rows, st->dma_step_rows_shift
         );
     }
 }
 
 typedef struct {
-    struct htp_thread_trace       * traces;
     const struct mmid_row_mapping * matrix_rows;
     __fp16                        * dst;
     const float                   * src;
@@ -2241,7 +2236,6 @@ typedef struct {
 } activation_transfer_gathered_task_state_t;
 
 typedef struct {
-    struct htp_thread_trace       * traces;
     const struct mmid_row_mapping * matrix_rows;
     const __fp16                  * vtcm_src;
     float                         * dst;
@@ -2257,9 +2251,9 @@ typedef struct {
     uint32_t                        cne1;
 } output_transfer_scattered_task_state_t;
 
-static void transfer_activation_chunk_gathered_worker_fn(unsigned int n, unsigned int i, void *data) {
+static void transfer_activation_chunk_gathered_worker_fn(const htp_thread_t * th, unsigned int n, unsigned int i, void *data) {
     activation_transfer_gathered_task_state_t *st = data;
-    struct htp_thread_trace * tr = &st->traces[i];
+    struct htp_thread_trace * tr = th->trace;
     int chunk_idx      = i;
     int chunk_size     = st->n_chunks_per_task;
     int vtcm_start_row = chunk_idx * chunk_size;
@@ -2275,9 +2269,9 @@ static void transfer_activation_chunk_gathered_worker_fn(unsigned int n, unsigne
     }
 }
 
-static void transfer_activation_chunk_gathered_worker_flat_fn(unsigned int n, unsigned int i, void *data) {
+static void transfer_activation_chunk_gathered_worker_flat_fn(const htp_thread_t * th, unsigned int n, unsigned int i, void *data) {
     activation_transfer_gathered_task_state_t *st = data;
-    struct htp_thread_trace * tr = &st->traces[i];
+    struct htp_thread_trace * tr = th->trace;
     int chunk_idx = i;
     int chunk_size = st->n_chunks_per_task;
     int vtcm_start_row = chunk_idx * chunk_size;
@@ -2293,9 +2287,9 @@ static void transfer_activation_chunk_gathered_worker_flat_fn(unsigned int n, un
     }
 }
 
-static void transfer_output_chunk_scattered_worker_fn(unsigned int n, unsigned int i, void *data) {
+static void transfer_output_chunk_scattered_worker_fn(const htp_thread_t * th, unsigned int n, unsigned int i, void *data) {
     output_transfer_scattered_task_state_t *st = data;
-    struct htp_thread_trace * tr = &st->traces[i];
+    struct htp_thread_trace * tr = th->trace;
     int chunk_idx = i;
     int chunk_size = st->n_chunks_per_task;
     int vtcm_start_row = chunk_idx * chunk_size;
@@ -2368,23 +2362,15 @@ static void dequantize_tiled_weight_chunk_to_fp16_tiles(
     state.n_k_tiles        = n_k_tiles;
     state.n_weight_tiles   = n_weight_tiles;
     state.n_k_tiles_div    = n_k_tiles_div;
-    state.traces           = ctx->trace;
-    state.ctx              = ctx;
 
     state.tile_size = htp_tensor_get_tile_size(weight_type);
     state.aligned_tile_size = htp_tensor_get_tile_padded_size(weight_type);
 
-    if (state.n_tasks == 1 || n_hvx == 1) {
-        dequantize_tiled_worker_loop(1, 0, &state);
-    } else {
-        int n_tasks = hex_smin((int) state.n_tasks, n_hvx);
-        work_queue_run(ctx->hvx_queue, dequantize_tiled_worker_loop, &state, n_tasks);
-    }
+    int n_tasks = hex_smin((int) state.n_tasks, n_hvx);
+    work_queue_run(ctx->hvx_queue, dequantize_tiled_worker_loop, &state, n_tasks);
 }
 
 typedef struct {
-    struct htp_context      * ctx;
-    struct htp_thread_trace * traces;
     float                   * dst;
     const __fp16            * vtcm_src;
     const float             * src2;
@@ -2396,10 +2382,10 @@ typedef struct {
     struct fastdiv_values     n_hvx_div;
 } output_transfer_col_chunk_state_t;
 
-static void transfer_output_chunk_col_chunk_worker_fn(unsigned int n, unsigned int i, void *data) {
+static void transfer_output_chunk_col_chunk_worker_fn(const htp_thread_t * th, unsigned int n, unsigned int i, void *data) {
     (void) n;
     output_transfer_col_chunk_state_t *st = (output_transfer_col_chunk_state_t *) data;
-    struct htp_thread_trace * tr = &st->traces[i];
+    struct htp_thread_trace * tr = th->trace;
 
     // Round up: the last block is partial when N is not 32-aligned. Its pad
     // columns are dropped by the dst_cols clamp inside the store.
@@ -2446,8 +2432,6 @@ static void transfer_output_chunk_threaded(struct htp_context *ctx, float *dst, 
         col_state.src2_stride = src2_stride;
         col_state.dst_cols = (uint32_t)dst_cols;
         col_state.n_hvx_div = n_hvx_div;
-        col_state.traces = ctx->trace;
-        col_state.ctx = ctx;
 
         work_queue_run(ctx->hvx_queue, transfer_output_chunk_col_chunk_worker_fn, &col_state, n_hvx);
         return;
@@ -2470,13 +2454,8 @@ static void transfer_output_chunk_threaded(struct htp_context *ctx, float *dst, 
     state.dst_stride        = dst_stride;
     state.src2_stride       = src2_stride;
     state.dst_cols          = dst_cols;
-    state.traces            = ctx->trace;
 
-    if (actual_hvx <= 1) {
-        transfer_output_chunk_worker_fn(1, 0, &state);
-    } else {
-        work_queue_run(ctx->hvx_queue, transfer_output_chunk_worker_fn, &state, actual_hvx);
-    }
+    work_queue_run(ctx->hvx_queue, transfer_output_chunk_worker_fn, &state, actual_hvx);
 }
 
 struct activation_transfer_params {
@@ -2541,8 +2520,6 @@ static void transfer_activation_chunk_threaded(const struct activation_transfer_
         col_state.n_hvx_div = *act_hvx_div;
         col_state.vtcm_f32_act = vtcm_f32_act;
         col_state.vtcm_f32_act_bytes = vtcm_f32_act_bytes;
-        col_state.traces = ctx->trace;
-        col_state.ctx = ctx;
         col_state.dma_step_rows = dma_step_rows;
         col_state.dma_step_rows_shift = dma_step_rows_shift;
 
@@ -2564,8 +2541,6 @@ static void transfer_activation_chunk_threaded(const struct activation_transfer_
     state.k_block            = k_block;
     state.k_stride           = k_stride;
     state.k_valid            = k_valid;
-    state.traces             = ctx->trace;
-    state.ctx                = ctx;
     state.vtcm_f32_act       = vtcm_f32_act;
     state.act_elem_size      = act_elem_size;
 
@@ -2585,11 +2560,7 @@ static void transfer_activation_chunk_threaded(const struct activation_transfer_
     state.dma_step_rows_shift = dma_step_rows_shift;
 
     int active_hvx = hex_smin(n_hvx, (int)state.n_tasks);
-    if (state.n_tasks == 1 || n_hvx == 1) {
-        transfer_activation_chunk_worker_fn(1, 0, &state);
-    } else {
-        work_queue_run(ctx->hvx_queue, transfer_activation_chunk_worker_fn, &state, active_hvx);
-    }
+    work_queue_run(ctx->hvx_queue, transfer_activation_chunk_worker_fn, &state, active_hvx);
 }
 // --- Async HMX matmul job (for pipeline overlap) ---
 
@@ -2603,7 +2574,7 @@ typedef struct {
     uint32_t       n_dot_tiles;
 } hmx_matmul_job_t;
 
-static void hmx_matmul_worker_fn(void * data) {
+static void hmx_matmul_worker_fn(const htp_thread_t * th, void * data) {
     hmx_matmul_job_t * job = (hmx_matmul_job_t *) data;
     FARF(HIGH, "hmx-mm-job: n_row_tiles %u n_col_tiles %u n_dot_tiles %u", job->n_row_tiles, job->n_col_tiles, job->n_dot_tiles);
     core_dot_chunk_fp16(job->output, job->activation, job->weight, job->scales, job->n_row_tiles, job->n_col_tiles, job->n_dot_tiles);
@@ -3455,17 +3426,12 @@ static void transfer_activation_chunk_gathered_threaded(
         .start_row                                  = start_row,
         .cne1                                       = cne1,
         .k_valid                                    = k_valid,
-        .traces                                     = ctx->trace,
     };
 
     work_queue_func_t worker_fn = ne11 == 1 ? transfer_activation_chunk_gathered_worker_flat_fn :
                                               transfer_activation_chunk_gathered_worker_fn;
 
-    if (actual_hvx <= 1) {
-        worker_fn(1, 0, &state);
-    } else {
-        work_queue_run(ctx->hvx_queue, worker_fn, &state, actual_hvx);
-    }
+    work_queue_run(ctx->hvx_queue, worker_fn, &state, actual_hvx);
 }
 
 static void transfer_output_chunk_scattered_threaded(
@@ -3502,14 +3468,9 @@ static void transfer_output_chunk_scattered_threaded(
         .dst_nb2                                 = dst_nb2,
         .start_row                               = start_row,
         .cne1                                    = cne1,
-        .traces                                  = ctx->trace,
     };
 
-    if (actual_hvx <= 1) {
-        transfer_output_chunk_scattered_worker_fn(1, 0, &state);
-    } else {
-        work_queue_run(ctx->hvx_queue, transfer_output_chunk_scattered_worker_fn, &state, actual_hvx);
-    }
+    work_queue_run(ctx->hvx_queue, transfer_output_chunk_scattered_worker_fn, &state, actual_hvx);
 }
 
 static int hmx_mm_id_2d_f32(struct htp_context *ctx,

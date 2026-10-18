@@ -32,7 +32,7 @@ struct htp_repeat_context {
     size_t   type_size;
 };
 
-static void repeat_job_per_thread(unsigned int nth, unsigned int ith, void * data) {
+static void repeat_job_per_thread(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {
     const struct htp_repeat_context * rctx = (const struct htp_repeat_context *) data;
     struct htp_ops_context * octx = rctx->octx;
     const struct htp_tensor * src = octx->src[0];
@@ -68,7 +68,7 @@ static void repeat_job_per_thread(unsigned int nth, unsigned int ith, void * dat
     const uint32_t row_start = rctx->row_start + rctx->nrows_per_hvx * ith;
     const uint32_t row_end   = MIN(row_start + rctx->nrows_per_hvx, rctx->row_start + rctx->total_dst_rows);
 
-    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    struct htp_thread_trace * tr = th->trace;
     htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, row_start);
 
     for (uint32_t dst_row = row_start; dst_row < row_end; dst_row++) {

@@ -181,7 +181,11 @@ struct htp_op_desc {
 };
 
 #ifndef HTP_MAX_NTHREADS
-#define HTP_MAX_NTHREADS 10
+#define HTP_MAX_NTHREADS 12
+#endif
+
+#ifndef HTP_MAX_NHVX
+#define HTP_MAX_NHVX 8
 #endif
 
 #define HTP_TRACE_MAX_EVENTS 256

@@ -77,7 +77,7 @@ static inline void solve_tri_row_hvx(const float * A_row,
 }
 
 // Batch-level thread: each job is one full batch.
-static void solve_tri_batch_thread_f32(unsigned int nth, unsigned int ith, void * data) {
+static void solve_tri_batch_thread_f32(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {
     struct htp_solve_tri_context * sctx = (struct htp_solve_tri_context *) data;
     struct htp_ops_context *       octx = sctx->octx;
 
@@ -96,7 +96,7 @@ static void solve_tri_batch_thread_f32(unsigned int nth, unsigned int ith, void 
     const uint32_t start_batch = sctx->job_start + sctx->jobs_per_hvx * ith;
     const uint32_t end_batch   = MIN(start_batch + sctx->jobs_per_hvx, sctx->job_start + sctx->total_jobs);
 
-    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    struct htp_thread_trace * tr = th->trace;
     htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) start_batch);
 
     for (uint32_t batch = start_batch; batch < end_batch; ++batch) {
@@ -138,7 +138,7 @@ static void solve_tri_batch_thread_f32(unsigned int nth, unsigned int ith, void 
 }
 
 // Chunk-level thread: each job is one (batch, col_chunk) pair.
-static void solve_tri_chunk_thread_f32(unsigned int nth, unsigned int ith, void * data) {
+static void solve_tri_chunk_thread_f32(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {
     struct htp_solve_tri_context * sctx = (struct htp_solve_tri_context *) data;
     struct htp_ops_context *       octx = sctx->octx;
 
@@ -154,7 +154,7 @@ static void solve_tri_chunk_thread_f32(unsigned int nth, unsigned int ith, void 
     const uint32_t start_job = sctx->job_start + sctx->jobs_per_hvx * ith;
     const uint32_t end_job   = MIN(start_job + sctx->jobs_per_hvx, sctx->job_start + sctx->total_jobs);
 
-    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    struct htp_thread_trace * tr = th->trace;
     htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) start_job);
 
     for (uint32_t job = start_job; job < end_job; ++job) {
