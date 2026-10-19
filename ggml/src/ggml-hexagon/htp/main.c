@@ -669,7 +669,6 @@ AEEResult htp_iface_start(remote_handle64 handle, uint32_t sess_id, uint64_t dsp
     ctx->ddr_spad_base = memalign(128, ctx->ddr_spad_size);
 
     htp_thread_reset();
-    htp_thread_init(&ctx->main_th, ctx->dma, ctx->trace);
 
     void * wq_ptr = (void *) ((uintptr_t) block + offset_wq);
     ctx->hvx_queue = work_queue_init(wq_ptr, n_hvx, WORK_QUEUE_CAPACITY, WORK_QUEUE_STACK_SIZE, ctx->dma, ctx->trace);
@@ -1271,7 +1270,7 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
     const uint32_t t_size = sizeof(struct htp_tensor)    * n_tens;
     const uint32_t o_size = sizeof(struct htp_op_desc)   * n_ops;
     const uint32_t p_size = sizeof(struct htp_prof_desc) * n_ops;
-    const uint32_t tr_size = (HTP_MAX_NTHREADS + 1) * req->n_traces * sizeof(struct htp_trace_desc);
+    const uint32_t tr_size = HTP_MAX_NTHREADS * req->n_traces * sizeof(struct htp_trace_desc);
 
     if (dbuf->size < b_size + t_size + o_size + p_size + tr_size) {
         FARF(ERROR, "invalid opbatch memory block size %u (req %u)", dbuf->size, b_size + t_size + o_size + p_size + tr_size);
@@ -1294,7 +1293,7 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
     memset(ctx->trace, 0, sizeof(ctx->trace));
     if (ctx->profiler == HTP_PROF_TRACE) {
         struct htp_trace_desc * trace_events = (struct htp_trace_desc *) (m_ptr + p_size);
-        for (int t = 0; t <= HTP_MAX_NTHREADS; t++) {
+        for (int t = 0; t < HTP_MAX_NTHREADS; t++) {
             ctx->trace[t].events     = &trace_events[t * req->n_traces];
             ctx->trace[t].max_events = req->n_traces;
         }
@@ -1354,7 +1353,6 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
         hmx_queue_suspend(ctx->hmx_queue);
         hmx_queue_flush(ctx->hmx_queue);
     }
-    work_queue_flush(ctx->hvx_queue);
     work_queue_suspend(ctx->hvx_queue);
 
     // Flush remaining dirty tensors at the end of the batch
@@ -1378,7 +1376,7 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
     rsp.cycles_stop  = batch_prof.cycles_stop;
 
     if (ctx->profiler == HTP_PROF_TRACE) {
-        for (int t = 0; t <= HTP_MAX_NTHREADS; t++) {
+        for (int t = 0; t < HTP_MAX_NTHREADS; t++) {
             rsp.n_traces[t] = ctx->trace[t].count;
         }
     }

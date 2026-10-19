@@ -20,15 +20,6 @@ void         work_queue_free(work_queue_t q);
 void work_queue_wakeup(work_queue_t q);
 void work_queue_suspend(work_queue_t q);
 
-bool work_queue_push(work_queue_t q, work_queue_func_t func, void * data, unsigned int n);
-bool work_queue_pop(work_queue_t q);
-void work_queue_flush(work_queue_t q);
-
-static inline bool work_queue_run(work_queue_t q, work_queue_func_t func, void * data, unsigned int n) {
-    if (!work_queue_push(q, func, data, n)) {
-        return false;
-    }
-    return work_queue_pop(q);
-}
+bool work_queue_run(work_queue_t q, work_queue_func_t func, void * data, unsigned int n);
 
 #endif  // #ifndef HTP_WORK_QUEUE_H

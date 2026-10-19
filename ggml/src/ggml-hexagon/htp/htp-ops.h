@@ -278,7 +278,7 @@ struct htp_opbatch_rsp {
     uint32_t n_tensors;      // Number of tensors
     uint32_t n_ops;          // Number of op profile descriptors
     uint32_t usecs;          // Number of usec
-    uint32_t n_traces[HTP_MAX_NTHREADS + 1];
+    uint32_t n_traces[HTP_MAX_NTHREADS];
     // struct htp_prof_desc profs[];  -- dspqueue buf 0
 };
 

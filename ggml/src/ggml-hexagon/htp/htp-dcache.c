@@ -19,7 +19,6 @@ struct l2flush_range {
 };
 
 struct l2flush_multi_task {
-    struct htp_thread_trace * trace;
     struct l2flush_range      ranges[HTP_MAX_DIRTY_RANGES];
     uint32_t                  n_ranges;
     uint32_t                  total_blocks;
@@ -174,9 +173,8 @@ void htp_dcache_mark_dirty_tensors(struct htp_context * ctx, const struct htp_te
         return;
     }
 
-    if (total_evict_size > HEX_L2_FLUSH_WQ_THRESHOLD && ctx->n_threads > 1 && n_evict <= HTP_MAX_DIRTY_RANGES) {
+    if (total_evict_size > HEX_L2_FLUSH_WQ_THRESHOLD && ctx->n_hvx > 1 && n_evict <= HTP_MAX_DIRTY_RANGES) {
         struct l2flush_multi_task task;
-        task.trace    = ctx->trace;
         task.n_ranges = n_evict;
 
         uint32_t block_acc = 0;
@@ -272,7 +270,6 @@ static inline bool is_tensor_dirty(struct htp_context * ctx, const struct htp_te
 static void flush_dirty_ranges(struct htp_context * ctx, const struct htp_dirty_range * ranges, uint32_t n_ranges, uint64_t total_dirty) {
     if (total_dirty >= HEX_L2_FLUSH_WQ_THRESHOLD && ctx->n_hvx > 1) {
         struct l2flush_multi_task task;
-        task.trace    = ctx->trace;
         task.n_ranges = n_ranges;
 
         uint32_t block_acc = 0;

@@ -86,7 +86,7 @@ struct htp_context {
 
     struct htp_mmap        mmap[HTP_MAX_MMAPS];
     dma_queue_t            dma[HTP_MAX_NTHREADS];
-    struct htp_thread_trace trace[HTP_MAX_NTHREADS + 1];
+    struct htp_thread_trace trace[HTP_MAX_NTHREADS];
     work_queue_t           hvx_queue;
     hmx_queue_t            hmx_queue;
 
@@ -118,7 +118,6 @@ struct htp_context {
     struct htp_ops_context octx;
 
     qurt_thread_t          main_thread;
-    htp_thread_t           main_th;
     void *                 main_stack;
     atomic_bool            killed;
     size_t                 footprint;
