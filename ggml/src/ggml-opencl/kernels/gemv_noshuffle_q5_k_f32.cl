@@ -263,11 +263,11 @@ kernel void kernel_gemv_noshuffle_q5_k_f32(
         uint sb = k / 8;
         uint j  = k % 8;
 
-        half2 d   = src0_d[gid + sb * LINE_STRIDE_A];
-        half2 dm  = src0_m[gid + sb * LINE_STRIDE_A];
+        half2 d   = src0_d[gid_s + sb * LINE_STRIDE_A];
+        half2 dm  = src0_m[gid_s + sb * LINE_STRIDE_A];
 
-        global const uchar * sc0 = src0_s + 2 * gid * scales_per_row + sb * 12;
-        global const uchar * sc1 = src0_s + (2 * gid + 1) * scales_per_row + sb * 12;
+        global const uchar * sc0 = src0_s + 2 * gid_s * scales_per_row + sb * 12;
+        global const uchar * sc1 = src0_s + (2 * gid_s + 1) * scales_per_row + sb * 12;
 
         uchar sv0, mn0, sv1, mn1;
         get_scale_min_k4(j, sc0, &sv0, &mn0, mask_d6, mask_d4, mask_hi2);
@@ -405,11 +405,11 @@ kernel void kernel_gemv_noshuffle_q5_k_f32_mc3(
         uint sb = k / 8;
         uint j  = k % 8;
 
-        half2 d   = src0_d[gid + sb * LINE_STRIDE_A];
-        half2 dm  = src0_m[gid + sb * LINE_STRIDE_A];
+        half2 d   = src0_d[gid_s + sb * LINE_STRIDE_A];
+        half2 dm  = src0_m[gid_s + sb * LINE_STRIDE_A];
 
-        global const uchar * sc0 = src0_s + 2 * gid * scales_per_row + sb * 12;
-        global const uchar * sc1 = src0_s + (2 * gid + 1) * scales_per_row + sb * 12;
+        global const uchar * sc0 = src0_s + 2 * gid_s * scales_per_row + sb * 12;
+        global const uchar * sc1 = src0_s + (2 * gid_s + 1) * scales_per_row + sb * 12;
 
         uchar sv0, mn0, sv1, mn1;
         get_scale_min_k4(j, sc0, &sv0, &mn0, mask_d6, mask_d4, mask_hi2);

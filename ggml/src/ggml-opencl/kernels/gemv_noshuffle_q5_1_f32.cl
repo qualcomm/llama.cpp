@@ -228,10 +228,10 @@ __kernel void kernel_gemv_noshuffle_q5_1_f32(
         regM = src0_m[gid_s + k * LINE_STRIDE_A];
 
         ushort4 qh_raw;
-        qh_raw.s0 = src0_qh[gid + (4*k + 0) * LINE_STRIDE_A];
-        qh_raw.s1 = src0_qh[gid + (4*k + 1) * LINE_STRIDE_A];
-        qh_raw.s2 = src0_qh[gid + (4*k + 2) * LINE_STRIDE_A];
-        qh_raw.s3 = src0_qh[gid + (4*k + 3) * LINE_STRIDE_A];
+        qh_raw.s0 = src0_qh[gid_s + (4*k + 0) * LINE_STRIDE_A];
+        qh_raw.s1 = src0_qh[gid_s + (4*k + 1) * LINE_STRIDE_A];
+        qh_raw.s2 = src0_qh[gid_s + (4*k + 2) * LINE_STRIDE_A];
+        qh_raw.s3 = src0_qh[gid_s + (4*k + 3) * LINE_STRIDE_A];
 
         uchar8 raw = as_uchar8(qh_raw);
         uchar8 qh_bytes = (uchar8)(raw.s0, raw.s2, raw.s4, raw.s6,
