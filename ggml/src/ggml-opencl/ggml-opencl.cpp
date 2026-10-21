@@ -9530,10 +9530,13 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
             }
         case GGML_OP_GLU:
             switch (ggml_get_glu_op(op)) {
+                case GGML_GLU_OP_SWIGLU_OAI:
+                    // kernel_swiglu_oai is f32-only
+                    return ggml_is_contiguous_1(op->src[0]) && op->type == GGML_TYPE_F32 &&
+                           op->src[0]->type == GGML_TYPE_F32 && (!op->src[1] || op->src[1]->type == GGML_TYPE_F32);
                 case GGML_GLU_OP_GEGLU:
                 case GGML_GLU_OP_REGLU:
                 case GGML_GLU_OP_SWIGLU:
-                case GGML_GLU_OP_SWIGLU_OAI:
                 case GGML_GLU_OP_GEGLU_ERF:
                 case GGML_GLU_OP_GEGLU_QUICK:
                 case GGML_GLU_OP_SWIGLU_CLAMP:
