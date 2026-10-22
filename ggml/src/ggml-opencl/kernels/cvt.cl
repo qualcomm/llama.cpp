@@ -2773,3 +2773,60 @@ kernel void kernel_restore_block_q2_k_noshuffle(
         }
     }
 }
+
+struct block_q3_K {
+    uchar hmask[QK_K/8];
+    uchar qs[QK_K/4];
+    uchar scales[12];
+    half d;
+};
+
+kernel void kernel_convert_block_q3_K(
+    global struct block_q3_K * src0,
+    global uchar * dst_qs,
+    global uchar * dst_hm,
+    global uchar * dst_sc,
+    global half * dst_d,
+    ulong n_blk
+) {
+    const ulong i = get_global_id(0);
+    if (i >= n_blk) {
+        return;
+    }
+    global struct block_q3_K * b = src0 + i;
+    for (int j = 0; j < 64; ++j) {
+        dst_qs[64*i + j] = b->qs[j];
+    }
+    for (int j = 0; j < 32; ++j) {
+        dst_hm[32*i + j] = b->hmask[j];
+    }
+    for (int j = 0; j < 12; ++j) {
+        dst_sc[12*i + j] = b->scales[j];
+    }
+    dst_d[i] = b->d;
+}
+
+kernel void kernel_restore_block_q3_K(
+    global uchar * src_qs,
+    global uchar * src_hm,
+    global uchar * src_sc,
+    global half * src_d,
+    global struct block_q3_K * dst,
+    ulong n_blk
+) {
+    const ulong i = get_global_id(0);
+    if (i >= n_blk) {
+        return;
+    }
+    global struct block_q3_K * b = dst + i;
+    for (int j = 0; j < 64; ++j) {
+        b->qs[j] = src_qs[64*i + j];
+    }
+    for (int j = 0; j < 32; ++j) {
+        b->hmask[j] = src_hm[32*i + j];
+    }
+    for (int j = 0; j < 12; ++j) {
+        b->scales[j] = src_sc[12*i + j];
+    }
+    b->d = src_d[i];
+}
