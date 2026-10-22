@@ -19,6 +19,7 @@ layout (constant_id = 13) const uint32_t FaTypeV = 0;
 // sizeof(decode buffer): quants -> ggml block size; F32 -> 16 (decodeBufF32 vec4).
 layout (constant_id = 14) const uint32_t FaBlockBytesK = 2;
 layout (constant_id = 15) const uint32_t FaBlockBytesV = 2;
+layout (constant_id = 16) const uint32_t DstTileK = 0;
 
 const bool USE_MASK_OPT    = (Flags & 1) != 0;
 const bool MASK_ENABLE     = (Flags & 2) != 0;

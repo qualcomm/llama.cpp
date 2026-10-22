@@ -61,6 +61,7 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
 #include <limits>
 #include <map>
 #include <set>
+#include <unordered_set>
 #include <unordered_map>
 #include <shared_mutex>
 #include <mutex>
@@ -210,6 +211,10 @@ static bool is_pow2(uint32_t x) { return x > 1 && (x & (x-1)) == 0; }
                 "ggml_vulkan: " msg);                               \
         }                                                           \
     } while (0)
+
+// std::vector<std::string> qcom_layer_tilekfirst = { "attn_norm-", "ffn_norm-", "ffn_gate_par-", "kqv_merged_cont-","ffn_swiglu-", "kqv_out-" };
+// K dimension of the TileK-first activation layout. Must match TILEK in vulkan-shaders/tile_layout.glsl, and the device's cooperative-matrix K size.
+static constexpr uint32_t GGML_VK_TILEK = 16;
 
 #ifdef GGML_VULKAN_DEBUG
 #define VK_LOG_DEBUG(msg) std::cerr << msg << std::endl
@@ -733,6 +738,7 @@ struct vk_device_struct {
     bool coopmat_bf16_support {};
     bool coopmat_support_16x16x16_f16acc {};
     bool coopmat_support_16x16x16_f32acc {};
+    bool tilek_support {};
     bool coopmat1_fa_support {};
     uint32_t coopmat_m;
     uint32_t coopmat_n;
@@ -782,6 +788,7 @@ struct vk_device_struct {
     vk::DescriptorSetLayout dsl;
 
     std::map<vk_matmul_pipeline_key, std::vector<vk_matmul_pipeline_pair>> pipeline_matmul;
+    vk_pipeline pipeline_matmul_tilek_q4_0;
     matmul_tile_selector_t matmul_tile_selector;
     matmul_tile_selector_t matmul_id_tile_selector;
 
@@ -908,6 +915,10 @@ struct vk_device_struct {
     vk_pipeline pipeline_swiglu_clamp[2];
     vk_pipeline pipeline_geglu_erf[2];
     vk_pipeline pipeline_geglu_quick[2];
+
+    // Tilek specific: RMS_norm and SwiGLU writing TileK-first
+    vk_pipeline pipeline_swiglu_tilek_f32;
+    vk_pipeline pipeline_rms_norm_mul_tilek_f32;
 
     vk_pipeline pipeline_leaky_relu[2];
     vk_pipeline pipeline_silu_back_f32;
@@ -1242,6 +1253,16 @@ struct ggml_backend_vk_context {
     const ggml_tensor * prealloc_y_last_tensor_used {};
     // True when the K dimension in prealloc_y is padded.
     bool prealloc_y_last_k_padded {};
+
+    // [Qcom specific]
+    // Tensors that may be produced in the TileK-first layout: every consumer in
+    // the graph is a matmul that can read that layout. Filled by a pre-pass in
+    // ggml_backend_vk_graph_compute.
+    std::unordered_set<const ggml_tensor *> tilek_candidates;
+    // Subset of the above that a producer actually emitted TileK-first. The
+    // producer inserts into this when it picks a TileK pipeline, and consumers
+    // read it later in the same graph, so the two can never disagree.
+    std::unordered_set<const ggml_tensor *> tilek_tensors;
 
     // Track which nodes have been used since the last sync, and whether they were written to
     std::vector<const ggml_tensor *> unsynced_nodes_written;
