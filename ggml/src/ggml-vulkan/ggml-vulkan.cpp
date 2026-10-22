@@ -6046,7 +6046,7 @@ void ggml_vk_matmul(
     ctx->prealloc_split_k_need_sync = true;
 }
 
-static bool ggml_vk_get_mul_mat_mat_f16acc(ggml_backend_vk_context * ctx, ggml_type src0_type, ggml_type src1_type, ggml_prec prec) {
+static bool ggml_vk_get_mul_mat_mat_f16acc(const ggml_backend_vk_context * ctx, ggml_type src0_type, ggml_type src1_type, ggml_prec prec) {
     if (src0_type == GGML_TYPE_F32 || src0_type == GGML_TYPE_BF16) return false;
     if (src1_type == GGML_TYPE_Q8_1) return false;
     if (src0_type == GGML_TYPE_F16) {
@@ -6425,23 +6425,28 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     // If src0 is BF16, try to use a BF16 x BF16 multiply
     ggml_type f16_type = src0->type == GGML_TYPE_BF16 ? GGML_TYPE_BF16 : GGML_TYPE_F16;
 
+    const bool tilek_b = ctx->tilek_tensors.count(src1) > 0;
+
     const bool is_coopmat = ctx->device->coopmat_support || ctx->device->coopmat2;
-    const bool can_quantize_y = (ctx->device->integer_dot_product || ctx->device->coopmat_int_support) &&
+    const bool can_quantize_y = !tilek_b &&
+                                (ctx->device->integer_dot_product || ctx->device->coopmat_int_support) &&
                                 src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && (ne11 * ne10) % 4 == 0;
     // coopmat shaders are fast enough that memory bandwidth reduction from f16 activations helps
     const bool prefer_f16_b = is_coopmat && ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32;
 
-    const ggml_type y_kernel_type = ggml_vk_mul_mat_b_type(ctx, src0->type, src1, f16_type,
-                                        (ggml_prec)dst->op_params[0], false, can_quantize_y, prefer_f16_b);
+    const ggml_type y_kernel_type = tilek_b ? GGML_TYPE_F32 :
+        ggml_vk_mul_mat_b_type(ctx, src0->type, src1, f16_type,
+                                (ggml_prec)dst->op_params[0], false, can_quantize_y, prefer_f16_b);
 
     const bool quantize_y       = y_kernel_type == GGML_TYPE_Q8_1;
     const bool y_f32_kernel     = y_kernel_type == GGML_TYPE_F32;
-    const bool y_needs_reformat = !quantize_y && (!ggml_vk_dim01_contiguous(src1) || y_kernel_type != src1->type);
+    const bool y_needs_reformat = !tilek_b && !quantize_y &&
+                                  (!ggml_vk_dim01_contiguous(src1) || y_kernel_type != src1->type);
 
-    const std::vector<vk_matmul_pipeline_pair>* mmp_map =
+    const std::vector<vk_matmul_pipeline_pair>* mmp_map = tilek_b ? nullptr :
         ggml_vk_get_mul_mat_mat_pipeline_map(ctx, src0->type, y_kernel_type, (ggml_prec)dst->op_params[0]);
 
-    const bool qx_needs_dequant = mmp_map == nullptr || x_non_contig;
+    const bool qx_needs_dequant = !tilek_b && (mmp_map == nullptr || x_non_contig);
     const bool qy_needs_dequant = y_needs_reformat;
 
     if (qx_needs_dequant) {
@@ -6449,12 +6454,17 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         mmp_map = ggml_vk_get_mul_mat_mat_pipeline_map(ctx, f16_type, y_kernel_type, (ggml_prec)dst->op_params[0]);
     }
 
-    GGML_ASSERT(mmp_map != nullptr);
-
-    const uint32_t kpad = quantize_y ? 0 : ggml_vk_align_size(ne10, ggml_vk_guess_matmul_pipeline_align_map(ctx, *mmp_map, ne01, ne11, false));
-    const bool aligned = !quantize_y && ne10 == kpad && ne01 > 8 && ne11 > 8;
-
-    vk_pipeline pipeline = ggml_vk_guess_matmul_pipeline_map(ctx, *mmp_map, ne01, ne11, aligned, false);
+    vk_pipeline pipeline;
+    if (tilek_b) {
+        pipeline = ctx->device->pipeline_matmul_tilek_q4_0;
+        GGML_ASSERT(pipeline != nullptr);
+        GGML_ASSERT(ne10 % pipeline->align == 0);
+    } else {
+        GGML_ASSERT(mmp_map != nullptr);
+        const uint32_t kpad = quantize_y ? 0 : ggml_vk_align_size(ne10, ggml_vk_guess_matmul_pipeline_align_map(ctx, *mmp_map, ne01, ne11, false));
+        const bool aligned = !quantize_y && ne10 == kpad && ne01 > 8 && ne11 > 8;
+        pipeline = ggml_vk_guess_matmul_pipeline_map(ctx, *mmp_map, ne01, ne11, aligned, false);
+    }
 
     if (ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange) {
         pipeline = ggml_vk_get_64b_indexing_pipeline(ctx, pipeline);
@@ -14367,24 +14377,33 @@ static int32_t find_first_set(uint32_t x) {
 // reading the tensor as B, dispatched through the mat-mat path, with a TileK
 // matmul available for the weight type.
 static bool ggml_vk_tilek_consumer_ok(const ggml_backend_vk_context * ctx, const ggml_tensor * use, const ggml_tensor * t) {
-   if (use->op != GGML_OP_MUL_MAT || use->src[1] != t) {
-       return false;
-   }
-   const ggml_tensor * a = use->src[0];
-   if (a->type != GGML_TYPE_Q4_0 || ctx->device->pipeline_matmul_tilek_q4_0 == nullptr) {
-       return false;
-   }
-   // mul_mat_vec would read B row-major. Only take over where
-   // ggml_vk_mul_mat() would have picked the mat-mat path anyway.
-   if (use->ne[1] <= mul_mat_vec_max_cols) {
-       return false;
-   }
-   // The TileK matmul walks A one quantization block at a time and indexes B
-   // by whole K-tiles, so K has to divide evenly by both.
-   if (a->ne[0] % ggml_blck_size(a->type) != 0 || a->ne[0] % GGML_VK_TILEK != 0) {
-       return false;
-   }
-   return true;
+    if (use->op != GGML_OP_MUL_MAT || use->src[1] != t) {
+        return false;
+    }
+    const ggml_tensor * a = use->src[0];
+    if (a->type != GGML_TYPE_Q4_0 || ctx->device->pipeline_matmul_tilek_q4_0 == nullptr) {
+        return false;
+    }
+    if (!ggml_vk_dim01_contiguous(a)) {
+        return false;
+    }
+    if (!ggml_vk_get_mul_mat_mat_f16acc(ctx, a->type, t->type, (ggml_prec) use->op_params[0])) {
+        return false;
+    }
+    // mul_mat_vec would read B row-major. Only take over where
+    // ggml_vk_mul_mat() would have picked the mat-mat path anyway.
+    if (use->ne[1] <= mul_mat_vec_max_cols) {
+        return false;
+    }
+    if (a->ne[1] % 64 != 0 || use->ne[1] % 64 != 0) {
+        return false;
+    }
+    // The TileK matmul walks A one quantization block at a time and indexes B
+    // by whole K-tiles, so K has to divide evenly by both.
+    if (a->ne[0] % ggml_blck_size(a->type) != 0 || a->ne[0] % GGML_VK_TILEK != 0) {
+        return false;
+    }
+    return true;
 }
 
 // Collect the tensors whose consumers all read TileK-first. Producers consult
@@ -14415,7 +14434,7 @@ static bool ggml_vk_tilek_consumer_ok(const ggml_backend_vk_context * ctx, const
 
           // Register this node as a candidate for everything still downstream.
           if (node->type == GGML_TYPE_F32 && ggml_is_contiguous(node) &&
-              node->ne[0] % GGML_VK_TILEK == 0 && node->ne[1] > 1 &&
+              node->ne[0] % GGML_VK_TILEK == 0 && node->ne[1] > 1 && node->ne[1] % 64 == 0 &&
               node->ne[2] == 1 && node->ne[3] == 1 &&
               !(node->flags & GGML_TENSOR_FLAG_OUTPUT)) {
               ok[node] = true;
