@@ -243,6 +243,40 @@ kernel void kernel_swiglu_oai(
     }
 }
 
+kernel void kernel_swiglu_oai_f16(
+    global char * src0,
+    ulong         offset0,
+    global char * src1,
+    ulong         offset1,
+    global char * dst,
+    ulong         offsetd,
+    ulong         nb01,
+    ulong         nb11,
+    int           ne0,
+    ulong         nb1,
+    int           ne00_off,
+    int           ne10_off,
+    float         limit,
+    float         alpha
+) {
+    src0 = (global char*)((global char*)src0 + offset0);
+    src1 = (global char*)((global char*)src1 + offset1);
+    dst  = (global char*)((global char*)dst  + offsetd);
+
+    global half * src0_row = (global half *) ((global char *) src0 + get_group_id(0)*nb01) + ne00_off;
+    global half * src1_row = (global half *) ((global char *) src1 + get_group_id(0)*nb11) + ne10_off;
+    global half * dst_row  = (global half *) ((global char *) dst  + get_group_id(0)*nb1);
+
+    for (int i0 = get_local_id(0); i0 < ne0; i0 += get_local_size(0)) {
+        const float x0 = min((float) src0_row[i0], limit);
+        const float x1 = clamp((float) src1_row[i0], -limit, limit);
+
+        const float out_glu = x0 / (1.0f + exp(-x0 * alpha));
+
+        dst_row[i0] = (half) (out_glu * (1.0f + x1));
+    }
+}
+
 //------------------------------------------------------------------------------
 // swiglu_clamp
 //------------------------------------------------------------------------------
