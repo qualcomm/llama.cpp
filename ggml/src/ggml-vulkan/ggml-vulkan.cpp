@@ -2287,6 +2287,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             create_mm_pipelines({GGML_TYPE_BF16, GGML_TYPE_BF16, false, false}, tc_mm, "matmul_bf16", matmul_bf16_cm2_len, matmul_bf16_cm2_data, sizeof(vk_mat_mat_push_constants), 3, cm2_spec, true);
         }
 #endif
+
         for (const auto type : non_lut_quant_types) {
             // regression in unified shader on Ampere
             if (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K) {
@@ -2374,6 +2375,27 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 #if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
     if (device->coopmat_support) {
         spec_fn_t cm1_spec = [&](const std::vector<uint32_t>& wt, bool a) { return ggml_vk_mul_mm_spec(wt, a); };
+
+#if defined(GGML_VULKAN_TILEK_GLSLC_SUPPORT)
+        if (device->tilek_support) {
+            const uint32_t tilek_bk = 32;
+            const std::vector<uint32_t> tilek_warptile = {
+                device->subgroup_size,
+                device->coopmat_m, device->coopmat_n,
+                tilek_bk,
+                device->coopmat_m, device->coopmat_n,
+                1,
+                device->coopmat_m, device->coopmat_n,
+                device->coopmat_k,
+                device->subgroup_size,
+            };
+            const std::array<uint32_t, 3> tilek_wg_denoms = { device->coopmat_m, device->coopmat_n, 1 };
+
+            ggml_vk_create_pipeline(device, device->pipeline_matmul_tilek_q4_0, "matmul_q4_0_f32_tilek_f16acc",
+                matmul_q4_0_f32_tilek_f16acc_cm1_len, matmul_q4_0_f32_tilek_f16acc_cm1_data, "main", 3, sizeof(vk_mat_mat_push_constants),
+                tilek_wg_denoms, cm1_spec(tilek_warptile, true), tilek_bk, false, true, device->subgroup_size);
+        }
+#endif
 
         // Intel coopmat1 pins each pipeline's required subgroup size to its warptile WARP element.
         const bool cm1_pin = device->vendor_id == VK_VENDOR_ID_INTEL;
@@ -3270,6 +3292,10 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_rope_f32_f16, "rms_norm_mul_rope_f32_f16", rms_norm_mul_rope_f32_f16_len, rms_norm_mul_rope_f32_f16_data, "main", 7, sizeof(vk_op_rms_norm_mul_rope_push_constants), {1, 1, 1}, {0, 1}, 1, true);
     }
 
+    if (device->tilek_support) {
+        ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_tilek_f32, "rms_norm_mul_tilek_f32", rms_norm_f32_len, rms_norm_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1, 0, 1}, 1, true);
+    }
+
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_back_f32, "rms_norm_back_f32", rms_norm_back_f32_len, rms_norm_back_f32_data, "main", 3, sizeof(vk_op_push_constants), {1, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_l2_norm_f32, "l2_norm_f32", l2_norm_f32_len, l2_norm_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {1, 1, 1}, {}, 1);
 
@@ -3480,6 +3506,13 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     CREATE_GLU(geglu_erf)
     CREATE_GLU(geglu_quick)
 #undef CREATE_GLU
+
+// Todo: only for adreno with coopmat support
+#if defined(GGML_VULKAN_TILEK_GLSLC_SUPPORT)
+    if (device->tilek_support) {
+        ggml_vk_create_pipeline(device, device->pipeline_swiglu_tilek_f32, "swiglu_tilek_f32", swiglu_tilek_f32_len, swiglu_tilek_f32_data, "main", 3, sizeof(vk_op_glu_push_constants), {512, 1, 1}, {}, 1, true);
+    }
+#endif
 
     ggml_vk_create_pipeline(device, device->pipeline_silu_back_f32, "silu_back_f32", silu_back_f32_len, silu_back_f32_data, "main", 3, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
 
@@ -4760,10 +4793,18 @@ vk_device ggml_vk_get_device(size_t idx) {
                 GGML_LOG_DEBUG("ggml_vulkan: WARNING: No suitable matrix core mode found. Disabling matrix cores.\n");
                 device->coopmat_support = false;
             }
+
+            device->tilek_support = device->architecture == QUALCOMM_ADRENO &&
+                                    device->coopmat_support &&
+                                    device->coopmat_support_16x16x16_f16acc &&
+                                    device->coopmat_support_16x16x16_f32acc;
         }
 
         if (device->coopmat_support) {
             device_extensions.push_back("VK_KHR_cooperative_matrix");
+        }
+        if (device->tilek_support) {
+            device_extensions.push_back("VK_QCOM_cooperative_matrix_conversion");
         }
 #endif
         device->name = GGML_VK_NAME + std::to_string(idx);
@@ -6005,7 +6046,7 @@ void ggml_vk_matmul(
     ctx->prealloc_split_k_need_sync = true;
 }
 
-static bool ggml_vk_get_mul_mat_mat_f16acc(ggml_backend_vk_context * ctx, ggml_type src0_type, ggml_type src1_type, ggml_prec prec) {
+static bool ggml_vk_get_mul_mat_mat_f16acc(const ggml_backend_vk_context * ctx, ggml_type src0_type, ggml_type src1_type, ggml_prec prec) {
     if (src0_type == GGML_TYPE_F32 || src0_type == GGML_TYPE_BF16) return false;
     if (src1_type == GGML_TYPE_Q8_1) return false;
     if (src0_type == GGML_TYPE_F16) {
@@ -6384,23 +6425,28 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     // If src0 is BF16, try to use a BF16 x BF16 multiply
     ggml_type f16_type = src0->type == GGML_TYPE_BF16 ? GGML_TYPE_BF16 : GGML_TYPE_F16;
 
+    const bool tilek_b = ctx->tilek_tensors.count(src1) > 0;
+
     const bool is_coopmat = ctx->device->coopmat_support || ctx->device->coopmat2;
-    const bool can_quantize_y = (ctx->device->integer_dot_product || ctx->device->coopmat_int_support) &&
+    const bool can_quantize_y = !tilek_b &&
+                                (ctx->device->integer_dot_product || ctx->device->coopmat_int_support) &&
                                 src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && (ne11 * ne10) % 4 == 0;
     // coopmat shaders are fast enough that memory bandwidth reduction from f16 activations helps
     const bool prefer_f16_b = is_coopmat && ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32;
 
-    const ggml_type y_kernel_type = ggml_vk_mul_mat_b_type(ctx, src0->type, src1, f16_type,
-                                        (ggml_prec)dst->op_params[0], false, can_quantize_y, prefer_f16_b);
+    const ggml_type y_kernel_type = tilek_b ? GGML_TYPE_F32 :
+        ggml_vk_mul_mat_b_type(ctx, src0->type, src1, f16_type,
+                                (ggml_prec)dst->op_params[0], false, can_quantize_y, prefer_f16_b);
 
     const bool quantize_y       = y_kernel_type == GGML_TYPE_Q8_1;
     const bool y_f32_kernel     = y_kernel_type == GGML_TYPE_F32;
-    const bool y_needs_reformat = !quantize_y && (!ggml_vk_dim01_contiguous(src1) || y_kernel_type != src1->type);
+    const bool y_needs_reformat = !tilek_b && !quantize_y &&
+                                  (!ggml_vk_dim01_contiguous(src1) || y_kernel_type != src1->type);
 
-    const std::vector<vk_matmul_pipeline_pair>* mmp_map =
+    const std::vector<vk_matmul_pipeline_pair>* mmp_map = tilek_b ? nullptr :
         ggml_vk_get_mul_mat_mat_pipeline_map(ctx, src0->type, y_kernel_type, (ggml_prec)dst->op_params[0]);
 
-    const bool qx_needs_dequant = mmp_map == nullptr || x_non_contig;
+    const bool qx_needs_dequant = !tilek_b && (mmp_map == nullptr || x_non_contig);
     const bool qy_needs_dequant = y_needs_reformat;
 
     if (qx_needs_dequant) {
@@ -6408,12 +6454,17 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         mmp_map = ggml_vk_get_mul_mat_mat_pipeline_map(ctx, f16_type, y_kernel_type, (ggml_prec)dst->op_params[0]);
     }
 
-    GGML_ASSERT(mmp_map != nullptr);
-
-    const uint32_t kpad = quantize_y ? 0 : ggml_vk_align_size(ne10, ggml_vk_guess_matmul_pipeline_align_map(ctx, *mmp_map, ne01, ne11, false));
-    const bool aligned = !quantize_y && ne10 == kpad && ne01 > 8 && ne11 > 8;
-
-    vk_pipeline pipeline = ggml_vk_guess_matmul_pipeline_map(ctx, *mmp_map, ne01, ne11, aligned, false);
+    vk_pipeline pipeline;
+    if (tilek_b) {
+        pipeline = ctx->device->pipeline_matmul_tilek_q4_0;
+        GGML_ASSERT(pipeline != nullptr);
+        GGML_ASSERT(ne10 % pipeline->align == 0);
+    } else {
+        GGML_ASSERT(mmp_map != nullptr);
+        const uint32_t kpad = quantize_y ? 0 : ggml_vk_align_size(ne10, ggml_vk_guess_matmul_pipeline_align_map(ctx, *mmp_map, ne01, ne11, false));
+        const bool aligned = !quantize_y && ne10 == kpad && ne01 > 8 && ne11 > 8;
+        pipeline = ggml_vk_guess_matmul_pipeline_map(ctx, *mmp_map, ne01, ne11, aligned, false);
+    }
 
     if (ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange) {
         pipeline = ggml_vk_get_64b_indexing_pipeline(ctx, pipeline);
@@ -8685,6 +8736,29 @@ static vk_conv_shapes ggml_vk_conv_select_shape(ggml_backend_vk_context * ctx, u
     }
 }
 
+// Whether the fused rms_norm+mul writing dst should emit TileK-first. Used by
+// both the pipeline lookup and the dispatch, so the two cannot disagree about
+// what layout the tensor ended up in.
+static bool ggml_vk_rms_norm_use_tilek(const ggml_backend_vk_context * ctx, const ggml_tensor * dst) {
+//    VK_LOG_DEBUG("ggml_vk_rms_norm_use_tilek( Tilek layout =" << ctx->device->tilek_support << ", TileK candidates =" << ctx->tilek_candidates.count(dst));
+
+   return ctx->device->tilek_support &&
+          !ctx->do_add_rms_partials &&
+          ctx->num_additional_fused_ops == 1 && // rms_norm + mul, no rope
+          ctx->tilek_candidates.count(dst) > 0;
+}
+
+// Same contract for GLU: consulted by the pipeline lookup and by the dispatch
+// that records the layout, so the two cannot disagree. Only SwiGLU has a TileK
+// shader; the other GLU ops keep the shared row-major path.
+static bool ggml_vk_glu_use_tilek(const ggml_backend_vk_context * ctx, const ggml_tensor * dst) {
+   return ctx->device->tilek_support &&
+          dst->type == GGML_TYPE_F32 &&
+          ggml_get_glu_op(dst) == GGML_GLU_OP_SWIGLU &&
+          ctx->device->pipeline_swiglu_tilek_f32 != nullptr &&
+          ctx->tilek_candidates.count(dst) > 0;
+}
+
 static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, const ggml_tensor * dst, ggml_op op) {
     switch (op) {
     case GGML_OP_GET_ROWS:
@@ -8924,8 +8998,11 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
             if (ctx->do_add_rms_partials) {
                 return ctx->fused_rms_norm_mode == RMS_NORM_MUL ? ctx->device->pipeline_rms_norm_mul_partials_f32 : ctx->device->pipeline_rms_norm_partials_f32;
-            }
+           } else if (ggml_vk_rms_norm_use_tilek(ctx, dst)) {
+               return ctx->device->pipeline_rms_norm_mul_tilek_f32;
+           } else {
             return ctx->fused_rms_norm_mode == RMS_NORM_MUL ? ctx->device->pipeline_rms_norm_mul_f32 : ctx->device->pipeline_rms_norm_f32;
+           }
         }
         return nullptr;
     case GGML_OP_RMS_NORM_BACK:
@@ -8999,6 +9076,10 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             (dst->type != GGML_TYPE_F32 && dst->type != GGML_TYPE_F16) ||
             (src0->type != dst->type)) {
             return nullptr;
+        }
+
+        if (ggml_vk_glu_use_tilek(ctx, dst)) {
+            return ctx->device->pipeline_swiglu_tilek_f32;
         }
 
         switch (ggml_get_glu_op(dst)) {
@@ -11015,6 +11096,11 @@ void ggml_vk_rms_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const s
                 ggml_vk_subbuffer(ctx, buf[6], offset[6]),
             }, pc, elements);
     } else {
+        // Record the layout before dispatching, so the consuming matmuls later
+        // in this graph pick the matching B loader.
+        if (ggml_vk_rms_norm_use_tilek(ctx, dst)) {
+            ctx->tilek_tensors.insert(dst);
+        }
         GGML_ASSERT(ctx->fused_rms_norm_mode == RMS_NORM_MUL || ctx->fused_rms_norm_mode == RMS_NORM_COUNT);
         ggml_vk_op_f32<vk_op_binary_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_RMS_NORM, std::move(bin));
     }
@@ -11062,6 +11148,12 @@ void ggml_vk_glu(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_t
         GGML_ASSERT(src0->ne[0] == src1->ne[0]);
         GGML_ASSERT(src0->ne[0] == dst->ne[0]);
         GGML_ASSERT(src0->type == src1->type);
+    }
+
+    // Record the layout before dispatching, so the consuming matmuls later in
+    // this graph pick the matching B loader.
+    if (ggml_vk_glu_use_tilek(ctx, dst)) {
+        ctx->tilek_tensors.insert(dst);
     }
 
     const uint32_t mode = split ? 2 : (swapped ? 1 : 0);
@@ -14279,6 +14371,84 @@ static int32_t find_first_set(uint32_t x) {
     return ret;
 }
 
+// A tensor may only be written in the TileK-first layout if every consumer
+// reads it in that layout, so the decision belongs to the tensor rather than to
+// the producing op. This checks the one consumer shape we support: a mul_mat
+// reading the tensor as B, dispatched through the mat-mat path, with a TileK
+// matmul available for the weight type.
+static bool ggml_vk_tilek_consumer_ok(const ggml_backend_vk_context * ctx, const ggml_tensor * use, const ggml_tensor * t) {
+    if (use->op != GGML_OP_MUL_MAT || use->src[1] != t) {
+        return false;
+    }
+    const ggml_tensor * a = use->src[0];
+    if (a->type != GGML_TYPE_Q4_0 || ctx->device->pipeline_matmul_tilek_q4_0 == nullptr) {
+        return false;
+    }
+    if (!ggml_vk_dim01_contiguous(a)) {
+        return false;
+    }
+    if (!ggml_vk_get_mul_mat_mat_f16acc(ctx, a->type, t->type, (ggml_prec) use->op_params[0])) {
+        return false;
+    }
+    // mul_mat_vec would read B row-major. Only take over where
+    // ggml_vk_mul_mat() would have picked the mat-mat path anyway.
+    if (use->ne[1] <= mul_mat_vec_max_cols) {
+        return false;
+    }
+    if (a->ne[1] % 64 != 0 || use->ne[1] % 64 != 0) {
+        return false;
+    }
+    // The TileK matmul walks A one quantization block at a time and indexes B
+    // by whole K-tiles, so K has to divide evenly by both.
+    if (a->ne[0] % ggml_blck_size(a->type) != 0 || a->ne[0] % GGML_VK_TILEK != 0) {
+        return false;
+    }
+    return true;
+}
+
+// Collect the tensors whose consumers all read TileK-first. Producers consult
+// this, and record what they actually emitted in ctx->tilek_tensors.
+ static void ggml_vk_find_tilek_candidates(ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph) {
+    ctx->tilek_candidates.clear();
+    ctx->tilek_tensors.clear();
+
+    if (!ctx->device->tilek_support) {
+        return;
+    }
+
+      std::unordered_map<const ggml_tensor *, bool> ok;      // candidate -> all consumers OK so far
+      std::unordered_set<const ggml_tensor *> used;          // candidate -> has >=1 consumer
+
+      for (int i = 0; i < cgraph->n_nodes; i++) {
+          const ggml_tensor * node = cgraph->nodes[i];
+
+          // Resolve this node's srcs against anything registered as a candidate so far.
+          for (int s = 0; s < GGML_MAX_SRC; s++) {
+              const ggml_tensor * src = node->src[s];
+              auto it = ok.find(src);
+              if (it != ok.end()) {
+                  it->second = it->second && ggml_vk_tilek_consumer_ok(ctx, node, src);
+                  used.insert(src);
+              }
+          }
+
+          // Register this node as a candidate for everything still downstream.
+          if (node->type == GGML_TYPE_F32 && ggml_is_contiguous(node) &&
+              node->ne[0] % GGML_VK_TILEK == 0 && node->ne[1] > 1 && node->ne[1] % 64 == 0 &&
+              node->ne[2] == 1 && node->ne[3] == 1 &&
+              !(node->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+              ok[node] = true;
+          }
+      }
+
+      for (auto & [t, all_ok] : ok) {
+          if (all_ok && used.count(t)) {
+              ctx->tilek_candidates.insert(t);
+          }
+      }
+  }
+
+
 static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
@@ -14298,6 +14468,9 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     ctx->prealloc_size_add_rms_partials_offset = 0;
     ctx->do_add_rms_partials = false;
     ctx->do_add_rms_partials_offset_calculation = false;
+
+    // Todo: Run for adreno with coopmat
+    ggml_vk_find_tilek_candidates(ctx, cgraph);
 
     int last_node = cgraph->n_nodes - 1;
 
@@ -16696,4 +16869,3 @@ void ggml_vk_debug_label::begin(vk_context & ctx, const std::string & name) {
     subctx->debug_labels.push_back(name);
     ggml_vk_cmd_label_begin(subctx->s->buffer->buf, subctx->debug_labels.back().c_str());
 }
-

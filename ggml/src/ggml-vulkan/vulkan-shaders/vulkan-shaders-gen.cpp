@@ -709,6 +709,10 @@ void process_shaders() {
         }
     }
 
+#if defined(GGML_VULKAN_TILEK_GLSLC_SUPPORT)
+    string_to_spv("matmul_q4_0_f32_tilek", "mul_mm_tilek.comp", {}, true, true, false, true);
+#endif
+
     for (const bool& fp16 : {false, true}) {
         std::map<std::string, std::string> base_dict;
         if (fp16) {
@@ -1056,6 +1060,9 @@ void process_shaders() {
     string_to_spv("reglu_f32",      "reglu.comp",       {{"A_TYPE", "float"},       {"D_TYPE", "float"}});
     string_to_spv("swiglu_f16",     "swiglu.comp",      {{"A_TYPE", "float16_t"},   {"D_TYPE", "float16_t"}});
     string_to_spv("swiglu_f32",     "swiglu.comp",      {{"A_TYPE", "float"},       {"D_TYPE", "float"}});
+#if defined(GGML_VULKAN_TILEK_GLSLC_SUPPORT)
+    string_to_spv("swiglu_tilek_f32", "swiglu_tilek.comp", {{"A_TYPE", "float"},     {"D_TYPE", "float"}});
+#endif
     string_to_spv("swiglu_oai_f16", "swiglu_oai.comp",  {{"A_TYPE", "float16_t"},   {"D_TYPE", "float16_t"}});
     string_to_spv("swiglu_oai_f32", "swiglu_oai.comp",  {{"A_TYPE", "float"},       {"D_TYPE", "float"}});
     string_to_spv("swiglu_clamp_f16", "swiglu_clamp.comp", {{"A_TYPE", "float16_t"}, {"D_TYPE", "float16_t"}});
