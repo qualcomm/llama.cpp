@@ -159,17 +159,20 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
     ggml_tensor * cur;
     ggml_tensor * inpL;
 
-    // do the PLE first to guarantee it is done in the host buffer
-    // ref: https://github.com/ggml-org/llama.cpp/pull/30160
+    // important: do not normalize weights for raw embeddings input (i.e. encoded image emdeddings)
+    inpL = build_inp_embd(model.tok_embd, sqrtf(n_embd));
+    cb(inpL, "inp_scaled", -1);
+
+    // The PLE rows come after the token embeddings, as before upstream #30160 built them first.
+    // They still land in the leading CPU split, since the PLE weight is in the host buffer. Built
+    // first, they leave the input-embedding select to the GPU split, which then uploads all three
+    // candidate embeddings (3 x 5 MB per 512-token batch) instead of the selected one; the blocking
+    // uploads cost the X2-90 about 5 ms per batch (gemma-4 E4B Q4_K_M pp512 -1.1%).
     ggml_tensor * inp_per_layer = nullptr;
     if (model.per_layer_tok_embd) {
         inp_per_layer = build_inp_per_layer();
         ggml_build_forward_expand(gf, inp_per_layer);
     }
-
-    // important: do not normalize weights for raw embeddings input (i.e. encoded image emdeddings)
-    inpL = build_inp_embd(model.tok_embd, sqrtf(n_embd));
-    cb(inpL, "inp_scaled", -1);
 
     // inp_pos - contains the positions
     ggml_tensor * inp_pos = build_inp_pos();
