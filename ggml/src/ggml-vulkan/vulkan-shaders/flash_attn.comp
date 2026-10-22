@@ -21,6 +21,7 @@
 #extension GL_KHR_shader_subgroup_vote : enable
 
 #include "types.glsl"
+#include "tilek_layout.glsl"
 #include "dot_product_funcs.glsl"
 #include "flash_attn_base.glsl"
 #include "flash_attn_dequant.glsl"
@@ -754,7 +755,30 @@ void main() {
                 }
             }
         }
-    } else {
+   } else if (DstTileK != 0) {
+       // Same values as the row-major branch below, permuted into the
+       // TileK-first layout for mul_mm_tilek.comp. Viewed as a 2D tensor, dst
+       // is nrows x K with nrows = N (tokens, dst->ne[2]) and K = p.ne1 * HSV
+       // (all heads of one token, contiguous), which is exactly the reshape
+       // the graph applies before feeding this into the wo matmul.
+       //
+       // o_offset is not added: the host only sets DstTileK when gqa_ratio == 1
+       // (so gqa_iq1 == 0) and dst has a single batch (so iq3 == 0), which
+       // makes it zero. tilek_first_idx() addresses the whole tensor anyway.
+       [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
+           const uint row = tile_row(r);
+           if (i * Br + row < N) {
+               [[unroll]] for (uint32_t d = 0; d < HSV_per_thread / 4; ++d) {
+                   // Scalar K index of the first element of this vec4. It is a
+                   // multiple of 4 and TILEK is 16, so all four elements land in
+                   // the same tile at consecutive offsets and the vec4 store is
+                   // still contiguous.
+                   const uint kidx = iq2 * HSV + (d * D_split + d_tid) * 4;
+                   data_ov4[tilek_first_idx(i * Br + row, kidx, N) / 4] = D_TYPEV4(Of[r][d]);
+               }
+           }
+       }
+   } else {
         [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
             const uint row = tile_row(r);
             if (i * Br + row < N) {

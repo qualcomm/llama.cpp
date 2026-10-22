@@ -1,0 +1,204 @@
+#version 450
+
+// Cooperative-matrix matmul for a quantized A and a TileK-first f32 B.
+//
+// Differences from mul_mm.comp:
+//  - B is read in TileK-first order (see tile_layout.glsl), so a subgroup's
+//    whole B fragment is one contiguous run and no shared-memory staging or
+//    transpose is needed.
+//  - A is dequantized straight into registers and handed to the matrix units
+//    through the vector <-> cooperative-matrix conversion builtins.
+//  - One subgroup per workgroup, producing exactly one TM x TN output tile.
+//    The host builds the specialization so that BM == TM and BN == TN, both
+//    equal to the subgroup size; see ggml_vk_tilek_warptile().
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+
+// vectorToCoopmatQCOM / coopmatToVectorQCOM / extractSubArrayQCOM
+#extension GL_QCOM_cooperative_matrix_conversion : require
+
+#include "tilek_layout.glsl"
+
+// Number of quantized values in one A block, and how many cooperative-matrix
+// K-tiles that covers. Only q4_0 is wired up so far.
+#define QUANT_K 32
+#define TILES_PER_BLOCK (QUANT_K / TILEK)
+
+struct block_q4_0_packed16 {
+   float16_t d;
+   uint16_t  qs[QUANT_K / 4];
+};
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer A_PACKED16 { block_q4_0_packed16 data_a_packed16[]; };
+layout(binding = 1) readonly  buffer B          { float data_b[]; };
+layout(binding = 2) writeonly buffer D          { float data_d[]; };
+
+layout(push_constant) uniform parameter
+{
+   uint M;
+   uint N;
+   uint K;
+   uint stride_a;
+   uint stride_b;
+   uint stride_d;
+
+   uint batch_stride_a;
+   uint batch_stride_b;
+   uint batch_stride_d;
+
+   uint base_work_group_z;
+   uint num_batches;
+   uint k_split;
+   uint ne02;
+   uint ne12;
+   uint broadcast2;
+   uint broadcast3;
+   uint padded_N;
+} p;
+
+// Specialization constants match mul_mm.comp so the host can reuse the warptile
+// plumbing. BK/WM/WN/WMITER are unused here: this shader has no shared-memory
+// tile and no per-subgroup sub-tiling.
+layout(constant_id = 0)  const uint BLOCK_SIZE = 64;
+layout(constant_id = 1)  const uint BM = 64;
+layout(constant_id = 2)  const uint BN = 64;
+layout(constant_id = 3)  const uint BK = 32;
+layout(constant_id = 4)  const uint WM = 64;
+layout(constant_id = 5)  const uint WN = 64;
+layout(constant_id = 6)  const uint WMITER = 1;
+layout(constant_id = 7)  const uint TM = 64;
+layout(constant_id = 8)  const uint TN = 64;
+layout(constant_id = 9)  const uint TK = 16;
+layout(constant_id = 10) const uint WARP = 64;
+layout(constant_id = 11) const bool ALIGNED = true;
+
+void main() {
+   // One subgroup per workgroup covering the whole BM x BN tile. Any other
+   // geometry would have subgroups writing into neighbouring tiles, so refuse
+   // to run; ggml_vk_tilek_warptile() asserts the same relationship host-side.
+   if (BM != TM || BN != TN || TK != TILEK || gl_NumSubgroups != 1) {
+       return;
+   }
+
+   const uint batch_idx = gl_WorkGroupID.z + p.base_work_group_z;
+
+   const uint i13 = batch_idx / p.ne12;
+   const uint i12 = batch_idx % p.ne12;
+
+   const uint i03 = i13 / p.broadcast3;
+   const uint i02 = i12 / p.broadcast2;
+
+   const uint batch_idx_a = i03 * p.ne02 + i02;
+
+   const uint blocks_m = (p.M + BM - 1) / BM;
+   const uint ir = gl_WorkGroupID.x % blocks_m; // row tile
+   const uint ik = gl_WorkGroupID.x / blocks_m; // split_k slice
+   const uint ic = gl_WorkGroupID.y;            // column tile
+
+   const uint lane = gl_SubgroupInvocationID;
+
+   const uint start_k = ik * p.k_split;
+   const uint end_k = min(p.K, (ik + 1) * p.k_split);
+
+   // A is row-major and lane m holds row (ir*BM + m). stride_a, batch_stride_a
+   // and start_k are all multiples of QUANT_K, so the block index divides out
+   // exactly.
+   uint ib = (batch_idx_a * p.batch_stride_a + (ir * BM + lane) * p.stride_a + start_k) / QUANT_K;
+
+   // B is TileK-first: the K-tile containing kidx for column n starts at
+   // (kidx / TILEK) * TILEK * N + n * TILEK, and start_k is a multiple of
+   // TILEK. Lane n holds column ic*BN + n, i.e. one contiguous TILEK run.
+   uint pos_b = batch_idx * p.batch_stride_b + start_k * p.N + (ic * BN + lane) * TILEK;
+
+   coopmat<float16_t, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> matA;
+   coopmat<float16_t, gl_ScopeSubgroup, TK, TN, gl_MatrixUseB> matB;
+   coopmat<float16_t, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> matC =
+       coopmat<float16_t, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(0.0f);
+
+   float16_t vecA[QUANT_K];
+   // The conversion builtins require the array length to be the coopmat's
+   // column count, spelled with the same specialization constant.
+   float16_t vecA_tile[TK];
+   float16_t vecB[TK];
+
+   for (uint k = start_k; k < end_k; k += QUANT_K) {
+       // Dequantize one q4_0 block per lane into registers. Low nibbles hold
+       // values 0..15 of the block, high nibbles values 16..31.
+       const float16_t d = data_a_packed16[ib].d;
+       [[unroll]] for (uint i = 0; i < QUANT_K / 8; i++) {
+           const uint vui = uint(data_a_packed16[ib].qs[2 * i]) | (uint(data_a_packed16[ib].qs[2 * i + 1]) << 16);
+           const f16vec4 v0 = (f16vec4(unpack8((vui >> 0) & 0x0F0F0F0F)) - float16_t(8.0f)) * d;
+           const f16vec4 v1 = (f16vec4(unpack8((vui >> 4) & 0x0F0F0F0F)) - float16_t(8.0f)) * d;
+           vecA[4 * i + 0]  = v0.x;
+           vecA[4 * i + 1]  = v0.y;
+           vecA[4 * i + 2]  = v0.z;
+           vecA[4 * i + 3]  = v0.w;
+           vecA[4 * i + 16] = v1.x;
+           vecA[4 * i + 17] = v1.y;
+           vecA[4 * i + 18] = v1.z;
+           vecA[4 * i + 19] = v1.w;
+       }
+       ib += 1;
+
+       // TILES_PER_BLOCK and TILEK are literals, so the offset handed to
+       // extractSubArrayQCOM stays a compile-time constant after unrolling.
+       [[unroll]] for (uint t = 0; t < TILES_PER_BLOCK; t++) {
+           extractSubArrayQCOM(vecA, t * TILEK, vecA_tile);
+
+           [[unroll]] for (uint kk = 0; kk < TK; kk++) {
+               vecB[kk] = float16_t(data_b[pos_b + kk]);
+           }
+           pos_b += TILEK * p.N;
+
+           vectorToCoopmatQCOM(vecA_tile, matA);
+           vectorToCoopmatQCOM(vecB, matB);
+
+           matC = coopMatMulAdd(matA, matB, matC);
+       }
+   }
+
+   // Lanes past M/N accumulate whatever robustBufferAccess handed them; their
+   // results are dropped by the bounds checks below.
+   const uint dr = ir * BM;
+   const uint dc = ic * BN;
+
+   const uint offsets = batch_idx * p.batch_stride_d + ik * p.batch_stride_d * p.num_batches;
+
+   // D holds dst->ne[0] == M contiguously, i.e. column-major for an M x N result.
+   const bool is_aligned = p.stride_d % 4 == 0;
+   const bool is_in_bounds = dr + TM <= p.M && dc + TN <= p.N;
+
+   if (is_aligned && is_in_bounds) {
+       coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> cm_dtype =
+           coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(matC);
+       coopMatStore(cm_dtype, data_d, offsets + dc * p.stride_d + dr, p.stride_d, gl_CooperativeMatrixLayoutColumnMajor);
+       return;
+   }
+
+   if (dr + lane >= p.M) {
+       return;
+   }
+
+   // Scalar fallback: coopmatToVectorQCOM gives lane m row (dr + m) of the
+   // tile, one element per output column.
+   float16_t vecC[TN];
+   coopmatToVectorQCOM(matC, vecC);
+
+   [[unroll]] for (uint col = 0; col < TN; col++) {
+       if (dc + col < p.N) {
+           data_d[offsets + (dc + col) * p.stride_d + dr + lane] = float(vecC[col]);
+       }
+   }
+}

@@ -38,11 +38,12 @@ endfunction()
 function(test_shader_extension_support EXTENSION_NAME TEST_SHADER_FILE RESULT_VARIABLE)
     execute_process(
         COMMAND ${Vulkan_GLSLC_EXECUTABLE} -o - -fshader-stage=compute --target-env=vulkan1.3 "${TEST_SHADER_FILE}"
+        RESULT_VARIABLE glslc_result
         OUTPUT_VARIABLE glslc_output
         ERROR_VARIABLE glslc_error
     )
 
-    if (${glslc_error} MATCHES ".*extension not supported: ${EXTENSION_NAME}.*")
+    if (NOT glslc_result EQUAL 0)
         message(STATUS "${EXTENSION_NAME} not supported by glslc")
         set(${RESULT_VARIABLE} OFF PARENT_SCOPE)
     else()
@@ -88,6 +89,14 @@ if (Vulkan_FOUND)
         "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders/feature-tests/coopmat2.comp"
         "GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT"
     )
+
+    if (GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+        test_shader_extension_support(
+            "GL_QCOM_cooperative_matrix_conversion"
+            "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders/feature-tests/coopmat_tilek_conversion.comp"
+            "GGML_VULKAN_TILEK_GLSLC_SUPPORT"
+        )
+    endif()
 
     test_shader_extension_support(
         "GL_NV_cooperative_matrix_decode_vector"
