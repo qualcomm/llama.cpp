@@ -324,6 +324,12 @@ on 4 physical NPUs, or `--devices 'HTP0[0-1:0],HTP1[0-1:1]'` on 2 physical NPUs 
 - `GGML_HEXAGON_NHVX=0`
   Controls the number of HVX hardware threads to use. The default is all (actual number varies depending on the hardware version).
 
+- `GGML_HEXAGON_VTCM_MB=0`
+  Caps the VTCM size (in MB) used by each session. The default is all the VTCM the hardware reports. Values above the hardware size have no effect.
+
+- `GGML_HEXAGON_NTHREADS=0`
+  Caps the scalar threads used by the backend. Each session runs the HVX workers plus two helper threads (`htp-main`, `hmx-queue`), so the number of workers is limited to `NTHREADS - 2`. The default is no cap. This limits only the threads the backend creates; it does not mask the hardware threads.
+
 - `GGML_HEXAGON_HOSTBUF=1` (default: 0, disabled)
   Enables allocating host buffers for debugging. By default, host buffers are disabled.
 

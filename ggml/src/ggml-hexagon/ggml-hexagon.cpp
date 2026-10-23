@@ -85,6 +85,8 @@ int    opt_arch       = 0; // autodetect
 size_t opt_ndev       = 1;
 size_t opt_nhvx       = 0; // use all
 int    opt_nhmx       = 1; // when set, enable HMX; when 0, use HVX only
+size_t opt_vtcm_mb    = 0; // cap VTCM size in MB; 0 = use all
+size_t opt_nthreads   = 0; // cap on scalar threads used by the backend (workers + 2); 0 = no cap
 size_t opt_vmem       = HTP_OP_MAX_VMEM_DEFAULT;  // max available va space for buffer mappings
 int    opt_etm        = 0;
 int    opt_verbose    = 0;
@@ -2152,6 +2154,9 @@ void ggml_hexagon_session::allocate(const ggml_hexagon_device_config & config) n
             this->n_hvx     = this->n_threads;
             this->n_hmx     = (opt_nhmx != 0) ? (uint32_t)hw_n_hmx : 0;
             this->vtcm_size = (uint64_t)hw_vtcm_size;
+            if (opt_vtcm_mb > 0) {
+                this->vtcm_size = (std::min)(this->vtcm_size, (uint64_t) opt_vtcm_mb * 1024 * 1024);
+            }
             GGML_LOG_INFO("ggml-hex: %s hwinfo: threads %u, hvx %u, hmx %u, vtcm %llu MB\n",
                           this->c_name(), this->n_threads, this->n_hvx, this->n_hmx,
                           (unsigned long long)(this->vtcm_size / (1024 * 1024)));
@@ -2162,6 +2167,18 @@ void ggml_hexagon_session::allocate(const ggml_hexagon_device_config & config) n
             this->n_hvx     = this->n_threads;
             this->n_hmx     = (opt_nhmx != 0) ? 1 : 0;
             this->vtcm_size = 8 * 1024 * 1024;
+        }
+
+        // Scalar thread budget: the backend runs n_hvx workers plus htp-main and hmx-queue.
+        if (opt_nthreads > 0) {
+            const uint32_t n_sys     = 2;
+            const uint32_t max_hvx   = opt_nthreads > n_sys ? (uint32_t) opt_nthreads - n_sys : 1;
+            if (this->n_threads > max_hvx) {
+                GGML_LOG_WARN("ggml-hex: %s NTHREADS=%zu caps workers %u -> %u\n",
+                              this->c_name(), opt_nthreads, this->n_threads, max_hvx);
+                this->n_threads = max_hvx;
+                this->n_hvx     = max_hvx;
+            }
         }
     }
 
@@ -2230,7 +2247,8 @@ void ggml_hexagon_session::allocate(const ggml_hexagon_device_config & config) n
     this->op_batch = new ggml_hexagon_opbatch(this, opt_opbatch, this->max_vmem);
 
     // Start dspqueue/opbatch processing
-    err = htp_iface_start(this->handle, this->session_id, this->queue_id, this->n_threads, opt_nhmx, this->max_vmem, (uint32_t) opt_power_mode);
+    err = htp_iface_start(this->handle, this->session_id, this->queue_id, this->n_threads, opt_nhmx, this->max_vmem, (uint32_t) opt_power_mode,
+                         (uint64_t) opt_vtcm_mb * 1024 * 1024);
     if (err != 0) {
         GGML_LOG_ERROR("ggml-hex: %s failed to start session: 0x%08x\n", this->c_name(), (unsigned) err);
         throw std::runtime_error("ggml-hex: iface start failed (see log for details)");
@@ -3391,6 +3409,8 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_etm      = getenv("GGML_HEXAGON_ETM");
     const char * str_nhvx     = getenv("GGML_HEXAGON_NHVX");
     const char * str_nhmx     = getenv("GGML_HEXAGON_NHMX");
+    const char * str_vtcm_mb  = getenv("GGML_HEXAGON_VTCM_MB");
+    const char * str_nthreads = getenv("GGML_HEXAGON_NTHREADS");
     const char * str_mm_select = getenv("GGML_HEXAGON_MM_SELECT");
     const char * str_fa_select = getenv("GGML_HEXAGON_FA_SELECT");
     const char * str_fa_split  = getenv("GGML_HEXAGON_FA_SPLIT");
@@ -3456,6 +3476,8 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     }
     opt_nhvx      = str_nhvx     ? strtoul(str_nhvx, NULL, 0)             : opt_nhvx;
     opt_nhmx      = str_nhmx     ? atoi(str_nhmx)                         : opt_nhmx;
+    opt_vtcm_mb   = str_vtcm_mb  ? strtoul(str_vtcm_mb, NULL, 0)          : opt_vtcm_mb;
+    opt_nthreads  = str_nthreads ? strtoul(str_nthreads, NULL, 0)         : opt_nthreads;
     opt_mm_select = str_mm_select ? atoi(str_mm_select)                   : opt_mm_select;
     opt_fa_select = str_fa_select ? atoi(str_fa_select)                   : opt_fa_select;
     opt_fa_split  = str_fa_split  ? atoi(str_fa_split)                   : opt_fa_split;
