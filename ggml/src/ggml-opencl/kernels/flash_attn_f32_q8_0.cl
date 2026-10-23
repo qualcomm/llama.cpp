@@ -2159,7 +2159,6 @@ __kernel void flash_attn_f32_q8_0(
                     s2 = sub_group_shuffle(s2, tri_base + 0) + sub_group_shuffle(s2, tri_base + 1) + sub_group_shuffle(s2, tri_base + 2);
                     s3 = sub_group_shuffle(s3, tri_base + 0) + sub_group_shuffle(s3, tri_base + 1) + sub_group_shuffle(s3, tri_base + 2);
                 #endif
-                if (!query_valid) { s0 = FA_M_INIT; s1 = FA_M_INIT; s2 = FA_M_INIT; s3 = FA_M_INIT; }
 #endif
                 s0 *= scale; s1 *= scale; s2 *= scale; s3 *= scale;
                 if (logit_softcap > 0.0f) {
@@ -2168,6 +2167,7 @@ __kernel void flash_attn_f32_q8_0(
                     s2 = logit_softcap * tanh(s2 / logit_softcap);
                     s3 = logit_softcap * tanh(s3 / logit_softcap);
                 }
+                if (!query_valid) { s0 = FA_M_INIT; s1 = FA_M_INIT; s2 = FA_M_INIT; s3 = FA_M_INIT; }
 
                 if (is_causal) {
                     const int causal_limit = n_kv - n_q + my_query_row;
