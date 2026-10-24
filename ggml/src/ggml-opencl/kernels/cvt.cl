@@ -2926,3 +2926,54 @@ kernel void kernel_restore_block_q3_k_noshuffle(
         b->hmask[ee] = (uchar)v;
     }
 }
+
+struct block_iq2_s {
+    half d;
+    uchar qs[QK_K/4];
+    uchar qh[QK_K/32];
+    uchar scales[QK_K/32];
+};
+
+kernel void kernel_convert_block_iq2_s(
+    global struct block_iq2_s * src0,
+    global uchar * dst_qs,      // QK_K/8 per block
+    global uchar * dst_sg,      // QK_K/8
+    global uchar * dst_qh,      // QK_K/32
+    global uchar * dst_sc,      // QK_K/32
+    global half  * dst_d,       // 1
+    ulong          n_blk
+) {
+    const ulong i = get_global_id(0);
+    if (i >= n_blk) {
+        return;
+    }
+    global struct block_iq2_s * b = src0 + i;
+
+    dst_d[i] = b->d;
+    for (int j = 0; j < QK_K/8;  ++j) { dst_qs[(QK_K/8)  * i + j] = b->qs[j];            }
+    for (int j = 0; j < QK_K/8;  ++j) { dst_sg[(QK_K/8)  * i + j] = b->qs[QK_K/8 + j];   }
+    for (int j = 0; j < QK_K/32; ++j) { dst_qh[(QK_K/32) * i + j] = b->qh[j];            }
+    for (int j = 0; j < QK_K/32; ++j) { dst_sc[(QK_K/32) * i + j] = b->scales[j];        }
+}
+
+kernel void kernel_restore_block_iq2_s(
+    global uchar * src_qs,
+    global uchar * src_sg,
+    global uchar * src_qh,
+    global uchar * src_sc,
+    global half  * src_d,
+    global struct block_iq2_s * dst,
+    ulong          n_blk
+) {
+    const ulong i = get_global_id(0);
+    if (i >= n_blk) {
+        return;
+    }
+    global struct block_iq2_s * b = dst + i;
+
+    b->d = src_d[i];
+    for (int j = 0; j < QK_K/8;  ++j) { b->qs[j]          = src_qs[(QK_K/8)  * i + j]; }
+    for (int j = 0; j < QK_K/8;  ++j) { b->qs[QK_K/8 + j] = src_sg[(QK_K/8)  * i + j]; }
+    for (int j = 0; j < QK_K/32; ++j) { b->qh[j]          = src_qh[(QK_K/32) * i + j]; }
+    for (int j = 0; j < QK_K/32; ++j) { b->scales[j]      = src_sc[(QK_K/32) * i + j]; }
+}
