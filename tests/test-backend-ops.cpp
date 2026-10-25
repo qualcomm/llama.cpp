@@ -11272,6 +11272,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 128, 8, false,  768, n, 2048));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q6_K, GGML_TYPE_F32, 128, 8, false, 2048, n,  768));
     }
+    // q8_0 GEMV on weights that stay in the plain (untransposed) layout at 2..8 columns: a
+    // vocab-scale q8_0 lm_head is past the transposed layout's element limit, and a weight
+    // whose row count is not a multiple of 4 does not qualify for it either. Neither was
+    // generated at n > 1. m=4097 also covers the partial last row group; 201088 x 2880 is
+    // gpt-oss-20b's head verbatim.
+    for (int n : {1, 2, 3, 4, 5, 8}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 4097, n, 2880, {1, 1}, {1, 1}));
+    }
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 201088, 4, 2880, {1, 1}, {1, 1}));
+
     // The gpt-oss expert FFN subgraph as the model builds it at these widths: gate and up
     // MUL_MAT_ID with per-expert ADD_ID biases into SWIGLU_OAI. The generic vec-fusion
     // cases never use SWIGLU_OAI, so the gpt-oss epilogue was not covered at n > 1.
@@ -13330,6 +13340,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+
+    // gpt-oss-20b q8_0 lm_head (plain layout) at the verify / multi-slot widths
+    for (int n : {1, 2, 4, 8}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 201088, n, 2880, {1, 1}, {1, 1}));
+    }
 
     // gpt-oss-20b
     for (int bs : {1, 2, 3, 4, 8, 512}) {
