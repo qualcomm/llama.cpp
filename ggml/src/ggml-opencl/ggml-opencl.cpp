@@ -1605,6 +1605,8 @@ struct ggml_backend_opencl_context {
     int       q6k_mc4_ndst = 0;
     cl_kernel kernel_mul_mv_mxfp4_f32, kernel_mul_mv_mxfp4_f32_flat;
     cl_kernel kernel_mul_mv_q8_0_f32, kernel_mul_mv_q8_0_f32_flat;
+    cl_kernel kernel_mul_mv_q8_0_f32_flat_mc2 = nullptr;  // multi-column twins of _flat (N_COLS 2 / 4)
+    cl_kernel kernel_mul_mv_q8_0_f32_flat_mc4 = nullptr;
     cl_kernel kernel_mul_mat_q8_0_f32_kq_gen = nullptr;
     cl_kernel kernel_mul_mat_q8_0_f32_gqa8_dk128 = nullptr;
     cl_kernel kernel_mul_mat_q8_0_f32_gqa8_dk128_img = nullptr;
@@ -6708,6 +6710,44 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 
         CL_CHECK((backend_ctx->kernel_mul_mv_q8_0_f32_flat = clCreateKernel(backend_ctx->program_mul_mv_q8_0_f32_flat, "kernel_mul_mv_q8_0_f32_flat", &err), err));
         GGML_LOG_CONT(".");
+    }
+
+    // mul_mv_q8_0_f32_flat_mc: multi-column twin of the flat q8_0 GEMV, for ne1 2..8 on
+    // the q8_0 weights that stay in the flat layout (a vocab-scale lm_head is past the
+    // transposed layout's element limit). The single-column kernel re-reads the weight once
+    // per output column. Built for 2 and 4 columns, as separate programs for the same A6X
+    // reason as the q6_K twin above. Non-fatal: a variant that does not build leaves its
+    // handle null and the dispatch keeps the single-column kernel. Opt out with
+    // GGML_OPENCL_Q8_FLAT_MC=0.
+    if (!ggml_cl_env_flag_zero("GGML_OPENCL_Q8_FLAT_MC")) {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src {
+            #include "mul_mv_q8_0_f32_flat_mc.cl.h"
+        };
+#else
+        const std::string kernel_src = read_file("mul_mv_q8_0_f32_flat_mc.cl");
+#endif
+        struct { int n_cols; cl_kernel * dst_k; } variants[] = {
+            { 2, &backend_ctx->kernel_mul_mv_q8_0_f32_flat_mc2 },
+            { 4, &backend_ctx->kernel_mul_mv_q8_0_f32_flat_mc4 },
+        };
+        for (auto & v : variants) {
+            const std::string mc_opts = compile_opts + " -DQ8_MC_N_COLS=" + std::to_string(v.n_cols);
+            cl_program prog_mc = build_program_from_source_ex_cached(
+                backend_ctx, kernel_src.c_str(), mc_opts, /*fatal=*/false, "mul_mv_q8_0_f32_flat_mc");
+            if (prog_mc == nullptr) {
+                GGML_LOG_WARN("ggml_opencl: q8_0 multi-column GEMV (N_COLS=%d) did not build; "
+                              "batched flat q8_0 falls back to the single-column kernel\n", v.n_cols);
+                continue;
+            }
+            *v.dst_k = clCreateKernel(prog_mc, "kernel_mul_mv_q8_0_f32_flat_mc", &err);
+            CL_CHECK(clReleaseProgram(prog_mc));
+            if (err != CL_SUCCESS) {
+                *v.dst_k = nullptr;
+                continue;
+            }
+            GGML_LOG_CONT(".");
+        }
     }
 
     // mul_mv_q1_0_f32
@@ -48901,6 +48941,21 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 GGML_ASSERT(false && "TODO: Unknown GPU");
             }
 
+            // ne1 2..8 (speculative verify batch, multi-slot decode) on a flat q8_0 weight --
+            // in practice a vocab-scale lm_head: the single-column kernel re-streams the whole
+            // weight for every column, so take the multi-column twin, which reads it once per 2
+            // or 4 columns. Same per-(row, column) arithmetic, same grid along x. Declined where
+            // the multi-column GEMV family miscompiles (ggml_cl_mc_gemv_ok).
+            if (backend_ctx->gpu_family == ADRENO && ne11 >= 2 && ne11 <= 8 && ggml_cl_mc_gemv_ok(backend_ctx)) {
+                if (ne11 == 2 && backend_ctx->kernel_mul_mv_q8_0_f32_flat_mc2 != nullptr) {
+                    kernel       = backend_ctx->kernel_mul_mv_q8_0_f32_flat_mc2;
+                    ncols_per_wg = 2;
+                } else if (backend_ctx->kernel_mul_mv_q8_0_f32_flat_mc4 != nullptr) {
+                    kernel       = backend_ctx->kernel_mul_mv_q8_0_f32_flat_mc4;
+                    ncols_per_wg = 4;
+                }
+            }
+
             CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0_q8_0->q));
             CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_mem),   &extra0_q8_0->d));
             CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),   &extra1->data_device));
@@ -51054,8 +51109,10 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         // produce N_DST*N_SIMDGROUP values in the result. Hence, the grid size
         // (number of workgroups) will be a nearest multiple of
         // N_DST*N_SIMDGROUP to cover the size of the dimension. Below, 4 is
-        // N_DST*N_SIMDGROUP (see the kernel for Q4_0 matmul).
-        size_t global_work_size[] = {(size_t)(ne01 + ndst-1)/ndst*nth0, (size_t)ne11*nth1, (size_t)ne12*ne13};
+        // N_DST*N_SIMDGROUP (see the kernel for Q4_0 matmul). ncols_per_wg > 1 only for
+        // the multi-column flat q8_0 GEMV, whose workgroup row covers that many columns.
+        const size_t n_col_tiles = (size_t)(ne11 + ncols_per_wg - 1)/ncols_per_wg;
+        size_t global_work_size[] = {(size_t)(ne01 + ndst-1)/ndst*nth0, n_col_tiles*nth1, (size_t)ne12*ne13};
         size_t local_work_size[] = {(size_t)nth0, (size_t)nth1, 1};
 
         backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
