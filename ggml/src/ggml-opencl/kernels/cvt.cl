@@ -3088,3 +3088,45 @@ kernel void kernel_restore_block_q2_0(
         dst[i].qs[j] = src_qs[16*i + j];
     }
 }
+
+struct block_iq1_s {
+    half d;
+    uchar qs[QK_K/8];
+    ushort qh[QK_K/32];
+};
+
+kernel void kernel_convert_block_iq1_s(
+    global struct block_iq1_s * src0,
+    global uchar * dst_qs,
+    global ushort * dst_qh,
+    global half * dst_d,
+    ulong n_blocks
+) {
+    const ulong i = get_global_id(0);
+    if (i >= n_blocks) { return; }
+    dst_d[i] = src0[i].d;
+    for (int j = 0; j < 32; ++j) {
+        dst_qs[32*i + j] = src0[i].qs[j];
+    }
+    for (int j = 0; j < 8; ++j) {
+        dst_qh[8*i + j] = src0[i].qh[j];
+    }
+}
+
+kernel void kernel_restore_block_iq1_s(
+    global uchar * src_qs,
+    global ushort * src_qh,
+    global half * src_d,
+    global struct block_iq1_s * dst,
+    ulong n_blocks
+) {
+    const ulong i = get_global_id(0);
+    if (i >= n_blocks) { return; }
+    dst[i].d = src_d[i];
+    for (int j = 0; j < 32; ++j) {
+        dst[i].qs[j] = src_qs[32*i + j];
+    }
+    for (int j = 0; j < 8; ++j) {
+        dst[i].qh[j] = src_qh[8*i + j];
+    }
+}
