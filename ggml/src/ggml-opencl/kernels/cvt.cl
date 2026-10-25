@@ -3011,3 +3011,47 @@ kernel void kernel_restore_block_iq2_xs(
     for (int j = 0; j < 32; ++j) { dst[i].qs[j] = src_qs[32*i + j]; }
     for (int j = 0; j < 8; ++j) { dst[i].scales[j] = src_sc[8*i + j]; }
 }
+
+struct block_iq2_xxs {
+    half d;
+    ushort qs[QK_K/8];
+};
+
+kernel void kernel_convert_block_iq2_xxs(
+    global struct block_iq2_xxs * src0,
+    global uchar * dst_qs,
+    global uint * dst_sas,
+    global half * dst_d,
+    ulong n_blocks
+) {
+    const ulong i = get_global_id(0);
+    if (i >= n_blocks) { return; }
+    dst_d[i] = src0[i].d;
+    for (int j = 0; j < 8; ++j) {
+        global ushort * q = src0[i].qs + 4*j;
+        uint indices = (uint)q[0] | ((uint)q[1] << 16);
+        vstore4(as_uchar4(indices), 8*i + j, dst_qs);
+        dst_sas[8*i + j] = (uint)q[2] | ((uint)q[3] << 16);
+    }
+}
+
+kernel void kernel_restore_block_iq2_xxs(
+    global uchar * src_qs,
+    global uint * src_sas,
+    global half * src_d,
+    global struct block_iq2_xxs * dst,
+    ulong n_blocks
+) {
+    const ulong i = get_global_id(0);
+    if (i >= n_blocks) { return; }
+    dst[i].d = src_d[i];
+    for (int j = 0; j < 8; ++j) {
+        global ushort * q = dst[i].qs + 4*j;
+        uint indices = as_uint(vload4(8*i + j, src_qs));
+        uint sas = src_sas[8*i + j];
+        q[0] = (ushort)indices;
+        q[1] = (ushort)(indices >> 16);
+        q[2] = (ushort)sas;
+        q[3] = (ushort)(sas >> 16);
+    }
+}
