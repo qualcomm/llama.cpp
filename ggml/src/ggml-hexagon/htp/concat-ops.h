@@ -53,9 +53,9 @@ static inline void htp_concat_transposed_vtcm_layout_build(
     uint32_t type_size,
     uint32_t n_threads) {
 
-    uint32_t block_i = (type_size == 4) ? 32 : 64;
+    uint32_t block_i = (type_size == 4) ? 64 : 128;
     uint32_t spad1_stride = block_i * type_size;
-    uint32_t src1_ne0_padded = hex_round_up(src1_ne0, block_i);
+    uint32_t src1_ne0_padded = hex_round_up(src1_ne0, (type_size == 4) ? 32 : 64);
     uint32_t spad0_row_bytes = hex_round_up(src0_ne0 * type_size, 128) + src1_ne0_padded * type_size;
 
     L->src0_spad_size_per_thread = block_i * spad0_row_bytes;

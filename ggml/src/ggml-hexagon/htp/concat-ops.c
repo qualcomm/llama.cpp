@@ -57,7 +57,7 @@ static void concat_2d_f32_transposed(unsigned int nth, unsigned int ith, void * 
     uint8_t * spad0_base = cctx->spad0_base + ith * cctx->spad0_size_per_thread;
     uint8_t * spad1_base = cctx->spad1_base + ith * cctx->spad1_size_per_thread;
 
-    const uint32_t block_i = 32;
+    const uint32_t block_i = 64;
     const uint32_t spad1_stride = block_i * sizeof(float);
 
     const HVX_Vector offsets = hvx_vec_gather_offsets_w(spad1_stride);
@@ -153,7 +153,7 @@ static void concat_2d_f16_transposed(unsigned int nth, unsigned int ith, void * 
     uint8_t * spad0_base = cctx->spad0_base + ith * cctx->spad0_size_per_thread;
     uint8_t * spad1_base = cctx->spad1_base + ith * cctx->spad1_size_per_thread;
 
-    const uint32_t block_i = 64;
+    const uint32_t block_i = 128;
     const uint32_t spad1_stride = block_i * sizeof(__fp16);
 
     const HVX_Vector offsets = hvx_vec_gather_offsets_h(spad1_stride);
