@@ -18660,7 +18660,13 @@ static bool ggml_cl_kq_rowsplit_on(const ggml_backend_opencl_context * backend_c
 // GEMV wins while the experts see few tokens each. Measured on the Adreno 850 (E17): the
 // GEMV wins while the batch averages up to ~2 tokens per expert (Qwen3-30B-A3B, 128 experts
 // top 8: up to 16 tokens; granite-3.0-3B-A800M, 40 experts top 8: 8 yes, 16 no), up to
-// max_tokens. Elsewhere unmeasured, so decode only. GGML_OPENCL_MOE_GEMV_MAX_TOK overrides
+// max_tokens. On the other X2-class parts (X2-90, Adreno 840) the GEMV wins for the
+// spec-decode verify batch and 2..4-way multi-slot decode while the experts see well under
+// one token each -- 2 * tokens * used < experts -- and the GEMM wins once tokens start to
+// share experts, since it reads each expert once for all of them (at 4 tokens: gpt-oss-20b,
+// 32 experts top 4, -3.9% on the GEMV; granite-3.0-3b-a800m, 40 top 8, -10%; Qwen3-30B-A3B
+// and gemma-4-26B-A4B, 128 top 8, +13% / +5%; Qwen3.6-35B-A3B, 256 top 8, +16%). Capped at
+// 4 tokens. Elsewhere unmeasured, so decode only. GGML_OPENCL_MOE_GEMV_MAX_TOK overrides
 // with a plain token limit.
 static bool ggml_cl_moe_small_batch(const ggml_backend_opencl_context * backend_ctx, int n_tokens, int n_used, int n_expert, int max_tokens) {
     if (n_tokens <= 1) {
@@ -18670,8 +18676,11 @@ static bool ggml_cl_moe_small_batch(const ggml_backend_opencl_context * backend_
     if (env && env[0]) {
         return n_tokens <= std::max(1, atoi(env));
     }
-    return adreno_art_compiler_quirks(backend_ctx) && n_tokens <= max_tokens &&
-           (int64_t) n_tokens * n_used <= 2 * (int64_t) n_expert;
+    if (adreno_art_compiler_quirks(backend_ctx)) {
+        return n_tokens <= max_tokens && (int64_t) n_tokens * n_used <= 2 * (int64_t) n_expert;
+    }
+    return backend_ctx->adreno_x2_class() && n_tokens <= 4 &&
+           2 * (int64_t) n_tokens * n_used < (int64_t) n_expert;
 }
 
 // Default gate for the *dense* dp4a prefill GEMMs (gemm_noshuffle_*_q8_1_dp4a).
