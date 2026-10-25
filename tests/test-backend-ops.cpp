@@ -11258,6 +11258,28 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_1, GGML_TYPE_F32, 2048, 9, 8192, {1, 1}, {1, 1}));
 
+    // MoE expert matmuls at small token counts (the spec/MTP verify batch and 2..4-way
+    // multi-slot decode), at real model shapes. Same blind spot as the dense blocks around
+    // here: the generated MUL_MAT_ID cases reach n in 2..8 only at toy sizes (m=512 k=256,
+    // n_used=1) or with broadcast b, so the per-token MoE GEMV vs GEMM choice at these
+    // widths was never exercised on a real expert layout. n=5 and n=8 are the controls
+    // past the usual verify width.
+    for (int n : {1, 2, 3, 4, 5, 8}) {
+        // gpt-oss-20b: 32 experts, 4 used, 2880 x 2880
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 4, false, 2880, n, 2880));
+        // Qwen3-30B-A3B: 128 experts, 8 used, gate/up 768 x 2048 and down 2048 x 768
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 128, 8, false,  768, n, 2048));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 128, 8, false,  768, n, 2048));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q6_K, GGML_TYPE_F32, 128, 8, false, 2048, n,  768));
+    }
+    // The gpt-oss expert FFN subgraph as the model builds it at these widths: gate and up
+    // MUL_MAT_ID with per-expert ADD_ID biases into SWIGLU_OAI. The generic vec-fusion
+    // cases never use SWIGLU_OAI, so the gpt-oss epilogue was not covered at n > 1.
+    for (int n : {1, 2, 3, 4}) {
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_MXFP4, GGML_GLU_OP_SWIGLU_OAI, n, 2880, 2880,
+            true, 32, 4, false, true, true, false, {1, 1}));
+    }
+
     // q8_0 small-N cooperative-K GEMM (the spec/MTP verify batch). Same blind spot again:
     // every generated q8_0 case in this band is m=16, so the Adreno cooperative-K route --
     // 64 lanes x 4 rows, gated on m % 4 -- is not reached by a single one of them, and an
@@ -13290,7 +13312,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
 
     // qwen3-30b-a3b
-    for (int bs : {1, 4, 8, 32, 64, 128, 256, 512}) {
+    for (int bs : {1, 2, 3, 4, 8, 32, 64, 128, 256, 512}) {
         for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ4_XS}) {
             for (ggml_type type_b : {GGML_TYPE_F32}) {
                 test_cases.emplace_back(new test_mul_mat_id(type_a, type_b, 128, 8, false, 768, bs, 2048));
@@ -13310,7 +13332,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
 
     // gpt-oss-20b
-    for (int bs : {1, 4, 8, 512}) {
+    for (int bs : {1, 2, 3, 4, 8, 512}) {
         for (ggml_type type_a : {GGML_TYPE_MXFP4}) {
             for (ggml_type type_b : {GGML_TYPE_F32}) {
                 test_cases.emplace_back(new test_mul_mat_id(type_a, type_b, 32, 4, false, 2880, bs, 2880));
