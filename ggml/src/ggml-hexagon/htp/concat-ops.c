@@ -72,8 +72,14 @@ static void concat_2d_f32_transposed(unsigned int nth, unsigned int ith, void * 
     const struct fastdiv_values * div_ne2 = &cctx->div_ne2;
     const uint32_t ne2 = dst->ne[2];
 
+    // two slots per scratchpad: block b gathers in slot b&1 while dst[b-1] and src1[b+1] DMA in the other
+    const uint32_t spad0_slot = block_i * spad0_row_bytes;
+    const uint32_t spad1_slot = src1_ne0_padded * spad1_stride;
+
     uint32_t p = 0;
     uint32_t i = start_i;
+    uint32_t s = 0;
+    bool dst_pending = false;
 
     const dma_addr_t src1_addr = concat_plane_addr(src1, p, div_ne2, ne2) + i * src1->nb[1];
     dma_queue_push(dma_q, dma_make_data(spad1_base, src1_addr), spad1_stride, src1->nb[0], MIN(end_i - i, block_i) * sizeof(float), src1_ne0);
@@ -81,19 +87,14 @@ static void concat_2d_f32_transposed(unsigned int nth, unsigned int ith, void * 
     const dma_addr_t src0_addr = concat_plane_addr(src0, p, div_ne2, ne2) + i * src0->nb[1];
     dma_queue_push(dma_q, dma_make_data(spad0_base + src0_pre, src0_addr), spad0_row_bytes, src0->nb[1], src0_row_bytes, MIN(end_i - i, block_i));
 
-    dma_queue_pop(dma_q); // src1
-
     while (p < cctx->nplanes) {
         const uint32_t current_block_i = MIN(end_i - i, block_i);
 
-        htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) i);
-        for (uint32_t j = 0; j < src1_ne0; j += 32) {
-            const uint8_t * src_ptr = spad1_base + j * spad1_stride;
-            uint8_t * dst_ptr = spad0_base + src0_row_padded + j * sizeof(float);
-            hvx_transpose_32x32_w_gather(dst_ptr, spad0_row_bytes, src_ptr, spad1_stride, offsets, current_block_i, MIN(src1_ne0 - j, 32));
-        }
-        hvx_gather_sync(spad0_base + src0_row_padded);
-        htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) i);
+        uint8_t * spad0 = spad0_base + s * spad0_slot;
+        uint8_t * spad1 = spad1_base + s * spad1_slot;
+
+        dma_queue_pop(dma_q); // src1
+        dma_queue_pop(dma_q); // src0
 
         uint32_t np = p;
         uint32_t ni = i + block_i;
@@ -104,30 +105,37 @@ static void concat_2d_f32_transposed(unsigned int nth, unsigned int ith, void * 
         const bool has_next = np < cctx->nplanes;
         const uint32_t next_block_i = MIN(end_i - ni, block_i);
 
-        // spad1 is free after the gather sync, prefetch next src1 ahead of the dst write
+        // other spad1 slot is free since the previous gather sync
         if (has_next) {
             const dma_addr_t nsrc1_addr = concat_plane_addr(src1, np, div_ne2, ne2) + ni * src1->nb[1];
-            dma_queue_push(dma_q, dma_make_data(spad1_base, nsrc1_addr), spad1_stride, src1->nb[0], next_block_i * sizeof(float), src1_ne0);
+            dma_queue_push(dma_q, dma_make_data(spad1_base + (s ^ 1) * spad1_slot, nsrc1_addr), spad1_stride, src1->nb[0], next_block_i * sizeof(float), src1_ne0);
         }
 
-        dma_queue_pop(dma_q); // src0
-
-        const dma_addr_t dst_addr = concat_plane_addr(dst, p, div_ne2, ne2) + i * dst->nb[1];
-        dma_queue_push(dma_q, dma_make_data(dst_addr, spad0_base + src0_pre), dst->nb[1], spad0_row_bytes, (src0_ne0 + src1_ne0) * sizeof(float), current_block_i);
-
-        if (has_next) {
-            dma_queue_pop(dma_q); // next src1
+        htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) i);
+        for (uint32_t j = 0; j < src1_ne0; j += 32) {
+            const uint8_t * src_ptr = spad1 + j * spad1_stride;
+            uint8_t * dst_ptr = spad0 + src0_row_padded + j * sizeof(float);
+            hvx_transpose_32x32_w_gather(dst_ptr, spad0_row_bytes, src_ptr, spad1_stride, offsets, current_block_i, MIN(src1_ne0 - j, 32));
         }
-        dma_queue_pop(dma_q); // dst
+        hvx_gather_sync(spad0 + src0_row_padded);
+        htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) i);
 
-        // spad0 is free after the dst write
+        // other spad0 slot is free once dst[b-1] is written
+        if (dst_pending) {
+            dma_queue_pop(dma_q); // dst
+        }
         if (has_next) {
             const dma_addr_t nsrc0_addr = concat_plane_addr(src0, np, div_ne2, ne2) + ni * src0->nb[1];
-            dma_queue_push(dma_q, dma_make_data(spad0_base + src0_pre, nsrc0_addr), spad0_row_bytes, src0->nb[1], src0_row_bytes, next_block_i);
+            dma_queue_push(dma_q, dma_make_data(spad0_base + (s ^ 1) * spad0_slot + src0_pre, nsrc0_addr), spad0_row_bytes, src0->nb[1], src0_row_bytes, next_block_i);
         }
+
+        const dma_addr_t dst_addr = concat_plane_addr(dst, p, div_ne2, ne2) + i * dst->nb[1];
+        dma_queue_push(dma_q, dma_make_data(dst_addr, spad0 + src0_pre), dst->nb[1], spad0_row_bytes, (src0_ne0 + src1_ne0) * sizeof(float), current_block_i);
+        dst_pending = true;
 
         p = np;
         i = ni;
+        s ^= 1;
     }
     dma_queue_flush(dma_q);
 }
@@ -168,8 +176,14 @@ static void concat_2d_f16_transposed(unsigned int nth, unsigned int ith, void * 
     const struct fastdiv_values * div_ne2 = &cctx->div_ne2;
     const uint32_t ne2 = dst->ne[2];
 
+    // two slots per scratchpad: block b gathers in slot b&1 while dst[b-1] and src1[b+1] DMA in the other
+    const uint32_t spad0_slot = block_i * spad0_row_bytes;
+    const uint32_t spad1_slot = src1_ne0_padded * spad1_stride;
+
     uint32_t p = 0;
     uint32_t i = start_i;
+    uint32_t s = 0;
+    bool dst_pending = false;
 
     const dma_addr_t src1_addr = concat_plane_addr(src1, p, div_ne2, ne2) + i * src1->nb[1];
     dma_queue_push(dma_q, dma_make_data(spad1_base, src1_addr), spad1_stride, src1->nb[0], MIN(end_i - i, block_i) * sizeof(__fp16), src1_ne0);
@@ -177,19 +191,14 @@ static void concat_2d_f16_transposed(unsigned int nth, unsigned int ith, void * 
     const dma_addr_t src0_addr = concat_plane_addr(src0, p, div_ne2, ne2) + i * src0->nb[1];
     dma_queue_push(dma_q, dma_make_data(spad0_base + src0_pre, src0_addr), spad0_row_bytes, src0->nb[1], src0_row_bytes, MIN(end_i - i, block_i));
 
-    dma_queue_pop(dma_q); // src1
-
     while (p < cctx->nplanes) {
         const uint32_t current_block_i = MIN(end_i - i, block_i);
 
-        htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) i);
-        for (uint32_t j = 0; j < src1_ne0; j += 64) {
-            const uint8_t * src_ptr = spad1_base + j * spad1_stride;
-            uint8_t * dst_ptr = spad0_base + src0_row_padded + j * sizeof(__fp16);
-            hvx_transpose_64x64_h_gather(dst_ptr, spad0_row_bytes, src_ptr, spad1_stride, offsets, current_block_i, MIN(src1_ne0 - j, 64));
-        }
-        hvx_gather_sync(spad0_base + src0_row_padded);
-        htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) i);
+        uint8_t * spad0 = spad0_base + s * spad0_slot;
+        uint8_t * spad1 = spad1_base + s * spad1_slot;
+
+        dma_queue_pop(dma_q); // src1
+        dma_queue_pop(dma_q); // src0
 
         uint32_t np = p;
         uint32_t ni = i + block_i;
@@ -200,30 +209,37 @@ static void concat_2d_f16_transposed(unsigned int nth, unsigned int ith, void * 
         const bool has_next = np < cctx->nplanes;
         const uint32_t next_block_i = MIN(end_i - ni, block_i);
 
-        // spad1 is free after the gather sync, prefetch next src1 ahead of the dst write
+        // other spad1 slot is free since the previous gather sync
         if (has_next) {
             const dma_addr_t nsrc1_addr = concat_plane_addr(src1, np, div_ne2, ne2) + ni * src1->nb[1];
-            dma_queue_push(dma_q, dma_make_data(spad1_base, nsrc1_addr), spad1_stride, src1->nb[0], next_block_i * sizeof(__fp16), src1_ne0);
+            dma_queue_push(dma_q, dma_make_data(spad1_base + (s ^ 1) * spad1_slot, nsrc1_addr), spad1_stride, src1->nb[0], next_block_i * sizeof(__fp16), src1_ne0);
         }
 
-        dma_queue_pop(dma_q); // src0
-
-        const dma_addr_t dst_addr = concat_plane_addr(dst, p, div_ne2, ne2) + i * dst->nb[1];
-        dma_queue_push(dma_q, dma_make_data(dst_addr, spad0_base + src0_pre), dst->nb[1], spad0_row_bytes, (src0_ne0 + src1_ne0) * sizeof(__fp16), current_block_i);
-
-        if (has_next) {
-            dma_queue_pop(dma_q); // next src1
+        htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) i);
+        for (uint32_t j = 0; j < src1_ne0; j += 64) {
+            const uint8_t * src_ptr = spad1 + j * spad1_stride;
+            uint8_t * dst_ptr = spad0 + src0_row_padded + j * sizeof(__fp16);
+            hvx_transpose_64x64_h_gather(dst_ptr, spad0_row_bytes, src_ptr, spad1_stride, offsets, current_block_i, MIN(src1_ne0 - j, 64));
         }
-        dma_queue_pop(dma_q); // dst
+        hvx_gather_sync(spad0 + src0_row_padded);
+        htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) i);
 
-        // spad0 is free after the dst write
+        // other spad0 slot is free once dst[b-1] is written
+        if (dst_pending) {
+            dma_queue_pop(dma_q); // dst
+        }
         if (has_next) {
             const dma_addr_t nsrc0_addr = concat_plane_addr(src0, np, div_ne2, ne2) + ni * src0->nb[1];
-            dma_queue_push(dma_q, dma_make_data(spad0_base + src0_pre, nsrc0_addr), spad0_row_bytes, src0->nb[1], src0_row_bytes, next_block_i);
+            dma_queue_push(dma_q, dma_make_data(spad0_base + (s ^ 1) * spad0_slot + src0_pre, nsrc0_addr), spad0_row_bytes, src0->nb[1], src0_row_bytes, next_block_i);
         }
+
+        const dma_addr_t dst_addr = concat_plane_addr(dst, p, div_ne2, ne2) + i * dst->nb[1];
+        dma_queue_push(dma_q, dma_make_data(dst_addr, spad0 + src0_pre), dst->nb[1], spad0_row_bytes, (src0_ne0 + src1_ne0) * sizeof(__fp16), current_block_i);
+        dst_pending = true;
 
         p = np;
         i = ni;
+        s ^= 1;
     }
     dma_queue_flush(dma_q);
 }
