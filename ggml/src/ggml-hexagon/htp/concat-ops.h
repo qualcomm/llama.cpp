@@ -53,14 +53,16 @@ static inline void htp_concat_transposed_vtcm_layout_build(
     uint32_t type_size,
     uint32_t n_threads) {
 
-    uint32_t block_i = (type_size == 4) ? 64 : 128;
+    // src1_ne0 is processed in chunks of block_t tokens, so VTCM does not grow with the batch
+    uint32_t block_i = 128;
+    uint32_t block_t = (type_size == 4) ? 256 : 512;
     uint32_t spad1_stride = block_i * type_size;
-    uint32_t src1_ne0_padded = hex_round_up(src1_ne0, (type_size == 4) ? 32 : 64);
-    uint32_t spad0_row_bytes = hex_round_up(src0_ne0 * type_size, 128) + src1_ne0_padded * type_size;
+    uint32_t block_t_padded = MIN(hex_round_up(src1_ne0, (type_size == 4) ? 32 : 64), block_t);
+    uint32_t spad0_row_bytes = hex_round_up(src0_ne0 * type_size, 128) + block_t_padded * type_size;
 
     // double-buffered: two slots per thread
     L->src0_spad_size_per_thread = 2 * block_i * spad0_row_bytes;
-    L->src1_spad_size_per_thread = 2 * src1_ne0_padded * spad1_stride;
+    L->src1_spad_size_per_thread = 2 * block_t_padded * spad1_stride;
 
     size_t off = 0;
     VTCM_LAYOUT_ALLOC(off, off_spad0, (size_t) n_threads * L->src0_spad_size_per_thread);
