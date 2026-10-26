@@ -4211,7 +4211,7 @@ static void zero_skipped_dst_rows(
 
     if (octx->ctx->mdev.count > 1) {
         const bool can_split = htp_tensor_can_row_partition(dst, elem_size);
-        const uint32_t chunk_elems = 128 / elem_size;
+        const uint32_t chunk_elems = (dst->type == HTP_TYPE_F16) ? 64 : 32;
         const struct htp_tensor_mdev_range range = htp_tensor_mdev_partition(
             dst->ne[0], can_split ? chunk_elems : 0, octx->ctx->mdev.idx, octx->ctx->mdev.count, &octx->ctx->mdev.count_div);
         col_start = range.start;
