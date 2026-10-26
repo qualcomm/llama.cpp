@@ -3432,6 +3432,10 @@ static bool htp_kparams_conv2d_win(
         }
     }
 
+    if (hex_round_up((size_t) T * sizeof(uint32_t), 128) + 2 * hex_round_up((size_t) ct, 128) > HTP_DDR_SPAD_SIZE) {
+        return false;
+    }
+
     kp->kernel_type = HTP_CONV2D_KERNEL_HMX_WINDOW;
     kp->cwhn        = cwhn;
     kp->window.fold        = fold;
