@@ -2272,162 +2272,260 @@ int op_conv_2d(struct htp_ops_context * octx) {
     return HTP_STATUS_NO_SUPPORT;
 }
 
-struct conv2d_dw_context {
+static inline float vtcm_load_f32(const float * p) {
+    const HVX_Vector v = hvx_vmemu(p);
+    union { uint32_t u; float f; } val = { .u = (uint32_t) Q6_R_vextract_VR(v, 0) };
+    return val.f;
+}
+
+static inline void vtcm_store_f32(float * p, float val) {
+    hvx_vec_store_u(p, sizeof(float), hvx_vec_splat_f32(val));
+}
+
+static void conv2d_dw_plane_whcn_vtcm(
+    const float * in_plane, float * out_plane, const float * w_local, const struct htp_conv2d_dw_kernel_params * kp) {
+
+    for (uint32_t oh = 0; oh < kp->oh; ++oh) {
+        float * out_row = out_plane + (size_t)oh * kp->ow;
+
+        uint32_t ow = 0;
+        if (kp->s0 == 1 && kp->d0 == 1) {
+            while (ow < kp->ow && (int32_t)ow < kp->p0) {
+                float sum = 0.0f;
+                for (uint32_t kh = 0; kh < kp->kh; ++kh) {
+                    const int32_t ih = (int32_t)(oh * kp->s1 + kh * kp->d1) - kp->p1;
+                    if (ih < 0 || ih >= (int32_t)kp->h) {
+                        continue;
+                    }
+                    const float * in_row = in_plane + (size_t)ih * kp->w;
+                    for (uint32_t kw = 0; kw < kp->kw; ++kw) {
+                        const int32_t iw = (int32_t)(ow + kw) - kp->p0;
+                        if (iw >= 0 && iw < (int32_t)kp->w) {
+                            sum += w_local[kh * kp->kw + kw] * vtcm_load_f32(in_row + iw);
+                        }
+                    }
+                }
+                vtcm_store_f32(out_row + ow, sum);
+                ow++;
+            }
+
+            const int32_t max_safe_ow = (int32_t)kp->w + kp->p0 - (int32_t)kp->kw - 31;
+            for (; (int32_t)ow <= max_safe_ow && ow + 32 <= kp->ow; ow += 32) {
+                HVX_Vector acc = Q6_V_vzero();
+                for (uint32_t kh = 0; kh < kp->kh; ++kh) {
+                    const int32_t ih = (int32_t)(oh * kp->s1 + kh * kp->d1) - kp->p1;
+                    if (ih < 0 || ih >= (int32_t)kp->h) {
+                        continue;
+                    }
+                    const float * in_row = in_plane + (size_t)ih * kp->w;
+                    for (uint32_t kw = 0; kw < kp->kw; ++kw) {
+                        const int32_t iw0 = (int32_t)(ow + kw) - kp->p0;
+                        const HVX_Vector in_v = hvx_vmemu(in_row + iw0);
+                        const HVX_Vector w_v  = hvx_vec_splat_f32(w_local[kh * kp->kw + kw]);
+                        acc = hvx_vec_add_f32_f32(acc, hvx_vec_mul_f32_f32(in_v, w_v));
+                    }
+                }
+                *(HVX_UVector *)(out_row + ow) = acc;
+            }
+        }
+
+        for (; ow < kp->ow; ++ow) {
+            float sum = 0.0f;
+            for (uint32_t kh = 0; kh < kp->kh; ++kh) {
+                const int32_t ih = (int32_t)(oh * kp->s1 + kh * kp->d1) - kp->p1;
+                if (ih < 0 || ih >= (int32_t)kp->h) {
+                    continue;
+                }
+                const float * in_row = in_plane + (size_t)ih * kp->w;
+                for (uint32_t kw = 0; kw < kp->kw; ++kw) {
+                    const int32_t iw = (int32_t)(ow * kp->s0 + kw * kp->d0) - kp->p0;
+                    if (iw >= 0 && iw < (int32_t)kp->w) {
+                        sum += w_local[kh * kp->kw + kw] * vtcm_load_f32(in_row + iw);
+                    }
+                }
+            }
+            vtcm_store_f32(out_row + ow, sum);
+        }
+    }
+}
+
+static void conv2d_dw_compute_whcn_vtcm(
+    const float * in_vtcm,
+    float *       out_vtcm,
+    uint32_t      unit,
+    const struct htp_ops_context * octx,
+    const struct htp_conv2d_dw_kernel_params * kp) {
+
+    const struct htp_tensor * src0 = octx->src[0];
+    const bool is_f16              = (src0->type == HTP_TYPE_F16);
+
+    const uint32_t n = fastdiv(unit, &kp->div_c);
+    const uint32_t c = unit - n * kp->c;
+    const char * w_chan = (const char *) src0->data + (size_t) c * src0->nb[3];
+
+    float w_local[256];
+    for (uint32_t kh = 0; kh < kp->kh; ++kh) {
+        for (uint32_t kw = 0; kw < kp->kw; ++kw) {
+            const void * ptr = w_chan + (size_t) kh * src0->nb[1] + (size_t) kw * src0->nb[0];
+            w_local[kh * kp->kw + kw] = is_f16 ? (float)(*(const __fp16 *) ptr) : *(const float *) ptr;
+        }
+    }
+
+    conv2d_dw_plane_whcn_vtcm(in_vtcm, out_vtcm, w_local, kp);
+}
+
+static void conv2d_dw_compute_cwhn_vtcm(
+    const float * in_vtcm,
+    float *       out_vtcm,
+    uint32_t      unit,
+    const struct htp_ops_context * octx,
+    const struct htp_conv2d_dw_kernel_params * kp) {
+
+    (void) unit;
+    const struct htp_tensor * src0 = octx->src[0];
+    const bool is_f16              = (src0->type == HTP_TYPE_F16);
+
+    for (uint32_t oh = 0; oh < kp->oh; ++oh) {
+        for (uint32_t ow = 0; ow < kp->ow; ++ow) {
+            float * out_ptr = out_vtcm + ((size_t)oh * kp->ow + ow) * kp->c;
+
+            for (uint32_t cb = 0; cb < kp->c; cb += 32) {
+                const uint32_t rem = MIN(32, kp->c - cb);
+                HVX_Vector acc = Q6_V_vzero();
+
+                for (uint32_t kh = 0; kh < kp->kh; ++kh) {
+                    const int32_t ih = (int32_t)(oh * kp->s1 + kh * kp->d1) - kp->p1;
+                    if (ih < 0 || ih >= (int32_t)kp->h) {
+                        continue;
+                    }
+                    for (uint32_t kw = 0; kw < kp->kw; ++kw) {
+                        const int32_t iw = (int32_t)(ow * kp->s0 + kw * kp->d0) - kp->p0;
+                        if (iw < 0 || iw >= (int32_t)kp->w) {
+                            continue;
+                        }
+
+                        const float * in_ptr = in_vtcm + ((size_t)ih * kp->w + iw) * kp->c + cb;
+                        const char *  w_ptr  = (const char *)src0->data + (size_t)kh * src0->nb[1] + (size_t)kw * src0->nb[0] + (size_t)cb * src0->nb[3];
+
+                        HVX_Vector v_in = hvx_vmemu(in_ptr);
+                        HVX_Vector v_w;
+                        if (is_f16) {
+                            HVX_Vector v_w16 = hvx_vmemu(w_ptr);
+                            HVX_VectorPair pr = hvx_vec_f16_to_f32(v_w16);
+                            v_w = Q6_V_lo_W(pr);
+                        } else {
+                            v_w = hvx_vmemu(w_ptr);
+                        }
+                        acc = hvx_vec_add_f32_f32(acc, hvx_vec_mul_f32_f32(v_in, v_w));
+                    }
+                }
+
+                if (rem == 32) {
+                    *(HVX_UVector *)(out_ptr + cb) = acc;
+                } else {
+                    hvx_vec_store_u(out_ptr + cb, rem * sizeof(float), acc);
+                }
+            }
+        }
+    }
+}
+
+typedef void (*conv2d_dw_compute_fn_t)(
+    const float * in_vtcm,
+    float *       out_vtcm,
+    uint32_t      unit,
+    const struct htp_ops_context * octx,
+    const struct htp_conv2d_dw_kernel_params * kp);
+
+struct conv2d_dw_dma_context {
     struct htp_ops_context *                   octx;
     const struct htp_conv2d_dw_kernel_params * kp;
-    uint32_t                                   task_start;
-    uint32_t                                   task_count;
-    uint32_t                                   tasks_per_thread;
+    struct htp_conv2d_dw_vtcm_layout           layout;
+    conv2d_dw_compute_fn_t                     compute_fn;
+    uint32_t                                   unit_start;
+    uint32_t                                   unit_count;
+    uint32_t                                   units_per_thread;
 };
 
-static void conv2d_dw_thread(unsigned int nth, unsigned int ith, void * data) {
-    const struct conv2d_dw_context * ctx = (const struct conv2d_dw_context *) data;
-    const struct htp_ops_context * octx  = ctx->octx;
+static void conv2d_dw_dma_thread(unsigned int nth, unsigned int ith, void * data) {
+    const struct conv2d_dw_dma_context * ctx  = (const struct conv2d_dw_dma_context *) data;
+    const struct htp_ops_context * octx       = ctx->octx;
     const struct htp_conv2d_dw_kernel_params * kp = ctx->kp;
-    const struct htp_tensor * src0       = octx->src[0];
-    const struct htp_tensor * src1       = octx->src[1];
-    const struct htp_tensor * dst        = octx->dst;
+    const struct htp_conv2d_dw_vtcm_layout * L = &ctx->layout;
+    const struct htp_tensor * src1            = octx->src[1];
+    const struct htp_tensor * dst             = octx->dst;
+    conv2d_dw_compute_fn_t compute_fn         = ctx->compute_fn;
 
-    const bool is_f16 = (src0->type == HTP_TYPE_F16);
-
-    const uint32_t t0 = ctx->task_start + ith * ctx->tasks_per_thread;
-    const uint32_t t1 = MIN(t0 + ctx->tasks_per_thread, ctx->task_start + ctx->task_count);
-    if (t0 >= t1) {
+    const uint32_t first = ctx->unit_start + ith * ctx->units_per_thread;
+    const uint32_t last  = MIN(first + ctx->units_per_thread, ctx->unit_start + ctx->unit_count);
+    if (first >= last) {
         return;
     }
 
     (void) nth;
 
-    if (kp->cwhn) {
-        // CWHN: channels are contiguous
-        for (uint32_t t = t0; t < t1; ++t) {
-            const uint32_t n  = fastdiv(t, &kp->div_oh);
-            const uint32_t oh = t - n * kp->oh;
+    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    dma_queue * dma_q = octx->ctx->dma[ith];
 
-            for (uint32_t ow = 0; ow < kp->ow; ++ow) {
-                float * out_ptr = (float *)((char *)dst->data + (size_t)n * dst->nb[3] + (size_t)oh * dst->nb[1] + (size_t)ow * dst->nb[0]);
+    const uint32_t src_unit_bytes = L->src_unit_bytes;
+    const uint32_t dst_unit_bytes = L->dst_unit_bytes;
+    const uint32_t src_spad_half  = (uint32_t) L->src_spad_half_size;
+    const uint32_t dst_spad_half  = (uint32_t) L->dst_spad_half_size;
 
-                for (uint32_t cb = 0; cb < kp->c; cb += 32) {
-                    const uint32_t rem = MIN(32, kp->c - cb);
-                    HVX_Vector acc = Q6_V_vzero();
+    uint8_t * vtcm_base = (uint8_t *) octx->ctx->vtcm_base;
+    uint8_t * src_spad  = VTCM_LAYOUT_PTR(uint8_t, vtcm_base, L->off_src) + ith * L->src_bytes_per_thread;
+    uint8_t * dst_spad  = VTCM_LAYOUT_PTR(uint8_t, vtcm_base, L->off_dst) + ith * L->dst_bytes_per_thread;
 
-                    for (uint32_t kh = 0; kh < kp->kh; ++kh) {
-                        const int32_t ih = (int32_t)(oh * kp->s1 + kh * kp->d1) - kp->p1;
-                        if (ih < 0 || ih >= (int32_t)kp->h) {
-                            continue;
-                        }
-                        for (uint32_t kw = 0; kw < kp->kw; ++kw) {
-                            const int32_t iw = (int32_t)(ow * kp->s0 + kw * kp->d0) - kp->p0;
-                            if (iw < 0 || iw >= (int32_t)kp->w) {
-                                continue;
-                            }
+    float * srcb2[2] = { (float *) src_spad, (float *) (src_spad + src_spad_half) };
+    float * dstb2[2] = { (float *) dst_spad, (float *) (dst_spad + dst_spad_half) };
 
-                            const char * in_ptr = (const char *)src1->data + (size_t)n * src1->nb[3] + (size_t)ih * src1->nb[1] + (size_t)iw * src1->nb[0] + (size_t)cb * src1->nb[2];
-                            const char * w_ptr  = (const char *)src0->data + (size_t)kh * src0->nb[1] + (size_t)kw * src0->nb[0] + (size_t)cb * src0->nb[3];
+    const uint32_t total = last - first;
 
-                            HVX_Vector v_in = *(const HVX_UVector *)in_ptr;
-                            HVX_Vector v_w;
-                            if (is_f16) {
-                                HVX_Vector v_w16 = *(const HVX_UVector *)w_ptr;
-                                HVX_VectorPair pr = hvx_vec_f16_to_f32(v_w16);
-                                v_w = Q6_V_lo_W(pr);
-                            } else {
-                                v_w = *(const HVX_UVector *)w_ptr;
-                            }
-                            acc = hvx_vec_add_f32_f32(acc, hvx_vec_mul_f32_f32(v_in, v_w));
-                        }
-                    }
+    for (uint32_t i = 0; i < total && i < 2; ++i) {
+        dma_queue_push(dma_q,
+                       dma_make_data(dst->data, dstb2[i]),
+                       dst_unit_bytes, dst_spad_half,
+                       dst_unit_bytes, 0);
 
-                    if (rem == 32) {
-                        *(HVX_UVector *)(out_ptr + cb) = acc;
-                    } else {
-                        hvx_vec_store_u(out_ptr + cb, rem * sizeof(float), acc);
-                    }
-                }
-            }
-        }
-    } else {
-        // WHCN: width is contiguous
-        for (uint32_t t = t0; t < t1; ++t) {
-            const uint32_t n = fastdiv(t, &kp->div_c);
-            const uint32_t c = t - n * kp->c;
+        const dma_addr_t src_addr = (dma_addr_t) ((const char *)src1->data + (size_t)(first + i) * src_unit_bytes);
+        dma_queue_push(dma_q,
+                       dma_make_data(srcb2[i], src_addr),
+                       src_spad_half, src_unit_bytes,
+                       src_unit_bytes, 1);
+    }
 
-            const char * in_plane  = (const char *)src1->data + (size_t)n * src1->nb[3] + (size_t)c * src1->nb[2];
-            char *       out_plane = (char *)dst->data + (size_t)n * dst->nb[3] + (size_t)c * dst->nb[2];
-            const char * w_chan    = (const char *)src0->data + (size_t)c * src0->nb[3];
+    for (uint32_t i = 0; i < total; ++i) {
+        const uint32_t unit = first + i;
+        const uint32_t buf  = i & 1u;
+        float * srcb = srcb2[buf];
+        float * dstb = dstb2[buf];
 
-            float w_local[256];
-            for (uint32_t kh = 0; kh < kp->kh; ++kh) {
-                for (uint32_t kw = 0; kw < kp->kw; ++kw) {
-                    const void * ptr = w_chan + (size_t)kh * src0->nb[1] + (size_t)kw * src0->nb[0];
-                    w_local[kh * kp->kw + kw] = is_f16 ? (float)(*(const __fp16 *)ptr) : *(const float *)ptr;
-                }
-            }
+        dma_queue_pop(dma_q);
+        dma_queue_pop(dma_q);
 
-            for (uint32_t oh = 0; oh < kp->oh; ++oh) {
-                float * out_row = (float *)(out_plane + (size_t)oh * dst->nb[1]);
+        htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) unit);
+        compute_fn(srcb, dstb, unit, octx, kp);
+        htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) unit);
 
-                uint32_t ow = 0;
-                if (kp->s0 == 1 && kp->d0 == 1) {
-                    while (ow < kp->ow && (int32_t)ow < kp->p0) {
-                        float sum = 0.0f;
-                        for (uint32_t kh = 0; kh < kp->kh; ++kh) {
-                            const int32_t ih = (int32_t)(oh * kp->s1 + kh * kp->d1) - kp->p1;
-                            if (ih < 0 || ih >= (int32_t)kp->h) {
-                                continue;
-                            }
-                            const float * in_row = (const float *)(in_plane + (size_t)ih * src1->nb[1]);
-                            for (uint32_t kw = 0; kw < kp->kw; ++kw) {
-                                const int32_t iw = (int32_t)(ow + kw) - kp->p0;
-                                if (iw >= 0 && iw < (int32_t)kp->w) {
-                                    sum += w_local[kh * kp->kw + kw] * in_row[iw];
-                                }
-                            }
-                        }
-                        out_row[ow++] = sum;
-                    }
+        const dma_addr_t dst_addr = (dma_addr_t) ((char *)dst->data + (size_t)unit * dst_unit_bytes);
+        dma_queue_push(dma_q,
+                       dma_make_data(dst_addr, dstb),
+                       dst_unit_bytes, dst_spad_half,
+                       dst_unit_bytes, 1);
 
-                    const int32_t max_safe_ow = (int32_t)kp->w + kp->p0 - (int32_t)kp->kw - 31;
-                    for (; (int32_t)ow <= max_safe_ow && ow + 32 <= kp->ow; ow += 32) {
-                        HVX_Vector acc = Q6_V_vzero();
-                        for (uint32_t kh = 0; kh < kp->kh; ++kh) {
-                            const int32_t ih = (int32_t)(oh * kp->s1 + kh * kp->d1) - kp->p1;
-                            if (ih < 0 || ih >= (int32_t)kp->h) {
-                                continue;
-                            }
-                            const float * in_row = (const float *)(in_plane + (size_t)ih * src1->nb[1]);
-                            for (uint32_t kw = 0; kw < kp->kw; ++kw) {
-                                const int32_t iw0 = (int32_t)(ow + kw) - kp->p0;
-                                const HVX_Vector in_v = hvx_vmemu(in_row + iw0);
-                                const HVX_Vector w_v  = hvx_vec_splat_f32(w_local[kh * kp->kw + kw]);
-                                acc = hvx_vec_add_f32_f32(acc, hvx_vec_mul_f32_f32(in_v, w_v));
-                            }
-                        }
-                        *(HVX_UVector *)(out_row + ow) = acc;
-                    }
-                }
-
-                for (; ow < kp->ow; ++ow) {
-                    float sum = 0.0f;
-                    for (uint32_t kh = 0; kh < kp->kh; ++kh) {
-                        const int32_t ih = (int32_t)(oh * kp->s1 + kh * kp->d1) - kp->p1;
-                        if (ih < 0 || ih >= (int32_t)kp->h) {
-                            continue;
-                        }
-                        const float * in_row = (const float *)(in_plane + (size_t)ih * src1->nb[1]);
-                        for (uint32_t kw = 0; kw < kp->kw; ++kw) {
-                            const int32_t iw = (int32_t)(ow * kp->s0 + kw * kp->d0) - kp->p0;
-                            if (iw < 0 || iw >= (int32_t)kp->w) {
-                                continue;
-                            }
-                            sum += w_local[kh * kp->kw + kw] * in_row[iw];
-                        }
-                    }
-                    out_row[ow] = sum;
-                }
-            }
+        if (i + 2 < total) {
+            const dma_addr_t next_src_addr = (dma_addr_t) ((const char *)src1->data + (size_t)(unit + 2) * src_unit_bytes);
+            dma_queue_push(dma_q,
+                           dma_make_data(srcb, next_src_addr),
+                           src_spad_half, src_unit_bytes,
+                           src_unit_bytes, 1);
         }
     }
+
+    dma_queue_flush(dma_q);
+
+    FARF(HIGH, "conv2d_dw-f32-dma %d/%d: %ux%ux%ux%u -> %ux%ux%ux%u (%u:%u)\n",
+         ith, nth, kp->w, kp->h, kp->c, kp->n, kp->ow, kp->oh, kp->c, kp->n, first, last);
 }
 
 int op_conv_2d_dw(struct htp_ops_context * octx) {
@@ -2438,29 +2536,41 @@ int op_conv_2d_dw(struct htp_ops_context * octx) {
         return HTP_STATUS_OK;
     }
 
-    uint32_t task_start = 0;
-    uint32_t task_count = kp->total_tasks;
+    const uint32_t src_unit_bytes = kp->cwhn
+        ? (kp->w * kp->h * kp->c * (uint32_t) sizeof(float))
+        : (kp->w * kp->h * (uint32_t) sizeof(float));
+    const uint32_t dst_unit_bytes = kp->cwhn
+        ? (kp->ow * kp->oh * kp->c * (uint32_t) sizeof(float))
+        : (kp->ow * kp->oh * (uint32_t) sizeof(float));
+
+    struct htp_conv2d_dw_vtcm_layout layout;
+    htp_conv2d_dw_vtcm_layout_build(&layout, src_unit_bytes, dst_unit_bytes, kp->n_threads);
+
+    uint32_t unit_start = 0;
+    uint32_t unit_count = kp->total_tasks;
     if (octx->ctx->mdev.count > 1) {
         const struct htp_tensor_mdev_range range = htp_tensor_mdev_partition(
-            task_count, 1, octx->ctx->mdev.idx, octx->ctx->mdev.count, &octx->ctx->mdev.count_div);
-        task_start = range.start;
-        task_count = range.count;
+            unit_count, 1, octx->ctx->mdev.idx, octx->ctx->mdev.count, &octx->ctx->mdev.count_div);
+        unit_start = range.start;
+        unit_count = range.count;
     }
-    if (task_count == 0) {
+    if (unit_count == 0) {
         return HTP_STATUS_OK;
     }
 
-    const uint32_t nth = MIN(kp->n_threads, task_count);
-    const uint32_t tasks_per_thread = (task_count + nth - 1) / nth;
+    const uint32_t nth = MIN(kp->n_threads, unit_count);
+    const uint32_t units_per_thread = (unit_count + nth - 1) / nth;
 
-    struct conv2d_dw_context ctx = {
+    struct conv2d_dw_dma_context ctx = {
         .octx             = octx,
         .kp               = kp,
-        .task_start       = task_start,
-        .task_count       = task_count,
-        .tasks_per_thread = tasks_per_thread,
+        .layout           = layout,
+        .compute_fn       = kp->cwhn ? conv2d_dw_compute_cwhn_vtcm : conv2d_dw_compute_whcn_vtcm,
+        .unit_start       = unit_start,
+        .unit_count       = unit_count,
+        .units_per_thread = units_per_thread,
     };
 
-    work_queue_run(octx->ctx->work_queue, conv2d_dw_thread, &ctx, nth);
+    work_queue_run(octx->ctx->work_queue, conv2d_dw_dma_thread, &ctx, nth);
     return HTP_STATUS_OK;
 }

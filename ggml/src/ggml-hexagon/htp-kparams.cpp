@@ -3710,11 +3710,32 @@ static bool htp_kparams_solve_conv2d_dw(
 
     const uint32_t c = (uint32_t) src1->ne[2];
     const uint32_t n = (uint32_t) src1->ne[3];
-    const uint32_t total_tasks = cwhn ? (uint32_t) (oh * n) : (uint32_t) (c * n);
+    const uint32_t total_tasks = cwhn ? n : (uint32_t) (c * n);
+
+    uint32_t n_threads = total_tasks == 0 ? 1 : (std::min)((uint32_t) htp_session_n_threads(sess), total_tasks);
+
+    const uint32_t src_unit_bytes = cwhn
+        ? ((uint32_t)src1->ne[0] * (uint32_t)src1->ne[1] * c * (uint32_t)sizeof(float))
+        : ((uint32_t)src1->ne[0] * (uint32_t)src1->ne[1] * (uint32_t)sizeof(float));
+    const uint32_t dst_unit_bytes = cwhn
+        ? ((uint32_t)ow * (uint32_t)oh * c * (uint32_t)sizeof(float))
+        : ((uint32_t)ow * (uint32_t)oh * (uint32_t)sizeof(float));
+
+    struct htp_conv2d_dw_vtcm_layout layout;
+    htp_conv2d_dw_vtcm_layout_build(&layout, src_unit_bytes, dst_unit_bytes, n_threads);
+    const size_t vtcm_budget = (sess && htp_session_vtcm_size(sess) > 0) ? htp_session_vtcm_size(sess) : 0;
+    while (layout.total_bytes > vtcm_budget && n_threads > 1) {
+        n_threads--;
+        htp_conv2d_dw_vtcm_layout_build(&layout, src_unit_bytes, dst_unit_bytes, n_threads);
+    }
+    if (layout.total_bytes > vtcm_budget || layout.total_bytes == 0) {
+        return false;
+    }
 
     kparams->total_tasks = total_tasks;
-    kparams->n_threads   = total_tasks == 0 ? 1 : (std::min)((uint32_t) htp_session_n_threads(sess), total_tasks);
+    kparams->n_threads   = n_threads;
     kparams->cwhn        = cwhn ? 1 : 0;
+    kparams->vtcm_size   = (uint32_t) layout.total_bytes;
     kparams->w           = (uint32_t) src1->ne[0];
     kparams->h           = (uint32_t) src1->ne[1];
     kparams->c           = c;
