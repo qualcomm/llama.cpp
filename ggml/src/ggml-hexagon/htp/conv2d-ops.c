@@ -2282,11 +2282,96 @@ static inline void vtcm_store_f32(float * p, float val) {
     hvx_vec_store_u(p, sizeof(float), hvx_vec_splat_f32(val));
 }
 
-static void conv2d_dw_plane_whcn_vtcm(
-    const float * in_plane, float * out_plane, const float * w_local, const struct htp_conv2d_dw_kernel_params * kp) {
+struct conv2d_dw_task_slice {
+    dma_addr_t src_addr;
+    dma_addr_t dst_addr;
+    uint32_t   src_bytes;
+    uint32_t   dst_bytes;
+    uint32_t   oh_start;
+    uint32_t   oh_len;
+    int32_t    ih_first;
+    uint32_t   c;
+};
 
-    for (uint32_t oh = 0; oh < kp->oh; ++oh) {
-        float * out_row = out_plane + (size_t)oh * kp->ow;
+static inline void conv2d_dw_get_slice(
+    struct conv2d_dw_task_slice * slice,
+    uint32_t task,
+    const struct htp_tensor * src1,
+    const struct htp_tensor * dst,
+    const struct htp_conv2d_dw_kernel_params * kp) {
+
+    uint32_t chunk_idx;
+    uint32_t n;
+    uint32_t c = 0;
+
+    if (kp->cwhn) {
+        n = fastdiv(task, &kp->div_n_chunks);
+        chunk_idx = task - n * kp->n_chunks;
+    } else {
+        const uint32_t plane = fastdiv(task, &kp->div_n_chunks);
+        chunk_idx = task - plane * kp->n_chunks;
+        n = fastdiv(plane, &kp->div_c);
+        c = plane - n * kp->c;
+    }
+
+    const uint32_t oh_start = chunk_idx * kp->oh_chunk;
+    const uint32_t oh_len   = MIN(kp->oh_chunk, kp->oh - oh_start);
+
+    const int32_t ih_min = (int32_t)(oh_start * kp->s1) - kp->p1;
+    const int32_t ih_max = (int32_t)((oh_start + oh_len - 1) * kp->s1 + (kp->kh - 1) * kp->d1) - kp->p1;
+
+    const int32_t ih_first = MAX(0, ih_min);
+    const int32_t ih_last  = MIN((int32_t)kp->h - 1, ih_max);
+    const uint32_t ih_count = (ih_first <= ih_last) ? (uint32_t)(ih_last - ih_first + 1) : 0;
+
+    slice->oh_start = oh_start;
+    slice->oh_len   = oh_len;
+    slice->ih_first = ih_first;
+    slice->c        = c;
+
+    if (kp->cwhn) {
+        const uint32_t row_src_bytes = kp->w * kp->c * (uint32_t) sizeof(float);
+        const uint32_t row_dst_bytes = kp->ow * kp->c * (uint32_t) sizeof(float);
+
+        slice->src_bytes = ih_count * row_src_bytes;
+        slice->dst_bytes = oh_len * row_dst_bytes;
+
+        slice->src_addr = (dma_addr_t)((const char *)src1->data + (size_t)n * src1->nb[3] + (size_t)ih_first * src1->nb[1]);
+        slice->dst_addr = (dma_addr_t)((char *)dst->data + (size_t)n * dst->nb[3] + (size_t)oh_start * dst->nb[1]);
+    } else {
+        const uint32_t row_src_bytes = kp->w * (uint32_t) sizeof(float);
+        const uint32_t row_dst_bytes = kp->ow * (uint32_t) sizeof(float);
+
+        slice->src_bytes = ih_count * row_src_bytes;
+        slice->dst_bytes = oh_len * row_dst_bytes;
+
+        slice->src_addr = (dma_addr_t)((const char *)src1->data + (size_t)n * src1->nb[3] + (size_t)c * src1->nb[2] + (size_t)ih_first * src1->nb[1]);
+        slice->dst_addr = (dma_addr_t)((char *)dst->data + (size_t)n * dst->nb[3] + (size_t)c * dst->nb[2] + (size_t)oh_start * dst->nb[1]);
+    }
+}
+
+static void conv2d_dw_compute_whcn_vtcm(
+    const float * in_vtcm,
+    float *       out_vtcm,
+    const struct conv2d_dw_task_slice * slice,
+    const struct htp_ops_context * octx,
+    const struct htp_conv2d_dw_kernel_params * kp) {
+
+    const struct htp_tensor * src0 = octx->src[0];
+    const bool is_f16              = (src0->type == HTP_TYPE_F16);
+    const char * w_chan            = (const char *) src0->data + (size_t) slice->c * src0->nb[3];
+
+    float w_local[256];
+    for (uint32_t kh = 0; kh < kp->kh; ++kh) {
+        for (uint32_t kw = 0; kw < kp->kw; ++kw) {
+            const void * ptr = w_chan + (size_t) kh * src0->nb[1] + (size_t) kw * src0->nb[0];
+            w_local[kh * kp->kw + kw] = is_f16 ? (float)(*(const __fp16 *) ptr) : *(const float *) ptr;
+        }
+    }
+
+    for (uint32_t ohi = 0; ohi < slice->oh_len; ++ohi) {
+        const uint32_t oh = slice->oh_start + ohi;
+        float * out_row = out_vtcm + (size_t)ohi * kp->ow;
 
         uint32_t ow = 0;
         if (kp->s0 == 1 && kp->d0 == 1) {
@@ -2297,7 +2382,8 @@ static void conv2d_dw_plane_whcn_vtcm(
                     if (ih < 0 || ih >= (int32_t)kp->h) {
                         continue;
                     }
-                    const float * in_row = in_plane + (size_t)ih * kp->w;
+                    const int32_t ih_local = ih - slice->ih_first;
+                    const float * in_row = in_vtcm + (size_t)ih_local * kp->w;
                     for (uint32_t kw = 0; kw < kp->kw; ++kw) {
                         const int32_t iw = (int32_t)(ow + kw) - kp->p0;
                         if (iw >= 0 && iw < (int32_t)kp->w) {
@@ -2317,7 +2403,8 @@ static void conv2d_dw_plane_whcn_vtcm(
                     if (ih < 0 || ih >= (int32_t)kp->h) {
                         continue;
                     }
-                    const float * in_row = in_plane + (size_t)ih * kp->w;
+                    const int32_t ih_local = ih - slice->ih_first;
+                    const float * in_row = in_vtcm + (size_t)ih_local * kp->w;
                     for (uint32_t kw = 0; kw < kp->kw; ++kw) {
                         const int32_t iw0 = (int32_t)(ow + kw) - kp->p0;
                         const HVX_Vector in_v = hvx_vmemu(in_row + iw0);
@@ -2336,7 +2423,8 @@ static void conv2d_dw_plane_whcn_vtcm(
                 if (ih < 0 || ih >= (int32_t)kp->h) {
                     continue;
                 }
-                const float * in_row = in_plane + (size_t)ih * kp->w;
+                const int32_t ih_local = ih - slice->ih_first;
+                const float * in_row = in_vtcm + (size_t)ih_local * kp->w;
                 for (uint32_t kw = 0; kw < kp->kw; ++kw) {
                     const int32_t iw = (int32_t)(ow * kp->s0 + kw * kp->d0) - kp->p0;
                     if (iw >= 0 && iw < (int32_t)kp->w) {
@@ -2349,45 +2437,20 @@ static void conv2d_dw_plane_whcn_vtcm(
     }
 }
 
-static void conv2d_dw_compute_whcn_vtcm(
-    const float * in_vtcm,
-    float *       out_vtcm,
-    uint32_t      unit,
-    const struct htp_ops_context * octx,
-    const struct htp_conv2d_dw_kernel_params * kp) {
-
-    const struct htp_tensor * src0 = octx->src[0];
-    const bool is_f16              = (src0->type == HTP_TYPE_F16);
-
-    const uint32_t n = fastdiv(unit, &kp->div_c);
-    const uint32_t c = unit - n * kp->c;
-    const char * w_chan = (const char *) src0->data + (size_t) c * src0->nb[3];
-
-    float w_local[256];
-    for (uint32_t kh = 0; kh < kp->kh; ++kh) {
-        for (uint32_t kw = 0; kw < kp->kw; ++kw) {
-            const void * ptr = w_chan + (size_t) kh * src0->nb[1] + (size_t) kw * src0->nb[0];
-            w_local[kh * kp->kw + kw] = is_f16 ? (float)(*(const __fp16 *) ptr) : *(const float *) ptr;
-        }
-    }
-
-    conv2d_dw_plane_whcn_vtcm(in_vtcm, out_vtcm, w_local, kp);
-}
-
 static void conv2d_dw_compute_cwhn_vtcm(
     const float * in_vtcm,
     float *       out_vtcm,
-    uint32_t      unit,
+    const struct conv2d_dw_task_slice * slice,
     const struct htp_ops_context * octx,
     const struct htp_conv2d_dw_kernel_params * kp) {
 
-    (void) unit;
     const struct htp_tensor * src0 = octx->src[0];
     const bool is_f16              = (src0->type == HTP_TYPE_F16);
 
-    for (uint32_t oh = 0; oh < kp->oh; ++oh) {
+    for (uint32_t ohi = 0; ohi < slice->oh_len; ++ohi) {
+        const uint32_t oh = slice->oh_start + ohi;
         for (uint32_t ow = 0; ow < kp->ow; ++ow) {
-            float * out_ptr = out_vtcm + ((size_t)oh * kp->ow + ow) * kp->c;
+            float * out_ptr = out_vtcm + ((size_t)ohi * kp->ow + ow) * kp->c;
 
             for (uint32_t cb = 0; cb < kp->c; cb += 32) {
                 const uint32_t rem = MIN(32, kp->c - cb);
@@ -2398,13 +2461,14 @@ static void conv2d_dw_compute_cwhn_vtcm(
                     if (ih < 0 || ih >= (int32_t)kp->h) {
                         continue;
                     }
+                    const int32_t ih_local = ih - slice->ih_first;
                     for (uint32_t kw = 0; kw < kp->kw; ++kw) {
                         const int32_t iw = (int32_t)(ow * kp->s0 + kw * kp->d0) - kp->p0;
                         if (iw < 0 || iw >= (int32_t)kp->w) {
                             continue;
                         }
 
-                        const float * in_ptr = in_vtcm + ((size_t)ih * kp->w + iw) * kp->c + cb;
+                        const float * in_ptr = in_vtcm + ((size_t)ih_local * kp->w + iw) * kp->c + cb;
                         const char *  w_ptr  = (const char *)src0->data + (size_t)kh * src0->nb[1] + (size_t)kw * src0->nb[0] + (size_t)cb * src0->nb[3];
 
                         HVX_Vector v_in = hvx_vmemu(in_ptr);
@@ -2433,7 +2497,7 @@ static void conv2d_dw_compute_cwhn_vtcm(
 typedef void (*conv2d_dw_compute_fn_t)(
     const float * in_vtcm,
     float *       out_vtcm,
-    uint32_t      unit,
+    const struct conv2d_dw_task_slice * slice,
     const struct htp_ops_context * octx,
     const struct htp_conv2d_dw_kernel_params * kp);
 
@@ -2442,9 +2506,9 @@ struct conv2d_dw_dma_context {
     const struct htp_conv2d_dw_kernel_params * kp;
     struct htp_conv2d_dw_vtcm_layout           layout;
     conv2d_dw_compute_fn_t                     compute_fn;
-    uint32_t                                   unit_start;
-    uint32_t                                   unit_count;
-    uint32_t                                   units_per_thread;
+    uint32_t                                   task_start;
+    uint32_t                                   task_count;
+    uint32_t                                   tasks_per_thread;
 };
 
 static void conv2d_dw_dma_thread(unsigned int nth, unsigned int ith, void * data) {
@@ -2456,8 +2520,8 @@ static void conv2d_dw_dma_thread(unsigned int nth, unsigned int ith, void * data
     const struct htp_tensor * dst             = octx->dst;
     conv2d_dw_compute_fn_t compute_fn         = ctx->compute_fn;
 
-    const uint32_t first = ctx->unit_start + ith * ctx->units_per_thread;
-    const uint32_t last  = MIN(first + ctx->units_per_thread, ctx->unit_start + ctx->unit_count);
+    const uint32_t first = ctx->task_start + ith * ctx->tasks_per_thread;
+    const uint32_t last  = MIN(first + ctx->tasks_per_thread, ctx->task_start + ctx->task_count);
     if (first >= last) {
         return;
     }
@@ -2467,10 +2531,8 @@ static void conv2d_dw_dma_thread(unsigned int nth, unsigned int ith, void * data
     struct htp_thread_trace * tr = &octx->ctx->trace[ith];
     dma_queue * dma_q = octx->ctx->dma[ith];
 
-    const uint32_t src_unit_bytes = L->src_unit_bytes;
-    const uint32_t dst_unit_bytes = L->dst_unit_bytes;
-    const uint32_t src_spad_half  = (uint32_t) L->src_spad_half_size;
-    const uint32_t dst_spad_half  = (uint32_t) L->dst_spad_half_size;
+    const uint32_t src_spad_half = (uint32_t) L->src_spad_half_size;
+    const uint32_t dst_spad_half = (uint32_t) L->dst_spad_half_size;
 
     uint8_t * vtcm_base = (uint8_t *) octx->ctx->vtcm_base;
     uint8_t * src_spad  = VTCM_LAYOUT_PTR(uint8_t, vtcm_base, L->off_src) + ith * L->src_bytes_per_thread;
@@ -2482,20 +2544,22 @@ static void conv2d_dw_dma_thread(unsigned int nth, unsigned int ith, void * data
     const uint32_t total = last - first;
 
     for (uint32_t i = 0; i < total && i < 2; ++i) {
+        struct conv2d_dw_task_slice sl;
+        conv2d_dw_get_slice(&sl, first + i, src1, dst, kp);
+
         dma_queue_push(dma_q,
                        dma_make_data(dst->data, dstb2[i]),
-                       dst_unit_bytes, dst_spad_half,
-                       dst_unit_bytes, 0);
+                       sl.dst_bytes, dst_spad_half,
+                       sl.dst_bytes, 0);
 
-        const dma_addr_t src_addr = (dma_addr_t) ((const char *)src1->data + (size_t)(first + i) * src_unit_bytes);
         dma_queue_push(dma_q,
-                       dma_make_data(srcb2[i], src_addr),
-                       src_spad_half, src_unit_bytes,
-                       src_unit_bytes, 1);
+                       dma_make_data(srcb2[i], sl.src_addr),
+                       src_spad_half, sl.src_bytes,
+                       sl.src_bytes, sl.src_bytes > 0 ? 1 : 0);
     }
 
     for (uint32_t i = 0; i < total; ++i) {
-        const uint32_t unit = first + i;
+        const uint32_t task = first + i;
         const uint32_t buf  = i & 1u;
         float * srcb = srcb2[buf];
         float * dstb = dstb2[buf];
@@ -2503,22 +2567,26 @@ static void conv2d_dw_dma_thread(unsigned int nth, unsigned int ith, void * data
         dma_queue_pop(dma_q);
         dma_queue_pop(dma_q);
 
-        htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) unit);
-        compute_fn(srcb, dstb, unit, octx, kp);
-        htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) unit);
+        struct conv2d_dw_task_slice sl;
+        conv2d_dw_get_slice(&sl, task, src1, dst, kp);
 
-        const dma_addr_t dst_addr = (dma_addr_t) ((char *)dst->data + (size_t)unit * dst_unit_bytes);
+        htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) task);
+        compute_fn(srcb, dstb, &sl, octx, kp);
+        htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) task);
+
         dma_queue_push(dma_q,
-                       dma_make_data(dst_addr, dstb),
-                       dst_unit_bytes, dst_spad_half,
-                       dst_unit_bytes, 1);
+                       dma_make_data(sl.dst_addr, dstb),
+                       sl.dst_bytes, dst_spad_half,
+                       sl.dst_bytes, sl.dst_bytes > 0 ? 1 : 0);
 
         if (i + 2 < total) {
-            const dma_addr_t next_src_addr = (dma_addr_t) ((const char *)src1->data + (size_t)(unit + 2) * src_unit_bytes);
+            struct conv2d_dw_task_slice next_sl;
+            conv2d_dw_get_slice(&next_sl, task + 2, src1, dst, kp);
+
             dma_queue_push(dma_q,
-                           dma_make_data(srcb, next_src_addr),
-                           src_spad_half, src_unit_bytes,
-                           src_unit_bytes, 1);
+                           dma_make_data(srcb, next_sl.src_addr),
+                           src_spad_half, next_sl.src_bytes,
+                           next_sl.src_bytes, next_sl.src_bytes > 0 ? 1 : 0);
         }
     }
 
@@ -2536,39 +2604,43 @@ int op_conv_2d_dw(struct htp_ops_context * octx) {
         return HTP_STATUS_OK;
     }
 
-    const uint32_t src_unit_bytes = kp->cwhn
-        ? (kp->w * kp->h * kp->c * (uint32_t) sizeof(float))
-        : (kp->w * kp->h * (uint32_t) sizeof(float));
-    const uint32_t dst_unit_bytes = kp->cwhn
-        ? (kp->ow * kp->oh * kp->c * (uint32_t) sizeof(float))
-        : (kp->ow * kp->oh * (uint32_t) sizeof(float));
+    const uint32_t row_src_bytes = kp->cwhn
+        ? (kp->w * kp->c * (uint32_t) sizeof(float))
+        : (kp->w * (uint32_t) sizeof(float));
+    const uint32_t row_dst_bytes = kp->cwhn
+        ? (kp->ow * kp->c * (uint32_t) sizeof(float))
+        : (kp->ow * (uint32_t) sizeof(float));
+
+    const uint32_t max_ih_chunk = MIN(kp->h, (kp->oh_chunk - 1) * (uint32_t) kp->s1 + (kp->kh - 1) * (uint32_t) kp->d1 + 1);
+    const uint32_t max_src_bytes = max_ih_chunk * row_src_bytes;
+    const uint32_t max_dst_bytes = kp->oh_chunk * row_dst_bytes;
 
     struct htp_conv2d_dw_vtcm_layout layout;
-    htp_conv2d_dw_vtcm_layout_build(&layout, src_unit_bytes, dst_unit_bytes, kp->n_threads);
+    htp_conv2d_dw_vtcm_layout_build(&layout, max_src_bytes, max_dst_bytes, kp->n_threads);
 
-    uint32_t unit_start = 0;
-    uint32_t unit_count = kp->total_tasks;
+    uint32_t task_start = 0;
+    uint32_t task_count = kp->total_tasks;
     if (octx->ctx->mdev.count > 1) {
         const struct htp_tensor_mdev_range range = htp_tensor_mdev_partition(
-            unit_count, 1, octx->ctx->mdev.idx, octx->ctx->mdev.count, &octx->ctx->mdev.count_div);
-        unit_start = range.start;
-        unit_count = range.count;
+            task_count, 1, octx->ctx->mdev.idx, octx->ctx->mdev.count, &octx->ctx->mdev.count_div);
+        task_start = range.start;
+        task_count = range.count;
     }
-    if (unit_count == 0) {
+    if (task_count == 0) {
         return HTP_STATUS_OK;
     }
 
-    const uint32_t nth = MIN(kp->n_threads, unit_count);
-    const uint32_t units_per_thread = (unit_count + nth - 1) / nth;
+    const uint32_t nth = MIN(kp->n_threads, task_count);
+    const uint32_t tasks_per_thread = (task_count + nth - 1) / nth;
 
     struct conv2d_dw_dma_context ctx = {
         .octx             = octx,
         .kp               = kp,
         .layout           = layout,
         .compute_fn       = kp->cwhn ? conv2d_dw_compute_cwhn_vtcm : conv2d_dw_compute_whcn_vtcm,
-        .unit_start       = unit_start,
-        .unit_count       = unit_count,
-        .units_per_thread = units_per_thread,
+        .task_start       = task_start,
+        .task_count       = task_count,
+        .tasks_per_thread = tasks_per_thread,
     };
 
     work_queue_run(octx->ctx->work_queue, conv2d_dw_dma_thread, &ctx, nth);

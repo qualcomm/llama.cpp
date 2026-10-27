@@ -97,9 +97,10 @@ struct htp_conv2d_dw_kernel_params {
     int32_t  p1;
     int32_t  d0;
     int32_t  d1;
+    uint32_t oh_chunk;
+    uint32_t n_chunks;
     struct fastdiv_values div_c;
-    struct fastdiv_values div_ow;
-    struct fastdiv_values div_oh;
+    struct fastdiv_values div_n_chunks;
 };
 
 #if defined(__cplusplus)
@@ -116,20 +117,20 @@ struct htp_conv2d_dw_vtcm_layout {
     size_t   dst_spad_half_size;
     size_t   src_bytes_per_thread;
     size_t   dst_bytes_per_thread;
-    uint32_t src_unit_bytes;
-    uint32_t dst_unit_bytes;
+    uint32_t max_src_bytes;
+    uint32_t max_dst_bytes;
 };
 
 static inline void htp_conv2d_dw_vtcm_layout_build(
     struct htp_conv2d_dw_vtcm_layout * L,
-    uint32_t src_unit_bytes,
-    uint32_t dst_unit_bytes,
+    uint32_t max_src_bytes,
+    uint32_t max_dst_bytes,
     uint32_t n_threads
 ) {
-    L->src_unit_bytes       = src_unit_bytes;
-    L->dst_unit_bytes       = dst_unit_bytes;
-    L->src_spad_half_size   = hex_round_up(src_unit_bytes + 256, 128);
-    L->dst_spad_half_size   = hex_round_up(dst_unit_bytes + 128, 128);
+    L->max_src_bytes        = max_src_bytes;
+    L->max_dst_bytes        = max_dst_bytes;
+    L->src_spad_half_size   = hex_round_up(max_src_bytes + 256, 128);
+    L->dst_spad_half_size   = hex_round_up(max_dst_bytes + 128, 128);
     L->src_bytes_per_thread = 2 * L->src_spad_half_size;
     L->dst_bytes_per_thread = 2 * L->dst_spad_half_size;
 
