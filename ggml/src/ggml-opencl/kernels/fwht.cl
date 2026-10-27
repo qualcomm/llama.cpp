@@ -7,7 +7,8 @@
 // order, the same result the CPU, CUDA, Metal, SYCL and Vulkan backends produce.
 //
 // One 64-lane workgroup per row; the row is staged in local memory and transformed in place
-// in log2(n) butterfly stages. n is 64, 128, 256 or 512 (the host declines anything else).
+// in log2(n) butterfly stages. n is 64, 128, 256 or 512 here; kernel_fwht_f32_wide below takes
+// 1024 to 4096 (the host declines anything else).
 
 #define FWHT_WG  64
 #define FWHT_MAX 512
@@ -42,6 +43,48 @@ kernel void kernel_fwht_f32(
     }
 
     for (int i = lid; i < n; i += FWHT_WG) {
+        d[i] = buf[i];
+    }
+}
+
+// Wide blocks (prism.hadamard block_size 4096 on Ternary-Bonsai-2-9B): same transform with a
+// 256-lane workgroup, so each lane does n/512 butterflies per stage instead of n/128. The row
+// takes 16 KB of local memory at 4096; 8192 would take the whole 32 KB of an Adreno SP, so the
+// host leaves it to the ordinary matmul.
+
+#define FWHT_WIDE_WG  256
+#define FWHT_WIDE_MAX 4096
+
+kernel void kernel_fwht_f32_wide(
+        global const char * src, ulong off_src,
+        global       char * dst, ulong off_dst,
+        int n, float scale
+) {
+    local float buf[FWHT_WIDE_MAX];
+
+    const int   lid = get_local_id(0);
+    const ulong row = get_group_id(0);
+
+    global const float * s = (global const float *)(src + off_src) + row*n;
+    global       float * d = (global       float *)(dst + off_dst) + row*n;
+
+    for (int i = lid; i < n; i += FWHT_WIDE_WG) {
+        buf[i] = s[i]*scale;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    for (int h = 1; h < n; h <<= 1) {
+        for (int t = lid; t < n/2; t += FWHT_WIDE_WG) {
+            const int i = (t/h)*2*h + (t%h);   // lower element of the pair (i, i + h)
+            const float a = buf[i];
+            const float b = buf[i + h];
+            buf[i]     = a + b;
+            buf[i + h] = a - b;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    for (int i = lid; i < n; i += FWHT_WIDE_WG) {
         d[i] = buf[i];
     }
 }

@@ -1649,6 +1649,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_softplus_f32, kernel_softplus_f32_4, kernel_softplus_f32_nc;
     cl_kernel kernel_softplus_f16, kernel_softplus_f16_4, kernel_softplus_f16_nc;
     cl_kernel kernel_fwht_f32 = nullptr;   // MUL_MAT tagged GGML_HINT_SRC0_IS_HADAMARD
+    cl_kernel kernel_fwht_f32_wide = nullptr; // the same for n 1024..4096
     cl_kernel kernel_upscale;
     cl_kernel kernel_upscale_bilinear;
     cl_kernel kernel_upscale_bilinear_aa;
@@ -8438,6 +8439,15 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
         CL_CHECK((backend_ctx->kernel_fwht_f32 = clCreateKernel(prog, "kernel_fwht_f32", &err), err));
+        CL_CHECK((backend_ctx->kernel_fwht_f32_wide = clCreateKernel(prog, "kernel_fwht_f32_wide", &err), err));
+        size_t fwht_wide_max_wg = 0;
+        CL_CHECK(clGetKernelWorkGroupInfo(backend_ctx->kernel_fwht_f32_wide, backend_ctx->device,
+                                          CL_KERNEL_WORK_GROUP_SIZE, sizeof(size_t), &fwht_wide_max_wg, NULL));
+        if (fwht_wide_max_wg < 256) {
+            // the wide kernel needs 256 lanes; without them n 1024..4096 stays on the matmul
+            CL_CHECK(clReleaseKernel(backend_ctx->kernel_fwht_f32_wide));
+            backend_ctx->kernel_fwht_f32_wide = nullptr;
+        }
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
@@ -44223,18 +44233,25 @@ static bool ggml_cl_mul_mat_kquant_plane(
 static bool ggml_cl_fwht(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst) {
     ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *)backend->context;
     static const bool off = ggml_cl_env_flag_zero("GGML_OPENCL_FWHT");
-    cl_kernel kernel = backend_ctx->kernel_fwht_f32;
-    if (off || kernel == nullptr) {
+    if (off) {
         return false;
     }
     if (src->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || !ggml_are_same_shape(src, dst) ||
         !ggml_is_contiguous(src) || !ggml_is_contiguous(dst)) {
         return false;
     }
+    // n 1024..4096 is the prism.hadamard block of Ternary-Bonsai-2-9B (4096): as a dense f32 GEMM
+    // it was 150 of the 245 ms of every decode token on the Adreno 840.
     const int n = (int) src->ne[0];
-    if (n != 64 && n != 128 && n != 256 && n != 512) {
+    const bool wide = n == 1024 || n == 2048 || n == 4096;
+    if (!wide && n != 64 && n != 128 && n != 256 && n != 512) {
         return false;
     }
+    cl_kernel kernel = wide ? backend_ctx->kernel_fwht_f32_wide : backend_ctx->kernel_fwht_f32;
+    if (kernel == nullptr) {
+        return false;
+    }
+    const size_t wg = wide ? 256 : 64;
     const int64_t rows = ggml_nrows(src);
 
     ggml_tensor_extra_cl * extra_s = (ggml_tensor_extra_cl *)src->extra;
@@ -44250,8 +44267,8 @@ static bool ggml_cl_fwht(ggml_backend_t backend, const ggml_tensor * src, ggml_t
     CL_CHECK(clSetKernelArg(kernel, 4, sizeof(int),      &n));
     CL_CHECK(clSetKernelArg(kernel, 5, sizeof(float),    &scale));
 
-    size_t gws[3] = { (size_t) rows * 64, 1, 1 };
-    size_t lws[3] = { 64, 1, 1 };
+    size_t gws[3] = { (size_t) rows * wg, 1, 1 };
+    size_t lws[3] = { wg, 1, 1 };
     backend_ctx->enqueue_ndrange_kernel(kernel, 1, gws, lws, dst);
     return true;
 }
