@@ -1,10 +1,13 @@
 #ifndef HTP_CONV2D_OPS_H
 #define HTP_CONV2D_OPS_H
 
+#include <stddef.h>
 #include <stdint.h>
 
+#include "hex-common.h"
 #include "hex-fastdiv.h"
 #include "htp-ops.h"
+#include "htp-vtcm.h"
 
 enum htp_conv2d_kernel_type {
     HTP_CONV2D_KERNEL_UNSUPPORTED = 0,
@@ -19,23 +22,16 @@ enum htp_conv2d_kernel_type {
 #define HTP_CONV2D_HMX_SCALES_SIZE 256
 
 struct htp_conv2d_kernel_params {
-    uint32_t n_threads;
-    uint32_t total_rows;
-    uint32_t kernel_type;
+    uint8_t  kernel_type;
+    uint8_t  n_threads;
+    uint8_t  cwhn;
+    uint8_t  w_kmajor;
 
-    uint32_t cwhn;
-    uint32_t w_kmajor;
+    uint32_t total_rows;
     uint32_t n_row_tiles;
     uint32_t ct_chunk;
     uint32_t rt_block;
     uint32_t stage_size;
-
-    uint32_t off_w;
-    uint32_t off_act;
-    uint32_t act_size;
-    uint32_t off_out;
-    uint32_t out_size;
-    uint32_t off_thr;
     uint32_t thr_size;
     uint32_t vtcm_size;
 
@@ -68,6 +64,10 @@ struct htp_conv2d_kernel_params {
             uint32_t w_cs;
             struct fastdiv_values div_sr;
             struct fastdiv_values div_ihs;
+            struct fastdiv_values div_kw;
+            struct fastdiv_values div_tg;
+            struct fastdiv_values div_cc;
+            struct fastdiv_values div_cs;
         } window;
     };
 };
@@ -77,5 +77,38 @@ static_assert(sizeof(struct htp_conv2d_kernel_params) <= 128, "htp_conv2d_kernel
 #else
 _Static_assert(sizeof(struct htp_conv2d_kernel_params) <= 128, "htp_conv2d_kernel_params is too large for kernel_params blob");
 #endif
+
+struct htp_conv2d_vtcm_layout {
+    size_t total_bytes;
+    size_t off_scales;
+    size_t off_w;
+    size_t off_act[2];
+    size_t off_out[2];
+    size_t off_thr;
+
+    size_t act_size;
+};
+
+static inline void htp_conv2d_vtcm_layout_build(
+    struct htp_conv2d_vtcm_layout * L,
+    uint32_t rt_block,
+    size_t   w_size,
+    size_t   act_size,
+    size_t   out_size,
+    size_t   thr_size,
+    uint32_t n_threads
+) {
+    const size_t sc = hex_round_up((size_t) rt_block * HTP_CONV2D_HMX_SCALES_SIZE, 2048);
+    size_t off = 0;
+    VTCM_LAYOUT_ALLOC(off, off_scales, sc);
+    VTCM_LAYOUT_ALLOC(off, off_w,      w_size);
+    VTCM_LAYOUT_ALLOC(off, off_act[0], act_size);
+    VTCM_LAYOUT_ALLOC(off, off_act[1], act_size);
+    VTCM_LAYOUT_ALLOC(off, off_out[0], out_size);
+    VTCM_LAYOUT_ALLOC(off, off_out[1], out_size);
+    VTCM_LAYOUT_ALLOC(off, off_thr,    (size_t) n_threads * thr_size);
+    L->act_size    = act_size;
+    L->total_bytes = off;
+}
 
 #endif // HTP_CONV2D_OPS_H

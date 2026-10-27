@@ -3384,7 +3384,7 @@ static bool htp_kparams_conv2d_win(
         while (!fold && w_cs > 1 && n_rt * ((Cin + 31) / 32) * ((T + w_cs - 1) / w_cs) < kp->n_threads) {
             w_cs = (w_cs + 1) / 2;
         }
-        wscr = (size_t) w_cs * 32 * 128;
+        wscr = 2 * (size_t) w_cs * 32 * 128;
     }
 
     uint32_t rt_block = n_rt;
@@ -3399,7 +3399,7 @@ static bool htp_kparams_conv2d_win(
         rt_block = (rt_block + 1) / 2;
     }
 
-    size_t stage = 0, thr = 0, sc = 0, act = 0, out = 0, w_size = 0, total = 0;
+    size_t stage = 0, thr = 0, act = 0, out = 0, w_size = 0, total = 0;
     uint32_t n_bc = 0;
     while (true) {
         n_bc   = ct + halo;
@@ -3410,11 +3410,12 @@ static bool htp_kparams_conv2d_win(
         }
         stage  = hex_round_up(stage, 128);
         thr    = hex_round_up((std::max)(2 * stage + (size_t) HTP_CONV2D_WIN_OBUF * 32 * seg_t * 32 * sizeof(float), wscr), tile);
-        sc     = hex_round_up((size_t) rt_block * HTP_CONV2D_HMX_SCALES_SIZE, tile);
         w_size = (size_t) rt_block * n_wt * n_cc * tile;
         act    = (size_t) n_cc * n_bc * tile;
         out    = (size_t) rt_block * ct * tile;
-        total  = sc + w_size + 2 * act + 2 * out + nth * thr;
+        struct htp_conv2d_vtcm_layout L;
+        htp_conv2d_vtcm_layout_build(&L, rt_block, w_size, act, out, thr, nth);
+        total  = L.total_bytes;
         if (total <= htp_session_vtcm_size(sess)) {
             break;
         }
@@ -3436,33 +3437,37 @@ static bool htp_kparams_conv2d_win(
         return false;
     }
 
-    kp->kernel_type = HTP_CONV2D_KERNEL_HMX_WINDOW;
-    kp->cwhn        = cwhn;
+    const uint32_t TG   = w_cs;
+    const uint32_t CS   = w_cs;
+    const uint32_t n_tg = (T + TG - 1) / TG;
+    const uint32_t n_cs = (32 + CS - 1) / CS;
+
+    kp->kernel_type        = (uint8_t) HTP_CONV2D_KERNEL_HMX_WINDOW;
+    kp->n_threads          = (uint8_t) nth;
+    kp->cwhn               = cwhn ? 1 : 0;
+    kp->w_kmajor           = !w_rows ? 1 : 0;
+    kp->n_row_tiles        = n_rt;
+    kp->ct_chunk           = ct;
+    kp->rt_block           = rt_block;
+    kp->stage_size         = stage;
+    kp->thr_size           = thr;
+    kp->vtcm_size          = total;
     kp->window.fold        = fold;
-    kp->w_kmajor           = !w_rows;
     kp->window.n_cc        = n_cc;
     kp->window.act_rt_last = 0x780 | 0x2 | (stop << 2);
     kp->window.sr          = SR;
     kp->window.ihs         = IHS;
     kp->window.max_off     = moff;
-    kp->n_row_tiles        = n_rt;
-    kp->rt_block           = rt_block;
-    kp->ct_chunk           = ct;
     kp->window.n_bc        = n_bc;
     kp->window.seg_b       = seg_b;
     kp->window.seg_t       = seg_t;
     kp->window.w_cs        = w_cs;
-    kp->stage_size         = stage;
-    kp->off_w              = sc;
-    kp->off_act            = kp->off_w + w_size;
-    kp->act_size           = act;
-    kp->off_out            = kp->off_act + 2 * act;
-    kp->out_size           = out;
-    kp->off_thr            = kp->off_out + 2 * out;
-    kp->thr_size           = thr;
-    kp->vtcm_size          = total;
     kp->window.div_sr      = init_fastdiv_values(SR);
     kp->window.div_ihs     = init_fastdiv_values(IHS);
+    kp->window.div_kw      = init_fastdiv_values(KW);
+    kp->window.div_tg      = init_fastdiv_values(n_tg);
+    kp->window.div_cc      = init_fastdiv_values(n_cc);
+    kp->window.div_cs      = init_fastdiv_values(n_cs);
     return true;
 }
 
@@ -3531,7 +3536,7 @@ static bool htp_kparams_conv2d_tiled(
     uint32_t n_stage  = 1;
     uint32_t sr       = 0;
     size_t   stage = 0, ostage = 0, prow = 0, wpack = 0;
-    size_t   sc = 0, w_size = 0, act_size = 0, out_size = 0, thr_size = 0, total = 0;
+    size_t   w_size = 0, act_size = 0, out_size = 0, thr_size = 0, total = 0;
 
     while (true) {
         const uint32_t wb = 32 * seg + (KW - 1) * d0;
@@ -3539,13 +3544,14 @@ static bool htp_kparams_conv2d_tiled(
         stage  = cwhn ? (size_t) KH * sr * sizeof(float) : (size_t) Cin * KH * sr * sizeof(float);
         ostage = 2 * 32 * (size_t) seg * 32 * sizeof(float);
         prow   = cwhn ? stage / 2 + 256 + 64 * 128 : 0;
-        wpack  = kmajor ? (size_t) wk * 64 * sizeof(float) + 96 * 128 : (size_t) 32 * wk * (sizeof(float) + sizeof(uint16_t));
+        wpack  = kmajor ? 2 * (size_t) wk * 64 * sizeof(float) + 96 * 128 : 2 * (size_t) 32 * wk * (sizeof(float) + sizeof(uint16_t));
         thr_size = hex_round_up((std::max)(stage + ostage + prow, wpack), tile);
-        sc       = hex_round_up((size_t) rt_block * HTP_CONV2D_HMX_SCALES_SIZE, tile);
         w_size   = (size_t) rt_block * n_kt * tile;
         act_size = (size_t) ct * n_kt * tile;
         out_size = (size_t) rt_block * ct * tile;
-        total    = sc + w_size + 2 * act_size + 2 * out_size + nth * thr_size;
+        struct htp_conv2d_vtcm_layout L;
+        htp_conv2d_vtcm_layout_build(&L, rt_block, w_size, act_size, out_size, thr_size, nth);
+        total    = L.total_bytes;
         if (total <= htp_session_vtcm_size(sess)) {
             break;
         }
@@ -3565,44 +3571,39 @@ static bool htp_kparams_conv2d_tiled(
     // Second stage buffer: DMA of the next segment overlaps HVX pack of this one.
     // Skip large stages. They already fill VTCM, and the extra DMA slows HMX.
     {
-        const size_t thr2   = hex_round_up((std::max)(2 * stage + ostage + prow, wpack), tile);
-        const size_t total2 = sc + w_size + 2 * act_size + 2 * out_size + nth * thr2;
-        if (stage <= 128 * 1024 && total2 <= htp_session_vtcm_size(sess)) {
+        const size_t thr2 = hex_round_up((std::max)(2 * stage + ostage + prow, wpack), tile);
+        struct htp_conv2d_vtcm_layout L2;
+        htp_conv2d_vtcm_layout_build(&L2, rt_block, w_size, act_size, out_size, thr2, nth);
+        if (stage <= 128 * 1024 && L2.total_bytes <= htp_session_vtcm_size(sess)) {
             n_stage  = 2;
             thr_size = thr2;
-            total    = total2;
+            total    = L2.total_bytes;
         }
     }
 
-    kp->n_threads    = nth;
-    kp->cwhn         = cwhn;
-    kp->w_kmajor     = kmajor;
+    kp->kernel_type        = (uint8_t) HTP_CONV2D_KERNEL_HMX_TILED;
+    kp->n_threads          = (uint8_t) nth;
+    kp->cwhn               = cwhn ? 1 : 0;
+    kp->w_kmajor           = kmajor ? 1 : 0;
+    kp->n_row_tiles        = n_rt;
+    kp->ct_chunk           = ct;
+    kp->rt_block           = rt_block;
+    kp->stage_size         = stage;
+    kp->thr_size           = thr_size;
+    kp->vtcm_size          = total;
     kp->tiled.w_kstride    = ks;
     kp->tiled.k_size       = K;
     kp->tiled.k_group      = kg;
     kp->tiled.k_group_pad  = kg_p;
     kp->tiled.n_groups     = n_grp;
     kp->tiled.n_k_tiles    = n_kt;
-    kp->n_row_tiles  = n_rt;
     kp->tiled.n_ow_tiles   = n_owt;
-    kp->ct_chunk     = ct;
-    kp->rt_block     = rt_block;
     kp->tiled.seg_tiles    = seg;
     kp->tiled.stage_row    = sr;
-    kp->stage_size   = stage;
     kp->tiled.n_stage      = n_stage;
     kp->tiled.wk_chunk     = wk;
-    kp->off_w        = sc;
-    kp->off_act      = kp->off_w + w_size;
-    kp->act_size     = act_size;
-    kp->off_out      = kp->off_act + 2 * act_size;
-    kp->out_size     = out_size;
-    kp->off_thr      = kp->off_out + 2 * out_size;
-    kp->thr_size     = thr_size;
-    kp->vtcm_size    = total;
     kp->tiled.div_ow_tiles = init_fastdiv_values(n_owt);
     kp->tiled.div_oh       = init_fastdiv_values(OH);
-    kp->kernel_type  = HTP_CONV2D_KERNEL_HMX_TILED;
     return true;
 }
 

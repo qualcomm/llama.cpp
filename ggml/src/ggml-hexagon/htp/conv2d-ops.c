@@ -25,7 +25,7 @@
 // fp16 elements between the HMX scales of two row tiles
 #define CONV2D_HMX_SCALES_N (HTP_CONV2D_HMX_SCALES_SIZE / sizeof(__fp16))
 
-struct htp_conv2d_hmx_job {
+struct htp_conv2d_hmx_task {
     __fp16 *       output;
     const __fp16 * kernel_tiles;
     const __fp16 * patch_tiles;
@@ -46,13 +46,6 @@ static inline HVX_Vector conv2d_f32_to_f16_shuff(HVX_Vector v0, HVX_Vector v1) {
     return conv2d_f32_to_f16_shuff_z(v0, v1, Q6_V_vzero());
 }
 
-// Zero vector made at this point. Q6_V_vzero() is hoisted out of all loops, so in a loop with transposes it spills.
-static inline HVX_Vector conv2d_vzero_here(void) {
-    HVX_Vector z;
-    asm volatile("%0 = vxor(%0, %0)" : "=v"(z));
-    return z;
-}
-
 static inline HVX_Vector conv2d_f32_to_f16(HVX_Vector v0, HVX_Vector v1) {
     return Q6_Vh_vdeal_Vh(conv2d_f32_to_f16_shuff(v0, v1));
 }
@@ -60,26 +53,6 @@ static inline HVX_Vector conv2d_f32_to_f16(HVX_Vector v0, HVX_Vector v1) {
 // v if keep, else 0. Loops with transposes use this for padding rows: a hoisted zero vector would spill.
 static inline HVX_Vector conv2d_keep(HVX_Vector v, bool keep) {
     return Q6_V_vand_VV(v, Q6_V_vsplat_R(keep ? ~0u : 0));
-}
-
-// DMA pipelines: every step records how many DMAs it pushed and pops exactly that many before its buffer is used.
-// nrows = 0 pushes a dummy that completes at once. A full queue retires its oldest DMA, which only makes a later pop
-// return early, since pops complete DMAs in push order.
-
-// DMA hangs if a stride is less than the row size, even for a single row
-static inline void conv2d_dma_push(dma_queue * q, dma_data d, size_t dst_stride, size_t src_stride, size_t row, size_t nrows) {
-    if (nrows == 1) {
-        dst_stride = src_stride = row;
-    }
-    while (!dma_queue_push(q, d, dst_stride, src_stride, row, nrows)) {
-        dma_queue_pop(q);
-    }
-}
-
-static inline void conv2d_dma_pop(dma_queue * q, uint32_t n) {
-    for (; n > 0; n--) {
-        dma_queue_pop(q);
-    }
 }
 
 // HMX output scale of one row tile: 2^-e with 2^e >= K * max|w|, so the fp16 result |y| * 2^-e <= max|x| does not overflow
@@ -127,23 +100,23 @@ static void conv2d_mdev_rows(const struct htp_ops_context * octx, uint32_t * row
 }
 
 static void conv2d_hmx_worker(void * data) {
-    struct htp_conv2d_hmx_job * job = (struct htp_conv2d_hmx_job *) data;
+    struct htp_conv2d_hmx_task * task = (struct htp_conv2d_hmx_task *) data;
 
-    const size_t dot_stride = job->n_dot_tiles * HMX_FP16_TILE_N_ELMS;
+    const size_t dot_stride = task->n_dot_tiles * HMX_FP16_TILE_N_ELMS;
 
-    for (uint32_t r = 0; r < job->n_row_tiles; ++r) {
-        asm volatile(HMX_SET_BIAS("%0") :: "r"((unsigned int) (job->scales + r * CONV2D_HMX_SCALES_N)));
+    for (uint32_t r = 0; r < task->n_row_tiles; ++r) {
+        asm volatile(HMX_SET_BIAS("%0") :: "r"((unsigned int) (task->scales + r * CONV2D_HMX_SCALES_N)));
 
-        const __fp16 * row_base = job->kernel_tiles + r * dot_stride;
-        const __fp16 * col_base = job->patch_tiles;
-        __fp16 * out_tile = job->output + r * job->n_col_tiles * HMX_FP16_TILE_N_ELMS;
+        const __fp16 * row_base = task->kernel_tiles + r * dot_stride;
+        const __fp16 * col_base = task->patch_tiles;
+        __fp16 * out_tile = task->output + r * task->n_col_tiles * HMX_FP16_TILE_N_ELMS;
 
-        for (uint32_t c = 0; c < job->n_col_tiles; ++c) {
+        for (uint32_t c = 0; c < task->n_col_tiles; ++c) {
             const __fp16 * row_tiles = row_base;
             const __fp16 * col_tiles = col_base;
             asm volatile(HMX_CLRACC_F16());
 
-            uint32_t rem = job->n_dot_tiles;
+            uint32_t rem = task->n_dot_tiles;
             while (rem > 0) {
                 const uint32_t n_tiles = MIN(rem, 32);
                 const uint32_t range = 2048u * n_tiles - 1;
@@ -163,6 +136,7 @@ static void conv2d_hmx_worker(void * data) {
 struct htp_conv2d_hmx_context {
     struct htp_ops_context *                octx;
     const struct htp_conv2d_kernel_params * kp;
+    struct htp_conv2d_vtcm_layout           layout;
     __fp16 *                                scales;  // [rt] HMX scales
     __fp16 *                                w_tiles;
     __fp16 *                                act[2];
@@ -203,9 +177,15 @@ static void conv2d_hmx_wpack_thread(unsigned int nth, unsigned int ith, void * d
 
     dma_queue * dmaq = octx->ctx->dma[ith];
     uint8_t *   thr  = hc->thr_base + (size_t) ith * kp->thr_size;
-    __fp16 *    wbuf = (__fp16 *) thr;
-    float *     wraw = (float *) (thr + (size_t) WK * 32 * sizeof(__fp16));
-    uint8_t *   wdma = is_f16 ? (uint8_t *) wbuf : (uint8_t *) wraw;
+    const size_t w_buf_size = (size_t) WK * 32 * sizeof(__fp16);
+    const size_t w_raw_size = (size_t) WK * 32 * sizeof(float);
+    const size_t w_step     = w_buf_size + w_raw_size;
+
+    __fp16 *  wbuf[2] = { (__fp16 *) thr, (__fp16 *) (thr + w_step) };
+    float *   wraw[2] = { (float *) ((uint8_t *) wbuf[0] + w_buf_size),
+                          (float *) ((uint8_t *) wbuf[1] + w_buf_size) };
+    uint8_t * wdma[2] = { is_f16 ? (uint8_t *) wbuf[0] : (uint8_t *) wraw[0],
+                          is_f16 ? (uint8_t *) wbuf[1] : (uint8_t *) wraw[1] };
 
     const HVX_Vector zero = Q6_V_vzero();
 
@@ -215,19 +195,25 @@ static void conv2d_hmx_wpack_thread(unsigned int nth, unsigned int ith, void * d
         const uint32_t co0 = (hc->rt0 + rt) * 32;
         const uint32_t nco = MIN(32, Cout - co0);
 
+        uint32_t bi = 0;
+        for (uint32_t i = 0; i < 2 && i * WK < k_pad; i++) {
+            const uint32_t kc = i * WK;
+            const uint32_t kv = MIN(WK, K - kc);
+            dma_queue_push(dmaq, dma_make_data(wdma[i], kernel->data + (size_t) co0 * kernel->nb[3] + (size_t) kc * es),
+                           WK * es, kernel->nb[3], kv * es, nco);
+        }
+
         for (uint32_t kc = 0; kc < k_pad; kc += WK) {
             const uint32_t kv = MIN(WK, K - kc);
             const uint32_t hd = MIN(WK, k_pad - kc);
 
-            conv2d_dma_push(dmaq, dma_make_data(wdma, kernel->data + (size_t) co0 * kernel->nb[3] + (size_t) kc * es),
-                           WK * es, kernel->nb[3], kv * es, nco);
-            conv2d_dma_pop(dmaq, 1);
+            dma_queue_pop(dmaq);
 
             htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_W_PREP, (uint16_t) kc);
 
             for (uint32_t r = 0; r < 32; r++) {
-                HVX_Vector *       dv = (HVX_Vector *) (wbuf + (size_t) r * WK);
-                const HVX_Vector * sv = (const HVX_Vector *) (wraw + (size_t) r * WK);
+                HVX_Vector *       dv = (HVX_Vector *) (wbuf[bi] + (size_t) r * WK);
+                const HVX_Vector * sv = (const HVX_Vector *) (wraw[bi] + (size_t) r * WK);
                 for (uint32_t j = 0; j < hd; j += 64) {
                     HVX_Vector v = zero;
                     if (r < nco && j < kv) {
@@ -241,15 +227,22 @@ static void conv2d_hmx_wpack_thread(unsigned int nth, unsigned int ith, void * d
             }
 
             __fp16 * tiles = hc->w_tiles + ((size_t) rt * kp->tiled.n_k_tiles + kc / 32) * HMX_FP16_TILE_N_ELMS;
-            hmx_interleave_cols_to_tiles(tiles, wbuf, 32, hd, WK, 1, 0, 32);
+            hmx_interleave_cols_to_tiles(tiles, wbuf[bi], 32, hd, WK, 1, 0, 32);
             htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_W_PREP, (uint16_t) kc);
+
+            const uint32_t next_kc = kc + 2 * WK;
+            if (next_kc < k_pad) {
+                const uint32_t next_kv = MIN(WK, K - next_kc);
+                dma_queue_push(dmaq, dma_make_data(wdma[bi], kernel->data + (size_t) co0 * kernel->nb[3] + (size_t) next_kc * es),
+                               WK * es, kernel->nb[3], next_kv * es, nco);
+            }
+            bi ^= 1;
         }
     }
 }
 
-// Stage Cin*KH input rows for G col tiles: stage[(cin*KH + kh)*SR + j] = x[n][cin][ih(kh)][ow0 - p0 + j], zero outside.
-// Returns the number of DMAs pushed.
-static uint32_t conv2d_hmx_stage(const struct htp_ops_context * octx, const struct htp_conv2d_kernel_params * kp,
+// Stage Cin*KH input rows for G col tiles: stage[(cin*KH + kh)*SR + j] = x[n][cin][ih(kh)][ow0 - p0 + j], zero outside
+static void conv2d_hmx_stage(const struct htp_ops_context * octx, const struct htp_conv2d_kernel_params * kp,
                              dma_queue * dmaq, float * stage, uint32_t n, uint32_t oh, uint32_t ow0, uint32_t G) {
     const struct htp_tensor * kernel = octx->src[0];
     const struct htp_tensor * input  = octx->src[1];
@@ -271,7 +264,6 @@ static uint32_t conv2d_hmx_stage(const struct htp_ops_context * octx, const stru
     const int32_t lo  = MAX(0, -iw0);
     const int32_t hi  = MIN(Wb, IW - iw0);
 
-    uint32_t nd = 0;
     for (uint32_t kh = 0; kh < KH; kh++) {
         const int32_t ih   = (int32_t) oh * s1 + (int32_t) kh * d1 - p1;
         float *       rows = stage + (size_t) kh * SR;
@@ -280,13 +272,13 @@ static uint32_t conv2d_hmx_stage(const struct htp_ops_context * octx, const stru
             for (uint32_t c = 0; c < Cin; c++) {
                 hvx_splat_f32_u(rows + (size_t) c * KH * SR, 0.0f, Wb);
             }
+            dma_queue_push(dmaq, dma_make_data(rows, 0), 0, 0, 0, 0);
             continue;
         }
 
         const dma_addr_t src = input->data + (size_t) n * input->nb[3] + (size_t) ih * input->nb[1] + (size_t) (iw0 + lo) * sizeof(float);
-        conv2d_dma_push(dmaq, dma_make_data(rows + lo, src), (size_t) KH * SR * sizeof(float), input->nb[2],
-                        (size_t) (hi - lo) * sizeof(float), Cin);
-        nd++;
+        dma_queue_push(dmaq, dma_make_data(rows + lo, src), (size_t) KH * SR * sizeof(float), input->nb[2],
+                       (size_t) (hi - lo) * sizeof(float), Cin);
 
         if (lo > 0 || hi < Wb) {
             for (uint32_t c = 0; c < Cin; c++) {
@@ -300,7 +292,6 @@ static uint32_t conv2d_hmx_stage(const struct htp_ops_context * octx, const stru
             }
         }
     }
-    return nd;
 }
 
 // One weight-side tile column: vector i holds k rows 2i and 2i+1 interleaved over 32 pixels
@@ -337,8 +328,8 @@ static inline void conv2d_hmx_pack_tile(__fp16 * restrict dst, const float * res
     }
 }
 
-// CWHN: stage[kh*SR + j*Cin + cin] = x[n][ih(kh)][ow0 - p0 + j][cin], zero outside. Returns the number of DMAs pushed.
-static uint32_t conv2d_hmx_stage_cwhn(const struct htp_ops_context * octx, const struct htp_conv2d_kernel_params * kp,
+// CWHN: stage[kh*SR + j*Cin + cin] = x[n][ih(kh)][ow0 - p0 + j][cin], zero outside
+static void conv2d_hmx_stage_cwhn(const struct htp_ops_context * octx, const struct htp_conv2d_kernel_params * kp,
                                   dma_queue * dmaq, float * stage, uint32_t n, uint32_t oh, uint32_t ow0, uint32_t G) {
     const struct htp_tensor * kernel = octx->src[0];
     const struct htp_tensor * input  = octx->src[1];
@@ -360,20 +351,19 @@ static uint32_t conv2d_hmx_stage_cwhn(const struct htp_ops_context * octx, const
     const int32_t lo  = MAX(0, -iw0);
     const int32_t hi  = MIN(Wb, IW - iw0);
 
-    uint32_t nd = 0;
     for (uint32_t kh = 0; kh < KH; kh++) {
         const int32_t ih  = (int32_t) oh * s1 + (int32_t) kh * d1 - p1;
         float *       row = stage + (size_t) kh * SR;
 
         if (ih < 0 || ih >= IH || hi <= lo) {
             hvx_splat_f32_u(row, 0.0f, Wb * Cin);
+            dma_queue_push(dmaq, dma_make_data(row, 0), 0, 0, 0, 0);
             continue;
         }
 
         const dma_addr_t src  = input->data + (size_t) n * input->nb[3] + (size_t) ih * input->nb[1] + (size_t) (iw0 + lo) * input->nb[0];
         const size_t     size = (size_t) (hi - lo) * Cin * sizeof(float);
-        conv2d_dma_push(dmaq, dma_make_data(row + lo * Cin, src), size, size, size, 1);
-        nd++;
+        dma_queue_push(dmaq, dma_make_data(row + lo * Cin, src), size, size, size, 1);
 
         if (lo > 0) {
             hvx_splat_f32_u(row, 0.0f, lo * Cin);
@@ -382,7 +372,6 @@ static uint32_t conv2d_hmx_stage_cwhn(const struct htp_ops_context * octx, const
             hvx_splat_f32_u(row + hi * Cin, 0.0f, (Wb - hi) * Cin);
         }
     }
-    return nd;
 }
 
 static void conv2d_hmx_cwhn_f16(__fp16 * restrict dst, const float * restrict src, uint32_t KH, uint32_t SR, uint32_t n) {
@@ -391,9 +380,9 @@ static void conv2d_hmx_cwhn_f16(__fp16 * restrict dst, const float * restrict sr
     }
 }
 
-// Stage the segment of col tiles starting at t, returns its number of col tiles and DMAs (*nd)
+// Stage the segment of col tiles starting at t, returns its number of col tiles
 static uint32_t conv2d_hmx_issue_seg(const struct htp_ops_context * octx, const struct htp_conv2d_kernel_params * kp,
-                                     dma_queue * dmaq, float * stage, uint32_t t, uint32_t t1, uint32_t * nd) {
+                                     dma_queue * dmaq, float * stage, uint32_t t, uint32_t t1) {
     const uint32_t OH    = octx->dst->ne[1];
     const uint32_t n_owt = kp->tiled.n_ow_tiles;
     const uint32_t row   = fastdiv(t, &kp->tiled.div_ow_tiles);
@@ -402,8 +391,11 @@ static uint32_t conv2d_hmx_issue_seg(const struct htp_ops_context * octx, const 
     const uint32_t n     = fastdiv(row, &kp->tiled.div_oh);
     const uint32_t oh    = row - n * OH;
 
-    *nd = kp->cwhn ? conv2d_hmx_stage_cwhn(octx, kp, dmaq, stage, n, oh, owt * 32, G) :
-                     conv2d_hmx_stage(octx, kp, dmaq, stage, n, oh, owt * 32, G);
+    if (kp->cwhn) {
+        conv2d_hmx_stage_cwhn(octx, kp, dmaq, stage, n, oh, owt * 32, G);
+    } else {
+        conv2d_hmx_stage(octx, kp, dmaq, stage, n, oh, owt * 32, G);
+    }
     return G;
 }
 
@@ -546,6 +538,104 @@ static void conv2d_hmx_pack_tile_cwhn(__fp16 * restrict dst, const __fp16 * rest
     }
 }
 
+struct wpack_kmajor_task {
+    uint32_t rt;
+    uint32_t g;
+    uint32_t kc;
+    uint32_t nco;
+    uint32_t nk;
+    uint32_t hk;
+};
+
+static inline void conv2d_hmx_wpack_kmajor_compute(const struct htp_conv2d_hmx_context * hc,
+                                                   const uint8_t * wraw,
+                                                   const struct wpack_kmajor_task * task,
+                                                   HVX_Vector * vin,
+                                                   HVX_Vector * scratch,
+                                                   HVX_Vector * sink,
+                                                   bool is_f16,
+                                                   uint32_t es) {
+    const struct htp_conv2d_kernel_params * kp = hc->kp;
+    const uint32_t KGp = kp->tiled.k_group_pad;
+    const HVX_VectorPred qco = Q6_Q_vsetq2_R(task->nco * sizeof(__fp16));
+    for (uint32_t kt = 0; kt < task->hk / 32; kt++) {
+        for (uint32_t j = 0; j < 32; j++) {
+            const uint32_t     k  = kt * 32 + j;
+            const HVX_Vector * sv = (const HVX_Vector *) (wraw + (size_t) k * 64 * es);
+            const HVX_Vector   v  = is_f16 ? sv[0] : conv2d_f32_to_f16(sv[0], sv[1]);
+            vin[j] = conv2d_keep(Q6_V_vand_QV(qco, v), k < task->nk);
+        }
+
+        const uint32_t ktg = (task->g * KGp + task->kc) / 32 + kt;
+        HVX_Vector *   lo  = (HVX_Vector *) (hc->w_tiles + ((size_t) task->rt * kp->tiled.n_k_tiles + ktg) * HMX_FP16_TILE_N_ELMS);
+        HVX_Vector *   hi  = task->rt + 1 < hc->n_rt ?
+            (HVX_Vector *) (hc->w_tiles + ((size_t) (task->rt + 1) * kp->tiled.n_k_tiles + ktg) * HMX_FP16_TILE_N_ELMS) : sink;
+        conv2d_transpose_w32(vin, 1, scratch, lo, hi);
+    }
+}
+
+static inline void conv2d_hmx_wpack_kmajor_dma(const struct htp_conv2d_hmx_context * hc,
+                                               dma_queue * dmaq,
+                                               uint8_t * wraw,
+                                               const struct wpack_kmajor_task * task,
+                                               uint32_t es,
+                                               size_t ks) {
+    const struct htp_tensor * kernel = hc->octx->src[0];
+    const uint32_t KG = hc->kp->tiled.k_group;
+    if (task->nk > 0) {
+        const dma_addr_t src = kernel->data + ((size_t) task->g * KG + task->kc) * ks + (size_t) (hc->rt0 + task->rt) * 32 * es;
+        dma_queue_push(dmaq, dma_make_data(wraw, src), 64 * es, ks, task->nco * es, task->nk);
+    } else {
+        dma_queue_push(dmaq, dma_make_data(wraw, 0), 0, 0, 0, 0);
+    }
+}
+
+struct conv2d_wpack_kmajor_iter {
+    uint32_t cb;
+    uint32_t g;
+    uint32_t kc;
+    uint32_t owner;
+    uint32_t n_cb;
+    uint32_t NG;
+    uint32_t KG;
+    uint32_t KGp;
+    uint32_t k_pad;
+    uint32_t WK;
+    uint32_t Cout;
+    uint32_t rt0;
+    uint32_t nth;
+    uint32_t ith;
+};
+
+static inline bool conv2d_wpack_kmajor_next_task(struct conv2d_wpack_kmajor_iter * it, struct wpack_kmajor_task * task) {
+    while (it->cb < it->n_cb) {
+        const uint32_t span = it->g + 1 == it->NG ? it->k_pad - it->g * it->KGp : it->KGp;
+        while (it->kc < span) {
+            const bool mine = it->owner == it->ith;
+            it->owner = it->owner + 1 == it->nth ? 0 : it->owner + 1;
+            const uint32_t kc = it->kc;
+            it->kc += it->WK;
+            if (mine) {
+                const uint32_t rt  = 2 * it->cb;
+                const uint32_t co0 = (it->rt0 + rt) * 32;
+                task->rt  = rt;
+                task->g   = it->g;
+                task->kc  = kc;
+                task->nco = MIN(64, it->Cout - co0);
+                task->nk  = kc < it->KG ? MIN(it->WK, it->KG - kc) : 0;
+                task->hk  = MIN(it->WK, span - kc);
+                return true;
+            }
+        }
+        it->kc = 0;
+        if (++it->g == it->NG) {
+            it->g = 0;
+            it->cb++;
+        }
+    }
+    return false;
+}
+
 // Kernel stored as [k][cout] (cout contiguous): DMA k rows of 64 cout, transpose into two row tiles
 static void conv2d_hmx_wpack_kmajor_thread(unsigned int nth, unsigned int ith, void * data) {
     const struct htp_conv2d_hmx_context * hc = (const struct htp_conv2d_hmx_context *) data;
@@ -564,63 +654,64 @@ static void conv2d_hmx_wpack_kmajor_thread(unsigned int nth, unsigned int ith, v
     const uint32_t es     = is_f16 ? sizeof(__fp16) : sizeof(float);
     const uint32_t n_cb   = (hc->n_rt + 1) / 2;
 
-    dma_queue *  dmaq    = octx->ctx->dma[ith];
-    uint8_t *    wraw    = hc->thr_base + (size_t) ith * kp->thr_size;
-    HVX_Vector * vin     = (HVX_Vector *) (wraw + (size_t) WK * 64 * sizeof(float));
-    HVX_Vector * scratch = vin + 32;
-    HVX_Vector * sink    = scratch + 32;
+    dma_queue *  dmaq       = octx->ctx->dma[ith];
+    const size_t w_raw_size = (size_t) WK * 64 * sizeof(float);
+    uint8_t *    wraws[2]   = { hc->thr_base + (size_t) ith * kp->thr_size,
+                                hc->thr_base + (size_t) ith * kp->thr_size + w_raw_size };
+    HVX_Vector * vin        = (HVX_Vector *) (wraws[1] + w_raw_size);
+    HVX_Vector * scratch    = vin + 32;
+    HVX_Vector * sink       = scratch + 32;
 
     struct htp_thread_trace * tr = &octx->ctx->trace[ith];
 
-    uint32_t owner = 0;
-    for (uint32_t cb = 0; cb < n_cb; cb++) {
-        for (uint32_t g = 0; g < NG; g++) {
-            const uint32_t span = g + 1 == NG ? k_pad - g * KGp : KGp;
-            for (uint32_t kc = 0; kc < span; kc += WK) {
-                const bool mine = owner == ith;
-                owner = owner + 1 == nth ? 0 : owner + 1;
-                if (!mine) {
-                    continue;
-                }
+    struct conv2d_wpack_kmajor_iter it = {
+        .cb    = 0,
+        .g     = 0,
+        .kc    = 0,
+        .owner = 0,
+        .n_cb  = n_cb,
+        .NG    = NG,
+        .KG    = KG,
+        .KGp   = KGp,
+        .k_pad = k_pad,
+        .WK    = WK,
+        .Cout  = Cout,
+        .rt0   = hc->rt0,
+        .nth   = nth,
+        .ith   = ith,
+    };
 
-                const uint32_t rt  = 2 * cb;
-                const uint32_t co0 = (hc->rt0 + rt) * 32;
-                const uint32_t nco = MIN(64, Cout - co0);
-                const uint32_t nk  = kc < KG ? MIN(WK, KG - kc) : 0;
-                const uint32_t hk  = MIN(WK, span - kc);
+    struct wpack_kmajor_task tasks[2];
+    uint32_t n_tasks = 0;
 
-                if (nk > 0) {
-                    conv2d_dma_push(dmaq, dma_make_data(wraw, kernel->data + ((size_t) g * KG + kc) * ks + (size_t) co0 * es),
-                                    64 * es, ks, nco * es, nk);
-                    conv2d_dma_pop(dmaq, 1);
-                }
-
-                htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_W_PREP, (uint16_t) kc);
-
-                const HVX_VectorPred qco = Q6_Q_vsetq2_R(nco * sizeof(__fp16));
-                for (uint32_t kt = 0; kt < hk / 32; kt++) {
-                    // rows past nk are in the buffer but not loaded
-                    for (uint32_t j = 0; j < 32; j++) {
-                        const uint32_t     k  = kt * 32 + j;
-                        const HVX_Vector * sv = (const HVX_Vector *) (wraw + (size_t) k * 64 * es);
-                        const HVX_Vector   v  = is_f16 ? sv[0] : conv2d_f32_to_f16(sv[0], sv[1]);
-                        vin[j] = conv2d_keep(Q6_V_vand_QV(qco, v), k < nk);
-                    }
-
-                    const uint32_t ktg = (g * KGp + kc) / 32 + kt;
-                    HVX_Vector *   lo  = (HVX_Vector *) (hc->w_tiles + ((size_t) rt * kp->tiled.n_k_tiles + ktg) * HMX_FP16_TILE_N_ELMS);
-                    HVX_Vector *   hi  = rt + 1 < hc->n_rt ?
-                        (HVX_Vector *) (hc->w_tiles + ((size_t) (rt + 1) * kp->tiled.n_k_tiles + ktg) * HMX_FP16_TILE_N_ELMS) : sink;
-                    conv2d_transpose_w32(vin, 1, scratch, lo, hi);
-                }
-                htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_W_PREP, (uint16_t) kc);
-            }
+    // push(0), push(1)
+    for (uint32_t i = 0; i < 2; i++) {
+        if (conv2d_wpack_kmajor_next_task(&it, &tasks[i])) {
+            conv2d_hmx_wpack_kmajor_dma(hc, dmaq, wraws[i], &tasks[i], es, ks);
+            n_tasks++;
         }
+    }
+
+    // pop(N), compute(N), push(N + 2)
+    uint32_t bi = 0;
+    while (n_tasks > 0) {
+        dma_queue_pop(dmaq);
+        htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_W_PREP, (uint16_t) tasks[bi].kc);
+        conv2d_hmx_wpack_kmajor_compute(hc, wraws[bi], &tasks[bi], vin, scratch, sink, is_f16, es);
+        htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_W_PREP, (uint16_t) tasks[bi].kc);
+        n_tasks--;
+
+        struct wpack_kmajor_task next_task;
+        if (conv2d_wpack_kmajor_next_task(&it, &next_task)) {
+            tasks[bi] = next_task;
+            conv2d_hmx_wpack_kmajor_dma(hc, dmaq, wraws[bi], &tasks[bi], es, ks);
+            n_tasks++;
+        }
+        bi ^= 1;
     }
 }
 
-// n_prev: output DMAs of the unpack still in flight, retired by the first pop
-static void conv2d_hmx_pack(const struct htp_conv2d_hmx_context * hc, uint32_t ith, uint32_t n_prev) {
+static void conv2d_hmx_pack(const struct htp_conv2d_hmx_context * hc, uint32_t ith) {
     struct htp_ops_context *                octx = hc->octx;
     const struct htp_conv2d_kernel_params * kp   = hc->kp;
     const struct htp_tensor *               kernel = octx->src[0];
@@ -652,19 +743,14 @@ static void conv2d_hmx_pack(const struct htp_conv2d_hmx_context * hc, uint32_t i
     struct htp_thread_trace * tr = &octx->ctx->trace[ith];
 
     if (t0 >= t1) {
-        conv2d_dma_pop(dmaq, n_prev);
         return;
     }
 
-    // push(N), push(N + 1), pop(N), pack(N), push(N + 2), ... with n_stage 2, push(N), pop(N), pack(N), ... with 1
-    uint32_t nd[2] = { n_prev, 0 };
     uint32_t ng[2] = { 0, 0 };
     uint32_t tq    = t0;
     for (uint32_t i = 0; i < n_stage && tq < t1; i++) {
-        uint32_t n;
-        ng[i]  = conv2d_hmx_issue_seg(octx, kp, dmaq, stages[i], tq, t1, &n);
-        nd[i] += n;
-        tq    += ng[i];
+        ng[i] = conv2d_hmx_issue_seg(octx, kp, dmaq, stages[i], tq, t1);
+        tq   += ng[i];
     }
 
     uint32_t bi = 0;
@@ -672,7 +758,9 @@ static void conv2d_hmx_pack(const struct htp_conv2d_hmx_context * hc, uint32_t i
         const uint32_t G     = ng[bi];
         float *        stage = stages[bi];
 
-        conv2d_dma_pop(dmaq, nd[bi]);
+        for (uint32_t p = 0; p < KH; p++) {
+            dma_queue_pop(dmaq);
+        }
 
         htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_A_PREP, (uint16_t) t);
         if (kp->cwhn) {
@@ -690,18 +778,16 @@ static void conv2d_hmx_pack(const struct htp_conv2d_hmx_context * hc, uint32_t i
         }
         htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_A_PREP, (uint16_t) t);
 
-        nd[bi] = 0;
         if (tq < t1) {
-            ng[bi]  = conv2d_hmx_issue_seg(octx, kp, dmaq, stage, tq, t1, &nd[bi]);
-            tq     += ng[bi];
+            ng[bi] = conv2d_hmx_issue_seg(octx, kp, dmaq, stage, tq, t1);
+            tq    += ng[bi];
         }
         t += G;
         bi = bi + 1 == n_stage ? 0 : bi + 1;
     }
 }
 
-// Returns the number of output DMAs left in flight
-static uint32_t conv2d_hmx_unpack(const struct htp_conv2d_hmx_context * hc, uint32_t ith) {
+static void conv2d_hmx_unpack(const struct htp_conv2d_hmx_context * hc, uint32_t ith) {
     struct htp_ops_context *                octx = hc->octx;
     const struct htp_conv2d_kernel_params * kp   = hc->kp;
     const struct htp_tensor *               dst  = octx->dst;
@@ -726,9 +812,12 @@ static uint32_t conv2d_hmx_unpack(const struct htp_conv2d_hmx_context * hc, uint
 
     struct htp_thread_trace * tr = &octx->ctx->trace[ith];
 
-    // nd[b] = DMAs pushed from ostage b, popped before it is reused: pop(N - 2), unpack(N), push(N)
-    uint32_t nd[2] = { 0, 0 };
-    uint32_t b     = 0;
+    if (t0 >= t1) {
+        return;
+    }
+
+    uint32_t b        = 0;
+    uint32_t n_pushed = 0;
 
     for (uint32_t t = t0; t < t1;) {
         const uint32_t row = fastdiv(t, &kp->tiled.div_ow_tiles);
@@ -744,7 +833,9 @@ static uint32_t conv2d_hmx_unpack(const struct htp_conv2d_hmx_context * hc, uint
             const uint32_t nco = MIN(32, Cout - co0);
             const HVX_Vector restore = conv2d_hmx_rt_restore(hc->scales, rt);
 
-            conv2d_dma_pop(dmaq, nd[b]);
+            if (n_pushed >= 2) {
+                dma_queue_pop(dmaq);
+            }
 
             htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_O_PROC, (uint16_t) t);
             float * ob = ostage[b];
@@ -759,21 +850,27 @@ static uint32_t conv2d_hmx_unpack(const struct htp_conv2d_hmx_context * hc, uint
             htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_O_PROC, (uint16_t) t);
 
             const dma_addr_t ddr = dst->data + (size_t) n * dst->nb[3] + (size_t) oh * dst->nb[1] + (size_t) co0 * dst->nb[2] + (size_t) ow0 * sizeof(float);
-            conv2d_dma_push(dmaq, dma_make_data(ddr, ob), dst->nb[2], (size_t) OS * sizeof(float), (size_t) nv * sizeof(float), nco);
-            nd[b] = 1;
+            dma_queue_push(dmaq, dma_make_data(ddr, ob), dst->nb[2], (size_t) OS * sizeof(float), (size_t) nv * sizeof(float), nco);
+            n_pushed++;
             b ^= 1;
         }
         t += G;
     }
-    return nd[0] + nd[1];
+
+    // Drain the pipeline
+    if (n_pushed >= 1) {
+        dma_queue_pop(dmaq);
+    }
+    if (n_pushed >= 2) {
+        dma_queue_pop(dmaq);
+    }
 }
 
 static void conv2d_hmx_phase_thread(unsigned int nth, unsigned int ith, void * data) {
     const struct htp_conv2d_hmx_context * hc = (const struct htp_conv2d_hmx_context *) data;
 
-    uint32_t n_out = 0;
     if (hc->unpack_chunk >= 0) {
-        n_out = conv2d_hmx_unpack(hc, ith);
+        conv2d_hmx_unpack(hc, ith);
     }
     // weights of this rt block are packed before its first chunk
     if (hc->pack_chunk == 0) {
@@ -784,9 +881,7 @@ static void conv2d_hmx_phase_thread(unsigned int nth, unsigned int ith, void * d
         }
     }
     if (hc->pack_chunk >= 0) {
-        conv2d_hmx_pack(hc, ith, n_out);
-    } else {
-        conv2d_dma_pop(hc->octx->ctx->dma[ith], n_out);
+        conv2d_hmx_pack(hc, ith);
     }
 }
 
@@ -814,16 +909,25 @@ static int conv2d_hmx_tiled(struct htp_ops_context * octx, const struct htp_conv
         return HTP_STATUS_OK;
     }
 
+    const size_t tile     = 2048;
+    const size_t w_size   = (size_t) kp->rt_block * kp->tiled.n_k_tiles * tile;
+    const size_t act_size = (size_t) kp->ct_chunk * kp->tiled.n_k_tiles * tile;
+    const size_t out_size = (size_t) kp->rt_block * kp->ct_chunk * tile;
+
+    struct htp_conv2d_vtcm_layout layout;
+    htp_conv2d_vtcm_layout_build(&layout, kp->rt_block, w_size, act_size, out_size, kp->thr_size, kp->n_threads);
+
     uint8_t * base = (uint8_t *) octx->ctx->vtcm_base;
 
     struct htp_conv2d_hmx_context hc = {
         .octx     = octx,
         .kp       = kp,
-        .scales   = (__fp16 *) base,
-        .w_tiles  = VTCM_LAYOUT_PTR(__fp16, base, kp->off_w),
-        .act      = { VTCM_LAYOUT_PTR(__fp16, base, kp->off_act), VTCM_LAYOUT_PTR(__fp16, base, kp->off_act + kp->act_size) },
-        .out      = { VTCM_LAYOUT_PTR(__fp16, base, kp->off_out), VTCM_LAYOUT_PTR(__fp16, base, kp->off_out + kp->out_size) },
-        .thr_base = VTCM_LAYOUT_PTR(uint8_t, base, kp->off_thr),
+        .layout   = layout,
+        .scales   = VTCM_LAYOUT_PTR(__fp16, base, layout.off_scales),
+        .w_tiles  = VTCM_LAYOUT_PTR(__fp16, base, layout.off_w),
+        .act      = { VTCM_LAYOUT_PTR(__fp16, base, layout.off_act[0]), VTCM_LAYOUT_PTR(__fp16, base, layout.off_act[1]) },
+        .out      = { VTCM_LAYOUT_PTR(__fp16, base, layout.off_out[0]), VTCM_LAYOUT_PTR(__fp16, base, layout.off_out[1]) },
+        .thr_base = VTCM_LAYOUT_PTR(uint8_t, base, layout.off_thr),
         .t_base   = row_base * kp->tiled.n_ow_tiles,
         .t_end    = (row_base + n_rows) * kp->tiled.n_ow_tiles,
     };
@@ -831,7 +935,7 @@ static int conv2d_hmx_tiled(struct htp_ops_context * octx, const struct htp_conv
     const uint32_t nth      = kp->n_threads;
     const int32_t  n_chunks = (int32_t) ((hc.t_end - hc.t_base + kp->ct_chunk - 1) / kp->ct_chunk);
 
-    struct htp_conv2d_hmx_job job;
+    struct htp_conv2d_hmx_task task;
 
     for (uint32_t rt0 = 0; rt0 < kp->n_row_tiles; rt0 += kp->rt_block) {
         hc.rt0  = rt0;
@@ -843,14 +947,14 @@ static int conv2d_hmx_tiled(struct htp_ops_context * octx, const struct htp_conv
         for (int32_t c = 0; c < n_chunks; c++) {
             const uint32_t cs = hc.t_base + (uint32_t) c * kp->ct_chunk;
 
-            job.output       = hc.out[c & 1];
-            job.kernel_tiles = hc.w_tiles;
-            job.patch_tiles  = hc.act[c & 1];
-            job.scales       = hc.scales;
-            job.n_row_tiles  = hc.n_rt;
-            job.n_col_tiles  = MIN(kp->ct_chunk, hc.t_end - cs);
-            job.n_dot_tiles  = kp->tiled.n_k_tiles;
-            hmx_queue_push(octx->ctx->hmx_queue, hmx_queue_make_desc(conv2d_hmx_worker, &job));
+            task.output       = hc.out[c & 1];
+            task.kernel_tiles = hc.w_tiles;
+            task.patch_tiles  = hc.act[c & 1];
+            task.scales       = hc.scales;
+            task.n_row_tiles  = hc.n_rt;
+            task.n_col_tiles  = MIN(kp->ct_chunk, hc.t_end - cs);
+            task.n_dot_tiles  = kp->tiled.n_k_tiles;
+            hmx_queue_push(octx->ctx->hmx_queue, hmx_queue_make_desc(conv2d_hmx_worker, &task));
 
             const int32_t pack   = c + 1 < n_chunks ? c + 1 : -1;
             const int32_t unpack = c - 1;
@@ -883,6 +987,7 @@ static const int32_t conv2d_hmx_win_scat_off[32] __attribute__((aligned(VLEN))) 
 struct htp_conv2d_win_context {
     struct htp_ops_context *             octx;
     const struct htp_conv2d_kernel_params * kp;
+    struct htp_conv2d_vtcm_layout        layout;
     __fp16 *                             scales;  // [rt] HMX scales
     __fp16 *                             w_tiles; // [rt][tap][cc] weight tiles
     __fp16 *                             act[2];  // [cc][b] croutons of a chunk
@@ -900,7 +1005,7 @@ struct htp_conv2d_win_context {
     uint8_t *                            live[2]; // per chunk: tiles with an output row to write
 };
 
-struct htp_conv2d_win_job {
+struct htp_conv2d_win_task {
     __fp16 *         out;
     const __fp16 *   w;
     const __fp16 *   act;
@@ -923,7 +1028,7 @@ static inline uint32_t conv2d_hmx_win_act_off(uint32_t u) {
 }
 
 static void conv2d_hmx_win_worker(void * data) {
-    const struct htp_conv2d_win_job * j = (const struct htp_conv2d_win_job *) data;
+    const struct htp_conv2d_win_task * j = (const struct htp_conv2d_win_task *) data;
 
     const uint32_t * taps    = j->taps;
     const uint32_t   T       = j->n_taps;
@@ -1017,6 +1122,127 @@ static inline uint32_t conv2d_hmx_win_chunk_tiles(const struct htp_conv2d_win_co
     return MIN(wc->kp->ct_chunk, wc->t_end - *ts);
 }
 
+struct conv2d_win_wpack_kmajor_task {
+    uint32_t rt;
+    uint32_t cc;
+    uint32_t tg;
+    uint32_t t0;
+    uint32_t nt;
+    uint32_t c0;
+    uint32_t nc;
+    uint32_t co0;
+    uint32_t nco;
+    uint32_t kh0;
+    uint32_t kw0;
+};
+
+static inline struct conv2d_win_wpack_kmajor_task conv2d_hmx_win_wpack_kmajor_make_task(
+    const struct htp_conv2d_win_context * wc,
+    uint32_t unit,
+    uint32_t n_tg,
+    uint32_t n_cc,
+    const struct fastdiv_values * div_tg,
+    const struct fastdiv_values * div_cc,
+    const struct fastdiv_values * div_kw,
+    uint32_t TG,
+    uint32_t T,
+    uint32_t KW,
+    uint32_t Cin,
+    uint32_t Cout) {
+    const uint32_t tg   = fastmodulo(unit, n_tg, div_tg);
+    const uint32_t u_cc = fastdiv(unit, div_tg);
+    const uint32_t cc   = fastmodulo(u_cc, n_cc, div_cc);
+    const uint32_t rt   = fastdiv(u_cc, div_cc);
+    const uint32_t co0  = (wc->rt0 + rt) * 32;
+    const uint32_t nco  = MIN(32, Cout - co0);
+    const uint32_t c0   = cc * 32;
+    const uint32_t nc   = MIN(32, Cin - c0);
+    const uint32_t t0   = tg * TG;
+    const uint32_t nt   = MIN(TG, T - t0);
+    const uint32_t kh0  = fastdiv(t0, div_kw);
+    const uint32_t kw0  = fastmodulo(t0, KW, div_kw);
+
+    return (struct conv2d_win_wpack_kmajor_task) {
+        .rt  = rt,
+        .cc  = cc,
+        .tg  = tg,
+        .t0  = t0,
+        .nt  = nt,
+        .c0  = c0,
+        .nc  = nc,
+        .co0 = co0,
+        .nco = nco,
+        .kh0 = kh0,
+        .kw0 = kw0,
+    };
+}
+
+static inline uint32_t conv2d_hmx_win_wpack_kmajor_dma(const struct htp_conv2d_win_context * wc,
+                                                       dma_queue * dmaq,
+                                                       uint8_t * raw,
+                                                       const struct conv2d_win_wpack_kmajor_task * task,
+                                                       uint32_t KW,
+                                                       uint32_t es) {
+    const struct htp_tensor * kernel = wc->octx->src[0];
+    uint32_t kh = task->kh0;
+    uint32_t kw = task->kw0;
+
+    for (uint32_t t = 0; t < task->nt; t++) {
+        const dma_addr_t src = kernel->data + (size_t) kw * kernel->nb[0] + (size_t) kh * kernel->nb[1] +
+                               (size_t) task->c0 * kernel->nb[2] + (size_t) task->co0 * es;
+        dma_queue_push(dmaq, dma_make_data(raw + (size_t) t * 32 * VLEN, src), VLEN, kernel->nb[2], task->nco * es, task->nc);
+        if (++kw == KW) {
+            kw = 0;
+            kh++;
+        }
+    }
+    return task->nt;
+}
+
+static inline void conv2d_hmx_win_wpack_kmajor_compute(const struct htp_conv2d_win_context * wc,
+                                                       const uint8_t * raw,
+                                                       const struct conv2d_win_wpack_kmajor_task * task,
+                                                       uint32_t n_cc,
+                                                       uint32_t T,
+                                                       uint32_t KW,
+                                                       uint32_t KH,
+                                                       uint32_t Cin,
+                                                       uint32_t es,
+                                                       bool is_f16,
+                                                       HVX_Vector zero) {
+    const struct htp_conv2d_kernel_params * kp = wc->kp;
+    const HVX_VectorPred qco = Q6_Q_vsetq2_R(task->nco * es);
+    if (kp->window.fold) {
+        const HVX_Vector * rows = (const HVX_Vector *) raw;
+        HVX_Vector *       tile = (HVX_Vector *) (wc->w_tiles + ((size_t) (task->rt * KH + task->tg) * n_cc + task->cc) * HMX_FP16_TILE_N_ELMS);
+        uint32_t           kw   = 0;
+        uint32_t           c    = 0;
+        for (uint32_t p = 0; p < 16; p++) {
+            const HVX_Vector a = kw < KW ? Q6_V_vmux_QVV(qco, rows[kw * 32 + c], zero) : zero;
+            if (++c == Cin) {
+                c = 0;
+                kw++;
+            }
+            const HVX_Vector b = kw < KW ? Q6_V_vmux_QVV(qco, rows[kw * 32 + c], zero) : zero;
+            if (++c == Cin) {
+                c = 0;
+                kw++;
+            }
+            tile[p] = is_f16 ? Q6_V_lo_W(Q6_W_vshuff_VVR(b, a, -2)) : conv2d_f32_to_f16_shuff(a, b);
+        }
+        return;
+    }
+    for (uint32_t t = 0; t < task->nt; t++) {
+        const HVX_Vector * rows = (const HVX_Vector *) (raw + (size_t) t * 32 * VLEN);
+        HVX_Vector *       tile = (HVX_Vector *) (wc->w_tiles + ((size_t) (task->rt * T + task->t0 + t) * n_cc + task->cc) * HMX_FP16_TILE_N_ELMS);
+        for (uint32_t p = 0; p < 16; p++) {
+            const HVX_Vector a = 2 * p + 0 < task->nc ? Q6_V_vmux_QVV(qco, rows[2 * p + 0], zero) : zero;
+            const HVX_Vector b = 2 * p + 1 < task->nc ? Q6_V_vmux_QVV(qco, rows[2 * p + 1], zero) : zero;
+            tile[p] = is_f16 ? Q6_V_lo_W(Q6_W_vshuff_VVR(b, a, -2)) : conv2d_f32_to_f16_shuff(a, b);
+        }
+    }
+}
+
 // Cout-contiguous kernel: DMA w[t][c][32 cout] rows, tile vector p = (row 2p, row 2p+1) interleaved per cout
 static void conv2d_hmx_win_wpack_kmajor(const struct htp_conv2d_win_context * wc, unsigned int nth, unsigned int ith) {
     struct htp_ops_context *             octx   = wc->octx;
@@ -1033,68 +1259,39 @@ static void conv2d_hmx_win_wpack_kmajor(const struct htp_conv2d_win_context * wc
     const bool     is_f16 = kernel->type == HTP_TYPE_F16;
     const uint32_t es     = is_f16 ? sizeof(__fp16) : sizeof(float);
 
-    dma_queue *  dmaq = octx->ctx->dma[ith];
-    uint8_t *    raw  = wc->thr_base + (size_t) ith * kp->thr_size;
-    const HVX_Vector zero = Q6_V_vzero();
+    dma_queue *  dmaq       = octx->ctx->dma[ith];
+    const size_t w_raw_size = (size_t) TG * 32 * VLEN;
+    uint8_t *    raws[2]    = { wc->thr_base + (size_t) ith * kp->thr_size,
+                                wc->thr_base + (size_t) ith * kp->thr_size + w_raw_size };
+    const HVX_Vector zero   = Q6_V_vzero();
 
     struct htp_thread_trace * tr = &octx->ctx->trace[ith];
 
     const uint32_t n_tg    = (T + TG - 1) / TG;
     const uint32_t n_units = wc->n_rt * n_cc * n_tg;
 
-    for (uint32_t unit = ith; unit < n_units; unit += nth) {
-        const uint32_t tg  = unit % n_tg;
-        const uint32_t cc  = (unit / n_tg) % n_cc;
-        const uint32_t rt  = unit / (n_tg * n_cc);
-        const uint32_t co0 = (wc->rt0 + rt) * 32;
-        const uint32_t nco = MIN(32, Cout - co0);
-        const uint32_t c0  = cc * 32;
-        const uint32_t nc  = MIN(32, Cin - c0);
-        const uint32_t t0  = tg * TG;
-        const uint32_t nt  = MIN(TG, T - t0);
+    struct conv2d_win_wpack_kmajor_task tasks[2];
+    uint32_t nd[2] = { 0, 0 };
+    for (uint32_t k = 0, unit = ith; k < 2 && unit < n_units; k++, unit += nth) {
+        tasks[k] = conv2d_hmx_win_wpack_kmajor_make_task(wc, unit, n_tg, n_cc, &kp->window.div_tg, &kp->window.div_cc, &kp->window.div_kw, TG, T, KW, Cin, Cout);
+        nd[k] = conv2d_hmx_win_wpack_kmajor_dma(wc, dmaq, raws[k], &tasks[k], KW, es);
+    }
+    for (uint32_t unit = ith, k = 0; unit < n_units; unit += nth, k++) {
+        const uint32_t bi  = k & 1;
+        uint8_t *      raw = raws[bi];
 
-        for (uint32_t t = 0; t < nt; t++) {
-            const uint32_t   kh  = (t0 + t) / KW;
-            const uint32_t   kw  = (t0 + t) - kh * KW;
-            const dma_addr_t src = kernel->data + (size_t) kw * kernel->nb[0] + (size_t) kh * kernel->nb[1] + (size_t) c0 * kernel->nb[2] + (size_t) co0 * es;
-            conv2d_dma_push(dmaq, dma_make_data(raw + (size_t) t * 32 * VLEN, src), VLEN, kernel->nb[2], nco * es, nc);
+        for (uint32_t p = 0; p < nd[bi]; p++) {
+            dma_queue_pop(dmaq);
         }
-        conv2d_dma_pop(dmaq, nt);
 
         htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_W_PREP, (uint16_t) unit);
-        const HVX_VectorPred qco = Q6_Q_vsetq2_R(nco * es);
-        if (kp->window.fold) {
-            // crouton channel kw * Cin + c is row c of tap kw of this kh
-            const HVX_Vector * rows = (const HVX_Vector *) raw;
-            HVX_Vector *       tile = (HVX_Vector *) (wc->w_tiles + ((size_t) (rt * KH + tg) * n_cc + cc) * HMX_FP16_TILE_N_ELMS);
-            uint32_t           kw   = 0;
-            uint32_t           c    = 0;
-            for (uint32_t p = 0; p < 16; p++) {
-                const HVX_Vector a = kw < KW ? Q6_V_vmux_QVV(qco, rows[kw * 32 + c], zero) : zero;
-                if (++c == Cin) {
-                    c = 0;
-                    kw++;
-                }
-                const HVX_Vector b = kw < KW ? Q6_V_vmux_QVV(qco, rows[kw * 32 + c], zero) : zero;
-                if (++c == Cin) {
-                    c = 0;
-                    kw++;
-                }
-                tile[p] = is_f16 ? Q6_V_lo_W(Q6_W_vshuff_VVR(b, a, -2)) : conv2d_f32_to_f16_shuff(a, b);
-            }
-            htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_W_PREP, (uint16_t) unit);
-            continue;
-        }
-        for (uint32_t t = 0; t < nt; t++) {
-            const HVX_Vector * rows = (const HVX_Vector *) (raw + (size_t) t * 32 * VLEN);
-            HVX_Vector *       tile = (HVX_Vector *) (wc->w_tiles + ((size_t) (rt * T + t0 + t) * n_cc + cc) * HMX_FP16_TILE_N_ELMS);
-            for (uint32_t p = 0; p < 16; p++) {
-                const HVX_Vector a = 2 * p + 0 < nc ? Q6_V_vmux_QVV(qco, rows[2 * p + 0], zero) : zero;
-                const HVX_Vector b = 2 * p + 1 < nc ? Q6_V_vmux_QVV(qco, rows[2 * p + 1], zero) : zero;
-                tile[p] = is_f16 ? Q6_V_lo_W(Q6_W_vshuff_VVR(b, a, -2)) : conv2d_f32_to_f16_shuff(a, b);
-            }
-        }
+        conv2d_hmx_win_wpack_kmajor_compute(wc, raw, &tasks[bi], n_cc, T, KW, KH, Cin, es, is_f16, zero);
         htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_W_PREP, (uint16_t) unit);
+
+        if (unit + 2 * nth < n_units) {
+            tasks[bi] = conv2d_hmx_win_wpack_kmajor_make_task(wc, unit + 2 * nth, n_tg, n_cc, &kp->window.div_tg, &kp->window.div_cc, &kp->window.div_kw, TG, T, KW, Cin, Cout);
+            nd[bi] = conv2d_hmx_win_wpack_kmajor_dma(wc, dmaq, raw, &tasks[bi], KW, es);
+        }
     }
 }
 
@@ -1109,22 +1306,24 @@ static void conv2d_hmx_win_wrows_dma(const struct htp_conv2d_win_context * wc, d
     const uint32_t es  = kernel->type == HTP_TYPE_F16 ? sizeof(__fp16) : sizeof(float);
     const uint32_t kpw = VLEN / es;
 
-    const uint32_t cs  = unit % n_cs;
-    const uint32_t cc  = (unit / n_cs) % kp->window.n_cc;
-    const uint32_t rt  = unit / (n_cs * kp->window.n_cc);
-    const uint32_t co0 = (wc->rt0 + rt) * 32;
-    const uint32_t nco = MIN(32, (uint32_t) kernel->ne[3] - co0);
-    const uint32_t c0  = cc * 32 + cs * CS;
-    const uint32_t nk  = c0 < Cin ? MIN(CS, Cin - c0) * T : 0;
+    const uint32_t cs   = fastmodulo(unit, n_cs, &kp->window.div_cs);
+    const uint32_t u_cc = fastdiv(unit, &kp->window.div_cs);
+    const uint32_t cc   = fastmodulo(u_cc, kp->window.n_cc, &kp->window.div_cc);
+    const uint32_t rt   = fastdiv(u_cc, &kp->window.div_cc);
+    const uint32_t co0  = (wc->rt0 + rt) * 32;
+    const uint32_t nco  = MIN(32, (uint32_t) kernel->ne[3] - co0);
+    const uint32_t c0   = cc * 32 + cs * CS;
+    const uint32_t nk   = c0 < Cin ? MIN(CS, Cin - c0) * T : 0;
     if (nk == 0 || (kp->window.fold && cs > 0)) {
-        conv2d_dma_push(dmaq, dma_make_data(raw, raw), 0, 0, 0, 0);
+        dma_queue_push(dmaq, dma_make_data(raw, raw), 0, 0, 0, 0);
         return;
     }
-    conv2d_dma_push(dmaq, dma_make_data(raw, kernel->data + (size_t) co0 * kernel->nb[3] + (size_t) c0 * kernel->nb[2]),
-                    (size_t) ((nk + kpw - 1) / kpw) * VLEN, kernel->nb[3], (size_t) nk * es, nco);
+    dma_queue_push(dmaq, dma_make_data(raw, kernel->data + (size_t) co0 * kernel->nb[3] + (size_t) c0 * kernel->nb[2]),
+                   (size_t) ((nk + kpw - 1) / kpw) * VLEN, kernel->nb[3], (size_t) nk * es, nco);
 }
 
 // K-contiguous kernel (k = cin * T + t): transpose the 32 cout rows of a packing unit to k rows of 32 cout, then into tiles
+__attribute__((noinline))
 static void conv2d_hmx_win_wrows_pack(const struct htp_conv2d_win_context * wc, const uint8_t * raw, uint8_t * xr, HVX_Vector * vin,
                                       HVX_Vector * scratch, uint32_t unit, uint32_t n_cs) {
     const struct htp_conv2d_kernel_params * kp     = wc->kp;
@@ -1141,11 +1340,12 @@ static void conv2d_hmx_win_wrows_pack(const struct htp_conv2d_win_context * wc, 
     const uint32_t kpw    = is_f16 ? 64 : 32; // k per vector
     const uint32_t rstep  = is_f16 ? 64 : 128; // bytes per transposed k row
 
-    const uint32_t cs  = unit % n_cs;
-    const uint32_t cc  = (unit / n_cs) % n_cc;
-    const uint32_t rt  = unit / (n_cs * n_cc);
-    const uint32_t co0 = (wc->rt0 + rt) * 32;
-    const uint32_t nco = MIN(32, Cout - co0);
+    const uint32_t cs   = fastmodulo(unit, n_cs, &kp->window.div_cs);
+    const uint32_t u_cc = fastdiv(unit, &kp->window.div_cs);
+    const uint32_t cc   = fastmodulo(u_cc, n_cc, &kp->window.div_cc);
+    const uint32_t rt   = fastdiv(u_cc, &kp->window.div_cc);
+    const uint32_t co0  = (wc->rt0 + rt) * 32;
+    const uint32_t nco  = MIN(32, Cout - co0);
     const uint32_t c0  = cc * 32 + cs * CS;
     const uint32_t nc   = c0 < Cin ? MIN(CS, Cin - c0) : 0;
     const uint32_t nk   = nc * T;
@@ -1171,7 +1371,7 @@ static void conv2d_hmx_win_wrows_pack(const struct htp_conv2d_win_context * wc, 
     }
 
     // rows past the valid ones are still inside xr, so they are loaded and masked like the rows of vin
-    const HVX_Vector zero = conv2d_vzero_here();
+    const HVX_Vector zero = Q6_V_vzero();
     if (kp->window.fold) {
         // tile kh, crouton channel kw * Cin + c is k row c * T + kh * KW + kw
         for (uint32_t kh = 0; kh < KH; kh++) {
@@ -1236,7 +1436,7 @@ static void conv2d_hmx_win_wpack_rows(const struct htp_conv2d_win_context * wc, 
     for (uint32_t unit = ith, k = 0; unit < n_units; unit += nth, k++) {
         uint8_t * raw = raws[k & 1];
 
-        conv2d_dma_pop(dmaq, 1);
+        dma_queue_pop(dmaq);
 
         htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_W_PREP, (uint16_t) unit);
         conv2d_hmx_win_wrows_pack(wc, raw, xr, vin, scratch, unit, n_cs);
@@ -1340,10 +1540,10 @@ static uint32_t conv2d_hmx_win_stage(const struct htp_conv2d_win_context * wc, d
             const uint32_t   off = u - ua + (a - col);
             if (cwhn) {
                 const size_t sz = (size_t) (b - a) * Cin * sizeof(float);
-                conv2d_dma_push(dmaq, dma_make_data(stage + (size_t) off * Cin, src), sz, sz, sz, 1);
+                dma_queue_push(dmaq, dma_make_data(stage + (size_t) off * Cin, src), sz, sz, sz, 1);
             } else {
-                conv2d_dma_push(dmaq, dma_make_data(stage + off, src), (size_t) span * sizeof(float), input->nb[2],
-                                (size_t) (b - a) * sizeof(float), Cin);
+                dma_queue_push(dmaq, dma_make_data(stage + off, src), (size_t) span * sizeof(float), input->nb[2],
+                               (size_t) (b - a) * sizeof(float), Cin);
             }
             nd++;
         }
@@ -1397,10 +1597,10 @@ static uint32_t conv2d_hmx_win_stage_fold(const struct htp_conv2d_win_context * 
         if (kp->cwhn) {
             // raw[vr - vr_a][iw][c]
             const size_t sz = (size_t) nr * IW * Cin * sizeof(float);
-            conv2d_dma_push(dmaq, dma_make_data(raw + (size_t) (vr - vr_a) * IW * Cin, src), sz, sz, sz, 1);
+            dma_queue_push(dmaq, dma_make_data(raw + (size_t) (vr - vr_a) * IW * Cin, src), sz, sz, sz, 1);
         } else {
-            conv2d_dma_push(dmaq, dma_make_data(raw + (size_t) (vr - vr_a) * IW, src), (size_t) RP * sizeof(float), input->nb[2],
-                            (size_t) nr * IW * sizeof(float), Cin);
+            dma_queue_push(dmaq, dma_make_data(raw + (size_t) (vr - vr_a) * IW, src), (size_t) RP * sizeof(float), input->nb[2],
+                           (size_t) nr * IW * sizeof(float), Cin);
         }
         nd++;
         vr += nr;
@@ -1700,8 +1900,7 @@ static void conv2d_hmx_win_croutons_fold_cwhn(const struct htp_conv2d_win_contex
     }
 }
 
-// n_prev: output DMAs of the unpack still in flight, retired by the first pop
-static void conv2d_hmx_win_pack(const struct htp_conv2d_win_context * wc, unsigned int nth, unsigned int ith, uint32_t n_prev) {
+static void conv2d_hmx_win_pack(const struct htp_conv2d_win_context * wc, unsigned int nth, unsigned int ith) {
     struct htp_ops_context *             octx = wc->octx;
     const struct htp_conv2d_kernel_params * kp   = wc->kp;
 
@@ -1725,12 +1924,11 @@ static void conv2d_hmx_win_pack(const struct htp_conv2d_win_context * wc, unsign
     const uint32_t SB = kp->window.seg_b;
 
     if (b0 >= b1) {
-        conv2d_dma_pop(dmaq, n_prev);
         return;
     }
 
     // push(N), push(N + 1), pop(N), croutons(N), push(N + 2), ...
-    uint32_t nd[2] = { n_prev, 0 };
+    uint32_t nd[2] = { 0, 0 };
     for (uint32_t i = 0; i < 2 && b0 + i * SB < b1; i++) {
         const uint32_t b = b0 + i * SB;
         nd[i] += stage_fn(wc, dmaq, stages[i], (ts + b) * 32, (ts + MIN(b + SB, b1)) * 32);
@@ -1740,7 +1938,9 @@ static void conv2d_hmx_win_pack(const struct htp_conv2d_win_context * wc, unsign
     for (uint32_t b = b0; b < b1; b += SB) {
         const uint32_t nb = MIN(SB, b1 - b);
 
-        conv2d_dma_pop(dmaq, nd[si]);
+        for (uint32_t p = 0; p < nd[si]; p++) {
+            dma_queue_pop(dmaq);
+        }
 
         htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_A_PREP, (uint16_t) b);
         if (kp->window.fold && kp->cwhn) {
@@ -1758,8 +1958,7 @@ static void conv2d_hmx_win_pack(const struct htp_conv2d_win_context * wc, unsign
     }
 }
 
-// Returns the number of output DMAs left in flight
-static uint32_t conv2d_hmx_win_unpack(const struct htp_conv2d_win_context * wc, unsigned int nth, unsigned int ith) {
+static void conv2d_hmx_win_unpack(const struct htp_conv2d_win_context * wc, unsigned int nth, unsigned int ith) {
     struct htp_ops_context *             octx = wc->octx;
     const struct htp_conv2d_kernel_params * kp   = wc->kp;
     const struct htp_tensor *            dst  = octx->dst;
@@ -1802,7 +2001,9 @@ static uint32_t conv2d_hmx_win_unpack(const struct htp_conv2d_win_context * wc, 
             const uint32_t npr = (nco + 1) / 2;
             const HVX_Vector restore = conv2d_hmx_rt_restore(wc->scales, rt);
 
-            conv2d_dma_pop(dmaq, nd[bi]);
+            for (uint32_t p = 0; p < nd[bi]; p++) {
+                dma_queue_pop(dmaq);
+            }
 
             htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_O_PROC, (uint16_t) i);
             float * ob = obuf + (size_t) bi * 32 * OS;
@@ -1854,28 +2055,27 @@ static uint32_t conv2d_hmx_win_unpack(const struct htp_conv2d_win_context * wc, 
                     b  = MIN(q_hi - base, (r - 1) * SR + OW);
                     vr += r - 1;
                 }
-                conv2d_dma_push(dmaq, dma_make_data(ddr, ob + (base + a - q_lo)), dst->nb[2], (size_t) OS * sizeof(float),
-                                (size_t) (b - a) * sizeof(float), nco);
+                dma_queue_push(dmaq, dma_make_data(ddr, ob + (base + a - q_lo)), dst->nb[2], (size_t) OS * sizeof(float),
+                               (size_t) (b - a) * sizeof(float), nco);
                 nd[bi]++;
             }
             bi = bi + 1 == HTP_CONV2D_WIN_OBUF ? 0 : bi + 1;
         }
     }
 
-    uint32_t n_out = 0;
     for (uint32_t k = 0; k < HTP_CONV2D_WIN_OBUF; k++) {
-        n_out += nd[k];
+        for (uint32_t p = 0; p < nd[k]; p++) {
+            dma_queue_pop(dmaq);
+        }
     }
-    return n_out;
 }
 
 // per-thread callback for one pipeline phase
 static void conv2d_hmx_win_phase_thread(unsigned int nth, unsigned int ith, void * data) {
     const struct htp_conv2d_win_context * wc = (const struct htp_conv2d_win_context *) data;
 
-    uint32_t n_out = 0;
     if (wc->unpack_chunk >= 0) {
-        n_out = conv2d_hmx_win_unpack(wc, nth, ith);
+        conv2d_hmx_win_unpack(wc, nth, ith);
     }
     // weights of this rt block are packed before its first chunk
     if (wc->pack_chunk == 0) {
@@ -1887,9 +2087,7 @@ static void conv2d_hmx_win_phase_thread(unsigned int nth, unsigned int ith, void
         }
     }
     if (wc->pack_chunk >= 0) {
-        conv2d_hmx_win_pack(wc, nth, ith, n_out);
-    } else {
-        conv2d_dma_pop(wc->octx->ctx->dma[ith], n_out);
+        conv2d_hmx_win_pack(wc, nth, ith);
     }
 }
 
@@ -1897,7 +2095,7 @@ static void conv2d_hmx_win_phase_thread(unsigned int nth, unsigned int ith, void
 static void conv2d_hmx_win_zero_thread(unsigned int nth, unsigned int ith, void * data) {
     const struct htp_conv2d_win_context * wc = (const struct htp_conv2d_win_context *) data;
 
-    const size_t n   = 2 * (size_t) wc->kp->act_size / sizeof(float);
+    const size_t n   = 2 * wc->layout.act_size / sizeof(float);
     const size_t per = hex_round_up((n + nth - 1) / nth, VLEN_FP32);
     const size_t i0  = MIN((size_t) ith * per, n);
     const size_t i1  = MIN(i0 + per, n);
@@ -1963,16 +2161,26 @@ static int conv2d_hmx_win(struct htp_ops_context * octx, const struct htp_conv2d
     const uint32_t vr0 = (ra / OH) * IHS + ra % OH;
     const uint32_t vr1 = (rb / OH) * IHS + rb % OH + 1;
 
+    const size_t tile     = 2048;
+    const uint32_t n_wt   = kp->window.fold ? KH : (KW * KH);
+    const size_t w_size   = (size_t) kp->rt_block * n_wt * kp->window.n_cc * tile;
+    const size_t act_size = (size_t) kp->window.n_cc * kp->window.n_bc * tile;
+    const size_t out_size = (size_t) kp->rt_block * kp->ct_chunk * tile;
+
+    struct htp_conv2d_vtcm_layout layout;
+    htp_conv2d_vtcm_layout_build(&layout, kp->rt_block, w_size, act_size, out_size, kp->thr_size, kp->n_threads);
+
     uint8_t * base = (uint8_t *) octx->ctx->vtcm_base;
 
     struct htp_conv2d_win_context wctx = {
         .octx     = octx,
         .kp       = kp,
-        .scales   = (__fp16 *) base,
-        .w_tiles  = VTCM_LAYOUT_PTR(__fp16, base, kp->off_w),
-        .act      = { VTCM_LAYOUT_PTR(__fp16, base, kp->off_act), VTCM_LAYOUT_PTR(__fp16, base, kp->off_act + kp->act_size) },
-        .out      = { VTCM_LAYOUT_PTR(__fp16, base, kp->off_out), VTCM_LAYOUT_PTR(__fp16, base, kp->off_out + kp->out_size) },
-        .thr_base = VTCM_LAYOUT_PTR(uint8_t, base, kp->off_thr),
+        .layout   = layout,
+        .scales   = VTCM_LAYOUT_PTR(__fp16, base, layout.off_scales),
+        .w_tiles  = VTCM_LAYOUT_PTR(__fp16, base, layout.off_w),
+        .act      = { VTCM_LAYOUT_PTR(__fp16, base, layout.off_act[0]), VTCM_LAYOUT_PTR(__fp16, base, layout.off_act[1]) },
+        .out      = { VTCM_LAYOUT_PTR(__fp16, base, layout.off_out[0]), VTCM_LAYOUT_PTR(__fp16, base, layout.off_out[1]) },
+        .thr_base = VTCM_LAYOUT_PTR(uint8_t, base, layout.off_thr),
         .t_base   = (vr0 * SR) / 32,
         .t_end    = ((vr1 - 1) * SR + OW + 31) / 32,
         .vr0      = vr0,
@@ -2001,7 +2209,7 @@ static int conv2d_hmx_win(struct htp_ops_context * octx, const struct htp_conv2d
     wctx.live[0] = (uint8_t *) octx->ctx->ddr_spad_base + hex_round_up(KH * KW * sizeof(uint32_t), 128);
     wctx.live[1] = wctx.live[0] + hex_round_up(kp->ct_chunk, 128);
 
-    struct htp_conv2d_win_job job = {
+    struct htp_conv2d_win_task task = {
         .scales     = wctx.scales,
         .taps       = taps,
         .n_taps     = TW * KH,
@@ -2023,13 +2231,13 @@ static int conv2d_hmx_win(struct htp_ops_context * octx, const struct htp_conv2d
             uint32_t ts;
             const uint32_t nt = conv2d_hmx_win_chunk_tiles(&wctx, c, &ts);
             conv2d_hmx_win_live(&wctx, wctx.live[c & 1], ts, nt);
-            job.live    = wctx.live[c & 1];
-            job.out     = wctx.out[c & 1];
-            job.w       = wctx.w_tiles;
-            job.act     = wctx.act[c & 1];
-            job.n_rt    = wctx.n_rt;
-            job.n_tiles = nt;
-            hmx_queue_push(octx->ctx->hmx_queue, hmx_queue_make_desc(conv2d_hmx_win_worker, &job));
+            task.live    = wctx.live[c & 1];
+            task.out     = wctx.out[c & 1];
+            task.w       = wctx.w_tiles;
+            task.act     = wctx.act[c & 1];
+            task.n_rt    = wctx.n_rt;
+            task.n_tiles = nt;
+            hmx_queue_push(octx->ctx->hmx_queue, hmx_queue_make_desc(conv2d_hmx_win_worker, &task));
 
             const int32_t pack   = c + 1 < n_chunks ? c + 1 : -1;
             const int32_t unpack = c - 1;
