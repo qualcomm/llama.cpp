@@ -6,11 +6,6 @@
 
 #define QK2_0 64
 
-typedef struct {
-    half  d;
-    uchar qs[QK2_0/4];
-} block_q2_0;
-
 #define LOAD_VEC_A 4
 #define LOAD_VEC_B 4
 
@@ -51,8 +46,8 @@ typedef float lm_st;
 #endif
 
 kernel void kernel_mul_mm_q2_0_f32_l4_lm(
-    global char   * src0,
-    ulong offset0,
+    global uchar  * src0_q,
+    global half   * src0_d,
     global float4 * src1,
     ulong offset1,
     global float  * dst,
@@ -73,9 +68,9 @@ kernel void kernel_mul_mm_q2_0_f32_l4_lm(
     int batch_stride_d,
 
     int r2,
-    int r3
+    int r3,
+    int trans   // 1: q as [K/16][ne01] uint32 and d as [K/64][ne01] (2D weights only)
 ) {
-    global block_q2_0 * src0_b = (global block_q2_0 *)(src0 + offset0);
     src1 = (global float4*)((global char*)src1 + offset1);
     dst  = (global float *)((global char*)dst  + offsetd);
 
@@ -126,16 +121,23 @@ kernel void kernel_mul_mm_q2_0_f32_l4_lm(
         for (int l = 0; l < BM; l += loadstride_a) {
             if (ir*BM + loadc_a + l < ne01) {
                 int idx = pos_a + (loadc_a + l) * stride_a + loadr_a * LOAD_VEC_A;
-                int ib  = idx / QK2_0;
-                int e   = idx % QK2_0;
 
-                global block_q2_0 * xb = src0_b + ib;
-
-                // 4 quants per byte, so one vec4 comes from a single byte
-                uchar b = xb->qs[e >> 2];
+                // SOA (shares the q1_0 split): quants are 4 per byte in element order and
+                // there is one scale per 64-element block, so one vec4 is a single byte
+                uchar b;
+                float d;
+                if (trans) {
+                    // element (row, k) is byte (k%16)/4 of word (k/16)*ne01 + row (2D weight)
+                    const int row = ir*BM + loadc_a + l;
+                    const int k   = block + loadr_a * LOAD_VEC_A;
+                    b = src0_q[((k/16)*ne01 + row)*4 + (k%16)/4];
+                    d = (float)src0_d[(k/QK2_0)*ne01 + row];
+                } else {
+                    b = src0_q[idx >> 2];
+                    d = (float)src0_d[idx / QK2_0];
+                }
                 float4 v1 = (convert_float4((uchar4)((b >> 0) & 3, (b >> 2) & 3,
-                                                     (b >> 4) & 3, (b >> 6) & 3)) - 1.0f)
-                            * (float)xb->d;
+                                                     (b >> 4) & 3, (b >> 6) & 3)) - 1.0f) * d;
 
                 buf_a[(loadr_a * LOAD_VEC_A + 0) * BM + loadc_a + l] = v1.s0;
                 buf_a[(loadr_a * LOAD_VEC_A + 1) * BM + loadc_a + l] = v1.s1;
