@@ -58,6 +58,7 @@ htp_op_code htp_op_remap(const struct ggml_tensor * t) {
         case GGML_OP_IM2COL:          return HTP_OP_IM2COL;
         case GGML_OP_IM2COL_3D:       return HTP_OP_IM2COL_3D;
         case GGML_OP_CONV_2D:         return HTP_OP_CONV_2D;
+        case GGML_OP_CONV_2D_DW:      return HTP_OP_CONV_2D_DW;
         case GGML_OP_ROLL:            return HTP_OP_ROLL;
 
         case GGML_OP_UNARY:
@@ -3661,6 +3662,81 @@ static bool htp_kparams_solve_conv2d(
     return htp_kparams_solve_conv2d_unchecked(sess, op, kparams);
 }
 
+static bool htp_kparams_solve_conv2d_dw(
+    const struct ggml_hexagon_session * sess,
+    const struct ggml_tensor * op,
+    struct htp_conv2d_dw_kernel_params * kparams
+) {
+    memset(kparams, 0, sizeof(*kparams));
+
+    const struct ggml_tensor * src0 = op->src[0];
+    const struct ggml_tensor * src1 = op->src[1];
+    const struct ggml_tensor * dst  = op;
+
+    if ((src0->type != GGML_TYPE_F16 && src0->type != GGML_TYPE_F32) ||
+        src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    if (src0->ne[2] != 1 || src0->ne[3] != src1->ne[2]) {
+        return false;
+    }
+
+    if (src0->ne[0] * src0->ne[1] > 256) {
+        return false;
+    }
+
+    const int32_t s0 = ggml_get_op_params_i32(op, 0);
+    const int32_t s1 = ggml_get_op_params_i32(op, 1);
+    const int32_t p0 = ggml_get_op_params_i32(op, 2);
+    const int32_t p1 = ggml_get_op_params_i32(op, 3);
+    const int32_t d0 = ggml_get_op_params_i32(op, 4);
+    const int32_t d1 = ggml_get_op_params_i32(op, 5);
+
+    if (s0 <= 0 || s1 <= 0 || d0 <= 0 || d1 <= 0) {
+        return false;
+    }
+
+    const int64_t ow = (src1->ne[0] + 2 * p0 - d0 * (src0->ne[0] - 1) - 1) / s0 + 1;
+    const int64_t oh = (src1->ne[1] + 2 * p1 - d1 * (src0->ne[1] - 1) - 1) / s1 + 1;
+    if (ow != dst->ne[0] || oh != dst->ne[1] || dst->ne[2] != src1->ne[2] || dst->ne[3] != src1->ne[3]) {
+        return false;
+    }
+
+    const bool cwhn = ggml_is_contiguous_channels(src1);
+    if (!cwhn && !ggml_is_contiguous(src1)) {
+        return false;
+    }
+
+    const uint32_t c = (uint32_t) src1->ne[2];
+    const uint32_t n = (uint32_t) src1->ne[3];
+    const uint32_t total_tasks = cwhn ? (uint32_t) (oh * n) : (uint32_t) (c * n);
+
+    kparams->total_tasks = total_tasks;
+    kparams->n_threads   = total_tasks == 0 ? 1 : (std::min)((uint32_t) htp_session_n_threads(sess), total_tasks);
+    kparams->cwhn        = cwhn ? 1 : 0;
+    kparams->w           = (uint32_t) src1->ne[0];
+    kparams->h           = (uint32_t) src1->ne[1];
+    kparams->c           = c;
+    kparams->n           = n;
+    kparams->kw          = (uint32_t) src0->ne[0];
+    kparams->kh          = (uint32_t) src0->ne[1];
+    kparams->ow          = (uint32_t) ow;
+    kparams->oh          = (uint32_t) oh;
+    kparams->s0          = s0;
+    kparams->s1          = s1;
+    kparams->p0          = p0;
+    kparams->p1          = p1;
+    kparams->d0          = d0;
+    kparams->d1          = d1;
+
+    kparams->div_c  = init_fastdiv_values(c);
+    kparams->div_ow = init_fastdiv_values((uint32_t) ow);
+    kparams->div_oh = init_fastdiv_values((uint32_t) oh);
+
+    return true;
+}
+
 template <auto SolveFn>
 static inline bool htp_kparams_invoke(
     const struct ggml_hexagon_session * sess,
@@ -3853,6 +3929,9 @@ bool htp_kparams_solve(
 
         case HTP_OP_CONV_2D:
             return htp_kparams_invoke<htp_kparams_solve_conv2d>(sess, op, kparams);
+
+        case HTP_OP_CONV_2D_DW:
+            return htp_kparams_invoke<htp_kparams_solve_conv2d_dw>(sess, op, kparams);
 
         case HTP_OP_SUM_ROWS:
         case HTP_OP_SUM:

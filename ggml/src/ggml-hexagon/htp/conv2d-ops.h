@@ -78,6 +78,35 @@ static_assert(sizeof(struct htp_conv2d_kernel_params) <= 128, "htp_conv2d_kernel
 _Static_assert(sizeof(struct htp_conv2d_kernel_params) <= 128, "htp_conv2d_kernel_params is too large for kernel_params blob");
 #endif
 
+struct htp_conv2d_dw_kernel_params {
+    uint32_t total_tasks;
+    uint32_t n_threads;
+    uint32_t cwhn;
+    uint32_t w;
+    uint32_t h;
+    uint32_t c;
+    uint32_t n;
+    uint32_t kw;
+    uint32_t kh;
+    uint32_t ow;
+    uint32_t oh;
+    int32_t  s0;
+    int32_t  s1;
+    int32_t  p0;
+    int32_t  p1;
+    int32_t  d0;
+    int32_t  d1;
+    struct fastdiv_values div_c;
+    struct fastdiv_values div_ow;
+    struct fastdiv_values div_oh;
+};
+
+#if defined(__cplusplus)
+static_assert(sizeof(struct htp_conv2d_dw_kernel_params) <= 128, "htp_conv2d_dw_kernel_params is too large for kernel_params blob");
+#else
+_Static_assert(sizeof(struct htp_conv2d_dw_kernel_params) <= 128, "htp_conv2d_dw_kernel_params is too large for kernel_params blob");
+#endif
+
 struct htp_conv2d_vtcm_layout {
     size_t total_bytes;
     size_t off_scales;

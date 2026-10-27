@@ -2271,3 +2271,196 @@ int op_conv_2d(struct htp_ops_context * octx) {
 
     return HTP_STATUS_NO_SUPPORT;
 }
+
+struct conv2d_dw_context {
+    struct htp_ops_context *                   octx;
+    const struct htp_conv2d_dw_kernel_params * kp;
+    uint32_t                                   task_start;
+    uint32_t                                   task_count;
+    uint32_t                                   tasks_per_thread;
+};
+
+static void conv2d_dw_thread(unsigned int nth, unsigned int ith, void * data) {
+    const struct conv2d_dw_context * ctx = (const struct conv2d_dw_context *) data;
+    const struct htp_ops_context * octx  = ctx->octx;
+    const struct htp_conv2d_dw_kernel_params * kp = ctx->kp;
+    const struct htp_tensor * src0       = octx->src[0];
+    const struct htp_tensor * src1       = octx->src[1];
+    const struct htp_tensor * dst        = octx->dst;
+
+    const bool is_f16 = (src0->type == HTP_TYPE_F16);
+
+    const uint32_t t0 = ctx->task_start + ith * ctx->tasks_per_thread;
+    const uint32_t t1 = MIN(t0 + ctx->tasks_per_thread, ctx->task_start + ctx->task_count);
+    if (t0 >= t1) {
+        return;
+    }
+
+    (void) nth;
+
+    if (kp->cwhn) {
+        // CWHN: channels are contiguous
+        for (uint32_t t = t0; t < t1; ++t) {
+            const uint32_t n  = fastdiv(t, &kp->div_oh);
+            const uint32_t oh = t - n * kp->oh;
+
+            for (uint32_t ow = 0; ow < kp->ow; ++ow) {
+                float * out_ptr = (float *)((char *)dst->data + (size_t)n * dst->nb[3] + (size_t)oh * dst->nb[1] + (size_t)ow * dst->nb[0]);
+
+                for (uint32_t cb = 0; cb < kp->c; cb += 32) {
+                    const uint32_t rem = MIN(32, kp->c - cb);
+                    HVX_Vector acc = Q6_V_vzero();
+
+                    for (uint32_t kh = 0; kh < kp->kh; ++kh) {
+                        const int32_t ih = (int32_t)(oh * kp->s1 + kh * kp->d1) - kp->p1;
+                        if (ih < 0 || ih >= (int32_t)kp->h) {
+                            continue;
+                        }
+                        for (uint32_t kw = 0; kw < kp->kw; ++kw) {
+                            const int32_t iw = (int32_t)(ow * kp->s0 + kw * kp->d0) - kp->p0;
+                            if (iw < 0 || iw >= (int32_t)kp->w) {
+                                continue;
+                            }
+
+                            const char * in_ptr = (const char *)src1->data + (size_t)n * src1->nb[3] + (size_t)ih * src1->nb[1] + (size_t)iw * src1->nb[0] + (size_t)cb * src1->nb[2];
+                            const char * w_ptr  = (const char *)src0->data + (size_t)kh * src0->nb[1] + (size_t)kw * src0->nb[0] + (size_t)cb * src0->nb[3];
+
+                            HVX_Vector v_in = *(const HVX_UVector *)in_ptr;
+                            HVX_Vector v_w;
+                            if (is_f16) {
+                                HVX_Vector v_w16 = *(const HVX_UVector *)w_ptr;
+                                HVX_VectorPair pr = hvx_vec_f16_to_f32(v_w16);
+                                v_w = Q6_V_lo_W(pr);
+                            } else {
+                                v_w = *(const HVX_UVector *)w_ptr;
+                            }
+                            acc = hvx_vec_add_f32_f32(acc, hvx_vec_mul_f32_f32(v_in, v_w));
+                        }
+                    }
+
+                    if (rem == 32) {
+                        *(HVX_UVector *)(out_ptr + cb) = acc;
+                    } else {
+                        hvx_vec_store_u(out_ptr + cb, rem * sizeof(float), acc);
+                    }
+                }
+            }
+        }
+    } else {
+        // WHCN: width is contiguous
+        for (uint32_t t = t0; t < t1; ++t) {
+            const uint32_t n = fastdiv(t, &kp->div_c);
+            const uint32_t c = t - n * kp->c;
+
+            const char * in_plane  = (const char *)src1->data + (size_t)n * src1->nb[3] + (size_t)c * src1->nb[2];
+            char *       out_plane = (char *)dst->data + (size_t)n * dst->nb[3] + (size_t)c * dst->nb[2];
+            const char * w_chan    = (const char *)src0->data + (size_t)c * src0->nb[3];
+
+            float w_local[256];
+            for (uint32_t kh = 0; kh < kp->kh; ++kh) {
+                for (uint32_t kw = 0; kw < kp->kw; ++kw) {
+                    const void * ptr = w_chan + (size_t)kh * src0->nb[1] + (size_t)kw * src0->nb[0];
+                    w_local[kh * kp->kw + kw] = is_f16 ? (float)(*(const __fp16 *)ptr) : *(const float *)ptr;
+                }
+            }
+
+            for (uint32_t oh = 0; oh < kp->oh; ++oh) {
+                float * out_row = (float *)(out_plane + (size_t)oh * dst->nb[1]);
+
+                uint32_t ow = 0;
+                if (kp->s0 == 1 && kp->d0 == 1) {
+                    while (ow < kp->ow && (int32_t)ow < kp->p0) {
+                        float sum = 0.0f;
+                        for (uint32_t kh = 0; kh < kp->kh; ++kh) {
+                            const int32_t ih = (int32_t)(oh * kp->s1 + kh * kp->d1) - kp->p1;
+                            if (ih < 0 || ih >= (int32_t)kp->h) {
+                                continue;
+                            }
+                            const float * in_row = (const float *)(in_plane + (size_t)ih * src1->nb[1]);
+                            for (uint32_t kw = 0; kw < kp->kw; ++kw) {
+                                const int32_t iw = (int32_t)(ow + kw) - kp->p0;
+                                if (iw >= 0 && iw < (int32_t)kp->w) {
+                                    sum += w_local[kh * kp->kw + kw] * in_row[iw];
+                                }
+                            }
+                        }
+                        out_row[ow++] = sum;
+                    }
+
+                    const int32_t max_safe_ow = (int32_t)kp->w + kp->p0 - (int32_t)kp->kw - 31;
+                    for (; (int32_t)ow <= max_safe_ow && ow + 32 <= kp->ow; ow += 32) {
+                        HVX_Vector acc = Q6_V_vzero();
+                        for (uint32_t kh = 0; kh < kp->kh; ++kh) {
+                            const int32_t ih = (int32_t)(oh * kp->s1 + kh * kp->d1) - kp->p1;
+                            if (ih < 0 || ih >= (int32_t)kp->h) {
+                                continue;
+                            }
+                            const float * in_row = (const float *)(in_plane + (size_t)ih * src1->nb[1]);
+                            for (uint32_t kw = 0; kw < kp->kw; ++kw) {
+                                const int32_t iw0 = (int32_t)(ow + kw) - kp->p0;
+                                const HVX_Vector in_v = hvx_vmemu(in_row + iw0);
+                                const HVX_Vector w_v  = hvx_vec_splat_f32(w_local[kh * kp->kw + kw]);
+                                acc = hvx_vec_add_f32_f32(acc, hvx_vec_mul_f32_f32(in_v, w_v));
+                            }
+                        }
+                        *(HVX_UVector *)(out_row + ow) = acc;
+                    }
+                }
+
+                for (; ow < kp->ow; ++ow) {
+                    float sum = 0.0f;
+                    for (uint32_t kh = 0; kh < kp->kh; ++kh) {
+                        const int32_t ih = (int32_t)(oh * kp->s1 + kh * kp->d1) - kp->p1;
+                        if (ih < 0 || ih >= (int32_t)kp->h) {
+                            continue;
+                        }
+                        const float * in_row = (const float *)(in_plane + (size_t)ih * src1->nb[1]);
+                        for (uint32_t kw = 0; kw < kp->kw; ++kw) {
+                            const int32_t iw = (int32_t)(ow * kp->s0 + kw * kp->d0) - kp->p0;
+                            if (iw < 0 || iw >= (int32_t)kp->w) {
+                                continue;
+                            }
+                            sum += w_local[kh * kp->kw + kw] * in_row[iw];
+                        }
+                    }
+                    out_row[ow] = sum;
+                }
+            }
+        }
+    }
+}
+
+int op_conv_2d_dw(struct htp_ops_context * octx) {
+    const struct htp_conv2d_dw_kernel_params * kp =
+        (const struct htp_conv2d_dw_kernel_params *) octx->kernel_params;
+
+    if (kp->total_tasks == 0) {
+        return HTP_STATUS_OK;
+    }
+
+    uint32_t task_start = 0;
+    uint32_t task_count = kp->total_tasks;
+    if (octx->ctx->mdev.count > 1) {
+        const struct htp_tensor_mdev_range range = htp_tensor_mdev_partition(
+            task_count, 1, octx->ctx->mdev.idx, octx->ctx->mdev.count, &octx->ctx->mdev.count_div);
+        task_start = range.start;
+        task_count = range.count;
+    }
+    if (task_count == 0) {
+        return HTP_STATUS_OK;
+    }
+
+    const uint32_t nth = MIN(kp->n_threads, task_count);
+    const uint32_t tasks_per_thread = (task_count + nth - 1) / nth;
+
+    struct conv2d_dw_context ctx = {
+        .octx             = octx,
+        .kp               = kp,
+        .task_start       = task_start,
+        .task_count       = task_count,
+        .tasks_per_thread = tasks_per_thread,
+    };
+
+    work_queue_run(octx->ctx->work_queue, conv2d_dw_thread, &ctx, nth);
+    return HTP_STATUS_OK;
+}

@@ -1028,6 +1028,9 @@ static int execute_op(struct htp_ops_context * octx) {
         case HTP_OP_CONV_2D:
             return op_conv_2d(octx);
 
+        case HTP_OP_CONV_2D_DW:
+            return op_conv_2d_dw(octx);
+
         case HTP_OP_ROLL:
             return op_roll(octx);
 
