@@ -50,11 +50,11 @@ static_assert(sizeof(struct htp_upscale_kernel_params) <= 128, "htp_upscale_kern
 _Static_assert(sizeof(struct htp_upscale_kernel_params) <= 128, "htp_upscale_kernel_params is too large");
 #endif
 
-struct upscale_bilinear_x {
-    uint32_t x0;
-    uint32_t x1;
-    float    w0;
-    float    dx;
+struct upscale_bilinear_x_chunk {
+    int32_t  off0[32];
+    int32_t  off1[32];
+    float    w0[32];
+    float    dx[32];
 };
 
 struct upscale_bilinear_y {
@@ -90,8 +90,12 @@ struct htp_upscale_vtcm_layout {
     size_t   total_bytes;
     size_t   off_src;
     size_t   off_dst;
+    size_t   off_r;
+    size_t   off_gather;
     size_t   src_bytes_per_thread;
     size_t   dst_bytes_per_thread;
+    size_t   r_bytes_per_thread;
+    size_t   gather_bytes_per_thread;
     size_t   src_spad_half_size;
     size_t   dst_spad_half_size;
     uint32_t max_src_chunk_rows;
@@ -122,16 +126,20 @@ static inline void htp_upscale_vtcm_layout_build(
     const uint32_t src_chunk_bytes = src_x * max_src_rows * sizeof(float);
     const uint32_t dst_chunk_bytes = dst_x * dst_chunk_rows * sizeof(float);
 
-    L->max_src_chunk_rows   = max_src_rows;
-    L->dst_chunk_rows       = dst_chunk_rows;
-    L->src_spad_half_size   = hex_round_up(src_chunk_bytes + 256, 128);
-    L->dst_spad_half_size   = hex_round_up(dst_chunk_bytes, 128);
-    L->src_bytes_per_thread = 2 * L->src_spad_half_size;
-    L->dst_bytes_per_thread = 2 * L->dst_spad_half_size;
+    L->max_src_chunk_rows      = max_src_rows;
+    L->dst_chunk_rows          = dst_chunk_rows;
+    L->src_spad_half_size      = hex_round_up(src_chunk_bytes + 256, 128);
+    L->dst_spad_half_size      = hex_round_up(dst_chunk_bytes, 128);
+    L->src_bytes_per_thread    = 2 * L->src_spad_half_size;
+    L->dst_bytes_per_thread    = 2 * L->dst_spad_half_size;
+    L->r_bytes_per_thread      = hex_round_up(src_x * sizeof(float), 128);
+    L->gather_bytes_per_thread = 256;
 
     size_t off = 0;
-    VTCM_LAYOUT_ALLOC(off, off_src, L->src_bytes_per_thread * n_threads);
-    VTCM_LAYOUT_ALLOC(off, off_dst, L->dst_bytes_per_thread * n_threads);
+    VTCM_LAYOUT_ALLOC(off, off_src,    L->src_bytes_per_thread * n_threads);
+    VTCM_LAYOUT_ALLOC(off, off_dst,    L->dst_bytes_per_thread * n_threads);
+    VTCM_LAYOUT_ALLOC(off, off_r,      L->r_bytes_per_thread   * n_threads);
+    VTCM_LAYOUT_ALLOC(off, off_gather, L->gather_bytes_per_thread * n_threads);
     L->total_bytes = off;
 }
 

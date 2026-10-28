@@ -2454,6 +2454,26 @@ bool htp_kparams_solve_upscale(
         return false;
     }
 
+    size_t lut_x_size = 0;
+    size_t elem_y_sz  = sizeof(uint32_t);
+    if (mode_raw == HTP_UPSCALE_MODE_BICUBIC) {
+        lut_x_size = hex_round_up(dst_x * sizeof(struct upscale_bicubic_x), 128);
+        elem_y_sz  = sizeof(struct upscale_bicubic_y);
+    } else if (antialias) {
+        lut_x_size = hex_round_up(dst_x * sizeof(struct upscale_antialias_x), 128);
+        elem_y_sz  = sizeof(struct upscale_antialias_y);
+    } else if (mode_raw == HTP_UPSCALE_MODE_BILINEAR) {
+        const uint32_t n_chunks = (dst_x + 31) / 32;
+        lut_x_size = hex_round_up(n_chunks * sizeof(struct upscale_bilinear_x_chunk), 128);
+        elem_y_sz  = sizeof(struct upscale_bilinear_y);
+    } else {
+        lut_x_size = hex_round_up(dst_x * sizeof(uint32_t), 128);
+    }
+    const size_t total_lut_size = lut_x_size + hex_round_up(dst_y * elem_y_sz, 128);
+    if (total_lut_size > 512 * 1024) {
+        return false;
+    }
+
     const uint32_t chunks_per_slice = (dst_y + dst_nrows_per_chunk - 1) / dst_nrows_per_chunk;
     const uint32_t total_chunks     = total_slices * chunks_per_slice;
 
