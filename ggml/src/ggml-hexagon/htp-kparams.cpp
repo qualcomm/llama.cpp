@@ -4011,6 +4011,52 @@ static bool htp_kparams_solve_conv2d_dw(
     return true;
 }
 
+// shared dma layout of DSV4_HC_PRE/POST: jobs are 32-element chunks of a token row, each thread double-buffers
+// blocks of up to HTP_DSV4_HC_DMA_CHUNKS chunks with n_rows rows each in vtcm
+template <typename KParams>
+static bool htp_dsv4_hc_dma_layout_solve(
+    const struct ggml_hexagon_session * sess,
+    uint32_t n_embd,
+    uint32_t n_tokens,
+    uint32_t n_rows,
+    KParams * kparams
+) {
+    kparams->n_chunks   = (n_embd + HTP_DSV4_HC_CHUNK_ELEMS - 1) / HTP_DSV4_HC_CHUNK_ELEMS;
+    kparams->row_size   = n_embd * sizeof(float);
+    kparams->total_jobs = n_tokens * kparams->n_chunks;
+    if (kparams->total_jobs == 0) {
+        return true;
+    }
+
+    // largest per-device share of htp_tensor_mdev_partition() with one job per chunk
+    const uint32_t mdev_count = htp_session_mdev_count(sess);
+    const uint32_t n_jobs     = (mdev_count > 1 && kparams->total_jobs >= mdev_count)
+        ? (kparams->total_jobs + mdev_count - 1) / mdev_count
+        : kparams->total_jobs;
+
+    kparams->n_threads       = (std::min)(htp_session_n_threads(sess), n_jobs);
+    kparams->jobs_per_thread = (n_jobs + kparams->n_threads - 1) / kparams->n_threads;
+
+    // at least two blocks per thread so the dma of one block overlaps the compute of the other
+    uint32_t block_chunks = (std::min)({ (uint32_t) HTP_DSV4_HC_DMA_CHUNKS, kparams->n_chunks, (kparams->jobs_per_thread + 1) / 2 });
+    while (2 * kparams->n_threads * n_rows * block_chunks * 128 > htp_session_vtcm_size(sess)) {
+        if (block_chunks == 1) {
+            return false;
+        }
+        block_chunks /= 2;
+    }
+
+    kparams->dma_block_chunks = block_chunks;
+    kparams->dma_row_stride   = block_chunks * 128;
+    kparams->dma_buffer_size  = n_rows * kparams->dma_row_stride;
+    kparams->dma_vtcm_size    = 2 * kparams->dma_buffer_size * kparams->n_threads;
+
+    kparams->div_n_chunks  = init_fastdiv_values(kparams->n_chunks);
+    kparams->div_n_threads = init_fastdiv_values(kparams->n_threads);
+
+    return true;
+}
+
 static bool htp_kparams_solve_dsv4_hc_pre(
     const struct ggml_hexagon_session * sess,
     const struct ggml_tensor * op,
@@ -4049,38 +4095,19 @@ static bool htp_kparams_solve_dsv4_hc_pre(
         }
     }
 
-    const uint32_t n_tokens = (uint32_t) x->ne[2];
-    const bool     n_hc4    = x->ne[1] == 4;
+    const uint32_t n_hc     = (uint32_t) x->ne[1];
+    const uint32_t n_inputs = gated ? 2 : 1;
 
-    if (gated) {
-        kparams->kernel_type = n_hc4 ? HTP_DSV4_HC_PRE_KERNEL_GATED : HTP_DSV4_HC_PRE_KERNEL_GATED_GENERIC;
-    } else {
-        kparams->kernel_type = n_hc4 ? HTP_DSV4_HC_PRE_KERNEL_PLAIN : HTP_DSV4_HC_PRE_KERNEL_PLAIN_GENERIC;
+    kparams->kernel_type = gated ? HTP_DSV4_HC_PRE_KERNEL_GATED : HTP_DSV4_HC_PRE_KERNEL_PLAIN;
+    kparams->n_hc        = n_hc;
+
+    // x rows, gate rows (gated only), one dst row
+    if (!htp_dsv4_hc_dma_layout_solve(sess, (uint32_t) x->ne[0], (uint32_t) x->ne[2], n_inputs * n_hc + 1, kparams)) {
+        return false;
     }
 
-    kparams->n_chunks   = ((uint32_t) x->ne[0] + HTP_DSV4_HC_CHUNK_ELEMS - 1) / HTP_DSV4_HC_CHUNK_ELEMS;
-    kparams->total_jobs = n_tokens * kparams->n_chunks;
-    if (kparams->total_jobs == 0) {
-        return true;
-    }
-    kparams->n_threads       = (std::min)(htp_session_n_threads(sess), kparams->total_jobs);
-    kparams->jobs_per_thread = (kparams->total_jobs + kparams->n_threads - 1) / kparams->n_threads;
-
-    kparams->dma_block_chunks = (std::min)((uint32_t) HTP_DSV4_HC_DMA_CHUNKS, kparams->n_chunks);
-    kparams->dma_row_stride   = kparams->dma_block_chunks * 128;
-    kparams->dma_buffer_size  = HTP_DSV4_HC_PRE_DMA_ROWS * kparams->dma_row_stride;
-    kparams->dma_vtcm_size    = 2 * kparams->dma_buffer_size * kparams->n_threads;
-
-    if (gated && n_hc4 &&
-        n_tokens > 1 &&
-        x->ne[0] % HTP_DSV4_HC_CHUNK_ELEMS == 0 &&
-        kparams->jobs_per_thread >= 2*kparams->dma_block_chunks &&
-        kparams->dma_vtcm_size <= htp_session_vtcm_size(sess)) {
-        kparams->kernel_type = HTP_DSV4_HC_PRE_KERNEL_GATED_DMA;
-    }
-
-    kparams->div_n_chunks  = init_fastdiv_values(kparams->n_chunks);
-    kparams->div_n_threads = init_fastdiv_values(kparams->n_threads);
+    kparams->dma_g_offset = n_hc * kparams->dma_row_stride;
+    kparams->dma_d_offset = n_inputs * n_hc * kparams->dma_row_stride;
 
     return true;
 }
@@ -4114,34 +4141,9 @@ static bool htp_kparams_solve_dsv4_hc_post(
         return false;
     }
 
-    const uint32_t n_tokens = (uint32_t) x->ne[1];
+    kparams->has_comb = comb != nullptr;
 
-    kparams->has_comb   = comb != nullptr;
-    kparams->n_chunks   = ((uint32_t) x->ne[0] + HTP_DSV4_HC_CHUNK_ELEMS - 1) / HTP_DSV4_HC_CHUNK_ELEMS;
-    kparams->total_jobs = n_tokens * kparams->n_chunks;
-    if (kparams->total_jobs == 0) {
-        return true;
-    }
-    kparams->n_threads       = (std::min)(htp_session_n_threads(sess), kparams->total_jobs);
-    kparams->jobs_per_thread = (kparams->total_jobs + kparams->n_threads - 1) / kparams->n_threads;
-
-    kparams->dma_block_chunks = (std::min)((uint32_t) HTP_DSV4_HC_DMA_CHUNKS, kparams->n_chunks);
-    kparams->dma_row_stride   = kparams->dma_block_chunks * 128;
-    kparams->dma_buffer_size  = HTP_DSV4_HC_POST_DMA_ROWS*kparams->dma_row_stride;
-    kparams->dma_vtcm_size    = 2*kparams->dma_buffer_size*kparams->n_threads;
-
-    // decode uses l2 prefetch: per-thread data is too small to hide the dma latency
-    if (n_tokens > 1 &&
-        x->ne[0] % HTP_DSV4_HC_CHUNK_ELEMS == 0 &&
-        kparams->jobs_per_thread >= 2*kparams->dma_block_chunks &&
-        kparams->dma_vtcm_size <= htp_session_vtcm_size(sess)) {
-        kparams->kernel_type = HTP_DSV4_HC_POST_KERNEL_DMA;
-    }
-
-    kparams->div_n_chunks  = init_fastdiv_values(kparams->n_chunks);
-    kparams->div_n_threads = init_fastdiv_values(kparams->n_threads);
-
-    return true;
+    return htp_dsv4_hc_dma_layout_solve(sess, (uint32_t) x->ne[0], (uint32_t) x->ne[1], HTP_DSV4_HC_POST_DMA_ROWS, kparams);
 }
 
 template <auto SolveFn>
