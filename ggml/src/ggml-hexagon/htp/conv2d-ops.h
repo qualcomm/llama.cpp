@@ -21,6 +21,41 @@ enum htp_conv2d_kernel_type {
 // HMX scales of one row tile at the start of VTCM: 32 (scale, bias) fp16 pairs and 128 zero bytes
 #define HTP_CONV2D_HMX_SCALES_SIZE 256
 
+struct htp_conv2d_tiled_params {
+    uint32_t w_kstride;
+    uint32_t k_size;
+    uint32_t k_group;
+    uint32_t k_group_pad;
+    uint32_t n_groups;
+    uint32_t n_k_tiles;
+    uint32_t n_ow_tiles;
+    uint32_t seg_tiles;
+    uint32_t stage_row;
+    uint32_t n_stage;
+    uint32_t wk_chunk;
+    struct fastdiv_values div_ow_tiles;
+    struct fastdiv_values div_oh;
+};
+
+struct htp_conv2d_window_params {
+    uint32_t fold;
+    uint32_t n_cc;
+    uint32_t act_rt_last;
+    uint32_t sr;
+    uint32_t ihs;
+    uint32_t max_off;
+    uint32_t n_bc;
+    uint32_t seg_b;
+    uint32_t seg_t;
+    uint32_t w_cs;
+    struct fastdiv_values div_sr;
+    struct fastdiv_values div_ihs;
+    struct fastdiv_values div_kw;
+    struct fastdiv_values div_tg;
+    struct fastdiv_values div_cc;
+    struct fastdiv_values div_cs;
+};
+
 struct htp_conv2d_kernel_params {
     uint8_t  kernel_type;
     uint8_t  n_threads;
@@ -36,39 +71,8 @@ struct htp_conv2d_kernel_params {
     uint32_t vtcm_size;
 
     union {
-        struct {
-            uint32_t w_kstride;
-            uint32_t k_size;
-            uint32_t k_group;
-            uint32_t k_group_pad;
-            uint32_t n_groups;
-            uint32_t n_k_tiles;
-            uint32_t n_ow_tiles;
-            uint32_t seg_tiles;
-            uint32_t stage_row;
-            uint32_t n_stage;
-            uint32_t wk_chunk;
-            struct fastdiv_values div_ow_tiles;
-            struct fastdiv_values div_oh;
-        } tiled;
-        struct {
-            uint32_t fold;
-            uint32_t n_cc;
-            uint32_t act_rt_last;
-            uint32_t sr;
-            uint32_t ihs;
-            uint32_t max_off;
-            uint32_t n_bc;
-            uint32_t seg_b;
-            uint32_t seg_t;
-            uint32_t w_cs;
-            struct fastdiv_values div_sr;
-            struct fastdiv_values div_ihs;
-            struct fastdiv_values div_kw;
-            struct fastdiv_values div_tg;
-            struct fastdiv_values div_cc;
-            struct fastdiv_values div_cs;
-        } window;
+        struct htp_conv2d_tiled_params  tiled;
+        struct htp_conv2d_window_params window;
     };
 };
 
