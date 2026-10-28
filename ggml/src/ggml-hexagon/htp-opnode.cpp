@@ -19,6 +19,7 @@
 #include "htp/ssm-conv.h"
 #include "htp/sum-rows-ops.h"
 #include "htp/unary-ops.h"
+#include "htp/upscale-ops.h"
 
 #include <stdio.h>
 
@@ -224,6 +225,15 @@ static std::string format_kernel_params(const htp_opnode & node) {
     } else if (node.opcode == HTP_OP_SOLVE_TRI) {
         const auto * kparams = node.kparams<htp_solve_tri_kernel_params>();
         snprintf(str, max_size, "%s nth %d", kparams->batched ? "batched" : "chunked", (int) kparams->n_threads);
+    } else if (node.opcode == HTP_OP_UPSCALE) {
+        const auto * kparams = node.kparams<htp_upscale_kernel_params>();
+        const char * mode_str = "unknown";
+        switch (kparams->mode) {
+            case HTP_UPSCALE_MODE_NEAREST:  mode_str = "nearest";  break;
+            case HTP_UPSCALE_MODE_BILINEAR: mode_str = kparams->antialias ? "bilinear-aa" : (kparams->align_corners ? "bilinear-ac" : "bilinear"); break;
+            case HTP_UPSCALE_MODE_BICUBIC:  mode_str = "bicubic";  break;
+        }
+        snprintf(str, max_size, "%s nth %d chk %d", mode_str, (int) kparams->n_threads, (int) kparams->dst_nrows_per_chunk);
     } else {
         snprintf(str, max_size, "----");
     }

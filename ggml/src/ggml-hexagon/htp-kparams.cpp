@@ -58,6 +58,7 @@ htp_op_code htp_op_remap(const struct ggml_tensor * t) {
         case GGML_OP_IM2COL:          return HTP_OP_IM2COL;
         case GGML_OP_IM2COL_3D:       return HTP_OP_IM2COL_3D;
         case GGML_OP_ROLL:            return HTP_OP_ROLL;
+        case GGML_OP_UPSCALE:         return HTP_OP_UPSCALE;
 
         case GGML_OP_UNARY:
             switch (ggml_get_unary_op(t)) {
@@ -2375,6 +2376,114 @@ static bool htp_kparams_solve_pool_2d(
     return true;
 }
 
+bool htp_kparams_solve_upscale(
+    const struct ggml_hexagon_session * sess,
+    const struct ggml_tensor * op,
+    struct htp_upscale_kernel_params * kparams
+) {
+    memset(kparams, 0, sizeof(*kparams));
+
+    const struct ggml_tensor * src0 = op->src[0];
+    const struct ggml_tensor * dst  = op;
+
+    if (src0->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    if (src0->nb[0] != sizeof(float) || dst->nb[0] != sizeof(float)) {
+        return false;
+    }
+
+    const int32_t mode_flags = dst->op_params[0];
+    const uint32_t mode_raw  = (uint32_t) (mode_flags & 0xFF);
+    if (mode_raw >= GGML_SCALE_MODE_COUNT) {
+        return false;
+    }
+
+    const bool align_corners = (mode_flags & GGML_SCALE_FLAG_ALIGN_CORNERS) != 0;
+    const bool antialias     = (mode_flags & GGML_SCALE_FLAG_ANTIALIAS) != 0;
+
+    const uint32_t src_x = (uint32_t) src0->ne[0];
+    const uint32_t src_y = (uint32_t) src0->ne[1];
+    const uint32_t src_z = (uint32_t) src0->ne[2];
+    const uint32_t src_w = (uint32_t) src0->ne[3];
+
+    const uint32_t dst_x = (uint32_t) dst->ne[0];
+    const uint32_t dst_y = (uint32_t) dst->ne[1];
+    const uint32_t dst_z = (uint32_t) dst->ne[2];
+    const uint32_t dst_w = (uint32_t) dst->ne[3];
+
+    if (src_x == 0 || src_y == 0 || src_z == 0 || src_w == 0 ||
+        dst_x == 0 || dst_y == 0 || dst_z == 0 || dst_w == 0) {
+        return false;
+    }
+
+    float sf0 = (float) dst_x / (float) src_x;
+    float sf1 = (float) dst_y / (float) src_y;
+    float sf2 = (float) dst_z / (float) src_z;
+    float sf3 = (float) dst_w / (float) src_w;
+    float pixel_offset = 0.5f;
+
+    if (align_corners) {
+        pixel_offset = 0.0f;
+        sf0 = (dst_x > 1 && src_x > 1) ? (float) (dst_x - 1) / (float) (src_x - 1) : sf0;
+        sf1 = (dst_y > 1 && src_y > 1) ? (float) (dst_y - 1) / (float) (src_y - 1) : sf1;
+    }
+
+    const float inv_sf0 = 1.0f / sf0;
+    const float inv_sf1 = 1.0f / sf1;
+    const float inv_sf2 = 1.0f / sf2;
+    const float inv_sf3 = 1.0f / sf3;
+
+    const float support0  = antialias ? (std::max)(1.0f, inv_sf0) : 0.0f;
+    const float support1  = antialias ? (std::max)(1.0f, inv_sf1) : 0.0f;
+    const float invscale0 = antialias ? (1.0f / support0) : 0.0f;
+    const float invscale1 = antialias ? (1.0f / support1) : 0.0f;
+
+    const uint32_t total_slices = dst_z * dst_w;
+    const uint32_t n_threads    = (std::min)(htp_session_n_threads(sess), total_slices > 0 ? total_slices : 1);
+
+    struct htp_upscale_vtcm_layout layout;
+    uint32_t dst_nrows_per_chunk = 0;
+    if (!htp_upscale_solve_layout(&layout, src_x, src_y, dst_x, dst_y, inv_sf1, n_threads,
+                                  htp_session_vtcm_size(sess), &dst_nrows_per_chunk)) {
+        return false;
+    }
+
+    const uint32_t chunks_per_slice = (dst_y + dst_nrows_per_chunk - 1) / dst_nrows_per_chunk;
+    const uint32_t total_chunks     = total_slices * chunks_per_slice;
+
+    const uint32_t slice_dst_bytes  = dst_x * dst_y * sizeof(float);
+    const uint32_t slices_per_chunk = (slice_dst_bytes > 0) ? (HEX_L2_LINE_SIZE / hex_gcd_u32(slice_dst_bytes, HEX_L2_LINE_SIZE)) : 1;
+
+    kparams->mode                 = (uint8_t) mode_raw;
+    kparams->align_corners        = align_corners ? 1 : 0;
+    kparams->antialias            = antialias ? 1 : 0;
+
+    kparams->inv_sf0              = inv_sf0;
+    kparams->inv_sf1              = inv_sf1;
+    kparams->inv_sf2              = inv_sf2;
+    kparams->inv_sf3              = inv_sf3;
+    kparams->pixel_offset         = pixel_offset;
+
+    kparams->support0             = support0;
+    kparams->support1             = support1;
+    kparams->invscale0            = invscale0;
+    kparams->invscale1            = invscale1;
+
+    kparams->n_threads            = n_threads;
+    kparams->slices_per_chunk     = slices_per_chunk;
+
+    kparams->dst_nrows_per_chunk  = dst_nrows_per_chunk;
+    kparams->chunks_per_slice     = chunks_per_slice;
+    kparams->total_chunks         = total_chunks;
+
+    kparams->div_chunks_per_slice = init_fastdiv_values(chunks_per_slice > 0 ? chunks_per_slice : 1);
+    kparams->div_dst_z            = init_fastdiv_values(dst_z > 0 ? dst_z : 1);
+
+    return true;
+}
+
 static bool htp_kparams_solve_concat(
     const struct ggml_hexagon_session * sess,
     const struct ggml_tensor * op,
@@ -3462,6 +3571,9 @@ bool htp_kparams_solve(
         case HTP_OP_POOL_2D:
         case HTP_OP_POOL_1D:
             return htp_kparams_invoke<htp_kparams_solve_pool_2d>(sess, op, kparams);
+
+        case HTP_OP_UPSCALE:
+            return htp_kparams_invoke<htp_kparams_solve_upscale>(sess, op, kparams);
 
         case HTP_OP_CONCAT:
             return htp_kparams_invoke<htp_kparams_solve_concat>(sess, op, kparams);
