@@ -2084,6 +2084,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemv_noshuffle_q1_0_f32_ns1 = nullptr;  // no K-split, for tall M
     cl_kernel kernel_gemv_noshuffle_q2_0_f32 = nullptr;
     cl_kernel kernel_gemv_noshuffle_q2_0_f32_ns1 = nullptr;  // no K-split, for tall M
+    cl_kernel kernel_gemv_noshuffle_q2_0_f32_ns8 = nullptr;  // 8-wave K-split, for short M
     cl_kernel kernel_gemv_noshuffle_q4_k_f32;
     cl_kernel kernel_gemv_noshuffle_q4_k_f32_splitk;  // split-K across WGs (small M)
     cl_kernel kernel_gemv_splitk_reduce_f32;          // sums split-K partials
@@ -9086,6 +9087,11 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         cl_program prog_ns1 = build_program_from_source(backend_ctx, kernel_src.c_str(), ns1_opts);
         CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q2_0_f32_ns1 = clCreateKernel(prog_ns1, "kernel_gemv_noshuffle_q2_0_f32", &err), err));
         CL_CHECK(clReleaseProgram(prog_ns1));
+
+        std::string ns8_opts = CL_gemv_compile_opts + " -DN_SIMDGROUP=8";
+        cl_program prog_ns8 = build_program_from_source(backend_ctx, kernel_src.c_str(), ns8_opts);
+        CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q2_0_f32_ns8 = clCreateKernel(prog_ns8, "kernel_gemv_noshuffle_q2_0_f32", &err), err));
+        CL_CHECK(clReleaseProgram(prog_ns8));
         GGML_LOG_CONT(".");
     }
 
@@ -36854,7 +36860,14 @@ static void ggml_cl_mul_mat_q2_0_f32_adreno(ggml_backend_t backend, const ggml_t
     static const char * ns1_env = getenv("GGML_OPENCL_Q20_GEMV_NS1_MIN_M");
     const int ns1_min_m = ns1_env ? atoi(ns1_env) : INT_MAX;
     const bool use_ns1 = backend_ctx->kernel_gemv_noshuffle_q2_0_f32_ns1 && M >= ns1_min_m;
+    // a single column of a short matrix has too few waves to keep the memory busy with the
+    // 4-way K-split (2560 x 9216: 80 GB/s on the X2-90 against ~120 for tall M); 8 waves
+    // fill it. More columns, or more rows, already give enough waves and lose with 8.
+    static const char * ns8_env = getenv("GGML_OPENCL_Q20_GEMV_NS8_MAX_M");
+    const int ns8_max_m = ns8_env ? atoi(ns8_env) : 4096;
+    const bool use_ns8 = !use_ns1 && backend_ctx->kernel_gemv_noshuffle_q2_0_f32_ns8 && N == 1 && M <= ns8_max_m;
     cl_kernel kernel = use_ns1 ? backend_ctx->kernel_gemv_noshuffle_q2_0_f32_ns1
+                     : use_ns8 ? backend_ctx->kernel_gemv_noshuffle_q2_0_f32_ns8
                                : backend_ctx->kernel_gemv_noshuffle_q2_0_f32;
 
     const int r2 = 1;
@@ -36877,7 +36890,7 @@ static void ggml_cl_mul_mat_q2_0_f32_adreno(ggml_backend_t backend, const ggml_t
     CL_CHECK(clSetKernelArg(kernel, 14, sizeof(int),      &r3));
 
     const size_t wavesize = backend_ctx->adreno_wave_size;
-    const size_t nsg = use_ns1 ? 1 : 4;
+    const size_t nsg = use_ns1 ? 1 : use_ns8 ? 8 : 4;
     size_t local_work_size[]  = { wavesize, nsg, 1 };
     size_t global_work_size[] = { CEIL_DIV(M / rows, wavesize)*wavesize, nsg, (size_t)N };
 
