@@ -36849,9 +36849,10 @@ static void ggml_cl_mul_mat_q2_0_f32_adreno(ggml_backend_t backend, const ggml_t
     img_desc.buffer      = b_sub_buf;
     CL_CHECK((b_img = clCreateImage(context, CL_MEM_READ_ONLY, &img_fmt, &img_desc, NULL, &err), err));
 
-    // tall M has the rows to fill the GPU without the K-split (same rule as q1_0)
+    // the K-split is faster at every M measured, tall M included (X2-90 4B decode +19%, 840 and
+    // 850 up to +4%), so the no-split variant is opt-in by row count
     static const char * ns1_env = getenv("GGML_OPENCL_Q20_GEMV_NS1_MIN_M");
-    const int ns1_min_m = ns1_env ? atoi(ns1_env) : 8192;
+    const int ns1_min_m = ns1_env ? atoi(ns1_env) : INT_MAX;
     const bool use_ns1 = backend_ctx->kernel_gemv_noshuffle_q2_0_f32_ns1 && M >= ns1_min_m;
     cl_kernel kernel = use_ns1 ? backend_ctx->kernel_gemv_noshuffle_q2_0_f32_ns1
                                : backend_ctx->kernel_gemv_noshuffle_q2_0_f32;
