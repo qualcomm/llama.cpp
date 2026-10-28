@@ -2439,18 +2439,24 @@ bool htp_kparams_solve_upscale(
     const float inv_sf2 = 1.0f / sf2;
     const float inv_sf3 = 1.0f / sf3;
 
-    const float support0  = antialias ? (std::max)(1.0f, inv_sf0) : 0.0f;
-    const float support1  = antialias ? (std::max)(1.0f, inv_sf1) : 0.0f;
-    const float invscale0 = antialias ? (1.0f / support0) : 0.0f;
-    const float invscale1 = antialias ? (1.0f / support1) : 0.0f;
+    const float filter_radius0 = antialias ? (std::max)(1.0f, inv_sf0) : 0.0f;
+    const float filter_radius1 = antialias ? (std::max)(1.0f, inv_sf1) : 0.0f;
+    const float invscale0      = antialias ? (1.0f / filter_radius0) : 0.0f;
+    const float invscale1      = antialias ? (1.0f / filter_radius1) : 0.0f;
 
     const uint32_t total_slices = dst_z * dst_w;
-    const uint32_t n_threads    = (std::min)(htp_session_n_threads(sess), total_slices > 0 ? total_slices : 1);
+    uint32_t       n_threads    = htp_session_n_threads(sess);
 
     struct htp_upscale_vtcm_layout layout;
     uint32_t dst_nrows_per_chunk = 0;
-    if (!htp_upscale_solve_layout(&layout, src_x, src_y, dst_x, dst_y, inv_sf1, n_threads,
-                                  htp_session_vtcm_size(sess), &dst_nrows_per_chunk)) {
+    while (n_threads > 0) {
+        if (htp_upscale_solve_layout(&layout, src_x, src_y, dst_x, dst_y, inv_sf1, filter_radius1, n_threads,
+                                     htp_session_vtcm_size(sess), &dst_nrows_per_chunk)) {
+            break;
+        }
+        n_threads--;
+    }
+    if (n_threads == 0) {
         return false;
     }
 
@@ -2470,16 +2476,54 @@ bool htp_kparams_solve_upscale(
         lut_x_size = hex_round_up(dst_x * sizeof(uint32_t), 128);
     }
     const size_t total_lut_size = lut_x_size + hex_round_up(dst_y * elem_y_sz, 128);
-    if (total_lut_size > 512 * 1024) {
+    if (total_lut_size > HTP_DDR_SPAD_SIZE) {
         return false;
     }
 
     const uint32_t chunks_per_slice = (dst_y + dst_nrows_per_chunk - 1) / dst_nrows_per_chunk;
     const uint32_t total_chunks     = total_slices * chunks_per_slice;
 
-    const uint32_t slice_dst_bytes  = dst_x * dst_y * sizeof(float);
-    const uint32_t slices_per_chunk = (slice_dst_bytes > 0) ? (HEX_L2_LINE_SIZE / hex_gcd_u32(slice_dst_bytes, HEX_L2_LINE_SIZE)) : 1;
+    n_threads = (std::min)(n_threads, total_chunks > 0 ? total_chunks : 1);
+    htp_upscale_vtcm_layout_build(&layout, src_x, src_y, dst_x, dst_y, dst_nrows_per_chunk, inv_sf1, filter_radius1, n_threads);
 
+    const uint32_t slice_dst_bytes = dst_x * dst_y * sizeof(float);
+    const uint32_t chunk_dst_bytes = dst_x * dst_nrows_per_chunk * sizeof(float);
+    const bool     dst_contig      = (dst->nb[1] == (size_t) dst_x * sizeof(float)) &&
+                                     (dst_z <= 1 || dst->nb[2] == (size_t) dst_y * dst->nb[1]) &&
+                                     (dst_w <= 1 || dst->nb[3] == (size_t) dst_z * dst->nb[2]);
+
+    uint32_t chunks_per_group = 0;
+    if (dst_contig) {
+        const uint32_t slices_per_group = (slice_dst_bytes > 0)
+            ? (HEX_L2_LINE_SIZE / hex_gcd_u32(slice_dst_bytes, HEX_L2_LINE_SIZE))
+            : 1;
+        if (slices_per_group == 1 && (chunk_dst_bytes % HEX_L2_LINE_SIZE == 0)) {
+            chunks_per_group = 1;
+        } else {
+            chunks_per_group = slices_per_group * chunks_per_slice;
+        }
+    }
+
+    uint8_t kernel_type = HTP_UPSCALE_KERNEL_BILINEAR;
+    if (mode_raw == HTP_UPSCALE_MODE_NEAREST) {
+        if (dst_x == 2 * src_x && dst_y == 2 * src_y && !align_corners) {
+            kernel_type = HTP_UPSCALE_KERNEL_NEAREST_2X;
+        } else if (dst_x == 4 * src_x && dst_y == 4 * src_y && !align_corners) {
+            kernel_type = HTP_UPSCALE_KERNEL_NEAREST_4X;
+        } else {
+            kernel_type = HTP_UPSCALE_KERNEL_NEAREST;
+        }
+    } else if (mode_raw == HTP_UPSCALE_MODE_BICUBIC) {
+        kernel_type = HTP_UPSCALE_KERNEL_BICUBIC;
+    } else if (antialias) {
+        kernel_type = HTP_UPSCALE_KERNEL_BILINEAR_AA;
+    } else if (dst_x == 2 * src_x && dst_y == 2 * src_y && !align_corners && (src_x % 32 == 0)) {
+        kernel_type = HTP_UPSCALE_KERNEL_BILINEAR_2X;
+    } else {
+        kernel_type = HTP_UPSCALE_KERNEL_BILINEAR;
+    }
+
+    kparams->kernel_type          = kernel_type;
     kparams->mode                 = (uint8_t) mode_raw;
     kparams->align_corners        = align_corners ? 1 : 0;
     kparams->antialias            = antialias ? 1 : 0;
@@ -2490,17 +2534,18 @@ bool htp_kparams_solve_upscale(
     kparams->inv_sf3              = inv_sf3;
     kparams->pixel_offset         = pixel_offset;
 
-    kparams->support0             = support0;
-    kparams->support1             = support1;
+    kparams->filter_radius0       = filter_radius0;
+    kparams->filter_radius1       = filter_radius1;
     kparams->invscale0            = invscale0;
     kparams->invscale1            = invscale1;
 
     kparams->n_threads            = n_threads;
-    kparams->slices_per_chunk     = slices_per_chunk;
+    kparams->chunks_per_group     = chunks_per_group;
 
     kparams->dst_nrows_per_chunk  = dst_nrows_per_chunk;
     kparams->chunks_per_slice     = chunks_per_slice;
     kparams->total_chunks         = total_chunks;
+    kparams->vtcm_size            = (uint32_t) layout.total_bytes;
 
     kparams->div_chunks_per_slice = init_fastdiv_values(chunks_per_slice > 0 ? chunks_per_slice : 1);
     kparams->div_dst_z            = init_fastdiv_values(dst_z > 0 ? dst_z : 1);

@@ -51,10 +51,15 @@ static void upscale_init_luts_nearest(
     const uint32_t src_y = src0->ne[1];
     const uint32_t dst_x = dst->ne[0];
     const uint32_t dst_y = dst->ne[1];
+    const uint32_t dst_x_aligned = (dst_x + VLEN_FP32 - 1) & ~(VLEN_FP32 - 1);
 
-    for (uint32_t ox = 0; ox < dst_x; ++ox) {
-        uint32_t x0 = (uint32_t) ((float) ox * p->inv_sf0);
-        lut_x[ox] = MIN(x0, src_x - 1);
+    for (uint32_t ox = 0; ox < dst_x_aligned; ++ox) {
+        if (ox < dst_x) {
+            uint32_t x0 = (uint32_t) ((float) ox * p->inv_sf0);
+            lut_x[ox] = MIN(x0, src_x - 1) * sizeof(float);
+        } else {
+            lut_x[ox] = 0;
+        }
     }
     for (uint32_t oy = 0; oy < dst_y; ++oy) {
         uint32_t y0 = (uint32_t) ((float) oy * p->inv_sf1);
@@ -163,21 +168,21 @@ static void upscale_init_luts_antialias(
     const uint32_t dst_x = dst->ne[0];
     const uint32_t dst_y = dst->ne[1];
 
-    const float support0 = p->support0;
-    const float support1 = p->support1;
+    const float filter_radius0 = p->filter_radius0;
+    const float filter_radius1 = p->filter_radius1;
 
     for (uint32_t ox = 0; ox < dst_x; ++ox) {
         const float xf = ((float) ox + p->pixel_offset) * p->inv_sf0;
-        int32_t x_min = (int32_t) MAX(xf - support0 + p->pixel_offset, 0.0f);
-        int32_t x_max = (int32_t) MIN(xf + support0 + p->pixel_offset, (float) src_x);
+        int32_t x_min = (int32_t) MAX(xf - filter_radius0 + p->pixel_offset, 0.0f);
+        int32_t x_max = (int32_t) MIN(xf + filter_radius0 + p->pixel_offset, (float) src_x);
         lut_x[ox].x_min = clamp_i32(x_min, 0, (int32_t) src_x);
         lut_x[ox].x_max = clamp_i32(x_max, 0, (int32_t) src_x);
         lut_x[ox].xf    = xf;
     }
     for (uint32_t oy = 0; oy < dst_y; ++oy) {
         const float yf = ((float) oy + p->pixel_offset) * p->inv_sf1;
-        int32_t y_min = (int32_t) MAX(yf - support1 + p->pixel_offset, 0.0f);
-        int32_t y_max = (int32_t) MIN(yf + support1 + p->pixel_offset, (float) src_y);
+        int32_t y_min = (int32_t) MAX(yf - filter_radius1 + p->pixel_offset, 0.0f);
+        int32_t y_max = (int32_t) MIN(yf + filter_radius1 + p->pixel_offset, (float) src_y);
         lut_y[oy].y_min = clamp_i32(y_min, 0, (int32_t) src_y);
         lut_y[oy].y_max = clamp_i32(y_max, 0, (int32_t) src_y);
         lut_y[oy].yf    = yf;
@@ -279,49 +284,81 @@ static inline void resolve_src_slice(
     *out_src_yc        = s_yc;
 }
 
-static void compute_nearest_chunk(
+struct upscale_context;
+
+typedef void (*upscale_chunk_fn_t)(
+    const struct upscale_context * ctx,
     const float * srcb,
     float * dstb,
-    const struct htp_tensor * src0,
-    const struct htp_tensor * dst,
-    const uint32_t * lut_x,
-    const uint32_t * lut_y,
+    float * R_buf,
+    float * gather_tmp,
+    uint32_t dst_y_start,
+    uint32_t dst_y_count,
+    uint32_t src_y_start
+);
+
+struct upscale_context {
+    struct htp_ops_context * octx;
+    const struct htp_upscale_kernel_params * kparams;
+    struct htp_upscale_vtcm_layout layout;
+    upscale_chunk_fn_t compute_chunk;
+    const void * lut_x;
+    const void * lut_y;
+    uint32_t chunk_start;
+    uint32_t chunk_count;
+    uint32_t chunks_per_thread;
+};
+
+static void compute_nearest_chunk(
+    const struct upscale_context * ctx,
+    const float * srcb,
+    float * dstb,
+    float * R_buf,
+    float * gather_tmp,
     uint32_t dst_y_start,
     uint32_t dst_y_count,
     uint32_t src_y_start
 ) {
-    const uint32_t src_x = src0->ne[0];
-    const uint32_t dst_x = dst->ne[0];
+    const uint32_t src_x = ctx->octx->src[0]->ne[0];
+    const uint32_t dst_x = ctx->octx->dst->ne[0];
+    const uint32_t * lut_x = (const uint32_t *) ctx->lut_x;
+    const uint32_t * lut_y = (const uint32_t *) ctx->lut_y;
+    const uint32_t region_size = hex_round_up(src_x * sizeof(float), 128);
 
     for (uint32_t oy = dst_y_start; oy < dst_y_start + dst_y_count; ++oy) {
         const uint32_t y0 = lut_y[oy];
         const float * r0  = srcb + (y0 - src_y_start) * src_x;
         float * dst_row   = dstb + (oy - dst_y_start) * dst_x;
 
+        for (uint32_t ix = 0; ix < src_x; ix += VLEN_FP32) {
+            *(HVX_Vector *) (R_buf + ix) = hvx_vmemu(r0 + ix);
+        }
+
         for (uint32_t ox = 0; ox < dst_x; ox += VLEN_FP32) {
             const uint32_t rem = dst_x - ox;
             const uint32_t nbytes = (rem < VLEN_FP32) ? (rem * sizeof(float)) : VLEN;
-            float tmp[VLEN_FP32] __attribute__((aligned(128)));
-            const uint32_t cnt = rem < VLEN_FP32 ? rem : VLEN_FP32;
-            for (uint32_t l = 0; l < cnt; ++l) {
-                tmp[l] = r0[lut_x[ox + l]];
-            }
-            hvx_vec_store_u(dst_row + ox, nbytes, hvx_vmem(tmp));
+            const HVX_Vector voff = hvx_vmem(lut_x + ox);
+            Q6_vgather_ARMVw((HVX_Vector *) gather_tmp, (size_t) R_buf, region_size, voff);
+            hvx_gather_sync(gather_tmp);
+            hvx_vec_store_u(dst_row + ox, nbytes, hvx_vmem(gather_tmp));
         }
     }
 }
 
 static void compute_nearest_2x_chunk(
+    const struct upscale_context * ctx,
     const float * srcb,
     float * dstb,
-    const struct htp_tensor * src0,
-    const struct htp_tensor * dst,
+    float * R_buf,
+    float * gather_tmp,
     uint32_t dst_y_start,
     uint32_t dst_y_count,
     uint32_t src_y_start
 ) {
-    const uint32_t src_x = src0->ne[0];
-    const uint32_t dst_x = dst->ne[0];
+    (void) R_buf;
+    (void) gather_tmp;
+    const uint32_t src_x = ctx->octx->src[0]->ne[0];
+    const uint32_t dst_x = ctx->octx->dst->ne[0];
 
     for (uint32_t oy = dst_y_start; oy < dst_y_start + dst_y_count; ++oy) {
         const uint32_t sy = oy >> 1;
@@ -351,16 +388,19 @@ static void compute_nearest_2x_chunk(
 }
 
 static void compute_nearest_4x_chunk(
+    const struct upscale_context * ctx,
     const float * srcb,
     float * dstb,
-    const struct htp_tensor * src0,
-    const struct htp_tensor * dst,
+    float * R_buf,
+    float * gather_tmp,
     uint32_t dst_y_start,
     uint32_t dst_y_count,
     uint32_t src_y_start
 ) {
-    const uint32_t src_x = src0->ne[0];
-    const uint32_t dst_x = dst->ne[0];
+    (void) R_buf;
+    (void) gather_tmp;
+    const uint32_t src_x = ctx->octx->src[0]->ne[0];
+    const uint32_t dst_x = ctx->octx->dst->ne[0];
 
     for (uint32_t oy = dst_y_start; oy < dst_y_start + dst_y_count; ++oy) {
         const uint32_t sy = oy >> 2;
@@ -419,6 +459,7 @@ static inline void compute_bilinear_chunk_32(
 
     Q6_vgather_ARMVw((HVX_Vector *) tmp_a, (size_t) R_buf, region_size, voff0);
     Q6_vgather_ARMVw((HVX_Vector *) tmp_b, (size_t) R_buf, region_size, voff1);
+    hvx_gather_sync(tmp_b);
 
     const HVX_Vector va = hvx_vmem(tmp_a);
     const HVX_Vector vb = hvx_vmem(tmp_b);
@@ -432,20 +473,19 @@ static inline void compute_bilinear_chunk_32(
 }
 
 static void compute_bilinear_chunk(
+    const struct upscale_context * ctx,
     const float * srcb,
     float * dstb,
-    const struct htp_tensor * src0,
-    const struct htp_tensor * dst,
-    const struct upscale_bilinear_x_chunk * lut_x,
-    const struct upscale_bilinear_y * lut_y,
     float * R_buf,
     float * gather_tmp,
     uint32_t dst_y_start,
     uint32_t dst_y_count,
     uint32_t src_y_start
 ) {
-    const uint32_t src_x = src0->ne[0];
-    const uint32_t dst_x = dst->ne[0];
+    const uint32_t src_x = ctx->octx->src[0]->ne[0];
+    const uint32_t dst_x = ctx->octx->dst->ne[0];
+    const struct upscale_bilinear_x_chunk * lut_x = (const struct upscale_bilinear_x_chunk *) ctx->lut_x;
+    const struct upscale_bilinear_y * lut_y = (const struct upscale_bilinear_y *) ctx->lut_y;
     const uint32_t n_chunks = (dst_x + VLEN_FP32 - 1) / VLEN_FP32;
     const uint32_t region_size = hex_round_up(src_x * sizeof(float), 128);
     float * tmp_a = gather_tmp;
@@ -484,17 +524,20 @@ static void compute_bilinear_chunk(
 }
 
 static void compute_bilinear_2x_chunk(
+    const struct upscale_context * ctx,
     const float * srcb,
     float * dstb,
-    const struct htp_tensor * src0,
-    const struct htp_tensor * dst,
-    const struct upscale_bilinear_y * lut_y,
+    float * R_buf,
+    float * gather_tmp,
     uint32_t dst_y_start,
     uint32_t dst_y_count,
     uint32_t src_y_start
 ) {
-    const uint32_t src_x = src0->ne[0];
-    const uint32_t dst_x = dst->ne[0];
+    (void) R_buf;
+    (void) gather_tmp;
+    const uint32_t src_x = ctx->octx->src[0]->ne[0];
+    const uint32_t dst_x = ctx->octx->dst->ne[0];
+    const struct upscale_bilinear_y * lut_y = (const struct upscale_bilinear_y *) ctx->lut_y;
     const HVX_Vector c_075 = hvx_vec_splat_f32(0.75f);
     const HVX_Vector c_025 = hvx_vec_splat_f32(0.25f);
 
@@ -505,32 +548,28 @@ static void compute_bilinear_2x_chunk(
         float * dst_row  = dstb + (oy - dst_y_start) * dst_x;
 
         const bool same_row = (ey->y0 == ey->y1);
-        const float wy0 = ey->wy0;
-        const float wy1 = ey->wy1;
-        const HVX_Vector vwy0 = hvx_vec_splat_f32(wy0);
-        const HVX_Vector vwy1 = hvx_vec_splat_f32(wy1);
+        const HVX_Vector vwy0 = hvx_vec_splat_f32(ey->wy0);
+        const HVX_Vector vwy1 = hvx_vec_splat_f32(ey->wy1);
 
-        const float first_val = same_row ? r0[0] : (wy0 * r0[0] + wy1 * r1[0]);
-        HVX_Vector v_prev = hvx_vec_splat_f32(first_val);
-
-        HVX_Vector v_curr = hvx_vmemu(r0);
+        HVX_Vector v_curr = hvx_vmem(r0);
         if (!same_row) {
-            const HVX_Vector v1 = hvx_vmemu(r1);
+            const HVX_Vector v1 = hvx_vmem(r1);
             v_curr = hvx_vec_add_f32_f32(hvx_vec_mul_f32_f32(vwy0, v_curr), hvx_vec_mul_f32_f32(vwy1, v1));
         }
+
+        HVX_Vector v_prev = Q6_V_vror_VR(v_curr, 4);
 
         for (uint32_t ix = 0; ix < src_x; ix += VLEN_FP32) {
             HVX_Vector v_next_chunk;
             const uint32_t next_ix = ix + VLEN_FP32;
             if (next_ix < src_x) {
-                v_next_chunk = hvx_vmemu(r0 + next_ix);
+                v_next_chunk = hvx_vmem(r0 + next_ix);
                 if (!same_row) {
-                    const HVX_Vector v1 = hvx_vmemu(r1 + next_ix);
+                    const HVX_Vector v1 = hvx_vmem(r1 + next_ix);
                     v_next_chunk = hvx_vec_add_f32_f32(hvx_vec_mul_f32_f32(vwy0, v_next_chunk), hvx_vec_mul_f32_f32(vwy1, v1));
                 }
             } else {
-                const float last_val = same_row ? r0[src_x - 1] : (wy0 * r0[src_x - 1] + wy1 * r1[src_x - 1]);
-                v_next_chunk = hvx_vec_splat_f32(last_val);
+                v_next_chunk = Q6_V_vror_VR(v_curr, 124);
             }
 
             const HVX_Vector v_shl = Q6_V_valign_VVR(v_curr, v_prev, 124);
@@ -544,8 +583,8 @@ static void compute_bilinear_2x_chunk(
             const HVX_Vector out1 = Q6_V_hi_W(p);
 
             const uint32_t ox0 = 2 * ix;
-            hvx_vec_store_u(dst_row + ox0, VLEN, out0);
-            hvx_vec_store_u(dst_row + ox0 + VLEN_FP32, VLEN, out1);
+            hvx_vmem(dst_row + ox0)             = out0;
+            hvx_vmem(dst_row + ox0 + VLEN_FP32) = out1;
 
             v_prev = v_curr;
             v_curr = v_next_chunk;
@@ -554,19 +593,22 @@ static void compute_bilinear_2x_chunk(
 }
 
 static void compute_bilinear_antialias_chunk(
+    const struct upscale_context * ctx,
     const float * srcb,
     float * dstb,
-    const struct htp_tensor * src0,
-    const struct htp_tensor * dst,
-    const struct htp_upscale_kernel_params * p,
-    const struct upscale_antialias_x * lut_x,
-    const struct upscale_antialias_y * lut_y,
+    float * R_buf,
+    float * gather_tmp,
     uint32_t dst_y_start,
     uint32_t dst_y_count,
     uint32_t src_y_start
 ) {
-    const uint32_t src_x = src0->ne[0];
-    const uint32_t dst_x = dst->ne[0];
+    (void) R_buf;
+    (void) gather_tmp;
+    const uint32_t src_x = ctx->octx->src[0]->ne[0];
+    const uint32_t dst_x = ctx->octx->dst->ne[0];
+    const struct htp_upscale_kernel_params * p = ctx->kparams;
+    const struct upscale_antialias_x * lut_x = (const struct upscale_antialias_x *) ctx->lut_x;
+    const struct upscale_antialias_y * lut_y = (const struct upscale_antialias_y *) ctx->lut_y;
 
     const float invscale1 = p->invscale1;
     const float invscale0 = p->invscale0;
@@ -624,18 +666,21 @@ static void compute_bilinear_antialias_chunk(
 }
 
 static void compute_bicubic_chunk(
+    const struct upscale_context * ctx,
     const float * srcb,
     float * dstb,
-    const struct htp_tensor * src0,
-    const struct htp_tensor * dst,
-    const struct upscale_bicubic_x * lut_x,
-    const struct upscale_bicubic_y * lut_y,
+    float * R_buf,
+    float * gather_tmp,
     uint32_t dst_y_start,
     uint32_t dst_y_count,
     uint32_t src_y_start
 ) {
-    const uint32_t src_x = src0->ne[0];
-    const uint32_t dst_x = dst->ne[0];
+    (void) R_buf;
+    (void) gather_tmp;
+    const uint32_t src_x = ctx->octx->src[0]->ne[0];
+    const uint32_t dst_x = ctx->octx->dst->ne[0];
+    const struct upscale_bicubic_x * lut_x = (const struct upscale_bicubic_x *) ctx->lut_x;
+    const struct upscale_bicubic_y * lut_y = (const struct upscale_bicubic_y *) ctx->lut_y;
 
     for (uint32_t oy = dst_y_start; oy < dst_y_start + dst_y_count; ++oy) {
         const struct upscale_bicubic_y * ey = &lut_y[oy];
@@ -711,17 +756,6 @@ static inline void dma_push_src_chunk(
     }
 }
 
-struct upscale_context {
-    struct htp_ops_context * octx;
-    const struct htp_upscale_kernel_params * kparams;
-    struct htp_upscale_vtcm_layout layout;
-    const void * lut_x;
-    const void * lut_y;
-    uint32_t chunk_start;
-    uint32_t chunk_count;
-    uint32_t chunks_per_thread;
-};
-
 static void upscale_worker(unsigned int nth, unsigned int ith, void * data) {
     struct upscale_context * ctx = (struct upscale_context *) data;
     const struct htp_upscale_kernel_params * p = ctx->kparams;
@@ -747,7 +781,6 @@ static void upscale_worker(unsigned int nth, unsigned int ith, void * data) {
     uint8_t * dst_spad   = VTCM_LAYOUT_PTR(uint8_t, vtcm_base, L->off_dst)    + ith * L->dst_bytes_per_thread;
     float   * R_buf      = VTCM_LAYOUT_PTR(float,   vtcm_base, L->off_r)      + ith * (L->r_bytes_per_thread / sizeof(float));
     float   * gather_tmp = VTCM_LAYOUT_PTR(float,   vtcm_base, L->off_gather) + ith * (L->gather_bytes_per_thread / sizeof(float));
-    const void * lut_x   = ctx->lut_x;
     const void * lut_y   = ctx->lut_y;
 
     float * srcb2[2] = { (float *) src_spad, (float *) (src_spad + src_spad_half) };
@@ -786,26 +819,7 @@ static void upscale_worker(unsigned int nth, unsigned int ith, void * data) {
         get_src_y_window(src0, dst, p, lut_y, dst_ys, dst_yc, &src_ys, &src_yc);
 
         htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) (first + i));
-        if (p->mode == HTP_UPSCALE_MODE_NEAREST) {
-            if (dst->ne[0] == 2 * src0->ne[0] && dst->ne[1] == 2 * src0->ne[1]) {
-                compute_nearest_2x_chunk(srcb, dstb, src0, dst, dst_ys, dst_yc, src_ys);
-            } else if (dst->ne[0] == 4 * src0->ne[0] && dst->ne[1] == 4 * src0->ne[1]) {
-                compute_nearest_4x_chunk(srcb, dstb, src0, dst, dst_ys, dst_yc, src_ys);
-            } else {
-                compute_nearest_chunk(srcb, dstb, src0, dst, (const uint32_t *) lut_x, (const uint32_t *) lut_y, dst_ys, dst_yc, src_ys);
-            }
-        } else if (p->mode == HTP_UPSCALE_MODE_BICUBIC) {
-            compute_bicubic_chunk(srcb, dstb, src0, dst, (const struct upscale_bicubic_x *) lut_x, (const struct upscale_bicubic_y *) lut_y, dst_ys, dst_yc, src_ys);
-        } else if (p->antialias) {
-            compute_bilinear_antialias_chunk(srcb, dstb, src0, dst, p, (const struct upscale_antialias_x *) lut_x, (const struct upscale_antialias_y *) lut_y, dst_ys, dst_yc, src_ys);
-        } else {
-            if (dst->ne[0] == 2 * src0->ne[0] && dst->ne[1] == 2 * src0->ne[1] &&
-                !p->align_corners && (src0->ne[0] % VLEN_FP32 == 0)) {
-                compute_bilinear_2x_chunk(srcb, dstb, src0, dst, (const struct upscale_bilinear_y *) lut_y, dst_ys, dst_yc, src_ys);
-            } else {
-                compute_bilinear_chunk(srcb, dstb, src0, dst, (const struct upscale_bilinear_x_chunk *) lut_x, (const struct upscale_bilinear_y *) lut_y, R_buf, gather_tmp, dst_ys, dst_yc, src_ys);
-            }
-        }
+        ctx->compute_chunk(ctx, srcb, dstb, R_buf, gather_tmp, dst_ys, dst_yc, src_ys);
         htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) (first + i));
 
         const dma_addr_t dst_addr = dst->data + slice_dst_off + (dma_addr_t) dst_ys * dst_stride;
@@ -842,7 +856,7 @@ int op_upscale(struct htp_ops_context * octx) {
 
     if (octx->ctx->mdev.count > 1) {
         const struct htp_tensor_mdev_range range = htp_tensor_mdev_partition(
-            chunk_count, htp_tensor_mdev_data_aligned(dst) ? p->slices_per_chunk : 0,
+            chunk_count, htp_tensor_mdev_data_aligned(dst) ? p->chunks_per_group : 0,
             octx->ctx->mdev.idx, octx->ctx->mdev.count, &octx->ctx->mdev.count_div);
         chunk_start = range.start;
         chunk_count = range.count;
@@ -897,9 +911,37 @@ int op_upscale(struct htp_ops_context * octx) {
         upscale_init_luts_bilinear((struct upscale_bilinear_x_chunk *) lut_x, (struct upscale_bilinear_y *) lut_y, src0, dst, p);
     }
 
+    upscale_chunk_fn_t compute_chunk;
+    switch (p->kernel_type) {
+        case HTP_UPSCALE_KERNEL_NEAREST:
+            compute_chunk = compute_nearest_chunk;
+            break;
+        case HTP_UPSCALE_KERNEL_NEAREST_2X:
+            compute_chunk = compute_nearest_2x_chunk;
+            break;
+        case HTP_UPSCALE_KERNEL_NEAREST_4X:
+            compute_chunk = compute_nearest_4x_chunk;
+            break;
+        case HTP_UPSCALE_KERNEL_BILINEAR:
+            compute_chunk = compute_bilinear_chunk;
+            break;
+        case HTP_UPSCALE_KERNEL_BILINEAR_2X:
+            compute_chunk = compute_bilinear_2x_chunk;
+            break;
+        case HTP_UPSCALE_KERNEL_BILINEAR_AA:
+            compute_chunk = compute_bilinear_antialias_chunk;
+            break;
+        case HTP_UPSCALE_KERNEL_BICUBIC:
+            compute_chunk = compute_bicubic_chunk;
+            break;
+        default:
+            return HTP_STATUS_INVAL_PARAMS;
+    }
+
     struct upscale_context ctx = {
         .octx               = octx,
         .kparams            = p,
+        .compute_chunk      = compute_chunk,
         .lut_x              = lut_x,
         .lut_y              = lut_y,
         .chunk_start        = chunk_start,
@@ -908,7 +950,7 @@ int op_upscale(struct htp_ops_context * octx) {
     };
 
     htp_upscale_vtcm_layout_build(&ctx.layout, src_x, src_y, dst_x, dst_y,
-                                  p->dst_nrows_per_chunk, p->inv_sf1, n_threads);
+                                  p->dst_nrows_per_chunk, p->inv_sf1, p->filter_radius1, n_threads);
 
     work_queue_run(octx->ctx->work_queue, upscale_worker, &ctx, n_threads);
 

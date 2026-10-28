@@ -227,13 +227,17 @@ static std::string format_kernel_params(const htp_opnode & node) {
         snprintf(str, max_size, "%s nth %d", kparams->batched ? "batched" : "chunked", (int) kparams->n_threads);
     } else if (node.opcode == HTP_OP_UPSCALE) {
         const auto * kparams = node.kparams<htp_upscale_kernel_params>();
-        const char * mode_str = "unknown";
-        switch (kparams->mode) {
-            case HTP_UPSCALE_MODE_NEAREST:  mode_str = "nearest";  break;
-            case HTP_UPSCALE_MODE_BILINEAR: mode_str = kparams->antialias ? "bilinear-aa" : (kparams->align_corners ? "bilinear-ac" : "bilinear"); break;
-            case HTP_UPSCALE_MODE_BICUBIC:  mode_str = "bicubic";  break;
+        const char * ktype_str = "unknown";
+        switch (kparams->kernel_type) {
+            case HTP_UPSCALE_KERNEL_NEAREST:     ktype_str = "nearest";     break;
+            case HTP_UPSCALE_KERNEL_NEAREST_2X:  ktype_str = "nearest-2x";  break;
+            case HTP_UPSCALE_KERNEL_NEAREST_4X:  ktype_str = "nearest-4x";  break;
+            case HTP_UPSCALE_KERNEL_BILINEAR:    ktype_str = kparams->align_corners ? "bilinear-ac" : "bilinear"; break;
+            case HTP_UPSCALE_KERNEL_BILINEAR_2X: ktype_str = "bilinear-2x"; break;
+            case HTP_UPSCALE_KERNEL_BILINEAR_AA: ktype_str = "bilinear-aa"; break;
+            case HTP_UPSCALE_KERNEL_BICUBIC:     ktype_str = "bicubic";     break;
         }
-        snprintf(str, max_size, "%s nth %d chk %d", mode_str, (int) kparams->n_threads, (int) kparams->dst_nrows_per_chunk);
+        snprintf(str, max_size, "%s nth %d chk %d vtcm %u", ktype_str, (int) kparams->n_threads, (int) kparams->dst_nrows_per_chunk, (unsigned int) kparams->vtcm_size);
     } else {
         snprintf(str, max_size, "----");
     }

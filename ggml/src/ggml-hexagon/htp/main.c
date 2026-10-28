@@ -677,7 +677,7 @@ AEEResult htp_iface_start(remote_handle64 handle, uint32_t sess_id, uint64_t dsp
         dma_ptr_curr += size_dma_q;
     }
 
-    ctx->ddr_spad_size = 512 * 1024; // 512 KB
+    ctx->ddr_spad_size = HTP_DDR_SPAD_SIZE;
     ctx->ddr_spad_base = memalign(128, ctx->ddr_spad_size);
 
     void * wq_ptr = (void *) ((uintptr_t) block + offset_wq);

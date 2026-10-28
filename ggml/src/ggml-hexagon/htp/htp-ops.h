@@ -135,6 +135,8 @@ enum htp_op_code {
 
 #define HTP_MMAP_MAX_VMEM  (2147483648u)
 
+#define HTP_DDR_SPAD_SIZE  (512 * 1024)
+
 enum htp_tensor_flags {
     HTP_TENSOR_WEIGHT   = (1U << 0), // Tensor buffer model weight data (not compute)
     HTP_TENSOR_TILED    = (1U << 1), // Tensor is in tiled format
