@@ -136,8 +136,17 @@ bool htp_kparams_solve_unary_mul_glu(
 
 bool htp_kparams_solve_upscale(
     const struct ggml_hexagon_session * sess,
-    const struct ggml_tensor * op,
+    const struct ggml_tensor * src0,
+    const struct ggml_tensor * dst,
     struct htp_upscale_kernel_params * kparams
 );
+
+static inline bool htp_kparams_solve_upscale(
+    const struct ggml_hexagon_session * sess,
+    const struct ggml_tensor * op,
+    struct htp_upscale_kernel_params * kparams
+) {
+    return htp_kparams_solve_upscale(sess, op->src[0], op, kparams);
+}
 
 #endif // HTP_KPARAMS_H

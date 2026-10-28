@@ -2378,30 +2378,15 @@ static bool htp_kparams_solve_pool_2d(
 
 bool htp_kparams_solve_upscale(
     const struct ggml_hexagon_session * sess,
-    const struct ggml_tensor * op,
+    const struct ggml_tensor * src0,
+    const struct ggml_tensor * dst,
     struct htp_upscale_kernel_params * kparams
 ) {
     memset(kparams, 0, sizeof(*kparams));
 
-    const struct ggml_tensor * src0 = op->src[0];
-    const struct ggml_tensor * dst  = op;
-
     if (src0->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
         return false;
     }
-
-    if (src0->nb[0] != sizeof(float) || dst->nb[0] != sizeof(float)) {
-        return false;
-    }
-
-    const int32_t mode_flags = dst->op_params[0];
-    const uint32_t mode_raw  = (uint32_t) (mode_flags & 0xFF);
-    if (mode_raw >= GGML_SCALE_MODE_COUNT) {
-        return false;
-    }
-
-    const bool align_corners = (mode_flags & GGML_SCALE_FLAG_ALIGN_CORNERS) != 0;
-    const bool antialias     = (mode_flags & GGML_SCALE_FLAG_ANTIALIAS) != 0;
 
     const uint32_t src_x = (uint32_t) src0->ne[0];
     const uint32_t src_y = (uint32_t) src0->ne[1];
@@ -2417,6 +2402,25 @@ bool htp_kparams_solve_upscale(
         dst_x == 0 || dst_y == 0 || dst_z == 0 || dst_w == 0) {
         return false;
     }
+
+    const bool is_src_contig_row = (src0->nb[0] == sizeof(float));
+    const bool is_src_strided_2d = (src0->nb[0] > sizeof(float)) &&
+                                   (src0->nb[0] % sizeof(float) == 0) &&
+                                   (src0->nb[1] == (size_t) src_x * src0->nb[0]) &&
+                                   ((size_t) src_x * src_y <= 0xFFFFu);
+
+    if ((!is_src_contig_row && !is_src_strided_2d) || dst->nb[0] != sizeof(float)) {
+        return false;
+    }
+
+    const int32_t mode_flags = dst->op_params[0];
+    const uint32_t mode_raw  = (uint32_t) (mode_flags & 0xFF);
+    if (mode_raw >= GGML_SCALE_MODE_COUNT) {
+        return false;
+    }
+
+    const bool align_corners = (mode_flags & GGML_SCALE_FLAG_ALIGN_CORNERS) != 0;
+    const bool antialias     = (mode_flags & GGML_SCALE_FLAG_ANTIALIAS) != 0;
 
     float sf0 = (float) dst_x / (float) src_x;
     float sf1 = (float) dst_y / (float) src_y;
@@ -3481,6 +3485,31 @@ void htp_opnode_collapse(const struct ggml_hexagon_session * sess, htp_opnode & 
         }
         return;
     }
+
+    if (node.opcode == HTP_OP_UPSCALE) {
+        if (node.inputs.empty() || !node.inputs[0] || node.outputs.empty() || !node.outputs[0]) {
+            return;
+        }
+        const struct ggml_tensor * src0 = node.inputs[0];
+        const struct ggml_tensor * dst  = node.outputs[0];
+
+        if ((src0->ne[3] > 1 || dst->ne[3] > 1) &&
+            src0->ne[2] == dst->ne[2] && src0->ne[3] == dst->ne[3] &&
+            src0->nb[3] == (size_t) src0->ne[2] * src0->nb[2] &&
+            dst->nb[3]  == (size_t) dst->ne[2]  * dst->nb[2]) {
+            struct ggml_tensor src0_c = *src0;
+            struct ggml_tensor dst_c  = *dst;
+            src0_c.ne[2] *= src0_c.ne[3];
+            src0_c.ne[3] = 1;
+            src0_c.nb[3] = (size_t) src0_c.ne[2] * src0_c.nb[2];
+            dst_c.ne[2]  *= dst_c.ne[3];
+            dst_c.ne[3]  = 1;
+            dst_c.nb[3]  = (size_t) dst_c.ne[2] * dst_c.nb[2];
+            node.inputs[0]  = node.add_dummy(src0_c);
+            node.outputs[0] = node.add_dummy(dst_c);
+        }
+        return;
+    }
 }
 
 bool htp_kparams_solve(
@@ -3510,6 +3539,9 @@ bool htp_kparams_solve(
         const size_t src2_size = src2 ? hex_round_up(ggml_nbytes(src2), 128) : 0;
         return htp_kparams_solve_matmul_impl(sess, src0, src1, dst, src2 ? src2->nb[1] : 0, src2_size, node.kparams<htp_mm_kernel_params>());
     }
+    if (node.opcode == HTP_OP_UPSCALE) {
+        return htp_kparams_solve_upscale(sess, src0, dst, node.kparams<htp_upscale_kernel_params>());
+    }
 
     return htp_kparams_solve(sess, node.node, node.kernel_params);
 }
@@ -3520,7 +3552,7 @@ bool htp_kparams_solve(
     void * kparams
 ) {
     const htp_op_code opcode = htp_op_remap(op);
-    if (htp_op_is_unary(opcode) || htp_op_is_glu(opcode)) {
+    if (htp_op_is_unary(opcode) || htp_op_is_glu(opcode) || opcode == HTP_OP_UPSCALE) {
         htp_opnode tmp(opcode, op);
         if (!htp_kparams_solve(sess, tmp)) {
             return false;
@@ -3571,9 +3603,6 @@ bool htp_kparams_solve(
         case HTP_OP_POOL_2D:
         case HTP_OP_POOL_1D:
             return htp_kparams_invoke<htp_kparams_solve_pool_2d>(sess, op, kparams);
-
-        case HTP_OP_UPSCALE:
-            return htp_kparams_invoke<htp_kparams_solve_upscale>(sess, op, kparams);
 
         case HTP_OP_CONCAT:
             return htp_kparams_invoke<htp_kparams_solve_concat>(sess, op, kparams);

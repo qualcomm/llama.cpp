@@ -657,6 +657,31 @@ static void compute_bicubic_chunk(
     }
 }
 
+static inline void dma_push_src_chunk(
+    dma_queue * dma_q,
+    float * spad,
+    const struct htp_tensor * src0,
+    dma_addr_t slice_src_off,
+    uint32_t src_ys,
+    uint32_t src_yc
+) {
+    const uint32_t src_x = src0->ne[0];
+    const dma_addr_t src_addr = src0->data + slice_src_off + (dma_addr_t) src_ys * src0->nb[1];
+
+    if (src0->nb[0] == sizeof(float)) {
+        const uint32_t row_size   = src_x * sizeof(float);
+        const uint32_t dst_stride = row_size;
+        const uint32_t src_stride = src0->nb[1];
+        dma_queue_push(dma_q, dma_make_data(spad, src_addr), dst_stride, src_stride, row_size, src_yc);
+    } else {
+        const uint32_t row_size   = sizeof(float);
+        const uint32_t dst_stride = sizeof(float);
+        const uint32_t src_stride = src0->nb[0];
+        const uint32_t nrows      = src_x * src_yc;
+        dma_queue_push(dma_q, dma_make_data(spad, src_addr), dst_stride, src_stride, row_size, nrows);
+    }
+}
+
 struct upscale_context {
     struct htp_ops_context * octx;
     const struct htp_upscale_kernel_params * kparams;
@@ -697,9 +722,7 @@ static void upscale_worker(unsigned int nth, unsigned int ith, void * data) {
     float * srcb2[2] = { (float *) src_spad, (float *) (src_spad + src_spad_half) };
     float * dstb2[2] = { (float *) dst_spad, (float *) (dst_spad + dst_spad_half) };
 
-    const uint32_t src_row_size = src0->ne[0] * sizeof(float);
     const uint32_t dst_row_size = dst->ne[0] * sizeof(float);
-    const uint32_t src_stride   = src0->nb[1];
     const uint32_t dst_stride   = dst->nb[1];
 
     const uint32_t total = last - first;
@@ -712,8 +735,7 @@ static void upscale_worker(unsigned int nth, unsigned int ith, void * data) {
         uint32_t src_ys, src_yc;
         resolve_src_slice(src0, dst, p, lut_y, first + i, &slice_src_off, &src_ys, &src_yc);
 
-        const dma_addr_t src_addr = src0->data + slice_src_off + (dma_addr_t) src_ys * src_stride;
-        dma_queue_push(dma_q, dma_make_data(srcb2[i], src_addr), src_row_size, src_stride, src_row_size, src_yc);
+        dma_push_src_chunk(dma_q, srcb2[i], src0, slice_src_off, src_ys, src_yc);
     }
 
     // Steady state loop
@@ -764,8 +786,7 @@ static void upscale_worker(unsigned int nth, unsigned int ith, void * data) {
             uint32_t next_src_ys, next_src_yc;
             resolve_src_slice(src0, dst, p, lut_y, first + next, &next_src_off, &next_src_ys, &next_src_yc);
 
-            const dma_addr_t next_src_addr = src0->data + next_src_off + (dma_addr_t) next_src_ys * src_stride;
-            dma_queue_push(dma_q, dma_make_data(srcb, next_src_addr), src_row_size, src_stride, src_row_size, next_src_yc);
+            dma_push_src_chunk(dma_q, srcb, src0, next_src_off, next_src_ys, next_src_yc);
         }
     }
 
