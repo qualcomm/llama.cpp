@@ -2342,7 +2342,80 @@ static inline void conv2d_dw_get_slice(
     }
 }
 
-static void conv2d_dw_compute_whcn_vtcm(
+__attribute__((noinline))
+static void conv2d_dw_compute_whcn_s2_k3x3(
+    const float * restrict in_vtcm,
+    float * restrict       out_vtcm,
+    const float * restrict w,
+    uint32_t               oh_start,
+    uint32_t               oh_len,
+    int32_t                ih_first,
+    uint32_t               w_in,
+    uint32_t               h_in,
+    uint32_t               ow) {
+
+    for (uint32_t ohi = 0; ohi < oh_len; ++ohi) {
+        const uint32_t oh = oh_start + ohi;
+        float * restrict out_row = out_vtcm + (size_t) ohi * ow;
+
+        for (uint32_t ox = 0; ox < ow; ox += 32) {
+            const uint32_t rem    = ow - ox;
+            const uint32_t nbytes = (rem < 32) ? (rem * sizeof(float)) : 128;
+            HVX_Vector acc0       = Q6_V_vzero();
+            HVX_Vector acc1       = Q6_V_vzero();
+            HVX_Vector acc2       = Q6_V_vzero();
+
+            for (uint32_t kh = 0; kh < 3; ++kh) {
+                const int32_t ih = (int32_t) (2 * oh + kh) - 1;
+                if (ih < 0 || ih >= (int32_t) h_in) {
+                    continue;
+                }
+                const int32_t ih_local = ih - ih_first;
+                const float * restrict in_row = in_vtcm + (size_t) ih_local * w_in;
+
+                const HVX_Vector w0 = hvx_vec_splat_f32(w[kh * 3 + 0]);
+                const HVX_Vector w1 = hvx_vec_splat_f32(w[kh * 3 + 1]);
+                const HVX_Vector w2 = hvx_vec_splat_f32(w[kh * 3 + 2]);
+
+                HVX_Vector v0 = Q6_V_vzero();
+                HVX_Vector v1 = Q6_V_vzero();
+                const int32_t rem_w = (int32_t) w_in - (int32_t) (2 * ox);
+                if (rem_w >= 64) {
+                    v0 = hvx_vmemu(in_row + 2 * ox);
+                    v1 = hvx_vmemu(in_row + 2 * ox + 32);
+                } else if (rem_w >= 32) {
+                    v0 = hvx_vmemu(in_row + 2 * ox);
+                    if (rem_w > 32) {
+                        const HVX_VectorPred q = Q6_Q_vsetq_R((rem_w - 32) * sizeof(float));
+                        v1 = Q6_V_vmux_QVV(q, hvx_vmemu(in_row + 2 * ox + 32), Q6_V_vzero());
+                    }
+                } else if (rem_w > 0) {
+                    const HVX_VectorPred q = Q6_Q_vsetq_R(rem_w * sizeof(float));
+                    v0 = Q6_V_vmux_QVV(q, hvx_vmemu(in_row + 2 * ox), Q6_V_vzero());
+                }
+
+                const HVX_VectorPair vp = Q6_W_vdeal_VVR(v1, v0, -4);
+                const HVX_Vector v_even = Q6_V_lo_W(vp);
+                const HVX_Vector v_odd  = Q6_V_hi_W(vp);
+                const HVX_Vector v_left = Q6_V_valign_VVR(v_odd, Q6_V_vzero(), 124);
+
+                acc0 = hvx_vec_add_f32_f32(acc0, hvx_vec_mul_f32_f32(v_left, w0));
+                acc1 = hvx_vec_add_f32_f32(acc1, hvx_vec_mul_f32_f32(v_even, w1));
+                acc2 = hvx_vec_add_f32_f32(acc2, hvx_vec_mul_f32_f32(v_odd,  w2));
+            }
+
+            HVX_Vector acc_out = hvx_vec_add_f32_f32(hvx_vec_add_f32_f32(acc0, acc1), acc2);
+            if (rem < 32) {
+                const HVX_VectorPred q = Q6_Q_vsetq_R(rem * sizeof(float));
+                acc_out = Q6_V_vmux_QVV(q, acc_out, Q6_V_vzero());
+            }
+            hvx_vec_store_u(out_row + ox, nbytes, acc_out);
+        }
+    }
+}
+
+__attribute__((noinline))
+static void conv2d_dw_compute_whcn(
     const float * in_vtcm,
     float *       out_vtcm,
     const void *  w_vtcm,
@@ -2362,6 +2435,14 @@ static void conv2d_dw_compute_whcn_vtcm(
         }
     }
 
+    if (kp->kw == 3 && kp->kh == 3 && kp->s0 == 2 && kp->s1 == 2 &&
+        kp->p0 == 1 && kp->p1 == 1 && kp->d0 == 1 && kp->d1 == 1) {
+        conv2d_dw_compute_whcn_s2_k3x3(in_vtcm, out_vtcm, w_local,
+                                       slice->oh_start, slice->oh_len, slice->ih_first,
+                                       kp->w, kp->h, kp->ow);
+        return;
+    }
+
     const uint32_t s0 = (uint32_t) kp->s0;
     const int32_t  p0 = kp->p0;
     const int32_t  p1 = kp->p1;
@@ -2376,7 +2457,10 @@ static void conv2d_dw_compute_whcn_vtcm(
         for (uint32_t ox = 0; ox < kp->ow; ox += 32) {
             const uint32_t rem    = kp->ow - ox;
             const uint32_t nbytes = (rem < 32) ? (rem * sizeof(float)) : 128;
-            HVX_Vector acc[4]     = { Q6_V_vzero(), Q6_V_vzero(), Q6_V_vzero(), Q6_V_vzero() };
+            HVX_Vector acc0       = Q6_V_vzero();
+            HVX_Vector acc1       = Q6_V_vzero();
+            HVX_Vector acc2       = Q6_V_vzero();
+            HVX_Vector acc3       = Q6_V_vzero();
 
             for (uint32_t kh = 0; kh < kp->kh; ++kh) {
                 const int32_t ih = (int32_t) (oh * s1 + kh * d1) - p1;
@@ -2432,12 +2516,18 @@ static void conv2d_dw_compute_whcn_vtcm(
                         }
                     }
 
-                    acc[kw & 3] = hvx_vec_add_f32_f32(acc[kw & 3], hvx_vec_mul_f32_f32(in_v, w_v));
+                    const HVX_Vector prod = hvx_vec_mul_f32_f32(in_v, w_v);
+                    switch (kw & 3) {
+                        case 0: acc0 = hvx_vec_add_f32_f32(acc0, prod); break;
+                        case 1: acc1 = hvx_vec_add_f32_f32(acc1, prod); break;
+                        case 2: acc2 = hvx_vec_add_f32_f32(acc2, prod); break;
+                        case 3: acc3 = hvx_vec_add_f32_f32(acc3, prod); break;
+                    }
                 }
             }
 
-            const HVX_Vector acc01   = hvx_vec_add_f32_f32(acc[0], acc[1]);
-            const HVX_Vector acc23   = hvx_vec_add_f32_f32(acc[2], acc[3]);
+            const HVX_Vector acc01   = hvx_vec_add_f32_f32(acc0, acc1);
+            const HVX_Vector acc23   = hvx_vec_add_f32_f32(acc2, acc3);
             const HVX_Vector acc_out = hvx_vec_add_f32_f32(acc01, acc23);
 
             hvx_vec_store_u(out_row + ox, nbytes, acc_out);
@@ -2445,7 +2535,8 @@ static void conv2d_dw_compute_whcn_vtcm(
     }
 }
 
-static void conv2d_dw_compute_cwhn_vtcm(
+__attribute__((noinline))
+static void conv2d_dw_compute_cwhn(
     const float * in_vtcm,
     float *       out_vtcm,
     const void *  w_vtcm,
@@ -2463,7 +2554,10 @@ static void conv2d_dw_compute_cwhn_vtcm(
 
             for (uint32_t cb = 0; cb < kp->c; cb += 32) {
                 const uint32_t rem = MIN(32, kp->c - cb);
-                HVX_Vector acc[4]  = { Q6_V_vzero(), Q6_V_vzero(), Q6_V_vzero(), Q6_V_vzero() };
+                HVX_Vector acc0 = Q6_V_vzero();
+                HVX_Vector acc1 = Q6_V_vzero();
+                HVX_Vector acc2 = Q6_V_vzero();
+                HVX_Vector acc3 = Q6_V_vzero();
 
                 for (uint32_t kh = 0; kh < kp->kh; ++kh) {
                     const int32_t ih = (int32_t)(oh * kp->s1 + kh * kp->d1) - kp->p1;
@@ -2489,12 +2583,18 @@ static void conv2d_dw_compute_cwhn_vtcm(
                         } else {
                             v_w = hvx_vmemu(w_ptr);
                         }
-                        acc[kw & 3] = hvx_vec_add_f32_f32(acc[kw & 3], hvx_vec_mul_f32_f32(v_in, v_w));
+                        const HVX_Vector prod = hvx_vec_mul_f32_f32(v_in, v_w);
+                        switch (kw & 3) {
+                            case 0: acc0 = hvx_vec_add_f32_f32(acc0, prod); break;
+                            case 1: acc1 = hvx_vec_add_f32_f32(acc1, prod); break;
+                            case 2: acc2 = hvx_vec_add_f32_f32(acc2, prod); break;
+                            case 3: acc3 = hvx_vec_add_f32_f32(acc3, prod); break;
+                        }
                     }
                 }
 
-                const HVX_Vector acc01   = hvx_vec_add_f32_f32(acc[0], acc[1]);
-                const HVX_Vector acc23   = hvx_vec_add_f32_f32(acc[2], acc[3]);
+                const HVX_Vector acc01   = hvx_vec_add_f32_f32(acc0, acc1);
+                const HVX_Vector acc23   = hvx_vec_add_f32_f32(acc2, acc3);
                 const HVX_Vector acc_out = hvx_vec_add_f32_f32(acc01, acc23);
 
                 if (rem == 32) {
@@ -2670,7 +2770,7 @@ int op_conv_2d_dw(struct htp_ops_context * octx) {
         .kp               = kp,
         .layout           = layout,
         .w_vtcm           = w_vtcm,
-        .compute_fn       = kp->cwhn ? conv2d_dw_compute_cwhn_vtcm : conv2d_dw_compute_whcn_vtcm,
+        .compute_fn       = kp->cwhn ? conv2d_dw_compute_cwhn : conv2d_dw_compute_whcn,
         .task_start       = task_start,
         .task_count       = task_count,
         .tasks_per_thread = tasks_per_thread,
