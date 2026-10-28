@@ -1792,11 +1792,6 @@ static bool htp_kparams_solve_softmax(
         return false;
     }
 
-    const int64_t ne0 = src0->ne[0];
-    if ((ne0 > 32 && (ne0 & (32 - 1)) != 0) || ne0 > 131072) {
-        return false;
-    }
-
     const uint32_t src0_nrows          = src0->ne[1] * src0->ne[2] * src0->ne[3];
     const size_t   dst_data_row_size   = op->ne[0] * ggml_type_size(op->type);
     const uint32_t min_rows_per_thread = (uint32_t) (std::max<size_t>(1, (128 + dst_data_row_size - 1) / dst_data_row_size));
