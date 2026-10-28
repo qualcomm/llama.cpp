@@ -3728,6 +3728,29 @@ static bool htp_kparams_solve_conv2d_dw(
         ? (ow_u * c * (uint32_t) sizeof(float))
         : (ow_u * (uint32_t) sizeof(float));
 
+    uint8_t kernel_type = HTP_CONV2D_DW_KERNEL_UNSUPPORTED;
+    if (cwhn) {
+        kernel_type = HTP_CONV2D_DW_KERNEL_CWHN;
+    } else if ((w & 31) == 0 && kw == 3 && kh == 3 && p0 == 1 && p1 == 1 && d0 == 1 && d1 == 1 && s0 == 1 && s1 == 1) {
+        kernel_type = HTP_CONV2D_DW_KERNEL_WHCN_S1_K3X3;
+    } else if ((w & 31) == 0 && kw == 3 && kh == 3 && p0 == 1 && p1 == 1 && d0 == 1 && d1 == 1 && s0 == 2 && s1 == 2) {
+        if (w == 32 && ow_u == 16) {
+            kernel_type = HTP_CONV2D_DW_KERNEL_WHCN_S2_K3X3_W32;
+        } else if (w == 64 && ow_u == 32) {
+            kernel_type = HTP_CONV2D_DW_KERNEL_WHCN_S2_K3X3_W64;
+        } else {
+            kernel_type = HTP_CONV2D_DW_KERNEL_WHCN_S2_K3X3;
+        }
+    } else if (s0 == 1) {
+        kernel_type = HTP_CONV2D_DW_KERNEL_WHCN_S1;
+    } else {
+        kernel_type = HTP_CONV2D_DW_KERNEL_WHCN_S2;
+    }
+
+    const bool     fast_k3x3      = kernel_type >= HTP_CONV2D_DW_KERNEL_WHCN_S1_K3X3;
+    const uint32_t pad_rows       = fast_k3x3 ? 4 : 0;
+    const uint32_t pad_top_stride = fast_k3x3 ? w : 0;
+
     const size_t vtcm_budget = (sess && htp_session_vtcm_size(sess) > 0) ? htp_session_vtcm_size(sess) : 0;
     if (vtcm_budget == 0) {
         return false;
@@ -3743,7 +3766,7 @@ static bool htp_kparams_solve_conv2d_dw(
 
     while (true) {
         const uint32_t max_ih_chunk = (std::min)(h, (oh_chunk - 1) * (uint32_t) s1 + (kh - 1) * (uint32_t) d1 + 1);
-        const uint32_t max_src_bytes = max_ih_chunk * row_src_bytes + 128;
+        const uint32_t max_src_bytes = (max_ih_chunk + pad_rows) * row_src_bytes + 128;
         const uint32_t max_dst_bytes = oh_chunk * row_dst_bytes + 128;
 
         htp_conv2d_dw_vtcm_layout_build(&layout, max_src_bytes, max_dst_bytes, w_size, n_threads);
@@ -3769,32 +3792,37 @@ static bool htp_kparams_solve_conv2d_dw(
     }
 
     const uint32_t max_ih_chunk = (std::min)(h, (oh_chunk - 1) * (uint32_t) s1 + (kh - 1) * (uint32_t) d1 + 1);
-    const uint32_t max_src_bytes = max_ih_chunk * row_src_bytes + 128;
+    const uint32_t max_src_bytes = (max_ih_chunk + pad_rows) * row_src_bytes + 128;
     const uint32_t max_dst_bytes = oh_chunk * row_dst_bytes + 128;
     htp_conv2d_dw_vtcm_layout_build(&layout, max_src_bytes, max_dst_bytes, w_size, n_threads);
 
-    kparams->total_tasks  = total_tasks;
-    kparams->n_threads    = n_threads;
-    kparams->cwhn         = cwhn ? 1 : 0;
-    kparams->vtcm_size    = (uint32_t) layout.total_bytes;
-    kparams->w            = w;
-    kparams->h            = h;
-    kparams->c            = c;
-    kparams->n            = n;
-    kparams->kw           = kw;
-    kparams->kh           = kh;
-    kparams->ow           = ow_u;
-    kparams->oh           = oh_u;
-    kparams->s0           = s0;
-    kparams->s1           = s1;
-    kparams->p0           = p0;
-    kparams->p1           = p1;
-    kparams->d0           = d0;
-    kparams->d1           = d1;
-    kparams->oh_chunk     = oh_chunk;
-    kparams->n_chunks     = n_chunks;
-    kparams->div_c        = init_fastdiv_values(c);
-    kparams->div_n_chunks = init_fastdiv_values(n_chunks > 0 ? n_chunks : 1);
+    kparams->kernel_type    = kernel_type;
+    kparams->n_threads      = (uint8_t) n_threads;
+    kparams->cwhn           = cwhn ? 1 : 0;
+    kparams->is_f16         = (src0->type == GGML_TYPE_F16) ? 1 : 0;
+    kparams->total_tasks    = total_tasks;
+    kparams->vtcm_size      = (uint32_t) layout.total_bytes;
+    kparams->w              = w;
+    kparams->h              = h;
+    kparams->c              = c;
+    kparams->n              = n;
+    kparams->kw             = kw;
+    kparams->kh             = kh;
+    kparams->ow             = ow_u;
+    kparams->oh             = oh_u;
+    kparams->s0             = s0;
+    kparams->s1             = s1;
+    kparams->p0             = p0;
+    kparams->p1             = p1;
+    kparams->d0             = d0;
+    kparams->d1             = d1;
+    kparams->oh_chunk       = oh_chunk;
+    kparams->n_chunks       = n_chunks;
+    kparams->row_src_bytes  = row_src_bytes;
+    kparams->row_dst_bytes  = row_dst_bytes;
+    kparams->pad_top_stride = pad_top_stride;
+    kparams->div_c          = init_fastdiv_values(c);
+    kparams->div_n_chunks   = init_fastdiv_values(n_chunks > 0 ? n_chunks : 1);
 
     return true;
 }

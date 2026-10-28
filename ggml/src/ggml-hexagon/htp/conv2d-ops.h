@@ -82,10 +82,25 @@ static_assert(sizeof(struct htp_conv2d_kernel_params) <= 128, "htp_conv2d_kernel
 _Static_assert(sizeof(struct htp_conv2d_kernel_params) <= 128, "htp_conv2d_kernel_params is too large for kernel_params blob");
 #endif
 
+enum htp_conv2d_dw_kernel_type {
+    HTP_CONV2D_DW_KERNEL_UNSUPPORTED = 0,
+    HTP_CONV2D_DW_KERNEL_CWHN,             // CWHN channel-contiguous layout
+    HTP_CONV2D_DW_KERNEL_WHCN_S1,          // WHCN general stride-1
+    HTP_CONV2D_DW_KERNEL_WHCN_S2,          // WHCN general stride-2
+    HTP_CONV2D_DW_KERNEL_WHCN_S1_K3X3,     // WHCN aligned w%32==0, 3x3 s=1 p=1 d=1
+    HTP_CONV2D_DW_KERNEL_WHCN_S2_K3X3_W32, // WHCN w=32->ow=16, 3x3 s=2 p=1 d=1 (2 rows per vector)
+    HTP_CONV2D_DW_KERNEL_WHCN_S2_K3X3_W64, // WHCN w=64->ow=32, 3x3 s=2 p=1 d=1 (1 vector rolling kh)
+    HTP_CONV2D_DW_KERNEL_WHCN_S2_K3X3,     // WHCN aligned w%32==0 (w>=96), 3x3 s=2 p=1 d=1
+    HTP_CONV2D_DW_KERNEL_COUNT,
+};
+
 struct htp_conv2d_dw_kernel_params {
+    uint8_t  kernel_type;
+    uint8_t  n_threads;
+    uint8_t  cwhn;
+    uint8_t  is_f16;
+
     uint32_t total_tasks;
-    uint32_t n_threads;
-    uint32_t cwhn;
     uint32_t vtcm_size;
     uint32_t w;
     uint32_t h;
@@ -103,6 +118,9 @@ struct htp_conv2d_dw_kernel_params {
     int32_t  d1;
     uint32_t oh_chunk;
     uint32_t n_chunks;
+    uint32_t row_src_bytes;
+    uint32_t row_dst_bytes;
+    uint32_t pad_top_stride;
     struct fastdiv_values div_c;
     struct fastdiv_values div_n_chunks;
 };
