@@ -11617,6 +11617,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 514, 2, 512, {1, 1}, {1, 1}));
         }
     }
+    // q2_0 at the Ternary-Bonsai projection shapes: row counts that fill the row-tiled
+    // GEMVs, K long enough for their K-split, and a row count that is only a multiple of 4
+    for (int64_t m : {1024, 2560, 4100, 9216}) {
+        for (int64_t k : {2560, 9216}) {
+            for (int n : {1, 3}) {
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q2_0, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+            }
+        }
+    }
 #else
     // m = a rows
     // n = b rows
