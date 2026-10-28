@@ -2376,7 +2376,7 @@ static void conv2d_dw_compute_whcn_vtcm(
         for (uint32_t ox = 0; ox < kp->ow; ox += 32) {
             const uint32_t rem    = kp->ow - ox;
             const uint32_t nbytes = (rem < 32) ? (rem * sizeof(float)) : 128;
-            HVX_Vector acc        = Q6_V_vzero();
+            HVX_Vector acc[4]     = { Q6_V_vzero(), Q6_V_vzero(), Q6_V_vzero(), Q6_V_vzero() };
 
             for (uint32_t kh = 0; kh < kp->kh; ++kh) {
                 const int32_t ih = (int32_t) (oh * s1 + kh * d1) - p1;
@@ -2432,11 +2432,15 @@ static void conv2d_dw_compute_whcn_vtcm(
                         }
                     }
 
-                    acc = hvx_vec_add_f32_f32(acc, hvx_vec_mul_f32_f32(in_v, w_v));
+                    acc[kw & 3] = hvx_vec_add_f32_f32(acc[kw & 3], hvx_vec_mul_f32_f32(in_v, w_v));
                 }
             }
 
-            hvx_vec_store_u(out_row + ox, nbytes, acc);
+            const HVX_Vector acc01   = hvx_vec_add_f32_f32(acc[0], acc[1]);
+            const HVX_Vector acc23   = hvx_vec_add_f32_f32(acc[2], acc[3]);
+            const HVX_Vector acc_out = hvx_vec_add_f32_f32(acc01, acc23);
+
+            hvx_vec_store_u(out_row + ox, nbytes, acc_out);
         }
     }
 }
@@ -2459,7 +2463,7 @@ static void conv2d_dw_compute_cwhn_vtcm(
 
             for (uint32_t cb = 0; cb < kp->c; cb += 32) {
                 const uint32_t rem = MIN(32, kp->c - cb);
-                HVX_Vector acc = Q6_V_vzero();
+                HVX_Vector acc[4]  = { Q6_V_vzero(), Q6_V_vzero(), Q6_V_vzero(), Q6_V_vzero() };
 
                 for (uint32_t kh = 0; kh < kp->kh; ++kh) {
                     const int32_t ih = (int32_t)(oh * kp->s1 + kh * kp->d1) - kp->p1;
@@ -2485,14 +2489,18 @@ static void conv2d_dw_compute_cwhn_vtcm(
                         } else {
                             v_w = hvx_vmemu(w_ptr);
                         }
-                        acc = hvx_vec_add_f32_f32(acc, hvx_vec_mul_f32_f32(v_in, v_w));
+                        acc[kw & 3] = hvx_vec_add_f32_f32(acc[kw & 3], hvx_vec_mul_f32_f32(v_in, v_w));
                     }
                 }
 
+                const HVX_Vector acc01   = hvx_vec_add_f32_f32(acc[0], acc[1]);
+                const HVX_Vector acc23   = hvx_vec_add_f32_f32(acc[2], acc[3]);
+                const HVX_Vector acc_out = hvx_vec_add_f32_f32(acc01, acc23);
+
                 if (rem == 32) {
-                    *(HVX_UVector *)(out_ptr + cb) = acc;
+                    *(HVX_UVector *)(out_ptr + cb) = acc_out;
                 } else {
-                    hvx_vec_store_u(out_ptr + cb, rem * sizeof(float), acc);
+                    hvx_vec_store_u(out_ptr + cb, rem * sizeof(float), acc_out);
                 }
             }
         }
@@ -2619,8 +2627,8 @@ int op_conv_2d_dw(struct htp_ops_context * octx) {
         : (kp->ow * (uint32_t) sizeof(float));
 
     const uint32_t max_ih_chunk = MIN(kp->h, (kp->oh_chunk - 1) * (uint32_t) kp->s1 + (kp->kh - 1) * (uint32_t) kp->d1 + 1);
-    const uint32_t max_src_bytes = max_ih_chunk * row_src_bytes;
-    const uint32_t max_dst_bytes = kp->oh_chunk * row_dst_bytes;
+    const uint32_t max_src_bytes = max_ih_chunk * row_src_bytes + 128;
+    const uint32_t max_dst_bytes = kp->oh_chunk * row_dst_bytes + 128;
 
     const struct htp_tensor * src0 = octx->src[0];
     const uint32_t elem_size       = (src0->type == HTP_TYPE_F16) ? sizeof(__fp16) : sizeof(float);

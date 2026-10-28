@@ -3737,6 +3737,7 @@ static bool htp_kparams_solve_conv2d_dw(
 
     uint32_t max_threads_sess = (uint32_t) htp_session_n_threads(sess);
     uint32_t oh_chunk = oh_u;
+
     uint32_t n_threads = max_threads_sess;
     struct htp_conv2d_dw_vtcm_layout layout;
 
