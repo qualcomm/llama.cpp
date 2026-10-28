@@ -3729,6 +3729,8 @@ static bool htp_kparams_solve_conv2d_dw(
         return false;
     }
 
+    const uint32_t w_size = (uint32_t) (kw * kh * c * ggml_type_size(src0->type));
+
     uint32_t max_threads_sess = (uint32_t) htp_session_n_threads(sess);
     uint32_t oh_chunk = oh_u;
     uint32_t n_threads = max_threads_sess;
@@ -3739,7 +3741,7 @@ static bool htp_kparams_solve_conv2d_dw(
         const uint32_t max_src_bytes = max_ih_chunk * row_src_bytes;
         const uint32_t max_dst_bytes = oh_chunk * row_dst_bytes;
 
-        htp_conv2d_dw_vtcm_layout_build(&layout, max_src_bytes, max_dst_bytes, n_threads);
+        htp_conv2d_dw_vtcm_layout_build(&layout, max_src_bytes, max_dst_bytes, w_size, n_threads);
 
         if (layout.total_bytes <= vtcm_budget && layout.total_bytes > 0) {
             break;
@@ -3764,7 +3766,7 @@ static bool htp_kparams_solve_conv2d_dw(
     const uint32_t max_ih_chunk = (std::min)(h, (oh_chunk - 1) * (uint32_t) s1 + (kh - 1) * (uint32_t) d1 + 1);
     const uint32_t max_src_bytes = max_ih_chunk * row_src_bytes;
     const uint32_t max_dst_bytes = oh_chunk * row_dst_bytes;
-    htp_conv2d_dw_vtcm_layout_build(&layout, max_src_bytes, max_dst_bytes, n_threads);
+    htp_conv2d_dw_vtcm_layout_build(&layout, max_src_bytes, max_dst_bytes, w_size, n_threads);
 
     kparams->total_tasks  = total_tasks;
     kparams->n_threads    = n_threads;

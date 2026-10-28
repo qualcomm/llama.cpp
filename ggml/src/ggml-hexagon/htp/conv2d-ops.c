@@ -8,6 +8,7 @@
 #define GGML_COMMON_DECL_C
 #include "ggml-common.h"
 #include "conv2d-ops.h"
+#include "dma-copy.h"
 #include "dma-queue.h"
 #include "hex-common.h"
 #include "hex-fastdiv.h"
@@ -2336,8 +2337,8 @@ static inline void conv2d_dw_get_slice(
         slice->src_bytes = ih_count * row_src_bytes;
         slice->dst_bytes = oh_len * row_dst_bytes;
 
-        slice->src_addr = (dma_addr_t)((const char *)src1->data + (size_t)n * src1->nb[3] + (size_t)ih_first * src1->nb[1]);
-        slice->dst_addr = (dma_addr_t)((char *)dst->data + (size_t)n * dst->nb[3] + (size_t)oh_start * dst->nb[1]);
+        slice->src_addr = src1->data + (size_t) n * src1->nb[3] + (size_t) ih_first * src1->nb[1];
+        slice->dst_addr = dst->data  + (size_t) n * dst->nb[3]  + (size_t) oh_start * dst->nb[1];
     } else {
         const uint32_t row_src_bytes = kp->w * (uint32_t) sizeof(float);
         const uint32_t row_dst_bytes = kp->ow * (uint32_t) sizeof(float);
@@ -2345,21 +2346,22 @@ static inline void conv2d_dw_get_slice(
         slice->src_bytes = ih_count * row_src_bytes;
         slice->dst_bytes = oh_len * row_dst_bytes;
 
-        slice->src_addr = (dma_addr_t)((const char *)src1->data + (size_t)n * src1->nb[3] + (size_t)c * src1->nb[2] + (size_t)ih_first * src1->nb[1]);
-        slice->dst_addr = (dma_addr_t)((char *)dst->data + (size_t)n * dst->nb[3] + (size_t)c * dst->nb[2] + (size_t)oh_start * dst->nb[1]);
+        slice->src_addr = src1->data + (size_t) n * src1->nb[3] + (size_t) c * src1->nb[2] + (size_t) ih_first * src1->nb[1];
+        slice->dst_addr = dst->data  + (size_t) n * dst->nb[3]  + (size_t) c * dst->nb[2] + (size_t) oh_start * dst->nb[1];
     }
 }
 
 static void conv2d_dw_compute_whcn_vtcm(
     const float * in_vtcm,
     float *       out_vtcm,
+    const void *  w_vtcm,
     const struct conv2d_dw_task_slice * slice,
     const struct htp_ops_context * octx,
     const struct htp_conv2d_dw_kernel_params * kp) {
 
     const struct htp_tensor * src0 = octx->src[0];
     const bool is_f16              = (src0->type == HTP_TYPE_F16);
-    const char * w_chan            = (const char *) src0->data + (size_t) slice->c * src0->nb[3];
+    const char * w_chan            = (const char *) w_vtcm + (size_t) slice->c * src0->nb[3];
 
     float w_local[256];
     for (uint32_t kh = 0; kh < kp->kh; ++kh) {
@@ -2440,6 +2442,7 @@ static void conv2d_dw_compute_whcn_vtcm(
 static void conv2d_dw_compute_cwhn_vtcm(
     const float * in_vtcm,
     float *       out_vtcm,
+    const void *  w_vtcm,
     const struct conv2d_dw_task_slice * slice,
     const struct htp_ops_context * octx,
     const struct htp_conv2d_dw_kernel_params * kp) {
@@ -2469,7 +2472,7 @@ static void conv2d_dw_compute_cwhn_vtcm(
                         }
 
                         const float * in_ptr = in_vtcm + ((size_t)ih_local * kp->w + iw) * kp->c + cb;
-                        const char *  w_ptr  = (const char *)src0->data + (size_t)kh * src0->nb[1] + (size_t)kw * src0->nb[0] + (size_t)cb * src0->nb[3];
+                        const char *  w_ptr  = (const char *) w_vtcm + (size_t)kh * src0->nb[1] + (size_t)kw * src0->nb[0] + (size_t)cb * src0->nb[3];
 
                         HVX_Vector v_in = hvx_vmemu(in_ptr);
                         HVX_Vector v_w;
@@ -2497,6 +2500,7 @@ static void conv2d_dw_compute_cwhn_vtcm(
 typedef void (*conv2d_dw_compute_fn_t)(
     const float * in_vtcm,
     float *       out_vtcm,
+    const void *  w_vtcm,
     const struct conv2d_dw_task_slice * slice,
     const struct htp_ops_context * octx,
     const struct htp_conv2d_dw_kernel_params * kp);
@@ -2505,6 +2509,7 @@ struct conv2d_dw_dma_context {
     struct htp_ops_context *                   octx;
     const struct htp_conv2d_dw_kernel_params * kp;
     struct htp_conv2d_dw_vtcm_layout           layout;
+    const void *                               w_vtcm;
     conv2d_dw_compute_fn_t                     compute_fn;
     uint32_t                                   task_start;
     uint32_t                                   task_count;
@@ -2571,7 +2576,7 @@ static void conv2d_dw_dma_thread(unsigned int nth, unsigned int ith, void * data
         conv2d_dw_get_slice(&sl, task, src1, dst, kp);
 
         htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) task);
-        compute_fn(srcb, dstb, &sl, octx, kp);
+        compute_fn(srcb, dstb, ctx->w_vtcm, &sl, octx, kp);
         htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) task);
 
         dma_queue_push(dma_q,
@@ -2615,8 +2620,25 @@ int op_conv_2d_dw(struct htp_ops_context * octx) {
     const uint32_t max_src_bytes = max_ih_chunk * row_src_bytes;
     const uint32_t max_dst_bytes = kp->oh_chunk * row_dst_bytes;
 
+    const struct htp_tensor * src0 = octx->src[0];
+    const uint32_t elem_size       = (src0->type == HTP_TYPE_F16) ? sizeof(__fp16) : sizeof(float);
+    const uint32_t w_size          = src0->size;
+
     struct htp_conv2d_dw_vtcm_layout layout;
-    htp_conv2d_dw_vtcm_layout_build(&layout, max_src_bytes, max_dst_bytes, kp->n_threads);
+    htp_conv2d_dw_vtcm_layout_build(&layout, max_src_bytes, max_dst_bytes, w_size, kp->n_threads);
+
+    uint8_t * vtcm_base = (uint8_t *) octx->ctx->vtcm_base;
+    void *    w_vtcm    = VTCM_LAYOUT_PTR(void, vtcm_base, layout.off_w);
+
+    struct htp_tensor w_vtcm_tensor = *src0;
+    w_vtcm_tensor.data = (dma_addr_t) w_vtcm;
+
+    if (src0->nb[0] == elem_size) {
+        dma_cpy_sametype_sameshape(octx->ctx->dma[0], &w_vtcm_tensor, src0, elem_size);
+    } else {
+        dma_sync_read(octx->ctx->dma[0], w_vtcm, src0->data, w_size);
+    }
+    dma_queue_flush(octx->ctx->dma[0]);
 
     uint32_t task_start = 0;
     uint32_t task_count = kp->total_tasks;
@@ -2637,6 +2659,7 @@ int op_conv_2d_dw(struct htp_ops_context * octx) {
         .octx             = octx,
         .kp               = kp,
         .layout           = layout,
+        .w_vtcm           = w_vtcm,
         .compute_fn       = kp->cwhn ? conv2d_dw_compute_cwhn_vtcm : conv2d_dw_compute_whcn_vtcm,
         .task_start       = task_start,
         .task_count       = task_count,

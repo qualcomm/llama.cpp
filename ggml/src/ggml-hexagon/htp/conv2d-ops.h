@@ -111,30 +111,29 @@ _Static_assert(sizeof(struct htp_conv2d_dw_kernel_params) <= 128, "htp_conv2d_dw
 
 struct htp_conv2d_dw_vtcm_layout {
     size_t   total_bytes;
+    size_t   off_w;
     size_t   off_src;
     size_t   off_dst;
     size_t   src_spad_half_size;
     size_t   dst_spad_half_size;
     size_t   src_bytes_per_thread;
     size_t   dst_bytes_per_thread;
-    uint32_t max_src_bytes;
-    uint32_t max_dst_bytes;
 };
 
 static inline void htp_conv2d_dw_vtcm_layout_build(
     struct htp_conv2d_dw_vtcm_layout * L,
     uint32_t max_src_bytes,
     uint32_t max_dst_bytes,
+    uint32_t w_size,
     uint32_t n_threads
 ) {
-    L->max_src_bytes        = max_src_bytes;
-    L->max_dst_bytes        = max_dst_bytes;
     L->src_spad_half_size   = hex_round_up(max_src_bytes + 256, 128);
     L->dst_spad_half_size   = hex_round_up(max_dst_bytes + 128, 128);
     L->src_bytes_per_thread = 2 * L->src_spad_half_size;
     L->dst_bytes_per_thread = 2 * L->dst_spad_half_size;
 
     size_t off = 0;
+    VTCM_LAYOUT_ALLOC(off, off_w, hex_round_up(w_size, 128));
     VTCM_LAYOUT_ALLOC(off, off_src, L->src_bytes_per_thread * n_threads);
     VTCM_LAYOUT_ALLOC(off, off_dst, L->dst_bytes_per_thread * n_threads);
     L->total_bytes = off;
