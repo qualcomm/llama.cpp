@@ -298,6 +298,98 @@ static void compute_nearest_chunk(
     }
 }
 
+static void compute_nearest_2x_chunk(
+    const float * srcb,
+    float * dstb,
+    const struct htp_tensor * src0,
+    const struct htp_tensor * dst,
+    uint32_t dst_y_start,
+    uint32_t dst_y_count,
+    uint32_t src_y_start
+) {
+    const uint32_t src_x = src0->ne[0];
+    const uint32_t dst_x = dst->ne[0];
+
+    for (uint32_t oy = dst_y_start; oy < dst_y_start + dst_y_count; ++oy) {
+        const uint32_t sy = oy >> 1;
+        const float * r0  = srcb + (sy - src_y_start) * src_x;
+        float * dst_row   = dstb + (oy - dst_y_start) * dst_x;
+
+        for (uint32_t ix = 0; ix < src_x; ix += VLEN_FP32) {
+            const HVX_Vector vin = hvx_vmemu(r0 + ix);
+
+            const HVX_VectorPair p = Q6_W_vshuff_VVR(vin, vin, -4);
+            const HVX_Vector v_lo = Q6_V_lo_W(p);
+            const HVX_Vector v_hi = Q6_V_hi_W(p);
+
+            const uint32_t ox0 = 2 * ix;
+            const uint32_t rem_out0 = (dst_x > ox0) ? (dst_x - ox0) : 0;
+            const uint32_t nbytes_out0 = (rem_out0 < VLEN_FP32) ? (rem_out0 * sizeof(float)) : VLEN;
+            hvx_vec_store_u(dst_row + ox0, nbytes_out0, v_lo);
+
+            const uint32_t ox1 = ox0 + VLEN_FP32;
+            if (dst_x > ox1) {
+                const uint32_t rem_out1 = dst_x - ox1;
+                const uint32_t nbytes_out1 = (rem_out1 < VLEN_FP32) ? (rem_out1 * sizeof(float)) : VLEN;
+                hvx_vec_store_u(dst_row + ox1, nbytes_out1, v_hi);
+            }
+        }
+    }
+}
+
+static void compute_nearest_4x_chunk(
+    const float * srcb,
+    float * dstb,
+    const struct htp_tensor * src0,
+    const struct htp_tensor * dst,
+    uint32_t dst_y_start,
+    uint32_t dst_y_count,
+    uint32_t src_y_start
+) {
+    const uint32_t src_x = src0->ne[0];
+    const uint32_t dst_x = dst->ne[0];
+
+    for (uint32_t oy = dst_y_start; oy < dst_y_start + dst_y_count; ++oy) {
+        const uint32_t sy = oy >> 2;
+        const float * r0  = srcb + (sy - src_y_start) * src_x;
+        float * dst_row   = dstb + (oy - dst_y_start) * dst_x;
+
+        for (uint32_t ix = 0; ix < src_x; ix += VLEN_FP32) {
+            const HVX_Vector vin = hvx_vmemu(r0 + ix);
+
+            const HVX_VectorPair p = Q6_W_vshuff_VVR(vin, vin, -4);
+            const HVX_Vector v_lo = Q6_V_lo_W(p);
+            const HVX_Vector v_hi = Q6_V_hi_W(p);
+
+            const HVX_VectorPair p0 = Q6_W_vshuff_VVR(v_lo, v_lo, -4);
+            const HVX_VectorPair p1 = Q6_W_vshuff_VVR(v_hi, v_hi, -4);
+
+            const HVX_Vector out0 = Q6_V_lo_W(p0);
+            const HVX_Vector out1 = Q6_V_hi_W(p0);
+            const HVX_Vector out2 = Q6_V_lo_W(p1);
+            const HVX_Vector out3 = Q6_V_hi_W(p1);
+
+            const uint32_t ox = 4 * ix;
+            if (dst_x > ox) {
+                const uint32_t rem = dst_x - ox;
+                hvx_vec_store_u(dst_row + ox, (rem < VLEN_FP32) ? (rem * sizeof(float)) : VLEN, out0);
+            }
+            if (dst_x > ox + VLEN_FP32) {
+                const uint32_t rem = dst_x - (ox + VLEN_FP32);
+                hvx_vec_store_u(dst_row + ox + VLEN_FP32, (rem < VLEN_FP32) ? (rem * sizeof(float)) : VLEN, out1);
+            }
+            if (dst_x > ox + 2 * VLEN_FP32) {
+                const uint32_t rem = dst_x - (ox + 2 * VLEN_FP32);
+                hvx_vec_store_u(dst_row + ox + 2 * VLEN_FP32, (rem < VLEN_FP32) ? (rem * sizeof(float)) : VLEN, out2);
+            }
+            if (dst_x > ox + 3 * VLEN_FP32) {
+                const uint32_t rem = dst_x - (ox + 3 * VLEN_FP32);
+                hvx_vec_store_u(dst_row + ox + 3 * VLEN_FP32, (rem < VLEN_FP32) ? (rem * sizeof(float)) : VLEN, out3);
+            }
+        }
+    }
+}
+
 static void compute_bilinear_chunk(
     const float * srcb,
     float * dstb,
@@ -358,6 +450,76 @@ static void compute_bilinear_chunk(
             const HVX_Vector val  = hvx_vec_add_f32_f32(hvx_vec_mul_f32_f32(vwy0, val0), hvx_vec_mul_f32_f32(vwy1, val1));
 
             hvx_vec_store_u(dst_row + ox, nbytes, val);
+        }
+    }
+}
+
+static void compute_bilinear_2x_chunk(
+    const float * srcb,
+    float * dstb,
+    const struct htp_tensor * src0,
+    const struct htp_tensor * dst,
+    const struct upscale_bilinear_y * lut_y,
+    uint32_t dst_y_start,
+    uint32_t dst_y_count,
+    uint32_t src_y_start
+) {
+    const uint32_t src_x = src0->ne[0];
+    const uint32_t dst_x = dst->ne[0];
+    const HVX_Vector c_075 = hvx_vec_splat_f32(0.75f);
+    const HVX_Vector c_025 = hvx_vec_splat_f32(0.25f);
+
+    for (uint32_t oy = dst_y_start; oy < dst_y_start + dst_y_count; ++oy) {
+        const struct upscale_bilinear_y * ey = &lut_y[oy];
+        const float * r0 = srcb + (ey->y0 - src_y_start) * src_x;
+        const float * r1 = srcb + (ey->y1 - src_y_start) * src_x;
+        float * dst_row  = dstb + (oy - dst_y_start) * dst_x;
+
+        const bool same_row = (ey->y0 == ey->y1);
+        const float wy0 = ey->wy0;
+        const float wy1 = ey->wy1;
+        const HVX_Vector vwy0 = hvx_vec_splat_f32(wy0);
+        const HVX_Vector vwy1 = hvx_vec_splat_f32(wy1);
+
+        const float first_val = same_row ? r0[0] : (wy0 * r0[0] + wy1 * r1[0]);
+        HVX_Vector v_prev = hvx_vec_splat_f32(first_val);
+
+        HVX_Vector v_curr = hvx_vmemu(r0);
+        if (!same_row) {
+            const HVX_Vector v1 = hvx_vmemu(r1);
+            v_curr = hvx_vec_add_f32_f32(hvx_vec_mul_f32_f32(vwy0, v_curr), hvx_vec_mul_f32_f32(vwy1, v1));
+        }
+
+        for (uint32_t ix = 0; ix < src_x; ix += VLEN_FP32) {
+            HVX_Vector v_next_chunk;
+            const uint32_t next_ix = ix + VLEN_FP32;
+            if (next_ix < src_x) {
+                v_next_chunk = hvx_vmemu(r0 + next_ix);
+                if (!same_row) {
+                    const HVX_Vector v1 = hvx_vmemu(r1 + next_ix);
+                    v_next_chunk = hvx_vec_add_f32_f32(hvx_vec_mul_f32_f32(vwy0, v_next_chunk), hvx_vec_mul_f32_f32(vwy1, v1));
+                }
+            } else {
+                const float last_val = same_row ? r0[src_x - 1] : (wy0 * r0[src_x - 1] + wy1 * r1[src_x - 1]);
+                v_next_chunk = hvx_vec_splat_f32(last_val);
+            }
+
+            const HVX_Vector v_shl = Q6_V_valign_VVR(v_curr, v_prev, 124);
+            const HVX_Vector v_shr = Q6_V_valign_VVR(v_next_chunk, v_curr, 4);
+
+            const HVX_Vector ve = hvx_vec_add_f32_f32(hvx_vec_mul_f32_f32(c_075, v_curr), hvx_vec_mul_f32_f32(c_025, v_shl));
+            const HVX_Vector vo = hvx_vec_add_f32_f32(hvx_vec_mul_f32_f32(c_075, v_curr), hvx_vec_mul_f32_f32(c_025, v_shr));
+
+            const HVX_VectorPair p = Q6_W_vshuff_VVR(vo, ve, -4);
+            const HVX_Vector out0 = Q6_V_lo_W(p);
+            const HVX_Vector out1 = Q6_V_hi_W(p);
+
+            const uint32_t ox0 = 2 * ix;
+            hvx_vec_store_u(dst_row + ox0, VLEN, out0);
+            hvx_vec_store_u(dst_row + ox0 + VLEN_FP32, VLEN, out1);
+
+            v_prev = v_curr;
+            v_curr = v_next_chunk;
         }
     }
 }
@@ -572,13 +734,24 @@ static void upscale_worker(unsigned int nth, unsigned int ith, void * data) {
 
         htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) (first + i));
         if (p->mode == HTP_UPSCALE_MODE_NEAREST) {
-            compute_nearest_chunk(srcb, dstb, src0, dst, (const uint32_t *) lut_x, (const uint32_t *) lut_y, dst_ys, dst_yc, src_ys);
+            if (dst->ne[0] == 2 * src0->ne[0] && dst->ne[1] == 2 * src0->ne[1]) {
+                compute_nearest_2x_chunk(srcb, dstb, src0, dst, dst_ys, dst_yc, src_ys);
+            } else if (dst->ne[0] == 4 * src0->ne[0] && dst->ne[1] == 4 * src0->ne[1]) {
+                compute_nearest_4x_chunk(srcb, dstb, src0, dst, dst_ys, dst_yc, src_ys);
+            } else {
+                compute_nearest_chunk(srcb, dstb, src0, dst, (const uint32_t *) lut_x, (const uint32_t *) lut_y, dst_ys, dst_yc, src_ys);
+            }
         } else if (p->mode == HTP_UPSCALE_MODE_BICUBIC) {
             compute_bicubic_chunk(srcb, dstb, src0, dst, (const struct upscale_bicubic_x *) lut_x, (const struct upscale_bicubic_y *) lut_y, dst_ys, dst_yc, src_ys);
         } else if (p->antialias) {
             compute_bilinear_antialias_chunk(srcb, dstb, src0, dst, p, (const struct upscale_antialias_x *) lut_x, (const struct upscale_antialias_y *) lut_y, dst_ys, dst_yc, src_ys);
         } else {
-            compute_bilinear_chunk(srcb, dstb, src0, dst, (const struct upscale_bilinear_x *) lut_x, (const struct upscale_bilinear_y *) lut_y, dst_ys, dst_yc, src_ys);
+            if (dst->ne[0] == 2 * src0->ne[0] && dst->ne[1] == 2 * src0->ne[1] &&
+                !p->align_corners && (src0->ne[0] % VLEN_FP32 == 0)) {
+                compute_bilinear_2x_chunk(srcb, dstb, src0, dst, (const struct upscale_bilinear_y *) lut_y, dst_ys, dst_yc, src_ys);
+            } else {
+                compute_bilinear_chunk(srcb, dstb, src0, dst, (const struct upscale_bilinear_x *) lut_x, (const struct upscale_bilinear_y *) lut_y, dst_ys, dst_yc, src_ys);
+            }
         }
         htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) (first + i));
 
