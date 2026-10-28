@@ -18205,7 +18205,18 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
         }
 
         cl_int err = CL_SUCCESS;
-        cl_recording_qcom rec = backend_ctx->clNewRecordingQCOM(backend_ctx->rec_queue, &err);
+        // The context outlives its last backend (it is cached per device), and that backend's
+        // free() releases the recordable queue. llama-completion frees a probe context before
+        // the real one, so recording found a null queue and turned itself off for good.
+        if (backend_ctx->rec_queue == nullptr) {
+            backend_ctx->rec_queue = clCreateCommandQueue(backend_ctx->context, backend_ctx->device,
+                                                          CL_QUEUE_RECORDABLE_QCOM, &err);
+            if (err != CL_SUCCESS) {
+                backend_ctx->rec_queue = nullptr;
+            }
+        }
+        cl_recording_qcom rec = backend_ctx->rec_queue ?
+            backend_ctx->clNewRecordingQCOM(backend_ctx->rec_queue, &err) : nullptr;
         if (!rec || err != CL_SUCCESS) {
             if (s_log) GGML_LOG_INFO("ggml_opencl: clNewRecordingQCOM failed (err %d) — disabling recordable queue\n", err);
             backend_ctx->rec_enabled = false;
