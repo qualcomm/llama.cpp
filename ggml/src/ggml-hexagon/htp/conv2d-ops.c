@@ -2102,11 +2102,12 @@ static void conv2d_hmx_win_zero_thread(unsigned int nth, unsigned int ith, void 
     const size_t i1  = MIN(i0 + per, n);
 
     struct htp_thread_trace * tr = &wc->octx->ctx->trace[ith];
-    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_A_PREP, (uint16_t) ith);
+    const uint16_t block = (uint16_t) (i0 / VLEN_FP32);
+    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_A_PREP, block);
     if (i1 > i0) {
         hvx_splat_f32_a((uint8_t *) wc->act[0] + i0 * sizeof(float), 0.0f, i1 - i0);
     }
-    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_A_PREP, (uint16_t) ith);
+    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_A_PREP, block);
 }
 
 static void conv2d_hmx_win_run_phase(struct htp_conv2d_win_context * wc, int32_t pack, int32_t unpack) {
@@ -2273,16 +2274,6 @@ int op_conv_2d(struct htp_ops_context * octx) {
     return HTP_STATUS_NO_SUPPORT;
 }
 
-static inline float vtcm_load_f32(const float * p) {
-    const HVX_Vector v = hvx_vmemu(p);
-    union { uint32_t u; float f; } val = { .u = (uint32_t) Q6_R_vextract_VR(v, 0) };
-    return val.f;
-}
-
-static inline void vtcm_store_f32(float * p, float val) {
-    hvx_vec_store_u(p, sizeof(float), hvx_vec_splat_f32(val));
-}
-
 struct conv2d_dw_task_slice {
     dma_addr_t src_addr;
     dma_addr_t dst_addr;
@@ -2363,7 +2354,7 @@ static void conv2d_dw_compute_whcn_vtcm(
     const bool is_f16              = (src0->type == HTP_TYPE_F16);
     const char * w_chan            = (const char *) w_vtcm + (size_t) slice->c * src0->nb[3];
 
-    float w_local[256];
+    float w_local[64];
     for (uint32_t kh = 0; kh < kp->kh; ++kh) {
         for (uint32_t kw = 0; kw < kp->kw; ++kw) {
             const void * ptr = w_chan + (size_t) kh * src0->nb[1] + (size_t) kw * src0->nb[0];
@@ -2371,70 +2362,81 @@ static void conv2d_dw_compute_whcn_vtcm(
         }
     }
 
+    const uint32_t s0 = (uint32_t) kp->s0;
+    const int32_t  p0 = kp->p0;
+    const int32_t  p1 = kp->p1;
+    const int32_t  s1 = kp->s1;
+    const int32_t  d1 = kp->d1;
+    const int32_t  w  = (int32_t) kp->w;
+
     for (uint32_t ohi = 0; ohi < slice->oh_len; ++ohi) {
         const uint32_t oh = slice->oh_start + ohi;
-        float * out_row = out_vtcm + (size_t)ohi * kp->ow;
+        float * out_row   = out_vtcm + (size_t) ohi * kp->ow;
 
-        uint32_t ow = 0;
-        if (kp->s0 == 1 && kp->d0 == 1) {
-            while (ow < kp->ow && (int32_t)ow < kp->p0) {
-                float sum = 0.0f;
-                for (uint32_t kh = 0; kh < kp->kh; ++kh) {
-                    const int32_t ih = (int32_t)(oh * kp->s1 + kh * kp->d1) - kp->p1;
-                    if (ih < 0 || ih >= (int32_t)kp->h) {
-                        continue;
-                    }
-                    const int32_t ih_local = ih - slice->ih_first;
-                    const float * in_row = in_vtcm + (size_t)ih_local * kp->w;
-                    for (uint32_t kw = 0; kw < kp->kw; ++kw) {
-                        const int32_t iw = (int32_t)(ow + kw) - kp->p0;
-                        if (iw >= 0 && iw < (int32_t)kp->w) {
-                            sum += w_local[kh * kp->kw + kw] * vtcm_load_f32(in_row + iw);
-                        }
-                    }
-                }
-                vtcm_store_f32(out_row + ow, sum);
-                ow++;
-            }
+        for (uint32_t ox = 0; ox < kp->ow; ox += 32) {
+            const uint32_t rem    = kp->ow - ox;
+            const uint32_t nbytes = (rem < 32) ? (rem * sizeof(float)) : 128;
+            HVX_Vector acc        = Q6_V_vzero();
 
-            const int32_t max_safe_ow = (int32_t)kp->w + kp->p0 - (int32_t)kp->kw - 31;
-            for (; (int32_t)ow <= max_safe_ow && ow + 32 <= kp->ow; ow += 32) {
-                HVX_Vector acc = Q6_V_vzero();
-                for (uint32_t kh = 0; kh < kp->kh; ++kh) {
-                    const int32_t ih = (int32_t)(oh * kp->s1 + kh * kp->d1) - kp->p1;
-                    if (ih < 0 || ih >= (int32_t)kp->h) {
-                        continue;
-                    }
-                    const int32_t ih_local = ih - slice->ih_first;
-                    const float * in_row = in_vtcm + (size_t)ih_local * kp->w;
-                    for (uint32_t kw = 0; kw < kp->kw; ++kw) {
-                        const int32_t iw0 = (int32_t)(ow + kw) - kp->p0;
-                        const HVX_Vector in_v = hvx_vmemu(in_row + iw0);
-                        const HVX_Vector w_v  = hvx_vec_splat_f32(w_local[kh * kp->kw + kw]);
-                        acc = hvx_vec_add_f32_f32(acc, hvx_vec_mul_f32_f32(in_v, w_v));
-                    }
-                }
-                *(HVX_UVector *)(out_row + ow) = acc;
-            }
-        }
-
-        for (; ow < kp->ow; ++ow) {
-            float sum = 0.0f;
             for (uint32_t kh = 0; kh < kp->kh; ++kh) {
-                const int32_t ih = (int32_t)(oh * kp->s1 + kh * kp->d1) - kp->p1;
-                if (ih < 0 || ih >= (int32_t)kp->h) {
+                const int32_t ih = (int32_t) (oh * s1 + kh * d1) - p1;
+                if (ih < 0 || ih >= (int32_t) kp->h) {
                     continue;
                 }
                 const int32_t ih_local = ih - slice->ih_first;
-                const float * in_row = in_vtcm + (size_t)ih_local * kp->w;
+                const float * in_row   = in_vtcm + (size_t) ih_local * kp->w;
+
                 for (uint32_t kw = 0; kw < kp->kw; ++kw) {
-                    const int32_t iw = (int32_t)(ow * kp->s0 + kw * kp->d0) - kp->p0;
-                    if (iw >= 0 && iw < (int32_t)kp->w) {
-                        sum += w_local[kh * kp->kw + kw] * vtcm_load_f32(in_row + iw);
+                    const HVX_Vector w_v = hvx_vec_splat_f32(w_local[kh * kp->kw + kw]);
+                    HVX_Vector in_v;
+
+                    if (s0 == 1) {
+                        const int32_t base_iw = (int32_t) ox - p0 + (int32_t) kw;
+                        if (base_iw >= 0) {
+                            in_v = hvx_vmemu(in_row + base_iw);
+                        } else {
+                            const int32_t pad = -base_iw;
+                            const HVX_Vector v = hvx_vmemu(in_row);
+                            in_v = Q6_V_valign_VVR(v, Q6_V_vzero(), 128 - (uint32_t) pad * sizeof(float));
+                        }
+                        if (base_iw + 31 >= w) {
+                            const int32_t valid = w - base_iw;
+                            const HVX_VectorPred q = Q6_Q_vsetq_R(MAX(0, valid) * sizeof(float));
+                            in_v = Q6_V_vmux_QVV(q, in_v, Q6_V_vzero());
+                        }
+                    } else { // s0 == 2
+                        const int32_t base_iw = (int32_t) (2 * ox) - p0 + (int32_t) kw;
+                        if (base_iw >= 0) {
+                            const HVX_Vector v0 = hvx_vmemu(in_row + base_iw);
+                            const HVX_Vector v1 = hvx_vmemu(in_row + base_iw + 32);
+                            in_v = Q6_V_lo_W(Q6_W_vdeal_VVR(v1, v0, -4));
+                        } else {
+                            const int32_t pad = -base_iw;
+                            const HVX_Vector v0 = hvx_vmemu(in_row);
+                            const HVX_Vector v1 = hvx_vmemu(in_row + 32);
+                            const HVX_VectorPair vp = Q6_W_vdeal_VVR(v1, v0, -4);
+                            if (pad & 1) {
+                                const uint32_t shift_lanes = (uint32_t) (pad + 1) / 2;
+                                const HVX_Vector v_odd = Q6_V_hi_W(vp);
+                                in_v = Q6_V_valign_VVR(v_odd, Q6_V_vzero(), 128 - shift_lanes * sizeof(float));
+                            } else {
+                                const uint32_t shift_lanes = (uint32_t) pad / 2;
+                                const HVX_Vector v_even = Q6_V_lo_W(vp);
+                                in_v = Q6_V_valign_VVR(v_even, Q6_V_vzero(), 128 - shift_lanes * sizeof(float));
+                            }
+                        }
+                        if (base_iw + 62 >= w) {
+                            const int32_t valid = (w - base_iw + 1) / 2;
+                            const HVX_VectorPred q = Q6_Q_vsetq_R(MAX(0, valid) * sizeof(float));
+                            in_v = Q6_V_vmux_QVV(q, in_v, Q6_V_vzero());
+                        }
                     }
+
+                    acc = hvx_vec_add_f32_f32(acc, hvx_vec_mul_f32_f32(in_v, w_v));
                 }
             }
-            vtcm_store_f32(out_row + ow, sum);
+
+            hvx_vec_store_u(out_row + ox, nbytes, acc);
         }
     }
 }
