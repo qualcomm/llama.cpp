@@ -83,22 +83,27 @@ Since common quantizations are supported now, it is recommanded to download GGUF
 A prebuilt binary kernel library has been introduced for Adreno GPUs.
 It currently targets X2 GPUs (X2-90, X2-85 and X2-45) found in Snapdragon X2 SoC.
 The library currently contains kernels for MUL_MAT_ID with Q4_0, Q4_1, Q4_K, MXFP4.
-The library must be manually downloaded from https://softwarecenter.qualcomm.com/catalog/item/Adreno_Kernel_Library_GGML.
+The library is published at https://softwarecenter.qualcomm.com/catalog/item/Adreno_Kernel_Library_GGML.
+Its use is subject to the license in the `license.txt` file shipped with it.
 
 To allow using the kernel library, add `-DGGML_OPENCL_USE_ADRENO_BIN_KERNELS=ON` when configuring with CMake.
-Then, extract `adreno-opencl-kernels.dll` from the zip file downloaded from the above URL and put it alongside the executables.
+On Windows, also add `-DGGML_OPENCL_ADRENO_BIN_KERNELS_FETCH=ON` to have CMake download the library version pinned in `ggml/src/ggml-opencl/CMakeLists.txt` during configuration.
+The download is verified against a SHA256 hash, and the build copies `adreno-opencl-kernels.dll` and `LICENSE-adreno-opencl-kernels` alongside the executables.
+Without the fetch option, extract `adreno-opencl-kernels.dll` from the zip file downloaded from the above URL and put it alongside the executables yourself.
 If kernels compatible with the current GPU are found in the library, they will be loaded and used.
+If the library is missing, the builtin kernels are used.
 
 
 ## CMake Options
 
 The OpenCL backend has the following CMake options that control the behavior of the backend.
 
-| CMake options                        | Default value  | Description                               |
-|:------------------------------------:|:--------------:|:------------------------------------------|
-| `GGML_OPENCL_EMBED_KERNELS`          | `ON`           | Embed OpenCL kernels into the executable. |
-| `GGML_OPENCL_USE_ADRENO_KERNELS`     | `ON`           | Use kernels optimized for Adreno.         |
-| `GGML_OPENCL_USE_ADRENO_BIN_KERNELS` | `OFF`          | Allow using binary kernel lib for Adreno. |
+| CMake options                          | Default value  | Description                                             |
+|:--------------------------------------:|:--------------:|:--------------------------------------------------------|
+| `GGML_OPENCL_EMBED_KERNELS`            | `ON`           | Embed OpenCL kernels into the executable.               |
+| `GGML_OPENCL_USE_ADRENO_KERNELS`       | `ON`           | Use kernels optimized for Adreno.                       |
+| `GGML_OPENCL_USE_ADRENO_BIN_KERNELS`   | `OFF`          | Allow using binary kernel lib for Adreno.               |
+| `GGML_OPENCL_ADRENO_BIN_KERNELS_FETCH` | `OFF`          | Download the binary kernel lib for Adreno (Windows).    |
 
 ## Program Binary Cache
 
