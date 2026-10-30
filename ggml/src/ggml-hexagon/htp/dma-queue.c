@@ -141,78 +141,10 @@ bool dma_queue_push_fallback_2d(dma_queue * q, dma_data ddata, size_t dst_stride
     dma_ring_flush(r1);
     r0->tail = r1->tail;
 
-    return dma_ring_push_single_2d(r0, ddata, 0, 0, 0, /*nrows=*/ 0);
-}
-
-bool dma_queue_push_fallback_contig(dma_queue * q, dma_data ddata, size_t total) {
-    dma_ring * r0 = q->ring0;
-    dma_ring * r1 = q->ring1;
-
-    if (((r0->push_idx + 1) & r0->idx_mask) == r0->pop_idx) {
-        return false;
-    }
-
-    r1->tail = r0->tail;
-
-    size_t rem_bytes   = total;
-    dma_addr_t cur_dst = ddata.dst;
-    dma_addr_t cur_src = ddata.src;
-
-    while (rem_bytes > 0) {
-        const uint32_t cur_bytes = MIN(rem_bytes, DMA_SAFE_CHUNK_SIZE);
-        dma_data cur_data = dma_make_data(cur_dst, cur_src);
-        if (!dma_ring_push_single_contig(r1, cur_data, cur_bytes)) {
-            dma_ring_flush(r1);
-            dma_ring_push_single_contig(r1, cur_data, cur_bytes);
-        }
-        cur_dst   += cur_bytes;
-        cur_src   += cur_bytes;
-        rem_bytes -= cur_bytes;
-    }
-
-    dma_ring_flush(r1);
-    r0->tail = r1->tail;
-
     return dma_ring_push_single_1d(r0, ddata, /*size=*/ 0);
 }
-
-#if __HVX_ARCH__ < 75
 
 bool dma_queue_push_fallback_1d(dma_queue * q, dma_data ddata, size_t dst_stride, size_t src_stride, size_t row_size, size_t nrows) {
-    dma_ring * r0 = q->ring0;
-    dma_ring * r1 = q->ring1;
-
-    if (((r0->push_idx + 1) & r0->idx_mask) == r0->pop_idx) {
-        return false;
-    }
-
-    r1->tail = r0->tail;
-
-    size_t rem_rows    = nrows;
-    dma_addr_t cur_dst = ddata.dst;
-    dma_addr_t cur_src = ddata.src;
-
-    while (rem_rows > 0) {
-        dma_data cur_data = dma_make_data(cur_dst, cur_src);
-        if (!dma_ring_push_single_1d(r1, cur_data, row_size)) {
-            dma_ring_flush(r1);
-            dma_ring_push_single_1d(r1, cur_data, row_size);
-        }
-        cur_dst  += dst_stride;
-        cur_src  += src_stride;
-        rem_rows -= 1;
-    }
-
-    dma_ring_flush(r1);
-    r0->tail = r1->tail;
-
-    return dma_ring_push_single_1d(r0, ddata, /*size=*/ 0);
-}
-
-#else
-
-// One contiguous transfer per row (split at DMA_SAFE_CHUNK_SIZE), for strides or row sizes that do not fit 24 bits.
-bool dma_queue_push_fallback_rows(dma_queue * q, dma_data ddata, size_t dst_stride, size_t src_stride, size_t row_size, size_t nrows) {
     dma_ring * r0 = q->ring0;
     dma_ring * r1 = q->ring1;
 
@@ -249,7 +181,5 @@ bool dma_queue_push_fallback_rows(dma_queue * q, dma_data ddata, size_t dst_stri
     dma_ring_flush(r1);
     r0->tail = r1->tail;
 
-    return dma_ring_push_single_2d(r0, ddata, 0, 0, 0, /*nrows=*/ 0);
+    return dma_ring_push_single_1d(r0, ddata, /*size=*/ 0);
 }
-
-#endif

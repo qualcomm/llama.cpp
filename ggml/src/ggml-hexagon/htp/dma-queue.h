@@ -148,12 +148,7 @@ dma_queue_t dma_queue_alias_init(void * ptr, dma_queue_t main_q);
 void        dma_queue_alias_free(dma_queue_t q);
 
 bool        dma_queue_push_fallback_2d(dma_queue * q, dma_data ddata, size_t dst_stride, size_t src_stride, size_t row_size, size_t nrows);
-bool        dma_queue_push_fallback_contig(dma_queue * q, dma_data ddata, size_t total);
-#if __HVX_ARCH__ < 75
 bool        dma_queue_push_fallback_1d(dma_queue * q, dma_data ddata, size_t dst_stride, size_t src_stride, size_t row_size, size_t nrows);
-#else
-bool        dma_queue_push_fallback_rows(dma_queue * q, dma_data ddata, size_t dst_stride, size_t src_stride, size_t row_size, size_t nrows);
-#endif
 
 // TODO: technically we don't need these and could use Q6_dmstart/wait/etc instead
 // but those do not seem to always compiler properly.
@@ -402,7 +397,7 @@ static inline bool dma_queue_push(dma_queue * q, dma_data ddata, size_t dst_stri
         if (__builtin_expect(total <= DMA_MAX_SIZE_24B, 1)) {
             return dma_ring_push_single_contig(q->ring0, ddata, total);
         }
-        return dma_queue_push_fallback_contig(q, ddata, total);
+        return dma_queue_push_fallback_1d(q, ddata, 0, 0, total, 1);
     }
 
     // 2. Hot path: Standard strided 2D (10-20% of calls)
@@ -412,18 +407,10 @@ static inline bool dma_queue_push(dma_queue * q, dma_data ddata, size_t dst_stri
     }
 
     // 3. Cold path: Descriptor chunking fallbacks (< 0.1%)
-#if __HVX_ARCH__ < 75
-    if (row_size <= DMA_MAX_SIZE_16B && (src_stride | dst_stride) <= DMA_MAX_STRIDE_16B) {
+    if ((row_size | src_stride | dst_stride) <= DMA_MAX_2D_ROW_SIZE) {
         return dma_queue_push_fallback_2d(q, ddata, dst_stride, src_stride, row_size, nrows);
     }
     return dma_queue_push_fallback_1d(q, ddata, dst_stride, src_stride, row_size, nrows);
-#else
-    // Descriptor fields keep only the low 24 bits, so large strides need one transfer per row
-    if (row_size <= DMA_MAX_SIZE_24B && (src_stride | dst_stride) <= DMA_MAX_STRIDE_24B) {
-        return dma_queue_push_fallback_2d(q, ddata, dst_stride, src_stride, row_size, nrows);
-    }
-    return dma_queue_push_fallback_rows(q, ddata, dst_stride, src_stride, row_size, nrows);
-#endif
 }
 
 static inline void dma_sync_read(dma_queue * dma_q, void * dst, dma_addr_t src, size_t bytes) {
