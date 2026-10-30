@@ -449,6 +449,7 @@ struct ggml_backend_opencl_context;
 
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
 static void ggml_cl_adreno_xmem_attn_release_scratch(ggml_backend_opencl_context * backend_ctx);
+static bool adreno_e17_compiler_quirks(const ggml_backend_opencl_context *backend_ctx);
 #endif
 
 // backend device context
@@ -4520,10 +4521,13 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #else
         const std::string kernel_src = read_file("gemm_noshuffle_q3_k_q8_1_dp4a.cl");
 #endif
-        cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        // E17 reads wrong values from the start of the local tiles: pad them
+        const std::string q3_k_dp4a_opts = adreno_e17_compiler_quirks(backend_ctx)
+            ? compile_opts + " -DGEMM_LM_PAD=1" : compile_opts;
+        cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), q3_k_dp4a_opts);
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q3_k_q8_1_dp4a = clCreateKernel(prog, "kernel_gemm_noshuffle_q3_k_q8_1_dp4a", &err), err));
         CL_CHECK(clReleaseProgram(prog));
-        prog = build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts + " -DTILESIZE_N=8");
+        prog = build_program_from_source(backend_ctx, kernel_src.c_str(), q3_k_dp4a_opts + " -DTILESIZE_N=8");
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q3_k_q8_1_dp4a_narrow = clCreateKernel(prog, "kernel_gemm_noshuffle_q3_k_q8_1_dp4a", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
@@ -4538,10 +4542,13 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #else
         const std::string kernel_src = read_file("gemm_noshuffle_iq2_s_q8_1_dp4a.cl");
 #endif
-        cl_program prog = build_program_from_source(backend_ctx, (iq2_s_grid_src + kernel_src).c_str(), compile_opts);
+        // E17 reads wrong values from the start of the local tiles: pad them
+        const std::string iq2_s_dp4a_opts = adreno_e17_compiler_quirks(backend_ctx)
+            ? compile_opts + " -DGEMM_LM_PAD=1" : compile_opts;
+        cl_program prog = build_program_from_source(backend_ctx, (iq2_s_grid_src + kernel_src).c_str(), iq2_s_dp4a_opts);
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_iq2_s_q8_1_dp4a = clCreateKernel(prog, "kernel_gemm_noshuffle_iq2_s_q8_1_dp4a", &err), err));
         CL_CHECK(clReleaseProgram(prog));
-        prog = build_program_from_source(backend_ctx, (iq2_s_grid_src + kernel_src).c_str(), compile_opts + " -DTILESIZE_N=8");
+        prog = build_program_from_source(backend_ctx, (iq2_s_grid_src + kernel_src).c_str(), iq2_s_dp4a_opts + " -DTILESIZE_N=8");
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_iq2_s_q8_1_dp4a_narrow = clCreateKernel(prog, "kernel_gemm_noshuffle_iq2_s_q8_1_dp4a", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
@@ -4556,10 +4563,13 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #else
         const std::string kernel_src = read_file("gemm_noshuffle_iq2_xs_q8_1_dp4a.cl");
 #endif
-        cl_program prog = build_program_from_source(backend_ctx, (iq2_xs_grid_src + kernel_src).c_str(), compile_opts);
+        // E17 reads wrong values from the start of the local tiles: pad them
+        const std::string iq2_xs_dp4a_opts = adreno_e17_compiler_quirks(backend_ctx)
+            ? compile_opts + " -DGEMM_LM_PAD=1" : compile_opts;
+        cl_program prog = build_program_from_source(backend_ctx, (iq2_xs_grid_src + kernel_src).c_str(), iq2_xs_dp4a_opts);
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_iq2_xs_q8_1_dp4a = clCreateKernel(prog, "kernel_gemm_noshuffle_iq2_xs_q8_1_dp4a", &err), err));
         CL_CHECK(clReleaseProgram(prog));
-        prog = build_program_from_source(backend_ctx, (iq2_xs_grid_src + kernel_src).c_str(), compile_opts + " -DTILESIZE_N=8");
+        prog = build_program_from_source(backend_ctx, (iq2_xs_grid_src + kernel_src).c_str(), iq2_xs_dp4a_opts + " -DTILESIZE_N=8");
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_iq2_xs_q8_1_dp4a_narrow = clCreateKernel(prog, "kernel_gemm_noshuffle_iq2_xs_q8_1_dp4a", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
@@ -4574,10 +4584,13 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #else
         const std::string kernel_src = read_file("gemm_noshuffle_iq2_xxs_q8_1_dp4a.cl");
 #endif
-        cl_program prog = build_program_from_source(backend_ctx, (iq2_xxs_grid_src + kernel_src).c_str(), compile_opts);
+        // E17 reads wrong values from the start of the local tiles: pad them
+        const std::string iq2_xxs_dp4a_opts = adreno_e17_compiler_quirks(backend_ctx)
+            ? compile_opts + " -DGEMM_LM_PAD=1" : compile_opts;
+        cl_program prog = build_program_from_source(backend_ctx, (iq2_xxs_grid_src + kernel_src).c_str(), iq2_xxs_dp4a_opts);
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_iq2_xxs_q8_1_dp4a = clCreateKernel(prog, "kernel_gemm_noshuffle_iq2_xxs_q8_1_dp4a", &err), err));
         CL_CHECK(clReleaseProgram(prog));
-        prog = build_program_from_source(backend_ctx, (iq2_xxs_grid_src + kernel_src).c_str(), compile_opts + " -DTILESIZE_N=8");
+        prog = build_program_from_source(backend_ctx, (iq2_xxs_grid_src + kernel_src).c_str(), iq2_xxs_dp4a_opts + " -DTILESIZE_N=8");
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_iq2_xxs_q8_1_dp4a_narrow = clCreateKernel(prog, "kernel_gemm_noshuffle_iq2_xxs_q8_1_dp4a", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
@@ -4870,10 +4883,13 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #else
         const std::string kernel_src = read_file("gemm_noshuffle_q2_k_q8_1_dp4a.cl");
 #endif
-        cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        // E17 reads wrong values from the start of the local tiles: pad them
+        const std::string q2_k_dp4a_opts = adreno_e17_compiler_quirks(backend_ctx)
+            ? compile_opts + " -DGEMM_LM_PAD=1" : compile_opts;
+        cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), q2_k_dp4a_opts);
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q2_k_q8_1_dp4a = clCreateKernel(prog, "kernel_gemm_noshuffle_q2_k_q8_1_dp4a", &err), err));
         CL_CHECK(clReleaseProgram(prog));
-        prog = build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts + " -DTILESIZE_N=8");
+        prog = build_program_from_source(backend_ctx, kernel_src.c_str(), q2_k_dp4a_opts + " -DTILESIZE_N=8");
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q2_k_q8_1_dp4a_narrow = clCreateKernel(prog, "kernel_gemm_noshuffle_q2_k_q8_1_dp4a", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
@@ -5460,7 +5476,10 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 #else
         const std::string kernel_src = read_file("gemm_noshuffle_q6_k_q8_1_dp4a.cl");
 #endif
-        cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        // E17 reads wrong values from the start of the local tiles: pad them
+        const std::string q6_k_dp4a_opts = adreno_e17_compiler_quirks(backend_ctx)
+            ? compile_opts + " -DGEMM_LM_PAD=1" : compile_opts;
+        cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), q6_k_dp4a_opts);
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a = clCreateKernel(prog, "kernel_gemm_noshuffle_q6_k_q8_1_dp4a", &err), err));
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q6_k_q8_1_dp4a_act_vload4 = clCreateKernel(prog, "kernel_gemm_noshuffle_q6_k_q8_1_dp4a_act_vload4", &err), err));
         CL_CHECK(clReleaseProgram(prog));

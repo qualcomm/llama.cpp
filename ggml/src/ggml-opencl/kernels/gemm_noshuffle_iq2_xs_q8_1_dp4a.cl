@@ -56,8 +56,17 @@ kernel void kernel_gemm_noshuffle_iq2_xs_q8_1_dp4a(
     const uint k_u = (uint)k >> 2;
     const uint k_b = (uint)k >> 5;
 
+#ifdef GEMM_LM_PAD
+    // E17 reads wrong values from the start of these local tiles; start each one
+    // GEMM_LM_PAD x 16 bytes in.
+    __local uint4 sh_qa4_store[TILESIZE_N * 2 + GEMM_LM_PAD];
+    __local half  sh_d_store[TILESIZE_N + 8 * GEMM_LM_PAD];
+    __local uint4 (*sh_qa4)[2] = (__local uint4 (*)[2])(sh_qa4_store + GEMM_LM_PAD);
+    __local half * sh_d = sh_d_store + 8 * GEMM_LM_PAD;
+#else
     __local uint4 sh_qa4[TILESIZE_N][2];
     __local half sh_d[TILESIZE_N];
+#endif
 
 #define IQ2_XS_GRID(i) iq2_xs_grid[(i)]
 
