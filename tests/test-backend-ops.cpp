@@ -11667,6 +11667,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // logical order corrupts every KQ while all other permuted cases (n < 32) stay green.
     // This is the regression case for that break (single-stream PPL 8.67 -> 26039).
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 512, 512, 128, {8, 1}, {2, 1}, {0, 2, 1, 3}));
+    // the same prefill KQ with a q8_0 K cache and no flash attention (-ctk q8_0 -fa 0):
+    // the gemma-4 E4B shapes, 2 K heads x GQA 4, head size 256 and 512, n >= 32
+    for (int64_t k : {256, 512}) {
+        for (int64_t n : {32, 47, 128}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 512, n, k, {2, 1}, {4, 1}, {0, 2, 1, 3}));
+        }
+    }
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 16, 32, 32, { 1,  1}, {1, 1}, {0, 1, 2, 3}, 64, 3));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 64, 77, 77, {12,1}, {1,1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 32, 4, 96, {3, 2}, {1, 1}, {0, 1, 2, 3}, 0, 1, true));
