@@ -36554,11 +36554,15 @@ static void ggml_cl_mul_mat_kq_kqv_adreno(ggml_backend_t backend, const ggml_ten
 // Here K is read as q8_0 in place and Q is quantized to int8 once, so the pass is gone
 // and the inner product runs on dp4a.
 //
-// Off by default while it is being brought up: GGML_OPENCL_KQ_DP4A=1 to enable.
-static bool ggml_cl_kq_dp4a_on() {
+// Default on except on X1E, where the int8 Q moves a greedy token on a short prompt for
+// a 0-3% prefill gain. GGML_OPENCL_KQ_DP4A=1 forces it on, =0 restores the
+// dequantize-then-GEMM path everywhere.
+static bool ggml_cl_kq_dp4a_on(const ggml_backend_opencl_context * backend_ctx) {
     static const char * env = getenv("GGML_OPENCL_KQ_DP4A");
-    static const bool   on  = (env != nullptr && env[0] == '1');
-    return on;
+    if (env != nullptr) {
+        return env[0] != '0';
+    }
+    return backend_ctx->adreno_gen != ADRENO_GPU_GEN::X1E;
 }
 
 static void ggml_cl_mul_mat_kq_q8_0_dp4a_adreno(
@@ -44919,7 +44923,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         return;
     }
 
-    if (ggml_cl_kq_dp4a_on() && !kq_dp4a_rerun && kq_dp4a_shape) {
+    if (ggml_cl_kq_dp4a_on(backend_ctx) && !kq_dp4a_rerun && kq_dp4a_shape) {
         ggml_cl_mul_mat_kq_q8_0_dp4a_adreno(backend, src0, src1, dst);
         return;
     }
