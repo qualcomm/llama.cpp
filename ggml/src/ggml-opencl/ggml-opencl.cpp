@@ -14941,11 +14941,16 @@ struct ggml_tensor_extra_cl {
     // The actual size of the cl_mem object. This is needed when returning the
     // block to the pool.
     size_t actual_size;
+    // Set only on the stack extra of the f16 scratch copy that ggml_cl_mul_mat
+    // dequantizes a quantized attention operand into. That copy is packed
+    // head-major, which is not the layout the Adreno KQ/KQV kernels admit by.
+    bool dequant_scratch;
 
     void reset() {
         data_device = nullptr;
         offset = 0;
         actual_size = 0;
+        dequant_scratch = false;
     }
 };
 
@@ -31797,6 +31802,7 @@ static void ggml_cl_fa_scratch_tensor(
     extra.data_device = buffer;
     extra.offset      = 0;
     extra.actual_size = 0;
+    extra.dequant_scratch = false;
     t.extra = &extra;
 
     snprintf(t.name, sizeof(t.name), "%s", name);
@@ -45027,6 +45033,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         ggml_tensor_extra_cl fake_extra = {};
         fake_extra.data_device = f16_buf;
         fake_extra.offset      = 0;
+        fake_extra.dequant_scratch = true;
         fake_src0.type     = GGML_TYPE_F16;
         fake_src0.extra    = &fake_extra;
         fake_src0.view_src = nullptr;
@@ -45140,7 +45147,16 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         // Attention shapes in the graph satisfy both (head sizes are multiples
         // of 64 there and n_kv is padded to 256), which is why this has stayed
         // latent; declining keeps those shapes on the generic GEMM.
+        //
+        // The dequantized scratch copy of a q8_0/q4_0 K (non-FA prefill with
+        // -ctk q8_0) is declined as well. It is contiguous [dk, n_kv, n_head_kv],
+        // so it fails the KQ packed-layout check below and then satisfies the
+        // KQV one (nb01 <= nb02, nb02 == nb01*ne01): a KQ served by the KQV
+        // kernel, garbage for every ubatch of 32+ tokens. The generic GEMM is
+        // what X1E already runs it on, correctly.
+        const ggml_tensor_extra_cl * extra0_f16 = (const ggml_tensor_extra_cl *) src0->extra;
         if (!backend_ctx->fa_decompose_generic_gemm &&
+            !(extra0_f16 != nullptr && extra0_f16->dequant_scratch) &&
             ne01 >= 64 && ne1 >= 32 && ne00 >= 16 &&
             (ne00 % 16) == 0 && (ne01 % 64) == 0 && (ne12 % ne02) == 0  &&
             // the kq/kqv kernels and their dispatch are 3D only: dim 3 is never indexed,
