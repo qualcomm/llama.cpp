@@ -15092,11 +15092,16 @@ struct ggml_tensor_extra_cl {
     // The actual size of the cl_mem object. This is needed when returning the
     // block to the pool.
     size_t actual_size;
+    // Set only on the stack extra of the f16 scratch copy that ggml_cl_mul_mat
+    // dequantizes a quantized attention operand into. That copy is packed
+    // head-major, which is not the layout the Adreno KQ/KQV kernels admit by.
+    bool dequant_scratch;
 
     void reset() {
         data_device = nullptr;
         offset = 0;
         actual_size = 0;
+        dequant_scratch = false;
     }
 };
 
@@ -18991,14 +18996,17 @@ inline bool use_q6k_tiled(const ggml_backend_opencl_context *backend_ctx, const 
 }
 
 // q4_K analog of the tiled-wide lm_head/embed GEMV (GGML_OPENCL_Q4K_GEMV_TILED forces
-// either way: =0 off, else on). Same gate. On by default on X2E: unlike q6_K, there is no
-// flat multi-column q4_K head kernel for it to displace.
+// either way: =0 off, else on). Same gate. On by default on X2E and X1E: unlike q6_K, there
+// is no flat multi-column q4_K head kernel for it to displace. On X1E the flat q4_K GEMV
+// runs a vocab head once per column (9.8 ms at ne1 = 1, 78 ms at 8 on gemma-4-E4B); the
+// tiled path takes that to 5.2 / 22 ms and is what lets X1E keep the head on the GPU.
 inline bool q4k_gemv_tiled_enabled(const ggml_backend_opencl_context *backend_ctx) {
     static const char * e = std::getenv("GGML_OPENCL_Q4K_GEMV_TILED");
     if (e && e[0] != '\0') {
         return e[0] != '0';
     }
-    return backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E || tiled_gemv_default_on(backend_ctx);
+    return backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E ||
+           backend_ctx->adreno_gen == ADRENO_GPU_GEN::X1E || tiled_gemv_default_on(backend_ctx);
 }
 inline bool use_q4k_tiled(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor) {
     return q4k_gemv_tiled_enabled(backend_ctx) && tensor->type == GGML_TYPE_Q4_K &&
@@ -20152,9 +20160,17 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                     // correctly (Q4_K/Q5_K/Q6_K at vocab 128256/151936, ne1 1-192), and there
                     // the CPU head made decode bimodal on which cores the threads landed on:
                     // Qwen3-4B Q4_0 tg32 22 -> 29.5 at d0, 9.0 or 15.5 -> 19.0 at d4096.
+                    // X1E only for a Q4_K head on the tiled path, the one combination measured
+                    // there. gemma-4-E4B Q4_K_M on the X1-85 against the CPU head, interleaved:
+                    // MTP n-max 7 agentic TG4 23.0 / 22.9 / 22.8 vs 23.2 / 22.8 / 22.1, no-spec
+                    // 15.8 / 15.8 vs 14.4 / 14.0; KLD vs the CPU head mean 3e-5, max 1.1e-3, same
+                    // top 99.79%. (The flat GPU GEMV gave 18.3 there.) A Q6_K head would run the
+                    // flat GEMV and keeps the pin.
                     const bool lmhead_gen_default =
                         backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E ||
-                        backend_ctx->adreno_gen == ADRENO_GPU_GEN::A8X;
+                        backend_ctx->adreno_gen == ADRENO_GPU_GEN::A8X ||
+                        (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X1E && ht == GGML_TYPE_Q4_K &&
+                         q4k_gemv_tiled_enabled(backend_ctx));
                     const bool lmhead_gpu = lmhead_env
                         ? (lmhead_env[0] != '\0' && lmhead_env[0] != '0')
                         : (lmhead_type_validated && lmhead_gen_default);
@@ -32031,6 +32047,7 @@ static void ggml_cl_fa_scratch_tensor(
     extra.data_device = buffer;
     extra.offset      = 0;
     extra.actual_size = 0;
+    extra.dequant_scratch = false;
     t.extra = &extra;
 
     snprintf(t.name, sizeof(t.name), "%s", name);
@@ -36782,11 +36799,15 @@ static void ggml_cl_mul_mat_kq_kqv_adreno(ggml_backend_t backend, const ggml_ten
 // Here K is read as q8_0 in place and Q is quantized to int8 once, so the pass is gone
 // and the inner product runs on dp4a.
 //
-// Off by default while it is being brought up: GGML_OPENCL_KQ_DP4A=1 to enable.
-static bool ggml_cl_kq_dp4a_on() {
+// Default on except on X1E, where the int8 Q moves a greedy token on a short prompt for
+// a 0-3% prefill gain. GGML_OPENCL_KQ_DP4A=1 forces it on, =0 restores the
+// dequantize-then-GEMM path everywhere.
+static bool ggml_cl_kq_dp4a_on(const ggml_backend_opencl_context * backend_ctx) {
     static const char * env = getenv("GGML_OPENCL_KQ_DP4A");
-    static const bool   on  = (env != nullptr && env[0] == '1');
-    return on;
+    if (env != nullptr) {
+        return env[0] != '0';
+    }
+    return backend_ctx->adreno_gen != ADRENO_GPU_GEN::X1E;
 }
 
 static void ggml_cl_mul_mat_kq_q8_0_dp4a_adreno(
@@ -45326,7 +45347,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         return;
     }
 
-    if (ggml_cl_kq_dp4a_on() && !kq_dp4a_rerun && kq_dp4a_shape) {
+    if (ggml_cl_kq_dp4a_on(backend_ctx) && !kq_dp4a_rerun && kq_dp4a_shape) {
         ggml_cl_mul_mat_kq_q8_0_dp4a_adreno(backend, src0, src1, dst);
         return;
     }
@@ -45440,6 +45461,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         ggml_tensor_extra_cl fake_extra = {};
         fake_extra.data_device = f16_buf;
         fake_extra.offset      = 0;
+        fake_extra.dequant_scratch = true;
         fake_src0.type     = GGML_TYPE_F16;
         fake_src0.extra    = &fake_extra;
         fake_src0.view_src = nullptr;
@@ -45553,7 +45575,16 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         // Attention shapes in the graph satisfy both (head sizes are multiples
         // of 64 there and n_kv is padded to 256), which is why this has stayed
         // latent; declining keeps those shapes on the generic GEMM.
+        //
+        // The dequantized scratch copy of a q8_0/q4_0 K (non-FA prefill with
+        // -ctk q8_0) is declined as well. It is contiguous [dk, n_kv, n_head_kv],
+        // so it fails the KQ packed-layout check below and then satisfies the
+        // KQV one (nb01 <= nb02, nb02 == nb01*ne01): a KQ served by the KQV
+        // kernel, garbage for every ubatch of 32+ tokens. The generic GEMM is
+        // what X1E already runs it on, correctly.
+        const ggml_tensor_extra_cl * extra0_f16 = (const ggml_tensor_extra_cl *) src0->extra;
         if (!backend_ctx->fa_decompose_generic_gemm &&
+            !(extra0_f16 != nullptr && extra0_f16->dequant_scratch) &&
             ne01 >= 64 && ne1 >= 32 && ne00 >= 16 &&
             (ne00 % 16) == 0 && (ne01 % 64) == 0 && (ne12 % ne02) == 0  &&
             // the kq/kqv kernels and their dispatch are 3D only: dim 3 is never indexed,
