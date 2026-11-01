@@ -18825,14 +18825,17 @@ inline bool use_q6k_tiled(const ggml_backend_opencl_context *backend_ctx, const 
 }
 
 // q4_K analog of the tiled-wide lm_head/embed GEMV (GGML_OPENCL_Q4K_GEMV_TILED forces
-// either way: =0 off, else on). Same gate. On by default on X2E: unlike q6_K, there is no
-// flat multi-column q4_K head kernel for it to displace.
+// either way: =0 off, else on). Same gate. On by default on X2E and X1E: unlike q6_K, there
+// is no flat multi-column q4_K head kernel for it to displace. On X1E the flat q4_K GEMV
+// runs a vocab head once per column (9.8 ms at ne1 = 1, 78 ms at 8 on gemma-4-E4B); the
+// tiled path takes that to 5.2 / 22 ms and is what lets X1E keep the head on the GPU.
 inline bool q4k_gemv_tiled_enabled(const ggml_backend_opencl_context *backend_ctx) {
     static const char * e = std::getenv("GGML_OPENCL_Q4K_GEMV_TILED");
     if (e && e[0] != '\0') {
         return e[0] != '0';
     }
-    return backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E || tiled_gemv_default_on(backend_ctx);
+    return backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E ||
+           backend_ctx->adreno_gen == ADRENO_GPU_GEN::X1E || tiled_gemv_default_on(backend_ctx);
 }
 inline bool use_q4k_tiled(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor) {
     return q4k_gemv_tiled_enabled(backend_ctx) && tensor->type == GGML_TYPE_Q4_K &&
@@ -19967,9 +19970,17 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                     // correctly (Q4_K/Q5_K/Q6_K at vocab 128256/151936, ne1 1-192), and there
                     // the CPU head made decode bimodal on which cores the threads landed on:
                     // Qwen3-4B Q4_0 tg32 22 -> 29.5 at d0, 9.0 or 15.5 -> 19.0 at d4096.
+                    // X1E only for a Q4_K head on the tiled path, the one combination measured
+                    // there. gemma-4-E4B Q4_K_M on the X1-85 against the CPU head, interleaved:
+                    // MTP n-max 7 agentic TG4 23.0 / 22.9 / 22.8 vs 23.2 / 22.8 / 22.1, no-spec
+                    // 15.8 / 15.8 vs 14.4 / 14.0; KLD vs the CPU head mean 3e-5, max 1.1e-3, same
+                    // top 99.79%. (The flat GPU GEMV gave 18.3 there.) A Q6_K head would run the
+                    // flat GEMV and keeps the pin.
                     const bool lmhead_gen_default =
                         backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E ||
-                        backend_ctx->adreno_gen == ADRENO_GPU_GEN::A8X;
+                        backend_ctx->adreno_gen == ADRENO_GPU_GEN::A8X ||
+                        (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X1E && ht == GGML_TYPE_Q4_K &&
+                         q4k_gemv_tiled_enabled(backend_ctx));
                     const bool lmhead_gpu = lmhead_env
                         ? (lmhead_env[0] != '\0' && lmhead_env[0] != '0')
                         : (lmhead_type_validated && lmhead_gen_default);
