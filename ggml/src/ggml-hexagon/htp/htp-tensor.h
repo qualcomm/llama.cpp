@@ -20,6 +20,8 @@
 #define HTP_TENSOR_TILE_SIZE_Q8_0   1088
 #define HTP_TENSOR_TILE_SIZE_IQ4_NL 576
 #define HTP_TENSOR_TILE_SIZE_MXFP4  544
+#define HTP_TENSOR_TILE_SIZE_NVFP4  576
+#define HTP_TENSOR_TILE_SIZE_IQ2_XXS 264
 #define HTP_TENSOR_TILE_SIZE_Q4_K   640
 #define HTP_TENSOR_TILE_SIZE_Q5_K   768
 #define HTP_TENSOR_TILE_SIZE_Q6_K   896
@@ -30,7 +32,7 @@
 #define HTP_TENSOR_TILE_K_Q2_0      64
 #define HTP_TENSOR_TILE_SIZE_Q2_0   576
 
-// Tiled weight tensor layouts (Q4_0, Q8_0, IQ4_NL, MXFP4, Q1_0, Q2_0, K-quants):
+// Tiled weight tensor layouts (Q4_0, Q8_0, IQ4_NL, MXFP4, NVFP4, IQ2_XXS, Q1_0, Q2_0, K-quants):
 // See docs/backend/snapdragon/developer.md ("Tiled Weight Formats").
 
 struct htp_tensor_mdev_range {
@@ -152,6 +154,8 @@ static inline uint32_t htp_tensor_get_tile_size(int type) {
         case HTP_TYPE_Q1_0:   return HTP_TENSOR_TILE_SIZE_Q1_0;
         case HTP_TYPE_Q2_0:   return HTP_TENSOR_TILE_SIZE_Q2_0;
         case HTP_TYPE_MXFP4:  return HTP_TENSOR_TILE_SIZE_MXFP4;
+        case HTP_TYPE_NVFP4:  return HTP_TENSOR_TILE_SIZE_NVFP4;
+        case HTP_TYPE_IQ2_XXS: return HTP_TENSOR_TILE_SIZE_IQ2_XXS;
         case HTP_TYPE_F16:    return HTP_TENSOR_TILE_SIZE_F16;
         default:              return 0;
     }
@@ -183,6 +187,8 @@ static inline uint32_t htp_tensor_get_row_size(int type, uint32_t ne00) {
         case HTP_TYPE_IQ4_NL: return (ne00 / 32) * 18;
         case HTP_TYPE_Q4_1:   return (ne00 / 32) * 20;
         case HTP_TYPE_MXFP4:  return (ne00 / 32) * 17;
+        case HTP_TYPE_NVFP4:  return (ne00 / 64) * 36;
+        case HTP_TYPE_IQ2_XXS: return (ne00 / 256) * 66;
         case HTP_TYPE_Q2_K:   return (ne00 / 256) * 84;
         case HTP_TYPE_Q2_0:   return (ne00 / 64) * 18;
         case HTP_TYPE_Q3_K:   return (ne00 / 256) * 110;
