@@ -942,6 +942,7 @@ static bool htp_matmul_check_types(
             case GGML_TYPE_Q8_0:
             case GGML_TYPE_IQ4_NL:
             case GGML_TYPE_MXFP4:
+            case GGML_TYPE_IQ2_XXS:
             case GGML_TYPE_Q4_K:
             case GGML_TYPE_Q5_K:
             case GGML_TYPE_Q6_K:
@@ -984,6 +985,7 @@ static bool htp_matmul_check_types(
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_MXFP4:
+        case GGML_TYPE_IQ2_XXS:
         case GGML_TYPE_Q4_K:
         case GGML_TYPE_Q5_K:
         case GGML_TYPE_Q6_K:
