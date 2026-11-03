@@ -14480,6 +14480,10 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             flops_cap = 2'000'000'000ULL * ctx->device->shader_core_count;
         }
     }
+    // Adreno resets the GPU when a single submission runs for about two seconds
+    if (ctx->device->vendor_id == VK_VENDOR_ID_QUALCOMM) {
+        flops_cap = 4'000'000'000ULL;
+    }
     // small graphs gain nothing from splitting, each submit costs CPU time
     uint64_t flops_per_submit = ctx->last_total_flops < 1'000'000'000ULL ? 0 :
         std::clamp(ctx->last_total_flops / 40u, std::min<uint64_t>(100'000'000ULL, flops_cap), flops_cap);
