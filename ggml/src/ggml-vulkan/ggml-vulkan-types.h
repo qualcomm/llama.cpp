@@ -719,6 +719,8 @@ struct vk_device_struct {
     bool shader_64b_indexing;
 
     bool integer_dot_product;
+    // the integer dot matmul uses its fp32 build, also with fp16 support
+    bool mmq_fp32;
     // 0: default, 1: force mmvq, -1: disable mmvq
     int32_t mmvq_mode;
 
