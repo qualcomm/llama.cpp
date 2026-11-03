@@ -1259,6 +1259,19 @@ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, 
         result.block_rows = std::min(result.block_rows, 8u);
     }
 
+#if defined(__ANDROID__)
+    // The Android Adreno driver can give wrong results, or crash, once rows times head size
+    // reaches 2048 (16 rows at head size 128, 8 rows at 512). Row split needs row_split rows.
+    if (device->vendor_id == VK_VENDOR_ID_QUALCOMM) {
+        const uint32_t D_max = std::max(hsk, hsv);
+        uint32_t max_rows = 8;
+        while (max_rows > result.row_split && max_rows * D_max > 1024) {
+            max_rows /= 2;
+        }
+        result.block_rows = std::min(result.block_rows, max_rows);
+    }
+#endif
+
     // On AMD RDNA, for small head sizes and big batch size the shader uses few registers, so too many subgroups get scheduled
     // at once and end up thrashing the cache. Fix this by setting a large (unused) shmem buffer that reduces occupancy.
     // This targets an occupancy of 4 subgroups per SIMD.
