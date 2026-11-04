@@ -12218,6 +12218,22 @@ static bool ggml_opencl_ensure_fa_q8_vec_512(ggml_backend_opencl_context * backe
     return true;
 }
 
+// A DK=512 kernel that fails to build or to fit sends Gemma-4's global-attention layers to the
+// CPU through supports_op, which used to happen without a word: a driver whose compiler rejects
+// one of these programs shows up only as slow decode and prefill. Say so once per kernel.
+// An empty kernel_compile_opts means supports_op ran before the kernels loaded, not a failure.
+static bool ggml_opencl_fa512_built_or_warn(ggml_backend_opencl_context * backend_ctx, bool built,
+                                            bool & warned, const char * what) {
+    if (!built && !warned && !backend_ctx->kernel_compile_opts.empty()) {
+        warned = true;
+        GGML_LOG_WARN("ggml_opencl: WARNING: the flash-attention %s kernel (head size 512) could not be "
+                      "built on driver %s; those attention layers will run on the CPU and be much slower. "
+                      "Run with -fa 0, or use a validated driver.\n",
+                      what, backend_ctx->driver_version.c_str());
+    }
+    return built;
+}
+
 // DK=512 decode, KV-head-coalesced + flash-decoding split, in its own program.
 //
 // q1_vec still reads the KV cache once per QUERY head: gemma-4-E4B is
@@ -20455,7 +20471,9 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                         if (dk512_env != NULL && dk512_env[0] == '0') {
                             return false;
                         }
-                        return ggml_opencl_ensure_fa_q8_vec_512(backend_ctx);
+                        static bool warned = false;
+                        return ggml_opencl_fa512_built_or_warn(backend_ctx,
+                            ggml_opencl_ensure_fa_q8_vec_512(backend_ctx), warned, "q8_0 KV decode");
                     }
                     // q8_0 KV prefill: the int8 decomposed path only (see the predicate).
                     return ggml_cl_fa_q8_dk512_prefill_ok(backend_ctx, op);
@@ -20486,12 +20504,17 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                     // Only accept if a DV-split decode kernel actually built:
                     // the fallback q1 holds 2 KB/work-item of o_acc at DV=512
                     // and is slower than running these layers on the CPU.
-                    if (!ggml_opencl_ensure_fa_f32_f16_vec_512(backend_ctx)) {
+                    static bool warned = false;
+                    if (!ggml_opencl_fa512_built_or_warn(backend_ctx,
+                            ggml_opencl_ensure_fa_f32_f16_vec_512(backend_ctx), warned, "f16 KV decode")) {
                         return false;
                     }
                 } else {
                     // prefill, BM-tile in its own FA_PREFILL_ONLY program
-                    if (!ggml_opencl_ensure_fa_f32_f16_prefill_512(backend_ctx, /*split=*/false)) {
+                    static bool warned = false;
+                    if (!ggml_opencl_fa512_built_or_warn(backend_ctx,
+                            ggml_opencl_ensure_fa_f32_f16_prefill_512(backend_ctx, /*split=*/false), warned,
+                            "f16 KV prefill")) {
                         return false;
                     }
                 }
