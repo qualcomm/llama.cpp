@@ -1272,6 +1272,12 @@ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, 
     }
 #endif
 
+    // The Adreno X1 hangs at 8 rows with head size 512 when processing prompts. 4 rows works.
+    if (device->vendor_id == VK_VENDOR_ID_QUALCOMM && n_rows > 8 && std::max(hsk, hsv) >= 512 &&
+        std::string(device->properties.deviceName.data()).find("Adreno(TM) X1") != std::string::npos) {
+        result.block_rows = std::min(result.block_rows, 4u);
+    }
+
     // On AMD RDNA, for small head sizes and big batch size the shader uses few registers, so too many subgroups get scheduled
     // at once and end up thrashing the cache. Fix this by setting a large (unused) shmem buffer that reduces occupancy.
     // This targets an occupancy of 4 subgroups per SIMD.
