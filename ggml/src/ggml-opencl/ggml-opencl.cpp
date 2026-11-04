@@ -1364,6 +1364,8 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemm_noshuffle_q4_0_f32;
     cl_kernel kernel_gemv_noshuffle_q4_0_f32;
     cl_kernel kernel_gemv_noshuffle_q4_0_f32_mc3;  // multi-column (N=3) verify GEMV (spec/MTP)
+    cl_kernel kernel_gemv_noshuffle_q4_0_f32_glu     = nullptr; // fused gate+up GEMV + GLU (q4_0 FFN)
+    cl_kernel kernel_gemv_noshuffle_q4_0_f32_glu_bin = nullptr; // same, over the bin (32b-transposed) layout
     cl_kernel kernel_gemm_noshuffle_q4_0_f32_32b_trans_ila_a8_bin;
     cl_kernel kernel_gemm_noshuffle_q4_0_q8_1_dp4a_ila_a8_bin;
     cl_kernel kernel_gemv_noshuffle_q4_0_f32_32b_trans;
@@ -5864,6 +5866,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 
         CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q4_0_f32 = clCreateKernel(prog, "kernel_gemv_noshuffle_q4_0_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q4_0_f32_mc3 = clCreateKernel(prog, "kernel_gemv_noshuffle_q4_0_f32_mc3", &err), err));
+        CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q4_0_f32_glu = clCreateKernel(prog, "kernel_gemv_noshuffle_q4_0_f32_glu", &err), err));
+        CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q4_0_f32_glu_bin = clCreateKernel(prog, "kernel_gemv_noshuffle_q4_0_f32_glu_bin", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
@@ -10577,14 +10581,40 @@ static void ggml_cl_moe_combine_fused(ggml_backend_t backend, const ggml_tensor 
 inline bool use_q4k_tiled(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor);   // defined below (used by the GLU-subgraph fuse check)
 inline bool use_q4_k_bin_kernels(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor);
 inline bool use_adreno_kernels(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor);   // defined below
+inline bool use_q4_0_bin_kernels(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor);
+static void ggml_cl_mul_mat_q4_0_glu_fused(ggml_backend_t backend, ggml_tensor * gate_tensor, ggml_tensor * up_tensor, ggml_tensor * glu_tensor);
+
+// A fused group reads its inputs while it writes its output, all in one dispatch, but the
+// allocator placed that output as if the group's earlier nodes had already run: an input
+// whose last reader is an earlier node of the group is free by the time the last node runs,
+// so the output may be put on top of it. The fused kernel then overwrites input that other
+// work-groups have not read yet. Decline the fusion when the output overlaps an input.
+static bool ggml_cl_fused_out_overlaps(const ggml_tensor * out, std::initializer_list<const ggml_tensor *> ins) {
+    if (out == nullptr || out->data == nullptr || out->buffer == nullptr) {
+        return false;
+    }
+    const char * o0 = (const char *) out->data;
+    const char * o1 = o0 + ggml_nbytes(out);
+    for (const ggml_tensor * t : ins) {
+        if (t == nullptr || t->data == nullptr || t->buffer != out->buffer) {
+            continue;
+        }
+        const char * i0 = (const char *) t->data;
+        const char * i1 = i0 + ggml_nbytes(t);
+        if (i0 < o1 && o0 < i1) {
+            return true;
+        }
+    }
+    return false;
+}
 
 static bool ggml_opencl_can_fuse(const ggml_backend_opencl_context * backend_ctx, const struct ggml_cgraph * cgraph, int node_idx, std::initializer_list<enum ggml_op> ops) {
 
     // glu(mul_mat(Wg,x), mul_mat(Wu,x)) — the FFN gate/up GEMVs + GLU. This is a
     // non-linear subgraph (up does NOT consume gate), so the contiguous
     // ggml_can_fuse below rejects it; use ggml_can_fuse_subgraph with the glu as
-    // the sole output and validate the edges explicitly. q4_K decode only;
-    // byte-identical to the per-op path.
+    // the sole output and validate the edges explicitly. q4_K and q4_0 decode
+    // only; q4_K is byte-identical to the per-op path.
     if (ops.size() == 3 && ops.begin()[0] == GGML_OP_MUL_MAT &&
         ops.begin()[1] == GGML_OP_MUL_MAT && ops.begin()[2] == GGML_OP_GLU) {
         const enum ggml_op glu_ops[] = { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU };
@@ -10596,13 +10626,18 @@ static bool ggml_opencl_can_fuse(const ggml_backend_opencl_context * backend_ctx
         const ggml_tensor *gate = cgraph->nodes[node_idx];
         const ggml_tensor *up   = cgraph->nodes[node_idx+1];
         const ggml_tensor *glu  = cgraph->nodes[node_idx+2];
+        if (ggml_cl_fused_out_overlaps(glu, { gate->src[1], up->src[1] })) {
+            return false;
+        }
 
         // decode GEMV path only (single token); prefill GEMM is separate
         if (gate->ne[1] != 1 || up->ne[1] != 1) {
             return false;
         }
-        // both projections must be q4_K weights, f32 activation/output
-        if (gate->src[0]->type != GGML_TYPE_Q4_K || up->src[0]->type != GGML_TYPE_Q4_K ||
+        // both projections must be q4_K or q4_0 weights, f32 activation/output
+        const bool wg_q4_k = gate->src[0]->type == GGML_TYPE_Q4_K;
+        const bool wg_q4_0 = gate->src[0]->type == GGML_TYPE_Q4_0;
+        if (!(wg_q4_k || wg_q4_0) || up->src[0]->type != gate->src[0]->type ||
             gate->src[1]->type != GGML_TYPE_F32  || up->src[1]->type != GGML_TYPE_F32  ||
             gate->type != GGML_TYPE_F32 || up->type != GGML_TYPE_F32 || glu->type != GGML_TYPE_F32) {
             return false;
@@ -10625,18 +10660,58 @@ static bool ggml_opencl_can_fuse(const ggml_backend_opencl_context * backend_ctx
         if (ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU_OAI) {
             return false;
         }
-        // the fused kernel reads the standard noshuffle image layout; the tiled
-        // layout packs weights differently -> defer those to the per-op path
-        if (use_q4k_tiled(backend_ctx, gate->src[0]) || use_q4k_tiled(backend_ctx, up->src[0])) {
-            return false;
+        if (wg_q4_k) {
+            // the fused kernel reads the standard noshuffle image layout; the tiled
+            // layout packs weights differently -> defer those to the per-op path
+            if (use_q4k_tiled(backend_ctx, gate->src[0]) || use_q4k_tiled(backend_ctx, up->src[0])) {
+                return false;
+            }
+            // q4_K bin kernel requires 32b transposed layout, not compatible with the fused gemv
+            if (use_q4_k_bin_kernels(backend_ctx, gate->src[0]) || use_q4_k_bin_kernels(backend_ctx, up->src[0])) {
+                return false;
+            }
         }
-        // q4_K bin kernel requires 32b transposed layout, not compatible with the fused gemv
-        if (use_q4_k_bin_kernels(backend_ctx, gate->src[0]) || use_q4_k_bin_kernels(backend_ctx, up->src[0])) {
-            return false;
+        if (wg_q4_0) {
+            // Opt-in for now: GGML_OPENCL_FUSE_MM_GLU_Q40=1. Measured on Adreno X2-90, 840
+            // and X1-85; kept off by default until it has run on more parts.
+            static const bool fuse_glu_q40_on = []{
+                const char * e = std::getenv("GGML_OPENCL_FUSE_MM_GLU_Q40");
+                return e && e[0] && e[0] != '0';
+            }();
+            if (!fuse_glu_q40_on) {
+                return false;
+            }
+            // The epilogue implements REGLU, GEGLU, SWIGLU, GEGLU_ERF and GEGLU_QUICK.
+            const ggml_glu_op op = ggml_get_glu_op(glu);
+            if (op != GGML_GLU_OP_REGLU && op != GGML_GLU_OP_GEGLU && op != GGML_GLU_OP_SWIGLU &&
+                op != GGML_GLU_OP_GEGLU_ERF && op != GGML_GLU_OP_GEGLU_QUICK) {
+                return false;
+            }
+            // kernel_gemv_noshuffle_q4_0_f32_glu dispatches ceil(M/2 / 64)*64 work-items in x, so
+            // M % 128 != 0 leaves a padded tail, and on such a grid its cross-subgroup reduce
+            // returns a wrong and run-varying result at the nsg=4 the dispatch selects.
+            // Measured on X2-90 with gemma-4-26B-A4B-it-QAT-Q4_0 (n_ff = 2112, 2112 % 128 = 64),
+            // 128-token greedy completions, distinct outputs over 5 runs: nsg=1 and nsg=2 give 1
+            // each and are bit-identical to the unfused path, nsg=4 gives 4 and never matches it.
+            // Unpadded shapes are correct at nsg=4 (gemma-4-E4B n_ff = 10240 and gemma-4-12B
+            // n_ff = 15360 were bit-identical to the unfused path over 4 runs each), so decline
+            // only the padded grid. Declining is also the faster choice there: tg128 37.6 unfused
+            // vs 35.8 at nsg=4.
+            if ((gate->src[0]->ne[1] % 128) != 0) {
+                return false;
+            }
+            // gate and up must be in the same layout: both bin (32b-transposed) or both
+            // noshuffle. Each layout has its own build of the fused kernel.
+            if (use_q4_0_bin_kernels(backend_ctx, gate->src[0]) != use_q4_0_bin_kernels(backend_ctx, up->src[0])) {
+                return false;
+            }
+            if (!backend_ctx->kernel_gemv_noshuffle_q4_0_f32_glu || !backend_ctx->kernel_gemv_noshuffle_q4_0_f32_glu_bin) {
+                return false;
+            }
         }
         // that noshuffle layout is only produced at set_tensor time when
         // use_adreno_kernels() accepts the weight (ne0 >= 512 && ne1 >= 512).
-        // Smaller weights stay in the plain q4_K layout, which this kernel would
+        // Smaller weights stay in the plain layout, which this kernel would
         // misread -> defer them to the per-op path. Real FFN gate/up weights are
         // far above the threshold, so production dispatch is unchanged.
         if (!use_adreno_kernels(backend_ctx, gate->src[0]) ||
@@ -11038,16 +11113,21 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
             continue;
         }
         // Fuse mul_mat(Wg,x) + mul_mat(Wu,x) + glu — fold the FFN's two decode
-        // GEMVs and the GLU into one dispatch. q4_K only (guarded below); the
+        // GEMVs and the GLU into one dispatch. q4_K and q4_0 (guarded below); the
         // fused kernel uses the same accumulation/reduction order and the same
-        // scalar GLU formula -> coherent. Default on, opt-out GGML_OPENCL_FUSE_MM_GLU=0.
+        // scalar GLU formula -> coherent. Default on, opt-out GGML_OPENCL_FUSE_MM_GLU=0;
+        // q4_0 additionally needs GGML_OPENCL_FUSE_MM_GLU_Q40=1.
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
-        // The fused executor (ggml_cl_mul_mat_q4_k_glu_fused) is image-path /
+        // The fused executors (ggml_cl_mul_mat_q4_{k,0}_glu_fused) are image-path /
         // Adreno-only (GGML_ABORT on the non-Adreno #else); gate the dispatch to
         // match so the FFN GLU subgraph stays dormant on Intel/other drivers.
         if (backend_ctx->fuse_mm_glu && !backend_ctx->disable_fusion &&
             ggml_opencl_can_fuse(backend_ctx, cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU })) {
-            ggml_cl_mul_mat_q4_k_glu_fused(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
+            if (node->src[0]->type == GGML_TYPE_Q4_0) {
+                ggml_cl_mul_mat_q4_0_glu_fused(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
+            } else {
+                ggml_cl_mul_mat_q4_k_glu_fused(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
+            }
             i += 2;
             continue;
         }
@@ -38744,4 +38824,112 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
 
     func(backend, tensor->src[0], tensor->src[1], tensor);
     return true;
+}
+
+static void ggml_cl_mul_mat_q4_0_glu_fused(ggml_backend_t backend, ggml_tensor * gate_tensor, ggml_tensor * up_tensor, ggml_tensor * glu_tensor) {
+#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+    GGML_ASSERT(gate_tensor && up_tensor && glu_tensor);
+    const ggml_tensor * Wg   = gate_tensor->src[0];
+    const ggml_tensor * Wu   = up_tensor->src[0];
+    const ggml_tensor * src1 = gate_tensor->src[1];   // == up_tensor->src[1]
+    const ggml_tensor * dst  = glu_tensor;
+    GGML_ASSERT(Wg && Wg->extra); GGML_ASSERT(Wu && Wu->extra);
+    GGML_ASSERT(src1 && src1->extra); GGML_ASSERT(dst && dst->extra);
+
+    ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
+    ggml_tensor_extra_cl       * extra1  = (ggml_tensor_extra_cl *)src1->extra;
+    ggml_tensor_extra_cl       * extrad  = (ggml_tensor_extra_cl *)dst->extra;
+    ggml_tensor_extra_cl_q4_0  * extra_g = (ggml_tensor_extra_cl_q4_0 *)Wg->extra;
+    ggml_tensor_extra_cl_q4_0  * extra_u = (ggml_tensor_extra_cl_q4_0 *)Wu->extra;
+
+    cl_ulong offset1 = extra1->offset + src1->view_offs;
+    cl_ulong offsetd = extrad->offset + dst->view_offs;
+
+    const int K = Wg->ne[0];
+    const int M = Wg->ne[1];
+    const int N = 1;
+    const int glu_op = (int)ggml_get_glu_op(dst);
+
+    cl_context context = backend_ctx->context;
+    cl_int           err;
+    cl_image_format  img_fmt;
+    cl_image_desc    img_desc;
+    cl_buffer_region region;
+
+    img_fmt = { CL_R, CL_UNSIGNED_INT32 };
+    memset(&img_desc, 0, sizeof(img_desc));
+    img_desc.image_type  = CL_MEM_OBJECT_IMAGE1D_BUFFER;
+    img_desc.image_width = (size_t)M * K / 2 / 4;
+    img_desc.buffer      = extra_g->q;
+    cl_mem qg_img = nullptr, qu_img = nullptr;
+    CL_CHECK((qg_img = clCreateImage(context, CL_MEM_READ_ONLY, &img_fmt, &img_desc, NULL, &err), err));
+    img_desc.buffer = extra_u->q;
+    CL_CHECK((qu_img = clCreateImage(context, CL_MEM_READ_ONLY, &img_fmt, &img_desc, NULL, &err), err));
+
+    region.origin = offset1;
+    region.size   = (size_t)K * N * sizeof(float);
+    cl_mem b_sub_buf = nullptr, b_img = nullptr;
+    CL_CHECK((b_sub_buf = clCreateSubBuffer(extra1->data_device, 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &err), err));
+    img_fmt = { CL_RGBA, CL_FLOAT };
+    memset(&img_desc, 0, sizeof(img_desc));
+    img_desc.image_type  = CL_MEM_OBJECT_IMAGE1D_BUFFER;
+    img_desc.image_width = (size_t)K * N / 4;
+    img_desc.buffer      = b_sub_buf;
+    CL_CHECK((b_img = clCreateImage(context, CL_MEM_READ_ONLY, &img_fmt, &img_desc, NULL, &err), err));
+
+    // Same R32UI view for either layout: the bin plane has the same texel count (M*K/8).
+    cl_kernel kernel = use_q4_0_bin_kernels(backend_ctx, Wg)
+                     ? backend_ctx->kernel_gemv_noshuffle_q4_0_f32_glu_bin
+                     : backend_ctx->kernel_gemv_noshuffle_q4_0_f32_glu;
+    CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),   &qg_img));
+    CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem),   &extra_g->d));
+    CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem),   &qu_img));
+    CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_mem),   &extra_u->d));
+    CL_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_mem),   &b_img));
+    CL_CHECK(clSetKernelArg(kernel, 5, sizeof(cl_mem),   &extrad->data_device));
+    CL_CHECK(clSetKernelArg(kernel, 6, sizeof(cl_ulong), &offsetd));
+    CL_CHECK(clSetKernelArg(kernel, 7, sizeof(cl_int),   &K));
+    CL_CHECK(clSetKernelArg(kernel, 8, sizeof(cl_int),   &M));
+    CL_CHECK(clSetKernelArg(kernel, 9, sizeof(cl_int),   &glu_op));
+
+    // float4 reduceLM (gate+up packed) = 2x the base LDS. Kernel reduceLM is sized for
+    // nsg<=8, but 8 IS NOT SAFE HERE -- cap at 4.
+    //
+    // At nsg=8 this kernel returns a WRONG and RUN-VARYING result. Measured on
+    // gemma-4-26B-A4B-it-QAT-Q4_0 (X2-90), top-1 logprob at the first decode position,
+    // 5 identical greedy requests to one server process:
+    //     nsg=1  -0.0002267  bit-exact
+    //     nsg=2  -0.0002266  bit-exact
+    //     nsg=4  -0.0002265  bit-exact
+    //     nsg=8  -0.000337 .. -0.000371   4 of 5 runs distinct
+    // nsg 1/2/4 are three different reduction orders and agree to ~1e-7, which is the
+    // reassociation you expect. nsg=8 is 1.1e-4 away -- a thousand times further -- and
+    // is not reproducible, so it is not reassociation: the 8-subgroup reduce is simply
+    // wrong. A 64x8 = 512 work-item group needs all 8 subgroups co-resident for the
+    // barrier to mean anything, and CL_KERNEL_WORK_GROUP_SIZE does not express that
+    // constraint on Adreno's streaming model, so the host clamp above cannot see it.
+    //
+    // 4 matches the base decode GEMV (N_SIMDGROUP 4), which has always been
+    // bit-reproducible. GGML_OPENCL_GLU_NSG overrides for A/B.
+    size_t maxwg = backend_ctx->get_kernel_workgroup_size(kernel);
+    size_t nsg_y = 4;
+    while (nsg_y > 1 && 64 * nsg_y > maxwg) { nsg_y >>= 1; }
+    static const int glu_nsg_force = []{
+        const char * e = std::getenv("GGML_OPENCL_GLU_NSG");
+        return e ? atoi(e) : 0;
+    }();
+    if (glu_nsg_force > 0 && (size_t)(64 * glu_nsg_force) <= maxwg) { nsg_y = (size_t)glu_nsg_force; }
+    size_t local_work_size[3]  = { 64, nsg_y, 1 };
+    size_t global_work_size[3] = { (size_t)CEIL_DIV(M / 2, 64) * 64, nsg_y, 1 };
+
+    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+
+    CL_CHECK(clReleaseMemObject(qg_img));
+    CL_CHECK(clReleaseMemObject(qu_img));
+    CL_CHECK(clReleaseMemObject(b_img));
+    CL_CHECK(clReleaseMemObject(b_sub_buf));
+#else
+    GGML_UNUSED(backend); GGML_UNUSED(gate_tensor); GGML_UNUSED(up_tensor); GGML_UNUSED(glu_tensor);
+    GGML_ABORT("q4_0 GLU fusion requires GGML_OPENCL_USE_ADRENO_KERNELS");
+#endif
 }

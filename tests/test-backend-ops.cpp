@@ -12600,6 +12600,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // q4_0 gate and up large enough for the OpenCL Adreno GEMV layouts (rows and K >= 512);
+    // 1088 rows is a multiple of 64 but not of 128, which the fused q4_0 GEMV declines
+    for (int64_t n : {1024, 1088}) {
+        for (ggml_glu_op glu_op : {GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU}) {
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q4_0, glu_op, 1, n, 1024,
+                false, 16, 8, false, false, true, false, { 1, 1 }));
+        }
+    }
+
     for (int64_t k : {96, 896, 1024, 2880}) {
         for (ggml_glu_op glu_op : {GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU}) {
             test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q8_0, glu_op, 1, 32, k,

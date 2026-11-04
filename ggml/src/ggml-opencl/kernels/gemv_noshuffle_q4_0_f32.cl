@@ -396,3 +396,168 @@ __kernel void kernel_gemv_noshuffle_q4_0_f32_mc3(
 #undef MC_COL_Q40
 #undef MC_DQ_HI
 #undef MC_DQ_LO
+
+// --- Fused gate+up decode GEMV + GLU (q4_0 FFN) ---------------------------------
+// Folds the FFN's two q4_0 decode GEMVs (ffn_gate, ffn_up) and the GLU into one
+// dispatch: two sequential K-loops accumulate gate and up over the SHARED activation
+// (read once), then a float4-packed cross-subgroup reduce and the GLU epilogue emit
+// silu/gelu(gate)*up directly. Removes the separate geglu kernel's global round-trip
+// (gate/up intermediate writes + re-reads) and two dispatches. Coherent (the K-sum
+// order matches the base GEMV; nsg<16 makes it not byte-identical). Mirrors the q4_K
+// GLU kernel, minus the min/6-bit-scale machinery. Gated host-side (q4_0 gate/up).
+#define GLU_GEGLU_COEF_A      0.044715f
+#define GLU_SQRT_2_OVER_PI    0.79788456080286535587989211986876f
+#define GLU_SQRT_2_INV        0.70710678118654752440084436210484f
+#define GLU_QUICK_COEF       -1.702f
+inline float q40_glu_apply(int glu_op, float g, float u) {
+    float act;
+    if (glu_op == 1) {        // GEGLU (tanh-approx gelu)
+        act = 0.5f*g*(1.0f + tanh(GLU_SQRT_2_OVER_PI*g*(1.0f + GLU_GEGLU_COEF_A*g*g)));
+    } else if (glu_op == 2) { // SWIGLU (silu)
+        act = g / (1.0f + exp(-g));
+    } else if (glu_op == 0) { // REGLU
+        return g*u*(g > 0.0f);
+    } else if (glu_op == 4) { // GEGLU_ERF
+        act = 0.5f*g*(1.0f + erf(g*GLU_SQRT_2_INV));
+    } else {                  // GEGLU_QUICK
+        act = g*(1.0f/(1.0f + exp(GLU_QUICK_COEF*g)));
+    }
+    return act*u;
+}
+// Weight fetch for K-groups J and J+1 of rows 2*gid_s and 2*gid_s+1, as two noshuffle
+// texels (each: two rows x four K, low half the even row). With BIN set it reads the bin
+// (32b-transposed) plane instead, where texel u*M + row holds one row's eight K, and
+// rebuilds the same two texels from the halves of the two rows' words, so the arithmetic
+// that follows is unchanged. BIN is a literal at every call site and folds away.
+#define Q40_LD2(d0, d1, IMG, J, BIN) {                                                   \
+    if (BIN) {                                                                           \
+        const uint q40_u  = (4 * k + ((J) >> 1)) * M + 2 * gid_s;                        \
+        const uint q40_w0 = read_imageui(IMG, (int)(q40_u    )).x;                       \
+        const uint q40_w1 = read_imageui(IMG, (int)(q40_u + 1)).x;                       \
+        d0 = (q40_w0 & 0xFFFFu) | (q40_w1 << 16);                                        \
+        d1 = (q40_w0 >> 16)     | (q40_w1 & 0xFFFF0000u);                                \
+    } else {                                                                             \
+        d0 = read_imageui(IMG, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * (J))).x;    \
+        d1 = read_imageui(IMG, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * ((J) + 1))).x; \
+    } }
+
+inline void q40_gemv_glu(
+        __read_only  image1d_buffer_t src0g_q,
+        global half2  * src0g_d,
+        __read_only  image1d_buffer_t src0u_q,
+        global half2  * src0u_d,
+        __read_only  image1d_buffer_t src1,
+        global float * dst,
+        ulong offsetd,
+        int ne00,
+        int ne01,
+        int glu_op,
+        __local float4 * reduceLM,
+        const int bin)
+{
+    uint groupId = get_local_id(1);
+    uint gid     = get_global_id(0);
+    ushort slid  = get_sub_group_local_id();
+    uint nsg     = get_local_size(1);
+    MATERIALIZE_WG(nsg);
+
+    uint K = ne00;
+    uint M = ne01;
+    uint LINE_STRIDE_A  = M / 2;
+    uint BLOCK_STRIDE_A = N_SIMDGROUP * M;
+
+    __private uint4  regA;
+    __private half2  regS;
+    __private float8 regB;
+    __private float2 gateSum = (float2)(0.0f);
+    __private float2 upSum   = (float2)(0.0f);
+
+#ifdef VECTOR_SUB_GROUP_BROADCAST
+#define Q40_DEQ_HI dequantizeBlockAccum_ns_sgbroadcast_8_hi
+#define Q40_DEQ_LO dequantizeBlockAccum_ns_sgbroadcast_8_lo
+#else
+#define Q40_DEQ_HI dequantizeBlockAccum_ns_sgbroadcast_1_hi
+#define Q40_DEQ_LO dequantizeBlockAccum_ns_sgbroadcast_1_lo
+#endif
+    // The x-grid is padded to CEIL_DIV(M/2,64)*64, so when M % 128 != 0 the tail lanes
+    // hold gid >= M/2. Their outputs are discarded below, but read_imageui on an
+    // image1d_buffer_t is undefined out of range (images clamp only for sampler reads)
+    // and the scale fetch is a raw global pointer, so both fetches use a clamped row.
+    // The lanes stay active, which subgroup broadcast requires.
+    uint gid_s = min(gid, LINE_STRIDE_A - 1);
+#define Q40_GLU_LOOP(SUM, Q, DD)                                                    \
+    for (uint k = groupId; k < (K / QK4_0); k += nsg) {                            \
+        regS = DD[gid_s + k * LINE_STRIDE_A];                                      \
+        if (slid < 4) {                                                            \
+            regB.s0123 = read_imagef(src1, (slid * 2 + k * 8));                    \
+            regB.s4567 = read_imagef(src1, (1 + slid * 2 + k * 8));                \
+        }                                                                          \
+        Q40_LD2(regA.s0, regA.s1, Q, 0, bin);                                      \
+        Q40_LD2(regA.s2, regA.s3, Q, 2, bin);                                      \
+        Q40_DEQ_HI(SUM, as_ushort8(regA), regS, regB);                             \
+        Q40_LD2(regA.s0, regA.s1, Q, 4, bin);                                      \
+        Q40_LD2(regA.s2, regA.s3, Q, 6, bin);                                      \
+        Q40_DEQ_LO(SUM, as_ushort8(regA), regS, regB);                             \
+    }
+    Q40_GLU_LOOP(gateSum, src0g_q, src0g_d)
+    Q40_GLU_LOOP(upSum,   src0u_q, src0u_d)
+#undef Q40_DEQ_HI
+#undef Q40_DEQ_LO
+#undef Q40_GLU_LOOP
+
+    if (groupId > 0) {
+        reduceLM[SIMDGROUP_WIDTH * (groupId - 1) + slid] = (float4)(gateSum, upSum);
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (groupId == 0) {
+        for (uint i = 0; i < nsg - 1; ++i) {
+            float4 p = reduceLM[SIMDGROUP_WIDTH * i + slid];
+            gateSum += p.xy;
+            upSum   += p.zw;
+        }
+        dst = (global float*)((global char*)dst + offsetd);
+        if (gid * 2 + 0 < M) dst[gid * 2 + 0] = q40_glu_apply(glu_op, gateSum.s0, upSum.s0);
+        if (gid * 2 + 1 < M) dst[gid * 2 + 1] = q40_glu_apply(glu_op, gateSum.s1, upSum.s1);
+    }
+}
+
+// Noshuffle layout (the default q4_0 Adreno layout).
+#ifdef ADRENO_GPU
+REQD_SUBGROUP_SIZE_64
+#endif
+__kernel void kernel_gemv_noshuffle_q4_0_f32_glu(
+        __read_only  image1d_buffer_t src0g_q,   // gate weights
+        global half2  * src0g_d,                  // gate scales
+        __read_only  image1d_buffer_t src0u_q,    // up weights
+        global half2  * src0u_d,                  // up scales
+        __read_only  image1d_buffer_t src1,       // shared activation
+        global float * dst,
+        ulong offsetd,
+        int ne00,                                 // K
+        int ne01,                                 // M
+        int glu_op)
+{
+    __local float4 reduceLM[SIMDGROUP_WIDTH * 7];
+    q40_gemv_glu(src0g_q, src0g_d, src0u_q, src0u_d, src1, dst, offsetd, ne00, ne01, glu_op, reduceLM, 0);
+}
+
+// Bin (32b-transposed) layout, used when the q4_0 bin kernels are active. The scales
+// are laid out the same way in both.
+#ifdef ADRENO_GPU
+REQD_SUBGROUP_SIZE_64
+#endif
+__kernel void kernel_gemv_noshuffle_q4_0_f32_glu_bin(
+        __read_only  image1d_buffer_t src0g_q,
+        global half2  * src0g_d,
+        __read_only  image1d_buffer_t src0u_q,
+        global half2  * src0u_d,
+        __read_only  image1d_buffer_t src1,
+        global float * dst,
+        ulong offsetd,
+        int ne00,
+        int ne01,
+        int glu_op)
+{
+    __local float4 reduceLM[SIMDGROUP_WIDTH * 7];
+    q40_gemv_glu(src0g_q, src0g_d, src0u_q, src0u_d, src1, dst, offsetd, ne00, ne01, glu_op, reduceLM, 1);
+}
