@@ -4019,6 +4019,24 @@ private:
                 slot.spec_tree.clear();   // fall back to the linear spine
                 return;
             }
+            // 🔴 A sliding-window cache breaks the tree long before the half-n_ctx bound: its
+            // SWA half holds n_swa * n_seq_max + n_ubatch cells in total (unified), and copying
+            // the slot into the scratch sequences leaves the verify batch no room there.
+            // Measured on gemma-4-E4B + MTP, -np auto (unified, SWA cache 2560 cells),
+            // -c 16384: a 4404-token request after a short one fails every time with the same
+            // 500, on the GPU and on the CPU; LLAMA_MTP_TREE_NODES=0 or --swa-full serves it.
+            // n_swa is 0 for a full-attention model and under --swa-full, so only the small
+            // SWA cache is excluded.
+            if (n_swa > 0) {
+                static bool warned_swa = false;
+                if (!warned_swa) {
+                    warned_swa = true;
+                    SLT_WRN(slot, "%s", "draft trees cannot be placed in a sliding-window KV cache "
+                            "(use --swa-full to allow them); using the linear draft\n");
+                }
+                slot.spec_tree.clear();
+                return;
+            }
             for (int i = 0; i < params_base.n_parallel && (int32_t) slot.spec_tree_seqs.size() < n_need; ++i) {
                 if (i != slot.id) {
                     slot.spec_tree_seqs.push_back(i);
