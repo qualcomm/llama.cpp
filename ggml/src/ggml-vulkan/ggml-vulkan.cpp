@@ -1197,6 +1197,8 @@ void ggml_vk_wait_events(vk_context& ctx, std::vector<vk::Event>&& events) {
     );
 }
 
+static bool ggml_vk_fa_scalar_uses_mmq(const vk_device& device, ggml_type k_type, ggml_type v_type);
+
 static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, uint32_t hsk, uint32_t hsv, uint32_t n_rows, uint32_t n_kv, ggml_type k_type, ggml_type v_type, bool f32acc) {
 
     vk_fa_tuning_params result{};
@@ -1246,6 +1248,20 @@ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, 
     const uint32_t D_lsb = D ^ (D & (D-1));  // extract lowest set bit
 
     result.d_split = std::min(std::min(result.subgroup_size, 8u), D_lsb / 4);
+
+    // On Adreno, the integer dot K path can give wrong results when each thread steps through K
+    // 2 ints at a time (e.g. head size 576 with d_split 8). Use a smaller d_split that gives a
+    // step of 4 or more if there is one.
+    if (device->vendor_id == VK_VENDOR_ID_QUALCOMM &&
+        ggml_vk_fa_scalar_uses_mmq(device, k_type, v_type) && (hsk / result.d_split / 4) % 4 == 2) {
+        uint32_t d_split = result.d_split;
+        while (d_split > 1 && (hsk / d_split / 4) % 4 != 0) {
+            d_split /= 2;
+        }
+        if ((hsk / d_split / 4) % 4 == 0) {
+            result.d_split = d_split;
+        }
+    }
 
     result.shmem_staging = (device->vendor_id == VK_VENDOR_ID_NVIDIA && hsk < 256 && hsv < 256) ? 1 : 0;
 
