@@ -12923,8 +12923,9 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
                 }
                 // Position-parallel block-softmax decode FA (MQ_GQA=8). WG=32=1
                 // subgroup; compiled only for DK=DV=128 (DV_VEC==DK_VEC==FA_SG).
-                // Env-gated GGML_OPENCL_FA_PPB=1 at dispatch. Experimental.
-                if (dk == 128 && dv == 128) {
+                // Env-gated GGML_OPENCL_FA_PPB=1 at dispatch, Intel only. Experimental.
+                // Its source needs DK_VEC == FA_SG, so it is not in the Adreno program.
+                if (backend_ctx->gpu_family == INTEL && dk == 128 && dv == 128) {
                     cl_kernel k_ppb_g8 = clCreateKernel(prog_g8, "flash_attn_f32_f16_q1_ppb", &err);
                     if (err == CL_SUCCESS) {
                         if (ggml_opencl_fa_kernel_fits_wg(backend_ctx, k_ppb_g8, 32,
@@ -12939,8 +12940,8 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
                     }
                 }
                 // Wider-WG ppb: 4 subgroups/WG (WG=128), head-split. Env-gated
-                // GGML_OPENCL_FA_PPB4=1 at dispatch. Experimental.
-                if (dk == 128 && dv == 128) {
+                // GGML_OPENCL_FA_PPB4=1 at dispatch, Intel only. Experimental.
+                if (backend_ctx->gpu_family == INTEL && dk == 128 && dv == 128) {
                     cl_kernel k_ppb4_g8 = clCreateKernel(prog_g8, "flash_attn_f32_f16_q1_ppb4", &err);
                     if (err == CL_SUCCESS) {
                         if (ggml_opencl_fa_kernel_fits_wg(backend_ctx, k_ppb4_g8, 128,
