@@ -170,6 +170,9 @@ __kernel void kernel_moe_scatter_det(
     }
 
     int val = input[n * n_experts + k];
+    if (val == -1) { // skipped slot, owned by no expert
+        return;
+    }
 
     const int me = (int)(n * topK + k);
     int local_slot = 0;

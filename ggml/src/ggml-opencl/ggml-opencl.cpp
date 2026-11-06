@@ -19832,6 +19832,12 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
         case GGML_OP_CPY:
         case GGML_OP_DUP:
         case GGML_OP_CONT:
+            // the copy kernels write each source row as one run along dst dim 0, which holds
+            // when dst is contiguous or each source row is exactly one unit-stride dst row
+            if (!ggml_is_contiguous(op) &&
+                !(op->nb[0] == ggml_type_size(op->type) && op->src[0]->ne[0] == op->ne[0])) {
+                return false;
+            }
             switch (op->src[0]->type) {
                 case GGML_TYPE_F32:
                     switch (op->type) {
@@ -29932,6 +29938,35 @@ static void ggml_cl_mul_mat_q4_0_glu_fused(ggml_backend_t backend, ggml_tensor *
 #endif
 }
 
+// The MoE matmul kernels write nothing for a -1 (skipped) expert id, so zero those dst
+// rows first. dst is [ne0, n_expert_used, n_tokens], one row per (slot, token) of ids.
+// A GLU output of two zero rows is zero, so the fused GEMV+GLU paths use it as well.
+static void ggml_cl_moe_zero_skipped_rows(ggml_backend_opencl_context * backend_ctx, const ggml_tensor * ids, const ggml_tensor * dst) {
+    ggml_tensor_extra_cl * extra_ids = (ggml_tensor_extra_cl *)ids->extra;
+    ggml_tensor_extra_cl * extrad    = (ggml_tensor_extra_cl *)dst->extra;
+
+    const cl_ulong offset_ids = extra_ids->offset + ids->view_offs;
+    const cl_ulong offsetd    = extrad->offset + dst->view_offs;
+    const cl_ulong nb_ids1    = ids->nb[1];
+    const cl_ulong nb1        = dst->nb[1];
+    const cl_ulong nb2        = dst->nb[2];
+    const int      ne0        = (int)dst->ne[0];
+
+    cl_kernel kernel_zero = backend_ctx->kernel_moe_zero_dst;
+    CL_CHECK(clSetKernelArg(kernel_zero, 0, sizeof(cl_mem),   &extra_ids->data_device));
+    CL_CHECK(clSetKernelArg(kernel_zero, 1, sizeof(cl_ulong), &offset_ids));
+    CL_CHECK(clSetKernelArg(kernel_zero, 2, sizeof(cl_ulong), &nb_ids1));
+    CL_CHECK(clSetKernelArg(kernel_zero, 3, sizeof(cl_mem),   &extrad->data_device));
+    CL_CHECK(clSetKernelArg(kernel_zero, 4, sizeof(cl_ulong), &offsetd));
+    CL_CHECK(clSetKernelArg(kernel_zero, 5, sizeof(cl_ulong), &nb1));
+    CL_CHECK(clSetKernelArg(kernel_zero, 6, sizeof(cl_ulong), &nb2));
+    CL_CHECK(clSetKernelArg(kernel_zero, 7, sizeof(int),      &ne0));
+
+    size_t zero_local[3]  = {1, 1, 64};
+    size_t zero_global[3] = {(size_t) ids->ne[0], (size_t) ids->ne[1], 64};
+    backend_ctx->enqueue_ndrange_kernel(kernel_zero, 3, zero_global, zero_local, (ggml_tensor *)dst);
+}
+
 // Fused combined-gate_up MoE GEMV + GLU. mmid_tensor = the mul_mat_id over the
 // combined ffn_gate_up_exps weight (rows [0,n_ff)=gate, [n_ff,2n_ff)=up);
 // glu_tensor = the GLU on the two row-halves. Folds the GLU into the MoE GEMV
@@ -30030,6 +30065,7 @@ static void ggml_cl_mul_mat_id_q4_k_glu_fused(ggml_backend_t backend, ggml_tenso
         if (dbg < 3) { fprintf(stderr, "[FUSE_MOE_GLU] fired #%d K=%d 2nff=%d n_ff=%d ne20=%d glu_op=%d\n", ++dbg, ne00, ne01, n_ff, ne20, glu_op); fflush(stderr); }
     }
 
+    ggml_cl_moe_zero_skipped_rows(backend_ctx, src2, dst);
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_size, local_size, dst);
 
     CL_CHECK(clReleaseMemObject(src1_sub_buffer));
@@ -30129,6 +30165,7 @@ static void ggml_cl_mul_mat_id_q4_k_glu2_fused(ggml_backend_t backend, ggml_tens
                       ne00, ne01, ne20, glu_op);
     }
 
+    ggml_cl_moe_zero_skipped_rows(backend_ctx, src2, glu_tensor);
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_size, local_size, dst);
 
     CL_CHECK(clReleaseMemObject(src1_sub_buffer));
@@ -30250,6 +30287,7 @@ static void ggml_cl_mul_mat_id_mxfp4_glu_fused(ggml_backend_t backend,
         if (dbg < 3) { fprintf(stderr, "[FUSE_MOE_GLU_MXFP4] fired #%d K=%d n_ff=%d ne20=%d alpha=%.3f limit=%.3f\n", ++dbg, ne00, ne01, ne20, alpha, limit); fflush(stderr); }
     }
 
+    ggml_cl_moe_zero_skipped_rows(backend_ctx, src2, dst);
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_size, local_size, (ggml_tensor *)dst);
 
     CL_CHECK(clReleaseMemObject(src1_sub_buffer));
@@ -52213,23 +52251,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
     GGML_ASSERT(ne00 == ne10);
 
     // the matmul kernels only write the rows an expert owns, so zero the skipped rows here
-    {
-        const cl_ulong nb1 = dst->nb[1];
-        const cl_ulong nb2 = dst->nb[2];
-        cl_kernel kernel_zero = backend_ctx->kernel_moe_zero_dst;
-        CL_CHECK(clSetKernelArg(kernel_zero, 0, sizeof(cl_mem),   &extra2->data_device));
-        CL_CHECK(clSetKernelArg(kernel_zero, 1, sizeof(cl_ulong), &offset2));
-        CL_CHECK(clSetKernelArg(kernel_zero, 2, sizeof(cl_ulong), &nb21));
-        CL_CHECK(clSetKernelArg(kernel_zero, 3, sizeof(cl_mem),   &extrad->data_device));
-        CL_CHECK(clSetKernelArg(kernel_zero, 4, sizeof(cl_ulong), &offsetd));
-        CL_CHECK(clSetKernelArg(kernel_zero, 5, sizeof(cl_ulong), &nb1));
-        CL_CHECK(clSetKernelArg(kernel_zero, 6, sizeof(cl_ulong), &nb2));
-        CL_CHECK(clSetKernelArg(kernel_zero, 7, sizeof(int),      &ne0));
-
-        size_t zero_local[3]  = {1, 1, 64};
-        size_t zero_global[3] = {(size_t) ne20, (size_t) ne21, 64};
-        backend_ctx->enqueue_ndrange_kernel(kernel_zero, 3, zero_global, zero_local, dst);
-    }
+    ggml_cl_moe_zero_skipped_rows(backend_ctx, src2, dst);
 
     int sgs   = 32; // subgroup size
     int nsg   = 1;  // number of subgroups
