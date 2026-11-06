@@ -11685,6 +11685,12 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
         case GGML_OP_CPY:
         case GGML_OP_DUP:
         case GGML_OP_CONT:
+            // the copy kernels write each source row as one run along dst dim 0, which holds
+            // when dst is contiguous or each source row is exactly one unit-stride dst row
+            if (!ggml_is_contiguous(op) &&
+                !(op->nb[0] == ggml_type_size(op->type) && op->src[0]->ne[0] == op->ne[0])) {
+                return false;
+            }
             switch (op->src[0]->type) {
                 case GGML_TYPE_F32:
                     switch (op->type) {
