@@ -15,6 +15,9 @@ __kernel void kernel_moe_histogram(
     }
 
     int expert_id = input[n * n_experts + k];
+    if (expert_id == -1) { // skipped slot, owned by no expert
+        return;
+    }
     atomic_inc(&hist[expert_id]);
 }
 
@@ -57,6 +60,9 @@ __kernel void kernel_moe_scatter(
     }
 
     int val = input[n * n_experts + k];
+    if (val == -1) { // skipped slot, owned by no expert
+        return;
+    }
 
     int local_slot = atomic_inc(&slot_counter[val]);
 

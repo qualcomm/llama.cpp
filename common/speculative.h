@@ -139,7 +139,7 @@ struct common_speculative_draft_params {
     // Left empty by implementations that do not branch.
     common_speculative_draft_tree * tree = nullptr;
 
-    // candidate distribution per drafted token; set it to make draft-simple and draft-mtp sample
+    // candidate distribution per drafted token; set it to make draft-simple, draft-mtp and draft-dflash (DFlash2 only) sample
     std::vector<std::vector<llama_token_data>> * result_q = nullptr;
 
     // the target's temp and seed, read only when the drafter samples probabilistically

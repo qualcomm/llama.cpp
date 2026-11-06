@@ -22,6 +22,7 @@
 #include <fstream>
 #include <iomanip>
 #include <map>
+#include <random>
 #include <cinttypes>
 
 #define SPC_DBG(fmt, ...) LOG_DBG("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -1110,6 +1111,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     bool    is_mrope       = false;
     int32_t selector_top_k = 0;
 
+    // DFlash2 probabilistic drafting: one generator per sequence and the seed it was last seeded with (-1: reseed)
+    std::vector<std::mt19937> dflash2_rng;
+    std::vector<int64_t>      dflash2_seed;
+
     // draft-dspark: the draft carries a Markov head and uses an anchor-first block layout
     const bool is_dspark;
 
@@ -1121,6 +1126,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     const int32_t * target_layer_ids   = nullptr; // model_dft's extract layer indices
     uint32_t        target_layer_ids_n = 0;
+
+    // inject target features from the target's device buffer instead of host copies (not wired here, see the constructor)
+    bool use_dev_features = false;
 
     common_speculative_impl_draft_dflash(const common_params_speculative & params, uint32_t n_seq,
             common_speculative_type type = COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)
@@ -1160,6 +1168,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         selector_top_k = llama_model_dflash_selector_top_k(model_dft);
         is_dflash2     = selector_top_k > 0;
+        dflash2_rng.resize(n_seq);
+        dflash2_seed.assign(n_seq, -1);
         char lilicorr_meta[32] = {};
         lilicorr_top_k = llama_model_meta_val_str(model_dft, "lilicorr.candidate_topk", lilicorr_meta, sizeof(lilicorr_meta)) >= 0
                 ? std::atoi(lilicorr_meta) : 0;
@@ -1237,6 +1247,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k], true);
         }
 
+        // the device-buffer feature injection (#31506) feeds a common_batch with embd rows; this
+        // implementation injects through a llama_batch, so it keeps the host copies
+        use_dev_features = false;
+
         // DFlash2 reads its selector lattice from h_nextn and never consumes raw logits.
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ !is_dflash2 && !is_lilicorr);
         llama_set_causal_attn(ctx_dft, causal_attn); // DFlash needs non-causal attention unless the model says otherwise
@@ -1263,6 +1277,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
         }
+
+        // reseed per request rather than per round, or two identical requests differ
+        dflash2_seed[seq_id] = -1;
 
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
@@ -1545,6 +1562,21 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 const float * lattice = llama_get_embeddings_nextn(ctx_dft);
                 GGML_ASSERT(lattice && "DFlash2 selector produced no lattice");
 
+                // DFlash2 can instead sample each step and hand q to the verifier for rejection sampling
+                const bool sample = is_dflash2 && params.probabilistic && dp.result_q;
+
+                // greedy keeps temperature 1, sampling uses the target's
+                const float temp = sample ? dp.temp : 1.0f;
+
+                if (sample && dflash2_seed[seq_id] != dp.seed) {
+                    dflash2_seed[seq_id] = dp.seed;
+                    // the default seed means random; mixed so it differs from the target's, as in spec_retune
+                    dflash2_rng[seq_id].seed(dp.seed == LLAMA_DEFAULT_SEED ? std::random_device{}() : dp.seed ^ 0x85ebca6bu);
+                }
+
+                std::vector<float>   probs;
+                std::vector<int32_t> sorted_idx;
+
                 int32_t predecessor = 0;
                 for (int32_t i = 1; i < (is_dflash2 ? n_block_tokens : params.n_max + 1); ++i) {
                     const float * row = lattice + (size_t) (beg + i) * n_embd_dec;
@@ -1553,14 +1585,43 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                     predecessor = (int32_t) std::distance(scores,
                             std::max_element(scores, scores + top_k));
-                    if (params.p_min > 0.0f) {
-                        // softmax(scores) at the argmax, i.e. 1 / sum(exp(s_k - s_max))
+                    if (params.p_min > 0.0f || sample) {
+                        // softmax(scores / temp) at the argmax, i.e. 1 / sum(exp((s_k - s_max) / temp))
+                        probs.resize(top_k);
                         float sum = 0.0f;
                         for (int32_t k = 0; k < top_k; ++k) {
-                            sum += std::exp(scores[k] - scores[predecessor]);
+                            probs[k] = std::exp((scores[k] - scores[predecessor]) / temp);
+                            sum += probs[k];
                         }
                         if (1.0f / sum < params.p_min) {
                             break;
+                        }
+                        for (int32_t k = 0; k < top_k; ++k) {
+                            probs[k] /= sum;
+                        }
+                    }
+                    if (sample) {
+                        // ggml_top_k leaves candidates unordered, so walk them by token id to keep a seed's draft stable
+                        sorted_idx.resize(top_k);
+                        for (int32_t k = 0; k < top_k; ++k) {
+                            sorted_idx[k] = k;
+                        }
+                        std::sort(sorted_idx.begin(), sorted_idx.end(), [row](int32_t a, int32_t b) { return row[a] < row[b]; });
+
+                        // a round-off overshoot keeps the argmax, which has q > 0
+                        double u = std::uniform_real_distribution<double>(0.0, 1.0)(dflash2_rng[seq_id]);
+                        for (const int32_t k : sorted_idx) {
+                            u -= probs[k];
+                            if (u < 0.0) {
+                                predecessor = k;
+                                break;
+                            }
+                        }
+
+                        auto & q = dp.result_q->emplace_back();
+                        q.reserve(top_k);
+                        for (int32_t k = 0; k < top_k; ++k) {
+                            q.push_back({ (llama_token) row[k], scores[k], probs[k] });
                         }
                     }
                     result.push_back((llama_token) row[predecessor]);
@@ -1568,6 +1629,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                 if (result.size() < (size_t) params.n_min) {
                     result.clear();
+                    if (sample) {
+                        dp.result_q->clear();
+                    }
                 }
                 continue;
             }
@@ -2541,6 +2605,29 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
+    }
+
+    bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return false;
+        }
+
+        const size_t row_bytes = (size_t) n_embd * sizeof(float);
+        data.resize(row_bytes);
+        std::memcpy(data.data(), pending_h[seq_id].data(), row_bytes);
+        return true;
+    }
+
+    void set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return;
+        }
+
+        const size_t row_bytes = (size_t) n_embd * sizeof(float);
+        if (data.size() != row_bytes) {
+            return;
+        }
+        std::memcpy(pending_h[seq_id].data(), data.data(), row_bytes);
     }
 };
 

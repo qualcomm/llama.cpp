@@ -34,6 +34,7 @@
 #include "work-queue.h"
 #include "hex-profile.h"
 #include "allreduce-ops.h"
+#include "dsv4-hc-ops.h"
 #include "htp-fence.h"
 
 #define HMX_QUEUE_CAPACITY     128
@@ -325,8 +326,11 @@ static unsigned int vtcm_query_size(void) {
     return vtcm_size;
 }
 
-static int vtcm_alloc(struct htp_context * ctx) {
+static int vtcm_alloc(struct htp_context * ctx, uint64_t size_override) {
     unsigned int vtcm_size = vtcm_query_size();
+    if (size_override) {
+        vtcm_size = (unsigned int) size_override;
+    }
 
     compute_res_attr_t attr;
     HAP_compute_res_attr_init(&attr);
@@ -438,7 +442,7 @@ static const struct htp_power_profile htp_power_profiles[HTP_POWER_MODE_COUNT] =
 
 #undef HTP_POWER_PROFILE_ENTRY
 
-AEEResult htp_iface_start(remote_handle64 handle, uint32_t sess_id, uint64_t dsp_queue_id, uint32_t n_hvx, uint32_t n_hmx, uint64_t max_vmem, uint32_t power_mode) {
+AEEResult htp_iface_start(remote_handle64 handle, uint32_t sess_id, uint64_t dsp_queue_id, uint32_t n_hvx, uint32_t n_hmx, uint64_t vtcm_size, uint64_t max_vmem, uint32_t power_mode) {
     struct htp_handle * h = (struct htp_handle *) handle;
     if (!h) {
         return AEE_EBADPARM;
@@ -557,7 +561,7 @@ AEEResult htp_iface_start(remote_handle64 handle, uint32_t sess_id, uint64_t dsp
     ctx->max_vmem    = max_vmem;
     ctx->dsp_queue   = dsp_queue;
 
-    err = vtcm_alloc(ctx);
+    err = vtcm_alloc(ctx, vtcm_size);
     if (err != AEE_SUCCESS) {
         FARF(ERROR, "Unable to allocate VTCM");
         htp_iface_stop(handle);
@@ -674,7 +678,7 @@ AEEResult htp_iface_start(remote_handle64 handle, uint32_t sess_id, uint64_t dsp
         dma_ptr_curr += size_dma_q;
     }
 
-    ctx->ddr_spad_size = 512 * 1024; // 512 KB
+    ctx->ddr_spad_size = HTP_DDR_SPAD_SIZE;
     ctx->ddr_spad_base = memalign(128, ctx->ddr_spad_size);
 
     void * wq_ptr = (void *) ((uintptr_t) block + offset_wq);
@@ -945,6 +949,8 @@ static int execute_op(struct htp_ops_context * octx) {
         case HTP_OP_UNARY_LOG:
         case HTP_OP_UNARY_RELU:
         case HTP_OP_UNARY_STEP:
+        case HTP_OP_UNARY_CEIL:
+        case HTP_OP_UNARY_SGN:
         case HTP_OP_L2_NORM:
         case HTP_OP_HADAMARD:
             return op_unary(octx);
@@ -955,7 +961,9 @@ static int execute_op(struct htp_ops_context * octx) {
         case HTP_OP_GLU_GEGLU:
         case HTP_OP_GLU_GEGLU_QUICK:
         case HTP_OP_GLU_GEGLU_ERF:
-            return op_activations(octx);
+        case HTP_OP_GLU_REGLU:
+        case HTP_OP_GLU_SIGMOID:
+            return op_glu(octx);
 
         case HTP_OP_SOFTMAX:
             return op_softmax(octx);
@@ -1000,6 +1008,9 @@ static int execute_op(struct htp_ops_context * octx) {
         case HTP_OP_CUMSUM:
             return op_cumsum(octx);
 
+        case HTP_OP_TOP_K_MASK:
+            return op_top_k_mask(octx);
+
         case HTP_OP_FILL:
             return op_fill(octx);
 
@@ -1018,6 +1029,12 @@ static int execute_op(struct htp_ops_context * octx) {
         case HTP_OP_IM2COL_3D:
             return op_im2col_3d(octx);
 
+        case HTP_OP_CONV_2D:
+            return op_conv_2d(octx);
+
+        case HTP_OP_CONV_2D_DW:
+            return op_conv_2d_dw(octx);
+
         case HTP_OP_ROLL:
             return op_roll(octx);
 
@@ -1027,14 +1044,26 @@ static int execute_op(struct htp_ops_context * octx) {
         case HTP_OP_POOL_1D:
             return op_pool_1d(octx);
 
+        case HTP_OP_DSV4_HC_PRE:
+            return op_dsv4_hc_pre(octx);
+
+        case HTP_OP_DSV4_HC_POST:
+            return op_dsv4_hc_post(octx);
+
         case HTP_OP_CONCAT:
             return op_concat(octx);
 
         case HTP_OP_GATED_DELTA_NET:
             return op_gated_delta_net(octx);
 
+        case HTP_OP_LIGHTNING_INDEXER:
+            return op_lightning_indexer(octx);
+
         case HTP_OP_TRI:
             return op_unary(octx);
+
+        case HTP_OP_UPSCALE:
+            return op_upscale(octx);
 
         case HTP_OP_INVALID:
             break;
@@ -1244,8 +1273,6 @@ static int proc_op_req(struct htp_ops_context * octx, struct htp_buf_desc * bufs
 
     octx->src0_spad.src = NULL;
     octx->src1_spad.src = NULL;
-    octx->src2_spad.src = NULL;
-    octx->src3_spad.src = NULL;
     octx->dst_spad.src  = NULL;
 
     return octx->status;
@@ -1306,10 +1333,7 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
     prep_tensors(ctx, bufs, tens, n_tens);
 
     struct htp_ops_context *octx = &ctx->octx;
-    memset(octx, 0, sizeof(*octx));
-    octx->n_threads     = ctx->n_threads;
-    octx->n_threads_div = ctx->n_threads_div;
-    octx->ctx           = ctx;
+    htp_ops_context_reset(octx, ctx);
 
     mdev_group_init(ctx, req);
 
