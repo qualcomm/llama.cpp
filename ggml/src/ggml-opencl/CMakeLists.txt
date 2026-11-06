@@ -337,6 +337,7 @@ set(GGML_OPENCL_KERNELS
     l2_norm
     rms_norm
     rope
+    arange
     scale
     set_rows
     sigmoid
