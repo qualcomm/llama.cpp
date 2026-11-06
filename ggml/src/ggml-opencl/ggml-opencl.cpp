@@ -29941,7 +29941,18 @@ static void ggml_cl_mul_mat_q4_0_glu_fused(ggml_backend_t backend, ggml_tensor *
 // The MoE matmul kernels write nothing for a -1 (skipped) expert id, so zero those dst
 // rows first. dst is [ne0, n_expert_used, n_tokens], one row per (slot, token) of ids.
 // A GLU output of two zero rows is zero, so the fused GEMV+GLU paths use it as well.
+// Ids read straight out of ARGSORT / TOP_K are expert indices and never -1; skipping the
+// launch there keeps one dispatch per MUL_MAT_ID off the decode path.
 static void ggml_cl_moe_zero_skipped_rows(ggml_backend_opencl_context * backend_ctx, const ggml_tensor * ids, const ggml_tensor * dst) {
+    const ggml_tensor * root = ids;
+    while ((root->op == GGML_OP_VIEW || root->op == GGML_OP_RESHAPE || root->op == GGML_OP_PERMUTE ||
+            root->op == GGML_OP_TRANSPOSE) && root->src[0] != nullptr) {
+        root = root->src[0];
+    }
+    if (root->op == GGML_OP_ARGSORT || root->op == GGML_OP_TOP_K) {
+        return;
+    }
+
     ggml_tensor_extra_cl * extra_ids = (ggml_tensor_extra_cl *)ids->extra;
     ggml_tensor_extra_cl * extrad    = (ggml_tensor_extra_cl *)dst->extra;
 
