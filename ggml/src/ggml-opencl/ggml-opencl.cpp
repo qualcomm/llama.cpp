@@ -34819,13 +34819,18 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
             // the texture path's per-access latency is paid on each re-read
             // instead of being amortised over one streaming pass. So enable it
             // only where one workgroup owns the whole gqa group.
+            // Except DK=512 at gqa=2 (the gemma-4-E4B MTP drafter), where it loses even
+            // with head_sub 1: test-backend-ops perf, X2-90, 2 KV heads, us/run at kv
+            // 4096 / 16384, 200 / 719 with it against 170 / 592 without (upstream's
+            // mq decode program: 170 / 597).
             // GGML_OPENCL_FA_MQN_KIMG=0/1 forces it either way.
             static const int mqn_kimg_env = []{
                 const char * e = getenv("GGML_OPENCL_FA_MQN_KIMG");
                 if (e == NULL || e[0] == 0) return -1;
                 return (e[0] != '0') ? 1 : 0;
             }();
-            const bool mqn_kimg = (mqn_kimg_env >= 0) ? (mqn_kimg_env == 1) : (hs == 1);
+            const bool mqn_kimg = (mqn_kimg_env >= 0) ? (mqn_kimg_env == 1)
+                                                      : (hs == 1 && !(d_head_q == 512 && gqa == 2));
             if (gqa % hs == 0) {
                 ggml_opencl_ensure_fa_mq_narrow(backend_ctx, d_head_q, d_head_v, gqa, hs, nsg, false);
                 if (mqn_kimg) {
