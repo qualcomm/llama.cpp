@@ -380,6 +380,23 @@ struct ggml_cl_buffer {
     }
 };
 
+// image1d_buffer view over a ggml_cl_buffer, with the buffer and size it was made for so
+// that it can be rebuilt after allocate() replaces the buffer.
+struct ggml_cl_buffer_view {
+    cl_mem image  = nullptr;
+    cl_mem buffer = nullptr;
+    size_t size   = 0;
+
+    void release() {
+        if (image) {
+            CL_CHECK(clReleaseMemObject(image));
+        }
+        image  = nullptr;
+        buffer = nullptr;
+        size   = 0;
+    }
+};
+
 // Profiling
 struct ProfilingInfo {
     std::string op_name;
@@ -705,6 +722,7 @@ struct ggml_backend_opencl_context {
     size_t  image_max_buffer_size;
     size_t  image2d_max_width;
     size_t  image2d_max_height;
+    cl_uint compute_units = 0;  // CL_DEVICE_MAX_COMPUTE_UNITS
 
     cl_device_svm_capabilities svm_caps;
 
@@ -1467,6 +1485,21 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemm_coopk_q6_k_q8_1_dp4a_c2 = nullptr;
     int       nsg_coopk_dp4a_q6_k  = 8;
     int       rows_coopk_dp4a_q6_k = 4;
+    // Eight-column CoopK DP4A GEMMs for bin-layout weights at verify widths. Each program
+    // also exports the activation quant whose byte order its GEMM reads.
+    cl_kernel kernel_gemm_cok8_q4_0_q8_1_dp4a_bin = nullptr;
+    cl_kernel kernel_quant_a_q8_1_eo              = nullptr;
+    int       nsg_cok8_dp4a_q4_0  = 6;
+    int       rows_cok8_dp4a_q4_0 = 4;
+    cl_kernel kernel_gemm_cok8_q4_k_q8_1_dp4a_bin = nullptr;
+    cl_kernel kernel_quant_a_q8_1_k4              = nullptr;
+    int       nsg_cok8_dp4a_q4_k  = 4;
+    cl_kernel kernel_gemm_cok8_q6_k_q8_1_dp4a_bin = nullptr;
+    cl_kernel kernel_quant_a_q8_1_k4h             = nullptr;
+    int       nsg_cok8_dp4a_q6_k  = 4;
+    // RGBA32UI views of prealloc_moe_qa / prealloc_moe_da read by the cok8 GEMMs
+    ggml_cl_buffer_view cok8_qa_view;
+    ggml_cl_buffer_view cok8_da_view;
 #endif // GGML_OPENCL_USE_ADRENO_KERNELS
 
     ~ggml_backend_opencl_context() {
@@ -1529,6 +1562,8 @@ struct ggml_backend_opencl_context {
             }
             dequant_f16_pool.clear();
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+            cok8_qa_view.release();
+            cok8_da_view.release();
             ggml_cl_adreno_xmem_attn_release_scratch(this);
 #endif
         }
@@ -1838,6 +1873,40 @@ static void ggml_cl_coopk_build_narrow(ggml_backend_opencl_context * backend_ctx
     }
 }
 
+// Build one cok8 program and take its GEMM and activation quant kernels. Both stay null when the
+// program does not fit the workgroup limit or either kernel cannot be created.
+static void ggml_cl_cok8_build(ggml_backend_opencl_context * backend_ctx,
+                               const std::string & kernel_src, const std::string & opts,
+                               const char * gemm_name, const char * quant_name,
+                               int & nsg, cl_kernel & kernel_gemm, cl_kernel & kernel_quant) {
+    int nsg_eff = nsg;
+    cl_program program = ggml_cl_build_program_coopk(backend_ctx, kernel_src.c_str(), gemm_name, opts, nsg_eff);
+    if (program == nullptr) {
+        return;
+    }
+    cl_int err;
+    cl_kernel kg = clCreateKernel(program, gemm_name, &err);
+    if (err != CL_SUCCESS) { kg = nullptr; }
+    cl_kernel kq = clCreateKernel(program, quant_name, &err);
+    if (err != CL_SUCCESS) { kq = nullptr; }
+    CL_CHECK(clReleaseProgram(program));
+    if (kg == nullptr || kq == nullptr) {
+        if (kg) { CL_CHECK(clReleaseKernel(kg)); }
+        if (kq) { CL_CHECK(clReleaseKernel(kq)); }
+        return;
+    }
+    kernel_gemm  = kg;
+    kernel_quant = kq;
+    nsg          = nsg_eff;
+}
+
+// GGML_OPENCL_{Q4_0,Q4_K,Q6_K}_BIN_COK: unset or non-zero keeps the cok8 GEMM for that type, 0 leaves
+// those widths to the bin GEMM.
+static bool ggml_cl_cok8_env_on(const char * name) {
+    const char * env = getenv(name);
+    return !env || !*env || atoi(env) != 0;
+}
+
 static void load_cl_kernels_gemm_coopk(ggml_backend_opencl_context * backend_ctx) {
     if (backend_ctx->gpu_family != GPU_FAMILY::ADRENO || !ggml_cl_coopk_dp4a_enabled(backend_ctx)) {
         return;
@@ -1915,6 +1984,60 @@ static void load_cl_kernels_gemm_coopk(ggml_backend_opencl_context * backend_ctx
                                  backend_ctx->rows_coopk_dp4a_q6_k, backend_ctx->nsg_coopk_dp4a_q6_k,
                                  backend_ctx->kernel_gemm_coopk_q6_k_q8_1_dp4a_c4,
                                  backend_ctx->kernel_gemm_coopk_q6_k_q8_1_dp4a_c2);
+        GGML_LOG_CONT(".");
+    }
+
+    // Eight-column cok8 GEMMs, ne1 up to 8, for the bin weight layout only.
+    if (!use_adreno_bin_kernels(backend_ctx)) {
+        return;
+    }
+
+    if (ggml_cl_cok8_env_on("GGML_OPENCL_Q4_0_BIN_COK")) {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src {
+            #include "gemm_cok8_q4_0_q8_1_dp4a.cl.h"
+        };
+#else
+        const std::string kernel_src = read_file("gemm_cok8_q4_0_q8_1_dp4a.cl");
+#endif
+        ggml_cl_cok8_build(backend_ctx, kernel_src,
+                           backend_ctx->kernel_compile_opts + " -DCOOPK_ROWS=" + std::to_string(backend_ctx->rows_cok8_dp4a_q4_0),
+                           "kernel_gemm_cok8_q4_0_q8_1_dp4a", "kernel_quant_a_q8_1_eo",
+                           backend_ctx->nsg_cok8_dp4a_q4_0,
+                           backend_ctx->kernel_gemm_cok8_q4_0_q8_1_dp4a_bin,
+                           backend_ctx->kernel_quant_a_q8_1_eo);
+        GGML_LOG_CONT(".");
+    }
+
+    if (ggml_cl_cok8_env_on("GGML_OPENCL_Q4_K_BIN_COK")) {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src {
+            #include "gemm_cok8_q4_k_q8_1_dp4a.cl.h"
+        };
+#else
+        const std::string kernel_src = read_file("gemm_cok8_q4_k_q8_1_dp4a.cl");
+#endif
+        ggml_cl_cok8_build(backend_ctx, kernel_src, backend_ctx->kernel_compile_opts,
+                           "kernel_gemm_cok8_q4_k_q8_1_dp4a_bin", "kernel_quant_a_q8_1_k4",
+                           backend_ctx->nsg_cok8_dp4a_q4_k,
+                           backend_ctx->kernel_gemm_cok8_q4_k_q8_1_dp4a_bin,
+                           backend_ctx->kernel_quant_a_q8_1_k4);
+        GGML_LOG_CONT(".");
+    }
+
+    if (ggml_cl_cok8_env_on("GGML_OPENCL_Q6_K_BIN_COK")) {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src {
+            #include "gemm_cok8_q6_k_q8_1_dp4a.cl.h"
+        };
+#else
+        const std::string kernel_src = read_file("gemm_cok8_q6_k_q8_1_dp4a.cl");
+#endif
+        ggml_cl_cok8_build(backend_ctx, kernel_src, backend_ctx->kernel_compile_opts,
+                           "kernel_gemm_cok8_q6_k_q8_1_dp4a_bin", "kernel_quant_a_q8_1_k4h",
+                           backend_ctx->nsg_cok8_dp4a_q6_k,
+                           backend_ctx->kernel_gemm_cok8_q6_k_q8_1_dp4a_bin,
+                           backend_ctx->kernel_quant_a_q8_1_k4h);
         GGML_LOG_CONT(".");
     }
 }
@@ -9122,6 +9245,7 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
     CL_CHECK(clGetDeviceInfo(device, CL_DEVICE_IMAGE_MAX_BUFFER_SIZE, sizeof(size_t), &backend_ctx->image_max_buffer_size, NULL));
     CL_CHECK(clGetDeviceInfo(device, CL_DEVICE_IMAGE2D_MAX_WIDTH, sizeof(size_t), &backend_ctx->image2d_max_width, NULL));
     CL_CHECK(clGetDeviceInfo(device, CL_DEVICE_IMAGE2D_MAX_HEIGHT, sizeof(size_t), &backend_ctx->image2d_max_height, NULL));
+    CL_CHECK(clGetDeviceInfo(device, CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(cl_uint), &backend_ctx->compute_units, NULL));
     CL_CHECK(clGetDeviceInfo(device, CL_DEVICE_MAX_WORK_GROUP_SIZE, sizeof(size_t), &backend_ctx->max_workgroup_size, NULL));
     CL_CHECK(clGetDeviceInfo(device, CL_DEVICE_LOCAL_MEM_SIZE, sizeof(cl_ulong), &backend_ctx->local_mem_size, NULL));
     CL_CHECK(clGetDeviceInfo(device, CL_DEVICE_SVM_CAPABILITIES, sizeof(cl_device_svm_capabilities), &backend_ctx->svm_caps, 0));
@@ -24528,6 +24652,128 @@ static void ggml_cl_mul_mat_q2_0_f32_adreno(ggml_backend_t backend, const ggml_t
     CL_CHECK(clReleaseMemObject(b_sub_buf));
 }
 
+// Workgroup-level K split for the cok8 GEMMs. Splitting fills an otherwise idle device on low-M
+// shapes, but the partials and their reduction cost ksplit * M * N, so take the split that
+// maximises wg / (ceil(wg / CU) * CU), keeping the smaller one unless a larger one gains occupancy.
+static int ggml_cl_cok8_ksplit(const ggml_backend_opencl_context * backend_ctx, int base_wg, int n_blk) {
+    const int cu = backend_ctx->compute_units > 0 ? (int) backend_ctx->compute_units : 16;
+    int   ksplit   = 1;
+    float best_eff = -1.0f;
+    for (int kk = 1; kk <= 8; ++kk) {
+        const int   wg    = base_wg * kk;
+        const int   waves = (wg + cu - 1) / cu;
+        const float eff   = (float) wg / (float) (waves * cu);
+        if (eff > best_eff + 0.06f) {
+            best_eff = eff;
+            ksplit   = kk;
+        }
+    }
+    // Every slice needs at least one 32-value block.
+    if (ksplit > n_blk) {
+        ksplit = n_blk > 0 ? n_blk : 1;
+    }
+    return ksplit;
+}
+
+// Keep view an RGBA32UI image over the whole of buf (capped at the image buffer limit). allocate()
+// only grows, so a replaced buffer also changes the size; comparing both catches a cl_mem handle
+// that was recycled for the new buffer.
+static void ggml_cl_cok8_view(ggml_backend_opencl_context * backend_ctx, const ggml_cl_buffer & buf,
+                              ggml_cl_buffer_view & view) {
+    if (view.image != nullptr && view.buffer == buf.buffer && view.size == buf.size) {
+        return;
+    }
+    view.release();
+    cl_int err;
+    cl_image_format fmt = { CL_RGBA, CL_UNSIGNED_INT32 };
+    cl_image_desc   desc;
+    memset(&desc, 0, sizeof(desc));
+    desc.image_type  = CL_MEM_OBJECT_IMAGE1D_BUFFER;
+    desc.image_width = std::min(buf.size / 16, backend_ctx->image_max_buffer_size);
+    desc.buffer      = buf.buffer;
+    CL_CHECK((view.image = clCreateImage(backend_ctx->context, CL_MEM_READ_ONLY, &fmt, &desc, nullptr, &err), err));
+    view.buffer = buf.buffer;
+    view.size   = buf.size;
+}
+
+// Size prealloc_moe_qa / prealloc_moe_da for a cok8 GEMM, which always reads eight columns, and
+// refresh their image views. Returns false when an operand needs more texels than an image buffer
+// may hold. Newly allocated memory is zeroed. Columns past ne1 may still hold data from an earlier
+// user of these buffers; they have their own accumulators and are never stored.
+static bool ggml_cl_cok8_prepare(ggml_backend_opencl_context * backend_ctx, size_t size_qa, size_t size_da) {
+    const size_t max_width = backend_ctx->image_max_buffer_size;
+    if (CEIL_DIV(size_qa, 16) > max_width || CEIL_DIV(size_da, 16) > max_width) {
+        return false;
+    }
+    auto grow = [backend_ctx](ggml_cl_buffer & buf, size_t size) {
+        const size_t size_prev = buf.size;
+        buf.allocate(backend_ctx->context, size);
+        if (buf.size != size_prev) {
+            const cl_char zero = 0;
+            CL_CHECK(clEnqueueFillBuffer(backend_ctx->queue, buf.buffer, &zero, sizeof(zero), 0, buf.size, 0, NULL, NULL));
+        }
+    };
+    grow(backend_ctx->prealloc_moe_qa, size_qa);
+    grow(backend_ctx->prealloc_moe_da, size_da);
+    ggml_cl_cok8_view(backend_ctx, backend_ctx->prealloc_moe_qa, backend_ctx->cok8_qa_view);
+    ggml_cl_cok8_view(backend_ctx, backend_ctx->prealloc_moe_da, backend_ctx->cok8_da_view);
+    return true;
+}
+
+// Quantize the n activation columns at offset1 of src1 into prealloc_moe_qa / prealloc_moe_da.
+static void ggml_cl_cok8_quant(ggml_backend_opencl_context * backend_ctx, cl_kernel kernel_quant,
+                               cl_mem src1_buf, cl_ulong offset1, int n, int k, ggml_tensor * dst) {
+    cl_int err;
+    cl_buffer_region region;
+    region.origin = offset1;
+    region.size   = (size_t)k * n * sizeof(float);
+    cl_mem b_sub_buf = nullptr;
+    CL_CHECK((b_sub_buf = clCreateSubBuffer(src1_buf, 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &err), err));
+
+    const cl_int n_blk    = k / 32;
+    const cl_int n_blocks = n * n_blk;
+    CL_CHECK(clSetKernelArg(kernel_quant, 0, sizeof(cl_mem), &b_sub_buf));
+    CL_CHECK(clSetKernelArg(kernel_quant, 1, sizeof(cl_mem), &backend_ctx->prealloc_moe_qa.buffer));
+    CL_CHECK(clSetKernelArg(kernel_quant, 2, sizeof(cl_mem), &backend_ctx->prealloc_moe_da.buffer));
+    CL_CHECK(clSetKernelArg(kernel_quant, 3, sizeof(cl_int), &n_blocks));
+    CL_CHECK(clSetKernelArg(kernel_quant, 4, sizeof(cl_int), &n_blk));
+    size_t local_work_size[1]  = { 64 };
+    size_t global_work_size[1] = { (size_t)CEIL_DIV(n_blocks, 64) * 64 };
+    backend_ctx->enqueue_ndrange_kernel(kernel_quant, 1, global_work_size, local_work_size, dst);
+
+    CL_CHECK(clReleaseMemObject(b_sub_buf));
+}
+
+// Output of a cok8 GEMM: dst itself, or [ksplit][n][m] partials when K is split across workgroups.
+static void ggml_cl_cok8_output(ggml_backend_opencl_context * backend_ctx, int ksplit, int m, int n,
+                                cl_mem dst_buf, cl_ulong offsetd, cl_mem & out, cl_ulong & out_offset) {
+    out        = dst_buf;
+    out_offset = offsetd;
+    if (ksplit > 1) {
+        backend_ctx->prealloc_splitk_partial.allocate(backend_ctx->context, (size_t)ksplit * m * n * sizeof(float));
+        out        = backend_ctx->prealloc_splitk_partial.buffer;
+        out_offset = 0;
+    }
+}
+
+// Sum the partials of a split cok8 GEMM into dst.
+static void ggml_cl_cok8_reduce(ggml_backend_opencl_context * backend_ctx, int ksplit, int m, int n,
+                                cl_mem dst_buf, cl_ulong offsetd, ggml_tensor * dst) {
+    if (ksplit <= 1) {
+        return;
+    }
+    const cl_int rows = m * n;
+    cl_kernel kernel = backend_ctx->kernel_gemv_splitk_reduce_f32;
+    CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),   &backend_ctx->prealloc_splitk_partial.buffer));
+    CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem),   &dst_buf));
+    CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_ulong), &offsetd));
+    CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_int),   &rows));
+    CL_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_int),   &ksplit));
+    size_t local_work_size[3]  = { 64, 1, 1 };
+    size_t global_work_size[3] = { (size_t)CEIL_DIV(rows, 64) * 64, 1, 1 };
+    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+}
+
 static void ggml_cl_mul_mat_q4_0_f32_adreno_ila(ggml_backend_t backend, const ggml_tensor * src0,
                                                 const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_ASSERT(src0);
@@ -24564,6 +24810,42 @@ static void ggml_cl_mul_mat_q4_0_f32_adreno_ila(ggml_backend_t backend, const gg
     int M = ne01;
     int N = ne1;
     int K = ne00;
+
+    // Verify widths 2..8: the bin GEMM below pads N to a full column tile, while the cok8 GEMM
+    // computes eight columns and splits K across subgroups and workgroups.
+    if (ne1 >= 2 && ne1 <= 8 &&
+        backend_ctx->kernel_gemm_cok8_q4_0_q8_1_dp4a_bin != nullptr &&
+        (M % (64 * backend_ctx->rows_cok8_dp4a_q4_0)) == 0 && (K % 32) == 0 &&
+        ggml_cl_cok8_prepare(backend_ctx, (size_t)8 * K * sizeof(cl_char), (size_t)8 * (K / 32) * sizeof(cl_half))) {
+        const int rows   = backend_ctx->rows_cok8_dp4a_q4_0;
+        const int nsg    = backend_ctx->nsg_cok8_dp4a_q4_0;
+        const int ksplit = ggml_cl_cok8_ksplit(backend_ctx, M / (64 * rows), K / 32);
+
+        ggml_cl_cok8_quant(backend_ctx, backend_ctx->kernel_quant_a_q8_1_eo, extra1->data_device, offset1, N, K, dst);
+
+        cl_mem   out;
+        cl_ulong out_offset;
+        ggml_cl_cok8_output(backend_ctx, ksplit, M, N, extrad->data_device, offsetd, out, out_offset);
+
+        cl_kernel kernel_cok8 = backend_ctx->kernel_gemm_cok8_q4_0_q8_1_dp4a_bin;
+        CL_CHECK(clSetKernelArg(kernel_cok8, 0, sizeof(cl_mem),   &extra0_q4_0->q));
+        CL_CHECK(clSetKernelArg(kernel_cok8, 1, sizeof(cl_mem),   &extra0_q4_0->d));
+        CL_CHECK(clSetKernelArg(kernel_cok8, 2, sizeof(cl_mem),   &backend_ctx->cok8_qa_view.image));
+        CL_CHECK(clSetKernelArg(kernel_cok8, 3, sizeof(cl_mem),   &backend_ctx->cok8_da_view.image));
+        CL_CHECK(clSetKernelArg(kernel_cok8, 4, sizeof(cl_mem),   &out));
+        CL_CHECK(clSetKernelArg(kernel_cok8, 5, sizeof(cl_ulong), &out_offset));
+        CL_CHECK(clSetKernelArg(kernel_cok8, 6, sizeof(cl_int),   &M));
+        CL_CHECK(clSetKernelArg(kernel_cok8, 7, sizeof(cl_int),   &K));
+        CL_CHECK(clSetKernelArg(kernel_cok8, 8, sizeof(cl_int),   &N));
+        CL_CHECK(clSetKernelArg(kernel_cok8, 9, sizeof(cl_int),   &ksplit));
+
+        size_t local_work_size[3]  = { 64, (size_t)nsg, 1 };
+        size_t global_work_size[3] = { (size_t)(M / rows), (size_t)nsg * ksplit, 1 };
+        backend_ctx->enqueue_ndrange_kernel(kernel_cok8, 3, global_work_size, local_work_size, dst);
+
+        ggml_cl_cok8_reduce(backend_ctx, ksplit, M, N, extrad->data_device, offsetd, dst);
+        return;
+    }
 
     if (ne1 == 1) {
         cl_mem b_sub_buf = nullptr;
@@ -24809,7 +25091,7 @@ static void ggml_cl_mul_mat_q4_0_f32_adreno(ggml_backend_t backend, const ggml_t
                 warned = true;
             }
         }
-        // This bin layout is not supported by CoopK.
+        // The narrow CoopK kernels do not read this layout; the ila path has its own cok8 GEMM.
         ggml_cl_mul_mat_q4_0_f32_adreno_ila(backend, src0, src1, dst);
         return;
     }
@@ -26792,6 +27074,47 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno_ila(ggml_backend_t backend, const gg
         return;
     }
 
+    // Verify widths 5..8 on the eight-column cok8 GEMM. Its activation scales are two half8
+    // texels per 32-value block (scale, scaled sum).
+    if (ne1 >= 5 && ne1 <= 8 &&
+        backend_ctx->kernel_gemm_cok8_q4_k_q8_1_dp4a_bin != nullptr &&
+        (M % 256) == 0 && (K % 256) == 0 &&
+        ggml_cl_cok8_prepare(backend_ctx, (size_t)8 * K * sizeof(cl_char), (size_t)16 * (K / 32) * sizeof(cl_half))) {
+        const int nsg    = backend_ctx->nsg_cok8_dp4a_q4_k;
+        const int ksplit = ggml_cl_cok8_ksplit(backend_ctx, M / 256, K / 32);
+
+        ggml_cl_cok8_quant(backend_ctx, backend_ctx->kernel_quant_a_q8_1_k4, extra1->data_device, offset1, N, K, dst);
+
+        cl_mem   out;
+        cl_ulong out_offset;
+        ggml_cl_cok8_output(backend_ctx, ksplit, M, N, extrad->data_device, offsetd, out, out_offset);
+
+        const cl_uchar mask_d6 = 0x3F, mask_d4 = 0x0F, mask_hi2 = 0xC0;
+        cl_kernel kernel_cok8 = backend_ctx->kernel_gemm_cok8_q4_k_q8_1_dp4a_bin;
+        CL_CHECK(clSetKernelArg(kernel_cok8,  0, sizeof(cl_mem),   &extra0_q4_k->q));
+        CL_CHECK(clSetKernelArg(kernel_cok8,  1, sizeof(cl_mem),   &extra0_q4_k->s));
+        CL_CHECK(clSetKernelArg(kernel_cok8,  2, sizeof(cl_mem),   &extra0_q4_k->d));
+        CL_CHECK(clSetKernelArg(kernel_cok8,  3, sizeof(cl_mem),   &extra0_q4_k->dm));
+        CL_CHECK(clSetKernelArg(kernel_cok8,  4, sizeof(cl_mem),   &backend_ctx->cok8_qa_view.image));
+        CL_CHECK(clSetKernelArg(kernel_cok8,  5, sizeof(cl_mem),   &backend_ctx->cok8_da_view.image));
+        CL_CHECK(clSetKernelArg(kernel_cok8,  6, sizeof(cl_mem),   &out));
+        CL_CHECK(clSetKernelArg(kernel_cok8,  7, sizeof(cl_ulong), &out_offset));
+        CL_CHECK(clSetKernelArg(kernel_cok8,  8, sizeof(cl_int),   &M));
+        CL_CHECK(clSetKernelArg(kernel_cok8,  9, sizeof(cl_int),   &K));
+        CL_CHECK(clSetKernelArg(kernel_cok8, 10, sizeof(cl_int),   &N));
+        CL_CHECK(clSetKernelArg(kernel_cok8, 11, sizeof(cl_uchar), &mask_d6));
+        CL_CHECK(clSetKernelArg(kernel_cok8, 12, sizeof(cl_uchar), &mask_d4));
+        CL_CHECK(clSetKernelArg(kernel_cok8, 13, sizeof(cl_uchar), &mask_hi2));
+        CL_CHECK(clSetKernelArg(kernel_cok8, 14, sizeof(cl_int),   &ksplit));
+
+        size_t local_work_size[3]  = { 64, (size_t)nsg, 1 };
+        size_t global_work_size[3] = { (size_t)(M / 4), (size_t)nsg * ksplit, 1 };
+        backend_ctx->enqueue_ndrange_kernel(kernel_cok8, 3, global_work_size, local_work_size, dst);
+
+        ggml_cl_cok8_reduce(backend_ctx, ksplit, M, N, extrad->data_device, offsetd, dst);
+        return;
+    }
+
     if (ne1 == 1) {
         cl_mem b_sub_buf = nullptr;
         cl_mem b_img     = nullptr;
@@ -27636,6 +27959,52 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno_ila(ggml_backend_t backend, const gg
     const int N = ne1;
     const int K = ne00;
 
+    // Verify widths 2..8: the bin GEMM below pads N to a full column tile, while the cok8 GEMM
+    // computes eight columns and splits K across subgroups and workgroups. Its activation scales
+    // are three half8 texels per 32-value block (scale, two half-block scaled sums).
+    if (ne1 >= 2 && ne1 <= 8 &&
+        backend_ctx->kernel_gemm_cok8_q6_k_q8_1_dp4a_bin != nullptr &&
+        (M % 4) == 0 && (K % 256) == 0 &&
+        ggml_cl_cok8_prepare(backend_ctx, (size_t)8 * K * sizeof(cl_char), (size_t)24 * (K / 32) * sizeof(cl_half))) {
+        const int nsg     = backend_ctx->nsg_cok8_dp4a_q6_k;
+        // Lanes past the last group of four rows recompute that group and do not store.
+        const int n_lanes = (int)CEIL_DIV(M / 4, 64) * 64;
+        int ksplit = ggml_cl_cok8_ksplit(backend_ctx, n_lanes / 64, K / 32);
+        // A vocab-sized weight already fills the device with one slice, but streams better split four ways.
+        if (M >= 131072 && ksplit < 4 && K / 32 >= 4) {
+            ksplit = 4;
+        }
+
+        ggml_cl_cok8_quant(backend_ctx, backend_ctx->kernel_quant_a_q8_1_k4h, extra1->data_device, offset1, N, K, dst);
+
+        cl_mem   out;
+        cl_ulong out_offset;
+        ggml_cl_cok8_output(backend_ctx, ksplit, M, N, extrad->data_device, offsetd, out, out_offset);
+
+        const cl_uchar mask_c0 = 0xC0;
+        cl_kernel kernel_cok8 = backend_ctx->kernel_gemm_cok8_q6_k_q8_1_dp4a_bin;
+        CL_CHECK(clSetKernelArg(kernel_cok8,  0, sizeof(cl_mem),   &extra0_q6_K->ql));
+        CL_CHECK(clSetKernelArg(kernel_cok8,  1, sizeof(cl_mem),   &extra0_q6_K->qh));
+        CL_CHECK(clSetKernelArg(kernel_cok8,  2, sizeof(cl_mem),   &extra0_q6_K->s));
+        CL_CHECK(clSetKernelArg(kernel_cok8,  3, sizeof(cl_mem),   &extra0_q6_K->d));
+        CL_CHECK(clSetKernelArg(kernel_cok8,  4, sizeof(cl_mem),   &backend_ctx->cok8_qa_view.image));
+        CL_CHECK(clSetKernelArg(kernel_cok8,  5, sizeof(cl_mem),   &backend_ctx->cok8_da_view.image));
+        CL_CHECK(clSetKernelArg(kernel_cok8,  6, sizeof(cl_mem),   &out));
+        CL_CHECK(clSetKernelArg(kernel_cok8,  7, sizeof(cl_ulong), &out_offset));
+        CL_CHECK(clSetKernelArg(kernel_cok8,  8, sizeof(cl_int),   &M));
+        CL_CHECK(clSetKernelArg(kernel_cok8,  9, sizeof(cl_int),   &K));
+        CL_CHECK(clSetKernelArg(kernel_cok8, 10, sizeof(cl_int),   &N));
+        CL_CHECK(clSetKernelArg(kernel_cok8, 11, sizeof(cl_uchar), &mask_c0));
+        CL_CHECK(clSetKernelArg(kernel_cok8, 12, sizeof(cl_int),   &ksplit));
+
+        size_t local_work_size[3]  = { 64, (size_t)nsg, 1 };
+        size_t global_work_size[3] = { (size_t)n_lanes, (size_t)nsg * ksplit, 1 };
+        backend_ctx->enqueue_ndrange_kernel(kernel_cok8, 3, global_work_size, local_work_size, dst);
+
+        ggml_cl_cok8_reduce(backend_ctx, ksplit, M, N, extrad->data_device, offsetd, dst);
+        return;
+    }
+
     if (ne1 == 1) {
         cl_mem b_sub_buf  = nullptr;
         cl_mem b_img      = nullptr;
@@ -27858,7 +28227,7 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
                 warned = true;
             }
         }
-        // This bin layout is not supported by CoopK.
+        // The narrow CoopK kernels do not read this layout; the ila path has its own cok8 GEMM.
         ggml_cl_mul_mat_q6_K_f32_adreno_ila(backend, src0, src1, dst);
         return;
     }
