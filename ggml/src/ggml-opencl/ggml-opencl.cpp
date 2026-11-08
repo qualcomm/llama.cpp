@@ -5038,7 +5038,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
     }
 
     // gemm_noshuffle_q2_0_q8_1_dp4a
-    {
+    if (backend_ctx->has_integer_dot) {
 #ifdef GGML_OPENCL_EMBED_KERNELS
         const std::string kernel_src {
             #include "gemm_noshuffle_q2_0_q8_1_dp4a.cl.h"
@@ -5056,7 +5056,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
     }
 
     // gemm_noshuffle_iq4_xs_q8_1_dp4a
-    {
+    if (backend_ctx->has_integer_dot) {
 #ifdef GGML_OPENCL_EMBED_KERNELS
         const std::string kernel_src {
             #include "gemm_noshuffle_iq4_xs_q8_1_dp4a.cl.h"
@@ -5178,7 +5178,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
     }
 
     // gemm_noshuffle_iq1_s_q8_1_dp4a
-    {
+    if (backend_ctx->has_integer_dot) {
 #ifdef GGML_OPENCL_EMBED_KERNELS
         const std::string kernel_src {
             #include "gemm_noshuffle_iq1_s_q8_1_dp4a.cl.h"
@@ -5265,7 +5265,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
     }
 
     // gemm_noshuffle_iq1_m_q8_1_dp4a
-    {
+    if (backend_ctx->has_integer_dot) {
 #ifdef GGML_OPENCL_EMBED_KERNELS
         const std::string kernel_src {
             #include "gemm_noshuffle_iq1_m_q8_1_dp4a.cl.h"
@@ -5333,7 +5333,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
     }
 
     // gemm_noshuffle_iq3_s_q8_1_dp4a
-    {
+    if (backend_ctx->has_integer_dot) {
 #ifdef GGML_OPENCL_EMBED_KERNELS
         const std::string kernel_src {
             #include "gemm_noshuffle_iq3_s_q8_1_dp4a.cl.h"
@@ -5420,7 +5420,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
     }
 
     // gemm_noshuffle_iq3_xxs_q8_1_dp4a
-    {
+    if (backend_ctx->has_integer_dot) {
 #ifdef GGML_OPENCL_EMBED_KERNELS
         const std::string kernel_src {
             #include "gemm_noshuffle_iq3_xxs_q8_1_dp4a.cl.h"
