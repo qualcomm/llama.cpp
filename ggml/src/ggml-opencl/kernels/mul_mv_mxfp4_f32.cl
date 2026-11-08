@@ -88,6 +88,8 @@ kernel void kernel_mul_mv_mxfp4_f32(
     int im = get_group_id(2);
 
     int first_row = (r0 * N_SG_MXFP4 + get_sub_group_id()) * N_R0_MXFP4;
+    // keep the padded tail subgroups inside src0
+    first_row = min(first_row, max(ne0 - N_R0_MXFP4, 0));
 
     uint i12 = im%ne12;
     uint i13 = im/ne12;

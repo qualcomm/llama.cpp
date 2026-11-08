@@ -128,6 +128,8 @@ inline void mul_vec_q_n_f32_8x_flat(
     // Currently with llama2 7B, im is always 0.
     // TODO: how to handle im/gqa*(nb*ne0)?
     int first_row = (r0 * N_SIMDGROUP + get_sub_group_id()) * N_DST;
+    // keep the padded tail subgroups inside src0
+    first_row = min(first_row, max(ne01 - N_DST, 0));
 
     int i12 = im%ne12;
     int i13 = im/ne12;
