@@ -93,6 +93,8 @@ inline void mul_vec_q_n_f32(
     int im = get_group_id(2);
 
     int first_row = (r0 * N_SUBGROUP + get_sub_group_id()) * N_DST;
+    // keep the padded tail subgroups inside src0
+    first_row = min(first_row, max(ne01 - N_DST, 0));
 
     int i12 = im%ne12;
     int i13 = im/ne12;
