@@ -1,4 +1,4 @@
-// Cooperative-K q4_K GEMM with a dp4a inner product at eight columns, for verify batches (ne1 = 5..8)
+// Cooperative-K q4_K GEMM with a dp4a inner product at eight columns, for verify batches (ne1 up to 8)
 // on bin (32b-transposed) weights. A lane folds four rows and always computes eight columns; columns
 // past n_no_padding are dropped. K is split across COOPK_NSG subgroups (local memory reduce) and ksplit
 // workgroups (kernel_gemv_splitk_reduce_f32), each slice a contiguous run of 32-K blocks.
