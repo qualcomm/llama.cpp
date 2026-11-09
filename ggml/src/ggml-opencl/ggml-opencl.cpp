@@ -33017,8 +33017,17 @@ static bool ggml_cl_flash_attn_decompose(
 #endif
     static const bool q8_sinks_int8 = !ggml_cl_env_flag_zero("GGML_OPENCL_FA_Q8_SINKS_INT8");
     const bool kq_int8_sinks = sinks != nullptr && dk <= 64 && !(kv_q8 && q8_sinks_int8 && !wmm_takes);
+    // With an f16 KV cache on the X2-90 the int8 KQ starts to pay for the quantisation only from
+    // n_kv 2048 on (gemma-4-E4B pp512 at depth 0: -2%); below that the f16 KQ stays.
+    // GGML_OPENCL_FA_KQ_INT8_MIN_KV moves the threshold, 0 takes int8 at every depth.
+    static const int kq_int8_f16_min_kv = [&]{
+        const char * e = getenv("GGML_OPENCL_FA_KQ_INT8_MIN_KV");
+        if (e && e[0]) { return atoi(e); }
+        return backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E ? 2048 : 0;
+    }();
+    const bool kq_int8_f16_shallow = k->type == GGML_TYPE_F16 && n_kv < kq_int8_f16_min_kv;
     const bool kq_int8_env_pre = kq_int8_env_val == 1 ||
-                                 (kq_int8_env_val == -1 && !kq_int8_sinks &&
+                                 (kq_int8_env_val == -1 && !kq_int8_sinks && !kq_int8_f16_shallow &&
                                   kq_p8_env && kqv_int8_possible && kq_p8_int8_shape);
     const bool kq_p8_possible = !e17_dec && kq_p8_env && kqv_int8_possible &&
         (kq_int8_env_pre ? kq_p8_int8_shape
