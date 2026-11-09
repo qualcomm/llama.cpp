@@ -639,6 +639,37 @@ struct ggml_cl_buffer {
     }
 };
 
+// A 2D image kept across calls and grown when a larger one is needed. Users pass their own
+// extents to the kernels, so the image may be larger than one call needs. One format per object.
+struct ggml_cl_image2d {
+    cl_mem image  = nullptr;
+    size_t width  = 0;
+    size_t height = 0;
+
+    ~ggml_cl_image2d() {
+        if (image) {
+            CL_CHECK(clReleaseMemObject(image));
+        }
+    }
+
+    cl_mem get(cl_context context, const cl_image_format & fmt, size_t w, size_t h) {
+        if (image == nullptr || w > width || h > height) {
+            if (image) {
+                CL_CHECK(clReleaseMemObject(image));
+            }
+            width  = std::max(width, w);
+            height = std::max(height, h);
+            cl_image_desc desc = {};
+            desc.image_type   = CL_MEM_OBJECT_IMAGE2D;
+            desc.image_width  = width;
+            desc.image_height = height;
+            cl_int err;
+            CL_CHECK((image = clCreateImage(context, CL_MEM_READ_WRITE, &fmt, &desc, nullptr, &err), err));
+        }
+        return image;
+    }
+};
+
 // Profiling
 struct ProfilingInfo {
     std::string op_name;
@@ -1255,6 +1286,10 @@ struct ggml_backend_opencl_context {
 
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
     ggml_cl_buffer prealloc_adreno_xmem_const;
+    // xmem GEMM scratch, reused across calls: packed weights, packed activations, packed result
+    ggml_cl_buffer  prealloc_adreno_xmem_weight;
+    ggml_cl_image2d adreno_xmem_src_img;
+    ggml_cl_image2d adreno_xmem_dst_img;
     bool adreno_xmem_gemm_enabled = false;
 #endif
 
@@ -36955,27 +36990,16 @@ static void ggml_cl_mul_mat_f16_f32_adreno_xmem(
 
     backend_ctx->prealloc_adreno_xmem_const.allocate(backend_ctx->context, xmem_bytes);
 
-    cl_int err = CL_SUCCESS;
     cl_image_format fmt = {};
     fmt.image_channel_order = CL_RGBA;
     fmt.image_channel_data_type = CL_HALF_FLOAT;
 
-    cl_image_desc desc_src = {};
-    desc_src.image_type = CL_MEM_OBJECT_IMAGE2D;
-    desc_src.image_width = static_cast<size_t>(N);
-    desc_src.image_height = static_cast<size_t>(kpack);
-    cl_mem src_img = clCreateImage(backend_ctx->context, CL_MEM_READ_WRITE, &fmt, &desc_src, nullptr, &err);
-    CL_CHECK(err);
-
-    cl_image_desc desc_dst = {};
-    desc_dst.image_type = CL_MEM_OBJECT_IMAGE2D;
-    desc_dst.image_width = static_cast<size_t>(N);
-    desc_dst.image_height = static_cast<size_t>(npack);
-    cl_mem dst_img = clCreateImage(backend_ctx->context, CL_MEM_READ_WRITE, &fmt, &desc_dst, nullptr, &err);
-    CL_CHECK(err);
-
-    cl_mem weights = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE, weight_bytes, nullptr, &err);
-    CL_CHECK(err);
+    // Scratch kept in the context: a fresh buffer the size of the packed weight on every call
+    // costs far more host time than the GEMM itself takes on the GPU.
+    cl_mem src_img = backend_ctx->adreno_xmem_src_img.get(backend_ctx->context, fmt, static_cast<size_t>(N), static_cast<size_t>(kpack));
+    cl_mem dst_img = backend_ctx->adreno_xmem_dst_img.get(backend_ctx->context, fmt, static_cast<size_t>(N), static_cast<size_t>(npack));
+    backend_ctx->prealloc_adreno_xmem_weight.allocate(backend_ctx->context, weight_bytes);
+    cl_mem weights = backend_ctx->prealloc_adreno_xmem_weight.buffer;
 
     cl_kernel prepack = backend_ctx->kernel_adreno_xmem_prepack_weight_f16;
     CL_CHECK(clSetKernelArg(prepack, 0, sizeof(cl_mem),   &weights));
@@ -37036,10 +37060,6 @@ static void ggml_cl_mul_mat_f16_f32_adreno_xmem(
         CEIL_DIV(static_cast<size_t>(npack), store_lws[1])*store_lws[1]
     };
     backend_ctx->enqueue_ndrange_kernel(store_dst, 2, store_gws, store_lws, dst);
-
-    CL_CHECK(clReleaseMemObject(weights));
-    CL_CHECK(clReleaseMemObject(dst_img));
-    CL_CHECK(clReleaseMemObject(src_img));
 }
 #endif // GGML_OPENCL_USE_ADRENO_KERNELS
 
