@@ -26998,7 +26998,15 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno_ila(ggml_backend_t backend, const gg
     // This switch disables only this bin-layout path; weight conversion is unchanged.
     static const char * env_coopk_bin = getenv("GGML_OPENCL_COOPK_Q4_K_BIN");
     const bool use_coopk_bin = !env_coopk_bin || !*env_coopk_bin || atoi(env_coopk_bin) != 0;
-    if (use_coopk_bin && ne1 >= 2 && ne1 <= 4 &&
+    // Narrowest width the eight-column cok8 GEMM below takes; narrower widths stay here. On the
+    // X2-90 the eight-column kernel wins at widths 2..4 too although it computes all eight columns.
+    // GGML_OPENCL_Q4_K_BIN_COK8_MINN overrides.
+    const int cok8_min_n = [&]{
+        const char * e = getenv("GGML_OPENCL_Q4_K_BIN_COK8_MINN");
+        if (e && e[0]) { return atoi(e); }
+        return backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E ? 2 : 5;
+    }();
+    if (use_coopk_bin && ne1 >= 2 && ne1 <= 4 && ne1 < cok8_min_n &&
         ggml_cl_coopk_dp4a_narrow_on(backend_ctx, dst, backend_ctx->rows_coopk_dp4a_q4_k) &&
         backend_ctx->kernel_gemm_coopk_q4_k_q8_1_dp4a_bin_c4 != nullptr &&
         ((ne1 <= 2) ? backend_ctx->kernel_gemm_coopk_q4_k_q8_1_dp4a_bin_c2
@@ -27074,9 +27082,9 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno_ila(ggml_backend_t backend, const gg
         return;
     }
 
-    // Verify widths 5..8 on the eight-column cok8 GEMM. Its activation scales are two half8
+    // Verify widths up to 8 on the eight-column cok8 GEMM. Its activation scales are two half8
     // texels per 32-value block (scale, scaled sum).
-    if (ne1 >= 5 && ne1 <= 8 &&
+    if (ne1 >= std::max(2, std::min(cok8_min_n, 5)) && ne1 <= 8 &&
         backend_ctx->kernel_gemm_cok8_q4_k_q8_1_dp4a_bin != nullptr &&
         (M % 256) == 0 && (K % 256) == 0 &&
         ggml_cl_cok8_prepare(backend_ctx, (size_t)8 * K * sizeof(cl_char), (size_t)16 * (K / 32) * sizeof(cl_half))) {
