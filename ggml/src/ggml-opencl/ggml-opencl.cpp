@@ -46404,7 +46404,14 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             static const char * kqv_src1_copy_env = getenv("GGML_OPENCL_KQV_SRC1_COPY");
             static const bool   kqv_src1_copy_on  =
                 (kqv_src1_copy_env == nullptr || kqv_src1_copy_env[0] != '0');
+            // A plain 2D f16 weight also satisfies nb01 <= nb02 (gpt-oss attention projections,
+            // gemma-4 per-layer input projection); it is not a KQV and the weight GEMMs below
+            // serve it 3x faster. Setting GGML_OPENCL_KQV_WEIGHTS restores the old routing.
+            static const bool kqv_weights_on = ggml_cl_env_flag("GGML_OPENCL_KQV_WEIGHTS");
+            const bool src0_is_weight = src0->buffer != nullptr &&
+                ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
             if (nb01 <= nb02 && (ggml_is_contiguous(src1) || kqv_src1_copy_on) &&
+                (kqv_weights_on || !src0_is_weight) &&
                 (ne02 == 1 || nb02 == nb01 * ne01) &&
                 ((nb01 * ne01 * ne02 / 4)/4 <= backend_ctx->image_max_buffer_size)) {
                 ggml_cl_mul_mat_kq_kqv_adreno(backend, src0, src1, dst, /*is_kq =*/ false);
