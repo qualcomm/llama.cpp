@@ -78,22 +78,24 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         self.gguf_writer.add_hyper_connection_count(hp["hc_count"])
         self.gguf_writer.add_hyper_connection_low_rank(hp["hc_lowrank"])
 
-        n_layer = hp["num_hidden_layers"]
-        self.gguf_writer.add_indexer_head_count(hp["indexer_n_heads"])
-        self.gguf_writer.add_indexer_key_length(hp["indexer_head_dim"])
-        self.gguf_writer.add_indexer_top_k(hp["indexer_budget"])
-        ratio = hp["indexer_compress_ratio"]
-        layer_types = hp["layer_types"]
-        # the MTP block is a full-attention QSA layer too
-        self.gguf_writer.add_attention_compress_ratios(
-            [ratio if layer_types[i] == "full_attention" else 0 for i in range(n_layer)]
-            + [ratio] * (self.block_count - n_layer)
-        )
+        # the dense variants (Qwen4-27B) have plain GQA full attention: no indexer keys at all
+        if hp.get("indexer_n_heads"):
+            n_layer = hp["num_hidden_layers"]
+            self.gguf_writer.add_indexer_head_count(hp["indexer_n_heads"])
+            self.gguf_writer.add_indexer_key_length(hp["indexer_head_dim"])
+            self.gguf_writer.add_indexer_top_k(hp["indexer_budget"])
+            ratio = hp["indexer_compress_ratio"]
+            layer_types = hp["layer_types"]
+            # the MTP block is a full-attention QSA layer too
+            self.gguf_writer.add_attention_compress_ratios(
+                [ratio if layer_types[i] == "full_attention" else 0 for i in range(n_layer)]
+                + [ratio] * (self.block_count - n_layer)
+            )
 
         # ple_layer_ids is 1-based in the HF config; empty means no n-gram table,
         # so emit no PLE keys rather than optional ones
         # the MTP head never reads PLE, so an MTP-only file carries none of it
-        ple_layers = [i - 1 for i in hp["ple_layer_ids"]]
+        ple_layers = [i - 1 for i in (hp.get("ple_layer_ids") or [])]
         if not ple_layers or self.mtp_only:
             return
         self.gguf_writer.add_ple_layers(ple_layers)
