@@ -240,14 +240,22 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         // matmuls that read the same input: try the merged [a | b] weight the converter writes, else the separate ones
         auto create_merged = [&](llm_tensor t_merged, llm_tensor t_a, llm_tensor t_b, int64_t n_in, int64_t n_a, int64_t n_b,
                 ggml_tensor *& merged, ggml_tensor *& a, ggml_tensor *& b) {
+            // the converter may pad the merged rows to a multiple of 64 with zeros, so the backends
+            // that tile rows by 64 keep their fast path; the padded rows are never read
+            int64_t n_rows = n_a + n_b;
+            if (const ggml_tensor * meta = ml.get_tensor_meta(tn(t_merged, "weight", il).str().c_str())) {
+                if (meta->ne[1] > n_rows && meta->ne[1] == GGML_PAD(n_rows, 64)) {
+                    n_rows = meta->ne[1];
+                }
+            }
             if (flags & TENSOR_SKIP) {
                 const int skip = TENSOR_NOT_REQUIRED | TENSOR_SKIP;
-                create_tensor(tn(t_merged, "weight", il), { n_in, n_a + n_b }, skip | TENSOR_SKIP_IF_VIRTUAL);
+                create_tensor(tn(t_merged, "weight", il), { n_in, n_rows }, skip | TENSOR_SKIP_IF_VIRTUAL);
                 create_tensor(tn(t_a,      "weight", il), { n_in, n_a },       skip);
                 create_tensor(tn(t_b,      "weight", il), { n_in, n_b },       skip);
                 return;
             }
-            merged = create_tensor(tn(t_merged, "weight", il), { n_in, n_a + n_b }, flags | TENSOR_NOT_REQUIRED | TENSOR_SKIP_IF_VIRTUAL);
+            merged = create_tensor(tn(t_merged, "weight", il), { n_in, n_rows }, flags | TENSOR_NOT_REQUIRED | TENSOR_SKIP_IF_VIRTUAL);
             if (!merged) {
                 a = create_tensor(tn(t_a, "weight", il), { n_in, n_a }, flags);
                 b = create_tensor(tn(t_b, "weight", il), { n_in, n_b }, flags);
@@ -385,8 +393,8 @@ llama_model_qwen4exp::graph::build_hc_mix(
     ggml_tensor * lo = nullptr;
     ggml_tensor * inject = nullptr;
     if (w_down_inject) {
-        // one matmul for both: the hc_down rows, then the hc_inject rows
-        const int64_t n_lo = w_down_inject->ne[1] - hc;
+        // one matmul for both: the hc_down rows, then the hc_inject rows (then any zero padding)
+        const int64_t n_lo = hparams.hc_low_rank;
         ggml_tensor * lo_inject = build_lora_mm(w_down_inject, xn);
         // scale the combined rows before the split; both lo and inject use 1/hc
         lo_inject = ggml_scale(ctx0, lo_inject, 1.0f / (float) hc);
