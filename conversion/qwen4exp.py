@@ -207,7 +207,14 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         halves[idx] = data
         if len(halves) == 2:
             del self._merge_parts[(bid, merged)]
-            yield (self.format_tensor_name(merged, bid), torch.cat([halves[0], halves[1]], dim=0))
+            data = torch.cat([halves[0], halves[1]], dim=0)
+            # hc_down | hc_inject is hc_low_rank + hc rows (644): zero-pad it to a multiple of 64 so the
+            # backends that tile weight rows by 64 keep their fast path; the runtime never reads the padding
+            if merged in (gguf.MODEL_TENSOR.HC_ATTN_DOWN_INJECT, gguf.MODEL_TENSOR.HC_FFN_DOWN_INJECT):
+                pad = -data.shape[0] % 64
+                if pad:
+                    data = torch.cat([data, data.new_zeros((pad, *data.shape[1:]))], dim=0)
+            yield (self.format_tensor_name(merged, bid), data)
 
     # the shards concatenate into a tensor of well over 100 GB
     # use LazyChunkedTensor here, a single shard resident at a time
