@@ -208,10 +208,11 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         if len(halves) == 2:
             del self._merge_parts[(bid, merged)]
             data = torch.cat([halves[0], halves[1]], dim=0)
-            # hc_down | hc_inject is hc_low_rank + hc rows (644): zero-pad it to a multiple of 64 so the
-            # backends that tile weight rows by 64 keep their fast path; the runtime never reads the padding
+            # hc_down | hc_inject is hc_low_rank + hc rows (644): zero-pad it to a multiple of 128 so the
+            # backends that tile weight rows keep their fast path (OpenCL: 64 for most quants, 128 for
+            # q6_K, which Q4_K_M picks for this weight); the runtime never reads the padding
             if merged in (gguf.MODEL_TENSOR.HC_ATTN_DOWN_INJECT, gguf.MODEL_TENSOR.HC_FFN_DOWN_INJECT):
-                pad = -data.shape[0] % 64
+                pad = -data.shape[0] % 128
                 if pad:
                     data = torch.cat([data, data.new_zeros((pad, *data.shape[1:]))], dim=0)
             yield (self.format_tensor_name(merged, bid), data)

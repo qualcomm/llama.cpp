@@ -240,11 +240,12 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         // matmuls that read the same input: try the merged [a | b] weight the converter writes, else the separate ones
         auto create_merged = [&](llm_tensor t_merged, llm_tensor t_a, llm_tensor t_b, int64_t n_in, int64_t n_a, int64_t n_b,
                 ggml_tensor *& merged, ggml_tensor *& a, ggml_tensor *& b) {
-            // the converter may pad the merged rows to a multiple of 64 with zeros, so the backends
-            // that tile rows by 64 keep their fast path; the padded rows are never read
+            // the converter may zero-pad the merged rows (to a multiple of 128; files padded to 64
+            // load too) so the backends that tile weight rows keep their fast path; the padded rows
+            // are never read
             int64_t n_rows = n_a + n_b;
             if (const ggml_tensor * meta = ml.get_tensor_meta(tn(t_merged, "weight", il).str().c_str())) {
-                if (meta->ne[1] > n_rows && meta->ne[1] == GGML_PAD(n_rows, 64)) {
+                if (meta->ne[1] > n_rows && meta->ne[1] % 64 == 0 && meta->ne[1] <= GGML_PAD(n_rows, 128)) {
                     n_rows = meta->ne[1];
                 }
             }
