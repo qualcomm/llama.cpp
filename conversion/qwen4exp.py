@@ -76,22 +76,24 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         self.gguf_writer.add_hyper_connection_count(hp["hc_count"])
         self.gguf_writer.add_hyper_connection_low_rank(hp["hc_lowrank"])
 
-        n_layer = hp["num_hidden_layers"]
-        self.gguf_writer.add_indexer_head_count(hp["indexer_n_heads"])
-        self.gguf_writer.add_indexer_key_length(hp["indexer_head_dim"])
-        self.gguf_writer.add_indexer_top_k(hp["indexer_budget"])
-        ratio = hp["indexer_compress_ratio"]
-        layer_types = hp["layer_types"]
-        # the MTP block is a full-attention QSA layer too
-        self.gguf_writer.add_attention_compress_ratios(
-            [ratio if layer_types[i] == "full_attention" else 0 for i in range(n_layer)]
-            + [ratio] * (self.block_count - n_layer)
-        )
+        # the dense variants (Qwen4-27B) have plain GQA full attention: no indexer keys at all
+        if hp.get("indexer_n_heads"):
+            n_layer = hp["num_hidden_layers"]
+            self.gguf_writer.add_indexer_head_count(hp["indexer_n_heads"])
+            self.gguf_writer.add_indexer_key_length(hp["indexer_head_dim"])
+            self.gguf_writer.add_indexer_top_k(hp["indexer_budget"])
+            ratio = hp["indexer_compress_ratio"]
+            layer_types = hp["layer_types"]
+            # the MTP block is a full-attention QSA layer too
+            self.gguf_writer.add_attention_compress_ratios(
+                [ratio if layer_types[i] == "full_attention" else 0 for i in range(n_layer)]
+                + [ratio] * (self.block_count - n_layer)
+            )
 
         # ple_layer_ids is 1-based in the HF config; empty means no n-gram table,
         # so emit no PLE keys rather than optional ones
         # the MTP head never reads PLE, so an MTP-only file carries none of it
-        ple_layers = [i - 1 for i in hp["ple_layer_ids"]]
+        ple_layers = [i - 1 for i in (hp.get("ple_layer_ids") or [])]
         if not ple_layers or self.mtp_only:
             return
         self.gguf_writer.add_ple_layers(ple_layers)
@@ -179,6 +181,18 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         (gguf.MODEL_TENSOR.ATTN_QKV_GATE,       (gguf.MODEL_TENSOR.ATTN_QKV,     gguf.MODEL_TENSOR.ATTN_GATE),      True),
         (gguf.MODEL_TENSOR.SSM_BETA_ALPHA_CAT,  (gguf.MODEL_TENSOR.SSM_BETA,     gguf.MODEL_TENSOR.SSM_ALPHA),      True),
     )
+
+    # hc_down | hc_inject is hc_low_rank + hc rows (644): zero-pad it to a multiple of 128 so the
+    # backends that tile weight rows keep their fast path (OpenCL: 64 for most quants, 128 for
+    # q6_K, which Q4_K_M picks for this weight); the runtime never reads the padding
+    def _merge_shared_input(self, new_name: str, data: Tensor, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        for name, merged in super()._merge_shared_input(new_name, data, bid):
+            if bid is not None and name in (self.format_tensor_name(gguf.MODEL_TENSOR.HC_ATTN_DOWN_INJECT, bid),
+                                            self.format_tensor_name(gguf.MODEL_TENSOR.HC_FFN_DOWN_INJECT, bid)):
+                pad = -merged.shape[0] % 128
+                if pad:
+                    merged = torch.cat([merged, merged.new_zeros((pad, *merged.shape[1:]))], dim=0)
+            yield (name, merged)
 
     # the shards concatenate into a tensor of well over 100 GB
     # use LazyChunkedTensor here, a single shard resident at a time
