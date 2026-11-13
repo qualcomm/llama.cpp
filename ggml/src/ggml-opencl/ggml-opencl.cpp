@@ -778,6 +778,10 @@ struct ggml_backend_opencl_context {
     ggml_cl_buffer prealloc_fa_pd;
     ggml_cl_buffer prealloc_fa_bmax;
     ggml_cl_buffer prealloc_fa_bsum;
+    ggml_cl_buffer prealloc_fa_kq_q;
+    ggml_cl_buffer prealloc_fa_kq_d;
+    ggml_cl_buffer prealloc_fa_qq_q;
+    ggml_cl_buffer prealloc_fa_qq_d;
 
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
     ggml_cl_buffer prealloc_adreno_xmem_const;
@@ -891,6 +895,10 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_fa_decompose_soft_max_4_f16, kernel_fa_decompose_scale_rows_f32;
     cl_kernel kernel_mul_mm_f16_f32_kq_p8 = nullptr;
     cl_kernel kernel_mul_mm_q8_f32_kqv = nullptr;
+    cl_kernel kernel_mul_mm_q8_kq_p8 = nullptr;
+    cl_kernel kernel_mul_mm_q8_kq_p8_dk512 = nullptr;  // head sizes 257..512, built on first use
+    cl_kernel kernel_fa_q8_rows_f16 = nullptr;
+    cl_kernel kernel_fa_q8_rows_f32 = nullptr;
     cl_kernel kernel_fa_p8_fixup = nullptr;
     cl_kernel kernel_fa_kqv_direct_f16 = nullptr;
     cl_kernel kernel_fa_kqv_direct_reduce = nullptr;
@@ -1498,7 +1506,8 @@ struct ggml_backend_opencl_context {
 #endif // GGML_OPENCL_USE_ADRENO_KERNELS
 
     ~ggml_backend_opencl_context() {
-        for (cl_kernel kernel : {kernel_mul_mm_f16_f32_kq_p8, kernel_mul_mm_q8_f32_kqv, kernel_fa_p8_fixup, kernel_fa_v_transpose_q8, kernel_fa_kqv_direct_f16, kernel_fa_kqv_direct_reduce}) {
+        for (cl_kernel kernel : {kernel_mul_mm_f16_f32_kq_p8, kernel_mul_mm_q8_f32_kqv, kernel_fa_p8_fixup, kernel_fa_v_transpose_q8, kernel_fa_kqv_direct_f16, kernel_fa_kqv_direct_reduce,
+                                 kernel_mul_mm_q8_kq_p8, kernel_mul_mm_q8_kq_p8_dk512, kernel_fa_q8_rows_f16, kernel_fa_q8_rows_f32}) {
             if (kernel != nullptr) {
                 CL_CHECK(clReleaseKernel(kernel));
             }
@@ -4250,6 +4259,25 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                                                       compile_opts, /*fatal=*/false);
         if (prog != nullptr) {
             CL_CHECK((backend_ctx->kernel_mul_mm_q8_f32_kqv = clCreateKernel(prog, "kernel_mul_mm_q8_f32_kqv", &err), err));
+            CL_CHECK(clReleaseProgram(prog));
+        }
+        GGML_LOG_CONT(".");
+    }
+
+    if (backend_ctx->gpu_family == ADRENO && backend_ctx->has_integer_dot) {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src {
+            #include "mul_mm_q8_kq_p8.cl.h"
+        };
+#else
+        const std::string kernel_src = read_file("mul_mm_q8_kq_p8.cl");
+#endif
+        cl_program prog = build_program_from_source_ex(backend_ctx->context, backend_ctx->device, kernel_src.c_str(),
+                                                      compile_opts, /*fatal=*/false);
+        if (prog != nullptr) {
+            CL_CHECK((backend_ctx->kernel_mul_mm_q8_kq_p8 = clCreateKernel(prog, "kernel_mul_mm_q8_kq_p8", &err), err));
+            CL_CHECK((backend_ctx->kernel_fa_q8_rows_f16  = clCreateKernel(prog, "kernel_fa_q8_rows_f16", &err), err));
+            CL_CHECK((backend_ctx->kernel_fa_q8_rows_f32  = clCreateKernel(prog, "kernel_fa_q8_rows_f32", &err), err));
             CL_CHECK(clReleaseProgram(prog));
         }
         GGML_LOG_CONT(".");
@@ -22796,6 +22824,125 @@ static void ggml_cl_flash_attn_prefill_bin(ggml_backend_t backend, const ggml_te
 }
 #endif // GGML_OPENCL_USE_ADRENO_KERNELS
 
+static void ggml_cl_fa_p8_fixup(
+    ggml_backend_opencl_context * backend_ctx,
+    const ggml_tensor * q, const ggml_tensor * sinks, const ggml_tensor * dst,
+    int M, int N, int p_pitch);
+
+// int8 KQ for head sizes 257..512: a second build of the kernel that stages Q per 256-wide slice,
+// built on first use so that no other model pays for the compile.
+static cl_kernel ggml_cl_fa_kq_int8_dk512(ggml_backend_opencl_context * backend_ctx) {
+    static bool tried = false;
+    if (tried || backend_ctx->kernel_mul_mm_q8_kq_p8 == nullptr || backend_ctx->kernel_compile_opts.empty()) {
+        return backend_ctx->kernel_mul_mm_q8_kq_p8_dk512;
+    }
+    tried = true;
+#ifdef GGML_OPENCL_EMBED_KERNELS
+    const std::string kernel_src {
+        #include "mul_mm_q8_kq_p8.cl.h"
+    };
+#else
+    const std::string kernel_src = read_file("mul_mm_q8_kq_p8.cl");
+#endif
+    cl_program prog = build_program_from_source_ex(backend_ctx->context, backend_ctx->device, kernel_src.c_str(),
+                                                  backend_ctx->kernel_compile_opts + " -DKQ_DK_MAX=512", /*fatal=*/false);
+    if (prog == nullptr) {
+        return nullptr;
+    }
+    cl_int err;
+    cl_kernel kernel = clCreateKernel(prog, "kernel_mul_mm_q8_kq_p8", &err);
+    CL_CHECK(clReleaseProgram(prog));
+    if (err == CL_SUCCESS) {
+        backend_ctx->kernel_mul_mm_q8_kq_p8_dk512 = kernel;
+    }
+    return backend_ctx->kernel_mul_mm_q8_kq_p8_dk512;
+}
+
+// Quantise the rows of an f16 or f32 [ne0, nrow, nhead] view to int8, one half scale per 32.
+static void ggml_cl_fa_q8_rows(
+    ggml_backend_opencl_context * backend_ctx, cl_kernel kernel,
+    cl_mem src, cl_ulong off, cl_ulong nb1, cl_ulong nb2,
+    cl_mem dq, cl_mem dd, int ne0, int nrow, int nhead, const ggml_tensor * dst
+) {
+    cl_uint a = 0;
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &src));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &off));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &nb1));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &nb2));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &dq));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &dd));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &ne0));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &nrow));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &nhead));
+
+    const size_t n = (size_t)(ne0 / 32) * nrow * nhead;
+    size_t gws[3] = {(n + 63) / 64 * 64, 1, 1};
+    size_t lws[3] = {64, 1, 1};
+    backend_ctx->enqueue_ndrange_kernel(kernel, 3, gws, lws, dst);
+}
+
+// int8 KQ + block softmax: K is already in prealloc_fa_kq_q/kq_d (once per call), the Q chunk
+// is quantised here. Writes the same P8 outputs as mul_mm_f16_f32_kq_p8.
+static void ggml_cl_fa_kq_int8_p8_dispatch(
+    ggml_backend_t backend,
+    const ggml_tensor * q, const ggml_tensor * k,
+    const ggml_tensor * mask, const ggml_tensor * sinks,
+    const ggml_tensor * dst,
+    int64_t q0, int nqc, float scale, float max_bias, int p_pitch
+) {
+    auto * backend_ctx = (ggml_backend_opencl_context *) backend->context;
+    auto * extra_q = (ggml_tensor_extra_cl *) q->extra;
+    auto * extra_m = (ggml_tensor_extra_cl *) mask->extra;
+
+    const int dk = q->ne[0];
+    const int n_kv = k->ne[1];
+    const int n_head = q->ne[2];
+    const int n_head_kv = k->ne[2];
+
+    ggml_cl_fa_q8_rows(backend_ctx, backend_ctx->kernel_fa_q8_rows_f32,
+        extra_q->data_device, extra_q->offset + q->view_offs + q0 * q->nb[1], q->nb[1], q->nb[2],
+        backend_ctx->prealloc_fa_qq_q.buffer, backend_ctx->prealloc_fa_qq_d.buffer, dk, nqc, n_head, dst);
+
+    const cl_ulong off_mask = extra_m->offset + mask->view_offs + q0 * mask->nb[1];
+    const cl_ulong mask_nb1 = mask->nb[1];
+    const int n_head_log2 = 1u << (unsigned) floorf(log2f((float) n_head));
+    const float m0 = powf(2.0f, -max_bias / n_head_log2);
+    const float m1 = powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
+
+    cl_kernel kernel = dk > 256 ? backend_ctx->kernel_mul_mm_q8_kq_p8_dk512 : backend_ctx->kernel_mul_mm_q8_kq_p8;
+
+    cl_uint a = 0;
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &backend_ctx->prealloc_fa_kq_q.buffer));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &backend_ctx->prealloc_fa_kq_d.buffer));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &backend_ctx->prealloc_fa_qq_q.buffer));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &backend_ctx->prealloc_fa_qq_d.buffer));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &backend_ctx->prealloc_fa_pq.buffer));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &backend_ctx->prealloc_fa_bmax.buffer));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &backend_ctx->prealloc_fa_bsum.buffer));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &extra_m->data_device));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &off_mask));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &mask_nb1));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(float),    &scale));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(float),    &max_bias));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(float),    &m0));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(float),    &m1));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &n_head_log2));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &dk));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &n_kv));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &nqc));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &n_head));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &n_head_kv));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &p_pitch));
+
+    // (query tile, query head of the group), then 512-row kv spans, then KV head
+    const size_t gqa = n_head / n_head_kv;
+    size_t gws[3] = {64 * gqa * (size_t)((nqc + 31) / 32), (size_t)((n_kv + 511) / 512), (size_t) n_head_kv};
+    size_t lws[3] = {64, 1, 1};
+    backend_ctx->enqueue_ndrange_kernel(kernel, 3, gws, lws, dst);
+
+    ggml_cl_fa_p8_fixup(backend_ctx, q, sinks, dst, n_kv, nqc, p_pitch);
+}
+
 static void ggml_cl_fa_kq_p8_dispatch(
     ggml_backend_t backend,
     const ggml_tensor * q, const ggml_tensor * k,
@@ -22873,6 +23020,18 @@ static void ggml_cl_fa_kq_p8_dispatch(
     CL_CHECK(clReleaseMemObject(k_sub));
     CL_CHECK(clReleaseMemObject(q_sub));
 
+    ggml_cl_fa_p8_fixup(backend_ctx, q, sinks, dst, M, N, p_pitch);
+}
+
+// Per row: the f32 block scales of the u8 P and the deferred-norm row sums.
+static void ggml_cl_fa_p8_fixup(
+    ggml_backend_opencl_context * backend_ctx,
+    const ggml_tensor * q, const ggml_tensor * sinks, const ggml_tensor * dst,
+    int M, int N, int p_pitch
+) {
+    auto * extra_q = (ggml_tensor_extra_cl *) q->extra;
+    const int D_B = q->ne[2];
+
     cl_mem sinks_buf = extra_q->data_device;
     cl_ulong sinks_off = 0;
     const int has_sinks = sinks != nullptr;
@@ -22886,9 +23045,9 @@ static void ggml_cl_fa_kq_p8_dispatch(
     const int nblk = M / 32;
     const int row_blk = p_pitch / 32;
 
-    kernel = backend_ctx->kernel_fa_p8_fixup;
+    cl_kernel kernel = backend_ctx->kernel_fa_p8_fixup;
 
-    a = 0;
+    cl_uint a = 0;
     CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &backend_ctx->prealloc_fa_bmax.buffer));
     CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &backend_ctx->prealloc_fa_bsum.buffer));
     CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &backend_ctx->prealloc_fa_pd.buffer));
@@ -23135,7 +23294,7 @@ static void ggml_cl_flash_attn_decompose_kq_p8(
     ggml_backend_t backend,
     const ggml_tensor * q, const ggml_tensor * k,
     ggml_tensor * dst,
-    int64_t n_q_chunk, float scale, float max_bias, bool kqv_direct
+    int64_t n_q_chunk, float scale, float max_bias, bool kqv_direct, bool kq_int8
 ) {
     auto * backend_ctx = (ggml_backend_opencl_context *) backend->context;
     const ggml_tensor * v = dst->src[2];
@@ -23196,13 +23355,33 @@ static void ggml_cl_flash_attn_decompose_kq_p8(
         backend_ctx->enqueue_ndrange_kernel(kernel, 3, gws, lws, dst);
     }
 
+    // int8 KQ: K is quantised once for the whole call, each Q chunk in the KQ dispatch.
+    if (kq_int8) {
+        const int64_t dk = q->ne[0];
+        const size_t nb = (size_t) dk / 32;
+        backend_ctx->prealloc_fa_kq_q.allocate(backend_ctx->context, (size_t) n_kv * dk * n_head_kv);
+        backend_ctx->prealloc_fa_kq_d.allocate(backend_ctx->context, (size_t) n_kv * nb * n_head_kv * sizeof(cl_half));
+        backend_ctx->prealloc_fa_qq_q.allocate(backend_ctx->context, (size_t) n_q_chunk * dk * n_head);
+        backend_ctx->prealloc_fa_qq_d.allocate(backend_ctx->context, (size_t) n_q_chunk * nb * n_head * sizeof(cl_half));
+
+        auto * extra_k = (ggml_tensor_extra_cl *) (k->view_src ? k->view_src->extra : k->extra);
+        ggml_cl_fa_q8_rows(backend_ctx, backend_ctx->kernel_fa_q8_rows_f16,
+            extra_k->data_device, extra_k->offset + k->view_offs, k->nb[1], k->nb[2],
+            backend_ctx->prealloc_fa_kq_q.buffer, backend_ctx->prealloc_fa_kq_d.buffer,
+            (int) dk, (int) n_kv, (int) n_head_kv, dst);
+    }
+
     ggml_tensor_extra_cl extra_kqv;
     ggml_tensor kqv;
 
     for (int64_t q0 = 0; q0 < n_q; q0 += n_q_chunk) {
         const int64_t nqc = MIN(n_q_chunk, n_q - q0);
 
-        ggml_cl_fa_kq_p8_dispatch(backend, q, k, mask, sinks, dst, q0, nqc, scale, max_bias, kv_pitch);
+        if (kq_int8) {
+            ggml_cl_fa_kq_int8_p8_dispatch(backend, q, k, mask, sinks, dst, q0, nqc, scale, max_bias, kv_pitch);
+        } else {
+            ggml_cl_fa_kq_p8_dispatch(backend, q, k, mask, sinks, dst, q0, nqc, scale, max_bias, kv_pitch);
+        }
 
         ggml_cl_fa_decompose_scratch_tensor(kqv, extra_kqv, backend_ctx->prealloc_fa_kqv.buffer, GGML_TYPE_F32, dv, nqc, n_head);
 
@@ -23259,6 +23438,7 @@ static void ggml_cl_flash_attn_decompose_kq_p8(
 // head size. GGML_OPENCL_FA_DECOMPOSE_MB sets the KQ scratch budget (default 256).
 // GGML_OPENCL_FA_KQ_P8=0 disables U8 probabilities and int8 KQV.
 // GGML_OPENCL_FA_KQV_DIRECT=0 disables direct PV for small query batches.
+// GGML_OPENCL_FA_KQ_INT8=1 takes the int8 KQ wherever it fits, =0 never; see below for the default.
 static bool ggml_cl_flash_attn_decompose_dispatch(
     ggml_backend_t backend,
     const ggml_tensor * q, const ggml_tensor * k, ggml_tensor * dst
@@ -23369,6 +23549,26 @@ static bool ggml_cl_flash_attn_decompose_dispatch(
         return false;
     }
 
+    // int8 KQ (K and Q quantised along dk, one scale per 32) is faster at depth, with a small
+    // perplexity shift against the f16 KQ. By default the X2E takes it from n_kv 2048
+    // (GGML_OPENCL_FA_KQ_INT8_MIN_KV, 0 disables the default). Attention sinks at head size 64
+    // decline it: the sink logit is fixed while the scores move, so the int8 error re-weights the
+    // sink against the keys.
+    static const int kq_int8_env = []{
+        const char * e = getenv("GGML_OPENCL_FA_KQ_INT8");
+        return (e && e[0]) ? (e[0] != '0' ? 1 : 0) : -1;
+    }();
+    static const int64_t kq_int8_min_kv = [backend_ctx]{
+        const char * e = getenv("GGML_OPENCL_FA_KQ_INT8_MIN_KV");
+        return (int64_t)((e && e[0]) ? atoi(e) : (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E ? 2048 : 0));
+    }();
+    const bool kq_int8_wanted = kq_int8_env == 1 ||
+        (kq_int8_env == -1 && kq_int8_min_kv > 0 && n_kv >= kq_int8_min_kv && !(dst->src[4] != nullptr && dk <= 64));
+    const bool kq_int8 = kq_int8_wanted && kq_p8 && (dk % 32) == 0 &&
+        backend_ctx->kernel_mul_mm_q8_kq_p8 != nullptr &&
+        backend_ctx->kernel_fa_q8_rows_f16 != nullptr && backend_ctx->kernel_fa_q8_rows_f32 != nullptr &&
+        (dk <= 256 || (dk <= 512 && n_q >= 32 && ggml_cl_fa_kq_int8_dk512(backend_ctx) != nullptr));
+
     // Chunk size: a byte budget for KQ, at least 8 tiles of 32 queries so the
     // GEMMs get usable shapes, and below the image1d_buffer limit of the KQ dst.
     static const size_t budget_bytes = []{
@@ -23384,6 +23584,16 @@ static bool ggml_cl_flash_attn_decompose_dispatch(
     if (!kq_p8) {
         n_q_chunk = MIN(n_q_chunk, (int64_t)(backend_ctx->image_max_buffer_size / (n_kv * n_head)));
     }
+    // The int8 KQ cost per score grows with the number of query tiles per kv block at depth:
+    // cap it at 3 tiles (GGML_OPENCL_FA_KQ_INT8_MAX_CHUNK).
+    if (kq_int8) {
+        static const int64_t max_chunk = []{
+            const char * e = getenv("GGML_OPENCL_FA_KQ_INT8_MAX_CHUNK");
+            const int v = (e && e[0]) ? atoi(e) : 96;
+            return (int64_t)(v >= 32 ? v / 32 * 32 : 96);
+        }();
+        n_q_chunk = MIN(n_q_chunk, max_chunk);
+    }
     if (n_q_chunk < 32 && n_q_chunk < n_q) {
         return false;
     }
@@ -23393,7 +23603,7 @@ static bool ggml_cl_flash_attn_decompose_dispatch(
     n_q_chunk = MIN(n_q_chunk, ((n_q + n_chunks - 1) / n_chunks + 31) & ~(int64_t) 31);
 
     if (kq_p8) {
-        ggml_cl_flash_attn_decompose_kq_p8(backend, q, k, dst, n_q_chunk, scale, max_bias, kqv_direct);
+        ggml_cl_flash_attn_decompose_kq_p8(backend, q, k, dst, n_q_chunk, scale, max_bias, kqv_direct, kq_int8);
     } else {
         ggml_cl_flash_attn_decompose(backend, q, k, dst, n_q_chunk, scale, max_bias);
     }
