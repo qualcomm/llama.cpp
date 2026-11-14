@@ -60,6 +60,29 @@ kernel void kernel_fa_q8_rows_f16(
     }
 }
 
+// A q8_0 KV cache already holds K as int8 with one half scale per 32: copy it into the planes.
+kernel void kernel_fa_q8_rows_q8_0(
+        global const char * src, ulong off_src, ulong nb1, ulong nb2,
+        global char * dq, global half * dd,
+        int ne0, int nrow, int nhead
+) {
+    const int nblk = ne0 / 32;
+    const int gid  = get_global_id(0);
+    if (gid >= nblk*nrow*nhead) {
+        return;
+    }
+    const int b = gid % nblk;
+    const int r = (gid / nblk) % nrow;
+    const int h = gid / (nblk*nrow);
+
+    global const char * blk = src + off_src + (ulong)h*nb2 + (ulong)r*nb1 + (ulong)b*34;
+    const size_t row = (size_t)h*nrow + r;
+    dd[row*nblk + b] = *(global const half *)blk;
+    global char * q = dq + row*ne0 + b*32;
+    vstore16(vload16(0, blk + 2), 0, q);
+    vstore16(vload16(1, blk + 2), 1, q);
+}
+
 kernel void kernel_fa_q8_rows_f32(
         global const char * src, ulong off_src, ulong nb1, ulong nb2,
         global char * dq, global half * dd,
