@@ -899,10 +899,12 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mm_q8_kq_p8_dk512 = nullptr;  // head sizes 257..512, built on first use
     cl_kernel kernel_fa_q8_rows_f16 = nullptr;
     cl_kernel kernel_fa_q8_rows_f32 = nullptr;
+    cl_kernel kernel_fa_q8_rows_q8_0 = nullptr;          // q8_0 KV cache -> the int8 K planes
     cl_kernel kernel_fa_p8_fixup = nullptr;
     cl_kernel kernel_fa_kqv_direct_f16 = nullptr;
     cl_kernel kernel_fa_kqv_direct_reduce = nullptr;
     cl_kernel kernel_fa_v_transpose_q8 = nullptr;
+    cl_kernel kernel_fa_v_transpose_q8_q8_0 = nullptr;   // the same int8 V^T from a q8_0 V cache
     ggml_opencl_fa_kernels fa;
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
     ggml_cl_adreno_xmem_attn_state adreno_xmem_attn;
@@ -1507,7 +1509,8 @@ struct ggml_backend_opencl_context {
 
     ~ggml_backend_opencl_context() {
         for (cl_kernel kernel : {kernel_mul_mm_f16_f32_kq_p8, kernel_mul_mm_q8_f32_kqv, kernel_fa_p8_fixup, kernel_fa_v_transpose_q8, kernel_fa_kqv_direct_f16, kernel_fa_kqv_direct_reduce,
-                                 kernel_mul_mm_q8_kq_p8, kernel_mul_mm_q8_kq_p8_dk512, kernel_fa_q8_rows_f16, kernel_fa_q8_rows_f32}) {
+                                 kernel_mul_mm_q8_kq_p8, kernel_mul_mm_q8_kq_p8_dk512, kernel_fa_q8_rows_f16, kernel_fa_q8_rows_f32,
+                                 kernel_fa_q8_rows_q8_0, kernel_fa_v_transpose_q8_q8_0}) {
             if (kernel != nullptr) {
                 CL_CHECK(clReleaseKernel(kernel));
             }
@@ -4278,6 +4281,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             CL_CHECK((backend_ctx->kernel_mul_mm_q8_kq_p8 = clCreateKernel(prog, "kernel_mul_mm_q8_kq_p8", &err), err));
             CL_CHECK((backend_ctx->kernel_fa_q8_rows_f16  = clCreateKernel(prog, "kernel_fa_q8_rows_f16", &err), err));
             CL_CHECK((backend_ctx->kernel_fa_q8_rows_f32  = clCreateKernel(prog, "kernel_fa_q8_rows_f32", &err), err));
+            CL_CHECK((backend_ctx->kernel_fa_q8_rows_q8_0 = clCreateKernel(prog, "kernel_fa_q8_rows_q8_0", &err), err));
             CL_CHECK(clReleaseProgram(prog));
         }
         GGML_LOG_CONT(".");
@@ -7949,6 +7953,12 @@ static void ggml_opencl_ensure_fa_pre_kernels(ggml_backend_opencl_context * back
         backend_ctx->kernel_fa_v_transpose_q8 = clCreateKernel(prog_pre_f16, "flash_attn_v_transpose_q8", &err);
         if (err != CL_SUCCESS) {
             backend_ctx->kernel_fa_v_transpose_q8 = nullptr;
+        }
+    }
+    if (backend_ctx->kernel_fa_v_transpose_q8_q8_0 == nullptr && backend_ctx->has_integer_dot) {
+        backend_ctx->kernel_fa_v_transpose_q8_q8_0 = clCreateKernel(prog_pre_f16, "flash_attn_v_transpose_q8_q8_0", &err);
+        if (err != CL_SUCCESS) {
+            backend_ctx->kernel_fa_v_transpose_q8_q8_0 = nullptr;
         }
     }
     clReleaseProgram(prog_pre_f16);
@@ -21604,6 +21614,30 @@ static bool ggml_cl_flash_attn_reconstruct_aos(
     temp.data = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE, parent_nbytes, NULL, &err);
     CL_CHECK(err);
 
+#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+    // set_tensor also transposes a 2D q8_0 tensor (a K/V with one head); undo it as get_tensor does
+    if (is_q8_0 && enable_adreno_trans_weight(backend_ctx, soa_src)) {
+        cl_kernel kernel = backend_ctx->kernel_restore_block_q8_0_trans;
+        const cl_int ne00 = (cl_int) soa_src->ne[0];
+        const cl_int ne01 = (cl_int) soa_src->ne[1];
+        CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &extra_q));
+        CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &extra_d));
+        CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem), &temp.data));
+        CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_int), &ne00));
+        CL_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_int), &ne01));
+        size_t gws[3] = { (size_t) ((ne01 + 63) / 64) * 64, 1, 1 };
+        size_t lws[3] = { 64, 1, 1 };
+        CL_CHECK(clEnqueueNDRangeKernel(backend_ctx->queue, kernel, 3, NULL, gws, lws, 0, NULL, NULL));
+
+        out_buf    = temp.data;
+        out_offset = tensor->view_offs;
+        out_nb1    = tensor->nb[1];
+        out_nb2    = tensor->nb[2];
+        out_nb3    = tensor->nb[3];
+        return true;
+    }
+#endif
+
     cl_kernel kernel = is_q8_0 ? backend_ctx->kernel_restore_block_q8_0
                                : backend_ctx->kernel_restore_block_q4_0;
     CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &extra_q));
@@ -23327,7 +23361,8 @@ static void ggml_cl_flash_attn_decompose_kq_p8(
         backend_ctx->prealloc_fa_vtd.allocate(backend_ctx->context, nblk * dv * n_head_kv * sizeof(cl_half));
 
         ggml_tensor_extra_cl * extra_v = (ggml_tensor_extra_cl *)v->extra;
-        cl_kernel kernel = backend_ctx->kernel_fa_v_transpose_q8;
+        cl_kernel kernel = v->type == GGML_TYPE_Q8_0 ? backend_ctx->kernel_fa_v_transpose_q8_q8_0
+                                                     : backend_ctx->kernel_fa_v_transpose_q8;
 
         const cl_ulong offset_v = extra_v->offset + v->view_offs;
         const cl_ulong v_nb1 = v->nb[1];
@@ -23365,7 +23400,8 @@ static void ggml_cl_flash_attn_decompose_kq_p8(
         backend_ctx->prealloc_fa_qq_d.allocate(backend_ctx->context, (size_t) n_q_chunk * nb * n_head * sizeof(cl_half));
 
         auto * extra_k = (ggml_tensor_extra_cl *) (k->view_src ? k->view_src->extra : k->extra);
-        ggml_cl_fa_q8_rows(backend_ctx, backend_ctx->kernel_fa_q8_rows_f16,
+        ggml_cl_fa_q8_rows(backend_ctx,
+            k->type == GGML_TYPE_Q8_0 ? backend_ctx->kernel_fa_q8_rows_q8_0 : backend_ctx->kernel_fa_q8_rows_f16,
             extra_k->data_device, extra_k->offset + k->view_offs, k->nb[1], k->nb[2],
             backend_ctx->prealloc_fa_kq_q.buffer, backend_ctx->prealloc_fa_kq_d.buffer,
             (int) dk, (int) n_kv, (int) n_head_kv, dst);
@@ -23439,6 +23475,7 @@ static void ggml_cl_flash_attn_decompose_kq_p8(
 // GGML_OPENCL_FA_KQ_P8=0 disables U8 probabilities and int8 KQV.
 // GGML_OPENCL_FA_KQV_DIRECT=0 disables direct PV for small query batches.
 // GGML_OPENCL_FA_KQ_INT8=1 takes the int8 KQ wherever it fits, =0 never; see below for the default.
+// A q8_0 KV cache is served only through the int8 KQ, so GGML_OPENCL_FA_KQ_INT8=0 leaves it to the fused tile.
 static bool ggml_cl_flash_attn_decompose_dispatch(
     ggml_backend_t backend,
     const ggml_tensor * q, const ggml_tensor * k, ggml_tensor * dst
@@ -23475,8 +23512,13 @@ static bool ggml_cl_flash_attn_decompose_dispatch(
     if (n_q < 2) {
         return false;
     }
+    // q8_0 blocks already are the int8 KQ's K quantisation (one half scale per 32 along dk).
+    // A q8_0 tensor that set_tensor split into scales and quants is rebuilt into blocks by
+    // the caller (ggml_cl_flash_attn_decompose_q8_0_blocks).
+    const bool kv_q8 = k->type == GGML_TYPE_Q8_0 && v->type == GGML_TYPE_Q8_0 &&
+                       !ggml_cl_is_q8_0_soa(k) && !ggml_cl_is_q8_0_soa(v);
     if (q->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
-        k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16) {
+        !((k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16) || kv_q8)) {
         return false;
     }
     if (q->ne[3] != 1 || k->ne[3] != 1 || v->ne[3] != 1 || dst->ne[3] != 1) {
@@ -23485,13 +23527,15 @@ static bool ggml_cl_flash_attn_decompose_dispatch(
     if (n_head_kv <= 0 || n_head < n_head_kv || n_head % n_head_kv != 0) {
         return false;
     }
-    if (k->nb[0] != ggml_type_size(k->type) || v->nb[0] != ggml_type_size(v->type)) {
+    if (k->nb[0] != ggml_type_size(k->type) || v->nb[0] != ggml_type_size(v->type) ||
+        (kv_q8 && ((dk % 32) != 0 || (dv % 32) != 0))) {
         return false;
     }
+    const size_t k_row = ggml_row_size(k->type, dk);
     // K and Q must be packed [dk, head, row], as the KV cache and the permuted Q
     // are. mul_mat sends the KQ to the image KQ kernel only for this layout;
     // other K views can reach the KQV image kernel there and give wrong results.
-    if (k->nb[2] != (size_t) dk * sizeof(ggml_fp16_t) || k->nb[1] != (size_t) dk * n_head_kv * sizeof(ggml_fp16_t) ||
+    if (k->nb[2] != k_row || k->nb[1] != k_row * n_head_kv ||
         q->nb[0] != sizeof(float) || q->nb[2] != (size_t) dk * sizeof(float) || q->nb[1] != (size_t) dk * n_head * sizeof(float)) {
         return false;
     }
@@ -23537,7 +23581,7 @@ static bool ggml_cl_flash_attn_decompose_dispatch(
     }
 
     static const char * direct_env = getenv("GGML_OPENCL_FA_KQV_DIRECT");
-    const bool kqv_direct = (!direct_env || direct_env[0] != '0') && kq_p8 &&
+    const bool kqv_direct = (!direct_env || direct_env[0] != '0') && kq_p8 && !kv_q8 &&
         backend_ctx->kernel_fa_kqv_direct_f16 != nullptr && backend_ctx->kernel_fa_kqv_direct_reduce != nullptr &&
         v->ne[1] == n_kv && v->ne[2] == n_head_kv &&
         n_q <= 32 / (n_head / n_head_kv) && dv >= 128 && dv <= INT_MAX && (dv % 128) == 0 &&
@@ -23562,12 +23606,18 @@ static bool ggml_cl_flash_attn_decompose_dispatch(
         const char * e = getenv("GGML_OPENCL_FA_KQ_INT8_MIN_KV");
         return (int64_t)((e && e[0]) ? atoi(e) : (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E ? 2048 : 0));
     }();
+    // With a q8_0 KV cache there is no quantisation to pay for, so it is the default at any depth.
+    const bool kq_int8_sinks = dst->src[4] != nullptr && dk <= 64;
     const bool kq_int8_wanted = kq_int8_env == 1 ||
-        (kq_int8_env == -1 && kq_int8_min_kv > 0 && n_kv >= kq_int8_min_kv && !(dst->src[4] != nullptr && dk <= 64));
+        (kq_int8_env == -1 && !kq_int8_sinks && (kv_q8 || (kq_int8_min_kv > 0 && n_kv >= kq_int8_min_kv)));
     const bool kq_int8 = kq_int8_wanted && kq_p8 && (dk % 32) == 0 &&
-        backend_ctx->kernel_mul_mm_q8_kq_p8 != nullptr &&
-        backend_ctx->kernel_fa_q8_rows_f16 != nullptr && backend_ctx->kernel_fa_q8_rows_f32 != nullptr &&
+        backend_ctx->kernel_mul_mm_q8_kq_p8 != nullptr && backend_ctx->kernel_fa_q8_rows_f32 != nullptr &&
+        (kv_q8 ? backend_ctx->kernel_fa_q8_rows_q8_0 != nullptr && backend_ctx->kernel_fa_v_transpose_q8_q8_0 != nullptr
+               : backend_ctx->kernel_fa_q8_rows_f16 != nullptr) &&
         (dk <= 256 || (dk <= 512 && n_q >= 32 && ggml_cl_fa_kq_int8_dk512(backend_ctx) != nullptr));
+    if (kv_q8 && !kq_int8) {
+        return false;
+    }
 
     // Chunk size: a byte budget for KQ, at least 8 tiles of 32 queries so the
     // GEMMs get usable shapes, and below the image1d_buffer limit of the KQ dst.
@@ -23608,6 +23658,35 @@ static bool ggml_cl_flash_attn_decompose_dispatch(
         ggml_cl_flash_attn_decompose(backend, q, k, dst, n_q_chunk, scale, max_bias);
     }
     return true;
+}
+
+// The decomposed prefill, with a q8_0 K/V that set_tensor split into scales and quants (a standalone
+// tensor, not a KV cache) rebuilt into blocks first: the int8 KQ reads the q8_0 blocks.
+static bool ggml_cl_flash_attn_decompose_q8_0_blocks(ggml_backend_t backend, ggml_tensor * dst) {
+    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *) backend->context;
+
+    ggml_cl_flash_attn_temp_buffer temp_aos[2];
+    ggml_tensor_extra_cl extra[2];
+    ggml_tensor kv_aos[2];
+    ggml_tensor dst_aos = *dst;
+    for (int i = 0; i < 2; ++i) {
+        const ggml_tensor * t = dst->src[1 + i];
+        cl_mem   buf = nullptr;
+        cl_ulong off = 0, nb1 = 0, nb2 = 0, nb3 = 0;
+        if (t->type != GGML_TYPE_Q8_0 ||
+            !ggml_cl_flash_attn_reconstruct_aos(backend_ctx, t, temp_aos[i], buf, off, nb1, nb2, nb3)) {
+            continue;
+        }
+        extra[i].reset();
+        extra[i].data_device = buf;
+        kv_aos[i] = *t;
+        kv_aos[i].view_src  = nullptr;
+        kv_aos[i].view_offs = off;
+        kv_aos[i].buffer    = nullptr;  // not registered as split into scales and quants
+        kv_aos[i].extra     = &extra[i];
+        dst_aos.src[1 + i] = &kv_aos[i];
+    }
+    return ggml_cl_flash_attn_decompose_dispatch(backend, dst_aos.src[0], dst_aos.src[1], &dst_aos);
 }
 
 static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, const ggml_tensor * k, ggml_tensor * dst) {
@@ -23732,8 +23811,12 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     }
 
     // after all lazy compiles, so the decode kernels are built during warmup as on the fused path
-    if (n_q > 1 && ggml_cl_flash_attn_decompose_dispatch(backend, q, k, dst)) {
-        return;
+    if (n_q > 1) {
+        const bool kv_q8_split = is_q8_0 && (ggml_cl_is_q8_0_soa(k) || ggml_cl_is_q8_0_soa(v));
+        if (kv_q8_split ? ggml_cl_flash_attn_decompose_q8_0_blocks(backend, dst)
+                        : ggml_cl_flash_attn_decompose_dispatch(backend, q, k, dst)) {
+            return;
+        }
     }
 
     const bool use_native_q8_0_q1 = is_q8_0 && n_q == 1 &&
