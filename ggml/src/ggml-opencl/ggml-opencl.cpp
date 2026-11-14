@@ -24308,10 +24308,13 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         const bool mq_decode_q8 = is_q8_0 && n_q == 1 && d_head_q == d_head_v &&
                                   (d_head_q == 64 || d_head_q == 256 || d_head_q == 512) &&
                                   backend_ctx->fa.f32_q8_0_mq_decode.count(mq_decode_key) > 0;
+        // The KV-head coalescing kernels read each KV row once for the gqa group, which pays well
+        // below FD_MIN_N_KV (tuned for the per-head split): f16 decode shapes and every q8_0 route
+        // take them from n_kv 32. Otherwise a q8_0 cache decodes short contexts per query head.
         if (mq_enabled && mq_kv_ok && nq_in_vec_range && !is_causal &&
             backend_ctx->gpu_family != INTEL &&
             !use_local_tile &&
-            n_kv >= (mq_decode_shape || mq_decode_q8 ? 32 : FD_MIN_N_KV) &&
+            n_kv >= (mq_decode_shape || is_q8_0 ? 32 : FD_MIN_N_KV) &&
             backend_ctx->fa.f32_merge.count(dk_dv) > 0) {
             if (mq_decode_shape && backend_ctx->fa.f32_f16_mq_decode.count(mq_decode_key) > 0) {
                 fd_k_split = backend_ctx->fa.f32_f16_mq_decode.at(mq_decode_key);
