@@ -13058,6 +13058,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 1, {8, 1}, 8192,  512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 1, {8, 1}, 8193,  513, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
 
+    // q8_0 K/V as views of a KV cache (block layout, not split by set_tensor), prefill batches
+    for (auto [hs, nh, nr2, kv, nb] : std::vector<std::array<int64_t, 5>>{
+            { 64, 1, 8, 4096, 512}, {128, 2, 4, 4096, 512}, {128, 2, 4, 2048, 8},
+            {256, 2, 4, 2048,  96}, {512, 1, 2, 2048,  64}}) {
+        test_cases.emplace_back(new test_flash_attn_ext(hs, hs, nh, {nr2, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32,
+                                                        GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, true));
+    }
+
     // Grouped decode uses Q's head stride, which is not eight-element aligned here.
     for (int nb : {1, 3}) {
         for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
