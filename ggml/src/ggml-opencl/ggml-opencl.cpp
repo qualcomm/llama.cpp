@@ -506,6 +506,12 @@ struct ggml_opencl_fa_kernels {
     std::map<std::tuple<int, int, int>, size_t>    f32_f16_mq_decode_wg;
     std::map<std::tuple<int, int, int>, int>       f32_f16_mq_decode_hs;
     std::set<std::tuple<int, int, int>>           f32_f16_mq_decode_attempted;
+    // q8_0 KV at head size 512: the decode kernels are built in their own programs
+    bool f32_q8_0_vec_512_attempted = false;
+    std::map<std::tuple<int, int, int>, cl_kernel> f32_q8_0_mq_decode;
+    std::map<std::tuple<int, int, int>, size_t>    f32_q8_0_mq_decode_wg;
+    std::map<std::tuple<int, int, int>, int>       f32_q8_0_mq_decode_hs;
+    std::set<std::tuple<int, int, int>>           f32_q8_0_mq_decode_attempted;
     ggml_cl_buffer fd_partial;
     cl_uint compute_units = 0;
     // kv-head-coalesced vec decode
@@ -8086,6 +8092,123 @@ static void ggml_opencl_ensure_fa_f32_f16_mq_decode(ggml_backend_opencl_context 
     }
 }
 
+// q8_0 KV decode at head size 512. A full q8_0 program does not build at this size, so the
+// single-workgroup decode kernel is built alone (FA_Q8_VEC_ONLY) with the merge kernel.
+static bool ggml_opencl_ensure_fa_q8_0_vec_512(ggml_backend_opencl_context * backend_ctx) {
+    const std::pair<int, int> key = {512, 512};
+    auto & fa = backend_ctx->fa;
+    if (fa.f32_q8_0_q1_vec.count(key) > 0) {
+        return true;
+    }
+    if (fa.f32_q8_0_vec_512_attempted || backend_ctx->kernel_compile_opts.empty()) {
+        return false;
+    }
+    fa.f32_q8_0_vec_512_attempted = true;
+
+    const ggml_opencl_fa_dim * cfg = nullptr;
+    for (const auto & d : g_opencl_fa_dims) {
+        if (d.dk == 512 && d.dv == 512) {
+            cfg = &d;
+            break;
+        }
+    }
+    if (cfg == nullptr) {
+        return false;
+    }
+
+    const std::string opts = ggml_opencl_fa_compile_opts(backend_ctx, cfg, FA_VARIANT_Q8_0) + " -D FA_Q8_VEC_ONLY";
+    cl_program prog = build_program_from_source_ex(
+        backend_ctx->context, backend_ctx->device,
+        ggml_opencl_fa_kernel_src(FA_VARIANT_Q8_0).c_str(), opts,
+        /*fatal=*/false, "fa q8_0 decode512 vec", backend_ctx->queue);
+    if (!prog) {
+        return false;
+    }
+    cl_int err;
+    cl_kernel vec = clCreateKernel(prog, "flash_attn_f32_q8_0_q1_vec", &err);
+    if (err != CL_SUCCESS) {
+        clReleaseProgram(prog);
+        return false;
+    }
+    cl_kernel merge = clCreateKernel(prog, "flash_attn_f32_merge", &err);
+    clReleaseProgram(prog);
+    if (err != CL_SUCCESS) {
+        clReleaseKernel(vec);
+        return false;
+    }
+    if (!ggml_opencl_fa_kernel_fits_wg(backend_ctx, vec, 256, "flash_attn_f32_q8_0_q1_vec", 512, 512) ||
+        !ggml_opencl_fa_kernel_fits_wg(backend_ctx, merge, 128, "flash_attn_f32_merge", 512, 512)) {
+        clReleaseKernel(vec);
+        clReleaseKernel(merge);
+        return false;
+    }
+    fa.f32_q8_0_q1_vec[key] = vec;
+    if (fa.f32_merge.count(key) > 0) {
+        clReleaseKernel(merge);
+    } else {
+        fa.f32_merge[key] = merge;
+    }
+    return true;
+}
+
+// q8_0 KV decode at head size 512: one workgroup takes MQ_GQA query heads of a KV head, so each
+// KV row is read once for them, and n_kv is split across workgroups (FA_MQ_SPLIT_ONLY builds
+// this kernel alone). Head groups as in the f16 program, except gqa 8 at 2 (gemma-4-26B).
+static void ggml_opencl_ensure_fa_q8_0_mq_decode_512(ggml_backend_opencl_context * backend_ctx, int gqa) {
+    const int dk = 512, dv = 512;
+    const std::tuple<int, int, int> key = {dk, dv, gqa};
+    auto & fa = backend_ctx->fa;
+    if (fa.f32_q8_0_mq_decode.count(key) > 0 || fa.f32_q8_0_mq_decode_attempted.count(key) > 0 ||
+        backend_ctx->kernel_compile_opts.empty()) {
+        return;
+    }
+    fa.f32_q8_0_mq_decode_attempted.insert(key);
+    if (gqa != 2 && gqa != 4 && gqa != 8 && gqa != 16) {
+        return;
+    }
+    const ggml_opencl_fa_dim * cfg = nullptr;
+    for (const auto & d : g_opencl_fa_dims) {
+        if (d.dk == dk && d.dv == dv) {
+            cfg = &d;
+            break;
+        }
+    }
+    if (cfg == nullptr) {
+        return;
+    }
+
+    const int head_sub = gqa == 16 ? 8 : (gqa == 8 ? 2 : 1);
+    const char * kernel_name = "flash_attn_f32_q8_0_q1_vec_mq_split";
+    const std::string src = ggml_opencl_fa_kernel_src(FA_VARIANT_Q8_0);
+    const std::string opts = ggml_opencl_fa_compile_opts(backend_ctx, cfg, FA_VARIANT_Q8_0) +
+                             " -D FA_MQ_SPLIT_ONLY -D FA_Q8MQ_VPRE -D MQ_GQA=" + std::to_string(gqa / head_sub) +
+                             " -D FA_HEAD_SUB=" + std::to_string(head_sub);
+    for (int nsg = 4; nsg >= 1; nsg /= 2) {
+        const size_t wg = 64 * nsg;
+        cl_program prog = build_program_from_source_ex(
+            backend_ctx->context, backend_ctx->device, src.c_str(),
+            opts + " -D MQ_NSG_SPLIT=" + std::to_string(nsg),
+            /*fatal=*/false, "fa q8_0 mq decode512", backend_ctx->queue);
+        if (!prog) {
+            continue;
+        }
+        cl_int err;
+        cl_kernel kernel = clCreateKernel(prog, kernel_name, &err);
+        clReleaseProgram(prog);
+        if (err != CL_SUCCESS) {
+            continue;
+        }
+        if (!ggml_opencl_fa_kernel_fits_wg(backend_ctx, kernel, wg, kernel_name, dk, dv)) {
+            clReleaseKernel(kernel);
+            continue;
+        }
+        fa.f32_q8_0_mq_decode[key] = kernel;
+        fa.f32_q8_0_mq_decode_wg[key] = wg;
+        fa.f32_q8_0_mq_decode_hs[key] = head_sub;
+        return;
+    }
+}
+
 // DK=512 prefill BM-tile
 static bool ggml_opencl_ensure_fa_f32_f16_prefill_512(ggml_backend_opencl_context * backend_ctx, bool split) {
     const int dk = 512, dv = 512;
@@ -11662,6 +11785,9 @@ inline bool use_q4_0_bin_kernels(const ggml_backend_opencl_context *backend_ctx,
 #endif
 }
 
+static bool ggml_cl_flash_attn_decompose_dispatch(ggml_backend_opencl_context * backend_ctx, ggml_backend_t backend,
+                                                   const ggml_tensor * dst, bool dry_run);
+
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
 static bool use_fa_bin_kernels_prefill(const ggml_backend_opencl_context * backend_ctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v) {
     if (backend_ctx->fa.kernel_flash_attn_f32_f16_bin == nullptr) {
@@ -11679,6 +11805,12 @@ static bool use_fa_bin_kernels_prefill(const ggml_backend_opencl_context * backe
     // verify batches on X2
     if (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E && is_mixed &&
         (dk == 256 || dk == 512) && n_q <= 4) {
+        return false;
+    }
+
+    // q8_0 K/V at head size 512 comes out wrong here when V differs from K; the int8 KQ
+    // decomposition takes that prefill
+    if (is_q8_0 && dk == 512) {
         return false;
     }
 
@@ -12403,6 +12535,18 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
             if (dk == 512) {
                 if (backend_ctx->gpu_family == INTEL) {
                     return false;
+                }
+                if (is_f32_q8_0) {
+                    if (q->ne[1] == 1) {
+                        // decode: the q8_0 kernels built for this head size, alone in their programs
+                        const char * decode_env = getenv("GGML_OPENCL_FA_DK512_DECODE");
+                        if ((decode_env && decode_env[0] == '0') || backend_ctx->gpu_family != ADRENO) {
+                            return false;
+                        }
+                        return ggml_opencl_ensure_fa_q8_0_vec_512(backend_ctx);
+                    }
+                    // prefill: only the int8 KQ decomposition, there is no q8_0 tile at this head size
+                    return ggml_cl_flash_attn_decompose_dispatch(backend_ctx, nullptr, op, /*dry_run=*/true);
                 }
                 if (!is_f32_f16) {
                     return false;
@@ -23476,12 +23620,14 @@ static void ggml_cl_flash_attn_decompose_kq_p8(
 // GGML_OPENCL_FA_KQV_DIRECT=0 disables direct PV for small query batches.
 // GGML_OPENCL_FA_KQ_INT8=1 takes the int8 KQ wherever it fits, =0 never; see below for the default.
 // A q8_0 KV cache is served only through the int8 KQ, so GGML_OPENCL_FA_KQ_INT8=0 leaves it to the fused tile.
+// dry_run (backend may be null): only say whether the op would take the decomposition. supports_op
+// asks before the tensors are allocated, so a q8_0 K/V that set_tensor splits into scales and
+// quants is only seen at run time (ggml_cl_flash_attn_decompose_q8_0_blocks rebuilds the blocks).
 static bool ggml_cl_flash_attn_decompose_dispatch(
-    ggml_backend_t backend,
-    const ggml_tensor * q, const ggml_tensor * k, ggml_tensor * dst
+    ggml_backend_opencl_context * backend_ctx, ggml_backend_t backend, const ggml_tensor * dst, bool dry_run
 ) {
-    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *)backend->context;
-
+    const ggml_tensor * q     = dst->src[0];
+    const ggml_tensor * k     = dst->src[1];
     const ggml_tensor * v     = dst->src[2];
     const ggml_tensor * mask  = dst->src[3];
 
@@ -23516,7 +23662,7 @@ static bool ggml_cl_flash_attn_decompose_dispatch(
     // A q8_0 tensor that set_tensor split into scales and quants is rebuilt into blocks by
     // the caller (ggml_cl_flash_attn_decompose_q8_0_blocks).
     const bool kv_q8 = k->type == GGML_TYPE_Q8_0 && v->type == GGML_TYPE_Q8_0 &&
-                       !ggml_cl_is_q8_0_soa(k) && !ggml_cl_is_q8_0_soa(v);
+                       (dry_run || (!ggml_cl_is_q8_0_soa(k) && !ggml_cl_is_q8_0_soa(v)));
     if (q->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
         !((k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16) || kv_q8)) {
         return false;
@@ -23557,6 +23703,9 @@ static bool ggml_cl_flash_attn_decompose_dispatch(
     }
 
     const std::pair<int, int> dk_dv = {(int) dk, (int) dv};
+    if (dry_run) {
+        ggml_opencl_ensure_fa_pre_kernels(backend_ctx, (int) dk, (int) dv);
+    }
     if (backend_ctx->fa.v_transpose_f16.count(dk_dv) == 0) {
         return false;
     }
@@ -23648,14 +23797,18 @@ static bool ggml_cl_flash_attn_decompose_dispatch(
         return false;
     }
 
+    if (dry_run) {
+        return true;
+    }
+
     // even out the chunks, then align to the 32-wide n-tile
     const int64_t n_chunks = (n_q + n_q_chunk - 1) / n_q_chunk;
     n_q_chunk = MIN(n_q_chunk, ((n_q + n_chunks - 1) / n_chunks + 31) & ~(int64_t) 31);
 
     if (kq_p8) {
-        ggml_cl_flash_attn_decompose_kq_p8(backend, q, k, dst, n_q_chunk, scale, max_bias, kqv_direct, kq_int8);
+        ggml_cl_flash_attn_decompose_kq_p8(backend, q, k, const_cast<ggml_tensor *>(dst), n_q_chunk, scale, max_bias, kqv_direct, kq_int8);
     } else {
-        ggml_cl_flash_attn_decompose(backend, q, k, dst, n_q_chunk, scale, max_bias);
+        ggml_cl_flash_attn_decompose(backend, q, k, const_cast<ggml_tensor *>(dst), n_q_chunk, scale, max_bias);
     }
     return true;
 }
@@ -23686,7 +23839,7 @@ static bool ggml_cl_flash_attn_decompose_q8_0_blocks(ggml_backend_t backend, ggm
         kv_aos[i].extra     = &extra[i];
         dst_aos.src[1 + i] = &kv_aos[i];
     }
-    return ggml_cl_flash_attn_decompose_dispatch(backend, dst_aos.src[0], dst_aos.src[1], &dst_aos);
+    return ggml_cl_flash_attn_decompose_dispatch(backend_ctx, backend, &dst_aos, /*dry_run=*/false);
 }
 
 static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, const ggml_tensor * k, ggml_tensor * dst) {
@@ -23749,7 +23902,21 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     }
 #endif
 
-    if (is_f16) {
+    // q8_0 K/V at head size 512, where no q8_0 program builds: the prefill is the int8 KQ
+    // decomposition (supports_op admits only that), the decode kernels are built alone.
+    if (is_q8_0 && fa_decode_only_512 && n_q > 1) {
+        const bool kv_q8_split = ggml_cl_is_q8_0_soa(k) || ggml_cl_is_q8_0_soa(v);
+        GGML_ASSERT(kv_q8_split ? ggml_cl_flash_attn_decompose_q8_0_blocks(backend, dst)
+                                : ggml_cl_flash_attn_decompose_dispatch(backend_ctx, backend, dst, /*dry_run=*/false));
+        return;
+    }
+
+    if (is_q8_0 && fa_decode_only_512) {
+        GGML_ASSERT(ggml_opencl_ensure_fa_q8_0_vec_512(backend_ctx));
+        if (n_head_kv > 0 && n_head % n_head_kv == 0) {
+            ggml_opencl_ensure_fa_q8_0_mq_decode_512(backend_ctx, n_head / n_head_kv);
+        }
+    } else if (is_f16) {
         ggml_opencl_ensure_fa_variant(backend_ctx, d_head_q, d_head_v, FA_VARIANT_F16);
     } else if (is_mixed) {
         if (fa_decode_only_512 && n_q == 1) {
@@ -23814,13 +23981,15 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     if (n_q > 1) {
         const bool kv_q8_split = is_q8_0 && (ggml_cl_is_q8_0_soa(k) || ggml_cl_is_q8_0_soa(v));
         if (kv_q8_split ? ggml_cl_flash_attn_decompose_q8_0_blocks(backend, dst)
-                        : ggml_cl_flash_attn_decompose_dispatch(backend, q, k, dst)) {
+                        : ggml_cl_flash_attn_decompose_dispatch(backend_ctx, backend, dst, /*dry_run=*/false)) {
             return;
         }
     }
 
+    // head size 512 has the single-workgroup q8_0 decode kernel only
     const bool use_native_q8_0_q1 = is_q8_0 && n_q == 1 &&
-                                    backend_ctx->fa.f32_q8_0_q1.count(dk_dv) > 0;
+                                    (backend_ctx->fa.f32_q8_0_q1.count(dk_dv) > 0 ||
+                                     backend_ctx->fa.f32_q8_0_q1_vec.count(dk_dv) > 0);
     // Native q8_0 prefill — reads q8_0 directly, wg_size = cfg->bm.
     const bool use_native_q8_0 = is_q8_0 && n_q > 1 &&
                                  backend_ctx->fa.f32_q8_0.count(dk_dv) > 0;
@@ -24108,15 +24277,23 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         const bool c8_f16_on = (c8_env_state >= 0) ? (c8_env_state == 1) : c8_default_on;
         // Quant-KV (q4_0/q8_0) GQA4 c8: default-on X2E + X1E
         const bool c8_quant_on = (c8_env_state >= 0) ? (c8_env_state == 1) : c8_default_on;
+        const bool mq_decode_q8_512 = is_q8_0 && n_q == 1 && d_head_q == 512 && d_head_v == 512 &&
+                                      backend_ctx->fa.f32_q8_0_mq_decode.count(mq_decode_key) > 0;
         if (mq_enabled && mq_kv_ok && nq_in_vec_range && !is_causal &&
             backend_ctx->gpu_family != INTEL &&
             !use_local_tile &&
-            n_kv >= (mq_decode_shape ? 32 : FD_MIN_N_KV) &&
+            n_kv >= (mq_decode_shape || mq_decode_q8_512 ? 32 : FD_MIN_N_KV) &&
             backend_ctx->fa.f32_merge.count(dk_dv) > 0) {
             if (mq_decode_shape && backend_ctx->fa.f32_f16_mq_decode.count(mq_decode_key) > 0) {
                 fd_k_split = backend_ctx->fa.f32_f16_mq_decode.at(mq_decode_key);
                 fd_mq_wg = backend_ctx->fa.f32_f16_mq_decode_wg.at(mq_decode_key);
                 fd_head_sub = backend_ctx->fa.f32_f16_mq_decode_hs.at(mq_decode_key);
+                use_fd_mq = true;
+                use_fd_mq_decode = true;
+            } else if (mq_decode_q8_512) {
+                fd_k_split = backend_ctx->fa.f32_q8_0_mq_decode.at(mq_decode_key);
+                fd_mq_wg = backend_ctx->fa.f32_q8_0_mq_decode_wg.at(mq_decode_key);
+                fd_head_sub = backend_ctx->fa.f32_q8_0_mq_decode_hs.at(mq_decode_key);
                 use_fd_mq = true;
                 use_fd_mq_decode = true;
             } else if (nq1_only && lmq_on && is_mixed && d_head_q == 128 && d_head_v == 128 &&
