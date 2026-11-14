@@ -24624,7 +24624,9 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         ggml_cl_flash_attn_temp_buffer temp_partial;
         cl_mem partial_buffer;
         cl_int err;
-        if (use_fd_mq_decode) {
+        // The KV-head coalescing routes run from n_kv 32, so per call: reuse one partials buffer
+        // that only grows instead of creating one each time.
+        if (use_fd_mq) {
             auto & pool = backend_ctx->fa.fd_partial;
             if (partial_size_bytes > pool.size) {
                 CL_CHECK(clFinish(backend_ctx->queue));
