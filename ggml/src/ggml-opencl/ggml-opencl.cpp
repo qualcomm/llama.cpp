@@ -22876,7 +22876,6 @@ static void ggml_cl_fa_kq_p8_dispatch(
     const size_t n_tiles = (N * fold + 31) / 32;
     size_t gws[3] = {64, n_tiles, (size_t)(M / 64) * (fold > 1 ? D_A : D_B)};
 
-
     const bool two_tiles = n_tiles % 2 == 0 && backend_ctx->get_kernel_workgroup_size(kernel) >= 128;
     size_t lws[3] = {64, two_tiles ? (size_t) 2 : (size_t) 1, 1};
 
@@ -23257,6 +23256,27 @@ static void ggml_cl_flash_attn_decompose_kq_p8(
     }
 }
 
+// Decode with a wide GQA group (DK=512, 16 query heads per KV head, gemma-4-12B's global layers) through
+// the decomposition: its KQ folds the group's heads into one tile and the direct KQV reads V in row layout,
+// so K and V stream once per KV head. It has a fixed per-call cost, so the default starts at n_kv 4096.
+// GGML_OPENCL_FA_DECODE_DECOMPOSE=0 opts out; =1 forces it for any decode with GQA >= 8.
+static bool ggml_cl_fa_decode_decompose(const ggml_backend_opencl_context * backend_ctx,
+                                        const ggml_tensor * q, const ggml_tensor * k) {
+    static const int env = []{
+        const char * e = getenv("GGML_OPENCL_FA_DECODE_DECOMPOSE");
+        if (!e || !e[0]) return -1;
+        return atoi(e) != 0 ? 1 : 0;
+    }();
+    if (env == 0 || q->ne[1] != 1 || k->ne[2] <= 0 || q->ne[2] % k->ne[2] != 0) {
+        return false;
+    }
+    const int64_t gqa = q->ne[2] / k->ne[2];
+    if (env == 1) {
+        return gqa >= 8;
+    }
+    return backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E && q->ne[0] == 512 && gqa >= 16 && k->ne[1] >= 4096;
+}
+
 // Decomposed flash attention prefill.
 //
 // On Adreno the fused prefill tile is slow at large head sizes, while the
@@ -23304,7 +23324,7 @@ static bool ggml_cl_flash_attn_decompose_dispatch(
                               backend_ctx->adreno_gen == ADRENO_GPU_GEN::A8X ||
                               backend_ctx->adreno_gen == ADRENO_GPU_GEN::X1E;
 
-    if (n_q < 2) {
+    if (n_q < 2 && !ggml_cl_fa_decode_decompose(backend_ctx, q, k)) {
         return false;
     }
     if (q->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
@@ -23452,7 +23472,9 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     // per-variant lazy compile for this (dk, dv)
     // DK=512 decode (n_q==1) needs no prepass
     // DK=512 prefill (n_q>1) does, so compile it only when needed
-    if (!fa_decode_only_512 || n_q > 1) {
+    // (and the decode through the decomposition, for its V transpose)
+    const bool decode_decompose = n_q == 1 && ggml_cl_fa_decode_decompose(backend_ctx, q, k);
+    if (!fa_decode_only_512 || n_q > 1 || decode_decompose) {
         ggml_opencl_ensure_fa_pre_kernels(backend_ctx, d_head_q, d_head_v);
     }
 
@@ -23534,7 +23556,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     }
 
     // after all lazy compiles, so the decode kernels are built during warmup as on the fused path
-    if (n_q > 1 && ggml_cl_flash_attn_decompose_dispatch(backend, q, k, dst)) {
+    if ((n_q > 1 || decode_decompose) && ggml_cl_flash_attn_decompose_dispatch(backend, q, k, dst)) {
         return;
     }
 
