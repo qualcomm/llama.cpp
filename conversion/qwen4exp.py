@@ -78,7 +78,7 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         self.gguf_writer.add_hyper_connection_count(hp["hc_count"])
         self.gguf_writer.add_hyper_connection_low_rank(hp["hc_lowrank"])
 
-        # the dense variants (Qwen4-27B) have plain GQA full attention: no indexer keys at all
+        # Qwen4-27B has no indexer keys; Qwen4-4B uses the QSA indexer
         if hp.get("indexer_n_heads"):
             n_layer = hp["num_hidden_layers"]
             self.gguf_writer.add_indexer_head_count(hp["indexer_n_heads"])

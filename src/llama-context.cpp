@@ -1676,6 +1676,16 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    if (backend_cpu) {
+        const auto buft = ggml_backend_sched_get_buffer_type(sched.get(), backend_cpu);
+        for (const auto & backend : backends) {
+            if (backend.get() != backend_cpu && ggml_backend_supports_buft(backend.get(), buft)) {
+                // Shared host inputs and graph storage must stay intact until the previous compute completes.
+                ggml_backend_sched_synchronize(sched.get());
+                break;
+            }
+        }
+    }
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;

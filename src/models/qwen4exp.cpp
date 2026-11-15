@@ -53,7 +53,7 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     qwen4exp_require_nonzero(ml, LLM_KV_HYPER_CONNECTION_LOW_RANK, hparams.hc_low_rank);
     hparams.n_embd_out_impl = hparams.dsv4_hc_mult * hparams.n_embd;
 
-    // the dense variants (Qwen4-27B) have plain GQA full attention and carry no indexer keys
+    // Qwen4-27B has no indexer keys; Qwen4-4B uses the QSA indexer
     hparams.indexer_n_head    = 0;
     hparams.indexer_head_size = 0;
     hparams.indexer_top_k     = 0;
@@ -309,7 +309,7 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
             layer.ple_conv1d     = create_tensor(tn(LLM_TENSOR_PLE_CONV1D,     "weight", il), { hparams.ple_conv_kernel, hc_dim }, flags);
         }
 
-        // the dense variants (Qwen4-27B) have a plain SwiGLU FFN
+        // the dense variants (Qwen4-4B and Qwen4-27B) have a plain SwiGLU FFN
         if (n_expert == 0) {
             layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", il), { n_embd, n_ff }, flags);
             layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", il), { n_embd, n_ff }, flags);
@@ -1251,7 +1251,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
 
 ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, const int il) {
     if (model.layers[il].ffn_gate_inp == nullptr) {
-        // dense SwiGLU (Qwen4-27B)
+        // dense SwiGLU (Qwen4-4B and Qwen4-27B)
         cur = build_ffn(cur,
                 model.layers[il].ffn_up,   NULL, model.layers[il].ffn_up_s,
                 model.layers[il].ffn_gate, NULL, model.layers[il].ffn_gate_s,
