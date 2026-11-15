@@ -138,9 +138,11 @@ static bool fuse_rms_norm_mul(const ggml_hexagon_session * sess, htp_opnode & pr
     if (src0->type != GGML_TYPE_F32 || src0->ne[0] != weight->ne[0] || !htp_same_shape_and_contiguity(prev.dst(), dst)) return false;
     if (htp_inputs_overlap_unsafe(prev, dst, weight)) return false;
 
-    const bool is_row_bcast  = (weight->ne[1] == 1 && weight->ne[2] == 1 && weight->ne[3] == 1);
+    const bool is_row_bcast = (weight->ne[1] == 1 && weight->ne[2] == 1 && weight->ne[3] == 1);
+    const bool is_hc_bcast  = (weight->ne[1] == src0->ne[1] && weight->ne[2] == 1 && weight->ne[3] == 1);
     const bool is_same_shape = ggml_are_same_shape(src0, weight);
-    if (!is_row_bcast && !is_same_shape) return false;
+    if (!is_row_bcast && !is_hc_bcast && !is_same_shape) return false;
+    if (!ggml_is_contiguous(weight)) return false;
 
     struct htp_unary_kernel_params kparams;
     if (!htp_kparams_solve_rms_norm_mul(sess, src0, weight, dst, &kparams)) {

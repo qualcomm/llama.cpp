@@ -11,7 +11,8 @@ struct htp_unary_kernel_params {
     uint32_t  n_hvx;
     uint32_t  col_tile;
     uint32_t  block;
-    uint32_t  broadcast_weight;
+    uint32_t  broadcast_weight; // weight rows repeat across src0 rows
+    uint32_t  weight_nrows;     // number of rows in that repeating period
 
     uint32_t  src0_contig;
     uint32_t  src1_contig;
@@ -112,6 +113,7 @@ static inline void htp_unary_vtcm_layout_build(
     uint32_t col_tile,
     uint32_t block,
     bool broadcast_weight,
+    uint32_t weight_nrows,
     uint32_t n_hvx
 ) {
     const bool has_weight = (op == HTP_OP_RMS_NORM_MUL || op == HTP_OP_RMS_NORM_MUL_ADD);
@@ -131,7 +133,8 @@ static inline void htp_unary_vtcm_layout_build(
         L->src2_bytes = (op == HTP_OP_RMS_NORM_MUL_ADD) ? L->src0_bytes : 0;
         L->dst_bytes  = L->dst_row_size_aligned  * block * 2;
         if (has_weight) {
-            L->src1_bytes = broadcast_weight ? L->src1_row_size_aligned : (L->src1_row_size_aligned * block * 2);
+            L->src1_bytes = broadcast_weight ? (L->src1_row_size_aligned * weight_nrows) :
+                                               (L->src1_row_size_aligned * block * 2);
         } else {
             L->src1_bytes = 0;
         }
@@ -153,6 +156,7 @@ static inline void htp_unary_solve_layout(
     uint32_t ne11,
     uint32_t max_block,
     bool broadcast_weight,
+    uint32_t weight_nrows,
     uint32_t n_hvx,
     size_t vtcm_size,
     size_t elem_size,
@@ -181,7 +185,7 @@ static inline void htp_unary_solve_layout(
     } else if (op == HTP_OP_RMS_NORM_MUL) {
         if (broadcast_weight) {
             size_t available_vtcm = vtcm_size;
-            size_t src1_vtcm_total = n_hvx * src1_row_size_aligned;
+            size_t src1_vtcm_total = n_hvx * src1_row_size_aligned * weight_nrows;
             if (available_vtcm > src1_vtcm_total) {
                 available_vtcm -= src1_vtcm_total;
             } else {
@@ -222,7 +226,7 @@ static inline void htp_unary_solve_layout(
 
     const uint32_t block = col_tile ? 0 : (uint32_t) vtcm_row_per_hvx;
     htp_unary_vtcm_layout_build(L, op, src0_data_row_size, dst_data_row_size, src1_data_row_size,
-                                elem_size, col_tile, block, broadcast_weight, n_hvx);
+                                elem_size, col_tile, block, broadcast_weight, weight_nrows, n_hvx);
 
     *out_col_tile = col_tile;
     *out_vtcm_row_per_hvx = (uint32_t) vtcm_row_per_hvx;
