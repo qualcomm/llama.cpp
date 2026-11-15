@@ -137,6 +137,9 @@ static inline void hvx_ssm_conv_unpack_to_T(const float * raw, float * T, uint32
 
 static __attribute__((noinline)) void hvx_ssm_conv_silu_vtcm(float * restrict buf, uint32_t n_vecs) {
     HVX_Vector * restrict vbuf = (HVX_Vector *) buf;
+#if __HVX_ARCH__ == 73
+    #pragma unroll(4)
+#endif
     for (uint32_t i = 0; i < n_vecs; ++i) {
         vbuf[i] = hvx_vec_silu_f32(vbuf[i]);
     }
