@@ -22862,8 +22862,20 @@ static void ggml_cl_fa_kq_p8_dispatch(
     CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int), &D_B));
     CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int), &p_pitch));
 
-    const size_t n_tiles = (N + 31) / 32;
-    size_t gws[3] = {64, n_tiles, (size_t)(M / 64) * D_B};
+    // A single decode query folds the query heads of a KV group into the tile columns: the tile
+    // fills instead of running 31 of 32 columns as padding, and each K row streams once per KV
+    // head instead of once per query head. GGML_OPENCL_FA_KQ_P8_FOLD=0 opts out.
+    static const bool fold_env = []{
+        const char * e = getenv("GGML_OPENCL_FA_KQ_P8_FOLD");
+        return !(e && e[0] == '0');
+    }();
+    const int fold = (fold_env && N == 1 && D_A > 0 && D_B / D_A > 1) ? D_B / D_A : 1;
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int), &fold));
+
+    // n-tiles on the fast axis, m-blocks x heads on the slow one (KV heads when folded)
+    const size_t n_tiles = (N * fold + 31) / 32;
+    size_t gws[3] = {64, n_tiles, (size_t)(M / 64) * (fold > 1 ? D_A : D_B)};
+
 
     const bool two_tiles = n_tiles % 2 == 0 && backend_ctx->get_kernel_workgroup_size(kernel) >= 128;
     size_t lws[3] = {64, two_tiles ? (size_t) 2 : (size_t) 1, 1};

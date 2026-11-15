@@ -119,7 +119,8 @@ __kernel void mul_mm_f16_f32_kq_p8(
         int N,
         int D_A,
         int D_B,
-        int p_pitch              // bytes per P row, >= M, multiple of 32
+        int p_pitch,             // bytes per P row, >= M, multiple of 32
+        int gqa_fold             // > 1: the query heads of one KV group share the n-tiles
 ) {
 
     // Match the n-tile-first grid in ggml_cl_fa_kq_p8_dispatch.
@@ -135,7 +136,11 @@ __kernel void mul_mm_f16_f32_kq_p8(
 
     const uint col   = block_id_m * TILESIZE_M;
     const uint row   = block_id_n * TILESIZE_N;
-    const uint depth_A = block_id_d / (D_B/D_A);
+    // gqa_fold > 1: block_id_d is a KV head and the n-tile columns run over (query, head of the
+    // group), column c = query*gqa_fold + head. A single decode query then fills the 32-wide tile,
+    // and each K row streams once per KV head instead of once per query head.
+    const uint fold    = gqa_fold > 1 ? (uint)gqa_fold : 1u;
+    const uint depth_A = fold > 1 ? block_id_d : block_id_d / (D_B/D_A);
     const uint depth_B = block_id_d;
 
     int line_stride_matrix_A_in_bytes = K * D_A * 2;
@@ -159,10 +164,11 @@ __kernel void mul_mm_f16_f32_kq_p8(
     __local float matrix_B_local[1024];
 
     // Clamp Q loads in the last tile; columns past N are not stored.
-    const uint c0 = min(row + b_globalOffsetInWords_xy.y, (uint)N - 1);
-    const uint c1 = min(row + b_globalOffsetInWords_xy.y + 16, (uint)N - 1);
-    const uint b_globalOffsetInWords00 = c0*strideBinElements + depth_B*K + b_globalOffsetInWords_xy.x;
-    const uint b_globalOffsetInWords16 = c1*strideBinElements + depth_B*K + b_globalOffsetInWords_xy.x;
+    const uint nv = (uint)N * fold;
+    const uint c0 = min(row + b_globalOffsetInWords_xy.y, nv - 1);
+    const uint c1 = min(row + b_globalOffsetInWords_xy.y + 16, nv - 1);
+    const uint b_globalOffsetInWords00 = (c0/fold)*strideBinElements + (depth_B*fold + c0%fold)*K + b_globalOffsetInWords_xy.x;
+    const uint b_globalOffsetInWords16 = (c1/fold)*strideBinElements + (depth_B*fold + c1%fold)*K + b_globalOffsetInWords_xy.x;
 
     for (uint step=0; step < K; step+=TILESIZE_K) {
         regA = mm_load_a(matrix_A, subMatrixAStartInElements, line_stride_matrix_A_in_bytes);
@@ -199,9 +205,10 @@ __kernel void mul_mm_f16_f32_kq_p8(
         if (lane < 32) {
             const int  j = lane >> 1;
             const int  b = lane & 1;
-            const uint n = row + half_*16 + j;
-            const uint h = depth_B;
-            if (n < (uint)N) {
+            const uint c = row + half_*16 + j;          // tile column
+            const uint n = c / fold;                     // query
+            const uint h = depth_B*fold + c % fold;      // query head
+            if (c < nv) {
                 float slope = 1.0f;
                 if (max_bias > 0.0f) {
                     const float base = (int)h < n_head_log2 ? m0 : m1;
