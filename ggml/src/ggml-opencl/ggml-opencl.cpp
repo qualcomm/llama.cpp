@@ -18700,6 +18700,18 @@ inline bool use_adreno_kernels(const ggml_backend_opencl_context *backend_ctx, c
     if (backend_ctx->adreno_x2_class() && threshold_ne0 > 256) {
         threshold_ne0 = 256;
     }
+    // The ne1 floor on the X2 class is 384. At 512, Qwen4's hc-mix projection (q4_0,
+    // K = 10240, 384 rows, two per layer) misses the dp4a GEMM and runs the generic
+    // l4_lm matmul at ~1.2 TFLOP/s -- 26% of qwen4-4B pp512 GPU time. ABBA pp512 / tg64
+    // at 384: qwen4-4B q4_0 X2-45 186 -> 247 / 13.9 -> 13.9, q4_K_M 163 -> 207 /
+    // 11.0 -> 11.1; X2-90 q4_0 +23-33%, q4_K_M +20-25%, tg flat.
+    // Not lower: the noshuffle GEMV is slower than the flat one on narrow GQA K/V
+    // weights. At 256, Qwen2.5-3B (256-row K/V) gains pp +9% but X2-45 decode drops
+    // 3-4% (23.8 -> 22.7 / 23.1, reproduced); at 64, Qwen2.5-0.5B (128-row K/V) X2-90
+    // decode drops 7.5% (168 -> 156).
+    if (backend_ctx->adreno_x2_class() && threshold_ne1 > 384) {
+        threshold_ne1 = 384;
+    }
     // The ne1 (output-row) threshold declines any weight narrower than 512 rows, which on a
     // GQA model is exactly the K and V projections: muse-glimmer-30B has 2 KV heads x 128 =
     // 256 rows, so attn_k/attn_v fall out of the Adreno path onto the generic flat GEMV.
