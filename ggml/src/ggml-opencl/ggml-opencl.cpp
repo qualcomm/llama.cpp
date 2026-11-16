@@ -18700,16 +18700,24 @@ inline bool use_adreno_kernels(const ggml_backend_opencl_context *backend_ctx, c
     if (backend_ctx->adreno_x2_class() && threshold_ne0 > 256) {
         threshold_ne0 = 256;
     }
-    // The ne1 floor on the X2 class is 384. At 512, Qwen4's hc-mix projection (q4_0,
-    // K = 10240, 384 rows, two per layer) misses the dp4a GEMM and runs the generic
-    // l4_lm matmul at ~1.2 TFLOP/s -- 26% of qwen4-4B pp512 GPU time. ABBA pp512 / tg64
-    // at 384: qwen4-4B q4_0 X2-45 186 -> 247 / 13.9 -> 13.9, q4_K_M 163 -> 207 /
-    // 11.0 -> 11.1; X2-90 q4_0 +23-33%, q4_K_M +20-25%, tg flat.
+    // The ne1 floor is 384 on the X2 laptop parts (X2E). At 512, Qwen4's hc-mix
+    // projection (K = 10240, 384 rows, two per layer) misses the dp4a GEMM and runs the
+    // generic l4_lm matmul at ~1.2 TFLOP/s -- 26% of qwen4-4B pp512 GPU time. ABBA
+    // pp512 / tg64 at 384: qwen4-4B q4_0 X2-45 186 -> 247 / 13.9 -> 13.9, q4_K_M
+    // 163 -> 207 / 11.0 -> 11.1; X2-90 q4_0 +23-33%, q4_K_M +20-25%, tg flat.
     // Not lower: the noshuffle GEMV is slower than the flat one on narrow GQA K/V
     // weights. At 256, Qwen2.5-3B (256-row K/V) gains pp +9% but X2-45 decode drops
     // 3-4% (23.8 -> 22.7 / 23.1, reproduced); at 64, Qwen2.5-0.5B (128-row K/V) X2-90
     // decode drops 7.5% (168 -> 156).
-    if (backend_ctx->adreno_x2_class() && threshold_ne1 > 384) {
+    // X1E: q4_0 only. The 384-row q4_K / q6_K noshuffle GEMVs launch 4-6 WGs over
+    // K = 10240 there (q4_K split-K is X2E-only), so qwen4-4B q4_K_M decode loses 9%
+    // (16.93 -> 15.41; forcing q4_K split-K recovers half, 16.12). q4_0 keeps its
+    // decode (20.9 -> 21.0) and gains pp512 +8% (178 -> 192).
+    // A8X (830/840/850) keeps 512: unmeasured, and it shares X1E's no-split-K q4_K
+    // GEMV, so it would likely pay the same decode cost.
+    if ((backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E ||
+         (backend_ctx->gen_level == GEN_LEVEL_X1E && tensor->type == GGML_TYPE_Q4_0)) &&
+        threshold_ne1 > 384) {
         threshold_ne1 = 384;
     }
     // The ne1 (output-row) threshold declines any weight narrower than 512 rows, which on a
