@@ -919,6 +919,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_sigmoid_f32_nc, kernel_sigmoid_f16_nc;
     cl_kernel kernel_tri;
     cl_kernel kernel_fill;
+    cl_kernel kernel_fill_f16;
     cl_kernel kernel_arange;
     cl_kernel kernel_clamp, kernel_clamp_nc;
     cl_kernel kernel_geglu, kernel_reglu, kernel_swiglu, kernel_swiglu_oai, kernel_swiglu_clamp, kernel_geglu_erf,
@@ -2512,7 +2513,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
 
-        CL_CHECK((backend_ctx->kernel_fill = clCreateKernel(prog, "kernel_fill_f32", &err), err));
+        CL_CHECK((backend_ctx->kernel_fill     = clCreateKernel(prog, "kernel_fill_f32", &err), err));
+        CL_CHECK((backend_ctx->kernel_fill_f16 = clCreateKernel(prog, "kernel_fill_f16", &err), err));
         GGML_LOG_CONT(".");
 
         CL_CHECK(clReleaseProgram(prog));
@@ -12583,7 +12585,9 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
         case GGML_OP_TRI:
             return op->type == GGML_TYPE_F32 && ggml_is_contiguous(op);
         case GGML_OP_FILL:
-            return op->type == GGML_TYPE_F32 && ggml_is_contiguous(op);
+            // f16: the indexer's flash-attention masks are filled in f16; on the CPU they split the graph per layer
+            return (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16) && ggml_is_contiguous(op) &&
+                   ggml_nelements(op) <= INT_MAX;
         case GGML_OP_ARANGE:
             return op->type == GGML_TYPE_F32;
         case GGML_OP_CLAMP:
@@ -20415,14 +20419,14 @@ static void ggml_cl_fill(ggml_backend_t backend, const ggml_tensor * src0, const
     float v = 0.0f;
     memcpy(&v, ((int32_t *) dst->op_params), sizeof(float));
 
-    const int64_t n = ggml_nelements(dst);
+    const int n = (int) ggml_nelements(dst);
 
-    cl_kernel kernel = backend_ctx->kernel_fill;
+    cl_kernel kernel = dst->type == GGML_TYPE_F16 ? backend_ctx->kernel_fill_f16 : backend_ctx->kernel_fill;
 
     CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),   &extrad->data_device));
     CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_ulong), &offsetd));
     CL_CHECK(clSetKernelArg(kernel, 2, sizeof(float),    &v));
-    CL_CHECK(clSetKernelArg(kernel, 3, sizeof(float),    &n));
+    CL_CHECK(clSetKernelArg(kernel, 3, sizeof(int),      &n));
 
     size_t local_work_size[1] = { 256 };
     size_t global_work_size[1] = { ((size_t)n + local_work_size[0] - 1) / local_work_size[0] * local_work_size[0] };

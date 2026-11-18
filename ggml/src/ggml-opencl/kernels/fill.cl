@@ -15,3 +15,16 @@ __kernel void kernel_fill_f32(
         dst[get_global_id(0)] = v;
     }
 }
+
+__kernel void kernel_fill_f16(
+        __global half *dst,
+        ulong offsetd,
+        float v,
+        int n
+
+) {
+    dst = (global half*)((global char*)dst + offsetd);
+    if(get_global_id(0) < n){
+        dst[get_global_id(0)] = (half) v;
+    }
+}
