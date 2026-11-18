@@ -405,6 +405,11 @@ llama_model_qwen4exp::graph::build_hc_mix(
     } else {
         lo = ggml_scale(ctx0, build_lora_mm(w_down, xn), 1.0f / (float) hc);
     }
+    // with several tokens the lo view strides over the inject rows; a backend whose unary ops need
+    // contiguous input would otherwise run this silu on the CPU, splitting the graph twice per layer
+    if (!ggml_is_contiguous(lo)) {
+        lo = ggml_cont(ctx0, lo);
+    }
     lo = ggml_silu(ctx0, lo);
     ggml_tensor * gate = build_lora_mm(w_up, lo);
     cb(gate, "hc_gate", il);
