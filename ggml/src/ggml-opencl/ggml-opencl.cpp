@@ -23825,6 +23825,16 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
 
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
     if (use_fa_bin_kernels_prefill(backend_ctx, q, k, v)) {
+        // On X2E the decomposed path is faster at large head sizes, so it gets the shape first
+        static const int dec_first_env = []{
+            const char * e = getenv("GGML_OPENCL_FA_DECOMPOSE_FIRST");
+            return (e && e[0]) ? (e[0] != '0' ? 1 : 0) : -1;
+        }();
+        const bool dec_first = dec_first_env == 1 ||
+            (dec_first_env == -1 && backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E);
+        if (dec_first && n_q > 1 && ggml_cl_flash_attn_decompose_dispatch(backend, q, k, dst)) {
+            return;
+        }
         // We support the prefill path of flash attn with a specialized d_head = 64/128/256
         ggml_cl_flash_attn_prefill_bin(backend, q, k, dst);
         return;
