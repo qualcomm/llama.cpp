@@ -88,6 +88,8 @@ add_library(mtmd
             models/fish-s2-spkenc.cpp
             models/zonos3-gen.cpp
             models/yue2-gen.cpp
+            models/voxcpm2-gen.cpp
+            models/voxcpm2-spkenc.cpp
             models/snake-vae.cpp
             models/music3-gen.cpp
             models/zonos3-spkenc.cpp
@@ -95,6 +97,8 @@ add_library(mtmd
             models/pockettts-spkenc.cpp
             models/pockettts-gen.cpp
             models/soprano.cpp
+            models/kokoro.cpp
+            models/tiny-voca.cpp
             models/step3vl.cpp
             models/siglip.cpp
             models/whisper-enc.cpp
