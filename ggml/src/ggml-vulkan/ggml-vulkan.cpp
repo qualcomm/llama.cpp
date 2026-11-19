@@ -7116,35 +7116,45 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         mmp_map = ggml_vk_get_mul_mat_mat_pipeline_map(ctx, f16_type, y_kernel_type, ggml_prec_get_acc(dst));
     }
 
-    GGML_ASSERT(mmp_map != nullptr);
+    vk_pipeline pipeline;
+    uint32_t split_k;
+    uint32_t stream_k_groups = 0;
+    if (tilek_b) {
+        pipeline = ctx->device->pipeline_matmul_tilek_q4_0_f16;
+        GGML_ASSERT(ne10 % pipeline->align == 0);
+        split_k = ggml_vk_guess_split_k(ctx, ne01, ne11, ne10, disable_split_k, pipeline, false);
+    } else {
+        GGML_ASSERT(mmp_map != nullptr);
 
-    const std::vector<vk_matmul_pipeline_pair> * regular_mmp_map = mmp_map;
-    bool use_stream_k = ctx->device->coopmat2 && !ctx->device->disable_stream_k && !disable_split_k;
-    if (use_stream_k) {
-        mmp_map = ggml_vk_get_mul_mat_mat_pipeline_map(ctx, mmp_type_a, mmp_type_b, ggml_prec_get_acc(dst), false, true);
-        if (mmp_map == nullptr) {
+        const std::vector<vk_matmul_pipeline_pair> * regular_mmp_map = mmp_map;
+        const ggml_type mmp_type_a = qx_needs_dequant ? f16_type : src0->type;
+        bool use_stream_k = ctx->device->coopmat2 && !ctx->device->disable_stream_k && !disable_split_k;
+        if (use_stream_k) {
+            mmp_map = ggml_vk_get_mul_mat_mat_pipeline_map(ctx, mmp_type_a, y_kernel_type, ggml_prec_get_acc(dst), false, true);
+            if (mmp_map == nullptr) {
+                mmp_map = regular_mmp_map;
+                use_stream_k = false;
+            }
+        }
+
+        const uint32_t kpad = quantize_y ? 0 : ggml_vk_align_size(ne10, ggml_vk_guess_matmul_pipeline_align_map(ctx, *mmp_map, ne01, ne11, false));
+        const bool aligned = !quantize_y && ne10 == kpad && ne01 > 8 && ne11 > 8;
+        if (use_stream_k && !aligned) {
             mmp_map = regular_mmp_map;
             use_stream_k = false;
         }
+
+        pipeline = ggml_vk_guess_matmul_pipeline_map(ctx, *mmp_map, ne01, ne11, aligned, false);
+
+        const bool narrow_n = mmp_map->back().narrow_n_max != 0 && ne11 <= mmp_map->back().narrow_n_max;
+        split_k = ggml_vk_guess_split_k(ctx, ne01, ne11, ne10, disable_split_k, pipeline, narrow_n);
+        stream_k_groups = use_stream_k ? ggml_vk_guess_stream_k_groups(ctx, pipeline, ne01, ne11, ne10, stride_d, ne12 * ne13, split_k, disable_split_k) : 0;
+        if (use_stream_k && stream_k_groups == 0) {
+            pipeline = ggml_vk_guess_matmul_pipeline_map(ctx, *regular_mmp_map, ne01, ne11, aligned, false);
+        }
     }
 
-    const uint32_t kpad = quantize_y ? 0 : ggml_vk_align_size(ne10, ggml_vk_guess_matmul_pipeline_align_map(ctx, *mmp_map, ne01, ne11, false));
-    const bool aligned = !quantize_y && ne10 == kpad && ne01 > 8 && ne11 > 8;
     const bool needs_64b_indexing = ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange;
-    if (use_stream_k && !aligned) {
-        mmp_map = regular_mmp_map;
-        use_stream_k = false;
-    }
-
-    vk_pipeline pipeline = ggml_vk_guess_matmul_pipeline_map(ctx, *mmp_map, ne01, ne11, aligned, false);
-
-    const bool narrow_n = mmp_map->back().narrow_n_max != 0 && ne11 <= mmp_map->back().narrow_n_max;
-    const uint32_t split_k = ggml_vk_guess_split_k(ctx, ne01, ne11, ne10, disable_split_k, pipeline, narrow_n);
-    const uint32_t stream_k_groups = use_stream_k ? ggml_vk_guess_stream_k_groups(ctx, pipeline, ne01, ne11, ne10, stride_d, ne12 * ne13, split_k, disable_split_k) : 0;
-    if (use_stream_k && stream_k_groups == 0) {
-        pipeline = ggml_vk_guess_matmul_pipeline_map(ctx, *regular_mmp_map, ne01, ne11, aligned, false);
-    }
-
     if (needs_64b_indexing) {
         pipeline = ggml_vk_get_64b_indexing_pipeline(ctx, pipeline);
     }
