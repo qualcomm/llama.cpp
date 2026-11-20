@@ -47567,7 +47567,11 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     backend_ctx->enqueue_ndrange_kernel(kr, 3, gws, lws, dst);
                     return;
                 }
-                if (f32_mc && ne11 >= 2 && ne11 <= 8 && ne01 <= 512 && (ne00 % 4 == 0) &&
+                // A 1-4 row output at any batch width (Qwen4-Turbo's shared_expert_gate, [2048] x
+                // [2048, n_tokens]) wastes 60+ of the tiled GEMM's 64 rows and its grid is only
+                // ceil(N/64) workgroups; one workgroup per output gives ne01*ne11 of them.
+                const bool f32_skinny = ne01 <= 4 && ne11 > 8;
+                if (f32_mc && ((ne11 >= 2 && ne11 <= 8 && ne01 <= 512) || f32_skinny) && (ne00 % 4 == 0) &&
                     ne02 == 1 && ne12 == 1 && ne13 == 1 &&
                     ggml_is_contiguous(src0) && ggml_is_contiguous(src1)) {
                     cl_kernel kmc = backend_ctx->kernel_gemv_f32_f32_mc;
@@ -47591,6 +47595,30 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 }
                 kernel = backend_ctx->kernel_mul_mm_f32_f32_l4_lm;
                 nth0 = backend_ctx->f32_lm_nth0; // (BM*BN)/(TM*TN); 256 when A8X builds -DTN=4
+
+                // Split K across extra z-batches when the tile grid is small, as the f16 tiled
+                // GEMM does. The MoE router (ffn_gate_inp, F32 [2048, 256]) is a 4 x ceil(N/64)
+                // grid: 4 workgroups for a 17-token ubatch, 32 for 512. X2E only (measured
+                // there); GGML_OPENCL_F32_MM_SPLITK_WGS sets the target workgroup count
+                // (0 disables; a positive value also enables it on other GPUs).
+                static const int f32_splitk_env = ggml_cl_env_int("GGML_OPENCL_F32_MM_SPLITK_WGS", -1);
+                const int f32_splitk_wgs = f32_splitk_env >= 0 ? f32_splitk_env
+                    : (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E ? 64 : 0);
+                int f32_nsplit = 1;
+                int f32_kslice = ne00;
+                {
+                    const size_t n_wg = (size_t)CEIL_DIV(ne01, 64) * (size_t)CEIL_DIV(ne11, 64) * (size_t)ne12 * (size_t)ne13;
+                    if (f32_splitk_wgs > 0 && n_wg < (size_t)f32_splitk_wgs && ne00 >= 512 && ne00 % 16 == 0 &&
+                        ggml_is_contiguous(dst) && ggml_nelements(dst) % 4 == 0 && offsetd % 16 == 0 &&
+                        backend_ctx->kernel_mul_mm_f16_f32_l4_lm_splitk_reduce != nullptr) {
+                        int want = (int)CEIL_DIV((size_t)f32_splitk_wgs, n_wg);
+                        if (want > ne00 / 256) { want = ne00 / 256; }
+                        if (want > 1) {
+                            f32_kslice = CEIL_DIV(CEIL_DIV(ne00, want), 16) * 16;
+                            f32_nsplit = CEIL_DIV(ne00, f32_kslice);
+                        }
+                    }
+                }
 
                 int batch_stride_a = ne00*ne01;
                 int batch_stride_b = ne10*ne11;
@@ -47647,12 +47675,33 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 CL_CHECK(clSetKernelArg(kernel, 16, sizeof(int),      &batch_stride_d));
                 CL_CHECK(clSetKernelArg(kernel, 17, sizeof(int),      &r2));
                 CL_CHECK(clSetKernelArg(kernel, 18, sizeof(int),      &r3));
+                CL_CHECK(clSetKernelArg(kernel, 19, sizeof(int),      &f32_nsplit));
+                CL_CHECK(clSetKernelArg(kernel, 20, sizeof(int),      &f32_kslice));
+                if (f32_nsplit > 1) {
+                    backend_ctx->prealloc_splitk_partial.allocate(backend_ctx->context, (size_t)f32_nsplit * ggml_nbytes(dst));
+                    const cl_ulong zero = 0;
+                    CL_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_mem),   &backend_ctx->prealloc_splitk_partial.buffer));
+                    CL_CHECK(clSetKernelArg(kernel, 5, sizeof(cl_ulong), &zero));
+                }
 
                 // 64 is block tile size BM and BN - change here when BM and BN in the kernel are changed.
-                size_t global_work_size[] = {(size_t)(CEIL_DIV(ne01, 64)*nth0), (size_t)(CEIL_DIV(ne11, 64)), (size_t)ne12*ne13};
+                size_t global_work_size[] = {(size_t)(CEIL_DIV(ne01, 64)*nth0), (size_t)(CEIL_DIV(ne11, 64)), (size_t)ne12*ne13*f32_nsplit};
                 size_t local_work_size[] = {(size_t)nth0, 1, 1};
 
                 backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+
+                if (f32_nsplit > 1) {
+                    cl_kernel rk = backend_ctx->kernel_mul_mm_f16_f32_l4_lm_splitk_reduce;
+                    const int tot4 = (int)(ggml_nelements(dst) / 4);
+                    CL_CHECK(clSetKernelArg(rk, 0, sizeof(cl_mem),   &backend_ctx->prealloc_splitk_partial.buffer));
+                    CL_CHECK(clSetKernelArg(rk, 1, sizeof(cl_mem),   &extrad->data_device));
+                    CL_CHECK(clSetKernelArg(rk, 2, sizeof(cl_ulong), &offsetd));
+                    CL_CHECK(clSetKernelArg(rk, 3, sizeof(int),      &tot4));
+                    CL_CHECK(clSetKernelArg(rk, 4, sizeof(int),      &f32_nsplit));
+                    size_t r_global[] = {(size_t)CEIL_DIV(tot4, 64) * 64};
+                    size_t r_local[]  = {64};
+                    backend_ctx->enqueue_ndrange_kernel(rk, 1, r_global, r_local, dst);
+                }
                 return;
             }
             case GGML_TYPE_F16: {
