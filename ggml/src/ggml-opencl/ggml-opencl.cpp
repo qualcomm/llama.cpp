@@ -32535,7 +32535,12 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 // 2D contiguous, small N + skinny M only. Default on for X2E, GGML_OPENCL_F32_MC=0/1 forces it.
                 static const char * f32_mc_env = getenv("GGML_OPENCL_F32_MC");
                 const bool f32_mc = f32_mc_env ? atoi(f32_mc_env) != 0 : backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E;
-                if (f32_mc && ne11 >= 2 && ne11 <= 8 && ne01 <= 512 && (ne00 % 4 == 0) &&
+                // A 1-4 row output at any batch width (the shared-expert gate of Qwen4-Turbo,
+                // [2048] x [2048, n_tokens]) leaves 60+ of the tiled GEMM's 64 rows idle on a
+                // ceil(N/64) grid; one workgroup per output gives ne01*ne11 of them. X2E only
+                // (measured there).
+                const bool f32_skinny = ne01 <= 4 && ne11 > 8 && backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E;
+                if (f32_mc && ((ne11 >= 2 && ne11 <= 8 && ne01 <= 512) || f32_skinny) && (ne00 % 4 == 0) &&
                     ne02 == 1 && ne12 == 1 && ne13 == 1 &&
                     ggml_is_contiguous(src0) && ggml_is_contiguous(src1)) {
                     cl_kernel kmc = backend_ctx->kernel_gemv_f32_f32_mc;
