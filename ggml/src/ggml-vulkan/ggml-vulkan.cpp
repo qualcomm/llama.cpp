@@ -5245,6 +5245,9 @@ vk_device ggml_vk_get_device(size_t idx) {
                         if (prop.MSize == 16 && prop.NSize == 16 && prop.KSize == 16) {
                             device->coopmat_support_16x16x16_f16acc = true;
                         }
+                        if (prop.MSize == 64 && prop.NSize == 64 && prop.KSize == 16) {
+                            device->coopmat_support_64x64x16_f16acc = true;
+                        }
                     }
                 } else if ((vk::ComponentTypeKHR)prop.AType      == vk::ComponentTypeKHR::eSint8 &&
                            (vk::ComponentTypeKHR)prop.BType      == vk::ComponentTypeKHR::eSint8 &&
@@ -5288,11 +5291,8 @@ vk_device ggml_vk_get_device(size_t idx) {
 #if defined(GGML_VULKAN_TILEK_GLSLC_SUPPORT)
             device->tilek_support = device->architecture == vk_device_architecture::QUALCOMM_ADRENO &&
                                     device->coopmat_support &&
-                                    device->coopmat_m == 64 &&
-                                    device->coopmat_n == 64 &&
-                                    device->coopmat_k == 16 &&
                                     device->subgroup_size == 64 &&
-                                    device->coopmat_acc_f16_support;
+                                    device->coopmat_support_64x64x16_f16acc;
 #endif
 
         }

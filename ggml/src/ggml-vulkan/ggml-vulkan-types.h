@@ -768,6 +768,7 @@ struct vk_device_struct {
     bool coopmat_bf16_support {};
     bool coopmat_support_16x16x16_f16acc {};
     bool coopmat_support_16x16x16_f32acc {};
+    bool coopmat_support_64x64x16_f16acc {};
     bool tilek_support {};
     bool coopmat1_fa_support {};
     uint32_t coopmat_m;
