@@ -9,6 +9,7 @@
 #include <thread>
 #include <mutex>
 #include <future>
+#include <functional>
 #include <queue>
 #include <condition_variable>
 #include <atomic>
@@ -120,16 +121,18 @@ int execute_command(std::vector<std::string>& command, std::string& stdout_str, 
     CloseHandle(stdout_write);
     CloseHandle(stderr_write);
 
-    std::array<char, 128> buffer;
-    DWORD bytes_read;
-
-    while (ReadFile(stdout_read, buffer.data(), (DWORD)buffer.size(), &bytes_read, NULL) && bytes_read > 0) {
-        stdout_str.append(buffer.data(), bytes_read);
-    }
-
-    while (ReadFile(stderr_read, buffer.data(), (DWORD)buffer.size(), &bytes_read, NULL) && bytes_read > 0) {
-        stderr_str.append(buffer.data(), bytes_read);
-    }
+    // Drain both pipes at the same time: if the child fills the stderr pipe while we are still
+    // waiting for stdout to close, it blocks on the write and neither side makes progress.
+    auto drain = [](HANDLE h, std::string & out) {
+        std::array<char, 4096> buffer;
+        DWORD bytes_read;
+        while (ReadFile(h, buffer.data(), (DWORD)buffer.size(), &bytes_read, NULL) && bytes_read > 0) {
+            out.append(buffer.data(), bytes_read);
+        }
+    };
+    std::thread stderr_thread(drain, stderr_read, std::ref(stderr_str));
+    drain(stdout_read, stdout_str);
+    stderr_thread.join();
 
     CloseHandle(stdout_read);
     CloseHandle(stderr_read);
@@ -172,16 +175,18 @@ int execute_command(std::vector<std::string>& command, std::string& stdout_str, 
         close(stdout_pipe[1]);
         close(stderr_pipe[1]);
 
-        std::array<char, 128> buffer;
-        ssize_t bytes_read;
-
-        while ((bytes_read = read(stdout_pipe[0], buffer.data(), buffer.size())) > 0) {
-            stdout_str.append(buffer.data(), bytes_read);
-        }
-
-        while ((bytes_read = read(stderr_pipe[0], buffer.data(), buffer.size())) > 0) {
-            stderr_str.append(buffer.data(), bytes_read);
-        }
+        // Drain both pipes at the same time: if the child fills the stderr pipe while we are still
+        // waiting for stdout to close, it blocks on the write and neither side makes progress.
+        auto drain = [](int fd, std::string & out) {
+            std::array<char, 4096> buffer;
+            ssize_t bytes_read;
+            while ((bytes_read = read(fd, buffer.data(), buffer.size())) > 0) {
+                out.append(buffer.data(), bytes_read);
+            }
+        };
+        std::thread stderr_thread(drain, stderr_pipe[0], std::ref(stderr_str));
+        drain(stdout_pipe[0], stdout_str);
+        stderr_thread.join();
 
         close(stdout_pipe[0]);
         close(stderr_pipe[0]);
