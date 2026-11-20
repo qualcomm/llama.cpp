@@ -821,7 +821,7 @@ struct vk_device_struct {
     vk::DescriptorSetLayout dsl;
 
     std::map<vk_matmul_pipeline_key, std::vector<vk_matmul_pipeline_pair>> pipeline_matmul;
-    vk_pipeline pipeline_matmul_tilek_q4_0_f16;
+    vk_pipeline pipeline_matmul_tilek_f16[GGML_TYPE_COUNT];
     matmul_tile_selector_t matmul_tile_selector;
     matmul_tile_selector_t matmul_id_tile_selector;
 
