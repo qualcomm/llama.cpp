@@ -841,6 +841,18 @@ llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build
     return (llm_graph_input_kpool *) res->add_input(std::move(inp));
 }
 
+// True when the top-k takes every pool (n_pool <= top_k / kpool, below ~2K cells): the selection is then
+// every visible cell, which is the dense causal mask, so scoring, top-k and the mask scatter are skipped.
+// LLAMA_QSA_ALWAYS_SELECT=1 keeps the indexer path for A/B.
+bool llama_model_qwen4exp::graph::qsa_select_all(const llm_graph_input_kpool * inp_kpool) const {
+    static const bool always_select = std::getenv("LLAMA_QSA_ALWAYS_SELECT") != nullptr;
+    if (always_select) {
+        return false;
+    }
+    const int64_t n_pool = inp_kpool->pool_cells->ne[0];
+    return n_pool <= (int64_t) (hparams.indexer_top_k / inp_kpool->kpool);
+}
+
 // QSA attends to the top blocks of compress_ratio cells plus the incomplete tail, like the glm5-next k-pool indexer
 // a block is scored by one pooled key: the mean of its raw indexer keys, normed and rotated to its first member
 ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
@@ -891,6 +903,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     // scatter the fresh pooled keys into their rep rows, then gather all n_pool of them by cell:
     // the older pools come from the rows earlier ubatches wrote
     ggml_build_forward_expand(gf, kpool_cache.scatter_pooled(pooled_new, inp_kpool->new_pool_rep));
+
+    // every pool fits in the top-k, so the selection is all visible cells: the indexer cache is
+    // kept current above, and the caller attends densely under the usual causal mask
+    if (qsa_select_all(inp_kpool)) {
+        return nullptr;
+    }
+
     ggml_tensor * pooled = kpool_cache.gather_pooled(inp_kpool->pool_cells);
     pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, 1, n_pool);
     cb(pooled, "indexer_k", il);
