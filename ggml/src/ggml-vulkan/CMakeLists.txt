@@ -101,7 +101,7 @@ if (Vulkan_FOUND)
             "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders/feature-tests/coopmat_tilek_conversion.comp"
             "GGML_VULKAN_TILEK_GLSLC_SUPPORT"
         )
-    endif()    
+    endif()
 
     test_shader_extension_support(
         "GL_NV_cooperative_matrix_decode_vector"

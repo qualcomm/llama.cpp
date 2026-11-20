@@ -711,7 +711,7 @@ void process_shaders() {
 
 #if defined(GGML_VULKAN_TILEK_GLSLC_SUPPORT)
     string_to_spv("matmul_q4_0_f16_tilek", "mul_mm_tilek.comp", {{"DATA_A_Q4_0", "1"}}, true, true, false, true);
-#endif    
+#endif
 
     for (const bool& fp16 : {false, true}) {
         std::map<std::string, std::string> base_dict;
@@ -896,7 +896,7 @@ void process_shaders() {
     string_to_spv("contig_cpy_i32_f32", "contig_copy.comp", {{"A_TYPE", "int"}, {"D_TYPE", "float"}});
 #if defined(GGML_VULKAN_TILEK_GLSLC_SUPPORT)
     string_to_spv("contig_cpy_f32_f16_tilek", "contig_copy.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float16_t"}, {"DST_TILEK", "1"}});
-#endif    
+#endif
     string_to_spv("contig_cpy_f32_f16", "contig_copy.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float16_t"}});
     string_to_spv("contig_cpy_16", "contig_copy.comp", {{"A_TYPE", "uint16_t"}, {"D_TYPE", "uint16_t"}});
     string_to_spv("contig_cpy_f16_f32", "contig_copy.comp", {{"A_TYPE", "float16_t"}, {"D_TYPE", "float"}, {"OPTIMIZATION_ERROR_WORKAROUND", "1"}});
