@@ -11784,7 +11784,7 @@ static int ggml_cl_mcr_lpr_log2(int ne00) {
 }
 
 // The row-shared GEMV launches one work-group per (64 >> lpr_log2) rows, so a skinny weight
-// gets too few work-groups to fill the GPU; leave those to kernel_gemv_f32_f32_mc.
+// gets too few work-groups to fill the GPU; leave skinny f32 weights to kernel_gemv_f32_f32_mc.
 static bool ggml_cl_mcr_wide_enough(int ne00, int ne01) {
     const int rows_per_wg = 64 >> ggml_cl_mcr_lpr_log2(ne00);
     return ne01 > 512 || (ne01 + rows_per_wg - 1) / rows_per_wg >= 256;
@@ -11802,10 +11802,12 @@ static bool ggml_cl_mcr_on(const ggml_backend_opencl_context * backend_ctx) {
 }
 
 // Small-N GEMV with each weight row read once for all ne11 (2..8) columns: plain 2D f32 or f16
-// weights at speculative verify widths, e.g. gemma-4's per-layer inp_gate and proj.
+// weights at speculative verify widths, e.g. gemma-4's per-layer inp_gate and proj. Skinny
+// weights are taken only when skinny_ok is set, i.e. when the caller has no narrow fallback.
 static bool ggml_cl_mul_mat_mcr(ggml_backend_opencl_context * backend_ctx,
                                 const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
-                                cl_mem d0, cl_ulong offset0, cl_mem d1, cl_ulong offset1, cl_mem dd, cl_ulong offsetd) {
+                                cl_mem d0, cl_ulong offset0, cl_mem d1, cl_ulong offset1, cl_mem dd, cl_ulong offsetd,
+                                bool skinny_ok) {
     const int ne00 = src0->ne[0];
     const int ne01 = src0->ne[1];
     const int ne11 = src1->ne[1];
@@ -11813,7 +11815,7 @@ static bool ggml_cl_mul_mat_mcr(ggml_backend_opencl_context * backend_ctx,
                    // BF16 weights are stored as F16 on the device and take the F16 path
                    (src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16) ? backend_ctx->kernel_gemv_f16_f32_mcr : nullptr;
     if (kr == nullptr || !ggml_cl_mcr_on(backend_ctx) || src1->type != GGML_TYPE_F32 ||
-        ne11 < 2 || ne11 > 8 || (ne00 % 4) != 0 || src1->ne[0] != ne00 || !ggml_cl_mcr_wide_enough(ne00, ne01) ||
+        ne11 < 2 || ne11 > 8 || (ne00 % 4) != 0 || src1->ne[0] != ne00 || (!skinny_ok && !ggml_cl_mcr_wide_enough(ne00, ne01)) ||
         src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 ||
         !ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) {
         return false;
@@ -33437,7 +33439,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 static const char * f32_mc_env = getenv("GGML_OPENCL_F32_MC");
                 const bool f32_mc = f32_mc_env ? atoi(f32_mc_env) != 0 : backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E;
                 if (ggml_cl_mul_mat_mcr(backend_ctx, src0, src1, dst, extra0->data_device, offset0,
-                                        extra1->data_device, offset1, extrad->data_device, offsetd)) {
+                                        extra1->data_device, offset1, extrad->data_device, offsetd, false)) {
                     return;
                 }
                 if (f32_mc && ne11 >= 2 && ne11 <= 8 && ne01 <= 512 && (ne00 % 4 == 0) &&
@@ -33536,7 +33538,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 }
 #endif
                 if (ggml_cl_mul_mat_mcr(backend_ctx, src0, src1, dst, extra0->data_device, offset0,
-                                        extra1->data_device, offset1, extrad->data_device, offsetd)) {
+                                        extra1->data_device, offset1, extrad->data_device, offsetd, true)) {
                     return;
                 }
                 static const char * mm_narrow_n_env = getenv("GGML_OPENCL_MM_NARROW_N");
