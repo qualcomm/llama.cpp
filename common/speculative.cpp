@@ -81,6 +81,8 @@ const std::map<std::string, common_speculative_type> common_speculative_type_fro
     {"draft-mtp",     COMMON_SPECULATIVE_TYPE_DRAFT_MTP},
     {"draft-dflash",  COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH},
     {"draft-dspark",  COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK},
+    {"draft-dflash2", COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH2},
+    {"draft-lilicorr", COMMON_SPECULATIVE_TYPE_DRAFT_LILICORR},
     {"ngram-simple",  COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE},
     {"ngram-map-k",   COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K},
     {"ngram-map-k4v", COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V},
@@ -1990,9 +1992,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // x2ue: the catch-up batch is a llama_batch filled by memcpy (no set_embd_state_row), so the
         // device-row path (#31927) is not wired here; dev_rows stays false and the host rows are used
         if (false && !is_mem_shared && !chain_heads) {
-            dev_rows = llama_set_embeddings_nextn_dev(ctx_tgt, true) && llama_set_embd_state_src(ctx_dft, ctx_tgt);
+            dev_rows = llama_set_embeddings_nextn_dev(ctx_tgt, true) && llama_set_ctx_state_src(ctx_dft, ctx_tgt);
             if (!dev_rows) {
-                llama_set_embd_state_src(ctx_dft, nullptr);
+                llama_set_ctx_state_src(ctx_dft, nullptr);
                 llama_set_embeddings_nextn_dev(ctx_tgt, false);
             }
         }
@@ -2002,7 +2004,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     ~common_speculative_impl_draft_mtp() override {
         auto * ctx_dft = this->params.ctx_dft;
         if (dev_rows) {
-            llama_set_embd_state_src(ctx_dft, nullptr);
+            llama_set_ctx_state_src(ctx_dft, nullptr);
             llama_set_embeddings_nextn_dev(this->params.ctx_tgt, false);
         }
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) backend_chains.size(); ++seq_id) {
@@ -3158,6 +3160,8 @@ std::string common_speculative_type_to_str(common_speculative_type type) {
         case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:     return "draft-mtp";
         case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:  return "draft-dflash";
         case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:  return "draft-dspark";
+        case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH2: return "draft-dflash2";
+        case COMMON_SPECULATIVE_TYPE_DRAFT_LILICORR: return "draft-lilicorr";
         case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:  return "ngram-simple";
         case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:   return "ngram-map-k";
         case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V: return "ngram-map-k4v";
@@ -3249,6 +3253,8 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
             case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:
             case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
             case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:
+            case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH2:
+            case COMMON_SPECULATIVE_TYPE_DRAFT_LILICORR:
                 n_max = std::max(n_max, std::max(0, spec->draft.n_max));
                 break;
             case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:
@@ -3420,7 +3426,8 @@ common_params common_base_params_to_speculative(const common_params & params) {
     const bool has_block_draft = std::any_of(
         params.speculative.types.begin(), params.speculative.types.end(),
         [](common_speculative_type t) {
-            return t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+            return t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH  || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK ||
+                   t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH2 || t == COMMON_SPECULATIVE_TYPE_DRAFT_LILICORR;
         });
     if (has_block_draft) {
         // per-seq output positions: DFlash decodes anchor + n_max masks (n_max + 1); DSpark n_max -> +1 covers both
@@ -3536,6 +3543,14 @@ common_speculative * common_speculative_init(common_params_speculative & params,
     {
         uint32_t enabled_configs = common_get_enabled_speculative_configs(params.types);
 
+        // the DFlash family types share the draft context, so one run uses at most one of them
+        const uint32_t dflash_configs = enabled_configs & (
+                (1u << COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)  | (1u << COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) |
+                (1u << COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH2) | (1u << COMMON_SPECULATIVE_TYPE_DRAFT_LILICORR));
+        if (dflash_configs & (dflash_configs - 1)) {
+            throw std::runtime_error("draft-dflash, draft-dflash2, draft-dspark and draft-lilicorr cannot be combined");
+        }
+
         auto add_config_if_enabled = [&](common_speculative_type type, bool available = true) {
             if (available && (enabled_configs & (1u << type))) {
                 configs.emplace_back(type, params);
@@ -3543,7 +3558,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         };
 
         // when adding a new type - update here the logic above
-        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 11);
+        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 13);
 
         // this list here defines the priority of the speculators
         // the one with highest priority are listed first
@@ -3558,6 +3573,8 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_MTP,    params.draft.ctx_dft != nullptr);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH, params.draft.ctx_dft != nullptr);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK, params.draft.ctx_dft != nullptr);
+        add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH2,  params.draft.ctx_dft != nullptr);
+        add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_LILICORR, params.draft.ctx_dft != nullptr);
     }
 
     std::vector<std::unique_ptr<common_speculative_impl>> impls = {};
@@ -3578,7 +3595,10 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                 impls.push_back(std::make_unique<common_speculative_impl_draft_mtp>(config.params, n_seq));
                 break;
             }
-            case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH: {
+            case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
+            case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH2:
+            case COMMON_SPECULATIVE_TYPE_DRAFT_LILICORR: {
+                // one implementation here: DFlash2 and LiliCorr are read from the draft metadata
                 impls.push_back(std::make_unique<common_speculative_impl_draft_dflash>(config.params, n_seq));
                 break;
             }
@@ -3634,6 +3654,26 @@ common_speculative * common_speculative_init(common_params_speculative & params,
     if (impls.empty()) {
         SPC_TRC("%s", "no implementations specified for speculative decoding\n");
         return nullptr;
+    }
+
+    // the n-gram drafters ignore p_min, and DSpark uses it as the cutoff of its confidence head
+    const bool uses_p_min = std::any_of(configs.begin(), configs.end(), [](const common_speculative_config & c) {
+        switch (c.type) {
+            case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:
+            case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:
+            case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:
+            case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V:
+            case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:
+            case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:
+                return false;
+            default:
+                return true;
+        }
+    });
+
+    if (params.draft.probabilistic && params.draft.p_min > 0.0f && uses_p_min) {
+        LOG_WRN("%s: --spec-draft-p-min %.2f stops sampled drafts early, consider setting it to 0 with --spec-draft-sampling probabilistic\n",
+                __func__, (double) params.draft.p_min);
     }
 
     common_speculative_ptr result(new common_speculative {
