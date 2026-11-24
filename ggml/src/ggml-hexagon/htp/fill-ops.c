@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include "hex-common.h"
+#include "hex-utils.h"
 #include "htp-trace.h"
 
 #include "hvx-copy.h"
@@ -61,8 +62,37 @@ static void fill_thread_contiguous(const htp_thread_t * th, unsigned int nth, un
 
     const uint32_t elem_start = ir0 * ne0;
     const uint32_t elem_end   = ir1 * ne0;
+    const uint32_t n_elem     = elem_end - elem_start;
     uint8_t * dst_ptr = (uint8_t *) dst->data + elem_start * fctx->elem_size;
-    hvx_splat_u(dst_ptr, fctx->splat_vec, elem_end - elem_start, fctx->elem_size);
+    // A row shorter than one HVX vector is only the masked tail store. That store
+    // leaves a 24-float sink vector (Inkling's zero sinks) untouched, and the next
+    // flash-attn load then treats garbage as the sink logit.
+    if (n_elem * fctx->elem_size < 128) {
+        float val = 0.f;
+        memcpy(&val, &octx->op_params[0], sizeof(float));
+        if (fctx->elem_size == sizeof(float)) {
+            float * p = (float *) dst_ptr;
+            for (uint32_t i = 0; i < n_elem; ++i) {
+                p[i] = val;
+            }
+        } else {
+            __fp16 h = (__fp16) val;
+            uint16_t bits;
+            memcpy(&bits, &h, sizeof(bits));
+            uint16_t * p = (uint16_t *) dst_ptr;
+            for (uint32_t i = 0; i < n_elem; ++i) {
+                p[i] = bits;
+            }
+        }
+        const uintptr_t line = HEX_L2_LINE_SIZE;
+        const uintptr_t s = (uintptr_t) dst_ptr & ~(line - 1);
+        const uintptr_t e = ((uintptr_t) dst_ptr + n_elem * fctx->elem_size + line - 1) & ~(line - 1);
+        for (uintptr_t i = s; i < e; i += line) {
+            Q6_dccleaninva_A((void *) i);
+        }
+    } else {
+        hvx_splat_u(dst_ptr, fctx->splat_vec, n_elem, fctx->elem_size);
+    }
 
     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) ir1);
     FARF(HIGH, "fill-contig %u/%u: rows %u:%u\n", ith, nth, ir0, ir1);

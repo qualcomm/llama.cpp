@@ -231,6 +231,8 @@ ggml_tensor * llama_model_inkling2::graph::build_inputs() {
 ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tensor * cur, std::vector<ggml_tensor *> & blocks,
         ggml_tensor * messages, const loop_layer * loop) {
     GGML_ASSERT(!messages == !loop);
+    // DSpark reads the residual entering this cache slot.
+    res->t_layer_inp[il] = cur;
     const auto & l = model.layers[il];
     const bool swa = hparams.is_swa(il);
     const int64_t nh = hparams.n_head(il);
@@ -329,6 +331,8 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
 }
 
 void llama_model_inkling2::graph::build_output(ggml_tensor * cur, const std::vector<ggml_tensor *> & blocks) {
+    // Slot n_layer is the residual after the last cache slot, before the output mix.
+    res->t_layer_inp[n_layer] = cur;
     cur = ggml_reshape_2d(ctx0, mix(blocks, cur, model.output_res_query), n_embd, n_tokens);
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
     if (inp_out_ids) {
