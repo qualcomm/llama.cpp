@@ -260,6 +260,169 @@ static uint32_t fa_scan_active_blocks(
     return n_active;
 }
 
+// Hexagon C forbids __fp16 in a parameter or a return type. Pass the bits.
+static inline float fa_h2f(uint16_t bits) {
+    __fp16 h;
+    memcpy(&h, &bits, sizeof(h));
+    return (float) h;
+}
+
+static inline uint16_t fa_f2h_bits(float f) {
+    __fp16 h = (__fp16) f;
+    uint16_t bits;
+    memcpy(&bits, &h, sizeof(bits));
+    return bits;
+}
+
+// Same online-softmax attention as ggml_compute_forward_flash_attn_ext_f16_one_chunk.
+// The HVX block kernel rounds a head dim that is not a multiple of 64 through a
+// 64-wide tail, and a per-head mask (Inkling ne[2] == n_head) is enough to move
+// a close greedy token. This row matches the CPU op, including expf and f32 V.
+static void fa_scalar_row(struct htp_fa_context * factx, uint8_t * q16_buf, float * VKQ32, uint32_t ir) {
+    const struct htp_ops_context * octx = factx->octx;
+    const struct htp_tensor * q     = octx->src[0];
+    const struct htp_tensor * k     = octx->src[1];
+    const struct htp_tensor * v     = octx->src[2];
+    const struct htp_tensor * mask  = octx->src[3];
+    const struct htp_tensor * sinks = octx->src[4];
+    const struct htp_tensor * dst   = octx->dst;
+
+    const uint32_t neq1 = q->ne[1];
+    const uint32_t neq2 = q->ne[2];
+    const uint32_t DK   = k->ne[0];
+    const uint32_t DV   = v->ne[0];
+    const uint32_t nek1 = k->ne[1];
+
+    const uint32_t iq3 = fastdiv(ir, &factx->src0_div21);
+    const uint32_t iq2 = fastdiv(ir - iq3 * neq2 * neq1, &factx->src0_div1);
+    const uint32_t iq1 = ir - iq3 * neq2 * neq1 - iq2 * neq1;
+
+    const uint32_t ik3 = fastdiv(iq3, &factx->broadcast_rk3);
+    const uint32_t ik2 = fastdiv(iq2, &factx->broadcast_rk2);
+    const uint32_t iv3 = fastdiv(iq3, &factx->broadcast_rv3);
+    const uint32_t iv2 = fastdiv(iq2, &factx->broadcast_rv2);
+
+    float slope = 1.0f;
+    if (factx->max_bias > 0.0f) {
+        const uint32_t n_head_log2 = factx->n_head_log2;
+        slope = (iq2 < n_head_log2) ? powf(factx->m0, (float) (iq2 + 1))
+                                    : powf(factx->m1, (float) (2 * (iq2 - n_head_log2) + 1));
+    }
+
+    for (uint32_t i = 0; i < DV; ++i) {
+        VKQ32[i] = 0.0f;
+    }
+
+    const uint8_t * q_row = (const uint8_t *) q->data + iq1 * q->nb[1] + iq2 * q->nb[2] + iq3 * q->nb[3];
+    // CPU ggml_vec_dot_f16_f32 keeps a f32 query. Rounding Q to f16 before the
+    // dot is enough to flip Inkling's close "I'm" / "I am" token.
+    uint16_t * qh = (uint16_t *) q16_buf;
+    if (q->type == HTP_TYPE_F16) {
+        memcpy(qh, q_row, DK * sizeof(uint16_t));
+    }
+
+    const uint8_t * mp_base = NULL;
+    if (mask) {
+        const uint32_t im2 = fastmodulo(iq2, mask->ne[2], &factx->src3_div2);
+        const uint32_t im3 = fastmodulo(iq3, mask->ne[3], &factx->src3_div3);
+        mp_base = (const uint8_t *) mask->data + iq1 * mask->nb[1] + im2 * mask->nb[2] + im3 * mask->nb[3];
+    }
+
+    float S = 0.0f;
+    float M = -INFINITY;
+
+    for (uint32_t ic = 0; ic < nek1; ++ic) {
+        float mv = 0.0f;
+        if (mp_base) {
+            mv = slope * fa_h2f(*(const uint16_t *) (mp_base + (size_t) ic * mask->nb[0]));
+        }
+        if (mv == -INFINITY) {
+            continue;
+        }
+
+        const uint8_t * k_row = (const uint8_t *) k->data + (size_t) ic * k->nb[1] + ik2 * k->nb[2] + ik3 * k->nb[3];
+        float s = 0.0f;
+        if (q->type == HTP_TYPE_F32 && k->type == HTP_TYPE_F16) {
+            const float * qf = (const float *) q_row;
+            const uint16_t * kh = (const uint16_t *) k_row;
+            for (uint32_t i = 0; i < DK; ++i) {
+                s += qf[i] * fa_h2f(kh[i]);
+            }
+        } else if (k->type == HTP_TYPE_F16) {
+            const uint16_t * kh = (const uint16_t *) k_row;
+            for (uint32_t i = 0; i < DK; ++i) {
+                s += fa_h2f(qh[i]) * fa_h2f(kh[i]);
+            }
+        } else {
+            const float * qf = (const float *) q_row;
+            const float * kf = (const float *) k_row;
+            for (uint32_t i = 0; i < DK; ++i) {
+                s += qf[i] * kf[i];
+            }
+        }
+        s *= factx->scale;
+        s += mv;
+
+        const uint8_t * v_row = (const uint8_t *) v->data + (size_t) ic * v->nb[1] + iv2 * v->nb[2] + iv3 * v->nb[3];
+        float ms = 1.0f;
+        float vs = 1.0f;
+        if (s > M) {
+            const float Mold = M;
+            M = s;
+            ms = expf(Mold - M);
+            for (uint32_t i = 0; i < DV; ++i) {
+                VKQ32[i] *= ms;
+            }
+        } else {
+            vs = expf(s - M);
+        }
+        if (v->type == HTP_TYPE_F16) {
+            const uint16_t * vh = (const uint16_t *) v_row;
+            for (uint32_t i = 0; i < DV; ++i) {
+                VKQ32[i] += fa_h2f(vh[i]) * vs;
+            }
+        } else {
+            const float * vf = (const float *) v_row;
+            for (uint32_t i = 0; i < DV; ++i) {
+                VKQ32[i] += vf[i] * vs;
+            }
+        }
+        S = S * ms + vs;
+    }
+
+    if (sinks) {
+        const float sink = ((const float *) sinks->data)[iq2];
+        float ms = 1.0f;
+        float vs = 1.0f;
+        if (sink > M) {
+            ms = expf(M - sink);
+            for (uint32_t i = 0; i < DV; ++i) {
+                VKQ32[i] *= ms;
+            }
+        } else {
+            vs = expf(sink - M);
+        }
+        S = S * ms + vs;
+    }
+
+    const float S_inv = S == 0.0f ? 0.0f : 1.0f / S;
+    for (uint32_t i = 0; i < DV; ++i) {
+        VKQ32[i] *= S_inv;
+    }
+
+    const uint32_t ne1 = dst->ne[1];
+    const uint32_t ne2 = dst->ne[2];
+    uint8_t * dst_row = (uint8_t *) dst->data + ((size_t) iq3 * ne2 * ne1 + iq2 + (size_t) iq1 * ne1) * dst->nb[1];
+    if (dst->type == HTP_TYPE_F32) {
+        memcpy(dst_row, VKQ32, DV * sizeof(float));
+    } else {
+        uint16_t * dh = (uint16_t *) dst_row;
+        for (uint32_t i = 0; i < DV; ++i) {
+            dh[i] = fa_f2h_bits(VKQ32[i]);
+        }
+    }
+}
+
 static void flash_attn_ext_f16_thread(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {
     struct htp_fa_context * factx = (struct htp_fa_context *) data;
     const struct htp_ops_context * octx = factx->octx;
@@ -346,6 +509,21 @@ static void flash_attn_ext_f16_thread(const htp_thread_t * th, unsigned int nth,
     }
 
     const size_t size_vkq_acc_single = hex_round_up(DV * sizeof(float), 128);
+
+    // Head dim 96 and a mask plane per head both disagree with the 64-wide HVX kernel.
+    const bool fa_scalar = ((DK % 64u) != 0 || (mask && mask->ne[2] != 1)) &&
+                           DK <= 256 && DV <= 256 &&
+                           (q->type == HTP_TYPE_F16 || q->type == HTP_TYPE_F32) &&
+                           (k->type == HTP_TYPE_F16 || k->type == HTP_TYPE_F32) &&
+                           (v->type == HTP_TYPE_F16 || v->type == HTP_TYPE_F32);
+    if (fa_scalar) {
+        uint8_t * q16 = spad_q;
+        float * acc = (float *) spad_a;
+        for (uint32_t row = ir0; row < ir1; ++row) {
+            fa_scalar_row(factx, q16, acc, row);
+        }
+        return;
+    }
 
     uint32_t ir = ir0;
     while (ir < ir1) {
@@ -542,7 +720,6 @@ static void flash_attn_ext_f16_thread(const htp_thread_t * th, unsigned int nth,
                 {
                     HVX_Vector M_new_vec = Q6_Vsf_vmax_VsfVsf(v_max, M_vec[g]);
                     HVX_Vector diff_vec  = HVX_OP_SUB_F32(M_vec[g], M_new_vec);
-
                     HVX_Vector diff_f16   = hvx_vec_f32_to_f16(diff_vec, diff_vec);
                     HVX_Vector diff_base2 = hvx_vec_mul_f16_f16(diff_f16, v_log2e);
                     HVX_Vector ms_f16     = hvx_vec_exp2_f16(diff_base2);

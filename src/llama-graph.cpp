@@ -1724,6 +1724,9 @@ ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur,
           ggml_tensor * w_s) const {
+    if (!w_s) {
+        w_s = model.get_w_scale(w);
+    }
     // a Hadamard-folded weight reads the transformed input; a LoRA delta lives in the primal basis and reads `cur`
     ggml_tensor * cur_mm = build_hadamard_input(w, cur);
     ggml_tensor * res = ggml_mul_mat(ctx0, w, cur_mm);
@@ -1805,6 +1808,9 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * w_s,
           ggml_tensor * slots,
                  bool   cached) const {
+    if (!w_s) {
+        w_s = model.get_w_scale(w);
+    }
     // as in build_lora_mm: the folded weight reads the transformed input, the LoRA delta reads `cur`
     ggml_tensor * cur_mm = build_hadamard_input(w, cur);
     // the experts in the MoE cache are selected by their slots

@@ -1621,7 +1621,10 @@ struct llama_model_dflash : public llama_model_base {
         graph_base(const llm_graph_params & params);
 
         ggml_tensor * build_inject();
+        void          build_inject_ctx_mix();
+        void          store_inject_kv(ggml_tensor * Kcur, ggml_tensor * Vcur, int il);
         ggml_tensor * build_inp_tokens();
+        ggml_tensor * build_inp_block(ggml_tensor * inp_tokens);
         ggml_tensor * build_layers(ggml_tensor * inp_tokens);
         ggml_tensor * build_logits(ggml_tensor * cur);
         ggml_tensor * build_rope(ggml_tensor * cur, ggml_tensor * pos, int il);
@@ -2476,11 +2479,63 @@ struct llama_model_inkling2 : public llama_model_base {
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 
+    virtual int n_layer_phys() const { return hparams.n_layer(); }
+
+    enum { LOOP_CTRL_Q, LOOP_CTRL_K, LOOP_CTRL_V, LOOP_CTRL_FFN, LOOP_CTRL_COUNT };
+
+    struct loop_layer {
+        ggml_tensor * msg_query = nullptr;
+        ggml_tensor * ctrl_down[LOOP_CTRL_COUNT]   = {};
+        ggml_tensor * ctrl_gain[LOOP_CTRL_COUNT]   = {};
+        ggml_tensor * ctrl_forget[LOOP_CTRL_COUNT] = {};
+    };
+
     struct graph : public llm_graph_context {
         graph(const llm_graph_params & params);
         ggml_tensor * mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query);
         ggml_tensor * clip(ggml_tensor * cur, ggml_tensor * scale, float threshold);
         ggml_tensor * convolve(ggml_tensor * cur, ggml_tensor * weight, ggml_tensor * dynamic, ggml_tensor * state, ggml_tensor * history, llm_graph_input_rs * inp, int64_t offset);
+
+    protected:
+        struct no_build {};
+        graph(const llm_graph_params & params, no_build) : llm_graph_context(params) {}
+
+        ggml_tensor * control(ggml_tensor * cur, ggml_tensor * message, const loop_layer & loop, int ctrl);
+        ggml_tensor * build_inputs();
+        ggml_tensor * build_layer(int il, int ip, ggml_tensor * cur, std::vector<ggml_tensor *> & blocks,
+                ggml_tensor * messages = nullptr, const loop_layer * loop = nullptr);
+        void build_output(ggml_tensor * cur, const std::vector<ggml_tensor *> & blocks);
+
+        llm_graph_input_attn_kv_iswa * attn = nullptr;
+        llm_graph_input_rs           * recr = nullptr;
+        ggml_tensor * distances[2] = {};
+        ggml_tensor * tau = nullptr;
+        ggml_tensor * inp_out_ids = nullptr;
+    };
+
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+};
+
+struct llama_model_inkling2_loop : public llama_model_inkling2 {
+    llama_model_inkling2_loop(const struct llama_model_params & params) : llama_model_inkling2(params) {}
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
+    void post_arch_tensors(llama_model_loader & ml) override;
+
+    int n_layer_phys() const override { return n_phys; }
+    int layer_phys(int il) const;
+
+    int      n_phys     = 0;
+    uint32_t core_start = 0;
+    uint32_t core_end   = 0;
+    uint32_t n_passes   = 0;
+    uint32_t gate_rank  = 0;
+    bool     varying    = false;
+
+    std::vector<loop_layer> loop_layers;
+
+    struct graph : public llama_model_inkling2::graph {
+        graph(const llm_graph_params & params);
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;

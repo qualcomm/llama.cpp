@@ -326,6 +326,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_falcon_h1(params);
         case LLM_ARCH_INKLING2:
             return new llama_model_inkling2(params);
+        case LLM_ARCH_INKLING2_LOOP:
+            return new llama_model_inkling2_loop(params);
         case LLM_ARCH_LFM2:
             return new llama_model_lfm2(params);
         case LLM_ARCH_LFM2MOE:
@@ -1909,6 +1911,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
             if (!layer.ffn_up_exps_s && layer.ffn_up_exps) {
                 layer.ffn_up_exps_s = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS, "scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
+                if (layer.ffn_up_exps_s && layer.ffn_gate_up_exps) {
+                    throw std::runtime_error(format("ffn_up_exps.scale and ffn_gate_up_exps.weight both exist for layer %d", i));
+                }
+            }
+            if (!layer.ffn_up_exps_s && layer.ffn_gate_up_exps) {
+                layer.ffn_up_exps_s = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
             }
 
             // recurrent / linear-attention weight scales (per-tensor, shape {1})
@@ -2009,6 +2017,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 output_in_s = create_tensor(tn(LLM_TENSOR_OUTPUT, "input_scale"), {1}, TENSOR_NOT_REQUIRED);
             }
         }
+        post_arch_tensors(ml);
     }
 
     ml.done_getting_tensors();
@@ -2028,6 +2037,33 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     for (auto & [_, ctx_ptr] : ml.ctx_map) {
         for (auto * cur = ggml_get_first_tensor(ctx_ptr.get()); cur != NULL; cur = ggml_get_next_tensor(ctx_ptr.get(), cur)) {
             tensors_by_name.emplace_back(ggml_get_name(cur), cur);
+        }
+    }
+
+    // map each weight to its "<name>.scale" tensor: shape {1} for a 2D weight, {n_expert} for a 3D weight
+    {
+        auto ends_with = [](const std::string & str, const std::string & suffix) {
+            return str.size() >= suffix.size() && str.compare(str.size() - suffix.size(), suffix.size(), suffix) == 0;
+        };
+        std::unordered_map<std::string, ggml_tensor *> weights;
+        for (const auto & [name, cur] : tensors_by_name) {
+            if (ends_with(name, ".weight")) {
+                weights.emplace(name.substr(0, name.size() - 7), cur);
+            }
+        }
+        for (const auto & [name, s] : tensors_by_name) {
+            if (!ends_with(name, ".scale")) {
+                continue;
+            }
+            const auto it = weights.find(name.substr(0, name.size() - 6));
+            if (it == weights.end()) {
+                continue;
+            }
+            ggml_tensor * w = it->second;
+            const bool ok = w->ne[3] == 1 && ggml_nelements(s) == w->ne[2] && s->ne[0] == w->ne[2];
+            if (ok) {
+                w_scales.emplace(w, s);
+            }
         }
     }
 
@@ -2564,6 +2600,11 @@ size_t llama_model::size() const {
 
 size_t llama_model::n_tensors() const {
     return tensors_by_name.size();
+}
+
+ggml_tensor * llama_model::get_w_scale(const ggml_tensor * w) const {
+    const auto it = w_scales.find(w);
+    return it == w_scales.end() ? nullptr : it->second;
 }
 
 size_t llama_model::n_devices() const {
@@ -3351,7 +3392,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         filter_idx = [&](uint32_t il) {
                             return il < hparams.n_layer() && !hparams.is_recr(il) && hparams.is_indexer_full(il);
                         };
-                    } else if (arch == LLM_ARCH_FALCON_H1 || arch == LLM_ARCH_INKLING2 || arch == LLM_ARCH_ZAYA1) {
+                    } else if (arch == LLM_ARCH_FALCON_H1 || arch == LLM_ARCH_INKLING2 || arch == LLM_ARCH_INKLING2_LOOP || arch == LLM_ARCH_ZAYA1) {
                         filter_attn = [&](uint32_t) { return true; };
                         filter_recr = [&](uint32_t) { return true; };
                     } else if (arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE) {
@@ -3727,6 +3768,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_GLM5_NEXT:
         case LLM_ARCH_STARCODER:
         case LLM_ARCH_INKLING2:
+        case LLM_ARCH_INKLING2_LOOP:
         case LLM_ARCH_KOKORO:
             return LLAMA_ROPE_TYPE_NONE;
 

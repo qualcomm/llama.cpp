@@ -306,6 +306,15 @@ static bool htp_flash_attn_is_hmx_eligible(
 
     GGML_UNUSED(sinks);
 
+    const uint32_t n_head     = q->ne[2];
+    const uint32_t n_kv_heads = k->ne[2];
+    const uint32_t G          = n_kv_heads > 0 ? n_head / n_kv_heads : 1;
+    // HMX tiles 32 query rows. A group size that does not divide 32 (Inkling G=3)
+    // mis-pairs heads with per-head mask planes. Stay on HVX for every length.
+    if (G == 0 || (32 % G) != 0) {
+        return false;
+    }
+
     if (opt_fa_select > 2) {
         return true;
     }
@@ -316,9 +325,6 @@ static bool htp_flash_attn_is_hmx_eligible(
     }
 
     const uint32_t n_hvx         = htp_session_n_hvx(sess);
-    const uint32_t n_head        = q->ne[2];
-    const uint32_t n_kv_heads    = k->ne[2];
-    const uint32_t G             = n_kv_heads > 0 ? n_head / n_kv_heads : 1;
     const uint32_t S             = k->ne[1];
     const uint32_t total_threads = n_hvx * htp_session_mdev_count(sess);
 
@@ -906,6 +912,13 @@ static bool htp_kparams_solve_matmul_impl(
     const int  ne01_tiled  = hex_round_up(ne01, 32);
 
     const bool   is_matmul_id = (dst->op == GGML_OP_MUL_MAT_ID);
+    // One token (ne11*ne12*ne13 == 1) matches the CPU expert gather. A longer
+    // prefill does not: the same expert owns several rows and the device
+    // indirect matmul writes the wrong activation into those rows. Inkling
+    // then samples token 0. Leave that shape on the CPU.
+    if (is_matmul_id && (int64_t) ne11 * ne12 * ne13 > 1) {
+        return false;
+    }
     const bool   is_batched   = (ne02 * ne03 > 1 || ne12 * ne13 > 1);
     const size_t vtcm_budget  = htp_session_vtcm_size(sess);
 
@@ -3521,7 +3534,9 @@ static bool htp_kparams_solve_pad(
     struct htp_pad_vtcm_layout layout;
     htp_pad_vtcm_layout_build(&layout, (uint32_t) src0->ne[0] * type_size, (uint32_t) dst->ne[0] * type_size, n_hvx);
 
-    const bool use_dma = (src0->nb[0] == type_size) && (src0->ne[0] >= 512) &&
+    // ne[0] >= 512 used to skip DMA for short rows. Relative-bias rows are 16 wide and live in a
+    // DMA64 weight buffer, and the non-DMA pad kernel cannot touch an extended pointer.
+    const bool use_dma = (src0->nb[0] == type_size) &&
                          (htp_session_vtcm_size(sess) >= layout.total_bytes);
 
     kparams->n_hvx      = n_hvx;

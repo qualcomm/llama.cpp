@@ -16,6 +16,7 @@
 #include "htp-trace.h"
 #include "htp-ops.h"
 #include "htp-tensor.h"
+#include "dma-queue.h"
 #include "repeat-ops.h"
 
 struct htp_repeat_context {
@@ -27,6 +28,8 @@ struct htp_repeat_context {
     uint32_t row_start;
 
     size_t   type_size;
+    size_t   scratch_stride; // VTCM bytes per thread when bouncing an extended pointer
+    int      bounce;
 };
 
 static void repeat_job_per_hvx(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {
@@ -81,12 +84,35 @@ static void repeat_job_per_hvx(const htp_thread_t * th, unsigned int nth, unsign
         const uint32_t k2 = fastmodulo(i2, ne02, &kparams->div_ne02);
         const uint32_t k3 = fastmodulo(i3, ne03, &kparams->div_ne03);
 
-        const uint8_t * src_row = (const uint8_t *) src->data + k1 * nb01 + k2 * nb02 + k3 * nb03;
-        uint8_t * dst_base      = (uint8_t *) dst->data + i1 * nb1 + i2 * nb2 + i3 * nb3;
+        const uint64_t src_addr = src->data + (uint64_t) k1 * nb01 + (uint64_t) k2 * nb02 + (uint64_t) k3 * nb03;
+        const uint64_t dst_base = dst->data + (uint64_t) i1 * nb1 + (uint64_t) i2 * nb2 + (uint64_t) i3 * nb3;
+
+        // An extended pointer is a DMA64 DDR address. Casting it to a 32-bit pointer drops the high half,
+        // so one source row is staged through this thread's VTCM slice and written back out.
+        if (rctx->bounce) {
+            uint8_t * scratch = octx->ctx->vtcm_base + (size_t) ith * rctx->scratch_stride;
+            if (htp_tensor_is_extended(src)) {
+                dma_sync_read(th->dma_q, scratch, src_addr, row_bytes);
+            } else {
+                memcpy(scratch, (const uint8_t *) (uintptr_t) src_addr, row_bytes);
+            }
+            for (uint32_t i0 = 0; i0 < nr0; i0++) {
+                const uint64_t dst_addr = dst_base + (uint64_t) i0 * ne00 * nb0;
+                if (htp_tensor_is_extended(dst)) {
+                    dma_sync_write(th->dma_q, dst_addr, scratch, row_bytes);
+                } else {
+                    memcpy((uint8_t *) (uintptr_t) dst_addr, scratch, row_bytes);
+                }
+            }
+            continue;
+        }
+
+        const uint8_t * src_row = (const uint8_t *) (uintptr_t) src_addr;
+        uint8_t * dst_row_base  = (uint8_t *) (uintptr_t) dst_base;
 
         // Tile along dimension 0
         for (uint32_t i0 = 0; i0 < nr0; i0++) {
-            uint8_t * dst_ptr = dst_base + i0 * ne00 * nb0;
+            uint8_t * dst_ptr = dst_row_base + i0 * ne00 * nb0;
             memcpy(dst_ptr, src_row, row_bytes);
         }
     }
@@ -112,9 +138,7 @@ int op_repeat(struct htp_ops_context * octx) {
             return HTP_STATUS_NO_SUPPORT;
     }
 
-    if (htp_tensor_is_extended(src0) || htp_tensor_is_extended(dst)) {
-        return HTP_STATUS_NO_SUPPORT;
-    }
+    const int bounce = htp_tensor_is_extended(src0) || htp_tensor_is_extended(dst);
 
     const struct htp_repeat_kernel_params * kparams =
         (const struct htp_repeat_kernel_params *) octx->kernel_params;
@@ -143,6 +167,15 @@ int op_repeat(struct htp_ops_context * octx) {
 
     const uint32_t n_hvx = octx->n_hvx;
 
+    size_t scratch_stride = 0;
+    if (bounce) {
+        scratch_stride = hex_round_up(src0->ne[0] * type_size, 128);
+        if (!octx->ctx->vtcm_base || scratch_stride == 0 || scratch_stride * n_hvx > octx->ctx->vtcm_size) {
+            FARF(ERROR, "repeat: extended row %zu does not fit VTCM\n", scratch_stride);
+            return HTP_STATUS_NO_SUPPORT;
+        }
+    }
+
     struct htp_repeat_context rctx = {
         .octx             = octx,
         .kparams          = kparams,
@@ -150,6 +183,8 @@ int op_repeat(struct htp_ops_context * octx) {
         .total_dst_rows   = nrows,
         .row_start        = row_start,
         .type_size        = type_size,
+        .scratch_stride   = scratch_stride,
+        .bounce           = bounce,
     };
 
     FARF(HIGH, "repeat: (%ux%ux%ux%u) -> (%ux%ux%ux%u) nr=(%u,%u,%u,%u)\n",
