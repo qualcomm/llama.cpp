@@ -771,6 +771,7 @@ struct vk_device_struct {
     bool shader_64b_indexing;
 
     bool integer_dot_product;
+    bool broken_8bit_vectors {};
     // Which 4x8 bit packed integer dot products are accelerated
     bool integer_dot_signed {};
     bool integer_dot_mixed {};

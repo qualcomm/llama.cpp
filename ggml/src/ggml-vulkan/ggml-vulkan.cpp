@@ -4588,6 +4588,30 @@ static bool ggml_vk_has_rebar(const vk::PhysicalDevice & physical_device) {
     return false;
 }
 
+// No released Qualcomm driver is known to be fixed yet; GGML_VK_ALLOW_BROKEN_8BIT_VECTORS skips the check.
+static bool ggml_vk_qualcomm_8bit_vector_bug(vk::DriverId driver_id) {
+    return driver_id == vk::DriverId::eQualcommProprietary &&
+           getenv("GGML_VK_ALLOW_BROKEN_8BIT_VECTORS") == nullptr;
+}
+
+// Ops that still go wrong on such a driver once the integer dot product path is off.
+static bool ggml_vk_op_needs_8bit_vectors(const ggml_tensor * op) {
+    switch (op->op) {
+        case GGML_OP_MUL_MAT:
+        case GGML_OP_MUL_MAT_ID:
+        case GGML_OP_GET_ROWS:
+        case GGML_OP_CPY:
+        case GGML_OP_CONT:
+        case GGML_OP_DUP:
+            return op->src[0]->type == GGML_TYPE_Q8_0 || op->src[0]->type == GGML_TYPE_IQ2_XXS ||
+                   op->src[0]->type == GGML_TYPE_IQ4_XS;
+        case GGML_OP_FLASH_ATTN_EXT:
+            return ggml_is_quantized(op->src[1]->type) || ggml_is_quantized(op->src[2]->type);
+        default:
+            return false;
+    }
+}
+
 static void ggml_vk_device_start_keepalive(vk_device& device);
 
 vk_device ggml_vk_get_device(size_t idx) {
@@ -4902,6 +4926,17 @@ vk_device ggml_vk_get_device(size_t idx) {
         device->integer_dot_mixed = shader_integer_dot_product_props.integerDotProduct4x8BitPackedMixedSignednessAccelerated;
         device->integer_dot_unsigned = shader_integer_dot_product_props.integerDotProduct4x8BitPackedUnsignedAccelerated;
         device->integer_dot_product = device->integer_dot_product && (device->integer_dot_signed || device->integer_dot_mixed);
+
+        // Qualcomm's shader compiler miscompiles unpack8()/pack32() on 8-bit vectors (#28290). They are used
+        // by the q8_1 quantization of src1 and by the dequantization of some quantized types, so skip the
+        // integer dot product path and leave the affected types to other backends.
+        device->broken_8bit_vectors = ggml_vk_qualcomm_8bit_vector_bug(device->driver_id);
+        if (device->broken_8bit_vectors) {
+            device->integer_dot_product = false;
+            GGML_LOG_WARN("ggml_vulkan: %s: driver miscompiles 8-bit vectors, integer dot product disabled and "
+                          "q8_0/iq2_xxs/iq4_xs weights and quantized KV flash attention left to other backends "
+                          "(the OpenCL backend supports them)\n", device->properties.deviceName.data());
+        }
 
         device->min_imported_host_pointer_alignment = external_memory_host_props.minImportedHostPointerAlignment;
 
@@ -5852,7 +5887,8 @@ static void ggml_vk_print_gpu_info(size_t idx) {
     integer_dot_product = integer_dot_product
                        && (shader_integer_dot_product_props.integerDotProduct4x8BitPackedSignedAccelerated ||
                            shader_integer_dot_product_props.integerDotProduct4x8BitPackedMixedSignednessAccelerated)
-                       && shader_integer_dot_product_features.shaderIntegerDotProduct;
+                       && shader_integer_dot_product_features.shaderIntegerDotProduct
+                       && !ggml_vk_qualcomm_8bit_vector_bug(driver_props.driverID);
 
     coopmat_support = coopmat_support
 #if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
@@ -16763,6 +16799,9 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
         }
     }
     if (!non_compute && !tensor_size_supported(ggml_nbytes(op))) {
+        return false;
+    }
+    if (device->broken_8bit_vectors && ggml_vk_op_needs_8bit_vectors(op)) {
         return false;
     }
 
