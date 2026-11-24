@@ -1509,6 +1509,10 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemm_coopk_q4_0_q8_1_dp4a_c2 = nullptr;
     int       nsg_coopk_dp4a_q4_0  = 8;
     int       rows_coopk_dp4a_q4_0 = 4;
+    cl_kernel kernel_gemm_coopk_q4_0_q8_1_dp4a_bin_c8 = nullptr;
+    cl_kernel kernel_quant_a_q8_1_eo = nullptr;
+    int       nsg_coopk_dp4a_q4_0_bin_c8  = 6;
+    int       rows_coopk_dp4a_q4_0_bin_c8 = 4;
     cl_kernel kernel_gemm_coopk_q4_k_q8_1_dp4a_c4 = nullptr;
     cl_kernel kernel_gemm_coopk_q4_k_q8_1_dp4a_c2 = nullptr;
     int       nsg_coopk_dp4a_q4_k  = 8;
@@ -1538,6 +1542,8 @@ struct ggml_backend_opencl_context {
     ~ggml_backend_opencl_context() {
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
         for (cl_kernel kernel : {
+                kernel_gemm_coopk_q4_0_q8_1_dp4a_bin_c8,
+                kernel_quant_a_q8_1_eo,
                 kernel_gemm_coopk_q4_k_q8_1_dp4a_bin_c8,
                 kernel_quant_a_q8_1_k4,
                 kernel_gemm_coopk_q6_k_q8_1_dp4a_bin_c8,
@@ -1915,6 +1921,47 @@ static cl_program ggml_cl_build_program_coopk(ggml_backend_opencl_context * back
     return nullptr;
 }
 
+static void load_cl_kernel_coopk_q4_0_bin_c8(ggml_backend_opencl_context * backend_ctx) {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+    const std::string kernel_src {
+        #include "gemm_coopk_q4_0_q8_1_dp4a_bin_c8.cl.h"
+    };
+#else
+    const std::string kernel_src = read_file("gemm_coopk_q4_0_q8_1_dp4a_bin_c8.cl");
+#endif
+    cl_program program = ggml_cl_build_program_coopk(backend_ctx, kernel_src.c_str(),
+        "kernel_gemm_coopk_q4_0_q8_1_dp4a_bin_c8",
+        backend_ctx->kernel_compile_opts + " -DCOOPK_ROWS=" + std::to_string(backend_ctx->rows_coopk_dp4a_q4_0_bin_c8),
+        backend_ctx->nsg_coopk_dp4a_q4_0_bin_c8, false);
+    if (program == nullptr) {
+        return;
+    }
+
+    cl_int err;
+
+    cl_kernel gemm = clCreateKernel(program, "kernel_gemm_coopk_q4_0_q8_1_dp4a_bin_c8", &err);
+    if (err != CL_SUCCESS) {
+        CL_CHECK(clReleaseProgram(program));
+        return;
+    }
+
+    cl_kernel quant = clCreateKernel(program, "kernel_quant_a_q8_1_eo", &err);
+    CL_CHECK(clReleaseProgram(program));
+    if (err != CL_SUCCESS) {
+        CL_CHECK(clReleaseKernel(gemm));
+        return;
+    }
+
+    if (backend_ctx->get_kernel_workgroup_size(quant) < 64) {
+        CL_CHECK(clReleaseKernel(gemm));
+        CL_CHECK(clReleaseKernel(quant));
+        return;
+    }
+
+    backend_ctx->kernel_gemm_coopk_q4_0_q8_1_dp4a_bin_c8 = gemm;
+    backend_ctx->kernel_quant_a_q8_1_eo = quant;
+}
+
 static void load_cl_kernel_coopk_q4_k_bin_c8(ggml_backend_opencl_context * backend_ctx) {
 #ifdef GGML_OPENCL_EMBED_KERNELS
     const std::string kernel_src {
@@ -2047,6 +2094,15 @@ static void load_cl_kernels_gemm_coopk(ggml_backend_opencl_context * backend_ctx
                                  backend_ctx->rows_coopk_dp4a_q4_0, backend_ctx->nsg_coopk_dp4a_q4_0,
                                  backend_ctx->kernel_gemm_coopk_q4_0_q8_1_dp4a_c4,
                                  backend_ctx->kernel_gemm_coopk_q4_0_q8_1_dp4a_c2);
+
+        static const bool use_coopk_bin = [] {
+            const char * env = getenv("GGML_OPENCL_COOPK_Q4_0_BIN");
+            return !env || !*env || atoi(env) != 0;
+        }();
+
+        if (use_adreno_bin_kernels(backend_ctx) && use_coopk_bin) {
+            load_cl_kernel_coopk_q4_0_bin_c8(backend_ctx);
+        }
         GGML_LOG_CONT(".");
     }
 
@@ -26012,6 +26068,108 @@ static bool ggml_cl_mul_mat_coopmat(ggml_backend_opencl_context * backend_ctx, c
     return true;
 }
 
+static bool ggml_cl_coopk_c8_image(ggml_backend_opencl_context * backend_ctx, ggml_cl_buffer & buffer, size_t bytes,
+                                   cl_mem & image, cl_mem & image_buffer, size_t & image_bytes);
+static int ggml_cl_coopk_ksplit(const ggml_backend_opencl_context * backend_ctx, int base_wg, int n_blocks);
+
+// q4_0 verify widths 2..8 on bin weights: the bin GEMM pads N to a full column tile, while the c8
+// GEMM computes eight columns and splits K across subgroups and workgroups. Returns false when the
+// shape or the image limits do not fit, and the caller falls through to the bin GEMM.
+static bool ggml_cl_mul_mat_q4_0_f32_coopk_bin_c8(ggml_backend_opencl_context * backend_ctx, const ggml_tensor * src0,
+                                                  const ggml_tensor * src1, ggml_tensor * dst) {
+    const int M = src0->ne[1];
+    const int K = src0->ne[0];
+    const int N = dst->ne[1];
+    const int rows = backend_ctx->rows_coopk_dp4a_q4_0_bin_c8;
+
+    if (backend_ctx->kernel_gemm_coopk_q4_0_q8_1_dp4a_bin_c8 == nullptr ||
+        N < 2 || N > 8 || M % (64 * rows) != 0 || K % 32 != 0 ||
+        src0->ne[2] != 1 || src0->ne[3] != 1 || src0->view_src != nullptr ||
+        src1->ne[2] != 1 || src1->ne[3] != 1 || dst->ne[2] != 1 || dst->ne[3] != 1 ||
+        !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) {
+        return false;
+    }
+
+    cl_context context = backend_ctx->context;
+    ggml_tensor_extra_cl      * extra1      = (ggml_tensor_extra_cl *)src1->extra;
+    ggml_tensor_extra_cl      * extrad      = (ggml_tensor_extra_cl *)dst->extra;
+    ggml_tensor_extra_cl_q4_0 * extra0_q4_0 = (ggml_tensor_extra_cl_q4_0 *)src0->extra;
+    const cl_ulong offset1 = extra1->offset + src1->view_offs;
+    const cl_ulong offsetd = extrad->offset + dst->view_offs;
+
+    const int    kb       = K / 32;
+    const size_t qa_bytes = (size_t)8 * K;
+    const size_t ds_bytes = (size_t)8 * kb * sizeof(cl_half);
+
+    backend_ctx->prealloc_moe_qa.allocate(context, qa_bytes);
+    backend_ctx->prealloc_moe_da.allocate(context, ds_bytes);
+
+    if (!ggml_cl_coopk_c8_image(backend_ctx, backend_ctx->prealloc_moe_qa, qa_bytes,
+                                backend_ctx->coopk_c8_qa_image, backend_ctx->coopk_c8_qa_buffer, backend_ctx->coopk_c8_qa_image_bytes) ||
+        !ggml_cl_coopk_c8_image(backend_ctx, backend_ctx->prealloc_moe_da, ds_bytes,
+                                backend_ctx->coopk_c8_ds_image, backend_ctx->coopk_c8_ds_buffer, backend_ctx->coopk_c8_ds_image_bytes)) {
+        return false;
+    }
+
+    const int n_blocks = N * kb;
+
+    cl_kernel quant = backend_ctx->kernel_quant_a_q8_1_eo;
+    CL_CHECK(clSetKernelArg(quant, 0, sizeof(cl_mem),   &extra1->data_device));
+    CL_CHECK(clSetKernelArg(quant, 1, sizeof(cl_mem),   &backend_ctx->prealloc_moe_qa.buffer));
+    CL_CHECK(clSetKernelArg(quant, 2, sizeof(cl_mem),   &backend_ctx->prealloc_moe_da.buffer));
+    CL_CHECK(clSetKernelArg(quant, 3, sizeof(cl_ulong), &offset1));
+    CL_CHECK(clSetKernelArg(quant, 4, sizeof(int),      &n_blocks));
+    CL_CHECK(clSetKernelArg(quant, 5, sizeof(int),      &kb));
+
+    size_t quant_local[]  = { 64 };
+    size_t quant_global[] = { (size_t)CEIL_DIV(8 * kb, 64) * 64 };
+    backend_ctx->enqueue_ndrange_kernel(quant, 1, quant_global, quant_local, dst);
+
+    int ksplit = ggml_cl_coopk_ksplit(backend_ctx, M / (64 * rows), kb);
+    if (backend_ctx->kernel_gemv_splitk_reduce_f32 == nullptr) {
+        ksplit = 1;
+    }
+
+    cl_mem   out        = extrad->data_device;
+    cl_ulong out_offset = offsetd;
+    if (ksplit > 1) {
+        backend_ctx->prealloc_splitk_partial.allocate(context, (size_t)ksplit * M * N * sizeof(float));
+        out        = backend_ctx->prealloc_splitk_partial.buffer;
+        out_offset = 0;
+    }
+
+    const size_t nsg  = backend_ctx->nsg_coopk_dp4a_q4_0_bin_c8;
+    cl_kernel    gemm = backend_ctx->kernel_gemm_coopk_q4_0_q8_1_dp4a_bin_c8;
+    CL_CHECK(clSetKernelArg(gemm, 0, sizeof(cl_mem),   &extra0_q4_0->q));
+    CL_CHECK(clSetKernelArg(gemm, 1, sizeof(cl_mem),   &extra0_q4_0->d));
+    CL_CHECK(clSetKernelArg(gemm, 2, sizeof(cl_mem),   &backend_ctx->coopk_c8_qa_image));
+    CL_CHECK(clSetKernelArg(gemm, 3, sizeof(cl_mem),   &backend_ctx->coopk_c8_ds_image));
+    CL_CHECK(clSetKernelArg(gemm, 4, sizeof(cl_mem),   &out));
+    CL_CHECK(clSetKernelArg(gemm, 5, sizeof(cl_ulong), &out_offset));
+    CL_CHECK(clSetKernelArg(gemm, 6, sizeof(int),      &M));
+    CL_CHECK(clSetKernelArg(gemm, 7, sizeof(int),      &K));
+    CL_CHECK(clSetKernelArg(gemm, 8, sizeof(int),      &N));
+    CL_CHECK(clSetKernelArg(gemm, 9, sizeof(int),      &ksplit));
+
+    size_t local[]  = { 64, nsg, 1 };
+    size_t global[] = { (size_t)M / rows, nsg * ksplit, 1 };
+    backend_ctx->enqueue_ndrange_kernel(gemm, 3, global, local, dst);
+
+    if (ksplit > 1) {
+        const int rows_out = M * N;
+        cl_kernel reduce = backend_ctx->kernel_gemv_splitk_reduce_f32;
+        CL_CHECK(clSetKernelArg(reduce, 0, sizeof(cl_mem),   &out));
+        CL_CHECK(clSetKernelArg(reduce, 1, sizeof(cl_mem),   &extrad->data_device));
+        CL_CHECK(clSetKernelArg(reduce, 2, sizeof(cl_ulong), &offsetd));
+        CL_CHECK(clSetKernelArg(reduce, 3, sizeof(int),      &rows_out));
+        CL_CHECK(clSetKernelArg(reduce, 4, sizeof(int),      &ksplit));
+        size_t reduce_local[]  = { 64, 1, 1 };
+        size_t reduce_global[] = { (size_t)CEIL_DIV(rows_out, 64) * 64, 1, 1 };
+        backend_ctx->enqueue_ndrange_kernel(reduce, 3, reduce_global, reduce_local, dst);
+    }
+    return true;
+}
+
 static void ggml_cl_mul_mat_q4_0_f32_adreno_ila(ggml_backend_t backend, const ggml_tensor * src0,
                                                 const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_ASSERT(src0);
@@ -26048,6 +26206,10 @@ static void ggml_cl_mul_mat_q4_0_f32_adreno_ila(ggml_backend_t backend, const gg
     int M = ne01;
     int N = ne1;
     int K = ne00;
+
+    if (ggml_cl_mul_mat_q4_0_f32_coopk_bin_c8(backend_ctx, src0, src1, dst)) {
+        return;
+    }
 
     if (ne1 == 1) {
         cl_mem b_sub_buf = nullptr;
@@ -26340,7 +26502,7 @@ static void ggml_cl_mul_mat_q4_0_f32_adreno(ggml_backend_t backend, const ggml_t
                 warned = true;
             }
         }
-        // This bin layout is not supported by CoopK.
+        // The narrow CoopK kernels do not read this layout; the ila path has its own c8 GEMM.
         ggml_cl_mul_mat_q4_0_f32_adreno_ila(backend, src0, src1, dst);
         return;
     }
