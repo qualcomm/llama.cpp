@@ -2236,6 +2236,8 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemm_cok8_q4_0_q8_1_dp4a = nullptr;   // q4_0 8-column dp4a cok, ne1 5..8
     cl_kernel kernel_gemm_cok8_q4_0_q8_1_dp4a_bin = nullptr; // same, bin (32b-transposed) weights
     int q40_cok8_bin_nsg = 6;
+    cl_kernel kernel_gemm_cok8_q4_0_q8_1_dp4a_bin_r2 = nullptr; // bin, two rows per lane (rows % 128)
+    int q40_cok8_bin_r2_nsg = 6;
     cl_kernel kernel_quant_a_q8_1_eo          = nullptr;   // its even/odd activation quant
     int       q40_cok8_nsg  = 6;
     int       q40_cok8_rows = 4;
@@ -4672,6 +4674,20 @@ static void ggml_cl_cok_build_q40_cok8(ggml_backend_opencl_context * backend_ctx
             backend_ctx->kernel_gemm_cok8_q4_0_q8_1_dp4a_bin = (err == CL_SUCCESS) ? kb : nullptr;
             backend_ctx->q40_cok8_bin_nsg = nsg_bin;
             CL_CHECK(clReleaseProgram(pb));
+        }
+        // A two-row bin build for weights whose row count is a multiple of 128 but not of the
+        // four-row tile (Qwen4-Turbo's 384-row projections); they would otherwise take the bin GEMM.
+        if (rows != 2) {
+            int nsg_r2 = nsg;
+            cl_program pr2 = ggml_cl_build_cok_program(
+                backend_ctx, kernel_src.c_str(),
+                compile_opts + " -DCOK_Q_BIN=1 -DCOK_ROWS=2", nsg_r2, &nsg_r2);
+            if (pr2 != nullptr) {
+                cl_kernel kr2 = clCreateKernel(pr2, "kernel_gemm_cok8_q4_0_q8_1_dp4a", &err);
+                backend_ctx->kernel_gemm_cok8_q4_0_q8_1_dp4a_bin_r2 = (err == CL_SUCCESS) ? kr2 : nullptr;
+                backend_ctx->q40_cok8_bin_r2_nsg = nsg_r2;
+                CL_CHECK(clReleaseProgram(pr2));
+            }
         }
     }
     backend_ctx->kernel_quant_a_q8_1_eo          = (kk && kq) ? kq : nullptr;
@@ -18975,6 +18991,27 @@ static bool ggml_cl_cok8_dp4a_on(const ggml_backend_opencl_context * backend_ctx
         && ne1 >= 5 && ne1 <= 8
         && rows > 0 && (ne01 % (64 * rows)) == 0
         && (ne00 % 32) == 0;
+}
+
+// The bin cok8 build that takes this weight: the default rows-per-lane build, or the two-row one
+// for row counts that are a multiple of 128 but not of the default tile.
+static bool ggml_cl_q40_cok8_bin_pick(const ggml_backend_opencl_context * backend_ctx, int64_t ne01, int64_t ne00,
+                                      cl_kernel & kernel, int & rows, int & nsg) {
+    if (backend_ctx->kernel_gemm_cok8_q4_0_q8_1_dp4a_bin != nullptr &&
+        ggml_cl_cok8_dp4a_on(backend_ctx, 5, ne01, ne00, backend_ctx->q40_cok8_rows)) {
+        kernel = backend_ctx->kernel_gemm_cok8_q4_0_q8_1_dp4a_bin;
+        rows   = backend_ctx->q40_cok8_rows;
+        nsg    = backend_ctx->q40_cok8_bin_nsg;
+        return true;
+    }
+    if (backend_ctx->kernel_gemm_cok8_q4_0_q8_1_dp4a_bin_r2 != nullptr &&
+        ggml_cl_cok8_dp4a_on(backend_ctx, 5, ne01, ne00, 2)) {
+        kernel = backend_ctx->kernel_gemm_cok8_q4_0_q8_1_dp4a_bin_r2;
+        rows   = 2;
+        nsg    = backend_ctx->q40_cok8_bin_r2_nsg;
+        return true;
+    }
+    return false;
 }
 
 // q5_K eight-column cok+dp4a (ne1 = 5..8), the q4_0 gate at the q5_K kernel's fixed
@@ -38384,14 +38421,14 @@ static void ggml_cl_mul_mat_q4_0_f32_adreno_ila(ggml_backend_t backend, const gg
     // eight columns regardless, and still beats the noshuffle dispatch at 2..4).
     static const bool bin_cok_off  = ggml_cl_env_flag_zero("GGML_OPENCL_Q4_0_BIN_COK");
     static const int  bin_cok_minn = ggml_cl_env_int("GGML_OPENCL_Q4_0_BIN_COK_MINN", 2);
+    cl_kernel ck8   = nullptr;
+    int       rows8 = 0;
+    int       nsg8  = 0;
     if (!bin_cok_off && ne1 >= bin_cok_minn && ne1 <= 8 &&
         ggml_cl_cok_have_q40_cok8(backend_ctx) &&
-        ggml_cl_cok8_dp4a_on(backend_ctx, 5, ne01, ne00, backend_ctx->q40_cok8_rows) &&
-        backend_ctx->kernel_gemm_cok8_q4_0_q8_1_dp4a_bin != nullptr) {
+        ggml_cl_q40_cok8_bin_pick(backend_ctx, ne01, ne00, ck8, rows8, nsg8)) {
 
             const int K8 = (int)ne00, kb8 = K8 / 32;
-            const int rows8 = backend_ctx->q40_cok8_rows;
-            const int nsg8  = backend_ctx->q40_cok8_bin_nsg;
 
             cl_mem a_sub8 = nullptr;
             region.origin = offset1;
@@ -38447,7 +38484,6 @@ static void ggml_cl_mul_mat_q4_0_f32_adreno_ila(ggml_backend_t backend, const gg
             }
 
             const cl_int ksplit8_arg = ksplit8;
-            cl_kernel ck8 = backend_ctx->kernel_gemm_cok8_q4_0_q8_1_dp4a_bin;
             CL_CHECK(clSetKernelArg(ck8, 0, sizeof(cl_mem),   &extra0_q4_0->q));
             CL_CHECK(clSetKernelArg(ck8, 1, sizeof(cl_mem),   &extra0_q4_0->d));
             CL_CHECK(clSetKernelArg(ck8, 2, sizeof(cl_mem),   &backend_ctx->q40_cok8_qa_img));
