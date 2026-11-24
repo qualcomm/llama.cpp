@@ -11732,6 +11732,23 @@ inline bool use_adreno_kernels(const ggml_backend_opencl_context *backend_ctx, c
     if (k_floor_256 && threshold_ne0 > 256) {
         threshold_ne0 = 256;
     }
+    // Row floor 384 for q4_0 on X2E: Qwen4's hc projections are 384-row q4_0 weights (two per
+    // layer). At 512 they miss the dp4a GEMM and the noshuffle GEMV and run the generic l4_lm
+    // matmul in prefill and the flat GEMV in decode. q4_0 only: the other types would need the
+    // q4_K split-K GEMV to keep their decode speed at 384 rows.
+    if (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E && tensor->type == GGML_TYPE_Q4_0 && threshold_ne1 > 384) {
+        threshold_ne1 = 384;
+    }
+    // GGML_OPENCL_ADRENO_MIN_NE0/NE1 override the floors, e.g. to run small test shapes
+    // through the Adreno kernels. Read once: this runs for every matmul dispatch.
+    static const char * const min_ne0_env = getenv("GGML_OPENCL_ADRENO_MIN_NE0");
+    static const char * const min_ne1_env = getenv("GGML_OPENCL_ADRENO_MIN_NE1");
+    if (min_ne0_env) {
+        threshold_ne0 = atoi(min_ne0_env);
+    }
+    if (min_ne1_env) {
+        threshold_ne1 = atoi(min_ne1_env);
+    }
     bool threashold_ok = tensor->ne[0] >= threshold_ne0 && tensor->ne[1] >= threshold_ne1 &&
             tensor->ne[2] == 1 && tensor->ne[3] == 1;
 
