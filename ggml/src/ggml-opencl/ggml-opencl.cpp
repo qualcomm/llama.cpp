@@ -1513,6 +1513,8 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_quant_a_q8_1_eo = nullptr;
     int       nsg_coopk_dp4a_q4_0_bin_c8  = 6;
     int       rows_coopk_dp4a_q4_0_bin_c8 = 4;
+    cl_kernel kernel_gemm_coopk_q4_0_q8_1_dp4a_bin_c8_r2 = nullptr;
+    int       nsg_coopk_dp4a_q4_0_bin_c8_r2 = 6;
     cl_kernel kernel_gemm_coopk_q4_k_q8_1_dp4a_c4 = nullptr;
     cl_kernel kernel_gemm_coopk_q4_k_q8_1_dp4a_c2 = nullptr;
     int       nsg_coopk_dp4a_q4_k  = 8;
@@ -1543,6 +1545,7 @@ struct ggml_backend_opencl_context {
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
         for (cl_kernel kernel : {
                 kernel_gemm_coopk_q4_0_q8_1_dp4a_bin_c8,
+                kernel_gemm_coopk_q4_0_q8_1_dp4a_bin_c8_r2,
                 kernel_quant_a_q8_1_eo,
                 kernel_gemm_coopk_q4_k_q8_1_dp4a_bin_c8,
                 kernel_quant_a_q8_1_k4,
@@ -1960,6 +1963,22 @@ static void load_cl_kernel_coopk_q4_0_bin_c8(ggml_backend_opencl_context * backe
 
     backend_ctx->kernel_gemm_coopk_q4_0_q8_1_dp4a_bin_c8 = gemm;
     backend_ctx->kernel_quant_a_q8_1_eo = quant;
+
+    // Two rows per lane for weights whose row count is a multiple of 128 but not of the
+    // four-row tile (Qwen4-Turbo's 384-row projections). It reads the same activations.
+    if (backend_ctx->rows_coopk_dp4a_q4_0_bin_c8 != 2) {
+        cl_program program_r2 = ggml_cl_build_program_coopk(backend_ctx, kernel_src.c_str(),
+            "kernel_gemm_coopk_q4_0_q8_1_dp4a_bin_c8",
+            backend_ctx->kernel_compile_opts + " -DCOOPK_ROWS=2",
+            backend_ctx->nsg_coopk_dp4a_q4_0_bin_c8_r2, false);
+        if (program_r2 != nullptr) {
+            cl_kernel gemm_r2 = clCreateKernel(program_r2, "kernel_gemm_coopk_q4_0_q8_1_dp4a_bin_c8", &err);
+            CL_CHECK(clReleaseProgram(program_r2));
+            if (err == CL_SUCCESS) {
+                backend_ctx->kernel_gemm_coopk_q4_0_q8_1_dp4a_bin_c8_r2 = gemm_r2;
+            }
+        }
+    }
 }
 
 static void load_cl_kernel_coopk_q4_k_bin_c8(ggml_backend_opencl_context * backend_ctx) {
@@ -26097,9 +26116,17 @@ static bool ggml_cl_mul_mat_q4_0_f32_coopk_bin_c8(ggml_backend_opencl_context * 
     const int M = src0->ne[1];
     const int K = src0->ne[0];
     const int N = dst->ne[1];
-    const int rows = backend_ctx->rows_coopk_dp4a_q4_0_bin_c8;
+    int       rows = backend_ctx->rows_coopk_dp4a_q4_0_bin_c8;
+    size_t    nsg  = backend_ctx->nsg_coopk_dp4a_q4_0_bin_c8;
+    cl_kernel gemm = backend_ctx->kernel_gemm_coopk_q4_0_q8_1_dp4a_bin_c8;
+    // a row count that is a multiple of 128 but not of the four-row tile takes the two-row build
+    if (M % (64 * rows) != 0 && backend_ctx->kernel_gemm_coopk_q4_0_q8_1_dp4a_bin_c8_r2 != nullptr) {
+        rows = 2;
+        nsg  = backend_ctx->nsg_coopk_dp4a_q4_0_bin_c8_r2;
+        gemm = backend_ctx->kernel_gemm_coopk_q4_0_q8_1_dp4a_bin_c8_r2;
+    }
 
-    if (backend_ctx->kernel_gemm_coopk_q4_0_q8_1_dp4a_bin_c8 == nullptr ||
+    if (gemm == nullptr ||
         N < 2 || N > 8 || M % (64 * rows) != 0 || K % 32 != 0 ||
         src0->ne[2] != 1 || src0->ne[3] != 1 || src0->view_src != nullptr ||
         src1->ne[2] != 1 || src1->ne[3] != 1 || dst->ne[2] != 1 || dst->ne[3] != 1 ||
@@ -26155,8 +26182,6 @@ static bool ggml_cl_mul_mat_q4_0_f32_coopk_bin_c8(ggml_backend_opencl_context * 
         out_offset = 0;
     }
 
-    const size_t nsg  = backend_ctx->nsg_coopk_dp4a_q4_0_bin_c8;
-    cl_kernel    gemm = backend_ctx->kernel_gemm_coopk_q4_0_q8_1_dp4a_bin_c8;
     CL_CHECK(clSetKernelArg(gemm, 0, sizeof(cl_mem),   &extra0_q4_0->q));
     CL_CHECK(clSetKernelArg(gemm, 1, sizeof(cl_mem),   &extra0_q4_0->d));
     CL_CHECK(clSetKernelArg(gemm, 2, sizeof(cl_mem),   &backend_ctx->coopk_c8_qa_image));
