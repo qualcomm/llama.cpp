@@ -992,6 +992,11 @@ struct llama_model {
     // for quantize-stats only
     std::vector<std::pair<std::string, struct ggml_tensor *>> tensors_by_name;
 
+    // weight -> "<name>.scale" (per-tensor {1} or per-expert {n_expert}), applied by the matmul builders
+    std::unordered_map<const ggml_tensor *, ggml_tensor *> w_scales;
+
+    ggml_tensor * get_w_scale(const ggml_tensor * w) const;
+
     // for keeping track of associated LoRA adapters
     std::unordered_set<llama_adapter_lora *> loras;
 
@@ -1062,6 +1067,7 @@ struct llama_model {
     // model must define these
     virtual void load_arch_hparams(llama_model_loader & ml) = 0;
     virtual void load_arch_tensors(llama_model_loader & ml) = 0;
+    virtual void post_arch_tensors(llama_model_loader &) {}
     virtual std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const = 0;
 
 protected:

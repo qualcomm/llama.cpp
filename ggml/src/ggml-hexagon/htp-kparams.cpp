@@ -3521,7 +3521,9 @@ static bool htp_kparams_solve_pad(
     struct htp_pad_vtcm_layout layout;
     htp_pad_vtcm_layout_build(&layout, (uint32_t) src0->ne[0] * type_size, (uint32_t) dst->ne[0] * type_size, n_hvx);
 
-    const bool use_dma = (src0->nb[0] == type_size) && (src0->ne[0] >= 512) &&
+    // ne[0] >= 512 used to skip DMA for short rows. Relative-bias rows are 16 wide and live in a
+    // DMA64 weight buffer, and the non-DMA pad kernel cannot touch an extended pointer.
+    const bool use_dma = (src0->nb[0] == type_size) &&
                          (htp_session_vtcm_size(sess) >= layout.total_bytes);
 
     kparams->n_hvx      = n_hvx;
