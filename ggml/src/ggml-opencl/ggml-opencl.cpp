@@ -42347,10 +42347,17 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
         // GEMV only; tiled/o4/mc3 keep 4 (their reductions are hard-coded to 4).
         // Layout-safe: the base kernel derives its K-split from get_local_size(1)
         // and the packed block stride is a physical constant (independent of it).
-        // Opt-out: GGML_OPENCL_Q4K_GEMV_WIDE=0.
-        static const bool splitk_wide_env = []{
+        // Default on from X1E up. On the Adreno 750 (A7X, E031.45.02.13) the 16-subgroup
+        // workgroup returns wrong sums, with no error from the driver: every n=1 q4_K
+        // MUL_MAT fails (ERR 850-1400), and Qwen4-4B Q4_K_M decode ends in a GPU page fault
+        // in llama-bench. With 4 subgroups all 171 q4_K MUL_MAT cases pass there.
+        // GGML_OPENCL_Q4K_GEMV_WIDE=0/1 forces it either way on any device.
+        static const bool splitk_wide_env = [backend_ctx]{
             const char * e = std::getenv("GGML_OPENCL_Q4K_GEMV_WIDE");
-            return !e || e[0] == '\0' || e[0] != '0';
+            if (e && e[0] != '\0') {
+                return e[0] != '0';
+            }
+            return adreno_gen_level(backend_ctx->adreno_gen) >= GEN_LEVEL_X1E;
         }();
         const bool   splitk_wide = splitk_wide_env && !use_tiled && !use_q4k_o4 && !use_mc3;
         size_t       nsg_y       = splitk_wide ? 16 : 4;
