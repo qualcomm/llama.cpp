@@ -2203,6 +2203,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_fa_coopmat_dk128_sb_rows = nullptr;
     cl_kernel kernel_fa_coopmat_reduce = nullptr;
     bool fa_coopmat_possible = false;
+    bool coopmat_possible = false;      // the coopmat GEMMs will be built (decided before they are, for supports_op)
     ggml_cl_buffer prealloc_fa_cm_part_o;
     ggml_cl_buffer prealloc_fa_cm_part_ml;
     cl_kernel kernel_gemm_noshuffle_q5_k_f32_coopmat = nullptr;
@@ -15621,6 +15622,13 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
         backend_ctx->fa_coopmat_possible =
             strstr(ext_buffer.data(), "cl_qcom_kernel_cooperative_matrix") != NULL &&
             strstr(backend_ctx->device_name.c_str(), "850") != NULL && !(e && e[0] == '0');
+        const char * ec = getenv("GGML_OPENCL_COOPMAT");
+        // the conditions load_cl_kernels_coopmat builds the coopmat GEMMs under
+        backend_ctx->coopmat_possible =
+            backend_ctx->gpu_family == GPU_FAMILY::ADRENO &&
+            strstr(ext_buffer.data(), "cl_qcom_kernel_cooperative_matrix") != NULL &&
+            strstr(backend_ctx->device_name.c_str(), "850") != NULL &&
+            !(ec != nullptr && ec[0] != '\0' && atoi(ec) == 0);
         GGML_LOG_INFO("ggml_opencl: cl_qcom_kernel_cooperative_matrix %s, coopmat FA %s\n",
             strstr(ext_buffer.data(), "cl_qcom_kernel_cooperative_matrix") ? "present" : "absent",
             backend_ctx->fa_coopmat_possible ? "on" : "off");
@@ -21156,9 +21164,13 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                     // (gpt-oss is unaffected either way: its head is F16, which returns
                     // true far above this branch and was never pinned.)
                     const ggml_type ht = op->src[0]->type;
+                    // Q5_0 where its batched GEMM is the coopmat one (Adreno 850): gpt-oss-20b with a
+                    // Q5_0 head, 8-chunk wikitext PPL 447.50 (GPU head) vs 447.44 (CPU head) at -ub 512,
+                    // 445.19 vs 445.40 at -ub 4, and tg64 28.3 -> 33.6 t/s.
                     const bool lmhead_type_validated = (ht == GGML_TYPE_Q4_K ||
                                                         ht == GGML_TYPE_Q5_K ||
-                                                        ht == GGML_TYPE_Q6_K);
+                                                        ht == GGML_TYPE_Q6_K ||
+                                                        (ht == GGML_TYPE_Q5_0 && backend_ctx->coopmat_possible));
                     static const char * lmhead_env = std::getenv("GGML_OPENCL_Q6K_LMHEAD_GPU");
                     // DEFAULT-ON AGAIN (2026-08-14, second pass), X2E + validated types only.
                     //
