@@ -251,7 +251,7 @@ kernel void kernel_gemm_cok8_q6_k_q8_1_dp4a(
 #undef COK_STORE_COL
 }
 
-// The same kernel over the bin (32b-transposed) weight layout that the QPM kernel library's
+// The same kernel over the bin (32b-transposed) weight layout that the prebuilt kernel library's
 // q6_K GEMMs use. Only the weight fetches differ:
 //  - ql is one uint per (8 K, row): its low half is the noshuffle ushort of the first four
 //    K, its high half the next four.

@@ -1945,7 +1945,7 @@ kernel void kernel_gemm_noshuffle_q4_k_f32_cok_r8(
 #endif  // !Q4K_COK_MINIMAL
 
 
-// cok_r4_wimg_nr over the bin (32b-transposed) weight layout that the QPM kernel library's
+// cok_r4_wimg_nr over the bin (32b-transposed) weight layout that the prebuilt kernel library's
 // q4_K GEMMs use. There a uint32 texel holds one row's eight consecutive-K nibbles
 // (texel u*m + row for K-group u), where the noshuffle layout holds four per ushort. So a
 // lane's four rows for eight K-values are four texels, read once and used twice: the low

@@ -286,7 +286,7 @@ kernel void kernel_gemm_cok8_q5_k_q8_1_dp4a(
 #undef COK_STORE_COL
 }
 
-// The same GEMM for q4_K weights in the bin (32b-transposed) layout a QPM kernel library's
+// The same GEMM for q4_K weights in the bin (32b-transposed) layout a prebuilt kernel library's
 // q4_K GEMMs use: one uint per (8 K, row), nibble i = K i, the low half the first four K.
 // No high-bit plane, so each K-group's dp4a word is the nibble spread alone. The scale
 // bytes keep the noshuffle q4_K layout, byte b of (row, superblock) at [sb][b][row], so
