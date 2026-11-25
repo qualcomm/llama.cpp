@@ -71,23 +71,40 @@ inline void store_c16(global float * p, half16 h, int j0, int nv, int M) {
         acc = qcom_coop_mat_mulAdd(a0, b0, acc, CLK_COOPERATIVE_MATRIX_OPERAND_NONE_QCOM); \
         acc = qcom_coop_mat_mulAdd(a1, b1, acc, CLK_COOPERATIVE_MATRIX_OPERAND_NONE_QCOM); }
 
+#ifdef Q4K_Q16
+// Quants transposed as 16-bit words ([K/4][M] u16, the layout the plain Q4_K GEMV reads);
+// a 32-bit word of 8 nibbles is two consecutive 16-bit rows.
+#define Q_T ushort
+#define QW(i) ((uint)qp[(2 * (i)) * M] | ((uint)qp[(2 * (i) + 1) * M] << 16))
+#define Q_STEP (16 * M)
+#else
+// Quants transposed as 32-bit words ([K/8][M] u32, the binary-kernel layout).
+#define Q_T uint
+#define QW(i) qp[(i) * M]
+#define Q_STEP (8 * M)
+#endif
+
 #define STEP64(sa, na, sb_, nb_) { \
         uint8 qv; \
-        qv.s0 = qp[0]; \
-        qv.s1 = qp[M]; \
-        qv.s2 = qp[2 * M]; \
-        qv.s3 = qp[3 * M]; \
-        qv.s4 = qp[4 * M]; \
-        qv.s5 = qp[5 * M]; \
-        qv.s6 = qp[6 * M]; \
-        qv.s7 = qp[7 * M]; \
-        qp += 8 * M; \
+        qv.s0 = QW(0); \
+        qv.s1 = QW(1); \
+        qv.s2 = QW(2); \
+        qv.s3 = QW(3); \
+        qv.s4 = QW(4); \
+        qv.s5 = QW(5); \
+        qv.s6 = QW(6); \
+        qv.s7 = QW(7); \
+        qp += Q_STEP; \
         MMA_K32(qv.s0, qv.s1, qv.s2, qv.s3, sa, na, bp) \
         MMA_K32(qv.s4, qv.s5, qv.s6, qv.s7, sb_, nb_, bp + 2048) \
         bp += 4096; }
 
+#ifdef Q4K_Q16
+kernel void kernel_gemm_noshuffle_q4_k_f32_coopmat_q16(
+#else
 kernel void kernel_gemm_noshuffle_q4_k_f32_coopmat(
-        global const uint  * src0_q,   // A: q4_K quants,         [K/8][M] u32
+#endif
+        global const Q_T   * src0_q,   // A: q4_K quants, [K/8][M] u32 or [K/4][M] u16
         global const uchar * src0_s,   // A: 6-bit scale/min codes, [K/256*12][M] u8
         global const half  * src0_d,   // A: per-superblock scale, [K/256][M] f16
         global const half  * src0_dm,  // A: per-superblock min,   [K/256][M] f16
@@ -109,7 +126,7 @@ kernel void kernel_gemm_noshuffle_q4_k_f32_coopmat(
 
     const int lrow = row + lane;
 
-    global const uint * qp = src0_q + lrow;
+    global const Q_T * qp = src0_q + lrow;
     global const half * bp = src1 + (ulong)tn * (K / 16) * 1024;
 
     mat_c_t acc = qcom_coop_mat_init(0.0);

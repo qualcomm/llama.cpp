@@ -1520,6 +1520,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemm_noshuffle_q5_0_f32_coopmat = nullptr;
     cl_kernel kernel_gemm_noshuffle_q8_0_f32_coopmat = nullptr;
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_coopmat = nullptr;
+    cl_kernel kernel_gemm_noshuffle_q4_k_f32_coopmat_q16 = nullptr;
     cl_kernel kernel_gemm_noshuffle_q5_k_f32_coopmat = nullptr;
     cl_kernel kernel_gemm_noshuffle_q6_k_f32_coopmat = nullptr;
     cl_kernel kernel_gemm_coopk_q4_0_q8_1_dp4a_c4 = nullptr;
@@ -2234,6 +2235,14 @@ static void load_cl_kernels_coopmat(ggml_backend_opencl_context * backend_ctx) {
         if (prog) {
             CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_k_f32_coopmat = clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_f32_coopmat", &err), err));
             CL_CHECK(clReleaseProgram(prog));
+            GGML_LOG_CONT(".");
+        }
+        // the same kernel reading the 16-bit transposed quants of the plain Q4_K layout, so that loading
+        // coopmat does not move Q4_K weights to the binary layout (decode keeps its GEMV and fused GLU kernels)
+        cl_program prog16 = build_program_from_source(backend_ctx, kernel_src.c_str(), opts + " -DQ4K_Q16", false);
+        if (prog16) {
+            CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_k_f32_coopmat_q16 = clCreateKernel(prog16, "kernel_gemm_noshuffle_q4_k_f32_coopmat_q16", &err), err));
+            CL_CHECK(clReleaseProgram(prog16));
             GGML_LOG_CONT(".");
         }
     }
@@ -11702,8 +11711,9 @@ static bool ggml_opencl_can_fuse(const ggml_backend_opencl_context * backend_ctx
         if (ggml_get_op_params_i32(glu, 1) /* swapped */) {
             return false;
         }
-        // SWIGLU_OAI carries extra alpha/limit params -> not handled by the fused kernel
-        if (ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU_OAI) {
+        // SWIGLU only: with GEGLU (gemma-4 E4B Q4_K_M) the fused kernel's single-token perplexity is
+        // 442 vs 99 unfused on the Adreno 850, growing with the K split, while the op test passes
+        if (ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU) {
             return false;
         }
         // the fused kernel reads the standard noshuffle image layout; the tiled
@@ -12694,7 +12704,7 @@ inline bool use_q4_k_bin_kernels(const ggml_backend_opencl_context *backend_ctx,
     if (!backend_ctx->kernel_gemv_noshuffle_q4_k_f32_32b_trans ||
         !(backend_ctx->kernel_gemm_noshuffle_q4_k_f32_32b_trans_ila_a8_bin ||
           backend_ctx->kernel_gemm_noshuffle_q4_k_f32_32b_trans_ila_a7_bin ||
-          backend_ctx->kernel_gemm_noshuffle_q4_k_f32_coopmat)) {
+          (backend_ctx->kernel_gemm_noshuffle_q4_k_f32_coopmat && !backend_ctx->kernel_gemm_noshuffle_q4_k_f32_coopmat_q16))) {
         return false;
     }
     // bin kernels require ne2 == 1 and ne3 == 1 for weights
@@ -29373,6 +29383,16 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
     const bool use_bin = use_q4_k_bin_kernels(backend_ctx, src0);
 
     if (use_bin && ggml_cl_mul_mat_coopmat(backend_ctx, backend_ctx->kernel_gemm_noshuffle_q4_k_f32_coopmat,
+            { extra0_q4_k->q, extra0_q4_k->s, extra0_q4_k->d, extra0_q4_k->dm }, src1, dst, K, M, N)) {
+        return;
+    }
+
+    // coopmat GEMM on the plain (16-bit transposed) layout, so decode keeps the plain GEMV
+    // and the fused GLU GEMV. Large-M weights (e.g. a tied Q4_K output) are stored tiled or flat
+    // instead, the same weights the bin path excludes.
+    if (!use_bin && src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
+        !use_q4k_tiled(backend_ctx, src0) && !use_flat_gemv_for_large_m_q4_K(backend_ctx, src0) &&
+        ggml_cl_mul_mat_coopmat(backend_ctx, backend_ctx->kernel_gemm_noshuffle_q4_k_f32_coopmat_q16,
             { extra0_q4_k->q, extra0_q4_k->s, extra0_q4_k->d, extra0_q4_k->dm }, src1, dst, K, M, N)) {
         return;
     }
