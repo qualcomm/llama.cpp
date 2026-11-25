@@ -1,5 +1,8 @@
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
 #pragma OPENCL EXTENSION cl_qcom_kernel_cooperative_matrix : enable
+#ifdef FA_KV_ROWS
+#pragma OPENCL EXTENSION cl_khr_subgroups : enable
+#endif
 
 // Fused flash attention (Adreno 850) with cl_qcom_kernel_cooperative_matrix, DK = DV = 128.
 // One wave = 64 rows; lane r owns one (query token, head) row, so the online softmax is per lane.
@@ -15,6 +18,11 @@
 // mask f16 [n_kv, n_q]                element (j, i)    at mask + i*nbm1
 // dst  f32 [DV, n_head, n_q]          element (d, h, i) at dst + ((i*n_head + h)*DV + d)*4
 // n_kv must be a multiple of 64 (llama pads the KV to 256).
+//
+// n_slices > 1 (ggml_flash_attn_ext_rows): dim 1 also runs over the slices; slice s reads q and mask at
+// offsets s*nbq3 and s*nbm3 and writes dst rows s*n_q... With FA_KV_ROWS, mask column j of slice s uses
+// K/V row rows[j] (i32, at rows + s*nbr1; negative = padding, its mask entry is -inf). K and V are then
+// gathered into registers: a B operand built from registers is read as lane = column, element = row.
 
 #define DK 128
 #define DV 128
@@ -36,6 +44,37 @@ typedef union { half4096 v; struct { half16 h0, h1, h2, h3; } s; } c_row_t;
 #define NEG_BIG (-1e30f)
 #define Q_LD    (DK + 8)   // local Q row pitch in halves
 
+#ifdef FA_KV_ROWS
+// B (16 KV rows x 64 dims): KV rows rows[j .. j+15], dims d0 .. d0+63; lane = dim, element = KV row
+inline mat_b_t load_v_rows(global const half * vb, int ldv, global const int * rr, int j, int d0, int lane) {
+    const int16 r = max(vload16(0, rr + j), (int16)(0));
+    global const half * v = vb + d0 + lane;
+    a_row_t u;
+    u.h = (half16)(v[(ulong)r.s0 * ldv], v[(ulong)r.s1 * ldv], v[(ulong)r.s2 * ldv], v[(ulong)r.s3 * ldv],
+                   v[(ulong)r.s4 * ldv], v[(ulong)r.s5 * ldv], v[(ulong)r.s6 * ldv], v[(ulong)r.s7 * ldv],
+                   v[(ulong)r.s8 * ldv], v[(ulong)r.s9 * ldv], v[(ulong)r.sa * ldv], v[(ulong)r.sb * ldv],
+                   v[(ulong)r.sc * ldv], v[(ulong)r.sd * ldv], v[(ulong)r.se * ldv], v[(ulong)r.sf * ldv]);
+    return __builtin_astype(u.v, mat_b_t);
+}
+#endif
+#define PV_LOAD_MULADD(a, c) { \
+            mat_b_t b0 = qcom_coop_mat_load(vr + (ulong)(c) * 16 * ldv,      CLK_COOPERATIVE_MATRIX_LAYOUT_ROW_MAJOR_QCOM, ldv); \
+            mat_b_t b1 = qcom_coop_mat_load(vr + (ulong)(c) * 16 * ldv + 64, CLK_COOPERATIVE_MATRIX_LAYOUT_ROW_MAJOR_QCOM, ldv); \
+            o0 = qcom_coop_mat_mulAdd(a, b0, o0, CLK_COOPERATIVE_MATRIX_OPERAND_NONE_QCOM); \
+            o1 = qcom_coop_mat_mulAdd(a, b1, o1, CLK_COOPERATIVE_MATRIX_OPERAND_NONE_QCOM); }
+#ifdef FA_KV_ROWS
+// each branch keeps its own B values: the compiler cannot merge a loaded and a register-built B
+#define PV_MULADD(a, c) \
+        if (contig) PV_LOAD_MULADD(a, c) \
+        else { \
+            mat_b_t b0 = load_v_rows(vb, ldv, rr, j0 + (c) * 16,  0, lane); \
+            mat_b_t b1 = load_v_rows(vb, ldv, rr, j0 + (c) * 16, 64, lane); \
+            o0 = qcom_coop_mat_mulAdd(a, b0, o0, CLK_COOPERATIVE_MATRIX_OPERAND_NONE_QCOM); \
+            o1 = qcom_coop_mat_mulAdd(a, b1, o1, CLK_COOPERATIVE_MATRIX_OPERAND_NONE_QCOM); }
+#else
+#define PV_MULADD(a, c) PV_LOAD_MULADD(a, c)
+#endif
+
 inline float16 load_mask16(global const half * p) {
     ushort16 b = vload16(0, (global const ushort *) p);
     b = select(b, (ushort16)(0xFBFF), b == (ushort16)(0xFC00));
@@ -51,7 +90,8 @@ kernel void kernel_fa_coopmat_dk128(
         global       float * part_o,
         global       float * part_ml,
         int n_q, int n_kv, int n_head, int n_head_kv, float scale,
-        int F_arg, int kv_per_split
+        int F_arg, int kv_per_split,
+        global const char * rows, ulong offr, ulong nbr1, ulong nbq3, ulong nbm3, int n_slices, int n_cells
 ) {
     const int F = F_arg;
     q    += offq;
@@ -65,17 +105,36 @@ kernel void kernel_fa_coopmat_dk128(
     const int n_split = get_num_groups(2);
     const int T      = 64 / F;                       // query tokens per wave
 
+#ifdef FA_KV_ROWS
+    // slices only exist with K/V rows; the plain builds keep their register footprint (decode is sensitive)
+    const int nh1 = F == 1 ? n_head : n_head_kv;
+    const int sl  = get_group_id(1) / nh1;           // slice
+    const int g1  = get_group_id(1) % nh1;
+    q    += (ulong)sl * nbq3;
+    mask += (ulong)sl * nbm3;
+    global const int * rr = (global const int *)(rows + offr + (ulong)sl * nbr1);
+#else
+    const int g1  = get_group_id(1);
+#endif
+
     int h, hk;
     if (F == 1) {
-        h  = get_group_id(1);
+        h  = g1;
         hk = h / (n_head / n_head_kv);
     } else {
-        hk = get_group_id(1);
+        hk = g1;
         h  = hk * F + lane % F;
     }
-    const int  i     = get_group_id(0) * T + lane / F;
-    const bool valid = lane < T * F && i < n_q;
-    const int  ic    = min(i, n_q - 1);
+    const int  i      = get_group_id(0) * T + lane / F;
+    const bool valid  = lane < T * F && i < n_q;
+    const int  ic     = min(i, n_q - 1);
+#ifdef FA_KV_ROWS
+    const int  iq     = sl * n_q + i;                // row over all slices (dst, partials)
+    const int  nq_all = n_slices * n_q;
+#else
+    const int  iq     = i;
+    const int  nq_all = n_q;
+#endif
 
     // Q (pre-scaled, f16) in local memory, row = lane: keeping it as 8 A operands in registers spills
     local half q_lds[64 * Q_LD];
@@ -103,11 +162,36 @@ kernel void kernel_fa_coopmat_dk128(
 
     for (int j0 = j_beg; j0 < j_end; j0 += 64) {
         mat_c_t s = qcom_coop_mat_init(0.0);
+#ifdef FA_KV_ROWS
+        // a block of 64 consecutive rows (the usual case) takes the coopmat loads; otherwise
+        // lane = column = KV row rows[j0 + lane], its 16 elements = 16 dims of that row.
+        // Padding rows (< 0) are masked: a block of padding only is skipped, and padding at the
+        // end of a run reads the rows that follow it, when they are inside the cache.
+        const int  rl     = rr[j0 + lane];
+        if (sub_group_all(rl < 0)) {
+            continue;
+        }
+        const int  r0     = sub_group_broadcast(rl, 0);
+        const bool contig = r0 >= 0 && r0 + 64 <= n_cells && sub_group_all(rl == r0 + lane || rl < 0);
+        const int  jb     = contig ? r0 : j0;
+        global const half * kr = kb + (ulong)max(rl, 0) * ldk;
+#else
+        const int  jb     = j0;
+#endif
         for (int kk = 0; kk < DK / 16; kk++) {
             a_row_t qk;
             qk.h = vload16(0, q_lds + lane * Q_LD + kk * 16);
             mat_a_t a = __builtin_astype(qk.v, mat_a_t);
-            mat_b_t b = qcom_coop_mat_load(kb + (ulong)j0 * ldk + kk * 16, CLK_COOPERATIVE_MATRIX_LAYOUT_COLUMN_MAJOR_QCOM, ldk);
+#ifdef FA_KV_ROWS
+            if (!contig) {
+                a_row_t kv;
+                kv.h = vload16(0, kr + kk * 16);
+                mat_b_t b = __builtin_astype(kv.v, mat_b_t);
+                s = qcom_coop_mat_mulAdd(a, b, s, CLK_COOPERATIVE_MATRIX_OPERAND_NONE_QCOM);
+                continue;
+            }
+#endif
+            mat_b_t b = qcom_coop_mat_load(kb + (ulong)jb * ldk + kk * 16, CLK_COOPERATIVE_MATRIX_LAYOUT_COLUMN_MAJOR_QCOM, ldk);
             s = qcom_coop_mat_mulAdd(a, b, s, CLK_COOPERATIVE_MATRIX_OPERAND_NONE_QCOM);
         }
 
@@ -161,12 +245,8 @@ kernel void kernel_fa_coopmat_dk128(
         mat_a_t a2 = __builtin_astype(pa2.v, mat_a_t);
         mat_a_t a3 = __builtin_astype(pa3.v, mat_a_t);
 
-        global const half * vr = vb + (ulong)j0 * ldv;
-#define PV(a, c) { \
-            mat_b_t b0 = qcom_coop_mat_load(vr + (ulong)(c) * 16 * ldv,      CLK_COOPERATIVE_MATRIX_LAYOUT_ROW_MAJOR_QCOM, ldv); \
-            mat_b_t b1 = qcom_coop_mat_load(vr + (ulong)(c) * 16 * ldv + 64, CLK_COOPERATIVE_MATRIX_LAYOUT_ROW_MAJOR_QCOM, ldv); \
-            o0 = qcom_coop_mat_mulAdd(a, b0, o0, CLK_COOPERATIVE_MATRIX_OPERAND_NONE_QCOM); \
-            o1 = qcom_coop_mat_mulAdd(a, b1, o1, CLK_COOPERATIVE_MATRIX_OPERAND_NONE_QCOM); }
+        global const half * vr = vb + (ulong)jb * ldv;
+#define PV(a, c) { PV_MULADD(a, c) }
         PV(a0, 0)
         PV(a1, 1)
         PV(a2, 2)
@@ -198,7 +278,7 @@ kernel void kernel_fa_coopmat_dk128(
         }
 
         // P = exp(S - m) one chunk at a time, straight into its P.V update
-        global const half * vr = vb + (ulong)j0 * ldv;
+        global const half * vr = vb + (ulong)jb * ldv;
         float lsum = 0.0f;
 #define PV_CHUNK(hc, c) { \
             const float16 p = exp(convert_float16(hc) + load_mask16(mr + j0 + (c) * 16) - mnew); \
@@ -207,10 +287,7 @@ kernel void kernel_fa_coopmat_dk128(
             a_row_t pa; \
             pa.h = convert_half16(p); \
             mat_a_t a = __builtin_astype(pa.v, mat_a_t); \
-            mat_b_t b0 = qcom_coop_mat_load(vr + (ulong)(c) * 16 * ldv,      CLK_COOPERATIVE_MATRIX_LAYOUT_ROW_MAJOR_QCOM, ldv); \
-            mat_b_t b1 = qcom_coop_mat_load(vr + (ulong)(c) * 16 * ldv + 64, CLK_COOPERATIVE_MATRIX_LAYOUT_ROW_MAJOR_QCOM, ldv); \
-            o0 = qcom_coop_mat_mulAdd(a, b0, o0, CLK_COOPERATIVE_MATRIX_OPERAND_NONE_QCOM); \
-            o1 = qcom_coop_mat_mulAdd(a, b1, o1, CLK_COOPERATIVE_MATRIX_OPERAND_NONE_QCOM); }
+            PV_MULADD(a, c) }
         PV_CHUNK(us.s.h0, 0)
         PV_CHUNK(us.s.h1, 1)
         PV_CHUNK(us.s.h2, 2)
@@ -225,9 +302,9 @@ kernel void kernel_fa_coopmat_dk128(
         global float * out;
         if (n_split == 1) {
             il  = l > 0.0f ? 1.0f / l : 0.0f;
-            out = dst + ((ulong)i * n_head + h) * DV;
+            out = dst + ((ulong)iq * n_head + h) * DV;
         } else {
-            const ulong pr = ((ulong)split * n_head + h) * n_q + i;
+            const ulong pr = ((ulong)split * n_head + h) * nq_all + iq;
             out = part_o + pr * DV;
             part_ml[pr * 2 + 0] = m;
             part_ml[pr * 2 + 1] = l;

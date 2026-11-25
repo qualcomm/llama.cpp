@@ -2185,6 +2185,8 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mm_f16_f32_attn_coopmat = nullptr;
     cl_kernel kernel_fa_coopmat_dk128 = nullptr;
     cl_kernel kernel_fa_coopmat_dk128_sb = nullptr;
+    cl_kernel kernel_fa_coopmat_dk128_rows = nullptr;     // K/V row lists (ggml_flash_attn_ext_rows)
+    cl_kernel kernel_fa_coopmat_dk128_sb_rows = nullptr;
     cl_kernel kernel_fa_coopmat_reduce = nullptr;
     bool fa_coopmat_possible = false;
     ggml_cl_buffer prealloc_fa_cm_part_o;
@@ -5309,6 +5311,19 @@ static void load_cl_kernels_coopmat(ggml_backend_opencl_context * backend_ctx) {
         if (prog_sb) {
             CL_CHECK((backend_ctx->kernel_fa_coopmat_dk128_sb = clCreateKernel(prog_sb, "kernel_fa_coopmat_dk128", &err), err));
             CL_CHECK(clReleaseProgram(prog_sb));
+            GGML_LOG_CONT(".");
+        }
+        // K/V row lists (llama-server's unified KV cache): K and V rows gathered through kv_rows
+        cl_program prog_r = build_program_from_source(backend_ctx, kernel_src.c_str(), opts + " -cl-fast-relaxed-math -DFA_KV_ROWS", false);
+        if (prog_r) {
+            CL_CHECK((backend_ctx->kernel_fa_coopmat_dk128_rows = clCreateKernel(prog_r, "kernel_fa_coopmat_dk128", &err), err));
+            CL_CHECK(clReleaseProgram(prog_r));
+            GGML_LOG_CONT(".");
+        }
+        cl_program prog_sbr = build_program_from_source(backend_ctx, kernel_src.c_str(), opts + " -cl-fast-relaxed-math -DFA_STREAM_P -DFA_KV_ROWS", false);
+        if (prog_sbr) {
+            CL_CHECK((backend_ctx->kernel_fa_coopmat_dk128_sb_rows = clCreateKernel(prog_sbr, "kernel_fa_coopmat_dk128", &err), err));
+            CL_CHECK(clReleaseProgram(prog_sbr));
             GGML_LOG_CONT(".");
         }
     }
@@ -21056,9 +21071,12 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
         case GGML_OP_MEAN:
             return op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_FLASH_ATTN_EXT: {
-            // K/V row lists (ggml_flash_attn_ext_rows) are not supported
+            // K/V row lists only on the coopmat kernel, opt-in: GGML_OPENCL_FA_KV_ROWS=1. With one
+            // sequence they cost 10-14% in llama-server on the 850 (the row-list build is slower even
+            // on contiguous rows), so by default llama falls back to attention over the whole cache.
             if (op->src[5] != nullptr) {
-                return false;
+                static const bool kv_rows_on = [] { const char * e = getenv("GGML_OPENCL_FA_KV_ROWS"); return e && atoi(e) != 0; }();
+                return kv_rows_on && ggml_cl_fa_coopmat_can_use(backend_ctx, op);
             }
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
             if (use_fa_bin_kernels_prefill(backend_ctx, op->src[0], op->src[1], op->src[2], op->src[4])) {
@@ -35159,8 +35177,10 @@ static bool ggml_cl_flash_attn_sparse(ggml_backend_t backend, const ggml_tensor 
 static bool ggml_cl_fa_coopmat_can_use(const ggml_backend_opencl_context * backend_ctx, const ggml_tensor * op) {
     // kernels are built lazily (first buffer allocation), after supports_op is first asked:
     // gate on the device capability; ggml_cl_fa_coopmat_run checks that the kernel did build
+    const ggml_tensor * rows = op->src[5];   // K/V row lists (ggml_flash_attn_ext_rows)
     if (!backend_ctx || !backend_ctx->fa_coopmat_possible ||
-        (backend_ctx->kernels_loaded && backend_ctx->kernel_fa_coopmat_dk128 == nullptr)) {
+        (backend_ctx->kernels_loaded && (backend_ctx->kernel_fa_coopmat_dk128 == nullptr ||
+                                         (rows && backend_ctx->kernel_fa_coopmat_dk128_rows == nullptr)))) {
         return false;
     }
     const ggml_tensor * q    = op->src[0];
@@ -35168,7 +35188,13 @@ static bool ggml_cl_fa_coopmat_can_use(const ggml_backend_opencl_context * backe
     const ggml_tensor * v    = op->src[2];
     const ggml_tensor * mask = op->src[3];
     // no sinks, no n_kv_max hint (the decomposed path serves the gathered QSA cells)
-    if (op->src[4] != nullptr || op->src[5] != nullptr || ggml_get_op_params_i32(op, 4) > 0 || mask == nullptr) {
+    if (op->src[4] != nullptr || ggml_get_op_params_i32(op, 4) > 0 || mask == nullptr) {
+        return false;
+    }
+    // with K/V rows: n_kv = the row list length, one q/mask slice per list, K/V shared by all slices
+    const int64_t n_kv     = rows ? rows->ne[0] : k->ne[1];
+    const int64_t n_slices = rows ? rows->ne[1] : 1;
+    if (rows && (rows->type != GGML_TYPE_I32 || rows->nb[0] != sizeof(int32_t) || rows->ne[2] != 1 || rows->ne[3] != 1)) {
         return false;
     }
     if (q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16 ||
@@ -35181,8 +35207,8 @@ static bool ggml_cl_fa_coopmat_can_use(const ggml_backend_opencl_context * backe
     const int64_t n_head = q->ne[2], n_head_kv = k->ne[2];
     return q->ne[0] == 128 && k->ne[0] == 128 && v->ne[0] == 128 &&
            max_bias == 0.0f && softcap == 0.0f &&
-           k->ne[1] % 64 == 0 && v->ne[1] == k->ne[1] && mask->ne[0] >= k->ne[1] && mask->ne[1] >= q->ne[1] &&
-           q->ne[3] == 1 && k->ne[3] == 1 && v->ne[3] == 1 && mask->ne[2] == 1 && mask->ne[3] == 1 &&
+           n_kv % 64 == 0 && v->ne[1] == k->ne[1] && mask->ne[0] >= n_kv && mask->ne[1] >= q->ne[1] &&
+           q->ne[3] == n_slices && k->ne[3] == 1 && v->ne[3] == 1 && mask->ne[2] == 1 && mask->ne[3] == n_slices &&
            n_head_kv > 0 && n_head % n_head_kv == 0 && n_head / n_head_kv <= 64 && v->ne[2] == n_head_kv &&
            q->nb[0] == sizeof(float) && k->nb[0] == sizeof(ggml_fp16_t) && v->nb[0] == sizeof(ggml_fp16_t) &&
            mask->nb[0] == sizeof(ggml_fp16_t) && (k->nb[1] % 2) == 0 && (v->nb[1] % 2) == 0 &&
@@ -35195,6 +35221,7 @@ static void ggml_cl_fa_coopmat_run(ggml_backend_t backend, ggml_tensor * dst) {
     const ggml_tensor * k    = dst->src[1];
     const ggml_tensor * v    = dst->src[2];
     const ggml_tensor * mask = dst->src[3];
+    const ggml_tensor * rows = dst->src[5];
 
     if (backend_ctx->kernel_fa_coopmat_dk128 == nullptr) {
         GGML_ABORT("ggml_opencl: FLASH_ATTN_EXT was accepted for the coopmat kernel but it failed to build; "
@@ -35202,7 +35229,8 @@ static void ggml_cl_fa_coopmat_run(ggml_backend_t backend, ggml_tensor * dst) {
     }
 
     const int n_q       = q->ne[1];
-    const int n_kv      = k->ne[1];
+    const int n_kv      = rows ? rows->ne[0] : k->ne[1];
+    const int n_slices  = rows ? rows->ne[1] : 1;
     const int n_head    = q->ne[2];
     const int n_head_kv = k->ne[2];
     const int G         = n_head / n_head_kv;
@@ -35214,7 +35242,7 @@ static void ggml_cl_fa_coopmat_run(ggml_backend_t backend, ggml_tensor * dst) {
     const int F       = (n_q < 64 && G > 1) ? G : 1;
     const int T       = 64 / F;
     const int n_rowwg = (n_q + T - 1) / T;
-    const int n_waves = n_rowwg * (F == 1 ? n_head : n_head_kv);
+    const int n_waves = n_rowwg * (F == 1 ? n_head : n_head_kv) * n_slices;
     int n_split = 1;
     if (n_waves < 48) {
         n_split = std::max(1, std::min(4, n_kv / 256));
@@ -35234,7 +35262,7 @@ static void ggml_cl_fa_coopmat_run(ggml_backend_t backend, ggml_tensor * dst) {
     cl_ulong offm = em->offset + mask->view_offs;
     cl_ulong offd = ed->offset + dst->view_offs;
 
-    const size_t part_rows = (size_t) n_split * n_head * n_q;
+    const size_t part_rows = (size_t) n_split * n_head * n_q * n_slices;
     backend_ctx->prealloc_fa_cm_part_o.allocate(backend_ctx->context,  std::max<size_t>(16, n_split > 1 ? part_rows * 128 * sizeof(float) : 16));
     backend_ctx->prealloc_fa_cm_part_ml.allocate(backend_ctx->context, std::max<size_t>(16, n_split > 1 ? part_rows * 2 * sizeof(float) : 16));
 
@@ -35243,8 +35271,19 @@ static void ggml_cl_fa_coopmat_run(ggml_backend_t backend, ggml_tensor * dst) {
     cl_ulong nbv1 = v->nb[1], nbv2 = v->nb[2];
     cl_ulong nbm1 = mask->nb[1];
 
-    cl_kernel kn = (F > 1 && backend_ctx->kernel_fa_coopmat_dk128_sb) ? backend_ctx->kernel_fa_coopmat_dk128_sb
-                                                                     : backend_ctx->kernel_fa_coopmat_dk128;
+    cl_kernel kn;
+    if (rows) {
+        kn = (F > 1 && backend_ctx->kernel_fa_coopmat_dk128_sb_rows) ? backend_ctx->kernel_fa_coopmat_dk128_sb_rows
+                                                                     : backend_ctx->kernel_fa_coopmat_dk128_rows;
+    } else {
+        kn = (F > 1 && backend_ctx->kernel_fa_coopmat_dk128_sb) ? backend_ctx->kernel_fa_coopmat_dk128_sb
+                                                                : backend_ctx->kernel_fa_coopmat_dk128;
+    }
+    // without K/V rows the row-list argument is unused; q's buffer stands in
+    auto * er = rows ? (ggml_tensor_extra_cl *) rows->extra : eq;
+    cl_ulong offr = rows ? er->offset + rows->view_offs : 0;
+    cl_ulong nbr1 = rows ? rows->nb[1] : 0;
+    cl_ulong nbq3 = q->nb[3], nbm3 = mask->nb[3];
     cl_uint a = 0;
     CL_CHECK(clSetKernelArg(kn, a++, sizeof(cl_mem),   &eq->data_device));
     CL_CHECK(clSetKernelArg(kn, a++, sizeof(cl_ulong), &offq));
@@ -35272,9 +35311,17 @@ static void ggml_cl_fa_coopmat_run(ggml_backend_t backend, ggml_tensor * dst) {
     CL_CHECK(clSetKernelArg(kn, a++, sizeof(float),    &scale));
     CL_CHECK(clSetKernelArg(kn, a++, sizeof(int),      &F));
     CL_CHECK(clSetKernelArg(kn, a++, sizeof(int),      &kv_per_split));
+    CL_CHECK(clSetKernelArg(kn, a++, sizeof(cl_mem),   &er->data_device));
+    CL_CHECK(clSetKernelArg(kn, a++, sizeof(cl_ulong), &offr));
+    CL_CHECK(clSetKernelArg(kn, a++, sizeof(cl_ulong), &nbr1));
+    CL_CHECK(clSetKernelArg(kn, a++, sizeof(cl_ulong), &nbq3));
+    CL_CHECK(clSetKernelArg(kn, a++, sizeof(cl_ulong), &nbm3));
+    CL_CHECK(clSetKernelArg(kn, a++, sizeof(int),      &n_slices));
+    const int n_cells = k->ne[1];   // rows of the K/V cache
+    CL_CHECK(clSetKernelArg(kn, a++, sizeof(int),      &n_cells));
 
     size_t lws[3] = { 64, 1, 1 };
-    size_t gws[3] = { (size_t) n_rowwg * 64, (size_t) (F == 1 ? n_head : n_head_kv), (size_t) n_split };
+    size_t gws[3] = { (size_t) n_rowwg * 64, (size_t) (F == 1 ? n_head : n_head_kv) * n_slices, (size_t) n_split };
     backend_ctx->enqueue_ndrange_kernel(kn, 3, gws, lws, dst);
 
     if (n_split > 1) {
@@ -35284,10 +35331,11 @@ static void ggml_cl_fa_coopmat_run(ggml_backend_t backend, ggml_tensor * dst) {
         CL_CHECK(clSetKernelArg(kr, a++, sizeof(cl_mem), &backend_ctx->prealloc_fa_cm_part_ml.buffer));
         CL_CHECK(clSetKernelArg(kr, a++, sizeof(cl_mem), &ed->data_device));
         CL_CHECK(clSetKernelArg(kr, a++, sizeof(cl_ulong), &offd));
-        CL_CHECK(clSetKernelArg(kr, a++, sizeof(int),    &n_q));
+        const int nq_all = n_q * n_slices;   // dst rows of all slices are contiguous
+        CL_CHECK(clSetKernelArg(kr, a++, sizeof(int),    &nq_all));
         CL_CHECK(clSetKernelArg(kr, a++, sizeof(int),    &n_head));
         CL_CHECK(clSetKernelArg(kr, a++, sizeof(int),    &n_split));
-        size_t rgws[3] = { 128, (size_t) n_head, (size_t) n_q };
+        size_t rgws[3] = { 128, (size_t) n_head, (size_t) nq_all };
         size_t rlws[3] = { 64, 1, 1 };
         backend_ctx->enqueue_ndrange_kernel(kr, 3, rgws, rlws, dst);
     }
