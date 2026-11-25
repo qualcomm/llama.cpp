@@ -14,6 +14,18 @@ typedef half  mat_a_t __attribute__((qcom_coop_mat(CLK_COOPERATIVE_MATRIX_SCOPE_
 typedef half  mat_b_t __attribute__((qcom_coop_mat(CLK_COOPERATIVE_MATRIX_SCOPE_SUBGROUP_QCOM, 16, 32, CLK_COOPERATIVE_MATRIX_B_QCOM)));
 typedef float mat_c_t __attribute__((qcom_coop_mat(CLK_COOPERATIVE_MATRIX_SCOPE_SUBGROUP_QCOM, 64, 32, CLK_COOPERATIVE_MATRIX_ACCUMULATOR_QCOM)));
 
+#ifdef MOE_RP
+// MOE_RP: A goes straight from registers into the A operand, one weight row per lane (no local
+// memory or barrier in the K loop), and B is read from the packed f16 copy of
+// kernel_moe_reorder_b_f16_packed ([tile][K/16][32][16], contiguous 16x32 column-major blocks).
+typedef half half1024 __attribute__((ext_vector_type(1024)));
+
+typedef union {
+    half1024 v;
+    half16   h;
+} a_row_t;
+#endif
+
 // 8 nibbles -> (q - 8) * d in k order 0 4 1 5 2 6 3 7 (kernel_moe_reorder_b_f16 writes B in the same order).
 // 0x6400 | q is f16 1024 + q, so the subtract is exact.
 inline half8 q4_0_to_f16x8(uint v, half d) {
@@ -104,6 +116,16 @@ kernel void kernel_gemm_moe_q4_0_f32_ns_coopmat(
             LOAD_A(qn, dn)
         }
 
+#ifdef MOE_RP
+        a_row_t ua0;
+        a_row_t ua1;
+        ua0.h = (half16)(q4_0_to_f16x8(q.s0, d), q4_0_to_f16x8(q.s1, d));
+        ua1.h = (half16)(q4_0_to_f16x8(q.s2, d), q4_0_to_f16x8(q.s3, d));
+        mat_a_t a0 = __builtin_astype(ua0.v, mat_a_t);
+        mat_a_t a1 = __builtin_astype(ua1.v, mat_a_t);
+        mat_b_t b0 = qcom_coop_mat_load(bp + k0 * 32,       CLK_COOPERATIVE_MATRIX_LAYOUT_COLUMN_MAJOR_QCOM, 16);
+        mat_b_t b1 = qcom_coop_mat_load(bp + k0 * 32 + 512, CLK_COOPERATIVE_MATRIX_LAYOUT_COLUMN_MAJOR_QCOM, 16);
+#else
         vstore16((half16)(q4_0_to_f16x8(q.s0, d), q4_0_to_f16x8(q.s1, d)), 0, la[0] + lane * 16);
         vstore16((half16)(q4_0_to_f16x8(q.s2, d), q4_0_to_f16x8(q.s3, d)), 0, la[1] + lane * 16);
         sub_group_barrier(CLK_LOCAL_MEM_FENCE);
@@ -112,6 +134,7 @@ kernel void kernel_gemm_moe_q4_0_f32_ns_coopmat(
         sub_group_barrier(CLK_LOCAL_MEM_FENCE);
         mat_b_t b0 = qcom_coop_mat_load(bp + k0,      CLK_COOPERATIVE_MATRIX_LAYOUT_COLUMN_MAJOR_QCOM, ne00);
         mat_b_t b1 = qcom_coop_mat_load(bp + k0 + 16, CLK_COOPERATIVE_MATRIX_LAYOUT_COLUMN_MAJOR_QCOM, ne00);
+#endif
         acc = qcom_coop_mat_mulAdd(a0, b0, acc, CLK_COOPERATIVE_MATRIX_OPERAND_NONE_QCOM);
         acc = qcom_coop_mat_mulAdd(a1, b1, acc, CLK_COOPERATIVE_MATRIX_OPERAND_NONE_QCOM);
     }
