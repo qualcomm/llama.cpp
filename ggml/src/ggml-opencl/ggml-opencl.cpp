@@ -35210,6 +35210,16 @@ static bool ggml_cl_fa_coopmat_can_use(const ggml_backend_opencl_context * backe
         mask->type != GGML_TYPE_F16 || op->type != GGML_TYPE_F32) {
         return false;
     }
+    // Single-token decode over a short cache stays on the decomposed decode, which is as fast or
+    // faster there: Llama-3.2-3B tg64 at depth 0 is 37.9 vs 36.5 (Q4_0) and 35.5 vs 34.7 (Q4_K_M);
+    // from 2048 cells on, coopmat is level or ahead. GGML_OPENCL_FA_COOPMAT_DECODE_MIN_KV overrides.
+    static const int64_t decode_min_kv = [] {
+        const char * e = getenv("GGML_OPENCL_FA_COOPMAT_DECODE_MIN_KV");
+        return e ? (int64_t) atoll(e) : (int64_t) 2048;
+    }();
+    if (!rows && q->ne[1] == 1 && n_kv < decode_min_kv) {
+        return false;
+    }
     float max_bias, softcap;
     memcpy(&max_bias, (const float *) op->op_params + 1, sizeof(float));
     memcpy(&softcap,  (const float *) op->op_params + 2, sizeof(float));
