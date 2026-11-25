@@ -1797,7 +1797,9 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemm_moe_q6_k_q8_1_dp4a_bin = nullptr;    // binary dp4a (int8) q6_k MoE prefill GEMM
     cl_kernel kernel_moe_reorder_b;
     cl_kernel kernel_moe_reorder_b_f16 = nullptr;
-    cl_kernel kernel_moe_reorder_b_f16_packed = nullptr;          // packed f16 B for the _rp coopmat mxfp4 MoE GEMM
+    cl_kernel kernel_moe_reorder_b_f16_packed = nullptr;          // packed f16 B for the _rp coopmat MoE GEMMs
+    // the register-A / packed-B (-DMOE_RP) build of each coopmat MoE GEMM, keyed by the original
+    std::unordered_map<cl_kernel, cl_kernel> moe_coopmat_rp;
     cl_kernel kernel_gemm_moe_mxfp4_f32_ns_coopmat_rp = nullptr;  // register-A / packed-B coopmat mxfp4 MoE GEMM                 // f16 B for the coopmat mxfp4 MoE GEMM
     cl_kernel kernel_gemm_moe_mxfp4_f32_ns_coopmat = nullptr;     // cl_qcom_kernel_cooperative_matrix mxfp4 MoE prefill GEMM, A850 only
     cl_kernel kernel_gemm_moe_q4_0_f32_ns_coopmat = nullptr;   // cl_qcom_kernel_cooperative_matrix q4_0 MoE prefill GEMM, A850 only
@@ -5451,6 +5453,15 @@ static void load_cl_kernels_coopmat(ggml_backend_opencl_context * backend_ctx) {
             CL_CHECK(clReleaseProgram(prog));
             GGML_LOG_CONT(".");
         }
+        // the same kernel with A from registers and a packed B (MOE_RP in the source)
+        cl_program prog_rp = backend_ctx->kernel_gemm_moe_q4_0_f32_ns_coopmat ? build_program_from_source(backend_ctx, kernel_src.c_str(), q4_0_coopmat_opts + " -DMOE_RP", false) : nullptr;
+        if (prog_rp) {
+            cl_kernel k_rp = clCreateKernel(prog_rp, "kernel_gemm_moe_q4_0_f32_ns_coopmat", &err);
+            CL_CHECK(err);
+            backend_ctx->moe_coopmat_rp[backend_ctx->kernel_gemm_moe_q4_0_f32_ns_coopmat] = k_rp;
+            CL_CHECK(clReleaseProgram(prog_rp));
+            GGML_LOG_CONT(".");
+        }
     }
 
     // gemm_moe_q4_1_f32_ns_coopmat, same options as the mxfp4 one
@@ -5472,6 +5483,15 @@ static void load_cl_kernels_coopmat(ggml_backend_opencl_context * backend_ctx) {
         if (prog) {
             CL_CHECK((backend_ctx->kernel_gemm_moe_q4_1_f32_ns_coopmat = clCreateKernel(prog, "kernel_gemm_moe_q4_1_f32_ns_coopmat", &err), err));
             CL_CHECK(clReleaseProgram(prog));
+            GGML_LOG_CONT(".");
+        }
+        // the same kernel with A from registers and a packed B (MOE_RP in the source)
+        cl_program prog_rp = backend_ctx->kernel_gemm_moe_q4_1_f32_ns_coopmat ? build_program_from_source(backend_ctx, kernel_src.c_str(), q4_1_coopmat_opts + " -DMOE_RP", false) : nullptr;
+        if (prog_rp) {
+            cl_kernel k_rp = clCreateKernel(prog_rp, "kernel_gemm_moe_q4_1_f32_ns_coopmat", &err);
+            CL_CHECK(err);
+            backend_ctx->moe_coopmat_rp[backend_ctx->kernel_gemm_moe_q4_1_f32_ns_coopmat] = k_rp;
+            CL_CHECK(clReleaseProgram(prog_rp));
             GGML_LOG_CONT(".");
         }
     }
@@ -5497,6 +5517,15 @@ static void load_cl_kernels_coopmat(ggml_backend_opencl_context * backend_ctx) {
             CL_CHECK(clReleaseProgram(prog));
             GGML_LOG_CONT(".");
         }
+        // the same kernel with A from registers and a packed B (MOE_RP in the source)
+        cl_program prog_rp = backend_ctx->kernel_gemm_moe_q5_0_f32_ns_coopmat ? build_program_from_source(backend_ctx, kernel_src.c_str(), q5_0_coopmat_opts + " -DMOE_RP", false) : nullptr;
+        if (prog_rp) {
+            cl_kernel k_rp = clCreateKernel(prog_rp, "kernel_gemm_moe_q5_0_f32_ns_coopmat", &err);
+            CL_CHECK(err);
+            backend_ctx->moe_coopmat_rp[backend_ctx->kernel_gemm_moe_q5_0_f32_ns_coopmat] = k_rp;
+            CL_CHECK(clReleaseProgram(prog_rp));
+            GGML_LOG_CONT(".");
+        }
     }
 
     // gemm_moe_q5_1_f32_ns_coopmat, same options as the mxfp4 one
@@ -5518,6 +5547,15 @@ static void load_cl_kernels_coopmat(ggml_backend_opencl_context * backend_ctx) {
         if (prog) {
             CL_CHECK((backend_ctx->kernel_gemm_moe_q5_1_f32_ns_coopmat = clCreateKernel(prog, "kernel_gemm_moe_q5_1_f32_ns_coopmat", &err), err));
             CL_CHECK(clReleaseProgram(prog));
+            GGML_LOG_CONT(".");
+        }
+        // the same kernel with A from registers and a packed B (MOE_RP in the source)
+        cl_program prog_rp = backend_ctx->kernel_gemm_moe_q5_1_f32_ns_coopmat ? build_program_from_source(backend_ctx, kernel_src.c_str(), q5_1_coopmat_opts + " -DMOE_RP", false) : nullptr;
+        if (prog_rp) {
+            cl_kernel k_rp = clCreateKernel(prog_rp, "kernel_gemm_moe_q5_1_f32_ns_coopmat", &err);
+            CL_CHECK(err);
+            backend_ctx->moe_coopmat_rp[backend_ctx->kernel_gemm_moe_q5_1_f32_ns_coopmat] = k_rp;
+            CL_CHECK(clReleaseProgram(prog_rp));
             GGML_LOG_CONT(".");
         }
     }
@@ -5543,6 +5581,15 @@ static void load_cl_kernels_coopmat(ggml_backend_opencl_context * backend_ctx) {
             CL_CHECK(clReleaseProgram(prog));
             GGML_LOG_CONT(".");
         }
+        // the same kernel with A from registers and a packed B (MOE_RP in the source)
+        cl_program prog_rp = backend_ctx->kernel_gemm_moe_q4_k_f32_ns_coopmat ? build_program_from_source(backend_ctx, kernel_src.c_str(), q4_k_coopmat_opts + " -DMOE_RP", false) : nullptr;
+        if (prog_rp) {
+            cl_kernel k_rp = clCreateKernel(prog_rp, "kernel_gemm_moe_q4_k_f32_ns_coopmat", &err);
+            CL_CHECK(err);
+            backend_ctx->moe_coopmat_rp[backend_ctx->kernel_gemm_moe_q4_k_f32_ns_coopmat] = k_rp;
+            CL_CHECK(clReleaseProgram(prog_rp));
+            GGML_LOG_CONT(".");
+        }
     }
 
     // gemm_moe_q5_k_f32_ns_coopmat, same options as the mxfp4 one
@@ -5566,6 +5613,15 @@ static void load_cl_kernels_coopmat(ggml_backend_opencl_context * backend_ctx) {
             CL_CHECK(clReleaseProgram(prog));
             GGML_LOG_CONT(".");
         }
+        // the same kernel with A from registers and a packed B (MOE_RP in the source)
+        cl_program prog_rp = backend_ctx->kernel_gemm_moe_q5_k_f32_ns_coopmat ? build_program_from_source(backend_ctx, kernel_src.c_str(), q5_k_coopmat_opts + " -DMOE_RP", false) : nullptr;
+        if (prog_rp) {
+            cl_kernel k_rp = clCreateKernel(prog_rp, "kernel_gemm_moe_q5_k_f32_ns_coopmat", &err);
+            CL_CHECK(err);
+            backend_ctx->moe_coopmat_rp[backend_ctx->kernel_gemm_moe_q5_k_f32_ns_coopmat] = k_rp;
+            CL_CHECK(clReleaseProgram(prog_rp));
+            GGML_LOG_CONT(".");
+        }
     }
 
     // gemm_moe_q6_k_f32_ns_coopmat, same options as the mxfp4 one
@@ -5587,6 +5643,15 @@ static void load_cl_kernels_coopmat(ggml_backend_opencl_context * backend_ctx) {
         if (prog) {
             CL_CHECK((backend_ctx->kernel_gemm_moe_q6_k_f32_ns_coopmat = clCreateKernel(prog, "kernel_gemm_moe_q6_k_f32_ns_coopmat", &err), err));
             CL_CHECK(clReleaseProgram(prog));
+            GGML_LOG_CONT(".");
+        }
+        // the same kernel with A from registers and a packed B (MOE_RP in the source)
+        cl_program prog_rp = backend_ctx->kernel_gemm_moe_q6_k_f32_ns_coopmat ? build_program_from_source(backend_ctx, kernel_src.c_str(), q6_k_coopmat_opts + " -DMOE_RP", false) : nullptr;
+        if (prog_rp) {
+            cl_kernel k_rp = clCreateKernel(prog_rp, "kernel_gemm_moe_q6_k_f32_ns_coopmat", &err);
+            CL_CHECK(err);
+            backend_ctx->moe_coopmat_rp[backend_ctx->kernel_gemm_moe_q6_k_f32_ns_coopmat] = k_rp;
+            CL_CHECK(clReleaseProgram(prog_rp));
             GGML_LOG_CONT(".");
         }
     }
@@ -17312,6 +17377,13 @@ static bool ggml_cl_moe_qk_dp4a_bin_on(const char * type_env, bool def) {
     return def;
 }
 
+// Whether the register-A / packed-B build of a coopmat MoE GEMM will serve it (see ggml_cl_moe_gemm_coopmat).
+static bool ggml_cl_moe_coopmat_rp_on(const ggml_backend_opencl_context * backend_ctx, cl_kernel kernel) {
+    static const bool rp_on = [] { const char * e = getenv("GGML_OPENCL_MOE_COOPMAT_RP"); return !e || atoi(e) != 0; }();
+    return rp_on && kernel != nullptr && backend_ctx->kernel_moe_reorder_b_f16_packed != nullptr &&
+           backend_ctx->moe_coopmat_rp.count(kernel) != 0;
+}
+
 // Run a cl_qcom_kernel_cooperative_matrix MoE GEMM: f16 reorder of the activations, then the GEMM.
 // The weight buffers come first in the kernel args, in the order of the ns kernel of the same type.
 static void ggml_cl_moe_gemm_coopmat(
@@ -17329,7 +17401,13 @@ static void ggml_cl_moe_gemm_coopmat(
     cl_mem buf_src1_reordered = clCreateSubBuffer(backend_ctx->prealloc_act_trans.buffer, 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &status);
     CL_CHECK(status);
 
-    cl_kernel rk = backend_ctx->kernel_moe_reorder_b_f16;
+    // the register-A / packed-B build where there is one; GGML_OPENCL_MOE_COOPMAT_RP=0 keeps the original
+    const bool packed = ggml_cl_moe_coopmat_rp_on(backend_ctx, kernel);
+    if (packed) {
+        kernel = backend_ctx->moe_coopmat_rp.at(kernel);
+    }
+
+    cl_kernel rk = packed ? backend_ctx->kernel_moe_reorder_b_f16_packed : backend_ctx->kernel_moe_reorder_b_f16;
     unsigned int ne00_u = ne00;
     unsigned int tile_u = n_tile_size;
     CL_CHECK(clSetKernelArg(rk, 0, sizeof(cl_mem),         &sub_buf_src1_pre));
@@ -56005,6 +56083,8 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     const bool          use_moe_dp4a = q4k_moe_dp4a_env
                         ? (atoi(q4k_moe_dp4a_env) != 0)
                         : (backend_ctx->adreno_dp4a_moe()
+                           // the register-A coopmat GEMM (Adreno 850) outranks dp4a: granite-3.0-3b-a800m Q4_K_M pp512 +17%
+                           && !ggml_cl_moe_coopmat_rp_on(backend_ctx, backend_ctx->kernel_gemm_moe_q4_k_f32_ns_coopmat)
                            && (backend_ctx->kernel_gemm_moe_q4_k_f32_ns_bin == nullptr || q4k_rb2_ok || q4k_dp4a_bin));
 
                     // GGML_OPENCL_MOE_DISPATCH_LOG=1 names the kernel that fired, once per
@@ -56591,7 +56671,9 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     // bin-kernel precedence rule is not, so it is ANDed in below.
                     const bool          use_q6k_dp4a = (q6k_moe_dp4a_env
                         ? (atoi(q6k_moe_dp4a_env) != 0)
-                        : backend_ctx->adreno_dp4a_moe())
+                        : (backend_ctx->adreno_dp4a_moe() &&
+                           // as for q4_K: the register-A coopmat GEMM outranks dp4a
+                           !ggml_cl_moe_coopmat_rp_on(backend_ctx, backend_ctx->kernel_gemm_moe_q6_k_f32_ns_coopmat)))
                         // bin kernel takes precedence (from upstream), unless the prebuilt
                         // q6_K dp4a GEMM is selected
                         && (backend_ctx->kernel_gemm_moe_q6_k_f32_ns_bin == nullptr || q6k_dp4a_bin);
