@@ -57,11 +57,24 @@ inline void store_c16(global float * p, half16 h, int j0, int nv, int M) {
     if (j0 + 15 < nv) p[(ulong)(j0 + 15) * M] = f.sf;
 }
 
+#ifdef Q40_Q16
+// Quants transposed as 16-bit words ([K/4][M] u16, the layout the plain Q4_0 GEMV reads);
+// a 32-bit word of 8 nibbles is two consecutive 16-bit rows.
+#define Q_T ushort
+#define QW(i) ((uint)qp[(2 * (i)) * M] | ((uint)qp[(2 * (i) + 1) * M] << 16))
+#define Q_WORDS 2
+#else
+// Quants transposed as 32-bit words ([K/8][M] u32, the binary-kernel layout).
+#define Q_T uint
+#define QW(i) qp[(i) * M]
+#define Q_WORDS 1
+#endif
+
 #define LOAD_Q(qv, dd, o) { \
-        qv.s0 = qp[(4 * (o) + 0) * M]; \
-        qv.s1 = qp[(4 * (o) + 1) * M]; \
-        qv.s2 = qp[(4 * (o) + 2) * M]; \
-        qv.s3 = qp[(4 * (o) + 3) * M]; \
+        qv.s0 = QW(4 * (o) + 0); \
+        qv.s1 = QW(4 * (o) + 1); \
+        qv.s2 = QW(4 * (o) + 2); \
+        qv.s3 = QW(4 * (o) + 3); \
         dd    = dp[(o) * M]; }
 
 #define MMA_K32(qv, dd, b) { \
@@ -76,8 +89,12 @@ inline void store_c16(global float * p, half16 h, int j0, int nv, int M) {
         acc = qcom_coop_mat_mulAdd(a0, b0, acc, CLK_COOPERATIVE_MATRIX_OPERAND_NONE_QCOM); \
         acc = qcom_coop_mat_mulAdd(a1, b1, acc, CLK_COOPERATIVE_MATRIX_OPERAND_NONE_QCOM); }
 
+#ifdef Q40_Q16
+kernel void kernel_gemm_noshuffle_q4_0_f32_coopmat_q16(
+#else
 kernel void kernel_gemm_noshuffle_q4_0_f32_coopmat(
-        global const uint * src0_q,  // A: q4_0 quants, [K/8][M] u32
+#endif
+        global const Q_T  * src0_q,  // A: q4_0 quants, [K/8][M] u32 or [K/4][M] u16
         global const half * src0_d,  // A: q4_0 scales, [K/32][M] f16
         global const half * src1,    // B: packed f16 tiles
         global       char * dst,     // C: [N][M] f32
@@ -95,7 +112,7 @@ kernel void kernel_gemm_noshuffle_q4_0_f32_coopmat(
         return;
     }
 
-    global const uint * qp = src0_q + row + lane;
+    global const Q_T  * qp = src0_q + row + lane;
     global const half * dp = src0_d + row + lane;
     global const half * bp = src1 + (ulong)tn * (K / 16) * 1024;
 
@@ -113,7 +130,7 @@ kernel void kernel_gemm_noshuffle_q4_0_f32_coopmat(
         da = odd ? 0.0h : da;
         MMA_K32(qa, da, bp)
         MMA_K32(qb, db, bp + ob * 2048)
-        qp += (ob + 1) * 4 * M;
+        qp += (ob + 1) * 4 * Q_WORDS * M;
         dp += (ob + 1) * M;
         bp += (ob + 1) * 2048;
     }
@@ -128,7 +145,7 @@ kernel void kernel_gemm_noshuffle_q4_0_f32_coopmat(
         LOAD_Q(qb, db, 1)
         MMA_K32(qa, da, bp)
         MMA_K32(qb, db, bp + 2048)
-        qp += 8 * M;
+        qp += 8 * Q_WORDS * M;
         dp += 2 * M;
         bp += 4096;
     }

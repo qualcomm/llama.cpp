@@ -2177,6 +2177,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemm_noshuffle_q4_k_q8_1_dp4a_ila_a8_bin;
     cl_kernel kernel_pack_b_f16_coopmat              = nullptr;
     cl_kernel kernel_gemm_noshuffle_q4_0_f32_coopmat = nullptr;
+    cl_kernel kernel_gemm_noshuffle_q4_0_f32_coopmat_q16 = nullptr;
     cl_kernel kernel_gemm_noshuffle_q5_0_f32_coopmat = nullptr;
     cl_kernel kernel_gemm_noshuffle_q8_0_f32_coopmat = nullptr;
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_coopmat = nullptr;
@@ -5208,6 +5209,14 @@ static void load_cl_kernels_coopmat(ggml_backend_opencl_context * backend_ctx) {
         if (prog) {
             CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_0_f32_coopmat = clCreateKernel(prog, "kernel_gemm_noshuffle_q4_0_f32_coopmat", &err), err));
             CL_CHECK(clReleaseProgram(prog));
+            GGML_LOG_CONT(".");
+        }
+        // the same kernel reading the 16-bit transposed quants of the plain Q4_0 layout, so that loading
+        // coopmat does not move Q4_0 weights to the binary layout (decode keeps the plain GEMV)
+        cl_program prog16 = build_program_from_source_ex(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), opts + " -DQ40_Q16", false);
+        if (prog16) {
+            CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_0_f32_coopmat_q16 = clCreateKernel(prog16, "kernel_gemm_noshuffle_q4_0_f32_coopmat_q16", &err), err));
+            CL_CHECK(clReleaseProgram(prog16));
             GGML_LOG_CONT(".");
         }
     }
@@ -19837,7 +19846,7 @@ inline bool use_q4_0_bin_kernels(const ggml_backend_opencl_context *backend_ctx,
     if (!backend_ctx->kernel_gemv_noshuffle_q4_0_f32_32b_trans ||
         !(backend_ctx->kernel_gemm_noshuffle_q4_0_f32_32b_trans_ila_a8_bin ||
           backend_ctx->kernel_gemm_noshuffle_q4_0_f32_32b_trans_ila_a7_bin ||
-          backend_ctx->kernel_gemm_noshuffle_q4_0_f32_coopmat)) {
+          (backend_ctx->kernel_gemm_noshuffle_q4_0_f32_coopmat && !backend_ctx->kernel_gemm_noshuffle_q4_0_f32_coopmat_q16))) {
         return false;
     }
     // The bin kernels transpose and multiply one 2-D matrix; a stacked weight keeps the
@@ -39463,6 +39472,13 @@ static void ggml_cl_mul_mat_q4_0_f32_adreno(ggml_backend_t backend, const ggml_t
     const bool use_bin = use_q4_0_bin_kernels(backend_ctx, src0);
 
     if (use_bin && ggml_cl_mul_mat_coopmat(backend_ctx, backend_ctx->kernel_gemm_noshuffle_q4_0_f32_coopmat,
+            { extra0_q4_0->q, extra0_q4_0->d }, src1, dst, K, M, N)) {
+        return;
+    }
+    // coopmat GEMM on the plain (16-bit transposed) layout, so decode keeps the plain GEMV
+    if (!use_bin && use_adreno_kernels(backend_ctx, src0) && !use_adreno_moe_kernels(backend_ctx, src0) &&
+        src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
+        ggml_cl_mul_mat_coopmat(backend_ctx, backend_ctx->kernel_gemm_noshuffle_q4_0_f32_coopmat_q16,
             { extra0_q4_0->q, extra0_q4_0->d }, src1, dst, K, M, N)) {
         return;
     }
