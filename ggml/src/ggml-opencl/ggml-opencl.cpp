@@ -263,6 +263,8 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 static void ggml_cl_soft_max(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
 static void ggml_cl_soft_max_ex(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, cl_mem sums, cl_mem qp = nullptr, cl_mem dp = nullptr, int qp_pitch = 0);
 static void ggml_cl_cpy(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
+struct ggml_backend_opencl_context;
+static bool ggml_cl_fa_coopmat_can_use(const ggml_backend_opencl_context * backend_ctx, const ggml_tensor * op);
 
 // See https://gmplib.org/~tege/divcnst-pldi94.pdf figure 4.1.
 // Precompute mp (m' in the paper) and L such that division
@@ -2181,6 +2183,12 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_coopmat_q16 = nullptr;
     cl_kernel kernel_pack_b_f16_attn_coopmat = nullptr;
     cl_kernel kernel_mul_mm_f16_f32_attn_coopmat = nullptr;
+    cl_kernel kernel_fa_coopmat_dk128 = nullptr;
+    cl_kernel kernel_fa_coopmat_dk128_sb = nullptr;
+    cl_kernel kernel_fa_coopmat_reduce = nullptr;
+    bool fa_coopmat_possible = false;
+    ggml_cl_buffer prealloc_fa_cm_part_o;
+    ggml_cl_buffer prealloc_fa_cm_part_ml;
     cl_kernel kernel_gemm_noshuffle_q5_k_f32_coopmat = nullptr;
     cl_kernel kernel_gemm_noshuffle_q6_k_f32_coopmat = nullptr;
     cl_kernel kernel_gemv_noshuffle_q4_k_f32_32b_trans;
@@ -5275,6 +5283,32 @@ static void load_cl_kernels_coopmat(ggml_backend_opencl_context * backend_ctx) {
             CL_CHECK((backend_ctx->kernel_pack_b_f16_attn_coopmat = clCreateKernel(prog, "kernel_pack_b_f16_attn_coopmat", &err), err));
             CL_CHECK((backend_ctx->kernel_mul_mm_f16_f32_attn_coopmat = clCreateKernel(prog, "kernel_mul_mm_f16_f32_attn_coopmat", &err), err));
             CL_CHECK(clReleaseProgram(prog));
+            GGML_LOG_CONT(".");
+        }
+    }
+
+    // flash_attn_coopmat_dk128 (fused FA, DK = DV = 128); GGML_OPENCL_FA_COOPMAT=0 skips it.
+    // The softmax is exp-bound, -cl-fast-relaxed-math is 1.6x at the same error.
+    if (const char * e = getenv("GGML_OPENCL_FA_COOPMAT"); !(e && e[0] == '0')) {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src {
+            #include "flash_attn_coopmat_dk128.cl.h"
+        };
+#else
+        const std::string kernel_src = read_file("flash_attn_coopmat_dk128.cl");
+#endif
+        cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), opts + " -cl-fast-relaxed-math", false);
+        if (prog) {
+            CL_CHECK((backend_ctx->kernel_fa_coopmat_dk128 = clCreateKernel(prog, "kernel_fa_coopmat_dk128", &err), err));
+            CL_CHECK((backend_ctx->kernel_fa_coopmat_reduce = clCreateKernel(prog, "kernel_fa_coopmat_reduce", &err), err));
+            CL_CHECK(clReleaseProgram(prog));
+            GGML_LOG_CONT(".");
+        }
+        // small-batch build (decode / spec verify): P streamed one chunk at a time into P.V
+        cl_program prog_sb = build_program_from_source(backend_ctx, kernel_src.c_str(), opts + " -cl-fast-relaxed-math -DFA_STREAM_P", false);
+        if (prog_sb) {
+            CL_CHECK((backend_ctx->kernel_fa_coopmat_dk128_sb = clCreateKernel(prog_sb, "kernel_fa_coopmat_dk128", &err), err));
+            CL_CHECK(clReleaseProgram(prog_sb));
             GGML_LOG_CONT(".");
         }
     }
@@ -15271,6 +15305,17 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
     }
 #endif
 
+    // cooperative matrix (Adreno 850): decides FLASH_ATTN_EXT support before the kernels are built
+    {
+        const char * e = getenv("GGML_OPENCL_FA_COOPMAT");
+        backend_ctx->fa_coopmat_possible =
+            strstr(ext_buffer.data(), "cl_qcom_kernel_cooperative_matrix") != NULL &&
+            strstr(backend_ctx->device_name.c_str(), "850") != NULL && !(e && e[0] == '0');
+        GGML_LOG_INFO("ggml_opencl: cl_qcom_kernel_cooperative_matrix %s, coopmat FA %s\n",
+            strstr(ext_buffer.data(), "cl_qcom_kernel_cooperative_matrix") ? "present" : "absent",
+            backend_ctx->fa_coopmat_possible ? "on" : "off");
+    }
+
     // subgroup shuffle support (N_SPLIT>1 FA kernel)
     backend_ctx->has_qcom_subgroup_shuffle = strstr(ext_buffer.data(), "cl_qcom_subgroup_shuffle") != NULL;
     backend_ctx->has_khr_subgroup_shuffle = strstr(ext_buffer.data(), "cl_khr_subgroup_shuffle") != NULL;
@@ -21020,6 +21065,10 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                 return true;
             }
 #endif
+            // the coopmat FA kernel builds on E17 (850), unlike the generic FA programs below
+            if (ggml_cl_fa_coopmat_can_use(backend_ctx, op)) {
+                return true;
+            }
             const ggml_tensor * q = op->src[0];
             const ggml_tensor * k = op->src[1];
             const ggml_tensor * v = op->src[2];
@@ -35105,6 +35154,145 @@ static void ggml_cl_flash_attn_prefill_bin(ggml_backend_t backend, const ggml_te
 
 static bool ggml_cl_flash_attn_sparse(ggml_backend_t backend, const ggml_tensor * q, const ggml_tensor * k, ggml_tensor * dst);
 
+// Fused coopmat flash attention (cl_qcom_kernel_cooperative_matrix, Adreno 850): DK = DV = 128,
+// f32 Q, f16 K/V, f16 mask, no sinks / ALiBi / softcap, KV length a multiple of 64.
+static bool ggml_cl_fa_coopmat_can_use(const ggml_backend_opencl_context * backend_ctx, const ggml_tensor * op) {
+    // kernels are built lazily (first buffer allocation), after supports_op is first asked:
+    // gate on the device capability; ggml_cl_fa_coopmat_run checks that the kernel did build
+    if (!backend_ctx || !backend_ctx->fa_coopmat_possible ||
+        (backend_ctx->kernels_loaded && backend_ctx->kernel_fa_coopmat_dk128 == nullptr)) {
+        return false;
+    }
+    const ggml_tensor * q    = op->src[0];
+    const ggml_tensor * k    = op->src[1];
+    const ggml_tensor * v    = op->src[2];
+    const ggml_tensor * mask = op->src[3];
+    // no sinks, no n_kv_max hint (the decomposed path serves the gathered QSA cells)
+    if (op->src[4] != nullptr || op->src[5] != nullptr || ggml_get_op_params_i32(op, 4) > 0 || mask == nullptr) {
+        return false;
+    }
+    if (q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16 ||
+        mask->type != GGML_TYPE_F16 || op->type != GGML_TYPE_F32) {
+        return false;
+    }
+    float max_bias, softcap;
+    memcpy(&max_bias, (const float *) op->op_params + 1, sizeof(float));
+    memcpy(&softcap,  (const float *) op->op_params + 2, sizeof(float));
+    const int64_t n_head = q->ne[2], n_head_kv = k->ne[2];
+    return q->ne[0] == 128 && k->ne[0] == 128 && v->ne[0] == 128 &&
+           max_bias == 0.0f && softcap == 0.0f &&
+           k->ne[1] % 64 == 0 && v->ne[1] == k->ne[1] && mask->ne[0] >= k->ne[1] && mask->ne[1] >= q->ne[1] &&
+           q->ne[3] == 1 && k->ne[3] == 1 && v->ne[3] == 1 && mask->ne[2] == 1 && mask->ne[3] == 1 &&
+           n_head_kv > 0 && n_head % n_head_kv == 0 && n_head / n_head_kv <= 64 && v->ne[2] == n_head_kv &&
+           q->nb[0] == sizeof(float) && k->nb[0] == sizeof(ggml_fp16_t) && v->nb[0] == sizeof(ggml_fp16_t) &&
+           mask->nb[0] == sizeof(ggml_fp16_t) && (k->nb[1] % 2) == 0 && (v->nb[1] % 2) == 0 &&
+           ggml_is_contiguous(op);
+}
+
+static void ggml_cl_fa_coopmat_run(ggml_backend_t backend, ggml_tensor * dst) {
+    auto * backend_ctx = (ggml_backend_opencl_context *) backend->context;
+    const ggml_tensor * q    = dst->src[0];
+    const ggml_tensor * k    = dst->src[1];
+    const ggml_tensor * v    = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+
+    if (backend_ctx->kernel_fa_coopmat_dk128 == nullptr) {
+        GGML_ABORT("ggml_opencl: FLASH_ATTN_EXT was accepted for the coopmat kernel but it failed to build; "
+                   "set GGML_OPENCL_FA_COOPMAT=0");
+    }
+
+    const int n_q       = q->ne[1];
+    const int n_kv      = k->ne[1];
+    const int n_head    = q->ne[2];
+    const int n_head_kv = k->ne[2];
+    const int G         = n_head / n_head_kv;
+    float scale;
+    memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
+
+    // small batches (decode, spec verify): fold the G query heads sharing a kv head into one wave,
+    // and split the KV across waves when there are too few of them to fill the GPU
+    const int F       = (n_q < 64 && G > 1) ? G : 1;
+    const int T       = 64 / F;
+    const int n_rowwg = (n_q + T - 1) / T;
+    const int n_waves = n_rowwg * (F == 1 ? n_head : n_head_kv);
+    int n_split = 1;
+    if (n_waves < 48) {
+        n_split = std::max(1, std::min(4, n_kv / 256));
+    }
+    const int kv_per_split = ((n_kv / 64 + n_split - 1) / n_split) * 64;
+
+    auto * eq = (ggml_tensor_extra_cl *) q->extra;
+    auto * ek = (ggml_tensor_extra_cl *) k->extra;
+    auto * ev = (ggml_tensor_extra_cl *) v->extra;
+    auto * em = (ggml_tensor_extra_cl *) mask->extra;
+    auto * ed = (ggml_tensor_extra_cl *) dst->extra;
+
+    // base buffers + byte offsets: no per-call sub-buffers (host cost matters at decode)
+    cl_ulong offq = eq->offset + q->view_offs;
+    cl_ulong offk = ek->offset + k->view_offs;
+    cl_ulong offv = ev->offset + v->view_offs;
+    cl_ulong offm = em->offset + mask->view_offs;
+    cl_ulong offd = ed->offset + dst->view_offs;
+
+    const size_t part_rows = (size_t) n_split * n_head * n_q;
+    backend_ctx->prealloc_fa_cm_part_o.allocate(backend_ctx->context,  std::max<size_t>(16, n_split > 1 ? part_rows * 128 * sizeof(float) : 16));
+    backend_ctx->prealloc_fa_cm_part_ml.allocate(backend_ctx->context, std::max<size_t>(16, n_split > 1 ? part_rows * 2 * sizeof(float) : 16));
+
+    cl_ulong nbq1 = q->nb[1], nbq2 = q->nb[2];
+    cl_ulong nbk1 = k->nb[1], nbk2 = k->nb[2];
+    cl_ulong nbv1 = v->nb[1], nbv2 = v->nb[2];
+    cl_ulong nbm1 = mask->nb[1];
+
+    cl_kernel kn = (F > 1 && backend_ctx->kernel_fa_coopmat_dk128_sb) ? backend_ctx->kernel_fa_coopmat_dk128_sb
+                                                                     : backend_ctx->kernel_fa_coopmat_dk128;
+    cl_uint a = 0;
+    CL_CHECK(clSetKernelArg(kn, a++, sizeof(cl_mem),   &eq->data_device));
+    CL_CHECK(clSetKernelArg(kn, a++, sizeof(cl_ulong), &offq));
+    CL_CHECK(clSetKernelArg(kn, a++, sizeof(cl_ulong), &nbq1));
+    CL_CHECK(clSetKernelArg(kn, a++, sizeof(cl_ulong), &nbq2));
+    CL_CHECK(clSetKernelArg(kn, a++, sizeof(cl_mem),   &ek->data_device));
+    CL_CHECK(clSetKernelArg(kn, a++, sizeof(cl_ulong), &offk));
+    CL_CHECK(clSetKernelArg(kn, a++, sizeof(cl_ulong), &nbk1));
+    CL_CHECK(clSetKernelArg(kn, a++, sizeof(cl_ulong), &nbk2));
+    CL_CHECK(clSetKernelArg(kn, a++, sizeof(cl_mem),   &ev->data_device));
+    CL_CHECK(clSetKernelArg(kn, a++, sizeof(cl_ulong), &offv));
+    CL_CHECK(clSetKernelArg(kn, a++, sizeof(cl_ulong), &nbv1));
+    CL_CHECK(clSetKernelArg(kn, a++, sizeof(cl_ulong), &nbv2));
+    CL_CHECK(clSetKernelArg(kn, a++, sizeof(cl_mem),   &em->data_device));
+    CL_CHECK(clSetKernelArg(kn, a++, sizeof(cl_ulong), &offm));
+    CL_CHECK(clSetKernelArg(kn, a++, sizeof(cl_ulong), &nbm1));
+    CL_CHECK(clSetKernelArg(kn, a++, sizeof(cl_mem),   &ed->data_device));
+    CL_CHECK(clSetKernelArg(kn, a++, sizeof(cl_ulong), &offd));
+    CL_CHECK(clSetKernelArg(kn, a++, sizeof(cl_mem),   &backend_ctx->prealloc_fa_cm_part_o.buffer));
+    CL_CHECK(clSetKernelArg(kn, a++, sizeof(cl_mem),   &backend_ctx->prealloc_fa_cm_part_ml.buffer));
+    CL_CHECK(clSetKernelArg(kn, a++, sizeof(int),      &n_q));
+    CL_CHECK(clSetKernelArg(kn, a++, sizeof(int),      &n_kv));
+    CL_CHECK(clSetKernelArg(kn, a++, sizeof(int),      &n_head));
+    CL_CHECK(clSetKernelArg(kn, a++, sizeof(int),      &n_head_kv));
+    CL_CHECK(clSetKernelArg(kn, a++, sizeof(float),    &scale));
+    CL_CHECK(clSetKernelArg(kn, a++, sizeof(int),      &F));
+    CL_CHECK(clSetKernelArg(kn, a++, sizeof(int),      &kv_per_split));
+
+    size_t lws[3] = { 64, 1, 1 };
+    size_t gws[3] = { (size_t) n_rowwg * 64, (size_t) (F == 1 ? n_head : n_head_kv), (size_t) n_split };
+    backend_ctx->enqueue_ndrange_kernel(kn, 3, gws, lws, dst);
+
+    if (n_split > 1) {
+        cl_kernel kr = backend_ctx->kernel_fa_coopmat_reduce;
+        a = 0;
+        CL_CHECK(clSetKernelArg(kr, a++, sizeof(cl_mem), &backend_ctx->prealloc_fa_cm_part_o.buffer));
+        CL_CHECK(clSetKernelArg(kr, a++, sizeof(cl_mem), &backend_ctx->prealloc_fa_cm_part_ml.buffer));
+        CL_CHECK(clSetKernelArg(kr, a++, sizeof(cl_mem), &ed->data_device));
+        CL_CHECK(clSetKernelArg(kr, a++, sizeof(cl_ulong), &offd));
+        CL_CHECK(clSetKernelArg(kr, a++, sizeof(int),    &n_q));
+        CL_CHECK(clSetKernelArg(kr, a++, sizeof(int),    &n_head));
+        CL_CHECK(clSetKernelArg(kr, a++, sizeof(int),    &n_split));
+        size_t rgws[3] = { 128, (size_t) n_head, (size_t) n_q };
+        size_t rlws[3] = { 64, 1, 1 };
+        backend_ctx->enqueue_ndrange_kernel(kr, 3, rgws, rlws, dst);
+    }
+}
+
 static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, const ggml_tensor * k, ggml_tensor * dst) {
     const ggml_tensor * v = dst->src[2];
     const ggml_tensor * mask = dst->src[3];
@@ -35142,6 +35330,11 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         return;
     }
 #endif
+
+    if (ggml_cl_fa_coopmat_can_use(backend_ctx, dst)) {
+        ggml_cl_fa_coopmat_run(backend, dst);
+        return;
+    }
 
     // DK=512 (Gemma-4 global layers) runs decode-only (q1 / q1_split) on
     // Adreno — it never uses the BM-tile path, and the prepass + split-tile
