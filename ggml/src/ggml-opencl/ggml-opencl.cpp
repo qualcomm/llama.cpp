@@ -54512,6 +54512,8 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     const bool use_moe_dp4a = q4_0_moe_dp4a_env
                         ? (atoi(q4_0_moe_dp4a_env) != 0)
                         : (backend_ctx->adreno_dp4a_moe()
+                           // the register-A coopmat GEMM (Adreno 850) outranks dp4a: granite-3.0-3b-a800m Q4_0 pp512 +21%
+                           && !ggml_cl_moe_coopmat_rp_on(backend_ctx, backend_ctx->kernel_gemm_moe_q4_0_f32_ns_coopmat)
                            && (dp4a_bin_available || !bin_available || moe_routings < moe_bin_min));
                     const bool use_bin_kernel = bin_available && !use_moe_dp4a;
 
