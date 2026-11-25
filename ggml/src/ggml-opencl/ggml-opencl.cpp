@@ -56883,6 +56883,8 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     const bool use_moe_dp4a = use_moe_dp4a_ldck || (mxfp4_moe_dp4a_env
                         ? (atoi(mxfp4_moe_dp4a_env) != 0)
                         : (backend_ctx->adreno_dp4a_moe()
+                           // the coopmat GEMM (Adreno 850) outranks the dp4a one: gpt-oss-20b pp512 +43%, PPL nearer the CPU
+                           && backend_ctx->kernel_gemm_moe_mxfp4_f32_ns_coopmat == nullptr
                            // the dp4a bin kernel outranks the plain ILA bin kernel
                            && (backend_ctx->kernel_gemm_moe_mxfp4_q8_1_dp4a_bin != nullptr ||
                                backend_ctx->kernel_gemm_moe_mxfp4_f32_ns_bin == nullptr)));
