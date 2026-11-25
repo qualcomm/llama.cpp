@@ -2179,6 +2179,8 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemm_noshuffle_q8_0_f32_coopmat = nullptr;
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_coopmat = nullptr;
     cl_kernel kernel_gemm_noshuffle_q4_k_f32_coopmat_q16 = nullptr;
+    cl_kernel kernel_pack_b_f16_attn_coopmat = nullptr;
+    cl_kernel kernel_mul_mm_f16_f32_attn_coopmat = nullptr;
     cl_kernel kernel_gemm_noshuffle_q5_k_f32_coopmat = nullptr;
     cl_kernel kernel_gemm_noshuffle_q6_k_f32_coopmat = nullptr;
     cl_kernel kernel_gemv_noshuffle_q4_k_f32_32b_trans;
@@ -5255,6 +5257,24 @@ static void load_cl_kernels_coopmat(ggml_backend_opencl_context * backend_ctx) {
         if (prog16) {
             CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_k_f32_coopmat_q16 = clCreateKernel(prog16, "kernel_gemm_noshuffle_q4_k_f32_coopmat_q16", &err), err));
             CL_CHECK(clReleaseProgram(prog16));
+            GGML_LOG_CONT(".");
+        }
+    }
+
+    // mul_mm_f16_f32_attn_coopmat (attention KQ / KQV)
+    {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src {
+            #include "mul_mm_f16_f32_attn_coopmat.cl.h"
+        };
+#else
+        const std::string kernel_src = read_file("mul_mm_f16_f32_attn_coopmat.cl");
+#endif
+        cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), opts, false);
+        if (prog) {
+            CL_CHECK((backend_ctx->kernel_pack_b_f16_attn_coopmat = clCreateKernel(prog, "kernel_pack_b_f16_attn_coopmat", &err), err));
+            CL_CHECK((backend_ctx->kernel_mul_mm_f16_f32_attn_coopmat = clCreateKernel(prog, "kernel_mul_mm_f16_f32_attn_coopmat", &err), err));
+            CL_CHECK(clReleaseProgram(prog));
             GGML_LOG_CONT(".");
         }
     }
@@ -38511,6 +38531,76 @@ static bool ggml_cl_mul_mat_coopmat(ggml_backend_opencl_context * backend_ctx, c
     return true;
 }
 
+// Attention KQ / KQV (f16 cache x f32, batched over heads with GQA broadcast) on the coopmat GEMM.
+// src0 [K, M, ne02] f16 with k contiguous, src1 [K, N, ne12] f32 with k contiguous, dst [M, N, ne12] f32 contiguous.
+static bool ggml_cl_mul_mat_attn_coopmat(ggml_backend_opencl_context * backend_ctx,
+                                         const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    if (backend_ctx->kernel_mul_mm_f16_f32_attn_coopmat == nullptr ||
+        src0->type != GGML_TYPE_F16 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+    const int K    = src0->ne[0];
+    const int M    = src0->ne[1];
+    const int ne02 = src0->ne[2];
+    const int N    = src1->ne[1];
+    const int ne12 = src1->ne[2];
+    if (K % 16 != 0 || M % 64 != 0 || N < 2 || ne02 == 0 || ne12 % ne02 != 0 ||
+        src0->ne[3] != 1 || src1->ne[3] != 1 ||
+        src0->nb[0] != sizeof(ggml_fp16_t) || src1->nb[0] != sizeof(float) ||
+        (src0->nb[1] % 2) != 0 || (src1->nb[1] % 16) != 0 || (src1->nb[2] % 16) != 0 ||
+        !ggml_is_contiguous(dst)) {
+        return false;
+    }
+    ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *)src0->extra;
+    ggml_tensor_extra_cl * extra1 = (ggml_tensor_extra_cl *)src1->extra;
+    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
+    cl_ulong offset0 = extra0->offset + src0->view_offs;
+    cl_ulong offset1 = extra1->offset + src1->view_offs;
+    cl_ulong offsetd = extrad->offset + dst->view_offs;
+    if ((offset1 % 16) != 0 || (offset0 % 2) != 0) {
+        return false;
+    }
+    cl_ulong nb01 = src0->nb[1], nb02 = src0->nb[2];
+    cl_ulong nb11 = src1->nb[1], nb12 = src1->nb[2];
+    const int r2 = ne12 / ne02;
+
+    const int n_tiles = CEIL_DIV(N, 64);
+    backend_ctx->prealloc_act_trans.allocate(backend_ctx->context, (size_t)ne12 * n_tiles * 64 * K * sizeof(cl_half));
+
+    cl_kernel pk = backend_ctx->kernel_pack_b_f16_attn_coopmat;
+    CL_CHECK(clSetKernelArg(pk, 0, sizeof(cl_mem),   &extra1->data_device));
+    CL_CHECK(clSetKernelArg(pk, 1, sizeof(cl_ulong), &offset1));
+    CL_CHECK(clSetKernelArg(pk, 2, sizeof(cl_ulong), &nb11));
+    CL_CHECK(clSetKernelArg(pk, 3, sizeof(cl_ulong), &nb12));
+    CL_CHECK(clSetKernelArg(pk, 4, sizeof(cl_mem),   &backend_ctx->prealloc_act_trans.buffer));
+    CL_CHECK(clSetKernelArg(pk, 5, sizeof(int),      &K));
+    CL_CHECK(clSetKernelArg(pk, 6, sizeof(int),      &N));
+    size_t p_local[3]  = { 64, 4, 1 };
+    size_t p_global[3] = { (size_t)n_tiles * 64, (size_t)CEIL_DIV(K, 64) * 4, (size_t)ne12 };
+    backend_ctx->enqueue_ndrange_kernel(pk, 3, p_global, p_local, dst);
+
+    cl_kernel kernel = backend_ctx->kernel_mul_mm_f16_f32_attn_coopmat;
+    cl_uint ka = 0;
+    CL_CHECK(clSetKernelArg(kernel, ka++, sizeof(cl_mem),   &extra0->data_device));
+    CL_CHECK(clSetKernelArg(kernel, ka++, sizeof(cl_ulong), &offset0));
+    CL_CHECK(clSetKernelArg(kernel, ka++, sizeof(cl_ulong), &nb01));
+    CL_CHECK(clSetKernelArg(kernel, ka++, sizeof(cl_ulong), &nb02));
+    CL_CHECK(clSetKernelArg(kernel, ka++, sizeof(cl_mem),   &backend_ctx->prealloc_act_trans.buffer));
+    CL_CHECK(clSetKernelArg(kernel, ka++, sizeof(cl_mem),   &extrad->data_device));
+    CL_CHECK(clSetKernelArg(kernel, ka++, sizeof(cl_ulong), &offsetd));
+    CL_CHECK(clSetKernelArg(kernel, ka++, sizeof(int),      &K));
+    CL_CHECK(clSetKernelArg(kernel, ka++, sizeof(int),      &M));
+    CL_CHECK(clSetKernelArg(kernel, ka++, sizeof(int),      &N));
+    CL_CHECK(clSetKernelArg(kernel, ka++, sizeof(int),      &ne12));
+    CL_CHECK(clSetKernelArg(kernel, ka++, sizeof(int),      &r2));
+
+    const int n_z = n_tiles * ne12;
+    size_t c_local[3]  = { 64, 1, 4 };
+    size_t c_global[3] = { 64, (size_t)(M / 64), (size_t)CEIL_DIV(n_z, 4) * 4 };
+    backend_ctx->enqueue_ndrange_kernel(kernel, 3, c_global, c_local, dst);
+    return true;
+}
+
 static void ggml_cl_mul_mat_q4_0_f32_adreno_ila(ggml_backend_t backend, const ggml_tensor * src0,
                                                 const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_ASSERT(src0);
@@ -47223,6 +47313,9 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 nb10 <= nb12 &&
                 nb12 <= nb11 &&
                 nb11 <= nb13) {
+                if (ggml_cl_mul_mat_attn_coopmat(backend_ctx, src0, src1, dst)) {
+                    return;
+                }
                 ggml_cl_mul_mat_kq_kqv_adreno(backend, src0, src1, dst, /*is_kq =*/ true);
                 return;
             }
@@ -47261,6 +47354,11 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 (kqv_weights_on || !src0_is_weight) &&
                 (ne02 == 1 || nb02 == nb01 * ne01) &&
                 ((nb01 * ne01 * ne02 / 4)/4 <= backend_ctx->image_max_buffer_size)) {
+                // the coopmat GEMM is validated on the upstream KQV layout: transposed V, packed probs
+                if (!ggml_is_contiguous(src0) && ggml_is_contiguous(src1) &&
+                    ggml_cl_mul_mat_attn_coopmat(backend_ctx, src0, src1, dst)) {
+                    return;
+                }
                 ggml_cl_mul_mat_kq_kqv_adreno(backend, src0, src1, dst, /*is_kq =*/ false);
                 return;
             }
