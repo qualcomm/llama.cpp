@@ -308,6 +308,7 @@ set(GGML_OPENCL_KERNELS
     gemm_noshuffle_q4_k_f32_coopmat
     gemm_noshuffle_q5_k_f32_coopmat
     gemm_noshuffle_q6_k_f32_coopmat
+    mul_mm_f16_f32_attn_coopmat
     quant_a_q8_1
     gemv_moe_q4_k_f32_ns
     gemm_moe_q5_k_f32_ns
