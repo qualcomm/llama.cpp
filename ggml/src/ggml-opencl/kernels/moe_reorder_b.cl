@@ -60,3 +60,39 @@ kernel void kernel_moe_reorder_b_f16(
     float4 b = src[activation_idx * K / 4 + k_8 * 2 + 1];
     vstore8(convert_half8((float8)(a.x, b.x, a.y, b.y, a.z, b.z, a.w, b.w)), 0, dst + (ulong)post_router_idx * K + k_8 * 8);
 }
+
+// Packed f16 variant for kernel_gemm_moe_mxfp4_f32_ns_coopmat_rp: the same values and k order as
+// kernel_moe_reorder_b_f16, laid out as [tile][K/16][32 slots][16 k] so that each 16x32 B block of
+// the GEMM is contiguous (column-major, ld 16). One work-item per 8 k.
+kernel void kernel_moe_reorder_b_f16_packed(
+    global float4 * src,
+    global uint * router,
+    global half * dst,
+    global int * total_tiles,
+    uint K,
+    ushort map_ratio,
+    uint tile_size
+) {
+    uint k_8 = get_global_id(0);
+    uint post_router_idx = get_global_id(1);
+
+    if ((k_8 >= (K / 8)) || (post_router_idx >= total_tiles[0] * tile_size)) {
+        return;
+    }
+
+    const uint tile = post_router_idx / tile_size;
+    const uint slot = post_router_idx % tile_size;
+    global half * out = dst + (((ulong)tile * (K / 16) + k_8 / 2) * tile_size + slot) * 16 + (k_8 & 1) * 8;
+
+    // padded slots only affect their own (not stored) columns of C, but keep them finite
+    uint router_idx = router[post_router_idx];
+    if (router_idx == 0xFFFFFFFF) {
+        vstore8((half8)(0.0h), 0, out);
+        return;
+    }
+
+    uint activation_idx = router_idx / map_ratio;
+    float4 a = src[activation_idx * K / 4 + k_8 * 2];
+    float4 b = src[activation_idx * K / 4 + k_8 * 2 + 1];
+    vstore8(convert_half8((float8)(a.x, b.x, a.y, b.y, a.z, b.z, a.w, b.w)), 0, out);
+}

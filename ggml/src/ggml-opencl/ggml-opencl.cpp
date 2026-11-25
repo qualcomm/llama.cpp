@@ -1796,7 +1796,9 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemm_moe_q4_k_q8_1_dp4a_bin = nullptr;   // binary dp4a (int8) q4_k MoE prefill GEMM
     cl_kernel kernel_gemm_moe_q6_k_q8_1_dp4a_bin = nullptr;    // binary dp4a (int8) q6_k MoE prefill GEMM
     cl_kernel kernel_moe_reorder_b;
-    cl_kernel kernel_moe_reorder_b_f16 = nullptr;                 // f16 B for the coopmat mxfp4 MoE GEMM
+    cl_kernel kernel_moe_reorder_b_f16 = nullptr;
+    cl_kernel kernel_moe_reorder_b_f16_packed = nullptr;          // packed f16 B for the _rp coopmat mxfp4 MoE GEMM
+    cl_kernel kernel_gemm_moe_mxfp4_f32_ns_coopmat_rp = nullptr;  // register-A / packed-B coopmat mxfp4 MoE GEMM                 // f16 B for the coopmat mxfp4 MoE GEMM
     cl_kernel kernel_gemm_moe_mxfp4_f32_ns_coopmat = nullptr;     // cl_qcom_kernel_cooperative_matrix mxfp4 MoE prefill GEMM, A850 only
     cl_kernel kernel_gemm_moe_q4_0_f32_ns_coopmat = nullptr;   // cl_qcom_kernel_cooperative_matrix q4_0 MoE prefill GEMM, A850 only
     cl_kernel kernel_gemm_moe_q4_1_f32_ns_coopmat = nullptr;   // cl_qcom_kernel_cooperative_matrix q4_1 MoE prefill GEMM, A850 only
@@ -5401,6 +5403,29 @@ static void load_cl_kernels_coopmat(ggml_backend_opencl_context * backend_ctx) {
         cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), coopmat_opts, false);
         if (prog) {
             CL_CHECK((backend_ctx->kernel_gemm_moe_mxfp4_f32_ns_coopmat = clCreateKernel(prog, "kernel_gemm_moe_mxfp4_f32_ns_coopmat", &err), err));
+            CL_CHECK(clReleaseProgram(prog));
+            GGML_LOG_CONT(".");
+        }
+    }
+    // gemm_moe_mxfp4_f32_ns_coopmat_rp: the same GEMM with A dequantized into registers and a packed B,
+    // in its own program for the reason given in the kernel source
+    backend_ctx->kernel_gemm_moe_mxfp4_f32_ns_coopmat_rp = nullptr;
+    {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src {
+            #include "gemm_moe_mxfp4_f32_ns_coopmat_rp.cl.h"
+        };
+#else
+        const std::string kernel_src = read_file("gemm_moe_mxfp4_f32_ns_coopmat_rp.cl");
+#endif
+        std::string coopmat_opts =
+            " -cl-std=CL3.0 "
+            " -qcom-ray-tracing-kernel "
+            " -qcom-disable-promote-pointer-to-texture ";
+
+        cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), coopmat_opts, false);
+        if (prog) {
+            CL_CHECK((backend_ctx->kernel_gemm_moe_mxfp4_f32_ns_coopmat_rp = clCreateKernel(prog, "kernel_gemm_moe_mxfp4_f32_ns_coopmat_rp", &err), err));
             CL_CHECK(clReleaseProgram(prog));
             GGML_LOG_CONT(".");
         }
@@ -12240,6 +12265,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 
         CL_CHECK((backend_ctx->kernel_moe_reorder_b = clCreateKernel(prog, "kernel_moe_reorder_b", &err), err));
         CL_CHECK((backend_ctx->kernel_moe_reorder_b_f16 = clCreateKernel(prog, "kernel_moe_reorder_b_f16", &err), err));
+        CL_CHECK((backend_ctx->kernel_moe_reorder_b_f16_packed = clCreateKernel(prog, "kernel_moe_reorder_b_f16_packed", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
@@ -56909,8 +56935,15 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     const bool use_moe_coopmat = !use_moe_dp4a &&
                                                  (mxfp4_moe_coopmat_env ? (atoi(mxfp4_moe_coopmat_env) != 0) : true) &&
                                                  backend_ctx->kernel_gemm_moe_mxfp4_f32_ns_coopmat != nullptr;
+                    // register-A / packed-B variant, GGML_OPENCL_MXFP4_MOE_COOPMAT_RP=0 keeps the original
+                    static const char * mxfp4_moe_coopmat_rp_env = getenv("GGML_OPENCL_MXFP4_MOE_COOPMAT_RP");
+                    const bool use_moe_coopmat_rp = use_moe_coopmat &&
+                                                    (mxfp4_moe_coopmat_rp_env ? (atoi(mxfp4_moe_coopmat_rp_env) != 0) : true) &&
+                                                    backend_ctx->kernel_gemm_moe_mxfp4_f32_ns_coopmat_rp != nullptr &&
+                                                    backend_ctx->kernel_moe_reorder_b_f16_packed != nullptr;
                     if (use_moe_coopmat) {
-                        kernel = backend_ctx->kernel_gemm_moe_mxfp4_f32_ns_coopmat;
+                        kernel = use_moe_coopmat_rp ? backend_ctx->kernel_gemm_moe_mxfp4_f32_ns_coopmat_rp
+                                                    : backend_ctx->kernel_gemm_moe_mxfp4_f32_ns_coopmat;
                     }
 
                     cl_buffer_region region;
@@ -56948,7 +56981,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                             &status);
                         CL_CHECK(status);
 
-                        cl_kernel rk = backend_ctx->kernel_moe_reorder_b_f16;
+                        cl_kernel rk = use_moe_coopmat_rp ? backend_ctx->kernel_moe_reorder_b_f16_packed : backend_ctx->kernel_moe_reorder_b_f16;
                         CL_CHECK(clSetKernelArg(rk, 0, sizeof(cl_mem),         &sub_buf_src1_pre));
                         CL_CHECK(clSetKernelArg(rk, 1, sizeof(cl_mem),         &buf_src2));
                         CL_CHECK(clSetKernelArg(rk, 2, sizeof(cl_mem),         &buf_src1_reordered));
