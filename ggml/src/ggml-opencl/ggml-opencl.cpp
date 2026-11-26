@@ -16016,12 +16016,17 @@ struct ggml_tensor_extra_cl {
     // dequantizes a quantized attention operand into. That copy is packed
     // head-major, which is not the layout the Adreno KQ/KQV kernels admit by.
     bool dequant_scratch;
+    // f16 copy of a 2-D f32 weight, read by the single-token GEMV instead of the f32
+    // data (which stays as is for every other use). Owned by this extra.
+    cl_mem f16_shadow;
 
     void reset() {
         data_device = nullptr;
         offset = 0;
         actual_size = 0;
         dequant_scratch = false;
+        if (f16_shadow) { clReleaseMemObject(f16_shadow); }
+        f16_shadow = nullptr;
     }
 };
 
@@ -25238,6 +25243,26 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
     CL_CHECK(clEnqueueWriteBuffer(
         queue, extra->data_device, CL_TRUE, extra->offset + tensor->view_offs + offset,
         size, data, 0, NULL, NULL));
+    // Adreno 850: keep an f16 copy of whole 2-D f32 weights for the decode GEMV, which
+    // is memory bound and reads half the bytes from it (gemma-4 E4B/E2B per-layer
+    // inp_gate/proj). GGML_OPENCL_F32W_F16=0/1 forces either way.
+    {
+        static const int f32w_f16_env = []{ const char * e = getenv("GGML_OPENCL_F32W_F16"); return (e && e[0]) ? atoi(e) : -1; }();
+        const bool on = f32w_f16_env >= 0 ? f32w_f16_env != 0 : backend_ctx->adreno_850;
+        if (on && tensor->type == GGML_TYPE_F32 && tensor->view_src == nullptr && offset == 0 &&
+            size == ggml_nbytes(tensor) && ggml_n_dims(tensor) == 2 && ggml_is_contiguous(tensor) &&
+            tensor->ne[0] % 8 == 0 && tensor->ne[1] >= 64 &&
+            ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+            const size_t n = (size_t) ggml_nelements(tensor);
+            std::vector<ggml_fp16_t> h16(n);
+            ggml_fp32_to_fp16_row((const float *) data, h16.data(), (int64_t) n);
+            cl_int err;
+            cl_mem sh = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, n * sizeof(ggml_fp16_t), h16.data(), &err);
+            CL_CHECK(err);
+            if (extra->f16_shadow) { CL_CHECK(clReleaseMemObject(extra->f16_shadow)); }
+            extra->f16_shadow = sh;
+        }
+    }
 
     GGML_UNUSED(buffer);
 }
@@ -47101,6 +47126,25 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
     const enum ggml_type src1t = src1->type;
 
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
+
+    // single-token GEMV over an f32 weight that has an f16 copy (see set_tensor)
+    if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && src1->ne[1] == 1 &&
+        src1->ne[2] == 1 && src1->ne[3] == 1 && src0->view_src == nullptr &&
+        ((ggml_tensor_extra_cl *) src0->extra)->f16_shadow != nullptr) {
+        ggml_tensor          f16_src0   = *src0;
+        ggml_tensor_extra_cl f16_extra  = {};
+        f16_extra.data_device = ((ggml_tensor_extra_cl *) src0->extra)->f16_shadow;
+        f16_extra.offset      = 0;
+        f16_src0.type      = GGML_TYPE_F16;
+        f16_src0.extra     = &f16_extra;
+        f16_src0.view_offs = 0;
+        f16_src0.nb[0] = sizeof(ggml_fp16_t);
+        f16_src0.nb[1] = f16_src0.nb[0] * src0->ne[0];
+        f16_src0.nb[2] = f16_src0.nb[1] * src0->ne[1];
+        f16_src0.nb[3] = f16_src0.nb[2] * src0->ne[2];
+        ggml_cl_mul_mat(backend, &f16_src0, src1, dst);
+        return;
+    }
 
     if (ggml_get_op_params_i32(dst, 1) == GGML_HINT_SRC0_IS_HADAMARD && ggml_cl_fwht(backend, src1, dst)) {
         return;
