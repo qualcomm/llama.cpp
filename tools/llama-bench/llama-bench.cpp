@@ -367,6 +367,8 @@ struct cmd_params {
     std::vector<bool>                repack;
     std::vector<size_t>              fit_params_target;
     std::vector<uint32_t>            fit_params_min_ctx;
+    bool                             expert_cache_enabled;
+    std::vector<uint64_t>            expert_cache_size_bytes;
     ggml_numa_strategy               numa;
     int                              reps;
     ggml_sched_priority              prio;
@@ -413,6 +415,8 @@ static const cmd_params cmd_params_defaults = {
     /* repack               */ { llama_model_default_params().use_extra_bufts },
     /* fit_params_target    */ { 0 },
     /* fit_params_min_ctx   */ { 0 },
+    /* expert_cache_enabled    */ false,
+    /* expert_cache_size_bytes */ { 0 },
     /* numa                 */ GGML_NUMA_STRATEGY_DISABLED,
     /* reps                 */ 5,
     /* prio                 */ GGML_SCHED_PRIO_NORMAL,
@@ -486,6 +490,8 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -nopo, --no-op-offload <0|1>                      (default: 0)\n");
     printf("  --no-host <0|1>                                   (default: %s)\n", join(cmd_params_defaults.no_host, ",").c_str());
     printf("  --repack <0|1>                                    (default: %s)\n", join(cmd_params_defaults.repack, ",").c_str());
+    printf("  --expert-cache                                    (default: disabled)\n");
+    printf("  --expert-cache-size <bytes,..>                    (default: 0 = environment or model minimum)\n");
     printf("\n");
     printf(
         "Multiple values can be given for each parameter by separating them with ','\n"
@@ -542,6 +548,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     params.progress             = cmd_params_defaults.progress;
     params.no_warmup            = cmd_params_defaults.no_warmup;
     params.offline              = cmd_params_defaults.offline;
+    params.expert_cache_enabled = cmd_params_defaults.expert_cache_enabled;
 
     if (const char * env = getenv("HF_TOKEN")) {
         params.hf_token = env;
@@ -919,6 +926,15 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = string_split<bool>(argv[i], split_delim);
                 params.repack.insert(params.repack.end(), p.begin(), p.end());
+            } else if (arg == "--expert-cache") {
+                params.expert_cache_enabled = true;
+            } else if (arg == "--expert-cache-size") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = string_split<uint64_t>(argv[i], split_delim);
+                params.expert_cache_size_bytes.insert(params.expert_cache_size_bytes.end(), p.begin(), p.end());
             } else if (arg == "-ts" || arg == "--tensor-split") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1207,7 +1223,9 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.fit_params_min_ctx.empty()) {
         params.fit_params_min_ctx = cmd_params_defaults.fit_params_min_ctx;
     }
-
+    if (params.expert_cache_size_bytes.empty()) {
+        params.expert_cache_size_bytes = cmd_params_defaults.expert_cache_size_bytes;
+    }
     return params;
 }
 
@@ -1241,6 +1259,8 @@ struct cmd_params_instance {
     bool               repack;
     size_t             fit_target;
     uint32_t           fit_min_ctx;
+    bool               expert_cache_enabled;
+    uint64_t           expert_cache_size_bytes;
 
     llama_model_params to_llama_mparams() const {
         llama_model_params mparams = llama_model_default_params();
@@ -1256,6 +1276,12 @@ struct cmd_params_instance {
         mparams.tensor_split  = tensor_split.data();
         mparams.no_host       = no_host;
         mparams.use_extra_bufts = repack;
+
+        mparams.expert_cache_enabled = expert_cache_enabled;
+        // Zero uses the environment or model minimum.
+        if (expert_cache_size_bytes > 0) {
+            mparams.expert_cache_size_bytes = expert_cache_size_bytes;
+        }
 
         if (n_cpu_moe <= 0) {
             if (tensor_buft_overrides.empty()) {
@@ -1302,7 +1328,9 @@ struct cmd_params_instance {
                main_gpu == other.main_gpu && tensor_split == other.tensor_split &&
                load_mode == other.load_mode && lazy_mode == other.lazy_mode &&
                devices == other.devices && no_host == other.no_host && repack == other.repack &&
-               vec_tensor_buft_override_equal(tensor_buft_overrides, other.tensor_buft_overrides);
+               vec_tensor_buft_override_equal(tensor_buft_overrides, other.tensor_buft_overrides) &&
+               expert_cache_enabled == other.expert_cache_enabled &&
+               expert_cache_size_bytes == other.expert_cache_size_bytes;
     }
 
     llama_context_params to_llama_cparams() const {
@@ -1331,6 +1359,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & m : params.model)
     for (const auto & fpt : params.fit_params_target)
     for (const auto & fpc : params.fit_params_min_ctx)
+    for (const auto & ec_size : params.expert_cache_size_bytes)
     for (const auto & nl : params.n_gpu_layers)
     for (const auto & ncmoe : params.n_cpu_moe)
     for (const auto & sm : params.split_mode)
@@ -1389,6 +1418,8 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .repack                = */ rpk,
                 /* .fit_target            = */ fpt,
                 /* .fit_min_ctx           = */ fpc,
+                /* .expert_cache_enabled    = */ params.expert_cache_enabled,
+                /* .expert_cache_size_bytes = */ ec_size,
             };
             instances.push_back(instance);
         }
@@ -1427,6 +1458,8 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .repack                = */ rpk,
                 /* .fit_target            = */ fpt,
                 /* .fit_min_ctx           = */ fpc,
+                /* .expert_cache_enabled    = */ params.expert_cache_enabled,
+                /* .expert_cache_size_bytes = */ ec_size,
             };
             instances.push_back(instance);
         }
@@ -1465,6 +1498,8 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .repack                = */ rpk,
                 /* .fit_target            = */ fpt,
                 /* .fit_min_ctx           = */ fpc,
+                /* .expert_cache_enabled    = */ params.expert_cache_enabled,
+                /* .expert_cache_size_bytes = */ ec_size,
             };
             instances.push_back(instance);
         }
@@ -1508,6 +1543,9 @@ struct test {
     bool                     repack;
     size_t                   fit_target;
     uint32_t                 fit_min_ctx;
+    uint64_t                  expert_cache_size_bytes;
+    float                     expert_cache_threshold;
+    std::string               expert_cache_policy;
     int                      n_prompt;
     int                      n_gen;
     int                      n_depth;
@@ -1549,6 +1587,24 @@ struct test {
         repack         = inst.repack;
         fit_target     = inst.fit_target;
         fit_min_ctx    = inst.fit_min_ctx;
+        if (inst.expert_cache_enabled) {
+            const auto default_mparams = llama_model_default_params();
+            expert_cache_size_bytes    = llama_model_expert_cache_size(lmodel);
+            n_ubatch                   = llama_n_ubatch(ctx);
+            expert_cache_threshold     = default_mparams.expert_cache_threshold;
+            expert_cache_policy        = default_mparams.expert_cache_policy == LLAMA_EXPERT_CACHE_POLICY_LFU ? "lfu" : "lru";
+
+            if (const char * value = std::getenv("LLAMA_EXPERT_CACHE_THRESHOLD")) {
+                expert_cache_threshold = std::stof(value);
+            }
+            if (const char * value = std::getenv("LLAMA_EXPERT_CACHE_POLICY")) {
+                expert_cache_policy = value;
+            }
+        } else {
+            expert_cache_size_bytes = 0;
+            expert_cache_threshold  = 0.0f;
+            expert_cache_policy     = "lfu";
+        }
         n_prompt       = inst.n_prompt;
         n_gen          = inst.n_gen;
         n_depth        = inst.n_depth;
@@ -1608,6 +1664,7 @@ struct test {
             "tensor_buft_overrides",            "load_mode",     "lazy_mode",
             "embeddings",
             "no_op_offload",  "no_host",        "repack",        "fit_target",    "fit_min_ctx",
+            "ec_size",        "ec_threshold",   "ec_policy",
             "n_prompt",       "n_gen",          "n_depth",
             "test_time",      "avg_ns",         "stddev_ns",     "avg_ts",         "stddev_ts"
         };
@@ -1621,14 +1678,14 @@ struct test {
             field == "poll" || field == "model_size" || field == "model_n_params" || field == "n_gpu_layers" ||
             field == "main_gpu" || field == "n_prompt" || field == "n_gen" || field == "n_depth" || field == "avg_ns" ||
             field == "stddev_ns" || field == "no_op_offload" || field == "n_cpu_moe" ||
-            field == "fit_target" || field == "fit_min_ctx" || field == "flash_attn") {
+            field == "fit_target" || field == "fit_min_ctx" || field == "flash_attn" || field == "ec_size") {
             return INT;
         }
         if (field == "f16_kv" || field == "no_kv_offload" || field == "cpu_strict" ||
             field == "embeddings" || field == "no_host" || field == "repack") {
             return BOOL;
         }
-        if (field == "avg_ts" || field == "stddev_ts") {
+        if (field == "avg_ts" || field == "stddev_ts" || field == "ec_threshold") {
             return FLOAT;
         }
         if (field == "load_mode" || field == "lazy_mode") {
@@ -1708,6 +1765,9 @@ struct test {
                                             std::to_string(repack),
                                             std::to_string(fit_target),
                                             std::to_string(fit_min_ctx),
+                                            std::to_string(expert_cache_size_bytes),
+                                            std::to_string(expert_cache_threshold),
+                                            expert_cache_policy,
                                             std::to_string(n_prompt),
                                             std::to_string(n_gen),
                                             std::to_string(n_depth),
@@ -1957,6 +2017,12 @@ struct markdown_printer : public printer {
         if (field == "fit_min_ctx") {
             return "fitc";
         }
+        if (field == "ec_size") {
+            return "ec_size";
+        }
+        if (field == "ec_threshold") {
+            return "ec_thr";
+        }
         return field;
     }
 
@@ -2043,6 +2109,14 @@ struct markdown_printer : public printer {
         }
         if (params.fit_params_min_ctx.size() > 1 || params.fit_params_min_ctx != cmd_params_defaults.fit_params_min_ctx) {
             fields.emplace_back("fit_min_ctx");
+        }
+        if (params.expert_cache_enabled != cmd_params_defaults.expert_cache_enabled) {
+            fields.emplace_back("ec_size");
+            fields.emplace_back("ec_threshold");
+            fields.emplace_back("ec_policy");
+        } else if (params.expert_cache_size_bytes.size() > 1 ||
+                   params.expert_cache_size_bytes != cmd_params_defaults.expert_cache_size_bytes) {
+            fields.emplace_back("ec_size");
         }
         fields.emplace_back("test");
         fields.emplace_back("t/s");
@@ -2355,13 +2429,17 @@ int llama_bench(int argc, char ** argv) {
             uint32_t n_ctx_needed = std::max<uint32_t>(inst.n_prompt + inst.n_gen + inst.n_depth, inst.fit_min_ctx);
             cparams.n_ctx = std::max(cparams.n_ctx, n_ctx_needed);
 
-            common_fit_params({ inst.model }, &mparams, &cparams,
+            const auto status = common_fit_params({ inst.model }, &mparams, &cparams,
                 fit_tensor_split.data(),
                 fit_overrides.data(),
                 margins.data(),
                 inst.fit_min_ctx,
                 nullptr,
                 params.verbose ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+            if (mparams.expert_cache_enabled && status != COMMON_PARAMS_FIT_STATUS_SUCCESS) {
+                fprintf(stderr, "error: expert cache memory fitting failed\n");
+                return 1;
+            }
        }
 
         // keep the same model between tests when possible

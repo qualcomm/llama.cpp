@@ -2799,6 +2799,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_env("LLAMA_ARG_N_GPU_LAYERS"));
+    add_opt(common_arg({ "--expert-cache" }, "enable MoE expert DDR cache (default: disabled)", [](common_params & params) {
+        params.expert_cache_enabled = true;
+    }).set_examples({ LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_BENCH, LLAMA_EXAMPLE_PERPLEXITY }));
     add_opt(common_arg(
         {"-sm", "--split-mode"}, "{none,layer,row,tensor}",
         "how to split the model across multiple GPUs, one of:\n"

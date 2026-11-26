@@ -10,7 +10,9 @@ struct llama_expert_cache_context {
     explicit llama_expert_cache_context(llama_expert_cache * cache);
     ~llama_expert_cache_context();
 
-    void limit_batch(llama_cparams & cparams) const;
+    void   limit_batch(llama_cparams & cparams) const;
+    void   prepare_memory(uint32_t max_tokens, bool no_alloc);
+    size_t memory_size = 0;
 
     llama_expert_cache *                         cache;
     std::vector<llama_expert_cache::op_params_t> ops;
@@ -50,6 +52,13 @@ ggml_tensor * llama_expert_cache_slot_ids(llama_expert_cache_context * state,
                                           ggml_context *               ctx,
                                           ggml_tensor *                selected_experts,
                                           uint32_t                     layer);
+
+ggml_tensor * llama_expert_cache_remap_scale(ggml_context * ctx,
+                                             ggml_tensor *  scale,
+                                             ggml_tensor *  ids,
+                                             ggml_tensor *  slots,
+                                             int64_t        n_experts,
+                                             int64_t        n_slots);
 
 llama_expert_cache_pool_tensors llama_expert_cache_get_pool_tensors(llama_expert_cache_context * state,
                                                                     uint32_t                     layer,

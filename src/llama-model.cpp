@@ -18,6 +18,7 @@
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-hybrid-idx.h"
 #include "llama-memory-recurrent.h"
+#include "llama-expert-cache-model.h"
 
 #include "llama.h"
 #include "models/models.h"
@@ -1550,6 +1551,7 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
 }
 
 llama_model::~llama_model() {
+    expert_cache.reset();
     for (auto * lora : loras) {
         delete lora;
     }
@@ -2068,7 +2070,18 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft); // real buffer
             }
             if (buf == nullptr) {
-                throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
+                // Cache stubs can leave this context with no buffers to allocate.
+                bool has_unallocated = false;
+                for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                    if (t->data == nullptr && t->view_src == nullptr) {
+                        has_unallocated = true;
+                        break;
+                    }
+                }
+                if (has_unallocated) {
+                    throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
+                }
+                continue;
             }
             // lock the buffers that hold the tensors: a multi_buffer has no base, and its parts are pageable memory when pinning fails
             if (use_mlock && !ml.no_alloc && ggml_backend_buffer_is_host(buf)) {
@@ -2129,6 +2142,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     if (ml.no_alloc) {
+        if (params.expert_cache_enabled && hparams.n_expert > 0) {
+            expert_cache = llama_expert_cache_init(*this, ml, params);
+            if (!expert_cache) {
+                throw std::runtime_error("failed to initialize expert cache layout");
+            }
+        }
         return true;
     }
 
@@ -2158,6 +2177,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     load_tensors_hadamard();
+
+    if (params.expert_cache_enabled && hparams.n_expert > 0) {
+        expert_cache = llama_expert_cache_init(*this, ml, params);
+        if (!expert_cache) {
+            throw std::runtime_error("failed to initialize expert cache");
+        }
+    }
 
     return true;
 }
@@ -2610,12 +2636,27 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() con
             ggml_backend_buffer_t buf = bufs[0].get();
             GGML_ASSERT(ggml_backend_buffer_get_base(buf) == nullptr);
             ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf);
-            ret[buft] += ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft);
+            if (!params.expert_cache_enabled) {
+                ret[buft] += ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft);
+                continue;
+            }
+            std::vector<ggml_tensor *> tensors;
+            for (auto * t = ggml_get_first_tensor(ctx.get()); t; t = ggml_get_next_tensor(ctx.get(), t)) {
+                if (!params.expert_cache_enabled || !is_expert_weight_tensor(t->name)) {
+                    tensors.push_back(t);
+                }
+            }
+            ret[buft] += ggml_backend_buft_get_alloc_size_n(buft, tensors.data(), tensors.size());
         } else {
             for (const auto & buf : bufs) {
                 // GGML_ASSERT(ggml_backend_buffer_get_base(buf.get()) != nullptr); // multi_buffer does not have a defined base
                 ret[ggml_backend_buffer_get_type(buf.get())] += ggml_backend_buffer_get_size(buf.get());
             }
+        }
+    }
+    if (expert_cache) {
+        for (const auto & entry : expert_cache->memory_breakdown()) {
+            ret[entry.first] += entry.second;
         }
     }
     return ret;
@@ -3644,6 +3685,11 @@ llama_model_params llama_model_default_params() {
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
+        /*.expert_cache_enabled        =*/ false,
+        /*.expert_cache_size_bytes     =*/ 0,
+        /*.expert_cache_threshold      =*/ 0.0f,
+        /*.expert_cache_mode           =*/ LLAMA_EXPERT_CACHE_MODE_LAYERED,
+        /*.expert_cache_policy         =*/ LLAMA_EXPERT_CACHE_POLICY_LRU,
     };
 
     return result;

@@ -7,6 +7,51 @@
 #include <functional>
 #include <stdexcept>
 
+static void remap_scale_fn(ggml_tensor * dst, int, int, void *) {
+    const ggml_tensor * scale      = dst->src[0];
+    const ggml_tensor * ids        = dst->src[1];
+    const ggml_tensor * slots      = dst->src[2];
+    const bool          per_expert = ggml_is_vector(scale) && ggml_is_vector(dst);
+    const int64_t       n_experts  = per_expert ? scale->ne[0] : scale->ne[1];
+    const int64_t       n_slots    = per_expert ? dst->ne[0] : dst->ne[1];
+    const int64_t       n_channels = per_expert ? 1 : dst->ne[0];
+
+    memset(dst->data, 0, ggml_nbytes(dst));
+    for (int64_t t = 0; t < ids->ne[1]; ++t) {
+        for (int64_t r = 0; r < ids->ne[0]; ++r) {
+            const int32_t slot = *(const int32_t *) ((const char *) slots->data + t * slots->nb[1] + r * slots->nb[0]);
+            if (slot < 0) {
+                continue;
+            }
+            const int32_t expert = *(const int32_t *) ((const char *) ids->data + t * ids->nb[1] + r * ids->nb[0]);
+            GGML_ASSERT(slot < n_slots && expert >= 0 && expert < n_experts);
+            const char * src = (const char *) scale->data + expert * (per_expert ? scale->nb[0] : scale->nb[1]);
+            char *       out = (char *) dst->data + slot * (per_expert ? dst->nb[0] : dst->nb[1]);
+            for (int64_t c = 0; c < n_channels; ++c) {
+                *(float *) (out + c * dst->nb[0]) = *(const float *) (src + c * scale->nb[0]);
+            }
+        }
+    }
+}
+
+ggml_tensor * llama_expert_cache_remap_scale(ggml_context * ctx,
+                                             ggml_tensor *  scale,
+                                             ggml_tensor *  ids,
+                                             ggml_tensor *  slots,
+                                             int64_t        n_experts,
+                                             int64_t        n_slots) {
+    if (!scale || ggml_is_scalar(scale) || (n_experts == 1 && n_slots == 1)) {
+        return scale;
+    }
+    GGML_ASSERT(scale->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32 && slots->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_are_same_shape(ids, slots));
+    const bool    per_expert = ggml_is_vector(scale) && scale->ne[0] == n_experts;
+    ggml_tensor * args[]     = { scale, ids, slots };
+    // Scales follow logical experts even when their resident slot numbers differ.
+    return ggml_custom_4d(ctx, GGML_TYPE_F32, per_expert ? n_slots : scale->ne[0], per_expert ? 1 : n_slots, 1, 1, args,
+                          3, remap_scale_fn, 1, nullptr);
+}
+
 static ggml_tensor * mark_cache_callback(llama_expert_cache_context * state, ggml_tensor * tensor) {
     if (state->cache->use_htp_pool_ && state->cache->htp_mark_callback_) {
         state->cache->htp_mark_callback_(tensor);
@@ -49,6 +94,37 @@ void llama_expert_cache_context::limit_batch(llama_cparams & cparams) const {
         "%s: expert cache limits n_ubatch from %u to %u; increase LLAMA_EXPERT_CACHE_SIZE for larger microbatches\n",
         __func__, cparams.n_ubatch, max_tokens);
     cparams.n_ubatch = max_tokens;
+}
+
+void llama_expert_cache_context::prepare_memory(uint32_t max_tokens, bool no_alloc) {
+    memory_size = sizeof(*this) + ops.capacity() * sizeof(llama_expert_cache::op_params_t);
+    auto add    = [&](size_t count, size_t size) {
+        if (count && size > (SIZE_MAX - memory_size) / count) {
+            throw std::overflow_error("expert cache routing memory exceeds size_t");
+        }
+        memory_size += count * size;
+    };
+    const size_t ids  = (size_t) max_tokens * cache->n_expert_used_;
+    const size_t pins = std::min(ids, (size_t) cache->n_expert_);
+    for (auto & op : ops) {
+        add(ids, sizeof(int32_t));
+        add(pins, sizeof(int32_t));
+        add(cache->n_expert_, sizeof(int32_t) + sizeof(uint8_t));
+        if (!no_alloc) {
+            op.slot_ids.reserve(ids);
+            op.pinned.reserve(pins);
+            op.cached_slots.reserve(cache->n_expert_);
+            op.pinned_mark.reserve(cache->n_expert_);
+        }
+    }
+    // One routing callback runs at a time; its scratch overlaps the read batch.
+    add(ids, sizeof(llama_expert_cache::load_req));
+    if (cache->n_expert_ > 256) {
+        add(cache->n_expert_, sizeof(int32_t) + sizeof(uint8_t));
+    }
+    if (cache->n_expert_used_ > 64) {
+        add(cache->n_expert_used_, 2 * sizeof(int64_t) + sizeof(llama_expert_cache::miss_candidate));
+    }
 }
 
 ggml_status llama_expert_cache_graph_compute(llama_expert_cache_context * state,
@@ -226,7 +302,7 @@ ggml_tensor * llm_graph_build_moe_router(ggml_context *                         
     ggml_tensor * logits = nullptr;
 
     if (rd.gate_inp != nullptr) {
-        logits = ggml_mul_mat(ctx, rd.gate_inp, cur);  // [n_expert, n_tokens]
+        logits = ggml_mul_mat_ext(ctx, rd.gate_inp, cur, rd.gate_scale, rd.input_scale);  // [n_expert, n_tokens]
         if (rd.gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS || rd.expert_router_f32) {
             ggml_prec_set_acc(logits, GGML_PREC_F32);
         }

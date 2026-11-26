@@ -16,6 +16,9 @@ set(LLAMA_CORE_SOURCES
     llama-chat.cpp
     llama-context.cpp
     llama-cparams.cpp
+    llama-expert-cache.cpp
+    llama-expert-cache-graph.cpp
+    llama-expert-cache-model.cpp
     llama-grammar.cpp
     llama-graph.cpp
     llama-hparams.cpp

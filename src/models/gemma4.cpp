@@ -388,10 +388,9 @@ llama_model_gemma4::graph::graph(const llm_graph_params & params) :
                     LLM_NORM_RMS, il);
             cb(cur_moe, "ffn_norm_2", il);
 
-            // custom MoE logits calculation (router operates on attn_out, not cur)
-            ggml_tensor * tmp = ggml_rms_norm(ctx0, attn_out, hparams.f_norm_rms_eps);
-            tmp = ggml_scale(ctx0, tmp, 1.0f / sqrtf((float) n_embd));
-            tmp = ggml_mul(ctx0, tmp, model.layers[il].ffn_gate_inp_s);
+            // Gemma 4 routes from attn_out using the same pre-gating as the worker.
+            ggml_tensor * tmp = llama_expert_cache_gemma4_pregate(ctx0, attn_out, model.layers[il].ffn_gate_inp_s,
+                                               n_embd, hparams.f_norm_rms_eps);
             ggml_tensor * logits = build_lora_mm(model.layers[il].ffn_gate_inp, tmp); // [n_expert, n_rows]
             cb(logits, "ffn_moe_logits", il);
 
@@ -406,7 +405,10 @@ llama_model_gemma4::graph::graph(const llm_graph_params & params) :
                     1.0f,
                     LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX,
                     il, logits,
-                    model.layers[il].ffn_gate_up_exps);
+                    model.layers[il].ffn_gate_up_exps,
+                    /* selected_experts_in */ nullptr,
+                    /* post_exp_norm */ nullptr, 1e-5f,
+                    attn_out); // prefetch_router_input
             cur_moe = build_norm(cur_moe,
                     model.layers[il].ffn_post_norm_2, nullptr,
                     LLM_NORM_RMS, il);

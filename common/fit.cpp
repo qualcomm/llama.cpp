@@ -11,9 +11,12 @@
 #include <cassert>
 #include <stdexcept>
 #include <cinttypes>
+#include <cstring>
 #include <set>
 #include <string>
 #include <vector>
+#include <fstream>
+#include <sstream>
 
 // this enum is only used in llama_params_fit_impl but needs to be defined outside of it to fix a Windows compilation issue
 // enum to identify part of a layer for distributing its tensors:
@@ -55,6 +58,25 @@ private:
     ggml_log_level min_level;
 };
 
+static int64_t common_fit_host_available(int64_t fallback) {
+#if defined(__linux__)
+    GGML_UNUSED(fallback);
+    std::ifstream file("/proc/meminfo");
+    std::string line;
+    while (std::getline(file, line)) {
+        std::istringstream fields(line);
+        std::string key, unit;
+        uint64_t value;
+        if (fields >> key >> value >> unit && key == "MemAvailable:" && unit == "kB" && value <= INT64_MAX / 1024) {
+            return (int64_t) value * 1024;
+        }
+    }
+    throw std::runtime_error("expert cache fitting could not read MemAvailable");
+#else
+    return fallback;
+#endif
+}
+
 static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         const std::vector<std::string> & paths_model,
         const llama_model_params * mparams,
@@ -64,16 +86,21 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         uint32_t & hp_ngl_skip,
         uint32_t & hp_n_ctx_train,
         uint32_t & hp_n_expert,
-        ggml_log_level log_level) {
+        ggml_log_level log_level,
+        llama_expert_cache_memory * cache_memory = nullptr) {
     common_fit_log_scope log_scope(log_level);
 
     llama_model_params mparams_copy = *mparams;
     mparams_copy.no_alloc  = true;
-    mparams_copy.load_mode = LLAMA_LOAD_MODE_NONE;
+    mparams_copy.load_mode = mparams->expert_cache_enabled && mparams->load_mode == LLAMA_LOAD_MODE_DIRECT_IO ?
+                                LLAMA_LOAD_MODE_DIRECT_IO : LLAMA_LOAD_MODE_NONE;
 
     llama_model * model = common_model_load(paths_model, mparams_copy);
     if (model == nullptr) {
         throw std::runtime_error("failed to load model");
+    }
+    if (cache_memory) {
+        *cache_memory = llama_model_expert_cache_memory(model);
     }
 
     llama_context * ctx = llama_init_from_model(model, *cparams);
@@ -117,7 +144,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         size_t free;
         size_t total;
         ggml_backend_dev_memory(cpu_dev, &free, &total);
-        ret.back().free  = free;
+        ret.back().free  = mparams->expert_cache_enabled ? common_fit_host_available(free) : free;
         ret.back().total = total;
     }
     for (size_t i = 0; i < nd; i++) {
@@ -126,6 +153,16 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         size_t free;
         size_t total;
         ggml_backend_dev_memory(dev, &free, &total);
+
+        const auto reg = ggml_backend_dev_backend_reg(dev);
+        const bool shared_host = mparams->expert_cache_enabled && reg && strcmp(ggml_backend_reg_name(reg), "HTP") == 0;
+        if (shared_host) {
+            free = free ? std::min<uint64_t>(free, ret.back().free) : ret.back().free;
+            total = total ? std::min<uint64_t>(total, ret.back().total) : ret.back().total;
+            ret[i].mb.model   += ret.back().mb.model;
+            ret[i].mb.context += ret.back().mb.context;
+            ret[i].mb.compute += ret.back().mb.compute;
+        }
 
         // Some non-GPU accelerator backends, such as BLAS, report 0/0 and rely on
         // the host-memory fallback. For GPU-like backends, keep 0/0 so --fit does
@@ -177,7 +214,8 @@ std::vector<common_memory_breakdown_row> common_fit_measure(
 
     llama_model_params mparams_copy = *mparams;
     mparams_copy.no_alloc  = true;
-    mparams_copy.load_mode = LLAMA_LOAD_MODE_NONE;
+    mparams_copy.load_mode = mparams->expert_cache_enabled && mparams->load_mode == LLAMA_LOAD_MODE_DIRECT_IO ?
+                                LLAMA_LOAD_MODE_DIRECT_IO : LLAMA_LOAD_MODE_NONE;
 
     llama_model_ptr model(common_model_load(paths_model, mparams_copy));
     if (!model) {
@@ -212,7 +250,9 @@ common_memory_reports common_measure_memory(common_params & params) {
     {
         auto mparams_fit = mparams;
         auto cparams_fit = cparams;
-        common_fit_apply(params, mparams_fit, cparams_fit);
+        if (!common_fit_apply(params, mparams_fit, cparams_fit)) {
+            throw std::runtime_error("expert cache memory fitting failed");
+        }
         res.info_max = common_fit_measure(paths_model, &mparams_fit, &cparams_fit, &res.n_ctx_train, &res.n_ctx_max, log_level);
     }
 
@@ -342,6 +382,14 @@ static void common_params_fit_impl(
             dmds[id].mb.model   += dmds_extra[id].mb.model;
             dmds[id].mb.context += dmds_extra[id].mb.context;
             dmds[id].mb.compute += dmds_extra[id].mb.compute;
+            if (mparams->expert_cache_enabled && id < devs.size()) {
+                const auto reg = ggml_backend_dev_backend_reg(devs[id]);
+                if (reg && strcmp(ggml_backend_reg_name(reg), "HTP") == 0) {
+                    dmds[id].mb.model   += dmds_extra.back().mb.model;
+                    dmds[id].mb.context += dmds_extra.back().mb.context;
+                    dmds[id].mb.compute += dmds_extra.back().mb.compute;
+                }
+            }
         }
     };
 
@@ -403,7 +451,7 @@ static void common_params_fit_impl(
 
     if (nd == 0) {
         sum_projected_used = dmds_full.back().mb.total();
-        sum_free           = dmds_full.back().total;
+        sum_free           = mparams->expert_cache_enabled ? dmds_full.back().free : dmds_full.back().total;
         sum_projected_free = sum_free - sum_projected_used;
         LOG_TRC("%s: projected to use %" PRId64 " MiB of host memory vs. %" PRId64 " MiB of total host memory\n",
             __func__, sum_projected_used/MiB, sum_free/MiB);
@@ -977,6 +1025,96 @@ static void common_params_fit_impl(
     set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams);
 }
 
+static void common_fit_expert_cache(
+        const std::vector<std::string> & paths_model,
+        llama_model_params * mparams,
+        const llama_context_params * cparams,
+        const size_t * margins,
+        const common_fit_extra_model * extra,
+        const llama_expert_cache_memory & initial,
+        ggml_log_level log_level) {
+    std::vector<ggml_backend_dev_t> devs, extra_devs;
+    uint32_t ngl = 0, nsk = 0, nct = 0, nex = 0;
+    std::vector<llama_device_memory_data> extra_memory;
+    if (extra) {
+        extra_memory = common_get_device_memory_data_impl(extra->paths_model, extra->mparams, extra->cparams,
+                extra_devs, ngl, nsk, nct, nex, log_level);
+        if (extra->shares_model) {
+            for (auto & row : extra_memory) {
+                row.mb.model = 0;
+            }
+        }
+    }
+    llama_expert_cache_memory measured;
+    std::vector<llama_device_memory_data> memory;
+    auto measure = [&]() -> int64_t {
+        memory = common_get_device_memory_data_impl(paths_model, mparams, cparams,
+                devs, ngl, nsk, nct, nex, log_level, &measured);
+        if (extra) {
+            auto add = [](llama_memory_breakdown_data & dst, const llama_memory_breakdown_data & src) {
+                dst.model += src.model;
+                dst.context += src.context;
+                dst.compute += src.compute;
+            };
+            add(memory.back().mb, extra_memory.back().mb);
+            for (size_t i = 0; i < devs.size(); ++i) {
+                const auto reg = ggml_backend_dev_backend_reg(devs[i]);
+                if (reg && strcmp(ggml_backend_reg_name(reg), "HTP") == 0) {
+                    add(memory[i].mb, extra_memory.back().mb);
+                }
+                for (size_t j = 0; j < extra_devs.size(); ++j) {
+                    if (devs[i] == extra_devs[j]) {
+                        add(memory[i].mb, extra_memory[j].mb);
+                    }
+                }
+            }
+        }
+        int64_t surplus = INT64_MAX;
+        for (size_t i = 0; i < memory.size(); ++i) {
+            const size_t margin = margins[i < devs.size() ? i : 0];
+            surplus = std::min(surplus, memory[i].free - (int64_t) memory[i].mb.total() - (int64_t) margin);
+        }
+        return surplus;
+    };
+
+    const int64_t initial_surplus = measure();
+    if (initial_surplus < 0) {
+        throw common_params_fit_exception("expert cache and requested execution parameters exceed the memory budget");
+    }
+    if (initial.automatic) {
+        uint64_t low = initial.minimum / initial.slot_size;
+        uint64_t high = initial.maximum / initial.slot_size;
+        while (low < high) {
+            const uint64_t mid = low + (high - low + 1) / 2;
+            mparams->expert_cache_size_bytes = mid * initial.slot_size;
+            if (measure() >= 0) {
+                low = mid;
+            } else {
+                high = mid - 1;
+            }
+        }
+        mparams->expert_cache_size_bytes = low * initial.slot_size;
+    }
+    int64_t surplus = measure();
+    while (surplus < 0 && initial.automatic && mparams->expert_cache_size_bytes > initial.minimum) {
+        const uint64_t remove = ((uint64_t) -surplus + initial.slot_size - 1) / initial.slot_size;
+        mparams->expert_cache_size_bytes -= std::min(remove * initial.slot_size, mparams->expert_cache_size_bytes - initial.minimum);
+        surplus = measure();
+    }
+    if (surplus < 0) {
+        throw common_params_fit_exception("available memory changed while fitting the expert cache");
+    }
+    LOG_INF("[ECFIT] automatic=%d minimum_bytes=%" PRIu64 " cache_bytes=%" PRIu64 " allocated_bytes=%" PRIu64 " slots=%" PRIu64 " ubatch=%u\n",
+            initial.automatic, initial.minimum, mparams->expert_cache_size_bytes, measured.allocated,
+            measured.allocated / initial.slot_size, cparams->n_ubatch);
+    for (size_t i = 0; i < memory.size(); ++i) {
+        LOG_INF("[ECFIT] device=%s available_bytes=%" PRId64 " model_bytes=%zu context_bytes=%zu compute_bytes=%zu margin_bytes=%zu projected_free_bytes=%" PRId64 "\n",
+                i < devs.size() ? ggml_backend_dev_name(devs[i]) : "Host", memory[i].free,
+                memory[i].mb.model, memory[i].mb.context, memory[i].mb.compute,
+                margins[i < devs.size() ? i : 0], memory[i].free - (int64_t) memory[i].mb.total());
+    }
+}
+
 enum common_params_fit_status common_fit_params(
         const std::vector<std::string> & paths_model,
         llama_model_params * mparams,
@@ -990,7 +1128,19 @@ enum common_params_fit_status common_fit_params(
     const int64_t t0_us = llama_time_us();
     common_params_fit_status status = COMMON_PARAMS_FIT_STATUS_SUCCESS;
     try {
+        llama_expert_cache_memory cache_memory;
+        if (mparams->expert_cache_enabled) {
+            std::vector<ggml_backend_dev_t> devs;
+            uint32_t ngl = 0, nsk = 0, nct = 0, nex = 0;
+            common_get_device_memory_data_impl(paths_model, mparams, cparams, devs, ngl, nsk, nct, nex, log_level, &cache_memory);
+            if (cache_memory.minimum) {
+                mparams->expert_cache_size_bytes = cache_memory.automatic ? cache_memory.minimum : cache_memory.budget;
+            }
+        }
         common_params_fit_impl(paths_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins, n_ctx_min, extra, log_level);
+        if (cache_memory.minimum) {
+            common_fit_expert_cache(paths_model, mparams, cparams, margins, extra, cache_memory, log_level);
+        }
         LOG_TRC("%s: successfully fit params to free device memory\n", __func__);
     } catch (const common_params_fit_exception & e) {
         LOG_WRN("%s: failed to fit params to free device memory: %s\n", __func__, e.what());

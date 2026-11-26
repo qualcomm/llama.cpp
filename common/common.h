@@ -513,6 +513,13 @@ struct common_params {
 
     enum llama_lazy_mode lazy_mode = LLAMA_LAZY_MODE_AUTO; // on-demand reading of tensors marked by the arch
 
+    // expert DDR cache (MoE models only)
+    bool                      expert_cache_enabled       = false;
+    uint64_t                  expert_cache_size_bytes    = 0;  // use environment or automatic sizing
+    float                     expert_cache_threshold     = 0.0f;  // substitution threshold in percent, 0 disables
+    llama_expert_cache_mode   expert_cache_mode          = LLAMA_EXPERT_CACHE_MODE_LAYERED;
+    llama_expert_cache_policy expert_cache_policy        = LLAMA_EXPERT_CACHE_POLICY_LRU;
+
     common_cpu_params cpuparams;
     common_cpu_params cpuparams_batch;
 
@@ -1043,8 +1050,8 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
 struct llama_model_params   common_model_params_to_llama  (      common_params & params);
 struct llama_context_params common_context_params_to_llama(const common_params & params);
 
-// apply --fit to mparams and cparams, no-op if params.fit_params is false
-void common_fit_apply(common_params & params, struct llama_model_params & mparams, struct llama_context_params & cparams);
+// Apply fitting and return false if an enabled expert cache cannot fit.
+bool common_fit_apply(common_params & params, struct llama_model_params & mparams, struct llama_context_params & cparams);
 
 struct llama_model * common_model_load(const std::vector<std::string> & paths, const struct llama_model_params & mparams);
 

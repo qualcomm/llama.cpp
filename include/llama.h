@@ -237,6 +237,18 @@ extern "C" {
         LLAMA_DFLASH_VARIANT_LILICORR = 3,
     };
 
+    enum llama_expert_cache_mode {
+        LLAMA_EXPERT_CACHE_MODE_AUTO             = 0, // shared pool, padded for nonuniform models
+        LLAMA_EXPERT_CACHE_MODE_GLOBAL           = 1, // shared pool, uniform expert sizes only
+        LLAMA_EXPERT_CACHE_MODE_LAYERED          = 2, // per-layer slot ranges, supports nonuniform experts
+        LLAMA_EXPERT_CACHE_MODE_GLOBAL_NONUNIFORM = 3, // shared pool with padded slots
+    };
+
+    enum llama_expert_cache_policy {
+        LLAMA_EXPERT_CACHE_POLICY_LFU = 0,
+        LLAMA_EXPERT_CACHE_POLICY_LRU,
+    };
+
     // TODO: simplify (https://github.com/ggml-org/llama.cpp/pull/9294#pullrequestreview-2286561979)
     typedef struct llama_token_data {
         llama_token id; // token id
@@ -365,6 +377,13 @@ extern "C" {
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool load_mtp;        // whether to load MTP layers
+
+        // expert DDR cache (MoE models only)
+        bool     expert_cache_enabled;     // enable MoE weight caching, default false
+        uint64_t expert_cache_size_bytes;  // bytes, 0 uses environment or automatic sizing
+        float    expert_cache_threshold;   // substitution threshold in percent, default 0
+        enum llama_expert_cache_mode   expert_cache_mode;    // pool partitioning strategy, default LAYERED
+        enum llama_expert_cache_policy expert_cache_policy;  // replacement policy, default LRU
     };
 
     struct llama_sampler_seq_config {
@@ -1729,6 +1748,13 @@ extern "C" {
     LLAMA_API struct llama_perf_context_data llama_perf_context      (const struct llama_context * ctx);
     LLAMA_API void                           llama_perf_context_print(const struct llama_context * ctx);
     LLAMA_API void                           llama_perf_context_reset(      struct llama_context * ctx);
+
+    // Returns cache statistics, or an empty string when disabled.
+    // The library owns the result, which is valid until the next call on this thread.
+    LLAMA_API const char *                   llama_expert_cache_stats_str(const struct llama_context * ctx);
+
+    // Resolved expert cache budget in bytes, or zero if caching is disabled.
+    LLAMA_API uint64_t                       llama_model_expert_cache_size(const struct llama_model * model);
 
     // NOTE: the following work only with samplers constructed via llama_sampler_chain_init
     LLAMA_API struct llama_perf_sampler_data llama_perf_sampler      (const struct llama_sampler * chain);

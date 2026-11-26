@@ -10,6 +10,7 @@
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
+#include "llama-expert-cache-graph.h"
 #include "llama-ext.h"
 #include "llama-sampler.h"
 #include "llama.h"
@@ -177,6 +178,10 @@ llama_context::llama_context(
     t_load_us  = model.t_load_us;
 
     const auto & hparams = model.hparams;
+
+    if (model.expert_cache) {
+        expert_cache = std::make_unique<llama_expert_cache_context>(model.expert_cache.get());
+    }
 
     cparams.n_seq_max = std::max(1u, params.n_seq_max);
     if (cparams.n_seq_max > LLAMA_MAX_SEQ) {
@@ -349,6 +354,10 @@ llama_context::llama_context(
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
 
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
+    if (expert_cache) {
+        expert_cache->limit_batch(cparams);
+        expert_cache->prepare_memory(cparams.n_ubatch, model.no_alloc());
+    }
 
     cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
     cparams.n_outputs_max_per_seq = params.n_outputs_max_per_seq == 0 ?
@@ -623,6 +632,9 @@ llama_context::llama_context(
         }
 
         if (cparams.moe_cache_size > 0) {
+            if (model.expert_cache) {
+                throw std::runtime_error("--expert-cache cannot be combined with --moe-cache-mib");
+            }
             moe_cache = std::make_unique<llama_moe_cache>(model, model.no_alloc(), backend_ptrs, backend_buft, cparams.moe_cache_size, cparams.moe_cache_cpu_share);
         }
 
@@ -984,6 +996,10 @@ void llama_context::synchronize() {
             t_p_eval_us += ggml_time_us() - t_compute_start_us;
         }
         n_p_eval += n_queued_tokens;
+    }
+
+    if (!cparams.no_perf && n_queued_tokens > 0 && model.expert_cache) {
+        model.expert_cache->stats_set_eval_time_us((uint64_t)t_p_eval_us, (uint64_t)t_eval_us);
     }
 
     // get a more accurate load time, upon first eval
@@ -3081,6 +3097,7 @@ llm_graph_params llama_context::graph_params(
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
+        /*.expert_cache=*/ expert_cache.get(),
     };
 }
 
@@ -3127,7 +3144,8 @@ ggml_status llama_context::graph_compute(
 
     copy_experts.reset();
 
-    auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
+    auto status = llama_expert_cache_graph_compute(expert_cache.get(), sched.get(), gf);
+
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }
@@ -4129,7 +4147,9 @@ void llama_context::perf_reset() {
     t_eval_us   = n_eval = 0;
     t_p_eval_us = n_p_eval = 0;
     n_reused    = 0;
-
+    if (model.expert_cache) {
+        model.expert_cache->stats_reset();
+    }
     // note: the reallocation counters are not reset - they track the lifetime totals for this context
 }
 
@@ -4148,6 +4168,9 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
             ret[buft].context += size;
         }
     }
+    if (model.expert_cache && buf_output) {
+        ret[ggml_backend_buffer_get_type(buf_output.get())].context += ggml_backend_buffer_get_size(buf_output.get());
+    }
     if (model.no_alloc()) {
         for (size_t i = 0; i < backends.size(); ++i) {
             ggml_backend_t             backend = backends[i].get();
@@ -4159,6 +4182,30 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
             ggml_backend_t             backend = backend_ptr.get();
             ggml_backend_buffer_type_t buft    = ggml_backend_sched_get_buffer_type(sched.get(), backend);
             ret[buft].compute += ggml_backend_sched_get_buffer_size(sched.get(), backend);
+        }
+    }
+    if (expert_cache) {
+        ret[ggml_backend_cpu_buffer_type()].context += expert_cache->memory_size;
+    }
+    if (model.no_alloc() && model.expert_cache) {
+        const auto cache_memory = model.expert_cache->memory_breakdown();
+        size_t execution_only = 0;
+        for (const auto & entry : ret) {
+            const auto buft = entry.first;
+            auto dev = ggml_backend_buft_get_device(buft);
+            auto reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+            const bool shared = ggml_backend_buft_is_host(buft) || (reg && strcmp(ggml_backend_reg_name(reg), "HTP") == 0);
+            if (shared) {
+                execution_only += entry.second.context + entry.second.compute;
+                const auto cache = cache_memory.find(buft);
+                if (cache != cache_memory.end()) {
+                    execution_only += cache->second;
+                }
+            }
+        }
+        // Loading staging is freed before the cache and context are allocated.
+        if (model.expert_cache->loading_memory_ > execution_only) {
+            ret[ggml_backend_cpu_buffer_type()].context += model.expert_cache->loading_memory_ - execution_only;
         }
     }
     return ret;

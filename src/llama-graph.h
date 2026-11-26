@@ -4,6 +4,7 @@
 #include "llama-batch.h"
 #include "llama-hparams.h"
 #include "llama-adapter.h"
+#include "llama-expert-cache-graph.h"
 
 #include <cstdint>
 #include <cstdlib>
@@ -909,6 +910,9 @@ struct llm_graph_params {
 
     llm_graph_result * res;
 
+    // Expert DDR cache (null when feature disabled)
+    llama_expert_cache_context * expert_cache = nullptr;
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -1167,6 +1171,9 @@ struct llm_graph_context {
 
     const llm_graph_cb & cb_func;
 
+    // Expert DDR cache (null when feature disabled)
+    llama_expert_cache_context * expert_cache = nullptr;
+
     llm_graph_result * res;
 
     ggml_context * ctx0 = nullptr;
@@ -1216,7 +1223,8 @@ struct llm_graph_context {
               ggml_tensor * cur, // ggml_tensor * b
               ggml_tensor * ids,
               ggml_tensor * slots  = nullptr,
-                     bool   cached = true) const;
+                     bool   cached = true,
+              ggml_tensor * pool   = nullptr) const;
 
     // rescale `cur` (the src1 of a matmul) by a power of two, computed from its maximum absolute
     // keep both individual values and Q8 activation block sums within F16 range
@@ -1267,6 +1275,15 @@ struct llm_graph_context {
        llm_ffn_gate_type   type_gate,
                      int   il) const;
 
+    // Select experts and return biased selection scores alongside unbiased expert weights.
+    ggml_tensor * build_moe_router(ggml_context *          ctx,
+                                   ggml_tensor *           cur,
+                                   const moe_router_desc & rd,
+                                   int                     il,
+                                   ggml_tensor **          out_selection_probs,
+                                   ggml_tensor **          out_probs,
+                                   ggml_tensor *           selected_experts_in = nullptr) const;
+
     // build MoE FFN without bias tensors
     ggml_tensor * build_moe_ffn(
              ggml_tensor * cur,
@@ -1286,7 +1303,8 @@ struct llm_graph_context {
              ggml_tensor * gate_up_exps = nullptr,
              ggml_tensor * selected_experts_in = nullptr,
              ggml_tensor * post_exp_norm = nullptr,
-                   float   post_exp_norm_eps = 1e-5f) const;
+                   float   post_exp_norm_eps = 1e-5f,
+             ggml_tensor * prefetch_router_input = nullptr) const;
 
     ggml_tensor * build_moe_ffn(
              ggml_tensor * cur,
@@ -1311,7 +1329,8 @@ struct llm_graph_context {
              ggml_tensor * gate_up_exps_b = nullptr,
              ggml_tensor * selected_experts_in = nullptr,
              ggml_tensor * post_exp_norm = nullptr,
-                   float   post_exp_norm_eps = 1e-5f) const;
+                   float   post_exp_norm_eps = 1e-5f,
+             ggml_tensor * prefetch_router_input = nullptr) const;
 
     //
     // inputs

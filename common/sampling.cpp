@@ -600,6 +600,10 @@ void common_perf_print(const struct llama_context * ctx, const struct common_sam
         LOG_INF("%s:   graph reallocs = %10d    / %5d        (same size) / (changed size)\n", __func__, data.n_reallocs_same, data.n_reallocs_diff);
 
         common_memory_breakdown_print(ctx);
+        const char * ec_stats = llama_expert_cache_stats_str(ctx);
+        if (ec_stats && ec_stats[0] != '\0') {
+            LOG_INF("%s", ec_stats);
+        }
     }
 }
 

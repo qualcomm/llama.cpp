@@ -39,6 +39,11 @@
 
 struct ec_file;
 
+#ifndef EC_IO_TEST_POINT
+#    define EC_IO_TEST_POINT(name, index) ((void) 0)
+#    define EC_IO_TEST_POINT_DEFAULT
+#endif
+
 static int64_t ec_pread(int fd, void * dst, size_t size, int64_t offset) {
 #if defined(_WIN32)
     OVERLAPPED ov{};
@@ -248,7 +253,70 @@ struct ec_read_batch_result {
 
 // Reuse read threads across batches.
 class ec_thread_pool {
+    struct completed_read {
+        uint32_t index;
+        bool     ok;
+        uint64_t copy_ns;
+    };
+
+    struct batch_state {
+        std::vector<ec_read_op>     ops;
+        std::vector<completed_read> completed;
+        std::vector<uint64_t>       started_ns;
+        std::vector<uint8_t>        finished;
+        std::mutex                  mu;
+        std::condition_variable     cv;
+        uint32_t                    n_completed = 0;
+        uint32_t                    n_consumed  = 0;
+        uint32_t                    remaining   = 0;
+        uint64_t                    done_ns     = 0;
+    };
+
+    struct read_work {
+        std::shared_ptr<batch_state> state;
+        uint32_t                     i;
+        ec_odirect *                 od;
+        bool                         collect_timing;
+        size_t                       pool_slot;
+
+        void operator()() const {
+            if (collect_timing) {
+                std::lock_guard<std::mutex> lk(state->mu);
+                state->started_ns[i] = stats_now_ns();
+            }
+
+            uint64_t op_copy_ns = 0;
+            bool     ok         = false;
+            try {
+                const auto & op = state->ops[i];
+                ok =
+                    op.file->read(od, pool_slot, i, op.dst, op.size, op.offset, collect_timing ? &op_copy_ns : nullptr);
+            } catch (...) {
+                ok = false;
+            }
+
+            std::lock_guard<std::mutex> lk(state->mu);
+            state->completed[state->n_completed++] = { i, ok, op_copy_ns };
+            if (collect_timing) {
+                state->finished[i] = 1;
+            }
+            if (--state->remaining == 0) {
+                state->done_ns = collect_timing ? stats_now_ns() : 0;
+            }
+            state->cv.notify_one();
+        }
+    };
+
   public:
+    static size_t batch_memory(size_t n, bool timing) {
+        const size_t item = sizeof(ec_read_op) + 2 * sizeof(completed_read) + sizeof(std::function<void()>) +
+                            sizeof(read_work) + (timing ? sizeof(uint64_t) + sizeof(uint8_t) : 0);
+        if (n > (SIZE_MAX - sizeof(batch_state)) / item) {
+            throw std::overflow_error("expert cache read batch memory exceeds size_t");
+        }
+        return sizeof(batch_state) + n * item;
+    }
+
     // Main and prefetch pools use separate O_DIRECT bounce buffers.
     explicit ec_thread_pool(size_t n_threads, size_t pool_slot = 0) : pool_slot_(pool_slot) {
         if (n_threads == 0) {
@@ -282,35 +350,22 @@ class ec_thread_pool {
             return { true, 0, 0 };
         }
 
-        struct completed_read {
-            uint32_t index;
-            bool     ok;
-            uint64_t copy_ns;
-        };
-
-        struct batch_state {
-            std::vector<ec_read_op>     ops;
-            std::vector<completed_read> completed;
-            std::vector<uint64_t>       started_ns;
-            std::vector<uint8_t>        finished;
-            std::mutex                  mu;
-            std::condition_variable     cv;
-            uint32_t                    n_completed = 0;
-            uint32_t                    n_consumed  = 0;
-            uint32_t                    remaining   = 0;
-            uint64_t                    done_ns     = 0;
-        };
-
         const uint64_t start_ns = collect_timing ? stats_now_ns() : 0;
+        EC_IO_TEST_POINT("batch-state", 0);
         auto           state    = std::make_shared<batch_state>();
+        EC_IO_TEST_POINT("ops", 0);
         state->ops.assign(ops, ops + n);
+        EC_IO_TEST_POINT("completed", 0);
         state->completed.resize(n);
         if (collect_timing) {
+            EC_IO_TEST_POINT("timing-start", 0);
             state->started_ns.resize(n);
+            EC_IO_TEST_POINT("timing-finished", 0);
             state->finished.resize(n);
         }
 
         std::vector<completed_read> ready;
+        EC_IO_TEST_POINT("ready", 0);
         ready.reserve(n);
 
         uint64_t           copy_ns      = 0;
@@ -326,42 +381,28 @@ class ec_thread_pool {
             }
             for (uint32_t i = 0; i < n; ++i) {
                 try {
-                    queue_.push_back([state, i, od, collect_timing, pool_slot] {
-                        if (collect_timing) {
-                            std::lock_guard<std::mutex> lk(state->mu);
-                            state->started_ns[i] = stats_now_ns();
-                        }
-
-                        uint64_t op_copy_ns = 0;
-                        bool     ok         = false;
-                        try {
-                            const auto & op = state->ops[i];
-                            ok              = op.file->read(od, pool_slot, i, op.dst, op.size, op.offset,
-                                               collect_timing ? &op_copy_ns : nullptr);
-                        } catch (...) {
-                            ok = false;
-                        }
-
-                        std::lock_guard<std::mutex> lk(state->mu);
-                        state->completed[state->n_completed++] = { i, ok, op_copy_ns };
-                        if (collect_timing) {
-                            state->finished[i] = 1;
-                        }
-                        if (--state->remaining == 0) {
-                            state->done_ns = collect_timing ? stats_now_ns() : 0;
-                        }
-                        state->cv.notify_one();
-                    });
+                    EC_IO_TEST_POINT("read-callback", i);
+                    std::function<void()> job = read_work{ state, i, od, collect_timing, pool_slot };
+                    EC_IO_TEST_POINT("queue", i);
+                    queue_.push_back(std::move(job));
                     ++state->remaining;
                 } catch (...) {
                     error = std::current_exception();
                     break;
                 }
             }
+            if (!error) {
+                try {
+                    EC_IO_TEST_POINT("submitted", n);
+                } catch (...) {
+                    error = std::current_exception();
+                }
+            }
         }
         cv_.notify_all();
 
         try {
+            EC_IO_TEST_POINT("before-drain", 0);
             if (error) {
                 LLAMA_LOG_WARN("%s: expert cache: failed to queue a streamed read batch\n", __func__);
             }
@@ -495,3 +536,8 @@ class ec_thread_pool {
     bool                              shutdown_  = false;
     size_t                            pool_slot_ = 0;
 };
+
+#ifdef EC_IO_TEST_POINT_DEFAULT
+#    undef EC_IO_TEST_POINT
+#    undef EC_IO_TEST_POINT_DEFAULT
+#endif

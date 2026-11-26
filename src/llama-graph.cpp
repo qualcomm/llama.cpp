@@ -1768,6 +1768,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     ctx0             (res->get_ctx()),
     gf               (res->get_gf()) {
         res->set_params(params);
+        expert_cache = params.expert_cache;
     }
 
 void llm_graph_context::cb(ggml_tensor * cur, const char * name, int il) const {
@@ -1940,17 +1941,23 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * cur, // ggml_tensor * b
           ggml_tensor * ids,
           ggml_tensor * slots,
-                 bool   cached) const {
+                 bool   cached,
+          ggml_tensor * pool) const {
     ggml_tensor * w_s = get_weight_scale(w);
     ggml_tensor * x_s = get_input_scale(w);
     // as in build_lora_mm: the folded weight reads the transformed input, the LoRA delta reads `cur`
     ggml_tensor * cur_mm = build_hadamard_input(w, cur);
-    // the experts in the MoE cache are selected by their slots
-    ggml_tensor * res = slots == nullptr ?
-        ggml_mul_mat_id_ext(ctx0, w, cur_mm, ids, w_s, x_s) :
-        ggml_mul_mat_id_ext(ctx0, cached ? moe_cache->get_experts(w) : w, cur_mm, slots,
-            w_s ? (cached ? moe_cache->get_scales(w, LLAMA_MOE_CACHE_SCALE_WEIGHT) : w_s) : nullptr,
-            x_s ? (cached ? moe_cache->get_scales(w, LLAMA_MOE_CACHE_SCALE_INPUT)  : x_s) : nullptr);
+    ggml_tensor * weights = pool ? pool : (slots && cached ? moe_cache->get_experts(w) : w);
+    if (pool) {
+        GGML_ASSERT(slots != nullptr);
+        w_s = llama_expert_cache_remap_scale(ctx0, w_s, ids, slots, w->ne[2], pool->ne[2]);
+        x_s = llama_expert_cache_remap_scale(ctx0, x_s, ids, slots, w->ne[2], pool->ne[2]);
+    } else if (slots && cached) {
+        w_s = w_s ? moe_cache->get_scales(w, LLAMA_MOE_CACHE_SCALE_WEIGHT) : nullptr;
+        x_s = x_s ? moe_cache->get_scales(w, LLAMA_MOE_CACHE_SCALE_INPUT) : nullptr;
+    }
+    ggml_tensor * res = ggml_mul_mat_id_ext(ctx0, weights, cur_mm, slots ? slots : ids, w_s, x_s);
+    ggml_mul_mat_id_set_sparse(res, pool != nullptr);
 
     if (w->type == GGML_TYPE_NVFP4) {
         ggml_prec_set_acc(res, GGML_PREC_BF16);
@@ -2341,7 +2348,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * gate_up_exps,
          ggml_tensor * selected_experts_in,
          ggml_tensor * post_exp_norm,
-               float   post_exp_norm_eps) const {
+               float   post_exp_norm_eps,
+         ggml_tensor * prefetch_router_input) const {
     return build_moe_ffn(
         cur,
         gate_inp,  /* gate_inp_b  */ nullptr,
@@ -2361,7 +2369,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         /* gate_up_exps_b */ nullptr,
         selected_experts_in,
         post_exp_norm,
-        post_exp_norm_eps
+        post_exp_norm_eps,
+        prefetch_router_input
     );
 }
 
@@ -2388,100 +2397,53 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * gate_up_exps_b,
          ggml_tensor * selected_experts_in,
          ggml_tensor * post_exp_norm,
-               float   post_exp_norm_eps) const {
+               float   post_exp_norm_eps,
+         ggml_tensor * prefetch_router_input) const {
+    auto * expert_cache = is_expert_weight_tensor(down_exps->name) ? this->expert_cache : nullptr;
     const llm_arch arch = model.arch;
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
+    const bool random_routing = cparams.moe_random_routing && n_expert == hparams.n_expert &&
+        n_expert_used <= hparams.n_expert_used_max() && n_tokens <= ubatch.n_tokens;
 
-    ggml_tensor * logits = nullptr;
+    // probs_in supplies logits, so the router skips the gate_inp matmul.
+    moe_router_desc rd;
+    rd.gate_inp        = probs_in ? nullptr : gate_inp;
+    rd.gate_inp_b      = gate_inp_b;
+    rd.exp_probs_b     = exp_probs_b;
+    rd.gating_op       = gating_op;
+    rd.expert_router_f32 = hparams.expert_router_f32;
+    rd.n_expert        = n_expert;
+    rd.n_expert_used   = n_expert_used;
+    rd.n_expert_groups = hparams.n_expert_groups;
+    rd.n_group_used    = hparams.n_group_used;
+    rd.arch            = arch;
+    rd.n_group_experts = hparams.n_group_experts;
 
-    if (probs_in == nullptr) {
-        logits = build_lora_mm(gate_inp, cur); // [n_expert, n_tokens]
-        cb(logits, "ffn_moe_logits", il);
-    } else {
-        logits = probs_in;
+    ggml_tensor * selection_probs = nullptr;
+    ggml_tensor * probs           = nullptr;
+
+    ggml_tensor * router_in = probs_in ? probs_in : cur;
+
+    router_in = llama_expert_cache_publish_router_input(
+            expert_cache, ctx0, gf, router_in, prefetch_router_input,
+            (uint32_t) il, n_tokens);
+
+    ggml_tensor * selected_experts = build_moe_router(ctx0, router_in, rd, il, &selection_probs, &probs, selected_experts_in);
+
+    if (!random_routing) {
+        selected_experts = llama_expert_cache_reroute_selected(
+                expert_cache, ctx0, selected_experts, selection_probs,
+                (uint32_t) il);
     }
 
-    if (gate_inp_b) {
-        logits = ggml_add(ctx0, logits, gate_inp_b);
-        cb(logits, "ffn_moe_logits_biased", il);
-    }
-
-    ggml_tensor * probs = nullptr;
-    switch (gating_op) {
-        case LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX:
-            {
-                probs = ggml_soft_max(ctx0, logits); // [n_expert, n_tokens]
-            } break;
-        case LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID:
-            {
-                probs = ggml_sigmoid(ctx0, logits); // [n_expert, n_tokens]
-            } break;
-        case LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT:
-            {
-                probs = logits; // [n_expert, n_tokens]
-            } break;
-        case LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS:
-            {
-                probs = ggml_sqrt(ctx0, ggml_softplus(ctx0, logits)); // [n_expert, n_tokens]
-            } break;
-        default:
-            GGML_ABORT("fatal error");
-    }
-    cb(probs, "ffn_moe_probs", il);
-
-    // add experts selection bias - introduced in DeepSeek V3
-    // leave probs unbiased as it's later used to get expert weights
-    ggml_tensor * selection_probs = probs;
-    if (exp_probs_b != nullptr) {
-        selection_probs = ggml_add(ctx0, probs, exp_probs_b);
-        cb(selection_probs, "ffn_moe_probs_biased", il);
-    }
-
-    // llama4 doesn't have exp_probs_b, and sigmoid is only used after top_k
-    // see: https://github.com/meta-llama/llama-models/blob/699a02993512fb36936b1b0741e13c06790bcf98/models/llama4/moe.py#L183-L198
-    if (arch == LLM_ARCH_LLAMA4) {
-        selection_probs = logits;
-    }
-
-    if (arch == LLM_ARCH_GROVEMOE) {
-        selection_probs = ggml_sigmoid(ctx0, logits); // [n_expert, n_tokens]
-        cb(selection_probs, "ffn_moe_probs_biased", il);
-    }
-
-    // select top n_group_used expert groups
-    // https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/e815299b0bcbac849fa540c768ef21845365c9eb/modeling_deepseek.py#L440-L457
-    if (hparams.n_expert_groups > 1 && n_tokens > 0) {
-        const int64_t n_exp_per_group = n_expert / hparams.n_expert_groups;
-
-        // organize experts into n_expert_groups
-        ggml_tensor * selection_groups = ggml_reshape_3d(ctx0, selection_probs, n_exp_per_group, hparams.n_expert_groups, n_tokens); // [n_exp_per_group, n_expert_groups, n_tokens]
-
-        ggml_tensor * group_scores = ggml_argsort_top_k(ctx0, selection_groups, 2); // [2, n_expert_groups, n_tokens]
-        group_scores = ggml_get_rows(ctx0, ggml_reshape_4d(ctx0, selection_groups, 1, selection_groups->ne[0], selection_groups->ne[1], selection_groups->ne[2]), group_scores); // [1, 2, n_expert_groups, n_tokens]
-
-        // get top n_group_used expert groups
-        group_scores = ggml_sum_rows(ctx0, ggml_reshape_3d(ctx0, group_scores, group_scores->ne[1], group_scores->ne[2], group_scores->ne[3])); // [1, n_expert_groups, n_tokens]
-        group_scores = ggml_reshape_2d(ctx0, group_scores, group_scores->ne[1], group_scores->ne[2]); // [n_expert_groups, n_tokens]
-
-        ggml_tensor * expert_groups = ggml_argsort_top_k(ctx0, group_scores, hparams.n_group_used); // [n_group_used, n_tokens]
-        cb(expert_groups, "ffn_moe_group_topk", il);
-
-        // mask out the other groups
-        selection_probs = ggml_get_rows(ctx0, selection_groups, expert_groups); // [n_exp_per_group, n_group_used, n_tokens]
-        selection_probs = ggml_set_rows(ctx0, ggml_fill(ctx0, selection_groups, -INFINITY), selection_probs, expert_groups); // [n_exp_per_group, n_expert_groups, n_tokens]
-        selection_probs = ggml_reshape_2d(ctx0, selection_probs, n_expert, n_tokens); // [n_expert, n_tokens]
-        cb(selection_probs, "ffn_moe_probs_masked", il);
-    }
-
-    // select experts
-    ggml_tensor * selected_experts = selected_experts_in;
-    if (selected_experts == nullptr) {
-        selected_experts = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
-        cb(selected_experts->src[0], "ffn_moe_argsort", il);
-    }
-    cb(selected_experts, "ffn_moe_topk", il);
+    const auto pool_tensors = llama_expert_cache_get_pool_tensors(
+            expert_cache, (uint32_t) il, n_tokens);
+    ggml_tensor * pool_gate_up = pool_tensors.gate_up;
+    ggml_tensor * pool_gate    = pool_tensors.gate;
+    ggml_tensor * pool_up      = pool_tensors.up;
+    ggml_tensor * pool_down    = pool_tensors.down;
 
     if (arch == LLM_ARCH_GROVEMOE && n_expert != hparams.n_expert) {
         // TODO: Use scalar div instead when/if implemented
@@ -2534,7 +2496,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_build_forward_expand(gf, weights);
 
     // benchmark only: the expert GEMMs use random ids, the router above is not changed
-    if (cparams.moe_random_routing && n_expert == hparams.n_expert && n_expert_used <= hparams.n_expert_used_max() && n_tokens <= ubatch.n_tokens) {
+    if (random_routing) {
         // fused top-k kernels write the router ids together with the weights, so keep the ids alive until here
         // the empty get_rows is skipped by the backends, it only adds this dependency
         ggml_build_forward_expand(gf, ggml_get_rows(ctx0, weights, ggml_view_2d(ctx0, selected_experts, 0, n_tokens, selected_experts->nb[1], 0)));
@@ -2545,7 +2507,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         if (down_exps->buffer && ggml_backend_buffer_is_host(down_exps->buffer)) {
             selected_experts = ggml_cont(ctx0, selected_experts);
         }
+        selected_experts = llama_expert_cache_reroute_selected(
+                expert_cache, ctx0, selected_experts, selection_probs,
+                (uint32_t) il);
     }
+
+    ggml_tensor * slot_ids = llama_expert_cache_slot_ids(
+            expert_cache, ctx0, selected_experts, (uint32_t) il);
+    ggml_tensor * mm_ids = slot_ids;
 
     // compute the expert input before the slot lookup, so that the scheduler prefetches it for the CPU part (the router can read a different tensor)
     ggml_build_forward_expand(gf, cur);
@@ -2565,12 +2534,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     // the experts selected by mm_ids, up to the down projection, from the MoE cache if cached
     // ids are the selected experts, for the biases and scales
-    auto build_experts = [&](ggml_tensor * cur, ggml_tensor * ids, ggml_tensor * mm_ids, bool cached) {
+    auto build_experts = [&](ggml_tensor * cur, ggml_tensor * ids, ggml_tensor * cache_ids, bool cached) {
         ggml_tensor * up = nullptr;
 
         if (gate_up_exps) {
             // merged gate_up path: one mul_mat_id, then split into gate and up views
-            ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, ids, mm_ids, cached); // [n_ff*2, n_expert_used, n_tokens]
+            ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, ids, expert_cache ? mm_ids : cache_ids, expert_cache ? false : cached, pool_gate_up); // [n_ff*2, n_expert_used, n_tokens]
             cb(gate_up, "ffn_moe_gate_up", il);
 
             if (gate_up_exps_b) {
@@ -2585,7 +2554,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             cb(up, "ffn_moe_up", il);
         } else {
             // separate gate and up path
-            up = build_lora_mm_id(up_exps, cur, ids, mm_ids, cached); // [n_ff, n_expert_used, n_tokens]
+            up = build_lora_mm_id(up_exps, cur, ids, expert_cache ? mm_ids : cache_ids, expert_cache ? false : cached, pool_up); // [n_ff, n_expert_used, n_tokens]
             cb(up, "ffn_moe_up", il);
 
             if (up_exps_b) {
@@ -2594,7 +2563,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             }
 
             if (gate_exps) {
-                cur = build_lora_mm_id(gate_exps, cur, ids, mm_ids, cached); // [n_ff, n_expert_used, n_tokens]
+                cur = build_lora_mm_id(gate_exps, cur, ids, expert_cache ? mm_ids : cache_ids, expert_cache ? false : cached, pool_gate); // [n_ff, n_expert_used, n_tokens]
                 cb(cur, "ffn_moe_gate", il);
             } else {
                 cur = up;
@@ -2704,7 +2673,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             cur = amax_src1.res;
         }
 
-        ggml_tensor * experts = build_lora_mm_id(down_exps, cur, ids, mm_ids, cached); // [n_embd, n_expert_used, n_tokens]
+        ggml_tensor * experts = build_lora_mm_id(down_exps, cur, ids, expert_cache ? mm_ids : cache_ids, expert_cache ? false : cached, pool_down); // [n_embd, n_expert_used, n_tokens]
         cb(experts, "ffn_moe_down", il);
 
         if (amax_src1.scale_s) {
@@ -2720,6 +2689,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 [](ggml_tensor * cur, ggml_tensor * ids, ggml_tensor * mm_ids, bool cached, void * user_data) {
                     return (*static_cast<decltype(build_experts) *>(user_data))(cur, ids, mm_ids, cached);
                 }, &build_experts);
+
+    llama_expert_cache_finish_layer(expert_cache, ctx0, gf, experts, (uint32_t) il);
 
     if (down_exps_b) {
         experts = ggml_add_id(ctx0, experts, down_exps_b, selected_experts);

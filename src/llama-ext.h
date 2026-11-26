@@ -89,6 +89,17 @@ LLAMA_API void llama_quant_compute_types(
 // device memory querying
 //
 
+struct llama_expert_cache_memory {
+    uint64_t minimum = 0;
+    uint64_t maximum = 0;
+    uint64_t allocated = 0;
+    uint64_t budget = 0;
+    uint64_t slot_size = 0;
+    bool automatic = false;
+};
+
+LLAMA_API llama_expert_cache_memory llama_model_expert_cache_memory(const llama_model * model);
+
 // "memory" as in physical memory for a buffer type, in bytes
 struct llama_memory_breakdown_data {
     size_t model   = 0; // memory allocated for the model

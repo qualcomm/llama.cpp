@@ -119,6 +119,8 @@ enum moe_pre_gating_kind {
 // Shared router settings, with gate_inp == nullptr for dense layers.
 struct moe_router_desc {
     ggml_tensor * gate_inp    = nullptr;
+    ggml_tensor * gate_scale  = nullptr;
+    ggml_tensor * input_scale = nullptr;
     ggml_tensor * gate_inp_b  = nullptr;
     ggml_tensor * exp_probs_b = nullptr;
 
@@ -187,6 +189,11 @@ struct llama_expert_cache {
     size_t                               expert_sz = 0;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
+    void                                         prepare_runtime_memory(int64_t n_embd);
+    size_t                                       loading_memory_    = 0;
+    size_t                                       direct_io_memory_  = 0;
+    size_t                                       predictor_memory_  = 0;
+    size_t                                       read_batch_memory_ = 0;
     void                                         alloc_pool_tensor(ggml_tensor * tensor, size_t offset);
 
     // Configured once from LLAMA_EXPERT_CACHE_* environment variables.
@@ -210,6 +217,7 @@ struct llama_expert_cache {
     using htp_repack_range_fn                     = void (*)(ggml_tensor *, const void *, size_t, size_t);
     htp_repack_range_fn htp_repack_range_         = nullptr;
     using htp_mark_tensor_expert_cache_fn         = void (*)(ggml_tensor *);
+    htp_mark_tensor_expert_cache_fn htp_mark_tensor_expert_cache_ = nullptr;
     htp_mark_tensor_expert_cache_fn htp_mark_callback_            = nullptr;
 
     void init_pool_tensor(ggml_tensor * tensor) const;
@@ -377,6 +385,8 @@ struct llama_expert_cache {
     void        stats_record_miss(bool is_prefill);
     void        stats_record_ddr_copy(bool is_prefill);
     void        stats_record_prefetch_adopt(bool is_prefill);
+    void        stats_record_prefetch_use(int32_t slot);
+    void        stats_record_prefetch_load(int32_t slot, uint32_t layer, uint32_t expert);
     void        stats_record_substitution(bool is_prefill);
     void        stats_record_flash_read(uint64_t bytes, uint64_t ns, bool is_prefill);
     void        stats_set_eval_time_us(uint64_t p_eval_us, uint64_t eval_us);
@@ -409,6 +419,7 @@ struct llama_expert_cache {
     };
 
     std::vector<worker_pred_graph> worker_pred_graphs_;
+    worker_pred_graph              build_worker_pred_graph(uint32_t layer, int64_t n_embd) const;
     worker_pred_graph &            worker_pred_graph_for(uint32_t layer, int64_t n_embd);
 
     void prefetch_init();
@@ -470,6 +481,14 @@ struct llama_expert_cache {
                           const std::vector<expert_slice_loc> & locs);
 
     expert_slice_loc get_loc(uint32_t layer, tensor_kind kind, uint32_t expert) const;
+
+    struct miss_candidate {
+        int64_t r;
+        int32_t best_eid;
+        int32_t best_slot;
+        float   gap;
+        bool    has_candidate;
+    };
 
     struct op_params_t {
         llama_expert_cache * cache        = nullptr;

@@ -98,6 +98,71 @@ void llama_expert_cache_prepare(llama_model_loader & loader, llama_model_params 
     loader.expert_cache_enabled = params.expert_cache_enabled;
 }
 
+// Match the temporary host buffers in load_all_data and read_aligned_chunk.
+static size_t expert_cache_loading_memory(const llama_model & model, const llama_model_loader & loader) {
+    if (loader.use_mmap) {
+        return 0;
+    }
+    size_t alignment = 1;
+    for (const auto & file : loader.files) {
+        alignment = std::max(alignment, file->read_alignment());
+    }
+
+    struct loading_buffers {
+        size_t bounce  = 0;
+        size_t staging = 0;
+    };
+
+    std::map<ggml_backend_buffer_type_t, loading_buffers> groups;
+    for (const auto & entry : model.tensors_by_name) {
+        const auto * tensor = entry.second;
+        if (!tensor->buffer || is_expert_weight_tensor(tensor->name) || loader.lazy.has(tensor)) {
+            continue;
+        }
+        const auto * weight = loader.get_weight(tensor->name);
+        if (!weight) {
+            continue;
+        }
+        const size_t align = loader.files.at(weight->idx)->read_alignment();
+        const size_t lead  = weight->offs & (align - 1);
+        const size_t bytes = ggml_nbytes(tensor);
+        if (bytes > SIZE_MAX - lead - (align - 1) || bytes + lead + align - 1 > SIZE_MAX - (align - 1)) {
+            throw std::overflow_error("expert cache loading memory exceeds size_t");
+        }
+        const size_t read_size = (lead + bytes + align - 1) & ~(align - 1);
+        auto         buft      = ggml_backend_buffer_get_type(tensor->buffer);
+        auto &       group     = groups[buft];
+        if (ggml_backend_buft_is_host(buft)) {
+            if (align > 1) {
+                group.bounce = std::max(group.bounce, std::min(read_size, (size_t) LLAMA_DIRECT_IO_BUFFER_SIZE));
+            }
+        } else {
+            group.staging = std::max(group.staging, read_size + align - 1);
+        }
+    }
+    size_t peak = 0;
+    for (const auto & entry : groups) {
+        const auto   buft    = entry.first;
+        const auto & group   = entry.second;
+        size_t       uploads = 0;
+        auto         dev     = ggml_backend_buft_get_device(buft);
+        if (dev && !loader.check_tensors && buft == ggml_backend_dev_buffer_type(dev)) {
+            ggml_backend_dev_props props;
+            ggml_backend_dev_get_props(dev, &props);
+            if (props.caps.async && props.caps.host_buffer && props.caps.events &&
+                ggml_backend_dev_host_buffer_type(dev)) {
+                uploads = 4 * (alignment > 1 ? LLAMA_DIRECT_IO_BUFFER_SIZE + 2 * alignment : 1024 * 1024);
+            }
+        }
+        // Failed upload initialization can retain its buffers during synchronous fallback.
+        if (group.staging > SIZE_MAX - uploads || group.bounce > SIZE_MAX - uploads - group.staging) {
+            throw std::overflow_error("expert cache loading buffers exceed size_t");
+        }
+        peak = std::max(peak, uploads + group.staging + group.bounce);
+    }
+    return peak;
+}
+
 std::unique_ptr<llama_expert_cache> llama_expert_cache_init(llama_model &              model,
                                                             llama_model_loader &       ml,
                                                             const llama_model_params & mparams) {
@@ -269,6 +334,8 @@ std::unique_ptr<llama_expert_cache> llama_expert_cache_init(llama_model &       
             const auto &      layer = model.layers[il];
             moe_router_desc & rd    = cache->router_descs_[il];
             rd.gate_inp             = layer.ffn_gate_inp;
+            rd.gate_scale           = layer.ffn_gate_inp ? model.w_scales.get(layer.ffn_gate_inp) : nullptr;
+            rd.input_scale          = layer.ffn_gate_inp ? model.w_scales.get_input(layer.ffn_gate_inp) : nullptr;
             rd.gate_inp_b           = layer.ffn_gate_inp_b;
             rd.exp_probs_b          = layer.ffn_exp_probs_b;
             rd.gating_op            = gating_op;
@@ -292,9 +359,6 @@ std::unique_ptr<llama_expert_cache> llama_expert_cache_init(llama_model &       
     uint64_t cache_bytes    = mparams.expert_cache_size_bytes;
     auto     finalize_cache = [&]() -> std::unique_ptr<llama_expert_cache> {
         result->budget_bytes_ = cache_bytes;
-        if (mparams.no_alloc) {
-            return std::move(result);
-        }
         if (ml.files.empty()) {
             LLAMA_LOG_WARN("%s: expert cache disabled: no files in model loader\n", __func__);
             return nullptr;
@@ -304,6 +368,11 @@ std::unique_ptr<llama_expert_cache> llama_expert_cache_init(llama_model &       
             if (!result->add_file(file->file_id(), ml.use_direct_io)) {
                 throw std::runtime_error("could not open expert cache GGUF source");
             }
+        }
+        result->prepare_runtime_memory(hparams.n_embd);
+        result->loading_memory_ = expert_cache_loading_memory(model, ml);
+        if (mparams.no_alloc) {
+            return std::move(result);
         }
 
 #ifdef MADV_DONTNEED
@@ -390,7 +459,9 @@ std::unique_ptr<llama_expert_cache> llama_expert_cache_init(llama_model &       
                 reg, "ggml_backend_hexagon_supports_expert_repack_type");
             auto htp_repack_range =
                 (htp_repack_range_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_hexagon_repack_tensor_range");
-            if (!get_htp_repack || !supports_htp_repack_type || !htp_repack_range) {
+            auto mark_tensor_expert_cache = (htp_mark_tensor_expert_cache_t) ggml_backend_reg_get_proc_address(
+                reg, "ggml_backend_hexagon_mark_tensor_expert_cache");
+            if (!get_htp_repack || !supports_htp_repack_type || !htp_repack_range || !mark_tensor_expert_cache) {
                 continue;
             }
 
@@ -433,6 +504,7 @@ std::unique_ptr<llama_expert_cache> llama_expert_cache_init(llama_model &       
             }
             result->use_htp_pool_                 = true;
             result->htp_repack_range_             = htp_repack_range;
+            result->htp_mark_tensor_expert_cache_ = mark_tensor_expert_cache;
             if (result->htp_async_) {
                 result->htp_mark_callback_ = (htp_mark_tensor_expert_cache_t) ggml_backend_reg_get_proc_address(
                     reg, "ggml_backend_hexagon_mark_cache_callback");

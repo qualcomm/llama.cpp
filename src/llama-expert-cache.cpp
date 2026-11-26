@@ -7,6 +7,7 @@
 
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "ggml-cpp.h"
 #include "ggml-cpu.h"
 #include "ggml.h"
 #include "llama-context.h"
@@ -28,6 +29,7 @@ extern "C" ggml_backend_buffer_t ggml_backend_multi_buffer_alloc_buffer(ggml_bac
 #include <condition_variable>
 #include <cstdio>
 #include <deque>
+#include <exception>
 #include <functional>
 #include <limits>
 #include <random>
@@ -59,20 +61,25 @@ static ec_read_batch_result read_batch_stream(ec_thread_pool *                  
 
     const uint64_t        start_ns = collect_timing ? stats_now_ns() : 0;
     bool                  all_ok   = true;
+    uint64_t              copy_ns  = 0;
     std::vector<uint32_t> completed;
     completed.reserve(n);
     for (uint32_t i = 0; i < n; ++i) {
-        if (!ops[i].file->read(od, pool_slot, i, ops[i].dst, ops[i].size, ops[i].offset)) {
+        uint64_t op_copy_ns = 0;
+        if (!ops[i].file->read(od, pool_slot, i, ops[i].dst, ops[i].size, ops[i].offset,
+                               collect_timing ? &op_copy_ns : nullptr)) {
             all_ok = false;
             continue;
         }
+        copy_ns += op_copy_ns;
         completed.push_back(i);
     }
-    on_reads_done(collect_timing ? stats_now_ns() : 0);
+    const uint64_t end_ns = collect_timing ? stats_now_ns() : 0;
+    on_reads_done(end_ns);
     for (uint32_t i : completed) {
         on_complete(i);
     }
-    return { all_ok, collect_timing ? stats_now_ns() - start_ns : 0, 0 };
+    return { all_ok, collect_timing ? end_ns - start_ns : 0, copy_ns };
 }
 
 #include <iomanip>
@@ -86,28 +93,28 @@ static size_t htp_chunk_rows_for(const ggml_tensor * tensor, int chunk_kb) {
 }
 
 std::string llama_expert_cache::stats_to_str() const {
-    const uint64_t p_hits   = stat_p_hits.load();
-    const uint64_t p_misses = stat_p_misses.load();
-    const uint64_t d_hits   = stat_hits.load();
-    const uint64_t d_misses = stat_misses.load();
+    const uint64_t p_hits   = stat_p_hits.load(std::memory_order_relaxed);
+    const uint64_t p_misses = stat_p_misses.load(std::memory_order_relaxed);
+    const uint64_t d_hits   = stat_hits.load(std::memory_order_relaxed);
+    const uint64_t d_misses = stat_misses.load(std::memory_order_relaxed);
 
     const uint64_t p_total = p_hits + p_misses;
     const uint64_t d_total = d_hits + d_misses;
     const uint64_t t_total = p_total + d_total;
 
-    const uint64_t p_subs  = stat_p_subs.load();
-    const uint64_t d_subs  = stat_subs.load();
-    const uint64_t p_ddr   = stat_p_ddr_copies.load();
-    const uint64_t d_ddr   = stat_ddr_copies.load();
-    const uint64_t p_adopt = stat_p_prefetch_adopts.load();
-    const uint64_t d_adopt = stat_prefetch_adopts.load();
+    const uint64_t p_subs  = stat_p_subs.load(std::memory_order_relaxed);
+    const uint64_t d_subs  = stat_subs.load(std::memory_order_relaxed);
+    const uint64_t p_ddr   = stat_p_ddr_copies.load(std::memory_order_relaxed);
+    const uint64_t d_ddr   = stat_ddr_copies.load(std::memory_order_relaxed);
+    const uint64_t p_adopt = stat_p_prefetch_adopts.load(std::memory_order_relaxed);
+    const uint64_t d_adopt = stat_prefetch_adopts.load(std::memory_order_relaxed);
 
-    const double p_flash_gb = stat_p_flash_bytes.load() / 1073741824.0;
-    const double d_flash_gb = stat_flash_bytes.load() / 1073741824.0;
-    const double p_flash_ms = stat_p_flash_ns.load() / 1e6;
-    const double d_flash_ms = flash_busy_ns_.load() / 1e6;
-    const double p_eval_ms  = stat_p_eval_us.load() / 1000.0;
-    const double d_eval_ms  = stat_eval_us.load() / 1000.0;
+    const double p_flash_gb = stat_p_flash_bytes.load(std::memory_order_relaxed) / 1073741824.0;
+    const double d_flash_gb = stat_flash_bytes.load(std::memory_order_relaxed) / 1073741824.0;
+    const double p_flash_ms = stat_p_flash_ns.load(std::memory_order_relaxed) / 1e6;
+    const double d_flash_ms = flash_busy_ns_.load(std::memory_order_relaxed) / 1e6;
+    const double p_eval_ms  = stat_p_eval_us.load(std::memory_order_relaxed) / 1000.0;
+    const double d_eval_ms  = stat_eval_us.load(std::memory_order_relaxed) / 1000.0;
 
     auto flash_speed = [](double gb, double ms) -> double {
         return (ms > 0) ? (gb / (ms / 1000.0)) : 0.0;
@@ -130,23 +137,25 @@ std::string llama_expert_cache::stats_to_str() const {
     ss << "[ECSTATS] prefill: lookups=" << p_total << "  hits=" << p_hits << " (" << pct(p_hits, p_total) << "%)"
        << "  misses=" << p_misses << " (" << pct(p_misses, p_total) << "%)" << "  subs=" << p_subs
        << "  ddr_copies=" << p_ddr << "  prefetch_adopts=" << p_adopt << "\n";
-    ss << "[ECSTATS] prefill: " << std::setprecision(3) << "flash_read=" << p_flash_gb << " GB  "
+    ss << "[ECSTATS] prefill: " << std::setprecision(3) << "flash_read=" << p_flash_gb << " GiB  "
        << std::setprecision(0) << "flash_time=" << p_flash_ms << " ms  " << std::setprecision(2)
-       << "flash_speed=" << flash_speed(p_flash_gb, p_flash_ms) << " GB/s  " << std::setprecision(1)
-       << "flash_pct=" << flash_pct_fn(p_flash_ms, p_eval_ms) << "%\n";
+       << "logical_expert_cache_read_bandwidth=" << flash_speed(p_flash_gb, p_flash_ms) << " GiB/s  "
+       << std::setprecision(1) << "flash_pct=" << flash_pct_fn(p_flash_ms, p_eval_ms) << "%\n";
 
     ss << std::setprecision(1);
     ss << "[ECSTATS] decode:  lookups=" << d_total << "  hits=" << d_hits << " (" << pct(d_hits, d_total) << "%)"
        << "  misses=" << d_misses << " (" << pct(d_misses, d_total) << "%)" << "  subs=" << d_subs
        << "  ddr_copies=" << d_ddr << "  prefetch_adopts=" << d_adopt << "\n";
-    ss << "[ECSTATS] decode:  " << std::setprecision(3) << "flash_read=" << d_flash_gb << " GB  "
+    ss << "[ECSTATS] decode:  " << std::setprecision(3) << "flash_read=" << d_flash_gb << " GiB  "
        << std::setprecision(0) << "flash_time=" << d_flash_ms << " ms  " << std::setprecision(2)
-       << "flash_speed=" << flash_speed(d_flash_gb, d_flash_ms) << " GB/s  " << std::setprecision(1)
-       << "flash_pct=" << flash_pct_fn(d_flash_ms, d_eval_ms) << "%\n";
+       << "logical_expert_cache_read_bandwidth=" << flash_speed(d_flash_gb, d_flash_ms) << " GiB/s  "
+       << std::setprecision(1) << "flash_pct=" << flash_pct_fn(d_flash_ms, d_eval_ms) << "%\n";
     ss << "[ECSTATS] decode:  " << std::setprecision(3)
-       << "flash_worker=" << (flash_bytes_worker_.load() / 1073741824.0) << " GB  " << std::setprecision(1)
-       << "flash_worker_pct="
-       << (d_flash_gb > 0 ? 100.0 * (flash_bytes_worker_.load() / 1073741824.0) / d_flash_gb : 0.0) << "%\n";
+       << "flash_worker=" << (flash_bytes_worker_.load(std::memory_order_relaxed) / 1073741824.0) << " GiB  "
+       << std::setprecision(1) << "flash_worker_pct="
+       << (d_flash_gb > 0 ? 100.0 * (flash_bytes_worker_.load(std::memory_order_relaxed) / 1073741824.0) / d_flash_gb :
+                            0.0)
+       << "%\n";
 
     const double t_flash_gb = p_flash_gb + d_flash_gb;
     const double t_flash_ms = p_flash_ms + d_flash_ms;
@@ -156,38 +165,39 @@ std::string llama_expert_cache::stats_to_str() const {
        << pct(p_hits + d_hits, t_total) << "%)" << "  misses=" << (p_misses + d_misses) << " ("
        << pct(p_misses + d_misses, t_total) << "%)" << "  subs=" << (p_subs + d_subs)
        << "  ddr_copies=" << (p_ddr + d_ddr) << "  prefetch_adopts=" << (p_adopt + d_adopt) << "\n";
-    ss << "[ECSTATS] total:   " << std::setprecision(3) << "flash_read=" << t_flash_gb << " GB  "
+    ss << "[ECSTATS] total:   " << std::setprecision(3) << "flash_read=" << t_flash_gb << " GiB  "
        << std::setprecision(0) << "flash_time=" << t_flash_ms << " ms  " << std::setprecision(2)
-       << "flash_speed=" << flash_speed(t_flash_gb, t_flash_ms) << " GB/s  " << std::setprecision(1)
-       << "flash_pct=" << flash_pct_fn(t_flash_ms, t_eval_ms) << "%\n";
-    const uint64_t pf_warmed  = stat_prefetch_warmed.load();
-    const uint64_t pf_useful  = stat_prefetch_useful.load();
-    const uint64_t pf_wasted  = stat_prefetch_wasted.load();
-    const uint64_t pred_calls = stat_predict_calls.load();
+       << "logical_expert_cache_read_bandwidth=" << flash_speed(t_flash_gb, t_flash_ms) << " GiB/s  "
+       << std::setprecision(1) << "flash_pct=" << flash_pct_fn(t_flash_ms, t_eval_ms) << "%\n";
+    const uint64_t pf_warmed  = stat_prefetch_warmed.load(std::memory_order_relaxed);
+    const uint64_t pf_useful  = stat_prefetch_useful.load(std::memory_order_relaxed);
+    const uint64_t pf_wasted  = stat_prefetch_wasted.load(std::memory_order_relaxed);
+    const uint64_t pred_calls = stat_predict_calls.load(std::memory_order_relaxed);
     ss << std::setprecision(1);
     ss << "[ECSTATS] prefetch: warmed=" << pf_warmed << "  useful=" << pf_useful << " (" << pct(pf_useful, pf_warmed)
-       << "%)" << "  wasted=" << pf_wasted << "  skip_cached=" << stat_warm_skip_cached.load()
-       << "  skip_noslot=" << stat_warm_skip_noslot.load() << "  evictions=" << stat_worker_evictions.load() << "\n";
-    ss << "[ECSTATS] prefetch: predict_calls=" << pred_calls
-       << "  predict_avg_us=" << (pred_calls ? (stat_predict_ns.load() / 1000.0 / pred_calls) : 0.0) << "\n";
+       << "%)" << "  wasted=" << pf_wasted << "  skip_cached=" << stat_warm_skip_cached.load(std::memory_order_relaxed)
+       << "  skip_noslot=" << stat_warm_skip_noslot.load(std::memory_order_relaxed)
+       << "  evictions=" << stat_worker_evictions.load(std::memory_order_relaxed) << "\n";
+    ss << "[ECSTATS] prefetch: predict_calls=" << pred_calls << "  predict_avg_us="
+       << (pred_calls ? (stat_predict_ns.load(std::memory_order_relaxed) / 1000.0 / pred_calls) : 0.0) << "\n";
 
-    const uint64_t f_subs  = stat_forced_subs.load();
-    const uint64_t f_hits  = stat_prefetch_hits.load();
+    const uint64_t f_subs  = stat_forced_subs.load(std::memory_order_relaxed);
+    const uint64_t f_hits  = stat_prefetch_hits.load(std::memory_order_relaxed);
     const uint64_t f_total = f_subs + f_hits;
     ss << std::setprecision(1);
     ss << "[ECSTATS] forced_prefetch: lookups=" << f_total << "  forced_subs=" << f_subs << " (" << pct(f_subs, f_total)
        << "%)" << "  prefetch_hits=" << f_hits << " (" << pct(f_hits, f_total) << "%)\n";
 
-    ss << "[ECSTATS] read_percentage: subs=" << stat_read_pct_subs.load() << "\n";
+    ss << "[ECSTATS] read_percentage: subs=" << stat_read_pct_subs.load(std::memory_order_relaxed) << "\n";
 
     if (use_htp_pool_) {
         ss << std::setprecision(3);
-        ss << "[ECSTATS] htp: main_read=" << (stat_htp_main_read_ns.load() / 1e6) << " ms"
-           << "  main_copy=" << (stat_htp_main_copy_ns.load() / 1e6) << " ms"
-           << "  main_repack=" << (stat_htp_main_repack_ns.load() / 1e6) << " ms\n";
-        ss << "[ECSTATS] htp: worker_read=" << (stat_htp_worker_read_ns.load() / 1e6) << " ms"
-           << "  worker_copy=" << (stat_htp_worker_copy_ns.load() / 1e6) << " ms"
-           << "  worker_repack=" << (stat_htp_worker_repack_ns.load() / 1e6) << " ms\n";
+        ss << "[ECSTATS] htp: main_read=" << (stat_htp_main_read_ns.load(std::memory_order_relaxed) / 1e6) << " ms"
+           << "  main_copy=" << (stat_htp_main_copy_ns.load(std::memory_order_relaxed) / 1e6) << " ms"
+           << "  main_repack=" << (stat_htp_main_repack_ns.load(std::memory_order_relaxed) / 1e6) << " ms\n";
+        ss << "[ECSTATS] htp: worker_read=" << (stat_htp_worker_read_ns.load(std::memory_order_relaxed) / 1e6) << " ms"
+           << "  worker_copy=" << (stat_htp_worker_copy_ns.load(std::memory_order_relaxed) / 1e6) << " ms"
+           << "  worker_repack=" << (stat_htp_worker_repack_ns.load(std::memory_order_relaxed) / 1e6) << " ms\n";
     }
 
     ss << std::setprecision(0);
@@ -197,47 +207,60 @@ std::string llama_expert_cache::stats_to_str() const {
 }
 
 void llama_expert_cache::stats_reset() {
-    stat_hits.store(0);
-    stat_misses.store(0);
-    stat_subs.store(0);
-    stat_ddr_copies.store(0);
-    stat_prefetch_adopts.store(0);
-    stat_forced_subs.store(0);
-    stat_prefetch_hits.store(0);
-    stat_read_pct_subs.store(0);
-    stat_flash_reads.store(0);
-    stat_flash_bytes.store(0);
-    stat_flash_ns.store(0);
-    stat_eval_us.store(0);
-    stat_p_hits.store(0);
-    stat_p_misses.store(0);
-    stat_p_subs.store(0);
-    stat_p_ddr_copies.store(0);
-    stat_p_prefetch_adopts.store(0);
-    stat_p_flash_reads.store(0);
-    stat_p_flash_bytes.store(0);
-    stat_p_flash_ns.store(0);
-    stat_p_eval_us.store(0);
-    stat_prefetch_warmed.store(0);
-    stat_prefetch_useful.store(0);
-    stat_prefetch_wasted.store(0);
-    stat_warm_skip_cached.store(0);
-    stat_warm_skip_noslot.store(0);
-    stat_worker_evictions.store(0);
-    stat_predict_calls.store(0);
-    stat_predict_ns.store(0);
-    stat_htp_main_read_ns.store(0);
-    stat_htp_main_copy_ns.store(0);
-    stat_htp_main_repack_ns.store(0);
-    stat_htp_worker_read_ns.store(0);
-    stat_htp_worker_copy_ns.store(0);
-    stat_htp_worker_repack_ns.store(0);
-    flash_busy_ns_.store(0);
-    flash_bytes_worker_.store(0);
+    if (!stats_) {
+        return;
+    }
+    const bool restart_worker = worker_thread_.joinable();
+    stop_worker();
+    std::unique_lock<std::mutex> reservation_lock(reserve_mu_);
+    for (uint32_t s = 0; slots && s < n_slots_; ++s) {
+        slots[s].warmed_by_worker.store(0, std::memory_order_relaxed);
+    }
+    stat_hits.store(0, std::memory_order_relaxed);
+    stat_misses.store(0, std::memory_order_relaxed);
+    stat_subs.store(0, std::memory_order_relaxed);
+    stat_ddr_copies.store(0, std::memory_order_relaxed);
+    stat_prefetch_adopts.store(0, std::memory_order_relaxed);
+    stat_forced_subs.store(0, std::memory_order_relaxed);
+    stat_prefetch_hits.store(0, std::memory_order_relaxed);
+    stat_read_pct_subs.store(0, std::memory_order_relaxed);
+    stat_flash_reads.store(0, std::memory_order_relaxed);
+    stat_flash_bytes.store(0, std::memory_order_relaxed);
+    stat_flash_ns.store(0, std::memory_order_relaxed);
+    stat_eval_us.store(0, std::memory_order_relaxed);
+    stat_p_hits.store(0, std::memory_order_relaxed);
+    stat_p_misses.store(0, std::memory_order_relaxed);
+    stat_p_subs.store(0, std::memory_order_relaxed);
+    stat_p_ddr_copies.store(0, std::memory_order_relaxed);
+    stat_p_prefetch_adopts.store(0, std::memory_order_relaxed);
+    stat_p_flash_reads.store(0, std::memory_order_relaxed);
+    stat_p_flash_bytes.store(0, std::memory_order_relaxed);
+    stat_p_flash_ns.store(0, std::memory_order_relaxed);
+    stat_p_eval_us.store(0, std::memory_order_relaxed);
+    stat_prefetch_warmed.store(0, std::memory_order_relaxed);
+    stat_prefetch_useful.store(0, std::memory_order_relaxed);
+    stat_prefetch_wasted.store(0, std::memory_order_relaxed);
+    stat_warm_skip_cached.store(0, std::memory_order_relaxed);
+    stat_warm_skip_noslot.store(0, std::memory_order_relaxed);
+    stat_worker_evictions.store(0, std::memory_order_relaxed);
+    stat_predict_calls.store(0, std::memory_order_relaxed);
+    stat_predict_ns.store(0, std::memory_order_relaxed);
+    stat_htp_main_read_ns.store(0, std::memory_order_relaxed);
+    stat_htp_main_copy_ns.store(0, std::memory_order_relaxed);
+    stat_htp_main_repack_ns.store(0, std::memory_order_relaxed);
+    stat_htp_worker_read_ns.store(0, std::memory_order_relaxed);
+    stat_htp_worker_copy_ns.store(0, std::memory_order_relaxed);
+    stat_htp_worker_repack_ns.store(0, std::memory_order_relaxed);
+    flash_busy_ns_.store(0, std::memory_order_relaxed);
+    flash_bytes_worker_.store(0, std::memory_order_relaxed);
     {
         std::lock_guard<std::mutex> lk(flash_busy_mu_);
         flash_in_flight_  = 0;
         flash_busy_start_ = 0;
+    }
+    reservation_lock.unlock();
+    if (restart_worker) {
+        start_worker();
     }
 }
 
@@ -269,6 +292,25 @@ void llama_expert_cache::stats_record_prefetch_adopt(bool is_prefill) {
     }
     (is_prefill ? stat_p_hits : stat_hits).fetch_add(1, std::memory_order_relaxed);
     (is_prefill ? stat_p_prefetch_adopts : stat_prefetch_adopts).fetch_add(1, std::memory_order_relaxed);
+}
+
+void llama_expert_cache::stats_record_prefetch_use(int32_t slot) {
+    if (stats_ && slots[slot].warmed_by_worker.exchange(0, std::memory_order_relaxed)) {
+        stat_prefetch_useful.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+void llama_expert_cache::stats_record_prefetch_load(int32_t slot, uint32_t layer, uint32_t expert) {
+    if (!stats_) {
+        return;
+    }
+    for (int k = 0; k < N_KINDS; ++k) {
+        if (get_loc(layer, (tensor_kind) k, expert).size != 0) {
+            slots[slot].warmed_by_worker.store(1, std::memory_order_relaxed);
+            stat_prefetch_warmed.fetch_add(1, std::memory_order_relaxed);
+            break;
+        }
+    }
 }
 
 void llama_expert_cache::stats_record_substitution(bool is_prefill) {
@@ -366,6 +408,7 @@ void llama_expert_cache::init_kind_first_layout(const size_t * kind_sizes) {
     if (no_alloc_) {
         pool_buf_ =
             ggml_backend_buft_alloc_buffer(use_htp_pool_ ? htp_repack_buft_ : ggml_backend_cpu_buffer_type(), 0);
+        ggml_backend_buffer_set_usage(pool_buf_, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
         return;
     }
     slots = std::make_unique<llama_expert_slot[]>(n_slots_);
@@ -406,6 +449,9 @@ void llama_expert_cache::init_kind_first(uint32_t n_slots, const std::vector<siz
 void llama_expert_cache::init_pool_tensor(ggml_tensor * tensor) const {
     // Name shared weights before graph construction can rename them concurrently.
     ggml_set_name(tensor, "expert_cache");
+    if (use_htp_pool_ && htp_mark_tensor_expert_cache_) {
+        htp_mark_tensor_expert_cache_(tensor);
+    }
 }
 
 namespace {
@@ -694,12 +740,11 @@ int32_t llama_expert_cache::claim_slot(uint32_t layer, uint32_t expert) {
     const uint32_t scan_end   = layered_mode_ ? layer_slot_base_[layer + 1] : n_slots_;
 
     for (uint32_t i = scan_begin; i < scan_end; ++i) {
-        uint32_t expected = (uint32_t) llama_expert_slot_state::EMPTY;
-        if (slots[i].state.compare_exchange_strong(expected, (uint32_t) llama_expert_slot_state::LOADING,
-                                                   std::memory_order_acq_rel)) {
+        if (slots[i].state.load(std::memory_order_acquire) == (uint32_t) llama_expert_slot_state::EMPTY) {
+            index_[make_key(layer, expert)] = i;
             slots[i].key = { layer, expert };
             slots[i].usage.store(0, std::memory_order_relaxed);
-            index_[make_key(layer, expert)] = i;
+            slots[i].state.store((uint32_t) llama_expert_slot_state::LOADING, std::memory_order_release);
             return (int32_t) i;
         }
     }
@@ -715,12 +760,11 @@ int32_t llama_expert_cache::claim_slot_in_range(uint32_t layer, uint32_t expert,
         }
     }
     for (uint32_t i = begin; i < end; ++i) {
-        uint32_t expected = (uint32_t) llama_expert_slot_state::EMPTY;
-        if (slots[i].state.compare_exchange_strong(expected, (uint32_t) llama_expert_slot_state::LOADING,
-                                                   std::memory_order_acq_rel)) {
+        if (slots[i].state.load(std::memory_order_acquire) == (uint32_t) llama_expert_slot_state::EMPTY) {
+            index_[make_key(layer, expert)] = i;
             slots[i].key = { layer, expert };
             slots[i].usage.store(0, std::memory_order_relaxed);
-            index_[make_key(layer, expert)] = i;
+            slots[i].state.store((uint32_t) llama_expert_slot_state::LOADING, std::memory_order_release);
             return (int32_t) i;
         }
     }
@@ -748,6 +792,7 @@ int32_t llama_expert_cache::claim_or_copy_slot_in_range(uint32_t layer, uint32_t
             memcpy(kind_slot_ptr((tensor_kind) k, dest), kind_slot_ptr((tensor_kind) k, source), kind_size_[k]);
         }
     }
+    stats_record_prefetch_use(source);
     // Prefill may still be reading the copy outside the decode range.
     if (slots[source].readers == 0) {
         release(source);
@@ -765,6 +810,7 @@ void llama_expert_cache::mark_occupied(int32_t slot) {
 }
 
 void llama_expert_cache::record_use(int32_t slot) {
+    stats_record_prefetch_use(slot);
     slots[slot].usage.fetch_add(1, std::memory_order_relaxed);
     slots[slot].last_use.store(next_tick(), std::memory_order_relaxed);
 }
@@ -778,7 +824,9 @@ void llama_expert_cache::release(int32_t slot) {
             index_.erase(it);
         }
         slots[slot].key = { 0, 0 };
-        slots[slot].warmed_by_worker.store(0, std::memory_order_relaxed);
+        if (slots[slot].warmed_by_worker.exchange(0, std::memory_order_relaxed) && stats_) {
+            stat_prefetch_wasted.fetch_add(1, std::memory_order_relaxed);
+        }
         slots[slot].state.store((uint32_t) llama_expert_slot_state::EMPTY, std::memory_order_release);
     }
     slots_cv_.notify_all();
@@ -1069,7 +1117,9 @@ void llama_expert_cache::reroute_fn(struct ggml_tensor * dst,
     // Use stack storage for small expert sets.
     constexpr int64_t STACK_MAX = 64;
     int32_t           pinned_stack[STACK_MAX];
-    int32_t *         pinned = ((size_t) cache->n_expert_ <= STACK_MAX) ? pinned_stack : new int32_t[cache->n_expert_];
+    std::unique_ptr<int32_t[]> pinned_heap(((size_t) cache->n_expert_ <= STACK_MAX) ? nullptr :
+                                                                                      new int32_t[cache->n_expert_]);
+    int32_t *                  pinned   = pinned_heap ? pinned_heap.get() : pinned_stack;
     int               pinned_n = 0;
 
     // Pin each selected expert once, even when several tokens use it.
@@ -1081,22 +1131,20 @@ void llama_expert_cache::reroute_fn(struct ggml_tensor * dst,
     constexpr int64_t MISS_STACK_MAX   = 64;
     constexpr int64_t EXPERT_STACK_MAX = 256;
     int64_t           miss_r_stack[MISS_STACK_MAX];
-    int64_t *         miss_r = (n_expert_used <= MISS_STACK_MAX) ? miss_r_stack : new int64_t[n_expert_used];
+    std::unique_ptr<int64_t[]> miss_r_heap((n_expert_used <= MISS_STACK_MAX) ? nullptr : new int64_t[n_expert_used]);
+    int64_t *                  miss_r = miss_r_heap ? miss_r_heap.get() : miss_r_stack;
     uint8_t           claimed_e_stack[EXPERT_STACK_MAX];
-    uint8_t *         claimed_e = (n_expert_total <= EXPERT_STACK_MAX) ? claimed_e_stack : new uint8_t[n_expert_total];
-
-    struct miss_candidate {
-        int64_t r;
-        int32_t best_eid;
-        int32_t best_slot;
-        float   gap;
-        bool    has_candidate;
-    };
+    std::unique_ptr<uint8_t[]> claimed_e_heap((n_expert_total <= EXPERT_STACK_MAX) ? nullptr :
+                                                                                     new uint8_t[n_expert_total]);
+    uint8_t *                  claimed_e = claimed_e_heap ? claimed_e_heap.get() : claimed_e_stack;
 
     miss_candidate   cands_stack[MISS_STACK_MAX];
-    miss_candidate * cands = (n_expert_used <= MISS_STACK_MAX) ? cands_stack : new miss_candidate[n_expert_used];
+    std::unique_ptr<miss_candidate[]> cands_heap((n_expert_used <= MISS_STACK_MAX) ? nullptr :
+                                                                                     new miss_candidate[n_expert_used]);
+    miss_candidate *                  cands = cands_heap ? cands_heap.get() : cands_stack;
     int64_t          ranked_stack[MISS_STACK_MAX];
-    int64_t *        ranked = (n_expert_used <= MISS_STACK_MAX) ? ranked_stack : new int64_t[n_expert_used];
+    std::unique_ptr<int64_t[]> ranked_heap((n_expert_used <= MISS_STACK_MAX) ? nullptr : new int64_t[n_expert_used]);
+    int64_t *                  ranked = ranked_heap ? ranked_heap.get() : ranked_stack;
 
     // Treat a layer as covered when prefetch warmed all predicted experts.
     bool          forced_covered    = false;
@@ -1337,12 +1385,6 @@ void llama_expert_cache::reroute_fn(struct ggml_tensor * dst,
                 pin_mark[eid]      = 1;
                 pinned[pinned_n++] = slot;
                 cache->record_use(slot);
-                if (cache->stats_) {
-                    // Exchange clears the worker tag exactly once.
-                    if (cache->slots[slot].warmed_by_worker.exchange(0, std::memory_order_relaxed)) {
-                        cache->stat_prefetch_useful.fetch_add(1, std::memory_order_relaxed);
-                    }
-                }
             }
         }
     }
@@ -1408,6 +1450,24 @@ void llama_expert_cache::reroute_fn(struct ggml_tensor * dst,
 
     std::vector<llama_expert_cache::load_req> to_load;
     to_load.reserve((size_t) n_tokens * n_expert_used);
+
+    struct pending_load_cleanup {
+        llama_expert_cache *          cache;
+        const std::vector<load_req> & requests;
+        int                           exceptions = std::uncaught_exceptions();
+
+        ~pending_load_cleanup() {
+            if (std::uncaught_exceptions() <= exceptions) {
+                return;
+            }
+            for (const auto & req : requests) {
+                if (cache->slots[req.slot].state.load(std::memory_order_acquire) ==
+                    (uint32_t) llama_expert_slot_state::LOADING) {
+                    cache->release(req.slot);
+                }
+            }
+        }
+    } cleanup{ cache, to_load };
 
     for (int64_t t = 0; t < n_tokens; ++t) {
         int32_t * row = ids + t * n_expert_used;
@@ -1491,21 +1551,6 @@ void llama_expert_cache::reroute_fn(struct ggml_tensor * dst,
                     }
                 }
                 if (slot < 0) {
-                    if (pinned != pinned_stack) {
-                        delete[] pinned;
-                    }
-                    if (miss_r != miss_r_stack) {
-                        delete[] miss_r;
-                    }
-                    if (claimed_e != claimed_e_stack) {
-                        delete[] claimed_e;
-                    }
-                    if (cands != cands_stack) {
-                        delete[] cands;
-                    }
-                    if (ranked != ranked_stack) {
-                        delete[] ranked;
-                    }
                     GGML_ABORT(
                         "expert cache: no slot for layer=%u expert=%d "
                         "(n_tokens=%ld n_expert_used=%ld pinned_n=%d n_slots=%u, "
@@ -1528,9 +1573,6 @@ void llama_expert_cache::reroute_fn(struct ggml_tensor * dst,
                 cache->record_use(slot);
             } else {
                 cache->stats_record_hit(prefill);
-                if (cache->stats_ && cache->slots[slot].warmed_by_worker.exchange(0, std::memory_order_relaxed)) {
-                    cache->stat_prefetch_useful.fetch_add(1, std::memory_order_relaxed);
-                }
             }
 
             slot_out[t * n_expert_used + r] = to_local(slot);
@@ -1553,22 +1595,6 @@ void llama_expert_cache::reroute_fn(struct ggml_tensor * dst,
     p->pinned.assign(pinned, pinned + pinned_n);
     for (int32_t s : p->pinned) {
         ++cache->slots[s].readers;
-    }
-
-    if (pinned != pinned_stack) {
-        delete[] pinned;
-    }
-    if (miss_r != miss_r_stack) {
-        delete[] miss_r;
-    }
-    if (claimed_e != claimed_e_stack) {
-        delete[] claimed_e;
-    }
-    if (cands != cands_stack) {
-        delete[] cands;
-    }
-    if (ranked != ranked_stack) {
-        delete[] ranked;
     }
 }
 
@@ -1686,7 +1712,6 @@ void llama_expert_cache::warm_cache(uint32_t layer, const std::vector<int32_t> &
             continue;  // prefetch is optional
         }
 
-        slots[slot].warmed_by_worker.store(1, std::memory_order_relaxed);
         to_load.push_back({ slot, layer, (uint32_t) eid });
     }
     lock.unlock();
@@ -1702,10 +1727,6 @@ void llama_expert_cache::warm_cache(uint32_t layer, const std::vector<int32_t> &
                 load_experts_batch_cpu(&to_load[idx], w, /*is_prefill=*/false, cpu_load_origin::worker);
             }
         }
-    }
-
-    if (stats_) {
-        stat_prefetch_warmed.fetch_add(to_load.size(), std::memory_order_relaxed);
     }
 
     // Stamp the marker only after every predicted expert is resident.
@@ -1916,6 +1937,7 @@ uint64_t llama_expert_cache::load_experts_batch_htp_prefetch(const load_req * re
     }
 
     for (uint32_t i = 0; i < n; ++i) {
+        stats_record_prefetch_load(reqs[i].slot, reqs[i].layer, reqs[i].expert);
         mark_occupied(reqs[i].slot);
     }
 
@@ -2057,6 +2079,9 @@ uint64_t llama_expert_cache::load_experts_batch_cpu(const load_req * reqs,
     }
 
     for (uint32_t i = 0; i < n; ++i) {
+        if (origin == cpu_load_origin::worker) {
+            stats_record_prefetch_load(reqs[i].slot, reqs[i].layer, reqs[i].expert);
+        }
         mark_occupied(reqs[i].slot);
     }
 
@@ -2392,16 +2417,9 @@ void llama_expert_cache::prefetch_teardown() {
     }
 }
 
-llama_expert_cache::worker_pred_graph & llama_expert_cache::worker_pred_graph_for(uint32_t layer, int64_t n_embd) {
-    if (worker_pred_graphs_.empty()) {
-        worker_pred_graphs_.resize(n_layer_);
-    }
-    worker_pred_graph & g = worker_pred_graphs_[layer];
-    if (g.gf != nullptr) {
-        GGML_ASSERT(g.inp->ne[0] == n_embd && "worker_predict: n_embd changed for a cached layer");
-        return g;  // already built
-    }
-
+llama_expert_cache::worker_pred_graph llama_expert_cache::build_worker_pred_graph(uint32_t layer,
+                                                                                  int64_t  n_embd) const {
+    worker_pred_graph       g;
     const moe_router_desc & rd = router_descs_[layer];
 
     const size_t            n_nodes_est = 24;  // router nodes + up to 3 pre-gating nodes (gemma4) + margin
@@ -2410,8 +2428,9 @@ llama_expert_cache::worker_pred_graph & llama_expert_cache::worker_pred_graph_fo
         /* .mem_buffer = */ nullptr,
         /* .no_alloc   = */ true,
     };
-    g.ctx = ggml_init(params);
-    GGML_ASSERT(g.ctx != nullptr);
+    ggml_context_ptr ctx(ggml_init(params));
+    GGML_ASSERT(ctx != nullptr);
+    g.ctx = ctx.get();
 
     g.inp = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, n_embd, 1);
     ggml_set_input(g.inp);
@@ -2424,10 +2443,121 @@ llama_expert_cache::worker_pred_graph & llama_expert_cache::worker_pred_graph_fo
     g.gf = ggml_new_graph(g.ctx);
     ggml_build_forward_expand(g.gf, g.out);
 
+    ctx.release();
+    return g;
+}
+
+llama_expert_cache::worker_pred_graph & llama_expert_cache::worker_pred_graph_for(uint32_t layer, int64_t n_embd) {
+    if (worker_pred_graphs_.empty()) {
+        worker_pred_graphs_.resize(n_layer_);
+    }
+    worker_pred_graph & g = worker_pred_graphs_[layer];
+    if (g.gf != nullptr) {
+        GGML_ASSERT(g.inp->ne[0] == n_embd && "worker_predict: n_embd changed for a cached layer");
+        return g;
+    }
+    g     = build_worker_pred_graph(layer, n_embd);
     g.buf = ggml_backend_alloc_ctx_tensors(g.ctx, worker_backend_);
     GGML_ASSERT(g.buf != nullptr);
-
     return g;
+}
+
+void llama_expert_cache::prepare_runtime_memory(int64_t n_embd) {
+    auto add = [](size_t & total, size_t count, size_t size) {
+        if (count != 0 && size > (SIZE_MAX - total) / count) {
+            throw std::overflow_error("expert cache runtime memory exceeds size_t");
+        }
+        total += count * size;
+    };
+    direct_io_memory_ = 0;
+    predictor_memory_ = 0;
+    {
+        std::vector<size_t> capacities;
+        auto                measure_batch = [&](uint32_t layer, uint32_t count, bool chunked) {
+            size_t index = 0;
+            for (uint32_t i = 0; i < count; ++i) {
+                for (int k = 0; k < N_KINDS; ++k) {
+                    const auto first = get_loc(layer, (tensor_kind) k, 0);
+                    if (first.size == 0) {
+                        continue;
+                    }
+                    const auto * tensor = pool_tensor(layer, (tensor_kind) k);
+                    const size_t row_size = use_htp_pool_ ? ggml_row_size(tensor->type, tensor->ne[0]) : first.size;
+                    const size_t rows = use_htp_pool_ ? (size_t) tensor->ne[1] : 1;
+                    const size_t chunk_rows = chunked ? htp_chunk_rows_for(tensor, htp_read_chunk_kb_) : rows;
+                    for (size_t row = 0; row < rows;) {
+                        const size_t length  = std::min(chunk_rows, rows - row) * row_size;
+                        size_t       maximum = 0;
+                        for (uint32_t e = 0; e < n_expert_; ++e) {
+                            const auto   loc  = get_loc(layer, (tensor_kind) k, e);
+                            const auto & file = *files_.at(loc.file_idx);
+                            if (file.direct_fd < 0) {
+                                continue;
+                            }
+                            const size_t block = file.block_size;
+                            const size_t lead  = (loc.offset + row * row_size) & (block - 1);
+                            if (length > SIZE_MAX - lead - (block - 1)) {
+                                throw std::overflow_error("expert cache direct I/O size exceeds size_t");
+                            }
+                            maximum = std::max(maximum, (lead + length + block - 1) & ~(block - 1));
+                        }
+                        if (index >= capacities.size()) {
+                            capacities.resize(index + 1);
+                        }
+                        capacities[index] = std::max(capacities[index], maximum);
+                        ++index;
+                        row += std::min(chunk_rows, rows - row);
+                    }
+                }
+            }
+        };
+        const uint32_t depth = (uint32_t) batch_depth_;
+        for (uint32_t l = 0; l < n_layer_; ++l) {
+            measure_batch(l, std::min(depth, n_expert_), false);
+            if (use_htp_pool_ && htp_read_chunk_kb_ > 0 && htp_repack_range_ && depth > 1) {
+                measure_batch(l, std::min(depth - 1, n_expert_), true);
+            }
+        }
+        const size_t pools = layered_mode_ && decode_prefetch_lookahead_ != 0 ? 2 : 1;
+        read_batch_memory_ = 0;
+        add(read_batch_memory_, pools, ec_thread_pool::batch_memory(capacities.size(), stats_));
+        // HTP tracks repacking destinations and row ranges in addition to read descriptors.
+        if (use_htp_pool_) {
+            add(read_batch_memory_, pools * capacities.size(),
+                sizeof(ec_read_op) + sizeof(uint32_t) + sizeof(int) + 3 * sizeof(size_t) + sizeof(void *));
+        }
+        if (odirect_) {
+            for (size_t size : capacities) {
+                add(direct_io_memory_, pools, size);
+            }
+            add(direct_io_memory_, pools * capacities.size(), sizeof(ec_odirect::buf));
+            // Reserve descriptors now so later vector growth does not exceed the estimate.
+            for (size_t s = 0; s < pools; ++s) {
+                odirect_->bufs[s].reserve(capacities.size());
+            }
+        }
+    }
+    if (decode_prefetch_lookahead_ != 0) {
+        size_t workspace = 0;
+        for (uint32_t l = 0; l < router_descs_.size(); ++l) {
+            if (!router_descs_[l].gate_inp || !router_descs_[l].prefetch_capable) {
+                continue;
+            }
+            auto             g = build_worker_pred_graph(l, n_embd);
+            ggml_context_ptr ctx(g.ctx);
+            const size_t data = ggml_backend_alloc_ctx_tensors_from_buft_size(g.ctx, ggml_backend_cpu_buffer_type());
+            if (data == 0) {
+                throw std::runtime_error("expert cache could not measure predictor tensors");
+            }
+            add(predictor_memory_, 1, ggml_get_mem_size(g.ctx));
+            add(predictor_memory_, 1, data);
+            workspace = std::max(workspace, ggml_graph_plan(g.gf, 1, nullptr).work_size);
+        }
+        add(predictor_memory_, 1, workspace);
+        add(predictor_memory_, n_layer_, sizeof(worker_pred_graph));
+        add(predictor_memory_, (size_t) n_embd, sizeof(float));
+        add(predictor_memory_, n_expert_used_, sizeof(int32_t) + sizeof(load_req));
+    }
 }
 
 void llama_expert_cache::worker_predict(uint32_t               layer,
@@ -2446,12 +2576,16 @@ void llama_expert_cache::worker_predict(uint32_t               layer,
 
     worker_pred_graph & g = worker_pred_graph_for(layer, n_embd);
 
-    ggml_backend_tensor_set(g.inp, hidden, 0, n_embd * sizeof(float));
-    ggml_backend_graph_compute(worker_backend_, g.gf);
-
     const int64_t n_expert_used = g.out->ne[0];
     result.resize(n_expert_used);
+    const uint64_t start = stats_ ? stats_now_ns() : 0;
+    ggml_backend_tensor_set(g.inp, hidden, 0, n_embd * sizeof(float));
+    ggml_backend_graph_compute(worker_backend_, g.gf);
     ggml_backend_tensor_get(g.out, result.data(), 0, n_expert_used * sizeof(int32_t));
+    if (stats_) {
+        stat_predict_ns.fetch_add(stats_now_ns() - start, std::memory_order_relaxed);
+        stat_predict_calls.fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 uint8_t * llama_expert_cache::ensure_pool_buf() {
@@ -2488,6 +2622,19 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_expert_cache::memory_breakdow
         result[cpu_buft] += staging * batch_depth_ * (decode_prefetch_lookahead_ != 0 ? 2 : 1);
     }
     result[cpu_buft] += (size_t) n_slots_ * sizeof(llama_expert_slot) + offsets_.capacity() * sizeof(expert_slice_loc);
+    result[cpu_buft] += direct_io_memory_ + predictor_memory_ + read_batch_memory_;
+    result[cpu_buft] +=
+        router_descs_.capacity() * sizeof(moe_router_desc) + prefetch_snapshot_.hidden.capacity() * sizeof(float);
+    result[cpu_buft] += (size_t) n_layer_ * sizeof(std::atomic<uint64_t>);
+    for (const auto * ctx : { pool_ggml_ctx_, layered_pool_ctx_ }) {
+        if (ctx) {
+            result[cpu_buft] += ggml_get_mem_size(ctx);
+        }
+    }
+    result[cpu_buft] += layered_kind_size_.capacity() * sizeof(size_t) + layered_kind_base_.capacity() * sizeof(size_t);
+    result[cpu_buft] += layered_pool_tensors_.capacity() * sizeof(ggml_tensor *) +
+                        layered_prefill_tensors_.capacity() * sizeof(ggml_tensor *);
+    result[cpu_buft] += layer_slot_base_.capacity() * sizeof(uint32_t);
     return result;
 }
 

@@ -10,6 +10,7 @@
 #include "llama-model-loader.h"
 #include "llama-model-saver.h"
 #include "llama-model.h"
+#include "llama-expert-cache-model.h"
 
 #include "ggml.h"
 #include "ggml-cpp.h"
@@ -320,6 +321,7 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             params.check_tensors, params.no_alloc, params.load_mtp, params.kv_overrides, params.tensor_buft_overrides);
 
         ml.lazy.mode = params.lazy_mode;
+        llama_expert_cache_prepare(ml, params);
 
         ml.print_info();
         std::unique_ptr<llama_model> model_ptr(llama_model_create(ml, params));
@@ -490,6 +492,11 @@ struct llama_model * llama_model_load_from_file_ptr(FILE * file, struct llama_mo
 }
 
 void llama_model_save_to_file(const struct llama_model * model, const char * path_model) {
+    if (model->expert_cache) {
+        LLAMA_LOG_ERROR("%s: cannot save a model with expert caching enabled; reload it without expert caching before saving\n", __func__);
+        return;
+    }
+
     llama_model_saver ms(model);
     ms.add_kv_from_model();
     ms.add_tensors_from_model();
@@ -611,4 +618,3 @@ const char * llama_print_system_info(void) {
 
     return s.c_str();
 }
-

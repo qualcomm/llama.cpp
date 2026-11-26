@@ -2,6 +2,7 @@
 
 #include "llama.h"
 #include "llama-arch.h"
+#include "llama-expert-cache.h"
 #include "llama-graph.h"
 #include "llama-hparams.h"
 #include "llama-memory.h"
@@ -999,6 +1000,9 @@ struct llama_model {
 
     // which tensors can be prefetched - driven by TENSOR_READ_LAZY
     std::unordered_set<const ggml_tensor *> can_prefetch;
+
+    // expert DDR cache (null when feature disabled or model has no MoE experts)
+    std::unique_ptr<llama_expert_cache> expert_cache;
 
     // statically allocated context for assigning
     struct llama_meta_device_get_split_state_userdata get_split_state_ud;

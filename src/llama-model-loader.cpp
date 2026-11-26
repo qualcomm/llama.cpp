@@ -1,4 +1,5 @@
 #include "llama-model-loader.h"
+#include "llama-expert-cache.h"
 
 #include "ggml-alloc.h"
 #include "ggml.h"
@@ -18,6 +19,9 @@
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
 static const size_t GiB = 1024*MiB;
+
+// Non-null data makes the allocator and mmap loader skip cached expert weights.
+alignas(64) static uint8_t s_expert_null_stub[64] = {};
 
 const char * llama_file_version_name(llama_fver version) {
     switch (version) {
@@ -1488,6 +1492,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         ggml_context * ctx = ctx_for_buft(buft);
         ggml_tensor * ret = ggml_dup_tensor(ctx, &t_meta);
         ggml_set_name(ret, tn.str().c_str());
+        if (expert_cache_enabled && is_expert_weight_tensor(ret->name)) {
+            ret->data = no_alloc ? nullptr : s_expert_null_stub;
+        }
         return ret;
     }
 
@@ -1537,6 +1544,11 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
     struct ggml_tensor * tensor = ggml_dup_tensor(ctx, &t_meta);
     ggml_set_name(tensor, ggml_get_name(&t_meta));
+
+    // Skip backend allocation for cached experts.
+    if (expert_cache_enabled && is_expert_weight_tensor(tensor->name)) {
+        tensor->data = no_alloc ? nullptr : s_expert_null_stub;
+    }
 
     if (duplicated) {
         size_data += ggml_nbytes(&t_meta);
@@ -1607,7 +1619,7 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
                 }
             }
 
-            const size_t prefetch_size = prefetch && use_mmap ? -1 : 0;
+            const size_t prefetch_size = prefetch && use_mmap && !expert_cache_enabled ? -1 : 0;
 
             std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch_size, is_numa,
                     lazy.for_file(idx));
@@ -1619,6 +1631,7 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
             }
             mappings.emplace_back(std::move(mapping));
         }
+
     }
 
     // compute the total size of all tensors for progress reporting
@@ -1678,6 +1691,9 @@ std::vector<llama_model_loader::mapping_range> llama_model_loader::get_mapping_r
     mapping_ranges other;
 
     for (ggml_tensor * tensor = ggml_get_first_tensor(ctx); tensor; tensor = ggml_get_next_tensor(ctx, tensor)) {
+        if (tensor->data == s_expert_null_stub) {
+            continue;
+        }
         const auto * weight = get_weight(ggml_get_name(tensor));
         if (!weight || weight->idx != idx) {
             continue;
@@ -1864,6 +1880,7 @@ bool llama_model_loader::load_all_data(
     // staging buffer for non-host buffers without async uploads, reused because a fresh allocation per tensor page faults on every load
     // allocated from the CPU buffer type, which uses vm_allocate on Apple platforms, so freeing it returns its pages to the OS right away
     ggml_backend_buffer_ptr read_buf;
+    std::vector<uint8_t>    validation_buf;
     for (struct ggml_tensor * cur : tensors) {
         const auto * weight = get_weight(ggml_get_name(cur));
         if (weight == nullptr) {
@@ -1901,6 +1918,11 @@ bool llama_model_loader::load_all_data(
                 }));
             }
 
+            if (expert_cache_enabled && is_expert_weight_tensor(ggml_get_name(cur))) {
+                size_done += n_size;
+                continue;
+            }
+
             GGML_ASSERT(buf_mmap || cur->data); // either we have a buffer to allocate the tensor in, or it is already allocated
             if (buf_mmap && cur->data == nullptr) {
                 ggml_backend_tensor_alloc(buf_mmap, cur, data);
@@ -1918,6 +1940,27 @@ bool llama_model_loader::load_all_data(
                 ggml_backend_tensor_set(cur, data, 0, n_size);
             }
         } else {
+            // Validate cached backing without retaining a full tensor.
+            if (expert_cache_enabled && is_expert_weight_tensor(ggml_get_name(cur))) {
+                if (check_tensors) {
+                    const auto & file  = files.at(weight->idx);
+                    const size_t block = ggml_type_size(cur->type);
+                    const size_t chunk = std::max(block, MiB / block * block);
+                    validation_buf.resize(std::min(n_size, chunk));
+                    file->seek(weight->offs, SEEK_SET);
+                    for (size_t offset = 0; offset < n_size;) {
+                        const size_t count = std::min(chunk, n_size - offset);
+                        file->read_raw(validation_buf.data(), count);
+                        if (!ggml_validate_row_data(cur->type, validation_buf.data(), count)) {
+                            throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
+                        }
+                        offset += count;
+                    }
+                }
+                size_done += n_size;
+                continue;
+            }
+
             const auto & file = files.at(weight->idx);
 
             if (ggml_backend_buffer_is_host(cur->buffer)) {

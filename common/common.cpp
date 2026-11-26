@@ -1235,9 +1235,9 @@ common_gguf_info common_get_gguf_info(const std::string & fname) {
     return info;
 }
 
-void common_fit_apply(common_params & params, llama_model_params & mparams, llama_context_params & cparams) {
+bool common_fit_apply(common_params & params, llama_model_params & mparams, llama_context_params & cparams) {
     if (!params.fit_params) {
-        return;
+        return true;
     }
 
     COM_TRC("%s", "fitting params to device memory ...\n");
@@ -1264,13 +1264,18 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
         /*.shares_model =*/ !has_draft, // an MTP context runs on the weights of the main model
     };
 
-    common_fit_params(params.model.get_paths(), &mparams, &cparams,
+    const auto status = common_fit_params(params.model.get_paths(), &mparams, &cparams,
         params.tensor_split,
         params.tensor_buft_overrides.data(),
         params.fit_params_target.data(),
         params.fit_params_min_ctx,
         has_draft || spec_mtp ? &extra : nullptr,
         params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+    if (mparams.expert_cache_enabled && status != COMMON_PARAMS_FIT_STATUS_SUCCESS) {
+        COM_ERR("%s", "expert cache memory fitting failed, adjust the cache size or execution parameters\n");
+        return false;
+    }
+    return true;
 }
 
 common_init_result::common_init_result(common_params & params, bool model_only) :
@@ -1278,7 +1283,9 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
-    common_fit_apply(params, mparams, cparams);
+    if (!common_fit_apply(params, mparams, cparams)) {
+        return;
+    }
 
     llama_model * model = common_model_load(params.model.get_paths(), mparams);
     if (model == NULL) {
@@ -1704,6 +1711,11 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.check_tensors   = params.check_tensors;
     mparams.use_extra_bufts = !params.no_extra_bufts;
     mparams.no_host         = params.no_host;
+    mparams.expert_cache_enabled       = params.expert_cache_enabled;
+    mparams.expert_cache_size_bytes    = params.expert_cache_size_bytes;
+    mparams.expert_cache_threshold     = params.expert_cache_threshold;
+    mparams.expert_cache_mode          = params.expert_cache_mode;
+    mparams.expert_cache_policy        = params.expert_cache_policy;
 
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;
