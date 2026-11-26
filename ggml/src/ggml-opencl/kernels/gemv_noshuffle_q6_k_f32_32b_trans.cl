@@ -126,3 +126,99 @@ __kernel void kernel_gemv_noshuffle_q6_k_f32_32b_trans(
         dst[i01] = sum;
     }
 }
+
+// ---- Super-block-per-subgroup variant (default on the Adreno 850) -----------------
+// Each subgroup takes a whole 256-element super-block per iteration instead of one
+// 32-element group: the row's 16 int8 scales come in with ONE 16-byte load (the
+// scales are row-major, so the per-group byte loads above hit a new 64 B line per
+// lane), d is read once per super-block, and the 64 activation float4s of the
+// super-block are fetched with one image read per lane and broadcast from there.
+// The 6-bit codes are dotted with y first and scaled once per 16 elements.
+#ifndef Q6K_SB_NSG
+#define Q6K_SB_NSG 16
+#endif
+
+static inline float q6_dot8(ushort2 ql8, ushort qh8, float4 ya, float4 yb) {
+    float4 qa = (float4)((float)(( ql8.s0        & 0xF) | (((qh8      ) & 3) << 4)),
+                         (float)(((ql8.s0 >>  4) & 0xF) | (((qh8 >>  2) & 3) << 4)),
+                         (float)(((ql8.s0 >>  8) & 0xF) | (((qh8 >>  4) & 3) << 4)),
+                         (float)(((ql8.s0 >> 12) & 0xF) | (((qh8 >>  6) & 3) << 4))) - 32.f;
+    float4 qb = (float4)((float)(( ql8.s1        & 0xF) | (((qh8 >>  8) & 3) << 4)),
+                         (float)(((ql8.s1 >>  4) & 0xF) | (((qh8 >> 10) & 3) << 4)),
+                         (float)(((ql8.s1 >>  8) & 0xF) | (((qh8 >> 12) & 3) << 4)),
+                         (float)(((ql8.s1 >> 12) & 0xF) | (((qh8 >> 14) & 3) << 4))) - 32.f;
+    return dot(qa, ya) + dot(qb, yb);
+}
+
+__attribute__((qcom_reqd_sub_group_size("half")))
+__kernel void kernel_gemv_noshuffle_q6_k_f32_32b_trans_sb(
+    __read_only image1d_buffer_t src0_ql,
+    __read_only image1d_buffer_t src0_qh,
+    __global char *         src0_s,
+    __global half *         src0_d,
+    __read_only image1d_buffer_t src1,
+    __global float *        dst,
+    ulong                   offsetd,
+    int                     ne00,
+    int                     ne01
+) {
+    uint i01  = get_global_id(0);
+    uint sgid = get_local_id(1);
+    uint slid = get_sub_group_local_id();
+
+    int nsb = ne00 / QK_K;
+    int scales_per_row = nsb * 16;
+    uint row = min(i01, (uint)ne01 - 1);
+
+    float sum = 0.0f;
+
+    for (int sb = sgid; sb < nsb; sb += Q6K_SB_NSG) {
+        float  d  = (float)src0_d[sb * ne01 + row];
+        char16 sc = vload16(0, src0_s + row * scales_per_row + sb * 16);
+        float4 yl = read_imagef(src1, sb * 64 + slid);
+
+        float s16[16];
+        s16[0]  = (float)sc.s0; s16[1]  = (float)sc.s1; s16[2]  = (float)sc.s2; s16[3]  = (float)sc.s3;
+        s16[4]  = (float)sc.s4; s16[5]  = (float)sc.s5; s16[6]  = (float)sc.s6; s16[7]  = (float)sc.s7;
+        s16[8]  = (float)sc.s8; s16[9]  = (float)sc.s9; s16[10] = (float)sc.sa; s16[11] = (float)sc.sb;
+        s16[12] = (float)sc.sc; s16[13] = (float)sc.sd; s16[14] = (float)sc.se; s16[15] = (float)sc.sf;
+
+        float acc = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            uint ib = sb * 8 + j;
+            uint ql_base = (ib * 4) * ne01 + row;
+            uint qh_base = (ib * 2) * ne01 + row;
+            uint q0 = read_imageui(src0_ql, ql_base).x;
+            uint q1 = read_imageui(src0_ql, ql_base + ne01).x;
+            uint q2 = read_imageui(src0_ql, ql_base + ne01 * 2).x;
+            uint q3 = read_imageui(src0_ql, ql_base + ne01 * 3).x;
+            uint h0 = read_imageui(src0_qh, qh_base).x;
+            uint h1 = read_imageui(src0_qh, qh_base + ne01).x;
+
+            float a0 = q6_dot8(as_ushort2(q0), (ushort)(h0 & 0xFFFF),
+                               sub_group_broadcast(yl, j * 8 + 0), sub_group_broadcast(yl, j * 8 + 1))
+                     + q6_dot8(as_ushort2(q1), (ushort)(h0 >> 16),
+                               sub_group_broadcast(yl, j * 8 + 2), sub_group_broadcast(yl, j * 8 + 3));
+            float a1 = q6_dot8(as_ushort2(q2), (ushort)(h1 & 0xFFFF),
+                               sub_group_broadcast(yl, j * 8 + 4), sub_group_broadcast(yl, j * 8 + 5))
+                     + q6_dot8(as_ushort2(q3), (ushort)(h1 >> 16),
+                               sub_group_broadcast(yl, j * 8 + 6), sub_group_broadcast(yl, j * 8 + 7));
+            acc += a0 * s16[2 * j] + a1 * s16[2 * j + 1];
+        }
+        sum += d * acc;
+    }
+
+    __local float reduceLM_sb[SIMDGROUP_WIDTH * (Q6K_SB_NSG - 1)];
+    if (sgid > 0) {
+        reduceLM_sb[SIMDGROUP_WIDTH * (sgid - 1) + slid] = sum;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (sgid == 0 && i01 < (uint)ne01) {
+        for (uint i = 0; i < Q6K_SB_NSG - 1; ++i) {
+            sum += reduceLM_sb[SIMDGROUP_WIDTH * i + slid];
+        }
+        dst = dst + (offsetd >> 2);
+        dst[i01] = sum;
+    }
+}

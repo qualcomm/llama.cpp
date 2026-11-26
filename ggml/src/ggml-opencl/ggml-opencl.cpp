@@ -2206,7 +2206,8 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_fa_coopmat_dk128_sb_rows = nullptr;
     cl_kernel kernel_fa_coopmat_reduce = nullptr;
     bool fa_coopmat_possible = false;
-    bool coopmat_possible = false;      // the coopmat GEMMs will be built (decided before they are, for supports_op)
+    bool coopmat_possible = false;
+    bool adreno_850 = false;            // decode GEMV defaults measured on the Adreno 850      // the coopmat GEMMs will be built (decided before they are, for supports_op)
     ggml_cl_buffer prealloc_fa_cm_part_o;
     ggml_cl_buffer prealloc_fa_cm_part_ml;
     cl_kernel kernel_gemm_noshuffle_q5_k_f32_coopmat = nullptr;
@@ -2399,6 +2400,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemm_noshuffle_q6_k_f32_32b_trans_ila_a7_bin = nullptr;
     cl_kernel kernel_gemm_noshuffle_q6_k_q8_1_dp4a_ila_a8_bin;
     cl_kernel kernel_gemv_noshuffle_q6_k_f32_32b_trans;
+    cl_kernel kernel_gemv_noshuffle_q6_k_f32_32b_trans_sb = nullptr;
     cl_kernel kernel_gemv_noshuffle_q5_k_f32;
     cl_kernel kernel_gemv_noshuffle_q5_k_f32_mc3;  // multi-column (N=3) verify GEMV (spec/MTP)
     cl_kernel kernel_gemm_noshuffle_q5_k_f32;
@@ -11510,6 +11512,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), opts);
             CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q6_k_f32_32b_trans =
                 clCreateKernel(prog, "kernel_gemv_noshuffle_q6_k_f32_32b_trans", &err), err));
+            CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q6_k_f32_32b_trans_sb =
+                clCreateKernel(prog, "kernel_gemv_noshuffle_q6_k_f32_32b_trans_sb", &err), err));
             CL_CHECK(clReleaseProgram(prog));
             GGML_LOG_CONT(".");
         }
@@ -15633,6 +15637,8 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
             strstr(backend_ctx->device_name.c_str(), "850") != NULL && !(e && e[0] == '0');
         const char * ec = getenv("GGML_OPENCL_COOPMAT");
         // the conditions load_cl_kernels_coopmat builds the coopmat GEMMs under
+        backend_ctx->adreno_850 = backend_ctx->gpu_family == GPU_FAMILY::ADRENO &&
+            strstr(backend_ctx->device_name.c_str(), "850") != NULL;
         backend_ctx->coopmat_possible =
             backend_ctx->gpu_family == GPU_FAMILY::ADRENO &&
             strstr(ext_buffer.data(), "cl_qcom_kernel_cooperative_matrix") != NULL &&
@@ -30423,6 +30429,9 @@ static void ggml_cl_mul_mat_q4_k_glu_fused(ggml_backend_t backend, ggml_tensor *
     // GGML_OPENCL_GLU_NSG_Q4K overrides for A/B.
     size_t maxwg = backend_ctx->get_kernel_workgroup_size(kernel);
     size_t nsg_y = (K >= 4096) ? 1 : ((M % 128 != 0) ? 4 : 8);
+    // Adreno 850: 2 subgroups beat 8 for the M % 128 == 0 class (gemma-4-E4B K=2560
+    // M=10240: tg +1.4..1.8%, greedy output unchanged).
+    if (backend_ctx->adreno_850 && nsg_y == 8) { nsg_y = 2; }
     while (nsg_y > 1 && 64 * nsg_y > maxwg) { nsg_y >>= 1; }
     static const int glu_nsg_q4k_force = []{
         const char * e = std::getenv("GGML_OPENCL_GLU_NSG_Q4K");
@@ -44582,7 +44591,14 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno_ila(ggml_backend_t backend, const gg
         img_desc.buffer      = b_sub_buf;
         CL_CHECK((b_img = clCreateImage(context, CL_MEM_READ_ONLY, &img_fmt, &img_desc, NULL, &err), err));
 
-        kernel = backend_ctx->kernel_gemv_noshuffle_q6_k_f32_32b_trans;
+        // Adreno 850: one 256-element super-block per subgroup (one 16-byte scale load and one
+        // activation read per lane per super-block) at 16 subgroups; E4B ffn_down
+        // [2560 x 10240] 301 -> 245 us. GGML_OPENCL_Q6K_GEMV_SB=0/1 forces either way.
+        static const int q6k_sb_env = []{ const char * e = getenv("GGML_OPENCL_Q6K_GEMV_SB"); return (e && e[0]) ? atoi(e) : -1; }();
+        const bool use_q6k_sb = backend_ctx->kernel_gemv_noshuffle_q6_k_f32_32b_trans_sb != nullptr &&
+                                (q6k_sb_env >= 0 ? q6k_sb_env != 0 : backend_ctx->adreno_850);
+        kernel = use_q6k_sb ? backend_ctx->kernel_gemv_noshuffle_q6_k_f32_32b_trans_sb
+                            : backend_ctx->kernel_gemv_noshuffle_q6_k_f32_32b_trans;
         CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),   &extra0_q6_K->ql_img));
         CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem),   &extra0_q6_K->qh_img));
         CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem),   &extra0_q6_K->s));
@@ -44593,8 +44609,9 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno_ila(ggml_backend_t backend, const gg
         CL_CHECK(clSetKernelArg(kernel, 7, sizeof(cl_int),   &ne00));
         CL_CHECK(clSetKernelArg(kernel, 8, sizeof(cl_int),   &ne01));
 
-        size_t local_work_size[3]  = { 64, 8, 1 };
-        size_t global_work_size[3] = { (size_t)ne01, 8, 1 };
+        const size_t q6_nsg = use_q6k_sb ? 16 : 8;
+        size_t local_work_size[3]  = { 64, q6_nsg, 1 };
+        size_t global_work_size[3] = { use_q6k_sb ? (size_t)CEIL_DIV(ne01, 64) * 64 : (size_t)ne01, q6_nsg, 1 };
         backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
 
         CL_CHECK(clReleaseMemObject(b_img));
