@@ -1669,6 +1669,42 @@ void htp_repack_tensor_tiled(ggml_tensor * tensor, const void * data, size_t siz
     }
 }
 
+void ggml_backend_hexagon_repack_tensor_range(
+        ggml_tensor * tensor, const void * data, size_t row_start, size_t row_count) {
+    GGML_ASSERT(tensor != nullptr);
+    GGML_ASSERT(row_count > 0);
+    GGML_ASSERT(row_start % 32 == 0);
+    GGML_ASSERT(row_start + row_count <= (size_t) tensor->ne[1]);
+
+    size_t tile_size = 0;
+    switch (tensor->type) {
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_IQ4_NL:
+            tile_size = HTP_TENSOR_TILE_SIZE_Q4_0;
+            break;
+        case GGML_TYPE_Q4_1:
+            tile_size = HTP_TENSOR_TILE_SIZE_Q4_1;
+            break;
+        case GGML_TYPE_Q8_0:
+            tile_size = HTP_TENSOR_TILE_SIZE_Q8_0;
+            break;
+        case GGML_TYPE_MXFP4:
+            tile_size = HTP_TENSOR_TILE_SIZE_MXFP4;
+            break;
+        default:
+            GGML_ABORT("unsupported HTP repack type");
+    }
+
+    const size_t n_k_tiles = (hex_round_up(tensor->ne[0], 32) / 32);
+    ggml_tensor range = *tensor;
+    range.data = (uint8_t *) tensor->data + (row_start / 32) * n_k_tiles * tile_size;
+    range.ne[1] = row_count;
+    range.ne[2] = 1;
+    range.ne[3] = 1;
+
+    htp_repack_tensor_tiled(&range, data, row_count * ggml_row_size(tensor->type, tensor->ne[0]));
+}
+
 void htp_unpack_tensor_tiled(void * data, const ggml_tensor * tensor, size_t offset, size_t size) {
     GGML_ASSERT(offset + size <= ggml_nbytes(tensor));
 

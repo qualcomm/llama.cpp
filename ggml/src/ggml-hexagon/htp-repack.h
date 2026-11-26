@@ -60,6 +60,9 @@ static inline size_t htp_tiled_row_size(enum ggml_type type, int64_t ne0) {
     return ggml_row_size(type, ne0);
 }
 
+void ggml_backend_hexagon_repack_tensor_range(
+        struct ggml_tensor * tensor, const void * data, size_t row_start, size_t row_count);
+
 void htp_repack_tensor_tiled(struct ggml_tensor * t, const void * data, size_t size);
 void htp_unpack_tensor_tiled(void * data, const struct ggml_tensor * t, size_t offset, size_t size);
 

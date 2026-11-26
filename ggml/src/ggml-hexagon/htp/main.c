@@ -33,6 +33,7 @@
 #include "allreduce-ops.h"
 #include "dsv4-hc-ops.h"
 #include "htp-fence.h"
+#include "host-callback.h"
 
 #define DMA_PROXY_CAPACITY     64
 #define DMA_PROXY_STACK_SIZE   16384
@@ -937,6 +938,8 @@ static int op_mdev_group(struct htp_ops_context * octx) {
 
 static int execute_op(struct htp_ops_context * octx) {
     switch (octx->op) {
+        case HTP_OP_HOST_CALLBACK:
+            return htp_host_callback(octx);
         case HTP_OP_MDEV_GROUP:
             return op_mdev_group(octx);
 
@@ -1391,13 +1394,19 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
     }
 
     int op_status = HTP_STATUS_OK;
+    bool callback_failed = false;
     octx->status  = HTP_STATUS_OK;
     for (uint32_t i = 0; i < n_ops; i++) {
         struct profile_data prof;
 
         profile_start(ctx->profiler, &prof);
 
-        op_status = proc_op_req(octx, bufs, n_bufs, tens, i, &ops[i]);
+        if (!callback_failed || ops[i].opcode == HTP_OP_HOST_CALLBACK) {
+            op_status = proc_op_req(octx, bufs, n_bufs, tens, i, &ops[i]);
+        }
+        if (ops[i].opcode == HTP_OP_HOST_CALLBACK && op_status > HTP_STATUS_OK) {
+            callback_failed = true;
+        }
 
         profile_stop(ctx->profiler, &prof);
 

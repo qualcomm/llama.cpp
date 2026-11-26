@@ -978,6 +978,10 @@ static void htp_fuse_gdn_state(const struct ggml_hexagon_session * sess, std::ve
                 }
             }
             if (k > p && k < c) {
+                if (nodes[k].opcode == HTP_OP_HOST_CALLBACK) {
+                    safe = false;
+                    break;
+                }
                 for (const ggml_tensor * out : nodes[k].outputs) {
                     if (out && (htp_tensors_overlap(out, gr_src0) || htp_tensors_overlap(out, gr_src1) ||
                                 htp_tensors_overlap(out, base_s))) {
@@ -1155,6 +1159,10 @@ static void htp_fuse_concat_ssm_conv(const struct ggml_hexagon_session * sess, s
 
         bool safe = true;
         for (size_t k = p + 1; k < c && safe; ++k) {
+            if (nodes[k].opcode == HTP_OP_HOST_CALLBACK) {
+                safe = false;
+                break;
+            }
             if (has_cpy && k == q) {
                 continue;
             }
@@ -1176,6 +1184,10 @@ static void htp_fuse_concat_ssm_conv(const struct ggml_hexagon_session * sess, s
             const size_t lo = (q < c) ? (q + 1) : (c + 1);
             const size_t hi = (q < c) ? c       : q;
             for (size_t k = lo; k < hi && safe; ++k) {
+                if (nodes[k].opcode == HTP_OP_HOST_CALLBACK) {
+                    safe = false;
+                    break;
+                }
                 for (const ggml_tensor * in : nodes[k].inputs) {
                     if (htp_tensor_reads_from(in, cpy_dst)) {
                         safe = false;
@@ -1262,6 +1274,10 @@ static void htp_fuse_mul_mat_nx_glu(const struct ggml_hexagon_session * sess, st
                 }
             }
             if (safe && k > p && k < c) {
+                if (nodes[k].opcode == HTP_OP_HOST_CALLBACK) {
+                    safe = false;
+                    break;
+                }
                 for (const ggml_tensor * out : nodes[k].outputs) {
                     if (out && (htp_tensors_overlap(out, w0) || htp_tensors_overlap(out, w1) ||
                                 htp_tensors_overlap(out, act) || htp_tensors_overlap(out, o0) ||

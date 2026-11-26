@@ -2,6 +2,7 @@
 
 #include "htp-kparams.h"
 #include "htp-opnode.h"
+#include "htp-callback.h"
 #include "ggml-impl.h"
 
 #include <algorithm>
@@ -14,6 +15,8 @@
 
 htp_op_code htp_op_remap(const struct ggml_tensor * t) {
     switch (t->op) {
+        case GGML_OP_MAP_CUSTOM1:
+        case GGML_OP_MAP_CUSTOM2:     return htp_callback_is_marked(t) ? HTP_OP_HOST_CALLBACK : HTP_OP_INVALID;
         case GGML_OP_FLASH_ATTN_EXT:  return HTP_OP_FLASH_ATTN_EXT;
         case GGML_OP_MUL_MAT:         return htp_is_hadamard(t) ? HTP_OP_HADAMARD : HTP_OP_MUL_MAT;
         case GGML_OP_MUL_MAT_ID:      return HTP_OP_MUL_MAT_ID;
@@ -5803,6 +5806,9 @@ bool htp_kparams_solve(
     const struct ggml_hexagon_session * sess,
     htp_opnode & node
 ) {
+    if (node.opcode == HTP_OP_HOST_CALLBACK) {
+        return htp_session_mdev_count(sess) == 1 && htp_callback_supports(node.node);
+    }
     ggml_tensor scratch[HTP_OP_MAX_INPUTS + HTP_OP_MAX_OUTPUTS];
     htp_opnode tmp = node;
     htp_lower_opnode(sess, tmp, scratch);
@@ -6020,6 +6026,8 @@ bool htp_kparams_solve(
     }
 
     switch (opcode) {
+        case HTP_OP_HOST_CALLBACK:
+            return htp_session_mdev_count(sess) == 1 && htp_callback_supports(op);
         case HTP_OP_MUL_MAT:
         case HTP_OP_MUL_MAT_ID:
             return htp_kparams_invoke<htp_kparams_solve_matmul>(sess, op, kparams);

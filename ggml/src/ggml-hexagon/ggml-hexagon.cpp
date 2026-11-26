@@ -53,6 +53,7 @@
 #include "ggml-common.h"
 #include "ggml-hexagon.h"
 #include "ggml-impl.h"
+#include "htp-callback.h"
 #include "ggml-quants.h"
 #include "htp-opnode.h"
 #include "htp/htp-ops.h"
@@ -350,6 +351,8 @@ struct ggml_hexagon_session {
     ggml_backend_hexagon_device_context *  dev_ctx   = nullptr;
     ggml_hexagon_shared_buffer *           shm_buf   = nullptr;
     ggml_hexagon_fence_buffer *            fence_buf = nullptr;
+    std::unique_ptr<htp_callback_worker>   callback_worker;
+    ggml_tensor                           callback_control = {};
 
     ggml_hexagon_session(const ggml_hexagon_device_config & config, ggml_backend_dev_t dev = nullptr, uint32_t mdev_idx = 0, uint32_t mdev_count = 0) noexcept(false);
     ~ggml_hexagon_session() noexcept(true);
@@ -372,6 +375,7 @@ struct ggml_hexagon_session {
 
     void enqueue_mdev_group();
     void enqueue_op(const htp_opnode & node, bool allow_fuse = true);
+    void enqueue_callback(const htp_opnode & node);
     void enqueue_cpy(const ggml_tensor * src, ggml_tensor * dst, const ggml_tensor * sync_tensor = nullptr, uint32_t fence_seq = 0);
     void enqueue_fence(const ggml_tensor * sync_tensor, uint32_t fence_seq = 0, bool wait = true);
     void enqueue_allreduce(const ggml_tensor * dst, const std::vector<const ggml_tensor *> & src_tensors,
@@ -1465,6 +1469,10 @@ struct ggml_hexagon_opbatch {
             const int64_t ne1_padded = hex_round_up(t->ne[1], 32);
             h.nb[1] = htp_tiled_row_size(t->type, ne0_padded);
             h.nb[2] = h.nb[1] * ne1_padded;
+            if (ggml_hexagon_tensor_is_expert_cache(t)) {
+                // Expert cache pools can use a larger slot stride.
+                h.nb[2] = (uint32_t) std::max((uint64_t) t->nb[2], (uint64_t) h.nb[2]);
+            }
             h.nb[3] = h.nb[2] * h.ne[2];
             h.size  = h.nb[3] * h.ne[3];
         } else {
@@ -2031,6 +2039,20 @@ void ggml_hexagon_session::enqueue_op(const htp_opnode & node, bool allow_fuse) 
     op_batch->add_op(node, opt_profile || (opt_opfusion && allow_fuse));
 }
 
+void ggml_hexagon_session::enqueue_callback(const htp_opnode & node) {
+    if (!callback_worker) {
+        uint8_t * control = alloc_fence(2);
+        callback_control = make_fence_tensor(control, 2);
+        callback_worker = std::make_unique<htp_callback_worker>(control);
+    }
+    htp_opnode callback = node;
+    // Host callback pointers stay on the host.
+    memset(callback.params, 0, sizeof(callback.params));
+    callback.params[0] = (int32_t) callback_worker->enqueue(node.node);
+    callback.inputs.insert(callback.inputs.begin(), &callback_control);
+    enqueue_op(callback, false);
+}
+
 void ggml_hexagon_session::enqueue_mdev_group() {
     htp_opnode group_node(HTP_OP_MDEV_GROUP);
 
@@ -2529,6 +2551,11 @@ void ggml_hexagon_session::release() noexcept(true) {
     }
     this->cpy_fence_slots.clear();
 
+    if (callback_worker) {
+        callback_worker.reset();
+        free_fence(callback_control.data, 2);
+    }
+
     if (this->fence_buf) {
         unclone_buffer(this->fence_buf);
         delete this->fence_buf;
@@ -2620,7 +2647,8 @@ static inline bool ggml_hexagon_op_is_compute(const struct ggml_tensor * node) {
 }
 
 static void ggml_hexagon_tensor_repack(ggml_tensor * tensor, ggml_hexagon_session * sess) {
-    if (tensor->data == nullptr || ggml_hexagon_tensor_is_tiled(tensor) || !ggml_hexagon_tensor_can_tile(tensor)) {
+    if (tensor->data == nullptr || tensor->buffer == nullptr || ggml_backend_buffer_get_size(tensor->buffer) == 0 ||
+            ggml_hexagon_tensor_is_tiled(tensor) || !ggml_hexagon_tensor_can_tile(tensor)) {
         return;
     }
     HEX_VERBOSE("ggml-hex: %s rt-repack %s|size %zu\n", sess->c_name(), htp_format_tensor(tensor, HTP_OPFMT_TENSOR).c_str(), ggml_nbytes(tensor));
@@ -2690,7 +2718,11 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
     }
 
     for (const auto & node : sess->cached_nodes) {
-        sess->enqueue_op(node, false);
+        if (node.opcode == HTP_OP_HOST_CALLBACK) {
+            sess->enqueue_callback(node);
+        } else {
+            sess->enqueue_op(node, false);
+        }
     }
 
     if (sess->last_error > HTP_STATUS_OK) {
@@ -2862,6 +2894,9 @@ static std::vector<int> ggml_hexagon_graph_optimize_reorder(const std::vector<no
         mrs.reset();
 
         for (int i1 = i0 + 1; i1 < i0 + N_FORWARD && i1 < n; i1++) {
+            if (htp_callback_is_marked(nodes[i1].node)) {
+                break;
+            }
             if (used[i1]) {
                 continue;
             }
@@ -3234,6 +3269,22 @@ static ggml_backend_buffer_type_t ggml_backend_hexagon_device_get_host_buffer_ty
     return &dev_ctx->host_buffer_type;
 }
 
+static size_t ggml_backend_hexagon_get_expert_cache_max_size() {
+    return opt_mbuf_static ? opt_mbuf_static : SIZE_MAX;
+}
+
+static ggml_backend_buffer_type_t ggml_backend_hexagon_device_get_repack_buffer_type(ggml_backend_dev_t dev) {
+    auto dev_ctx = static_cast<ggml_backend_hexagon_device_context *>(dev->context);
+    return &dev_ctx->buffer_type;
+}
+
+static ggml_backend_buffer_type_t ggml_backend_hexagon_get_repack_buffer_type(ggml_backend_dev_t dev) {
+    if (!dev || dev->iface.get_name != ggml_backend_hexagon_device_get_name) {
+        return nullptr;
+    }
+    return ggml_backend_hexagon_device_get_repack_buffer_type(dev);
+}
+
 // IMPORTANT: supports_op runs before buffer allocation and before tensor data is populated.
 // Never check buffer usage, buffer properties, or repacking state (is_tiled) here.
 // Support must depend only on static tensor properties (shape, type, strides).
@@ -3493,13 +3544,41 @@ static ggml_backend_buffer_type_t ggml_backend_hexagon_split_buffer_type(int mai
     return &dev_ctx->buffer_type;
 }
 
+static bool ggml_backend_hexagon_supports_expert_repack_type(enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_MXFP4:
+            return true;
+        default:
+            return false;
+    }
+}
+
 static void * ggml_backend_hexagon_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_split_buffer_type") == 0) {
         return (void *) ggml_backend_hexagon_split_buffer_type;
     }
+    if (strcmp(name, "ggml_backend_hexagon_get_repack_buffer_type") == 0) {
+        return (void *) ggml_backend_hexagon_get_repack_buffer_type;
+    }
+    if (strcmp(name, "ggml_backend_hexagon_get_expert_cache_max_size") == 0) {
+        return (void *) ggml_backend_hexagon_get_expert_cache_max_size;
+    }
+    if (strcmp(name, "ggml_backend_hexagon_supports_expert_repack_type") == 0) {
+        return (void *) ggml_backend_hexagon_supports_expert_repack_type;
+    }
+    if (strcmp(name, "ggml_backend_hexagon_repack_tensor_range") == 0) {
+        return (void *) ggml_backend_hexagon_repack_tensor_range;
+    }
     if (strcmp(name, "ggml_backend_hexagon_mark_tensor_expert_cache") == 0) {
         return (void *) ggml_backend_hexagon_mark_tensor_expert_cache;
+    }
+    if (strcmp(name, "ggml_backend_hexagon_mark_cache_callback") == 0) {
+        return (void *) htp_callback_mark;
     }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *) ggml_backend_hexagon_comm_init;
