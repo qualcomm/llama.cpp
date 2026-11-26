@@ -1727,20 +1727,36 @@ static void ggml_compute_forward_mul_mat_id(
     const int n_ids = ids->ne[0]; // n_expert_used
     const int n_as  = ne02;       // n_expert
 
+    const bool sparse_mode = ggml_mul_mat_id_get_sparse(dst);
+    const int64_t n_unique_max = MIN((int64_t)n_as, (int64_t)n_ids * ids->ne[1]);
+
+    // Sparse mode work buffer pointers (NULL in dense mode)
+    int64_t * n_unique_ptr  = NULL;  // unique slot count shared by all threads
+    int32_t * unique_slots  = NULL;  // maps compact index -> actual slot ID
+
     void * wdata_cur = params->wdata;
 
     if (src1->type != vec_dot_type) {
         incr_ptr_aligned(&wdata_cur, ggml_row_size(vec_dot_type, ggml_nelements(src1)), sizeof(int64_t));
     }
 
-    int64_t * matrix_row_counts = // [n_as]
-        incr_ptr_aligned(&wdata_cur, n_as*sizeof(int64_t), sizeof(int64_t));
+    const int64_t n_as_eff = sparse_mode ? n_unique_max : (int64_t)n_as;
 
-    struct mmid_row_mapping * matrix_rows = // [n_as][ids->ne[0]*ids->ne[1]]
-        incr_ptr_aligned(&wdata_cur, n_as*ids->ne[0]*ids->ne[1]*sizeof(struct mmid_row_mapping), sizeof(int64_t));
+    if (sparse_mode) {
+        n_unique_ptr = (int64_t *)
+            incr_ptr_aligned(&wdata_cur, sizeof(int64_t), sizeof(int64_t));
+        unique_slots = (int32_t *)
+            incr_ptr_aligned(&wdata_cur, n_unique_max * sizeof(int32_t), sizeof(int64_t));
+    }
 
-    char (*atomic_current_chunk)[CACHE_LINE_SIZE] = // [n_as]
-        incr_ptr_aligned(&wdata_cur, CACHE_LINE_SIZE * n_as, CACHE_LINE_SIZE);
+    int64_t * matrix_row_counts = // [n_as_eff]
+        incr_ptr_aligned(&wdata_cur, n_as_eff * sizeof(int64_t), sizeof(int64_t));
+
+    struct mmid_row_mapping * matrix_rows = // [n_as_eff][ids->ne[0]*ids->ne[1]]
+        incr_ptr_aligned(&wdata_cur, n_as_eff*ids->ne[0]*ids->ne[1]*sizeof(struct mmid_row_mapping), sizeof(int64_t));
+
+    char (*atomic_current_chunk)[CACHE_LINE_SIZE] = // [n_as_eff]
+        incr_ptr_aligned(&wdata_cur, CACHE_LINE_SIZE * n_as_eff, CACHE_LINE_SIZE);
 
     // Tiled matmul (see tiled.h); per-thread work buffers, 0 bytes when disabled. The
     // reservation is unconditional, the per expert eligibility is decided at dispatch time
@@ -1790,48 +1806,90 @@ static void ggml_compute_forward_mul_mat_id(
     }
 
     if (ith == 0) {
-        // initialize matrix_row_counts
-        memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
+        if (sparse_mode) {
+            // Compact slot IDs so workspace scales with selected experts.
+            int64_t n_unique = 0;
+            memset(matrix_row_counts, 0, n_unique_max * sizeof(int64_t));
 
-        // group rows by src0 matrix
-        for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
-            for (int id = 0; id < n_ids; ++id) {
-                const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
+            for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
+                for (int id = 0; id < n_ids; ++id) {
+                    const int32_t slot = *(const int32_t *)
+                        ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
 
-                assert(i02 == -1 || (i02 >= 0 && i02 < n_as));
+                    GGML_ASSERT(slot == -1 || (slot >= 0 && slot < n_as));
 
-                if (i02 == -1) {
-                    memset((char *) dst->data + id*nb1 + iid1*nb2, 0, ne0*sizeof(float));
-                    continue;
+                    if (slot == -1) {
+                        memset((char *) dst->data + id*nb1 + iid1*nb2, 0, ne0*sizeof(float));
+                        continue;
+                    }
+
+                    // Reuse the index when several tokens select the same slot.
+                    int64_t j = -1;
+                    for (int64_t k = 0; k < n_unique; ++k) {
+                        if (unique_slots[k] == slot) { j = k; break; }
+                    }
+                    if (j < 0) {
+                        GGML_ASSERT(n_unique < n_unique_max);
+                        j = n_unique;
+                        unique_slots[n_unique++] = slot;
+                    }
+
+                    MMID_MATRIX_ROW(j, matrix_row_counts[j]) = (struct mmid_row_mapping) {id, iid1};
+                    matrix_row_counts[j] += 1;
                 }
+            }
+            *n_unique_ptr = n_unique;
+        } else {
+            memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
 
-                MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
-                matrix_row_counts[i02] += 1;
+            for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
+                for (int id = 0; id < n_ids; ++id) {
+                    const int32_t i02 = *(const int32_t *)
+                        ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
+
+                    assert(i02 == -1 || (i02 >= 0 && i02 < n_as));
+
+                    if (i02 == -1) {
+                        memset((char *) dst->data + id*nb1 + iid1*nb2, 0, ne0*sizeof(float));
+                        continue;
+                    }
+
+                    MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
+                    matrix_row_counts[i02] += 1;
+                }
             }
         }
     }
 
+    if (sparse_mode) {
+        ggml_barrier(params->threadpool); // publish row mapping and unique slot count
+    }
+
+    const int64_t n_active = sparse_mode ? *n_unique_ptr : (int64_t)n_as;
+
     // reset current_chunk
-    for (int cur_a = ith; cur_a < n_as; cur_a += nth) {
+    for (int64_t cur_a = ith; cur_a < n_active; cur_a += nth) {
         atomic_int * current_chunk_ctr = (atomic_int *)(atomic_current_chunk + cur_a);
         *current_chunk_ctr = nth;
     }
 
-    ggml_barrier(params->threadpool);
+    ggml_barrier(params->threadpool); // chunk counters are ready
 
-    for (int cur_a = 0; cur_a < n_as; ++cur_a) {
+    for (int64_t cur_a = 0; cur_a < n_active; ++cur_a) {
         const int64_t cne1 = matrix_row_counts[cur_a];
 
         if (cne1 == 0) {
             continue;
         }
 
+        const int64_t actual_a = sparse_mode ? (int64_t)unique_slots[cur_a] : cur_a;
+
         // tiled takes over if profitable for this expert (see tiled.h)
-        if (ggml_compute_forward_mul_mat_id_tiled(params, dst, cur_a, cne1, (const int32_t *) &MMID_MATRIX_ROW(cur_a, 0), tiled_scratch)) {
+        if (ggml_compute_forward_mul_mat_id_tiled(params, dst, actual_a, cne1, (const int32_t *) &MMID_MATRIX_ROW(cur_a, 0), tiled_scratch)) {
             continue;
         }
 
-        const char * src0_cur = (const char *) src0->data + cur_a * nb02;
+        const char * src0_cur = (const char *) src0->data + actual_a * nb02;
         const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 
@@ -3052,17 +3110,27 @@ struct ggml_cplan ggml_graph_plan(
                         const struct ggml_tensor * src1 = node->src[1];
                         const struct ggml_tensor * ids = node->src[2];
                         const enum ggml_type vec_dot_type = type_traits_cpu[src0->type].vec_dot_type;
-                        const int n_as = src0->ne[2];
+
+                        const bool sparse_mode = ggml_mul_mat_id_get_sparse(node);
+                        const int64_t n_as_eff = sparse_mode
+                            ? MIN(src0->ne[2], ids->ne[0] * ids->ne[1])
+                            : src0->ne[2];
+
                         // src1
                         if (src1->type != vec_dot_type) {
                             cur += ggml_row_size(vec_dot_type, ggml_nelements(src1)) + sizeof(int64_t);
                         }
+                        // Sparse mode needs a unique slot table and a shared count.
+                        if (sparse_mode) {
+                            cur += sizeof(int64_t) + sizeof(int64_t);            // n_unique_shared (int64_t)
+                            cur += n_as_eff * sizeof(int32_t) + sizeof(int64_t); // unique_slots array
+                        }
                         // matrix_row_counts
-                        cur += n_as * sizeof(int64_t) + sizeof(int64_t);
+                        cur += n_as_eff * sizeof(int64_t) + sizeof(int64_t);
                         // matrix_rows
-                        cur += n_as*ids->ne[0]*ids->ne[1]*sizeof(struct mmid_row_mapping) + sizeof(int64_t);
+                        cur += n_as_eff*ids->ne[0]*ids->ne[1]*sizeof(struct mmid_row_mapping) + sizeof(int64_t);
                         // atomic_current_chunk
-                        cur += CACHE_LINE_SIZE*n_as + CACHE_LINE_SIZE;
+                        cur += CACHE_LINE_SIZE*n_as_eff + CACHE_LINE_SIZE;
                         // Workspace for tiled (see tiled.h)
                         cur = GGML_PAD(cur, 64);
                         cur += ggml_tiled_wdata_size(n_tasks, node);

@@ -1356,6 +1356,10 @@ extern "C" {
             struct ggml_tensor  * scale_weight,
             struct ggml_tensor  * scale_activations);
 
+    // Bound CPU workspace by the selected matrices, independently of precision.
+    GGML_API void ggml_mul_mat_id_set_sparse(struct ggml_tensor * a, bool sparse);
+    GGML_API bool ggml_mul_mat_id_get_sparse(const struct ggml_tensor * a);
+
     // A: m columns, n rows,
     // B: p columns, n rows,
     // result is m columns, p rows

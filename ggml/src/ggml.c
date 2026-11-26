@@ -3537,6 +3537,16 @@ struct ggml_tensor * ggml_mul_mat_id_ext(
     return result;
 }
 
+void ggml_mul_mat_id_set_sparse(struct ggml_tensor * a, bool sparse) {
+    GGML_ASSERT(a->op == GGML_OP_MUL_MAT_ID);
+    ggml_set_op_params_i32(a, 1, sparse);
+}
+
+bool ggml_mul_mat_id_get_sparse(const struct ggml_tensor * a) {
+    GGML_ASSERT(a->op == GGML_OP_MUL_MAT_ID);
+    return ggml_get_op_params_i32(a, 1) != 0;
+}
+
 // ggml_out_prod
 
 static inline bool ggml_can_out_prod(const struct ggml_tensor * t0, const struct ggml_tensor * t1) {

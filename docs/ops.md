@@ -2,6 +2,8 @@
 
 List of GGML operations and backend support status.
 
+HTP also accepts single-task `MAP_CUSTOM1` and `MAP_CUSTOM2` nodes marked by the expert cache when its asynchronous worker is enabled. These callbacks run on the CPU through shared fences, and general custom callbacks remain unsupported on HTP.
+
 ## How to add a backend to this table:
 
 1. Run `test-backend-ops support --output csv` with your backend name and redirect output to a csv file in `docs/ops/` (e.g., `docs/ops/CUDA.csv`)
