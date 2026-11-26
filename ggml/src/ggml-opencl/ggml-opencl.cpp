@@ -2206,8 +2206,8 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_fa_coopmat_dk128_sb_rows = nullptr;
     cl_kernel kernel_fa_coopmat_reduce = nullptr;
     bool fa_coopmat_possible = false;
-    bool coopmat_possible = false;
-    bool adreno_850 = false;            // decode GEMV defaults measured on the Adreno 850      // the coopmat GEMMs will be built (decided before they are, for supports_op)
+    bool coopmat_possible = false;      // the coopmat GEMMs will be built (decided before they are, for supports_op)
+    bool adreno_850 = false;            // decode GEMV defaults measured on the Adreno 850
     ggml_cl_buffer prealloc_fa_cm_part_o;
     ggml_cl_buffer prealloc_fa_cm_part_ml;
     cl_kernel kernel_gemm_noshuffle_q5_k_f32_coopmat = nullptr;
@@ -20056,8 +20056,12 @@ inline bool q4k_gemv_tiled_enabled(const ggml_backend_opencl_context *backend_ct
     if (e && e[0] != '\0') {
         return e[0] != '0';
     }
+    // Adreno 850 (driver 0891.17.1): the plain layout streams a 262144 x 2560 head at
+    // ~64 GB/s against ~86 GB/s up to M = 20480 (the K-step stride grows with M); tiled
+    // runs it at ~86 GB/s. gemma-4-E4B decode +0.3..1.5%, pp512 and PPL unchanged.
     return backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E ||
-           backend_ctx->adreno_gen == ADRENO_GPU_GEN::X1E || tiled_gemv_default_on(backend_ctx);
+           backend_ctx->adreno_gen == ADRENO_GPU_GEN::X1E || backend_ctx->adreno_850 ||
+           tiled_gemv_default_on(backend_ctx);
 }
 inline bool use_q4k_tiled(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor) {
     return q4k_gemv_tiled_enabled(backend_ctx) && tensor->type == GGML_TYPE_Q4_K &&
