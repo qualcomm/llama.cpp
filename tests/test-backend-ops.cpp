@@ -6846,9 +6846,10 @@ struct test_mul_mat_id : public test_case {
     const bool skip; // set some ids to a negative value
     const int scale_gran; // weight scale granularity: 0=default, 1=per-expert scalar, 2=per-channel-per-expert
     const bool scale_view;
+    const bool sparse;
 
     std::string vars() override {
-        return VARS_TO_STR13(type_a, type_b, n_mats, n_used, b, m, n, k, m_v, ids_offset, skip, scale_gran, scale_view);
+        return VARS_TO_STR14(type_a, type_b, n_mats, n_used, b, m, n, k, m_v, ids_offset, skip, scale_gran, scale_view, sparse);
     }
 
     double max_nmse_err() override {
@@ -6876,9 +6877,9 @@ struct test_mul_mat_id : public test_case {
     test_mul_mat_id(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
             int n_mats = 8, int n_used = 2, bool b = false,
             int64_t m = 32, int64_t n = 32, int64_t k = 32,
-            int64_t m_v = 0, bool ids_offset = false, bool skip = false, int scale_gran = 0, bool scale_view = false)
+            int64_t m_v = 0, bool ids_offset = false, bool skip = false, int scale_gran = 0, bool scale_view = false, bool sparse = false)
         : type_a(type_a), type_b(type_b), n_mats(n_mats), n_used(n_used), b(b),
-            m(m), n(n), k(k), m_v(m_v), ids_offset(ids_offset), skip(skip), scale_gran(scale_gran), scale_view(scale_view) {
+            m(m), n(n), k(k), m_v(m_v), ids_offset(ids_offset), skip(skip), scale_gran(scale_gran), scale_view(scale_view), sparse(sparse) {
             GGML_ASSERT(n_used <= n_mats);
             GGML_ASSERT(m_v == 0 || m_v > m);
         }
@@ -6924,6 +6925,7 @@ struct test_mul_mat_id : public test_case {
         }
 
         ggml_tensor * out = ggml_mul_mat_id_ext(ctx, as, b, ids, s, nullptr);
+        ggml_mul_mat_id_set_sparse(out, sparse);
         ggml_set_name(out, "out");
 
         return out;
@@ -14064,6 +14066,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 4, false, 16, 10, 256));
     }
 
+    for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1}) {
+        for (int n : {1, 64}) {
+            for (bool broadcast : {false, true}) {
+                for (bool skip : {false, true}) {
+                    test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 8, 2, broadcast, 32, n, 256, 0, false, skip, 0, false, true));
+                }
+            }
+        }
+    }
+
     for (ggml_type type_a : base_types) {
         for (ggml_type type_b : {GGML_TYPE_F32 /*, GGML_TYPE_F16 */}) {
             for (int n_mats : {4, 8}) {
@@ -16457,6 +16469,7 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
 
         output_printer->print_summary(test_summary_info(n_ok, tests_run, false));
         output_printer->print_failed_tests(failed_tests);
+
 
         bool ran_any = true;
         if (tests_run == 0 && must_run) {
