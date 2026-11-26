@@ -1,4 +1,5 @@
 #include "htp-repack.h"
+#include "htp-common.h"
 
 #define GGML_COMMON_IMPL_CPP
 #include "ggml-common.h"
@@ -239,9 +240,10 @@ static void repack_neon_f16_tile(uint16_t * tile_dst, const SrcT * src_slice, in
 // --- Generic 32x32 tile grid walkers for block-32 and float types ---
 
 template <typename Fn>
-static void repack_parallel_for_ct(size_t slice_bytes, int n_col_tiles, Fn && fn) {
+static void repack_parallel_for_ct(const ggml_tensor * t, size_t slice_bytes, int n_col_tiles, Fn && fn) {
     int n_threads = 1;
-    if (slice_bytes > 128 * 1024) {
+    // Keep cache repacks on the caller thread to avoid competing with decode.
+    if (!ggml_hexagon_tensor_is_expert_cache(t) && slice_bytes > 128 * 1024) {
         for (int nt : { 4, 3, 2 }) {
             if (n_col_tiles % nt == 0) {
                 n_threads = nt;
@@ -293,7 +295,7 @@ static void repack_to_tiled_grid_32(ggml_tensor * t, const void * data, size_t o
         const SrcElemT * src_slice = src_matrix + (slice_idx - start_slice) * (ne1 * row_stride);
         uint8_t * matrix_dst = (uint8_t *) t->data + slice_idx * matrix_size;
 
-        repack_parallel_for_ct(matrix_size, n_col_tiles, [&](int ct0, int ct1) {
+        repack_parallel_for_ct(t, matrix_size, n_col_tiles, [&](int ct0, int ct1) {
             for (int ct = ct0; ct < ct1; ct++) {
                 for (int kt = 0; kt < n_k_tiles; kt++) {
                     uint8_t * tile_dst = matrix_dst + ((size_t) ct * n_k_tiles + kt) * tile_size;
@@ -639,7 +641,7 @@ static void repack_q2_0_tiled(ggml_tensor * t, const void * data, size_t offset,
         uint8_t * dst_slice = (uint8_t *) t->data + slice * matrix_size;
         const size_t ct_bytes = (size_t) n_weight_tiles * HTP_TENSOR_TILE_SIZE_Q2_0;
 
-        repack_parallel_for_ct(matrix_size, (int) n_col_tiles, [&](int ct0, int ct1) {
+        repack_parallel_for_ct(t, matrix_size, (int) n_col_tiles, [&](int ct0, int ct1) {
             memset(dst_slice + (size_t) ct0 * ct_bytes, 0, (size_t) (ct1 - ct0) * ct_bytes);
             const int64_t r0 = (int64_t) ct0 * 32;
             const int64_t r1 = (std::min)((int64_t) ct1 * 32, t->ne[1]);
@@ -775,7 +777,7 @@ static void repack_kquant_to_tiled_grid(ggml_tensor * t, const void * data, size
         uint8_t * matrix_dst     = (uint8_t *) t->data + slice_idx * matrix_size;
         const size_t ct_bytes    = (size_t) n_k_tiles * tile_size;
 
-        repack_parallel_for_ct(matrix_size, n_col_tiles, [&](int ct0, int ct1) {
+        repack_parallel_for_ct(t, matrix_size, n_col_tiles, [&](int ct0, int ct1) {
             // Padding rows and OR-ed bit planes require zeroed tiles
             memset(matrix_dst + (size_t) ct0 * ct_bytes, 0, (size_t) (ct1 - ct0) * ct_bytes);
 
@@ -1376,7 +1378,7 @@ static void repack_q1_0_tiled(ggml_tensor * t, const void * data, size_t offset,
         const block_q1_0 * src_slice = src_matrix + (slice_idx - start_slice) * ne1 * n_k_tiles;
         uint8_t * matrix_dst = (uint8_t *) t->data + slice_idx * matrix_size;
 
-        repack_parallel_for_ct(matrix_size, n_col_tiles, [&](int ct0, int ct1) {
+        repack_parallel_for_ct(t, matrix_size, n_col_tiles, [&](int ct0, int ct1) {
             for (int ct = ct0; ct < ct1; ct++) {
                 for (int kt = 0; kt < n_k_tiles; kt++) {
                     uint8_t * tile_dst = matrix_dst + ((size_t) ct * n_k_tiles + kt) * tile_size;
@@ -1540,7 +1542,7 @@ static void repack_nvfp4_tiled(ggml_tensor * t, const void * data, size_t offset
         const block_nvfp4 * src_slice = src + slice * t->ne[1] * blocks_per_row;
         uint8_t * dst_slice = (uint8_t *) t->data + slice * matrix_size;
 
-        repack_parallel_for_ct(matrix_size, (int) n_col_tiles, [&](int ct0, int ct1) {
+        repack_parallel_for_ct(t, matrix_size, (int) n_col_tiles, [&](int ct0, int ct1) {
             // Padding rows require zeroed tiles
             memset(dst_slice + (size_t) ct0 * ct_bytes, 0, (size_t) (ct1 - ct0) * ct_bytes);
 
