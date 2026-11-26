@@ -12,6 +12,9 @@
 #define REQD_SUBGROUP_SIZE_128 __attribute__((qcom_reqd_sub_group_size("full")))
 #endif
 
+#ifndef REPLAY
+#define REPLAY 0
+#endif
 #ifndef S_V
 #define S_V 128
 #endif
@@ -127,6 +130,17 @@ kernel void kernel_gated_delta_net(
         uint  H_k,
         uint  rq3,
         float scale,
+#if REPLAY
+        // Replay (ggml_gated_delta_net_ext): the pending tokens of the previous ubatch run
+        // first, without attention output, so that a rollback only drops pending tokens.
+        // With keep, the state after the replay is the state output and the final state
+        // is not written.
+        uint n_pend, uint keep,
+        global const char * pk_buf,  ulong off_pk,  ulong spk1, ulong spk2, ulong spk3,
+        global const char * pv_buf,  ulong off_pv,  ulong spv1, ulong spv2, ulong spv3,
+        global const char * pgb_buf, ulong off_pgb, ulong spg1, ulong spg2, ulong spg3,
+        global const char * rep_buf, ulong off_rep,
+#endif
         uint K,
         // Where the state snapshots go. Standalone this is the tail of dst
         // (off_dst + s_off floats, slot stride S_V*S_V*H_v*n_seqs); when the
@@ -204,6 +218,79 @@ kernel void kernel_gated_delta_net(
             s_shard[cg][r] = data_state[state_in_base + col * S_V + GDN_ROW(r)];
         }
     }
+
+#if REPLAY
+    // The host only takes the chunked prefill path without replay, so t0 == 0 here.
+    global const float * data_pk  = (global const float *)(pk_buf + off_pk);
+    global const float * data_pv  = (global const float *)(pv_buf + off_pv);
+    global const float * data_pgb = (global const float *)(pgb_buf + off_pgb);
+    global const int * data_n_rep = (global const int *)(rep_buf + off_rep);
+    const uint n_r = (uint)clamp(data_n_rep[seq_id], 0, (int)n_pend);
+
+    for (uint t = 0; t < n_r; t++) {
+        const ulong k_off = seq_id * spk3 + t * spk2 + iq1 * spk1;
+        const ulong v_off = seq_id * spv3 + t * spv2 + head_id * spv1;
+        const ulong g_off = seq_id * spg3 + t * spg2 + head_id * spg1;
+        const float beta_val = data_pgb[g_off + n_pend * spg2];
+
+        float k_reg[ROWS_PER_LANE];
+        #pragma unroll
+        for (uint r = 0; r < ROWS_PER_LANE; r++) {
+            k_reg[r] = data_pk[k_off + GDN_ROW(r)];
+        }
+
+#if KDA
+        float g_exp[ROWS_PER_LANE];
+        #pragma unroll
+        for (uint r = 0; r < ROWS_PER_LANE; r++) {
+            g_exp[r] = exp(data_pgb[g_off + GDN_ROW(r)]);
+        }
+#else
+        const float g_val = exp(data_pgb[g_off]);
+#endif
+
+        // Same state update as the main loop, without the attention output.
+        #pragma unroll
+        for (uint cg = 0; cg < COLS_PER_LANE_GROUP; cg++) {
+            const uint col = sg_col_base + cg * LANE_GROUPS_PER_SG + lane_group;
+            float kv_shard = 0.0f;
+            #pragma unroll
+            for (uint r = 0; r < ROWS_PER_LANE; r++) {
+#if KDA
+                kv_shard += g_exp[r] * s_shard[cg][r] * k_reg[r];
+#else
+                kv_shard += s_shard[cg][r] * k_reg[r];
+#endif
+            }
+#if !KDA
+            kv_shard *= g_val;
+#endif
+            const float kv_col = REDUCE_PARTIAL(kv_shard, temp_ptr, sg_lid);
+            const float delta_col = (data_pv[v_off + col] - kv_col) * beta_val;
+            #pragma unroll
+            for (uint r = 0; r < ROWS_PER_LANE; r++) {
+#if KDA
+                const float gs = g_exp[r] * s_shard[cg][r];
+#else
+                const float gs = g_val * s_shard[cg][r];
+#endif
+                s_shard[cg][r] = gs + k_reg[r] * delta_col;
+            }
+        }
+    }
+
+    if (keep) {
+        // the state after the replay is the state output (K == 1 with replay)
+        #pragma unroll
+        for (uint cg = 0; cg < COLS_PER_LANE_GROUP; cg++) {
+            const uint col = sg_col_base + cg * LANE_GROUPS_PER_SG + lane_group;
+            #pragma unroll
+            for (uint r = 0; r < ROWS_PER_LANE; r++) {
+                data_snap[state_base + col * S_V + GDN_ROW(r)] = s_shard[cg][r];
+            }
+        }
+    }
+#endif
 
     uint attn_off = (seq_id * n_tokens * H_v + head_id) * S_V + t0 * S_V * H_v;
 
@@ -302,6 +389,12 @@ kernel void kernel_gated_delta_net(
             }
         }
     }
+
+#if REPLAY
+    if (keep) {
+        return;
+    }
+#endif
 
     if (K == 1u) {
         #pragma unroll

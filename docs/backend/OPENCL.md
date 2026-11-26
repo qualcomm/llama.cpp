@@ -86,12 +86,14 @@ The library currently contains kernels for MUL_MAT_ID with Q4_0, Q4_1, Q4_K, MXF
 The library is published at https://softwarecenter.qualcomm.com/catalog/item/Adreno_Kernel_Library_GGML.
 Its use is subject to the license in the `license.txt` file shipped with it.
 
-To allow using the kernel library, add `-DGGML_OPENCL_USE_ADRENO_BIN_KERNELS=ON` when configuring with CMake.
-On Windows, also add `-DGGML_OPENCL_ADRENO_BIN_KERNELS_FETCH=ON` to have CMake download the library version pinned in `ggml/src/ggml-opencl/CMakeLists.txt` during configuration.
-The download is verified against a SHA256 hash, and the build copies `adreno-opencl-kernels.dll` and `LICENSE-adreno-opencl-kernels` alongside the executables.
-Without the fetch option, extract `adreno-opencl-kernels.dll` from the zip file downloaded from the above URL and put it alongside the executables yourself.
+The library is enabled by default (`GGML_OPENCL_USE_ADRENO_BIN_KERNELS=ON`).
+On Windows on ARM64, CMake downloads the library version pinned in `ggml/src/ggml-opencl/CMakeLists.txt` during configuration (`GGML_OPENCL_ADRENO_BIN_KERNELS_FETCH=ON`).
+The download is verified against a SHA256 hash, and the build copies `adreno-opencl-kernels.dll` and `LICENSE-adreno-opencl-kernels.txt` alongside the executables.
+If the download fails, configuration continues with a warning.
+To skip the download, add `-DGGML_OPENCL_ADRENO_BIN_KERNELS_FETCH=OFF`, then extract `adreno-opencl-kernels.dll` from the zip file downloaded from the above URL and put it alongside the executables yourself.
 If kernels compatible with the current GPU are found in the library, they will be loaded and used.
 If the library is missing, the builtin kernels are used.
+Add `-DGGML_OPENCL_USE_ADRENO_BIN_KERNELS=OFF` to disable the library entirely.
 
 
 ## CMake Options
@@ -102,8 +104,8 @@ The OpenCL backend has the following CMake options that control the behavior of 
 |:--------------------------------------:|:--------------:|:--------------------------------------------------------|
 | `GGML_OPENCL_EMBED_KERNELS`            | `ON`           | Embed OpenCL kernels into the executable.               |
 | `GGML_OPENCL_USE_ADRENO_KERNELS`       | `ON`           | Use kernels optimized for Adreno.                       |
-| `GGML_OPENCL_USE_ADRENO_BIN_KERNELS`   | `OFF`          | Allow using binary kernel lib for Adreno.               |
-| `GGML_OPENCL_ADRENO_BIN_KERNELS_FETCH` | `OFF`          | Download the binary kernel lib for Adreno (Windows).    |
+| `GGML_OPENCL_USE_ADRENO_BIN_KERNELS`   | `ON`           | Allow using binary kernel lib for Adreno.               |
+| `GGML_OPENCL_ADRENO_BIN_KERNELS_FETCH` | `ON`           | Download the binary kernel lib for Adreno (Windows ARM64). |
 
 ## Decomposed Flash Attention
 
@@ -316,6 +318,7 @@ ninja
 
 ## Known Issues
 
+- Adreno E17 compiler workarounds are disabled by default. If you encounter Flash Attention compilation failures or incorrect MoE results, set `GGML_OPENCL_ADRENO_E17_QUIRKS=1` before starting llama.cpp.
 - Flash attention does not always improve performance.
 - Currently OpenCL backend works on A6xx GPUs with recent drivers and compilers (usually found in IoT platforms).
   However, it does not work on A6xx GPUs found in phones with old drivers and compilers.

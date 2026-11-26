@@ -1710,6 +1710,8 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_sgn_f32, kernel_sgn_f32_4, kernel_sgn_f32_nc, kernel_sgn_f16, kernel_sgn_f16_4, kernel_sgn_f16_nc;
     cl_kernel kernel_step_f32, kernel_step_f32_4, kernel_step_f32_nc, kernel_step_f16, kernel_step_f16_4, kernel_step_f16_nc;
     cl_kernel kernel_elu_f32, kernel_elu_f32_4, kernel_elu_f32_nc, kernel_elu_f16, kernel_elu_f16_4, kernel_elu_f16_nc;
+    cl_kernel kernel_xielu_f32 = nullptr;
+    cl_kernel kernel_xielu_f16 = nullptr;
     cl_kernel kernel_hardswish_f32, kernel_hardswish_f32_4, kernel_hardswish_f32_nc, kernel_hardswish_f16, kernel_hardswish_f16_4, kernel_hardswish_f16_nc;
     cl_kernel kernel_hardsigmoid_f32, kernel_hardsigmoid_f32_4, kernel_hardsigmoid_f32_nc, kernel_hardsigmoid_f16, kernel_hardsigmoid_f16_4, kernel_hardsigmoid_f16_nc;
     cl_kernel kernel_floor_f32, kernel_floor_f32_4, kernel_floor_f32_nc, kernel_floor_f16, kernel_floor_f16_4, kernel_floor_f16_nc;
@@ -1732,7 +1734,8 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_conv2d_dw_f32_f32, kernel_conv2d_dwf16_f32;
     // [size_idx][kda][tgpp] where size_idx: 0=S_V=16, 1=32, 2=64, 3=128; kda: 0 or 1.
     // tgpp 0 = TG variant (COLS_PER_LANE_GROUP=1), tgpp 1 = prefill variant (COLS_PER_LANE_GROUP=4).
-    cl_kernel kernel_gated_delta_net_f32[4][2][2] = {};
+    // [size_idx][kda][tgpp][replay]; replay 1 = the -DREPLAY=1 build for ggml_gated_delta_net_ext
+    cl_kernel kernel_gated_delta_net_f32[4][2][2][2] = {};
     // Chunkwise (WY) gated_delta_net prefill, S_V=128 scalar gate only; see
     // kernels/gated_delta_net_chunk.cl. Default on for X2-class Adreno (GGML_OPENCL_GDN_CHUNK=0
     // opts out), GGML_OPENCL_GDN_CHUNK=1 opts in elsewhere;
@@ -9231,6 +9234,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         CL_UNARY_EXT_K(round)
         CL_UNARY_EXT_K(trunc)
 #undef CL_UNARY_EXT_K
+        CL_CHECK((backend_ctx->kernel_xielu_f32 = clCreateKernel(prog, "kernel_xielu_f32", &err), err));
+        CL_CHECK((backend_ctx->kernel_xielu_f16 = clCreateKernel(prog, "kernel_xielu_f16", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
@@ -9620,11 +9625,15 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                     // Please remember to implement code to handle it.
                     opts += " -DSUBGROUPS_PER_WG=" + std::to_string(spw);
 
-                    cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), opts);
+                    // replay 1: the pending tokens of the previous ubatch run first (ggml_gated_delta_net_ext)
+                    for (int replay = 0; replay < 2; replay++) {
+                        const std::string opts_rep = opts + " -DREPLAY=" + std::to_string(replay);
+                        cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), opts_rep);
 
-                    CL_CHECK((backend_ctx->kernel_gated_delta_net_f32[si][kda][tgpp] =
-                                clCreateKernel(prog, "kernel_gated_delta_net", &err), err));
-                    CL_CHECK(clReleaseProgram(prog));
+                        CL_CHECK((backend_ctx->kernel_gated_delta_net_f32[si][kda][tgpp][replay] =
+                                    clCreateKernel(prog, "kernel_gated_delta_net", &err), err));
+                        CL_CHECK(clReleaseProgram(prog));
+                    }
                 }
             }
         }
@@ -20813,6 +20822,14 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                 case GGML_UNARY_OP_SILU:
                     return op->src[0]->type == op->type &&
                            (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16);
+                case GGML_UNARY_OP_XIELU:
+                    for (int64_t ne : op->src[0]->ne) {
+                        if (ne > INT_MAX) {
+                            return false;
+                        }
+                    }
+                    return op->src[0]->type == op->type &&
+                           (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16);
                 case GGML_UNARY_OP_GELU:
                 case GGML_UNARY_OP_RELU:
                 case GGML_UNARY_OP_GELU_ERF:
@@ -21457,6 +21474,10 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
         case GGML_OP_MEAN:
             return op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_FLASH_ATTN_EXT: {
+            // indexed bias (ggml_flash_attn_ext_add_indexed_bias) is not supported
+            if (ggml_flash_attn_ext_has_indexed_bias(op)) {
+                return false;
+            }
             // K/V row lists only on the coopmat kernel, opt-in: GGML_OPENCL_FA_KV_ROWS=1. With one
             // sequence they cost 10-14% in llama-server on the 850 (the row-list build is slower even
             // on contiguous rows), so by default llama falls back to attention over the whole cache.
@@ -27239,6 +27260,7 @@ static void ggml_backend_opencl_device_get_props(ggml_backend_dev_t dev, struct 
         /* .buffer_from_host_ptr  = */ false,
         /* .events                = */ false,
         /* .mmap_support          = */ false,
+        /* .fast_async_host_input = */ false,
     };
 }
 
@@ -32387,6 +32409,51 @@ GGML_CL_UNARY_EXT_WRAP(ggml_cl_round,       round)
 GGML_CL_UNARY_EXT_WRAP(ggml_cl_trunc,       trunc)
 
 #undef GGML_CL_UNARY_EXT_WRAP
+
+static void ggml_cl_xielu(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    UNUSED(src1);
+
+    auto * backend_ctx = (ggml_backend_opencl_context *) backend->context;
+    cl_kernel kernel = src0->type == GGML_TYPE_F16 ? backend_ctx->kernel_xielu_f16 : backend_ctx->kernel_xielu_f32;
+
+    const auto * extra0 = (const ggml_tensor_extra_cl *) src0->extra;
+    const auto * extrad = (const ggml_tensor_extra_cl *) dst->extra;
+
+    const cl_ulong offset0 = extra0->offset + src0->view_offs;
+    const cl_ulong offsetd = extrad->offset + dst->view_offs;
+
+    GGML_TENSOR_LOCALS(int,      ne0, src0, ne);
+    GGML_TENSOR_LOCALS(cl_ulong, nb0, src0, nb);
+    GGML_TENSOR_LOCALS(cl_ulong, nb,  dst,  nb);
+
+    const float alpha_n = ggml_get_op_params_f32(dst, 1);
+    const float alpha_p = ggml_get_op_params_f32(dst, 2);
+    const float beta    = ggml_get_op_params_f32(dst, 3);
+    const float eps     = ggml_get_op_params_f32(dst, 4);
+
+    CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0->data_device));
+    CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_ulong), &offset0));
+    CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),   &extrad->data_device));
+    CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_ulong), &offsetd));
+    CL_CHECK(clSetKernelArg(kernel,  4, sizeof(int),      &ne00));
+    CL_CHECK(clSetKernelArg(kernel,  5, sizeof(cl_ulong), &nb00));
+    CL_CHECK(clSetKernelArg(kernel,  6, sizeof(cl_ulong), &nb01));
+    CL_CHECK(clSetKernelArg(kernel,  7, sizeof(cl_ulong), &nb02));
+    CL_CHECK(clSetKernelArg(kernel,  8, sizeof(cl_ulong), &nb03));
+    CL_CHECK(clSetKernelArg(kernel,  9, sizeof(cl_ulong), &nb0));
+    CL_CHECK(clSetKernelArg(kernel, 10, sizeof(cl_ulong), &nb1));
+    CL_CHECK(clSetKernelArg(kernel, 11, sizeof(cl_ulong), &nb2));
+    CL_CHECK(clSetKernelArg(kernel, 12, sizeof(cl_ulong), &nb3));
+    CL_CHECK(clSetKernelArg(kernel, 13, sizeof(float),    &alpha_n));
+    CL_CHECK(clSetKernelArg(kernel, 14, sizeof(float),    &alpha_p));
+    CL_CHECK(clSetKernelArg(kernel, 15, sizeof(float),    &beta));
+    CL_CHECK(clSetKernelArg(kernel, 16, sizeof(float),    &eps));
+
+    const size_t nth = 64;
+    size_t global[] = {(size_t) ne01*nth, (size_t) ne02, (size_t) ne03};
+    size_t local[]  = {nth, 1, 1};
+    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global, local, dst);
+}
 
 static void ggml_cl_softplus(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_ASSERT(src0);
@@ -59402,6 +59469,11 @@ static void ggml_cl_gated_delta_net_recurrent(ggml_backend_t backend, ggml_tenso
     const cl_uint n_tokens = (cl_uint) src_v->ne[2];
     const cl_uint n_seqs   = (cl_uint) src_v->ne[3];
     const cl_uint K        = (cl_uint) ggml_get_op_params_i32(dst, 0);
+    // replay (ggml_gated_delta_net_ext): pending tokens in src[6..9], n_pend and keep in op params 1 and 2
+    const bool    replay   = dst->src[6] != nullptr;
+    const cl_uint n_pend   = replay ? (cl_uint) ggml_get_op_params_i32(dst, 1) : 0;
+    const cl_uint keep     = replay ? (cl_uint) ggml_get_op_params_i32(dst, 2) : 0;
+    GGML_ASSERT(!replay || t0 == 0); // the chunked prefill is not taken with replay
 
     int si;
     switch (S_v) {
@@ -59432,7 +59504,7 @@ static void ggml_cl_gated_delta_net_recurrent(ggml_backend_t backend, ggml_tenso
     // spw needs adjustment when S_v != 128
     const int spw  = (tgpp == 0) ? 1 : 1;
 
-    cl_kernel kernel = backend_ctx->kernel_gated_delta_net_f32[si][kda][tgpp];
+    cl_kernel kernel = backend_ctx->kernel_gated_delta_net_f32[si][kda][tgpp][replay ? 1 : 0];
     GGML_ASSERT(kernel != nullptr);
 
     const cl_uint s_off = S_v * H_v * n_tokens * n_seqs;
@@ -59542,6 +59614,57 @@ static void ggml_cl_gated_delta_net_recurrent(ggml_backend_t backend, ggml_tenso
     CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &H_k));
     CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &rq3));
     CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(float),    &scale));
+    if (replay) {
+        const ggml_tensor * src_pk  = dst->src[6];
+        const ggml_tensor * src_pv  = dst->src[7];
+        const ggml_tensor * src_pgb = dst->src[8];
+        const ggml_tensor * src_rep = dst->src[9];
+
+        GGML_ASSERT(src_pk  && src_pk->extra);
+        GGML_ASSERT(src_pv  && src_pv->extra);
+        GGML_ASSERT(src_pgb && src_pgb->extra);
+        GGML_ASSERT(src_rep && src_rep->extra);
+
+        const ggml_tensor_extra_cl * extra_pk  = (const ggml_tensor_extra_cl *) src_pk->extra;
+        const ggml_tensor_extra_cl * extra_pv  = (const ggml_tensor_extra_cl *) src_pv->extra;
+        const ggml_tensor_extra_cl * extra_pgb = (const ggml_tensor_extra_cl *) src_pgb->extra;
+        const ggml_tensor_extra_cl * extra_rep = (const ggml_tensor_extra_cl *) src_rep->extra;
+
+        const cl_ulong off_pk  = extra_pk->offset  + src_pk->view_offs;
+        const cl_ulong off_pv  = extra_pv->offset  + src_pv->view_offs;
+        const cl_ulong off_pgb = extra_pgb->offset + src_pgb->view_offs;
+        const cl_ulong off_rep = extra_rep->offset + src_rep->view_offs;
+
+        const cl_ulong spk1 = src_pk->nb[1]  / sizeof(float);
+        const cl_ulong spk2 = src_pk->nb[2]  / sizeof(float);
+        const cl_ulong spk3 = src_pk->nb[3]  / sizeof(float);
+        const cl_ulong spv1 = src_pv->nb[1]  / sizeof(float);
+        const cl_ulong spv2 = src_pv->nb[2]  / sizeof(float);
+        const cl_ulong spv3 = src_pv->nb[3]  / sizeof(float);
+        const cl_ulong spg1 = src_pgb->nb[1] / sizeof(float);
+        const cl_ulong spg2 = src_pgb->nb[2] / sizeof(float);
+        const cl_ulong spg3 = src_pgb->nb[3] / sizeof(float);
+
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &n_pend));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &keep));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem),   &extra_pk->data_device));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off_pk));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &spk1));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &spk2));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &spk3));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem),   &extra_pv->data_device));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off_pv));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &spv1));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &spv2));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &spv3));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem),   &extra_pgb->data_device));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off_pgb));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &spg1));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &spg2));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &spg3));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem),   &extra_rep->data_device));
+        CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off_rep));
+    }
     CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),    &K));
     CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem),   &snap_mem));
     CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off_snap));
@@ -59615,7 +59738,10 @@ static void ggml_cl_gated_delta_net_impl(ggml_backend_t backend, ggml_tensor * d
     // tokens 1.45 -> 1.73 ms, 256 tokens 5.84 -> 5.15 ms).
     const int64_t CH = 64;
     int64_t n_full = 0;
-    if (backend_ctx->gdn_chunk && backend_ctx->kernel_gdn_chunk_scan != nullptr && S_v == 128 && !kda) {
+    // Not with replay: the pending tokens have to run before the first chunk, and only the recurrent
+    // kernel replays them.
+    if (backend_ctx->gdn_chunk && backend_ctx->kernel_gdn_chunk_scan != nullptr && S_v == 128 && !kda &&
+        dst->src[6] == nullptr) {
         const int64_t reserve = K > 1 ? K : 0;
         if (n_tokens - reserve >= 2 * CH) {
             n_full = ((n_tokens - reserve) / CH) * CH;
@@ -60218,6 +60344,10 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
                 case GGML_UNARY_OP_ELU:
                     if (!any_on_device) { return false; }
                     func = ggml_cl_elu;
+                    break;
+                case GGML_UNARY_OP_XIELU:
+                    if (!any_on_device) { return false; }
+                    func = ggml_cl_xielu;
                     break;
                 case GGML_UNARY_OP_HARDSWISH:
                     if (!any_on_device) { return false; }
