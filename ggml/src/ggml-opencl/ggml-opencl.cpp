@@ -1454,6 +1454,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mat_f16_f16;
     cl_kernel kernel_mul_mat_f16_f32_1row;
     cl_kernel kernel_mul_mat_f16_f32_mrow = nullptr;
+    cl_kernel kernel_mul_mv_f16_f32_pl[2][3] = {};   // small-matrix f16 GEMV: [LPR 64, 32][RB 1/2/4, 2/4/8]
     cl_kernel kernel_mul_mat_f16_f32_mrow_r2 = nullptr;
     cl_kernel kernel_mul_mat_f16_f32_mrow_r4 = nullptr;
     cl_kernel kernel_mul_mat_f16_f32_mrow_h8 = nullptr;
@@ -7658,6 +7659,28 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                 *k = nullptr;
             }
         }
+        GGML_LOG_CONT(".");
+    }
+
+    // mul_mv_f16_f32_pl (small-matrix f16 decode GEMV, gemma-4 per-layer shapes)
+    if (backend_ctx->adreno_850 && !ggml_cl_env_flag_zero("GGML_OPENCL_F16_PL")) {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src {
+            #include "mul_mv_f16_f32_pl.cl.h"
+        };
+#else
+        const std::string kernel_src = read_file("mul_mv_f16_f32_pl.cl");
+#endif
+        cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        const char * names[2][3] = {
+            { "kernel_mul_mv_f16_f32_pl_l64_rb1", "kernel_mul_mv_f16_f32_pl_l64_rb2", "kernel_mul_mv_f16_f32_pl_l64_rb4" },
+            { "kernel_mul_mv_f16_f32_pl_l32_rb2", "kernel_mul_mv_f16_f32_pl_l32_rb4", "kernel_mul_mv_f16_f32_pl_l32_rb8" } };
+        for (int l = 0; l < 2; ++l) {
+            for (int i = 0; i < 3; ++i) {
+                CL_CHECK((backend_ctx->kernel_mul_mv_f16_f32_pl[l][i] = clCreateKernel(prog, names[l][i], &err), err));
+            }
+        }
+        CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
 
@@ -18470,6 +18493,7 @@ static void ggml_opencl_op_group_norm_fused(ggml_backend_t backend, ggml_tensor 
 static void ggml_cl_rope_set_rows(ggml_backend_t backend, ggml_tensor * rope_tensor, ggml_tensor * view_tensor, ggml_tensor * set_rows_tensor);
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
 static bool ggml_opencl_can_fuse_gemma4_perlayer_block(const ggml_backend_opencl_context * backend_ctx, const struct ggml_cgraph * cgraph, int i, int * out_idx);
+static bool ggml_cl_mul_mv_f16_pl(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const ggml_tensor * gate);
 static void ggml_opencl_op_gemma4_perlayer_block(ggml_backend_t backend, const struct ggml_cgraph * cgraph, const int * idx);
 #endif
 inline bool use_q4k_tiled(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor);   // defined below
@@ -18572,6 +18596,86 @@ static inline bool ggml_opencl_node_is_noop(const ggml_tensor * n) {
 // precompute lives elsewhere). Highly specific wiring -> the intermediate
 // outputs are private to the block, no separate use-count guard needed.
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+// An f32 weight with an f16 copy (see set_tensor) seen as an f16 tensor over that copy.
+// Returns src0 itself when it has no copy. tmp/tmp_extra must outlive the use.
+static const ggml_tensor * ggml_cl_f16_shadow_view(const ggml_tensor * src0, ggml_tensor * tmp, ggml_tensor_extra_cl * tmp_extra) {
+    if (src0->type != GGML_TYPE_F32 || src0->view_src != nullptr || src0->extra == nullptr ||
+        ((const ggml_tensor_extra_cl *) src0->extra)->f16_shadow == nullptr) {
+        return src0;
+    }
+    *tmp       = *src0;
+    *tmp_extra = {};
+    tmp_extra->data_device = ((const ggml_tensor_extra_cl *) src0->extra)->f16_shadow;
+    tmp_extra->offset      = 0;
+    tmp->type      = GGML_TYPE_F16;
+    tmp->extra     = tmp_extra;
+    tmp->view_offs = 0;
+    tmp->nb[0] = sizeof(ggml_fp16_t);
+    tmp->nb[1] = tmp->nb[0] * src0->ne[0];
+    tmp->nb[2] = tmp->nb[1] * src0->ne[1];
+    tmp->nb[3] = tmp->nb[2] * src0->ne[2];
+    return tmp;
+}
+
+// gemma-4 per-layer block: MUL_MAT(inp_gate) -> GELU -> MUL(inp_this_layer) as one small
+// f16 GEMV with a GELU*gate epilogue (ggml_cl_mul_mv_f16_pl). No-op view nodes between the
+// ops are skipped. In the layers after the output rows are selected, a GET_ROWS that makes
+// the gate sits between the GELU and the MUL; it does not depend on the GEMV, so it is run
+// first. Returns the index of the MUL (the last node handled), or -1.
+static int ggml_opencl_try_pl_gelu_mul(ggml_backend_t backend, const struct ggml_cgraph * cgraph, int i) {
+    static const bool off = ggml_cl_env_flag_zero("GGML_OPENCL_FUSE_PL_GELU");
+    if (off) {
+        return -1;
+    }
+    int idx[4];
+    int got = 0;
+    for (int j = i; j < cgraph->n_nodes && got < 4; ++j) {
+        if (j > i && ggml_opencl_node_is_noop(cgraph->nodes[j])) { continue; }
+        idx[got++] = j;
+    }
+    if (got < 3) {
+        return -1;
+    }
+    ggml_tensor * pre = nullptr; // the GET_ROWS that makes the gate, if any
+    if (got == 4 && cgraph->nodes[idx[2]]->op == GGML_OP_GET_ROWS) {
+        pre    = cgraph->nodes[idx[2]];
+        idx[2] = idx[3];
+    }
+    const enum ggml_op ops[3] = { GGML_OP_MUL_MAT, GGML_OP_UNARY, GGML_OP_MUL };
+    if (!ggml_can_fuse_ext(cgraph, idx, ops, 3)) {
+        return -1;
+    }
+    const ggml_tensor * mm  = cgraph->nodes[idx[0]];
+    const ggml_tensor * un  = cgraph->nodes[idx[1]];
+    ggml_tensor       * mul = cgraph->nodes[idx[2]];
+    if (ggml_get_unary_op(un) != GGML_UNARY_OP_GELU || un->src[0] != mm || mul->src[0] != un) {
+        return -1;
+    }
+    const ggml_tensor * x    = mm->src[1];
+    const ggml_tensor * gate = mul->src[1];
+    if (gate->type != GGML_TYPE_F32 || !ggml_is_contiguous(gate) || !ggml_are_same_shape(gate, mul)) {
+        return -1;
+    }
+    // every work-group reads all of x, and gate[r] is read where dst[r] is written:
+    // the output may not overlap either (the pool allocator can reuse a dead buffer)
+    if (ggml_cl_tensors_overlap(mul, x) || ggml_cl_tensors_overlap(mul, gate)) {
+        return -1;
+    }
+    if (pre != nullptr) {
+        // run ahead of the GEMV: it must make the gate, read neither GEMV result, and
+        // not land on x (x may be dead by the GET_ROWS, so its buffer can be reused)
+        if (pre != gate || pre->src[0] == mm || pre->src[0] == un || pre->src[1] == mm || pre->src[1] == un ||
+            ggml_cl_tensors_overlap(pre, x) || !ggml_cl_compute_forward(backend, pre)) {
+            return -1;
+        }
+    }
+    ggml_tensor          tmp;
+    ggml_tensor_extra_cl tmp_extra;
+    const ggml_tensor * w = ggml_cl_f16_shadow_view(mm->src[0], &tmp, &tmp_extra);
+    // on a decline the caller runs the nodes one by one; an early GET_ROWS is simply redone
+    return ggml_cl_mul_mv_f16_pl(backend, w, x, mul, gate) ? idx[2] : -1;
+}
+
 static bool ggml_opencl_can_fuse_gemma4_perlayer_block(const ggml_backend_opencl_context * backend_ctx, const struct ggml_cgraph * cgraph, int i, int * out_idx) {
     // Gather the next 8 COMPUTED nodes from index i (skipping no-op VIEW/RESHAPE/
     // PERMUTE/etc nodes that sit between the block's ops, e.g. the inp_this_layer
@@ -18926,6 +19030,15 @@ static void ggml_backend_opencl_exec_graph_nodes(ggml_backend_t backend, ggml_cg
             if (n_slots > 1) {
                 ggml_cl_cpy_slots(backend, cgraph, i, last_idx, n_slots);
                 i = last_idx;
+                continue;
+            }
+        }
+
+        if (!backend_ctx->disable_fusion && node->op == GGML_OP_MUL_MAT &&
+            backend_ctx->kernel_mul_mv_f16_f32_pl[0][0] != nullptr) {
+            const int last = ggml_opencl_try_pl_gelu_mul(backend, cgraph, i);
+            if (last > 0) {
+                i = last;
                 continue;
             }
         }
@@ -47124,6 +47237,77 @@ static bool ggml_cl_fwht(ggml_backend_t backend, const ggml_tensor * src, ggml_t
     return true;
 }
 
+// Single-token f16 GEMV for small matrices (kernel_mul_mv_f16_f32_pl): one row split over
+// min(64, K/8) lanes, so short rows (K = 256) still fill a subgroup's 16-byte loads.
+// Measured on the Adreno 850 for the gemma-4 per-layer-embedding shapes, which reach it
+// through the f16 copy of their f32 weights. gate != nullptr applies GELU * gate[r].
+// Returns false (nothing enqueued) when the shape is not one it serves.
+static bool ggml_cl_mul_mv_f16_pl(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1,
+                                  ggml_tensor * dst, const ggml_tensor * gate) {
+    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *) backend->context;
+    static const int env = []{ const char * e = getenv("GGML_OPENCL_F16_PL"); return (e && e[0]) ? atoi(e) : -1; }();
+    if (env == 0 || backend_ctx->kernel_mul_mv_f16_f32_pl[0][0] == nullptr) { return false; }
+    if (src0->type != GGML_TYPE_F16 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) { return false; }
+    if (src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[1] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1) { return false; }
+    if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) { return false; }
+    const int K = (int) src0->ne[0];
+    const int M = (int) src0->ne[1];
+    if (K % 8 != 0) { return false; }
+    int lpr_log2;
+    if (K % 512 == 0) {
+        lpr_log2 = 6;
+    } else if (K == 256) {
+        lpr_log2 = 5;
+    } else {
+        return false;
+    }
+    // the measured shapes: short rows, or few rows
+    if (env < 0 && !((K <= 512 && M <= 4096) || (M <= 512 && K <= 4096))) { return false; }
+
+    static const int rb_env = []{ const char * e = getenv("GGML_OPENCL_F16_PL_RB"); return (e && e[0]) ? atoi(e) : 0; }();
+    // RB index 0/1/2 = 1/2/4 rows (LPR 64) or 2/4/8 row pairs (LPR 32)
+    const int ki = rb_env ? std::min(std::max(rb_env - 1, 0), 2) : 0;   // GGML_OPENCL_F16_PL_RB=1..3
+    const int rb = lpr_log2 == 6 ? (1 << ki) : (2 << ki);
+    cl_kernel kernel = backend_ctx->kernel_mul_mv_f16_f32_pl[lpr_log2 == 6 ? 0 : 1][ki];
+
+    ggml_tensor_extra_cl * ex0 = (ggml_tensor_extra_cl *) src0->extra;
+    ggml_tensor_extra_cl * ex1 = (ggml_tensor_extra_cl *) src1->extra;
+    ggml_tensor_extra_cl * exd = (ggml_tensor_extra_cl *) dst->extra;
+    const cl_ulong off0 = ex0->offset + src0->view_offs;
+    const cl_ulong off1 = ex1->offset + src1->view_offs;
+    const cl_ulong offd = exd->offset + dst->view_offs;
+    cl_mem   gmem = ex1->data_device;
+    cl_ulong offg = off1;
+    cl_int   mode = 0;
+    if (gate) {
+        ggml_tensor_extra_cl * exg = (ggml_tensor_extra_cl *) gate->extra;
+        gmem = exg->data_device;
+        offg = exg->offset + gate->view_offs;
+        mode = 1;
+    }
+
+    int a = 0;
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &ex0->data_device));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &off0));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &ex1->data_device));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &off1));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &gmem));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &offg));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &exd->data_device));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &offd));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_int),   &K));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_int),   &M));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_int),   &mode));
+
+    const int rows_per_sg = rb * (64 >> lpr_log2);
+    const int nsg         = 4;
+    size_t lws[1] = { (size_t) 64 * nsg };
+    size_t gws[1] = { (size_t) CEIL_DIV(M, rows_per_sg * nsg) * 64 * nsg };
+    backend_ctx->enqueue_ndrange_kernel(kernel, 1, gws, lws, dst);
+    return true;
+}
+
+
 static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_ASSERT(src0);
     GGML_ASSERT(src0->extra);
@@ -47140,20 +47324,17 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 
     // single-token GEMV over an f32 weight that has an f16 copy (see set_tensor)
     if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && src1->ne[1] == 1 &&
-        src1->ne[2] == 1 && src1->ne[3] == 1 && src0->view_src == nullptr &&
-        ((ggml_tensor_extra_cl *) src0->extra)->f16_shadow != nullptr) {
-        ggml_tensor          f16_src0   = *src0;
-        ggml_tensor_extra_cl f16_extra  = {};
-        f16_extra.data_device = ((ggml_tensor_extra_cl *) src0->extra)->f16_shadow;
-        f16_extra.offset      = 0;
-        f16_src0.type      = GGML_TYPE_F16;
-        f16_src0.extra     = &f16_extra;
-        f16_src0.view_offs = 0;
-        f16_src0.nb[0] = sizeof(ggml_fp16_t);
-        f16_src0.nb[1] = f16_src0.nb[0] * src0->ne[0];
-        f16_src0.nb[2] = f16_src0.nb[1] * src0->ne[1];
-        f16_src0.nb[3] = f16_src0.nb[2] * src0->ne[2];
-        ggml_cl_mul_mat(backend, &f16_src0, src1, dst);
+        src1->ne[2] == 1 && src1->ne[3] == 1) {
+        ggml_tensor          f16_src0;
+        ggml_tensor_extra_cl f16_extra;
+        const ggml_tensor *  w = ggml_cl_f16_shadow_view(src0, &f16_src0, &f16_extra);
+        if (w != src0) {
+            ggml_cl_mul_mat(backend, w, src1, dst);
+            return;
+        }
+    }
+
+    if (ggml_cl_mul_mv_f16_pl(backend, src0, src1, dst, nullptr)) {
         return;
     }
 
