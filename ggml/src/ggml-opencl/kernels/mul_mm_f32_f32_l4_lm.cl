@@ -235,34 +235,32 @@ kernel void kernel_gemv_f32_f32_mc(
 
 // The same small-N product with the weight row read ONCE for all columns: a lane
 // group of 2^lpr_log2 lanes owns one row and carries one accumulator per column
-// (N <= 8), so a work-group of 64 covers 64 >> lpr_log2 rows. kernel_gemv_f32_f32_mc
-// re-reads the row per column, which costs N times the weight traffic once the
-// weight is not skinny (gemma-4's per-layer inp_gate, 256 x 2560). 64 lanes per row
-// suit a long K; a short K (proj, 2560 x 256) wants 16, or each lane gets one float4.
+// (N <= 8), so a work-group of 64 covers 64 >> lpr_log2 rows.
 kernel void kernel_gemv_f32_f32_mcr(
-    global float * src0, ulong offset0,
-    global float * src1, ulong offset1,
+    global const float * src0, ulong offset0,
+    global const float * src1, ulong offset1,
     global float * dst,  ulong offsetd,
     int ne00,        // K
     int ne01,        // M
-    int ne11,        // N, 1..8
+    int ne11,        // N, 2..8
     int stride_a,
     int stride_b,
     int stride_d,
-    int lpr_log2)    // lanes per row = 1 << lpr_log2, 1..64
-{
-    src0 = (global float*)((global char*)src0 + offset0);
-    src1 = (global float*)((global char*)src1 + offset1);
+    int lpr_log2    // lanes per row = 1 << lpr_log2
+) {
+    src0 = (global const float*)((global const char*)src0 + offset0);
+    src1 = (global const float*)((global const char*)src1 + offset1);
     dst  = (global float*)((global char*)dst  + offsetd);
 
-    const uint lane = get_local_id(0);                  // 0..63
+    const uint lane = get_local_id(0);
     const uint lpr  = 1u << lpr_log2;
     const uint l    = lane & (lpr - 1);
     const uint mr   = get_group_id(0) * (64u >> lpr_log2) + (lane >> lpr_log2);
     const bool valid = mr < (uint)ne01;
-    const uint m    = valid ? mr : (uint)ne01 - 1;      // keep every lane in the barriers
+    // Keep padded rows in the local-memory barriers.
+    const uint m    = valid ? mr : (uint)ne01 - 1;
 
-    global float4 * wrow = (global float4*)(src0 + (ulong)m * (uint)stride_a);
+    global const float4 * wrow = (global const float4*)(src0 + (ulong)m * (uint)stride_a);
     const uint k4 = (uint)ne00 >> 2;
 
     float acc[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
@@ -271,7 +269,7 @@ kernel void kernel_gemv_f32_f32_mcr(
         #pragma unroll
         for (int n = 0; n < 8; n++) {
             if (n < ne11) {
-                acc[n] += dot(w, ((global float4*)(src1 + (ulong)n * (uint)stride_b))[k]);
+                acc[n] += dot(w, ((global const float4*)(src1 + (ulong)n * (uint)stride_b))[k]);
             }
         }
     }
