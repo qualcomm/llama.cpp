@@ -7938,7 +7938,13 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         // Override with GGML_OPENCL_A8X_F32_LM_TN4=0.
         static const char * a8x_tn4_env = getenv("GGML_OPENCL_A8X_F32_LM_TN4");
         static const bool   a8x_tn4_on  = (a8x_tn4_env == nullptr || a8x_tn4_env[0] != '0');
+        // f32 x f32 keeps its tiles in float: LM_HALF is for the quantized l4_lm GEMMs, and
+        // half-staged f32 operands keep only half's 11-bit significand (LOOP_CTRL T>1 failed on the 850).
         std::string f32_lm_opts = compile_opts;
+        {
+            const size_t p = f32_lm_opts.find(" -DLM_HALF=1");
+            if (p != std::string::npos) { f32_lm_opts.replace(p, 12, " -DLM_HALF=0"); }
+        }
         if (a8x_tn4_on && backend_ctx->adreno_gen == ADRENO_GPU_GEN::A8X) {
             f32_lm_opts += " -DTN=4";
             backend_ctx->f32_lm_nth0 = 256;   // (BM*BN)/(TM*TN) = (64*64)/(4*4)
