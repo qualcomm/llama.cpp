@@ -7663,7 +7663,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
     }
 
     // mul_mv_f16_f32_pl (small-matrix f16 decode GEMV, gemma-4 per-layer shapes)
-    if (backend_ctx->adreno_850 && !ggml_cl_env_flag_zero("GGML_OPENCL_F16_PL")) {
+    if ((backend_ctx->adreno_850 || backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E) &&
+        !ggml_cl_env_flag_zero("GGML_OPENCL_F16_PL")) {
 #ifdef GGML_OPENCL_EMBED_KERNELS
         const std::string kernel_src {
             #include "mul_mv_f16_f32_pl.cl.h"
@@ -25360,12 +25361,13 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
     CL_CHECK(clEnqueueWriteBuffer(
         queue, extra->data_device, CL_TRUE, extra->offset + tensor->view_offs + offset,
         size, data, 0, NULL, NULL));
-    // Adreno 850: keep an f16 copy of whole 2-D f32 weights for the decode GEMV, which
-    // is memory bound and reads half the bytes from it (gemma-4 E4B/E2B per-layer
+    // Adreno 850 and X2: keep an f16 copy of whole 2-D f32 weights for the decode GEMV,
+    // which is memory bound and reads half the bytes from it (gemma-4 E4B/E2B per-layer
     // inp_gate/proj). GGML_OPENCL_F32W_F16=0/1 forces either way.
     {
         static const int f32w_f16_env = []{ const char * e = getenv("GGML_OPENCL_F32W_F16"); return (e && e[0]) ? atoi(e) : -1; }();
-        const bool on = f32w_f16_env >= 0 ? f32w_f16_env != 0 : backend_ctx->adreno_850;
+        const bool on = f32w_f16_env >= 0 ? f32w_f16_env != 0 :
+                        (backend_ctx->adreno_850 || backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E);
         if (on && tensor->type == GGML_TYPE_F32 && tensor->view_src == nullptr && offset == 0 &&
             size == ggml_nbytes(tensor) && ggml_n_dims(tensor) == 2 && ggml_is_contiguous(tensor) &&
             tensor->ne[0] % 8 == 0 && tensor->ne[1] >= 64 &&
@@ -47239,7 +47241,7 @@ static bool ggml_cl_fwht(ggml_backend_t backend, const ggml_tensor * src, ggml_t
 
 // Single-token f16 GEMV for small matrices (kernel_mul_mv_f16_f32_pl): one row split over
 // min(64, K/8) lanes, so short rows (K = 256) still fill a subgroup's 16-byte loads.
-// Measured on the Adreno 850 for the gemma-4 per-layer-embedding shapes, which reach it
+// Measured on the Adreno 850 and X2 for the gemma-4 per-layer-embedding shapes, which reach it
 // through the f16 copy of their f32 weights. gate != nullptr applies GELU * gate[r].
 // Returns false (nothing enqueued) when the shape is not one it serves.
 static bool ggml_cl_mul_mv_f16_pl(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1,
