@@ -43317,7 +43317,12 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
         // so this is not a "the 850 is slow" adjustment that a faster part would fix --
         // the 840 is 13x cheaper per launch and still loses.
         //
-        // Enabled where it is measured to win, i.e. X2E only. The X1-85 was measured
+        // Re-measured on the 850 once its per-dispatch cost had come down (driver
+        // 0891.17.1, no printf in the build: ~3.7 us host enqueue, 0.5 us GPU gap). The
+        // split now wins there: q4_K n=1 M<=2048 shapes 5-27% faster (nsg 4, ksplit 12),
+        // tg64 gemma-4 E4B Q4_K_M +1.9%, Llama-3.2-3B Q4_K_M +1.4%. So the 850 is on as well.
+        //
+        // Enabled where it is measured to win, i.e. X2E and the 850. The X1-85 was measured
         // afterwards and is NOT a win either: Qwen3.5-4B-Q4_K_M tg32, split-K off
         // 17.98/18.10/18.19 vs on 18.03/17.91/17.97 = -0.7%, so X1E stays excluded on
         // evidence rather than on absence of it. Do not widen this without a NEW
@@ -43332,7 +43337,7 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
         }();
         const bool splitk_wg_env = splitk_env_set
             ? splitk_env_on
-            : (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E);
+            : (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E || backend_ctx->adreno_850);
         // Gate: small-M decode GEMVs that under-fill the 16 CUs even with the wide
         // intra-WG split (all 16 subgroups land on one CU). M<=2560 covers Kcur/Vcur
         // (M=1024), Qcur (2048), attn_output + ffn_down (2560). The tiny ones
@@ -43343,8 +43348,10 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
         const bool use_splitk = splitk_wg_env && !use_tiled && !use_q4k_o4 && !use_mc3 && ne01 <= 2560;
 
         if (use_splitk) {
-            const int    nsg    = 8;
-            const int    ksplit = (ne01 <= 512) ? 8 : 4;   // -> ~32 total WGs
+            // The 850 (12 CUs) takes a narrower intra-WG split and one K-slice per CU:
+            // nsg 4 x ksplit 12 measured best or tied on every M <= 2560 shape there.
+            const int    nsg    = backend_ctx->adreno_850 ? 4 : 8;
+            const int    ksplit = backend_ctx->adreno_850 ? 12 : (ne01 <= 512) ? 8 : 4;   // -> ~32 total WGs
             const size_t gx     = (size_t)CEIL_DIV(ne01/2, 64) * 64;
 
             backend_ctx->prealloc_splitk_partial.allocate(
